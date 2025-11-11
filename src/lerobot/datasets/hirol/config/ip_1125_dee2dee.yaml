@@ -1,14 +1,14 @@
-custom_prompt: ["pick the white pinboard, put into the red base"]
+custom_prompt: ["pick up the white pinboard and place it into the red base"]
 # 支持单一路径或多路径；此处示例为单元素列表
 data_dir:
-  # - "/data/fr3/1113_left_fr3_insert_pinboard_53ep" #定点采集，轨迹一致
-  - "/data/fr3/1114_left_fr3_insert_pinboard_Generalize_82ep" #局部随机摆放采集，轨迹较一致
+  - "/data/fr3/1113_left_fr3_insert_pinboard_53ep" #定点采集，轨迹一致
+  # - "/data/fr3/1114_left_fr3_insert_pinboard_Generalize_82ep" #局部随机摆放采集，轨迹较一致
   # - "/data/fr3/1119_left_fr3_insert_pinboard_generalize_216ep"
 action_ori_type: "quaternion"
 action_prediction_step: 1
-contain_ft: true
+contain_ft: false
 contain_depth: false
-repo_name: "ip_1124_q2q_ft_within"
+repo_name: "left_fr3_ip_53ep_dee2dee"
 root_path: "/data/fr3_lerobot"
 fps: 15
 num_writer_thread: 8

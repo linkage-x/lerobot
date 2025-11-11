@@ -164,6 +164,29 @@ class WandBLogger:
 
             return value
 
+        # Expand list/tuple metrics (e.g. per-dimension losses) into individual scalar keys so that
+        # WandB can log them. For example, a key "loss_per_dim" with value [0.1, 0.2] becomes
+        # "loss_per_dim/0"=0.1 and "loss_per_dim/1"=0.2.
+        expanded: dict[str, Any] = {}
+        for key, value in d.items():
+            if isinstance(value, (list, tuple)) and len(value) > 0:
+                per_dim_scalars: list[float] = []
+                for item in value:
+                    scalar_item = _to_scalar_if_possible(key, item)
+                    if isinstance(scalar_item, (int, float)):
+                        per_dim_scalars.append(float(scalar_item))
+                    else:
+                        per_dim_scalars = []
+                        break
+                if per_dim_scalars:
+                    for idx, scalar in enumerate(per_dim_scalars):
+                        expanded[f"{key}/{idx}"] = scalar
+                    continue
+
+            expanded[key] = value
+
+        d = expanded
+
         for k, v in d.items():
             v = _to_scalar_if_possible(k, v)
             if not isinstance(v, (int | float | str)):

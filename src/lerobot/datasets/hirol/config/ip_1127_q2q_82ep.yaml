@@ -4,11 +4,13 @@ data_dir:
   # - "/data/fr3/1113_left_fr3_insert_pinboard_53ep" #定点采集，轨迹一致
   - "/data/fr3/1114_left_fr3_insert_pinboard_Generalize_82ep" #局部随机摆放采集，轨迹较一致
   # - "/data/fr3/1119_left_fr3_insert_pinboard_generalize_216ep"
-action_ori_type: "quaternion"
+  # - "/data/fr3/1121_left_fr3_insert_pinboard_generalize_20ep"
+  # - "/data/fr3/1122_left_fr3_insert_pinboard_generalized_133ep"
+# action_ori_type: "quaternion"
 action_prediction_step: 1
-contain_ft: true
+contain_ft: false
 contain_depth: false
-repo_name: "ip_1124_q2q_ft_within"
+repo_name: "left_fr3_ip_82ep_q2q"
 root_path: "/data/fr3_lerobot"
 fps: 15
 num_writer_thread: 8

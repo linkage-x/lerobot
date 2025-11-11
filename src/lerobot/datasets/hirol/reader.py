@@ -191,8 +191,21 @@ class RerunEpisodeReader:
             
             # Append the action data in the item_data list
             cur_actions = {}
-            action_state_id = i+self._action_prediction_step
-            if action_state_id >= len_json_file: continue
+            actions_data = item_data.get("actions", {})
+            action_state_id = i + self._action_prediction_step
+
+            # For state-based actions we look ahead by _action_prediction_step.
+            # For command-based actions (cq/cdq/cee/cdee) we use the action
+            # recorded at the current timestep in item_data["actions"].
+            state_based_actions = (
+                ActionType.JointPosition,
+                ActionType.EEPose,
+                ActionType.DeltaJointPosition,
+                ActionType.DeltaEEPose,
+            )
+            if self.action_type in state_based_actions and action_state_id >= len_json_file:
+                continue
+
             if self.action_type == ActionType.JointPosition:
                 joint_states = item_data.get("joint_states", {})
                 cur_actions = self._get_absolute_action(joint_states, 
@@ -234,16 +247,132 @@ class RerunEpisodeReader:
                     cur_actions = modified_action
                 elif self._action_ori_type != "quaternion":
                     raise ValueError(f'The action orientation type {self._action_ori_type} is not supported for reading episode data')
+            elif self.action_type == ActionType.CommandJointPosition:
+                if not actions_data:
+                    raise ValueError(
+                        f"actions field is missing while using action_type={self.action_type}"
+                    )
+                # Use commanded joint positions directly from item_data['actions'].
+                for key, action in actions_data.items():
+                    joint_cmd = action.get("joint", {})
+                    if "position" not in joint_cmd:
+                        raise ValueError(
+                            f"actions['{key}']['joint']['position'] is missing for CommandJointPosition"
+                        )
+                    cur_actions[key] = np.asarray(joint_cmd["position"], dtype=np.float32)
+            elif self.action_type == ActionType.CommandDeltaJointPosition:
+                if not actions_data:
+                    raise ValueError(
+                        f"actions field is missing while using action_type={self.action_type}"
+                    )
+                joint_states = item_data.get("joint_states", {})
+                for key, action in actions_data.items():
+                    joint_cmd = action.get("joint", {})
+                    if "position" not in joint_cmd:
+                        raise ValueError(
+                            f"actions['{key}']['joint']['position'] is missing for CommandDeltaJointPosition"
+                        )
+                    if key not in joint_states or "position" not in joint_states[key]:
+                        raise ValueError(
+                            f"joint_states['{key}']['position'] is missing while computing CommandDeltaJointPosition"
+                        )
+                    cmd = np.asarray(joint_cmd["position"], dtype=np.float32)
+                    cur = np.asarray(joint_states[key]["position"], dtype=np.float32)
+                    cur_actions[key] = cmd - cur
+            elif self.action_type == ActionType.CommandEEPose:
+                if not actions_data:
+                    raise ValueError(
+                        f"actions field is missing while using action_type={self.action_type}"
+                    )
+                # Use commanded EE pose directly from item_data['actions'].
+                for key, action in actions_data.items():
+                    ee_cmd = action.get("ee", {})
+                    if "pose" not in ee_cmd:
+                        raise ValueError(
+                            f"actions['{key}']['ee']['pose'] is missing for CommandEEPose"
+                        )
+                    pose = np.asarray(ee_cmd["pose"], dtype=np.float32)
+                    if self._action_ori_type == "euler":
+                        # [x, y, z, roll, pitch, yaw]
+                        cur_action = np.zeros(6, dtype=np.float32)
+                        cur_action[:3] = pose[:3]
+                        cur_action[3:] = R.from_quat(pose[3:]).as_euler("xyz", False)
+                        cur_actions[key] = cur_action
+                    elif self._action_ori_type == "quaternion":
+                        cur_actions[key] = pose
+                    else:
+                        raise ValueError(
+                            f"The action orientation type {self._action_ori_type} is not supported for CommandEEPose"
+                        )
+            elif self.action_type == ActionType.CommandDeltaEEPose:
+                if not actions_data:
+                    raise ValueError(
+                        f"actions field is missing while using action_type={self.action_type}"
+                    )
+                ee_states = item_data.get("ee_states", {})
+                for key, action in actions_data.items():
+                    ee_cmd = action.get("ee", {})
+                    if "pose" not in ee_cmd:
+                        raise ValueError(
+                            f"actions['{key}']['ee']['pose'] is missing for CommandDeltaEEPose"
+                        )
+                    if key not in ee_states or "pose" not in ee_states[key]:
+                        raise ValueError(
+                            f"ee_states['{key}']['pose'] is missing while computing CommandDeltaEEPose"
+                        )
+                    cmd_pose = np.asarray(ee_cmd["pose"], dtype=np.float32)
+                    cur_pose = np.asarray(ee_states[key]["pose"], dtype=np.float32)
+                    pose_diff = self.get_pose_diff(cmd_pose, cur_pose)
+                    if self._action_ori_type == "euler":
+                        cur_action = np.zeros(6, dtype=np.float32)
+                        cur_action[:3] = pose_diff[:3]
+                        cur_action[3:] = R.from_quat(pose_diff[3:]).as_euler("xyz")
+                        cur_actions[key] = cur_action
+                    elif self._action_ori_type == "quaternion":
+                        cur_actions[key] = pose_diff
+                    else:
+                        raise ValueError(
+                            f"The action orientation type {self._action_ori_type} is not supported for CommandDeltaEEPose"
+                        )
             else:
                 raise ValueError(f'The action type {self.action_type} is not supported for reading episode data')
             # tool state
             tool_states = item_data.get("tools", {})
-            for key, tool_state in tool_states.items():
-                cur_actions[key] = np.hstack((cur_actions[key], tool_state["position"]))
-                if self._obs_type == ObservationType.Mask:
-                    cur_obs[key] = np.hstack((cur_obs[key], [0]))
+            # For command-based actions, use tool value from actions[*]['tool']
+            # instead of the measured tool_states.
+            if self.action_type in (
+                ActionType.CommandJointPosition,
+                ActionType.CommandDeltaJointPosition,
+                ActionType.CommandEEPose,
+                ActionType.CommandDeltaEEPose,
+            ):
+                tool_source = {}
+                for key, action in actions_data.items():
+                    tool = action.get("tool", None)
+                    if tool is not None and "position" in tool:
+                        tool_source[key] = tool
+            else:
+                tool_source = tool_states
+
+            for key, tool_state in tool_source.items():
+                tool_pos = tool_state["position"]
+                # Append tool position to actions; create entry if missing.
+                if key in cur_actions:
+                    cur_actions[key] = np.hstack((cur_actions[key], tool_pos))
                 else:
-                    cur_obs[key] = np.hstack((cur_obs[key], tool_state["position"]))
+                    cur_actions[key] = np.atleast_1d(np.asarray(tool_pos, dtype=np.float32))
+
+                # Append tool position (or mask) to observations.
+                if self._obs_type == ObservationType.Mask:
+                    if key in cur_obs:
+                        cur_obs[key] = np.hstack((cur_obs[key], [0]))
+                    else:
+                        cur_obs[key] = np.asarray([0], dtype=np.float32)
+                else:
+                    if key in cur_obs:
+                        cur_obs[key] = np.hstack((cur_obs[key], tool_pos))
+                    else:
+                        cur_obs[key] = np.atleast_1d(np.asarray(tool_pos, dtype=np.float32))
             
             episode_data.append(
                 {

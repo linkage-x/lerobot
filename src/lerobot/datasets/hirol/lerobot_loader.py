@@ -290,6 +290,10 @@ def _parse_obs_action_from_repo_name(repo_name: str):
             "dq": ActionType.DeltaJointPosition,
             "ee": ActionType.EEPose,
             "dee": ActionType.DeltaEEPose,
+            "cq": ActionType.CommandJointPosition,
+            "cdq": ActionType.CommandDeltaJointPosition,
+            "cee": ActionType.CommandEEPose,
+            "cdee": ActionType.CommandDeltaEEPose,
         }
         obs_type = obs_map[obs_tok]
         act_type = act_map[act_tok]

@@ -1,4 +1,4 @@
-custom_prompt: ["pick up the white pinboard and place it into the red base"]
+custom_prompt: ["pick the white pinboard, put into the red base"]
 # 支持单一路径或多路径；此处示例为单元素列表
 data_dir:
   # - "/data/fr3/1113_left_fr3_insert_pinboard_53ep" #定点采集，轨迹一致

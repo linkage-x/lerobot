@@ -1,13 +1,12 @@
 {
     "dataset": {
-        "repo_id": "fr3_insert_pinboard",
-        "root": "/data/fr3_lerobot/1119_mix_left_fr3_ip_82ep_ft2q",
+        "repo_id": "left_fr3_ip_216ep_ft2ee",
+        "root": "/data/fr3_lerobot/left_fr3_ip_216ep_ft2ee",
         "episodes": null,
         "streaming": false,
         "use_imagenet_stats": true,
         "image_transforms": {
-            "enable": true,
-            "random_order": true
+            "enable": false
         },
         "video_backend": "torchcodec"
     },
@@ -37,16 +36,16 @@
     },
     "optimizer": null,
     "scheduler": null,
-    "batch_size": 32,
-    "num_workers": 8,
-    "steps": 10000,
-    "eval_freq": 1000,
+    "batch_size": 64,
+    "num_workers": 12,
+    "steps": 200000,
+    "eval_freq": 500,
     "log_freq": 500,
     "save_checkpoint": true,
-    "save_freq": 1000,
+    "save_freq": 2000,
     "seed": 42,
     "use_policy_training_preset": true,
-    "output_dir": "/data/ckpts/ip_1126_ft2q_smolvla",
+    "output_dir": "/data/ckpts/ip_1127_ft2ee_smolvla",
     "wandb": {
         "enable": true,
         "disable_artifact": true

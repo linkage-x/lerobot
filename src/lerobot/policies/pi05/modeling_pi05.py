@@ -1239,11 +1239,18 @@ class PI05Policy(PreTrainedPolicy):
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
+        # losses is per-dimension squared error: (u_t - v_t)^2.
+        # MSE-style training loss:
         loss = losses.mean()
+
+        # "True" L1 metric for logging/eval: mean absolute error on the same tensor.
+        # Since losses = (delta)^2, taking sqrt before averaging recovers |delta|.
+        l1_loss = torch.sqrt(losses).mean()
 
         loss_dict = {
             "loss": loss.item(),
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "l1_loss": l1_loss.item(),
         }
 
         return loss, loss_dict
