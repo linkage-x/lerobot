@@ -18,7 +18,10 @@ import os
 import re
 from glob import glob
 from pathlib import Path
+from typing import Any
 
+import numpy as np
+import torch
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from termcolor import colored
 
@@ -135,8 +138,34 @@ class WandBLogger:
             if new_custom_key not in self._wandb_custom_step_key:
                 self._wandb_custom_step_key.add(new_custom_key)
                 self._wandb.define_metric(new_custom_key, hidden=True)
+        # Helper: convert various numeric containers to a plain Python scalar so wandb can log them.
+        def _to_scalar_if_possible(key: str, value: Any) -> Any:
+            # Leave simple types as-is.
+            if isinstance(value, (int, float, str)):
+                return value
+            if isinstance(value, bool):
+                # wandb accepts bool but we keep everything numeric for consistency
+                return int(value)
+
+            # Torch tensors
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 1:
+                    return value.item()
+                # For non-scalar tensors, log the mean value as a compact summary.
+                return value.detach().float().mean().item()
+
+            # NumPy scalars / arrays
+            if isinstance(value, (np.generic,)):
+                return value.item()
+            if isinstance(value, np.ndarray):
+                if value.size == 1:
+                    return value.item()
+                return float(np.asarray(value, dtype=float).mean())
+
+            return value
 
         for k, v in d.items():
+            v = _to_scalar_if_possible(k, v)
             if not isinstance(v, (int | float | str)):
                 logging.warning(
                     f'WandB logging of key "{k}" was ignored as its type "{type(v)}" is not handled by this wrapper.'

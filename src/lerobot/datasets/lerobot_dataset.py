@@ -109,7 +109,13 @@ class LeRobotDatasetMetadata:
             self.load_metadata()
 
     def _flush_metadata_buffer(self) -> None:
-        """Write all buffered episode metadata to parquet file."""
+        """Write all buffered episode metadata to parquet file.
+
+        Note: Use atomic rewrite to avoid keeping an open ParquetWriter, which makes
+        reading the episodes metadata fail (footer not written) when batch-encoding
+        videos. Since episodes metadata is small (one row per episode), the overhead
+        of concatenating on flush is acceptable and more robust.
+        """
         if not hasattr(self, "metadata_buffer") or len(self.metadata_buffer) == 0:
             return
 
@@ -129,14 +135,19 @@ class LeRobotDatasetMetadata:
 
         table = pa.Table.from_pydict(combined_dict)
 
-        if not self.writer:
-            path = Path(self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx))
-            path.parent.mkdir(parents=True, exist_ok=True)
-            self.writer = pq.ParquetWriter(
-                path, schema=table.schema, compression="snappy", use_dictionary=True
-            )
+        path = Path(self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx))
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.writer.write_table(table)
+        if path.exists():
+            # Read existing metadata and append new rows, then rewrite the file atomically.
+            existing = pq.read_table(path)
+            concat = pa.concat_tables([existing, table])
+            pq.write_table(concat, path, compression="snappy")
+        else:
+            pq.write_table(table, path, compression="snappy")
+
+        # Keep writer closed to ensure future readers see a finalized parquet file.
+        self.writer = None
 
         self.latest_episode = self.metadata_buffer[-1]
         self.metadata_buffer.clear()
@@ -1193,6 +1204,23 @@ class LeRobotDataset(torch.utils.data.Dataset):
         logging.info(
             f"Batch encoding {self.batch_encoding_size} videos for episodes {start_episode} to {end_episode - 1}"
         )
+        # Ensure episode metadata parquet is in a readable state. If the metadata writer is still
+        # open, parquet footers may not be written yet which makes readers fail with
+        # "Parquet magic bytes not found in footer". Close it to finalize the file before reading.
+        # Note: this function does not reopen the writer; subsequent metadata writes should still
+        # work since we reload episodes below and operate via pandas for updates in this function.
+        with contextlib.suppress(Exception):
+            # Safe to call even if there is no active writer
+            self.meta._close_writer()
+
+        # Ensure episode metadata is loaded before accessing it.
+        try:
+            self.meta.episodes = load_episodes(self.root)
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                "Episode metadata not available on disk when attempting batched video encoding. "
+                "This likely means no episodes have been flushed yet."
+            ) from e
 
         chunk_idx = self.meta.episodes[start_episode]["data/chunk_index"]
         file_idx = self.meta.episodes[start_episode]["data/file_index"]
@@ -1342,11 +1370,17 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if self.meta.episodes is not None and len(self.meta.episodes) > 0:
                 # It means we are resuming recording, so we need to load the latest episode
                 # Update the indices to avoid overwriting the latest episode
-                old_chunk_idx = self.meta.episodes[-1][f"videos/{video_key}/chunk_index"]
-                old_file_idx = self.meta.episodes[-1][f"videos/{video_key}/file_index"]
-                chunk_idx, file_idx = update_chunk_file_indices(
-                    old_chunk_idx, old_file_idx, self.meta.chunks_size
-                )
+                try:
+                    old_chunk_idx = self.meta.episodes[-1][f"videos/{video_key}/chunk_index"]
+                    old_file_idx = self.meta.episodes[-1][f"videos/{video_key}/file_index"]
+                    # Some datasets may have the column present but with None values for this key
+                    if old_chunk_idx is not None and old_file_idx is not None:
+                        chunk_idx, file_idx = update_chunk_file_indices(
+                            old_chunk_idx, old_file_idx, self.meta.chunks_size
+                        )
+                except KeyError:
+                    # This video_key hasn't been written before; start at (0, 0)
+                    pass
             latest_duration_in_s = 0.0
             new_path = self.root / self.meta.video_path.format(
                 video_key=video_key, chunk_index=chunk_idx, file_index=file_idx

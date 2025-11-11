@@ -1,0 +1,48 @@
+{
+  "dataset": {
+    "repo_id": "fr3_insert_pinboard",
+    "root": "/data/fr3_lerobot/1113_left_fr3_insert_pinboard_53ep_mask2q",
+    "episodes": null,
+    "streaming": false,
+    "use_imagenet_stats": true,
+    "image_transforms": {
+      "enable": true,
+      "random_order": true
+    },
+    "video_backend": "torchcodec"
+  },
+  "policy": {
+    "type": "act",
+    "device": "cuda",
+    "push_to_hub": false,
+    "chunk_size": 100,
+    "n_action_steps": 100,
+    "use_amp": true,
+    "repo_id": null,
+    "pretrained_path": null
+  },
+  "optimizer": {
+    "type": "adamw",
+    "lr": 1e-5,
+    "weight_decay": 1e-4,
+    "betas": [0.9, 0.999],
+    "eps": 1e-8,
+    "grad_clip_norm": 10.0
+  },
+  "scheduler": null,
+  "batch_size": 32,
+  "num_workers": 12,
+  "steps": 200000,
+  "eval_freq": 2000,
+  "log_freq": 2000,
+  "save_checkpoint": true,
+  "save_freq": 2000,
+  "seed": 0,
+  "use_policy_training_preset": true,
+  "output_dir": "/data/ckpts/1113_ip_53ep_mask2q",
+  "wandb": {
+    "enable": true,
+    "disable_artifact": true
+  }
+}
+

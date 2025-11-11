@@ -40,16 +40,11 @@ from .gym_action_processor import (
     Numpy2TorchActionProcessorStep,
     Torch2NumpyActionProcessorStep,
 )
-from .hil_processor import (
-    AddTeleopActionAsComplimentaryDataStep,
-    AddTeleopEventsAsInfoStep,
-    GripperPenaltyProcessorStep,
-    ImageCropResizeProcessorStep,
-    InterventionActionProcessorStep,
-    RewardClassifierProcessorStep,
-    TimeLimitProcessorStep,
-)
-from .joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
+# Optional processors that depend on unsupported modules (teleoperators/robots)
+# are intentionally NOT imported here to keep the package usable without them.
+# If you need those features, import their modules directly.
+# from .hil_processor import (...)
+# from .joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
 from .normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep, hotswap_stats
 from .observation_processor import VanillaObservationProcessorStep
 from .pipeline import (
@@ -79,8 +74,9 @@ from .tokenizer_processor import TokenizerProcessorStep
 
 __all__ = [
     "ActionProcessorStep",
-    "AddTeleopActionAsComplimentaryDataStep",
-    "AddTeleopEventsAsInfoStep",
+    # Teleop-related steps are intentionally omitted from the public surface by default.
+    # "AddTeleopActionAsComplimentaryDataStep",
+    # "AddTeleopEventsAsInfoStep",
     "ComplementaryDataProcessorStep",
     "batch_to_transition",
     "create_transition",
@@ -88,20 +84,20 @@ __all__ = [
     "DoneProcessorStep",
     "EnvAction",
     "EnvTransition",
-    "GripperPenaltyProcessorStep",
+    # "GripperPenaltyProcessorStep",
     "hotswap_stats",
     "IdentityProcessorStep",
-    "ImageCropResizeProcessorStep",
+    # "ImageCropResizeProcessorStep",
     "InfoProcessorStep",
-    "InterventionActionProcessorStep",
-    "JointVelocityProcessorStep",
+    # "InterventionActionProcessorStep",
+    # "JointVelocityProcessorStep",
     "make_default_processors",
     "make_default_teleop_action_processor",
     "make_default_robot_action_processor",
     "make_default_robot_observation_processor",
     "MapDeltaActionToRobotActionStep",
     "MapTensorToDeltaActionDictStep",
-    "MotorCurrentProcessorStep",
+    # "MotorCurrentProcessorStep",
     "NormalizerProcessorStep",
     "Numpy2TorchActionProcessorStep",
     "ObservationProcessorStep",
@@ -115,10 +111,10 @@ __all__ = [
     "RobotActionProcessorStep",
     "RobotObservation",
     "RenameObservationsProcessorStep",
-    "RewardClassifierProcessorStep",
+    # "RewardClassifierProcessorStep",
     "RewardProcessorStep",
     "DataProcessorPipeline",
-    "TimeLimitProcessorStep",
+    # "TimeLimitProcessorStep",
     "AddBatchDimensionProcessorStep",
     "RobotProcessorPipeline",
     "TokenizerProcessorStep",
