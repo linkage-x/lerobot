@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import os
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -183,11 +184,116 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
 
+        # Optional: create a small hold-out for offline eval when no env is configured.
+        # We keep this lightweight and self-contained to provide an eval curve similar to original ACT
+        # when users train purely offline on recorded datasets.
+        offline_eval_enabled = (
+            cfg.eval_freq > 0 and cfg.env is None and not cfg.dataset.streaming and getattr(dataset, "num_episodes", 0) >= 2
+        )
+        if offline_eval_enabled:
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+            from lerobot.datasets.factory import resolve_delta_timestamps, ImageTransforms, IMAGENET_STATS
+
+            num_eps = int(dataset.num_episodes)
+            # 10% episodes as validation (at least 1)
+            n_val = max(1, num_eps // 10)
+            # use last episodes as val to keep split deterministic
+            val_eps = list(range(num_eps - n_val, num_eps))
+            train_eps = list(range(0, num_eps - n_val))
+            if len(train_eps) == 0:
+                # fallback: keep at least 1 train episode
+                train_eps = [0]
+                val_eps = [i for i in range(1, num_eps)]
+
+            # Rebuild train/val datasets with identical transforms and delta timestamps
+            img_tf = ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
+            delta_ts = resolve_delta_timestamps(cfg.policy, dataset.meta)
+            train_dataset = LeRobotDataset(
+                cfg.dataset.repo_id,
+                root=cfg.dataset.root,
+                episodes=train_eps,
+                image_transforms=img_tf,
+                delta_timestamps=delta_ts,
+                revision=cfg.dataset.revision,
+                video_backend=cfg.dataset.video_backend,
+            )
+            val_dataset = LeRobotDataset(
+                cfg.dataset.repo_id,
+                root=cfg.dataset.root,
+                episodes=val_eps,
+                image_transforms=img_tf,
+                delta_timestamps=delta_ts,
+                revision=cfg.dataset.revision,
+                video_backend=cfg.dataset.video_backend,
+            )
+            # Apply ImageNet stats override if requested (same as make_dataset)
+            if cfg.dataset.use_imagenet_stats:
+                import torch as _torch
+                for key in train_dataset.meta.camera_keys:
+                    for stats_type, stats in IMAGENET_STATS.items():
+                        train_dataset.meta.stats[key][stats_type] = _torch.tensor(stats, dtype=_torch.float32)
+                for key in val_dataset.meta.camera_keys:
+                    for stats_type, stats in IMAGENET_STATS.items():
+                        val_dataset.meta.stats[key][stats_type] = _torch.tensor(stats, dtype=_torch.float32)
+            # Replace dataset with train split for the rest of the pipeline
+            dataset = train_dataset
+            logging.info(
+                f"Offline eval enabled (no env). Split episodes -> train: {len(train_eps)}, val: {len(val_eps)}"
+            )
+        else:
+            val_dataset = None
+
     accelerator.wait_for_everyone()
 
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
+        offline_eval_enabled = (
+            cfg.eval_freq > 0 and cfg.env is None and not cfg.dataset.streaming and getattr(dataset, "num_episodes", 0) >= 2
+        )
+        if offline_eval_enabled:
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+            from lerobot.datasets.factory import resolve_delta_timestamps, ImageTransforms, IMAGENET_STATS
+
+            num_eps = int(dataset.num_episodes)
+            n_val = max(1, num_eps // 10)
+            val_eps = list(range(num_eps - n_val, num_eps))
+            train_eps = list(range(0, num_eps - n_val))
+            if len(train_eps) == 0:
+                train_eps = [0]
+                val_eps = [i for i in range(1, num_eps)]
+
+            img_tf = ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
+            delta_ts = resolve_delta_timestamps(cfg.policy, dataset.meta)
+            train_dataset = LeRobotDataset(
+                cfg.dataset.repo_id,
+                root=cfg.dataset.root,
+                episodes=train_eps,
+                image_transforms=img_tf,
+                delta_timestamps=delta_ts,
+                revision=cfg.dataset.revision,
+                video_backend=cfg.dataset.video_backend,
+            )
+            val_dataset = LeRobotDataset(
+                cfg.dataset.repo_id,
+                root=cfg.dataset.root,
+                episodes=val_eps,
+                image_transforms=img_tf,
+                delta_timestamps=delta_ts,
+                revision=cfg.dataset.revision,
+                video_backend=cfg.dataset.video_backend,
+            )
+            if cfg.dataset.use_imagenet_stats:
+                import torch as _torch
+                for key in train_dataset.meta.camera_keys:
+                    for stats_type, stats in IMAGENET_STATS.items():
+                        train_dataset.meta.stats[key][stats_type] = _torch.tensor(stats, dtype=_torch.float32)
+                for key in val_dataset.meta.camera_keys:
+                    for stats_type, stats in IMAGENET_STATS.items():
+                        val_dataset.meta.stats[key][stats_type] = _torch.tensor(stats, dtype=_torch.float32)
+            dataset = train_dataset
+        else:
+            val_dataset = None
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -292,11 +398,30 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
+    # Optional validation dataloader for offline eval (no env)
+    if cfg.env is None and val_dataset is not None:
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            num_workers=max(1, cfg.num_workers // 2),
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
+        )
+    else:
+        val_dataloader = None
+
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
-    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        policy, optimizer, dataloader, lr_scheduler
-    )
+    if val_dataloader is not None:
+        policy, optimizer, dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, dataloader, val_dataloader, lr_scheduler
+        )
+    else:
+        policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, dataloader, lr_scheduler
+        )
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -422,6 +547,42 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
+        elif (cfg.env is None) and (val_dataloader is not None) and is_eval_step:
+            # Offline eval on hold-out split: report avg loss and avg L1 over a handful of batches
+            if is_main_process:
+                step_id = get_step_identifier(step, cfg.steps)
+                logging.info(f"Offline eval (no env) at step {step} on hold-out episodes")
+            policy.eval()
+            n_batches = 0
+            total_loss = 0.0
+            total_l1 = 0.0
+            max_eval_batches = 20  # keep it light
+            with torch.no_grad(), accelerator.autocast():
+                for i, batch in enumerate(val_dataloader):
+                    if i >= max_eval_batches:
+                        break
+                    batch = preprocessor(batch)
+                    # Use policy.forward: in eval mode KL is disabled by design; report L1 as eval loss
+                    loss, output_dict = policy.forward(batch)
+                    total_loss += float(loss.item())
+                    total_l1 += float(output_dict.get("l1_loss", 0.0))
+                    n_batches += 1
+
+            if n_batches > 0 and is_main_process:
+                avg_loss = total_loss / n_batches
+                avg_l1 = total_l1 / n_batches
+                logging.info(f"Offline eval: avg_loss={avg_loss:.4f}, avg_l1={avg_l1:.4f} over {n_batches} batches")
+                if wandb_logger:
+                    wandb_logger.log_dict(
+                        {
+                            "offline_eval/avg_loss": avg_loss,
+                            "offline_eval/avg_l1": avg_l1,
+                            "offline_eval/n_batches": n_batches,
+                        },
+                        step,
+                        mode="eval",
+                    )
+            policy.train()
 
     if eval_env:
         close_envs(eval_env)
@@ -429,11 +590,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info("End of training")
 
-        if cfg.policy.push_to_hub:
-            unwrapped_policy = accelerator.unwrap_model(policy)
-            unwrapped_policy.push_model_to_hub(cfg)
-            preprocessor.push_to_hub(cfg.policy.repo_id)
-            postprocessor.push_to_hub(cfg.policy.repo_id)
+        # if cfg.policy.push_to_hub:
+        #     unwrapped_policy = accelerator.unwrap_model(policy)
+        #     unwrapped_policy.push_model_to_hub(cfg)
+        #     preprocessor.push_to_hub(cfg.policy.repo_id)
+        #     postprocessor.push_to_hub(cfg.policy.repo_id)
 
     # Properly clean up the distributed process group
     accelerator.wait_for_everyone()

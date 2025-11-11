@@ -1,0 +1,17 @@
+# task_list: ["1015_pick_and_place_fr3_3dmouse_250ep", "1016_pick_and_place_fr3_3dmouse_242ep"]
+# custom_prompt: ["pick up the cube and place it into the box"]
+
+task_name: "fr3_insert_pinboard"
+data_dir: "/data/fr3/1113_left_fr3_insert_pinboard_53ep"
+action_ori_type: "quaternion"
+action_prediction_step: 1
+contain_ft: false
+contain_depth: false
+repo_name: "1113_left_fr3_insert_pinboard_53ep_dee2dee"
+root_path: "/data/fr3_lerobot"
+fps: 30
+num_writer_thread: 8
+num_writer_process: 4
+skip_steps_nums: 2
+batch_encoding_size: 1
+video_backend: torchcodec
