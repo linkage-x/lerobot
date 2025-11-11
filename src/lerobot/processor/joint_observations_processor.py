@@ -24,7 +24,6 @@ from lerobot.processor.pipeline import (
     ObservationProcessorStep,
     ProcessorStepRegistry,
 )
-from lerobot.robots import Robot
 from lerobot.utils.constants import OBS_STATE
 
 
@@ -143,7 +142,9 @@ class MotorCurrentProcessorStep(ObservationProcessorStep):
                the hardware bus.
     """
 
-    robot: Robot | None = None
+    # NOTE: We avoid importing `lerobot.robots` to keep this module usable when
+    # robot support is not available in the current build. Use duck typing.
+    robot: Any | None = None
 
     def observation(self, observation: dict) -> dict:
         """

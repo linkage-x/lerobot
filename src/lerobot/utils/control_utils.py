@@ -33,7 +33,6 @@ from lerobot.datasets.utils import DEFAULT_FEATURES
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
-from lerobot.robots import Robot
 
 
 @cache

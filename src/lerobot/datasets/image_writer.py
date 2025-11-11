@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import multiprocessing
+import os
+import shutil
 import queue
 import threading
 from pathlib import Path
@@ -68,7 +70,7 @@ def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) 
     return PIL.Image.fromarray(image_array)
 
 
-def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1):
+def write_image(image: np.ndarray | PIL.Image.Image | str | Path, fpath: Path, compress_level: int = 1):
     """
     Saves a NumPy array or PIL Image to a file.
 
@@ -93,12 +95,28 @@ def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level
         fails for any reason.
     """
     try:
+        # Fast-path: if 'image' is a path, hardlink or copy the file without decoding/encoding
+        if isinstance(image, (str, Path)):
+            src = Path(image)
+            dst = Path(fpath)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                # Prefer hardlink for speed and disk efficiency (same filesystem)
+                if dst.exists():
+                    dst.unlink()
+                os.link(src, dst)
+            except OSError:
+                # Fallback to regular copy across filesystems
+                shutil.copy2(src, dst)
+            return
+
         if isinstance(image, np.ndarray):
             img = image_array_to_pil_image(image)
         elif isinstance(image, PIL.Image.Image):
             img = image
         else:
             raise TypeError(f"Unsupported image type: {type(image)}")
+        fpath.parent.mkdir(parents=True, exist_ok=True)
         img.save(fpath, compress_level=compress_level)
     except Exception as e:
         print(f"Error writing image {fpath}: {e}")

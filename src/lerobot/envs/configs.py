@@ -19,8 +19,8 @@ from typing import Any
 import draccus
 
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.robots import RobotConfig
-from lerobot.teleoperators.config import TeleoperatorConfig
+# from lerobot.robots import RobotConfig
+# from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGE, OBS_IMAGES, OBS_STATE
 
 
@@ -214,8 +214,8 @@ class HILSerlProcessorConfig:
 class HILSerlRobotEnvConfig(EnvConfig):
     """Configuration for the HILSerlRobotEnv environment."""
 
-    robot: RobotConfig | None = None
-    teleop: TeleoperatorConfig | None = None
+    # robot: RobotConfig | None = None
+    # teleop: TeleoperatorConfig | None = None
     processor: HILSerlProcessorConfig = field(default_factory=HILSerlProcessorConfig)
 
     name: str = "real_robot"

@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import os
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -141,6 +142,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         accelerator: Optional Accelerator instance. If None, one will be created automatically.
     """
     cfg.validate()
+
+    # Docker-friendly: avoid using POSIX shared memory in DataLoader workers
+    # This prevents "Unexpected bus error encountered in worker. This might be caused by insufficient shared memory (shm)"
+    try:
+        import torch.multiprocessing as mp  # lazy import
+
+        if os.environ.get("PYTORCH_SHARING_STRATEGY", "").lower() == "file_system" or os.path.exists("/.dockerenv"):
+            mp.set_sharing_strategy("file_system")
+    except Exception:
+        pass
 
     # Create Accelerator if not provided
     # It will automatically detect if running in distributed mode or single-process mode
@@ -429,11 +440,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info("End of training")
 
-        if cfg.policy.push_to_hub:
-            unwrapped_policy = accelerator.unwrap_model(policy)
-            unwrapped_policy.push_model_to_hub(cfg)
-            preprocessor.push_to_hub(cfg.policy.repo_id)
-            postprocessor.push_to_hub(cfg.policy.repo_id)
+        # if cfg.policy.push_to_hub:
+        #     unwrapped_policy = accelerator.unwrap_model(policy)
+        #     unwrapped_policy.push_model_to_hub(cfg)
+        #     preprocessor.push_to_hub(cfg.policy.repo_id)
+        #     postprocessor.push_to_hub(cfg.policy.repo_id)
 
     # Properly clean up the distributed process group
     accelerator.wait_for_everyone()
