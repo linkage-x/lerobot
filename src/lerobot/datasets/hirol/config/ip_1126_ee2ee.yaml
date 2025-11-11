@@ -1,0 +1,19 @@
+custom_prompt: ["pick the white pinboard, put into the red base"]
+# 支持单一路径或多路径；此处示例为单元素列表
+data_dir:
+  # - "/data/fr3/1113_left_fr3_insert_pinboard_53ep" #定点采集，轨迹一致
+  # - "/data/fr3/1114_left_fr3_insert_pinboard_Generalize_82ep" #局部随机摆放采集，轨迹较一致
+  - "/data/fr3/1119_left_fr3_insert_pinboard_generalize_216ep"
+  # - "/data/fr3/1121_left_fr3_insert_pinboard_generalize_20ep"
+  # - "/data/fr3/1122_left_fr3_insert_pinboard_generalized_133ep"
+action_ori_type: "quaternion"
+action_prediction_step: 1
+contain_ft: false
+contain_depth: false
+repo_name: "left_fr3_ip_216ep_ee2ee"
+root_path: "/data/fr3_lerobot"
+fps: 15
+num_writer_thread: 8
+num_writer_process: 4
+batch_encoding_size: 1
+video_backend: torchcodec

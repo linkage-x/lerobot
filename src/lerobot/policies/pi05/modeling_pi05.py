@@ -972,6 +972,17 @@ class PI05Policy(PreTrainedPolicy):
             # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
 
+            # Ensure weight tying between embed_tokens and lm_head if checkpoint is missing the former.
+            embed_key = "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+            lm_head_key = "paligemma_with_expert.paligemma.model.language_model.lm_head.weight"
+            if embed_key not in fixed_state_dict:
+                if lm_head_key in fixed_state_dict:
+                    fixed_state_dict[embed_key] = fixed_state_dict[lm_head_key]
+                elif hasattr(model, "model") and hasattr(model.model, "paligemma_with_expert"):
+                    fixed_state_dict[embed_key] = (
+                        model.model.paligemma_with_expert.paligemma.language_model.embed_tokens.weight.detach().clone()
+                    )
+
             # Then add "model." prefix for all keys that don't already have it
             remapped_state_dict = {}
             remap_count = 0
@@ -1014,6 +1025,12 @@ class PI05Policy(PreTrainedPolicy):
 
             if not missing_keys and not unexpected_keys:
                 print("All keys loaded successfully!")
+
+            # Explicitly tie embed_tokens and lm_head weights at runtime as well.
+            if hasattr(model, "model") and hasattr(model.model, "paligemma_with_expert"):
+                lm_module = model.model.paligemma_with_expert.paligemma.language_model
+                if hasattr(lm_module, "lm_head") and hasattr(lm_module, "embed_tokens"):
+                    lm_module.embed_tokens.weight = lm_module.lm_head.weight
 
         except Exception as e:
             print(f"Warning: Could not remap state dict keys: {e}")
@@ -1222,11 +1239,18 @@ class PI05Policy(PreTrainedPolicy):
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
+        # losses is per-dimension squared error: (u_t - v_t)^2.
+        # MSE-style training loss:
         loss = losses.mean()
+
+        # "True" L1 metric for logging/eval: mean absolute error on the same tensor.
+        # Since losses = (delta)^2, taking sqrt before averaging recovers |delta|.
+        l1_loss = torch.sqrt(losses).mean()
 
         loss_dict = {
             "loss": loss.item(),
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "l1_loss": l1_loss.item(),
         }
 
         return loss, loss_dict

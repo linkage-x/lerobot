@@ -85,10 +85,11 @@ class ActionQueue:
         Returns:
             int: Number of unconsumed actions.
         """
-        if self.queue is None:
-            return 0
-        length = len(self.queue)
-        return length - self.last_index
+        with self.lock:
+            if self.queue is None:
+                return 0
+            length = len(self.queue)
+            return length - self.last_index
 
     def empty(self) -> bool:
         """Check if the queue is empty.
@@ -96,11 +97,12 @@ class ActionQueue:
         Returns:
             bool: True if no actions remain, False otherwise.
         """
-        if self.queue is None:
-            return True
+        with self.lock:
+            if self.queue is None:
+                return True
 
-        length = len(self.queue)
-        return length - self.last_index <= 0
+            length = len(self.queue)
+            return length - self.last_index <= 0
 
     def get_action_index(self) -> int:
         """Get the current action consumption index.
@@ -108,7 +110,8 @@ class ActionQueue:
         Returns:
             int: Index of the next action to be consumed.
         """
-        return self.last_index
+        with self.lock:
+            return self.last_index
 
     def get_left_over(self) -> Tensor | None:
         """Get leftover original actions for RTC prev_chunk_left_over.
@@ -145,10 +148,14 @@ class ActionQueue:
             action_index_before_inference: Index before inference started, for validation.
         """
         with self.lock:
-            self._check_delays(real_delay, action_index_before_inference)
+            # Compute an effective delay based on actual queue consumption
+            # during this inference window. This keeps the queue aligned with
+            # how many actions were really executed, instead of relying solely
+            # on the latency-based estimate provided by the caller.
+            effective_delay = self._check_delays(real_delay, action_index_before_inference)
 
             if self.cfg.enabled:
-                self._replace_actions_queue(original_actions, processed_actions, real_delay)
+                self._replace_actions_queue(original_actions, processed_actions, effective_delay)
                 return
 
             self._append_actions_queue(original_actions, processed_actions)
@@ -196,24 +203,50 @@ class ActionQueue:
 
         self.last_index = 0
 
-    def _check_delays(self, real_delay: int, action_index_before_inference: int | None = None):
-        """Validate that computed delays match expectations.
+    def _check_delays(self, real_delay: int, action_index_before_inference: int | None = None) -> int:
+        """Validate and reconcile delay estimates.
 
-        Compares the delay computed from inference latency with the actual
-        number of actions consumed during inference.
+        Compares the delay computed from inference latency (``real_delay`` as
+        passed by the caller) with the actual number of actions consumed during
+        inference (derived from the action index difference), and returns the
+        effective delay to use for queue updates.
 
         Args:
-            real_delay: Delay computed from inference latency.
+            real_delay: Delay estimate based on inference latency.
             action_index_before_inference: Action index when inference started.
+
+        Returns:
+            int: Effective delay based on queue consumption (non-negative).
         """
         if action_index_before_inference is None:
-            return
+            # Fall back to caller-provided delay; clamp to non-negative.
+            effective_delay = max(int(real_delay), 0)
+            logger.info(
+                "[ACTION_QUEUE] No action_index_before_inference provided; "
+                "using real_delay as effective_delay=%d",
+                effective_delay,
+            )
+            return effective_delay
 
         indexes_diff = self.last_index - action_index_before_inference
+        effective_delay = max(int(indexes_diff), 0)
+
         if indexes_diff != real_delay:
-            # Let's check that action index difference (real delay calculated based on action queue)
-            # is the same as delay calculated based on inference latency
+            # Log the discrepancy for debugging, but always trust the index-based
+            # delay for queue slicing to stay aligned with executed actions.
             logger.warning(
-                f"[ACTION_QUEUE] Indexes diff is not equal to real delay. "
-                f"Indexes diff: {indexes_diff}, real delay: {real_delay}"
+                "[ACTION_QUEUE] Indexes diff != real_delay; "
+                "using indexes_diff as effective_delay. "
+                "indexes_diff=%d, real_delay=%d, effective_delay=%d",
+                indexes_diff,
+                real_delay,
+                effective_delay,
             )
+        else:
+            logger.info(
+                "[ACTION_QUEUE] Delay estimates match. indexes_diff=%d, real_delay=%d",
+                indexes_diff,
+                real_delay,
+            )
+
+        return effective_delay

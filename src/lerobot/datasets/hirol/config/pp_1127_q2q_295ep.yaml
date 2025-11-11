@@ -1,0 +1,16 @@
+custom_prompt: ["pick the kiwi, put into the red box"]
+# 支持单一路径或多路径；此处示例为单元素列表
+data_dir:
+  - "/data/fr3/1025_pick_and_place_fr3_295ep" #局部随机摆放采集，轨迹较一致
+
+# action_ori_type: "quaternion"
+action_prediction_step: 1
+contain_ft: false
+contain_depth: false
+repo_name: "left_fr3_pp_295ep_q2q"
+root_path: "/data/fr3_lerobot"
+fps: 15
+num_writer_thread: 8
+num_writer_process: 4
+batch_encoding_size: 1
+video_backend: torchcodec

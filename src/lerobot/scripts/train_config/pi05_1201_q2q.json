@@ -1,0 +1,51 @@
+{
+  "dataset": {
+    "repo_id": "left_fr3_pp_295ep_q2q",
+    "root": "/data/fr3_lerobot/left_fr3_pp_295ep_q2q",
+    "episodes": null,
+    "streaming": false,
+    "use_imagenet_stats": true,
+    "image_transforms": {
+      "enable": true
+    },
+    "video_backend": "torchcodec"
+  },
+  "policy": {
+    "type": "pi05",
+    "device": "cuda",
+    "push_to_hub": false,
+    "repo_id": null,
+    "pretrained_path": "/data/model/pi05_base",
+    "chunk_size": 50,
+    "n_action_steps": 50,
+    "use_amp": true,
+    "gradient_checkpointing": true,
+    "dtype": "bfloat16",
+    "optimizer_lr": 1e-5,
+    "optimizer_weight_decay": 0.02
+  },
+  "optimizer": {
+    "type": "adamw",
+    "lr": 2.5e-5,
+    "weight_decay": 0.01,
+    "betas": [0.9, 0.95],
+    "eps": 1e-8,
+    "grad_clip_norm": 1.0
+  },
+  "scheduler": null,
+  "batch_size": 8,
+  "num_workers": 12,
+  "steps": 8000,
+  "eval_freq": 500,
+  "log_freq": 500,
+  "save_checkpoint": true,
+  "save_freq": 4000,
+  "seed": 0,
+  "use_policy_training_preset": true,
+  "output_dir": "/data/ckpts/left_fr3_pp_295ep_q2q_pi05",
+  "wandb": {
+    "enable": true,
+    "disable_artifact": true
+  }
+}
+

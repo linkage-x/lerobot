@@ -1,0 +1,34 @@
+
+services:
+  hirol_lerobot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.prod
+    # Increase shared memory to avoid PyTorch/HF datasets workers bus errors
+    shm_size: '16g'
+    # Share host IPC namespace for larger /dev/shm (alternate to shm_size)
+    ipc: host
+    # Or explicitly mount a tmpfs for /dev/shm (uncomment if needed)
+    # tmpfs:
+    #   - /dev/shm:size=16g
+    volumes:
+      - ../:/workspace
+      - /boot/common_data/2025:/data
+    environment:
+      - http_proxy=
+      - https_proxy=
+      - all_proxy=
+      - SHELL=/bin/bash
+    privileged: true
+    user: user
+    # network_mode: host
+    stdin_open: true
+    tty: true
+    command: ["tail", "-f", "/dev/null"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, graphics, display, utility, video, compute]
