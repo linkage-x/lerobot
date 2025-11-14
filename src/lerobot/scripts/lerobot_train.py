@@ -21,7 +21,6 @@ from pprint import pformat
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
@@ -573,28 +572,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     if i >= max_eval_batches:
                         break
                     batch = preprocessor(batch)
-                    # Compute masked L1 directly to avoid relying on KL path in forward()
-                    try:
-                        actions_hat, _ = policy.model(batch)
-                        # Expected training keys
-                        gt = batch.get("action")
-                        pad_mask = batch.get("action_is_pad")
-                        if gt is not None:
-                            l1 = F.l1_loss(gt, actions_hat, reduction="none")
-                            if pad_mask is not None:
-                                l1 = l1 * (~pad_mask).unsqueeze(-1)
-                            l1 = l1.mean()
-                            total_l1 += float(l1.item())
-                            total_loss += float(l1.item())  # report same as loss for offline eval
-                        else:
-                            # fallback: cannot compute L1 without GT, count zero to avoid crash
-                            pass
-                        n_batches += 1
-                    except Exception as e:
-                        # Be robust during eval; skip problematic batch
-                        if is_main_process:
-                            logging.warning(f"Offline eval: skip batch {i} due to error: {e}")
-                        continue
+                    # Use policy.forward: in eval mode KL is disabled by design; report L1 as eval loss
+                    loss, output_dict = policy.forward(batch)
+                    total_loss += float(loss.item())
+                    total_l1 += float(output_dict.get("l1_loss", 0.0))
+                    n_batches += 1
 
             if n_batches > 0 and is_main_process:
                 avg_loss = total_loss / n_batches
