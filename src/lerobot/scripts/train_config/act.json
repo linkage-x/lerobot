@@ -46,7 +46,8 @@
   "use_policy_training_preset": true,
   "output_dir": "1113_ip_53ep_02",
   "wandb": {
-    "enable": true
+    "enable": true,
+    "disable_artifact": true
   }
 }
 
