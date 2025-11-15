@@ -2,7 +2,7 @@
 # custom_prompt: ["pick up the cube and place it into the box"]
 
 task_name: "fr3_insert_pinboard"
-data_dir: "/data/fr3/1113_left_fr3_insert_pinboard_53ep_mask2q"
+data_dir: "/data/fr3/1113_left_fr3_insert_pinboard_53ep"
 action_ori_type: "quaternion"
 action_prediction_step: 1
 contain_ft: false
