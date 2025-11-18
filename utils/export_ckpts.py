@@ -10,7 +10,8 @@ Parameters:
   --snapshot     Checkpoint snapshot under 'checkpoints' (e.g. 'last', '000100'). Default: last
 
 Output:
-  Creates a temporary directory under /tmp and writes <repo_name>.zip inside it.
+  Creates a temporary directory under /tmp and writes <run_name>.zip inside it,
+  where <run_name> is derived from the training config's output_dir.name.
   The zip root contains:
     - meta/ (dataset meta folder)
     - all files and subfolders from pretrained_model/
@@ -137,9 +138,12 @@ def main() -> None:
     output_dir = _load_train_output_dir(train_cfg_path)
     pm_dir = _resolve_pretrained_model_dir(output_dir, args.snapshot)
 
+    # Use output_dir.name as the exported run/model name
+    run_name = output_dir.name
+
     # Prepare staging directory in /tmp
     tmp_root = Path(tempfile.mkdtemp(prefix="lerobot_export_", dir="/tmp"))
-    staging_dir = tmp_root / repo_name
+    staging_dir = tmp_root / run_name
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy dataset meta as folder
@@ -148,8 +152,8 @@ def main() -> None:
     # Copy pretrained_model contents into staging root
     _copy_pretrained_contents(pm_dir, staging_dir)
 
-    # Create repo_name.zip inside the temp root
-    zip_base = tmp_root / repo_name
+    # Create run_name.zip inside the temp root
+    zip_base = tmp_root / run_name
     archive_path = shutil.make_archive(str(zip_base), "zip", root_dir=staging_dir)
 
     print(f"Created zip: {archive_path}")
@@ -158,4 +162,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -33,7 +33,7 @@ TRAIN_CFG=""
 GPU_IDS="0"
 GPU_COUNT=1
 ASSUME_YES=0
-DEST_DIR=""
+DEST_DIR="/data/ckpts"
 
 while getopts ":d:t:g:n:o:yh" opt; do
   case "$opt" in

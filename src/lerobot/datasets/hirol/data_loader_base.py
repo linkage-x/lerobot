@@ -27,7 +27,8 @@ class DataLoaderBase(abc.ABC, metaclass=abc.ABCMeta):
                                                   action_prediction_step=self._action_prediction_step,
                                                   action_ori_type=self._action_ori_type,
                                                   observation_type=self._obs_type,
-                                                  rotation_transform=self._rotation_transform)
+                                                  rotation_transform=self._rotation_transform,
+                                                  contain_ft=self._contain_ft)
         if 'episode' in episode_dir:
             episode_number = int(episode_dir.lstrip("episode_"))
             episode_id = episode_number
