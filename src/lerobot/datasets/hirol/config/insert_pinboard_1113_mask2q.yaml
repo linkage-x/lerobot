@@ -1,5 +1,4 @@
-# task_list: ["1015_pick_and_place_fr3_3dmouse_250ep", "1016_pick_and_place_fr3_3dmouse_242ep"]
-# custom_prompt: ["pick up the cube and place it into the box"]
+custom_prompt: ["pick up the white pinboard and place it into the red base"]
 
 data_dir: "/data/fr3/1113_left_fr3_insert_pinboard_53ep"
 action_ori_type: "quaternion"

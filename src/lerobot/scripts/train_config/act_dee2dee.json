@@ -19,7 +19,10 @@
     "n_action_steps": 100,
     "use_amp": true,
     "repo_id": null,
-    "pretrained_path": null
+    "pretrained_path": null,
+    "optimizer_lr": 5e-5,
+    "optimizer_lr_backbone": 5e-5,
+    "optimizer_weight_decay": 1e-4
   },
   "optimizer": {
     "type": "adamw",
