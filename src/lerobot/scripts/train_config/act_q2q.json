@@ -6,7 +6,7 @@
     "streaming": false,
     "use_imagenet_stats": true,
     "image_transforms": {
-      "enable": false
+      "enable": true
     },
     "video_backend": "torchcodec"
   },
@@ -17,8 +17,8 @@
     "chunk_size": 100,
     "n_action_steps": 100,
     "use_amp": true,
-    "repo_id": "fr3_insert_pinboard",
-    "pretrained_path": "/data/ckpts/1113_ip_53ep_03/checkpoints/last/pretrained_model",
+    "repo_id": null,
+    "pretrained_path": null,
     "optimizer_lr": 1e-5,
     "optimizer_lr_backbone": 1e-5,
     "optimizer_weight_decay": 1e-4
