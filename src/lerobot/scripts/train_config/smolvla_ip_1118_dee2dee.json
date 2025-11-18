@@ -18,7 +18,7 @@
         "repo_id": null,
         "pretrained_path": null,
         "use_amp": true,
-        "vlm_model_name": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+        "vlm_model_name": "/data/model/SmolVLM2-500M-Video-Instruct",
         "load_vlm_weights": true,
         "chunk_size": 50,
         "n_action_steps": 50,
@@ -43,7 +43,7 @@
     "use_policy_training_preset": true,
     "output_dir": "/data/ckpts/1113_14_ip_135ep_dee2dee_smolvla",
     "wandb": {
-        "enable": false,
+        "enable": true,
         "disable_artifact": true
     },
     "rename_map": {
