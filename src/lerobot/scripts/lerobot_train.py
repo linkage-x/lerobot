@@ -20,6 +20,10 @@ from contextlib import nullcontext
 from pprint import pformat
 from typing import Any
 
+# Silence HuggingFace tokenizers fork/parallelism warnings and avoid potential deadlocks.
+# If the user has already set TOKENIZERS_PARALLELISM explicitly, we respect their choice.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import torch
 from accelerate import Accelerator
 from termcolor import colored
