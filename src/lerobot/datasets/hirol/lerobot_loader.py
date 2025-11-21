@@ -83,6 +83,36 @@ class LerobotLoader(DataLoaderBase):
         - States/actions dtype unified to float32 for smaller, consistent storage.
         - Frame sampling is based on timestamps from the episode metadata instead of a fixed step skip.
         """
+        # Target save path for the converted LeRobot dataset
+        save_path = os.path.join(self._output_root_path, self._repo_name)
+
+        # If a dataset already exists at save_path, do not re-convert.
+        if os.path.exists(save_path):
+            log.info(f"Found existing LeRobotDataset at {save_path}, skip raw conversion.")
+            try:
+                reader_ds = LeRobotDataset(repo_id=self._repo_name, root=save_path)
+                # 尽量打印一些有用的统计信息，同时兼容不同版本的 LeRobotDataset
+                num_episodes = getattr(reader_ds, "total_episodes", None)
+                num_frames = getattr(reader_ds, "total_frames", None)
+                fps = getattr(reader_ds, "fps", None)
+                if num_episodes is not None or num_frames is not None or fps is not None:
+                    log.info(
+                        "Existing dataset summary: "
+                        f"total_episodes={num_episodes}, "
+                        f"total_frames={num_frames}, "
+                        f"fps={fps}"
+                    )
+                features = getattr(reader_ds, "features", None)
+                if features is not None:
+                    log.info(f"Features: {features}")
+            except Exception as e:
+                log.error(
+                    f"Failed to load existing LeRobotDataset at {save_path}. "
+                    f"Please verify or remove the directory. Error: {e}"
+                )
+                raise
+            return reader_ds
+
         # Load a reference episode without subsampling to infer feature dims and timestamp keys.
         # Use the first task_dir as template when multiple dirs are provided.
         first_task_dir = self._task_dirs[0]
