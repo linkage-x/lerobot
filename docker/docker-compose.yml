@@ -18,6 +18,7 @@ services:
       - http_proxy=
       - https_proxy=
       - all_proxy=
+      - SHELL=/bin/bash
     privileged: true
     user: user
     # network_mode: host

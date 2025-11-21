@@ -21,16 +21,23 @@ class ActionType(enum.Enum):
     DeltaJointPosition = "dq"
     EEPose = "ee"
     DeltaEEPose = "dee"
-    # TODO @hph
-    # COMMAND_JOINT_POSITION = "cmdq"
-    # COMMAND_END_EFFECTOR_POSE = "cmdee"
+    CommandJointPosition = "cq"
+    CommandDeltaJointPosition = "cdq"
+    CommandEEPose = "cee"
+    CommandDeltaEEPose = "cdee"
 
 class RerunEpisodeReader:
-    def __init__(self, task_dir = ".", json_file="data.json", 
-                 action_type: ActionType = ActionType.JointPosition,
-                 action_prediction_step = 2, action_ori_type = "euler", 
-                 observation_type = ObservationType.JointPosition,
-                 rotation_transform = None):
+    def __init__(
+        self,
+        task_dir=".",
+        json_file="data.json",
+        action_type: ActionType = ActionType.JointPosition,
+        action_prediction_step=2,
+        action_ori_type="euler",
+        observation_type: ObservationType = ObservationType.JointPosition,
+        rotation_transform=None,
+        contain_ft: bool = False,
+    ):
         self.task_dir = task_dir
         self.json_file = json_file
         self.action_type = action_type
@@ -39,6 +46,8 @@ class RerunEpisodeReader:
         self._action_ori_type = action_ori_type
         # None or dict[str, np.ndarray]
         self._rotation_transform = rotation_transform
+        # Whether force/torque readings are present in ee_states and should be used
+        self._contain_ft = contain_ft
 
     def return_episode_data(self, episode_idx, skip_steps_nums=1):
         # Load episode data on-demand
@@ -81,6 +90,37 @@ class RerunEpisodeReader:
             audios = self._process_audio(item_data, 'audios', episode_dir)
             
             # Append the observation state data in the item_data list
+            joint_states = item_data.get("joint_states", {})
+            joint_check = [ObservationType.JointPosition, ObservationType.JP_EEPose]
+            if self._obs_type in joint_check:
+                if joint_states is None or len(joint_states) == 0:
+                    raise ValueError(f'Do not get the {i}th joint state from {self.task_dir} {episode_dir} for {self._obs_type}')
+            ee_states = item_data.get('ee_states', {})
+            if len(init_ee_poses) != len(ee_states):
+                for key, cur_ee_state in ee_states.items():
+                    if self._rotation_transform:
+                        pose = cur_ee_state["pose"]
+                        init_ee_poses[key] = self.apply_rotation_offset(pose, key)      
+                        log.info(f'Successfully updated the init ee pose for relative pose calculation {list(init_ee_poses.keys())}')
+                    else: init_ee_poses[key] = None
+            # @TODO: used for latter head tracker
+            head_pose = ee_states.pop('head', None)
+            ee_check = [ObservationType.JP_EEPose, ObservationType.EEPose,
+                        ObservationType.DeltaEEPose] 
+            if self._obs_type in ee_check:
+                if ee_states is None or len(ee_states) == 0:
+                    raise ValueError(f'Do not get the {i}th ee state pose from {self.task_dir} {episode_dir} for {self._obs_type}')
+
+            # Validate FT signals if requested
+            if self._obs_type == ObservationType.FT or self._contain_ft:
+                for key, state in ee_states.items():
+                    if "ft" not in state:
+                        raise ValueError(
+                            f"ee state '{key}' does not contain 'ft' field "
+                            f"while obs_type={self._obs_type} and contain_ft={self._contain_ft}"
+                        )
+
+            # Append the observation state data in the item_data list
             cur_obs = {}
             joint_states = item_data.get("joint_states", {})
             if self._obs_type in (ObservationType.JointPosition, ObservationType.JP_EEPose):
@@ -91,7 +131,7 @@ class RerunEpisodeReader:
                 for key, cur_ee_state in ee_states.items():
                     if self._rotation_transform:
                         pose = cur_ee_state["pose"]
-                        init_ee_poses[key] = self.apply_rotation_offset(pose, key)      
+                        init_ee_poses[key] = self.apply_rotation_offset(pose, key)
                         log.info(f'Successfully updated the init ee pose for relative pose calculation {list(init_ee_poses.keys())}')
                     else: init_ee_poses[key] = None
             # @TODO: used for latter head tracker
@@ -125,6 +165,29 @@ class RerunEpisodeReader:
             elif self._obs_type == ObservationType.Mask:
                 for key in ee_states.keys():
                     cur_obs[key] = np.zeros(7)
+            elif self._obs_type == ObservationType.FT:
+                # Pure FT observation: use force/torque vector per ee
+                for key, state in ee_states.items():
+                    ft_vals = state.get("ft", None)
+                    if ft_vals is None:
+                        raise ValueError(
+                            f"ee state '{key}' missing 'ft' data for ObservationType.FT"
+                        )
+                    cur_obs[key] = np.asarray(ft_vals, dtype=np.float32)
+
+            # Optionally append FT to existing observations when contain_ft is enabled
+            if self._contain_ft and self._obs_type != ObservationType.FT:
+                for key, state in ee_states.items():
+                    ft_vals = state.get("ft", None)
+                    if ft_vals is None:
+                        raise ValueError(
+                            f"ee state '{key}' missing 'ft' data while contain_ft=True"
+                        )
+                    ft_arr = np.asarray(ft_vals, dtype=np.float32)
+                    if key in cur_obs:
+                        cur_obs[key] = np.hstack((cur_obs[key], ft_arr))
+                    else:
+                        cur_obs[key] = ft_arr
             
             # Append the action data in the item_data list
             cur_actions = {}
