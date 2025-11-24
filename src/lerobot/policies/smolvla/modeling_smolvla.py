@@ -519,6 +519,12 @@ class VLAFlowMatching(nn.Module):
 
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
+            # NOTE:
+            #   We explicitly pass a concrete device (e.g. "cuda" or "cpu") instead of relying
+            #   on the SmolVLMWithExpertModel default ("auto"), because `device_map="auto"`
+            #   in `from_pretrained` can create DTensor parameters which are incompatible
+            #   with Accelerate's DDP prepare_model step.
+            device=self.config.device,
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             load_vlm_weights=self.config.load_vlm_weights,

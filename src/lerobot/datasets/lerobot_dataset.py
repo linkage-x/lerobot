@@ -728,6 +728,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
             check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
+        # When a subset of episodes is requested, the HF dataset contains only those
+        # episodes while the metadata `dataset_from_index` / `dataset_to_index` still
+        # refer to the global index space. We maintain a local mapping so helpers
+        # relying on episode ranges (e.g. `_get_query_indices`) can operate in the
+        # correct index space of the loaded `hf_dataset`.
+        self._local_episode_to_range: dict[int, tuple[int, int]] | None = None
+        if self.episodes is not None and self.hf_dataset is not None:
+            self._build_local_episode_index_map()
+
     def _close_writer(self) -> None:
         """Close and cleanup the parquet writer if it exists."""
         writer = getattr(self, "writer", None)
@@ -917,10 +926,48 @@ class LeRobotDataset(torch.utils.data.Dataset):
         else:
             return get_hf_features_from_features(self.features)
 
+    def _build_local_episode_index_map(self) -> None:
+        """
+        Build a mapping from episode_index -> (start_idx, end_idx) in the currently
+        loaded `hf_dataset` index space.
+
+        This is needed when `self.episodes` is not None, because the HF dataset then
+        contains only a subset of episodes, but the metadata `dataset_from_index` and
+        `dataset_to_index` still refer to the global index space of the full dataset.
+        """
+        # Extract episode_index column as a plain list of ints for efficient scanning.
+        ep_col = self.hf_dataset["episode_index"]
+        # `ep_col` entries may be scalars or 0-d tensors; normalize to int.
+        def _to_int(x):
+            if isinstance(x, torch.Tensor):
+                return int(x.item())
+            return int(x)
+
+        self._local_episode_to_range = {}
+        if len(ep_col) == 0:
+            return
+
+        current_ep = _to_int(ep_col[0])
+        start_idx = 0
+        for idx in range(1, len(ep_col)):
+            ep_idx = _to_int(ep_col[idx])
+            if ep_idx != current_ep:
+                # Close range for previous episode: [start_idx, idx)
+                self._local_episode_to_range[current_ep] = (start_idx, idx)
+                current_ep = ep_idx
+                start_idx = idx
+        # Close last episode range
+        self._local_episode_to_range[current_ep] = (start_idx, len(ep_col))
+
     def _get_query_indices(self, idx: int, ep_idx: int) -> tuple[dict[str, list[int | bool]]]:
-        ep = self.meta.episodes[ep_idx]
-        ep_start = ep["dataset_from_index"]
-        ep_end = ep["dataset_to_index"]
+        # For full datasets, metadata indices already align with the HF dataset.
+        # For episode subsets, we remap to local ranges built from `episode_index`.
+        if self.episodes is not None and self._local_episode_to_range is not None:
+            ep_start, ep_end = self._local_episode_to_range[ep_idx]
+        else:
+            ep = self.meta.episodes[ep_idx]
+            ep_start = ep["dataset_from_index"]
+            ep_end = ep["dataset_to_index"]
         query_indices = {
             key: [max(ep_start, min(ep_end - 1, idx + delta)) for delta in delta_idx]
             for key, delta_idx in self.delta_indices.items()
@@ -1000,6 +1047,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 self._writer_closed_for_reading = True
             self.hf_dataset = self.load_hf_dataset()
             self._lazy_loading = False
+
+            # Rebuild local episode index mapping if working on a subset of episodes.
+            if self.episodes is not None and self.hf_dataset is not None:
+                self._build_local_episode_index_map()
 
     def __len__(self):
         return self.num_frames
