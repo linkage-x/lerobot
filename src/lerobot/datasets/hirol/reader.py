@@ -362,6 +362,8 @@ class RerunEpisodeReader:
                 else:
                     cur_actions[key] = np.atleast_1d(np.asarray(tool_pos, dtype=np.float32))
 
+            for key, tool_state in tool_states.items():
+                tool_pos = tool_state["position"]
                 # Append tool position (or mask) to observations.
                 if self._obs_type == ObservationType.Mask:
                     if key in cur_obs:
