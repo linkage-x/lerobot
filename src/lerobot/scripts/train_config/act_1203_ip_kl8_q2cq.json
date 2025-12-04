@@ -1,0 +1,50 @@
+{
+  "dataset": {
+    "repo_id": "left_fr3_ip_338ep_q2cq",
+    "root": "/data/fr3_lerobot/left_fr3_ip_338ep_q2cq",
+    "episodes": null,
+    "streaming": false,
+    "use_imagenet_stats": true,
+    "image_transforms": {
+      "enable": true
+    },
+    "video_backend": "torchcodec"
+  },
+  "policy": {
+    "type": "act",
+    "device": "cuda",
+    "push_to_hub": false,
+    "chunk_size": 100,
+    "n_action_steps": 100,
+    "use_amp": true,
+    "repo_id": null,
+    "pretrained_path": null,
+    "optimizer_lr": 5e-5,
+    "dropout": 0.2,
+    "kl_weight": 8.0
+  },
+  "optimizer": {
+    "type": "adamw",
+    "lr": 1e-5,
+    "weight_decay": 1e-4,
+    "betas": [0.9, 0.999],
+    "eps": 1e-8,
+    "grad_clip_norm": 10.0
+  },
+  "scheduler": null,
+  "batch_size": 64,
+  "num_workers": 12,
+  "steps": 80000,
+  "eval_freq": 2000,
+  "log_freq": 2000,
+  "save_checkpoint": true,
+  "save_freq": 2000,
+  "seed": 42,
+  "use_policy_training_preset": true,
+  "output_dir": "/data/ckpts/1203_ip_q2cq_338ep_act_kl8",
+  "wandb": {
+    "enable": true,
+    "disable_artifact": true
+  }
+}
+
