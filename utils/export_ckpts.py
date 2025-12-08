@@ -59,9 +59,16 @@ def _resolve_dataset_meta_dir(data_cfg_path: Path) -> tuple[Path, str]:
 
 
 def _load_train_output_dir(train_cfg_path: Path) -> Path:
-    """Parse training json for output_dir and resolve a real path."""
+    """Parse training config (JSON or YAML) for output_dir and resolve a real path."""
     with open(train_cfg_path, "r", encoding="utf-8") as f:
-        tc = json.load(f)
+        raw_text = f.read()
+
+    # Try JSON first (backward compatible), then fall back to YAML so that
+    # we can support both LeRobot JSON configs and VLASH/LeRobot YAML configs.
+    try:
+        tc = json.loads(raw_text)
+    except json.JSONDecodeError:
+        tc = yaml.safe_load(raw_text)
 
     if "output_dir" not in tc:
         raise KeyError(f"'output_dir' missing in training config: {train_cfg_path}")
@@ -114,7 +121,7 @@ def main() -> None:
         "--train_cfg",
         type=str,
         default="src/lerobot/scripts/train_config/act.json",
-        help="Training JSON path",
+        help="Training config path (JSON or YAML)",
     )
     parser.add_argument(
         "--snapshot",
