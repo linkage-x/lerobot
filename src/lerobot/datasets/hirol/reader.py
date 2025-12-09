@@ -149,7 +149,8 @@ class RerunEpisodeReader:
                         cur_obs[key] = np.hstack((cur_obs[key], ee_pose))
             elif self._obs_type in (ObservationType.EEPose, ObservationType.DeltaEEPose):
                 last_id = i - 1
-                if last_id >= len_json_file: continue
+                if last_id < 0: continue
+                
                 last_ee_states = json_data[last_id].get("ee_states", {})
                 for key in ee_states.keys():
                     ee_pose = self.apply_rotation_offset(ee_states[key]["pose"], key,
