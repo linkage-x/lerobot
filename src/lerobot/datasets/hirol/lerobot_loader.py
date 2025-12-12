@@ -160,12 +160,17 @@ class LerobotLoader(DataLoaderBase):
         self._lerobot_dataset.meta.metadata_buffer_size = 1
         log.info('Set metadata_buffer_size=1 for immediate meta flush per episode')
         
+        # Stats for dimension mismatches and skipped episodes
         state_dismatch_list = []; action_dismatch_list = []
-        state_step_list = []; action_step_list = []; 
+        state_step_list = []; action_step_list = []
+        skipped_empty_episodes = []
+        total_raw_episodes = 0
+        total_saved_episodes = 0
         # 支持单一或多个 task 目录
         for task_dir in self._task_dirs:
             dirs = sorted(os.listdir(task_dir))
             for cur_episode_dir in tqdm(dirs, desc=f"processing episodes in {task_dir}", unit="episode"):
+                total_raw_episodes += 1
                 episode_data, text_info = self.load_episode(task_dir, cur_episode_dir, skip_nums_steps)
                 if episode_data is None:
                     continue
@@ -188,7 +193,8 @@ class LerobotLoader(DataLoaderBase):
                 # Target interval in seconds between two kept frames
                 target_dt = 1.0 / max(float(self._load_fps), 1e-6)
                 last_kept_ts = None
-                state_wrong_nums = 0; action_wrong_nums = 0 
+                state_wrong_nums = 0; action_wrong_nums = 0
+                num_valid_frames = 0
                 for num_step, step in tqdm(enumerate(episode_data), desc=f"processing steps", unit="step"):
                     # Subsample by timestamps: keep first step or if elapsed >= target_dt
                     ts_dict = step.get("colors_time_stamp", {}) if prefer_colors_ts else step.get("depths_time_stamp", {})
@@ -242,13 +248,31 @@ class LerobotLoader(DataLoaderBase):
                     frame_feature["task"] = text
                     
                     self._lerobot_dataset.add_frame(frame=frame_feature)
+                    num_valid_frames += 1
                     if ts is not None:
                         last_kept_ts = ts
                 if state_wrong_nums != 0:
                     state_step_list.append(state_wrong_nums)
                 if action_wrong_nums != 0:
                     action_step_list.append(action_wrong_nums)
+
+                # If this episode ended up with no valid frames, treat it as invalid data and skip it
+                if num_valid_frames == 0:
+                    log.warning(
+                        f"Skip episode {task_dir}/{cur_episode_dir} because no valid frames were added "
+                        f"(state_wrong_steps={state_wrong_nums}, action_wrong_steps={action_wrong_nums})."
+                    )
+                    skipped_empty_episodes.append(f"{task_dir}/{cur_episode_dir}")
+                    # Clear current episode buffer and delete temporary images to avoid affecting later episodes
+                    if getattr(self._lerobot_dataset, 'episode_buffer', None) is not None:
+                        self._lerobot_dataset.clear_episode_buffer(
+                            delete_images=len(self._lerobot_dataset.meta.image_keys) > 0
+                        )
+                    del episode_data
+                    continue
+
                 self._lerobot_dataset.save_episode()
+                total_saved_episodes += 1
                 del episode_data
                 
                 log.info(f'Successfully processed {task_dir}/{cur_episode_dir} and saved to {save_path}')
@@ -259,6 +283,18 @@ class LerobotLoader(DataLoaderBase):
         log.info(f'{len(self._lack_data_json_list)} lacks the data.json files: {self._lack_data_json_list}')
         log.info(f'state: {state_dismatch_list}, len: {state_step_list}')
         log.info(f'action: {action_dismatch_list}, len: {action_step_list}')
+        log.info(
+            f'Finished HIROL to LeRobot conversion: raw_episodes={total_raw_episodes}, '
+            f'saved_episodes={total_saved_episodes}, skipped_empty_episodes={len(skipped_empty_episodes)}'
+        )
+        if skipped_empty_episodes:
+            # Print a subset of skipped episodes to avoid overly long logs
+            max_show = 10
+            show_eps = skipped_empty_episodes[:max_show]
+            log.info(
+                f'Skipped empty episodes (showing at most {max_show}): '
+                f'{show_eps}{" ..." if len(skipped_empty_episodes) > max_show else ""}'
+            )
         
         self._lerobot_dataset.finalize()
         return self._lerobot_dataset

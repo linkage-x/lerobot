@@ -14,6 +14,7 @@ services:
     volumes:
       - ../:/workspace
       - /boot/common_data/2025:/data
+      - ../vlash:/vlash
     environment:
       - http_proxy=
       - https_proxy=
@@ -30,5 +31,5 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu, graphics, display, utility, video, compute]
