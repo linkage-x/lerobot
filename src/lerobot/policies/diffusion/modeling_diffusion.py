@@ -41,7 +41,7 @@ from lerobot.policies.utils import (
     get_output_shape,
     populate_queues,
 )
-from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGE, OBS_IMAGES, OBS_STATE
 
 
 class DiffusionPolicy(PreTrainedPolicy):
@@ -145,6 +145,48 @@ class DiffusionPolicy(PreTrainedPolicy):
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
         return loss, None
+
+    # --- OT integration helper -------------------------------------------------
+    def encode_feature_for_ot(self, key: str, x: Tensor) -> Tensor | None:
+        """
+        Provide policy-native embeddings for OT loss.
+
+        Semantics aligned with robomimic's diffusion_policy_ot:
+          - For state / env_state, return identity (they are used directly).
+          - For image keys, use the diffusion.rgb_encoder to obtain a 1D feature.
+            If separate encoders per camera are used, select the encoder by the
+            camera key index in `config.image_features`.
+        Expected input shapes:
+          - state/env_state: (B, D)
+          - image: (B, C, H, W)
+        Returns:
+          - (B, D_embed) or None if key not supported.
+        """
+        # State-like features: use identity.
+        if key == OBS_STATE or key == OBS_ENV_STATE:
+            return x
+
+        # Image features: route through the appropriate rgb encoder.
+        # Accept both plural 'observation.images.*' (internal stacked key)
+        # and singular dataset-style 'observation.image*' keys.
+        if isinstance(key, str) and (key.startswith(OBS_IMAGES) or key.startswith(OBS_IMAGE)):
+            rgb_enc = getattr(self.diffusion, "rgb_encoder", None)
+            if rgb_enc is None:
+                return None
+
+            # Separate encoders per camera: choose by key index.
+            if isinstance(rgb_enc, nn.ModuleList) and self.config.use_separate_rgb_encoder_per_camera:
+                try:
+                    cam_idx = list(self.config.image_features).index(key)
+                except ValueError:
+                    cam_idx = 0  # fallback to the first encoder if key is unexpected
+                return rgb_enc[cam_idx](x)
+
+            # Shared encoder for all cameras
+            if isinstance(rgb_enc, nn.Module):
+                return rgb_enc(x)
+
+        return None
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:

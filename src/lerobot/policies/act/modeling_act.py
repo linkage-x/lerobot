@@ -61,6 +61,8 @@ class ACTPolicy(PreTrainedPolicy):
         self.config = config
 
         self.model = ACT(config)
+        # OT embedding heads are no longer used. OT will consume the policy's
+        # own observation encoders via encode_feature_for_ot.
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
@@ -144,7 +146,8 @@ class ACTPolicy(PreTrainedPolicy):
             F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
         ).mean()
 
-        loss_dict = {"l1_loss": l1_loss.item()}
+        loss_dict: dict[str, float] = {"l1_loss": float(l1_loss.item())}
+
         # Compute KL only when VAE is enabled AND latent params are available (training mode)
         if self.config.use_vae and mu_hat is not None and log_sigma_x2_hat is not None and self.training:
             # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
@@ -154,13 +157,44 @@ class ACTPolicy(PreTrainedPolicy):
             mean_kld = (
                 (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
             )
-            loss_dict["kld_loss"] = mean_kld.item()
+            loss_dict["kld_loss"] = float(mean_kld.item())
             loss = l1_loss + mean_kld * self.config.kl_weight
         else:
             loss = l1_loss
 
         return loss, loss_dict
 
+    # --- OT integration helpers -------------------------------------------------
+    def encode_feature_for_ot(self, key: str, x: Tensor) -> Tensor | None:
+        """
+        Return a policy-native embedding for the given observation key when
+        computing OT costs.
+
+        For ACT, we use the same input projections as the transformer encoder
+        for state and environment features so OT aligns in the policy's latent
+        space rather than a separate OTEmbeddingHead.
+        """
+        try:
+            if key == OBS_STATE and hasattr(self.model, "encoder_robot_state_input_proj"):
+                return self.model.encoder_robot_state_input_proj(x)
+            if key == OBS_ENV_STATE and hasattr(self.model, "encoder_env_state_input_proj"):
+                return self.model.encoder_env_state_input_proj(x)
+            # Image features: run ACT backbone and a 1x1 conv projection, then
+            # global average pool to obtain a (B, D) embedding. This mirrors
+            # the image path used to produce encoder tokens, but aggregates
+            # spatially instead of flattening into a sequence.
+            if isinstance(key, str) and (key.startswith("observation.images") or key.startswith("observation.image")):
+                if not hasattr(self.model, "backbone") or not hasattr(self.model, "encoder_img_feat_input_proj"):
+                    return None
+                # Expect x shape (B, C, H, W). Compute feature map and project to dim_model.
+                feat_map = self.model.backbone(x)["feature_map"]  # (B, C', H', W')
+                feat_map = self.model.encoder_img_feat_input_proj(feat_map)  # (B, D, H', W')
+                # Global average pooling to (B, D)
+                embed = torch.mean(feat_map, dim=(2, 3))
+                return embed
+        except Exception:
+            pass
+        return None
 
 class ACTTemporalEnsembler:
     def __init__(self, temporal_ensemble_coeff: float, chunk_size: int) -> None:

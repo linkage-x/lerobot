@@ -179,3 +179,9 @@ outputs/
 *.part
 
 transformers-fix-lerobot_openpi
+
+src/lerobot/datasets/fr3_lerobot
+
+src/lerobot/datasets/hirol/dtw
+
+ot-sim2real

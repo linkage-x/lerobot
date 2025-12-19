@@ -44,6 +44,8 @@ from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.policies.ot_train import make_ot_dataloader
+from lerobot.policies.ot_train.ot_loss import OTLossConfig, OTFeatureSpec, compute_ot_loss_for_policy
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
@@ -73,6 +75,10 @@ def update_policy(
     accelerator: Accelerator,
     lr_scheduler=None,
     lock=None,
+    ot_src_obs: dict[str, torch.Tensor] | None = None,
+    ot_tgt_obs: dict[str, torch.Tensor] | None = None,
+    ot_loss_cfg: OTLossConfig | None = None,
+    lambda_ot: float = 0.0,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -89,6 +95,9 @@ def update_policy(
         accelerator: The Accelerator instance for distributed training and mixed precision.
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
+        ot_src_obs / ot_tgt_obs: Optional raw observations for feature-based OT loss.
+        ot_loss_cfg: Optional OTLossConfig describing OT feature terms.
+        lambda_ot: Global weight for the OT loss term.
 
     Returns:
         A tuple containing:
@@ -100,8 +109,32 @@ def update_policy(
 
     # Let accelerator handle mixed precision
     with accelerator.autocast():
+        # Standard BC loss on the main batch
         loss, output_dict = policy.forward(batch)
-        # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+
+        # Optional: add OT loss when OT observations and a loss config are provided.
+        ot_info: dict[str, float] = {}
+
+        if lambda_ot != 0.0:
+            # Feature-based OT loss using raw src / tgt observations and an
+            # OTLossConfig. This implements the "canonical" OT described in
+            # OT_LOSS_DESIGN.md.
+            if ot_src_obs is not None and ot_tgt_obs is not None and ot_loss_cfg is not None:
+                ot_loss, ot_metrics = compute_ot_loss_for_policy(
+                    policy=policy,
+                    src_obs=ot_src_obs,
+                    tgt_obs=ot_tgt_obs,
+                    cfg=ot_loss_cfg,
+                )
+                loss = loss + float(lambda_ot) * ot_loss
+                ot_info["ot_loss"] = float(ot_loss.item())
+                for k, v in ot_metrics.items():
+                    # Avoid duplicating ot_loss as another key; keep only train/ot_loss
+                    if k == "ot_loss":
+                        continue
+                    if isinstance(v, (int, float)):
+                        # Log OT metrics with their native names (e.g. 'ot_pi_sum', 'ot_cost/…')
+                        ot_info[k] = float(v)
 
     # Use accelerator's backward method
     accelerator.backward(loss)
@@ -132,7 +165,97 @@ def update_policy(
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
+    # attach OT metrics if any
+    if ot_info and lambda_ot != 0.0:
+        if output_dict is None:
+            output_dict = {}
+        output_dict.update(ot_info)
     return train_metrics, output_dict
+
+
+def _build_ot_loss_config_from_object(loss_cfg: object | None) -> OTLossConfig | None:
+    """Convert a generic JSON/YAML-style object into an `OTLossConfig`.
+
+    This lets us keep `OTConfig.loss_config` typed as a plain object in the
+    config tree (to avoid import cycles) while still feeding a strongly-typed
+    `OTLossConfig` instance into the OT loss module at training time.
+    """
+    if loss_cfg is None:
+        return None
+
+    # Already a fully-formed config (e.g. set programmatically).
+    if isinstance(loss_cfg, OTLossConfig):
+        return loss_cfg
+
+    # JSON / dict-style representation coming from train_config.{json,yaml}.
+    if isinstance(loss_cfg, dict):
+        raw_features = loss_cfg.get("features", [])
+        reg = float(loss_cfg.get("reg", 0.01))
+        tau_src_val = loss_cfg.get("tau_src", None)
+        tau_tgt_val = loss_cfg.get("tau_tgt", None)
+        tau_src = float(tau_src_val) if tau_src_val is not None else None
+        tau_tgt = float(tau_tgt_val) if tau_tgt_val is not None else None
+        heuristic = bool(loss_cfg.get("heuristic", False))
+
+        features: list[OTFeatureSpec] = []
+        for feat_cfg in raw_features:
+            # Allow mixing dicts and already-constructed OTFeatureSpec instances.
+            if isinstance(feat_cfg, OTFeatureSpec):
+                features.append(feat_cfg)
+                continue
+            if not isinstance(feat_cfg, dict):
+                raise TypeError(
+                    f"Unsupported OT feature spec type {type(feat_cfg)}; expected dict or OTFeatureSpec."
+                )
+
+            # dim_slice is represented in JSON as [start, stop]; optionally also
+            # accept a mapping {"start": ..., "stop": ...} for flexibility.
+            dim_slice_cfg = feat_cfg.get("dim_slice", None)
+            dim_slice = None
+            if isinstance(dim_slice_cfg, (list, tuple)):
+                if len(dim_slice_cfg) != 2:
+                    raise ValueError(
+                        f"dim_slice list must have length 2 [start, stop], got {dim_slice_cfg!r}"
+                    )
+                start, stop = dim_slice_cfg
+                dim_slice = slice(start, stop)
+            elif isinstance(dim_slice_cfg, dict):
+                # e.g. {"start": 0, "stop": 8}
+                start = dim_slice_cfg.get("start", None)
+                stop = dim_slice_cfg.get("stop", None)
+                dim_slice = slice(start, stop)
+            elif dim_slice_cfg is None:
+                dim_slice = None
+            else:
+                raise TypeError(
+                    f"Unsupported dim_slice type {type(dim_slice_cfg)}; expected [start, stop], "
+                    f"{{'start': ..., 'stop': ...}}, or null."
+                )
+
+            features.append(
+                OTFeatureSpec(
+                    src_key=feat_cfg["src_key"],
+                    tgt_key=feat_cfg.get("tgt_key", feat_cfg["src_key"]),
+                    dim_slice=dim_slice,
+                    use_learned_embed=bool(feat_cfg.get("use_learned_embed", False)),
+                    embed_name=feat_cfg.get("embed_name"),
+                    weight_embed=float(feat_cfg.get("weight_embed", 1.0)),
+                    weight_label=float(feat_cfg.get("weight_label", 1.0)),
+                    term_name=feat_cfg.get("term_name"),
+                )
+            )
+
+        return OTLossConfig(
+            features=features,
+            reg=reg,
+            tau_src=tau_src,
+            tau_tgt=tau_tgt,
+            heuristic=heuristic,
+        )
+
+    raise TypeError(
+        f"Unsupported ot.loss_config type {type(loss_cfg)}; expected dict, OTLossConfig, or None."
+    )
 
 
 def build_train_val_episode_split(cfg: TrainPipelineConfig) -> tuple[list[int], list[int]]:
@@ -215,7 +338,8 @@ def offline_eval_split(
         with accelerator.autocast():
             loss, out = model.forward(batch)
         total_loss += float(loss.item())
-        total_l1 += float(out.get("l1_loss", 0.0))
+        # Some policies (e.g., diffusion) return None as output_dict
+        total_l1 += float(out.get("l1_loss", 0.0)) if isinstance(out, dict) else 0.0
         n += 1
 
     if was_training:
@@ -551,6 +675,49 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
+    # Optional: build OT dataloader and loss config if enabled
+    ot_dataloader = None
+    ot_loss_cfg: OTLossConfig | None = None
+    if cfg.ot.enable:
+        if cfg.ot.src_repo_id is None or cfg.ot.pair_info_path is None:
+            raise ValueError("OT enabled but src_repo_id or pair_info_path is None")
+        # Make the OT source dataset use the same image transforms and stats as the
+        # main (target) dataset to keep visual distributions consistent for OT
+        # embeddings. This mirrors make_dataset's behavior.
+        img_tf_src = (
+            ImageTransforms(cfg.dataset.image_transforms)
+            if cfg.dataset.image_transforms.enable
+            else None
+        )
+        ds_src = LeRobotDataset(
+            cfg.ot.src_repo_id,
+            root=cfg.ot.src_root if cfg.ot.src_root else cfg.dataset.root,
+            image_transforms=img_tf_src,
+            revision=cfg.dataset.revision,
+            video_backend=cfg.dataset.video_backend,
+        )
+        if cfg.dataset.use_imagenet_stats:
+            # Align source dataset camera stats to ImageNet like the main dataset
+            for key in ds_src.meta.camera_keys:
+                for stats_type, stats in IMAGENET_STATS.items():
+                    ds_src.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+        ot_batch_size = max(1, int(cfg.batch_size * cfg.ot.batch_ratio))
+        ot_dataloader = make_ot_dataloader(
+            ds_src=ds_src,
+            ds_tgt=dataset,
+            pair_info_path=cfg.ot.pair_info_path,
+            batch_size=ot_batch_size,
+            obs_keys=cfg.ot.obs_keys,
+            action_key="action",
+            base_index_src=cfg.ot.base_index_src,
+            base_index_tgt=cfg.ot.base_index_tgt,
+            window_size=cfg.ot.window_size if cfg.ot.window_size > 0 else None,
+            num_workers=cfg.num_workers,
+        )
+        # Convert any JSON/YAML-style OT loss config into a strongly-typed
+        # OTLossConfig instance understood by the OT loss utilities.
+        ot_loss_cfg = _build_ot_loss_config_from_object(cfg.ot.loss_config)
+
     # Optional validation dataloader for offline eval (no env)
     if cfg.env is None and val_dataset is not None:
         val_dataloader = torch.utils.data.DataLoader(
@@ -575,7 +742,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
             policy, optimizer, dataloader, lr_scheduler
         )
+    # Note: ot_dataloader stays on CPU workers (no .to(device)); yielded tensors are moved by preprocessor
     dl_iter = cycle(dataloader)
+    # Prepare OT iterator if enabled
+    if cfg.ot.enable and ot_dataloader is not None:
+        ot_iter = cycle(ot_dataloader)
+    else:
+        ot_iter = None
 
     policy.train()
 
@@ -603,9 +776,29 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
-        batch = next(dl_iter)
-        batch = preprocessor(batch)
+        raw_batch = next(dl_iter)
+        batch = preprocessor(raw_batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
+
+        # If OT is enabled, extract raw src / tgt observations for feature-based OT.
+        ot_src_obs: dict[str, torch.Tensor] | None = None
+        ot_tgt_obs: dict[str, torch.Tensor] | None = None
+        if cfg.ot.enable and ot_iter is not None:
+            try:
+                ot_pair = next(ot_iter)
+                # Ensure OT loss can reference 'action' as a feature (to align with
+                # ot-sim2real diffusion_policy_ot config where label='action'). We
+                # inject actions into the obs dicts so that OTFeatureSpec with
+                # src_key / tgt_key == 'action' is supported.
+                ot_src_obs = dict(ot_pair["src"]["obs"])  # shallow copy
+                ot_tgt_obs = dict(ot_pair["tgt"]["obs"])  # shallow copy
+                if "actions" in ot_pair["src"] and ot_pair["src"]["actions"] is not None:
+                    ot_src_obs["action"] = ot_pair["src"]["actions"]
+                if "actions" in ot_pair["tgt"] and ot_pair["tgt"]["actions"] is not None:
+                    ot_tgt_obs["action"] = ot_pair["tgt"]["actions"]
+            except StopIteration:
+                ot_src_obs = None
+                ot_tgt_obs = None
 
         train_tracker, output_dict = update_policy(
             train_tracker,
@@ -615,6 +808,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             cfg.optimizer.grad_clip_norm,
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
+            ot_src_obs=ot_src_obs,
+            ot_tgt_obs=ot_tgt_obs,
+            ot_loss_cfg=ot_loss_cfg,
+            lambda_ot=cfg.ot.lambda_ot if cfg.ot.enable else 0.0,
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
@@ -667,7 +864,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         preprocessor=preprocessor,
                         postprocessor=postprocessor,
                         n_episodes=cfg.eval.n_episodes,
-                        videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                        videos_dir=cfg.output_dir
+                        / "eval"
+                        / f"videos_step_{step_id}",
                         max_episodes_rendered=4,
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,
@@ -699,14 +898,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 if wandb_logger:
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                    wandb_logger.log_video(
+                        eval_info["overall"]["video_paths"][0],
+                        step,
+                        mode="eval",
+                    )
 
             accelerator.wait_for_everyone()
         elif (cfg.env is None) and (val_dataloader is not None) and is_eval_step:
             # Offline eval on hold-out split: report avg loss and avg L1 over a handful of batches
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
-                logging.info(f"Offline eval (no env) at step {step} on hold-out episodes")
+                logging.info(
+                    f"Offline eval (no env) at step {step} on hold-out episodes"
+                )
             policy.eval()
             n_batches = 0
             total_loss = 0.0
@@ -720,13 +925,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     # Use policy.forward: in eval mode KL is disabled by design; report L1 as eval loss
                     loss, output_dict = policy.forward(batch)
                     total_loss += float(loss.item())
-                    total_l1 += float(output_dict.get("l1_loss", 0.0))
+                    # Diffusion returns None for output_dict; guard accordingly
+                    total_l1 += float(output_dict.get("l1_loss", 0.0)) if isinstance(output_dict, dict) else 0.0
                     n_batches += 1
 
             if n_batches > 0 and is_main_process:
                 avg_loss = total_loss / n_batches
                 avg_l1 = total_l1 / n_batches
-                logging.info(f"Offline eval: avg_loss={avg_loss:.4f}, avg_l1={avg_l1:.4f} over {n_batches} batches")
+                logging.info(
+                    f"Offline eval: avg_loss={avg_loss:.4f}, avg_l1={avg_l1:.4f} over {n_batches} batches"
+                )
                 if wandb_logger:
                     wandb_logger.log_dict(
                         {

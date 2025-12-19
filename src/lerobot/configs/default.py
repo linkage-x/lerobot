@@ -21,6 +21,32 @@ from lerobot.datasets.video_utils import get_safe_default_codec
 
 
 @dataclass
+class OTConfig:
+    # Enable OT-as-BC training (use DTW pair_info to supervise src obs with tgt actions)
+    enable: bool = False
+    # Source dataset location (converted to LeRobot v3)
+    src_repo_id: str | None = None
+    src_root: str | None = None
+    # DTW pair info json path
+    pair_info_path: str | None = None
+    # Per-step OT batch ratio relative to main batch. Effective ot_batch_size = max(1, int(batch_size * batch_ratio))
+    batch_ratio: float = 0.5
+    # Weight for OT loss: total_loss = bc_loss + lambda_ot * ot_loss
+    lambda_ot: float = 1.0
+    # Observation keys used for OT supervision inputs (default: state-only)
+    obs_keys: list[str] = field(default_factory=lambda: ["observation.state"])
+    # Pairing index bases and optional local window jitter
+    base_index_src: int = 0
+    base_index_tgt: int = 0
+    window_size: int = 0
+    # Optional high-level OT loss configuration. Kept as a plain mapping here
+    # so that the configs package stays free of policy / OT module imports.
+    # The training script is responsible for interpreting this (typically as
+    # an OTLossConfig instance) via a lightweight adapter.
+    loss_config: dict | None = None
+
+
+@dataclass
 class DatasetConfig:
     # You may provide a list of datasets here. `train.py` creates them all and concatenates them. Note: only data
     # keys common between the datasets are kept. Each dataset gets and additional transform that inserts the
