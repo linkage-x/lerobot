@@ -120,3 +120,39 @@ What To Watch
 - Primary: `eval/offline_eval/avg_loss` downtrend (10k-steps checkpoint)
 - OT: `train/ot_ot_pi_diag` in 0.1–0.2; if <0.08 consider moving from iter4a→iter4b; if >0.25 ensure BC not regressing
 - LR dynamics: `train/lr` after warmup; if flat or unstable, consider halving lr or increasing warmup
+## Run pczv9hci Analysis
+
+- URL: https://wandb.ai/kjust-pinduoduo/lerobot/runs/pczv9hci
+- Snapshot (steps≈1600):
+  - train/loss≈0.037, train/grad_norm≈0.488, train/lr≈3e-4 (cosine)
+  - eval/offline_eval/avg_loss≈0.0673 over 20 batches（极好，早期就收敛较快）
+  - OT: ot_pi_diag≈0.652, ot_pi_sum≈0.652（强对角对齐），ot_loss≈0.0088
+  - OT per-term cost: action_lbl≈1.86e-2，images≈1e-5 量级（img_ee / img_side / img_third_person）
+
+Observations
+- 早期指标非常好；学习率和优化器设置工作正常。
+- ot_pi_diag 与 pi_sum 接近，说明传输质量强、几乎全在对角，对齐“太强”可能掩盖 BC 信号。
+- image embed 成本量级远小于 action label，当前 OT 主要受动作标签主导；可适当降低 label 权重或提升图像嵌入权重以平衡。
+
+Stage Conclusion
+- 继续当前优化设置（AdamW 3e-4 + cosine）是合理的。
+- 优先测试：弱化标签支配、降低对角偏置，确保 OT 不盖过 BC，同时验证更长训练的收益。
+
+Next Experiments (Top-3 Priority)
+1) iter5a（降低标签权重，保持对角先验）
+   - AdamW lr=3e-4 wd=1e-4 cosine warmup=1000，steps=50k，bs=16
+   - OT: lambda_ot=0.1, weight_embed(image)=1.0, weight_label(action)=0.005, reg=0.02, tau=0.01, heuristic=true
+   - 目标：减弱标签主导，保留温和 OT，观察 eval/offline_eval/avg_loss、ot_pi_diag 是否仍然健康（~0.1–0.3）
+
+2) iter5b（去掉对角先验 + 降低 tau）
+   - 同 iter5a，但 heuristic=false，tau_src=tau_tgt=0.005
+   - 目标：去除对角偏置，验证跨域对齐是否仍有效，避免过拟合严格对齐
+
+3) iter5c（增强图像嵌入权重 + 长训练）
+   - AdamW lr=3e-4，cosine warmup=1000，steps=100k，bs=16（资源允许可 20）
+   - OT: lambda_ot=0.1, weight_embed(image)=2.0, weight_label(action)=0.01, reg=0.02, tau=0.01, heuristic=true
+   - 目标：提升图像特征在 OT 中的权重，结合更长训练观察泛化
+
+Monitors & Rollback
+- 监控 eval/offline_eval/avg_loss、train/l1；OT 指标关注 ot_pi_diag（目标 0.1–0.2 区间较稳健）。
+- 若 eval/offline_eval/avg_loss 恶化 >10%，或 ot_pi_diag >0.4 持续，回滚到弱 OT（减小 lambda_ot 或增大 reg）。
