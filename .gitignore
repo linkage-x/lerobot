@@ -179,3 +179,5 @@ outputs/
 *.part
 
 transformers-fix-lerobot_openpi
+
+src/lerobot/datasets/fr3_lerobot

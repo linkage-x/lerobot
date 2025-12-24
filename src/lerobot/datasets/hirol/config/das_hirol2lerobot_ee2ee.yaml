@@ -1,0 +1,14 @@
+custom_prompt: "pick and place"
+data_dir:
+  - "/home/hanyu/Codes/HIROLRobotPlatform/dataset/data/das"
+action_ori_type: "quaternion"
+action_prediction_step: 1
+contain_ft: false
+contain_depth: false
+repo_name: "das_ee2ee"
+root_path: "/home/hanyu/Codes/HIROLRobotPlatform/assets/data"
+fps: 15
+num_writer_thread: 4
+num_writer_process: 0
+batch_encoding_size: 1
+video_backend: torchcodec
