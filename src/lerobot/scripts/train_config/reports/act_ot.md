@@ -1,107 +1,122 @@
-# ACT-OT 实验阶段性报告
+# Act/OT Comparison Report
 
-## R1  (https://wandb.ai/kjust-pinduoduo/lerobot/runs/m55wsgj6)
-- 训练总损失: 首=15.15, 末=1.459, 最优=1.459@1050, Δ=-13.69 (-90.37%)
-- 训练L1: 首=0.5182, 末=0.2298, 最优=0.2088@800, Δ=-0.2884 (-55.66%)
-- 离线评估L1: 首=0.6585, 末=0.3535, 最优=0.3477@900, Δ=-0.3049 (-46.31%)
-- OT损失: 首=0.1658, 末=0.09685, 最优=0.01351@200, Δ=-0.06895 (-41.59%)
-- π总和: 首=0.1536, 末=0.03095, 最优=0.001345@150, Δ=-0.1226 (-79.85%)
-- π对角和: 首=0.1536, 末=0.03095, 最优=0.001345@150, Δ=-0.1226 (-79.85%)
-- OT cost(state): 首=1246, 末=1286, 最优=547.4@550, Δ=39.77 (3.19%)
+Generated: 2025-12-25T02:34:43.202013Z
 
-## R2  (https://wandb.ai/kjust-pinduoduo/lerobot/runs/cf915gzs)
-- 训练总损失: 首=15.16, 末=1.467, 最优=1.467@1000, Δ=-13.69 (-90.33%)
-- 训练L1: 首=0.5182, 末=0.2223, 最优=0.2076@800, Δ=-0.2959 (-57.10%)
-- 离线评估L1: 首=0.658, 末=0.3678, 最优=0.3476@900, Δ=-0.2902 (-44.11%)
-- OT损失: 首=0.0004007, 末=0.2095, 最优=0.0004007@50, Δ=0.2091 (52181.88%)
-- π总和: 首=2.333e-05, 末=0.1982, 最优=2.333e-05@50, Δ=0.1982 (849479.31%)
-- π对角和: 首=2.333e-05, 末=0.1982, 最优=2.333e-05@50, Δ=0.1982 (849479.24%)
-- OT cost(state): 首=1371, 末=1052, 最优=885.5@550, Δ=-318.9 (-23.26%)
+## Runs
+- zecwqro4 · act · https://wandb.ai/kjust-pinduoduo/lerobot/runs/zecwqro4
+- 4gb7zc4r · act · https://wandb.ai/kjust-pinduoduo/lerobot/runs/4gb7zc4r
+- 80h5t9k8 · act · https://wandb.ai/kjust-pinduoduo/lerobot/runs/80h5t9k8
 
-## R3  (https://wandb.ai/kjust-pinduoduo/lerobot/runs/uxk6ti2d)
-- 训练总损失: 首=15.18, 末=1.514, 最优=1.514@1000, Δ=-13.66 (-90.03%)
-- 训练L1: 首=0.5182, 末=0.2216, 最优=0.2082@800, Δ=-0.2966 (-57.24%)
-- 离线评估L1: 首=0.6582, 末=0.3674, 最优=0.3477@900, Δ=-0.2908 (-44.18%)
-- OT损失: 首=0.1658, 末=0.1809, 最优=0.01351@200, Δ=0.01513 (9.13%)
-- π总和: 首=0.1536, 末=0.1021, 最优=0.001345@150, Δ=-0.05146 (-33.50%)
-- π对角和: 首=0.1536, 末=0.1021, 最优=0.001345@150, Δ=-0.05146 (-33.50%)
-- OT cost(state): 首=1246, 末=1109, 最优=547.4@550, Δ=-137.2 (-11.00%)
+## Metrics Summary (key curves)
 
-## 诊断与结论
-- BC 路径整体收敛正常；OT 分支的 π 与 cost 变化决定对齐强度与稳定性。
-- ot_loss 非单调，属正常：见下节原因解释（采样噪声、权重耦合、unbalanced 正则等共同作用）。
-## 为什么 ot_loss 不是单调下降？
-- 训练优化的是总损失 L = L_bc + λ·L_ot；每步更新朝着同时降低 L_bc 与 L_ot 的方向，但 L_ot 不一定单步下降。
-- 迷你批次采样噪声：每步的 src/tgt 样本不同（含 window 抖动），M 与 π 都不同，L_ot 会抖动。
-- OT 为非端到端（π 在 detatched 的 M 上求）：embedding 分支参数更新后，下一步的 M 重新构造，可能导致 L_ot 上下波动。
-- unbalanced Sinkhorn：reg 与 tau 的大小直接影响 π 的总质量与分布；当 π 总量变化时，(π*M).sum 也随之改变。
-- 对角先验（heuristic）与正则放宽可能让早期 π 更‘扩散’，短期内 L_ot 可能上升，但长期能促使更稳的对齐。
-- label 分支的量纲较大时（未经标准化），轻微权重变化即可放大 L_ot 的波动；这也是我们建议减小 weight_label 的原因。
-## 下一步建议
-- 若 π_sum < 0.1：进一步提高 reg（如到 3.0）或 tau（如到 20），并保持 heuristic=true；保障 π 不是被压回近零。
-- 若 π_sum 较大但 OT cost 不降：减小 weight_label（0.0005→0.0001）或仅用 embedding（embedOnly）做对照；必要时略降 reg。
-- 稳定后再把 λ_ot 提升到 0.2 放大 OT 作用。
+| run_id | ot_cost/action_lbl last_mean | last_std | slope_last | jitter | ot_loss last_mean | eval_l1 last_mean |
+|---|---:|---:|---:|---:|---:|---:|
+| zecwqro4 | 0.01996 | 0.005859 | -4.435e-06 | 0.4299 | 0.01659 | 0.4441 |
+| 4gb7zc4r | 0.01892 | 0.005671 | 9.063e-05 | 0.4556 | 0.01363 | 0.3944 |
+| 80h5t9k8 | 0.01996 | 0.005859 | -4.435e-06 | 0.4299 | 0.01563 | 0.4457 |
 
----
+### Interpretation
+- last_mean/last_std: 用尾段窗口（<=100，或 10%）的均值/方差衡量稳定性与收敛水平；
+- slope_last: 尾段趋势斜率，负值向下收敛；
+- jitter: 一阶差分（按序列中位数缩放）的标准差，越大表示抖动越强；
 
-## 实验记录更新（2025-12-24 07:47）
+## Next-Step Experiments
 
-### R1_latest  [act](https://wandb.ai/kjust-pinduoduo/lerobot/runs/m55wsgj6)
-- 配置：
-  - window_size=30, reg=2, tau=(10,10), heuristic=True
-  - weight_embed=1, weight_label=0.0005, lambda_ot=0.1
-- 结果：
-  - 训练总损失: 首=15.15, 末=1.081, 最优=1.081@1500
-  - 训练L1: 首=0.5182, 末=0.1963, 最优=0.1482@1400
-  - 离线评估L1: 首=0.6585, 末=0.3435, 最优=0.341@1300
-  - OT损失: 首=0.1658, 末=0.1554, 最优=0.001246@1300
-  - π总和: 首=0.1536, 末=0.07535, 最优=8.36e-05@1300
-  - π对角和: 首=0.1536, 末=0.07535, 最优=8.36e-05@1300
-  - OT cost(state): 首=1246, 末=1196, 最优=547.4@550
+详见以下三个配置建议（A/B/C），关注：A 稳定性、B OT 参数、C action_lbl 头部质量。
 
-### R2_latest  [act](https://wandb.ai/kjust-pinduoduo/lerobot/runs/cf915gzs)
-- 配置：
-  - window_size=20, reg=2, tau=(10,10), heuristic=True
-  - weight_embed=1, weight_label=0, lambda_ot=0.1
-- 结果：
-  - 训练总损失: 首=15.16, 末=1.185, 最优=1.167@1350
-  - 训练L1: 首=0.5182, 末=0.1483, 最优=0.1483@1400
-  - 离线评估L1: 首=0.658, 末=0.3484, 最优=0.3414@1300
-  - OT损失: 首=0.0004007, 末=0.1633, 最优=0.0004007@50
-  - π总和: 首=2.333e-05, 末=0.09817, 最优=2.333e-05@50
-  - π对角和: 首=2.333e-05, 末=0.09817, 最优=2.333e-05@50
-  - OT cost(state): 首=1371, 末=945.4, 最优=802.9@1200
+### A) stable_ot
+```yaml
+experiment: stable_ot
+train:
+  optimizer: adamw
+  lr: 2.0e-4
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_ratio: 0.10
+  batch_size: 256
+  grad_accum: 4
+  grad_clip_norm: 1.0
+  ema: true
+  ema_decay: 0.999
+  seed: 42
+data:
+  seq_len: 128
+  window_stride: 2
+loss:
+  weights:
+    ot: 0.5
+    action_lbl: 1.0
+  ot:
+    cost: l2
+    sinkhorn_epsilon: 0.10
+    sinkhorn_iters: 200
+    weight_warmup_ratio: 0.30
+logging:
+  smooth_window: 200
+eval:
+  interval_steps: 2000
+```
 
-### R3_latest  [act](https://wandb.ai/kjust-pinduoduo/lerobot/runs/uxk6ti2d)
-- 配置：
-  - window_size=30, reg=2, tau=(10,10), heuristic=True
-  - weight_embed=1, weight_label=0.0005, lambda_ot=0.2
-- 结果：
-  - 训练总损失: 首=15.18, 末=1.187, 最优=1.187@1400
-  - 训练L1: 首=0.5182, 末=0.1482, 最优=0.1482@1400
-  - 离线评估L1: 首=0.6582, 末=0.3487, 最优=0.341@1300
-  - OT损失: 首=0.1658, 末=0.01597, 最优=0.001255@1300
-  - π总和: 首=0.1536, 末=0.001766, 最优=8.432e-05@1300
-  - π对角和: 首=0.1536, 末=0.001766, 最优=8.432e-05@1300
-  - OT cost(state): 首=1246, 末=1337, 最优=547.4@550
+### B) ot_tune
+```yaml
+experiment: ot_tune
+train:
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 0.02
+  scheduler: cosine
+  warmup_ratio: 0.05
+  batch_size: 128
+  grad_accum: 2
+  grad_clip_norm: 1.0
+data:
+  seq_len: 160
+  window_stride: 2
+loss:
+  weights:
+    ot: 0.7
+    action_lbl: 1.0
+  ot:
+    cost: l2_squared
+    sinkhorn_epsilon: 0.07
+    sinkhorn_iters: 160
+    compute_every_n_steps: 2
+    detach_cost_grad: true
+eval:
+  interval_steps: 2000
+```
 
+### C) action_lbl_focus
+```yaml
+experiment: action_lbl_focus
+train:
+  optimizer: adamw
+  lr: 2.5e-4
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_ratio: 0.10
+  batch_size: 192
+  grad_accum: 2
+  grad_clip_norm: 1.0
+loss:
+  weights:
+    ot: 0.2
+    action_lbl: 2.0
+  action_lbl:
+    label_smoothing: 0.05
+    focal_gamma: 1.5
+    class_balance: true
+  ot:
+    cost: l2
+    sinkhorn_epsilon: 0.05
+    sinkhorn_iters: 120
+eval:
+  interval_steps: 1500
+```
 
-
----
-
-## ACT-OT Report Update (2025-12-24 10:11)
-- Note: Baseline 3-cam embedOnly (reg=1.0,tau=5,λ=0.1)
-
-### act (8wdzd9cy)
-- Link: https://wandb.ai/kjust-pinduoduo/lerobot/runs/8wdzd9cy
-- Config:
-  - window_size=20, reg=1, tau=(5,5), heuristic=True
-  - weight_embed=0.3333, weight_label=0, lambda_ot=0.1
-- Metrics:
-  - train/loss: first=16.01, last=0.7356, best=0.7356@2850
-  - train/l1_loss: first=0.5373, last=0.1635, best=0.1262@2600
-  - eval/avg_l1: first=0.889, last=0.4804, best=0.4547@1650
-  - ot_loss: first=0.1591, last=0.009248, best=0.009248@2850
-  - ot_pi_sum: first=0.9854, last=0.9992, best=0.9854@50
-  - ot_pi_diag: first=0.9854, last=0.9992, best=0.9854@50
-  - ot_cost(state): first=nan, last=nan, best=nan@None
+## Jitter Diagnosis & Fixes
+- 小批/短序列导致方差大；增大 batch 或 grad_accum，并适度加长 seq_len。
+- Sinkhorn 超参偏“激进”（epsilon 过小、迭代不足）会放大噪声；建议 epsilon 0.07–0.12、iters 160–200。
+- 每步都算 OT 会把匹配随机性直接注入梯度；可 compute_every_n_steps=2–4，或复用匹配结果。
+- 优化器侧：降低 lr、增加 warmup、启用 grad_clip、EMA(0.999–0.9995)。
+- 指标侧：在 W&B 增大平滑窗口；评估用 episode 聚合，训练看尾段均值/方差与斜率。

@@ -12,7 +12,7 @@ Example
   python -m lerobot.datasets.hirol.build_pair_info \
     --src-dir dataset/data/block_stacking \
     --tgt-dir dataset/data/block_stacking \
-    --label state_joint_gripper --window 80 --stride 2 --top-k 5 \
+    --label state_joint_gripper --window 80 --stride 2 \
     --output dataset/dtw/block_stacking_pair_info.json
 
 Output JSON format (indices are 0-based):
