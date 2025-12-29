@@ -10,10 +10,10 @@ minimal. If the dtw package is missing, an informative error is raised.
 
 Example
   python -m lerobot.datasets.hirol.build_pair_info \
-    --src-dir dataset/data/block_stacking \
-    --tgt-dir dataset/data/block_stacking \
-    --label state_joint_gripper --window 80 --stride 2 \
-    --output dataset/dtw/block_stacking_pair_info.json
+    --src-dir /data/fr3/1025_insert_tube_fr3_3dmouse_99ep \
+    --tgt-dir /data/fr3/1107_insert_tube_fr3_3dmouse_contain_ft_20eps \
+    --label state_joint_gripper --stride 2 \
+    --output src/lerobot/datasets/hirol/dtw/it_99to20_pair_info.json
 
 Output JSON format (indices are 0-based):
 {

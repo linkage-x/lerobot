@@ -1,7 +1,7 @@
 custom_prompt: ["pick the kiwi, put into the red box"]
 # 支持单一路径或多路径；此处示例为单元素列表
 data_dir:
-  - "/data/fr3_lerobot/left_fr3_ip_src_q2cq" #局部随机摆放采集，轨迹较一致
+  - "/data/fr3/left_fr3_ip_src_q2cq" #局部随机摆放采集，轨迹较一致
 
 # action_ori_type: "quaternion"
 action_prediction_step: 1

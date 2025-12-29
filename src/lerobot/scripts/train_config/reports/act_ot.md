@@ -1,122 +1,246 @@
-# Act/OT Comparison Report
+# ACT-OT 三实验对比与后续计划
 
-Generated: 2025-12-25T02:34:43.202013Z
+对比的 W&B 实验：
+- rk711khx: https://wandb.ai/kjust-pinduoduo/lerobot/runs/rk711khx
+- gpki6xab: https://wandb.ai/kjust-pinduoduo/lerobot/runs/gpki6xab
+- 3tef3yy2: https://wandb.ai/kjust-pinduoduo/lerobot/runs/3tef3yy2
 
-## Runs
-- zecwqro4 · act · https://wandb.ai/kjust-pinduoduo/lerobot/runs/zecwqro4
-- 4gb7zc4r · act · https://wandb.ai/kjust-pinduoduo/lerobot/runs/4gb7zc4r
-- 80h5t9k8 · act · https://wandb.ai/kjust-pinduoduo/lerobot/runs/80h5t9k8
+注：以下数值来自本地汇总文件（compare_runs_3.json / compare_runs_new.json），键与量纲与线上一致，仅截取关键指标用于决策。
 
-## Metrics Summary (key curves)
+---
+## 关键指标对比（摘要）
 
-| run_id | ot_cost/action_lbl last_mean | last_std | slope_last | jitter | ot_loss last_mean | eval_l1 last_mean |
-|---|---:|---:|---:|---:|---:|---:|
-| zecwqro4 | 0.01996 | 0.005859 | -4.435e-06 | 0.4299 | 0.01659 | 0.4441 |
-| 4gb7zc4r | 0.01892 | 0.005671 | 9.063e-05 | 0.4556 | 0.01363 | 0.3944 |
-| 80h5t9k8 | 0.01996 | 0.005859 | -4.435e-06 | 0.4299 | 0.01563 | 0.4457 |
+1) rk711khx（记作 r1）
+- eval/offline_eval/avg_loss: first=0.6585, last=0.3429, best=0.3429@1250（稳定下降）
+- train/ot_loss: first=0.1960 → last=0.0512，best≈2.0e-4@250（早期快速变小）
+- train/ot_pi_sum: 0.1668 → 0.0931，best≈1.5e-5@250（早期高度稀疏，后期回升）
+- train/ot_cost/observation.state: 1327.7 → 1093.1，best=761.1@1000（成本显著降低）
 
-### Interpretation
-- last_mean/last_std: 用尾段窗口（<=100，或 10%）的均值/方差衡量稳定性与收敛水平；
-- slope_last: 尾段趋势斜率，负值向下收敛；
-- jitter: 一阶差分（按序列中位数缩放）的标准差，越大表示抖动越强；
+2) gpki6xab（记作 r2）
+- eval/offline_eval/avg_loss: first=0.6582, last=0.3460, best=0.3451@1100（与 r1 接近）
+- train/ot_loss: first≈2.38e-10 → last=0.0307，best≈2.38e-10@50（起始近 0，后期上升）
+- train/ot_pi_sum: first≈1.38e-11 → last=0.0720（起始近 0，后期上升）
+- train/ot_cost/observation.state: 1371.8 → 1090.1，best=815.8@1200
 
-## Next-Step Experiments
+3) 3tef3yy2（记作 r3）
+- eval/offline_eval/avg_loss: first=0.6584, last=0.4015（最弱）
+- train/ot_loss: first≈2.38e-10 → last=0.00157（极小）
+- train/ot_pi_sum: first≈1.39e-11 → last≈3.58e-4（极稀疏）
+- train/ot_cost/observation.state: 1371.7 → 1195.7，best=888.5@550（成本降幅最小）
 
-详见以下三个配置建议（A/B/C），关注：A 稳定性、B OT 参数、C action_lbl 头部质量。
+解读要点
+- r1: 评估最稳；OT 早期极稀疏（pi_sum→~1e-5），随后回到 0.09 左右，说明 reg/tau 较小会在初期“塌缩”为强对角/弱耦合，后续才恢复。
+- r2: 起步即接近“零耦合”（ot/π≈0），随后 π_sum 上升并保持低于 r1，评估与 r1 接近。推测窗口/对角先验更强或 reg 更大；但早期极小 π_sum 仍是风险。
+- r3: π_sum 始终极小（~3.6e-4），ot_loss 极低但 eval 最差，符合“过度平滑/质量流失”现象：不平衡 OT 吸收了过多质量，OT 分支几乎不工作，难以提供有用对齐信号。
 
-### A) stable_ot
-```yaml
-experiment: stable_ot
-train:
-  optimizer: adamw
-  lr: 2.0e-4
-  weight_decay: 0.05
-  scheduler: cosine
-  warmup_ratio: 0.10
-  batch_size: 256
-  grad_accum: 4
-  grad_clip_norm: 1.0
-  ema: true
-  ema_decay: 0.999
-  seed: 42
-data:
-  seq_len: 128
-  window_stride: 2
-loss:
-  weights:
-    ot: 0.5
-    action_lbl: 1.0
-  ot:
-    cost: l2
-    sinkhorn_epsilon: 0.10
-    sinkhorn_iters: 200
-    weight_warmup_ratio: 0.30
-logging:
-  smooth_window: 200
-eval:
-  interval_steps: 2000
-```
+与 OT_LOSS_DESIGN.md 对齐
+- 建议对 reg、tau_src/tau_tgt 网格化调参；监控 `ot_pi_sum/diag` 与 `ot_cost/<term>` 的量级与趋势，避免“π 过小/退化”。
+- 当 π_sum 极小且 eval 变差时：提高 tau（放宽边缘）、适度提高 reg（更平滑）、降低 label 权重或分阶段增大 λ_ot。
 
-### B) ot_tune
-```yaml
-experiment: ot_tune
-train:
-  optimizer: adamw
-  lr: 3.0e-4
-  weight_decay: 0.02
-  scheduler: cosine
-  warmup_ratio: 0.05
-  batch_size: 128
-  grad_accum: 2
-  grad_clip_norm: 1.0
-data:
-  seq_len: 160
-  window_stride: 2
-loss:
-  weights:
-    ot: 0.7
-    action_lbl: 1.0
-  ot:
-    cost: l2_squared
-    sinkhorn_epsilon: 0.07
-    sinkhorn_iters: 160
-    compute_every_n_steps: 2
-    detach_cost_grad: true
-eval:
-  interval_steps: 2000
-```
+---
+## 下一步配置（3 个）
 
-### C) action_lbl_focus
-```yaml
-experiment: action_lbl_focus
-train:
-  optimizer: adamw
-  lr: 2.5e-4
-  weight_decay: 0.05
-  scheduler: cosine
-  warmup_ratio: 0.10
-  batch_size: 192
-  grad_accum: 2
-  grad_clip_norm: 1.0
-loss:
-  weights:
-    ot: 0.2
-    action_lbl: 2.0
-  action_lbl:
-    label_smoothing: 0.05
-    focal_gamma: 1.5
-    class_balance: true
-  ot:
-    cost: l2
-    sinkhorn_epsilon: 0.05
-    sinkhorn_iters: 120
-eval:
-  interval_steps: 1500
-```
+目标：抑制“早期零耦合/过稀疏”与“π_sum 过小”两类现象，同时验证窗口与权重对评估稳定性的影响。
 
-## Jitter Diagnosis & Fixes
-- 小批/短序列导致方差大；增大 batch 或 grad_accum，并适度加长 seq_len。
-- Sinkhorn 超参偏“激进”（epsilon 过小、迭代不足）会放大噪声；建议 epsilon 0.07–0.12、iters 160–200。
-- 每步都算 OT 会把匹配随机性直接注入梯度；可 compute_every_n_steps=2–4，或复用匹配结果。
-- 优化器侧：降低 lr、增加 warmup、启用 grad_clip、EMA(0.999–0.9995)。
-- 指标侧：在 W&B 增大平滑窗口；评估用 episode 聚合，训练看尾段均值/方差与斜率。
+1) 更平滑、轻放宽（面向 r1 的稳态对照）
+- 文件: `src/lerobot/scripts/train_config/act_fr3_ot_next_reg02_tau1.json`
+- 变更: reg=0.20, tau_src=tau_tgt=1.0, λ_ot=0.10（窗口启用, heuristic=true, action_lbl.weight_label=0.02）
+- 预期: 初期 π 不再塌缩到 ~0，维持可解释耦合，同时保持与 r1 相近的训练/评估趋势。
+
+2) 适中放宽 + 略增 λ_ot + 窗口加权（面向 r2 的对角先验对照）
+- 文件: `src/lerobot/scripts/train_config/act_fr3_ot_next_reg015_tau2_lambda015_weighted_window.json`
+- 变更: reg=0.15, tau=2.0, λ_ot=0.15, sharpness=1.0（启用窗口权重），其余同基线
+- 预期: π_sum 在 0.07~0.15 区间更平稳；对角偏好更强但不至塌缩，评估与 r1 接近或略优。
+
+3) 强放宽 + 降低 action 标签权重 + 关窗（面向 r3 的“π_sum 极小”修复）
+- 文件: `src/lerobot/scripts/train_config/act_fr3_ot_next_reg02_tau5_lambda01_no_window_action005.json`
+- 变更: reg=0.20, tau=5.0, λ_ot=0.10, no_window=true, action_lbl.weight_label=0.005
+- 预期: 允许跨更远时间步的匹配并显著提高 π_sum；减小 label 竞争，避免把 BC 推偏；若 π_sum ≥ 0.2 且 eval 稳定，可在下一轮把 λ_ot 提至 0.15–0.20。
+
+---
+## 验证要点与判定标准
+- 监控：`train/ot_ot_pi_sum`、`train/ot_ot_pi_diag`、`train/ot_ot_cost/observation.state` 与 `eval/offline_eval/avg_loss`。
+- 判定成功：
+  - r1/r2 路线：避免初期 π_sum → ~0 的塌缩；eval 持平或更低；
+  - r3 路线：π_sum 明显上升（≥1e-2 → 1e-1 量级），同时 eval 不反弹。
+
+---
+## 运行与记录
+- 训练示例：
+  - `python -m lerobot.scripts.train --config_path src/lerobot/scripts/train_config/act_fr3_ot_next_reg02_tau1.json`
+  - `python -m lerobot.scripts.train --config_path src/lerobot/scripts/train_config/act_fr3_ot_next_reg015_tau2_lambda015_weighted_window.json`
+  - `python -m lerobot.scripts.train --config_path src/lerobot/scripts/train_config/act_fr3_ot_next_reg02_tau5_lambda01_no_window_action005.json`
+- 建议：保持相同 seed/评估数据；开启 W&B；关键超参随 run 一并入库以便复盘。
+
+
+
+---
+
+## ACT-OT Report Update (2025-12-29 09:02)
+- Note: Tuning batch phgb325y vlly2hzl kmaf5wox
+
+### act (phgb325y)
+- Link: https://wandb.ai/kjust-pinduoduo/lerobot/runs/phgb325y
+- Config:
+  - window_size=10, reg=0.2, tau=(1,1), heuristic=True
+  - weight_embed=0.3333, weight_label=0, lambda_ot=0.1
+- Metrics:
+  - train/loss: first=16.15, last=0.6064, best=0.6056@3550
+  - train/l1_loss: first=0.6076, last=0.1594, best=0.1107@2100
+  - eval/avg_l1: first=0.8106, last=0.2683, best=0.2524@3350
+  - ot_loss: first=0.5037, last=0.6893, best=0.3513@1200
+  - ot_pi_sum: first=0.554, last=0.4268, best=0.4268@3600
+  - ot_pi_diag: first=0.554, last=0.4268, best=0.4268@3600
+  - ot_cost(state): first=nan, last=nan, best=nan@None
+
+### act (vlly2hzl)
+- Link: https://wandb.ai/kjust-pinduoduo/lerobot/runs/vlly2hzl
+- Config:
+  - window_size=10, reg=0.15, tau=(2,2), heuristic=True
+  - weight_embed=0.3333, weight_label=0, lambda_ot=0.15
+- Metrics:
+  - train/loss: first=16.25, last=0.6659, best=0.6659@3500
+  - train/l1_loss: first=0.605, last=0.158, best=0.1101@2100
+  - eval/avg_l1: first=0.8122, last=0.2566, best=0.2566@3500
+  - ot_loss: first=0.6313, last=0.556, best=0.2167@400
+  - ot_pi_sum: first=0.8266, last=0.8478, best=0.5564@350
+  - ot_pi_diag: first=0.8266, last=0.8478, best=0.5564@350
+  - ot_cost(state): first=nan, last=nan, best=nan@None
+
+### act (kmaf5wox)
+- Link: https://wandb.ai/kjust-pinduoduo/lerobot/runs/kmaf5wox
+- Config:
+  - window_size=10, reg=0.2, tau=(5,5), heuristic=True
+  - weight_embed=0.3333, weight_label=0, lambda_ot=0.1
+- Metrics:
+  - train/loss: first=16.25, last=0.6374, best=0.6374@3450
+  - train/l1_loss: first=0.5985, last=0.1518, best=0.1072@2100
+  - eval/avg_l1: first=0.8088, last=0.2833, best=0.2697@3150
+  - ot_loss: first=0.6705, last=0.4704, best=0.1858@750
+  - ot_pi_sum: first=0.9317, last=0.9525, best=0.9143@1700
+  - ot_pi_diag: first=0.9317, last=0.9525, best=0.9143@1700
+  - ot_cost(state): first=nan, last=nan, best=nan@None
+
+
+
+---
+
+## ACT-OT Report Update (2025-12-29 09:23)
+- Note: Tuning batch hpdecad1 hbp2xock vyg9tuy1
+
+### act (hpdecad1)
+- Link: https://wandb.ai/kjust-pinduoduo/lerobot/runs/hpdecad1
+- Config:
+  - window_size=10, reg=0.2, tau=(1,1), heuristic=True
+  - weight_embed=0.3333, weight_label=0, lambda_ot=0.12
+- Metrics:
+  - train/loss: first=16.16, last=0.9327, best=0.9327@2550
+  - train/l1_loss: first=0.6093, last=0.2082, best=0.1104@2100
+  - eval/avg_l1: first=0.8117, last=0.2901, best=0.2813@2450
+  - ot_loss: first=0.6259, last=0.415, best=0.2841@400
+  - ot_pi_sum: first=0.5926, last=0.7464, best=0.2268@350
+  - ot_pi_diag: first=0.5926, last=0.7464, best=0.2268@350
+  - ot_cost(state): first=nan, last=nan, best=nan@None
+
+---
+
+## Root-Cause Notes (fgc0bcxr, gv4yyjzk, 843np9lc 共性问题)
+
+现象（用户反馈）
+- `ot_pi_sum / ot_pi_diag` 没有“趋于 1”；`ot_loss` 与 `action_lbl` 不单调下降。
+
+原因分析（要点）
+- 度量未归一：在“不平衡 OT”下，`π` 的总质量不是 1；我们记录的是原值（质量和与对角和），不是“对角占比”。因此“趋于 1”不成立。应改用 `diag_ratio = ot_pi_diag / (ot_pi_sum + 1e-9)` 作为“对角占比”指标，目标是趋近 1；而 `ot_pi_sum` 本身的绝对值受 `tau/reg/成本量纲` 影响较大。
+- 成本矩阵 M 动态变化：图像项使用 learnable embedding，训练中表征分布变化导致每步的 M 改变；再叠加“随机窗口/样本对”，`ot_loss` 与各 term（含 `action_lbl`）会出现非单调波动。这是期望内行为，并不代表退化。
+- 不平衡松弛与窗口策略：较大的 `tau`、窗口权重（sharpness）与对角先验会改变质量分布与对角偏好，但不会让 `π_sum→1`。当 `tau` 较大时，更允许“质量缺失/新增”，`π_sum` 通常背离 1。
+- 量纲竞争：多 term 线性组合时，若各项的尺度未对齐（如图像 embed 与动作 label），`ot_loss` 的主导项会随训练阶段切换，引起曲线起伏。
+
+证据/佐证
+- 最近数批次里 `ot_pi_diag ≈ ot_pi_sum`（见多条 run 的同值），说明对角质量占比已接近 1（即 diag_ratio≈1），但绝对值<1 是不平衡设置与成本尺度的结果。
+- `ot_cost(state)` 为 NaN 是因为当前未启用该 term（非异常）；建议直接记录 `ot_cost/action_lbl` 与各图像项的 `ot_cost/<term>` 以区分分量趋势。
+
+改进与验证建议
+- 指标层面：
+  - 新增日志 `train/ot_diag_ratio = ot_pi_diag / (ot_pi_sum + 1e-9)`；并对每个 term 记录 `ot_cost/<term>`，避免只看总 `ot_loss`。
+  - 增加一个“固定评估对齐集”（固定窗口与样本对）用于周期性 OT 评估，以降低曲线噪声、观察真实收敛趋势。
+- 训练/超参：
+  - 若希望 `π_sum` 更接近 1：减小 `tau_src/tau_tgt`（如 1.0→0.5），增大/保持中等 `reg`（0.15–0.2）以稳定求解。
+  - 若对角占比不足（diag_ratio<0.8）：减小窗口（如 10→6）或开启/增大 `sharpness`，并确保 `base_index_{src,tgt}` 对齐。
+  - 量纲对齐：对各 term 的 `weight_*` 做温和网格（图像 embed 总和≈动作 label 的量级），必要时做 per-term 标准化（以初始化分布的分位数/方差缩放）。
+
+### act (hbp2xock)
+- Link: https://wandb.ai/kjust-pinduoduo/lerobot/runs/hbp2xock
+- Config:
+  - window_size=10, reg=0.2, tau=(1,1), heuristic=True
+  - weight_embed=0.3333, weight_label=0, lambda_ot=0.18
+- Metrics:
+  - train/loss: first=16.2, last=0.9659, best=0.9659@2500
+  - train/l1_loss: first=0.6132, last=0.2294, best=0.1074@2100
+  - eval/avg_l1: first=0.8218, last=0.3099, best=0.2846@2450
+  - ot_loss: first=0.3495, last=0.3438, best=0.1118@400
+  - ot_pi_sum: first=0.819, last=0.8226, best=0.5727@350
+  - ot_pi_diag: first=0.819, last=0.8226, best=0.5727@350
+  - ot_cost(state): first=nan, last=nan, best=nan@None
+
+### act (vyg9tuy1)
+- Link: https://wandb.ai/kjust-pinduoduo/lerobot/runs/vyg9tuy1
+- Config:
+  - window_size=10, reg=0.2, tau=(2,2), heuristic=True
+  - weight_embed=0.3333, weight_label=0, lambda_ot=0.15
+- Metrics:
+  - train/loss: first=16.23, last=0.9981, best=0.9981@2400
+  - train/l1_loss: first=0.6021, last=0.1926, best=0.111@2100
+  - eval/avg_l1: first=0.8054, last=0.2824, best=0.2824@2400
+  - ot_loss: first=0.3921, last=0.2847, best=0.1173@400
+  - ot_pi_sum: first=0.9, last=0.9289, best=0.7395@350
+  - ot_pi_diag: first=0.9, last=0.9289, best=0.7395@350
+  - ot_cost(state): first=nan, last=nan, best=nan@None
+
+
+
+---
+
+## ACT-OT Report Update (2025-12-29 09:51)
+- Note: Tuning batch fgc0bcxr gv4yyjzk 843np9lc
+
+### act (fgc0bcxr)
+- Link: https://wandb.ai/kjust-pinduoduo/lerobot/runs/fgc0bcxr
+- Config:
+  - window_size=10, reg=0.2, tau=(1,1), heuristic=True
+  - weight_embed=0.3333, weight_label=0, lambda_ot=0.12
+- Metrics:
+  - train/loss: first=16.17, last=0.606, best=0.606@3650
+  - train/l1_loss: first=0.6099, last=0.19, best=0.1093@2100
+  - eval/avg_l1: first=0.8108, last=0.2961, best=0.2582@3350
+  - ot_loss: first=0.4902, last=0.6518, best=0.3496@300
+  - ot_pi_sum: first=0.5649, last=0.5973, best=0.4271@3600
+  - ot_pi_diag: first=0.5649, last=0.5973, best=0.4271@3600
+  - ot_cost(state): first=nan, last=nan, best=nan@None
+
+### act (gv4yyjzk)
+- Link: https://wandb.ai/kjust-pinduoduo/lerobot/runs/gv4yyjzk
+- Config:
+  - window_size=10, reg=0.2, tau=(1,1), heuristic=True
+  - weight_embed=0.3333, weight_label=0, lambda_ot=0.16
+- Metrics:
+  - train/loss: first=16.19, last=0.6108, best=0.6108@3550
+  - train/l1_loss: first=0.6121, last=0.1856, best=0.1093@2100
+  - eval/avg_l1: first=0.8197, last=0.2561, best=0.2468@3500
+  - ot_loss: first=0.4341, last=0.3111, best=0.2154@1800
+  - ot_pi_sum: first=0.7007, last=0.8421, best=0.6464@1750
+  - ot_pi_diag: first=0.7007, last=0.8421, best=0.6464@1750
+  - ot_cost(state): first=nan, last=nan, best=nan@None
+
+### act (843np9lc)
+- Link: https://wandb.ai/kjust-pinduoduo/lerobot/runs/843np9lc
+- Config:
+  - window_size=10, reg=0.2, tau=(2,2), heuristic=True
+  - weight_embed=0.3333, weight_label=0, lambda_ot=0.15
+- Metrics:
+  - train/loss: first=16.28, last=0.7436, best=0.7436@3500
+  - train/l1_loss: first=0.6009, last=0.1605, best=0.1095@2100
+  - eval/avg_l1: first=0.8039, last=0.2569, best=0.2569@3500
+  - ot_loss: first=0.8776, last=1.238, best=0.7203@300
+  - ot_pi_sum: first=0.5452, last=0.3901, best=0.358@2650
+  - ot_pi_diag: first=0.5452, last=0.3901, best=0.358@2650
+  - ot_cost(state): first=nan, last=nan, best=nan@None
