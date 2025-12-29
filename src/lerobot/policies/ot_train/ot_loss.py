@@ -111,6 +111,9 @@ class OTFeatureSpec:
 
     # Optional explicit term name; if None, derive from src_key / dim_slice.
     term_name: str | None = None
+    # Optional top-level term weight when aggregating multiple terms (Σ w_i * M_i).
+    # This mirrors ot-sim2real里单term的 emb_scale / cost_scale 之外的“外层”权重，用于多term场景。
+    term_weight: float = 1.0
 
 
 @dataclass
@@ -434,6 +437,9 @@ def compute_ot_loss_for_policy(
 
         src = src_obs[src_key]
         tgt = tgt_obs[tgt_key]
+        # 保留原始张量，用于 label 路径做“时间展平”以对齐 ot-sim2real（flatten across time）
+        src_raw = src
+        tgt_raw = tgt
 
         # Some datasets (e.g., diffusion training) provide a temporal stack for
         # observations like state/env_state with shape (B, S, D). OT operates on
@@ -466,33 +472,56 @@ def compute_ot_loss_for_policy(
                 return x[:, -1]
             return x
 
-        src = _collapse_time_if_needed(feat.src_key, src)
-        tgt = _collapse_time_if_needed(feat.tgt_key, tgt)
+        src_for_embed = _collapse_time_if_needed(feat.src_key, src)
+        tgt_for_embed = _collapse_time_if_needed(feat.tgt_key, tgt)
 
         # Move features to the policy's device if necessary so that they match
         # any OT embedding head parameters.
         if target_device is not None:
-            if src.device != target_device:
-                src = src.to(target_device)
-            if tgt.device != target_device:
-                tgt = tgt.to(target_device)
+            if src_for_embed.device != target_device:
+                src_for_embed = src_for_embed.to(target_device)
+            if tgt_for_embed.device != target_device:
+                tgt_for_embed = tgt_for_embed.to(target_device)
 
         # Build label cost if requested; requires 2D tensors (B, D)
         build_label = float(getattr(feat, "weight_label", 0.0)) != 0.0
-        if build_label and (src.ndim != 2 or tgt.ndim != 2):
-            raise ValueError(
-                f"OT label features must be 2D (B, D). Got {feat.src_key}: {tuple(src.shape)}, "
-                f"{feat.tgt_key}: {tuple(tgt.shape)}"
-            )
 
-        # Slice along feature dimension if requested (label space). For the
-        # label cost we interpret `dim_slice` in the raw feature space.
-        if feat.dim_slice is not None:
-            src_slice = src[:, feat.dim_slice]
-            tgt_slice = tgt[:, feat.dim_slice]
+        # Label 路径：以 ot-sim2real 为准，若存在时间维（B,S,D），先在最后一维做 dim_slice，再在 S 维展平到 2D。
+        if build_label:
+            s_raw = src_raw
+            t_raw = tgt_raw
+            # 先做 dim_slice（按最后一维）
+            if feat.dim_slice is not None and s_raw.ndim >= 2:
+                if s_raw.ndim == 2:
+                    s_raw = s_raw[:, feat.dim_slice]
+                else:
+                    s_raw = s_raw[..., feat.dim_slice]
+            if feat.dim_slice is not None and t_raw.ndim >= 2:
+                if t_raw.ndim == 2:
+                    t_raw = t_raw[:, feat.dim_slice]
+                else:
+                    t_raw = t_raw[..., feat.dim_slice]
+            # 再在 batch 之外全部展平，得到 (B, D_flat)
+            if s_raw.ndim >= 3:
+                s_lab = torch.flatten(s_raw, start_dim=1)
+            else:
+                s_lab = s_raw
+            if t_raw.ndim >= 3:
+                t_lab = torch.flatten(t_raw, start_dim=1)
+            else:
+                t_lab = t_raw
+            # 移到设备
+            if target_device is not None:
+                if s_lab.device != target_device:
+                    s_lab = s_lab.to(target_device)
+                if t_lab.device != target_device:
+                    t_lab = t_lab.to(target_device)
+            src_slice = s_lab
+            tgt_slice = t_lab
         else:
-            src_slice = src
-            tgt_slice = tgt
+            # 不需要 label cost 时，embed 路径仍使用处理过的 2D 表征
+            src_slice = src_for_embed
+            tgt_slice = tgt_for_embed
 
         # Label cost in the original feature space. To match ot-sim2real's
         # behavior, label terms are treated as pure targets and do not receive
@@ -510,14 +539,19 @@ def compute_ot_loss_for_policy(
         # Optional embedding cost.
         if feat.use_learned_embed:
             # Require a policy-native encoder for learned embeddings.
-            src_encoded = _encode_with_policy(feat.src_key, src)
-            tgt_encoded = _encode_with_policy(feat.tgt_key, tgt)
+            src_encoded = _encode_with_policy(feat.src_key, src_for_embed)
+            tgt_encoded = _encode_with_policy(feat.tgt_key, tgt_for_embed)
             if src_encoded is None or tgt_encoded is None:
                 raise ValueError(
                     f"No policy-native encoder available for OT embedding of keys "
                     f"'{feat.src_key}' / '{feat.tgt_key}'. Implement 'encode_feature_for_ot' on the policy "
                     f"or ensure the policy exposes appropriate encoders."
                 )
+            # 若编码结果仍包含时间维（B,S,D），按 ot-sim2real 展平为 (B, S*D)
+            if src_encoded.ndim >= 3:
+                src_encoded = torch.flatten(src_encoded, start_dim=1)
+            if tgt_encoded.ndim >= 3:
+                tgt_encoded = torch.flatten(tgt_encoded, start_dim=1)
             # Keep full encoded reps; don't reuse dim_slice here to avoid mismatch with policy dims.
             M_embed = torch.cdist(src_encoded, tgt_encoded) ** 2
         else:
@@ -547,7 +581,8 @@ def compute_ot_loss_for_policy(
 
     # Build a corresponding OTCostConfig from feature specs.
     terms_cfg = [
-        OTTermConfig(name=(feat.term_name or feat.src_key), weight=1.0) for feat in cfg.features
+        OTTermConfig(name=(feat.term_name or feat.src_key), weight=float(getattr(feat, "term_weight", 1.0)))
+        for feat in cfg.features
     ]
     cost_cfg = OTCostConfig(
         terms=terms_cfg,

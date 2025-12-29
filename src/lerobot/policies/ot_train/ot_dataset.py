@@ -1,6 +1,7 @@
 import json
 import random
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -138,6 +139,10 @@ class LeRobotOTPairDataset(Dataset):
         base_index_src: int = 0,
         base_index_tgt: int = 0,
         window_size: int | None = None,
+        # Optional sampling controls
+        sharpness: float = 0.0,
+        no_window: bool = False,
+        topk_src_episodes: int | None = None,
     ) -> None:
         super().__init__()
         self.ds_src = ds_src
@@ -145,6 +150,10 @@ class LeRobotOTPairDataset(Dataset):
         self.obs_keys = list(obs_keys) if obs_keys is not None else ["observation.state"]
         self.action_key = action_key
         self.window = int(window_size) if window_size and window_size > 0 else None
+        # Sampling knobs (default preserve legacy behavior)
+        self.sharpness = float(sharpness) if sharpness is not None else 0.0
+        self.no_window = bool(no_window)
+        self.topk_src_episodes = int(topk_src_episodes) if topk_src_episodes not in (None, -1) else None
 
         self.src_spans = _build_episode_spans(self.ds_src)
         self.tgt_spans = _build_episode_spans(self.ds_tgt)
@@ -160,8 +169,8 @@ class LeRobotOTPairDataset(Dataset):
         def name2idx_tgt(name: str) -> int:
             return _episode_name_to_index(name, base_index=base_index_tgt)
 
-        # Build sample descriptors: each contains (tgt_global_idx, [src_global_idx ...])
-        samples: List[Tuple[int, List[int]]] = []
+        # Build sample descriptors: each contains (tgt_global_idx, [src_global_idx ...], [weight ...])
+        samples: List[Tuple[int, List[int], List[float]]] = []
         # Keep a reference to the target dataset's local episode map (if any) so
         # that we can ignore pairs for episodes that are not present in `ds_tgt`.
         tgt_local_map: dict[int, tuple[int, int]] | None = getattr(
@@ -179,10 +188,20 @@ class LeRobotOTPairDataset(Dataset):
                 continue
             tgt_span = self.tgt_spans[tgt_ep_idx]
 
+            # Optionally keep only top-K closest src episodes for this target episode
+            if self.topk_src_episodes is not None and self.topk_src_episodes > 0:
+                with_dist = [p for p in src_list if "raw_dtw_dist" in p]
+                if len(with_dist) == len(src_list) and len(with_dist) > self.topk_src_episodes:
+                    src_iter = sorted(with_dist, key=lambda p: float(p.get("raw_dtw_dist", float("inf"))))[: self.topk_src_episodes]
+                else:
+                    src_iter = src_list  # distances missing or not enough candidates
+            else:
+                src_iter = src_list
+
             # Merge all candidate src episodes for this target episode
-            # into a dict: tgt_local_idx -> List[src_global_idx]
-            per_tgt_index: Dict[int, List[int]] = {}
-            for pair in src_list:
+            # into a dict: tgt_local_idx -> (List[src_global_idx], List[weight])
+            per_tgt_index: Dict[int, Tuple[List[int], List[float]]] = {}
+            for pair in src_iter:
                 src_name = pair.get("demo_name")
                 if src_name is None:
                     continue
@@ -191,6 +210,16 @@ class LeRobotOTPairDataset(Dataset):
                     continue
                 src_span = self.src_spans[src_ep_idx]
                 idx_map: Dict[str, List[int]] = pair.get("pairing", {})  # tgt_local -> list[src_local]
+                # Episode-level weight from DTW distance, if available
+                dist_val = pair.get("raw_dtw_dist", None)
+                if dist_val is None or not isinstance(dist_val, (int, float)):
+                    w_ep = 1.0
+                else:
+                    w_ep = math.exp(-self.sharpness * float(dist_val)) if self.sharpness > 0 else 1.0
+                    if not math.isfinite(w_ep):
+                        w_ep = 0.0
+                    if w_ep == 0.0:
+                        w_ep = 1e-12
                 for tgt_local_str, src_locals in idx_map.items():
                     try:
                         tgt_local = int(tgt_local_str)
@@ -199,7 +228,8 @@ class LeRobotOTPairDataset(Dataset):
                     # Bound-check within episode lengths
                     if tgt_local < 0 or tgt_local >= len(tgt_span):
                         continue
-                    src_globals = []
+                    src_globals: List[int] = []
+                    src_weights: List[float] = []
                     for s_local in src_locals:
                         if isinstance(s_local, (list, tuple)):
                             # In case pairing stores [idx] lists
@@ -208,41 +238,86 @@ class LeRobotOTPairDataset(Dataset):
                             s_local = int(s_local[0])
                         s_local = int(s_local)
                         if 0 <= s_local < len(src_span):
-                            src_globals.append(src_span.start + s_local)
+                            g = src_span.start + s_local
+                            src_globals.append(g)
+                            src_weights.append(w_ep)
                     if len(src_globals) == 0:
                         continue
-                    per_tgt_index.setdefault(tgt_local, []).extend(src_globals)
+                    if tgt_local not in per_tgt_index:
+                        per_tgt_index[tgt_local] = ([], [])
+                    per_tgt_index[tgt_local][0].extend(src_globals)
+                    per_tgt_index[tgt_local][1].extend(src_weights)
 
             # Finalize per-tgt sample list
             for tgt_local, src_candidates in per_tgt_index.items():
                 tgt_global = tgt_span.start + int(tgt_local)
-                samples.append((tgt_global, src_candidates))
+                if isinstance(src_candidates, tuple):
+                    src_list_final, w_list_final = src_candidates
+                else:
+                    src_list_final = list(src_candidates)  # type: ignore[list-item]
+                    w_list_final = [1.0] * len(src_list_final)
+                if not any(w > 0 for w in w_list_final):
+                    w_list_final = [1.0] * len(w_list_final)
+                samples.append((tgt_global, src_list_final, w_list_final))
 
         if len(samples) == 0:
             raise ValueError(
                 "No valid OT pairs built from pair_info. Check base_index_src/tgt or episode naming."
             )
 
-        self._samples: List[Tuple[int, List[int]]] = samples
+        self._samples: List[Tuple[int, List[int], List[float]]] = samples
+
+        # Precompute a lookup from global src index to its episode span index
+        # for fast no_window sampling.
+        try:
+            n_src = len(self.ds_src)
+        except Exception:
+            n_src = max((span.end for span in self.src_spans), default=0)
+        self._src_global_to_ep_idx: List[int] = [-1] * int(n_src)
+        for ep_i, span in enumerate(self.src_spans):
+            for g in range(int(span.start), int(span.end)):
+                if 0 <= g < n_src:
+                    self._src_global_to_ep_idx[g] = ep_i
 
     def __len__(self) -> int:
         return len(self._samples)
 
-    def _select_indices(self, tgt_global: int, src_candidates: List[int]) -> Tuple[int, int]:
-        """Pick concrete indices using window semantics: jitter only source.
-
-        - If window is None: keep target fixed and pick a source from candidates.
-        - If window is set: keep target fixed at tgt_global, and jitter the chosen
-          source index within [center - w, center + w], clamped to dataset bounds.
-        """
+    def _select_indices(
+        self, tgt_global: int, src_candidates: List[int], src_weights: List[float]
+    ) -> Tuple[int, int]:
+        """Pick concrete indices using window semantics and optional weighted / no-window sampling."""
         tgt_idx = tgt_global  # target is fixed
-        src_idx_center = random.choice(src_candidates)
-        if self.window is None:
+        # Weighted pick if possible
+        if src_weights and any(w > 0 for w in src_weights):
+            try:
+                src_idx_center = random.choices(src_candidates, weights=src_weights, k=1)[0]
+            except Exception:
+                src_idx_center = random.choice(src_candidates)
+        else:
+            src_idx_center = random.choice(src_candidates)
+
+        # no_window variant: ignore aligned index and sample anywhere within that source episode
+        if self.no_window:
+            ep_idx = -1
+            if 0 <= src_idx_center < len(self._src_global_to_ep_idx):
+                ep_idx = self._src_global_to_ep_idx[src_idx_center]
+            if 0 <= ep_idx < len(self.src_spans):
+                span = self.src_spans[ep_idx]
+                if len(span) > 0:
+                    src_idx = random.randint(int(span.start), int(span.end) - 1)
+                    return tgt_idx, src_idx
+            # Fallback
             return tgt_idx, src_idx_center
-        w = int(self.window)
-        offset = random.randint(-w, w)
-        src_idx = max(0, min(src_idx_center + offset, len(self.ds_src) - 1))
-        return tgt_idx, src_idx
+
+        # window jitter around aligned source index
+        if self.window is not None:
+            w = int(self.window)
+            offset = random.randint(-w, w)
+            src_idx = max(0, min(src_idx_center + offset, len(self.ds_src) - 1))
+            return tgt_idx, src_idx
+
+        # Default: use aligned index
+        return tgt_idx, src_idx_center
 
     def _filter_obs(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """Select observation keys to include in OT samples.
@@ -271,8 +346,8 @@ class LeRobotOTPairDataset(Dataset):
         return out
 
     def __getitem__(self, i: int) -> Dict[str, Dict[str, Any]]:
-        tgt_global, src_candidates = self._samples[i]
-        tgt_idx, src_idx = self._select_indices(tgt_global, src_candidates)
+        tgt_global, src_candidates, src_weights = self._samples[i]
+        tgt_idx, src_idx = self._select_indices(tgt_global, src_candidates, src_weights)
 
         tgt_item = self.ds_tgt[tgt_idx]
         src_item = self.ds_src[src_idx]

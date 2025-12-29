@@ -39,6 +39,10 @@ class OTConfig:
     base_index_src: int = 0
     base_index_tgt: int = 0
     window_size: int = 0
+    # Sampling strategy extensions for OT pair dataset
+    sharpness: float = 0.0          # distance→weight: w = exp(-sharpness * dist); 0 means uniform
+    no_window: bool = False         # if True, ignore aligned time and sample anywhere within the source episode
+    topk_src_episodes: int | None = None  # keep only top-K closest src episodes per tgt episode (by raw_dtw_dist)
     # Optional high-level OT loss configuration. Kept as a plain mapping here
     # so that the configs package stays free of policy / OT module imports.
     # The training script is responsible for interpreting this (typically as

@@ -173,6 +173,146 @@ def update_policy(
     return train_metrics, output_dict
 
 
+
+def _slice_batch(batch: dict, n: int) -> dict:
+    """Take the first n samples along batch dim for every tensor leaf in a nested dict."""
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, dict):
+            out[k] = _slice_batch(v, n)
+        elif hasattr(v, "shape") and v.__class__.__name__ == "Tensor":
+            out[k] = v[:n]
+        else:
+            out[k] = v
+    return out
+
+
+_CONCAT_DEBUG_LIMIT = 8  # emit at most N debug lines from concat alignment
+_concat_debug_count = 0
+
+
+def _concat_two_batches(b1: dict, b2: dict) -> dict:
+    """Concatenate two nested-batch dicts along batch dim for matching tensor leaves.
+
+    If a key exists in only one input, keep that value.
+    """
+    keys = set(b1.keys()) | set(b2.keys())
+    out = {}
+    # Only align ranks for scalar/vector-like keys; never try to expand images/videos.
+    RANK_ALIGN_KEYS = {"action", "observation.state", "observation.environment_state"}
+
+    def _infer_batch_size(d: dict) -> int | None:
+        """Try to infer batch size from a nested dict by looking for a Tensor leaf.
+
+        Prefer the 'action' key when available.
+        """
+        try:
+            v = d.get("action", None)
+            if hasattr(v, "shape") and v.__class__.__name__ == "Tensor":
+                return int(v.shape[0])
+        except Exception:
+            pass
+        for _v in d.values():
+            if isinstance(_v, dict):
+                bs = _infer_batch_size(_v)
+                if bs is not None:
+                    return bs
+            elif hasattr(_v, "shape") and _v.__class__.__name__ == "Tensor":
+                return int(_v.shape[0])
+        return None
+    for k in keys:
+        in1 = k in b1; in2 = k in b2
+        if in1 and in2:
+            v1, v2 = b1[k], b2[k]
+            if isinstance(v1, dict) and isinstance(v2, dict):
+                out[k] = _concat_two_batches(v1, v2)
+            elif (
+                hasattr(v1, "shape")
+                and v1.__class__.__name__ == "Tensor"
+                and hasattr(v2, "shape")
+                and v2.__class__.__name__ == "Tensor"
+            ):
+                # When mixing batches coming from different DataLoaders, Accelerate may have already
+                # moved one to the GPU while the other is still on CPU. Ensure both tensors are on
+                # the same device before concatenating along the batch dimension.
+                import torch as _torch
+
+                if v1.device != v2.device:
+                    # Prefer the non-CPU device if any; otherwise keep CPU.
+                    if v1.device.type != "cpu":
+                        v2 = v2.to(v1.device, non_blocking=(v1.device.type == "cuda"))
+                    elif v2.device.type != "cpu":
+                        v1 = v1.to(v2.device, non_blocking=(v2.device.type == "cuda"))
+                    # If both are CPU, do nothing.
+                    global _concat_debug_count
+                    if _concat_debug_count < _CONCAT_DEBUG_LIMIT:
+                        logging.info(f"concat-align device for key='{k}': {v1.device} vs {v2.device}")
+                        _concat_debug_count += 1
+
+                # Align ranks if needed (e.g., (B, T, D) with (B, D)).
+                if v1.dim() != v2.dim() and k in RANK_ALIGN_KEYS:
+                    # Handle common 3D vs 2D mismatch for whitelisted keys only.
+                    if v1.dim() == 3 and v2.dim() == 2 and v1.size(-1) == v2.size(-1):
+                        v2 = v2.unsqueeze(1).repeat(1, v1.size(1), 1)
+                        if _concat_debug_count < _CONCAT_DEBUG_LIMIT:
+                            logging.info(
+                                f"concat-align rank (expand v2) key='{k}': {tuple(v1.shape)} vs {tuple(v2.shape)}"
+                            )
+                            _concat_debug_count += 1
+                    elif v1.dim() == 2 and v2.dim() == 3 and v1.size(-1) == v2.size(-1):
+                        v1 = v1.unsqueeze(1).repeat(1, v2.size(1), 1)
+                        if _concat_debug_count < _CONCAT_DEBUG_LIMIT:
+                            logging.info(
+                                f"concat-align rank (expand v1) key='{k}': {tuple(v1.shape)} vs {tuple(v2.shape)}"
+                            )
+                            _concat_debug_count += 1
+                    # Otherwise fall through; torch.cat will raise if shapes incompatible.
+
+                out[k] = _torch.cat([v1, v2], dim=0)
+            else:
+                out[k] = v1
+        elif in1:
+            v1 = b1[k]
+            # If only present in batch1 and tensor-like, try to pad with sensible defaults for batch2.
+            if hasattr(v1, "shape") and v1.__class__.__name__ == "Tensor":
+                import torch as _torch
+                # Special-case known mask: action_is_pad -> default False
+                if k == "action_is_pad" and v1.dim() >= 1:
+                    bs2 = _infer_batch_size(b2) or 0
+                    pad_shape = (bs2,) + tuple(v1.shape[1:])
+                    pad = _torch.zeros(pad_shape, dtype=v1.dtype, device=v1.device)
+                    out[k] = _torch.cat([v1, pad], dim=0)
+                    if _concat_debug_count < _CONCAT_DEBUG_LIMIT:
+                        logging.info(
+                            f"concat-pad missing action_is_pad (left present) with zeros; new shape={tuple(out[k].shape)}"
+                        )
+                        _concat_debug_count += 1
+                else:
+                    out[k] = v1
+            else:
+                out[k] = v1
+        else:
+            v2 = b2[k]
+            if hasattr(v2, "shape") and v2.__class__.__name__ == "Tensor":
+                import torch as _torch
+                if k == "action_is_pad" and v2.dim() >= 1:
+                    bs1 = _infer_batch_size(b1) or 0
+                    pad_shape = (bs1,) + tuple(v2.shape[1:])
+                    pad = _torch.zeros(pad_shape, dtype=v2.dtype, device=v2.device)
+                    out[k] = _torch.cat([pad, v2], dim=0)
+                    if _concat_debug_count < _CONCAT_DEBUG_LIMIT:
+                        logging.info(
+                            f"concat-pad missing action_is_pad (right present) with zeros; new shape={tuple(out[k].shape)}"
+                        )
+                        _concat_debug_count += 1
+                else:
+                    out[k] = v2
+            else:
+                out[k] = v2
+    return out
+
+
+
 def _build_ot_loss_config_from_object(loss_cfg: object | None) -> OTLossConfig | None:
     """Convert a generic JSON/YAML-style object into an `OTLossConfig`.
 
@@ -689,10 +829,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             if cfg.dataset.image_transforms.enable
             else None
         )
+        # 让 BC 源数据集在时间维与主数据集一致（对齐 action 窗口与 _is_pad 掩码），以匹配 ot-sim2real 的做法：
+        # 使用与主数据相同的 delta_timestamps（由 policy 的 *delta_indices 推导）。
+        ds_src_meta = LeRobotDatasetMetadata(
+            cfg.ot.src_repo_id,
+            root=cfg.ot.src_root if cfg.ot.src_root else cfg.dataset.root,
+            revision=cfg.dataset.revision,
+        )
+        delta_timestamps_src = resolve_delta_timestamps(cfg.policy, ds_src_meta)
+
         ds_src = LeRobotDataset(
             cfg.ot.src_repo_id,
             root=cfg.ot.src_root if cfg.ot.src_root else cfg.dataset.root,
             image_transforms=img_tf_src,
+            delta_timestamps=delta_timestamps_src,
             revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,
         )
@@ -712,7 +862,22 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             base_index_src=cfg.ot.base_index_src,
             base_index_tgt=cfg.ot.base_index_tgt,
             window_size=cfg.ot.window_size if cfg.ot.window_size > 0 else None,
+            sharpness=getattr(cfg.ot, 'sharpness', 0.0),
+            no_window=getattr(cfg.ot, 'no_window', False),
+            topk_src_episodes=getattr(cfg.ot, 'topk_src_episodes', None),
             num_workers=cfg.num_workers,
+        )
+        # Mix source data into BC: make a small BC-src dataloader and split the main batch.
+        bc_tgt_bs = (cfg.batch_size + 1) // 2
+        bc_src_bs = max(1, cfg.batch_size - bc_tgt_bs)
+        bc_src_dataloader = torch.utils.data.DataLoader(
+            ds_src,
+            num_workers=cfg.num_workers,
+            batch_size=bc_src_bs,
+            shuffle=True,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
         )
         # Convert any JSON/YAML-style OT loss config into a strongly-typed
         # OTLossConfig instance understood by the OT loss utilities.
@@ -750,6 +915,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     else:
         ot_iter = None
 
+    if "bc_src_dataloader" in locals():
+        bc_src_iter = cycle(bc_src_dataloader)
+    else:
+        bc_src_iter = None
+
     policy.train()
 
     train_metrics = {
@@ -777,6 +947,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         raw_batch = next(dl_iter)
+        if bc_src_iter is not None:
+            raw_batch_tgt = _slice_batch(raw_batch, bc_tgt_bs)
+            raw_batch_src = next(bc_src_iter)
+            raw_batch = _concat_two_batches(raw_batch_tgt, raw_batch_src)
         batch = preprocessor(raw_batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
