@@ -2,10 +2,10 @@
 
 input:
   mcap_file: ""             # or leave empty and use task_dir
-  task_dir: ""              # e.g. /data/das/task_run_dir (must contain vio_result.json)
+  task_dir: "/home/hanyu/Data_Collection/data/output/vio_12_22_x"              # e.g. /data/das/task_run_dir (must contain vio_result.json)
 
 output:
-  root_path: "../assets/data"
+  task_dir: "dataset/data/das"
   repo_name: "das_demo_ee2dee"
   robot_name: "fr3"
 

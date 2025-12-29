@@ -431,6 +431,11 @@ class Das2HirolConverter:
         tgt_size = tuple(pp.get("target_size", [640, 480]))
         tgt_ar = tuple(pp.get("aspect_ratio", [4, 3]))
 
+        # Record kept frame indices in the ref timebase so we can build actions
+        # over the downsampled sequence (t -> t+K in kept frames), matching
+        # das2lerobot_converter.md L43-L48.
+        kept_indices: List[int] = []
+
         for i, seq in enumerate(ref_seq):
             ts_s = ref_ts_s[i]
             if not self._keep_by_fps(ts_s, last_kept_ts, self.cfg.fps):
@@ -524,10 +529,106 @@ class Das2HirolConverter:
             frames_out.append(step_obj)
             last_kept_ts = ts_s
             frames_written += 1
+            kept_indices.append(i)
 
         if frames_written == 0:
             log.warning("No frames written for episode; skipping JSON emit")
             return 0, frames_skipped
+
+        # If configured or requested, synthesize state-based actions per frame.
+        # Default behavior: action at step t is the observation at kept step t+1.
+        try:
+            raw = getattr(self.cfg, 'action', None)
+        except Exception:
+            raw = None
+        # Only build actions when ee pose exists; otherwise skip silently.
+        has_eef = ("eef_pose" in arrays) and (arrays["eef_pose"].shape[0] > 0)
+        if has_eef and frames_written > 0:
+            act_type = "ee"
+            act_step = 1
+            act_ori = "quaternion"
+            include_gripper = False
+            if isinstance(raw, dict):
+                act_type = str(raw.get("type", act_type)).lower()
+                act_step = int(raw.get("prediction_step", act_step))
+                act_ori = str(raw.get("orientation", act_ori)).lower()
+                include_gripper = bool(raw.get("include_gripper", False))
+
+            # Helper: quaternion ops to compute relative pose if needed.
+            def _quat_mul(q1: List[float] | Tuple[float, ...], q2: List[float] | Tuple[float, ...]):
+                x1, y1, z1, w1 = q1
+                x2, y2, z2, w2 = q2
+                # Hamilton product (x,y,z,w)
+                x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+                y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+                z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+                w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+                return [x, y, z, w]
+
+            def _quat_conj(q: List[float] | Tuple[float, ...]):
+                x, y, z, w = q
+                return [-x, -y, -z, w]
+
+            def _quat_apply(q: List[float] | Tuple[float, ...], v: List[float] | Tuple[float, ...]):
+                # Rotate vector v by unit quaternion q using cross-product form
+                x, y, z, w = q
+                qv = np.array([x, y, z], dtype=np.float64)
+                v = np.array(v, dtype=np.float64)
+                t = 2.0 * np.cross(qv, v)
+                return (v + w * t + np.cross(qv, t)).tolist()
+
+            def _pose_delta(next_pose: List[float], cur_pose: List[float]) -> List[float]:
+                # next - cur in the current frame (position expressed in cur frame)
+                p1 = np.array(next_pose[:3], dtype=np.float64)
+                p2 = np.array(cur_pose[:3], dtype=np.float64)
+                q1 = [float(next_pose[3]), float(next_pose[4]), float(next_pose[5]), float(next_pose[6])]
+                q2 = [float(cur_pose[3]), float(cur_pose[4]), float(cur_pose[5]), float(cur_pose[6])]
+                dq = _quat_mul(_quat_conj(q2), q1)
+                dp_world = (p1 - p2).tolist()
+                dp_local = _quat_apply(_quat_conj(q2), dp_world)
+                return [dp_local[0], dp_local[1], dp_local[2], dq[0], dq[1], dq[2], dq[3]]
+
+            # Build actions for each kept frame, using the next kept frame by default
+            for j in range(frames_written):
+                # Resolve current/next kept indices into the original ref index space
+                cur_ref_idx = kept_indices[j]
+                next_j = j + max(1, act_step)
+                if next_j >= frames_written:
+                    next_ref_idx = kept_indices[-1]  # duplicate last valid action
+                else:
+                    next_ref_idx = kept_indices[next_j]
+
+                # Populate actions per ee key present in ee_states for this frame
+                step_actions: Dict[str, Any] = {}
+                ee_states = frames_out[j].get("ee_states", {}) or {}
+                ts_next = _json_float_or_none(ref_ts_s[next_ref_idx])
+                # allow both single-EE (key 'single') and multi-EE schemas
+                for ee_key, state in ee_states.items():
+                    # Current and future pose from arrays to avoid JSON float rounding
+                    cur_pose = arrays["eef_pose"][cur_ref_idx].astype(float).tolist()
+                    next_pose = arrays["eef_pose"][next_ref_idx].astype(float).tolist()
+                    if act_type == "dee":
+                        act_pose = _pose_delta(next_pose, cur_pose)
+                    else:  # "ee" absolute by default
+                        act_pose = next_pose
+                    # Orientation output: currently only quaternion supported in converter
+                    if act_ori != "quaternion":
+                        log.warning(
+                            f"action.orientation '{act_ori}' not supported in converter; using quaternion"
+                        )
+                    action_entry: Dict[str, Any] = {
+                        "ee": {"pose": act_pose, "time_stamp": ts_next}
+                    }
+                    if include_gripper and ("gripper" in arrays):
+                        g_next = float(np.atleast_1d(arrays["gripper"][next_ref_idx].reshape(-1))[0])
+                        action_entry["tool"] = {"position": g_next, "time_stamp": ts_next}
+                    step_actions[ee_key] = action_entry
+                # If no ee_states, but we still want to write tool-only action
+                if (not step_actions) and include_gripper and ("gripper" in arrays):
+                    g_next = float(np.atleast_1d(arrays["gripper"][next_ref_idx].reshape(-1))[0])
+                    step_actions["single"] = {"tool": {"position": g_next, "time_stamp": ts_next}}
+                # Attach actions to the frame
+                frames_out[j]["actions"] = step_actions
 
         # Fallback hw if no image saved (should not happen if frames_written>0)
         if image_hw is None:
@@ -620,6 +721,10 @@ def _parse_cfg(raw: Dict[str, Any]) -> ConverterCfg:
     require = raw.get('require', None)
     if isinstance(require, dict):
         setattr(cfg, 'require', require)
+    # Attach optional 'action' configuration so the converter can build actions
+    action_cfg = raw.get('action', None)
+    if isinstance(action_cfg, dict):
+        setattr(cfg, 'action', action_cfg)
     return cfg
 
 

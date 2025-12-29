@@ -529,24 +529,67 @@ class Das2LerobotConverter:
         frames_written = 0
         frames_skipped = 0
 
+        # Build kept index list first, then use next kept frame for action (t+K on downsampled timeline).
+        kept_indices: List[int] = []
         last_kept_ts: Optional[float] = None
-        n = len(ref_seq)
-        for i in range(n):
-            ts_s = ref_ts_s[i]
-            if not self._keep_by_fps(ts_s, last_kept_ts, self.cfg.fps):
-                frames_skipped += 1
-                continue
+        for i, ts_s in enumerate(ref_ts_s):
+            if self._keep_by_fps(ts_s, last_kept_ts, self.cfg.fps):
+                kept_indices.append(i)
+                last_kept_ts = ts_s
 
-            # Compose frame
+        # Nothing to write
+        if len(kept_indices) == 0:
+            return 0, len(ref_seq)
+
+        # Iterate kept frames and compose obs/action aligned to kept t+K
+        def _compose_action_between(idx_cur: int, idx_next: int) -> Optional[np.ndarray]:
+            act_type = (self.cfg.action.type or "").lower()
+            ee = arrays.get("eef_pose", None)
+            g = arrays.get("gripper", None)
+            if act_type in ("ee", "dee"):
+                if ee is None:
+                    raise RuntimeError("Action requires eef_pose but it's missing")
+                if idx_next >= ee.shape[0]:
+                    return None
+                if act_type == "ee":
+                    vec = self._ee_vec_for_action(ee[idx_next])
+                else:  # dee
+                    diff = pose_diff_quat(ee[idx_next], ee[idx_cur])
+                    if self.cfg.action.orientation == "euler":
+                        v = np.zeros((6,), dtype=np.float32)
+                        v[:3] = diff[:3]
+                        v[3:] = quat_to_euler_xyz(diff[3:])
+                        vec = v
+                    else:
+                        vec = diff
+                if bool(self.cfg.action.include_gripper) and g is not None:
+                    if act_type == "ee":
+                        gv = np.asarray(g[idx_next]).reshape(-1).astype(np.float32)
+                    else:
+                        gv = (np.asarray(g[idx_next]) - np.asarray(g[idx_cur])).reshape(-1).astype(np.float32)
+                    vec = np.concatenate([vec, gv], axis=0)
+                return vec
+            raise ValueError(f"Unsupported or missing action.type: {act_type}")
+
+        # Determine stride on kept timeline (at least 1)
+        K = max(int(self.cfg.action.prediction_step), 1)
+        for j, i in enumerate(kept_indices):
+            # Next kept index: clamp to last kept frame to keep length consistent
+            next_j = j + K
+            if next_j >= len(kept_indices):
+                next_i = kept_indices[-1]
+            else:
+                next_i = kept_indices[next_j]
+
+            # Fetch images for current kept seq
             imgs = self._fetch_images_for_seq(bag, ref_seq[i])
             if imgs is None or len(imgs) != len(self.cfg.topics.cameras):
                 frames_skipped += 1
                 continue
 
             obs_vec = self.compose_observation_state_at(i, arrays)
-            act_vec = self.compose_action_at(i, arrays, allow_tail_short=True)
+            act_vec = _compose_action_between(i, next_i)
             if act_vec is None:
-                # tail frames that cannot form action t+K
                 frames_skipped += 1
                 continue
 
@@ -560,11 +603,10 @@ class Das2LerobotConverter:
             try:
                 writer.add_frame(frame)
             except Exception as e:
-                log.warning(f"add_frame failed at idx={i}: {e}")
+                log.warning(f"add_frame failed at kept_idx={j} (src idx={i}): {e}")
                 frames_skipped += 1
                 continue
 
-            last_kept_ts = ts_s
             frames_written += 1
 
         if frames_written > 0:
