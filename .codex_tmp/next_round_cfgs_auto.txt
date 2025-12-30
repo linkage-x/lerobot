@@ -1,0 +1,5 @@
+src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline_1imqb7.json
+src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline_0j57ea_fix.json
+src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline_cqm6fm_idj1ci_fix.json
+src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline_f41by4_v9z4nx_fix.json
+src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline_16lch8_qllxw3_fix.json

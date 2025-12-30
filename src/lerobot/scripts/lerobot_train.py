@@ -791,6 +791,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
+    # Default: single-dataset loader (target only), optionally using EpisodeAwareSampler
+    # If OT weighted BC mixing is enabled (cfg.ot.enable and cfg.ot.bc_src_weight is not None),
+    # we will overwrite this dataloader below after constructing the OT source dataset.
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
         sampler = EpisodeAwareSampler(
@@ -867,18 +870,81 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             topk_src_episodes=getattr(cfg.ot, 'topk_src_episodes', None),
             num_workers=cfg.num_workers,
         )
-        # Mix source data into BC: make a small BC-src dataloader and split the main batch.
-        bc_tgt_bs = (cfg.batch_size + 1) // 2
-        bc_src_bs = max(1, cfg.batch_size - bc_tgt_bs)
-        bc_src_dataloader = torch.utils.data.DataLoader(
-            ds_src,
-            num_workers=cfg.num_workers,
-            batch_size=bc_src_bs,
-            shuffle=True,
-            pin_memory=device.type == "cuda",
-            drop_last=False,
-            prefetch_factor=2 if cfg.num_workers > 0 else None,
-        )
+        # Weighted BC sampling (target + src) to align with robomimic MetaDataset
+        # If cfg.ot.bc_src_weight is set, build a ConcatDataset and a WeightedRandomSampler
+        # that draws from target and src according to weights, optionally normalized by dataset size.
+        if getattr(cfg.ot, "bc_src_weight", None) is not None:
+            from torch.utils.data import ConcatDataset, WeightedRandomSampler
+            import torch as _torch
+
+            bc_src_weight = float(cfg.ot.bc_src_weight)
+            bc_tgt_weight = max(0.0, 1.0 - bc_src_weight)
+
+            # Build concat dataset: [target, src]
+            mixed_dataset = ConcatDataset([dataset, ds_src])
+
+            # Optional: drop last N frames per episode similar to EpisodeAwareSampler
+            drop_last = int(getattr(cfg.policy, "drop_n_last_frames", 0) or 0)
+
+            def _mask_valid_indices(ds: LeRobotDataset, drop_n_last_frames: int) -> _torch.Tensor:
+                if drop_n_last_frames <= 0:
+                    return _torch.ones(len(ds), dtype=_torch.bool)
+                mask = _torch.zeros(len(ds), dtype=_torch.bool)
+                starts = ds.meta.episodes["dataset_from_index"]
+                ends = ds.meta.episodes["dataset_to_index"]
+                for s, e in zip(starts, ends, strict=True):
+                    end_keep = max(int(s), int(e) - int(drop_n_last_frames))
+                    if end_keep > int(s):
+                        mask[_torch.arange(int(s), end_keep, dtype=_torch.long)] = True
+                return mask
+
+            mask_tgt = _mask_valid_indices(dataset, drop_last)
+            mask_src = _mask_valid_indices(ds_src, drop_last)
+
+            if getattr(cfg.ot, "normalize_bc_weights_by_ds_size", True):
+                # Probability mass per dataset divided uniformly among its valid samples
+                wt_tgt = (bc_tgt_weight / max(1, int(mask_tgt.sum()))) if bc_tgt_weight > 0 else 0.0
+                wt_src = (bc_src_weight / max(1, int(mask_src.sum()))) if bc_src_weight > 0 else 0.0
+            else:
+                # Raw dataset weights per-sample (length-biased)
+                wt_tgt = bc_tgt_weight
+                wt_src = bc_src_weight
+
+            weights_tgt = _torch.where(mask_tgt, _torch.full((len(dataset),), float(wt_tgt)), _torch.zeros(len(dataset)))
+            weights_src = _torch.where(mask_src, _torch.full((len(ds_src),), float(wt_src)), _torch.zeros(len(ds_src)))
+            weights = _torch.cat([weights_tgt, weights_src])
+            if float(weights.sum()) <= 0:
+                # Fallback to uniform if masks zero everything (shouldn't happen)
+                weights = _torch.ones(len(weights)) / len(weights)
+            else:
+                weights = weights / weights.sum()
+
+            sampler = WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
+
+            # Overwrite main dataloader with the weighted-mix dataset + sampler
+            dataloader = torch.utils.data.DataLoader(
+                mixed_dataset,
+                num_workers=cfg.num_workers,
+                batch_size=cfg.batch_size,
+                shuffle=False,  # sampler controls randomness
+                sampler=sampler,
+                pin_memory=device.type == "cuda",
+                drop_last=False,
+                prefetch_factor=2 if cfg.num_workers > 0 else None,
+            )
+        else:
+            # Fallback: Mix source data into BC via a secondary loader and concatenate batches
+            bc_tgt_bs = (cfg.batch_size + 1) // 2
+            bc_src_bs = max(1, cfg.batch_size - bc_tgt_bs)
+            bc_src_dataloader = torch.utils.data.DataLoader(
+                ds_src,
+                num_workers=cfg.num_workers,
+                batch_size=bc_src_bs,
+                shuffle=True,
+                pin_memory=device.type == "cuda",
+                drop_last=False,
+                prefetch_factor=2 if cfg.num_workers > 0 else None,
+            )
         # Convert any JSON/YAML-style OT loss config into a strongly-typed
         # OTLossConfig instance understood by the OT loss utilities.
         ot_loss_cfg = _build_ot_loss_config_from_object(cfg.ot.loss_config)

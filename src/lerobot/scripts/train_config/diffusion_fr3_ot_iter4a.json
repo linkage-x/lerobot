@@ -5,7 +5,9 @@
     "episodes": null,
     "streaming": false,
     "use_imagenet_stats": true,
-    "image_transforms": { "enable": true }
+    "image_transforms": {
+      "enable": true
+    }
   },
   "policy": {
     "type": "diffusion",
@@ -18,8 +20,11 @@
     "type": "adamw",
     "lr": 0.0003,
     "weight_decay": 0.0001,
-    "betas": [0.9, 0.999],
-    "eps": 1e-8,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
     "grad_clip_norm": 10.0
   },
   "scheduler": {
@@ -36,7 +41,10 @@
   "save_freq": 10000,
   "seed": 42,
   "use_policy_training_preset": false,
-  "wandb": { "enable": true, "disable_artifact": true },
+  "wandb": {
+    "enable": true,
+    "disable_artifact": true
+  },
   "output_dir": "/data/ckpts/1223_ip_q2cq_diffusion_ot_iter4a",
   "ot": {
     "enable": true,
@@ -82,7 +90,10 @@
         {
           "src_key": "action",
           "tgt_key": "action",
-          "dim_slice": [0, 8],
+          "dim_slice": [
+            0,
+            8
+          ],
           "use_learned_embed": false,
           "embed_name": null,
           "weight_embed": 0.0,
@@ -97,4 +108,3 @@
     }
   }
 }
-

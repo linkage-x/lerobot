@@ -1,0 +1,3 @@
+src/lerobot/scripts/train_config/fromwandb_iztuqxzc_jog82_9heqj.json
+src/lerobot/scripts/train_config/fromwandb_ithx0mon_foyva_yh3qc.json
+src/lerobot/scripts/train_config/fromwandb_xx5st9ij_6fwj4_0t3t7.json

@@ -30,10 +30,38 @@ def decide(summary: Dict[str, Any]) -> List[Decision]:
     """
     out: List[Decision] = []
 
-    pi_sum_last = _get(summary, "train/ot_ot_pi_sum", "last")
-    pi_sum_best = _get(summary, "train/ot_ot_pi_sum", "best")
-    cost_first = _get(summary, "train/ot_ot_cost/observation.state", "first")
-    cost_last = _get(summary, "train/ot_ot_cost/observation.state", "last")
+    # Prefer canonical keys written by WandBLogger (train/*). Fall back to legacy
+    # aliases when present to stay compatible with older summaries.
+    def _first_existing(*candidates: str, which: str) -> Optional[float]:
+        for key in candidates:
+            val = _get(summary, key, which)
+            if val is not None:
+                return val
+        return None
+
+    # OT mass / diagonal
+    pi_sum_last = _first_existing("train/ot_pi_sum", "train/ot_ot_pi_sum", which="last")
+    pi_sum_best = _first_existing("train/ot_pi_sum", "train/ot_ot_pi_sum", which="best")
+
+    # OT per-term costs: prefer action label when available; otherwise any image term
+    cost_first = _first_existing(
+        "train/ot_cost/action_lbl",
+        "train/ot_cost/img_third_person",
+        "train/ot_cost/img_side",
+        "train/ot_cost/img_ee",
+        "train/ot_ot_cost/observation.state",
+        which="first",
+    )
+    cost_last = _first_existing(
+        "train/ot_cost/action_lbl",
+        "train/ot_cost/img_third_person",
+        "train/ot_cost/img_side",
+        "train/ot_cost/img_ee",
+        "train/ot_ot_cost/observation.state",
+        which="last",
+    )
+
+    # Core train metrics
     l1_first = _get(summary, "train/l1_loss", "first")
     l1_last = _get(summary, "train/l1_loss", "last")
     grad_last = _get(summary, "train/grad_norm", "last")
@@ -179,4 +207,3 @@ def apply_changes(cfg: Dict[str, Any], changes: Dict[str, Any]) -> Dict[str, Any
 
     # Safety: keep use_policy_training_preset as-is; user configs rely on it
     return out
-

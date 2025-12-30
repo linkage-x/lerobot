@@ -5,7 +5,9 @@
     "episodes": null,
     "streaming": false,
     "use_imagenet_stats": true,
-    "image_transforms": { "enable": true }
+    "image_transforms": {
+      "enable": true
+    }
   },
   "policy": {
     "type": "diffusion",
@@ -18,8 +20,11 @@
     "type": "adamw",
     "lr": 0.0003,
     "weight_decay": 0.0001,
-    "betas": [0.9, 0.999],
-    "eps": 1e-8,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
     "grad_clip_norm": 10.0
   },
   "scheduler": {
@@ -36,7 +41,10 @@
   "save_freq": 10000,
   "seed": 42,
   "use_policy_training_preset": false,
-  "wandb": { "enable": true, "disable_artifact": true },
+  "wandb": {
+    "enable": true,
+    "disable_artifact": true
+  },
   "output_dir": "/data/ckpts/1223_ip_q2cq_diffusion_ot_iter4c",
   "ot": {
     "enable": true,
@@ -45,7 +53,10 @@
     "pair_info_path": "src/lerobot/datasets/hirol/dtw/source_to_target_state_joint_gripper_pair_info.json",
     "batch_ratio": 0.5,
     "lambda_ot": 0.1,
-    "obs_keys": ["observation.state", "observation.images"],
+    "obs_keys": [
+      "observation.state",
+      "observation.images"
+    ],
     "base_index_src": 0,
     "base_index_tgt": 0,
     "window_size": 20,
@@ -63,7 +74,10 @@
         {
           "src_key": "action",
           "tgt_key": "action",
-          "dim_slice": [0, 8],
+          "dim_slice": [
+            0,
+            8
+          ],
           "use_learned_embed": false,
           "embed_name": null,
           "weight_embed": 0.0,
@@ -77,4 +91,3 @@
     }
   }
 }
-

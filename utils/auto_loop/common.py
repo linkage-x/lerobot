@@ -60,41 +60,64 @@ def find_wandb_file(run_dir: Path, filename: str) -> Optional[Path]:
 
 
 def load_history_from_run_dir(run_dir: Path) -> Dict[str, List[Tuple[int, float]]]:
-    """Extract step->metric series from a wandb offline run directory.
+    """Extract step->metric series from a W&B run directory.
+
+    Preferred source: wandb-history.jsonl (offline/local file stream).
+    Fallback: wandb-summary.json (final summary only) when history.jsonl is missing
+              e.g. with newer W&B versions or pure online mode.
 
     Returns a dict: metric_name -> list[(step, value)], step-sorted.
     """
-    history_path = find_wandb_file(run_dir, "wandb-history.jsonl")
-    if history_path is None:
-        return {}
     series: Dict[str, List[Tuple[int, float]]] = {}
-    with open(history_path, "r") as f:
-        for line in f:
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            step = rec.get("_step")
-            if step is None:
-                # support custom step keys like "train/Optimization step"
-                step = rec.get("train/Optimization step", rec.get("Optimization step"))
-            if step is None:
-                continue
-            try:
-                step = int(step)
-            except Exception:
-                continue
-            for k, v in rec.items():
-                if k.startswith("_"):
+
+    # 1) Try the line-delimited history first
+    history_path = find_wandb_file(run_dir, "wandb-history.jsonl")
+    if history_path is not None and history_path.exists():
+        with open(history_path, "r") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
                     continue
+                step = rec.get("_step")
+                if step is None:
+                    # support custom step keys like "train/Optimization step"
+                    step = rec.get("train/Optimization step", rec.get("Optimization step"))
+                if step is None:
+                    continue
+                try:
+                    step = int(step)
+                except Exception:
+                    continue
+                for k, v in rec.items():
+                    if k.startswith("_"):
+                        continue
+                    val = _safe_float(v)
+                    if val is None:
+                        continue
+                    lst = series.setdefault(k, [])
+                    lst.append((step, val))
+        # sort by step
+        for k in list(series.keys()):
+            series[k] = sorted(series[k], key=lambda kv: kv[0])
+        if series:
+            return series
+
+    # 2) Fallback to final summary if no history.jsonl is present
+    summary_path = find_wandb_file(run_dir, "wandb-summary.json")
+    if summary_path is not None and summary_path.exists():
+        try:
+            with open(summary_path, "r") as f:
+                summ = json.load(f)
+        except Exception:
+            summ = None
+        if isinstance(summ, dict):
+            # Use a single pseudo-step (1) for all numeric keys
+            for k, v in summ.items():
                 val = _safe_float(v)
                 if val is None:
                     continue
-                lst = series.setdefault(k, [])
-                lst.append((step, val))
-    # sort by step
-    for k in list(series.keys()):
-        series[k] = sorted(series[k], key=lambda kv: kv[0])
+                series.setdefault(k, []).append((1, float(val)))
     return series
 
 

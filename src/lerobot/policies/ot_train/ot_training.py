@@ -270,3 +270,84 @@ def make_ot_dataloader(
         drop_last=True,
     )
     return loader
+
+
+def make_weighted_mixed_bc_dataloader(
+    ds_tgt,
+    ds_src,
+    *,
+    bc_src_weight: float,
+    batch_size: int,
+    num_workers: int = 4,
+    normalize_by_size: bool = True,
+    drop_n_last_frames: int = 0,
+    pin_memory: bool | None = None,
+):
+    """
+    Build a single DataLoader that mixes target and source BC samples with weighted
+    random sampling (replacement=True), analogous to robomimic's MetaDataset.
+
+    Args:
+        ds_tgt: main/target LeRobotDataset
+        ds_src: source LeRobotDataset
+        bc_src_weight: probability mass assigned to source samples in expectation
+        batch_size: dataloader batch size
+        num_workers: dataloader workers
+        normalize_by_size: if True, divide each dataset's weight by its (valid) size
+        drop_n_last_frames: optional per-episode tail trimming to align windows
+        pin_memory: defaults to CUDA availability
+    Returns:
+        torch.utils.data.DataLoader over a ConcatDataset with a WeightedRandomSampler
+    """
+    import torch
+    from torch.utils.data import ConcatDataset, WeightedRandomSampler, DataLoader
+
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
+
+    bc_src_weight = float(bc_src_weight)
+    bc_tgt_weight = max(0.0, 1.0 - bc_src_weight)
+
+    def _mask_valid_indices(ds, drop_n_last_frames: int) -> torch.Tensor:
+        if drop_n_last_frames <= 0:
+            return torch.ones(len(ds), dtype=torch.bool)
+        mask = torch.zeros(len(ds), dtype=torch.bool)
+        starts = ds.meta.episodes["dataset_from_index"]
+        ends = ds.meta.episodes["dataset_to_index"]
+        for s, e in zip(starts, ends, strict=True):
+            end_keep = max(int(s), int(e) - int(drop_n_last_frames))
+            if end_keep > int(s):
+                mask[torch.arange(int(s), end_keep, dtype=torch.long)] = True
+        return mask
+
+    mask_tgt = _mask_valid_indices(ds_tgt, drop_n_last_frames)
+    mask_src = _mask_valid_indices(ds_src, drop_n_last_frames)
+
+    if normalize_by_size:
+        wt_tgt = (bc_tgt_weight / max(1, int(mask_tgt.sum()))) if bc_tgt_weight > 0 else 0.0
+        wt_src = (bc_src_weight / max(1, int(mask_src.sum()))) if bc_src_weight > 0 else 0.0
+    else:
+        wt_tgt = bc_tgt_weight
+        wt_src = bc_src_weight
+
+    weights_tgt = torch.where(mask_tgt, torch.full((len(ds_tgt),), float(wt_tgt)), torch.zeros(len(ds_tgt)))
+    weights_src = torch.where(mask_src, torch.full((len(ds_src),), float(wt_src)), torch.zeros(len(ds_src)))
+    weights = torch.cat([weights_tgt, weights_src])
+    if float(weights.sum()) <= 0:
+        weights = torch.ones(len(weights)) / len(weights)
+    else:
+        weights = weights / weights.sum()
+
+    sampler = WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
+
+    mixed_dataset = ConcatDataset([ds_tgt, ds_src])
+    return DataLoader(
+        mixed_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )

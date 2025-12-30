@@ -98,6 +98,13 @@ def run_queue(jobs: List[Job], concurrency: int, gpus: List[str], dry_run: bool,
         env = os.environ.copy()
         if jb.gpu_id is not None:
             env["CUDA_VISIBLE_DEVICES"] = jb.gpu_id
+        # Ensure the local package layout (src/) is importable without pip install -e .
+        try:
+            src_path = str((Path(__file__).resolve().parents[2] / "src").resolve())
+            prev = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{src_path}:{prev}" if prev else src_path
+        except Exception:
+            pass
         # Route wandb caches to a workspace-local writable dir to avoid permission issues under ~/.cache
         cache_root = Path(".wandb_cache").resolve()
         (cache_root / "logs").mkdir(parents=True, exist_ok=True)
@@ -142,7 +149,6 @@ def run_queue(jobs: List[Job], concurrency: int, gpus: List[str], dry_run: bool,
             proc_slots.pop(s, None)
             jb = job_slots.pop(s, None)
             if jb is not None:
-                # Try to summarize offline metrics
                 series = load_history_from_run_dir(jb.out_dir)
                 if series:
                     summary = summarize_series_dict(series)
@@ -182,7 +188,6 @@ def main() -> None:
     ap.add_argument("--wandb-online", action="store_true", help="force wandb online mode")
     ap.add_argument("--wandb-entity", default="", help="wandb entity when online")
     ap.add_argument("--wandb-project", default="", help="wandb project when online")
-    ap.add_argument("--inherit-dataset-from", default="", help="baseline cfg path whose dataset/ot roots will be inherited by spawned jobs")
     ap.add_argument("--output-root", default="outputs/train")
     ap.add_argument("--summary-out", default="src/lerobot/scripts/train_config/reports/data/autorun_summary.json")
     ap.add_argument("--rounds", type=int, default=1, help="number of iterative rounds")
@@ -219,7 +224,7 @@ def main() -> None:
                 steps=args.steps,
                 log_freq=args.log_freq,
                 eval_freq=args.eval_freq,
-                extra=(extra + (["--inherit-dataset-from", args.inherit_dataset_from] if args.inherit_dataset_from else [])),
+                extra=extra,
             )
         )
 

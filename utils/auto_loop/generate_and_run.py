@@ -64,42 +64,38 @@ def main() -> None:
     ap.add_argument("--out-dir", default="src/lerobot/scripts/train_config")
     ap.add_argument("--exec", action="store_true", help="actually launch training")
     ap.add_argument("--extra-args", nargs="*", default=[], help="passed through to training script")
-    ap.add_argument("--inherit-dataset-from", default="", help="path to a cfg to copy dataset/ot.src_root/ot.pair_info_path from")
     args = ap.parse_args()
 
     base = Path(args.base_cfg)
     cfg = _load_json(base)
 
     # parse changes from CLI
+    # Prefer int -> float -> str to preserve types expected by configs (e.g. window_size must be int)
+    def _parse_scalar(s: str) -> Any:
+        ss = s.strip()
+        if ss.lower() in {"true", "false"}:
+            return ss.lower() == "true"
+        # int (no decimal point)
+        try:
+            if ss.isdigit() or (ss.startswith("-") and ss[1:].isdigit()):
+                return int(ss)
+        except Exception:
+            pass
+        # float
+        try:
+            return float(ss)
+        except Exception:
+            return ss
+
     changes: Dict[str, Any] = {}
     for ch in args.changes:
         if "=" not in ch:
             continue
         key, sval = ch.split("=", 1)
-        try:
-            val: Any = float(sval)
-        except Exception:
-            val = sval
-        changes[key] = val
+        changes[key] = _parse_scalar(sval)
 
     new_cfg = apply_changes(cfg, changes)
 
-    # Inherit dataset roots from a baseline cfg if requested
-    if args.inherit_dataset_from:
-        try:
-            base_ds = _load_json(Path(args.inherit_dataset_from))
-            if "dataset" in base_ds and isinstance(base_ds["dataset"], dict):
-                new_cfg.setdefault("dataset", {})
-                for k in ["root", "repo_id", "revision", "streaming", "use_imagenet_stats", "video_backend"]:
-                    if k in base_ds["dataset"]:
-                        new_cfg["dataset"][k] = base_ds["dataset"][k]
-            if "ot" in base_ds and isinstance(base_ds["ot"], dict):
-                new_cfg.setdefault("ot", {})
-                for k in ["src_root", "src_repo_id", "pair_info_path"]:
-                    if k in base_ds["ot"]:
-                        new_cfg["ot"][k] = base_ds["ot"][k]
-        except Exception as e:
-            print(f"[warn] failed to inherit dataset from {args.inherit_dataset_from}: {e}")
     tag = tiny_id(6)
     base_stem = base.stem
     new_name = f"{base_stem}_{tag}.json"

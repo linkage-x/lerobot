@@ -49,6 +49,15 @@ class OTConfig:
     # an OTLossConfig instance) via a lightweight adapter.
     loss_config: dict | None = None
 
+    # Weighted BC sampling between target (main) dataset and OT source dataset.
+    # When set, the training dataloader will be built from a weighted mix of
+    # the target dataset (cfg.dataset) and the source dataset (cfg.ot.src_*),
+    # using a `WeightedRandomSampler` similar to robomimic's MetaDataset.
+    # If left as None, the older behavior (separate target/src BC loaders with
+    # fixed split) is used for backward-compatibility.
+    bc_src_weight: float | None = None  # e.g. 0.8 -> 80% of samples from src on average
+    normalize_bc_weights_by_ds_size: bool = True  # divide ds weights by len(ds) before sampling
+
 
 @dataclass
 class DatasetConfig:

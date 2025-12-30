@@ -1,0 +1,108 @@
+{
+  "dataset": {
+    "repo_id": "left_fr3_ip_dst_q2cq",
+    "root": "/data/fr3_lerobot/left_fr3_ip_dst_q2cq",
+    "episodes": null,
+    "streaming": false,
+    "use_imagenet_stats": true,
+    "image_transforms": {
+      "enable": true
+    }
+  },
+  "policy": {
+    "type": "diffusion",
+    "device": "cuda",
+    "use_amp": true,
+    "push_to_hub": false
+  },
+  "optimizer": {
+    "type": "adamw",
+    "lr": 0.0001,
+    "weight_decay": 0.0001,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "grad_clip_norm": 10.0
+  },
+  "scheduler": {
+    "type": "diffuser",
+    "name": "cosine",
+    "num_warmup_steps": 5000
+  },
+  "batch_size": 16,
+  "num_workers": 4,
+  "steps": 50000,
+  "eval_freq": 1000,
+  "log_freq": 100,
+  "save_checkpoint": true,
+  "save_freq": 10000,
+  "seed": 42,
+  "use_policy_training_preset": false,
+  "wandb": {
+    "enable": true,
+    "disable_artifact": true
+  },
+  "output_dir": "/data/ckpts/dp_ot_cvc8migk_fix",
+  "ot": {
+    "enable": true,
+    "src_repo_id": "left_fr3_ip_src_q2cq",
+    "src_root": "/data/fr3_lerobot/left_fr3_ip_src_q2cq",
+    "pair_info_path": "src/lerobot/datasets/hirol/dtw/source_to_target_state_joint_gripper_pair_info.json",
+    "batch_ratio": 0.5,
+    "lambda_ot": 0.1,
+    "obs_keys": [
+      "observation.images.third_person_cam_color",
+      "observation.images.ee_cam_color",
+      "observation.images.side_cam_color"
+    ],
+    "base_index_src": 0,
+    "base_index_tgt": 0,
+    "window_size": 20,
+    "loss_config": {
+      "features": [
+        {
+          "src_key": "observation.images.third_person_cam_color",
+          "tgt_key": "observation.images.third_person_cam_color",
+          "use_learned_embed": true,
+          "weight_embed": 0.3333,
+          "weight_label": 0.0,
+          "term_name": "img_third_person"
+        },
+        {
+          "src_key": "observation.images.ee_cam_color",
+          "tgt_key": "observation.images.ee_cam_color",
+          "use_learned_embed": true,
+          "weight_embed": 0.3333,
+          "weight_label": 0.0,
+          "term_name": "img_ee"
+        },
+        {
+          "src_key": "observation.images.side_cam_color",
+          "tgt_key": "observation.images.side_cam_color",
+          "use_learned_embed": true,
+          "weight_embed": 0.3333,
+          "weight_label": 0.0,
+          "term_name": "img_side"
+        },
+        {
+          "src_key": "action",
+          "tgt_key": "action",
+          "dim_slice": [
+            0,
+            8
+          ],
+          "use_learned_embed": false,
+          "weight_embed": 0.0,
+          "weight_label": 0.005,
+          "term_name": "action_lbl"
+        }
+      ],
+      "reg": 0.02,
+      "tau_src": 0.01,
+      "tau_tgt": 0.01,
+      "heuristic": true
+    }
+  }
+}
