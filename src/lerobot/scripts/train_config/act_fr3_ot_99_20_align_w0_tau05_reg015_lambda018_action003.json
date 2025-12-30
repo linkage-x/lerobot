@@ -107,6 +107,8 @@
     },
     "sharpness": 2.0,
     "no_window": false,
-    "topk_src_episodes": 10
+    "topk_src_episodes": 10,
+    "bc_src_weight": 0.85,
+    "normalize_bc_weights_by_ds_size": true
   }
 }

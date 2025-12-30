@@ -8,76 +8,15 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+from lerobot.utils.batch_concat import concat_two_batches as _concat_two_batches
+
 def concat_two_batch(batch1: dict, batch2: dict) -> dict:
-    keys = set(batch1.keys()) | set(batch2.keys())
-    out = {}
-    for k in keys:
-        if k in batch1 and k in batch2:
-            if isinstance(batch1[k], dict):
-                out[k] = concat_two_batch(batch1[k], batch2[k])
-            else:
-                v1, v2 = batch1[k], batch2[k]
-                # Ensure both tensors are on the same device before concatenation.
-                if isinstance(v1, torch.Tensor) and isinstance(v2, torch.Tensor):
-                    if v1.device != v2.device:
-                        if v1.device.type != "cpu":
-                            v2 = v2.to(v1.device, non_blocking=(v1.device.type == "cuda"))
-                        elif v2.device.type != "cpu":
-                            v1 = v1.to(v2.device, non_blocking=(v2.device.type == "cuda"))
-                    # Align ranks if needed (e.g., (B, T, D) with (B, D)).
-                    if v1.dim() != v2.dim():
-                        if v1.dim() == 3 and v2.dim() == 2 and v1.size(-1) == v2.size(-1):
-                            v2 = v2.unsqueeze(1).repeat(1, v1.size(1), 1)
-                        elif v1.dim() == 2 and v2.dim() == 3 and v1.size(-1) == v2.size(-1):
-                            v1 = v1.unsqueeze(1).repeat(1, v2.size(1), 1)
-                out[k] = torch.cat([v1, v2], dim=0)
-        elif k in batch1:
-            v1 = batch1[k]
-            if isinstance(v1, torch.Tensor):
-                # Pad missing side with zeros if it's the boolean pad mask.
-                if k == "action_is_pad" and v1.dim() >= 1:
-                    # Infer batch size from other batch
-                    def _infer_bs(d: dict) -> int | None:
-                        if "action" in d and isinstance(d["action"], torch.Tensor):
-                            return int(d["action"].shape[0])
-                        for _v in d.values():
-                            if isinstance(_v, dict):
-                                bs = _infer_bs(_v)
-                                if bs is not None:
-                                    return bs
-                            elif isinstance(_v, torch.Tensor):
-                                return int(_v.shape[0])
-                        return None
-                    bs2 = _infer_bs(batch2) or 0
-                    pad = torch.zeros((bs2,) + tuple(v1.shape[1:]), dtype=v1.dtype, device=v1.device)
-                    out[k] = torch.cat([v1, pad], dim=0)
-                else:
-                    out[k] = v1
-            else:
-                out[k] = v1
-        else:
-            v2 = batch2[k]
-            if isinstance(v2, torch.Tensor):
-                if k == "action_is_pad" and v2.dim() >= 1:
-                    def _infer_bs(d: dict) -> int | None:
-                        if "action" in d and isinstance(d["action"], torch.Tensor):
-                            return int(d["action"].shape[0])
-                        for _v in d.values():
-                            if isinstance(_v, dict):
-                                bs = _infer_bs(_v)
-                                if bs is not None:
-                                    return bs
-                            elif isinstance(_v, torch.Tensor):
-                                return int(_v.shape[0])
-                        return None
-                    bs1 = _infer_bs(batch1) or 0
-                    pad = torch.zeros((bs1,) + tuple(v2.shape[1:]), dtype=v2.dtype, device=v2.device)
-                    out[k] = torch.cat([pad, v2], dim=0)
-                else:
-                    out[k] = v2
-            else:
-                out[k] = v2
-    return out
+    """Compatibility wrapper that delegates to the shared concat utility.
+
+    Note: keeps the public name used elsewhere in this module, but the logic
+    lives in lerobot.utils.batch_concat.concat_two_batches to avoid divergence.
+    """
+    return _concat_two_batches(batch1, batch2)
 
 
 def run_epoch_for_ot_policy(
@@ -150,7 +89,12 @@ def run_epoch_for_ot_policy(
             t1 = time.time()
             src_ot = ot_batch["src"]
             tgt_ot = ot_batch["tgt"]
+            # Sanity check: source / target OT batch sizes should match
             b_ot = src_ot["actions"].shape[0]
+            if isinstance(tgt_ot.get("actions"), torch.Tensor):
+                assert (
+                    int(tgt_ot["actions"].shape[0]) == int(b_ot)
+                ), "OT src / tgt batch size mismatch"
             ot_cat = concat_two_batch(src_ot, tgt_ot)
             full = concat_two_batch(ot_cat, bc_batch)
             if hasattr(model, "process_batch_for_training"):

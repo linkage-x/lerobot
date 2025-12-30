@@ -49,7 +49,6 @@ def decide(summary: Dict[str, Any]) -> List[Decision]:
         "train/ot_cost/img_third_person",
         "train/ot_cost/img_side",
         "train/ot_cost/img_ee",
-        "train/ot_ot_cost/observation.state",
         which="first",
     )
     cost_last = _first_existing(
@@ -57,7 +56,6 @@ def decide(summary: Dict[str, Any]) -> List[Decision]:
         "train/ot_cost/img_third_person",
         "train/ot_cost/img_side",
         "train/ot_cost/img_ee",
-        "train/ot_ot_cost/observation.state",
         which="last",
     )
 

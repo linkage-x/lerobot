@@ -51,7 +51,7 @@
     "src_root": "/data/fr3_lerobot/1025_insert_tube_fr3_3dmouse_99ep",
     "pair_info_path": "src/lerobot/datasets/hirol/dtw/it_99to20_pair_info.json",
     "batch_ratio": 0.5,
-    "bc_src_weight": 0.8,
+    "bc_src_weight": 0.9,
     "normalize_bc_weights_by_ds_size": true,
     "lambda_ot": 0.1,
     "obs_keys": [
