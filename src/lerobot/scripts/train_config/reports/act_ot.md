@@ -483,3 +483,33 @@
   - eval_l1: - | train_l1: - | ot_pi_sum: - | ot_loss: - | grad_norm: -
 - cfg: `src/lerobot/scripts/train_config/act_fr3_ot_99_20_light_w12_tau025_lambda008_action0005_4v9bt_6zfng.json` | out: `outputs/train/loop_1767084579/r1_act_fr3_ot_99_20_light_w12_tau025_lambda008_action0005_4v9bt_6zfng_zbtv`
   - eval_l1: - | train_l1: - | ot_pi_sum: - | ot_loss: - | grad_norm: -
+
+### Auto Loop Round 1
+
+- cfg: `src/lerobot/scripts/train_config/act_fr3_ot_99_20_w8_tau1_reg02_lambda012_action002_sharp05_topk20_calA.json` | out: `outputs/train/loop_1767087812/00_act_fr3_ot_99_20_w8_tau1_reg02_lambda012_action002_sharp05_topk20_calA_7e71`
+  - W&B: https://wandb.ai/kjust-pinduoduo/lerobot/runs/bcoclyah
+  - eval_l1: 0.1827 | train_l1: 0.1500 | ot_pi_sum: 0.1273 | ot_loss: 0.2148 | grad_norm: 48.8630
+- cfg: `src/lerobot/scripts/train_config/act_fr3_ot_99_20_light_w12_tau025_lambda008_action0005_4v9bt_calB.json` | out: `outputs/train/loop_1767087812/01_act_fr3_ot_99_20_light_w12_tau025_lambda008_action0005_4v9bt_calB_7e71`
+  - W&B: https://wandb.ai/kjust-pinduoduo/lerobot/runs/wgl64e6g
+  - eval_l1: - | train_l1: - | ot_pi_sum: - | ot_loss: - | grad_norm: -
+- cfg: `src/lerobot/scripts/train_config/act_fr3_ot_99_20_align_w0_tau05_reg015_lambda018_action003_calC.json` | out: `outputs/train/loop_1767087812/02_act_fr3_ot_99_20_align_w0_tau05_reg015_lambda018_action003_calC_7e71`
+  - W&B: https://wandb.ai/kjust-pinduoduo/lerobot/runs/25uhjkan
+  - eval_l1: 0.2178 | train_l1: 0.1629 | ot_pi_sum: 0.1241 | ot_loss: 0.0125 | grad_norm: 48.5131
+- cfg: `src/lerobot/scripts/train_config/act_fr3_ot_99_20_balanced_w8_sharp075_tau1_reg015_lambda014_action015_pqs89_calD.json` | out: `outputs/train/loop_1767087812/03_act_fr3_ot_99_20_balanced_w8_sharp075_tau1_reg015_lambda014_action015_pqs89_calD_7e71`
+  - W&B: https://wandb.ai/kjust-pinduoduo/lerobot/runs/zdquhflx
+  - eval_l1: 0.1840 | train_l1: 0.1520 | ot_pi_sum: 0.2243 | ot_loss: 0.0049 | grad_norm: 48.7280
+
+### Auto Loop Round 1
+
+- cfg: `src/lerobot/scripts/train_config/act_fr3_ot_99_20_w8_tau1_reg02_lambda012_action002_sharp05_topk20_calA.json` | out: `outputs/train/loop_1767089892/00_act_fr3_ot_99_20_w8_tau1_reg02_lambda012_action002_sharp05_topk20_calA_n8dz`
+  - W&B: https://wandb.ai/kjust-pinduoduo/lerobot/runs/vip558th
+  - eval_l1: 0.1913 | train_l1: 0.1516 | ot_pi_sum: 0.1193 | ot_loss: 0.2390 | grad_norm: 48.9440
+- cfg: `src/lerobot/scripts/train_config/act_fr3_ot_99_20_light_w12_tau025_lambda008_action0005_4v9bt_calB.json` | out: `outputs/train/loop_1767089892/01_act_fr3_ot_99_20_light_w12_tau025_lambda008_action0005_4v9bt_calB_n8dz`
+  - W&B: https://wandb.ai/kjust-pinduoduo/lerobot/runs/7uhp4ces
+  - eval_l1: 0.2173 | train_l1: 0.1927 | ot_pi_sum: 0.0006 | ot_loss: 0.0076 | grad_norm: 49.1913
+- cfg: `src/lerobot/scripts/train_config/act_fr3_ot_99_20_align_w0_tau05_reg015_lambda018_action003_calC.json` | out: `outputs/train/loop_1767089892/02_act_fr3_ot_99_20_align_w0_tau05_reg015_lambda018_action003_calC_n8dz`
+  - W&B: https://wandb.ai/kjust-pinduoduo/lerobot/runs/wqbm1ks5
+  - eval_l1: 0.2279 | train_l1: 0.1612 | ot_pi_sum: 0.0804 | ot_loss: 0.4158 | grad_norm: 48.6837
+- cfg: `src/lerobot/scripts/train_config/act_fr3_ot_99_20_balanced_w8_sharp075_tau1_reg015_lambda014_action015_pqs89_calD.json` | out: `outputs/train/loop_1767089892/03_act_fr3_ot_99_20_balanced_w8_sharp075_tau1_reg015_lambda014_action015_pqs89_calD_n8dz`
+  - W&B: https://wandb.ai/kjust-pinduoduo/lerobot/runs/6tnrcv0m
+  - eval_l1: 0.1950 | train_l1: 0.1478 | ot_pi_sum: 0.0000 | ot_loss: 0.0000 | grad_norm: 49.0529

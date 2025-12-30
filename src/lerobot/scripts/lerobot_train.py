@@ -756,6 +756,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # If cfg.ot.bc_src_weight is set, build a ConcatDataset and a WeightedRandomSampler
         # that draws from target and src according to weights, optionally normalized by dataset size.
         if getattr(cfg.ot, "bc_src_weight", None) is not None:
+            # Build a deterministic generator per-process if a seed is known
+            torch_gen = None
+            if cfg.seed is not None:
+                import torch as _torch
+                # Small offset to decorrelate from global RNG usage
+                rank = getattr(accelerator, 'process_index', 0)
+                torch_gen = _torch.Generator(device='cpu')
+                torch_gen.manual_seed(int(cfg.seed) + int(rank) + 12345)
             dataloader = make_weighted_mixed_bc_dataloader(
                 ds_tgt=dataset,
                 ds_src=ds_src,
@@ -765,6 +773,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 normalize_by_size=getattr(cfg.ot, "normalize_bc_weights_by_ds_size", True),
                 drop_n_last_frames=int(getattr(cfg.policy, "drop_n_last_frames", 0) or 0),
                 pin_memory=(device.type == "cuda"),
+                generator=torch_gen,
             )
         else:
             raise Exception('bc_src_weight MUST be SET!')
@@ -799,7 +808,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Note: ot_dataloader stays on CPU workers (no .to(device)); yielded tensors are moved by preprocessor
     dl_iter = cycle(dataloader)
     # Prepare OT iterator if enabled
-    if cfg.ot.enable and ot_dataloader is not None:
+    if cfg.ot.enable and ot_dataloader is not None and len(ot_dataloader) > 0:
         ot_iter = cycle(ot_dataloader)
     else:
         ot_iter = None

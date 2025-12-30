@@ -191,7 +191,9 @@ def _compute_sinkhorn_plan(
     b = torch.full((n_tgt,), 1.0 / n_tgt, dtype=cost.dtype, device=cost.device)
 
     # Run Sinkhorn in numpy to leverage POT, then convert back to torch.
-    cost_np = cost.detach().cpu().numpy()
+    # Use float64 for numerical stability — small couplings can underflow in fp32
+    # when the ground cost has a much larger magnitude than `reg`.
+    cost_np = cost.detach().cpu().to(dtype=torch.float64).numpy()
     a_np = a.detach().cpu().numpy()
     b_np = b.detach().cpu().numpy()
 
@@ -245,7 +247,9 @@ def _compute_sinkhorn_plan(
         n_src, n_tgt = cost_np.shape
         pi_np = np.full_like(cost_np, 1.0 / (n_src * n_tgt))
 
-    pi = torch.from_numpy(pi_np).to(device=cost.device, dtype=cost.dtype)
+    # Keep high precision to avoid underflow in tiny couplings; downstream ops
+    # can safely cast as needed by PyTorch's type promotion rules.
+    pi = torch.from_numpy(pi_np).to(device=cost.device, dtype=torch.float64)
     return pi
 
 

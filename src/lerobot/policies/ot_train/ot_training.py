@@ -226,6 +226,7 @@ def make_weighted_mixed_bc_dataloader(
     normalize_by_size: bool = True,
     drop_n_last_frames: int = 0,
     pin_memory: bool | None = None,
+    generator: torch.Generator | None = None,
 ):
     """
     Build a single DataLoader that mixes target and source BC samples with weighted
@@ -282,7 +283,12 @@ def make_weighted_mixed_bc_dataloader(
     else:
         weights = weights / weights.sum()
 
-    sampler = WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
+    sampler = WeightedRandomSampler(
+        weights=weights,
+        num_samples=len(weights),
+        replacement=True,
+        generator=generator,
+    )
 
     mixed_dataset = ConcatDataset([ds_tgt, ds_src])
     return DataLoader(
