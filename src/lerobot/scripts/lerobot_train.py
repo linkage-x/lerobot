@@ -68,6 +68,70 @@ from lerobot.utils.utils import (
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# -----------------------------
+# Debug helpers (lightweight)
+# -----------------------------
+def _tensor_stats(x: torch.Tensor) -> dict:
+    """Small numeric summary for a tensor; avoids large reductions when possible."""
+    try:
+        xf = x.detach()
+        # Use float32 for stats to avoid overflow on fp16/bf16
+        xf32 = xf.float()
+        return {
+            "shape": tuple(xf.shape),
+            "dtype": str(xf.dtype),
+            "device": str(xf.device),
+            "min": float(torch.nanmin(xf32).item()),
+            "max": float(torch.nanmax(xf32).item()),
+            "mean": float(torch.nanmean(xf32).item()),
+            "nan": int(torch.isnan(xf).sum().item()),
+            "inf": int(torch.isinf(xf).sum().item()),
+        }
+    except Exception as e:  # pragma: no cover - best effort stats
+        return {"error": f"stats_failed: {type(e).__name__}"}
+
+
+def _log_batch_tree(prefix: str, batch: Any, limit: int = 8) -> None:
+    """Log shapes/dtypes for a nested batch dict. Limit number of leaves printed."""
+    shown = 0
+
+    def _recurse(k, v):
+        nonlocal shown
+        if shown >= limit:
+            return
+        if isinstance(v, dict):
+            for kk, vv in v.items():
+                _recurse(f"{k}.{kk}" if k else kk, vv)
+        elif torch.is_tensor(v):
+            stats = _tensor_stats(v)
+            logging.info(f"{prefix} {k}: {stats}")
+            shown += 1
+        # Skip non-tensor leaves silently
+
+    _recurse("", batch)
+
+
+def _log_cuda_mem(tag: str) -> dict:
+    """Return CUDA mem usage in MB (and also log). Safe on CPU-only machines."""
+    out = {}
+    if torch.cuda.is_available():
+        try:
+            dev = torch.cuda.current_device()
+            alloc = torch.cuda.memory_allocated(dev) / (1024 ** 2)
+            reserv = torch.cuda.memory_reserved(dev) / (1024 ** 2)
+            max_alloc = torch.cuda.max_memory_allocated(dev) / (1024 ** 2)
+            out = {
+                "cuda/mem_allocated_mb": float(alloc),
+                "cuda/mem_reserved_mb": float(reserv),
+                "cuda/max_mem_allocated_mb": float(max_alloc),
+            }
+            logging.info(
+                f"{tag} cuda_mem MB: alloc={alloc:.1f} reserved={reserv:.1f} max_alloc={max_alloc:.1f}"
+            )
+        except Exception:
+            pass
+    return out
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -139,6 +203,15 @@ def update_policy(
                         ot_info[k] = float(v)
 
     # Use accelerator's backward method
+    # Guard against non-finite loss early
+    if not torch.isfinite(loss):
+        logging.error("Non-finite loss detected: %s", loss)
+        # Try to surface a few label stats for debugging
+        try:
+            if isinstance(batch, dict) and torch.is_tensor(batch.get("actions")):
+                logging.error("Label/actions stats: %s", _tensor_stats(batch["actions"]))
+        except Exception:
+            pass
     accelerator.backward(loss)
 
     # Clip gradients if specified
@@ -148,6 +221,8 @@ def update_policy(
         grad_norm = torch.nn.utils.clip_grad_norm_(
             policy.parameters(), float("inf"), error_if_nonfinite=False
         )
+    if not torch.isfinite(grad_norm):
+        logging.error("Non-finite grad_norm detected: %s", grad_norm)
 
     # Optimizer step
     with lock if lock is not None else nullcontext():
@@ -444,6 +519,26 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             f"{len(train_episodes)} train, {len(val_episodes)} val"
         )
         dataset = make_dataset(cfg)
+        # Dataset sanity summary
+        try:
+            cam_keys = getattr(dataset.meta, "camera_keys", [])
+            logging.info(
+                "Dataset meta: total_frames=%s total_episodes=%s fps=%s cameras=%s",
+                getattr(dataset.meta, "total_frames", "?"),
+                getattr(dataset.meta, "total_episodes", "?"),
+                getattr(dataset.meta, "fps", "?"),
+                cam_keys,
+            )
+            # Spot-check stats presence for cameras (mean/std)
+            missing_stats = []
+            for k in cam_keys:
+                stats = dataset.meta.stats.get(k, {}) if hasattr(dataset.meta, "stats") else {}
+                if not ("mean" in stats and "std" in stats):
+                    missing_stats.append(k)
+            if missing_stats:
+                logging.warning("Missing stats for cameras (mean/std not found): %s", missing_stats)
+        except Exception:
+            pass
 
         # Optional: create a small hold-out for offline eval when no env is configured.
         # We keep this lightweight and self-contained to provide an eval curve similar to original ACT
@@ -644,6 +739,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         **processor_kwargs,
         **postprocessor_kwargs,
     )
+    if is_main_process:
+        # Show concise pipelines (step names)
+        try:
+            logging.info("Preprocessor: %s", preprocessor)
+            logging.info("Postprocessor: %s", postprocessor)
+        except Exception:
+            pass
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
@@ -699,6 +801,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
+    if is_main_process:
+        logging.info(
+            "Train DataLoader: bs=%d workers=%d shuffle=%s sampler=%s len=%s",
+            cfg.batch_size,
+            cfg.num_workers,
+            shuffle and not cfg.dataset.streaming,
+            sampler.__class__.__name__ if sampler is not None else "None",
+            len(dataloader) if hasattr(dataloader, "__len__") else "?",
+        )
 
     # Optional: build OT dataloader and loss config if enabled
     ot_dataloader = None
@@ -752,6 +863,19 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             topk_src_episodes=getattr(cfg.ot, 'topk_src_episodes', None),
             num_workers=cfg.num_workers,
         )
+        if is_main_process:
+            try:
+                logging.info(
+                    "OT DataLoader: bs=%d workers=%d sharp=%.3f no_window=%s topk_src=%s pair_info=%s",
+                    ot_batch_size,
+                    cfg.num_workers,
+                    float(getattr(cfg.ot, 'sharpness', 0.0)),
+                    bool(getattr(cfg.ot, 'no_window', False)),
+                    getattr(cfg.ot, 'topk_src_episodes', None),
+                    cfg.ot.pair_info_path,
+                )
+            except Exception:
+                pass
         # Weighted BC sampling (target + src) to align with robomimic MetaDataset
         # If cfg.ot.bc_src_weight is set, build a ConcatDataset and a WeightedRandomSampler
         # that draws from target and src according to weights, optionally normalized by dataset size.
@@ -775,6 +899,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 pin_memory=(device.type == "cuda"),
                 generator=torch_gen,
             )
+            if is_main_process:
+                logging.info(
+                    "WeightedMixedBC: bs=%d workers=%d bc_src_weight=%.3f normalize=%s drop_last_frames=%d",
+                    cfg.batch_size,
+                    cfg.num_workers,
+                    float(cfg.ot.bc_src_weight),
+                    bool(getattr(cfg.ot, "normalize_bc_weights_by_ds_size", True)),
+                    int(getattr(cfg.policy, "drop_n_last_frames", 0) or 0),
+                )
         else:
             raise Exception('bc_src_weight MUST be SET!')
         # Convert any JSON/YAML-style OT loss config into a strongly-typed
@@ -842,6 +975,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info("Start offline training on a fixed dataset")
 
+    first_debug_done = False
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         raw_batch = next(dl_iter)
@@ -849,8 +983,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             raw_batch_tgt = _slice_batch(raw_batch, bc_tgt_bs)
             raw_batch_src = next(bc_src_iter)
             raw_batch = _concat_two_batches(raw_batch_tgt, raw_batch_src)
+        if (not first_debug_done) and is_main_process:
+            logging.info("Raw batch snapshot (preprocess)")
+            _log_batch_tree("raw", raw_batch, limit=8)
         batch = preprocessor(raw_batch)
+        if (not first_debug_done) and is_main_process:
+            logging.info("Batch snapshot (post-preprocess)")
+            _log_batch_tree("proc", batch, limit=12)
         train_tracker.dataloading_s = time.perf_counter() - start_time
+        if (not first_debug_done) and is_main_process:
+            _log_cuda_mem("after_dataload")
 
         # If OT is enabled, extract raw src / tgt observations for feature-based OT.
         ot_src_obs: dict[str, torch.Tensor] | None = None
@@ -885,6 +1027,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             ot_loss_cfg=ot_loss_cfg,
             lambda_ot=cfg.ot.lambda_ot if cfg.ot.enable else 0.0,
         )
+        if (not first_debug_done) and is_main_process:
+            _log_cuda_mem("after_step")
+            # One-time signal about key tensors we expect
+            try:
+                if isinstance(batch, dict) and "actions" in batch:
+                    logging.info("Label/actions shape: %s", tuple(getattr(batch["actions"], "shape", [])))
+            except Exception:
+                pass
+            first_debug_done = True
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -900,6 +1051,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
                     wandb_log_dict.update(output_dict)
+                # Attach lightweight device/memory info every log step
+                wandb_log_dict.update(_log_cuda_mem("log_step"))
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
