@@ -35,8 +35,8 @@
 
 - OTLossConfig（多特征组合）
   - `features: list[OTFeatureSpec]`；
-  - `reg`：Sinkhorn 正则；
-  - `tau_src` / `tau_tgt`：不平衡 OT 边缘松弛；任一不为空则使用不平衡；
+  - `reg`：Sinkhorn 正则； epsilon
+  - `tau_src` / `tau_tgt`：不平衡 OT 边缘松弛；任一不为空则使用不平衡；tau1/tau2
   - `heuristic`：可选对角先验（仅不平衡 OT 生效）。
 
 - 求解
@@ -60,7 +60,7 @@
 
 标准集成：
 
-- 每步 `total = bc_loss + lambda_ot * ot_loss`；
+- 每步 `total = bc_loss + lambda_ot * ot_loss`； # lambda_ot论文中使用 0.1
 - 从 `ot_dataloader` 获取 `ot_pair`，直接使用 raw obs；需要时将 `action` 注入 obs 以复用 `src_key/tgt_key == "action"` 的配置；
 - 源 OT 数据集建议复用目标数据集的图像变换/统计（例如 ImageNet 统计）。
 

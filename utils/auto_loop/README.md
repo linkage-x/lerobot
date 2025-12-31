@@ -91,6 +91,6 @@ Auto Loop 实验编排器（轻量）
 
 ```
 cfgs=$(cat .codex_tmp/next_round_cfgs_calibrated.txt | tr '\n' ' '); echo "$cfgs"; setsid nohup python utils/auto_loop/autorun.py --cfgs $cfgs --steps 10000
-  │ --log-freq 100 --eval-freq 500 --concurrency 4 --gpus 0,1,6,7 --exec --wandb-online --wandb-entity kjust-pinduoduo --wandb-project lerobot > .codex_tmp/
+  │ --log-freq 100 --eval-freq 500 --concurrency 4 --gpus 4,5,6,7 --exec --wandb-online --wandb-entity kjust-pinduoduo --wandb-project lerobot > .codex_tmp/
   │ autorun_longrun.log 2>&1 & echo $! && sleep 5 && tail -n 160 .codex_tmp/autorun_longrun.log
 ```

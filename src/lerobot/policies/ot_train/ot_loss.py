@@ -121,11 +121,11 @@ class OTLossConfig:
     """High-level configuration for building an OT loss from feature pairs."""
 
     features: List[OTFeatureSpec] = field(default_factory=list)
-    reg: float = 0.01
+    reg: float = 0.0005
     # Optional unbalanced-OT parameters propagated down to OTCostConfig.
     # When both are None we compute a standard balanced OT plan.
-    tau_src: float | None = None
-    tau_tgt: float | None = None
+    tau_src: float = 0.01
+    tau_tgt: float = 0.01
     # Heuristic diagonal prior toggle (see OTCostConfig.heuristic for details).
     heuristic: bool = False
 
@@ -143,14 +143,6 @@ class OTEmbeddingHead(nn.Module):  # pragma: no cover
 
     def forward(self, x: Tensor) -> Tensor:
         return self._stub(x)
-
-
-def _require_pot() -> None:
-    if _ot is None:
-        raise RuntimeError(
-            "OT loss requested but the 'ot' package (POT) is not available. "
-            "Install it with `pip install pot` to enable OT training."
-        )
 
 
 def _compute_sinkhorn_plan(
@@ -177,7 +169,11 @@ def _compute_sinkhorn_plan(
     Returns:
         plan: (B_src, B_tgt) transport plan tensor on the same device / dtype.
     """
-    _require_pot()
+    if _ot is None:
+        raise RuntimeError(
+            "OT loss requested but the 'ot' package (POT) is not available. "
+            "Install it with `pip install pot` to enable OT training."
+        )
 
     if cost.ndim != 2:
         raise ValueError(f"Expected 2D cost matrix, got shape {tuple(cost.shape)}")
