@@ -88,38 +88,9 @@ Auto Loop 实验编排器（轻量）
   4) 如需仅汇总现有离线日志，可运行 analyze_offline.py。
 
 -----------------
-我已基于第 1 轮的 4 个作业各生成 1 个“温和 OT”变体，并写好了待跑清单。
 
-  已生成的下一轮配置
-
-  - src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline_0j57ea.json
-  - src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline_cqm6fm_idj1ci.json
-  - src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline_f41by4_v9z4nx.json
-  - src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline_16lch8_qllxw3.json
-
-  已写入列表
-
-  - .codex_tmp/next_round_cfgs_auto.txt
-
-  如何手动启动 Round 2（并发 4，GPU=0,1,6,7，steps=2K，在线 W&B）
-
-  - 推荐命令：
-      - cfgs=$(cat .codex_tmp/next_round_cfgs_auto.txt | tr '\n' ' '); echo "$cfgs"
-      - setsid nohup python utils/auto_loop/autorun.py --cfgs $cfgs --steps 2000 --log-freq 50 --eval-freq 200 --concurrency 4 --gpus 0,1,6,7 --decide --rounds 2 --variants-per-run 1 --exec
-        --wandb-online --wandb-entity kjust-pinduoduo --wandb-project lerobot > .codex_tmp/autorun_round2.log 2>&1 & echo $! && sleep 2 && tail -n 120 .codex_tmp/autorun_round2.log
-
-  说明
-
-  - 之所以上一轮没有自动进入下一轮，是因为在线 W&B 情况下本地可能没有 wandb-history.jsonl。我已在 utils/auto_loop/common.py 增加了容错：若缺失 history.jsonl，就回退读取 wandb-summary.json，
-    不影响训练，只用于本地汇总。
-  - 我没有改动你的训练脚本或命令风格；autorun 仍按 CUDA_VISIBLE_DEVICES + accelerate launch 的格式启动。
-
-  需要我也顺带生成 Round 3 的候选清单（等 Round 2 完成后再给出），还是你跑完 Round 2 再通知我继续？
-
-  请用你熟悉的 nohup 启动 Round 2
-
-  - 先取变量：
-      - cfgs=$(cat .codex_tmp/next_round_cfgs_auto.txt | tr '\n' ' '); echo "$cfgs"
-  - 启动：
-      - setsid nohup python utils/auto_loop/autorun.py --cfgs $cfgs --steps 2000 --log-freq 50 --eval-freq 200 --concurrency 4 --gpus 0,1,6,7 --decide --rounds 2 --variants-per-run 1 --exec
-        --wandb-online --wandb-entity kjust-pinduoduo --wandb-project lerobot > .codex_tmp/autorun_round2.log 2>&1 & echo $! && sleep 2 && tail -n 120 .codex_tmp/autorun_round2.log
+```
+cfgs=$(cat .codex_tmp/next_round_cfgs_calibrated.txt | tr '\n' ' '); echo "$cfgs"; setsid nohup python utils/auto_loop/autorun.py --cfgs $cfgs --steps 10000
+  │ --log-freq 100 --eval-freq 500 --concurrency 4 --gpus 0,1,6,7 --exec --wandb-online --wandb-entity kjust-pinduoduo --wandb-project lerobot > .codex_tmp/
+  │ autorun_longrun.log 2>&1 & echo $! && sleep 5 && tail -n 160 .codex_tmp/autorun_longrun.log
+```

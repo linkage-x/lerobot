@@ -72,20 +72,38 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Debug helpers (lightweight)
 # -----------------------------
 def _tensor_stats(x: torch.Tensor) -> dict:
-    """Small numeric summary for a tensor; avoids large reductions when possible."""
+    """Small numeric summary for a tensor. Avoids nan* ops for broader torch compat."""
     try:
         xf = x.detach()
         # Use float32 for stats to avoid overflow on fp16/bf16
         xf32 = xf.float()
+        # Count special values on original dtype
+        try:
+            n_nan = int(torch.isnan(xf).sum().item())
+        except Exception:
+            n_nan = 0
+        try:
+            n_inf = int(torch.isinf(xf).sum().item())
+        except Exception:
+            n_inf = 0
+        # Compute stats on finite values only (and handle all-nan case)
+        fin = torch.isfinite(xf32)
+        if fin.any():
+            xs = xf32[fin]
+            mn = float(xs.min().item())
+            mx = float(xs.max().item())
+            mu = float(xs.mean().item())
+        else:
+            mn = mx = mu = float("nan")
         return {
             "shape": tuple(xf.shape),
             "dtype": str(xf.dtype),
             "device": str(xf.device),
-            "min": float(torch.nanmin(xf32).item()),
-            "max": float(torch.nanmax(xf32).item()),
-            "mean": float(torch.nanmean(xf32).item()),
-            "nan": int(torch.isnan(xf).sum().item()),
-            "inf": int(torch.isinf(xf).sum().item()),
+            "min": mn,
+            "max": mx,
+            "mean": mu,
+            "nan": n_nan,
+            "inf": n_inf,
         }
     except Exception as e:  # pragma: no cover - best effort stats
         return {"error": f"stats_failed: {type(e).__name__}"}
@@ -105,6 +123,11 @@ def _log_batch_tree(prefix: str, batch: Any, limit: int = 8) -> None:
         elif torch.is_tensor(v):
             stats = _tensor_stats(v)
             logging.info(f"{prefix} {k}: {stats}")
+            shown += 1
+        elif isinstance(v, (list, tuple)) and v and torch.is_tensor(v[0]):
+            # Occasionally collate can produce lists of tensors; summarize first element
+            stats = _tensor_stats(v[0])
+            logging.info(f"{prefix} {k}[0]: {stats} (list-like)")
             shown += 1
         # Skip non-tensor leaves silently
 
@@ -519,7 +542,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             f"{len(train_episodes)} train, {len(val_episodes)} val"
         )
         dataset = make_dataset(cfg)
-        # Dataset sanity summary
+        # Dataset sanity summary (always keep; useful even when debug disabled)
         try:
             cam_keys = getattr(dataset.meta, "camera_keys", [])
             logging.info(
@@ -529,14 +552,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 getattr(dataset.meta, "fps", "?"),
                 cam_keys,
             )
-            # Spot-check stats presence for cameras (mean/std)
-            missing_stats = []
-            for k in cam_keys:
-                stats = dataset.meta.stats.get(k, {}) if hasattr(dataset.meta, "stats") else {}
-                if not ("mean" in stats and "std" in stats):
-                    missing_stats.append(k)
-            if missing_stats:
-                logging.warning("Missing stats for cameras (mean/std not found): %s", missing_stats)
+            if cfg.debug.instrument:
+                # Spot-check stats presence for cameras (mean/std)
+                missing_stats = []
+                for k in cam_keys:
+                    stats = dataset.meta.stats.get(k, {}) if hasattr(dataset.meta, "stats") else {}
+                    if not ("mean" in stats and "std" in stats):
+                        missing_stats.append(k)
+                if missing_stats:
+                    logging.warning("Missing stats for cameras (mean/std not found): %s", missing_stats)
         except Exception:
             pass
 
@@ -739,7 +763,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         **processor_kwargs,
         **postprocessor_kwargs,
     )
-    if is_main_process:
+    if is_main_process and cfg.debug.instrument:
         # Show concise pipelines (step names)
         try:
             logging.info("Preprocessor: %s", preprocessor)
@@ -801,7 +825,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
-    if is_main_process:
+    if is_main_process and cfg.debug.instrument:
         logging.info(
             "Train DataLoader: bs=%d workers=%d shuffle=%s sampler=%s len=%s",
             cfg.batch_size,
@@ -863,7 +887,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             topk_src_episodes=getattr(cfg.ot, 'topk_src_episodes', None),
             num_workers=cfg.num_workers,
         )
-        if is_main_process:
+        if is_main_process and cfg.debug.instrument:
             try:
                 logging.info(
                     "OT DataLoader: bs=%d workers=%d sharp=%.3f no_window=%s topk_src=%s pair_info=%s",
@@ -899,7 +923,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 pin_memory=(device.type == "cuda"),
                 generator=torch_gen,
             )
-            if is_main_process:
+            if is_main_process and cfg.debug.instrument:
                 logging.info(
                     "WeightedMixedBC: bs=%d workers=%d bc_src_weight=%.3f normalize=%s drop_last_frames=%d",
                     cfg.batch_size,
@@ -983,15 +1007,55 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             raw_batch_tgt = _slice_batch(raw_batch, bc_tgt_bs)
             raw_batch_src = next(bc_src_iter)
             raw_batch = _concat_two_batches(raw_batch_tgt, raw_batch_src)
-        if (not first_debug_done) and is_main_process:
+        if (not first_debug_done) and is_main_process and cfg.debug.instrument:
             logging.info("Raw batch snapshot (preprocess)")
             _log_batch_tree("raw", raw_batch, limit=8)
         batch = preprocessor(raw_batch)
-        if (not first_debug_done) and is_main_process:
+        if (not first_debug_done) and is_main_process and cfg.debug.instrument and cfg.debug.log_first_batch_images and wandb_logger is not None:
+            # Try to log a few raw and processed images for visual sanity.
+            try:
+                import torchvision.utils as vutils
+                import torch.nn.functional as F
+
+                def _unnormalize(img: torch.Tensor, key: str) -> torch.Tensor:
+                    # Attempt to unnormalize using dataset stats if available
+                    try:
+                        stats = dataset.meta.stats[key]
+                        mean = stats["mean"].to(img.device).view(1, -1, 1, 1)
+                        std = stats["std"].to(img.device).view(1, -1, 1, 1)
+                        return img * std + mean
+                    except Exception:
+                        return img
+
+                # Choose 1 sample and up to 3 cameras
+                cams = []
+                for cam in ["observation.images.third_person_cam_color", "observation.images.ee_cam_color", "observation.images.side_cam_color"]:
+                    if cam in raw_batch:
+                        cams.append(cam)
+                cams = cams[:3]
+                if cams:
+                    b0 = 0
+                    # Raw (expect [0,1])
+                    raw_imgs = [raw_batch[cam][b0:b0+1] for cam in cams]
+                    raw_grid = vutils.make_grid(torch.cat(raw_imgs, dim=0), nrow=len(raw_imgs))
+                    wandb_logger.log_dict({"first_batch/raw_images": raw_grid}, step)
+                    # Processed (try to invert normalization for display)
+                    proc_imgs = []
+                    for cam in cams:
+                        # Navigate nested dict for processed batch
+                        proc_img = batch
+                        for kk in cam.split('.'):
+                            proc_img = proc_img[kk]
+                        proc_imgs.append(_unnormalize(proc_img[b0:b0+1], cam))
+                    proc_grid = vutils.make_grid(torch.cat(proc_imgs, dim=0), nrow=len(proc_imgs))
+                    wandb_logger.log_dict({"first_batch/proc_images": proc_grid}, step)
+            except Exception:
+                pass
+        if (not first_debug_done) and is_main_process and cfg.debug.instrument:
             logging.info("Batch snapshot (post-preprocess)")
             _log_batch_tree("proc", batch, limit=12)
         train_tracker.dataloading_s = time.perf_counter() - start_time
-        if (not first_debug_done) and is_main_process:
+        if (not first_debug_done) and is_main_process and cfg.debug.instrument:
             _log_cuda_mem("after_dataload")
 
         # If OT is enabled, extract raw src / tgt observations for feature-based OT.
@@ -1027,7 +1091,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             ot_loss_cfg=ot_loss_cfg,
             lambda_ot=cfg.ot.lambda_ot if cfg.ot.enable else 0.0,
         )
-        if (not first_debug_done) and is_main_process:
+        if (not first_debug_done) and is_main_process and cfg.debug.instrument:
             _log_cuda_mem("after_step")
             # One-time signal about key tensors we expect
             try:
@@ -1051,8 +1115,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
                     wandb_log_dict.update(output_dict)
-                # Attach lightweight device/memory info every log step
-                wandb_log_dict.update(_log_cuda_mem("log_step"))
+                # Attach lightweight device/memory info every log step (optional)
+                if cfg.debug.instrument:
+                    wandb_log_dict.update(_log_cuda_mem("log_step"))
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 

@@ -106,3 +106,13 @@ class EvalConfig:
                 f"to increase the number of episodes to match the batch size (e.g. `eval.n_episodes={self.batch_size}`), "
                 f"or lower the batch size (e.g. `eval.batch_size={self.n_episodes}`)."
             )
+
+
+@dataclass
+class DebugConfig:
+    # Whether to print additional one-time and periodic debug logs (batch snapshots, CUDA mem, etc.).
+    # Defaults to True to preserve current behavior unless explicitly disabled.
+    instrument: bool = True
+    # Log the first minibatch images (per camera) to WandB for visual sanity checks.
+    # We log both raw (pre-normalization) and unnormalized processed images (attempting to invert mean/std).
+    log_first_batch_images: bool = False

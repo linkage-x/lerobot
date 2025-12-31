@@ -554,3 +554,18 @@
   - eval_l1: - | train_l1: - | ot_pi_sum: - | ot_loss: - | grad_norm: -
 - cfg: `src/lerobot/scripts/train_config/act_fr3_ot_99_20_w8_tau1_reg02_lambda012_action002_sharp05_topk20_calA_calA2d_0qz20.json` | out: `outputs/train/loop_1767143634/r1_act_fr3_ot_99_20_w8_tau1_reg02_lambda012_action002_sharp05_topk20_calA_calA2d_0qz20_ou2t`
   - eval_l1: - | train_l1: - | ot_pi_sum: - | ot_loss: - | grad_norm: -
+
+### Auto Loop Round 1
+
+- cfg: `src/lerobot/scripts/train_config/act_fr3_ot_99_20_w8_tau1_reg02_lambda012_action002_sharp05_topk20_calA_calA2d_v1_reg055.json` | out: `outputs/train/loop_1767146115/00_act_fr3_ot_99_20_w8_tau1_reg02_lambda012_action002_sharp05_topk20_calA_calA2d_v1_reg055_wdd3`
+  - W&B: https://wandb.ai/kjust-pinduoduo/lerobot/runs/62t0ogj7
+  - eval_l1: 0.1909 | train_l1: 0.1494 | ot_pi_sum: 0.1210 | ot_loss: 0.2443 | grad_norm: 48.8667
+- cfg: `src/lerobot/scripts/train_config/act_fr3_ot_99_20_w8_tau1_reg02_lambda012_action002_sharp05_topk20_calA_calA2d_v2_tau15.json` | out: `outputs/train/loop_1767146115/01_act_fr3_ot_99_20_w8_tau1_reg02_lambda012_action002_sharp05_topk20_calA_calA2d_v2_tau15_wdd3`
+  - W&B: https://wandb.ai/kjust-pinduoduo/lerobot/runs/v1ps13jw
+  - eval_l1: 0.1933 | train_l1: 0.1496 | ot_pi_sum: 0.1524 | ot_loss: 0.3522 | grad_norm: 49.0288
+- cfg: `src/lerobot/scripts/train_config/act_fr3_ot_99_20_w8_tau1_reg02_lambda012_action002_sharp05_topk20_calA_calA2d_v3_wl0007.json` | out: `outputs/train/loop_1767146115/02_act_fr3_ot_99_20_w8_tau1_reg02_lambda012_action002_sharp05_topk20_calA_calA2d_v3_wl0007_wdd3`
+  - W&B: https://wandb.ai/kjust-pinduoduo/lerobot/runs/yh4ruune
+  - eval_l1: 0.1947 | train_l1: 0.1492 | ot_pi_sum: 0.1541 | ot_loss: 0.2530 | grad_norm: 49.0015
+- cfg: `src/lerobot/scripts/train_config/act_fr3_ot_99_20_w8_tau1_reg02_lambda012_action002_sharp05_topk20_calA_calA2c_v4_reg044.json` | out: `outputs/train/loop_1767146115/03_act_fr3_ot_99_20_w8_tau1_reg02_lambda012_action002_sharp05_topk20_calA_calA2c_v4_reg044_wdd3`
+  - W&B: https://wandb.ai/kjust-pinduoduo/lerobot/runs/cnohyhu3
+  - eval_l1: 0.1911 | train_l1: 0.1495 | ot_pi_sum: 0.1169 | ot_loss: 0.2328 | grad_norm: 48.9396
