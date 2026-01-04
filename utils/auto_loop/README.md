@@ -55,7 +55,7 @@ Auto Loop 实验编排器（轻量）
          src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline.json \
          <三个上面生成的新 cfg 路径> \
        --steps 2000 --log-freq 50 --eval-freq 200 \
-       --concurrency 4 --gpus 0,1,6,7 \
+       --concurrency 4 --gpus 4,5,6,7 \
        --decide --variants-per-run 1 --rounds 3 \
        --exec --wandb-online --wandb-entity <你的entity> --wandb-project <你的project>
 
