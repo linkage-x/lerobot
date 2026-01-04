@@ -9,10 +9,13 @@ Only the pollen-robotics/dtw implementation is supported here to keep the code
 minimal. If the dtw package is missing, an informative error is raised.
 
 Example
-  python -m lerobot.datasets.hirol.build_pair_info \
+
+python -m lerobot.datasets.hirol.build_pair_info \
     --src-dir /data/fr3/1025_insert_tube_fr3_3dmouse_99ep \
     --tgt-dir /data/fr3/1107_insert_tube_fr3_3dmouse_contain_ft_20eps \
     --label state_joint_gripper \
+    --center first \
+    --dtw-agg mean \
     --output src/lerobot/datasets/hirol/dtw/it_99to20_pair_info.json
 
 Output JSON format (indices are 0-based):

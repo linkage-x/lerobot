@@ -204,4 +204,28 @@ def apply_changes(cfg: Dict[str, Any], changes: Dict[str, Any]) -> Dict[str, Any
         _assign(out, parts, op, val)
 
     # Safety: keep use_policy_training_preset as-is; user configs rely on it
+    # Coerce a few known integer fields back to int when users provided float edits
+    def _coerce_ints(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for k, v in list(obj.items()):
+                # known integer keys in our TrainPipelineConfig tree
+                if k in {"batch_size", "num_workers", "steps", "eval_freq", "log_freq", "save_freq", "window_size"}:
+                    try:
+                        # Some edits may have introduced floats like 20.0; cast back to int safely
+                        if isinstance(v, float) and float(v).is_integer():
+                            obj[k] = int(v)
+                        elif isinstance(v, (int,)):
+                            obj[k] = int(v)
+                    except Exception:
+                        pass
+                # Recurse
+                _coerce_ints(v)
+        elif isinstance(obj, list):
+            for it in obj:
+                _coerce_ints(it)
+
+    try:
+        _coerce_ints(out)
+    except Exception:
+        pass
     return out

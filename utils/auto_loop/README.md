@@ -89,8 +89,18 @@ Auto Loop 实验编排器（轻量）
 
 -----------------
 
+并发4个实验
 ```
 cfgs=$(cat .codex_tmp/next_round_cfgs_calibrated.txt | tr '\n' ' '); echo "$cfgs"; setsid nohup python utils/auto_loop/autorun.py --cfgs $cfgs --steps 10000
-  │ --log-freq 100 --eval-freq 500 --concurrency 4 --gpus 4,5,6,7 --exec --wandb-online --wandb-entity kjust-pinduoduo --wandb-project lerobot > .codex_tmp/
+  │ --log-freq 100 --eval-freq 500 --concurrency 4 --gpus 0,1,2,3 --exec --wandb-online --wandb-entity kjust-pinduoduo --wandb-project lerobot > .codex_tmp/
   │ autorun_longrun.log 2>&1 & echo $! && sleep 5 && tail -n 160 .codex_tmp/autorun_longrun.log
+```
+
+后台执行单个实验
+```
+cfg=src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline_h2jr9c.json; \
+        setsid nohup python utils/auto_loop/autorun.py --cfgs $cfg --steps 10000 \
+        --log-freq 100 --eval-freq 500 --concurrency 1 --gpus 3 \
+        --exec --wandb-online --wandb-entity kjust-pinduoduo --wandb-project lerobot \
+        > .codex_tmp/autorun_fix_h2jr9c.log 2>&1 & echo $!
 ```
