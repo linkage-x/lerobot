@@ -12,7 +12,7 @@ Example
   python -m lerobot.datasets.hirol.build_pair_info \
     --src-dir /data/fr3/1025_insert_tube_fr3_3dmouse_99ep \
     --tgt-dir /data/fr3/1107_insert_tube_fr3_3dmouse_contain_ft_20eps \
-    --label state_joint_gripper --stride 2 \
+    --label state_joint_gripper \
     --output src/lerobot/datasets/hirol/dtw/it_99to20_pair_info.json
 
 Output JSON format (indices are 0-based):
@@ -20,7 +20,11 @@ Output JSON format (indices are 0-based):
   "episode_0001": [
     {
       "demo_name": "episode_0003",
-      "raw_dtw_dist": 0.0012,                # normalized distance = dDTW / max(||xs||, ||xt||)
+      # Normalized DTW distance per the paper:
+      #   d_bar(x_s, x_t) = d_DTW(x_s, x_t) / max(|x_s|, |x_t|)
+      # where |x| is interpreted as the arc length of the trajectory under the
+      # same metric as DTW (sum of per-step distances along time).
+      "raw_dtw_dist": 0.0012,
       "pairing": { "0": [0], "1": [1, 2] }  # target idx -> list of aligned source indices
     }
   ]
@@ -155,6 +159,22 @@ def compute_norm_stats(seqs: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
     return mean.astype(np.float32), std.astype(np.float32)
 
 
+def center_sequence(x: np.ndarray, mode: str = "first") -> np.ndarray:
+    """Center per-episode to remove constant bias.
+
+    - 'first': subtract the first frame vector x[0]
+    - 'mean': subtract the temporal mean vector mean_t x[t]
+    - 'none': no centering
+    """
+    if x is None or x.size == 0:
+        return x
+    if mode == "first":
+        return (x - x[:1]).astype(np.float32)
+    if mode == "mean":
+        return (x - x.mean(axis=0, keepdims=True)).astype(np.float32)
+    return x.astype(np.float32)
+
+
 # -------------------------
 # Main logic (pollen DTW only)
 # -------------------------
@@ -177,6 +197,40 @@ def _resolve_output_path(output: str, src_dir: str, tgt_dir: str, label: str) ->
     return output
 
 
+def _arc_length(seq: np.ndarray, metric: str = "l2") -> float:
+    """Compute trajectory arc length |x| under the given metric.
+
+    |x| = sum_t d(x[t], x[t-1]) where d matches the DTW metric.
+    """
+    if seq is None or len(seq) <= 1:
+        return 0.0
+    diffs = seq[1:] - seq[:-1]
+    if metric == "l1":
+        return float(np.sum(np.abs(diffs))) if diffs.ndim == 1 else float(np.sum(np.abs(diffs), axis=1).sum())
+    if metric == "linf":
+        return float(np.max(np.abs(diffs), axis=1).sum())
+    # l2
+    return float(np.linalg.norm(diffs, axis=1).sum())
+
+
+def _per_step_cost_stats(tgt_seq: np.ndarray, src_seq: np.ndarray, p: np.ndarray, q: np.ndarray, metric: str = "l2") -> Tuple[int, float, float, float, float]:
+    """Compute per-step path statistics for debugging.
+
+    Returns (path_len, avg, median, min, max).
+    """
+    if p is None or q is None or len(p) == 0:
+        return 0, float("nan"), float("nan"), float("nan"), float("nan")
+    diffs = tgt_seq[p] - src_seq[q]
+    if metric == "l1":
+        step = np.sum(np.abs(diffs), axis=1)
+    elif metric == "linf":
+        step = np.max(np.abs(diffs), axis=1)
+    else:
+        step = np.linalg.norm(diffs, axis=1)
+    step = step.astype(np.float64)
+    return int(len(step)), float(np.mean(step)), float(np.median(step)), float(np.min(step)), float(np.max(step))
+
+
 def build_pair_info_from_hirol(
     src_dir: str,
     tgt_dir: str,
@@ -188,6 +242,11 @@ def build_pair_info_from_hirol(
     limit_src: int | None,
     limit_tgt: int | None,
     metric: str = "l2",
+    center: str = "first",
+    dtw_agg: str = "mean",  # 'mean' or 'sum'
+    debug_summary: bool = False,
+    debug_topk: int | None = None,
+    debug_one: str | None = None,
 ):
     if pollen_dtw is None or pollen_accel_dtw is None:
         raise ImportError(
@@ -212,8 +271,16 @@ def build_pair_info_from_hirol(
         src_seqs = [(eid, s[::stride]) for eid, s in src_seqs]
         tgt_seqs = [(eid, s[::stride]) for eid, s in tgt_seqs]
 
-    mean, std = compute_norm_stats([s for _, s in src_seqs] + [s for _, s in tgt_seqs])
+    # Center per-episode to suppress constant offsets between sequences
+    center = str(center).lower()
+    if center not in ("none", "first", "mean"):
+        center = "first"
+    if center != "none":
+        src_seqs = [(eid, center_sequence(s, mode=center)) for eid, s in src_seqs]
+        tgt_seqs = [(eid, center_sequence(s, mode=center)) for eid, s in tgt_seqs]
 
+    # Global z-score after centering
+    mean, std = compute_norm_stats([s for _, s in src_seqs] + [s for _, s in tgt_seqs])
     src_seqs = [(eid, zscore(s, mean, std)) for eid, s in src_seqs]
     tgt_seqs = [(eid, zscore(s, mean, std)) for eid, s in tgt_seqs]
 
@@ -221,9 +288,27 @@ def build_pair_info_from_hirol(
     metric_map = {"l2": "euclidean", "l1": "cityblock", "linf": "chebyshev"}
     dist_name = metric_map.get(metric, "euclidean")
 
+    # Optional specific pair debug: parse "tgt_id:src_id"
+    debug_tgt = debug_src = None
+    if debug_one:
+        try:
+            parts = debug_one.split(":", 1)
+            if len(parts) == 2:
+                debug_tgt, debug_src = parts[0], parts[1]
+        except Exception:
+            debug_tgt = debug_src = None
+
+    # Print run setup summary
+    print(f"[DTW] src={len(src_seqs)} eps, tgt={len(tgt_seqs)} eps, label={label}, D={tgt_seqs[0][1].shape[1] if tgt_seqs and tgt_seqs[0][1].ndim==2 else 'N/A'}")
+    print(f"[DTW] metric={metric} (cdist={dist_name}), stride={stride}, window={window}, center={center}, dtw_agg={dtw_agg}")
+
     result: Dict[str, List[Dict]] = {}
     for tgt_id, tgt_seq in tgt_seqs:
         pairs: List[Tuple[str, float, Dict[str, List[int]]]] = []
+        # Precompute arc length of tgt once
+        xt_len = _arc_length(tgt_seq, metric)
+        lt = len(tgt_seq)
+        D = tgt_seq.shape[1] if tgt_seq.ndim == 2 else 0
         for src_id, src_seq in src_seqs:
             # Use accelerated DTW when no window is requested; fall back to dtw() to honor window
             if window is None:
@@ -248,34 +333,73 @@ def build_pair_info_from_hirol(
             if not path:
                 continue
 
-            # Note: cum_cost is the total DTW cost along the optimal path
-            xs_norm = float(np.linalg.norm(src_seq))
-            xt_norm = float(np.linalg.norm(tgt_seq))
-            denom = max(xs_norm, xt_norm)
-            norm = float(cum_cost / denom) if denom > 1e-12 else float("inf")
-
             # Convert alignment pairs back to original (pre-stride) indices
             pairing: Dict[int, List[int]] = defaultdict(list)
             for (ti, sj) in path:
                 pairing[int(ti * stride)].append(int(sj * stride))
 
-            pairs.append((src_id, float(cum_cost), {str(k): v for k, v in pairing.items()}))
+            # Paper-normalized DTW: d_DTW / max(|x_s|, |x_t|), where |x| is arc length.
+            # Here, d_DTW can be the mean per-step path cost ('mean') or the total path cost ('sum').
+            xs_len = _arc_length(src_seq, metric)
+            denom = max(xs_len, xt_len)
+            path_len = max(1, int(len(p)))
+            cost_val = float(cum_cost) if dtw_agg == "sum" else float(cum_cost) / float(path_len)
+            dist_val = float(cost_val / denom) if denom > 1e-12 else float("inf")
+
+            # Per-pair debug: only when explicitly requested for this (tgt,src)
+            if debug_tgt is not None and debug_src is not None and tgt_id == debug_tgt and src_id == debug_src:
+                path_len, step_avg, step_med, step_min, step_max = _per_step_cost_stats(tgt_seq, src_seq, p, q, metric)
+                print((
+                    f"[DEBUG one] tgt={tgt_id} (T={lt}, D={D}) src={src_id} (T={len(src_seq)}) "
+                    f"cum_cost={cum_cost:.6f} cost_mode={dtw_agg} cost_val={cost_val:.6f} "
+                    f"|xs|={xs_len:.6f} |xt|={xt_len:.6f} denom={denom:.6f} ratio={dist_val:.6f} "
+                    f"path_len={path_len} step_avg={step_avg:.6f} step_med={step_med:.6f} step_min={step_min:.6f} step_max={step_max:.6f}"
+                ))
+
+            pairs.append((src_id, dist_val, {str(k): v for k, v in pairing.items()}))
 
         # Keep top-k by cost (lower is better)
         pairs.sort(key=lambda x: x[1])
         if top_k is not None and top_k > 0:
             pairs = pairs[:top_k]
 
-        # Recompute normalized distance for output consistency
+        # Per-target summary debug for top few pairs
+        if debug_summary and len(pairs) > 0:
+            show_k = len(pairs) if not debug_topk or debug_topk <= 0 else min(debug_topk, len(pairs))
+            print(f"[DEBUG sum] tgt={tgt_id} (T={lt}, D={D}) |xt|={xt_len:.6f}; top{show_k} pairs by ratio")
+            for sid, dist_val, pairing in pairs[:show_k]:
+                # recompute DTW path stats for display (run accelerated again with same settings)
+                src_seq = next(s for s_id, s in src_seqs if s_id == sid)
+                if window is None:
+                    cum_cost, _C, _D1, pq = pollen_accel_dtw(tgt_seq, src_seq, dist=dist_name, warp=1)
+                    p, q = map(lambda x: np.asarray(x, dtype=np.int64), pq)
+                else:
+                    lt2, ls2 = len(tgt_seq), len(src_seq)
+                    w_eff = int(max(window, abs(lt2 - ls2)))
+                    def _metric(u, v):
+                        if metric == "l1":
+                            return float(np.sum(np.abs(u - v)))
+                        if metric == "linf":
+                            return float(np.max(np.abs(u - v)))
+                        return float(np.linalg.norm(u - v))
+                    cum_cost, _C, _D1, pq = pollen_dtw(tgt_seq, src_seq, dist=_metric, warp=1, w=w_eff, s=1.0)
+                    p, q = map(lambda x: np.asarray(x, dtype=np.int64), pq)
+                xs_len = _arc_length(src_seq, metric)
+                denom = max(xs_len, xt_len)
+                path_len2 = max(1, int(len(p)))
+                cost_val2 = float(cum_cost) if dtw_agg == "sum" else float(cum_cost) / float(path_len2)
+                path_len, step_avg, step_med, step_min, step_max = _per_step_cost_stats(tgt_seq, src_seq, p, q, metric)
+                print((
+                    f"  - src={sid} (T={len(src_seq)}) cum_cost={cum_cost:.6f} cost_val={cost_val2:.6f} "
+                    f"|xs|={xs_len:.6f} denom={denom:.6f} "
+                    f"ratio={float(cost_val2/denom) if denom>1e-12 else float('inf'):.6f} (stored={dist_val:.6f}) "
+                    f"path_len={path_len} step_avg={step_avg:.6f} step_med={step_med:.6f} step_min={step_min:.6f} step_max={step_max:.6f}"
+                ))
+
+        # Emit distance directly as raw_dtw_dist (paper normalization)
         out_list = []
-        for sid, cum_cost, pairing in pairs:
-            # Use the cached normalized sequences to compute norms
-            src_seq = next(s for s_id, s in src_seqs if s_id == sid)
-            xs_norm = float(np.linalg.norm(src_seq))
-            xt_norm = float(np.linalg.norm(tgt_seq))
-            denom = max(xs_norm, xt_norm)
-            norm = float(cum_cost / denom) if denom > 1e-12 else float("inf")
-            out_list.append({"demo_name": sid, "raw_dtw_dist": norm, "pairing": pairing})
+        for sid, dist_val, pairing in pairs:
+            out_list.append({"demo_name": sid, "raw_dtw_dist": float(dist_val), "pairing": pairing})
 
         result[tgt_id] = out_list
 
@@ -315,6 +439,23 @@ def main():
         default="l2",
         help="distance metric (used by pollen backend)",
     )
+    parser.add_argument(
+        "--dtw-agg",
+        choices=["mean", "sum"],
+        default="mean",
+        help="aggregate along DTW path for d_DTW: 'mean' (per-step average) or 'sum' (total path cost)",
+    )
+    parser.add_argument(
+        "--center",
+        choices=["none", "first", "mean"],
+        default="first",
+        help=(
+            "per-episode centering before z-score: 'first' subtracts the first frame, 'mean' subtracts temporal mean"
+        ),
+    )
+    parser.add_argument("--debug-summary", action="store_true", help="print per-target summary with top pairs")
+    parser.add_argument("--debug-topk", type=int, default=3, help="how many top pairs to show per target in debug summary")
+    parser.add_argument("--debug-one", type=str, default=None, help="debug a specific pair: '<tgt_id>:<src_id>'")
 
     args = parser.parse_args()
 
@@ -331,9 +472,13 @@ def main():
         limit_src=args.limit_src,
         limit_tgt=args.limit_tgt,
         metric=args.metric,
+        center=args.center,
+        dtw_agg=args.dtw_agg,
+        debug_summary=bool(args.debug_summary),
+        debug_topk=args.debug_topk,
+        debug_one=args.debug_one,
     )
 
 
 if __name__ == "__main__":
     main()
-
