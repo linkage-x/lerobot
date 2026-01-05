@@ -185,3 +185,6 @@ src/lerobot/datasets/fr3_lerobot
 src/lerobot/datasets/hirol/dtw
 
 ot-sim2real
+
+.codex_tmp
+nohup*

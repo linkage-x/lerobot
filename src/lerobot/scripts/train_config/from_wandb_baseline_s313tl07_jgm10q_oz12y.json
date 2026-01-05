@@ -1,0 +1,217 @@
+{
+  "ot": {
+    "enable": true,
+    "obs_keys": [
+      "observation.images.third_person_cam_color",
+      "observation.images.ee_cam_color",
+      "observation.images.side_cam_color"
+    ],
+    "src_root": "/data/fr3_lerobot/1025_insert_tube_fr3_3dmouse_99ep",
+    "lambda_ot": 0.05,
+    "no_window": false,
+    "sharpness": 0.5,
+    "batch_ratio": 0.5,
+    "loss_config": {
+      "reg": 0.5,
+      "tau_src": 1.0,
+      "tau_tgt": 1.0,
+      "features": [
+        {
+          "src_key": "observation.images.third_person_cam_color",
+          "tgt_key": "observation.images.third_person_cam_color",
+          "term_name": "img_third_person",
+          "weight_embed": 0.3333,
+          "weight_label": 0.0,
+          "use_learned_embed": true
+        },
+        {
+          "src_key": "observation.images.ee_cam_color",
+          "tgt_key": "observation.images.ee_cam_color",
+          "term_name": "img_ee",
+          "weight_embed": 0.3333,
+          "weight_label": 0.0,
+          "use_learned_embed": true
+        },
+        {
+          "src_key": "observation.images.side_cam_color",
+          "tgt_key": "observation.images.side_cam_color",
+          "term_name": "img_side",
+          "weight_embed": 0.3333,
+          "weight_label": 0.0,
+          "use_learned_embed": true
+        }
+      ],
+      "heuristic": true
+    },
+    "src_repo_id": "1025_insert_tube_fr3_3dmouse_99ep",
+    "window_size": 10,
+    "bc_src_weight": 0.9,
+    "base_index_src": 0,
+    "base_index_tgt": 0,
+    "pair_info_path": "src/lerobot/datasets/hirol/dtw/it_99to20_pair_info.json",
+    "topk_src_episodes": null,
+    "normalize_bc_weights_by_ds_size": true
+  },
+  "env": null,
+  "eval": {
+    "batch_size": 50,
+    "n_episodes": 50,
+    "use_async_envs": false
+  },
+  "seed": 42,
+  "debug": {
+    "instrument": true,
+    "log_first_batch_images": false
+  },
+  "steps": 10000,
+  "wandb": {
+    "mode": "online",
+    "notes": null,
+    "enable": true,
+    "entity": "kjust-pinduoduo",
+    "run_id": null,
+    "project": "lerobot",
+    "disable_artifact": true
+  },
+  "policy": {
+    "tags": null,
+    "type": "act",
+    "device": "cuda",
+    "dropout": 0.1,
+    "license": null,
+    "n_heads": 8,
+    "private": null,
+    "repo_id": null,
+    "use_amp": true,
+    "use_vae": true,
+    "pre_norm": false,
+    "dim_model": 512,
+    "kl_weight": 10,
+    "chunk_size": 100,
+    "latent_dim": 32,
+    "n_obs_steps": 1,
+    "push_to_hub": false,
+    "optimizer_lr": 1e-05,
+    "n_action_steps": 100,
+    "dim_feedforward": 3200,
+    "pretrained_path": null,
+    "vision_backbone": "resnet18",
+    "n_decoder_layers": 1,
+    "n_encoder_layers": 4,
+    "n_vae_encoder_layers": 4,
+    "normalization_mapping": {
+      "STATE": "MEAN_STD",
+      "ACTION": "MEAN_STD",
+      "VISUAL": "MEAN_STD"
+    },
+    "optimizer_lr_backbone": 1e-05,
+    "feedforward_activation": "relu",
+    "optimizer_weight_decay": 0.0001,
+    "temporal_ensemble_coeff": null,
+    "pretrained_backbone_weights": "ResNet18_Weights.IMAGENET1K_V1",
+    "replace_final_stride_with_dilation": false
+  },
+  "resume": false,
+  "dataset": {
+    "root": "/data/fr3_lerobot/1107_insert_tube_fr3_3dmouse_contain_ft_20eps",
+    "repo_id": "1107_insert_tube_fr3_3dmouse_contain_ft_20eps",
+    "episodes": null,
+    "revision": null,
+    "streaming": false,
+    "video_backend": "torchcodec",
+    "image_transforms": {
+      "tfs": {
+        "hue": {
+          "type": "ColorJitter",
+          "kwargs": {
+            "hue": [
+              -0.05,
+              0.05
+            ]
+          },
+          "weight": 1
+        },
+        "affine": {
+          "type": "RandomAffine",
+          "kwargs": {
+            "degrees": [
+              -5,
+              5
+            ],
+            "translate": [
+              0.05,
+              0.05
+            ]
+          },
+          "weight": 1
+        },
+        "contrast": {
+          "type": "ColorJitter",
+          "kwargs": {
+            "contrast": [
+              0.8,
+              1.2
+            ]
+          },
+          "weight": 1
+        },
+        "sharpness": {
+          "type": "SharpnessJitter",
+          "kwargs": {
+            "sharpness": [
+              0.5,
+              1.5
+            ]
+          },
+          "weight": 1
+        },
+        "brightness": {
+          "type": "ColorJitter",
+          "kwargs": {
+            "brightness": [
+              0.8,
+              1.2
+            ]
+          },
+          "weight": 1
+        },
+        "saturation": {
+          "type": "ColorJitter",
+          "kwargs": {
+            "saturation": [
+              0.5,
+              1.5
+            ]
+          },
+          "weight": 1
+        }
+      },
+      "enable": true,
+      "random_order": false,
+      "max_num_transforms": 3
+    },
+    "use_imagenet_stats": true
+  },
+  "job_name": "act",
+  "log_freq": 100,
+  "eval_freq": 500,
+  "optimizer": {
+    "lr": 1e-05,
+    "eps": 1e-08,
+    "type": "adamw",
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "weight_decay": 0.0001,
+    "grad_clip_norm": 10
+  },
+  "save_freq": 10000,
+  "scheduler": null,
+  "batch_size": 8,
+  "output_dir": "outputs/train/loop_1767520593/00_act_fr3_ot_99_20_baseline_h2jr9c_b4tn",
+  "num_workers": 4,
+  "checkpoint_path": null,
+  "save_checkpoint": true,
+  "use_policy_training_preset": true
+}
