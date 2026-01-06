@@ -2,10 +2,10 @@
 
 input:
   mcap_file: ""             # or leave empty and use task_dir
-  task_dir: "/home/hanyu/Data_Collection/data/output/vio_12_22_x"              # e.g. /data/das/task_run_dir (must contain vio_result.json)
+  task_dir: "/home/tele/Data/data/output/vio_1.05-1-100"              # e.g. /data/das/task_run_dir (must contain vio_result.json)
 
 output:
-  task_dir: "dataset/data/das"
+  task_dir: "dataset/data/das_1.05-1-100"
   repo_name: "das_demo_ee2dee"
   robot_name: "fr3"
 
@@ -25,7 +25,7 @@ topics:
   tactile_right: "/robot0/sensor/tactile_right"
 
 # Downsample and image handling
-fps: 15
+fps: 30
 img_new_width: -1           # deprecated in favor of preprocess
 preprocess:
   target_size: [640, 480]   # width, height
