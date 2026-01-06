@@ -86,32 +86,12 @@ class LerobotLoader(DataLoaderBase):
         # Target save path for the converted LeRobot dataset
         save_path = os.path.join(self._output_root_path, self._repo_name)
 
-        # If a dataset already exists at save_path, do not re-convert.
+        # If a dataset already exists at save_path, append new episodes instead of opening in reader mode
+        # to avoid network/caching issues in restricted environments.
         if os.path.exists(save_path):
-            log.info(f"Found existing LeRobotDataset at {save_path}, skip raw conversion.")
-            try:
-                reader_ds = LeRobotDataset(repo_id=self._repo_name, root=save_path)
-                # 尽量打印一些有用的统计信息，同时兼容不同版本的 LeRobotDataset
-                num_episodes = getattr(reader_ds, "total_episodes", None)
-                num_frames = getattr(reader_ds, "total_frames", None)
-                fps = getattr(reader_ds, "fps", None)
-                if num_episodes is not None or num_frames is not None or fps is not None:
-                    log.info(
-                        "Existing dataset summary: "
-                        f"total_episodes={num_episodes}, "
-                        f"total_frames={num_frames}, "
-                        f"fps={fps}"
-                    )
-                features = getattr(reader_ds, "features", None)
-                if features is not None:
-                    log.info(f"Features: {features}")
-            except Exception as e:
-                log.error(
-                    f"Failed to load existing LeRobotDataset at {save_path}. "
-                    f"Please verify or remove the directory. Error: {e}"
-                )
-                raise
-            return reader_ds
+            log.info(
+                f"Found existing LeRobotDataset at {save_path}, will append/continue without opening in reader mode."
+            )
 
         # Load a reference episode without subsampling to infer feature dims and timestamp keys.
         # Use the first task_dir as template when multiple dirs are provided.
@@ -205,6 +185,17 @@ class LerobotLoader(DataLoaderBase):
                         continue
                     frame_feature = {}
                     # vision images: write to observation.images.<name>
+                    # Ensure all required image keys exist for this step; otherwise skip this step
+                    all_images_present = True
+                    for idx, image_key in enumerate(self._image_keys):
+                        source = self._image_sources[idx]
+                        src_dict = step.get(source, {}) or {}
+                        if image_key not in src_dict:
+                            all_images_present = False
+                            break
+                    if not all_images_present:
+                        # Skip this frame to keep video streams aligned and avoid KeyError
+                        continue
                     for idx, image_key in enumerate(self._image_keys):
                         source = self._image_sources[idx]
                         frame_feature[f"observation.images.{image_key}"] = step[source][image_key]
