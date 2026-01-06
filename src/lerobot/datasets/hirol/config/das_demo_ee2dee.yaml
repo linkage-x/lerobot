@@ -25,7 +25,7 @@ topics:
   tactile_right: "/robot0/sensor/tactile_right"
 
 # Downsample and image handling
-fps: 15
+fps: 30
 img_new_width: -1           # deprecated in favor of preprocess
 preprocess:
   target_size: [640, 480]   # width, height
