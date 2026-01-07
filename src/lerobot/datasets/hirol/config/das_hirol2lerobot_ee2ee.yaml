@@ -7,8 +7,10 @@ contain_ft: false
 contain_depth: false
 repo_name: "das_ee2ee"
 root_path: "/home/hanyu/Codes/HIROLRobotPlatform/assets/data"
-fps: 15
+fps: 30
 num_writer_thread: 4
 num_writer_process: 0
 batch_encoding_size: 1
 video_backend: torchcodec
+rotation_transform:
+  single: [0.7071068, 0, 0.7071068, 0]
