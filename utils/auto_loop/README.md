@@ -1,173 +1,297 @@
-Auto Loop 实验编排器（轻量）
+# Auto Loop 实验编排器（轻量）
 
-用途
-- 批量排队小步数训练（如 2K steps），可设置并发与固定 GPU 绑核。
-- 默认离线 W&B，输出到本地 output_dir；可切换在线 W&B。
-- 每个作业结束后解析 wandb-history.jsonl，生成精简统计并累计到 JSON/Markdown 报告。
-- 可按规则自动生成下一轮实验配置，形成多轮迭代。
+面向小步数快速迭代的训练编排工具。支持批量排队、并发跑、固定 GPU 绑核、在线 W&B 记录、离线解析汇总，以及按规则自动生成下一轮配置。
 
-涉及脚本
-- autorun.py：主循环调度器。按“accelerate launch … src/lerobot/scripts/lerobot_train.py”启动；
-  - 每个 slot 设置独立 CUDA_VISIBLE_DEVICES；
+## 强制要求（本项目）
+- codex cli在“非沙箱/提升权限”模式运行
+- 必须使用 GPU 运行：所有正式实验需通过 `--gpus` 指定 GPU，并将 `policy.device=cuda`（`autorun` 会自动设置）。默认0,1,2,3.
+- W&B 必须在线：所有正式实验须使用在线 W&B，传入 `--wandb-online --wandb-entity <entity> --wandb-project <project>`，并提前设置 `WANDB_API_KEY`。
+  默认使用entity：kjust-pinduoduo project：lerobot。 允许请求网络权限
+- 说明：`autorun.py` 为安全起见仍默认离线，但仅用于调试/排查；正式跑请务必显式开启在线模式并使用 GPU。
+
+## 适用场景 / 功能
+- 批量排队小步数训练（如 3K steps），可设置并发与固定 GPU 绑核。
+- 默认离线 W&B（调试用途），输出到本地 `output_dir`；正式实验请改为在线 W&B。
+- 每个作业结束后解析 `wandb-history.jsonl`，生成精简统计，累计写入 JSON/Markdown 报告。
+- 可按启发式规则从已完成作业生成下一轮配置，形成多轮迭代（auto-decide）。
+
+## 脚本总览
+- `autorun.py`：主循环调度器（accelerate 启动训练脚本）。
+  - 每个 slot 设置独立 `CUDA_VISIBLE_DEVICES`；
   - 记录离线/在线 W&B；
-  - 作业结束后解析本地 wandb 历史，汇总到 reports/data/autorun_summary.json；
-  - 打开 --decide 时，按 rules.py 的启发式从已完成作业生成下一轮候选配置，并继续跑。
-- rules.py：根据关键指标（例如 L1、OT 质量和/对角、OT 成本、梯度范数）提出若干“配置改动”。支持点号路径 + @set/@mul/@add，含列表通配符（features.*.weight_label）。
-- common.py：解析本地 wandb 历史（wandb-history.jsonl），按 first/last/best/delta/% 生成简明统计。
-- analyze_offline.py：扫描 outputs/train/**/wandb/**，生成本地离线汇总 JSON。
-- analyze_wandb.py：在线 W&B 汇总（需要网络与 WANDB_API_KEY，可选）。
-- generate_and_run.py：从一个基线 JSON 生成单个变体（点号编辑），可选择立即启动该单跑。
+  - 作业结束后解析本地 wandb 历史，汇总到 `reports/data/autorun_summary.json`；
+  - 打开 `--decide` 时，调用 `rules.py` 生成下一轮候选配置并继续跑。
+- `rules.py`：按关键指标（L1、OT 质量和/对角、OT 成本、梯度范数等）提出“配置改动”。
+  - 使用点号路径 + `@set/@mul/@add`，支持列表通配符（如 `features.*.weight_label`）。
+- `common.py`：解析本地 wandb 历史（`wandb-history.jsonl`），按 first/last/best/delta/% 生成简明统计。
+- `analyze_offline.py`：扫描 `outputs/train/**/wandb/**`，生成离线汇总 JSON。
+- `analyze_wandb.py`：在线 W&B 汇总（需要网络与 `WANDB_API_KEY`，可选）。
+- `generate_and_run.py`：基于一个基线 JSON 生成单个变体（点号编辑），可选择立即启动该单跑。
 
-输出位置
-- 训练输出目录：outputs/train/…（每个作业各自的 output_dir，内部含 wandb/）
-- 轮次累计 JSON：src/lerobot/scripts/train_config/reports/data/autorun_summary.json
-- 轮次 Markdown 摘要：src/lerobot/scripts/train_config/reports/act_ot.md（附每个 cfg、out 路径与关键指标；若日志里发现 W&B URL 也会附上）
+## 输出位置
+- 训练输出目录：`outputs/train/...`（每个作业各自的 `output_dir`，内部含 `wandb/`）。
+- 轮次累计 JSON：`src/lerobot/scripts/train_config/reports/data/autorun_summary.json`。
+- 轮次 Markdown 摘要：`src/lerobot/scripts/train_config/reports/act_ot.md`（附 cfg、out 路径与关键指标；若日志内发现 W&B URL 也会附上）。
 
-安全默认
-- 未指定时，默认强制 W&B 离线（--wandb.mode=offline，禁止 artifact 以减少权限噪音）。
-- 不会预创建 output_dir（训练脚本会校验目录必须不存在）。
-- 自动把 W&B 缓存指向 .wandb_cache/，避免写入家目录权限问题。
+## 安全默认
+- 默认（调试用途）：未指定时使用 W&B 离线（`--wandb.mode=offline`，并禁用 artifact 以减少权限噪音）。
+- 正式实验：必须显式加 `--wandb-online --wandb-entity <entity> --wandb-project <project>` 并在 GPU 上运行。
+- 不会预创建 `output_dir`（训练脚本会校验目录必须不存在）。
+- W&B 缓存重定向至本地 `.wandb_cache/`，避免写入家目录权限问题。
 
-快速开始：3 轮 ACT-OT（并发 4，GPU=0,1,6,7，steps=2K）
-- 最推荐：第一轮就占满 4 个 slot（基线 + 3 个小变体），保证每轮稳定 4 并发。
+## 快速开始：3 轮 ACT-OT（并发 4，GPU=0,1,2,3，3K steps）
+> 建议第一轮就占满 4 个 slot（基线 + 3 个小变体），保证每轮稳定 4 并发。
 
-  1) 先生成 3 个变体（只写文件，不执行）：
+1) 先生成 3 个变体（只写文件，不执行）：
 
-     python -m utils.auto_loop.generate_and_run \
-       --base-cfg src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline.json \
-       --reason "reg+tau" \
-       --changes 'ot.loss_config.reg@mul=1.5' 'ot.loss_config.tau_src@set=1.0' 'ot.loss_config.tau_tgt@set=1.0' 'ot.lambda_ot@set=0.12'
+```bash
+python -m utils.auto_loop.generate_and_run \
+  --base-cfg src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline.json \
+  --reason "reg+tau" \
+  --changes 'ot.loss_config.reg@mul=1.5' 'ot.loss_config.tau_src@set=1.0' 'ot.loss_config.tau_tgt@set=1.0' 'ot.lambda_ot@set=0.12'
 
-     python -m utils.auto_loop.generate_and_run \
-       --base-cfg src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline.json \
-       --reason "tau=2, lam=0.15" \
-       --changes 'ot.loss_config.tau_src@set=2.0' 'ot.loss_config.tau_tgt@set=2.0' 'ot.lambda_ot@set=0.15' 'ot.loss_config.features.*.weight_label@mul=0.5'
+python -m utils.auto_loop.generate_and_run \
+  --base-cfg src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline.json \
+  --reason "tau=2, lam=0.15" \
+  --changes 'ot.loss_config.tau_src@set=2.0' 'ot.loss_config.tau_tgt@set=2.0' 'ot.lambda_ot@set=0.15' 'ot.loss_config.features.*.weight_label@mul=0.5'
 
-     python -m utils.auto_loop.generate_and_run \
-       --base-cfg src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline.json \
-       --reason "tau=5, action=0.005" \
-       --changes 'ot.loss_config.tau_src@set=5.0' 'ot.loss_config.tau_tgt@set=5.0' 'ot.lambda_ot@set=0.10' 'ot.loss_config.features.*.weight_label@set=0.005'
-
-  2) 用 4 份配置跑 3 轮（在线 W&B 示例）：
-
-     python utils/auto_loop/autorun.py \
-       --cfgs \
-         src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline.json \
-         <三个上面生成的新 cfg 路径> \
-       --steps 2000 --log-freq 50 --eval-freq 200 \
-       --concurrency 4 --gpus 4,5,6,7 \
-       --decide --variants-per-run 1 --rounds 3 \
-       --exec --wandb-online --wandb-entity <你的entity> --wandb-project <你的project>
-
-  说明：
-  - 下一轮会在“本轮全部作业结束后”自动生成并启动；
-  - 在线/离线均会在 output_dir/wandb/latest-run/files 下写本地历史文件，autorun 依此解析；
-  - 如果看到 “No next-round jobs were generated by rules; stopping.”，常见原因是本轮作业未产出可解析的历史（如提前报错退出）。请先检查各 slot 日志与输出目录。
-
-手动单进程（命令格式示例）
-- 直接手动跑一个作业时，推荐：
-
-  CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 \
-    src/lerobot/scripts/lerobot_train.py \
-    --config_path=src/lerobot/scripts/train_config/act_fr3_ot.json
-
-  autorun.py 内部就是按该格式为每个并发 slot 绑定一张 GPU 并启动。
-
-规则（简述）
-- pi_sum 很小：增大 reg、增大 tau、扩大/上限窗口；
-- pi 高但成本不降：降低 label 权重、稍降 lambda_ot；
-- L1 停滞：小幅增大学习率与 batch；
-- grad_norm 过大：增加正则或降低学习率；
-- 都不触发：给出“温和 OT”默认变体。
-
-排障要点
-- 未生成下一轮：
-  1) 先等本轮所有作业结束（autorun 才会汇总并决策）；
-  2) 检查每个 output_dir 下是否存在 wandb/latest-run/files/wandb-history.jsonl；
-  3) 查 .codex_tmp/slot*_*.log 是否有报错；
-  4) 如需仅汇总现有离线日志，可运行 analyze_offline.py。
-
------------------
-
-并发4个实验
-```
-cfgs=$(cat .codex_tmp/next_round_cfgs_calibrated.txt | tr '\n' ' '); echo "$cfgs"; setsid nohup python utils/auto_loop/autorun.py --cfgs $cfgs --steps 10000
-  │ --log-freq 100 --eval-freq 500 --concurrency 4 --gpus 0,1,2,3 --exec --wandb-online --wandb-entity kjust-pinduoduo --wandb-project lerobot > .codex_tmp/
-  │ autorun_longrun.log 2>&1 & echo $! && sleep 5 && tail -n 160 .codex_tmp/autorun_longrun.log
+python -m utils.auto_loop.generate_and_run \
+  --base-cfg src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline.json \
+  --reason "tau=5, action=0.005" \
+  --changes 'ot.loss_config.tau_src@set=5.0' 'ot.loss_config.tau_tgt@set=5.0' 'ot.lambda_ot@set=0.10' 'ot.loss_config.features.*.weight_label@set=0.005'
 ```
 
-附录：上下文/自动迭代常见问题与排障（必读）
+2) 用 4 份配置跑 3 轮（GPU + W&B 在线，正式实验）：
 
-- 自动迭代的“上下文”来源
-  - autorun 每个作业结束后，会从 output_dir/wandb/latest-run/files/wandb-history.jsonl 读取历史并汇总到 reports/data/autorun_summary.json，再根据 rules.py 生成下一轮候选配置；
-  - 若使用在线 W&B，同样会在本地 latest-run/files 写入 wandb-history.jsonl，autorun 依此解析（无需联网）。
-
-- “未进入下一轮（No next-round jobs were generated by rules）”常见原因
-  1) 本轮作业未产生可解析历史：进程提前报错退出或 wandb-history.jsonl 缺失。处理：
-     - 先 tail .codex_tmp/slot*_*.log 查错误；
-     - 再检查各 output_dir 下的 wandb/latest-run/files 是否存在 wandb-history.jsonl。
-  2) draccus 类型错误阻断了启动：例如 `window_size`、`batch_size` 被规则编辑成了 `20.0/12.0` 等浮点，解析期报错。
-     - 已在 utils/auto_loop/rules.py 增加“整型字段回转”为 int（batch_size/num_workers/steps/log_freq/eval_freq/save_freq/window_size 等），但若你私自改了 rules.py，请确保保留该逻辑。
-  3) OT 配置导致训练期异常：
-     - “Both embedding and label costs are disabled for an OT feature.”：不要把某个 feature 的 embed 和 label 同时关掉；纯图像嵌入时应直接删除 action 这条 feature。
-     - π 或 ot_loss 直接为 0：多数是 reg 太小而成本矩阵 M 的量级太大（Sinkhorn 下溢），先增大 `ot.loss_config.reg`（0.3→0.5）、放宽 `tau_src/tau_tgt`（1→2），并减小标签权重/λ_ot。
-
-- 当“上下文不够”时的手动续跑流程（离线也可）
-  1) 汇总本地离线运行：
-     - `python -m utils.auto_loop.analyze_offline --outputs-root outputs/train --limit 100 --out-json .codex_tmp/offline_summary.json`
-  2) 基于汇总做一次性“人工决策 + 生成下一轮 cfg”：
-     - 方案 A（推荐）：`python -m utils.auto_loop.generate_and_run --base-cfg <上一轮某 cfg> --reason "<说明>" --changes 'a.b@op=val' ...`（仅生成，不执行）；
-     - 方案 B（脚本化）：参考本 README 的“快速开始”命令，先把 4 个新 cfg 路径写入 `.codex_tmp/next_round_cfgs_calibrated.txt`，再用 autorun 启动。
-  3) 启动一轮：
-     - `WANDB_SENTRY_ENABLED=false setsid nohup python utils/auto_loop/autorun.py --cfgs $(cat .codex_tmp/next_round_cfgs_calibrated.txt | tr '\n' ' ') --steps 10000 --log-freq 100 --eval-freq 500 --concurrency 4 --gpus 0,1,2,3 --exec --wandb-online --wandb-entity <entity> --wandb-project <project> > .codex_tmp/autorun_roundN.log 2>&1 & echo $!`
-
-- 一次起 2–3 轮（链式等待）
-  - 某些环境下 `--decide --rounds N` 可能因某个作业类型错误/日志缺失导致链路中断。此时可以先 `--rounds 1` 跑完一轮，然后用“链式脚本”在该 autorun 进程结束后自动生成与启动下一轮：
-  ```bash
-  pid=$(cat .codex_tmp/autorun_roundN.pid); while kill -0 $pid 2>/dev/null; do sleep 60; done
-  # 生成下一轮 cfg（示例，按需调整 decide/changes）
-  python - << 'PY'
-  import json, re, subprocess, sys
-  from pathlib import Path
-  from utils.auto_loop.rules import decide
-  with open('.codex_tmp/offline_summary.json','r') as f:
-      summaries=json.load(f)
-  # 选最新 loop 下的 run
-  loops={}
-  for k in summaries.keys():
-      m=re.search(r"outputs/train/(loop_\d+)/",k)
-      if m: loops.setdefault(m.group(1),[]).append(k)
-  latest=sorted(loops)[-1]
-  for rk in sorted(loops[latest]):
-      props=decide(summaries[rk]) or []
-      if not props: continue
-      ch=props[0].changes; cli=[f"{k}={v}" for k,v in ch.items()]
-      subprocess.run([sys.executable,'-m','utils.auto_loop.generate_and_run','--base-cfg','<你的上一轮cfg路径>','--reason',props[0].reason,'--changes',*cli,'--steps','10000','--log-freq','100','--eval-freq','500','--out-dir','src/lerobot/scripts/train_config'])
-  PY
-  # 将新 cfg 路径写入列表后，再启动下一轮 autorun（同上）
-  ```
-
-- W&B 相关
-  - 在线：加 `--wandb-online --wandb-entity <entity> --wandb-project <project>`；建议 `export WANDB_SENTRY_ENABLED=false` 以屏蔽内网 DNS 噪音；
-  - 离线：默认 `--wandb.mode=offline`，日志在 `output_dir/wandb/latest-run/files/`；autorun 只需本地 history 即可做决策；
-  - 本仓库的 common.py 已内置指标别名，确保能识别 `train/ot_loss`, `train/ot_pi_sum`, `train/ot_pi_diag`, `train/ot_cost/*` 等。
-
-- OT 配置提示
-  - 避免“both disabled”：不要让某个 feature 同时 `use_learned_embed=false` 且 `weight_label=0.0`；纯图像嵌入请删除 action 这条 feature；
-  - π=0/ot_loss=0：优先增大 `reg`、放宽 `tau_src/tau_tgt`，并降低 `lambda_ot` 与标签权重；
-  - 数值：若成本矩阵量级远大于 reg，Sinkhorn 容易下溢到 0（即使 fp64），务必先把 reg 提高到 0.3–0.5 再探索。
-
-- 其他
-  - autorun 会自动设置 `PYTHONPATH=src` 与本地 `.wandb_cache/`；
-  - GPU 绑核：`CUDA_VISIBLE_DEVICES` 由 autorun 为每个 slot 单独设置；
-  - 若你直接用 `accelerate launch` 跑，请确保 `--num_processes 1`，并与 autorun 的参数保持一致。
-
-
-后台执行单个实验
+```bash
+python utils/auto_loop/autorun.py \
+  --cfgs \
+    src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline.json \
+    <三个上面生成的新 cfg 路径> \
+  --steps 2000 --log-freq 50 --eval-freq 200 \
+  --concurrency 4 --gpus 4,5,6,7 \
+  --decide --variants-per-run 1 --rounds 3 \
+  --exec --wandb-online --wandb-entity <entity> --wandb-project <project>
 ```
-cfg=src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline_h2jr9c.json; \
-        setsid nohup python utils/auto_loop/autorun.py --cfgs $cfg --steps 10000 \
-        --log-freq 100 --eval-freq 500 --concurrency 1 --gpus 3 \
-        --exec --wandb-online --wandb-entity kjust-pinduoduo --wandb-project lerobot \
-        > .codex_tmp/autorun_fix_h2jr9c.log 2>&1 & echo $!
+
+说明：
+- 下一轮会在“本轮全部作业结束后”自动生成并启动。
+- 在线/离线均会在 `output_dir/wandb/latest-run/files/` 下写本地历史，`autorun` 据此解析。
+- 若出现 “No next-round jobs were generated by rules; stopping.”，多为本轮作业未产出可解析历史（如提前报错）。请先检查各 slot 日志与输出目录。
+
+## 手动单进程（命令格式示例，GPU + W&B 在线，正式实验）
+直接手动跑一个作业时，推荐：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 \
+  src/lerobot/scripts/lerobot_train.py \
+  --config_path=src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline.json \
+  --steps=2000 --log_freq=50 --eval_freq=200 \
+  --output_dir=outputs/train/manual_demo_$(date +%s) \
+  --policy.device=cuda \
+  --wandb.mode=online --wandb.enable=true --wandb.entity=<entity> --wandb.project=<project>
+```
+
+在运行前确保：
+
+```bash
+export WANDB_API_KEY=<your_token>
+export WANDB_SENTRY_ENABLED=false   # 可选，减少内网 DNS 噪音
+```
+
+常见问题与排查：
+1) 作业未启动或异常退出：
+   - 先查看 `.codex_tmp/slot*_*.log` 查错误；
+   - 再检查各 `output_dir` 下的 `wandb/latest-run/files/` 是否存在 `wandb-history.jsonl`。
+2) draccus 类型错误阻断启动（如 `window_size`、`batch_size` 被编辑成了浮点 `20.0/12.0`）：
+   - `utils/auto_loop/rules.py` 已内置“整型字段回转”为 `int`（`batch_size/num_workers/steps/log_freq/eval_freq/save_freq/window_size` 等）。若自定义了 `rules.py`，请保留该逻辑。
+3) OT 配置导致训练期异常：不要让某个 feature 的 embed 和 label 同时被关闭。
+
+## 续跑与多轮
+当“上下文不够”时，可先离线汇总，再人工决策生成下一轮：
+
+1) 汇总本地离线运行：
+```bash
+python -m utils.auto_loop.analyze_offline \
+  --outputs-root outputs/train --limit 100 \
+  --out-json .codex_tmp/offline_summary.json
+```
+
+2) 基于汇总做一次性“人工决策 + 生成下一轮 cfg”：
+- 方案 A（推荐）：仅生成，不执行。
+```bash
+python -m utils.auto_loop.generate_and_run \
+  --base-cfg <上一轮某 cfg> --reason "<说明>" \
+  --changes 'a.b@op=val' ...
+```
+- 方案 B（脚本化）：仿照“快速开始”，把 4 个新 cfg 路径写入 `.codex_tmp/next_round_cfgs_calibrated.txt`，再用 `autorun` 启动。
+
+3) 启动一轮：
+```bash
+WANDB_SENTRY_ENABLED=false \
+setsid nohup python utils/auto_loop/autorun.py \
+  --cfgs $(tr '\n' ' ' < .codex_tmp/next_round_cfgs_calibrated.txt) \
+  --steps 10000 --log-freq 100 --eval-freq 500 \
+  --concurrency 4 --gpus 0,1,2,3 \
+  --exec --wandb-online --wandb-entity <entity> --wandb-project <project> \
+  > .codex_tmp/autorun_roundN.log 2>&1 & echo $!
+```
+
+### 链式等待跑 2–3 轮
+某些环境下 `--decide --rounds N` 可能因类型错误/日志缺失导致中断。可以先 `--rounds 1` 跑完一轮，再用“链式脚本”在该 autorun 进程结束后自动生成与启动下一轮：
+
+```bash
+pid=$(cat .codex_tmp/autorun_roundN.pid)
+while kill -0 "$pid" 2>/dev/null; do sleep 60; done
+
+# 生成下一轮 cfg（示例，按需调整 decide/changes）
+python - << 'PY'
+import json, re, subprocess, sys
+from pathlib import Path
+from utils.auto_loop.rules import decide
+
+with open('.codex_tmp/offline_summary.json','r') as f:
+    summaries=json.load(f)
+
+# 选最新 loop 下的 run
+loops={}
+for k in summaries.keys():
+    m=re.search(r"outputs/train/(loop_\d+)/",k)
+    if m: loops.setdefault(m.group(1),[]).append(k)
+latest=sorted(loops)[-1]
+
+for rk in sorted(loops[latest]):
+    props=decide(summaries[rk]) or []
+    if not props: continue
+    ch=props[0].changes; cli=[f"{k}={v}" for k,v in ch.items()]
+    subprocess.run([
+        sys.executable,'-m','utils.auto_loop.generate_and_run',
+        '--base-cfg','<上一轮cfg路径>','--reason',props[0].reason,
+        '--changes',*cli,'--steps','10000','--log-freq','100','--eval-freq','500',
+        '--out-dir','src/lerobot/scripts/train_config'
+    ])
+PY
+
+# 将新 cfg 路径写入列表后，再启动下一轮 autorun（同上）
+```
+
+## W&B 相关
+- 正式实验必须在线：加 `--wandb-online --wandb-entity <entity> --wandb-project <project>`，并设置 `WANDB_API_KEY`。
+- 建议：`export WANDB_SENTRY_ENABLED=false` 以屏蔽内网 DNS 噪音。
+- 离线仅用于调试：`--wandb.mode=offline` 时日志在 `output_dir/wandb/latest-run/files/`，`autorun` 仍可解析本地 history 做决策。
+- `common.py` 内置指标别名，能识别 `train/ot_loss`, `train/ot_pi_sum`, `train/ot_pi_diag`, `train/ot_cost/*` 等。
+
+## OT 配置提示
+- 避免 “both disabled”：不要让某个 feature 同时 `use_learned_embed=false` 且 `weight_label=0.0`；纯图像嵌入请删除 action 这条 feature。
+- `pi=0` / `ot_loss=0`：优先增大 `reg`、放宽 `tau_src/tau_tgt`，并降低 `lambda_ot` 与标签权重。
+- 数值稳定性：若成本矩阵量级远大于 `reg`，Sinkhorn 容易下溢到 0（即使 fp64），务必先把 `reg` 提高到 0.3–0.5 再探索。
+
+## 其他
+- `autorun` 会自动设置 `PYTHONPATH=src` 与本地 `.wandb_cache/`。
+- GPU 绑核：`CUDA_VISIBLE_DEVICES` 由 `autorun` 为每个 slot 单独设置。
+- 若直接用 `accelerate launch` 跑，请确保 `--num_processes 1`，并与 `autorun` 参数保持一致。
+
+## 最新迭代建议（基于在线 W&B：run 7r5j8h63）
+结论（快速）：
+- 在最近 4 个并发变体中，`topk20 + tau=1 + reg=0.3 + λ_ot=0.08`（run 7r5j8h63）当前 `eval/offline_eval/avg_l1` 最低（≈0.223 @ step≈1900），但 `train/ot_pi_sum` 仍接近 0（≈2.6e-85）。说明收益主要来自 BC，OT 尚未有效参与。
+- `no_window` 与“更强 label（action_lbl=0.005）+ 强 τ”的组合并未提升 `ot_pi_sum`，且动作项代价飙升（>600）。
+- 另一个变体在早期将 `ot_pi_sum` 拉升到 ≈7e-7（仍很小），提示“增大 reg + 适度增大 τ + 控制动作标签权重 + 限定 topk 源集”是让 OT 出质量的正确方向。
+
+下一轮（目标：快速把 `ot_pi_sum` 拉出 0；并在 200–500 step 内判定走向）
+- 判据：`train/ot_pi_sum` > 1e-6（优先）/ >1e-3（更好）；同时观察 `train/ot_loss` 随 step 下降，`eval/offline_eval/avg_l1` 是否跟进改善。
+- 调参优先级：
+  1) `ot.loss_config.reg` 提到 0.4–0.5；
+  2) `ot.loss_config.tau_src/tau_tgt` 放宽到 2–3；
+  3) 保持 `action_lbl` 适中（≈0.002），避免动作代价主导；
+  4) 启用 `topk_src_episodes=20` 限定跨 episode 搜索空间；
+  5) 需要时再降低 `bc_src_weight`（如 0.9 → 0.7），让 OT 梯度更有影响（仅在 `pi_sum` 已>0 时再做）。
+
+推荐 4 个配置（基于 h5ktqxph 的基线做点改）
+1) 提质（温和）：
+   - `ot.loss_config.reg@set=0.4`
+   - `ot.loss_config.tau_src@set=2.0`
+   - `ot.loss_config.tau_tgt@set=2.0`
+   - `ot.lambda_ot@set=0.10`
+   - `ot.loss_config.features.3.weight_label@set=0.002`
+   - `ot.topk_src_episodes@set=20`
+2) 提质（激进）：
+   - `ot.loss_config.reg@set=0.5`
+   - `ot.loss_config.tau_src@set=3.0`
+   - `ot.loss_config.tau_tgt@set=3.0`
+   - `ot.lambda_ot@set=0.12`
+   - `ot.loss_config.features.3.weight_label@set=0.002`
+   - `ot.topk_src_episodes@set=20`
+3) 锐化尝试（控制采样锐度）：
+   - `ot.loss_config.reg@set=0.3`
+   - `ot.loss_config.tau_src@set=1.0`
+   - `ot.loss_config.tau_tgt@set=1.0`
+   - `ot.lambda_ot@set=0.10`
+   - `ot.loss_config.features.3.weight_label@set=0.002`
+   - `ot.topk_src_episodes@set=20`
+   - `ot.sharpness@set=0.75`
+4) 增强 OT 影响（在有质量的前提下）：
+   - `ot.loss_config.reg@set=0.4`
+   - `ot.loss_config.tau_src@set=1.0`
+   - `ot.loss_config.tau_tgt@set=1.0`
+   - `ot.lambda_ot@set=0.10`
+   - `ot.loss_config.features.3.weight_label@set=0.002`
+   - `ot.topk_src_episodes@set=20`
+   - `ot.bc_src_weight@set=0.7`
+
+运行建议（小步快速判定）
+- 每个配置先跑 3000 steps；在 300–500 step 时若 `ot_pi_sum < 1e-6`，立刻：`reg += 0.1` 或 `tau ×= 2`（无需等满程）。
+- 出现 Sinkhorn 数值告警时优先增大 `reg`（到 0.5），再放宽 `tau`；如仍不稳，再调低 `action_lbl` 或减小 `λ_ot`。
+
+示例（基于从 W&B 拉取的基线 JSON）
+```bash
+# 拉取基线
+python utils/auto_loop/fetch_wandb_config.py \
+  --entity kjust-pinduoduo --project lerobot \
+  --run h5ktqxph --out-dir src/lerobot/scripts/train_config
+
+# 生成 4 个变体（只写文件）
+python -m utils.auto_loop.generate_and_run --base-cfg src/lerobot/scripts/train_config/fromwandb_h5ktqxph.json \
+  --reason "pi unlock mild" \
+  --changes 'ot.loss_config.reg@set=0.4' 'ot.loss_config.tau_src@set=2.0' 'ot.loss_config.tau_tgt@set=2.0' 'ot.lambda_ot@set=0.10' 'ot.loss_config.features.3.weight_label@set=0.002' 'ot.topk_src_episodes@set=20'
+
+python -m utils.auto_loop.generate_and_run --base-cfg src/lerobot/scripts/train_config/fromwandb_h5ktqxph.json \
+  --reason "pi unlock aggressive" \
+  --changes 'ot.loss_config.reg@set=0.5' 'ot.loss_config.tau_src@set=3.0' 'ot.loss_config.tau_tgt@set=3.0' 'ot.lambda_ot@set=0.12' 'ot.loss_config.features.3.weight_label@set=0.002' 'ot.topk_src_episodes@set=20'
+
+python -m utils.auto_loop.generate_and_run --base-cfg src/lerobot/scripts/train_config/fromwandb_h5ktqxph.json \
+  --reason "sharpness=0.75" \
+  --changes 'ot.loss_config.reg@set=0.3' 'ot.loss_config.tau_src@set=1.0' 'ot.loss_config.tau_tgt@set=1.0' 'ot.lambda_ot@set=0.10' 'ot.loss_config.features.3.weight_label@set=0.002' 'ot.topk_src_episodes@set=20' 'ot.sharpness@set=0.75'
+
+python -m utils.auto_loop.generate_and_run --base-cfg src/lerobot/scripts/train_config/fromwandb_h5ktqxph.json \
+  --reason "more OT mixing" \
+  --changes 'ot.loss_config.reg@set=0.4' 'ot.loss_config.tau_src@set=1.0' 'ot.loss_config.tau_tgt@set=1.0' 'ot.lambda_ot@set=0.10' 'ot.loss_config.features.3.weight_label@set=0.002' 'ot.topk_src_episodes@set=20' 'ot.bc_src_weight@set=0.7'
+
+# 并发启动（示例）
+python utils/auto_loop/autorun.py \
+  --cfgs <四个新 cfg 路径> \
+  --steps 3000 --log-freq 50 --eval-freq 200 \
+  --concurrency 4 --gpus 4,5,6,7 \
+  --exec --wandb-online --wandb-entity <entity> --wandb-project <project>
+```
+
+## 后台执行单个实验（GPU + W&B 在线）
+
+```bash
+cfg=src/lerobot/scripts/train_config/act_fr3_ot_99_20_baseline_h2jr9c.json
+setsid nohup python utils/auto_loop/autorun.py \
+  --cfgs "$cfg" --steps 10000 \
+  --log-freq 100 --eval-freq 500 \
+  --concurrency 1 --gpus 3 \
+  --exec --wandb-online --wandb-entity <entity> --wandb-project <project> \
+  > .codex_tmp/autorun_fix_h2jr9c.log 2>&1 & echo $!
+```
+
+---
+如需仅查看可执行计划，去掉 `--exec`；如需传入训练脚本的额外参数，可使用 `--extra`（`autorun.py`）或 `--extra-args`（`generate_and_run.py`）。
+
+TODO: 确认对齐
+```
+"ot": {
+            "sharpness": 10,
+            "cutoff": 0.01,
 ```

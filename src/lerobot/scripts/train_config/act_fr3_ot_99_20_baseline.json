@@ -41,7 +41,10 @@
   "seed": 42,
   "use_policy_training_preset": true,
   "wandb": {
+    "mode": "online",
     "enable": true,
+    "entity": "kjust-pinduoduo",
+    "project": "lerobot",
     "disable_artifact": true
   },
   "output_dir": "/data/ckpts/insert_tube_fr3_src99_tgt20",
@@ -68,7 +71,7 @@
           "src_key": "observation.images.third_person_cam_color",
           "tgt_key": "observation.images.third_person_cam_color",
           "use_learned_embed": true,
-          "weight_embed": 0.3333,
+          "weight_embed": 0.01,
           "weight_label": 0.0,
           "term_name": "img_third_person"
         },
@@ -76,7 +79,7 @@
           "src_key": "observation.images.ee_cam_color",
           "tgt_key": "observation.images.ee_cam_color",
           "use_learned_embed": true,
-          "weight_embed": 0.3333,
+          "weight_embed": 0.01,
           "weight_label": 0.0,
           "term_name": "img_ee"
         },
@@ -84,7 +87,7 @@
           "src_key": "observation.images.side_cam_color",
           "tgt_key": "observation.images.side_cam_color",
           "use_learned_embed": true,
-          "weight_embed": 0.3333,
+          "weight_embed": 0.01,
           "weight_label": 0.0,
           "term_name": "img_side"
         },
@@ -98,13 +101,13 @@
           "use_learned_embed": false,
           "embed_name": null,
           "weight_embed": 0.0,
-          "weight_label": 0.02,
+          "weight_label": 0.0005,
           "term_name": "action_lbl"
         }
       ],
       "reg": 0.1,
-      "tau_src": 0.5,
-      "tau_tgt": 0.5,
+      "tau_src": 0.05,
+      "tau_tgt": 0.05,
       "heuristic": true
     }
   }
