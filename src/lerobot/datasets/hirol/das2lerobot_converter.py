@@ -533,54 +533,44 @@ class Das2LerobotConverter:
 
     # -------- Episode writing --------
     def _create_writer(self, features: Dict[str, Any]) -> LeRobotDataset:
-        out_root = self.cfg.output.root_path
         repo = self.cfg.output.repo_name
-        # Use output.task_dir if provided; else fall back to <root_path>/<repo_name>
-        if self.cfg.output.task_dir:
-            td = os.path.expanduser(self.cfg.output.task_dir)
-            dataset_dir = td if os.path.isabs(td) else os.path.join(_CUR_DIR, td)
-        else:
-            save_root = os.path.join(_CUR_DIR, out_root)
-            dataset_dir = os.path.join(save_root, repo)
+        if not self.cfg.output.task_dir:
+            raise ValueError("output.task_dir must be set; fallback to root_path/repo_name is disabled")
+        td = os.path.expanduser(self.cfg.output.task_dir)
+        dataset_dir = td if os.path.isabs(td) else os.path.join(_CUR_DIR, td)
+        if os.path.exists(dataset_dir):
+            # 明确拒绝覆盖已有目录，避免隐式回退或污染
+            raise FileExistsError(
+                f"output.task_dir already exists: {dataset_dir}. Please remove it or choose an empty directory."
+            )
         log.info(f"save_path: {dataset_dir}")
-        # Prefer threads-only writer in restricted environments; fall back if processes fail.
-        iw_threads = int(self.cfg.writer.image_writer_threads)
+
+        # 先创建数据集但不启动图像写入器（避免在 create() 内部失败导致二次创建目录冲突）
+        ds = LeRobotDataset.create(
+            root=dataset_dir,
+            repo_id=repo,
+            robot_type=self.cfg.output.robot_name,
+            fps=int(self.cfg.fps),
+            features=features,
+            image_writer_threads=0,
+            image_writer_processes=0,
+            batch_encoding_size=int(self.cfg.writer.batch_encoding_size),
+            video_backend=self.cfg.writer.video_backend,
+        )
+
+        # 按配置尝试启动写入器；若多进程受限则退回到线程（不改变路径）
+        iw_threads = max(int(self.cfg.writer.image_writer_threads), 1)
         iw_procs = int(self.cfg.writer.image_writer_processes)
         try:
-            ds = LeRobotDataset.create(
-                root=dataset_dir,
-                repo_id=repo,
-                robot_type=self.cfg.output.robot_name,
-                fps=int(self.cfg.fps),
-                features=features,
-                image_writer_threads=iw_threads,
-                image_writer_processes=iw_procs,
-                batch_encoding_size=int(self.cfg.writer.batch_encoding_size),
-                video_backend=self.cfg.writer.video_backend,
-            )
+            if iw_procs or iw_threads:
+                ds.start_image_writer(num_processes=iw_procs, num_threads=iw_threads)
         except PermissionError as e:
-            log.warning(
-                f"Async image writer with processes={iw_procs} failed: {e}. Falling back to threads-only."
-            )
-            # Avoid clashing with the possibly half-created directory from the failed attempt
-            base = dataset_dir.rstrip("/")
-            fallback_dir = f"{base}_threads"
-            suf = 1
-            while os.path.exists(fallback_dir):
-                suf += 1
-                fallback_dir = f"{base}_threads{suffix}" if (suffix := f"_{suf}") else f"{base}_threads"
-            ds = LeRobotDataset.create(
-                root=fallback_dir,
-                repo_id=repo,
-                robot_type=self.cfg.output.robot_name,
-                fps=int(self.cfg.fps),
-                features=features,
-                image_writer_threads=iw_threads if iw_threads > 0 else 4,
-                image_writer_processes=0,
-                batch_encoding_size=int(self.cfg.writer.batch_encoding_size),
-                video_backend=self.cfg.writer.video_backend,
-            )
-        # Flush metadata per episode to avoid keeping open ParquetWriter
+            log.warning(f"Async image writer with processes={iw_procs} failed: {e}. Falling back to threads-only.")
+            # 尝试仅线程写入
+            ds.stop_image_writer()
+            ds.start_image_writer(num_processes=0, num_threads=iw_threads or 4)
+
+        # 每个 episode 后立刻落盘 meta，避免悬空 writer
         ds.meta.metadata_buffer_size = 1
         return ds
 
@@ -897,13 +887,10 @@ def main():
 
     # Optional: verify by opening in reader mode
     try:
-        # Re-open from the same directory we used for writing. If output.task_dir is set,
-        # use that. Otherwise default to <root_path>/<repo_name> relative to this script.
-        if cfg.output.task_dir:
-            td = os.path.expanduser(cfg.output.task_dir)
-            read_root = td if os.path.isabs(td) else os.path.join(_CUR_DIR, td)
-        else:
-            read_root = os.path.join(_CUR_DIR, cfg.output.root_path, cfg.output.repo_name)
+        if not cfg.output.task_dir:
+            raise ValueError("output.task_dir must be set for post-check")
+        td = os.path.expanduser(cfg.output.task_dir)
+        read_root = td if os.path.isabs(td) else os.path.join(_CUR_DIR, td)
         reader_ds = LeRobotDataset(repo_id=cfg.output.repo_name, root=read_root)
         log.info(f"Loaded dataset back. len={len(reader_ds)} features={getattr(reader_ds, 'features', None)}")
     except Exception as e:
