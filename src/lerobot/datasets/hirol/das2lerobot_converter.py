@@ -116,6 +116,9 @@ class OutputCfg:
     root_path: str
     repo_name: str
     robot_name: str = "fr3"
+    # When provided, this path is used as the dataset root directory.
+    # Accepts absolute or relative (relative to this script dir).
+    task_dir: Optional[str] = None
 
 
 @dataclass
@@ -532,8 +535,13 @@ class Das2LerobotConverter:
     def _create_writer(self, features: Dict[str, Any]) -> LeRobotDataset:
         out_root = self.cfg.output.root_path
         repo = self.cfg.output.repo_name
-        save_root = os.path.join(_CUR_DIR, out_root)
-        dataset_dir = os.path.join(save_root, repo)
+        # Use output.task_dir if provided; else fall back to <root_path>/<repo_name>
+        if self.cfg.output.task_dir:
+            td = os.path.expanduser(self.cfg.output.task_dir)
+            dataset_dir = td if os.path.isabs(td) else os.path.join(_CUR_DIR, td)
+        else:
+            save_root = os.path.join(_CUR_DIR, out_root)
+            dataset_dir = os.path.join(save_root, repo)
         log.info(f"save_path: {dataset_dir}")
         # Prefer threads-only writer in restricted environments; fall back if processes fail.
         iw_threads = int(self.cfg.writer.image_writer_threads)
@@ -855,6 +863,7 @@ def _parse_cfg(raw: Dict[str, Any]) -> ConverterCfg:
         root_path=raw.get("output", {}).get("root_path", "../assets/data"),
         repo_name=raw.get("output", {}).get("repo_name", "das_dataset"),
         robot_name=raw.get("output", {}).get("robot_name", "fr3"),
+        task_dir=raw.get("output", {}).get("task_dir"),
     )
 
     cfg = ConverterCfg(
@@ -888,7 +897,14 @@ def main():
 
     # Optional: verify by opening in reader mode
     try:
-        reader_ds = LeRobotDataset(repo_id=cfg.output.repo_name, root=os.path.join(_CUR_DIR, cfg.output.root_path))
+        # Re-open from the same directory we used for writing. If output.task_dir is set,
+        # use that. Otherwise default to <root_path>/<repo_name> relative to this script.
+        if cfg.output.task_dir:
+            td = os.path.expanduser(cfg.output.task_dir)
+            read_root = td if os.path.isabs(td) else os.path.join(_CUR_DIR, td)
+        else:
+            read_root = os.path.join(_CUR_DIR, cfg.output.root_path, cfg.output.repo_name)
+        reader_ds = LeRobotDataset(repo_id=cfg.output.repo_name, root=read_root)
         log.info(f"Loaded dataset back. len={len(reader_ds)} features={getattr(reader_ds, 'features', None)}")
     except Exception as e:
         log.warning(f"Post-check failed to open dataset: {e}")
