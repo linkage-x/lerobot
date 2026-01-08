@@ -1,0 +1,16 @@
+custom_prompt: ["transfer the tube from right hole to the left hole"]
+# 支持单一路径或多路径；此处示例为单元素列表
+data_dir:
+  - "/data/fr3/right_fr3_it_0107_2ep"
+
+action_ori_type: "quaternion"
+action_prediction_step: 1
+contain_ft: false
+contain_depth: false
+repo_name: "right_fr3_it_0107_2ep_ee2cee"
+root_path: "/data/fr3_lerobot"
+fps: 15
+num_writer_thread: 8
+num_writer_process: 4
+batch_encoding_size: 1
+video_backend: torchcodec
