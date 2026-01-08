@@ -34,18 +34,27 @@ from scipy.spatial.transform import Rotation as R
 
 # Ensure local imports for lerobot and das-datakit work when running this script directly.
 _CUR_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.abspath(os.path.join(_CUR_DIR, "../../../../.."))
+# Workspace root (repo root) four levels up: hirol -> datasets -> lerobot -> src -> workspace
+_WS_ROOT = os.path.abspath(os.path.join(_CUR_DIR, "../../../.."))
 _LEROBOT_SRC = os.path.abspath(os.path.join(_CUR_DIR, "../../.."))
-_DAS_DK_ROOT = os.path.abspath(os.path.join(_REPO_ROOT, "dependencies", "das-datakit"))
-if _LEROBOT_SRC not in sys.path:
-    sys.path.insert(0, _LEROBOT_SRC)
-if _DAS_DK_ROOT not in sys.path:
-    sys.path.insert(0, _DAS_DK_ROOT)
+# Optional old layout support (kept for compatibility)
+_DAS_DK_ROOT = os.path.abspath(os.path.join(_WS_ROOT, "dependencies", "das-datakit"))
+# Add common roots to sys.path so 'lerobot' and 'das' can be imported when running as a script
+for _p in (_LEROBOT_SRC, _WS_ROOT, _DAS_DK_ROOT, "/das"):
+    if _p and os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
-from utils.mcaploader import McapLoader  # noqa: E402
-from utils.interpolate import get_inter_data  # noqa: E402
-from .image_utils import center_crop_and_resize_rgb  # noqa: E402
+# Prefer package-qualified imports (das.utils) so that adding REPO_ROOT to sys.path is enough.
+from das.utils.mcaploader import McapLoader  # noqa: E402
+from das.utils.interpolate import get_inter_data  # noqa: E402
+# Try relative import first; fall back to local file import when run as a script.
+try:  # noqa: E402
+    from .image_utils import center_crop_and_resize_rgb  # type: ignore
+except Exception:  # noqa: E402
+    if _CUR_DIR not in sys.path:
+        sys.path.insert(0, _CUR_DIR)
+    from image_utils import center_crop_and_resize_rgb  # type: ignore  # noqa: E402
 
 
 # ------------------------
@@ -236,6 +245,31 @@ class Das2LerobotConverter:
         # Build sync graph and decode images
         bag.load_topics(topics, auto_decompress=True, auto_sync=True)
 
+        # Some bags may miss explicit sync relations (header.inputs) for cameras.
+        # Fall back to time-nearest registration if we detect missing links.
+        try:
+            ref_topic = self.cfg.topics.ref
+            ref_seqs = bag.get_topic_seq_num(ref_topic)
+            # Probe only a few early seq ids to decide if a camera lacks mapping
+            probe_seqs = ref_seqs[: min(3, len(ref_seqs))]
+            for cam in self.cfg.topics.cameras:
+                needs_register = False
+                for s in probe_seqs:
+                    rels = bag.sync_graph.get_relations(ref_topic, s)
+                    if rels.get(cam.topic, None) is None:
+                        needs_register = True
+                        break
+                if needs_register:
+                    try:
+                        # Register time-based sync once; do not overwrite existing mappings.
+                        bag.register_sync_relation_with_time(ref_topic, cam.topic, overwrite=False)
+                    except Exception as e:
+                        # Keep going; writer will skip frames that fail later.
+                        log.warning(f"Time-based sync registration failed for {cam.topic}: {e}")
+        except Exception as e:
+            # Don't make topic loading brittle due to sync probing
+            log.debug(f"Sync probing failed (non-fatal): {e}")
+
     def _validate_required_topics(self, bag: McapLoader) -> Tuple[bool, List[str]]:
         """Check all required topics exist and have messages.
 
@@ -320,12 +354,37 @@ class Das2LerobotConverter:
           - obs_dim
           - act_dim
         """
-        # Fetch first frame's synced camera images to get shapes
-        seq0 = ref_seq[0]
+        # Fetch a frame with all cameras synced to infer image shapes. The very first
+        # ref frame may lack sync relations for some cameras, so search forward a bit
+        # and, if needed, register a time-based sync as a fallback.
         cam_topics = [c.topic for c in self.cfg.topics.cameras]
-        hit = bag.get_topic_data_by_seq_num(self.cfg.topics.ref, seq0, sync_topics=cam_topics)
+        hit = None
+        hit_seq = None
+        # Try a short window of ref seqs to find a complete sync hit
+        search_window = min(50, len(ref_seq))
+        for k in range(search_window):
+            seq_try = ref_seq[k]
+            hit_try = bag.get_topic_data_by_seq_num(self.cfg.topics.ref, seq_try, sync_topics=cam_topics)
+            if hit_try is None:
+                continue
+            missing = [ct for ct in cam_topics if (hit_try.get(ct) is None or ("decode_data" not in hit_try.get(ct, {})))]
+            if not missing:
+                hit = hit_try
+                hit_seq = seq_try
+                break
         if hit is None:
-            raise RuntimeError("Failed to fetch first frame for camera shapes")
+            # Attempt to register time-based sync and retry once from the first seq
+            ref_topic = self.cfg.topics.ref
+            for ct in cam_topics:
+                try:
+                    bag.register_sync_relation_with_time(ref_topic, ct, overwrite=False)
+                except Exception:
+                    pass
+            seq0 = ref_seq[0]
+            hit = bag.get_topic_data_by_seq_num(ref_topic, seq0, sync_topics=cam_topics)
+            hit_seq = seq0 if hit is not None else None
+        if hit is None:
+            raise RuntimeError("Failed to fetch a synced frame for camera shapes after fallback")
 
         features: Dict[str, Any] = {}
         image_dims: List[Tuple[int, int, int]] = []
@@ -474,18 +533,45 @@ class Das2LerobotConverter:
         out_root = self.cfg.output.root_path
         repo = self.cfg.output.repo_name
         save_root = os.path.join(_CUR_DIR, out_root)
-        log.info(f"save_path: {os.path.join(save_root, repo)}")
-        ds = LeRobotDataset.create(
-            root=save_root,
-            repo_id=repo,
-            robot_type=self.cfg.output.robot_name,
-            fps=int(self.cfg.fps),
-            features=features,
-            image_writer_threads=int(self.cfg.writer.image_writer_threads),
-            image_writer_processes=int(self.cfg.writer.image_writer_processes),
-            batch_encoding_size=int(self.cfg.writer.batch_encoding_size),
-            video_backend=self.cfg.writer.video_backend,
-        )
+        dataset_dir = os.path.join(save_root, repo)
+        log.info(f"save_path: {dataset_dir}")
+        # Prefer threads-only writer in restricted environments; fall back if processes fail.
+        iw_threads = int(self.cfg.writer.image_writer_threads)
+        iw_procs = int(self.cfg.writer.image_writer_processes)
+        try:
+            ds = LeRobotDataset.create(
+                root=dataset_dir,
+                repo_id=repo,
+                robot_type=self.cfg.output.robot_name,
+                fps=int(self.cfg.fps),
+                features=features,
+                image_writer_threads=iw_threads,
+                image_writer_processes=iw_procs,
+                batch_encoding_size=int(self.cfg.writer.batch_encoding_size),
+                video_backend=self.cfg.writer.video_backend,
+            )
+        except PermissionError as e:
+            log.warning(
+                f"Async image writer with processes={iw_procs} failed: {e}. Falling back to threads-only."
+            )
+            # Avoid clashing with the possibly half-created directory from the failed attempt
+            base = dataset_dir.rstrip("/")
+            fallback_dir = f"{base}_threads"
+            suf = 1
+            while os.path.exists(fallback_dir):
+                suf += 1
+                fallback_dir = f"{base}_threads{suffix}" if (suffix := f"_{suf}") else f"{base}_threads"
+            ds = LeRobotDataset.create(
+                root=fallback_dir,
+                repo_id=repo,
+                robot_type=self.cfg.output.robot_name,
+                fps=int(self.cfg.fps),
+                features=features,
+                image_writer_threads=iw_threads if iw_threads > 0 else 4,
+                image_writer_processes=0,
+                batch_encoding_size=int(self.cfg.writer.batch_encoding_size),
+                video_backend=self.cfg.writer.video_backend,
+            )
         # Flush metadata per episode to avoid keeping open ParquetWriter
         ds.meta.metadata_buffer_size = 1
         return ds

@@ -1,16 +1,55 @@
 custom_prompt: "pick the tube from the right rack and insert into the left rack"
-data_dir:
-  - "/data/das/vio_260108_3eps"
-action_ori_type: "quaternion"
-action_prediction_step: 1
-contain_ft: false
-contain_depth: false
-repo_name: "260108_3eps_ee2ee"
-root_path: "/data/fr3_lerobot"
+# Downsample and image handling
 fps: 30
-num_writer_thread: 4
-num_writer_process: 0
-batch_encoding_size: 1
-video_backend: torchcodec
+img_new_width: -1           # deprecated in favor of preprocess
+preprocess:
+  target_size: [640, 480]   # width, height
+  aspect_ratio: [4, 3]      # center-crop to this AR before resize
+
+observation:
+  type: "ee"
+  orientation: "quaternion" # or "euler"
+  include_gripper: true
+  include_imu: false
+  include_tactile: false
+  contain_ft: false
+  fields: ["ee", "gripper"]
+
+action:
+  type: "ee"               # "ee" or "dee"
+  prediction_step: 1
+  orientation: "quaternion" # or "euler"
+  include_gripper: true
+
+writer:
+  image_writer_threads: 4
+  image_writer_processes: 0
+  batch_encoding_size: 1
+  video_backend: "torchcodec"
+
 rotation_transform:
   single: [0.7071068, 0, 0.7071068, 0]
+
+input:
+  mcap_file: ""             # or leave empty and use task_dir
+  task_dir: "/data/das/vio_260108_3eps"              # e.g. /data/das/task_run_dir (must contain vio_result.json)
+
+output:
+  task_dir: "/data/fr3_lerobot/vio_260108_3eps"
+  repo_name: "das_demo_ee2dee"
+  robot_name: "fr3"
+
+topics:
+  ref: "/robot0/sensor/camera0/compressed"
+  cameras:
+    - topic: "/robot0/sensor/camera0/compressed"
+      key: "mid"
+    - topic: "/robot0/sensor/camera1/compressed"
+      key: "left"
+    - topic: "/robot0/sensor/camera2/compressed"
+      key: "right"
+  eef_pose: "/robot0/vio/eef_pose"
+  gripper: "/robot0/sensor/magnetic_encoder"
+  imu: "/robot0/sensor/imu"
+  tactile_left: "/robot0/sensor/tactile_left"
+  tactile_right: "/robot0/sensor/tactile_right"

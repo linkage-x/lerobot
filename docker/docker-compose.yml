@@ -13,8 +13,9 @@ services:
     #   - /dev/shm:size=16g
     volumes:
       - ../:/workspace
-      - /boot/common_data/2025:/data
-      - ../vlash:/vlash
+      - /boot/common_data/2026:/data
+      - ../../vlash:/vlash
+      - ../../das:/das
     environment:
       - http_proxy=
       - https_proxy=
