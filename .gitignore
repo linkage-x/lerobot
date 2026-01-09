@@ -181,3 +181,5 @@ outputs/
 transformers-fix-lerobot_openpi
 
 src/lerobot/datasets/fr3_lerobot
+
+src/lerobot/scripts/train_config/experiments

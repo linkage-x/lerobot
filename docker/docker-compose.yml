@@ -13,7 +13,7 @@ services:
     #   - /dev/shm:size=16g
     volumes:
       - ../:/workspace
-      - /boot/common_data/2026:/data
+      - /boot/common_data:/data
       - ../../vlash:/vlash
       - ../../das:/das
     environment:
