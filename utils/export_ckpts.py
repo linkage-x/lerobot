@@ -35,27 +35,66 @@ except Exception:
 
 
 def _resolve_dataset_meta_dir(data_cfg_path: Path) -> tuple[Path, str]:
-    """Resolve dataset meta dir from YAML (root_path/repo_name/meta)."""
+    """Resolve dataset meta directory from data config.
+
+    Supports two schemas:
+      1) DAS-style:
+            output:
+              task_dir: "/abs/or/relative/path"
+              repo_name: "name"  # optional
+         In this case, dataset root = task_dir (relative to hirol dir if not absolute),
+         and meta dir = <dataset_root>/meta.
+
+      2) Legacy HIROL-style (top-level keys):
+            root_path: "../assets/data" | "/abs/path"
+            repo_name: "name"
+         In this case, dataset root = root_path/repo_name (root_path relative to hirol dir if not absolute),
+         and meta dir = <dataset_root>/meta.
+    """
     with open(data_cfg_path, "r", encoding="utf-8") as f:
         dc = yaml.safe_load(f)
 
+    hirol_dir = data_cfg_path.parent.parent.resolve()  # .../datasets/hirol
+
+    # Prefer DAS-style output.task_dir
+    out = dc.get("output") if isinstance(dc, dict) else None
+    if isinstance(out, dict):
+        task_dir = out.get("task_dir")
+        if task_dir:
+            td = Path(str(task_dir)).expanduser()
+            dataset_root = td if td.is_absolute() else (hirol_dir / td)
+            meta_dir = (dataset_root / "meta").resolve()
+            repo_name = str(out.get("repo_name") or dataset_root.name)
+            if not meta_dir.exists():
+                raise FileNotFoundError(f"Dataset meta directory not found: {meta_dir}")
+            return meta_dir, repo_name
+        # Fallback to nested root_path/repo_name if present
+        if "root_path" in out and "repo_name" in out:
+            rp = Path(str(out["root_path"]))
+            rp = rp.expanduser()
+            repo_name = str(out["repo_name"])  # must exist
+            dataset_root = rp if rp.is_absolute() else (hirol_dir / rp)
+            meta_dir = (dataset_root / repo_name / "meta").resolve()
+            if not meta_dir.exists():
+                raise FileNotFoundError(f"Dataset meta directory not found: {meta_dir}")
+            return meta_dir, repo_name
+
+    # Legacy top-level schema
     try:
         root_path = dc["root_path"]
         repo_name = dc["repo_name"]
-    except KeyError as e:
-        raise KeyError(f"Missing key in data config '{data_cfg_path}': {e}")
+    except Exception as e:
+        raise KeyError(
+            f"Unsupported data config schema in '{data_cfg_path}'. Expected either top-level '\n"
+            f"'root_path'/'repo_name' or nested 'output.task_dir'. Error: {e}"
+        )
 
-    # If root_path is absolute, use it; else resolve relative to hirol dir
-    # hirol dir: .../datasets/hirol (parent of 'config')
-    hirol_dir = data_cfg_path.parent.parent.resolve()
     rp = Path(str(root_path)).expanduser()
     dataset_root = rp if rp.is_absolute() else (hirol_dir / rp)
     meta_dir = (dataset_root / repo_name / "meta").resolve()
-
     if not meta_dir.exists():
         raise FileNotFoundError(f"Dataset meta directory not found: {meta_dir}")
-
-    return meta_dir, repo_name
+    return meta_dir, str(repo_name)
 
 
 def _load_train_output_dir(train_cfg_path: Path) -> Path:
