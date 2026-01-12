@@ -7,7 +7,7 @@ action_ori_type: "quaternion"
 action_prediction_step: 1
 contain_ft: false
 contain_depth: false
-repo_name: "1227_bp_1227_182ep_ee2ee"
+repo_name: "1227_bp_182ep_ee2ee"
 root_path: "/data/2026/fr3_lerobot"
 fps: 30
 num_writer_thread: 8

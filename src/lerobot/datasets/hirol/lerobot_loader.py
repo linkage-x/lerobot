@@ -24,7 +24,14 @@ class LerobotLoader(DataLoaderBase):
         self._repo_name = config.get("repo_name", "peg_in_hole")
         # 不再支持多 task 列表，统一为单一 task 路径
         self._contain_depth = config.get(f'contain_depth', False)
-        self._custom_prompt = config.get("custom_prompt", None)
+        # Allow custom_prompt to be provided as a string or a list[str] in YAML.
+        # Normalize to a single string (first element if list) or None.
+        _cp = config.get("custom_prompt", None)
+        if isinstance(_cp, list):
+            _cp = _cp[0] if len(_cp) > 0 else None
+        elif not (isinstance(_cp, str) or _cp is None):
+            _cp = str(_cp)
+        self._custom_prompt = _cp
         self._output_root_path = config.get("root_path", "../assets/data")
         cur_path = os.path.dirname(os.path.abspath(__file__))
         self._output_root_path = os.path.join(cur_path, self._output_root_path)
@@ -231,11 +238,12 @@ class LerobotLoader(DataLoaderBase):
                             action_dismatch_list.append(action_wrong)
                         action_wrong_nums += 1
                         continue
-                    # 单一 task 的提示词：优先使用配置中的 custom_prompt（字符串），否则使用数据中的文本
+                    # 单一 task 的提示词：优先使用配置中的 custom_prompt，否则使用数据中的文本；
+                    # 若两者都不可用，则回退为一个占位符，避免产生 None。
                     if isinstance(self._custom_prompt, str) and len(self._custom_prompt) > 0:
                         text = self._custom_prompt
                     else:
-                        text = text_info
+                        text = text_info if isinstance(text_info, str) and len(text_info) > 0 else "Perform the task."
                     frame_feature["task"] = text
                     
                     self._lerobot_dataset.add_frame(frame=frame_feature)

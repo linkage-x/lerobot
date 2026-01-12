@@ -1,7 +1,7 @@
 {
   "dataset": {
-    "repo_id": "1227_bp_1227_182ep_ee2ee",
-    "root": "/data/2026/fr3_lerobot/1227_bp_1227_182ep_ee2ee",
+    "repo_id": "1227_bp_182ep_ee2ee",
+    "root": "/data/2026/fr3_lerobot/1227_bp_182ep_ee2ee",
     "episodes": null,
     "streaming": false,
     "use_imagenet_stats": true,
@@ -42,7 +42,7 @@
   "save_freq": 10000,
   "seed": 42,
   "use_policy_training_preset": true,
-  "output_dir": "/data/2026/ckpts/1227_bp_1227_182ep_ee2ee",
+  "output_dir": "/data/2026/ckpts/1227_bp_182ep_ee2ee",
   "wandb": {
     "enable": true,
     "disable_artifact": true
