@@ -1,12 +1,12 @@
 {
   "dataset": {
     "repo_id": "right_fr3_it_0108_162ep_ee2cee",
-    "root": "/data/fr3_lerobot/right_fr3_it_0108_162ep_ee2cee",
+    "root": "/data/2026/fr3_lerobot/right_fr3_it_0108_162ep_ee2cee",
     "episodes": null,
     "streaming": false,
     "use_imagenet_stats": true,
     "image_transforms": {
-      "enable": true
+      "enable": false
     },
     "video_backend": "torchcodec"
   },
@@ -17,9 +17,11 @@
     "chunk_size": 100,
     "n_action_steps": 100,
     "use_amp": true,
+    "pretrained_backbone_weights": "ResNet18_Weights.IMAGENET1K_V1",
+    "optimizer_lr_backbone": 1e-5,
     "repo_id": null,
     "pretrained_path": null,
-    "optimizer_lr": 5e-5,
+    "optimizer_lr": 1e-5,
     "dropout": 0.2
   },
   "optimizer": {
@@ -31,16 +33,16 @@
     "grad_clip_norm": 10.0
   },
   "scheduler": null,
-  "batch_size": 8,
+  "batch_size": 64,
   "num_workers": 12,
   "steps": 200000,
   "eval_freq": 2000,
   "log_freq": 2000,
   "save_checkpoint": true,
-  "save_freq": 20000,
+  "save_freq": 10000,
   "seed": 42,
   "use_policy_training_preset": true,
-  "output_dir": "/data/ckpts/right_fr3_it_0108_162ep_ee2cee",
+  "output_dir": "/data/2026/ckpts/right_fr3_it_0108_162ep_new_ee2cee",
   "wandb": {
     "enable": true,
     "disable_artifact": true
