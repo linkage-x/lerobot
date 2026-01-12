@@ -108,23 +108,28 @@ def _find_trim_index(
     window: int = 10,
     move_thresh_m: float = 0.01,
 ) -> int:
-    """Scan from the start with a sliding window and find the first window
-    where max displacement >= move_thresh_m. Return the window's left index.
+    """Find the trim start index in the given positions array.
 
-    If not found, return 0 (keep all). positions is Nx3.
+    Rule 1: from-start threshold crossing: earliest t with ||pos[t]-pos[0]|| >= th.
+    Rule 2: fallback sliding window: first i where max||pos[i:j]-pos[i]|| >= th.
+
+    Returns the index in [0, N). If not found, returns 0.
     """
     n = int(positions.shape[0])
-    if n <= 1 or window <= 1:
+    if n <= 1:
         return 0
-    w = min(window, n)
+    # Rule 1
+    d0 = np.linalg.norm(positions - positions[0][None, :], axis=1)
+    idxs = np.nonzero(d0 >= move_thresh_m)[0]
+    if idxs.size > 0:
+        return int(idxs[0])
+    # Rule 2
+    w = max(2, min(int(window), n))
     for i in range(0, n - 1):
         j_end = min(i + w, n)
-        p0 = positions[i]
-        # max distance inside [i, j_end)
-        diffs = positions[i:j_end] - p0[None, :]
-        dists = np.linalg.norm(diffs, axis=1)
+        dists = np.linalg.norm(positions[i:j_end] - positions[i][None, :], axis=1)
         if np.max(dists) >= move_thresh_m:
-            return i
+            return int(i)
     return 0
 
 
@@ -274,6 +279,7 @@ def _trim_one_episode(
     thresh: float,
     reindex: bool = True,
     keep_cam_patterns: Iterable[str] = ("right",),
+    ignore_first: int = 0,
 ) -> bool:
     src_json = os.path.join(src_ep_dir, "data.json")
     obj = _load_json(src_json)
@@ -288,9 +294,22 @@ def _trim_one_episode(
     positions = _extract_ee_positions(frames)
     if positions is None:
         log.warning(f"No usable ee pose in {src_ep_dir}; keep all frames but filter to right-only")
-        keep_start = 0
+        keep_start = max(0, int(ignore_first))
     else:
-        keep_start = _find_trim_index(positions, window=win, move_thresh_m=thresh)
+        ig = max(0, int(ignore_first))
+        if ig >= len(positions):
+            keep_start = len(positions)
+        else:
+            sub = positions[ig:]
+            keep_start = ig + _find_trim_index(sub, window=win, move_thresh_m=thresh)
+        try:
+            d0 = np.linalg.norm(positions - positions[0][None, :], axis=1)
+            dbg = ", ".join([f"{v:.4f}" for v in d0[: min(8, len(d0))]])
+            log.info(
+                f"{os.path.basename(src_ep_dir)}: trim_start={keep_start}, ignore_first={ig}, d0[:8]=[{dbg}] (th={thresh}, win={win})"
+            )
+        except Exception:
+            pass
 
     trimmed: List[Dict] = []
     idx_counter = 0
@@ -324,7 +343,7 @@ def _trim_one_episode(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Trim leading static frames in HIROL episodes and keep right-only images")
+    parser = argparse.ArgumentParser(description="Trim leading static frames in HIROL episodes and keep selected cameras only")
     parser.add_argument("-i", "--input", required=True, help="Input task dir that contains episode_XXXX")
     parser.add_argument("-o", "--output", default=None, help="Output dir; default: <input>_trimmed")
     parser.add_argument("--win", type=int, default=10, help="Sliding window size (frames)")
@@ -332,6 +351,8 @@ def main():
     parser.add_argument("--keep_idx", action="store_true", help="Keep original per-step idx instead of reindexing from 0")
     parser.add_argument("--keep-cam", dest="keep_cam", default="right",
                         help="Comma-separated substrings of camera keys to keep (e.g., 'right' or 'right,mid')")
+    parser.add_argument("--ignore-first", dest="ignore_first", type=int, default=300,
+                        help="Ignore first N frames when detecting movement (reduces startup jitter)")
     args = parser.parse_args()
 
     in_root = _expand(args.input)
@@ -358,6 +379,10 @@ def main():
                 thresh=args.th,
                 reindex=(not args.keep_idx),
                 keep_cam_patterns=keep_cam_patterns,
+                # Ignore first N frames in detection; still keep frames before trim boundary
+                # if trimming decides to start after ignore_first.
+                # The trimming boundary is computed on positions[ignore_first:].
+                ignore_first=args.ignore_first,
             )
             if ok:
                 n_ok += 1
