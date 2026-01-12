@@ -1,0 +1,51 @@
+{
+  "dataset": {
+    "repo_id": "1227_bp_1227_182ep_ee2ee",
+    "root": "/data/2026/fr3_lerobot/1227_bp_1227_182ep_ee2ee",
+    "episodes": null,
+    "streaming": false,
+    "use_imagenet_stats": true,
+    "image_transforms": {
+      "enable": false
+    },
+    "video_backend": "torchcodec"
+  },
+  "policy": {
+    "type": "act",
+    "device": "cuda",
+    "push_to_hub": false,
+    "chunk_size": 100,
+    "n_action_steps": 100,
+    "use_amp": true,
+    "pretrained_backbone_weights": "ResNet18_Weights.IMAGENET1K_V1",
+    "optimizer_lr_backbone": 1e-5,
+    "repo_id": null,
+    "pretrained_path": null,
+    "optimizer_lr": 1e-5,
+    "dropout": 0.2
+  },
+  "optimizer": {
+    "type": "adamw",
+    "lr": 1e-5,
+    "weight_decay": 1e-4,
+    "betas": [0.9, 0.999],
+    "eps": 1e-8,
+    "grad_clip_norm": 10.0
+  },
+  "scheduler": null,
+  "batch_size": 64,
+  "num_workers": 12,
+  "steps": 200000,
+  "eval_freq": 2000,
+  "log_freq": 2000,
+  "save_checkpoint": true,
+  "save_freq": 10000,
+  "seed": 42,
+  "use_policy_training_preset": true,
+  "output_dir": "/data/2026/ckpts/1227_bp_1227_182ep_ee2ee",
+  "wandb": {
+    "enable": true,
+    "disable_artifact": true
+  }
+}
+
