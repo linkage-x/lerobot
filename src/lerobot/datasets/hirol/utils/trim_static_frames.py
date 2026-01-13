@@ -147,6 +147,7 @@ def _filter_keep_cameras(step: Dict, keep_cam_patterns: Iterable[str]) -> Dict:
     - colors/depths: keep entries whose key name contains any pattern in
       keep_cam_patterns (case-insensitive). Default pattern is ['right'].
     - ee_states: prefer 'right'; else keep 'single' as-is; drop others.
+    - tools: prefer 'right'; else keep 'single' as-is; drop others.
     Other fields are passed through unchanged.
     """
     out = dict(step)
@@ -189,6 +190,15 @@ def _filter_keep_cameras(step: Dict, keep_cam_patterns: Iterable[str]) -> Dict:
         else:
             # If actions keyed by multiple arms, drop non-right
             out["actions"] = {}
+    # tools: keep right or single entries, drop others (left)
+    tools = out.get("tools", None)
+    if isinstance(tools, dict) and len(tools) > 0:
+        if "right" in tools:
+            out["tools"] = {"right": tools["right"]}
+        elif "single" in tools:
+            out["tools"] = {"single": tools["single"]}
+        else:
+            out["tools"] = {}
     # tactiles: keep right/single if present
     tacs = out.get("tactiles", None)
     if isinstance(tacs, dict) and len(tacs) > 0:
