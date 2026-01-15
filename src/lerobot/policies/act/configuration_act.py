@@ -167,22 +167,24 @@ class ACTConfig(PreTrainedConfig):
             weight_decay=self.optimizer_weight_decay,
         )
 
-    def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
-        # Use cosine decay with linear warmup. This preserves param-group LR ratios because
-        # the scheduler scales optimizer param groups multiplicatively.
-        #
-        # For current 50k-step setups, we use:
-        # - warmup: 2,500 steps (~5%) to stabilize early training with higher LR
-        # - decay: 50,000 steps (match training steps)
-        # - peak_lr: self.optimizer_lr (e.g. 2e-4)
-        # - decay_lr: 5% of peak (e.g. 1e-5), providing a gentle tail for finer convergence
-        return CosineDecayWithWarmupSchedulerConfig(
-            num_warmup_steps=2500,
-            num_decay_steps=50000,
-            peak_lr=self.optimizer_lr,
-            decay_lr=self.optimizer_lr * 0.05,
-        )
-
+    # def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
+    #     # Use cosine decay with linear warmup. This preserves param-group LR ratios because
+    #     # the scheduler scales optimizer param groups multiplicatively.
+    #     #
+    #     # For current 50k-step setups, we use:
+    #     # - warmup: 2,500 steps (~5%) to stabilize early training with higher LR
+    #     # - decay: 50,000 steps (match training steps)
+    #     # - peak_lr: self.optimizer_lr (e.g. 2e-4)
+    #     # - decay_lr: 5% of peak (e.g. 1e-5), providing a gentle tail for finer convergence
+    #     return CosineDecayWithWarmupSchedulerConfig(
+    #         num_warmup_steps=2500,
+    #         num_decay_steps=50000,
+    #         peak_lr=self.optimizer_lr,
+    #         decay_lr=self.optimizer_lr * 0.05,
+    #     )
+    def get_scheduler_preset(self):
+        return None
+        
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")

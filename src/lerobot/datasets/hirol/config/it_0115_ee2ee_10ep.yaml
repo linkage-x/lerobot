@@ -1,0 +1,16 @@
+custom_prompt: ["pick up the bread and place it onto the box"]
+# 支持单一路径或多路径；此处示例为单元素列表
+data_dir:
+  - "/data/2025/unitree_co-train/insert_tube/0109_duo_unitree_tube_insert_human_282ep_right_first10"
+
+action_ori_type: "quaternion"
+action_prediction_step: 1
+contain_ft: false
+contain_depth: false
+repo_name: "0109_it_282ep_first10_ee2ee"
+root_path: "/data/2026/fr3_lerobot"
+fps: 30
+num_writer_thread: 8
+num_writer_process: 4
+batch_encoding_size: 1
+video_backend: torchcodec

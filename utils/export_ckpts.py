@@ -126,8 +126,15 @@ def _load_train_output_dir(train_cfg_path: Path) -> Path:
             return cand.resolve()
 
     tried = "\n".join(str(c.resolve()) for c in candidates)
+    rerun_candidates = (
+        list(train_cfg_path.parent.glob(f"{p.name}_rerun_*")) if not p.is_absolute() else []
+    )
+    hint = ""
+    if rerun_candidates:
+        rerun_list = "\n".join(str(c.resolve()) for c in sorted(rerun_candidates))
+        hint = f"\nFound rerun dirs:\n{rerun_list}"
     raise FileNotFoundError(
-        f"Could not resolve output_dir '{raw}'. Tried:\n{tried}"
+        f"Could not resolve output_dir '{raw}'. Tried:\n{tried}{hint}"
     )
 
 
@@ -151,22 +158,32 @@ def _copy_pretrained_contents(src_dir: Path, dst_dir: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Package dataset meta and pretrained model into a zip")
     parser.add_argument(
+        "-d",
         "--data_cfg",
         type=str,
         default="src/lerobot/datasets/hirol/config/insert_pinboard.yaml",
         help="Data conversion YAML path",
     )
     parser.add_argument(
+        "-t",
         "--train_cfg",
         type=str,
         default="src/lerobot/scripts/train_config/act.json",
         help="Training config path (JSON or YAML)",
     )
     parser.add_argument(
+        "-s",
         "--snapshot",
         type=str,
         default="last",
         help="Checkpoint snapshot name under 'checkpoints' (e.g. 'last', '000100')",
+    )
+    parser.add_argument(
+        "-o",
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Override output_dir from training config",
     )
 
     args = parser.parse_args()
@@ -181,7 +198,9 @@ def main() -> None:
 
     # Resolve inputs
     meta_dir, repo_name = _resolve_dataset_meta_dir(data_cfg_path)
-    output_dir = _load_train_output_dir(train_cfg_path)
+    output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else _load_train_output_dir(train_cfg_path)
+    if not output_dir.exists():
+        raise FileNotFoundError(f"Output dir not found: {output_dir}")
     pm_dir = _resolve_pretrained_model_dir(output_dir, args.snapshot)
 
     # Use output_dir.name as the exported run/model name
