@@ -13,4 +13,20 @@
 # limitations under the License.
 
 from .configuration_reachy2_camera import Reachy2CameraConfig
-from .reachy2_camera import Reachy2Camera
+
+try:
+    from .reachy2_camera import Reachy2Camera
+except ModuleNotFoundError as exc:
+    if exc.name and exc.name.split(".")[0] != "reachy2_sdk":
+        raise
+
+    _reachy2_camera_import_error = exc
+
+    class Reachy2Camera:  # type: ignore[no-redef]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise ModuleNotFoundError(
+                "reachy2_sdk is required to use Reachy2Camera. Install it to enable Reachy 2 cameras."
+            ) from _reachy2_camera_import_error
+
+
+__all__ = ["Reachy2CameraConfig", "Reachy2Camera"]
