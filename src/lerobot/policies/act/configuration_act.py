@@ -146,7 +146,7 @@ class ACTConfig(PreTrainedConfig):
         """Input validation (not exhaustive)."""
         if self.vision_backbone.startswith("resnet"):
             pass
-        elif self.vision_backbone.startswith("dinov3"):
+        elif "dinov3" in self.vision_backbone:
             if (
                 self.pretrained_backbone_weights
                 and "ResNet" in self.pretrained_backbone_weights
@@ -158,7 +158,7 @@ class ACTConfig(PreTrainedConfig):
         else:
             raise ValueError(
                 "Unsupported `vision_backbone`. Use a torchvision ResNet name (e.g. 'resnet18') "
-                "or a DINOv3 model name (e.g. 'dinov3_vitb14')."
+                "or a DINOv3 model name (e.g. 'vit_base_patch16_dinov3')."
             )
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(
@@ -198,7 +198,7 @@ class ACTConfig(PreTrainedConfig):
     #     )
     def get_scheduler_preset(self):
         return None
-        
+
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")

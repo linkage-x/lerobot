@@ -203,7 +203,7 @@ def _build_act_backbone(config: ACTConfig) -> tuple[nn.Module, int]:
         )
         backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
         return backbone, backbone_model.fc.in_features
-    if config.vision_backbone.startswith("dinov3"):
+    if "dinov3" in config.vision_backbone:
         return _build_dinov3_backbone(config)
     raise ValueError(f"Unsupported vision backbone '{config.vision_backbone}'.")
 

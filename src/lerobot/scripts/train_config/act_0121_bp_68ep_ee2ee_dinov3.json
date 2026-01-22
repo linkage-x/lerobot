@@ -34,7 +34,7 @@
     "grad_clip_norm": 10.0
   },
   "scheduler": null,
-  "batch_size": 32,
+  "batch_size": 16,
   "num_workers": 12,
   "steps": 100000,
   "eval_freq": 2000,

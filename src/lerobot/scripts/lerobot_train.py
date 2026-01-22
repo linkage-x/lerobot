@@ -302,136 +302,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         )
         dataset = make_dataset(cfg)
 
-        # Optional: create a small hold-out for offline eval when no env is configured.
-        # We keep this lightweight and self-contained to provide an eval curve similar to original ACT
-        # when users train purely offline on recorded datasets.
-        offline_eval_enabled = (
-            cfg.eval_freq > 0 and cfg.env is None and not cfg.dataset.streaming and getattr(dataset, "num_episodes", 0) >= 2
-        )
-        if offline_eval_enabled:
-            from lerobot.datasets.lerobot_dataset import LeRobotDataset
-            from lerobot.datasets.factory import resolve_delta_timestamps, ImageTransforms, IMAGENET_STATS
-
-            num_eps = int(dataset.num_episodes)
-            # 10% episodes as validation (at least 1)
-            n_val = max(1, num_eps // 10)
-            # use last episodes as val to keep split deterministic
-            val_eps = list(range(num_eps - n_val, num_eps))
-            train_eps = list(range(0, num_eps - n_val))
-            if len(train_eps) == 0:
-                # fallback: keep at least 1 train episode
-                train_eps = [0]
-                val_eps = [i for i in range(1, num_eps)]
-
-            # Rebuild train/val datasets with identical transforms and delta timestamps
-            img_tf = ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
-            delta_ts = resolve_delta_timestamps(cfg.policy, dataset.meta)
-            train_dataset = LeRobotDataset(
-                cfg.dataset.repo_id,
-                root=cfg.dataset.root,
-                episodes=train_eps,
-                image_transforms=img_tf,
-                delta_timestamps=delta_ts,
-                revision=cfg.dataset.revision,
-                video_backend=cfg.dataset.video_backend,
-            )
-            val_dataset = LeRobotDataset(
-                cfg.dataset.repo_id,
-                root=cfg.dataset.root,
-                episodes=val_eps,
-                image_transforms=img_tf,
-                delta_timestamps=delta_ts,
-                revision=cfg.dataset.revision,
-                video_backend=cfg.dataset.video_backend,
-            )
-            # Apply ImageNet stats override if requested (same as make_dataset)
-            if cfg.dataset.use_imagenet_stats:
-                import torch as _torch
-                for key in train_dataset.meta.camera_keys:
-                    for stats_type, stats in IMAGENET_STATS.items():
-                        train_dataset.meta.stats[key][stats_type] = _torch.tensor(stats, dtype=_torch.float32)
-                for key in val_dataset.meta.camera_keys:
-                    for stats_type, stats in IMAGENET_STATS.items():
-                        val_dataset.meta.stats[key][stats_type] = _torch.tensor(stats, dtype=_torch.float32)
-            # Replace dataset with train split for the rest of the pipeline
-            dataset = train_dataset
-            logging.info(
-                f"Offline eval enabled (no env). Split episodes -> train: {len(train_eps)}, val: {len(val_eps)}"
-            )
-        else:
-            val_dataset = None
-
     accelerator.wait_for_everyone()
 
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
-        offline_eval_enabled = (
-            cfg.eval_freq > 0 and cfg.env is None and not cfg.dataset.streaming and getattr(dataset, "num_episodes", 0) >= 2
-        )
-        if offline_eval_enabled:
-            from lerobot.datasets.lerobot_dataset import LeRobotDataset
-            from lerobot.datasets.factory import resolve_delta_timestamps, ImageTransforms, IMAGENET_STATS
 
-            num_eps = int(dataset.num_episodes)
-            n_val = max(1, num_eps // 10)
-            val_eps = list(range(num_eps - n_val, num_eps))
-            train_eps = list(range(0, num_eps - n_val))
-            if len(train_eps) == 0:
-                train_eps = [0]
-                val_eps = [i for i in range(1, num_eps)]
+    # Optional validation dataset for offline eval when no env is configured.
+    val_dataset = None
+    if cfg.env is None and not cfg.dataset.streaming and len(val_episodes) > 0:
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        from lerobot.datasets.factory import resolve_delta_timestamps, ImageTransforms, IMAGENET_STATS
 
-            img_tf = ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
-            delta_ts = resolve_delta_timestamps(cfg.policy, dataset.meta)
-            train_dataset = LeRobotDataset(
-                cfg.dataset.repo_id,
-                root=cfg.dataset.root,
-                episodes=train_eps,
-                image_transforms=img_tf,
-                delta_timestamps=delta_ts,
-                revision=cfg.dataset.revision,
-                video_backend=cfg.dataset.video_backend,
-            )
-            val_dataset = LeRobotDataset(
-                cfg.dataset.repo_id,
-                root=cfg.dataset.root,
-                episodes=val_eps,
-                image_transforms=img_tf,
-                delta_timestamps=delta_ts,
-                revision=cfg.dataset.revision,
-                video_backend=cfg.dataset.video_backend,
-            )
-            if cfg.dataset.use_imagenet_stats:
-                import torch as _torch
-                for key in train_dataset.meta.camera_keys:
-                    for stats_type, stats in IMAGENET_STATS.items():
-                        train_dataset.meta.stats[key][stats_type] = _torch.tensor(stats, dtype=_torch.float32)
-                for key in val_dataset.meta.camera_keys:
-                    for stats_type, stats in IMAGENET_STATS.items():
-                        val_dataset.meta.stats[key][stats_type] = _torch.tensor(stats, dtype=_torch.float32)
-            dataset = train_dataset
-        else:
-            val_dataset = None
-
-    # Create environment used for evaluating checkpoints during training on simulation data.
-    # On real-world data, no need to create an environment as evaluations are done outside train.py,
-    # using the eval.py instead, with gym_dora environment and dora-rs.
-    eval_env = None
-    if cfg.eval_freq > 0 and cfg.env is not None:
-        if is_main_process:
-            logging.info("Creating env")
-        eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
-
-    # Build a validation dataloader on held-out episodes for offline eval when no env is used.
-    val_dataloader: torch.utils.data.DataLoader | None = None
-    if cfg.env is None and len(val_episodes) > 0 and is_main_process:
-        img_tf = (
-            ImageTransforms(cfg.dataset.image_transforms)
-            if cfg.dataset.image_transforms.enable
-            else None
-        )
+        img_tf = ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
         delta_ts = resolve_delta_timestamps(cfg.policy, dataset.meta)
-
         val_dataset = LeRobotDataset(
             cfg.dataset.repo_id,
             root=cfg.dataset.root,
@@ -445,17 +329,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         if cfg.dataset.use_imagenet_stats:
             for key in val_dataset.meta.camera_keys:
                 for stats_type, stats in IMAGENET_STATS.items():
-                    val_dataset.meta.stats[key][stats_type] = torch.tensor(
-                        stats, dtype=torch.float32
-                    )
+                    val_dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
-        val_dataloader = torch.utils.data.DataLoader(
-            val_dataset,
-            batch_size=cfg.batch_size,
-            shuffle=False,
-            num_workers=max(1, cfg.num_workers // 2),
-            pin_memory=device.type == "cuda",
-        )
+    # Create environment used for evaluating checkpoints during training on simulation data.
+    # On real-world data, no need to create an environment as evaluations are done outside train.py,
+    # using the eval.py instead, with gym_dora environment and dora-rs.
+    eval_env = None
+    if cfg.eval_freq > 0 and cfg.env is not None:
+        if is_main_process:
+            logging.info("Creating env")
+        eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
     if is_main_process:
         logging.info("Creating policy")
