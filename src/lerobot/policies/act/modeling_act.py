@@ -37,6 +37,176 @@ from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
+try:
+    import timm
+except ImportError:  # pragma: no cover - timm is optional and only used for DINOv3 backbones.
+    timm = None
+
+_DINOV3_DEFAULT_NAME = "dinov3_vitb14"
+_DINOV3_PRETRAINED_TAGS = {"timm", "pretrained", "default"}
+
+
+def _resolve_dinov3_backbone_name(backbone_name: str) -> str:
+    return _DINOV3_DEFAULT_NAME if backbone_name == "dinov3" else backbone_name
+
+
+def _resolve_dinov3_weights(weights: str | None) -> tuple[bool, str | None]:
+    if not weights:
+        return False, None
+    if isinstance(weights, str) and weights.lower() in _DINOV3_PRETRAINED_TAGS:
+        return True, None
+    return False, weights
+
+
+def _infer_patch_size(model: nn.Module) -> tuple[int, int]:
+    patch_size = None
+    if hasattr(model, "patch_embed") and hasattr(model.patch_embed, "patch_size"):
+        patch_size = model.patch_embed.patch_size
+    elif hasattr(model, "patch_size"):
+        patch_size = model.patch_size
+    if patch_size is None:
+        return (16, 16)
+    if isinstance(patch_size, int):
+        return (patch_size, patch_size)
+    return tuple(patch_size)
+
+
+def _infer_embed_dim(model: nn.Module) -> int:
+    for attr in ("num_features", "embed_dim", "hidden_dim"):
+        value = getattr(model, attr, None)
+        if isinstance(value, int) and value > 0:
+            return value
+    raise ValueError("Unable to infer embedding dimension for DINOv3 backbone.")
+
+
+def _unwrap_backbone_tokens(features):
+    if isinstance(features, dict):
+        for key in ("x", "last_hidden_state", "tokens"):
+            if key in features:
+                return features[key]
+        return next(iter(features.values()))
+    if isinstance(features, (list, tuple)):
+        return features[-1]
+    return features
+
+
+def _create_timm_model(model_name: str, pretrained: bool) -> nn.Module:
+    if timm is None:
+        raise ImportError("timm is required for DINOv3 backbones. Install timm>=1.0.")
+    try:
+        return timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            num_classes=0,
+            global_pool="",
+            dynamic_img_size=True,
+        )
+    except TypeError:
+        return timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            num_classes=0,
+            global_pool="",
+        )
+
+
+def _load_backbone_checkpoint(model: nn.Module, checkpoint_path: str) -> None:
+    state = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(state, dict):
+        for key in ("state_dict", "model"):
+            if key in state and isinstance(state[key], dict):
+                state = state[key]
+                break
+        if all(isinstance(k, str) and k.startswith("module.") for k in state):
+            state = {k.removeprefix("module."): v for k, v in state.items()}
+    model.load_state_dict(state, strict=False)
+
+
+class DinoV3Backbone(nn.Module):
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+        self.patch_size = _infer_patch_size(model)
+        self.embed_dim = _infer_embed_dim(model)
+
+    def forward(self, x: Tensor) -> dict[str, Tensor]:
+        x = self._pad_to_patch_size(x)
+        features = self._forward_tokens(x)
+        if features.dim() == 4:
+            feature_map = features
+        elif features.dim() == 2:
+            feature_map = features[:, :, None, None]
+        else:
+            features = self._strip_extra_tokens(features, x)
+            bsz, n_tokens, dim = features.shape
+            grid_h, grid_w = self._infer_grid_size(x, n_tokens)
+            feature_map = features.transpose(1, 2).reshape(bsz, dim, grid_h, grid_w)
+        return {"feature_map": feature_map}
+
+    def _forward_tokens(self, x: Tensor) -> Tensor:
+        if hasattr(self.model, "forward_features"):
+            features = self.model.forward_features(x)
+        else:
+            features = self.model(x)
+        return _unwrap_backbone_tokens(features)
+
+    def _pad_to_patch_size(self, x: Tensor) -> Tensor:
+        pad_h = (self.patch_size[0] - x.shape[-2] % self.patch_size[0]) % self.patch_size[0]
+        pad_w = (self.patch_size[1] - x.shape[-1] % self.patch_size[1]) % self.patch_size[1]
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="constant", value=0)
+        return x
+
+    def _strip_extra_tokens(self, tokens: Tensor, x: Tensor) -> Tensor:
+        expected_tokens = (x.shape[-2] // self.patch_size[0]) * (x.shape[-1] // self.patch_size[1])
+        if tokens.shape[1] > expected_tokens:
+            extra = tokens.shape[1] - expected_tokens
+            tokens = tokens[:, extra:, :]
+        return tokens
+
+    def _infer_grid_size(self, x: Tensor, n_tokens: int) -> tuple[int, int]:
+        grid_h = x.shape[-2] // self.patch_size[0]
+        grid_w = x.shape[-1] // self.patch_size[1]
+        if grid_h * grid_w == n_tokens:
+            return grid_h, grid_w
+        if (
+            hasattr(self.model, "patch_embed")
+            and hasattr(self.model.patch_embed, "grid_size")
+            and self.model.patch_embed.grid_size
+        ):
+            grid = self.model.patch_embed.grid_size
+            if isinstance(grid, tuple) and grid[0] * grid[1] == n_tokens:
+                return grid
+        grid_h = int(math.sqrt(n_tokens))
+        grid_w = n_tokens // grid_h
+        if grid_h * grid_w != n_tokens:
+            raise ValueError("Unable to infer DINOv3 feature map grid size.")
+        return grid_h, grid_w
+
+
+def _build_dinov3_backbone(config: ACTConfig) -> tuple[nn.Module, int]:
+    model_name = _resolve_dinov3_backbone_name(config.vision_backbone)
+    pretrained, checkpoint_path = _resolve_dinov3_weights(config.pretrained_backbone_weights)
+    model = _create_timm_model(model_name, pretrained)
+    if checkpoint_path:
+        _load_backbone_checkpoint(model, checkpoint_path)
+    backbone = DinoV3Backbone(model)
+    return backbone, backbone.embed_dim
+
+
+def _build_act_backbone(config: ACTConfig) -> tuple[nn.Module, int]:
+    if config.vision_backbone.startswith("resnet"):
+        backbone_model = getattr(torchvision.models, config.vision_backbone)(
+            replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+            weights=config.pretrained_backbone_weights,
+            norm_layer=FrozenBatchNorm2d,
+        )
+        backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+        return backbone, backbone_model.fc.in_features
+    if config.vision_backbone.startswith("dinov3"):
+        return _build_dinov3_backbone(config)
+    raise ValueError(f"Unsupported vision backbone '{config.vision_backbone}'.")
+
 
 class ACTPolicy(PreTrainedPolicy):
     """
@@ -320,16 +490,9 @@ class ACT(nn.Module):
             )
 
         # Backbone for image feature extraction.
+        backbone_out_channels = None
         if self.config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            self.backbone, backbone_out_channels = _build_act_backbone(config)
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -347,8 +510,10 @@ class ACT(nn.Module):
             )
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
+            if backbone_out_channels is None:
+                raise ValueError("Backbone output channels are required for image features.")
             self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
+                backbone_out_channels, config.dim_model, kernel_size=1
             )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent

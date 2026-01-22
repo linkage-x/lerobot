@@ -3,8 +3,8 @@ Extract right-side observations from HIROL episodes without trimming.
 
 Usage:
   python -m src.lerobot.datasets.hirol.utils.extract_right \
-      -i /data/2025/unitree_co-train/insert_tube/0109_duo_unitree_tube_insert_human_282ep \
-      -o /data/2025/unitree_co-train/insert_tube/0109_duo_unitree_tube_insert_human_282ep_right \
+      -i /data/2025/unitree_co-train/bread_picking/0118_position2_horizontal_bread_picking_single_human_68ep \
+      -o /data/2025/unitree_co-train/bread_picking/0118_position2_horizontal_bread_picking_single_human_68ep_right \
       --keep-cam right
 
 What it does

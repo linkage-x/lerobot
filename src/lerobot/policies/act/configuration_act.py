@@ -64,9 +64,11 @@ class ACTConfig(PreTrainedConfig):
             [-1, 1] range.
         output_normalization_modes: Similar dictionary as `normalize_input_modes`, but to unnormalize to the
             original scale. Note that this is also used for normalizing the training targets.
-        vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
-        pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
-            `None` means no pretrained weights.
+        vision_backbone: Name of the vision backbone to use for encoding images. ResNet names are
+            resolved from torchvision, and DINOv3 names are resolved from timm/torch.hub.
+        pretrained_backbone_weights: Pretrained weights to initialize the backbone.
+            For ResNet, use torchvision weight enums. For DINOv3, use "timm" to load default timm
+            weights, a local checkpoint path, or `None` for random init.
         replace_final_stride_with_dilation: Whether to replace the ResNet's final 2x2 stride with a dilated
             convolution.
         pre_norm: Whether to use "pre-norm" in the transformer blocks.
@@ -142,9 +144,21 @@ class ACTConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        if not self.vision_backbone.startswith("resnet"):
+        if self.vision_backbone.startswith("resnet"):
+            pass
+        elif self.vision_backbone.startswith("dinov3"):
+            if (
+                self.pretrained_backbone_weights
+                and "ResNet" in self.pretrained_backbone_weights
+            ):
+                raise ValueError(
+                    "DINOv3 backbones do not accept torchvision ResNet weight enums. "
+                    "Set `pretrained_backbone_weights` to None, 'timm', or a checkpoint path."
+                )
+        else:
             raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+                "Unsupported `vision_backbone`. Use a torchvision ResNet name (e.g. 'resnet18') "
+                "or a DINOv3 model name (e.g. 'dinov3_vitb14')."
             )
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(

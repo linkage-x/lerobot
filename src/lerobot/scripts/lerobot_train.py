@@ -215,7 +215,8 @@ def offline_eval_split(
         with accelerator.autocast():
             loss, out = model.forward(batch)
         total_loss += float(loss.item())
-        total_l1 += float(out.get("l1_loss", 0.0))
+        if out is not None and "l1_loss" in out:
+            total_l1 += float(out["l1_loss"])
         n += 1
 
     if was_training:
@@ -224,11 +225,13 @@ def offline_eval_split(
     if n == 0:
         return None
 
-    return {
+    result = {
         "offline_eval/avg_loss": total_loss / n,
-        "offline_eval/avg_l1": total_l1 / n,
         "offline_eval/n_batches": n,
     }
+    if total_l1 > 0.0:
+        result["offline_eval/avg_l1"] = total_l1 / n
+    return result
 
 
 @parser.wrap()
@@ -720,23 +723,26 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     # Use policy.forward: in eval mode KL is disabled by design; report L1 as eval loss
                     loss, output_dict = policy.forward(batch)
                     total_loss += float(loss.item())
-                    total_l1 += float(output_dict.get("l1_loss", 0.0))
+                    if output_dict is not None and "l1_loss" in output_dict:
+                        total_l1 += float(output_dict["l1_loss"])
                     n_batches += 1
 
             if n_batches > 0 and is_main_process:
                 avg_loss = total_loss / n_batches
-                avg_l1 = total_l1 / n_batches
-                logging.info(f"Offline eval: avg_loss={avg_loss:.4f}, avg_l1={avg_l1:.4f} over {n_batches} batches")
+                log_line = f"Offline eval: avg_loss={avg_loss:.4f}"
+                if total_l1 > 0.0:
+                    avg_l1 = total_l1 / n_batches
+                    log_line += f", avg_l1={avg_l1:.4f}"
+                log_line += f" over {n_batches} batches"
+                logging.info(log_line)
                 if wandb_logger:
-                    wandb_logger.log_dict(
-                        {
-                            "offline_eval/avg_loss": avg_loss,
-                            "offline_eval/avg_l1": avg_l1,
-                            "offline_eval/n_batches": n_batches,
-                        },
-                        step,
-                        mode="eval",
-                    )
+                    wandb_log = {
+                        "offline_eval/avg_loss": avg_loss,
+                        "offline_eval/n_batches": n_batches,
+                    }
+                    if total_l1 > 0.0:
+                        wandb_log["offline_eval/avg_l1"] = total_l1 / n_batches
+                    wandb_logger.log_dict(wandb_log, step, mode="eval")
             policy.train()
 
         elif cfg.env is None and is_eval_step:

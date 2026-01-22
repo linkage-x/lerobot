@@ -1,0 +1,72 @@
+{
+  "dataset": {
+    "repo_id": "0109_it_282ep_first10_ee2ee",
+    "root": "/data/2026/fr3_lerobot/0109_it_282ep_first10_ee2ee",
+    "episodes": null,
+    "streaming": false,
+    "use_imagenet_stats": false,
+    "image_transforms": {
+      "enable": true,
+      "max_num_transforms": 3,
+      "random_order": true,
+      "tfs": {
+        "brightness": {
+          "weight": 1.0,
+          "type": "ColorJitter",
+          "kwargs": { "brightness": [0.6, 1.4] }
+        },
+        "contrast": {
+          "weight": 1.0,
+          "type": "ColorJitter",
+          "kwargs": { "contrast": [0.6, 1.4] }
+        },
+        "saturation": {
+          "weight": 0.8,
+          "type": "ColorJitter",
+          "kwargs": { "saturation": [0.4, 1.6] }
+        }
+      }
+    },
+    "video_backend": "torchcodec"
+  },
+  "policy": {
+    "type": "act",
+    "device": "cuda",
+    "push_to_hub": false,
+    "chunk_size": 20,
+    "n_action_steps": 20,
+    "use_amp": true,
+    "pretrained_backbone_weights": "ResNet18_Weights.IMAGENET1K_V1",
+    "optimizer_lr_backbone": 1e-6,
+    "repo_id": null,
+    "pretrained_path": null,
+    "optimizer_lr": 1e-4,
+    "use_vae": false,
+    "kl_weight": 1.0,
+    "dropout": 0.3
+  },
+  "optimizer": {
+    "type": "adamw",
+    "lr": 1e-5,
+    "weight_decay": 1e-4,
+    "betas": [0.9, 0.999],
+    "eps": 1e-8,
+    "grad_clip_norm": 10.0
+  },
+  "scheduler": null,
+  "batch_size": 32,
+  "num_workers": 12,
+  "steps": 2000,
+  "eval_freq": 500,
+  "log_freq": 500,
+  "save_checkpoint": true,
+  "save_freq": 2000,
+  "seed": 0,
+  "use_policy_training_preset": true,
+  "output_dir": "/data/2026/ckpts/0109_it_282ep_first10_ee2ee_enhance2",
+  "job_name": "act_0115_it_282_10ep_ee2ee_enhance2",
+  "wandb": {
+    "enable": true,
+    "disable_artifact": true
+  }
+}
