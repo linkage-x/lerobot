@@ -38,6 +38,7 @@ from lerobot.robots import (  # noqa: F401
     RobotConfig,
     bi_openarm_follower,
     bi_so_follower,
+    franka_research3,
     hope_jr,
     koch_follower,
     lekiwi,
@@ -58,6 +59,7 @@ from lerobot.teleoperators import (  # noqa: F401
     openarm_leader,
     openarm_mini,
     so_leader,
+    spacemouse,
     unitree_g1,
 )
 from lerobot.utils.import_utils import register_third_party_plugins

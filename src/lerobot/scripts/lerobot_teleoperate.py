@@ -74,6 +74,7 @@ from lerobot.robots import (  # noqa: F401
     bi_openarm_follower,
     bi_so_follower,
     earthrover_mini_plus,
+    franka_research3,
     hope_jr,
     koch_follower,
     make_robot_from_config,
@@ -98,6 +99,7 @@ from lerobot.teleoperators import (  # noqa: F401
     openarm_mini,
     reachy2_teleoperator,
     so_leader,
+    spacemouse,
     unitree_g1,
 )
 from lerobot.utils.import_utils import register_third_party_plugins
