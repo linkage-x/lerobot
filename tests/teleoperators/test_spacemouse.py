@@ -22,8 +22,11 @@ from lerobot.teleoperators.spacemouse.configuration_spacemouse import SpaceMouse
 
 
 class DummySpaceMouseDriver:
+    instances: list["DummySpaceMouseDriver"] = []
+
     def __init__(self, *args, **kwargs):
         del args, kwargs
+        type(self).instances.append(self)
         self.connected = False
         self.readings: list[SpaceMouseReading | None] = []
 
@@ -41,6 +44,7 @@ class DummySpaceMouseDriver:
 
 @pytest.fixture
 def teleop(monkeypatch):
+    DummySpaceMouseDriver.instances = []
     monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
     cfg = SpaceMouseTeleopConfig(
         tool_mode=SpaceMouseToolMode.INCREMENTAL,
@@ -127,3 +131,21 @@ def test_binary_gripper_toggles_on_rising_edge(monkeypatch):
     assert first["gripper"] == pytest.approx(0.0)
     assert second["gripper"] == pytest.approx(0.0)
     teleop.disconnect()
+
+
+def test_connect_cleans_up_failed_backend(monkeypatch):
+    class FailingSpaceMouseDriver(DummySpaceMouseDriver):
+        def connect(self) -> None:
+            self.connected = True
+            raise RuntimeError("spacemouse connect failed")
+
+    FailingSpaceMouseDriver.instances = []
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", FailingSpaceMouseDriver)
+    teleop = SpaceMouseTeleop(SpaceMouseTeleopConfig())
+
+    with pytest.raises(RuntimeError, match="spacemouse connect failed"):
+        teleop.connect()
+
+    assert not teleop.is_connected
+    assert teleop._driver is None
+    assert FailingSpaceMouseDriver.instances[-1].connected is False

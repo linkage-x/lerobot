@@ -40,6 +40,7 @@ class SpaceMouseTeleop(Teleoperator):
         super().__init__(config)
         self.config = config
         self._driver = None
+        self._is_connected = False
         self._last_button_0 = False
         self._last_gripper = float(np.clip(config.initial_gripper, 0.0, 1.0))
         self._last_gripper_update = 0.0
@@ -63,13 +64,22 @@ class SpaceMouseTeleop(Teleoperator):
 
     @property
     def is_connected(self) -> bool:
-        return self._driver is not None
+        return self._is_connected
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         del calibrate
-        self._driver = self.driver_cls(device_id=self.config.device_id)
-        self._driver.connect()
+        driver = self.driver_cls(device_id=self.config.device_id)
+        try:
+            driver.connect()
+        except Exception:
+            try:
+                driver.disconnect()
+            except Exception:
+                pass
+            raise
+        self._driver = driver
+        self._is_connected = True
 
     @property
     def is_calibrated(self) -> bool:
@@ -173,6 +183,12 @@ class SpaceMouseTeleop(Teleoperator):
 
     @check_if_not_connected
     def disconnect(self) -> None:
-        if self._driver is not None:
-            self._driver.disconnect()
+        try:
+            if self._driver is not None:
+                try:
+                    self._driver.disconnect()
+                except Exception:
+                    pass
+        finally:
             self._driver = None
+            self._is_connected = False

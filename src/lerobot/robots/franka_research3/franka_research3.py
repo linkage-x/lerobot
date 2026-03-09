@@ -45,6 +45,7 @@ class FrankaResearch3(Robot):
         self._arm = None
         self._gripper = None
         self._kinematics = None
+        self._is_connected = False
         self._reference_pose: np.ndarray | None = None
         self._last_command_pose: np.ndarray | None = None
         self._prev_enabled = False
@@ -85,32 +86,59 @@ class FrankaResearch3(Robot):
 
     @property
     def is_connected(self) -> bool:
-        return self._arm is not None and self._gripper is not None and self._kinematics is not None
+        return self._is_connected
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         del calibrate
-        self._arm = self.arm_driver_cls(
+        arm = self.arm_driver_cls(
             robot_ip=self.config.robot_ip,
             damping=self.config.damping,
             stiffness=self.config.stiffness,
             filter_coeff=self.config.filter_coeff,
         )
-        self._gripper = self.gripper_driver_cls(
+        gripper = self.gripper_driver_cls(
             serial_port=self.config.gripper_port,
             max_width_mm=self.config.gripper_max_width_mm,
         )
-        self._kinematics = self.kinematics_driver_cls(
+        kinematics = self.kinematics_driver_cls(
             urdf_path=self.config.urdf_path,
             target_frame_name=self.config.target_frame_name,
             joint_names=self.config.joint_names,
         )
+        connected_cameras = []
 
-        self._arm.connect()
-        self._gripper.connect()
-        for camera in self.cameras.values():
-            camera.connect()
-        self.configure()
+        try:
+            arm.connect()
+            gripper.connect()
+            for camera in self.cameras.values():
+                camera.connect()
+                connected_cameras.append(camera)
+        except Exception:
+            for camera in reversed(connected_cameras):
+                try:
+                    camera.disconnect()
+                except Exception:
+                    pass
+            try:
+                gripper.disconnect()
+            except Exception:
+                pass
+            try:
+                arm.disconnect()
+            except Exception:
+                pass
+            raise
+
+        self._arm = arm
+        self._gripper = gripper
+        self._kinematics = kinematics
+        self._is_connected = True
+        try:
+            self.configure()
+        except Exception:
+            self.disconnect()
+            raise
 
     @property
     def is_calibrated(self) -> bool:
@@ -195,6 +223,11 @@ class FrankaResearch3(Robot):
         gripper_target = float(np.clip(action["gripper"], 0.0, 1.0))
         self._gripper.set_position(gripper_target)
 
+        self._last_command_pose = desired_pose.copy()
+        if enabled:
+            self._reference_pose = desired_pose.copy()
+        else:
+            self._reference_pose = None
         self._prev_enabled = enabled
         return {
             "enabled": enabled,
@@ -209,15 +242,27 @@ class FrankaResearch3(Robot):
 
     @check_if_not_connected
     def disconnect(self) -> None:
-        for camera in self.cameras.values():
-            camera.disconnect()
-        if self._gripper is not None:
-            self._gripper.disconnect()
-        if self._arm is not None:
-            self._arm.disconnect()
-        self._arm = None
-        self._gripper = None
-        self._kinematics = None
-        self._reference_pose = None
-        self._last_command_pose = None
-        self._prev_enabled = False
+        try:
+            for camera in self.cameras.values():
+                try:
+                    camera.disconnect()
+                except Exception:
+                    pass
+            if self._gripper is not None:
+                try:
+                    self._gripper.disconnect()
+                except Exception:
+                    pass
+            if self._arm is not None:
+                try:
+                    self._arm.disconnect()
+                except Exception:
+                    pass
+        finally:
+            self._arm = None
+            self._gripper = None
+            self._kinematics = None
+            self._is_connected = False
+            self._reference_pose = None
+            self._last_command_pose = None
+            self._prev_enabled = False

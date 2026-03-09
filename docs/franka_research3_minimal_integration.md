@@ -420,3 +420,56 @@ integration is:
 
 That path minimizes code surface area while keeping the system aligned with the
 existing LeRobot architecture.
+
+## Review Follow-Up
+
+After the first implementation landed, the next review pass tightened two
+runtime requirements that should be treated as mandatory for bring-up.
+
+### 1. Connection Lifecycle Must Be Transactional
+
+The robot and teleoperator adapters should not report `is_connected=True` until
+all required backends are fully connected and ready.
+
+Implications:
+
+- constructing backend objects is not enough to count as connected
+- if arm, gripper, or camera setup fails midway, the adapter must roll back
+  already connected resources
+- the same rule applies to the SpaceMouse teleoperator backend
+
+Required behavior:
+
+- `connect()` stages resources locally first
+- backends are assigned to adapter state only after successful setup
+- any partial failure triggers disconnect on already connected resources
+- `disconnect()` always clears adapter state, even if a backend disconnect call
+  raises
+
+### 2. EE Delta Control Must Be Continuous
+
+The initial review found that a SpaceMouse delta stream should not remain tied
+to the pose latched on the first `enabled=True` edge for the full interaction.
+For the intended teleop behavior, each successful command should advance the
+reference pose.
+
+Required behavior:
+
+1. When `enabled` rises, latch the current measured pose.
+2. Compose the incoming delta onto the current reference pose.
+3. After a successful command, promote the commanded pose to the next reference
+   pose.
+4. When `enabled=False`, hold the last commanded pose steady.
+5. When teleop is re-enabled later, latch the current measured pose again.
+
+This yields continuous relative control instead of repeatedly recomputing from a
+stale base pose.
+
+### Immediate Next Steps From Review
+
+- add regression tests for partial-connect cleanup on both robot and teleop
+- add regression tests for continuous EE delta integration while `enabled=True`
+- keep the remaining known gaps explicit:
+  - no HIROL `teleop/config/*.yaml` include-chain compatibility yet
+  - no latency compensation
+  - no DAgger/intervention logic
