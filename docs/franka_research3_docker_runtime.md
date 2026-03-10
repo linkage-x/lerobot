@@ -94,6 +94,8 @@ Both Dockerfiles now include:
 - `panda_py` installation from the specified git repository
 - `agx-pypika` installation for `pika.gripper`
 - `pyspacemouse` installation
+- `easyhid` installation required by `pyspacemouse`
+- dynamic linker registration for the virtualenv `cmeel.prefix/lib` directory
 - build-time import checks for:
   - `placo`
   - `panda_py`
@@ -122,8 +124,7 @@ bring-up while still using the repository's own Dockerfile structure.
 
 ## Current Status
 
-The Docker dependency chain has been implemented, but not fully validated end to
-end yet.
+The `lerobot-user` image now builds successfully with the FR3 dependency chain.
 
 What is known:
 
@@ -141,15 +142,25 @@ What is known:
   newer venv `cmake` package to avoid `common/` compatibility failures
 - the fetched `fmt` dependency from the `libfranka` build must also be installed
   to `/usr/local` so downstream `panda_py` can satisfy `FrankaConfig.cmake`
+- the runtime linker also needs the virtualenv `cmeel.prefix/lib` directory so
+  `panda_py` can resolve `libpinocchio_parsers.so`
+- `pyspacemouse` additionally requires `easyhid` at import time
+- `docker compose -f docker/docker-compose.yml build lerobot-user` now finishes
+  successfully
+- the image build-time smoke checks now pass for:
+  - `import placo`
+  - `import panda_py`
+  - `from pika.gripper import Gripper`
+  - `import pyspacemouse`
 
 What is not yet confirmed:
 
-- that `docker compose build lerobot-user` finishes successfully after the new
-  ordering
-- that `panda_py` imports and links successfully against the built `libfranka`
-- that `from pika.gripper import Gripper` resolves correctly in the built image
+- that `docker compose -f docker/docker-compose.yml build lerobot-internal`
+  also succeeds with the same dependency chain
 - that `pyspacemouse.list_devices()` sees the physical device inside the
-  container
+  running container
+- that FR3 arm and Pika serial hardware are reachable from the running
+  container on the target machine
 
 ## Practical Conclusion
 
@@ -157,20 +168,20 @@ At this stage:
 
 - there is no evidence that FR3 minimal integration requires a full conda
   environment
+- there is no current need to source-build `pinocchio` from upstream for the
+  FR3 minimal container path
 - there is evidence that FR3 runtime requires careful native dependency
   ordering
-- the correct immediate focus is completing Docker validation of the current
-  `uv`-based approach before introducing another environment manager
+- the current `uv`-based approach is sufficient for `lerobot-user`
+- the next focus should move from build-time dependency resolution to runtime
+  device validation
 
 ## Next Validation Target
 
 The next concrete milestone is:
 
-- get `docker compose -f docker/docker-compose.yml build lerobot-user` to
-  complete successfully
-- then run a container smoke check for:
-  - `import placo`
-  - `import panda_py`
-  - `from pika.gripper import Gripper`
-  - `import pyspacemouse`
+- build and validate `lerobot-internal`
+- then run a container runtime smoke check for:
+  - `pyspacemouse.list_devices()`
   - device visibility under `/dev/bus/usb`, `/dev/input`, and serial nodes
+  - FR3 and gripper connectivity from inside the compose environment
