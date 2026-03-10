@@ -34,6 +34,7 @@ The current `franka_research3` implementation depends on:
 - `placo` via `src/lerobot/model/kinematics.py`
 - `panda_py` for FR3 arm control
 - `pika.gripper` for the Pika gripper
+- `ruckig` for joint-space OTG smoothing after IK
 - `pyspacemouse` for the SpaceMouse teleoperator
 - `libfranka` as the native backend required by `panda_py`
 
@@ -78,7 +79,8 @@ The current ordering is:
 3. verify that `pinocchioConfig.cmake` exists in the virtualenv `cmeel.prefix`
 4. build and install `libfranka`
 5. install `panda_py`, `agx-pypika`, and `pyspacemouse`
-6. run import smoke checks during image build
+6. install `ruckig`
+7. run import smoke checks during image build
 
 This ordering is currently the most defensible path inside the existing
 repository setup.
@@ -93,6 +95,7 @@ Both Dockerfiles now include:
 - `libfranka` source build
 - `panda_py` installation from the specified git repository
 - `agx-pypika` installation for `pika.gripper`
+- `ruckig` installation for FR3 joint OTG
 - `pyspacemouse` installation
 - `easyhid` installation required by `pyspacemouse`
 - dynamic linker registration for the virtualenv `cmeel.prefix/lib` directory
@@ -100,6 +103,7 @@ Both Dockerfiles now include:
   - `placo`
   - `panda_py`
   - `pika.gripper`
+  - `ruckig`
   - `pyspacemouse`
 
 Updated files:
@@ -151,6 +155,7 @@ What is known:
   - `import placo`
   - `import panda_py`
   - `from pika.gripper import Gripper`
+  - `import ruckig`
   - `import pyspacemouse`
 
 What is not yet confirmed:

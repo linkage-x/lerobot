@@ -16,6 +16,7 @@
 
 import numpy as np
 import pytest
+import time
 
 from lerobot.robots.franka_research3 import FrankaResearch3, FrankaResearch3Config
 
@@ -87,13 +88,34 @@ class DummyKinematicsDriver:
         return self.inverse_solution.copy()
 
 
+class DummyOTGDriver:
+    instances: list["DummyOTGDriver"] = []
+
+    def __init__(self, *args, **kwargs):
+        del args, kwargs
+        type(self).instances.append(self)
+        self.reset_calls: list[np.ndarray] = []
+        self.step_calls: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def reset(self, current_joint_positions: np.ndarray) -> None:
+        self.reset_calls.append(np.asarray(current_joint_positions, dtype=np.float64))
+
+    def step(self, current_joint_positions: np.ndarray, target_joint_positions: np.ndarray) -> np.ndarray:
+        current = np.asarray(current_joint_positions, dtype=np.float64)
+        target = np.asarray(target_joint_positions, dtype=np.float64)
+        self.step_calls.append((current.copy(), target.copy()))
+        return target.copy()
+
+
 @pytest.fixture
 def robot(monkeypatch):
     DummyArmDriver.instances = []
     DummyGripperDriver.instances = []
+    DummyOTGDriver.instances = []
     monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
     monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
     monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
     cfg = FrankaResearch3Config(
         robot_ip="192.168.1.206",
         gripper_port="/dev/ttyUSB80",
@@ -111,6 +133,8 @@ def test_connect_disconnect(robot):
     assert not robot.is_connected
     robot.connect()
     assert robot.is_connected
+    assert len(DummyOTGDriver.instances) == 1
+    assert len(DummyOTGDriver.instances[-1].reset_calls) == 1
     robot.disconnect()
     assert not robot.is_connected
 
@@ -143,10 +167,19 @@ def test_send_action_clips_workspace_and_sends_joint_targets(robot):
         "gripper": 1.2,
     }
     returned = robot.send_action(action)
+    deadline = time.perf_counter() + 0.2
+    while (
+        (
+            len(robot._arm.set_joint_positions_calls) == 0
+            or not np.allclose(robot._arm.set_joint_positions_calls[-1], robot._kinematics.inverse_solution)
+        )
+        and time.perf_counter() < deadline
+    ):
+        time.sleep(0.005)
 
     assert returned["gripper"] == pytest.approx(1.0)
     assert robot._gripper.set_position_calls[-1] == pytest.approx(1.0)
-    assert len(robot._arm.set_joint_positions_calls) == 1
+    assert len(robot._arm.set_joint_positions_calls) >= 1
     assert np.allclose(robot._arm.set_joint_positions_calls[-1], robot._kinematics.inverse_solution)
 
     _, desired_pose = robot._kinematics.inverse_calls[-1]
@@ -204,6 +237,112 @@ def test_send_action_integrates_relative_pose_while_enabled(robot):
     _, second_desired_pose = robot._kinematics.inverse_calls[-1]
     assert np.allclose(first_desired_pose[:3, 3], np.array([0.41, 0.08, 0.33]))
     assert np.allclose(second_desired_pose[:3, 3], np.array([0.42, 0.06, 0.36]))
+
+
+def test_send_action_runs_joint_targets_through_otg(monkeypatch):
+    class SmoothingOTGDriver(DummyOTGDriver):
+        def step(self, current_joint_positions: np.ndarray, target_joint_positions: np.ndarray) -> np.ndarray:
+            current = np.asarray(current_joint_positions, dtype=np.float64)
+            target = np.asarray(target_joint_positions, dtype=np.float64)
+            self.step_calls.append((current.copy(), target.copy()))
+            return target - 0.05
+
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", SmoothingOTGDriver)
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+            use_otg=True,
+        )
+    )
+    robot.connect()
+
+    action = {
+        "enabled": True,
+        "target_x": 0.01,
+        "target_y": 0.0,
+        "target_z": 0.0,
+        "target_wx": 0.0,
+        "target_wy": 0.0,
+        "target_wz": 0.0,
+        "gripper": 0.5,
+    }
+    robot.send_action(action)
+    deadline = time.perf_counter() + 0.2
+    expected_command = robot._kinematics.inverse_solution - 0.05
+    while (
+        (
+            len(robot._arm.set_joint_positions_calls) == 0
+            or not np.allclose(robot._arm.set_joint_positions_calls[-1], expected_command)
+        )
+        and time.perf_counter() < deadline
+    ):
+        time.sleep(0.005)
+
+    assert len(robot._otg.step_calls) >= 1
+    assert np.allclose(robot._arm.set_joint_positions_calls[-1], expected_command)
+    robot.disconnect()
+
+
+def test_otg_continues_running_after_single_send_action(robot):
+    robot.connect()
+    action = {
+        "enabled": True,
+        "target_x": 0.01,
+        "target_y": 0.0,
+        "target_z": 0.0,
+        "target_wx": 0.0,
+        "target_wy": 0.0,
+        "target_wz": 0.0,
+        "gripper": 0.5,
+    }
+
+    robot.send_action(action)
+    deadline = time.perf_counter() + 0.2
+    while len(robot._otg.step_calls) < 2 and time.perf_counter() < deadline:
+        time.sleep(0.005)
+
+    assert len(robot._otg.step_calls) >= 2
+
+
+def test_otg_sender_runs_faster_than_smoother(monkeypatch):
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+            otg_control_frequency=20.0,
+            otg_async_control_frequency=200.0,
+        )
+    )
+    robot.connect()
+    action = {
+        "enabled": True,
+        "target_x": 0.01,
+        "target_y": 0.0,
+        "target_z": 0.0,
+        "target_wx": 0.0,
+        "target_wy": 0.0,
+        "target_wz": 0.0,
+        "gripper": 0.5,
+    }
+
+    robot.send_action(action)
+    deadline = time.perf_counter() + 0.25
+    while len(robot._otg.step_calls) < 2 and time.perf_counter() < deadline:
+        time.sleep(0.005)
+
+    assert len(robot._otg.step_calls) >= 2
+    assert len(robot._arm.set_joint_positions_calls) > len(robot._otg.step_calls)
+    robot.disconnect()
 
 
 def test_connect_cleans_up_partial_backends(monkeypatch):

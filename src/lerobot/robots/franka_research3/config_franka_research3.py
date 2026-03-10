@@ -47,6 +47,16 @@ class FrankaResearch3Config(RobotConfig):
     damping: list[float] | None = None
     stiffness: list[float] | None = None
     filter_coeff: float | None = None
+    use_otg: bool = True
+    otg_control_frequency: float = 800.0
+    otg_async_control_frequency: float = 1000.0
+    otg_max_velocity: tuple[float, ...] = (2.096, 2.096, 2.096, 2.096, 4.208, 3.344, 4.208)
+    otg_max_acceleration: tuple[float, ...] = (8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0)
+    otg_max_jerk: tuple[float, ...] = (4000.0, 4000.0, 4000.0, 4000.0, 4000.0, 4000.0, 4000.0)
+    otg_min_position: tuple[float, ...] = (-2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159)
+    otg_max_position: tuple[float, ...] = (2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159)
+    otg_synchronization: bool = True
+    otg_sync_mode: str = "time"
 
     def __post_init__(self):
         super().__post_init__()
@@ -56,3 +66,24 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("workspace_min must be strictly smaller than workspace_max.")
         if self.gripper_max_width_mm <= 0:
             raise ValueError("gripper_max_width_mm must be positive.")
+        if self.otg_control_frequency <= 0:
+            raise ValueError("otg_control_frequency must be positive.")
+        if self.otg_async_control_frequency <= 0:
+            raise ValueError("otg_async_control_frequency must be positive.")
+        otg_limits = (
+            self.otg_max_velocity,
+            self.otg_max_acceleration,
+            self.otg_max_jerk,
+            self.otg_min_position,
+            self.otg_max_position,
+        )
+        if any(len(values) != len(self.joint_names) for values in otg_limits):
+            raise ValueError("All OTG limit arrays must match the number of FR3 joints.")
+
+    @property
+    def otg_dt(self) -> float:
+        return 1.0 / self.otg_control_frequency
+
+    @property
+    def otg_async_dt(self) -> float:
+        return 1.0 / self.otg_async_control_frequency

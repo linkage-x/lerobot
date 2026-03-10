@@ -114,7 +114,7 @@ RUN cd /tmp/libfranka \
 
 USER user_lerobot
 
-RUN uv pip install --no-cache easyhid pyspacemouse "agx-pypika==${AGX_PYPIKA_VERSION}" --no-deps \
+RUN uv pip install --no-cache easyhid pyspacemouse "ruckig>=0.15,<0.16" "agx-pypika==${AGX_PYPIKA_VERSION}" --no-deps \
     && export CMEEL_PREFIX="$(find /lerobot/.venv/lib -path '*/site-packages/cmeel.prefix' -type d | head -n 1)" \
     && test -n "${CMEEL_PREFIX}" \
     && git clone --depth 1 --branch "${PANDA_PY_REF}" "${PANDA_PY_REPO}" /tmp/panda-py \
@@ -125,6 +125,7 @@ RUN uv pip install --no-cache easyhid pyspacemouse "agx-pypika==${AGX_PYPIKA_VER
     && python -c "import placo; print('placo_ok')" \
     && LD_LIBRARY_PATH="${CMEEL_PREFIX}/lib:/usr/local/lib" python -c "import panda_py; print('panda_py_ok')" \
     && python -c "from pika.gripper import Gripper; print('pika_gripper_ok')" \
+    && python -c "import ruckig; print('ruckig_ok')" \
     && python -c "import pyspacemouse; print('pyspacemouse_ok')"
 
 # Copy the rest of the application code

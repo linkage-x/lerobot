@@ -52,6 +52,12 @@ class KinematicsDriver(Protocol):
     def inverse_kinematics(self, current_joint_positions_rad: np.ndarray, desired_pose: np.ndarray) -> np.ndarray: ...
 
 
+class JointOTGDriver(Protocol):
+    def reset(self, current_joint_positions: np.ndarray) -> None: ...
+
+    def step(self, current_joint_positions: np.ndarray, target_joint_positions: np.ndarray) -> np.ndarray: ...
+
+
 @dataclass
 class PandaPyArmDriver:
     robot_ip: str
@@ -177,3 +183,98 @@ class PlacoKinematicsDriver:
         current_joint_positions_deg = np.rad2deg(np.asarray(current_joint_positions_rad, dtype=np.float64))
         solution_deg = self._kinematics.inverse_kinematics(current_joint_positions_deg, desired_pose)
         return np.deg2rad(np.asarray(solution_deg, dtype=np.float64))
+
+
+@dataclass
+class RuckigOTGDriver:
+    dof: int
+    dt: float
+    max_velocity: list[float]
+    max_acceleration: list[float]
+    max_jerk: list[float]
+    min_position: list[float] | None = None
+    max_position: list[float] | None = None
+    synchronization: bool = True
+    sync_mode: str = "time"
+
+    def __post_init__(self):
+        try:
+            from ruckig import InputParameter, OutputParameter, Result, Ruckig, Synchronization
+        except Exception as e:  # pragma: no cover - exercised in docker / hardware runtime
+            raise ImportError(
+                "franka_research3 OTG requires ruckig in the runtime environment. "
+                "Use the FR3 docker image or install ruckig manually."
+            ) from e
+
+        self._result = Result
+        self._ruckig = Ruckig(self.dof, self.dt)
+        self._input = InputParameter(self.dof)
+        self._output = OutputParameter(self.dof)
+
+        self._max_velocity = np.asarray(self.max_velocity, dtype=np.float64)
+        self._max_acceleration = np.asarray(self.max_acceleration, dtype=np.float64)
+        self._max_jerk = np.asarray(self.max_jerk, dtype=np.float64)
+        self._min_position = (
+            None if self.min_position is None else np.asarray(self.min_position, dtype=np.float64)
+        )
+        self._max_position = (
+            None if self.max_position is None else np.asarray(self.max_position, dtype=np.float64)
+        )
+        self._current_velocity = np.zeros(self.dof, dtype=np.float64)
+        self._current_acceleration = np.zeros(self.dof, dtype=np.float64)
+
+        self._input.max_velocity = self._max_velocity.tolist()
+        self._input.max_acceleration = self._max_acceleration.tolist()
+        self._input.max_jerk = self._max_jerk.tolist()
+        if self._min_position is not None and self._max_position is not None:
+            self._input.min_position = self._min_position.tolist()
+            self._input.max_position = self._max_position.tolist()
+
+        if not self.synchronization or self.sync_mode.lower() == "none":
+            self._input.synchronization = Synchronization.No
+        elif self.sync_mode.lower() == "phase":
+            self._input.synchronization = Synchronization.Phase
+        else:
+            self._input.synchronization = Synchronization.Time
+
+    def reset(self, current_joint_positions: np.ndarray) -> None:
+        current = np.asarray(current_joint_positions, dtype=np.float64)
+        if current.shape != (self.dof,):
+            raise ValueError(f"Expected current_joint_positions shape {(self.dof,)}, got {current.shape}.")
+
+        self._current_velocity.fill(0.0)
+        self._current_acceleration.fill(0.0)
+        self._input.current_position = current.tolist()
+        self._input.current_velocity = self._current_velocity.tolist()
+        self._input.current_acceleration = self._current_acceleration.tolist()
+        self._input.target_position = current.tolist()
+        self._input.target_velocity = [0.0] * self.dof
+        self._input.target_acceleration = [0.0] * self.dof
+
+    def step(self, current_joint_positions: np.ndarray, target_joint_positions: np.ndarray) -> np.ndarray:
+        current = np.asarray(current_joint_positions, dtype=np.float64)
+        target = np.asarray(target_joint_positions, dtype=np.float64)
+        if current.shape != (self.dof,) or target.shape != (self.dof,):
+            raise ValueError(
+                f"Expected current and target shapes {(self.dof,)}, got {current.shape} and {target.shape}."
+            )
+
+        if self._min_position is not None and self._max_position is not None:
+            target = np.clip(target, self._min_position, self._max_position)
+
+        self._input.current_position = current.tolist()
+        self._input.current_velocity = self._current_velocity.tolist()
+        self._input.current_acceleration = self._current_acceleration.tolist()
+        self._input.target_position = target.tolist()
+        self._input.target_velocity = [0.0] * self.dof
+        self._input.target_acceleration = [0.0] * self.dof
+
+        result = self._ruckig.update(self._input, self._output)
+        if result not in (self._result.Working, self._result.Finished):
+            raise RuntimeError(f"Ruckig OTG update failed with result={result}.")
+
+        new_position = np.asarray(self._output.new_position, dtype=np.float64)
+        self._current_velocity = np.asarray(self._output.new_velocity, dtype=np.float64)
+        self._current_acceleration = np.asarray(self._output.new_acceleration, dtype=np.float64)
+        self._output.pass_to_input(self._input)
+        return new_position

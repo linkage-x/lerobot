@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 from functools import cached_property
+import logging
+import threading
 
 import numpy as np
 
@@ -24,10 +26,13 @@ from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.processor import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 from lerobot.utils.rotation import Rotation
+from lerobot.utils.robot_utils import precise_sleep
 
 from ..robot import Robot
-from .backends import PandaPyArmDriver, PikaGripperHardwareDriver, PlacoKinematicsDriver
+from .backends import PandaPyArmDriver, PikaGripperHardwareDriver, PlacoKinematicsDriver, RuckigOTGDriver
 from .config_franka_research3 import FrankaResearch3Config
+
+logger = logging.getLogger(__name__)
 
 
 class FrankaResearch3(Robot):
@@ -37,6 +42,7 @@ class FrankaResearch3(Robot):
     arm_driver_cls = PandaPyArmDriver
     gripper_driver_cls = PikaGripperHardwareDriver
     kinematics_driver_cls = PlacoKinematicsDriver
+    otg_driver_cls = RuckigOTGDriver
 
     def __init__(self, config: FrankaResearch3Config):
         super().__init__(config)
@@ -45,14 +51,112 @@ class FrankaResearch3(Robot):
         self._arm = None
         self._gripper = None
         self._kinematics = None
+        self._otg = None
         self._is_connected = False
         self._reference_pose: np.ndarray | None = None
         self._last_command_pose: np.ndarray | None = None
         self._prev_enabled = False
+        self._otg_target_joints: np.ndarray | None = None
+        self._otg_target_lock = threading.Lock()
+        self._otg_command_joints: np.ndarray | None = None
+        self._otg_command_lock = threading.Lock()
+        self._otg_thread: threading.Thread | None = None
+        self._otg_sender_thread: threading.Thread | None = None
+        self._otg_running = False
+        self._otg_error: Exception | None = None
 
     @property
     def _joint_names(self) -> list[str]:
         return [f"joint_{i}" for i in range(1, 8)]
+
+    def _raise_if_otg_failed(self) -> None:
+        if self._otg_error is not None:
+            raise RuntimeError("FR3 OTG background loop failed.") from self._otg_error
+
+    def _start_otg_loop(self, initial_joint_positions: np.ndarray) -> None:
+        self._otg_target_joints = np.asarray(initial_joint_positions, dtype=np.float64).copy()
+        self._otg_command_joints = np.asarray(initial_joint_positions, dtype=np.float64).copy()
+        self._otg_error = None
+        self._otg_running = True
+        self._otg_thread = threading.Thread(
+            target=self._otg_loop,
+            daemon=True,
+            name="FrankaResearch3OTGLoop",
+        )
+        self._otg_thread.start()
+        self._otg_sender_thread = threading.Thread(
+            target=self._otg_sender_loop,
+            daemon=True,
+            name="FrankaResearch3OTGSenderLoop",
+        )
+        self._otg_sender_thread.start()
+
+    def _stop_otg_loop(self) -> None:
+        self._otg_running = False
+        if self._otg_thread is not None:
+            self._otg_thread.join(timeout=1.0)
+        self._otg_thread = None
+        if self._otg_sender_thread is not None:
+            self._otg_sender_thread.join(timeout=1.0)
+        self._otg_sender_thread = None
+        with self._otg_target_lock:
+            self._otg_target_joints = None
+        with self._otg_command_lock:
+            self._otg_command_joints = None
+
+    def _otg_loop(self) -> None:
+        if self._otg is None or self._arm is None:
+            return
+
+        while self._otg_running:
+            with self._otg_target_lock:
+                target_joints_rad = (
+                    None if self._otg_target_joints is None else self._otg_target_joints.copy()
+                )
+            with self._otg_command_lock:
+                command_joints_rad = (
+                    None if self._otg_command_joints is None else self._otg_command_joints.copy()
+                )
+
+            if target_joints_rad is None or command_joints_rad is None:
+                precise_sleep(self.config.otg_dt)
+                continue
+
+            try:
+                next_command_joints_rad = self._otg.step(command_joints_rad, target_joints_rad)
+                with self._otg_command_lock:
+                    self._otg_command_joints = np.asarray(next_command_joints_rad, dtype=np.float64).copy()
+            except Exception as e:  # pragma: no cover - exercised with real hardware only
+                self._otg_error = e
+                self._otg_running = False
+                logger.exception("FR3 OTG background loop failed")
+                break
+
+            precise_sleep(self.config.otg_dt)
+
+    def _otg_sender_loop(self) -> None:
+        if self._arm is None:
+            return
+
+        while self._otg_running:
+            with self._otg_command_lock:
+                command_joints_rad = (
+                    None if self._otg_command_joints is None else self._otg_command_joints.copy()
+                )
+
+            if command_joints_rad is None:
+                precise_sleep(self.config.otg_async_dt)
+                continue
+
+            try:
+                self._arm.set_joint_positions(command_joints_rad)
+            except Exception as e:  # pragma: no cover - exercised with real hardware only
+                self._otg_error = e
+                self._otg_running = False
+                logger.exception("FR3 OTG sender loop failed")
+                break
+
+            precise_sleep(self.config.otg_async_dt)
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -106,6 +210,7 @@ class FrankaResearch3(Robot):
             target_frame_name=self.config.target_frame_name,
             joint_names=self.config.joint_names,
         )
+        otg = None
         connected_cameras = []
 
         try:
@@ -114,6 +219,19 @@ class FrankaResearch3(Robot):
             for camera in self.cameras.values():
                 camera.connect()
                 connected_cameras.append(camera)
+            if self.config.use_otg:
+                otg = self.otg_driver_cls(
+                    dof=len(self._joint_names),
+                    dt=self.config.otg_dt,
+                    max_velocity=list(self.config.otg_max_velocity),
+                    max_acceleration=list(self.config.otg_max_acceleration),
+                    max_jerk=list(self.config.otg_max_jerk),
+                    min_position=list(self.config.otg_min_position),
+                    max_position=list(self.config.otg_max_position),
+                    synchronization=self.config.otg_synchronization,
+                    sync_mode=self.config.otg_sync_mode,
+                )
+                otg.reset(np.asarray(arm.get_joint_positions(), dtype=np.float64))
         except Exception:
             for camera in reversed(connected_cameras):
                 try:
@@ -133,7 +251,10 @@ class FrankaResearch3(Robot):
         self._arm = arm
         self._gripper = gripper
         self._kinematics = kinematics
+        self._otg = otg
         self._is_connected = True
+        if self._otg is not None:
+            self._start_otg_loop(np.asarray(arm.get_joint_positions(), dtype=np.float64))
         try:
             self.configure()
         except Exception:
@@ -165,6 +286,7 @@ class FrankaResearch3(Robot):
 
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
+        self._raise_if_otg_failed()
         joint_positions_rad = self._read_joint_positions()
         ee_pose = self._compute_ee_pose(joint_positions_rad)
         ee_rotvec = Rotation.from_matrix(ee_pose[:3, :3]).as_rotvec()
@@ -187,6 +309,7 @@ class FrankaResearch3(Robot):
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
+        self._raise_if_otg_failed()
         joint_positions_rad = self._read_joint_positions()
         current_pose = self._compute_ee_pose(joint_positions_rad)
 
@@ -218,7 +341,11 @@ class FrankaResearch3(Robot):
             desired_pose = self._last_command_pose.copy()
 
         target_joints_rad = self._kinematics.inverse_kinematics(joint_positions_rad, desired_pose)
-        self._arm.set_joint_positions(target_joints_rad)
+        if self._otg is not None:
+            with self._otg_target_lock:
+                self._otg_target_joints = np.asarray(target_joints_rad, dtype=np.float64).copy()
+        else:
+            self._arm.set_joint_positions(target_joints_rad)
 
         gripper_target = float(np.clip(action["gripper"], 0.0, 1.0))
         self._gripper.set_position(gripper_target)
@@ -243,6 +370,7 @@ class FrankaResearch3(Robot):
     @check_if_not_connected
     def disconnect(self) -> None:
         try:
+            self._stop_otg_loop()
             for camera in self.cameras.values():
                 try:
                     camera.disconnect()
@@ -262,7 +390,9 @@ class FrankaResearch3(Robot):
             self._arm = None
             self._gripper = None
             self._kinematics = None
+            self._otg = None
             self._is_connected = False
             self._reference_pose = None
             self._last_command_pose = None
             self._prev_enabled = False
+            self._otg_error = None
