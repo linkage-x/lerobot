@@ -26,6 +26,7 @@ from ..config import RobotConfig
 class FrankaResearch3Config(RobotConfig):
     robot_ip: str = "127.0.0.1"
     gripper_port: str = "/dev/ttyUSB0"
+    mock_gripper: bool = False
     urdf_path: str = ""
     target_frame_name: str = "pika_gripper_ee"
     joint_names: list[str] = field(
@@ -41,6 +42,8 @@ class FrankaResearch3Config(RobotConfig):
     )
     workspace_min: tuple[float, float, float] = (0.2, -0.6, 0.05)
     workspace_max: tuple[float, float, float] = (0.9, 0.6, 0.8)
+    max_target_delta_pos: tuple[float, float, float] | None = None
+    max_target_delta_rot: tuple[float, float, float] | None = None
     gripper_max_width_mm: float = 90.0
     disable_torque_on_disconnect: bool = True
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
@@ -62,6 +65,10 @@ class FrankaResearch3Config(RobotConfig):
         super().__post_init__()
         if len(self.workspace_min) != 3 or len(self.workspace_max) != 3:
             raise ValueError("workspace_min and workspace_max must be 3D tuples.")
+        if self.max_target_delta_pos is not None and len(self.max_target_delta_pos) != 3:
+            raise ValueError("max_target_delta_pos must be a 3D tuple when provided.")
+        if self.max_target_delta_rot is not None and len(self.max_target_delta_rot) != 3:
+            raise ValueError("max_target_delta_rot must be a 3D tuple when provided.")
         if any(mn >= mx for mn, mx in zip(self.workspace_min, self.workspace_max, strict=True)):
             raise ValueError("workspace_min must be strictly smaller than workspace_max.")
         if self.gripper_max_width_mm <= 0:

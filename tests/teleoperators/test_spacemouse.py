@@ -20,7 +20,10 @@ import types
 
 from lerobot.teleoperators.spacemouse import SpaceMouseTeleop, SpaceMouseTeleopConfig
 from lerobot.teleoperators.spacemouse.backend import PySpaceMouseDriver, SpaceMouseReading
-from lerobot.teleoperators.spacemouse.configuration_spacemouse import SpaceMouseToolMode
+from lerobot.teleoperators.spacemouse.configuration_spacemouse import (
+    SpaceMouseEnableButton,
+    SpaceMouseToolMode,
+)
 
 
 class DummySpaceMouseDriver:
@@ -92,6 +95,39 @@ def test_get_action_maps_axes_and_scales(teleop):
     assert action["target_wx"] == pytest.approx(0.5 * teleop.config.scale_wx)
     assert action["target_wy"] == pytest.approx(-0.6 * teleop.config.scale_wy)
     assert action["target_wz"] == pytest.approx(0.7 * teleop.config.scale_wz)
+
+
+def test_get_action_requires_deadman_button(monkeypatch):
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            tool_mode=SpaceMouseToolMode.INCREMENTAL,
+            motion_enable_button=SpaceMouseEnableButton.LEFT,
+            move_time=0.0,
+        )
+    )
+    teleop.connect()
+    teleop._driver.readings.extend(
+        [
+            SpaceMouseReading(
+                translation=[0.2, -0.3, 0.4],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+            SpaceMouseReading(
+                translation=[0.2, -0.3, 0.4],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(True, False),
+            ),
+        ]
+    )
+
+    disabled = teleop.get_action()
+    enabled = teleop.get_action()
+
+    assert disabled["enabled"] is False
+    assert enabled["enabled"] is True
+    teleop.disconnect()
 
 
 def test_incremental_gripper_updates(teleop):

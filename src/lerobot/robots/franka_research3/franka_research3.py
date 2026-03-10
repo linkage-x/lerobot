@@ -29,7 +29,13 @@ from lerobot.utils.rotation import Rotation
 from lerobot.utils.robot_utils import precise_sleep
 
 from ..robot import Robot
-from .backends import PandaPyArmDriver, PikaGripperHardwareDriver, PlacoKinematicsDriver, RuckigOTGDriver
+from .backends import (
+    MockGripperDriver,
+    PandaPyArmDriver,
+    PikaGripperHardwareDriver,
+    PlacoKinematicsDriver,
+    RuckigOTGDriver,
+)
 from .config_franka_research3 import FrankaResearch3Config
 
 logger = logging.getLogger(__name__)
@@ -41,6 +47,7 @@ class FrankaResearch3(Robot):
 
     arm_driver_cls = PandaPyArmDriver
     gripper_driver_cls = PikaGripperHardwareDriver
+    mock_gripper_driver_cls = MockGripperDriver
     kinematics_driver_cls = PlacoKinematicsDriver
     otg_driver_cls = RuckigOTGDriver
 
@@ -201,10 +208,13 @@ class FrankaResearch3(Robot):
             stiffness=self.config.stiffness,
             filter_coeff=self.config.filter_coeff,
         )
-        gripper = self.gripper_driver_cls(
-            serial_port=self.config.gripper_port,
-            max_width_mm=self.config.gripper_max_width_mm,
-        )
+        if self.config.mock_gripper:
+            gripper = self.mock_gripper_driver_cls(initial_position=1.0)
+        else:
+            gripper = self.gripper_driver_cls(
+                serial_port=self.config.gripper_port,
+                max_width_mm=self.config.gripper_max_width_mm,
+            )
         kinematics = self.kinematics_driver_cls(
             urdf_path=self.config.urdf_path,
             target_frame_name=self.config.target_frame_name,
@@ -322,9 +332,22 @@ class FrankaResearch3(Robot):
                 [float(action["target_x"]), float(action["target_y"]), float(action["target_z"])],
                 dtype=np.float64,
             )
+            if self.config.max_target_delta_pos is not None:
+                delta_pos = np.clip(
+                    delta_pos,
+                    -np.asarray(self.config.max_target_delta_pos, dtype=np.float64),
+                    np.asarray(self.config.max_target_delta_pos, dtype=np.float64),
+                )
             delta_rot = Rotation.from_rotvec(
                 [float(action["target_wx"]), float(action["target_wy"]), float(action["target_wz"])]
             )
+            if self.config.max_target_delta_rot is not None:
+                clamped_delta_rot = np.clip(
+                    delta_rot.as_rotvec(),
+                    -np.asarray(self.config.max_target_delta_rot, dtype=np.float64),
+                    np.asarray(self.config.max_target_delta_rot, dtype=np.float64),
+                )
+                delta_rot = Rotation.from_rotvec(clamped_delta_rot)
 
             desired_pose = np.eye(4, dtype=np.float64)
             desired_pose[:3, :3] = self._reference_pose[:3, :3] @ delta_rot.as_matrix()

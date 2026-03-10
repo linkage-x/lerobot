@@ -163,6 +163,31 @@ class PikaGripperHardwareDriver:
 
 
 @dataclass
+class MockGripperDriver:
+    initial_position: float = 1.0
+
+    def __post_init__(self):
+        self._position = float(np.clip(self.initial_position, 0.0, 1.0))
+        self._connected = False
+
+    def connect(self) -> None:
+        self._connected = True
+
+    def disconnect(self) -> None:
+        self._connected = False
+
+    def get_position(self) -> float:
+        if not self._connected:
+            raise RuntimeError("Gripper backend is not connected.")
+        return self._position
+
+    def set_position(self, normalized_position: float) -> None:
+        if not self._connected:
+            raise RuntimeError("Gripper backend is not connected.")
+        self._position = float(np.clip(normalized_position, 0.0, 1.0))
+
+
+@dataclass
 class PlacoKinematicsDriver:
     urdf_path: str
     target_frame_name: str

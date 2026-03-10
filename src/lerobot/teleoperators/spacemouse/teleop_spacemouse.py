@@ -27,7 +27,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ..teleoperator import Teleoperator
 from .backend import PySpaceMouseDriver
-from .configuration_spacemouse import SpaceMouseTeleopConfig, SpaceMouseToolMode
+from .configuration_spacemouse import SpaceMouseEnableButton, SpaceMouseTeleopConfig, SpaceMouseToolMode
 
 
 class SpaceMouseTeleop(Teleoperator):
@@ -104,6 +104,11 @@ class SpaceMouseTeleop(Teleoperator):
         }
 
     def _update_gripper(self, button_0: bool, button_1: bool) -> None:
+        if self.config.motion_enable_button == SpaceMouseEnableButton.LEFT:
+            button_0 = False
+        elif self.config.motion_enable_button == SpaceMouseEnableButton.RIGHT:
+            button_1 = False
+
         if self.config.tool_mode == SpaceMouseToolMode.BINARY:
             if button_0 and not self._last_button_0:
                 self._last_gripper = 1.0 - self._last_gripper
@@ -157,8 +162,15 @@ class SpaceMouseTeleop(Teleoperator):
             ],
             dtype=np.float64,
         )
+        motion_detected = bool(np.any(np.abs(data) >= threshold))
+        if self.config.motion_enable_button == SpaceMouseEnableButton.LEFT:
+            motion_enabled = motion_detected and bool(reading.buttons[0])
+        elif self.config.motion_enable_button == SpaceMouseEnableButton.RIGHT:
+            motion_enabled = motion_detected and bool(reading.buttons[1])
+        else:
+            motion_enabled = motion_detected
 
-        if not np.any(np.abs(data) >= threshold):
+        if not motion_enabled:
             self._update_gripper(*reading.buttons)
             return self._zero_action()
 

@@ -25,6 +25,12 @@ class SpaceMouseToolMode(StrEnum):
     INCREMENTAL = "incremental"
 
 
+class SpaceMouseEnableButton(StrEnum):
+    NONE = "none"
+    LEFT = "left"
+    RIGHT = "right"
+
+
 @TeleoperatorConfig.register_subclass("space_mouse")
 @TeleoperatorConfig.register_subclass("spacemouse")
 @dataclass
@@ -44,6 +50,7 @@ class SpaceMouseTeleopConfig(TeleoperatorConfig):
     threshold_wy: float = 0.04
     threshold_wz: float = 0.04
     enable_rotation: bool = True
+    motion_enable_button: SpaceMouseEnableButton = SpaceMouseEnableButton.NONE
     tool_mode: SpaceMouseToolMode = SpaceMouseToolMode.INCREMENTAL
     initial_gripper: float = 1.0
     incremental_step: float = 0.02

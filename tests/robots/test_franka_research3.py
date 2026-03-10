@@ -71,6 +71,12 @@ class DummyGripperDriver:
         self.position = normalized_position
 
 
+class FailingGripperDriver(DummyGripperDriver):
+    def connect(self) -> None:
+        self.connected = True
+        raise RuntimeError("gripper connect failed")
+
+
 class DummyKinematicsDriver:
     def __init__(self, *args, **kwargs):
         del args, kwargs
@@ -151,6 +157,26 @@ def test_get_observation(robot):
     assert observation["ee.y"] == pytest.approx(0.1)
     assert observation["ee.z"] == pytest.approx(0.3)
     assert observation["gripper.pos"] == pytest.approx(0.25)
+
+
+def test_connect_uses_mock_gripper_when_enabled(monkeypatch):
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", FailingGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+            mock_gripper=True,
+        )
+    )
+
+    robot.connect()
+    assert robot.is_connected
+    assert robot.get_observation()["gripper.pos"] == pytest.approx(1.0)
+    robot.disconnect()
 
 
 def test_send_action_clips_workspace_and_sends_joint_targets(robot):
@@ -237,6 +263,41 @@ def test_send_action_integrates_relative_pose_while_enabled(robot):
     _, second_desired_pose = robot._kinematics.inverse_calls[-1]
     assert np.allclose(first_desired_pose[:3, 3], np.array([0.41, 0.08, 0.33]))
     assert np.allclose(second_desired_pose[:3, 3], np.array([0.42, 0.06, 0.36]))
+
+
+def test_send_action_clamps_target_delta_before_workspace(monkeypatch):
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+            max_target_delta_pos=(0.01, 0.02, 0.03),
+            max_target_delta_rot=(0.1, 0.2, 0.3),
+        )
+    )
+    robot.connect()
+
+    action = {
+        "enabled": True,
+        "target_x": 1.0,
+        "target_y": -1.0,
+        "target_z": 1.0,
+        "target_wx": 1.0,
+        "target_wy": -1.0,
+        "target_wz": 1.0,
+        "gripper": 0.5,
+    }
+    robot.send_action(action)
+
+    _, desired_pose = robot._kinematics.inverse_calls[-1]
+    assert np.allclose(desired_pose[:3, 3], np.array([0.41, 0.08, 0.33]))
+    rotvec = Rotation.from_matrix(desired_pose[:3, :3]).as_rotvec()
+    assert np.allclose(rotvec, np.array([0.1, -0.2, 0.3]))
+    robot.disconnect()
 
 
 def test_send_action_runs_joint_targets_through_otg(monkeypatch):
@@ -346,11 +407,6 @@ def test_otg_sender_runs_faster_than_smoother(monkeypatch):
 
 
 def test_connect_cleans_up_partial_backends(monkeypatch):
-    class FailingGripperDriver(DummyGripperDriver):
-        def connect(self) -> None:
-            self.connected = True
-            raise RuntimeError("gripper connect failed")
-
     DummyArmDriver.instances = []
     FailingGripperDriver.instances = []
     monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
