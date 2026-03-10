@@ -11,6 +11,7 @@ x-lerobot-common: &lerobot-common
   command: ["/bin/bash"]
   environment: &lerobot-env
     DISPLAY: ${DISPLAY:-:0}
+    XAUTHORITY: /root/.Xauthority
     QT_X11_NO_MITSHM: "1"
     SDL_VIDEODRIVER: x11
     SDL_AUDIODRIVER: pulse
@@ -32,6 +33,7 @@ x-lerobot-common: &lerobot-common
     - ${HOME}/.cache/triton:/home/user_lerobot/.cache/triton
     - ${HOME}/.config/libsurvive:/home/user_lerobot/.config/libsurvive
     - /tmp/.X11-unix:/tmp/.X11-unix
+    - ${HOME}/.Xauthority:/root/.Xauthority:ro
     - /sys/bus/usb:/sys/bus/usb:ro
     - /sys/class/input:/sys/class/input:ro
     - /dev:/dev
@@ -61,6 +63,7 @@ x-lerobot-sim-common: &lerobot-sim-common
     - ${HOME}/.cache/torch:/home/user_lerobot/.cache/torch
     - ${HOME}/.cache/triton:/home/user_lerobot/.cache/triton
     - /tmp/.X11-unix:/tmp/.X11-unix
+    - ${HOME}/.Xauthority:/root/.Xauthority:ro
   shm_size: "8gb"
 
 services:
@@ -97,6 +100,25 @@ services:
     <<: *lerobot-sim-common
     image: lerobot-internal:local
     profiles: ["sim", "mujoco", "gpu"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.internal
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+        CUDA_VERSION: ${CUDA_VERSION:-12.4.1}
+        OS_VERSION: ${OS_VERSION:-22.04}
+        UNBOUND_DEPS: ${UNBOUND_DEPS:-false}
+    environment:
+      <<: *lerobot-env
+      DEVICE: cuda
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+      TEST_TYPE: single_gpu
+    gpus: all
+
+  lerobot-fr3-sim-teleop:
+    <<: *lerobot-common
+    image: lerobot-internal:local
+    profiles: ["sim", "mujoco", "gpu", "teleop"]
     build:
       context: ..
       dockerfile: docker/Dockerfile.internal

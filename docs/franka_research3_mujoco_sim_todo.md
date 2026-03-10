@@ -104,3 +104,14 @@ Current non-blocking warnings:
 
 - the imported URDF reports expected self-collision pairs in the neutral pose
 - MuJoCo warns about duplicate `fr3_link0_visual` geom names during URDF import
+
+## Current Local Teleop Entry
+
+- `scripts/fr3_mujoco_teleop.py` runs SpaceMouse-driven FR3 MuJoCo teleop
+- `src/lerobot/envs/fr3_mujoco_teleop.py` owns the target/TCP marker update
+  helpers and headless teleop loop
+- `docker compose --profile sim --profile teleop run --rm lerobot-fr3-sim-teleop`
+  is the intended local interactive container when SpaceMouse and a viewer are
+  required
+- local X11 viewer use currently expects the host to allow container root via
+  `xhost +si:localuser:root`
