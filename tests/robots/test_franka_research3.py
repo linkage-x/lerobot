@@ -159,7 +159,7 @@ def test_get_observation(robot):
     assert observation["gripper.pos"] == pytest.approx(0.25)
 
 
-def test_connect_uses_mock_gripper_when_enabled(monkeypatch):
+def test_connect_falls_back_to_mock_gripper_when_hardware_unavailable(monkeypatch):
     monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
     monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", FailingGripperDriver)
     monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
@@ -169,12 +169,12 @@ def test_connect_uses_mock_gripper_when_enabled(monkeypatch):
             robot_ip="192.168.1.206",
             gripper_port="/dev/ttyUSB80",
             urdf_path="/tmp/fr3.urdf",
-            mock_gripper=True,
         )
     )
 
     robot.connect()
     assert robot.is_connected
+    assert robot._gripper_is_mock is True
     assert robot.get_observation()["gripper.pos"] == pytest.approx(1.0)
     robot.disconnect()
 

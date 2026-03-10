@@ -26,7 +26,6 @@ from ..config import RobotConfig
 class FrankaResearch3Config(RobotConfig):
     robot_ip: str = "127.0.0.1"
     gripper_port: str = "/dev/ttyUSB0"
-    mock_gripper: bool = False
     urdf_path: str = ""
     target_frame_name: str = "pika_gripper_ee"
     joint_names: list[str] = field(

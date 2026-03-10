@@ -60,6 +60,7 @@ class FrankaResearch3(Robot):
         self._kinematics = None
         self._otg = None
         self._is_connected = False
+        self._gripper_is_mock = False
         self._reference_pose: np.ndarray | None = None
         self._last_command_pose: np.ndarray | None = None
         self._prev_enabled = False
@@ -208,13 +209,7 @@ class FrankaResearch3(Robot):
             stiffness=self.config.stiffness,
             filter_coeff=self.config.filter_coeff,
         )
-        if self.config.mock_gripper:
-            gripper = self.mock_gripper_driver_cls(initial_position=1.0)
-        else:
-            gripper = self.gripper_driver_cls(
-                serial_port=self.config.gripper_port,
-                max_width_mm=self.config.gripper_max_width_mm,
-            )
+        gripper = None
         kinematics = self.kinematics_driver_cls(
             urdf_path=self.config.urdf_path,
             target_frame_name=self.config.target_frame_name,
@@ -225,7 +220,27 @@ class FrankaResearch3(Robot):
 
         try:
             arm.connect()
-            gripper.connect()
+            try:
+                gripper = self.gripper_driver_cls(
+                    serial_port=self.config.gripper_port,
+                    max_width_mm=self.config.gripper_max_width_mm,
+                )
+                gripper.connect()
+                self._gripper_is_mock = False
+            except Exception as gripper_error:
+                logger.warning(
+                    "FR3 gripper hardware unavailable on %s; falling back to mock gripper: %s",
+                    self.config.gripper_port,
+                    gripper_error,
+                )
+                if gripper is not None:
+                    try:
+                        gripper.disconnect()
+                    except Exception:
+                        pass
+                gripper = self.mock_gripper_driver_cls(initial_position=1.0)
+                gripper.connect()
+                self._gripper_is_mock = True
             for camera in self.cameras.values():
                 camera.connect()
                 connected_cameras.append(camera)
@@ -248,10 +263,11 @@ class FrankaResearch3(Robot):
                     camera.disconnect()
                 except Exception:
                     pass
-            try:
-                gripper.disconnect()
-            except Exception:
-                pass
+            if gripper is not None:
+                try:
+                    gripper.disconnect()
+                except Exception:
+                    pass
             try:
                 arm.disconnect()
             except Exception:
@@ -415,6 +431,7 @@ class FrankaResearch3(Robot):
             self._kinematics = None
             self._otg = None
             self._is_connected = False
+            self._gripper_is_mock = False
             self._reference_pose = None
             self._last_command_pose = None
             self._prev_enabled = False
