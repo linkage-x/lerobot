@@ -43,6 +43,8 @@ class SpaceMouseTeleop(Teleoperator):
         self._is_connected = False
         self._last_gripper = float(np.clip(config.initial_gripper, 0.0, 1.0))
         self._last_gripper_update = 0.0
+        self._translation_bias = np.zeros(3, dtype=np.float64)
+        self._rotation_bias = np.zeros(3, dtype=np.float64)
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -78,7 +80,30 @@ class SpaceMouseTeleop(Teleoperator):
                 pass
             raise
         self._driver = driver
+        self._translation_bias, self._rotation_bias = self._estimate_idle_bias()
         self._is_connected = True
+
+    def _estimate_idle_bias(self) -> tuple[np.ndarray, np.ndarray]:
+        if self._driver is None or self.config.bias_sample_count <= 0:
+            return np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64)
+
+        translations: list[np.ndarray] = []
+        rotations: list[np.ndarray] = []
+        for _ in range(self.config.bias_sample_count):
+            reading = self._driver.poll()
+            if reading is not None:
+                translations.append(np.asarray(reading.translation, dtype=np.float64))
+                rotations.append(np.asarray(reading.rotation, dtype=np.float64))
+            if self.config.bias_sample_sleep_s > 0.0:
+                time.sleep(self.config.bias_sample_sleep_s)
+
+        if not translations:
+            return np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64)
+
+        return (
+            np.median(np.stack(translations, axis=0), axis=0),
+            np.median(np.stack(rotations, axis=0), axis=0),
+        )
 
     @property
     def is_calibrated(self) -> bool:
@@ -126,12 +151,12 @@ class SpaceMouseTeleop(Teleoperator):
 
         data = np.array(
             [
-                -reading.translation[1],
-                reading.translation[0],
-                reading.translation[2],
-                reading.rotation[0],
-                reading.rotation[1],
-                reading.rotation[2],
+                -(reading.translation[1] - self._translation_bias[1]),
+                reading.translation[0] - self._translation_bias[0],
+                reading.translation[2] - self._translation_bias[2],
+                reading.rotation[0] - self._rotation_bias[0],
+                reading.rotation[1] - self._rotation_bias[1],
+                reading.rotation[2] - self._rotation_bias[2],
             ],
             dtype=np.float64,
         )
@@ -157,7 +182,9 @@ class SpaceMouseTeleop(Teleoperator):
             ],
             dtype=np.float64,
         )
-        motion_detected = bool(np.any(np.abs(data) >= threshold))
+        active_mask = np.abs(data) >= threshold
+        data = np.where(active_mask, data, 0.0)
+        motion_detected = bool(np.any(active_mask))
         if self.config.motion_enable_button == SpaceMouseEnableButton.LEFT:
             motion_enabled = motion_detected and bool(reading.buttons[0])
         elif self.config.motion_enable_button == SpaceMouseEnableButton.RIGHT:
@@ -199,3 +226,5 @@ class SpaceMouseTeleop(Teleoperator):
         finally:
             self._driver = None
             self._is_connected = False
+            self._translation_bias = np.zeros(3, dtype=np.float64)
+            self._rotation_bias = np.zeros(3, dtype=np.float64)

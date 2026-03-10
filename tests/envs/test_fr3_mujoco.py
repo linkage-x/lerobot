@@ -113,3 +113,62 @@ def test_teleop_target_lags_tcp_under_otg_then_converges():
         assert final_gap < initial_gap
     finally:
         env.close()
+
+
+def test_disabling_teleop_stops_at_current_tcp_pose():
+    cfg = FR3MujocoEnvConfig(
+        max_target_delta_pos=(0.01, 0.01, 0.01),
+        otg_max_velocity=(0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02),
+        otg_max_acceleration=(0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2),
+        otg_max_jerk=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+    )
+    env = FR3MujocoEnv(cfg=cfg)
+    try:
+        env.reset()
+        _, _, _, _, info = env.step_teleop_action(
+            {
+                "enabled": True,
+                "target_x": 0.002,
+                "target_y": 0.0,
+                "target_z": 0.0,
+            }
+        )
+        assert np.linalg.norm(info["target_pose"][:3, 3] - info["tcp_pose"][:3, 3]) > 1e-5
+
+        _, _, _, _, info = env.step_teleop_action({"enabled": False})
+        first_disabled_target = info["target_pose"].copy()
+        assert np.linalg.norm(first_disabled_target[:3, 3] - info["tcp_pose"][:3, 3]) > 1e-5
+
+        _, _, _, _, next_info = env.step_teleop_action({"enabled": False})
+        np.testing.assert_allclose(next_info["target_pose"], first_disabled_target, atol=1e-6)
+    finally:
+        env.close()
+
+
+def test_disabled_teleop_keeps_latched_hold_target_across_multiple_steps():
+    cfg = FR3MujocoEnvConfig(
+        max_target_delta_pos=(0.01, 0.01, 0.01),
+        otg_max_velocity=(0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02),
+        otg_max_acceleration=(0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2),
+        otg_max_jerk=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+    )
+    env = FR3MujocoEnv(cfg=cfg)
+    try:
+        env.reset()
+        _, _, _, _, info = env.step_teleop_action(
+            {
+                "enabled": True,
+                "target_x": 0.002,
+                "target_y": 0.0,
+                "target_z": 0.0,
+            }
+        )
+        first_release_target = None
+        for _ in range(2):
+            _, _, _, _, info = env.step_teleop_action({"enabled": False})
+            if first_release_target is None:
+                first_release_target = info["target_joint_positions"].copy()
+            else:
+                np.testing.assert_allclose(info["target_joint_positions"], first_release_target)
+    finally:
+        env.close()

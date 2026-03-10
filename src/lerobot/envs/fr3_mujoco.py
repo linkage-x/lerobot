@@ -137,6 +137,7 @@ class FR3MujocoEnv(gym.Env):
         self._prev_enabled = False
         self._reference_pose: np.ndarray | None = None
         self._last_command_pose: np.ndarray | None = None
+        self._hold_joint_target: np.ndarray | None = None
         self._target_pose: np.ndarray | None = None
         self._tcp_pose: np.ndarray | None = None
         self._otg_target_joints: np.ndarray | None = None
@@ -291,6 +292,7 @@ class FR3MujocoEnv(gym.Env):
         hold_current_joints = False
 
         if enabled:
+            self._hold_joint_target = None
             if not self._prev_enabled or self._reference_pose is None:
                 self._reference_pose = current_pose.copy()
 
@@ -309,11 +311,13 @@ class FR3MujocoEnv(gym.Env):
             desired_pose[:3, 3] = self._reference_pose[:3, 3] + delta_pos
             desired_pose[:3, 3] = np.clip(desired_pose[:3, 3], self._workspace_min, self._workspace_max)
         else:
-            if self._last_command_pose is None:
-                desired_pose = current_pose.copy()
-                hold_current_joints = True
-            else:
-                desired_pose = self._last_command_pose.copy()
+            if self._hold_joint_target is None:
+                if self._prev_enabled and self._otg_target_joints is not None:
+                    self._hold_joint_target = self._otg_target_joints.copy()
+                else:
+                    self._hold_joint_target = self._get_joint_positions().copy()
+            desired_pose = np.asarray(self._kinematics.forward_kinematics(self._hold_joint_target), dtype=np.float64)
+            hold_current_joints = True
 
         return desired_pose, hold_current_joints
 
@@ -324,7 +328,7 @@ class FR3MujocoEnv(gym.Env):
         desired_pose, hold_current_joints = self._compute_desired_pose_from_teleop(current_pose, teleop_action)
 
         if hold_current_joints:
-            target_joints = current_joints.copy()
+            target_joints = self._hold_joint_target.copy()
         else:
             target_joints = np.asarray(self._kinematics.inverse_kinematics(current_joints, desired_pose), dtype=np.float64)
         target_joints = np.clip(target_joints, self._joint_lower, self._joint_upper)
@@ -376,6 +380,7 @@ class FR3MujocoEnv(gym.Env):
         self._prev_enabled = False
         self._reference_pose = None
         self._last_command_pose = None
+        self._hold_joint_target = None
         self._target_pose = None
         self._otg_target_joints = None
         target_joint_positions = self._initial_joint_positions
@@ -402,6 +407,7 @@ class FR3MujocoEnv(gym.Env):
             self._set_joint_state(target_joint_positions)
         self._last_command_pose = self._tcp_pose.copy()
         self._reference_pose = None
+        self._hold_joint_target = None
         self._prev_enabled = False
         self._step_count += 1
         observation = self._build_observation()

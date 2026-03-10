@@ -49,6 +49,8 @@ class SpaceMouseTeleopConfig(TeleoperatorConfig):
     threshold_wx: float = 0.04
     threshold_wy: float = 0.04
     threshold_wz: float = 0.04
+    bias_sample_count: int = 30
+    bias_sample_sleep_s: float = 0.005
     enable_rotation: bool = True
     motion_enable_button: SpaceMouseEnableButton = SpaceMouseEnableButton.NONE
     tool_mode: SpaceMouseToolMode = SpaceMouseToolMode.INCREMENTAL

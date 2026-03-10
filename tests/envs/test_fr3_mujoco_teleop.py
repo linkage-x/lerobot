@@ -69,6 +69,6 @@ def test_run_sim_teleop_loop_steps_env_without_viewer():
         assert info["target_marker_name"] == "target"
         assert info["tcp_marker_name"] == "TCP"
         assert info["otg_enabled"] is True
-        assert np.linalg.norm(info["target_pose"][:3, 3] - info["tcp_pose"][:3, 3]) > 1e-6
+        assert np.linalg.norm(info["target_pose"][:3, 3] - info["tcp_pose"][:3, 3]) > 1e-5
     finally:
         env.close()

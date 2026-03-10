@@ -63,6 +63,7 @@ class FrankaResearch3(Robot):
         self._gripper_is_mock = False
         self._reference_pose: np.ndarray | None = None
         self._last_command_pose: np.ndarray | None = None
+        self._hold_joint_target: np.ndarray | None = None
         self._prev_enabled = False
         self._otg_target_joints: np.ndarray | None = None
         self._otg_target_lock = threading.Lock()
@@ -302,6 +303,16 @@ class FrankaResearch3(Robot):
             raise RuntimeError("Arm backend is not connected.")
         return np.asarray(self._arm.get_joint_positions(), dtype=np.float64)
 
+    def _get_release_hold_joint_target(self, current_joint_positions_rad: np.ndarray) -> np.ndarray:
+        if self._prev_enabled and self._otg is not None:
+            with self._otg_command_lock:
+                if self._otg_command_joints is not None:
+                    return np.asarray(self._otg_command_joints, dtype=np.float64).copy()
+            with self._otg_target_lock:
+                if self._otg_target_joints is not None:
+                    return np.asarray(self._otg_target_joints, dtype=np.float64).copy()
+        return np.asarray(current_joint_positions_rad, dtype=np.float64).copy()
+
     def _compute_ee_pose(self, joint_positions_rad: np.ndarray) -> np.ndarray:
         if self._kinematics is None:
             raise RuntimeError("Robot is not connected.")
@@ -339,6 +350,7 @@ class FrankaResearch3(Robot):
         enabled = bool(action["enabled"])
         hold_current_joints = False
         if enabled:
+            self._hold_joint_target = None
             if not self._prev_enabled or self._reference_pose is None:
                 self._reference_pose = current_pose.copy()
 
@@ -373,13 +385,14 @@ class FrankaResearch3(Robot):
             )
             self._last_command_pose = desired_pose.copy()
         else:
-            if self._last_command_pose is None:
-                self._last_command_pose = current_pose.copy()
-                hold_current_joints = True
-            desired_pose = self._last_command_pose.copy()
+            if self._hold_joint_target is None:
+                self._hold_joint_target = self._get_release_hold_joint_target(joint_positions_rad)
+            target_joints_rad = self._hold_joint_target.copy()
+            desired_pose = self._compute_ee_pose(target_joints_rad)
+            hold_current_joints = True
 
         if hold_current_joints:
-            target_joints_rad = joint_positions_rad.copy()
+            target_joints_rad = np.asarray(target_joints_rad, dtype=np.float64).copy()
         else:
             target_joints_rad = self._kinematics.inverse_kinematics(joint_positions_rad, desired_pose)
         if self._otg is not None:
@@ -436,5 +449,6 @@ class FrankaResearch3(Robot):
             self._gripper_is_mock = False
             self._reference_pose = None
             self._last_command_pose = None
+            self._hold_joint_target = None
             self._prev_enabled = False
             self._otg_error = None

@@ -248,7 +248,7 @@ def test_send_action_clips_workspace_and_sends_joint_targets(robot):
     assert np.allclose(desired_pose[:3, 3], np.array([0.6, 0.3, 0.5]))
 
 
-def test_send_action_disabled_reuses_last_command_pose(robot):
+def test_send_action_disabled_stops_at_current_pose_after_release(robot):
     robot.connect()
     first_action = {
         "enabled": True,
@@ -262,6 +262,8 @@ def test_send_action_disabled_reuses_last_command_pose(robot):
     }
     robot.send_action(first_action)
     assert robot._last_command_pose is not None
+    inverse_call_count = len(robot._kinematics.inverse_calls)
+    current_joints = robot._arm.get_joint_positions()
 
     second_action = {
         "enabled": False,
@@ -275,8 +277,54 @@ def test_send_action_disabled_reuses_last_command_pose(robot):
     }
     robot.send_action(second_action)
 
-    _, desired_pose = robot._kinematics.inverse_calls[-1]
-    assert np.allclose(desired_pose, robot._last_command_pose)
+    assert len(robot._kinematics.inverse_calls) == inverse_call_count
+    assert np.allclose(robot._last_command_pose, robot._kinematics.forward_pose)
+    with robot._otg_target_lock:
+        assert robot._otg_target_joints is not None
+        assert np.allclose(robot._otg_target_joints, current_joints)
+
+
+def test_send_action_disabled_after_active_holds_current_otg_command(robot):
+    robot.connect()
+    first_action = {
+        "enabled": True,
+        "target_x": 0.01,
+        "target_y": -0.02,
+        "target_z": 0.03,
+        "target_wx": 0.0,
+        "target_wy": 0.0,
+        "target_wz": 0.0,
+        "gripper": 0.5,
+    }
+    robot.send_action(first_action)
+
+    latched_otg_command = np.array([0.21, 0.22, 0.23, -0.94, 0.55, 1.18, -0.68], dtype=np.float64)
+    with robot._otg_command_lock:
+        robot._otg_command_joints = latched_otg_command.copy()
+
+    second_action = {
+        "enabled": False,
+        "target_x": 0.0,
+        "target_y": 0.0,
+        "target_z": 0.0,
+        "target_wx": 0.0,
+        "target_wy": 0.0,
+        "target_wz": 0.0,
+        "gripper": 0.5,
+    }
+    inverse_call_count = len(robot._kinematics.inverse_calls)
+    robot.send_action(second_action)
+
+    assert len(robot._kinematics.inverse_calls) == inverse_call_count
+    with robot._otg_target_lock:
+        assert robot._otg_target_joints is not None
+        assert np.allclose(robot._otg_target_joints, latched_otg_command)
+
+    robot._arm.joint_positions = np.array([0.05, 0.1, 0.15, -1.1, 0.45, 1.05, -0.8], dtype=np.float64)
+    robot.send_action(second_action)
+    with robot._otg_target_lock:
+        assert robot._otg_target_joints is not None
+        assert np.allclose(robot._otg_target_joints, latched_otg_command)
 
 
 def test_send_action_disabled_without_previous_command_holds_current_joints(robot):

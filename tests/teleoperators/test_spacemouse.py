@@ -28,12 +28,13 @@ from lerobot.teleoperators.spacemouse.configuration_spacemouse import (
 
 class DummySpaceMouseDriver:
     instances: list["DummySpaceMouseDriver"] = []
+    queued_readings: list[SpaceMouseReading | None] = []
 
     def __init__(self, *args, **kwargs):
         del args, kwargs
         type(self).instances.append(self)
         self.connected = False
-        self.readings: list[SpaceMouseReading | None] = []
+        self.readings: list[SpaceMouseReading | None] = list(type(self).queued_readings)
 
     def connect(self) -> None:
         self.connected = True
@@ -50,10 +51,12 @@ class DummySpaceMouseDriver:
 @pytest.fixture
 def teleop(monkeypatch):
     DummySpaceMouseDriver.instances = []
+    DummySpaceMouseDriver.queued_readings = []
     monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
     cfg = SpaceMouseTeleopConfig(
         tool_mode=SpaceMouseToolMode.INCREMENTAL,
         move_time=0.0,
+        bias_sample_count=0,
     )
     device = SpaceMouseTeleop(cfg)
     yield device
@@ -97,6 +100,67 @@ def test_get_action_maps_axes_and_scales(teleop):
     assert action["target_wz"] == pytest.approx(0.7 * teleop.config.scale_wz)
 
 
+def test_connect_estimates_idle_bias_and_cancels_idle_reading(monkeypatch):
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    bias_reading = SpaceMouseReading(
+        translation=[0.05, -0.04, 0.03],
+        rotation=[0.02, -0.01, 0.015],
+        buttons=(False, False),
+    )
+    DummySpaceMouseDriver.queued_readings = [bias_reading, bias_reading, bias_reading, bias_reading]
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            bias_sample_count=3,
+            bias_sample_sleep_s=0.0,
+            move_time=0.0,
+        )
+    )
+    teleop.connect()
+    action = teleop.get_action()
+
+    assert action["enabled"] is False
+    assert action["target_x"] == pytest.approx(0.0)
+    assert action["target_y"] == pytest.approx(0.0)
+    assert action["target_z"] == pytest.approx(0.0)
+    teleop.disconnect()
+
+
+def test_get_action_zeroes_subthreshold_axes_even_when_other_axis_is_active(monkeypatch):
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    DummySpaceMouseDriver.queued_readings = []
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            threshold_x=0.02,
+            threshold_y=0.02,
+            threshold_z=0.02,
+            threshold_wx=0.04,
+            threshold_wy=0.04,
+            threshold_wz=0.04,
+            bias_sample_count=0,
+            move_time=0.0,
+        )
+    )
+    teleop.connect()
+    teleop._driver.readings.append(
+        SpaceMouseReading(
+            translation=[0.03, -0.01, 0.015],
+            rotation=[0.05, 0.03, 0.01],
+            buttons=(False, False),
+        )
+    )
+
+    action = teleop.get_action()
+
+    assert action["enabled"] is True
+    assert action["target_x"] == pytest.approx(0.0)
+    assert action["target_y"] == pytest.approx(0.03 * teleop.config.scale_y)
+    assert action["target_z"] == pytest.approx(0.0)
+    assert action["target_wx"] == pytest.approx(0.05 * teleop.config.scale_wx)
+    assert action["target_wy"] == pytest.approx(0.0)
+    assert action["target_wz"] == pytest.approx(0.0)
+    teleop.disconnect()
+
+
 def test_get_action_requires_deadman_button(monkeypatch):
     monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
     teleop = SpaceMouseTeleop(
@@ -132,7 +196,8 @@ def test_get_action_requires_deadman_button(monkeypatch):
 
 def test_incremental_gripper_updates(teleop):
     teleop.connect()
-    start = teleop.config.initial_gripper
+    teleop._last_gripper = 0.5
+    start = teleop._last_gripper
     teleop._driver.readings.append(
         SpaceMouseReading(
             translation=[0.03, 0.0, 0.0],

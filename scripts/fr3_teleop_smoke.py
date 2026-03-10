@@ -34,6 +34,9 @@ DEFAULT_SERVICE = "lerobot-user"
 DEFAULT_ROBOT_IP = "192.168.1.206"
 DEFAULT_GRIPPER_PORT = "/dev/ttyUSB0"
 DEFAULT_URDF_PATH = "/lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.urdf"
+DEFAULT_SCALE_X = 0.000143
+DEFAULT_SCALE_Y = 0.000139
+DEFAULT_SCALE_Z = 0.000114
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -53,7 +56,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Compose file to use. Defaults to <workspace>/docker/docker-compose.yml.",
     )
-    parser.add_argument("--fps", type=int, default=60, help="Teleoperation loop frequency.")
+    parser.add_argument("--fps", type=int, default=200, help="Teleoperation loop frequency.")
     parser.add_argument("--duration", type=float, default=30.0, help="Smoke duration in seconds.")
     parser.add_argument("--device-id", type=int, default=0, help="SpaceMouse device index.")
     parser.add_argument(
@@ -64,9 +67,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--incremental-step", type=float, default=0.01, help="Incremental gripper step size.")
     parser.add_argument("--move-time", type=float, default=0.02, help="Incremental gripper update interval.")
-    parser.add_argument("--scale-x", type=float, default=0.0001, help="SpaceMouse X translation scale.")
-    parser.add_argument("--scale-y", type=float, default=0.0001, help="SpaceMouse Y translation scale.")
-    parser.add_argument("--scale-z", type=float, default=0.0001, help="SpaceMouse Z translation scale.")
+    parser.add_argument("--scale-x", type=float, default=DEFAULT_SCALE_X, help="SpaceMouse X translation scale.")
+    parser.add_argument("--scale-y", type=float, default=DEFAULT_SCALE_Y, help="SpaceMouse Y translation scale.")
+    parser.add_argument("--scale-z", type=float, default=DEFAULT_SCALE_Z, help="SpaceMouse Z translation scale.")
     parser.add_argument(
         "--allow-rotation",
         action="store_true",
