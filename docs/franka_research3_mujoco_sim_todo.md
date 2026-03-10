@@ -118,3 +118,40 @@ Current non-blocking warnings:
   required
 - local X11 viewer use currently expects the host to allow container root via
   `xhost +si:localuser:root`
+
+## Next Calibration Step
+
+The next recommended step is not more ad hoc scale tuning. The next step is a
+repeatable replay-and-compare loop.
+
+Tooling is now in place:
+
+- `scripts/fr3_teleop_trace_replay.py` launches the replay in Docker for either
+  `sim` or `hardware` mode
+- `scripts/fr3_teleop_trace_replay_runtime.py` runs the fixed profile and
+  records TCP/joint traces inside the target runtime
+- `scripts/fr3_teleop_trace_compare.py` compares two trace bundles and reports
+  residual `scale_x/y/z` correction multipliers
+- `src/lerobot/calibration/fr3_teleop.py` owns the shared
+  fixed profile, trace schema, and comparison logic
+
+The remaining operational step is to run that loop with one sim trace and one
+real-hardware trace:
+
+1. Define a fixed teleop input profile with deterministic EE deltas over time.
+2. Replay that same profile into the MuJoCo teleop path and record TCP pose
+   traces.
+3. Replay that same profile into the real FR3 teleop path and record TCP pose
+   traces.
+4. Compare the two traces over the same time window and derive scale correction
+   suggestions for `scale_x`, `scale_y`, and `scale_z`.
+5. Prefer adjusting the simulation and control-path alignment first; only then
+   use scale retuning for residual operator feel differences.
+
+Why:
+
+- the current mismatch is primarily dynamic, not just a static gain problem
+- MuJoCo teleop now uses OTG, so trace comparison can reveal remaining gap from
+  hardware controller behavior instead of masking it
+- a fixed replay profile gives a reusable acceptance gate for future teleop
+  changes
