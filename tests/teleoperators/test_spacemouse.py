@@ -144,10 +144,10 @@ def test_incremental_gripper_updates(teleop):
     assert action["gripper"] == pytest.approx(start + teleop.config.incremental_step)
 
 
-def test_binary_gripper_toggles_on_rising_edge(monkeypatch):
+def test_binary_gripper_uses_left_open_right_close(monkeypatch):
     monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
     teleop = SpaceMouseTeleop(
-        SpaceMouseTeleopConfig(tool_mode=SpaceMouseToolMode.BINARY, initial_gripper=1.0)
+        SpaceMouseTeleopConfig(tool_mode=SpaceMouseToolMode.BINARY, initial_gripper=0.5)
     )
     teleop.connect()
     teleop._driver.readings.extend(
@@ -160,13 +160,13 @@ def test_binary_gripper_toggles_on_rising_edge(monkeypatch):
             SpaceMouseReading(
                 translation=[0.03, 0.0, 0.0],
                 rotation=[0.0, 0.0, 0.0],
-                buttons=(True, False),
+                buttons=(False, True),
             ),
         ]
     )
     first = teleop.get_action()
     second = teleop.get_action()
-    assert first["gripper"] == pytest.approx(0.0)
+    assert first["gripper"] == pytest.approx(1.0)
     assert second["gripper"] == pytest.approx(0.0)
     teleop.disconnect()
 

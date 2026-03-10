@@ -41,7 +41,6 @@ class SpaceMouseTeleop(Teleoperator):
         self.config = config
         self._driver = None
         self._is_connected = False
-        self._last_button_0 = False
         self._last_gripper = float(np.clip(config.initial_gripper, 0.0, 1.0))
         self._last_gripper_update = 0.0
 
@@ -104,14 +103,11 @@ class SpaceMouseTeleop(Teleoperator):
         }
 
     def _update_gripper(self, button_0: bool, button_1: bool) -> None:
-        if self.config.motion_enable_button == SpaceMouseEnableButton.LEFT:
-            button_0 = False
-        elif self.config.motion_enable_button == SpaceMouseEnableButton.RIGHT:
-            button_1 = False
-
         if self.config.tool_mode == SpaceMouseToolMode.BINARY:
-            if button_0 and not self._last_button_0:
-                self._last_gripper = 1.0 - self._last_gripper
+            if button_0 and not button_1:
+                self._last_gripper = 1.0
+            elif button_1 and not button_0:
+                self._last_gripper = 0.0
         else:
             now = time.perf_counter()
             if now - self._last_gripper_update >= self.config.move_time:
@@ -121,7 +117,6 @@ class SpaceMouseTeleop(Teleoperator):
                 elif button_1 and not button_0:
                     self._last_gripper = max(0.0, self._last_gripper - self.config.incremental_step)
                     self._last_gripper_update = now
-        self._last_button_0 = button_0
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:
