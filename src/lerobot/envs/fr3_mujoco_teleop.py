@@ -166,7 +166,7 @@ def run_sim_teleop_loop(
 
         loop_start = time.perf_counter()
         action = teleop.get_action()
-        _, _, terminated, truncated, info = env.step_teleop_action(action)
+        _, _, terminated, truncated, info = env.step_teleop_action(action, control_period_s=1.0 / fps)
 
         if viewer is not None:
             with viewer.lock():

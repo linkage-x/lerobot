@@ -110,6 +110,9 @@ Current non-blocking warnings:
 - `scripts/fr3_mujoco_teleop.py` runs SpaceMouse-driven FR3 MuJoCo teleop
 - `src/lerobot/envs/fr3_mujoco_teleop.py` owns the target/TCP marker update
   helpers and headless teleop loop
+- `src/lerobot/envs/fr3_mujoco.py` now advances teleop targets through the same
+  Ruckig OTG path used by the hardware backend instead of jumping directly to
+  IK joint targets
 - `docker compose --profile sim --profile teleop run --rm lerobot-fr3-sim-teleop`
   is the intended local interactive container when SpaceMouse and a viewer are
   required

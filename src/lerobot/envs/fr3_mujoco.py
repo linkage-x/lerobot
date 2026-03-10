@@ -59,8 +59,31 @@ class FR3MujocoEnvConfig:
     workspace_max: tuple[float, float, float] = (0.9, 0.6, 0.8)
     max_target_delta_pos: tuple[float, float, float] | None = None
     max_target_delta_rot: tuple[float, float, float] | None = None
+    use_otg: bool = True
+    teleop_control_frequency: float = 200.0
+    otg_control_frequency: float = 800.0
+    otg_async_control_frequency: float = 1000.0
+    otg_max_velocity: tuple[float, ...] = (2.096, 2.096, 2.096, 2.096, 4.208, 3.344, 4.208)
+    otg_max_acceleration: tuple[float, ...] = (8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0)
+    otg_max_jerk: tuple[float, ...] = (4000.0, 4000.0, 4000.0, 4000.0, 4000.0, 4000.0, 4000.0)
+    otg_min_position: tuple[float, ...] = (-2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159)
+    otg_max_position: tuple[float, ...] = (2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159)
+    otg_synchronization: bool = True
+    otg_sync_mode: str = "time"
     max_episode_steps: int = 300
     render_mode: str | None = None
+
+    @property
+    def teleop_dt(self) -> float:
+        return 1.0 / self.teleop_control_frequency
+
+    @property
+    def otg_dt(self) -> float:
+        return 1.0 / self.otg_control_frequency
+
+    @property
+    def otg_async_dt(self) -> float:
+        return 1.0 / self.otg_async_control_frequency
 
 
 class FR3MujocoEnv(gym.Env):
@@ -83,6 +106,7 @@ class FR3MujocoEnv(gym.Env):
         self.render_mode = self.cfg.render_mode
         self._mujoco = self._import_mujoco()
         self._kinematics = self._build_kinematics()
+        self._otg = self._build_otg()
 
         self.model = self._mujoco.MjModel.from_xml_path(self.cfg.urdf_path)
         self.data = self._mujoco.MjData(self.model)
@@ -115,6 +139,7 @@ class FR3MujocoEnv(gym.Env):
         self._last_command_pose: np.ndarray | None = None
         self._target_pose: np.ndarray | None = None
         self._tcp_pose: np.ndarray | None = None
+        self._otg_target_joints: np.ndarray | None = None
         self._last_gripper = 1.0
 
         self.action_space = spaces.Box(
@@ -162,6 +187,23 @@ class FR3MujocoEnv(gym.Env):
             joint_names=list(self.cfg.joint_names),
         )
 
+    def _build_otg(self):
+        if not self.cfg.use_otg:
+            return None
+        from lerobot.robots.franka_research3.backends import RuckigOTGDriver
+
+        return RuckigOTGDriver(
+            dof=len(self.cfg.joint_names),
+            dt=self.cfg.otg_dt,
+            max_velocity=list(self.cfg.otg_max_velocity),
+            max_acceleration=list(self.cfg.otg_max_acceleration),
+            max_jerk=list(self.cfg.otg_max_jerk),
+            min_position=list(self.cfg.otg_min_position),
+            max_position=list(self.cfg.otg_max_position),
+            synchronization=self.cfg.otg_synchronization,
+            sync_mode=self.cfg.otg_sync_mode,
+        )
+
     def _set_joint_state(self, joint_positions: np.ndarray) -> None:
         self.data.qpos[self._qpos_indices] = np.asarray(joint_positions, dtype=np.float64)
         self.data.qvel[self._qvel_indices] = 0.0
@@ -178,6 +220,29 @@ class FR3MujocoEnv(gym.Env):
         self._tcp_pose = self._current_tcp_pose()
         if self._target_pose is None:
             self._target_pose = self._tcp_pose.copy()
+
+    def _reset_otg_state(self, current_joint_positions: np.ndarray) -> None:
+        if self._otg is None:
+            self._otg_target_joints = None
+            return
+        current = np.asarray(current_joint_positions, dtype=np.float64)
+        self._otg.reset(current)
+        self._otg_target_joints = current.copy()
+
+    def _advance_otg_window(self, duration_s: float | None) -> tuple[int, int]:
+        if self._otg is None or self._otg_target_joints is None:
+            return 0, 0
+
+        window_s = self.cfg.teleop_dt if duration_s is None else max(float(duration_s), 0.0)
+        otg_steps = max(1, int(np.ceil(window_s / self.cfg.otg_dt)))
+        sender_steps = max(1, int(np.ceil(window_s / self.cfg.otg_async_dt)))
+
+        for _ in range(otg_steps):
+            current_joints = self._get_joint_positions()
+            next_joints = self._otg.step(current_joints, self._otg_target_joints)
+            self._set_joint_state(next_joints)
+
+        return otg_steps, sender_steps
 
     def _pose_to_seven_d(self, pose: np.ndarray) -> np.ndarray:
         quat_xyzw = Rotation.from_matrix(pose[:3, :3]).as_quat()
@@ -252,7 +317,7 @@ class FR3MujocoEnv(gym.Env):
 
         return desired_pose, hold_current_joints
 
-    def step_teleop_action(self, action: dict[str, Any] | None):
+    def step_teleop_action(self, action: dict[str, Any] | None, control_period_s: float | None = None):
         teleop_action = self._normalize_teleop_action(action)
         current_joints = self._get_joint_positions()
         current_pose = self._current_tcp_pose()
@@ -262,7 +327,13 @@ class FR3MujocoEnv(gym.Env):
             target_joints = current_joints.copy()
         else:
             target_joints = np.asarray(self._kinematics.inverse_kinematics(current_joints, desired_pose), dtype=np.float64)
-        self._set_joint_state(target_joints)
+        target_joints = np.clip(target_joints, self._joint_lower, self._joint_upper)
+        if self._otg is not None:
+            self._otg_target_joints = target_joints.copy()
+            otg_steps, sender_steps = self._advance_otg_window(control_period_s)
+        else:
+            self._set_joint_state(target_joints)
+            otg_steps, sender_steps = 0, 0
 
         self._last_gripper = float(teleop_action["gripper"])
         self._last_command_pose = desired_pose.copy()
@@ -279,6 +350,10 @@ class FR3MujocoEnv(gym.Env):
         truncated = self._step_count >= self.cfg.max_episode_steps
         info = self._build_info()
         info["teleop_action"] = teleop_action.copy()
+        info["target_joint_positions"] = target_joints.copy()
+        info["otg_enabled"] = self._otg is not None
+        info["otg_steps"] = otg_steps
+        info["sender_steps"] = sender_steps
         return observation, 0.0, terminated, truncated, info
 
     def _build_observation(self) -> dict[str, np.ndarray]:
@@ -302,6 +377,7 @@ class FR3MujocoEnv(gym.Env):
         self._reference_pose = None
         self._last_command_pose = None
         self._target_pose = None
+        self._otg_target_joints = None
         target_joint_positions = self._initial_joint_positions
         if options and "joint_positions" in options:
             target_joint_positions = np.clip(
@@ -310,6 +386,7 @@ class FR3MujocoEnv(gym.Env):
                 self._joint_upper,
             )
         self._set_joint_state(target_joint_positions)
+        self._reset_otg_state(target_joint_positions)
         return self._build_observation(), self._build_info()
 
     def step(self, action: np.ndarray):
@@ -318,7 +395,11 @@ class FR3MujocoEnv(gym.Env):
             self._joint_lower,
             self._joint_upper,
         )
-        self._set_joint_state(target_joint_positions)
+        if self._otg is not None:
+            self._otg_target_joints = target_joint_positions.copy()
+            self._advance_otg_window(self.cfg.teleop_dt)
+        else:
+            self._set_joint_state(target_joint_positions)
         self._last_command_pose = self._tcp_pose.copy()
         self._reference_pose = None
         self._prev_enabled = False

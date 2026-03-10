@@ -39,6 +39,7 @@ def test_first_disabled_teleop_action_holds_current_joint_state():
         _, _, _, _, info = env.step_teleop_action({"enabled": False})
         np.testing.assert_allclose(info["joint_positions"], before_joints)
         np.testing.assert_allclose(info["target_pose"], info["tcp_pose"])
+        assert info["otg_enabled"] is True
     finally:
         env.close()
 
@@ -65,6 +66,8 @@ def test_teleop_action_clips_target_to_workspace():
             np.array([0.3, -0.1, 0.25]),
             atol=1e-6,
         )
+        assert info["otg_steps"] == 4
+        assert info["sender_steps"] == 5
     finally:
         env.close()
 
@@ -82,8 +85,13 @@ def test_fk_ik_round_trip_stays_in_target_frame():
         env.close()
 
 
-def test_teleop_target_and_tcp_pose_remain_aligned_after_small_delta():
-    cfg = FR3MujocoEnvConfig(max_target_delta_pos=(0.01, 0.01, 0.01))
+def test_teleop_target_lags_tcp_under_otg_then_converges():
+    cfg = FR3MujocoEnvConfig(
+        max_target_delta_pos=(0.01, 0.01, 0.01),
+        otg_max_velocity=(0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02),
+        otg_max_acceleration=(0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2),
+        otg_max_jerk=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+    )
     env = FR3MujocoEnv(cfg=cfg)
     try:
         env.reset()
@@ -95,6 +103,13 @@ def test_teleop_target_and_tcp_pose_remain_aligned_after_small_delta():
                 "target_z": 0.0015,
             }
         )
-        np.testing.assert_allclose(info["target_pose"], info["tcp_pose"], atol=1e-4)
+        initial_gap = np.linalg.norm(info["target_pose"][:3, 3] - info["tcp_pose"][:3, 3])
+        assert initial_gap > 1e-5
+
+        for _ in range(20):
+            _, _, _, _, info = env.step_teleop_action({"enabled": False})
+
+        final_gap = np.linalg.norm(info["target_pose"][:3, 3] - info["tcp_pose"][:3, 3])
+        assert final_gap < initial_gap
     finally:
         env.close()

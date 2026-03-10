@@ -48,7 +48,14 @@ def test_marker_axes_use_configured_axis_length():
 
 
 def test_run_sim_teleop_loop_steps_env_without_viewer():
-    env = FR3MujocoEnv(FR3MujocoEnvConfig(max_episode_steps=20))
+    env = FR3MujocoEnv(
+        FR3MujocoEnvConfig(
+            max_episode_steps=20,
+            otg_max_velocity=(0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02),
+            otg_max_acceleration=(0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2),
+            otg_max_jerk=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+        )
+    )
     teleop = FakeTeleop(
         [
             {"enabled": True, "target_x": 0.002, "target_y": 0.0, "target_z": 0.0},
@@ -61,6 +68,7 @@ def test_run_sim_teleop_loop_steps_env_without_viewer():
         assert info["loop_steps"] == 3
         assert info["target_marker_name"] == "target"
         assert info["tcp_marker_name"] == "TCP"
-        np.testing.assert_allclose(info["target_pose"], info["tcp_pose"], atol=1e-4)
+        assert info["otg_enabled"] is True
+        assert np.linalg.norm(info["target_pose"][:3, 3] - info["tcp_pose"][:3, 3]) > 1e-6
     finally:
         env.close()
