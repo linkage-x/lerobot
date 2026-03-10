@@ -67,3 +67,34 @@ def test_teleop_action_clips_target_to_workspace():
         )
     finally:
         env.close()
+
+
+def test_fk_ik_round_trip_stays_in_target_frame():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        current_joints = env._get_joint_positions()
+        current_pose = env._current_tcp_pose()
+        ik_joints = env._kinematics.inverse_kinematics(current_joints, current_pose)
+        round_trip_pose = env._kinematics.forward_kinematics(ik_joints)
+        np.testing.assert_allclose(round_trip_pose, current_pose, atol=1e-5)
+    finally:
+        env.close()
+
+
+def test_teleop_target_and_tcp_pose_remain_aligned_after_small_delta():
+    cfg = FR3MujocoEnvConfig(max_target_delta_pos=(0.01, 0.01, 0.01))
+    env = FR3MujocoEnv(cfg=cfg)
+    try:
+        env.reset()
+        _, _, _, _, info = env.step_teleop_action(
+            {
+                "enabled": True,
+                "target_x": 0.002,
+                "target_y": -0.001,
+                "target_z": 0.0015,
+            }
+        )
+        np.testing.assert_allclose(info["target_pose"], info["tcp_pose"], atol=1e-4)
+    finally:
+        env.close()
