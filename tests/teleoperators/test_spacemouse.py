@@ -15,9 +15,11 @@
 # limitations under the License.
 
 import pytest
+import sys
+import types
 
 from lerobot.teleoperators.spacemouse import SpaceMouseTeleop, SpaceMouseTeleopConfig
-from lerobot.teleoperators.spacemouse.backend import SpaceMouseReading
+from lerobot.teleoperators.spacemouse.backend import PySpaceMouseDriver, SpaceMouseReading
 from lerobot.teleoperators.spacemouse.configuration_spacemouse import SpaceMouseToolMode
 
 
@@ -149,3 +151,53 @@ def test_connect_cleans_up_failed_backend(monkeypatch):
     assert not teleop.is_connected
     assert teleop._driver is None
     assert FailingSpaceMouseDriver.instances[-1].connected is False
+
+
+def test_pyspacemouse_driver_supports_get_connected_devices_api(monkeypatch):
+    class DummyDevice:
+        def __init__(self):
+            self.closed = False
+
+        def read(self):
+            return types.SimpleNamespace(
+                x=0.1,
+                y=0.2,
+                z=0.3,
+                roll=0.4,
+                pitch=0.5,
+                yaw=0.6,
+                buttons=(1, 0),
+            )
+
+        def close(self):
+            self.closed = True
+
+    opened = DummyDevice()
+    fake_module = types.SimpleNamespace(
+        get_connected_devices=lambda: ["/dev/hidraw7"],
+        open=lambda **kwargs: opened if kwargs == {"device": "/dev/hidraw7"} else None,
+    )
+    monkeypatch.setitem(sys.modules, "pyspacemouse", fake_module)
+
+    driver = PySpaceMouseDriver(device_id=0)
+    driver.connect()
+    reading = driver.poll()
+    driver.disconnect()
+
+    assert reading.translation.tolist() == pytest.approx([0.1, 0.2, 0.3])
+    assert reading.rotation.tolist() == pytest.approx([0.4, 0.5, 0.6])
+    assert reading.buttons == (True, False)
+    assert opened.closed is True
+
+
+def test_pyspacemouse_driver_raises_when_device_index_out_of_range(monkeypatch):
+    fake_module = types.SimpleNamespace(
+        get_connected_devices=lambda: ["/dev/hidraw7"],
+        open=lambda **kwargs: None,
+    )
+    monkeypatch.setitem(sys.modules, "pyspacemouse", fake_module)
+
+    driver = PySpaceMouseDriver(device_id=1)
+
+    with pytest.raises(ConnectionError, match="out of range"):
+        driver.connect()

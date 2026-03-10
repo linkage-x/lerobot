@@ -52,11 +52,35 @@ class PySpaceMouseDriver:
         self._pyspacemouse = pyspacemouse
         self._device = None
 
+    def _list_devices(self) -> list[object]:
+        if hasattr(self._pyspacemouse, "list_devices"):
+            return list(self._pyspacemouse.list_devices())
+        if hasattr(self._pyspacemouse, "get_connected_devices"):
+            return list(self._pyspacemouse.get_connected_devices())
+        raise AttributeError("pyspacemouse does not expose a supported device enumeration API.")
+
+    def _open_device(self, device: object) -> object | None:
+        open_candidates = (
+            {"device": device},
+            {"device_index": self.device_id},
+            {"device": device, "DeviceNumber": self.device_id},
+        )
+        for kwargs in open_candidates:
+            try:
+                opened = self._pyspacemouse.open(**kwargs)
+            except TypeError:
+                continue
+            if opened is not None:
+                return opened
+        return None
+
     def connect(self) -> None:
-        devices = self._pyspacemouse.list_devices()
+        devices = self._list_devices()
         if not devices:
             raise ConnectionError("No SpaceMouse devices detected.")
-        self._device = self._pyspacemouse.open(device=devices[0], DeviceNumber=self.device_id)
+        if self.device_id >= len(devices):
+            raise ConnectionError(f"SpaceMouse device index {self.device_id} out of range for {len(devices)} devices.")
+        self._device = self._open_device(devices[self.device_id])
         if self._device is None:
             raise ConnectionError(f"Could not open SpaceMouse device {self.device_id}.")
 
