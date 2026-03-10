@@ -26,6 +26,7 @@ x-lerobot-common: &lerobot-common
     no_proxy: ${no_proxy:-}
   volumes: &lerobot-volumes
     - ..:/lerobot
+    - lerobot_venv:/lerobot/.venv
     - ${HOME}/.cache/huggingface:/home/user_lerobot/.cache/huggingface
     - ${HOME}/.cache/torch:/home/user_lerobot/.cache/torch
     - ${HOME}/.cache/triton:/home/user_lerobot/.cache/triton
@@ -43,6 +44,23 @@ x-lerobot-common: &lerobot-common
     - /dev/input:/dev/input
     - /var/run/dbus:/var/run/dbus
     - /run/dbus:/run/dbus
+  shm_size: "8gb"
+
+x-lerobot-sim-common: &lerobot-sim-common
+  working_dir: /lerobot
+  stdin_open: true
+  tty: true
+  user: root
+  command: ["/bin/bash"]
+  environment:
+    <<: *lerobot-env
+  volumes:
+    - ..:/lerobot
+    - lerobot_venv:/lerobot/.venv
+    - ${HOME}/.cache/huggingface:/home/user_lerobot/.cache/huggingface
+    - ${HOME}/.cache/torch:/home/user_lerobot/.cache/torch
+    - ${HOME}/.cache/triton:/home/user_lerobot/.cache/triton
+    - /tmp/.X11-unix:/tmp/.X11-unix
   shm_size: "8gb"
 
 services:
@@ -74,3 +92,25 @@ services:
       CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
       TEST_TYPE: single_gpu
     gpus: all
+
+  lerobot-fr3-sim:
+    <<: *lerobot-sim-common
+    image: lerobot-internal:local
+    profiles: ["sim", "mujoco", "gpu"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.internal
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+        CUDA_VERSION: ${CUDA_VERSION:-12.4.1}
+        OS_VERSION: ${OS_VERSION:-22.04}
+        UNBOUND_DEPS: ${UNBOUND_DEPS:-false}
+    environment:
+      <<: *lerobot-env
+      DEVICE: cuda
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+      TEST_TYPE: single_gpu
+    gpus: all
+
+volumes:
+  lerobot_venv:
