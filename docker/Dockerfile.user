@@ -22,16 +22,23 @@
 ARG PYTHON_VERSION=3.12
 FROM python:${PYTHON_VERSION}-slim
 
+ARG LIBFRANKA_REF=0.15.0
+ARG PANDA_PY_REF=main
+ARG PANDA_PY_REPO=https://github.com/linkage-x/panda-py.git
+ARG AGX_PYPIKA_VERSION=0.1.1
+
 # Configure environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
     MUJOCO_GL=egl \
-    PATH=/lerobot/.venv/bin:$PATH
+    PATH=/lerobot/.venv/bin:$PATH \
+    LD_LIBRARY_PATH=/usr/local/lib
 
 # Install system dependencies and uv (as root)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential git curl libglib2.0-0 libegl1-mesa-dev ffmpeg \
+    ca-certificates build-essential git curl libglib2.0-0 libegl1-mesa-dev ffmpeg \
     libusb-1.0-0-dev speech-dispatcher libgeos-dev portaudio19-dev \
-    cmake pkg-config ninja-build \
+    cmake pkg-config ninja-build libeigen3-dev libpoco-dev libhidapi-dev \
+    libudev-dev libx11-dev freeglut3-dev libglu1-mesa-dev libssl-dev \
     && curl -LsSf https://astral.sh/uv/install.sh | sh \
     && mv /root/.local/bin/uv /usr/local/bin/uv \
     && useradd --create-home --shell /bin/bash user_lerobot \
@@ -70,6 +77,37 @@ RUN if [ "$UNBOUND_DEPS" = "true" ]; then \
     fi
 
 RUN uv pip install --no-cache ".[all]"
+
+USER root
+
+RUN export CMEEL_PREFIX="/lerobot/.venv/lib/python${PYTHON_VERSION}/site-packages/cmeel.prefix" \
+    && test -d "${CMEEL_PREFIX}" \
+    && git clone --recursive --depth 1 --branch "${LIBFRANKA_REF}" https://github.com/frankarobotics/libfranka.git /tmp/libfranka \
+    && cd /tmp/libfranka \
+    && cmake -S . -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTS=OFF \
+        -DBUILD_EXAMPLES=OFF \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_PREFIX_PATH="${CMEEL_PREFIX};/usr/local" \
+    && cmake --build build -j"$(nproc)" \
+    && cmake --install build \
+    && ldconfig \
+    && test -f /usr/local/lib/libfranka.so \
+    && rm -rf /tmp/libfranka
+
+USER user_lerobot
+
+RUN uv pip install --no-cache pyspacemouse "agx-pypika==${AGX_PYPIKA_VERSION}" --no-deps \
+    && git clone --depth 1 --branch "${PANDA_PY_REF}" "${PANDA_PY_REPO}" /tmp/panda-py \
+    && CMAKE_PREFIX_PATH="/lerobot/.venv/lib/python${PYTHON_VERSION}/site-packages/cmeel.prefix;/usr/local" \
+       LD_LIBRARY_PATH=/usr/local/lib \
+       pip install --no-cache-dir /tmp/panda-py \
+    && rm -rf /tmp/panda-py \
+    && python -c "import placo; print('placo_ok')" \
+    && python -c "import panda_py; print('panda_py_ok')" \
+    && python -c "from pika.gripper import Gripper; print('pika_gripper_ok')" \
+    && python -c "import pyspacemouse; print('pyspacemouse_ok')"
 
 # Copy the rest of the application code
 # Make sure to have the git-LFS files for testing

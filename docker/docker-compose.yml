@@ -1,0 +1,76 @@
+name: lerobot
+
+x-lerobot-common: &lerobot-common
+  working_dir: /lerobot
+  stdin_open: true
+  tty: true
+  privileged: true
+  network_mode: host
+  ipc: host
+  user: root
+  command: ["/bin/bash"]
+  environment: &lerobot-env
+    DISPLAY: ${DISPLAY:-:0}
+    QT_X11_NO_MITSHM: "1"
+    SDL_VIDEODRIVER: x11
+    SDL_AUDIODRIVER: pulse
+    UDEV: "1"
+    SHELL: /bin/bash
+    PYTHONUNBUFFERED: "1"
+    HF_HOME: /home/user_lerobot/.cache/huggingface
+    HF_LEROBOT_HOME: /home/user_lerobot/.cache/huggingface/lerobot
+    TORCH_HOME: /home/user_lerobot/.cache/torch
+    TRITON_CACHE_DIR: /home/user_lerobot/.cache/triton
+    http_proxy: ${http_proxy:-}
+    https_proxy: ${https_proxy:-}
+    no_proxy: ${no_proxy:-}
+  volumes: &lerobot-volumes
+    - ..:/lerobot
+    - ${HOME}/.cache/huggingface:/home/user_lerobot/.cache/huggingface
+    - ${HOME}/.cache/torch:/home/user_lerobot/.cache/torch
+    - ${HOME}/.cache/triton:/home/user_lerobot/.cache/triton
+    - ${HOME}/.config/libsurvive:/home/user_lerobot/.config/libsurvive
+    - /tmp/.X11-unix:/tmp/.X11-unix
+    - /sys/bus/usb:/sys/bus/usb:ro
+    - /sys/class/input:/sys/class/input:ro
+    - /dev:/dev
+    - /dev/bus/usb:/dev/bus/usb
+    - /dev/input:/dev/input
+    - /var/run/dbus:/var/run/dbus
+    - /run/dbus:/run/dbus
+  devices: &lerobot-devices
+    - /dev/bus/usb:/dev/bus/usb
+    - /dev/input:/dev/input
+    - /var/run/dbus:/var/run/dbus
+    - /run/dbus:/run/dbus
+  shm_size: "8gb"
+
+services:
+  lerobot-user:
+    <<: *lerobot-common
+    image: lerobot-user:local
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.user
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+        UNBOUND_DEPS: ${UNBOUND_DEPS:-false}
+
+  lerobot-internal:
+    <<: *lerobot-common
+    image: lerobot-internal:local
+    profiles: ["internal", "gpu"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.internal
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+        CUDA_VERSION: ${CUDA_VERSION:-12.4.1}
+        OS_VERSION: ${OS_VERSION:-22.04}
+        UNBOUND_DEPS: ${UNBOUND_DEPS:-false}
+    environment:
+      <<: *lerobot-env
+      DEVICE: cuda
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+      TEST_TYPE: single_gpu
+    gpus: all

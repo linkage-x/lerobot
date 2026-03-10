@@ -23,6 +23,11 @@ ARG CUDA_VERSION=12.4.1
 ARG OS_VERSION=22.04
 FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu${OS_VERSION}
 
+ARG LIBFRANKA_REF=0.15.0
+ARG PANDA_PY_REF=main
+ARG PANDA_PY_REPO=https://github.com/linkage-x/panda-py.git
+ARG AGX_PYPIKA_VERSION=0.1.1
+
 # Define Python version argument
 ARG PYTHON_VERSION=3.12
 
@@ -30,6 +35,7 @@ ARG PYTHON_VERSION=3.12
 ENV DEBIAN_FRONTEND=noninteractive \
     MUJOCO_GL=egl \
     PATH=/lerobot/.venv/bin:$PATH \
+    LD_LIBRARY_PATH=/usr/local/lib \
     CUDA_VISIBLE_DEVICES=0 \
     TEST_TYPE=single_gpu \
     DEVICE=cuda
@@ -39,7 +45,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     software-properties-common build-essential git curl \
     libglib2.0-0 libgl1-mesa-glx libegl1-mesa ffmpeg \
     libusb-1.0-0-dev speech-dispatcher libgeos-dev portaudio19-dev \
-    cmake pkg-config ninja-build \
+    cmake pkg-config ninja-build libeigen3-dev libpoco-dev libhidapi-dev \
+    libudev-dev libx11-dev freeglut3-dev libglu1-mesa-dev libssl-dev \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -84,6 +91,37 @@ RUN if [ "$UNBOUND_DEPS" = "true" ]; then \
     fi
 
 RUN uv pip install --no-cache ".[all]"
+
+USER root
+
+RUN export CMEEL_PREFIX="/lerobot/.venv/lib/python${PYTHON_VERSION}/site-packages/cmeel.prefix" \
+    && test -d "${CMEEL_PREFIX}" \
+    && git clone --recursive --depth 1 --branch "${LIBFRANKA_REF}" https://github.com/frankarobotics/libfranka.git /tmp/libfranka \
+    && cd /tmp/libfranka \
+    && cmake -S . -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTS=OFF \
+        -DBUILD_EXAMPLES=OFF \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_PREFIX_PATH="${CMEEL_PREFIX};/usr/local" \
+    && cmake --build build -j"$(nproc)" \
+    && cmake --install build \
+    && ldconfig \
+    && test -f /usr/local/lib/libfranka.so \
+    && rm -rf /tmp/libfranka
+
+USER user_lerobot
+
+RUN uv pip install --no-cache pyspacemouse "agx-pypika==${AGX_PYPIKA_VERSION}" --no-deps \
+    && git clone --depth 1 --branch "${PANDA_PY_REF}" "${PANDA_PY_REPO}" /tmp/panda-py \
+    && CMAKE_PREFIX_PATH="/lerobot/.venv/lib/python${PYTHON_VERSION}/site-packages/cmeel.prefix;/usr/local" \
+       LD_LIBRARY_PATH=/usr/local/lib \
+       pip install --no-cache-dir /tmp/panda-py \
+    && rm -rf /tmp/panda-py \
+    && python -c "import placo; print('placo_ok')" \
+    && python -c "import panda_py; print('panda_py_ok')" \
+    && python -c "from pika.gripper import Gripper; print('pika_gripper_ok')" \
+    && python -c "import pyspacemouse; print('pyspacemouse_ok')"
 
 RUN chmod +x /lerobot/.venv/lib/python${PYTHON_VERSION}/site-packages/triton/backends/nvidia/bin/ptxas
 
