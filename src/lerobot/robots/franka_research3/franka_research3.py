@@ -303,11 +303,8 @@ class FrankaResearch3(Robot):
         return np.asarray(self._arm.get_joint_positions(), dtype=np.float64)
 
     def _compute_ee_pose(self, joint_positions_rad: np.ndarray) -> np.ndarray:
-        if self._arm is None or self._kinematics is None:
+        if self._kinematics is None:
             raise RuntimeError("Robot is not connected.")
-        ee_pose = self._arm.get_ee_pose()
-        if ee_pose is not None:
-            return np.asarray(ee_pose, dtype=np.float64)
         return np.asarray(self._kinematics.forward_kinematics(joint_positions_rad), dtype=np.float64)
 
     @check_if_not_connected
@@ -340,6 +337,7 @@ class FrankaResearch3(Robot):
         current_pose = self._compute_ee_pose(joint_positions_rad)
 
         enabled = bool(action["enabled"])
+        hold_current_joints = False
         if enabled:
             if not self._prev_enabled or self._reference_pose is None:
                 self._reference_pose = current_pose.copy()
@@ -377,9 +375,13 @@ class FrankaResearch3(Robot):
         else:
             if self._last_command_pose is None:
                 self._last_command_pose = current_pose.copy()
+                hold_current_joints = True
             desired_pose = self._last_command_pose.copy()
 
-        target_joints_rad = self._kinematics.inverse_kinematics(joint_positions_rad, desired_pose)
+        if hold_current_joints:
+            target_joints_rad = joint_positions_rad.copy()
+        else:
+            target_joints_rad = self._kinematics.inverse_kinematics(joint_positions_rad, desired_pose)
         if self._otg is not None:
             with self._otg_target_lock:
                 self._otg_target_joints = np.asarray(target_joints_rad, dtype=np.float64).copy()

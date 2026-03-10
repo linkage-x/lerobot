@@ -19,6 +19,7 @@ import pytest
 import time
 
 from lerobot.robots.franka_research3 import FrankaResearch3, FrankaResearch3Config
+from lerobot.utils.rotation import Rotation
 
 
 class DummyArmDriver:
@@ -45,6 +46,13 @@ class DummyArmDriver:
 
     def set_joint_positions(self, joint_positions: np.ndarray) -> None:
         self.set_joint_positions_calls.append(np.asarray(joint_positions, dtype=np.float64))
+
+
+class ReportingArmDriver(DummyArmDriver):
+    def get_ee_pose(self) -> np.ndarray | None:
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, 3] = np.array([9.0, 8.0, 7.0], dtype=np.float64)
+        return pose
 
 
 class DummyGripperDriver:
@@ -113,6 +121,12 @@ class DummyOTGDriver:
         return target.copy()
 
 
+class FailingOTGDriver(DummyOTGDriver):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        raise RuntimeError("otg init failed")
+
+
 @pytest.fixture
 def robot(monkeypatch):
     DummyArmDriver.instances = []
@@ -157,6 +171,28 @@ def test_get_observation(robot):
     assert observation["ee.y"] == pytest.approx(0.1)
     assert observation["ee.z"] == pytest.approx(0.3)
     assert observation["gripper.pos"] == pytest.approx(0.25)
+
+
+def test_get_observation_uses_kinematics_target_frame_even_if_arm_reports_pose(monkeypatch):
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", ReportingArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+        )
+    )
+
+    robot.connect()
+    observation = robot.get_observation()
+
+    assert observation["ee.x"] == pytest.approx(0.4)
+    assert observation["ee.y"] == pytest.approx(0.1)
+    assert observation["ee.z"] == pytest.approx(0.3)
+    robot.disconnect()
 
 
 def test_connect_falls_back_to_mock_gripper_when_hardware_unavailable(monkeypatch):
@@ -241,6 +277,29 @@ def test_send_action_disabled_reuses_last_command_pose(robot):
 
     _, desired_pose = robot._kinematics.inverse_calls[-1]
     assert np.allclose(desired_pose, robot._last_command_pose)
+
+
+def test_send_action_disabled_without_previous_command_holds_current_joints(robot):
+    robot.connect()
+    current_joints = robot._arm.get_joint_positions()
+    action = {
+        "enabled": False,
+        "target_x": 0.4,
+        "target_y": 0.4,
+        "target_z": 0.4,
+        "target_wx": 0.1,
+        "target_wy": -0.1,
+        "target_wz": 0.2,
+        "gripper": 0.1,
+    }
+
+    robot.send_action(action)
+
+    assert len(robot._kinematics.inverse_calls) == 0
+    assert np.allclose(robot._last_command_pose, robot._kinematics.forward_pose)
+    with robot._otg_target_lock:
+        assert robot._otg_target_joints is not None
+        assert np.allclose(robot._otg_target_joints, current_joints)
 
 
 def test_send_action_integrates_relative_pose_while_enabled(robot):
@@ -408,23 +467,25 @@ def test_otg_sender_runs_faster_than_smoother(monkeypatch):
 
 def test_connect_cleans_up_partial_backends(monkeypatch):
     DummyArmDriver.instances = []
-    FailingGripperDriver.instances = []
+    DummyGripperDriver.instances = []
     monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
-    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", FailingGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
     monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", FailingOTGDriver)
     robot = FrankaResearch3(
         FrankaResearch3Config(
             robot_ip="192.168.1.206",
             gripper_port="/dev/ttyUSB80",
             urdf_path="/tmp/fr3.urdf",
+            use_otg=True,
         )
     )
 
-    with pytest.raises(RuntimeError, match="gripper connect failed"):
+    with pytest.raises(RuntimeError, match="otg init failed"):
         robot.connect()
 
     assert not robot.is_connected
     assert robot._arm is None
     assert robot._gripper is None
     assert DummyArmDriver.instances[-1].connected is False
-    assert FailingGripperDriver.instances[-1].connected is False
+    assert DummyGripperDriver.instances[-1].connected is False

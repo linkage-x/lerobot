@@ -70,6 +70,22 @@ services:
   lerobot-user:
     <<: *lerobot-common
     image: lerobot-user:local
+    volumes:
+      - ..:/lerobot
+      - lerobot_user_venv:/lerobot/.venv
+      - ${HOME}/.cache/huggingface:/home/user_lerobot/.cache/huggingface
+      - ${HOME}/.cache/torch:/home/user_lerobot/.cache/torch
+      - ${HOME}/.cache/triton:/home/user_lerobot/.cache/triton
+      - ${HOME}/.config/libsurvive:/home/user_lerobot/.config/libsurvive
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ${HOME}/.Xauthority:/root/.Xauthority:ro
+      - /sys/bus/usb:/sys/bus/usb:ro
+      - /sys/class/input:/sys/class/input:ro
+      - /dev:/dev
+      - /dev/bus/usb:/dev/bus/usb
+      - /dev/input:/dev/input
+      - /var/run/dbus:/var/run/dbus
+      - /run/dbus:/run/dbus
     build:
       context: ..
       dockerfile: docker/Dockerfile.user
@@ -136,3 +152,4 @@ services:
 
 volumes:
   lerobot_venv:
+  lerobot_user_venv:
