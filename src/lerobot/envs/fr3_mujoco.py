@@ -23,6 +23,7 @@ from typing import Any
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
+from scipy.spatial.transform import Rotation
 
 
 def _default_fr3_urdf_path() -> str:
@@ -40,6 +41,10 @@ def _default_fr3_urdf_path() -> str:
 class FR3MujocoEnvConfig:
     urdf_path: str = field(default_factory=_default_fr3_urdf_path)
     target_frame_name: str = "pika_gripper_ee"
+    target_marker_name: str = "target"
+    target_site_name: str = "target_site"
+    tcp_marker_name: str = "TCP"
+    tcp_site_name: str = "TCP_site"
     joint_names: tuple[str, ...] = (
         "fr3_joint1",
         "fr3_joint2",
@@ -50,6 +55,10 @@ class FR3MujocoEnvConfig:
         "fr3_joint7",
     )
     initial_joint_positions: tuple[float, ...] = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
+    workspace_min: tuple[float, float, float] = (0.2, -0.6, 0.05)
+    workspace_max: tuple[float, float, float] = (0.9, 0.6, 0.8)
+    max_target_delta_pos: tuple[float, float, float] | None = None
+    max_target_delta_rot: tuple[float, float, float] | None = None
     max_episode_steps: int = 300
     render_mode: str | None = None
 
@@ -99,6 +108,14 @@ class FR3MujocoEnv(gym.Env):
             self._joint_lower,
             self._joint_upper,
         )
+        self._workspace_min = np.asarray(self.cfg.workspace_min, dtype=np.float64)
+        self._workspace_max = np.asarray(self.cfg.workspace_max, dtype=np.float64)
+        self._prev_enabled = False
+        self._reference_pose: np.ndarray | None = None
+        self._last_command_pose: np.ndarray | None = None
+        self._target_pose: np.ndarray | None = None
+        self._tcp_pose: np.ndarray | None = None
+        self._last_gripper = 1.0
 
         self.action_space = spaces.Box(
             low=self._joint_lower.astype(np.float32),
@@ -149,9 +166,120 @@ class FR3MujocoEnv(gym.Env):
         self.data.qpos[self._qpos_indices] = np.asarray(joint_positions, dtype=np.float64)
         self.data.qvel[self._qvel_indices] = 0.0
         self._mujoco.mj_forward(self.model, self.data)
+        self._update_visualization_state()
 
     def _get_joint_positions(self) -> np.ndarray:
         return np.asarray(self.data.qpos[self._qpos_indices], dtype=np.float64).copy()
+
+    def _current_tcp_pose(self) -> np.ndarray:
+        return np.asarray(self._kinematics.forward_kinematics(self._get_joint_positions()), dtype=np.float64)
+
+    def _update_visualization_state(self) -> None:
+        self._tcp_pose = self._current_tcp_pose()
+        if self._target_pose is None:
+            self._target_pose = self._tcp_pose.copy()
+
+    def _pose_to_seven_d(self, pose: np.ndarray) -> np.ndarray:
+        quat_xyzw = Rotation.from_matrix(pose[:3, :3]).as_quat()
+        return np.concatenate([pose[:3, 3], quat_xyzw], dtype=np.float64)
+
+    def _build_visualization_info(self) -> dict[str, Any]:
+        target_pose = self._target_pose if self._target_pose is not None else self._current_tcp_pose()
+        tcp_pose = self._tcp_pose if self._tcp_pose is not None else self._current_tcp_pose()
+        return {
+            "target_marker_name": self.cfg.target_marker_name,
+            "target_site_name": self.cfg.target_site_name,
+            "target_pose": target_pose.copy(),
+            "target_pose_7d": self._pose_to_seven_d(target_pose),
+            "tcp_marker_name": self.cfg.tcp_marker_name,
+            "tcp_site_name": self.cfg.tcp_site_name,
+            "tcp_pose": tcp_pose.copy(),
+            "tcp_pose_7d": self._pose_to_seven_d(tcp_pose),
+        }
+
+    def _zero_teleop_action(self) -> dict[str, float | bool]:
+        return {
+            "enabled": False,
+            "target_x": 0.0,
+            "target_y": 0.0,
+            "target_z": 0.0,
+            "target_wx": 0.0,
+            "target_wy": 0.0,
+            "target_wz": 0.0,
+            "gripper": self._last_gripper,
+        }
+
+    def _normalize_teleop_action(self, action: dict[str, Any] | None) -> dict[str, float | bool]:
+        merged = self._zero_teleop_action()
+        if action is not None:
+            merged.update(action)
+        merged["enabled"] = bool(merged["enabled"])
+        for key in ("target_x", "target_y", "target_z", "target_wx", "target_wy", "target_wz", "gripper"):
+            merged[key] = float(merged[key])
+        merged["gripper"] = float(np.clip(merged["gripper"], 0.0, 1.0))
+        return merged
+
+    def _compute_desired_pose_from_teleop(
+        self, current_pose: np.ndarray, action: dict[str, float | bool]
+    ) -> tuple[np.ndarray, bool]:
+        enabled = bool(action["enabled"])
+        hold_current_joints = False
+
+        if enabled:
+            if not self._prev_enabled or self._reference_pose is None:
+                self._reference_pose = current_pose.copy()
+
+            delta_pos = np.array([action["target_x"], action["target_y"], action["target_z"]], dtype=np.float64)
+            if self.cfg.max_target_delta_pos is not None:
+                limit = np.asarray(self.cfg.max_target_delta_pos, dtype=np.float64)
+                delta_pos = np.clip(delta_pos, -limit, limit)
+
+            delta_rot = Rotation.from_rotvec([action["target_wx"], action["target_wy"], action["target_wz"]])
+            if self.cfg.max_target_delta_rot is not None:
+                limit = np.asarray(self.cfg.max_target_delta_rot, dtype=np.float64)
+                delta_rot = Rotation.from_rotvec(np.clip(delta_rot.as_rotvec(), -limit, limit))
+
+            desired_pose = np.eye(4, dtype=np.float64)
+            desired_pose[:3, :3] = self._reference_pose[:3, :3] @ delta_rot.as_matrix()
+            desired_pose[:3, 3] = self._reference_pose[:3, 3] + delta_pos
+            desired_pose[:3, 3] = np.clip(desired_pose[:3, 3], self._workspace_min, self._workspace_max)
+        else:
+            if self._last_command_pose is None:
+                desired_pose = current_pose.copy()
+                hold_current_joints = True
+            else:
+                desired_pose = self._last_command_pose.copy()
+
+        return desired_pose, hold_current_joints
+
+    def step_teleop_action(self, action: dict[str, Any] | None):
+        teleop_action = self._normalize_teleop_action(action)
+        current_joints = self._get_joint_positions()
+        current_pose = self._current_tcp_pose()
+        desired_pose, hold_current_joints = self._compute_desired_pose_from_teleop(current_pose, teleop_action)
+
+        if hold_current_joints:
+            target_joints = current_joints.copy()
+        else:
+            target_joints = np.asarray(self._kinematics.inverse_kinematics(current_joints, desired_pose), dtype=np.float64)
+        self._set_joint_state(target_joints)
+
+        self._last_gripper = float(teleop_action["gripper"])
+        self._last_command_pose = desired_pose.copy()
+        if teleop_action["enabled"]:
+            self._reference_pose = desired_pose.copy()
+        else:
+            self._reference_pose = None
+        self._target_pose = desired_pose.copy()
+        self._prev_enabled = bool(teleop_action["enabled"])
+
+        self._step_count += 1
+        observation = self._build_observation()
+        terminated = False
+        truncated = self._step_count >= self.cfg.max_episode_steps
+        info = self._build_info()
+        info["teleop_action"] = teleop_action.copy()
+        return observation, 0.0, terminated, truncated, info
 
     def _build_observation(self) -> dict[str, np.ndarray]:
         joint_positions = self._get_joint_positions()
@@ -170,6 +298,10 @@ class FR3MujocoEnv(gym.Env):
     ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         super().reset(seed=seed)
         self._step_count = 0
+        self._prev_enabled = False
+        self._reference_pose = None
+        self._last_command_pose = None
+        self._target_pose = None
         target_joint_positions = self._initial_joint_positions
         if options and "joint_positions" in options:
             target_joint_positions = np.clip(
@@ -187,6 +319,9 @@ class FR3MujocoEnv(gym.Env):
             self._joint_upper,
         )
         self._set_joint_state(target_joint_positions)
+        self._last_command_pose = self._tcp_pose.copy()
+        self._reference_pose = None
+        self._prev_enabled = False
         self._step_count += 1
         observation = self._build_observation()
         terminated = False
@@ -195,12 +330,14 @@ class FR3MujocoEnv(gym.Env):
 
     def _build_info(self) -> dict[str, Any]:
         joint_positions = self._get_joint_positions()
-        ee_pose = np.asarray(self._kinematics.forward_kinematics(joint_positions), dtype=np.float64)
-        return {
+        ee_pose = self._current_tcp_pose()
+        info = {
             "joint_positions": joint_positions,
             "ee_pose": ee_pose,
             "target_frame_name": self.cfg.target_frame_name,
         }
+        info.update(self._build_visualization_info())
+        return info
 
     def render(self):
         # The first implementation step stays headless. Viewer integration will

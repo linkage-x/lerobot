@@ -43,10 +43,10 @@ the next real-hardware smoke test.
 
 ### P2: Teleop Path Validation
 
-- [ ] Add target/TCP visualization markers consistent with the HIROL MuJoCo
+- [x] Add target/TCP visualization markers consistent with the HIROL MuJoCo
       workflow.
-- [ ] Bridge the current teleop target semantics into the local sim path.
-- [ ] Validate `enabled` transitions, workspace clipping, and first-frame hold
+- [x] Bridge the current teleop target semantics into the local sim path.
+- [x] Validate `enabled` transitions, workspace clipping, and first-frame hold
       behavior without touching hardware.
 - [ ] Add regression checks for FK/IK consistency and target-frame alignment.
 
@@ -95,6 +95,8 @@ Validated on March 10, 2026 in the dedicated `lerobot-fr3-sim` GPU container:
 - `MUJOCO_GL=egl` successfully created a `mujoco.GLContext`
 - `scripts/fr3_mujoco_env_smoke.py` loaded the FR3/Pika model and completed
   reset plus three zero-action steps
+- the same smoke entrypoint completed one relative-target teleop probe and
+  returned aligned target/TCP marker poses
 
 Current non-blocking warnings:
 

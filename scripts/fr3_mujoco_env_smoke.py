@@ -17,6 +17,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--async-envs", action="store_true")
     parser.add_argument(
+        "--skip-teleop-probe",
+        action="store_true",
+        help="Skip a single relative-target teleop probe after the zero-action rollout.",
+    )
+    parser.add_argument(
         "--skip-egl-probe",
         action="store_true",
         help="Skip creating a MuJoCo EGL context before environment startup.",
@@ -74,6 +79,35 @@ def main() -> int:
                     }
                 )
             )
+        if not args.skip_teleop_probe and not args.async_envs and args.n_envs == 1:
+            observation, reward, terminated, truncated, info = env.envs[0].step_teleop_action(
+                {
+                    "enabled": True,
+                    "target_x": 0.002,
+                    "target_y": 0.0,
+                    "target_z": 0.0,
+                    "target_wx": 0.0,
+                    "target_wy": 0.0,
+                    "target_wz": 0.0,
+                    "gripper": 1.0,
+                }
+            )
+            print(
+                pformat(
+                    {
+                        "teleop_probe": "READY",
+                        "target_marker_name": info["target_marker_name"],
+                        "tcp_marker_name": info["tcp_marker_name"],
+                        "target_pose_7d": np.asarray(info["target_pose_7d"]).round(6).tolist(),
+                        "tcp_pose_7d": np.asarray(info["tcp_pose_7d"]).round(6).tolist(),
+                        "reward": reward,
+                        "terminated": terminated,
+                        "truncated": truncated,
+                    }
+                )
+            )
+        elif not args.skip_teleop_probe:
+            print("teleop_probe=SKIPPED (requires SyncVectorEnv with n_envs=1)")
         return 0
     finally:
         env.close()
