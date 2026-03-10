@@ -39,6 +39,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libusb-1.0-0-dev speech-dispatcher libgeos-dev portaudio19-dev \
     cmake pkg-config ninja-build libeigen3-dev libpoco-dev libhidapi-dev \
     libudev-dev libx11-dev freeglut3-dev libglu1-mesa-dev libssl-dev \
+    libboost-filesystem-dev libboost-system-dev libboost-test-dev \
+    libboost-serialization-dev liburdfdom-dev \
     && curl -LsSf https://astral.sh/uv/install.sh | sh \
     && mv /root/.local/bin/uv /usr/local/bin/uv \
     && useradd --create-home --shell /bin/bash user_lerobot \
@@ -80,29 +82,42 @@ RUN uv pip install --no-cache ".[all]"
 
 USER root
 
-RUN export CMEEL_PREFIX="/lerobot/.venv/lib/python${PYTHON_VERSION}/site-packages/cmeel.prefix" \
-    && test -d "${CMEEL_PREFIX}" \
-    && git clone --recursive --depth 1 --branch "${LIBFRANKA_REF}" https://github.com/frankarobotics/libfranka.git /tmp/libfranka \
+RUN export CMEEL_PREFIX="$(find /lerobot/.venv/lib -path '*/site-packages/cmeel.prefix' -type d | head -n 1)" \
+    && test -n "${CMEEL_PREFIX}" \
+    && find "${CMEEL_PREFIX}" -path '*/pinocchioConfig.cmake' -print -quit | grep -q . \
+    && git clone --recursive --depth 1 --branch "${LIBFRANKA_REF}" https://github.com/frankarobotics/libfranka.git /tmp/libfranka
+
+RUN export CMEEL_PREFIX="$(find /lerobot/.venv/lib -path '*/site-packages/cmeel.prefix' -type d | head -n 1)" \
+    && test -n "${CMEEL_PREFIX}" \
     && cd /tmp/libfranka \
-    && cmake -S . -B build \
+    && /usr/bin/cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTS=OFF \
         -DBUILD_EXAMPLES=OFF \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DPython3_EXECUTABLE=/lerobot/.venv/bin/python \
+        -DPython_EXECUTABLE=/lerobot/.venv/bin/python \
         -DCMAKE_PREFIX_PATH="${CMEEL_PREFIX};/usr/local" \
-    && cmake --build build -j"$(nproc)" \
-    && cmake --install build \
+    && test -f /tmp/libfranka/build/CMakeCache.txt
+
+RUN cd /tmp/libfranka \
+    && /usr/bin/cmake --build build -j"$(nproc)" \
+    && /usr/bin/cmake --install build \
+    && /usr/bin/cmake --install build/_deps/fmt-build --prefix /usr/local \
     && ldconfig \
     && test -f /usr/local/lib/libfranka.so \
+    && find /usr/local \( -path '*/fmt-config.cmake' -o -path '*/fmtConfig.cmake' \) -print -quit | grep -q . \
     && rm -rf /tmp/libfranka
 
 USER user_lerobot
 
 RUN uv pip install --no-cache pyspacemouse "agx-pypika==${AGX_PYPIKA_VERSION}" --no-deps \
+    && export CMEEL_PREFIX="$(find /lerobot/.venv/lib -path '*/site-packages/cmeel.prefix' -type d | head -n 1)" \
+    && test -n "${CMEEL_PREFIX}" \
     && git clone --depth 1 --branch "${PANDA_PY_REF}" "${PANDA_PY_REPO}" /tmp/panda-py \
-    && CMAKE_PREFIX_PATH="/lerobot/.venv/lib/python${PYTHON_VERSION}/site-packages/cmeel.prefix;/usr/local" \
+    && CMAKE_PREFIX_PATH="${CMEEL_PREFIX};/usr/local" \
        LD_LIBRARY_PATH=/usr/local/lib \
-       pip install --no-cache-dir /tmp/panda-py \
+       uv pip install --python /lerobot/.venv/bin/python --no-cache /tmp/panda-py \
     && rm -rf /tmp/panda-py \
     && python -c "import placo; print('placo_ok')" \
     && python -c "import panda_py; print('panda_py_ok')" \

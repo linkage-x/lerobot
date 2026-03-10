@@ -57,12 +57,25 @@ The first real Docker build exposed an important native dependency detail:
 
 This means `libfranka` cannot simply be built first in a blank image layer.
 
-The current Dockerfiles were therefore reordered to:
+The repository's `.[all]` extra does not declare `pin` directly, but the real
+Docker build showed that `pin` and the related `cmeel` package tree are pulled
+in transitively. That matters because the wheel install provides a usable
+`pinocchioConfig.cmake` under the virtualenv's `cmeel.prefix` directory.
+
+An attempted switch to upstream source installation of `pinocchio` failed during
+configuration because it also required additional CMake packages such as
+`urdfdom_headers`. For the current repository layout, that path adds complexity
+without solving a real gap.
+
+The current Dockerfiles therefore keep `uv pip install ".[all]"` first and then
+build `libfranka` against the `cmeel.prefix` tree created by the Python
+dependencies.
+
+The current ordering is:
 
 1. create the Python environment
 2. install `lerobot` Python dependencies with `uv pip install ".[all]"`
-3. reuse the `cmeel.prefix` tree created by the installed robotics packages as a
-   `CMAKE_PREFIX_PATH`
+3. verify that `pinocchioConfig.cmake` exists in the virtualenv `cmeel.prefix`
 4. build and install `libfranka`
 5. install `panda_py`, `agx-pypika`, and `pyspacemouse`
 6. run import smoke checks during image build
@@ -75,6 +88,8 @@ repository setup.
 Both Dockerfiles now include:
 
 - extra system packages needed for FR3 native builds
+- extra URDF DOM development packages so `pinocchio`'s CMake config can resolve
+  `urdfdom_headers`
 - `libfranka` source build
 - `panda_py` installation from the specified git repository
 - `agx-pypika` installation for `pika.gripper`
@@ -115,7 +130,17 @@ What is known:
 - the previous image lacked `panda_py`, `pika.gripper`, and `pyspacemouse`
 - a real Docker build reproduced a native build failure in `libfranka`
 - that failure identified a required CMake dependency on `pinocchio`
-- the Dockerfiles were updated to address that failure by reordering the build
+- a later Docker build showed that `pin` is pulled transitively by `.[all]`
+- an attempted upstream `pinocchio` source build failed on missing
+  `urdfdom_headers` CMake packages
+- the Dockerfiles were updated to consume the virtualenv `cmeel.prefix` tree
+  directly for `libfranka` and `panda_py`
+- `libfranka` CMake configuration must also be pointed at the venv Python
+  executable so `eigenpy` can detect the installed `numpy`
+- `libfranka` must be configured with the system CMake binary rather than the
+  newer venv `cmake` package to avoid `common/` compatibility failures
+- the fetched `fmt` dependency from the `libfranka` build must also be installed
+  to `/usr/local` so downstream `panda_py` can satisfy `FrankaConfig.cmake`
 
 What is not yet confirmed:
 
