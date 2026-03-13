@@ -36,6 +36,8 @@ class ArmDriver(Protocol):
 
     def set_joint_positions(self, joint_positions: np.ndarray) -> None: ...
 
+    def move_to_start(self) -> None: ...
+
 
 class GripperDriver(Protocol):
     def connect(self) -> None: ...
@@ -87,6 +89,11 @@ class PandaPyArmDriver:
 
     def connect(self) -> None:
         self._robot = self._panda_cls(self.robot_ip)
+        self._start_controller()
+
+    def _start_controller(self) -> None:
+        if self._robot is None:
+            raise RuntimeError("Arm backend is not connected.")
         self._controller = self._controllers.JointPosition()
         if self.damping is not None:
             self._controller.set_damping(self.damping)
@@ -96,11 +103,15 @@ class PandaPyArmDriver:
             self._controller.set_filter(self.filter_coeff)
         self._robot.start_controller(self._controller)
 
+    def _stop_controller(self) -> None:
+        if self._robot is not None and self._controller is not None:
+            self._robot.stop_controller()
+            self._controller = None
+
     def disconnect(self) -> None:
         if self._robot is not None:
-            self._robot.stop_controller()
+            self._stop_controller()
             self._robot = None
-            self._controller = None
 
     def get_joint_positions(self) -> np.ndarray:
         if self._robot is None:
@@ -121,6 +132,18 @@ class PandaPyArmDriver:
         if self._controller is None:
             raise RuntimeError("Arm backend is not connected.")
         self._controller.set_control(np.asarray(joint_positions, dtype=np.float64))
+
+    def move_to_start(self) -> None:
+        if self._robot is None:
+            raise RuntimeError("Arm backend is not connected.")
+        controller_was_running = self._controller is not None
+        if controller_was_running:
+            self._stop_controller()
+        try:
+            self._robot.move_to_start()
+        finally:
+            if controller_was_running:
+                self._start_controller()
 
 
 @dataclass

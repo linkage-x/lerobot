@@ -302,6 +302,12 @@ class FrankaResearch3(Robot):
     def configure(self) -> None:
         pass
 
+    def _reset_teleop_state(self) -> None:
+        self._reference_pose = None
+        self._last_command_pose = None
+        self._hold_joint_target = None
+        self._prev_enabled = False
+
     def _read_joint_positions(self) -> np.ndarray:
         if self._arm is None:
             raise RuntimeError("Arm backend is not connected.")
@@ -344,6 +350,30 @@ class FrankaResearch3(Robot):
         for camera_name, camera in self.cameras.items():
             observation[camera_name] = camera.read_latest()
         return observation
+
+    @check_if_not_connected
+    def move_to_start(self) -> None:
+        self._raise_if_otg_failed()
+        if self._arm is None:
+            raise RuntimeError("Arm backend is not connected.")
+        move_to_start = getattr(self._arm, "move_to_start", None)
+        if not callable(move_to_start):
+            raise RuntimeError("FR3 arm backend does not support move_to_start().")
+
+        otg_enabled = self._otg is not None
+        fallback_joint_positions_rad = self._read_joint_positions()
+        if otg_enabled:
+            self._stop_otg_loop()
+
+        moved_joint_positions_rad = fallback_joint_positions_rad
+        try:
+            move_to_start()
+            moved_joint_positions_rad = self._read_joint_positions()
+        finally:
+            self._reset_teleop_state()
+            if otg_enabled:
+                self._otg.reset(moved_joint_positions_rad)
+                self._start_otg_loop(moved_joint_positions_rad)
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
@@ -451,8 +481,5 @@ class FrankaResearch3(Robot):
             self._otg = None
             self._is_connected = False
             self._gripper_is_mock = False
-            self._reference_pose = None
-            self._last_command_pose = None
-            self._hold_joint_target = None
-            self._prev_enabled = False
+            self._reset_teleop_state()
             self._otg_error = None

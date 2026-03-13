@@ -31,6 +31,7 @@ class DummyArmDriver:
         self.connected = False
         self.joint_positions = np.array([0.1, 0.2, 0.3, -1.0, 0.5, 1.2, -0.7], dtype=np.float64)
         self.set_joint_positions_calls: list[np.ndarray] = []
+        self.move_to_start_calls = 0
 
     def connect(self) -> None:
         self.connected = True
@@ -46,6 +47,14 @@ class DummyArmDriver:
 
     def set_joint_positions(self, joint_positions: np.ndarray) -> None:
         self.set_joint_positions_calls.append(np.asarray(joint_positions, dtype=np.float64))
+
+    def move_to_start(self) -> None:
+        self.move_to_start_calls += 1
+        self.joint_positions = np.array([0.0, -0.5, 0.0, -2.2, 0.0, 1.8, 0.7], dtype=np.float64)
+
+
+class NoMoveToStartArmDriver(DummyArmDriver):
+    move_to_start = None
 
 
 class ReportingArmDriver(DummyArmDriver):
@@ -157,6 +166,46 @@ def test_connect_disconnect(robot):
     assert len(DummyOTGDriver.instances[-1].reset_calls) == 1
     robot.disconnect()
     assert not robot.is_connected
+
+
+def test_move_to_start_restarts_otg_and_clears_teleop_state(robot):
+    robot.connect()
+    robot._reference_pose = np.eye(4, dtype=np.float64)
+    robot._last_command_pose = np.eye(4, dtype=np.float64)
+    robot._hold_joint_target = np.ones(7, dtype=np.float64)
+    robot._prev_enabled = True
+
+    robot.move_to_start()
+
+    assert robot._arm.move_to_start_calls == 1
+    assert len(DummyOTGDriver.instances[-1].reset_calls) == 2
+    assert np.allclose(
+        DummyOTGDriver.instances[-1].reset_calls[-1],
+        np.array([0.0, -0.5, 0.0, -2.2, 0.0, 1.8, 0.7], dtype=np.float64),
+    )
+    assert robot._reference_pose is None
+    assert robot._last_command_pose is None
+    assert robot._hold_joint_target is None
+    assert robot._prev_enabled is False
+
+
+def test_move_to_start_raises_when_backend_does_not_support_it(monkeypatch):
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", NoMoveToStartArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+        )
+    )
+
+    robot.connect()
+    with pytest.raises(RuntimeError, match="does not support move_to_start"):
+        robot.move_to_start()
+    robot.disconnect()
 
 
 def test_get_observation(robot):

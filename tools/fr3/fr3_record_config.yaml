@@ -1,0 +1,62 @@
+robot:
+  type: franka_research3
+  robot_ip: 192.168.1.206
+  gripper_port: /dev/ttyUSB80
+  allow_mock_gripper: false
+  urdf_path: /lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.urdf
+  target_frame_name: pika_gripper_ee
+  max_target_delta_pos: [0.001, 0.001, 0.001]
+  max_target_delta_rot: [0.01, 0.01, 0.01]
+  cameras:
+    ee:
+      type: intelrealsense
+      serial_number_or_name: "315122271876"
+      width: 640
+      height: 480
+      fps: 30
+    side:
+      type: intelrealsense
+      serial_number_or_name: "243122071795"
+      width: 640
+      height: 480
+      fps: 30
+    front:
+      type: intelrealsense
+      serial_number_or_name: "244222075350"
+      width: 640
+      height: 480
+      fps: 30
+
+teleop:
+  type: spacemouse
+  device_id: 0
+  tool_mode: incremental
+  incremental_step: 0.05
+  move_time: 0.02
+  enable_rotation: true
+  translation_scale: 0.000615
+  rotation_scale: 0.000648
+  scale_wx: 0.0
+  scale_wy: 0.0
+
+dataset:
+  repo_id: hph/fr3_pick_place_v1
+  single_task: Pick and place
+  root: /lerobot/outputs/datasets/fr3_pick_place_v1
+  fps: 30
+  num_episodes: 20
+  episode_time_s: 45
+  reset_time_s: 0
+  video: true
+  streaming_encoding: true
+  vcodec: h264
+  encoder_threads: 2
+  push_to_hub: false
+
+control_fps: 200
+auto_move_to_start_after_episode: true
+move_to_start_after_last_episode: true
+confirm_next_episode_after_reset: true
+display_data: false
+play_sounds: false
+resume: false

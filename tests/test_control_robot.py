@@ -16,8 +16,16 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
-from lerobot.scripts.lerobot_record import DatasetRecordConfig, RecordConfig, record
+from lerobot.scripts.lerobot_record import (
+    DatasetRecordConfig,
+    RecordConfig,
+    _confirm_next_episode,
+    _move_robot_to_start,
+    record,
+)
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
 from tests.fixtures.constants import DUMMY_REPO_ID
@@ -121,3 +129,65 @@ def test_record_and_replay(tmp_path):
         mock_get_safe_version.return_value = "v3.0"
         mock_snapshot_download.return_value = str(tmp_path / "record_and_replay")
         replay(replay_cfg)
+
+
+def test_record_higher_control_fps_keeps_dataset_fps(tmp_path):
+    robot_cfg = MockRobotConfig()
+    teleop_cfg = MockTeleopConfig()
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        root=tmp_path / "record_high_control_fps",
+        num_episodes=1,
+        episode_time_s=0.1,
+        reset_time_s=0,
+        push_to_hub=False,
+    )
+    cfg = RecordConfig(
+        robot=robot_cfg,
+        dataset=dataset_cfg,
+        control_fps=200,
+        teleop=teleop_cfg,
+        play_sounds=False,
+    )
+
+    dataset = record(cfg)
+
+    assert dataset.fps == 30
+    assert dataset.meta.total_episodes == dataset.num_episodes == 1
+    assert dataset.meta.total_frames == dataset.num_frames == 3
+
+
+class StartableRobot:
+    name = "startable"
+
+    def __init__(self):
+        self.calls = 0
+
+    def move_to_start(self):
+        self.calls += 1
+
+
+def test_move_robot_to_start_calls_robot_method():
+    robot = StartableRobot()
+
+    _move_robot_to_start(robot, play_sounds=False)
+
+    assert robot.calls == 1
+
+
+def test_move_robot_to_start_raises_for_unsupported_robot():
+    with pytest.raises(RuntimeError, match="does not support move_to_start"):
+        _move_robot_to_start(object(), play_sounds=False)
+
+
+def test_confirm_next_episode_accepts_yes(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda prompt: "")
+
+    assert _confirm_next_episode(play_sounds=False) is True
+
+
+def test_confirm_next_episode_accepts_no(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+
+    assert _confirm_next_episode(play_sounds=False) is False

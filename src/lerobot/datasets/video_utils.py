@@ -51,6 +51,13 @@ HW_ENCODERS = [
 VALID_VIDEO_CODECS = {"h264", "hevc", "libsvtav1", "auto"} | set(HW_ENCODERS)
 
 
+def _quiet_av_logs(level: int = av.logging.ERROR) -> None:
+    logging.getLogger("libav").setLevel(level)
+    av.logging.set_level(level)
+    av.logging.set_libav_level(level)
+    av.logging.set_skip_repeated(True)
+
+
 def _get_codec_options(
     vcodec: str,
     g: int | None = 2,
@@ -453,7 +460,7 @@ def encode_video_frames(
     # Set logging level
     if log_level is not None:
         # "While less efficient, it is generally preferable to modify logging with Python's logging"
-        logging.getLogger("libav").setLevel(log_level)
+        _quiet_av_logs(log_level)
 
     # Create and open output file (overwrite by default)
     with av.open(str(video_path), "w") as output:
@@ -612,7 +619,7 @@ class _CameraEncoderThread(threading.Thread):
         frame_count = 0
 
         try:
-            logging.getLogger("libav").setLevel(av.logging.WARNING)
+            _quiet_av_logs()
 
             while True:
                 try:
@@ -943,7 +950,7 @@ with warnings.catch_warnings():
 
 def get_audio_info(video_path: Path | str) -> dict:
     # Set logging level
-    logging.getLogger("libav").setLevel(av.logging.WARNING)
+    _quiet_av_logs()
 
     # Getting audio stream information
     audio_info = {}
@@ -975,7 +982,7 @@ def get_audio_info(video_path: Path | str) -> dict:
 
 def get_video_info(video_path: Path | str) -> dict:
     # Set logging level
-    logging.getLogger("libav").setLevel(av.logging.WARNING)
+    _quiet_av_logs()
 
     # Getting video stream information
     video_info = {}

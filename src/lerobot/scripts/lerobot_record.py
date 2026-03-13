@@ -212,6 +212,14 @@ class DatasetRecordConfig:
 class RecordConfig:
     robot: RobotConfig
     dataset: DatasetRecordConfig
+    # Control-loop frequency for robot and teleop updates. Defaults to dataset.fps when unset.
+    control_fps: int | None = None
+    # Automatically move the robot to its start pose after each recorded episode when supported.
+    auto_move_to_start_after_episode: bool = False
+    # Also move the robot to its start pose after the final recorded episode.
+    move_to_start_after_last_episode: bool = False
+    # Ask for terminal confirmation before starting the next episode after the reset window.
+    confirm_next_episode_after_reset: bool = False
     # Whether to control the robot with a teleoperator
     teleop: TeleoperatorConfig | None = None
     # Whether to control the robot with a policy
@@ -241,6 +249,14 @@ class RecordConfig:
 
         if self.teleop is None and self.policy is None:
             raise ValueError("Choose a policy, a teleoperator or both to control the robot")
+        if self.control_fps is not None and self.control_fps < self.dataset.fps:
+            raise ValueError(
+                f"control_fps must be greater than or equal to dataset.fps ({self.control_fps} < {self.dataset.fps})."
+            )
+        if self.move_to_start_after_last_episode and not self.auto_move_to_start_after_episode:
+            raise ValueError(
+                "move_to_start_after_last_episode requires auto_move_to_start_after_episode to be enabled."
+            )
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -302,9 +318,6 @@ def record_loop(
     display_data: bool = False,
     display_compressed_images: bool = False,
 ):
-    if dataset is not None and dataset.fps != fps:
-        raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
-
     teleop_arm = teleop_keyboard = None
     if isinstance(teleop, list):
         teleop_keyboard = next((t for t in teleop if isinstance(t, KeyboardTeleop)), None)
@@ -339,6 +352,8 @@ def record_loop(
     no_action_count = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
+    dataset_frame_period_s = None if dataset is None else 1 / dataset.fps
+    next_dataset_frame_t = 0.0
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
@@ -409,11 +424,16 @@ def record_loop(
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
 
-        # Write to dataset
-        if dataset is not None:
+        loop_elapsed_s = time.perf_counter() - start_episode_t
+
+        # Write to dataset at the dataset sampling rate while keeping the control loop independent.
+        if dataset is not None and loop_elapsed_s + 1e-9 >= next_dataset_frame_t:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
+            if dataset_frame_period_s is not None:
+                while next_dataset_frame_t <= loop_elapsed_s + 1e-9:
+                    next_dataset_frame_t += dataset_frame_period_s
 
         if display_data:
             log_rerun_data(
@@ -425,12 +445,39 @@ def record_loop(
         sleep_time_s: float = 1 / fps - dt_s
         if sleep_time_s < 0:
             logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
+                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target control FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
             )
 
         precise_sleep(max(sleep_time_s, 0.0))
 
         timestamp = time.perf_counter() - start_episode_t
+
+
+def _move_robot_to_start(robot: Robot, play_sounds: bool) -> None:
+    move_to_start = getattr(robot, "move_to_start", None)
+    if not callable(move_to_start):
+        robot_name = getattr(robot, "name", type(robot).__name__)
+        raise RuntimeError(f"Robot '{robot_name}' does not support move_to_start().")
+    logging.info("Moving robot to start pose.")
+    log_say("Moving robot to start", play_sounds)
+    move_to_start()
+
+
+def _confirm_next_episode(play_sounds: bool) -> bool:
+    logging.info("Waiting for terminal confirmation before starting the next episode.")
+    log_say("Confirm next episode", play_sounds)
+    while True:
+        try:
+            response = input("Continue to next episode? [Y/n]: ").strip().lower()
+        except EOFError:
+            logging.warning("Terminal input closed while waiting for next-episode confirmation; stopping recording.")
+            return False
+
+        if response in ("", "y", "yes"):
+            return True
+        if response in ("n", "no"):
+            return False
+        print("Please answer 'Y' or 'n'.")
 
 
 @parser.wrap()
@@ -467,6 +514,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     dataset = None
     listener = None
+    control_fps = cfg.control_fps or cfg.dataset.fps
 
     try:
         if cfg.resume:
@@ -538,7 +586,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 record_loop(
                     robot=robot,
                     events=events,
-                    fps=cfg.dataset.fps,
+                    fps=control_fps,
                     teleop_action_processor=teleop_action_processor,
                     robot_action_processor=robot_action_processor,
                     robot_observation_processor=robot_observation_processor,
@@ -553,26 +601,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_compressed_images=display_compressed_images,
                 )
 
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
-                    log_say("Reset the environment", cfg.play_sounds)
-
-                    record_loop(
-                        robot=robot,
-                        events=events,
-                        fps=cfg.dataset.fps,
-                        teleop_action_processor=teleop_action_processor,
-                        robot_action_processor=robot_action_processor,
-                        robot_observation_processor=robot_observation_processor,
-                        teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
-                        single_task=cfg.dataset.single_task,
-                        display_data=cfg.display_data,
-                    )
-
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)
                     events["rerecord_episode"] = False
@@ -582,6 +610,47 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
                 dataset.save_episode()
                 recorded_episodes += 1
+
+                should_move_to_start = (
+                    cfg.auto_move_to_start_after_episode
+                    and not events["stop_recording"]
+                    and (
+                        recorded_episodes < cfg.dataset.num_episodes
+                        or cfg.move_to_start_after_last_episode
+                    )
+                )
+                if should_move_to_start:
+                    _move_robot_to_start(robot, cfg.play_sounds)
+
+                should_run_reset_window = (
+                    not cfg.confirm_next_episode_after_reset
+                    and not events["stop_recording"]
+                    and recorded_episodes < cfg.dataset.num_episodes
+                    and cfg.dataset.reset_time_s > 0
+                )
+                if should_run_reset_window:
+                    log_say("Reset the environment", cfg.play_sounds)
+
+                    record_loop(
+                        robot=robot,
+                        events=events,
+                        fps=control_fps,
+                        teleop_action_processor=teleop_action_processor,
+                        robot_action_processor=robot_action_processor,
+                        robot_observation_processor=robot_observation_processor,
+                        teleop=teleop,
+                        control_time_s=cfg.dataset.reset_time_s,
+                        single_task=cfg.dataset.single_task,
+                        display_data=cfg.display_data,
+                    )
+
+                should_confirm_next_episode = (
+                    cfg.confirm_next_episode_after_reset
+                    and not events["stop_recording"]
+                    and recorded_episodes < cfg.dataset.num_episodes
+                )
+                if should_confirm_next_episode and not _confirm_next_episode(cfg.play_sounds):
+                    events["stop_recording"] = True
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 

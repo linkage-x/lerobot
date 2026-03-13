@@ -18,7 +18,6 @@
 
 
 import logging
-import traceback
 from contextlib import nullcontext
 from copy import copy
 from functools import cache
@@ -53,14 +52,10 @@ def is_headless():
 
         return False
     except Exception:
-        print(
-            "Error trying to import pynput. Switching to headless mode. "
-            "As a result, the video stream from the cameras won't be shown, "
-            "and you won't be able to change the control flow with keyboards. "
-            "For more info, see traceback below.\n"
+        logging.warning(
+            "Failed to initialize pynput; switching to headless mode. "
+            "Camera display and keyboard control flow will be unavailable."
         )
-        traceback.print_exc()
-        print()
         return True
 
 

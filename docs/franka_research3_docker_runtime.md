@@ -190,3 +190,47 @@ The next concrete milestone is:
   - `pyspacemouse.list_devices()`
   - device visibility under `/dev/bus/usb`, `/dev/input`, and serial nodes
   - FR3 and gripper connectivity from inside the compose environment
+
+## SSH Dataset Visualization
+
+For dataset inspection over SSH, the current preferred path is not to rely on
+the remote machine's X display.
+
+The working path is:
+
+1. run `lerobot_dataset_viz` on the target machine in distant mode
+2. connect from the local machine with a local `rerun` viewer
+
+Remote command:
+
+```bash
+PYTHONPATH=src .venv-codex/bin/python -m lerobot.scripts.lerobot_dataset_viz \
+  --repo-id hph/fr3_pick_place_v1 \
+  --root /home/hph/Code/lerobot/outputs/datasets/fr3_pick_place_v1_20260313_153947 \
+  --episode-index 0 \
+  --mode distant \
+  --grpc-port 9876
+```
+
+Local command:
+
+```bash
+rerun --connect rerun+http://192.168.1.200:9876/proxy
+```
+
+This is currently more reliable than exporting `DISPLAY` over SSH and trying to
+spawn a remote viewer process. In the observed setup, the remote viewer failed
+because the SSH shell did not have valid X authorization, while distant-mode
+streaming worked.
+
+### Dataset Ownership Note
+
+If the dataset was recorded through `sudo` or a root-owned Docker invocation,
+the recorded mp4 files may end up unreadable by the normal user, for example as
+`root:root` with mode `600`.
+
+In that case, fix ownership before running visualization:
+
+```bash
+sudo chown -R hph:hph /home/hph/Code/lerobot/outputs/datasets/fr3_pick_place_v1_20260313_153947
+```

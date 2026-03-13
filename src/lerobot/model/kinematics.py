@@ -12,7 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
+import os
+import sys
+
 import numpy as np
+
+
+@contextmanager
+def _suppress_native_output():
+    """Temporarily silence native stdout/stderr emitted by kinematics backends."""
+    saved_fds: list[tuple[int, int]] = []
+    devnull_fd = None
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        for fd in (1, 2):
+            saved_fds.append((fd, os.dup(fd)))
+            os.dup2(devnull_fd, fd)
+        yield
+    finally:
+        for fd, saved_fd in reversed(saved_fds):
+            os.dup2(saved_fd, fd)
+            os.close(saved_fd)
+        if devnull_fd is not None:
+            os.close(devnull_fd)
 
 
 class RobotKinematics:
@@ -40,7 +65,8 @@ class RobotKinematics:
                 "Please install the optional dependencies of `kinematics` in the package."
             ) from e
 
-        self.robot = placo.RobotWrapper(urdf_path)
+        with _suppress_native_output():
+            self.robot = placo.RobotWrapper(urdf_path)
         self.solver = placo.KinematicsSolver(self.robot)
         self.solver.mask_fbase(True)  # Fix the base
 
