@@ -17,7 +17,7 @@ The pure environment implementation lives in:
 
 Interactive local teleoperation entrypoint:
 
-- `scripts/fr3_mujoco_teleop.py`
+- `tools/fr3/fr3_mujoco_teleop.py`
 
 Recommended Docker service for local viewer + SpaceMouse teleop:
 

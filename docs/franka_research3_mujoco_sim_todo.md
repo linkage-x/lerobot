@@ -93,7 +93,7 @@ Validated on March 10, 2026 in the dedicated `lerobot-fr3-sim` GPU container:
 
 - `nvidia-smi -L` detected `NVIDIA GeForce RTX 4090 D`
 - `MUJOCO_GL=egl` successfully created a `mujoco.GLContext`
-- `scripts/fr3_mujoco_env_smoke.py` loaded the FR3/Pika model and completed
+- `tools/fr3/fr3_mujoco_env_smoke.py` loaded the FR3/Pika model and completed
   reset plus three zero-action steps
 - the same smoke entrypoint completed one relative-target teleop probe and
   returned aligned target/TCP marker poses
@@ -107,7 +107,7 @@ Current non-blocking warnings:
 
 ## Current Local Teleop Entry
 
-- `scripts/fr3_mujoco_teleop.py` runs SpaceMouse-driven FR3 MuJoCo teleop
+- `tools/fr3/fr3_mujoco_teleop.py` runs SpaceMouse-driven FR3 MuJoCo teleop
 - `src/lerobot/envs/fr3_mujoco_teleop.py` owns the target/TCP marker update
   helpers and headless teleop loop
 - `src/lerobot/envs/fr3_mujoco.py` now advances teleop targets through the same
@@ -126,11 +126,11 @@ repeatable replay-and-compare loop.
 
 Tooling is now in place:
 
-- `scripts/fr3_teleop_trace_replay.py` launches the replay in Docker for either
+- `tools/fr3/fr3_teleop_trace_replay.py` launches the replay in Docker for either
   `sim` or `hardware` mode
-- `scripts/fr3_teleop_trace_replay_runtime.py` runs the fixed profile and
+- `tools/fr3/fr3_teleop_trace_replay_runtime.py` runs the fixed profile and
   records TCP/joint traces inside the target runtime
-- `scripts/fr3_teleop_trace_compare.py` compares two trace bundles and reports
+- `tools/fr3/fr3_teleop_trace_compare.py` compares two trace bundles and reports
   residual `scale_x/y/z` correction multipliers
 - `src/lerobot/calibration/fr3_teleop.py` owns the shared
   fixed profile, trace schema, and comparison logic

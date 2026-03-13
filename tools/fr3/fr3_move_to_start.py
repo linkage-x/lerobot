@@ -37,7 +37,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--workspace",
         type=Path,
-        default=Path(__file__).resolve().parents[1],
+        default=Path(__file__).resolve().parents[2],
         help="Repository root that contains docker/docker-compose.yml.",
     )
     parser.add_argument(
@@ -57,7 +57,7 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         "cd /lerobot &&",
         "PYTHONPATH=/lerobot/src",
         "/lerobot/.venv/bin/python",
-        "scripts/fr3_move_to_start_runtime.py",
+        "tools/fr3/fr3_move_to_start_runtime.py",
         f"--robot-ip={args.robot_ip}",
     ]
     return [

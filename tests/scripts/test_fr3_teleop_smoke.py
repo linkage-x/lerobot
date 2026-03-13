@@ -19,7 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
-from scripts import fr3_teleop_smoke
+from tools.fr3 import fr3_teleop_smoke
 
 
 def test_build_docker_command_contains_default_smoke_settings(tmp_path: Path):

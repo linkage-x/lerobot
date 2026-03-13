@@ -24,7 +24,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--workspace",
         type=Path,
-        default=Path(__file__).resolve().parents[1],
+        default=Path(__file__).resolve().parents[2],
         help="Repository root mounted into the container.",
     )
     parser.add_argument(
@@ -68,7 +68,7 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         "cd /lerobot &&",
         "PYTHONPATH=/lerobot/src",
         "/lerobot/.venv/bin/python",
-        "scripts/fr3_teleop_trace_replay_runtime.py",
+        "tools/fr3/fr3_teleop_trace_replay_runtime.py",
         f"--mode={args.mode}",
         f"--trace-profile={args.trace_profile}",
         f"--output=/lerobot/{repo_relative_output.as_posix()}",

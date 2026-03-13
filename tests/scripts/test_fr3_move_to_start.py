@@ -19,7 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
-from scripts import fr3_move_to_start
+from tools.fr3 import fr3_move_to_start
 
 
 def test_build_docker_command_contains_expected_runtime_entrypoint(tmp_path: Path):
@@ -48,7 +48,7 @@ def test_build_docker_command_contains_expected_runtime_entrypoint(tmp_path: Pat
     assert "lerobot-internal" in command
     assert "cd /lerobot &&" in command_text
     assert "PYTHONPATH=/lerobot/src" in command_text
-    assert "scripts/fr3_move_to_start_runtime.py" in command_text
+    assert "tools/fr3/fr3_move_to_start_runtime.py" in command_text
     assert "--robot-ip=10.0.0.5" in command_text
 
 
@@ -58,7 +58,7 @@ def test_main_dry_run_prints_command(capsys):
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "docker compose" in captured.out
-    assert "scripts/fr3_move_to_start_runtime.py" in captured.out
+    assert "tools/fr3/fr3_move_to_start_runtime.py" in captured.out
     assert "lerobot-user" in captured.out
 
 

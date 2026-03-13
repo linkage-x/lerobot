@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
-from scripts import fr3_teleop_trace_replay
+from tools.fr3 import fr3_teleop_trace_replay
 
 
 def test_build_docker_command_defaults_to_sim_service(tmp_path: Path):
@@ -24,7 +24,7 @@ def test_build_docker_command_defaults_to_sim_service(tmp_path: Path):
     ]
     assert "lerobot-fr3-sim" in command
     assert "--mode=sim" in command_text
-    assert "scripts/fr3_teleop_trace_replay_runtime.py" in command_text
+    assert "tools/fr3/fr3_teleop_trace_replay_runtime.py" in command_text
     assert "--output=/lerobot/outputs/fr3_traces/sim_trace.json" in command_text
 
 

@@ -27,7 +27,7 @@ DEFAULT_GRIPPER_PORT = "/dev/ttyUSB0"
 DEFAULT_TRANSLATION_MAX_TARGET_DELTA_ROT = (0.0, 0.0, 0.0)
 DEFAULT_COMBINED_MAX_TARGET_DELTA_ROT = (0.01, 0.01, 0.01)
 DEFAULT_URDF_PATH = (
-    Path(__file__).resolve().parents[1]
+    Path(__file__).resolve().parents[2]
     / "src"
     / "lerobot"
     / "robots"
