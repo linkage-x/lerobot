@@ -328,6 +328,22 @@ class FrankaResearch3(Robot):
             raise RuntimeError("Robot is not connected.")
         return np.asarray(self._kinematics.forward_kinematics(joint_positions_rad), dtype=np.float64)
 
+    def _make_pose_from_absolute_action(self, action: RobotAction) -> np.ndarray:
+        desired_pose = np.eye(4, dtype=np.float64)
+        desired_pose[:3, 3] = np.array(
+            [float(action["ee.x"]), float(action["ee.y"]), float(action["ee.z"])],
+            dtype=np.float64,
+        )
+        desired_pose[:3, :3] = Rotation.from_rotvec(
+            [float(action["ee.wx"]), float(action["ee.wy"]), float(action["ee.wz"])]
+        ).as_matrix()
+        desired_pose[:3, 3] = np.clip(
+            desired_pose[:3, 3],
+            np.asarray(self.config.workspace_min, dtype=np.float64),
+            np.asarray(self.config.workspace_max, dtype=np.float64),
+        )
+        return desired_pose
+
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
         self._raise_if_otg_failed()
@@ -379,51 +395,57 @@ class FrankaResearch3(Robot):
     def send_action(self, action: RobotAction) -> RobotAction:
         self._raise_if_otg_failed()
         joint_positions_rad = self._read_joint_positions()
-        current_pose = self._compute_ee_pose(joint_positions_rad)
-
-        enabled = bool(action["enabled"])
         hold_current_joints = False
-        if enabled:
+        if all(key in action for key in ("ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz")):
+            desired_pose = self._make_pose_from_absolute_action(action)
+            enabled = True
             self._hold_joint_target = None
-            if not self._prev_enabled or self._reference_pose is None:
-                self._reference_pose = current_pose.copy()
-
-            delta_pos = np.array(
-                [float(action["target_x"]), float(action["target_y"]), float(action["target_z"])],
-                dtype=np.float64,
-            )
-            if self.config.max_target_delta_pos is not None:
-                delta_pos = np.clip(
-                    delta_pos,
-                    -np.asarray(self.config.max_target_delta_pos, dtype=np.float64),
-                    np.asarray(self.config.max_target_delta_pos, dtype=np.float64),
-                )
-            delta_rot = Rotation.from_rotvec(
-                [float(action["target_wx"]), float(action["target_wy"]), float(action["target_wz"])]
-            )
-            if self.config.max_target_delta_rot is not None:
-                clamped_delta_rot = np.clip(
-                    delta_rot.as_rotvec(),
-                    -np.asarray(self.config.max_target_delta_rot, dtype=np.float64),
-                    np.asarray(self.config.max_target_delta_rot, dtype=np.float64),
-                )
-                delta_rot = Rotation.from_rotvec(clamped_delta_rot)
-
-            desired_pose = np.eye(4, dtype=np.float64)
-            desired_pose[:3, :3] = self._reference_pose[:3, :3] @ delta_rot.as_matrix()
-            desired_pose[:3, 3] = self._reference_pose[:3, 3] + delta_pos
-            desired_pose[:3, 3] = np.clip(
-                desired_pose[:3, 3],
-                np.asarray(self.config.workspace_min, dtype=np.float64),
-                np.asarray(self.config.workspace_max, dtype=np.float64),
-            )
-            self._last_command_pose = desired_pose.copy()
+            self._reference_pose = None
+            self._prev_enabled = False
         else:
-            if self._hold_joint_target is None:
-                self._hold_joint_target = self._get_release_hold_joint_target(joint_positions_rad)
-            target_joints_rad = self._hold_joint_target.copy()
-            desired_pose = self._compute_ee_pose(target_joints_rad)
-            hold_current_joints = True
+            current_pose = self._compute_ee_pose(joint_positions_rad)
+            enabled = bool(action["enabled"])
+            if enabled:
+                self._hold_joint_target = None
+                if not self._prev_enabled or self._reference_pose is None:
+                    self._reference_pose = current_pose.copy()
+
+                delta_pos = np.array(
+                    [float(action["target_x"]), float(action["target_y"]), float(action["target_z"])],
+                    dtype=np.float64,
+                )
+                if self.config.max_target_delta_pos is not None:
+                    delta_pos = np.clip(
+                        delta_pos,
+                        -np.asarray(self.config.max_target_delta_pos, dtype=np.float64),
+                        np.asarray(self.config.max_target_delta_pos, dtype=np.float64),
+                    )
+                delta_rot = Rotation.from_rotvec(
+                    [float(action["target_wx"]), float(action["target_wy"]), float(action["target_wz"])]
+                )
+                if self.config.max_target_delta_rot is not None:
+                    clamped_delta_rot = np.clip(
+                        delta_rot.as_rotvec(),
+                        -np.asarray(self.config.max_target_delta_rot, dtype=np.float64),
+                        np.asarray(self.config.max_target_delta_rot, dtype=np.float64),
+                    )
+                    delta_rot = Rotation.from_rotvec(clamped_delta_rot)
+
+                desired_pose = np.eye(4, dtype=np.float64)
+                desired_pose[:3, :3] = self._reference_pose[:3, :3] @ delta_rot.as_matrix()
+                desired_pose[:3, 3] = self._reference_pose[:3, 3] + delta_pos
+                desired_pose[:3, 3] = np.clip(
+                    desired_pose[:3, 3],
+                    np.asarray(self.config.workspace_min, dtype=np.float64),
+                    np.asarray(self.config.workspace_max, dtype=np.float64),
+                )
+                self._last_command_pose = desired_pose.copy()
+            else:
+                if self._hold_joint_target is None:
+                    self._hold_joint_target = self._get_release_hold_joint_target(joint_positions_rad)
+                target_joints_rad = self._hold_joint_target.copy()
+                desired_pose = self._compute_ee_pose(target_joints_rad)
+                hold_current_joints = True
 
         if hold_current_joints:
             target_joints_rad = np.asarray(target_joints_rad, dtype=np.float64).copy()
@@ -435,24 +457,38 @@ class FrankaResearch3(Robot):
         else:
             self._arm.set_joint_positions(target_joints_rad)
 
-        gripper_target = float(np.clip(action["gripper"], 0.0, 1.0))
+        gripper_key = "gripper.pos" if "gripper.pos" in action else "gripper"
+        gripper_target = float(np.clip(action[gripper_key], 0.0, 1.0))
         self._gripper.set_position(gripper_target)
 
         self._last_command_pose = desired_pose.copy()
-        if enabled:
-            self._reference_pose = desired_pose.copy()
-        else:
-            self._reference_pose = None
-        self._prev_enabled = enabled
+        if not all(key in action for key in ("ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz")):
+            if enabled:
+                self._hold_joint_target = None
+            if enabled:
+                self._reference_pose = desired_pose.copy()
+            else:
+                self._reference_pose = None
+            self._prev_enabled = enabled
+            return {
+                "enabled": enabled,
+                "target_x": float(action["target_x"]),
+                "target_y": float(action["target_y"]),
+                "target_z": float(action["target_z"]),
+                "target_wx": float(action["target_wx"]),
+                "target_wy": float(action["target_wy"]),
+                "target_wz": float(action["target_wz"]),
+                "gripper": gripper_target,
+            }
+
         return {
-            "enabled": enabled,
-            "target_x": float(action["target_x"]),
-            "target_y": float(action["target_y"]),
-            "target_z": float(action["target_z"]),
-            "target_wx": float(action["target_wx"]),
-            "target_wy": float(action["target_wy"]),
-            "target_wz": float(action["target_wz"]),
-            "gripper": gripper_target,
+            "ee.x": float(desired_pose[0, 3]),
+            "ee.y": float(desired_pose[1, 3]),
+            "ee.z": float(desired_pose[2, 3]),
+            "ee.wx": float(action["ee.wx"]),
+            "ee.wy": float(action["ee.wy"]),
+            "ee.wz": float(action["ee.wz"]),
+            "gripper.pos": gripper_target,
         }
 
     @check_if_not_connected

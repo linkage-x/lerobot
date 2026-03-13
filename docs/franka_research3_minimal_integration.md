@@ -26,7 +26,9 @@ The recommended minimal integration is:
 - Do not import or wrap HIROL `TeleoperationFactory`, `MotionFactory`, or
   `RobotFactory`.
 - Add one thin `Robot` adapter and one thin `Teleoperator` adapter.
-- Avoid custom processor wiring for the first cut.
+- Keep the runtime teleop path simple, but allow FR3-specific processors in the
+  default recording/training path so datasets are written directly in the final
+  `ee2ee` learning representation.
 
 This keeps the runtime model simple:
 
@@ -39,9 +41,10 @@ This keeps the runtime model simple:
 ## Why This Is the Smallest Viable Cut
 
 LeRobot's current teleoperation loop uses identity processors by default, so
-teleop output is forwarded directly to `robot.send_action()`. Because of that,
-the cheapest path is not to add new processor stages, but to make the
-teleoperator emit exactly the action structure the robot expects.
+the direct teleop path still forwards SpaceMouse delta commands directly to
+`robot.send_action()`. For FR3 recording and learning, the repository now adds a
+thin FR3-specific processor layer on top of that runtime so the default dataset
+contract is `ee2ee`, not mixed joint-plus-teleop state.
 
 Relevant files:
 

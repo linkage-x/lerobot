@@ -16,5 +16,11 @@
 
 from .config_franka_research3 import FrankaResearch3Config
 from .franka_research3 import FrankaResearch3
+from .processor_franka_research3 import DeltaActionToAbsoluteEEAction, KeepAbsoluteEEObservation
 
-__all__ = ["FrankaResearch3", "FrankaResearch3Config"]
+__all__ = [
+    "DeltaActionToAbsoluteEEAction",
+    "FrankaResearch3",
+    "FrankaResearch3Config",
+    "KeepAbsoluteEEObservation",
+]

@@ -23,7 +23,8 @@ from typing import Any
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
-from scipy.spatial.transform import Rotation
+
+from lerobot.utils.rotation import Rotation
 
 
 def _default_fr3_urdf_path() -> str:

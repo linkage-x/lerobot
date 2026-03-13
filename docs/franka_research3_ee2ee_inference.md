@@ -11,6 +11,11 @@ inference chain represented by:
 under the explicit assumption that the target policy path is `ee2ee`, not
 `q2cq`.
 
+The default FR3 recording path in this repository now matches that assumption:
+the Docker recording wrapper records absolute EE observation and absolute EE
+action targets directly into the dataset's standard `observation.state` and
+`action` vectors.
+
 ## Primary Decision
 
 For the first cut, the minimal migration should:
@@ -127,7 +132,7 @@ the observation adapter, not by changing the robot's canonical schema.
 
 ### Robot Canonical Action
 
-The robot should continue to accept the canonical Cartesian action contract:
+The low-level teleop runtime still accepts the native delta command contract:
 
 ```python
 {
@@ -142,8 +147,24 @@ The robot should continue to accept the canonical Cartesian action contract:
 }
 ```
 
-If a checkpoint outputs quaternion orientation, conversion should happen inside
-the action adapter before the command reaches the robot.
+For `ee2ee` checkpoints, the action adapter should instead emit absolute EE
+targets:
+
+```python
+{
+    "ee.x": float,
+    "ee.y": float,
+    "ee.z": float,
+    "ee.wx": float,
+    "ee.wy": float,
+    "ee.wz": float,
+    "gripper.pos": float,
+}
+```
+
+`franka_research3.send_action()` now accepts that absolute EE contract directly,
+so replay and inference can execute the same action layout that was recorded in
+the default FR3 dataset.
 
 ## Policy-Private Contracts
 

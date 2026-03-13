@@ -193,6 +193,16 @@ The next concrete milestone is:
 
 ## SSH Dataset Visualization
 
+The default FR3 recording wrapper now writes an `ee2ee`-style dataset:
+
+- `observation.state`: absolute EE pose + absolute gripper position
+- `action`: absolute EE target pose + absolute gripper target
+- camera streams remain under `observation.images.*`
+
+This means the default FR3 training path follows the existing LeRobot pattern:
+pick the final learning representation at record time instead of recording a
+multi-semantic canonical schema first.
+
 For dataset inspection over SSH, the current preferred path is not to rely on
 the remote machine's X display.
 
@@ -205,8 +215,8 @@ Remote command:
 
 ```bash
 PYTHONPATH=src .venv-codex/bin/python -m lerobot.scripts.lerobot_dataset_viz \
-  --repo-id hph/fr3_pick_place_v1 \
-  --root /home/hph/Code/lerobot/outputs/datasets/fr3_pick_place_v1_20260313_153947 \
+  --repo-id hph/fr3_pick_place_ee2ee_v1 \
+  --root /home/hph/Code/lerobot/outputs/datasets/fr3_pick_place_ee2ee_v1_20260313_153947 \
   --episode-index 0 \
   --mode distant \
   --grpc-port 9876
@@ -232,5 +242,5 @@ the recorded mp4 files may end up unreadable by the normal user, for example as
 In that case, fix ownership before running visualization:
 
 ```bash
-sudo chown -R hph:hph /home/hph/Code/lerobot/outputs/datasets/fr3_pick_place_v1_20260313_153947
+sudo chown -R hph:hph /home/hph/Code/lerobot/outputs/datasets/fr3_pick_place_ee2ee_v1_20260313_153947
 ```

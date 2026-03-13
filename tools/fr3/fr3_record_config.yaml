@@ -40,12 +40,12 @@ teleop:
   scale_wy: 0.0
 
 dataset:
-  repo_id: hph/fr3_pick_place_v1
+  repo_id: hph/fr3_pick_place_ee2ee_v1
   single_task: Pick and place
-  root: /lerobot/outputs/datasets/fr3_pick_place_v1
+  root: /lerobot/outputs/datasets/fr3_pick_place_ee2ee_v1
   fps: 30
   num_episodes: 20
-  episode_time_s: 45
+  episode_time_s: 10
   reset_time_s: 0
   video: true
   streaming_encoding: true

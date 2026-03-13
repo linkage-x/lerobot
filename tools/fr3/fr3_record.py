@@ -152,7 +152,9 @@ def build_docker_command(args: argparse.Namespace, extras: list[str] | None = No
     record_args = [
         "cd /lerobot &&",
         "PYTHONPATH=/lerobot/src",
-        "/lerobot/.venv/bin/lerobot-record",
+        "/lerobot/.venv/bin/python",
+        "-m",
+        "tools.fr3.fr3_record_runtime",
         f"--config_path={config_path}",
     ]
     if args.repo_id is not None:

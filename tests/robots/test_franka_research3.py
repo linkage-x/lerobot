@@ -19,6 +19,17 @@ import pytest
 import time
 
 from lerobot.robots.franka_research3 import FrankaResearch3, FrankaResearch3Config
+from lerobot.robots.franka_research3.processor_franka_research3 import (
+    DeltaActionToAbsoluteEEAction,
+    KeepAbsoluteEEObservation,
+)
+from lerobot.processor import RobotProcessorPipeline
+from lerobot.processor.converters import (
+    observation_to_transition,
+    robot_action_observation_to_transition,
+    transition_to_observation,
+    transition_to_robot_action,
+)
 from lerobot.utils.rotation import Rotation
 
 
@@ -318,6 +329,38 @@ def test_send_action_clips_workspace_and_sends_joint_targets(robot):
     assert np.allclose(desired_pose[:3, 3], np.array([0.6, 0.3, 0.5]))
 
 
+def test_send_action_accepts_absolute_ee_targets(robot):
+    robot.connect()
+
+    absolute_action = {
+        "ee.x": 0.7,
+        "ee.y": 0.5,
+        "ee.z": 0.8,
+        "ee.wx": 0.0,
+        "ee.wy": 0.0,
+        "ee.wz": 0.0,
+        "gripper.pos": 1.2,
+    }
+    returned = robot.send_action(absolute_action)
+    deadline = time.perf_counter() + 0.2
+    while (
+        (
+            len(robot._arm.set_joint_positions_calls) == 0
+            or not np.allclose(robot._arm.set_joint_positions_calls[-1], robot._kinematics.inverse_solution)
+        )
+        and time.perf_counter() < deadline
+    ):
+        time.sleep(0.005)
+
+    _, desired_pose = robot._kinematics.inverse_calls[-1]
+    assert np.allclose(desired_pose[:3, 3], np.array([0.6, 0.3, 0.5]))
+    assert returned["ee.x"] == pytest.approx(0.6)
+    assert returned["ee.y"] == pytest.approx(0.3)
+    assert returned["ee.z"] == pytest.approx(0.5)
+    assert returned["gripper.pos"] == pytest.approx(1.0)
+    assert robot._gripper.set_position_calls[-1] == pytest.approx(1.0)
+
+
 def test_send_action_disabled_stops_at_current_pose_after_release(robot):
     robot.connect()
     first_action = {
@@ -440,6 +483,59 @@ def test_send_action_integrates_relative_pose_while_enabled(robot):
     _, second_desired_pose = robot._kinematics.inverse_calls[-1]
     assert np.allclose(first_desired_pose[:3, 3], np.array([0.41, 0.08, 0.33]))
     assert np.allclose(second_desired_pose[:3, 3], np.array([0.42, 0.06, 0.36]))
+
+
+def test_delta_action_processor_outputs_absolute_ee_targets(robot):
+    robot.connect()
+    processor = RobotProcessorPipeline[tuple[dict, dict], dict](
+        steps=[
+            DeltaActionToAbsoluteEEAction(
+                workspace_min=robot.config.workspace_min,
+                workspace_max=robot.config.workspace_max,
+                max_target_delta_pos=robot.config.max_target_delta_pos,
+                max_target_delta_rot=robot.config.max_target_delta_rot,
+            )
+        ],
+        to_transition=robot_action_observation_to_transition,
+        to_output=transition_to_robot_action,
+    )
+
+    observation = robot.get_observation()
+    action = {
+        "enabled": True,
+        "target_x": 0.01,
+        "target_y": -0.02,
+        "target_z": 0.03,
+        "target_wx": 0.0,
+        "target_wy": 0.0,
+        "target_wz": 0.0,
+        "gripper": 0.5,
+    }
+    processed_first = processor((action.copy(), observation))
+    processed_second = processor((action.copy(), observation))
+
+    assert processed_first["ee.x"] == pytest.approx(0.41)
+    assert processed_first["ee.y"] == pytest.approx(0.08)
+    assert processed_first["ee.z"] == pytest.approx(0.33)
+    assert processed_first["gripper.pos"] == pytest.approx(0.5)
+    assert processed_second["ee.x"] == pytest.approx(0.42)
+    assert processed_second["ee.y"] == pytest.approx(0.06)
+    assert processed_second["ee.z"] == pytest.approx(0.36)
+
+
+def test_keep_absolute_ee_observation_filters_joint_state(robot):
+    robot.connect()
+    processor = RobotProcessorPipeline[dict, dict](
+        steps=[KeepAbsoluteEEObservation()],
+        to_transition=observation_to_transition,
+        to_output=transition_to_observation,
+    )
+
+    filtered = processor(robot.get_observation())
+
+    assert "ee.x" in filtered
+    assert "gripper.pos" in filtered
+    assert "joint_1.pos" not in filtered
 
 
 def test_send_action_clamps_target_delta_before_workspace(monkeypatch):
