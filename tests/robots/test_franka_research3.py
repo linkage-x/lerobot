@@ -215,6 +215,27 @@ def test_connect_falls_back_to_mock_gripper_when_hardware_unavailable(monkeypatc
     robot.disconnect()
 
 
+def test_connect_raises_when_mock_gripper_disabled(monkeypatch):
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", FailingGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            allow_mock_gripper=False,
+            urdf_path="/tmp/fr3.urdf",
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="FR3 gripper hardware unavailable on /dev/ttyUSB80"):
+        robot.connect()
+
+    assert robot.is_connected is False
+    assert robot._gripper is None
+
+
 def test_send_action_clips_workspace_and_sends_joint_targets(robot):
     robot.connect()
 

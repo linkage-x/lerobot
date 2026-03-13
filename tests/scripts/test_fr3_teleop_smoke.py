@@ -40,12 +40,16 @@ def test_build_docker_command_contains_default_smoke_settings(tmp_path: Path):
     assert "--fps=200" in command_text
     assert "--teleop_time_s=30.0" in command_text
     assert "--robot.robot_ip=192.168.1.206" in command_text
+    assert f"--robot.gripper_port={fr3_teleop_smoke.DEFAULT_GRIPPER_PORT}" in command_text
+    assert "--robot.allow_mock_gripper=true" in command_text
     assert f"--robot.urdf_path={fr3_teleop_smoke.DEFAULT_URDF_PATH}" in command_text
     assert "--teleop.tool_mode=binary" in command_text
     assert "--teleop.enable_rotation=false" in command_text
     assert f"--teleop.translation_scale={fr3_teleop_smoke.DEFAULT_TRANSLATION_SCALE}" in command_text
     assert f"--teleop.rotation_scale={fr3_teleop_smoke.DEFAULT_ROTATION_SCALE}" in command_text
     assert "--teleop.scale_x=" not in command_text
+    assert f"--teleop.scale_wx={fr3_teleop_smoke.DEFAULT_SCALE_WX}" in command_text
+    assert f"--teleop.scale_wy={fr3_teleop_smoke.DEFAULT_SCALE_WY}" in command_text
     assert "--teleop.scale_wz=" not in command_text
     assert f"--robot.max_target_delta_pos={fr3_teleop_smoke.DEFAULT_TRANSLATION_MAX_TARGET_DELTA_POS}" in command_text
     assert f"--robot.max_target_delta_rot={fr3_teleop_smoke.DEFAULT_TRANSLATION_MAX_TARGET_DELTA_ROT}" in command_text
@@ -60,8 +64,17 @@ def test_incremental_mode_adds_incremental_flags():
     command_text = " ".join(command)
 
     assert "--teleop.tool_mode=incremental" in command_text
-    assert "--teleop.incremental_step=0.01" in command_text
-    assert "--teleop.move_time=0.02" in command_text
+    assert f"--teleop.incremental_step={fr3_teleop_smoke.DEFAULT_INCREMENTAL_STEP}" in command_text
+    assert f"--teleop.move_time={fr3_teleop_smoke.DEFAULT_MOVE_TIME}" in command_text
+
+
+def test_require_gripper_disables_mock_gripper_fallback():
+    args = fr3_teleop_smoke.parse_args(["--require-gripper"])
+
+    command = fr3_teleop_smoke.build_docker_command(args)
+    command_text = " ".join(command)
+
+    assert "--robot.allow_mock_gripper=false" in command_text
 
 
 def test_rotation_profile_enables_small_angle_rotation_smoke():
@@ -74,7 +87,8 @@ def test_rotation_profile_enables_small_angle_rotation_smoke():
     assert f"--teleop.translation_scale={fr3_teleop_smoke.DEFAULT_ROTATION_ONLY_TRANSLATION_SCALE}" in command_text
     assert f"--teleop.rotation_scale={fr3_teleop_smoke.DEFAULT_ROTATION_SCALE}" in command_text
     assert "--teleop.scale_x=" not in command_text
-    assert "--teleop.scale_wx=" not in command_text
+    assert f"--teleop.scale_wx={fr3_teleop_smoke.DEFAULT_SCALE_WX}" in command_text
+    assert f"--teleop.scale_wy={fr3_teleop_smoke.DEFAULT_SCALE_WY}" in command_text
     assert f"--robot.max_target_delta_pos={fr3_teleop_smoke.DEFAULT_ROTATION_MAX_TARGET_DELTA_POS}" in command_text
     assert f"--robot.max_target_delta_rot={fr3_teleop_smoke.DEFAULT_ROTATION_MAX_TARGET_DELTA_ROT}" in command_text
 
@@ -89,6 +103,8 @@ def test_combined_profile_enables_coupled_translation_and_rotation_smoke():
     assert f"--teleop.translation_scale={fr3_teleop_smoke.DEFAULT_TRANSLATION_SCALE}" in command_text
     assert f"--teleop.rotation_scale={fr3_teleop_smoke.DEFAULT_ROTATION_SCALE}" in command_text
     assert "--teleop.scale_x=" not in command_text
+    assert f"--teleop.scale_wx={fr3_teleop_smoke.DEFAULT_SCALE_WX}" in command_text
+    assert f"--teleop.scale_wy={fr3_teleop_smoke.DEFAULT_SCALE_WY}" in command_text
     assert "--teleop.scale_wz=" not in command_text
     assert f"--robot.max_target_delta_pos={fr3_teleop_smoke.DEFAULT_COMBINED_MAX_TARGET_DELTA_POS}" in command_text
     assert f"--robot.max_target_delta_rot={fr3_teleop_smoke.DEFAULT_COMBINED_MAX_TARGET_DELTA_ROT}" in command_text

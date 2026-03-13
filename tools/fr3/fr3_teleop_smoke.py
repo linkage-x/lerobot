@@ -32,7 +32,7 @@ import subprocess
 
 DEFAULT_SERVICE = "lerobot-user"
 DEFAULT_ROBOT_IP = "192.168.1.206"
-DEFAULT_GRIPPER_PORT = "/dev/ttyUSB0"
+DEFAULT_GRIPPER_PORT = "/dev/ttyUSB80"
 DEFAULT_URDF_PATH = "/lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.urdf"
 DEFAULT_TRANSLATION_SCALE = 0.000615
 DEFAULT_ROTATION_SCALE = 0.000648
@@ -44,8 +44,12 @@ DEFAULT_COMBINED_MAX_TARGET_DELTA_POS = DEFAULT_TRANSLATION_MAX_TARGET_DELTA_POS
 DEFAULT_COMBINED_MAX_TARGET_DELTA_ROT = DEFAULT_ROTATION_MAX_TARGET_DELTA_ROT
 DEFAULT_ROTATION_ONLY_TRANSLATION_SCALE = 0.0
 DEFAULT_WZ_ONLY_TRANSLATION_SCALE = 0.0
+DEFAULT_SCALE_WX = 0.0
+DEFAULT_SCALE_WY = 0.0
 DEFAULT_WZ_ONLY_SCALE_WX = 0.0
 DEFAULT_WZ_ONLY_SCALE_WY = 0.0
+DEFAULT_INCREMENTAL_STEP = 0.05
+DEFAULT_MOVE_TIME = 0.02
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -75,13 +79,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--duration", type=float, default=30.0, help="Smoke duration in seconds.")
     parser.add_argument("--device-id", type=int, default=0, help="SpaceMouse device index.")
     parser.add_argument(
+        "--require-gripper",
+        action="store_true",
+        help="Fail fast if the Pika gripper cannot be reached instead of falling back to a mock gripper.",
+    )
+    parser.add_argument(
         "--tool-mode",
         choices=["binary", "incremental"],
         default="binary",
         help="SpaceMouse gripper button mode.",
     )
-    parser.add_argument("--incremental-step", type=float, default=0.01, help="Incremental gripper step size.")
-    parser.add_argument("--move-time", type=float, default=0.02, help="Incremental gripper update interval.")
+    parser.add_argument(
+        "--incremental-step",
+        type=float,
+        default=DEFAULT_INCREMENTAL_STEP,
+        help="Incremental gripper step size.",
+    )
+    parser.add_argument("--move-time", type=float, default=DEFAULT_MOVE_TIME, help="Incremental gripper update interval.")
     parser.add_argument("--translation-scale", type=float, default=None, help="Unified SpaceMouse translation scale.")
     parser.add_argument("--rotation-scale", type=float, default=None, help="Unified SpaceMouse rotation scale.")
     parser.add_argument("--scale-x", type=float, default=None, help="Optional X translation scale override.")
@@ -152,6 +166,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.max_target_delta_rot is None:
             args.max_target_delta_rot = DEFAULT_TRANSLATION_MAX_TARGET_DELTA_ROT
 
+    if args.scale_wx is None:
+        args.scale_wx = DEFAULT_SCALE_WX
+    if args.scale_wy is None:
+        args.scale_wy = DEFAULT_SCALE_WY
+
     return args
 
 
@@ -167,6 +186,7 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         "--robot.type=franka_research3",
         f"--robot.robot_ip={args.robot_ip}",
         f"--robot.gripper_port={args.gripper_port}",
+        f"--robot.allow_mock_gripper={'false' if args.require_gripper else 'true'}",
         f"--robot.urdf_path={DEFAULT_URDF_PATH}",
         "--robot.target_frame_name=pika_gripper_ee",
         f"--robot.max_target_delta_pos={args.max_target_delta_pos}",

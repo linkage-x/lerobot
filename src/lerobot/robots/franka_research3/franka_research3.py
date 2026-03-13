@@ -229,6 +229,10 @@ class FrankaResearch3(Robot):
                 gripper.connect()
                 self._gripper_is_mock = False
             except Exception as gripper_error:
+                if not self.config.allow_mock_gripper:
+                    raise RuntimeError(
+                        f"FR3 gripper hardware unavailable on {self.config.gripper_port}."
+                    ) from gripper_error
                 logger.warning(
                     "FR3 gripper hardware unavailable on %s; falling back to mock gripper: %s",
                     self.config.gripper_port,

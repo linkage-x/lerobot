@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Protocol
 
 import numpy as np
@@ -56,6 +57,11 @@ class JointOTGDriver(Protocol):
     def reset(self, current_joint_positions: np.ndarray) -> None: ...
 
     def step(self, current_joint_positions: np.ndarray, target_joint_positions: np.ndarray) -> np.ndarray: ...
+
+
+def _silence_pika_logs() -> None:
+    logging.getLogger("pika.gripper").setLevel(logging.WARNING)
+    logging.getLogger("pika.serial_comm").setLevel(logging.WARNING)
 
 
 @dataclass
@@ -123,6 +129,7 @@ class PikaGripperHardwareDriver:
     max_width_mm: float = 90.0
 
     def __post_init__(self):
+        _silence_pika_logs()
         try:
             from pika.gripper import Gripper
         except Exception as e:  # pragma: no cover - exercised with real hardware only
