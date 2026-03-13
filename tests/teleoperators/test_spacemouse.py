@@ -92,12 +92,12 @@ def test_get_action_maps_axes_and_scales(teleop):
     action = teleop.get_action()
 
     assert action["enabled"] is True
-    assert action["target_x"] == pytest.approx(0.3 * teleop.config.scale_x)
-    assert action["target_y"] == pytest.approx(0.2 * teleop.config.scale_y)
-    assert action["target_z"] == pytest.approx(0.4 * teleop.config.scale_z)
-    assert action["target_wx"] == pytest.approx(0.5 * teleop.config.scale_wx)
-    assert action["target_wy"] == pytest.approx(-0.6 * teleop.config.scale_wy)
-    assert action["target_wz"] == pytest.approx(0.7 * teleop.config.scale_wz)
+    assert action["target_x"] == pytest.approx(0.3 * teleop.translation_scale_vector[0])
+    assert action["target_y"] == pytest.approx(0.2 * teleop.translation_scale_vector[1])
+    assert action["target_z"] == pytest.approx(0.4 * teleop.translation_scale_vector[2])
+    assert action["target_wx"] == pytest.approx(0.5 * teleop.rotation_scale_vector[0])
+    assert action["target_wy"] == pytest.approx(-0.6 * teleop.rotation_scale_vector[1])
+    assert action["target_wz"] == pytest.approx(0.7 * teleop.rotation_scale_vector[2])
 
 
 def test_connect_estimates_idle_bias_and_cancels_idle_reading(monkeypatch):
@@ -153,11 +153,42 @@ def test_get_action_zeroes_subthreshold_axes_even_when_other_axis_is_active(monk
 
     assert action["enabled"] is True
     assert action["target_x"] == pytest.approx(0.0)
-    assert action["target_y"] == pytest.approx(0.03 * teleop.config.scale_y)
+    assert action["target_y"] == pytest.approx(0.03 * teleop.translation_scale_vector[1])
     assert action["target_z"] == pytest.approx(0.0)
-    assert action["target_wx"] == pytest.approx(0.05 * teleop.config.scale_wx)
+    assert action["target_wx"] == pytest.approx(0.05 * teleop.rotation_scale_vector[0])
     assert action["target_wy"] == pytest.approx(0.0)
     assert action["target_wz"] == pytest.approx(0.0)
+    teleop.disconnect()
+
+
+def test_per_dof_scale_overrides_can_isolate_wz_rotation(monkeypatch):
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            translation_scale=0.0,
+            scale_wx=0.0,
+            scale_wy=0.0,
+            bias_sample_count=0,
+            move_time=0.0,
+        )
+    )
+    teleop.connect()
+    teleop._driver.readings.append(
+        SpaceMouseReading(
+            translation=[0.2, -0.3, 0.4],
+            rotation=[0.5, -0.6, 0.7],
+            buttons=(False, False),
+        )
+    )
+
+    action = teleop.get_action()
+
+    assert action["target_x"] == pytest.approx(0.0)
+    assert action["target_y"] == pytest.approx(0.0)
+    assert action["target_z"] == pytest.approx(0.0)
+    assert action["target_wx"] == pytest.approx(0.0)
+    assert action["target_wy"] == pytest.approx(0.0)
+    assert action["target_wz"] == pytest.approx(0.7 * teleop.rotation_scale_vector[2])
     teleop.disconnect()
 
 

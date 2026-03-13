@@ -37,12 +37,14 @@ class SpaceMouseEnableButton(StrEnum):
 class SpaceMouseTeleopConfig(TeleoperatorConfig):
     device_id: int = 0
     frequency: int = 200
-    scale_x: float = 0.0006
-    scale_y: float = 0.0006
-    scale_z: float = 0.0006
-    scale_wx: float = 0.0004
-    scale_wy: float = 0.0004
-    scale_wz: float = 0.0004
+    translation_scale: float = 0.000615
+    rotation_scale: float = 0.000648
+    scale_x: float | None = None
+    scale_y: float | None = None
+    scale_z: float | None = None
+    scale_wx: float | None = None
+    scale_wy: float | None = None
+    scale_wz: float | None = None
     threshold_x: float = 0.02
     threshold_y: float = 0.02
     threshold_z: float = 0.02

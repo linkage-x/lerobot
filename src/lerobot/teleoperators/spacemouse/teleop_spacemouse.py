@@ -35,6 +35,14 @@ class SpaceMouseTeleop(Teleoperator):
     name = "spacemouse"
 
     driver_cls = PySpaceMouseDriver
+    TRANSLATION_AXIS_CALIBRATION = np.array(
+        [1.0, 0.9414634146341463, 0.5902439024390244],
+        dtype=np.float64,
+    )
+    ROTATION_AXIS_CALIBRATION = np.array(
+        [1.0, 0.9490740740740741, 0.9259259259259259],
+        dtype=np.float64,
+    )
 
     def __init__(self, config: SpaceMouseTeleopConfig):
         super().__init__(config)
@@ -143,6 +151,38 @@ class SpaceMouseTeleop(Teleoperator):
                     self._last_gripper = max(0.0, self._last_gripper - self.config.incremental_step)
                     self._last_gripper_update = now
 
+    @property
+    def translation_scale_vector(self) -> np.ndarray:
+        default_vector = (
+            float(self.config.translation_scale)
+            * self.TRANSLATION_AXIS_CALIBRATION
+        )
+        overrides = np.array(
+            [
+                self.config.scale_x,
+                self.config.scale_y,
+                self.config.scale_z,
+            ],
+            dtype=np.float64,
+        )
+        return np.where(np.isnan(overrides), default_vector, overrides)
+
+    @property
+    def rotation_scale_vector(self) -> np.ndarray:
+        default_vector = (
+            float(self.config.rotation_scale)
+            * self.ROTATION_AXIS_CALIBRATION
+        )
+        overrides = np.array(
+            [
+                self.config.scale_wx,
+                self.config.scale_wy,
+                self.config.scale_wz,
+            ],
+            dtype=np.float64,
+        )
+        return np.where(np.isnan(overrides), default_vector, overrides)
+
     @check_if_not_connected
     def get_action(self) -> RobotAction:
         reading = self._driver.poll()
@@ -171,17 +211,7 @@ class SpaceMouseTeleop(Teleoperator):
             ],
             dtype=np.float64,
         )
-        scale = np.array(
-            [
-                self.config.scale_x,
-                self.config.scale_y,
-                self.config.scale_z,
-                self.config.scale_wx,
-                self.config.scale_wy,
-                self.config.scale_wz,
-            ],
-            dtype=np.float64,
-        )
+        scale = np.concatenate((self.translation_scale_vector, self.rotation_scale_vector))
         active_mask = np.abs(data) >= threshold
         data = np.where(active_mask, data, 0.0)
         motion_detected = bool(np.any(active_mask))

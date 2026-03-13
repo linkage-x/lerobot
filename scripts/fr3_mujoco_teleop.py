@@ -24,12 +24,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tool-mode", choices=[mode.value for mode in SpaceMouseToolMode], default="binary")
     parser.add_argument("--motion-enable-button", choices=[button.value for button in SpaceMouseEnableButton], default="none")
     parser.add_argument("--enable-rotation", action="store_true")
-    parser.add_argument("--scale-x", type=float, default=0.0006)
-    parser.add_argument("--scale-y", type=float, default=0.0006)
-    parser.add_argument("--scale-z", type=float, default=0.0006)
-    parser.add_argument("--scale-wx", type=float, default=0.0004)
-    parser.add_argument("--scale-wy", type=float, default=0.0004)
-    parser.add_argument("--scale-wz", type=float, default=0.0004)
+    parser.add_argument("--translation-scale", type=float, default=0.000615)
+    parser.add_argument("--rotation-scale", type=float, default=0.000648)
+    parser.add_argument("--scale-x", type=float, default=None)
+    parser.add_argument("--scale-y", type=float, default=None)
+    parser.add_argument("--scale-z", type=float, default=None)
+    parser.add_argument("--scale-wx", type=float, default=None)
+    parser.add_argument("--scale-wy", type=float, default=None)
+    parser.add_argument("--scale-wz", type=float, default=None)
     parser.add_argument("--threshold-x", type=float, default=0.02)
     parser.add_argument("--threshold-y", type=float, default=0.02)
     parser.add_argument("--threshold-z", type=float, default=0.02)
@@ -48,6 +50,8 @@ def build_teleop_config(args: argparse.Namespace) -> SpaceMouseTeleopConfig:
     return SpaceMouseTeleopConfig(
         device_id=args.device_id,
         frequency=args.fps,
+        translation_scale=args.translation_scale,
+        rotation_scale=args.rotation_scale,
         scale_x=args.scale_x,
         scale_y=args.scale_y,
         scale_z=args.scale_z,
