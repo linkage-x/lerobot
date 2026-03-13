@@ -42,6 +42,51 @@ def test_build_docker_command_uses_hardware_service_and_robot_flags(tmp_path: Pa
     assert "--gripper-port=/dev/ttyUSB0" in command_text
 
 
+def test_build_docker_command_passes_combined_trace_profile_and_rotation_steps(tmp_path: Path):
+    args = fr3_teleop_trace_replay.parse_args(
+        [
+            "--mode",
+            "sim",
+            "--workspace",
+            str(tmp_path),
+            "--trace-profile",
+            "combined",
+            "--step-wx",
+            "0.0003",
+        ]
+    )
+
+    command = fr3_teleop_trace_replay.build_docker_command(args)
+    command_text = " ".join(command)
+
+    assert "--trace-profile=combined" in command_text
+    assert "--step-wx=0.0003" in command_text
+    assert "--step-wy=0.0002" in command_text
+    assert "--step-wz=0.0002" in command_text
+
+
+def test_build_docker_command_passes_wz_trace_profile(tmp_path: Path):
+    args = fr3_teleop_trace_replay.parse_args(
+        [
+            "--mode",
+            "hardware",
+            "--workspace",
+            str(tmp_path),
+            "--trace-profile",
+            "wz",
+            "--step-wz",
+            "0.00025",
+        ]
+    )
+
+    command = fr3_teleop_trace_replay.build_docker_command(args)
+    command_text = " ".join(command)
+
+    assert "--trace-profile=wz" in command_text
+    assert "--step-wz=0.00025" in command_text
+    assert "--mode=hardware" in command_text
+
+
 def test_main_dry_run_prints_command(capsys):
     exit_code = fr3_teleop_trace_replay.main(["--mode", "sim", "--dry-run"])
 

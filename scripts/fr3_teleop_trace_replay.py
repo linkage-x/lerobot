@@ -16,6 +16,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a Docker-based FR3 teleop trace replay.")
     parser.add_argument("--mode", choices=["sim", "hardware"], required=True)
     parser.add_argument(
+        "--trace-profile",
+        choices=["translation", "combined", "wz"],
+        default="translation",
+        help="Trace preset. 'combined' replays coupled translation and rotation pulses, while 'wz' isolates yaw rotation.",
+    )
+    parser.add_argument(
         "--workspace",
         type=Path,
         default=Path(__file__).resolve().parents[1],
@@ -37,6 +43,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step-x", type=float, default=0.0002)
     parser.add_argument("--step-y", type=float, default=0.0002)
     parser.add_argument("--step-z", type=float, default=0.0002)
+    parser.add_argument("--step-wx", type=float, default=0.0002)
+    parser.add_argument("--step-wy", type=float, default=0.0002)
+    parser.add_argument("--step-wz", type=float, default=0.0002)
     parser.add_argument("--warmup-s", type=float, default=0.5)
     parser.add_argument("--move-s", type=float, default=0.75)
     parser.add_argument("--hold-s", type=float, default=0.5)
@@ -61,11 +70,15 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         "/lerobot/.venv/bin/python",
         "scripts/fr3_teleop_trace_replay_runtime.py",
         f"--mode={args.mode}",
+        f"--trace-profile={args.trace_profile}",
         f"--output=/lerobot/{repo_relative_output.as_posix()}",
         f"--fps={args.fps}",
         f"--step-x={args.step_x}",
         f"--step-y={args.step_y}",
         f"--step-z={args.step_z}",
+        f"--step-wx={args.step_wx}",
+        f"--step-wy={args.step_wy}",
+        f"--step-wz={args.step_wz}",
         f"--warmup-s={args.warmup_s}",
         f"--move-s={args.move_s}",
         f"--hold-s={args.hold_s}",

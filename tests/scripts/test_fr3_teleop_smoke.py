@@ -46,7 +46,11 @@ def test_build_docker_command_contains_default_smoke_settings(tmp_path: Path):
     assert f"--teleop.scale_x={fr3_teleop_smoke.DEFAULT_SCALE_X}" in command_text
     assert f"--teleop.scale_y={fr3_teleop_smoke.DEFAULT_SCALE_Y}" in command_text
     assert f"--teleop.scale_z={fr3_teleop_smoke.DEFAULT_SCALE_Z}" in command_text
-    assert "--robot.max_target_delta_pos=[0.001,0.001,0.001]" in command_text
+    assert f"--teleop.scale_wx={fr3_teleop_smoke.DEFAULT_SCALE_WX}" in command_text
+    assert f"--teleop.scale_wy={fr3_teleop_smoke.DEFAULT_SCALE_WY}" in command_text
+    assert f"--teleop.scale_wz={fr3_teleop_smoke.DEFAULT_SCALE_WZ}" in command_text
+    assert f"--robot.max_target_delta_pos={fr3_teleop_smoke.DEFAULT_TRANSLATION_MAX_TARGET_DELTA_POS}" in command_text
+    assert f"--robot.max_target_delta_rot={fr3_teleop_smoke.DEFAULT_TRANSLATION_MAX_TARGET_DELTA_ROT}" in command_text
     assert "cd /lerobot &&" in command_text
     assert "PYTHONPATH=/lerobot/src" in command_text
 
@@ -60,6 +64,57 @@ def test_incremental_mode_adds_incremental_flags():
     assert "--teleop.tool_mode=incremental" in command_text
     assert "--teleop.incremental_step=0.01" in command_text
     assert "--teleop.move_time=0.02" in command_text
+
+
+def test_rotation_profile_enables_small_angle_rotation_smoke():
+    args = fr3_teleop_smoke.parse_args(["--smoke-profile", "rotation"])
+
+    command = fr3_teleop_smoke.build_docker_command(args)
+    command_text = " ".join(command)
+
+    assert "--teleop.enable_rotation=true" in command_text
+    assert "--teleop.scale_x=0.0" in command_text
+    assert "--teleop.scale_y=0.0" in command_text
+    assert "--teleop.scale_z=0.0" in command_text
+    assert f"--teleop.scale_wx={fr3_teleop_smoke.DEFAULT_ROTATION_SCALE_WX}" in command_text
+    assert f"--teleop.scale_wy={fr3_teleop_smoke.DEFAULT_ROTATION_SCALE_WY}" in command_text
+    assert f"--teleop.scale_wz={fr3_teleop_smoke.DEFAULT_ROTATION_SCALE_WZ}" in command_text
+    assert f"--robot.max_target_delta_pos={fr3_teleop_smoke.DEFAULT_ROTATION_MAX_TARGET_DELTA_POS}" in command_text
+    assert f"--robot.max_target_delta_rot={fr3_teleop_smoke.DEFAULT_ROTATION_MAX_TARGET_DELTA_ROT}" in command_text
+
+
+def test_combined_profile_enables_coupled_translation_and_rotation_smoke():
+    args = fr3_teleop_smoke.parse_args(["--smoke-profile", "combined"])
+
+    command = fr3_teleop_smoke.build_docker_command(args)
+    command_text = " ".join(command)
+
+    assert "--teleop.enable_rotation=true" in command_text
+    assert f"--teleop.scale_x={fr3_teleop_smoke.DEFAULT_SCALE_X}" in command_text
+    assert f"--teleop.scale_y={fr3_teleop_smoke.DEFAULT_SCALE_Y}" in command_text
+    assert f"--teleop.scale_z={fr3_teleop_smoke.DEFAULT_SCALE_Z}" in command_text
+    assert f"--teleop.scale_wx={fr3_teleop_smoke.DEFAULT_COMBINED_SCALE_WX}" in command_text
+    assert f"--teleop.scale_wy={fr3_teleop_smoke.DEFAULT_COMBINED_SCALE_WY}" in command_text
+    assert f"--teleop.scale_wz={fr3_teleop_smoke.DEFAULT_COMBINED_SCALE_WZ}" in command_text
+    assert f"--robot.max_target_delta_pos={fr3_teleop_smoke.DEFAULT_COMBINED_MAX_TARGET_DELTA_POS}" in command_text
+    assert f"--robot.max_target_delta_rot={fr3_teleop_smoke.DEFAULT_COMBINED_MAX_TARGET_DELTA_ROT}" in command_text
+
+
+def test_wz_profile_isolates_yaw_rotation_smoke():
+    args = fr3_teleop_smoke.parse_args(["--smoke-profile", "wz"])
+
+    command = fr3_teleop_smoke.build_docker_command(args)
+    command_text = " ".join(command)
+
+    assert "--teleop.enable_rotation=true" in command_text
+    assert "--teleop.scale_x=0.0" in command_text
+    assert "--teleop.scale_y=0.0" in command_text
+    assert "--teleop.scale_z=0.0" in command_text
+    assert f"--teleop.scale_wx={fr3_teleop_smoke.DEFAULT_WZ_ONLY_SCALE_WX}" in command_text
+    assert f"--teleop.scale_wy={fr3_teleop_smoke.DEFAULT_WZ_ONLY_SCALE_WY}" in command_text
+    assert f"--teleop.scale_wz={fr3_teleop_smoke.DEFAULT_WZ_ONLY_SCALE_WZ}" in command_text
+    assert f"--robot.max_target_delta_pos={fr3_teleop_smoke.DEFAULT_ROTATION_MAX_TARGET_DELTA_POS}" in command_text
+    assert f"--robot.max_target_delta_rot={fr3_teleop_smoke.DEFAULT_ROTATION_MAX_TARGET_DELTA_ROT}" in command_text
 
 
 def test_main_dry_run_prints_command(capsys):

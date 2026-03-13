@@ -34,9 +34,27 @@ DEFAULT_SERVICE = "lerobot-user"
 DEFAULT_ROBOT_IP = "192.168.1.206"
 DEFAULT_GRIPPER_PORT = "/dev/ttyUSB0"
 DEFAULT_URDF_PATH = "/lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.urdf"
-DEFAULT_SCALE_X = 0.000143
-DEFAULT_SCALE_Y = 0.000139
-DEFAULT_SCALE_Z = 0.000114
+DEFAULT_SCALE_X = 0.000615
+DEFAULT_SCALE_Y = 0.000579
+DEFAULT_SCALE_Z = 0.000363
+DEFAULT_SCALE_WX = 0.0012
+DEFAULT_SCALE_WY = 0.0012
+DEFAULT_SCALE_WZ = 0.0012
+DEFAULT_TRANSLATION_MAX_TARGET_DELTA_POS = "[0.001,0.001,0.001]"
+DEFAULT_TRANSLATION_MAX_TARGET_DELTA_ROT = "[0.0,0.0,0.0]"
+DEFAULT_ROTATION_MAX_TARGET_DELTA_POS = "[0.0,0.0,0.0]"
+DEFAULT_ROTATION_MAX_TARGET_DELTA_ROT = "[0.01,0.01,0.01]"
+DEFAULT_COMBINED_MAX_TARGET_DELTA_POS = DEFAULT_TRANSLATION_MAX_TARGET_DELTA_POS
+DEFAULT_COMBINED_MAX_TARGET_DELTA_ROT = DEFAULT_ROTATION_MAX_TARGET_DELTA_ROT
+DEFAULT_ROTATION_SCALE_WX = 0.0006
+DEFAULT_ROTATION_SCALE_WY = 0.0006
+DEFAULT_ROTATION_SCALE_WZ = 0.0006
+DEFAULT_COMBINED_SCALE_WX = 0.000648
+DEFAULT_COMBINED_SCALE_WY = 0.000615
+DEFAULT_COMBINED_SCALE_WZ = 0.0006
+DEFAULT_WZ_ONLY_SCALE_WX = 0.0
+DEFAULT_WZ_ONLY_SCALE_WY = 0.0
+DEFAULT_WZ_ONLY_SCALE_WZ = 0.0006
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -44,6 +62,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP, help="FR3 controller IP address.")
     parser.add_argument("--gripper-port", default=DEFAULT_GRIPPER_PORT, help="Pika serial port to probe before fallback.")
     parser.add_argument("--service", default=DEFAULT_SERVICE, help="Docker compose service to run.")
+    parser.add_argument(
+        "--smoke-profile",
+        choices=["translation", "rotation", "combined", "wz"],
+        default="translation",
+        help="Smoke preset. 'rotation' disables translation, 'combined' enables conservative coupled translation + rotation checks, and 'wz' isolates yaw rotation.",
+    )
     parser.add_argument(
         "--workspace",
         type=Path,
@@ -67,9 +91,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--incremental-step", type=float, default=0.01, help="Incremental gripper step size.")
     parser.add_argument("--move-time", type=float, default=0.02, help="Incremental gripper update interval.")
-    parser.add_argument("--scale-x", type=float, default=DEFAULT_SCALE_X, help="SpaceMouse X translation scale.")
-    parser.add_argument("--scale-y", type=float, default=DEFAULT_SCALE_Y, help="SpaceMouse Y translation scale.")
-    parser.add_argument("--scale-z", type=float, default=DEFAULT_SCALE_Z, help="SpaceMouse Z translation scale.")
+    parser.add_argument("--scale-x", type=float, default=None, help="SpaceMouse X translation scale.")
+    parser.add_argument("--scale-y", type=float, default=None, help="SpaceMouse Y translation scale.")
+    parser.add_argument("--scale-z", type=float, default=None, help="SpaceMouse Z translation scale.")
+    parser.add_argument("--scale-wx", type=float, default=None, help="SpaceMouse WX rotation scale.")
+    parser.add_argument("--scale-wy", type=float, default=None, help="SpaceMouse WY rotation scale.")
+    parser.add_argument("--scale-wz", type=float, default=None, help="SpaceMouse WZ rotation scale.")
     parser.add_argument(
         "--allow-rotation",
         action="store_true",
@@ -77,16 +104,90 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-target-delta-pos",
-        default="[0.001,0.001,0.001]",
+        default=None,
         help="Per-step EE translation clamp passed to the robot config.",
     )
     parser.add_argument(
         "--max-target-delta-rot",
-        default="[0.0,0.0,0.0]",
+        default=None,
         help="Per-step EE rotation clamp passed to the robot config.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print the Docker command without executing it.")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    if args.smoke_profile == "rotation":
+        if args.scale_x is None:
+            args.scale_x = 0.0
+        if args.scale_y is None:
+            args.scale_y = 0.0
+        if args.scale_z is None:
+            args.scale_z = 0.0
+        if args.scale_wx is None:
+            args.scale_wx = DEFAULT_ROTATION_SCALE_WX
+        if args.scale_wy is None:
+            args.scale_wy = DEFAULT_ROTATION_SCALE_WY
+        if args.scale_wz is None:
+            args.scale_wz = DEFAULT_ROTATION_SCALE_WZ
+        if args.max_target_delta_pos is None:
+            args.max_target_delta_pos = DEFAULT_ROTATION_MAX_TARGET_DELTA_POS
+        if args.max_target_delta_rot is None:
+            args.max_target_delta_rot = DEFAULT_ROTATION_MAX_TARGET_DELTA_ROT
+        args.allow_rotation = True
+    elif args.smoke_profile == "wz":
+        if args.scale_x is None:
+            args.scale_x = 0.0
+        if args.scale_y is None:
+            args.scale_y = 0.0
+        if args.scale_z is None:
+            args.scale_z = 0.0
+        if args.scale_wx is None:
+            args.scale_wx = DEFAULT_WZ_ONLY_SCALE_WX
+        if args.scale_wy is None:
+            args.scale_wy = DEFAULT_WZ_ONLY_SCALE_WY
+        if args.scale_wz is None:
+            args.scale_wz = DEFAULT_WZ_ONLY_SCALE_WZ
+        if args.max_target_delta_pos is None:
+            args.max_target_delta_pos = DEFAULT_ROTATION_MAX_TARGET_DELTA_POS
+        if args.max_target_delta_rot is None:
+            args.max_target_delta_rot = DEFAULT_ROTATION_MAX_TARGET_DELTA_ROT
+        args.allow_rotation = True
+    elif args.smoke_profile == "combined":
+        if args.scale_x is None:
+            args.scale_x = DEFAULT_SCALE_X
+        if args.scale_y is None:
+            args.scale_y = DEFAULT_SCALE_Y
+        if args.scale_z is None:
+            args.scale_z = DEFAULT_SCALE_Z
+        if args.scale_wx is None:
+            args.scale_wx = DEFAULT_COMBINED_SCALE_WX
+        if args.scale_wy is None:
+            args.scale_wy = DEFAULT_COMBINED_SCALE_WY
+        if args.scale_wz is None:
+            args.scale_wz = DEFAULT_COMBINED_SCALE_WZ
+        if args.max_target_delta_pos is None:
+            args.max_target_delta_pos = DEFAULT_COMBINED_MAX_TARGET_DELTA_POS
+        if args.max_target_delta_rot is None:
+            args.max_target_delta_rot = DEFAULT_COMBINED_MAX_TARGET_DELTA_ROT
+        args.allow_rotation = True
+    else:
+        if args.scale_x is None:
+            args.scale_x = DEFAULT_SCALE_X
+        if args.scale_y is None:
+            args.scale_y = DEFAULT_SCALE_Y
+        if args.scale_z is None:
+            args.scale_z = DEFAULT_SCALE_Z
+        if args.scale_wx is None:
+            args.scale_wx = DEFAULT_SCALE_WX
+        if args.scale_wy is None:
+            args.scale_wy = DEFAULT_SCALE_WY
+        if args.scale_wz is None:
+            args.scale_wz = DEFAULT_SCALE_WZ
+        if args.max_target_delta_pos is None:
+            args.max_target_delta_pos = DEFAULT_TRANSLATION_MAX_TARGET_DELTA_POS
+        if args.max_target_delta_rot is None:
+            args.max_target_delta_rot = DEFAULT_TRANSLATION_MAX_TARGET_DELTA_ROT
+
+    return args
 
 
 def build_docker_command(args: argparse.Namespace) -> list[str]:
@@ -112,6 +213,9 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         f"--teleop.scale_x={args.scale_x}",
         f"--teleop.scale_y={args.scale_y}",
         f"--teleop.scale_z={args.scale_z}",
+        f"--teleop.scale_wx={args.scale_wx}",
+        f"--teleop.scale_wy={args.scale_wy}",
+        f"--teleop.scale_wz={args.scale_wz}",
     ]
     if args.tool_mode == "incremental":
         teleop_args.append(f"--teleop.incremental_step={args.incremental_step}")

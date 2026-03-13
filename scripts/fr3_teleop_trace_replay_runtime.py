@@ -10,8 +10,10 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from lerobot.calibration.fr3_teleop import (
+    build_combined_trace_profile,
     build_default_trace_profile,
     build_trace_bundle,
+    build_wz_trace_profile,
     make_trace_sample,
     save_trace_bundle,
 )
@@ -22,6 +24,8 @@ from lerobot.utils.robot_utils import precise_sleep
 
 DEFAULT_ROBOT_IP = "192.168.1.206"
 DEFAULT_GRIPPER_PORT = "/dev/ttyUSB0"
+DEFAULT_TRANSLATION_MAX_TARGET_DELTA_ROT = (0.0, 0.0, 0.0)
+DEFAULT_COMBINED_MAX_TARGET_DELTA_ROT = (0.01, 0.01, 0.01)
 DEFAULT_URDF_PATH = (
     Path(__file__).resolve().parents[1]
     / "src"
@@ -47,11 +51,15 @@ def _parse_tuple(value: str) -> tuple[float, float, float]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Replay a fixed FR3 teleop profile and record TCP traces.")
     parser.add_argument("--mode", choices=["sim", "hardware"], required=True)
+    parser.add_argument("--trace-profile", choices=["translation", "combined", "wz"], default="translation")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--step-x", type=float, default=0.0002)
     parser.add_argument("--step-y", type=float, default=0.0002)
     parser.add_argument("--step-z", type=float, default=0.0002)
+    parser.add_argument("--step-wx", type=float, default=0.0002)
+    parser.add_argument("--step-wy", type=float, default=0.0002)
+    parser.add_argument("--step-wz", type=float, default=0.0002)
     parser.add_argument("--warmup-s", type=float, default=0.5)
     parser.add_argument("--move-s", type=float, default=0.75)
     parser.add_argument("--hold-s", type=float, default=0.5)
@@ -63,8 +71,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workspace-min", type=_parse_tuple, default=(0.2, -0.6, 0.05))
     parser.add_argument("--workspace-max", type=_parse_tuple, default=(0.9, 0.6, 0.8))
     parser.add_argument("--max-target-delta-pos", type=_parse_tuple, default=(0.001, 0.001, 0.001))
-    parser.add_argument("--max-target-delta-rot", type=_parse_tuple, default=(0.0, 0.0, 0.0))
-    return parser.parse_args()
+    parser.add_argument("--max-target-delta-rot", type=_parse_tuple, default=None)
+    args = parser.parse_args()
+    if args.max_target_delta_rot is None:
+        if args.trace_profile in ("combined", "wz"):
+            args.max_target_delta_rot = DEFAULT_COMBINED_MAX_TARGET_DELTA_ROT
+        else:
+            args.max_target_delta_rot = DEFAULT_TRANSLATION_MAX_TARGET_DELTA_ROT
+    return args
 
 
 def _observation_to_sample(*, profile_step: int, scheduled_time_s: float, measured_time_s: float, action, observation, target_pose):
@@ -237,16 +251,40 @@ def run_hardware_trace(args: argparse.Namespace, profile: dict[str, object]) -> 
 
 def main() -> int:
     args = parse_args()
-    profile = build_default_trace_profile(
-        fps=args.fps,
-        step_x=args.step_x,
-        step_y=args.step_y,
-        step_z=args.step_z,
-        warmup_s=args.warmup_s,
-        move_s=args.move_s,
-        hold_s=args.hold_s,
-        settle_s=args.settle_s,
-    )
+    if args.trace_profile == "combined":
+        profile = build_combined_trace_profile(
+            fps=args.fps,
+            step_x=args.step_x,
+            step_y=args.step_y,
+            step_z=args.step_z,
+            step_wx=args.step_wx,
+            step_wy=args.step_wy,
+            step_wz=args.step_wz,
+            warmup_s=args.warmup_s,
+            move_s=args.move_s,
+            hold_s=args.hold_s,
+            settle_s=args.settle_s,
+        )
+    elif args.trace_profile == "wz":
+        profile = build_wz_trace_profile(
+            fps=args.fps,
+            step_wz=args.step_wz,
+            warmup_s=args.warmup_s,
+            move_s=args.move_s,
+            hold_s=args.hold_s,
+            settle_s=args.settle_s,
+        )
+    else:
+        profile = build_default_trace_profile(
+            fps=args.fps,
+            step_x=args.step_x,
+            step_y=args.step_y,
+            step_z=args.step_z,
+            warmup_s=args.warmup_s,
+            move_s=args.move_s,
+            hold_s=args.hold_s,
+            settle_s=args.settle_s,
+        )
     if args.mode == "sim":
         bundle = run_sim_trace(args, profile)
     else:
