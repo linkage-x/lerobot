@@ -10,8 +10,11 @@ from lerobot.scripts.lerobot_dataset_viz import (
     build_ee_axis_ruler_strips,
     extract_ee_pose,
     get_ee_pose_state_indices,
+    get_next_episode_index,
     has_ee_pose,
     make_system_time_anchor,
+    run_episode_switch_loop,
+    should_enable_episode_switch,
     to_system_timestamp,
 )
 from lerobot.utils.rotation import Rotation
@@ -173,3 +176,51 @@ def test_system_time_anchor_and_timestamp_conversion():
     assert anchor == now - timedelta(seconds=1.5)
     assert to_system_timestamp(anchor, 1.5) == now
     assert to_system_timestamp(anchor, 2.0) == now + timedelta(seconds=0.5)
+
+
+def test_should_enable_episode_switch_only_for_distant_streaming():
+    assert should_enable_episode_switch("distant", False)
+    assert not should_enable_episode_switch("local", False)
+    assert not should_enable_episode_switch("distant", True)
+
+
+def test_get_next_episode_index_stops_at_last_episode():
+    assert get_next_episode_index(0, 3) == 1
+    assert get_next_episode_index(1, 3) == 2
+    assert get_next_episode_index(2, 3) is None
+
+
+def test_run_episode_switch_loop_restarts_process_for_next_episode():
+    launched = []
+    terminated = []
+    commands = iter(["n", "n", "n", "q"])
+
+    def launch_episode(episode_index: int):
+        process = f"proc-{episode_index}"
+        launched.append((episode_index, process))
+        return process
+
+    def terminate_episode(process):
+        terminated.append(process)
+
+    def read_command():
+        return next(commands)
+
+    run_episode_switch_loop(
+        start_episode_index=0,
+        total_episodes=3,
+        launch_episode=launch_episode,
+        terminate_episode=terminate_episode,
+        read_command=read_command,
+    )
+
+    assert launched == [
+        (0, "proc-0"),
+        (1, "proc-1"),
+        (2, "proc-2"),
+    ]
+    assert terminated == [
+        "proc-0",
+        "proc-1",
+        "proc-2",
+    ]

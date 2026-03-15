@@ -60,11 +60,18 @@ local$ rerun rerun+http://IP:GRPC_PORT/proxy
 """
 
 import argparse
+import contextlib
 import gc
 import logging
+import multiprocessing as mp
+import os
+import select
+import sys
+import termios
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+import tty
 
 import numpy as np
 import rerun as rr
@@ -72,7 +79,7 @@ import torch
 import torch.utils.data
 import tqdm
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.utils.rotation import Rotation
 from lerobot.utils.constants import ACTION, DONE, OBS_STATE, REWARD
 from lerobot.utils.utils import init_logging
@@ -85,6 +92,8 @@ EE_RULER_AXIS_COLORS = {
     "y": [0, 255, 0, 255],
     "z": [0, 0, 255, 255],
 }
+
+QUIT_COMMANDS = {"q", "\x03", "\x04"}
 
 
 def to_hwc_uint8_numpy(chw_float32_torch: torch.Tensor) -> np.ndarray:
@@ -251,6 +260,117 @@ def log_ee_ruler(length: float) -> None:
         ),
         static=True,
     )
+
+
+def should_enable_episode_switch(mode: str, save: bool) -> bool:
+    return mode == "distant" and not save
+
+
+def get_next_episode_index(current_episode_index: int, total_episodes: int) -> int | None:
+    next_episode_index = current_episode_index + 1
+    if next_episode_index >= total_episodes:
+        return None
+    return next_episode_index
+
+
+@contextlib.contextmanager
+def raw_terminal_mode():
+    if not sys.stdin.isatty():
+        yield
+        return
+
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+
+def read_episode_switch_command() -> str:
+    if sys.stdin.isatty():
+        with raw_terminal_mode():
+            while True:
+                ready, _, _ = select.select([sys.stdin], [], [], None)
+                if ready:
+                    return sys.stdin.read(1).lower()
+
+    line = sys.stdin.readline()
+    if line == "":
+        raise EOFError
+    stripped = line.strip().lower()
+    return stripped[:1] if stripped else ""
+
+
+def terminate_episode_process(process: mp.Process | None, timeout_s: float = 5.0) -> None:
+    if process is None:
+        return
+    if not process.is_alive():
+        process.join(timeout=timeout_s)
+        return
+
+    process.terminate()
+    process.join(timeout=timeout_s)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=timeout_s)
+
+
+def run_episode_switch_loop(
+    *,
+    start_episode_index: int,
+    total_episodes: int,
+    launch_episode,
+    terminate_episode,
+    read_command,
+) -> None:
+    current_episode_index = start_episode_index
+    process = launch_episode(current_episode_index)
+    try:
+        while True:
+            command = read_command()
+            if not command:
+                continue
+            if command in QUIT_COMMANDS:
+                break
+            if command != "n":
+                continue
+
+            next_episode_index = get_next_episode_index(current_episode_index, total_episodes)
+            if next_episode_index is None:
+                logging.info(
+                    "Episode %d is the last available episode (%d total). Ignoring 'n'.",
+                    current_episode_index,
+                    total_episodes,
+                )
+                continue
+
+            logging.info("Switching from episode %d to episode %d.", current_episode_index, next_episode_index)
+            terminate_episode(process)
+            process = launch_episode(next_episode_index)
+            current_episode_index = next_episode_index
+    finally:
+        terminate_episode(process)
+
+
+def serve_dataset_episode(
+    *,
+    repo_id: str,
+    root: Path | None,
+    episode_index: int,
+    tolerance_s: float,
+    visualize_kwargs: dict,
+) -> None:
+    init_logging()
+    logging.info("Loading dataset for episode %d", episode_index)
+    dataset = LeRobotDataset(repo_id, episodes=[episode_index], root=root, tolerance_s=tolerance_s)
+    try:
+        visualize_dataset(dataset, episode_index=episode_index, **visualize_kwargs)
+    finally:
+        del dataset
+        gc.collect()
+        rr.disconnect()
 
 
 def visualize_dataset(
@@ -494,10 +614,58 @@ def main():
         kwargs["grpc_port"] = kwargs.pop("ws_port")
 
     init_logging()
+    if should_enable_episode_switch(args.mode, bool(args.save)):
+        meta = LeRobotDatasetMetadata(repo_id, root=root)
+        total_episodes = meta.total_episodes
+        del meta
+        gc.collect()
+
+        if args.episode_index >= total_episodes:
+            raise IndexError(f"Episode index {args.episode_index} out of range for dataset with {total_episodes} episodes.")
+
+        visualize_kwargs = vars(args).copy()
+        visualize_kwargs.pop("repo_id")
+        visualize_kwargs.pop("root")
+        visualize_kwargs.pop("tolerance_s")
+        visualize_kwargs.pop("episode_index")
+
+        ctx = mp.get_context("spawn")
+
+        def launch_episode(episode_index: int) -> mp.Process:
+            process = ctx.Process(
+                target=serve_dataset_episode,
+                kwargs={
+                    "repo_id": repo_id,
+                    "root": root,
+                    "episode_index": episode_index,
+                    "tolerance_s": tolerance_s,
+                    "visualize_kwargs": visualize_kwargs,
+                },
+                daemon=True,
+            )
+            process.start()
+            return process
+
+        logging.info(
+            "Interactive episode switching enabled for distant mode. Press 'n' for next episode, 'q' to quit."
+        )
+        run_episode_switch_loop(
+            start_episode_index=args.episode_index,
+            total_episodes=total_episodes,
+            launch_episode=launch_episode,
+            terminate_episode=terminate_episode_process,
+            read_command=read_episode_switch_command,
+        )
+        return
+
     logging.info("Loading dataset")
     dataset = LeRobotDataset(repo_id, episodes=[args.episode_index], root=root, tolerance_s=tolerance_s)
-
-    visualize_dataset(dataset, **vars(args))
+    try:
+        visualize_dataset(dataset, **vars(args))
+    finally:
+        del dataset
+        gc.collect()
+        rr.disconnect()
 
 
 if __name__ == "__main__":
