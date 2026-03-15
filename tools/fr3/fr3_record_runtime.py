@@ -323,7 +323,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
+            needs_pre_episode_reset = cfg.auto_move_to_start_after_episode
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                if needs_pre_episode_reset and not events["stop_recording"]:
+                    _move_robot_to_start(robot, cfg.play_sounds)
+                    _reset_gripper_to_open(robot, teleop, play_sounds=cfg.play_sounds)
+                    needs_pre_episode_reset = False
+
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 _wait_for_teleop_idle(teleop, play_sounds=cfg.play_sounds)
                 _wait_for_episode_start_settle(
