@@ -78,7 +78,7 @@ The current ordering is:
 2. install `lerobot` Python dependencies with `uv pip install ".[all]"`
 3. verify that `pinocchioConfig.cmake` exists in the virtualenv `cmeel.prefix`
 4. build and install `libfranka`
-5. install `panda_py`, `agx-pypika`, and `pyspacemouse`
+5. install `panda_py`, `pika_sdk`, and `pyspacemouse`
 6. install `ruckig`
 7. run import smoke checks during image build
 
@@ -94,7 +94,7 @@ Both Dockerfiles now include:
   `urdfdom_headers`
 - `libfranka` source build
 - `panda_py` installation from the specified git repository
-- `agx-pypika` installation for `pika.gripper`
+- `pika_sdk` installation from `git@github.com:linkage-x/pika_sdk.git` for `pika.gripper`
 - `ruckig` installation for FR3 joint OTG
 - `pyspacemouse` installation
 - `easyhid` installation required by `pyspacemouse`
@@ -233,13 +233,36 @@ spawn a remote viewer process. In the observed setup, the remote viewer failed
 because the SSH shell did not have valid X authorization, while distant-mode
 streaming worked.
 
+## Current Best Practice
+
+For FR3 hardware recording and inspection, the current recommended path is:
+
+1. run recordings through `tools/fr3/fr3_record.py`
+2. let the wrapper choose or forward the dataset root
+3. let the wrapper normalize output ownership back to the host user after a
+   successful Docker recording
+4. inspect the dataset through `lerobot_dataset_viz --mode distant` and a local
+   `rerun` viewer
+
+This is the current best practice because it preserves the existing Docker
+hardware setup while also avoiding the two most common operator failures seen in
+this round:
+
+- root-owned dataset files that break downstream video decoding
+- fragile remote GUI/X11 viewer workflows over SSH
+
 ### Dataset Ownership Note
 
 If the dataset was recorded through `sudo` or a root-owned Docker invocation,
 the recorded mp4 files may end up unreadable by the normal user, for example as
 `root:root` with mode `600`.
 
-In that case, fix ownership before running visualization:
+The FR3 recording wrapper now treats host-readable ownership as part of the
+normal success path and runs a container-side `chown -R <host_uid>:<host_gid>
+<dataset_root>` after a successful recording.
+
+If a dataset was still produced outside that wrapper, fix ownership before
+running visualization:
 
 ```bash
 sudo chown -R hph:hph /home/hph/Code/lerobot/outputs/datasets/fr3_pick_place_ee2ee_v1_20260313_153947

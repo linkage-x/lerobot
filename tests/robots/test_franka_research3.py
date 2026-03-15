@@ -21,7 +21,8 @@ import time
 import types
 
 from lerobot.robots.franka_research3 import FrankaResearch3, FrankaResearch3Config
-from lerobot.robots.franka_research3.backends import PandaPyArmDriver
+from lerobot.robots.franka_research3 import backends as fr3_backends
+from lerobot.robots.franka_research3.backends import PandaPyArmDriver, PikaGripperHardwareDriver
 from lerobot.robots.franka_research3.processor_franka_research3 import (
     AbsoluteEEActionToRobotAction,
     DeltaActionToAbsoluteEEAction,
@@ -83,9 +84,10 @@ class DummyGripperDriver:
     instances: list["DummyGripperDriver"] = []
 
     def __init__(self, *args, **kwargs):
-        del args, kwargs
+        del args
         type(self).instances.append(self)
         self.connected = False
+        self.init_kwargs = kwargs
         self.position = 0.25
         self.set_position_calls: list[float] = []
 
@@ -236,6 +238,127 @@ def test_pandapy_arm_driver_connect_seeds_controller_with_current_joints(monkeyp
     assert len(controller.set_control_calls) == 1
     assert np.allclose(controller.set_control_calls[0], DummyPanda.instances[-1].state.q)
     assert DummyPanda.instances[-1].started_controllers == [controller]
+
+
+def test_pika_gripper_hardware_driver_deduplicates_and_rate_limits(monkeypatch):
+    class FakeSDKGripper:
+        instances: list["FakeSDKGripper"] = []
+
+        def __init__(self, port):
+            self.port = port
+            self.set_gripper_distance_calls: list[float] = []
+            type(self).instances.append(self)
+
+        def connect(self):
+            return True
+
+        def enable(self):
+            return True
+
+        def disable(self):
+            return True
+
+        def disconnect(self):
+            pass
+
+        def get_gripper_distance(self):
+            return 0.0
+
+        def set_gripper_distance(self, width_mm):
+            self.set_gripper_distance_calls.append(float(width_mm))
+
+    monkeypatch.setitem(sys.modules, "pika.gripper", types.SimpleNamespace(Gripper=FakeSDKGripper))
+    perf_counter_values = iter([0.0, 0.01, 0.05, 0.11])
+    monkeypatch.setattr(fr3_backends.time, "perf_counter", lambda: next(perf_counter_values))
+
+    driver = PikaGripperHardwareDriver(
+        serial_port="/dev/ttyUSB80",
+        max_width_mm=100.0,
+        command_rate_limit_hz=10.0,
+        command_deadband_mm=0.5,
+    )
+    driver.connect()
+
+    driver.set_position(0.2)
+    driver.set_position(0.2)
+    driver.set_position(0.4)
+    driver.set_position(0.4)
+    driver.set_position(0.4)
+
+    assert FakeSDKGripper.instances[-1].set_gripper_distance_calls == [20.0, 40.0]
+
+
+def test_pika_gripper_hardware_driver_skips_small_target_changes(monkeypatch):
+    class FakeSDKGripper:
+        instances: list["FakeSDKGripper"] = []
+
+        def __init__(self, port):
+            self.port = port
+            self.set_gripper_distance_calls: list[float] = []
+            type(self).instances.append(self)
+
+        def connect(self):
+            return True
+
+        def enable(self):
+            return True
+
+        def disable(self):
+            return True
+
+        def disconnect(self):
+            pass
+
+        def get_gripper_distance(self):
+            return 0.0
+
+        def set_gripper_distance(self, width_mm):
+            self.set_gripper_distance_calls.append(float(width_mm))
+
+    monkeypatch.setitem(sys.modules, "pika.gripper", types.SimpleNamespace(Gripper=FakeSDKGripper))
+    perf_counter_values = iter([0.0, 1.0])
+    monkeypatch.setattr(fr3_backends.time, "perf_counter", lambda: next(perf_counter_values))
+
+    driver = PikaGripperHardwareDriver(
+        serial_port="/dev/ttyUSB80",
+        max_width_mm=100.0,
+        command_rate_limit_hz=None,
+        command_deadband_mm=0.5,
+    )
+    driver.connect()
+
+    driver.set_position(0.200)
+    driver.set_position(0.203)
+
+    assert FakeSDKGripper.instances[-1].set_gripper_distance_calls == [20.0]
+
+
+def test_connect_passes_gripper_command_throttle_config(monkeypatch):
+    DummyArmDriver.instances = []
+    DummyGripperDriver.instances = []
+    DummyOTGDriver.instances = []
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+            gripper_command_rate_limit_hz=12.5,
+            gripper_command_deadband_mm=0.25,
+        )
+    )
+
+    try:
+        robot.connect()
+        assert DummyGripperDriver.instances[-1].init_kwargs["command_rate_limit_hz"] == pytest.approx(12.5)
+        assert DummyGripperDriver.instances[-1].init_kwargs["command_deadband_mm"] == pytest.approx(0.25)
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
 
 
 def test_move_to_start_restarts_otg_and_clears_teleop_state(robot):

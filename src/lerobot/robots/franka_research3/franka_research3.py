@@ -225,6 +225,8 @@ class FrankaResearch3(Robot):
                 gripper = self.gripper_driver_cls(
                     serial_port=self.config.gripper_port,
                     max_width_mm=self.config.gripper_max_width_mm,
+                    command_rate_limit_hz=self.config.gripper_command_rate_limit_hz,
+                    command_deadband_mm=self.config.gripper_command_deadband_mm,
                 )
                 gripper.connect()
                 self._gripper_is_mock = False

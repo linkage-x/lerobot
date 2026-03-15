@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -128,6 +129,15 @@ def _extras_override_flag(extras: list[str], prefix: str) -> bool:
     return any(extra == prefix or extra.startswith(f"{prefix}=") for extra in extras)
 
 
+def _extras_override_value(extras: list[str], prefix: str) -> str | None:
+    for idx, extra in enumerate(extras):
+        if extra.startswith(f"{prefix}="):
+            return extra.split("=", 1)[1]
+        if extra == prefix and idx + 1 < len(extras):
+            return extras[idx + 1]
+    return None
+
+
 def _build_timestamped_dataset_root(args: argparse.Namespace, extras: list[str], workspace: Path) -> str | None:
     if args.dataset_root is not None or args.resume:
         return None
@@ -142,6 +152,19 @@ def _build_timestamped_dataset_root(args: argparse.Namespace, extras: list[str],
     timestamp = _now().strftime("%Y%m%d_%H%M%S")
     base_path = Path(dataset_root)
     return str(base_path.parent / f"{base_path.name}_{timestamp}")
+
+
+def resolve_dataset_root(args: argparse.Namespace, extras: list[str] | None = None) -> str | None:
+    extra_args = extras or []
+    workspace = args.workspace.resolve()
+    if args.dataset_root is not None:
+        return args.dataset_root
+
+    extra_dataset_root = _extras_override_value(extra_args, "--dataset.root")
+    if extra_dataset_root is not None:
+        return extra_dataset_root
+
+    return _build_timestamped_dataset_root(args, extra_args, workspace)
 
 
 def build_docker_command(args: argparse.Namespace, extras: list[str] | None = None) -> list[str]:
@@ -159,7 +182,7 @@ def build_docker_command(args: argparse.Namespace, extras: list[str] | None = No
     ]
     if args.repo_id is not None:
         record_args.append(f"--dataset.repo_id={args.repo_id}")
-    dataset_root = args.dataset_root or _build_timestamped_dataset_root(args, extra_args, workspace)
+    dataset_root = resolve_dataset_root(args, extra_args)
     if dataset_root is not None:
         record_args.append(f"--dataset.root={dataset_root}")
     if args.task is not None:
@@ -191,15 +214,47 @@ def build_docker_command(args: argparse.Namespace, extras: list[str] | None = No
     ]
 
 
+def build_chown_command(args: argparse.Namespace, dataset_root: str, *, uid: int, gid: int) -> list[str]:
+    workspace = args.workspace.resolve()
+    compose_file = args.compose_file.resolve() if args.compose_file is not None else workspace / "docker" / "docker-compose.yml"
+    quoted_dataset_root = shlex.quote(dataset_root)
+    runtime_args = [
+        "cd /lerobot &&",
+        f"chown -R {uid}:{gid} {quoted_dataset_root}",
+    ]
+    return [
+        "docker",
+        "compose",
+        "-f",
+        str(compose_file),
+        "run",
+        "--rm",
+        args.service,
+        "bash",
+        "-lc",
+        " ".join(runtime_args),
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     args, extras = parse_args(argv)
+    dataset_root = resolve_dataset_root(args, extras)
     command = build_docker_command(args, extras)
     if args.dry_run:
         print(shlex.join(command))
+        if dataset_root is not None:
+            print(shlex.join(build_chown_command(args, dataset_root, uid=os.getuid(), gid=os.getgid())))
         return 0
 
     completed = subprocess.run(command, check=False)
-    return completed.returncode
+    if completed.returncode != 0 or dataset_root is None:
+        return completed.returncode
+
+    ownership_fix = subprocess.run(
+        build_chown_command(args, dataset_root, uid=os.getuid(), gid=os.getgid()),
+        check=False,
+    )
+    return ownership_fix.returncode
 
 
 if __name__ == "__main__":

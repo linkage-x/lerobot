@@ -26,7 +26,8 @@ FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu${OS_VERSION}
 ARG LIBFRANKA_REF=0.15.0
 ARG PANDA_PY_REF=main
 ARG PANDA_PY_REPO=https://github.com/linkage-x/panda-py.git
-ARG AGX_PYPIKA_VERSION=0.1.1
+ARG PIKA_SDK_REF=main
+ARG PIKA_SDK_REPO=git@github.com:linkage-x/pika_sdk.git
 
 # Define Python version argument
 ARG PYTHON_VERSION=3.12
@@ -128,14 +129,17 @@ RUN cd /tmp/libfranka \
 
 USER user_lerobot
 
-RUN uv pip install --no-cache easyhid pyspacemouse "ruckig>=0.15,<0.16" "agx-pypika==${AGX_PYPIKA_VERSION}" --no-deps \
+RUN uv pip install --no-cache easyhid pyspacemouse "ruckig>=0.15,<0.16" --no-deps \
     && export CMEEL_PREFIX="$(find /lerobot/.venv/lib -path '*/site-packages/cmeel.prefix' -type d | head -n 1)" \
     && test -n "${CMEEL_PREFIX}" \
     && git clone --depth 1 --branch "${PANDA_PY_REF}" "${PANDA_PY_REPO}" /tmp/panda-py \
+    && git clone --depth 1 --branch "${PIKA_SDK_REF}" "${PIKA_SDK_REPO}" /tmp/pika_sdk \
     && CMAKE_PREFIX_PATH="${CMEEL_PREFIX};/usr/local" \
        LD_LIBRARY_PATH="${CMEEL_PREFIX}/lib:/usr/local/lib" \
        uv pip install --python /lerobot/.venv/bin/python --no-cache /tmp/panda-py \
+    && uv pip install --python /lerobot/.venv/bin/python --no-cache /tmp/pika_sdk \
     && rm -rf /tmp/panda-py \
+    && rm -rf /tmp/pika_sdk \
     && python -c "import placo; print('placo_ok')" \
     && LD_LIBRARY_PATH="${CMEEL_PREFIX}/lib:/usr/local/lib" python -c "import panda_py; print('panda_py_ok')" \
     && python -c "from pika.gripper import Gripper; print('pika_gripper_ok')" \

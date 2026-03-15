@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import time
 from typing import Protocol
 
 import numpy as np
@@ -152,6 +153,8 @@ class PandaPyArmDriver:
 class PikaGripperHardwareDriver:
     serial_port: str
     max_width_mm: float = 90.0
+    command_rate_limit_hz: float | None = 15.0
+    command_deadband_mm: float = 0.5
 
     def __post_init__(self):
         _silence_pika_logs()
@@ -165,6 +168,9 @@ class PikaGripperHardwareDriver:
 
         self._gripper_cls = Gripper
         self._gripper = None
+        self._last_command_width_mm: float | None = None
+        self._last_command_time_s: float | None = None
+        self._pending_command_width_mm: float | None = None
 
     def connect(self) -> None:
         self._gripper = self._gripper_cls(self.serial_port)
@@ -180,6 +186,9 @@ class PikaGripperHardwareDriver:
             finally:
                 self._gripper.disconnect()
                 self._gripper = None
+        self._last_command_width_mm = None
+        self._last_command_time_s = None
+        self._pending_command_width_mm = None
 
     def get_position(self) -> float:
         if self._gripper is None:
@@ -191,7 +200,30 @@ class PikaGripperHardwareDriver:
         if self._gripper is None:
             raise RuntimeError("Gripper backend is not connected.")
         target_width_mm = float(np.clip(normalized_position, 0.0, 1.0) * self.max_width_mm)
-        self._gripper.set_gripper_distance(target_width_mm)
+        if (
+            self._last_command_width_mm is not None
+            and abs(target_width_mm - self._last_command_width_mm) < self.command_deadband_mm
+        ):
+            self._pending_command_width_mm = None
+            return
+
+        self._pending_command_width_mm = target_width_mm
+
+        now = time.perf_counter()
+        if self.command_rate_limit_hz is not None and self._last_command_time_s is not None:
+            min_interval_s = 1.0 / self.command_rate_limit_hz
+            if now - self._last_command_time_s < min_interval_s:
+                return
+
+        pending_width_mm = self._pending_command_width_mm
+        if pending_width_mm is None:
+            return
+
+        # Collapse repeated control-loop writes into the newest target before touching the serial link.
+        self._gripper.set_gripper_distance(pending_width_mm)
+        self._last_command_width_mm = pending_width_mm
+        self._last_command_time_s = now
+        self._pending_command_width_mm = None
 
 
 @dataclass

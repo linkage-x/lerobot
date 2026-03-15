@@ -45,6 +45,8 @@ class FrankaResearch3Config(RobotConfig):
     max_target_delta_pos: tuple[float, float, float] | None = None
     max_target_delta_rot: tuple[float, float, float] | None = None
     gripper_max_width_mm: float = 90.0
+    gripper_command_rate_limit_hz: float | None = 15.0
+    gripper_command_deadband_mm: float = 0.5
     disable_torque_on_disconnect: bool = True
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
     damping: list[float] | None = None
@@ -73,6 +75,10 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("workspace_min must be strictly smaller than workspace_max.")
         if self.gripper_max_width_mm <= 0:
             raise ValueError("gripper_max_width_mm must be positive.")
+        if self.gripper_command_rate_limit_hz is not None and self.gripper_command_rate_limit_hz <= 0:
+            raise ValueError("gripper_command_rate_limit_hz must be positive when provided.")
+        if self.gripper_command_deadband_mm < 0:
+            raise ValueError("gripper_command_deadband_mm must be non-negative.")
         if self.otg_control_frequency <= 0:
             raise ValueError("otg_control_frequency must be positive.")
         if self.otg_async_control_frequency <= 0:
