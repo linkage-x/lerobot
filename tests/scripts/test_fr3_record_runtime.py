@@ -402,9 +402,94 @@ def test_wait_for_episode_start_settle_freezes_initial_target_and_waits_until_gr
     )
 
     assert teleop.get_action_calls == 1
-    assert len(teleop_action_processor.calls) == 1
+    assert len(teleop_action_processor.calls) == 0
     assert len(robot.send_action_calls) == 3
     assert all(action["gripper.pos"] == 1.0 for action in robot.send_action_calls)
+    assert all(action["ee.x"] == 0.4 for action in robot.send_action_calls)
+    assert teleop_action_processor.reset_calls == 1
+    assert robot_observation_processor.reset_calls == 1
+
+
+def test_wait_for_episode_start_settle_ignores_initial_spacemouse_translation(monkeypatch):
+    monkeypatch.setattr(fr3_record_runtime, "precise_sleep", lambda duration_s: None)
+    monkeypatch.setattr(fr3_record_runtime, "EPISODE_START_SETTLE_CONSECUTIVE_SAMPLES", 1)
+    monkeypatch.setattr(fr3_record_runtime, "EPISODE_START_SETTLE_TIMEOUT_S", 1.0)
+
+    observations = [
+        {
+            "ee.x": 0.42,
+            "ee.y": 0.01,
+            "ee.z": 0.31,
+            "ee.qx": 0.0,
+            "ee.qy": 0.0,
+            "ee.qz": 0.0,
+            "ee.qw": 1.0,
+            "gripper.pos": 0.4,
+        },
+        {
+            "ee.x": 0.42,
+            "ee.y": 0.01,
+            "ee.z": 0.31,
+            "ee.qx": 0.0,
+            "ee.qy": 0.0,
+            "ee.qz": 0.0,
+            "ee.qw": 1.0,
+            "gripper.pos": 0.7,
+        },
+    ]
+    robot = FakeSettlingRobot(observations)
+    teleop = FakeTeleopWithAction(
+        {
+            "enabled": True,
+            "target_x": -0.05,
+            "target_y": 0.02,
+            "target_z": 0.01,
+            "target_wx": 0.0,
+            "target_wy": 0.0,
+            "target_wz": 0.1,
+            "gripper": 0.7,
+        }
+    )
+    teleop_action_processor = FakeTargetActionProcessor(
+        {
+            "enabled": True,
+            "target_x": -0.05,
+            "target_y": 0.02,
+            "target_z": 0.01,
+            "target_wx": 0.0,
+            "target_wy": 0.0,
+            "target_wz": 0.1,
+            "gripper": 0.7,
+            "ee.x": 0.37,
+            "ee.y": 0.03,
+            "ee.z": 0.32,
+            "ee.qx": 0.0,
+            "ee.qy": 0.0,
+            "ee.qz": 0.05,
+            "ee.qw": 0.998749217771909,
+            "gripper.pos": 0.7,
+        }
+    )
+    robot_action_processor = FakeRobotActionProcessor()
+    robot_observation_processor = FakeObservationProcessor()
+
+    fr3_record_runtime._wait_for_episode_start_settle(
+        robot=robot,
+        teleop=teleop,
+        teleop_action_processor=teleop_action_processor,
+        robot_action_processor=robot_action_processor,
+        robot_observation_processor=robot_observation_processor,
+        events={"stop_recording": False},
+        fps=30,
+    )
+
+    assert teleop.get_action_calls == 1
+    assert len(teleop_action_processor.calls) == 0
+    assert len(robot.send_action_calls) == 1
+    assert robot.send_action_calls[0]["ee.x"] == 0.42
+    assert robot.send_action_calls[0]["ee.y"] == 0.01
+    assert robot.send_action_calls[0]["ee.z"] == 0.31
+    assert robot.send_action_calls[0]["gripper.pos"] == 0.7
     assert teleop_action_processor.reset_calls == 1
     assert robot_observation_processor.reset_calls == 1
 

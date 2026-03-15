@@ -201,6 +201,35 @@ This note captures the main conclusions from the FR3 recording and visualization
   an invalid recording artifact for downstream tooling.
 - For remote inspection, use `lerobot_dataset_viz --mode distant` plus a local
   `rerun` viewer instead of trying to forward the remote GUI directly.
+- During episode-start settle, freeze the current EE pose from robot
+  observation and only inherit the current gripper target from teleop.
+- Do not freeze live SpaceMouse translation/rotation deltas into the settle
+  target, even for a single frame.
+
+## Settle Target Regression Fix
+
+- After the gripper command-spam fix, recording start showed a new visible
+  default motion along `-X`.
+- Root cause:
+  `_wait_for_episode_start_settle(...)` froze its settle target from the first
+  live `teleop.get_action()` sample.
+- That meant a transient SpaceMouse sample such as:
+  - `enabled=True`
+  - `target_x != 0`
+  could be converted into an absolute EE target and replayed throughout the
+  settle window.
+- Why it became visible only now:
+  gripper rate limiting did not create the bug, but it lengthened the settle
+  window enough for the bad first-frame target to move the arm.
+- Fix:
+  `tools/fr3/fr3_record_runtime.py` now builds the settle target from:
+  - current robot EE pose
+  - current robot EE orientation
+  - current teleop gripper target
+  and forces zero translational / rotational deltas for the settle phase.
+- Regression tests now lock this down:
+  - the settle helper must not call the teleop delta-to-absolute processor
+  - an initial SpaceMouse `target_x` sample must not change the settle EE target
 
 ## Next TODO
 

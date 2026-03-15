@@ -121,6 +121,29 @@ def _compute_episode_start_settle_errors(observation: dict, target_action: dict)
     return position_error_m, angle_error_rad, gripper_error
 
 
+def _make_episode_start_settle_target(initial_observation: dict, initial_action: dict) -> dict:
+    gripper = float(
+        np.clip(
+            initial_action.get("gripper.pos", initial_action.get("gripper", initial_observation["gripper.pos"])),
+            0.0,
+            1.0,
+        )
+    )
+    return {
+        "enabled": False,
+        "target_x": 0.0,
+        "target_y": 0.0,
+        "target_z": 0.0,
+        "target_wx": 0.0,
+        "target_wy": 0.0,
+        "target_wz": 0.0,
+        "gripper": gripper,
+        **{key: float(initial_observation[key]) for key in EE_POSITION_KEYS},
+        **{key: float(initial_observation[key]) for key in EE_QUAT_KEYS},
+        "gripper.pos": gripper,
+    }
+
+
 def _wait_for_episode_start_settle(
     *,
     robot,
@@ -132,8 +155,9 @@ def _wait_for_episode_start_settle(
     fps: int,
 ) -> None:
     initial_observation = robot.get_observation()
+    initial_observation_processed = robot_observation_processor(initial_observation)
     initial_action = teleop.get_action()
-    target_action = teleop_action_processor((initial_action, initial_observation))
+    target_action = _make_episode_start_settle_target(initial_observation_processed, initial_action)
 
     settle_start_t = time.perf_counter()
     consecutive_ok = 0
