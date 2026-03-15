@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+from datetime import datetime, timedelta, timezone
+
 import numpy as np
 import torch
 
@@ -9,6 +11,8 @@ from lerobot.scripts.lerobot_dataset_viz import (
     extract_ee_pose,
     get_ee_pose_state_indices,
     has_ee_pose,
+    make_system_time_anchor,
+    to_system_timestamp,
 )
 from lerobot.utils.rotation import Rotation
 
@@ -159,3 +163,13 @@ def test_ee_ruler_axis_colors_follow_rgb_convention():
         "y": [0, 255, 0, 255],
         "z": [0, 0, 255, 255],
     }
+
+
+def test_system_time_anchor_and_timestamp_conversion():
+    now = datetime(2026, 3, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    anchor = make_system_time_anchor(1.5, now=now)
+
+    assert anchor == now - timedelta(seconds=1.5)
+    assert to_system_timestamp(anchor, 1.5) == now
+    assert to_system_timestamp(anchor, 2.0) == now + timedelta(seconds=0.5)

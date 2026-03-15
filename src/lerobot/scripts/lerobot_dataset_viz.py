@@ -63,6 +63,7 @@ import argparse
 import gc
 import logging
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -115,6 +116,16 @@ def _to_float(value) -> float:
     if hasattr(value, "item"):
         return float(value.item())
     return float(value)
+
+
+def make_system_time_anchor(first_relative_timestamp_s: float, now: datetime | None = None) -> datetime:
+    if now is None:
+        now = datetime.now().astimezone()
+    return now - timedelta(seconds=float(first_relative_timestamp_s))
+
+
+def to_system_timestamp(anchor: datetime, relative_timestamp_s: float) -> datetime:
+    return anchor + timedelta(seconds=float(relative_timestamp_s))
 
 
 def extract_ee_pose(
@@ -294,15 +305,21 @@ def visualize_dataset(
     log_ee_ruler(ee_ruler_length)
 
     first_index = None
+    system_time_anchor = None
     ee_trajectory_positions: list[np.ndarray] = []
     ee_pose_state_indices = get_ee_pose_state_indices(dataset.meta.features.get(OBS_STATE, {}).get("names"))
     for batch in tqdm.tqdm(dataloader, total=len(dataloader)):
         if first_index is None:
             first_index = batch["index"][0].item()
+        if system_time_anchor is None:
+            system_time_anchor = make_system_time_anchor(batch["timestamp"][0].item())
+            logging.info("Rerun timestamp timeline anchored to system time at %s.", system_time_anchor.isoformat())
         # iterate over the batch
         for i in range(len(batch["index"])):
+            relative_timestamp_s = batch["timestamp"][i].item()
             rr.set_time("frame_index", sequence=batch["index"][i].item() - first_index)
-            rr.set_time("timestamp", timestamp=batch["timestamp"][i].item())
+            rr.set_time("episode_time", duration=relative_timestamp_s)
+            rr.set_time("timestamp", timestamp=to_system_timestamp(system_time_anchor, relative_timestamp_s))
 
             # display each camera image
             for key in dataset.meta.camera_keys:
