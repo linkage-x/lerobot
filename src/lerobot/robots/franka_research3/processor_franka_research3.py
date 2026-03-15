@@ -58,25 +58,34 @@ class KeepAbsoluteEEObservation(ObservationProcessorStep):
     _prev_quaternion_xyzw: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def observation(self, observation: RobotObservation) -> RobotObservation:
-        filtered_observation = {
-            key: value
-            for key, value in observation.items()
-            if key not in EE_ROTVEC_KEYS
-            and ((key.startswith("ee.")) or key == "gripper.pos" or not key.endswith(".pos"))
-        }
-
         if all(key in observation for key in EE_ROTVEC_KEYS):
             quaternion_xyzw = Rotation.from_rotvec([observation[key] for key in EE_ROTVEC_KEYS]).as_quat()
         elif all(key in observation for key in EE_QUAT_KEYS):
             quaternion_xyzw = np.array([observation[key] for key in EE_QUAT_KEYS], dtype=np.float64)
         else:
-            return filtered_observation
+            quaternion_xyzw = None
+
+        passthrough_observation = {
+            key: value
+            for key, value in observation.items()
+            if not key.startswith("ee.") and key != "gripper.pos" and not key.endswith(".pos")
+        }
+
+        if quaternion_xyzw is None:
+            return {
+                **{key: observation[key] for key in EE_POSITION_KEYS if key in observation},
+                "gripper.pos": observation["gripper.pos"],
+                **passthrough_observation,
+            }
 
         quaternion_xyzw = _continuous_quaternion(quaternion_xyzw, self._prev_quaternion_xyzw)
         self._prev_quaternion_xyzw = quaternion_xyzw.copy()
-        for key, value in zip(EE_QUAT_KEYS, quaternion_xyzw, strict=True):
-            filtered_observation[key] = float(value)
-        return filtered_observation
+        return {
+            **{key: observation[key] for key in EE_POSITION_KEYS},
+            **{key: float(value) for key, value in zip(EE_QUAT_KEYS, quaternion_xyzw, strict=True)},
+            "gripper.pos": observation["gripper.pos"],
+            **passthrough_observation,
+        }
 
     def reset(self) -> None:
         self._prev_quaternion_xyzw = None
@@ -90,8 +99,11 @@ class KeepAbsoluteEEObservation(ObservationProcessorStep):
                 observation_features.pop(key, None)
         for key in EE_ROTVEC_KEYS:
             observation_features.pop(key, None)
+        gripper_feature = observation_features.pop("gripper.pos", None)
         for key in EE_QUAT_KEYS:
             observation_features[key] = PolicyFeature(type=FeatureType.STATE, shape=(1,))
+        if gripper_feature is not None:
+            observation_features["gripper.pos"] = gripper_feature
         return features
 
 
