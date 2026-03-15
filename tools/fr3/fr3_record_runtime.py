@@ -207,6 +207,17 @@ def _wait_for_episode_start_settle(
     robot_observation_processor.reset()
 
 
+def _wait_for_teleop_idle(teleop, *, play_sounds: bool) -> None:
+    wait_until_idle = getattr(teleop, "wait_until_idle", None)
+    if not callable(wait_until_idle):
+        return
+
+    logging.info("Waiting for teleop input to return to idle before starting the episode.")
+    log_say("Release teleop input", play_sounds)
+    if not wait_until_idle(consecutive_samples=3):
+        raise RuntimeError("Teleop input did not return to idle before starting the episode.")
+
+
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
     if cfg.teleop is None:
@@ -287,6 +298,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                _wait_for_teleop_idle(teleop, play_sounds=cfg.play_sounds)
                 _wait_for_episode_start_settle(
                     robot=robot,
                     teleop=teleop,

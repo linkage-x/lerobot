@@ -225,6 +225,69 @@ def test_get_action_requires_deadman_button(monkeypatch):
     teleop.disconnect()
 
 
+def test_wait_until_idle_drains_stale_motion_before_returning(monkeypatch):
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            bias_sample_count=0,
+            move_time=0.0,
+            threshold_x=0.02,
+            threshold_y=0.02,
+            threshold_z=0.02,
+            threshold_wx=0.04,
+            threshold_wy=0.04,
+            threshold_wz=0.04,
+        )
+    )
+    teleop.connect()
+    teleop._driver.readings.extend(
+        [
+            SpaceMouseReading(
+                translation=[0.0, -0.3, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+            SpaceMouseReading(
+                translation=[0.0, -0.3, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+            SpaceMouseReading(
+                translation=[0.0, 0.0, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+            None,
+        ]
+    )
+
+    assert teleop.wait_until_idle(consecutive_samples=2, poll_interval_s=0.0) is True
+
+    teleop.disconnect()
+
+
+def test_wait_until_idle_times_out_when_motion_persists(monkeypatch):
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            bias_sample_count=0,
+            move_time=0.0,
+        )
+    )
+    teleop.connect()
+    teleop._driver.readings.append(
+        SpaceMouseReading(
+            translation=[0.0, -0.3, 0.0],
+            rotation=[0.0, 0.0, 0.0],
+            buttons=(False, False),
+        )
+    )
+
+    assert teleop.wait_until_idle(consecutive_samples=1, timeout_s=0.0, poll_interval_s=0.0) is False
+
+    teleop.disconnect()
+
+
 def test_incremental_gripper_updates(teleop):
     teleop.connect()
     teleop._last_gripper = 0.5

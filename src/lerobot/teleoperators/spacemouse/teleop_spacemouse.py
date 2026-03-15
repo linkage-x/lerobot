@@ -135,6 +135,37 @@ class SpaceMouseTeleop(Teleoperator):
             "gripper": self._last_gripper,
         }
 
+    def _motion_threshold_vector(self) -> np.ndarray:
+        return np.array(
+            [
+                self.config.threshold_x,
+                self.config.threshold_y,
+                self.config.threshold_z,
+                self.config.threshold_wx,
+                self.config.threshold_wy,
+                self.config.threshold_wz,
+            ],
+            dtype=np.float64,
+        )
+
+    def _reading_motion_data(self, reading) -> np.ndarray:
+        return np.array(
+            [
+                -(reading.translation[1] - self._translation_bias[1]),
+                reading.translation[0] - self._translation_bias[0],
+                reading.translation[2] - self._translation_bias[2],
+                reading.rotation[0] - self._rotation_bias[0],
+                reading.rotation[1] - self._rotation_bias[1],
+                reading.rotation[2] - self._rotation_bias[2],
+            ],
+            dtype=np.float64,
+        )
+
+    def _reading_has_motion(self, reading) -> bool:
+        if reading is None:
+            return False
+        return bool(np.any(np.abs(self._reading_motion_data(reading)) >= self._motion_threshold_vector()))
+
     def _update_gripper(self, button_0: bool, button_1: bool) -> None:
         if self.config.tool_mode == SpaceMouseToolMode.BINARY:
             if button_0 and not button_1:
@@ -184,33 +215,43 @@ class SpaceMouseTeleop(Teleoperator):
         return np.where(np.isnan(overrides), default_vector, overrides)
 
     @check_if_not_connected
+    def wait_until_idle(
+        self,
+        *,
+        consecutive_samples: int = 3,
+        timeout_s: float | None = None,
+        poll_interval_s: float | None = None,
+    ) -> bool:
+        if consecutive_samples < 1:
+            raise ValueError("consecutive_samples must be >= 1")
+
+        interval_s = poll_interval_s if poll_interval_s is not None else 1.0 / max(self.config.frequency, 1)
+        deadline = None if timeout_s is None else time.perf_counter() + timeout_s
+        idle_samples = 0
+
+        while True:
+            reading = self._driver.poll()
+            if self._reading_has_motion(reading):
+                idle_samples = 0
+            else:
+                idle_samples += 1
+                if idle_samples >= consecutive_samples:
+                    return True
+
+            if deadline is not None and time.perf_counter() >= deadline:
+                return False
+
+            if interval_s > 0.0:
+                time.sleep(interval_s)
+
+    @check_if_not_connected
     def get_action(self) -> RobotAction:
         reading = self._driver.poll()
         if reading is None:
             return self._zero_action()
 
-        data = np.array(
-            [
-                -(reading.translation[1] - self._translation_bias[1]),
-                reading.translation[0] - self._translation_bias[0],
-                reading.translation[2] - self._translation_bias[2],
-                reading.rotation[0] - self._rotation_bias[0],
-                reading.rotation[1] - self._rotation_bias[1],
-                reading.rotation[2] - self._rotation_bias[2],
-            ],
-            dtype=np.float64,
-        )
-        threshold = np.array(
-            [
-                self.config.threshold_x,
-                self.config.threshold_y,
-                self.config.threshold_z,
-                self.config.threshold_wx,
-                self.config.threshold_wy,
-                self.config.threshold_wz,
-            ],
-            dtype=np.float64,
-        )
+        data = self._reading_motion_data(reading)
+        threshold = self._motion_threshold_vector()
         scale = np.concatenate((self.translation_scale_vector, self.rotation_scale_vector))
         active_mask = np.abs(data) >= threshold
         data = np.where(active_mask, data, 0.0)

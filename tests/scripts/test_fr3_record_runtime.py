@@ -251,6 +251,7 @@ def test_record_waits_for_episode_start_settle_before_record_loop(monkeypatch):
     robot = FakeRobot()
     teleop = FakeTeleop()
     call_order = []
+    teleop.wait_until_idle = lambda **kwargs: call_order.append("idle") or True
 
     monkeypatch.setattr(fr3_record_runtime, "init_logging", lambda: None)
     monkeypatch.setattr(fr3_record_runtime, "make_robot_from_config", lambda cfg: robot)
@@ -306,7 +307,7 @@ def test_record_waits_for_episode_start_settle_before_record_loop(monkeypatch):
 
     fr3_record_runtime.record(cfg)
 
-    assert call_order == ["settle", "record"]
+    assert call_order == ["idle", "settle", "record"]
 
 
 def test_wait_for_episode_start_settle_freezes_initial_target_and_waits_until_gripper_catches_up(monkeypatch):
