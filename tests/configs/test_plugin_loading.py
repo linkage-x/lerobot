@@ -103,3 +103,25 @@ def test_wrap_with_plugin(plugin_dir: Path):
     assert isinstance(cfg, Config)
     assert isinstance(cfg.env, EnvConfig.get_choice_class("test_env"))
     assert cfg.env.value == 42
+
+
+def test_wrap_resolves_string_annotations(monkeypatch):
+    @dataclass
+    class Config:
+        value: int = 42
+
+    globals()["StringAnnotatedConfig"] = Config
+
+    @wrap()
+    def dummy_func(cfg: "StringAnnotatedConfig"):
+        return cfg
+
+    monkeypatch.setattr(sys, "argv", ["dummy_script.py"])
+
+    try:
+        cfg = dummy_func()
+    finally:
+        globals().pop("StringAnnotatedConfig", None)
+
+    assert isinstance(cfg, Config)
+    assert cfg.value == 42

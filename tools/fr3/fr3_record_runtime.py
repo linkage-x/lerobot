@@ -27,7 +27,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.datasets.utils import combine_feature_dicts
-from lerobot.processor import RobotProcessorPipeline, make_default_robot_action_processor
+from lerobot.processor import RobotProcessorPipeline
 from lerobot.processor.converters import (
     observation_to_transition,
     robot_action_observation_to_transition,
@@ -35,7 +35,11 @@ from lerobot.processor.converters import (
     transition_to_robot_action,
 )
 from lerobot.robots import franka_research3, make_robot_from_config
-from lerobot.robots.franka_research3 import DeltaActionToAbsoluteEEAction, KeepAbsoluteEEObservation
+from lerobot.robots.franka_research3 import (
+    AbsoluteEEActionToRobotAction,
+    DeltaActionToAbsoluteEEAction,
+    KeepAbsoluteEEObservation,
+)
 from lerobot.scripts.lerobot_record import (
     RecordConfig,
     _confirm_next_episode,
@@ -72,7 +76,11 @@ def make_fr3_ee2ee_processors(cfg: RecordConfig) -> tuple[
         to_transition=robot_action_observation_to_transition,
         to_output=transition_to_robot_action,
     )
-    robot_action_processor = make_default_robot_action_processor()
+    robot_action_processor = RobotProcessorPipeline[tuple[dict, dict], dict](
+        steps=[AbsoluteEEActionToRobotAction()],
+        to_transition=robot_action_observation_to_transition,
+        to_output=transition_to_robot_action,
+    )
     robot_observation_processor = RobotProcessorPipeline[dict, dict](
         steps=[KeepAbsoluteEEObservation()],
         to_transition=observation_to_transition,
@@ -187,6 +195,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
                 dataset.save_episode()
                 recorded_episodes += 1
+                teleop_action_processor.reset()
 
                 should_move_to_start = (
                     cfg.auto_move_to_start_after_episode

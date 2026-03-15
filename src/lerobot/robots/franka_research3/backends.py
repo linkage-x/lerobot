@@ -101,6 +101,8 @@ class PandaPyArmDriver:
             self._controller.set_stiffness(self.stiffness)
         if self.filter_coeff is not None:
             self._controller.set_filter(self.filter_coeff)
+        current_joint_positions = np.asarray(self._robot.get_state().q, dtype=np.float64)
+        self._controller.set_control(current_joint_positions)
         self._robot.start_controller(self._controller)
 
     def _stop_controller(self) -> None:

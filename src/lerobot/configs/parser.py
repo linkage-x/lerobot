@@ -21,7 +21,7 @@ from functools import wraps
 from pathlib import Path
 from pkgutil import ModuleInfo
 from types import ModuleType
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar, cast, get_type_hints
 
 import draccus
 
@@ -31,6 +31,17 @@ F = TypeVar("F", bound=Callable[..., object])
 
 PATH_KEY = "path"
 PLUGIN_DISCOVERY_SUFFIX = "discover_packages_path"
+
+
+def get_wrapped_argtype(fn: Callable[..., object], arg_name: str) -> Any:
+    """Resolve the wrapped config type, including postponed annotations."""
+    closure_vars = inspect.getclosurevars(fn)
+    localns = {
+        **closure_vars.globals,
+        **closure_vars.nonlocals,
+        **closure_vars.builtins,
+    }
+    return get_type_hints(fn, globalns=fn.__globals__, localns=localns)[arg_name]
 
 
 def get_cli_overrides(field_name: str, args: Sequence[str] | None = None) -> list[str] | None:
@@ -207,7 +218,8 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
         @wraps(fn)
         def wrapper_inner(*args: Any, **kwargs: Any) -> Any:
             argspec = inspect.getfullargspec(fn)
-            argtype = argspec.annotations[argspec.args[0]]
+            arg_name = argspec.args[0]
+            argtype = get_wrapped_argtype(fn, arg_name)
             if len(args) > 0 and type(args[0]) is argtype:
                 cfg = args[0]
                 args = args[1:]

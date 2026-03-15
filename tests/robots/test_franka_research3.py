@@ -16,10 +16,14 @@
 
 import numpy as np
 import pytest
+import sys
 import time
+import types
 
 from lerobot.robots.franka_research3 import FrankaResearch3, FrankaResearch3Config
+from lerobot.robots.franka_research3.backends import PandaPyArmDriver
 from lerobot.robots.franka_research3.processor_franka_research3 import (
+    AbsoluteEEActionToRobotAction,
     DeltaActionToAbsoluteEEAction,
     KeepAbsoluteEEObservation,
 )
@@ -177,6 +181,61 @@ def test_connect_disconnect(robot):
     assert len(DummyOTGDriver.instances[-1].reset_calls) == 1
     robot.disconnect()
     assert not robot.is_connected
+
+
+def test_pandapy_arm_driver_connect_seeds_controller_with_current_joints(monkeypatch):
+    class DummyJointPositionController:
+        def __init__(self):
+            self.set_control_calls = []
+            self.set_damping_calls = []
+            self.set_stiffness_calls = []
+            self.set_filter_calls = []
+
+        def set_control(self, joint_positions):
+            self.set_control_calls.append(np.asarray(joint_positions, dtype=np.float64))
+
+        def set_damping(self, damping):
+            self.set_damping_calls.append(damping)
+
+        def set_stiffness(self, stiffness):
+            self.set_stiffness_calls.append(stiffness)
+
+        def set_filter(self, coeff):
+            self.set_filter_calls.append(coeff)
+
+    class DummyPanda:
+        instances: list["DummyPanda"] = []
+
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.started_controllers = []
+            self.stopped = 0
+            self.state = types.SimpleNamespace(q=np.array([0.1, 0.2, 0.3, -1.0, 0.5, 1.2, -0.7], dtype=np.float64))
+            type(self).instances.append(self)
+
+        def start_controller(self, controller):
+            self.started_controllers.append(controller)
+
+        def stop_controller(self):
+            self.stopped += 1
+
+        def get_state(self):
+            return self.state
+
+    fake_module = types.SimpleNamespace(
+        Panda=DummyPanda,
+        controllers=types.SimpleNamespace(JointPosition=DummyJointPositionController),
+    )
+    monkeypatch.setitem(sys.modules, "panda_py", fake_module)
+
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206")
+    driver.connect()
+
+    controller = driver._controller
+    assert controller is not None
+    assert len(controller.set_control_calls) == 1
+    assert np.allclose(controller.set_control_calls[0], DummyPanda.instances[-1].state.q)
+    assert DummyPanda.instances[-1].started_controllers == [controller]
 
 
 def test_move_to_start_restarts_otg_and_clears_teleop_state(robot):
@@ -517,10 +576,115 @@ def test_delta_action_processor_outputs_absolute_ee_targets(robot):
     assert processed_first["ee.x"] == pytest.approx(0.41)
     assert processed_first["ee.y"] == pytest.approx(0.08)
     assert processed_first["ee.z"] == pytest.approx(0.33)
+    assert processed_first["enabled"] is True
+    assert processed_first["target_x"] == pytest.approx(0.01)
+    assert processed_first["target_y"] == pytest.approx(-0.02)
+    assert processed_first["target_z"] == pytest.approx(0.03)
+    assert processed_first["gripper"] == pytest.approx(0.5)
     assert processed_first["gripper.pos"] == pytest.approx(0.5)
     assert processed_second["ee.x"] == pytest.approx(0.42)
     assert processed_second["ee.y"] == pytest.approx(0.06)
     assert processed_second["ee.z"] == pytest.approx(0.36)
+
+
+def test_delta_action_processor_reset_clears_previous_episode_target(robot):
+    robot.connect()
+    processor = RobotProcessorPipeline[tuple[dict, dict], dict](
+        steps=[
+            DeltaActionToAbsoluteEEAction(
+                workspace_min=robot.config.workspace_min,
+                workspace_max=robot.config.workspace_max,
+                max_target_delta_pos=robot.config.max_target_delta_pos,
+                max_target_delta_rot=robot.config.max_target_delta_rot,
+            )
+        ],
+        to_transition=robot_action_observation_to_transition,
+        to_output=transition_to_robot_action,
+    )
+
+    episode_one_observation = robot.get_observation()
+    active_action = {
+        "enabled": True,
+        "target_x": 0.01,
+        "target_y": -0.02,
+        "target_z": 0.03,
+        "target_wx": 0.0,
+        "target_wy": 0.0,
+        "target_wz": 0.0,
+        "gripper": 0.5,
+    }
+    processor((active_action.copy(), episode_one_observation))
+
+    start_pose_observation = episode_one_observation.copy()
+    start_pose_observation["ee.x"] = 0.3
+    start_pose_observation["ee.y"] = -0.1
+    start_pose_observation["ee.z"] = 0.25
+    processor.reset()
+
+    disabled_action = {
+        "enabled": False,
+        "target_x": 0.0,
+        "target_y": 0.0,
+        "target_z": 0.0,
+        "target_wx": 0.0,
+        "target_wy": 0.0,
+        "target_wz": 0.0,
+        "gripper": 0.5,
+    }
+    processed = processor((disabled_action.copy(), start_pose_observation))
+
+    assert processed["ee.x"] == pytest.approx(0.3)
+    assert processed["ee.y"] == pytest.approx(-0.1)
+    assert processed["ee.z"] == pytest.approx(0.25)
+    assert processed["gripper.pos"] == pytest.approx(0.5)
+
+
+def test_absolute_ee_action_to_robot_action_uses_delta_hold_when_disabled():
+    processor = RobotProcessorPipeline[tuple[dict, dict], dict](
+        steps=[AbsoluteEEActionToRobotAction()],
+        to_transition=robot_action_observation_to_transition,
+        to_output=transition_to_robot_action,
+    )
+
+    observation = {
+        "ee.x": 0.4,
+        "ee.y": 0.1,
+        "ee.z": 0.3,
+        "ee.wx": 0.0,
+        "ee.wy": 0.0,
+        "ee.wz": 0.0,
+        "gripper.pos": 0.5,
+    }
+    action = {
+        "enabled": False,
+        "target_x": 0.0,
+        "target_y": 0.0,
+        "target_z": 0.0,
+        "target_wx": 0.0,
+        "target_wy": 0.0,
+        "target_wz": 0.0,
+        "gripper": 0.5,
+        "ee.x": 0.39,
+        "ee.y": 0.09,
+        "ee.z": 0.28,
+        "ee.wx": 0.0,
+        "ee.wy": 0.0,
+        "ee.wz": 0.0,
+        "gripper.pos": 0.5,
+    }
+
+    processed = processor((action, observation))
+
+    assert processed == {
+        "enabled": False,
+        "target_x": 0.0,
+        "target_y": 0.0,
+        "target_z": 0.0,
+        "target_wx": 0.0,
+        "target_wy": 0.0,
+        "target_wz": 0.0,
+        "gripper": 0.5,
+    }
 
 
 def test_keep_absolute_ee_observation_filters_joint_state(robot):

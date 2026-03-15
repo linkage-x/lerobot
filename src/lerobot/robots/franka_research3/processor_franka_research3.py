@@ -79,13 +79,19 @@ class DeltaActionToAbsoluteEEAction(RobotActionProcessorStep):
         current_pose = self._pose_from_observation(observation)
         enabled = bool(action.pop("enabled"))
         gripper = float(np.clip(action.pop("gripper"), 0.0, 1.0))
+        raw_target_x = float(action.pop("target_x"))
+        raw_target_y = float(action.pop("target_y"))
+        raw_target_z = float(action.pop("target_z"))
+        raw_target_wx = float(action.pop("target_wx"))
+        raw_target_wy = float(action.pop("target_wy"))
+        raw_target_wz = float(action.pop("target_wz"))
 
         if enabled:
             if not self._prev_enabled or self._reference_pose is None:
                 self._reference_pose = current_pose.copy()
 
             delta_pos = np.array(
-                [float(action.pop("target_x")), float(action.pop("target_y")), float(action.pop("target_z"))],
+                [raw_target_x, raw_target_y, raw_target_z],
                 dtype=np.float64,
             )
             if self.max_target_delta_pos is not None:
@@ -96,7 +102,7 @@ class DeltaActionToAbsoluteEEAction(RobotActionProcessorStep):
                 )
 
             delta_rotvec = np.array(
-                [float(action.pop("target_wx")), float(action.pop("target_wy")), float(action.pop("target_wz"))],
+                [raw_target_wx, raw_target_wy, raw_target_wz],
                 dtype=np.float64,
             )
             if self.max_target_delta_rot is not None:
@@ -121,13 +127,17 @@ class DeltaActionToAbsoluteEEAction(RobotActionProcessorStep):
             desired_pose = self._last_command_pose.copy() if self._last_command_pose is not None else current_pose.copy()
             self._reference_pose = None
 
-            # Consume the disabled delta payload to keep the action contract explicit.
-            for key in ("target_x", "target_y", "target_z", "target_wx", "target_wy", "target_wz"):
-                action.pop(key, None)
-
         desired_rotvec = Rotation.from_matrix(desired_pose[:3, :3]).as_rotvec()
         self._prev_enabled = enabled
         return {
+            "enabled": enabled,
+            "target_x": raw_target_x,
+            "target_y": raw_target_y,
+            "target_z": raw_target_z,
+            "target_wx": raw_target_wx,
+            "target_wy": raw_target_wy,
+            "target_wz": raw_target_wz,
+            "gripper": gripper,
             "ee.x": float(desired_pose[0, 3]),
             "ee.y": float(desired_pose[1, 3]),
             "ee.z": float(desired_pose[2, 3]),
@@ -151,4 +161,42 @@ class DeltaActionToAbsoluteEEAction(RobotActionProcessorStep):
 
         for key in ("ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz", "gripper.pos"):
             action_features[key] = PolicyFeature(type=FeatureType.ACTION, shape=(1,))
+        return features
+
+
+@dataclass
+class AbsoluteEEActionToRobotAction(RobotActionProcessorStep):
+    """Adapt ee2ee record actions so idle frames still use the robot's hold-current-joints path."""
+
+    def action(self, action: RobotAction) -> RobotAction:
+        if not all(key in action for key in ("ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz")):
+            return action
+
+        gripper = float(np.clip(action.get("gripper.pos", action.get("gripper", 0.0)), 0.0, 1.0))
+        enabled = bool(action.get("enabled", True))
+        if not enabled:
+            return {
+                "enabled": False,
+                "target_x": float(action.get("target_x", 0.0)),
+                "target_y": float(action.get("target_y", 0.0)),
+                "target_z": float(action.get("target_z", 0.0)),
+                "target_wx": float(action.get("target_wx", 0.0)),
+                "target_wy": float(action.get("target_wy", 0.0)),
+                "target_wz": float(action.get("target_wz", 0.0)),
+                "gripper": gripper,
+            }
+
+        return {
+            "ee.x": float(action["ee.x"]),
+            "ee.y": float(action["ee.y"]),
+            "ee.z": float(action["ee.z"]),
+            "ee.wx": float(action["ee.wx"]),
+            "ee.wy": float(action["ee.wy"]),
+            "ee.wz": float(action["ee.wz"]),
+            "gripper.pos": gripper,
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         return features
