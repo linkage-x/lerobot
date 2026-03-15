@@ -25,31 +25,79 @@ from lerobot.processor import ObservationProcessorStep, RobotAction, RobotAction
 from lerobot.processor.core import TransitionKey
 from lerobot.utils.rotation import Rotation
 
+EE_POSITION_KEYS = ("ee.x", "ee.y", "ee.z")
+EE_ROTVEC_KEYS = ("ee.wx", "ee.wy", "ee.wz")
+EE_QUAT_KEYS = ("ee.qx", "ee.qy", "ee.qz", "ee.qw")
+
+
+def _continuous_quaternion(quaternion_xyzw: np.ndarray, previous_quaternion_xyzw: np.ndarray | None) -> np.ndarray:
+    quaternion_xyzw = np.asarray(quaternion_xyzw, dtype=np.float64)
+    if previous_quaternion_xyzw is not None and float(np.dot(quaternion_xyzw, previous_quaternion_xyzw)) < 0.0:
+        quaternion_xyzw = -quaternion_xyzw
+    return quaternion_xyzw
+
+
+def _pose_from_position_and_rotvec(position_xyz: np.ndarray, rotvec_xyz: np.ndarray) -> np.ndarray:
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, 3] = np.asarray(position_xyz, dtype=np.float64)
+    pose[:3, :3] = Rotation.from_rotvec(rotvec_xyz).as_matrix()
+    return pose
+
+
+def _pose_from_position_and_quaternion(position_xyz: np.ndarray, quaternion_xyzw: np.ndarray) -> np.ndarray:
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, 3] = np.asarray(position_xyz, dtype=np.float64)
+    pose[:3, :3] = Rotation.from_quat(quaternion_xyzw).as_matrix()
+    return pose
+
 
 @dataclass
 class KeepAbsoluteEEObservation(ObservationProcessorStep):
-    """Keep only absolute EE pose, gripper position, and camera observations."""
+    """Keep only absolute EE pose, gripper position, and camera observations using quaternions."""
+
+    _prev_quaternion_xyzw: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def observation(self, observation: RobotObservation) -> RobotObservation:
-        return {
+        filtered_observation = {
             key: value
             for key, value in observation.items()
-            if key.startswith("ee.") or key == "gripper.pos" or not key.endswith(".pos")
+            if key not in EE_ROTVEC_KEYS
+            and ((key.startswith("ee.")) or key == "gripper.pos" or not key.endswith(".pos"))
         }
+
+        if all(key in observation for key in EE_ROTVEC_KEYS):
+            quaternion_xyzw = Rotation.from_rotvec([observation[key] for key in EE_ROTVEC_KEYS]).as_quat()
+        elif all(key in observation for key in EE_QUAT_KEYS):
+            quaternion_xyzw = np.array([observation[key] for key in EE_QUAT_KEYS], dtype=np.float64)
+        else:
+            return filtered_observation
+
+        quaternion_xyzw = _continuous_quaternion(quaternion_xyzw, self._prev_quaternion_xyzw)
+        self._prev_quaternion_xyzw = quaternion_xyzw.copy()
+        for key, value in zip(EE_QUAT_KEYS, quaternion_xyzw, strict=True):
+            filtered_observation[key] = float(value)
+        return filtered_observation
+
+    def reset(self) -> None:
+        self._prev_quaternion_xyzw = None
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         observation_features = features[PipelineFeatureType.OBSERVATION]
         for key in list(observation_features):
-            if key.endswith(".pos") and key != "gripper.pos" and not key.startswith("ee."):
+            if key.endswith(".pos") and key != "gripper.pos" and key not in EE_POSITION_KEYS:
                 observation_features.pop(key, None)
+        for key in EE_ROTVEC_KEYS:
+            observation_features.pop(key, None)
+        for key in EE_QUAT_KEYS:
+            observation_features[key] = PolicyFeature(type=FeatureType.STATE, shape=(1,))
         return features
 
 
 @dataclass
 class DeltaActionToAbsoluteEEAction(RobotActionProcessorStep):
-    """Convert FR3 delta teleop actions into absolute EE action targets."""
+    """Convert FR3 delta teleop actions into absolute EE action targets using quaternions."""
 
     workspace_min: tuple[float, float, float]
     workspace_max: tuple[float, float, float]
@@ -59,17 +107,13 @@ class DeltaActionToAbsoluteEEAction(RobotActionProcessorStep):
     _reference_pose: np.ndarray | None = field(default=None, init=False, repr=False)
     _last_command_pose: np.ndarray | None = field(default=None, init=False, repr=False)
     _prev_enabled: bool = field(default=False, init=False, repr=False)
+    _prev_output_quaternion_xyzw: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def _pose_from_observation(self, observation: RobotObservation) -> np.ndarray:
-        pose = np.eye(4, dtype=np.float64)
-        pose[:3, 3] = np.array(
-            [observation["ee.x"], observation["ee.y"], observation["ee.z"]],
-            dtype=np.float64,
+        return _pose_from_position_and_rotvec(
+            position_xyz=np.array([observation[key] for key in EE_POSITION_KEYS], dtype=np.float64),
+            rotvec_xyz=np.array([observation[key] for key in EE_ROTVEC_KEYS], dtype=np.float64),
         )
-        pose[:3, :3] = Rotation.from_rotvec(
-            [observation["ee.wx"], observation["ee.wy"], observation["ee.wz"]]
-        ).as_matrix()
-        return pose
 
     def action(self, action: RobotAction) -> RobotAction:
         observation = self.transition.get(TransitionKey.OBSERVATION)
@@ -127,7 +171,9 @@ class DeltaActionToAbsoluteEEAction(RobotActionProcessorStep):
             desired_pose = self._last_command_pose.copy() if self._last_command_pose is not None else current_pose.copy()
             self._reference_pose = None
 
-        desired_rotvec = Rotation.from_matrix(desired_pose[:3, :3]).as_rotvec()
+        desired_quaternion_xyzw = Rotation.from_matrix(desired_pose[:3, :3]).as_quat()
+        desired_quaternion_xyzw = _continuous_quaternion(desired_quaternion_xyzw, self._prev_output_quaternion_xyzw)
+        self._prev_output_quaternion_xyzw = desired_quaternion_xyzw.copy()
         self._prev_enabled = enabled
         return {
             "enabled": enabled,
@@ -141,9 +187,10 @@ class DeltaActionToAbsoluteEEAction(RobotActionProcessorStep):
             "ee.x": float(desired_pose[0, 3]),
             "ee.y": float(desired_pose[1, 3]),
             "ee.z": float(desired_pose[2, 3]),
-            "ee.wx": float(desired_rotvec[0]),
-            "ee.wy": float(desired_rotvec[1]),
-            "ee.wz": float(desired_rotvec[2]),
+            "ee.qx": float(desired_quaternion_xyzw[0]),
+            "ee.qy": float(desired_quaternion_xyzw[1]),
+            "ee.qz": float(desired_quaternion_xyzw[2]),
+            "ee.qw": float(desired_quaternion_xyzw[3]),
             "gripper.pos": gripper,
         }
 
@@ -151,6 +198,7 @@ class DeltaActionToAbsoluteEEAction(RobotActionProcessorStep):
         self._reference_pose = None
         self._last_command_pose = None
         self._prev_enabled = False
+        self._prev_output_quaternion_xyzw = None
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
@@ -159,7 +207,7 @@ class DeltaActionToAbsoluteEEAction(RobotActionProcessorStep):
         for key in ("enabled", "target_x", "target_y", "target_z", "target_wx", "target_wy", "target_wz", "gripper"):
             action_features.pop(key, None)
 
-        for key in ("ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz", "gripper.pos"):
+        for key in ("ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw", "gripper.pos"):
             action_features[key] = PolicyFeature(type=FeatureType.ACTION, shape=(1,))
         return features
 
@@ -169,7 +217,7 @@ class AbsoluteEEActionToRobotAction(RobotActionProcessorStep):
     """Adapt ee2ee record actions so idle frames still use the robot's hold-current-joints path."""
 
     def action(self, action: RobotAction) -> RobotAction:
-        if not all(key in action for key in ("ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz")):
+        if not all(key in action for key in ("ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw")):
             return action
 
         gripper = float(np.clip(action.get("gripper.pos", action.get("gripper", 0.0)), 0.0, 1.0))
@@ -186,13 +234,19 @@ class AbsoluteEEActionToRobotAction(RobotActionProcessorStep):
                 "gripper": gripper,
             }
 
+        desired_pose = _pose_from_position_and_quaternion(
+            position_xyz=np.array([action[key] for key in EE_POSITION_KEYS], dtype=np.float64),
+            quaternion_xyzw=np.array([action[key] for key in EE_QUAT_KEYS], dtype=np.float64),
+        )
+        desired_rotvec = Rotation.from_matrix(desired_pose[:3, :3]).as_rotvec()
+
         return {
             "ee.x": float(action["ee.x"]),
             "ee.y": float(action["ee.y"]),
             "ee.z": float(action["ee.z"]),
-            "ee.wx": float(action["ee.wx"]),
-            "ee.wy": float(action["ee.wy"]),
-            "ee.wz": float(action["ee.wz"]),
+            "ee.wx": float(desired_rotvec[0]),
+            "ee.wy": float(desired_rotvec[1]),
+            "ee.wz": float(desired_rotvec[2]),
             "gripper.pos": gripper,
         }
 

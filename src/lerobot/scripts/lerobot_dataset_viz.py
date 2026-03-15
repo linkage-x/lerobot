@@ -78,7 +78,7 @@ from lerobot.utils.utils import init_logging
 
 
 EE_POSITION_KEYS = ("ee.x", "ee.y", "ee.z")
-EE_ROTATION_KEYS = ("ee.wx", "ee.wy", "ee.wz")
+EE_QUAT_KEYS = ("ee.qx", "ee.qy", "ee.qz", "ee.qw")
 EE_RULER_AXIS_COLORS = {
     "x": [255, 0, 0, 255],
     "y": [0, 255, 0, 255],
@@ -99,14 +99,14 @@ def get_ee_pose_state_indices(state_feature_names: list[str] | tuple[str, ...] |
     if state_feature_names is None:
         return None
     state_name_to_index = {name: idx for idx, name in enumerate(state_feature_names)}
-    required_keys = (*EE_POSITION_KEYS, *EE_ROTATION_KEYS)
+    required_keys = (*EE_POSITION_KEYS, *EE_QUAT_KEYS)
     if not all(key in state_name_to_index for key in required_keys):
         return None
     return {key: state_name_to_index[key] for key in required_keys}
 
 
 def has_ee_pose(batch: dict, ee_pose_state_indices: dict[str, int] | None = None) -> bool:
-    return all(key in batch for key in (*EE_POSITION_KEYS, *EE_ROTATION_KEYS)) or (
+    return all(key in batch for key in (*EE_POSITION_KEYS, *EE_QUAT_KEYS)) or (
         ee_pose_state_indices is not None and OBS_STATE in batch
     )
 
@@ -122,18 +122,19 @@ def extract_ee_pose(
     index: int,
     ee_pose_state_indices: dict[str, int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    if all(key in batch for key in (*EE_POSITION_KEYS, *EE_ROTATION_KEYS)):
+    if all(key in batch for key in (*EE_POSITION_KEYS, *EE_QUAT_KEYS)):
         position = np.array([_to_float(batch[key][index]) for key in EE_POSITION_KEYS], dtype=np.float32)
-        rotvec = np.array([_to_float(batch[key][index]) for key in EE_ROTATION_KEYS], dtype=np.float32)
+        quaternion = np.array([_to_float(batch[key][index]) for key in EE_QUAT_KEYS], dtype=np.float32)
+        rotation = Rotation.from_quat(quaternion).as_matrix().astype(np.float32)
+        return position, rotation
     elif ee_pose_state_indices is not None and OBS_STATE in batch:
         state = batch[OBS_STATE][index]
         position = np.array([_to_float(state[ee_pose_state_indices[key]]) for key in EE_POSITION_KEYS], dtype=np.float32)
-        rotvec = np.array([_to_float(state[ee_pose_state_indices[key]]) for key in EE_ROTATION_KEYS], dtype=np.float32)
+        quaternion = np.array([_to_float(state[ee_pose_state_indices[key]]) for key in EE_QUAT_KEYS], dtype=np.float32)
+        rotation = Rotation.from_quat(quaternion).as_matrix().astype(np.float32)
+        return position, rotation
     else:
         raise KeyError("EE pose is unavailable in both top-level batch keys and observation.state.")
-
-    rotation = Rotation.from_rotvec(rotvec).as_matrix().astype(np.float32)
-    return position, rotation
 
 
 def log_ee_pose_3d(

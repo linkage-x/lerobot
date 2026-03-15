@@ -162,6 +162,7 @@ def test_record_resets_teleop_action_processor_after_episode(monkeypatch):
 
     assert dataset.num_episodes == 1
     assert teleop_action_processor.reset_calls == 1
+    assert robot_observation_processor.reset_calls == 1
     assert dataset.finalized is True
 
 
@@ -217,6 +218,6 @@ def test_make_fr3_ee2ee_processors_use_delta_hold_for_idle_robot_frames():
     processed_for_dataset = teleop_action_processor((idle_action.copy(), observation))
     processed_for_robot = robot_action_processor((processed_for_dataset, observation))
 
-    assert all(key in processed_for_dataset for key in ("ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz"))
+    assert all(key in processed_for_dataset for key in ("ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw"))
     assert np.isclose(processed_for_dataset["ee.z"], observation["ee.z"])
     assert processed_for_robot == idle_action

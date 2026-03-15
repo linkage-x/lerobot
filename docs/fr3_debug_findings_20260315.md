@@ -30,11 +30,22 @@ This note captures the main conclusions from the FR3 recording and visualization
 
 ## Dataset Visualization
 
-- The FR3 ee2ee dataset stores EE pose inside `observation.state`, not as top-level `ee.x`, `ee.y`, `ee.z`, `ee.wx`, `ee.wy`, `ee.wz` keys.
+- The FR3 ee2ee dataset stores EE pose inside `observation.state`, not as top-level `ee.x`, `ee.y`, `ee.z`, `ee.qx`, `ee.qy`, `ee.qz`, `ee.qw` keys.
 - The visualizer originally looked only for top-level EE keys, so the 3D EE visualization never activated.
-- Fix: `src/lerobot/scripts/lerobot_dataset_viz.py` now supports both:
-  - top-level `ee.*` fields
-  - packed `observation.state` with `names=["ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz", "gripper.pos"]`
+- Fix: `src/lerobot/scripts/lerobot_dataset_viz.py` now reads packed quaternion EE poses from
+  `observation.state` with
+  `names=["ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw", "gripper.pos"]`.
+
+## Absolute Orientation Representation
+
+- Internal robot control and teleop delta rotations remain rotation-vector based.
+- Absolute EE orientation in the ee2ee dataset was switched to quaternion representation.
+- Dataset action and observation state are now:
+  - `ee.x`, `ee.y`, `ee.z`
+  - `ee.qx`, `ee.qy`, `ee.qz`, `ee.qw`
+  - `gripper.pos`
+- Quaternions are continuous within an episode using hemisphere alignment:
+  if `dot(q_t, q_{t-1}) < 0`, the sign is flipped.
 
 ## World Frame Interpretation
 

@@ -581,6 +581,10 @@ def test_delta_action_processor_outputs_absolute_ee_targets(robot):
     assert processed_first["target_y"] == pytest.approx(-0.02)
     assert processed_first["target_z"] == pytest.approx(0.03)
     assert processed_first["gripper"] == pytest.approx(0.5)
+    assert processed_first["ee.qx"] == pytest.approx(0.0)
+    assert processed_first["ee.qy"] == pytest.approx(0.0)
+    assert processed_first["ee.qz"] == pytest.approx(0.0)
+    assert processed_first["ee.qw"] == pytest.approx(1.0)
     assert processed_first["gripper.pos"] == pytest.approx(0.5)
     assert processed_second["ee.x"] == pytest.approx(0.42)
     assert processed_second["ee.y"] == pytest.approx(0.06)
@@ -636,6 +640,10 @@ def test_delta_action_processor_reset_clears_previous_episode_target(robot):
     assert processed["ee.x"] == pytest.approx(0.3)
     assert processed["ee.y"] == pytest.approx(-0.1)
     assert processed["ee.z"] == pytest.approx(0.25)
+    assert processed["ee.qx"] == pytest.approx(0.0)
+    assert processed["ee.qy"] == pytest.approx(0.0)
+    assert processed["ee.qz"] == pytest.approx(0.0)
+    assert processed["ee.qw"] == pytest.approx(1.0)
     assert processed["gripper.pos"] == pytest.approx(0.5)
 
 
@@ -650,9 +658,10 @@ def test_absolute_ee_action_to_robot_action_uses_delta_hold_when_disabled():
         "ee.x": 0.4,
         "ee.y": 0.1,
         "ee.z": 0.3,
-        "ee.wx": 0.0,
-        "ee.wy": 0.0,
-        "ee.wz": 0.0,
+        "ee.qx": 0.0,
+        "ee.qy": 0.0,
+        "ee.qz": 0.0,
+        "ee.qw": 1.0,
         "gripper.pos": 0.5,
     }
     action = {
@@ -667,9 +676,10 @@ def test_absolute_ee_action_to_robot_action_uses_delta_hold_when_disabled():
         "ee.x": 0.39,
         "ee.y": 0.09,
         "ee.z": 0.28,
-        "ee.wx": 0.0,
-        "ee.wy": 0.0,
-        "ee.wz": 0.0,
+        "ee.qx": 0.0,
+        "ee.qy": 0.0,
+        "ee.qz": 0.0,
+        "ee.qw": 1.0,
         "gripper.pos": 0.5,
     }
 
@@ -687,6 +697,47 @@ def test_absolute_ee_action_to_robot_action_uses_delta_hold_when_disabled():
     }
 
 
+def test_absolute_ee_action_to_robot_action_converts_quaternion_to_rotvec_when_enabled():
+    processor = RobotProcessorPipeline[tuple[dict, dict], dict](
+        steps=[AbsoluteEEActionToRobotAction()],
+        to_transition=robot_action_observation_to_transition,
+        to_output=transition_to_robot_action,
+    )
+
+    observation = {
+        "ee.x": 0.4,
+        "ee.y": 0.1,
+        "ee.z": 0.3,
+        "ee.qx": 0.0,
+        "ee.qy": 0.0,
+        "ee.qz": 0.0,
+        "ee.qw": 1.0,
+        "gripper.pos": 0.5,
+    }
+    quat = Rotation.from_rotvec([0.0, 0.0, np.pi / 2]).as_quat()
+    action = {
+        "enabled": True,
+        "ee.x": 0.39,
+        "ee.y": 0.09,
+        "ee.z": 0.28,
+        "ee.qx": float(quat[0]),
+        "ee.qy": float(quat[1]),
+        "ee.qz": float(quat[2]),
+        "ee.qw": float(quat[3]),
+        "gripper.pos": 0.5,
+    }
+
+    processed = processor((action, observation))
+
+    assert processed["ee.x"] == pytest.approx(0.39)
+    assert processed["ee.y"] == pytest.approx(0.09)
+    assert processed["ee.z"] == pytest.approx(0.28)
+    assert processed["ee.wx"] == pytest.approx(0.0)
+    assert processed["ee.wy"] == pytest.approx(0.0)
+    assert processed["ee.wz"] == pytest.approx(np.pi / 2)
+    assert processed["gripper.pos"] == pytest.approx(0.5)
+
+
 def test_keep_absolute_ee_observation_filters_joint_state(robot):
     robot.connect()
     processor = RobotProcessorPipeline[dict, dict](
@@ -698,8 +749,87 @@ def test_keep_absolute_ee_observation_filters_joint_state(robot):
     filtered = processor(robot.get_observation())
 
     assert "ee.x" in filtered
+    assert "ee.qx" in filtered
+    assert "ee.qy" in filtered
+    assert "ee.qz" in filtered
+    assert "ee.qw" in filtered
+    assert "ee.wx" not in filtered
     assert "gripper.pos" in filtered
     assert "joint_1.pos" not in filtered
+
+
+def test_keep_absolute_ee_observation_makes_quaternion_sign_continuous():
+    processor = RobotProcessorPipeline[dict, dict](
+        steps=[KeepAbsoluteEEObservation()],
+        to_transition=observation_to_transition,
+        to_output=transition_to_observation,
+    )
+
+    first = processor(
+        {
+            "ee.x": 0.4,
+            "ee.y": 0.1,
+            "ee.z": 0.3,
+            "ee.wx": 0.0,
+            "ee.wy": 0.0,
+            "ee.wz": np.pi - 0.01,
+            "gripper.pos": 0.5,
+        }
+    )
+    second = processor(
+        {
+            "ee.x": 0.4,
+            "ee.y": 0.1,
+            "ee.z": 0.3,
+            "ee.wx": 0.0,
+            "ee.wy": 0.0,
+            "ee.wz": -(np.pi - 0.01),
+            "gripper.pos": 0.5,
+        }
+    )
+
+    first_quat = np.array([first["ee.qx"], first["ee.qy"], first["ee.qz"], first["ee.qw"]], dtype=np.float64)
+    second_quat = np.array([second["ee.qx"], second["ee.qy"], second["ee.qz"], second["ee.qw"]], dtype=np.float64)
+    assert float(np.dot(first_quat, second_quat)) > 0.0
+
+
+def test_keep_absolute_ee_observation_reset_restarts_quaternion_continuity():
+    processor = RobotProcessorPipeline[dict, dict](
+        steps=[KeepAbsoluteEEObservation()],
+        to_transition=observation_to_transition,
+        to_output=transition_to_observation,
+    )
+
+    processor(
+        {
+            "ee.x": 0.4,
+            "ee.y": 0.1,
+            "ee.z": 0.3,
+            "ee.wx": 0.0,
+            "ee.wy": 0.0,
+            "ee.wz": np.pi - 0.01,
+            "gripper.pos": 0.5,
+        }
+    )
+    processor.reset()
+
+    after_reset = processor(
+        {
+            "ee.x": 0.4,
+            "ee.y": 0.1,
+            "ee.z": 0.3,
+            "ee.wx": 0.0,
+            "ee.wy": 0.0,
+            "ee.wz": -(np.pi - 0.01),
+            "gripper.pos": 0.5,
+        }
+    )
+    after_reset_quat = np.array(
+        [after_reset["ee.qx"], after_reset["ee.qy"], after_reset["ee.qz"], after_reset["ee.qw"]],
+        dtype=np.float64,
+    )
+    expected_quat = Rotation.from_rotvec([0.0, 0.0, -(np.pi - 0.01)]).as_quat()
+    assert np.allclose(after_reset_quat, expected_quat)
 
 
 def test_send_action_clamps_target_delta_before_workspace(monkeypatch):

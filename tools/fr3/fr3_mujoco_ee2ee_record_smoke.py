@@ -216,7 +216,7 @@ def main() -> int:
 
         obs_names = recorded.features[OBS_STR + ".state"]["names"]
         act_names = recorded.features[ACTION]["names"]
-        expected_names = ["ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz", "gripper.pos"]
+        expected_names = ["ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw", "gripper.pos"]
         if obs_names != expected_names:
             raise RuntimeError(f"Unexpected observation.state names: {obs_names}")
         if act_names != expected_names:

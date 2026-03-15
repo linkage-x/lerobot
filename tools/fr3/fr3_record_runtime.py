@@ -196,6 +196,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 dataset.save_episode()
                 recorded_episodes += 1
                 teleop_action_processor.reset()
+                robot_observation_processor.reset()
 
                 should_move_to_start = (
                     cfg.auto_move_to_start_after_episode

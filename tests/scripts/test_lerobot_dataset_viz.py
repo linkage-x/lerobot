@@ -10,6 +10,7 @@ from lerobot.scripts.lerobot_dataset_viz import (
     get_ee_pose_state_indices,
     has_ee_pose,
 )
+from lerobot.utils.rotation import Rotation
 
 
 def test_has_ee_pose_requires_all_pose_fields():
@@ -18,9 +19,10 @@ def test_has_ee_pose_requires_all_pose_fields():
             "ee.x": torch.tensor([0.1]),
             "ee.y": torch.tensor([0.2]),
             "ee.z": torch.tensor([0.3]),
-            "ee.wx": torch.tensor([0.0]),
-            "ee.wy": torch.tensor([0.0]),
-            "ee.wz": torch.tensor([0.0]),
+            "ee.qx": torch.tensor([0.0]),
+            "ee.qy": torch.tensor([0.0]),
+            "ee.qz": torch.tensor([0.0]),
+            "ee.qw": torch.tensor([1.0]),
         }
     )
     assert not has_ee_pose(
@@ -28,20 +30,22 @@ def test_has_ee_pose_requires_all_pose_fields():
             "ee.x": torch.tensor([0.1]),
             "ee.y": torch.tensor([0.2]),
             "ee.z": torch.tensor([0.3]),
-            "ee.wx": torch.tensor([0.0]),
-            "ee.wy": torch.tensor([0.0]),
+            "ee.qx": torch.tensor([0.0]),
+            "ee.qy": torch.tensor([0.0]),
         }
     )
 
 
 def test_extract_ee_pose_returns_position_and_rotation_matrix():
+    quaternion = Rotation.from_rotvec([0.0, 0.0, np.pi / 2]).as_quat()
     batch = {
         "ee.x": torch.tensor([0.4], dtype=torch.float32),
         "ee.y": torch.tensor([-0.1], dtype=torch.float32),
         "ee.z": torch.tensor([0.25], dtype=torch.float32),
-        "ee.wx": torch.tensor([0.0], dtype=torch.float32),
-        "ee.wy": torch.tensor([0.0], dtype=torch.float32),
-        "ee.wz": torch.tensor([np.pi / 2], dtype=torch.float32),
+        "ee.qx": torch.tensor([quaternion[0]], dtype=torch.float32),
+        "ee.qy": torch.tensor([quaternion[1]], dtype=torch.float32),
+        "ee.qz": torch.tensor([quaternion[2]], dtype=torch.float32),
+        "ee.qw": torch.tensor([quaternion[3]], dtype=torch.float32),
     }
 
     position, rotation = extract_ee_pose(batch, 0)
@@ -60,25 +64,30 @@ def test_extract_ee_pose_returns_position_and_rotation_matrix():
 
 def test_get_ee_pose_state_indices_from_packed_observation_state():
     indices = get_ee_pose_state_indices(
-        ["ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz", "gripper.pos"]
+        ["ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw", "gripper.pos"]
     )
 
     assert indices == {
         "ee.x": 0,
         "ee.y": 1,
         "ee.z": 2,
-        "ee.wx": 3,
-        "ee.wy": 4,
-        "ee.wz": 5,
+        "ee.qx": 3,
+        "ee.qy": 4,
+        "ee.qz": 5,
+        "ee.qw": 6,
     }
 
 
 def test_extract_ee_pose_supports_packed_observation_state():
     ee_pose_state_indices = get_ee_pose_state_indices(
-        ["ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz", "gripper.pos"]
+        ["ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw", "gripper.pos"]
     )
+    quaternion = Rotation.from_rotvec([0.0, 0.0, np.pi / 2]).as_quat()
     batch = {
-        "observation.state": torch.tensor([[0.4, -0.1, 0.25, 0.0, 0.0, np.pi / 2, 0.5]], dtype=torch.float32)
+        "observation.state": torch.tensor(
+            [[0.4, -0.1, 0.25, quaternion[0], quaternion[1], quaternion[2], quaternion[3], 0.5]],
+            dtype=torch.float32,
+        )
     }
 
     assert has_ee_pose(batch, ee_pose_state_indices=ee_pose_state_indices)
