@@ -80,6 +80,7 @@ import multiprocessing as mp
 import os
 import queue
 import select
+import socket
 import socketserver
 import sys
 import termios
@@ -88,6 +89,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 import tty
+from uuid import uuid4
 
 import numpy as np
 import rerun as rr
@@ -288,6 +290,12 @@ def build_episode_switch_visualize_kwargs(cli_kwargs: dict) -> dict:
     return visualize_kwargs
 
 
+def build_episode_process_visualize_kwargs(visualize_kwargs: dict, *, rerun_recording_id: str) -> dict:
+    visualize_kwargs = visualize_kwargs.copy()
+    visualize_kwargs["rerun_recording_id"] = rerun_recording_id
+    return visualize_kwargs
+
+
 def normalize_control_command(raw_command: str) -> str | None:
     normalized = raw_command.strip().lower()
     if not normalized:
@@ -399,6 +407,36 @@ def terminate_episode_process(process: mp.Process | None, timeout_s: float = 5.0
         process.join(timeout=timeout_s)
 
 
+def is_tcp_port_available(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+def wait_for_tcp_port_available(
+    host: str,
+    port: int,
+    *,
+    timeout_s: float = 5.0,
+    poll_interval_s: float = 0.05,
+    label: str | None = None,
+) -> None:
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        if is_tcp_port_available(host, port):
+            return
+        time.sleep(poll_interval_s)
+
+    port_label = label or f"{host}:{port}"
+    raise RuntimeError(
+        f"Port {port_label} is still in use. Stop the previous dataset_viz/rerun process or choose another port."
+    )
+
+
 def create_episode_process(
     ctx: mp.context.BaseContext,
     *,
@@ -490,6 +528,7 @@ def visualize_dataset(
     display_compressed_images: bool = False,
     ee_axis_length: float = 0.05,
     ee_ruler_length: float = 0.1,
+    rerun_recording_id: str | None = None,
     **kwargs,
 ) -> Path | None:
     if save:
@@ -512,7 +551,7 @@ def visualize_dataset(
         raise ValueError(mode)
 
     spawn_local_viewer = mode == "local" and not save
-    rr.init(f"{repo_id}/episode_{episode_index}", spawn=spawn_local_viewer)
+    rr.init(f"{repo_id}/episode_{episode_index}", recording_id=rerun_recording_id, spawn=spawn_local_viewer)
 
     # Manually call python garbage collector after `rr.init` to avoid hanging in a blocking flush
     # when iterating on a dataloader with `num_workers` > 0
@@ -752,18 +791,31 @@ def main():
         if args.episode_index >= total_episodes:
             raise IndexError(f"Episode index {args.episode_index} out of range for dataset with {total_episodes} episodes.")
 
+        if args.control_port is not None:
+            wait_for_tcp_port_available(
+                args.control_host,
+                args.control_port,
+                label=f"control server {args.control_host}:{args.control_port}",
+            )
+
         visualize_kwargs = build_episode_switch_visualize_kwargs(kwargs)
 
         ctx = mp.get_context("spawn")
 
         def launch_episode(episode_index: int) -> mp.Process:
+            episode_visualize_kwargs = build_episode_process_visualize_kwargs(
+                visualize_kwargs,
+                rerun_recording_id=str(uuid4()),
+            )
+            wait_for_tcp_port_available("0.0.0.0", visualize_kwargs["grpc_port"], label=f"gRPC {visualize_kwargs['grpc_port']}")
+            wait_for_tcp_port_available("0.0.0.0", visualize_kwargs["web_port"], label=f"web viewer {visualize_kwargs['web_port']}")
             process = create_episode_process(
                 ctx,
                 repo_id=repo_id,
                 root=root,
                 episode_index=episode_index,
                 tolerance_s=tolerance_s,
-                visualize_kwargs=visualize_kwargs,
+                visualize_kwargs=episode_visualize_kwargs,
             )
             process.start()
             return process

@@ -247,16 +247,14 @@ PYTHONPATH=src .venv-codex/bin/python src/lerobot/scripts/lerobot_dataset_viz.py
   --episode-index 0 \
   --mode distant \
   --web-port 9090 \
-  --grpc-port 9876 \
-  --control-port 9999
+  --grpc-port 19876 \
+  --control-port 19999
 ```
 
 Local command:
 
 ```bash
-PYTHONPATH=src .venv-codex/bin/python src/lerobot/scripts/dataset_viz_client.py \
-  --host 192.168.1.200 \
-  --control-port 9999
+uv run src/lerobot/scripts/dataset_viz_client.py     --host 192.168.1.200     --control-port 19999     --rerun-connect-url rerun+http://192.168.1.200:19876/proxy
 ```
 
 In this mode:

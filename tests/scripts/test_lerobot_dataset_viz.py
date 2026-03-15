@@ -2,12 +2,15 @@
 
 from datetime import datetime, timedelta, timezone
 import multiprocessing as mp
+from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 import torch
 
 from lerobot.scripts.lerobot_dataset_viz import (
     EE_RULER_AXIS_COLORS,
+    build_episode_process_visualize_kwargs,
     build_episode_switch_visualize_kwargs,
     build_ee_axis_ruler_strips,
     create_episode_process,
@@ -15,10 +18,12 @@ from lerobot.scripts.lerobot_dataset_viz import (
     get_ee_pose_state_indices,
     get_next_episode_index,
     has_ee_pose,
+    is_tcp_port_available,
     make_system_time_anchor,
     run_episode_switch_loop,
     should_enable_episode_switch,
     to_system_timestamp,
+    wait_for_tcp_port_available,
 )
 from lerobot.utils.rotation import Rotation
 
@@ -204,6 +209,24 @@ def test_build_episode_switch_visualize_kwargs_reuses_cleaned_cli_kwargs():
     assert visualize_kwargs["grpc_port"] == 9876
 
 
+def test_build_episode_process_visualize_kwargs_adds_unique_recording_id():
+    cli_kwargs = {
+        "batch_size": 32,
+        "mode": "distant",
+        "grpc_port": 9876,
+        "web_port": 9090,
+    }
+
+    visualize_kwargs = build_episode_process_visualize_kwargs(
+        cli_kwargs,
+        rerun_recording_id="recording-123",
+    )
+
+    assert visualize_kwargs["batch_size"] == 32
+    assert visualize_kwargs["grpc_port"] == 9876
+    assert visualize_kwargs["rerun_recording_id"] == "recording-123"
+
+
 def test_get_next_episode_index_stops_at_last_episode():
     assert get_next_episode_index(0, 3) == 1
     assert get_next_episode_index(1, 3) == 2
@@ -259,3 +282,39 @@ def test_run_episode_switch_loop_restarts_process_for_next_episode():
         "proc-1",
         "proc-2",
     ]
+
+
+def test_wait_for_tcp_port_available_returns_once_port_is_free(monkeypatch):
+    availability = iter([False, False, True])
+    sleeps = []
+
+    monkeypatch.setattr(
+        "lerobot.scripts.lerobot_dataset_viz.is_tcp_port_available",
+        lambda host, port: next(availability),
+    )
+    monkeypatch.setattr("lerobot.scripts.lerobot_dataset_viz.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    wait_for_tcp_port_available("0.0.0.0", 9876, timeout_s=1.0, poll_interval_s=0.1, label="gRPC 9876")
+
+    assert sleeps == [0.1, 0.1]
+
+
+def test_wait_for_tcp_port_available_raises_on_timeout(monkeypatch):
+    perf_counter_values = iter([0.0, 0.1, 0.2, 0.3])
+    monkeypatch.setattr("lerobot.scripts.lerobot_dataset_viz.is_tcp_port_available", lambda host, port: False)
+    monkeypatch.setattr("lerobot.scripts.lerobot_dataset_viz.time.perf_counter", lambda: next(perf_counter_values))
+    monkeypatch.setattr("lerobot.scripts.lerobot_dataset_viz.time.sleep", lambda seconds: None)
+
+    with pytest.raises(RuntimeError, match="Port gRPC 9876 is still in use"):
+        wait_for_tcp_port_available("0.0.0.0", 9876, timeout_s=0.25, poll_interval_s=0.1, label="gRPC 9876")
+
+
+def test_is_tcp_port_available_returns_false_when_bind_fails(monkeypatch):
+    fake_socket = MagicMock()
+    fake_socket.__enter__.return_value = fake_socket
+    fake_socket.bind.side_effect = OSError("in use")
+    fake_socket_factory = MagicMock(return_value=fake_socket)
+
+    monkeypatch.setattr("lerobot.scripts.lerobot_dataset_viz.socket.socket", fake_socket_factory)
+
+    assert is_tcp_port_available("0.0.0.0", 9876) is False
