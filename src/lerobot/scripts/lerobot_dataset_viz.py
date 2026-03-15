@@ -57,6 +57,19 @@ distant$ lerobot-dataset-viz \
 local$ rerun rerun+http://IP:GRPC_PORT/proxy
 ```
 
+- Visualize data on a distant machine and switch episodes from a local terminal:
+```
+distant$ lerobot-dataset-viz \
+    --repo-id lerobot/pusht \
+    --episode-index 0 \
+    --mode distant \
+    --grpc-port 9876 \
+    --control-port 9999
+
+local$ rerun rerun+http://IP:9876/proxy
+local$ dataset_viz_client.py --host IP --control-port 9999
+```
+
 """
 
 import argparse
@@ -65,9 +78,12 @@ import gc
 import logging
 import multiprocessing as mp
 import os
+import queue
 import select
+import socketserver
 import sys
 import termios
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -266,6 +282,31 @@ def should_enable_episode_switch(mode: str, save: bool) -> bool:
     return mode == "distant" and not save
 
 
+def build_episode_switch_visualize_kwargs(cli_kwargs: dict) -> dict:
+    visualize_kwargs = cli_kwargs.copy()
+    visualize_kwargs.pop("episode_index")
+    return visualize_kwargs
+
+
+def normalize_control_command(raw_command: str) -> str | None:
+    normalized = raw_command.strip().lower()
+    if not normalized:
+        return None
+    first = normalized[0]
+    if first == "n":
+        return "n"
+    if first == "q":
+        return "q"
+    return None
+
+
+def enqueue_control_command(command_queue: queue.Queue[str], raw_command: str) -> str | None:
+    command = normalize_control_command(raw_command)
+    if command is not None:
+        command_queue.put(command)
+    return command
+
+
 def get_next_episode_index(current_episode_index: int, total_episodes: int) -> int | None:
     next_episode_index = current_episode_index + 1
     if next_episode_index >= total_episodes:
@@ -303,6 +344,47 @@ def read_episode_switch_command() -> str:
     return stripped[:1] if stripped else ""
 
 
+class EpisodeControlTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, server_address, request_handler_class, command_queue: queue.Queue[str]):
+        self.command_queue = command_queue
+        super().__init__(server_address, request_handler_class)
+
+
+class EpisodeControlTCPHandler(socketserver.StreamRequestHandler):
+    def handle(self) -> None:
+        server: EpisodeControlTCPServer = self.server  # type: ignore[assignment]
+        client = f"{self.client_address[0]}:{self.client_address[1]}"
+        logging.info("Dataset viz control client connected: %s", client)
+        try:
+            while True:
+                line = self.rfile.readline()
+                if not line:
+                    break
+                enqueue_control_command(server.command_queue, line.decode("utf-8", errors="ignore"))
+        finally:
+            logging.info("Dataset viz control client disconnected: %s", client)
+
+
+def start_control_server(host: str, port: int) -> tuple[callable, callable, int]:
+    command_queue: queue.Queue[str] = queue.Queue()
+    server = EpisodeControlTCPServer((host, port), EpisodeControlTCPHandler, command_queue)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def read_command() -> str:
+        return command_queue.get()
+
+    def shutdown() -> None:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    return read_command, shutdown, server.server_address[1]
+
+
 def terminate_episode_process(process: mp.Process | None, timeout_s: float = 5.0) -> None:
     if process is None:
         return
@@ -315,6 +397,28 @@ def terminate_episode_process(process: mp.Process | None, timeout_s: float = 5.0
     if process.is_alive():
         process.kill()
         process.join(timeout=timeout_s)
+
+
+def create_episode_process(
+    ctx: mp.context.BaseContext,
+    *,
+    repo_id: str,
+    root: Path | None,
+    episode_index: int,
+    tolerance_s: float,
+    visualize_kwargs: dict,
+) -> mp.Process:
+    return ctx.Process(
+        target=serve_dataset_episode,
+        kwargs={
+            "repo_id": repo_id,
+            "root": root,
+            "episode_index": episode_index,
+            "tolerance_s": tolerance_s,
+            "visualize_kwargs": visualize_kwargs,
+        },
+        daemon=False,
+    )
 
 
 def run_episode_switch_loop(
@@ -506,7 +610,11 @@ def main():
         "--episode-index",
         type=int,
         required=True,
-        help="Episode to visualize.",
+        help=(
+            "Episode to visualize initially. In `--mode distant` without `--save`, "
+            "press `n`/`q` in the remote terminal by default, or use `dataset_viz_client.py` "
+            "from a local terminal when `--control-port` is set."
+        ),
     )
     parser.add_argument(
         "--root",
@@ -540,7 +648,9 @@ def main():
             "Mode of viewing between 'local' or 'distant'. "
             "'local' requires data to be on a local machine. It spawns a viewer to visualize the data locally. "
             "'distant' creates a server on the distant machine where the data is stored. "
-            "Visualize the data by connecting to the server with `rerun rerun+http://IP:GRPC_PORT/proxy` on the local machine."
+            "Visualize the data by connecting to the server with `rerun rerun+http://IP:GRPC_PORT/proxy` on the local machine. "
+            "In distant mode without `--save`, switch episodes either from the remote terminal with `n`/`q`, "
+            "or from a local terminal through `dataset_viz_client.py` when `--control-port` is set."
         ),
     )
     parser.add_argument(
@@ -559,6 +669,25 @@ def main():
         type=int,
         default=9876,
         help="gRPC port for rerun.io when `--mode distant` is set.",
+    )
+    parser.add_argument(
+        "--control-host",
+        type=str,
+        default="0.0.0.0",
+        help=(
+            "Host interface for the optional TCP control server. "
+            "Use together with `--control-port`, then connect from a local terminal with `dataset_viz_client.py`."
+        ),
+    )
+    parser.add_argument(
+        "--control-port",
+        type=int,
+        default=None,
+        help=(
+            "Optional TCP control port for remote episode switching. "
+            "When set in `--mode distant`, the script listens for `n`/`q` commands from `dataset_viz_client.py` "
+            "instead of requiring the remote terminal."
+        ),
     )
     parser.add_argument(
         "--save",
@@ -623,39 +752,47 @@ def main():
         if args.episode_index >= total_episodes:
             raise IndexError(f"Episode index {args.episode_index} out of range for dataset with {total_episodes} episodes.")
 
-        visualize_kwargs = vars(args).copy()
-        visualize_kwargs.pop("repo_id")
-        visualize_kwargs.pop("root")
-        visualize_kwargs.pop("tolerance_s")
-        visualize_kwargs.pop("episode_index")
+        visualize_kwargs = build_episode_switch_visualize_kwargs(kwargs)
 
         ctx = mp.get_context("spawn")
 
         def launch_episode(episode_index: int) -> mp.Process:
-            process = ctx.Process(
-                target=serve_dataset_episode,
-                kwargs={
-                    "repo_id": repo_id,
-                    "root": root,
-                    "episode_index": episode_index,
-                    "tolerance_s": tolerance_s,
-                    "visualize_kwargs": visualize_kwargs,
-                },
-                daemon=True,
+            process = create_episode_process(
+                ctx,
+                repo_id=repo_id,
+                root=root,
+                episode_index=episode_index,
+                tolerance_s=tolerance_s,
+                visualize_kwargs=visualize_kwargs,
             )
             process.start()
             return process
 
-        logging.info(
-            "Interactive episode switching enabled for distant mode. Press 'n' for next episode, 'q' to quit."
-        )
-        run_episode_switch_loop(
-            start_episode_index=args.episode_index,
-            total_episodes=total_episodes,
-            launch_episode=launch_episode,
-            terminate_episode=terminate_episode_process,
-            read_command=read_episode_switch_command,
-        )
+        if args.control_port is not None:
+            read_command, shutdown_control, control_port = start_control_server(args.control_host, args.control_port)
+            logging.info(
+                "Interactive episode switching enabled through TCP control server on %s:%d.",
+                args.control_host,
+                control_port,
+            )
+            logging.info("Use dataset_viz_client.py locally and send `n` / `q` commands over the control port.")
+        else:
+            logging.info(
+                "Interactive episode switching enabled for distant mode. Press 'n' for next episode, 'q' to quit."
+            )
+            read_command = read_episode_switch_command
+            shutdown_control = lambda: None
+
+        try:
+            run_episode_switch_loop(
+                start_episode_index=args.episode_index,
+                total_episodes=total_episodes,
+                launch_episode=launch_episode,
+                terminate_episode=terminate_episode_process,
+                read_command=read_command,
+            )
+        finally:
+            shutdown_control()
         return
 
     logging.info("Loading dataset")

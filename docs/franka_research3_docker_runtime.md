@@ -228,6 +228,49 @@ Local command:
 rerun --connect rerun+http://192.168.1.200:9876/proxy
 ```
 
+While the distant-mode script is running on the remote machine:
+
+- press `n` in that terminal to switch to the next episode
+- press `q` to quit
+- once the last episode is reached, further `n` presses are ignored
+
+If you want to drive episode switching from the local machine instead of the
+remote SSH terminal, start `lerobot_dataset_viz` with a control port and then
+run the companion client locally:
+
+Remote command:
+
+```bash
+PYTHONPATH=src .venv-codex/bin/python src/lerobot/scripts/lerobot_dataset_viz.py \
+  --repo-id hph/fr3_pick_place_ee2ee_v1 \
+  --root outputs/datasets/fr3_pick_place_ee2ee_v1_20260315_125942 \
+  --episode-index 0 \
+  --mode distant \
+  --web-port 9090 \
+  --grpc-port 9876 \
+  --control-port 9999
+```
+
+Local command:
+
+```bash
+PYTHONPATH=src .venv-codex/bin/python src/lerobot/scripts/dataset_viz_client.py \
+  --host 192.168.1.200 \
+  --control-port 9999
+```
+
+In this mode:
+
+- press `n` in the local client terminal to switch to the next episode
+- press `q` in the local client terminal to stop the remote supervisor cleanly
+- if the dataset is already at the last episode, further `n` commands are ignored
+
+Implementation note:
+episode switching is handled by terminating the current episode worker process
+and starting a new one for the next episode. This is the current defensive path
+to keep video decoder and dataset memory usage from accumulating across
+switches.
+
 This is currently more reliable than exporting `DISPLAY` over SSH and trying to
 spawn a remote viewer process. In the observed setup, the remote viewer failed
 because the SSH shell did not have valid X authorization, while distant-mode
@@ -243,6 +286,9 @@ For FR3 hardware recording and inspection, the current recommended path is:
    successful Docker recording
 4. inspect the dataset through `lerobot_dataset_viz --mode distant` and a local
    `rerun` viewer
+5. when stepping through multiple episodes remotely, prefer `--control-port`
+   plus local `dataset_viz_client.py`; if that is not convenient, fall back to
+   remote terminal `n` / `q`
 
 This is the current best practice because it preserves the existing Docker
 hardware setup while also avoiding the two most common operator failures seen in

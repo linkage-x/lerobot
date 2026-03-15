@@ -1,13 +1,16 @@
 #!/usr/bin/env python
 
 from datetime import datetime, timedelta, timezone
+import multiprocessing as mp
 
 import numpy as np
 import torch
 
 from lerobot.scripts.lerobot_dataset_viz import (
     EE_RULER_AXIS_COLORS,
+    build_episode_switch_visualize_kwargs,
     build_ee_axis_ruler_strips,
+    create_episode_process,
     extract_ee_pose,
     get_ee_pose_state_indices,
     get_next_episode_index,
@@ -184,10 +187,42 @@ def test_should_enable_episode_switch_only_for_distant_streaming():
     assert not should_enable_episode_switch("distant", True)
 
 
+def test_build_episode_switch_visualize_kwargs_reuses_cleaned_cli_kwargs():
+    cli_kwargs = {
+        "episode_index": 0,
+        "batch_size": 32,
+        "mode": "distant",
+        "grpc_port": 9876,
+        "ws_port": None,
+    }
+
+    visualize_kwargs = build_episode_switch_visualize_kwargs(cli_kwargs)
+
+    assert "episode_index" not in visualize_kwargs
+    assert visualize_kwargs["batch_size"] == 32
+    assert visualize_kwargs["mode"] == "distant"
+    assert visualize_kwargs["grpc_port"] == 9876
+
+
 def test_get_next_episode_index_stops_at_last_episode():
     assert get_next_episode_index(0, 3) == 1
     assert get_next_episode_index(1, 3) == 2
     assert get_next_episode_index(2, 3) is None
+
+
+def test_create_episode_process_is_not_daemonic():
+    ctx = mp.get_context("spawn")
+
+    process = create_episode_process(
+        ctx,
+        repo_id="local/test",
+        root=None,
+        episode_index=0,
+        tolerance_s=1e-4,
+        visualize_kwargs={"mode": "distant", "batch_size": 1, "num_workers": 2},
+    )
+
+    assert process.daemon is False
 
 
 def test_run_episode_switch_loop_restarts_process_for_next_episode():
