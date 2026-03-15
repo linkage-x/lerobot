@@ -100,6 +100,17 @@ lerobot-train \
   --dataset.repo_id=lerobot/aloha_mobile_cabinet
 ```
 
+If you already have a local `lerobot-internal:local` image and want to train against the current workspace with Docker Compose:
+
+```bash
+sudo env HOME=/home/hph docker compose --profile train -f docker/docker-compose.yml run --rm lerobot-train-fr3-act
+```
+
+```bash
+sudo env HOME=/home/hph ACCELERATE_NUM_PROCESSES=2 ACCELERATE_MIXED_PRECISION=bf16 \
+  docker compose --profile train --profile multi-gpu -f docker/docker-compose.yml run --rm lerobot-train-fr3-act-multi-gpu
+```
+
 | Category                   | Models                                                                                                                                                                                                       |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md)                                                             |

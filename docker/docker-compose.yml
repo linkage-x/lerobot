@@ -66,6 +66,48 @@ x-lerobot-sim-common: &lerobot-sim-common
     - ${HOME}/.Xauthority:/root/.Xauthority:ro
   shm_size: "8gb"
 
+x-lerobot-train-env: &lerobot-train-env
+  SHELL: /bin/bash
+  PYTHONUNBUFFERED: "1"
+  PYTHONPATH: /workspace/src
+  HF_HOME: /home/user_lerobot/.cache/huggingface
+  HF_LEROBOT_HOME: /home/user_lerobot/.cache/huggingface/lerobot
+  TORCH_HOME: /home/user_lerobot/.cache/torch
+  TRITON_CACHE_DIR: /home/user_lerobot/.cache/triton
+  DEVICE: cuda
+  NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+  NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility,video}
+  TOKENIZERS_PARALLELISM: ${TOKENIZERS_PARALLELISM:-false}
+  OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+  PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+  TEST_TYPE: ${TEST_TYPE:-single_gpu}
+  http_proxy: ${http_proxy:-}
+  https_proxy: ${https_proxy:-}
+  no_proxy: ${no_proxy:-}
+
+x-lerobot-train-common: &lerobot-train-common
+  working_dir: /workspace
+  stdin_open: true
+  tty: true
+  ipc: host
+  user: root
+  command: ["/bin/bash"]
+  image: lerobot-internal:local
+  pull_policy: never
+  environment:
+    <<: *lerobot-train-env
+  volumes:
+    - ..:/workspace
+    - ${HOME}/.cache/huggingface:/home/user_lerobot/.cache/huggingface
+    - ${HOME}/.cache/torch:/home/user_lerobot/.cache/torch
+    - ${HOME}/.cache/triton:/home/user_lerobot/.cache/triton
+  shm_size: "16gb"
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+    stack: 67108864
+
 services:
   lerobot-user:
     <<: *lerobot-common
@@ -94,22 +136,41 @@ services:
         UNBOUND_DEPS: ${UNBOUND_DEPS:-false}
 
   lerobot-internal:
-    <<: *lerobot-common
-    image: lerobot-internal:local
-    profiles: ["internal", "gpu"]
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.internal
-      args:
-        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
-        CUDA_VERSION: ${CUDA_VERSION:-12.4.1}
-        OS_VERSION: ${OS_VERSION:-22.04}
-        UNBOUND_DEPS: ${UNBOUND_DEPS:-false}
+    <<: *lerobot-train-common
+    profiles: ["internal", "train", "gpu"]
+    gpus: all
+
+  lerobot-train-fr3-act:
+    <<: *lerobot-train-common
+    profiles: ["train", "gpu"]
     environment:
-      <<: *lerobot-env
-      DEVICE: cuda
-      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
-      TEST_TYPE: single_gpu
+      <<: *lerobot-train-env
+      LEROBOT_DATASET_ROOT: ${LEROBOT_DATASET_ROOT:-outputs/datasets/fr3_pick_place_ee2ee_v1_20260315_125942}
+    command:
+      - lerobot-train
+      - --config_path=src/lerobot/configs/franka_research3_ee2ee_act.yaml
+      - --dataset.root=${LEROBOT_DATASET_ROOT:-outputs/datasets/fr3_pick_place_ee2ee_v1_20260315_125942}
+    gpus: all
+
+  lerobot-train-fr3-act-multi-gpu:
+    <<: *lerobot-train-common
+    profiles: ["train", "multi-gpu", "gpu"]
+    environment:
+      <<: *lerobot-train-env
+      LEROBOT_DATASET_ROOT: ${LEROBOT_DATASET_ROOT:-outputs/datasets/fr3_pick_place_ee2ee_v1_20260315_125942}
+      ACCELERATE_NUM_PROCESSES: ${ACCELERATE_NUM_PROCESSES:-2}
+      ACCELERATE_MIXED_PRECISION: ${ACCELERATE_MIXED_PRECISION:-no}
+    command:
+      - /bin/bash
+      - -lc
+      - >
+        accelerate launch
+        --multi_gpu
+        --num_processes="$${ACCELERATE_NUM_PROCESSES}"
+        --mixed_precision="$${ACCELERATE_MIXED_PRECISION}"
+        "$$(which lerobot-train)"
+        --config_path=src/lerobot/configs/franka_research3_ee2ee_act.yaml
+        --dataset.root="$${LEROBOT_DATASET_ROOT}"
     gpus: all
 
   lerobot-fr3-sim:
