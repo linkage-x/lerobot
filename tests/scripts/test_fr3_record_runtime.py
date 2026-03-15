@@ -40,12 +40,13 @@ class FakeDataset:
         self.num_episodes = 0
         self.features = {}
         self.finalized = False
+        self.clear_episode_buffer_calls = 0
 
     def save_episode(self):
         self.num_episodes += 1
 
     def clear_episode_buffer(self):
-        pass
+        self.clear_episode_buffer_calls += 1
 
     def finalize(self):
         self.finalized = True
@@ -80,6 +81,9 @@ class FakeRobot:
 
     def __init__(self):
         self.is_connected = False
+        self.call_order = None
+        self.move_to_start_calls = 0
+        self.send_action_calls = []
         self._observation = {
             "ee.x": 0.4,
             "ee.y": 0.0,
@@ -101,10 +105,15 @@ class FakeRobot:
         return self._observation.copy()
 
     def send_action(self, action):
+        self.send_action_calls.append(action.copy())
+        if self.call_order is not None:
+            self.call_order.append("send_action")
         return action
 
     def move_to_start(self):
-        pass
+        self.move_to_start_calls += 1
+        if self.call_order is not None:
+            self.call_order.append("move_to_start")
 
 
 class FakeTeleop:
@@ -112,6 +121,7 @@ class FakeTeleop:
 
     def __init__(self):
         self.is_connected = False
+        self.last_gripper = 0.5
 
     def connect(self):
         self.is_connected = True
@@ -128,8 +138,11 @@ class FakeTeleop:
             "target_wx": 0.0,
             "target_wy": 0.0,
             "target_wz": 0.0,
-            "gripper": 0.5,
+            "gripper": self.last_gripper,
         }
+
+    def set_gripper(self, normalized_position: float):
+        self.last_gripper = normalized_position
 
 
 class FakeTargetActionProcessor(FakeProcessor):
@@ -204,6 +217,7 @@ def test_record_resets_teleop_action_processor_after_episode(monkeypatch):
     monkeypatch.setattr(fr3_record_runtime, "LeRobotDataset", FakeDatasetFactory)
     monkeypatch.setattr(fr3_record_runtime, "_wait_for_episode_start_settle", lambda **kwargs: None)
     monkeypatch.setattr(fr3_record_runtime, "record_loop", lambda **kwargs: None)
+    monkeypatch.setattr(fr3_record_runtime, "_confirm_keep_episode", lambda play_sounds: True)
     monkeypatch.setattr(
         fr3_record_runtime,
         "init_keyboard_listener",
@@ -273,6 +287,7 @@ def test_record_waits_for_episode_start_settle_before_record_loop(monkeypatch):
         lambda **kwargs: call_order.append("settle"),
     )
     monkeypatch.setattr(fr3_record_runtime, "record_loop", lambda **kwargs: call_order.append("record"))
+    monkeypatch.setattr(fr3_record_runtime, "_confirm_keep_episode", lambda play_sounds: True)
     monkeypatch.setattr(
         fr3_record_runtime,
         "init_keyboard_listener",
@@ -308,6 +323,152 @@ def test_record_waits_for_episode_start_settle_before_record_loop(monkeypatch):
     fr3_record_runtime.record(cfg)
 
     assert call_order == ["idle", "settle", "record"]
+
+
+def test_record_moves_to_start_opens_gripper_before_keep_confirmation(monkeypatch):
+    teleop_action_processor = FakeProcessor()
+    robot_action_processor = FakeProcessor()
+    robot_observation_processor = FakeProcessor()
+    robot = FakeRobot()
+    teleop = FakeTeleop()
+    call_order = []
+    robot.call_order = call_order
+    teleop.wait_until_idle = lambda **kwargs: True
+
+    monkeypatch.setattr(fr3_record_runtime, "init_logging", lambda: None)
+    monkeypatch.setattr(fr3_record_runtime, "make_robot_from_config", lambda cfg: robot)
+    monkeypatch.setattr(fr3_record_runtime, "make_teleoperator_from_config", lambda cfg: teleop)
+    monkeypatch.setattr(
+        fr3_record_runtime,
+        "make_fr3_ee2ee_processors",
+        lambda cfg: (teleop_action_processor, robot_action_processor, robot_observation_processor),
+    )
+    monkeypatch.setattr(fr3_record_runtime, "aggregate_pipeline_dataset_features", lambda **kwargs: {})
+    monkeypatch.setattr(fr3_record_runtime, "create_initial_features", lambda **kwargs: {})
+    monkeypatch.setattr(fr3_record_runtime, "combine_feature_dicts", lambda *args: {})
+    monkeypatch.setattr(fr3_record_runtime, "sanity_check_dataset_name", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fr3_record_runtime, "VideoEncodingManager", FakeVideoEncodingManager)
+    monkeypatch.setattr(fr3_record_runtime, "LeRobotDataset", FakeDatasetFactory)
+    monkeypatch.setattr(fr3_record_runtime, "_wait_for_episode_start_settle", lambda **kwargs: None)
+    monkeypatch.setattr(fr3_record_runtime, "record_loop", lambda **kwargs: call_order.append("record"))
+    monkeypatch.setattr(
+        fr3_record_runtime,
+        "_confirm_keep_episode",
+        lambda play_sounds: call_order.append("confirm") or True,
+    )
+    monkeypatch.setattr(
+        fr3_record_runtime,
+        "init_keyboard_listener",
+        lambda: (None, {"exit_early": False, "rerecord_episode": False, "stop_recording": False}),
+    )
+    monkeypatch.setattr(fr3_record_runtime, "log_say", lambda *args, **kwargs: None)
+
+    cfg = RecordConfig(
+        robot=FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+        ),
+        teleop=SpaceMouseTeleopConfig(),
+        dataset=DatasetRecordConfig(
+            repo_id="local/fr3_test",
+            single_task="test",
+            root="/tmp/fr3_test",
+            fps=30,
+            num_episodes=1,
+            episode_time_s=1,
+            reset_time_s=0,
+            video=False,
+            push_to_hub=False,
+        ),
+        auto_move_to_start_after_episode=True,
+        move_to_start_after_last_episode=True,
+        confirm_next_episode_after_reset=False,
+        play_sounds=False,
+        display_data=False,
+    )
+
+    dataset = fr3_record_runtime.record(cfg)
+
+    assert call_order == ["record", "move_to_start", "send_action", "confirm"]
+    assert robot.move_to_start_calls == 1
+    assert robot.send_action_calls[-1]["gripper"] == 1.0
+    assert teleop.last_gripper == 1.0
+    assert dataset.num_episodes == 1
+
+
+def test_record_discards_episode_when_keep_confirmation_rejects(monkeypatch):
+    teleop_action_processor = FakeProcessor()
+    robot_action_processor = FakeProcessor()
+    robot_observation_processor = FakeProcessor()
+    robot = FakeRobot()
+    teleop = FakeTeleop()
+    teleop.wait_until_idle = lambda **kwargs: True
+    dataset_holder = {}
+    keep_responses = iter([False, True])
+
+    def create_dataset(*args, **kwargs):
+        del args, kwargs
+        dataset = FakeDataset()
+        dataset_holder["dataset"] = dataset
+        return dataset
+
+    monkeypatch.setattr(fr3_record_runtime, "init_logging", lambda: None)
+    monkeypatch.setattr(fr3_record_runtime, "make_robot_from_config", lambda cfg: robot)
+    monkeypatch.setattr(fr3_record_runtime, "make_teleoperator_from_config", lambda cfg: teleop)
+    monkeypatch.setattr(
+        fr3_record_runtime,
+        "make_fr3_ee2ee_processors",
+        lambda cfg: (teleop_action_processor, robot_action_processor, robot_observation_processor),
+    )
+    monkeypatch.setattr(fr3_record_runtime, "aggregate_pipeline_dataset_features", lambda **kwargs: {})
+    monkeypatch.setattr(fr3_record_runtime, "create_initial_features", lambda **kwargs: {})
+    monkeypatch.setattr(fr3_record_runtime, "combine_feature_dicts", lambda *args: {})
+    monkeypatch.setattr(fr3_record_runtime, "sanity_check_dataset_name", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fr3_record_runtime, "VideoEncodingManager", FakeVideoEncodingManager)
+    monkeypatch.setattr(fr3_record_runtime, "LeRobotDataset", type("Factory", (), {"create": staticmethod(create_dataset)}))
+    monkeypatch.setattr(fr3_record_runtime, "_wait_for_episode_start_settle", lambda **kwargs: None)
+    monkeypatch.setattr(fr3_record_runtime, "record_loop", lambda **kwargs: None)
+    monkeypatch.setattr(fr3_record_runtime, "_confirm_keep_episode", lambda play_sounds: next(keep_responses))
+    monkeypatch.setattr(
+        fr3_record_runtime,
+        "init_keyboard_listener",
+        lambda: (None, {"exit_early": False, "rerecord_episode": False, "stop_recording": False}),
+    )
+    monkeypatch.setattr(fr3_record_runtime, "log_say", lambda *args, **kwargs: None)
+
+    cfg = RecordConfig(
+        robot=FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+        ),
+        teleop=SpaceMouseTeleopConfig(),
+        dataset=DatasetRecordConfig(
+            repo_id="local/fr3_test",
+            single_task="test",
+            root="/tmp/fr3_test",
+            fps=30,
+            num_episodes=1,
+            episode_time_s=1,
+            reset_time_s=0,
+            video=False,
+            push_to_hub=False,
+        ),
+        auto_move_to_start_after_episode=False,
+        move_to_start_after_last_episode=False,
+        confirm_next_episode_after_reset=False,
+        play_sounds=False,
+        display_data=False,
+    )
+
+    dataset = fr3_record_runtime.record(cfg)
+
+    assert dataset is dataset_holder["dataset"]
+    assert dataset.num_episodes == 1
+    assert dataset.clear_episode_buffer_calls == 1
+    assert teleop_action_processor.reset_calls == 2
+    assert robot_observation_processor.reset_calls == 2
 
 
 def test_wait_for_episode_start_settle_freezes_initial_target_and_waits_until_gripper_catches_up(monkeypatch):

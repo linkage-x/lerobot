@@ -22,6 +22,7 @@ from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
 from lerobot.scripts.lerobot_record import (
     DatasetRecordConfig,
     RecordConfig,
+    _confirm_keep_episode,
     _confirm_next_episode,
     _move_robot_to_start,
     record,
@@ -191,3 +192,15 @@ def test_confirm_next_episode_accepts_no(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt: "n")
 
     assert _confirm_next_episode(play_sounds=False) is False
+
+
+def test_confirm_keep_episode_accepts_yes(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda prompt: "")
+
+    assert _confirm_keep_episode(play_sounds=False) is True
+
+
+def test_confirm_keep_episode_accepts_no(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+
+    assert _confirm_keep_episode(play_sounds=False) is False

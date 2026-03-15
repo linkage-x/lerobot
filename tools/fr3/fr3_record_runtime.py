@@ -45,7 +45,7 @@ from lerobot.robots.franka_research3 import (
 )
 from lerobot.scripts.lerobot_record import (
     RecordConfig,
-    _confirm_next_episode,
+    _confirm_keep_episode,
     _move_robot_to_start,
     record_loop,
 )
@@ -218,6 +218,33 @@ def _wait_for_teleop_idle(teleop, *, play_sounds: bool) -> None:
         raise RuntimeError("Teleop input did not return to idle before starting the episode.")
 
 
+def _reset_gripper_to_open(robot, teleop=None, *, play_sounds: bool) -> None:
+    send_action = getattr(robot, "send_action", None)
+    if not callable(send_action):
+        robot_name = getattr(robot, "name", type(robot).__name__)
+        raise RuntimeError(f"Robot '{robot_name}' does not support send_action().")
+
+    logging.info("Resetting gripper to open state.")
+    log_say("Opening gripper", play_sounds)
+    send_action(
+        {
+            "enabled": False,
+            "target_x": 0.0,
+            "target_y": 0.0,
+            "target_z": 0.0,
+            "target_wx": 0.0,
+            "target_wy": 0.0,
+            "target_wz": 0.0,
+            "gripper": 1.0,
+        }
+    )
+
+    if teleop is not None:
+        set_gripper = getattr(teleop, "set_gripper", None)
+        if callable(set_gripper):
+            set_gripper(1.0)
+
+
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
     if cfg.teleop is None:
@@ -334,24 +361,25 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     dataset.clear_episode_buffer()
                     continue
 
-                dataset.save_episode()
-                recorded_episodes += 1
+                should_move_to_start = cfg.auto_move_to_start_after_episode and not events["stop_recording"]
+                if should_move_to_start:
+                    _move_robot_to_start(robot, cfg.play_sounds)
+                    _reset_gripper_to_open(robot, teleop, play_sounds=cfg.play_sounds)
+
+                keep_episode = _confirm_keep_episode(cfg.play_sounds)
+                if keep_episode:
+                    dataset.save_episode()
+                    recorded_episodes += 1
+                else:
+                    logging.info("Discarding recorded episode %s.", dataset.num_episodes)
+                    dataset.clear_episode_buffer()
+
                 teleop_action_processor.reset()
                 robot_observation_processor.reset()
 
-                should_move_to_start = (
-                    cfg.auto_move_to_start_after_episode
-                    and not events["stop_recording"]
-                    and (
-                        recorded_episodes < cfg.dataset.num_episodes
-                        or cfg.move_to_start_after_last_episode
-                    )
-                )
-                if should_move_to_start:
-                    _move_robot_to_start(robot, cfg.play_sounds)
-
                 should_run_reset_window = (
-                    cfg.dataset.reset_time_s > 0
+                    keep_episode
+                    and cfg.dataset.reset_time_s > 0
                     and not events["stop_recording"]
                     and recorded_episodes < cfg.dataset.num_episodes
                 )
@@ -374,14 +402,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         display_data=cfg.display_data,
                         display_compressed_images=display_compressed_images,
                     )
-
-                should_confirm_next_episode = (
-                    cfg.confirm_next_episode_after_reset
-                    and not events["stop_recording"]
-                    and recorded_episodes < cfg.dataset.num_episodes
-                )
-                if should_confirm_next_episode and not _confirm_next_episode(cfg.play_sounds):
-                    events["stop_recording"] = True
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
         dataset.finalize()

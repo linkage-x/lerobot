@@ -244,6 +244,10 @@ class SpaceMouseTeleop(Teleoperator):
             if interval_s > 0.0:
                 time.sleep(interval_s)
 
+    def set_gripper(self, normalized_position: float) -> None:
+        self._last_gripper = float(np.clip(normalized_position, 0.0, 1.0))
+        self._last_gripper_update = time.perf_counter()
+
     @check_if_not_connected
     def get_action(self) -> RobotAction:
         reading = self._driver.poll()

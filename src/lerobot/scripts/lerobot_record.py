@@ -480,6 +480,23 @@ def _confirm_next_episode(play_sounds: bool) -> bool:
         print("Please answer 'Y' or 'n'.")
 
 
+def _confirm_keep_episode(play_sounds: bool) -> bool:
+    logging.info("Waiting for terminal confirmation to keep the recorded episode.")
+    log_say("Confirm keep episode", play_sounds)
+    while True:
+        try:
+            response = input("Keep this episode? [Y/n]: ").strip().lower()
+        except EOFError:
+            logging.warning("Terminal input closed while waiting for keep-episode confirmation; discarding episode.")
+            return False
+
+        if response in ("", "y", "yes"):
+            return True
+        if response in ("n", "no"):
+            return False
+        print("Please answer 'Y' or 'n'.")
+
+
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
     init_logging()
