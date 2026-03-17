@@ -1,390 +1,418 @@
-# Franka Research 3 DAS-Gripper SLAM Frame Contract
+# FR3 + DAS Gripper + SLAM 开发指导文档（当前冻结版）
 
-## Scope
+## 1. 目的
 
-This note fixes the frame semantics and data/control contracts for the planned
-pipeline:
+本文档用于冻结当前阶段已经明确的坐标系、外参、数据语义与部署链路，避免后续在以下环节出现 frame contract 不一致的问题：
 
-- DAS-gripper provides synchronized multi-view images, tactile signals, and SLAM
-  poses.
-- SLAM outputs `T(W_s, I_t)`.
-- The learning target is `obs(images, ee pose, tactile, etc.) => action(ee pose)`.
-- The current action label is defined as absolute end-effector pose in `W_s`.
-- FR3 inverse kinematics requires the target pose in the FR3 base frame `B`.
+- 数据采集
+- 数据集导出
+- policy 训练
+- replay
+- 在线控制
+- IK 接口
 
-This document does not implement the pipeline. It specifies what must be
-defined, persisted, and validated before implementation starts.
+当前文档的目标不是解决所有问题，而是让后续开发能够在统一、可验证、可追责的假设下继续推进。
 
-## Goal
+## 2. 当前已经明确的结论
 
-The immediate goal is to make the following unambiguous:
+### 2.1 坐标系定义
 
-- what each frame means
-- how to transform SLAM output into FR3 control targets
-- what must be recorded at episode level and frame level
-- how to initialize each episode
-- how to validate that the frame chain is correct
+采用如下 frame：
 
-## Coordinate Frames
-
-The system uses the following frames:
-
-| Symbol | Meaning |
+| 符号 | 含义 |
 | --- | --- |
 | `B` | FR3 base frame |
-| `E` | End-effector / TCP frame |
-| `I` | DAS-gripper IMU body frame |
-| `W_s` | SLAM world frame for the current episode |
+| `E` | end-effector / TCP frame |
+| `I` | DAS gripper IMU body frame |
+| `W_s` | 每个 episode 的 SLAM world frame |
 
-`W_s` is defined as the IMU body frame at the first frame of the episode:
+其中 `W_s` 定义为该 episode 首帧 IMU body frame：
 
 $$
 W_s \equiv I_0
 $$
 
-This means `W_s` is episode-local, not globally stable across recordings.
+这意味着：
 
-## Transform Convention
+- `W_s` 是 episode-local
+- 不同 episode 之间的 `W_s` 不可直接比较
+- 所有 SLAM pose 只能在本 episode 内自洽使用
 
-The document uses the following convention:
+### 2.2 变换记号
+
+统一采用：
 
 $$
 \mathbf{p}_A = T(A, B)\,\mathbf{p}_B
 $$
 
-That is, `T(A, B)` transforms a point expressed in frame `B` into frame `A`.
+即 `T(A,B)` 把一个在 `B` 中表达的点变到 `A`。由此：
 
-Under this convention:
+- `T(W_s, I_t)`：SLAM 输出
+- `T(I, E)`：IMU 到 TCP 的固定外参
+- `T(B, E_t)`：FR3 base 下的 TCP pose
 
-- `T(W_s, I_t)` is the SLAM output at frame `t`
-- `T(I, E)` is the rigid extrinsic from IMU body to end-effector
-- `T(B, E_t)` is the end-effector pose in FR3 base coordinates
+## 3. E frame 的正式定义
 
-## Confirmed Inputs and Assumptions
+### 3.1 E 的原点
 
-The current planning assumptions are:
+当前冻结为：
 
-- SLAM directly outputs `T(W_s, I_t)`.
-- Tactile, three-view images, and pose signals are already synchronized to the
-  same frame timestamp.
-- The policy action label is the absolute end-effector pose in `W_s`.
-- FR3 joint state at episode start is available.
-- FR3 forward kinematics can provide `T(B, E_0)`.
-- The rigid extrinsic `T(I, E)` is known or will be calibrated.
+> E 原点位于两指尖中心 TCP 附近
 
-## Core Transform Chain
+结合 MuJoCo 多视角可视化，这个位置在几何上是合理的。
 
-### IMU pose to end-effector pose in SLAM world
+### 3.2 E 的轴语义
 
-Given the SLAM output and the IMU-to-EE extrinsic:
+当前正式冻结如下：
+
+| 轴 | 语义 |
+| --- | --- |
+| `-z_E` | 接近方向（approach） |
+| `-y_E` | 夹爪闭合方向（closing） |
+| `x_E` | 法向（normal） |
+
+E 为右手系。即在代码或可视化中：
+
+- `+z_E` 是接近方向的反向
+- `+y_E` 是闭合方向的反向
+- `+x_E` 是法向
+
+此定义后续必须在数据集字段说明、replay、policy label、runtime adapter、IK 接口中统一使用。
+
+## 4. I 和 E 的来源与当前状态
+
+### 4.1 I 的来源
+
+`I` 当前定义为 `link_imu`，来自 DAS_Gripper_V4 中 IMU 对应的 fixed joint。
+
+因此已知 $T(\text{base}, I)$，这里的 `base` 指夹爪机械 base frame。
+
+### 4.2 E 的来源
+
+`E` 当前定义为 `das_gripper_ee`，来自补充 URDF 中：
+
+```
+parent = gripper_base_link
+child  = das_gripper_ee
+```
+
+因此已知 $T(\text{base}, E)$。
+
+### 4.3 T(I,E) 的构造方式
+
+当前采用：
 
 $$
-T(W_s, E_t) = T(W_s, I_t)\,T(I, E)
+T(I, E) = T(\text{base}, I)^{-1}\,T(\text{base}, E)
 $$
 
-### Episode initialization transform
+这是目前候选固定外参的来源。
 
-Because:
+## 5. T(I,E) 的当前结论
 
-$$
-W_s \equiv I_0
-$$
+### 5.1 是否已经能确定
 
-we have:
+可以确定一个候选固定外参 `T(I,E)`。它不是拍脑袋得到的，而是由两份 URDF 链条组合得到。
 
-$$
-T(B, W_s) = T(B, I_0)
-$$
+### 5.2 是否已经可信
 
-At episode start:
+- 在位置层面，已经通过 MuJoCo 可视化 sanity check
+- 在几何语义层面，已具备较强可信度
+- 在工程层面，可以进入正式开发使用，但应标注为"候选冻结版"
 
-$$
-T(B, E_0) = T(B, I_0)\,T(I, E)
-$$
+### 5.3 仍未完全闭环的部分
 
-Therefore:
+还需要继续验证的不是"位置有没有大错"，而是：
 
-$$
-T(B, W_s) = T(B, E_0)\,T(E, I)
-$$
+**A. 真实 IMU body frame 一致性**
 
-where:
+需要确认真实设备中 SLAM 所使用的 IMU frame 是否与 URDF 中 `link_imu` 完全一致。否则可能出现：
 
-$$
-T(E, I) = T(I, E)^{-1}
-$$
+- 固定 90° / 180° 旋转偏差
+- replay 位置看着对，姿态总不对
 
-### Runtime conversion to FR3 base frame
+**B. 运行链路一致性**
 
-For any frame `t`:
+需要在代码中验证：
 
 $$
 T(B, E_t) = T(B, W_s)\,T(W_s, I_t)\,T(I, E)
 $$
 
-If the policy predicts a target end-effector pose in `W_s`:
+以及 replay / FK consistency 是否成立。
 
-$$
-\hat{T}(W_s, E_t^\star)
-$$
+## 6. MuJoCo 可视化验证结论
 
-then the online control adapter must convert it to FR3 base coordinates:
+### 6.1 已确认的现象
 
-$$
-\hat{T}(B, E_t^\star) = T(B, W_s)\,\hat{T}(W_s, E_t^\star)
-$$
+在修正 parent frame 后，多视角可视化显示：
 
-The result is then sent to the FR3 IK solver.
+- `I` 位于夹爪主体内部上方，符合 IMU 安装位置直觉
+- `E` 位于两指尖中心附近，符合任务 TCP 位置直觉
+- `I -> E` 连线从机身内部连向抓取工作区，几何上合理
 
-## Data and Control Architecture
+### 6.2 因此可以得出的结论
 
-```mermaid
-flowchart LR
-    subgraph Episode Init
-        Q0["FR3 joint state q0"]
-        FK["Forward kinematics"]
-        TIE["Extrinsic T(I,E)"]
-        TBW["Compute T(B,W_s)"]
-        Q0 --> FK
-        FK --> TBW
-        TIE --> TBW
-    end
+当前 `T(I,E)` 至少满足：
 
-    subgraph Runtime
-        SLAM["SLAM output T(W_s,I_t)"]
-        OBS["images + tactile + pose"]
-        Policy["ACT policy or similar"]
-        Adapter["W_s to B control adapter"]
-        IK["FR3 IK"]
-        TargetB["target pose T(B,E_star)"]
-        SLAM --> OBS
-        OBS --> Policy
-        Policy -->|"predict T(W_s,E_star)"| Adapter
-        TBW --> Adapter
-        Adapter --> TargetB
-        TargetB --> IK
-    end
-```
+- 原点位置合理
+- 相对偏移合理
+- 不存在显著的父子层级错误
+- 不存在明显的左右翻转/前后颠倒/飞离模型问题
 
-## Training Contract
+### 6.3 对开发的意义
 
-The observation may include:
+当前外参已经足够支持继续写数据管线与 runtime adapter。后续主要是"验证和固化"，不是"从零猜测"。
 
-$$
-o_t = \{\text{images}_t,\ \text{tactile}_t,\ T(W_s, E_t),\ \ldots\}
-$$
+## 7. MuJoCo 模型结构结论
 
-The current canonical action label is:
+### 7.1 das_base_frame 的角色
+
+当前明确：
+
+- `gripper_base`：装配容器 frame
+- `das_base_frame`：MuJoCo 中对应 URDF `gripper_base_link` 的 frame
+
+后续所有相对夹爪 base 定义的对象，都应挂在 `das_base_frame` 下，包括：
+
+- `imu_vis`、`ee_vis`
+- `link1` ~ `link6`
+
+### 7.2 当前开发规则
+
+以后凡是新增与 DAS base 相关的内容（新的 site、tcp_guess、传感器可视化、collision proxy、任务 marker），都应优先挂在 `das_base_frame`，而不是 `gripper_base`、`fr3_link7` 或 `world/root`。
+
+## 8. 训练与部署的 contract
+
+### 8.1 当前训练语义
+
+当前 canonical action label 建议保持为：
 
 $$
 a_t = T(W_s, E_t^\star)
 $$
 
-This contract is valid for training, but `a_t` is not directly usable by FR3
-IK until converted through `T(B, W_s)`.
+即在 `W_s` 下表达的绝对 TCP pose，与当前录制/SLAM 体系更一致。
 
-### Recommended derived label
+### 8.2 当前 observation 语义
 
-Even if `action in W_s` remains the canonical supervision target, the dataset
-should also export a derived base-frame label for debugging and ablation:
+建议 observation 中如果包含位姿，统一用 `E` 语义，而不是混用 `I`：
 
 $$
-a_t^{(B)} = T(B, W_s)\,a_t
+o_t = \{\text{images}_t,\ \text{tactile}_t,\ T(W_s, E_t),\ \ldots\}
 $$
 
-This is not a change of training definition. It is a derived field that makes
-it easier to compare:
-
-- training-time pose semantics
-- replay-time pose semantics
-- deployment-time IK targets
-
-## Episode-Level Requirements
-
-Each episode must persist the initialization data needed to reconstruct the
-frame chain.
-
-Required episode-level fields:
-
-- `episode_id`
-- `start_timestamp`
-- `q_0`
-- `T(B,E_0)` from FR3 forward kinematics
-- `T(I,E)` extrinsic
-- `T(B,W_s)`
-- `robot_model_version`
-- `extrinsic_calib_version`
-- `slam_version`
-
-If `T(B,W_s)` is missing, the episode is not deployable for FR3 IK control.
-
-## Frame-Level Requirements
-
-Each frame should record the synchronized sensor data plus the raw and derived
-poses.
-
-Required frame-level fields:
-
-- `frame_index`
-- `timestamp`
-- `image_left`
-- `image_right`
-- `image_third`
-- `tactile`
-- `joint_state`
-- `T(W_s,I_t)` raw SLAM output
-- `T(W_s,E_t)` derived end-effector observation pose
-- `action_pose_ws`
-
-Strongly recommended derived fields:
-
-- `T(B,E_t)`
-- `action_pose_b`
-
-Saving both raw and derived fields avoids re-deriving critical transforms in
-multiple places with potentially inconsistent conventions.
-
-## What Must Actually Be Completed
-
-The following artifacts should be completed before implementation starts.
-
-### 1. Coordinate frame and transform contract
-
-Create a short design note that freezes:
-
-- the meaning of `B`, `E`, `I`, and `W_s`
-- the direction convention of `T(A, B)`
-- the rotation representation used in storage and runtime
-- the canonical definition of the end-effector frame
-
-This is the top-level contract. All data writing, replay, training, and control
-code must obey it.
-
-### 2. Episode initialization specification
-
-Define the exact procedure used at the beginning of every episode to compute:
+如果底层原始 pose 仍是 `T(W_s, I_t)`，则应显式导出：
 
 $$
-T(B, W_s)
+T(W_s, E_t) = T(W_s, I_t)\,T(I, E)
 $$
 
-This procedure must specify:
+不要在不同模块中各自重复推导。
 
-- required inputs
-- timing requirements
-- FK dependency
-- extrinsic dependency
-- failure handling
-- persistence format
+### 8.3 为什么不能忽略 T(I,E)
 
-### 3. Dataset field specification
+如果忽略 `T(I,E)`，直接把学到的 action 作用在 ee，本质上是在假设 $I \equiv E$，这不成立。结果会是：
 
-Define the dataset schema for:
+- 位置产生固定偏差
+- 姿态产生固定偏差
+- 精细接触任务明显变差
+- 训练语义和部署语义失配
 
-- raw SLAM poses
-- derived end-effector poses
-- canonical action labels in `W_s`
-- optional derived action labels in `B`
-- timestamps and synchronization assumptions
+因此，**部署时必须显式使用 `T(I,E)`**。
 
-This schema should state, field by field:
+## 9. 在线控制链路（推荐实现）
 
-- tensor layout
-- frame semantics
-- units
-- rotation representation
-- whether the field is recorded or derived
+### 9.1 episode 初始化
 
-### 4. Online control adapter specification
-
-Define the runtime adapter that converts:
+每个 episode 开始时应计算 $T(B, W_s)$。因为 $W_s \equiv I_0$，又有：
 
 $$
-\hat{T}(W_s, E_t^\star) \rightarrow \hat{T}(B, E_t^\star)
+T(B, E_0) = T(B, I_0)\,T(I, E)
 $$
 
-This spec should cover:
-
-- required episode metadata
-- exact transform chain
-- numerical conventions
-- error handling when metadata is missing
-- interface to the FR3 IK solver
-
-### 5. Validation and replay plan
-
-Define the checks that prove the frame chain is correct.
-
-Minimum checks:
-
-- first-frame identity check for `T(W_s, I_0)`
-- transform-chain consistency check
-- replay check from logged `W_s` action to reconstructed `B` action
-- FK comparison when joint state is available
-- tolerance thresholds for translation and rotation errors
-
-## Validation Checklist
-
-The following checks should be treated as mandatory.
-
-### First-frame check
-
-At the beginning of each episode:
+所以：
 
 $$
-T(W_s, I_0) \approx I
+T(B, W_s) = T(B, I_0) = T(B, E_0)\,T(E, I)
 $$
 
-where `I` is the identity transform up to numerical tolerance.
+其中 $T(E, I) = T(I, E)^{-1}$。
 
-### Chain consistency check
+### 9.2 runtime pose 变换
 
-For sampled frames, verify:
+对任意时刻 `t`：
 
 $$
 T(B, E_t) = T(B, W_s)\,T(W_s, I_t)\,T(I, E)
 $$
 
-with a fixed and documented convention.
+如果 policy 直接输出的是 E 语义下的 action $\hat{T}(W_s, E_t^\star)$，则在线控制时应转换为：
 
-### Replay check
+$$
+\hat{T}(B, E_t^\star) = T(B, W_s)\,\hat{T}(W_s, E_t^\star)
+$$
 
-Given a logged `action_pose_ws`, reconstruct the base-frame target:
+然后送给 FR3 IK。
+
+### 9.3 强制规则
+
+| 规则 | 内容 |
+| --- | --- |
+| 规则 1 | 所有送入 IK 的 pose 必须是 `B` 下的 `E` pose |
+| 规则 2 | 所有从 SLAM 来的 pose 默认是 `I` 语义，不能直接当 `E` 用 |
+| 规则 3 | `T(I,E)` 只应在少数明确位置使用，推荐只允许在 dataset export 和 runtime control adapter 两处实现 |
+
+## 10. 数据集字段建议（当前版）
+
+### 10.1 episode-level 必备字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `episode_id` | |
+| `start_timestamp` | |
+| `q_0` | episode 起始关节角 |
+| `T(B,E_0)` | 由 FR3 FK 给出 |
+| `T(I,E)` | 固定外参 |
+| `T(B,W_s)` | episode 初始化计算得到 |
+| `robot_model_version` | |
+| `extrinsic_calib_version` | |
+| `slam_version` | |
+
+如果没有 `T(B,W_s)`，则该 episode 不可直接部署。
+
+### 10.2 frame-level 必备字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `frame_index` | |
+| `timestamp` | |
+| `image_left` | |
+| `image_right` | |
+| `image_third` | |
+| `tactile` | |
+| `joint_state` | |
+| `T(W_s,I_t)` | 原始 SLAM 输出 |
+| `T(W_s,E_t)` | 派生 observation pose |
+| `action_pose_ws` | |
+
+### 10.3 强烈推荐的派生字段
+
+| 字段 | 理由 |
+| --- | --- |
+| `T(B,E_t)` | 避免不同模块各自重算，方便排查 frame bug |
+| `action_pose_b` | 更容易做 replay / FK / deployment 比较 |
+
+## 11. 必做验证项
+
+### 11.1 First-frame identity check
+
+每个 episode 起始帧检查：
+
+$$
+T(W_s, I_0) \approx I
+$$
+
+### 11.2 Chain consistency check
+
+抽样验证：
+
+$$
+T(B, E_t) = T(B, W_s)\,T(W_s, I_t)\,T(I, E)
+$$
+
+### 11.3 Replay check
+
+给定 logged `action_pose_ws`，重建：
 
 $$
 T(B, E_t^\star) = T(B, W_s)\,T(W_s, E_t^\star)
 $$
 
-and verify that online replay yields the expected FR3 target pose.
+检查 replay 时 FR3 target 是否与预期一致。
 
-### FK agreement check
+### 11.4 FK agreement check
 
-When joint state is available for a logged frame, compare:
+如果某帧 joint state 可用，比较：
 
-- `T(B,E_t)` from robot forward kinematics
-- `T(B,E_t)` from the SLAM-plus-extrinsic chain
+- robot FK 给出的 $T(B, E_t)$
+- SLAM + extrinsic 链给出的 $T(B, E_t)$
 
-This will expose calibration drift or frame-direction mistakes quickly.
+如果差异持续过大，应优先怀疑：
 
-## Open Design Notes
+- `T(I,E)` 方向错
+- IMU frame 真实定义不一致
+- FK 所用 TCP 定义和 `E` 不一致
 
-The canonical training action remains absolute EE pose in `W_s`, because that
-matches the current data definition. However, storing a derived `action_pose_b`
-is still recommended for three reasons:
+## 12. 当前开发建议：接下来该做什么
 
-- easier deployment debugging
-- easier replay validation
-- easier ablation if a future experiment compares `W_s` labels with `B` labels
+### 优先级 1：冻结实现 contract
 
-This document does not choose between training on `W_s` labels and training on
-`B` labels. It only ensures that the system can support both without redefining
-the raw recording contract.
+在代码库中明确只保留这几个统一入口：
 
-## Immediate TODO
+- `transform_utils.py`
+- `dataset_schema.md`
+- `runtime_adapter.py`
 
-1. Freeze the transform notation and end-effector frame definition.
-2. Freeze the calibration contract for `T(I,E)`.
-3. Write the episode initialization procedure for `T(B,W_s)`.
-4. Write the dataset field schema for raw and derived pose fields.
-5. Write the runtime adapter spec from `W_s` action to `B` IK target.
-6. Write the validation and replay test plan with tolerances.
+不要让各个脚本临时各写一版 `I -> E`。
+
+### 优先级 2：把 E 的轴语义写进代码注释和文档
+
+必须在代码里明确写出：
+
+```
+-z_E: approach（接近方向）
+-y_E: closing（闭合方向）
+ x_E: normal（法向）
+```
+
+否则后面换人开发很容易再乱。
+
+### 优先级 3：做一版"静态 replay 检查脚本"
+
+输入：`T(W_s,I_t)`、`T(I,E)`、`T(B,W_s)`
+
+输出：`T(B,E_t)`，然后和 FK 结果对比。
+
+这会是目前性价比最高的验证工具。
+
+### 优先级 4：确认真实 IMU body axes
+
+这是当前最容易被忽略、但最可能埋雷的点。需要确认真实 SLAM 输出所使用的 IMU frame 是否与 URDF `link_imu` 保持：
+
+- 原点一致
+- 轴方向一致
+- 无固定偏转
+
+## 13. 当前可冻结的技术决策
+
+| 决策 | 内容 |
+| --- | --- |
+| 决策 A | `I = link_imu` |
+| 决策 B | `E = das_gripper_ee` |
+| 决策 C | E 轴语义：`-z` 接近，`-y` 闭合，`x` 法向 |
+| 决策 D | 使用 URDF 链构造候选固定外参：$T(I,E) = T(\text{base},I)^{-1} T(\text{base},E)$ |
+| 决策 E | SLAM pose 默认是 `I` 语义，部署前必须转到 `E` |
+| 决策 F | 送入 IK 的 pose 必须是 `T(B,E)`，不能混用 `T(B,I)` |
+
+## 14. 当前不要做的事
+
+| 禁止 | 原因 |
+| --- | --- |
+| 不要在不同脚本里各写一份 `T(I,E)` 推导逻辑 | 导致 contract 散落，难以维护 |
+| 不要把 `T(W_s,I_t)` 直接当成 `T(W_s,E_t)` 用 | `I ≠ E`，会引入固定偏差 |
+| 不要在没定义清楚 E 轴语义前就开始大规模训练 | 训练后修改代价极高 |
+| 不要把 MuJoCo 可视化结果当成最终真值 | 仍要保留 replay/FK 检查 |
+
+## 15. 一页版结论
+
+- 当前已能构造候选 `T(I,E)`，其位置几何上已通过 MuJoCo sanity check。
+- E 的正式语义已冻结：`-z` 接近，`-y` 闭合，`x` 法向。
+- `das_base_frame` 在 MuJoCo 中应作为 URDF `gripper_base_link` 的对应帧。
+- SLAM 输出是 `I` 语义，不能直接拿来当 `E` 控制。
+- 部署前必须通过 `T(I,E)` 把 pose/action 转到 `E` 语义。
+- 所有 IK 输入必须是 `B` 下的 `E` pose。
+- 下一步重点不是再猜位置，而是做 runtime replay/FK consistency 和真实 IMU frame 一致性验证。
+
+
