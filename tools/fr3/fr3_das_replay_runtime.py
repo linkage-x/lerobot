@@ -306,8 +306,20 @@ def replay(args: argparse.Namespace) -> int:
             T_B_Et_star = ws_to_base(T_B_Ws, T_Ws_Et_star)
 
             # IK  (PlacoKinematicsDriver: input rad → output rad)
+            prev_joints_ik = target_joints_ik if fi > 0 else current_joints_rad  # noqa: F821
             target_joints_ik = np.asarray(kin.inverse_kinematics(current_joints_rad, T_B_Et_star), dtype=np.float64)
             target_joints_rad = np.clip(target_joints_ik[:7], _OTG_MIN_POS, _OTG_MAX_POS)
+            if fi > 0:
+                ik_delta = np.abs(target_joints_ik[:7] - prev_joints_ik[:7])
+                if ik_delta.max() > 0.3:  # rad ≈ 17°，超过此阈值视为 elbow flip
+                    print(f"  [IK_JUMP] frame {fi:4d}: max_joint_delta={ik_delta.max():.3f}rad "
+                          f"joint_idx={int(np.argmax(ik_delta))}  pos_err={pos_errors_mm[-1] if pos_errors_mm else 0:.1f}mm")
+                # OTG 追踪能力检查：每帧最大可追踪关节角 = max_vel * frame_dt
+                otg_max_per_frame = np.array(_OTG_MAX_VEL) * (1.0 / args.fps)
+                otg_gap = np.abs(target_joints_rad - current_joints_rad) - otg_max_per_frame
+                if otg_gap.max() > 0.05:  # 超出 OTG 单帧追踪能力 0.05 rad
+                    print(f"  [OTG_LAG] frame {fi:4d}: otg_gap={otg_gap.max():.3f}rad "
+                          f"joint_idx={int(np.argmax(otg_gap))}")
 
             # OTG 平滑步进
             for _ in range(otg_steps_per_frame):
