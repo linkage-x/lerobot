@@ -7,16 +7,20 @@ FR3 DAS 数据集 MuJoCo 重播运行时（容器内运行）
 
 数据格式（observation.state / action）：
     [x, y, z, qx, qy, qz, qw, gripper]
-    坐标系：SLAM world frame W_s（每个 episode 起始位置为原点）
+    坐标系：SLAM world frame W_s，各帧存储 T(W_s, I_t)
+    其中 I = link_imu（DAS IMU 坐标系），E = das_gripper_ee（末端执行器）
 
 坐标变换链：
-    T(B, E_t) = T(B, E_reset) * inv(T(W_s, E_0)) * T(W_s, E_t)
+    T(B, E_t) = T(B, W_s) * T(W_s, I_t) * T(I, E)
 
     其中：
         T(B, E_reset) = pose_from_xyzquat(reset_arm_command)
                         录制前机械臂 reset 笛卡尔位姿（reset_space="cartesian"）
-        T(W_s, E_0)   = pose_from_xyzquat(state[0]) — 首帧 SLAM 位姿
-        T(W_s, E_t)   = pose_from_xyzquat(state[t])
+        T(B, W_s)     = T(B, E_reset) * T(E, I) * inv(T(W_s, I_0))
+                        W_s 为 VIO 重力对齐世界系，I_0 为 DAS 设备机身首帧（≠ identity，
+                        因 IMU 安装与重力方向约 15° 夹角）
+        T(W_s, I_t)   = pose_from_xyzquat(state[t]) — 第 t 帧 gripper_base_link pose
+        T(I, E)       = _T_IE — 来自 URDF fr3_hand_tcp_joint（gripper_base_link→das_gripper_ee）
 """
 
 from __future__ import annotations
@@ -54,6 +58,22 @@ _RESET_POSE_B_XYZQUAT = np.array(
 # 从真实机器人当前位置出发，IK 收敛更快，消除启动瞬态误差
 _IK_SEED_JOINTS_RAD = np.array(
     [-0.057898, -1.550287, -1.694779, -2.125869, 0.022876, 2.119851, -0.948924],
+    dtype=np.float64,
+)
+
+# DAS 设备机身→EE 固定外参 T(I, E)
+# I = gripper_base_link（DAS 设备机身 / SLAM 跟踪帧）
+# E = das_gripper_ee（TCP）
+# 来源：URDF fr3_hand_tcp_joint  rpy=[π, -π/2, 0]  xyz=[0.13, 0, -0.04]
+# R(I,E) = Rz(0)@Ry(-π/2)@Rx(π) = [[0,0,1],[0,-1,0],[1,0,0]]
+# 验证：R_reset @ R_IE^T = I，即 W_s ≈ B（仅 15° 小倾斜），物理上正确
+_T_IE = np.array(
+    [
+        [0.0,  0.0,  1.0,  0.13],
+        [0.0, -1.0,  0.0,  0.00],
+        [1.0,  0.0,  0.0, -0.04],
+        [0.0,  0.0,  0.0,  1.00],
+    ],
     dtype=np.float64,
 )
 
@@ -105,8 +125,8 @@ def load_episode(dataset_path: str, episode_idx: int) -> dict[str, np.ndarray]:
     """从 Parquet 数据集读取指定 episode 的 state/action/timestamp。
 
     Returns:
-        state:     np.ndarray[N, 8]  — T(W_s, E_t) 在 W_s 系下的 EE pose + gripper
-        action:    np.ndarray[N, 8]  — 发送的 EE 目标 + gripper
+        state:     np.ndarray[N, 8]  — T(W_s, I_t) 在 W_s 系下的 IMU pose + gripper
+        action:    np.ndarray[N, 8]  — 发送的 IMU 目标 pose + gripper
         timestamp: np.ndarray[N]
     """
     meta_dir = Path(dataset_path) / "meta" / "episodes"
@@ -141,24 +161,27 @@ def load_episode(dataset_path: str, episode_idx: int) -> dict[str, np.ndarray]:
 # ---------------------------------------------------------------------------
 
 
-def build_T_B_Ws(T_B_E_reset: np.ndarray, T_Ws_E0: np.ndarray) -> np.ndarray:
+def build_T_B_Ws(T_B_E_reset: np.ndarray, T_Ws_I0: np.ndarray) -> np.ndarray:
     """
     计算 T(B, W_s)。
 
-    T(B, W_s) = T(B, E_reset) * T(E_0, W_s)
-              = T(B, E_reset) * inv(T(W_s, E_0))
+    T(B, W_s) = T(B, I_0)
+              = T(B, E_reset) * T(E, I) * inv(T(W_s, I_0))
+
+    数据集存储的是 T(W_s, I_t)（IMU frame），因此需要先通过 T(E,I)=inv(_T_IE)
+    将 E_reset 转换到 I 系，再对齐到 W_s 原点。
 
     Args:
         T_B_E_reset: 录制前机械臂 reset 位姿在 B 系下的 4x4 SE(3)
                      由 reset_arm_command（cartesian）直接构造
-        T_Ws_E0:     首帧 EE pose 在 W_s 系下（来自 state[0]）
+        T_Ws_I0:     首帧 IMU pose 在 W_s 系下（来自 state[0]）
     """
-    return T_B_E_reset @ se3_inv(T_Ws_E0)
+    return T_B_E_reset @ se3_inv(_T_IE) @ se3_inv(T_Ws_I0)
 
 
-def ws_to_base(T_B_Ws: np.ndarray, T_Ws_Et: np.ndarray) -> np.ndarray:
-    """T(B, E_t) = T(B, W_s) * T(W_s, E_t)"""
-    return T_B_Ws @ T_Ws_Et
+def ws_to_base(T_B_Ws: np.ndarray, T_Ws_It: np.ndarray) -> np.ndarray:
+    """T(B, E_t) = T(B, W_s) * T(W_s, I_t) * T(I, E)"""
+    return T_B_Ws @ T_Ws_It @ _T_IE
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +324,7 @@ def replay(args: argparse.Namespace) -> int:
         for fi in range(n_frames):
             t0 = time.perf_counter()
 
-            # 目标 EE pose：action[fi] → T(W_s, E*_t) → T(B, E*_t)
+            # 目标 EE pose：action[fi] → T(W_s, I*_t) → T(B, I*_t) @ T(I,E) → T(B, E*_t)
             T_Ws_Et_star = pose_from_xyzquat(actions[fi])
             T_B_Et_star = ws_to_base(T_B_Ws, T_Ws_Et_star)
 
@@ -335,7 +358,7 @@ def replay(args: argparse.Namespace) -> int:
             sim_pos = T_B_Et_sim[:3, 3]
             sim_rot = T_B_Et_sim[:3, :3]
 
-            # 录制参考 EE pose：state[fi] → T(W_s, E_t) → T(B, E_t)
+            # 录制参考 EE pose：state[fi] → T(W_s, I_t) → T(B, I_t) @ T(I,E) → T(B, E_t)
             T_Ws_Et_rec = pose_from_xyzquat(states[fi])
             T_B_Et_rec = ws_to_base(T_B_Ws, T_Ws_Et_rec)
             rec_pos = T_B_Et_rec[:3, 3]
