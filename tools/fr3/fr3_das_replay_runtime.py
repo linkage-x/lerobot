@@ -16,9 +16,10 @@ FR3 DAS 数据集 MuJoCo 重播运行时（容器内运行）
     其中：
         T(B, E_reset) = pose_from_xyzquat(reset_arm_command)
                         录制前机械臂 reset 笛卡尔位姿（reset_space="cartesian"）
-        T(B, W_s)     = T(B, E_reset) * T(E, I) * inv(T(W_s, I_0))
-                        W_s 为 VIO 重力对齐世界系，I_0 为 DAS 设备机身首帧（≠ identity，
-                        因 IMU 安装与重力方向约 15° 夹角）
+        T(B, W_s)     = T(B, E_reset) * T(E, I) * inv(T(W_s, I_0)_pos_only)
+                        W_s 为 VIO 重力对齐世界系；T(W_s, I_0) 旋转部分（≈Ry(15°)）
+                        被强制为 I，仅保留平移（≈0），使 R(B,W_s)=I，
+                        消除 IMU 安装倾斜引入的 +Z 耦合与 TCP 15° 旋转偏差
         T(W_s, I_t)   = pose_from_xyzquat(state[t]) — 第 t 帧 gripper_base_link pose
         T(I, E)       = _T_IE — 来自 URDF fr3_hand_tcp_joint（gripper_base_link→das_gripper_ee）
 """
@@ -66,7 +67,7 @@ _IK_SEED_JOINTS_RAD = np.array(
 # E = das_gripper_ee（TCP）
 # 来源：URDF fr3_hand_tcp_joint  rpy=[π, -π/2, 0]  xyz=[0.13, 0, -0.04]
 # R(I,E) = Rz(0)@Ry(-π/2)@Rx(π) = [[0,0,1],[0,-1,0],[1,0,0]]
-# 验证：R_reset @ R_IE^T = I，即 W_s ≈ B（仅 15° 小倾斜），物理上正确
+# ati_das_joint 已校正为 rpy=[0,0,0]，新录数据 state[0] ≈ R_reset，R(B,W_s)=I
 _T_IE = np.array(
     [
         [0.0,  0.0,  1.0,  0.13],
@@ -165,18 +166,26 @@ def build_T_B_Ws(T_B_E_reset: np.ndarray, T_Ws_I0: np.ndarray) -> np.ndarray:
     """
     计算 T(B, W_s)。
 
-    T(B, W_s) = T(B, I_0)
-              = T(B, E_reset) * T(E, I) * inv(T(W_s, I_0))
+    T(B, W_s) = T(B, E_reset) * T(E, I) * inv(T(W_s, I_0)_pos_only)
 
-    数据集存储的是 T(W_s, I_t)（IMU frame），因此需要先通过 T(E,I)=inv(_T_IE)
-    将 E_reset 转换到 I 系，再对齐到 W_s 原点。
+    关键：仅使用 T_Ws_I0 的平移部分（≈0），旋转部分强制为 I。
+    目的：消除 IMU 安装倾斜（≈15°Y）对 R(B,W_s) 的耦合。
+    若保留 T_Ws_I0 的旋转 Ry(15°)，则 R(B,W_s) = Ry(-15°)，导致
+    X_Ws→Z_B 耦合（+Z offset）及 TCP 姿态 15° 偏差。
+    强制旋转=I 后，R(B,W_s) = R_reset @ R_IE^T = I，轨迹坐标系与 B 对齐。
+
+    代价：t=0 时 T(B,E_0) ≠ T(B,E_reset)，存在约 15° 初始姿态差；
+    位置因 T_Ws_I0 平移≈0 而无影响。
 
     Args:
         T_B_E_reset: 录制前机械臂 reset 位姿在 B 系下的 4x4 SE(3)
                      由 reset_arm_command（cartesian）直接构造
-        T_Ws_I0:     首帧 IMU pose 在 W_s 系下（来自 state[0]）
+        T_Ws_I0:     首帧 device pose 在 W_s 系下（来自 state[0]）
     """
-    return T_B_E_reset @ se3_inv(_T_IE) @ se3_inv(T_Ws_I0)
+    # 仅保留首帧平移，丢弃旋转（消除 15° 安装倾斜对 R(B,Ws) 的影响）
+    T_Ws_I0_pos_only = np.eye(4, dtype=np.float64)
+    T_Ws_I0_pos_only[:3, 3] = T_Ws_I0[:3, 3]
+    return T_B_E_reset @ se3_inv(_T_IE) @ se3_inv(T_Ws_I0_pos_only)
 
 
 def ws_to_base(T_B_Ws: np.ndarray, T_Ws_It: np.ndarray) -> np.ndarray:

@@ -1,0 +1,49 @@
+<mujoco model="fr3_das_ati posi scene">
+  <include file="fr3_das_ati.xml" />
+  <option gravity="0 0 -9.81" />
+  <!-- <option gravity="0 0 0.0" /> -->
+
+  <!-- visual effect -->
+  <statistic center="1 0.7 1.5" extent="0.8" />
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0" />
+    <rgba haze="0.15 0.25 0.35 1" />
+    <global azimuth="-140" elevation="-30" />
+  </visual>
+
+  <!-- background -->
+  <asset>
+    <texture type="skybox" builtin="flat" rgb1="0 0 0" rgb2="0 0 0" width="512" height="3072" />
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4"
+      rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300" />
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5"
+      reflectance="0.2" />
+  </asset>
+
+  <worldbody>
+    <!-- light and floor  -->
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true" />
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" />
+
+    <!-- Fixed cameras in world coordinate system -->
+    <!-- Side camera on the left side of the robot base, looking towards the robot -->
+    <camera name="side_cam" pos="0 0.8 0.4" euler="1.57 3.14 0" fovy="60"/>
+    
+    <!-- Third person camera in front of the robot base, looking at the workspace -->
+    <camera name="third_person_cam" pos="1.5 0.0 0.8" euler="0.785 1.57 0.785" fovy="60"/>
+
+    <!-- Mocap object as target -->
+    <!-- 0 1 0 0;  0 0.7071068 0 0.7071068-->
+    <body name="target" pos="0.3 0 0.45" quat="0 0.7071068 0 0.7071068" mocap="true">
+      <geom type="box" size=".04 .04 .04" contype="0" conaffinity="0" rgba=".6 .3 .3 .4" />
+      <site type="sphere" name="target_site" size="0.005" rgba="0 0 1 1" group="1" />
+    </body>
+
+    <body name="TCP" pos="0.365 0 0.4" quat="0 1 0 0" mocap="true">
+      <geom type="sphere" size=".04 .04 .04" contype="0" conaffinity="0" rgba=".6 .3 .3 .4" />
+      <site type="sphere" name="TCP_site" size="0.005" rgba="0 0 1 1" group="1" />
+    </body>
+
+  </worldbody>
+
+</mujoco>
