@@ -176,6 +176,7 @@ services:
   lerobot-fr3-sim:
     <<: *lerobot-sim-common
     image: lerobot-internal:local
+    network_mode: host
     profiles: ["sim", "mujoco", "gpu"]
     build:
       context: ..
