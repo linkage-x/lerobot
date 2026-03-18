@@ -49,9 +49,12 @@ _JOINT_NAMES = [
 # 录制前机械臂 reset 位姿（B 系笛卡尔，reset_space="cartesian"）
 # 格式：[x, y, z, qx, qy, qz, qw]（xyzw，标量在后），供 pose_from_xyzquat 使用
 # 原始 reset_arm_command 四元数（xyzw）：qx=0.7071068, qy=0, qz=0.7071068, qw=0
-# → 绕 [1,0,1]/√2 轴 180° 旋转
+# → R_reset = [[0,0,1],[0,-1,0],[1,0,0]]（绕 [1,0,1]/√2 轴 180° 旋转）
+# 补偿：R_reset_new = R_reset @ Ry(+15°)，使 t=0 时 TCP 平行于桌面（消除 15° 初始 pitch 误差）
+# 实际采集时夹爪第一帧平行于桌面，但 pos_only 方案下 state[0]≈Ry(15°) 引入 15° pitch 差，故在此补偿
+# 新四元数（xyzw）：qx=0.60876143, qy=0, qz=0.79335334, qw=0
 _RESET_POSE_B_XYZQUAT = np.array(
-    [0.15327496, -0.54249998, 0.27, 0.7071068, 0.0, 0.7071068, 0.0],
+    [0.15327496, -0.54249998, 0.27, 0.60876143, 0.0, 0.79335334, 0.0],
     dtype=np.float64,
 )
 
