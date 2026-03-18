@@ -53,7 +53,8 @@ _RESET_POSE_B_XYZQUAT = np.array(
 # DAS 录制起始关节角（rad），从真实 FR3 192.168.1.208 查询（2026-03-17）
 # 重播前必须先将机械臂移动到此构型
 _IK_SEED_JOINTS_RAD = np.array(
-    [-0.057892, -1.550292, -1.694795, -2.125873, 0.022874, 2.119849, -0.948928],
+    # [-0.057892, -1.550292, -1.694795, -2.125873, 0.022874, 2.119849, -0.948928],
+    [-0.053397256451184094, -1.5604194603713035, -1.720175311909912, -2.119629211414152, 0.011555741406479218, 2.1189401256121045, -0.9682376640047694],
     dtype=np.float64,
 )
 
@@ -258,7 +259,7 @@ def replay_real(args: argparse.Namespace) -> int:
         allow_mock_gripper=True,
         urdf_path=str(_DAS_URDF),
         target_frame_name="das_gripper_ee",
-        workspace_min=(0.2, -0.6, _MIN_Z_M),
+        workspace_min=(0.1, -0.6, _MIN_Z_M),  # x min < reset_x(0.153)，避免首帧被 clip 引起 IK 偏移
         workspace_max=(0.9, 0.6, 0.8),
     )
     robot = FrankaResearch3(cfg)
@@ -267,10 +268,30 @@ def replay_real(args: argparse.Namespace) -> int:
     print("[INFO] 真机已连接")
 
     try:
-        # ── 计算 T(B, W_s) ────────────────────────────────────────────
+        # ── 读取真机实际 EE 完整位姿（position + orientation）──────────
+        # 真机版不做 pos_only 简化：
+        #   T_B_Ws = T_B_E_actual @ inv(T_IE) @ inv(T_Ws_I0)
+        # → t=0 时 T_B_Ws @ states[0] @ T_IE = T_B_E_actual（精确，零首帧误差）
+        # pos_only 会让 R_0（~15° IMU 倾斜）通过 T_IE 外参耦合出 ~3.5cm Z 平移残差，
+        # 导致首帧命令比实际位置低 3.5cm（"下沉"）。
+        obs_init = robot.get_observation()
+        T_B_E_actual = np.eye(4, dtype=np.float64)
+        T_B_E_actual[:3, 3] = [obs_init["ee.x"], obs_init["ee.y"], obs_init["ee.z"]]
+        T_B_E_actual[:3, :3] = Rotation.from_rotvec(
+            [obs_init["ee.wx"], obs_init["ee.wy"], obs_init["ee.wz"]]
+        ).as_matrix()
+        print(f"[INFO] 实际 EE 位置: xyz=[{obs_init['ee.x']:.4f}, {obs_init['ee.y']:.4f}, {obs_init['ee.z']:.4f}]")
+        print(f"[INFO] 理论 reset xyz={_RESET_POSE_B_XYZQUAT[:3].round(4)}  "
+              f"偏差 dz={obs_init['ee.z'] - _RESET_POSE_B_XYZQUAT[2]:.4f}m")
+
+        # ── 计算 T(B, W_s)（不做 pos_only，使用完整 T_Ws_I0）─────────
         T_Ws_I0 = pose_from_xyzquat(states[0])
-        T_B_Ws = build_T_B_Ws(T_B_E_reset, T_Ws_I0)
+        T_B_Ws = T_B_E_actual @ se3_inv(_T_IE) @ se3_inv(T_Ws_I0)
+        # 验证：t=0 命令应等于实际 EE 位置
+        T_B_E0_check = ws_to_base(T_B_Ws, T_Ws_I0)
         print(f"[INFO] T(B, W_s)  pos={T_B_Ws[:3,3].round(4)}")
+        print(f"[INFO] t=0 命令预测 xyz={T_B_E0_check[:3,3].round(4)}  "
+              f"（应 ≈ 实际 EE 位置，差值={np.linalg.norm(T_B_E0_check[:3,3] - T_B_E_actual[:3,3])*1000:.2f}mm）")
 
         # ── 初始化 Rerun ──────────────────────────────────────────────
         rr_ok, _ = init_rerun(args.episode)
@@ -293,6 +314,10 @@ def replay_real(args: argparse.Namespace) -> int:
             # 目标 EE pose
             T_Ws_Et_star = pose_from_xyzquat(actions[fi])
             T_B_Et_star = ws_to_base(T_B_Ws, T_Ws_Et_star)
+
+            # 前3帧打印命令位置，确认无首帧下沉
+            if fi < 3:
+                print(f"  [DEBUG] frame {fi}: 命令 xyz={T_B_Et_star[:3,3].round(4)}")
 
             # 安全检查：Z < 15cm 时跳过，不发给机器人
             target_z = float(T_B_Et_star[2, 3])
