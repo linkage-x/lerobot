@@ -24,6 +24,7 @@ DEFAULT_GRIPPER_PORT = "/dev/ttyUSB0"
 DEFAULT_GRIPPER_BACKEND = "das"
 DEFAULT_RESET_GRIPPER_POSITION = 1.0
 DEFAULT_RESET_GRIPPER_TIMEOUT_S = 2.0
+DEFAULT_TIMING_SOURCE = "timestamp"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -37,7 +38,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Dataset path relative to repo root (default: {DEFAULT_DATASET})",
     )
     parser.add_argument("--fps", type=int, default=30, help="Replay frame rate (default: 30)")
+    parser.add_argument(
+        "--timing-source",
+        choices=["fps", "timestamp"],
+        default=DEFAULT_TIMING_SOURCE,
+        help="Replay pacing source: fixed fps or dataset timestamps.",
+    )
     parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP, help=f"FR3 robot IP (default: {DEFAULT_ROBOT_IP})")
+    parser.add_argument(
+        "--filter-coeff",
+        type=float,
+        default=None,
+        help="Optional panda_py JointPosition filter coefficient.",
+    )
+    parser.add_argument(
+        "--damping",
+        default=None,
+        help="Optional panda_py JointPosition damping as 7 comma-separated floats.",
+    )
+    parser.add_argument(
+        "--stiffness",
+        default=None,
+        help="Optional panda_py JointPosition stiffness as 7 comma-separated floats.",
+    )
     parser.add_argument("--gripper-port", default=DEFAULT_GRIPPER_PORT,
                         help=f"DAS controller serial port (default: {DEFAULT_GRIPPER_PORT})")
     parser.add_argument(
@@ -82,7 +105,11 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         f"--episode={args.episode}",
         f"--dataset={shlex.quote(f'/lerobot/{args.dataset}')}",
         f"--fps={args.fps}",
+        f"--timing-source={shlex.quote(args.timing_source)}",
         f"--robot-ip={shlex.quote(args.robot_ip)}",
+        *( [f"--filter-coeff={args.filter_coeff}"] if args.filter_coeff is not None else [] ),
+        *( [f"--damping={shlex.quote(args.damping)}"] if args.damping is not None else [] ),
+        *( [f"--stiffness={shlex.quote(args.stiffness)}"] if args.stiffness is not None else [] ),
         f"--gripper-port={shlex.quote(args.gripper_port)}",
         f"--gripper-backend={shlex.quote(args.gripper_backend)}",
         f"--reset-gripper-position={args.reset_gripper_position}",

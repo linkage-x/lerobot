@@ -76,6 +76,7 @@ _MIN_Z_M = 0.15
 _DAS_RESET_POSITION = 1.0
 _DAS_RESET_TARGET_TOLERANCE = 0.02
 _DAS_FULLY_OPEN_SUCCESS_THRESHOLD = 0.90
+_PEAK_DIAGNOSTIC_FRAMES = 5
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +105,28 @@ def rotation_angle_error_deg(R1: np.ndarray, R2: np.ndarray) -> float:
     """两个旋转矩阵之间的角度误差（°）"""
     trace = np.clip(np.trace(R1.T @ R2), -1.0, 3.0)
     return float(np.degrees(np.arccos((trace - 1.0) / 2.0)))
+
+
+def quaternion_angle_error_deg(q1_xyzw: np.ndarray, q2_xyzw: np.ndarray) -> float:
+    """两个四元数之间的最小夹角（°）"""
+    q1 = np.asarray(q1_xyzw, dtype=np.float64)
+    q2 = np.asarray(q2_xyzw, dtype=np.float64)
+    dot = float(np.clip(abs(np.dot(q1, q2)), 0.0, 1.0))
+    return float(np.degrees(2.0 * np.arccos(dot)))
+
+
+def parse_joint_gains(value: str) -> list[float]:
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != len(_JOINT_NAMES):
+        raise argparse.ArgumentTypeError(
+            f"Expected {len(_JOINT_NAMES)} comma-separated floats for FR3 joint gains."
+        )
+    try:
+        return [float(part) for part in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Expected {len(_JOINT_NAMES)} comma-separated floats for FR3 joint gains."
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +304,75 @@ def dataset_gripper_aperture_to_normalized(aperture_m: float, cfg: "FrankaResear
     return float(np.clip(aperture_m / max_width_m, 0.0, 1.0))
 
 
+def print_peak_diagnostics(
+    *,
+    frame_indices: np.ndarray,
+    pos_errors_mm: np.ndarray,
+    rot_errors_deg: np.ndarray,
+    timestamps: np.ndarray,
+    ee_frames: np.ndarray,
+    states: np.ndarray,
+    actions: np.ndarray,
+    hw_positions: np.ndarray,
+) -> None:
+    if len(pos_errors_mm) == 0:
+        return
+
+    topk = min(_PEAK_DIAGNOSTIC_FRAMES, len(pos_errors_mm))
+    peak_indices = np.argsort(pos_errors_mm)[-topk:][::-1]
+    print("[INFO] 误差峰值诊断（按位置误差排序）")
+    for local_idx in peak_indices:
+        fi = int(frame_indices[local_idx])
+        prev_local_idx = max(local_idx - 1, 0)
+        prev_fi = int(frame_indices[prev_local_idx])
+        ee_quat = np.asarray(ee_frames[local_idx][3:7], dtype=np.float64)
+        ee_prev_quat = np.asarray(ee_frames[prev_local_idx][3:7], dtype=np.float64)
+        state_quat = np.asarray(states[local_idx][3:7], dtype=np.float64)
+        state_prev_quat = np.asarray(states[prev_local_idx][3:7], dtype=np.float64)
+        action_quat = np.asarray(actions[local_idx][3:7], dtype=np.float64)
+        action_prev_quat = np.asarray(actions[prev_local_idx][3:7], dtype=np.float64)
+        ee_step_xyz_mm = float(np.linalg.norm(ee_frames[local_idx][:3] - ee_frames[prev_local_idx][:3]) * 1000.0)
+        state_step_xyz_mm = float(np.linalg.norm(states[local_idx][:3] - states[prev_local_idx][:3]) * 1000.0)
+        action_step_xyz_mm = float(np.linalg.norm(actions[local_idx][:3] - actions[prev_local_idx][:3]) * 1000.0)
+        dt_s = float(max(timestamps[local_idx] - timestamps[prev_local_idx], 1e-9))
+        ee_step_rot_deg = quaternion_angle_error_deg(ee_quat, ee_prev_quat)
+        state_step_rot_deg = quaternion_angle_error_deg(state_quat, state_prev_quat)
+        action_step_rot_deg = quaternion_angle_error_deg(action_quat, action_prev_quat)
+        gripper_step_mm = float((actions[local_idx][7] - actions[prev_local_idx][7]) * 1000.0)
+        print(
+            f"  frame={fi:4d} ts={timestamps[local_idx]:7.3f}s  "
+            f"pos_err={pos_errors_mm[local_idx]:6.2f}mm  rot_err={rot_errors_deg[local_idx]:5.2f}deg"
+        )
+        print(
+            f"    z: hw={hw_positions[local_idx,2]:+.4f}m  ee_src={ee_frames[local_idx][2]:+.4f}m  "
+            f"state={states[local_idx][2]:+.4f}m  action={actions[local_idx][2]:+.4f}m"
+        )
+        print(
+            f"    dz_prev: ee_src={(ee_frames[local_idx][2]-ee_frames[prev_local_idx][2])*1000:+6.2f}mm  "
+            f"state={(states[local_idx][2]-states[prev_local_idx][2])*1000:+6.2f}mm  "
+            f"action={(actions[local_idx][2]-actions[prev_local_idx][2])*1000:+6.2f}mm"
+        )
+        print(
+            f"    dt_prev={dt_s*1000:6.2f}ms  "
+            f"quat_step_prev: ee_src={ee_step_rot_deg:5.2f}deg  "
+            f"state={state_step_rot_deg:5.2f}deg  "
+            f"action={action_step_rot_deg:5.2f}deg"
+        )
+        print(
+            f"    xyz_step_prev: ee_src={ee_step_xyz_mm:6.2f}mm  "
+            f"state={state_step_xyz_mm:6.2f}mm  action={action_step_xyz_mm:6.2f}mm"
+        )
+        print(
+            f"    xyz_speed_prev: ee_src={ee_step_xyz_mm / dt_s:7.2f}mm/s  "
+            f"state={state_step_xyz_mm / dt_s:7.2f}mm/s  "
+            f"action={action_step_xyz_mm / dt_s:7.2f}mm/s"
+        )
+        print(
+            f"    gripper: aperture={actions[local_idx][7]*1000:6.2f}mm  "
+            f"delta_prev={gripper_step_mm:+6.2f}mm"
+        )
+
+
 # ---------------------------------------------------------------------------
 # 真机重播主循环
 # ---------------------------------------------------------------------------
@@ -298,11 +390,21 @@ def replay_real(args: argparse.Namespace) -> int:
     timestamps = ep["timestamp"]
     n_frames = len(states)
     print(f"[INFO] {n_frames} 帧 @ {args.fps} fps")
+    ee_frames = actions
+    print("[INFO] EE 重播源: action[t]")
+    if len(timestamps) >= 2:
+        dt = np.diff(timestamps)
+        print(
+            "[INFO] 数据集时间戳: "
+            f"mean_dt={dt.mean():.5f}s  std={dt.std():.5f}s  "
+            f"min={dt.min():.5f}s  max={dt.max():.5f}s"
+        )
+    print(f"[INFO] 时序源: {args.timing_source}")
 
     # ── 预检查：打印轨迹 Z 范围 ───────────────────────────────────────
     T_B_E_reset = pose_from_xyzquat(_RESET_POSE_B_XYZQUAT)
     T_B_Ws_preview = build_T_B_Ws(T_B_E_reset, pose_from_xyzquat(states[0]))
-    target_poses = [ws_to_base(T_B_Ws_preview, pose_from_xyzquat(actions[fi])) for fi in range(n_frames)]
+    target_poses = [ws_to_base(T_B_Ws_preview, pose_from_xyzquat(ee_frames[fi])) for fi in range(n_frames)]
     z_vals = [float(T[2, 3]) for T in target_poses]
     z_min, z_max = min(z_vals), max(z_vals)
     n_below = sum(1 for z in z_vals if z < _MIN_Z_M)
@@ -316,6 +418,9 @@ def replay_real(args: argparse.Namespace) -> int:
     # ── 初始化真机 ────────────────────────────────────────────────────
     cfg = FrankaResearch3Config(
         robot_ip=args.robot_ip,
+        damping=args.damping,
+        stiffness=args.stiffness,
+        filter_coeff=args.filter_coeff,
         gripper_port=args.gripper_port,
         gripper_backend=args.gripper_backend,
         allow_mock_gripper=False,
@@ -326,6 +431,13 @@ def replay_real(args: argparse.Namespace) -> int:
     )
     robot = FrankaResearch3(cfg)
     print(f"[INFO] 连接真机 {args.robot_ip} ...")
+    if args.filter_coeff is not None or args.damping is not None or args.stiffness is not None:
+        print(
+            "[INFO] Arm 控制器参数: "
+            f"filter_coeff={args.filter_coeff} "
+            f"damping={args.damping} "
+            f"stiffness={args.stiffness}"
+        )
     robot.connect()
     print("[INFO] 真机已连接")
 
@@ -366,6 +478,7 @@ def replay_real(args: argparse.Namespace) -> int:
         rr_ok, _ = init_rerun(args.episode)
 
         # ── 误差记录 ──────────────────────────────────────────────────
+        processed_frame_indices: list[int] = []
         pos_errors_mm: list[float] = []
         rot_errors_deg: list[float] = []
         skipped_frames: list[int] = []
@@ -382,15 +495,18 @@ def replay_real(args: argparse.Namespace) -> int:
             f"frame0={actions[0][7]:.4f}m->{action_gripper_normalized[0]:.4f}"
         )
 
-        frame_dt = 1.0 / args.fps
+        hw_positions: list[np.ndarray] = []
+
         print(f"\n[INFO] 开始真机重播 ({n_frames} 帧)…\n")
 
         for fi in range(n_frames):
             t0 = time.perf_counter()
-
-            # 目标 EE pose
-            T_Ws_Et_star = pose_from_xyzquat(actions[fi])
+            T_Ws_Et_star = pose_from_xyzquat(ee_frames[fi])
             T_B_Et_star = ws_to_base(T_B_Ws, T_Ws_Et_star)
+            if args.timing_source == "timestamp" and fi + 1 < n_frames:
+                target_dt = max(0.0, float(timestamps[fi + 1] - timestamps[fi]))
+            else:
+                target_dt = 1.0 / args.fps
 
             # 前3帧打印命令位置，确认无首帧下沉
             if fi < 3:
@@ -402,11 +518,10 @@ def replay_real(args: argparse.Namespace) -> int:
                 print(f"  [WARN] frame {fi:4d}: target Z={target_z:.4f}m < {_MIN_Z_M}m，跳过")
                 skipped_frames.append(fi)
                 elapsed = time.perf_counter() - t0
-                if (sleep_t := frame_dt - elapsed) > 0:
+                if (sleep_t := target_dt - elapsed) > 0:
                     time.sleep(sleep_t)
                 continue
 
-            # 发送给真机（绝对 EE pose，旋转向量格式）
             rotvec = Rotation.from_matrix(T_B_Et_star[:3, :3]).as_rotvec()
             robot.send_action({
                 "ee.x":  float(T_B_Et_star[0, 3]),
@@ -422,6 +537,7 @@ def replay_real(args: argparse.Namespace) -> int:
             obs = robot.get_observation()
             hw_pos = np.array([obs["ee.x"], obs["ee.y"], obs["ee.z"]], dtype=np.float64)
             hw_rot = Rotation.from_rotvec([obs["ee.wx"], obs["ee.wy"], obs["ee.wz"]]).as_matrix()
+            hw_positions.append(hw_pos.copy())
 
             # 录制参考 pose
             T_B_Et_rec = ws_to_base(T_B_Ws, pose_from_xyzquat(states[fi]))
@@ -430,15 +546,15 @@ def replay_real(args: argparse.Namespace) -> int:
 
             pos_err_mm = float(np.linalg.norm(hw_pos - rec_pos) * 1000)
             rot_err_deg = rotation_angle_error_deg(hw_rot, rec_rot)
+            processed_frame_indices.append(fi)
             pos_errors_mm.append(pos_err_mm)
             rot_errors_deg.append(rot_err_deg)
 
             log_frame(rr_ok, fi, float(timestamps[fi]),
                       hw_pos, rec_pos, pos_err_mm, rot_err_deg, float(action_gripper_normalized[fi]))
 
-            # 速率控制
             elapsed = time.perf_counter() - t0
-            if (sleep_t := frame_dt - elapsed) > 0:
+            if (sleep_t := target_dt - elapsed) > 0:
                 time.sleep(sleep_t)
 
             if fi % 30 == 0:
@@ -453,7 +569,9 @@ def replay_real(args: argparse.Namespace) -> int:
         if len(pos_arr) == 0:
             print("[WARN] 无有效帧（全部被跳过），无统计数据")
             return 0
+        frame_idx_arr = np.asarray(processed_frame_indices, dtype=np.int64)
         rot_arr = np.array(rot_errors_deg)
+        hw_pos_arr = np.asarray(hw_positions, dtype=np.float64)
         _WARMUP = min(30, len(pos_arr))
         pos_stable = pos_arr[_WARMUP:]
         rot_stable = rot_arr[_WARMUP:]
@@ -472,6 +590,16 @@ def replay_real(args: argparse.Namespace) -> int:
             print(f"  【稳定期 frame {_WARMUP}+】旋转误差 (°)    mean={rot_stable.mean():.2f}  "
                   f"max={rot_stable.max():.2f}  p95={np.percentile(rot_stable,95):.2f}")
         print("=" * 60)
+        print_peak_diagnostics(
+            frame_indices=frame_idx_arr,
+            pos_errors_mm=pos_arr,
+            rot_errors_deg=rot_arr,
+            timestamps=timestamps[frame_idx_arr],
+            ee_frames=ee_frames[frame_idx_arr],
+            states=states[frame_idx_arr],
+            actions=actions[frame_idx_arr],
+            hw_positions=hw_pos_arr,
+        )
 
     finally:
         robot.disconnect()
@@ -492,7 +620,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--episode", type=int, default=0)
     parser.add_argument("--dataset", type=str, required=True, help="数据集绝对路径（容器内）")
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--timing-source", choices=["fps", "timestamp"], default="timestamp")
     parser.add_argument("--robot-ip", default="192.168.1.208")
+    parser.add_argument("--filter-coeff", type=float, default=None)
+    parser.add_argument("--damping", type=parse_joint_gains, default=None)
+    parser.add_argument("--stiffness", type=parse_joint_gains, default=None)
     parser.add_argument("--gripper-port", default="/dev/ttyUSB0")
     parser.add_argument("--gripper-backend", choices=["pika", "das"], default="das")
     parser.add_argument("--reset-gripper-position", type=float, default=_DAS_RESET_POSITION)
