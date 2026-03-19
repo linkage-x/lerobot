@@ -336,7 +336,7 @@ class ACT(nn.Module):
         self.decoder = ACTDecoder(config)
 
         # Transformer encoder input projections. The tokens will be structured like
-        # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
+        # [latent, (robot_state), (env_state), (tactile_feature_map_pixels), (image_feature_map_pixels)].
         if self.config.robot_state_feature:
             self.encoder_robot_state_input_proj = nn.Linear(
                 self.config.robot_state_feature.shape[0], config.dim_model
@@ -346,6 +346,13 @@ class ACT(nn.Module):
                 self.config.env_state_feature.shape[0], config.dim_model
             )
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
+        if self.config.use_tactile and self.config.tactile_features:
+            self.encoder_tactile = ACTTactileEncoder(
+                out_channels=config.dim_model,
+                hidden_channels=config.tactile_encoder_hidden_channels,
+            )
+            self.encoder_tactile_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
+            self.encoder_tactile_side_embed = nn.Embedding(len(self.config.tactile_feature_keys), config.dim_model)
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 backbone_model.fc.in_features, config.dim_model, kernel_size=1
@@ -382,6 +389,8 @@ class ACT(nn.Module):
         {
             [robot_state_feature] (optional): (B, state_dim) batch of robot states.
 
+            [tactile_features] (optional): (B, H, W) or (B, 1, H, W) batch of tactile maps.
+
             [image_features]: (B, n_cameras, C, H, W) batch of images.
                 AND/OR
             [env_state_feature]: (B, env_dim) batch of environment states.
@@ -399,7 +408,8 @@ class ACT(nn.Module):
                 "actions must be provided when using the variational objective in training mode."
             )
 
-        batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        reference_tensor = self._get_reference_tensor(batch)
+        batch_size = reference_tensor.shape[0]
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -452,7 +462,7 @@ class ACT(nn.Module):
             mu = log_sigma_x2 = None
             # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
             latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
-                batch[OBS_STATE].device
+                reference_tensor.device
             )
 
         # Prepare transformer encoder inputs.
@@ -464,6 +474,8 @@ class ACT(nn.Module):
         # Environment state token.
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+        if self.config.use_tactile and self.config.tactile_features:
+            self._append_tactile_tokens(batch, encoder_in_tokens, encoder_in_pos_embed)
 
         if self.config.image_features:
             # For a list of images, the H and W may vary but H*W is constant.
@@ -508,6 +520,47 @@ class ACT(nn.Module):
         actions = self.action_head(decoder_out)
 
         return actions, (mu, log_sigma_x2)
+
+    def _get_reference_tensor(self, batch: dict[str, Tensor]) -> Tensor:
+        if OBS_IMAGES in batch:
+            return batch[OBS_IMAGES][0]
+        if self.config.env_state_feature:
+            return batch[OBS_ENV_STATE]
+        if self.config.robot_state_feature:
+            return batch[OBS_STATE]
+        if self.config.use_tactile and self.config.tactile_feature_keys:
+            return batch[self.config.tactile_feature_keys[0]]
+        raise ValueError("Unable to determine a reference tensor for the ACT batch.")
+
+    def _append_tactile_tokens(
+        self,
+        batch: dict[str, Tensor],
+        encoder_in_tokens: list[Tensor],
+        encoder_in_pos_embed: list[Tensor],
+    ) -> None:
+        for side_idx, tactile_key in enumerate(self.config.tactile_feature_keys):
+            tactile = batch[tactile_key]
+            if tactile.ndim == 3:
+                tactile = tactile.unsqueeze(1)
+            elif tactile.ndim != 4:
+                raise ValueError(
+                    f"Tactile feature `{tactile_key}` must be a 3D or 4D tensor. Got shape {tuple(tactile.shape)}."
+                )
+
+            tactile = tactile.float()
+            tactile_features = self.encoder_tactile(tactile)
+            tactile_pos_embed = self.encoder_tactile_feat_pos_embed(tactile_features).to(
+                dtype=tactile_features.dtype
+            )
+            side_embed = self.encoder_tactile_side_embed.weight[side_idx]
+            side_embed = side_embed.to(device=tactile_features.device, dtype=tactile_features.dtype)
+            tactile_features = tactile_features + side_embed.view(1, -1, 1, 1)
+
+            tactile_features = einops.rearrange(tactile_features, "b c h w -> (h w) b c")
+            tactile_pos_embed = einops.rearrange(tactile_pos_embed, "b c h w -> (h w) b c")
+
+            encoder_in_tokens.extend(list(tactile_features))
+            encoder_in_pos_embed.extend(list(tactile_pos_embed))
 
 
 class ACTEncoder(nn.Module):
@@ -661,6 +714,36 @@ class ACTDecoderLayer(nn.Module):
         if not self.pre_norm:
             x = self.norm3(x)
         return x
+
+
+class ACTTactileEncoder(nn.Module):
+    """Lightweight shared tactile encoder for 2D clean tactile maps."""
+
+    def __init__(self, out_channels: int, hidden_channels: list[int]):
+        super().__init__()
+
+        channel_schedule = [*hidden_channels, out_channels]
+        stride_schedule = [(2, 1), (2, 2), (2, 2)]
+
+        layers = []
+        in_channels = 1
+        for idx, out_ch in enumerate(channel_schedule):
+            stride = stride_schedule[idx] if idx < len(stride_schedule) else (1, 1)
+            kernel_size = 3 if idx < len(channel_schedule) - 1 else 1
+            padding = 1 if kernel_size == 3 else 0
+            layers.extend(
+                [
+                    nn.Conv2d(in_channels, out_ch, kernel_size=kernel_size, stride=stride, padding=padding),
+                    nn.GroupNorm(1, out_ch),
+                    nn.GELU(),
+                ]
+            )
+            in_channels = out_ch
+
+        self.encoder = nn.Sequential(*layers)
+
+    def forward(self, tactile: Tensor) -> Tensor:
+        return self.encoder(tactile)
 
 
 def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tensor:

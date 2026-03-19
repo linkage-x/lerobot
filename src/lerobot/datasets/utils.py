@@ -255,6 +255,12 @@ def load_json(fpath: Path) -> Any:
         return json.load(f)
 
 
+def load_jsonlines(fpath: Path) -> list[Any]:
+    """Load a JSON Lines file into memory."""
+    with open(fpath) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
 def write_json(data: dict, fpath: Path) -> None:
     """Write data to a JSON file.
 
@@ -338,8 +344,20 @@ def write_tasks(tasks: pandas.DataFrame, local_dir: Path) -> None:
 
 
 def load_tasks(local_dir: Path) -> pandas.DataFrame:
-    tasks = pd.read_parquet(local_dir / DEFAULT_TASKS_PATH)
-    tasks.index.name = "task"
+    tasks_path = local_dir / DEFAULT_TASKS_PATH
+    if tasks_path.exists():
+        tasks = pd.read_parquet(tasks_path)
+        tasks.index.name = "task"
+        return tasks
+
+    legacy_tasks_path = local_dir / LEGACY_TASKS_PATH
+    if not legacy_tasks_path.exists():
+        raise FileNotFoundError(f"Could not find `{DEFAULT_TASKS_PATH}` or `{LEGACY_TASKS_PATH}` in {local_dir}.")
+
+    legacy_tasks = load_jsonlines(legacy_tasks_path)
+    task_indices = [item["task_index"] for item in legacy_tasks]
+    task_strings = [item["task"] for item in legacy_tasks]
+    tasks = pd.DataFrame({"task_index": task_indices}, index=pd.Index(task_strings, name="task"))
     return tasks
 
 

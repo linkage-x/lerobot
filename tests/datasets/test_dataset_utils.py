@@ -14,13 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from pathlib import Path
+
 import pytest
 import torch
 from datasets import Dataset
 from huggingface_hub import DatasetCard
 
+from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.push_dataset_to_hub.utils import calculate_episode_data_index
-from lerobot.datasets.utils import combine_feature_dicts, create_lerobot_dataset_card, hf_transform_to_torch
+from lerobot.datasets.utils import (
+    combine_feature_dicts,
+    create_lerobot_dataset_card,
+    hf_transform_to_torch,
+    load_tasks,
+)
 from lerobot.utils.constants import ACTION, OBS_IMAGES
 
 
@@ -131,3 +140,49 @@ def test_non_dict_passthrough_last_wins():
     out = combine_feature_dicts(g1, g2)
     # For non-dict entries the last one wins
     assert out["misc"] == 456
+
+
+def test_load_tasks_falls_back_to_legacy_jsonl(tmp_path: Path):
+    legacy_tasks_path = tmp_path / "meta" / "tasks.jsonl"
+    legacy_tasks_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_tasks = [
+        {"task_index": 1, "task": "pick"},
+        {"task_index": 0, "task": "approach"},
+    ]
+    legacy_tasks_path.write_text("".join(json.dumps(item) + "\n" for item in legacy_tasks))
+
+    tasks = load_tasks(tmp_path)
+
+    assert list(tasks.index) == ["pick", "approach"]
+    assert tasks.index.name == "task"
+    assert tasks["task_index"].tolist() == [1, 0]
+
+
+def test_metadata_file_path_falls_back_to_six_digit_file_index(tmp_path: Path):
+    data_file = tmp_path / "data" / "chunk-000" / "file-000000.parquet"
+    video_file = tmp_path / "videos" / "observation.images.left" / "chunk-000" / "file-000000.mp4"
+    data_file.parent.mkdir(parents=True, exist_ok=True)
+    video_file.parent.mkdir(parents=True, exist_ok=True)
+    data_file.touch()
+    video_file.touch()
+
+    meta = LeRobotDatasetMetadata.__new__(LeRobotDatasetMetadata)
+    meta.root = tmp_path
+    meta.info = {
+        "codebase_version": "v3.0",
+        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+    }
+    meta.episodes = [
+        {
+            "data/chunk_index": 0,
+            "data/file_index": 0,
+            "videos/observation.images.left/chunk_index": 0,
+            "videos/observation.images.left/file_index": 0,
+        }
+    ]
+
+    assert meta.get_data_file_path(0) == Path("data/chunk-000/file-000000.parquet")
+    assert meta.get_video_file_path(0, "observation.images.left") == Path(
+        "videos/observation.images.left/chunk-000/file-000000.mp4"
+    )

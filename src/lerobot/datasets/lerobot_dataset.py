@@ -191,6 +191,23 @@ class LeRobotDatasetMetadata:
         """Codebase version used to create this dataset."""
         return packaging.version.parse(self.info["codebase_version"])
 
+    def _resolve_chunk_file_path(
+        self, path_template: str, chunk_idx: int, file_idx: int, **kwargs
+    ) -> Path:
+        path = Path(path_template.format(chunk_index=chunk_idx, file_index=file_idx, **kwargs))
+        if (self.root / path).exists():
+            return path
+
+        if "{file_index:03d}" not in path_template:
+            return path
+
+        alt_template = path_template.replace("{file_index:03d}", "{file_index:06d}")
+        alt_path = Path(alt_template.format(chunk_index=chunk_idx, file_index=file_idx, **kwargs))
+        if (self.root / alt_path).exists():
+            return alt_path
+
+        return path
+
     def get_data_file_path(self, ep_index: int) -> Path:
         if self.episodes is None:
             self.episodes = load_episodes(self.root)
@@ -201,8 +218,7 @@ class LeRobotDatasetMetadata:
         ep = self.episodes[ep_index]
         chunk_idx = ep["data/chunk_index"]
         file_idx = ep["data/file_index"]
-        fpath = self.data_path.format(chunk_index=chunk_idx, file_index=file_idx)
-        return Path(fpath)
+        return self._resolve_chunk_file_path(self.data_path, chunk_idx, file_idx)
 
     def get_video_file_path(self, ep_index: int, vid_key: str) -> Path:
         if self.episodes is None:
@@ -214,8 +230,9 @@ class LeRobotDatasetMetadata:
         ep = self.episodes[ep_index]
         chunk_idx = ep[f"videos/{vid_key}/chunk_index"]
         file_idx = ep[f"videos/{vid_key}/file_index"]
-        fpath = self.video_path.format(video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx)
-        return Path(fpath)
+        if self.video_path is None:
+            raise ValueError("This dataset does not define a `video_path` template.")
+        return self._resolve_chunk_file_path(self.video_path, chunk_idx, file_idx, video_key=vid_key)
 
     @property
     def data_path(self) -> str:

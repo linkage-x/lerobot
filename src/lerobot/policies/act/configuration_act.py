@@ -95,6 +95,10 @@ class ACTConfig(PreTrainedConfig):
     )
 
     # Architecture.
+    # Tactile encoder.
+    use_tactile: bool = False
+    tactile_feature_keys: list[str] = field(default_factory=list)
+    tactile_encoder_hidden_channels: list[int] = field(default_factory=lambda: [32, 64, 128])
     # Vision backbone.
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
@@ -161,8 +165,31 @@ class ACTConfig(PreTrainedConfig):
         return None
 
     def validate_features(self) -> None:
-        if not self.image_features and not self.env_state_feature:
-            raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        if not self.image_features and not self.env_state_feature and not self.tactile_features:
+            raise ValueError(
+                "You must provide at least one image, the environment state, or tactile features among the inputs."
+            )
+
+        if not self.use_tactile:
+            return
+
+        if not self.tactile_feature_keys:
+            raise ValueError("`tactile_feature_keys` must be provided when `use_tactile=True`.")
+
+        tactile_features = self.tactile_features
+        missing_tactile_keys = [key for key in self.tactile_feature_keys if key not in tactile_features]
+        if missing_tactile_keys:
+            raise ValueError(f"Tactile features missing from `input_features`: {missing_tactile_keys}")
+
+        tactile_shapes = {tuple(ft.shape) for ft in tactile_features.values()}
+        if len(tactile_shapes) != 1:
+            raise ValueError(f"All tactile features must share the same shape. Got {sorted(tactile_shapes)}")
+
+        tactile_shape = next(iter(tactile_shapes))
+        if len(tactile_shape) != 2:
+            raise ValueError(
+                f"Tactile features must be 2D sensor maps. Got shape {tactile_shape} for tactile features."
+            )
 
     @property
     def observation_delta_indices(self) -> None:
@@ -175,3 +202,13 @@ class ACTConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+
+    @property
+    def tactile_features(self) -> dict[str, "PolicyFeature"]:
+        if not self.input_features or not self.tactile_feature_keys:
+            return {}
+        return {
+            key: self.input_features[key]
+            for key in self.tactile_feature_keys
+            if key in self.input_features
+        }

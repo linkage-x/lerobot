@@ -55,6 +55,11 @@ def test_fr3_ee2ee_act_das_train_config_parses(monkeypatch):
     assert cfg.dataset.repo_id == "hph/fr3_pick_place_ee2ee_v1"
     assert cfg.dataset.root is None
     assert cfg.policy.type == "act"
+    assert cfg.policy.use_tactile is True
+    assert cfg.policy.tactile_feature_keys == [
+        "observation.tactile.left_clean",
+        "observation.tactile.right_clean",
+    ]
     assert cfg.policy.chunk_size == 100
     assert cfg.policy.n_action_steps == 100
     assert cfg.num_workers == 12
