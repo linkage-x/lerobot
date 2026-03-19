@@ -10,6 +10,7 @@ import subprocess
 
 DEFAULT_HARDWARE_SERVICE = "lerobot-user"
 DEFAULT_SIM_SERVICE = "lerobot-fr3-sim"
+DEFAULT_GRIPPER_PORT = "/dev/ttyUSB0"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -51,7 +52,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hold-s", type=float, default=0.5)
     parser.add_argument("--settle-s", type=float, default=1.0)
     parser.add_argument("--robot-ip", default="192.168.1.206")
-    parser.add_argument("--gripper-port", default="/dev/ttyUSB80")
+    parser.add_argument("--gripper-port", default=DEFAULT_GRIPPER_PORT)
     parser.add_argument("--service", default=None)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)

@@ -25,7 +25,8 @@ from ..config import RobotConfig
 @dataclass
 class FrankaResearch3Config(RobotConfig):
     robot_ip: str = "127.0.0.1"
-    gripper_port: str = "/dev/ttyUSB80"
+    gripper_port: str = "/dev/ttyUSB0"
+    gripper_backend: str = "pika"
     allow_mock_gripper: bool = True
     urdf_path: str = ""
     target_frame_name: str = "pika_gripper_ee"
@@ -47,6 +48,13 @@ class FrankaResearch3Config(RobotConfig):
     gripper_max_width_mm: float = 90.0
     gripper_command_rate_limit_hz: float | None = 15.0
     gripper_command_deadband_mm: float = 0.5
+    gen_con_sdk_path: str | None = None
+    das_baudrate: int = 921600
+    das_update_frequency_hz: float = 50.0
+    das_min_distance_m: float = 0.0
+    das_max_distance_m: float = 0.103
+    das_grasp_threshold_m: float = 0.002
+    das_initial_position: float = 1.0
     disable_torque_on_disconnect: bool = True
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
     damping: list[float] | None = None
@@ -65,6 +73,8 @@ class FrankaResearch3Config(RobotConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.gripper_backend not in {"pika", "das"}:
+            raise ValueError("gripper_backend must be either 'pika' or 'das'.")
         if len(self.workspace_min) != 3 or len(self.workspace_max) != 3:
             raise ValueError("workspace_min and workspace_max must be 3D tuples.")
         if self.max_target_delta_pos is not None and len(self.max_target_delta_pos) != 3:
@@ -79,6 +89,14 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("gripper_command_rate_limit_hz must be positive when provided.")
         if self.gripper_command_deadband_mm < 0:
             raise ValueError("gripper_command_deadband_mm must be non-negative.")
+        if self.das_baudrate <= 0:
+            raise ValueError("das_baudrate must be positive.")
+        if self.das_update_frequency_hz <= 0:
+            raise ValueError("das_update_frequency_hz must be positive.")
+        if self.das_max_distance_m <= self.das_min_distance_m:
+            raise ValueError("das_max_distance_m must be greater than das_min_distance_m.")
+        if not 0.0 <= self.das_initial_position <= 1.0:
+            raise ValueError("das_initial_position must be within [0.0, 1.0].")
         if self.otg_control_frequency <= 0:
             raise ValueError("otg_control_frequency must be positive.")
         if self.otg_async_control_frequency <= 0:

@@ -111,6 +111,47 @@ Updated files:
 - `docker/Dockerfile.user`
 - `docker/Dockerfile.internal`
 
+## Mirror Selection
+
+On March 18, 2026, the current host measured the following mirror latency with
+`curl -w '%{time_connect} %{time_starttransfer} %{time_total}'` before changing
+the Dockerfiles:
+
+- Debian apt:
+  - USTC: `0.000990 0.050702 0.082206`
+  - Aliyun: `0.000948 0.164176 0.230495`
+  - TUNA: `0.000888 0.261199 0.510412`
+- Debian security:
+  - USTC: `0.000697 0.055855 0.074384`
+  - Aliyun: `0.000818 0.346434 0.370837`
+  - TUNA: `0.000922 0.260956 0.390333`
+- Ubuntu apt:
+  - Aliyun: `0.000772 0.360750 0.417862`
+  - USTC: `0.000780 0.455346 0.592105`
+  - TUNA: `0.000714 0.273451 0.693071`
+- PyPI simple index:
+  - Aliyun: `0.000925 0.105898 0.147795`
+  - USTC: `0.001545 0.258952 0.282000`
+  - TUNA: `0.000819 0.516508 0.677986`
+- deadsnakes PPA:
+  - USTC Launchpad proxy: `0.000870 2.560676 2.687783`
+  - Launchpad direct: `0.000812 2.711509 2.739291`
+
+The Dockerfiles now default to:
+
+- `docker/Dockerfile.user`
+  - Debian apt: `https://mirrors.ustc.edu.cn`
+  - Debian security: `https://mirrors.ustc.edu.cn`
+- `docker/Dockerfile.internal`
+  - Ubuntu apt: `https://mirrors.aliyun.com`
+  - Ubuntu security: `https://mirrors.aliyun.com`
+  - deadsnakes PPA proxy: `https://launchpad.proxy.ustclug.org/deadsnakes/ppa/ubuntu`
+- both Dockerfiles
+  - PyPI / `uv pip`: `https://mirrors.aliyun.com/pypi/simple/`
+
+These defaults remain overrideable through Docker build args so the target
+machine can switch mirrors without editing the Dockerfiles.
+
 ## Compose Status
 
 `docker/docker-compose.yml` now provides:
@@ -129,6 +170,24 @@ bring-up while still using the repository's own Dockerfile structure.
 ## Current Status
 
 The `lerobot-user` image now builds successfully with the FR3 dependency chain.
+
+On March 18, 2026, the DAS gripper serial mapping on the current host was
+confirmed as:
+
+- DAS gripper serial node: `/dev/ttyUSB0`
+
+The repository's FR3 hardware-facing defaults have been aligned to that serial
+node so the common replay / smoke / teleop entrypoints no longer assume the
+older placeholder path.
+
+For the DAS-controller path, the Docker images now also clone
+`genrobot-ai/gen_con_sdk_python_release` into
+`/opt/dependencies/gen_con_sdk_python_release`, install its Python
+requirements, and expose that root via `GEN_CON_SDK_HOME`.
+
+Important: the SDK's `config/99-usb-serial.rules` udev template still belongs
+on the host machine, not inside the container. The compose services mount the
+host `/dev`, so stable DAS serial naming must be configured on the host first.
 
 What is known:
 

@@ -6,7 +6,7 @@ FR3 DAS 数据集 MuJoCo 重播运行时（容器内运行）
 在 MuJoCo 中重播，并用 Rerun 可视化重播轨迹 vs 录制轨迹。
 
 数据格式（observation.state / action）：
-    [x, y, z, qx, qy, qz, qw, gripper]
+    [x, y, z, qx, qy, qz, qw, gripper_aperture_m]
     坐标系：SLAM world frame W_s，各帧存储 T(W_s, I_t)
     其中 I = link_imu（DAS IMU 坐标系），E = das_gripper_ee（末端执行器）
 

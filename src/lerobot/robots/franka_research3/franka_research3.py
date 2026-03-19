@@ -30,6 +30,7 @@ from lerobot.utils.robot_utils import precise_sleep
 
 from ..robot import Robot
 from .backends import (
+    DasGripperHardwareDriver,
     MockGripperDriver,
     PandaPyArmDriver,
     PikaGripperHardwareDriver,
@@ -47,6 +48,7 @@ class FrankaResearch3(Robot):
 
     arm_driver_cls = PandaPyArmDriver
     gripper_driver_cls = PikaGripperHardwareDriver
+    das_gripper_driver_cls = DasGripperHardwareDriver
     mock_gripper_driver_cls = MockGripperDriver
     kinematics_driver_cls = PlacoKinematicsDriver
     otg_driver_cls = RuckigOTGDriver
@@ -201,6 +203,27 @@ class FrankaResearch3(Robot):
     def is_connected(self) -> bool:
         return self._is_connected
 
+    def _make_gripper_driver(self):
+        if self.config.gripper_backend == "das":
+            return self.das_gripper_driver_cls(
+                serial_port=self.config.gripper_port,
+                gen_con_sdk_path=self.config.gen_con_sdk_path,
+                baudrate=self.config.das_baudrate,
+                update_frequency_hz=self.config.das_update_frequency_hz,
+                min_distance_m=self.config.das_min_distance_m,
+                max_distance_m=self.config.das_max_distance_m,
+                grasp_threshold_m=self.config.das_grasp_threshold_m,
+                initial_position=self.config.das_initial_position,
+                command_rate_limit_hz=self.config.gripper_command_rate_limit_hz,
+                command_deadband_m=self.config.gripper_command_deadband_mm / 1000.0,
+            )
+        return self.gripper_driver_cls(
+            serial_port=self.config.gripper_port,
+            max_width_mm=self.config.gripper_max_width_mm,
+            command_rate_limit_hz=self.config.gripper_command_rate_limit_hz,
+            command_deadband_mm=self.config.gripper_command_deadband_mm,
+        )
+
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         del calibrate
@@ -222,12 +245,7 @@ class FrankaResearch3(Robot):
         try:
             arm.connect()
             try:
-                gripper = self.gripper_driver_cls(
-                    serial_port=self.config.gripper_port,
-                    max_width_mm=self.config.gripper_max_width_mm,
-                    command_rate_limit_hz=self.config.gripper_command_rate_limit_hz,
-                    command_deadband_mm=self.config.gripper_command_deadband_mm,
-                )
+                gripper = self._make_gripper_driver()
                 gripper.connect()
                 self._gripper_is_mock = False
             except Exception as gripper_error:

@@ -10,7 +10,7 @@ FR3 DAS 数据集真机重播运行时（容器内运行）
         --episode 0 --dataset /lerobot/outputs/datasets/lerobotv3_0310_100ep
 
 数据格式（observation.state / action）：
-    [x, y, z, qx, qy, qz, qw, gripper]
+    [x, y, z, qx, qy, qz, qw, gripper_aperture_m]
     坐标系：SLAM world frame W_s，各帧存储 T(W_s, I_t)
     其中 I = gripper_base_link（DAS 设备机身），E = das_gripper_ee（末端执行器）
 
@@ -73,6 +73,9 @@ _T_IE = np.array(
 
 # EE base 坐标系 Z 安全下限（米）：低于此值跳过该帧命令，防止撞桌
 _MIN_Z_M = 0.15
+_DAS_RESET_POSITION = 1.0
+_DAS_RESET_TARGET_TOLERANCE = 0.02
+_DAS_FULLY_OPEN_SUCCESS_THRESHOLD = 0.90
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +223,64 @@ def move_to_das_start(robot_ip: str) -> None:
     print("[INFO] 已到达 DAS 起始关节角")
 
 
+def reset_das_gripper(robot: "FrankaResearch3", target_position: float, timeout_s: float) -> None:
+    """
+    重播前显式将 DAS 夹爪 reset 到指定开口，并等待编码器反馈变化。
+
+    这里直接走 gripper driver，避免通过 send_action 触发 arm IK/OTG。
+    """
+    clipped_target = float(np.clip(target_position, 0.0, 1.0))
+    gripper = getattr(robot, "_gripper", None)
+    if gripper is None:
+        raise RuntimeError("FR3 gripper backend is not connected.")
+
+    initial_position = float(gripper.get_position())
+    print(
+        f"[INFO] DAS 夹爪 reset: target={clipped_target:.4f} "
+        f"(1.0=fully open), current={initial_position:.4f}"
+    )
+    gripper.set_position(clipped_target)
+
+    deadline = time.perf_counter() + max(0.0, timeout_s)
+    last_position = initial_position
+    while time.perf_counter() < deadline:
+        last_position = float(gripper.get_position())
+        if abs(last_position - clipped_target) <= _DAS_RESET_TARGET_TOLERANCE:
+            print(f"[INFO] DAS 夹爪已 reset 到 {last_position:.4f}")
+            return
+        if clipped_target >= 1.0 - _DAS_RESET_TARGET_TOLERANCE and last_position >= _DAS_FULLY_OPEN_SUCCESS_THRESHOLD:
+            print(
+                f"[INFO] DAS 夹爪已足够打开: measured={last_position:.4f} "
+                f"(threshold={_DAS_FULLY_OPEN_SUCCESS_THRESHOLD:.2f})"
+            )
+            return
+        time.sleep(0.05)
+
+    raise TimeoutError(
+        f"DAS gripper did not reach reset target {clipped_target:.4f} within {timeout_s:.2f}s "
+        f"(last={last_position:.4f})."
+    )
+
+
+def dataset_gripper_aperture_to_normalized(aperture_m: float, cfg: "FrankaResearch3Config") -> float:
+    """
+    DAS 数据集的第 8 维是夹爪开口距离（米），而不是 [0,1] 归一化值。
+
+    replay 到硬件前，需要按当前 gripper backend 的行程映射回归一化命令。
+    """
+    aperture_m = float(max(0.0, aperture_m))
+    if cfg.gripper_backend == "das":
+        span_m = cfg.das_max_distance_m - cfg.das_min_distance_m
+        if span_m <= 0:
+            return 0.0
+        return float(np.clip((aperture_m - cfg.das_min_distance_m) / span_m, 0.0, 1.0))
+
+    max_width_m = cfg.gripper_max_width_mm / 1000.0
+    if max_width_m <= 0:
+        return 0.0
+    return float(np.clip(aperture_m / max_width_m, 0.0, 1.0))
+
+
 # ---------------------------------------------------------------------------
 # 真机重播主循环
 # ---------------------------------------------------------------------------
@@ -256,7 +317,8 @@ def replay_real(args: argparse.Namespace) -> int:
     cfg = FrankaResearch3Config(
         robot_ip=args.robot_ip,
         gripper_port=args.gripper_port,
-        allow_mock_gripper=True,
+        gripper_backend=args.gripper_backend,
+        allow_mock_gripper=False,
         urdf_path=str(_DAS_URDF),
         target_frame_name="das_gripper_ee",
         workspace_min=(0.1, -0.6, _MIN_Z_M),  # x min < reset_x(0.153)，避免首帧被 clip 引起 IK 偏移
@@ -268,6 +330,13 @@ def replay_real(args: argparse.Namespace) -> int:
     print("[INFO] 真机已连接")
 
     try:
+        if args.gripper_backend == "das":
+            reset_das_gripper(
+                robot,
+                target_position=args.reset_gripper_position,
+                timeout_s=args.reset_gripper_timeout_s,
+            )
+
         # ── 读取真机实际 EE 完整位姿（position + orientation）──────────
         # 真机版不做 pos_only 简化：
         #   T_B_Ws = T_B_E_actual @ inv(T_IE) @ inv(T_Ws_I0)
@@ -304,6 +373,14 @@ def replay_real(args: argparse.Namespace) -> int:
         assert actions.shape[1] >= 8, (
             f"action 列数 {actions.shape[1]} < 8，期望 [x,y,z,qx,qy,qz,qw,gripper]"
         )
+        action_gripper_normalized = np.array(
+            [dataset_gripper_aperture_to_normalized(frame[7], cfg) for frame in actions],
+            dtype=np.float64,
+        )
+        print(
+            "[INFO] 数据集夹爪语义: aperture_m -> normalized  "
+            f"frame0={actions[0][7]:.4f}m->{action_gripper_normalized[0]:.4f}"
+        )
 
         frame_dt = 1.0 / args.fps
         print(f"\n[INFO] 开始真机重播 ({n_frames} 帧)…\n")
@@ -338,7 +415,7 @@ def replay_real(args: argparse.Namespace) -> int:
                 "ee.wx": float(rotvec[0]),
                 "ee.wy": float(rotvec[1]),
                 "ee.wz": float(rotvec[2]),
-                "gripper.pos": float(actions[fi][7]),
+                "gripper.pos": float(action_gripper_normalized[fi]),
             })
 
             # 读取当前 EE pose（误差统计用）
@@ -357,7 +434,7 @@ def replay_real(args: argparse.Namespace) -> int:
             rot_errors_deg.append(rot_err_deg)
 
             log_frame(rr_ok, fi, float(timestamps[fi]),
-                      hw_pos, rec_pos, pos_err_mm, rot_err_deg, float(actions[fi][7]))
+                      hw_pos, rec_pos, pos_err_mm, rot_err_deg, float(action_gripper_normalized[fi]))
 
             # 速率控制
             elapsed = time.perf_counter() - t0
@@ -416,7 +493,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset", type=str, required=True, help="数据集绝对路径（容器内）")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--robot-ip", default="192.168.1.208")
-    parser.add_argument("--gripper-port", default="/dev/ttyUSB80")
+    parser.add_argument("--gripper-port", default="/dev/ttyUSB0")
+    parser.add_argument("--gripper-backend", choices=["pika", "das"], default="das")
+    parser.add_argument("--reset-gripper-position", type=float, default=_DAS_RESET_POSITION)
+    parser.add_argument("--reset-gripper-timeout-s", type=float, default=2.0)
     return parser.parse_args(argv)
 
 

@@ -39,7 +39,7 @@ def test_build_docker_command_uses_hardware_service_and_robot_flags(tmp_path: Pa
     assert "lerobot-user" in command
     assert "--mode=hardware" in command_text
     assert "--robot-ip=192.168.1.206" in command_text
-    assert "--gripper-port=/dev/ttyUSB80" in command_text
+    assert "--gripper-port=/dev/ttyUSB0" in command_text
 
 
 def test_build_docker_command_passes_combined_trace_profile_and_rotation_steps(tmp_path: Path):

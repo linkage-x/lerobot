@@ -17,7 +17,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
 import logging
+import os
+from pathlib import Path
+import struct
+import sys
+import threading
 import time
 from typing import Protocol
 
@@ -65,6 +71,55 @@ class JointOTGDriver(Protocol):
 def _silence_pika_logs() -> None:
     logging.getLogger("pika.gripper").setLevel(logging.WARNING)
     logging.getLogger("pika.serial_comm").setLevel(logging.WARNING)
+
+
+_DAS_SDK_ENV_VAR = "GEN_CON_SDK_HOME"
+_DEFAULT_DAS_SDK_ROOTS = (
+    Path("/opt/dependencies/gen_con_sdk_python_release"),
+    Path("/opt/gen_con_sdk_python_release"),
+)
+_DAS_SDK_MODULE_CANDIDATES = (
+    "gen_controller_sdk_python",
+    "gen_con_sdk_python_release",
+    "gen_con_sdk_python_release.gen_controller_sdk_python",
+    "dependencies.gen_con_sdk_python_release.gen_controller_sdk_python",
+)
+
+
+def _resolve_das_databus_cls(gen_con_sdk_path: str | None):
+    search_roots: list[Path] = []
+    for raw_path in (gen_con_sdk_path, os.environ.get(_DAS_SDK_ENV_VAR)):
+        if raw_path:
+            path = Path(raw_path).expanduser()
+            search_roots.extend([path, path.parent])
+    for root in _DEFAULT_DAS_SDK_ROOTS:
+        search_roots.extend([root, root.parent])
+
+    seen_paths: set[str] = set()
+    for root in search_roots:
+        root_str = str(root)
+        if not root_str or root_str in seen_paths or not root.exists():
+            continue
+        seen_paths.add(root_str)
+        if root_str not in sys.path:
+            sys.path.insert(0, root_str)
+
+    import_errors: list[str] = []
+    for module_name in _DAS_SDK_MODULE_CANDIDATES:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError as exc:
+            import_errors.append(f"{module_name}: {exc}")
+            continue
+        databus_cls = getattr(module, "DataBus", None)
+        if databus_cls is not None:
+            return databus_cls
+
+    raise ImportError(
+        "franka_research3 DAS gripper backend requires the gen_controller_sdk_python DataBus. "
+        f"Set {_DAS_SDK_ENV_VAR} to the cloned SDK root if it is not installed in the default image. "
+        f"Import attempts: {import_errors}"
+    )
 
 
 @dataclass
@@ -224,6 +279,130 @@ class PikaGripperHardwareDriver:
         self._last_command_width_mm = pending_width_mm
         self._last_command_time_s = now
         self._pending_command_width_mm = None
+
+
+@dataclass
+class DasGripperHardwareDriver:
+    serial_port: str
+    gen_con_sdk_path: str | None = None
+    baudrate: int = 921600
+    update_frequency_hz: float = 50.0
+    min_distance_m: float = 0.0
+    max_distance_m: float = 0.103
+    grasp_threshold_m: float = 0.002
+    initial_position: float = 1.0
+    command_rate_limit_hz: float | None = 15.0
+    command_deadband_m: float = 0.0005
+
+    def __post_init__(self):
+        if self.max_distance_m <= self.min_distance_m:
+            raise ValueError("Das gripper max_distance_m must be greater than min_distance_m.")
+        if self.update_frequency_hz <= 0:
+            raise ValueError("Das gripper update_frequency_hz must be positive.")
+        if self.baudrate <= 0:
+            raise ValueError("Das gripper baudrate must be positive.")
+        if self.command_deadband_m < 0:
+            raise ValueError("Das gripper command_deadband_m must be non-negative.")
+        self._databus_cls = _resolve_das_databus_cls(self.gen_con_sdk_path)
+        self._databus = None
+        self._lock = threading.Lock()
+        self._gripper_state_updated = False
+        self._position_m: float | None = None
+        self._target_distance_m: float | None = None
+        self._last_command_distance_m: float | None = None
+        self._last_command_time_s: float | None = None
+        self._pending_command_distance_m: float | None = None
+
+    def connect(self) -> None:
+        self._databus = self._databus_cls(
+            tty_port=self.serial_port,
+            baudrate=self.baudrate,
+            encoder_freq=self.update_frequency_hz,
+            encoder_callback=self._encoder_callback,
+        )
+        initial_distance_m = self._scale_to_distance(self.initial_position)
+        self._databus.set_target_distance(initial_distance_m)
+        self._target_distance_m = initial_distance_m
+        self._last_command_distance_m = initial_distance_m
+
+        deadline = time.perf_counter() + 2.0
+        while not self._gripper_state_updated:
+            if time.perf_counter() >= deadline:
+                raise TimeoutError("DasController did not receive encoder data within timeout.")
+            time.sleep(0.001)
+
+    def disconnect(self) -> None:
+        if self._databus is not None:
+            stop = getattr(self._databus, "stop", None)
+            if callable(stop):
+                stop()
+            self._databus = None
+        self._gripper_state_updated = False
+        self._position_m = None
+        self._target_distance_m = None
+        self._last_command_distance_m = None
+        self._last_command_time_s = None
+        self._pending_command_distance_m = None
+
+    def _encoder_callback(self, record_data: bytes) -> None:
+        try:
+            distance_m = float(struct.unpack(">f", record_data)[0])
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Failed to parse DAS encoder update: %s", exc)
+            return
+
+        with self._lock:
+            self._position_m = float(np.clip(distance_m, self.min_distance_m, self.max_distance_m))
+            if self._target_distance_m is not None and self.grasp_threshold_m > 0:
+                _ = self._position_m > (self._target_distance_m + self.grasp_threshold_m)
+        self._gripper_state_updated = True
+
+    def _scale_to_distance(self, normalized_position: float) -> float:
+        normalized = float(np.clip(normalized_position, 0.0, 1.0))
+        return self.min_distance_m + normalized * (self.max_distance_m - self.min_distance_m)
+
+    def get_position(self) -> float:
+        if self._databus is None:
+            raise RuntimeError("Gripper backend is not connected.")
+        with self._lock:
+            distance_m = self._position_m
+        if distance_m is None:
+            distance_m = self._target_distance_m
+        if distance_m is None:
+            raise RuntimeError("Das gripper backend has not received any position update yet.")
+        span = self.max_distance_m - self.min_distance_m
+        if span <= 0:
+            return 0.0
+        return float(np.clip((distance_m - self.min_distance_m) / span, 0.0, 1.0))
+
+    def set_position(self, normalized_position: float) -> None:
+        if self._databus is None:
+            raise RuntimeError("Gripper backend is not connected.")
+
+        target_distance_m = self._scale_to_distance(normalized_position)
+        if (
+            self._last_command_distance_m is not None
+            and abs(target_distance_m - self._last_command_distance_m) < self.command_deadband_m
+        ):
+            self._pending_command_distance_m = None
+            return
+
+        self._pending_command_distance_m = target_distance_m
+        now = time.perf_counter()
+        if self.command_rate_limit_hz is not None and self._last_command_time_s is not None:
+            min_interval_s = 1.0 / self.command_rate_limit_hz
+            if now - self._last_command_time_s < min_interval_s:
+                return
+
+        pending_distance_m = self._pending_command_distance_m
+        if pending_distance_m is None:
+            return
+
+        self._databus.set_target_distance(pending_distance_m)
+        self._target_distance_m = pending_distance_m
+        self._last_command_distance_m = pending_distance_m
+        self._last_command_time_s = now
+        self._pending_command_distance_m = None
 
 
 @dataclass

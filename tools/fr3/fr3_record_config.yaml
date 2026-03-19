@@ -1,7 +1,7 @@
 robot:
   type: franka_research3
   robot_ip: 192.168.1.206
-  gripper_port: /dev/ttyUSB80
+  gripper_port: /dev/ttyUSB0
   allow_mock_gripper: false
   urdf_path: /lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.urdf
   target_frame_name: pika_gripper_ee

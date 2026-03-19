@@ -185,14 +185,14 @@ RUN resolved_extra="${PIP_EXTRA_INDEX_URL}"; \
     && CMAKE_PREFIX_PATH="${CMEEL_PREFIX};/usr/local" \
        LD_LIBRARY_PATH="${CMEEL_PREFIX}/lib:/usr/local/lib" \
        install_with_indexes --python /lerobot/.venv/bin/python --no-cache /tmp/panda-py \
-    && install_with_indexes --python /lerobot/.venv/bin/python --no-cache /tmp/pika_sdk \
+    && install_with_indexes --python /lerobot/.venv/bin/python --no-cache --no-deps /tmp/pika_sdk \
     && install_with_indexes --python /lerobot/.venv/bin/python --no-cache -r "${GEN_CON_SDK_HOME}/requirements.txt" \
     && rm -rf /tmp/panda-py \
     && rm -rf /tmp/pika_sdk \
     && python -c "import placo; print('placo_ok')" \
     && LD_LIBRARY_PATH="${CMEEL_PREFIX}/lib:/usr/local/lib" python -c "import panda_py; print('panda_py_ok')" \
     && python -c "from pika.gripper import Gripper; print('pika_gripper_ok')" \
-    && PYTHONPATH="${GEN_CON_SDK_HOME}" python -c "from gen_controller_sdk_python import DataBus; print('gen_con_sdk_ok')" \
+    && PYTHONPATH="$(dirname "${GEN_CON_SDK_HOME}")" python -c "from gen_con_sdk_python_release import DataBus; print('gen_con_sdk_ok')" \
     && python -c "import ruckig; print('ruckig_ok')" \
     && python -c "import pyspacemouse; print('pyspacemouse_ok')"
 

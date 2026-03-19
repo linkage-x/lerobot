@@ -17,10 +17,13 @@ import sys
 from pathlib import Path
 
 DEFAULT_DATASET = "outputs/datasets/lerobotv3_0310_100ep"
-# 服务名须与 docker/docker-compose.yml 中真机容器的服务名一致（此处复用 sim 容器，仅去掉 X11 挂载）
-DEFAULT_SERVICE = "lerobot-fr3-sim"
+# 真机重播需要访问宿主机 /dev 下的串口设备，因此默认使用带硬件挂载的 teleop 服务。
+DEFAULT_SERVICE = "lerobot-fr3-sim-teleop"
 DEFAULT_ROBOT_IP = "192.168.1.208"
-DEFAULT_GRIPPER_PORT = "/dev/ttyUSB80"
+DEFAULT_GRIPPER_PORT = "/dev/ttyUSB0"
+DEFAULT_GRIPPER_BACKEND = "das"
+DEFAULT_RESET_GRIPPER_POSITION = 1.0
+DEFAULT_RESET_GRIPPER_TIMEOUT_S = 2.0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -36,7 +39,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=30, help="Replay frame rate (default: 30)")
     parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP, help=f"FR3 robot IP (default: {DEFAULT_ROBOT_IP})")
     parser.add_argument("--gripper-port", default=DEFAULT_GRIPPER_PORT,
-                        help=f"Pika gripper serial port (default: {DEFAULT_GRIPPER_PORT})")
+                        help=f"DAS controller serial port (default: {DEFAULT_GRIPPER_PORT})")
+    parser.add_argument(
+        "--gripper-backend",
+        choices=["pika", "das"],
+        default=DEFAULT_GRIPPER_BACKEND,
+        help=f"Hardware gripper backend to use inside the container (default: {DEFAULT_GRIPPER_BACKEND})",
+    )
+    parser.add_argument(
+        "--reset-gripper-position",
+        type=float,
+        default=DEFAULT_RESET_GRIPPER_POSITION,
+        help="Normalized gripper position commanded before replay starts (default: 1.0, fully open).",
+    )
+    parser.add_argument(
+        "--reset-gripper-timeout-s",
+        type=float,
+        default=DEFAULT_RESET_GRIPPER_TIMEOUT_S,
+        help="Maximum time to wait for the pre-replay gripper reset feedback.",
+    )
     parser.add_argument(
         "--workspace",
         type=Path,
@@ -63,6 +84,9 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         f"--fps={args.fps}",
         f"--robot-ip={shlex.quote(args.robot_ip)}",
         f"--gripper-port={shlex.quote(args.gripper_port)}",
+        f"--gripper-backend={shlex.quote(args.gripper_backend)}",
+        f"--reset-gripper-position={args.reset_gripper_position}",
+        f"--reset-gripper-timeout-s={args.reset_gripper_timeout_s}",
     ]
 
     return [

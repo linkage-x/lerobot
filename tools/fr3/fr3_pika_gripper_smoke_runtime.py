@@ -24,7 +24,7 @@ import argparse
 import time
 
 
-DEFAULT_GRIPPER_PORT = "/dev/ttyUSB80"
+DEFAULT_GRIPPER_PORT = "/dev/ttyUSB0"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

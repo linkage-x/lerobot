@@ -32,7 +32,7 @@ import subprocess
 
 DEFAULT_SERVICE = "lerobot-user"
 DEFAULT_ROBOT_IP = "192.168.1.206"
-DEFAULT_GRIPPER_PORT = "/dev/ttyUSB80"
+DEFAULT_GRIPPER_PORT = "/dev/ttyUSB0"
 DEFAULT_URDF_PATH = "/lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.urdf"
 DEFAULT_TRANSLATION_SCALE = 0.000615
 DEFAULT_ROTATION_SCALE = 0.000648

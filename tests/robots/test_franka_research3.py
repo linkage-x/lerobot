@@ -16,6 +16,7 @@
 
 import numpy as np
 import pytest
+import struct
 import sys
 import time
 import types
@@ -331,6 +332,97 @@ def test_pika_gripper_hardware_driver_skips_small_target_changes(monkeypatch):
     driver.set_position(0.203)
 
     assert FakeSDKGripper.instances[-1].set_gripper_distance_calls == [20.0]
+
+
+def test_das_gripper_hardware_driver_reports_normalized_position_and_rate_limits(monkeypatch):
+    class FakeDataBus:
+        instances: list["FakeDataBus"] = []
+
+        def __init__(self, tty_port, baudrate, encoder_freq, encoder_callback):
+            self.tty_port = tty_port
+            self.baudrate = baudrate
+            self.encoder_freq = encoder_freq
+            self.encoder_callback = encoder_callback
+            self.set_target_distance_calls: list[float] = []
+            self.stopped = False
+            type(self).instances.append(self)
+            self.encoder_callback(struct.pack(">f", 0.0206))
+
+        def set_target_distance(self, distance_m):
+            self.set_target_distance_calls.append(float(distance_m))
+
+        def stop(self):
+            self.stopped = True
+
+    fake_module = types.ModuleType("gen_controller_sdk_python")
+    fake_module.DataBus = FakeDataBus
+    monkeypatch.setitem(sys.modules, "gen_controller_sdk_python", fake_module)
+    perf_counter_values = iter([0.0, 0.01, 0.05, 0.11])
+    monkeypatch.setattr(fr3_backends.time, "perf_counter", lambda: next(perf_counter_values))
+
+    driver = fr3_backends.DasGripperHardwareDriver(
+        serial_port="/dev/ttyUSB0",
+        baudrate=921600,
+        update_frequency_hz=50.0,
+        min_distance_m=0.0,
+        max_distance_m=0.103,
+        initial_position=0.2,
+        command_rate_limit_hz=10.0,
+        command_deadband_m=1e-4,
+    )
+    driver.connect()
+
+    assert driver.get_position() == pytest.approx(0.2, abs=1e-3)
+    driver.set_position(0.2)
+    driver.set_position(0.4)
+    driver.set_position(0.4)
+
+    assert FakeDataBus.instances[-1].set_target_distance_calls == pytest.approx([0.0206, 0.0412])
+
+    driver.disconnect()
+    assert FakeDataBus.instances[-1].stopped is True
+
+
+def test_connect_uses_das_gripper_backend_when_configured(monkeypatch):
+    DummyArmDriver.instances = []
+    DummyGripperDriver.instances = []
+    DummyOTGDriver.instances = []
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", FailingGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "das_gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB0",
+            gripper_backend="das",
+            gen_con_sdk_path="/opt/dependencies/gen_con_sdk_python_release",
+            das_baudrate=921600,
+            das_update_frequency_hz=60.0,
+            das_min_distance_m=0.0,
+            das_max_distance_m=0.103,
+            das_grasp_threshold_m=0.003,
+            das_initial_position=0.6,
+            urdf_path="/tmp/fr3.urdf",
+        )
+    )
+
+    try:
+        robot.connect()
+        init_kwargs = DummyGripperDriver.instances[-1].init_kwargs
+        assert init_kwargs["serial_port"] == "/dev/ttyUSB0"
+        assert init_kwargs["gen_con_sdk_path"] == "/opt/dependencies/gen_con_sdk_python_release"
+        assert init_kwargs["baudrate"] == pytest.approx(921600)
+        assert init_kwargs["update_frequency_hz"] == pytest.approx(60.0)
+        assert init_kwargs["max_distance_m"] == pytest.approx(0.103)
+        assert init_kwargs["grasp_threshold_m"] == pytest.approx(0.003)
+        assert init_kwargs["initial_position"] == pytest.approx(0.6)
+        assert init_kwargs["command_deadband_m"] == pytest.approx(robot.config.gripper_command_deadband_mm / 1000.0)
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
 
 
 def test_connect_passes_gripper_command_throttle_config(monkeypatch):
