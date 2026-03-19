@@ -1058,7 +1058,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             # Thus we load the start timestamp of the episode on this mp4 and,
             # shift the query timestamp accordingly.
             from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
-            shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+            to_timestamp = ep[f"videos/{vid_key}/to_timestamp"]
+            shifted_query_ts = [min(max(from_timestamp + ts, from_timestamp), to_timestamp) for ts in query_ts]
 
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
             frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)

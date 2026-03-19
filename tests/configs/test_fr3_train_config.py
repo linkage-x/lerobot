@@ -38,7 +38,26 @@ def test_fr3_ee2ee_act_train_config_parses(monkeypatch):
     assert cfg.dataset.repo_id == "hph/fr3_pick_place_ee2ee_v1"
     assert cfg.dataset.root is None
     assert cfg.policy.type == "act"
-    assert cfg.policy.chunk_size == 50
-    assert cfg.policy.n_action_steps == 50
-    assert cfg.eval_freq == 0
+    assert cfg.policy.chunk_size == 100
+    assert cfg.policy.n_action_steps == 100
+    assert cfg.eval_freq == 20000
+    assert cfg.tolerance_s == 1e-4
+    assert cfg.wandb.enable is False
+
+
+def test_fr3_ee2ee_act_das_train_config_parses(monkeypatch):
+    config_path = Path(__file__).resolve().parents[2] / "src/lerobot/configs/franka_research3_ee2ee_act_das.yaml"
+    monkeypatch.setattr(sys, "argv", ["test_train_config", f"--config_path={config_path}"])
+
+    cfg = load_train_config()
+    cfg.validate()
+
+    assert cfg.dataset.repo_id == "hph/fr3_pick_place_ee2ee_v1"
+    assert cfg.dataset.root is None
+    assert cfg.policy.type == "act"
+    assert cfg.policy.chunk_size == 100
+    assert cfg.policy.n_action_steps == 100
+    assert cfg.num_workers == 12
+    assert cfg.eval_freq == 20000
+    assert cfg.tolerance_s == 1e-3
     assert cfg.wandb.enable is False

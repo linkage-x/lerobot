@@ -106,6 +106,12 @@ If you already have a local `lerobot-internal:local` image and want to train aga
 sudo env HOME=/home/hph docker compose --profile train -f docker/docker-compose.yml run --rm lerobot-train-fr3-act
 ```
 
+For DAS-recorded FR3 datasets with slightly looser video timestamp alignment, use:
+
+```bash
+sudo env HOME=/home/hph docker compose --profile train -f docker/docker-compose.yml run --rm lerobot-train-fr3-act-das
+```
+
 ```bash
 sudo env HOME=/home/hph ACCELERATE_NUM_PROCESSES=2 ACCELERATE_MIXED_PRECISION=bf16 \
   docker compose --profile train --profile multi-gpu -f docker/docker-compose.yml run --rm lerobot-train-fr3-act-multi-gpu

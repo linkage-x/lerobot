@@ -18,17 +18,20 @@
 
 import queue
 import threading
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import av
 import numpy as np
 import pytest
+import torch
 
 from lerobot.datasets.video_utils import (
     VALID_VIDEO_CODECS,
     StreamingVideoEncoder,
     _CameraEncoderThread,
     _get_codec_options,
+    decode_video_frames_torchcodec,
     detect_available_hw_encoders,
     resolve_vcodec,
 )
@@ -130,6 +133,39 @@ class TestHWEncoderDetection:
         """Test that resolve_vcodec raises ValueError for invalid codecs."""
         with pytest.raises(ValueError, match="Invalid vcodec"):
             resolve_vcodec("not_a_real_codec")
+
+
+class TestTorchcodecDecode:
+    def test_clamps_frame_index_to_last_valid_frame(self, tmp_path):
+        requested_indices = []
+
+        class FakeDecoder:
+            metadata = SimpleNamespace(average_fps=30)
+
+            def __len__(self):
+                return 100
+
+            def get_frames_at(self, indices):
+                requested_indices.extend(indices)
+                return SimpleNamespace(
+                    data=[torch.zeros((3, 4, 4), dtype=torch.uint8)],
+                    pts_seconds=[torch.tensor(3.32)],
+                )
+
+        class FakeDecoderCache:
+            def get_decoder(self, _):
+                return FakeDecoder()
+
+        frames = decode_video_frames_torchcodec(
+            tmp_path / "dummy.mp4",
+            timestamps=[3.32],  # round(3.32 * 30) == 100, which must clamp to 99
+            tolerance_s=1.0,
+            decoder_cache=FakeDecoderCache(),
+        )
+
+        assert requested_indices == [99]
+        assert frames.shape == (1, 3, 4, 4)
+        assert frames.dtype == torch.float32
 
 
 # ─── _CameraEncoderThread tests ───

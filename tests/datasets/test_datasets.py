@@ -17,6 +17,8 @@ import logging
 import re
 from itertools import chain
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -109,6 +111,63 @@ def test_dataset_initialization(tmp_path, lerobot_dataset_factory):
     assert dataset.episodes == kwargs["episodes"]
     assert dataset.num_episodes == len(kwargs["episodes"])
     assert dataset.num_frames == len(dataset)
+
+
+def test_make_dataset_fills_missing_camera_stats_with_imagenet_stats():
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="dummy/repo", use_imagenet_stats=True),
+        policy=make_policy_config("act", push_to_hub=False),
+    )
+    cfg.validate()
+
+    fake_dataset = SimpleNamespace(
+        meta=SimpleNamespace(
+            camera_keys=["observation.images.mid"],
+            stats={"action": {"mean": torch.tensor([0.0])}},
+        )
+    )
+
+    with (
+        patch("lerobot.datasets.factory.LeRobotDatasetMetadata", return_value=SimpleNamespace(features={}, fps=30)),
+        patch("lerobot.datasets.factory.resolve_delta_timestamps", return_value=None),
+        patch("lerobot.datasets.factory.LeRobotDataset", return_value=fake_dataset),
+    ):
+        dataset = make_dataset(cfg)
+
+    image_stats = dataset.meta.stats["observation.images.mid"]
+    assert set(image_stats) == {"mean", "std"}
+    assert torch.equal(image_stats["mean"], torch.tensor([[[0.485]], [[0.456]], [[0.406]]], dtype=torch.float32))
+    assert torch.equal(image_stats["std"], torch.tensor([[[0.229]], [[0.224]], [[0.225]]], dtype=torch.float32))
+
+
+def test_query_videos_clamps_timestamps_to_episode_video_bounds():
+    dataset = LeRobotDataset.__new__(LeRobotDataset)
+    dataset.meta = SimpleNamespace(
+        episodes=[
+            {
+                "videos/observation.images.mid/from_timestamp": 10.0,
+                "videos/observation.images.mid/to_timestamp": 12.0,
+            }
+        ],
+        get_video_file_path=lambda ep_idx, vid_key: Path(f"videos/{vid_key}/chunk-000/file-000000.mp4"),
+    )
+    dataset.root = Path("/tmp/dataset")
+    dataset.tolerance_s = 1e-3
+    dataset.video_backend = "torchcodec"
+
+    with patch(
+        "lerobot.datasets.lerobot_dataset.decode_video_frames",
+        return_value=torch.zeros((2, 3, 4, 4), dtype=torch.float32),
+    ) as decode_mock:
+        result = dataset._query_videos({"observation.images.mid": [-1.0, 3.5]}, ep_idx=0)
+
+    assert result["observation.images.mid"].shape == (2, 3, 4, 4)
+    decode_mock.assert_called_once_with(
+        Path("/tmp/dataset/videos/observation.images.mid/chunk-000/file-000000.mp4"),
+        [10.0, 12.0],
+        1e-3,
+        "torchcodec",
+    )
 
 
 # TODO(rcadene, aliberts): do not run LeRobotDataset.create, instead refactor LeRobotDatasetMetadata.create

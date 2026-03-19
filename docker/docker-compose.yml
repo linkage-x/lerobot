@@ -133,6 +133,9 @@ services:
       dockerfile: docker/Dockerfile.user
       args:
         PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+        PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-https://pypi.org/simple/}
+        PIP_FALLBACK_INDEX_URL: ${PIP_FALLBACK_INDEX_URL:-https://pypi.org/simple/}
         UNBOUND_DEPS: ${UNBOUND_DEPS:-false}
 
   lerobot-internal:
@@ -150,6 +153,18 @@ services:
       - lerobot-train
       - --config_path=src/lerobot/configs/franka_research3_ee2ee_act.yaml
       - --dataset.root=${LEROBOT_DATASET_ROOT:-outputs/datasets/fr3_pick_place_ee2ee_v1_20260315_125942}
+    gpus: all
+
+  lerobot-train-fr3-act-das:
+    <<: *lerobot-train-common
+    profiles: ["train", "gpu"]
+    environment:
+      <<: *lerobot-train-env
+      LEROBOT_DATASET_ROOT: ${LEROBOT_DATASET_ROOT:-outputs/datasets/lerobotv3_0310_100ep}
+    command:
+      - lerobot-train
+      - --config_path=src/lerobot/configs/franka_research3_ee2ee_act_das.yaml
+      - --dataset.root=${LEROBOT_DATASET_ROOT:-outputs/datasets/lerobotv3_0310_100ep}
     gpus: all
 
   lerobot-train-fr3-act-multi-gpu:
@@ -185,6 +200,9 @@ services:
         PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
         CUDA_VERSION: ${CUDA_VERSION:-12.4.1}
         OS_VERSION: ${OS_VERSION:-22.04}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+        PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-https://pypi.org/simple/}
+        PIP_FALLBACK_INDEX_URL: ${PIP_FALLBACK_INDEX_URL:-https://pypi.org/simple/}
         UNBOUND_DEPS: ${UNBOUND_DEPS:-false}
     environment:
       <<: *lerobot-env
@@ -204,6 +222,9 @@ services:
         PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
         CUDA_VERSION: ${CUDA_VERSION:-12.4.1}
         OS_VERSION: ${OS_VERSION:-22.04}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+        PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-https://pypi.org/simple/}
+        PIP_FALLBACK_INDEX_URL: ${PIP_FALLBACK_INDEX_URL:-https://pypi.org/simple/}
         UNBOUND_DEPS: ${UNBOUND_DEPS:-false}
     environment:
       <<: *lerobot-env
