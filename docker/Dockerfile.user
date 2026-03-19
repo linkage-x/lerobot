@@ -22,11 +22,9 @@
 ARG PYTHON_VERSION=3.12
 FROM python:${PYTHON_VERSION}-slim
 
-ARG LIBFRANKA_REF=0.15.0
-ARG PANDA_PY_REF=main
-ARG PANDA_PY_REPO=https://github.com/linkage-x/panda-py.git
-ARG PIKA_SDK_REF=main
-ARG PIKA_SDK_REPO=git@github.com:linkage-x/pika_sdk.git
+ARG DEBIAN_MIRROR=https://mirrors.ustc.edu.cn
+ARG DEBIAN_SECURITY_MIRROR=https://mirrors.ustc.edu.cn
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 # Configure environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -35,17 +33,35 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LD_LIBRARY_PATH=/usr/local/lib
 
 # Install system dependencies and uv (as root)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN set -eux \
+    && if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i \
+          -e "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}/debian|g" \
+          -e "s|https://deb.debian.org/debian|${DEBIAN_MIRROR}/debian|g" \
+          -e "s|http://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}/debian-security|g" \
+          -e "s|https://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}/debian-security|g" \
+          /etc/apt/sources.list.d/debian.sources; \
+       fi \
+    && if [ -f /etc/apt/sources.list ]; then \
+        sed -i \
+          -e "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}/debian|g" \
+          -e "s|https://deb.debian.org/debian|${DEBIAN_MIRROR}/debian|g" \
+          -e "s|http://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}/debian-security|g" \
+          -e "s|https://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}/debian-security|g" \
+          /etc/apt/sources.list; \
+       fi \
+    && apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates build-essential git curl libglib2.0-0 libegl1-mesa-dev ffmpeg \
     libusb-1.0-0-dev speech-dispatcher libgeos-dev portaudio19-dev \
     cmake pkg-config ninja-build libeigen3-dev libpoco-dev libhidapi-dev \
     libudev-dev libx11-dev freeglut3-dev libglu1-mesa-dev libssl-dev \
     libboost-filesystem-dev libboost-system-dev libboost-test-dev \
     libboost-serialization-dev liburdfdom-dev \
-    && curl -LsSf https://astral.sh/uv/install.sh | sh \
-    && mv /root/.local/bin/uv /usr/local/bin/uv \
+    && python -m pip install --no-cache-dir --disable-pip-version-check --index-url "${PIP_INDEX_URL}" uv \
     && useradd --create-home --shell /bin/bash user_lerobot \
     && usermod -aG sudo user_lerobot \
+    && mkdir -p /opt/dependencies \
+    && chown -R user_lerobot:user_lerobot /opt/dependencies \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Create application directory and set permissions
@@ -73,15 +89,27 @@ COPY --chown=user_lerobot:user_lerobot setup.py pyproject.toml README.md MANIFES
 COPY --chown=user_lerobot:user_lerobot src/ src/
 
 ARG UNBOUND_DEPS=false
+ARG PIP_EXTRA_INDEX_URL=https://pypi.org/simple/
+ARG PIP_FALLBACK_INDEX_URL=https://pypi.org/simple/
 
 RUN if [ "$UNBOUND_DEPS" = "true" ]; then \
     sed -i 's/,[[:space:]]*<[0-9\.]*//g' pyproject.toml; \
     echo "Dependencies unbound:" && cat pyproject.toml; \
     fi
 
-RUN uv pip install --no-cache ".[all]"
+RUN resolved_extra="${PIP_EXTRA_INDEX_URL}"; \
+    if [ -z "${resolved_extra}" ] || [ "${resolved_extra}" = "${PIP_INDEX_URL}" ]; then \
+      resolved_extra="${PIP_FALLBACK_INDEX_URL}"; \
+    fi; \
+    if [ -n "${resolved_extra}" ] && [ "${resolved_extra}" != "${PIP_INDEX_URL}" ]; then \
+      uv pip install --default-index "${PIP_INDEX_URL}" --index "${resolved_extra}" --no-cache ".[all]"; \
+    else \
+      uv pip install --default-index "${PIP_INDEX_URL}" --no-cache ".[all]"; \
+    fi
 
 USER root
+
+ARG LIBFRANKA_REF=0.15.0
 
 RUN export CMEEL_PREFIX="$(find /lerobot/.venv/lib -path '*/site-packages/cmeel.prefix' -type d | head -n 1)" \
     && test -n "${CMEEL_PREFIX}" \
@@ -115,20 +143,40 @@ RUN cd /tmp/libfranka \
 
 USER user_lerobot
 
-RUN uv pip install --no-cache easyhid pyspacemouse "ruckig>=0.15,<0.16" --no-deps \
+ARG PANDA_PY_REF=main
+ARG PANDA_PY_REPO=https://github.com/linkage-x/panda-py.git
+ARG PIKA_SDK_REF=master
+ARG PIKA_SDK_REPO=https://github.com/linkage-x/pika_sdk.git
+ARG GEN_CON_SDK_REF=master
+ARG GEN_CON_SDK_REPO=https://github.com/genrobot-ai/gen_con_sdk_python_release.git
+ENV GEN_CON_SDK_HOME=/opt/dependencies/gen_con_sdk_python_release
+
+RUN resolved_extra="${PIP_EXTRA_INDEX_URL}"; \
+    if [ -z "${resolved_extra}" ] || [ "${resolved_extra}" = "${PIP_INDEX_URL}" ]; then \
+      resolved_extra="${PIP_FALLBACK_INDEX_URL}"; \
+    fi; \
+    if [ -n "${resolved_extra}" ] && [ "${resolved_extra}" != "${PIP_INDEX_URL}" ]; then \
+      install_with_indexes() { uv pip install --default-index "${PIP_INDEX_URL}" --index "${resolved_extra}" "$@"; }; \
+    else \
+      install_with_indexes() { uv pip install --default-index "${PIP_INDEX_URL}" "$@"; }; \
+    fi \
+    && install_with_indexes --no-cache easyhid pyspacemouse "ruckig>=0.15,<0.16" --no-deps \
     && export CMEEL_PREFIX="$(find /lerobot/.venv/lib -path '*/site-packages/cmeel.prefix' -type d | head -n 1)" \
     && test -n "${CMEEL_PREFIX}" \
     && git clone --depth 1 --branch "${PANDA_PY_REF}" "${PANDA_PY_REPO}" /tmp/panda-py \
     && git clone --depth 1 --branch "${PIKA_SDK_REF}" "${PIKA_SDK_REPO}" /tmp/pika_sdk \
+    && git clone --depth 1 --branch "${GEN_CON_SDK_REF}" "${GEN_CON_SDK_REPO}" "${GEN_CON_SDK_HOME}" \
     && CMAKE_PREFIX_PATH="${CMEEL_PREFIX};/usr/local" \
        LD_LIBRARY_PATH="${CMEEL_PREFIX}/lib:/usr/local/lib" \
-       uv pip install --python /lerobot/.venv/bin/python --no-cache /tmp/panda-py \
-    && uv pip install --python /lerobot/.venv/bin/python --no-cache /tmp/pika_sdk \
+       install_with_indexes --python /lerobot/.venv/bin/python --no-cache /tmp/panda-py \
+    && install_with_indexes --python /lerobot/.venv/bin/python --no-cache /tmp/pika_sdk \
+    && install_with_indexes --python /lerobot/.venv/bin/python --no-cache -r "${GEN_CON_SDK_HOME}/requirements.txt" \
     && rm -rf /tmp/panda-py \
     && rm -rf /tmp/pika_sdk \
     && python -c "import placo; print('placo_ok')" \
     && LD_LIBRARY_PATH="${CMEEL_PREFIX}/lib:/usr/local/lib" python -c "import panda_py; print('panda_py_ok')" \
     && python -c "from pika.gripper import Gripper; print('pika_gripper_ok')" \
+    && PYTHONPATH="${GEN_CON_SDK_HOME}" python -c "from gen_controller_sdk_python import DataBus; print('gen_con_sdk_ok')" \
     && python -c "import ruckig; print('ruckig_ok')" \
     && python -c "import pyspacemouse; print('pyspacemouse_ok')"
 
