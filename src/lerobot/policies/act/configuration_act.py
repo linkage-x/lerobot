@@ -98,7 +98,12 @@ class ACTConfig(PreTrainedConfig):
     # Tactile encoder.
     use_tactile: bool = False
     tactile_feature_keys: list[str] = field(default_factory=list)
+    tactile_use_valid_mask: bool = False
+    tactile_valid_mask_feature_key: str | None = None
     tactile_encoder_hidden_channels: list[int] = field(default_factory=lambda: [32, 64, 128])
+    tactile_encoder_residual_blocks: int = 0
+    tactile_encoder_use_se: bool = False
+    tactile_transformer_layers: int = 0
     # Vision backbone.
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
@@ -154,6 +159,10 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
+        if self.tactile_encoder_residual_blocks < 0:
+            raise ValueError("`tactile_encoder_residual_blocks` must be non-negative.")
+        if self.tactile_transformer_layers < 0:
+            raise ValueError("`tactile_transformer_layers` must be non-negative.")
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -191,6 +200,26 @@ class ACTConfig(PreTrainedConfig):
                 f"Tactile features must be 2D sensor maps. Got shape {tactile_shape} for tactile features."
             )
 
+        if not self.tactile_use_valid_mask:
+            return
+
+        if not self.tactile_valid_mask_feature_key:
+            raise ValueError(
+                "`tactile_valid_mask_feature_key` must be provided when `tactile_use_valid_mask=True`."
+            )
+
+        tactile_valid_mask_feature = self.tactile_valid_mask_feature
+        if tactile_valid_mask_feature is None:
+            raise ValueError(
+                f"Tactile valid mask feature `{self.tactile_valid_mask_feature_key}` is missing from `input_features`."
+            )
+
+        if tuple(tactile_valid_mask_feature.shape) != tactile_shape:
+            raise ValueError(
+                "Tactile valid mask shape must match tactile feature shape. "
+                f"Got mask shape {tactile_valid_mask_feature.shape} and tactile shape {tactile_shape}."
+            )
+
     @property
     def observation_delta_indices(self) -> None:
         return None
@@ -212,3 +241,9 @@ class ACTConfig(PreTrainedConfig):
             for key in self.tactile_feature_keys
             if key in self.input_features
         }
+
+    @property
+    def tactile_valid_mask_feature(self) -> "PolicyFeature | None":
+        if not self.input_features or not self.tactile_valid_mask_feature_key:
+            return None
+        return self.input_features.get(self.tactile_valid_mask_feature_key)

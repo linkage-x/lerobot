@@ -348,11 +348,18 @@ class ACT(nn.Module):
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.use_tactile and self.config.tactile_features:
             self.encoder_tactile = ACTTactileEncoder(
+                in_channels=1 + int(config.tactile_use_valid_mask),
                 out_channels=config.dim_model,
                 hidden_channels=config.tactile_encoder_hidden_channels,
+                residual_blocks=config.tactile_encoder_residual_blocks,
+                use_se=config.tactile_encoder_use_se,
             )
             self.encoder_tactile_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
             self.encoder_tactile_side_embed = nn.Embedding(len(self.config.tactile_feature_keys), config.dim_model)
+            if self.config.tactile_transformer_layers > 0:
+                self.encoder_tactile_transformer = ACTTactileTransformer(
+                    config, num_layers=self.config.tactile_transformer_layers
+                )
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 backbone_model.fc.in_features, config.dim_model, kernel_size=1
@@ -538,17 +545,36 @@ class ACT(nn.Module):
         encoder_in_tokens: list[Tensor],
         encoder_in_pos_embed: list[Tensor],
     ) -> None:
-        for side_idx, tactile_key in enumerate(self.config.tactile_feature_keys):
-            tactile = batch[tactile_key]
-            if tactile.ndim == 3:
-                tactile = tactile.unsqueeze(1)
-            elif tactile.ndim != 4:
-                raise ValueError(
-                    f"Tactile feature `{tactile_key}` must be a 3D or 4D tensor. Got shape {tuple(tactile.shape)}."
-                )
+        tactile_tokens = []
+        tactile_pos_embeds = []
+        tactile_valid_mask = None
+        if self.config.tactile_use_valid_mask and self.config.tactile_valid_mask_feature_key:
+            tactile_valid_mask = self._format_tactile_feature(
+                batch[self.config.tactile_valid_mask_feature_key], self.config.tactile_valid_mask_feature_key
+            )
 
-            tactile = tactile.float()
-            tactile_features = self.encoder_tactile(tactile)
+        for side_idx, tactile_key in enumerate(self.config.tactile_feature_keys):
+            tactile = self._format_tactile_feature(batch[tactile_key], tactile_key).float()
+            tactile_input = tactile
+            if tactile_valid_mask is not None:
+                tactile_mask = tactile_valid_mask
+                if tactile_mask.shape[-2:] != tactile.shape[-2:]:
+                    raise ValueError(
+                        "Tactile valid mask spatial shape must match tactile feature shape. "
+                        f"Got mask shape {tuple(tactile_mask.shape)} and tactile shape {tuple(tactile.shape)}."
+                    )
+                if tactile_mask.shape[0] != tactile.shape[0]:
+                    if tactile_mask.shape[0] == 1:
+                        tactile_mask = tactile_mask.expand(tactile.shape[0], -1, -1, -1)
+                    else:
+                        raise ValueError(
+                            "Tactile valid mask batch dimension must match tactile feature batch dimension. "
+                            f"Got mask batch {tactile_mask.shape[0]} and tactile batch {tactile.shape[0]}."
+                        )
+                tactile_mask = tactile_mask.to(device=tactile.device, dtype=tactile.dtype)
+                tactile_input = torch.cat([tactile, tactile_mask], dim=1)
+
+            tactile_features = self.encoder_tactile(tactile_input)
             tactile_pos_embed = self.encoder_tactile_feat_pos_embed(tactile_features).to(
                 dtype=tactile_features.dtype
             )
@@ -559,8 +585,31 @@ class ACT(nn.Module):
             tactile_features = einops.rearrange(tactile_features, "b c h w -> (h w) b c")
             tactile_pos_embed = einops.rearrange(tactile_pos_embed, "b c h w -> (h w) b c")
 
-            encoder_in_tokens.extend(list(tactile_features))
-            encoder_in_pos_embed.extend(list(tactile_pos_embed))
+            tactile_tokens.extend(list(tactile_features))
+            tactile_pos_embeds.extend(list(tactile_pos_embed))
+
+        if not tactile_tokens:
+            return
+
+        tactile_tokens = torch.stack(tactile_tokens, axis=0)
+        tactile_pos_embeds = torch.stack(tactile_pos_embeds, axis=0)
+        if hasattr(self, "encoder_tactile_transformer"):
+            tactile_tokens = self.encoder_tactile_transformer(tactile_tokens, pos_embed=tactile_pos_embeds)
+
+        encoder_in_tokens.extend(list(tactile_tokens))
+        encoder_in_pos_embed.extend(list(tactile_pos_embeds))
+
+    @staticmethod
+    def _format_tactile_feature(tactile: Tensor, tactile_key: str) -> Tensor:
+        if tactile.ndim == 2:
+            tactile = tactile.unsqueeze(0).unsqueeze(0)
+        elif tactile.ndim == 3:
+            tactile = tactile.unsqueeze(1)
+        elif tactile.ndim != 4:
+            raise ValueError(
+                f"Tactile feature `{tactile_key}` must be a 2D, 3D or 4D tensor. Got shape {tuple(tactile.shape)}."
+            )
+        return tactile
 
 
 class ACTEncoder(nn.Module):
@@ -717,33 +766,99 @@ class ACTDecoderLayer(nn.Module):
 
 
 class ACTTactileEncoder(nn.Module):
-    """Lightweight shared tactile encoder for 2D clean tactile maps."""
+    """Shared tactile encoder with a CNN stem and optional residual channel gating blocks."""
 
-    def __init__(self, out_channels: int, hidden_channels: list[int]):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        hidden_channels: list[int],
+        residual_blocks: int = 0,
+        use_se: bool = False,
+    ):
         super().__init__()
 
         channel_schedule = [*hidden_channels, out_channels]
         stride_schedule = [(2, 1), (2, 2), (2, 2)]
 
         layers = []
-        in_channels = 1
+        current_in_channels = in_channels
         for idx, out_ch in enumerate(channel_schedule):
             stride = stride_schedule[idx] if idx < len(stride_schedule) else (1, 1)
             kernel_size = 3 if idx < len(channel_schedule) - 1 else 1
             padding = 1 if kernel_size == 3 else 0
             layers.extend(
                 [
-                    nn.Conv2d(in_channels, out_ch, kernel_size=kernel_size, stride=stride, padding=padding),
+                    nn.Conv2d(current_in_channels, out_ch, kernel_size=kernel_size, stride=stride, padding=padding),
                     nn.GroupNorm(1, out_ch),
                     nn.GELU(),
                 ]
             )
-            in_channels = out_ch
+            current_in_channels = out_ch
 
-        self.encoder = nn.Sequential(*layers)
+        self.stem = nn.Sequential(*layers)
+        self.residual_blocks = nn.ModuleList(
+            [ACTTactileResidualBlock(out_channels, use_se=use_se) for _ in range(residual_blocks)]
+        )
 
     def forward(self, tactile: Tensor) -> Tensor:
-        return self.encoder(tactile)
+        tactile = self.stem(tactile)
+        for block in self.residual_blocks:
+            tactile = block(tactile)
+        return tactile
+
+
+class ACTTactileResidualBlock(nn.Module):
+    def __init__(self, channels: int, use_se: bool = False):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.norm1 = nn.GroupNorm(1, channels)
+        self.act1 = nn.GELU()
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(1, channels)
+        self.channel_gate = ACTSqueezeExcitation(channels) if use_se else nn.Identity()
+        self.act2 = nn.GELU()
+
+    def forward(self, x: Tensor) -> Tensor:
+        residual = x
+        x = self.act1(self.norm1(self.conv1(x)))
+        x = self.norm2(self.conv2(x))
+        x = self.channel_gate(x)
+        x = x + residual
+        return self.act2(x)
+
+
+class ACTSqueezeExcitation(nn.Module):
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        hidden_channels = max(channels // reduction, 4)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(channels, hidden_channels, kernel_size=1)
+        self.act = nn.GELU()
+        self.fc2 = nn.Conv2d(hidden_channels, channels, kernel_size=1)
+        self.gate = nn.Sigmoid()
+
+    def forward(self, x: Tensor) -> Tensor:
+        scale = self.pool(x)
+        scale = self.fc1(scale)
+        scale = self.act(scale)
+        scale = self.fc2(scale)
+        scale = self.gate(scale)
+        return x * scale
+
+
+class ACTTactileTransformer(nn.Module):
+    """Small tactile-only transformer that refines tactile tokens before multimodal fusion."""
+
+    def __init__(self, config: ACTConfig, num_layers: int):
+        super().__init__()
+        self.layers = nn.ModuleList([ACTEncoderLayer(config) for _ in range(num_layers)])
+        self.norm = nn.LayerNorm(config.dim_model) if config.pre_norm else nn.Identity()
+
+    def forward(self, x: Tensor, pos_embed: Tensor | None = None) -> Tensor:
+        for layer in self.layers:
+            x = layer(x, pos_embed=pos_embed)
+        return self.norm(x)
 
 
 def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tensor:

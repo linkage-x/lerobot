@@ -60,6 +60,11 @@ def test_fr3_ee2ee_act_das_train_config_parses(monkeypatch):
         "observation.tactile.left_clean",
         "observation.tactile.right_clean",
     ]
+    assert cfg.policy.tactile_use_valid_mask is True
+    assert cfg.policy.tactile_valid_mask_feature_key == "observation.tactile.valid_mask"
+    assert cfg.policy.tactile_encoder_residual_blocks == 1
+    assert cfg.policy.tactile_encoder_use_se is True
+    assert cfg.policy.tactile_transformer_layers == 1
     assert cfg.policy.chunk_size == 100
     assert cfg.policy.n_action_steps == 100
     assert cfg.num_workers == 12

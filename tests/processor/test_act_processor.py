@@ -35,6 +35,8 @@ from lerobot.processor import (
 from lerobot.processor.converters import create_transition, transition_to_batch
 from lerobot.utils.constants import ACTION, OBS_STATE
 
+TACTILE_VALID_MASK = "observation.tactile.valid_mask"
+
 
 def create_default_config():
     """Create a default ACT configuration for testing."""
@@ -219,9 +221,29 @@ def test_act_processor_without_stats():
     action = torch.randn(4)
     transition = create_transition(observation, action)
     batch = transition_to_batch(transition)
-
     processed = preprocessor(batch)
     assert processed is not None
+
+
+def test_act_processor_skips_valid_mask_normalization():
+    config = create_default_config()
+    config.input_features[TACTILE_VALID_MASK] = PolicyFeature(type=FeatureType.STATE, shape=(50, 10))
+    config.use_tactile = True
+    config.tactile_use_valid_mask = True
+    config.tactile_valid_mask_feature_key = TACTILE_VALID_MASK
+
+    stats = create_default_stats()
+    stats[TACTILE_VALID_MASK] = {"mean": torch.ones(50, 10), "std": torch.zeros(50, 10)}
+
+    preprocessor, _ = make_act_pre_post_processors(config, stats)
+
+    valid_mask = torch.randint(0, 2, (50, 10), dtype=torch.float32)
+    transition = create_transition({OBS_STATE: torch.randn(7), TACTILE_VALID_MASK: valid_mask}, torch.randn(4))
+    batch = transition_to_batch(transition)
+
+    processed = preprocessor(batch)
+
+    assert torch.equal(processed[TACTILE_VALID_MASK], valid_mask)
 
 
 def test_act_processor_save_and_load():
