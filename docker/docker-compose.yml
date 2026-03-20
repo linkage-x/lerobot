@@ -167,6 +167,18 @@ services:
       - --dataset.root=${LEROBOT_DATASET_ROOT:-outputs/datasets/lerobotv3_0310_100ep}
     gpus: all
 
+  lerobot-infer-fr3-act:
+    <<: *lerobot-common
+    image: lerobot-internal:local
+    pull_policy: never
+    profiles: ["infer", "gpu"]
+    environment:
+      <<: *lerobot-env
+      DEVICE: cuda
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+      TEST_TYPE: single_gpu
+    gpus: all
+
   lerobot-train-fr3-act-multi-gpu:
     <<: *lerobot-train-common
     profiles: ["train", "multi-gpu", "gpu"]
