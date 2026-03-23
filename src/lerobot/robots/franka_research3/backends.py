@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import importlib
 import logging
 import os
@@ -281,12 +282,190 @@ class PikaGripperHardwareDriver:
         self._pending_command_width_mm = None
 
 
+_TACTILE_IMAGE_SHAPE = (50, 10)
+_TACTILE_SIDE_COUNT = int(np.prod(_TACTILE_IMAGE_SHAPE))
+_TACTILE_VALID_COUNT = 448
+_TACTILE_COMPRESSED_SIDE_VALID_COUNT = _TACTILE_VALID_COUNT // 2
+_TACTILE_INVALID_VALUE = 255.0
+
+
+def _load_tactile_valid_mask(mask_path: str | Path) -> np.ndarray:
+    payload = json.loads(Path(mask_path).read_text(encoding="utf-8"))
+    mask = np.asarray(payload.get("mask"), dtype=np.float32)
+    if tuple(mask.shape) != _TACTILE_IMAGE_SHAPE:
+        raise ValueError(
+            f"DAS tactile valid mask must have shape {_TACTILE_IMAGE_SHAPE}, got {tuple(mask.shape)} from {mask_path}."
+        )
+    valid_count = int(mask.astype(bool).sum())
+    if valid_count != _TACTILE_VALID_COUNT:
+        raise ValueError(
+            f"DAS tactile valid mask must contain {_TACTILE_VALID_COUNT} valid cells, got {valid_count} from {mask_path}."
+        )
+    return mask
+
+
+def _load_tactile_baselines(baseline_path: str | Path) -> dict[str, np.ndarray]:
+    payload = json.loads(Path(baseline_path).read_text(encoding="utf-8"))
+    try:
+        baseline_data = payload["data"][0]["tactiles"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError(f"Invalid DAS tactile baseline format in {baseline_path}.") from exc
+
+    baselines: dict[str, np.ndarray] = {}
+    for side in ("left", "right"):
+        values = np.asarray(baseline_data[side], dtype=np.float32)
+        if values.size != _TACTILE_SIDE_COUNT:
+            raise ValueError(
+                f"DAS tactile baseline '{side}' must contain {_TACTILE_SIDE_COUNT} values, got {values.size} from {baseline_path}."
+            )
+        baselines[side] = values.reshape(_TACTILE_IMAGE_SHAPE)
+    return baselines
+
+
+def _scatter_tactile_valid_values(valid_values: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    valid_values = np.asarray(valid_values, dtype=np.float32).reshape(-1)
+    valid_flat = valid_mask.astype(bool).reshape(-1)
+    if valid_values.size != int(valid_flat.sum()):
+        raise ValueError(
+            f"Expected {int(valid_flat.sum())} tactile valid values, got {valid_values.size}."
+        )
+    dense = np.full(valid_flat.shape, _TACTILE_INVALID_VALUE, dtype=np.float32)
+    dense[valid_flat] = valid_values
+    return dense.reshape(_TACTILE_IMAGE_SHAPE)
+
+
+def _build_tactile_horizontal_mirror_pairs(valid_mask: np.ndarray) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    valid = valid_mask.astype(bool)
+    rows, cols = valid.shape
+    if cols % 2 != 0:
+        raise ValueError(f"Expected an even tactile width for horizontal mirror expansion, got {cols}.")
+
+    pairs: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    half_width = cols // 2
+    for row in range(rows):
+        for col in range(half_width):
+            mirror_col = cols - 1 - col
+            if not valid[row, col]:
+                if valid[row, mirror_col]:
+                    raise ValueError(
+                        "DAS tactile valid mask must be horizontally symmetric for bilateral compressed decoding."
+                    )
+                continue
+            if not valid[row, mirror_col]:
+                raise ValueError(
+                    "DAS tactile valid mask must be horizontally symmetric for bilateral compressed decoding."
+                )
+            pairs.append(((row, col), (row, mirror_col)))
+
+    if len(pairs) != _TACTILE_COMPRESSED_SIDE_VALID_COUNT:
+        raise ValueError(
+            f"Expected {_TACTILE_COMPRESSED_SIDE_VALID_COUNT} compressed tactile pairs, got {len(pairs)}."
+        )
+    return pairs
+
+
+def _expand_tactile_horizontal_mirror_values(valid_values: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    valid_values = np.asarray(valid_values, dtype=np.float32).reshape(-1)
+    pairs = _build_tactile_horizontal_mirror_pairs(valid_mask)
+    if valid_values.size != len(pairs):
+        raise ValueError(f"Expected {len(pairs)} compressed tactile values, got {valid_values.size}.")
+
+    dense = np.full(valid_mask.shape, _TACTILE_INVALID_VALUE, dtype=np.float32)
+    for value, (left_pos, right_pos) in zip(valid_values, pairs, strict=True):
+        dense[left_pos] = value
+        dense[right_pos] = value
+    return dense
+
+
+def _decode_tactile_direct_spatial_split(record_data: bytes, valid_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    values = np.frombuffer(record_data, dtype=np.uint8).astype(np.float32)
+    if values.size != _TACTILE_VALID_COUNT:
+        raise ValueError(f"Expected {_TACTILE_VALID_COUNT} tactile bytes, got {values.size}.")
+
+    combined = _scatter_tactile_valid_values(values, valid_mask)
+    pairs = _build_tactile_horizontal_mirror_pairs(valid_mask)
+    left = np.full(valid_mask.shape, _TACTILE_INVALID_VALUE, dtype=np.float32)
+    right = np.full(valid_mask.shape, _TACTILE_INVALID_VALUE, dtype=np.float32)
+    for left_pos, right_pos in pairs:
+        left_value = combined[left_pos]
+        right_value = combined[right_pos]
+        left[left_pos] = left_value
+        left[right_pos] = left_value
+        right[left_pos] = right_value
+        right[right_pos] = right_value
+    return left, right
+
+
+def _decode_float32_payload(record_data: bytes, count: int) -> np.ndarray:
+    if len(record_data) != count * 4:
+        raise ValueError(f"Expected {count * 4} bytes for {count} float32 values, got {len(record_data)}.")
+
+    candidates: list[tuple[float, np.ndarray]] = []
+    for endian in ("<", ">"):
+        try:
+            values = np.asarray(struct.unpack(f"{endian}{count}f", record_data), dtype=np.float32)
+        except struct.error:
+            continue
+        finite_ratio = float(np.isfinite(values).mean())
+        range_ratio = float(((values >= -1e-3) & (values <= (_TACTILE_INVALID_VALUE + 1e-3))).mean())
+        candidates.append((finite_ratio + range_ratio, values))
+
+    if not candidates:
+        raise ValueError("Could not decode tactile float32 payload.")
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _decode_tactile_record(record_data: bytes, valid_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    expected_valid_values = _TACTILE_VALID_COUNT * 2
+    expected_dense_values = _TACTILE_SIDE_COUNT * 2
+
+    if len(record_data) == _TACTILE_VALID_COUNT:
+        return _decode_tactile_direct_spatial_split(record_data, valid_mask)
+
+    if len(record_data) == expected_valid_values:
+        values = np.frombuffer(record_data, dtype=np.uint8).astype(np.float32)
+        left_valid = values[:_TACTILE_VALID_COUNT]
+        right_valid = values[_TACTILE_VALID_COUNT:]
+        return (
+            _scatter_tactile_valid_values(left_valid, valid_mask),
+            _scatter_tactile_valid_values(right_valid, valid_mask),
+        )
+
+    if len(record_data) == expected_valid_values * 4:
+        values = _decode_float32_payload(record_data, expected_valid_values)
+        left_valid = values[:_TACTILE_VALID_COUNT]
+        right_valid = values[_TACTILE_VALID_COUNT:]
+        return (
+            _scatter_tactile_valid_values(left_valid, valid_mask),
+            _scatter_tactile_valid_values(right_valid, valid_mask),
+        )
+
+    if len(record_data) == expected_dense_values:
+        values = np.frombuffer(record_data, dtype=np.uint8).astype(np.float32).reshape(2, *_TACTILE_IMAGE_SHAPE)
+        return values[0], values[1]
+
+    if len(record_data) == expected_dense_values * 4:
+        values = _decode_float32_payload(record_data, expected_dense_values).reshape(2, *_TACTILE_IMAGE_SHAPE)
+        return values[0], values[1]
+
+    raise ValueError(
+        "Unsupported DAS tactile payload length: "
+        f"got {len(record_data)} bytes, expected one of "
+        f"{{{expected_valid_values}, {expected_valid_values * 4}, {expected_dense_values}, {expected_dense_values * 4}}}."
+    )
+
+
 @dataclass
 class DasGripperHardwareDriver:
     serial_port: str
     gen_con_sdk_path: str | None = None
     baudrate: int = 921600
     update_frequency_hz: float = 50.0
+    tactile_frequency_hz: float | None = None
+    tactile_valid_mask_path: str | None = None
+    tactile_baseline_path: str | None = None
+    tactile_timeout_s: float = 2.0
     min_distance_m: float = 0.0
     max_distance_m: float = 0.103
     grasp_threshold_m: float = 0.002
@@ -299,25 +478,48 @@ class DasGripperHardwareDriver:
             raise ValueError("Das gripper max_distance_m must be greater than min_distance_m.")
         if self.update_frequency_hz <= 0:
             raise ValueError("Das gripper update_frequency_hz must be positive.")
+        if self.tactile_frequency_hz is not None and self.tactile_frequency_hz <= 0:
+            raise ValueError("Das gripper tactile_frequency_hz must be positive when provided.")
         if self.baudrate <= 0:
             raise ValueError("Das gripper baudrate must be positive.")
         if self.command_deadband_m < 0:
             raise ValueError("Das gripper command_deadband_m must be non-negative.")
+        if self.tactile_timeout_s <= 0:
+            raise ValueError("Das gripper tactile_timeout_s must be positive.")
+        if (self.tactile_valid_mask_path is None) != (self.tactile_baseline_path is None):
+            raise ValueError("DAS tactile valid mask and baseline paths must be provided together.")
         self._databus_cls = _resolve_das_databus_cls(self.gen_con_sdk_path)
         self._databus = None
         self._lock = threading.Lock()
+        self._tactile_lock = threading.Lock()
         self._gripper_state_updated = False
+        self._tactile_state_updated = False
         self._position_m: float | None = None
         self._target_distance_m: float | None = None
         self._last_command_distance_m: float | None = None
         self._last_command_time_s: float | None = None
         self._pending_command_distance_m: float | None = None
+        self._latest_tactile_observation: dict[str, np.ndarray] | None = None
+
+        self._tactile_valid_mask: np.ndarray | None = None
+        self._tactile_baselines: dict[str, np.ndarray] | None = None
+        if self.tactile_valid_mask_path is not None and self.tactile_baseline_path is not None:
+            self._tactile_valid_mask = _load_tactile_valid_mask(self.tactile_valid_mask_path)
+            self._tactile_baselines = _load_tactile_baselines(self.tactile_baseline_path)
+            if self.tactile_frequency_hz is None:
+                self.tactile_frequency_hz = self.update_frequency_hz
+
+    @property
+    def tactile_enabled(self) -> bool:
+        return self._tactile_valid_mask is not None and self._tactile_baselines is not None
 
     def connect(self) -> None:
         self._databus = self._databus_cls(
             tty_port=self.serial_port,
             baudrate=self.baudrate,
             encoder_freq=self.update_frequency_hz,
+            tactile_freq=self.tactile_frequency_hz if self.tactile_enabled else None,
+            tactile_callback=self._tactile_callback if self.tactile_enabled else None,
             encoder_callback=self._encoder_callback,
         )
         initial_distance_m = self._scale_to_distance(self.initial_position)
@@ -325,10 +527,15 @@ class DasGripperHardwareDriver:
         self._target_distance_m = initial_distance_m
         self._last_command_distance_m = initial_distance_m
 
-        deadline = time.perf_counter() + 2.0
-        while not self._gripper_state_updated:
+        deadline = time.perf_counter() + max(2.0, self.tactile_timeout_s)
+        while True:
+            tactile_ready = (not self.tactile_enabled) or self._tactile_state_updated
+            if self._gripper_state_updated and tactile_ready:
+                break
             if time.perf_counter() >= deadline:
-                raise TimeoutError("DasController did not receive encoder data within timeout.")
+                if not self._gripper_state_updated:
+                    raise TimeoutError("DasController did not receive encoder data within timeout.")
+                raise TimeoutError("DasController did not receive tactile data within timeout.")
             time.sleep(0.001)
 
     def disconnect(self) -> None:
@@ -338,11 +545,14 @@ class DasGripperHardwareDriver:
                 stop()
             self._databus = None
         self._gripper_state_updated = False
+        self._tactile_state_updated = False
         self._position_m = None
         self._target_distance_m = None
         self._last_command_distance_m = None
         self._last_command_time_s = None
         self._pending_command_distance_m = None
+        with self._tactile_lock:
+            self._latest_tactile_observation = None
 
     def _encoder_callback(self, record_data: bytes) -> None:
         try:
@@ -356,6 +566,31 @@ class DasGripperHardwareDriver:
             if self._target_distance_m is not None and self.grasp_threshold_m > 0:
                 _ = self._position_m > (self._target_distance_m + self.grasp_threshold_m)
         self._gripper_state_updated = True
+
+    def _tactile_callback(self, record_data: bytes) -> None:
+        if self._tactile_valid_mask is None or self._tactile_baselines is None:
+            return
+        try:
+            left_raw, right_raw = _decode_tactile_record(record_data, self._tactile_valid_mask)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Failed to parse DAS tactile update: %s", exc)
+            return
+
+        valid_mask = self._tactile_valid_mask.astype(np.float32)
+        left_clean = (left_raw - self._tactile_baselines["left"]) * valid_mask
+        right_clean = (right_raw - self._tactile_baselines["right"]) * valid_mask
+        left_clean[valid_mask == 0.0] = 0.0
+        right_clean[valid_mask == 0.0] = 0.0
+
+        with self._tactile_lock:
+            self._latest_tactile_observation = {
+                "observation.tactile.left_raw": np.asarray(left_raw, dtype=np.float32).copy(),
+                "observation.tactile.right_raw": np.asarray(right_raw, dtype=np.float32).copy(),
+                "observation.tactile.valid_mask": valid_mask.copy(),
+                "observation.tactile.left_clean": np.asarray(left_clean, dtype=np.float32).copy(),
+                "observation.tactile.right_clean": np.asarray(right_clean, dtype=np.float32).copy(),
+            }
+        self._tactile_state_updated = True
 
     def _scale_to_distance(self, normalized_position: float) -> float:
         normalized = float(np.clip(normalized_position, 0.0, 1.0))
@@ -374,6 +609,17 @@ class DasGripperHardwareDriver:
         if span <= 0:
             return 0.0
         return float(np.clip((distance_m - self.min_distance_m) / span, 0.0, 1.0))
+
+    def get_tactile_observation(self) -> dict[str, np.ndarray]:
+        if not self.tactile_enabled:
+            return {}
+        if self._databus is None:
+            raise RuntimeError("Gripper backend is not connected.")
+        with self._tactile_lock:
+            tactile = self._latest_tactile_observation
+            if tactile is None:
+                raise RuntimeError("Das gripper backend has not received any tactile update yet.")
+            return {key: value.copy() for key, value in tactile.items()}
 
     def set_position(self, normalized_position: float) -> None:
         if self._databus is None:

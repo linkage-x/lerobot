@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
 import numpy as np
 import pytest
 import struct
@@ -37,6 +38,7 @@ from lerobot.processor.converters import (
     transition_to_robot_action,
 )
 from lerobot.utils.rotation import Rotation
+import json
 
 
 class DummyArmDriver:
@@ -338,11 +340,13 @@ def test_das_gripper_hardware_driver_reports_normalized_position_and_rate_limits
     class FakeDataBus:
         instances: list["FakeDataBus"] = []
 
-        def __init__(self, tty_port, baudrate, encoder_freq, encoder_callback):
+        def __init__(self, tty_port, baudrate, encoder_freq, encoder_callback, tactile_freq=None, tactile_callback=None):
             self.tty_port = tty_port
             self.baudrate = baudrate
             self.encoder_freq = encoder_freq
             self.encoder_callback = encoder_callback
+            self.tactile_freq = tactile_freq
+            self.tactile_callback = tactile_callback
             self.set_target_distance_calls: list[float] = []
             self.stopped = False
             type(self).instances.append(self)
@@ -383,6 +387,175 @@ def test_das_gripper_hardware_driver_reports_normalized_position_and_rate_limits
     assert FakeDataBus.instances[-1].stopped is True
 
 
+def test_das_gripper_hardware_driver_decodes_tactile_and_applies_clean_rule(tmp_path, monkeypatch):
+    mask_payload = json.loads(
+        (Path(__file__).resolve().parents[2] / "docs/tactile/tactile_valid_mask_50x10.json").read_text(encoding="utf-8")
+    )
+    mask_path = tmp_path / "mask.json"
+    mask_path.write_text(json.dumps(mask_payload), encoding="utf-8")
+
+    mask_rows = mask_payload["mask"]
+    baseline_flat = [255.0 if int(mask_rows[row][col]) == 0 else 0.0 for row in range(50) for col in range(10)]
+    baseline_payload = {
+        "data": [
+            {
+                "tactiles": {
+                    "left": baseline_flat,
+                    "right": baseline_flat,
+                }
+            }
+        ]
+    }
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(json.dumps(baseline_payload), encoding="utf-8")
+
+    left_valid = bytes([index % 256 for index in range(448)])
+    right_valid = bytes([(255 - index) % 256 for index in range(448)])
+
+    class FakeDataBus:
+        instances: list["FakeDataBus"] = []
+
+        def __init__(self, tty_port, baudrate, encoder_freq, encoder_callback, tactile_freq=None, tactile_callback=None):
+            self.tty_port = tty_port
+            self.baudrate = baudrate
+            self.encoder_freq = encoder_freq
+            self.encoder_callback = encoder_callback
+            self.tactile_freq = tactile_freq
+            self.tactile_callback = tactile_callback
+            self.set_target_distance_calls: list[float] = []
+            self.stopped = False
+            type(self).instances.append(self)
+            self.encoder_callback(struct.pack(">f", 0.0206))
+            if self.tactile_callback is not None:
+                self.tactile_callback(left_valid + right_valid)
+
+        def set_target_distance(self, distance_m):
+            self.set_target_distance_calls.append(float(distance_m))
+
+        def stop(self):
+            self.stopped = True
+
+    fake_module = types.ModuleType("gen_controller_sdk_python")
+    fake_module.DataBus = FakeDataBus
+    monkeypatch.setitem(sys.modules, "gen_controller_sdk_python", fake_module)
+
+    driver = fr3_backends.DasGripperHardwareDriver(
+        serial_port="/dev/ttyUSB0",
+        baudrate=921600,
+        update_frequency_hz=50.0,
+        tactile_frequency_hz=30.0,
+        tactile_valid_mask_path=str(mask_path),
+        tactile_baseline_path=str(baseline_path),
+        min_distance_m=0.0,
+        max_distance_m=0.103,
+        initial_position=0.2,
+    )
+    driver.connect()
+
+    observation = driver.get_tactile_observation()
+
+    assert observation["observation.tactile.left_raw"].shape == (50, 10)
+    assert observation["observation.tactile.right_raw"].shape == (50, 10)
+    assert observation["observation.tactile.valid_mask"].shape == (50, 10)
+    assert int(observation["observation.tactile.valid_mask"].sum()) == 448
+    assert float(observation["observation.tactile.left_raw"][0, 0]) == pytest.approx(255.0)
+    assert float(observation["observation.tactile.left_raw"][0, 3]) == pytest.approx(0.0)
+    assert float(observation["observation.tactile.left_raw"][0, 4]) == pytest.approx(1.0)
+    assert float(observation["observation.tactile.left_clean"][0, 0]) == pytest.approx(0.0)
+    assert float(observation["observation.tactile.left_clean"][0, 3]) == pytest.approx(0.0)
+    assert float(observation["observation.tactile.left_clean"][0, 4]) == pytest.approx(1.0)
+    assert float(observation["observation.tactile.right_raw"][0, 3]) == pytest.approx(255.0)
+    assert FakeDataBus.instances[-1].tactile_freq == pytest.approx(30.0)
+
+    driver.disconnect()
+    assert FakeDataBus.instances[-1].stopped is True
+
+
+def test_das_gripper_hardware_driver_decodes_448_as_bilateral_horizontal_mirror_expand(tmp_path, monkeypatch):
+    mask_payload = json.loads(
+        (Path(__file__).resolve().parents[2] / "docs/tactile/tactile_valid_mask_50x10.json").read_text(encoding="utf-8")
+    )
+    mask_path = tmp_path / "mask.json"
+    mask_path.write_text(json.dumps(mask_payload), encoding="utf-8")
+
+    mask_rows = mask_payload["mask"]
+    baseline_flat = [255.0 if int(mask_rows[row][col]) == 0 else 0.0 for row in range(50) for col in range(10)]
+    baseline_payload = {
+        "data": [
+            {
+                "tactiles": {
+                    "left": baseline_flat,
+                    "right": baseline_flat,
+                }
+            }
+        ]
+    }
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(json.dumps(baseline_payload), encoding="utf-8")
+
+    left_compressed = bytes(range(224))
+    right_compressed = bytes((32 + index) % 256 for index in range(224))
+
+    class FakeDataBus:
+        instances: list["FakeDataBus"] = []
+
+        def __init__(self, tty_port, baudrate, encoder_freq, encoder_callback, tactile_freq=None, tactile_callback=None):
+            self.tty_port = tty_port
+            self.baudrate = baudrate
+            self.encoder_freq = encoder_freq
+            self.encoder_callback = encoder_callback
+            self.tactile_freq = tactile_freq
+            self.tactile_callback = tactile_callback
+            self.stopped = False
+            type(self).instances.append(self)
+            self.encoder_callback(struct.pack(">f", 0.0206))
+            if self.tactile_callback is not None:
+                self.tactile_callback(left_compressed + right_compressed)
+
+        def set_target_distance(self, distance_m):
+            del distance_m
+
+        def stop(self):
+            self.stopped = True
+
+    fake_module = types.ModuleType("gen_controller_sdk_python")
+    fake_module.DataBus = FakeDataBus
+    monkeypatch.setitem(sys.modules, "gen_controller_sdk_python", fake_module)
+
+    driver = fr3_backends.DasGripperHardwareDriver(
+        serial_port="/dev/ttyUSB0",
+        baudrate=921600,
+        update_frequency_hz=50.0,
+        tactile_frequency_hz=30.0,
+        tactile_valid_mask_path=str(mask_path),
+        tactile_baseline_path=str(baseline_path),
+        min_distance_m=0.0,
+        max_distance_m=0.103,
+        initial_position=0.2,
+    )
+    driver.connect()
+
+    observation = driver.get_tactile_observation()
+
+    assert observation["observation.tactile.left_raw"].shape == (50, 10)
+    assert observation["observation.tactile.right_raw"].shape == (50, 10)
+    assert float(observation["observation.tactile.left_raw"][0, 0]) == pytest.approx(255.0)
+    assert float(observation["observation.tactile.left_raw"][0, 3]) == pytest.approx(0.0)
+    assert float(observation["observation.tactile.left_raw"][0, 6]) == pytest.approx(0.0)
+    assert float(observation["observation.tactile.left_raw"][0, 4]) == pytest.approx(1.0)
+    assert float(observation["observation.tactile.left_raw"][0, 5]) == pytest.approx(1.0)
+    assert float(observation["observation.tactile.left_clean"][0, 6]) == pytest.approx(0.0)
+
+    assert float(observation["observation.tactile.right_raw"][0, 3]) == pytest.approx(3.0)
+    assert float(observation["observation.tactile.right_raw"][0, 6]) == pytest.approx(3.0)
+    assert float(observation["observation.tactile.right_raw"][0, 4]) == pytest.approx(2.0)
+    assert float(observation["observation.tactile.right_raw"][0, 5]) == pytest.approx(2.0)
+    assert float(observation["observation.tactile.right_clean"][0, 5]) == pytest.approx(2.0)
+
+    driver.disconnect()
+    assert FakeDataBus.instances[-1].stopped is True
+
+
 def test_connect_uses_das_gripper_backend_when_configured(monkeypatch):
     DummyArmDriver.instances = []
     DummyGripperDriver.instances = []
@@ -416,6 +589,9 @@ def test_connect_uses_das_gripper_backend_when_configured(monkeypatch):
         assert init_kwargs["gen_con_sdk_path"] == "/opt/dependencies/gen_con_sdk_python_release"
         assert init_kwargs["baudrate"] == pytest.approx(921600)
         assert init_kwargs["update_frequency_hz"] == pytest.approx(60.0)
+        assert init_kwargs["tactile_frequency_hz"] is None
+        assert init_kwargs["tactile_valid_mask_path"] is None
+        assert init_kwargs["tactile_baseline_path"] is None
         assert init_kwargs["max_distance_m"] == pytest.approx(0.103)
         assert init_kwargs["grasp_threshold_m"] == pytest.approx(0.003)
         assert init_kwargs["initial_position"] == pytest.approx(0.6)
@@ -505,6 +681,20 @@ def test_get_observation(robot):
     assert observation["ee.y"] == pytest.approx(0.1)
     assert observation["ee.z"] == pytest.approx(0.3)
     assert observation["gripper.pos"] == pytest.approx(0.25)
+
+
+def test_get_observation_includes_tactile_when_gripper_provides_it(robot):
+    robot.connect()
+    robot._gripper.get_tactile_observation = lambda: {
+        "observation.tactile.left_clean": np.ones((50, 10), dtype=np.float32),
+        "observation.tactile.valid_mask": np.ones((50, 10), dtype=np.float32),
+    }
+
+    observation = robot.get_observation()
+
+    assert observation["observation.tactile.left_clean"].shape == (50, 10)
+    assert float(observation["observation.tactile.left_clean"][0, 0]) == pytest.approx(1.0)
+    assert float(observation["observation.tactile.valid_mask"][0, 0]) == pytest.approx(1.0)
 
 
 def test_get_observation_uses_kinematics_target_frame_even_if_arm_reports_pose(monkeypatch):
