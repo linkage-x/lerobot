@@ -106,10 +106,35 @@ If you already have a local `lerobot-internal:local` image and want to train aga
 sudo env HOME=/home/hph docker compose --profile train -f docker/docker-compose.yml run --rm lerobot-train-fr3-act
 ```
 
-For DAS-recorded FR3 datasets with slightly looser video timestamp alignment, use:
+For DAS-recorded FR3 datasets with slightly looser video timestamp alignment, prefer running the tactile ACT
+training entrypoint with explicit overrides and an in-container Weights & Biases API key:
 
 ```bash
-sudo env HOME=/home/hph docker compose --profile train -f docker/docker-compose.yml run --rm lerobot-train-fr3-act-das
+cd /home/hph/Code/lerobot-replay
+
+export WANDB_API_KEY=your_wandb_api_key
+RUN_NAME=fr3_act_das_tactile_$(date +%Y%m%d_%H%M%S)
+
+sudo env HOME=/home/hph docker compose --profile train -f docker/docker-compose.yml run --rm \
+  -e WANDB_API_KEY=$WANDB_API_KEY \
+  lerobot-train-fr3-act-das \
+  lerobot-train \
+  --config_path=src/lerobot/configs/franka_research3_ee2ee_act_das.yaml \
+  --dataset.root=outputs/datasets/lerobotv3_0310_100ep \
+  --output_dir=outputs/train/${RUN_NAME} \
+  --job_name=${RUN_NAME} \
+  --policy.device=cuda \
+  --policy.push_to_hub=false \
+  --batch_size=8 \
+  --num_workers=12 \
+  --steps=100000 \
+  --log_freq=200 \
+  --eval_freq=0 \
+  --save_checkpoint=true \
+  --save_freq=20000 \
+  --tolerance_s=1e-3 \
+  --wandb.enable=true \
+  --wandb.project=fr3-act-das
 ```
 
 ```bash

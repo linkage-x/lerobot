@@ -84,6 +84,7 @@ x-lerobot-train-env: &lerobot-train-env
   http_proxy: ${http_proxy:-}
   https_proxy: ${https_proxy:-}
   no_proxy: ${no_proxy:-}
+  WANDB_API_KEY: ${WANDB_API_KEY:-}
 
 x-lerobot-train-common: &lerobot-train-common
   working_dir: /workspace

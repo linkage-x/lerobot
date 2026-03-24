@@ -51,6 +51,10 @@ class FrankaResearch3Config(RobotConfig):
     gen_con_sdk_path: str | None = None
     das_baudrate: int = 921600
     das_update_frequency_hz: float = 50.0
+    das_tactile_frequency_hz: float | None = None
+    das_tactile_valid_mask_path: str | None = None
+    das_tactile_baseline_path: str | None = None
+    das_tactile_timeout_s: float = 2.0
     das_min_distance_m: float = 0.0
     das_max_distance_m: float = 0.103
     das_grasp_threshold_m: float = 0.002
@@ -93,6 +97,12 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("das_baudrate must be positive.")
         if self.das_update_frequency_hz <= 0:
             raise ValueError("das_update_frequency_hz must be positive.")
+        if self.das_tactile_frequency_hz is not None and self.das_tactile_frequency_hz <= 0:
+            raise ValueError("das_tactile_frequency_hz must be positive when provided.")
+        if self.das_tactile_timeout_s <= 0:
+            raise ValueError("das_tactile_timeout_s must be positive.")
+        if (self.das_tactile_valid_mask_path is None) != (self.das_tactile_baseline_path is None):
+            raise ValueError("das_tactile_valid_mask_path and das_tactile_baseline_path must be provided together.")
         if self.das_max_distance_m <= self.das_min_distance_m:
             raise ValueError("das_max_distance_m must be greater than das_min_distance_m.")
         if not 0.0 <= self.das_initial_position <= 1.0:

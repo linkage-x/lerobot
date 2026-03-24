@@ -24,6 +24,8 @@ FR3 DAS 数据集真机重播运行时（容器内运行）
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import time
 from pathlib import Path
 
@@ -77,6 +79,8 @@ _DAS_RESET_POSITION = 1.0
 _DAS_RESET_TARGET_TOLERANCE = 0.02
 _DAS_FULLY_OPEN_SUCCESS_THRESHOLD = 0.90
 _PEAK_DIAGNOSTIC_FRAMES = 5
+_DEFAULT_OTG_SCALE = 1.0
+_DEFAULT_ANALYSIS_OUTPUT_DIR = _REPO_ROOT / "outputs" / "analysis"
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +133,77 @@ def parse_joint_gains(value: str) -> list[float]:
         ) from exc
 
 
+def parse_joint_limit_values(value: str) -> list[float]:
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != len(_JOINT_NAMES):
+        raise argparse.ArgumentTypeError(
+            f"Expected {len(_JOINT_NAMES)} comma-separated floats for FR3 OTG limits."
+        )
+    try:
+        return [float(part) for part in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Expected {len(_JOINT_NAMES)} comma-separated floats for FR3 OTG limits."
+        ) from exc
+
+
+def positive_scale(value: str) -> float:
+    try:
+        scale = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Expected a positive float.") from exc
+    if scale <= 0.0:
+        raise argparse.ArgumentTypeError("Expected a positive float.")
+    return scale
+
+
+def summarize_metric(name: str, values: np.ndarray, unit: str, prefix: str = "") -> None:
+    if len(values) == 0:
+        return
+    print(
+        f"  {prefix}{name} ({unit})   mean={values.mean():.2f}  "
+        f"max={values.max():.2f}  p95={np.percentile(values, 95):.2f}"
+    )
+
+
+def resolve_joint_limit_values(
+    default_values: tuple[float, ...],
+    override_values: list[float] | None,
+    scale: float,
+) -> tuple[float, ...]:
+    base = np.asarray(default_values if override_values is None else override_values, dtype=np.float64)
+    return tuple((base * float(scale)).tolist())
+
+
+def snapshot_otg_debug(robot: "FrankaResearch3") -> tuple[np.ndarray | None, np.ndarray | None]:
+    target_joints = None
+    command_joints = None
+    target_lock = getattr(robot, "_otg_target_lock", None)
+    command_lock = getattr(robot, "_otg_command_lock", None)
+
+    if target_lock is not None:
+        with target_lock:
+            raw_target = getattr(robot, "_otg_target_joints", None)
+            if raw_target is not None:
+                target_joints = np.asarray(raw_target, dtype=np.float64).copy()
+    else:
+        raw_target = getattr(robot, "_otg_target_joints", None)
+        if raw_target is not None:
+            target_joints = np.asarray(raw_target, dtype=np.float64).copy()
+
+    if command_lock is not None:
+        with command_lock:
+            raw_command = getattr(robot, "_otg_command_joints", None)
+            if raw_command is not None:
+                command_joints = np.asarray(raw_command, dtype=np.float64).copy()
+    else:
+        raw_command = getattr(robot, "_otg_command_joints", None)
+        if raw_command is not None:
+            command_joints = np.asarray(raw_command, dtype=np.float64).copy()
+
+    return target_joints, command_joints
+
+
 # ---------------------------------------------------------------------------
 # 数据加载
 # ---------------------------------------------------------------------------
@@ -167,6 +242,41 @@ def load_episode(dataset_path: str, episode_idx: int) -> dict[str, np.ndarray]:
     }
 
 
+def load_joint_target_sequence(
+    csv_path: str,
+    *,
+    n_frames: int,
+    column_prefix: str,
+) -> np.ndarray:
+    path = Path(csv_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Joint target CSV not found: {path}")
+
+    targets_deg: list[np.ndarray] = []
+    expected_columns = [f"{column_prefix}_{joint_idx}_deg" for joint_idx in range(1, 8)]
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        missing = [name for name in expected_columns if name not in (reader.fieldnames or [])]
+        if missing:
+            raise ValueError(f"Missing joint target columns in {path}: {missing}")
+        for expected_frame, row in enumerate(reader):
+            frame_text = row.get("frame")
+            if frame_text is not None and int(frame_text) != expected_frame:
+                raise ValueError(
+                    f"Unexpected frame index in {path}: expected {expected_frame}, got {frame_text}"
+                )
+            targets_deg.append(
+                np.array([float(row[column_name]) for column_name in expected_columns], dtype=np.float64)
+            )
+
+    targets_deg_arr = np.asarray(targets_deg, dtype=np.float64)
+    if targets_deg_arr.shape != (n_frames, 7):
+        raise ValueError(
+            f"Expected joint target CSV shape {(n_frames, 7)}, got {targets_deg_arr.shape} from {path}"
+        )
+    return np.deg2rad(targets_deg_arr)
+
+
 # ---------------------------------------------------------------------------
 # 坐标变换
 # ---------------------------------------------------------------------------
@@ -194,33 +304,324 @@ def ws_to_base(T_B_Ws: np.ndarray, T_Ws_It: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-def init_rerun(episode_idx: int) -> tuple[bool, str]:
+def init_rerun(episode_idx: int, *, output_dir: Path) -> tuple[bool, Path | None]:
     try:
         import rerun as rr
-        rrd_path = f"/tmp/fr3_real_replay_ep{episode_idx:03d}.rrd"
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        rrd_path = output_dir / f"fr3_real_replay_ep{episode_idx:03d}.rrd"
         rr.init(f"fr3_das_real_replay_ep{episode_idx:03d}", spawn=False)
-        rr.save(rrd_path)
-        print(f"[INFO] Rerun 记录保存到 {rrd_path}  (用 'rerun {rrd_path}' 查看)")
+        rr.save(str(rrd_path))
+        print(f"[INFO] Rerun 记录保存到 {rrd_path}  (宿主机可直接运行: rerun {rrd_path})")
         return True, rrd_path
     except Exception as e:
         print(f"[WARN] Rerun 不可用: {e}")
-        return False, ""
+        return False, None
 
 
-def log_frame(rr_ok: bool, fi: int, ts: float,
-              hw_pos: np.ndarray, rec_pos: np.ndarray,
-              pos_err_mm: float, rot_err_deg: float,
-              gripper: float) -> None:
+def log_frame(
+    rr_ok: bool,
+    fi: int,
+    ts: float,
+    hw_pos: np.ndarray,
+    state_pos: np.ndarray,
+    action_pos: np.ndarray,
+    pos_err_state_mm: float,
+    rot_err_state_deg: float,
+    pos_err_action_mm: float,
+    rot_err_action_deg: float,
+    gripper: float,
+    hw_traj: np.ndarray,
+    state_traj: np.ndarray,
+    action_traj: np.ndarray,
+) -> None:
     if not rr_ok:
         return
     import rerun as rr
+
     rr.set_time("frame", sequence=fi)
     rr.set_time("timestamp", timestamp=ts)
-    rr.log("ee/hardware", rr.Points3D([hw_pos], colors=[[0, 220, 0]], radii=[0.005]))
-    rr.log("ee/recorded", rr.Points3D([rec_pos], colors=[[220, 100, 0]], radii=[0.005]))
-    rr.log("error/pos_mm", rr.Scalars([pos_err_mm]))
-    rr.log("error/rot_deg", rr.Scalars([rot_err_deg]))
+    rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+    rr.log(
+        "world/ee/hardware/trajectory",
+        rr.LineStrips3D([np.asarray(hw_traj, dtype=np.float32)], colors=[[0, 220, 0, 255]], radii=[0.002]),
+    )
+    rr.log(
+        "world/ee/reference_state/trajectory",
+        rr.LineStrips3D([np.asarray(state_traj, dtype=np.float32)], colors=[[220, 100, 0, 255]], radii=[0.002]),
+    )
+    rr.log(
+        "world/ee/reference_action/trajectory",
+        rr.LineStrips3D([np.asarray(action_traj, dtype=np.float32)], colors=[[40, 120, 255, 255]], radii=[0.002]),
+    )
+    rr.log("world/ee/hardware/current", rr.Points3D([hw_pos], colors=[[0, 220, 0]], radii=[0.005]))
+    rr.log("world/ee/reference_state/current", rr.Points3D([state_pos], colors=[[220, 100, 0]], radii=[0.005]))
+    rr.log("world/ee/reference_action/current", rr.Points3D([action_pos], colors=[[40, 120, 255]], radii=[0.005]))
+    rr.log(
+        "world/ee/error/action_to_hardware",
+        rr.LineStrips3D([np.asarray([action_pos, hw_pos], dtype=np.float32)], colors=[[255, 64, 64, 255]], radii=[0.001]),
+    )
+    rr.log(
+        "world/ee/error/state_to_hardware",
+        rr.LineStrips3D([np.asarray([state_pos, hw_pos], dtype=np.float32)], colors=[[255, 191, 0, 255]], radii=[0.001]),
+    )
+    rr.log("error/state_pos_mm", rr.Scalars([pos_err_state_mm]))
+    rr.log("error/state_rot_deg", rr.Scalars([rot_err_state_deg]))
+    rr.log("error/action_pos_mm", rr.Scalars([pos_err_action_mm]))
+    rr.log("error/action_rot_deg", rr.Scalars([rot_err_action_deg]))
     rr.log("gripper", rr.Scalars([gripper]))
+
+
+def write_trajectory_csv(
+    output_path: Path,
+    *,
+    frame_indices: np.ndarray,
+    timestamps: np.ndarray,
+    hw_positions: np.ndarray,
+    state_positions: np.ndarray,
+    action_positions: np.ndarray,
+    pos_errors_state_mm: np.ndarray,
+    rot_errors_state_deg: np.ndarray,
+    pos_errors_action_mm: np.ndarray,
+    rot_errors_action_deg: np.ndarray,
+    state_action_gap_mm: np.ndarray,
+    state_action_gap_deg: np.ndarray,
+    measured_joints: np.ndarray,
+    command_joints: np.ndarray | None,
+    target_joints: np.ndarray | None,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    header = [
+        "frame",
+        "timestamp_s",
+        "hw_x_m",
+        "hw_y_m",
+        "hw_z_m",
+        "state_x_m",
+        "state_y_m",
+        "state_z_m",
+        "action_x_m",
+        "action_y_m",
+        "action_z_m",
+        "pos_err_state_mm",
+        "rot_err_state_deg",
+        "pos_err_action_mm",
+        "rot_err_action_deg",
+        "state_action_gap_mm",
+        "state_action_gap_deg",
+    ]
+    for joint_idx in range(1, 8):
+        header.append(f"q_meas_{joint_idx}_rad")
+    if command_joints is not None:
+        for joint_idx in range(1, 8):
+            header.append(f"q_cmd_{joint_idx}_rad")
+    if target_joints is not None:
+        for joint_idx in range(1, 8):
+            header.append(f"q_target_{joint_idx}_rad")
+
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=header)
+        writer.writeheader()
+        for row_idx, frame_idx in enumerate(frame_indices.tolist()):
+            row = {
+                "frame": int(frame_idx),
+                "timestamp_s": f"{float(timestamps[row_idx]):.6f}",
+                "hw_x_m": f"{float(hw_positions[row_idx, 0]):.6f}",
+                "hw_y_m": f"{float(hw_positions[row_idx, 1]):.6f}",
+                "hw_z_m": f"{float(hw_positions[row_idx, 2]):.6f}",
+                "state_x_m": f"{float(state_positions[row_idx, 0]):.6f}",
+                "state_y_m": f"{float(state_positions[row_idx, 1]):.6f}",
+                "state_z_m": f"{float(state_positions[row_idx, 2]):.6f}",
+                "action_x_m": f"{float(action_positions[row_idx, 0]):.6f}",
+                "action_y_m": f"{float(action_positions[row_idx, 1]):.6f}",
+                "action_z_m": f"{float(action_positions[row_idx, 2]):.6f}",
+                "pos_err_state_mm": f"{float(pos_errors_state_mm[row_idx]):.6f}",
+                "rot_err_state_deg": f"{float(rot_errors_state_deg[row_idx]):.6f}",
+                "pos_err_action_mm": f"{float(pos_errors_action_mm[row_idx]):.6f}",
+                "rot_err_action_deg": f"{float(rot_errors_action_deg[row_idx]):.6f}",
+                "state_action_gap_mm": f"{float(state_action_gap_mm[row_idx]):.6f}",
+                "state_action_gap_deg": f"{float(state_action_gap_deg[row_idx]):.6f}",
+            }
+            for joint_idx in range(7):
+                row[f"q_meas_{joint_idx + 1}_rad"] = f"{float(measured_joints[row_idx, joint_idx]):.9f}"
+            if command_joints is not None:
+                for joint_idx in range(7):
+                    row[f"q_cmd_{joint_idx + 1}_rad"] = f"{float(command_joints[row_idx, joint_idx]):.9f}"
+            if target_joints is not None:
+                for joint_idx in range(7):
+                    row[f"q_target_{joint_idx + 1}_rad"] = f"{float(target_joints[row_idx, joint_idx]):.9f}"
+            writer.writerow(row)
+
+
+def build_hover_text(
+    frame_indices: np.ndarray,
+    timestamps: np.ndarray,
+    pos_errors_action_mm: np.ndarray,
+    pos_errors_state_mm: np.ndarray,
+    state_action_gap_mm: np.ndarray,
+) -> list[str]:
+    hover_text: list[str] = []
+    for idx, frame_idx in enumerate(frame_indices.tolist()):
+        hover_text.append(
+            "<br>".join(
+                [
+                    f"frame={int(frame_idx)}",
+                    f"t={float(timestamps[idx]):.3f}s",
+                    f"hw-action={float(pos_errors_action_mm[idx]):.2f} mm",
+                    f"hw-state={float(pos_errors_state_mm[idx]):.2f} mm",
+                    f"state-action={float(state_action_gap_mm[idx]):.2f} mm",
+                ]
+            )
+        )
+    return hover_text
+
+
+def write_trajectory_plot_html(
+    output_path: Path,
+    *,
+    episode_idx: int,
+    dataset_path: str,
+    frame_indices: np.ndarray,
+    timestamps: np.ndarray,
+    hw_positions: np.ndarray,
+    state_positions: np.ndarray,
+    action_positions: np.ndarray,
+    pos_errors_state_mm: np.ndarray,
+    pos_errors_action_mm: np.ndarray,
+    state_action_gap_mm: np.ndarray,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    hover_text = build_hover_text(
+        frame_indices,
+        timestamps,
+        pos_errors_action_mm,
+        pos_errors_state_mm,
+        state_action_gap_mm,
+    )
+    peak_count = min(_PEAK_DIAGNOSTIC_FRAMES, len(frame_indices))
+    peak_order = np.argsort(pos_errors_action_mm)[-peak_count:][::-1] if peak_count > 0 else np.array([], dtype=np.int64)
+
+    def positions_to_axes(positions: np.ndarray) -> tuple[list[float], list[float], list[float]]:
+        return (
+            positions[:, 0].astype(float).tolist(),
+            positions[:, 1].astype(float).tolist(),
+            positions[:, 2].astype(float).tolist(),
+        )
+
+    hw_x, hw_y, hw_z = positions_to_axes(hw_positions)
+    state_x, state_y, state_z = positions_to_axes(state_positions)
+    action_x, action_y, action_z = positions_to_axes(action_positions)
+
+    traces = [
+        {
+            "type": "scatter3d",
+            "mode": "lines",
+            "name": "hardware",
+            "x": hw_x,
+            "y": hw_y,
+            "z": hw_z,
+            "line": {"color": "rgb(0,220,0)", "width": 6},
+            "text": hover_text,
+            "hovertemplate": "%{text}<extra>hardware</extra>",
+        },
+        {
+            "type": "scatter3d",
+            "mode": "lines",
+            "name": "reference_state",
+            "x": state_x,
+            "y": state_y,
+            "z": state_z,
+            "line": {"color": "rgb(220,100,0)", "width": 4},
+            "text": hover_text,
+            "hovertemplate": "%{text}<extra>state</extra>",
+        },
+        {
+            "type": "scatter3d",
+            "mode": "lines",
+            "name": "reference_action",
+            "x": action_x,
+            "y": action_y,
+            "z": action_z,
+            "line": {"color": "rgb(40,120,255)", "width": 4},
+            "text": hover_text,
+            "hovertemplate": "%{text}<extra>action</extra>",
+        },
+    ]
+
+    if peak_count > 0:
+        traces.append(
+            {
+                "type": "scatter3d",
+                "mode": "markers",
+                "name": "peak hw-action error",
+                "x": hw_positions[peak_order, 0].astype(float).tolist(),
+                "y": hw_positions[peak_order, 1].astype(float).tolist(),
+                "z": hw_positions[peak_order, 2].astype(float).tolist(),
+                "marker": {"color": "rgb(255,64,64)", "size": 6, "symbol": "diamond"},
+                "text": [hover_text[idx] for idx in peak_order.tolist()],
+                "hovertemplate": "%{text}<extra>peak</extra>",
+            }
+        )
+
+    layout = {
+        "title": {
+            "text": f"FR3 Replay Episode {episode_idx:03d} 3D Trajectory",
+            "x": 0.02,
+        },
+        "paper_bgcolor": "#0b1020",
+        "plot_bgcolor": "#0b1020",
+        "font": {"color": "#e8ecf3", "family": "Menlo, Consolas, monospace"},
+        "legend": {"orientation": "h", "x": 0.0, "y": 1.02},
+        "margin": {"l": 0, "r": 0, "t": 50, "b": 0},
+        "scene": {
+            "aspectmode": "data",
+            "xaxis": {"title": "X (m)", "backgroundcolor": "#11192d", "gridcolor": "#33415c", "zerolinecolor": "#4a5a78"},
+            "yaxis": {"title": "Y (m)", "backgroundcolor": "#11192d", "gridcolor": "#33415c", "zerolinecolor": "#4a5a78"},
+            "zaxis": {"title": "Z (m)", "backgroundcolor": "#11192d", "gridcolor": "#33415c", "zerolinecolor": "#4a5a78"},
+            "camera": {"eye": {"x": 1.4, "y": -1.6, "z": 1.1}},
+        },
+        "annotations": [
+            {
+                "xref": "paper",
+                "yref": "paper",
+                "x": 0.0,
+                "y": 0.0,
+                "showarrow": False,
+                "align": "left",
+                "font": {"size": 12, "color": "#c4ccda"},
+                "text": (
+                    f"dataset={dataset_path}<br>"
+                    f"frames={len(frame_indices)} | peak markers={peak_count}<br>"
+                    "drag to orbit, scroll to zoom, hover to inspect frame metrics"
+                ),
+            }
+        ],
+    }
+
+    html = f'''<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FR3 Replay Episode {episode_idx:03d} 3D Trajectory</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    html, body {{ margin: 0; height: 100%; background: #0b1020; color: #e8ecf3; }}
+    #plot {{ width: 100vw; height: 100vh; }}
+  </style>
+</head>
+<body>
+  <div id="plot"></div>
+  <script>
+    const traces = {json.dumps(traces, ensure_ascii=False)};
+    const layout = {json.dumps(layout, ensure_ascii=False)};
+    Plotly.newPlot('plot', traces, layout, {{responsive: true, displaylogo: false}});
+  </script>
+</body>
+</html>
+'''
+    output_path.write_text(html, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -307,24 +708,31 @@ def dataset_gripper_aperture_to_normalized(aperture_m: float, cfg: "FrankaResear
 def print_peak_diagnostics(
     *,
     frame_indices: np.ndarray,
-    pos_errors_mm: np.ndarray,
-    rot_errors_deg: np.ndarray,
+    pos_errors_state_mm: np.ndarray,
+    rot_errors_state_deg: np.ndarray,
+    pos_errors_action_mm: np.ndarray,
+    rot_errors_action_deg: np.ndarray,
+    state_action_gap_mm: np.ndarray,
+    state_action_gap_deg: np.ndarray,
     timestamps: np.ndarray,
     ee_frames: np.ndarray,
     states: np.ndarray,
     actions: np.ndarray,
     hw_positions: np.ndarray,
+    measured_joints: np.ndarray,
+    command_joints: np.ndarray | None,
+    target_joints: np.ndarray | None,
 ) -> None:
-    if len(pos_errors_mm) == 0:
+    if len(pos_errors_state_mm) == 0:
         return
 
-    topk = min(_PEAK_DIAGNOSTIC_FRAMES, len(pos_errors_mm))
-    peak_indices = np.argsort(pos_errors_mm)[-topk:][::-1]
-    print("[INFO] 误差峰值诊断（按位置误差排序）")
+    peak_score = np.maximum(pos_errors_state_mm, pos_errors_action_mm)
+    topk = min(_PEAK_DIAGNOSTIC_FRAMES, len(peak_score))
+    peak_indices = np.argsort(peak_score)[-topk:][::-1]
+    print("[INFO] 误差峰值诊断（按 max(hw-state, hw-action) 位置误差排序）")
     for local_idx in peak_indices:
         fi = int(frame_indices[local_idx])
         prev_local_idx = max(local_idx - 1, 0)
-        prev_fi = int(frame_indices[prev_local_idx])
         ee_quat = np.asarray(ee_frames[local_idx][3:7], dtype=np.float64)
         ee_prev_quat = np.asarray(ee_frames[prev_local_idx][3:7], dtype=np.float64)
         state_quat = np.asarray(states[local_idx][3:7], dtype=np.float64)
@@ -339,9 +747,30 @@ def print_peak_diagnostics(
         state_step_rot_deg = quaternion_angle_error_deg(state_quat, state_prev_quat)
         action_step_rot_deg = quaternion_angle_error_deg(action_quat, action_prev_quat)
         gripper_step_mm = float((actions[local_idx][7] - actions[prev_local_idx][7]) * 1000.0)
+        joint_cmd_l2_deg = None
+        joint_cmd_max_abs_deg = None
+        joint_target_l2_deg = None
+        joint_target_max_abs_deg = None
+        target_cmd_l2_deg = None
+        if command_joints is not None:
+            joint_cmd_delta_deg = np.rad2deg(command_joints[local_idx] - measured_joints[local_idx])
+            joint_cmd_l2_deg = float(np.linalg.norm(joint_cmd_delta_deg))
+            joint_cmd_max_abs_deg = float(np.max(np.abs(joint_cmd_delta_deg)))
+        if target_joints is not None:
+            joint_target_delta_deg = np.rad2deg(target_joints[local_idx] - measured_joints[local_idx])
+            joint_target_l2_deg = float(np.linalg.norm(joint_target_delta_deg))
+            joint_target_max_abs_deg = float(np.max(np.abs(joint_target_delta_deg)))
+        if target_joints is not None and command_joints is not None:
+            target_cmd_l2_deg = float(np.linalg.norm(np.rad2deg(target_joints[local_idx] - command_joints[local_idx])))
         print(
             f"  frame={fi:4d} ts={timestamps[local_idx]:7.3f}s  "
-            f"pos_err={pos_errors_mm[local_idx]:6.2f}mm  rot_err={rot_errors_deg[local_idx]:5.2f}deg"
+            f"pos_err_state={pos_errors_state_mm[local_idx]:6.2f}mm  "
+            f"pos_err_action={pos_errors_action_mm[local_idx]:6.2f}mm"
+        )
+        print(
+            f"    rot_err_state={rot_errors_state_deg[local_idx]:5.2f}deg  "
+            f"rot_err_action={rot_errors_action_deg[local_idx]:5.2f}deg  "
+            f"state_action_gap={state_action_gap_mm[local_idx]:6.2f}mm/{state_action_gap_deg[local_idx]:5.2f}deg"
         )
         print(
             f"    z: hw={hw_positions[local_idx,2]:+.4f}m  ee_src={ee_frames[local_idx][2]:+.4f}m  "
@@ -371,6 +800,18 @@ def print_peak_diagnostics(
             f"    gripper: aperture={actions[local_idx][7]*1000:6.2f}mm  "
             f"delta_prev={gripper_step_mm:+6.2f}mm"
         )
+        if joint_cmd_l2_deg is not None:
+            print(
+                f"    q_meas_vs_q_cmd: l2={joint_cmd_l2_deg:5.2f}deg  "
+                f"max_abs={joint_cmd_max_abs_deg:5.2f}deg"
+            )
+        if joint_target_l2_deg is not None:
+            print(
+                f"    q_meas_vs_q_target: l2={joint_target_l2_deg:5.2f}deg  "
+                f"max_abs={joint_target_max_abs_deg:5.2f}deg"
+            )
+        if target_cmd_l2_deg is not None:
+            print(f"    q_cmd_vs_q_target: l2={target_cmd_l2_deg:5.2f}deg")
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +823,18 @@ def replay_real(args: argparse.Namespace) -> int:
     from lerobot.robots.franka_research3 import FrankaResearch3
     from lerobot.robots.franka_research3.config_franka_research3 import FrankaResearch3Config
 
+    if args.joint_targets_csv is not None and not args.allow_experimental_joint_replay:
+        raise RuntimeError(
+            "Real-hardware replay defaults have been rolled back to the validated "
+            "action[t] + OTG path. Add --allow-experimental-joint-replay to use "
+            "joint-target CSV replay."
+        )
+    if args.disable_otg and not args.allow_unsafe_otg_bypass:
+        raise RuntimeError(
+            "Real-hardware replay keeps OTG enabled by default. Add "
+            "--allow-unsafe-otg-bypass to use --disable-otg."
+        )
+
     # ── 加载数据 ──────────────────────────────────────────────────────
     print(f"[INFO] 加载 episode {args.episode}  dataset={args.dataset}")
     ep = load_episode(args.dataset, args.episode)
@@ -391,7 +844,20 @@ def replay_real(args: argparse.Namespace) -> int:
     n_frames = len(states)
     print(f"[INFO] {n_frames} 帧 @ {args.fps} fps")
     ee_frames = actions
-    print("[INFO] EE 重播源: action[t]")
+    joint_target_sequence = None
+    if args.joint_targets_csv is not None:
+        joint_target_sequence = load_joint_target_sequence(
+            args.joint_targets_csv,
+            n_frames=n_frames,
+            column_prefix=args.joint_target_column_prefix,
+        )
+        print(
+            "[INFO] Joint 重播源: "
+            f"{args.joint_targets_csv}  prefix={args.joint_target_column_prefix}"
+        )
+        print("[INFO] EE 参考源: action[t]  (用于对比统计与 gripper)")
+    else:
+        print("[INFO] EE 重播源: action[t]")
     if len(timestamps) >= 2:
         dt = np.diff(timestamps)
         print(
@@ -400,6 +866,9 @@ def replay_real(args: argparse.Namespace) -> int:
             f"min={dt.min():.5f}s  max={dt.max():.5f}s"
         )
     print(f"[INFO] 时序源: {args.timing_source}")
+    analysis_output_dir = args.analysis_output_dir.resolve()
+    analysis_output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] 分析输出目录: {analysis_output_dir}")
 
     # ── 预检查：打印轨迹 Z 范围 ───────────────────────────────────────
     T_B_E_reset = pose_from_xyzquat(_RESET_POSE_B_XYZQUAT)
@@ -416,11 +885,31 @@ def replay_real(args: argparse.Namespace) -> int:
     move_to_das_start(args.robot_ip)
 
     # ── 初始化真机 ────────────────────────────────────────────────────
+    otg_max_velocity = resolve_joint_limit_values(
+        FrankaResearch3Config.otg_max_velocity,
+        args.otg_max_velocity,
+        args.otg_velocity_scale,
+    )
+    otg_max_acceleration = resolve_joint_limit_values(
+        FrankaResearch3Config.otg_max_acceleration,
+        args.otg_max_acceleration,
+        args.otg_acceleration_scale,
+    )
+    otg_max_jerk = resolve_joint_limit_values(
+        FrankaResearch3Config.otg_max_jerk,
+        args.otg_max_jerk,
+        args.otg_jerk_scale,
+    )
+
     cfg = FrankaResearch3Config(
         robot_ip=args.robot_ip,
         damping=args.damping,
         stiffness=args.stiffness,
         filter_coeff=args.filter_coeff,
+        use_otg=not args.disable_otg,
+        otg_max_velocity=otg_max_velocity,
+        otg_max_acceleration=otg_max_acceleration,
+        otg_max_jerk=otg_max_jerk,
         gripper_port=args.gripper_port,
         gripper_backend=args.gripper_backend,
         allow_mock_gripper=False,
@@ -438,6 +927,16 @@ def replay_real(args: argparse.Namespace) -> int:
             f"damping={args.damping} "
             f"stiffness={args.stiffness}"
         )
+    print(
+        "[INFO] OTG 参数: "
+        f"use_otg={cfg.use_otg} "
+        f"vel_scale={args.otg_velocity_scale:.3f} "
+        f"acc_scale={args.otg_acceleration_scale:.3f} "
+        f"jerk_scale={args.otg_jerk_scale:.3f}"
+    )
+    print(f"[INFO] OTG max_velocity   = {np.round(np.asarray(cfg.otg_max_velocity), 4).tolist()}")
+    print(f"[INFO] OTG max_accel      = {np.round(np.asarray(cfg.otg_max_acceleration), 4).tolist()}")
+    print(f"[INFO] OTG max_jerk       = {np.round(np.asarray(cfg.otg_max_jerk), 4).tolist()}")
     robot.connect()
     print("[INFO] 真机已连接")
 
@@ -475,12 +974,21 @@ def replay_real(args: argparse.Namespace) -> int:
               f"（应 ≈ 实际 EE 位置，差值={np.linalg.norm(T_B_E0_check[:3,3] - T_B_E_actual[:3,3])*1000:.2f}mm）")
 
         # ── 初始化 Rerun ──────────────────────────────────────────────
-        rr_ok, _ = init_rerun(args.episode)
+        rr_ok, rrd_path = init_rerun(args.episode, output_dir=analysis_output_dir)
 
         # ── 误差记录 ──────────────────────────────────────────────────
         processed_frame_indices: list[int] = []
-        pos_errors_mm: list[float] = []
-        rot_errors_deg: list[float] = []
+        pos_errors_state_mm: list[float] = []
+        rot_errors_state_deg: list[float] = []
+        pos_errors_action_mm: list[float] = []
+        rot_errors_action_deg: list[float] = []
+        state_action_gap_mm: list[float] = []
+        state_action_gap_deg: list[float] = []
+        joint_cmd_track_l2_deg: list[float] = []
+        joint_cmd_track_max_abs_deg: list[float] = []
+        joint_target_track_l2_deg: list[float] = []
+        joint_target_track_max_abs_deg: list[float] = []
+        joint_target_cmd_l2_deg: list[float] = []
         skipped_frames: list[int] = []
 
         assert actions.shape[1] >= 8, (
@@ -496,6 +1004,11 @@ def replay_real(args: argparse.Namespace) -> int:
         )
 
         hw_positions: list[np.ndarray] = []
+        state_positions_history: list[np.ndarray] = []
+        action_positions_history: list[np.ndarray] = []
+        measured_joint_history: list[np.ndarray] = []
+        command_joint_history: list[np.ndarray] = []
+        target_joint_history: list[np.ndarray] = []
 
         print(f"\n[INFO] 开始真机重播 ({n_frames} 帧)…\n")
 
@@ -523,82 +1036,221 @@ def replay_real(args: argparse.Namespace) -> int:
                 continue
 
             rotvec = Rotation.from_matrix(T_B_Et_star[:3, :3]).as_rotvec()
-            robot.send_action({
-                "ee.x":  float(T_B_Et_star[0, 3]),
-                "ee.y":  float(T_B_Et_star[1, 3]),
-                "ee.z":  float(T_B_Et_star[2, 3]),
-                "ee.wx": float(rotvec[0]),
-                "ee.wy": float(rotvec[1]),
-                "ee.wz": float(rotvec[2]),
-                "gripper.pos": float(action_gripper_normalized[fi]),
-            })
+            if joint_target_sequence is not None:
+                robot.send_joint_positions(
+                    joint_target_sequence[fi],
+                    gripper_pos=float(action_gripper_normalized[fi]),
+                )
+            else:
+                robot.send_action({
+                    "ee.x":  float(T_B_Et_star[0, 3]),
+                    "ee.y":  float(T_B_Et_star[1, 3]),
+                    "ee.z":  float(T_B_Et_star[2, 3]),
+                    "ee.wx": float(rotvec[0]),
+                    "ee.wy": float(rotvec[1]),
+                    "ee.wz": float(rotvec[2]),
+                    "gripper.pos": float(action_gripper_normalized[fi]),
+                })
 
             # 读取当前 EE pose（误差统计用）
             obs = robot.get_observation()
             hw_pos = np.array([obs["ee.x"], obs["ee.y"], obs["ee.z"]], dtype=np.float64)
             hw_rot = Rotation.from_rotvec([obs["ee.wx"], obs["ee.wy"], obs["ee.wz"]]).as_matrix()
+            measured_joints = np.array([obs[f"joint_{joint_idx}.pos"] for joint_idx in range(1, 8)], dtype=np.float64)
+            target_joints, command_joints = snapshot_otg_debug(robot)
             hw_positions.append(hw_pos.copy())
+            measured_joint_history.append(measured_joints.copy())
+            if command_joints is not None:
+                command_joint_history.append(command_joints.copy())
+            if target_joints is not None:
+                target_joint_history.append(target_joints.copy())
 
             # 录制参考 pose
-            T_B_Et_rec = ws_to_base(T_B_Ws, pose_from_xyzquat(states[fi]))
-            rec_pos = T_B_Et_rec[:3, 3]
-            rec_rot = T_B_Et_rec[:3, :3]
+            T_B_Et_state = ws_to_base(T_B_Ws, pose_from_xyzquat(states[fi]))
+            state_pos = T_B_Et_state[:3, 3]
+            state_rot = T_B_Et_state[:3, :3]
+            action_pos = T_B_Et_star[:3, 3]
+            action_rot = T_B_Et_star[:3, :3]
 
-            pos_err_mm = float(np.linalg.norm(hw_pos - rec_pos) * 1000)
-            rot_err_deg = rotation_angle_error_deg(hw_rot, rec_rot)
+            pos_err_state_mm = float(np.linalg.norm(hw_pos - state_pos) * 1000.0)
+            rot_err_state_deg = rotation_angle_error_deg(hw_rot, state_rot)
+            pos_err_action_mm = float(np.linalg.norm(hw_pos - action_pos) * 1000.0)
+            rot_err_action_deg = rotation_angle_error_deg(hw_rot, action_rot)
+            ref_gap_mm = float(np.linalg.norm(state_pos - action_pos) * 1000.0)
+            ref_gap_deg = rotation_angle_error_deg(state_rot, action_rot)
             processed_frame_indices.append(fi)
-            pos_errors_mm.append(pos_err_mm)
-            rot_errors_deg.append(rot_err_deg)
+            state_positions_history.append(state_pos.copy())
+            action_positions_history.append(action_pos.copy())
+            pos_errors_state_mm.append(pos_err_state_mm)
+            rot_errors_state_deg.append(rot_err_state_deg)
+            pos_errors_action_mm.append(pos_err_action_mm)
+            rot_errors_action_deg.append(rot_err_action_deg)
+            state_action_gap_mm.append(ref_gap_mm)
+            state_action_gap_deg.append(ref_gap_deg)
+            if command_joints is not None:
+                command_delta_deg = np.rad2deg(command_joints - measured_joints)
+                joint_cmd_track_l2_deg.append(float(np.linalg.norm(command_delta_deg)))
+                joint_cmd_track_max_abs_deg.append(float(np.max(np.abs(command_delta_deg))))
+            if target_joints is not None:
+                target_delta_deg = np.rad2deg(target_joints - measured_joints)
+                joint_target_track_l2_deg.append(float(np.linalg.norm(target_delta_deg)))
+                joint_target_track_max_abs_deg.append(float(np.max(np.abs(target_delta_deg))))
+            if target_joints is not None and command_joints is not None:
+                joint_target_cmd_l2_deg.append(
+                    float(np.linalg.norm(np.rad2deg(target_joints - command_joints)))
+                )
 
-            log_frame(rr_ok, fi, float(timestamps[fi]),
-                      hw_pos, rec_pos, pos_err_mm, rot_err_deg, float(action_gripper_normalized[fi]))
+            log_frame(
+                rr_ok,
+                fi,
+                float(timestamps[fi]),
+                hw_pos,
+                state_pos,
+                action_pos,
+                pos_err_state_mm,
+                rot_err_state_deg,
+                pos_err_action_mm,
+                rot_err_action_deg,
+                float(action_gripper_normalized[fi]),
+                np.asarray(hw_positions, dtype=np.float64),
+                np.asarray(state_positions_history, dtype=np.float64),
+                np.asarray(action_positions_history, dtype=np.float64),
+            )
 
             elapsed = time.perf_counter() - t0
             if (sleep_t := target_dt - elapsed) > 0:
                 time.sleep(sleep_t)
 
             if fi % 30 == 0:
-                print(f"  [{fi:4d}/{n_frames}]  pos_err={pos_err_mm:6.2f}mm  rot_err={rot_err_deg:5.2f}°")
+                print(
+                    f"  [{fi:4d}/{n_frames}]  "
+                    f"state_err={pos_err_state_mm:6.2f}mm/{rot_err_state_deg:5.2f}°  "
+                    f"action_err={pos_err_action_mm:6.2f}mm/{rot_err_action_deg:5.2f}°  "
+                    f"state_action_gap={ref_gap_mm:6.2f}mm"
+                )
 
         # ── 统计汇总 ──────────────────────────────────────────────────
         if skipped_frames:
             print(f"\n[WARN] 共跳过 {len(skipped_frames)} 帧（Z < {_MIN_Z_M}m）: {skipped_frames[:10]}"
                   f"{'...' if len(skipped_frames) > 10 else ''}")
 
-        pos_arr = np.array(pos_errors_mm)
-        if len(pos_arr) == 0:
+        pos_state_arr = np.array(pos_errors_state_mm, dtype=np.float64)
+        if len(pos_state_arr) == 0:
             print("[WARN] 无有效帧（全部被跳过），无统计数据")
             return 0
         frame_idx_arr = np.asarray(processed_frame_indices, dtype=np.int64)
-        rot_arr = np.array(rot_errors_deg)
+        rot_state_arr = np.array(rot_errors_state_deg, dtype=np.float64)
+        pos_action_arr = np.array(pos_errors_action_mm, dtype=np.float64)
+        rot_action_arr = np.array(rot_errors_action_deg, dtype=np.float64)
+        gap_pos_arr = np.array(state_action_gap_mm, dtype=np.float64)
+        gap_rot_arr = np.array(state_action_gap_deg, dtype=np.float64)
         hw_pos_arr = np.asarray(hw_positions, dtype=np.float64)
-        _WARMUP = min(30, len(pos_arr))
-        pos_stable = pos_arr[_WARMUP:]
-        rot_stable = rot_arr[_WARMUP:]
+        state_pos_arr = np.asarray(state_positions_history, dtype=np.float64)
+        action_pos_arr = np.asarray(action_positions_history, dtype=np.float64)
+        measured_joint_arr = np.asarray(measured_joint_history, dtype=np.float64)
+        command_joint_arr = (
+            np.asarray(command_joint_history, dtype=np.float64)
+            if len(command_joint_history) == len(processed_frame_indices)
+            else None
+        )
+        target_joint_arr = (
+            np.asarray(target_joint_history, dtype=np.float64)
+            if len(target_joint_history) == len(processed_frame_indices)
+            else None
+        )
+        _WARMUP = min(30, len(pos_state_arr))
+        pos_state_stable = pos_state_arr[_WARMUP:]
+        rot_state_stable = rot_state_arr[_WARMUP:]
+        pos_action_stable = pos_action_arr[_WARMUP:]
+        rot_action_stable = rot_action_arr[_WARMUP:]
+        gap_pos_stable = gap_pos_arr[_WARMUP:]
+        gap_rot_stable = gap_rot_arr[_WARMUP:]
 
         print("\n" + "=" * 60)
         print(f"  Episode {args.episode} 真机重播完成   {n_frames} 帧 @ {args.fps} fps")
         print("=" * 60)
-        if len(pos_arr) > 0:
-            print(f"  【全程】位置误差 (mm)   mean={pos_arr.mean():.2f}  "
-                  f"max={pos_arr.max():.2f}  p95={np.percentile(pos_arr,95):.2f}")
-            print(f"  【全程】旋转误差 (°)    mean={rot_arr.mean():.2f}  "
-                  f"max={rot_arr.max():.2f}  p95={np.percentile(rot_arr,95):.2f}")
-        if len(pos_stable) > 0:
-            print(f"  【稳定期 frame {_WARMUP}+】位置误差 (mm)   mean={pos_stable.mean():.2f}  "
-                  f"max={pos_stable.max():.2f}  p95={np.percentile(pos_stable,95):.2f}")
-            print(f"  【稳定期 frame {_WARMUP}+】旋转误差 (°)    mean={rot_stable.mean():.2f}  "
-                  f"max={rot_stable.max():.2f}  p95={np.percentile(rot_stable,95):.2f}")
+        summarize_metric("【全程】跟踪误差 vs action 位置", pos_action_arr, "mm")
+        summarize_metric("【全程】跟踪误差 vs action 旋转", rot_action_arr, "°")
+        summarize_metric("【全程】复现误差 vs state 位置", pos_state_arr, "mm")
+        summarize_metric("【全程】复现误差 vs state 旋转", rot_state_arr, "°")
+        summarize_metric("【全程】state-action 源数据位置差", gap_pos_arr, "mm")
+        summarize_metric("【全程】state-action 源数据旋转差", gap_rot_arr, "°")
+        if len(pos_state_stable) > 0:
+            summarize_metric(f"【稳定期 frame {_WARMUP}+】跟踪误差 vs action 位置", pos_action_stable, "mm")
+            summarize_metric(f"【稳定期 frame {_WARMUP}+】跟踪误差 vs action 旋转", rot_action_stable, "°")
+            summarize_metric(f"【稳定期 frame {_WARMUP}+】复现误差 vs state 位置", pos_state_stable, "mm")
+            summarize_metric(f"【稳定期 frame {_WARMUP}+】复现误差 vs state 旋转", rot_state_stable, "°")
+            summarize_metric(f"【稳定期 frame {_WARMUP}+】state-action 源数据位置差", gap_pos_stable, "mm")
+            summarize_metric(f"【稳定期 frame {_WARMUP}+】state-action 源数据旋转差", gap_rot_stable, "°")
+        if joint_cmd_track_l2_deg:
+            summarize_metric("【全程】q_meas vs q_cmd 关节 L2", np.asarray(joint_cmd_track_l2_deg), "deg")
+            summarize_metric(
+                "【全程】q_meas vs q_cmd 单关节 max_abs",
+                np.asarray(joint_cmd_track_max_abs_deg),
+                "deg",
+            )
+        if joint_target_track_l2_deg:
+            summarize_metric("【全程】q_meas vs q_target 关节 L2", np.asarray(joint_target_track_l2_deg), "deg")
+            summarize_metric(
+                "【全程】q_meas vs q_target 单关节 max_abs",
+                np.asarray(joint_target_track_max_abs_deg),
+                "deg",
+            )
+        if joint_target_cmd_l2_deg:
+            summarize_metric("【全程】q_cmd vs q_target 关节 L2", np.asarray(joint_target_cmd_l2_deg), "deg")
         print("=" * 60)
+        trajectory_csv_path = analysis_output_dir / f"fr3_real_replay_ep{args.episode:03d}_trajectory.csv"
+        write_trajectory_csv(
+            trajectory_csv_path,
+            frame_indices=frame_idx_arr,
+            timestamps=timestamps[frame_idx_arr],
+            hw_positions=hw_pos_arr,
+            state_positions=state_pos_arr,
+            action_positions=action_pos_arr,
+            pos_errors_state_mm=pos_state_arr,
+            rot_errors_state_deg=rot_state_arr,
+            pos_errors_action_mm=pos_action_arr,
+            rot_errors_action_deg=rot_action_arr,
+            state_action_gap_mm=gap_pos_arr,
+            state_action_gap_deg=gap_rot_arr,
+            measured_joints=measured_joint_arr,
+            command_joints=command_joint_arr,
+            target_joints=target_joint_arr,
+        )
+        print(f"[INFO] 轨迹 CSV 已保存: {trajectory_csv_path}")
+        trajectory_html_path = analysis_output_dir / f"fr3_real_replay_ep{args.episode:03d}_trajectory.html"
+        write_trajectory_plot_html(
+            trajectory_html_path,
+            episode_idx=args.episode,
+            dataset_path=args.dataset,
+            frame_indices=frame_idx_arr,
+            timestamps=timestamps[frame_idx_arr],
+            hw_positions=hw_pos_arr,
+            state_positions=state_pos_arr,
+            action_positions=action_pos_arr,
+            pos_errors_state_mm=pos_state_arr,
+            pos_errors_action_mm=pos_action_arr,
+            state_action_gap_mm=gap_pos_arr,
+        )
+        print(f"[INFO] 3D HTML 已保存: {trajectory_html_path}")
+        if rrd_path is not None:
+            print(f"[INFO] Rerun 3D 轨迹已保存: {rrd_path}")
         print_peak_diagnostics(
             frame_indices=frame_idx_arr,
-            pos_errors_mm=pos_arr,
-            rot_errors_deg=rot_arr,
+            pos_errors_state_mm=pos_state_arr,
+            rot_errors_state_deg=rot_state_arr,
+            pos_errors_action_mm=pos_action_arr,
+            rot_errors_action_deg=rot_action_arr,
+            state_action_gap_mm=gap_pos_arr,
+            state_action_gap_deg=gap_rot_arr,
             timestamps=timestamps[frame_idx_arr],
             ee_frames=ee_frames[frame_idx_arr],
             states=states[frame_idx_arr],
             actions=actions[frame_idx_arr],
             hw_positions=hw_pos_arr,
+            measured_joints=measured_joint_arr,
+            command_joints=command_joint_arr,
+            target_joints=target_joint_arr,
         )
 
     finally:
@@ -625,10 +1277,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--filter-coeff", type=float, default=None)
     parser.add_argument("--damping", type=parse_joint_gains, default=None)
     parser.add_argument("--stiffness", type=parse_joint_gains, default=None)
+    parser.add_argument("--otg-max-velocity", type=parse_joint_limit_values, default=None)
+    parser.add_argument("--otg-max-acceleration", type=parse_joint_limit_values, default=None)
+    parser.add_argument("--otg-max-jerk", type=parse_joint_limit_values, default=None)
+    parser.add_argument("--otg-velocity-scale", type=positive_scale, default=_DEFAULT_OTG_SCALE)
+    parser.add_argument("--otg-acceleration-scale", type=positive_scale, default=_DEFAULT_OTG_SCALE)
+    parser.add_argument("--otg-jerk-scale", type=positive_scale, default=_DEFAULT_OTG_SCALE)
+    parser.add_argument("--disable-otg", action="store_true")
+    parser.add_argument("--joint-targets-csv", type=str, default=None)
+    parser.add_argument("--joint-target-column-prefix", type=str, default="bc_joint")
+    parser.add_argument("--allow-experimental-joint-replay", action="store_true")
+    parser.add_argument("--allow-unsafe-otg-bypass", action="store_true")
     parser.add_argument("--gripper-port", default="/dev/ttyUSB0")
     parser.add_argument("--gripper-backend", choices=["pika", "das"], default="das")
     parser.add_argument("--reset-gripper-position", type=float, default=_DAS_RESET_POSITION)
     parser.add_argument("--reset-gripper-timeout-s", type=float, default=2.0)
+    parser.add_argument("--analysis-output-dir", type=Path, default=_DEFAULT_ANALYSIS_OUTPUT_DIR)
     return parser.parse_args(argv)
 
 
