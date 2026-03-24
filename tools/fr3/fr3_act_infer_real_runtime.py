@@ -56,6 +56,18 @@ _DEFAULT_FIRST_FRAME_MAX_ROT_DELTA_DEG = 10.0
 _DEFAULT_MAX_STEP_POS_DELTA_MM = 5.0
 _DEFAULT_MAX_STEP_ROT_DELTA_DEG = 3.0
 _DEFAULT_DATASET_START_GRIPPER_TOLERANCE = 0.05
+_DAS_START_JOINTS_RAD = np.array(
+    [
+        -0.053397256451184094,
+        -1.5604194603713035,
+        -1.720175311909912,
+        -2.119629211414152,
+        0.011555741406479218,
+        2.1189401256121045,
+        -0.9682376640047694,
+    ],
+    dtype=np.float64,
+)
 # Replay uses I=gripper_base_link and E=das_gripper_ee with this fixed DAS extrinsic.
 _T_IE = np.array(
     [
@@ -129,9 +141,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Optional output directory to dump the exact step0 policy input bundle for offline comparison.',
     )
     parser.add_argument(
-        '--align-gripper-to-dataset-start',
-        action='store_true',
-        help='Physically move the gripper to the dataset-start mean before policy inference begins.',
+        '--no-move-to-das-start',
+        dest='move_to_das_start',
+        action='store_false',
+        help='Skip moving the arm to the DAS replay start joint configuration before inference.',
+    )
+    parser.add_argument(
+        '--no-align-gripper-to-dataset-start',
+        dest='align_gripper_to_dataset_start',
+        action='store_false',
+        help='Skip physically moving the gripper to the dataset-start mean before policy inference begins.',
     )
     parser.add_argument(
         '--dataset-start-gripper-tolerance',
@@ -139,6 +158,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_DEFAULT_DATASET_START_GRIPPER_TOLERANCE,
         help='Absolute normalized gripper tolerance used for startup diagnostics and optional auto-alignment.',
     )
+    parser.set_defaults(move_to_das_start=True, align_gripper_to_dataset_start=True)
     return parser.parse_args(argv)
 
 
@@ -170,6 +190,21 @@ def resolve_dataset_root(pretrained_dir: Path, train_cfg: TrainPipelineConfig, d
             f"No dataset root resolved from {pretrained_dir / 'train_config.json'}. Pass --dataset-root explicitly."
         )
     return _resolve_repo_path(root_value)
+
+
+def move_to_das_start_if_requested(*, robot_ip: str, enabled: bool) -> None:
+    if not enabled:
+        return
+
+    import panda_py
+
+    print(f'[INFO] 连接 panda_py ({robot_ip})，移动到 DAS 起始关节角...')
+    print(f'[INFO] 目标关节角（rad）: {_DAS_START_JOINTS_RAD.tolist()}')
+    panda = panda_py.Panda(robot_ip)
+    panda.move_to_joint_position(_DAS_START_JOINTS_RAD.tolist())
+    del panda
+    time.sleep(0.5)
+    print('[INFO] 已到达 DAS 起始关节角')
 
 
 def _coerce_opencv_index_or_path(value: Any) -> int | Path:
@@ -340,6 +375,34 @@ def normalize_dataset_gripper(aperture_m: float, cfg: FrankaResearch3Config) -> 
     if max_width_m <= 0.0:
         return 0.0
     return float(np.clip(aperture_m / max_width_m, 0.0, 1.0))
+
+
+def denormalize_live_gripper_observation(gripper_pos: float, cfg: FrankaResearch3Config) -> float:
+    gripper_pos = float(np.clip(gripper_pos, 0.0, 1.0))
+    if cfg.gripper_backend == 'das':
+        span_m = float(cfg.das_max_distance_m - cfg.das_min_distance_m)
+        if span_m <= 0.0:
+            return 0.0
+        return float(cfg.das_min_distance_m + gripper_pos * span_m)
+    max_width_m = float(cfg.gripper_max_width_mm) / 1000.0
+    if max_width_m <= 0.0:
+        return 0.0
+    return float(gripper_pos * max_width_m)
+
+
+def convert_gripper_observation_to_dataset_units(
+    observation: RobotObservation,
+    *,
+    robot_cfg: FrankaResearch3Config,
+) -> RobotObservation:
+    converted_observation = dict(observation)
+    if 'gripper.pos' not in converted_observation:
+        return converted_observation
+    converted_observation['gripper.pos'] = denormalize_live_gripper_observation(
+        float(converted_observation['gripper.pos']),
+        robot_cfg,
+    )
+    return converted_observation
 
 
 def _state_name_to_observation_key(name: str) -> str:
@@ -863,6 +926,7 @@ def align_gripper_to_dataset_start(
             )
 
 
+
 def apply_gripper_observation_offset(
     dataset_observation_i: RobotObservation,
     *,
@@ -1117,9 +1181,17 @@ def run_inference(args: argparse.Namespace) -> int:
         cameras={name: cfg for name, cfg in camera_configs.items()},
     )
 
+    move_to_das_start_if_requested(robot_ip=args.robot_ip, enabled=bool(args.move_to_das_start))
+
     from lerobot.robots.franka_research3 import FrankaResearch3
 
     robot = FrankaResearch3(robot_cfg)
+    dataset_start_gripper_mean_normalized: float | None = None
+    if 'gripper_mean' in dataset_start_pose_stats:
+        dataset_start_gripper_mean_normalized = normalize_dataset_gripper(
+            float(dataset_start_pose_stats['gripper_mean']),
+            robot_cfg,
+        )
     state_processor = KeepAbsoluteEEObservation()
     T_B_Ws: np.ndarray | None = None
     start_alignment_stats: dict[str, Any] | None = None
@@ -1169,17 +1241,17 @@ def run_inference(args: argparse.Namespace) -> int:
         '[INFO] joint-space smoothing='
         f'FR3 OTG @ {robot_cfg.otg_control_frequency:.1f}Hz / sender @ {robot_cfg.otg_async_control_frequency:.1f}Hz'
     )
+
     if args.preview and args.align_gripper_to_dataset_start:
         print('[INFO] preview_gripper_alignment=requested; using virtual observation correction without moving hardware.')
 
     robot.connect()
     if args.align_gripper_to_dataset_start and not args.preview:
-        dataset_start_gripper_mean = dataset_start_pose_stats.get('gripper_mean')
-        if dataset_start_gripper_mean is None:
+        if dataset_start_gripper_mean_normalized is None:
             raise ValueError('Dataset start states do not include gripper values; cannot auto-align gripper.')
         align_gripper_to_dataset_start(
             robot,
-            target_gripper_pos=float(dataset_start_gripper_mean),
+            target_gripper_pos=float(dataset_start_gripper_mean_normalized),
             tolerance=dataset_start_gripper_tolerance,
         )
     policy.reset()
@@ -1192,6 +1264,10 @@ def run_inference(args: argparse.Namespace) -> int:
             robot_observation = robot.get_observation()
             absolute_state_observation_e = state_processor.observation(dict(robot_observation))
             absolute_state_observation_i = convert_absolute_observation_from_E_to_I(absolute_state_observation_e)
+            live_gripper_dataset_units = denormalize_live_gripper_observation(
+                float(robot_observation['gripper.pos']),
+                robot_cfg,
+            )
             if T_B_Ws is None:
                 current_start_pose_i = _pose_from_quaternion_observation(absolute_state_observation_i)
                 T_B_Ws = current_start_pose_i @ _invert_pose(dataset_start_pose_contract)
@@ -1199,7 +1275,7 @@ def run_inference(args: argparse.Namespace) -> int:
                     dataset_root,
                     T_B_Ws,
                     current_start_pose_i,
-                    live_gripper=float(robot_observation['gripper.pos']),
+                    live_gripper=live_gripper_dataset_units,
                 )
                 dataset_alignment_line = (
                     '[INFO] dataset_start_alignment='
@@ -1248,11 +1324,16 @@ def run_inference(args: argparse.Namespace) -> int:
                         f"offset={preview_gripper_offset:+.3f} "
                         f"corrected_start={preview_target_gripper:.3f}"
                     )
+
             assert T_B_Ws is not None
             dataset_state_observation_i, previous_dataset_quaternion_xyzw = convert_base_observation_from_I_to_dataset_frame(
                 absolute_state_observation_i,
                 T_B_Ws,
                 previous_quaternion_xyzw=previous_dataset_quaternion_xyzw,
+            )
+            dataset_state_observation_i = convert_gripper_observation_to_dataset_units(
+                dataset_state_observation_i,
+                robot_cfg=robot_cfg,
             )
             policy_state_observation_i = apply_gripper_observation_offset(
                 dataset_state_observation_i,

@@ -73,12 +73,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Optional output directory to dump the exact step0 policy input bundle for offline comparison.',
     )
     parser.add_argument(
-        '--align-gripper-to-dataset-start',
-        action='store_true',
-        help='Physically move the gripper to the dataset-start mean before policy inference begins.',
+        '--no-move-to-das-start',
+        dest='move_to_das_start',
+        action='store_false',
+        help='Skip moving the arm to the DAS start joint configuration before inference.',
+    )
+    parser.add_argument(
+        '--no-align-gripper-to-dataset-start',
+        dest='align_gripper_to_dataset_start',
+        action='store_false',
+        help='Skip physically moving the gripper to the dataset-start mean before policy inference begins.',
     )
     parser.add_argument('--dataset-start-gripper-tolerance', type=float, default=None)
     parser.add_argument('--dry-run', action='store_true', help='Print the Docker command without executing it.')
+    parser.set_defaults(move_to_das_start=True, align_gripper_to_dataset_start=True)
     return parser.parse_args(argv)
 
 
@@ -120,7 +128,8 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         *(['--preview'] if args.preview else []),
         *([f'--tactile-fallback={shlex.quote(args.tactile_fallback)}'] if args.tactile_fallback is not None else []),
         *([f'--debug-step0-dump-dir={shlex.quote(debug_step0_dump_dir)}'] if debug_step0_dump_dir is not None else []),
-        *(['--align-gripper-to-dataset-start'] if args.align_gripper_to_dataset_start else []),
+        *([] if args.move_to_das_start else ['--no-move-to-das-start']),
+        *([] if args.align_gripper_to_dataset_start else ['--no-align-gripper-to-dataset-start']),
         *([f'--dataset-start-gripper-tolerance={args.dataset_start_gripper_tolerance}'] if args.dataset_start_gripper_tolerance is not None else []),
         *([f'--robot-ip={shlex.quote(args.robot_ip)}'] if args.robot_ip is not None else []),
         *([f'--gripper-port={shlex.quote(args.gripper_port)}'] if args.gripper_port is not None else []),
