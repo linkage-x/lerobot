@@ -27,6 +27,7 @@ def test_build_docker_command_defaults_to_hardware_visible_service(tmp_path: Pat
     assert "--timing-source=timestamp" in command_text
     assert "--gripper-port=/dev/ttyUSB0" in command_text
     assert "--gripper-backend=das" in command_text
+    assert "--analysis-output-dir=/lerobot/outputs/analysis" in command_text
 
 
 def test_build_docker_command_can_switch_timing_source(tmp_path: Path):
@@ -60,6 +61,32 @@ def test_build_docker_command_can_override_arm_controller_params(tmp_path: Path)
     assert "--filter-coeff=0.2" in command_text
     assert "--damping=1,2,3,4,5,6,7" in command_text
     assert "--stiffness=7,6,5,4,3,2,1" in command_text
+
+
+def test_build_docker_command_maps_absolute_repo_paths_into_container(tmp_path: Path):
+    dataset_path = tmp_path / "outputs" / "datasets" / "demo"
+    joint_targets_csv = tmp_path / "outputs" / "analysis" / "targets.csv"
+    analysis_output_dir = tmp_path / "outputs" / "analysis" / "fr3"
+
+    args = fr3_das_replay_real.parse_args(
+        [
+            "--workspace",
+            str(tmp_path),
+            "--dataset",
+            str(dataset_path),
+            "--joint-targets-csv",
+            str(joint_targets_csv),
+            "--analysis-output-dir",
+            str(analysis_output_dir),
+        ]
+    )
+
+    command = fr3_das_replay_real.build_docker_command(args)
+    command_text = " ".join(command)
+
+    assert "--dataset=/lerobot/outputs/datasets/demo" in command_text
+    assert "--joint-targets-csv=/lerobot/outputs/analysis/targets.csv" in command_text
+    assert "--analysis-output-dir=/lerobot/outputs/analysis/fr3" in command_text
 
 
 def test_main_dry_run_prints_command(capsys):

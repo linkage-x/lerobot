@@ -20,6 +20,7 @@
 # ```
 
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 
 import cv2
@@ -297,3 +298,25 @@ def test_rotation(rotation, index_or_path):
             assert camera.width == original_width
             assert camera.height == original_height
             assert img.shape[:2] == (original_height, original_width)
+
+
+def test_read_loop_uses_captured_stop_event(monkeypatch):
+    config = OpenCVCameraConfig(index_or_path=DEFAULT_PNG_FILE_PATH, warmup_s=0)
+    camera = OpenCVCamera(config)
+    stop_event = Event()
+    frame = np.zeros((1, 1, 3), dtype=np.uint8)
+
+    camera.stop_event = stop_event
+
+    def fake_read_from_hardware():
+        stop_event.set()
+        camera.stop_event = None
+        return frame
+
+    monkeypatch.setattr(camera, '_read_from_hardware', fake_read_from_hardware)
+    monkeypatch.setattr(camera, '_postprocess_image', lambda image: image)
+
+    camera._read_loop()
+
+    assert camera.latest_frame is not None
+    assert camera.latest_timestamp is not None

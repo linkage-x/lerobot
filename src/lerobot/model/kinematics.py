@@ -108,6 +108,9 @@ class RobotKinematics:
         desired_ee_pose: np.ndarray,
         position_weight: float = 1.0,
         orientation_weight: float = 0.01,
+        max_iterations: int = 20,
+        position_tolerance_m: float = 1e-4,
+        orientation_tolerance_rad: float = 1e-3,
     ) -> np.ndarray:
         """
         Compute inverse kinematics using placo solver.
@@ -117,6 +120,9 @@ class RobotKinematics:
             desired_ee_pose: Target end-effector pose as a 4x4 transformation matrix
             position_weight: Weight for position constraint in IK
             orientation_weight: Weight for orientation constraint in IK, set to 0.0 to only constrain position
+            max_iterations: Maximum number of solver iterations to run before returning
+            position_tolerance_m: Early-stop position tolerance in meters
+            orientation_tolerance_rad: Early-stop orientation tolerance in radians
 
         Returns:
             Joint positions in degrees that achieve the desired end-effector pose
@@ -135,9 +141,27 @@ class RobotKinematics:
         # Configure the task based on position_only flag
         self.tip_frame.configure(self.target_frame_name, "soft", position_weight, orientation_weight)
 
-        # Solve IK
-        self.solver.solve(True)
-        self.robot.update_kinematics()
+        # Placo's solve() performs one optimization step. For poses far from the
+        # current seed, a single call can leave hundreds of millimeters of
+        # residual error. Iterate until the achieved FK pose is close enough.
+        orientation_enabled = orientation_weight > 0.0
+        for _ in range(max_iterations):
+            self.solver.solve(True)
+            self.robot.update_kinematics()
+
+            achieved_pose = self.robot.get_T_world_frame(self.target_frame_name)
+            position_error_m = np.linalg.norm(achieved_pose[:3, 3] - desired_ee_pose[:3, 3])
+            if orientation_enabled:
+                rotation_trace = np.clip(np.trace(achieved_pose[:3, :3].T @ desired_ee_pose[:3, :3]), -1.0, 3.0)
+                orientation_error_rad = float(np.arccos((rotation_trace - 1.0) / 2.0))
+            else:
+                orientation_error_rad = 0.0
+
+            if (
+                position_error_m <= position_tolerance_m
+                and orientation_error_rad <= orientation_tolerance_rad
+            ):
+                break
 
         # Extract joint positions
         joint_pos_rad = []

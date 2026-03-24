@@ -85,6 +85,20 @@ def test_fk_ik_round_trip_stays_in_target_frame():
         env.close()
 
 
+def test_fk_ik_round_trip_converges_for_far_reachable_target():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        current_joints = env._get_joint_positions()
+        target_joints = current_joints + np.array([0.35, -0.25, 0.30, -0.20, 0.15, -0.35, 0.25], dtype=np.float64)
+        target_pose = env._kinematics.forward_kinematics(target_joints)
+        ik_joints = env._kinematics.inverse_kinematics(current_joints, target_pose)
+        round_trip_pose = env._kinematics.forward_kinematics(ik_joints)
+        np.testing.assert_allclose(round_trip_pose, target_pose, atol=1e-4)
+    finally:
+        env.close()
+
+
 def test_teleop_target_lags_tcp_under_otg_then_converges():
     cfg = FR3MujocoEnvConfig(
         max_target_delta_pos=(0.01, 0.01, 0.01),

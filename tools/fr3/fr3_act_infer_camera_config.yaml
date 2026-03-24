@@ -1,0 +1,16 @@
+robot:
+  cameras:
+    left:
+      type: opencv
+      device_id: /dev/video22
+      image_shape: [480, 640]
+      fps: 30
+      fourcc: MJPG
+      backend: v4l2
+    right:
+      type: opencv
+      device_id: /dev/video20
+      image_shape: [480, 640]
+      fps: 30
+      fourcc: MJPG
+      backend: v4l2

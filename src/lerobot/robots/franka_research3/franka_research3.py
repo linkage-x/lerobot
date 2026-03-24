@@ -184,7 +184,16 @@ class FrankaResearch3(Robot):
         camera_features = {
             name: (cfg.height, cfg.width, 3) for name, cfg in self.config.cameras.items()
         }
-        return {**ee_features, **joint_features, **camera_features}
+        tactile_features: dict[str, tuple[int, int]] = {}
+        if self.config.das_tactile_valid_mask_path is not None and self.config.das_tactile_baseline_path is not None:
+            tactile_features = {
+                'observation.tactile.left_raw': (50, 10),
+                'observation.tactile.right_raw': (50, 10),
+                'observation.tactile.valid_mask': (50, 10),
+                'observation.tactile.left_clean': (50, 10),
+                'observation.tactile.right_clean': (50, 10),
+            }
+        return {**ee_features, **joint_features, **camera_features, **tactile_features}
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -210,6 +219,10 @@ class FrankaResearch3(Robot):
                 gen_con_sdk_path=self.config.gen_con_sdk_path,
                 baudrate=self.config.das_baudrate,
                 update_frequency_hz=self.config.das_update_frequency_hz,
+                tactile_frequency_hz=self.config.das_tactile_frequency_hz,
+                tactile_valid_mask_path=self.config.das_tactile_valid_mask_path,
+                tactile_baseline_path=self.config.das_tactile_baseline_path,
+                tactile_timeout_s=self.config.das_tactile_timeout_s,
                 min_distance_m=self.config.das_min_distance_m,
                 max_distance_m=self.config.das_max_distance_m,
                 grasp_threshold_m=self.config.das_grasp_threshold_m,
@@ -383,6 +396,9 @@ class FrankaResearch3(Robot):
         }
         for index, joint_position in enumerate(joint_positions_rad, start=1):
             observation[f"joint_{index}.pos"] = float(joint_position)
+        get_tactile_observation = getattr(self._gripper, 'get_tactile_observation', None)
+        if callable(get_tactile_observation):
+            observation.update(get_tactile_observation())
         for camera_name, camera in self.cameras.items():
             observation[camera_name] = camera.read_latest()
         return observation
@@ -510,6 +526,32 @@ class FrankaResearch3(Robot):
             "ee.wz": float(action["ee.wz"]),
             "gripper.pos": gripper_target,
         }
+
+    @check_if_not_connected
+    def send_joint_positions(
+        self,
+        joint_positions_rad: np.ndarray,
+        *,
+        gripper_pos: float | None = None,
+    ) -> np.ndarray:
+        self._raise_if_otg_failed()
+        target_joints_rad = np.asarray(joint_positions_rad, dtype=np.float64).reshape(-1)
+        if target_joints_rad.shape != (7,):
+            raise ValueError(f"Expected 7 joint targets, got shape {target_joints_rad.shape}.")
+        if self._otg is not None:
+            with self._otg_target_lock:
+                self._otg_target_joints = target_joints_rad.copy()
+        else:
+            if self._arm is None:
+                raise RuntimeError("Arm backend is not connected.")
+            self._arm.set_joint_positions(target_joints_rad)
+        if gripper_pos is not None:
+            self._gripper.set_position(float(np.clip(gripper_pos, 0.0, 1.0)))
+        self._hold_joint_target = None
+        self._reference_pose = None
+        self._prev_enabled = False
+        self._last_command_pose = self._compute_ee_pose(target_joints_rad)
+        return target_joints_rad.copy()
 
     @check_if_not_connected
     def disconnect(self) -> None:
