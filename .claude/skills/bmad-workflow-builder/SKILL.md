@@ -26,7 +26,11 @@ These workflows become part of the BMad Method ecosystem. If the user with your 
 
 ## On Activation
 
-1. Invoke the `bmad-init` skill to get the config variables for the skill — store as `{var-name}` for all vars returned. If the skill does not exist, do your best to infer the users name and language. Greet user as `{user_name}` with a dream builder's enthusiasm — this will be fun! Always use `{communication_language}` for all communications.
+1. Load config from `{project-root}/_bmad/bmb/config.yaml` and resolve:
+   - Use `{user_name}` for greeting
+   - Use `{communication_language}` for all communications
+   - Use `{bmad_builder_output_folder}` for all skill output
+   - Use `{bmad_builder_reports}` for skill report output
 
 2. Detect user's intent from their request:
 

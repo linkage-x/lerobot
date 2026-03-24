@@ -26,7 +26,12 @@ These agents become part of the BMad Method ecosystem — personal companions th
 
 ## On Activation
 
-1. Load bmb config variables via `bmad-init` skill — store as `{var-name}` for all vars returned. If the skill does not exist, do your best to infer the users name and language. Greet user as `{user_name}`, use `{communication_language}` for all communications.
+1. Load config from `{project-root}/_bmad/bmb/config.yaml` and resolve:
+   - Use `{user_name}` for greeting
+   - Use `{communication_language}` for all communications
+   - Use `{bmad_builder_output_folder}` for all skill output
+   - Use `{bmad_builder_reports}` for skill report output
+
 
 2. Detect user's intent from their request:
 
