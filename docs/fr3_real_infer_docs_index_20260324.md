@@ -12,9 +12,11 @@ Use this index to avoid duplicating FR3 real-robot inference knowledge across mu
    - closed conclusion for `left/right` image semantics
 4. `docs/fr3_infer_frame_alignment_findings_20260323.md`
    - closed conclusion for the original step0 mismatch investigation
-5. `docs/tactile/fr3_das_tactile_packet_investigation_20260323.md`
+5. `docs/fr3_pickplace_policy_dataset_validation_plan_20260324.md`
+   - current plan for dataset-fed policy validation to localize the remaining pick-place failure
+6. `docs/tactile/fr3_das_tactile_packet_investigation_20260323.md`
    - still-open tactile wire-format investigation
-6. `docs/fr3_replay_tracking_findings_20260319.md`
+7. `docs/fr3_replay_tracking_findings_20260319.md`
    - replay tracking evidence and branch-instability analysis
 
 ## Documentation Rules
@@ -26,5 +28,6 @@ Use this index to avoid duplicating FR3 real-robot inference knowledge across mu
 
 ## Current Open Threads
 
+- pick-place still does not complete on hardware; next step is dataset-fed policy validation
 - tactile `448-byte` payload to dataset `left_raw/right_raw` mapping
 - long-rollout runtime robustness and operator safety gates
