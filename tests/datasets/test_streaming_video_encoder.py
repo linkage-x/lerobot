@@ -31,8 +31,11 @@ from lerobot.datasets.video_utils import (
     StreamingVideoEncoder,
     _CameraEncoderThread,
     _get_codec_options,
+    decode_video_frames,
+    decode_video_frames_torchvision,
     decode_video_frames_torchcodec,
     detect_available_hw_encoders,
+    get_safe_default_codec,
     resolve_vcodec,
 )
 from lerobot.utils.constants import OBS_IMAGES
@@ -134,6 +137,16 @@ class TestHWEncoderDetection:
         with pytest.raises(ValueError, match="Invalid vcodec"):
             resolve_vcodec("not_a_real_codec")
 
+    def test_get_safe_default_codec_falls_back_when_torchcodec_cannot_initialize(self):
+        with (
+            patch("lerobot.datasets.video_utils.importlib.util.find_spec", return_value=object()),
+            patch(
+                "lerobot.datasets.video_utils._load_torchcodec_video_decoder",
+                side_effect=RuntimeError("Could not load libtorchcodec"),
+            ),
+        ):
+            assert get_safe_default_codec() == "pyav"
+
 
 class TestTorchcodecDecode:
     def test_clamps_frame_index_to_last_valid_frame(self, tmp_path):
@@ -164,6 +177,90 @@ class TestTorchcodecDecode:
         )
 
         assert requested_indices == [99]
+        assert frames.shape == (1, 3, 4, 4)
+        assert frames.dtype == torch.float32
+
+    def test_decode_video_frames_falls_back_to_pyav_when_torchcodec_runtime_is_unavailable(self, tmp_path):
+        timestamps = [0.1]
+        expected = torch.zeros((1, 3, 4, 4), dtype=torch.float32)
+
+        with (
+            patch(
+                "lerobot.datasets.video_utils.decode_video_frames_torchcodec",
+                side_effect=RuntimeError("Could not load libtorchcodec"),
+            ) as torchcodec_decode,
+            patch(
+                "lerobot.datasets.video_utils.decode_video_frames_torchvision",
+                return_value=expected,
+            ) as torchvision_decode,
+        ):
+            result = decode_video_frames(
+                tmp_path / "dummy.mp4",
+                timestamps=timestamps,
+                tolerance_s=1e-3,
+                backend="torchcodec",
+            )
+
+        assert torch.equal(result, expected)
+        torchcodec_decode.assert_called_once()
+        torchvision_decode.assert_called_once_with(tmp_path / "dummy.mp4", timestamps, 1e-3, "pyav")
+
+    def test_decode_video_frames_torchcodec_accepts_timestamp_exactly_on_tolerance_boundary(self, tmp_path):
+        class FakeDecoder:
+            metadata = SimpleNamespace(average_fps=30)
+
+            def __len__(self):
+                return 100
+
+            def get_frames_at(self, indices):
+                return SimpleNamespace(
+                    data=[torch.zeros((3, 4, 4), dtype=torch.uint8)],
+                    pts_seconds=[torch.tensor(3.2)],
+                )
+
+        class FakeDecoderCache:
+            def get_decoder(self, _):
+                return FakeDecoder()
+
+        frames = decode_video_frames_torchcodec(
+            tmp_path / "dummy.mp4",
+            timestamps=[3.2001],
+            tolerance_s=1e-4,
+            decoder_cache=FakeDecoderCache(),
+        )
+
+        assert frames.shape == (1, 3, 4, 4)
+        assert frames.dtype == torch.float32
+
+
+class TestTorchvisionDecode:
+    def test_decode_video_frames_torchvision_accepts_timestamp_exactly_on_tolerance_boundary(self, tmp_path):
+        class FakeReader:
+            def __init__(self):
+                self.seek_calls = []
+                self.container = SimpleNamespace(close=lambda: None)
+
+            def seek(self, ts, keyframes_only=False):
+                self.seek_calls.append((ts, keyframes_only))
+
+            def __iter__(self):
+                yield {"pts": 3.2, "data": torch.zeros((3, 4, 4), dtype=torch.uint8)}
+
+        reader = FakeReader()
+
+        with (
+            patch("lerobot.datasets.video_utils.torchvision.set_video_backend") as set_backend,
+            patch("lerobot.datasets.video_utils.torchvision.io.VideoReader", return_value=reader),
+        ):
+            frames = decode_video_frames_torchvision(
+                tmp_path / "dummy.mp4",
+                timestamps=[3.2001],
+                tolerance_s=1e-4,
+                backend="pyav",
+            )
+
+        set_backend.assert_called_once_with("pyav")
+        assert reader.seek_calls == [(3.2001, True)]
         assert frames.shape == (1, 3, 4, 4)
         assert frames.dtype == torch.float32
 

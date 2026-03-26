@@ -121,14 +121,62 @@ def resolve_vcodec(vcodec: str) -> str:
     return "libsvtav1"
 
 
+def _summarize_exception(exc: Exception) -> str:
+    message = str(exc).strip()
+    if not message:
+        return exc.__class__.__name__
+    return message.splitlines()[0]
+
+
+def _load_torchcodec_video_decoder():
+    from torchcodec.decoders import VideoDecoder
+
+    return VideoDecoder
+
+
+def is_torchcodec_usable(log_failure: bool = True) -> bool:
+    if importlib.util.find_spec("torchcodec") is None:
+        return False
+
+    try:
+        _load_torchcodec_video_decoder()
+    except Exception as exc:  # nosec B110
+        if log_failure:
+            logging.warning(
+                "torchcodec is installed but unavailable at runtime (%s); falling back to 'pyav'.",
+                _summarize_exception(exc),
+            )
+        return False
+
+    return True
+
+
 def get_safe_default_codec():
-    if importlib.util.find_spec("torchcodec"):
-        return "torchcodec"
-    else:
-        logging.warning(
-            "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
-        )
+    if importlib.util.find_spec("torchcodec") is None:
+        logging.warning("'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder")
         return "pyav"
+    if is_torchcodec_usable():
+        return "torchcodec"
+    return "pyav"
+
+
+def _should_fallback_to_torchvision(exc: Exception) -> bool:
+    if isinstance(exc, (ImportError, OSError)):
+        return True
+    if isinstance(exc, RuntimeError):
+        message = str(exc).lower()
+        return "torchcodec" in message or "libav" in message
+    return False
+
+
+def _find_closest_timestamp_matches(
+    timestamps: list[float],
+    loaded_timestamps: list[float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    query_ts = torch.as_tensor(timestamps, dtype=torch.float64)
+    loaded_ts = torch.as_tensor(loaded_timestamps, dtype=torch.float64)
+    dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
+    return query_ts, loaded_ts, dist.min(1)
 
 
 def decode_video_frames(
@@ -154,7 +202,17 @@ def decode_video_frames(
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":
-        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
+        try:
+            return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
+        except Exception as exc:
+            if not _should_fallback_to_torchvision(exc):
+                raise
+            logging.warning(
+                "Falling back from 'torchcodec' to 'pyav' for %s (%s).",
+                video_path,
+                _summarize_exception(exc),
+            )
+            return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, "pyav")
     elif backend in ["pyav", "video_reader"]:
         return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
     else:
@@ -226,14 +284,8 @@ def decode_video_frames_torchvision(
 
     reader = None
 
-    query_ts = torch.tensor(timestamps)
-    loaded_ts = torch.tensor(loaded_ts)
-
-    # compute distances between each query timestamp and timestamps of all loaded frames
-    dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
-    min_, argmin_ = dist.min(1)
-
-    is_within_tol = min_ < tolerance_s
+    query_ts, loaded_ts, (min_, argmin_) = _find_closest_timestamp_matches(timestamps, loaded_ts)
+    is_within_tol = min_ <= tolerance_s
     if not is_within_tol.all():
         raise FrameTimestampError(
             f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
@@ -274,7 +326,7 @@ class VideoDecoderCache:
     def get_decoder(self, video_path: str):
         """Get a cached decoder or create a new one."""
         if importlib.util.find_spec("torchcodec"):
-            from torchcodec.decoders import VideoDecoder
+            VideoDecoder = _load_torchcodec_video_decoder()
         else:
             raise ImportError("torchcodec is required but not available.")
 
@@ -359,14 +411,8 @@ def decode_video_frames_torchcodec(
         if log_loaded_timestamps:
             logging.info(f"Frame loaded at timestamp={pts:.4f}")
 
-    query_ts = torch.tensor(timestamps)
-    loaded_ts = torch.tensor(loaded_ts)
-
-    # compute distances between each query timestamp and loaded timestamps
-    dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
-    min_, argmin_ = dist.min(1)
-
-    is_within_tol = min_ < tolerance_s
+    query_ts, loaded_ts, (min_, argmin_) = _find_closest_timestamp_matches(timestamps, loaded_ts)
+    is_within_tol = min_ <= tolerance_s
     if not is_within_tol.all():
         raise FrameTimestampError(
             f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."

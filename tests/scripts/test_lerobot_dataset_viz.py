@@ -10,11 +10,14 @@ import torch
 
 from lerobot.scripts.lerobot_dataset_viz import (
     EE_RULER_AXIS_COLORS,
+    build_public_rerun_connect_url,
+    build_public_rerun_web_viewer_url,
     build_episode_process_visualize_kwargs,
     build_episode_switch_visualize_kwargs,
     build_ee_axis_ruler_strips,
     create_episode_process,
     extract_ee_pose,
+    format_host_for_url,
     get_ee_pose_state_indices,
     get_next_episode_index,
     has_ee_pose,
@@ -192,12 +195,54 @@ def test_should_enable_episode_switch_only_for_distant_streaming():
     assert not should_enable_episode_switch("distant", True)
 
 
+def test_format_host_for_url_wraps_ipv6_but_leaves_ipv4_and_hostname_unchanged():
+    assert format_host_for_url("192.168.1.200") == "192.168.1.200"
+    assert format_host_for_url("robot-host") == "robot-host"
+    assert format_host_for_url("2001:db8::1") == "[2001:db8::1]"
+
+
+def test_build_public_rerun_connect_url_uses_public_host_when_provided():
+    assert (
+        build_public_rerun_connect_url(
+            grpc_port=19874,
+            server_uri="rerun+http://127.0.0.1:19874/proxy",
+            public_host="192.168.1.200",
+        )
+        == "rerun+http://192.168.1.200:19874/proxy"
+    )
+
+
+def test_build_public_rerun_connect_url_keeps_server_uri_when_public_host_is_missing():
+    server_uri = "rerun+http://127.0.0.1:19874/proxy"
+
+    assert (
+        build_public_rerun_connect_url(
+            grpc_port=19874,
+            server_uri=server_uri,
+            public_host=None,
+        )
+        == server_uri
+    )
+
+
+def test_build_public_rerun_web_viewer_url_embeds_encoded_connect_url():
+    assert (
+        build_public_rerun_web_viewer_url(
+            web_port=9092,
+            connect_url="rerun+http://192.168.1.200:19874/proxy",
+            public_host="192.168.1.200",
+        )
+        == "http://192.168.1.200:9092?url=rerun%2Bhttp%3A%2F%2F192.168.1.200%3A19874%2Fproxy"
+    )
+
+
 def test_build_episode_switch_visualize_kwargs_reuses_cleaned_cli_kwargs():
     cli_kwargs = {
         "episode_index": 0,
         "batch_size": 32,
         "mode": "distant",
         "grpc_port": 9876,
+        "public_host": "192.168.1.200",
         "ws_port": None,
     }
 
@@ -207,6 +252,7 @@ def test_build_episode_switch_visualize_kwargs_reuses_cleaned_cli_kwargs():
     assert visualize_kwargs["batch_size"] == 32
     assert visualize_kwargs["mode"] == "distant"
     assert visualize_kwargs["grpc_port"] == 9876
+    assert visualize_kwargs["public_host"] == "192.168.1.200"
 
 
 def test_build_episode_process_visualize_kwargs_adds_unique_recording_id():

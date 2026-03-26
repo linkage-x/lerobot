@@ -89,6 +89,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 import tty
+from urllib.parse import quote
 from uuid import uuid4
 
 import numpy as np
@@ -282,6 +283,32 @@ def log_ee_ruler(length: float) -> None:
 
 def should_enable_episode_switch(mode: str, save: bool) -> bool:
     return mode == "distant" and not save
+
+
+def format_host_for_url(host: str) -> str:
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
+def build_public_rerun_connect_url(
+    *,
+    grpc_port: int,
+    server_uri: str,
+    public_host: str | None = None,
+) -> str:
+    if public_host is None:
+        return server_uri
+    return f"rerun+http://{format_host_for_url(public_host)}:{grpc_port}/proxy"
+
+
+def build_public_rerun_web_viewer_url(
+    *,
+    web_port: int,
+    connect_url: str,
+    public_host: str,
+) -> str:
+    return f"http://{format_host_for_url(public_host)}:{web_port}?url={quote(connect_url, safe='')}"
 
 
 def build_episode_switch_visualize_kwargs(cli_kwargs: dict) -> dict:
@@ -523,6 +550,7 @@ def visualize_dataset(
     mode: str = "local",
     web_port: int = 9090,
     grpc_port: int = 9876,
+    public_host: str | None = None,
     save: bool = False,
     output_dir: Path | None = None,
     display_compressed_images: bool = False,
@@ -561,7 +589,23 @@ def visualize_dataset(
     if mode == "distant":
         server_uri = rr.serve_grpc(grpc_port=grpc_port)
         logging.info(f"Connect to a Rerun Server: rerun rerun+http://IP:{grpc_port}/proxy")
-        rr.serve_web_viewer(open_browser=False, web_port=web_port, connect_to=server_uri)
+        viewer_connect_uri = build_public_rerun_connect_url(
+            grpc_port=grpc_port,
+            server_uri=server_uri,
+            public_host=public_host,
+        )
+        if viewer_connect_uri != server_uri:
+            logging.info("Using public rerun connect URL: %s", viewer_connect_uri)
+        rr.serve_web_viewer(open_browser=False, web_port=web_port)
+        if public_host is not None:
+            logging.info(
+                "Open remote web viewer: %s",
+                build_public_rerun_web_viewer_url(
+                    web_port=web_port,
+                    connect_url=viewer_connect_uri,
+                    public_host=public_host,
+                ),
+            )
 
     logging.info("Logging to Rerun")
     logging.info("World frame convention: +X forward, +Y left, +Z up (URDF base/world frame).")
@@ -708,6 +752,17 @@ def main():
         type=int,
         default=9876,
         help="gRPC port for rerun.io when `--mode distant` is set.",
+    )
+    parser.add_argument(
+        "--public-host",
+        type=str,
+        default=None,
+        help=(
+            "Optional public hostname or IP advertised to the remote web viewer. "
+            "Use this in `--mode distant` when the browser cannot reach the host through 127.0.0.1. "
+            "The script will print a full browser URL with `?url=...` for the remote web viewer. "
+            "Example: `--public-host 192.168.1.200`."
+        ),
     )
     parser.add_argument(
         "--control-host",
