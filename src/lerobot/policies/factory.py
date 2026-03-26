@@ -52,6 +52,7 @@ from lerobot.processor.converters import (
 )
 from lerobot.utils.constants import (
     ACTION,
+    OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
@@ -469,6 +470,8 @@ def make_policy(
     cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     if not cfg.input_features:
         cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
+    if ds_meta is not None and hasattr(cfg, "state_feature_names") and getattr(cfg, "state_feature_names") is None:
+        setattr(cfg, "state_feature_names", ds_meta.features.get(OBS_STATE, {}).get("names"))
     kwargs["config"] = cfg
 
     # Pass dataset_stats to the policy if available (needed for some policies like SARM)

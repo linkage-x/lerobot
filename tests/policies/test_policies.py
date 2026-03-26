@@ -81,6 +81,38 @@ def dummy_dataset_metadata(lerobot_dataset_metadata_factory, info_factory, tmp_p
     return ds_meta
 
 
+@pytest.fixture
+def dummy_mask2ee_dataset_metadata(lerobot_dataset_metadata_factory, info_factory, tmp_path):
+    camera_features = {
+        f"{OBS_IMAGES}.wrist": {
+            "shape": (84, 84, 3),
+            "names": ["height", "width", "channels"],
+            "info": None,
+        },
+    }
+    motor_features = {
+        ACTION: {
+            "dtype": "float32",
+            "shape": (8,),
+            "names": ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper"],
+        },
+        OBS_STATE: {
+            "dtype": "float32",
+            "shape": (8,),
+            "names": ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper"],
+        },
+    }
+    info = info_factory(
+        total_episodes=1,
+        total_frames=1,
+        total_tasks=1,
+        camera_features=camera_features,
+        motor_features=motor_features,
+    )
+    ds_meta = lerobot_dataset_metadata_factory(root=tmp_path / "mask2ee", info=info)
+    return ds_meta
+
+
 @pytest.mark.parametrize("policy_name", available_policies)
 def test_get_policy_and_config_classes(policy_name: str):
     """Check that the correct policy and config classes are returned."""
@@ -261,6 +293,16 @@ def test_policy_defaults(dummy_dataset_metadata, policy_name: str):
         key: ft for key, ft in features.items() if key not in policy_cfg.output_features
     }
     policy_cls(policy_cfg)
+
+
+def test_make_policy_injects_state_feature_names_for_act_mask2ee(dummy_mask2ee_dataset_metadata):
+    cfg = ACTConfig(mask_ee_pose_in_state=True)
+    cfg.device = "cpu"
+
+    policy = make_policy(cfg, ds_meta=dummy_mask2ee_dataset_metadata)
+
+    assert policy.config.state_feature_names == ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper"]
+    assert list(policy.masked_robot_state_indices) == [0, 1, 2, 3, 4, 5, 6]
 
 
 @pytest.mark.parametrize("policy_name", available_policies)

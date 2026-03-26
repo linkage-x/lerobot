@@ -56,6 +56,16 @@ runtime 当前按下列语义构造 `observation.state`：
 
 这一步是当前版本最重要的修复点。此前 preview 和 real-run 不一致，根因不是主坐标链，而是 live gripper observation 与 dataset gripper 单位不一致。
 
+如果 checkpoint 来自 `mask2ee` 训练：
+
+- runtime 不需要额外 CLI 开关
+- 推理会跟随 checkpoint 中保存的 policy config 自动继续 mask 掉 `x y z qx qy qz qw`
+- `gripper` 仍然保留
+
+详细合同见：
+
+- `docs/fr3_mask2ee_training_inference_contract_20260326.md`
+
 ### 图像输入
 
 当前图像语义已确认正确：
@@ -147,7 +157,8 @@ python3 tools/fr3/fr3_act_infer_real.py \
 
 1. 本文：运行入口与当前合同
 2. `docs/fr3_real_infer_docs_index_20260324.md`：文档职责索引
-3. `docs/fr3_act_infer_runtime_fix_20260324.md`：本轮修复记录
-4. `docs/fr3_infer_image_semantics_validation_20260323.md`：图像链路结论
-5. `docs/tactile/fr3_das_tactile_packet_investigation_20260323.md`：tactile open issue
-6. `docs/fr3_replay_tracking_findings_20260319.md`：replay 侧追踪问题
+3. `docs/fr3_mask2ee_training_inference_contract_20260326.md`：mask2ee 训练/推理合同
+4. `docs/fr3_act_infer_runtime_fix_20260324.md`：本轮修复记录
+5. `docs/fr3_infer_image_semantics_validation_20260323.md`：图像链路结论
+6. `docs/tactile/fr3_das_tactile_packet_investigation_20260323.md`：tactile open issue
+7. `docs/fr3_replay_tracking_findings_20260319.md`：replay 侧追踪问题

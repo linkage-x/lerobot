@@ -62,6 +62,7 @@ class ACTPolicy(PreTrainedPolicy):
         self.config = config
 
         self.model = ACT(config)
+        self.masked_robot_state_indices = tuple(config.masked_robot_state_indices)
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
@@ -125,6 +126,7 @@ class ACTPolicy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
+        batch = self._mask_robot_state_features(batch)
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
@@ -135,6 +137,7 @@ class ACTPolicy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
+        batch = self._mask_robot_state_features(batch)
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
@@ -160,6 +163,16 @@ class ACTPolicy(PreTrainedPolicy):
             loss = l1_loss
 
         return loss, loss_dict
+
+    def _mask_robot_state_features(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        if not self.masked_robot_state_indices or OBS_STATE not in batch:
+            return batch
+
+        masked_batch = dict(batch)
+        masked_state = batch[OBS_STATE].clone()
+        masked_state[..., list(self.masked_robot_state_indices)] = 0
+        masked_batch[OBS_STATE] = masked_state
+        return masked_batch
 
 
 class ACTTemporalEnsembler:

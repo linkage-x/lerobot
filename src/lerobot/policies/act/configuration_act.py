@@ -14,10 +14,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass, field
+from typing import Any
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
+
+EE_STATE_NAME_ALIASES = {
+    "ee.x": ("ee.x", "x"),
+    "ee.y": ("ee.y", "y"),
+    "ee.z": ("ee.z", "z"),
+    "ee.qx": ("ee.qx", "qx"),
+    "ee.qy": ("ee.qy", "qy"),
+    "ee.qz": ("ee.qz", "qz"),
+    "ee.qw": ("ee.qw", "qw"),
+}
+
+
+def flatten_feature_name_paths(
+    feature_names: list[str] | tuple[str, ...] | dict[str, Any] | None,
+    prefix: str = "",
+) -> list[str] | None:
+    if feature_names is None:
+        return None
+    if isinstance(feature_names, (list, tuple)):
+        return [f"{prefix}/{name}" if prefix else str(name) for name in feature_names]
+    if isinstance(feature_names, dict):
+        flattened = []
+        for key, value in feature_names.items():
+            child_prefix = f"{prefix}/{key}" if prefix else str(key)
+            child_paths = flatten_feature_name_paths(value, child_prefix)
+            if child_paths is not None:
+                flattened.extend(child_paths)
+        return flattened
+    raise TypeError(f"Unsupported feature names structure: {type(feature_names)!r}")
 
 
 @PreTrainedConfig.register_subclass("act")
@@ -104,6 +134,8 @@ class ACTConfig(PreTrainedConfig):
     tactile_encoder_residual_blocks: int = 0
     tactile_encoder_use_se: bool = False
     tactile_transformer_layers: int = 0
+    mask_ee_pose_in_state: bool = False
+    state_feature_names: list[str] | dict[str, Any] | None = None
     # Vision backbone.
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
@@ -247,3 +279,36 @@ class ACTConfig(PreTrainedConfig):
         if not self.input_features or not self.tactile_valid_mask_feature_key:
             return None
         return self.input_features.get(self.tactile_valid_mask_feature_key)
+
+    @property
+    def masked_robot_state_indices(self) -> list[int]:
+        if not self.mask_ee_pose_in_state:
+            return []
+        flattened_names = flatten_feature_name_paths(self.state_feature_names)
+        if flattened_names is None:
+            raise ValueError(
+                "`mask_ee_pose_in_state=true` requires `state_feature_names` to resolve EE pose indices."
+            )
+
+        aliases = {}
+        for idx, name in enumerate(flattened_names):
+            aliases[name] = idx
+            aliases[name.split("/")[-1]] = idx
+
+        indices = []
+        missing = []
+        for canonical_name, candidate_aliases in EE_STATE_NAME_ALIASES.items():
+            for alias in candidate_aliases:
+                if alias in aliases:
+                    indices.append(aliases[alias])
+                    break
+            else:
+                missing.append(canonical_name)
+
+        if missing:
+            raise ValueError(
+                "`mask_ee_pose_in_state=true` could not resolve the following EE pose state features: "
+                f"{missing}. Available state features: {flattened_names}"
+            )
+
+        return sorted(set(indices))
