@@ -12,19 +12,24 @@ from lerobot.scripts.lerobot_dataset_viz import (
     EE_RULER_AXIS_COLORS,
     build_public_rerun_connect_url,
     build_public_rerun_web_viewer_url,
+    build_scalar_entity_paths,
     build_episode_process_visualize_kwargs,
     build_episode_switch_visualize_kwargs,
     build_ee_axis_ruler_strips,
     create_episode_process,
     extract_ee_pose,
+    flatten_feature_name_paths,
     format_host_for_url,
     get_ee_pose_state_indices,
     get_next_episode_index,
+    get_auto_visualization_keys,
     has_ee_pose,
     is_tcp_port_available,
+    log_feature_value,
     make_system_time_anchor,
     run_episode_switch_loop,
     should_enable_episode_switch,
+    tensor_to_rerun_image_numpy,
     to_system_timestamp,
     wait_for_tcp_port_available,
 )
@@ -84,6 +89,85 @@ def test_get_ee_pose_state_indices_from_packed_observation_state():
     indices = get_ee_pose_state_indices(
         ["ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw", "gripper.pos"]
     )
+
+    assert indices == {
+        "ee.x": 0,
+        "ee.y": 1,
+        "ee.z": 2,
+        "ee.qx": 3,
+        "ee.qy": 4,
+        "ee.qz": 5,
+        "ee.qw": 6,
+    }
+
+
+def test_flatten_feature_name_paths_supports_grouped_feature_metadata():
+    assert flatten_feature_name_paths({"motors": ["x", "y"], "other": ["gripper"]}) == [
+        "motors/x",
+        "motors/y",
+        "other/gripper",
+    ]
+
+
+def test_build_scalar_entity_paths_uses_feature_names_when_width_matches():
+    assert build_scalar_entity_paths("state", {"motors": ["x", "y", "gripper"]}, 3) == [
+        "state/motors/x",
+        "state/motors/y",
+        "state/motors/gripper",
+    ]
+
+
+def test_build_scalar_entity_paths_falls_back_to_indices_when_width_mismatches():
+    assert build_scalar_entity_paths("state", {"motors": ["x", "y"]}, 3) == [
+        "state/0",
+        "state/1",
+        "state/2",
+    ]
+
+
+def test_tensor_to_rerun_image_numpy_converts_bool_masks_to_uint8():
+    image = tensor_to_rerun_image_numpy(torch.tensor([[True, False], [False, True]], dtype=torch.bool))
+
+    assert image.dtype == np.uint8
+    assert np.array_equal(image, np.array([[255, 0], [0, 255]], dtype=np.uint8))
+
+
+def test_get_auto_visualization_keys_keeps_unhandled_numeric_observations():
+    batch = {
+        "observation.images.left": torch.zeros(1, 3, 4, 4),
+        "observation.state": torch.zeros(1, 8),
+        "action": torch.zeros(1, 8),
+        "observation.tactile.left_raw": torch.zeros(1, 50, 10),
+        "observation.tactile.valid_mask": torch.zeros(1, 50, 10, dtype=torch.bool),
+        "timestamp": torch.zeros(1),
+        "index": torch.zeros(1, dtype=torch.int64),
+    }
+
+    assert get_auto_visualization_keys(batch, camera_keys=["observation.images.left"]) == [
+        "observation.tactile.left_raw",
+        "observation.tactile.valid_mask",
+    ]
+
+
+def test_log_feature_value_logs_matrix_as_image(monkeypatch):
+    logged = []
+
+    monkeypatch.setattr("lerobot.scripts.lerobot_dataset_viz.rr.log", lambda *args, **kwargs: logged.append((args, kwargs)))
+
+    log_feature_value(
+        "observation.tactile.left_raw",
+        torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        feature_names=None,
+        display_compressed_images=False,
+    )
+
+    assert len(logged) == 1
+    assert logged[0][0][0] == "observation.tactile.left_raw"
+    assert logged[0][1]["entity"].__class__.__name__ == "Image"
+
+
+def test_get_ee_pose_state_indices_supports_grouped_bare_xyz_quaternion_names():
+    indices = get_ee_pose_state_indices({"motors": ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper"]})
 
     assert indices == {
         "ee.x": 0,

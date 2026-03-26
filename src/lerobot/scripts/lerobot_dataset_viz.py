@@ -113,6 +113,8 @@ EE_RULER_AXIS_COLORS = {
 }
 
 QUIT_COMMANDS = {"q", "\x03", "\x04"}
+MANUALLY_LOGGED_KEYS = {ACTION, OBS_STATE, DONE, REWARD, "next.success"}
+AUTO_VIZ_EXCLUDED_KEYS = {"episode_index", "frame_index", "index", "task_index", "timestamp"}
 
 
 def to_hwc_uint8_numpy(chw_float32_torch: torch.Tensor) -> np.ndarray:
@@ -124,14 +126,125 @@ def to_hwc_uint8_numpy(chw_float32_torch: torch.Tensor) -> np.ndarray:
     return hwc_uint8_numpy
 
 
-def get_ee_pose_state_indices(state_feature_names: list[str] | tuple[str, ...] | None) -> dict[str, int] | None:
-    if state_feature_names is None:
+def tensor_to_rerun_image_numpy(value: torch.Tensor) -> np.ndarray | None:
+    if value.ndim == 2:
+        image = value.detach().cpu().numpy()
+        if image.dtype == np.bool_:
+            return image.astype(np.uint8) * 255
+        return image
+
+    if value.ndim == 3 and value.shape[0] in (1, 3, 4) and value.shape[-1] not in (1, 3, 4):
+        if value.dtype == torch.bool:
+            image = value.detach().cpu().to(torch.uint8).mul(255).permute(1, 2, 0).numpy()
+        elif value.dtype == torch.float32 and value.min().item() >= 0.0 and value.max().item() <= 1.0:
+            image = to_hwc_uint8_numpy(value)
+        else:
+            image = value.detach().cpu().permute(1, 2, 0).numpy()
+        if image.ndim == 3 and image.shape[-1] == 1:
+            return image[..., 0]
+        return image
+
+    return None
+
+
+def flatten_feature_name_paths(
+    feature_names: list[str] | tuple[str, ...] | dict[str, list[str] | dict] | None,
+    prefix: str = "",
+) -> list[str] | None:
+    if feature_names is None:
         return None
-    state_name_to_index = {name: idx for idx, name in enumerate(state_feature_names)}
-    required_keys = (*EE_POSITION_KEYS, *EE_QUAT_KEYS)
-    if not all(key in state_name_to_index for key in required_keys):
+    if isinstance(feature_names, (list, tuple)):
+        return [f"{prefix}/{name}" if prefix else str(name) for name in feature_names]
+    if isinstance(feature_names, dict):
+        flattened = []
+        for key, value in feature_names.items():
+            child_prefix = f"{prefix}/{key}" if prefix else str(key)
+            child_paths = flatten_feature_name_paths(value, child_prefix)
+            if child_paths is not None:
+                flattened.extend(child_paths)
+        return flattened
+    raise TypeError(f"Unsupported feature names structure: {type(feature_names)!r}")
+
+
+def build_scalar_entity_paths(
+    root: str,
+    feature_names: list[str] | tuple[str, ...] | dict[str, list[str] | dict] | None,
+    width: int,
+) -> list[str]:
+    flattened_names = flatten_feature_name_paths(feature_names)
+    if flattened_names is None or len(flattened_names) != width:
+        return [f"{root}/{dim_idx}" for dim_idx in range(width)]
+    return [f"{root}/{name}" for name in flattened_names]
+
+
+def get_auto_visualization_keys(batch: dict, camera_keys: list[str] | tuple[str, ...]) -> list[str]:
+    excluded_keys = set(camera_keys) | MANUALLY_LOGGED_KEYS | AUTO_VIZ_EXCLUDED_KEYS
+    return [
+        key
+        for key in batch
+        if key not in excluded_keys and not key.endswith("_is_pad") and not isinstance(batch[key], str | bytes)
+    ]
+
+
+def log_feature_value(
+    key: str,
+    value: torch.Tensor,
+    feature_names: list[str] | tuple[str, ...] | dict[str, list[str] | dict] | None,
+    display_compressed_images: bool,
+) -> None:
+    if not isinstance(value, torch.Tensor):
+        return
+
+    if value.ndim == 0:
+        rr.log(key, rr.Scalars(value.item()))
+        return
+
+    if value.ndim == 1:
+        entity_paths = build_scalar_entity_paths(key, feature_names, len(value))
+        for entity_path, val in zip(entity_paths, value, strict=True):
+            rr.log(entity_path, rr.Scalars(val.item()))
+        return
+
+    image = tensor_to_rerun_image_numpy(value)
+    if image is not None:
+        entity = rr.Image(image)
+        if display_compressed_images and image.dtype == np.uint8:
+            entity = entity.compress()
+        rr.log(key, entity=entity)
+        return
+
+    rr.log(key, rr.Tensor(value.detach().cpu().numpy()))
+
+
+def get_ee_pose_state_indices(
+    state_feature_names: list[str] | tuple[str, ...] | dict[str, list[str] | dict] | None,
+) -> dict[str, int] | None:
+    flattened_names = flatten_feature_name_paths(state_feature_names)
+    if flattened_names is None:
         return None
-    return {key: state_name_to_index[key] for key in required_keys}
+    aliases = {}
+    for idx, name in enumerate(flattened_names):
+        aliases[name] = idx
+        aliases[name.split("/")[-1]] = idx
+
+    required_aliases = {
+        "ee.x": ("ee.x", "x"),
+        "ee.y": ("ee.y", "y"),
+        "ee.z": ("ee.z", "z"),
+        "ee.qx": ("ee.qx", "qx"),
+        "ee.qy": ("ee.qy", "qy"),
+        "ee.qz": ("ee.qz", "qz"),
+        "ee.qw": ("ee.qw", "qw"),
+    }
+    indices = {}
+    for canonical_name, candidate_aliases in required_aliases.items():
+        for alias in candidate_aliases:
+            if alias in aliases:
+                indices[canonical_name] = aliases[alias]
+                break
+        else:
+            return None
+    return indices
 
 
 def has_ee_pose(batch: dict, ee_pose_state_indices: dict[str, int] | None = None) -> bool:
@@ -614,7 +727,20 @@ def visualize_dataset(
     first_index = None
     system_time_anchor = None
     ee_trajectory_positions: list[np.ndarray] = []
-    ee_pose_state_indices = get_ee_pose_state_indices(dataset.meta.features.get(OBS_STATE, {}).get("names"))
+    state_feature_names = dataset.meta.features.get(OBS_STATE, {}).get("names")
+    action_feature_names = dataset.meta.features.get(ACTION, {}).get("names")
+    ee_pose_state_indices = get_ee_pose_state_indices(state_feature_names)
+    state_name_paths = flatten_feature_name_paths(state_feature_names)
+    action_name_paths = flatten_feature_name_paths(action_feature_names)
+    action_root = ACTION
+    if state_name_paths is not None and action_name_paths == state_name_paths:
+        action_root = "action_target"
+        logging.info(
+            "Action and observation.state share identical feature names; logging actions under '%s/'.",
+            action_root,
+        )
+    action_entity_paths = None
+    state_entity_paths = None
     for batch in tqdm.tqdm(dataloader, total=len(dataloader)):
         if first_index is None:
             first_index = batch["index"][0].item()
@@ -636,13 +762,17 @@ def visualize_dataset(
 
             # display each dimension of action space (e.g. actuators command)
             if ACTION in batch:
-                for dim_idx, val in enumerate(batch[ACTION][i]):
-                    rr.log(f"{ACTION}/{dim_idx}", rr.Scalars(val.item()))
+                if action_entity_paths is None:
+                    action_entity_paths = build_scalar_entity_paths(action_root, action_feature_names, len(batch[ACTION][i]))
+                for entity_path, val in zip(action_entity_paths, batch[ACTION][i], strict=True):
+                    rr.log(entity_path, rr.Scalars(val.item()))
 
             # display each dimension of observed state space (e.g. agent position in joint space)
             if OBS_STATE in batch:
-                for dim_idx, val in enumerate(batch[OBS_STATE][i]):
-                    rr.log(f"state/{dim_idx}", rr.Scalars(val.item()))
+                if state_entity_paths is None:
+                    state_entity_paths = build_scalar_entity_paths("state", state_feature_names, len(batch[OBS_STATE][i]))
+                for entity_path, val in zip(state_entity_paths, batch[OBS_STATE][i], strict=True):
+                    rr.log(entity_path, rr.Scalars(val.item()))
 
             if DONE in batch:
                 rr.log(DONE, rr.Scalars(batch[DONE][i].item()))
@@ -652,6 +782,10 @@ def visualize_dataset(
 
             if "next.success" in batch:
                 rr.log("next.success", rr.Scalars(batch["next.success"][i].item()))
+
+            for key in get_auto_visualization_keys(batch, dataset.meta.camera_keys):
+                feature_names = dataset.meta.features.get(key, {}).get("names")
+                log_feature_value(key, batch[key][i], feature_names, display_compressed_images)
 
             if has_ee_pose(batch, ee_pose_state_indices=ee_pose_state_indices):
                 log_ee_pose_3d(
