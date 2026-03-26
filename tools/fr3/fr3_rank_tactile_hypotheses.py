@@ -2,8 +2,8 @@
 """Capture multiple DAS tactile frames and rank reconstruction hypotheses.
 
 This script samples a sequence of raw 448-byte tactile payloads from the DAS serial link,
-reconstructs each frame under three hypotheses, and ranks the hypotheses against historical
-sequence statistics from docs/tactile/baseline.json.
+reconstructs each frame under three hypotheses, and ranks the hypotheses against stored
+tactile profile statistics plus an idle baseline frame.
 """
 
 from __future__ import annotations
@@ -17,33 +17,61 @@ from statistics import mean, median
 
 import numpy as np
 
-from fr3_capture_tactile_frame import (
-    _DEFAULT_BAUDRATE,
-    _DEFAULT_ENCODER_FREQ,
-    _DEFAULT_MASK_PATH,
-    _DEFAULT_SCALE,
-    _DEFAULT_TACTILE_FREQ,
-    _DEFAULT_TIMEOUT_S,
-    _DEFAULT_TTY_PORT,
-    _COMPRESSED_SIDE_VALID_COUNT,
-    _EXPECTED_VALID_COUNT,
-    _build_horizontal_mirror_pairs,
-    _decode_direct_spatial_split_expand,
-    _build_row_major_pairs,
-    _build_vertical_priority_pairs,
-    _compute_baseline_abs_diff_stats,
-    _expand_pair_values_to_dense,
-    _load_baseline_side,
-    _load_mask,
-    _pairwise_reduce_adjacent_bytes,
-    _require_sdk_databus_cls,
-    _resolve_path,
-    _save_pngs,
-    _scatter_row_major,
-)
+try:
+    from tools.fr3.fr3_capture_tactile_frame import (
+        _DEFAULT_BAUDRATE,
+        _DEFAULT_BASELINE_PATH,
+        _DEFAULT_ENCODER_FREQ,
+        _DEFAULT_MASK_PATH,
+        _DEFAULT_SCALE,
+        _DEFAULT_TACTILE_FREQ,
+        _DEFAULT_TIMEOUT_S,
+        _DEFAULT_TTY_PORT,
+        _COMPRESSED_SIDE_VALID_COUNT,
+        _EXPECTED_VALID_COUNT,
+        _build_horizontal_mirror_pairs,
+        _build_row_major_pairs,
+        _build_vertical_priority_pairs,
+        _compute_baseline_abs_diff_stats,
+        _decode_direct_spatial_split_expand,
+        _expand_pair_values_to_dense,
+        _load_baseline_side,
+        _load_mask,
+        _pairwise_reduce_adjacent_bytes,
+        _require_sdk_databus_cls,
+        _resolve_path,
+        _save_pngs,
+        _scatter_row_major,
+    )
+except ImportError:
+    from fr3_capture_tactile_frame import (
+        _DEFAULT_BAUDRATE,
+        _DEFAULT_BASELINE_PATH,
+        _DEFAULT_ENCODER_FREQ,
+        _DEFAULT_MASK_PATH,
+        _DEFAULT_SCALE,
+        _DEFAULT_TACTILE_FREQ,
+        _DEFAULT_TIMEOUT_S,
+        _DEFAULT_TTY_PORT,
+        _COMPRESSED_SIDE_VALID_COUNT,
+        _EXPECTED_VALID_COUNT,
+        _build_horizontal_mirror_pairs,
+        _build_row_major_pairs,
+        _build_vertical_priority_pairs,
+        _compute_baseline_abs_diff_stats,
+        _decode_direct_spatial_split_expand,
+        _expand_pair_values_to_dense,
+        _load_baseline_side,
+        _load_mask,
+        _pairwise_reduce_adjacent_bytes,
+        _require_sdk_databus_cls,
+        _resolve_path,
+        _save_pngs,
+        _scatter_row_major,
+    )
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_BASELINE_PATH = _REPO_ROOT / 'docs/tactile/baseline.json'
+_DEFAULT_PROFILE_STATS_PATH = _REPO_ROOT / 'docs/tactile/profile_stats.json'
 _DEFAULT_OUTPUT_ANALYSIS_ROOT = _REPO_ROOT / 'outputs/tactile_sequence_analysis'
 _DEFAULT_NUM_FRAMES = 12
 _DEFAULT_FRAME_INTERVAL_S = 1.5
@@ -60,7 +88,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--encoder-freq', type=float, default=_DEFAULT_ENCODER_FREQ)
     parser.add_argument('--timeout-s', type=float, default=_DEFAULT_TIMEOUT_S)
     parser.add_argument('--mask-path', type=Path, default=_DEFAULT_MASK_PATH)
-    parser.add_argument('--baseline-path', type=Path, default=_DEFAULT_BASELINE_PATH)
+    parser.add_argument('--idle-baseline-path', type=Path, default=_DEFAULT_BASELINE_PATH)
+    parser.add_argument('--profile-stats-path', type=Path, default=_DEFAULT_PROFILE_STATS_PATH)
+    parser.add_argument('--baseline-path', type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument('--output-dir', type=Path, default=None)
     parser.add_argument('--sequence-name', default='sequence_rank')
     parser.add_argument('--num-frames', type=int, default=_DEFAULT_NUM_FRAMES)
@@ -77,6 +107,27 @@ def _default_output_dir() -> Path:
 
 def _load_baseline_records(path: str | Path) -> dict:
     return json.loads(_resolve_path(path).read_text(encoding='utf-8'))
+
+
+def _load_dataset_profiles(profile_stats_path: str | Path, valid_mask: np.ndarray) -> dict[str, dict[str, dict[str, float]]]:
+    payload = _load_baseline_records(profile_stats_path)
+    profiles_payload = payload.get('profiles')
+    if profiles_payload is None:
+        return _build_dataset_profiles(payload, valid_mask)
+
+    profiles: dict[str, dict[str, dict[str, float]]] = {}
+    for side in ('left', 'right'):
+        side_payload = profiles_payload[side]
+        metrics_payload = side_payload['metrics']
+        profiles[side] = {
+            metric_name: {
+                'mean': float(metric_stats['mean']),
+                'std': float(metric_stats['std']),
+            }
+            for metric_name, metric_stats in metrics_payload.items()
+        }
+        profiles[side]['frame_count'] = {'mean': float(side_payload['frame_count']), 'std': 1.0}
+    return profiles
 
 
 def _valid_values(frame: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
@@ -403,15 +454,18 @@ def run(args: argparse.Namespace) -> int:
     output_dir = _resolve_path(args.output_dir) if args.output_dir is not None else _default_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.baseline_path is not None:
+        args.idle_baseline_path = args.baseline_path
+        args.profile_stats_path = args.baseline_path
+
     valid_mask = _load_mask(args.mask_path)
-    left_baseline = _load_baseline_side(args.baseline_path, 'left')
-    right_baseline = _load_baseline_side(args.baseline_path, 'right')
+    left_baseline = _load_baseline_side(args.idle_baseline_path, 'left', valid_mask)
+    right_baseline = _load_baseline_side(args.idle_baseline_path, 'right', valid_mask)
     baseline_for_images = left_baseline if args.image_baseline_side == 'left' else right_baseline
     row_major_pairs = _build_row_major_pairs(valid_mask)
     vertical_pairs, vertical_leftovers = _build_vertical_priority_pairs(valid_mask)
     horizontal_mirror_pairs = _build_horizontal_mirror_pairs(valid_mask)
-    baseline_payload = _load_baseline_records(args.baseline_path)
-    dataset_profiles = _build_dataset_profiles(baseline_payload, valid_mask)
+    dataset_profiles = _load_dataset_profiles(args.profile_stats_path, valid_mask)
 
     sequence = _capture_sequence(args)
 

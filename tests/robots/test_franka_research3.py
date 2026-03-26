@@ -471,6 +471,77 @@ def test_das_gripper_hardware_driver_decodes_tactile_and_applies_clean_rule(tmp_
     assert FakeDataBus.instances[-1].stopped is True
 
 
+def test_das_gripper_hardware_driver_supports_mask_fill_idle_baseline(tmp_path, monkeypatch):
+    mask_payload = json.loads(
+        (Path(__file__).resolve().parents[2] / "docs/tactile/tactile_valid_mask_50x10.json").read_text(encoding="utf-8")
+    )
+    mask_path = tmp_path / "mask.json"
+    mask_path.write_text(json.dumps(mask_payload), encoding="utf-8")
+
+    baseline_payload = {
+        "encoding": "mask_fill",
+        "shape": [50, 10],
+        "sides": {
+            "left": {"valid_value": 0.0, "invalid_value": 255.0},
+            "right": {"valid_value": 0.0, "invalid_value": 255.0},
+        },
+    }
+    baseline_path = tmp_path / "idle_baseline.json"
+    baseline_path.write_text(json.dumps(baseline_payload), encoding="utf-8")
+
+    left_valid = bytes([index % 256 for index in range(448)])
+    right_valid = bytes([(255 - index) % 256 for index in range(448)])
+
+    class FakeDataBus:
+        instances: list["FakeDataBus"] = []
+
+        def __init__(self, tty_port, baudrate, encoder_freq, encoder_callback, tactile_freq=None, tactile_callback=None):
+            self.tty_port = tty_port
+            self.baudrate = baudrate
+            self.encoder_freq = encoder_freq
+            self.encoder_callback = encoder_callback
+            self.tactile_freq = tactile_freq
+            self.tactile_callback = tactile_callback
+            self.stopped = False
+            type(self).instances.append(self)
+            self.encoder_callback(struct.pack(">f", 0.0206))
+            if self.tactile_callback is not None:
+                self.tactile_callback(left_valid + right_valid)
+
+        def set_target_distance(self, distance_m):
+            del distance_m
+
+        def stop(self):
+            self.stopped = True
+
+    fake_module = types.ModuleType("gen_controller_sdk_python")
+    fake_module.DataBus = FakeDataBus
+    monkeypatch.setitem(sys.modules, "gen_controller_sdk_python", fake_module)
+
+    driver = fr3_backends.DasGripperHardwareDriver(
+        serial_port="/dev/ttyUSB0",
+        baudrate=921600,
+        update_frequency_hz=50.0,
+        tactile_frequency_hz=30.0,
+        tactile_valid_mask_path=str(mask_path),
+        tactile_baseline_path=str(baseline_path),
+        min_distance_m=0.0,
+        max_distance_m=0.103,
+        initial_position=0.2,
+    )
+    driver.connect()
+
+    observation = driver.get_tactile_observation()
+
+    assert float(observation["observation.tactile.left_raw"][0, 0]) == pytest.approx(255.0)
+    assert float(observation["observation.tactile.left_raw"][0, 3]) == pytest.approx(0.0)
+    assert float(observation["observation.tactile.left_clean"][0, 0]) == pytest.approx(0.0)
+    assert float(observation["observation.tactile.left_clean"][0, 4]) == pytest.approx(1.0)
+
+    driver.disconnect()
+    assert FakeDataBus.instances[-1].stopped is True
+
+
 def test_das_gripper_hardware_driver_decodes_448_as_bilateral_horizontal_mirror_expand(tmp_path, monkeypatch):
     mask_payload = json.loads(
         (Path(__file__).resolve().parents[2] / "docs/tactile/tactile_valid_mask_50x10.json").read_text(encoding="utf-8")

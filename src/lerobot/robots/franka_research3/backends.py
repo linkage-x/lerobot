@@ -304,16 +304,43 @@ def _load_tactile_valid_mask(mask_path: str | Path) -> np.ndarray:
     return mask
 
 
-def _load_tactile_baselines(baseline_path: str | Path) -> dict[str, np.ndarray]:
-    payload = json.loads(Path(baseline_path).read_text(encoding="utf-8"))
+def _build_mask_fill_tactile_baseline(
+    baseline_payload: dict,
+    *,
+    side: str,
+    valid_mask: np.ndarray,
+    baseline_path: str | Path,
+) -> np.ndarray:
     try:
-        baseline_data = payload["data"][0]["tactiles"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError(f"Invalid DAS tactile baseline format in {baseline_path}.") from exc
+        side_payload = baseline_payload["sides"][side]
+        valid_value = float(side_payload["valid_value"])
+        invalid_value = float(side_payload["invalid_value"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid DAS tactile idle baseline format in {baseline_path}.") from exc
+
+    baseline = np.full(valid_mask.shape, invalid_value, dtype=np.float32)
+    baseline[valid_mask.astype(bool)] = valid_value
+    return baseline
+
+
+def _load_tactile_baselines(baseline_path: str | Path, valid_mask: np.ndarray) -> dict[str, np.ndarray]:
+    payload = json.loads(Path(baseline_path).read_text(encoding="utf-8"))
 
     baselines: dict[str, np.ndarray] = {}
     for side in ("left", "right"):
-        values = np.asarray(baseline_data[side], dtype=np.float32)
+        if payload.get("encoding") == "mask_fill":
+            baselines[side] = _build_mask_fill_tactile_baseline(
+                payload,
+                side=side,
+                valid_mask=valid_mask,
+                baseline_path=baseline_path,
+            )
+            continue
+
+        try:
+            values = np.asarray(payload["data"][0]["tactiles"][side], dtype=np.float32)
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ValueError(f"Invalid DAS tactile baseline format in {baseline_path}.") from exc
         if values.size != _TACTILE_SIDE_COUNT:
             raise ValueError(
                 f"DAS tactile baseline '{side}' must contain {_TACTILE_SIDE_COUNT} values, got {values.size} from {baseline_path}."
@@ -505,7 +532,7 @@ class DasGripperHardwareDriver:
         self._tactile_baselines: dict[str, np.ndarray] | None = None
         if self.tactile_valid_mask_path is not None and self.tactile_baseline_path is not None:
             self._tactile_valid_mask = _load_tactile_valid_mask(self.tactile_valid_mask_path)
-            self._tactile_baselines = _load_tactile_baselines(self.tactile_baseline_path)
+            self._tactile_baselines = _load_tactile_baselines(self.tactile_baseline_path, self._tactile_valid_mask)
             if self.tactile_frequency_hz is None:
                 self.tactile_frequency_hz = self.update_frequency_hz
 

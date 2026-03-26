@@ -45,7 +45,7 @@ _DEFAULT_GRIPPER_PORT = '/dev/ttyUSB0'
 _DEFAULT_GRIPPER_BACKEND = 'das'
 _DAS_URDF = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_das_ati.urdf'
 _DEFAULT_TACTILE_VALID_MASK_PATH = _REPO_ROOT / 'docs/tactile/tactile_valid_mask_50x10.json'
-_DEFAULT_TACTILE_BASELINE_PATH = _REPO_ROOT / 'docs/tactile/baseline.json'
+_DEFAULT_TACTILE_BASELINE_PATH = _REPO_ROOT / 'docs/tactile/idle_baseline.json'
 _DEFAULT_STATE_NAMES = ['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw', 'gripper']
 _DEFAULT_ACTION_NAMES = ['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw', 'gripper']
 _DEFAULT_OPENCV_FOURCC = 'MJPG'
@@ -332,9 +332,25 @@ def _load_tactile_valid_mask(mask_path: str | Path) -> np.ndarray:
     return mask
 
 
-def _load_tactile_baseline_side(baseline_path: str | Path, side: str) -> np.ndarray:
+def _load_tactile_baseline_side(
+    baseline_path: str | Path,
+    side: str,
+    valid_mask: np.ndarray | None = None,
+) -> np.ndarray:
     path = _resolve_repo_path(baseline_path)
     payload = json.loads(path.read_text(encoding='utf-8'))
+    if payload.get('encoding') == 'mask_fill':
+        if valid_mask is None:
+            raise ValueError(f'valid_mask is required to decode mask_fill tactile baseline from {path}')
+        try:
+            side_payload = payload['sides'][side]
+            valid_value = float(side_payload['valid_value'])
+            invalid_value = float(side_payload['invalid_value'])
+        except Exception as exc:
+            raise ValueError(f'Could not load tactile baseline side={side!r} from {path}') from exc
+        baseline = np.full(valid_mask.shape, invalid_value, dtype=np.float32)
+        baseline[valid_mask.astype(bool)] = valid_value
+        return baseline
     try:
         values = payload['data'][0]['tactiles'][side]
     except Exception as exc:
@@ -352,8 +368,8 @@ def build_tactile_fallback_observation(fallback_mode: str | None) -> dict[str, n
         raise ValueError(f'Unsupported tactile fallback mode: {fallback_mode}')
 
     valid_mask = _load_tactile_valid_mask(_DEFAULT_TACTILE_VALID_MASK_PATH)
-    left_raw = _load_tactile_baseline_side(_DEFAULT_TACTILE_BASELINE_PATH, 'left')
-    right_raw = _load_tactile_baseline_side(_DEFAULT_TACTILE_BASELINE_PATH, 'right')
+    left_raw = _load_tactile_baseline_side(_DEFAULT_TACTILE_BASELINE_PATH, 'left', valid_mask)
+    right_raw = _load_tactile_baseline_side(_DEFAULT_TACTILE_BASELINE_PATH, 'right', valid_mask)
     zeros = np.zeros_like(left_raw, dtype=np.float32)
     return {
         'observation.tactile.left_raw': left_raw.astype(np.float32),

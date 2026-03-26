@@ -18,7 +18,7 @@ import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_MASK_PATH = _REPO_ROOT / 'docs/tactile/tactile_valid_mask_50x10.json'
-_DEFAULT_BASELINE_PATH = _REPO_ROOT / 'docs/tactile/baseline.json'
+_DEFAULT_BASELINE_PATH = _REPO_ROOT / 'docs/tactile/idle_baseline.json'
 _DEFAULT_OUTPUT_ROOT = _REPO_ROOT / 'outputs/tactile_capture'
 _DEFAULT_TTY_PORT = '/dev/ttyUSB0'
 _DEFAULT_BAUDRATE = 921600
@@ -180,9 +180,21 @@ def _expand_pair_values_to_dense(
     return dense
 
 
-def _load_baseline_side(baseline_path: str | Path, side: str) -> np.ndarray:
+def _load_baseline_side(baseline_path: str | Path, side: str, valid_mask: np.ndarray | None = None) -> np.ndarray:
     path = _resolve_path(baseline_path)
     payload = json.loads(path.read_text(encoding='utf-8'))
+    if payload.get('encoding') == 'mask_fill':
+        if valid_mask is None:
+            raise ValueError(f'valid_mask is required to decode mask_fill tactile baseline from {path}')
+        try:
+            side_payload = payload['sides'][side]
+            valid_value = float(side_payload['valid_value'])
+            invalid_value = float(side_payload['invalid_value'])
+        except Exception as exc:
+            raise ValueError(f'Could not load tactile baseline side={side!r} from {path}') from exc
+        baseline = np.full(valid_mask.shape, invalid_value, dtype=np.float32)
+        baseline[valid_mask.astype(bool)] = valid_value
+        return baseline
     try:
         values = payload['data'][0]['tactiles'][side]
     except Exception as exc:
@@ -323,8 +335,8 @@ def _compute_baseline_abs_diff_stats(frame_50x10: np.ndarray, baseline_50x10: np
 
 def capture_one_frame(args: argparse.Namespace) -> int:
     mask = _load_mask(args.mask_path)
-    left_baseline_50x10 = _load_baseline_side(args.baseline_path, 'left')
-    right_baseline_50x10 = _load_baseline_side(args.baseline_path, 'right')
+    left_baseline_50x10 = _load_baseline_side(args.baseline_path, 'left', valid_mask)
+    right_baseline_50x10 = _load_baseline_side(args.baseline_path, 'right', valid_mask)
     baseline_50x10 = left_baseline_50x10 if args.baseline_side == 'left' else right_baseline_50x10
     output_dir = (_resolve_path(args.output_dir) if args.output_dir is not None else _default_output_dir())
     row_major_pairs = _build_row_major_pairs(mask)

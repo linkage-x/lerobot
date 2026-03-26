@@ -1,0 +1,52 @@
+{
+  "version": "1.0.0",
+  "summary": {
+    "active_frame_max_threshold": 10.0,
+    "legacy_frames": 314,
+    "legacy_unique_paired_frames": 80
+  },
+  "profiles": {
+    "left": {
+      "frame_count": 77,
+      "metrics": {
+        "anisotropy_ratio": {
+          "mean": 0.5218338895213129,
+          "std": 0.04840545593315283
+        },
+        "component_count": {
+          "mean": 1.5454545454545454,
+          "std": 0.5233621215483086
+        },
+        "hot_fraction": {
+          "mean": 0.0796324211502783,
+          "std": 0.026101638809806392
+        },
+        "largest_component_fraction": {
+          "mean": 0.9130064801628217,
+          "std": 0.0971854234175841
+        }
+      }
+    },
+    "right": {
+      "frame_count": 79,
+      "metrics": {
+        "anisotropy_ratio": {
+          "mean": 0.9140020114414696,
+          "std": 0.0993438223260155
+        },
+        "component_count": {
+          "mean": 1.7088607594936709,
+          "std": 0.5069616302405262
+        },
+        "hot_fraction": {
+          "mean": 0.117625452079566,
+          "std": 0.04022148732473747
+        },
+        "largest_component_fraction": {
+          "mean": 0.7963050501991248,
+          "std": 0.15022453981708497
+        }
+      }
+    }
+  }
+}

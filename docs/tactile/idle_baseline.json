@@ -1,0 +1,18 @@
+{
+  "version": "1.0.0",
+  "encoding": "mask_fill",
+  "shape": [
+    50,
+    10
+  ],
+  "sides": {
+    "left": {
+      "valid_value": 0.0,
+      "invalid_value": 255.0
+    },
+    "right": {
+      "valid_value": 0.0,
+      "invalid_value": 255.0
+    }
+  }
+}
