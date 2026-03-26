@@ -36,3 +36,4 @@ Use this index to avoid duplicating FR3 real-robot inference knowledge across mu
 - pick-place still does not complete on hardware; next step is to execute the dataset-fed validation runbook and localize the dominant blocker
 - tactile `448-byte` payload to dataset `left_raw/right_raw` mapping
 - long-rollout runtime robustness and operator safety gates
+- `mask2ee` is currently ACT-only; a future TODO is to generalize it into a shared state-masking mechanism for more policies with end-to-end tests

@@ -12,6 +12,20 @@ Goal:
 
 This note is intentionally about the `mask2ee` contract only. For the general FR3 real-inference entrypoint, use `docs/fr3_act_infer_real_minimal.md`.
 
+## Current Implementation Scope
+
+Current status:
+
+- implemented for `ACT` only
+- not yet implemented as a policy-agnostic mechanism across the broader policy set
+
+Important clarification:
+
+- the current repository does not provide a universal `mask2ee` switch that automatically applies to every policy consuming `observation.state`
+- only ACT has the config field, index resolution, and runtime masking path today
+
+This note therefore describes the current ACT contract plus the future direction for generalization.
+
 ## Canonical Training Config
 
 Current config:
@@ -69,6 +83,87 @@ Current code points:
 - runtime masking: `src/lerobot/policies/act/modeling_act.py`
 
 This means the behavior is tied to the dataset contract saved with the checkpoint, not to ad-hoc CLI flags at inference time.
+
+## Future TODO: Generalize State Masking Beyond ACT
+
+This section is a documented TODO only. It is not implemented yet.
+
+### Goal
+
+Extract `mask2ee` into a reusable state-masking mechanism that can be shared across most policies that consume `observation.state`.
+
+Target outcome:
+
+- one common way to describe which state dimensions must be masked
+- consistent train/infer behavior across policies
+- dataset-metadata-driven index resolution, instead of duplicating FR3-specific assumptions in each policy
+
+### Why This Is Worth Doing
+
+Today only ACT supports `mask2ee`.
+
+That creates three problems:
+
+- feature parity is policy-specific
+- future policy experiments can silently drift away from the intended proprio contract
+- the same EE-pose-masking logic would need to be re-implemented and re-tested per policy
+
+### Likely Candidate Policies
+
+These are the obvious next policies to evaluate because they directly consume `OBS_STATE` in their model paths:
+
+- Diffusion
+- VQBeT
+- TDMPC
+- PI0 / PI05 / PI0Fast
+- WallX
+- XVLA where proprio is enabled
+- other future policies that directly encode `observation.state`
+
+This does not mean every policy should necessarily expose the feature by default. It means the masking primitive should be reusable.
+
+### Recommended Design Direction
+
+Prefer a shared mechanism with these properties:
+
+1. configuration-level intent is policy-independent
+2. state-name resolution from dataset metadata is shared
+3. actual masking happens immediately before the model consumes `observation.state`
+4. train and inference paths must reuse the exact same masking logic
+5. the mechanism should fail loudly if required state names cannot be resolved
+
+Recommended scope split:
+
+- shared utility for resolving named state dimensions to indices
+- shared helper for producing a masked copy of `batch[OBS_STATE]`
+- thin policy-specific integration that opts into the common helper
+
+Avoid:
+
+- hard-coding FR3 index positions inside multiple policy implementations
+- implementing train-only masking and forgetting inference
+- introducing a generic config field without end-to-end tests for each adopted policy
+
+### Required Test Coverage When This TODO Is Implemented
+
+The future implementation should not be considered complete without all of the following:
+
+- config parsing test for every policy config that exposes the feature
+- unit test for grouped and flat `observation.state.names` metadata resolution
+- unit test that unresolved EE names raise a loud error
+- training-path test proving `forward(...)` masks the intended state dimensions
+- inference-path test proving action selection uses the same masking behavior
+- factory-level test proving dataset metadata injection works end-to-end
+- regression test proving the original input batch is not mutated in place
+
+### Acceptance Criteria For The Future Work
+
+The future work should be considered done only when:
+
+- at least one non-ACT policy supports the shared mechanism
+- train and inference both honor the same checkpoint-level contract
+- the documentation here can remove the phrase `implemented for ACT only`
+- the test suite covers both shared utilities and policy integrations
 
 ## Why Inference Also Masks EE Pose
 
@@ -177,3 +272,5 @@ The durable rule is:
 - `mask2ee` is a checkpoint-level contract, not an inference-time toggle
 
 If the checkpoint was trained with `mask_ee_pose_in_state=true`, both training and inference will zero EE pose before the ACT model sees `observation.state`.
+
+As of now, that statement is guaranteed for ACT only. Generalizing the same contract to more policies is a planned follow-up, not a completed feature.
