@@ -1094,6 +1094,74 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.hf_dataset = self.load_hf_dataset()
             self._lazy_loading = False
 
+    @staticmethod
+    def _column_values_to_numpy(values) -> np.ndarray:
+        if isinstance(values, torch.Tensor):
+            return values.detach().cpu().numpy()
+        if isinstance(values, list):
+            if not values:
+                return np.asarray(values)
+            if isinstance(values[0], torch.Tensor):
+                try:
+                    return torch.stack(values).detach().cpu().numpy()
+                except RuntimeError:
+                    return np.asarray([value.detach().cpu().numpy() for value in values])
+            return np.asarray(values)
+        return np.asarray(values)
+
+    def get_episode_column_arrays(self, episode_index: int, keys: list[str]) -> dict[str, np.ndarray]:
+        """Return episode-aligned column arrays for the requested keys.
+
+        This is a read-only helper for tools that need dense per-episode arrays without depending on the
+        on-disk chunk/file parquet layout. The returned arrays preserve the frame order within the episode.
+        """
+        self._ensure_hf_dataset_loaded()
+
+        if episode_index < 0 or episode_index >= self.meta.total_episodes:
+            raise IndexError(
+                f"Episode index {episode_index} out of range. Total episodes: {self.meta.total_episodes}"
+            )
+
+        missing_keys = [key for key in keys if key not in self.features]
+        if missing_keys:
+            raise KeyError(f"Requested keys are not present in dataset features: {missing_keys}")
+
+        video_keys = [key for key in keys if key in self.meta.video_keys]
+        if video_keys:
+            raise ValueError(
+                "get_episode_column_arrays only supports parquet-backed features. "
+                f"Video keys are not supported: {video_keys}"
+            )
+
+        ep = self.meta.episodes[episode_index]
+        absolute_indices = list(range(int(ep["dataset_from_index"]), int(ep["dataset_to_index"])))
+
+        if self._absolute_to_relative_idx is None:
+            relative_indices = absolute_indices
+        else:
+            try:
+                relative_indices = [self._absolute_to_relative_idx[idx] for idx in absolute_indices]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Episode {episode_index} is not loaded in this dataset instance. "
+                    f"Loaded episodes: {self.episodes}"
+                ) from exc
+
+        result = {}
+        for key in keys:
+            try:
+                values = self.hf_dataset[key][relative_indices]
+            except (KeyError, TypeError, IndexError):
+                values = self.hf_dataset[relative_indices][key]
+            array = self._column_values_to_numpy(values)
+            feature_shape = tuple(self.features[key]["shape"])
+            expected_shape = (len(relative_indices), *feature_shape)
+            expected_size = int(np.prod(expected_shape, dtype=np.int64))
+            if array.size == expected_size and array.shape != expected_shape:
+                array = array.reshape(expected_shape)
+            result[key] = array
+        return result
+
     def __len__(self):
         return self.num_frames
 
@@ -1192,19 +1260,36 @@ class LeRobotDataset(torch.utils.data.Dataset):
         temporary directory — nothing is written to disk. To save those frames, the 'save_episode()' method
         then needs to be called.
         """
+        frame = dict(frame)
+
         # Convert torch to numpy if needed
         for name in frame:
             if isinstance(frame[name], torch.Tensor):
                 frame[name] = frame[name].numpy()
 
-        validate_frame(frame, self.features)
-
         if self.episode_buffer is None:
             self.episode_buffer = self.create_episode_buffer()
 
-        # Automatically add frame_index and timestamp to episode buffer
         frame_index = self.episode_buffer["size"]
-        timestamp = frame.pop("timestamp") if "timestamp" in frame else frame_index / self.fps
+        expected_timestamp = frame_index / self.fps
+        # `timestamp` is the canonical dataset clock. Explicit overrides must stay on the
+        # nominal sampling grid (`frame_index / fps`); store real capture time in a separate
+        # feature instead so videos, delta_timestamps and replay stay aligned.
+        if "timestamp" in frame:
+            timestamp = frame.pop("timestamp")
+            if abs(float(timestamp) - expected_timestamp) > self.tolerance_s:
+                raise ValueError(
+                    "The feature 'timestamp' must stay on the canonical dataset clock "
+                    f"(`frame_index / fps`). Got timestamp={timestamp!r} for frame_index={frame_index} "
+                    f"with expected_timestamp={expected_timestamp:.9f} and tolerance_s={self.tolerance_s}. "
+                    "Store real capture time in a separate feature such as `capture_timestamp` instead."
+                )
+        else:
+            timestamp = expected_timestamp
+
+        validate_frame(frame, self.features)
+
+        # Automatically add frame_index and timestamp to episode buffer
         self.episode_buffer["frame_index"].append(frame_index)
         self.episode_buffer["timestamp"].append(timestamp)
         self.episode_buffer["task"].append(frame.pop("task"))  # Remove task from frame after processing

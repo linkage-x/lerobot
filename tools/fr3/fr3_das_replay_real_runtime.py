@@ -30,8 +30,8 @@ import time
 from pathlib import Path
 
 import numpy as np
-import pyarrow.parquet as pq
-from scipy.spatial.transform import Rotation
+
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 # ---------------------------------------------------------------------------
 # 路径常量（容器内 /lerobot 挂载到 repo 根）
@@ -88,11 +88,17 @@ _DEFAULT_ANALYSIS_OUTPUT_DIR = _REPO_ROOT / "outputs" / "analysis"
 # ---------------------------------------------------------------------------
 
 
+def _rotation_class():
+    from scipy.spatial.transform import Rotation
+
+    return Rotation
+
+
 def pose_from_xyzquat(xyzquat: np.ndarray) -> np.ndarray:
     """[x, y, z, qx, qy, qz, qw] → 4x4 SE(3)（scipy quat 约定：scalar-last）"""
     T = np.eye(4, dtype=np.float64)
     T[:3, 3] = xyzquat[:3]
-    T[:3, :3] = Rotation.from_quat(xyzquat[3:7]).as_matrix()
+    T[:3, :3] = _rotation_class().from_quat(xyzquat[3:7]).as_matrix()
     return T
 
 
@@ -210,35 +216,24 @@ def snapshot_otg_debug(robot: "FrankaResearch3") -> tuple[np.ndarray | None, np.
 
 
 def load_episode(dataset_path: str, episode_idx: int) -> dict[str, np.ndarray]:
-    """从 Parquet 数据集读取指定 episode 的 state/action/timestamp。"""
-    meta_dir = Path(dataset_path) / "meta" / "episodes"
-    meta_files = sorted(meta_dir.rglob("*.parquet"))
-    if not meta_files:
-        raise FileNotFoundError(f"No episode metadata in {meta_dir}")
+    """通过 LeRobotDataset 公共接口读取指定 episode 的 state/action/timestamp。"""
+    dataset_root = Path(dataset_path)
+    if not dataset_root.exists():
+        raise FileNotFoundError(f"Dataset path not found: {dataset_root}")
+    if not (dataset_root / "meta").exists():
+        raise FileNotFoundError(f"No dataset metadata directory in {dataset_root}")
 
-    chunk_idx = file_idx = None
-    for mf in meta_files:
-        t = pq.read_table(str(mf)).to_pydict()
-        if episode_idx in t["episode_index"]:
-            i = t["episode_index"].index(episode_idx)
-            chunk_idx = t["data/chunk_index"][i]
-            file_idx = t["data/file_index"][i]
-            break
-    if chunk_idx is None:
-        raise ValueError(f"Episode {episode_idx} not found in {dataset_path}")
-
-    data_file = Path(dataset_path) / "data" / f"chunk-{chunk_idx:03d}" / f"file-{file_idx:06d}.parquet"
-    t = pq.read_table(str(data_file)).to_pydict()
-    mask = [i for i, e in enumerate(t["episode_index"]) if e == episode_idx]
-    if not mask:
-        raise ValueError(
-            f"Episode {episode_idx} found in metadata but no rows in {data_file}"
-        )
-
+    dataset = LeRobotDataset(
+        repo_id=f"local/{dataset_root.name}",
+        root=dataset_root,
+        episodes=[episode_idx],
+        download_videos=False,
+    )
+    columns = dataset.get_episode_column_arrays(episode_idx, ["observation.state", "action", "timestamp"])
     return {
-        "state": np.array([t["observation.state"][i] for i in mask], dtype=np.float64),
-        "action": np.array([t["action"][i] for i in mask], dtype=np.float64),
-        "timestamp": np.array([t["timestamp"][i] for i in mask], dtype=np.float64),
+        "state": columns["observation.state"].astype(np.float64, copy=False),
+        "action": columns["action"].astype(np.float64, copy=False),
+        "timestamp": columns["timestamp"].reshape(-1).astype(np.float64, copy=False),
     }
 
 
@@ -957,7 +952,7 @@ def replay_real(args: argparse.Namespace) -> int:
         obs_init = robot.get_observation()
         T_B_E_actual = np.eye(4, dtype=np.float64)
         T_B_E_actual[:3, 3] = [obs_init["ee.x"], obs_init["ee.y"], obs_init["ee.z"]]
-        T_B_E_actual[:3, :3] = Rotation.from_rotvec(
+        T_B_E_actual[:3, :3] = _rotation_class().from_rotvec(
             [obs_init["ee.wx"], obs_init["ee.wy"], obs_init["ee.wz"]]
         ).as_matrix()
         print(f"[INFO] 实际 EE 位置: xyz=[{obs_init['ee.x']:.4f}, {obs_init['ee.y']:.4f}, {obs_init['ee.z']:.4f}]")
@@ -1035,7 +1030,7 @@ def replay_real(args: argparse.Namespace) -> int:
                     time.sleep(sleep_t)
                 continue
 
-            rotvec = Rotation.from_matrix(T_B_Et_star[:3, :3]).as_rotvec()
+            rotvec = _rotation_class().from_matrix(T_B_Et_star[:3, :3]).as_rotvec()
             if joint_target_sequence is not None:
                 robot.send_joint_positions(
                     joint_target_sequence[fi],
@@ -1055,7 +1050,7 @@ def replay_real(args: argparse.Namespace) -> int:
             # 读取当前 EE pose（误差统计用）
             obs = robot.get_observation()
             hw_pos = np.array([obs["ee.x"], obs["ee.y"], obs["ee.z"]], dtype=np.float64)
-            hw_rot = Rotation.from_rotvec([obs["ee.wx"], obs["ee.wy"], obs["ee.wz"]]).as_matrix()
+            hw_rot = _rotation_class().from_rotvec([obs["ee.wx"], obs["ee.wy"], obs["ee.wz"]]).as_matrix()
             measured_joints = np.array([obs[f"joint_{joint_idx}.pos"] for joint_idx in range(1, 8)], dtype=np.float64)
             target_joints, command_joints = snapshot_otg_debug(robot)
             hw_positions.append(hw_pos.copy())

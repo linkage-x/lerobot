@@ -130,6 +130,12 @@ for batch in data_loader:
     # model.forward(batch)
 ```
 
+> [!IMPORTANT]
+> The canonical `timestamp` must stay on the nominal dataset clock: `frame_index / fps`.
+> If you also need real wall-clock or sensor capture time, store it in a separate custom feature instead of overloading `timestamp`.
+> LeRobot enforces this invariant when writing frames and will reject off-grid `timestamp` overrides.
+> Mixing wall-clock `timestamp` values with videos encoded at the declared `fps` will make image playback, scalar timelines, `delta_timestamps`, and replay drift out of sync.
+
 ## Stream a dataset (no downloads)
 
 Use `StreamingLeRobotDataset` to iterate directly from the Hub without local copies. This allows to stream large datasets without the need to downloading them onto disk or loading them onto memory, and is a key feature of the new dataset format.

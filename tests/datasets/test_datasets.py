@@ -281,6 +281,31 @@ def test_add_frame(tmp_path, empty_lerobot_dataset_factory):
     assert dataset[0]["state"].ndim == 0
 
 
+def test_add_frame_accepts_explicit_timestamp_on_nominal_dataset_clock(tmp_path, empty_lerobot_dataset_factory):
+    features = {"state": {"dtype": "float32", "shape": (1,), "names": None}}
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "test", features=features)
+
+    dataset.add_frame({"state": torch.randn(1), "task": "Dummy task", "timestamp": 0.0})
+    dataset.add_frame({"state": torch.randn(1), "task": "Dummy task", "timestamp": 1.0 / dataset.fps})
+
+    assert dataset.episode_buffer["timestamp"] == pytest.approx([0.0, 1.0 / dataset.fps])
+
+
+def test_add_frame_rejects_explicit_timestamp_off_nominal_dataset_clock(tmp_path, empty_lerobot_dataset_factory):
+    features = {"state": {"dtype": "float32", "shape": (1,), "names": None}}
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "test", features=features)
+
+    dataset.add_frame({"state": torch.randn(1), "task": "Dummy task"})
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "The feature 'timestamp' must stay on the canonical dataset clock (`frame_index / fps`)."
+        ),
+    ):
+        dataset.add_frame({"state": torch.randn(1), "task": "Dummy task", "timestamp": 1234567890.0})
+
+
 def test_add_frame_state_1d(tmp_path, empty_lerobot_dataset_factory):
     features = {"state": {"dtype": "float32", "shape": (2,), "names": None}}
     dataset = empty_lerobot_dataset_factory(root=tmp_path / "test", features=features)
@@ -288,6 +313,89 @@ def test_add_frame_state_1d(tmp_path, empty_lerobot_dataset_factory):
     dataset.save_episode()
 
     assert dataset[0]["state"].shape == torch.Size([2])
+
+
+def test_get_episode_column_arrays_returns_requested_episode_in_order(tmp_path, empty_lerobot_dataset_factory):
+    features = {
+        OBS_STATE: {"dtype": "float32", "shape": (2,), "names": ["x", "y"]},
+        ACTION: {"dtype": "float32", "shape": (2,), "names": ["ax", "ay"]},
+    }
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "episode_arrays", features=features, use_videos=False)
+
+    for episode_idx in range(2):
+        for frame_idx in range(3):
+            dataset.add_frame(
+                {
+                    OBS_STATE: torch.tensor([episode_idx, frame_idx], dtype=torch.float32),
+                    ACTION: torch.tensor([episode_idx + 0.1, frame_idx + 0.2], dtype=torch.float32),
+                    "task": f"task_{episode_idx}",
+                }
+            )
+        dataset.save_episode()
+
+    dataset.finalize()
+    loaded = LeRobotDataset(DUMMY_REPO_ID, root=dataset.root, download_videos=False)
+    arrays = loaded.get_episode_column_arrays(1, [OBS_STATE, ACTION, "timestamp"])
+
+    assert arrays[OBS_STATE].shape == (3, 2)
+    assert arrays[ACTION].shape == (3, 2)
+    assert arrays["timestamp"].shape == (3, 1)
+    assert np.allclose(arrays[OBS_STATE], np.array([[1.0, 0.0], [1.0, 1.0], [1.0, 2.0]], dtype=np.float32))
+    assert np.allclose(
+        arrays["timestamp"],
+        np.array([[0.0], [1.0 / 30.0], [2.0 / 30.0]], dtype=np.float64),
+    )
+
+
+def test_get_episode_column_arrays_supports_filtered_episode_datasets(tmp_path, empty_lerobot_dataset_factory):
+    features = {
+        OBS_STATE: {"dtype": "float32", "shape": (1,), "names": ["x"]},
+        ACTION: {"dtype": "float32", "shape": (1,), "names": ["ax"]},
+    }
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "filtered_episode_arrays", features=features, use_videos=False)
+
+    for episode_idx in range(3):
+        for frame_idx in range(2):
+            dataset.add_frame(
+                {
+                    OBS_STATE: torch.tensor([episode_idx * 10 + frame_idx], dtype=torch.float32),
+                    ACTION: torch.tensor([episode_idx * 100 + frame_idx], dtype=torch.float32),
+                    "task": f"task_{episode_idx}",
+                }
+            )
+        dataset.save_episode()
+
+    dataset.finalize()
+    filtered = LeRobotDataset(DUMMY_REPO_ID, root=dataset.root, episodes=[2], download_videos=False)
+    arrays = filtered.get_episode_column_arrays(2, [OBS_STATE, ACTION, "timestamp"])
+
+    assert np.allclose(arrays[OBS_STATE], np.array([[20.0], [21.0]], dtype=np.float32))
+    assert np.allclose(arrays[ACTION], np.array([[200.0], [201.0]], dtype=np.float32))
+    assert np.allclose(arrays["timestamp"], np.array([[0.0], [1.0 / 30.0]], dtype=np.float64))
+
+
+def test_get_episode_column_arrays_rejects_unloaded_episode_subset(tmp_path, empty_lerobot_dataset_factory):
+    features = {
+        OBS_STATE: {"dtype": "float32", "shape": (1,), "names": ["x"]},
+        ACTION: {"dtype": "float32", "shape": (1,), "names": ["ax"]},
+    }
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "episode_subset_guard", features=features, use_videos=False)
+
+    for episode_idx in range(2):
+        dataset.add_frame(
+            {
+                OBS_STATE: torch.tensor([episode_idx], dtype=torch.float32),
+                ACTION: torch.tensor([episode_idx], dtype=torch.float32),
+                "task": f"task_{episode_idx}",
+            }
+        )
+        dataset.save_episode()
+
+    dataset.finalize()
+    filtered = LeRobotDataset(DUMMY_REPO_ID, root=dataset.root, episodes=[1], download_videos=False)
+
+    with pytest.raises(ValueError, match="Episode 0 is not loaded in this dataset instance"):
+        filtered.get_episode_column_arrays(0, [OBS_STATE, ACTION, "timestamp"])
 
 
 def test_add_frame_state_2d(tmp_path, empty_lerobot_dataset_factory):
