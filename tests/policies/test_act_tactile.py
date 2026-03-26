@@ -103,6 +103,23 @@ def test_act_config_resolves_mask2ee_indices_from_bare_state_names():
     assert config.masked_robot_state_indices == [0, 1, 2, 3, 4, 5, 6]
 
 
+def test_act_config_mask2ee_reports_missing_state_features():
+    config = ACTConfig(
+        input_features={
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+        },
+        output_features={
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(8,)),
+        },
+        mask_ee_pose_in_state=True,
+        state_feature_names=["x", "y", "z", "qx", "qy", "gripper"],
+        device="cpu",
+    )
+
+    with pytest.raises(ValueError, match=r"Could not resolve required feature names \['ee.qz', 'ee.qw'\]"):
+        _ = config.masked_robot_state_indices
+
+
 def test_act_policy_mask2ee_zeroes_ee_pose_before_model_forward(monkeypatch):
     config = ACTConfig(
         input_features={

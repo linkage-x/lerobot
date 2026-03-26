@@ -99,8 +99,9 @@ import torch.utils.data
 import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.utils.rotation import Rotation
 from lerobot.utils.constants import ACTION, DONE, OBS_STATE, REWARD
+from lerobot.utils.rotation import Rotation
+from lerobot.utils.state_feature_names import flatten_feature_name_paths, get_ee_pose_state_indices
 from lerobot.utils.utils import init_logging
 
 
@@ -145,25 +146,6 @@ def tensor_to_rerun_image_numpy(value: torch.Tensor) -> np.ndarray | None:
         return image
 
     return None
-
-
-def flatten_feature_name_paths(
-    feature_names: list[str] | tuple[str, ...] | dict[str, list[str] | dict] | None,
-    prefix: str = "",
-) -> list[str] | None:
-    if feature_names is None:
-        return None
-    if isinstance(feature_names, (list, tuple)):
-        return [f"{prefix}/{name}" if prefix else str(name) for name in feature_names]
-    if isinstance(feature_names, dict):
-        flattened = []
-        for key, value in feature_names.items():
-            child_prefix = f"{prefix}/{key}" if prefix else str(key)
-            child_paths = flatten_feature_name_paths(value, child_prefix)
-            if child_paths is not None:
-                flattened.extend(child_paths)
-        return flattened
-    raise TypeError(f"Unsupported feature names structure: {type(feature_names)!r}")
 
 
 def build_scalar_entity_paths(
@@ -214,37 +196,6 @@ def log_feature_value(
         return
 
     rr.log(key, rr.Tensor(value.detach().cpu().numpy()))
-
-
-def get_ee_pose_state_indices(
-    state_feature_names: list[str] | tuple[str, ...] | dict[str, list[str] | dict] | None,
-) -> dict[str, int] | None:
-    flattened_names = flatten_feature_name_paths(state_feature_names)
-    if flattened_names is None:
-        return None
-    aliases = {}
-    for idx, name in enumerate(flattened_names):
-        aliases[name] = idx
-        aliases[name.split("/")[-1]] = idx
-
-    required_aliases = {
-        "ee.x": ("ee.x", "x"),
-        "ee.y": ("ee.y", "y"),
-        "ee.z": ("ee.z", "z"),
-        "ee.qx": ("ee.qx", "qx"),
-        "ee.qy": ("ee.qy", "qy"),
-        "ee.qz": ("ee.qz", "qz"),
-        "ee.qw": ("ee.qw", "qw"),
-    }
-    indices = {}
-    for canonical_name, candidate_aliases in required_aliases.items():
-        for alias in candidate_aliases:
-            if alias in aliases:
-                indices[canonical_name] = aliases[alias]
-                break
-        else:
-            return None
-    return indices
 
 
 def has_ee_pose(batch: dict, ee_pose_state_indices: dict[str, int] | None = None) -> bool:
