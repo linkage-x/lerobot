@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
+import subprocess
+import sys
 
 from tools.fr3 import (
     fr3_build_policy_validation_report,
@@ -165,3 +167,33 @@ def test_build_policy_validation_report_end_to_end(tmp_path: Path):
     assert "- dominant_blocker: gripper timing" in markdown
     assert "- next_action: inspect frame 0" in markdown
     assert "## Phase Candidates" in markdown
+
+
+def test_generate_policy_validation_decision_supports_direct_script_execution():
+    script_path = Path(__file__).resolve().parents[2] / "tools/fr3/fr3_generate_policy_validation_decision.py"
+
+    result = subprocess.run(
+        [sys.executable, str(script_path), "--help"],
+        cwd=script_path.parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "Generate FR3 decision.md scaffolding" in result.stdout
+
+
+def test_build_policy_validation_report_supports_direct_script_execution():
+    script_path = Path(__file__).resolve().parents[2] / "tools/fr3/fr3_build_policy_validation_report.py"
+
+    result = subprocess.run(
+        [sys.executable, str(script_path), "--help"],
+        cwd=script_path.parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "Build FR3 policy validation report artifacts" in result.stdout

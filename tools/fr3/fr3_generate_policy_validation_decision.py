@@ -9,7 +9,10 @@ import math
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from tools.fr3.fr3_parse_policy_dataset_frame_log import ErrorRow, PhaseLabel, load_phase_labels
+try:
+    from tools.fr3.fr3_parse_policy_dataset_frame_log import ErrorRow, PhaseLabel, load_phase_labels
+except ImportError:  # pragma: no cover - fallback for direct script execution
+    from fr3_parse_policy_dataset_frame_log import ErrorRow, PhaseLabel, load_phase_labels
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

@@ -335,8 +335,8 @@ def _compute_baseline_abs_diff_stats(frame_50x10: np.ndarray, baseline_50x10: np
 
 def capture_one_frame(args: argparse.Namespace) -> int:
     mask = _load_mask(args.mask_path)
-    left_baseline_50x10 = _load_baseline_side(args.baseline_path, 'left', valid_mask)
-    right_baseline_50x10 = _load_baseline_side(args.baseline_path, 'right', valid_mask)
+    left_baseline_50x10 = _load_baseline_side(args.baseline_path, 'left', mask)
+    right_baseline_50x10 = _load_baseline_side(args.baseline_path, 'right', mask)
     baseline_50x10 = left_baseline_50x10 if args.baseline_side == 'left' else right_baseline_50x10
     output_dir = (_resolve_path(args.output_dir) if args.output_dir is not None else _default_output_dir())
     row_major_pairs = _build_row_major_pairs(mask)
