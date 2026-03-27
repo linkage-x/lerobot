@@ -1272,6 +1272,8 @@ def run_inference(args: argparse.Namespace) -> int:
         )
     policy.reset()
     state_processor.reset()
+    preprocessor.reset()
+    postprocessor.reset()
 
     try:
         step_idx = 0

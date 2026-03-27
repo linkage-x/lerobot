@@ -15,6 +15,10 @@
 # limitations under the License.
 
 from .batch_processor import AddBatchDimensionProcessorStep
+from .action_chunk_quantile_processor import (
+    ActionChunkQuantileNormalizerProcessorStep,
+    ActionChunkQuantileUnnormalizerProcessorStep,
+)
 from .converters import (
     batch_to_transition,
     create_transition,
@@ -79,6 +83,8 @@ from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcesso
 
 __all__ = [
     "ActionProcessorStep",
+    "ActionChunkQuantileNormalizerProcessorStep",
+    "ActionChunkQuantileUnnormalizerProcessorStep",
     "AddTeleopActionAsComplimentaryDataStep",
     "AddTeleopEventsAsInfoStep",
     "ComplementaryDataProcessorStep",

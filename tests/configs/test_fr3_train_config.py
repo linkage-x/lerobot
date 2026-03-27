@@ -84,4 +84,6 @@ def test_fr3_mask2ee_act_das_train_config_parses(monkeypatch):
     assert cfg.policy.type == "act"
     assert cfg.policy.use_tactile is True
     assert cfg.policy.mask_ee_pose_in_state is True
+    assert cfg.policy.action_chunk_quantile_normalization is True
+    assert cfg.policy.action_chunk_quantile_clip is False
     assert cfg.tolerance_s == 1e-3

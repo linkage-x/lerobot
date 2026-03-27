@@ -209,6 +209,7 @@ class ProcessorConfigKwargs(TypedDict, total=False):
     preprocessor_overrides: dict[str, Any] | None
     postprocessor_overrides: dict[str, Any] | None
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None
+    action_chunk_stats: dict[str, Any] | None
 
 
 def make_pre_post_processors(
@@ -307,6 +308,7 @@ def make_pre_post_processors(
         processors = make_act_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
+            action_chunk_stats=kwargs.get("action_chunk_stats"),
         )
 
     elif isinstance(policy_cfg, VQBeTConfig):

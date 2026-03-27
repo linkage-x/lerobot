@@ -22,6 +22,8 @@ policy:
   tactile_encoder_use_se: true
   tactile_transformer_layers: 1
   mask_ee_pose_in_state: true
+  action_chunk_quantile_normalization: true
+  action_chunk_quantile_clip: false
   chunk_size: 100
   n_action_steps: 100
   vision_backbone: resnet18

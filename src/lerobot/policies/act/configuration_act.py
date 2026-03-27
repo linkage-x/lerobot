@@ -108,6 +108,9 @@ class ACTConfig(PreTrainedConfig):
     tactile_transformer_layers: int = 0
     mask_ee_pose_in_state: bool = False
     state_feature_names: list[str] | dict[str, Any] | None = None
+    action_chunk_quantile_normalization: bool = False
+    action_chunk_stats_path: str | None = None
+    action_chunk_quantile_clip: bool = False
     # Vision backbone.
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"

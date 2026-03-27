@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import Any
 
@@ -36,6 +37,7 @@ from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.act.processor_act import load_action_chunk_stats
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
@@ -258,6 +260,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
         # Only provide dataset_stats when not resuming from saved processor state
         processor_kwargs["dataset_stats"] = dataset.meta.stats
+        if cfg.policy.type == "act" and getattr(cfg.policy, "action_chunk_quantile_normalization", False):
+            dataset_root = Path(cfg.dataset.root) if cfg.dataset.root is not None else dataset.root
+            processor_kwargs["action_chunk_stats"] = load_action_chunk_stats(cfg.policy, dataset_root)
 
     # For SARM, always provide dataset_meta for progress normalization
     if cfg.policy.type == "sarm":
