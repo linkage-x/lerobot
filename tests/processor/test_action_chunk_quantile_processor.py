@@ -113,3 +113,16 @@ def test_action_chunk_quantile_processor_pipeline_save_and_load(tmp_path):
 
     output = loaded(torch.zeros(1, 8, dtype=torch.float32))
     assert torch.allclose(output[0, :3], torch.tensor([1.0, 1.0, 1.0]))
+
+
+def test_action_chunk_quantile_normalizer_noops_when_transition_has_no_action():
+    normalizer = ActionChunkQuantileNormalizerProcessorStep(**_make_step_kwargs())
+    transition = create_transition(
+        observation={"observation.state": torch.tensor([[1.0, 2.0]], dtype=torch.float32)},
+        action=None,
+    )
+
+    output = normalizer(transition)
+
+    assert output["action"] is None
+    assert torch.equal(output["observation"]["observation.state"], transition["observation"]["observation.state"])

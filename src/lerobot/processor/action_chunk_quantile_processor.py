@@ -183,6 +183,14 @@ class _ActionChunkQuantileMixin:
 @dataclass
 @ProcessorStepRegistry.register(name="action_chunk_quantile_normalizer_processor")
 class ActionChunkQuantileNormalizerProcessorStep(_ActionChunkQuantileMixin, PolicyActionProcessorStep):
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        # In inference preprocessors there is no action yet. Skip instead of enforcing
+        # the PolicyAction contract, while still normalizing training transitions.
+        action = transition.get(TransitionKey.ACTION)
+        if action is None:
+            return transition.copy()
+        return super().__call__(transition)
+
     def action(self, action: PolicyAction) -> PolicyAction:
         return self._transform_action(action, inverse=False, advance_offset=False)
 
