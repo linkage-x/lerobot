@@ -1,0 +1,45 @@
+dataset:
+  repo_id: hph/fr3_pick_place_ee2ee_v1
+  root: null
+  streaming: false
+
+policy:
+  type: act
+  device: null
+  use_amp: false
+  push_to_hub: false
+  use_tactile: true
+  tactile_feature_keys:
+    - observation.tactile.left_clean
+    - observation.tactile.right_clean
+  tactile_use_valid_mask: true
+  tactile_valid_mask_feature_key: observation.tactile.valid_mask
+  tactile_encoder_hidden_channels:
+    - 32
+    - 64
+    - 128
+  tactile_encoder_residual_blocks: 1
+  tactile_encoder_use_se: true
+  tactile_transformer_layers: 1
+  action_chunk_quantile_normalization: true
+  action_chunk_quantile_clip: false
+  chunk_size: 100
+  n_action_steps: 100
+  vision_backbone: resnet18
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 1.0e-5
+  optimizer_weight_decay: 1.0e-4
+
+seed: 1000
+num_workers: 12
+batch_size: 8
+steps: 100000
+eval_freq: 20000
+log_freq: 200
+save_checkpoint: true
+save_freq: 20000
+tolerance_s: 1.0e-3
+
+wandb:
+  enable: true
