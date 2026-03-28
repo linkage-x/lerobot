@@ -73,6 +73,16 @@ Before using either example in Docker, rebuild the `lerobot-user` image with the
 INSTALL_HIKROBOT_SDK=true docker compose build lerobot-user
 ```
 
+List the available Hikrobot cameras first so you can copy their serial numbers into the example YAML files:
+
+```bash
+docker compose run --rm lerobot-user bash -lc '
+cd /lerobot &&
+PYTHONPATH=/lerobot/src \
+/lerobot/.venv/bin/lerobot-find-cameras hikrobot
+'
+```
+
 Record an FR3 teleoperation dataset with Hikrobot cameras through the existing wrapper:
 
 ```bash
