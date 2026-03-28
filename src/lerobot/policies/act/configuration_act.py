@@ -21,6 +21,9 @@ from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.utils.state_feature_names import get_ee_pose_state_indices
 
+DEFAULT_MASK_EE_STATE_COMPONENTS = ["x", "y", "z", "qx", "qy", "qz", "qw"]
+VALID_MASK_EE_STATE_COMPONENTS = tuple(DEFAULT_MASK_EE_STATE_COMPONENTS)
+
 
 @PreTrainedConfig.register_subclass("act")
 @dataclass
@@ -107,6 +110,7 @@ class ACTConfig(PreTrainedConfig):
     tactile_encoder_use_se: bool = False
     tactile_transformer_layers: int = 0
     mask_ee_pose_in_state: bool = False
+    mask_ee_state_components: list[str] | None = None
     state_feature_names: list[str] | dict[str, Any] | None = None
     action_chunk_quantile_normalization: bool = False
     action_chunk_stats_path: str | None = None
@@ -170,6 +174,15 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError("`tactile_encoder_residual_blocks` must be non-negative.")
         if self.tactile_transformer_layers < 0:
             raise ValueError("`tactile_transformer_layers` must be non-negative.")
+        if self.mask_ee_state_components is not None:
+            invalid_components = [
+                component for component in self.mask_ee_state_components if component not in VALID_MASK_EE_STATE_COMPONENTS
+            ]
+            if invalid_components:
+                raise ValueError(
+                    "`mask_ee_state_components` contains unsupported entries. "
+                    f"Got {invalid_components}; expected a subset of {list(VALID_MASK_EE_STATE_COMPONENTS)}."
+                )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -271,4 +284,5 @@ class ACTConfig(PreTrainedConfig):
                 f"{exc}"
             ) from exc
 
-        return sorted(set(indices.values()))
+        mask_components = self.mask_ee_state_components or DEFAULT_MASK_EE_STATE_COMPONENTS
+        return [indices[f"ee.{component}"] for component in mask_components]

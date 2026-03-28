@@ -305,6 +305,16 @@ def test_make_policy_injects_state_feature_names_for_act_mask2ee(dummy_mask2ee_d
     assert list(policy.masked_robot_state_indices) == [0, 1, 2, 3, 4, 5, 6]
 
 
+def test_make_policy_respects_partial_mask_components_for_act(dummy_mask2ee_dataset_metadata):
+    cfg = ACTConfig(mask_ee_pose_in_state=True, mask_ee_state_components=["x", "y", "z"])
+    cfg.device = "cpu"
+
+    policy = make_policy(cfg, ds_meta=dummy_mask2ee_dataset_metadata)
+
+    assert policy.config.state_feature_names == ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper"]
+    assert list(policy.masked_robot_state_indices) == [0, 1, 2]
+
+
 @pytest.mark.parametrize("policy_name", available_policies)
 def test_save_and_load_pretrained(dummy_dataset_metadata, tmp_path, policy_name: str):
     policy_cls = get_policy_class(policy_name)
