@@ -22,6 +22,8 @@ x-lerobot-common: &lerobot-common
     HF_LEROBOT_HOME: /home/user_lerobot/.cache/huggingface/lerobot
     TORCH_HOME: /home/user_lerobot/.cache/torch
     TRITON_CACHE_DIR: /home/user_lerobot/.cache/triton
+    HIKROBOT_MVS_HOME: /opt/MVS
+    MVCAM_COMMON_RUNENV: /opt/MVS/lib
     http_proxy: ${http_proxy:-}
     https_proxy: ${https_proxy:-}
     no_proxy: ${no_proxy:-}
@@ -41,6 +43,7 @@ x-lerobot-common: &lerobot-common
     - /dev/input:/dev/input
     - /var/run/dbus:/var/run/dbus
     - /run/dbus:/run/dbus
+    - /run/udev:/run/udev:ro
   devices: &lerobot-devices
     - /dev/bus/usb:/dev/bus/usb
     - /dev/input:/dev/input
@@ -129,6 +132,7 @@ services:
       - /dev/input:/dev/input
       - /var/run/dbus:/var/run/dbus
       - /run/dbus:/run/dbus
+      - /run/udev:/run/udev:ro
     build:
       context: ..
       dockerfile: docker/Dockerfile.user
@@ -138,6 +142,7 @@ services:
         PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-https://pypi.org/simple/}
         PIP_FALLBACK_INDEX_URL: ${PIP_FALLBACK_INDEX_URL:-https://pypi.org/simple/}
         UNBOUND_DEPS: ${UNBOUND_DEPS:-false}
+        INSTALL_HIKROBOT_SDK: ${INSTALL_HIKROBOT_SDK:-false}
 
   lerobot-internal:
     <<: *lerobot-train-common
@@ -217,6 +222,7 @@ services:
         PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-https://pypi.org/simple/}
         PIP_FALLBACK_INDEX_URL: ${PIP_FALLBACK_INDEX_URL:-https://pypi.org/simple/}
         UNBOUND_DEPS: ${UNBOUND_DEPS:-false}
+        INSTALL_HIKROBOT_SDK: ${INSTALL_HIKROBOT_SDK:-false}
     environment:
       <<: *lerobot-env
       DEVICE: cuda
@@ -239,6 +245,7 @@ services:
         PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-https://pypi.org/simple/}
         PIP_FALLBACK_INDEX_URL: ${PIP_FALLBACK_INDEX_URL:-https://pypi.org/simple/}
         UNBOUND_DEPS: ${UNBOUND_DEPS:-false}
+        INSTALL_HIKROBOT_SDK: ${INSTALL_HIKROBOT_SDK:-false}
     environment:
       <<: *lerobot-env
       DEVICE: cuda

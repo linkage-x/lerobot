@@ -26,7 +26,15 @@ import numpy as np
 
 from lerobot.cameras.hikrobot import HikrobotCamera, HikrobotCameraConfig
 from lerobot.cameras.hikrobot.camera_hikrobot import _decode_char_buffer, _extract_device_info, _load_mvs_sdk
-from lerobot.cameras.hikrobot.configuration_hikrobot import ColorMode
+from lerobot.cameras.hikrobot.configuration_hikrobot import (
+    HIKROBOT_DEFAULT_COLOR_MODE,
+    HIKROBOT_DEFAULT_EXPOSURE_US,
+    HIKROBOT_DEFAULT_GAIN_DB,
+    HIKROBOT_DEFAULT_GAMMA,
+    HIKROBOT_DEFAULT_LOCK_WHITE_BALANCE_AFTER_WARMUP,
+    HIKROBOT_DEFAULT_WARMUP_S,
+    ColorMode,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,7 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1280, help="Capture width.")
     parser.add_argument("--height", type=int, default=720, help="Capture height.")
     parser.add_argument("--fps", type=int, default=30, help="Target capture and video FPS.")
-    parser.add_argument("--exposure-us", type=float, default=10000.0, help="Manual exposure time in microseconds.")
+    parser.add_argument(
+        "--exposure-us",
+        type=float,
+        default=HIKROBOT_DEFAULT_EXPOSURE_US,
+        help="Manual exposure time in microseconds.",
+    )
     parser.add_argument(
         "--gain-mode",
         choices=("manual", "max"),
@@ -45,13 +58,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gain-db",
         type=float,
-        default=12.0,
+        default=HIKROBOT_DEFAULT_GAIN_DB,
         help="Manual analog gain in dB when --gain-mode=manual. Defaults to 12 dB for indoor scenes.",
     )
     parser.add_argument(
         "--gamma",
         type=float,
-        default=1.3,
+        default=HIKROBOT_DEFAULT_GAMMA,
         help="Gamma correction value. Set to <= 0 to disable. Defaults to 1.3.",
     )
     parser.add_argument(
@@ -95,7 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--warmup-s",
         type=int,
-        default=2,
+        default=HIKROBOT_DEFAULT_WARMUP_S,
         help="Warmup duration passed to the camera backend.",
     )
     parser.add_argument(
@@ -196,7 +209,9 @@ def main() -> int:
     resolved_gain_db, max_gain_db = _resolve_gain_db(args.serial, args.gain_mode, args.gain_db)
     white_balance_mode, manual_white_balance = _resolve_white_balance(args)
     lock_white_balance_after_warmup = (
-        white_balance_mode == "auto_continuous" and not args.keep_awb_running_during_recording
+        HIKROBOT_DEFAULT_LOCK_WHITE_BALANCE_AFTER_WARMUP
+        and white_balance_mode == "auto_continuous"
+        and not args.keep_awb_running_during_recording
     )
 
     config = HikrobotCameraConfig(
@@ -204,7 +219,7 @@ def main() -> int:
         width=args.width,
         height=args.height,
         fps=args.fps,
-        color_mode=ColorMode.BGR,
+        color_mode=HIKROBOT_DEFAULT_COLOR_MODE,
         warmup_s=args.warmup_s,
         exposure_us=args.exposure_us,
         gain_db=resolved_gain_db,

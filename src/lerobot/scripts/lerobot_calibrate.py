@@ -31,6 +31,7 @@ from pprint import pformat
 
 import draccus
 
+from lerobot.cameras.hikrobot.configuration_hikrobot import HikrobotCameraConfig  # noqa: F401
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.robots import (  # noqa: F401

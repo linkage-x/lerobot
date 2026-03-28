@@ -249,7 +249,10 @@ def test_connect_requires_device_rgb888_support():
     class _FakeMVSNoRgb(_FakeMVS):
         MvCamera = _FakeMvCameraNoRgb
 
-    camera = HikrobotCamera(HikrobotCameraConfig(serial="LEFT123", width=2, height=2, warmup_s=0), mvs_module=_FakeMVSNoRgb)
+    camera = HikrobotCamera(
+        HikrobotCameraConfig(serial="LEFT123", width=2, height=2, warmup_s=0, color_mode="rgb"),
+        mvs_module=_FakeMVSNoRgb,
+    )
 
     try:
         camera.connect(warmup=False)

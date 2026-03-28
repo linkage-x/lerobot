@@ -42,6 +42,11 @@ def make_cameras_from_configs(camera_configs: dict[str, CameraConfig]) -> dict[s
 
             cameras[key] = Reachy2Camera(cfg)
 
+        elif cfg.type == "hikrobot":
+            from .hikrobot.camera_hikrobot import HikrobotCamera
+
+            cameras[key] = HikrobotCamera(cfg)
+
         elif cfg.type == "zmq":
             from .zmq.camera_zmq import ZMQCamera
 

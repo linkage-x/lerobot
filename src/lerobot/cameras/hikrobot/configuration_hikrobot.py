@@ -16,7 +16,26 @@ from dataclasses import dataclass
 
 from ..configs import CameraConfig, ColorMode, Cv2Rotation
 
-__all__ = ["HikrobotCameraConfig", "ColorMode", "Cv2Rotation"]
+HIKROBOT_DEFAULT_COLOR_MODE = ColorMode.BGR
+HIKROBOT_DEFAULT_WARMUP_S = 2
+HIKROBOT_DEFAULT_EXPOSURE_US = 10000.0
+HIKROBOT_DEFAULT_GAIN_DB = 12.0
+HIKROBOT_DEFAULT_GAMMA = 1.3
+HIKROBOT_DEFAULT_WHITE_BALANCE_AUTO = "continuous"
+HIKROBOT_DEFAULT_LOCK_WHITE_BALANCE_AFTER_WARMUP = True
+
+__all__ = [
+    "HikrobotCameraConfig",
+    "ColorMode",
+    "Cv2Rotation",
+    "HIKROBOT_DEFAULT_COLOR_MODE",
+    "HIKROBOT_DEFAULT_WARMUP_S",
+    "HIKROBOT_DEFAULT_EXPOSURE_US",
+    "HIKROBOT_DEFAULT_GAIN_DB",
+    "HIKROBOT_DEFAULT_GAMMA",
+    "HIKROBOT_DEFAULT_WHITE_BALANCE_AUTO",
+    "HIKROBOT_DEFAULT_LOCK_WHITE_BALANCE_AFTER_WARMUP",
+]
 
 
 @CameraConfig.register_subclass("hikrobot")
@@ -25,17 +44,17 @@ class HikrobotCameraConfig(CameraConfig):
     serial: str | None = None
     device_index: int | None = None
     transport_layer: str = "usb"
-    color_mode: ColorMode = ColorMode.RGB
+    color_mode: ColorMode = HIKROBOT_DEFAULT_COLOR_MODE
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
-    warmup_s: int = 1
-    exposure_us: float | None = None
-    gain_db: float | None = None
-    gamma: float | None = None
-    white_balance_auto: str = "continuous"
+    warmup_s: int = HIKROBOT_DEFAULT_WARMUP_S
+    exposure_us: float | None = HIKROBOT_DEFAULT_EXPOSURE_US
+    gain_db: float | None = HIKROBOT_DEFAULT_GAIN_DB
+    gamma: float | None = HIKROBOT_DEFAULT_GAMMA
+    white_balance_auto: str = HIKROBOT_DEFAULT_WHITE_BALANCE_AUTO
     white_balance_red: int | None = None
     white_balance_green: int | None = None
     white_balance_blue: int | None = None
-    lock_white_balance_after_warmup: bool = False
+    lock_white_balance_after_warmup: bool = HIKROBOT_DEFAULT_LOCK_WHITE_BALANCE_AFTER_WARMUP
     timeout_ms: int = 1000
 
     def __post_init__(self) -> None:

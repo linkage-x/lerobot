@@ -184,5 +184,32 @@ RUN resolved_extra="${PIP_EXTRA_INDEX_URL}"; \
 # Make sure to have the git-LFS files for testing
 COPY --chown=user_lerobot:user_lerobot . .
 
+ARG INSTALL_HIKROBOT_SDK=false
+
+USER root
+
+RUN set -eux; \
+    if [ "${INSTALL_HIKROBOT_SDK}" = "true" ]; then \
+      sdk_deb="$(find /lerobot/docker/hik-sdk -maxdepth 1 -type f -name '*.deb' | sort | head -n 1)"; \
+      if [ -z "${sdk_deb}" ]; then \
+        echo "No Hikrobot MVS SDK .deb found under /lerobot/docker/hik-sdk" >&2; \
+        exit 1; \
+      fi; \
+      apt-get update; \
+      (dpkg -i "${sdk_deb}" || apt-get install -f -y --no-install-recommends); \
+      if [ -d /lerobot/docker/hik-sdk/Samples ]; then \
+        mkdir -p /opt/MVS; \
+        cp -r /lerobot/docker/hik-sdk/Samples /opt/MVS/; \
+      fi; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+
+ENV HIKROBOT_MVS_HOME=/opt/MVS \
+    MVCAM_COMMON_RUNENV=/opt/MVS/lib \
+    PYTHONPATH=/opt/MVS/Samples/64/Python:/opt/MVS/Samples/32/Python${PYTHONPATH:+:${PYTHONPATH}} \
+    LD_LIBRARY_PATH=/opt/MVS/lib/64:/opt/MVS/lib:/usr/local/lib
+
+USER user_lerobot
+
 # Set the default command
 CMD ["/bin/bash"]

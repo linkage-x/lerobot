@@ -24,6 +24,7 @@ import torch
 import yaml
 
 from lerobot.cameras.configs import Cv2Backends
+from lerobot.cameras.hikrobot.configuration_hikrobot import HikrobotCameraConfig
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
 from lerobot.configs.train import TrainPipelineConfig
@@ -233,7 +234,9 @@ def _coerce_opencv_backend(value: Any) -> Cv2Backends:
     raise ValueError(f'Unsupported OpenCV backend identifier: {value!r}')
 
 
-def load_camera_configs(camera_config_path: str | Path) -> dict[str, OpenCVCameraConfig | RealSenseCameraConfig]:
+def load_camera_configs(
+    camera_config_path: str | Path,
+) -> dict[str, OpenCVCameraConfig | RealSenseCameraConfig | HikrobotCameraConfig]:
     config_path = _resolve_repo_path(camera_config_path)
     with config_path.open('r', encoding='utf-8') as f:
         raw = yaml.safe_load(f) or {}
@@ -242,7 +245,7 @@ def load_camera_configs(camera_config_path: str | Path) -> dict[str, OpenCVCamer
     if not camera_entries:
         raise ValueError(f'No robot.cameras entries found in {config_path}')
 
-    camera_configs: dict[str, OpenCVCameraConfig | RealSenseCameraConfig] = {}
+    camera_configs: dict[str, OpenCVCameraConfig | RealSenseCameraConfig | HikrobotCameraConfig] = {}
     for camera_name, cfg in camera_entries.items():
         camera_type = cfg.get('type')
         if camera_type == 'intelrealsense':
@@ -276,6 +279,30 @@ def load_camera_configs(camera_config_path: str | Path) -> dict[str, OpenCVCamer
                 warmup_s=int(cfg.get('warmup_s', 1)),
                 fourcc=str(cfg.get('fourcc', _DEFAULT_OPENCV_FOURCC)),
                 backend=_coerce_opencv_backend(cfg.get('backend', _DEFAULT_OPENCV_BACKEND)),
+            )
+            continue
+        if camera_type == 'hikrobot':
+            image_shape = cfg.get('image_shape')
+            width = cfg.get('width')
+            height = cfg.get('height')
+            if image_shape is not None:
+                if not isinstance(image_shape, (list, tuple)) or len(image_shape) != 2:
+                    raise ValueError(f"hikrobot camera '{camera_name}' must use image_shape=[height, width]")
+                height, width = int(image_shape[0]), int(image_shape[1])
+            if width is None or height is None:
+                raise ValueError(f"hikrobot camera '{camera_name}' requires width/height or image_shape")
+
+            camera_configs[camera_name] = HikrobotCameraConfig(
+                serial=str(cfg['serial']) if cfg.get('serial') is not None else None,
+                device_index=int(cfg['device_index']) if cfg.get('device_index') is not None else None,
+                width=int(width),
+                height=int(height),
+                fps=int(cfg['fps']),
+                warmup_s=int(cfg.get('warmup_s', 1)),
+                transport_layer=str(cfg.get('transport_layer', 'usb')),
+                exposure_us=float(cfg['exposure_us']) if cfg.get('exposure_us') is not None else None,
+                gain_db=float(cfg['gain_db']) if cfg.get('gain_db') is not None else None,
+                timeout_ms=int(cfg.get('timeout_ms', 1000)),
             )
             continue
         raise ValueError(f"Unsupported camera type '{camera_type}' in {config_path} for {camera_name}")
