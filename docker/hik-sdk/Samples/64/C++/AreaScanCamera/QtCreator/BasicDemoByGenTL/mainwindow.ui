@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>749</width>
+    <height>507</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>MainWindow</string>
+  </property>
+  <widget class="QWidget" name="centralWidget">
+   <layout class="QHBoxLayout" name="horizontalLayout" stretch="5,3">
+    <item>
+     <layout class="QVBoxLayout" name="verticalLayout_2" stretch="1,10">
+      <item>
+       <layout class="QFormLayout" name="formLayout">
+        <property name="horizontalSpacing">
+         <number>0</number>
+        </property>
+        <property name="verticalSpacing">
+         <number>6</number>
+        </property>
+        <item row="0" column="0">
+         <widget class="QLabel" name="Interfacelabel">
+          <property name="text">
+           <string>Interface:</string>
+          </property>
+         </widget>
+        </item>
+        <item row="0" column="1">
+         <widget class="QComboBox" name="InterfacecomboBox"/>
+        </item>
+        <item row="1" column="0">
+         <widget class="QLabel" name="Devicelabel">
+          <property name="text">
+           <string>Device:</string>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="1">
+         <widget class="QComboBox" name="DevicecomboBox"/>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <widget class="QWidget" name="widgetDisplay" native="true">
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>300</height>
+         </size>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <layout class="QVBoxLayout" name="verticalLayout_3" stretch="1,1,6">
+      <property name="topMargin">
+       <number>10</number>
+      </property>
+      <item>
+       <widget class="QPushButton" name="EnumInterface">
+        <property name="text">
+         <string>枚举Interface</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="EnumDevice">
+        <property name="text">
+         <string>枚举设备</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <layout class="QGridLayout" name="gridLayout">
+        <property name="sizeConstraint">
+         <enum>QLayout::SetDefaultConstraint</enum>
+        </property>
+        <property name="topMargin">
+         <number>0</number>
+        </property>
+        <property name="horizontalSpacing">
+         <number>10</number>
+        </property>
+        <property name="verticalSpacing">
+         <number>20</number>
+        </property>
+        <item row="0" column="0">
+         <widget class="QPushButton" name="OpenDevice">
+          <property name="text">
+           <string>打开设备</string>
+          </property>
+         </widget>
+        </item>
+        <item row="0" column="1">
+         <widget class="QPushButton" name="CloseDevice">
+          <property name="text">
+           <string>关闭设备</string>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="0">
+         <widget class="QRadioButton" name="ContinueRadioButton">
+          <property name="text">
+           <string>连续模式</string>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="1">
+         <widget class="QRadioButton" name="TriggerRadioButton">
+          <property name="text">
+           <string>触发模式</string>
+          </property>
+         </widget>
+        </item>
+        <item row="2" column="0">
+         <widget class="QPushButton" name="StartGrab">
+          <property name="text">
+           <string>开始采集</string>
+          </property>
+         </widget>
+        </item>
+        <item row="2" column="1">
+         <widget class="QPushButton" name="StopGrab">
+          <property name="text">
+           <string>停止采集</string>
+          </property>
+         </widget>
+        </item>
+        <item row="3" column="0">
+         <widget class="QCheckBox" name="SoftCheckBox">
+          <property name="text">
+           <string>软触发</string>
+          </property>
+         </widget>
+        </item>
+        <item row="3" column="1">
+         <widget class="QPushButton" name="SoftOnceButton">
+          <property name="text">
+           <string>软触发一次</string>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+     </layout>
+    </item>
+   </layout>
+  </widget>
+ </widget>
+ <layoutdefault spacing="6" margin="11"/>
+ <resources/>
+ <connections/>
+</ui>

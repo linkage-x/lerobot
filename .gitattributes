@@ -19,3 +19,8 @@
 *.json !text !filter !merge !diff
 tests/artifacts/cameras/*.png filter=lfs diff=lfs merge=lfs -text
 *.bag filter=lfs diff=lfs merge=lfs -text
+docker/hik-sdk/*.deb filter=lfs diff=lfs merge=lfs -text
+docker/hik-sdk/**/*.deb filter=lfs diff=lfs merge=lfs -text
+docker/hik-sdk/**/*.dll filter=lfs diff=lfs merge=lfs -text
+docker/hik-sdk/**/*.jar filter=lfs diff=lfs merge=lfs -text
+docker/hik-sdk/**/*.qm filter=lfs diff=lfs merge=lfs -text

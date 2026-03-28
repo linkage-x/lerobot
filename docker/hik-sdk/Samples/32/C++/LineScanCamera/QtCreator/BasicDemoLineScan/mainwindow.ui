@@ -1,0 +1,351 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1200</width>
+    <height>800</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>MainWindow</string>
+  </property>
+  <widget class="QWidget" name="centralWidget">
+   <layout class="QHBoxLayout" name="horizontalLayout" stretch="5,4">
+    <item>
+     <layout class="QVBoxLayout" name="verticalLayout" stretch="1,10">
+      <item>
+       <widget class="QComboBox" name="EnumCombo"/>
+      </item>
+      <item>
+       <widget class="QWidget" name="DisplayWidget" native="true"/>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <layout class="QVBoxLayout" name="verticalLayout_2" stretch="1,4,1,5">
+      <item>
+       <widget class="QGroupBox" name="groupBox">
+        <property name="title">
+         <string>初始化</string>
+        </property>
+        <layout class="QGridLayout" name="gridLayout">
+         <item row="0" column="0">
+          <widget class="QPushButton" name="EnumButton">
+           <property name="maximumSize">
+            <size>
+             <width>150</width>
+             <height>30</height>
+            </size>
+           </property>
+           <property name="text">
+            <string>查找设备</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1">
+          <widget class="QPushButton" name="OpenButton">
+           <property name="maximumSize">
+            <size>
+             <width>150</width>
+             <height>30</height>
+            </size>
+           </property>
+           <property name="text">
+            <string>打开设备</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="2">
+          <widget class="QPushButton" name="CloseButton">
+           <property name="maximumSize">
+            <size>
+             <width>150</width>
+             <height>30</height>
+            </size>
+           </property>
+           <property name="text">
+            <string>关闭设备</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QGroupBox" name="groupBox_2">
+        <property name="title">
+         <string>图像采集 </string>
+        </property>
+        <layout class="QGridLayout" name="gridLayout_2">
+         <item row="1" column="1" colspan="2">
+          <widget class="QComboBox" name="SelchangeTriggerselCombo"/>
+         </item>
+         <item row="1" column="0">
+          <widget class="QLabel" name="label">
+           <property name="text">
+            <string>触发选项</string>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="0">
+          <widget class="QLabel" name="label_3">
+           <property name="text">
+            <string>触发源</string>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="1" colspan="2">
+          <widget class="QComboBox" name="SelchangeTriggersourceCombo"/>
+         </item>
+         <item row="0" column="0">
+          <widget class="QPushButton" name="StartGrabbingButton">
+           <property name="maximumSize">
+            <size>
+             <width>150</width>
+             <height>30</height>
+            </size>
+           </property>
+           <property name="text">
+            <string>开始采集</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="0">
+          <widget class="QLabel" name="label_2">
+           <property name="text">
+            <string>触发开关</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="2">
+          <widget class="QPushButton" name="StopGrabbingButton">
+           <property name="maximumSize">
+            <size>
+             <width>150</width>
+             <height>30</height>
+            </size>
+           </property>
+           <property name="text">
+            <string>停止采集</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="1" colspan="2">
+          <widget class="QComboBox" name="SelchangeTriggerswitchCombo"/>
+         </item>
+         <item row="4" column="1">
+          <widget class="QPushButton" name="SoftwareOnceButton">
+           <property name="maximumSize">
+            <size>
+             <width>200</width>
+             <height>30</height>
+            </size>
+           </property>
+           <property name="text">
+            <string>执行一次触发</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+        <zorder>SelchangeTriggerselCombo</zorder>
+        <zorder>StopGrabbingButton</zorder>
+        <zorder>label</zorder>
+        <zorder>label_2</zorder>
+        <zorder>label_3</zorder>
+        <zorder>SelchangeTriggerswitchCombo</zorder>
+        <zorder>SelchangeTriggersourceCombo</zorder>
+        <zorder>StartGrabbingButton</zorder>
+        <zorder>SoftwareOnceButton</zorder>
+       </widget>
+      </item>
+      <item>
+       <widget class="QGroupBox" name="groupBox_3">
+        <property name="title">
+         <string>图片保存</string>
+        </property>
+        <layout class="QGridLayout" name="gridLayout_3">
+         <item row="0" column="0">
+          <widget class="QPushButton" name="SaveBmpButton">
+           <property name="maximumSize">
+            <size>
+             <width>200</width>
+             <height>30</height>
+            </size>
+           </property>
+           <property name="text">
+            <string>保存BMP</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1">
+          <widget class="QPushButton" name="SaveJpgButton">
+           <property name="maximumSize">
+            <size>
+             <width>200</width>
+             <height>30</height>
+            </size>
+           </property>
+           <property name="text">
+            <string>保存JPG</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="2">
+          <widget class="QPushButton" name="SaveTiffButton">
+           <property name="maximumSize">
+            <size>
+             <width>200</width>
+             <height>30</height>
+            </size>
+           </property>
+           <property name="text">
+            <string>保存tiff</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="3">
+          <widget class="QPushButton" name="SavePngButton">
+           <property name="maximumSize">
+            <size>
+             <width>200</width>
+             <height>30</height>
+            </size>
+           </property>
+           <property name="text">
+            <string>保存png</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QGroupBox" name="groupBox_4">
+        <property name="title">
+         <string>参数</string>
+        </property>
+        <layout class="QGridLayout" name="gridLayout_5">
+         <item row="0" column="0" colspan="2">
+          <layout class="QGridLayout" name="gridLayout_4" columnminimumwidth="10,1">
+           <item row="0" column="0">
+            <widget class="QLabel" name="label_7">
+             <property name="text">
+              <string>像素格式</string>
+             </property>
+            </widget>
+           </item>
+           <item row="0" column="1">
+            <widget class="QComboBox" name="SelchangePixelformatCombo"/>
+           </item>
+           <item row="1" column="0">
+            <widget class="QLabel" name="label_8">
+             <property name="text">
+              <string>HB模式</string>
+             </property>
+            </widget>
+           </item>
+           <item row="1" column="1">
+            <widget class="QComboBox" name="SelchangeImageCompressionModeCombo"/>
+           </item>
+           <item row="2" column="0">
+            <widget class="QLabel" name="label_9">
+             <property name="text">
+              <string>曝光</string>
+             </property>
+            </widget>
+           </item>
+           <item row="2" column="1">
+            <widget class="QLineEdit" name="ExposureTimeLineEdit"/>
+           </item>
+           <item row="3" column="0">
+            <widget class="QLabel" name="label_10">
+             <property name="text">
+              <string>模拟增益</string>
+             </property>
+            </widget>
+           </item>
+           <item row="3" column="1">
+            <widget class="QComboBox" name="SelchangePreampgainCombo"/>
+           </item>
+           <item row="4" column="0">
+            <widget class="QLabel" name="label_11">
+             <property name="text">
+              <string>数字增益</string>
+             </property>
+            </widget>
+           </item>
+           <item row="4" column="1">
+            <widget class="QLineEdit" name="PreampGainLineEdit"/>
+           </item>
+           <item row="5" column="0">
+            <widget class="QLabel" name="label_12">
+             <property name="text">
+              <string>行频设定值
+</string>
+             </property>
+            </widget>
+           </item>
+           <item row="5" column="1">
+            <widget class="QLineEdit" name="AcquisitionLineRateLineEdit"/>
+           </item>
+           <item row="6" column="0" colspan="2">
+            <widget class="QCheckBox" name="AcquisitionLineRateEnableCheckBox">
+             <property name="text">
+              <string>行频使能开关</string>
+             </property>
+            </widget>
+           </item>
+           <item row="7" column="0">
+            <widget class="QLabel" name="label_13">
+             <property name="text">
+              <string>实际行频</string>
+             </property>
+            </widget>
+           </item>
+           <item row="7" column="1">
+            <widget class="QLineEdit" name="ResultingLineRateLineEdit"/>
+           </item>
+          </layout>
+         </item>
+         <item row="1" column="0">
+          <widget class="QPushButton" name="GetParameterButton">
+           <property name="maximumSize">
+            <size>
+             <width>200</width>
+             <height>30</height>
+            </size>
+           </property>
+           <property name="text">
+            <string>参数获取</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="1">
+          <widget class="QPushButton" name="SetParameterButton">
+           <property name="maximumSize">
+            <size>
+             <width>200</width>
+             <height>30</height>
+            </size>
+           </property>
+           <property name="text">
+            <string>参数设置</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+     </layout>
+    </item>
+   </layout>
+  </widget>
+ </widget>
+ <layoutdefault spacing="6" margin="11"/>
+ <resources/>
+ <connections/>
+</ui>

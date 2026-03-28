@@ -1,0 +1,261 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MultiLightCtrlDemo</class>
+ <widget class="QMainWindow" name="MultiLightCtrlDemo">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1121</width>
+    <height>662</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>MultiLightCtrlDemo</string>
+  </property>
+  <widget class="QWidget" name="centralWidget">
+   <layout class="QHBoxLayout" name="horizontalLayout" stretch="5,2">
+    <item>
+     <layout class="QVBoxLayout" name="verticalLayout" stretch="1,10">
+      <item>
+       <layout class="QGridLayout" name="gridLayout" columnstretch="1,5">
+        <item row="0" column="0">
+         <widget class="QLabel" name="label_2">
+          <property name="text">
+           <string>Device:</string>
+          </property>
+         </widget>
+        </item>
+        <item row="0" column="1">
+         <widget class="QComboBox" name="DevicecomboBox"/>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <layout class="QGridLayout" name="gridLayout_2" rowstretch="1,1" columnstretch="1,1">
+        <item row="0" column="0">
+         <widget class="QWidget" name="Display1widget" native="true"/>
+        </item>
+        <item row="0" column="1">
+         <widget class="QWidget" name="Display2widget" native="true"/>
+        </item>
+        <item row="1" column="0">
+         <widget class="QWidget" name="Display3widget" native="true"/>
+        </item>
+        <item row="1" column="1">
+         <widget class="QWidget" name="Display4widget" native="true"/>
+        </item>
+       </layout>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <layout class="QVBoxLayout" name="verticalLayout_2" stretch="5,5">
+      <property name="spacing">
+       <number>10</number>
+      </property>
+      <property name="topMargin">
+       <number>30</number>
+      </property>
+      <property name="bottomMargin">
+       <number>10</number>
+      </property>
+      <item>
+       <widget class="QGroupBox" name="groupBox">
+        <property name="title">
+         <string>设备</string>
+        </property>
+        <widget class="QPushButton" name="EnumDeviceButton">
+         <property name="geometry">
+          <rect>
+           <x>20</x>
+           <y>30</y>
+           <width>281</width>
+           <height>27</height>
+          </rect>
+         </property>
+         <property name="text">
+          <string>枚举设备</string>
+         </property>
+        </widget>
+        <widget class="QPushButton" name="OpenButton">
+         <property name="geometry">
+          <rect>
+           <x>20</x>
+           <y>80</y>
+           <width>131</width>
+           <height>27</height>
+          </rect>
+         </property>
+         <property name="text">
+          <string>打开设备</string>
+         </property>
+        </widget>
+        <widget class="QPushButton" name="CloseButton">
+         <property name="geometry">
+          <rect>
+           <x>170</x>
+           <y>80</y>
+           <width>131</width>
+           <height>27</height>
+          </rect>
+         </property>
+         <property name="text">
+          <string>关闭设备</string>
+         </property>
+        </widget>
+        <widget class="QComboBox" name="MultiLightcomboBox">
+         <property name="geometry">
+          <rect>
+           <x>130</x>
+           <y>200</y>
+           <width>171</width>
+           <height>21</height>
+          </rect>
+         </property>
+        </widget>
+        <widget class="QLabel" name="label_3">
+         <property name="geometry">
+          <rect>
+           <x>40</x>
+           <y>204</y>
+           <width>61</width>
+           <height>17</height>
+          </rect>
+         </property>
+         <property name="text">
+          <string>多灯控制:</string>
+         </property>
+        </widget>
+        <widget class="QCheckBox" name="chkUserInput">
+         <property name="geometry">
+          <rect>
+           <x>20</x>
+           <y>131</y>
+           <width>141</width>
+           <height>22</height>
+          </rect>
+         </property>
+         <property name="text">
+          <string>用户输入拆分节点数</string>
+         </property>
+        </widget>
+        <widget class="QCheckBox" name="chkCamNode">
+         <property name="geometry">
+          <rect>
+           <x>20</x>
+           <y>170</y>
+           <width>111</width>
+           <height>22</height>
+          </rect>
+         </property>
+         <property name="text">
+          <string>相机节点获取</string>
+         </property>
+        </widget>
+        <widget class="QLineEdit" name="txtUserInput">
+         <property name="geometry">
+          <rect>
+           <x>170</x>
+           <y>130</y>
+           <width>131</width>
+           <height>21</height>
+          </rect>
+         </property>
+        </widget>
+       </widget>
+      </item>
+      <item>
+       <widget class="QGroupBox" name="groupBox_3">
+        <property name="title">
+         <string>图像采集</string>
+        </property>
+        <widget class="QPushButton" name="StartButton">
+         <property name="geometry">
+          <rect>
+           <x>10</x>
+           <y>70</y>
+           <width>131</width>
+           <height>27</height>
+          </rect>
+         </property>
+         <property name="text">
+          <string>开始采集</string>
+         </property>
+        </widget>
+        <widget class="QPushButton" name="StopButton">
+         <property name="geometry">
+          <rect>
+           <x>160</x>
+           <y>70</y>
+           <width>141</width>
+           <height>27</height>
+          </rect>
+         </property>
+         <property name="text">
+          <string>停止采集</string>
+         </property>
+        </widget>
+        <widget class="QRadioButton" name="ContinusRadioButton">
+         <property name="geometry">
+          <rect>
+           <x>10</x>
+           <y>30</y>
+           <width>151</width>
+           <height>22</height>
+          </rect>
+         </property>
+         <property name="text">
+          <string>连续模式</string>
+         </property>
+        </widget>
+        <widget class="QRadioButton" name="TriggerRadioButton">
+         <property name="geometry">
+          <rect>
+           <x>160</x>
+           <y>30</y>
+           <width>131</width>
+           <height>22</height>
+          </rect>
+         </property>
+         <property name="text">
+          <string>触发模式</string>
+         </property>
+        </widget>
+        <widget class="QCheckBox" name="SoftwareCheckBox">
+         <property name="geometry">
+          <rect>
+           <x>10</x>
+           <y>120</y>
+           <width>161</width>
+           <height>22</height>
+          </rect>
+         </property>
+         <property name="text">
+          <string>软触发</string>
+         </property>
+        </widget>
+        <widget class="QPushButton" name="SoftwareButton">
+         <property name="geometry">
+          <rect>
+           <x>160</x>
+           <y>120</y>
+           <width>141</width>
+           <height>27</height>
+          </rect>
+         </property>
+         <property name="text">
+          <string>软触发一次</string>
+         </property>
+        </widget>
+       </widget>
+      </item>
+     </layout>
+    </item>
+   </layout>
+  </widget>
+ </widget>
+ <layoutdefault spacing="6" margin="11"/>
+ <resources/>
+ <connections/>
+</ui>

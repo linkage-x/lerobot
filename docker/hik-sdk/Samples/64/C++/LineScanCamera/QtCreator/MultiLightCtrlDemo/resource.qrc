@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/">
+        <file>MultiLightCtrlDemo_zh_EN.qm</file>
+    </qresource>
+</RCC>
