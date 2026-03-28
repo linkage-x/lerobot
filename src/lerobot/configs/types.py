@@ -36,6 +36,7 @@ class NormalizationMode(str, Enum):
     MEAN_STD = "MEAN_STD"
     IDENTITY = "IDENTITY"
     QUANTILES = "QUANTILES"
+    QUANTILE02 = "QUANTILE02"
     QUANTILE10 = "QUANTILE10"
 
 

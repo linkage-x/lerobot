@@ -31,6 +31,7 @@ from lerobot.cameras.hikrobot.configuration_hikrobot import (
 )
 from lerobot.cameras.hikrobot.configuration_hikrobot import ColorMode
 from lerobot.robots import RobotConfig
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
 from lerobot.scripts.lerobot_record import (
     DatasetRecordConfig,
@@ -188,6 +189,11 @@ def test_record_higher_control_fps_keeps_dataset_fps(tmp_path):
     assert dataset.fps == 30
     assert dataset.meta.total_episodes == dataset.num_episodes == 1
     assert dataset.meta.total_frames == dataset.num_frames == 3
+
+    reloaded_dataset = LeRobotDataset(DUMMY_REPO_ID, root=dataset_cfg.root)
+    raw_dataset = reloaded_dataset.hf_dataset.with_format(None)
+    expected_timestamps = [frame_index / reloaded_dataset.fps for frame_index in raw_dataset["frame_index"]]
+    assert raw_dataset["timestamp"] == pytest.approx(expected_timestamps)
 
 
 def test_record_config_uses_hikrobot_recording_profile_defaults(tmp_path):

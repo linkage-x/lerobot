@@ -256,6 +256,107 @@ sudo env HOME=/home/hph python tools/fr3/fr3_act_infer_real.py \
   --max-step-rot-delta-deg=2
 ```
 
+## Recommended Intermediate Checkpoint Evaluation Cadence
+
+This section records the current recommendation for the ongoing FR3 `mask2ee` training runs.
+
+Current assumption:
+
+- training uses `save_freq=20000`
+- training uses `eval_freq=0`
+- this means there is no automatic in-training evaluation signal beyond the training logs
+
+### Practical Gate Order
+
+Use this order for intermediate checkpoints:
+
+1. wait for `020000`
+2. run offline dataset-fed evaluation first
+3. only if offline behavior is directionally sane, run `preview`
+4. only if preview is stable, run a short real-robot rollout
+5. only after a short real rollout looks controlled, consider a longer rollout
+
+### Recommended First Checkpoint
+
+For the current run shape, the first meaningful checkpoint to inspect is:
+
+- `020000`
+
+Reason:
+
+- earlier in-run states are not saved anyway with `save_freq=20000`
+- the first saved checkpoint is the earliest low-cost chance to detect broken observation/action contracts
+- for `mask2ee`, early optimization is expected to be noisier than a version that directly exposes live EE pose
+
+### Recommended Sequence For `020000`
+
+1. offline check:
+
+```bash
+sudo env HOME=/home/hph python tools/fr3/fr3_check_policy_dataset_frame.py \
+  --checkpoint=outputs/train/${RUN_NAME}/checkpoints/020000 \
+  --dataset-root=outputs/datasets/lerobotv3_0310_100ep_aligned_ts \
+  --episodes=0,13 \
+  --frame-indices=0,1,2,4,8,16,24,32,40
+```
+
+2. preview only if the offline results are at least directionally plausible:
+
+```bash
+sudo env HOME=/home/hph python tools/fr3/fr3_act_infer_real.py \
+  --checkpoint=outputs/train/${RUN_NAME}/checkpoints/020000 \
+  --camera-config=tools/fr3/fr3_act_infer_camera_config.yaml \
+  --dataset-root=outputs/datasets/lerobotv3_0310_100ep_aligned_ts \
+  --preview \
+  --max-steps=5 \
+  --first-frame-max-pos-delta-mm=20 \
+  --first-frame-max-rot-delta-deg=8 \
+  --max-step-pos-delta-mm=3 \
+  --max-step-rot-delta-deg=2
+```
+
+3. short real rollout only if preview is stable:
+
+```bash
+sudo env HOME=/home/hph python tools/fr3/fr3_act_infer_real.py \
+  --checkpoint=outputs/train/${RUN_NAME}/checkpoints/020000 \
+  --camera-config=tools/fr3/fr3_act_infer_camera_config.yaml \
+  --dataset-root=outputs/datasets/lerobotv3_0310_100ep_aligned_ts \
+  --max-steps=10 \
+  --first-frame-max-pos-delta-mm=20 \
+  --first-frame-max-rot-delta-deg=8 \
+  --max-step-pos-delta-mm=3 \
+  --max-step-rot-delta-deg=2
+```
+
+4. if the short real rollout is controlled, then consider increasing to:
+
+- `--max-steps=30`
+
+### Stop Conditions
+
+If `020000` fails at a gate, stop and wait for the next checkpoint instead of forcing a real rollout.
+
+Current stop rules:
+
+- offline bad: do not run preview or real rollout yet
+- preview unstable: do not run real rollout yet
+- short real rollout unstable: do not extend rollout length yet
+
+In practice, the next checkpoint to compare against is usually:
+
+- `040000`
+
+### Why This Gate Order Matters
+
+This gate order is intentional:
+
+- offline checks are cheap and isolate model quality from robot execution risk
+- preview checks runtime contract and safety gates without sending actions
+- short real rollouts reduce the chance of conflating immature policy behavior with hardware-side execution issues
+
+Given `eval_freq=0`, the offline check is the main quality gate for deciding whether an intermediate checkpoint is mature enough to justify preview or hardware time.
+
 ## Failure Modes To Recheck
 
 If `mask2ee` appears ineffective, check these first:

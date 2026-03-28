@@ -187,6 +187,45 @@ sudo env HOME=/home/hph docker compose --profile train -f docker/docker-compose.
   --wandb.project=fr3-act-das
 ```
 
+```
+cd /home/hph/Code/lerobot-replay
+
+export WANDB_API_KEY=你的_wandb_api_key
+RUN_NAME=fr3_ee2ee_act_das_state_q02q98_$(date +%Y%m%d_%H%M%S)
+
+screen -L -Logfile outputs/train/${RUN_NAME}.screen.log -dmS "${RUN_NAME}" bash -lc "
+cd /home/hph/Code/lerobot-replay &&
+sudo env HOME=/home/hph docker compose --profile train -f docker/docker-compose.yml run --rm \
+  -e WANDB_API_KEY=$WANDB_API_KEY \
+  lerobot-train-fr3-act-das \
+  lerobot-train \
+  --config_path=src/lerobot/configs/franka_research3_ee2ee_act_das_state_q02q98.yaml \
+  --dataset.root=outputs/datasets/lerobotv3_0310_100ep_aligned_ts \
+  --output_dir=outputs/train/${RUN_NAME} \
+  --job_name=${RUN_NAME} \
+  --policy.device=cuda \
+  --policy.push_to_hub=false \
+  --batch_size=8 \
+  --num_workers=12 \
+  --steps=100000 \
+  --log_freq=200 \
+  --eval_freq=0 \
+  --save_checkpoint=true \
+  --save_freq=20000 \
+  --tolerance_s=1e-3 \
+  --wandb.enable=true \
+  --wandb.project=fr3-act-das-ee2ee-state-q02q98
+"
+```
+
+看日志用：
+
+`screen -r "${RUN_NAME}"`
+
+如果只是看后台输出文件：
+
+`tail -f outputs/train/${RUN_NAME}.screen.log`
+
 ```bash
 sudo env HOME=/home/hph ACCELERATE_NUM_PROCESSES=2 ACCELERATE_MIXED_PRECISION=bf16 \
   docker compose --profile train --profile multi-gpu -f docker/docker-compose.yml run --rm lerobot-train-fr3-act-multi-gpu

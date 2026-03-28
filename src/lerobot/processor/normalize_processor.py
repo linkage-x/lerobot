@@ -288,6 +288,7 @@ class _NormalizationMixin:
           - MEAN_STD: Centers data around zero with unit variance.
           - MIN_MAX: Scales data to [-1, 1] range using actual min/max values.
           - QUANTILES: Scales data to [-1, 1] range using 1st and 99th percentiles (q01/q99).
+          - QUANTILE02: Scales data to [-1, 1] range using 2nd and 98th percentiles (q02/q98).
           - QUANTILE10: Scales data to [-1, 1] range using 10th and 90th percentiles (q10/q90).
 
         Args:
@@ -310,6 +311,7 @@ class _NormalizationMixin:
             NormalizationMode.MEAN_STD,
             NormalizationMode.MIN_MAX,
             NormalizationMode.QUANTILES,
+            NormalizationMode.QUANTILE02,
             NormalizationMode.QUANTILE10,
         ):
             raise ValueError(f"Unsupported normalization mode: {norm_mode}")
@@ -375,6 +377,23 @@ class _NormalizationMixin:
             if inverse:
                 return (tensor + 1.0) * denom / 2.0 + q01
             return 2.0 * (tensor - q01) / denom - 1.0
+
+        if norm_mode == NormalizationMode.QUANTILE02:
+            q02 = stats.get("q02", None)
+            q98 = stats.get("q98", None)
+            if q02 is None or q98 is None:
+                raise ValueError(
+                    "QUANTILE02 normalization mode requires q02 and q98 stats, please update the dataset with the correct stats"
+                )
+
+            denom = q98 - q02
+            # Avoid division by zero by adding epsilon when quantiles are identical
+            denom = torch.where(
+                denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
+            )
+            if inverse:
+                return (tensor + 1.0) * denom / 2.0 + q02
+            return 2.0 * (tensor - q02) / denom - 1.0
 
         if norm_mode == NormalizationMode.QUANTILE10:
             q10 = stats.get("q10", None)

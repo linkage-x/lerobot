@@ -21,7 +21,6 @@ policy:
   tactile_encoder_residual_blocks: 1
   tactile_encoder_use_se: true
   tactile_transformer_layers: 1
-  mask_ee_pose_in_state: true
   normalization_mapping:
     VISUAL: MEAN_STD
     STATE: QUANTILE02
@@ -45,4 +44,4 @@ save_freq: 20000
 tolerance_s: 1.0e-3
 
 wandb:
-  enable: true
+  enable: false

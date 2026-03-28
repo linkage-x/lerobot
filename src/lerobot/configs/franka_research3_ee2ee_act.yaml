@@ -27,4 +27,5 @@ save_freq: 20000
 tolerance_s: 1.0e-4
 
 wandb:
-  enable: false
+  enable: true
+  disable_artifact: true

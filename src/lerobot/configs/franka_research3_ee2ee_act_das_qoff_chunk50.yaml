@@ -21,13 +21,10 @@ policy:
   tactile_encoder_residual_blocks: 1
   tactile_encoder_use_se: true
   tactile_transformer_layers: 1
-  mask_ee_pose_in_state: true
-  normalization_mapping:
-    VISUAL: MEAN_STD
-    STATE: QUANTILE02
-    ACTION: MEAN_STD
-  chunk_size: 100
-  n_action_steps: 100
+  action_chunk_quantile_normalization: true
+  action_chunk_quantile_clip: false
+  chunk_size: 50
+  n_action_steps: 50
   vision_backbone: resnet18
   pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
   optimizer_lr: 1.0e-5
