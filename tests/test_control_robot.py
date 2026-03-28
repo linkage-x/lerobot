@@ -14,10 +14,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass, field
 from unittest.mock import patch
 
 import pytest
 
+from lerobot.cameras import CameraConfig
+from lerobot.cameras.hikrobot import HikrobotCameraConfig
+from lerobot.cameras.hikrobot.configuration_hikrobot import (
+    HIKROBOT_DEFAULT_COLOR_MODE,
+    HIKROBOT_DEFAULT_EXPOSURE_US,
+    HIKROBOT_DEFAULT_GAIN_DB,
+    HIKROBOT_DEFAULT_GAMMA,
+    HIKROBOT_DEFAULT_LOCK_WHITE_BALANCE_AFTER_WARMUP,
+    HIKROBOT_DEFAULT_WARMUP_S,
+)
+from lerobot.cameras.hikrobot.configuration_hikrobot import ColorMode
+from lerobot.robots import RobotConfig
 from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
 from lerobot.scripts.lerobot_record import (
     DatasetRecordConfig,
@@ -32,6 +45,24 @@ from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
 from tests.fixtures.constants import DUMMY_REPO_ID
 from tests.mocks.mock_robot import MockRobotConfig
 from tests.mocks.mock_teleop import MockTeleopConfig
+
+
+@dataclass(kw_only=True)
+class _HikrobotConfigSurfaceRobot(RobotConfig):
+    cameras: dict[str, CameraConfig] = field(default_factory=dict)
+
+    def __post_init__(self):
+        super().__post_init__()
+
+
+def _make_hikrobot_camera_config(**overrides) -> HikrobotCameraConfig:
+    return HikrobotCameraConfig(
+        serial="LEFT123",
+        width=1280,
+        height=720,
+        fps=30,
+        **overrides,
+    )
 
 
 def test_calibrate():
@@ -157,6 +188,86 @@ def test_record_higher_control_fps_keeps_dataset_fps(tmp_path):
     assert dataset.fps == 30
     assert dataset.meta.total_episodes == dataset.num_episodes == 1
     assert dataset.meta.total_frames == dataset.num_frames == 3
+
+
+def test_record_config_uses_hikrobot_recording_profile_defaults(tmp_path):
+    robot_cfg = _HikrobotConfigSurfaceRobot(cameras={"front": _make_hikrobot_camera_config()})
+    cfg = RecordConfig(
+        robot=robot_cfg,
+        dataset=DatasetRecordConfig(
+            repo_id=DUMMY_REPO_ID,
+            single_task="Dummy task",
+            root=tmp_path / "hikrobot_record_cfg",
+            num_episodes=1,
+            episode_time_s=0.1,
+            reset_time_s=0,
+            push_to_hub=False,
+        ),
+        teleop=MockTeleopConfig(),
+        play_sounds=False,
+    )
+
+    camera_cfg = cfg.robot.cameras["front"]
+    assert camera_cfg.color_mode == HIKROBOT_DEFAULT_COLOR_MODE
+    assert camera_cfg.warmup_s == HIKROBOT_DEFAULT_WARMUP_S
+    assert camera_cfg.exposure_us == HIKROBOT_DEFAULT_EXPOSURE_US
+    assert camera_cfg.gain_db == HIKROBOT_DEFAULT_GAIN_DB
+    assert camera_cfg.gamma == HIKROBOT_DEFAULT_GAMMA
+    assert camera_cfg.lock_white_balance_after_warmup is HIKROBOT_DEFAULT_LOCK_WHITE_BALANCE_AFTER_WARMUP
+
+
+def test_teleoperate_config_uses_hikrobot_recording_profile_defaults():
+    robot_cfg = _HikrobotConfigSurfaceRobot(cameras={"front": _make_hikrobot_camera_config()})
+    cfg = TeleoperateConfig(
+        robot=robot_cfg,
+        teleop=MockTeleopConfig(),
+        teleop_time_s=0.1,
+    )
+
+    camera_cfg = cfg.robot.cameras["front"]
+    assert camera_cfg.color_mode == HIKROBOT_DEFAULT_COLOR_MODE
+    assert camera_cfg.warmup_s == HIKROBOT_DEFAULT_WARMUP_S
+    assert camera_cfg.exposure_us == HIKROBOT_DEFAULT_EXPOSURE_US
+    assert camera_cfg.gain_db == HIKROBOT_DEFAULT_GAIN_DB
+    assert camera_cfg.gamma == HIKROBOT_DEFAULT_GAMMA
+    assert camera_cfg.lock_white_balance_after_warmup is HIKROBOT_DEFAULT_LOCK_WHITE_BALANCE_AFTER_WARMUP
+
+
+def test_explicit_hikrobot_camera_overrides_are_preserved_in_record_config(tmp_path):
+    robot_cfg = _HikrobotConfigSurfaceRobot(
+        cameras={
+            "front": _make_hikrobot_camera_config(
+                color_mode=ColorMode.RGB,
+                warmup_s=0,
+                exposure_us=8000.0,
+                gain_db=8.0,
+                gamma=None,
+                lock_white_balance_after_warmup=False,
+            )
+        }
+    )
+    cfg = RecordConfig(
+        robot=robot_cfg,
+        dataset=DatasetRecordConfig(
+            repo_id=DUMMY_REPO_ID,
+            single_task="Dummy task",
+            root=tmp_path / "hikrobot_record_override_cfg",
+            num_episodes=1,
+            episode_time_s=0.1,
+            reset_time_s=0,
+            push_to_hub=False,
+        ),
+        teleop=MockTeleopConfig(),
+        play_sounds=False,
+    )
+
+    camera_cfg = cfg.robot.cameras["front"]
+    assert camera_cfg.color_mode == ColorMode.RGB
+    assert camera_cfg.warmup_s == 0
+    assert camera_cfg.exposure_us == 8000.0
+    assert camera_cfg.gain_db == 8.0
+    assert camera_cfg.gamma is None
+    assert camera_cfg.lock_white_balance_after_warmup is False
 
 
 class StartableRobot:

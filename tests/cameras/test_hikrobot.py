@@ -21,6 +21,14 @@ import ctypes
 import numpy as np
 
 from lerobot.cameras.hikrobot import HikrobotCamera, HikrobotCameraConfig
+from lerobot.cameras.hikrobot.configuration_hikrobot import (
+    HIKROBOT_DEFAULT_COLOR_MODE,
+    HIKROBOT_DEFAULT_EXPOSURE_US,
+    HIKROBOT_DEFAULT_GAIN_DB,
+    HIKROBOT_DEFAULT_GAMMA,
+    HIKROBOT_DEFAULT_LOCK_WHITE_BALANCE_AFTER_WARMUP,
+    HIKROBOT_DEFAULT_WARMUP_S,
+)
 
 
 class _FakeIntValue:
@@ -216,6 +224,18 @@ def test_find_cameras(monkeypatch):
     monkeypatch.setattr("lerobot.cameras.hikrobot.camera_hikrobot._load_mvs_sdk", lambda: _FakeMVS)
     cameras = HikrobotCamera.find_cameras()
     assert [camera["id"] for camera in cameras] == ["LEFT123", "RIGHT456"]
+
+
+def test_default_config_matches_hikrobot_recording_profile():
+    config = HikrobotCameraConfig(serial="LEFT123", width=2, height=2, fps=30)
+
+    assert config.color_mode == HIKROBOT_DEFAULT_COLOR_MODE
+    assert config.warmup_s == HIKROBOT_DEFAULT_WARMUP_S
+    assert config.exposure_us == HIKROBOT_DEFAULT_EXPOSURE_US
+    assert config.gain_db == HIKROBOT_DEFAULT_GAIN_DB
+    assert config.gamma == HIKROBOT_DEFAULT_GAMMA
+    assert config.white_balance_auto == "continuous"
+    assert config.lock_white_balance_after_warmup is HIKROBOT_DEFAULT_LOCK_WHITE_BALANCE_AFTER_WARMUP
 
 
 def test_connect_read_disconnect():

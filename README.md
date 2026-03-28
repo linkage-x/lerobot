@@ -63,6 +63,36 @@ While these devices are natively integrated into the LeRobot codebase, the libra
 
 For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
 
+### FR3 + Hikrobot Examples
+
+Example FR3 configs for Hikrobot cameras are available at [tools/fr3/fr3_record_hikrobot_example.yaml](./tools/fr3/fr3_record_hikrobot_example.yaml) and [tools/fr3/fr3_teleoperate_hikrobot_example.yaml](./tools/fr3/fr3_teleoperate_hikrobot_example.yaml).
+
+Before using either example in Docker, rebuild the `lerobot-user` image with the Hikrobot MVS SDK enabled:
+
+```bash
+INSTALL_HIKROBOT_SDK=true docker compose build lerobot-user
+```
+
+Record an FR3 teleoperation dataset with Hikrobot cameras through the existing wrapper:
+
+```bash
+python tools/fr3/fr3_record.py \
+  --config-path tools/fr3/fr3_record_hikrobot_example.yaml
+```
+
+Run FR3 teleoperation with the same Hikrobot camera setup without recording a dataset:
+
+```bash
+docker compose run --rm lerobot-user bash -lc '
+cd /lerobot &&
+PYTHONPATH=/lerobot/src \
+/lerobot/.venv/bin/lerobot-teleoperate \
+  --config_path=/lerobot/tools/fr3/fr3_teleoperate_hikrobot_example.yaml
+'
+```
+
+Replace the FR3 IP, gripper port, dataset repo id, and Hikrobot serial numbers in those YAML files before running them.
+
 ## LeRobot Dataset
 
 To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.
