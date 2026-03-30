@@ -80,7 +80,28 @@ class _FakeSpecialInfo:
 
 class _FakeDeviceInfo:
     def __init__(self, serial: str) -> None:
+        self.nTLayerType = 1
         self.SpecialInfo = _FakeSpecialInfo(serial)
+
+
+class _FakeGigEInfo:
+    def __init__(self, serial: str, ip: str, model: str = "MV-CE060-10GC") -> None:
+        self.chSerialNumber = serial.encode("utf-8") + b"\x00"
+        self.chModelName = model.encode("utf-8") + b"\x00"
+        self.chManufacturerName = b"HIKROBOT\x00"
+        octets = [int(part) for part in ip.split(".")]
+        self.nCurrentIp = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
+
+
+class _FakeGigESpecialInfo:
+    def __init__(self, serial: str, ip: str) -> None:
+        self.stGigEInfo = _FakeGigEInfo(serial, ip)
+
+
+class _FakeGigEDeviceInfo:
+    def __init__(self, serial: str, ip: str) -> None:
+        self.nTLayerType = 2
+        self.SpecialInfo = _FakeGigESpecialInfo(serial, ip)
 
 
 class _FakeDeviceInfoList:
@@ -224,6 +245,39 @@ def test_find_cameras(monkeypatch):
     monkeypatch.setattr("lerobot.cameras.hikrobot.camera_hikrobot._load_mvs_sdk", lambda: _FakeMVS)
     cameras = HikrobotCamera.find_cameras()
     assert [camera["id"] for camera in cameras] == ["LEFT123", "RIGHT456"]
+    assert cameras[0]["serial"] == "LEFT123"
+    assert cameras[0]["transport_layer"] == "usb"
+
+
+def test_find_cameras_reports_gige_serial_and_current_ip(monkeypatch):
+    class _FakeMvCameraGigE(_FakeMvCamera):
+        _devices = [_FakeGigEDeviceInfo("GIGE123", "192.168.1.50")]
+
+        @staticmethod
+        def MV_CC_EnumDevices(_transport_flag, device_list) -> int:
+            device_list.nDeviceNum = len(_FakeMvCameraGigE._devices)
+            device_list.pDeviceInfo = list(_FakeMvCameraGigE._devices)
+            return 0
+
+    class _FakeMVSGigE(_FakeMVS):
+        MvCamera = _FakeMvCameraGigE
+
+    monkeypatch.setattr("lerobot.cameras.hikrobot.camera_hikrobot._load_mvs_sdk", lambda: _FakeMVSGigE)
+    cameras = HikrobotCamera.find_cameras()
+
+    assert cameras == [
+        {
+            "name": "Hikrobot Camera @ GIGE123",
+            "type": "Hikrobot",
+            "id": "GIGE123",
+            "device_index": 0,
+            "serial": "GIGE123",
+            "manufacturer": "HIKROBOT",
+            "model": "MV-CE060-10GC",
+            "transport_layer": "gige",
+            "current_ip": "192.168.1.50",
+        }
+    ]
 
 
 def test_default_config_matches_hikrobot_recording_profile():
@@ -251,6 +305,31 @@ def test_connect_read_disconnect():
 
     latest = camera.read_latest(max_age_ms=500)
     assert latest.shape == (2, 2, 3)
+
+    camera.disconnect()
+    assert not camera.is_connected
+
+
+def test_connect_gige_camera_by_serial():
+    class _FakeMvCameraGigE(_FakeMvCamera):
+        _devices = [_FakeGigEDeviceInfo("GIGE123", "192.168.1.50"), _FakeGigEDeviceInfo("GIGE456", "192.168.1.51")]
+
+        @staticmethod
+        def MV_CC_EnumDevices(_transport_flag, device_list) -> int:
+            device_list.nDeviceNum = len(_FakeMvCameraGigE._devices)
+            device_list.pDeviceInfo = list(_FakeMvCameraGigE._devices)
+            return 0
+
+    class _FakeMVSGigE(_FakeMVS):
+        MvCamera = _FakeMvCameraGigE
+
+    camera = HikrobotCamera(
+        HikrobotCameraConfig(serial="GIGE456", width=2, height=2, fps=30, warmup_s=0, transport_layer="gige"),
+        mvs_module=_FakeMVSGigE,
+    )
+
+    camera.connect(warmup=False)
+    assert camera.is_connected
 
     camera.disconnect()
     assert not camera.is_connected

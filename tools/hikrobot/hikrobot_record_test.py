@@ -25,7 +25,11 @@ import cv2  # type: ignore
 import numpy as np
 
 from lerobot.cameras.hikrobot import HikrobotCamera, HikrobotCameraConfig
-from lerobot.cameras.hikrobot.camera_hikrobot import _decode_char_buffer, _extract_device_info, _load_mvs_sdk
+from lerobot.cameras.hikrobot.camera_hikrobot import (
+    _extract_camera_metadata,
+    _extract_device_info,
+    _load_mvs_sdk,
+)
 from lerobot.cameras.hikrobot.configuration_hikrobot import (
     HIKROBOT_DEFAULT_COLOR_MODE,
     HIKROBOT_DEFAULT_EXPOSURE_US,
@@ -37,9 +41,15 @@ from lerobot.cameras.hikrobot.configuration_hikrobot import (
 )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Record a short Hikrobot camera validation video.")
     parser.add_argument("--serial", default="DA5404760", help="Target Hikrobot camera serial number.")
+    parser.add_argument(
+        "--transport-layer",
+        choices=("usb", "gige", "all"),
+        default="all",
+        help="Camera transport layer to enumerate while resolving and opening the device.",
+    )
     parser.add_argument("--width", type=int, default=1280, help="Capture width.")
     parser.add_argument("--height", type=int, default=720, help="Capture height.")
     parser.add_argument("--fps", type=int, default=30, help="Target capture and video FPS.")
@@ -119,7 +129,7 @@ def parse_args() -> argparse.Namespace:
             "By default auto_continuous is only used during warmup, then locked before recording."
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def build_output_paths(args: argparse.Namespace) -> tuple[Path, Path]:
@@ -156,21 +166,34 @@ def _get_camera_float(camera: HikrobotCamera, key: str) -> tuple[float, float, f
     return float(float_value.fCurValue), float(float_value.fMin), float(float_value.fMax)
 
 
-def _resolve_gain_db(serial: str, gain_mode: str, requested_gain_db: float) -> tuple[float, float]:
+def _transport_layer_flag(mvs: object, transport_layer: str) -> int:
+    if transport_layer == "usb":
+        return int(getattr(mvs, "MV_USB_DEVICE", 0))
+    if transport_layer == "gige":
+        return int(getattr(mvs, "MV_GIGE_DEVICE", 0))
+    return int(getattr(mvs, "MV_USB_DEVICE", 0)) | int(getattr(mvs, "MV_GIGE_DEVICE", 0))
+
+
+def _resolve_gain_db(
+    serial: str,
+    transport_layer: str,
+    gain_mode: str,
+    requested_gain_db: float,
+) -> tuple[float, float, dict[str, str]]:
     mvs = _load_mvs_sdk()
-    transport = getattr(mvs, "MV_USB_DEVICE", 0) | getattr(mvs, "MV_GIGE_DEVICE", 0)
     device_list = mvs.MV_CC_DEVICE_INFO_LIST()
-    ret = mvs.MvCamera.MV_CC_EnumDevices(transport, device_list)
+    ret = mvs.MvCamera.MV_CC_EnumDevices(_transport_layer_flag(mvs, transport_layer), device_list)
     if ret != 0:
         raise RuntimeError(f"MVS EnumDevices failed while resolving gain: 0x{ret:08x}")
 
     device_info = None
+    device_metadata = None
     for idx in range(device_list.nDeviceNum):
         candidate = _extract_device_info(device_list.pDeviceInfo[idx], mvs)
-        usb_info = getattr(candidate.SpecialInfo, "stUsb3VInfo", None)
-        candidate_serial = _decode_char_buffer(usb_info.chSerialNumber) if usb_info is not None else ""
-        if candidate_serial == serial:
+        candidate_metadata = _extract_camera_metadata(candidate, mvs)
+        if candidate_metadata["serial"] == serial:
             device_info = candidate
+            device_metadata = candidate_metadata
             break
     if device_info is None:
         raise RuntimeError(f"Hikrobot device with serial {serial!r} not found while resolving gain.")
@@ -200,13 +223,18 @@ def _resolve_gain_db(serial: str, gain_mode: str, requested_gain_db: float) -> t
             pass
 
     resolved_gain_db = max_gain_db if gain_mode == "max" else float(np.clip(requested_gain_db, min_gain_db, max_gain_db))
-    return resolved_gain_db, max_gain_db
+    return resolved_gain_db, max_gain_db, device_metadata or {}
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     video_path, metadata_path = build_output_paths(args)
-    resolved_gain_db, max_gain_db = _resolve_gain_db(args.serial, args.gain_mode, args.gain_db)
+    resolved_gain_db, max_gain_db, device_metadata = _resolve_gain_db(
+        args.serial,
+        args.transport_layer,
+        args.gain_mode,
+        args.gain_db,
+    )
     white_balance_mode, manual_white_balance = _resolve_white_balance(args)
     lock_white_balance_after_warmup = (
         HIKROBOT_DEFAULT_LOCK_WHITE_BALANCE_AFTER_WARMUP
@@ -216,6 +244,7 @@ def main() -> int:
 
     config = HikrobotCameraConfig(
         serial=args.serial,
+        transport_layer=args.transport_layer,
         width=args.width,
         height=args.height,
         fps=args.fps,
@@ -256,7 +285,8 @@ def main() -> int:
         f"{args.width}x{args.height}, {args.fps} fps, {args.exposure_us:.0f} us exposure, "
         f"gain {'max' if args.gain_mode == 'max' else f'{args.gain_db:.1f} dB'}, "
         f"gamma {'off' if args.gamma <= 0 else f'{args.gamma:.2f}'}, "
-        f"white balance mode {white_balance_mode}"
+        f"white balance mode {white_balance_mode}, "
+        f"transport {device_metadata.get('transport_layer', args.transport_layer)}"
         f"{' (locked after warmup)' if lock_white_balance_after_warmup else ''}."
     )
     print(f"[INFO] Output video: {video_path}")
@@ -303,6 +333,8 @@ def main() -> int:
 
     metadata = {
         "serial": args.serial,
+        "transport_layer": device_metadata.get("transport_layer", args.transport_layer),
+        "current_ip": device_metadata.get("current_ip"),
         "width": args.width,
         "height": args.height,
         "fps_requested": args.fps,

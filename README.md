@@ -83,6 +83,16 @@ PYTHONPATH=/lerobot/src \
 '
 ```
 
+
+For a quick check of the Hikrobot backend, camera discovery, and the standalone recording:
+
+```bash
+cd /home/hanyu/Codes/lerobot
+uv run python tools/hikrobot/hikrobot_record_test.py \
+  --serial <相机序列号> \
+  --transport-layer gige
+```
+
 Record an FR3 teleoperation dataset with Hikrobot cameras through the existing wrapper:
 
 ```bash

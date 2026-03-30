@@ -100,6 +100,48 @@ def _extract_device_info(entry: Any, mvs_module: Any) -> Any:
     return ctypes.cast(entry, ctypes.POINTER(mvs_module.MV_CC_DEVICE_INFO)).contents
 
 
+def _decode_ipv4_address(raw_ip: Any) -> str:
+    value = int(raw_ip)
+    return ".".join(
+        str((value & mask) >> shift)
+        for mask, shift in (
+            (0xFF000000, 24),
+            (0x00FF0000, 16),
+            (0x0000FF00, 8),
+            (0x000000FF, 0),
+        )
+    )
+
+
+def _extract_camera_metadata(device_info: Any, mvs_module: Any) -> dict[str, Any]:
+    tlayer_type = int(getattr(device_info, "nTLayerType", 0))
+    gige_types = {int(getattr(mvs_module, "MV_GIGE_DEVICE", 0))}
+    gentl_gige_type = getattr(mvs_module, "MV_GENTL_GIGE_DEVICE", None)
+    if gentl_gige_type is not None:
+        gige_types.add(int(gentl_gige_type))
+
+    if tlayer_type in gige_types:
+        gige_info = getattr(device_info.SpecialInfo, "stGigEInfo", None)
+        serial = _decode_char_buffer(gige_info.chSerialNumber) if gige_info is not None else ""
+        metadata = {
+            "serial": serial,
+            "manufacturer": _decode_char_buffer(gige_info.chManufacturerName) if gige_info is not None else "",
+            "model": _decode_char_buffer(gige_info.chModelName) if gige_info is not None else "",
+            "transport_layer": "gige",
+        }
+        if gige_info is not None:
+            metadata["current_ip"] = _decode_ipv4_address(gige_info.nCurrentIp)
+        return metadata
+
+    usb_info = getattr(device_info.SpecialInfo, "stUsb3VInfo", None)
+    return {
+        "serial": _decode_char_buffer(usb_info.chSerialNumber) if usb_info is not None else "",
+        "manufacturer": _decode_char_buffer(usb_info.chVendorName) if usb_info is not None else "",
+        "model": _decode_char_buffer(usb_info.chModelName) if usb_info is not None else "",
+        "transport_layer": "usb",
+    }
+
+
 class HikrobotCamera(Camera):
     def __init__(self, config: HikrobotCameraConfig, mvs_module: Any | None = None):
         super().__init__(config)
@@ -154,20 +196,16 @@ class HikrobotCamera(Camera):
         cameras = []
         for idx in range(device_list.nDeviceNum):
             device_info = _extract_device_info(device_list.pDeviceInfo[idx], mvs)
-            usb_info = getattr(device_info.SpecialInfo, "stUsb3VInfo", None)
-            serial = _decode_char_buffer(usb_info.chSerialNumber) if usb_info is not None else str(idx)
-            model = _decode_char_buffer(usb_info.chModelName) if usb_info is not None else ""
-            manufacturer = _decode_char_buffer(usb_info.chVendorName) if usb_info is not None else ""
-            cameras.append(
-                {
-                    "name": f"Hikrobot Camera @ {serial}",
-                    "type": "Hikrobot",
-                    "id": serial,
-                    "device_index": idx,
-                    "manufacturer": manufacturer,
-                    "model": model,
-                }
-            )
+            metadata = _extract_camera_metadata(device_info, mvs)
+            serial = metadata["serial"] or str(idx)
+            camera = {
+                "name": f"Hikrobot Camera @ {serial}",
+                "type": "Hikrobot",
+                "id": serial,
+                "device_index": idx,
+                **metadata,
+            }
+            cameras.append(camera)
 
         return cameras
 
@@ -329,9 +367,8 @@ class HikrobotCamera(Camera):
         if self.serial is not None:
             for idx in range(device_list.nDeviceNum):
                 device_info = _extract_device_info(device_list.pDeviceInfo[idx], self._mvs)
-                usb_info = getattr(device_info.SpecialInfo, "stUsb3VInfo", None)
-                serial = _decode_char_buffer(usb_info.chSerialNumber) if usb_info is not None else ""
-                if serial == self.serial:
+                metadata = _extract_camera_metadata(device_info, self._mvs)
+                if metadata["serial"] == self.serial:
                     return idx
             raise RuntimeError(f"Hikrobot device with serial {self.serial!r} not found.")
 
