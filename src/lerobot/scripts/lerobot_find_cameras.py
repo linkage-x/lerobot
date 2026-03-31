@@ -199,7 +199,12 @@ def create_camera_instance(cam_meta: dict[str, Any]) -> dict[str, Any] | None:
             )
             instance = RealSenseCamera(rs_config)
         elif cam_type == "Hikrobot":
-            hk_config = HikrobotCameraConfig(serial=str(cam_id), color_mode=ColorMode.RGB, warmup_s=0)
+            hk_config = HikrobotCameraConfig(
+                serial=str(cam_id),
+                color_mode=ColorMode.RGB,
+                warmup_s=0,
+                transport_layer=str(cam_meta.get("transport_layer", "all")),
+            )
             instance = HikrobotCamera(hk_config)
         else:
             logger.warning(f"Unknown camera type: {cam_type} for ID {cam_id}. Skipping.")

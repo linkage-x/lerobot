@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import atexit
 import ctypes
 import logging
 import sys
@@ -43,6 +44,8 @@ _PIXEL_FORMAT_RGB8 = 0x02180014
 _PIXEL_FORMAT_BGR8 = 0x02180015
 _MVS_TIMEOUT_ERROR = 0x80000006
 _MVS_OPEN_LOCK = threading.Lock()
+_MVS_INIT_LOCK = threading.Lock()
+_MVS_INITIALIZED = False
 _AUTO_MODE_MAP = {
     "off": 0,
     "once": 1,
@@ -59,6 +62,7 @@ def _load_mvs_sdk():
     try:
         import MvCameraControl_class as mvs  # noqa: PLC0415
 
+        _ensure_mvs_initialized(mvs)
         return mvs
     except ImportError:
         pass
@@ -70,6 +74,7 @@ def _load_mvs_sdk():
     try:
         from MvImport import MvCameraControl_class as mvs  # noqa: PLC0415
 
+        _ensure_mvs_initialized(mvs)
         return mvs
     except ImportError:
         pass
@@ -77,6 +82,7 @@ def _load_mvs_sdk():
     try:
         import MvCameraControl_class as mvs  # noqa: PLC0415
 
+        _ensure_mvs_initialized(mvs)
         return mvs
     except ImportError as exc:
         raise RuntimeError(
@@ -85,6 +91,46 @@ def _load_mvs_sdk():
             "/opt/MVS/Samples/64/Python or /opt/MVS/Samples/32/Python, or rebuild the Docker image with "
             "INSTALL_HIKROBOT_SDK=true."
         ) from exc
+
+
+def _finalize_mvs_sdk(mvs_module: Any) -> None:
+    global _MVS_INITIALIZED
+
+    with _MVS_INIT_LOCK:
+        if not _MVS_INITIALIZED:
+            return
+        finalize = getattr(mvs_module.MvCamera, "MV_CC_Finalize", None)
+        if finalize is None:
+            _MVS_INITIALIZED = False
+            return
+
+        ret = finalize()
+        if ret not in (0, None):
+            logger.warning("Hikrobot MVS SDK finalize failed: 0x%08x", ret)
+            return
+
+        _MVS_INITIALIZED = False
+
+
+def _ensure_mvs_initialized(mvs_module: Any) -> None:
+    global _MVS_INITIALIZED
+
+    with _MVS_INIT_LOCK:
+        if _MVS_INITIALIZED:
+            return
+
+        initialize = getattr(mvs_module.MvCamera, "MV_CC_Initialize", None)
+        if initialize is None:
+            logger.debug("Hikrobot MVS binding does not expose MV_CC_Initialize; continuing without explicit init.")
+            _MVS_INITIALIZED = True
+            return
+
+        ret = initialize()
+        if ret not in (0, None):
+            raise RuntimeError(f"Hikrobot MVS SDK initialization failed: 0x{ret:08x}")
+
+        atexit.register(_finalize_mvs_sdk, mvs_module)
+        _MVS_INITIALIZED = True
 
 
 def _decode_char_buffer(field: Any) -> str:
@@ -131,6 +177,7 @@ def _extract_camera_metadata(device_info: Any, mvs_module: Any) -> dict[str, Any
         }
         if gige_info is not None:
             metadata["current_ip"] = _decode_ipv4_address(gige_info.nCurrentIp)
+            metadata["net_export"] = _decode_ipv4_address(gige_info.nNetExport)
         return metadata
 
     usb_info = getattr(device_info.SpecialInfo, "stUsb3VInfo", None)
@@ -185,9 +232,17 @@ class HikrobotCamera(Camera):
         return self._connected
 
     @staticmethod
+    def _gige_transport_flags(mvs: Any) -> int:
+        flags = int(getattr(mvs, "MV_GIGE_DEVICE", 0))
+        gentl_gige = getattr(mvs, "MV_GENTL_GIGE_DEVICE", None)
+        if gentl_gige is not None:
+            flags |= int(gentl_gige)
+        return flags
+
+    @staticmethod
     def find_cameras() -> list[dict[str, Any]]:
         mvs = _load_mvs_sdk()
-        transport_flag = getattr(mvs, "MV_USB_DEVICE", 0) | getattr(mvs, "MV_GIGE_DEVICE", 0)
+        transport_flag = getattr(mvs, "MV_USB_DEVICE", 0) | HikrobotCamera._gige_transport_flags(mvs)
         device_list = mvs.MV_CC_DEVICE_INFO_LIST()
         ret = mvs.MvCamera.MV_CC_EnumDevices(transport_flag, device_list)
         if ret != 0:
@@ -213,8 +268,8 @@ class HikrobotCamera(Camera):
         if self.config.transport_layer == "usb":
             return getattr(self._mvs, "MV_USB_DEVICE", 0)
         if self.config.transport_layer == "gige":
-            return getattr(self._mvs, "MV_GIGE_DEVICE", 0)
-        return getattr(self._mvs, "MV_USB_DEVICE", 0) | getattr(self._mvs, "MV_GIGE_DEVICE", 0)
+            return self._gige_transport_flags(self._mvs)
+        return getattr(self._mvs, "MV_USB_DEVICE", 0) | self._gige_transport_flags(self._mvs)
 
     def _set_value(self, method_name: str, key: str, value: Any) -> None:
         method = getattr(self._cam, method_name, None)

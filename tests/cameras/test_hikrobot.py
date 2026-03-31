@@ -85,23 +85,30 @@ class _FakeDeviceInfo:
 
 
 class _FakeGigEInfo:
-    def __init__(self, serial: str, ip: str, model: str = "MV-CE060-10GC") -> None:
+    def __init__(self, serial: str, ip: str, model: str = "MV-CE060-10GC", net_export: str = "192.168.1.10") -> None:
         self.chSerialNumber = serial.encode("utf-8") + b"\x00"
         self.chModelName = model.encode("utf-8") + b"\x00"
         self.chManufacturerName = b"HIKROBOT\x00"
         octets = [int(part) for part in ip.split(".")]
         self.nCurrentIp = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
+        export_octets = [int(part) for part in net_export.split(".")]
+        self.nNetExport = (
+            (export_octets[0] << 24)
+            | (export_octets[1] << 16)
+            | (export_octets[2] << 8)
+            | export_octets[3]
+        )
 
 
 class _FakeGigESpecialInfo:
-    def __init__(self, serial: str, ip: str) -> None:
-        self.stGigEInfo = _FakeGigEInfo(serial, ip)
+    def __init__(self, serial: str, ip: str, net_export: str = "192.168.1.10") -> None:
+        self.stGigEInfo = _FakeGigEInfo(serial, ip, net_export=net_export)
 
 
 class _FakeGigEDeviceInfo:
-    def __init__(self, serial: str, ip: str) -> None:
-        self.nTLayerType = 2
-        self.SpecialInfo = _FakeGigESpecialInfo(serial, ip)
+    def __init__(self, serial: str, ip: str, net_export: str = "192.168.1.10", tlayer_type: int = 2) -> None:
+        self.nTLayerType = tlayer_type
+        self.SpecialInfo = _FakeGigESpecialInfo(serial, ip, net_export=net_export)
 
 
 class _FakeDeviceInfoList:
@@ -231,6 +238,7 @@ class _FakeMvCamera:
 class _FakeMVS:
     MV_USB_DEVICE = 1
     MV_GIGE_DEVICE = 2
+    MV_GENTL_GIGE_DEVICE = 4
     MV_ACCESS_Exclusive = 1
     MV_CC_DEVICE_INFO_LIST = _FakeDeviceInfoList
     MV_CC_DEVICE_INFO = _FakeDeviceInfo
@@ -251,10 +259,12 @@ def test_find_cameras(monkeypatch):
 
 def test_find_cameras_reports_gige_serial_and_current_ip(monkeypatch):
     class _FakeMvCameraGigE(_FakeMvCamera):
-        _devices = [_FakeGigEDeviceInfo("GIGE123", "192.168.1.50")]
+        _devices = [_FakeGigEDeviceInfo("GIGE123", "192.168.1.50", net_export="192.168.1.10", tlayer_type=4)]
+        last_transport_flag = None
 
         @staticmethod
-        def MV_CC_EnumDevices(_transport_flag, device_list) -> int:
+        def MV_CC_EnumDevices(transport_flag, device_list) -> int:
+            _FakeMvCameraGigE.last_transport_flag = transport_flag
             device_list.nDeviceNum = len(_FakeMvCameraGigE._devices)
             device_list.pDeviceInfo = list(_FakeMvCameraGigE._devices)
             return 0
@@ -264,6 +274,7 @@ def test_find_cameras_reports_gige_serial_and_current_ip(monkeypatch):
 
     monkeypatch.setattr("lerobot.cameras.hikrobot.camera_hikrobot._load_mvs_sdk", lambda: _FakeMVSGigE)
     cameras = HikrobotCamera.find_cameras()
+    assert _FakeMvCameraGigE.last_transport_flag == (_FakeMVSGigE.MV_USB_DEVICE | _FakeMVSGigE.MV_GIGE_DEVICE | _FakeMVSGigE.MV_GENTL_GIGE_DEVICE)
 
     assert cameras == [
         {
@@ -276,6 +287,7 @@ def test_find_cameras_reports_gige_serial_and_current_ip(monkeypatch):
             "model": "MV-CE060-10GC",
             "transport_layer": "gige",
             "current_ip": "192.168.1.50",
+            "net_export": "192.168.1.10",
         }
     ]
 
