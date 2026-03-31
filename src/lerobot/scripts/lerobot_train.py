@@ -294,6 +294,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         **processor_kwargs,
         **postprocessor_kwargs,
     )
+    if is_main_process and cfg.policy.type == "act":
+        logging.info(
+            "ACT contract: relative_ee_action=%s mask_ee_pose_in_state=%s chunk_size=%s n_action_steps=%s",
+            bool(getattr(cfg.policy, "relative_ee_action", False)),
+            bool(getattr(cfg.policy, "mask_ee_pose_in_state", False)),
+            getattr(cfg.policy, "chunk_size", None),
+            getattr(cfg.policy, "n_action_steps", None),
+        )
+        logging.info(
+            "ACT preprocessor steps: %s",
+            [type(step).__name__ for step in preprocessor.steps],
+        )
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")

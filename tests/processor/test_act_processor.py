@@ -24,6 +24,7 @@ from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.processor_act import make_act_pre_post_processors
 from lerobot.processor import (
+    AbsoluteToRelativeEEActionProcessorStep,
     AddBatchDimensionProcessorStep,
     DataProcessorPipeline,
     DeviceProcessorStep,
@@ -55,11 +56,34 @@ def create_default_config():
     return config
 
 
+def create_relative_ee_config():
+    config = ACTConfig(relative_ee_action=True)
+    config.input_features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+    }
+    config.output_features = {
+        ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(8,)),
+    }
+    config.normalization_mapping = {
+        FeatureType.STATE: NormalizationMode.MEAN_STD,
+        FeatureType.ACTION: NormalizationMode.MEAN_STD,
+    }
+    config.device = "cpu"
+    return config
+
+
 def create_default_stats():
     """Create default dataset statistics for testing."""
     return {
         OBS_STATE: {"mean": torch.zeros(7), "std": torch.ones(7)},
         ACTION: {"mean": torch.zeros(4), "std": torch.ones(4)},
+    }
+
+
+def create_relative_ee_stats():
+    return {
+        OBS_STATE: {"mean": torch.zeros(8), "std": torch.ones(8)},
+        ACTION: {"mean": torch.zeros(8), "std": torch.ones(8)},
     }
 
 
@@ -85,6 +109,18 @@ def test_make_act_processor_basic():
     assert len(postprocessor.steps) == 2
     assert isinstance(postprocessor.steps[0], UnnormalizerProcessorStep)
     assert isinstance(postprocessor.steps[1], DeviceProcessorStep)
+
+
+def test_make_act_processor_inserts_relative_ee_action_step_conditionally():
+    config = create_relative_ee_config()
+    stats = create_relative_ee_stats()
+
+    preprocessor, _ = make_act_pre_post_processors(config, stats)
+
+    assert len(preprocessor.steps) == 5
+    assert isinstance(preprocessor.steps[3], AbsoluteToRelativeEEActionProcessorStep)
+    assert isinstance(preprocessor.steps[4], NormalizerProcessorStep)
+    assert preprocessor.steps[4].norm_map[FeatureType.ACTION] is NormalizationMode.IDENTITY
 
 
 def test_act_processor_normalization():
@@ -115,6 +151,31 @@ def test_act_processor_normalization():
 
     # Check that action is unnormalized
     assert postprocessed.shape == (1, 4)
+
+
+def test_act_processor_relative_ee_action_wiring_transforms_training_actions_and_noops_without_action():
+    config = create_relative_ee_config()
+    stats = create_relative_ee_stats()
+
+    preprocessor, _ = make_act_pre_post_processors(config, stats)
+
+    observation = {OBS_STATE: torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.2], dtype=torch.float32)}
+    action = torch.tensor([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0, 0.4]], dtype=torch.float32)
+    transition = create_transition(observation, action)
+    batch = transition_to_batch(transition)
+
+    processed = preprocessor(batch)
+
+    assert torch.allclose(processed[TransitionKey.ACTION.value][0, :3], torch.tensor([1.0, 2.0, 3.0]), atol=1e-6)
+    assert torch.allclose(processed[TransitionKey.ACTION.value][0, 3:7], torch.tensor([0.0, 0.0, 0.0, 1.0]), atol=1e-6)
+    assert torch.allclose(processed[TransitionKey.ACTION.value][0, 7], torch.tensor(0.4), atol=1e-6)
+
+    observation_only_transition = create_transition(observation, None)
+    observation_only_batch = transition_to_batch(observation_only_transition)
+    processed_observation_only = preprocessor(observation_only_batch)
+
+    assert TransitionKey.ACTION.value not in processed_observation_only or processed_observation_only[TransitionKey.ACTION.value] is None
+    assert processed_observation_only[OBS_STATE].shape == (1, 8)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

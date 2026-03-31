@@ -112,6 +112,7 @@ class ACTConfig(PreTrainedConfig):
     mask_ee_pose_in_state: bool = False
     mask_ee_state_components: list[str] | None = None
     state_feature_names: list[str] | dict[str, Any] | None = None
+    relative_ee_action: bool = False
     action_chunk_quantile_normalization: bool = False
     action_chunk_stats_path: str | None = None
     action_chunk_quantile_clip: bool = False

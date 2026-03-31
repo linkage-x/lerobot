@@ -572,6 +572,65 @@ def test_decode_action_to_robot_command_converts_quat_and_gripper():
     assert np.isclose(command['gripper.pos'], 1.0)
 
 
+def test_convert_relative_policy_action_to_absolute_if_needed_noops_for_absolute_policy():
+    policy_cfg = type('PolicyCfg', (), {'relative_ee_action': False})()
+    action_tensor = torch.tensor([[0.4, 0.1, 0.2, 0.0, 0.0, 0.0, 1.0, 0.103]], dtype=torch.float32)
+    dataset_state_observation_i = {
+        'ee.x': 1.0,
+        'ee.y': 2.0,
+        'ee.z': 3.0,
+        'ee.qx': 0.0,
+        'ee.qy': 0.0,
+        'ee.qz': 0.0,
+        'ee.qw': 1.0,
+    }
+
+    restored = fr3_act_infer_real_runtime.convert_relative_policy_action_to_absolute_if_needed(
+        action_tensor,
+        policy_cfg=policy_cfg,
+        dataset_state_observation_i=dataset_state_observation_i,
+    )
+
+    assert torch.allclose(restored, action_tensor)
+
+
+def test_convert_relative_policy_action_to_absolute_if_needed_restores_dataset_frame_pose():
+    policy_cfg = type('PolicyCfg', (), {'relative_ee_action': True})()
+    anchor_rotvec = np.array([0.0, 0.0, np.deg2rad(90.0)], dtype=np.float64)
+    anchor_quaternion = fr3_act_infer_real_runtime.Rotation.from_rotvec(anchor_rotvec).as_quat()
+    dataset_state_observation_i = {
+        'ee.x': 0.3,
+        'ee.y': -0.2,
+        'ee.z': 0.5,
+        'ee.qx': float(anchor_quaternion[0]),
+        'ee.qy': float(anchor_quaternion[1]),
+        'ee.qz': float(anchor_quaternion[2]),
+        'ee.qw': float(anchor_quaternion[3]),
+    }
+    relative_action = torch.tensor([[0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.103]], dtype=torch.float32)
+
+    restored = fr3_act_infer_real_runtime.convert_relative_policy_action_to_absolute_if_needed(
+        relative_action,
+        policy_cfg=policy_cfg,
+        dataset_state_observation_i=dataset_state_observation_i,
+    )
+
+    restored_pose = fr3_act_infer_real_runtime._pose_from_position_and_quaternion(
+        restored.squeeze(0).cpu().numpy()[:3],
+        restored.squeeze(0).cpu().numpy()[3:7],
+    )
+    expected_pose = (
+        fr3_act_infer_real_runtime._pose_from_quaternion_observation(dataset_state_observation_i)
+        @ fr3_act_infer_real_runtime._pose_from_position_and_quaternion(
+            np.array([0.1, 0.0, 0.0], dtype=np.float64),
+            np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+        )
+    )
+
+    assert np.allclose(restored_pose, expected_pose, atol=1e-6)
+    assert np.isclose(float(restored.squeeze(0)[7]), 0.103)
+
+
 def test_preview_and_real_alignment_share_step0_policy_observation_state():
     robot_cfg = FrankaResearch3Config(
         robot_ip='192.168.1.208',

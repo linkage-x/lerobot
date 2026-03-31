@@ -24,6 +24,7 @@ from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.processor import (
     ActionChunkQuantileNormalizerProcessorStep,
     ActionChunkQuantileUnnormalizerProcessorStep,
+    AbsoluteToRelativeEEActionProcessorStep,
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
     NormalizerProcessorStep,
@@ -110,21 +111,25 @@ def make_act_pre_post_processors(
         normalize_observation_keys.discard(config.tactile_valid_mask_feature_key)
 
     normalization_map = dict(config.normalization_mapping)
-    if config.action_chunk_quantile_normalization:
+    if config.relative_ee_action or config.action_chunk_quantile_normalization:
         normalization_map[FeatureType.ACTION] = NormalizationMode.IDENTITY
 
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         DeviceProcessorStep(device=config.device),
+    ]
+    if config.relative_ee_action:
+        input_steps.append(AbsoluteToRelativeEEActionProcessorStep())
+    input_steps.append(
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=normalization_map,
             stats=dataset_stats,
             device=config.device,
             normalize_observation_keys=normalize_observation_keys,
-        ),
-    ]
+        )
+    )
     output_steps = []
 
     if config.action_chunk_quantile_normalization:

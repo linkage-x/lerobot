@@ -78,6 +78,10 @@ from .policy_robot_bridge import (
     PolicyActionToRobotActionProcessorStep,
     RobotActionToPolicyActionProcessorStep,
 )
+from .relative_ee_action_processor import (
+    AbsoluteToRelativeEEActionProcessorStep,
+    RelativeToAbsoluteEEActionProcessorStep,
+)
 from .rename_processor import RenameObservationsProcessorStep
 from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
 
@@ -85,6 +89,7 @@ __all__ = [
     "ActionProcessorStep",
     "ActionChunkQuantileNormalizerProcessorStep",
     "ActionChunkQuantileUnnormalizerProcessorStep",
+    "AbsoluteToRelativeEEActionProcessorStep",
     "AddTeleopActionAsComplimentaryDataStep",
     "AddTeleopEventsAsInfoStep",
     "ComplementaryDataProcessorStep",
@@ -122,6 +127,7 @@ __all__ = [
     "RenameObservationsProcessorStep",
     "RewardClassifierProcessorStep",
     "RewardProcessorStep",
+    "RelativeToAbsoluteEEActionProcessorStep",
     "DataProcessorPipeline",
     "TimeLimitProcessorStep",
     "AddBatchDimensionProcessorStep",

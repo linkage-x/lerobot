@@ -908,6 +908,38 @@ def decode_action_to_robot_command(
     }
 
 
+def convert_relative_policy_action_to_absolute_if_needed(
+    action_tensor: torch.Tensor,
+    *,
+    policy_cfg: Any,
+    dataset_state_observation_i: RobotObservation,
+) -> torch.Tensor:
+    if not bool(getattr(policy_cfg, 'relative_ee_action', False)):
+        return action_tensor
+
+    action_np = np.asarray(action_tensor.detach().cpu().numpy(), dtype=np.float64)
+    if action_np.shape[-1] != 8:
+        raise ValueError(f'Expected relative EE action dim 8, got {action_np.shape}')
+
+    original_shape = tuple(action_np.shape)
+    flat_actions = action_np.reshape(-1, 8)
+    anchor_pose = _pose_from_quaternion_observation(dataset_state_observation_i)
+    absolute_actions = np.zeros_like(flat_actions)
+
+    for idx, relative_action in enumerate(flat_actions):
+        relative_pose = _pose_from_position_and_quaternion(relative_action[:3], relative_action[3:7])
+        absolute_pose = anchor_pose @ relative_pose
+        absolute_quaternion_xyzw = Rotation.from_matrix(absolute_pose[:3, :3]).as_quat()
+        absolute_actions[idx, :3] = absolute_pose[:3, 3]
+        absolute_actions[idx, 3:7] = absolute_quaternion_xyzw
+        absolute_actions[idx, 7] = relative_action[7]
+
+    return torch.from_numpy(absolute_actions.reshape(*original_shape)).to(
+        device=action_tensor.device,
+        dtype=action_tensor.dtype,
+    )
+
+
 def build_hold_command(
     robot_observation: RobotObservation,
     *,
@@ -1175,6 +1207,14 @@ def load_policy_stack(
         pretrained_path=str(pretrained_dir),
         preprocessor_overrides={'device_processor': {'device': str(device)}},
     )
+    print(
+        '[INFO] policy_contract '
+        f"relative_ee_action={bool(getattr(policy_cfg, 'relative_ee_action', False))} "
+        f"mask_ee_pose_in_state={bool(getattr(policy_cfg, 'mask_ee_pose_in_state', False))} "
+        f"chunk_size={getattr(policy_cfg, 'chunk_size', None)} "
+        f"n_action_steps={getattr(policy_cfg, 'n_action_steps', None)}"
+    )
+    print(f"[INFO] preprocessor_steps={[type(step).__name__ for step in preprocessor.steps]}")
     policy.eval()
     return policy, preprocessor, postprocessor
 
@@ -1424,6 +1464,11 @@ def run_inference(args: argparse.Namespace) -> int:
                 postprocessor=postprocessor,
                 use_amp=bool(policy.config.use_amp),
                 robot_type=robot.name,
+            )
+            action_tensor = convert_relative_policy_action_to_absolute_if_needed(
+                action_tensor,
+                policy_cfg=policy.config,
+                dataset_state_observation_i=dataset_state_observation_i,
             )
             dataset_robot_command_i = decode_action_to_robot_command(
                 action_tensor,
