@@ -30,6 +30,7 @@ from tqdm import tqdm
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
+from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
@@ -37,7 +38,7 @@ from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.act.processor_act import load_action_chunk_stats
+from lerobot.policies.act.processor_act import load_action_chunk_stats, resolve_action_chunk_stats_path
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
@@ -152,6 +153,89 @@ def update_policy(
     return train_metrics, output_dict
 
 
+def build_train_val_episode_split(cfg: TrainPipelineConfig) -> tuple[list[int], list[int]]:
+    if cfg.dataset is None:
+        raise ValueError("Offline dataset config is required to build a train/val split.")
+
+    ds_meta = LeRobotDatasetMetadata(
+        cfg.dataset.repo_id,
+        root=cfg.dataset.root,
+        revision=cfg.dataset.revision,
+    )
+
+    if cfg.resume and cfg.dataset.episodes is not None:
+        train_eps = list(cfg.dataset.episodes)
+        all_eps = list(range(ds_meta.total_episodes))
+        train_set = set(train_eps)
+        val_eps = [ep for ep in all_eps if ep not in train_set]
+        return train_eps, val_eps
+
+    if cfg.dataset.episodes is None:
+        available_eps = list(range(ds_meta.total_episodes))
+    else:
+        available_eps = list(cfg.dataset.episodes)
+
+    if len(available_eps) == 0:
+        raise ValueError("No episodes available in dataset to split into train/val.")
+
+    n_val = max(1, len(available_eps) // 10)
+
+    if len(available_eps) == 1:
+        return available_eps, []
+
+    train_eps = available_eps[:-n_val]
+    val_eps = available_eps[-n_val:]
+    if len(train_eps) == 0:
+        train_eps = [available_eps[0]]
+        val_eps = available_eps[1:]
+    return train_eps, val_eps
+
+
+@torch.no_grad()
+def offline_eval_split(
+    dataloader: torch.utils.data.DataLoader | None,
+    policy: PreTrainedPolicy,
+    preprocessor,
+    accelerator: Accelerator,
+    max_batches: int = 20,
+) -> dict[str, float] | None:
+    if dataloader is None:
+        return None
+
+    model = accelerator.unwrap_model(policy)
+    was_training = model.training
+    model.eval()
+
+    total_loss = 0.0
+    total_l1 = 0.0
+    total_rotation_geodesic = 0.0
+    n = 0
+
+    for batch_idx, batch in enumerate(dataloader):
+        if batch_idx >= max_batches:
+            break
+        batch = preprocessor(batch)
+        with accelerator.autocast():
+            loss, out = model.forward(batch)
+        total_loss += float(loss.item())
+        total_l1 += float(out.get("l1_loss", 0.0))
+        total_rotation_geodesic += float(out.get("rotation_geodesic_loss", 0.0))
+        n += 1
+
+    if was_training:
+        model.train()
+
+    if n == 0:
+        return None
+
+    return {
+        "offline_eval/avg_loss": total_loss / n,
+        "offline_eval/avg_l1": total_l1 / n,
+        "offline_eval/avg_rotation_geodesic_loss": total_rotation_geodesic / n,
+        "offline_eval/n_batches": float(n),
+    }
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     """
@@ -218,9 +302,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
+    train_episodes, val_episodes = build_train_val_episode_split(cfg)
+    cfg.dataset.episodes = train_episodes
+
     # Dataset loading synchronization: main process downloads first to avoid race conditions
     if is_main_process:
-        logging.info("Creating dataset")
+        logging.info(
+            "Creating dataset (train episodes only): %s train, %s val",
+            len(train_episodes),
+            len(val_episodes),
+        )
         dataset = make_dataset(cfg)
 
     accelerator.wait_for_everyone()
@@ -228,6 +319,29 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
+
+    val_dataloader: torch.utils.data.DataLoader | None = None
+    if (
+        is_main_process
+        and cfg.env is None
+        and cfg.eval_freq > 0
+        and not cfg.dataset.streaming
+        and len(val_episodes) > 0
+    ):
+        val_cfg = dataclasses.replace(
+            cfg,
+            dataset=dataclasses.replace(cfg.dataset, episodes=val_episodes),
+        )
+        val_dataset = make_dataset(val_cfg)
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            num_workers=max(1, cfg.num_workers // 2),
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
+        )
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -239,6 +353,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info("Creating policy")
+    if cfg.policy.type == "act" and getattr(cfg.policy, "action_chunk_quantile_normalization", False):
+        dataset_root = Path(cfg.dataset.root) if cfg.dataset.root is not None else dataset.root
+        resolved_stats_path = resolve_action_chunk_stats_path(cfg.policy, dataset_root)
+        if resolved_stats_path is None:
+            raise ValueError(
+                "action_chunk_quantile_normalization is enabled but action_chunk_stats_path could not be resolved."
+            )
+        cfg.policy.action_chunk_stats_path = str(resolved_stats_path)
     policy = make_policy(
         cfg=cfg.policy,
         ds_meta=dataset.meta,
@@ -454,6 +576,19 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         if is_log_step:
             logging.info(train_tracker)
+            if output_dict:
+                diagnostic_parts = [
+                    f"{key}:{float(output_dict[key]):.3f}"
+                    for key in (
+                        "quat_norm_mean",
+                        "quat_norm_max",
+                        "rot_geodesic_deg",
+                        "rotation_geodesic_loss",
+                    )
+                    if key in output_dict
+                ]
+                if diagnostic_parts:
+                    logging.info("ACT diag %s", " ".join(diagnostic_parts))
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
@@ -539,6 +674,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
+        elif is_eval_step and cfg.env is None and is_main_process:
+            logging.info(f"Offline eval policy at step {step}")
+            offline_eval_info = offline_eval_split(
+                dataloader=val_dataloader,
+                policy=policy,
+                preprocessor=preprocessor,
+                accelerator=accelerator,
+            )
+            if offline_eval_info is not None:
+                logging.info("Offline eval aggregated: %s", offline_eval_info)
+                if wandb_logger:
+                    wandb_logger.log_dict(offline_eval_info, step, mode="eval")
 
     if is_main_process:
         progbar.close()

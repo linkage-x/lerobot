@@ -1,0 +1,36 @@
+dataset:
+  repo_id: hph/fr3_pick_place_ee2ee_v1
+  root: null
+  streaming: false
+
+policy:
+  type: act
+  device: cuda
+  use_amp: false
+  push_to_hub: false
+  use_tactile: false
+  mask_ee_pose_in_state: true
+  relative_ee_action: true
+  action_chunk_quantile_normalization: false
+  action_chunk_quantile_clip: false
+  chunk_size: 50
+  n_action_steps: 10
+  vision_backbone: resnet18
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 1.0e-5
+  optimizer_weight_decay: 1.0e-4
+
+seed: 1000
+num_workers: 12
+batch_size: 8
+steps: 100000
+eval_freq: 10000
+log_freq: 200
+save_checkpoint: true
+save_freq: 10000
+tolerance_s: 1.0e-3
+
+wandb:
+  enable: true
+  disable_artifact: true

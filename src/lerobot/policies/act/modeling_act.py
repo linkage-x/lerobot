@@ -34,7 +34,9 @@ from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.act.processor_act import load_action_chunk_stats
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.processor import ActionChunkQuantileUnnormalizerProcessorStep
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
@@ -63,6 +65,7 @@ class ACTPolicy(PreTrainedPolicy):
 
         self.model = ACT(config)
         self.masked_robot_state_indices = tuple(config.masked_robot_state_indices)
+        self._action_chunk_unnormalizer = self._make_action_chunk_unnormalizer()
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
@@ -96,6 +99,127 @@ class ACTPolicy(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
+
+    def _make_action_chunk_unnormalizer(self) -> ActionChunkQuantileUnnormalizerProcessorStep | None:
+        if not self.config.action_chunk_quantile_normalization:
+            return None
+
+        action_chunk_stats = load_action_chunk_stats(self.config, dataset_root=None)
+        if action_chunk_stats is None:
+            raise ValueError(
+                "action_chunk_quantile_normalization is enabled but action_chunk_stats could not be loaded."
+            )
+
+        action_feature = self.config.output_features[ACTION]
+        return ActionChunkQuantileUnnormalizerProcessorStep(
+            feature_key=ACTION,
+            chunk_size=self.config.chunk_size,
+            n_action_steps=self.config.n_action_steps,
+            action_dim=action_feature.shape[-1],
+            lower_quantile=float(action_chunk_stats["lower_quantile"]),
+            upper_quantile=float(action_chunk_stats["upper_quantile"]),
+            offset_stats=action_chunk_stats["offset_stats"],
+            action_feature_names=action_chunk_stats.get("action_names"),
+            clip=bool(self.config.action_chunk_quantile_clip),
+        )
+
+    @staticmethod
+    def _compute_rotation_diagnostics(
+        actions_hat: Tensor,
+        action_target: Tensor,
+        action_is_pad: Tensor,
+    ) -> dict[str, float]:
+        if actions_hat.shape[-1] != 8 or action_target.shape[-1] != 8:
+            return {}
+
+        valid_mask = ~action_is_pad
+        if not torch.any(valid_mask):
+            return {}
+
+        pred_quat = actions_hat[..., 3:7]
+        target_quat = action_target[..., 3:7]
+
+        pred_quat_norm = torch.linalg.norm(pred_quat, dim=-1)
+        pred_quat_unit = pred_quat / pred_quat_norm.unsqueeze(-1).clamp_min(1e-8)
+        target_quat_unit = target_quat / torch.linalg.norm(target_quat, dim=-1).unsqueeze(-1).clamp_min(1e-8)
+
+        quat_dot = torch.sum(pred_quat_unit * target_quat_unit, dim=-1).abs().clamp(0.0, 1.0)
+        rot_geodesic_deg = torch.rad2deg(2.0 * torch.arccos(quat_dot))
+
+        valid_pred_quat_norm = pred_quat_norm[valid_mask]
+        valid_rot_geodesic_deg = rot_geodesic_deg[valid_mask]
+
+        return {
+            "quat_norm_mean": float(valid_pred_quat_norm.mean().item()),
+            "quat_norm_max": float(valid_pred_quat_norm.max().item()),
+            "rot_geodesic_deg": float(valid_rot_geodesic_deg.mean().item()),
+        }
+
+    @staticmethod
+    def _quaternion_geodesic_loss(pred_quat: Tensor, target_quat: Tensor) -> Tensor:
+        pred_quat_unit = pred_quat / torch.linalg.norm(pred_quat, dim=-1, keepdim=True).clamp_min(1e-8)
+        target_quat_unit = target_quat / torch.linalg.norm(target_quat, dim=-1, keepdim=True).clamp_min(1e-8)
+        quat_dot = torch.sum(pred_quat_unit * target_quat_unit, dim=-1).abs()
+        quat_dot = quat_dot.clamp(0.0, 1.0)
+        safe_quat_dot = quat_dot.clamp_max(1.0 - 1e-7)
+        return torch.where(
+            quat_dot > 1.0 - 1e-7,
+            torch.zeros_like(quat_dot),
+            2.0 * torch.arccos(safe_quat_dot),
+        )
+
+    @staticmethod
+    def _renormalize_action_quaternion(actions: Tensor) -> Tensor:
+        if actions.shape[-1] != 8:
+            return actions
+
+        quat = actions[..., 3:7]
+        quat = quat / torch.linalg.norm(quat, dim=-1, keepdim=True).clamp_min(1e-8)
+        return torch.cat((actions[..., :3], quat, actions[..., 7:]), dim=-1)
+
+    def _restore_actions_for_rotation(self, actions: Tensor) -> Tensor:
+        if actions.shape[-1] != 8:
+            return actions
+        if self._action_chunk_unnormalizer is None:
+            return self._renormalize_action_quaternion(actions)
+        restored_actions = self._action_chunk_unnormalizer.action(actions)
+        return self._renormalize_action_quaternion(restored_actions)
+
+    def _compute_action_loss(self, actions_hat: Tensor, action_target: Tensor, action_is_pad: Tensor) -> tuple[Tensor, dict]:
+        valid_mask = ~action_is_pad
+        if not torch.any(valid_mask):
+            zero = actions_hat.sum() * 0.0
+            return zero, {
+                "l1_loss": 0.0,
+                "position_l1_loss": 0.0,
+                "rotation_geodesic_loss": 0.0,
+                "gripper_l1_loss": 0.0,
+            }
+
+        if actions_hat.shape[-1] != 8 or action_target.shape[-1] != 8:
+            l1_loss = (F.l1_loss(action_target, actions_hat, reduction="none") * valid_mask.unsqueeze(-1)).mean()
+            return l1_loss, {"l1_loss": l1_loss.item()}
+
+        position_l1 = F.l1_loss(action_target[..., :3], actions_hat[..., :3], reduction="none").mean(dim=-1)
+        rotation_actions_hat = self._restore_actions_for_rotation(actions_hat)
+        rotation_action_target = self._restore_actions_for_rotation(action_target)
+        rotation_geodesic = self._quaternion_geodesic_loss(
+            rotation_actions_hat[..., 3:7],
+            rotation_action_target[..., 3:7],
+        )
+        gripper_l1 = F.l1_loss(action_target[..., 7:], actions_hat[..., 7:], reduction="none").mean(dim=-1)
+
+        position_l1_loss = position_l1[valid_mask].mean()
+        rotation_geodesic_loss = rotation_geodesic[valid_mask].mean()
+        gripper_l1_loss = gripper_l1[valid_mask].mean()
+        total_loss = position_l1_loss + rotation_geodesic_loss + gripper_l1_loss
+
+        return total_loss, {
+            "l1_loss": float((position_l1_loss + gripper_l1_loss).item()),
+            "position_l1_loss": float(position_l1_loss.item()),
+            "rotation_geodesic_loss": float(rotation_geodesic_loss.item()),
+            "gripper_l1_loss": float(gripper_l1_loss.item()),
+        }
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -133,6 +257,8 @@ class ACTPolicy(PreTrainedPolicy):
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
         actions = self.model(batch)[0]
+        if self._action_chunk_unnormalizer is None:
+            return self._renormalize_action_quaternion(actions)
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
@@ -143,13 +269,24 @@ class ACTPolicy(PreTrainedPolicy):
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
+        if self._action_chunk_unnormalizer is None:
+            actions_hat = self._renormalize_action_quaternion(actions_hat)
 
-        l1_loss = (
-            F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
-        ).mean()
-
-        loss_dict = {"l1_loss": l1_loss.item()}
-        if self.config.use_vae:
+        diagnostic_actions_hat = self._restore_actions_for_rotation(actions_hat)
+        diagnostic_action_target = self._restore_actions_for_rotation(batch[ACTION])
+        action_loss, loss_dict = self._compute_action_loss(
+            actions_hat=actions_hat,
+            action_target=batch[ACTION],
+            action_is_pad=batch["action_is_pad"],
+        )
+        loss_dict.update(
+            self._compute_rotation_diagnostics(
+                actions_hat=diagnostic_actions_hat,
+                action_target=diagnostic_action_target,
+                action_is_pad=batch["action_is_pad"],
+            )
+        )
+        if self.config.use_vae and mu_hat is not None and log_sigma_x2_hat is not None and self.training:
             # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
             # each dimension independently, we sum over the latent dimension to get the total
             # KL-divergence per batch element, then take the mean over the batch.
@@ -158,9 +295,9 @@ class ACTPolicy(PreTrainedPolicy):
                 (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
             )
             loss_dict["kld_loss"] = mean_kld.item()
-            loss = l1_loss + mean_kld * self.config.kl_weight
+            loss = action_loss + mean_kld * self.config.kl_weight
         else:
-            loss = l1_loss
+            loss = action_loss
 
         return loss, loss_dict
 

@@ -223,6 +223,201 @@ Training should derive chunk targets like this:
 This transform should happen in the policy-specific preprocessing path, not by
 changing the robot core.
 
+### Current Training Tensor Flow
+
+The following diagram records the current implementation-level tensor flow for a
+single dataset sample after collation into a training mini-batch.
+
+Current assumptions:
+
+- dataset still stores absolute `ee2ee` labels in `W_s`
+- config uses `relative_ee_action=true`
+- observation-side EE pose is masked before the ACT model sees `observation.state`
+- the final loss target depends on whether qoff is enabled
+
+```mermaid
+flowchart TD
+    A["LeRobotDataset item
+raw observation.state
+shape: (8,)
+semantics: absolute Ws xyzquatgripper
+
+raw action chunk
+shape: (chunk_size, 8)
+semantics: absolute Ws future xyzquatgripper"] --> B["DataLoader collate
+observation.state
+shape: (B, 8)
+
+action
+shape: (B, chunk_size, 8)"]
+
+    B --> C["ACT preprocessor
+RenameObservationsProcessorStep
+shape unchanged"]
+    C --> D["ACT preprocessor
+AddBatchDimensionProcessorStep
+training path: effectively no-op on collated batch
+shape unchanged"]
+    D --> E["ACT preprocessor
+DeviceProcessorStep
+move tensors to policy device
+shape unchanged"]
+
+    E --> F["AbsoluteToRelativeEEActionProcessorStep
+anchor from observation.state[:, 0:7]
+T_rel(t+k) = T_E(t)^-1 * T_E(t+k)
+
+observation.state: (B, 8), unchanged
+action: (B, chunk_size, 8)
+semantics: relative xyzquatgripper"]
+
+    F --> G["NormalizerProcessorStep
+STATE: normal path
+ACTION: IDENTITY when relative_ee_action=true
+
+observation.state: normalized absolute state
+action: still relative xyzquatgripper"]
+
+    G --> H{"action_chunk_quantile_normalization?"}
+
+    H -->|No| I["batch[ACTION]
+shape: (B, chunk_size, 8)
+semantics: relative_action_before_qoff
+
+This is the tensor used by loss in the current no-qoff baseline."]
+
+    H -->|Yes| J["ActionChunkQuantileNormalizerProcessorStep
+per-offset q02/q98 normalization
+
+batch[ACTION]
+shape: (B, chunk_size, 8)
+semantics: processed_action_after_qoff"]
+
+    I --> K["ACT.forward
+_mask_robot_state_features(...)
+zero masked EE indices in observation.state
+
+observation.state seen by model:
+(B, 8), EE pose zeroed
+action target:
+(B, chunk_size, 8), relative"]
+
+    J --> K2["ACT.forward
+_mask_robot_state_features(...)
+zero masked EE indices in observation.state
+
+observation.state seen by model:
+(B, 8), EE pose zeroed
+action target:
+(B, chunk_size, 8), relative + qoff-normalized"]
+
+    K --> L["ACT model output
+actions_hat
+shape: (B, chunk_size, 8)"]
+
+    K2 --> L2["ACT model output
+actions_hat
+shape: (B, chunk_size, 8)"]
+
+    L --> M["Training loss
+L1(batch[ACTION], actions_hat)
+
+loss target semantics:
+relative xyzquatgripper"]
+
+    L2 --> N["Training loss
+L1(batch[ACTION], actions_hat)
+
+loss target semantics:
+relative xyzquatgripper after qoff"]
+```
+
+Practical interpretation:
+
+- raw dataset storage is still `ee2ee`
+- the first semantic rewrite happens inside
+  `AbsoluteToRelativeEEActionProcessorStep`
+- `mask_ee_pose_in_state` does not rewrite the raw dataset item; it zeroes the
+  configured EE-pose indices immediately before ACT forward
+- therefore the model sees:
+  - images and tactile as configured
+  - `observation.state` with EE pose masked
+  - `action` target already converted to `rel2ee`
+
+Current important distinction:
+
+- `relative_action_before_qoff` is the geometric relative target
+- `processed_action_after_qoff` is the final training-space target when qoff is
+  enabled
+
+For the current `franka_research3_rel2ee_act_das_noqoff.yaml` baseline, the
+loss is computed against `relative_action_before_qoff`, not against qoff-scaled
+targets.
+
+### Rotation Diagnostics And Loss Semantics
+
+Current ACT rotation diagnostics use quaternion geodesic angle.
+
+For predicted quaternion `q_pred` and target quaternion `q_gt`, both are first
+renormalized:
+
+- `q_pred_unit = q_pred / ||q_pred||`
+- `q_gt_unit = q_gt / ||q_gt||`
+
+Then the shortest-angle rotation error is computed from their inner product:
+
+```text
+rot_geodesic_rad = 2 * arccos(|<q_pred_unit, q_gt_unit>|)
+rot_geodesic_deg = degrees(rot_geodesic_rad)
+```
+
+Equivalent intuition:
+
+- if the predicted and target rotations are identical, `|dot| = 1` and the
+  error is `0 deg`
+- if they differ slightly, `|dot|` stays close to `1` and the error is small
+- if they differ strongly, `|dot|` becomes smaller and the angle increases
+
+The absolute value is required because quaternion sign is ambiguous:
+
+- `q`
+- `-q`
+
+represent the same rotation.
+
+This is why geodesic rotation error is a better diagnostic than quaternion
+component L1/L2 distance:
+
+- it measures the physical rotation discrepancy directly
+- it is invariant to quaternion sign flip
+- it aligns with the robot-side notion of pose error
+
+Important distinction in current training logs:
+
+- `rot_geodesic_deg` is a human-readable diagnostic metric in degrees
+- `rotation_geodesic_loss` is the optimization term used in training, in
+  radians
+
+They are derived from the same geometric quantity, but they serve different
+purposes:
+
+- `rot_geodesic_deg` is easier to read in logs and compare against execution
+  tolerances
+- `rotation_geodesic_loss` is the scalar that enters the loss function
+
+For the current ACT implementation, the action loss is conceptually split into:
+
+- position L1 loss
+- rotation geodesic loss
+- gripper L1 loss
+
+with quaternion renormalization applied in both:
+
+- `ACT.forward(...)`
+- `predict_action_chunk(...)`
+
+so that training and inference use the same quaternion validity contract.
+
 ### Reuse `mask2ee` For Observation-State Leakage Control
 
 Training config should:
@@ -380,6 +575,110 @@ These are valuable, but intentionally not in the MVP:
 - replacing `mask2ee` with a richer relative proprio state
 - migrating raw dataset storage from absolute `W_s` to a new relative canonical
   format
+
+## Current Status (2026-04-01)
+
+### Implemented
+
+The current codebase now has:
+
+- `rel2ee` training support through `AbsoluteToRelativeEEActionProcessorStep`
+- FR3 runtime decode support for relative checkpoints
+- `mask_ee_pose_in_state` observation-side leakage control
+- batch inspection tooling for:
+  - raw absolute action
+  - relative action before qoff
+  - processed action after qoff
+- offline checkpoint inspection tooling
+- ACT-side quaternion diagnostics:
+  - `quat_norm_mean`
+  - `quat_norm_max`
+  - `rot_geodesic_deg`
+  - `rotation_geodesic_loss`
+
+### Confirmed Findings
+
+The current experiments established the following:
+
+- raw dataset storage remains `W_s`-absolute, but training-time `rel2ee`
+  conversion is working as intended
+- `mask_ee_pose_in_state` is correctly removing absolute EE pose leakage from
+  `observation.state`
+- long-horizon targets in the back half of the chunk are materially harder than
+  near-term targets
+- the original `rel2ee + no_qoff` run learned translation much better than
+  rotation
+- unconstrained quaternion prediction caused severe quaternion norm drift
+- adding quaternion renormalization alone was not enough
+- shared quaternion renormalization plus geodesic rotation loss made training
+  behavior more coherent, but did not remove long-horizon back-half divergence
+
+### Interpreting The Two Main Training Lines
+
+#### 1. `rel2ee + no_qoff`
+
+This line showed:
+
+- improving position error across training
+- persistent late-horizon divergence
+- rotation quality degrading or stagnating
+- quaternion norm drift when quaternion outputs were left unconstrained
+
+This confirmed that:
+
+- `rel2ee` itself was not obviously broken
+- quaternion handling in the original loss was inadequate
+
+#### 2. `rel2ee + no_qoff + shared renorm + geodesic rotation loss`
+
+This line showed:
+
+- stable quaternion norm diagnostics (`quat_norm_mean/max ~= 1.0`)
+- much healthier early training behavior
+- good short-horizon translation accuracy
+- rotation rollout error still remaining around a persistent bias band
+- back-half divergence still present across multiple episodes
+
+This means the current main failure mode is no longer only "bad quaternion
+norms".
+
+The remaining problem is a combination of:
+
+- imperfect rotation learning
+- long open-loop execution with `chunk_size=50` and `n_action_steps=50`
+
+### Current Best Technical Reading
+
+The current evidence supports these conclusions:
+
+- `rel2ee` is worth keeping
+- direct physical-output learning in `xyzquatgripper` is trainable, but the
+  subspaces do not behave equally
+- treating translation, rotation, and gripper with one undifferentiated loss is
+  not sufficient
+- geodesic rotation loss is more appropriate than quaternion component L1/L2
+- for `qoff` training, rotation loss must be computed on inverse-restored
+  quaternion targets, not directly in qoff space
+- the next likely bottleneck is execution horizon rather than representation
+  alone
+
+### Current Recommended Next Step
+
+The highest-priority next experiment is:
+
+- keep the current `rel2ee + shared renorm + geodesic rotation loss`
+- reduce execution horizon by changing `n_action_steps`
+
+Recommended first comparison:
+
+- `chunk_size=50`
+- `n_action_steps=10`
+
+Reason:
+
+- current results suggest that improving rotation loss alone does not remove
+  long-horizon back-half failure
+- the most likely remaining dominant cause is long open-loop rollout
 
 ## Follow-Up Design Question
 
