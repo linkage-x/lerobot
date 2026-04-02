@@ -33,7 +33,15 @@ from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline, RobotObservation
 from lerobot.robots.franka_research3 import FrankaResearch3Config
-from lerobot.robots.franka_research3.processor_franka_research3 import KeepAbsoluteEEObservation, _continuous_quaternion
+from lerobot.robots.franka_research3.processor_franka_research3 import (
+    EE_POSITION_KEYS,
+    EE_QUAT_KEYS,
+    KeepAbsoluteEEObservation,
+    PREV_CMD_GRIPPER_KEY,
+    PREV_CMD_POSITION_KEYS,
+    PREV_CMD_QUAT_KEYS,
+    _continuous_quaternion,
+)
 from lerobot.utils.control_utils import predict_action
 from lerobot.utils.rotation import Rotation
 from lerobot.utils.robot_utils import precise_sleep
@@ -81,6 +89,66 @@ _T_IE = np.array(
 )
 _T_EI = np.linalg.inv(_T_IE)
 _TACTILE_FALLBACK_CHOICES = ('baseline_idle',)
+
+
+def _load_dataset_info(dataset_root: Path) -> dict[str, Any]:
+    info_path = _resolve_repo_path(dataset_root) / 'meta' / 'info.json'
+    return json.loads(info_path.read_text(encoding='utf-8'))
+
+
+def _resolve_dataset_data_file(dataset_root: Path, *, chunk_index: int, file_index: int) -> Path:
+    dataset_root = _resolve_repo_path(dataset_root)
+    info = _load_dataset_info(dataset_root)
+    candidates: list[Path] = []
+    data_path_template = info.get('data_path')
+    if isinstance(data_path_template, str):
+        candidates.append(dataset_root / data_path_template.format(chunk_index=chunk_index, file_index=file_index))
+    candidates.extend(
+        [
+            dataset_root / 'data' / f'chunk-{chunk_index:03d}' / f'file-{file_index:03d}.parquet',
+            dataset_root / 'data' / f'chunk-{chunk_index:03d}' / f'file-{file_index:06d}.parquet',
+        ]
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f'Could not resolve data parquet for chunk_index={chunk_index} file_index={file_index} under {dataset_root}'
+    )
+
+
+def _load_observation_state_feature_names(dataset_root: Path) -> list[str]:
+    info = _load_dataset_info(dataset_root)
+    names = info.get('features', {}).get('observation.state', {}).get('names')
+    if not isinstance(names, list):
+        return [*EE_POSITION_KEYS, *EE_QUAT_KEYS, 'gripper.pos']
+    return [str(name) for name in names]
+
+
+def _extract_dataset_state_contract_indices(dataset_root: Path) -> dict[str, int]:
+    state_names = _load_observation_state_feature_names(dataset_root)
+    required_names = ['ee.x', 'ee.y', 'ee.z', 'ee.qx', 'ee.qy', 'ee.qz', 'ee.qw']
+    missing_names = [name for name in required_names if name not in state_names]
+    if missing_names:
+        raise KeyError(f'Dataset observation.state names are missing required entries: {missing_names}')
+    indices = {name: state_names.index(name) for name in required_names}
+    if 'gripper.pos' in state_names:
+        indices['gripper.pos'] = state_names.index('gripper.pos')
+    return indices
+
+
+def _extract_pose_gripper_from_state_row(
+    state_row: np.ndarray,
+    *,
+    state_indices: dict[str, int],
+) -> tuple[np.ndarray, np.ndarray, float | None]:
+    state_row = np.asarray(state_row, dtype=np.float64)
+    position = np.asarray([state_row[state_indices[key]] for key in EE_POSITION_KEYS], dtype=np.float64)
+    quaternion = np.asarray([state_row[state_indices[key]] for key in EE_QUAT_KEYS], dtype=np.float64)
+    gripper = None
+    if 'gripper.pos' in state_indices:
+        gripper = float(state_row[state_indices['gripper.pos']])
+    return position, quaternion, gripper
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -441,12 +509,13 @@ def convert_gripper_observation_to_dataset_units(
     robot_cfg: FrankaResearch3Config,
 ) -> RobotObservation:
     converted_observation = dict(observation)
-    if 'gripper.pos' not in converted_observation:
-        return converted_observation
-    converted_observation['gripper.pos'] = denormalize_live_gripper_observation(
-        float(converted_observation['gripper.pos']),
-        robot_cfg,
-    )
+    for key in ('gripper.pos', PREV_CMD_GRIPPER_KEY):
+        if key not in converted_observation:
+            continue
+        converted_observation[key] = denormalize_live_gripper_observation(
+            float(converted_observation[key]),
+            robot_cfg,
+        )
     return converted_observation
 
 
@@ -460,6 +529,7 @@ def _state_name_to_observation_key(name: str) -> str:
         'qz': 'ee.qz',
         'qw': 'ee.qw',
         'gripper': 'gripper.pos',
+        'prev_cmd.gripper': PREV_CMD_GRIPPER_KEY,
     }
     return aliases.get(name, name)
 
@@ -568,30 +638,46 @@ def _pose_to_xyzquat(pose: np.ndarray) -> np.ndarray:
     )
 
 
-def _pose_from_quaternion_observation(observation: RobotObservation) -> np.ndarray:
+def _pose_from_quaternion_observation(
+    observation: RobotObservation,
+    *,
+    position_keys: tuple[str, str, str] = EE_POSITION_KEYS,
+    quaternion_keys: tuple[str, str, str, str] = EE_QUAT_KEYS,
+) -> np.ndarray:
     return _pose_from_position_and_quaternion(
-        np.asarray([observation['ee.x'], observation['ee.y'], observation['ee.z']], dtype=np.float64),
-        np.asarray([observation['ee.qx'], observation['ee.qy'], observation['ee.qz'], observation['ee.qw']], dtype=np.float64),
+        np.asarray([observation[key] for key in position_keys], dtype=np.float64),
+        np.asarray([observation[key] for key in quaternion_keys], dtype=np.float64),
     )
 
 
 def convert_absolute_observation_from_E_to_I(absolute_observation_e: RobotObservation) -> RobotObservation:
-    absolute_pose_e = _pose_from_quaternion_observation(absolute_observation_e)
-    absolute_pose_i = absolute_pose_e @ _T_EI
-    quaternion_xyzw = Rotation.from_matrix(absolute_pose_i[:3, :3]).as_quat()
-
     absolute_observation_i = dict(absolute_observation_e)
-    absolute_observation_i.update(
-        {
-            'ee.x': float(absolute_pose_i[0, 3]),
-            'ee.y': float(absolute_pose_i[1, 3]),
-            'ee.z': float(absolute_pose_i[2, 3]),
-            'ee.qx': float(quaternion_xyzw[0]),
-            'ee.qy': float(quaternion_xyzw[1]),
-            'ee.qz': float(quaternion_xyzw[2]),
-            'ee.qw': float(quaternion_xyzw[3]),
-        }
-    )
+    for position_keys, quaternion_keys in (
+        (EE_POSITION_KEYS, EE_QUAT_KEYS),
+        (PREV_CMD_POSITION_KEYS, PREV_CMD_QUAT_KEYS),
+    ):
+        if not all(key in absolute_observation_e for key in position_keys + quaternion_keys):
+            continue
+        input_quaternion_xyzw = np.asarray([absolute_observation_e[key] for key in quaternion_keys], dtype=np.float64)
+        absolute_pose_e = _pose_from_quaternion_observation(
+            absolute_observation_e,
+            position_keys=position_keys,
+            quaternion_keys=quaternion_keys,
+        )
+        absolute_pose_i = absolute_pose_e @ _T_EI
+        quaternion_xyzw = Rotation.from_matrix(absolute_pose_i[:3, :3]).as_quat()
+        quaternion_xyzw = _continuous_quaternion(quaternion_xyzw, input_quaternion_xyzw)
+        absolute_observation_i.update(
+            {
+                position_keys[0]: float(absolute_pose_i[0, 3]),
+                position_keys[1]: float(absolute_pose_i[1, 3]),
+                position_keys[2]: float(absolute_pose_i[2, 3]),
+                quaternion_keys[0]: float(quaternion_xyzw[0]),
+                quaternion_keys[1]: float(quaternion_xyzw[1]),
+                quaternion_keys[2]: float(quaternion_xyzw[2]),
+                quaternion_keys[3]: float(quaternion_xyzw[3]),
+            }
+        )
     return absolute_observation_i
 
 
@@ -668,7 +754,7 @@ def _load_episode_start_state_rows(dataset_root: Path) -> list[tuple[int, np.nda
     episode_rows.sort(key=lambda item: item[0])
     start_state_rows: list[tuple[int, np.ndarray]] = []
     for episode_index, chunk_index, file_index in episode_rows:
-        data_file = dataset_root / 'data' / f'chunk-{chunk_index:03d}' / f'file-{file_index:06d}.parquet'
+        data_file = _resolve_dataset_data_file(dataset_root, chunk_index=chunk_index, file_index=file_index)
         table = pq.read_table(str(data_file), columns=['episode_index', 'observation.state']).to_pydict()
         for row_episode_index, state in zip(table['episode_index'], table['observation.state'], strict=True):
             if int(row_episode_index) != episode_index:
@@ -697,9 +783,14 @@ def _quaternion_angle_deg(quaternion_a_xyzw: np.ndarray, quaternion_b_xyzw: np.n
 
 def estimate_dataset_start_pose_contract(dataset_root: Path) -> tuple[np.ndarray, dict[str, Any]]:
     start_states = _load_episode_start_states(dataset_root)
-    positions = np.asarray(start_states[:, :3], dtype=np.float64)
-    quaternions = np.asarray(start_states[:, 3:7], dtype=np.float64)
-    gripper_values = np.asarray(start_states[:, 7], dtype=np.float64) if start_states.shape[1] > 7 else None
+    state_indices = _extract_dataset_state_contract_indices(dataset_root)
+    positions = np.asarray([[state[state_indices[key]] for key in EE_POSITION_KEYS] for state in start_states], dtype=np.float64)
+    quaternions = np.asarray([[state[state_indices[key]] for key in EE_QUAT_KEYS] for state in start_states], dtype=np.float64)
+    gripper_values = (
+        np.asarray([state[state_indices['gripper.pos']] for state in start_states], dtype=np.float64)
+        if 'gripper.pos' in state_indices
+        else None
+    )
 
     aligned_quaternions = quaternions.copy()
     reference_quaternion = aligned_quaternions[0]
@@ -739,6 +830,7 @@ def summarize_live_start_alignment_to_dataset_starts(
     live_gripper: float | None = None,
 ) -> dict[str, Any]:
     start_state_rows = _load_episode_start_state_rows(dataset_root)
+    state_indices = _extract_dataset_state_contract_indices(dataset_root)
     live_position = np.asarray(live_start_pose_i[:3, 3], dtype=np.float64)
     live_rotation = Rotation.from_matrix(live_start_pose_i[:3, :3])
 
@@ -753,7 +845,11 @@ def summarize_live_start_alignment_to_dataset_starts(
     best_score = float('inf')
 
     for episode_index, state in start_state_rows:
-        dataset_start_pose_i = _pose_from_position_and_quaternion(state[:3], state[3:7])
+        position_xyz, quaternion_xyzw, dataset_gripper = _extract_pose_gripper_from_state_row(
+            state,
+            state_indices=state_indices,
+        )
+        dataset_start_pose_i = _pose_from_position_and_quaternion(position_xyz, quaternion_xyzw)
         predicted_start_pose_i = T_B_Ws @ dataset_start_pose_i
         position_error_mm = float(np.linalg.norm(predicted_start_pose_i[:3, 3] - live_position) * 1000.0)
         rotation_error_deg = float(
@@ -764,9 +860,7 @@ def summarize_live_start_alignment_to_dataset_starts(
             )
         )
         gripper_abs_delta = float('nan')
-        dataset_gripper = float('nan')
-        if live_gripper is not None and state.shape[0] > 7:
-            dataset_gripper = float(state[7])
+        if live_gripper is not None and dataset_gripper is not None:
             gripper_abs_delta = float(abs(live_gripper - dataset_gripper))
             gripper_abs_errors.append(gripper_abs_delta)
         position_errors_mm.append(position_error_mm)
@@ -811,24 +905,42 @@ def convert_base_observation_from_I_to_dataset_frame(
     *,
     previous_quaternion_xyzw: np.ndarray | None = None,
 ) -> tuple[RobotObservation, np.ndarray]:
-    absolute_pose_i = _pose_from_quaternion_observation(absolute_observation_i)
-    dataset_pose_i = _invert_pose(T_B_Ws) @ absolute_pose_i
-    dataset_quaternion_xyzw = Rotation.from_matrix(dataset_pose_i[:3, :3]).as_quat()
-    dataset_quaternion_xyzw = _continuous_quaternion(dataset_quaternion_xyzw, previous_quaternion_xyzw)
-
     dataset_observation_i = dict(absolute_observation_i)
-    dataset_observation_i.update(
-        {
-            'ee.x': float(dataset_pose_i[0, 3]),
-            'ee.y': float(dataset_pose_i[1, 3]),
-            'ee.z': float(dataset_pose_i[2, 3]),
-            'ee.qx': float(dataset_quaternion_xyzw[0]),
-            'ee.qy': float(dataset_quaternion_xyzw[1]),
-            'ee.qz': float(dataset_quaternion_xyzw[2]),
-            'ee.qw': float(dataset_quaternion_xyzw[3]),
-        }
-    )
-    return dataset_observation_i, dataset_quaternion_xyzw
+    current_dataset_quaternion_xyzw = previous_quaternion_xyzw
+    for position_keys, quaternion_keys in (
+        (EE_POSITION_KEYS, EE_QUAT_KEYS),
+        (PREV_CMD_POSITION_KEYS, PREV_CMD_QUAT_KEYS),
+    ):
+        if not all(key in absolute_observation_i for key in position_keys + quaternion_keys):
+            continue
+        input_quaternion_xyzw = np.asarray([absolute_observation_i[key] for key in quaternion_keys], dtype=np.float64)
+        absolute_pose_i = _pose_from_quaternion_observation(
+            absolute_observation_i,
+            position_keys=position_keys,
+            quaternion_keys=quaternion_keys,
+        )
+        dataset_pose_i = _invert_pose(T_B_Ws) @ absolute_pose_i
+        dataset_quaternion_xyzw = Rotation.from_matrix(dataset_pose_i[:3, :3]).as_quat()
+        reference_quaternion = (
+            current_dataset_quaternion_xyzw if position_keys == EE_POSITION_KEYS else input_quaternion_xyzw
+        )
+        dataset_quaternion_xyzw = _continuous_quaternion(dataset_quaternion_xyzw, reference_quaternion)
+        dataset_observation_i.update(
+            {
+                position_keys[0]: float(dataset_pose_i[0, 3]),
+                position_keys[1]: float(dataset_pose_i[1, 3]),
+                position_keys[2]: float(dataset_pose_i[2, 3]),
+                quaternion_keys[0]: float(dataset_quaternion_xyzw[0]),
+                quaternion_keys[1]: float(dataset_quaternion_xyzw[1]),
+                quaternion_keys[2]: float(dataset_quaternion_xyzw[2]),
+                quaternion_keys[3]: float(dataset_quaternion_xyzw[3]),
+            }
+        )
+        if position_keys == EE_POSITION_KEYS:
+            current_dataset_quaternion_xyzw = dataset_quaternion_xyzw
+    if current_dataset_quaternion_xyzw is None:
+        raise KeyError('Current EE pose keys are missing from the absolute observation.')
+    return dataset_observation_i, current_dataset_quaternion_xyzw
 
 
 def convert_dataset_command_to_base_frame(

@@ -279,6 +279,58 @@ def test_build_policy_observation_maps_state_images_and_tactile_passthrough():
     assert np.allclose(observation['observation.tactile.valid_mask'], 1.0)
 
 
+def test_build_policy_observation_supports_prev_cmd_state_names():
+    input_features = {
+        'observation.state': PolicyFeature(type=FeatureType.STATE, shape=(16,)),
+    }
+    state_observation = {
+        'ee.x': 0.1,
+        'ee.y': 0.2,
+        'ee.z': 0.3,
+        'ee.qx': 0.0,
+        'ee.qy': 0.0,
+        'ee.qz': 0.0,
+        'ee.qw': 1.0,
+        'gripper.pos': 0.4,
+        'prev_cmd.ee.x': 0.11,
+        'prev_cmd.ee.y': 0.22,
+        'prev_cmd.ee.z': 0.33,
+        'prev_cmd.ee.qx': 0.0,
+        'prev_cmd.ee.qy': 0.0,
+        'prev_cmd.ee.qz': 0.0,
+        'prev_cmd.ee.qw': 1.0,
+        'prev_cmd.gripper.pos': 0.5,
+    }
+
+    observation = fr3_act_infer_real_runtime.build_policy_observation(
+        state_observation,
+        state_names=[
+            'ee.x',
+            'ee.y',
+            'ee.z',
+            'ee.qx',
+            'ee.qy',
+            'ee.qz',
+            'ee.qw',
+            'gripper.pos',
+            'prev_cmd.ee.x',
+            'prev_cmd.ee.y',
+            'prev_cmd.ee.z',
+            'prev_cmd.ee.qx',
+            'prev_cmd.ee.qy',
+            'prev_cmd.ee.qz',
+            'prev_cmd.ee.qw',
+            'prev_cmd.gripper.pos',
+        ],
+        input_features=input_features,
+    )
+
+    assert np.allclose(
+        observation['observation.state'],
+        [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0, 0.4, 0.11, 0.22, 0.33, 0.0, 0.0, 0.0, 1.0, 0.5],
+    )
+
+
 def test_build_policy_observation_normalizes_bgr_hikrobot_frames_to_rgb():
     input_features = {
         'observation.state': PolicyFeature(type=FeatureType.STATE, shape=(8,)),
@@ -534,6 +586,45 @@ def test_build_hold_command_reuses_current_observation():
         'ee.wz': 0.03,
         'gripper.pos': 0.4,
     }
+
+
+def test_resolve_dataset_data_file_uses_meta_template(tmp_path: Path):
+    dataset_root = tmp_path / 'dataset'
+    (dataset_root / 'meta').mkdir(parents=True)
+    (dataset_root / 'data' / 'chunk-000').mkdir(parents=True)
+    (dataset_root / 'meta' / 'info.json').write_text(
+        '{'
+        '"features":{"observation.state":{"names":["ee.x","ee.y","ee.z","ee.qx","ee.qy","ee.qz","ee.qw","gripper.pos"]}},'
+        '"data_path":"data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"'
+        '}',
+        encoding='utf-8',
+    )
+    data_file = dataset_root / 'data' / 'chunk-000' / 'file-000.parquet'
+    data_file.write_bytes(b'PAR1testPAR1')
+
+    resolved = fr3_act_infer_real_runtime._resolve_dataset_data_file(dataset_root, chunk_index=0, file_index=0)
+
+    assert resolved == data_file
+
+
+def test_extract_dataset_state_contract_indices_ignores_prev_cmd_suffix_fields(tmp_path: Path):
+    dataset_root = tmp_path / 'dataset'
+    (dataset_root / 'meta').mkdir(parents=True)
+    (dataset_root / 'meta' / 'info.json').write_text(
+        '{'
+        '"features":{"observation.state":{"names":['
+        '"ee.x","ee.y","ee.z","ee.qx","ee.qy","ee.qz","ee.qw","gripper.pos",'
+        '"prev_cmd.ee.x","prev_cmd.ee.y","prev_cmd.ee.z","prev_cmd.ee.qx","prev_cmd.ee.qy","prev_cmd.ee.qz","prev_cmd.ee.qw","prev_cmd.gripper.pos"'
+        ']}}'
+        '}',
+        encoding='utf-8',
+    )
+
+    indices = fr3_act_infer_real_runtime._extract_dataset_state_contract_indices(dataset_root)
+
+    assert indices['ee.x'] == 0
+    assert indices['ee.qw'] == 6
+    assert indices['gripper.pos'] == 7
 
 
 def test_denormalize_live_gripper_observation_matches_das_aperture():

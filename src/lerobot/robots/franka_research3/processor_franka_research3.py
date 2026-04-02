@@ -28,11 +28,25 @@ from lerobot.utils.rotation import Rotation
 EE_POSITION_KEYS = ("ee.x", "ee.y", "ee.z")
 EE_ROTVEC_KEYS = ("ee.wx", "ee.wy", "ee.wz")
 EE_QUAT_KEYS = ("ee.qx", "ee.qy", "ee.qz", "ee.qw")
+PREV_CMD_POSITION_KEYS = ("prev_cmd.ee.x", "prev_cmd.ee.y", "prev_cmd.ee.z")
+PREV_CMD_ROTVEC_KEYS = ("prev_cmd.ee.wx", "prev_cmd.ee.wy", "prev_cmd.ee.wz")
+PREV_CMD_QUAT_KEYS = ("prev_cmd.ee.qx", "prev_cmd.ee.qy", "prev_cmd.ee.qz", "prev_cmd.ee.qw")
+PREV_CMD_GRIPPER_KEY = "prev_cmd.gripper.pos"
+
+
+def _canonicalize_quaternion(quaternion_xyzw: np.ndarray) -> np.ndarray:
+    quaternion_xyzw = np.asarray(quaternion_xyzw, dtype=np.float64)
+    dominant_component_index = int(np.argmax(np.abs(quaternion_xyzw)))
+    if float(quaternion_xyzw[dominant_component_index]) < 0.0:
+        quaternion_xyzw = -quaternion_xyzw
+    return quaternion_xyzw
 
 
 def _continuous_quaternion(quaternion_xyzw: np.ndarray, previous_quaternion_xyzw: np.ndarray | None) -> np.ndarray:
     quaternion_xyzw = np.asarray(quaternion_xyzw, dtype=np.float64)
-    if previous_quaternion_xyzw is not None and float(np.dot(quaternion_xyzw, previous_quaternion_xyzw)) < 0.0:
+    if previous_quaternion_xyzw is None:
+        return _canonicalize_quaternion(quaternion_xyzw)
+    if float(np.dot(quaternion_xyzw, previous_quaternion_xyzw)) < 0.0:
         quaternion_xyzw = -quaternion_xyzw
     return quaternion_xyzw
 
@@ -56,54 +70,99 @@ class KeepAbsoluteEEObservation(ObservationProcessorStep):
     """Keep only absolute EE pose, gripper position, and camera observations using quaternions."""
 
     _prev_quaternion_xyzw: np.ndarray | None = field(default=None, init=False, repr=False)
+    _prev_prev_cmd_quaternion_xyzw: np.ndarray | None = field(default=None, init=False, repr=False)
+
+    def _extract_quaternion(
+        self,
+        observation: RobotObservation,
+        *,
+        rotvec_keys: tuple[str, str, str],
+        quat_keys: tuple[str, str, str, str],
+    ) -> np.ndarray | None:
+        if all(key in observation for key in rotvec_keys):
+            return Rotation.from_rotvec([observation[key] for key in rotvec_keys]).as_quat()
+        if all(key in observation for key in quat_keys):
+            return np.array([observation[key] for key in quat_keys], dtype=np.float64)
+        return None
 
     def observation(self, observation: RobotObservation) -> RobotObservation:
-        if all(key in observation for key in EE_ROTVEC_KEYS):
-            quaternion_xyzw = Rotation.from_rotvec([observation[key] for key in EE_ROTVEC_KEYS]).as_quat()
-        elif all(key in observation for key in EE_QUAT_KEYS):
-            quaternion_xyzw = np.array([observation[key] for key in EE_QUAT_KEYS], dtype=np.float64)
-        else:
-            quaternion_xyzw = None
+        quaternion_xyzw = self._extract_quaternion(
+            observation,
+            rotvec_keys=EE_ROTVEC_KEYS,
+            quat_keys=EE_QUAT_KEYS,
+        )
+        prev_cmd_quaternion_xyzw = self._extract_quaternion(
+            observation,
+            rotvec_keys=PREV_CMD_ROTVEC_KEYS,
+            quat_keys=PREV_CMD_QUAT_KEYS,
+        )
+
+        ignored_keys = set(EE_POSITION_KEYS + EE_ROTVEC_KEYS + EE_QUAT_KEYS + ("gripper.pos",))
+        ignored_keys.update(PREV_CMD_POSITION_KEYS + PREV_CMD_ROTVEC_KEYS + PREV_CMD_QUAT_KEYS + (PREV_CMD_GRIPPER_KEY,))
 
         passthrough_observation = {
             key: value
             for key, value in observation.items()
-            if not key.startswith("ee.") and key != "gripper.pos" and not key.endswith(".pos")
+            if key not in ignored_keys and not key.endswith(".pos")
         }
 
-        if quaternion_xyzw is None:
-            return {
-                **{key: observation[key] for key in EE_POSITION_KEYS if key in observation},
-                "gripper.pos": observation["gripper.pos"],
-                **passthrough_observation,
-            }
-
-        quaternion_xyzw = _continuous_quaternion(quaternion_xyzw, self._prev_quaternion_xyzw)
-        self._prev_quaternion_xyzw = quaternion_xyzw.copy()
-        return {
-            **{key: observation[key] for key in EE_POSITION_KEYS},
-            **{key: float(value) for key, value in zip(EE_QUAT_KEYS, quaternion_xyzw, strict=True)},
+        processed_observation: RobotObservation = {
+            **{key: observation[key] for key in EE_POSITION_KEYS if key in observation},
             "gripper.pos": observation["gripper.pos"],
             **passthrough_observation,
         }
 
+        if quaternion_xyzw is not None:
+            quaternion_xyzw = _continuous_quaternion(quaternion_xyzw, self._prev_quaternion_xyzw)
+            self._prev_quaternion_xyzw = quaternion_xyzw.copy()
+            processed_observation.update(
+                {key: float(value) for key, value in zip(EE_QUAT_KEYS, quaternion_xyzw, strict=True)}
+            )
+
+        if all(key in observation for key in PREV_CMD_POSITION_KEYS):
+            processed_observation.update({key: observation[key] for key in PREV_CMD_POSITION_KEYS})
+        if PREV_CMD_GRIPPER_KEY in observation:
+            processed_observation[PREV_CMD_GRIPPER_KEY] = observation[PREV_CMD_GRIPPER_KEY]
+        if prev_cmd_quaternion_xyzw is not None:
+            prev_cmd_quaternion_xyzw = _continuous_quaternion(
+                prev_cmd_quaternion_xyzw,
+                self._prev_prev_cmd_quaternion_xyzw,
+            )
+            self._prev_prev_cmd_quaternion_xyzw = prev_cmd_quaternion_xyzw.copy()
+            processed_observation.update(
+                {key: float(value) for key, value in zip(PREV_CMD_QUAT_KEYS, prev_cmd_quaternion_xyzw, strict=True)}
+            )
+
+        return processed_observation
+
     def reset(self) -> None:
         self._prev_quaternion_xyzw = None
+        self._prev_prev_cmd_quaternion_xyzw = None
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         observation_features = features[PipelineFeatureType.OBSERVATION]
         for key in list(observation_features):
-            if key.endswith(".pos") and key != "gripper.pos" and key not in EE_POSITION_KEYS:
+            if (
+                key.endswith(".pos")
+                and key not in {"gripper.pos", PREV_CMD_GRIPPER_KEY}
+                and key not in EE_POSITION_KEYS
+                and key not in PREV_CMD_POSITION_KEYS
+            ):
                 observation_features.pop(key, None)
-        for key in EE_ROTVEC_KEYS:
+        for key in EE_ROTVEC_KEYS + PREV_CMD_ROTVEC_KEYS:
             observation_features.pop(key, None)
         gripper_feature = observation_features.pop("gripper.pos", None)
+        prev_cmd_gripper_feature = observation_features.pop(PREV_CMD_GRIPPER_KEY, None)
         for key in EE_QUAT_KEYS:
+            observation_features[key] = PolicyFeature(type=FeatureType.STATE, shape=(1,))
+        for key in PREV_CMD_QUAT_KEYS:
             observation_features[key] = PolicyFeature(type=FeatureType.STATE, shape=(1,))
         if gripper_feature is not None:
             observation_features["gripper.pos"] = gripper_feature
+        if prev_cmd_gripper_feature is not None:
+            observation_features[PREV_CMD_GRIPPER_KEY] = prev_cmd_gripper_feature
         return features
 
 

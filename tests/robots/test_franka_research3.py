@@ -1063,13 +1063,27 @@ def test_get_observation(robot):
     observation = robot.get_observation()
 
     expected_ee_keys = {"ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz", "gripper.pos"}
+    expected_prev_cmd_keys = {
+        "prev_cmd.ee.x",
+        "prev_cmd.ee.y",
+        "prev_cmd.ee.z",
+        "prev_cmd.ee.wx",
+        "prev_cmd.ee.wy",
+        "prev_cmd.ee.wz",
+        "prev_cmd.gripper.pos",
+    }
     expected_joint_keys = {f"joint_{i}.pos" for i in range(1, 8)}
     assert expected_ee_keys.issubset(observation)
+    assert expected_prev_cmd_keys.issubset(observation)
     assert expected_joint_keys.issubset(observation)
     assert observation["ee.x"] == pytest.approx(0.4)
     assert observation["ee.y"] == pytest.approx(0.1)
     assert observation["ee.z"] == pytest.approx(0.3)
     assert observation["gripper.pos"] == pytest.approx(0.25)
+    assert observation["prev_cmd.ee.x"] == pytest.approx(observation["ee.x"])
+    assert observation["prev_cmd.ee.y"] == pytest.approx(observation["ee.y"])
+    assert observation["prev_cmd.ee.z"] == pytest.approx(observation["ee.z"])
+    assert observation["prev_cmd.gripper.pos"] == pytest.approx(observation["gripper.pos"])
 
 
 def test_get_observation_includes_tactile_when_gripper_provides_it(robot):
@@ -1619,7 +1633,61 @@ def test_keep_absolute_ee_observation_filters_joint_state(robot):
     assert "ee.qw" in filtered
     assert "ee.wx" not in filtered
     assert "gripper.pos" in filtered
+    assert "prev_cmd.ee.qx" in filtered
+    assert "prev_cmd.ee.qw" in filtered
+    assert "prev_cmd.ee.wx" not in filtered
+    assert "prev_cmd.gripper.pos" in filtered
     assert "joint_1.pos" not in filtered
+
+
+def test_delta_action_processor_matches_observation_quaternion_sign_on_first_frame(robot):
+    robot.connect()
+    processor = RobotProcessorPipeline[tuple[dict, dict], dict](
+        steps=[
+            DeltaActionToAbsoluteEEAction(
+                workspace_min=robot.config.workspace_min,
+                workspace_max=robot.config.workspace_max,
+                max_target_delta_pos=robot.config.max_target_delta_pos,
+                max_target_delta_rot=robot.config.max_target_delta_rot,
+            )
+        ],
+        to_transition=robot_action_observation_to_transition,
+        to_output=transition_to_robot_action,
+    )
+    observation_processor = RobotProcessorPipeline[dict, dict](
+        steps=[KeepAbsoluteEEObservation()],
+        to_transition=observation_to_transition,
+        to_output=transition_to_observation,
+    )
+
+    observation = robot.get_observation()
+    processed_observation = observation_processor(observation)
+    processed_action = processor(
+        (
+            {
+                "enabled": False,
+                "target_x": 0.0,
+                "target_y": 0.0,
+                "target_z": 0.0,
+                "target_wx": 0.0,
+                "target_wy": 0.0,
+                "target_wz": 0.0,
+                "gripper": observation["gripper.pos"],
+            },
+            observation,
+        )
+    )
+
+    observation_quaternion = np.asarray(
+        [processed_observation["ee.qx"], processed_observation["ee.qy"], processed_observation["ee.qz"], processed_observation["ee.qw"]],
+        dtype=np.float64,
+    )
+    action_quaternion = np.asarray(
+        [processed_action["ee.qx"], processed_action["ee.qy"], processed_action["ee.qz"], processed_action["ee.qw"]],
+        dtype=np.float64,
+    )
+
+    assert float(np.dot(observation_quaternion, action_quaternion)) > 0.0
 
 
 def test_keep_absolute_ee_observation_makes_quaternion_sign_continuous():
@@ -1693,7 +1761,7 @@ def test_keep_absolute_ee_observation_reset_restarts_quaternion_continuity():
         dtype=np.float64,
     )
     expected_quat = Rotation.from_rotvec([0.0, 0.0, -(np.pi - 0.01)]).as_quat()
-    assert np.allclose(after_reset_quat, expected_quat)
+    assert np.allclose(after_reset_quat, -expected_quat)
 
 
 def test_send_action_clamps_target_delta_before_workspace(monkeypatch):

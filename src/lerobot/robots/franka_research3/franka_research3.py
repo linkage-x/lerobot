@@ -39,6 +39,7 @@ from .backends import (
     RuckigOTGDriver,
 )
 from .config_franka_research3 import FrankaResearch3Config
+from .processor_franka_research3 import PREV_CMD_GRIPPER_KEY, PREV_CMD_POSITION_KEYS, PREV_CMD_ROTVEC_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ class FrankaResearch3(Robot):
         self._gripper_is_mock = False
         self._reference_pose: np.ndarray | None = None
         self._last_command_pose: np.ndarray | None = None
+        self._last_command_gripper: float | None = None
         self._hold_joint_target: np.ndarray | None = None
         self._prev_enabled = False
         self._otg_target_joints: np.ndarray | None = None
@@ -185,6 +187,11 @@ class FrankaResearch3(Robot):
             "ee.wz": float,
             "gripper.pos": float,
         }
+        prev_cmd_features: dict[str, type] = {
+            **{key: float for key in PREV_CMD_POSITION_KEYS},
+            **{key: float for key in PREV_CMD_ROTVEC_KEYS},
+            PREV_CMD_GRIPPER_KEY: float,
+        }
         joint_features = {f"{joint}.pos": float for joint in self._joint_names}
         camera_features = {
             name: (cfg.height, cfg.width, 3) for name, cfg in self.config.cameras.items()
@@ -198,7 +205,7 @@ class FrankaResearch3(Robot):
                 'observation.tactile.left_clean': (50, 10),
                 'observation.tactile.right_clean': (50, 10),
             }
-        return {**ee_features, **joint_features, **camera_features, **tactile_features}
+        return {**ee_features, **prev_cmd_features, **joint_features, **camera_features, **tactile_features}
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -349,6 +356,7 @@ class FrankaResearch3(Robot):
     def _reset_teleop_state(self) -> None:
         self._reference_pose = None
         self._last_command_pose = None
+        self._last_command_gripper = None
         self._hold_joint_target = None
         self._prev_enabled = False
 
@@ -420,6 +428,27 @@ class FrankaResearch3(Robot):
             return 1.0 if gripper_target >= 0.5 else 0.0
         return gripper_target
 
+    def _make_prev_command_observation(
+        self,
+        *,
+        current_ee_pose: np.ndarray,
+        current_gripper_pos: float,
+    ) -> RobotObservation:
+        previous_command_pose = current_ee_pose if self._last_command_pose is None else self._last_command_pose
+        previous_command_rotvec = Rotation.from_matrix(previous_command_pose[:3, :3]).as_rotvec()
+        previous_command_gripper = (
+            current_gripper_pos if self._last_command_gripper is None else self._last_command_gripper
+        )
+        return {
+            "prev_cmd.ee.x": float(previous_command_pose[0, 3]),
+            "prev_cmd.ee.y": float(previous_command_pose[1, 3]),
+            "prev_cmd.ee.z": float(previous_command_pose[2, 3]),
+            "prev_cmd.ee.wx": float(previous_command_rotvec[0]),
+            "prev_cmd.ee.wy": float(previous_command_rotvec[1]),
+            "prev_cmd.ee.wz": float(previous_command_rotvec[2]),
+            PREV_CMD_GRIPPER_KEY: float(previous_command_gripper),
+        }
+
     @check_if_not_connected
     def get_observation(self, *, include_cameras: bool = True) -> RobotObservation:
         self._raise_if_otg_failed()
@@ -437,6 +466,7 @@ class FrankaResearch3(Robot):
             "ee.wy": float(ee_rotvec[1]),
             "ee.wz": float(ee_rotvec[2]),
             "gripper.pos": gripper_pos,
+            **self._make_prev_command_observation(current_ee_pose=ee_pose, current_gripper_pos=gripper_pos),
         }
         for index, joint_position in enumerate(joint_positions_rad, start=1):
             observation[f"joint_{index}.pos"] = float(joint_position)
@@ -547,6 +577,7 @@ class FrankaResearch3(Robot):
         self._gripper.set_position(gripper_target)
 
         self._last_command_pose = desired_pose.copy()
+        self._last_command_gripper = gripper_target
         if not all(key in action for key in ("ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz")):
             if enabled:
                 self._hold_joint_target = None
@@ -596,7 +627,9 @@ class FrankaResearch3(Robot):
                 raise RuntimeError("Arm backend is not connected.")
             self._arm.set_joint_positions(target_joints_rad)
         if gripper_pos is not None:
-            self._gripper.set_position(self._normalize_gripper_command(float(gripper_pos)))
+            normalized_gripper_pos = self._normalize_gripper_command(float(gripper_pos))
+            self._gripper.set_position(normalized_gripper_pos)
+            self._last_command_gripper = normalized_gripper_pos
         self._hold_joint_target = None
         self._reference_pose = None
         self._prev_enabled = False
