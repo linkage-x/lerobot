@@ -7,6 +7,12 @@
 
 This package contains a simplified robot description (MJCF) of the [Franka Research 3](https://franka.de/research) (aka FR3) developed by [Franka Robotics](https://franka.de/company) (formerly Franka Emika). It is derived from the [publicly available URDF description](https://github.com/frankaemika/franka_description).
 
+This repo also carries hand-equipped URDF variants for LeRobot FR3 integrations:
+
+- `fr3_pika_gripper_ati.urdf`
+- `fr3_das_ati.urdf`
+- `fr3_franka_hand.urdf`
+
 <p float="left">
   <img src="fr3.png" width="400">
 </p>

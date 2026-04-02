@@ -33,7 +33,7 @@ import subprocess
 DEFAULT_SERVICE = "lerobot-user"
 DEFAULT_ROBOT_IP = "192.168.1.206"
 DEFAULT_GRIPPER_PORT = "/dev/ttyUSB0"
-DEFAULT_URDF_PATH = "/lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.urdf"
+DEFAULT_URDF_PATH = "/workspace/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.urdf"
 DEFAULT_TRANSLATION_SCALE = 0.000615
 DEFAULT_ROTATION_SCALE = 0.000648
 DEFAULT_TRANSLATION_MAX_TARGET_DELTA_POS = "[0.001,0.001,0.001]"
@@ -178,8 +178,8 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
     workspace = args.workspace.resolve()
     compose_file = args.compose_file.resolve() if args.compose_file is not None else workspace / "docker" / "docker-compose.yml"
     teleop_args = [
-        "cd /lerobot &&",
-        "PYTHONPATH=/lerobot/src",
+        "cd /workspace &&",
+        "PYTHONPATH=/workspace/src",
         "/lerobot/.venv/bin/lerobot-teleoperate",
         f"--fps={args.fps}",
         f"--teleop_time_s={args.duration}",

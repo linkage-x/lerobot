@@ -51,6 +51,7 @@ from lerobot.scripts.lerobot_record import (
 )
 import lerobot.teleoperators.spacemouse  # noqa: F401
 from lerobot.teleoperators import make_teleoperator_from_config
+from lerobot.teleoperators.spacemouse.configuration_spacemouse import SpaceMouseTeleopConfig, SpaceMouseToolMode
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
     is_headless,
@@ -69,6 +70,17 @@ EPISODE_START_SETTLE_ANGLE_THRESHOLD_RAD = np.deg2rad(1.0)
 EPISODE_START_SETTLE_GRIPPER_THRESHOLD = 0.02
 EPISODE_START_SETTLE_CONSECUTIVE_SAMPLES = 5
 EPISODE_START_SETTLE_TIMEOUT_S = 3.0
+
+
+def _force_binary_spacemouse_for_franka_hand(cfg: RecordConfig) -> None:
+    if getattr(cfg.robot, "gripper_backend", None) != "franka_hand":
+        return
+    if not isinstance(cfg.teleop, SpaceMouseTeleopConfig):
+        return
+    if cfg.teleop.tool_mode == SpaceMouseToolMode.BINARY:
+        return
+    logging.info("Forcing SpaceMouse tool_mode=binary because Franka Hand does not support incremental gripper control.")
+    cfg.teleop.tool_mode = SpaceMouseToolMode.BINARY
 
 
 def make_fr3_ee2ee_processors(cfg: RecordConfig) -> tuple[
@@ -144,6 +156,18 @@ def _make_episode_start_settle_target(initial_observation: dict, initial_action:
     }
 
 
+def _get_runtime_observation(robot, *, include_cameras: bool) -> dict:
+    if include_cameras:
+        return robot.get_observation()
+
+    try:
+        return robot.get_observation(include_cameras=False)
+    except TypeError as exc:
+        if "include_cameras" not in str(exc):
+            raise
+        return robot.get_observation()
+
+
 def _wait_for_episode_start_settle(
     *,
     robot,
@@ -154,7 +178,7 @@ def _wait_for_episode_start_settle(
     events: dict[str, bool],
     fps: int,
 ) -> None:
-    initial_observation = robot.get_observation()
+    initial_observation = _get_runtime_observation(robot, include_cameras=False)
     initial_observation_processed = robot_observation_processor(initial_observation)
     initial_action = teleop.get_action()
     target_action = _make_episode_start_settle_target(initial_observation_processed, initial_action)
@@ -164,7 +188,7 @@ def _wait_for_episode_start_settle(
     last_errors: tuple[float, float, float] | None = None
     while not events["stop_recording"]:
         loop_start_t = time.perf_counter()
-        current_observation = robot.get_observation()
+        current_observation = _get_runtime_observation(robot, include_cameras=False)
         current_observation_processed = robot_observation_processor(current_observation)
         robot_action = robot_action_processor((target_action, current_observation))
         robot.send_action(robot_action)
@@ -262,6 +286,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         else cfg.display_compressed_images
     )
 
+    _force_binary_spacemouse_for_franka_hand(cfg)
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop)
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_fr3_ee2ee_processors(cfg)

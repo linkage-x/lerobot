@@ -20,7 +20,7 @@ import numpy as np
 
 from lerobot.robots.franka_research3 import FrankaResearch3Config
 from lerobot.scripts.lerobot_record import DatasetRecordConfig, RecordConfig
-from lerobot.teleoperators.spacemouse.configuration_spacemouse import SpaceMouseTeleopConfig
+from lerobot.teleoperators.spacemouse.configuration_spacemouse import SpaceMouseTeleopConfig, SpaceMouseToolMode
 from tools.fr3 import fr3_record_runtime
 
 
@@ -183,6 +183,19 @@ class FakeSettlingRobot(FakeRobot):
         return action
 
 
+class FakeSelectiveObservationRobot(FakeRobot):
+    def __init__(self):
+        super().__init__()
+        self.include_cameras_calls: list[bool] = []
+
+    def get_observation(self, *, include_cameras: bool = True):
+        self.include_cameras_calls.append(include_cameras)
+        observation = super().get_observation()
+        if include_cameras:
+            observation["front"] = np.zeros((2, 2, 3), dtype=np.uint8)
+        return observation
+
+
 class FakeTeleopWithAction(FakeTeleop):
     def __init__(self, action):
         super().__init__()
@@ -258,6 +271,73 @@ def test_record_resets_teleop_action_processor_after_episode(monkeypatch):
     assert dataset.finalized is True
 
 
+def test_record_forces_binary_spacemouse_for_franka_hand(monkeypatch):
+    teleop_action_processor = FakeProcessor()
+    robot_action_processor = FakeProcessor()
+    robot_observation_processor = FakeProcessor()
+    robot = FakeRobot()
+    teleop = FakeTeleop()
+
+    monkeypatch.setattr(fr3_record_runtime, "init_logging", lambda: None)
+    monkeypatch.setattr(fr3_record_runtime, "make_robot_from_config", lambda cfg: robot)
+    monkeypatch.setattr(
+        fr3_record_runtime,
+        "make_teleoperator_from_config",
+        lambda cfg: (cfg.tool_mode == SpaceMouseToolMode.BINARY) and teleop,
+    )
+    monkeypatch.setattr(
+        fr3_record_runtime,
+        "make_fr3_ee2ee_processors",
+        lambda cfg: (teleop_action_processor, robot_action_processor, robot_observation_processor),
+    )
+    monkeypatch.setattr(fr3_record_runtime, "aggregate_pipeline_dataset_features", lambda **kwargs: {})
+    monkeypatch.setattr(fr3_record_runtime, "create_initial_features", lambda **kwargs: {})
+    monkeypatch.setattr(fr3_record_runtime, "combine_feature_dicts", lambda *args: {})
+    monkeypatch.setattr(fr3_record_runtime, "sanity_check_dataset_name", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fr3_record_runtime, "VideoEncodingManager", FakeVideoEncodingManager)
+    monkeypatch.setattr(fr3_record_runtime, "LeRobotDataset", FakeDatasetFactory)
+    monkeypatch.setattr(fr3_record_runtime, "_wait_for_episode_start_settle", lambda **kwargs: None)
+    monkeypatch.setattr(fr3_record_runtime, "record_loop", lambda **kwargs: None)
+    monkeypatch.setattr(fr3_record_runtime, "_confirm_keep_episode", lambda play_sounds: True)
+    monkeypatch.setattr(
+        fr3_record_runtime,
+        "init_keyboard_listener",
+        lambda: (None, {"exit_early": False, "rerecord_episode": False, "stop_recording": False}),
+    )
+    monkeypatch.setattr(fr3_record_runtime, "log_say", lambda *args, **kwargs: None)
+
+    cfg = RecordConfig(
+        robot=FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_backend="franka_hand",
+            allow_mock_gripper=False,
+            urdf_path="/tmp/fr3.urdf",
+        ),
+        teleop=SpaceMouseTeleopConfig(tool_mode=SpaceMouseToolMode.INCREMENTAL),
+        dataset=DatasetRecordConfig(
+            repo_id="local/fr3_test",
+            single_task="test",
+            root="/tmp/fr3_test",
+            fps=30,
+            num_episodes=1,
+            episode_time_s=1,
+            reset_time_s=0,
+            video=False,
+            push_to_hub=False,
+        ),
+        auto_move_to_start_after_episode=False,
+        move_to_start_after_last_episode=False,
+        confirm_next_episode_after_reset=False,
+        play_sounds=False,
+        display_data=False,
+    )
+
+    dataset = fr3_record_runtime.record(cfg)
+
+    assert cfg.teleop.tool_mode == SpaceMouseToolMode.BINARY
+    assert dataset.finalized is True
+
+
 def test_record_waits_for_episode_start_settle_before_record_loop(monkeypatch):
     teleop_action_processor = FakeProcessor()
     robot_action_processor = FakeProcessor()
@@ -323,6 +403,36 @@ def test_record_waits_for_episode_start_settle_before_record_loop(monkeypatch):
     fr3_record_runtime.record(cfg)
 
     assert call_order == ["idle", "settle", "record"]
+
+
+def test_wait_for_episode_start_settle_skips_cameras(monkeypatch):
+    robot = FakeSelectiveObservationRobot()
+    teleop = FakeTeleopWithAction(
+        {
+            "enabled": False,
+            "target_x": 0.0,
+            "target_y": 0.0,
+            "target_z": 0.0,
+            "target_wx": 0.0,
+            "target_wy": 0.0,
+            "target_wz": 0.0,
+            "gripper": 0.5,
+        }
+    )
+    monkeypatch.setattr(fr3_record_runtime, "precise_sleep", lambda *_args, **_kwargs: None)
+
+    fr3_record_runtime._wait_for_episode_start_settle(
+        robot=robot,
+        teleop=teleop,
+        teleop_action_processor=FakeProcessor(),
+        robot_action_processor=FakeRobotActionProcessor(),
+        robot_observation_processor=FakeObservationProcessor(),
+        events={"stop_recording": False},
+        fps=200,
+    )
+
+    assert robot.include_cameras_calls
+    assert set(robot.include_cameras_calls) == {False}
 
 
 def test_record_resets_before_first_episode_when_auto_move_enabled(monkeypatch):

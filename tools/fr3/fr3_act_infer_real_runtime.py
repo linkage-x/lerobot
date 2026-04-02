@@ -23,7 +23,7 @@ import numpy as np
 import torch
 import yaml
 
-from lerobot.cameras.configs import Cv2Backends
+from lerobot.cameras.configs import ColorMode, Cv2Backends
 from lerobot.cameras.hikrobot.configuration_hikrobot import HikrobotCameraConfig
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
@@ -276,6 +276,7 @@ def load_camera_configs(
                 width=int(width),
                 height=int(height),
                 fps=int(cfg['fps']),
+                color_mode=cfg.get('color_mode', ColorMode.RGB),
                 warmup_s=int(cfg.get('warmup_s', 1)),
                 fourcc=str(cfg.get('fourcc', _DEFAULT_OPENCV_FOURCC)),
                 backend=_coerce_opencv_backend(cfg.get('backend', _DEFAULT_OPENCV_BACKEND)),
@@ -298,6 +299,7 @@ def load_camera_configs(
                 width=int(width),
                 height=int(height),
                 fps=int(cfg['fps']),
+                color_mode=cfg.get('color_mode', ColorMode.BGR),
                 warmup_s=int(cfg.get('warmup_s', 1)),
                 transport_layer=str(cfg.get('transport_layer', 'usb')),
                 exposure_us=float(cfg['exposure_us']) if cfg.get('exposure_us') is not None else None,
@@ -475,6 +477,7 @@ def build_policy_observation(
     state_names: list[str],
     input_features: dict[str, Any],
     tactile_fallback_observation: dict[str, np.ndarray] | None = None,
+    camera_configs: dict[str, OpenCVCameraConfig | RealSenseCameraConfig | HikrobotCameraConfig] | None = None,
 ) -> dict[str, np.ndarray]:
     observation: dict[str, np.ndarray] = {
         'observation.state': np.asarray(
@@ -486,7 +489,16 @@ def build_policy_observation(
     for camera_key in extract_required_image_keys(input_features):
         if camera_key not in state_observation:
             raise KeyError(f"Camera '{camera_key}' missing from robot observation.")
-        observation[f'{_OBS_IMAGES_PREFIX}{camera_key}'] = np.asarray(state_observation[camera_key], dtype=np.uint8)
+        image = np.asarray(state_observation[camera_key], dtype=np.uint8)
+        if image.ndim == 3 and image.shape[-1] == 3 and camera_configs is not None and camera_key in camera_configs:
+            color_mode = getattr(camera_configs[camera_key], 'color_mode', None)
+            try:
+                color_mode = ColorMode(color_mode)
+            except ValueError:
+                color_mode = None
+            if color_mode == ColorMode.BGR:
+                image = np.ascontiguousarray(image[..., ::-1])
+        observation[f'{_OBS_IMAGES_PREFIX}{camera_key}'] = image
 
     required_tactile_keys = extract_required_tactile_keys(input_features)
     missing_tactile_keys = [feature_key for feature_key in required_tactile_keys if feature_key not in state_observation]
@@ -1396,6 +1408,7 @@ def run_inference(args: argparse.Namespace) -> int:
                 state_names=state_names,
                 input_features=policy.config.input_features,
                 tactile_fallback_observation=tactile_fallback_observation,
+                camera_configs=camera_configs,
             )
             if step_idx == 0 and args.debug_step0_dump_dir is not None:
                 if start_alignment_stats is None:

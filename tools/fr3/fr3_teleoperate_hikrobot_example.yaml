@@ -1,10 +1,10 @@
 robot:
   type: franka_research3
   robot_ip: 192.168.1.206
-  gripper_port: /dev/ttyUSB0
+  gripper_backend: franka_hand
   allow_mock_gripper: false
-  urdf_path: /lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.urdf
-  target_frame_name: pika_gripper_ee
+  urdf_path: /workspace/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_franka_hand.urdf
+  target_frame_name: fr3_hand_tcp
   max_target_delta_pos: [0.001, 0.001, 0.001]
   max_target_delta_rot: [0.01, 0.01, 0.01]
   cameras:
@@ -14,7 +14,7 @@ robot:
       width: 1280
       height: 720
       fps: 30
-      transport_layer: usb
+      transport_layer: gige
       color_mode: bgr
       warmup_s: 2
       exposure_us: 10000
@@ -29,7 +29,7 @@ robot:
       width: 1280
       height: 720
       fps: 30
-      transport_layer: usb
+      transport_layer: gige
       color_mode: bgr
       warmup_s: 2
       exposure_us: 10000
@@ -42,7 +42,7 @@ robot:
 teleop:
   type: spacemouse
   device_id: 0
-  tool_mode: incremental
+  tool_mode: binary
   incremental_step: 0.05
   move_time: 0.02
   enable_rotation: true

@@ -113,3 +113,23 @@ Choose one of these:
 1. Run Hikrobot discovery and recording on the host.
 2. If containerized recording is required, move to a Docker runtime that really exposes the physical NIC to the container.
 3. Keep Hikrobot/MVS on the host and stream frames into the container using a transport such as ZMQ, then record in-container via `ZMQCamera`.
+
+## Current Lightest Workaround In This Repo
+
+`tools/fr3/fr3_record.py` now supports an `auto` runtime mode.
+
+- If the recording config contains Hikrobot cameras with `transport_layer: gige`, the launcher skips Docker and runs `tools.fr3.fr3_record_runtime` directly on the host.
+- During host execution, config paths under `/workspace/...` and `/lerobot/...` are translated to the local repository path before the runtime starts.
+
+This keeps the operator entry point unchanged:
+
+```bash
+python tools/fr3/fr3_record.py --config-path tools/fr3/fr3_record_hikrobot_example.yaml
+```
+
+The shipped Hikrobot FR3 example is now configured to use:
+
+- `transport_layer: gige`
+- host-side runtime auto-selection
+- `gripper_backend: franka_hand`
+- `target_frame_name: fr3_link8` as the lightest FR3-hand-compatible control frame

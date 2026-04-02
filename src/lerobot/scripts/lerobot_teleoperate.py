@@ -103,6 +103,7 @@ from lerobot.teleoperators import (  # noqa: F401
     spacemouse,
     unitree_g1,
 )
+from lerobot.teleoperators.spacemouse.configuration_spacemouse import SpaceMouseTeleopConfig, SpaceMouseToolMode
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging, move_cursor_up
@@ -125,6 +126,17 @@ class TeleoperateConfig:
     display_port: int | None = None
     # Whether to  display compressed images in Rerun
     display_compressed_images: bool = False
+
+
+def _force_binary_spacemouse_for_franka_hand(cfg: TeleoperateConfig) -> None:
+    if getattr(cfg.robot, "gripper_backend", None) != "franka_hand":
+        return
+    if not isinstance(cfg.teleop, SpaceMouseTeleopConfig):
+        return
+    if cfg.teleop.tool_mode == SpaceMouseToolMode.BINARY:
+        return
+    logging.info("Forcing SpaceMouse tool_mode=binary because Franka Hand does not support incremental gripper control.")
+    cfg.teleop.tool_mode = SpaceMouseToolMode.BINARY
 
 
 def teleop_loop(
@@ -220,6 +232,7 @@ def teleoperate(cfg: TeleoperateConfig):
         else cfg.display_compressed_images
     )
 
+    _force_binary_spacemouse_for_franka_hand(cfg)
     teleop = make_teleoperator_from_config(cfg.teleop)
     robot = make_robot_from_config(cfg.robot)
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()

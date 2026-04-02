@@ -25,7 +25,7 @@ def test_build_docker_command_defaults_to_sim_service(tmp_path: Path):
     assert "lerobot-fr3-sim" in command
     assert "--mode=sim" in command_text
     assert "tools/fr3/fr3_teleop_trace_replay_runtime.py" in command_text
-    assert "--output=/lerobot/outputs/fr3_traces/sim_trace.json" in command_text
+    assert "--output=/workspace/outputs/fr3_traces/sim_trace.json" in command_text
 
 
 def test_build_docker_command_uses_hardware_service_and_robot_flags(tmp_path: Path):

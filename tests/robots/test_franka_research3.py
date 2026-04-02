@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from pathlib import Path
+import threading
 import numpy as np
 import pytest
 import struct
@@ -24,7 +25,11 @@ import types
 
 from lerobot.robots.franka_research3 import FrankaResearch3, FrankaResearch3Config
 from lerobot.robots.franka_research3 import backends as fr3_backends
-from lerobot.robots.franka_research3.backends import PandaPyArmDriver, PikaGripperHardwareDriver
+from lerobot.robots.franka_research3.backends import (
+    FrankaHandGripperHardwareDriver,
+    PandaPyArmDriver,
+    PikaGripperHardwareDriver,
+)
 from lerobot.robots.franka_research3.processor_franka_research3 import (
     AbsoluteEEActionToRobotAction,
     DeltaActionToAbsoluteEEAction,
@@ -51,6 +56,7 @@ class DummyArmDriver:
         self.joint_positions = np.array([0.1, 0.2, 0.3, -1.0, 0.5, 1.2, -0.7], dtype=np.float64)
         self.set_joint_positions_calls: list[np.ndarray] = []
         self.move_to_start_calls = 0
+        self.get_joint_positions_calls = 0
 
     def connect(self) -> None:
         self.connected = True
@@ -59,6 +65,7 @@ class DummyArmDriver:
         self.connected = False
 
     def get_joint_positions(self) -> np.ndarray:
+        self.get_joint_positions_calls += 1
         return self.joint_positions.copy()
 
     def get_ee_pose(self) -> np.ndarray | None:
@@ -216,6 +223,7 @@ def test_pandapy_arm_driver_connect_seeds_controller_with_current_joints(monkeyp
             self.started_controllers = []
             self.stopped = 0
             self.state = types.SimpleNamespace(q=np.array([0.1, 0.2, 0.3, -1.0, 0.5, 1.2, -0.7], dtype=np.float64))
+            self.get_state_calls = 0
             type(self).instances.append(self)
 
         def start_controller(self, controller):
@@ -225,6 +233,7 @@ def test_pandapy_arm_driver_connect_seeds_controller_with_current_joints(monkeyp
             self.stopped += 1
 
         def get_state(self):
+            self.get_state_calls += 1
             return self.state
 
     fake_module = types.SimpleNamespace(
@@ -241,6 +250,48 @@ def test_pandapy_arm_driver_connect_seeds_controller_with_current_joints(monkeyp
     assert len(controller.set_control_calls) == 1
     assert np.allclose(controller.set_control_calls[0], DummyPanda.instances[-1].state.q)
     assert DummyPanda.instances[-1].started_controllers == [controller]
+
+
+def test_pandapy_arm_driver_get_joint_positions_uses_cached_state(monkeypatch):
+    class DummyJointPositionController:
+        def set_control(self, joint_positions):
+            del joint_positions
+
+    class DummyPanda:
+        instances: list["DummyPanda"] = []
+
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.state = types.SimpleNamespace(q=np.array([0.1, 0.2, 0.3, -1.0, 0.5, 1.2, -0.7], dtype=np.float64))
+            self.get_state_calls = 0
+            type(self).instances.append(self)
+
+        def start_controller(self, controller):
+            del controller
+
+        def stop_controller(self):
+            return None
+
+        def get_state(self):
+            self.get_state_calls += 1
+            return self.state
+
+    fake_module = types.SimpleNamespace(
+        Panda=DummyPanda,
+        controllers=types.SimpleNamespace(JointPosition=DummyJointPositionController),
+    )
+    monkeypatch.setitem(sys.modules, "panda_py", fake_module)
+
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+
+    first = driver.get_joint_positions()
+    second = driver.get_joint_positions()
+
+    assert np.allclose(first, DummyPanda.instances[-1].state.q)
+    assert np.allclose(second, DummyPanda.instances[-1].state.q)
+    assert DummyPanda.instances[-1].get_state_calls == 1
+    driver.disconnect()
 
 
 def test_pika_gripper_hardware_driver_deduplicates_and_rate_limits(monkeypatch):
@@ -385,6 +436,191 @@ def test_das_gripper_hardware_driver_reports_normalized_position_and_rate_limits
 
     driver.disconnect()
     assert FakeDataBus.instances[-1].stopped is True
+
+
+def test_franka_hand_gripper_hardware_driver_reports_normalized_position_and_uses_grasp_when_closing(monkeypatch):
+    class FakeFrankaHandState:
+        def __init__(self, width=0.08, max_width=0.08):
+            self.width = width
+            self.max_width = max_width
+
+    class FakeFrankaHand:
+        instances: list["FakeFrankaHand"] = []
+
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.move_calls: list[tuple[float, float]] = []
+            self.grasp_calls: list[tuple[float, float, float, float, float]] = []
+            self.stop_calls = 0
+            self.homing_calls = 0
+            self.state = FakeFrankaHandState()
+            type(self).instances.append(self)
+
+        def homing(self):
+            self.homing_calls += 1
+            return True
+
+        def read_once(self):
+            return self.state
+
+        def move(self, width_m, speed_m_s):
+            self.move_calls.append((float(width_m), float(speed_m_s)))
+            self.state.width = float(width_m)
+            return True
+
+        def grasp(self, width_m, speed_m_s, force_n, epsilon_inner_m, epsilon_outer_m):
+            self.grasp_calls.append(
+                (
+                    float(width_m),
+                    float(speed_m_s),
+                    float(force_n),
+                    float(epsilon_inner_m),
+                    float(epsilon_outer_m),
+                )
+            )
+            self.state.width = float(width_m)
+            return True
+
+        def stop(self):
+            self.stop_calls += 1
+
+    fake_module = types.SimpleNamespace(libfranka=types.SimpleNamespace(Gripper=FakeFrankaHand))
+    monkeypatch.setitem(sys.modules, "panda_py", fake_module)
+
+    driver = FrankaHandGripperHardwareDriver(
+        robot_ip="192.168.1.206",
+        command_rate_limit_hz=None,
+        command_deadband_m=5e-4,
+    )
+    driver.connect()
+
+    assert driver.get_position() == pytest.approx(1.0)
+    driver.set_position(0.5)
+
+    deadline = time.perf_counter() + 0.2
+    while not FakeFrankaHand.instances[-1].move_calls and time.perf_counter() < deadline:
+        time.sleep(0.005)
+
+    driver.set_position(0.0)
+    driver.set_position(0.0)
+
+    deadline = time.perf_counter() + 0.2
+    while not FakeFrankaHand.instances[-1].grasp_calls and time.perf_counter() < deadline:
+        time.sleep(0.005)
+
+    assert FakeFrankaHand.instances[-1].move_calls == [(0.08, 0.05)]
+    assert FakeFrankaHand.instances[-1].grasp_calls == [(0.0, 0.05, 20.0, 0.005, 0.005)]
+
+    driver.disconnect()
+    assert FakeFrankaHand.instances[-1].stop_calls == 1
+
+
+def test_franka_hand_gripper_hardware_driver_caches_state_for_get_position(monkeypatch):
+    class FakeFrankaHandState:
+        def __init__(self, width=0.04, max_width=0.08):
+            self.width = width
+            self.max_width = max_width
+
+    class FakeFrankaHand:
+        instances: list["FakeFrankaHand"] = []
+
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.homing_calls = 0
+            self.stop_calls = 0
+            self.read_once_calls = 0
+            self.state = FakeFrankaHandState()
+            type(self).instances.append(self)
+
+        def homing(self):
+            self.homing_calls += 1
+            return True
+
+        def read_once(self):
+            self.read_once_calls += 1
+            return self.state
+
+        def stop(self):
+            self.stop_calls += 1
+
+    fake_module = types.SimpleNamespace(libfranka=types.SimpleNamespace(Gripper=FakeFrankaHand))
+    monkeypatch.setitem(sys.modules, "panda_py", fake_module)
+
+    driver = FrankaHandGripperHardwareDriver(
+        robot_ip="192.168.1.206",
+        state_poll_frequency_hz=1.0,
+    )
+    driver.connect()
+
+    fake_gripper = FakeFrankaHand.instances[-1]
+    assert fake_gripper.read_once_calls == 1
+    assert driver.get_position() == pytest.approx(0.5)
+    assert driver.get_position() == pytest.approx(0.5)
+    assert fake_gripper.read_once_calls == 1
+
+    driver.disconnect()
+    assert fake_gripper.stop_calls == 1
+
+
+def test_franka_hand_gripper_hardware_driver_set_position_is_async(monkeypatch):
+    command_started = threading.Event()
+    command_release = threading.Event()
+
+    class FakeFrankaHandState:
+        def __init__(self, width=0.08, max_width=0.08):
+            self.width = width
+            self.max_width = max_width
+
+    class FakeFrankaHand:
+        instances: list["FakeFrankaHand"] = []
+
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.state = FakeFrankaHandState()
+            self.stop_calls = 0
+            type(self).instances.append(self)
+
+        def homing(self):
+            return True
+
+        def read_once(self):
+            return self.state
+
+        def move(self, width_m, speed_m_s):
+            del width_m, speed_m_s
+            command_started.set()
+            command_release.wait(timeout=1.0)
+            return True
+
+        def grasp(self, width_m, speed_m_s, force_n, epsilon_inner_m, epsilon_outer_m):
+            del width_m, speed_m_s, force_n, epsilon_inner_m, epsilon_outer_m
+            command_started.set()
+            command_release.wait(timeout=1.0)
+            return True
+
+        def stop(self):
+            self.stop_calls += 1
+            command_release.set()
+
+    fake_module = types.SimpleNamespace(libfranka=types.SimpleNamespace(Gripper=FakeFrankaHand))
+    monkeypatch.setitem(sys.modules, "panda_py", fake_module)
+
+    driver = FrankaHandGripperHardwareDriver(
+        robot_ip="192.168.1.206",
+        command_rate_limit_hz=None,
+        state_poll_frequency_hz=0.0,
+    )
+    driver.connect()
+
+    start_t = time.perf_counter()
+    driver.set_position(1.0)
+    elapsed_s = time.perf_counter() - start_t
+
+    assert elapsed_s < 0.05
+    assert command_started.wait(timeout=0.2) is True
+
+    command_release.set()
+    driver.disconnect()
 
 
 def test_das_gripper_hardware_driver_decodes_tactile_and_applies_clean_rule(tmp_path, monkeypatch):
@@ -672,6 +908,88 @@ def test_connect_uses_das_gripper_backend_when_configured(monkeypatch):
             robot.disconnect()
 
 
+def test_connect_uses_franka_hand_gripper_backend_when_configured(monkeypatch):
+    DummyArmDriver.instances = []
+    DummyGripperDriver.instances = []
+    DummyOTGDriver.instances = []
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", FailingGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "franka_hand_gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_backend="franka_hand",
+            urdf_path="/tmp/fr3.urdf",
+        )
+    )
+
+    try:
+        robot.connect()
+        init_kwargs = DummyGripperDriver.instances[-1].init_kwargs
+        assert init_kwargs["robot_ip"] == "192.168.1.206"
+        assert init_kwargs["command_deadband_m"] == pytest.approx(robot.config.gripper_command_deadband_mm / 1000.0)
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
+
+
+def test_send_action_binarizes_franka_hand_gripper_commands(monkeypatch):
+    DummyArmDriver.instances = []
+    DummyGripperDriver.instances = []
+    DummyOTGDriver.instances = []
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", FailingGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "franka_hand_gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_backend="franka_hand",
+            urdf_path="/tmp/fr3.urdf",
+        )
+    )
+
+    try:
+        robot.connect()
+
+        opened = robot.send_action(
+            {
+                "enabled": False,
+                "target_x": 0.0,
+                "target_y": 0.0,
+                "target_z": 0.0,
+                "target_wx": 0.0,
+                "target_wy": 0.0,
+                "target_wz": 0.0,
+                "gripper": 0.7,
+            }
+        )
+        closed = robot.send_action(
+            {
+                "enabled": False,
+                "target_x": 0.0,
+                "target_y": 0.0,
+                "target_z": 0.0,
+                "target_wx": 0.0,
+                "target_wy": 0.0,
+                "target_wz": 0.0,
+                "gripper": 0.3,
+            }
+        )
+
+        assert DummyGripperDriver.instances[-1].set_position_calls[-2:] == [1.0, 0.0]
+        assert opened["gripper"] == pytest.approx(1.0)
+        assert closed["gripper"] == pytest.approx(0.0)
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
+
+
 def test_connect_passes_gripper_command_throttle_config(monkeypatch):
     DummyArmDriver.instances = []
     DummyGripperDriver.instances = []
@@ -768,6 +1086,30 @@ def test_get_observation_includes_tactile_when_gripper_provides_it(robot):
     assert float(observation["observation.tactile.valid_mask"][0, 0]) == pytest.approx(1.0)
 
 
+def test_get_observation_skips_cameras_when_disabled(robot):
+    class FakeCamera:
+        def __init__(self):
+            self.read_latest_calls = 0
+
+        def read_latest(self):
+            self.read_latest_calls += 1
+            return np.zeros((2, 2, 3), dtype=np.uint8)
+
+    robot.connect()
+    camera = FakeCamera()
+    robot.cameras = {"front": camera}
+
+    observation = robot.get_observation(include_cameras=False)
+
+    assert "front" not in observation
+    assert camera.read_latest_calls == 0
+
+    observation = robot.get_observation()
+
+    assert observation["front"].shape == (2, 2, 3)
+    assert camera.read_latest_calls == 1
+
+
 def test_get_observation_uses_kinematics_target_frame_even_if_arm_reports_pose(monkeypatch):
     monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", ReportingArmDriver)
     monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
@@ -862,6 +1204,52 @@ def test_send_action_clips_workspace_and_sends_joint_targets(robot):
 
     _, desired_pose = robot._kinematics.inverse_calls[-1]
     assert np.allclose(desired_pose[:3, 3], np.array([0.6, 0.3, 0.5]))
+
+
+def test_send_action_reuses_observation_joint_snapshot(monkeypatch):
+    DummyArmDriver.instances = []
+    DummyGripperDriver.instances = []
+    DummyOTGDriver.instances = []
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+            use_otg=False,
+        )
+    )
+
+    try:
+        robot.connect()
+        arm = DummyArmDriver.instances[-1]
+        assert arm.get_joint_positions_calls == 0
+
+        observation = robot.get_observation(include_cameras=False)
+        assert observation["gripper.pos"] == pytest.approx(0.25)
+        assert arm.get_joint_positions_calls == 1
+
+        robot.send_action(
+            {
+                "enabled": True,
+                "target_x": 0.01,
+                "target_y": -0.02,
+                "target_z": 0.03,
+                "target_wx": 0.0,
+                "target_wy": 0.0,
+                "target_wz": 0.0,
+                "gripper": 0.5,
+            }
+        )
+
+        assert arm.get_joint_positions_calls == 1
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
 
 
 def test_send_action_accepts_absolute_ee_targets(robot):

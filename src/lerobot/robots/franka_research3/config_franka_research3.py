@@ -77,8 +77,8 @@ class FrankaResearch3Config(RobotConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.gripper_backend not in {"pika", "das"}:
-            raise ValueError("gripper_backend must be either 'pika' or 'das'.")
+        if self.gripper_backend not in {"pika", "das", "franka_hand"}:
+            raise ValueError("gripper_backend must be one of 'pika', 'das', or 'franka_hand'.")
         if len(self.workspace_min) != 3 or len(self.workspace_max) != 3:
             raise ValueError("workspace_min and workspace_max must be 3D tuples.")
         if self.max_target_delta_pos is not None and len(self.max_target_delta_pos) != 3:

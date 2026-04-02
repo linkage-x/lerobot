@@ -11,6 +11,8 @@ import subprocess
 DEFAULT_SERVICE = 'lerobot-infer-fr3-act'
 DEFAULT_PROFILE = 'infer'
 DEFAULT_DATASET = Path('outputs/datasets/lerobotv3_0310_100ep')
+CONTAINER_WORKSPACE = '/workspace'
+LEGACY_CONTAINER_WORKSPACE = '/lerobot'
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -45,17 +47,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _to_container_path(path: Path, workspace: Path) -> str:
     path_str = str(path)
-    if path_str.startswith('/lerobot/'):
+    if path_str.startswith(f'{CONTAINER_WORKSPACE}/'):
         return path_str
+    if path_str.startswith(f'{LEGACY_CONTAINER_WORKSPACE}/'):
+        return f"{CONTAINER_WORKSPACE}/{path_str.removeprefix(f'{LEGACY_CONTAINER_WORKSPACE}/')}"
 
     resolved_workspace = workspace.resolve()
     resolved_path = path.resolve()
     try:
         relative = resolved_path.relative_to(resolved_workspace)
     except ValueError as exc:
-        raise ValueError(f'Path must live inside {resolved_workspace} or already be a /lerobot path.') from exc
+        raise ValueError(
+            f'Path must live inside {resolved_workspace} or already be a {CONTAINER_WORKSPACE} path.'
+        ) from exc
 
-    return f'/lerobot/{relative.as_posix()}'
+    return f'{CONTAINER_WORKSPACE}/{relative.as_posix()}'
 
 
 def build_docker_command(args: argparse.Namespace) -> list[str]:
@@ -64,8 +70,8 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
     dataset_path = _to_container_path(args.dataset, workspace)
 
     runtime_args = [
-        'cd /lerobot &&',
-        'PYTHONPATH=/lerobot/src:/lerobot/tools/fr3',
+        'cd /workspace &&',
+        'PYTHONPATH=/workspace/src:/workspace/tools/fr3',
         '/lerobot/.venv/bin/python',
         'tools/fr3/fr3_compare_infer_replay_decode_runtime.py',
         f'--dataset={shlex.quote(dataset_path)}',

@@ -27,6 +27,8 @@ DEFAULT_RESET_GRIPPER_TIMEOUT_S = 2.0
 DEFAULT_TIMING_SOURCE = "timestamp"
 DEFAULT_OTG_SCALE = 1.0
 DEFAULT_ANALYSIS_OUTPUT_DIR = "outputs/analysis"
+CONTAINER_WORKSPACE = "/workspace"
+LEGACY_CONTAINER_WORKSPACE = "/lerobot"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -160,6 +162,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def repo_path_to_container_path(path_value: str | Path, workspace: Path) -> str:
     path = Path(path_value)
+    path_str = str(path_value)
+    if path_str.startswith(f"{CONTAINER_WORKSPACE}/"):
+        return path_str
+    if path_str.startswith(f"{LEGACY_CONTAINER_WORKSPACE}/"):
+        return f"{CONTAINER_WORKSPACE}/{path_str.removeprefix(f'{LEGACY_CONTAINER_WORKSPACE}/')}"
     if path.is_absolute():
         resolved = path.resolve()
         try:
@@ -168,7 +175,7 @@ def repo_path_to_container_path(path_value: str | Path, workspace: Path) -> str:
             raise ValueError(f"Path must be inside workspace {workspace}: {resolved}") from exc
     else:
         relative = path
-    return f"/lerobot/{relative.as_posix()}"
+    return f"{CONTAINER_WORKSPACE}/{relative.as_posix()}"
 
 
 def build_docker_command(args: argparse.Namespace) -> list[str]:
@@ -183,8 +190,8 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
     )
 
     runtime_args = [
-        "cd /lerobot &&",
-        "PYTHONPATH=/lerobot/src",
+        "cd /workspace &&",
+        "PYTHONPATH=/workspace/src",
         "/lerobot/.venv/bin/python",
         "tools/fr3/fr3_das_replay_real_runtime.py",
         f"--episode={args.episode}",

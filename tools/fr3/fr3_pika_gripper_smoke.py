@@ -80,8 +80,8 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
     workspace = args.workspace.resolve()
     compose_file = args.compose_file.resolve() if args.compose_file is not None else workspace / "docker" / "docker-compose.yml"
     runtime_args = [
-        "cd /lerobot &&",
-        "PYTHONPATH=/lerobot/src",
+        "cd /workspace &&",
+        "PYTHONPATH=/workspace/src",
         "/lerobot/.venv/bin/python",
         "tools/fr3/fr3_pika_gripper_smoke_runtime.py",
         f"--gripper-port={args.gripper_port}",

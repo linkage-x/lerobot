@@ -8,7 +8,8 @@ import subprocess
 import numpy as np
 import torch
 
-from lerobot.cameras.configs import Cv2Backends
+from lerobot.cameras.configs import ColorMode, Cv2Backends
+from lerobot.cameras.hikrobot.configuration_hikrobot import HikrobotCameraConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.robots.franka_research3 import FrankaResearch3Config
 from tools.fr3 import fr3_act_infer_real, fr3_act_infer_real_runtime
@@ -32,7 +33,8 @@ def test_build_docker_command_defaults_to_infer_service_and_profile(tmp_path: Pa
     ]
     assert 'lerobot-infer-fr3-act' in command
     assert 'tools/fr3/fr3_act_infer_real_runtime.py' in command_text
-    assert '--camera-config=' in command_text
+    assert '--checkpoint=/workspace/outputs/train/2026-03-19/10-48-39_act/checkpoints/060000' in command_text
+    assert '--camera-config=/workspace/tools/fr3/fr3_act_infer_camera_config.yaml' in command_text
     assert '--camera-key-map' not in command_text
 
 
@@ -220,6 +222,27 @@ def test_load_camera_configs_supports_explicit_opencv_backend_and_fourcc(tmp_pat
     assert camera_configs['left'].backend == Cv2Backends.ANY
 
 
+def test_load_camera_configs_respects_hikrobot_color_mode(tmp_path: Path):
+    config_path = tmp_path / 'camera.yaml'
+    config_path.write_text(
+        """robot:
+  cameras:
+    wrist:
+      type: hikrobot
+      serial: "DA9342611"
+      image_shape: [480, 640]
+      fps: 30
+      transport_layer: gige
+      color_mode: rgb
+""",
+        encoding='utf-8',
+    )
+
+    camera_configs = fr3_act_infer_real_runtime.load_camera_configs(config_path)
+
+    assert camera_configs['wrist'].color_mode == ColorMode.RGB
+
+
 def test_build_policy_observation_maps_state_images_and_tactile_passthrough():
     input_features = {
         'observation.state': PolicyFeature(type=FeatureType.STATE, shape=(8,)),
@@ -254,6 +277,44 @@ def test_build_policy_observation_maps_state_images_and_tactile_passthrough():
     assert observation['observation.images.right'].shape == (4, 5, 3)
     assert np.allclose(observation['observation.tactile.left_clean'], 7.0)
     assert np.allclose(observation['observation.tactile.valid_mask'], 1.0)
+
+
+def test_build_policy_observation_normalizes_bgr_hikrobot_frames_to_rgb():
+    input_features = {
+        'observation.state': PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+        'observation.images.wrist': PolicyFeature(type=FeatureType.VISUAL, shape=(3, 4, 5)),
+    }
+    state_observation = {
+        'ee.x': 0.1,
+        'ee.y': 0.2,
+        'ee.z': 0.3,
+        'ee.qx': 0.0,
+        'ee.qy': 0.0,
+        'ee.qz': 0.0,
+        'ee.qw': 1.0,
+        'gripper.pos': 0.4,
+        'wrist': np.array([[[255, 0, 0]]], dtype=np.uint8),
+    }
+    camera_configs = {
+        'wrist': HikrobotCameraConfig(
+            serial='DA9342611',
+            width=1,
+            height=1,
+            fps=30,
+            warmup_s=0,
+            transport_layer='gige',
+            color_mode='bgr',
+        )
+    }
+
+    observation = fr3_act_infer_real_runtime.build_policy_observation(
+        state_observation,
+        state_names=['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw', 'gripper'],
+        input_features=input_features,
+        camera_configs=camera_configs,
+    )
+
+    assert observation['observation.images.wrist'][0, 0].tolist() == [0, 0, 255]
 
 
 def test_build_policy_observation_rejects_missing_required_tactile():

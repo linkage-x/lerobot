@@ -46,8 +46,8 @@ def test_build_docker_command_contains_expected_runtime_entrypoint(tmp_path: Pat
         "--rm",
     ]
     assert "lerobot-internal" in command
-    assert "cd /lerobot &&" in command_text
-    assert "PYTHONPATH=/lerobot/src" in command_text
+    assert "cd /workspace &&" in command_text
+    assert "PYTHONPATH=/workspace/src" in command_text
     assert "tools/fr3/fr3_move_to_start_runtime.py" in command_text
     assert "--robot-ip=10.0.0.5" in command_text
 

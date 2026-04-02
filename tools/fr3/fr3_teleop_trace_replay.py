@@ -66,13 +66,13 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
     service = args.service or (DEFAULT_SIM_SERVICE if args.mode == "sim" else DEFAULT_HARDWARE_SERVICE)
 
     runtime_args = [
-        "cd /lerobot &&",
-        "PYTHONPATH=/lerobot/src",
+        "cd /workspace &&",
+        "PYTHONPATH=/workspace/src",
         "/lerobot/.venv/bin/python",
         "tools/fr3/fr3_teleop_trace_replay_runtime.py",
         f"--mode={args.mode}",
         f"--trace-profile={args.trace_profile}",
-        f"--output=/lerobot/{repo_relative_output.as_posix()}",
+        f"--output=/workspace/{repo_relative_output.as_posix()}",
         f"--fps={args.fps}",
         f"--step-x={args.step_x}",
         f"--step-y={args.step_y}",

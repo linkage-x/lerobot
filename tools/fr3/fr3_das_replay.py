@@ -48,12 +48,12 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
     compose_file = args.compose_file.resolve() if args.compose_file else workspace / "docker" / "docker-compose.yml"
 
     runtime_args = [
-        "cd /lerobot &&",
-        "PYTHONPATH=/lerobot/src",
+        "cd /workspace &&",
+        "PYTHONPATH=/workspace/src",
         "/lerobot/.venv/bin/python",
         "tools/fr3/fr3_das_replay_runtime.py",
         f"--episode={args.episode}",
-        f"--dataset=/lerobot/{args.dataset}",
+        f"--dataset=/workspace/{args.dataset}",
         f"--fps={args.fps}",
     ]
     if args.no_viewer:

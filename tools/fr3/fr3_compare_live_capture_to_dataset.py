@@ -12,6 +12,14 @@ DEFAULT_SERVICE = 'lerobot-infer-fr3-act'
 DEFAULT_PROFILE = 'infer'
 DEFAULT_CAPTURE_DIR = Path('outputs/fr3_live_step0/latest')
 DEFAULT_CHECKPOINT = Path('outputs/train/2026-03-19/10-48-39_act/checkpoints/060000')
+CONTAINER_WORKSPACE = '/workspace'
+LEGACY_CONTAINER_WORKSPACE = '/lerobot'
+
+
+def _normalize_workspace_path(path_value: str) -> str:
+    if path_value.startswith(f'{LEGACY_CONTAINER_WORKSPACE}/'):
+        return f"{CONTAINER_WORKSPACE}/{path_value.removeprefix(f'{LEGACY_CONTAINER_WORKSPACE}/')}"
+    return path_value
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -39,17 +47,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _to_container_path(path: Path, workspace: Path) -> str:
     path_str = str(path)
-    if path_str.startswith('/lerobot/'):
+    if path_str.startswith(f'{CONTAINER_WORKSPACE}/'):
         return path_str
+    if path_str.startswith(f'{LEGACY_CONTAINER_WORKSPACE}/'):
+        return f"{CONTAINER_WORKSPACE}/{path_str.removeprefix(f'{LEGACY_CONTAINER_WORKSPACE}/')}"
 
     resolved_workspace = workspace.resolve()
     resolved_path = path.resolve()
     try:
         relative = resolved_path.relative_to(resolved_workspace)
     except ValueError as exc:
-        raise ValueError(f'Path must live inside {resolved_workspace} or already be a /lerobot path.') from exc
+        raise ValueError(
+            f'Path must live inside {resolved_workspace} or already be a {CONTAINER_WORKSPACE} path.'
+        ) from exc
 
-    return f'/lerobot/{relative.as_posix()}'
+    return f'{CONTAINER_WORKSPACE}/{relative.as_posix()}'
 
 
 def build_docker_command(args: argparse.Namespace) -> list[str]:
@@ -59,13 +71,13 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
     checkpoint = _to_container_path(args.checkpoint, workspace)
 
     runtime_args = [
-        'cd /lerobot &&',
-        'PYTHONPATH=/lerobot/src:/lerobot/tools/fr3',
+        'cd /workspace &&',
+        'PYTHONPATH=/workspace/src:/workspace/tools/fr3',
         '/lerobot/.venv/bin/python',
         'tools/fr3/fr3_compare_live_capture_to_dataset_runtime.py',
         f'--capture-dir={shlex.quote(capture_dir)}',
         f'--checkpoint={shlex.quote(checkpoint)}',
-        *([f'--dataset-root={shlex.quote(args.dataset_root)}'] if args.dataset_root is not None else []),
+        *([f"--dataset-root={shlex.quote(_normalize_workspace_path(args.dataset_root))}"] if args.dataset_root is not None else []),
     ]
 
     return [

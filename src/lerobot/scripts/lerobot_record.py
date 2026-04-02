@@ -74,9 +74,12 @@ from pathlib import Path
 from pprint import pformat
 from typing import Any
 
+import numpy as np
+
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
 )
+from lerobot.cameras.configs import ColorMode
 from lerobot.cameras.hikrobot.configuration_hikrobot import HikrobotCameraConfig  # noqa: F401
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.reachy2_camera.configuration_reachy2_camera import Reachy2CameraConfig  # noqa: F401
@@ -265,6 +268,60 @@ class RecordConfig:
         return ["policy"]
 
 
+def _build_record_loop_frequency_warning(actual_fps: float, control_fps: int, dataset_fps: int | None) -> str:
+    message = (
+        f"Record loop is running slower ({actual_fps:.1f} Hz) than the target control FPS ({control_fps} Hz). "
+    )
+    if dataset_fps is not None and actual_fps < dataset_fps:
+        message += f"Dataset frames might be dropped because the loop is also below dataset.fps ({dataset_fps} Hz). "
+    message += (
+        "Robot control might be unstable. Common causes are: 1) Camera FPS not keeping up "
+        "2) Policy inference taking too long 3) CPU starvation"
+    )
+    return message
+
+
+def _get_record_loop_observation(robot: Robot, *, include_cameras: bool) -> RobotObservation:
+    if include_cameras:
+        return robot.get_observation()
+
+    try:
+        return robot.get_observation(include_cameras=False)
+    except TypeError as exc:
+        if "include_cameras" not in str(exc):
+            raise
+        return robot.get_observation()
+
+
+def _normalize_dataset_observation_images_to_rgb(
+    robot: Robot, observation: RobotObservation
+) -> RobotObservation:
+    cameras = getattr(robot, "cameras", None)
+    if not isinstance(cameras, dict) or not cameras:
+        return observation
+
+    normalized_observation: RobotObservation | None = None
+    for camera_name, camera in cameras.items():
+        frame = observation.get(camera_name)
+        if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[-1] != 3:
+            continue
+
+        camera_config = getattr(camera, "config", None)
+        color_mode = getattr(camera_config, "color_mode", None)
+        try:
+            color_mode = ColorMode(color_mode)
+        except ValueError:
+            continue
+        if color_mode != ColorMode.BGR:
+            continue
+
+        if normalized_observation is None:
+            normalized_observation = dict(observation)
+        normalized_observation[camera_name] = np.ascontiguousarray(frame[..., ::-1])
+
+    return observation if normalized_observation is None else normalized_observation
+
+
 """ --------------- record_loop() data flow --------------------------
        [ Robot ]
            V
@@ -362,14 +419,24 @@ def record_loop(
             events["exit_early"] = False
             break
 
+        loop_elapsed_s = time.perf_counter() - start_episode_t
+        should_capture_dataset_frame = dataset is not None and loop_elapsed_s + 1e-9 >= next_dataset_frame_t
+
         # Get robot observation
-        obs = robot.get_observation()
+        obs = _get_record_loop_observation(
+            robot,
+            include_cameras=policy is not None or should_capture_dataset_frame,
+        )
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
 
-        if policy is not None or dataset is not None:
-            observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+        if policy is not None or should_capture_dataset_frame:
+            observation_frame = build_dataset_frame(
+                dataset.features,
+                _normalize_dataset_observation_images_to_rgb(robot, obs_processed),
+                prefix=OBS_STR,
+            )
 
         # Get action from either policy or teleop
         if policy is not None and preprocessor is not None and postprocessor is not None:
@@ -428,7 +495,7 @@ def record_loop(
         loop_elapsed_s = time.perf_counter() - start_episode_t
 
         # Write to dataset at the dataset sampling rate while keeping the control loop independent.
-        if dataset is not None and loop_elapsed_s + 1e-9 >= next_dataset_frame_t:
+        if dataset is not None and should_capture_dataset_frame:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
@@ -445,9 +512,8 @@ def record_loop(
 
         sleep_time_s: float = 1 / fps - dt_s
         if sleep_time_s < 0:
-            logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target control FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
-            )
+            dataset_fps = None if dataset is None else dataset.fps
+            logging.warning(_build_record_loop_frequency_warning(1 / dt_s, fps, dataset_fps))
 
         precise_sleep(max(sleep_time_s, 0.0))
 

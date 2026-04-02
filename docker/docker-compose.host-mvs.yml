@@ -1,0 +1,16 @@
+services:
+  lerobot-user:
+    volumes:
+      - ${HIKROBOT_MVS_HOST_ROOT:-/opt/MVS}:/opt/MVS:ro
+
+  lerobot-infer-fr3-act:
+    volumes:
+      - ${HIKROBOT_MVS_HOST_ROOT:-/opt/MVS}:/opt/MVS:ro
+
+  lerobot-fr3-sim:
+    volumes:
+      - ${HIKROBOT_MVS_HOST_ROOT:-/opt/MVS}:/opt/MVS:ro
+
+  lerobot-fr3-sim-teleop:
+    volumes:
+      - ${HIKROBOT_MVS_HOST_ROOT:-/opt/MVS}:/opt/MVS:ro

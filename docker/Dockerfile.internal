@@ -202,6 +202,12 @@ RUN chmod +x /lerobot/.venv/lib/python${PYTHON_VERSION}/site-packages/triton/bac
 # Make sure to have the git-LFS files for testing
 COPY --chown=user_lerobot:user_lerobot . .
 
+# Fail the build if a host virtualenv overwrote the image-managed one.
+RUN test -x /lerobot/.venv/bin/python \
+    && test -x /lerobot/.venv/bin/lerobot-find-cameras \
+    && head -n 1 /lerobot/.venv/bin/lerobot-find-cameras \
+        | grep -Eq '^#!/lerobot/.venv/bin/python([0-9]+(\.[0-9]+)?)?$'
+
 ARG INSTALL_HIKROBOT_SDK=false
 
 USER root
@@ -211,6 +217,12 @@ RUN set -eux; \
       sdk_deb="$(find /lerobot/docker/hik-sdk -maxdepth 1 -type f -name '*.deb' | sort | head -n 1)"; \
       if [ -z "${sdk_deb}" ]; then \
         echo "No Hikrobot MVS SDK .deb found under /lerobot/docker/hik-sdk" >&2; \
+        exit 1; \
+      fi; \
+      if ! dpkg-deb -I "${sdk_deb}" >/dev/null 2>&1; then \
+        echo "Invalid Hikrobot MVS SDK package: ${sdk_deb}" >&2; \
+        echo "The file is likely a Git LFS pointer instead of the real .deb payload." >&2; \
+        echo "Fetch the actual artifact before building, then retry with INSTALL_HIKROBOT_SDK=true." >&2; \
         exit 1; \
       fi; \
       apt-get update; \

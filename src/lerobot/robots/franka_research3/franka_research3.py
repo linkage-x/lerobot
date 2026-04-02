@@ -31,6 +31,7 @@ from lerobot.utils.robot_utils import precise_sleep
 from ..robot import Robot
 from .backends import (
     DasGripperHardwareDriver,
+    FrankaHandGripperHardwareDriver,
     MockGripperDriver,
     PandaPyArmDriver,
     PikaGripperHardwareDriver,
@@ -49,6 +50,7 @@ class FrankaResearch3(Robot):
     arm_driver_cls = PandaPyArmDriver
     gripper_driver_cls = PikaGripperHardwareDriver
     das_gripper_driver_cls = DasGripperHardwareDriver
+    franka_hand_gripper_driver_cls = FrankaHandGripperHardwareDriver
     mock_gripper_driver_cls = MockGripperDriver
     kinematics_driver_cls = PlacoKinematicsDriver
     otg_driver_cls = RuckigOTGDriver
@@ -75,6 +77,9 @@ class FrankaResearch3(Robot):
         self._otg_sender_thread: threading.Thread | None = None
         self._otg_running = False
         self._otg_error: Exception | None = None
+        self._state_snapshot_lock = threading.Lock()
+        self._last_observation_joint_positions_rad: np.ndarray | None = None
+        self._last_observation_ee_pose: np.ndarray | None = None
 
     @property
     def _joint_names(self) -> list[str]:
@@ -230,6 +235,12 @@ class FrankaResearch3(Robot):
                 command_rate_limit_hz=self.config.gripper_command_rate_limit_hz,
                 command_deadband_m=self.config.gripper_command_deadband_mm / 1000.0,
             )
+        if self.config.gripper_backend == "franka_hand":
+            return self.franka_hand_gripper_driver_cls(
+                robot_ip=self.config.robot_ip,
+                command_rate_limit_hz=self.config.gripper_command_rate_limit_hz,
+                command_deadband_m=self.config.gripper_command_deadband_mm / 1000.0,
+            )
         return self.gripper_driver_cls(
             serial_port=self.config.gripper_port,
             max_width_mm=self.config.gripper_max_width_mm,
@@ -341,6 +352,32 @@ class FrankaResearch3(Robot):
         self._hold_joint_target = None
         self._prev_enabled = False
 
+    def _cache_observation_state_snapshot(
+        self,
+        joint_positions_rad: np.ndarray,
+        ee_pose: np.ndarray,
+    ) -> None:
+        with self._state_snapshot_lock:
+            self._last_observation_joint_positions_rad = np.asarray(joint_positions_rad, dtype=np.float64).copy()
+            self._last_observation_ee_pose = np.asarray(ee_pose, dtype=np.float64).copy()
+
+    def _consume_observation_state_snapshot(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        with self._state_snapshot_lock:
+            joint_positions_rad = self._last_observation_joint_positions_rad
+            ee_pose = self._last_observation_ee_pose
+            self._last_observation_joint_positions_rad = None
+            self._last_observation_ee_pose = None
+        if joint_positions_rad is not None:
+            joint_positions_rad = np.asarray(joint_positions_rad, dtype=np.float64).copy()
+        if ee_pose is not None:
+            ee_pose = np.asarray(ee_pose, dtype=np.float64).copy()
+        return joint_positions_rad, ee_pose
+
+    def _clear_observation_state_snapshot(self) -> None:
+        with self._state_snapshot_lock:
+            self._last_observation_joint_positions_rad = None
+            self._last_observation_ee_pose = None
+
     def _read_joint_positions(self) -> np.ndarray:
         if self._arm is None:
             raise RuntimeError("Arm backend is not connected.")
@@ -377,11 +414,18 @@ class FrankaResearch3(Robot):
         )
         return desired_pose
 
+    def _normalize_gripper_command(self, gripper_target: float) -> float:
+        gripper_target = float(np.clip(gripper_target, 0.0, 1.0))
+        if self.config.gripper_backend == "franka_hand":
+            return 1.0 if gripper_target >= 0.5 else 0.0
+        return gripper_target
+
     @check_if_not_connected
-    def get_observation(self) -> RobotObservation:
+    def get_observation(self, *, include_cameras: bool = True) -> RobotObservation:
         self._raise_if_otg_failed()
         joint_positions_rad = self._read_joint_positions()
         ee_pose = self._compute_ee_pose(joint_positions_rad)
+        self._cache_observation_state_snapshot(joint_positions_rad, ee_pose)
         ee_rotvec = Rotation.from_matrix(ee_pose[:3, :3]).as_rotvec()
         gripper_pos = float(self._gripper.get_position())
 
@@ -399,13 +443,15 @@ class FrankaResearch3(Robot):
         get_tactile_observation = getattr(self._gripper, 'get_tactile_observation', None)
         if callable(get_tactile_observation):
             observation.update(get_tactile_observation())
-        for camera_name, camera in self.cameras.items():
-            observation[camera_name] = camera.read_latest()
+        if include_cameras:
+            for camera_name, camera in self.cameras.items():
+                observation[camera_name] = camera.read_latest()
         return observation
 
     @check_if_not_connected
     def move_to_start(self) -> None:
         self._raise_if_otg_failed()
+        self._clear_observation_state_snapshot()
         if self._arm is None:
             raise RuntimeError("Arm backend is not connected.")
         move_to_start = getattr(self._arm, "move_to_start", None)
@@ -430,7 +476,9 @@ class FrankaResearch3(Robot):
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
         self._raise_if_otg_failed()
-        joint_positions_rad = self._read_joint_positions()
+        joint_positions_rad, current_pose = self._consume_observation_state_snapshot()
+        if joint_positions_rad is None:
+            joint_positions_rad = self._read_joint_positions()
         hold_current_joints = False
         if all(key in action for key in ("ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz")):
             desired_pose = self._make_pose_from_absolute_action(action)
@@ -439,7 +487,8 @@ class FrankaResearch3(Robot):
             self._reference_pose = None
             self._prev_enabled = False
         else:
-            current_pose = self._compute_ee_pose(joint_positions_rad)
+            if current_pose is None:
+                current_pose = self._compute_ee_pose(joint_positions_rad)
             enabled = bool(action["enabled"])
             if enabled:
                 self._hold_joint_target = None
@@ -494,7 +543,7 @@ class FrankaResearch3(Robot):
             self._arm.set_joint_positions(target_joints_rad)
 
         gripper_key = "gripper.pos" if "gripper.pos" in action else "gripper"
-        gripper_target = float(np.clip(action[gripper_key], 0.0, 1.0))
+        gripper_target = self._normalize_gripper_command(float(action[gripper_key]))
         self._gripper.set_position(gripper_target)
 
         self._last_command_pose = desired_pose.copy()
@@ -535,6 +584,7 @@ class FrankaResearch3(Robot):
         gripper_pos: float | None = None,
     ) -> np.ndarray:
         self._raise_if_otg_failed()
+        self._clear_observation_state_snapshot()
         target_joints_rad = np.asarray(joint_positions_rad, dtype=np.float64).reshape(-1)
         if target_joints_rad.shape != (7,):
             raise ValueError(f"Expected 7 joint targets, got shape {target_joints_rad.shape}.")
@@ -546,7 +596,7 @@ class FrankaResearch3(Robot):
                 raise RuntimeError("Arm backend is not connected.")
             self._arm.set_joint_positions(target_joints_rad)
         if gripper_pos is not None:
-            self._gripper.set_position(float(np.clip(gripper_pos, 0.0, 1.0)))
+            self._gripper.set_position(self._normalize_gripper_command(float(gripper_pos)))
         self._hold_joint_target = None
         self._reference_pose = None
         self._prev_enabled = False
@@ -556,6 +606,7 @@ class FrankaResearch3(Robot):
     @check_if_not_connected
     def disconnect(self) -> None:
         try:
+            self._clear_observation_state_snapshot()
             self._stop_otg_loop()
             for camera in self.cameras.values():
                 try:

@@ -1,7 +1,7 @@
 name: lerobot
 
 x-lerobot-common: &lerobot-common
-  working_dir: /lerobot
+  working_dir: /workspace
   stdin_open: true
   tty: true
   privileged: true
@@ -28,8 +28,7 @@ x-lerobot-common: &lerobot-common
     https_proxy: ${https_proxy:-}
     no_proxy: ${no_proxy:-}
   volumes: &lerobot-volumes
-    - ..:/lerobot
-    - lerobot_venv:/lerobot/.venv
+    - ..:/workspace
     - ${HOME}/.cache/huggingface:/home/user_lerobot/.cache/huggingface
     - ${HOME}/.cache/torch:/home/user_lerobot/.cache/torch
     - ${HOME}/.cache/triton:/home/user_lerobot/.cache/triton
@@ -52,7 +51,7 @@ x-lerobot-common: &lerobot-common
   shm_size: "8gb"
 
 x-lerobot-sim-common: &lerobot-sim-common
-  working_dir: /lerobot
+  working_dir: /workspace
   stdin_open: true
   tty: true
   user: root
@@ -60,8 +59,7 @@ x-lerobot-sim-common: &lerobot-sim-common
   environment:
     <<: *lerobot-env
   volumes:
-    - ..:/lerobot
-    - lerobot_venv:/lerobot/.venv
+    - ..:/workspace
     - ${HOME}/.cache/huggingface:/home/user_lerobot/.cache/huggingface
     - ${HOME}/.cache/torch:/home/user_lerobot/.cache/torch
     - ${HOME}/.cache/triton:/home/user_lerobot/.cache/triton
@@ -117,8 +115,7 @@ services:
     <<: *lerobot-common
     image: lerobot-user:local
     volumes:
-      - ..:/lerobot
-      - lerobot_user_venv:/lerobot/.venv
+      - ..:/workspace
       - ${HOME}/.cache/huggingface:/home/user_lerobot/.cache/huggingface
       - ${HOME}/.cache/torch:/home/user_lerobot/.cache/torch
       - ${HOME}/.cache/triton:/home/user_lerobot/.cache/triton
@@ -252,7 +249,3 @@ services:
       CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
       TEST_TYPE: single_gpu
     gpus: all
-
-volumes:
-  lerobot_venv:
-  lerobot_user_venv:

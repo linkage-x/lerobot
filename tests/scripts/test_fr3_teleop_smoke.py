@@ -53,8 +53,8 @@ def test_build_docker_command_contains_default_smoke_settings(tmp_path: Path):
     assert "--teleop.scale_wz=" not in command_text
     assert f"--robot.max_target_delta_pos={fr3_teleop_smoke.DEFAULT_TRANSLATION_MAX_TARGET_DELTA_POS}" in command_text
     assert f"--robot.max_target_delta_rot={fr3_teleop_smoke.DEFAULT_TRANSLATION_MAX_TARGET_DELTA_ROT}" in command_text
-    assert "cd /lerobot &&" in command_text
-    assert "PYTHONPATH=/lerobot/src" in command_text
+    assert "cd /workspace &&" in command_text
+    assert "PYTHONPATH=/workspace/src" in command_text
 
 
 def test_incremental_mode_adds_incremental_flags():

@@ -27,7 +27,7 @@ def test_build_docker_command_defaults_to_hardware_visible_service(tmp_path: Pat
     assert "--timing-source=timestamp" in command_text
     assert "--gripper-port=/dev/ttyUSB0" in command_text
     assert "--gripper-backend=das" in command_text
-    assert "--analysis-output-dir=/lerobot/outputs/analysis" in command_text
+    assert "--analysis-output-dir=/workspace/outputs/analysis" in command_text
 
 
 def test_build_docker_command_can_switch_timing_source(tmp_path: Path):
@@ -84,9 +84,9 @@ def test_build_docker_command_maps_absolute_repo_paths_into_container(tmp_path: 
     command = fr3_das_replay_real.build_docker_command(args)
     command_text = " ".join(command)
 
-    assert "--dataset=/lerobot/outputs/datasets/demo" in command_text
-    assert "--joint-targets-csv=/lerobot/outputs/analysis/targets.csv" in command_text
-    assert "--analysis-output-dir=/lerobot/outputs/analysis/fr3" in command_text
+    assert "--dataset=/workspace/outputs/datasets/demo" in command_text
+    assert "--joint-targets-csv=/workspace/outputs/analysis/targets.csv" in command_text
+    assert "--analysis-output-dir=/workspace/outputs/analysis/fr3" in command_text
 
 
 def test_main_dry_run_prints_command(capsys):

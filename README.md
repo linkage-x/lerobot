@@ -73,12 +73,29 @@ Before using either example in Docker, rebuild the `lerobot-user` image with the
 INSTALL_HIKROBOT_SDK=true docker compose build lerobot-user
 ```
 
+If the host machine's official MVS application can discover the camera but the
+containerized Python bindings still return zero devices, run the same commands
+with the host MVS installation mounted into the container:
+
+```bash
+docker compose \
+  -f docker/docker-compose.yml \
+  -f docker/docker-compose.host-mvs.yml \
+  run --rm lerobot-user ...
+```
+
+By default the override expects the host SDK at `/opt/MVS`. Set
+`HIKROBOT_MVS_HOST_ROOT` if the host MVS install lives elsewhere.
+
 List the available Hikrobot cameras first so you can copy their serial numbers into the example YAML files:
 
 ```bash
-docker compose run --rm lerobot-user bash -lc '
-cd /lerobot &&
-PYTHONPATH=/lerobot/src \
+docker compose \
+  -f docker/docker-compose.yml \
+  -f docker/docker-compose.host-mvs.yml \
+  run --rm lerobot-user bash -lc '
+cd /workspace &&
+PYTHONPATH=/workspace/src \
 /lerobot/.venv/bin/lerobot-find-cameras hikrobot
 '
 ```
@@ -96,18 +113,31 @@ uv run python tools/hikrobot/hikrobot_record_test.py \
 Record an FR3 teleoperation dataset with Hikrobot cameras through the existing wrapper:
 
 ```bash
-python tools/fr3/fr3_record.py \
+./tools/fr3/setup_host_env.sh
+uv run --python .venv/bin/python python tools/fr3/fr3_record_preflight.py \
+  --config-path tools/fr3/fr3_record_hikrobot_example.yaml
+uv run --python .venv/bin/python python tools/fr3/fr3_record.py \
   --config-path tools/fr3/fr3_record_hikrobot_example.yaml
 ```
+
+The setup script uses `uv` to prepare the host `.venv` for the current
+host-side FR3 recording path, including the `libfranka` and `panda_py`
+dependency chain mirrored from the Docker image. The preflight script then
+verifies host imports, FR3 arm reachability, Franka Hand connectivity, and
+Hikrobot GigE camera enumeration plus open/read probes before the full record
+run starts.
 
 Run FR3 teleoperation with the same Hikrobot camera setup without recording a dataset:
 
 ```bash
-docker compose run --rm lerobot-user bash -lc '
-cd /lerobot &&
-PYTHONPATH=/lerobot/src \
+docker compose \
+  -f docker/docker-compose.yml \
+  -f docker/docker-compose.host-mvs.yml \
+  run --rm lerobot-user bash -lc '
+cd /workspace &&
+PYTHONPATH=/workspace/src \
 /lerobot/.venv/bin/lerobot-teleoperate \
-  --config_path=/lerobot/tools/fr3/fr3_teleoperate_hikrobot_example.yaml
+  --config_path=/workspace/tools/fr3/fr3_teleoperate_hikrobot_example.yaml
 '
 ```
 

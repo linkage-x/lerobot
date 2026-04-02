@@ -62,8 +62,8 @@ def test_build_docker_command_contains_expected_runtime_entrypoint(tmp_path: Pat
         "--rm",
     ]
     assert "lerobot-fr3-sim-teleop" in command
-    assert "cd /lerobot &&" in command_text
-    assert "PYTHONPATH=/lerobot/src" in command_text
+    assert "cd /workspace &&" in command_text
+    assert "PYTHONPATH=/workspace/src" in command_text
     assert "tools/fr3/fr3_das_gripper_open_wait_close_runtime.py" in command_text
     assert "--gripper-port=/dev/ttyUSB7" in command_text
     assert "--gen-con-sdk-path=/opt/sdk" in command_text

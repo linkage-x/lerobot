@@ -32,6 +32,8 @@ import numpy as np
 
 from lerobot.model.kinematics import RobotKinematics
 
+logger = logging.getLogger(__name__)
+
 
 class ArmDriver(Protocol):
     def connect(self) -> None: ...
@@ -129,6 +131,7 @@ class PandaPyArmDriver:
     damping: list[float] | None = None
     stiffness: list[float] | None = None
     filter_coeff: float | None = None
+    state_poll_frequency_hz: float = 200.0
 
     def __post_init__(self):
         try:
@@ -143,10 +146,15 @@ class PandaPyArmDriver:
         self._controllers = controllers
         self._robot = None
         self._controller = None
+        self._state_lock = threading.Lock()
+        self._state_reader_stop = threading.Event()
+        self._state_reader_thread: threading.Thread | None = None
+        self._cached_joint_positions: np.ndarray | None = None
 
     def connect(self) -> None:
         self._robot = self._panda_cls(self.robot_ip)
         self._start_controller()
+        self._start_state_reader()
 
     def _start_controller(self) -> None:
         if self._robot is None:
@@ -158,7 +166,7 @@ class PandaPyArmDriver:
             self._controller.set_stiffness(self.stiffness)
         if self.filter_coeff is not None:
             self._controller.set_filter(self.filter_coeff)
-        current_joint_positions = np.asarray(self._robot.get_state().q, dtype=np.float64)
+        current_joint_positions = self._refresh_joint_positions_cache()
         self._controller.set_control(current_joint_positions)
         self._robot.start_controller(self._controller)
 
@@ -167,15 +175,57 @@ class PandaPyArmDriver:
             self._robot.stop_controller()
             self._controller = None
 
+    def _refresh_joint_positions_cache(self) -> np.ndarray:
+        if self._robot is None:
+            raise RuntimeError("Arm backend is not connected.")
+        joint_positions = np.asarray(self._robot.get_state().q, dtype=np.float64)
+        with self._state_lock:
+            self._cached_joint_positions = joint_positions.copy()
+        return joint_positions
+
+    def _start_state_reader(self) -> None:
+        if self.state_poll_frequency_hz <= 0:
+            return
+        self._state_reader_stop.clear()
+        self._state_reader_thread = threading.Thread(
+            target=self._state_reader_loop,
+            daemon=True,
+            name="FrankaArmStateReader",
+        )
+        self._state_reader_thread.start()
+
+    def _state_reader_loop(self) -> None:
+        poll_period_s = 1.0 / self.state_poll_frequency_hz
+        while not self._state_reader_stop.wait(timeout=poll_period_s):
+            try:
+                self._refresh_joint_positions_cache()
+            except Exception as exc:  # pragma: no cover - exercised with real hardware only
+                if self._state_reader_stop.is_set():
+                    break
+                logger.warning("FR3 arm state refresh failed on %s: %s", self.robot_ip, exc)
+
     def disconnect(self) -> None:
+        self._state_reader_stop.set()
+        if self._state_reader_thread is not None:
+            self._state_reader_thread.join(timeout=1.0)
+            self._state_reader_thread = None
+        self._state_reader_stop.clear()
         if self._robot is not None:
             self._stop_controller()
             self._robot = None
+        with self._state_lock:
+            self._cached_joint_positions = None
 
     def get_joint_positions(self) -> np.ndarray:
         if self._robot is None:
             raise RuntimeError("Arm backend is not connected.")
-        return np.asarray(self._robot.get_state().q, dtype=np.float64)
+        with self._state_lock:
+            cached_joint_positions = (
+                None if self._cached_joint_positions is None else self._cached_joint_positions.copy()
+            )
+        if cached_joint_positions is not None:
+            return cached_joint_positions
+        return self._refresh_joint_positions_cache()
 
     def get_ee_pose(self) -> np.ndarray | None:
         if self._robot is None:
@@ -200,6 +250,7 @@ class PandaPyArmDriver:
             self._stop_controller()
         try:
             self._robot.move_to_start()
+            self._refresh_joint_positions_cache()
         finally:
             if controller_was_running:
                 self._start_controller()
@@ -280,6 +331,214 @@ class PikaGripperHardwareDriver:
         self._last_command_width_mm = pending_width_mm
         self._last_command_time_s = now
         self._pending_command_width_mm = None
+
+
+@dataclass
+class FrankaHandGripperHardwareDriver:
+    robot_ip: str
+    default_max_width_m: float = 0.08
+    move_speed_m_s: float = 0.05
+    grasp_force_n: float = 20.0
+    grasp_epsilon_inner_m: float = 0.005
+    grasp_epsilon_outer_m: float = 0.005
+    grasp_close_threshold: float = 0.05
+    command_rate_limit_hz: float | None = 15.0
+    command_deadband_m: float = 5e-4
+    auto_home: bool = True
+    state_poll_frequency_hz: float = 10.0
+    binary_open_threshold: float = 0.5
+
+    def __post_init__(self):
+        try:
+            from panda_py import libfranka
+        except Exception as e:  # pragma: no cover - exercised with real hardware only
+            raise ImportError(
+                "franka_research3 Franka Hand backend requires panda_py with libfranka bindings. "
+                "Install panda_py in the runtime environment to use this backend."
+            ) from e
+
+        self._gripper_cls = libfranka.Gripper
+        self._gripper = None
+        self._max_width_m = float(self.default_max_width_m)
+        self._last_command_width_m: float | None = None
+        self._last_command_time_s: float | None = None
+        self._pending_command_width_m: float | None = None
+        self._cached_width_m: float | None = None
+        self._io_lock = threading.Lock()
+        self._command_lock = threading.Lock()
+        self._command_event = threading.Event()
+        self._command_worker_stop = threading.Event()
+        self._command_worker_thread: threading.Thread | None = None
+        self._state_lock = threading.Lock()
+        self._state_reader_stop = threading.Event()
+        self._state_reader_thread: threading.Thread | None = None
+
+    def connect(self) -> None:
+        self._gripper = self._gripper_cls(self.robot_ip)
+        if self.auto_home:
+            with self._io_lock:
+                homing_ok = self._gripper.homing()
+            if homing_ok is False:
+                raise ConnectionError(f"Could not home Franka Hand gripper on robot {self.robot_ip}.")
+        self._refresh_state()
+        self._start_command_worker()
+        self._start_state_reader()
+
+    def disconnect(self) -> None:
+        self._command_worker_stop.set()
+        self._command_event.set()
+        self._state_reader_stop.set()
+        if self._gripper is not None:
+            try:
+                self._gripper.stop()
+            except Exception:
+                pass
+        if self._command_worker_thread is not None:
+            self._command_worker_thread.join(timeout=2.0)
+            self._command_worker_thread = None
+        if self._state_reader_thread is not None:
+            self._state_reader_thread.join(timeout=2.0)
+            self._state_reader_thread = None
+        self._command_worker_stop.clear()
+        self._command_event.clear()
+        self._state_reader_stop.clear()
+        with self._state_lock:
+            self._cached_width_m = None
+        self._gripper = None
+        self._last_command_width_m = None
+        self._last_command_time_s = None
+        self._pending_command_width_m = None
+
+    def _start_command_worker(self) -> None:
+        self._command_worker_stop.clear()
+        self._command_event.clear()
+        self._command_worker_thread = threading.Thread(
+            target=self._command_worker_loop,
+            daemon=True,
+            name="FrankaHandCommandWorker",
+        )
+        self._command_worker_thread.start()
+
+    def _command_worker_loop(self) -> None:
+        while not self._command_worker_stop.is_set():
+            self._command_event.wait(timeout=0.1)
+            if self._command_worker_stop.is_set():
+                break
+
+            with self._command_lock:
+                pending_width_m = self._pending_command_width_m
+                self._pending_command_width_m = None
+                if pending_width_m is None:
+                    self._command_event.clear()
+
+            if pending_width_m is None:
+                continue
+
+            if self.command_rate_limit_hz is not None and self._last_command_time_s is not None:
+                min_interval_s = 1.0 / self.command_rate_limit_hz
+                remaining_s = min_interval_s - (time.perf_counter() - self._last_command_time_s)
+                if remaining_s > 0 and self._command_worker_stop.wait(timeout=remaining_s):
+                    break
+
+            self._last_command_width_m = pending_width_m
+            self._last_command_time_s = time.perf_counter()
+            self._execute_width_command(pending_width_m)
+
+            with self._command_lock:
+                if self._pending_command_width_m is None:
+                    self._command_event.clear()
+
+    def _start_state_reader(self) -> None:
+        if self.state_poll_frequency_hz <= 0:
+            return
+        self._state_reader_stop.clear()
+        self._state_reader_thread = threading.Thread(
+            target=self._state_reader_loop,
+            daemon=True,
+            name="FrankaHandStateReader",
+        )
+        self._state_reader_thread.start()
+
+    def _state_reader_loop(self) -> None:
+        poll_period_s = 1.0 / self.state_poll_frequency_hz
+        while not self._state_reader_stop.wait(timeout=poll_period_s):
+            try:
+                self._refresh_state()
+            except Exception as exc:  # pragma: no cover - exercised with real hardware only
+                if self._state_reader_stop.is_set():
+                    break
+                logger.warning("Franka Hand state refresh failed on %s: %s", self.robot_ip, exc)
+
+    def _refresh_state(self):
+        if self._gripper is None:
+            raise RuntimeError("Gripper backend is not connected.")
+        with self._io_lock:
+            state = self._gripper.read_once()
+        width_m = float(getattr(state, "width", 0.0))
+        max_width_m = float(getattr(state, "max_width", self._max_width_m))
+        with self._state_lock:
+            if max_width_m > 0:
+                self._max_width_m = max_width_m
+            self._cached_width_m = width_m
+        return state
+
+    def get_position(self) -> float:
+        with self._state_lock:
+            width_m = self._cached_width_m
+            max_width_m = self._max_width_m
+
+        if width_m is None:
+            self._refresh_state()
+            with self._state_lock:
+                width_m = self._cached_width_m
+                max_width_m = self._max_width_m
+
+        if width_m is None or max_width_m <= 0:
+            return 0.0
+        return float(np.clip(width_m / max_width_m, 0.0, 1.0))
+
+    def _execute_width_command(self, pending_width_m: float) -> None:
+        if self._gripper is None:
+            return
+
+        with self._io_lock:
+            if self._gripper is None:
+                return
+            if pending_width_m <= self.grasp_close_threshold * self._max_width_m:
+                result = self._gripper.grasp(
+                    0.0,
+                    self.move_speed_m_s,
+                    self.grasp_force_n,
+                    self.grasp_epsilon_inner_m,
+                    self.grasp_epsilon_outer_m,
+                )
+            else:
+                result = self._gripper.move(pending_width_m, self.move_speed_m_s)
+        if result is False:
+            logger.warning("Franka Hand gripper command reported failure for target width %.4fm.", pending_width_m)
+
+    def set_position(self, normalized_position: float) -> None:
+        if self._gripper is None:
+            raise RuntimeError("Gripper backend is not connected.")
+
+        with self._state_lock:
+            max_width_m = self._max_width_m
+        normalized_position = float(np.clip(normalized_position, 0.0, 1.0))
+        target_width_m = max_width_m if normalized_position >= self.binary_open_threshold else 0.0
+
+        with self._command_lock:
+            if (
+                self._last_command_width_m is not None
+                and abs(target_width_m - self._last_command_width_m) < self.command_deadband_m
+            ):
+                return
+            if (
+                self._pending_command_width_m is not None
+                and abs(target_width_m - self._pending_command_width_m) < self.command_deadband_m
+            ):
+                return
+            self._pending_command_width_m = target_width_m
+            self._command_event.set()
 
 
 _TACTILE_IMAGE_SHAPE = (50, 10)
