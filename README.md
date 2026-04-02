@@ -196,25 +196,25 @@ RUN_NAME=fr3_ee2ee_act_das_state_q02q98_$(date +%Y%m%d_%H%M%S)
 screen -L -Logfile outputs/train/${RUN_NAME}.screen.log -dmS "${RUN_NAME}" bash -lc "
 cd /home/hph/Code/lerobot-replay &&
 sudo env HOME=/home/hph docker compose --profile train -f docker/docker-compose.yml run --rm \
-  -e WANDB_API_KEY=$WANDB_API_KEY \
-  lerobot-train-fr3-act-das \
-  lerobot-train \
-  --config_path=src/lerobot/configs/franka_research3_ee2ee_act_das_state_q02q98.yaml \
-  --dataset.root=outputs/datasets/lerobotv3_0310_100ep_aligned_ts \
-  --output_dir=outputs/train/${RUN_NAME} \
-  --job_name=${RUN_NAME} \
-  --policy.device=cuda \
-  --policy.push_to_hub=false \
-  --batch_size=8 \
-  --num_workers=12 \
-  --steps=100000 \
-  --log_freq=200 \
-  --eval_freq=0 \
-  --save_checkpoint=true \
-  --save_freq=20000 \
-  --tolerance_s=1e-3 \
-  --wandb.enable=true \
-  --wandb.project=fr3-act-das-ee2ee-state-q02q98
+    -e WANDB_API_KEY=$WANDB_API_KEY \
+    lerobot-train-fr3-act-das \
+    lerobot-train \
+    --config_path=src/lerobot/configs/franka_research3_rel2ee_act_das_noqoff.yaml \
+    --dataset.root=outputs/datasets/lerobotv3_0310_100ep_aligned_ts \
+    --output_dir=outputs/train/${RUN_NAME} \
+    --job_name=${RUN_NAME} \
+    --policy.device=cuda \
+    --policy.push_to_hub=false \
+    --batch_size=8 \
+    --num_workers=12 \
+    --steps=100000 \
+    --log_freq=200 \
+    --eval_freq=0 \
+    --save_checkpoint=true \
+    --save_freq=10000 \
+    --tolerance_s=1e-3 \
+    --wandb.enable=true \
+    --wandb.project=fr3-act-rel2ee-noqoff-renorm-geo
 "
 ```
 

@@ -42,7 +42,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CHECKPOINT = _REPO_ROOT / 'outputs/train/2026-03-19/10-48-39_act/checkpoints/060000'
 _DEFAULT_CAMERA_CONFIG = _REPO_ROOT / 'tools/fr3/fr3_act_infer_camera_config.yaml'
 _DEFAULT_ROBOT_IP = '192.168.1.208'
-_DEFAULT_GRIPPER_PORT = '/dev/ttyUSB0'
+_DEFAULT_GRIPPER_PORT = '/dev/ttyUSB1'
 _DEFAULT_GRIPPER_BACKEND = 'das'
 _DAS_URDF = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_das_ati.urdf'
 _DEFAULT_TACTILE_VALID_MASK_PATH = _REPO_ROOT / 'docs/tactile/tactile_valid_mask_50x10.json'
@@ -95,6 +95,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--dataset-root', default=None, help='Optional dataset root override.')
     parser.add_argument('--policy-fps', type=float, default=None, help='Optional low-rate policy update FPS override.')
     parser.add_argument('--max-steps', type=int, default=None, help='Optional inference loop step limit.')
+    parser.add_argument(
+        '--replan-every',
+        type=int,
+        default=None,
+        help='Optional number of low-rate policy steps to consume before resetting the ACT queue and replanning. Defaults to n_action_steps.',
+    )
     parser.add_argument(
         '--preview',
         action='store_true',
@@ -431,6 +437,18 @@ def denormalize_live_gripper_observation(gripper_pos: float, cfg: FrankaResearch
     if max_width_m <= 0.0:
         return 0.0
     return float(gripper_pos * max_width_m)
+
+
+def format_gripper_from_normalized(gripper_pos: float, cfg: FrankaResearch3Config, *, label: str = 'gripper') -> str:
+    gripper_norm = float(np.clip(gripper_pos, 0.0, 1.0))
+    gripper_m = denormalize_live_gripper_observation(gripper_norm, cfg)
+    return f'{label}_norm={gripper_norm:.3f} {label}_m={gripper_m:.3f}'
+
+
+def format_gripper_from_dataset_units(aperture_m: float, cfg: FrankaResearch3Config, *, label: str = 'gripper') -> str:
+    gripper_m = float(max(0.0, aperture_m))
+    gripper_norm = normalize_dataset_gripper(gripper_m, cfg)
+    return f'{label}_m={gripper_m:.3f} {label}_norm={gripper_norm:.3f}'
 
 
 def convert_gripper_observation_to_dataset_units(
@@ -1044,6 +1062,17 @@ def compute_pose_delta_from_current(
     return position_delta, rotation_delta
 
 
+def compute_tracking_error_from_previous_command(
+    robot_observation: RobotObservation,
+    previous_robot_command: dict[str, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    current_position, current_rotation = _extract_observation_pose(robot_observation)
+    target_position, target_rotation = _extract_command_pose(previous_robot_command)
+    position_error = current_position - target_position
+    rotation_error = (target_rotation.inv() * current_rotation).as_rotvec()
+    return position_error, rotation_error
+
+
 def should_reject_first_command(
     robot_command: dict[str, float],
     robot_observation: RobotObservation,
@@ -1238,6 +1267,13 @@ def run_inference(args: argparse.Namespace) -> int:
     policy_fps = float(args.policy_fps or ds_meta.fps)
     if policy_fps <= 0.0:
         raise ValueError('policy-fps must be positive.')
+    replan_every = (
+        int(args.replan_every)
+        if args.replan_every is not None
+        else max(1, int(getattr(policy.config, 'n_action_steps', 1) or 1))
+    )
+    if replan_every <= 0:
+        raise ValueError(f'replan-every must be positive, got {replan_every}')
     first_frame_max_pos_delta_m = float(args.first_frame_max_pos_delta_mm) / 1000.0
     first_frame_max_rot_delta_rad = np.deg2rad(float(args.first_frame_max_rot_delta_deg))
     max_step_pos_delta_m = float(args.max_step_pos_delta_mm) / 1000.0
@@ -1320,6 +1356,7 @@ def run_inference(args: argparse.Namespace) -> int:
         f'per_step<{args.max_step_pos_delta_mm:.1f}mm/{args.max_step_rot_delta_deg:.1f}deg, '
         f'preview={args.preview}'
     )
+    print(f'[INFO] replan_every={replan_every}')
     print(
         '[INFO] joint-space smoothing='
         f'FR3 OTG @ {robot_cfg.otg_control_frequency:.1f}Hz / sender @ {robot_cfg.otg_async_control_frequency:.1f}Hz'
@@ -1344,9 +1381,37 @@ def run_inference(args: argparse.Namespace) -> int:
 
     try:
         step_idx = 0
+        previous_sent_command: dict[str, float] | None = None
+        previous_sent_step: int | None = None
         while args.max_steps is None or step_idx < args.max_steps:
+            if step_idx > 0 and step_idx % replan_every == 0:
+                policy.reset()
+                preprocessor.reset()
+                postprocessor.reset()
+                print(f'[INFO] replanning at step={step_idx} after consuming {replan_every} low-rate actions')
             loop_start_t = time.perf_counter()
             robot_observation = robot.get_observation()
+            if previous_sent_command is not None:
+                tracking_position_error, tracking_rotation_error = compute_tracking_error_from_previous_command(
+                    robot_observation,
+                    previous_sent_command,
+                )
+                tracking_gripper_norm = float(robot_observation['gripper.pos']) - float(previous_sent_command['gripper.pos'])
+                tracking_gripper_m = denormalize_live_gripper_observation(
+                    float(robot_observation['gripper.pos']),
+                    robot_cfg,
+                ) - denormalize_live_gripper_observation(
+                    float(previous_sent_command['gripper.pos']),
+                    robot_cfg,
+                )
+                print(
+                    '[TRACK] '
+                    f"step={step_idx} prev_step={previous_sent_step} "
+                    f"pos_err_mm=({_format_vector(tracking_position_error, scale=1000.0)}) "
+                    f"rot_err_deg=({_format_vector(np.rad2deg(tracking_rotation_error))}) "
+                    f"gripper_err_norm={tracking_gripper_norm:+.3f} "
+                    f"gripper_err_m={tracking_gripper_m:+.3f}"
+                )
             absolute_state_observation_e = state_processor.observation(dict(robot_observation))
             absolute_state_observation_i = convert_absolute_observation_from_E_to_I(absolute_state_observation_e)
             live_gripper_dataset_units = denormalize_live_gripper_observation(
@@ -1377,8 +1442,8 @@ def run_inference(args: argparse.Namespace) -> int:
                     dataset_gripper_mean = float(dataset_start_pose_stats.get('gripper_mean', float('nan')))
                     gripper_delta_to_mean = abs(float(start_alignment_stats['live_gripper']) - dataset_gripper_mean)
                     dataset_alignment_line += (
-                        f" live_gripper={start_alignment_stats['live_gripper']:.3f}"
-                        f" dataset_gripper_mean={dataset_gripper_mean:.3f}"
+                        f" {format_gripper_from_dataset_units(float(start_alignment_stats['live_gripper']), robot_cfg, label='live_gripper')}"
+                        f" {format_gripper_from_dataset_units(dataset_gripper_mean, robot_cfg, label='dataset_gripper_mean')}"
                         f" delta_to_mean={gripper_delta_to_mean:.3f}"
                         f" nearest_gripper_abs={start_alignment_stats['best_gripper_abs_delta']:.3f}"
                         f" median_gripper_abs={start_alignment_stats['median_gripper_abs_delta']:.3f}"
@@ -1393,8 +1458,8 @@ def run_inference(args: argparse.Namespace) -> int:
                 ):
                     print(
                         '[WARN] live gripper start is far from dataset start contract; '
-                        f"live={start_alignment_stats['live_gripper']:.3f} "
-                        f"dataset_mean={float(dataset_start_pose_stats['gripper_mean']):.3f} "
+                        f"{format_gripper_from_dataset_units(float(start_alignment_stats['live_gripper']), robot_cfg, label='live')} "
+                        f"{format_gripper_from_dataset_units(float(dataset_start_pose_stats['gripper_mean']), robot_cfg, label='dataset_mean')} "
                         f"abs_delta={abs(float(start_alignment_stats['live_gripper']) - float(dataset_start_pose_stats['gripper_mean'])):.3f} "
                         f"tol={dataset_start_gripper_tolerance:.3f}. "
                         'Use a dataset-like start gripper or --align-gripper-to-dataset-start.'
@@ -1404,10 +1469,10 @@ def run_inference(args: argparse.Namespace) -> int:
                     preview_target_gripper = float(np.clip(float(start_alignment_stats['live_gripper']) + preview_gripper_offset, 0.0, 1.0))
                     print(
                         '[INFO] preview_gripper_alignment=virtual '
-                        f"live_start={float(start_alignment_stats['live_gripper']):.3f} "
-                        f"target_mean={float(dataset_start_pose_stats['gripper_mean']):.3f} "
+                        f"{format_gripper_from_dataset_units(float(start_alignment_stats['live_gripper']), robot_cfg, label='live_start')} "
+                        f"{format_gripper_from_dataset_units(float(dataset_start_pose_stats['gripper_mean']), robot_cfg, label='target_mean')} "
                         f"offset={preview_gripper_offset:+.3f} "
-                        f"corrected_start={preview_target_gripper:.3f}"
+                        f"{format_gripper_from_dataset_units(preview_target_gripper, robot_cfg, label='corrected_start')}"
                     )
 
             assert T_B_Ws is not None
@@ -1427,8 +1492,8 @@ def run_inference(args: argparse.Namespace) -> int:
             if args.preview and preview_gripper_offset is not None and step_idx == 0:
                 print(
                     '[INFO] preview_policy_obs_gripper='
-                    f"raw={float(dataset_state_observation_i['gripper.pos']):.3f} "
-                    f"corrected={float(policy_state_observation_i['gripper.pos']):.3f} "
+                    f"{format_gripper_from_dataset_units(float(dataset_state_observation_i['gripper.pos']), robot_cfg, label='raw')} "
+                    f"{format_gripper_from_dataset_units(float(policy_state_observation_i['gripper.pos']), robot_cfg, label='corrected')} "
                     f"offset={preview_gripper_offset:+.3f}"
                 )
             policy_observation = build_policy_observation(
@@ -1505,6 +1570,8 @@ def run_inference(args: argparse.Namespace) -> int:
 
             if not args.preview:
                 robot.send_action(command_to_send)
+                previous_sent_command = dict(command_to_send)
+                previous_sent_step = step_idx
 
             if args.preview or command_status != 'pass' or step_idx % max(args.log_interval, 1) == 0:
                 log_message = (
@@ -1513,7 +1580,7 @@ def run_inference(args: argparse.Namespace) -> int:
                     + f"status={command_status} "
                     + f"raw_ee=({robot_command['ee.x']:.4f}, {robot_command['ee.y']:.4f}, {robot_command['ee.z']:.4f}) "
                     + f"safe_ee=({command_to_send['ee.x']:.4f}, {command_to_send['ee.y']:.4f}, {command_to_send['ee.z']:.4f}) "
-                    + f"gripper={command_to_send['gripper.pos']:.3f}"
+                    + format_gripper_from_normalized(float(command_to_send['gripper.pos']), robot_cfg)
                     + (
                         ''
                         if command_status == 'hold_first_frame'

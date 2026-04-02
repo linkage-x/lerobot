@@ -264,6 +264,36 @@ def test_fr3_rel2ee_act_das_noqoff_na10_train_config_parses(monkeypatch):
     assert cfg.wandb.disable_artifact is True
 
 
+def test_fr3_rel2ee_act_das_noqoff_na10_nomask_train_config_parses(monkeypatch):
+    config_path = (
+        Path(__file__).resolve().parents[2]
+        / "src/lerobot/configs/franka_research3_rel2ee_act_das_noqoff_na10_nomask.yaml"
+    )
+    monkeypatch.setattr(sys, "argv", ["test_train_config", f"--config_path={config_path}"])
+
+    cfg = load_train_config()
+    cfg.validate()
+
+    assert cfg.dataset.repo_id == "hph/fr3_pick_place_ee2ee_v1"
+    assert cfg.dataset.root is None
+    assert cfg.policy.type == "act"
+    assert cfg.policy.device in {"cuda", "cpu"}
+    assert cfg.policy.use_tactile is False
+    assert cfg.policy.mask_ee_pose_in_state is False
+    assert cfg.policy.relative_ee_action is True
+    assert cfg.policy.action_chunk_quantile_normalization is False
+    assert cfg.policy.action_chunk_quantile_clip is False
+    assert cfg.policy.chunk_size == 50
+    assert cfg.policy.n_action_steps == 10
+    assert cfg.policy.n_obs_steps == 1
+    assert cfg.num_workers == 12
+    assert cfg.eval_freq == 10000
+    assert cfg.save_freq == 10000
+    assert cfg.tolerance_s == 1e-3
+    assert cfg.wandb.enable is True
+    assert cfg.wandb.disable_artifact is True
+
+
 def test_fr3_maskxyz_act_das_train_config_parses(monkeypatch):
     config_path = Path(__file__).resolve().parents[2] / "src/lerobot/configs/franka_research3_maskxyz_act_das.yaml"
     monkeypatch.setattr(sys, "argv", ["test_train_config", f"--config_path={config_path}"])
