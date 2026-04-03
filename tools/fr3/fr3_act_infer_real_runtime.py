@@ -1125,6 +1125,67 @@ def _format_vector(values: np.ndarray, *, scale: float = 1.0) -> str:
     return ', '.join(f'{component * scale:.2f}' for component in values)
 
 
+def _rotation_delta_deg_between_commands(command_a: dict[str, float], command_b: dict[str, float]) -> np.ndarray:
+    rotation_a = Rotation.from_rotvec(
+        [float(command_a['ee.wx']), float(command_a['ee.wy']), float(command_a['ee.wz'])]
+    )
+    rotation_b = Rotation.from_rotvec(
+        [float(command_b['ee.wx']), float(command_b['ee.wy']), float(command_b['ee.wz'])]
+    )
+    return np.rad2deg((rotation_a.inv() * rotation_b).as_rotvec())
+
+
+def _print_command_status_summary(status_counts: dict[str, int], *, total_steps: int) -> None:
+    if total_steps <= 0:
+        print('[SUMMARY] command_status count=0')
+        return
+
+    ordered_keys = ('pass', 'clamped', 'hold_first_frame')
+    summary_parts = [f'total_steps={total_steps}']
+    for key in ordered_keys:
+        count = int(status_counts.get(key, 0))
+        ratio = 100.0 * count / float(total_steps)
+        summary_parts.append(f'{key}={count} ({ratio:.1f}%)')
+    extra_keys = sorted(key for key in status_counts if key not in ordered_keys)
+    for key in extra_keys:
+        count = int(status_counts[key])
+        ratio = 100.0 * count / float(total_steps)
+        summary_parts.append(f'{key}={count} ({ratio:.1f}%)')
+    print('[SUMMARY] command_status ' + ' '.join(summary_parts))
+
+
+def _print_raw_safe_distribution_summary(
+    raw_safe_position_deltas_m: list[np.ndarray],
+    raw_safe_rotation_deltas_deg: list[np.ndarray],
+) -> None:
+    if not raw_safe_position_deltas_m or not raw_safe_rotation_deltas_deg:
+        print('[SUMMARY] raw_minus_safe count=0')
+        return
+
+    pos_arr_m = np.asarray(raw_safe_position_deltas_m, dtype=np.float64)
+    rot_arr_deg = np.asarray(raw_safe_rotation_deltas_deg, dtype=np.float64)
+    pos_norm_mm = np.linalg.norm(pos_arr_m, axis=1) * 1000.0
+    rot_norm_deg = np.linalg.norm(rot_arr_deg, axis=1)
+    pos_abs_axis_mm = np.abs(pos_arr_m) * 1000.0
+    rot_abs_axis_deg = np.abs(rot_arr_deg)
+
+    print(
+        '[SUMMARY] raw_minus_safe '
+        f'count={len(pos_arr_m)} '
+        f'pos_norm_mm mean/p95/max={pos_norm_mm.mean():.2f}/{np.percentile(pos_norm_mm, 95):.2f}/{pos_norm_mm.max():.2f} '
+        f'rot_norm_deg mean/p95/max={rot_norm_deg.mean():.2f}/{np.percentile(rot_norm_deg, 95):.2f}/{rot_norm_deg.max():.2f}'
+    )
+    print(
+        '[SUMMARY] raw_minus_safe_axis '
+        f'pos_abs_mm_p95=(x={np.percentile(pos_abs_axis_mm[:, 0], 95):.2f}, '
+        f'y={np.percentile(pos_abs_axis_mm[:, 1], 95):.2f}, '
+        f'z={np.percentile(pos_abs_axis_mm[:, 2], 95):.2f}) '
+        f'rot_abs_deg_p95=(wx={np.percentile(rot_abs_axis_deg[:, 0], 95):.2f}, '
+        f'wy={np.percentile(rot_abs_axis_deg[:, 1], 95):.2f}, '
+        f'wz={np.percentile(rot_abs_axis_deg[:, 2], 95):.2f})'
+    )
+
+
 
 def _sanitize_feature_key(feature_key: str) -> str:
     return feature_key.replace('/', '_').replace('.', '__')
@@ -1383,6 +1444,9 @@ def run_inference(args: argparse.Namespace) -> int:
         step_idx = 0
         previous_sent_command: dict[str, float] | None = None
         previous_sent_step: int | None = None
+        status_counts = {'pass': 0, 'clamped': 0, 'hold_first_frame': 0}
+        raw_safe_position_deltas_m: list[np.ndarray] = []
+        raw_safe_rotation_deltas_deg: list[np.ndarray] = []
         while args.max_steps is None or step_idx < args.max_steps:
             if step_idx > 0 and step_idx % replan_every == 0:
                 policy.reset()
@@ -1568,6 +1632,19 @@ def run_inference(args: argparse.Namespace) -> int:
             if command_status == 'pass' and clamped:
                 command_status = 'clamped'
 
+            raw_safe_position_delta = np.asarray(
+                [
+                    float(robot_command['ee.x']) - float(command_to_send['ee.x']),
+                    float(robot_command['ee.y']) - float(command_to_send['ee.y']),
+                    float(robot_command['ee.z']) - float(command_to_send['ee.z']),
+                ],
+                dtype=np.float64,
+            )
+            raw_safe_rotation_delta_deg = _rotation_delta_deg_between_commands(command_to_send, robot_command)
+            raw_safe_position_deltas_m.append(raw_safe_position_delta)
+            raw_safe_rotation_deltas_deg.append(raw_safe_rotation_delta_deg)
+            status_counts[command_status] = int(status_counts.get(command_status, 0)) + 1
+
             if not args.preview:
                 robot.send_action(command_to_send)
                 previous_sent_command = dict(command_to_send)
@@ -1598,6 +1675,8 @@ def run_inference(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print('[INFO] KeyboardInterrupt received, stopping inference loop.')
     finally:
+        _print_command_status_summary(status_counts, total_steps=step_idx)
+        _print_raw_safe_distribution_summary(raw_safe_position_deltas_m, raw_safe_rotation_deltas_deg)
         robot.disconnect()
 
     return 0

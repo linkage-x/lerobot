@@ -125,6 +125,33 @@ python3 tools/fr3/fr3_act_infer_real.py --preview --max-steps 5 --tactile-fallba
 python3 tools/fr3/fr3_act_infer_real.py
 ```
 
+当前更稳的 live baseline:
+
+```bash
+docker compose --profile infer -f docker/docker-compose.yml run --rm \
+  lerobot-infer-fr3-act bash -lc '
+cd /lerobot &&
+PYTHONPATH=/lerobot/src:/lerobot/tools/fr3 \
+/lerobot/.venv/bin/python tools/fr3/fr3_act_infer_real_runtime.py \
+  --checkpoint=/lerobot/outputs/train/fr3_rel2ee_act_das_noqoff_na10_20260401_153958/checkpoints/100000 \
+  --replan-every=1 \
+  --first-frame-max-pos-delta-mm=20 \
+  --first-frame-max-rot-delta-deg=8 \
+  --no-align-gripper-to-dataset-start
+'
+```
+
+这条命令当前可作为新的真机推理 baseline，原因是：
+
+- `--no-align-gripper-to-dataset-start` 避免了 DAS gripper 启动阶段经常出现的对齐超时
+- `--replan-every=1` 排除了 ACT action queue 拖尾，更容易直接观察单步 policy 输出
+- 在这个 baseline 下，后段 `TRACK` 误差通常保持在几毫米、亚 1 度到约 0.5 度量级，执行层基本稳定
+
+注意：
+
+- 该 baseline 的目标是先稳定观察 `policy raw output -> robot execution`，不是严格复现 dataset 起始 gripper 条件
+- 因为关闭了 startup gripper auto-alignment，它更适合做 live inference 行为诊断，不适合直接拿来证明 train/infer 起始分布完全一致
+
 更保守的安全门：
 
 ```bash

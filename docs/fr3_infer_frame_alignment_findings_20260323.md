@@ -47,3 +47,36 @@ Still open, but outside this note:
 
 - tactile wire-format closure
 - long-rollout runtime robustness
+
+## 2026-04-03 Live Baseline Update
+
+A newer live inference baseline proved materially more stable than the default
+startup sequence:
+
+```bash
+docker compose --profile infer -f docker/docker-compose.yml run --rm \
+  lerobot-infer-fr3-act bash -lc '
+cd /lerobot &&
+PYTHONPATH=/lerobot/src:/lerobot/tools/fr3 \
+/lerobot/.venv/bin/python tools/fr3/fr3_act_infer_real_runtime.py \
+  --checkpoint=/lerobot/outputs/train/fr3_rel2ee_act_das_noqoff_na10_20260401_153958/checkpoints/100000 \
+  --replan-every=1 \
+  --first-frame-max-pos-delta-mm=20 \
+  --first-frame-max-rot-delta-deg=8 \
+  --no-align-gripper-to-dataset-start
+'
+```
+
+Durable takeaway:
+
+- for this checkpoint, startup gripper auto-alignment was a larger source of
+  instability than the geometry chain
+- disabling startup gripper alignment produced a much more usable live
+  inference baseline
+- with `replan_every=1`, the later rollout `TRACK` logs stayed mostly within a
+  few millimeters and well below `1 deg`, so the execution layer was no longer
+  the dominant problem in that run
+
+This does not prove train/infer start-state equivalence. It is a practical
+baseline for online diagnosis while the startup gripper contract remains
+imperfect.
