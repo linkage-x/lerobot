@@ -17,6 +17,7 @@ import time
 from threading import Event, Lock, Thread
 from typing import Any
 
+import numpy as np
 import serial.tools.list_ports
 from numpy.typing import NDArray
 
@@ -90,7 +91,8 @@ class PaxiniGen2OmegaTactile(Tactile):
 
             if warmup:
                 timeout_ms = max(1000.0, (1000.0 / self.fps) * 2.0) if self.fps else 1000.0
-                self.async_read(timeout_ms=timeout_ms)
+                warmup_frame = self.async_read(timeout_ms=timeout_ms)
+                self._validate_tactile_frame_shape(warmup_frame)
         except Exception:
             self._is_connected = False
             self._stop_read_thread()
@@ -109,6 +111,16 @@ class PaxiniGen2OmegaTactile(Tactile):
         timeout_ms = max(1000.0, (1000.0 / self.fps) * 2.0) if self.fps else 1000.0
         return self.async_read(timeout_ms=timeout_ms)
 
+    def _validate_tactile_frame_shape(self, tactile_frame: NDArray[Any]) -> NDArray[np.int16]:
+        frame = np.asarray(tactile_frame)
+        expected_shape = (self.num_taxels, self.num_dimensions)
+        if frame.shape != expected_shape:
+            raise RuntimeError(
+                f"{self} tactile frame shape mismatch: expected {expected_shape}, received {frame.shape}."
+            )
+
+        return frame.astype(np.int16, copy=False)
+
     def _read_loop(self) -> None:
         stop_event = self.stop_event
         if stop_event is None:
@@ -125,6 +137,7 @@ class PaxiniGen2OmegaTactile(Tactile):
                     raise DeviceNotConnectedError(f"{self} wrapper is not initialized.")
 
                 tactile_frame = wrapper.read_module_sensing_data(self.connect_id)
+                tactile_frame = self._validate_tactile_frame_shape(tactile_frame)
                 capture_time = time.perf_counter()
 
                 with self.frame_lock:

@@ -27,10 +27,10 @@ PAXINI_NUM_DIMENSIONS = 3
 class PaxiniGen2OmegaTactileConfig(TactileConfig):
     serial_port: str
     baudrate: int
-    timeout: float
     control_mode: int
     model_name: str
     connect_id: int
+    timeout: float = 1.0
     provided_serial: InitVar[Serial | None] = None
     serial: Serial | None = field(default=None, repr=False, compare=False)
 

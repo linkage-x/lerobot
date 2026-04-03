@@ -41,7 +41,9 @@ from lerobot.tactiles.paxini_gen2 import PaxiniGen2OmegaTactile, PaxiniGen2Omega
 
 DEFAULT_BAUDRATE = 460800
 DEFAULT_TIMEOUT = 1.0
-DEFAULT_FPS = 30
+DEFAULT_FPS = 120
+DEFAULT_NUM_TAXELS = 120
+DEFAULT_NUM_DIMENSIONS = 3
 DEFAULT_ASYNC_TIMEOUT_MS = 200.0
 DEFAULT_MAX_AGE_MS = 2000
 DEFAULT_REFRESH_PAUSE_S = 0.001
@@ -57,6 +59,8 @@ class SensorSpec:
     baudrate: int = DEFAULT_BAUDRATE
     timeout: float = DEFAULT_TIMEOUT
     fps: int = DEFAULT_FPS
+    num_taxels: int = DEFAULT_NUM_TAXELS
+    num_dimensions: int = DEFAULT_NUM_DIMENSIONS
 
 
 @dataclass
@@ -182,6 +186,8 @@ def create_tactiles(specs: list[SensorSpec]) -> list[PaxiniGen2OmegaTactile]:
             model_name=spec.model_name,
             connect_id=spec.connect_id,
             fps=spec.fps,
+            num_taxels=spec.num_taxels,
+            num_dimensions=spec.num_dimensions,
         )
         tactiles.append(PaxiniGen2OmegaTactile(config))
     return tactiles
