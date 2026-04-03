@@ -474,3 +474,44 @@ Practical conclusion:
 - next work should focus on why the offline kinematics stack produces target
   sequences that are branch-consistent on paper but catastrophically wrong on
   the real robot
+
+## Potential Bug: Startup Blend Needed For The First Few Frames
+
+Current real-hardware replay for the legacy dataset
+`outputs/datasets/lerobotv3_0310_100ep_aligned_ts` still relies on a startup
+blend window for the first `12` frames.
+
+Observed behavior:
+
+- at replay start, the live hardware EE pose and the raw `frame 0` target do
+  not coincide
+- the typical gap is about `26 mm` in translation plus about `15 deg` in
+  rotation
+- the runtime therefore interpolates from the live EE pose to the dataset
+  target over the first `12` frames
+- after the blend window, commanded poses align with the replay reference pose
+  stream; remaining error is dominated by hardware tracking, skipped frames, or
+  later control degradation
+
+Why this is marked as a bug candidate:
+
+- if replay is expected to reproduce the dataset pose frame-by-frame from
+  `frame 0`, requiring a synthetic startup interpolation indicates that the
+  initialization contract is not fully self-consistent
+- the current blend hides that mismatch online instead of resolving it at the
+  contract level
+
+Current assessment:
+
+- this is a replay-start contract issue, not a training-data issue
+- it does not currently block training
+- it also does not block the current grasp-capable replay path once the blend
+  window has passed
+
+Current decision:
+
+- keep the blend path for now because it stabilizes startup and avoids an
+  immediate `frame 0` pose jump on hardware
+- treat the first-few-frames blend requirement as a documented potential bug
+  point
+- do not prioritize further investigation at this stage

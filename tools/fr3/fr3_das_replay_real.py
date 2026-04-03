@@ -26,7 +26,7 @@ DEFAULT_RESET_GRIPPER_POSITION = 1.0
 DEFAULT_RESET_GRIPPER_TIMEOUT_S = 2.0
 DEFAULT_TIMING_SOURCE = "timestamp"
 DEFAULT_OTG_SCALE = 1.0
-DEFAULT_MIN_TOOL_Z_M = 0.18
+DEFAULT_MIN_TOOL_Z_M = 0.15
 DEFAULT_LEGACY_Z_OFFSET_M = 0.01
 DEFAULT_ANALYSIS_OUTPUT_DIR = "outputs/analysis"
 
@@ -164,6 +164,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Directory for replay analysis artifacts relative to repo root (default: {DEFAULT_ANALYSIS_OUTPUT_DIR})",
     )
     parser.add_argument(
+        "--record-replay-dataset",
+        default=None,
+        help="Optional output dataset root relative to repo root; records the replay run as a LeRobot v3 dataset.",
+    )
+    parser.add_argument(
         "--workspace",
         type=Path,
         default=Path(__file__).resolve().parents[2],
@@ -193,6 +198,11 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
     compose_file = args.compose_file.resolve() if args.compose_file else workspace / "docker" / "docker-compose.yml"
     dataset_path = repo_path_to_container_path(args.dataset, workspace)
     analysis_output_dir = repo_path_to_container_path(args.analysis_output_dir, workspace)
+    record_replay_dataset = (
+        repo_path_to_container_path(args.record_replay_dataset, workspace)
+        if args.record_replay_dataset is not None
+        else None
+    )
     joint_targets_csv = (
         repo_path_to_container_path(args.joint_targets_csv, workspace)
         if args.joint_targets_csv is not None
@@ -230,6 +240,7 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         f"--reset-gripper-position={args.reset_gripper_position}",
         f"--reset-gripper-timeout-s={args.reset_gripper_timeout_s}",
         f"--analysis-output-dir={shlex.quote(analysis_output_dir)}",
+        *( [f"--record-replay-dataset={shlex.quote(record_replay_dataset)}"] if record_replay_dataset is not None else [] ),
     ]
 
     return [

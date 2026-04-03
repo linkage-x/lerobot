@@ -41,6 +41,18 @@ _JOINT_NAMES = [
     "fr3_joint1", "fr3_joint2", "fr3_joint3", "fr3_joint4",
     "fr3_joint5", "fr3_joint6", "fr3_joint7",
 ]
+_POSE_WITH_GRIPPER_NORMALIZED_NAMES = ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper_normalized"]
+_POSE_WITH_GRIPPER_APERTURE_NAMES = ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper_aperture_m"]
+_JOINT_POSITION_RAD_NAMES = [f"joint_{joint_idx}_rad" for joint_idx in range(1, 8)]
+_REPLAY_STATUS_NAMES = [
+    "command_sent",
+    "skipped_by_z",
+    "blend_alpha",
+    "finger_lowest_est_z_m",
+    "cmd_ee_z_m",
+    "target_ee_z_m",
+    "target_dt_s",
+]
 
 # 录制前机械臂 reset 位姿（B 系笛卡尔，xyzw 标量在后）
 # R_reset_new = R_reset @ Ry(+15°)，补偿 IMU 安装倾斜引入的初始 pitch 误差
@@ -78,6 +90,9 @@ _DAS_FULLY_OPEN_SUCCESS_THRESHOLD = 0.90
 _PEAK_DIAGNOSTIC_FRAMES = 5
 _DEFAULT_OTG_SCALE = 1.0
 _DEFAULT_ANALYSIS_OUTPUT_DIR = _REPO_ROOT / "outputs" / "analysis"
+_POSE_AXIS_LENGTH_M = 0.015
+_POSE_RESTORE_POS_THRESHOLD_MM = 5.0
+_POSE_RESTORE_ROT_THRESHOLD_DEG = 1.0
 _LEGACY_FIRST_FRAME_TILT_DEG_THRESHOLD = 8.0
 _LEGACY_FIRST_FRAME_AXIS_Y_ALIGNMENT_THRESHOLD = 0.9
 _LEGACY_START_BLEND_FRAMES = 12
@@ -109,6 +124,14 @@ def pose_from_xyzquat(xyzquat: np.ndarray) -> np.ndarray:
     T[:3, 3] = xyzquat[:3]
     T[:3, :3] = _rotation_class().from_quat(xyzquat[3:7]).as_matrix()
     return T
+
+
+def pose_to_xyzquat(T: np.ndarray) -> np.ndarray:
+    """4x4 SE(3) → [x, y, z, qx, qy, qz, qw]"""
+    xyzquat = np.empty(7, dtype=np.float64)
+    xyzquat[:3] = np.asarray(T, dtype=np.float64)[:3, 3]
+    xyzquat[3:7] = _rotation_class().from_matrix(np.asarray(T, dtype=np.float64)[:3, :3]).as_quat()
+    return xyzquat
 
 
 def se3_inv(T: np.ndarray) -> np.ndarray:
@@ -394,6 +417,161 @@ def load_joint_target_sequence(
     return np.deg2rad(targets_deg_arr)
 
 
+def create_replay_record_dataset(
+    output_root: Path,
+    *,
+    fps: int,
+    source_dataset_path: str,
+    episode_idx: int,
+) -> LeRobotDataset:
+    features = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (8,),
+            "names": {"motors": list(_POSE_WITH_GRIPPER_NORMALIZED_NAMES)},
+            "fps": float(fps),
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": (8,),
+            "names": {"motors": list(_POSE_WITH_GRIPPER_NORMALIZED_NAMES)},
+            "fps": float(fps),
+        },
+        "observation.reference_state": {
+            "dtype": "float32",
+            "shape": (8,),
+            "names": {"motors": list(_POSE_WITH_GRIPPER_APERTURE_NAMES)},
+            "fps": float(fps),
+        },
+        "observation.reference_action": {
+            "dtype": "float32",
+            "shape": (8,),
+            "names": {"motors": list(_POSE_WITH_GRIPPER_APERTURE_NAMES)},
+            "fps": float(fps),
+        },
+        "observation.source_state": {
+            "dtype": "float32",
+            "shape": (8,),
+            "names": {"motors": list(_POSE_WITH_GRIPPER_APERTURE_NAMES)},
+            "fps": float(fps),
+        },
+        "observation.source_action": {
+            "dtype": "float32",
+            "shape": (8,),
+            "names": {"motors": list(_POSE_WITH_GRIPPER_APERTURE_NAMES)},
+            "fps": float(fps),
+        },
+        "observation.joint_measured": {
+            "dtype": "float32",
+            "shape": (7,),
+            "names": {"motors": list(_JOINT_POSITION_RAD_NAMES)},
+            "fps": float(fps),
+        },
+        "observation.joint_commanded": {
+            "dtype": "float32",
+            "shape": (7,),
+            "names": {"motors": list(_JOINT_POSITION_RAD_NAMES)},
+            "fps": float(fps),
+        },
+        "observation.joint_target": {
+            "dtype": "float32",
+            "shape": (7,),
+            "names": {"motors": list(_JOINT_POSITION_RAD_NAMES)},
+            "fps": float(fps),
+        },
+        "observation.replay_status": {
+            "dtype": "float32",
+            "shape": (len(_REPLAY_STATUS_NAMES),),
+            "names": {"flags": list(_REPLAY_STATUS_NAMES)},
+            "fps": float(fps),
+        },
+    }
+    dataset = LeRobotDataset.create(
+        repo_id=f"local/{output_root.name}",
+        fps=fps,
+        root=output_root,
+        robot_type="franka_research3_real_replay",
+        features=features,
+        use_videos=False,
+        image_writer_threads=0,
+    )
+    metadata_path = output_root / "meta" / "replay_source.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "source_dataset": str(source_dataset_path),
+                "source_episode": int(episode_idx),
+                "record_layout": {
+                    "observation.state": "measured hardware EE pose in base frame + gripper_normalized",
+                    "action": "runtime command candidate in base frame + gripper_normalized",
+                    "observation.reference_state": "source state mapped into base frame + gripper_aperture_m",
+                    "observation.reference_action": "source action mapped into base frame before send + gripper_aperture_m",
+                    "observation.source_state": "raw source dataset state in dataset frame + gripper_aperture_m",
+                    "observation.source_action": "raw source dataset action in dataset frame + gripper_aperture_m",
+                },
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return dataset
+
+
+def make_pose_gripper_row(
+    pose_xyzquat: np.ndarray,
+    gripper_value: float,
+) -> np.ndarray:
+    row = np.empty(8, dtype=np.float32)
+    row[:7] = np.asarray(pose_xyzquat, dtype=np.float32)
+    row[7] = np.float32(gripper_value)
+    return row
+
+
+def build_replay_record_frame(
+    *,
+    measured_pose_xyzquat: np.ndarray,
+    measured_gripper_normalized: float,
+    command_pose_xyzquat: np.ndarray,
+    command_gripper_normalized: float,
+    reference_state_pose_xyzquat: np.ndarray,
+    reference_state_gripper_aperture_m: float,
+    reference_action_pose_xyzquat: np.ndarray,
+    reference_action_gripper_aperture_m: float,
+    source_state_row: np.ndarray,
+    source_action_row: np.ndarray,
+    measured_joints: np.ndarray,
+    command_joints: np.ndarray | None,
+    target_joints: np.ndarray | None,
+    replay_status: np.ndarray,
+    task: str,
+) -> dict[str, np.ndarray | str]:
+    nan_joints = np.full(7, np.nan, dtype=np.float32)
+    return {
+        "observation.state": make_pose_gripper_row(measured_pose_xyzquat, measured_gripper_normalized),
+        "action": make_pose_gripper_row(command_pose_xyzquat, command_gripper_normalized),
+        "observation.reference_state": make_pose_gripper_row(
+            reference_state_pose_xyzquat,
+            reference_state_gripper_aperture_m,
+        ),
+        "observation.reference_action": make_pose_gripper_row(
+            reference_action_pose_xyzquat,
+            reference_action_gripper_aperture_m,
+        ),
+        "observation.source_state": np.asarray(source_state_row, dtype=np.float32).copy(),
+        "observation.source_action": np.asarray(source_action_row, dtype=np.float32).copy(),
+        "observation.joint_measured": np.asarray(measured_joints, dtype=np.float32).copy(),
+        "observation.joint_commanded": (
+            np.asarray(command_joints, dtype=np.float32).copy() if command_joints is not None else nan_joints.copy()
+        ),
+        "observation.joint_target": (
+            np.asarray(target_joints, dtype=np.float32).copy() if target_joints is not None else nan_joints.copy()
+        ),
+        "observation.replay_status": np.asarray(replay_status, dtype=np.float32).copy(),
+        "task": task,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 坐标变换
 # ---------------------------------------------------------------------------
@@ -600,6 +778,45 @@ def build_hover_text(
     return hover_text
 
 
+def build_pose_axis_trace(
+    *,
+    positions: np.ndarray,
+    rotations: np.ndarray,
+    axis_index: int,
+    axis_length_m: float,
+    name: str,
+    color: str,
+    hover_text: list[str],
+) -> dict[str, object]:
+    x_vals: list[float | None] = []
+    y_vals: list[float | None] = []
+    z_vals: list[float | None] = []
+    text: list[str | None] = []
+    axis_vec = np.zeros(3, dtype=np.float64)
+    axis_vec[axis_index] = float(axis_length_m)
+
+    for frame_idx in range(len(positions)):
+        start = positions[frame_idx]
+        end = start + rotations[frame_idx] @ axis_vec
+        x_vals.extend([float(start[0]), float(end[0]), None])
+        y_vals.extend([float(start[1]), float(end[1]), None])
+        z_vals.extend([float(start[2]), float(end[2]), None])
+        text.extend([hover_text[frame_idx], hover_text[frame_idx], None])
+
+    return {
+        "type": "scatter3d",
+        "mode": "lines",
+        "name": name,
+        "x": x_vals,
+        "y": y_vals,
+        "z": z_vals,
+        "text": text,
+        "hovertemplate": "%{text}<extra>" + name + "</extra>",
+        "line": {"color": color, "width": 2},
+        "showlegend": True,
+    }
+
+
 def write_trajectory_plot_html(
     output_path: Path,
     *,
@@ -608,10 +825,14 @@ def write_trajectory_plot_html(
     frame_indices: np.ndarray,
     timestamps: np.ndarray,
     hw_positions: np.ndarray,
+    hw_rotations: np.ndarray,
     state_positions: np.ndarray,
     action_positions: np.ndarray,
+    action_rotations: np.ndarray,
     pos_errors_state_mm: np.ndarray,
+    rot_errors_state_deg: np.ndarray,
     pos_errors_action_mm: np.ndarray,
+    rot_errors_action_deg: np.ndarray,
     state_action_gap_mm: np.ndarray,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -640,12 +861,13 @@ def write_trajectory_plot_html(
     traces = [
         {
             "type": "scatter3d",
-            "mode": "lines",
+            "mode": "lines+markers",
             "name": "hardware",
             "x": hw_x,
             "y": hw_y,
             "z": hw_z,
             "line": {"color": "rgb(0,220,0)", "width": 6},
+            "marker": {"color": "rgb(0,220,0)", "size": 3},
             "text": hover_text,
             "hovertemplate": "%{text}<extra>hardware</extra>",
         },
@@ -662,15 +884,70 @@ def write_trajectory_plot_html(
         },
         {
             "type": "scatter3d",
-            "mode": "lines",
+            "mode": "lines+markers",
             "name": "reference_action",
             "x": action_x,
             "y": action_y,
             "z": action_z,
             "line": {"color": "rgb(40,120,255)", "width": 4},
+            "marker": {"color": "rgb(40,120,255)", "size": 3},
             "text": hover_text,
             "hovertemplate": "%{text}<extra>action</extra>",
         },
+        build_pose_axis_trace(
+            positions=hw_positions,
+            rotations=hw_rotations,
+            axis_index=0,
+            axis_length_m=_POSE_AXIS_LENGTH_M,
+            name="hardware x-axis",
+            color="rgb(255,80,80)",
+            hover_text=hover_text,
+        ),
+        build_pose_axis_trace(
+            positions=hw_positions,
+            rotations=hw_rotations,
+            axis_index=1,
+            axis_length_m=_POSE_AXIS_LENGTH_M,
+            name="hardware y-axis",
+            color="rgb(80,220,120)",
+            hover_text=hover_text,
+        ),
+        build_pose_axis_trace(
+            positions=hw_positions,
+            rotations=hw_rotations,
+            axis_index=2,
+            axis_length_m=_POSE_AXIS_LENGTH_M,
+            name="hardware z-axis",
+            color="rgb(80,140,255)",
+            hover_text=hover_text,
+        ),
+        build_pose_axis_trace(
+            positions=action_positions,
+            rotations=action_rotations,
+            axis_index=0,
+            axis_length_m=_POSE_AXIS_LENGTH_M,
+            name="source x-axis",
+            color="rgb(255,170,170)",
+            hover_text=hover_text,
+        ),
+        build_pose_axis_trace(
+            positions=action_positions,
+            rotations=action_rotations,
+            axis_index=1,
+            axis_length_m=_POSE_AXIS_LENGTH_M,
+            name="source y-axis",
+            color="rgb(170,255,190)",
+            hover_text=hover_text,
+        ),
+        build_pose_axis_trace(
+            positions=action_positions,
+            rotations=action_rotations,
+            axis_index=2,
+            axis_length_m=_POSE_AXIS_LENGTH_M,
+            name="source z-axis",
+            color="rgb(170,200,255)",
+            hover_text=hover_text,
+        ),
     ]
 
     if peak_count > 0:
@@ -717,7 +994,9 @@ def write_trajectory_plot_html(
                 "text": (
                     f"dataset={dataset_path}<br>"
                     f"frames={len(frame_indices)} | peak markers={peak_count}<br>"
-                    "drag to orbit, scroll to zoom, hover to inspect frame metrics"
+                    f"hw-action pos mean/p95={float(pos_errors_action_mm.mean()):.2f}/{float(np.percentile(pos_errors_action_mm,95)):.2f} mm<br>"
+                    f"hw-action rot mean/p95={float(rot_errors_action_deg.mean()):.2f}/{float(np.percentile(rot_errors_action_deg,95)):.2f} deg<br>"
+                    "drag to orbit, scroll to zoom, hover to inspect frame metrics and pose axes"
                 ),
             }
         ],
@@ -993,6 +1272,17 @@ def replay_real(args: argparse.Namespace) -> int:
     analysis_output_dir = args.analysis_output_dir.resolve()
     analysis_output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] 分析输出目录: {analysis_output_dir}")
+    replay_record_dataset: LeRobotDataset | None = None
+    replay_record_task = f"real_replay:{Path(args.dataset).name}:ep{args.episode:03d}"
+    if args.record_replay_dataset is not None:
+        replay_record_root = args.record_replay_dataset.resolve()
+        replay_record_dataset = create_replay_record_dataset(
+            replay_record_root,
+            fps=args.fps,
+            source_dataset_path=args.dataset,
+            episode_idx=args.episode,
+        )
+        print(f"[INFO] Replay 记录数据集输出: {replay_record_root}")
 
     # ── 预检查：打印轨迹 Z 范围 ───────────────────────────────────────
     T_B_E_reset = pose_from_xyzquat(_RESET_POSE_B_XYZQUAT)
@@ -1174,8 +1464,10 @@ def replay_real(args: argparse.Namespace) -> int:
         )
 
         hw_positions: list[np.ndarray] = []
+        hw_rotations_history: list[np.ndarray] = []
         state_positions_history: list[np.ndarray] = []
         action_positions_history: list[np.ndarray] = []
+        action_rotations_history: list[np.ndarray] = []
         measured_joint_history: list[np.ndarray] = []
         command_joint_history: list[np.ndarray] = []
         target_joint_history: list[np.ndarray] = []
@@ -1208,46 +1500,96 @@ def replay_real(args: argparse.Namespace) -> int:
 
             # 安全检查：按手指最低点估计 Z，低于阈值则跳过，防止夹爪/手指怼桌
             target_z = estimate_finger_lowest_z(T_B_Et_cmd)
+            command_sent = target_z >= args.min_tool_z_m
+            if command_sent:
+                rotvec = _rotation_class().from_matrix(T_B_Et_cmd[:3, :3]).as_rotvec()
+                if joint_target_sequence is not None:
+                    robot.send_joint_positions(
+                        joint_target_sequence[fi],
+                        gripper_pos=float(action_gripper_normalized[fi]),
+                    )
+                else:
+                    robot.send_action({
+                        "ee.x":  float(T_B_Et_cmd[0, 3]),
+                        "ee.y":  float(T_B_Et_cmd[1, 3]),
+                        "ee.z":  float(T_B_Et_cmd[2, 3]),
+                        "ee.wx": float(rotvec[0]),
+                        "ee.wy": float(rotvec[1]),
+                        "ee.wz": float(rotvec[2]),
+                        "gripper.pos": float(action_gripper_normalized[fi]),
+                    })
             if target_z < args.min_tool_z_m:
                 print(
                     f"  [WARN] frame {fi:4d}: finger_lowest_est_z={target_z:.4f}m "
                     f"(ee_z={float(T_B_Et_cmd[2, 3]):.4f}m) < {args.min_tool_z_m:.3f}m，跳过"
                 )
                 skipped_frames.append(fi)
-                elapsed = time.perf_counter() - t0
-                if (sleep_t := target_dt - elapsed) > 0:
-                    time.sleep(sleep_t)
-                continue
-
-            rotvec = _rotation_class().from_matrix(T_B_Et_cmd[:3, :3]).as_rotvec()
-            if joint_target_sequence is not None:
-                robot.send_joint_positions(
-                    joint_target_sequence[fi],
-                    gripper_pos=float(action_gripper_normalized[fi]),
-                )
-            else:
-                robot.send_action({
-                    "ee.x":  float(T_B_Et_cmd[0, 3]),
-                    "ee.y":  float(T_B_Et_cmd[1, 3]),
-                    "ee.z":  float(T_B_Et_cmd[2, 3]),
-                    "ee.wx": float(rotvec[0]),
-                    "ee.wy": float(rotvec[1]),
-                    "ee.wz": float(rotvec[2]),
-                    "gripper.pos": float(action_gripper_normalized[fi]),
-                })
 
             # 读取当前 EE pose（误差统计用）
             obs = robot.get_observation()
             hw_pos = np.array([obs["ee.x"], obs["ee.y"], obs["ee.z"]], dtype=np.float64)
             hw_rot = _rotation_class().from_rotvec([obs["ee.wx"], obs["ee.wy"], obs["ee.wz"]]).as_matrix()
+            hw_pose_xyzquat = pose_to_xyzquat(
+                np.block(
+                    [
+                        [hw_rot, hw_pos.reshape(3, 1)],
+                        [np.zeros((1, 3), dtype=np.float64), np.ones((1, 1), dtype=np.float64)],
+                    ]
+                )
+            )
             measured_joints = np.array([obs[f"joint_{joint_idx}.pos"] for joint_idx in range(1, 8)], dtype=np.float64)
             target_joints, command_joints = snapshot_otg_debug(robot)
+            T_B_Et_state = apply_pose_z_offset(
+                ws_to_base(T_B_Ws, pose_from_xyzquat(states[fi])),
+                legacy_z_offset_m,
+            )
+            state_pose_xyzquat = pose_to_xyzquat(T_B_Et_state)
+            action_pose_xyzquat = pose_to_xyzquat(T_B_Et_star)
+            command_pose_xyzquat = pose_to_xyzquat(T_B_Et_cmd)
+            replay_status = np.array(
+                [
+                    1.0 if command_sent else 0.0,
+                    0.0 if command_sent else 1.0,
+                    float(blend_alpha),
+                    float(target_z),
+                    float(T_B_Et_cmd[2, 3]),
+                    float(T_B_Et_star[2, 3]),
+                    float(target_dt),
+                ],
+                dtype=np.float32,
+            )
+            if replay_record_dataset is not None:
+                replay_record_dataset.add_frame(
+                    build_replay_record_frame(
+                        measured_pose_xyzquat=hw_pose_xyzquat,
+                        measured_gripper_normalized=float(obs["gripper.pos"]),
+                        command_pose_xyzquat=command_pose_xyzquat,
+                        command_gripper_normalized=float(action_gripper_normalized[fi]),
+                        reference_state_pose_xyzquat=state_pose_xyzquat,
+                        reference_state_gripper_aperture_m=float(states[fi][7]),
+                        reference_action_pose_xyzquat=action_pose_xyzquat,
+                        reference_action_gripper_aperture_m=float(actions[fi][7]),
+                        source_state_row=states[fi],
+                        source_action_row=actions[fi],
+                        measured_joints=measured_joints,
+                        command_joints=command_joints,
+                        target_joints=target_joints,
+                        replay_status=replay_status,
+                        task=replay_record_task,
+                    )
+                )
             abort_reason = detect_robot_abort_reason(robot)
             if abort_reason is not None:
                 abort_frame = fi
                 print(f"[ERROR] frame {fi:4d}: 检测到真机控制中止，立即停止 replay: {abort_reason}")
                 break
+            if not command_sent:
+                elapsed = time.perf_counter() - t0
+                if (sleep_t := target_dt - elapsed) > 0:
+                    time.sleep(sleep_t)
+                continue
             hw_positions.append(hw_pos.copy())
+            hw_rotations_history.append(hw_rot.copy())
             measured_joint_history.append(measured_joints.copy())
             if command_joints is not None:
                 command_joint_history.append(command_joints.copy())
@@ -1255,10 +1597,6 @@ def replay_real(args: argparse.Namespace) -> int:
                 target_joint_history.append(target_joints.copy())
 
             # 录制参考 pose
-            T_B_Et_state = apply_pose_z_offset(
-                ws_to_base(T_B_Ws, pose_from_xyzquat(states[fi])),
-                legacy_z_offset_m,
-            )
             state_pos = T_B_Et_state[:3, 3]
             state_rot = T_B_Et_state[:3, :3]
             action_pos = T_B_Et_star[:3, 3]
@@ -1273,6 +1611,7 @@ def replay_real(args: argparse.Namespace) -> int:
             processed_frame_indices.append(fi)
             state_positions_history.append(state_pos.copy())
             action_positions_history.append(action_pos.copy())
+            action_rotations_history.append(action_rot.copy())
             pos_errors_state_mm.append(pos_err_state_mm)
             rot_errors_state_deg.append(rot_err_state_deg)
             pos_errors_action_mm.append(pos_err_action_mm)
@@ -1358,8 +1697,10 @@ def replay_real(args: argparse.Namespace) -> int:
         gap_pos_arr = np.array(state_action_gap_mm, dtype=np.float64)
         gap_rot_arr = np.array(state_action_gap_deg, dtype=np.float64)
         hw_pos_arr = np.asarray(hw_positions, dtype=np.float64)
+        hw_rot_arr = np.asarray(hw_rotations_history, dtype=np.float64)
         state_pos_arr = np.asarray(state_positions_history, dtype=np.float64)
         action_pos_arr = np.asarray(action_positions_history, dtype=np.float64)
+        action_rot_arr = np.asarray(action_rotations_history, dtype=np.float64)
         measured_joint_arr = np.asarray(measured_joint_history, dtype=np.float64)
         command_joint_arr = (
             np.asarray(command_joint_history, dtype=np.float64)
@@ -1416,6 +1757,27 @@ def replay_real(args: argparse.Namespace) -> int:
             )
         if joint_target_cmd_l2_deg:
             summarize_metric("【全程】q_cmd vs q_target 关节 L2", np.asarray(joint_target_cmd_l2_deg), "deg")
+        pose_restore_mask = (
+            (pos_action_arr <= _POSE_RESTORE_POS_THRESHOLD_MM)
+            & (rot_action_arr <= _POSE_RESTORE_ROT_THRESHOLD_DEG)
+        )
+        print(
+            f"  【全程】pose 还原达标 (<={_POSE_RESTORE_POS_THRESHOLD_MM:.1f}mm & "
+            f"<={_POSE_RESTORE_ROT_THRESHOLD_DEG:.1f}deg)   "
+            f"{int(np.count_nonzero(pose_restore_mask))}/{len(pose_restore_mask)} "
+            f"({100.0 * float(np.mean(pose_restore_mask)):.1f}%)"
+        )
+        if len(pos_action_stable) > 0:
+            stable_restore_mask = (
+                (pos_action_stable <= _POSE_RESTORE_POS_THRESHOLD_MM)
+                & (rot_action_stable <= _POSE_RESTORE_ROT_THRESHOLD_DEG)
+            )
+            print(
+                f"  【稳定期 frame {_WARMUP}+】pose 还原达标 (<={_POSE_RESTORE_POS_THRESHOLD_MM:.1f}mm & "
+                f"<={_POSE_RESTORE_ROT_THRESHOLD_DEG:.1f}deg)   "
+                f"{int(np.count_nonzero(stable_restore_mask))}/{len(stable_restore_mask)} "
+                f"({100.0 * float(np.mean(stable_restore_mask)):.1f}%)"
+            )
         print("=" * 60)
         trajectory_csv_path = analysis_output_dir / f"fr3_real_replay_ep{args.episode:03d}_trajectory.csv"
         write_trajectory_csv(
@@ -1444,10 +1806,14 @@ def replay_real(args: argparse.Namespace) -> int:
             frame_indices=frame_idx_arr,
             timestamps=timestamps[frame_idx_arr],
             hw_positions=hw_pos_arr,
+            hw_rotations=hw_rot_arr,
             state_positions=state_pos_arr,
             action_positions=action_pos_arr,
+            action_rotations=action_rot_arr,
             pos_errors_state_mm=pos_state_arr,
+            rot_errors_state_deg=rot_state_arr,
             pos_errors_action_mm=pos_action_arr,
+            rot_errors_action_deg=rot_action_arr,
             state_action_gap_mm=gap_pos_arr,
         )
         print(f"[INFO] 3D HTML 已保存: {trajectory_html_path}")
@@ -1472,6 +1838,16 @@ def replay_real(args: argparse.Namespace) -> int:
         )
 
     finally:
+        if replay_record_dataset is not None:
+            try:
+                if int(replay_record_dataset.episode_buffer["size"]) > 0:
+                    replay_record_dataset.save_episode()
+                    print(
+                        "[INFO] Replay 记录数据集已保存: "
+                        f"{args.record_replay_dataset.resolve()}"
+                    )
+            finally:
+                replay_record_dataset.finalize()
         robot.disconnect()
         print("[INFO] 真机已断开")
 
@@ -1523,6 +1899,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reset-gripper-position", type=float, default=_DAS_RESET_POSITION)
     parser.add_argument("--reset-gripper-timeout-s", type=float, default=2.0)
     parser.add_argument("--analysis-output-dir", type=Path, default=_DEFAULT_ANALYSIS_OUTPUT_DIR)
+    parser.add_argument(
+        "--record-replay-dataset",
+        type=Path,
+        default=None,
+        help="Optional output root for recording the replay run as a LeRobot v3 dataset.",
+    )
     return parser.parse_args(argv)
 
 

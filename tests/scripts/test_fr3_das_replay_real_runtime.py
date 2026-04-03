@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from tools.fr3 import fr3_das_replay_real_runtime
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
@@ -84,3 +85,48 @@ def test_estimate_finger_lowest_z_uses_conservative_envelope():
     lowest_z = fr3_das_replay_real_runtime.estimate_finger_lowest_z(T_identity)
 
     assert np.isclose(lowest_z, fr3_das_replay_real_runtime._FINGER_SWEEP_BBOX_E_MIN[2])
+
+
+def test_create_replay_record_dataset_roundtrips_written_frame(tmp_path: Path):
+    dataset_root = tmp_path / "replay_log"
+    dataset = fr3_das_replay_real_runtime.create_replay_record_dataset(
+        dataset_root,
+        fps=30,
+        source_dataset_path="/tmp/source_dataset",
+        episode_idx=3,
+    )
+    dataset.add_frame(
+        fr3_das_replay_real_runtime.build_replay_record_frame(
+            measured_pose_xyzquat=np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+            measured_gripper_normalized=0.9,
+            command_pose_xyzquat=np.array([0.11, 0.21, 0.31, 0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+            command_gripper_normalized=0.8,
+            reference_state_pose_xyzquat=np.array([0.12, 0.22, 0.32, 0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+            reference_state_gripper_aperture_m=0.05,
+            reference_action_pose_xyzquat=np.array([0.13, 0.23, 0.33, 0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+            reference_action_gripper_aperture_m=0.06,
+            source_state_row=np.array([0.14, 0.24, 0.34, 0.0, 0.0, 0.0, 1.0, 0.07], dtype=np.float64),
+            source_action_row=np.array([0.15, 0.25, 0.35, 0.0, 0.0, 0.0, 1.0, 0.08], dtype=np.float64),
+            measured_joints=np.arange(7, dtype=np.float64),
+            command_joints=np.arange(10, 17, dtype=np.float64),
+            target_joints=np.arange(20, 27, dtype=np.float64),
+            replay_status=np.array([1.0, 0.0, 1.0, 0.2, 0.3, 0.4, 1.0 / 30.0], dtype=np.float32),
+            task="replay:test",
+        )
+    )
+    dataset.save_episode()
+    dataset.finalize()
+
+    recorded = LeRobotDataset("local/replay_log", root=dataset_root, episodes=[0], download_videos=False)
+    frame0 = recorded[0]
+
+    assert "observation.reference_state" in recorded.features
+    assert "observation.source_action" in recorded.features
+    assert "observation.replay_status" in recorded.features
+    assert recorded.features["observation.state"]["names"]["motors"] == fr3_das_replay_real_runtime._POSE_WITH_GRIPPER_NORMALIZED_NAMES
+    assert recorded.features["observation.source_state"]["names"]["motors"] == fr3_das_replay_real_runtime._POSE_WITH_GRIPPER_APERTURE_NAMES
+    assert np.allclose(np.asarray(frame0["observation.state"]), np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0, 0.9], dtype=np.float32))
+    assert np.allclose(np.asarray(frame0["action"]), np.array([0.11, 0.21, 0.31, 0.0, 0.0, 0.0, 1.0, 0.8], dtype=np.float32))
+    assert np.allclose(np.asarray(frame0["observation.replay_status"]), np.array([1.0, 0.0, 1.0, 0.2, 0.3, 0.4, 1.0 / 30.0], dtype=np.float32))
+    metadata = (dataset_root / "meta" / "replay_source.json").read_text(encoding="utf-8")
+    assert "source_dataset" in metadata

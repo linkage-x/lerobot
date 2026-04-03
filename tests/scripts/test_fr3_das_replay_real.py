@@ -91,6 +91,7 @@ def test_build_docker_command_maps_absolute_repo_paths_into_container(tmp_path: 
     dataset_path = tmp_path / "outputs" / "datasets" / "demo"
     joint_targets_csv = tmp_path / "outputs" / "analysis" / "targets.csv"
     analysis_output_dir = tmp_path / "outputs" / "analysis" / "fr3"
+    record_replay_dataset = tmp_path / "outputs" / "datasets" / "replay_log"
 
     args = fr3_das_replay_real.parse_args(
         [
@@ -102,6 +103,8 @@ def test_build_docker_command_maps_absolute_repo_paths_into_container(tmp_path: 
             str(joint_targets_csv),
             "--analysis-output-dir",
             str(analysis_output_dir),
+            "--record-replay-dataset",
+            str(record_replay_dataset),
         ]
     )
 
@@ -111,6 +114,7 @@ def test_build_docker_command_maps_absolute_repo_paths_into_container(tmp_path: 
     assert "--dataset=/lerobot/outputs/datasets/demo" in command_text
     assert "--joint-targets-csv=/lerobot/outputs/analysis/targets.csv" in command_text
     assert "--analysis-output-dir=/lerobot/outputs/analysis/fr3" in command_text
+    assert "--record-replay-dataset=/lerobot/outputs/datasets/replay_log" in command_text
 
 
 def test_main_dry_run_prints_command(capsys):
