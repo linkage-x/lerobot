@@ -16,9 +16,6 @@ FR3 DAS 数据集真机重播运行时（容器内运行）
 
 坐标变换链：
     T(B, E_t) = T(B, W_s) * T(W_s, I_t) * T(I, E)
-
-    其中：
-        T(B, W_s) = T(B, E_reset) * T(E, I) * inv(T(W_s, I_0)_pos_only)
 """
 
 from __future__ import annotations
@@ -74,13 +71,25 @@ _T_IE = np.array(
 )
 
 # EE base 坐标系 Z 安全下限（米）：低于此值跳过该帧命令，防止撞桌
-_MIN_Z_M = 0.15
+_DEFAULT_MIN_TOOL_Z_M = 0.18
 _DAS_RESET_POSITION = 1.0
 _DAS_RESET_TARGET_TOLERANCE = 0.02
 _DAS_FULLY_OPEN_SUCCESS_THRESHOLD = 0.90
 _PEAK_DIAGNOSTIC_FRAMES = 5
 _DEFAULT_OTG_SCALE = 1.0
 _DEFAULT_ANALYSIS_OUTPUT_DIR = _REPO_ROOT / "outputs" / "analysis"
+_LEGACY_FIRST_FRAME_TILT_DEG_THRESHOLD = 8.0
+_LEGACY_FIRST_FRAME_AXIS_Y_ALIGNMENT_THRESHOLD = 0.9
+_LEGACY_START_BLEND_FRAMES = 12
+_DEFAULT_LEGACY_Z_OFFSET_M = 0.01
+# Conservative swept finger envelope in EE frame, derived from the DAS URDF and
+# finger meshes (`das_link5.STL` / `das_link6.STL`) over joint range [0, 0.925].
+_FINGER_SWEEP_BBOX_E_MIN = np.array([-0.0350, -0.0707, -0.0976], dtype=np.float64)
+_FINGER_SWEEP_BBOX_E_MAX = np.array([0.0018, 0.0699, -0.0227], dtype=np.float64)
+_STALL_HW_STEP_MM_THRESHOLD = 0.3
+_STALL_POS_ERR_MM_THRESHOLD = 30.0
+_STALL_Q_CMD_ERR_DEG_THRESHOLD = 20.0
+_STALL_CONSECUTIVE_FRAMES = 3
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +132,119 @@ def quaternion_angle_error_deg(q1_xyzw: np.ndarray, q2_xyzw: np.ndarray) -> floa
     q2 = np.asarray(q2_xyzw, dtype=np.float64)
     dot = float(np.clip(abs(np.dot(q1, q2)), 0.0, 1.0))
     return float(np.degrees(2.0 * np.arccos(dot)))
+
+
+def interpolate_pose(T_start: np.ndarray, T_end: np.ndarray, alpha: float) -> np.ndarray:
+    """SE(3) pose interpolation with linear translation and shortest-path rotation."""
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    if alpha <= 0.0:
+        return np.asarray(T_start, dtype=np.float64).copy()
+    if alpha >= 1.0:
+        return np.asarray(T_end, dtype=np.float64).copy()
+
+    T_interp = np.eye(4, dtype=np.float64)
+    T_interp[:3, 3] = (1.0 - alpha) * T_start[:3, 3] + alpha * T_end[:3, 3]
+    R_start = T_start[:3, :3]
+    R_delta = R_start.T @ T_end[:3, :3]
+    scaled_delta = _rotation_class().from_matrix(R_delta).as_rotvec() * alpha
+    T_interp[:3, :3] = R_start @ _rotation_class().from_rotvec(scaled_delta).as_matrix()
+    return T_interp
+
+
+def bbox_corners(bmin: np.ndarray, bmax: np.ndarray) -> np.ndarray:
+    """Return the 8 corners of an axis-aligned bounding box."""
+    return np.asarray(
+        [[x, y, z] for x in (bmin[0], bmax[0]) for y in (bmin[1], bmax[1]) for z in (bmin[2], bmax[2])],
+        dtype=np.float64,
+    )
+
+
+def estimate_finger_lowest_z(T_B_E: np.ndarray) -> float:
+    """Estimate the world-frame lowest finger point using a conservative EE-frame envelope."""
+    safety_points_e = bbox_corners(_FINGER_SWEEP_BBOX_E_MIN, _FINGER_SWEEP_BBOX_E_MAX)
+    points_b = (T_B_E[:3, :3] @ safety_points_e.T).T + T_B_E[:3, 3]
+    return float(np.min(points_b[:, 2]))
+
+
+def apply_pose_z_offset(T_B_E: np.ndarray, z_offset_m: float) -> np.ndarray:
+    """Apply a constant base-frame Z correction to a pose."""
+    if abs(float(z_offset_m)) < 1e-12:
+        return np.asarray(T_B_E, dtype=np.float64).copy()
+    T_offset = np.asarray(T_B_E, dtype=np.float64).copy()
+    T_offset[2, 3] += float(z_offset_m)
+    return T_offset
+
+
+def _bool_like_is_true(value: object) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    return False
+
+
+def detect_robot_abort_reason(robot: object) -> str | None:
+    """Best-effort detection of real-hardware control aborts/reflexes."""
+    raise_if_failed = getattr(robot, "_raise_if_otg_failed", None)
+    if callable(raise_if_failed):
+        try:
+            raise_if_failed()
+        except Exception as exc:  # pragma: no cover - exercised on hardware
+            return f"OTG failed: {exc}"
+
+    arm_backend = getattr(robot, "_arm", None)
+    panda_robot = getattr(arm_backend, "_robot", None)
+    get_state = getattr(panda_robot, "get_state", None)
+    if not callable(get_state):
+        return None
+
+    try:
+        state = get_state()
+    except Exception as exc:  # pragma: no cover - exercised on hardware
+        return f"arm state unavailable: {exc}"
+
+    success_rate = getattr(state, "control_command_success_rate", None)
+    if success_rate is not None:
+        try:
+            success_rate = float(success_rate)
+        except (TypeError, ValueError):
+            success_rate = None
+        if success_rate is not None and success_rate < 1.0:
+            return f"control_command_success_rate={success_rate:.3f}"
+
+    for attr_name in dir(state):
+        attr_lower = attr_name.lower()
+        if "error" not in attr_lower and "reflex" not in attr_lower:
+            continue
+        try:
+            attr_value = getattr(state, attr_name)
+        except Exception:  # pragma: no cover - defensive
+            continue
+        if _bool_like_is_true(attr_value):
+            return f"robot state flagged {attr_name}=True"
+        if hasattr(attr_value, "__dict__"):
+            for nested_name, nested_value in vars(attr_value).items():
+                if _bool_like_is_true(nested_value):
+                    return f"robot state flagged {attr_name}.{nested_name}=True"
+    return None
+
+
+def describe_first_frame_tilt(T_Ws_I0: np.ndarray) -> dict[str, np.ndarray | float | bool]:
+    """Classify whether the dataset likely uses the legacy tilted first-frame contract."""
+    rotvec = _rotation_class().from_matrix(T_Ws_I0[:3, :3]).as_rotvec()
+    angle_rad = float(np.linalg.norm(rotvec))
+    angle_deg = float(np.degrees(angle_rad))
+    if angle_rad < 1e-9:
+        axis = np.zeros(3, dtype=np.float64)
+    else:
+        axis = rotvec / angle_rad
+    legacy_tilt = (
+        angle_deg >= _LEGACY_FIRST_FRAME_TILT_DEG_THRESHOLD
+        and abs(float(axis[1])) >= _LEGACY_FIRST_FRAME_AXIS_Y_ALIGNMENT_THRESHOLD
+    )
+    return {
+        "angle_deg": angle_deg,
+        "axis": axis,
+        "legacy_tilt": legacy_tilt,
+    }
 
 
 def parse_joint_gains(value: str) -> list[float]:
@@ -287,6 +409,13 @@ def build_T_B_Ws(T_B_E_reset: np.ndarray, T_Ws_I0: np.ndarray) -> np.ndarray:
     T_Ws_I0_pos_only = np.eye(4, dtype=np.float64)
     T_Ws_I0_pos_only[:3, 3] = T_Ws_I0[:3, 3]
     return T_B_E_reset @ se3_inv(_T_IE) @ se3_inv(T_Ws_I0_pos_only)
+
+
+def build_T_B_Ws_actual_pos_only(T_B_E_actual: np.ndarray, T_Ws_I0: np.ndarray) -> np.ndarray:
+    """Use live hardware EE pose for translation alignment while discarding legacy first-frame tilt."""
+    T_Ws_I0_pos_only = np.eye(4, dtype=np.float64)
+    T_Ws_I0_pos_only[:3, 3] = T_Ws_I0[:3, 3]
+    return T_B_E_actual @ se3_inv(_T_IE) @ se3_inv(T_Ws_I0_pos_only)
 
 
 def ws_to_base(T_B_Ws: np.ndarray, T_Ws_It: np.ndarray) -> np.ndarray:
@@ -867,14 +996,32 @@ def replay_real(args: argparse.Namespace) -> int:
 
     # ── 预检查：打印轨迹 Z 范围 ───────────────────────────────────────
     T_B_E_reset = pose_from_xyzquat(_RESET_POSE_B_XYZQUAT)
-    T_B_Ws_preview = build_T_B_Ws(T_B_E_reset, pose_from_xyzquat(states[0]))
-    target_poses = [ws_to_base(T_B_Ws_preview, pose_from_xyzquat(ee_frames[fi])) for fi in range(n_frames)]
-    z_vals = [float(T[2, 3]) for T in target_poses]
-    z_min, z_max = min(z_vals), max(z_vals)
-    n_below = sum(1 for z in z_vals if z < _MIN_Z_M)
-    print(f"[INFO] 轨迹 Z 范围: min={z_min:.4f}m  max={z_max:.4f}m  低于 {_MIN_Z_M}m 的帧数={n_below}")
+    T_Ws_I0 = pose_from_xyzquat(states[0])
+    preview_first_frame_tilt = describe_first_frame_tilt(T_Ws_I0)
+    preview_legacy_z_offset_m = (
+        float(args.legacy_z_offset_m) if bool(preview_first_frame_tilt["legacy_tilt"]) else 0.0
+    )
+    T_B_Ws_preview = build_T_B_Ws(T_B_E_reset, T_Ws_I0)
+    target_poses = [
+        apply_pose_z_offset(
+            ws_to_base(T_B_Ws_preview, pose_from_xyzquat(ee_frames[fi])),
+            preview_legacy_z_offset_m,
+        )
+        for fi in range(n_frames)
+    ]
+    ee_z_vals = [float(T[2, 3]) for T in target_poses]
+    ee_z_min, ee_z_max = min(ee_z_vals), max(ee_z_vals)
+    tool_lowest_z_vals = [estimate_finger_lowest_z(T) for T in target_poses]
+    tool_z_min, tool_z_max = min(tool_lowest_z_vals), max(tool_lowest_z_vals)
+    n_below = sum(1 for z in tool_lowest_z_vals if z < args.min_tool_z_m)
+    print(
+        "[INFO] 轨迹 Z 范围: "
+        f"ee_origin min={ee_z_min:.4f}m max={ee_z_max:.4f}m  "
+        f"finger_lowest_est min={tool_z_min:.4f}m max={tool_z_max:.4f}m  "
+        f"低于 {args.min_tool_z_m:.3f}m 的帧数={n_below}"
+    )
     if n_below > 0:
-        print(f"[WARN] {n_below} 帧目标 Z < {_MIN_Z_M}m，这些帧将被跳过（不发给机器人）")
+        print(f"[WARN] {n_below} 帧估计手指最低点 Z < {args.min_tool_z_m:.3f}m，这些帧将被跳过（不发给机器人）")
 
     # ── 移动到 DAS 起始关节角（先于 connect，避免控制器冲突）──────────
     move_to_das_start(args.robot_ip)
@@ -910,7 +1057,7 @@ def replay_real(args: argparse.Namespace) -> int:
         allow_mock_gripper=False,
         urdf_path=str(_DAS_URDF),
         target_frame_name="das_gripper_ee",
-        workspace_min=(0.1, -0.6, _MIN_Z_M),  # x min < reset_x(0.153)，避免首帧被 clip 引起 IK 偏移
+        workspace_min=(0.1, -0.6, args.min_tool_z_m),  # x min < reset_x(0.153)，避免首帧被 clip 引起 IK 偏移
         workspace_max=(0.9, 0.6, 0.8),
     )
     robot = FrankaResearch3(cfg)
@@ -944,11 +1091,6 @@ def replay_real(args: argparse.Namespace) -> int:
             )
 
         # ── 读取真机实际 EE 完整位姿（position + orientation）──────────
-        # 真机版不做 pos_only 简化：
-        #   T_B_Ws = T_B_E_actual @ inv(T_IE) @ inv(T_Ws_I0)
-        # → t=0 时 T_B_Ws @ states[0] @ T_IE = T_B_E_actual（精确，零首帧误差）
-        # pos_only 会让 R_0（~15° IMU 倾斜）通过 T_IE 外参耦合出 ~3.5cm Z 平移残差，
-        # 导致首帧命令比实际位置低 3.5cm（"下沉"）。
         obs_init = robot.get_observation()
         T_B_E_actual = np.eye(4, dtype=np.float64)
         T_B_E_actual[:3, 3] = [obs_init["ee.x"], obs_init["ee.y"], obs_init["ee.z"]]
@@ -959,14 +1101,44 @@ def replay_real(args: argparse.Namespace) -> int:
         print(f"[INFO] 理论 reset xyz={_RESET_POSE_B_XYZQUAT[:3].round(4)}  "
               f"偏差 dz={obs_init['ee.z'] - _RESET_POSE_B_XYZQUAT[2]:.4f}m")
 
-        # ── 计算 T(B, W_s)（不做 pos_only，使用完整 T_Ws_I0）─────────
+        # ── 根据数据集 pose 语义选择初始化模式─────────
         T_Ws_I0 = pose_from_xyzquat(states[0])
-        T_B_Ws = T_B_E_actual @ se3_inv(_T_IE) @ se3_inv(T_Ws_I0)
-        # 验证：t=0 命令应等于实际 EE 位置
-        T_B_E0_check = ws_to_base(T_B_Ws, T_Ws_I0)
+        first_frame_tilt = describe_first_frame_tilt(T_Ws_I0)
+        first_frame_axis = np.asarray(first_frame_tilt["axis"], dtype=np.float64)
+        use_legacy_pos_only = bool(first_frame_tilt["legacy_tilt"])
+        legacy_z_offset_m = float(args.legacy_z_offset_m) if use_legacy_pos_only else 0.0
+        if use_legacy_pos_only:
+            T_B_Ws = build_T_B_Ws_actual_pos_only(T_B_E_actual, T_Ws_I0)
+            start_blend_frames = _LEGACY_START_BLEND_FRAMES
+            init_mode = "legacy_tilt_pos_only_actual"
+        else:
+            T_B_Ws = T_B_E_actual @ se3_inv(_T_IE) @ se3_inv(T_Ws_I0)
+            start_blend_frames = 0
+            init_mode = "full_actual"
+        T_B_E0_check = apply_pose_z_offset(
+            ws_to_base(T_B_Ws, T_Ws_I0),
+            legacy_z_offset_m,
+        )
+        first_frame_rotvec = _rotation_class().from_matrix(T_Ws_I0[:3, :3]).as_rotvec()
+        print(
+            "[INFO] 首帧 contract 检测: "
+            f"mode={init_mode} "
+            f"rot={np.rad2deg(first_frame_rotvec).round(2).tolist()}deg "
+            f"angle={float(first_frame_tilt['angle_deg']):.2f}deg "
+            f"axis={first_frame_axis.round(3).tolist()}"
+        )
         print(f"[INFO] T(B, W_s)  pos={T_B_Ws[:3,3].round(4)}")
         print(f"[INFO] t=0 命令预测 xyz={T_B_E0_check[:3,3].round(4)}  "
               f"（应 ≈ 实际 EE 位置，差值={np.linalg.norm(T_B_E0_check[:3,3] - T_B_E_actual[:3,3])*1000:.2f}mm）")
+        if use_legacy_pos_only:
+            print(
+                "[INFO] 旧数据首帧 tilt 已检测到: "
+                f"启动 {start_blend_frames} 帧平滑过渡，抑制首帧下沉/姿态突变"
+            )
+            print(
+                "[INFO] 旧数据 Z 矫正已启用: "
+                f"legacy_z_offset={legacy_z_offset_m * 1000.0:.1f}mm"
+            )
 
         # ── 初始化 Rerun ──────────────────────────────────────────────
         rr_ok, rrd_path = init_rerun(args.episode, output_dir=analysis_output_dir)
@@ -985,6 +1157,9 @@ def replay_real(args: argparse.Namespace) -> int:
         joint_target_track_max_abs_deg: list[float] = []
         joint_target_cmd_l2_deg: list[float] = []
         skipped_frames: list[int] = []
+        abort_reason: str | None = None
+        abort_frame: int | None = None
+        consecutive_stall_frames = 0
 
         assert actions.shape[1] >= 8, (
             f"action 列数 {actions.shape[1]} < 8，期望 [x,y,z,qx,qy,qz,qw,gripper]"
@@ -1010,27 +1185,41 @@ def replay_real(args: argparse.Namespace) -> int:
         for fi in range(n_frames):
             t0 = time.perf_counter()
             T_Ws_Et_star = pose_from_xyzquat(ee_frames[fi])
-            T_B_Et_star = ws_to_base(T_B_Ws, T_Ws_Et_star)
+            T_B_Et_star = apply_pose_z_offset(
+                ws_to_base(T_B_Ws, T_Ws_Et_star),
+                legacy_z_offset_m,
+            )
+            T_B_Et_cmd = T_B_Et_star
+            blend_alpha = 1.0
+            if start_blend_frames > 0:
+                blend_alpha = min(float(fi) / float(start_blend_frames), 1.0)
+                T_B_Et_cmd = interpolate_pose(T_B_E_actual, T_B_Et_star, blend_alpha)
             if args.timing_source == "timestamp" and fi + 1 < n_frames:
                 target_dt = max(0.0, float(timestamps[fi + 1] - timestamps[fi]))
             else:
                 target_dt = 1.0 / args.fps
 
-            # 前3帧打印命令位置，确认无首帧下沉
+            # 前3帧打印命令位置，确认启动过渡与目标轨迹
             if fi < 3:
-                print(f"  [DEBUG] frame {fi}: 命令 xyz={T_B_Et_star[:3,3].round(4)}")
+                print(
+                    f"  [DEBUG] frame {fi}: cmd xyz={T_B_Et_cmd[:3,3].round(4)}  "
+                    f"target xyz={T_B_Et_star[:3,3].round(4)}  blend_alpha={blend_alpha:.2f}"
+                )
 
-            # 安全检查：Z < 15cm 时跳过，不发给机器人
-            target_z = float(T_B_Et_star[2, 3])
-            if target_z < _MIN_Z_M:
-                print(f"  [WARN] frame {fi:4d}: target Z={target_z:.4f}m < {_MIN_Z_M}m，跳过")
+            # 安全检查：按手指最低点估计 Z，低于阈值则跳过，防止夹爪/手指怼桌
+            target_z = estimate_finger_lowest_z(T_B_Et_cmd)
+            if target_z < args.min_tool_z_m:
+                print(
+                    f"  [WARN] frame {fi:4d}: finger_lowest_est_z={target_z:.4f}m "
+                    f"(ee_z={float(T_B_Et_cmd[2, 3]):.4f}m) < {args.min_tool_z_m:.3f}m，跳过"
+                )
                 skipped_frames.append(fi)
                 elapsed = time.perf_counter() - t0
                 if (sleep_t := target_dt - elapsed) > 0:
                     time.sleep(sleep_t)
                 continue
 
-            rotvec = _rotation_class().from_matrix(T_B_Et_star[:3, :3]).as_rotvec()
+            rotvec = _rotation_class().from_matrix(T_B_Et_cmd[:3, :3]).as_rotvec()
             if joint_target_sequence is not None:
                 robot.send_joint_positions(
                     joint_target_sequence[fi],
@@ -1038,9 +1227,9 @@ def replay_real(args: argparse.Namespace) -> int:
                 )
             else:
                 robot.send_action({
-                    "ee.x":  float(T_B_Et_star[0, 3]),
-                    "ee.y":  float(T_B_Et_star[1, 3]),
-                    "ee.z":  float(T_B_Et_star[2, 3]),
+                    "ee.x":  float(T_B_Et_cmd[0, 3]),
+                    "ee.y":  float(T_B_Et_cmd[1, 3]),
+                    "ee.z":  float(T_B_Et_cmd[2, 3]),
                     "ee.wx": float(rotvec[0]),
                     "ee.wy": float(rotvec[1]),
                     "ee.wz": float(rotvec[2]),
@@ -1053,6 +1242,11 @@ def replay_real(args: argparse.Namespace) -> int:
             hw_rot = _rotation_class().from_rotvec([obs["ee.wx"], obs["ee.wy"], obs["ee.wz"]]).as_matrix()
             measured_joints = np.array([obs[f"joint_{joint_idx}.pos"] for joint_idx in range(1, 8)], dtype=np.float64)
             target_joints, command_joints = snapshot_otg_debug(robot)
+            abort_reason = detect_robot_abort_reason(robot)
+            if abort_reason is not None:
+                abort_frame = fi
+                print(f"[ERROR] frame {fi:4d}: 检测到真机控制中止，立即停止 replay: {abort_reason}")
+                break
             hw_positions.append(hw_pos.copy())
             measured_joint_history.append(measured_joints.copy())
             if command_joints is not None:
@@ -1061,7 +1255,10 @@ def replay_real(args: argparse.Namespace) -> int:
                 target_joint_history.append(target_joints.copy())
 
             # 录制参考 pose
-            T_B_Et_state = ws_to_base(T_B_Ws, pose_from_xyzquat(states[fi]))
+            T_B_Et_state = apply_pose_z_offset(
+                ws_to_base(T_B_Ws, pose_from_xyzquat(states[fi])),
+                legacy_z_offset_m,
+            )
             state_pos = T_B_Et_state[:3, 3]
             state_rot = T_B_Et_state[:3, :3]
             action_pos = T_B_Et_star[:3, 3]
@@ -1094,6 +1291,27 @@ def replay_real(args: argparse.Namespace) -> int:
                 joint_target_cmd_l2_deg.append(
                     float(np.linalg.norm(np.rad2deg(target_joints - command_joints)))
                 )
+            if len(hw_positions) >= 2 and command_joints is not None:
+                hw_step_mm = float(np.linalg.norm(hw_positions[-1] - hw_positions[-2]) * 1000.0)
+                joint_cmd_l2_deg_current = joint_cmd_track_l2_deg[-1] if joint_cmd_track_l2_deg else 0.0
+                if (
+                    hw_step_mm <= _STALL_HW_STEP_MM_THRESHOLD
+                    and pos_err_action_mm >= _STALL_POS_ERR_MM_THRESHOLD
+                    and joint_cmd_l2_deg_current >= _STALL_Q_CMD_ERR_DEG_THRESHOLD
+                ):
+                    consecutive_stall_frames += 1
+                else:
+                    consecutive_stall_frames = 0
+                if consecutive_stall_frames >= _STALL_CONSECUTIVE_FRAMES:
+                    abort_reason = (
+                        "控制疑似已中止：硬件连续停滞且命令/测量持续大幅偏离 "
+                        f"(hw_step<={_STALL_HW_STEP_MM_THRESHOLD:.1f}mm, "
+                        f"pos_err>={_STALL_POS_ERR_MM_THRESHOLD:.1f}mm, "
+                        f"q_meas_vs_q_cmd>={_STALL_Q_CMD_ERR_DEG_THRESHOLD:.1f}deg)"
+                    )
+                    abort_frame = fi
+                    print(f"[ERROR] frame {fi:4d}: {abort_reason}")
+                    break
 
             log_frame(
                 rr_ok,
@@ -1126,7 +1344,7 @@ def replay_real(args: argparse.Namespace) -> int:
 
         # ── 统计汇总 ──────────────────────────────────────────────────
         if skipped_frames:
-            print(f"\n[WARN] 共跳过 {len(skipped_frames)} 帧（Z < {_MIN_Z_M}m）: {skipped_frames[:10]}"
+            print(f"\n[WARN] 共跳过 {len(skipped_frames)} 帧（估计手指最低点 Z < {args.min_tool_z_m:.3f}m）: {skipped_frames[:10]}"
                   f"{'...' if len(skipped_frames) > 10 else ''}")
 
         pos_state_arr = np.array(pos_errors_state_mm, dtype=np.float64)
@@ -1162,8 +1380,13 @@ def replay_real(args: argparse.Namespace) -> int:
         gap_rot_stable = gap_rot_arr[_WARMUP:]
 
         print("\n" + "=" * 60)
-        print(f"  Episode {args.episode} 真机重播完成   {n_frames} 帧 @ {args.fps} fps")
+        if abort_reason is None:
+            print(f"  Episode {args.episode} 真机重播完成   {n_frames} 帧 @ {args.fps} fps")
+        else:
+            print(f"  Episode {args.episode} 真机重播中止   截止 frame {abort_frame} @ {args.fps} fps")
         print("=" * 60)
+        if abort_reason is not None:
+            print(f"  [ERROR] 本次统计截止到中止帧 {abort_frame}: {abort_reason}")
         summarize_metric("【全程】跟踪误差 vs action 位置", pos_action_arr, "mm")
         summarize_metric("【全程】跟踪误差 vs action 旋转", rot_action_arr, "°")
         summarize_metric("【全程】复现误差 vs state 位置", pos_state_arr, "mm")
@@ -1278,6 +1501,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--otg-velocity-scale", type=positive_scale, default=_DEFAULT_OTG_SCALE)
     parser.add_argument("--otg-acceleration-scale", type=positive_scale, default=_DEFAULT_OTG_SCALE)
     parser.add_argument("--otg-jerk-scale", type=positive_scale, default=_DEFAULT_OTG_SCALE)
+    parser.add_argument(
+        "--min-tool-z-m",
+        type=positive_scale,
+        default=_DEFAULT_MIN_TOOL_Z_M,
+        help="Minimum estimated finger-lowest Z in base frame; frames below this threshold are skipped.",
+    )
+    parser.add_argument(
+        "--legacy-z-offset-m",
+        type=float,
+        default=_DEFAULT_LEGACY_Z_OFFSET_M,
+        help="Base-frame Z correction applied only when the legacy first-frame tilt contract is detected.",
+    )
     parser.add_argument("--disable-otg", action="store_true")
     parser.add_argument("--joint-targets-csv", type=str, default=None)
     parser.add_argument("--joint-target-column-prefix", type=str, default="bc_joint")

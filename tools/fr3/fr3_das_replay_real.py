@@ -26,6 +26,8 @@ DEFAULT_RESET_GRIPPER_POSITION = 1.0
 DEFAULT_RESET_GRIPPER_TIMEOUT_S = 2.0
 DEFAULT_TIMING_SOURCE = "timestamp"
 DEFAULT_OTG_SCALE = 1.0
+DEFAULT_MIN_TOOL_Z_M = 0.18
+DEFAULT_LEGACY_Z_OFFSET_M = 0.01
 DEFAULT_ANALYSIS_OUTPUT_DIR = "outputs/analysis"
 
 
@@ -95,6 +97,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=DEFAULT_OTG_SCALE,
         help="Scale factor applied to OTG max jerk limits after optional override (default: 1.0).",
+    )
+    parser.add_argument(
+        "--min-tool-z-m",
+        type=float,
+        default=DEFAULT_MIN_TOOL_Z_M,
+        help=f"Minimum estimated finger-lowest Z in base frame (default: {DEFAULT_MIN_TOOL_Z_M}).",
+    )
+    parser.add_argument(
+        "--legacy-z-offset-m",
+        type=float,
+        default=DEFAULT_LEGACY_Z_OFFSET_M,
+        help=(
+            "Base-frame Z correction applied only when the legacy first-frame tilt "
+            f"contract is detected (default: {DEFAULT_LEGACY_Z_OFFSET_M})."
+        ),
     )
     parser.add_argument(
         "--disable-otg",
@@ -201,6 +218,8 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         f"--otg-velocity-scale={args.otg_velocity_scale}",
         f"--otg-acceleration-scale={args.otg_acceleration_scale}",
         f"--otg-jerk-scale={args.otg_jerk_scale}",
+        f"--min-tool-z-m={args.min_tool_z_m}",
+        f"--legacy-z-offset-m={args.legacy_z_offset_m}",
         *( ["--disable-otg"] if args.disable_otg else [] ),
         *( [f"--joint-targets-csv={shlex.quote(joint_targets_csv)}"] if joint_targets_csv is not None else [] ),
         f"--joint-target-column-prefix={shlex.quote(args.joint_target_column_prefix)}",

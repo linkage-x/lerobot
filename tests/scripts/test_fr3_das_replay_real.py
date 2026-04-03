@@ -27,6 +27,8 @@ def test_build_docker_command_defaults_to_hardware_visible_service(tmp_path: Pat
     assert "--timing-source=timestamp" in command_text
     assert "--gripper-port=/dev/ttyUSB0" in command_text
     assert "--gripper-backend=das" in command_text
+    assert "--min-tool-z-m=0.18" in command_text
+    assert "--legacy-z-offset-m=0.01" in command_text
     assert "--analysis-output-dir=/lerobot/outputs/analysis" in command_text
 
 
@@ -61,6 +63,28 @@ def test_build_docker_command_can_override_arm_controller_params(tmp_path: Path)
     assert "--filter-coeff=0.2" in command_text
     assert "--damping=1,2,3,4,5,6,7" in command_text
     assert "--stiffness=7,6,5,4,3,2,1" in command_text
+
+
+def test_build_docker_command_can_override_min_tool_z(tmp_path: Path):
+    args = fr3_das_replay_real.parse_args(
+        ["--workspace", str(tmp_path), "--min-tool-z-m", "0.21"]
+    )
+
+    command = fr3_das_replay_real.build_docker_command(args)
+    command_text = " ".join(command)
+
+    assert "--min-tool-z-m=0.21" in command_text
+
+
+def test_build_docker_command_can_override_legacy_z_offset(tmp_path: Path):
+    args = fr3_das_replay_real.parse_args(
+        ["--workspace", str(tmp_path), "--legacy-z-offset-m", "0.015"]
+    )
+
+    command = fr3_das_replay_real.build_docker_command(args)
+    command_text = " ".join(command)
+
+    assert "--legacy-z-offset-m=0.015" in command_text
 
 
 def test_build_docker_command_maps_absolute_repo_paths_into_container(tmp_path: Path):
