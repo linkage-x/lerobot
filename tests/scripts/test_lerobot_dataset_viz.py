@@ -138,9 +138,9 @@ def test_build_device_capture_timestamp_entity_paths_converts_dots_to_hierarchy(
     )
 
     assert paths == [
-        "observation/device_capture_timestamp/camera/cam_0/capture_timestamp_s",
-        "observation/device_capture_timestamp/tactile/paxini/capture_timestamp_s",
-        "observation/device_capture_timestamp/handheld_gripper/pika/capture_timestamp_s",
+        "observation/device_capture_timestamp/camera/cam_0",
+        "observation/device_capture_timestamp/tactile/paxini",
+        "observation/device_capture_timestamp/handheld_gripper/pika",
     ]
 
 
@@ -192,6 +192,23 @@ def test_as_1d_tensor_promotes_scalar_tensor():
 
     assert result.shape == (1,)
     assert result.tolist() == [1.25]
+
+
+def test_log_feature_value_logs_named_device_capture_timestamp_scalar(monkeypatch):
+    logged = []
+
+    monkeypatch.setattr("lerobot.scripts.lerobot_dataset_viz.rr.log", lambda *args, **kwargs: logged.append((args, kwargs)))
+
+    log_feature_value(
+        "observation.device_capture_timestamp",
+        torch.tensor(1.25, dtype=torch.float64),
+        feature_names=["camera.front.capture_timestamp_s"],
+        display_compressed_images=False,
+    )
+
+    assert len(logged) == 1
+    assert logged[0][0][0] == "observation/device_capture_timestamp/camera/front"
+    assert logged[0][0][1].__class__.__name__ == "Scalars"
 
 
 def test_get_ee_pose_state_indices_supports_grouped_bare_xyz_quaternion_names():

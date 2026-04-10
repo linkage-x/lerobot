@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
+import sys
 from threading import Lock
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -171,3 +173,40 @@ def test_connect_cameras_best_effort_skips_failed_camera(caplog: pytest.LogCaptu
     assert cameras["bad"].is_connected is False
     assert cameras["bad"].disconnect_calls == 0
     assert "Camera 'bad' failed to connect and will be skipped" in caplog.text
+
+
+def test_log_rerun_frame_uses_structured_device_capture_timestamp_paths(monkeypatch):
+    logged = []
+
+    fake_rerun = SimpleNamespace(
+        set_time=lambda *args, **kwargs: None,
+        log=lambda *args, **kwargs: logged.append((args, kwargs)),
+        Image=lambda value: ("Image", value),
+        Tensor=lambda value: ("Tensor", value),
+        Scalars=lambda value: ("Scalars", value),
+    )
+    monkeypatch.setitem(sys.modules, "rerun", fake_rerun)
+
+    handheld_record._log_rerun_frame(
+        frame_index=0,
+        dataset_timestamp_s=0.25,
+        cameras={"front": object()},
+        tactiles={"paxini": object()},
+        handheld_grippers={"pika": object()},
+        frame={
+            "observation.images.front": np.zeros((1, 1, 3), dtype=np.uint8),
+            "observation.tactile.paxini.left_xyz": np.zeros((3, 10, 12), dtype=np.float32),
+            "observation.tactile.paxini.right_xyz": np.zeros((3, 10, 12), dtype=np.float32),
+            "observation.tactile.paxini.left_magnitude": np.zeros((10, 12), dtype=np.float32),
+            "observation.tactile.paxini.right_magnitude": np.zeros((10, 12), dtype=np.float32),
+            "observation.tactile.paxini.raw_xyz": np.zeros((2, 120, 3), dtype=np.float32),
+            "observation.state": np.array([12.5], dtype=np.float32),
+            "observation.device_capture_timestamp": np.array([0.25, 0.30, 0.40], dtype=np.float64),
+        },
+    )
+
+    logged_paths = [args[0] for args, _ in logged]
+
+    assert "observation/device_capture_timestamp/camera/front" in logged_paths
+    assert "observation/device_capture_timestamp/tactile/paxini" in logged_paths
+    assert "observation/device_capture_timestamp/handheld_gripper/pika" in logged_paths

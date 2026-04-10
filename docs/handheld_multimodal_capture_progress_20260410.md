@@ -23,6 +23,10 @@ The following capture-path fixes have been applied in-repo:
 - `tools/handheld/handheld_record.py` registers `opencv` and `intelrealsense` config types
 - Hikrobot camera connect failures now emit warnings and do not block the remaining cameras
 - Paxini tactile config now uses `connect_ids` only
+- `observation.device_capture_timestamp` now logs to stable per-device Rerun paths for both live recording and dataset replay:
+  - `observation/device_capture_timestamp/camera/<name>`
+  - `observation/device_capture_timestamp/tactile/<name>`
+  - `observation/device_capture_timestamp/handheld_gripper/<name>`
 - Handheld tactile frames are exported in a viewer-friendly layout:
   - `observation.tactile.paxini.left_xyz`: `(3, 10, 12)`
   - `observation.tactile.paxini.right_xyz`: `(3, 10, 12)`
@@ -49,9 +53,11 @@ Current `tools/handheld/handheld_record_example.yaml` assumptions:
 - `paxini.connect_ids`: `[6, 10]`
 - `pika.port`: `/dev/ttyUSB0`
 
-## Working Recording Command
+## Working Commands
 
-Use the project `uv` environment and keep the MVS variables split correctly:
+Use the project `uv` environment and keep the MVS variables split correctly.
+
+### 1. Record a smoke episode
 
 ```bash
 source "$HOME/.local/bin/env"
@@ -74,9 +80,7 @@ Notes:
 - After recording, confirm `Save current episode? [Y/n]:`.
 - `*******XOpenDisplay Fail *******` from MVS is expected in headless mode and did not block recording.
 
-## Rerun Replay Command
-
-To inspect the saved dataset in Rerun:
+### 2. Inspect the saved dataset in Rerun
 
 ```bash
 source "$HOME/.local/bin/env"

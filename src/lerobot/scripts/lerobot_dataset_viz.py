@@ -167,7 +167,13 @@ def build_device_capture_timestamp_entity_paths(
     flattened_names = flatten_feature_name_paths(feature_names)
     if flattened_names is None or len(flattened_names) != width:
         return [f"{root}/{dim_idx}" for dim_idx in range(width)]
-    return [f"{root}/{name.replace('.', '/')}" for name in flattened_names]
+    entity_paths = []
+    for name in flattened_names:
+        normalized_name = name.replace(".", "/")
+        if normalized_name.endswith("/capture_timestamp_s"):
+            normalized_name = normalized_name.removesuffix("/capture_timestamp_s")
+        entity_paths.append(f"{root}/{normalized_name}")
+    return entity_paths
 
 
 def get_auto_visualization_keys(batch: dict, camera_keys: list[str] | tuple[str, ...]) -> list[str]:
@@ -187,6 +193,9 @@ def log_feature_value(
 ) -> None:
     if not isinstance(value, torch.Tensor):
         return
+
+    if key == "observation.device_capture_timestamp":
+        value = as_1d_tensor(value)
 
     if value.ndim == 0:
         rr.log(key, rr.Scalars(value.item()))

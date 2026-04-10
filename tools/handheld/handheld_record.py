@@ -387,7 +387,7 @@ def _log_rerun_frame(
         rr.log(f"observation/images/{camera_name}", rr.Image(frame[f"observation.images.{camera_name}"]))
         if capture_timestamps is not None:
             rr.log(
-                f"observation/device_capture_timestamp/{camera_name}",
+                f"observation/device_capture_timestamp/camera/{camera_name}",
                 rr.Scalars(float(capture_timestamps[capture_index])),
             )
             capture_index += 1
@@ -417,7 +417,7 @@ def _log_rerun_frame(
         )
         if capture_timestamps is not None:
             rr.log(
-                f"observation/device_capture_timestamp/{tactile_name}",
+                f"observation/device_capture_timestamp/tactile/{tactile_name}",
                 rr.Scalars(float(capture_timestamps[capture_index])),
             )
             capture_index += 1
@@ -436,7 +436,7 @@ def _log_rerun_frame(
             state_offset += 1
         if capture_timestamps is not None:
             rr.log(
-                f"observation/device_capture_timestamp/{gripper_name}",
+                f"observation/device_capture_timestamp/handheld_gripper/{gripper_name}",
                 rr.Scalars(float(capture_timestamps[capture_index])),
             )
             capture_index += 1
