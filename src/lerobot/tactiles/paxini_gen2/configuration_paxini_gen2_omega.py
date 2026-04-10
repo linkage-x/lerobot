@@ -29,7 +29,7 @@ class PaxiniGen2OmegaTactileConfig(TactileConfig):
     baudrate: int
     control_mode: int
     model_name: str
-    connect_id: int
+    connect_ids: list[int]
     timeout: float = 1.0
     provided_serial: InitVar[Serial | None] = None
     serial: Serial | None = field(default=None, repr=False, compare=False)
@@ -52,8 +52,12 @@ class PaxiniGen2OmegaTactileConfig(TactileConfig):
             raise ValueError(f"`baudrate` must be > 0, but {self.baudrate} is provided.")
         if self.timeout <= 0:
             raise ValueError(f"`timeout` must be > 0, but {self.timeout} is provided.")
-        if self.connect_id <= 0:
-            raise ValueError(f"`connect_id` must be >= 1, but {self.connect_id} is provided.")
+        if not self.connect_ids:
+            raise ValueError("`connect_ids` must contain at least one module id.")
+        if any(connect_id <= 0 for connect_id in self.connect_ids):
+            raise ValueError(f"`connect_ids` must only contain values >= 1, but {self.connect_ids} is provided.")
+        if len(set(self.connect_ids)) != len(self.connect_ids):
+            raise ValueError(f"`connect_ids` must not contain duplicates, but {self.connect_ids} is provided.")
 
         if self.model_name not in self.model_config_map:
             raise ValueError(f"Unsupported sensor model: {self.model_name}")
@@ -67,7 +71,7 @@ class PaxiniGen2OmegaTactileConfig(TactileConfig):
             )
 
         if self.num_taxels is None:
-            self.num_taxels = PAXINI_NUM_TAXELS
+            self.num_taxels = PAXINI_NUM_TAXELS * len(self.connect_ids)
         if self.num_dimensions is None:
             self.num_dimensions = PAXINI_NUM_DIMENSIONS
 

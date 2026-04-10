@@ -14,7 +14,6 @@
 
 from .configs import HandheldGripperConfig
 from .handheld_gripper import HandheldGripper
-from .pika_sense import PikaSense, PikaSenseConfig
 from .utils import make_handheld_grippers_from_configs
 
 __all__ = [
@@ -24,3 +23,15 @@ __all__ = [
     "PikaSenseConfig",
     "make_handheld_grippers_from_configs",
 ]
+
+
+def __getattr__(name: str):
+    if name == "PikaSense":
+        from .pika_sense import PikaSense
+
+        return PikaSense
+    if name == "PikaSenseConfig":
+        from .pika_sense.configuration_pika_sense import PikaSenseConfig
+
+        return PikaSenseConfig
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

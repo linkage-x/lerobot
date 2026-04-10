@@ -10,7 +10,7 @@ UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
 
 INSTALL_SYSTEM_DEPS="${INSTALL_SYSTEM_DEPS:-1}"
 BUILD_LIBFRANKA="${BUILD_LIBFRANKA:-1}"
-WITH_PIKA_SDK="${WITH_PIKA_SDK:-0}"
+WITH_PIKA_SDK="${WITH_PIKA_SDK:-1}"
 WITH_GEN_CON_SDK="${WITH_GEN_CON_SDK:-0}"
 
 LIBFRANKA_REF="${LIBFRANKA_REF:-0.15.0}"
@@ -22,7 +22,7 @@ GEN_CON_SDK_REPO="${GEN_CON_SDK_REPO:-https://github.com/genrobot-ai/gen_con_sdk
 
 DEFAULT_HIROL_ROOT="$(cd "${REPO_ROOT}/.." && pwd)/HIROLRobotPlatform"
 PANDA_PY_SRC="${PANDA_PY_SRC:-${DEFAULT_HIROL_ROOT}/dependencies/panda-py}"
-PIKA_SDK_SRC="${PIKA_SDK_SRC:-${DEFAULT_HIROL_ROOT}/dependencies/pika_sdk}"
+PIKA_SDK_SRC="${PIKA_SDK_SRC:-${REPO_ROOT}/third_party/pika_sdk}"
 GEN_CON_SDK_SRC="${GEN_CON_SDK_SRC:-${DEFAULT_HIROL_ROOT}/dependencies/gen_con_sdk_python_release}"
 
 APT_PACKAGES=(
@@ -225,7 +225,7 @@ install_optional_sdk() {
 
   if [[ "${label}" == "pika_sdk" ]]; then
     log "Installing ${label} from ${resolved_source}"
-    "${UV_BIN}" pip install --python .venv/bin/python --no-cache --no-deps "${resolved_source}"
+    "${UV_BIN}" pip install --python .venv/bin/python --no-cache --no-deps --no-build-isolation "${resolved_source}"
   else
     log "Installing ${label} requirements from ${resolved_source}"
     "${UV_BIN}" pip install --python .venv/bin/python --no-cache -r "${resolved_source}/requirements.txt"
@@ -258,6 +258,9 @@ modules = [
     "ruckig",
     "pyspacemouse",
     "easyhid",
+    "pika",
+    "pika.sense",
+    "pika.gripper",
 ]
 for name in modules:
     importlib.import_module(name)

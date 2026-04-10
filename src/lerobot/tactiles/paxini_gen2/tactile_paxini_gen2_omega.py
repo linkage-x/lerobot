@@ -37,7 +37,7 @@ class PaxiniGen2OmegaTactile(Tactile):
 
         self.config = config
         self.serial_port = config.serial_port
-        self.connect_id = config.connect_id
+        self.connect_ids = list(config.connect_ids)
         self.control_mode = config.control_mode
 
         self.wrapper: PaxiniSerialWrapper | None = None
@@ -51,7 +51,7 @@ class PaxiniGen2OmegaTactile(Tactile):
         self.new_frame_event = Event()
 
     def __str__(self) -> str:
-        return f"{self.__class__.__name__}({self.serial_port}, connect_id={self.connect_id})"
+        return f"{self.__class__.__name__}({self.serial_port}, connect_ids={self.connect_ids})"
 
     @property
     def is_connected(self) -> bool:
@@ -84,7 +84,8 @@ class PaxiniGen2OmegaTactile(Tactile):
         )
 
         try:
-            wrapper.ensure_sensor_ready(self.connect_id, recalibrate=True)
+            for connect_id in self.connect_ids:
+                wrapper.ensure_sensor_ready(connect_id, recalibrate=True)
             self.wrapper = wrapper
             self._start_read_thread()
             self._is_connected = True
@@ -121,6 +122,15 @@ class PaxiniGen2OmegaTactile(Tactile):
 
         return frame.astype(np.int16, copy=False)
 
+    def _read_from_hardware(self) -> NDArray[np.int16]:
+        wrapper = self.wrapper
+        if wrapper is None:
+            raise DeviceNotConnectedError(f"{self} wrapper is not initialized.")
+
+        frames = [wrapper.read_module_sensing_data(connect_id) for connect_id in self.connect_ids]
+        tactile_frame = np.concatenate(frames, axis=0)
+        return self._validate_tactile_frame_shape(tactile_frame)
+
     def _read_loop(self) -> None:
         stop_event = self.stop_event
         if stop_event is None:
@@ -132,12 +142,7 @@ class PaxiniGen2OmegaTactile(Tactile):
         while not stop_event.is_set():
             loop_started_at = time.perf_counter()
             try:
-                wrapper = self.wrapper
-                if wrapper is None:
-                    raise DeviceNotConnectedError(f"{self} wrapper is not initialized.")
-
-                tactile_frame = wrapper.read_module_sensing_data(self.connect_id)
-                tactile_frame = self._validate_tactile_frame_shape(tactile_frame)
+                tactile_frame = self._read_from_hardware()
                 capture_time = time.perf_counter()
 
                 with self.frame_lock:

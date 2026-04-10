@@ -159,6 +159,17 @@ def build_scalar_entity_paths(
     return [f"{root}/{name}" for name in flattened_names]
 
 
+def build_device_capture_timestamp_entity_paths(
+    feature_names: list[str] | tuple[str, ...] | dict[str, list[str] | dict] | None,
+    width: int,
+) -> list[str]:
+    root = "observation/device_capture_timestamp"
+    flattened_names = flatten_feature_name_paths(feature_names)
+    if flattened_names is None or len(flattened_names) != width:
+        return [f"{root}/{dim_idx}" for dim_idx in range(width)]
+    return [f"{root}/{name.replace('.', '/')}" for name in flattened_names]
+
+
 def get_auto_visualization_keys(batch: dict, camera_keys: list[str] | tuple[str, ...]) -> list[str]:
     excluded_keys = set(camera_keys) | MANUALLY_LOGGED_KEYS | AUTO_VIZ_EXCLUDED_KEYS
     return [
@@ -182,7 +193,10 @@ def log_feature_value(
         return
 
     if value.ndim == 1:
-        entity_paths = build_scalar_entity_paths(key, feature_names, len(value))
+        if key == "observation.device_capture_timestamp":
+            entity_paths = build_device_capture_timestamp_entity_paths(feature_names, len(value))
+        else:
+            entity_paths = build_scalar_entity_paths(key, feature_names, len(value))
         for entity_path, val in zip(entity_paths, value, strict=True):
             rr.log(entity_path, rr.Scalars(val.item()))
         return
@@ -196,6 +210,12 @@ def log_feature_value(
         return
 
     rr.log(key, rr.Tensor(value.detach().cpu().numpy()))
+
+
+def as_1d_tensor(value: torch.Tensor) -> torch.Tensor:
+    if value.ndim == 0:
+        return value.reshape(1)
+    return value
 
 
 def has_ee_pose(batch: dict, ee_pose_state_indices: dict[str, int] | None = None) -> bool:
@@ -713,16 +733,18 @@ def visualize_dataset(
 
             # display each dimension of action space (e.g. actuators command)
             if ACTION in batch:
+                action_value = as_1d_tensor(batch[ACTION][i])
                 if action_entity_paths is None:
-                    action_entity_paths = build_scalar_entity_paths(action_root, action_feature_names, len(batch[ACTION][i]))
-                for entity_path, val in zip(action_entity_paths, batch[ACTION][i], strict=True):
+                    action_entity_paths = build_scalar_entity_paths(action_root, action_feature_names, len(action_value))
+                for entity_path, val in zip(action_entity_paths, action_value, strict=True):
                     rr.log(entity_path, rr.Scalars(val.item()))
 
             # display each dimension of observed state space (e.g. agent position in joint space)
             if OBS_STATE in batch:
+                state_value = as_1d_tensor(batch[OBS_STATE][i])
                 if state_entity_paths is None:
-                    state_entity_paths = build_scalar_entity_paths("state", state_feature_names, len(batch[OBS_STATE][i]))
-                for entity_path, val in zip(state_entity_paths, batch[OBS_STATE][i], strict=True):
+                    state_entity_paths = build_scalar_entity_paths("state", state_feature_names, len(state_value))
+                for entity_path, val in zip(state_entity_paths, state_value, strict=True):
                     rr.log(entity_path, rr.Scalars(val.item()))
 
             if DONE in batch:

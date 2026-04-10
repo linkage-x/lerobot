@@ -1,0 +1,151 @@
+sensors:
+  max_read_age_ms: 500
+  cameras:
+    cam_0:
+      type: hikrobot
+      serial: "DA9342471"
+      width: 1280
+      height: 720
+      fps: 30
+      transport_layer: gige
+      color_mode: bgr
+      warmup_s: 2
+      exposure_us: 10000
+      gain_db: 12
+      gamma: 1.3
+      white_balance_auto: continuous
+      lock_white_balance_after_warmup: true
+      timeout_ms: 1000
+    cam_1:
+      type: hikrobot
+      serial: "DA9342716"
+      width: 1280
+      height: 720
+      fps: 30
+      transport_layer: gige
+      color_mode: bgr
+      warmup_s: 2
+      exposure_us: 10000
+      gain_db: 12
+      gamma: 1.3
+      white_balance_auto: continuous
+      lock_white_balance_after_warmup: true
+      timeout_ms: 1000
+    cam_2:
+      type: hikrobot
+      serial: "DA9342700"
+      width: 1280
+      height: 720
+      fps: 30
+      transport_layer: gige
+      color_mode: bgr
+      warmup_s: 2
+      exposure_us: 10000
+      gain_db: 12
+      gamma: 1.3
+      white_balance_auto: continuous
+      lock_white_balance_after_warmup: true
+      timeout_ms: 1000
+    cam_3:
+      type: hikrobot
+      serial: "DA9342583"
+      width: 1280
+      height: 720
+      fps: 30
+      transport_layer: gige
+      color_mode: bgr
+      warmup_s: 2
+      exposure_us: 10000
+      gain_db: 12
+      gamma: 1.3
+      white_balance_auto: continuous
+      lock_white_balance_after_warmup: true
+      timeout_ms: 1000
+    cam_4:
+      type: hikrobot
+      serial: "DA9342477"
+      width: 1280
+      height: 720
+      fps: 30
+      transport_layer: gige
+      color_mode: bgr
+      warmup_s: 2
+      exposure_us: 10000
+      gain_db: 12
+      gamma: 1.3
+      white_balance_auto: continuous
+      lock_white_balance_after_warmup: true
+      timeout_ms: 1000
+    cam_5:
+      type: hikrobot
+      serial: "DA9342685"
+      width: 1280
+      height: 720
+      fps: 30
+      transport_layer: gige
+      color_mode: bgr
+      warmup_s: 2
+      exposure_us: 10000
+      gain_db: 12
+      gamma: 1.3
+      white_balance_auto: continuous
+      lock_white_balance_after_warmup: true
+      timeout_ms: 1000
+    # Placeholder camera config for a future Pika Sense-associated RGB stream via OpenCV.
+    # Replace these fields with the real camera entry once the actual Pika Sense camera API is wired in.
+    pika_opencv:
+      type: opencv
+      index_or_path: /dev/video6
+      width: 640
+      height: 480
+      fps: 30
+      color_mode: rgb
+      warmup_s: 1
+      fourcc: MJPG
+    # Placeholder camera config for a future Pika Sense-associated RealSense stream.
+    # Replace `serial_number_or_name` and the rest of this stanza with the real Pika Sense camera fields later.
+    pika_realsense:
+      type: intelrealsense
+      serial_number_or_name: "315122271805"
+      width: 640
+      height: 480
+      fps: 30
+      color_mode: rgb
+      use_depth: false
+      warmup_s: 1
+  tactiles:
+    paxini:
+      type: paxini_gen2_omega
+      serial_port: /dev/ttyACM0
+      baudrate: 460800
+      timeout: 1.0
+      control_mode: 5
+      model_name: GEN2-IP-L5325
+      connect_ids: [6, 10]
+      fps: 120
+  handheld_grippers:
+    pika:
+      type: pika_sense
+      port: /dev/ttyUSB0
+      fps: 120
+      warmup_s: 1.0
+
+dataset:
+  repo_id: local/handheld_multimodal_v1
+  single_task: Handheld multimodal capture
+  root: /workspace/outputs/datasets/handheld_multimodal_v1
+  fps: 30
+  num_episodes: 20
+  episode_time_s: 10
+  video: true
+  streaming_encoding: true
+  vcodec: h264
+  encoder_threads: 2
+  push_to_hub: false
+
+display_data: true
+display_ip:
+display_port:
+rerun_save_path:
+play_sounds: false
+resume: false

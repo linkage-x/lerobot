@@ -19,8 +19,7 @@ Visualize one or more Paxini tactile sensors as annotated taxel grids.
 
 Example:
     python3 src/lerobot/tactiles/paxini_gen2/test/visualize.py \
-        --sensor "name=left,serial_port=/dev/ttyUSB0,connect_id=1,model_name=GEN2-IP-L5325,control_mode=5" \
-        --sensor "name=right,serial_port=/dev/ttyUSB0,connect_id=2,model_name=GEN2-IP-M3025,control_mode=5"
+        --sensor "name=left,serial_port=/dev/ttyACM0,connect_ids=6|10,model_name=GEN2-IP-L5325,control_mode=5"
 """
 
 from __future__ import annotations
@@ -53,7 +52,7 @@ DEFAULT_REFRESH_PAUSE_S = 0.001
 class SensorSpec:
     name: str
     serial_port: str
-    connect_id: int
+    connect_ids: list[int]
     model_name: str
     control_mode: int
     baudrate: int = DEFAULT_BAUDRATE
@@ -82,7 +81,7 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help=(
             "Sensor specification. Repeat this flag for multiple sensors. "
-            "Format: name=left,serial_port=/dev/ttyUSB0,connect_id=1,model_name=GEN2-IP-L5325,control_mode=5"
+            "Format: name=left,serial_port=/dev/ttyACM0,connect_ids=6|10,model_name=GEN2-IP-L5325,control_mode=5"
         ),
     )
     parser.add_argument(
@@ -128,21 +127,24 @@ def parse_sensor_spec(raw_spec: str, index: int) -> SensorSpec:
         key, value = chunk.split("=", 1)
         items[key.strip()] = value.strip()
 
-    required_keys = ["serial_port", "connect_id", "model_name", "control_mode"]
+    required_keys = ["serial_port", "connect_ids", "model_name", "control_mode"]
     missing_keys = [key for key in required_keys if key not in items]
     if missing_keys:
         raise ValueError(f"Missing keys in --sensor spec: {missing_keys}. Raw spec: {raw_spec!r}")
 
     name = items.get("name", f"sensor_{index}")
+    connect_ids = [int(raw_id) for raw_id in items["connect_ids"].split("|") if raw_id]
     return SensorSpec(
         name=name,
         serial_port=items["serial_port"],
-        connect_id=int(items["connect_id"]),
+        connect_ids=connect_ids,
         model_name=items["model_name"],
         control_mode=int(items["control_mode"]),
         baudrate=int(items.get("baudrate", DEFAULT_BAUDRATE)),
         timeout=float(items.get("timeout", DEFAULT_TIMEOUT)),
         fps=int(items.get("fps", DEFAULT_FPS)),
+        num_taxels=int(items.get("num_taxels", DEFAULT_NUM_TAXELS * len(connect_ids))),
+        num_dimensions=int(items.get("num_dimensions", DEFAULT_NUM_DIMENSIONS)),
     )
 
 
@@ -184,7 +186,7 @@ def create_tactiles(specs: list[SensorSpec]) -> list[PaxiniGen2OmegaTactile]:
             timeout=spec.timeout,
             control_mode=spec.control_mode,
             model_name=spec.model_name,
-            connect_id=spec.connect_id,
+            connect_ids=spec.connect_ids,
             fps=spec.fps,
             num_taxels=spec.num_taxels,
             num_dimensions=spec.num_dimensions,
@@ -241,7 +243,7 @@ def build_panels(tactiles: list[PaxiniGen2OmegaTactile], specs: list[SensorSpec]
         ax.grid(which="minor", color="#d7dce5", linewidth=0.7)
         ax.tick_params(which="both", bottom=False, left=False, labelbottom=False, labelleft=False)
         ax.set_title(
-            f"{spec.name}\nport={spec.serial_port} connect_id={spec.connect_id}",
+            f"{spec.name}\nport={spec.serial_port} connect_ids={spec.connect_ids}",
             fontsize=11,
         )
 
@@ -305,7 +307,7 @@ def update_panel(panel: SensorPanel, frame: np.ndarray, magnitude_limit: float) 
     panel.image.set_clim(0.0, limit)
     panel.ax.set_title(
         f"{panel.spec.name}\n"
-        f"port={panel.spec.serial_port} connect_id={panel.spec.connect_id} "
+        f"port={panel.spec.serial_port} connect_ids={panel.spec.connect_ids} "
         f"mean={magnitudes.mean():.1f} max={magnitudes.max():.1f}",
         fontsize=11,
     )
@@ -322,8 +324,7 @@ def list_ports() -> None:
 
 
 # python3 src/lerobot/tactiles/paxini_gen2/test/visualize.py \
-# --sensor "name=left,serial_port=/dev/ttyACM0,connect_id=6,model_name=GEN2-IP-L5325,control_mode=5" \
-# --sensor "name=right,serial_port=/dev/ttyACM0,connect_id=10,model_name=GEN2-IP-L5325,control_mode=5"
+# --sensor "name=left_hand,serial_port=/dev/ttyACM0,connect_ids=6|10,model_name=GEN2-IP-L5325,control_mode=5"
 def main() -> int:
     args = parse_args()
 
@@ -334,7 +335,7 @@ def main() -> int:
     if not args.sensor:
         raise SystemExit(
             "At least one --sensor is required. "
-            "Example: --sensor \"name=left,serial_port=/dev/ttyUSB0,connect_id=1,model_name=GEN2-IP-L5325,control_mode=5\""
+            "Example: --sensor \"name=left_hand,serial_port=/dev/ttyACM0,connect_ids=6|10,model_name=GEN2-IP-L5325,control_mode=5\""
         )
 
     try:

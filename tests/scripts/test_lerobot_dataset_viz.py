@@ -10,6 +10,8 @@ import torch
 
 from lerobot.scripts.lerobot_dataset_viz import (
     EE_RULER_AXIS_COLORS,
+    as_1d_tensor,
+    build_device_capture_timestamp_entity_paths,
     build_public_rerun_connect_url,
     build_public_rerun_web_viewer_url,
     build_scalar_entity_paths,
@@ -125,6 +127,23 @@ def test_build_scalar_entity_paths_falls_back_to_indices_when_width_mismatches()
     ]
 
 
+def test_build_device_capture_timestamp_entity_paths_converts_dots_to_hierarchy():
+    paths = build_device_capture_timestamp_entity_paths(
+        [
+            "camera.cam_0.capture_timestamp_s",
+            "tactile.paxini.capture_timestamp_s",
+            "handheld_gripper.pika.capture_timestamp_s",
+        ],
+        3,
+    )
+
+    assert paths == [
+        "observation/device_capture_timestamp/camera/cam_0/capture_timestamp_s",
+        "observation/device_capture_timestamp/tactile/paxini/capture_timestamp_s",
+        "observation/device_capture_timestamp/handheld_gripper/pika/capture_timestamp_s",
+    ]
+
+
 def test_tensor_to_rerun_image_numpy_converts_bool_masks_to_uint8():
     image = tensor_to_rerun_image_numpy(torch.tensor([[True, False], [False, True]], dtype=torch.bool))
 
@@ -164,6 +183,15 @@ def test_log_feature_value_logs_matrix_as_image(monkeypatch):
     assert len(logged) == 1
     assert logged[0][0][0] == "observation.tactile.left_raw"
     assert logged[0][1]["entity"].__class__.__name__ == "Image"
+
+
+def test_as_1d_tensor_promotes_scalar_tensor():
+    value = torch.tensor(1.25)
+
+    result = as_1d_tensor(value)
+
+    assert result.shape == (1,)
+    assert result.tolist() == [1.25]
 
 
 def test_get_ee_pose_state_indices_supports_grouped_bare_xyz_quaternion_names():
