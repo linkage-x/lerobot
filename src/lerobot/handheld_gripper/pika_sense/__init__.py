@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .configuration_pika_sense import PikaSenseConfig
-from .pika_sense import PikaSense
-
 __all__ = ["PikaSense", "PikaSenseConfig"]
+
+
+def __getattr__(name: str):
+    if name == "PikaSense":
+        from .pika_sense import PikaSense
+
+        return PikaSense
+    if name == "PikaSenseConfig":
+        from .configuration_pika_sense import PikaSenseConfig
+
+        return PikaSenseConfig
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

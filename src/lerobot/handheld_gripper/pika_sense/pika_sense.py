@@ -17,7 +17,7 @@ from __future__ import annotations
 import importlib
 import logging
 import sys
-import time, math
+import time
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any
@@ -26,12 +26,46 @@ import serial.tools.list_ports
 
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 from lerobot.utils.errors import DeviceNotConnectedError
-from pika.sense import Sense
 
 from ..handheld_gripper import HandheldGripper
 from .configuration_pika_sense import PikaSenseConfig
 
 logger = logging.getLogger(__name__)
+
+_REPO_PIKA_SDK_ROOT = Path(__file__).resolve().parents[4] / "third_party" / "pika_sdk"
+
+
+def _resolve_pika_sense_cls():
+    import_errors: list[str] = []
+
+    try:
+        module = importlib.import_module("pika.sense")
+        sense_cls = getattr(module, "Sense", None)
+        if sense_cls is not None:
+            return sense_cls
+        import_errors.append("pika.sense: missing Sense attribute")
+    except ImportError as exc:
+        import_errors.append(f"pika.sense: {exc}")
+
+    sdk_root = str(_REPO_PIKA_SDK_ROOT)
+    if _REPO_PIKA_SDK_ROOT.exists() and sdk_root not in sys.path:
+        sys.path.insert(0, sdk_root)
+
+    try:
+        module = importlib.import_module("pika.sense")
+        sense_cls = getattr(module, "Sense", None)
+        if sense_cls is not None:
+            return sense_cls
+        import_errors.append("third_party/pika_sdk/pika.sense: missing Sense attribute")
+    except ImportError as exc:
+        import_errors.append(f"third_party/pika_sdk/pika.sense: {exc}")
+
+    raise ImportError(
+        "PikaSense requires the `pika.sense` module. "
+        "The runtime tried the installed environment first and then the repo-local SDK under "
+        f"{_REPO_PIKA_SDK_ROOT}. Import attempts: {import_errors}"
+    )
+
 
 class PikaSense(HandheldGripper):
     def __init__(self, config: PikaSenseConfig):
@@ -40,6 +74,7 @@ class PikaSense(HandheldGripper):
         self.config = config
         self.port = config.port
         self.warmup_s = config.warmup_s
+        self._sense_cls = _resolve_pika_sense_cls()
 
         self._sense: Any | None = None
         self._connected = False
@@ -79,7 +114,7 @@ class PikaSense(HandheldGripper):
 
     @check_if_already_connected
     def connect(self, warmup: bool = True) -> None:
-        self._sense = Sense(port=self.port)
+        self._sense = self._sense_cls(port=self.port)
 
         connected = self._sense.connect()
         if not connected:
