@@ -1,0 +1,145 @@
+robot:
+  type: franka_research3
+  robot_ip: 192.168.1.100
+  gripper_backend: franka_hand
+  allow_mock_gripper: false
+  urdf_path: /workspace/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_franka_hand.urdf
+  target_frame_name: fr3_hand_tcp
+  max_target_delta_pos: [0.001, 0.001, 0.001]
+  max_target_delta_rot: [0.01, 0.01, 0.01]
+  cameras:
+    cam_0:
+      type: hikrobot
+      serial: "DA9342471"
+      width: 1280
+      height: 720
+      fps: 30
+      transport_layer: gige
+      color_mode: bgr
+      warmup_s: 2
+      exposure_us: 10000
+      gain_db: 12
+      gamma: 1.3
+      white_balance_auto: continuous
+      lock_white_balance_after_warmup: true
+      timeout_ms: 1000
+    cam_1:
+      type: hikrobot
+      serial: "DA9342716"
+      width: 1280
+      height: 720
+      fps: 30
+      transport_layer: gige
+      color_mode: bgr
+      warmup_s: 2
+      exposure_us: 10000
+      gain_db: 12
+      gamma: 1.3
+      white_balance_auto: continuous
+      lock_white_balance_after_warmup: true
+      timeout_ms: 1000
+    cam_2:
+      type: hikrobot
+      serial: "DA9342700"
+      width: 1280
+      height: 720
+      fps: 30
+      transport_layer: gige
+      color_mode: bgr
+      warmup_s: 2
+      exposure_us: 10000
+      gain_db: 12
+      gamma: 1.3
+      white_balance_auto: continuous
+      lock_white_balance_after_warmup: true
+      timeout_ms: 1000
+    cam_3:
+      type: hikrobot
+      serial: "DA9342583"
+      width: 1280
+      height: 720
+      fps: 30
+      transport_layer: gige
+      color_mode: bgr
+      warmup_s: 2
+      exposure_us: 10000
+      gain_db: 12
+      gamma: 1.3
+      white_balance_auto: continuous
+      lock_white_balance_after_warmup: true
+      timeout_ms: 1000
+    cam_4:
+      type: hikrobot
+      serial: "DA9342477"
+      width: 1280
+      height: 720
+      fps: 30
+      transport_layer: gige
+      color_mode: bgr
+      warmup_s: 2
+      exposure_us: 10000
+      gain_db: 12
+      gamma: 1.3
+      white_balance_auto: continuous
+      lock_white_balance_after_warmup: true
+      timeout_ms: 1000
+    cam_5:
+      type: hikrobot
+      serial: "DA9342685"
+      width: 1280
+      height: 720
+      fps: 30
+      transport_layer: gige
+      color_mode: bgr
+      warmup_s: 2
+      exposure_us: 10000
+      gain_db: 12
+      gamma: 1.3
+      white_balance_auto: continuous
+      lock_white_balance_after_warmup: true
+      timeout_ms: 1000
+
+dataset:
+  repo_id: local/fr3_waypoint_capture_v1
+  single_task: FR3 fixed waypoint image capture
+  root: /workspace/outputs/datasets/fr3_waypoint_capture_v1
+  fps: 1
+  num_episodes: 1
+  video: true
+  streaming_encoding: true
+  vcodec: h264
+  encoder_threads: 2
+  push_to_hub: false
+
+runtime:
+  settle_time_s: 1.0
+  settle_timeout_s: 8.0
+  settle_position_threshold_m: 0.003
+  settle_angle_threshold_deg: 2.0
+  settle_consecutive_samples: 3
+  settle_check_fps: 30
+  max_read_age_ms: 500
+  auto_move_to_start_before_episode: false
+
+waypoints:
+  - ee.x: 0.450
+    ee.y: -0.120
+    ee.z: 0.300
+    ee.wx: 2.900
+    ee.wy: 0.100
+    ee.wz: 0.200
+    gripper.pos: 1.0
+  - ee.x: 0.500
+    ee.y: -0.060
+    ee.z: 0.320
+    ee.wx: 2.950
+    ee.wy: 0.050
+    ee.wz: 0.180
+    gripper.pos: 1.0
+  - ee.x: 0.550
+    ee.y: 0.000
+    ee.z: 0.340
+    ee.wx: 3.000
+    ee.wy: 0.000
+    ee.wz: 0.150
+    gripper.pos: 1.0

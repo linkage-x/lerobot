@@ -4,7 +4,7 @@
 
 As of 2026-04-10, `tools/handheld/handheld_record.py` can complete a 1-second smoke recording with:
 
-- 6 Hikrobot GigE cameras
+- 8 Hikrobot GigE cameras
 - 1 OpenCV USB camera at `/dev/video6`
 - 1 Intel RealSense D405 with serial `315122271805`
 - 1 Paxini Gen2 Omega tactile controller on `/dev/ttyACM0`
@@ -41,12 +41,14 @@ The following capture-path fixes have been applied in-repo:
 Current `tools/handheld/handheld_record_example.yaml` assumptions:
 
 - Hikrobot cameras:
-  - `cam_0`: `DA9342471`
+  - `cam_0`: `DA9342700`
   - `cam_1`: `DA9342716`
-  - `cam_2`: `DA9342700`
-  - `cam_3`: `DA9342583`
+  - `cam_2`: `DA9342685`
+  - `cam_3`: `DA9342471`
   - `cam_4`: `DA9342477`
-  - `cam_5`: `DA9342685`
+  - `cam_5`: `DA9342673`
+  - `cam_6`: `DA9342615`
+  - `cam_7`: `DA9342583`
 - `pika_opencv.index_or_path`: `/dev/video6`
 - `pika_realsense.serial_number_or_name`: `315122271805`
 - `paxini.serial_port`: `/dev/ttyACM0`

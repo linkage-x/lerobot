@@ -52,6 +52,31 @@ def test_build_docker_command_contains_expected_runtime_entrypoint(tmp_path: Pat
     assert "--robot-ip=10.0.0.5" in command_text
 
 
+def test_build_host_command_uses_workspace_venv_and_runtime_script(tmp_path: Path):
+    host_python = tmp_path / ".venv" / "bin" / "python"
+    host_python.parent.mkdir(parents=True)
+    host_python.write_text("", encoding="utf-8")
+
+    args = fr3_move_to_start.parse_args(
+        [
+            "--workspace",
+            str(tmp_path),
+            "--runtime",
+            "host",
+            "--robot-ip",
+            "10.0.0.5",
+        ]
+    )
+
+    command = fr3_move_to_start.build_host_command(args)
+
+    assert command == [
+        str(host_python),
+        str((tmp_path / "tools" / "fr3" / "fr3_move_to_start_runtime.py").resolve()),
+        "--robot-ip=10.0.0.5",
+    ]
+
+
 def test_main_dry_run_prints_command(capsys):
     exit_code = fr3_move_to_start.main(["--dry-run"])
 
@@ -60,6 +85,15 @@ def test_main_dry_run_prints_command(capsys):
     assert "docker compose" in captured.out
     assert "tools/fr3/fr3_move_to_start_runtime.py" in captured.out
     assert "lerobot-user" in captured.out
+
+
+def test_main_dry_run_host_prints_host_command(capsys):
+    exit_code = fr3_move_to_start.main(["--runtime", "host", "--dry-run"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "PYTHONPATH=" in captured.out
+    assert "tools/fr3/fr3_move_to_start_runtime.py" in captured.out
 
 
 def test_main_returns_subprocess_exit_code(monkeypatch):
@@ -76,3 +110,22 @@ def test_main_returns_subprocess_exit_code(monkeypatch):
 
     assert exit_code == 9
     assert calls
+
+
+def test_main_host_passes_workspace_env_and_cwd(monkeypatch, tmp_path: Path):
+    calls = []
+
+    def fake_run(command, check=False, cwd=None, env=None):
+        calls.append((command, check, cwd, env))
+        return subprocess.CompletedProcess(command, returncode=7)
+
+    monkeypatch.setattr(fr3_move_to_start.subprocess, "run", fake_run)
+
+    exit_code = fr3_move_to_start.main(["--runtime", "host", "--workspace", str(tmp_path)])
+
+    assert exit_code == 7
+    assert calls
+    _, check, cwd, env = calls[0]
+    assert check is False
+    assert cwd == tmp_path.resolve()
+    assert isinstance(env, dict)
