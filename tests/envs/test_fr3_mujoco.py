@@ -8,9 +8,10 @@ from lerobot.envs.fr3_mujoco import FR3MujocoEnv
 from lerobot.envs.fr3_mujoco import FR3MujocoEnvConfig
 
 
-def test_default_fr3_mujoco_urdf_path_exists():
+def test_default_fr3_mujoco_asset_paths_exist():
     cfg = FR3MujocoEnvConfig()
     assert Path(cfg.urdf_path).is_file()
+    assert Path(cfg.sim_xml_path).is_file()
 
 
 def test_local_envhub_wrapper_exists():
@@ -18,12 +19,13 @@ def test_local_envhub_wrapper_exists():
     assert wrapper_path.is_file()
 
 
-def test_reset_info_exposes_target_and_tcp_marker_state():
+def test_reset_info_exposes_target_tcp_marker_state_and_named_cameras():
     env = FR3MujocoEnv()
     try:
         _, info = env.reset()
         assert info["target_marker_name"] == "target"
         assert info["tcp_marker_name"] == "TCP"
+        assert info["camera_names"] == ("third_person", "side", "wrist")
         np.testing.assert_allclose(info["target_pose"], info["tcp_pose"])
         assert info["target_pose_7d"].shape == (7,)
         assert info["tcp_pose_7d"].shape == (7,)
@@ -95,6 +97,35 @@ def test_fk_ik_round_trip_converges_for_far_reachable_target():
         ik_joints = env._kinematics.inverse_kinematics(current_joints, target_pose)
         round_trip_pose = env._kinematics.forward_kinematics(ik_joints)
         np.testing.assert_allclose(round_trip_pose, target_pose, atol=1e-4)
+    finally:
+        env.close()
+
+
+def test_render_returns_named_camera_images_when_enabled():
+    cfg = FR3MujocoEnvConfig(enable_cameras=True, camera_height=64, camera_width=64)
+    env = FR3MujocoEnv(cfg=cfg)
+    try:
+        observation, info = env.reset()
+        assert sorted(observation["camera_obs"].keys()) == ["side", "third_person", "wrist"]
+        assert sorted(env.render().keys()) == ["side", "third_person", "wrist"]
+        for image in observation["camera_obs"].values():
+            assert image.shape == (64, 64, 3)
+            assert image.dtype == np.uint8
+        assert info["scene_geom_names"] == ("floor", "table", "workspace_object")
+    finally:
+        env.close()
+
+
+def test_gripper_command_updates_pika_slide_joints_symmetrically():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        _, _, _, _, closed = env.step_teleop_action({"enabled": False, "gripper": 0.0})
+        _, _, _, _, opened = env.step_teleop_action({"enabled": False, "gripper": 1.0})
+        assert abs(opened["gripper_joint_positions"]["left"]) > abs(closed["gripper_joint_positions"]["left"])
+        assert abs(opened["gripper_joint_positions"]["right"]) > abs(closed["gripper_joint_positions"]["right"])
+        assert abs(opened["gripper_joint_positions"]["left"] + opened["gripper_joint_positions"]["right"]) < 1e-6
+        assert opened["gripper_command"] == 1.0
     finally:
         env.close()
 

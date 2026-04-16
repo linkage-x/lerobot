@@ -1,157 +1,129 @@
-# FR3 MuJoCo Simulation TODO
+# FR3 MuJoCo 仿真待办
 
-## Scope
+## 范围
 
-This document captures the current execution plan for the FR3 teleoperation
-simulation track discussed in the latest architecture review.
+本文档记录了在最近一次架构评审中讨论的 FR3 遥操作仿真路线的当前执行计划。
 
-The immediate goal is not a full digital twin. The goal is a local MuJoCo
-simulation gate that can catch frame, IK, OTG, and teleop-target issues before
-the next real-hardware smoke test.
+当前的直接目标不是构建完整的数字孪生，而是建立一个本地 MuJoCo 仿真闸门，
+以便在下一次真实硬件 smoke test 之前，提前发现坐标系、IK、OTG 和遥操作目标相关问题。
 
-## Current Decisions
+## 当前决策
 
-1. Use MuJoCo as the next simulation backend for FR3 teleoperation bring-up.
-2. Keep the simulation runtime as a dedicated Docker service/profile, but run it
-   in the GPU-capable Docker environment and reuse the existing LeRobot
-   dependency stack.
-3. Reuse the same FR3 assets and kinematic contract used by hardware bring-up:
-   `fr3_pika_gripper_ati.urdf`, `pika_gripper_ee`, FR3 joint names, and the
-   current IK/OTG configuration path.
-4. Keep EnvHub as a later packaging target for the pure simulation layer, not
-   as the first implementation step for the full FR3 teleop workflow.
+1. 将 MuJoCo 作为 FR3 遥操作启动阶段的下一套仿真后端。
+2. 保持仿真运行时为独立的 Docker 服务/Profile，但运行在支持 GPU 的 Docker 环境中，并复用现有的 LeRobot 依赖栈。
+3. 复用与硬件启动相同的 FR3 资产和运动学约定：`fr3_pika_gripper_ati.urdf`、`pika_gripper_ee`、FR3 关节名称，以及当前 IK/OTG 配置路径。
+4. 将 EnvHub 保留为纯仿真层后续的打包目标，而不是完整 FR3 遥操作工作流的第一步实现。
 
-## Priority Order
+## 优先级顺序
 
-### P0: Foundation
+### P0：基础设施
 
-- [x] Record the architecture and implementation plan.
-- [x] Add a dedicated `lerobot-fr3-sim` Docker compose service/profile.
-- [x] Make MuJoCo an explicit FR3 sim dependency instead of relying on
-      transitive installs.
-- [x] Create a local, EnvHub-compatible FR3 MuJoCo environment entrypoint.
+- [x] 记录架构与实现计划。
+- [x] 添加专用的 `lerobot-fr3-sim` Docker compose 服务/Profile。
+- [x] 将 MuJoCo 设为 FR3 仿真的显式依赖，而不是依赖传递安装。
+- [x] 创建本地可用且兼容 EnvHub 的 FR3 MuJoCo 环境入口。
 
-### P1: Minimum Local Sim Gate
+### P1：最小本地仿真闸门
 
-- [x] Load the local FR3 MuJoCo model with the imported FR3/Pika assets.
-- [x] Expose a Gym-compatible environment with deterministic reset/step.
-- [x] Return joint-state observations and same-frame EE pose observations.
-- [x] Add a local smoke entrypoint that validates model load and one-step
-      rollout.
-- [x] Validate the GPU runtime path by creating a MuJoCo EGL context inside the
-      dedicated sim container.
+- [x] 使用导入的 FR3/Pika 资产加载本地 FR3 MuJoCo 模型。
+- [x] 暴露一个兼容 Gym、具备确定性 reset/step 的环境。
+- [x] 返回关节状态观测，以及与相同坐标系一致的末端执行器位姿观测。
+- [x] 添加本地 smoke 入口，用于验证模型加载和单步 rollout。
+- [x] 在专用仿真容器内创建 MuJoCo EGL context，以验证 GPU 运行时路径。
 
-### P2: Teleop Path Validation
+### P2：遥操作链路验证
 
-- [x] Add target/TCP visualization markers consistent with the HIROL MuJoCo
-      workflow.
-- [x] Bridge the current teleop target semantics into the local sim path.
-- [x] Validate `enabled` transitions, workspace clipping, and first-frame hold
-      behavior without touching hardware.
-- [x] Add regression checks for FK/IK consistency and target-frame alignment.
+- [x] 添加与 HIROL MuJoCo 工作流一致的 target/TCP 可视化标记。
+- [x] 将当前遥操作 target 语义桥接到本地仿真链路。
+- [x] 在不接触硬件的情况下验证 `enabled` 状态切换、工作空间裁剪和首帧保持行为。
+- [x] 添加 FK/IK 一致性和 target 坐标系对齐的回归检查。
 
-### P3: Future Extraction
+### P3：后续拆分
 
-- [ ] Split the pure environment layer into a standalone EnvHub-ready repo
-      layout.
-- [ ] Keep local hardware discovery, SpaceMouse orchestration, and real-robot
-      smoke scripts outside the EnvHub core package.
-- [ ] Publish only after the local MuJoCo gate is stable and reproducible.
+- [ ] 将纯环境层拆分为独立、可直接用于 EnvHub 的仓库结构。
+- [ ] 将本地硬件发现、SpaceMouse 编排和真实机器人 smoke 脚本保留在 EnvHub 核心包之外。
+- [ ] 仅在本地 MuJoCo 闸门稳定且可复现后再发布。
 
-## Container Recommendation
+## 容器建议
 
-Use a dedicated simulation container/service instead of folding simulation into
-the default FR3 hardware runtime service.
+建议使用独立的仿真容器/服务，而不是把仿真折叠进默认的 FR3 硬件运行时服务中。
 
-Why:
+原因：
 
-- the sim gate should remain runnable without FR3, serial, USB, or privileged
-  hardware access
-- MuJoCo for this FR3 sim track should assume a GPU-capable runtime and use the
-  GPU-oriented container profile by default
-- the code path should still reuse the same Python environment and FR3 assets
-- the resulting service can later serve local CI and future EnvHub packaging
+- 仿真闸门应当在没有 FR3、串口、USB 或特权硬件访问的情况下也能运行
+- 这一 FR3 仿真路线中的 MuJoCo 应默认假设运行时具备 GPU，并使用面向 GPU 的容器 Profile
+- 代码路径仍应复用相同的 Python 环境和 FR3 资产
+- 最终得到的服务后续还可以用于本地 CI 和未来的 EnvHub 打包
 
-Implementation rule:
+实现规则：
 
-- separate service/profile
-- shared LeRobot Docker base, but GPU-oriented for MuJoCo execution
-- shared repository volume
-- no hard dependency on real hardware mounts
+- 独立服务/Profile
+- 共享 LeRobot Docker 基础镜像，但 MuJoCo 执行使用 GPU 导向配置
+- 共享仓库挂载卷
+- 不对真实硬件挂载做硬依赖
 
-## Immediate Next Steps
+## 近期下一步
 
-1. Add target/TCP visualization markers consistent with the HIROL MuJoCo
-   workflow.
-2. Bridge the current teleop target semantics into the local sim path.
-3. Add regression checks for FK/IK consistency, `enabled` transitions, and
-   first-frame hold behavior.
+1. 添加与 HIROL MuJoCo 工作流一致的 target/TCP 可视化标记。
+2. 将当前遥操作 target 语义桥接到本地仿真链路。
+3. 添加 FK/IK 一致性、`enabled` 状态切换和首帧保持行为的回归检查。
 
-## Latest Validation
+## 最新验证
 
-Validated on March 10, 2026 in the dedicated `lerobot-fr3-sim` GPU container:
+已于 2026 年 3 月 10 日在专用的 `lerobot-fr3-sim` GPU 容器中完成验证：
 
-- `nvidia-smi -L` detected `NVIDIA GeForce RTX 4090 D`
-- `MUJOCO_GL=egl` successfully created a `mujoco.GLContext`
-- `tools/fr3/fr3_mujoco_env_smoke.py` loaded the FR3/Pika model and completed
-  reset plus three zero-action steps
-- the same smoke entrypoint completed one relative-target teleop probe and
-  returned aligned target/TCP marker poses
-- `tests/envs/test_fr3_mujoco.py` covers FK/IK round-trip, target/TCP marker
-  exposure, workspace clipping, first-frame hold, and target-frame alignment
+- `nvidia-smi -L` 检测到 `NVIDIA GeForce RTX 4090 D`
+- `MUJOCO_GL=egl` 成功创建 `mujoco.GLContext`
+- `tools/fr3/fr3_mujoco_env_smoke.py` 成功加载 FR3/Pika 模型，并完成 reset 加三次零动作 step
+- 同一个 smoke 入口还完成了一次相对 target 的遥操作探测，并返回了对齐的 target/TCP marker 位姿
+- `tests/envs/test_fr3_mujoco.py` 已覆盖 FK/IK 往返、target/TCP marker 暴露、工作空间裁剪、首帧保持，以及 target 坐标系对齐
 
-Current non-blocking warnings:
+当前非阻塞告警：
 
-- the imported URDF reports expected self-collision pairs in the neutral pose
-- MuJoCo warns about duplicate `fr3_link0_visual` geom names during URDF import
+- 导入的 URDF 在中立位姿下报告了符合预期的自碰撞对
+- MuJoCo 在 URDF 导入过程中提示 `fr3_link0_visual` geom 名称重复
 
-## Current Local Teleop Entry
+## 当前本地遥操作入口
 
-- `tools/fr3/fr3_mujoco_teleop.py` runs SpaceMouse-driven FR3 MuJoCo teleop
-- `src/lerobot/envs/fr3_mujoco_teleop.py` owns the target/TCP marker update
-  helpers and headless teleop loop
-- `src/lerobot/envs/fr3_mujoco.py` now advances teleop targets through the same
-  Ruckig OTG path used by the hardware backend instead of jumping directly to
-  IK joint targets
-- `docker compose --profile sim --profile teleop run --rm lerobot-fr3-sim-teleop`
-  is the intended local interactive container when SpaceMouse and a viewer are
-  required
-- local X11 viewer use currently expects the host to allow container root via
-  `xhost +si:localuser:root`
+- `tools/fr3/fr3_mujoco_teleop.py` 用于运行基于 SpaceMouse 的 FR3 MuJoCo 遥操作
+- `src/lerobot/envs/fr3_mujoco_teleop.py` 负责 target/TCP marker 更新辅助逻辑和无头遥操作循环
+- `src/lerobot/envs/fr3_mujoco.py` 现在会通过与硬件后端相同的 Ruckig OTG 路径推进遥操作 target，而不是直接跳到 IK 关节目标
+- `docker compose -f docker/docker-compose.yml --profile sim --profile teleop run --rm lerobot-fr3-sim-teleop` 只是进入本地交互式容器入口，默认不会自动启动遥操作脚本
+- 实际运行带 viewer 的仿真遥操作命令如下：
 
-## Next Calibration Step
+```bash
+xhost +si:localuser:root
+docker compose -f docker/docker-compose.yml --profile sim --profile teleop run --rm \
+  -e DISPLAY=$DISPLAY \
+  -e PYTHONPATH=/workspace/src \
+  lerobot-fr3-sim-teleop \
+  python tools/fr3/fr3_mujoco_teleop.py
+```
 
-The next recommended step is not more ad hoc scale tuning. The next step is a
-repeatable replay-and-compare loop.
+- 其中 `PYTHONPATH=/workspace/src` 是当前工作区源码导入所必需的；否则容器内已安装的旧版 `lerobot` 包可能找不到 `lerobot.envs.fr3_mujoco_teleop`
+- 当前本地 X11 viewer 的使用仍要求宿主机通过 `xhost +si:localuser:root` 允许容器中的 root 访问显示，并且当前 shell 需要已有可用的 `DISPLAY`
 
-Tooling is now in place:
+## 下一步标定
 
-- `tools/fr3/fr3_teleop_trace_replay.py` launches the replay in Docker for either
-  `sim` or `hardware` mode
-- `tools/fr3/fr3_teleop_trace_replay_runtime.py` runs the fixed profile and
-  records TCP/joint traces inside the target runtime
-- `tools/fr3/fr3_teleop_trace_compare.py` compares two trace bundles and reports
-  residual `scale_x/y/z` correction multipliers
-- `src/lerobot/calibration/fr3_teleop.py` owns the shared
-  fixed profile, trace schema, and comparison logic
+下一步推荐工作不是继续做零散的比例系数调参，而是建立一个可重复执行的 replay-and-compare 闭环。
 
-The remaining operational step is to run that loop with one sim trace and one
-real-hardware trace:
+当前工具链已经就位：
 
-1. Define a fixed teleop input profile with deterministic EE deltas over time.
-2. Replay that same profile into the MuJoCo teleop path and record TCP pose
-   traces.
-3. Replay that same profile into the real FR3 teleop path and record TCP pose
-   traces.
-4. Compare the two traces over the same time window and derive scale correction
-   suggestions for `scale_x`, `scale_y`, and `scale_z`.
-5. Prefer adjusting the simulation and control-path alignment first; only then
-   use scale retuning for residual operator feel differences.
+- `tools/fr3/fr3_teleop_trace_replay.py` 可在 Docker 中以 `sim` 或 `hardware` 模式启动回放
+- `tools/fr3/fr3_teleop_trace_replay_runtime.py` 负责运行固定输入 profile，并在目标运行时内记录 TCP/关节轨迹
+- `tools/fr3/fr3_teleop_trace_compare.py` 用于比较两组轨迹包，并输出 `scale_x/y/z` 的残差修正倍数建议
+- `src/lerobot/calibration/fr3_teleop.py` 负责共享的固定 profile、轨迹 schema 和比较逻辑
 
-Why:
+剩余的操作步骤，是分别跑出一份仿真轨迹和一份真实硬件轨迹：
 
-- the current mismatch is primarily dynamic, not just a static gain problem
-- MuJoCo teleop now uses OTG, so trace comparison can reveal remaining gap from
-  hardware controller behavior instead of masking it
-- a fixed replay profile gives a reusable acceptance gate for future teleop
-  changes
+1. 定义一个固定的遥操作输入 profile，使末端执行器位移随时间按确定性方式变化。
+2. 将同一份 profile 回放到 MuJoCo 遥操作链路中，并记录 TCP 位姿轨迹。
+3. 将同一份 profile 回放到真实 FR3 遥操作链路中，并记录 TCP 位姿轨迹。
+4. 在相同时间窗口内比较两组轨迹，并给出 `scale_x`、`scale_y` 和 `scale_z` 的修正建议。
+5. 优先调整仿真与控制链路的一致性；只有在这之后，才用比例系数微调去补偿操作者手感上的剩余差异。
+
+原因：
+
+- 当前不一致主要是动态行为差异，而不只是静态增益问题
+- MuJoCo 遥操作现在已经使用 OTG，因此轨迹比较能够暴露剩余的硬件控制器行为差异，而不是把问题掩盖掉
+- 固定回放 profile 可以作为后续遥操作改动的可复用验收闸门
