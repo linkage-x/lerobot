@@ -62,7 +62,14 @@ class GripperDriver(Protocol):
 class KinematicsDriver(Protocol):
     def forward_kinematics(self, joint_positions_rad: np.ndarray) -> np.ndarray: ...
 
-    def inverse_kinematics(self, current_joint_positions_rad: np.ndarray, desired_pose: np.ndarray) -> np.ndarray: ...
+    def inverse_kinematics(
+        self,
+        current_joint_positions_rad: np.ndarray,
+        desired_pose: np.ndarray,
+        *,
+        lock_orientation: bool = False,
+        orientation_weight: float | None = None,
+    ) -> np.ndarray: ...
 
 
 class JointOTGDriver(Protocol):
@@ -982,9 +989,64 @@ class PlacoKinematicsDriver:
         joint_positions_deg = np.rad2deg(np.asarray(joint_positions_rad, dtype=np.float64))
         return self._kinematics.forward_kinematics(joint_positions_deg)
 
-    def inverse_kinematics(self, current_joint_positions_rad: np.ndarray, desired_pose: np.ndarray) -> np.ndarray:
+    def inverse_kinematics(
+        self,
+        current_joint_positions_rad: np.ndarray,
+        desired_pose: np.ndarray,
+        *,
+        lock_orientation: bool = False,
+        orientation_weight: float | None = None,
+    ) -> np.ndarray:
         current_joint_positions_deg = np.rad2deg(np.asarray(current_joint_positions_rad, dtype=np.float64))
-        solution_deg = self._kinematics.inverse_kinematics(current_joint_positions_deg, desired_pose)
+        solution_deg = self._kinematics.inverse_kinematics(
+            current_joint_positions_deg,
+            desired_pose,
+            lock_orientation=lock_orientation,
+            orientation_weight=orientation_weight,
+        )
+        return np.deg2rad(np.asarray(solution_deg, dtype=np.float64))
+
+
+@dataclass
+class LocalKinematicsDriver:
+    """Local wrapper that is semantically identical to PlacoKinematicsDriver.
+
+    Kept in the same module as PlacoKinematicsDriver for A/B stability testing
+    against _MujocoArmKinematics in continuous_physics=True mode.
+    """
+
+    urdf_path: str
+    target_frame_name: str
+    joint_names: list[str]
+
+    def __post_init__(self):
+        from lerobot.model.kinematics import RobotKinematics
+
+        self._kinematics = RobotKinematics(
+            urdf_path=self.urdf_path,
+            target_frame_name=self.target_frame_name,
+            joint_names=self.joint_names,
+        )
+
+    def forward_kinematics(self, joint_positions_rad: np.ndarray) -> np.ndarray:
+        joint_positions_deg = np.rad2deg(np.asarray(joint_positions_rad, dtype=np.float64))
+        return self._kinematics.forward_kinematics(joint_positions_deg)
+
+    def inverse_kinematics(
+        self,
+        current_joint_positions_rad: np.ndarray,
+        desired_pose: np.ndarray,
+        *,
+        lock_orientation: bool = False,
+        orientation_weight: float | None = None,
+    ) -> np.ndarray:
+        current_joint_positions_deg = np.rad2deg(np.asarray(current_joint_positions_rad, dtype=np.float64))
+        solution_deg = self._kinematics.inverse_kinematics(
+            current_joint_positions_deg,
+            desired_pose,
+            lock_orientation=lock_orientation,
+            orientation_weight=orientation_weight,
+        )
         return np.deg2rad(np.asarray(solution_deg, dtype=np.float64))
 
 

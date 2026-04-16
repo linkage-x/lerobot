@@ -106,8 +106,10 @@ class RobotKinematics:
         self,
         current_joint_pos: np.ndarray,
         desired_ee_pose: np.ndarray,
+        *,
+        lock_orientation: bool = False,
         position_weight: float = 1.0,
-        orientation_weight: float = 0.01,
+        orientation_weight: float | None = None,
         max_iterations: int = 20,
         position_tolerance_m: float = 1e-4,
         orientation_tolerance_rad: float = 1e-3,
@@ -118,8 +120,12 @@ class RobotKinematics:
         Args:
             current_joint_pos: Current joint positions in degrees (used as initial guess)
             desired_ee_pose: Target end-effector pose as a 4x4 transformation matrix
+            lock_orientation: When True, treat orientation as a strongly constrained
+                part of the target pose instead of a weak preference.
             position_weight: Weight for position constraint in IK
-            orientation_weight: Weight for orientation constraint in IK, set to 0.0 to only constrain position
+            orientation_weight: Weight for orientation constraint in IK, set to 0.0 to only constrain position.
+                When omitted, uses a strong default in lock mode and the historical
+                weak default otherwise.
             max_iterations: Maximum number of solver iterations to run before returning
             position_tolerance_m: Early-stop position tolerance in meters
             orientation_tolerance_rad: Early-stop orientation tolerance in radians
@@ -138,13 +144,17 @@ class RobotKinematics:
         # Update the target pose for the frame task
         self.tip_frame.T_world_frame = desired_ee_pose
 
+        resolved_orientation_weight = 1.0 if lock_orientation else 0.01
+        if orientation_weight is not None:
+            resolved_orientation_weight = float(orientation_weight)
+
         # Configure the task based on position_only flag
-        self.tip_frame.configure(self.target_frame_name, "soft", position_weight, orientation_weight)
+        self.tip_frame.configure(self.target_frame_name, "soft", position_weight, resolved_orientation_weight)
 
         # Placo's solve() performs one optimization step. For poses far from the
         # current seed, a single call can leave hundreds of millimeters of
         # residual error. Iterate until the achieved FK pose is close enough.
-        orientation_enabled = orientation_weight > 0.0
+        orientation_enabled = resolved_orientation_weight > 0.0
         for _ in range(max_iterations):
             self.solver.solve(True)
             self.robot.update_kinematics()

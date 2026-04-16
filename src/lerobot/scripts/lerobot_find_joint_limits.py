@@ -63,6 +63,7 @@ from lerobot.teleoperators import (  # noqa: F401
     omx_leader,
     openarm_leader,
     openarm_mini,
+    quest3,
     so_leader,
     spacemouse,
 )

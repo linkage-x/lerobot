@@ -24,6 +24,14 @@
 
 🤗 Comprehensive support for the open-source ecosystem to democratize physical AI.
 
+## Data Collection GUI
+
+For the local FR3 data-collection workflow, use the [Data Collection GUI guide](./tools/data_collection_gui/frontend/README.md). It documents the browser entry points for Live Record, Dataset Processing, Episode Replay, annotation, MuJoCo validation, guarded real-robot replay, and the command-line fallbacks for functionality that is not fully wired into the GUI yet.
+
+## Team Notifications
+
+To notify a Feishu group when `origin/box` receives a new PR or merge, see [Feishu Notifications For origin/box](./docs/feishu_box_branch_notifications.md).
+
 ## Quick Start
 
 LeRobot can be installed directly from PyPI.
@@ -35,6 +43,18 @@ lerobot-info
 
 > [!IMPORTANT]
 > For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
+
+## Mujoco Simulation
+
+Run FR3 teleoperation in Mujoco simulation with Docker:
+
+```bash
+docker compose -f docker/docker-compose.yml --profile sim --profile teleop run --rm \
+  -e DISPLAY=$DISPLAY \
+  -e PYTHONPATH=/workspace/src \
+  lerobot-fr3-sim-teleop \
+  python tools/fr3/fr3_mujoco_teleop.py
+```
 
 ## Robots & Control
 

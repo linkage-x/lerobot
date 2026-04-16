@@ -672,4 +672,12 @@
     <child link="pika_gripper_ee" />
   </joint>
 
+  <!-- Task-space TCP: midpoint between the two finger working points. -->
+  <link name="pika_task_tcp" />
+  <joint name="pika_task_tcp_joint" type="fixed">
+    <origin rpy="3.1415926 -1.5707963 0" xyz="0 0 0.366842" />
+    <parent link="gripper_base_link" />
+    <child link="pika_task_tcp" />
+  </joint>
+
 </robot>

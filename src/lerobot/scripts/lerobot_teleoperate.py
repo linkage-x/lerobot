@@ -52,6 +52,7 @@ lerobot-teleoperate \
 """
 
 import logging
+import warnings
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
@@ -95,9 +96,11 @@ from lerobot.teleoperators import (  # noqa: F401
     keyboard,
     koch_leader,
     make_teleoperator_from_config,
+    nintendo,
     omx_leader,
     openarm_leader,
     openarm_mini,
+    quest3,
     reachy2_teleoperator,
     so_leader,
     spacemouse,
@@ -262,6 +265,7 @@ def teleoperate(cfg: TeleoperateConfig):
 
 
 def main():
+    warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API", category=DeprecationWarning)
     register_third_party_plugins()
     teleoperate()
 

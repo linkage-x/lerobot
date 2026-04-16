@@ -4,6 +4,7 @@ import { ReplayInspector } from "./ReplayInspector";
 import type {
   ConfigSummary,
   DeviceStatus,
+  EpisodeAnnotation,
   EventLogItem,
   ProcessingItem,
   ProcessingStatus,
@@ -137,15 +138,36 @@ function ReplayPanel({
   busy,
   onPreflight,
   onReplay,
+  onMujocoReplay,
   onAbort
 }: {
   status: ReplayStatus;
   busy: boolean;
   onPreflight: () => void;
   onReplay: (realRobot: boolean) => void;
+  onMujocoReplay: () => void;
   onAbort: () => void;
 }) {
-  const isActive = status.state === "dry_run" || status.state === "replaying";
+  const isActive = status.state === "dry_run" || status.state === "sim_replay" || status.state === "replaying";
+  const canReplayData = status.dataStatus === "loaded" && (status.recordedFrames ?? status.totalFrames) > 0;
+  const validation = status.mujocoValidation;
+  const mujocoPassed = validation?.status === "passed" && validation.isCurrentForSelection === true;
+  const validationLabel =
+    validation?.status === "passed"
+      ? "passed"
+      : validation?.status === "failed"
+        ? "failed"
+        : validation?.status === "running"
+          ? "running"
+          : "recommended";
+  const validationMetric =
+    validation?.maxPositionErrorMm != null && validation?.maxRotationErrorDeg != null
+      ? `Max ${validation.maxPositionErrorMm.toFixed(2)}mm / ${validation.maxRotationErrorDeg.toFixed(2)}deg; limits ${validation.maxPositionThresholdMm.toFixed(2)}mm / ${validation.maxRotationThresholdDeg.toFixed(2)}deg`
+      : "No completed MuJoCo metrics yet";
+  const validationGuidance = mujocoPassed
+    ? "MuJoCo replay is current for this episode."
+    : "Strongly recommended before Preflight/Dry Run; required before Real Robot.";
+  const realRobotDisabled = busy || isActive || status.safety !== "ready" || !mujocoPassed;
   return (
     <section className="panel replay-panel">
       <div className="panel-heading">
@@ -156,12 +178,17 @@ function ReplayPanel({
         </span>
       </div>
       <div className="control-row">
-        <button disabled={busy || isActive} onClick={onPreflight}>Preflight</button>
+        <button disabled={busy || isActive || !canReplayData} onClick={onPreflight}>Preflight</button>
         <button disabled={busy || isActive || status.safety !== "ready"} onClick={() => onReplay(false)}>Dry Run</button>
-        <button className="danger" disabled={busy || isActive || status.safety !== "ready"} onClick={() => onReplay(true)}>Real Robot</button>
+        <button disabled={busy || isActive || !canReplayData} onClick={onMujocoReplay}>MuJoCo</button>
+        <button className="danger" disabled={realRobotDisabled} onClick={() => onReplay(true)}>Real Robot</button>
         <button disabled={busy || !isActive} onClick={onAbort}>Abort</button>
       </div>
       <p className="panel-note">Safety {status.safety} · {status.message}</p>
+      <p className={`validation-note validation-${validationLabel}`}>
+        MuJoCo replay {validationLabel}: {validationGuidance} {validation?.message ?? "Run MuJoCo replay before real-robot replay."} · {validationMetric}
+      </p>
+      {status.lastOutput ? <p className="process-output">{status.lastOutput}</p> : null}
       {status.diagnostics?.length ? (
         <div className="diagnostic-box">
           {status.diagnostics.slice(0, 2).map((diagnostic, index) => (
@@ -492,24 +519,219 @@ function ReplayReadinessCard({
   );
 }
 
+function EpisodeAnnotationPanel({
+  annotation,
+  datasetPath,
+  busy,
+  onSave
+}: {
+  annotation: EpisodeAnnotation;
+  datasetPath: string;
+  busy: boolean;
+  onSave: (annotation: EpisodeAnnotation) => void;
+}) {
+  const [draft, setDraft] = useState<EpisodeAnnotation>(annotation);
+  const [tagsText, setTagsText] = useState(annotation.tags.join(", "));
+  const annotationIdentityRef = useRef(`${annotation.datasetRoot}:${annotation.episode}:${annotation.updatedAt}:${annotation.source}`);
+
+  useEffect(() => {
+    const nextIdentity = `${annotation.datasetRoot}:${annotation.episode}:${annotation.updatedAt}:${annotation.source}`;
+    if (annotationIdentityRef.current !== nextIdentity) {
+      annotationIdentityRef.current = nextIdentity;
+      setDraft(annotation);
+      setTagsText(annotation.tags.join(", "));
+    }
+  }, [annotation]);
+
+  const normalizedTags = tagsText
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter(Boolean)
+    .slice(0, 12);
+  const canSave = draft.taskPrompt.trim().length > 0;
+
+  return (
+    <section className="panel annotation-panel">
+      <div className="panel-heading">
+        <h2>Episode Annotation</h2>
+        <span>{draft.updatedAt ? `saved ${new Date(draft.updatedAt).toLocaleString()}` : "not saved"}</span>
+      </div>
+      <div className="annotation-grid">
+        <label className="annotation-field annotation-field-wide">
+          <span>Task Prompt</span>
+          <textarea
+            value={draft.taskPrompt}
+            onChange={(event) => setDraft({ ...draft, taskPrompt: event.target.value })}
+            placeholder="Pick up the red cube and place it into the fixture"
+          />
+        </label>
+        <label className="annotation-field">
+          <span>Outcome</span>
+          <select
+            value={draft.outcome}
+            onChange={(event) => setDraft({ ...draft, outcome: event.target.value as EpisodeAnnotation["outcome"] })}
+          >
+            <option value="unreviewed">Unreviewed</option>
+            <option value="success">Success</option>
+            <option value="partial">Partial</option>
+            <option value="failure">Failure</option>
+          </select>
+        </label>
+        <label className="annotation-field">
+          <span>Quality</span>
+          <select
+            value={draft.quality}
+            onChange={(event) => setDraft({ ...draft, quality: event.target.value as EpisodeAnnotation["quality"] })}
+          >
+            <option value="unreviewed">Unreviewed</option>
+            <option value="good">Good</option>
+            <option value="needs_review">Needs review</option>
+            <option value="bad">Bad</option>
+          </select>
+        </label>
+        <label className="annotation-field annotation-toggle">
+          <input
+            checked={draft.includeInTraining}
+            type="checkbox"
+            onChange={(event) => setDraft({ ...draft, includeInTraining: event.target.checked })}
+          />
+          <span>Use for training</span>
+        </label>
+        <label className="annotation-field">
+          <span>Annotator</span>
+          <input
+            value={draft.annotator}
+            onChange={(event) => setDraft({ ...draft, annotator: event.target.value })}
+            placeholder="operator"
+          />
+        </label>
+        <label className="annotation-field annotation-field-wide">
+          <span>Tags</span>
+          <input
+            value={tagsText}
+            onChange={(event) => setTagsText(event.target.value)}
+            placeholder="occlusion, collision, retry, object-slip"
+          />
+        </label>
+        <label className="annotation-field annotation-field-wide">
+          <span>Notes</span>
+          <textarea
+            value={draft.notes}
+            onChange={(event) => setDraft({ ...draft, notes: event.target.value })}
+            placeholder="Short review notes, failure reason, or scene details"
+          />
+        </label>
+      </div>
+      <div className="control-row">
+        <button
+          disabled={busy || !datasetPath || !canSave}
+          onClick={() =>
+            onSave({
+              ...draft,
+              datasetRoot: datasetPath,
+              tags: normalizedTags,
+              taskPrompt: draft.taskPrompt.trim(),
+              annotator: draft.annotator.trim(),
+              notes: draft.notes.trim()
+            })
+          }
+        >
+          Save Annotation
+        </button>
+        <span className="annotation-hint">Episode {draft.episode} · {draft.source}</span>
+      </div>
+    </section>
+  );
+}
+
+function EpisodeSelector({
+  status,
+  busy,
+  onSelectEpisode
+}: {
+  status: ReplayStatus;
+  busy: boolean;
+  onSelectEpisode: (episode: number) => void;
+}) {
+  const [pendingEpisode, setPendingEpisode] = useState<number | null>(null);
+  const options = status.episodeOptions?.length
+    ? status.episodeOptions
+    : Array.from({ length: status.totalEpisodes ?? 0 }, (_item, index) => index);
+  const current = status.episode ?? 0;
+  const currentIndex = options.indexOf(current);
+  const hasPrevious = currentIndex > 0;
+  const hasNext = currentIndex >= 0 && currentIndex < options.length - 1;
+  const switching = pendingEpisode != null && (busy || pendingEpisode !== current);
+
+  useEffect(() => {
+    if (!busy && pendingEpisode === current) {
+      setPendingEpisode(null);
+    }
+  }, [busy, current, pendingEpisode]);
+
+  const selectEpisode = (episode: number) => {
+    setPendingEpisode(episode);
+    onSelectEpisode(episode);
+  };
+
+  return (
+    <section className="panel episode-selector-panel">
+      <div className="panel-heading">
+        <h2>Episode</h2>
+        <span>{options.length ? `${options.length} available` : "no episode index"}</span>
+      </div>
+      <div className="episode-selector-row">
+        <button disabled={busy || !hasPrevious} onClick={() => selectEpisode(options[currentIndex - 1])}>Previous</button>
+        <select
+          disabled={busy || options.length === 0}
+          value={current}
+          onChange={(event) => selectEpisode(Number(event.target.value))}
+        >
+          {options.length ? (
+            options.map((episode) => (
+              <option value={episode} key={episode}>
+                Episode {episode}
+              </option>
+            ))
+          ) : (
+            <option value={current}>Episode {current}</option>
+          )}
+        </select>
+        <button disabled={busy || !hasNext} onClick={() => selectEpisode(options[currentIndex + 1])}>Next</button>
+      </div>
+      <p className="panel-note">
+        {switching
+          ? `Switching to episode ${pendingEpisode}: reading episode metadata and preparing video/timeline resources.`
+          : "Inspector, annotation, and replay commands follow the selected episode."}
+      </p>
+    </section>
+  );
+}
+
 function EpisodeReplayPage({
   snapshot,
   busy,
   onPreflight,
   onReplay,
+  onMujocoReplay,
   onAbort,
   onSelectDataset,
+  onSelectEpisode,
   onGenerateForActive,
-  onOpenProcessing
+  onOpenProcessing,
+  onSaveAnnotation
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
   onPreflight: () => void;
   onReplay: (realRobot: boolean) => void;
+  onMujocoReplay: () => void;
   onAbort: () => void;
   onSelectDataset: (path: string) => void;
+  onSelectEpisode: (episode: number) => void;
   onGenerateForActive: () => void;
   onOpenProcessing: () => void;
+  onSaveAnnotation: (annotation: EpisodeAnnotation) => void;
 }) {
   const activePath = snapshot.replay.datasetRoot ?? snapshot.replay.dataset;
   const matchingProcessing =
@@ -536,10 +758,18 @@ function EpisodeReplayPage({
           busy={busy}
           onPreflight={onPreflight}
           onReplay={onReplay}
+          onMujocoReplay={onMujocoReplay}
           onAbort={onAbort}
         />
       </div>
-      <ReplayInspector api={api} datasetPath={activePath} fallbackFps={snapshot.replay.fps} />
+      <EpisodeSelector status={snapshot.replay} busy={busy} onSelectEpisode={onSelectEpisode} />
+      <ReplayInspector api={api} datasetPath={activePath} episode={snapshot.replay.episode} fallbackFps={snapshot.replay.fps} />
+      <EpisodeAnnotationPanel
+        annotation={snapshot.annotation}
+        datasetPath={activePath}
+        busy={busy}
+        onSave={onSaveAnnotation}
+      />
       <EventLog events={snapshot.events} />
     </div>
   );
@@ -1008,6 +1238,17 @@ function App() {
   const activeReplayPath = snapshot.replay.datasetRoot ?? snapshot.replay.dataset;
   const replayMatch =
     snapshot.processing.find((item) => item.path === activeReplayPath) ?? snapshot.processing[0];
+  const startReplay = (realRobot: boolean) => {
+    if (realRobot) {
+      const ok = window.confirm(
+        `Start real-robot replay for episode ${snapshot.replay.episode}? MuJoCo validation is current for this dataset.`
+      );
+      if (!ok) {
+        return;
+      }
+    }
+    run(() => api.startReplay(realRobot));
+  };
 
   const pageNode =
     activePage === "live-record" ? (
@@ -1036,11 +1277,14 @@ function App() {
         snapshot={snapshot}
         busy={busy}
         onPreflight={() => run(() => api.preflightReplay())}
-        onReplay={(realRobot) => run(() => api.startReplay(realRobot))}
+        onReplay={startReplay}
+        onMujocoReplay={() => run(() => api.startMujocoReplay())}
         onAbort={() => run(() => api.abortReplay())}
         onSelectDataset={(path) => run(() => api.selectRecordedDataset(path))}
+        onSelectEpisode={(episode) => run(() => api.selectReplayEpisode(episode))}
         onGenerateForActive={() => replayMatch && queueTrajGenAndOpenProcessing(replayMatch.path)}
         onOpenProcessing={() => navigate("dataset-processing")}
+        onSaveAnnotation={(annotation) => run(() => api.saveEpisodeAnnotation(annotation))}
       />
     ) : activePage === "qc-report" ? (
       <QcReportPage snapshot={snapshot} />

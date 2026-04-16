@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import signal
@@ -20,6 +21,12 @@ from urllib.parse import parse_qs, urlparse
 
 DEFAULT_CONFIG_PATH = Path("tools/handheld/handheld_record_example.yaml")
 DEFAULT_DATASETS_ROOT = Path("outputs/datasets")
+DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM = 20.0
+DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG = 15.0
+DEFAULT_REPLAY_MAX_EE_STEP_MM = 120.0
+DEFAULT_REPLAY_MAX_GRIPPER_STEP = 0.35
+DEFAULT_REAL_PREFLIGHT_TIMEOUT_S = 30.0
+DEFAULT_REAL_ROBOT_IP = "192.168.1.208"
 
 
 @dataclass
@@ -61,8 +68,12 @@ class ReplayStatus:
     dataStatus: str = "missing"
     trajectoryKind: str = "none"
     totalEpisodes: int = 0
+    episodeOptions: list[int] = field(default_factory=list)
     recordedFrames: int = 0
     diagnostics: list[str] = field(default_factory=list)
+    pid: int | None = None
+    lastOutput: str = ""
+    mujocoValidation: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -88,7 +99,10 @@ class GatewayState:
     events: list[EventLogItem] = field(default_factory=list)
     selected_replay_root: Path | None = None
     process: subprocess.Popen[str] | None = None
+    replay_process: subprocess.Popen[str] | None = None
+    replay_process_kind: str = ""
     process_started_at_s: float | None = None
+    replay_started_at_s: float | None = None
     lock: Lock = field(default_factory=Lock)
 
     def log(self, level: str, message: str) -> None:
@@ -120,6 +134,157 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 def _dataset_config(config: dict[str, Any]) -> dict[str, Any]:
     dataset = config.get("dataset") or {}
     return dataset if isinstance(dataset, dict) else {}
+
+
+def _replay_config(config: dict[str, Any]) -> dict[str, Any]:
+    replay = config.get("replay") or {}
+    return replay if isinstance(replay, dict) else {}
+
+
+def _float_config(config: dict[str, Any], key: str, default: float) -> float:
+    value = config.get(key, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool_config(config: dict[str, Any], key: str, default: bool) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+    return default
+
+
+def _mujoco_validation_thresholds(config: dict[str, Any]) -> tuple[float, float]:
+    replay = _replay_config(config)
+    return (
+        _float_config(replay, "mujoco_max_position_error_mm", DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM),
+        _float_config(replay, "mujoco_max_rotation_error_deg", DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG),
+    )
+
+
+def _new_mujoco_validation(
+    state: GatewayState,
+    *,
+    status: str = "not_run",
+    dataset_root: Path | None = None,
+    episode: int | None = None,
+    message: str = "Run MuJoCo replay before real-robot replay.",
+) -> dict[str, Any]:
+    max_pos_mm, max_rot_deg = _mujoco_validation_thresholds(state.config)
+    return {
+        "status": status,
+        "datasetRoot": str(dataset_root) if dataset_root is not None else "",
+        "episode": int(state.replay.episode if episode is None else episode),
+        "fps": int(state.replay.fps or 30),
+        "exitCode": None,
+        "completedFrames": 0,
+        "totalFrames": 0,
+        "avgPositionErrorMm": None,
+        "maxPositionErrorMm": None,
+        "avgRotationErrorDeg": None,
+        "maxRotationErrorDeg": None,
+        "maxPositionThresholdMm": max_pos_mm,
+        "maxRotationThresholdDeg": max_rot_deg,
+        "hasStructuredResult": False,
+        "trajectoryContract": {},
+        "isCurrentForSelection": False,
+        "message": message,
+        "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _invalidate_mujoco_validation(state: GatewayState, message: str) -> None:
+    state.replay.mujocoValidation = _new_mujoco_validation(state, message=message)
+
+
+def _validation_store_path(dataset_root: Path) -> Path:
+    return dataset_root / "meta" / "gui_replay_validations.json"
+
+
+def _read_validation_store(dataset_root: Path) -> dict[str, Any]:
+    path = _validation_store_path(dataset_root)
+    if not path.is_file():
+        return {"validations": []}
+    try:
+        with path.open("r", encoding="utf-8") as validation_file:
+            payload = json.load(validation_file)
+    except (OSError, json.JSONDecodeError):
+        return {"validations": []}
+    if not isinstance(payload, dict):
+        return {"validations": []}
+    validations = payload.get("validations")
+    if not isinstance(validations, list):
+        payload["validations"] = []
+    return payload
+
+
+def _write_validation_store(dataset_root: Path, validation: dict[str, Any]) -> None:
+    path = _validation_store_path(dataset_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _read_validation_store(dataset_root)
+    validations = [item for item in payload.get("validations", []) if isinstance(item, dict)]
+    key = (
+        str(validation.get("datasetRoot") or ""),
+        int(validation.get("episode") or 0),
+        int(validation.get("fps") or 0),
+        float(validation.get("maxPositionThresholdMm") or 0.0),
+        float(validation.get("maxRotationThresholdDeg") or 0.0),
+    )
+    filtered = [
+        item
+        for item in validations
+        if (
+            str(item.get("datasetRoot") or ""),
+            int(item.get("episode") or 0),
+            int(item.get("fps") or 0),
+            float(item.get("maxPositionThresholdMm") or 0.0),
+            float(item.get("maxRotationThresholdDeg") or 0.0),
+        )
+        != key
+    ]
+    payload["validations"] = [validation, *filtered][:50]
+    with path.open("w", encoding="utf-8") as validation_file:
+        json.dump(payload, validation_file, ensure_ascii=False, indent=2)
+        validation_file.write("\n")
+
+
+def _load_persisted_mujoco_validation(state: GatewayState, dataset_root: Path, episode: int) -> dict[str, Any] | None:
+    max_pos_mm, max_rot_deg = _mujoco_validation_thresholds(state.config)
+    for item in _read_validation_store(dataset_root).get("validations", []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            matches = (
+                Path(str(item.get("datasetRoot") or "")).resolve() == dataset_root.resolve()
+                and int(item.get("episode")) == int(episode)
+                and int(item.get("fps")) == int(state.replay.fps or 30)
+                and float(item.get("maxPositionThresholdMm")) == max_pos_mm
+                and float(item.get("maxRotationThresholdDeg")) == max_rot_deg
+            )
+        except (TypeError, ValueError, OSError):
+            matches = False
+        if matches:
+            return dict(item)
+    return None
+
+
+def _refresh_mujoco_validation_current(state: GatewayState) -> None:
+    validation = state.replay.mujocoValidation
+    if not validation:
+        return
+    try:
+        dataset_root = _active_replay_dataset_root(state)
+        validation["isCurrentForSelection"] = _mujoco_validation_is_for_active_episode(state, dataset_root)
+    except RuntimeError:
+        validation["isCurrentForSelection"] = False
 
 
 def _target_frames(config: dict[str, Any]) -> int:
@@ -315,14 +480,53 @@ def _select_replay_dataset(state: GatewayState, raw_path: str) -> None:
         raise ValueError(f"Dataset is not in the recorded dataset list: {requested}")
 
     state.selected_replay_root = matched
+    episode_options = _dataset_episode_indices(matched, _load_dataset_info(matched))
     state.replay.state = "idle"
     state.replay.safety = "locked"
+    state.replay.episodeOptions = episode_options
+    state.replay.episode = episode_options[0] if episode_options else 0
     state.replay.frameIndex = 0
     state.replay.trackingErrorMm = 0.0
     state.replay.datasetRoot = str(matched)
     state.replay.dataset = str(matched)
     state.replay.message = f"Selected recorded dataset: {matched.name}"
+    _invalidate_mujoco_validation(state, "Dataset changed; run MuJoCo replay again before real-robot replay.")
+    persisted_validation = _load_persisted_mujoco_validation(state, matched, state.replay.episode)
+    if persisted_validation is not None:
+        state.replay.mujocoValidation = persisted_validation
+        _refresh_mujoco_validation_current(state)
+        state.replay.message = f"Selected recorded dataset: {matched.name}; MuJoCo validation restored"
     state.log("info", f"Selected replay dataset {matched}")
+
+
+def _select_replay_episode(state: GatewayState, raw_episode: str) -> None:
+    if raw_episode == "":
+        raise ValueError("Missing episode index.")
+    try:
+        episode = int(raw_episode)
+    except ValueError as exc:
+        raise ValueError(f"Invalid episode index: {raw_episode}") from exc
+    dataset_root = state.selected_replay_root or _resolve_known_dataset(state, state.replay.datasetRoot or state.replay.dataset)
+    if dataset_root is None:
+        raise ValueError("Select a recorded dataset before selecting an episode.")
+    episode_options = _dataset_episode_indices(dataset_root, _load_dataset_info(dataset_root))
+    if episode_options and episode not in episode_options:
+        raise ValueError(f"Episode {episode} is not available for {dataset_root.name}.")
+    state.selected_replay_root = dataset_root
+    state.replay.episode = episode
+    state.replay.episodeOptions = episode_options
+    state.replay.state = "idle"
+    state.replay.safety = "locked"
+    state.replay.frameIndex = 0
+    state.replay.trackingErrorMm = 0.0
+    state.replay.message = f"Selected episode {episode} from {dataset_root.name}"
+    _invalidate_mujoco_validation(state, "Episode changed; run MuJoCo replay again before real-robot replay.")
+    persisted_validation = _load_persisted_mujoco_validation(state, dataset_root, episode)
+    if persisted_validation is not None:
+        state.replay.mujocoValidation = persisted_validation
+        _refresh_mujoco_validation_current(state)
+        state.replay.message = f"Selected episode {episode} from {dataset_root.name}; MuJoCo validation restored"
+    state.log("info", f"Selected replay episode {episode} for {dataset_root}")
 
 
 def _load_dataset_info(dataset_root: Path) -> dict[str, Any]:
@@ -437,12 +641,65 @@ def _normalize_series(values: list[float], low: float = 8.0, high: float = 92.0)
 
 def _dataset_replay_meta(dataset_root: Path, info: dict[str, Any]) -> dict[str, Any]:
     data_files = _dataset_data_files(dataset_root)
+    episode_options = _dataset_episode_indices(dataset_root, info)
     return {
         "datasetRoot": str(dataset_root),
         "sourcePath": str(data_files[-1]) if data_files else "",
         "totalEpisodes": int(info.get("total_episodes") or 0),
+        "episodeOptions": episode_options,
         "recordedFrames": int(info.get("total_frames") or 0),
     }
+
+
+def _dataset_episode_indices(dataset_root: Path, info: dict[str, Any] | None = None) -> list[int]:
+    try:
+        import pyarrow.parquet as pq
+    except Exception:
+        total_episodes = int((info or _load_dataset_info(dataset_root)).get("total_episodes") or 0)
+        return list(range(total_episodes))
+
+    episode_indices: set[int] = set()
+    has_rows = False
+    for data_file in _dataset_data_files(dataset_root):
+        try:
+            parquet = pq.ParquetFile(data_file)
+            columns = parquet.schema_arrow.names
+            if "episode_index" not in columns:
+                if parquet.metadata and parquet.metadata.num_rows > 0:
+                    has_rows = True
+                continue
+            table = pq.read_table(data_file, columns=["episode_index"])
+            for value in table["episode_index"].to_pylist():
+                if value is not None:
+                    episode_indices.add(int(value))
+        except Exception:
+            continue
+    if episode_indices:
+        return sorted(episode_indices)
+    total_episodes = int((info or _load_dataset_info(dataset_root)).get("total_episodes") or 0)
+    if total_episodes:
+        return list(range(total_episodes))
+    return [0] if has_rows else []
+
+
+def _selected_episode_for_dataset(state: GatewayState, dataset_root: Path, episode_options: list[int]) -> int:
+    if not episode_options:
+        return int(state.replay.episode or 0)
+    selected_dataset = state.selected_replay_root
+    replay_dataset = _resolve_dataset_root(state.repo_root, state.replay.datasetRoot or state.replay.dataset)
+    is_active = False
+    for candidate in (selected_dataset, replay_dataset):
+        if candidate is None:
+            continue
+        try:
+            if candidate.resolve() == dataset_root.resolve():
+                is_active = True
+                break
+        except OSError:
+            continue
+    if is_active and int(state.replay.episode or 0) in episode_options:
+        return int(state.replay.episode or 0)
+    return episode_options[0]
 
 
 def _recorded_dataset_status(dataset_root: Path) -> str:
@@ -652,6 +909,143 @@ def _mock_calibrate_cameras(state: GatewayState) -> None:
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
+
+
+def _annotation_store_path(dataset_root: Path) -> Path:
+    return dataset_root / "meta" / "gui_annotations.json"
+
+
+def _read_annotation_store(dataset_root: Path) -> dict[str, Any]:
+    path = _annotation_store_path(dataset_root)
+    if not path.is_file():
+        return {"version": 1, "annotations": {}}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "annotations": {}}
+    if not isinstance(loaded, dict):
+        return {"version": 1, "annotations": {}}
+    annotations = loaded.get("annotations")
+    if not isinstance(annotations, dict):
+        loaded["annotations"] = {}
+    loaded.setdefault("version", 1)
+    return loaded
+
+
+def _write_annotation_store(dataset_root: Path, store: dict[str, Any]) -> None:
+    path = _annotation_store_path(dataset_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(store, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _dataset_task_prompt(dataset_root: Path, config: dict[str, Any]) -> str:
+    tasks_path = dataset_root / "meta" / "tasks.parquet"
+    if tasks_path.is_file():
+        try:
+            import pyarrow.parquet as pq
+
+            table = pq.read_table(str(tasks_path), columns=["task"]).to_pydict()
+            tasks = [str(task).strip() for task in table.get("task", []) if str(task).strip()]
+            if tasks:
+                return tasks[0]
+        except Exception:
+            pass
+    return str(_dataset_config(config).get("single_task") or "").strip()
+
+
+def _normalize_annotation(
+    payload: dict[str, Any],
+    *,
+    dataset_root: Path,
+    episode: int,
+    default_prompt: str,
+    source: str,
+) -> dict[str, Any]:
+    outcome = str(payload.get("outcome") or "unreviewed")
+    if outcome not in {"unreviewed", "success", "failure", "partial"}:
+        outcome = "unreviewed"
+    quality = str(payload.get("quality") or "unreviewed")
+    if quality not in {"unreviewed", "good", "needs_review", "bad"}:
+        quality = "unreviewed"
+    raw_tags = payload.get("tags") if isinstance(payload.get("tags"), list) else []
+    tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()][:12]
+    return {
+        "datasetRoot": str(dataset_root),
+        "episode": episode,
+        "taskPrompt": str(payload.get("taskPrompt") or default_prompt).strip(),
+        "outcome": outcome,
+        "quality": quality,
+        "includeInTraining": bool(payload.get("includeInTraining", True)),
+        "tags": tags,
+        "notes": str(payload.get("notes") or "").strip(),
+        "annotator": str(payload.get("annotator") or "").strip(),
+        "updatedAt": str(payload.get("updatedAt") or ""),
+        "source": source,
+    }
+
+
+def _active_annotation(state: GatewayState) -> dict[str, Any]:
+    dataset_root = state.selected_replay_root or _resolve_known_dataset(
+        state,
+        state.replay.datasetRoot or state.replay.dataset,
+    )
+    if dataset_root is None:
+        candidates = _replay_dataset_candidates(state)
+        dataset_root = candidates[0] if candidates else None
+    if dataset_root is None:
+        return {
+            **_normalize_annotation(
+                {},
+                dataset_root=Path("."),
+                episode=int(state.replay.episode or 0),
+                default_prompt=str(_dataset_config(state.config).get("single_task") or ""),
+                source="default",
+            ),
+            "datasetRoot": state.replay.datasetRoot or state.replay.dataset or "",
+        }
+    episode = int(state.replay.episode or 0)
+    store = _read_annotation_store(dataset_root)
+    raw = store.get("annotations", {}).get(str(episode))
+    if isinstance(raw, dict):
+        return _normalize_annotation(
+            raw,
+            dataset_root=dataset_root,
+            episode=episode,
+            default_prompt=_dataset_task_prompt(dataset_root, state.config),
+            source="manual",
+        )
+    return _normalize_annotation(
+        {},
+        dataset_root=dataset_root,
+        episode=episode,
+        default_prompt=_dataset_task_prompt(dataset_root, state.config),
+        source="dataset" if _dataset_task_prompt(dataset_root, state.config) else "default",
+    )
+
+
+def _save_annotation(state: GatewayState, payload: dict[str, Any]) -> None:
+    raw_dataset = str(payload.get("datasetRoot") or state.replay.datasetRoot or state.replay.dataset or "").strip()
+    dataset_root = _resolve_known_dataset(state, raw_dataset) or state.selected_replay_root
+    if dataset_root is None:
+        raise ValueError("Annotation dataset is not in the recorded dataset list.")
+    episode = int(payload.get("episode", state.replay.episode or 0))
+    default_prompt = _dataset_task_prompt(dataset_root, state.config)
+    annotation = _normalize_annotation(
+        payload,
+        dataset_root=dataset_root,
+        episode=episode,
+        default_prompt=default_prompt,
+        source="manual",
+    )
+    annotation["updatedAt"] = _now_iso()
+    store = _read_annotation_store(dataset_root)
+    annotations = store.setdefault("annotations", {})
+    annotations[str(episode)] = annotation
+    store["updatedAt"] = annotation["updatedAt"]
+    _write_annotation_store(dataset_root, store)
+    state.log("info", f"Saved annotation for {dataset_root.name} episode {episode}")
 
 
 def _run_qc(dataset_root: Path) -> dict[str, Any]:
@@ -974,6 +1368,10 @@ def _write_processing_meta_qc(dataset_root: Path, qc_result: dict[str, Any]) -> 
     return updated
 
 
+def _queue_traj_gen(_state: GatewayState, dataset_root: Path) -> None:
+    raise NotImplementedError(f"待实现：Generate EE Trajectory 功能尚未接入，dataset={dataset_root}")
+
+
 def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for index, dataset_root in enumerate(_complete_dataset_candidates(state)):
@@ -1079,8 +1477,11 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
             if "episode_index" in table.column_names:
                 episodes = [int(value) for value in table["episode_index"].to_pylist() if value is not None]
                 if episodes:
-                    episode = max(episodes)
+                    episode_options = sorted(set(episodes))
+                    episode = _selected_episode_for_dataset(state, dataset_root, episode_options)
                     table = table.filter(pc.equal(table["episode_index"], episode))
+                    if table.num_rows == 0:
+                        continue
 
             rows = table.to_pylist()
             rows.sort(key=lambda row: int(row.get("frame_index") or 0))
@@ -1257,7 +1658,7 @@ def _extract_gripper(names: list[str], values: list[float]) -> float | None:
     return None
 
 
-def _read_dataset_timeline(state: GatewayState, dataset_root: Path) -> dict[str, Any]:
+def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int | None = None) -> dict[str, Any]:
     try:
         import pyarrow.compute as pc
         import pyarrow.parquet as pq
@@ -1287,8 +1688,23 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path) -> dict[str,
     table = pq.read_table(data_file)
     if "episode_index" in table.column_names:
         episodes = [int(value) for value in table["episode_index"].to_pylist() if value is not None]
-        episode = max(episodes) if episodes else 0
-        table = table.filter(pc.equal(table["episode_index"], episode))
+        episode_options = sorted(set(episodes))
+        selected_episode = episode if episode is not None else _selected_episode_for_dataset(state, dataset_root, episode_options)
+        if episode_options and selected_episode not in episode_options:
+            return {
+                "datasetRoot": str(dataset_root),
+                "name": dataset_root.name,
+                "episode": selected_episode,
+                "totalFrames": 0,
+                "frames": [],
+                "cameraKeys": camera_keys,
+                "stateNames": state_names,
+                "actionNames": action_names,
+                "fps": fps,
+                "error": f"episode {selected_episode} not found",
+            }
+        table = table.filter(pc.equal(table["episode_index"], selected_episode))
+        episode = selected_episode
     else:
         episode = 0
 
@@ -1440,6 +1856,25 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
             "idle" if process.returncode == 0 or exited_from in ("idle", "discarding") else "error",
         )
 
+    replay_process = state.replay_process
+    if replay_process is not None and replay_process.poll() is not None:
+        replay_kind = state.replay_process_kind or "mujoco"
+        label = "MuJoCo replay" if replay_kind == "mujoco" else "Real robot replay"
+        state.log("info" if replay_process.returncode == 0 else "warn", f"{label} exited with code {replay_process.returncode}")
+        state.replay_process = None
+        state.replay_process_kind = ""
+        state.replay_started_at_s = None
+        state.replay.pid = None
+        if replay_kind == "mujoco":
+            _finish_mujoco_validation(state, replay_process.returncode)
+        else:
+            state.replay.safety = "locked"
+            state.replay.state = "complete" if replay_process.returncode == 0 else "aborted"
+            if state.replay.lastOutput:
+                state.replay.message = f"{label} exited with code {replay_process.returncode}: {state.replay.lastOutput}"
+            else:
+                state.replay.message = f"{label} exited with code {replay_process.returncode}"
+
     recording_state = state.recording.state
     elapsed_s = None
     if state.process_started_at_s is not None:
@@ -1460,18 +1895,24 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
     state.replay.dataStatus = str(trajectory_meta.get("dataStatus") or "missing")
     state.replay.trajectoryKind = str(trajectory_meta.get("trajectoryKind") or "none")
     state.replay.totalEpisodes = int(trajectory_meta.get("totalEpisodes") or 0)
+    state.replay.episodeOptions = [
+        int(episode) for episode in trajectory_meta.get("episodeOptions", []) if isinstance(episode, int)
+    ]
     state.replay.recordedFrames = int(trajectory_meta.get("recordedFrames") or len(trajectory))
     diagnostics = trajectory_meta.get("diagnostics") or []
     state.replay.diagnostics = [str(item) for item in diagnostics] if isinstance(diagnostics, list) else [str(diagnostics)]
+    if not state.replay.mujocoValidation:
+        state.replay.mujocoValidation = _new_mujoco_validation(state)
     if trajectory:
         state.replay.episode = int(trajectory_meta.get("episode") or 0)
         state.replay.totalFrames = len(trajectory)
         state.replay.dataset = str(trajectory_meta.get("datasetRoot") or state.replay.dataset)
-        if state.replay.state in ("idle", "armed"):
+        if state.replay.state == "idle":
             state.replay.message = str(trajectory_meta.get("message") or f"Loaded recorded episode {state.replay.episode}")
     elif state.replay.state == "idle":
         state.replay.totalFrames = state.replay.recordedFrames
         state.replay.message = str(trajectory_meta.get("message") or "No recorded trajectory loaded")
+    _refresh_mujoco_validation_current(state)
 
     return {
         "gateway": {
@@ -1488,6 +1929,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         ],
         "recording": asdict(state.recording),
         "replay": asdict(state.replay),
+        "annotation": _active_annotation(state),
         "calibration": asdict(state.calibration),
         "recordedDatasets": recorded_datasets,
         "processing": _processing_items(state),
@@ -1508,6 +1950,20 @@ def _json_response(handler: BaseHTTPRequestHandler, status: HTTPStatus, payload:
     handler.wfile.write(body)
 
 
+def _read_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
+    length = int(handler.headers.get("Content-Length") or "0")
+    if length <= 0:
+        return {}
+    raw_body = handler.rfile.read(length)
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON body: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("JSON body must be an object.")
+    return payload
+
+
 def _venv_python(repo_root: Path) -> Path:
     for name in (".venv", "venv"):
         candidate = repo_root / name / "bin" / "python"
@@ -1524,6 +1980,16 @@ def _recorder_env(repo_root: Path) -> dict[str, str]:
     env["PYTHONPATH"] = os.pathsep.join(python_paths)
     env["PYTHONUNBUFFERED"] = "1"
     env["LEROBOT_GUI_HEADLESS"] = "1"
+    return env
+
+
+def _tool_env(repo_root: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    python_paths = [str(repo_root / "src"), str(repo_root)]
+    if env.get("PYTHONPATH"):
+        python_paths.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(python_paths)
+    env["PYTHONUNBUFFERED"] = "1"
     return env
 
 
@@ -1629,6 +2095,16 @@ def _start_output_reader(state: GatewayState, process: subprocess.Popen[str]) ->
     thread.start()
 
 
+def _start_replay_output_reader(state: GatewayState, process: subprocess.Popen[str]) -> None:
+    thread = Thread(
+        target=_read_replay_process_output,
+        args=(state, process),
+        daemon=True,
+        name=f"mujoco-replay-output-{process.pid}",
+    )
+    thread.start()
+
+
 def _read_process_output(state: GatewayState, process: subprocess.Popen[str]) -> None:
     if process.stdout is None:
         return
@@ -1640,6 +2116,241 @@ def _read_process_output(state: GatewayState, process: subprocess.Popen[str]) ->
             if state.process is not process:
                 return
             _apply_recorder_output(state, output)
+
+
+def _read_replay_process_output(state: GatewayState, process: subprocess.Popen[str]) -> None:
+    if process.stdout is None:
+        return
+    for line in process.stdout:
+        output = line.strip()
+        if not output:
+            continue
+        with state.lock:
+            if state.replay_process is not process:
+                return
+            state.replay.lastOutput = output
+            state.replay.message = output
+            if state.replay_process_kind == "mujoco":
+                _apply_mujoco_replay_output(state, output)
+                state.log("info", f"mujoco replay: {output}")
+            else:
+                state.log("info", f"real replay: {output}")
+
+
+def _set_mujoco_validation_metric(validation: dict[str, Any], key: str, value: str) -> None:
+    try:
+        validation[key] = float(value)
+    except ValueError:
+        return
+
+
+def _apply_mujoco_replay_output(state: GatewayState, output: str) -> None:
+    validation = state.replay.mujocoValidation or _new_mujoco_validation(state, status="running")
+    result_match = re.search(
+        r"mujoco_replay_result=status=(?P<status>\w+)\s+"
+        r"completed_frames=(?P<completed>\d+)\s+total_frames=(?P<total>\d+)\s+"
+        r"avg_pos_mm=(?P<avg_pos>[0-9.]+)\s+max_pos_mm=(?P<max_pos>[0-9.]+)\s+"
+        r"avg_rot_deg=(?P<avg_rot>[0-9.]+)\s+max_rot_deg=(?P<max_rot>[0-9.]+)",
+        output,
+    )
+    if result_match:
+        validation["hasStructuredResult"] = True
+        validation["completedFrames"] = int(result_match.group("completed"))
+        validation["totalFrames"] = int(result_match.group("total"))
+        _set_mujoco_validation_metric(validation, "avgPositionErrorMm", result_match.group("avg_pos"))
+        _set_mujoco_validation_metric(validation, "maxPositionErrorMm", result_match.group("max_pos"))
+        _set_mujoco_validation_metric(validation, "avgRotationErrorDeg", result_match.group("avg_rot"))
+        _set_mujoco_validation_metric(validation, "maxRotationErrorDeg", result_match.group("max_rot"))
+        validation["message"] = "MuJoCo replay metrics received"
+    else:
+        metric_patterns = (
+            ("avgPositionErrorMm", r"平均位置误差:\s*([0-9.]+)\s*mm"),
+            ("maxPositionErrorMm", r"最大位置误差:\s*([0-9.]+)\s*mm"),
+            ("avgRotationErrorDeg", r"平均旋转误差:\s*([0-9.]+)\s*deg"),
+            ("maxRotationErrorDeg", r"最大旋转误差:\s*([0-9.]+)\s*deg"),
+        )
+        for key, pattern in metric_patterns:
+            metric_match = re.search(pattern, output)
+            if metric_match:
+                _set_mujoco_validation_metric(validation, key, metric_match.group(1))
+    validation["updatedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    state.replay.mujocoValidation = validation
+
+
+def _mujoco_validation_is_for_active_episode(state: GatewayState, dataset_root: Path) -> bool:
+    validation = state.replay.mujocoValidation or {}
+    validation_episode = validation.get("episode")
+    validation_fps = validation.get("fps")
+    max_pos_mm, max_rot_deg = _mujoco_validation_thresholds(state.config)
+    validation_pos_threshold = validation.get("maxPositionThresholdMm")
+    validation_rot_threshold = validation.get("maxRotationThresholdDeg")
+    return (
+        validation.get("status") == "passed"
+        and Path(str(validation.get("datasetRoot") or "")).resolve() == dataset_root.resolve()
+        and int(validation_episode if validation_episode is not None else -1) == int(state.replay.episode)
+        and int(validation_fps if validation_fps is not None else 0) == int(state.replay.fps or 30)
+        and float(validation_pos_threshold if validation_pos_threshold is not None else -1.0) == max_pos_mm
+        and float(validation_rot_threshold if validation_rot_threshold is not None else -1.0) == max_rot_deg
+    )
+
+
+def _distance_mm(a: dict[str, Any], b: dict[str, Any]) -> float | None:
+    keys = ("x", "y", "z")
+    try:
+        return math.sqrt(sum((float(a[key]) - float(b[key])) ** 2 for key in keys)) * 1000.0
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _trajectory_contract_for_episode(state: GatewayState, dataset_root: Path) -> dict[str, Any]:
+    replay = _replay_config(state.config)
+    max_ee_step_mm = _float_config(replay, "trajectory_max_ee_step_mm", DEFAULT_REPLAY_MAX_EE_STEP_MM)
+    max_gripper_step = _float_config(replay, "trajectory_max_gripper_step", DEFAULT_REPLAY_MAX_GRIPPER_STEP)
+    min_z_value = replay.get("trajectory_min_z_m")
+    max_z_value = replay.get("trajectory_max_z_m")
+    min_z = float(min_z_value) if min_z_value is not None else None
+    max_z = float(max_z_value) if max_z_value is not None else None
+
+    timeline = _read_dataset_timeline(state, dataset_root, state.replay.episode)
+    frames = timeline.get("frames") if isinstance(timeline, dict) else []
+    frames = frames if isinstance(frames, list) else []
+    checks: list[dict[str, Any]] = []
+    failures: list[str] = []
+    if not frames:
+        failures.append("no timeline frames")
+
+    poses = [frame.get("eePose") for frame in frames if isinstance(frame, dict) and frame.get("eePose")]
+    pose_count = len([pose for pose in poses if isinstance(pose, dict) and {"x", "y", "z"}.issubset(pose.keys())])
+    if pose_count != len(frames):
+        failures.append(f"missing EE pose for {len(frames) - pose_count}/{len(frames)} frames")
+    checks.append({"name": "ee_pose_present", "status": "pass" if pose_count == len(frames) and frames else "fail", "value": pose_count})
+
+    max_step = 0.0
+    previous_pose: dict[str, Any] | None = None
+    z_values: list[float] = []
+    gripper_values: list[float] = []
+    for pose in poses:
+        if not isinstance(pose, dict):
+            continue
+        if "z" in pose:
+            try:
+                z_values.append(float(pose["z"]))
+            except (TypeError, ValueError):
+                pass
+        if pose.get("gripper") is not None:
+            try:
+                gripper_values.append(float(pose["gripper"]))
+            except (TypeError, ValueError):
+                pass
+        if previous_pose is not None:
+            step = _distance_mm(previous_pose, pose)
+            if step is not None:
+                max_step = max(max_step, step)
+        previous_pose = pose
+    if max_step > max_ee_step_mm:
+        failures.append(f"max EE step {max_step:.2f}mm > {max_ee_step_mm:.2f}mm")
+    checks.append({"name": "max_ee_step", "status": "pass" if max_step <= max_ee_step_mm else "fail", "valueMm": max_step, "thresholdMm": max_ee_step_mm})
+
+    if gripper_values:
+        gripper_min = min(gripper_values)
+        gripper_max = max(gripper_values)
+        gripper_steps = [abs(curr - prev) for prev, curr in zip(gripper_values, gripper_values[1:], strict=False)]
+        max_gripper_delta = max(gripper_steps) if gripper_steps else 0.0
+        if gripper_min < 0.0 or gripper_max > 1.0:
+            failures.append(f"gripper range [{gripper_min:.3f}, {gripper_max:.3f}] outside [0, 1]")
+        if max_gripper_delta > max_gripper_step:
+            failures.append(f"max gripper step {max_gripper_delta:.3f} > {max_gripper_step:.3f}")
+        checks.append({
+            "name": "gripper_range_step",
+            "status": "pass" if 0.0 <= gripper_min <= gripper_max <= 1.0 and max_gripper_delta <= max_gripper_step else "fail",
+            "min": gripper_min,
+            "max": gripper_max,
+            "maxStep": max_gripper_delta,
+            "stepThreshold": max_gripper_step,
+        })
+
+    if z_values and (min_z is not None or max_z is not None):
+        z_min = min(z_values)
+        z_max = max(z_values)
+        z_failures: list[str] = []
+        if min_z is not None and z_min < min_z:
+            z_failures.append(f"min Z {z_min:.4f}m < {min_z:.4f}m")
+        if max_z is not None and z_max > max_z:
+            z_failures.append(f"max Z {z_max:.4f}m > {max_z:.4f}m")
+        failures.extend(z_failures)
+        checks.append({"name": "z_bounds", "status": "pass" if not z_failures else "fail", "min": z_min, "max": z_max, "minThreshold": min_z, "maxThreshold": max_z})
+
+    return {
+        "status": "failed" if failures else "passed",
+        "frames": len(frames),
+        "checks": checks,
+        "failures": failures,
+    }
+
+
+def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> None:
+    validation = state.replay.mujocoValidation or _new_mujoco_validation(state)
+    validation["exitCode"] = exit_code
+    validation["updatedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    max_pos = validation.get("maxPositionErrorMm")
+    max_rot = validation.get("maxRotationErrorDeg")
+    max_pos_threshold = float(validation.get("maxPositionThresholdMm") or DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM)
+    max_rot_threshold = float(validation.get("maxRotationThresholdDeg") or DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG)
+    completed = int(validation.get("completedFrames") or 0)
+    total = int(validation.get("totalFrames") or 0)
+
+    reasons: list[str] = []
+    if exit_code != 0:
+        reasons.append(f"exit code {exit_code}")
+    if not validation.get("hasStructuredResult"):
+        reasons.append("missing structured mujoco_replay_result")
+    if max_pos is None or max_rot is None:
+        reasons.append("missing replay metrics")
+    else:
+        if float(max_pos) > max_pos_threshold:
+            reasons.append(f"max position error {float(max_pos):.2f}mm > {max_pos_threshold:.2f}mm")
+        if float(max_rot) > max_rot_threshold:
+            reasons.append(f"max rotation error {float(max_rot):.2f}deg > {max_rot_threshold:.2f}deg")
+    if total > 0 and completed < total:
+        reasons.append(f"incomplete episode {completed}/{total} frames")
+
+    dataset_root_value = str(validation.get("datasetRoot") or "")
+    try:
+        dataset_root = Path(dataset_root_value).resolve()
+    except OSError:
+        dataset_root = None
+    if dataset_root is None or not dataset_root_value:
+        reasons.append("missing validation dataset root")
+    else:
+        try:
+            contract = _trajectory_contract_for_episode(state, dataset_root)
+        except Exception as exc:  # noqa: BLE001
+            contract = {"status": "failed", "checks": [], "failures": [f"trajectory contract error: {exc}"]}
+        validation["trajectoryContract"] = contract
+        if contract.get("status") != "passed":
+            reasons.extend(str(reason) for reason in contract.get("failures", []))
+
+    if reasons:
+        validation["status"] = "failed"
+        validation["message"] = "MuJoCo validation failed: " + "; ".join(reasons)
+        state.replay.safety = "fault"
+        state.replay.state = "aborted"
+    else:
+        validation["status"] = "passed"
+        validation["message"] = (
+            f"MuJoCo validation passed: max {float(max_pos):.2f}mm / {float(max_rot):.2f}deg "
+            f"within {max_pos_threshold:.2f}mm / {max_rot_threshold:.2f}deg"
+        )
+        state.replay.safety = "ready"
+        state.replay.state = "complete"
+    state.replay.mujocoValidation = validation
+    _refresh_mujoco_validation_current(state)
+    if dataset_root is not None and _is_dataset_root(dataset_root):
+        try:
+            _write_validation_store(dataset_root, state.replay.mujocoValidation)
+        except OSError as exc:
+            state.log("warn", f"Failed to persist MuJoCo validation: {exc}")
+    state.replay.message = validation["message"]
 
 
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
@@ -1698,6 +2409,273 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         state.recording.frameIndex = 0
     elif "Input stream closed; stopping recording session." in output:
         state.recording.message = "Recorder input closed; finalizing dataset"
+
+
+def _dataset_arg_for_container_replay(repo_root: Path, dataset_root: Path) -> str:
+    resolved_root = repo_root.resolve()
+    resolved_dataset = dataset_root.resolve()
+    try:
+        return str(resolved_dataset.relative_to(resolved_root))
+    except ValueError:
+        return str(resolved_dataset)
+
+
+def _active_replay_dataset_root(state: GatewayState) -> Path:
+    requested = state.selected_replay_root or _resolve_known_dataset(state, state.replay.datasetRoot or state.replay.dataset)
+    if requested is not None:
+        return requested.resolve()
+    candidates = _replay_dataset_candidates(state)
+    if not candidates:
+        raise RuntimeError("No recorded dataset is available for MuJoCo replay.")
+    return candidates[0].resolve()
+
+
+def _mujoco_replay_command(state: GatewayState, dataset_root: Path) -> list[str]:
+    command = [
+        str(_venv_python(state.repo_root)),
+        str(state.repo_root / "tools" / "fr3" / "fr3_sim_record_replay.py"),
+        f"--dataset={_dataset_arg_for_container_replay(state.repo_root, dataset_root)}",
+        f"--fps={state.replay.fps or 30}",
+    ]
+    if state.replay.episode >= 0:
+        command.append(f"--episode={state.replay.episode}")
+    return command
+
+
+def _real_replay_command(state: GatewayState, dataset_root: Path) -> list[str]:
+    replay = _replay_config(state.config)
+    command = [
+        str(_venv_python(state.repo_root)),
+        str(state.repo_root / "tools" / "fr3" / "fr3_das_replay_real.py"),
+        f"--dataset={_dataset_arg_for_container_replay(state.repo_root, dataset_root)}",
+        f"--episode={state.replay.episode}",
+        f"--fps={state.replay.fps or 30}",
+    ]
+    option_map = {
+        "timing_source": "--timing-source",
+        "robot_ip": "--robot-ip",
+        "filter_coeff": "--filter-coeff",
+        "damping": "--damping",
+        "stiffness": "--stiffness",
+        "otg_max_velocity": "--otg-max-velocity",
+        "otg_max_acceleration": "--otg-max-acceleration",
+        "otg_max_jerk": "--otg-max-jerk",
+        "otg_velocity_scale": "--otg-velocity-scale",
+        "otg_acceleration_scale": "--otg-acceleration-scale",
+        "otg_jerk_scale": "--otg-jerk-scale",
+        "gripper_port": "--gripper-port",
+        "gripper_backend": "--gripper-backend",
+        "reset_gripper_position": "--reset-gripper-position",
+        "reset_gripper_timeout_s": "--reset-gripper-timeout-s",
+        "analysis_output_dir": "--analysis-output-dir",
+        "compose_file": "--compose-file",
+        "service": "--service",
+    }
+    for config_key, cli_key in option_map.items():
+        if replay.get(config_key) is not None:
+            command.append(f"{cli_key}={replay[config_key]}")
+    if replay.get("disable_otg"):
+        command.append("--disable-otg")
+    return command
+
+
+def _real_robot_ip(state: GatewayState) -> str:
+    replay = _replay_config(state.config)
+    robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
+    return str(replay.get("robot_ip") or robot.get("robot_ip") or DEFAULT_REAL_ROBOT_IP)
+
+
+def _real_preflight_command(state: GatewayState) -> list[str]:
+    replay = _replay_config(state.config)
+    command = [
+        str(_venv_python(state.repo_root)),
+        str(state.repo_root / "tools" / "fr3" / "fr3_record_preflight.py"),
+        f"--workspace={state.repo_root}",
+        f"--config-path={state.config_path}",
+        f"--robot-ip={_real_robot_ip(state)}",
+    ]
+    if _bool_config(replay, "real_preflight_skip_hikrobot", True):
+        command.append("--skip-hikrobot")
+    if _bool_config(replay, "real_preflight_skip_gripper", True):
+        command.append("--skip-gripper")
+    if _bool_config(replay, "real_preflight_skip_arm", False):
+        command.append("--skip-arm")
+    if _bool_config(replay, "real_preflight_skip_ping", False):
+        command.append("--skip-ping")
+    return command
+
+
+def _run_real_preflight(state: GatewayState) -> None:
+    replay = _replay_config(state.config)
+    if not _bool_config(replay, "real_preflight_enabled", True):
+        state.log("warn", "Real-robot preflight skipped by replay.real_preflight_enabled=false")
+        return
+    timeout_s = _float_config(replay, "real_preflight_timeout_s", DEFAULT_REAL_PREFLIGHT_TIMEOUT_S)
+    command = _real_preflight_command(state)
+    state.replay.message = "Running real-robot preflight checks"
+    try:
+        result = subprocess.run(
+            command,
+            cwd=state.repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=_tool_env(state.repo_root),
+            timeout=max(timeout_s, 1.0),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Real-robot preflight timed out after {timeout_s:.1f}s") from exc
+    output_lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    if output_lines:
+        state.replay.lastOutput = output_lines[-1]
+    if result.returncode != 0:
+        details = output_lines[-1] if output_lines else f"exit code {result.returncode}"
+        raise RuntimeError(f"Real-robot preflight failed: {details}")
+
+
+def _require_mujoco_validation(state: GatewayState) -> Path:
+    dataset_root = _active_replay_dataset_root(state)
+    if not _is_dataset_root(dataset_root):
+        raise RuntimeError(f"Selected replay dataset is not finalized: {dataset_root}")
+    if not _mujoco_validation_is_for_active_episode(state, dataset_root):
+        validation = state.replay.mujocoValidation or {}
+        message = str(validation.get("message") or "Run MuJoCo replay successfully before real-robot replay.")
+        raise RuntimeError(f"MuJoCo validation required for this dataset/episode: {message}")
+    return dataset_root
+
+
+def _require_replay_dataset(state: GatewayState) -> Path:
+    dataset_root = _active_replay_dataset_root(state)
+    if not _is_dataset_root(dataset_root):
+        raise RuntimeError(f"Selected replay dataset is not finalized: {dataset_root}")
+    return dataset_root
+
+
+def _mujoco_recommendation_suffix(state: GatewayState, dataset_root: Path) -> str:
+    if _mujoco_validation_is_for_active_episode(state, dataset_root):
+        return "current MuJoCo validation is available"
+    return "MuJoCo replay is strongly recommended before Preflight/Dry Run and still required before Real Robot"
+
+
+def _preflight_replay(state: GatewayState) -> None:
+    dataset_root = _require_replay_dataset(state)
+    _run_real_preflight(state)
+    state.replay.state = "armed"
+    state.replay.safety = "ready"
+    state.replay.message = (
+        f"Preflight gate passed for episode {state.replay.episode} from {dataset_root.name}; "
+        f"hardware checks passed; {_mujoco_recommendation_suffix(state, dataset_root)}"
+    )
+    state.log("info", state.replay.message)
+
+
+def _start_mujoco_replay(state: GatewayState) -> None:
+    if state.replay_process is not None and state.replay_process.poll() is None:
+        state.replay.message = "MuJoCo replay is already running"
+        return
+
+    dataset_root = _active_replay_dataset_root(state)
+    if not _is_dataset_root(dataset_root):
+        raise RuntimeError(f"Selected replay dataset is not finalized: {dataset_root}")
+
+    command = _mujoco_replay_command(state, dataset_root)
+    state.replay.mujocoValidation = _new_mujoco_validation(
+        state,
+        status="running",
+        dataset_root=dataset_root,
+        episode=state.replay.episode,
+        message="MuJoCo replay is running; real-robot replay remains locked until metrics pass.",
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=state.repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=_tool_env(state.repo_root),
+        start_new_session=True,
+    )
+    state.replay_process = process
+    state.replay_process_kind = "mujoco"
+    state.replay_started_at_s = time.monotonic()
+    state.selected_replay_root = dataset_root
+    state.replay.state = "sim_replay"
+    state.replay.safety = "locked"
+    state.replay.pid = process.pid
+    state.replay.frameIndex = 0
+    state.replay.datasetRoot = str(dataset_root)
+    state.replay.dataset = str(dataset_root)
+    state.replay.message = f"MuJoCo replay started for {dataset_root.name}; waiting for validation metrics"
+    state.log("info", f"Started MuJoCo replay pid={process.pid} dataset={dataset_root}")
+    _start_replay_output_reader(state, process)
+
+
+def _start_real_replay(state: GatewayState) -> None:
+    if state.replay_process is not None and state.replay_process.poll() is None:
+        state.replay.message = "Replay process is already running"
+        return
+
+    dataset_root = _require_mujoco_validation(state)
+    command = _real_replay_command(state, dataset_root)
+    process = subprocess.Popen(
+        command,
+        cwd=state.repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=_tool_env(state.repo_root),
+        start_new_session=True,
+    )
+    state.replay_process = process
+    state.replay_process_kind = "real"
+    state.replay_started_at_s = time.monotonic()
+    state.selected_replay_root = dataset_root
+    state.replay.state = "replaying"
+    state.replay.safety = "active"
+    state.replay.pid = process.pid
+    state.replay.frameIndex = 0
+    state.replay.datasetRoot = str(dataset_root)
+    state.replay.dataset = str(dataset_root)
+    state.replay.message = f"Real robot replay started for episode {state.replay.episode} from {dataset_root.name}"
+    state.log("warn", f"Started real robot replay pid={process.pid} dataset={dataset_root} episode={state.replay.episode}")
+    _start_replay_output_reader(state, process)
+
+
+def _start_dry_run_replay(state: GatewayState) -> None:
+    dataset_root = _require_replay_dataset(state)
+    state.replay.state = "dry_run"
+    state.replay.safety = "ready"
+    state.replay.frameIndex = 0
+    state.replay.message = (
+        f"Dry-run started for episode {state.replay.episode} from {dataset_root.name}; "
+        f"{_mujoco_recommendation_suffix(state, dataset_root)}"
+    )
+    state.log("info", state.replay.message)
+
+
+def _abort_replay(state: GatewayState) -> None:
+    process = state.replay_process
+    replay_kind = state.replay_process_kind or "replay"
+    if process is not None and process.poll() is None:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=1.0)
+        state.log("warn", f"Terminated {replay_kind} replay pid={process.pid}")
+    if replay_kind == "mujoco" and state.replay.mujocoValidation:
+        state.replay.mujocoValidation["status"] = "failed"
+        state.replay.mujocoValidation["message"] = "MuJoCo validation aborted before completion"
+        state.replay.mujocoValidation["updatedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    state.replay_process = None
+    state.replay_process_kind = ""
+    state.replay_started_at_s = None
+    state.replay.state = "aborted"
+    state.replay.safety = "locked"
+    state.replay.pid = None
+    state.replay.message = "Replay aborted; command stream stopped"
 
 
 def _stop_recorder(state: GatewayState, action: str) -> None:
@@ -1831,7 +2809,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.NOT_FOUND, {"error": "no dataset available"})
                     return
                 try:
-                    timeline = _read_dataset_timeline(self.server.state, dataset_root)
+                    requested_episode = query.get("episode", [None])[0]
+                    episode = int(requested_episode) if requested_episode not in (None, "") else None
+                    timeline = _read_dataset_timeline(self.server.state, dataset_root, episode)
                 except Exception as exc:  # noqa: BLE001
                     _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                     return
@@ -1866,28 +2846,27 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/replay/preflight":
-                    self.server.state.replay.state = "armed"
-                    self.server.state.replay.safety = "ready"
-                    self.server.state.replay.message = "Replay preflight placeholder passed"
-                    self.server.state.log("info", "Replay preflight placeholder passed")
+                    _preflight_replay(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/replay/select-dataset":
                     _select_replay_dataset(self.server.state, query.get("path", [""])[0])
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
+                if path == "/api/replay/select-episode":
+                    _select_replay_episode(self.server.state, query.get("episode", [""])[0])
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
                 if path == "/api/replay/start":
-                    self.server.state.replay.state = "dry_run"
-                    self.server.state.replay.safety = "ready"
-                    self.server.state.replay.message = "Dry-run replay placeholder started"
-                    self.server.state.log("info", "Dry-run replay placeholder started")
+                    _start_dry_run_replay(self.server.state)
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/replay/start-mujoco":
+                    _start_mujoco_replay(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/replay/start-real":
-                    self.server.state.replay.state = "replaying"
-                    self.server.state.replay.safety = "active"
-                    self.server.state.replay.message = "Real robot replay placeholder started"
-                    self.server.state.log("warn", "Real robot replay placeholder started")
+                    _start_real_replay(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/calibration/run":
@@ -1912,6 +2891,19 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     )
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
+                if path == "/api/processing/traj-gen":
+                    requested = (query.get("path", [""])[0] or "").strip()
+                    dataset_root = _resolve_known_dataset(self.server.state, requested)
+                    if dataset_root is None:
+                        _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
+                        return
+                    try:
+                        _queue_traj_gen(self.server.state, dataset_root)
+                    except NotImplementedError as exc:
+                        _json_response(self, HTTPStatus.NOT_IMPLEMENTED, {"error": str(exc)})
+                        return
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
                 if path == "/api/processing/datasets-root":
                     requested = (query.get("path", [""])[0] or "").strip()
                     if not requested:
@@ -1933,11 +2925,13 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     self.server.state.log("info", f"Datasets root changed to {resolved}")
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
+                if path == "/api/annotation/save":
+                    _save_annotation(self.server.state, _read_json_body(self))
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
                 if path == "/api/replay/abort":
-                    self.server.state.replay.state = "aborted"
-                    self.server.state.replay.safety = "locked"
-                    self.server.state.replay.message = "Replay placeholder aborted"
-                    self.server.state.log("warn", "Replay placeholder aborted")
+                    _abort_replay(self.server.state)
+                    self.server.state.log("warn", "Replay aborted")
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
         except Exception as exc:  # noqa: BLE001
@@ -1955,7 +2949,7 @@ class DataCollectionGuiServer(ThreadingHTTPServer):
         self.state = state
 
 
-def make_state(repo_root: Path, config_path: Path, datasets_root: Path | None) -> GatewayState:
+def make_state(repo_root: Path, config_path: Path, datasets_root: Path | None = None) -> GatewayState:
     resolved_root = repo_root.resolve()
     resolved_config = config_path if config_path.is_absolute() else resolved_root / config_path
     config = _load_yaml(resolved_config)
@@ -1972,6 +2966,7 @@ def make_state(repo_root: Path, config_path: Path, datasets_root: Path | None) -
         datasets_root=resolved_datasets_root,
         devices=_device_statuses(config),
     )
+    state.replay.mujocoValidation = _new_mujoco_validation(state)
     state.log("info", f"Loaded handheld config {resolved_config}")
     if resolved_datasets_root is not None:
         state.log("info", f"Scanning datasets under {resolved_datasets_root}")
