@@ -248,4 +248,5 @@ services:
       DEVICE: cuda
       CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
       TEST_TYPE: single_gpu
+      SDL_VIDEODRIVER: dummy
     gpus: all

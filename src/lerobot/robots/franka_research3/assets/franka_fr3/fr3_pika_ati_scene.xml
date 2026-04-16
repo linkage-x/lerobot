@@ -22,8 +22,8 @@
     <light name="fill_light" pos="-0.6 0.4 1.2" dir="0.2 -0.1 -1" directional="true" diffuse="0.35 0.35 0.35" />
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" />
 
-    <camera name="side_cam" pos="0.05 0.95 0.62" euler="1.78 3.1415926 0" fovy="58"/>
-    <camera name="third_person_cam" pos="1.25 -0.2 0.95" euler="1.02 1.5707963 1.15" fovy="52"/>
+    <camera name="side_cam" pos="0.50 0.80 0.40" xyaxes="-1 0 0 0 -0.5 0.866" fovy="42"/>
+    <camera name="third_person_cam" pos="1.20 0.00 0.80" xyaxes="0 1 0 -0.866 0 0.5" fovy="42"/>
 
     <body name="table_body" pos="0.52 0 0.38">
       <geom name="table" type="box" size="0.34 0.46 0.02" material="table_surface" friction="1.2 0.05 0.01"/>

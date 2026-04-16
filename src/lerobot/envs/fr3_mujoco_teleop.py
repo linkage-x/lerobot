@@ -136,6 +136,25 @@ def update_passive_viewer_markers(mujoco, viewer: ViewerHandle, info: dict[str, 
         scene.ngeom += 1
 
 
+def render_camera_grid(camera_obs: dict[str, np.ndarray], width: int, height: int) -> np.ndarray:
+    """Assemble camera observations into a 2x2 grid as an RGB numpy array."""
+    keys = ["third_person", "side", "wrist"]
+    cells: list[list[np.ndarray]] = [[], []]
+    for i, key in enumerate(keys):
+        frame = camera_obs.get(key)
+        if frame is None:
+            frame = np.zeros((height, width, 3), dtype=np.uint8)
+        else:
+            frame = np.asarray(frame, dtype=np.uint8)
+        row = i // 2
+        cells[row].append(frame)
+    if len(keys) < 4:
+        cells[1].append(np.zeros((height, width, 3), dtype=np.uint8))
+    top_row = np.hstack(cells[0])
+    bottom_row = np.hstack(cells[1])
+    return np.vstack([top_row, bottom_row])
+
+
 def run_sim_teleop_loop(
     *,
     env,
@@ -145,6 +164,9 @@ def run_sim_teleop_loop(
     duration_s: float | None = None,
     max_steps: int | None = None,
     marker_style: MarkerStyle | None = None,
+    render_cameras: bool = False,
+    camera_width: int = 640,
+    camera_height: int = 480,
 ) -> dict[str, Any]:
     marker_style = marker_style or MarkerStyle()
     start = time.perf_counter()
@@ -155,6 +177,81 @@ def run_sim_teleop_loop(
         with viewer.lock():
             update_passive_viewer_markers(env._mujoco, viewer, info, marker_style)
         viewer.sync()
+
+    http_server = None
+    screen = None
+
+    if render_cameras:
+        import http.server
+        import os
+        import socketserver
+        import threading
+
+        out_dir = "/tmp/camera_stream"
+        os.makedirs(out_dir, exist_ok=True)
+
+        with open(os.path.join(out_dir, "index.html"), "w") as f:
+            f.write(
+                """<!DOCTYPE html>
+<html>
+<head>
+  <title>Camera Stream (2x2)</title>
+  <style>
+    body { margin: 0; background: #000; display: flex; align-items: center; justify-content: center; height: 100vh; overflow: hidden; }
+    canvas { max-width: 100vw; max-height: 100vh; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <script>
+    var canvas = document.getElementById('c');
+    var ctx = canvas.getContext('2d');
+    var img = new Image();
+    var w = 0, h = 0;
+
+    img.onload = function() {
+      if (w !== img.width || h !== img.height) {
+        w = img.width;
+        h = img.height;
+        canvas.width = w;
+        canvas.height = h;
+      }
+      ctx.drawImage(img, 0, 0, w, h);
+    };
+
+    function update() {
+      img.src = 'grid.jpg?t=' + Date.now();
+    }
+    update();
+    setInterval(update, 50);
+  </script>
+</body>
+</html>"""
+            )
+
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(directory=out_dir, *args, **kwargs)
+
+            def end_headers(self):
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.send_header("Expires", "0")
+                super().end_headers()
+
+        class UniqueTCPServer(socketserver.TCPServer):
+            allow_reuse_address = True
+
+        http_server = UniqueTCPServer(("", 18765), Handler)
+        threading.Thread(target=http_server.serve_forever, daemon=True).start()
+        print("Camera stream: http://localhost:18765/ (2x2 grid)")
+
+        try:
+            import pygame
+            pygame.init()
+            screen = pygame.display.set_mode((camera_width * 2, camera_height * 2))
+            pygame.display.set_caption("Camera Observations (2x2)")
+        except Exception:
+            screen = None
 
     while True:
         if viewer is not None and not viewer.is_running():
@@ -173,6 +270,30 @@ def run_sim_teleop_loop(
                 update_passive_viewer_markers(env._mujoco, viewer, info, marker_style)
             viewer.sync()
 
+        if render_cameras and info.get("camera_obs"):
+            import cv2
+            import os
+            import tempfile
+
+            grid = render_camera_grid(info["camera_obs"], camera_width, camera_height)
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".jpg", dir="/tmp/camera_stream")
+            os.close(tmp_fd)
+            cv2.imwrite(tmp_path, cv2.cvtColor(grid, cv2.COLOR_RGB2BGR))
+            os.replace(tmp_path, os.path.join("/tmp/camera_stream", "grid.jpg"))
+
+            if screen is not None:
+                try:
+                    import pygame
+                    surf = pygame.surfarray.make_surface(np.transpose(grid, (1, 0, 2)))
+                    screen.fill((0, 0, 0))
+                    screen.blit(surf, (0, 0))
+                    pygame.display.flip()
+                    for event in pygame.event.get():
+                        if event.type == pygame.QUIT:
+                            screen = None
+                except Exception:
+                    screen = None
+
         steps += 1
         if terminated or truncated:
             break
@@ -181,6 +302,12 @@ def run_sim_teleop_loop(
         sleep_s = max(1.0 / fps - dt_s, 0.0)
         if sleep_s > 0.0:
             time.sleep(sleep_s)
+
+    if http_server is not None:
+        http_server.shutdown()
+    if screen is not None:
+        import pygame
+        pygame.quit()
 
     info = dict(info)
     info["loop_steps"] = steps

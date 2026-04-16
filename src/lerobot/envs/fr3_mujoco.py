@@ -77,6 +77,7 @@ class FR3MujocoEnvConfig:
         }
     )
     scene_geom_names: tuple[str, ...] = ("floor", "table", "workspace_object")
+    camera_fovy: float = 42.0
     camera_height: int = 256
     camera_width: int = 256
     enable_cameras: bool = False
@@ -286,6 +287,15 @@ class FR3MujocoEnv(gym.Env):
 
         self._set_joint_state(self._initial_joint_positions)
         self._set_gripper_command(self._last_gripper)
+
+        if self.cfg.enable_cameras:
+            self._renderer = self._mujoco.Renderer(
+                self.model,
+                height=self.cfg.camera_height,
+                width=self.cfg.camera_width,
+            )
+        else:
+            self._renderer = None
 
     @staticmethod
     def _import_mujoco():
@@ -585,6 +595,8 @@ class FR3MujocoEnv(gym.Env):
             "ee_pose": ee_pose,
             "target_frame_name": self.cfg.target_frame_name,
         }
+        if self.cfg.enable_cameras:
+            info["camera_obs"] = self._build_camera_obs()
         info.update(self._build_visualization_info())
         return info
 
