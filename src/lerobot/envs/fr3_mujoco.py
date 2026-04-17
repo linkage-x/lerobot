@@ -84,7 +84,7 @@ class FR3MujocoEnvConfig:
     initial_joint_positions: tuple[float, ...] = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
     initial_gripper: float = 1.0
     workspace_min: tuple[float, float, float] = (0.2, -0.6, 0.05)
-    workspace_max: tuple[float, float, float] = (0.9, 0.6, 0.8)
+    workspace_max: tuple[float, float, float] = (0.9, 0.6, 1.2)
     max_target_delta_pos: tuple[float, float, float] | None = None
     max_target_delta_rot: tuple[float, float, float] | None = None
     use_otg: bool = True
@@ -396,6 +396,15 @@ class FR3MujocoEnv(gym.Env):
         window_s = self.cfg.teleop_dt if duration_s is None else max(float(duration_s), 0.0)
         otg_steps = max(1, int(np.ceil(window_s / self.cfg.otg_dt)))
         sender_steps = max(1, int(np.ceil(window_s / self.cfg.otg_async_dt)))
+
+        # Guard: if current and target joints are near-identical (within 1e-6 rad across
+        # all DOFs), skip Ruckig to avoid a degenerate time-synchronization failure.
+        # This can happen when the physics state drifts slightly from _otg_target_joints
+        # due to contact resolution, floating-point rounding, or repeated OTG steps.
+        current_joints = self._get_joint_positions()
+        if np.allclose(current_joints, self._otg_target_joints, atol=1e-6, rtol=0):
+            self._set_joint_state(self._otg_target_joints)
+            return otg_steps, sender_steps
 
         for _ in range(otg_steps):
             current_joints = self._get_joint_positions()
