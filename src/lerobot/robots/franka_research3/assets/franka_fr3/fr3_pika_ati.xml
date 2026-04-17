@@ -67,6 +67,7 @@
   </asset>
 
   <worldbody>
+    <body name="mount" pos="0 0 0.40">
     <body name="base" childclass="fr3">
       <body name="fr3_link0">
         <geom name="fr3_link0_visual" type="mesh" mesh="link0_0" material="black" class="visual"/>
@@ -167,6 +168,7 @@
             </body>
           </body>
         </body>
+      </body>
       </body>
     </body>
   </worldbody>

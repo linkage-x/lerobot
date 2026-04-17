@@ -19,6 +19,16 @@ def test_local_envhub_wrapper_exists():
     assert wrapper_path.is_file()
 
 
+def test_scene_mount_body_lifts_robot_base_to_table_height():
+    env = FR3MujocoEnv()
+    try:
+        mount_body_id = env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_BODY, "mount")
+        assert mount_body_id >= 0
+        np.testing.assert_allclose(env.model.body_pos[mount_body_id], np.array([0.0, 0.0, 0.40]), atol=1e-9)
+    finally:
+        env.close()
+
+
 def test_reset_info_exposes_target_tcp_marker_state_and_named_cameras():
     env = FR3MujocoEnv()
     try:
