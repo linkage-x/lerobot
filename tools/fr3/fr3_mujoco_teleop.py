@@ -17,11 +17,12 @@ from lerobot.teleoperators.spacemouse.teleop_spacemouse import SpaceMouseTeleop
 _D435I_COLOR_FOVY_DEG = 42.0
 _D435I_COLOR_WIDTH = 640
 _D435I_COLOR_HEIGHT = 480
+_TELEOP_TRACE_WINDOW_FRAMES = 8
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run FR3 MuJoCo teleoperation with SpaceMouse and marker viewer.")
-    parser.add_argument("--fps", type=int, default=120)
+    parser.add_argument("--fps", type=int, default=200)
     parser.add_argument("--duration-s", type=float, default=None)
     parser.add_argument("--device-id", type=int, default=0)
     parser.add_argument("--no-viewer", action="store_true")
@@ -31,9 +32,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--camera-height", type=int, default=_D435I_COLOR_HEIGHT)
     parser.add_argument("--tool-mode", choices=[mode.value for mode in SpaceMouseToolMode], default="binary")
     parser.add_argument("--motion-enable-button", choices=[button.value for button in SpaceMouseEnableButton], default="none")
-    parser.add_argument("--enable-rotation", action="store_true")
-    parser.add_argument("--translation-scale", type=float, default=0.000615)
-    parser.add_argument("--rotation-scale", type=float, default=0.000648)
+    parser.add_argument(
+        "--disable-rotation",
+        dest="enable_rotation",
+        action="store_false",
+        help="Disable end-effector rotation control (default).",
+    )
+    parser.add_argument(
+        "--enable-rotation",
+        dest="enable_rotation",
+        action="store_true",
+        help="Enable end-effector rotation control.",
+    )
+    parser.set_defaults(enable_rotation=False)
+    parser.add_argument("--translation-scale", type=float, default=0.001845)
+    parser.add_argument("--rotation-scale", type=float, default=0.001944)
     parser.add_argument("--scale-x", type=float, default=None)
     parser.add_argument("--scale-y", type=float, default=None)
     parser.add_argument("--scale-z", type=float, default=None)
@@ -120,6 +133,50 @@ def configure_viewer_camera(mujoco, viewer, env: FR3MujocoEnv, viewer_camera: st
     return camera_name
 
 
+class TransitionTraceTeleopReader:
+    def __init__(self, teleop: SpaceMouseTeleop, *, window_frames: int = _TELEOP_TRACE_WINDOW_FRAMES):
+        self._teleop = teleop
+        self._window_frames = max(int(window_frames), 0)
+        self._frame_idx = 0
+        self._last_enabled = False
+        self._trace_countdown = 0
+        self._trace_phase = "idle"
+
+    def get_action(self) -> dict[str, object]:
+        action = self._teleop.get_action()
+        enabled = bool(action.get("enabled", False))
+
+        if enabled and not self._last_enabled:
+            self._trace_countdown = self._window_frames
+            self._trace_phase = "start"
+        elif not enabled and self._last_enabled:
+            self._trace_countdown = self._window_frames
+            self._trace_phase = "end"
+
+        should_log = enabled or self._last_enabled or self._trace_countdown > 0
+        if should_log:
+            print(
+                pformat(
+                    {
+                        "trace": "teleop_transition",
+                        "phase": self._trace_phase,
+                        "frame": self._frame_idx,
+                        "enabled": enabled,
+                        "action": action,
+                    }
+                )
+            )
+
+        if self._trace_countdown > 0:
+            self._trace_countdown -= 1
+            if self._trace_countdown == 0 and not enabled:
+                self._trace_phase = "idle"
+
+        self._last_enabled = enabled
+        self._frame_idx += 1
+        return action
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     teleop = SpaceMouseTeleop(build_teleop_config(args))
@@ -147,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         teleop.connect()
+        traced_teleop = TransitionTraceTeleopReader(teleop)
         selected_camera_name = None
         if not args.no_viewer:
             import mujoco.viewer
@@ -156,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
             selected_camera_name = configure_viewer_camera(mujoco, viewer, env, args.viewer_camera)
         info = run_sim_teleop_loop(
             env=env,
-            teleop=teleop,
+            teleop=traced_teleop,
             fps=args.fps,
             viewer=viewer,
             duration_s=args.duration_s,

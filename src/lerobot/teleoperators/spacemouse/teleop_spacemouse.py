@@ -49,6 +49,9 @@ class SpaceMouseTeleop(Teleoperator):
         self.config = config
         self._driver = None
         self._is_connected = False
+        self._motion_active = False
+        self._last_active_motion_data = np.zeros(6, dtype=np.float64)
+        self._peak_active_motion_data = np.zeros(6, dtype=np.float64)
         self._last_gripper = float(np.clip(config.initial_gripper, 0.0, 1.0))
         self._last_gripper_update = 0.0
         self._translation_bias = np.zeros(3, dtype=np.float64)
@@ -248,27 +251,89 @@ class SpaceMouseTeleop(Teleoperator):
         self._last_gripper = float(np.clip(normalized_position, 0.0, 1.0))
         self._last_gripper_update = time.perf_counter()
 
+    def _should_truncate_release_decay(self, data: np.ndarray, threshold: np.ndarray) -> bool:
+        previous = self._last_active_motion_data
+        previous_abs = np.abs(previous)
+        if not np.any(previous_abs > 0.0):
+            return False
+
+        current_abs = np.abs(data)
+        peak_abs = np.maximum(self._peak_active_motion_data, previous_abs)
+        dominant_axis = int(np.argmax(peak_abs))
+        dominant_peak = peak_abs[dominant_axis]
+        if dominant_peak < threshold[dominant_axis] * 5.0:
+            return False
+
+        active_axes = previous_abs > 0.0
+        same_direction_or_zero = np.all(
+            (np.sign(data[active_axes]) == np.sign(previous[active_axes])) | np.isclose(current_abs[active_axes], 0.0)
+        )
+        if not same_direction_or_zero:
+            return False
+
+        previous_norm = float(np.linalg.norm(previous_abs[active_axes]))
+        current_norm = float(np.linalg.norm(current_abs[active_axes]))
+        dominant_axis_was_plateaued = previous_abs[dominant_axis] >= dominant_peak * 0.8
+        dominant_axis_collapsed = (
+            current_abs[dominant_axis] <= previous_abs[dominant_axis] * 0.6
+            and current_abs[dominant_axis] <= dominant_peak * 0.4
+        )
+        overall_energy_collapsed = current_norm <= previous_norm * 0.6
+        return bool(dominant_axis_was_plateaued and dominant_axis_collapsed and overall_energy_collapsed)
+
+    def _update_release_decay_state(self, *, motion_enabled: bool, data: np.ndarray | None = None) -> None:
+        if not motion_enabled or data is None:
+            self._last_active_motion_data.fill(0.0)
+            self._peak_active_motion_data.fill(0.0)
+            return
+
+        current = np.asarray(data, dtype=np.float64)
+        current_abs = np.abs(current)
+        previous = self._last_active_motion_data
+        previous_abs = np.abs(previous)
+        active_axes = previous_abs > 0.0
+        continuing_same_direction = bool(
+            np.any(active_axes)
+            and np.all((np.sign(current[active_axes]) == np.sign(previous[active_axes])) | np.isclose(current_abs[active_axes], 0.0))
+        )
+        if continuing_same_direction:
+            self._peak_active_motion_data = np.maximum(self._peak_active_motion_data, current_abs)
+        else:
+            self._peak_active_motion_data = current_abs.copy()
+        self._last_active_motion_data = current
+
     @check_if_not_connected
     def get_action(self) -> RobotAction:
         reading = self._driver.poll()
         if reading is None:
+            self._motion_active = False
+            self._update_release_decay_state(motion_enabled=False)
             return self._zero_action()
 
         data = self._reading_motion_data(reading)
         threshold = self._motion_threshold_vector()
         scale = np.concatenate((self.translation_scale_vector, self.rotation_scale_vector))
-        active_mask = np.abs(data) >= threshold
+        abs_data = np.abs(data)
+        active_mask = abs_data >= threshold
         data = np.where(active_mask, data, 0.0)
-        motion_detected = bool(np.any(active_mask))
+        enter_mask = abs_data >= (threshold * float(self.config.motion_enable_enter_scale))
+        exit_mask = abs_data >= (threshold * float(self.config.motion_enable_exit_scale))
+        motion_detected = bool(np.any(exit_mask if self._motion_active else enter_mask))
         if self.config.motion_enable_button == SpaceMouseEnableButton.LEFT:
             motion_enabled = motion_detected and bool(reading.buttons[0])
         elif self.config.motion_enable_button == SpaceMouseEnableButton.RIGHT:
             motion_enabled = motion_detected and bool(reading.buttons[1])
         else:
             motion_enabled = motion_detected
+        if motion_enabled and self._should_truncate_release_decay(data, threshold):
+            motion_enabled = False
+            motion_detected = False
+            data = np.zeros_like(data)
+        self._motion_active = motion_detected
 
         if not motion_enabled:
             self._update_gripper(*reading.buttons)
+            self._update_release_decay_state(motion_enabled=False)
             return self._zero_action()
 
         target = data * scale
@@ -276,6 +341,7 @@ class SpaceMouseTeleop(Teleoperator):
             target[3:] = 0.0
 
         self._update_gripper(*reading.buttons)
+        self._update_release_decay_state(motion_enabled=True, data=data)
         return {
             "enabled": True,
             "target_x": float(target[0]),
@@ -301,5 +367,8 @@ class SpaceMouseTeleop(Teleoperator):
         finally:
             self._driver = None
             self._is_connected = False
+            self._motion_active = False
+            self._last_active_motion_data.fill(0.0)
+            self._peak_active_motion_data.fill(0.0)
             self._translation_bias = np.zeros(3, dtype=np.float64)
             self._rotation_bias = np.zeros(3, dtype=np.float64)

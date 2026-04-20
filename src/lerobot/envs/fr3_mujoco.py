@@ -77,12 +77,13 @@ class FR3MujocoEnvConfig:
         }
     )
     scene_geom_names: tuple[str, ...] = ("floor", "table", "workspace_object")
-    camera_fovy: float = 42.0
+    camera_fovy: float = 60.0
     camera_height: int = 256
     camera_width: int = 256
     enable_cameras: bool = False
     initial_joint_positions: tuple[float, ...] = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
     initial_gripper: float = 1.0
+    gripper_sim_steps: int = 640
     workspace_min: tuple[float, float, float] = (0.2, -0.6, 0.05)
     workspace_max: tuple[float, float, float] = (0.9, 0.6, 1.2)
     max_target_delta_pos: tuple[float, float, float] | None = None
@@ -152,9 +153,9 @@ class _MujocoArmKinematics:
         guess = np.clip(np.asarray(current_joint_positions, dtype=np.float64), self._joint_lower, self._joint_upper)
         jac_pos = np.zeros((3, self._model.nv), dtype=np.float64)
         jac_rot = np.zeros((3, self._model.nv), dtype=np.float64)
-        damping = 1e-4
+        damping = 0.3
 
-        for _ in range(128):
+        for _ in range(200):
             self._set_arm_qpos(guess)
             current_pos = np.asarray(self._data.xpos[self._target_body_id], dtype=np.float64)
             current_rot = np.asarray(self._data.xmat[self._target_body_id], dtype=np.float64).reshape(3, 3)
@@ -239,9 +240,37 @@ class FR3MujocoEnv(gym.Env):
             self._gripper_qvel_indices[key] = int(self.model.jnt_dofadr[joint_id])
             limits = self.model.jnt_range[joint_id].astype(np.float64)
             self._gripper_joint_limits[key] = (float(limits[0]), float(limits[1]))
+        self._gripper_actuator_id = self._mujoco.mj_name2id(
+            self.model,
+            self._mujoco.mjtObj.mjOBJ_ACTUATOR,
+            "pika_gripper_actuator",
+        )
+        if self._gripper_actuator_id < 0:
+            raise ValueError("Actuator 'pika_gripper_actuator' not found in MuJoCo model.")
+        self._gripper_ctrl_range = self.model.actuator_ctrlrange[self._gripper_actuator_id].astype(np.float64)
 
         self._workspace_min = np.asarray(self.cfg.workspace_min, dtype=np.float64)
         self._workspace_max = np.asarray(self.cfg.workspace_max, dtype=np.float64)
+        self._gripper_base_body_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_BODY, "gripper_base")
+        self._gripper_left_body_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_BODY, "gripper_left_link")
+        self._gripper_right_body_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_BODY, "gripper_right_link")
+        self._link7_body_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_BODY, "fr3_link7")
+        self._table_geom_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_GEOM, "table")
+        self._workspace_object_geom_id = self._mujoco.mj_name2id(
+            self.model, self._mujoco.mjtObj.mjOBJ_GEOM, "workspace_object"
+        )
+        self._gripper_left_pad_geom_id = self._mujoco.mj_name2id(
+            self.model, self._mujoco.mjtObj.mjOBJ_GEOM, "gripper_left_pad_collision"
+        )
+        self._gripper_right_pad_geom_id = self._mujoco.mj_name2id(
+            self.model, self._mujoco.mjtObj.mjOBJ_GEOM, "gripper_right_pad_collision"
+        )
+        self._gripper_left_geom_id = self._mujoco.mj_name2id(
+            self.model, self._mujoco.mjtObj.mjOBJ_GEOM, "gripper_left_collision"
+        )
+        self._gripper_right_geom_id = self._mujoco.mj_name2id(
+            self.model, self._mujoco.mjtObj.mjOBJ_GEOM, "gripper_right_collision"
+        )
         self._prev_enabled = False
         self._reference_pose: np.ndarray | None = None
         self._last_command_pose: np.ndarray | None = None
@@ -285,7 +314,7 @@ class FR3MujocoEnv(gym.Env):
         )
         self.observation_space = spaces.Dict(observation_dict)
 
-        self._set_joint_state(self._initial_joint_positions)
+        self._reset_joint_state(self._initial_joint_positions)
         self._set_gripper_command(self._last_gripper)
 
         if self.cfg.enable_cameras:
@@ -343,6 +372,43 @@ class FR3MujocoEnv(gym.Env):
         self._mujoco.mj_forward(self.model, self.data)
         self._update_visualization_state()
 
+    def _reset_joint_state(self, joint_positions: np.ndarray) -> None:
+        """Direct qpos write for initialization/reset (no physics, matches prior _set_joint_state behavior).
+
+        Used only when placing the arm at startup or after reset — not during normal stepping.
+        """
+        arm_positions = np.asarray(joint_positions, dtype=np.float64)
+        previous_qpos = self.data.qpos.copy()
+        previous_qvel = self.data.qvel.copy()
+        previous_ctrl = self.data.ctrl.copy()
+
+        def apply_arm_state(candidate: np.ndarray) -> bool:
+            self.data.qpos[:] = previous_qpos
+            self.data.qvel[:] = previous_qvel
+            self.data.ctrl[:] = previous_ctrl
+            self.data.qpos[self._qpos_indices] = candidate
+            self.data.qvel[self._qvel_indices] = 0.0
+            if self._actuator_ids:
+                self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = candidate
+            self._mujoco.mj_forward(self.model, self.data)
+            return not self._has_gripper_table_penetration()
+
+        if not apply_arm_state(arm_positions):
+            low, high = 0.0, 1.0
+            best = np.asarray(previous_qpos[self._qpos_indices], dtype=np.float64).copy()
+            for _ in range(12):
+                mid = 0.5 * (low + high)
+                candidate = np.asarray(previous_qpos[self._qpos_indices], dtype=np.float64) + mid * (
+                    arm_positions - np.asarray(previous_qpos[self._qpos_indices], dtype=np.float64)
+                )
+                if apply_arm_state(candidate):
+                    best = candidate.copy()
+                    low = mid
+                else:
+                    high = mid
+            apply_arm_state(best)
+        self._update_visualization_state()
+
     def _gripper_joint_targets_from_command(self, gripper_command: float) -> dict[str, float]:
         command = float(np.clip(gripper_command, 0.0, 1.0))
         targets: dict[str, float] = {}
@@ -356,7 +422,33 @@ class FR3MujocoEnv(gym.Env):
             targets[key] = float(closed + command * (open_target - closed))
         return targets
 
-    def _set_gripper_command(self, gripper_command: float) -> None:
+    def _gripper_ctrl_from_command(self, gripper_command: float) -> float:
+        command = float(np.clip(gripper_command, 0.0, 1.0))
+        lower, upper = self._gripper_ctrl_range
+        return float(upper + command * (lower - upper))
+
+    def _set_gripper_command(self, gripper_command: float, *, simulate: bool = False) -> None:
+        self.data.ctrl[self._gripper_actuator_id] = self._gripper_ctrl_from_command(gripper_command)
+        if simulate:
+            frozen_arm_qpos = np.asarray(self.data.qpos[self._qpos_indices], dtype=np.float64).copy()
+            if self._actuator_ids:
+                self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = frozen_arm_qpos
+            self.data.qvel[self._qvel_indices] = 0.0
+            self._mujoco.mj_forward(self.model, self.data)
+            for _ in range(max(int(self.cfg.gripper_sim_steps), 1)):
+                self.data.qpos[self._qpos_indices] = frozen_arm_qpos
+                self.data.qvel[self._qvel_indices] = 0.0
+                if self._actuator_ids:
+                    self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = frozen_arm_qpos
+                self._mujoco.mj_step(self.model, self.data)
+            self.data.qpos[self._qpos_indices] = frozen_arm_qpos
+            self.data.qvel[self._qvel_indices] = 0.0
+            if self._actuator_ids:
+                self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = frozen_arm_qpos
+            self._mujoco.mj_forward(self.model, self.data)
+            self._update_visualization_state()
+            return
+
         targets = self._gripper_joint_targets_from_command(gripper_command)
         for key, qpos_index in self._gripper_joint_indices.items():
             self.data.qpos[qpos_index] = targets[key]
@@ -369,6 +461,35 @@ class FR3MujocoEnv(gym.Env):
             key: float(self.data.qpos[qpos_index])
             for key, qpos_index in self._gripper_joint_indices.items()
         }
+
+    def _has_gripper_table_penetration(self) -> bool:
+        if self._table_geom_id < 0:
+            return False
+        guard_geom_ids = {
+            geom_id
+            for geom_id in (self._gripper_left_pad_geom_id, self._gripper_right_pad_geom_id)
+            if geom_id >= 0
+        }
+        if not guard_geom_ids:
+            guard_geom_ids = {
+                geom_id
+                for geom_id in (self._gripper_left_geom_id, self._gripper_right_geom_id)
+                if geom_id >= 0
+            }
+        if not guard_geom_ids:
+            return False
+        for contact_id in range(int(self.data.ncon)):
+            contact = self.data.contact[contact_id]
+            if float(contact.dist) >= -1e-6:
+                continue
+            geom1 = int(contact.geom1)
+            geom2 = int(contact.geom2)
+            if self._table_geom_id not in (geom1, geom2):
+                continue
+            other_geom = geom2 if geom1 == self._table_geom_id else geom1
+            if other_geom in guard_geom_ids:
+                return True
+        return False
 
     def _get_joint_positions(self) -> np.ndarray:
         return np.asarray(self.data.qpos[self._qpos_indices], dtype=np.float64).copy()
@@ -410,6 +531,11 @@ class FR3MujocoEnv(gym.Env):
             current_joints = self._get_joint_positions()
             next_joints = self._otg.step(current_joints, self._otg_target_joints)
             self._set_joint_state(next_joints)
+
+        if self._step_count % 50 == 0:
+            final_joints = self._get_joint_positions()
+            err = np.linalg.norm(final_joints - self._otg_target_joints)
+            print(f"[DEBUG OTG] step={self._step_count} otg_steps={otg_steps} err={err:.6f} target[:3]={self._otg_target_joints[:3]} actual[:3]={final_joints[:3]}")
 
         return otg_steps, sender_steps
 
@@ -484,10 +610,9 @@ class FR3MujocoEnv(gym.Env):
             desired_pose[:3, 3] = np.clip(desired_pose[:3, 3], self._workspace_min, self._workspace_max)
         else:
             if self._hold_joint_target is None:
-                if self._prev_enabled and self._otg_target_joints is not None:
-                    self._hold_joint_target = self._otg_target_joints.copy()
-                else:
-                    self._hold_joint_target = self._get_joint_positions().copy()
+                # Freeze on the measured joint state at the moment teleop disables
+                # rather than the last planned OTG target, which may not have been reached.
+                self._hold_joint_target = self._get_joint_positions().copy()
             desired_pose = np.asarray(self._kinematics.forward_kinematics(self._hold_joint_target), dtype=np.float64)
             hold_current_joints = True
 
@@ -504,18 +629,28 @@ class FR3MujocoEnv(gym.Env):
 
         if hold_current_joints:
             target_joints = self._hold_joint_target.copy()
-        else:
-            target_joints = np.asarray(self._kinematics.inverse_kinematics(current_joints, desired_pose), dtype=np.float64)
-        target_joints = np.clip(target_joints, self._joint_lower, self._joint_upper)
-        if self._otg is not None:
-            self._otg_target_joints = target_joints.copy()
-            otg_steps, sender_steps = self._advance_otg_window(control_period_s)
-        else:
+            if self._step_count % 50 == 0:
+                err = np.linalg.norm(current_joints - target_joints)
+                print(f"[DEBUG HOLD] step={self._step_count} hold=True err={err:.6f} target[:3]={target_joints[:3]}")
+            target_joints = np.clip(target_joints, self._joint_lower, self._joint_upper)
+            # Disabled teleop should freeze on the cached hold target rather than
+            # continuously re-planning through OTG, which can introduce drift.
             self._set_joint_state(target_joints)
             otg_steps, sender_steps = 0, 0
+        else:
+            target_joints = np.asarray(self._kinematics.inverse_kinematics(current_joints, desired_pose), dtype=np.float64)
+            target_joints = np.clip(target_joints, self._joint_lower, self._joint_upper)
+            if self._otg is not None:
+                self._otg_target_joints = target_joints.copy()
+                otg_steps, sender_steps = self._advance_otg_window(control_period_s)
+            else:
+                self._set_joint_state(target_joints)
+                otg_steps, sender_steps = 0, 0
 
+        previous_gripper = self._last_gripper
         self._last_gripper = float(teleop_action["gripper"])
-        self._set_gripper_command(self._last_gripper)
+        if not np.isclose(previous_gripper, self._last_gripper):
+            self._set_gripper_command(self._last_gripper, simulate=True)
         self._last_command_pose = desired_pose.copy()
         if teleop_action["enabled"]:
             self._reference_pose = desired_pose.copy()
@@ -569,7 +704,7 @@ class FR3MujocoEnv(gym.Env):
                 self._joint_lower,
                 self._joint_upper,
             )
-        self._set_joint_state(target_joint_positions)
+        self._reset_joint_state(target_joint_positions)
         self._reset_otg_state(target_joint_positions)
         self._last_gripper = float(np.clip(self.cfg.initial_gripper, 0.0, 1.0))
         self._set_gripper_command(self._last_gripper)

@@ -33,7 +33,7 @@
       <geom type="box" pos="-0.28 -0.40 -0.34" size="0.03 0.03 0.34" material="table_surface"/>
     </body>
 
-    <body name="workspace_object_body" pos="0.45 -0.12 0.42">
+    <body name="workspace_object_body" pos="0.48 0.00 0.44">
       <freejoint/>
       <geom name="workspace_object" type="box" size="0.025 0.025 0.04" material="workspace_object_material" density="500" friction="1.8 0.05 0.01" condim="4" />
     </body>

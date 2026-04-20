@@ -161,6 +161,257 @@ def test_get_action_zeroes_subthreshold_axes_even_when_other_axis_is_active(monk
     teleop.disconnect()
 
 
+def test_get_action_requires_stricter_enter_deadband_before_latching_motion(monkeypatch):
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            threshold_x=0.02,
+            threshold_y=0.02,
+            threshold_z=0.02,
+            threshold_wx=0.04,
+            threshold_wy=0.04,
+            threshold_wz=0.04,
+            motion_enable_enter_scale=1.5,
+            motion_enable_exit_scale=1.0,
+            bias_sample_count=0,
+            move_time=0.0,
+        )
+    )
+    teleop.connect()
+    teleop._driver.readings.append(
+        SpaceMouseReading(
+            translation=[0.028, 0.0, 0.0],
+            rotation=[0.0, 0.0, 0.0],
+            buttons=(False, False),
+        )
+    )
+
+    action = teleop.get_action()
+
+    assert action["enabled"] is False
+    assert action["target_x"] == pytest.approx(0.0)
+    assert action["target_y"] == pytest.approx(0.0)
+    teleop.disconnect()
+
+
+def test_get_action_default_exit_deadband_stops_motion_as_soon_as_input_reenters_center(monkeypatch):
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            threshold_x=0.02,
+            threshold_y=0.02,
+            threshold_z=0.02,
+            threshold_wx=0.04,
+            threshold_wy=0.04,
+            threshold_wz=0.04,
+            motion_enable_enter_scale=1.5,
+            bias_sample_count=0,
+            move_time=0.0,
+        )
+    )
+    teleop.connect()
+    teleop._driver.readings.extend(
+        [
+            SpaceMouseReading(
+                translation=[0.03, 0.0, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+            SpaceMouseReading(
+                translation=[0.022, 0.0, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+        ]
+    )
+
+    entered = teleop.get_action()
+    released = teleop.get_action()
+
+    assert entered["enabled"] is True
+    assert released["enabled"] is False
+    teleop.disconnect()
+
+
+def test_get_action_hysteresis_keeps_motion_enabled_until_it_drops_below_exit_threshold(monkeypatch):
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            threshold_x=0.02,
+            threshold_y=0.02,
+            threshold_z=0.02,
+            threshold_wx=0.04,
+            threshold_wy=0.04,
+            threshold_wz=0.04,
+            motion_enable_enter_scale=1.5,
+            motion_enable_exit_scale=1.0,
+            bias_sample_count=0,
+            move_time=0.0,
+        )
+    )
+    teleop.connect()
+    teleop._driver.readings.extend(
+        [
+            SpaceMouseReading(
+                translation=[0.03, 0.0, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+            SpaceMouseReading(
+                translation=[0.022, 0.0, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+            SpaceMouseReading(
+                translation=[0.018, 0.0, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+        ]
+    )
+
+    entered = teleop.get_action()
+    latched = teleop.get_action()
+    released = teleop.get_action()
+
+    assert entered["enabled"] is True
+    assert latched["enabled"] is True
+    assert released["enabled"] is False
+    teleop.disconnect()
+
+
+def test_get_action_truncates_high_amplitude_release_decay(monkeypatch):
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            threshold_x=0.02,
+            threshold_y=0.02,
+            threshold_z=0.02,
+            threshold_wx=0.04,
+            threshold_wy=0.04,
+            threshold_wz=0.04,
+            bias_sample_count=0,
+            move_time=0.0,
+        )
+    )
+    teleop.connect()
+    teleop._driver.readings.extend(
+        [
+            SpaceMouseReading(
+                translation=[0.0, -0.30, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+            SpaceMouseReading(
+                translation=[0.0, -0.29, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+            SpaceMouseReading(
+                translation=[0.0, -0.08, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+        ]
+    )
+
+    first = teleop.get_action()
+    plateau = teleop.get_action()
+    released = teleop.get_action()
+
+    assert first["enabled"] is True
+    assert plateau["enabled"] is True
+    assert released["enabled"] is False
+    teleop.disconnect()
+
+
+def test_get_action_keeps_gradual_same_direction_reduction_enabled(monkeypatch):
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            threshold_x=0.02,
+            threshold_y=0.02,
+            threshold_z=0.02,
+            threshold_wx=0.04,
+            threshold_wy=0.04,
+            threshold_wz=0.04,
+            bias_sample_count=0,
+            move_time=0.0,
+        )
+    )
+    teleop.connect()
+    teleop._driver.readings.extend(
+        [
+            SpaceMouseReading(
+                translation=[0.0, -0.30, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+            SpaceMouseReading(
+                translation=[0.0, -0.27, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+            SpaceMouseReading(
+                translation=[0.0, -0.22, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+        ]
+    )
+
+    teleop.get_action()
+    second = teleop.get_action()
+    third = teleop.get_action()
+
+    assert second["enabled"] is True
+    assert third["enabled"] is True
+    teleop.disconnect()
+
+
+def test_get_action_truncates_release_decay_even_with_cross_axis_jitter(monkeypatch):
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            threshold_x=0.02,
+            threshold_y=0.02,
+            threshold_z=0.02,
+            threshold_wx=0.04,
+            threshold_wy=0.04,
+            threshold_wz=0.04,
+            bias_sample_count=0,
+            move_time=0.0,
+        )
+    )
+    teleop.connect()
+    teleop._driver.readings.extend(
+        [
+            SpaceMouseReading(
+                translation=[0.02, -0.30, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+            SpaceMouseReading(
+                translation=[0.02, -0.29, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+            SpaceMouseReading(
+                translation=[0.025, -0.08, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+        ]
+    )
+
+    teleop.get_action()
+    teleop.get_action()
+    released = teleop.get_action()
+
+    assert released["enabled"] is False
+    teleop.disconnect()
+
+
 def test_per_dof_scale_overrides_can_isolate_wz_rotation(monkeypatch):
     monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
     teleop = SpaceMouseTeleop(

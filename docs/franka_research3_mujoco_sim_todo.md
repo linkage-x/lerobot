@@ -81,11 +81,10 @@
 当前非阻塞告警：
 
 - 导入的 URDF 在中立位姿下报告了符合预期的自碰撞对
-- MuJoCo 在 URDF 导入过程中提示 `fr3_link0_visual` geom 名称重复
 
 ## 当前本地遥操作入口
 
-- `tools/fr3/fr3_mujoco_teleop.py` 用于运行基于 SpaceMouse 的 FR3 MuJoCo 遥操作
+`tools/fr3/fr3_mujoco_teleop.py` 用于运行基于 SpaceMouse 的 FR3 MuJoCo 遥操作。
 - `src/lerobot/envs/fr3_mujoco_teleop.py` 负责 target/TCP marker 更新辅助逻辑和无头遥操作循环
 - `src/lerobot/envs/fr3_mujoco.py` 现在会通过与硬件后端相同的 Ruckig OTG 路径推进遥操作 target，而不是直接跳到 IK 关节目标
 - `docker compose -f docker/docker-compose.yml --profile sim --profile teleop run --rm lerobot-fr3-sim-teleop` 只是进入本地交互式容器入口，默认不会自动启动遥操作脚本
@@ -97,11 +96,45 @@ docker compose -f docker/docker-compose.yml --profile sim --profile teleop run -
   -e DISPLAY=$DISPLAY \
   -e PYTHONPATH=/workspace/src \
   lerobot-fr3-sim-teleop \
-  python tools/fr3/fr3_mujoco_teleop.py
+  python tools/fr3/fr3_mujoco_teleop.py \
+  --enable-cameras --camera-width 640 --camera-height 480
 ```
 
 - 其中 `PYTHONPATH=/workspace/src` 是当前工作区源码导入所必需的；否则容器内已安装的旧版 `lerobot` 包可能找不到 `lerobot.envs.fr3_mujoco_teleop`
 - 当前本地 X11 viewer 的使用仍要求宿主机通过 `xhost +si:localuser:root` 允许容器中的 root 访问显示，并且当前 shell 需要已有可用的 `DISPLAY`
+
+### 2026-04-20 回归排查结论（已过时，见 2026-04-20 第二版更新）
+
+已确认"动一下 SpaceMouse 后末端继续下掉 / enabled 窗口 OTG 误差放大"是**当前工作区控制语义改动引入的回归**，不是 MuJoCo XML 资产本身的问题。
+
+已在用户实测中确认有效的回退项：
+
+- 将 `src/lerobot/envs/fr3_mujoco.py::_set_joint_state()` 恢复为旧的 `qpos/qvel + mj_forward` 语义，而不是 `data.ctrl + mj_step`
+- 将 `enabled=True` 的 target 生成路径恢复到基线实现
+- 将 `FR3MujocoEnvConfig.teleop_control_frequency` 恢复到 `200.0`
+- 将 `tools/fr3/fr3_mujoco_teleop.py` 的默认 `tool-mode` 恢复到 `binary`
+
+本轮结论：
+
+- 高嫌疑根因在 `src/lerobot/envs/fr3_mujoco.py` 的控制链路重构，而不是 `fr3_pika_ati.xml`
+- `src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_ati.xml` 中新增的 `gripper_left_pad_collision` / `gripper_right_pad_collision` 已回退
+- 回退理由：用户已确认 `/home/hanyu/Codes/HIROLRobotPlatform/teleop/teleoperation.py` 与 `/home/hanyu/Codes/HIROLRobotPlatform/teleop/config/left_fr3_with_pika_ati_ik_3d_mouse.yaml` 使用同款 XML 且可正常仿真，因此不应在 LeRobot 侧额外分叉出一套 pad collision 几何
+
+### 2026-04-20 第二版更新（已知问题状态）
+
+以下两个问题已被验证为当前 MuJoCo 仿真环境的已知限制，详见 `docs/franka_research3_mujoco_sim_teleop_params_alignment.md`：
+
+**问题 1：SpaceMouse 松开后臂继续运动（姿态漂移）**
+
+- 根因：`_set_gripper_command(simulate=True)` 期间的 gripper 物理积分残留通过共享 `env.data` 影响臂姿态
+- 临时规避：在夹爪完全张开状态断连，或使用 `initial_gripper=0.04`
+- 长期方向：freeze 时完整保存 `env.data` 状态并逐帧回填检查
+
+**问题 2：夹爪可夹住红色方块但无法抬起**
+
+- 根因：MuJoCo freejoint 方块摩擦力/密度不足 + gripper simulate 期间臂姿态不稳定
+- 临时修复：在 `fr3_pika_ati_scene.xml` 中将 `density` 改为 `2000`，`friction` 改为 `3.0 0.1 0.02`
+- 已知限制：这是 MuJoCo 抓取仿真的固有精度问题，真实硬件无此问题
 
 ## 下一步标定
 

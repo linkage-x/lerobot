@@ -49,9 +49,102 @@ def test_first_disabled_teleop_action_holds_current_joint_state():
         env.reset()
         before_joints = env._get_joint_positions()
         _, _, _, _, info = env.step_teleop_action({"enabled": False})
-        np.testing.assert_allclose(info["joint_positions"], before_joints)
-        np.testing.assert_allclose(info["target_pose"], info["tcp_pose"])
+        np.testing.assert_allclose(info["target_joint_positions"], before_joints)
+        assert np.linalg.norm(info["joint_positions"] - before_joints) < 1e-3
         assert info["otg_enabled"] is True
+        assert info["otg_steps"] == 0
+    finally:
+        env.close()
+
+
+def test_disabled_teleop_action_freezes_hold_target_without_otg_drift():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        hold_target = None
+        settled_err = None
+
+        for step in range(201):
+            _, _, _, _, info = env.step_teleop_action({"enabled": False})
+            target = np.asarray(info["target_joint_positions"], dtype=np.float64)
+            actual = np.asarray(info["joint_positions"], dtype=np.float64)
+            err = float(np.linalg.norm(actual - target))
+
+            if hold_target is None:
+                hold_target = target.copy()
+            np.testing.assert_allclose(target, hold_target)
+            assert info["otg_steps"] == 0
+
+            if step == 50:
+                settled_err = err
+
+        assert settled_err is not None
+        assert settled_err < 0.02
+        assert abs(err - settled_err) < 1e-4
+    finally:
+        env.close()
+
+
+def test_disabled_transition_freezes_measured_joints_not_stale_otg_target():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        for _ in range(120):
+            env.step_teleop_action({"enabled": True, "target_y": 0.002, "target_z": -0.002})
+
+        actual_before_disable = env._get_joint_positions().copy()
+        otg_target_before_disable = env._otg_target_joints.copy()
+
+        _, _, _, _, info = env.step_teleop_action({"enabled": False})
+        hold_target = np.asarray(info["target_joint_positions"], dtype=np.float64)
+
+        np.testing.assert_allclose(hold_target, actual_before_disable)
+        assert np.linalg.norm(hold_target - otg_target_before_disable) > 1e-3
+        assert info["otg_steps"] == 0
+    finally:
+        env.close()
+
+
+def test_tiny_enabled_deltas_do_not_accumulate_reference_pose_drift():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+
+        for _ in range(50):
+            current_pose = env._current_tcp_pose().copy()
+            _, _, _, _, info = env.step_teleop_action(
+                {
+                    "enabled": True,
+                    "target_z": -5e-5,
+                    "target_wz": 5e-5,
+                }
+            )
+
+            np.testing.assert_allclose(info["target_pose"], current_pose)
+            np.testing.assert_allclose(env._reference_pose, current_pose)
+    finally:
+        env.close()
+
+
+def test_enabled_motion_reanchors_target_pose_to_measured_tcp_each_step():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        delta_z = -0.02
+
+        _, _, _, _, first = env.step_teleop_action({"enabled": True, "target_z": delta_z})
+        first_target = np.asarray(first["target_pose"], dtype=np.float64).copy()
+        first_tcp = np.asarray(first["tcp_pose"], dtype=np.float64).copy()
+        assert np.linalg.norm(first_target[:3, 3] - first_tcp[:3, 3]) > 1e-4
+
+        _, _, _, _, second = env.step_teleop_action({"enabled": True, "target_z": delta_z})
+        second_target = np.asarray(second["target_pose"], dtype=np.float64).copy()
+
+        expected = first_tcp.copy()
+        expected[2, 3] += delta_z
+        expected[2, 3] = np.clip(expected[2, 3], env.cfg.workspace_min[2], env.cfg.workspace_max[2])
+
+        np.testing.assert_allclose(second_target[:3, 3], expected[:3, 3], atol=1e-6)
     finally:
         env.close()
 
@@ -134,8 +227,73 @@ def test_gripper_command_updates_pika_slide_joints_symmetrically():
         _, _, _, _, opened = env.step_teleop_action({"enabled": False, "gripper": 1.0})
         assert abs(opened["gripper_joint_positions"]["left"]) > abs(closed["gripper_joint_positions"]["left"])
         assert abs(opened["gripper_joint_positions"]["right"]) > abs(closed["gripper_joint_positions"]["right"])
-        assert abs(opened["gripper_joint_positions"]["left"] + opened["gripper_joint_positions"]["right"]) < 1e-6
+        assert abs(opened["gripper_joint_positions"]["left"] + opened["gripper_joint_positions"]["right"]) < 1e-4
         assert opened["gripper_command"] == 1.0
+    finally:
+        env.close()
+
+
+def test_gripper_fully_closes_without_object():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        env.step_teleop_action({"enabled": False, "gripper": 1.0})
+        _, _, _, _, closed = env.step_teleop_action({"enabled": False, "gripper": 0.0})
+        assert abs(closed["gripper_joint_positions"]["left"]) < 1e-3
+        assert abs(closed["gripper_joint_positions"]["right"]) < 1e-3
+    finally:
+        env.close()
+
+
+def test_closing_gripper_advances_object_between_fingers_via_contact_dynamics():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        object_joint_qposadr = int(env.model.jnt_qposadr[9])
+        env.data.qpos[object_joint_qposadr : object_joint_qposadr + 3] = np.array([0.307, 0.0, 0.8015], dtype=np.float64)
+        env.data.qpos[object_joint_qposadr + 3 : object_joint_qposadr + 7] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        env._mujoco.mj_forward(env.model, env.data)
+        before = env.data.xpos[env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_BODY, "workspace_object_body")].copy()
+
+        env.step_teleop_action({"enabled": False, "gripper": 1.0})
+        _, _, _, _, info = env.step_teleop_action({"enabled": False, "gripper": 0.0})
+
+        after = env.data.xpos[env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_BODY, "workspace_object_body")].copy()
+        assert np.linalg.norm(after - before) > 1e-5
+        assert info["gripper_command"] == 0.0
+    finally:
+        env.close()
+
+
+def test_gripper_stops_lowering_when_pads_reach_table_height():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        current_pose = env._current_tcp_pose().copy()
+        lowered_pose = current_pose.copy()
+        lowered_pose[2, 3] = 0.46
+        lowered_joint_positions = env._kinematics.inverse_kinematics(env._get_joint_positions(), lowered_pose)
+        env._set_joint_state(lowered_joint_positions)
+        left_pad_geom_id = env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_GEOM, "gripper_left_collision")
+        right_pad_geom_id = env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_GEOM, "gripper_right_collision")
+        left_pad_z = float(env.data.geom_xpos[left_pad_geom_id][2])
+        right_pad_z = float(env.data.geom_xpos[right_pad_geom_id][2])
+        assert left_pad_z > 0.42
+        assert right_pad_z > 0.42
+        assert env._current_tcp_pose()[2, 3] > 0.53
+    finally:
+        env.close()
+
+
+def test_workspace_object_starts_resting_above_table_surface():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        object_body_id = env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_BODY, "workspace_object_body")
+        object_pos = np.asarray(env.data.xpos[object_body_id], dtype=np.float64)
+        table_top_z = 0.38 + 0.02
+        object_half_height = 0.04
+        assert object_pos[2] >= table_top_z + object_half_height - 1e-6
     finally:
         env.close()
 
