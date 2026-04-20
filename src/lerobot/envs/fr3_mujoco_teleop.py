@@ -161,6 +161,7 @@ def run_sim_teleop_loop(
     teleop: TeleopReader,
     fps: int,
     viewer: ViewerHandle | None = None,
+    viewer_data: Any | None = None,
     duration_s: float | None = None,
     max_steps: int | None = None,
     marker_style: MarkerStyle | None = None,
@@ -172,8 +173,14 @@ def run_sim_teleop_loop(
     start = time.perf_counter()
     steps = 0
     _, info = env.reset()
+    sync_gripper = getattr(teleop, "sync_gripper_baseline", None)
+    if callable(sync_gripper) and "gripper_command" in info:
+        sync_gripper(float(info["gripper_command"]))
 
     if viewer is not None:
+        copy_visual_state = getattr(env, "copy_visual_state", None)
+        if viewer_data is not None and callable(copy_visual_state):
+            copy_visual_state(viewer_data)
         with viewer.lock():
             update_passive_viewer_markers(env._mujoco, viewer, info, marker_style)
         viewer.sync()
@@ -266,6 +273,9 @@ def run_sim_teleop_loop(
         _, _, terminated, truncated, info = env.step_teleop_action(action, control_period_s=1.0 / fps)
 
         if viewer is not None:
+            copy_visual_state = getattr(env, "copy_visual_state", None)
+            if viewer_data is not None and callable(copy_visual_state):
+                copy_visual_state(viewer_data)
             with viewer.lock():
                 update_passive_viewer_markers(env._mujoco, viewer, info, marker_style)
             viewer.sync()

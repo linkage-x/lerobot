@@ -61,3 +61,9 @@ class SpaceMouseTeleopConfig(TeleoperatorConfig):
     initial_gripper: float = 1.0
     incremental_step: float = 0.02
     move_time: float = 0.006
+    button_debounce_s: float = 0.0
+    button_release_grace_s: float = 0.0
+    gripper_cmd_min_delta: float = 0.0
+    gripper_cmd_min_interval_s: float = 0.0
+    gripper_cmd_ema_alpha: float = 0.0
+    gripper_cmd_max_rate: float = 0.0

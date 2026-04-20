@@ -17,7 +17,6 @@ from lerobot.teleoperators.spacemouse.teleop_spacemouse import SpaceMouseTeleop
 _D435I_COLOR_FOVY_DEG = 42.0
 _D435I_COLOR_WIDTH = 640
 _D435I_COLOR_HEIGHT = 480
-_TELEOP_TRACE_WINDOW_FRAMES = 8
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -30,7 +29,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enable-cameras", action="store_true")
     parser.add_argument("--camera-width", type=int, default=_D435I_COLOR_WIDTH)
     parser.add_argument("--camera-height", type=int, default=_D435I_COLOR_HEIGHT)
-    parser.add_argument("--tool-mode", choices=[mode.value for mode in SpaceMouseToolMode], default="binary")
+    parser.add_argument(
+        "--disable-continuous-physics",
+        dest="continuous_physics",
+        action="store_false",
+        help="Disable the background MuJoCo physics thread and only step physics during teleop actions.",
+    )
+    parser.add_argument(
+        "--continuous-physics-frequency",
+        type=float,
+        default=800.0,
+        help="Background MuJoCo stepping frequency in Hz when continuous physics is enabled.",
+    )
+    parser.set_defaults(continuous_physics=True)
+    parser.add_argument("--tool-mode", choices=[mode.value for mode in SpaceMouseToolMode], default="incremental")
     parser.add_argument("--motion-enable-button", choices=[button.value for button in SpaceMouseEnableButton], default="none")
     parser.add_argument(
         "--disable-rotation",
@@ -61,6 +73,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--threshold-wz", type=float, default=0.04)
     parser.add_argument("--incremental-step", type=float, default=0.02)
     parser.add_argument("--move-time", type=float, default=0.006)
+    parser.add_argument("--button-debounce-s", type=float, default=0.0)
+    parser.add_argument("--button-release-grace-s", type=float, default=0.01)
+    parser.add_argument("--gripper-cmd-min-delta", type=float, default=0.0)
+    parser.add_argument("--gripper-cmd-min-interval-s", type=float, default=0.0)
+    parser.add_argument("--gripper-cmd-ema-alpha", type=float, default=0.9)
+    parser.add_argument("--gripper-cmd-max-rate", type=float, default=12.0)
     parser.add_argument("--sphere-radius", type=float, default=0.012)
     parser.add_argument("--axis-radius", type=float, default=0.003)
     parser.add_argument("--axis-length", type=float, default=0.06)
@@ -90,6 +108,12 @@ def build_teleop_config(args: argparse.Namespace) -> SpaceMouseTeleopConfig:
         tool_mode=SpaceMouseToolMode(args.tool_mode),
         incremental_step=args.incremental_step,
         move_time=args.move_time,
+        button_debounce_s=args.button_debounce_s,
+        button_release_grace_s=args.button_release_grace_s,
+        gripper_cmd_min_delta=args.gripper_cmd_min_delta,
+        gripper_cmd_min_interval_s=args.gripper_cmd_min_interval_s,
+        gripper_cmd_ema_alpha=args.gripper_cmd_ema_alpha,
+        gripper_cmd_max_rate=args.gripper_cmd_max_rate,
     )
 
 
@@ -103,6 +127,8 @@ def build_env_config(args: argparse.Namespace) -> FR3MujocoEnvConfig:
         camera_width=int(args.camera_width),
         camera_height=int(args.camera_height),
         camera_fovy=float(_D435I_COLOR_FOVY_DEG),
+        continuous_physics=bool(args.continuous_physics),
+        continuous_physics_frequency=float(args.continuous_physics_frequency),
     )
 
 
@@ -133,56 +159,13 @@ def configure_viewer_camera(mujoco, viewer, env: FR3MujocoEnv, viewer_camera: st
     return camera_name
 
 
-class TransitionTraceTeleopReader:
-    def __init__(self, teleop: SpaceMouseTeleop, *, window_frames: int = _TELEOP_TRACE_WINDOW_FRAMES):
-        self._teleop = teleop
-        self._window_frames = max(int(window_frames), 0)
-        self._frame_idx = 0
-        self._last_enabled = False
-        self._trace_countdown = 0
-        self._trace_phase = "idle"
-
-    def get_action(self) -> dict[str, object]:
-        action = self._teleop.get_action()
-        enabled = bool(action.get("enabled", False))
-
-        if enabled and not self._last_enabled:
-            self._trace_countdown = self._window_frames
-            self._trace_phase = "start"
-        elif not enabled and self._last_enabled:
-            self._trace_countdown = self._window_frames
-            self._trace_phase = "end"
-
-        should_log = enabled or self._last_enabled or self._trace_countdown > 0
-        if should_log:
-            print(
-                pformat(
-                    {
-                        "trace": "teleop_transition",
-                        "phase": self._trace_phase,
-                        "frame": self._frame_idx,
-                        "enabled": enabled,
-                        "action": action,
-                    }
-                )
-            )
-
-        if self._trace_countdown > 0:
-            self._trace_countdown -= 1
-            if self._trace_countdown == 0 and not enabled:
-                self._trace_phase = "idle"
-
-        self._last_enabled = enabled
-        self._frame_idx += 1
-        return action
-
-
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     teleop = SpaceMouseTeleop(build_teleop_config(args))
     env_cfg = build_env_config(args)
     env = FR3MujocoEnv(env_cfg)
     viewer = None
+    viewer_data = None
 
     print(
         pformat(
@@ -195,6 +178,8 @@ def main(argv: list[str] | None = None) -> int:
                 "camera_width": args.camera_width,
                 "camera_height": args.camera_height,
                 "camera_fovy": _D435I_COLOR_FOVY_DEG,
+                "continuous_physics": args.continuous_physics,
+                "continuous_physics_frequency": args.continuous_physics_frequency,
                 "tool_mode": args.tool_mode,
                 "motion_enable_button": args.motion_enable_button,
                 "enable_rotation": args.enable_rotation,
@@ -204,19 +189,21 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         teleop.connect()
-        traced_teleop = TransitionTraceTeleopReader(teleop)
         selected_camera_name = None
         if not args.no_viewer:
             import mujoco.viewer
             import mujoco
 
-            viewer = mujoco.viewer.launch_passive(env.model, env.data)
+            viewer_data = mujoco.MjData(env.model)
+            env.copy_visual_state(viewer_data)
+            viewer = mujoco.viewer.launch_passive(env.model, viewer_data)
             selected_camera_name = configure_viewer_camera(mujoco, viewer, env, args.viewer_camera)
         info = run_sim_teleop_loop(
             env=env,
-            teleop=traced_teleop,
+            teleop=teleop,
             fps=args.fps,
             viewer=viewer,
+            viewer_data=viewer_data,
             duration_s=args.duration_s,
             marker_style=build_marker_style(args),
             render_cameras=args.enable_cameras,

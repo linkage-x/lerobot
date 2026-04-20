@@ -542,6 +542,7 @@ def test_wait_until_idle_times_out_when_motion_persists(monkeypatch):
 def test_incremental_gripper_updates(teleop):
     teleop.connect()
     teleop._last_gripper = 0.5
+    teleop.sync_gripper_baseline(0.5)
     start = teleop._last_gripper
     teleop._driver.readings.append(
         SpaceMouseReading(
@@ -552,6 +553,99 @@ def test_incremental_gripper_updates(teleop):
     )
     action = teleop.get_action()
     assert action["gripper"] == pytest.approx(start + teleop.config.incremental_step)
+
+
+def test_sync_gripper_baseline_updates_internal_and_output_state(monkeypatch):
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            bias_sample_count=0,
+            gripper_cmd_ema_alpha=0.9,
+            gripper_cmd_max_rate=12.0,
+        )
+    )
+    teleop.connect()
+
+    synced = teleop.sync_gripper_baseline(0.25)
+    action = teleop.get_action()
+
+    assert synced == pytest.approx(0.25)
+    assert teleop._last_gripper == pytest.approx(0.25)
+    assert action["gripper"] == pytest.approx(0.25)
+    teleop.disconnect()
+
+
+def test_gripper_filter_applies_rate_limit_and_ema(monkeypatch):
+    clock = {"now": 0.0}
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    monkeypatch.setattr("lerobot.teleoperators.spacemouse.teleop_spacemouse.time.perf_counter", lambda: clock["now"])
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            bias_sample_count=0,
+            tool_mode=SpaceMouseToolMode.BINARY,
+            initial_gripper=0.0,
+            gripper_cmd_ema_alpha=0.9,
+            gripper_cmd_max_rate=12.0,
+        )
+    )
+    teleop.connect()
+    teleop.sync_gripper_baseline(0.0)
+    teleop._driver.readings.append(
+        SpaceMouseReading(
+            translation=[0.0, 0.0, 0.0],
+            rotation=[0.0, 0.0, 0.0],
+            buttons=(True, False),
+        )
+    )
+
+    clock["now"] = 0.005
+    action = teleop.get_action()
+
+    assert action["enabled"] is False
+    assert action["gripper"] == pytest.approx(0.054, abs=1e-9)
+    assert teleop._last_gripper == pytest.approx(1.0)
+    teleop.disconnect()
+
+
+def test_button_release_grace_keeps_incremental_gripper_active_briefly(monkeypatch):
+    clock = {"now": 0.0}
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    monkeypatch.setattr("lerobot.teleoperators.spacemouse.teleop_spacemouse.time.perf_counter", lambda: clock["now"])
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            bias_sample_count=0,
+            tool_mode=SpaceMouseToolMode.INCREMENTAL,
+            initial_gripper=0.5,
+            incremental_step=0.02,
+            move_time=0.0,
+            button_release_grace_s=0.01,
+        )
+    )
+    teleop.connect()
+    teleop.sync_gripper_baseline(0.5)
+    teleop._driver.readings.extend(
+        [
+            SpaceMouseReading(
+                translation=[0.0, 0.0, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(True, False),
+            ),
+            SpaceMouseReading(
+                translation=[0.0, 0.0, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
+        ]
+    )
+
+    clock["now"] = 0.001
+    first = teleop.get_action()
+    clock["now"] = 0.006
+    second = teleop.get_action()
+
+    assert first["gripper"] == pytest.approx(0.52)
+    assert second["gripper"] == pytest.approx(0.54)
+    teleop.disconnect()
 
 
 def test_binary_gripper_uses_left_open_right_close(monkeypatch):

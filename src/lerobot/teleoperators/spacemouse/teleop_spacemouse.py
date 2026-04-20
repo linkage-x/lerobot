@@ -54,8 +54,20 @@ class SpaceMouseTeleop(Teleoperator):
         self._peak_active_motion_data = np.zeros(6, dtype=np.float64)
         self._last_gripper = float(np.clip(config.initial_gripper, 0.0, 1.0))
         self._last_gripper_update = 0.0
+        self._filtered_gripper = self._last_gripper
+        self._last_filtered_gripper_time = float("-inf")
+        self._last_button_raw: np.ndarray | None = None
+        self._debounced_buttons = np.zeros(2, dtype=np.float64)
+        self._button_change_time = 0.0
+        self._button_press_times = np.full(2, float("-inf"), dtype=np.float64)
         self._translation_bias = np.zeros(3, dtype=np.float64)
         self._rotation_bias = np.zeros(3, dtype=np.float64)
+        # State-change tracking for targeted debug logging
+        self._prev_motion_detected = False
+        self._prev_motion_enabled = False
+        self._prev_enabled_out = False
+        self._prev_motion_active = False
+        self._log_count = 0
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -135,7 +147,7 @@ class SpaceMouseTeleop(Teleoperator):
             "target_wx": 0.0,
             "target_wy": 0.0,
             "target_wz": 0.0,
-            "gripper": self._last_gripper,
+            "gripper": self._filtered_gripper,
         }
 
     def _motion_threshold_vector(self) -> np.ndarray:
@@ -184,6 +196,63 @@ class SpaceMouseTeleop(Teleoperator):
                 elif button_1 and not button_0:
                     self._last_gripper = max(0.0, self._last_gripper - self.config.incremental_step)
                     self._last_gripper_update = now
+
+    def _apply_button_filters(self, buttons: tuple[bool, bool] | np.ndarray) -> tuple[bool, bool]:
+        filtered = np.asarray(buttons, dtype=np.float64).copy()
+        now = time.perf_counter()
+
+        if self.config.button_debounce_s > 0.0:
+            if self._last_button_raw is None:
+                self._last_button_raw = filtered.copy()
+                self._debounced_buttons = filtered.copy()
+                self._button_change_time = now
+            else:
+                if not np.array_equal(filtered, self._last_button_raw):
+                    self._last_button_raw = filtered.copy()
+                    self._button_change_time = now
+                if (now - self._button_change_time) >= self.config.button_debounce_s:
+                    self._debounced_buttons = self._last_button_raw.copy()
+            filtered = self._debounced_buttons.copy()
+
+        if self.config.button_release_grace_s > 0.0:
+            for idx in range(len(filtered)):
+                if filtered[idx]:
+                    self._button_press_times[idx] = now
+                elif (now - self._button_press_times[idx]) <= self.config.button_release_grace_s:
+                    filtered[idx] = 1.0
+
+        return bool(filtered[0]), bool(filtered[1])
+
+    def _filter_gripper_command(self, value: float) -> float:
+        raw_value = float(np.clip(value, 0.0, 1.0))
+        now = time.perf_counter()
+        last_value = float(self._filtered_gripper)
+        last_time = float(self._last_filtered_gripper_time)
+
+        if not np.isfinite(last_time):
+            filtered = raw_value
+        else:
+            filtered = raw_value
+            delta = abs(filtered - last_value)
+            if self.config.gripper_cmd_min_delta > 0.0 and delta < self.config.gripper_cmd_min_delta:
+                if self.config.gripper_cmd_min_interval_s > 0.0 and (now - last_time) < self.config.gripper_cmd_min_interval_s:
+                    return last_value
+                filtered = last_value
+
+            if self.config.gripper_cmd_max_rate > 0.0:
+                step_dt = 1.0 / max(float(self.config.frequency), 1.0)
+                max_delta = self.config.gripper_cmd_max_rate * step_dt
+                delta = filtered - last_value
+                if abs(delta) > max_delta:
+                    filtered = last_value + np.sign(delta) * max_delta
+
+            if self.config.gripper_cmd_ema_alpha > 0.0:
+                alpha = float(np.clip(self.config.gripper_cmd_ema_alpha, 0.0, 1.0))
+                filtered = alpha * filtered + (1.0 - alpha) * last_value
+
+        self._filtered_gripper = float(np.clip(filtered, 0.0, 1.0))
+        self._last_filtered_gripper_time = now
+        return self._filtered_gripper
 
     @property
     def translation_scale_vector(self) -> np.ndarray:
@@ -248,8 +317,19 @@ class SpaceMouseTeleop(Teleoperator):
                 time.sleep(interval_s)
 
     def set_gripper(self, normalized_position: float) -> None:
-        self._last_gripper = float(np.clip(normalized_position, 0.0, 1.0))
-        self._last_gripper_update = time.perf_counter()
+        self.sync_gripper_baseline(normalized_position)
+
+    def sync_gripper_baseline(self, normalized_position: float) -> float:
+        value = float(np.clip(normalized_position, 0.0, 1.0))
+        now = time.perf_counter()
+        self._last_gripper = value
+        self._filtered_gripper = value
+        self._last_gripper_update = now
+        self._last_filtered_gripper_time = now
+        return value
+
+    def sync_tool_activity_baseline(self, normalized_command: float) -> float:
+        return self.sync_gripper_baseline(normalized_command)
 
     def _should_truncate_release_decay(self, data: np.ndarray, threshold: np.ndarray) -> bool:
         previous = self._last_active_motion_data
@@ -308,9 +388,21 @@ class SpaceMouseTeleop(Teleoperator):
         if reading is None:
             self._motion_active = False
             self._update_release_decay_state(motion_enabled=False)
+            # Log if enabled output just went True->False (transition to stop)
+            if self._prev_enabled_out and not self._prev_enabled_out:  # was True, now False
+                pass  # transition already logged below
+            enabled_out = False
+            if self._prev_enabled_out != enabled_out and self._log_count < 5:
+                print(f"[SM DEBUG] poll=None → enabled={enabled_out}")
+                self._log_count += 1
+            self._prev_enabled_out = enabled_out
+            self._prev_motion_detected = False
+            self._prev_motion_enabled = False
+            self._prev_motion_active = False
             return self._zero_action()
 
         data = self._reading_motion_data(reading)
+        button_0, button_1 = self._apply_button_filters(reading.buttons)
         threshold = self._motion_threshold_vector()
         scale = np.concatenate((self.translation_scale_vector, self.rotation_scale_vector))
         abs_data = np.abs(data)
@@ -320,9 +412,9 @@ class SpaceMouseTeleop(Teleoperator):
         exit_mask = abs_data >= (threshold * float(self.config.motion_enable_exit_scale))
         motion_detected = bool(np.any(exit_mask if self._motion_active else enter_mask))
         if self.config.motion_enable_button == SpaceMouseEnableButton.LEFT:
-            motion_enabled = motion_detected and bool(reading.buttons[0])
+            motion_enabled = motion_detected and button_0
         elif self.config.motion_enable_button == SpaceMouseEnableButton.RIGHT:
-            motion_enabled = motion_detected and bool(reading.buttons[1])
+            motion_enabled = motion_detected and button_1
         else:
             motion_enabled = motion_detected
         if motion_enabled and self._should_truncate_release_decay(data, threshold):
@@ -332,16 +424,59 @@ class SpaceMouseTeleop(Teleoperator):
         self._motion_active = motion_detected
 
         if not motion_enabled:
-            self._update_gripper(*reading.buttons)
+            self._update_gripper(button_0, button_1)
+            self._filter_gripper_command(self._last_gripper)
+            # After SpaceMouse is physically released, poll() returns readings that
+            # decay to zero over many frames.  Even though motion_enabled went False,
+            # the residual |data| can still be above the raw enter threshold for
+            # ~50-100+ frames, causing the arm to drift.  A simple L2-norm cutoff on
+            # the translation part catches this immediately.
+            # Coeff of 0.6 means: if residual translation norm < 60% of the raw motion
+            # threshold, treat it as "user has stopped" and truncate to zero.  This is
+            # well below normal intentional motion (~1-10× threshold) but safely above
+            # the electrical zero-floor of the device.
+            TRANSL_ONLY = slice(0, 3)
+            residual_norm = float(np.linalg.norm(data[TRANSL_ONLY]))
+            cutoff = float(np.linalg.norm(threshold[TRANSL_ONLY])) * 0.6
+            if residual_norm < cutoff:
+                data = np.zeros_like(data)
+                if self._log_count < 5:
+                    print(f"[SM DEBUG] release_decay TRUNCATE  norm={residual_norm:.6f} < {cutoff:.6f}")
+                    self._log_count += 1
             self._update_release_decay_state(motion_enabled=False)
+            enabled_out = False
+            # Log state transitions only
+            if self._prev_motion_detected and not motion_detected and self._log_count < 5:
+                print(f"[SM DEBUG] motion_detected: True→False  abs_data={abs_data}")
+                self._log_count += 1
+            if self._prev_motion_enabled and not motion_enabled and self._log_count < 5:
+                print(f"[SM DEBUG] motion_enabled: True→False  data={data}")
+                self._log_count += 1
+            if self._prev_enabled_out and not enabled_out and self._log_count < 5:
+                print(f"[SM DEBUG] enabled_out: True→False")
+                self._log_count += 1
+            self._prev_motion_detected = motion_detected
+            self._prev_motion_enabled = motion_enabled
+            self._prev_enabled_out = enabled_out
+            self._prev_motion_active = motion_detected
             return self._zero_action()
 
         target = data * scale
         if not self.config.enable_rotation:
             target[3:] = 0.0
 
-        self._update_gripper(*reading.buttons)
+        self._update_gripper(button_0, button_1)
+        filtered_gripper = self._filter_gripper_command(self._last_gripper)
         self._update_release_decay_state(motion_enabled=True, data=data)
+        enabled_out = True
+        # Log transition into active
+        if not self._prev_enabled_out and enabled_out and self._log_count < 5:
+            print(f"[SM DEBUG] enabled_out: False→True  target[:3]={target[:3]}")
+            self._log_count += 1
+        self._prev_motion_detected = motion_detected
+        self._prev_motion_enabled = motion_enabled
+        self._prev_enabled_out = enabled_out
+        self._prev_motion_active = motion_detected
         return {
             "enabled": True,
             "target_x": float(target[0]),
@@ -350,7 +485,7 @@ class SpaceMouseTeleop(Teleoperator):
             "target_wx": float(target[3]),
             "target_wy": float(target[4]),
             "target_wz": float(target[5]),
-            "gripper": self._last_gripper,
+            "gripper": filtered_gripper,
         }
 
     def send_feedback(self, feedback: dict[str, Any]) -> None:
@@ -370,5 +505,9 @@ class SpaceMouseTeleop(Teleoperator):
             self._motion_active = False
             self._last_active_motion_data.fill(0.0)
             self._peak_active_motion_data.fill(0.0)
+            self._last_button_raw = None
+            self._debounced_buttons.fill(0.0)
+            self._button_change_time = 0.0
+            self._button_press_times.fill(float("-inf"))
             self._translation_bias = np.zeros(3, dtype=np.float64)
             self._rotation_bias = np.zeros(3, dtype=np.float64)

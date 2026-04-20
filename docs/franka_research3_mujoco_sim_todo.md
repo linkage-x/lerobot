@@ -160,3 +160,77 @@ docker compose -f docker/docker-compose.yml --profile sim --profile teleop run -
 - 当前不一致主要是动态行为差异，而不只是静态增益问题
 - MuJoCo 遥操作现在已经使用 OTG，因此轨迹比较能够暴露剩余的硬件控制器行为差异，而不是把问题掩盖掉
 - 固定回放 profile 可以作为后续遥操作改动的可复用验收闸门
+
+## 2026-04-20 第三版对齐任务
+
+在修完 `enabled=True` 重锚定和 continuous physics 后，仍观察到：
+
+- `SpaceMouse` 仅做很小的 `x/y` 输入时，`target_pose.z` 基本不变
+- 但实际 `tcp_pose.z` 仍持续下探
+
+这说明剩余问题不在输入侧，而在 arm 控制链本身。下一步按以下顺序执行：
+
+1. 让后台 OTG thread 真正使用 `otg_async_control_frequency`
+   - 目标：修复当前 “OTG 已在后台执行，但实际步频由 `continuous_physics_frequency` 决定” 的语义不一致
+   - 验收：当 `use_otg=True` 且 `continuous_physics=True` 时，后台控制 tick 频率与 `otg_async_control_frequency` 一致
+
+2. 将 `step_teleop_action()` 的 IK 来源从 env-local `_MujocoArmKinematics` 切到 `PlacoKinematicsDriver`
+   - 目标：去掉当前 MuJoCo env 内部的简化 DLS IK 主路径，改用与硬件侧更一致的 kinematics 求解器
+   - 验收：`FR3MujocoEnv` 的主 FK/IK 路径使用 `PlacoKinematicsDriver`，相关 FK/IK 回归保持通过
+
+3. 完成上述两项后，再重新验证 “小幅 x/y 输入时末端是否仍明显下探”
+   - 若问题仍在，再继续检查更深一层的 controller / joint-space execution path
+
+### 2026-04-20 第三版执行进展
+
+- 已完成：
+  - `continuous_physics_dt` 在 `use_otg=True` 时已改为真正使用 `otg_async_control_frequency`
+  - `FR3MujocoEnv` 主 FK/IK 路径已从 env-local `_MujocoArmKinematics` 切换到 `PlacoKinematicsDriver`
+- 当前结果：
+  - 相关聚焦回归通过
+  - 但“小幅 x/y 输入、target_z=0 时实际 tcp_z 仍持续下探”的症状依旧存在
+  - 同时在 `PlacoKinematicsDriver + continuous physics` 的最小复现中观察到原生内存错误
+    （`malloc_consolidate(): invalid chunk size`）
+- 当前判断：
+  - 仅修正 async OTG 频率语义和切换 kinematics 来源还不足以消除末端下探
+  - 剩余问题更可能落在更深一层的 controller / joint-space execution path
+  - `PlacoKinematicsDriver` 在当前 MuJoCo continuous thread 使用方式下还需要额外稳定性验证
+
+### 2026-04-20 `PlacoKinematicsDriver` 稳定性隔离结论
+
+- 已执行的隔离验证：
+  1. 单线程、非 `continuous_physics` 模式下，对 `PlacoKinematicsDriver` 连续执行 300 次 FK/IK 压测
+- 更细一层的脚本化隔离显示：
+    - `import placo`、`import backends`、`import PlacoKinematicsDriver` 符号导入都可正常退出
+    - `placo.RobotWrapper`、`placo.KinematicsSolver`、`RobotKinematics` 也可在最小脚本中正常退出
+    - 但一旦实际实例化 `PlacoKinematicsDriver`，无论是否调用 FK/IK，子进程退出时都会稳定触发 glibc 堆错误
+    - `FR3MujocoEnvConfig + PlacoKinematicsDriver` 组合场景同样复现
+    - 在同一复现脚本里新增"本地普通包装类"和"本地 `@dataclass` 包装类"两种等价实现：
+      - 两者都只是二次持有同一个 `RobotKinematics`，并复刻 `PlacoKinematicsDriver` 的 rad/deg 转换逻辑
+      - **2026-04-20 更新**：在 `continuous_physics=True` 场景下（即 MuJoCo 后台物理线程持续运行的场景），
+        本地包装类和 `PlacoKinematicsDriver` **都会**触发 SIGSEGV (exit 139)，
+        因为问题不在 `PlacoKinematicsDriver` 这层包装，而在 `RobotKinematics` 底层调用的 placo C++ binding 本身。
+        因此"本地包装不崩"的结论仅在单线程 standalone 场景成立。
+
+- 实测结果（2026-04-20）：
+  - `continuous_physics=True` + 60秒压测（~200万次 FK/IK 调用）：
+    - `PlacoKinematicsDriver` → exit 139 (SIGSEGV)
+    - `LocalKinematicsDriver`（等价的本地包装）→ exit 139 (SIGSEGV)
+    - `RobotKinematics`（直连）→ exit 139 (SIGSEGV)
+  - 单线程 standalone FK/IK 场景：三者均正常退出，无崩溃
+  - **结论**：根因在 placo C++ binding 与 continuous_physics MuJoCo 环境的交互，与上层包装方式无关
+
+- 结论：
+  - `PlacoKinematicsDriver` 在 `continuous_physics=True` 场景下与 placo C++ binding 一起触发 SIGSEGV，与包装方式无关
+  - 问题收敛在 placo C++ binding 与 MuJoCo continuous_physics 线程的交互，而非 Python 层代码路径
+  - `_MujocoArmKinematics` 在相同场景下稳定，是当前唯一可靠的 MuJoCo FK/IK 路径
+  - 后续若继续沿 PlacoKinematics 方向推进，应先在 placo 库侧修复该线程安全问题
+
+### 2026-04-20 主路径回退执行结果
+
+- 已执行：
+  - `FR3MujocoEnv._build_kinematics()` 已回退为使用 env-local `_MujocoArmKinematics`
+  - `PlacoKinematicsDriver` 不再位于 `FR3MujocoEnv` 主 FK/IK 执行路径中
+- 保留项：
+  - `otg_async_control_frequency` 对后台 continuous physics tick 的语义修正仍保留
+  - `PlacoKinematicsDriver` 相关隔离结论保留为后续单独排查 `placo` binding 生命周期问题的依据

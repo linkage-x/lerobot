@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import threading
+import time
 from typing import Any
 
 import gymnasium as gym
@@ -92,6 +94,8 @@ class FR3MujocoEnvConfig:
     teleop_control_frequency: float = 200.0
     otg_control_frequency: float = 800.0
     otg_async_control_frequency: float = 1000.0
+    continuous_physics: bool = False
+    continuous_physics_frequency: float | None = None
     otg_max_velocity: tuple[float, ...] = (2.096, 2.096, 2.096, 2.096, 4.208, 3.344, 4.208)
     otg_max_acceleration: tuple[float, ...] = (8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0)
     otg_max_jerk: tuple[float, ...] = (4000.0, 4000.0, 4000.0, 4000.0, 4000.0, 4000.0, 4000.0)
@@ -113,6 +117,14 @@ class FR3MujocoEnvConfig:
     @property
     def otg_async_dt(self) -> float:
         return 1.0 / self.otg_async_control_frequency
+
+    @property
+    def continuous_physics_dt(self) -> float:
+        if self.use_otg:
+            frequency = self.otg_async_control_frequency
+        else:
+            frequency = self.otg_control_frequency if self.continuous_physics_frequency is None else self.continuous_physics_frequency
+        return 1.0 / float(frequency)
 
 
 class _MujocoArmKinematics:
@@ -190,6 +202,9 @@ class FR3MujocoEnv(gym.Env):
         self.model = self._mujoco.MjModel.from_xml_path(self.cfg.sim_xml_path)
         self.data = self._mujoco.MjData(self.model)
         self._step_count = 0
+        self._physics_lock = threading.RLock()
+        self._continuous_physics_stop = threading.Event()
+        self._continuous_physics_thread: threading.Thread | None = None
 
         self._joint_ids = []
         self._qpos_indices = []
@@ -213,15 +228,7 @@ class FR3MujocoEnv(gym.Env):
         self._qvel_indices = np.asarray(self._qvel_indices, dtype=np.int64)
         self._joint_lower = self.model.jnt_range[self._joint_ids, 0].astype(np.float64)
         self._joint_upper = self.model.jnt_range[self._joint_ids, 1].astype(np.float64)
-        self._kinematics = _MujocoArmKinematics(
-            self._mujoco,
-            self.model,
-            self.cfg.target_frame_name,
-            self._qpos_indices,
-            self._qvel_indices,
-            self._joint_lower,
-            self._joint_upper,
-        )
+        self._kinematics = self._build_kinematics()
         self._otg = self._build_otg()
         self._initial_joint_positions = np.clip(
             np.asarray(self.cfg.initial_joint_positions, dtype=np.float64),
@@ -278,6 +285,7 @@ class FR3MujocoEnv(gym.Env):
         self._target_pose: np.ndarray | None = None
         self._tcp_pose: np.ndarray | None = None
         self._otg_target_joints: np.ndarray | None = None
+        self._servo_target_joints: np.ndarray | None = None
         self._last_gripper = float(np.clip(self.cfg.initial_gripper, 0.0, 1.0))
 
         observation_dict: dict[str, spaces.Space] = {
@@ -315,6 +323,7 @@ class FR3MujocoEnv(gym.Env):
         self.observation_space = spaces.Dict(observation_dict)
 
         self._reset_joint_state(self._initial_joint_positions)
+        self._servo_target_joints = self._initial_joint_positions.copy()
         self._set_gripper_command(self._last_gripper)
 
         if self.cfg.enable_cameras:
@@ -338,12 +347,14 @@ class FR3MujocoEnv(gym.Env):
         return mujoco
 
     def _build_kinematics(self):
-        from lerobot.robots.franka_research3.backends import PlacoKinematicsDriver
-
-        return PlacoKinematicsDriver(
-            urdf_path=self.cfg.urdf_path,
-            target_frame_name=self.cfg.target_frame_name,
-            joint_names=list(self.cfg.joint_names),
+        return _MujocoArmKinematics(
+            self._mujoco,
+            self.model,
+            self.cfg.target_frame_name,
+            self._qpos_indices,
+            self._qvel_indices,
+            self._joint_lower,
+            self._joint_upper,
         )
 
     def _build_otg(self):
@@ -363,51 +374,79 @@ class FR3MujocoEnv(gym.Env):
             sync_mode=self.cfg.otg_sync_mode,
         )
 
+    def _set_arm_target(self, joint_positions: np.ndarray) -> np.ndarray:
+        with self._physics_lock:
+            arm_positions = np.clip(joint_positions, self._joint_lower, self._joint_upper)
+            if self._actuator_ids:
+                self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = arm_positions
+            return np.asarray(arm_positions, dtype=np.float64)
+
+    def _step_physics(self, physics_steps: int = 1) -> None:
+        with self._physics_lock:
+            for _ in range(max(int(physics_steps), 1)):
+                self._mujoco.mj_step(self.model, self.data)
+            self._mujoco.mj_forward(self.model, self.data)
+            self._update_visualization_state()
+
+    def _copy_visual_state_locked(self, target_data) -> None:
+        target_data.time = self.data.time
+        target_data.qpos[:] = self.data.qpos
+        target_data.qvel[:] = self.data.qvel
+        if hasattr(target_data, "act") and hasattr(self.data, "act") and target_data.act.shape == self.data.act.shape:
+            target_data.act[:] = self.data.act
+        target_data.ctrl[:] = self.data.ctrl
+        if hasattr(target_data, "mocap_pos") and hasattr(self.data, "mocap_pos"):
+            target_data.mocap_pos[:] = self.data.mocap_pos
+        if hasattr(target_data, "mocap_quat") and hasattr(self.data, "mocap_quat"):
+            target_data.mocap_quat[:] = self.data.mocap_quat
+        self._mujoco.mj_forward(self.model, target_data)
+
+    def copy_visual_state(self, target_data) -> None:
+        with self._physics_lock:
+            self._copy_visual_state_locked(target_data)
+
     def _set_joint_state(self, joint_positions: np.ndarray) -> None:
-        arm_positions = np.asarray(joint_positions, dtype=np.float64)
-        self.data.qpos[self._qpos_indices] = arm_positions
-        self.data.qvel[self._qvel_indices] = 0.0
-        if self._actuator_ids:
-            self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = arm_positions
-        self._mujoco.mj_forward(self.model, self.data)
-        self._update_visualization_state()
+        """Compatibility wrapper: set arm target then advance one physics step."""
+        self._set_arm_target(joint_positions)
+        self._step_physics(1)
 
     def _reset_joint_state(self, joint_positions: np.ndarray) -> None:
         """Direct qpos write for initialization/reset (no physics, matches prior _set_joint_state behavior).
 
         Used only when placing the arm at startup or after reset — not during normal stepping.
         """
-        arm_positions = np.asarray(joint_positions, dtype=np.float64)
-        previous_qpos = self.data.qpos.copy()
-        previous_qvel = self.data.qvel.copy()
-        previous_ctrl = self.data.ctrl.copy()
+        with self._physics_lock:
+            arm_positions = np.asarray(joint_positions, dtype=np.float64)
+            previous_qpos = self.data.qpos.copy()
+            previous_qvel = self.data.qvel.copy()
+            previous_ctrl = self.data.ctrl.copy()
 
-        def apply_arm_state(candidate: np.ndarray) -> bool:
-            self.data.qpos[:] = previous_qpos
-            self.data.qvel[:] = previous_qvel
-            self.data.ctrl[:] = previous_ctrl
-            self.data.qpos[self._qpos_indices] = candidate
-            self.data.qvel[self._qvel_indices] = 0.0
-            if self._actuator_ids:
-                self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = candidate
-            self._mujoco.mj_forward(self.model, self.data)
-            return not self._has_gripper_table_penetration()
+            def apply_arm_state(candidate: np.ndarray) -> bool:
+                self.data.qpos[:] = previous_qpos
+                self.data.qvel[:] = previous_qvel
+                self.data.ctrl[:] = previous_ctrl
+                self.data.qpos[self._qpos_indices] = candidate
+                self.data.qvel[self._qvel_indices] = 0.0
+                if self._actuator_ids:
+                    self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = candidate
+                self._mujoco.mj_forward(self.model, self.data)
+                return not self._has_gripper_table_penetration()
 
-        if not apply_arm_state(arm_positions):
-            low, high = 0.0, 1.0
-            best = np.asarray(previous_qpos[self._qpos_indices], dtype=np.float64).copy()
-            for _ in range(12):
-                mid = 0.5 * (low + high)
-                candidate = np.asarray(previous_qpos[self._qpos_indices], dtype=np.float64) + mid * (
-                    arm_positions - np.asarray(previous_qpos[self._qpos_indices], dtype=np.float64)
-                )
-                if apply_arm_state(candidate):
-                    best = candidate.copy()
-                    low = mid
-                else:
-                    high = mid
-            apply_arm_state(best)
-        self._update_visualization_state()
+            if not apply_arm_state(arm_positions):
+                low, high = 0.0, 1.0
+                best = np.asarray(previous_qpos[self._qpos_indices], dtype=np.float64).copy()
+                for _ in range(12):
+                    mid = 0.5 * (low + high)
+                    candidate = np.asarray(previous_qpos[self._qpos_indices], dtype=np.float64) + mid * (
+                        arm_positions - np.asarray(previous_qpos[self._qpos_indices], dtype=np.float64)
+                    )
+                    if apply_arm_state(candidate):
+                        best = candidate.copy()
+                        low = mid
+                    else:
+                        high = mid
+                apply_arm_state(best)
+            self._update_visualization_state()
 
     def _gripper_joint_targets_from_command(self, gripper_command: float) -> dict[str, float]:
         command = float(np.clip(gripper_command, 0.0, 1.0))
@@ -428,33 +467,26 @@ class FR3MujocoEnv(gym.Env):
         return float(upper + command * (lower - upper))
 
     def _set_gripper_command(self, gripper_command: float, *, simulate: bool = False) -> None:
-        self.data.ctrl[self._gripper_actuator_id] = self._gripper_ctrl_from_command(gripper_command)
-        if simulate:
-            frozen_arm_qpos = np.asarray(self.data.qpos[self._qpos_indices], dtype=np.float64).copy()
-            if self._actuator_ids:
-                self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = frozen_arm_qpos
-            self.data.qvel[self._qvel_indices] = 0.0
-            self._mujoco.mj_forward(self.model, self.data)
-            for _ in range(max(int(self.cfg.gripper_sim_steps), 1)):
-                self.data.qpos[self._qpos_indices] = frozen_arm_qpos
-                self.data.qvel[self._qvel_indices] = 0.0
+        with self._physics_lock:
+            self.data.ctrl[self._gripper_actuator_id] = self._gripper_ctrl_from_command(gripper_command)
+            if self.cfg.continuous_physics and self._continuous_physics_thread is not None:
+                return
+            if simulate:
+                frozen_arm_target = np.asarray(self.data.qpos[self._qpos_indices], dtype=np.float64).copy()
                 if self._actuator_ids:
-                    self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = frozen_arm_qpos
-                self._mujoco.mj_step(self.model, self.data)
-            self.data.qpos[self._qpos_indices] = frozen_arm_qpos
-            self.data.qvel[self._qvel_indices] = 0.0
-            if self._actuator_ids:
-                self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = frozen_arm_qpos
+                    self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = frozen_arm_target
+                for _ in range(max(int(self.cfg.gripper_sim_steps), 1)):
+                    self._mujoco.mj_step(self.model, self.data)
+                self._mujoco.mj_forward(self.model, self.data)
+                self._update_visualization_state()
+                return
+
+            targets = self._gripper_joint_targets_from_command(gripper_command)
+            for key, qpos_index in self._gripper_joint_indices.items():
+                self.data.qpos[qpos_index] = targets[key]
+                self.data.qvel[self._gripper_qvel_indices[key]] = 0.0
             self._mujoco.mj_forward(self.model, self.data)
             self._update_visualization_state()
-            return
-
-        targets = self._gripper_joint_targets_from_command(gripper_command)
-        for key, qpos_index in self._gripper_joint_indices.items():
-            self.data.qpos[qpos_index] = targets[key]
-            self.data.qvel[self._gripper_qvel_indices[key]] = 0.0
-        self._mujoco.mj_forward(self.model, self.data)
-        self._update_visualization_state()
 
     def _get_gripper_joint_positions(self) -> dict[str, float]:
         return {
@@ -492,7 +524,8 @@ class FR3MujocoEnv(gym.Env):
         return False
 
     def _get_joint_positions(self) -> np.ndarray:
-        return np.asarray(self.data.qpos[self._qpos_indices], dtype=np.float64).copy()
+        with self._physics_lock:
+            return np.asarray(self.data.qpos[self._qpos_indices], dtype=np.float64).copy()
 
     def _current_tcp_pose(self) -> np.ndarray:
         return np.asarray(self._kinematics.forward_kinematics(self._get_joint_positions()), dtype=np.float64)
@@ -502,6 +535,56 @@ class FR3MujocoEnv(gym.Env):
         if self._target_pose is None:
             self._target_pose = self._tcp_pose.copy()
 
+    def _apply_continuous_control_tick_locked(self) -> None:
+        if self._otg is not None and self._otg_target_joints is not None:
+            current_joints = np.asarray(self.data.qpos[self._qpos_indices], dtype=np.float64).copy()
+            if np.allclose(current_joints, self._otg_target_joints, atol=1e-6, rtol=0):
+                self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = self._otg_target_joints
+            else:
+                next_joints = self._otg.step(current_joints, self._otg_target_joints)
+                self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = np.clip(
+                    next_joints, self._joint_lower, self._joint_upper
+                )
+        elif self._servo_target_joints is not None:
+            self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = np.clip(
+                self._servo_target_joints, self._joint_lower, self._joint_upper
+            )
+
+        self._mujoco.mj_step(self.model, self.data)
+        self._mujoco.mj_forward(self.model, self.data)
+        self._update_visualization_state()
+
+    def _continuous_physics_loop(self) -> None:
+        dt = self.cfg.continuous_physics_dt
+        while not self._continuous_physics_stop.is_set():
+            step_start = time.perf_counter()
+            with self._physics_lock:
+                self._apply_continuous_control_tick_locked()
+            sleep_s = max(dt - (time.perf_counter() - step_start), 0.0)
+            if self._continuous_physics_stop.wait(sleep_s):
+                break
+
+    def _ensure_continuous_physics_thread(self) -> None:
+        if not self.cfg.continuous_physics:
+            return
+        if self._continuous_physics_thread is not None and self._continuous_physics_thread.is_alive():
+            return
+        self._continuous_physics_stop.clear()
+        self._continuous_physics_thread = threading.Thread(
+            target=self._continuous_physics_loop,
+            name="fr3-mujoco-physics",
+            daemon=True,
+        )
+        self._continuous_physics_thread.start()
+
+    def _stop_continuous_physics_thread(self) -> None:
+        if self._continuous_physics_thread is None:
+            return
+        self._continuous_physics_stop.set()
+        self._continuous_physics_thread.join(timeout=1.0)
+        self._continuous_physics_thread = None
+        self._continuous_physics_stop.clear()
+
     def _reset_otg_state(self, current_joint_positions: np.ndarray) -> None:
         if self._otg is None:
             self._otg_target_joints = None
@@ -510,13 +593,24 @@ class FR3MujocoEnv(gym.Env):
         self._otg.reset(current)
         self._otg_target_joints = current.copy()
 
+    def _control_window_step_counts(self, duration_s: float | None) -> tuple[int, int]:
+        window_s = self.cfg.teleop_dt if duration_s is None else max(float(duration_s), 0.0)
+        physics_steps = max(1, int(np.ceil(window_s / self.cfg.otg_dt)))
+        sender_steps = max(1, int(np.ceil(window_s / self.cfg.otg_async_dt)))
+        return physics_steps, sender_steps
+
+    def _advance_servo_window(self, target_joint_positions: np.ndarray, duration_s: float | None) -> tuple[int, int]:
+        physics_steps, sender_steps = self._control_window_step_counts(duration_s)
+        target = np.clip(np.asarray(target_joint_positions, dtype=np.float64), self._joint_lower, self._joint_upper)
+        self._set_arm_target(target)
+        self._step_physics(physics_steps)
+        return physics_steps, sender_steps
+
     def _advance_otg_window(self, duration_s: float | None) -> tuple[int, int]:
         if self._otg is None or self._otg_target_joints is None:
             return 0, 0
 
-        window_s = self.cfg.teleop_dt if duration_s is None else max(float(duration_s), 0.0)
-        otg_steps = max(1, int(np.ceil(window_s / self.cfg.otg_dt)))
-        sender_steps = max(1, int(np.ceil(window_s / self.cfg.otg_async_dt)))
+        otg_steps, sender_steps = self._control_window_step_counts(duration_s)
 
         # Guard: if current and target joints are near-identical (within 1e-6 rad across
         # all DOFs), skip Ruckig to avoid a degenerate time-synchronization failure.
@@ -524,18 +618,19 @@ class FR3MujocoEnv(gym.Env):
         # due to contact resolution, floating-point rounding, or repeated OTG steps.
         current_joints = self._get_joint_positions()
         if np.allclose(current_joints, self._otg_target_joints, atol=1e-6, rtol=0):
-            self._set_joint_state(self._otg_target_joints)
+            self._advance_servo_window(self._otg_target_joints, duration_s)
             return otg_steps, sender_steps
 
         for _ in range(otg_steps):
             current_joints = self._get_joint_positions()
             next_joints = self._otg.step(current_joints, self._otg_target_joints)
-            self._set_joint_state(next_joints)
+            self._set_arm_target(next_joints)
+            self._step_physics(1)
 
-        if self._step_count % 50 == 0:
-            final_joints = self._get_joint_positions()
-            err = np.linalg.norm(final_joints - self._otg_target_joints)
-            print(f"[DEBUG OTG] step={self._step_count} otg_steps={otg_steps} err={err:.6f} target[:3]={self._otg_target_joints[:3]} actual[:3]={final_joints[:3]}")
+        # if self._step_count % 50 == 0:
+        #     final_joints = self._get_joint_positions()
+        #     err = np.linalg.norm(final_joints - self._otg_target_joints)
+        #     print(f"[DEBUG OTG] step={self._step_count} otg_steps={otg_steps} err={err:.6f} target[:3]={self._otg_target_joints[:3]} actual[:3]={final_joints[:3]}")
 
         return otg_steps, sender_steps
 
@@ -605,8 +700,8 @@ class FR3MujocoEnv(gym.Env):
                 delta_rot = Rotation.from_rotvec(np.clip(delta_rot.as_rotvec(), -limit, limit))
 
             desired_pose = np.eye(4, dtype=np.float64)
-            desired_pose[:3, :3] = self._reference_pose[:3, :3] @ delta_rot.as_matrix()
-            desired_pose[:3, 3] = self._reference_pose[:3, 3] + delta_pos
+            desired_pose[:3, :3] = current_pose[:3, :3] @ delta_rot.as_matrix()
+            desired_pose[:3, 3] = current_pose[:3, 3] + delta_pos
             desired_pose[:3, 3] = np.clip(desired_pose[:3, 3], self._workspace_min, self._workspace_max)
         else:
             if self._hold_joint_target is None:
@@ -622,54 +717,64 @@ class FR3MujocoEnv(gym.Env):
         return self.render()
 
     def step_teleop_action(self, action: dict[str, Any] | None, control_period_s: float | None = None):
-        teleop_action = self._normalize_teleop_action(action)
-        current_joints = self._get_joint_positions()
-        current_pose = self._current_tcp_pose()
-        desired_pose, hold_current_joints = self._compute_desired_pose_from_teleop(current_pose, teleop_action)
+        with self._physics_lock:
+            teleop_action = self._normalize_teleop_action(action)
+            current_joints = self._get_joint_positions()
+            current_pose = self._current_tcp_pose()
+            desired_pose, hold_current_joints = self._compute_desired_pose_from_teleop(current_pose, teleop_action)
 
-        if hold_current_joints:
-            target_joints = self._hold_joint_target.copy()
-            if self._step_count % 50 == 0:
-                err = np.linalg.norm(current_joints - target_joints)
-                print(f"[DEBUG HOLD] step={self._step_count} hold=True err={err:.6f} target[:3]={target_joints[:3]}")
-            target_joints = np.clip(target_joints, self._joint_lower, self._joint_upper)
-            # Disabled teleop should freeze on the cached hold target rather than
-            # continuously re-planning through OTG, which can introduce drift.
-            self._set_joint_state(target_joints)
-            otg_steps, sender_steps = 0, 0
-        else:
-            target_joints = np.asarray(self._kinematics.inverse_kinematics(current_joints, desired_pose), dtype=np.float64)
-            target_joints = np.clip(target_joints, self._joint_lower, self._joint_upper)
-            if self._otg is not None:
-                self._otg_target_joints = target_joints.copy()
-                otg_steps, sender_steps = self._advance_otg_window(control_period_s)
+            if hold_current_joints:
+                target_joints = self._hold_joint_target.copy()
+                target_joints = np.clip(target_joints, self._joint_lower, self._joint_upper)
+                self._servo_target_joints = target_joints.copy()
+                self._otg_target_joints = None
+                if self.cfg.continuous_physics:
+                    otg_steps, sender_steps = 0, 0
+                else:
+                    self._advance_servo_window(target_joints, control_period_s)
+                    otg_steps, sender_steps = 0, 0
             else:
-                self._set_joint_state(target_joints)
-                otg_steps, sender_steps = 0, 0
+                target_joints = np.asarray(self._kinematics.inverse_kinematics(current_joints, desired_pose), dtype=np.float64)
+                target_joints = np.clip(target_joints, self._joint_lower, self._joint_upper)
+                if self._otg is not None:
+                    self._otg_target_joints = target_joints.copy()
+                    self._servo_target_joints = None
+                    if self.cfg.continuous_physics:
+                        otg_steps, sender_steps = 0, 0
+                    else:
+                        otg_steps, sender_steps = self._advance_otg_window(control_period_s)
+                else:
+                    self._servo_target_joints = target_joints.copy()
+                    self._otg_target_joints = None
+                    if self.cfg.continuous_physics:
+                        otg_steps, sender_steps = 0, 0
+                    else:
+                        self._advance_servo_window(target_joints, control_period_s)
+                        otg_steps, sender_steps = 0, 0
 
-        previous_gripper = self._last_gripper
-        self._last_gripper = float(teleop_action["gripper"])
-        if not np.isclose(previous_gripper, self._last_gripper):
-            self._set_gripper_command(self._last_gripper, simulate=True)
-        self._last_command_pose = desired_pose.copy()
-        if teleop_action["enabled"]:
-            self._reference_pose = desired_pose.copy()
-        else:
-            self._reference_pose = None
-        self._target_pose = desired_pose.copy()
-        self._prev_enabled = bool(teleop_action["enabled"])
+            previous_gripper = self._last_gripper
+            self._last_gripper = float(teleop_action["gripper"])
+            if not np.isclose(previous_gripper, self._last_gripper):
+                self._set_gripper_command(self._last_gripper, simulate=not self.cfg.continuous_physics)
+            self._last_command_pose = desired_pose.copy()
+            if teleop_action["enabled"]:
+                self._reference_pose = current_pose.copy()
+            else:
+                self._reference_pose = None
+            self._target_pose = desired_pose.copy()
+            self._prev_enabled = bool(teleop_action["enabled"])
 
-        self._step_count += 1
-        observation = self._build_observation()
-        terminated = False
-        truncated = self._step_count >= self.cfg.max_episode_steps
-        info = self._build_info()
-        info["teleop_action"] = teleop_action.copy()
-        info["target_joint_positions"] = target_joints.copy()
-        info["otg_enabled"] = self._otg is not None
-        info["otg_steps"] = otg_steps
-        info["sender_steps"] = sender_steps
-        return observation, 0.0, terminated, truncated, info
+            self._step_count += 1
+            observation = self._build_observation()
+            terminated = False
+            truncated = self._step_count >= self.cfg.max_episode_steps
+            info = self._build_info()
+            info["teleop_action"] = teleop_action.copy()
+            info["target_joint_positions"] = target_joints.copy()
+            info["otg_enabled"] = self._otg is not None
+            info["otg_steps"] = otg_steps
+            info["sender_steps"] = sender_steps
+            return observation, 0.0, terminated, truncated, info
 
     def _build_observation(self) -> dict[str, Any]:
         joint_positions = self._get_joint_positions()
@@ -689,60 +794,71 @@ class FR3MujocoEnv(gym.Env):
         seed: int | None = None,
         options: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        super().reset(seed=seed)
-        self._step_count = 0
-        self._prev_enabled = False
-        self._reference_pose = None
-        self._last_command_pose = None
-        self._hold_joint_target = None
-        self._target_pose = None
-        self._otg_target_joints = None
-        target_joint_positions = self._initial_joint_positions
-        if options and "joint_positions" in options:
+        with self._physics_lock:
+            super().reset(seed=seed)
+            self._step_count = 0
+            self._prev_enabled = False
+            self._reference_pose = None
+            self._last_command_pose = None
+            self._hold_joint_target = None
+            self._target_pose = None
+            self._otg_target_joints = None
+            target_joint_positions = self._initial_joint_positions
+            if options and "joint_positions" in options:
+                target_joint_positions = np.clip(
+                    np.asarray(options["joint_positions"], dtype=np.float64),
+                    self._joint_lower,
+                    self._joint_upper,
+                )
+            self._reset_joint_state(target_joint_positions)
+            self._reset_otg_state(target_joint_positions)
+            self._servo_target_joints = np.asarray(target_joint_positions, dtype=np.float64).copy()
+            self._last_gripper = float(np.clip(self.cfg.initial_gripper, 0.0, 1.0))
+            self._set_gripper_command(self._last_gripper)
+            if self.cfg.continuous_physics:
+                self._ensure_continuous_physics_thread()
+            return self._build_observation(), self._build_info()
+
+    def step(self, action: np.ndarray):
+        with self._physics_lock:
             target_joint_positions = np.clip(
-                np.asarray(options["joint_positions"], dtype=np.float64),
+                np.asarray(action, dtype=np.float64).reshape(len(self.cfg.joint_names)),
                 self._joint_lower,
                 self._joint_upper,
             )
-        self._reset_joint_state(target_joint_positions)
-        self._reset_otg_state(target_joint_positions)
-        self._last_gripper = float(np.clip(self.cfg.initial_gripper, 0.0, 1.0))
-        self._set_gripper_command(self._last_gripper)
-        return self._build_observation(), self._build_info()
-
-    def step(self, action: np.ndarray):
-        target_joint_positions = np.clip(
-            np.asarray(action, dtype=np.float64).reshape(len(self.cfg.joint_names)),
-            self._joint_lower,
-            self._joint_upper,
-        )
-        if self._otg is not None:
-            self._otg_target_joints = target_joint_positions.copy()
-            self._advance_otg_window(self.cfg.teleop_dt)
-        else:
-            self._set_joint_state(target_joint_positions)
-        self._last_command_pose = self._tcp_pose.copy()
-        self._reference_pose = None
-        self._hold_joint_target = None
-        self._prev_enabled = False
-        self._step_count += 1
-        observation = self._build_observation()
-        terminated = False
-        truncated = self._step_count >= self.cfg.max_episode_steps
-        return observation, 0.0, terminated, truncated, self._build_info()
+            if self._otg is not None:
+                self._otg_target_joints = target_joint_positions.copy()
+                self._servo_target_joints = None
+                if not self.cfg.continuous_physics:
+                    self._advance_otg_window(self.cfg.teleop_dt)
+            else:
+                self._servo_target_joints = target_joint_positions.copy()
+                self._otg_target_joints = None
+                if not self.cfg.continuous_physics:
+                    self._advance_servo_window(target_joint_positions, self.cfg.teleop_dt)
+            self._last_command_pose = self._tcp_pose.copy()
+            self._reference_pose = None
+            self._hold_joint_target = None
+            self._prev_enabled = False
+            self._step_count += 1
+            observation = self._build_observation()
+            terminated = False
+            truncated = self._step_count >= self.cfg.max_episode_steps
+            return observation, 0.0, terminated, truncated, self._build_info()
 
     def _build_info(self) -> dict[str, Any]:
-        joint_positions = self._get_joint_positions()
-        ee_pose = self._current_tcp_pose()
-        info = {
-            "joint_positions": joint_positions,
-            "ee_pose": ee_pose,
-            "target_frame_name": self.cfg.target_frame_name,
-        }
-        if self.cfg.enable_cameras:
-            info["camera_obs"] = self._build_camera_obs()
-        info.update(self._build_visualization_info())
-        return info
+        with self._physics_lock:
+            joint_positions = self._get_joint_positions()
+            ee_pose = self._current_tcp_pose()
+            info = {
+                "joint_positions": joint_positions,
+                "ee_pose": ee_pose,
+                "target_frame_name": self.cfg.target_frame_name,
+            }
+            if self.cfg.enable_cameras:
+                info["camera_obs"] = self._build_camera_obs()
+            info.update(self._build_visualization_info())
+            return info
 
     def _get_renderer(self):
         if self._renderer is None:
@@ -754,15 +870,17 @@ class FR3MujocoEnv(gym.Env):
         return self._renderer
 
     def render(self):
-        renderer = self._get_renderer()
-        frames: dict[str, np.ndarray] = {}
-        for camera_name in self.cfg.camera_names:
-            model_camera_name = self.cfg.camera_name_mapping.get(camera_name, camera_name)
-            renderer.update_scene(self.data, camera=model_camera_name)
-            frames[camera_name] = np.asarray(renderer.render()).copy()
-        return frames
+        with self._physics_lock:
+            renderer = self._get_renderer()
+            frames: dict[str, np.ndarray] = {}
+            for camera_name in self.cfg.camera_names:
+                model_camera_name = self.cfg.camera_name_mapping.get(camera_name, camera_name)
+                renderer.update_scene(self.data, camera=model_camera_name)
+                frames[camera_name] = np.asarray(renderer.render()).copy()
+            return frames
 
     def close(self) -> None:
+        self._stop_continuous_physics_thread()
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
