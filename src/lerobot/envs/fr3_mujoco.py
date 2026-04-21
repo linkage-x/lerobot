@@ -91,6 +91,7 @@ class FR3MujocoEnvConfig:
     max_target_delta_pos: tuple[float, float, float] | None = None
     max_target_delta_rot: tuple[float, float, float] | None = None
     use_otg: bool = True
+    arm_actuator_kp: float | None = None
     teleop_control_frequency: float = 200.0
     otg_control_frequency: float = 800.0
     otg_async_control_frequency: float = 1000.0
@@ -238,6 +239,7 @@ class FR3MujocoEnv(gym.Env):
         self._qvel_indices = np.asarray(self._qvel_indices, dtype=np.int64)
         self._joint_lower = self.model.jnt_range[self._joint_ids, 0].astype(np.float64)
         self._joint_upper = self.model.jnt_range[self._joint_ids, 1].astype(np.float64)
+        self._configure_arm_position_actuators()
         self._kinematics = self._build_kinematics()
         self._otg = self._build_otg()
         self._initial_joint_positions = np.clip(
@@ -390,6 +392,16 @@ class FR3MujocoEnv(gym.Env):
             synchronization=self.cfg.otg_synchronization,
             sync_mode=self.cfg.otg_sync_mode,
         )
+
+    def _configure_arm_position_actuators(self) -> None:
+        if self.cfg.arm_actuator_kp is None:
+            return
+        kp = float(self.cfg.arm_actuator_kp)
+        if kp <= 0:
+            raise ValueError("arm_actuator_kp must be positive when provided.")
+        actuator_ids = np.asarray(self._actuator_ids, dtype=np.int64)
+        self.model.actuator_gainprm[actuator_ids, 0] = kp
+        self.model.actuator_biasprm[actuator_ids, 1] = -kp
 
     def _set_arm_target(self, joint_positions: np.ndarray) -> np.ndarray:
         with self._physics_lock:

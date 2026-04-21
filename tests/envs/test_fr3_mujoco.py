@@ -285,6 +285,16 @@ def test_env_uses_mujoco_kinematics_for_main_fk_ik_path():
         env.close()
 
 
+def test_arm_actuator_kp_override_updates_mujoco_position_actuators():
+    env = FR3MujocoEnv(cfg=FR3MujocoEnvConfig(arm_actuator_kp=20000.0))
+    try:
+        actuator_ids = np.asarray(env._actuator_ids, dtype=np.int64)
+        np.testing.assert_allclose(env.model.actuator_gainprm[actuator_ids, 0], 20000.0)
+        np.testing.assert_allclose(env.model.actuator_biasprm[actuator_ids, 1], -20000.0)
+    finally:
+        env.close()
+
+
 def test_mujoco_ik_solution_moves_real_tcp_to_target_frame():
     env = FR3MujocoEnv()
     try:

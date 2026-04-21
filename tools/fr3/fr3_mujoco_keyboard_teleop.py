@@ -112,6 +112,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--camera-width", type=int, default=_D435I_COLOR_WIDTH)
     parser.add_argument("--camera-height", type=int, default=_D435I_COLOR_HEIGHT)
     parser.add_argument(
+        "--arm-actuator-kp",
+        type=float,
+        default=20000.0,
+        help="Override MuJoCo FR3 arm position actuator kp for teleop stability.",
+    )
+    parser.add_argument(
         "--disable-continuous-physics",
         dest="continuous_physics",
         action="store_false",
@@ -157,6 +163,7 @@ def build_env_config(args: argparse.Namespace) -> FR3MujocoEnvConfig:
     return FR3MujocoEnvConfig(
         max_episode_steps=max_episode_steps,
         use_otg=bool(args.use_otg),
+        arm_actuator_kp=float(args.arm_actuator_kp),
         enable_cameras=bool(args.enable_cameras),
         camera_width=int(args.camera_width),
         camera_height=int(args.camera_height),
