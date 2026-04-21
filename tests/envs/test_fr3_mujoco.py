@@ -285,6 +285,26 @@ def test_env_uses_mujoco_kinematics_for_main_fk_ik_path():
         env.close()
 
 
+def test_mujoco_ik_solution_moves_real_tcp_to_target_frame():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        current_joints = env._get_joint_positions()
+        current_pose = env._current_tcp_pose()
+
+        target_pose = current_pose.copy()
+        target_pose[:3, 3] += np.array([0.002, 0.002, 0.002], dtype=np.float64)
+
+        ik_joints = env._kinematics.inverse_kinematics(current_joints, target_pose, lock_orientation=True)
+        env._reset_joint_state(ik_joints)
+        achieved_pose = env._current_tcp_pose()
+
+        np.testing.assert_allclose(achieved_pose[:3, 3], target_pose[:3, 3], atol=5e-4)
+        np.testing.assert_allclose(achieved_pose[:3, :3], target_pose[:3, :3], atol=5e-3)
+    finally:
+        env.close()
+
+
 def test_teleop_action_clips_target_to_workspace():
     cfg = FR3MujocoEnvConfig(
         workspace_min=(0.25, -0.1, 0.2),

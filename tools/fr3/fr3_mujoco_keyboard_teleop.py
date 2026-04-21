@@ -21,6 +21,7 @@ Run:
          [--camera-width W] [--camera-height H]
          [--disable-continuous-physics]
          [--continuous-physics-frequency HZ]
+         [--enable-otg]
          [--delta-scale FLOAT]   # multiply keyboard deltas (default 0.01 m/key-step)
 """
 
@@ -124,6 +125,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.set_defaults(continuous_physics=True)
     parser.add_argument(
+        "--disable-otg",
+        dest="use_otg",
+        action="store_false",
+        help="Disable OTG for MuJoCo teleop (default).",
+    )
+    parser.add_argument(
+        "--enable-otg",
+        dest="use_otg",
+        action="store_true",
+        help="Enable OTG for MuJoCo teleop.",
+    )
+    parser.set_defaults(use_otg=False)
+    parser.add_argument(
         "--delta-scale",
         type=float,
         default=0.01,
@@ -142,6 +156,7 @@ def build_env_config(args: argparse.Namespace) -> FR3MujocoEnvConfig:
         max_episode_steps = max(int(args.duration_s * args.fps) + 100, 1_000)
     return FR3MujocoEnvConfig(
         max_episode_steps=max_episode_steps,
+        use_otg=bool(args.use_otg),
         enable_cameras=bool(args.enable_cameras),
         camera_width=int(args.camera_width),
         camera_height=int(args.camera_height),

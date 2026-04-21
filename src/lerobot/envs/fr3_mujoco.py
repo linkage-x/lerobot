@@ -298,6 +298,7 @@ class FR3MujocoEnv(gym.Env):
         self._target_pose: np.ndarray | None = None
         self._tcp_pose: np.ndarray | None = None
         self._otg_target_joints: np.ndarray | None = None
+        self._otg_command_joints: np.ndarray | None = None
         self._servo_target_joints: np.ndarray | None = None
         self._last_gripper = float(np.clip(self.cfg.initial_gripper, 0.0, 1.0))
 
@@ -360,12 +361,17 @@ class FR3MujocoEnv(gym.Env):
         return mujoco
 
     def _build_kinematics(self):
-        from lerobot.robots.franka_research3.backends import LocalKinematicsDriver
-
-        return LocalKinematicsDriver(
-            urdf_path=self.cfg.urdf_path,
+        # Keep teleop IK/FK on the same kinematic model that MuJoCo executes.
+        # Mixing URDF/placo kinematics with MuJoCo physics lets target_pose look
+        # correct in FK while the simulated TCP moves in a different direction.
+        return _MujocoArmKinematics(
+            mujoco=self._mujoco,
+            model=self.model,
             target_frame_name=self.cfg.target_frame_name,
-            joint_names=list(self.cfg.joint_names),
+            qpos_indices=self._qpos_indices,
+            qvel_indices=self._qvel_indices,
+            joint_lower=self._joint_lower,
+            joint_upper=self._joint_upper,
         )
 
     def _build_otg(self):
@@ -562,11 +568,17 @@ class FR3MujocoEnv(gym.Env):
 
     def _apply_continuous_control_tick_locked(self) -> None:
         if self._otg is not None and self._otg_target_joints is not None:
-            current_joints = np.asarray(self.data.qpos[self._qpos_indices], dtype=np.float64).copy()
-            if np.allclose(current_joints, self._otg_target_joints, atol=1e-6, rtol=0):
+            command_joints = (
+                np.asarray(self.data.qpos[self._qpos_indices], dtype=np.float64).copy()
+                if self._otg_command_joints is None
+                else self._otg_command_joints.copy()
+            )
+            if np.allclose(command_joints, self._otg_target_joints, atol=1e-6, rtol=0):
+                self._otg_command_joints = self._otg_target_joints.copy()
                 self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = self._otg_target_joints
             else:
-                next_joints = self._otg.step(current_joints, self._otg_target_joints)
+                next_joints = self._otg.step(command_joints, self._otg_target_joints)
+                self._otg_command_joints = next_joints.copy()
                 self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = np.clip(
                     next_joints, self._joint_lower, self._joint_upper
                 )
@@ -613,10 +625,12 @@ class FR3MujocoEnv(gym.Env):
     def _reset_otg_state(self, current_joint_positions: np.ndarray) -> None:
         if self._otg is None:
             self._otg_target_joints = None
+            self._otg_command_joints = None
             return
         current = np.asarray(current_joint_positions, dtype=np.float64)
         self._otg.reset(current)
         self._otg_target_joints = current.copy()
+        self._otg_command_joints = current.copy()
 
     def _control_window_step_counts(self, duration_s: float | None) -> tuple[int, int]:
         window_s = self.cfg.teleop_dt if duration_s is None else max(float(duration_s), 0.0)
@@ -636,21 +650,24 @@ class FR3MujocoEnv(gym.Env):
             return 0, 0
 
         otg_steps, sender_steps = self._control_window_step_counts(duration_s)
+        command_joints = (
+            self._get_joint_positions() if self._otg_command_joints is None else self._otg_command_joints.copy()
+        )
 
-        # Guard: if current and target joints are near-identical (within 1e-6 rad across
-        # all DOFs), skip Ruckig to avoid a degenerate time-synchronization failure.
-        # This can happen when the physics state drifts slightly from _otg_target_joints
-        # due to contact resolution, floating-point rounding, or repeated OTG steps.
-        current_joints = self._get_joint_positions()
-        if np.allclose(current_joints, self._otg_target_joints, atol=1e-6, rtol=0):
+        # Use the previous OTG command state, matching the real-robot integration.
+        # Refeeding lagging measured qpos together with planned velocity/acceleration
+        # makes Ruckig replan from an inconsistent state and can reverse direction.
+        if np.allclose(command_joints, self._otg_target_joints, atol=1e-6, rtol=0):
+            self._otg_command_joints = self._otg_target_joints.copy()
             self._advance_servo_window(self._otg_target_joints, duration_s)
             return otg_steps, sender_steps
 
         for _ in range(otg_steps):
-            current_joints = self._get_joint_positions()
-            next_joints = self._otg.step(current_joints, self._otg_target_joints)
+            next_joints = self._otg.step(command_joints, self._otg_target_joints)
+            self._otg_command_joints = next_joints.copy()
             self._set_arm_target(next_joints)
             self._step_physics(1)
+            command_joints = next_joints.copy()
 
         # if self._step_count % 50 == 0:
         #     final_joints = self._get_joint_positions()
@@ -831,6 +848,7 @@ class FR3MujocoEnv(gym.Env):
             self._hold_joint_target = None
             self._target_pose = None
             self._otg_target_joints = None
+            self._otg_command_joints = None
             target_joint_positions = self._initial_joint_positions
             if options and "joint_positions" in options:
                 target_joint_positions = np.clip(

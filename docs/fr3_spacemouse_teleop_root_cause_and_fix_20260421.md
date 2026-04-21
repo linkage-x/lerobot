@@ -29,6 +29,18 @@
 - 一旦某一步 IK 让末端轻微低头，下一步又会把这个低头姿态当成新的基线
 - 结果是：姿态误差被逐步积分，形成持续漂移
 
+4. 仿真执行模型与 IK/FK 模型不一致
+- 在 FR3 MuJoCo 环境中，实际物理执行由 MuJoCo 模型负责
+- 但此前 `_build_kinematics()` 默认返回的是 `LocalKinematicsDriver`，也就是 `URDF + placo` 运动学链
+- 新增 `pika_task_tcp` 后，这两套模型在 TCP 定义上并不再严格一致
+- 结果是：`target_pose` 在 `placo FK` 看起来正确，但同一组关节角写进 MuJoCo 后，真实 `tcp_pose` 会朝另一个方向漂移
+
+这条根因是本次进一步定位后确认的关键补充：
+
+- `SpaceMouse -> target_pose` 这一层已经可以按 `+x/+y/+z` 正常推进
+- 真正反向的是 `target_pose -> IK joints -> MuJoCo tcp_pose`
+- 当切换到 MuJoCo 自身的雅可比 IK `_MujocoArmKinematics` 后，`+x/+y/+z` 三个单轴目标都可以在 MuJoCo 模型内准确收敛
+
 ## 非根因
 
 以下现象目前判断为噪声，不是本次问题的根因：
@@ -116,6 +128,7 @@
 - 增加单轴输入到机器人命令的映射测试
 - 增加“禁转时姿态不漂移”的回归测试
 - 增加“重复小步命令不积累姿态漂移”的回归测试
+- 增加“IK 解写回 MuJoCo 后，真实 TCP 必须落在目标 frame” 的执行层回归测试
 
 ## 验收标准
 
@@ -137,3 +150,61 @@
 - 先止血，立即去掉最危险的姿态漂移
 - 再修坐标映射，避免把“方向错”和“姿态漂”混在一起调参
 - 最后用测试把这两个问题分层锁死，防止回归
+
+## 2026-04-21 补充结论
+
+对 `FR3MujocoEnv` 做单轴注入后，已经确认：
+
+1. `target_pose` 本身会按期望方向变化
+2. 旧的 `LocalKinematicsDriver` 会给出一组在 `placo FK` 中正确、但在 MuJoCo 中错误的关节解
+3. MuJoCo 自带 `_MujocoArmKinematics` 则能在真实仿真模型里把 TCP 准确送到 `+x/+y/+z` 目标
+
+因此，`spacemouse 移动时末端向 -x/-z 方向移动且低头` 的核心根因已收敛为：
+
+- 输入层存在映射问题
+- 控制层曾存在姿态锁不严的问题
+- 但当前仿真中最直接导致“target 正确、真实 TCP 反向”的主根因，是 **MuJoCo 仿真执行与 URDF/placo IK/FK 混用**
+
+对应修复原则也因此明确为：
+
+- FR3 MuJoCo 环境中，主 IK/FK 路径必须默认使用 MuJoCo 自身模型
+- `URDF/placo` 只能用于离线对照或独立分析，不能再作为仿真主控制链的一部分
+
+## 2026-04-21 再补充：OTG 与剩余下沉现象
+
+在将 FR3 MuJoCo 环境的主 IK/FK 路径切到 MuJoCo 自身模型后，问题进一步收敛为两层：
+
+1. 仿真 teleop 上的 OTG 会放大小步吞没问题
+- 对于 `SpaceMouse` 的小增量输入，OTG 会先把关节目标切成更细的小步
+- 在当前 MuJoCo FR3 arm 执行层里，这些小步在首个控制窗口内很容易被重力瞬态淹没
+- 实测结果是：仿真 teleop 默认关闭 OTG 后，`+x` 已经能出现正向响应；显式开启 OTG 时，首个小步几乎完全被吞掉
+
+因此，仿真 teleop 工具层先做了一个工程性止血：
+
+- `tools/fr3/fr3_mujoco_teleop.py` 默认 `use_otg=False`
+- `tools/fr3/fr3_mujoco_keyboard_teleop.py` 默认 `use_otg=False`
+- 如需恢复旧行为，可显式添加 `--enable-otg`
+
+这一步不是最终修复，但能明显减少“轻推一下几乎不动，或被错误瞬态主导”的问题。
+
+2. 剩余的 `-z` 下沉和“低头感”来自 MuJoCo arm actuator 的执行特性
+- 当前 FR3 arm 在 MuJoCo 中使用的是 `<position>` actuator，而不是 torque actuator
+- 这类 actuator 的控制语义本质上是 `ctrl = q_target`
+- 当 `ctrl` 刚好等于当前关节角时，初始恢复力矩接近 0
+- 在没有显式重力补偿前馈的情况下，机械臂会先在重力作用下产生位置误差，然后 position servo 才开始拉回
+
+直接证据：
+
+- 即使完全不动 `SpaceMouse`，只保持当前 joint target，不断推进物理仿真，TCP 也会自己向 `-x/-z` 缓慢漂移
+- 这说明“轻推一下就下沉”不再是输入层问题，而是执行层的静力不平衡与瞬态响应问题
+
+因此，当前剩余问题的主根因已经从“映射错误”收敛为：
+
+- 仿真 teleop 的 OTG 不适合当前这套小步 Cartesian 操作
+- MuJoCo FR3 arm position actuator 在现有参数下对重力瞬态抑制不够
+
+接下来的收敛方向应当集中在执行层，而不是继续修改 SpaceMouse 轴映射：
+
+1. 仿真 teleop 默认禁用 OTG，保留显式 `--enable-otg` 作为对照开关
+2. 调整 MuJoCo FR3 arm actuator 参数，提高对重力瞬态的抑制能力
+3. 继续观测在 translation-only 模式下，低头现象中有多少来自真实姿态漂移，有多少只是 `TCP z` 下沉造成的视觉感受

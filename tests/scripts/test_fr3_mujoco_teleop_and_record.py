@@ -25,6 +25,13 @@ def test_parse_args_accepts_camera_viewer_and_resolution_flags():
     assert args.camera_width == 640
     assert args.camera_height == 480
     assert args.continuous_physics is True
+    assert args.use_otg is False
+
+
+def test_parse_args_enable_otg_opt_in_overrides_default():
+    args = fr3_mujoco_teleop.parse_args(["--enable-otg"])
+
+    assert args.use_otg is True
 
 
 def test_build_env_config_uses_d435i_like_camera_defaults_when_enabled():
@@ -37,6 +44,7 @@ def test_build_env_config_uses_d435i_like_camera_defaults_when_enabled():
     assert cfg.camera_height == 480
     assert cfg.camera_names == ("third_person", "side", "wrist")
     assert cfg.camera_fovy == 42.0
+    assert cfg.use_otg is False
     assert cfg.continuous_physics is True
     assert cfg.continuous_physics_frequency == 800.0
 

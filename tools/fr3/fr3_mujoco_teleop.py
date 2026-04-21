@@ -42,6 +42,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Background MuJoCo stepping frequency in Hz when continuous physics is enabled.",
     )
     parser.set_defaults(continuous_physics=True)
+    parser.add_argument(
+        "--disable-otg",
+        dest="use_otg",
+        action="store_false",
+        help="Disable OTG for MuJoCo teleop (default).",
+    )
+    parser.add_argument(
+        "--enable-otg",
+        dest="use_otg",
+        action="store_true",
+        help="Enable OTG for MuJoCo teleop.",
+    )
+    parser.set_defaults(use_otg=False)
     parser.add_argument("--tool-mode", choices=[mode.value for mode in SpaceMouseToolMode], default="incremental")
     parser.add_argument("--motion-enable-button", choices=[button.value for button in SpaceMouseEnableButton], default="none")
     parser.add_argument(
@@ -123,6 +136,7 @@ def build_env_config(args: argparse.Namespace) -> FR3MujocoEnvConfig:
         max_episode_steps = max(int(args.duration_s * args.fps) + 100, 1_000)
     return FR3MujocoEnvConfig(
         max_episode_steps=max_episode_steps,
+        use_otg=bool(args.use_otg),
         enable_cameras=bool(args.enable_cameras),
         camera_width=int(args.camera_width),
         camera_height=int(args.camera_height),
@@ -178,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
                 "camera_width": args.camera_width,
                 "camera_height": args.camera_height,
                 "camera_fovy": _D435I_COLOR_FOVY_DEG,
+                "use_otg": args.use_otg,
                 "continuous_physics": args.continuous_physics,
                 "continuous_physics_frequency": args.continuous_physics_frequency,
                 "tool_mode": args.tool_mode,
