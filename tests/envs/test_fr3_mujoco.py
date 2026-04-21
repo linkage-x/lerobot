@@ -295,6 +295,60 @@ def test_arm_actuator_kp_override_updates_mujoco_position_actuators():
         env.close()
 
 
+def test_arm_gravity_compensation_applies_zero_velocity_qfrc_bias_to_arm_dofs():
+    env = FR3MujocoEnv(cfg=FR3MujocoEnvConfig(enable_arm_gravity_compensation=True))
+    try:
+        env.reset()
+        env._apply_arm_gravity_compensation_locked()
+        gravity_comp_data = env._gravity_comp_data
+        assert gravity_comp_data is not None
+        np.testing.assert_allclose(
+            env.data.qfrc_applied[env._qvel_indices],
+            env.cfg.arm_gravity_compensation_scale * gravity_comp_data.qfrc_bias[env._qvel_indices],
+            atol=1e-9,
+        )
+        np.testing.assert_allclose(gravity_comp_data.qvel, 0.0, atol=1e-12)
+    finally:
+        env.close()
+
+
+def test_arm_gravity_compensation_reduces_hold_drift():
+    compensated = FR3MujocoEnv(
+        cfg=FR3MujocoEnvConfig(
+            use_otg=False,
+            continuous_physics=False,
+            enable_arm_gravity_compensation=True,
+        )
+    )
+    uncompensated = FR3MujocoEnv(
+        cfg=FR3MujocoEnvConfig(
+            use_otg=False,
+            continuous_physics=False,
+            enable_arm_gravity_compensation=False,
+        )
+    )
+    try:
+        compensated.reset()
+        uncompensated.reset()
+
+        compensated_start = compensated._current_tcp_pose().copy()
+        uncompensated_start = uncompensated._current_tcp_pose().copy()
+        compensated_hold = compensated._get_joint_positions().copy()
+        uncompensated_hold = uncompensated._get_joint_positions().copy()
+
+        for _ in range(8):
+            compensated._advance_servo_window(compensated_hold, compensated.cfg.teleop_dt)
+            uncompensated._advance_servo_window(uncompensated_hold, uncompensated.cfg.teleop_dt)
+
+        compensated_drift = np.linalg.norm(compensated._current_tcp_pose()[:3, 3] - compensated_start[:3, 3])
+        uncompensated_drift = np.linalg.norm(uncompensated._current_tcp_pose()[:3, 3] - uncompensated_start[:3, 3])
+
+        assert compensated_drift < uncompensated_drift
+    finally:
+        compensated.close()
+        uncompensated.close()
+
+
 def test_mujoco_ik_solution_moves_real_tcp_to_target_frame():
     env = FR3MujocoEnv()
     try:

@@ -92,6 +92,8 @@ class FR3MujocoEnvConfig:
     max_target_delta_rot: tuple[float, float, float] | None = None
     use_otg: bool = True
     arm_actuator_kp: float | None = None
+    enable_arm_gravity_compensation: bool = True
+    arm_gravity_compensation_scale: float = 0.5
     teleop_control_frequency: float = 200.0
     otg_control_frequency: float = 800.0
     otg_async_control_frequency: float = 1000.0
@@ -216,6 +218,7 @@ class FR3MujocoEnv(gym.Env):
         self._physics_lock = threading.RLock()
         self._continuous_physics_stop = threading.Event()
         self._continuous_physics_thread: threading.Thread | None = None
+        self._gravity_comp_data = self._mujoco.MjData(self.model) if self.cfg.enable_arm_gravity_compensation else None
 
         self._joint_ids = []
         self._qpos_indices = []
@@ -403,6 +406,32 @@ class FR3MujocoEnv(gym.Env):
         self.model.actuator_gainprm[actuator_ids, 0] = kp
         self.model.actuator_biasprm[actuator_ids, 1] = -kp
 
+    def _apply_arm_gravity_compensation_locked(self) -> None:
+        if not self.cfg.enable_arm_gravity_compensation:
+            self.data.qfrc_applied[self._qvel_indices] = 0.0
+            return
+        if self._gravity_comp_data is None:
+            self.data.qfrc_applied[self._qvel_indices] = 0.0
+            return
+        scale = float(self.cfg.arm_gravity_compensation_scale)
+        if scale < 0:
+            raise ValueError("arm_gravity_compensation_scale must be non-negative.")
+
+        # First version of arm gravity compensation: evaluate bias forces on a
+        # zero-velocity copy of the current state so we only cancel the gravity
+        # load and avoid feeding Coriolis/centrifugal terms back into teleop.
+        self._gravity_comp_data.qpos[:] = self.data.qpos
+        self._gravity_comp_data.qvel[:] = 0.0
+        if hasattr(self._gravity_comp_data, "act") and hasattr(self.data, "act"):
+            if self._gravity_comp_data.act.shape == self.data.act.shape:
+                self._gravity_comp_data.act[:] = self.data.act
+        self._gravity_comp_data.ctrl[:] = self.data.ctrl
+        self._mujoco.mj_forward(self.model, self._gravity_comp_data)
+        self.data.qfrc_applied[self._qvel_indices] = np.asarray(
+            scale * self._gravity_comp_data.qfrc_bias[self._qvel_indices],
+            dtype=np.float64,
+        )
+
     def _set_arm_target(self, joint_positions: np.ndarray) -> np.ndarray:
         with self._physics_lock:
             arm_positions = np.clip(joint_positions, self._joint_lower, self._joint_upper)
@@ -413,6 +442,7 @@ class FR3MujocoEnv(gym.Env):
     def _step_physics(self, physics_steps: int = 1) -> None:
         with self._physics_lock:
             for _ in range(max(int(physics_steps), 1)):
+                self._apply_arm_gravity_compensation_locked()
                 self._mujoco.mj_step(self.model, self.data)
             self._mujoco.mj_forward(self.model, self.data)
             self._update_visualization_state()
@@ -511,6 +541,7 @@ class FR3MujocoEnv(gym.Env):
                     self.data.qvel[self._qvel_indices] = 0.0
                     if self._actuator_ids:
                         self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = frozen_arm_target
+                    self._apply_arm_gravity_compensation_locked()
                     self._mujoco.mj_step(self.model, self.data)
                 self.data.qpos[self._qpos_indices] = frozen_arm_target
                 self.data.qvel[self._qvel_indices] = 0.0
@@ -599,6 +630,7 @@ class FR3MujocoEnv(gym.Env):
                 self._servo_target_joints, self._joint_lower, self._joint_upper
             )
 
+        self._apply_arm_gravity_compensation_locked()
         self._mujoco.mj_step(self.model, self.data)
         self._mujoco.mj_forward(self.model, self.data)
         self._update_visualization_state()
@@ -912,6 +944,7 @@ class FR3MujocoEnv(gym.Env):
                 "joint_positions": joint_positions,
                 "ee_pose": ee_pose,
                 "target_frame_name": self.cfg.target_frame_name,
+                "arm_gravity_compensation_enabled": bool(self.cfg.enable_arm_gravity_compensation),
             }
             if self.cfg.enable_cameras:
                 info["camera_obs"] = self._build_camera_obs()
