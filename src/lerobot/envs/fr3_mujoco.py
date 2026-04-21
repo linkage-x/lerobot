@@ -55,7 +55,7 @@ def _default_fr3_sim_xml_path() -> str:
 class FR3MujocoEnvConfig:
     urdf_path: str = field(default_factory=_default_fr3_urdf_path)
     sim_xml_path: str = field(default_factory=_default_fr3_sim_xml_path)
-    target_frame_name: str = "pika_gripper_ee"
+    target_frame_name: str = "pika_task_tcp"
     target_marker_name: str = "target"
     target_site_name: str = "target_site"
     tcp_marker_name: str = "TCP"
@@ -161,11 +161,21 @@ class _MujocoArmKinematics:
         pose[:3, :3] = self._data.xmat[self._target_body_id].reshape(3, 3)
         return pose
 
-    def inverse_kinematics(self, current_joint_positions: np.ndarray, desired_pose: np.ndarray) -> np.ndarray:
+    def inverse_kinematics(
+        self,
+        current_joint_positions: np.ndarray,
+        desired_pose: np.ndarray,
+        *,
+        lock_orientation: bool = False,
+        orientation_weight: float | None = None,
+    ) -> np.ndarray:
         guess = np.clip(np.asarray(current_joint_positions, dtype=np.float64), self._joint_lower, self._joint_upper)
         jac_pos = np.zeros((3, self._model.nv), dtype=np.float64)
         jac_rot = np.zeros((3, self._model.nv), dtype=np.float64)
         damping = 0.3
+        resolved_orientation_weight = 1.0 if lock_orientation else 0.01
+        if orientation_weight is not None:
+            resolved_orientation_weight = float(orientation_weight)
 
         for _ in range(200):
             self._set_arm_qpos(guess)
@@ -176,7 +186,7 @@ class _MujocoArmKinematics:
             rot_error = (
                 Rotation.from_matrix(np.asarray(desired_pose[:3, :3], dtype=np.float64) @ current_rot.T).as_rotvec()
             )
-            error = np.concatenate([pos_error, rot_error], dtype=np.float64)
+            error = np.concatenate([pos_error, rot_error * resolved_orientation_weight], dtype=np.float64)
             if np.linalg.norm(error) < 1e-6:
                 break
 
@@ -258,6 +268,9 @@ class FR3MujocoEnv(gym.Env):
 
         self._workspace_min = np.asarray(self.cfg.workspace_min, dtype=np.float64)
         self._workspace_max = np.asarray(self.cfg.workspace_max, dtype=np.float64)
+        self._tcp_body_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_BODY, self.cfg.target_frame_name)
+        if self._tcp_body_id < 0:
+            raise ValueError(f"TCP body '{self.cfg.target_frame_name}' not found in MuJoCo model.")
         self._gripper_base_body_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_BODY, "gripper_base")
         self._gripper_left_body_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_BODY, "gripper_left_link")
         self._gripper_right_body_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_BODY, "gripper_right_link")
@@ -536,7 +549,11 @@ class FR3MujocoEnv(gym.Env):
             return np.asarray(self.data.qpos[self._qpos_indices], dtype=np.float64).copy()
 
     def _current_tcp_pose(self) -> np.ndarray:
-        return np.asarray(self._kinematics.forward_kinematics(self._get_joint_positions()), dtype=np.float64)
+        with self._physics_lock:
+            pose = np.eye(4, dtype=np.float64)
+            pose[:3, 3] = np.asarray(self.data.xpos[self._tcp_body_id], dtype=np.float64)
+            pose[:3, :3] = np.asarray(self.data.xmat[self._tcp_body_id], dtype=np.float64).reshape(3, 3)
+            return pose
 
     def _update_visualization_state(self) -> None:
         self._tcp_pose = self._current_tcp_pose()
@@ -708,8 +725,8 @@ class FR3MujocoEnv(gym.Env):
                 delta_rot = Rotation.from_rotvec(np.clip(delta_rot.as_rotvec(), -limit, limit))
 
             desired_pose = np.eye(4, dtype=np.float64)
-            desired_pose[:3, :3] = current_pose[:3, :3] @ delta_rot.as_matrix()
-            desired_pose[:3, 3] = current_pose[:3, 3] + delta_pos
+            desired_pose[:3, :3] = self._reference_pose[:3, :3] @ delta_rot.as_matrix()
+            desired_pose[:3, 3] = self._reference_pose[:3, 3] + delta_pos
             desired_pose[:3, 3] = np.clip(desired_pose[:3, 3], self._workspace_min, self._workspace_max)
         else:
             if self._hold_joint_target is None:
@@ -742,7 +759,10 @@ class FR3MujocoEnv(gym.Env):
                     self._advance_servo_window(target_joints, control_period_s)
                     otg_steps, sender_steps = 0, 0
             else:
-                target_joints = np.asarray(self._kinematics.inverse_kinematics(current_joints, desired_pose), dtype=np.float64)
+                target_joints = np.asarray(
+                    self._kinematics.inverse_kinematics(current_joints, desired_pose, lock_orientation=True),
+                    dtype=np.float64,
+                )
                 target_joints = np.clip(target_joints, self._joint_lower, self._joint_upper)
                 if self._otg is not None:
                     self._otg_target_joints = target_joints.copy()
@@ -766,7 +786,7 @@ class FR3MujocoEnv(gym.Env):
                 self._set_gripper_command(self._last_gripper, simulate=not self.cfg.continuous_physics)
             self._last_command_pose = desired_pose.copy()
             if teleop_action["enabled"]:
-                self._reference_pose = current_pose.copy()
+                self._reference_pose = desired_pose.copy()
             else:
                 self._reference_pose = None
             self._target_pose = desired_pose.copy()
@@ -786,7 +806,7 @@ class FR3MujocoEnv(gym.Env):
 
     def _build_observation(self) -> dict[str, Any]:
         joint_positions = self._get_joint_positions()
-        ee_pose = np.asarray(self._kinematics.forward_kinematics(joint_positions), dtype=np.float64)
+        ee_pose = self._current_tcp_pose()
         env_state = np.concatenate([ee_pose[:3, 3], ee_pose[:3, :3].reshape(-1)], dtype=np.float64)
         observation: dict[str, Any] = {
             "agent_pos": joint_positions.astype(np.float32),

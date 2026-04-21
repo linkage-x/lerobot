@@ -8,6 +8,7 @@ import pytest
 
 from lerobot.envs.fr3_mujoco import FR3MujocoEnv
 from lerobot.envs.fr3_mujoco import FR3MujocoEnvConfig
+from lerobot.utils.rotation import Rotation
 
 
 def test_default_fr3_mujoco_asset_paths_exist():
@@ -41,6 +42,19 @@ def test_reset_info_exposes_target_tcp_marker_state_and_named_cameras():
         np.testing.assert_allclose(info["target_pose"], info["tcp_pose"])
         assert info["target_pose_7d"].shape == (7,)
         assert info["tcp_pose_7d"].shape == (7,)
+    finally:
+        env.close()
+
+
+def test_current_tcp_pose_reads_directly_from_mujoco_tcp_body():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        tcp_pose = env._current_tcp_pose()
+        body_pose = np.eye(4, dtype=np.float64)
+        body_pose[:3, 3] = np.asarray(env.data.xpos[env._tcp_body_id], dtype=np.float64)
+        body_pose[:3, :3] = np.asarray(env.data.xmat[env._tcp_body_id], dtype=np.float64).reshape(3, 3)
+        np.testing.assert_allclose(tcp_pose, body_pose, atol=1e-9)
     finally:
         env.close()
 
@@ -169,26 +183,28 @@ def test_tiny_enabled_deltas_do_not_accumulate_reference_pose_drift():
     try:
         env.reset()
         delta_z = -5e-5
+        delta_wz = 5e-5
 
         for _ in range(50):
-            current_pose = env._current_tcp_pose().copy()
+            reference_pose = env._reference_pose.copy() if env._reference_pose is not None else env._current_tcp_pose().copy()
             _, _, _, _, info = env.step_teleop_action(
                 {
                     "enabled": True,
                     "target_z": delta_z,
-                    "target_wz": 5e-5,
+                    "target_wz": delta_wz,
                 }
             )
 
-            expected_pose = current_pose.copy()
+            expected_pose = reference_pose.copy()
+            expected_pose[:3, :3] = reference_pose[:3, :3] @ Rotation.from_rotvec([0.0, 0.0, delta_wz]).as_matrix()
             expected_pose[2, 3] += delta_z
-            np.testing.assert_allclose(info["target_pose"][:3, 3], expected_pose[:3, 3], atol=1e-6)
-            np.testing.assert_allclose(env._reference_pose, current_pose)
+            np.testing.assert_allclose(info["target_pose"], expected_pose, atol=1e-6)
+            np.testing.assert_allclose(env._reference_pose, expected_pose)
     finally:
         env.close()
 
 
-def test_enabled_motion_reanchors_target_pose_to_measured_tcp_each_step():
+def test_enabled_motion_advances_from_latched_reference_pose_each_step():
     env = FR3MujocoEnv()
     try:
         env.reset()
@@ -196,17 +212,34 @@ def test_enabled_motion_reanchors_target_pose_to_measured_tcp_each_step():
 
         _, _, _, _, first = env.step_teleop_action({"enabled": True, "target_z": delta_z})
         first_target = np.asarray(first["target_pose"], dtype=np.float64).copy()
-        first_tcp = np.asarray(first["tcp_pose"], dtype=np.float64).copy()
-        assert np.linalg.norm(first_target[:3, 3] - first_tcp[:3, 3]) > 1e-4
 
         _, _, _, _, second = env.step_teleop_action({"enabled": True, "target_z": delta_z})
         second_target = np.asarray(second["target_pose"], dtype=np.float64).copy()
 
-        expected = first_tcp.copy()
+        expected = first_target.copy()
         expected[2, 3] += delta_z
         expected[2, 3] = np.clip(expected[2, 3], env.cfg.workspace_min[2], env.cfg.workspace_max[2])
 
         np.testing.assert_allclose(second_target[:3, 3], expected[:3, 3], atol=1e-6)
+    finally:
+        env.close()
+
+
+def test_translation_only_teleop_keeps_latched_orientation_even_if_measured_tcp_tilts():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        _, _, _, _, first = env.step_teleop_action({"enabled": True, "target_x": 0.002})
+        first_target = np.asarray(first["target_pose"], dtype=np.float64).copy()
+
+        tilted_pose = first_target.copy()
+        tilted_pose[:3, :3] = Rotation.from_rotvec([0.0, 0.2, 0.0]).as_matrix() @ first_target[:3, :3]
+        env._current_tcp_pose = lambda: tilted_pose.copy()  # type: ignore[method-assign]
+
+        _, _, _, _, second = env.step_teleop_action({"enabled": True, "target_x": 0.002})
+        second_target = np.asarray(second["target_pose"], dtype=np.float64).copy()
+
+        np.testing.assert_allclose(second_target[:3, :3], first_target[:3, :3], atol=1e-6)
     finally:
         env.close()
 
@@ -303,6 +336,24 @@ def test_fk_ik_round_trip_converges_for_far_reachable_target():
         ik_joints = env._kinematics.inverse_kinematics(current_joints, target_pose)
         round_trip_pose = env._kinematics.forward_kinematics(ik_joints)
         np.testing.assert_allclose(round_trip_pose, target_pose, atol=1e-4)
+    finally:
+        env.close()
+
+
+def test_fk_ik_lock_orientation_keeps_target_rotation_for_translation_move():
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        current_joints = env._get_joint_positions()
+        current_pose = env._current_tcp_pose()
+        target_pose = current_pose.copy()
+        target_pose[0, 3] += 0.01
+        target_pose[2, 3] -= 0.01
+
+        ik_joints = env._kinematics.inverse_kinematics(current_joints, target_pose, lock_orientation=True)
+        round_trip_pose = env._kinematics.forward_kinematics(ik_joints)
+
+        np.testing.assert_allclose(round_trip_pose[:3, :3], target_pose[:3, :3], atol=1e-3)
     finally:
         env.close()
 

@@ -35,10 +35,28 @@ class SpaceMouseEnableButton(StrEnum):
 @TeleoperatorConfig.register_subclass("spacemouse")
 @dataclass
 class SpaceMouseTeleopConfig(TeleoperatorConfig):
+    """SpaceMouse teleop configuration.
+
+    `translation_axis_map` and `rotation_axis_map` are 3x3 matrices that map
+    raw debiased device axes into the teleop command frame. The default
+    translation map preserves the FR3 SpaceMouse convention validated in
+    teleop: `[-raw_y, raw_x, raw_z]`.
+    """
+
     device_id: int = 0
     frequency: int = 200
     translation_scale: float = 0.000615
     rotation_scale: float = 0.000648
+    translation_axis_map: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] = (
+        (0.0, -1.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    rotation_axis_map: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
     scale_x: float | None = None
     scale_y: float | None = None
     scale_z: float | None = None

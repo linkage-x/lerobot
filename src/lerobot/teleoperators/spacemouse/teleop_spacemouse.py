@@ -164,14 +164,18 @@ class SpaceMouseTeleop(Teleoperator):
         )
 
     def _reading_motion_data(self, reading) -> np.ndarray:
+        translation = np.asarray(reading.translation, dtype=np.float64) - self._translation_bias
+        rotation = np.asarray(reading.rotation, dtype=np.float64) - self._rotation_bias
+        translation = self.translation_axis_map @ translation
+        rotation = self.rotation_axis_map @ rotation
         return np.array(
             [
-                -(reading.translation[1] - self._translation_bias[1]),
-                reading.translation[0] - self._translation_bias[0],
-                reading.translation[2] - self._translation_bias[2],
-                reading.rotation[0] - self._rotation_bias[0],
-                reading.rotation[1] - self._rotation_bias[1],
-                reading.rotation[2] - self._rotation_bias[2],
+                translation[0],
+                translation[1],
+                translation[2],
+                rotation[0],
+                rotation[1],
+                rotation[2],
             ],
             dtype=np.float64,
         )
@@ -269,6 +273,20 @@ class SpaceMouseTeleop(Teleoperator):
             dtype=np.float64,
         )
         return np.where(np.isnan(overrides), default_vector, overrides)
+
+    @cached_property
+    def translation_axis_map(self) -> np.ndarray:
+        matrix = np.asarray(self.config.translation_axis_map, dtype=np.float64)
+        if matrix.shape != (3, 3):
+            raise ValueError(f"translation_axis_map must be 3x3, got {matrix.shape}")
+        return matrix
+
+    @cached_property
+    def rotation_axis_map(self) -> np.ndarray:
+        matrix = np.asarray(self.config.rotation_axis_map, dtype=np.float64)
+        if matrix.shape != (3, 3):
+            raise ValueError(f"rotation_axis_map must be 3x3, got {matrix.shape}")
+        return matrix
 
     @property
     def rotation_scale_vector(self) -> np.ndarray:

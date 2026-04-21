@@ -62,7 +62,14 @@ class GripperDriver(Protocol):
 class KinematicsDriver(Protocol):
     def forward_kinematics(self, joint_positions_rad: np.ndarray) -> np.ndarray: ...
 
-    def inverse_kinematics(self, current_joint_positions_rad: np.ndarray, desired_pose: np.ndarray) -> np.ndarray: ...
+    def inverse_kinematics(
+        self,
+        current_joint_positions_rad: np.ndarray,
+        desired_pose: np.ndarray,
+        *,
+        lock_orientation: bool = False,
+        orientation_weight: float | None = None,
+    ) -> np.ndarray: ...
 
 
 class JointOTGDriver(Protocol):
@@ -979,9 +986,21 @@ class PlacoKinematicsDriver:
         joint_positions_deg = np.rad2deg(np.asarray(joint_positions_rad, dtype=np.float64))
         return self._kinematics.forward_kinematics(joint_positions_deg)
 
-    def inverse_kinematics(self, current_joint_positions_rad: np.ndarray, desired_pose: np.ndarray) -> np.ndarray:
+    def inverse_kinematics(
+        self,
+        current_joint_positions_rad: np.ndarray,
+        desired_pose: np.ndarray,
+        *,
+        lock_orientation: bool = False,
+        orientation_weight: float | None = None,
+    ) -> np.ndarray:
         current_joint_positions_deg = np.rad2deg(np.asarray(current_joint_positions_rad, dtype=np.float64))
-        solution_deg = self._kinematics.inverse_kinematics(current_joint_positions_deg, desired_pose)
+        solution_deg = self._kinematics.inverse_kinematics(
+            current_joint_positions_deg,
+            desired_pose,
+            lock_orientation=lock_orientation,
+            orientation_weight=orientation_weight,
+        )
         return np.deg2rad(np.asarray(solution_deg, dtype=np.float64))
 
 
@@ -1010,9 +1029,21 @@ class LocalKinematicsDriver:
         joint_positions_deg = np.rad2deg(np.asarray(joint_positions_rad, dtype=np.float64))
         return self._kinematics.forward_kinematics(joint_positions_deg)
 
-    def inverse_kinematics(self, current_joint_positions_rad: np.ndarray, desired_pose: np.ndarray) -> np.ndarray:
+    def inverse_kinematics(
+        self,
+        current_joint_positions_rad: np.ndarray,
+        desired_pose: np.ndarray,
+        *,
+        lock_orientation: bool = False,
+        orientation_weight: float | None = None,
+    ) -> np.ndarray:
         current_joint_positions_deg = np.rad2deg(np.asarray(current_joint_positions_rad, dtype=np.float64))
-        solution_deg = self._kinematics.inverse_kinematics(current_joint_positions_deg, desired_pose)
+        solution_deg = self._kinematics.inverse_kinematics(
+            current_joint_positions_deg,
+            desired_pose,
+            lock_orientation=lock_orientation,
+            orientation_weight=orientation_weight,
+        )
         return np.deg2rad(np.asarray(solution_deg, dtype=np.float64))
 
 

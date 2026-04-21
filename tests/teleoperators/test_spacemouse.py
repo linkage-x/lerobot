@@ -161,6 +161,32 @@ def test_get_action_zeroes_subthreshold_axes_even_when_other_axis_is_active(monk
     teleop.disconnect()
 
 
+def test_get_action_uses_explicit_axis_map_instead_of_hidden_legacy_remap(monkeypatch):
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    teleop = SpaceMouseTeleop(
+        SpaceMouseTeleopConfig(
+            translation_axis_map=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            bias_sample_count=0,
+            move_time=0.0,
+        )
+    )
+    teleop.connect()
+    teleop._driver.readings.append(
+        SpaceMouseReading(
+            translation=[0.2, -0.3, 0.4],
+            rotation=[0.0, 0.0, 0.0],
+            buttons=(False, False),
+        )
+    )
+
+    action = teleop.get_action()
+
+    assert action["target_x"] == pytest.approx(0.2 * teleop.translation_scale_vector[0])
+    assert action["target_y"] == pytest.approx(-0.3 * teleop.translation_scale_vector[1])
+    assert action["target_z"] == pytest.approx(0.4 * teleop.translation_scale_vector[2])
+    teleop.disconnect()
+
+
 def test_get_action_requires_stricter_enter_deadband_before_latching_motion(monkeypatch):
     monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
     teleop = SpaceMouseTeleop(
