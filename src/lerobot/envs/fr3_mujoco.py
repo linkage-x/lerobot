@@ -523,7 +523,7 @@ class FR3MujocoEnv(gym.Env):
     def _gripper_ctrl_from_command(self, gripper_command: float) -> float:
         command = float(np.clip(gripper_command, 0.0, 1.0))
         lower, upper = self._gripper_ctrl_range
-        return float(upper + command * (lower - upper))
+        return float(lower + command * (upper - lower))
 
     def _set_gripper_command(self, gripper_command: float, *, simulate: bool = False) -> None:
         with self._physics_lock:
