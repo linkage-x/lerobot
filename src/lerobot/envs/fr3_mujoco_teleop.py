@@ -240,6 +240,15 @@ def run_sim_teleop_loop(
             def __init__(self, *args, **kwargs):
                 super().__init__(directory=out_dir, *args, **kwargs)
 
+            def log_message(self, format, *args):
+                pass
+
+            def handle(self):
+                try:
+                    super().handle()
+                except BrokenPipeError:
+                    pass
+
             def end_headers(self):
                 self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
                 self.send_header("Expires", "0")
