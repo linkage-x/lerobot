@@ -63,6 +63,24 @@ def _axis_segments_from_pose(pose: np.ndarray, axis_length: float) -> list[tuple
     return segments
 
 
+def _corrected_axis_segments_from_pose(pose: np.ndarray, axis_length: float) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    origin = np.asarray(pose[:3, 3], dtype=np.float64)
+    rotation = np.asarray(pose[:3, :3], dtype=np.float64)
+    theta = -np.pi * 3 / 4
+    corr = np.array([[-1, 0, 0], [0, np.cos(theta), -np.sin(theta)], [0, np.sin(theta), np.cos(theta)]], dtype=np.float64)
+    corrected = rotation @ corr
+    colors = (
+        np.array([1.0, 0.2, 0.2, 0.95], dtype=np.float32),
+        np.array([0.2, 1.0, 0.2, 0.95], dtype=np.float32),
+        np.array([0.2, 0.5, 1.0, 0.95], dtype=np.float32),
+    )
+    segments = []
+    for axis_idx, color in enumerate(colors):
+        direction = corrected[:, axis_idx] * axis_length
+        segments.append((origin, origin + direction, color))
+    return segments
+
+
 def marker_geoms_from_info(info: dict[str, Any], style: MarkerStyle) -> list[dict[str, Any]]:
     target_pose = np.asarray(info["target_pose"], dtype=np.float64)
     tcp_pose = np.asarray(info["tcp_pose"], dtype=np.float64)
@@ -84,7 +102,8 @@ def marker_geoms_from_info(info: dict[str, Any], style: MarkerStyle) -> list[dic
         },
     ]
     for pose, prefix in ((target_pose, "target"), (tcp_pose, "tcp")):
-        for axis_name, (start, end, color) in zip(("x", "y", "z"), _axis_segments_from_pose(pose, style.axis_length), strict=True):
+        segments = _corrected_axis_segments_from_pose(pose, style.axis_length)
+        for axis_name, (start, end, color) in zip(("x", "y", "z"), segments, strict=True):
             geoms.append(
                 {
                     "kind": "connector",
