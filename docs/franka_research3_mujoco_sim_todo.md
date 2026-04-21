@@ -38,6 +38,13 @@
 - [x] 在不接触硬件的情况下验证 `enabled` 状态切换、工作空间裁剪和首帧保持行为。
 - [x] 添加 FK/IK 一致性和 target 坐标系对齐的回归检查。
 
+### P2.1：已知问题
+
+- [ ] **Keyboard teleop 未生效**（2026-04-20）：键盘遥操作（`KeyboardEndEffectorTeleop`）按键后仿真内 EE 无响应。
+    可能原因：`KeyboardEndEffectorTeleop.get_action()` 返回的 `delta_x/delta_y/delta_z` 到 SpaceMouse 语义 action 的映射链路存在断点，
+    或 `fr3_mujoco_teleop.py` 中 `run_sim_teleop_loop` 对 keyboard 输出的 action 转换逻辑有遗漏。
+    进一步 debug 方向：在 `step_teleop_action` 处加断点，确认 action dict 的 `enabled`/`target_x/y/z` 是否随键盘输入变化。
+
 ### P3：后续拆分
 
 - [ ] 将纯环境层拆分为独立、可直接用于 EnvHub 的仓库结构。

@@ -347,14 +347,12 @@ class FR3MujocoEnv(gym.Env):
         return mujoco
 
     def _build_kinematics(self):
-        return _MujocoArmKinematics(
-            self._mujoco,
-            self.model,
-            self.cfg.target_frame_name,
-            self._qpos_indices,
-            self._qvel_indices,
-            self._joint_lower,
-            self._joint_upper,
+        from lerobot.robots.franka_research3.backends import LocalKinematicsDriver
+
+        return LocalKinematicsDriver(
+            urdf_path=self.cfg.urdf_path,
+            target_frame_name=self.cfg.target_frame_name,
+            joint_names=list(self.cfg.joint_names),
         )
 
     def _build_otg(self):
@@ -475,8 +473,18 @@ class FR3MujocoEnv(gym.Env):
                 frozen_arm_target = np.asarray(self.data.qpos[self._qpos_indices], dtype=np.float64).copy()
                 if self._actuator_ids:
                     self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = frozen_arm_target
+                self.data.qvel[:] = 0.0
+                self._mujoco.mj_forward(self.model, self.data)
                 for _ in range(max(int(self.cfg.gripper_sim_steps), 1)):
+                    self.data.qpos[self._qpos_indices] = frozen_arm_target
+                    self.data.qvel[self._qvel_indices] = 0.0
+                    if self._actuator_ids:
+                        self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = frozen_arm_target
                     self._mujoco.mj_step(self.model, self.data)
+                self.data.qpos[self._qpos_indices] = frozen_arm_target
+                self.data.qvel[self._qvel_indices] = 0.0
+                if self._actuator_ids:
+                    self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = frozen_arm_target
                 self._mujoco.mj_forward(self.model, self.data)
                 self._update_visualization_state()
                 return
