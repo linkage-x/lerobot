@@ -230,8 +230,24 @@ def test_run_sim_teleop_loop_skips_step_camera_obs_when_camera_stream_enabled(mo
                 "Cfg",
                 (),
                 {
-                    "camera_names": ("third_person", "side", "wrist"),
-                    "camera_name_mapping": {"third_person": "third_person", "side": "side", "wrist": "wrist"},
+                    "camera_names": (
+                        "third_person",
+                        "north_east",
+                        "side",
+                        "west",
+                        "south_west",
+                        "south_east",
+                        "wrist",
+                    ),
+                    "camera_name_mapping": {
+                        "third_person": "third_person",
+                        "north_east": "north_east",
+                        "side": "side",
+                        "west": "west",
+                        "south_west": "south_west",
+                        "south_east": "south_east",
+                        "wrist": "wrist",
+                    },
                 },
             )()
             self.info = {
@@ -241,7 +257,15 @@ def test_run_sim_teleop_loop_skips_step_camera_obs_when_camera_stream_enabled(mo
                 "tcp_marker_name": "TCP",
                 "target_site_name": "target_site",
                 "tcp_site_name": "tcp_site",
-                "camera_names": ("third_person", "side", "wrist"),
+                "camera_names": (
+                    "third_person",
+                    "north_east",
+                    "side",
+                    "west",
+                    "south_west",
+                    "south_east",
+                    "wrist",
+                ),
                 "gripper_command": 1.0,
             }
 

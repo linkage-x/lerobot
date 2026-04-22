@@ -38,7 +38,15 @@ def test_reset_info_exposes_target_tcp_marker_state_and_named_cameras():
         _, info = env.reset()
         assert info["target_marker_name"] == "target"
         assert info["tcp_marker_name"] == "TCP"
-        assert info["camera_names"] == ("third_person", "side", "wrist")
+        assert info["camera_names"] == (
+            "third_person",
+            "north_east",
+            "side",
+            "west",
+            "south_west",
+            "south_east",
+            "wrist",
+        )
         np.testing.assert_allclose(info["target_pose"], info["tcp_pose"])
         assert info["target_pose_7d"].shape == (7,)
         assert info["tcp_pose_7d"].shape == (7,)
@@ -447,8 +455,9 @@ def test_render_returns_named_camera_images_when_enabled():
     env = FR3MujocoEnv(cfg=cfg)
     try:
         observation, info = env.reset()
-        assert sorted(observation["camera_obs"].keys()) == ["side", "third_person", "wrist"]
-        assert sorted(env.render().keys()) == ["side", "third_person", "wrist"]
+        expected_camera_names = ["north_east", "side", "south_east", "south_west", "third_person", "west", "wrist"]
+        assert sorted(observation["camera_obs"].keys()) == expected_camera_names
+        assert sorted(env.render().keys()) == expected_camera_names
         for image in observation["camera_obs"].values():
             assert image.shape == (64, 64, 3)
             assert image.dtype == np.uint8

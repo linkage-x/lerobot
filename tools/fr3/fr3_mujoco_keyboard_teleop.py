@@ -41,6 +41,7 @@ from lerobot.teleoperators.keyboard import KeyboardEndEffectorTeleop, KeyboardEn
 
 _D435I_COLOR_WIDTH = 640
 _D435I_COLOR_HEIGHT = 480
+_VIEWER_CAMERA_CHOICES = tuple(FR3MujocoEnvConfig().camera_names)
 
 
 class KeyboardToSpacemouseAdapter:
@@ -104,7 +105,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-viewer", action="store_true")
     parser.add_argument(
         "--viewer-camera",
-        choices=("third_person", "side", "wrist"),
+        choices=_VIEWER_CAMERA_CHOICES,
         default=None,
     )
     parser.add_argument("--enable-cameras", action="store_true")

@@ -45,7 +45,7 @@ from lerobot.utils.rotation import Rotation
 from tools.fr3.fr3_record_runtime import make_fr3_ee2ee_processors
 
 _D435I_IMAGE_SHAPE = (480, 640, 3)
-_SIM_CAMERA_NAMES = ("third_person", "side", "wrist")
+_SIM_CAMERA_NAMES = FR3MujocoEnvConfig().camera_names
 
 
 def parse_args() -> argparse.Namespace:
@@ -246,13 +246,8 @@ def main() -> int:
         recorded = LeRobotDataset(record_cfg.dataset.repo_id, root=dataset_root, episodes=[0])
         frame0 = recorded[0]
 
-        required_keys = {
-            "observation.state",
-            "action",
-            "observation.images.third_person",
-            "observation.images.side",
-            "observation.images.wrist",
-        }
+        required_keys = {"observation.state", "action"}
+        required_keys.update({f"observation.images.{camera_name}" for camera_name in _SIM_CAMERA_NAMES})
         missing = required_keys - set(recorded.features)
         if missing:
             raise RuntimeError(f"Missing expected ee2ee features: {sorted(missing)}")

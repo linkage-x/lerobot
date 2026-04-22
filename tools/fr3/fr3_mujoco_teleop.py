@@ -17,6 +17,7 @@ from lerobot.teleoperators.spacemouse.teleop_spacemouse import SpaceMouseTeleop
 
 _D435I_COLOR_WIDTH = 640
 _D435I_COLOR_HEIGHT = 480
+_VIEWER_CAMERA_CHOICES = tuple(FR3MujocoEnvConfig().camera_names)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -25,7 +26,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--duration-s", type=float, default=None)
     parser.add_argument("--device-id", type=int, default=0)
     parser.add_argument("--no-viewer", action="store_true")
-    parser.add_argument("--viewer-camera", choices=("third_person", "side", "wrist"), default=None)
+    parser.add_argument("--viewer-camera", choices=_VIEWER_CAMERA_CHOICES, default=None)
     parser.add_argument("--enable-cameras", action="store_true", default=True)
     parser.add_argument("--camera-width", type=int, default=_D435I_COLOR_WIDTH)
     parser.add_argument("--camera-height", type=int, default=_D435I_COLOR_HEIGHT)

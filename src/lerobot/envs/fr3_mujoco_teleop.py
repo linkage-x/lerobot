@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -176,30 +177,39 @@ def update_passive_viewer_markers(mujoco, viewer: ViewerHandle, info: dict[str, 
         scene.ngeom += 1
 
 
-def render_camera_grid(camera_obs: dict[str, np.ndarray], width: int, height: int) -> np.ndarray:
-    """Assemble camera observations into a 2x2 grid as an RGB numpy array."""
-    keys = ["third_person", "side", "wrist"]
-    cells: list[list[np.ndarray]] = [[], []]
-    for i, key in enumerate(keys):
+def _camera_grid_layout(camera_count: int) -> tuple[int, int]:
+    camera_count = max(int(camera_count), 1)
+    cols = math.ceil(math.sqrt(camera_count))
+    rows = math.ceil(camera_count / cols)
+    return rows, cols
+
+
+def render_camera_grid(
+    camera_obs: dict[str, np.ndarray],
+    width: int,
+    height: int,
+    camera_names: tuple[str, ...],
+) -> np.ndarray:
+    """Assemble camera observations into a near-square grid as an RGB numpy array."""
+    rows, cols = _camera_grid_layout(len(camera_names))
+    grid = np.zeros((rows * height, cols * width, 3), dtype=np.uint8)
+    for index, key in enumerate(camera_names):
         frame = camera_obs.get(key)
         if frame is None:
             frame = np.zeros((height, width, 3), dtype=np.uint8)
         else:
             frame = np.asarray(frame, dtype=np.uint8)
-        row = i // 2
-        cells[row].append(frame)
-    if len(keys) < 4:
-        cells[1].append(np.zeros((height, width, 3), dtype=np.uint8))
-    top_row = np.hstack(cells[0])
-    bottom_row = np.hstack(cells[1])
-    return np.vstack([top_row, bottom_row])
+        row = index // cols
+        col = index % cols
+        grid[row * height : (row + 1) * height, col * width : (col + 1) * width] = frame
+    return grid
 
 
 def _camera_stream_index_html() -> str:
     return """<!DOCTYPE html>
 <html>
 <head>
-  <title>Camera Stream (2x2)</title>
+  <title>Camera Stream</title>
   <style>
     body { margin: 0; background: #000; display: flex; align-items: center; justify-content: center; height: 100vh; overflow: hidden; }
     canvas { max-width: 100vw; max-height: 100vh; }
@@ -260,6 +270,7 @@ def _start_camera_stream_outputs(
     *,
     camera_width: int,
     camera_height: int,
+    camera_names: tuple[str, ...],
 ) -> tuple[Any, _LatestCameraFrame, Any | None]:
     import http.server
     import socketserver
@@ -267,15 +278,16 @@ def _start_camera_stream_outputs(
     import cv2
 
     latest_frame = _LatestCameraFrame()
-    blank_grid = np.zeros((camera_height * 2, camera_width * 2, 3), dtype=np.uint8)
+    rows, cols = _camera_grid_layout(len(camera_names))
+    blank_grid = np.zeros((camera_height * rows, camera_width * cols, 3), dtype=np.uint8)
     latest_frame.set(_encode_grid_jpeg(blank_grid, cv2))
 
     try:
         import pygame
 
         pygame.init()
-        screen = pygame.display.set_mode((camera_width * 2, camera_height * 2))
-        pygame.display.set_caption("Camera Observations (2x2)")
+        screen = pygame.display.set_mode((camera_width * cols, camera_height * rows))
+        pygame.display.set_caption("Camera Observations")
     except Exception:
         pygame = None
         screen = None
@@ -324,7 +336,7 @@ def _start_camera_stream_outputs(
 
     http_server = ThreadedTCPServer(("", 18765), Handler)
     threading.Thread(target=http_server.serve_forever, daemon=True).start()
-    print("Camera stream: http://localhost:18765/ (2x2 grid)")
+    print(f"Camera stream: http://localhost:18765/ ({rows}x{cols} grid)")
     return http_server, latest_frame, screen
 
 
@@ -424,6 +436,7 @@ def run_sim_teleop_loop(
         http_server, latest_frame, screen = _start_camera_stream_outputs(
             camera_width=camera_width,
             camera_height=camera_height,
+            camera_names=tuple(env.cfg.camera_names),
         )
         camera_renderer = env._mujoco.Renderer(
             env.model,
@@ -480,7 +493,7 @@ def run_sim_teleop_loop(
                 camera_names=tuple(env.cfg.camera_names),
                 camera_name_mapping=dict(env.cfg.camera_name_mapping),
             )
-            grid = render_camera_grid(camera_obs, camera_width, camera_height)
+            grid = render_camera_grid(camera_obs, camera_width, camera_height, tuple(env.cfg.camera_names))
             latest_frame.set(_encode_grid_jpeg(grid, cv2_module))
             if screen is not None:
                 try:
@@ -528,7 +541,7 @@ def run_sim_teleop_loop(
             camera_names=tuple(env.cfg.camera_names),
             camera_name_mapping=dict(env.cfg.camera_name_mapping),
         )
-        grid = render_camera_grid(camera_obs, camera_width, camera_height)
+        grid = render_camera_grid(camera_obs, camera_width, camera_height, tuple(env.cfg.camera_names))
         latest_frame.set(_encode_grid_jpeg(grid, cv2_module))
         if screen is not None:
             try:

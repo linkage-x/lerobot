@@ -60,7 +60,7 @@ from lerobot.utils.constants import ACTION, OBS_STR
 
 EE_POSITION_KEYS = ("ee.x", "ee.y", "ee.z")
 EE_QUAT_KEYS = ("ee.qx", "ee.qy", "ee.qz", "ee.qw")
-_SIM_CAMERA_NAMES = ("third_person", "side", "wrist")
+_SIM_CAMERA_NAMES = FR3MujocoEnvConfig().camera_names
 _D435I_IMAGE_SHAPE = (480, 640, 3)
 
 

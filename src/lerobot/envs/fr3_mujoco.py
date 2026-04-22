@@ -70,11 +70,23 @@ class FR3MujocoEnvConfig:
         "fr3_joint7",
     )
     gripper_joint_names: tuple[str, str] = ("gripper_left_joint", "gripper_right_joint")
-    camera_names: tuple[str, ...] = ("third_person", "side", "wrist")
+    camera_names: tuple[str, ...] = (
+        "third_person",
+        "north_east",
+        "side",
+        "west",
+        "south_west",
+        "south_east",
+        "wrist",
+    )
     camera_name_mapping: dict[str, str] = field(
         default_factory=lambda: {
             "third_person": "third_person_cam",
+            "north_east": "north_east_cam",
             "side": "side_cam",
+            "west": "west_cam",
+            "south_west": "south_west_cam",
+            "south_east": "south_east_cam",
             "wrist": "ee_cam",
         }
     )
