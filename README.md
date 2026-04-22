@@ -36,6 +36,18 @@ lerobot-info
 > [!IMPORTANT]
 > For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
 
+## Mujoco Simulation
+
+Run FR3 teleoperation in Mujoco simulation with Docker:
+
+```bash
+docker compose -f docker/docker-compose.yml --profile sim --profile teleop run --rm \
+  -e DISPLAY=$DISPLAY \
+  -e PYTHONPATH=/workspace/src \
+  lerobot-fr3-sim-teleop \
+  python tools/fr3/fr3_mujoco_teleop.py
+```
+
 ## Robots & Control
 
 <div align="center">
