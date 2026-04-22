@@ -359,7 +359,10 @@ class SpaceMouseTeleop(Teleoperator):
         peak_abs = np.maximum(self._peak_active_motion_data, previous_abs)
         dominant_axis = int(np.argmax(peak_abs))
         dominant_peak = peak_abs[dominant_axis]
-        if dominant_peak < threshold[dominant_axis] * 5.0:
+        # pyspacemouse release decay often follows moderate motions too, not just
+        # very large peaks. Requiring a 5x-threshold peak misses those cases and
+        # lets the arm keep drifting after the puck is released.
+        if dominant_peak < threshold[dominant_axis] * 2.5:
             return False
 
         active_axes = previous_abs > 0.0
@@ -371,12 +374,12 @@ class SpaceMouseTeleop(Teleoperator):
 
         previous_norm = float(np.linalg.norm(previous_abs[active_axes]))
         current_norm = float(np.linalg.norm(current_abs[active_axes]))
-        dominant_axis_was_plateaued = previous_abs[dominant_axis] >= dominant_peak * 0.8
+        dominant_axis_was_plateaued = previous_abs[dominant_axis] >= dominant_peak * 0.6
         dominant_axis_collapsed = (
-            current_abs[dominant_axis] <= previous_abs[dominant_axis] * 0.6
-            and current_abs[dominant_axis] <= dominant_peak * 0.4
+            current_abs[dominant_axis] <= previous_abs[dominant_axis] * 0.8
+            and current_abs[dominant_axis] <= dominant_peak * 0.6
         )
-        overall_energy_collapsed = current_norm <= previous_norm * 0.6
+        overall_energy_collapsed = current_norm <= previous_norm * 0.85
         return bool(dominant_axis_was_plateaued and dominant_axis_collapsed and overall_energy_collapsed)
 
     def _update_release_decay_state(self, *, motion_enabled: bool, data: np.ndarray | None = None) -> None:
@@ -410,9 +413,6 @@ class SpaceMouseTeleop(Teleoperator):
             if self._prev_enabled_out and not self._prev_enabled_out:  # was True, now False
                 pass  # transition already logged below
             enabled_out = False
-            if self._prev_enabled_out != enabled_out and self._log_count < 5:
-                print(f"[SM DEBUG] poll=None → enabled={enabled_out}")
-                self._log_count += 1
             self._prev_enabled_out = enabled_out
             self._prev_motion_detected = False
             self._prev_motion_enabled = False
@@ -426,53 +426,23 @@ class SpaceMouseTeleop(Teleoperator):
         abs_data = np.abs(data)
         active_mask = abs_data >= threshold
         data = np.where(active_mask, data, 0.0)
-        enter_mask = abs_data >= (threshold * float(self.config.motion_enable_enter_scale))
-        exit_mask = abs_data >= (threshold * float(self.config.motion_enable_exit_scale))
-        motion_detected = bool(np.any(exit_mask if self._motion_active else enter_mask))
+        # Match the HIROL 3D-mouse teleop behavior more closely: once each axis is
+        # deadbanded, motion enable/disable is determined directly from the zeroed
+        # delta instead of a separate hysteresis/release-decay state machine.
+        motion_detected = bool(np.any(active_mask))
         if self.config.motion_enable_button == SpaceMouseEnableButton.LEFT:
             motion_enabled = motion_detected and button_0
         elif self.config.motion_enable_button == SpaceMouseEnableButton.RIGHT:
             motion_enabled = motion_detected and button_1
         else:
             motion_enabled = motion_detected
-        if motion_enabled and self._should_truncate_release_decay(data, threshold):
-            motion_enabled = False
-            motion_detected = False
-            data = np.zeros_like(data)
         self._motion_active = motion_detected
 
         if not motion_enabled:
             self._update_gripper(button_0, button_1)
             self._filter_gripper_command(self._last_gripper)
-            # After SpaceMouse is physically released, poll() returns readings that
-            # decay to zero over many frames.  Even though motion_enabled went False,
-            # the residual |data| can still be above the raw enter threshold for
-            # ~50-100+ frames, causing the arm to drift.  A simple L2-norm cutoff on
-            # the translation part catches this immediately.
-            # Coeff of 0.6 means: if residual translation norm < 60% of the raw motion
-            # threshold, treat it as "user has stopped" and truncate to zero.  This is
-            # well below normal intentional motion (~1-10× threshold) but safely above
-            # the electrical zero-floor of the device.
-            TRANSL_ONLY = slice(0, 3)
-            residual_norm = float(np.linalg.norm(data[TRANSL_ONLY]))
-            cutoff = float(np.linalg.norm(threshold[TRANSL_ONLY])) * 0.6
-            if residual_norm < cutoff:
-                data = np.zeros_like(data)
-                if self._log_count < 5:
-                    print(f"[SM DEBUG] release_decay TRUNCATE  norm={residual_norm:.6f} < {cutoff:.6f}")
-                    self._log_count += 1
             self._update_release_decay_state(motion_enabled=False)
             enabled_out = False
-            # Log state transitions only
-            if self._prev_motion_detected and not motion_detected and self._log_count < 5:
-                print(f"[SM DEBUG] motion_detected: True→False  abs_data={abs_data}")
-                self._log_count += 1
-            if self._prev_motion_enabled and not motion_enabled and self._log_count < 5:
-                print(f"[SM DEBUG] motion_enabled: True→False  data={data}")
-                self._log_count += 1
-            if self._prev_enabled_out and not enabled_out and self._log_count < 5:
-                print(f"[SM DEBUG] enabled_out: True→False")
-                self._log_count += 1
             self._prev_motion_detected = motion_detected
             self._prev_motion_enabled = motion_enabled
             self._prev_enabled_out = enabled_out
@@ -487,10 +457,6 @@ class SpaceMouseTeleop(Teleoperator):
         filtered_gripper = self._filter_gripper_command(self._last_gripper)
         self._update_release_decay_state(motion_enabled=True, data=data)
         enabled_out = True
-        # Log transition into active
-        if not self._prev_enabled_out and enabled_out and self._log_count < 5:
-            print(f"[SM DEBUG] enabled_out: False→True  target[:3]={target[:3]}")
-            self._log_count += 1
         self._prev_motion_detected = motion_detected
         self._prev_motion_enabled = motion_enabled
         self._prev_enabled_out = enabled_out

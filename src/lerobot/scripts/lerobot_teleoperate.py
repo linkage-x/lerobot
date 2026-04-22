@@ -52,6 +52,7 @@ lerobot-teleoperate \
 """
 
 import logging
+import warnings
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
@@ -262,6 +263,7 @@ def teleoperate(cfg: TeleoperateConfig):
 
 
 def main():
+    warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API", category=DeprecationWarning)
     register_third_party_plugins()
     teleoperate()
 
