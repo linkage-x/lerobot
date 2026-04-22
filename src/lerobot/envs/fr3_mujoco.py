@@ -176,11 +176,14 @@ class _MujocoArmKinematics:
         jac_pos = np.zeros((3, self._model.nv), dtype=np.float64)
         jac_rot = np.zeros((3, self._model.nv), dtype=np.float64)
         damping = 0.3
-        resolved_orientation_weight = 1.0 if lock_orientation else 0.01
+        resolved_orientation_weight = 1.0 if lock_orientation else 0.1
         if orientation_weight is not None:
             resolved_orientation_weight = float(orientation_weight)
 
-        for _ in range(200):
+        # The task TCP frame can be rotated away from the historical default.
+        # Give LM extra iterations so reachable far targets still converge
+        # under the updated frame convention.
+        for _ in range(400):
             self._set_arm_qpos(guess)
             current_pos = np.asarray(self._data.xpos[self._target_body_id], dtype=np.float64)
             current_rot = np.asarray(self._data.xmat[self._target_body_id], dtype=np.float64).reshape(3, 3)

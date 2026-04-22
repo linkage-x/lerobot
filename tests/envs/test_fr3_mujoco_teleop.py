@@ -115,6 +115,23 @@ def test_marker_axes_use_configured_axis_length():
         env.close()
 
 
+def test_marker_axes_follow_pose_axes_without_hidden_correction():
+    pose = np.eye(4, dtype=np.float64)
+    info = {
+        "target_pose": pose,
+        "tcp_pose": pose,
+        "target_marker_name": "target",
+        "tcp_marker_name": "TCP",
+    }
+
+    geoms = marker_geoms_from_info(info, MarkerStyle(axis_length=0.08))
+
+    target_x, target_y, target_z = geoms[2:5]
+    np.testing.assert_allclose(np.asarray(target_x["end"]) - np.asarray(target_x["start"]), np.array([0.08, 0.0, 0.0]))
+    np.testing.assert_allclose(np.asarray(target_y["end"]) - np.asarray(target_y["start"]), np.array([0.0, 0.08, 0.0]))
+    np.testing.assert_allclose(np.asarray(target_z["end"]) - np.asarray(target_z["start"]), np.array([0.0, 0.0, 0.08]))
+
+
 def test_run_sim_teleop_loop_steps_env_without_viewer():
     env = FR3MujocoEnv(
         FR3MujocoEnvConfig(

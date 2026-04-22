@@ -27,7 +27,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device-id", type=int, default=0)
     parser.add_argument("--no-viewer", action="store_true")
     parser.add_argument("--viewer-camera", choices=("third_person", "side", "wrist"), default=None)
-    parser.add_argument("--enable-cameras", action="store_true")
+    parser.add_argument("--enable-cameras", action="store_true", default=True)
     parser.add_argument("--camera-width", type=int, default=_D435I_COLOR_WIDTH)
     parser.add_argument("--camera-height", type=int, default=_D435I_COLOR_HEIGHT)
     parser.add_argument("--camera-fps", type=float, default=30.0)
@@ -83,21 +83,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Enable end-effector rotation control.",
     )
-    parser.set_defaults(enable_rotation=False)
+    parser.set_defaults(enable_rotation=True)
     parser.add_argument("--translation-scale", type=float, default=0.001845)
     parser.add_argument("--rotation-scale", type=float, default=0.001944)
     parser.add_argument("--scale-x", type=float, default=None)
     parser.add_argument("--scale-y", type=float, default=None)
     parser.add_argument("--scale-z", type=float, default=None)
-    parser.add_argument("--scale-wx", type=float, default=None)
+    parser.add_argument(
+        "--scale-wx",
+        type=float,
+        default=-0.001944,
+        help="Per-axis roll scale override. Defaults negative so SpaceMouse roll matches the FR3 sim TCP roll semantics.",
+    )
     parser.add_argument("--scale-wy", type=float, default=None)
     parser.add_argument("--scale-wz", type=float, default=None)
-    parser.add_argument("--threshold-x", type=float, default=0.35514)
-    parser.add_argument("--threshold-y", type=float, default=0.35514)
-    parser.add_argument("--threshold-z", type=float, default=0.35514)
-    parser.add_argument("--threshold-wx", type=float, default=1.08743)
-    parser.add_argument("--threshold-wy", type=float, default=1.08743)
-    parser.add_argument("--threshold-wz", type=float, default=1.08743)
+    parser.add_argument("--threshold-x", type=float, default=0.02)
+    parser.add_argument("--threshold-y", type=float, default=0.02)
+    parser.add_argument("--threshold-z", type=float, default=0.02)
+    parser.add_argument("--threshold-wx", type=float, default=0.04)
+    parser.add_argument("--threshold-wy", type=float, default=0.04)
+    parser.add_argument("--threshold-wz", type=float, default=0.04)
     parser.add_argument("--incremental-step", type=float, default=0.02)
     parser.add_argument("--move-time", type=float, default=0.006)
     parser.add_argument("--button-debounce-s", type=float, default=0.0)

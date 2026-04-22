@@ -178,6 +178,18 @@ flowchart TD
 - viewer 和 camera renderer 都基于 `copy_visual_state()` 的快照工作，避免直接把长时间渲染锁持有在控制线程上。
 - `FR3MujocoEnv` 仍保留 continuous physics 线程，用于持续推进 MuJoCo 物理和 servo 执行。
 
+## 6.1 已验证的 SpaceMouse 旋转语义
+
+- 在当前 `pika_task_tcp` 轴约定下，`pitch` 与 `yaw` 的 SpaceMouse 语义和末端行为一致。
+- `roll` 的 SpaceMouse 原始正方向与 FR3 sim 末端 `wx` 语义相反。
+- 因此，`tools/fr3/fr3_mujoco_teleop.py` 默认将 `--scale-wx` 设为 `-0.001944`，等价于显式传入：
+
+```bash
+python tools/fr3/fr3_mujoco_teleop.py --scale-wx=-0.001944
+```
+
+- 这个修正只反转 `wx`，不修改 `wy` / `wz` 的默认符号。
+
 ## 7. 当前推荐运行方式
 
 ```bash

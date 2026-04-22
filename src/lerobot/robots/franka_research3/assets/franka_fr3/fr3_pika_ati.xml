@@ -139,7 +139,10 @@
                         <camera name="ee_cam" mode="track" pos="0.04 0 0.255" euler="0 3.1415926 1.57" fovy="42"/>
                         <body name="pika_gripper_ee" pos="0.185 0 0" euler="3.1415926 -1.5707963 0"/>
                         <!-- Task-space TCP: midpoint between the two finger working points. -->
-                        <body name="pika_task_tcp" pos="0 0 0.366842" euler="3.1415926 -1.5707963 0"/>
+                        <!-- Use a right-handed task TCP where z aligns with the tool normal, x aligns with base +x,
+                             and y aligns with base -y at the nominal reset pose. This is a -45deg local-z rotation
+                             relative to gripper_base. -->
+                        <body name="pika_task_tcp" pos="0 0 0.366842" quat="0.92387953 0 0 -0.38268343"/>
                       </body>
                       <body name="gripper_left_link" pos="-0.0559287 -0.0696997 0.258" quat="0.25564 0.659279 -0.25564 0.659279">
                         <inertial pos="0.033255 -0.014661 -0.0057614" quat="0.606445 0.607197 0.362695 0.363302" mass="0.033674" diaginertia="4.22483e-05 3.9744e-05 7.51567e-06"/>

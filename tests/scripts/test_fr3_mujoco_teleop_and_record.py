@@ -31,12 +31,26 @@ def test_parse_args_accepts_camera_viewer_and_resolution_flags():
     assert args.arm_actuator_kp == 20000.0
     assert args.arm_gravity_comp_scale == 0.5
     assert args.use_otg is False
+    assert args.enable_rotation is True
+    assert args.scale_wx == -0.001944
+    assert args.threshold_x == 0.02
+    assert args.threshold_y == 0.02
+    assert args.threshold_z == 0.02
+    assert args.threshold_wx == 0.04
+    assert args.threshold_wy == 0.04
+    assert args.threshold_wz == 0.04
 
 
 def test_parse_args_enable_otg_opt_in_overrides_default():
     args = fr3_mujoco_teleop.parse_args(["--enable-otg"])
 
     assert args.use_otg is True
+
+
+def test_parse_args_disable_rotation_opt_out_overrides_default():
+    args = fr3_mujoco_teleop.parse_args(["--disable-rotation"])
+
+    assert args.enable_rotation is False
 
 
 def test_build_env_config_uses_d435i_like_camera_defaults_when_enabled():

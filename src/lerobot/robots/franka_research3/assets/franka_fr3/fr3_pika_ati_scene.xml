@@ -22,8 +22,8 @@
     <light name="fill_light" pos="-0.6 0.4 1.2" dir="0.2 -0.1 -1" directional="true" diffuse="0.35 0.35 0.35" />
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" />
 
-    <camera name="side_cam" pos="0.50 0.80 0.40" xyaxes="-1 0 0 0 -0.5 0.866" fovy="42"/>
-    <camera name="third_person_cam" pos="1.20 0.00 0.80" xyaxes="0 1 0 -0.866 0 0.5" fovy="42"/>
+    <camera name="side_cam" pos="0.50 0.80 0.90" xyaxes="-1 0 0 0 -0.5 0.866" fovy="42"/>
+    <camera name="third_person_cam" pos="1.20 0.00 1.50" xyaxes="0 1 0 -0.866 0 0.5" fovy="42"/>
 
     <body name="table_body" pos="0.52 0 0.38">
       <geom name="table" type="box" size="0.34 0.46 0.02" material="table_surface" friction="1.2 0.05 0.01"/>
@@ -38,7 +38,7 @@
       <geom name="workspace_object" type="box" size="0.025 0.025 0.04" material="workspace_object_material" density="500" friction="1.8 0.05 0.01" condim="4" />
     </body>
 
-    <body name="target" pos="0.45 0.10 0.50" quat="0 1 0 0" mocap="true">
+    <!-- <body name="target" pos="0.45 0.10 0.50" quat="0 1 0 0" mocap="true">
       <geom type="box" size="0.03 0.03 0.03" contype="0" conaffinity="0" rgba="0.1 0.9 0.2 0.25" />
       <site type="sphere" name="target_site" size="0.005" rgba="0 0 1 1" group="1" />
     </body>
@@ -46,6 +46,6 @@
     <body name="TCP" pos="0.365 0 0.4" quat="0 1 0 0" mocap="true">
       <geom type="sphere" size="0.03" contype="0" conaffinity="0" rgba="0.95 0.45 0.1 0.25" />
       <site type="sphere" name="TCP_site" size="0.005" rgba="0 0 1 1" group="1" />
-    </body>
+    </body> -->
   </worldbody>
 </mujoco>
