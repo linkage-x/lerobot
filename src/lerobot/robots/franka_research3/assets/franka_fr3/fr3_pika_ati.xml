@@ -136,7 +136,11 @@
                         <geom pos="-0.046 0.076 0.1865" quat="-0.5 0.5 -0.5 0.5" type="mesh" mesh="ati_pika_new" class="collision"/>
                         <geom pos="-0.001 -2.67949e-10 0.1765" quat="0.25564 0.659279 -0.25564 0.659279" type="mesh" material="black" class="visual" mesh="pika_gripper_base_link"/>
                         <geom pos="-0.001 -2.67949e-10 0.1765" quat="0.25564 0.659279 -0.25564 0.659279" type="mesh" mesh="pika_gripper_base_link" class="collision"/>
-                        <camera name="ee_cam" mode="fixed" pos="0.0 0 0.255" quat="0 -0.92403183 -0.38231554 0" fovy="42"/>
+                        <!--  p_new = p_old + R(q) @ [0, 0.02, 0]^T
+                          meaning:
+                          move the camera by 0.02 along its local +y axis,
+                          then convert that local offset into the parent/body frame using R(q) -->
+                        <camera name="ee_cam" mode="fixed" pos="0.01413 -0.01415 0.255" quat="0 -0.92403183 -0.38231554 0" fovy="42"/>
                         <body name="pika_gripper_ee" pos="0.185 0 0" euler="3.1415926 -1.5707963 0"/>
                         <!-- Task-space TCP: midpoint between the two finger working points. -->
                         <!-- Use a right-handed task TCP where z aligns with the tool normal, x aligns with base +x,
