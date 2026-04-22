@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pprint import pformat
 
 from lerobot.envs.fr3_mujoco import FR3MujocoEnv, FR3MujocoEnvConfig
@@ -29,6 +30,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enable-cameras", action="store_true")
     parser.add_argument("--camera-width", type=int, default=_D435I_COLOR_WIDTH)
     parser.add_argument("--camera-height", type=int, default=_D435I_COLOR_HEIGHT)
+    parser.add_argument("--camera-fps", type=float, default=30.0)
     parser.add_argument(
         "--arm-actuator-kp",
         type=float,
@@ -90,12 +92,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--scale-wx", type=float, default=None)
     parser.add_argument("--scale-wy", type=float, default=None)
     parser.add_argument("--scale-wz", type=float, default=None)
-    parser.add_argument("--threshold-x", type=float, default=0.02)
-    parser.add_argument("--threshold-y", type=float, default=0.02)
-    parser.add_argument("--threshold-z", type=float, default=0.02)
-    parser.add_argument("--threshold-wx", type=float, default=0.04)
-    parser.add_argument("--threshold-wy", type=float, default=0.04)
-    parser.add_argument("--threshold-wz", type=float, default=0.04)
+    parser.add_argument("--threshold-x", type=float, default=0.35514)
+    parser.add_argument("--threshold-y", type=float, default=0.35514)
+    parser.add_argument("--threshold-z", type=float, default=0.35514)
+    parser.add_argument("--threshold-wx", type=float, default=1.08743)
+    parser.add_argument("--threshold-wy", type=float, default=1.08743)
+    parser.add_argument("--threshold-wz", type=float, default=1.08743)
     parser.add_argument("--incremental-step", type=float, default=0.02)
     parser.add_argument("--move-time", type=float, default=0.006)
     parser.add_argument("--button-debounce-s", type=float, default=0.0)
@@ -168,6 +170,15 @@ def build_marker_style(args: argparse.Namespace) -> MarkerStyle:
     )
 
 
+def configure_mujoco_gl_backend(args: argparse.Namespace) -> str | None:
+    current_backend = os.environ.get("MUJOCO_GL")
+    if args.enable_cameras and not args.no_viewer:
+        if current_backend is None or current_backend.lower() == "egl":
+            os.environ["MUJOCO_GL"] = "glfw"
+            return "glfw"
+    return os.environ.get("MUJOCO_GL")
+
+
 def resolve_viewer_camera_name(viewer_camera: str | None, env_cfg: FR3MujocoEnvConfig) -> str | None:
     if viewer_camera is None:
         return None
@@ -189,6 +200,7 @@ def configure_viewer_camera(mujoco, viewer, env: FR3MujocoEnv, viewer_camera: st
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    mujoco_gl_backend = configure_mujoco_gl_backend(args)
     teleop = SpaceMouseTeleop(build_teleop_config(args))
     env_cfg = build_env_config(args)
     env = FR3MujocoEnv(env_cfg)
@@ -205,6 +217,8 @@ def main(argv: list[str] | None = None) -> int:
                 "enable_cameras": args.enable_cameras,
                 "camera_width": args.camera_width,
                 "camera_height": args.camera_height,
+                "camera_fps": args.camera_fps,
+                "mujoco_gl": mujoco_gl_backend,
                 "camera_fovy": _D435I_COLOR_FOVY_DEG,
                 "arm_actuator_kp": args.arm_actuator_kp,
                 "arm_gravity_compensation_scale": args.arm_gravity_comp_scale,
@@ -240,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
             render_cameras=args.enable_cameras,
             camera_width=args.camera_width,
             camera_height=args.camera_height,
+            camera_fps=args.camera_fps,
         )
         print("fr3_mujoco_teleop=READY")
         print(

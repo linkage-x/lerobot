@@ -248,5 +248,6 @@ services:
       DEVICE: cuda
       CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
       TEST_TYPE: single_gpu
+      MUJOCO_GL: ${LEROBOT_FR3_TELEOP_MUJOCO_GL:-glfw}
       SDL_VIDEODRIVER: dummy
     gpus: all

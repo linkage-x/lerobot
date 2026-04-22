@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -46,6 +47,44 @@ class ViewerHandle(Protocol):
     def sync(self) -> None: ...
 
     def close(self) -> None: ...
+
+
+@dataclass
+class _LatestCameraFrame:
+    jpeg_bytes: bytes | None = None
+
+    def __post_init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def set(self, jpeg_bytes: bytes) -> None:
+        with self._lock:
+            self.jpeg_bytes = jpeg_bytes
+
+    def get(self) -> bytes | None:
+        with self._lock:
+            return self.jpeg_bytes
+
+
+@dataclass
+class _LatestTeleopInfo:
+    info: dict[str, Any]
+    loop_steps: int = 0
+    terminated: bool = False
+    truncated: bool = False
+
+    def __post_init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def update(self, *, info: dict[str, Any], loop_steps: int, terminated: bool, truncated: bool) -> None:
+        with self._lock:
+            self.info = info
+            self.loop_steps = loop_steps
+            self.terminated = terminated
+            self.truncated = truncated
+
+    def snapshot(self) -> tuple[dict[str, Any], int, bool, bool]:
+        with self._lock:
+            return self.info, self.loop_steps, self.terminated, self.truncated
 
 
 def _axis_segments_from_pose(pose: np.ndarray, axis_length: float) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -174,51 +213,8 @@ def render_camera_grid(camera_obs: dict[str, np.ndarray], width: int, height: in
     return np.vstack([top_row, bottom_row])
 
 
-def run_sim_teleop_loop(
-    *,
-    env,
-    teleop: TeleopReader,
-    fps: int,
-    viewer: ViewerHandle | None = None,
-    viewer_data: Any | None = None,
-    duration_s: float | None = None,
-    max_steps: int | None = None,
-    marker_style: MarkerStyle | None = None,
-    render_cameras: bool = False,
-    camera_width: int = 640,
-    camera_height: int = 480,
-) -> dict[str, Any]:
-    marker_style = marker_style or MarkerStyle()
-    start = time.perf_counter()
-    steps = 0
-    _, info = env.reset()
-    sync_gripper = getattr(teleop, "sync_gripper_baseline", None)
-    if callable(sync_gripper) and "gripper_command" in info:
-        sync_gripper(float(info["gripper_command"]))
-
-    if viewer is not None:
-        copy_visual_state = getattr(env, "copy_visual_state", None)
-        if viewer_data is not None and callable(copy_visual_state):
-            copy_visual_state(viewer_data)
-        with viewer.lock():
-            update_passive_viewer_markers(env._mujoco, viewer, info, marker_style)
-        viewer.sync()
-
-    http_server = None
-    screen = None
-
-    if render_cameras:
-        import http.server
-        import os
-        import socketserver
-        import threading
-
-        out_dir = "/tmp/camera_stream"
-        os.makedirs(out_dir, exist_ok=True)
-
-        with open(os.path.join(out_dir, "index.html"), "w") as f:
-            f.write(
-                """<!DOCTYPE html>
+def _camera_stream_index_html() -> str:
+    return """<!DOCTYPE html>
 <html>
 <head>
   <title>Camera Stream (2x2)</title>
@@ -249,104 +245,331 @@ def run_sim_teleop_loop(
       img.src = 'grid.jpg?t=' + Date.now();
     }
     update();
-    setInterval(update, 50);
+    setInterval(update, 33);
   </script>
 </body>
 </html>"""
-            )
 
-        class Handler(http.server.SimpleHTTPRequestHandler):
-            def __init__(self, *args, **kwargs):
-                super().__init__(directory=out_dir, *args, **kwargs)
 
-            def log_message(self, format, *args):
-                pass
+def _encode_grid_jpeg(grid: np.ndarray, cv2_module) -> bytes:
+    ok, encoded = cv2_module.imencode(".jpg", cv2_module.cvtColor(grid, cv2_module.COLOR_RGB2BGR))
+    if not ok:
+        raise RuntimeError("Failed to encode camera grid as JPEG.")
+    return encoded.tobytes()
 
-            def handle(self):
+
+def _render_camera_frames(
+    *,
+    mujoco,
+    renderer,
+    render_data,
+    camera_names: tuple[str, ...],
+    camera_name_mapping: dict[str, str],
+) -> dict[str, np.ndarray]:
+    frames: dict[str, np.ndarray] = {}
+    for camera_name in camera_names:
+        model_camera_name = camera_name_mapping.get(camera_name, camera_name)
+        renderer.update_scene(render_data, camera=model_camera_name)
+        frames[camera_name] = np.asarray(renderer.render()).copy()
+    return frames
+
+
+def _start_camera_stream_outputs(
+    *,
+    camera_width: int,
+    camera_height: int,
+) -> tuple[Any, _LatestCameraFrame, Any | None]:
+    import http.server
+    import socketserver
+
+    import cv2
+
+    latest_frame = _LatestCameraFrame()
+    blank_grid = np.zeros((camera_height * 2, camera_width * 2, 3), dtype=np.uint8)
+    latest_frame.set(_encode_grid_jpeg(blank_grid, cv2))
+
+    try:
+        import pygame
+
+        pygame.init()
+        screen = pygame.display.set_mode((camera_width * 2, camera_height * 2))
+        pygame.display.set_caption("Camera Observations (2x2)")
+    except Exception:
+        pygame = None
+        screen = None
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            del format, args
+
+        def do_GET(self):
+            if self.path == "/" or self.path.startswith("/index.html"):
+                body = _camera_stream_index_html().encode("utf-8")
                 try:
-                    super().handle()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                    self.send_header("Expires", "0")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                 except BrokenPipeError:
                     pass
+                return
 
-            def end_headers(self):
-                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-                self.send_header("Expires", "0")
-                super().end_headers()
+            if self.path.startswith("/grid.jpg"):
+                payload = latest_frame.get()
+                if payload is None:
+                    self.send_error(503, "Camera frame not ready")
+                    return
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                    self.send_header("Expires", "0")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                except BrokenPipeError:
+                    pass
+                return
 
-        class UniqueTCPServer(socketserver.TCPServer):
-            allow_reuse_address = True
+            self.send_error(404)
 
-        http_server = UniqueTCPServer(("", 18765), Handler)
-        threading.Thread(target=http_server.serve_forever, daemon=True).start()
-        print("Camera stream: http://localhost:18765/ (2x2 grid)")
+    class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
 
-        try:
-            import pygame
-            pygame.init()
-            screen = pygame.display.set_mode((camera_width * 2, camera_height * 2))
-            pygame.display.set_caption("Camera Observations (2x2)")
-        except Exception:
-            screen = None
+    http_server = ThreadedTCPServer(("", 18765), Handler)
+    threading.Thread(target=http_server.serve_forever, daemon=True).start()
+    print("Camera stream: http://localhost:18765/ (2x2 grid)")
+    return http_server, latest_frame, screen
 
-    while True:
-        if viewer is not None and not viewer.is_running():
-            break
-        if duration_s is not None and time.perf_counter() - start >= duration_s:
-            break
-        if max_steps is not None and steps >= max_steps:
-            break
 
+def _run_control_loop(
+    *,
+    env,
+    teleop: TeleopReader,
+    fps: int,
+    shared_info: _LatestTeleopInfo,
+    stop_event: threading.Event,
+    render_cameras: bool,
+) -> None:
+    loop_steps = 0
+    while not stop_event.is_set():
         loop_start = time.perf_counter()
         action = teleop.get_action()
-        _, _, terminated, truncated, info = env.step_teleop_action(action, control_period_s=1.0 / fps)
+        if render_cameras:
+            _, _, terminated, truncated, info = env.step_teleop_action(
+                action,
+                control_period_s=1.0 / fps,
+                include_camera_obs_in_observation=False,
+                include_camera_obs_in_info=False,
+            )
+        else:
+            _, _, terminated, truncated, info = env.step_teleop_action(action, control_period_s=1.0 / fps)
 
-        if viewer is not None:
+        loop_steps += 1
+        shared_info.update(
+            info=info,
+            loop_steps=loop_steps,
+            terminated=terminated,
+            truncated=truncated,
+        )
+
+        if terminated or truncated:
+            stop_event.set()
+            break
+
+        sleep_s = max(1.0 / fps - (time.perf_counter() - loop_start), 0.0)
+        if sleep_s > 0.0:
+            stop_event.wait(sleep_s)
+
+
+def run_sim_teleop_loop(
+    *,
+    env,
+    teleop: TeleopReader,
+    fps: int,
+    viewer: ViewerHandle | None = None,
+    viewer_data: Any | None = None,
+    duration_s: float | None = None,
+    max_steps: int | None = None,
+    marker_style: MarkerStyle | None = None,
+    render_cameras: bool = False,
+    camera_width: int = 640,
+    camera_height: int = 480,
+    camera_fps: float = 30.0,
+) -> dict[str, Any]:
+    marker_style = marker_style or MarkerStyle()
+    start = time.perf_counter()
+    if render_cameras:
+        _, info = env.reset(
+            include_camera_obs_in_observation=False,
+            include_camera_obs_in_info=False,
+        )
+    else:
+        _, info = env.reset()
+    sync_gripper = getattr(teleop, "sync_gripper_baseline", None)
+    if callable(sync_gripper) and "gripper_command" in info:
+        sync_gripper(float(info["gripper_command"]))
+    shared_info = _LatestTeleopInfo(info=dict(info))
+    stop_event = threading.Event()
+
+    if viewer is not None:
+        copy_visual_state = getattr(env, "copy_visual_state", None)
+        if viewer_data is not None and callable(copy_visual_state):
+            copy_visual_state(viewer_data)
+        with viewer.lock():
+            update_passive_viewer_markers(env._mujoco, viewer, info, marker_style)
+        viewer.sync()
+
+    http_server = None
+    latest_frame = None
+    screen = None
+    camera_renderer = None
+    camera_render_data = None
+    cv2_module = None
+    viewer_period_s = 1.0 / 60.0
+    camera_period_s = 1.0 / max(float(camera_fps), 1.0)
+    next_viewer_sync = time.perf_counter()
+    next_camera_render = time.perf_counter()
+
+    if render_cameras:
+        import cv2
+
+        cv2_module = cv2
+        http_server, latest_frame, screen = _start_camera_stream_outputs(
+            camera_width=camera_width,
+            camera_height=camera_height,
+        )
+        camera_renderer = env._mujoco.Renderer(
+            env.model,
+            height=camera_height,
+            width=camera_width,
+        )
+        camera_render_data = env._mujoco.MjData(env.model)
+
+    control_thread = threading.Thread(
+        target=_run_control_loop,
+        name="fr3-teleop-control",
+        daemon=True,
+        kwargs={
+            "env": env,
+            "teleop": teleop,
+            "fps": fps,
+            "shared_info": shared_info,
+            "stop_event": stop_event,
+            "render_cameras": render_cameras,
+        },
+    )
+    control_thread.start()
+
+    while True:
+        info, loop_steps, terminated, truncated = shared_info.snapshot()
+        if viewer is not None and not viewer.is_running():
+            stop_event.set()
+            break
+        if duration_s is not None and time.perf_counter() - start >= duration_s:
+            stop_event.set()
+            break
+        if max_steps is not None and loop_steps >= max_steps:
+            stop_event.set()
+            break
+        if terminated or truncated:
+            break
+
+        now = time.perf_counter()
+        if viewer is not None and now >= next_viewer_sync:
             copy_visual_state = getattr(env, "copy_visual_state", None)
             if viewer_data is not None and callable(copy_visual_state):
                 copy_visual_state(viewer_data)
             with viewer.lock():
                 update_passive_viewer_markers(env._mujoco, viewer, info, marker_style)
             viewer.sync()
+            next_viewer_sync = now + viewer_period_s
 
-        if render_cameras and info.get("camera_obs"):
-            import cv2
-            import os
-            import tempfile
-
-            grid = render_camera_grid(info["camera_obs"], camera_width, camera_height)
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".jpg", dir="/tmp/camera_stream")
-            os.close(tmp_fd)
-            cv2.imwrite(tmp_path, cv2.cvtColor(grid, cv2.COLOR_RGB2BGR))
-            os.replace(tmp_path, os.path.join("/tmp/camera_stream", "grid.jpg"))
-
+        if render_cameras and camera_renderer is not None and camera_render_data is not None and latest_frame is not None and now >= next_camera_render:
+            env.copy_visual_state(camera_render_data)
+            camera_obs = _render_camera_frames(
+                mujoco=env._mujoco,
+                renderer=camera_renderer,
+                render_data=camera_render_data,
+                camera_names=tuple(env.cfg.camera_names),
+                camera_name_mapping=dict(env.cfg.camera_name_mapping),
+            )
+            grid = render_camera_grid(camera_obs, camera_width, camera_height)
+            latest_frame.set(_encode_grid_jpeg(grid, cv2_module))
             if screen is not None:
                 try:
                     import pygame
+
                     surf = pygame.surfarray.make_surface(np.transpose(grid, (1, 0, 2)))
                     screen.fill((0, 0, 0))
                     screen.blit(surf, (0, 0))
                     pygame.display.flip()
                     for event in pygame.event.get():
                         if event.type == pygame.QUIT:
-                            screen = None
+                            stop_event.set()
                 except Exception:
                     screen = None
+            next_camera_render = now + camera_period_s
 
-        steps += 1
-        if terminated or truncated:
-            break
+        sleep_s = 0.001
+        if viewer is not None or render_cameras:
+            next_deadline = now + 1.0
+            if viewer is not None:
+                next_deadline = min(next_deadline, next_viewer_sync)
+            if render_cameras:
+                next_deadline = min(next_deadline, next_camera_render)
+            sleep_s = max(min(next_deadline - time.perf_counter(), 0.01), 0.001)
+        time.sleep(sleep_s)
 
-        dt_s = time.perf_counter() - loop_start
-        sleep_s = max(1.0 / fps - dt_s, 0.0)
-        if sleep_s > 0.0:
-            time.sleep(sleep_s)
+    stop_event.set()
+    control_thread.join(timeout=1.0)
+    info, loop_steps, _, _ = shared_info.snapshot()
+
+    if viewer is not None and viewer.is_running():
+        copy_visual_state = getattr(env, "copy_visual_state", None)
+        if viewer_data is not None and callable(copy_visual_state):
+            copy_visual_state(viewer_data)
+        with viewer.lock():
+            update_passive_viewer_markers(env._mujoco, viewer, info, marker_style)
+        viewer.sync()
+
+    if render_cameras and camera_renderer is not None and camera_render_data is not None and latest_frame is not None:
+        env.copy_visual_state(camera_render_data)
+        camera_obs = _render_camera_frames(
+            mujoco=env._mujoco,
+            renderer=camera_renderer,
+            render_data=camera_render_data,
+            camera_names=tuple(env.cfg.camera_names),
+            camera_name_mapping=dict(env.cfg.camera_name_mapping),
+        )
+        grid = render_camera_grid(camera_obs, camera_width, camera_height)
+        latest_frame.set(_encode_grid_jpeg(grid, cv2_module))
+        if screen is not None:
+            try:
+                import pygame
+
+                surf = pygame.surfarray.make_surface(np.transpose(grid, (1, 0, 2)))
+                screen.fill((0, 0, 0))
+                screen.blit(surf, (0, 0))
+                pygame.display.flip()
+            except Exception:
+                screen = None
 
     if http_server is not None:
         http_server.shutdown()
+        server_close = getattr(http_server, "server_close", None)
+        if callable(server_close):
+            server_close()
+    if camera_renderer is not None:
+        camera_renderer.close()
     if screen is not None:
         import pygame
         pygame.quit()
 
     info = dict(info)
-    info["loop_steps"] = steps
+    info["loop_steps"] = loop_steps
     return info

@@ -238,6 +238,32 @@
 这说明：
 
 - 主运动方向已经和目标方向一致
+
+## 2026-04-22 补充：MuJoCo camera stream 与 GL backend 结论
+
+围绕 `tools/fr3/fr3_mujoco_teleop.py --enable-cameras` 的进一步定位后，结论已经收敛为两条：
+
+1. 控制与渲染必须解耦
+- 控制线程负责 `SpaceMouse -> step_teleop_action`
+- 相机与 viewer 相关的 MuJoCo GL 渲染必须留在主线程
+- 否则在当前 Docker + MuJoCo 环境下容易触发 EGL/GL context 绑定错误
+
+2. `viewer + camera Renderer` 在当前 teleop 容器内默认不能继续使用 `MUJOCO_GL=egl`
+- 当前镜像基础环境默认是 `MUJOCO_GL=egl`
+- 但在 `lerobot-fr3-sim-teleop` 里，如果同时启用 MuJoCo viewer 和相机渲染，`egl` 会在创建或切换 `mujoco.Renderer` 时失败
+- 实测可行配置是：`MUJOCO_GL=glfw`
+
+因此，本仓库现在将 FR3 teleop 的默认策略明确为：
+
+- `docker/docker-compose.yml` 中 `lerobot-fr3-sim-teleop` 默认 `MUJOCO_GL=glfw`
+- `tools/fr3/fr3_mujoco_teleop.py` 在“启用 cameras 且未禁用 viewer”时，会将 `MUJOCO_GL` 从缺省值或 `egl` 自动切到 `glfw`
+- 如需 headless/no-viewer 路径，可显式覆盖回 `MUJOCO_GL=egl`
+
+对应经验规则：
+
+1. `--enable-cameras` 且需要 viewer：优先 `MUJOCO_GL=glfw`
+2. `--no-viewer` 的 headless 相机渲染：可以再评估是否回到 `egl`
+3. 不要再尝试在子线程里创建或驱动 MuJoCo `Renderer`
 - 剩余误差主要表现为亚毫米到毫米级的 `z` 下沉与少量 `x` 串扰
 - 不再是先前那种“目标在正向，但真实 TCP 整段朝 `-x/-z` 漂”的失控状态
 

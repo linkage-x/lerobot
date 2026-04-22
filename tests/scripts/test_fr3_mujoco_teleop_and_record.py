@@ -17,6 +17,8 @@ def test_parse_args_accepts_camera_viewer_and_resolution_flags():
             "640",
             "--camera-height",
             "480",
+            "--camera-fps",
+            "30",
         ]
     )
 
@@ -24,6 +26,7 @@ def test_parse_args_accepts_camera_viewer_and_resolution_flags():
     assert args.enable_cameras is True
     assert args.camera_width == 640
     assert args.camera_height == 480
+    assert args.camera_fps == 30.0
     assert args.continuous_physics is True
     assert args.arm_actuator_kp == 20000.0
     assert args.arm_gravity_comp_scale == 0.5
@@ -58,6 +61,26 @@ def test_viewer_camera_name_normalization_accepts_none_and_named_camera():
 
     assert fr3_mujoco_teleop.resolve_viewer_camera_name(None, env_cfg) is None
     assert fr3_mujoco_teleop.resolve_viewer_camera_name("side", env_cfg) == "side_cam"
+
+
+def test_configure_mujoco_gl_backend_switches_to_glfw_for_viewer_plus_cameras(monkeypatch):
+    args = fr3_mujoco_teleop.parse_args(["--enable-cameras"])
+    monkeypatch.setenv("MUJOCO_GL", "egl")
+
+    backend = fr3_mujoco_teleop.configure_mujoco_gl_backend(args)
+
+    assert backend == "glfw"
+    assert fr3_mujoco_teleop.os.environ["MUJOCO_GL"] == "glfw"
+
+
+def test_configure_mujoco_gl_backend_keeps_existing_backend_without_viewer(monkeypatch):
+    args = fr3_mujoco_teleop.parse_args(["--enable-cameras", "--no-viewer"])
+    monkeypatch.setenv("MUJOCO_GL", "egl")
+
+    backend = fr3_mujoco_teleop.configure_mujoco_gl_backend(args)
+
+    assert backend == "egl"
+    assert fr3_mujoco_teleop.os.environ["MUJOCO_GL"] == "egl"
 
 
 def test_env_info_to_robot_observation_includes_camera_images():

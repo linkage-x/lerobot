@@ -61,6 +61,26 @@ class FakeMujoco:
         mjGEOM_SPHERE = 0
         mjGEOM_CAPSULE = 1
 
+    class Renderer:
+        def __init__(self, model, height, width):
+            del model, height, width
+
+        def update_scene(self, data, camera=None):
+            del data, camera
+
+        def render(self):
+            return np.zeros((8, 8, 3), dtype=np.uint8)
+
+        def close(self):
+            return None
+
+    class _FakeMjData(dict):
+        pass
+
+    def MjData(self, model):
+        del model
+        return self._FakeMjData()
+
     def mjv_initGeom(self, geom, type, size, pos, mat, rgba):
         del type, size, pos, mat
         geom.rgba[:] = rgba
@@ -149,7 +169,8 @@ def test_run_sim_teleop_loop_copies_visual_state_into_separate_viewer_data():
                 "gripper_command": 1.0,
             }
 
-        def reset(self):
+        def reset(self, **kwargs):
+            del kwargs
             return {}, dict(self.info)
 
         def copy_visual_state(self, target_data):
@@ -178,3 +199,92 @@ def test_run_sim_teleop_loop_copies_visual_state_into_separate_viewer_data():
     assert viewer_data["copied"] is True
     assert env.copy_calls >= 2
     assert viewer.sync_calls >= 2
+
+
+def test_run_sim_teleop_loop_skips_step_camera_obs_when_camera_stream_enabled(monkeypatch):
+    class FakeEnv:
+        def __init__(self):
+            self._mujoco = FakeMujoco()
+            self.step_kwargs = None
+            self.reset_kwargs = None
+            self.copy_calls = 0
+            self.model = object()
+            self.cfg = type(
+                "Cfg",
+                (),
+                {
+                    "camera_names": ("third_person", "side", "wrist"),
+                    "camera_name_mapping": {"third_person": "third_person", "side": "side", "wrist": "wrist"},
+                },
+            )()
+            self.info = {
+                "target_pose": np.eye(4, dtype=np.float64),
+                "tcp_pose": np.eye(4, dtype=np.float64),
+                "target_marker_name": "target",
+                "tcp_marker_name": "TCP",
+                "target_site_name": "target_site",
+                "tcp_site_name": "tcp_site",
+                "camera_names": ("third_person", "side", "wrist"),
+                "gripper_command": 1.0,
+            }
+
+        def reset(self, **kwargs):
+            self.reset_kwargs = kwargs
+            return {}, dict(self.info)
+
+        def step_teleop_action(self, action, control_period_s=None, **kwargs):
+            del action, control_period_s
+            self.step_kwargs = kwargs
+            return {}, 0.0, False, True, dict(self.info)
+
+        def copy_visual_state(self, target_data):
+            target_data["copied"] = True
+            self.copy_calls += 1
+
+    class FakeCameraServer:
+        def shutdown(self):
+            return None
+
+    class FakeLatestFrame:
+        def __init__(self):
+            self.value = None
+
+        def set(self, jpeg_bytes):
+            self.value = jpeg_bytes
+
+        def get(self):
+            return self.value
+
+    def fake_start_camera_stream_outputs(**kwargs):
+        del kwargs
+        return FakeCameraServer(), FakeLatestFrame(), None
+
+    monkeypatch.setattr(
+        "lerobot.envs.fr3_mujoco_teleop._start_camera_stream_outputs",
+        fake_start_camera_stream_outputs,
+    )
+
+    env = FakeEnv()
+    teleop = SyncingFakeTeleop([{"enabled": False}])
+    info = run_sim_teleop_loop(
+        env=env,
+        teleop=teleop,
+        fps=200,
+        viewer=None,
+        max_steps=1,
+        render_cameras=True,
+        camera_width=8,
+        camera_height=8,
+        camera_fps=30,
+    )
+
+    assert info["loop_steps"] == 1
+    assert env.reset_kwargs == {
+        "include_camera_obs_in_observation": False,
+        "include_camera_obs_in_info": False,
+    }
+    assert env.step_kwargs == {
+        "include_camera_obs_in_observation": False,
+        "include_camera_obs_in_info": False,
+    }
+    assert env.copy_calls >= 1

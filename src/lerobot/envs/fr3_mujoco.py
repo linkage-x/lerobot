@@ -345,14 +345,8 @@ class FR3MujocoEnv(gym.Env):
         self._servo_target_joints = self._initial_joint_positions.copy()
         self._set_gripper_command(self._last_gripper)
 
-        if self.cfg.enable_cameras:
-            self._renderer = self._mujoco.Renderer(
-                self.model,
-                height=self.cfg.camera_height,
-                width=self.cfg.camera_width,
-            )
-        else:
-            self._renderer = None
+        self._renderer = None
+        self._renderer_owner_thread_id: int | None = None
 
     @staticmethod
     def _import_mujoco():
@@ -791,8 +785,6 @@ class FR3MujocoEnv(gym.Env):
             desired_pose[:3, 3] = np.clip(desired_pose[:3, 3], self._workspace_min, self._workspace_max)
         else:
             if self._hold_joint_target is None:
-                # Freeze on the measured joint state at the moment teleop disables
-                # rather than the last planned OTG target, which may not have been reached.
                 self._hold_joint_target = self._get_joint_positions().copy()
             desired_pose = np.asarray(self._kinematics.forward_kinematics(self._hold_joint_target), dtype=np.float64)
             hold_current_joints = True
@@ -802,7 +794,14 @@ class FR3MujocoEnv(gym.Env):
     def _build_camera_obs(self) -> dict[str, np.ndarray]:
         return self.render()
 
-    def step_teleop_action(self, action: dict[str, Any] | None, control_period_s: float | None = None):
+    def step_teleop_action(
+        self,
+        action: dict[str, Any] | None,
+        control_period_s: float | None = None,
+        *,
+        include_camera_obs_in_observation: bool = True,
+        include_camera_obs_in_info: bool = True,
+    ):
         with self._physics_lock:
             teleop_action = self._normalize_teleop_action(action)
             current_joints = self._get_joint_positions()
@@ -854,10 +853,10 @@ class FR3MujocoEnv(gym.Env):
             self._prev_enabled = bool(teleop_action["enabled"])
 
             self._step_count += 1
-            observation = self._build_observation()
+            observation = self._build_observation(include_camera_obs=include_camera_obs_in_observation)
             terminated = False
             truncated = self._step_count >= self.cfg.max_episode_steps
-            info = self._build_info()
+            info = self._build_info(include_camera_obs=include_camera_obs_in_info)
             info["teleop_action"] = teleop_action.copy()
             info["target_joint_positions"] = target_joints.copy()
             info["otg_enabled"] = self._otg is not None
@@ -865,7 +864,7 @@ class FR3MujocoEnv(gym.Env):
             info["sender_steps"] = sender_steps
             return observation, 0.0, terminated, truncated, info
 
-    def _build_observation(self) -> dict[str, Any]:
+    def _build_observation(self, *, include_camera_obs: bool = True) -> dict[str, Any]:
         joint_positions = self._get_joint_positions()
         ee_pose = self._current_tcp_pose()
         env_state = np.concatenate([ee_pose[:3, 3], ee_pose[:3, :3].reshape(-1)], dtype=np.float64)
@@ -873,7 +872,7 @@ class FR3MujocoEnv(gym.Env):
             "agent_pos": joint_positions.astype(np.float32),
             "environment_state": env_state.astype(np.float32),
         }
-        if self.cfg.enable_cameras:
+        if self.cfg.enable_cameras and include_camera_obs:
             observation["camera_obs"] = self._build_camera_obs()
         return observation
 
@@ -882,6 +881,8 @@ class FR3MujocoEnv(gym.Env):
         *,
         seed: int | None = None,
         options: dict[str, Any] | None = None,
+        include_camera_obs_in_observation: bool = True,
+        include_camera_obs_in_info: bool = True,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         with self._physics_lock:
             super().reset(seed=seed)
@@ -907,7 +908,10 @@ class FR3MujocoEnv(gym.Env):
             self._set_gripper_command(self._last_gripper)
             if self.cfg.continuous_physics:
                 self._ensure_continuous_physics_thread()
-            return self._build_observation(), self._build_info()
+            return (
+                self._build_observation(include_camera_obs=include_camera_obs_in_observation),
+                self._build_info(include_camera_obs=include_camera_obs_in_info),
+            )
 
     def step(self, action: np.ndarray):
         with self._physics_lock:
@@ -936,7 +940,7 @@ class FR3MujocoEnv(gym.Env):
             truncated = self._step_count >= self.cfg.max_episode_steps
             return observation, 0.0, terminated, truncated, self._build_info()
 
-    def _build_info(self) -> dict[str, Any]:
+    def _build_info(self, *, include_camera_obs: bool = True) -> dict[str, Any]:
         with self._physics_lock:
             joint_positions = self._get_joint_positions()
             ee_pose = self._current_tcp_pose()
@@ -946,22 +950,31 @@ class FR3MujocoEnv(gym.Env):
                 "target_frame_name": self.cfg.target_frame_name,
                 "arm_gravity_compensation_enabled": bool(self.cfg.enable_arm_gravity_compensation),
             }
-            if self.cfg.enable_cameras:
+            if self.cfg.enable_cameras and include_camera_obs:
                 info["camera_obs"] = self._build_camera_obs()
             info.update(self._build_visualization_info())
             return info
 
     def _get_renderer(self):
+        current_thread_id = threading.get_ident()
+        if self._renderer is not None and self._renderer_owner_thread_id != current_thread_id:
+            self._renderer.close()
+            self._renderer = None
+            self._renderer_owner_thread_id = None
         if self._renderer is None:
             self._renderer = self._mujoco.Renderer(
                 self.model,
                 height=self.cfg.camera_height,
                 width=self.cfg.camera_width,
             )
+            self._renderer_owner_thread_id = current_thread_id
         return self._renderer
 
-    def render(self):
-        with self._physics_lock:
+    def render(self, *, blocking: bool = True):
+        acquired = self._physics_lock.acquire(blocking=blocking)
+        if not acquired:
+            return None
+        try:
             renderer = self._get_renderer()
             frames: dict[str, np.ndarray] = {}
             for camera_name in self.cfg.camera_names:
@@ -969,12 +982,15 @@ class FR3MujocoEnv(gym.Env):
                 renderer.update_scene(self.data, camera=model_camera_name)
                 frames[camera_name] = np.asarray(renderer.render()).copy()
             return frames
+        finally:
+            self._physics_lock.release()
 
     def close(self) -> None:
         self._stop_continuous_physics_thread()
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
+            self._renderer_owner_thread_id = None
         return None
 
 

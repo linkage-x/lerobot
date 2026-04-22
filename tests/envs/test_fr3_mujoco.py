@@ -457,6 +457,33 @@ def test_render_returns_named_camera_images_when_enabled():
         env.close()
 
 
+def test_camera_renderer_is_lazy_until_first_render():
+    cfg = FR3MujocoEnvConfig(enable_cameras=True, camera_height=64, camera_width=64)
+    env = FR3MujocoEnv(cfg=cfg)
+    try:
+        assert env._renderer is None
+        env.render()
+        assert env._renderer is not None
+    finally:
+        env.close()
+
+
+def test_step_teleop_action_can_skip_camera_obs_in_observation_and_info():
+    cfg = FR3MujocoEnvConfig(enable_cameras=True, camera_height=64, camera_width=64)
+    env = FR3MujocoEnv(cfg=cfg)
+    try:
+        env.reset()
+        observation, _, _, _, info = env.step_teleop_action(
+            {"enabled": False},
+            include_camera_obs_in_observation=False,
+            include_camera_obs_in_info=False,
+        )
+        assert "camera_obs" not in observation
+        assert "camera_obs" not in info
+    finally:
+        env.close()
+
+
 def test_gripper_command_updates_pika_slide_joints_symmetrically():
     env = FR3MujocoEnv()
     try:
