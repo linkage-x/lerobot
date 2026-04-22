@@ -79,7 +79,6 @@ class FR3MujocoEnvConfig:
         }
     )
     scene_geom_names: tuple[str, ...] = ("floor", "table", "workspace_object")
-    camera_fovy: float = 60.0
     camera_height: int = 256
     camera_width: int = 256
     enable_cameras: bool = False

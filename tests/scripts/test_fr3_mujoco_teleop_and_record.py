@@ -62,7 +62,6 @@ def test_build_env_config_uses_d435i_like_camera_defaults_when_enabled():
     assert cfg.camera_width == 640
     assert cfg.camera_height == 480
     assert cfg.camera_names == ("third_person", "side", "wrist")
-    assert cfg.camera_fovy == 42.0
     assert cfg.arm_actuator_kp == 20000.0
     assert cfg.arm_gravity_compensation_scale == 0.5
     assert cfg.use_otg is False

@@ -15,7 +15,6 @@ from lerobot.teleoperators.spacemouse.configuration_spacemouse import (
 )
 from lerobot.teleoperators.spacemouse.teleop_spacemouse import SpaceMouseTeleop
 
-_D435I_COLOR_FOVY_DEG = 42.0
 _D435I_COLOR_WIDTH = 640
 _D435I_COLOR_HEIGHT = 480
 
@@ -92,10 +91,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--scale-wx",
         type=float,
-        default=-0.001944,
+        default=0, # if set, should be a negative value, such as -0.001944,
         help="Per-axis roll scale override. Defaults negative so SpaceMouse roll matches the FR3 sim TCP roll semantics.",
     )
-    parser.add_argument("--scale-wy", type=float, default=None)
+    parser.add_argument("--scale-wy", type=float, default=0)
     parser.add_argument("--scale-wz", type=float, default=None)
     parser.add_argument("--threshold-x", type=float, default=0.02)
     parser.add_argument("--threshold-y", type=float, default=0.02)
@@ -161,7 +160,6 @@ def build_env_config(args: argparse.Namespace) -> FR3MujocoEnvConfig:
         enable_cameras=bool(args.enable_cameras),
         camera_width=int(args.camera_width),
         camera_height=int(args.camera_height),
-        camera_fovy=float(_D435I_COLOR_FOVY_DEG),
         continuous_physics=bool(args.continuous_physics),
         continuous_physics_frequency=float(args.continuous_physics_frequency),
     )
@@ -224,7 +222,6 @@ def main(argv: list[str] | None = None) -> int:
                 "camera_height": args.camera_height,
                 "camera_fps": args.camera_fps,
                 "mujoco_gl": mujoco_gl_backend,
-                "camera_fovy": _D435I_COLOR_FOVY_DEG,
                 "arm_actuator_kp": args.arm_actuator_kp,
                 "arm_gravity_compensation_scale": args.arm_gravity_comp_scale,
                 "use_otg": args.use_otg,

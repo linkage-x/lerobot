@@ -39,7 +39,6 @@ from lerobot.envs.fr3_mujoco_teleop import MarkerStyle, run_sim_teleop_loop
 from lerobot.teleoperators.keyboard import KeyboardEndEffectorTeleop, KeyboardEndEffectorTeleopConfig
 
 
-_D435I_COLOR_FOVY_DEG = 42.0
 _D435I_COLOR_WIDTH = 640
 _D435I_COLOR_HEIGHT = 480
 
@@ -174,7 +173,6 @@ def build_env_config(args: argparse.Namespace) -> FR3MujocoEnvConfig:
         enable_cameras=bool(args.enable_cameras),
         camera_width=int(args.camera_width),
         camera_height=int(args.camera_height),
-        camera_fovy=float(_D435I_COLOR_FOVY_DEG),
         continuous_physics=bool(args.continuous_physics),
         continuous_physics_frequency=float(args.continuous_physics_frequency),
     )

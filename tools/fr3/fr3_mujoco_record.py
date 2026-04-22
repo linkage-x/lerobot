@@ -224,7 +224,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         enable_cameras=True,
         camera_width=640,
         camera_height=480,
-        camera_fovy=42.0,
         continuous_physics=True,
         continuous_physics_frequency=800.0,
     )

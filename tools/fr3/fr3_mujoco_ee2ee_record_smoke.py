@@ -213,7 +213,6 @@ def main() -> int:
             enable_cameras=True,
             camera_width=int(args.camera_width),
             camera_height=int(args.camera_height),
-            camera_fovy=42.0,
         )
     )
 
