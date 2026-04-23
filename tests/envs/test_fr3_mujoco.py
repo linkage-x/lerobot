@@ -461,7 +461,16 @@ def test_render_returns_named_camera_images_when_enabled():
         for image in observation["camera_obs"].values():
             assert image.shape == (64, 64, 3)
             assert image.dtype == np.uint8
-        assert info["scene_geom_names"] == ("floor", "table", "workspace_object")
+        assert info["scene_geom_names"] == (
+            "floor",
+            "table",
+            "workspace_object",
+            "peg_hole_base",
+            "peg_hole_wall_x_pos",
+            "peg_hole_wall_x_neg",
+            "peg_hole_wall_y_pos",
+            "peg_hole_wall_y_neg",
+        )
     finally:
         env.close()
 
@@ -568,6 +577,34 @@ def test_workspace_object_starts_resting_above_table_surface():
         table_top_z = 0.38 + 0.02
         object_half_height = 0.04
         assert object_pos[2] >= table_top_z + object_half_height - 1e-6
+    finally:
+        env.close()
+
+
+def test_fixed_peg_hole_fixture_accepts_workspace_object_cross_section_with_clearance():
+    env = FR3MujocoEnv()
+    try:
+        x_pos_id = env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_GEOM, "peg_hole_wall_x_pos")
+        x_neg_id = env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_GEOM, "peg_hole_wall_x_neg")
+        y_pos_id = env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_GEOM, "peg_hole_wall_y_pos")
+        y_neg_id = env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_GEOM, "peg_hole_wall_y_neg")
+        base_id = env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_GEOM, "peg_hole_base")
+        object_id = env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_GEOM, "workspace_object")
+
+        assert min(x_pos_id, x_neg_id, y_pos_id, y_neg_id, base_id, object_id) >= 0
+
+        object_half_x, object_half_y, _ = env.model.geom_size[object_id]
+        x_inner_half = env.model.geom_pos[x_pos_id][0] - env.model.geom_size[x_pos_id][0]
+        y_inner_half = env.model.geom_pos[y_pos_id][1] - env.model.geom_size[y_pos_id][1]
+
+        assert x_inner_half > object_half_x
+        assert y_inner_half > object_half_y
+        assert x_inner_half - object_half_x >= 0.0015
+        assert y_inner_half - object_half_y >= 0.0015
+
+        fixture_body_id = env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_BODY, "peg_hole_fixture_body")
+        fixture_pos = np.asarray(env.model.body_pos[fixture_body_id], dtype=np.float64)
+        np.testing.assert_allclose(fixture_pos, np.array([0.10, -0.16, 0.02]), atol=1e-9)
     finally:
         env.close()
 

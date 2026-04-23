@@ -307,7 +307,7 @@ def _start_camera_stream_outputs(
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
-                except BrokenPipeError:
+                except (BrokenPipeError, ConnectionResetError):
                     pass
                 return
 
@@ -324,7 +324,7 @@ def _start_camera_stream_outputs(
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
-                except BrokenPipeError:
+                except (BrokenPipeError, ConnectionResetError):
                     pass
                 return
 

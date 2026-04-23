@@ -18,12 +18,15 @@
 
 from __future__ import annotations
 
+import argparse
 import logging
+import sys
+import threading
 import time
 from dataclasses import asdict
-from datetime import datetime
 from pathlib import Path
 from pprint import pformat
+from typing import Any
 
 import numpy as np
 
@@ -32,7 +35,13 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
 from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts, hw_to_dataset_features
 from lerobot.envs.fr3_mujoco import FR3MujocoEnv, FR3MujocoEnvConfig
-from lerobot.envs.fr3_mujoco_teleop import MarkerStyle
+from lerobot.envs.fr3_mujoco_teleop import (
+    _encode_grid_jpeg,
+    _render_camera_frames,
+    _start_camera_stream_outputs,
+    render_camera_grid,
+    update_passive_viewer_markers,
+)
 from lerobot.processor import RobotProcessorPipeline
 from lerobot.processor.converters import (
     observation_to_transition,
@@ -45,26 +54,113 @@ from lerobot.robots.franka_research3 import (
     DeltaActionToAbsoluteEEAction,
     KeepAbsoluteEEObservation,
 )
+from lerobot.scripts.lerobot_record import _confirm_keep_episode
 from lerobot.scripts.lerobot_record import RecordConfig
-from lerobot.teleoperators.spacemouse.configuration_spacemouse import (
-    SpaceMouseEnableButton,
-    SpaceMouseTeleopConfig,
-    SpaceMouseToolMode,
-)
 from lerobot.teleoperators.spacemouse.teleop_spacemouse import SpaceMouseTeleop
 from lerobot.utils.control_utils import init_keyboard_listener, is_headless
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.rotation import Rotation
 from lerobot.utils.utils import init_logging, log_say
 from lerobot.utils.constants import ACTION, OBS_STR
+try:
+    from tools.fr3.fr3_mujoco_runtime import (
+        build_runtime_env_config,
+        build_runtime_marker_style,
+        build_runtime_teleop_config,
+        configure_mujoco_gl_backend,
+        configure_viewer_camera,
+        parse_runtime_args,
+    )
+except ModuleNotFoundError:
+    from fr3_mujoco_runtime import (
+        build_runtime_env_config,
+        build_runtime_marker_style,
+        build_runtime_teleop_config,
+        configure_mujoco_gl_backend,
+        configure_viewer_camera,
+        parse_runtime_args,
+    )
 
 EE_POSITION_KEYS = ("ee.x", "ee.y", "ee.z")
 EE_QUAT_KEYS = ("ee.qx", "ee.qy", "ee.qz", "ee.qw")
 _SIM_CAMERA_NAMES = FR3MujocoEnvConfig().camera_names
 _D435I_IMAGE_SHAPE = (480, 640, 3)
+_WORKSPACE_OBJECT_BODY_NAME = "workspace_object_body"
+_WORKSPACE_OBJECT_RANDOM_RADIUS_M = 0.10
+_RUNTIME_ARGS: argparse.Namespace | None = None
 
 
-def _get_env_observation(info: dict, gripper_pos: float) -> dict:
+class _LatestEpisodeControlState:
+    def __init__(
+        self,
+        *,
+        sample_info: dict[str, Any],
+        viewer_info: dict[str, Any],
+        action: dict[str, Any],
+        sample_gripper: float,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._sample_info = dict(sample_info)
+        self._viewer_info = dict(viewer_info)
+        self._action = dict(action)
+        self._sample_gripper = float(sample_gripper)
+        self._loop_steps = 0
+        self._terminated = False
+        self._truncated = False
+        self._exception: BaseException | None = None
+
+    def update(
+        self,
+        *,
+        sample_info: dict[str, Any],
+        viewer_info: dict[str, Any],
+        action: dict[str, Any],
+        sample_gripper: float,
+        loop_steps: int,
+        terminated: bool,
+        truncated: bool,
+    ) -> None:
+        with self._lock:
+            self._sample_info = dict(sample_info)
+            self._viewer_info = dict(viewer_info)
+            self._action = dict(action)
+            self._sample_gripper = float(sample_gripper)
+            self._loop_steps = int(loop_steps)
+            self._terminated = bool(terminated)
+            self._truncated = bool(truncated)
+
+    def set_exception(self, error: BaseException) -> None:
+        with self._lock:
+            self._exception = error
+
+    def snapshot(self) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], float, int, bool, bool, BaseException | None]:
+        with self._lock:
+            return (
+                dict(self._sample_info),
+                dict(self._viewer_info),
+                dict(self._action),
+                float(self._sample_gripper),
+                int(self._loop_steps),
+                bool(self._terminated),
+                bool(self._truncated),
+                self._exception,
+            )
+
+
+def _zero_teleop_action(gripper: float) -> dict[str, float | bool]:
+    return {
+        "enabled": False,
+        "target_x": 0.0,
+        "target_y": 0.0,
+        "target_z": 0.0,
+        "target_wx": 0.0,
+        "target_wy": 0.0,
+        "target_wz": 0.0,
+        "gripper": float(gripper),
+    }
+
+
+def _get_env_observation(info: dict, gripper_pos: float, camera_obs: dict[str, np.ndarray] | None = None) -> dict:
     ee_pose = np.asarray(info["ee_pose"], dtype=np.float64)
     joint_positions = np.asarray(info["joint_positions"], dtype=np.float64)
     ee_rotvec = Rotation.from_matrix(ee_pose[:3, :3]).as_rotvec()
@@ -79,7 +175,8 @@ def _get_env_observation(info: dict, gripper_pos: float) -> dict:
     }
     for index, joint_position in enumerate(joint_positions, start=1):
         observation[f"joint_{index}.pos"] = float(joint_position)
-    camera_obs = info.get("camera_obs")
+    if camera_obs is None:
+        camera_obs = info.get("camera_obs")
     if isinstance(camera_obs, dict):
         for camera_name in _SIM_CAMERA_NAMES:
             image = camera_obs.get(camera_name)
@@ -129,28 +226,133 @@ def _build_teleop_features() -> dict:
     }
 
 
-def _update_viewer_markers(mujoco, viewer, info: dict, style: MarkerStyle) -> None:
-    target_pose = np.asarray(info["target_pose"], dtype=np.float64)
-    tcp_pose = np.asarray(info["tcp_pose"], dtype=np.float64)
-    scene = viewer.user_scn
-    geoms = [
-        {"kind": "sphere", "pos": target_pose[:3, 3], "rgba": style.target_rgba, "size": style.sphere_radius},
-        {"kind": "sphere", "pos": tcp_pose[:3, 3], "rgba": style.tcp_rgba, "size": style.sphere_radius},
-    ]
-    if scene.maxgeom < len(geoms):
-        raise RuntimeError(f"Viewer supports {scene.maxgeom} geoms, need {len(geoms)}")
-    scene.ngeom = 0
-    for geom_data in geoms:
-        geom = scene.geoms[scene.ngeom]
-        mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_SPHERE, np.array([geom_data["size"], 0, 0]),
-                            geom_data["pos"], np.eye(3).reshape(-1), geom_data["rgba"])
-        scene.ngeom += 1
+def _sample_disk_xy(center_xy: np.ndarray, radius_m: float, rng: np.random.Generator) -> np.ndarray:
+    center_xy = np.asarray(center_xy, dtype=np.float64).reshape(2)
+    sample_radius = float(radius_m) * np.sqrt(rng.uniform(0.0, 1.0))
+    sample_angle = rng.uniform(0.0, 2.0 * np.pi)
+    offset = np.array([np.cos(sample_angle), np.sin(sample_angle)], dtype=np.float64) * sample_radius
+    return center_xy + offset
+
+
+def _reset_workspace_object_for_episode(
+    env: FR3MujocoEnv,
+    rng: np.random.Generator,
+    *,
+    random_radius_m: float = _WORKSPACE_OBJECT_RANDOM_RADIUS_M,
+) -> np.ndarray:
+    mujoco = env._mujoco
+    body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, _WORKSPACE_OBJECT_BODY_NAME)
+    if body_id < 0:
+        raise ValueError(f"Body '{_WORKSPACE_OBJECT_BODY_NAME}' not found in MuJoCo model.")
+
+    joint_id = int(env.model.body_jntadr[body_id])
+    if joint_id < 0:
+        raise ValueError(f"Body '{_WORKSPACE_OBJECT_BODY_NAME}' has no associated joint to reset.")
+
+    qpos_adr = int(env.model.jnt_qposadr[joint_id])
+    qvel_adr = int(env.model.jnt_dofadr[joint_id])
+    initial_pos = np.asarray(env.model.body_pos[body_id], dtype=np.float64).copy()
+    initial_quat = np.asarray(env.model.body_quat[body_id], dtype=np.float64).copy()
+    sampled_xy = _sample_disk_xy(initial_pos[:2], random_radius_m, rng)
+    sampled_pos = initial_pos.copy()
+    sampled_pos[:2] = sampled_xy
+
+    with env._physics_lock:
+        env.data.qpos[qpos_adr : qpos_adr + 3] = sampled_pos
+        env.data.qpos[qpos_adr + 3 : qpos_adr + 7] = initial_quat
+        env.data.qvel[qvel_adr : qvel_adr + 6] = 0.0
+        mujoco.mj_forward(env.model, env.data)
+    return sampled_pos
+
+
+def _wait_for_teleop_idle(teleop, *, play_sounds: bool) -> None:
+    wait_until_idle = getattr(teleop, "wait_until_idle", None)
+    if not callable(wait_until_idle):
+        return
+
+    logging.info("Waiting for teleop input to return to idle before starting the episode.")
+    log_say("Release teleop input", play_sounds)
+    if not wait_until_idle(consecutive_samples=3):
+        raise RuntimeError("Teleop input did not return to idle before starting the episode.")
+
+
+def _run_episode_control_loop(
+    *,
+    env: FR3MujocoEnv,
+    teleop,
+    fps: int,
+    initial_info: dict[str, Any],
+    initial_gripper: float,
+    shared_state: _LatestEpisodeControlState,
+    stop_event: threading.Event,
+) -> None:
+    info = dict(initial_info)
+    current_gripper = float(initial_gripper)
+    loop_steps = 0
+    try:
+        while not stop_event.is_set():
+            loop_start = time.perf_counter()
+            action = teleop.get_action()
+            sample_info = dict(info)
+            sample_gripper = current_gripper
+            _, _, terminated, truncated, next_info = env.step_teleop_action(
+                action,
+                control_period_s=1.0 / fps,
+                include_camera_obs_in_observation=False,
+                include_camera_obs_in_info=False,
+            )
+            loop_steps += 1
+            shared_state.update(
+                sample_info=sample_info,
+                viewer_info=next_info,
+                action=action,
+                sample_gripper=sample_gripper,
+                loop_steps=loop_steps,
+                terminated=terminated,
+                truncated=truncated,
+            )
+            info = dict(next_info)
+            current_gripper = float(action.get("gripper", current_gripper))
+
+            if terminated or truncated:
+                stop_event.set()
+                break
+
+            sleep_s = max(1.0 / fps - (time.perf_counter() - loop_start), 0.0)
+            if sleep_s > 0.0:
+                stop_event.wait(sleep_s)
+    except BaseException as exc:
+        shared_state.set_exception(exc)
+        stop_event.set()
 
 
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
+    runtime_args = _RUNTIME_ARGS or parse_runtime_args(
+        [],
+        description="Run FR3 MuJoCo simulation recording with the default ee2ee dataset contract.",
+    )[0]
     init_logging()
-    logging.info(pformat(asdict(cfg)))
+    mujoco_gl_backend = configure_mujoco_gl_backend(runtime_args)
+    logging.info(
+        pformat(
+            {
+                "record_cfg": asdict(cfg),
+                "runtime": {
+                    "viewer": not runtime_args.no_viewer,
+                    "viewer_camera": runtime_args.viewer_camera,
+                    "enable_cameras": runtime_args.enable_cameras,
+                    "camera_width": runtime_args.camera_width,
+                    "camera_height": runtime_args.camera_height,
+                    "camera_fps": runtime_args.camera_fps,
+                    "mujoco_gl": mujoco_gl_backend,
+                    "tool_mode": runtime_args.tool_mode,
+                    "motion_enable_button": runtime_args.motion_enable_button,
+                    "enable_rotation": runtime_args.enable_rotation,
+                },
+            }
+        )
+    )
 
     teleop_action_processor = RobotProcessorPipeline[tuple[dict, dict], dict](
         steps=[
@@ -217,44 +419,72 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         encoder_threads=cfg.dataset.encoder_threads,
     )
 
-    env_cfg = FR3MujocoEnvConfig(
-        teleop_control_frequency=float(cfg.control_fps or cfg.dataset.fps),
-        max_episode_steps=max(int(cfg.dataset.episode_time_s * (cfg.control_fps or cfg.dataset.fps)) + 100, 1000),
-        use_otg=False,
-        enable_cameras=True,
-        camera_width=640,
-        camera_height=480,
-        continuous_physics=True,
-        continuous_physics_frequency=800.0,
+    control_fps = int(runtime_args.fps)
+    env_cfg = build_runtime_env_config(
+        runtime_args,
+        control_frequency=control_fps,
+        max_episode_steps=max(int(cfg.dataset.episode_time_s * control_fps) + 100, 1000),
     )
     env = FR3MujocoEnv(env_cfg)
 
-    teleop_cfg = SpaceMouseTeleopConfig(
-        device_id=0,
-        frequency=cfg.control_fps or cfg.dataset.fps,
-        translation_scale=0.001845,
-        rotation_scale=0.001944,
-        enable_rotation=True,
-        tool_mode=SpaceMouseToolMode.INCREMENTAL,
-        motion_enable_button=SpaceMouseEnableButton.NONE,
+    teleop_cfg = build_runtime_teleop_config(
+        runtime_args,
+        frequency=control_fps,
     )
     teleop = SpaceMouseTeleop(teleop_cfg)
 
-    marker_style = MarkerStyle()
+    marker_style = build_runtime_marker_style(runtime_args)
     viewer = None
     viewer_data = None
+    selected_camera_name = None
+    http_server = None
+    latest_frame = None
+    screen = None
+    camera_renderer = None
+    camera_render_data = None
+    cv2_module = None
+    camera_period_s = 1.0 / max(float(runtime_args.camera_fps), 1.0)
+    next_camera_render = time.perf_counter()
+    viewer_period_s = 1.0 / 60.0
+    next_viewer_sync = time.perf_counter()
 
     listener, events = None, None
-    control_fps = cfg.control_fps or cfg.dataset.fps
+    rng = np.random.default_rng()
 
     try:
         import mujoco
         import mujoco.viewer
 
-        viewer_data = mujoco.MjData(env.model)
-        env.copy_visual_state(viewer_data)
-        viewer = mujoco.viewer.launch_passive(env.model, viewer_data)
+        if not runtime_args.no_viewer:
+            viewer_data = mujoco.MjData(env.model)
+            env.copy_visual_state(viewer_data)
+            viewer = mujoco.viewer.launch_passive(env.model, viewer_data)
+            selected_camera_name = configure_viewer_camera(mujoco, viewer, env, runtime_args.viewer_camera)
+        if runtime_args.enable_cameras:
+            import cv2
+
+            cv2_module = cv2
+            http_server, latest_frame, screen = _start_camera_stream_outputs(
+                camera_width=int(runtime_args.camera_width),
+                camera_height=int(runtime_args.camera_height),
+                camera_names=tuple(env.cfg.camera_names),
+            )
+            camera_renderer = env._mujoco.Renderer(
+                env.model,
+                height=int(runtime_args.camera_height),
+                width=int(runtime_args.camera_width),
+            )
+            camera_render_data = env._mujoco.MjData(env.model)
         print("fr3_mujoco_record=READY")
+        print(
+            pformat(
+                {
+                    "camera_names": env.cfg.camera_names,
+                    "viewer_camera": selected_camera_name,
+                    "camera_stream": bool(runtime_args.enable_cameras),
+                }
+            )
+        )
     except Exception as e:
         logging.warning(f"Could not launch viewer: {e}")
 
@@ -267,79 +497,165 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
             log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
-            _, info = env.reset()
+            _, info = env.reset(
+                include_camera_obs_in_observation=False,
+                include_camera_obs_in_info=False,
+            )
+            sampled_object_pos = _reset_workspace_object_for_episode(env, rng)
+            info = env._build_info()
+            logging.info(
+                "Episode %s workspace_object reset to x=%.4f, y=%.4f, z=%.4f within %.3fm radius.",
+                dataset.num_episodes,
+                sampled_object_pos[0],
+                sampled_object_pos[1],
+                sampled_object_pos[2],
+                _WORKSPACE_OBJECT_RANDOM_RADIUS_M,
+            )
             sync_gripper = getattr(teleop, "sync_gripper_baseline", None)
             if callable(sync_gripper) and "gripper_command" in info:
                 sync_gripper(float(info["gripper_command"]))
                 current_gripper = float(info["gripper_command"])
+            _wait_for_teleop_idle(teleop, play_sounds=cfg.play_sounds)
+
+            shared_state = _LatestEpisodeControlState(
+                sample_info=info,
+                viewer_info=info,
+                action=_zero_teleop_action(current_gripper),
+                sample_gripper=current_gripper,
+            )
+            episode_stop_event = threading.Event()
+            control_thread = threading.Thread(
+                target=_run_episode_control_loop,
+                name="fr3-record-control",
+                daemon=True,
+                kwargs={
+                    "env": env,
+                    "teleop": teleop,
+                    "fps": control_fps,
+                    "initial_info": info,
+                    "initial_gripper": current_gripper,
+                    "shared_state": shared_state,
+                    "stop_event": episode_stop_event,
+                },
+            )
+            control_thread.start()
 
             if viewer is not None:
                 copy_visual_state = getattr(env, "copy_visual_state", None)
                 if viewer_data is not None and callable(copy_visual_state):
                     copy_visual_state(viewer_data)
                 with viewer.lock():
-                    _update_viewer_markers(env._mujoco, viewer, info, marker_style)
+                    update_passive_viewer_markers(env._mujoco, viewer, info, marker_style)
                 viewer.sync()
+                next_viewer_sync = time.perf_counter() + viewer_period_s
 
             timestamp = 0.0
             start_episode_t = time.perf_counter()
             dataset_frame_period_s = 1 / dataset.fps
             next_dataset_frame_t = 0.0
+            try:
+                while timestamp < cfg.dataset.episode_time_s and not events["stop_recording"]:
+                    if events["exit_early"]:
+                        events["exit_early"] = False
+                        episode_stop_event.set()
+                        break
 
-            while timestamp < cfg.dataset.episode_time_s and not events["stop_recording"]:
-                loop_start = time.perf_counter()
-
-                if events["exit_early"]:
-                    events["exit_early"] = False
-                    break
-
-                loop_elapsed_s = time.perf_counter() - start_episode_t
-                should_capture = loop_elapsed_s + 1e-9 >= next_dataset_frame_t
-
-                obs_raw = _get_env_observation(info, gripper_pos=current_gripper)
-                obs_processed = robot_observation_processor(obs_raw)
-                obs_completed = _complete_robot_observation(obs_raw)
-
-                action = teleop.get_action()
-                action_processed = teleop_action_processor((action.copy(), obs_raw))
-                action_values = action_processed
-
-                _, _, terminated, truncated, info = env.step_teleop_action(
-                    action, control_period_s=1.0 / control_fps
-                )
-                current_gripper = float(action.get("gripper", current_gripper))
-
-                if viewer is not None and not viewer.is_running():
-                    break
-                if viewer is not None:
-                    copy_visual_state = getattr(env, "copy_visual_state", None)
-                    if viewer_data is not None and callable(copy_visual_state):
-                        copy_visual_state(viewer_data)
-                    with viewer.lock():
-                        _update_viewer_markers(env._mujoco, viewer, info, marker_style)
-                    viewer.sync()
-
-                if should_capture:
-                    observation_frame = build_dataset_frame(
-                        dataset.features,
-                        {**obs_completed, **robot_observation_processor(obs_raw)},
-                        prefix=OBS_STR,
+                    sample_info, viewer_info, action, sample_gripper, loop_steps, terminated, truncated, error = (
+                        shared_state.snapshot()
                     )
-                    action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
-                    frame = {**observation_frame, **action_frame, "task": cfg.dataset.single_task}
-                    dataset.add_frame(frame)
+                    if error is not None:
+                        raise error
 
-                    while next_dataset_frame_t <= loop_elapsed_s + 1e-9:
-                        next_dataset_frame_t += dataset_frame_period_s
+                    loop_elapsed_s = time.perf_counter() - start_episode_t
+                    should_capture = loop_elapsed_s + 1e-9 >= next_dataset_frame_t
+                    now = time.perf_counter()
 
-                dt_s = time.perf_counter() - loop_start
-                precise_sleep(max(1.0 / control_fps - dt_s, 0.0))
-                timestamp = time.perf_counter() - start_episode_t
+                    if viewer is not None and not viewer.is_running():
+                        episode_stop_event.set()
+                        break
+                    if viewer is not None and now >= next_viewer_sync:
+                        copy_visual_state = getattr(env, "copy_visual_state", None)
+                        if viewer_data is not None and callable(copy_visual_state):
+                            copy_visual_state(viewer_data)
+                        with viewer.lock():
+                            update_passive_viewer_markers(env._mujoco, viewer, viewer_info, marker_style)
+                        viewer.sync()
+                        next_viewer_sync = now + viewer_period_s
 
-                if terminated or truncated:
-                    break
+                    should_refresh_cameras = bool(runtime_args.enable_cameras) and (
+                        should_capture or now >= next_camera_render
+                    )
+                    camera_obs = None
+                    if should_refresh_cameras and camera_renderer is not None and camera_render_data is not None:
+                        env.copy_visual_state(camera_render_data)
+                        camera_obs = _render_camera_frames(
+                            mujoco=env._mujoco,
+                            renderer=camera_renderer,
+                            render_data=camera_render_data,
+                            camera_names=tuple(env.cfg.camera_names),
+                            camera_name_mapping=dict(env.cfg.camera_name_mapping),
+                        )
+                        if latest_frame is not None:
+                            grid = render_camera_grid(
+                                camera_obs,
+                                int(runtime_args.camera_width),
+                                int(runtime_args.camera_height),
+                                tuple(env.cfg.camera_names),
+                            )
+                            latest_frame.set(_encode_grid_jpeg(grid, cv2_module))
+                            if screen is not None:
+                                try:
+                                    import pygame
 
-            keep_episode = True
+                                    surf = pygame.surfarray.make_surface(np.transpose(grid, (1, 0, 2)))
+                                    screen.fill((0, 0, 0))
+                                    screen.blit(surf, (0, 0))
+                                    pygame.display.flip()
+                                    for event in pygame.event.get():
+                                        if event.type == pygame.QUIT:
+                                            events["stop_recording"] = True
+                                except Exception:
+                                    screen = None
+                        next_camera_render = now + camera_period_s
+
+                    if should_capture:
+                        obs_raw = _get_env_observation(sample_info, gripper_pos=sample_gripper, camera_obs=camera_obs)
+                        obs_processed = robot_observation_processor(obs_raw)
+                        obs_completed = _complete_robot_observation(obs_raw)
+                        action_processed = teleop_action_processor((action.copy(), obs_raw))
+
+                        observation_frame = build_dataset_frame(
+                            dataset.features,
+                            {**obs_completed, **obs_processed},
+                            prefix=OBS_STR,
+                        )
+                        action_frame = build_dataset_frame(dataset.features, action_processed, prefix=ACTION)
+                        frame = {**observation_frame, **action_frame, "task": cfg.dataset.single_task}
+                        dataset.add_frame(frame)
+
+                        while next_dataset_frame_t <= loop_elapsed_s + 1e-9:
+                            next_dataset_frame_t += dataset_frame_period_s
+
+                    timestamp = time.perf_counter() - start_episode_t
+                    if terminated or truncated:
+                        episode_stop_event.set()
+                        break
+
+                    next_deadline = now + 1.0
+                    if viewer is not None:
+                        next_deadline = min(next_deadline, next_viewer_sync)
+                    if runtime_args.enable_cameras:
+                        next_deadline = min(next_deadline, next_camera_render)
+                    next_deadline = min(next_deadline, start_episode_t + next_dataset_frame_t)
+                    precise_sleep(max(min(next_deadline - time.perf_counter(), 0.01), 0.001))
+            finally:
+                episode_stop_event.set()
+                control_thread.join(timeout=1.0)
+                _, info, _, current_gripper, _, _, _, error = shared_state.snapshot()
+                if error is not None:
+                    raise error
+
+            keep_episode = _confirm_keep_episode(cfg.play_sounds)
             if keep_episode:
                 dataset.save_episode()
                 recorded_episodes += 1
@@ -354,6 +670,17 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
+        if http_server is not None:
+            http_server.shutdown()
+            server_close = getattr(http_server, "server_close", None)
+            if callable(server_close):
+                server_close()
+        if camera_renderer is not None:
+            camera_renderer.close()
+        if screen is not None:
+            import pygame
+
+            pygame.quit()
         if viewer is not None:
             viewer.close()
         if teleop is not None and teleop.is_connected:
@@ -365,7 +692,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     return dataset
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    runtime_args, remaining = parse_runtime_args(
+        argv,
+        description="Run FR3 MuJoCo simulation recording with the default ee2ee dataset contract.",
+    )
+    global _RUNTIME_ARGS
+    _RUNTIME_ARGS = runtime_args
+    sys.argv = [sys.argv[0], *remaining]
     record()
 
 

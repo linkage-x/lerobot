@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import threading
 import numpy as np
+import pytest
+
+from lerobot.envs.fr3_mujoco import FR3MujocoEnv
 
 from tools.fr3 import fr3_mujoco_record
 
@@ -54,9 +58,8 @@ def test_get_env_observation_without_cameras():
 
     observation = fr3_mujoco_record._get_env_observation(info, gripper_pos=0.0)
 
-    assert "third_person" not in observation
-    assert "side" not in observation
-    assert "wrist" not in observation
+    for camera_name in fr3_mujoco_record._SIM_CAMERA_NAMES:
+        assert camera_name not in observation
     assert observation["gripper.pos"] == 0.0
 
 
@@ -105,9 +108,8 @@ def test_build_robot_observation_features_includes_joints():
     assert features["gripper.pos"] is float
     for i in range(1, 8):
         assert features[f"joint_{i}.pos"] is float
-    assert "third_person" not in features
-    assert "side" not in features
-    assert "wrist" not in features
+    for camera_name in fr3_mujoco_record._SIM_CAMERA_NAMES:
+        assert camera_name not in features
 
 
 def test_build_robot_observation_features_with_cameras():
@@ -115,10 +117,71 @@ def test_build_robot_observation_features_with_cameras():
         include_cameras=True, camera_shape=(480, 640, 3)
     )
 
-    assert features["third_person"] == (480, 640, 3)
-    assert features["side"] == (480, 640, 3)
-    assert features["wrist"] == (480, 640, 3)
+    for camera_name in fr3_mujoco_record._SIM_CAMERA_NAMES:
+        assert features[camera_name] == (480, 640, 3)
     assert features["gripper.pos"] is float
+
+
+def test_sample_disk_xy_stays_within_requested_radius():
+    center_xy = np.array([0.48, 0.0], dtype=np.float64)
+    rng = np.random.default_rng(0)
+
+    for _ in range(128):
+        sample_xy = fr3_mujoco_record._sample_disk_xy(center_xy, 0.10, rng)
+        assert np.linalg.norm(sample_xy - center_xy) <= 0.10 + 1e-9
+
+
+def test_reset_workspace_object_for_episode_randomizes_pose_within_disk():
+    env = FR3MujocoEnv()
+    rng = np.random.default_rng(0)
+    try:
+        env.reset()
+        sampled_pos = fr3_mujoco_record._reset_workspace_object_for_episode(env, rng)
+
+        body_id = env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_BODY, "workspace_object_body")
+        joint_id = int(env.model.body_jntadr[body_id])
+        qpos_adr = int(env.model.jnt_qposadr[joint_id])
+        initial_pos = np.asarray(env.model.body_pos[body_id], dtype=np.float64)
+
+        assert np.linalg.norm(sampled_pos[:2] - initial_pos[:2]) <= fr3_mujoco_record._WORKSPACE_OBJECT_RANDOM_RADIUS_M + 1e-9
+        assert sampled_pos[2] == pytest.approx(initial_pos[2])
+        np.testing.assert_allclose(env.data.qpos[qpos_adr : qpos_adr + 3], sampled_pos, atol=1e-9)
+        np.testing.assert_allclose(
+            env.data.qpos[qpos_adr + 3 : qpos_adr + 7],
+            np.asarray(env.model.body_quat[body_id], dtype=np.float64),
+            atol=1e-9,
+        )
+    finally:
+        env.close()
+
+
+def test_wait_for_teleop_idle_uses_three_consecutive_samples(monkeypatch):
+    calls: list[int] = []
+
+    class FakeTeleop:
+        def wait_until_idle(self, *, consecutive_samples: int):
+            calls.append(consecutive_samples)
+            return True
+
+    messages: list[tuple[str, bool]] = []
+    monkeypatch.setattr(fr3_mujoco_record, "log_say", lambda text, play_sounds: messages.append((text, play_sounds)))
+
+    fr3_mujoco_record._wait_for_teleop_idle(FakeTeleop(), play_sounds=False)
+
+    assert calls == [3]
+    assert messages == [("Release teleop input", False)]
+
+
+def test_wait_for_teleop_idle_raises_when_input_does_not_settle(monkeypatch):
+    class FakeTeleop:
+        def wait_until_idle(self, *, consecutive_samples: int):
+            assert consecutive_samples == 3
+            return False
+
+    monkeypatch.setattr(fr3_mujoco_record, "log_say", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="did not return to idle"):
+        fr3_mujoco_record._wait_for_teleop_idle(FakeTeleop(), play_sounds=False)
 
 
 def test_build_teleop_features_returns_expected_keys():
@@ -133,3 +196,86 @@ def test_build_teleop_features_returns_expected_keys():
     assert features["target_wz"] is float
     assert features["gripper"] is float
     assert len(features) == 8
+
+
+def test_run_episode_control_loop_publishes_pre_step_observation_and_action():
+    initial_info = {
+        "ee_pose": np.eye(4, dtype=np.float64),
+        "joint_positions": np.zeros(7, dtype=np.float64),
+        "gripper_command": 0.25,
+    }
+    next_info = {
+        "ee_pose": np.eye(4, dtype=np.float64) * 2.0,
+        "joint_positions": np.ones(7, dtype=np.float64),
+        "gripper_command": 0.75,
+    }
+    action = {
+        "enabled": True,
+        "target_x": 0.1,
+        "target_y": 0.2,
+        "target_z": 0.3,
+        "target_wx": 0.0,
+        "target_wy": 0.0,
+        "target_wz": 0.0,
+        "gripper": 0.75,
+    }
+
+    class FakeTeleop:
+        def get_action(self):
+            return dict(action)
+
+    class FakeEnv:
+        def __init__(self):
+            self.calls: list[tuple[dict, float, bool, bool]] = []
+
+        def step_teleop_action(
+            self,
+            action_arg,
+            *,
+            control_period_s: float,
+            include_camera_obs_in_observation: bool,
+            include_camera_obs_in_info: bool,
+        ):
+            self.calls.append(
+                (
+                    dict(action_arg),
+                    control_period_s,
+                    include_camera_obs_in_observation,
+                    include_camera_obs_in_info,
+                )
+            )
+            return None, None, True, False, dict(next_info)
+
+    fake_env = FakeEnv()
+    shared_state = fr3_mujoco_record._LatestEpisodeControlState(
+        sample_info=initial_info,
+        viewer_info=initial_info,
+        action=fr3_mujoco_record._zero_teleop_action(0.25),
+        sample_gripper=0.25,
+    )
+    stop_event = threading.Event()
+
+    fr3_mujoco_record._run_episode_control_loop(
+        env=fake_env,
+        teleop=FakeTeleop(),
+        fps=200,
+        initial_info=initial_info,
+        initial_gripper=0.25,
+        shared_state=shared_state,
+        stop_event=stop_event,
+    )
+
+    sample_info, viewer_info, published_action, sample_gripper, loop_steps, terminated, truncated, error = (
+        shared_state.snapshot()
+    )
+
+    assert fake_env.calls == [(action, 1.0 / 200.0, False, False)]
+    assert sample_info == initial_info
+    assert viewer_info == next_info
+    assert published_action == action
+    assert sample_gripper == pytest.approx(0.25)
+    assert loop_steps == 1
+    assert terminated is True
+    assert truncated is False
+    assert error is None
+    assert stop_event.is_set()

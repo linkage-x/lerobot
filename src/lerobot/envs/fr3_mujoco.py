@@ -90,7 +90,16 @@ class FR3MujocoEnvConfig:
             "wrist": "ee_cam",
         }
     )
-    scene_geom_names: tuple[str, ...] = ("floor", "table", "workspace_object")
+    scene_geom_names: tuple[str, ...] = (
+        "floor",
+        "table",
+        "workspace_object",
+        "peg_hole_base",
+        "peg_hole_wall_x_pos",
+        "peg_hole_wall_x_neg",
+        "peg_hole_wall_y_pos",
+        "peg_hole_wall_y_neg",
+    )
     camera_height: int = 256
     camera_width: int = 256
     enable_cameras: bool = False

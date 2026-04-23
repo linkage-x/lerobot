@@ -15,6 +15,7 @@
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2" />
     <material name="table_surface" rgba="0.38 0.28 0.22 1" />
     <material name="workspace_object_material" rgba="0.85 0.25 0.18 1" />
+    <material name="peg_hole_material" rgba="0.18 0.55 0.72 1" />
   </asset>
 
   <worldbody>
@@ -37,6 +38,22 @@
       <geom type="box" pos="0.28 -0.40 -0.34" size="0.03 0.03 0.34" material="table_surface"/>
       <geom type="box" pos="-0.28 0.40 -0.34" size="0.03 0.03 0.34" material="table_surface"/>
       <geom type="box" pos="-0.28 -0.40 -0.34" size="0.03 0.03 0.34" material="table_surface"/>
+
+      <!-- Fixed peg-in-hole socket.
+           The rectangular peg is the workspace_object (0.05 x 0.05 x 0.08 full size).
+           The socket inner cross-section is 0.06 x 0.06, leaving ~5 mm clearance per side. -->
+      <body name="peg_hole_fixture_body" pos="0.10 -0.16 0.02">
+        <geom name="peg_hole_base" type="box" pos="0 0 0.005" size="0.035 0.035 0.005"
+              material="peg_hole_material" friction="1.4 0.05 0.01" condim="4"/>
+        <geom name="peg_hole_wall_x_pos" type="box" pos="0.034 0 0.0375" size="0.004 0.035 0.0275"
+              material="peg_hole_material" friction="1.4 0.05 0.01" condim="4"/>
+        <geom name="peg_hole_wall_x_neg" type="box" pos="-0.034 0 0.0375" size="0.004 0.035 0.0275"
+              material="peg_hole_material" friction="1.4 0.05 0.01" condim="4"/>
+        <geom name="peg_hole_wall_y_pos" type="box" pos="0 0.034 0.0375" size="0.030 0.004 0.0275"
+              material="peg_hole_material" friction="1.4 0.05 0.01" condim="4"/>
+        <geom name="peg_hole_wall_y_neg" type="box" pos="0 -0.034 0.0375" size="0.030 0.004 0.0275"
+              material="peg_hole_material" friction="1.4 0.05 0.01" condim="4"/>
+      </body>
     </body>
 
     <body name="workspace_object_body" pos="0.48 0.00 0.44">
