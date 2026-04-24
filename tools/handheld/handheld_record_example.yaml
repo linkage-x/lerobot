@@ -1,20 +1,21 @@
 sensors:
   max_read_age_ms: 500
   cameras:
+    # 8-channel Hikrobot setup.
+    # Mapping: cam_0..cam_7 <-> hk_01..hk_08
     cam_0:
       type: hikrobot
-      serial: "DA9342471"
+      serial: "DA9342700"
       width: 1280
       height: 720
       fps: 30
       transport_layer: gige
       color_mode: bgr
       warmup_s: 2
-      exposure_us: 10000
-      gain_db: 12
-      gamma: 1.3
+      exposure_us: 3000
+      gain_db: null
       white_balance_auto: continuous
-      lock_white_balance_after_warmup: true
+      lock_white_balance_after_warmup: false
       timeout_ms: 1000
     cam_1:
       type: hikrobot
@@ -25,41 +26,38 @@ sensors:
       transport_layer: gige
       color_mode: bgr
       warmup_s: 2
-      exposure_us: 10000
-      gain_db: 12
-      gamma: 1.3
+      exposure_us: 3000
+      gain_db: null
       white_balance_auto: continuous
-      lock_white_balance_after_warmup: true
+      lock_white_balance_after_warmup: false
       timeout_ms: 1000
     cam_2:
       type: hikrobot
-      serial: "DA9342700"
+      serial: "DA9342685"
       width: 1280
       height: 720
       fps: 30
       transport_layer: gige
       color_mode: bgr
       warmup_s: 2
-      exposure_us: 10000
-      gain_db: 12
-      gamma: 1.3
+      exposure_us: 3000
+      gain_db: null
       white_balance_auto: continuous
-      lock_white_balance_after_warmup: true
+      lock_white_balance_after_warmup: false
       timeout_ms: 1000
     cam_3:
       type: hikrobot
-      serial: "DA9342583"
+      serial: "DA9342471"
       width: 1280
       height: 720
       fps: 30
       transport_layer: gige
       color_mode: bgr
       warmup_s: 2
-      exposure_us: 10000
-      gain_db: 12
-      gamma: 1.3
+      exposure_us: 3000
+      gain_db: null
       white_balance_auto: continuous
-      lock_white_balance_after_warmup: true
+      lock_white_balance_after_warmup: false
       timeout_ms: 1000
     cam_4:
       type: hikrobot
@@ -70,26 +68,52 @@ sensors:
       transport_layer: gige
       color_mode: bgr
       warmup_s: 2
-      exposure_us: 10000
-      gain_db: 12
-      gamma: 1.3
+      exposure_us: 3000
+      gain_db: null
       white_balance_auto: continuous
-      lock_white_balance_after_warmup: true
+      lock_white_balance_after_warmup: false
       timeout_ms: 1000
     cam_5:
       type: hikrobot
-      serial: "DA9342685"
+      serial: "DA9342673"
       width: 1280
       height: 720
       fps: 30
       transport_layer: gige
       color_mode: bgr
       warmup_s: 2
-      exposure_us: 10000
-      gain_db: 12
-      gamma: 1.3
+      exposure_us: 3000
+      gain_db: null
       white_balance_auto: continuous
-      lock_white_balance_after_warmup: true
+      lock_white_balance_after_warmup: false
+      timeout_ms: 1000
+    cam_6:
+      type: hikrobot
+      serial: "DA9342615"
+      width: 1280
+      height: 720
+      fps: 30
+      transport_layer: gige
+      color_mode: bgr
+      warmup_s: 2
+      exposure_us: 3000
+      gain_db: null
+      white_balance_auto: continuous
+      lock_white_balance_after_warmup: false
+      timeout_ms: 1000
+    cam_7:
+      type: hikrobot
+      serial: "DA9342583"
+      width: 1280
+      height: 720
+      fps: 30
+      transport_layer: gige
+      color_mode: bgr
+      warmup_s: 2
+      exposure_us: 3000
+      gain_db: null
+      white_balance_auto: continuous
+      lock_white_balance_after_warmup: false
       timeout_ms: 1000
     # Placeholder camera config for a future Pika Sense-associated RGB stream via OpenCV.
     # Replace these fields with the real camera entry once the actual Pika Sense camera API is wired in.
