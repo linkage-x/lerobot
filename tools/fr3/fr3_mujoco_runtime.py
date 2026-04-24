@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import os
+from pathlib import Path
 
 from lerobot.envs.fr3_mujoco import FR3MujocoEnv, FR3MujocoEnvConfig
 from lerobot.envs.fr3_mujoco_teleop import MarkerStyle
+from lerobot.teleoperators.config import TeleoperatorConfig
+from lerobot.teleoperators.quest3.configuration_quest3 import (
+    DEFAULT_QUEST3_CALIBRATION_DIR,
+    DEFAULT_QUEST3_CERT_FILE,
+    DEFAULT_QUEST3_KEY_FILE,
+    Quest3GripperMapping,
+    Quest3Hand,
+    Quest3TeleopConfig,
+)
 from lerobot.teleoperators.spacemouse.configuration_spacemouse import (
     SpaceMouseEnableButton,
     SpaceMouseTeleopConfig,
@@ -28,6 +39,12 @@ def create_runtime_arg_parser(
     parser.add_argument("--fps", type=int, default=200)
     if include_duration:
         parser.add_argument("--duration-s", type=float, default=None)
+    parser.add_argument(
+        "--teleop-type",
+        choices=("spacemouse", "quest3"),
+        default="spacemouse",
+        help="Teleoperator type for argparse-only FR3 MuJoCo tools. fr3_mujoco_record.py also accepts draccus --teleop.type.",
+    )
     parser.add_argument("--device-id", type=int, default=0)
     parser.add_argument("--no-viewer", action="store_true")
     parser.add_argument("--viewer-camera", choices=_VIEWER_CAMERA_CHOICES, default=None)
@@ -115,6 +132,28 @@ def create_runtime_arg_parser(
     parser.add_argument("--gripper-cmd-min-interval-s", type=float, default=0.0)
     parser.add_argument("--gripper-cmd-ema-alpha", type=float, default=0.9)
     parser.add_argument("--gripper-cmd-max-rate", type=float, default=12.0)
+    parser.add_argument("--quest3-host", default="0.0.0.0")
+    parser.add_argument("--quest3-port", type=int, default=8012)
+    parser.add_argument("--quest3-cert-file", type=Path, default=DEFAULT_QUEST3_CERT_FILE)
+    parser.add_argument("--quest3-key-file", type=Path, default=DEFAULT_QUEST3_KEY_FILE)
+    parser.add_argument("--quest3-calibration-dir", type=Path, default=DEFAULT_QUEST3_CALIBRATION_DIR)
+    parser.add_argument("--quest3-hand", choices=[hand.value for hand in Quest3Hand], default=Quest3Hand.RIGHT.value)
+    parser.add_argument(
+        "--quest3-gripper-mapping",
+        choices=[mapping.value for mapping in Quest3GripperMapping],
+        default=Quest3GripperMapping.PINCH_VALUE.value,
+    )
+    parser.add_argument("--quest3-open-pinch-value", type=float, default=0.111)
+    parser.add_argument("--quest3-closed-pinch-value", type=float, default=0.004)
+    parser.add_argument("--quest3-open-fingertip-distance-m", type=float, default=0.085)
+    parser.add_argument("--quest3-closed-fingertip-distance-m", type=float, default=0.018)
+    parser.add_argument("--quest3-translation-scale", type=float, default=1.0)
+    parser.add_argument("--quest3-rotation-scale", type=float, default=1.0)
+    parser.add_argument("--quest3-translation-deadband-m", type=float, default=0.002)
+    parser.add_argument("--quest3-rotation-deadband-rad", type=float, default=0.02)
+    parser.add_argument("--quest3-clutch-source", choices=("pinch", "squeeze", "always"), default="squeeze")
+    parser.add_argument("--quest3-clutch-threshold", type=float, default=0.5)
+    parser.add_argument("--quest3-lost-tracking-timeout-s", type=float, default=0.25)
     parser.add_argument("--sphere-radius", type=float, default=0.012)
     parser.add_argument("--axis-radius", type=float, default=0.003)
     parser.add_argument("--axis-length", type=float, default=0.06)
@@ -131,10 +170,53 @@ def parse_runtime_args(
     return parser.parse_known_args(argv)
 
 
-def build_runtime_teleop_config(args: argparse.Namespace, *, frequency: int | None = None) -> SpaceMouseTeleopConfig:
+def _set_frequency(config: TeleoperatorConfig, frequency: int) -> TeleoperatorConfig:
+    if hasattr(config, "frequency"):
+        setattr(config, "frequency", int(frequency))
+    return config
+
+
+def build_runtime_teleop_config(
+    args: argparse.Namespace,
+    *,
+    frequency: int | None = None,
+    base_config: TeleoperatorConfig | None = None,
+) -> TeleoperatorConfig:
+    resolved_frequency = args.fps if frequency is None else frequency
+    if base_config is not None:
+        teleop_type = getattr(base_config, "type", None)
+        if teleop_type == "quest3":
+            return _set_frequency(copy.deepcopy(base_config), resolved_frequency)
+
+    if getattr(args, "teleop_type", "spacemouse") == "quest3":
+        return Quest3TeleopConfig(
+            host=args.quest3_host,
+            port=args.quest3_port,
+            cert_file=args.quest3_cert_file,
+            key_file=args.quest3_key_file,
+            calibration_dir=args.quest3_calibration_dir,
+            hand=Quest3Hand(args.quest3_hand),
+            frequency=resolved_frequency,
+            translation_scale=args.quest3_translation_scale,
+            rotation_scale=args.quest3_rotation_scale,
+            translation_deadband_m=args.quest3_translation_deadband_m,
+            rotation_deadband_rad=args.quest3_rotation_deadband_rad,
+            enable_rotation=args.enable_rotation,
+            clutch_source=args.quest3_clutch_source,
+            clutch_threshold=args.quest3_clutch_threshold,
+            gripper_mapping=Quest3GripperMapping(args.quest3_gripper_mapping),
+            open_pinch_value=args.quest3_open_pinch_value,
+            closed_pinch_value=args.quest3_closed_pinch_value,
+            open_fingertip_distance_m=args.quest3_open_fingertip_distance_m,
+            closed_fingertip_distance_m=args.quest3_closed_fingertip_distance_m,
+            gripper_cmd_ema_alpha=args.gripper_cmd_ema_alpha,
+            gripper_cmd_max_rate=args.gripper_cmd_max_rate,
+            lost_tracking_timeout_s=args.quest3_lost_tracking_timeout_s,
+        )
+
     return SpaceMouseTeleopConfig(
         device_id=args.device_id,
-        frequency=args.fps if frequency is None else frequency,
+        frequency=resolved_frequency,
         translation_scale=args.translation_scale,
         rotation_scale=args.rotation_scale,
         scale_x=args.scale_x,

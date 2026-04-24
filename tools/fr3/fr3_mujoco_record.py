@@ -56,7 +56,7 @@ from lerobot.robots.franka_research3 import (
 )
 from lerobot.scripts.lerobot_record import _confirm_keep_episode
 from lerobot.scripts.lerobot_record import RecordConfig
-from lerobot.teleoperators.spacemouse.teleop_spacemouse import SpaceMouseTeleop
+from lerobot.teleoperators import make_teleoperator_from_config
 from lerobot.utils.control_utils import init_keyboard_listener, is_headless
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.rotation import Rotation
@@ -369,6 +369,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     "camera_height": runtime_args.camera_height,
                     "camera_fps": runtime_args.camera_fps,
                     "mujoco_gl": mujoco_gl_backend,
+                    "teleop_type": getattr(cfg.teleop, "type", getattr(runtime_args, "teleop_type", None)),
                     "tool_mode": runtime_args.tool_mode,
                     "motion_enable_button": runtime_args.motion_enable_button,
                     "enable_rotation": runtime_args.enable_rotation,
@@ -461,8 +462,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     teleop_cfg = build_runtime_teleop_config(
         runtime_args,
         frequency=control_fps,
+        base_config=cfg.teleop,
     )
-    teleop = SpaceMouseTeleop(teleop_cfg)
+    teleop = make_teleoperator_from_config(teleop_cfg)
 
     marker_style = build_runtime_marker_style(runtime_args)
     viewer = None

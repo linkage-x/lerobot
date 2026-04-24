@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gripper-mapping",
         choices=[mapping.value for mapping in Quest3GripperMapping],
-        default=Quest3GripperMapping.FINGERTIP_DISTANCE.value,
+        default=Quest3GripperMapping.PINCH_VALUE.value,
     )
     parser.add_argument("--open-pinch-value", type=float, default=0.111)
     parser.add_argument("--closed-pinch-value", type=float, default=0.004)

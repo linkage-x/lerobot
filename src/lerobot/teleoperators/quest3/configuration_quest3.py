@@ -46,6 +46,8 @@ class Quest3GripperMapping(StrEnum):
 @dataclass
 class Quest3TeleopConfig(TeleoperatorConfig):
     calibration_dir: Path | None = DEFAULT_QUEST3_CALIBRATION_DIR
+    # Compatibility with existing FR3 configs that define teleop.device_id for SpaceMouse.
+    device_id: int | None = None
     mode: Quest3TeleopMode = Quest3TeleopMode.WEARABLE
     hand: Quest3Hand = Quest3Hand.RIGHT
     host: str = "0.0.0.0"
@@ -61,7 +63,7 @@ class Quest3TeleopConfig(TeleoperatorConfig):
     enable_rotation: bool = False
     clutch_source: str = "squeeze"
     clutch_threshold: float = 0.5
-    gripper_mapping: Quest3GripperMapping = Quest3GripperMapping.FINGERTIP_DISTANCE
+    gripper_mapping: Quest3GripperMapping = Quest3GripperMapping.PINCH_VALUE
     initial_gripper: float = 1.0
     open_pinch_value: float = 0.111
     closed_pinch_value: float = 0.004

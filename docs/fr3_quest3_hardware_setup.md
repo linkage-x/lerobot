@@ -131,3 +131,28 @@ The terminal should continuously print:
 - Nonzero `wrist_xyz` when the hand is tracked.
 
 If tracking is lost, `valid=False` is expected and robot motion should remain disabled.
+
+## MuJoCo Teleop
+
+After the smoke test works, run the interactive MuJoCo teleop path with Quest3:
+
+```bash
+uv run --extra fr3_teleop python tools/fr3/fr3_mujoco_teleop.py \
+  --teleop-type quest3 \
+  --quest3-gripper-mapping pinch_value \
+  --quest3-closed-pinch-value 0.004 \
+  --quest3-open-pinch-value 0.111
+```
+
+For recording, use the normal draccus teleop config override:
+
+```bash
+uv run --extra fr3_teleop python tools/fr3/fr3_mujoco_record.py \
+  --config_path tools/fr3/fr3_sim_record_config.yaml \
+  --teleop.type=quest3 \
+  --teleop.gripper_mapping=pinch_value \
+  --teleop.closed_pinch_value=0.004 \
+  --teleop.open_pinch_value=0.111
+```
+
+Quest3 motion uses `squeeze` as the default clutch. The gripper command can update even when the clutch is not active.

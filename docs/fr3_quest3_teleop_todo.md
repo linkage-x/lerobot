@@ -132,9 +132,9 @@ HIROL Quest3 代码可作为输入侧参考，但不建议直接整体搬入 LeR
 
 ## Phase 6: 接入现有 FR3 MuJoCo Teleop/Record
 
-- [ ] 在 `tools/fr3/fr3_mujoco_runtime.py` 增加 `--teleop-device {spacemouse,quest3}` 或独立 `--quest3-*` 参数。
-- [ ] 抽象 `build_runtime_teleop()`：SpaceMouse 仍走原逻辑；Quest3 创建 `Quest3TeleopConfig`。
-- [ ] 修改 `tools/fr3/fr3_mujoco_teleop.py` 和 `tools/fr3/fr3_mujoco_record.py`，不要硬编码 `SpaceMouseTeleop`。
+- [x] 在 `tools/fr3/fr3_mujoco_runtime.py` 增加 `--teleop-type {spacemouse,quest3}` 和 `--quest3-*` 参数。
+- [x] 抽象 runtime teleop config 构造：SpaceMouse 仍走原逻辑；Quest3 创建 `Quest3TeleopConfig`。
+- [x] 修改 `tools/fr3/fr3_mujoco_teleop.py` 和 `tools/fr3/fr3_mujoco_record.py`，不要硬编码 `SpaceMouseTeleop`。
 - [ ] 录制路径中保存 Quest3 诊断元数据：tracking valid、pinch value、hand pose latency。不要替代 canonical `timestamp`。
 - [ ] 增加 `tools/fr3/fr3_mujoco_quest3_teleop.py` 或命令示例，先只支持 sim。
 - [ ] 真实 FR3 接入前，要求通过 MuJoCo smoke 和 replay validation。

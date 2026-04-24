@@ -8,7 +8,7 @@ from pprint import pformat
 
 from lerobot.envs.fr3_mujoco import FR3MujocoEnv
 from lerobot.envs.fr3_mujoco_teleop import MarkerStyle, run_sim_teleop_loop
-from lerobot.teleoperators.spacemouse.teleop_spacemouse import SpaceMouseTeleop
+from lerobot.teleoperators import make_teleoperator_from_config
 try:
     from tools.fr3.fr3_mujoco_runtime import (
         build_runtime_env_config as build_env_config,
@@ -39,7 +39,7 @@ except ModuleNotFoundError:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = create_runtime_arg_parser(
-        description="Run FR3 MuJoCo teleoperation with SpaceMouse and marker viewer.",
+        description="Run FR3 MuJoCo teleoperation with SpaceMouse or Quest3 and marker viewer.",
         include_duration=True,
     )
     return parser.parse_args(argv)
@@ -48,7 +48,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     mujoco_gl_backend = configure_mujoco_gl_backend(args)
-    teleop = SpaceMouseTeleop(build_runtime_teleop_config(args))
+    teleop_cfg = build_runtime_teleop_config(args)
+    teleop = make_teleoperator_from_config(teleop_cfg)
     env_cfg = build_runtime_env_config(args)
     env = FR3MujocoEnv(env_cfg)
     viewer = None
@@ -66,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
                 "camera_height": args.camera_height,
                 "camera_fps": args.camera_fps,
                 "mujoco_gl": mujoco_gl_backend,
+                "teleop_type": teleop_cfg.type,
                 "arm_actuator_kp": args.arm_actuator_kp,
                 "arm_gravity_compensation_scale": args.arm_gravity_comp_scale,
                 "use_otg": args.use_otg,
