@@ -160,6 +160,29 @@ def _zero_teleop_action(gripper: float) -> dict[str, float | bool]:
     }
 
 
+def _chmod_dataset_tree(root: Path, mode: int = 0o777) -> None:
+    if not root.exists():
+        return
+
+    failed_paths: list[tuple[Path, OSError]] = []
+    for path in (root, *root.rglob("*")):
+        try:
+            path.chmod(mode)
+        except OSError as exc:
+            failed_paths.append((path, exc))
+
+    if failed_paths:
+        first_path, first_error = failed_paths[0]
+        logging.warning(
+            "Failed to chmod %s dataset paths under %s to %s. First failure: %s: %s",
+            len(failed_paths),
+            root,
+            oct(mode),
+            first_path,
+            first_error,
+        )
+
+
 def _get_env_observation(info: dict, gripper_pos: float, camera_obs: dict[str, np.ndarray] | None = None) -> dict:
     ee_pose = np.asarray(info["ee_pose"], dtype=np.float64)
     joint_positions = np.asarray(info["joint_positions"], dtype=np.float64)
@@ -420,10 +443,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     )
 
     control_fps = int(runtime_args.fps)
+    target_episode_frames = int(round(float(cfg.dataset.episode_time_s) * float(cfg.dataset.fps)))
+    if target_episode_frames <= 0:
+        raise ValueError(
+            "dataset.episode_time_s and dataset.fps must produce at least one frame "
+            f"(got episode_time_s={cfg.dataset.episode_time_s}, fps={cfg.dataset.fps})."
+        )
     env_cfg = build_runtime_env_config(
         runtime_args,
         control_frequency=control_fps,
-        max_episode_steps=max(int(cfg.dataset.episode_time_s * control_fps) + 100, 1000),
+        # Dataset length is owned by the fixed-frame capture loop below. Keep a generous
+        # simulation step budget so slow rendering does not truncate the episode early.
+        max_episode_steps=max(int(cfg.dataset.episode_time_s * control_fps * 3) + control_fps, 1000),
     )
     env = FR3MujocoEnv(env_cfg)
 
@@ -443,8 +474,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     camera_renderer = None
     camera_render_data = None
     cv2_module = None
-    camera_period_s = 1.0 / max(float(runtime_args.camera_fps), 1.0)
-    next_camera_render = time.perf_counter()
     viewer_period_s = 1.0 / 60.0
     next_viewer_sync = time.perf_counter()
 
@@ -549,15 +578,56 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 viewer.sync()
                 next_viewer_sync = time.perf_counter() + viewer_period_s
 
-            timestamp = 0.0
             start_episode_t = time.perf_counter()
             dataset_frame_period_s = 1 / dataset.fps
-            next_dataset_frame_t = 0.0
+            captured_dataset_frames = 0
+            max_capture_lag_s = 0.0
             try:
-                while timestamp < cfg.dataset.episode_time_s and not events["stop_recording"]:
+                for dataset_frame_idx in range(target_episode_frames):
+                    target_capture_t = start_episode_t + dataset_frame_idx * dataset_frame_period_s
+
                     if events["exit_early"]:
                         events["exit_early"] = False
                         episode_stop_event.set()
+                        break
+
+                    episode_finished = False
+                    while not events["stop_recording"]:
+                        sample_info, viewer_info, action, sample_gripper, loop_steps, terminated, truncated, error = (
+                            shared_state.snapshot()
+                        )
+                        if error is not None:
+                            raise error
+
+                        if terminated or truncated:
+                            episode_stop_event.set()
+                            episode_finished = True
+                            break
+
+                        now = time.perf_counter()
+
+                        if viewer is not None and not viewer.is_running():
+                            episode_stop_event.set()
+                            episode_finished = True
+                            break
+                        if viewer is not None and now >= next_viewer_sync:
+                            copy_visual_state = getattr(env, "copy_visual_state", None)
+                            if viewer_data is not None and callable(copy_visual_state):
+                                copy_visual_state(viewer_data)
+                            with viewer.lock():
+                                update_passive_viewer_markers(env._mujoco, viewer, viewer_info, marker_style)
+                            viewer.sync()
+                            next_viewer_sync = now + viewer_period_s
+
+                        if time.perf_counter() + 1e-9 >= target_capture_t:
+                            break
+
+                        next_deadline = target_capture_t
+                        if viewer is not None:
+                            next_deadline = min(next_deadline, next_viewer_sync)
+                        precise_sleep(max(min(next_deadline - time.perf_counter(), 0.01), 0.001))
+
+                    if events["stop_recording"] or episode_finished:
                         break
 
                     sample_info, viewer_info, action, sample_gripper, loop_steps, terminated, truncated, error = (
@@ -565,28 +635,29 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     )
                     if error is not None:
                         raise error
-
-                    loop_elapsed_s = time.perf_counter() - start_episode_t
-                    should_capture = loop_elapsed_s + 1e-9 >= next_dataset_frame_t
-                    now = time.perf_counter()
-
-                    if viewer is not None and not viewer.is_running():
+                    if terminated or truncated:
                         episode_stop_event.set()
                         break
-                    if viewer is not None and now >= next_viewer_sync:
-                        copy_visual_state = getattr(env, "copy_visual_state", None)
-                        if viewer_data is not None and callable(copy_visual_state):
-                            copy_visual_state(viewer_data)
-                        with viewer.lock():
-                            update_passive_viewer_markers(env._mujoco, viewer, viewer_info, marker_style)
-                        viewer.sync()
-                        next_viewer_sync = now + viewer_period_s
 
-                    should_refresh_cameras = bool(runtime_args.enable_cameras) and (
-                        should_capture or now >= next_camera_render
-                    )
+                    capture_lag_s = max(time.perf_counter() - target_capture_t, 0.0)
+                    max_capture_lag_s = max(max_capture_lag_s, capture_lag_s)
+                    if capture_lag_s > dataset_frame_period_s and dataset_frame_idx % max(int(dataset.fps), 1) == 0:
+                        logging.warning(
+                            "FR3 MuJoCo dataset capture is %.3fs behind the nominal %.3fs frame time "
+                            "(frame %s/%s). The episode will keep writing frames to preserve "
+                            "dataset.episode_time_s.",
+                            capture_lag_s,
+                            dataset_frame_period_s,
+                            dataset_frame_idx + 1,
+                            target_episode_frames,
+                        )
+
                     camera_obs = None
-                    if should_refresh_cameras and camera_renderer is not None and camera_render_data is not None:
+                    if (
+                        runtime_args.enable_cameras
+                        and camera_renderer is not None
+                        and camera_render_data is not None
+                    ):
                         env.copy_visual_state(camera_render_data)
                         camera_obs = _render_camera_frames(
                             mujoco=env._mujoco,
@@ -616,38 +687,33 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                                             events["stop_recording"] = True
                                 except Exception:
                                     screen = None
-                        next_camera_render = now + camera_period_s
+                    obs_raw = _get_env_observation(sample_info, gripper_pos=sample_gripper, camera_obs=camera_obs)
+                    obs_processed = robot_observation_processor(obs_raw)
+                    obs_completed = _complete_robot_observation(obs_raw)
+                    action_processed = teleop_action_processor((action.copy(), obs_raw))
 
-                    if should_capture:
-                        obs_raw = _get_env_observation(sample_info, gripper_pos=sample_gripper, camera_obs=camera_obs)
-                        obs_processed = robot_observation_processor(obs_raw)
-                        obs_completed = _complete_robot_observation(obs_raw)
-                        action_processed = teleop_action_processor((action.copy(), obs_raw))
+                    observation_frame = build_dataset_frame(
+                        dataset.features,
+                        {**obs_completed, **obs_processed},
+                        prefix=OBS_STR,
+                    )
+                    action_frame = build_dataset_frame(dataset.features, action_processed, prefix=ACTION)
+                    frame = {**observation_frame, **action_frame, "task": cfg.dataset.single_task}
+                    dataset.add_frame(frame)
+                    captured_dataset_frames += 1
 
-                        observation_frame = build_dataset_frame(
-                            dataset.features,
-                            {**obs_completed, **obs_processed},
-                            prefix=OBS_STR,
-                        )
-                        action_frame = build_dataset_frame(dataset.features, action_processed, prefix=ACTION)
-                        frame = {**observation_frame, **action_frame, "task": cfg.dataset.single_task}
-                        dataset.add_frame(frame)
-
-                        while next_dataset_frame_t <= loop_elapsed_s + 1e-9:
-                            next_dataset_frame_t += dataset_frame_period_s
-
-                    timestamp = time.perf_counter() - start_episode_t
-                    if terminated or truncated:
-                        episode_stop_event.set()
-                        break
-
-                    next_deadline = now + 1.0
-                    if viewer is not None:
-                        next_deadline = min(next_deadline, next_viewer_sync)
-                    if runtime_args.enable_cameras:
-                        next_deadline = min(next_deadline, next_camera_render)
-                    next_deadline = min(next_deadline, start_episode_t + next_dataset_frame_t)
-                    precise_sleep(max(min(next_deadline - time.perf_counter(), 0.01), 0.001))
+                if captured_dataset_frames != target_episode_frames:
+                    logging.warning(
+                        "Episode captured %s/%s dataset frames before stopping.",
+                        captured_dataset_frames,
+                        target_episode_frames,
+                    )
+                elif max_capture_lag_s > dataset_frame_period_s:
+                    logging.warning(
+                        "Episode preserved the target %s dataset frames, but capture lag peaked at %.3fs.",
+                        target_episode_frames,
+                        max_capture_lag_s,
+                    )
             finally:
                 episode_stop_event.set()
                 control_thread.join(timeout=1.0)
@@ -667,6 +733,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             robot_observation_processor.reset()
 
         dataset.finalize()
+        _chmod_dataset_tree(dataset_root)
 
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
