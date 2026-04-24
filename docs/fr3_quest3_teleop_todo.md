@@ -40,7 +40,7 @@ HIROL Quest3 代码可作为输入侧参考，但不建议直接整体搬入 LeR
 
 ## 推荐落地路线
 
-先做一个 LeRobot-native 的 Quest3 teleoperator，输出现有 SpaceMouse 风格 action，以最小改动接入现有 FR3 MuJoCo/record。等稳定后，再引入更高级的绝对 pose 控制和挂脖 viewer ghost gripper。
+先做一个 LeRobot-native 的 Quest3 teleoperator，输出现有 SpaceMouse 风格 action，以最小改动接入现有 FR3 MuJoCo/record。当前已增加 direct Pika gripper 场景：Quest3 模式下可以移除 FR3 本体，只保留 Pika gripper/table/object/fixture，并让 Pika TCP 直接跟随右手 wrist pose，适合先验证抓放数据采集链路。
 
 ## Phase 0: 依赖和联通性
 
@@ -117,11 +117,14 @@ HIROL Quest3 代码可作为输入侧参考，但不建议直接整体搬入 LeR
 
 ## Phase 5: 挂脖模式
 
-- [ ] 配置 `mode="neck"`：把 Quest3 当作固定/准固定视觉追踪设备，不使用 head-relative 交互假设。
+- [x] 配置 `mode="neck"`：把 Quest3 当作固定/准固定视觉追踪设备，不使用 head-relative 交互假设。
+- [x] 增加 direct Pika MuJoCo 场景：`quest3_pika_gripper_scene.xml` 移除 FR3 arm，本体只保留 Pika gripper、table、workspace object 和 peg-hole fixture。
+- [x] Pika gripper pose 跟随 Quest3 right-hand wrist pose：`Quest3Teleop` 输出 `tracking_valid + wrist_xyz + wrist_quat`，`Quest3PikaMujocoEnv` 用 mocap body 驱动 `pika_task_tcp`。
+- [x] 增加默认 VR-to-scene 对齐：第一次 valid wrist pose recenter 到初始 Pika TCP，之后用相对位移驱动，并 clip 到 tabletop workspace，便于直接做抓放 smoke。
 - [ ] 增加 neck mount 标定：求 `T_robot_quest`，支持手动输入、棋盘/AprilTag、或通过已知 gripper pose 对齐。
 - [ ] 手 pose 从 Quest3 camera/world frame 变换到 robot base frame：`T_robot_hand = T_robot_quest @ T_quest_hand`。
 - [ ] 增加挂脖模式 dead zone 和低通滤波，因为胸前视角下手部关键点更容易受遮挡。
-- [ ] MuJoCo viewer 显示 Pika gripper 目标 pose：扩展 `marker_geoms_from_info()` 或新增 `quest3_target_pose` marker，显示目标 gripper 的 xyz 轴、指尖 opening、tracking 状态颜色。
+- [x] MuJoCo viewer 显示 Pika gripper 目标 pose：direct scene 中 Pika gripper mesh 本身就是 Quest3 target pose，现有 target/TCP marker 同步显示。
 - [ ] 如需要更直观，后续再做 ghost Pika mesh；第一版用 axis + 两个 fingertip spheres 即可落地。
 
 验收：
@@ -135,8 +138,10 @@ HIROL Quest3 代码可作为输入侧参考，但不建议直接整体搬入 LeR
 - [x] 在 `tools/fr3/fr3_mujoco_runtime.py` 增加 `--teleop-type {spacemouse,quest3}` 和 `--quest3-*` 参数。
 - [x] 抽象 runtime teleop config 构造：SpaceMouse 仍走原逻辑；Quest3 创建 `Quest3TeleopConfig`。
 - [x] 修改 `tools/fr3/fr3_mujoco_teleop.py` 和 `tools/fr3/fr3_mujoco_record.py`，不要硬编码 `SpaceMouseTeleop`。
+- [x] Quest3 默认走 direct Pika gripper scene；可用 `--quest3-scene-mode fr3_arm` 回退原 FR3 arm 场景。
+- [x] 新增 `tools/fr3/fr3_quest3_pika_gripper_record_config.yaml`，默认采集 30 episodes、20s/episode、30fps。
 - [ ] 录制路径中保存 Quest3 诊断元数据：tracking valid、pinch value、hand pose latency。不要替代 canonical `timestamp`。
-- [ ] 增加 `tools/fr3/fr3_mujoco_quest3_teleop.py` 或命令示例，先只支持 sim。
+- [x] 增加 Quest3 direct Pika 命令示例，见 `docs/fr3_quest3_hardware_setup.md`。
 - [ ] 真实 FR3 接入前，要求通过 MuJoCo smoke 和 replay validation。
 
 验收：
@@ -165,6 +170,7 @@ HIROL Quest3 代码可作为输入侧参考，但不建议直接整体搬入 LeR
 ## 风险点
 
 - Quest3/Vuer hand tracking 的坐标系和 handedness 需要实测，不能只相信矩阵常量。
+- direct Pika 场景默认锁定 orientation；Quest3 wrist orientation 到 Pika TCP orientation 需要单独标定后再开启。
 - 手部关键点 occlusion 会直接影响 gripper command，必须有 tracking validity 和 hold/stop 策略。
 - 当前 FR3 MuJoCo action contract 是相对 delta，不是绝对 pose；直接把 Quest3 absolute pose 塞进去会导致方向和尺度错误。
 - `vuer` 和 HTTPS/证书/ADB reverse 是工程联通性风险，应该先做连接 smoke。

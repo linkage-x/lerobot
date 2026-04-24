@@ -50,6 +50,15 @@ class ViewerHandle(Protocol):
     def close(self) -> None: ...
 
 
+def _format_optional_vec3(value: Any) -> str:
+    if value is None:
+        return "None"
+    array = np.asarray(value, dtype=np.float64).reshape(-1)
+    if array.size < 3 or not np.all(np.isfinite(array[:3])):
+        return "None"
+    return f"({array[0]:.3f}, {array[1]:.3f}, {array[2]:.3f})"
+
+
 @dataclass
 class _LatestCameraFrame:
     jpeg_bytes: bytes | None = None
@@ -394,6 +403,8 @@ def run_sim_teleop_loop(
     camera_width: int = 640,
     camera_height: int = 480,
     camera_fps: float = 30.0,
+    debug_pose: bool = False,
+    debug_pose_period_s: float = 1.0,
 ) -> dict[str, Any]:
     marker_style = marker_style or MarkerStyle()
     start = time.perf_counter()
@@ -428,6 +439,7 @@ def run_sim_teleop_loop(
     camera_period_s = 1.0 / max(float(camera_fps), 1.0)
     next_viewer_sync = time.perf_counter()
     next_camera_render = time.perf_counter()
+    next_debug_pose = time.perf_counter()
 
     if render_cameras:
         import cv2
@@ -475,6 +487,19 @@ def run_sim_teleop_loop(
             break
 
         now = time.perf_counter()
+        if debug_pose and now >= next_debug_pose:
+            action = info.get("teleop_action", {})
+            print(
+                "quest3_pose_debug "
+                f"tracking={action.get('tracking_valid')} "
+                f"wrist=({action.get('wrist_x', 0.0):.3f}, {action.get('wrist_y', 0.0):.3f}, {action.get('wrist_z', 0.0):.3f}) "
+                f"origin={_format_optional_vec3(info.get('quest3_origin_wrist_position'))} "
+                f"mapped_tcp={_format_optional_vec3(info.get('quest3_mapped_tcp_position'))} "
+                f"ee=({info['ee_pose'][0, 3]:.3f}, {info['ee_pose'][1, 3]:.3f}, {info['ee_pose'][2, 3]:.3f}) "
+                f"gripper={info.get('gripper_command', float('nan')):.3f}"
+            )
+            next_debug_pose = now + max(float(debug_pose_period_s), 0.1)
+
         if viewer is not None and now >= next_viewer_sync:
             copy_visual_state = getattr(env, "copy_visual_state", None)
             if viewer_data is not None and callable(copy_visual_state):

@@ -64,7 +64,7 @@ from lerobot.utils.utils import init_logging, log_say
 from lerobot.utils.constants import ACTION, OBS_STR
 try:
     from tools.fr3.fr3_mujoco_runtime import (
-        build_runtime_env_config,
+        build_runtime_env,
         build_runtime_marker_style,
         build_runtime_teleop_config,
         configure_mujoco_gl_backend,
@@ -73,7 +73,7 @@ try:
     )
 except ModuleNotFoundError:
     from fr3_mujoco_runtime import (
-        build_runtime_env_config,
+        build_runtime_env,
         build_runtime_marker_style,
         build_runtime_teleop_config,
         configure_mujoco_gl_backend,
@@ -370,6 +370,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     "camera_fps": runtime_args.camera_fps,
                     "mujoco_gl": mujoco_gl_backend,
                     "teleop_type": getattr(cfg.teleop, "type", getattr(runtime_args, "teleop_type", None)),
+                    "quest3_scene_mode": getattr(runtime_args, "quest3_scene_mode", None),
                     "tool_mode": runtime_args.tool_mode,
                     "motion_enable_button": runtime_args.motion_enable_button,
                     "enable_rotation": runtime_args.enable_rotation,
@@ -450,21 +451,20 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             "dataset.episode_time_s and dataset.fps must produce at least one frame "
             f"(got episode_time_s={cfg.dataset.episode_time_s}, fps={cfg.dataset.fps})."
         )
-    env_cfg = build_runtime_env_config(
-        runtime_args,
-        control_frequency=control_fps,
-        # Dataset length is owned by the fixed-frame capture loop below. Keep a generous
-        # simulation step budget so slow rendering does not truncate the episode early.
-        max_episode_steps=max(int(cfg.dataset.episode_time_s * control_fps * 3) + control_fps, 1000),
-    )
-    env = FR3MujocoEnv(env_cfg)
-
     teleop_cfg = build_runtime_teleop_config(
         runtime_args,
         frequency=control_fps,
         base_config=cfg.teleop,
     )
     teleop = make_teleoperator_from_config(teleop_cfg)
+    env = build_runtime_env(
+        runtime_args,
+        teleop_cfg,
+        control_frequency=control_fps,
+        # Dataset length is owned by the fixed-frame capture loop below. Keep a generous
+        # simulation step budget so slow rendering does not truncate the episode early.
+        max_episode_steps=max(int(cfg.dataset.episode_time_s * control_fps * 3) + control_fps, 1000),
+    )
 
     marker_style = build_runtime_marker_style(runtime_args)
     viewer = None

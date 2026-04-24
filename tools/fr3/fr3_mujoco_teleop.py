@@ -6,34 +6,25 @@ import argparse
 import os
 from pprint import pformat
 
-from lerobot.envs.fr3_mujoco import FR3MujocoEnv
 from lerobot.envs.fr3_mujoco_teleop import MarkerStyle, run_sim_teleop_loop
 from lerobot.teleoperators import make_teleoperator_from_config
 try:
     from tools.fr3.fr3_mujoco_runtime import (
-        build_runtime_env_config as build_env_config,
-        build_runtime_env_config,
-        build_runtime_marker_style as build_marker_style,
+        build_runtime_env,
         build_runtime_marker_style,
-        build_runtime_teleop_config as build_teleop_config,
         build_runtime_teleop_config,
         configure_mujoco_gl_backend,
         configure_viewer_camera,
         create_runtime_arg_parser,
-        resolve_viewer_camera_name,
     )
 except ModuleNotFoundError:
     from fr3_mujoco_runtime import (
-        build_runtime_env_config as build_env_config,
-        build_runtime_env_config,
-        build_runtime_marker_style as build_marker_style,
+        build_runtime_env,
         build_runtime_marker_style,
-        build_runtime_teleop_config as build_teleop_config,
         build_runtime_teleop_config,
         configure_mujoco_gl_backend,
         configure_viewer_camera,
         create_runtime_arg_parser,
-        resolve_viewer_camera_name,
     )
 
 
@@ -50,8 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     mujoco_gl_backend = configure_mujoco_gl_backend(args)
     teleop_cfg = build_runtime_teleop_config(args)
     teleop = make_teleoperator_from_config(teleop_cfg)
-    env_cfg = build_runtime_env_config(args)
-    env = FR3MujocoEnv(env_cfg)
+    env = build_runtime_env(args, teleop_cfg)
     viewer = None
     viewer_data = None
 
@@ -68,11 +58,16 @@ def main(argv: list[str] | None = None) -> int:
                 "camera_fps": args.camera_fps,
                 "mujoco_gl": mujoco_gl_backend,
                 "teleop_type": teleop_cfg.type,
+                "scene_mode": getattr(env.cfg, "scene_mode", "fr3_arm"),
                 "arm_actuator_kp": args.arm_actuator_kp,
                 "arm_gravity_compensation_scale": args.arm_gravity_comp_scale,
                 "use_otg": args.use_otg,
                 "continuous_physics": args.continuous_physics,
                 "continuous_physics_frequency": args.continuous_physics_frequency,
+                "quest3_recenter_on_first_tracking": args.quest3_recenter_on_first_tracking,
+                "quest3_follow_orientation": args.quest3_follow_orientation,
+                "quest3_position_scale": args.quest3_position_scale,
+                "quest3_position_offset": args.quest3_position_offset,
                 "tool_mode": args.tool_mode,
                 "motion_enable_button": args.motion_enable_button,
                 "enable_rotation": args.enable_rotation,
@@ -103,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
             camera_width=args.camera_width,
             camera_height=args.camera_height,
             camera_fps=args.camera_fps,
+            debug_pose=args.quest3_debug_pose,
+            debug_pose_period_s=args.quest3_debug_pose_period_s,
         )
         print("fr3_mujoco_teleop=READY")
         print(

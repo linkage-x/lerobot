@@ -134,25 +134,41 @@ If tracking is lost, `valid=False` is expected and robot motion should remain di
 
 ## MuJoCo Teleop
 
-After the smoke test works, run the interactive MuJoCo teleop path with Quest3:
+After the smoke test works, run the direct Quest3 Pika gripper scene. This scene removes the FR3 arm body, keeps the table/object/fixture and Pika gripper, and maps the right-hand Quest3 wrist pose into the original MuJoCo workspace:
 
 ```bash
 uv run --extra fr3_teleop python tools/fr3/fr3_mujoco_teleop.py \
   --teleop-type quest3 \
+  --quest3-scene-mode pika_gripper \
   --quest3-gripper-mapping pinch_value \
   --quest3-closed-pinch-value 0.004 \
   --quest3-open-pinch-value 0.111
 ```
 
-For recording, use the normal draccus teleop config override:
+For recording, use the Quest3 Pika config:
 
 ```bash
 uv run --extra fr3_teleop python tools/fr3/fr3_mujoco_record.py \
-  --config_path tools/fr3/fr3_sim_record_config.yaml \
-  --teleop.type=quest3 \
-  --teleop.gripper_mapping=pinch_value \
-  --teleop.closed_pinch_value=0.004 \
-  --teleop.open_pinch_value=0.111
+  --config_path tools/fr3/fr3_quest3_pika_gripper_record_config.yaml
 ```
 
-Quest3 motion uses `squeeze` as the default clutch. The gripper command can update even when the clutch is not active.
+`--quest3-scene-mode pika_gripper` is the default when `teleop.type=quest3`. Use `--quest3-scene-mode fr3_arm` only when you want Quest3 to drive the original full FR3 arm scene.
+
+Default VR-to-scene alignment:
+
+- The first valid Quest3 wrist pose is mapped to the initial Pika TCP pose.
+- After that, `sim_xyz = initial_tcp_xyz + (quest3_wrist_xyz - first_wrist_xyz) * (1, 1, 1) + offset`.
+- The result is clipped to `x=[0.25,0.82]`, `y=[-0.36,0.36]`, `z=[0.43,0.90]`.
+- Change the offset/scale with `--quest3-position-offset OX OY OZ` and `--quest3-position-scale SX SY SZ`.
+- Orientation is locked by default because Quest3 wrist frame is not the same as Pika TCP frame. Use `--quest3-follow-orientation` only after calibrating `--quest3-rotation-alignment-xyzw`.
+- Use `--quest3-absolute-origin` only when the Quest3 world origin has been explicitly calibrated to the MuJoCo scene.
+
+Pose mapping diagnostics:
+
+```bash
+uv run --extra fr3_teleop python tools/fr3/fr3_mujoco_teleop.py \
+  --teleop-type quest3 \
+  --quest3-debug-pose
+```
+
+Move your right hand in one axis at a time and watch `wrist`, `origin`, `mapped_tcp`, and `ee` in the terminal. If an axis direction is wrong, adjust `--quest3-position-scale`, for example `--quest3-position-scale 1 -1 1` to flip the lateral axis.

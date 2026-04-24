@@ -9,6 +9,7 @@ from pathlib import Path
 
 from lerobot.envs.fr3_mujoco import FR3MujocoEnv, FR3MujocoEnvConfig
 from lerobot.envs.fr3_mujoco_teleop import MarkerStyle
+from lerobot.envs.quest3_pika_mujoco import Quest3PikaMujocoEnv, Quest3PikaMujocoEnvConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.teleoperators.quest3.configuration_quest3 import (
     DEFAULT_QUEST3_CALIBRATION_DIR,
@@ -154,9 +155,67 @@ def create_runtime_arg_parser(
     parser.add_argument("--quest3-clutch-source", choices=("pinch", "squeeze", "always"), default="squeeze")
     parser.add_argument("--quest3-clutch-threshold", type=float, default=0.5)
     parser.add_argument("--quest3-lost-tracking-timeout-s", type=float, default=0.25)
+    parser.add_argument(
+        "--quest3-scene-mode",
+        choices=("pika_gripper", "fr3_arm"),
+        default="pika_gripper",
+        help="For Quest3 teleop, use a direct Pika gripper scene by default or the full FR3 arm scene.",
+    )
+    parser.add_argument(
+        "--quest3-position-scale",
+        type=float,
+        nargs=3,
+        metavar=("SX", "SY", "SZ"),
+        default=(1.0, 1.0, 1.0),
+        help="Scale Quest3 wrist xyz before mapping into the MuJoCo scene.",
+    )
+    parser.add_argument(
+        "--quest3-position-offset",
+        type=float,
+        nargs=3,
+        metavar=("OX", "OY", "OZ"),
+        default=(0.0, 0.0, 0.0),
+        help="Offset mapped Quest3 wrist xyz in the MuJoCo scene. In recenter mode this is relative to the initial Pika TCP.",
+    )
+    parser.add_argument(
+        "--quest3-recenter-on-first-tracking",
+        dest="quest3_recenter_on_first_tracking",
+        action="store_true",
+        help="Map the first valid Quest3 wrist pose to the initial Pika TCP, then use relative hand motion.",
+    )
+    parser.add_argument(
+        "--quest3-absolute-origin",
+        dest="quest3_recenter_on_first_tracking",
+        action="store_false",
+        help="Use absolute Quest3 wrist xyz with scale/offset instead of recentering on first tracking.",
+    )
+    parser.set_defaults(quest3_recenter_on_first_tracking=True)
+    parser.add_argument(
+        "--quest3-follow-orientation",
+        dest="quest3_follow_orientation",
+        action="store_true",
+        help="Drive Pika TCP orientation from Quest3 wrist orientation.",
+    )
+    parser.add_argument(
+        "--quest3-lock-orientation",
+        dest="quest3_follow_orientation",
+        action="store_false",
+        help="Keep the Pika TCP orientation fixed while following Quest3 wrist position.",
+    )
+    parser.set_defaults(quest3_follow_orientation=False)
+    parser.add_argument(
+        "--quest3-rotation-alignment-xyzw",
+        type=float,
+        nargs=4,
+        metavar=("QX", "QY", "QZ", "QW"),
+        default=(0.0, 0.0, 0.0, 1.0),
+        help="Additional xyzw quaternion alignment applied to Quest3 wrist orientation.",
+    )
     parser.add_argument("--sphere-radius", type=float, default=0.012)
     parser.add_argument("--axis-radius", type=float, default=0.003)
     parser.add_argument("--axis-length", type=float, default=0.06)
+    parser.add_argument("--quest3-debug-pose", action="store_true", help="Print Quest3 wrist to MuJoCo TCP mapping diagnostics.")
+    parser.add_argument("--quest3-debug-pose-period-s", type=float, default=1.0)
     return parser
 
 
@@ -270,6 +329,45 @@ def build_runtime_env_config(
         continuous_physics=bool(args.continuous_physics),
         continuous_physics_frequency=float(args.continuous_physics_frequency),
     )
+
+
+def build_runtime_quest3_pika_env_config(
+    args: argparse.Namespace,
+    *,
+    max_episode_steps: int | None = None,
+    control_frequency: int | None = None,
+) -> Quest3PikaMujocoEnvConfig:
+    resolved_control_frequency = args.fps if control_frequency is None else control_frequency
+    resolved_max_episode_steps = max_episode_steps
+    if resolved_max_episode_steps is None:
+        duration_s = getattr(args, "duration_s", None)
+        resolved_max_episode_steps = 1_000_000
+        if duration_s is not None:
+            resolved_max_episode_steps = max(int(duration_s * resolved_control_frequency) + 100, 1_000)
+    return Quest3PikaMujocoEnvConfig(
+        max_episode_steps=resolved_max_episode_steps,
+        teleop_control_frequency=float(resolved_control_frequency),
+        enable_cameras=bool(args.enable_cameras),
+        camera_width=int(args.camera_width),
+        camera_height=int(args.camera_height),
+        continuous_physics=bool(args.continuous_physics),
+        continuous_physics_frequency=float(args.continuous_physics_frequency),
+        quest3_position_scale=tuple(float(v) for v in args.quest3_position_scale),
+        quest3_position_offset=tuple(float(v) for v in args.quest3_position_offset),
+        quest3_recenter_on_first_tracking=bool(args.quest3_recenter_on_first_tracking),
+        quest3_follow_orientation=bool(args.quest3_follow_orientation),
+        quest3_rotation_alignment_xyzw=tuple(float(v) for v in args.quest3_rotation_alignment_xyzw),
+    )
+
+
+def should_use_quest3_pika_env(args: argparse.Namespace, teleop_cfg: TeleoperatorConfig) -> bool:
+    return getattr(teleop_cfg, "type", None) == "quest3" and getattr(args, "quest3_scene_mode", "pika_gripper") == "pika_gripper"
+
+
+def build_runtime_env(args: argparse.Namespace, teleop_cfg: TeleoperatorConfig, **kwargs) -> FR3MujocoEnv | Quest3PikaMujocoEnv:
+    if should_use_quest3_pika_env(args, teleop_cfg):
+        return Quest3PikaMujocoEnv(build_runtime_quest3_pika_env_config(args, **kwargs))
+    return FR3MujocoEnv(build_runtime_env_config(args, **kwargs))
 
 
 def build_runtime_marker_style(args: argparse.Namespace) -> MarkerStyle:

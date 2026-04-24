@@ -1,0 +1,32 @@
+robot:
+  type: franka_research3
+  urdf_path: /lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.urdf
+  workspace_min: [0.25, -0.36, 0.43]
+  workspace_max: [0.82, 0.36, 0.90]
+  max_target_delta_pos: [0.02, 0.02, 0.02]
+  max_target_delta_rot: [0.05, 0.05, 0.05]
+
+teleop:
+  type: quest3
+  mode: neck
+  hand: right
+  host: 0.0.0.0
+  port: 8012
+  use_hand_tracking: true
+  clutch_source: always
+  gripper_mapping: pinch_value
+  open_pinch_value: 0.111
+  closed_pinch_value: 0.004
+  enable_rotation: true
+
+dataset:
+  repo_id: local/fr3_quest3_pika_gripper
+  single_task: Quest3 Pika Gripper Pick Place
+  root: /workspace/outputs/datasets/fr3_quest3_pika_gripper
+  fps: 30
+  num_episodes: 30
+  episode_time_s: 20
+  video: true
+
+control_fps: 200
+play_sounds: false
