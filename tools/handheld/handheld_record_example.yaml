@@ -123,18 +123,35 @@ sensors:
       timeout_ms: 1000
     # Placeholder camera config for a future Pika Sense-associated RGB stream via OpenCV.
     # Replace these fields with the real camera entry once the actual Pika Sense camera API is wired in.
-    pika_opencv:
+    pika_left_opencv:
       type: opencv
-      index_or_path: /dev/video6
+      index_or_path: /dev/video7
       width: 640
       height: 480
       fps: 30
       color_mode: rgb
       warmup_s: 1
       fourcc: MJPG
-    # Placeholder camera config for a future Pika Sense-associated RealSense stream.
-    # Replace `serial_number_or_name` and the rest of this stanza with the real Pika Sense camera fields later.
-    pika_realsense:
+
+    pika_right_opencv:
+      type: opencv
+      index_or_path: /dev/video15
+      width: 640
+      height: 480
+      fps: 30
+      color_mode: rgb
+      warmup_s: 1
+      fourcc: MJPG
+    pika_left_realsense:
+      type: intelrealsense
+      serial_number_or_name: "315122271700"
+      width: 640
+      height: 480
+      fps: 30
+      color_mode: rgb
+      use_depth: false
+      warmup_s: 1
+    pika_right_realsense:
       type: intelrealsense
       serial_number_or_name: "315122271805"
       width: 640
@@ -154,9 +171,14 @@ sensors:
   #     connect_ids: [6, 10]
   #     fps: 120
   handheld_grippers:
-    pika:
+    pika_right:
       type: pika_sense
-      port: /dev/ttyUSB0
+      port: /dev/ttyUSB1
+      fps: 120
+      warmup_s: 1.0
+    pika_left:
+      type: pika_sense
+      port: /dev/ttyUSB2
       fps: 120
       warmup_s: 1.0
 
