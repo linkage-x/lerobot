@@ -18,10 +18,16 @@ from __future__ import annotations
 
 import logging
 import os
+import select
+import sys
+import termios
 import time
+import tty
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 
@@ -110,6 +116,18 @@ class HandheldRecordingConfig:
     play_sounds: bool = False
     resume: bool = False
     robot_type: str | None = "handheld_capture"
+
+
+class EpisodeStopAction(str, Enum):
+    TIMED_OUT = "timed_out"
+    SAVE_EARLY = "save_early"
+    DISCARD_EARLY = "discard_early"
+
+
+@dataclass(frozen=True)
+class EpisodeRecordResult:
+    recorded_frames: int
+    stop_action: EpisodeStopAction
 
 
 def _make_tactiles_from_configs(tactile_configs: dict[str, TactileConfig]) -> dict[str, Any]:
@@ -551,6 +569,43 @@ def _wait_for_enter(episode_attempt_index: int, play_sounds: bool) -> None:
     input(f"Episode {episode_attempt_index}: press Enter to start recording...")
 
 
+@contextmanager
+def _terminal_cbreak_mode() -> Iterator[bool]:
+    if not sys.stdin.isatty():
+        yield False
+        return
+
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        yield True
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        termios.tcflush(fd, termios.TCIFLUSH)
+
+
+def _read_terminal_key_nonblocking() -> str | None:
+    if not sys.stdin.isatty():
+        return None
+
+    ready, _, _ = select.select([sys.stdin], [], [], 0.0)
+    if not ready:
+        return None
+
+    try:
+        pressed = os.read(sys.stdin.fileno(), 1)
+    except OSError:
+        return None
+    if not pressed:
+        return None
+    return pressed.decode("utf-8", errors="ignore").lower()
+
+
+def _has_episode_data(dataset: LeRobotDataset) -> bool:
+    return dataset.episode_buffer is not None and int(dataset.episode_buffer["size"]) > 0
+
+
 def _record_episode(
     *,
     cfg: HandheldRecordingConfig,
@@ -559,37 +614,49 @@ def _record_episode(
     tactiles: dict[str, Any],
     handheld_grippers: dict[str, Any],
     rerun_enabled: bool,
-) -> int:
+) -> EpisodeRecordResult:
     period_s = 1.0 / cfg.dataset.fps
     scheduled_timestamps = np.arange(0.0, cfg.dataset.episode_time_s, period_s, dtype=np.float64)
     episode_start_time_s = time.perf_counter()
 
-    for frame_index, target_timestamp_s in enumerate(scheduled_timestamps):
-        sleep_s = episode_start_time_s + float(target_timestamp_s) - time.perf_counter()
-        if sleep_s > 0:
-            precise_sleep(sleep_s)
+    with _terminal_cbreak_mode() as keyboard_enabled:
+        if keyboard_enabled:
+            print("Recording... press 's' to stop+save now, or 'n' to stop+discard now.")
 
-        frame = collect_dataset_frame(
-            cameras,
-            tactiles,
-            handheld_grippers,
-            max_read_age_ms=cfg.sensors.max_read_age_ms,
-            episode_start_time_s=episode_start_time_s,
-            task=cfg.dataset.single_task,
-        )
-        dataset.add_frame(frame)
+        for frame_index, target_timestamp_s in enumerate(scheduled_timestamps):
+            pressed = _read_terminal_key_nonblocking()
+            if pressed == "s":
+                logging.info("Detected 's' during recording; stopping early and saving the episode.")
+                return EpisodeRecordResult(recorded_frames=frame_index, stop_action=EpisodeStopAction.SAVE_EARLY)
+            if pressed == "n":
+                logging.info("Detected 'n' during recording; stopping early and discarding the episode.")
+                return EpisodeRecordResult(recorded_frames=frame_index, stop_action=EpisodeStopAction.DISCARD_EARLY)
 
-        if rerun_enabled:
-            _log_rerun_frame(
-                frame_index=frame_index,
-                dataset_timestamp_s=float(target_timestamp_s),
-                cameras=cameras,
-                tactiles=tactiles,
-                handheld_grippers=handheld_grippers,
-                frame=frame,
+            sleep_s = episode_start_time_s + float(target_timestamp_s) - time.perf_counter()
+            if sleep_s > 0:
+                precise_sleep(sleep_s)
+
+            frame = collect_dataset_frame(
+                cameras,
+                tactiles,
+                handheld_grippers,
+                max_read_age_ms=cfg.sensors.max_read_age_ms,
+                episode_start_time_s=episode_start_time_s,
+                task=cfg.dataset.single_task,
             )
+            dataset.add_frame(frame)
 
-    return int(len(scheduled_timestamps))
+            if rerun_enabled:
+                _log_rerun_frame(
+                    frame_index=frame_index,
+                    dataset_timestamp_s=float(target_timestamp_s),
+                    cameras=cameras,
+                    tactiles=tactiles,
+                    handheld_grippers=handheld_grippers,
+                    frame=frame,
+                )
+
+    return EpisodeRecordResult(recorded_frames=int(len(scheduled_timestamps)), stop_action=EpisodeStopAction.TIMED_OUT)
 
 
 def _create_or_resume_dataset(
@@ -672,7 +739,7 @@ def record(cfg: HandheldRecordingConfig) -> LeRobotDataset:
                 _wait_for_enter(attempted_episodes, cfg.play_sounds)
 
                 try:
-                    recorded_frames = _record_episode(
+                    record_result = _record_episode(
                         cfg=cfg,
                         dataset=dataset,
                         cameras=cameras,
@@ -686,7 +753,29 @@ def record(cfg: HandheldRecordingConfig) -> LeRobotDataset:
                         dataset.clear_episode_buffer(delete_images=len(dataset.meta.image_keys) > 0)
                     break
 
+                recorded_frames = record_result.recorded_frames
                 print(f"Recorded {recorded_frames} frames for the current episode.")
+
+                if record_result.stop_action == EpisodeStopAction.SAVE_EARLY:
+                    if _has_episode_data(dataset):
+                        dataset.save_episode()
+                        print(
+                            "Episode saved early by 's'. "
+                            f"Total saved episodes: {dataset.num_episodes}/{cfg.dataset.num_episodes}"
+                        )
+                    else:
+                        logging.warning("Received 's' but no frames were recorded; discarding empty episode.")
+                        if dataset.episode_buffer is not None:
+                            dataset.clear_episode_buffer(delete_images=len(dataset.meta.image_keys) > 0)
+                        print("No frames recorded; episode discarded.")
+                    continue
+
+                if record_result.stop_action == EpisodeStopAction.DISCARD_EARLY:
+                    if _has_episode_data(dataset):
+                        dataset.clear_episode_buffer(delete_images=len(dataset.meta.image_keys) > 0)
+                    print("Episode discarded early by 'n'.")
+                    continue
+
                 if _confirm_keep_episode(cfg.play_sounds):
                     dataset.save_episode()
                     print(f"Episode saved. Total saved episodes: {dataset.num_episodes}/{cfg.dataset.num_episodes}")

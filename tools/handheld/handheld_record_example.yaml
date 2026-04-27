@@ -137,16 +137,16 @@ sensors:
       color_mode: rgb
       use_depth: false
       warmup_s: 1
-  tactiles:
-    paxini:
-      type: paxini_gen2_omega
-      serial_port: /dev/ttyACM0
-      baudrate: 460800
-      timeout: 1.0
-      control_mode: 5
-      model_name: GEN2-IP-L5325
-      connect_ids: [6, 10]
-      fps: 120
+  # tactiles:
+  #   paxini:
+  #     type: paxini_gen2_omega
+  #     serial_port: /dev/ttyACM0
+  #     baudrate: 460800
+  #     timeout: 1.0
+  #     control_mode: 5
+  #     model_name: GEN2-IP-L5325
+  #     connect_ids: [6, 10]
+  #     fps: 120
   handheld_grippers:
     pika:
       type: pika_sense
