@@ -15,6 +15,18 @@ Validated smoke recordings were saved successfully under timestamped roots such 
 
 - `/tmp/handheld_multimodal_v1_smoke_<YYYYmmdd_HHMMSS>`
 
+Latest soft-sync validation:
+
+- Before capture/write decoupling, a 30 FPS no-Rerun smoke run reached `global_lag_s` mean `0.701675` and p95 `1.464623`.
+- After capture/write decoupling, a 30 FPS no-Rerun smoke run reached `global_lag_s` mean `-0.004170` and p95 `0.000739`.
+- The same post-decoupling run had `max_skew_s` mean `0.028177`, p95 `0.033182`, max `0.044096`, and `0/300` soft-sync timeouts.
+- The latest 30 FPS three-episode smoke dataset at `/tmp/handheld_multimodal_v1_smoke_20260427_113717`
+  reached `global_lag_s` mean `0.001544`, p95 `0.008732`, max `0.012947`,
+  and `max_skew_s` mean `0.027073`, p95 `0.031574`, max `0.036192`, with `0/321`
+  soft-sync timeouts.
+- Current conclusion: software sync is healthy for 30 FPS collection. Remaining `max_skew_s` is mostly
+  30 FPS multi-camera sample-phase spread, not write-pipeline lag or one consistently bad device.
+
 ## Repo Changes
 
 The following capture-path fixes have been applied in-repo:
@@ -26,10 +38,25 @@ The following capture-path fixes have been applied in-repo:
 - Paxini tactile config now uses `connect_ids` only
 - The example config now leaves Paxini tactile commented out so camera + Pika smoke runs do not require the tactile controller
 - During an interactive TTY recording, press `s` to stop and save the current episode immediately, or `n` to stop and discard it immediately
+- Handheld recording now supports host-clock soft synchronization before each dataset row:
+  - `sensors.soft_sync.enabled`
+  - `sensors.soft_sync.tolerance_ms`
+  - `sensors.soft_sync.wait_timeout_ms`
+  - `sensors.soft_sync.poll_interval_ms`
+  - `sensors.soft_sync.buffer_duration_s`
+- Soft sync uses per-device timestamped short-history buffers and selects the sample nearest to the row target time.
 - `observation.device_capture_timestamp` now logs to stable per-device Rerun paths for both live recording and dataset replay:
   - `observation/device_capture_timestamp/camera/<name>`
   - `observation/device_capture_timestamp/tactile/<name>`
   - `observation/device_capture_timestamp/handheld_gripper/<name>`
+- `observation.soft_sync` records per-row sync diagnostics:
+  - `target_timestamp_s`
+  - `max_skew_s`
+  - `oldest_device_lag_s`
+  - `global_lag_s`
+  - `timed_out`
+- Capture and dataset writes are now separated by a bounded episode queue:
+  - `dataset.capture_queue_size`
 - Handheld tactile frames are exported in a viewer-friendly layout:
   - `observation.tactile.paxini.left_xyz`: `(3, 10, 12)`
   - `observation.tactile.paxini.right_xyz`: `(3, 10, 12)`
@@ -43,6 +70,13 @@ The following capture-path fixes have been applied in-repo:
 
 Current `tools/handheld/handheld_record_example.yaml` assumptions:
 
+- Soft sync:
+  - `enabled`: `true`
+  - `tolerance_ms`: `20.0`
+  - `wait_timeout_ms`: `150.0`
+  - `poll_interval_ms`: `1.0`
+  - `buffer_duration_s`: `0.25`
+- `dataset.capture_queue_size`: `16`
 - Hikrobot cameras:
   - `cam_0`: `DA9342700`
   - `cam_1`: `DA9342716`
@@ -92,6 +126,11 @@ Notes:
 - `dataset.num_episodes` counts saved episodes. Discarded attempts do not advance the saved episode count.
 - The early-stop shortcuts require a TTY. In non-interactive stdin environments, recording runs to the configured duration and then uses the normal save prompt when input is available.
 - Paxini tactile is disabled in `tools/handheld/handheld_record_example.yaml`. Uncomment `sensors.tactiles.paxini` before running if tactile data should be included.
+- Soft sync is enabled by default. It buffers timestamped samples per device, waits for each device to reach the current dataset-row target time within `sensors.soft_sync.tolerance_ms`, then records the buffered sample nearest to the target time.
+- If soft sync times out, recording continues with latest available samples and sets `observation.soft_sync.timed_out` to `1.0` for that row.
+- The dataset `timestamp` remains the canonical `frame_index / dataset.fps`; use `observation.device_capture_timestamp` and `observation.soft_sync.max_skew_s` to inspect real capture skew.
+- Use `observation.soft_sync.global_lag_s` to detect full-pipeline lag. A rising positive value means scheduled capture is falling behind the dataset target clock even if `timed_out` stays `0.0`.
+- `dataset.capture_queue_size` controls the bounded queue between scheduled capture and `dataset.add_frame`; increasing it absorbs short write bursts but uses more memory.
 - `*******XOpenDisplay Fail *******` from MVS is expected in headless mode and did not block recording.
 
 ### 2. Inspect the saved dataset in Rerun

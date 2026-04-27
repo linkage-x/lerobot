@@ -23,11 +23,14 @@ import sys
 import termios
 import time
 import tty
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterator
+from queue import Queue
+from threading import Event, Lock, Thread
+from typing import Any, Callable, Iterator
 
 import numpy as np
 
@@ -54,6 +57,74 @@ HANDHELD_TACTILE_SIDE_NAMES = ("left", "right")
 HANDHELD_TACTILE_DIMENSION_LABELS = ("x", "y", "z")
 HANDHELD_TACTILE_SIDE_TAXELS = HANDHELD_TACTILE_WIDTH * HANDHELD_TACTILE_HEIGHT
 HANDHELD_TACTILE_NUM_SIDES = len(HANDHELD_TACTILE_SIDE_NAMES)
+HANDHELD_SOFT_SYNC_FEATURE_NAMES = (
+    "target_timestamp_s",
+    "max_skew_s",
+    "oldest_device_lag_s",
+    "global_lag_s",
+    "timed_out",
+)
+
+
+@dataclass
+class HandheldSoftSyncConfig:
+    enabled: bool = True
+    tolerance_ms: float = 20.0
+    wait_timeout_ms: float = 150.0
+    poll_interval_ms: float = 1.0
+    buffer_duration_s: float = 0.25
+
+    def __post_init__(self) -> None:
+        if self.tolerance_ms < 0:
+            raise ValueError(
+                f"`sensors.soft_sync.tolerance_ms` must be >= 0, but {self.tolerance_ms} is provided."
+            )
+        if self.wait_timeout_ms < 0:
+            raise ValueError(
+                f"`sensors.soft_sync.wait_timeout_ms` must be >= 0, but {self.wait_timeout_ms} is provided."
+            )
+        if self.poll_interval_ms <= 0:
+            raise ValueError(
+                f"`sensors.soft_sync.poll_interval_ms` must be > 0, but {self.poll_interval_ms} is provided."
+            )
+        if self.buffer_duration_s <= 0:
+            raise ValueError(
+                "`sensors.soft_sync.buffer_duration_s` must be > 0, "
+                f"but {self.buffer_duration_s} is provided."
+            )
+
+
+@dataclass(frozen=True)
+class SoftSyncResult:
+    target_timestamp_s: float
+    max_skew_s: float
+    oldest_device_lag_s: float
+    timed_out: bool
+
+
+@dataclass(frozen=True)
+class TimestampedSample:
+    timestamp_s: float
+    value: Any
+
+
+@dataclass(frozen=True)
+class SoftSyncFrameSelection:
+    result: SoftSyncResult
+    samples: dict[str, TimestampedSample]
+
+
+@dataclass(frozen=True)
+class CapturedEpisodeFrame:
+    frame_index: int
+    dataset_timestamp_s: float
+    frame: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class EpisodeCaptureComplete:
+    result: EpisodeRecordResult | None = None
+    error: BaseException | None = None
 
 
 @dataclass
@@ -75,6 +146,7 @@ class HandheldDatasetConfig:
     streaming_encoding: bool = False
     encoder_queue_maxsize: int = 30
     encoder_threads: int | None = None
+    capture_queue_size: int = 16
 
     def __post_init__(self) -> None:
         if not self.repo_id:
@@ -87,6 +159,10 @@ class HandheldDatasetConfig:
             raise ValueError(f"`dataset.episode_time_s` must be > 0, but {self.episode_time_s} is provided.")
         if self.num_episodes <= 0:
             raise ValueError(f"`dataset.num_episodes` must be > 0, but {self.num_episodes} is provided.")
+        if self.capture_queue_size <= 0:
+            raise ValueError(
+                f"`dataset.capture_queue_size` must be > 0, but {self.capture_queue_size} is provided."
+            )
 
 
 @dataclass
@@ -95,6 +171,7 @@ class HandheldSensorsConfig:
     tactiles: dict[str, TactileConfig] = field(default_factory=dict)
     handheld_grippers: dict[str, HandheldGripperConfig] = field(default_factory=dict)
     max_read_age_ms: int = 500
+    soft_sync: HandheldSoftSyncConfig = field(default_factory=HandheldSoftSyncConfig)
 
     def __post_init__(self) -> None:
         if not self.cameras and not self.tactiles and not self.handheld_grippers:
@@ -250,6 +327,7 @@ def build_dataset_features(
     handheld_grippers: dict[str, Any],
     *,
     use_videos: bool,
+    include_soft_sync_diagnostics: bool = True,
 ) -> dict[str, dict[str, Any]]:
     features: dict[str, dict[str, Any]] = {}
 
@@ -268,6 +346,12 @@ def build_dataset_features(
             "shape": (len(capture_timestamp_names),),
             "names": capture_timestamp_names,
         }
+        if include_soft_sync_diagnostics:
+            features["observation.soft_sync"] = {
+                "dtype": "float64",
+                "shape": (len(HANDHELD_SOFT_SYNC_FEATURE_NAMES),),
+                "names": list(HANDHELD_SOFT_SYNC_FEATURE_NAMES),
+            }
 
     for tactile_name, tactile in tactiles.items():
         _validate_handheld_tactile_layout(tactile_name, tactile)
@@ -315,6 +399,356 @@ def _get_latest_timestamp(device: Any) -> float:
     return float(timestamp)
 
 
+def _get_locked_latest_value(device: Any) -> tuple[Any, float] | None:
+    lock = getattr(device, "frame_lock", None) or getattr(device, "read_lock", None)
+    if lock is None:
+        return None
+
+    with lock:
+        timestamp = getattr(device, "latest_timestamp", None)
+        if timestamp is None:
+            return None
+
+        for attr_name in ("latest_frame", "latest_color_frame", "latest_width_mm"):
+            value = getattr(device, attr_name, None)
+            if value is not None:
+                return value, float(timestamp)
+
+    return None
+
+
+def _read_timestamped_latest(
+    device: Any,
+    *,
+    max_read_age_ms: int,
+) -> TimestampedSample:
+    locked_value = _get_locked_latest_value(device)
+    if locked_value is not None:
+        value, timestamp = locked_value
+        age_ms = (time.perf_counter() - timestamp) * 1000
+        if age_ms > max_read_age_ms:
+            raise TimeoutError(
+                f"{type(device).__name__} latest sample is stale ({age_ms:.1f} ms > {max_read_age_ms} ms)."
+            )
+        return TimestampedSample(timestamp_s=timestamp, value=value)
+
+    value = device.read_latest(max_age_ms=max_read_age_ms)
+    return TimestampedSample(timestamp_s=_get_latest_timestamp(device), value=value)
+
+
+class TimestampedSampleBuffer:
+    def __init__(
+        self,
+        *,
+        device_name: str,
+        device: Any,
+        max_read_age_ms: int,
+        buffer_duration_s: float,
+        poll_interval_s: float,
+    ) -> None:
+        self.device_name = device_name
+        self.device = device
+        self.max_read_age_ms = max_read_age_ms
+        self.buffer_duration_s = buffer_duration_s
+        self.poll_interval_s = poll_interval_s
+        self._samples: deque[TimestampedSample] = deque()
+        self._lock = Lock()
+        self._stop_event = Event()
+        self._thread: Thread | None = None
+        self._last_logged_error: str | None = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = Thread(target=self._run, daemon=True, name=f"soft-sync-buffer-{self.device_name}")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._thread = None
+
+    def latest(self) -> TimestampedSample | None:
+        with self._lock:
+            return self._samples[-1] if self._samples else None
+
+    def nearest(
+        self,
+        target_timestamp_s: float,
+        *,
+        min_timestamp_s: float | None = None,
+    ) -> TimestampedSample | None:
+        with self._lock:
+            candidates = list(self._samples)
+
+        if min_timestamp_s is not None:
+            candidates = [sample for sample in candidates if sample.timestamp_s >= min_timestamp_s]
+        if not candidates:
+            return None
+
+        return min(candidates, key=lambda sample: abs(sample.timestamp_s - target_timestamp_s))
+
+    def _append(self, sample: TimestampedSample) -> None:
+        with self._lock:
+            if self._samples and sample.timestamp_s <= self._samples[-1].timestamp_s:
+                return
+
+            self._samples.append(sample)
+            min_kept_timestamp_s = sample.timestamp_s - self.buffer_duration_s
+            while self._samples and self._samples[0].timestamp_s < min_kept_timestamp_s:
+                self._samples.popleft()
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._append(_read_timestamped_latest(self.device, max_read_age_ms=self.max_read_age_ms))
+                self._last_logged_error = None
+            except Exception as exc:  # noqa: BLE001
+                error_text = str(exc)
+                if error_text != self._last_logged_error:
+                    logging.debug(
+                        "Soft sync buffer for %s has no fresh sample yet: %s",
+                        self.device_name,
+                        exc,
+                    )
+                    self._last_logged_error = error_text
+
+            self._stop_event.wait(self.poll_interval_s)
+
+
+def _iter_capture_devices(
+    cameras: dict[str, Any],
+    tactiles: dict[str, Any],
+    handheld_grippers: dict[str, Any],
+) -> Iterator[tuple[str, Any]]:
+    for camera_name, camera in cameras.items():
+        yield f"camera.{camera_name}", camera
+    for tactile_name, tactile in tactiles.items():
+        yield f"tactile.{tactile_name}", tactile
+    for gripper_name, gripper in handheld_grippers.items():
+        yield f"handheld_gripper.{gripper_name}", gripper
+
+
+def _make_soft_sync_sample_buffers(
+    *,
+    cfg: HandheldSensorsConfig,
+    cameras: dict[str, Any],
+    tactiles: dict[str, Any],
+    handheld_grippers: dict[str, Any],
+) -> dict[str, TimestampedSampleBuffer]:
+    if not cfg.soft_sync.enabled:
+        return {}
+
+    return {
+        device_name: TimestampedSampleBuffer(
+            device_name=device_name,
+            device=device,
+            max_read_age_ms=cfg.max_read_age_ms,
+            buffer_duration_s=cfg.soft_sync.buffer_duration_s,
+            poll_interval_s=cfg.soft_sync.poll_interval_ms / 1000.0,
+        )
+        for device_name, device in _iter_capture_devices(cameras, tactiles, handheld_grippers)
+    }
+
+
+def _start_soft_sync_sample_buffers(buffers: dict[str, TimestampedSampleBuffer]) -> None:
+    for buffer in buffers.values():
+        buffer.start()
+
+
+def _stop_soft_sync_sample_buffers(buffers: dict[str, TimestampedSampleBuffer]) -> None:
+    for buffer in buffers.values():
+        buffer.stop()
+
+
+def _compute_soft_sync_result(
+    *,
+    target_capture_time_s: float,
+    episode_start_time_s: float,
+    timestamps: list[float],
+    timed_out: bool,
+) -> SoftSyncResult:
+    target_timestamp_s = target_capture_time_s - episode_start_time_s
+    if not timestamps:
+        return SoftSyncResult(
+            target_timestamp_s=target_timestamp_s,
+            max_skew_s=0.0,
+            oldest_device_lag_s=0.0,
+            timed_out=timed_out,
+        )
+
+    min_timestamp = min(timestamps)
+    max_timestamp = max(timestamps)
+    return SoftSyncResult(
+        target_timestamp_s=target_timestamp_s,
+        max_skew_s=max_timestamp - min_timestamp,
+        oldest_device_lag_s=max(0.0, target_capture_time_s - min_timestamp),
+        timed_out=timed_out,
+    )
+
+
+def _soft_sync_result_to_array(
+    soft_sync_result: SoftSyncResult,
+    capture_timestamp_values: list[float],
+) -> np.ndarray:
+    if capture_timestamp_values:
+        max_skew_s = max(capture_timestamp_values) - min(capture_timestamp_values)
+        oldest_device_lag_s = max(0.0, soft_sync_result.target_timestamp_s - min(capture_timestamp_values))
+        global_lag_s = float(np.median(np.asarray(capture_timestamp_values, dtype=np.float64)))
+        global_lag_s -= soft_sync_result.target_timestamp_s
+    else:
+        max_skew_s = soft_sync_result.max_skew_s
+        oldest_device_lag_s = soft_sync_result.oldest_device_lag_s
+        global_lag_s = 0.0
+
+    return np.asarray(
+        [
+            soft_sync_result.target_timestamp_s,
+            max_skew_s,
+            oldest_device_lag_s,
+            global_lag_s,
+            1.0 if soft_sync_result.timed_out else 0.0,
+        ],
+        dtype=np.float64,
+    )
+
+
+def _wait_for_soft_sync_target(
+    *,
+    cfg: HandheldSoftSyncConfig,
+    cameras: dict[str, Any],
+    tactiles: dict[str, Any],
+    handheld_grippers: dict[str, Any],
+    target_capture_time_s: float,
+    episode_start_time_s: float,
+    now_fn: Callable[[], float] = time.perf_counter,
+    sleep_fn: Callable[[float], None] = precise_sleep,
+) -> SoftSyncResult:
+    devices = list(_iter_capture_devices(cameras, tactiles, handheld_grippers))
+    if not cfg.enabled or not devices:
+        timestamps = [_get_latest_timestamp(device) for _, device in devices]
+        return _compute_soft_sync_result(
+            target_capture_time_s=target_capture_time_s,
+            episode_start_time_s=episode_start_time_s,
+            timestamps=timestamps,
+            timed_out=False,
+        )
+
+    min_accepted_timestamp_s = target_capture_time_s - (cfg.tolerance_ms / 1000.0)
+    deadline_s = now_fn() + (cfg.wait_timeout_ms / 1000.0)
+    last_timestamps: list[float] = []
+    stale_device_names: list[str] = []
+
+    while True:
+        last_timestamps = []
+        stale_device_names = []
+        for device_name, device in devices:
+            try:
+                timestamp = _get_latest_timestamp(device)
+            except RuntimeError:
+                stale_device_names.append(device_name)
+                continue
+
+            last_timestamps.append(timestamp)
+            if timestamp < min_accepted_timestamp_s:
+                stale_device_names.append(device_name)
+
+        if not stale_device_names:
+            return _compute_soft_sync_result(
+                target_capture_time_s=target_capture_time_s,
+                episode_start_time_s=episode_start_time_s,
+                timestamps=last_timestamps,
+                timed_out=False,
+            )
+
+        now_s = now_fn()
+        if now_s >= deadline_s:
+            logging.warning(
+                "Soft sync timed out for target %.6fs; stale devices: %s",
+                target_capture_time_s - episode_start_time_s,
+                ", ".join(stale_device_names),
+            )
+            return _compute_soft_sync_result(
+                target_capture_time_s=target_capture_time_s,
+                episode_start_time_s=episode_start_time_s,
+                timestamps=last_timestamps,
+                timed_out=True,
+            )
+
+        sleep_fn(min(cfg.poll_interval_ms / 1000.0, max(0.0, deadline_s - now_s)))
+
+
+def _compute_soft_sync_selection(
+    *,
+    target_capture_time_s: float,
+    episode_start_time_s: float,
+    samples: dict[str, TimestampedSample],
+    timed_out: bool,
+) -> SoftSyncFrameSelection:
+    result = _compute_soft_sync_result(
+        target_capture_time_s=target_capture_time_s,
+        episode_start_time_s=episode_start_time_s,
+        timestamps=[sample.timestamp_s for sample in samples.values()],
+        timed_out=timed_out,
+    )
+    return SoftSyncFrameSelection(result=result, samples=samples)
+
+
+def _wait_for_soft_sync_samples(
+    *,
+    cfg: HandheldSoftSyncConfig,
+    buffers: dict[str, TimestampedSampleBuffer],
+    target_capture_time_s: float,
+    episode_start_time_s: float,
+    now_fn: Callable[[], float] = time.perf_counter,
+    sleep_fn: Callable[[float], None] = precise_sleep,
+) -> SoftSyncFrameSelection:
+    min_accepted_timestamp_s = target_capture_time_s - (cfg.tolerance_ms / 1000.0)
+    deadline_s = now_fn() + (cfg.wait_timeout_ms / 1000.0)
+
+    while True:
+        selected_samples: dict[str, TimestampedSample] = {}
+        missing_device_names: list[str] = []
+
+        for device_name, buffer in buffers.items():
+            sample = buffer.nearest(target_capture_time_s, min_timestamp_s=min_accepted_timestamp_s)
+            if sample is None:
+                missing_device_names.append(device_name)
+                continue
+            selected_samples[device_name] = sample
+
+        if not missing_device_names:
+            return _compute_soft_sync_selection(
+                target_capture_time_s=target_capture_time_s,
+                episode_start_time_s=episode_start_time_s,
+                samples=selected_samples,
+                timed_out=False,
+            )
+
+        now_s = now_fn()
+        if now_s >= deadline_s:
+            fallback_samples = {
+                device_name: sample
+                for device_name, buffer in buffers.items()
+                if (sample := buffer.nearest(target_capture_time_s)) is not None
+            }
+            logging.warning(
+                "Soft sync sample selection timed out for target %.6fs; missing devices: %s",
+                target_capture_time_s - episode_start_time_s,
+                ", ".join(missing_device_names),
+            )
+            return _compute_soft_sync_selection(
+                target_capture_time_s=target_capture_time_s,
+                episode_start_time_s=episode_start_time_s,
+                samples=fallback_samples,
+                timed_out=True,
+            )
+
+        sleep_fn(min(cfg.poll_interval_ms / 1000.0, max(0.0, deadline_s - now_s)))
+
+
 def collect_dataset_frame(
     cameras: dict[str, Any],
     tactiles: dict[str, Any],
@@ -323,30 +757,46 @@ def collect_dataset_frame(
     max_read_age_ms: int,
     episode_start_time_s: float,
     task: str,
+    soft_sync_result: SoftSyncResult | None = None,
+    soft_sync_samples: dict[str, TimestampedSample] | None = None,
 ) -> dict[str, Any]:
     frame: dict[str, Any] = {}
     state_values: list[float] = []
     capture_timestamp_values: list[float] = []
 
     for camera_name, camera in cameras.items():
-        camera_frame = camera.read_latest(max_age_ms=max_read_age_ms)
-        capture_timestamp_values.append(_get_latest_timestamp(camera) - episode_start_time_s)
+        sample = (soft_sync_samples or {}).get(f"camera.{camera_name}")
+        if sample is None:
+            sample = _read_timestamped_latest(camera, max_read_age_ms=max_read_age_ms)
+        camera_frame = sample.value
+        capture_timestamp_values.append(sample.timestamp_s - episode_start_time_s)
         frame[f"observation.images.{camera_name}"] = _normalize_camera_frame_to_rgb(camera, camera_frame)
 
     for tactile_name, tactile in tactiles.items():
-        tactile_frame = np.asarray(tactile.read_latest(max_age_ms=max_read_age_ms), dtype=np.float32)
-        capture_timestamp_values.append(_get_latest_timestamp(tactile) - episode_start_time_s)
+        sample = (soft_sync_samples or {}).get(f"tactile.{tactile_name}")
+        if sample is None:
+            sample = _read_timestamped_latest(tactile, max_read_age_ms=max_read_age_ms)
+        tactile_frame = np.asarray(sample.value, dtype=np.float32)
+        capture_timestamp_values.append(sample.timestamp_s - episode_start_time_s)
         frame.update(_build_handheld_tactile_observation(tactile_name, tactile_frame))
 
-    for gripper in handheld_grippers.values():
-        width_mm = float(gripper.read_latest(max_age_ms=max_read_age_ms))
-        capture_timestamp_values.append(_get_latest_timestamp(gripper) - episode_start_time_s)
+    for gripper_name, gripper in handheld_grippers.items():
+        sample = (soft_sync_samples or {}).get(f"handheld_gripper.{gripper_name}")
+        if sample is None:
+            sample = _read_timestamped_latest(gripper, max_read_age_ms=max_read_age_ms)
+        width_mm = float(sample.value)
+        capture_timestamp_values.append(sample.timestamp_s - episode_start_time_s)
         state_values.append(width_mm)
 
     if state_values:
         frame["observation.state"] = np.asarray(state_values, dtype=np.float32)
     if capture_timestamp_values:
         frame["observation.device_capture_timestamp"] = np.asarray(capture_timestamp_values, dtype=np.float64)
+    if soft_sync_result is not None:
+        frame["observation.soft_sync"] = _soft_sync_result_to_array(
+            soft_sync_result,
+            capture_timestamp_values,
+        )
     frame["task"] = task
     return frame
 
@@ -459,6 +909,11 @@ def _log_rerun_frame(
             )
             capture_index += 1
 
+    soft_sync = frame.get("observation.soft_sync")
+    if soft_sync is not None:
+        for name, value in zip(HANDHELD_SOFT_SYNC_FEATURE_NAMES, soft_sync, strict=True):
+            rr.log(f"observation/soft_sync/{name}", rr.Scalars(float(value)))
+
 
 def _format_device_summary(devices: dict[str, Any]) -> str:
     if not devices:
@@ -488,6 +943,14 @@ def _print_intro(
         f"Episode length: {cfg.dataset.episode_time_s:.2f}s | Dataset FPS: {cfg.dataset.fps} | "
         f"Target saved episodes: {cfg.dataset.num_episodes}"
     )
+    if cfg.sensors.soft_sync.enabled:
+        print(
+            "Soft sync: enabled | "
+            f"tolerance={cfg.sensors.soft_sync.tolerance_ms:.1f}ms | "
+            f"timeout={cfg.sensors.soft_sync.wait_timeout_ms:.1f}ms"
+        )
+    else:
+        print("Soft sync: disabled")
 
 
 def _validate_resume_compatibility(dataset: LeRobotDataset, expected_features: dict[str, dict[str, Any]], fps: int) -> None:
@@ -606,35 +1069,83 @@ def _has_episode_data(dataset: LeRobotDataset) -> bool:
     return dataset.episode_buffer is not None and int(dataset.episode_buffer["size"]) > 0
 
 
-def _record_episode(
+def _capture_episode_frames(
     *,
     cfg: HandheldRecordingConfig,
-    dataset: LeRobotDataset,
     cameras: dict[str, Any],
     tactiles: dict[str, Any],
     handheld_grippers: dict[str, Any],
-    rerun_enabled: bool,
-) -> EpisodeRecordResult:
+    soft_sync_buffers: dict[str, TimestampedSampleBuffer],
+    output_queue: Queue[CapturedEpisodeFrame | EpisodeCaptureComplete],
+    stop_event: Event,
+) -> None:
     period_s = 1.0 / cfg.dataset.fps
     scheduled_timestamps = np.arange(0.0, cfg.dataset.episode_time_s, period_s, dtype=np.float64)
     episode_start_time_s = time.perf_counter()
 
-    with _terminal_cbreak_mode() as keyboard_enabled:
-        if keyboard_enabled:
-            print("Recording... press 's' to stop+save now, or 'n' to stop+discard now.")
-
+    try:
         for frame_index, target_timestamp_s in enumerate(scheduled_timestamps):
+            if stop_event.is_set():
+                output_queue.put(
+                    EpisodeCaptureComplete(
+                        EpisodeRecordResult(
+                            recorded_frames=frame_index,
+                            stop_action=EpisodeStopAction.DISCARD_EARLY,
+                        )
+                    )
+                )
+                return
+
             pressed = _read_terminal_key_nonblocking()
             if pressed == "s":
                 logging.info("Detected 's' during recording; stopping early and saving the episode.")
-                return EpisodeRecordResult(recorded_frames=frame_index, stop_action=EpisodeStopAction.SAVE_EARLY)
+                output_queue.put(
+                    EpisodeCaptureComplete(
+                        EpisodeRecordResult(
+                            recorded_frames=frame_index,
+                            stop_action=EpisodeStopAction.SAVE_EARLY,
+                        )
+                    )
+                )
+                return
             if pressed == "n":
                 logging.info("Detected 'n' during recording; stopping early and discarding the episode.")
-                return EpisodeRecordResult(recorded_frames=frame_index, stop_action=EpisodeStopAction.DISCARD_EARLY)
+                output_queue.put(
+                    EpisodeCaptureComplete(
+                        EpisodeRecordResult(
+                            recorded_frames=frame_index,
+                            stop_action=EpisodeStopAction.DISCARD_EARLY,
+                        )
+                    )
+                )
+                return
 
             sleep_s = episode_start_time_s + float(target_timestamp_s) - time.perf_counter()
             if sleep_s > 0:
                 precise_sleep(sleep_s)
+
+            soft_sync_result = None
+            soft_sync_samples = None
+            if cfg.sensors.soft_sync.enabled:
+                target_capture_time_s = episode_start_time_s + float(target_timestamp_s)
+                if soft_sync_buffers:
+                    selection = _wait_for_soft_sync_samples(
+                        cfg=cfg.sensors.soft_sync,
+                        buffers=soft_sync_buffers,
+                        target_capture_time_s=target_capture_time_s,
+                        episode_start_time_s=episode_start_time_s,
+                    )
+                    soft_sync_result = selection.result
+                    soft_sync_samples = selection.samples
+                else:
+                    soft_sync_result = _wait_for_soft_sync_target(
+                        cfg=cfg.sensors.soft_sync,
+                        cameras=cameras,
+                        tactiles=tactiles,
+                        handheld_grippers=handheld_grippers,
+                        target_capture_time_s=target_capture_time_s,
+                        episode_start_time_s=episode_start_time_s,
+                    )
 
             frame = collect_dataset_frame(
                 cameras,
@@ -643,20 +1154,87 @@ def _record_episode(
                 max_read_age_ms=cfg.sensors.max_read_age_ms,
                 episode_start_time_s=episode_start_time_s,
                 task=cfg.dataset.single_task,
+                soft_sync_result=soft_sync_result,
+                soft_sync_samples=soft_sync_samples,
             )
-            dataset.add_frame(frame)
-
-            if rerun_enabled:
-                _log_rerun_frame(
+            output_queue.put(
+                CapturedEpisodeFrame(
                     frame_index=frame_index,
                     dataset_timestamp_s=float(target_timestamp_s),
-                    cameras=cameras,
-                    tactiles=tactiles,
-                    handheld_grippers=handheld_grippers,
                     frame=frame,
                 )
+            )
 
-    return EpisodeRecordResult(recorded_frames=int(len(scheduled_timestamps)), stop_action=EpisodeStopAction.TIMED_OUT)
+        output_queue.put(
+            EpisodeCaptureComplete(
+                EpisodeRecordResult(
+                    recorded_frames=int(len(scheduled_timestamps)),
+                    stop_action=EpisodeStopAction.TIMED_OUT,
+                )
+            )
+        )
+    except BaseException as exc:  # noqa: BLE001
+        output_queue.put(EpisodeCaptureComplete(error=exc))
+
+
+def _record_episode(
+    *,
+    cfg: HandheldRecordingConfig,
+    dataset: LeRobotDataset,
+    cameras: dict[str, Any],
+    tactiles: dict[str, Any],
+    handheld_grippers: dict[str, Any],
+    soft_sync_buffers: dict[str, TimestampedSampleBuffer],
+    rerun_enabled: bool,
+) -> EpisodeRecordResult:
+    output_queue: Queue[CapturedEpisodeFrame | EpisodeCaptureComplete] = Queue(
+        maxsize=cfg.dataset.capture_queue_size
+    )
+    stop_event = Event()
+
+    with _terminal_cbreak_mode() as keyboard_enabled:
+        if keyboard_enabled:
+            print("Recording... press 's' to stop+save now, or 'n' to stop+discard now.")
+
+        capture_thread = Thread(
+            target=_capture_episode_frames,
+            kwargs={
+                "cfg": cfg,
+                "cameras": cameras,
+                "tactiles": tactiles,
+                "handheld_grippers": handheld_grippers,
+                "soft_sync_buffers": soft_sync_buffers,
+                "output_queue": output_queue,
+                "stop_event": stop_event,
+            },
+            daemon=True,
+            name="handheld-capture-producer",
+        )
+        capture_thread.start()
+
+        try:
+            while True:
+                item = output_queue.get()
+                if isinstance(item, EpisodeCaptureComplete):
+                    if item.error is not None:
+                        raise item.error
+                    if item.result is None:
+                        raise RuntimeError("Episode capture finished without a result.")
+                    return item.result
+
+                dataset.add_frame(item.frame)
+                if rerun_enabled:
+                    _log_rerun_frame(
+                        frame_index=item.frame_index,
+                        dataset_timestamp_s=item.dataset_timestamp_s,
+                        cameras=cameras,
+                        tactiles=tactiles,
+                        handheld_grippers=handheld_grippers,
+                        frame=item.frame,
+                    )
+        finally:
+            stop_event.set()
+            capture_thread.join(timeout=2.0)
 
 
 def _create_or_resume_dataset(
@@ -709,6 +1287,7 @@ def record(cfg: HandheldRecordingConfig) -> LeRobotDataset:
     tactiles = _make_tactiles_from_configs(cfg.sensors.tactiles)
     handheld_grippers = make_handheld_grippers_from_configs(cfg.sensors.handheld_grippers)
     dataset: LeRobotDataset | None = None
+    soft_sync_buffers: dict[str, TimestampedSampleBuffer] = {}
 
     try:
         cameras = _connect_cameras_best_effort(all_cameras)
@@ -720,11 +1299,19 @@ def record(cfg: HandheldRecordingConfig) -> LeRobotDataset:
             tactiles,
             handheld_grippers,
             use_videos=cfg.dataset.video,
+            include_soft_sync_diagnostics=cfg.sensors.soft_sync.enabled,
         )
         dataset = _create_or_resume_dataset(cfg, features=features, num_cameras=len(cameras))
         rerun_enabled = _init_rerun(cfg)
 
         _print_intro(cfg, cameras, tactiles, handheld_grippers, dataset.root)
+        soft_sync_buffers = _make_soft_sync_sample_buffers(
+            cfg=cfg.sensors,
+            cameras=cameras,
+            tactiles=tactiles,
+            handheld_grippers=handheld_grippers,
+        )
+        _start_soft_sync_sample_buffers(soft_sync_buffers)
 
         if not cfg.dataset.streaming_encoding:
             logging.info(
@@ -745,6 +1332,7 @@ def record(cfg: HandheldRecordingConfig) -> LeRobotDataset:
                         cameras=cameras,
                         tactiles=tactiles,
                         handheld_grippers=handheld_grippers,
+                        soft_sync_buffers=soft_sync_buffers,
                         rerun_enabled=rerun_enabled,
                     )
                 except KeyboardInterrupt:
@@ -788,6 +1376,7 @@ def record(cfg: HandheldRecordingConfig) -> LeRobotDataset:
 
         return dataset
     finally:
+        _stop_soft_sync_sample_buffers(soft_sync_buffers)
         _disconnect_devices(cameras, tactiles, handheld_grippers)
 
 

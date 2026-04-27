@@ -1,5 +1,11 @@
 sensors:
   max_read_age_ms: 500
+  soft_sync:
+    enabled: true
+    tolerance_ms: 20.0
+    wait_timeout_ms: 150.0
+    poll_interval_ms: 1.0
+    buffer_duration_s: 0.25
   cameras:
     # 8-channel Hikrobot setup.
     # Mapping: cam_0..cam_7 <-> hk_01..hk_08
@@ -165,6 +171,7 @@ dataset:
   streaming_encoding: true
   vcodec: h264
   encoder_threads: 2
+  capture_queue_size: 16
   push_to_hub: false
 
 display_data: true

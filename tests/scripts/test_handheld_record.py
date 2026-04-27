@@ -65,6 +65,19 @@ class FakeGripper:
         return 12.5
 
 
+class FakeSampleBuffer:
+    def __init__(self, samples):
+        self.samples = list(samples)
+
+    def nearest(self, target_timestamp_s: float, *, min_timestamp_s: float | None = None):
+        candidates = self.samples
+        if min_timestamp_s is not None:
+            candidates = [sample for sample in candidates if sample.timestamp_s >= min_timestamp_s]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda sample: abs(sample.timestamp_s - target_timestamp_s))
+
+
 class FakeConnectableCamera:
     def __init__(self, *, should_fail: bool):
         self.should_fail = should_fail
@@ -101,6 +114,13 @@ def test_build_dataset_features_includes_camera_tactile_and_gripper_streams():
         "camera.front.capture_timestamp_s",
         "tactile.paxini.capture_timestamp_s",
         "handheld_gripper.pika.capture_timestamp_s",
+    ]
+    assert features["observation.soft_sync"]["names"] == [
+        "target_timestamp_s",
+        "max_skew_s",
+        "oldest_device_lag_s",
+        "global_lag_s",
+        "timed_out",
     ]
     assert features["observation.tactile.paxini.left_xyz"]["shape"] == (3, 10, 12)
     assert features["observation.tactile.paxini.right_xyz"]["shape"] == (3, 10, 12)
@@ -149,6 +169,175 @@ def test_collect_dataset_frame_normalizes_bgr_images_and_preserves_capture_times
         np.array([0.25, 0.30, 0.40], dtype=np.float64),
         atol=1e-9,
     )
+
+
+def test_collect_dataset_frame_records_soft_sync_diagnostics():
+    cameras = {"front": FakeCamera(height=1, width=1, color_mode=ColorMode.RGB, timestamp=10.25)}
+    handheld_grippers = {"pika": FakeGripper(timestamp=10.24)}
+
+    frame = handheld_record.collect_dataset_frame(
+        cameras,
+        tactiles={},
+        handheld_grippers=handheld_grippers,
+        max_read_age_ms=500,
+        episode_start_time_s=10.0,
+        task="demo",
+        soft_sync_result=handheld_record.SoftSyncResult(
+            target_timestamp_s=0.25,
+            max_skew_s=999.0,
+            oldest_device_lag_s=999.0,
+            timed_out=True,
+        ),
+    )
+
+    np.testing.assert_allclose(
+        frame["observation.soft_sync"],
+        np.array([0.25, 0.01, 0.01, -0.005, 1.0], dtype=np.float64),
+        atol=1e-9,
+    )
+
+
+def test_collect_dataset_frame_uses_selected_soft_sync_samples_instead_of_latest_values():
+    camera = FakeCamera(height=1, width=1, color_mode=ColorMode.RGB, timestamp=10.40)
+    camera.latest_frame = np.array([[[1, 2, 3]]], dtype=np.uint8)
+    gripper = FakeGripper(timestamp=10.40)
+    gripper.latest_width_mm = 40.0
+    selected_camera = handheld_record.TimestampedSample(
+        timestamp_s=10.02,
+        value=np.array([[[9, 8, 7]]], dtype=np.uint8),
+    )
+    selected_gripper = handheld_record.TimestampedSample(timestamp_s=10.01, value=11.0)
+
+    frame = handheld_record.collect_dataset_frame(
+        {"front": camera},
+        tactiles={},
+        handheld_grippers={"pika": gripper},
+        max_read_age_ms=500,
+        episode_start_time_s=10.0,
+        task="demo",
+        soft_sync_result=handheld_record.SoftSyncResult(
+            target_timestamp_s=0.0,
+            max_skew_s=0.0,
+            oldest_device_lag_s=0.0,
+            timed_out=False,
+        ),
+        soft_sync_samples={
+            "camera.front": selected_camera,
+            "handheld_gripper.pika": selected_gripper,
+        },
+    )
+
+    assert frame["observation.images.front"].tolist() == [[[9, 8, 7]]]
+    assert frame["observation.state"].tolist() == [11.0]
+    np.testing.assert_allclose(
+        frame["observation.device_capture_timestamp"],
+        np.array([0.02, 0.01], dtype=np.float64),
+        atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        frame["observation.soft_sync"],
+        np.array([0.0, 0.01, 0.0, 0.015, 0.0], dtype=np.float64),
+        atol=1e-9,
+    )
+
+
+def test_wait_for_soft_sync_target_returns_ready_diagnostics_without_timeout():
+    cameras = {"front": FakeCamera(height=1, width=1, color_mode=ColorMode.RGB, timestamp=10.0)}
+    handheld_grippers = {"pika": FakeGripper(timestamp=9.99)}
+    cfg = handheld_record.HandheldSoftSyncConfig(
+        enabled=True,
+        tolerance_ms=20.0,
+        wait_timeout_ms=50.0,
+        poll_interval_ms=1.0,
+    )
+
+    result = handheld_record._wait_for_soft_sync_target(
+        cfg=cfg,
+        cameras=cameras,
+        tactiles={},
+        handheld_grippers=handheld_grippers,
+        target_capture_time_s=10.0,
+        episode_start_time_s=9.0,
+        now_fn=lambda: 10.0,
+        sleep_fn=lambda seconds: None,
+    )
+
+    assert result.timed_out is False
+    assert result.target_timestamp_s == pytest.approx(1.0)
+    assert result.max_skew_s == pytest.approx(0.01)
+    assert result.oldest_device_lag_s == pytest.approx(0.01)
+
+
+def test_wait_for_soft_sync_target_times_out_and_returns_latest_diagnostics(caplog):
+    cameras = {"front": FakeCamera(height=1, width=1, color_mode=ColorMode.RGB, timestamp=9.0)}
+    cfg = handheld_record.HandheldSoftSyncConfig(
+        enabled=True,
+        tolerance_ms=5.0,
+        wait_timeout_ms=3.0,
+        poll_interval_ms=1.0,
+    )
+    clock = {"now": 10.0}
+
+    def now_fn():
+        return clock["now"]
+
+    def sleep_fn(seconds: float) -> None:
+        clock["now"] += seconds
+
+    with caplog.at_level("WARNING"):
+        result = handheld_record._wait_for_soft_sync_target(
+            cfg=cfg,
+            cameras=cameras,
+            tactiles={},
+            handheld_grippers={},
+            target_capture_time_s=10.0,
+            episode_start_time_s=9.0,
+            now_fn=now_fn,
+            sleep_fn=sleep_fn,
+        )
+
+    assert result.timed_out is True
+    assert result.target_timestamp_s == pytest.approx(1.0)
+    assert result.max_skew_s == pytest.approx(0.0)
+    assert result.oldest_device_lag_s == pytest.approx(1.0)
+    assert "Soft sync timed out" in caplog.text
+
+
+def test_wait_for_soft_sync_samples_selects_nearest_buffered_samples():
+    cfg = handheld_record.HandheldSoftSyncConfig(
+        enabled=True,
+        tolerance_ms=30.0,
+        wait_timeout_ms=50.0,
+        poll_interval_ms=1.0,
+    )
+    buffers = {
+        "camera.front": FakeSampleBuffer(
+            [
+                handheld_record.TimestampedSample(timestamp_s=9.95, value="old"),
+                handheld_record.TimestampedSample(timestamp_s=10.01, value="near"),
+                handheld_record.TimestampedSample(timestamp_s=10.08, value="latest"),
+            ]
+        ),
+        "handheld_gripper.pika": FakeSampleBuffer(
+            [
+                handheld_record.TimestampedSample(timestamp_s=10.02, value=12.0),
+            ]
+        ),
+    }
+
+    selection = handheld_record._wait_for_soft_sync_samples(
+        cfg=cfg,
+        buffers=buffers,
+        target_capture_time_s=10.0,
+        episode_start_time_s=9.0,
+        now_fn=lambda: 10.0,
+        sleep_fn=lambda seconds: None,
+    )
+
+    assert selection.result.timed_out is False
+    assert selection.samples["camera.front"].value == "near"
+    assert selection.samples["handheld_gripper.pika"].value == 12.0
+    assert selection.result.max_skew_s == pytest.approx(0.01)
 
 
 def test_build_handheld_tactile_observation_rejects_unexpected_shape():
@@ -202,6 +391,7 @@ def test_log_rerun_frame_uses_structured_device_capture_timestamp_paths(monkeypa
             "observation.tactile.paxini.raw_xyz": np.zeros((2, 120, 3), dtype=np.float32),
             "observation.state": np.array([12.5], dtype=np.float32),
             "observation.device_capture_timestamp": np.array([0.25, 0.30, 0.40], dtype=np.float64),
+            "observation.soft_sync": np.array([0.25, 0.15, 0.0, 0.01, 0.0], dtype=np.float64),
         },
     )
 
@@ -210,3 +400,6 @@ def test_log_rerun_frame_uses_structured_device_capture_timestamp_paths(monkeypa
     assert "observation/device_capture_timestamp/camera/front" in logged_paths
     assert "observation/device_capture_timestamp/tactile/paxini" in logged_paths
     assert "observation/device_capture_timestamp/handheld_gripper/pika" in logged_paths
+    assert "observation/soft_sync/target_timestamp_s" in logged_paths
+    assert "observation/soft_sync/max_skew_s" in logged_paths
+    assert "observation/soft_sync/global_lag_s" in logged_paths
