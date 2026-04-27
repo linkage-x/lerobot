@@ -76,6 +76,11 @@ uv run --python .venv/bin/python python tools/handheld/handheld_record.py \
   --dataset.episode_time_s 1
 ```
 
+keyboard control
+'''
+uv run --python .venv/bin/python python tools/handheld/handheld_record_keyboard.py   --config_path tools/handheld/handheld_record_example.yaml   --display_data false   --dataset.root /tmp/handheld_multimodal_v1_smoke
+'''
+
 Notes:
 
 - The script waits for Enter before each episode.
