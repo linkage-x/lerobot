@@ -156,6 +156,13 @@ def create_runtime_arg_parser(
     parser.add_argument("--quest3-clutch-threshold", type=float, default=0.5)
     parser.add_argument("--quest3-lost-tracking-timeout-s", type=float, default=0.25)
     parser.add_argument(
+        "--quest3-use-controller",
+        dest="quest3_use_hand_tracking",
+        action="store_false",
+        help="Use Quest3 controllers (MotionControllers) instead of hand tracking. Right grip=clutch, triggers=gripper.",
+    )
+    parser.set_defaults(quest3_use_hand_tracking=True)
+    parser.add_argument(
         "--quest3-scene-mode",
         choices=("pika_gripper", "fr3_arm"),
         default="pika_gripper",
@@ -202,7 +209,7 @@ def create_runtime_arg_parser(
         action="store_false",
         help="Keep the Pika TCP orientation fixed while following Quest3 wrist position.",
     )
-    parser.set_defaults(quest3_follow_orientation=False)
+    parser.set_defaults(quest3_follow_orientation=True)
     parser.add_argument(
         "--quest3-rotation-alignment-xyzw",
         type=float,
@@ -255,6 +262,7 @@ def build_runtime_teleop_config(
             key_file=args.quest3_key_file,
             calibration_dir=args.quest3_calibration_dir,
             hand=Quest3Hand(args.quest3_hand),
+            use_hand_tracking=args.quest3_use_hand_tracking,
             frequency=resolved_frequency,
             translation_scale=args.quest3_translation_scale,
             rotation_scale=args.quest3_rotation_scale,

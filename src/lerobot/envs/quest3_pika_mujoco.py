@@ -35,13 +35,22 @@ class Quest3PikaMujocoEnvConfig(FR3MujocoEnvConfig):
     quest3_position_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
     quest3_position_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
     quest3_recenter_on_first_tracking: bool = True
-    quest3_follow_orientation: bool = False
+    quest3_incremental_mode: bool = True
+    quest3_follow_orientation: bool = True
     quest3_rotation_alignment_xyzw: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
-    quest3_fixed_tcp_quat_xyzw: tuple[float, float, float, float] = (0.0, 0.0, -0.38268343, 0.92387953)
+    quest3_fixed_tcp_quat_xyzw: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 0.0)
     initial_tcp_position: tuple[float, float, float] = (0.48, 0.0, 0.45)
-    workspace_min: tuple[float, float, float] = (0.25, -0.36, 0.43)
-    workspace_max: tuple[float, float, float] = (0.82, 0.36, 0.90)
+    workspace_min: tuple[float, float, float] = (0.20, -0.80, -0.20)
+    workspace_max: tuple[float, float, float] = (1.10, 0.80, 1.40)
     continuous_physics_frequency: float | None = 500.0
+    quest3_env_deadband_m: float = 0.0005
+    quest3_env_deadband_rad: float = 0.0
+    quest3_env_max_step_pos_m: float = 0.30
+    quest3_env_max_step_rot_rad: float = 3.14
+    quest3_env_filter_alpha_pos: float = 1.0
+    quest3_env_filter_alpha_rot: float = 1.0
+    quest3_gripper_binary: bool = True
+    quest3_gripper_binary_threshold: float = 0.5
 
 
 class Quest3PikaMujocoEnv(gym.Env):
@@ -113,6 +122,11 @@ class Quest3PikaMujocoEnv(gym.Env):
         self._last_quest3_wrist_pos: np.ndarray | None = None
         self._last_mapped_tcp_pos = np.asarray(self.cfg.initial_tcp_position, dtype=np.float64).copy()
         self._zero_joints = np.zeros(len(self.cfg.joint_names), dtype=np.float64)
+        self._prev_clutch_active = False
+        self._mocap_baseline_pos: np.ndarray | None = None
+        self._mocap_baseline_quat_wxyz: np.ndarray | None = None
+        self._prev_filtered_dp: np.ndarray | None = None
+        self._prev_filtered_dr_rotvec: np.ndarray | None = None
 
         self.action_space = spaces.Box(low=-np.inf, high=np.inf, shape=(len(self.cfg.joint_names),), dtype=np.float32)
         self.observation_space = spaces.Dict(
@@ -123,7 +137,7 @@ class Quest3PikaMujocoEnv(gym.Env):
         )
 
         self._apply_tcp_pose(self._last_command_pose)
-        self._set_gripper_command(self._last_gripper)
+        self._set_gripper_command(self._last_gripper, teleport=True)
 
     @staticmethod
     def _import_mujoco():
@@ -242,14 +256,17 @@ class Quest3PikaMujocoEnv(gym.Env):
     def _gripper_ctrl_from_command(self, gripper_command: float) -> float:
         lower, upper = self._gripper_ctrl_range
         command = float(np.clip(gripper_command, 0.0, 1.0))
-        return float(lower + command * (upper - lower))
+        return float(upper - command * (upper - lower))
 
-    def _set_gripper_command(self, gripper_command: float, *, simulate: bool = False) -> None:
+    def _set_gripper_command(self, gripper_command: float, *, simulate: bool = False, teleport: bool = False) -> None:
+        if self.cfg.quest3_gripper_binary:
+            gripper_command = 1.0 if float(gripper_command) >= float(self.cfg.quest3_gripper_binary_threshold) else 0.0
         self.data.ctrl[self._gripper_actuator_id] = self._gripper_ctrl_from_command(gripper_command)
-        targets = self._gripper_joint_targets_from_command(gripper_command)
-        for key, qpos_index in self._gripper_joint_indices.items():
-            self.data.qpos[qpos_index] = targets[key]
-            self.data.qvel[self._gripper_qvel_indices[key]] = 0.0
+        if teleport:
+            targets = self._gripper_joint_targets_from_command(gripper_command)
+            for key, qpos_index in self._gripper_joint_indices.items():
+                self.data.qpos[qpos_index] = targets[key]
+                self.data.qvel[self._gripper_qvel_indices[key]] = 0.0
         self._mujoco.mj_forward(self.model, self.data)
         if simulate:
             self._step_physics(max(int(self.cfg.gripper_sim_steps), 1))
@@ -320,6 +337,95 @@ class Quest3PikaMujocoEnv(gym.Env):
                 target_data.mocap_quat[:] = self.data.mocap_quat
             self._mujoco.mj_forward(self.model, target_data)
 
+    def _quat_wxyz_to_xyzw(self, quat_wxyz: np.ndarray) -> np.ndarray:
+        return np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float64)
+
+    def _quat_xyzw_to_wxyz(self, quat_xyzw: np.ndarray) -> np.ndarray:
+        return np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=np.float64)
+
+    def _apply_env_filtering(self, dp: np.ndarray, dr_rotvec: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        norm_p = float(np.linalg.norm(dp))
+        deadband_p = float(self.cfg.quest3_env_deadband_m)
+        if norm_p < deadband_p:
+            dp = np.zeros(3, dtype=np.float64)
+
+        max_step_p = float(self.cfg.quest3_env_max_step_pos_m)
+        if max_step_p > 0.0 and norm_p > max_step_p:
+            dp = dp / norm_p * max_step_p
+
+        alpha_p = float(np.clip(self.cfg.quest3_env_filter_alpha_pos, 0.0, 1.0))
+        if self._prev_filtered_dp is not None and alpha_p > 0.0:
+            dp = alpha_p * dp + (1.0 - alpha_p) * self._prev_filtered_dp
+        self._prev_filtered_dp = dp.copy()
+
+        norm_r = float(np.linalg.norm(dr_rotvec))
+        deadband_r = float(self.cfg.quest3_env_deadband_rad)
+        if norm_r < deadband_r:
+            dr_rotvec = np.zeros(3, dtype=np.float64)
+
+        max_step_r = float(self.cfg.quest3_env_max_step_rot_rad)
+        if max_step_r > 0.0 and norm_r > max_step_r:
+            dr_rotvec = dr_rotvec / norm_r * max_step_r
+
+        alpha_r = float(np.clip(self.cfg.quest3_env_filter_alpha_rot, 0.0, 1.0))
+        if self._prev_filtered_dr_rotvec is not None and alpha_r > 0.0:
+            dr_rotvec = alpha_r * dr_rotvec + (1.0 - alpha_r) * self._prev_filtered_dr_rotvec
+        self._prev_filtered_dr_rotvec = dr_rotvec.copy()
+
+        return dp, dr_rotvec
+
+    def _slerp_wxyz(self, q0_wxyz: np.ndarray, q1_wxyz: np.ndarray, t: float) -> np.ndarray:
+        t = float(np.clip(t, 0.0, 1.0))
+        q0 = np.asarray(q0_wxyz, dtype=np.float64)
+        q1 = np.asarray(q1_wxyz, dtype=np.float64)
+        q0 = q0 / np.linalg.norm(q0)
+        q1 = q1 / np.linalg.norm(q1)
+        dot = float(np.dot(q0, q1))
+        if dot < 0.0:
+            q1 = -q1
+            dot = -dot
+        if dot > 0.9995:
+            result = q0 + t * (q1 - q0)
+            return result / np.linalg.norm(result)
+        theta_0 = np.arccos(np.clip(dot, -1.0, 1.0))
+        sin_theta_0 = np.sin(theta_0)
+        s0 = np.sin((1.0 - t) * theta_0) / sin_theta_0
+        s1 = np.sin(t * theta_0) / sin_theta_0
+        return s0 * q0 + s1 * q1
+
+    def _apply_incremental_mocap(
+        self,
+        delta_pos: np.ndarray,
+        delta_rotvec: np.ndarray,
+    ) -> None:
+        if self._mocap_baseline_pos is None or self._mocap_baseline_quat_wxyz is None:
+            return
+
+        dp, dr = self._apply_env_filtering(delta_pos.copy(), delta_rotvec.copy())
+        p_target = self._mocap_baseline_pos + dp
+        p_target = np.clip(p_target, self._workspace_min, self._workspace_max)
+
+        q_target_wxyz = self._mocap_baseline_quat_wxyz.copy()
+        if np.linalg.norm(dr) > 0.0 and self.cfg.quest3_follow_orientation:
+            q_baseline_xyzw = self._quat_wxyz_to_xyzw(self._mocap_baseline_quat_wxyz)
+            R_baseline = Rotation.from_quat(q_baseline_xyzw)
+            R_delta = Rotation.from_rotvec(dr)
+            R_target = R_delta * R_baseline * self._rotation_alignment
+            q_target_xyzw = R_target.as_quat()
+            q_target_wxyz = self._quat_xyzw_to_wxyz(q_target_xyzw)
+
+        base_pose = np.eye(4, dtype=np.float64)
+        base_pose[:3, 3] = p_target
+        R_target = Rotation.from_quat(self._quat_wxyz_to_xyzw(q_target_wxyz))
+        base_pose[:3, :3] = R_target.as_matrix()
+        self.data.mocap_pos[self._mocap_id] = base_pose[:3, 3]
+        self.data.mocap_quat[self._mocap_id] = q_target_wxyz
+        self._mujoco.mj_forward(self.model, self.data)
+
+        self._target_pose = base_pose.copy()
+        self._tcp_pose = self._current_tcp_pose()
+        self._last_mapped_tcp_pos = p_target.copy()
+
     def step_teleop_action(
         self,
         action: dict[str, Any] | None,
@@ -330,10 +436,38 @@ class Quest3PikaMujocoEnv(gym.Env):
     ):
         with self._physics_lock:
             action = {} if action is None else dict(action)
-            target_pose = self._pose_from_quest3_action(action)
-            if target_pose is not None:
-                self._last_command_pose = target_pose.copy()
-            self._apply_tcp_pose(self._last_command_pose)
+            clutch_active = bool(action.get("clutch_active", False))
+
+            if self.cfg.quest3_incremental_mode:
+                if clutch_active and not self._prev_clutch_active:
+                    self._mocap_baseline_pos = self.data.mocap_pos[self._mocap_id].copy()
+                    self._mocap_baseline_quat_wxyz = self.data.mocap_quat[self._mocap_id].copy()
+                    self._prev_filtered_dp = None
+                    self._prev_filtered_dr_rotvec = None
+
+                if clutch_active:
+                    delta_pos = np.array(
+                        [action.get("delta_x", 0.0), action.get("delta_y", 0.0), action.get("delta_z", 0.0)],
+                        dtype=np.float64,
+                    )
+                    delta_rotvec = np.array(
+                        [action.get("delta_wx", 0.0), action.get("delta_wy", 0.0), action.get("delta_wz", 0.0)],
+                        dtype=np.float64,
+                    )
+                    if np.all(np.isfinite(delta_pos)) and np.all(np.isfinite(delta_rotvec)):
+                        self._apply_incremental_mocap(delta_pos, delta_rotvec)
+                else:
+                    self._mocap_baseline_pos = None
+                    self._mocap_baseline_quat_wxyz = None
+                    self._prev_filtered_dp = None
+                    self._prev_filtered_dr_rotvec = None
+            else:
+                target_pose = self._pose_from_quest3_action(action)
+                if target_pose is not None:
+                    self._last_command_pose = target_pose.copy()
+                self._apply_tcp_pose(self._last_command_pose)
+
+            self._prev_clutch_active = clutch_active
 
             previous_gripper = self._last_gripper
             self._last_gripper = float(np.clip(action.get("gripper", self._last_gripper), 0.0, 1.0))
@@ -401,6 +535,11 @@ class Quest3PikaMujocoEnv(gym.Env):
             self._quest3_origin_wrist_pos = None
             self._last_quest3_wrist_pos = None
             self._last_mapped_tcp_pos = np.asarray(self.cfg.initial_tcp_position, dtype=np.float64).copy()
+            self._prev_clutch_active = False
+            self._mocap_baseline_pos = None
+            self._mocap_baseline_quat_wxyz = None
+            self._prev_filtered_dp = None
+            self._prev_filtered_dr_rotvec = None
             if options and "tcp_pose" in options:
                 self._last_command_pose = np.asarray(options["tcp_pose"], dtype=np.float64).reshape(4, 4)
             self._last_gripper = float(np.clip(self.cfg.initial_gripper, 0.0, 1.0))

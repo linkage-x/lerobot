@@ -60,7 +60,7 @@ class Quest3TeleopConfig(TeleoperatorConfig):
     rotation_scale: float = 1.0
     translation_deadband_m: float = 0.002
     rotation_deadband_rad: float = 0.02
-    enable_rotation: bool = False
+    enable_rotation: bool = True
     clutch_source: str = "squeeze"
     clutch_threshold: float = 0.5
     gripper_mapping: Quest3GripperMapping = Quest3GripperMapping.PINCH_VALUE
@@ -72,3 +72,15 @@ class Quest3TeleopConfig(TeleoperatorConfig):
     gripper_cmd_ema_alpha: float = 0.8
     gripper_cmd_max_rate: float = 12.0
     lost_tracking_timeout_s: float = 0.25
+    # --- Phase 1: incremental control (mocap direct-drive) ---
+    pos_scale: float = 1.0
+    rot_scale: float = 1.0
+    delta_deadband_m: float = 0.001
+    delta_deadband_rad: float = 0.01
+    max_step_pos_m: float = 0.25
+    max_step_rot_rad: float = 0.3
+    # --- Phase 2: controller mode ---
+    grip_threshold: float = 0.5
+    # --- Phase 3: stability ---
+    filter_alpha_pos: float = 0.3
+    filter_alpha_rot: float = 0.3

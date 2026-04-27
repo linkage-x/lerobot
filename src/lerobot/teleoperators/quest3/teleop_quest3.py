@@ -76,6 +76,20 @@ class Quest3Teleop(Teleoperator):
         self._filtered_gripper = self._last_gripper
         self._last_filtered_gripper_time = float("-inf")
         self._last_hand_parse_warning_s = float("-inf")
+        self._last_controller_parse_warning_s = float("-inf")
+        self._controller_mats: dict[str, np.ndarray] = {
+            "left": np.eye(4, dtype=np.float64),
+            "right": np.eye(4, dtype=np.float64),
+        }
+        self._controller_states: dict[str, dict[str, float | bool]] = {
+            "left": {"trigger": 0.0, "grip": 0.0, "button_a": False, "button_b": False},
+            "right": {"trigger": 0.0, "grip": 0.0, "button_a": False, "button_b": False},
+        }
+        self._controller_last_update_s: dict[str, float] = {"left": float("-inf"), "right": float("-inf")}
+        self._clutch_baseline_vr_pos: np.ndarray | None = None
+        self._clutch_baseline_vr_rot: Rotation | None = None
+        self._prev_delta_pos: np.ndarray | None = None
+        self._prev_delta_rotvec: np.ndarray | None = None
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -89,6 +103,13 @@ class Quest3Teleop(Teleoperator):
             "target_wz": float,
             "gripper": float,
             "tracking_valid": bool,
+            "clutch_active": bool,
+            "delta_x": float,
+            "delta_y": float,
+            "delta_z": float,
+            "delta_wx": float,
+            "delta_wy": float,
+            "delta_wz": float,
             "wrist_x": float,
             "wrist_y": float,
             "wrist_z": float,
@@ -112,6 +133,10 @@ class Quest3Teleop(Teleoperator):
 
     def calibrate(self) -> None:
         self._baseline_pose = None
+        self._clutch_baseline_vr_pos = None
+        self._clutch_baseline_vr_rot = None
+        self._prev_delta_pos = None
+        self._prev_delta_rotvec = None
 
     def configure(self) -> None:
         pass
@@ -173,6 +198,13 @@ class Quest3Teleop(Teleoperator):
             "target_wz": 0.0,
             "gripper": self._filtered_gripper,
             "tracking_valid": False,
+            "clutch_active": False,
+            "delta_x": 0.0,
+            "delta_y": 0.0,
+            "delta_z": 0.0,
+            "delta_wx": 0.0,
+            "delta_wy": 0.0,
+            "delta_wz": 0.0,
             "wrist_x": 0.0,
             "wrist_y": 0.0,
             "wrist_z": 0.0,
@@ -281,6 +313,9 @@ class Quest3Teleop(Teleoperator):
         hand = self._selected_hand()
         pose, hand_mats, states, last_update_s = self._hand_pose_robot_frame(hand)
         age_s = time.perf_counter() - last_update_s
+        other_hand = "left" if hand == "right" else "right"
+        ctrl_pose, ctrl_states, ctrl_last_s = self._controller_pose_robot_frame(hand)
+        ctrl_age_s = time.perf_counter() - ctrl_last_s
         return {
             "hand": hand,
             "tracking_age_s": age_s,
@@ -294,55 +329,212 @@ class Quest3Teleop(Teleoperator):
             "fingertip_distance_m": self._fingertip_distance(hand_mats),
             "gripper_unclipped": self._gripper_from_fingertips_unclipped(hand_mats),
             "gripper": self._raw_gripper(states, hand_mats),
+            "controller_age_s": ctrl_age_s,
+            "controller_valid": ctrl_age_s <= float(self.config.lost_tracking_timeout_s),
+            "controller_grip": float(ctrl_states.get("grip", 0.0)),
+            "controller_trigger": float(ctrl_states.get("trigger", 0.0)),
+            "controller_button_a": bool(ctrl_states.get("button_a", False)),
+            "controller_button_b": bool(ctrl_states.get("button_b", False)),
+            "controller_pos": ctrl_pose[:3, 3].copy(),
+            "gripper_from_controller": self._controller_gripper(ctrl_states, {}),
+            "use_hand_tracking": bool(self.config.use_hand_tracking),
         }
+
+    def _controller_pose_robot_frame(self, hand: str) -> tuple[np.ndarray, dict[str, float | bool], float]:
+        with self._lock:
+            mat = self._controller_mats.get(hand, np.eye(4, dtype=np.float64)).copy()
+            states = dict(self._controller_states.get(hand, {}))
+            last_update_s = float(self._controller_last_update_s.get(hand, float("-inf")))
+
+        controller_pose, controller_valid = _safe_mat_update(np.eye(4, dtype=np.float64), mat)
+        if not controller_valid:
+            return np.eye(4, dtype=np.float64), states, last_update_s
+
+        pose_robot = self.T_ROBOT_OPENXR @ controller_pose @ self.T_OPENXR_ROBOT
+        return pose_robot, states, last_update_s
+
+    def _clutch_active_from_states(self, states: dict[str, float | bool]) -> bool:
+        source = self.config.clutch_source
+        threshold = float(self.config.clutch_threshold)
+        if source == "pinch":
+            return bool(states.get("pinch", False)) or float(states.get("pinch_value", 0.0)) >= threshold
+        if source == "squeeze":
+            return bool(states.get("squeeze", False)) or float(states.get("squeeze_value", 0.0)) >= threshold
+        if source == "always":
+            return True
+        return False
+
+    def _clutch_active_from_controller(self, states: dict[str, float | bool]) -> bool:
+        return float(states.get("grip", 0.0)) >= float(self.config.grip_threshold)
+
+    def _controller_gripper(self, right_states: dict[str, float | bool], left_states: dict[str, float | bool]) -> float:
+        r_trigger = float(right_states.get("trigger", 0.0))
+        l_trigger = float(left_states.get("trigger", 0.0))
+        if r_trigger > 0.01 or l_trigger > 0.01:
+            return float(np.clip(1.0 - r_trigger + l_trigger, 0.0, 1.0))
+        return float(np.clip(self._filtered_gripper, 0.0, 1.0))
+
+    def _compute_incremental_deltas(
+        self,
+        current_pose: np.ndarray,
+        baseline_pose: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        dp = (current_pose[:3, 3] - baseline_pose[:3, 3]) * float(self.config.pos_scale)
+        dp = np.where(np.linalg.norm(dp) >= float(self.config.delta_deadband_m), dp, 0.0)
+        max_step = float(self.config.max_step_pos_m)
+        if max_step > 0.0:
+            norm = np.linalg.norm(dp)
+            if norm > max_step:
+                dp = dp / norm * max_step
+
+        dr_rotvec = np.zeros(3, dtype=np.float64)
+        if self.config.enable_rotation:
+            dR = baseline_pose[:3, :3].T @ current_pose[:3, :3]
+            dr_rotvec = Rotation.from_matrix(dR).as_rotvec() * float(self.config.rot_scale)
+            dr_rotvec = np.where(
+                np.linalg.norm(dr_rotvec) >= float(self.config.delta_deadband_rad),
+                dr_rotvec,
+                0.0,
+            )
+            max_step_rot = float(self.config.max_step_rot_rad)
+            if max_step_rot > 0.0:
+                norm = np.linalg.norm(dr_rotvec)
+                if norm > max_step_rot:
+                    dr_rotvec = dr_rotvec / norm * max_step_rot
+
+        return dp, dr_rotvec
+
+    def _low_pass_filter_deltas(self, dp: np.ndarray, dr_rotvec: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        alpha_p = float(np.clip(self.config.filter_alpha_pos, 0.0, 1.0))
+        alpha_r = float(np.clip(self.config.filter_alpha_rot, 0.0, 1.0))
+        if self._prev_delta_pos is not None and alpha_p > 0.0:
+            dp = alpha_p * dp + (1.0 - alpha_p) * self._prev_delta_pos
+        if self._prev_delta_rotvec is not None and alpha_r > 0.0:
+            dr_rotvec = alpha_r * dr_rotvec + (1.0 - alpha_r) * self._prev_delta_rotvec
+        self._prev_delta_pos = dp.copy()
+        self._prev_delta_rotvec = dr_rotvec.copy()
+        return dp, dr_rotvec
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:
         hand = self._selected_hand()
+        if self.config.use_hand_tracking:
+            return self._get_action_hand_tracking(hand)
+        else:
+            return self._get_action_controller(hand)
+
+    def _get_action_hand_tracking(self, hand: str) -> RobotAction:
         pose, hand_mats, states, last_update_s = self._hand_pose_robot_frame(hand)
         tracking_valid = time.perf_counter() - last_update_s <= float(self.config.lost_tracking_timeout_s)
         if not tracking_valid:
             self._baseline_pose = None
             self._last_clutch_active = False
+            self._prev_delta_pos = None
+            self._prev_delta_rotvec = None
             return self._zero_action()
 
         raw_gripper = self._raw_gripper(states, hand_mats)
         filtered_gripper = self._filter_gripper_command(raw_gripper)
-        clutch_active = self._clutch_active(states)
+        clutch_active = self._clutch_active_from_states(states)
+
         if not clutch_active:
             self._baseline_pose = None
             self._last_clutch_active = False
+            self._prev_delta_pos = None
+            self._prev_delta_rotvec = None
             action = self._zero_action()
+            action["tracking_valid"] = True
             action["gripper"] = filtered_gripper
             action.update(self._wrist_action_fields(pose, tracking_valid=True))
             return action
 
         if self._baseline_pose is None or not self._last_clutch_active:
             self._baseline_pose = pose.copy()
+            self._clutch_baseline_vr_pos = pose[:3, 3].copy()
+            self._clutch_baseline_vr_rot = Rotation.from_matrix(pose[:3, :3])
             self._last_clutch_active = True
+            self._prev_delta_pos = None
+            self._prev_delta_rotvec = None
 
-        delta_pos = (pose[:3, 3] - self._baseline_pose[:3, 3]) * float(self.config.translation_scale)
-        delta_pos = np.where(np.abs(delta_pos) >= float(self.config.translation_deadband_m), delta_pos, 0.0)
-
-        delta_rotvec = np.zeros(3, dtype=np.float64)
-        if self.config.enable_rotation:
-            delta_rot = self._baseline_pose[:3, :3].T @ pose[:3, :3]
-            delta_rotvec = Rotation.from_matrix(delta_rot).as_rotvec() * float(self.config.rotation_scale)
-            delta_rotvec = np.where(
-                np.abs(delta_rotvec) >= float(self.config.rotation_deadband_rad),
-                delta_rotvec,
-                0.0,
-            )
+        dp, dr_rotvec = self._compute_incremental_deltas(pose, self._baseline_pose)
+        dp, dr_rotvec = self._low_pass_filter_deltas(dp, dr_rotvec)
 
         action = {
-            "enabled": bool(np.any(delta_pos) or np.any(delta_rotvec)),
-            "target_x": float(delta_pos[0]),
-            "target_y": float(delta_pos[1]),
-            "target_z": float(delta_pos[2]),
-            "target_wx": float(delta_rotvec[0]),
-            "target_wy": float(delta_rotvec[1]),
-            "target_wz": float(delta_rotvec[2]),
+            "enabled": True,
+            "target_x": float(dp[0]),
+            "target_y": float(dp[1]),
+            "target_z": float(dp[2]),
+            "target_wx": float(dr_rotvec[0]),
+            "target_wy": float(dr_rotvec[1]),
+            "target_wz": float(dr_rotvec[2]),
             "gripper": filtered_gripper,
+            "tracking_valid": True,
+            "clutch_active": True,
+            "delta_x": float(dp[0]),
+            "delta_y": float(dp[1]),
+            "delta_z": float(dp[2]),
+            "delta_wx": float(dr_rotvec[0]),
+            "delta_wy": float(dr_rotvec[1]),
+            "delta_wz": float(dr_rotvec[2]),
+        }
+        action.update(self._wrist_action_fields(pose, tracking_valid=True))
+        return action
+
+    def _get_action_controller(self, hand: str) -> RobotAction:
+        other_hand = "left" if hand == "right" else "right"
+        pose, states, last_update_s = self._controller_pose_robot_frame(hand)
+        _other_pose, other_states, other_last_update_s = self._controller_pose_robot_frame(other_hand)
+        tracking_valid = (time.perf_counter() - last_update_s) <= float(self.config.lost_tracking_timeout_s)
+        if not tracking_valid:
+            self._baseline_pose = None
+            self._last_clutch_active = False
+            self._prev_delta_pos = None
+            self._prev_delta_rotvec = None
+            return self._zero_action()
+
+        clutch_active = self._clutch_active_from_controller(states)
+        raw_gripper = self._controller_gripper(states, other_states)
+        filtered_gripper = self._filter_gripper_command(raw_gripper)
+
+        if not clutch_active:
+            self._baseline_pose = None
+            self._last_clutch_active = False
+            self._prev_delta_pos = None
+            self._prev_delta_rotvec = None
+            action = self._zero_action()
+            action["tracking_valid"] = True
+            action["gripper"] = filtered_gripper
+            action.update(self._wrist_action_fields(pose, tracking_valid=True))
+            return action
+
+        if self._baseline_pose is None or not self._last_clutch_active:
+            self._baseline_pose = pose.copy()
+            self._clutch_baseline_vr_pos = pose[:3, 3].copy()
+            self._clutch_baseline_vr_rot = Rotation.from_matrix(pose[:3, :3])
+            self._last_clutch_active = True
+            self._prev_delta_pos = None
+            self._prev_delta_rotvec = None
+
+        dp, dr_rotvec = self._compute_incremental_deltas(pose, self._baseline_pose)
+        dp, dr_rotvec = self._low_pass_filter_deltas(dp, dr_rotvec)
+
+        action = {
+            "enabled": True,
+            "target_x": float(dp[0]),
+            "target_y": float(dp[1]),
+            "target_z": float(dp[2]),
+            "target_wx": float(dr_rotvec[0]),
+            "target_wy": float(dr_rotvec[1]),
+            "target_wz": float(dr_rotvec[2]),
+            "gripper": filtered_gripper,
+            "tracking_valid": True,
+            "clutch_active": True,
+            "delta_x": float(dp[0]),
+            "delta_y": float(dp[1]),
+            "delta_z": float(dp[2]),
+            "delta_wx": float(dr_rotvec[0]),
+            "delta_wy": float(dr_rotvec[1]),
+            "delta_wz": float(dr_rotvec[2]),
         }
         action.update(self._wrist_action_fields(pose, tracking_valid=True))
         return action
@@ -367,6 +559,10 @@ class Quest3Teleop(Teleoperator):
             self._is_connected = False
             self._baseline_pose = None
             self._last_clutch_active = False
+            self._clutch_baseline_vr_pos = None
+            self._clutch_baseline_vr_rot = None
+            self._prev_delta_pos = None
+            self._prev_delta_rotvec = None
 
     async def _on_hand_move(self, event, session, fps=60):
         del session, fps
@@ -396,7 +592,125 @@ class Quest3Teleop(Teleoperator):
                 )
 
     async def _on_controller_move(self, event, session, fps=60):
-        del event, session, fps
+        del session, fps
+        try:
+            now = time.perf_counter()
+            value = event.value
+            if not isinstance(value, dict):
+                return
+            if not hasattr(self, "_ctrl_debugged"):
+                self._ctrl_debugged = True
+                logger.info(
+                    "CONTROLLER_MOVE received — keys=%s left_type=%s right_type=%s",
+                    list(value),
+                    type(value.get("left")).__name__,
+                    type(value.get("right")).__name__,
+                )
+            left_raw = value.get("left")
+            right_raw = value.get("right")
+            left_state = value.get("leftState", {})
+            right_state = value.get("rightState", {})
+            with self._lock:
+                if left_raw is not None:
+                    left_mat = self._extract_controller_mat_from_raw(left_raw)
+                    if left_mat is not None:
+                        self._controller_mats["left"] = left_mat
+                        self._controller_last_update_s["left"] = now
+                    self._controller_states["left"] = self._extract_controller_state(left_state if isinstance(left_state, dict) else {})
+                if right_raw is not None:
+                    right_mat = self._extract_controller_mat_from_raw(right_raw)
+                    if right_mat is not None:
+                        self._controller_mats["right"] = right_mat
+                        self._controller_last_update_s["right"] = now
+                    self._controller_states["right"] = self._extract_controller_state(right_state if isinstance(right_state, dict) else {})
+        except Exception:
+            now_ts = time.perf_counter()
+            if now_ts - self._last_controller_parse_warning_s > 2.0:
+                self._last_controller_parse_warning_s = now_ts
+                logger.exception(
+                    "Failed to parse Quest3 CONTROLLER_MOVE event. payload=%s",
+                    self._summarize_payload(getattr(event, "value", None)),
+                )
+
+    @staticmethod
+    def _decode_msgpack_ext_controller(data: bytes) -> np.ndarray | None:
+        target_values = 16
+        for dtype_str in ("<f4", "<f8", ">f4", ">f8"):
+            itemsize = np.dtype(dtype_str).itemsize
+            target_bytes = target_values * itemsize
+            if len(data) < target_bytes or len(data) % itemsize != 0:
+                continue
+            max_offset = min(16, max(0, len(data) - target_bytes) + 1)
+            for offset in range(max_offset):
+                usable = len(data) - offset
+                if usable < target_bytes or usable % itemsize != 0:
+                    continue
+                arr = np.frombuffer(data, dtype=dtype_str, count=target_values, offset=offset)
+                if np.all(np.isfinite(arr)):
+                    return arr.astype(np.float64, copy=False)
+        return None
+
+    @staticmethod
+    def _extract_controller_mat_from_raw(raw) -> np.ndarray | None:
+        ext_data = getattr(raw, "data", None)
+        if isinstance(ext_data, bytes):
+            decoded = Quest3Teleop._decode_msgpack_ext_controller(ext_data)
+            if decoded is None:
+                return None
+            raw = decoded
+        if isinstance(raw, dict):
+            return Quest3Teleop._extract_controller_mat(raw)
+        arr = np.asarray(raw, dtype=np.float64).reshape(-1)
+        if arr.size < 16 or not np.all(np.isfinite(arr[:16])):
+            return None
+        mat = arr[:16].reshape(4, 4, order="F")
+        if not (np.isclose(mat[3, 3], 1.0) or np.isclose(mat[3, 3], 0.0)):
+            mat = arr[:16].reshape(4, 4, order="C")
+        return mat
+
+    @staticmethod
+    def _extract_controller_mat(payload: dict) -> np.ndarray | None:
+        matrix = payload.get("matrix")
+        if matrix is None:
+            pose_key = next((k for k in ("pose", "position", "transform", "m") if k in payload), None)
+            if pose_key is not None:
+                matrix = payload[pose_key]
+        if matrix is not None:
+            arr = np.asarray(matrix, dtype=np.float64)
+            if arr.shape == (16,):
+                arr = arr.reshape(4, 4, order="F")
+            if arr.shape == (4, 4) and np.all(np.isfinite(arr)):
+                return arr
+        pos = payload.get("position") or payload.get("pos") or payload.get("xyz")
+        quat = payload.get("quaternion") or payload.get("quat") or payload.get("orientation")
+        if pos is not None and quat is not None:
+            pos_arr = np.asarray(pos, dtype=np.float64).reshape(3)
+            quat_arr = np.asarray(quat, dtype=np.float64).reshape(4)
+            mat = np.eye(4, dtype=np.float64)
+            mat[:3, 3] = pos_arr
+            mat[:3, :3] = Rotation.from_quat(quat_arr).as_matrix()
+            return mat
+        return None
+
+    @staticmethod
+    def _extract_controller_state(payload: dict) -> dict[str, float | bool]:
+        if not isinstance(payload, dict):
+            payload = {}
+        trigger_val = float(
+            payload.get("triggerValue", payload.get("trigger_value", payload.get("trigger", 0.0)))
+        )
+        squeeze_val = float(
+            payload.get("squeezeValue", payload.get("squeeze_value", payload.get("squeeze", payload.get("grip", payload.get("gripValue", 0.0)))))
+        )
+        buttons = payload.get("buttons", payload.get("button", {}))
+        if not isinstance(buttons, dict):
+            buttons = {}
+        return {
+            "trigger": float(trigger_val),
+            "grip": float(squeeze_val),
+            "button_a": bool(buttons.get("aButton", buttons.get("a", buttons.get("A", buttons.get("0", False))))),
+            "button_b": bool(buttons.get("bButton", buttons.get("b", buttons.get("B", buttons.get("1", False))))),
+        }
 
     @staticmethod
     def _extract_hand_mats(payload: Any) -> np.ndarray | None:

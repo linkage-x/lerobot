@@ -159,6 +159,134 @@ HIROL Quest3 代码可作为输入侧参考，但不建议直接整体搬入 LeR
 - [ ] 安全策略：断连、无手、奇异矩阵、pinch 突变、超 workspace、viewer 关闭，都输出 `enabled=False`。
 - [ ] 真实 Pika gripper 前置 smoke：先不动 FR3 机械臂，只控制 gripper。
 
+---
+
+# 增量控制实施路线 (Phase 1-3)
+
+## Phase 1: 增量控制核心实现（关键阶段）
+
+### 目标
+替换绝对控制 → 增量控制（clutch-based delta 公式）
+
+### 1.1 状态锁定（clutch 起点）
+在按下 grip / trigger 时记录：
+```
+p_vr0 = controller_pos.copy()
+q_vr0 = controller_quat.copy()
+
+p_target0 = data.mocap_pos[mocap_id].copy()
+q_target0 = data.mocap_quat[mocap_id].copy()
+```
+
+### 1.2 平移增量
+- 计算 VR 增量：`dp_vr = controller_pos - p_vr0`
+- 坐标系转换（VR → MuJoCo）：`dp_mj = scale * (R_MJ_VR @ dp_vr)`
+- 更新 target：`p_target = p_target0 + dp_mj`
+
+### 1.3 姿态增量
+- quaternion → rotation: `R_vr0 = R.from_quat(q_vr0_xyzw)`, `R_vr = R.from_quat(q_vr_xyzw)`
+- 增量旋转: `dR_vr = R_vr0.inv() * R_vr`
+- 坐标系转换: `R_delta_mj = R.from_matrix(R_MJ_VR) * dR_vr * R.from_matrix(R_MJ_VR).inv()`
+- 作用到 target: `R_target0 = R.from_quat(wxyz_to_xyzw(q_target0))`, `R_target = R_target0 * R_delta_mj`
+- 写回: `q_target = xyzw_to_wxyz(R_target.as_quat())`
+
+### 1.4 写入 mocap
+```python
+data.mocap_pos[mocap_id] = p_target
+data.mocap_quat[mocap_id] = q_target
+```
+
+### 1.5 代码位置
+- `src/lerobot/teleoperators/quest3/configuration_quest3.py` - 新增配置: `pos_scale`, `rot_scale`, `delta_deadband_m`, `delta_deadband_rad`, `max_step_pos_m`, `max_step_rot_rad`
+- `src/lerobot/teleoperators/quest3/teleop_quest3.py` - 核心 delta 计算逻辑, 新增 controller pose 跟踪
+- `src/lerobot/envs/quest3_pika_mujoco.py` - 增量 mocap 模式: 记录基线、应用 delta、滤波限制
+
+### 验收标准
+- [x] 松手再抓 → 不跳变（核心！）
+- [ ] 手柄移动 10cm → EE 平滑移动
+- [ ] 不依赖 VR 原点
+
+---
+
+## Phase 2: 交互设计（强烈建议做）
+
+### 目标
+让系统"像工具一样好用"，而不是 demo
+
+### 2.1 推荐映射
+```
+右手 grip（持续按）    → 控制 EE 位姿（开启增量模式）
+松开 grip              → 冻结 target（clutch）
+右 trigger             → 夹爪闭合
+左 trigger             → 夹爪打开
+```
+
+### 2.2 状态机
+```
+IDLE          → (grip down)    → CONTROLLING
+CONTROLLING   → (grip up)      → HOLD
+HOLD          → (grip down)    → CONTROLLING  (重新记录 baseline)
+```
+
+### 2.3 Gripper 控制接口
+- Panda / 自定义 gripper 命令接口
+- 连续 trigger 值映射到 gripper [0, 1]
+
+### 2.4 代码位置
+- `src/lerobot/teleoperators/quest3/teleop_quest3.py` - 新增 `_on_controller_move()`, state machine, trigger-based gripper
+- `src/lerobot/teleoperators/quest3/configuration_quest3.py` - 新增 `grip_threshold`, `trigger_threshold` 等
+
+### 验收标准
+- [ ] 可以像真实遥操作一样：抓 → 放 → 重新抓位置
+- [ ] 无需回中
+
+---
+
+## Phase 3: 稳定性工程（你这个项目的关键）
+
+### 目标
+真实机器人操作稳定性
+
+### 3.1 滤波 + 限幅
+```python
+# deadband
+if np.linalg.norm(dp_mj) < deadband:
+    dp_mj = 0
+
+# max step
+dp_mj = clip(dp_mj, max_step)
+
+# low-pass filter
+dp_mj_filtered = alpha * dp_mj + (1-alpha) * dp_mj_prev
+```
+
+### 3.2 Scale 参数
+```python
+pos_scale = 0.5   # 可调参数
+rot_scale = 0.7
+```
+
+### 3.3 姿态平滑（slerp）
+```python
+q_target_filtered = slerp(q_target_prev, q_target, alpha)
+```
+
+### 3.4 延迟补偿（可发挥点）
+```
+VR pose timestamp → 对齐 control tick → extrapolation / low-pass filter
+```
+
+### 3.5 代码位置
+- `src/lerobot/envs/quest3_pika_mujoco.py` - deadband, max_step clipping, low-pass filter, slerp
+- `src/lerobot/teleoperators/quest3/configuration_quest3.py` - 新增 `filter_alpha_pos`, `filter_alpha_rot`
+
+### 验收标准
+- [ ] 无 jitter
+- [ ] 无爆跳
+- [ ] 控制稳定
+
+---
+
 ## 预估工作量
 
 - MVP：Quest3 hand tracking 驱动 MuJoCo Pika gripper 开合，不控制 arm pose：1-2 天。

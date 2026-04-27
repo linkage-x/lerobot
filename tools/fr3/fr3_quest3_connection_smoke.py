@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Smoke-test Quest3/Vuer connectivity and hand-tracking data before FR3 control."""
+"""Smoke-test Quest3/Vuer connectivity — supports both hand-tracking and controller mode."""
 
 from __future__ import annotations
 
@@ -51,6 +51,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duration-s", type=float, default=None)
     parser.add_argument("--print-hz", type=float, default=10.0)
     parser.add_argument("--lost-tracking-timeout-s", type=float, default=0.25)
+    parser.add_argument(
+        "--use-controller",
+        dest="use_hand_tracking",
+        action="store_false",
+        help="Use controller (MotionControllers) instead of hand tracking. Right grip=clutch, triggers=gripper.",
+    )
+    parser.set_defaults(use_hand_tracking=True)
     return parser.parse_args()
 
 
@@ -65,6 +72,7 @@ def main() -> None:
         key_file=args.key_file,
         calibration_dir=args.calibration_dir,
         hand=Quest3Hand(args.hand),
+        use_hand_tracking=args.use_hand_tracking,
         gripper_mapping=Quest3GripperMapping(args.gripper_mapping),
         open_pinch_value=args.open_pinch_value,
         closed_pinch_value=args.closed_pinch_value,
@@ -74,20 +82,11 @@ def main() -> None:
     )
     teleop = Quest3Teleop(config)
     ip_hint = _local_ip_hint()
-    print("Quest3 connection smoke starting.")
+    mode_label = "HAND TRACKING" if args.use_hand_tracking else "CONTROLLER"
+    print(f"Quest3 connection smoke — MODE: {mode_label}")
     print(f"Certificate: {config.cert_file}")
     print(f"Private key: {config.key_file}")
     print(f"Calibration dir: {config.calibration_dir}")
-    print(
-        "Gripper mapping: {mapping} closed_pinch={closed_pinch:.3f} open_pinch={open_pinch:.3f} "
-        "closed_distance={closed:.3f}m open_distance={open:.3f}m".format(
-            mapping=config.gripper_mapping.value,
-            closed_pinch=config.closed_pinch_value,
-            open_pinch=config.open_pinch_value,
-            closed=config.closed_fingertip_distance_m,
-            open=config.open_fingertip_distance_m,
-        )
-    )
     print(f"USB reverse URL: https://127.0.0.1:{args.port}?ws=wss://127.0.0.1:{args.port}")
     print(f"Wi-Fi/LAN URL: https://{ip_hint}:{args.port}?ws=wss://{ip_hint}:{args.port}")
     print("If using USB debugging, run: adb reverse tcp:{0} tcp:{0}".format(args.port))
@@ -103,35 +102,64 @@ def main() -> None:
             pose = np.asarray(state["wrist_pose"], dtype=np.float64)
             xyz = pose[:3, 3]
             fingertip_distance = float(state["fingertip_distance_m"])
-            if bool(state["tracking_valid"]):
+
+            hand_valid = bool(state["tracking_valid"])
+            ctrl_valid = bool(state.get("controller_valid", False))
+
+            if hand_valid:
                 fingertip_distance_min = min(fingertip_distance_min, fingertip_distance)
                 fingertip_distance_max = max(fingertip_distance_max, fingertip_distance)
-            print(
-                "hand={hand} valid={valid} age={age:.3f}s "
-                "pinch={pinch} pinch_value={pinch_value:.3f} pinch_gripper={pinch_gripper:.3f} "
-                "squeeze={squeeze} squeeze_value={squeeze_value:.3f} "
-                "fingertip_distance_m={fingertip_distance_m:.3f} "
-                "distance_range_m=({distance_min:.3f},{distance_max:.3f}) "
-                "gripper_unclipped={gripper_unclipped:.3f} gripper={gripper:.3f} "
-                "wrist_xyz=({x:.3f}, {y:.3f}, {z:.3f})".format(
-                    hand=state["hand"],
-                    valid=state["tracking_valid"],
+
+            lines = []
+            lines.append(
+                "HAND  valid={valid} age={age:.3f}s "
+                "pinch={pinch} pinch_val={pinch_value:.3f} squeeze={squeeze} "
+                "gripper={gripper:.3f} "
+                "wrist=({x:.3f},{y:.3f},{z:.3f})".format(
+                    valid=hand_valid,
                     age=state["tracking_age_s"],
                     pinch=state["pinch"],
                     pinch_value=state["pinch_value"],
-                    pinch_gripper=state["pinch_gripper"],
-                    squeeze=state["squeeze"],
-                    squeeze_value=state["squeeze_value"],
-                    fingertip_distance_m=fingertip_distance,
-                    distance_min=fingertip_distance_min if np.isfinite(fingertip_distance_min) else float("nan"),
-                    distance_max=fingertip_distance_max if np.isfinite(fingertip_distance_max) else float("nan"),
-                    gripper_unclipped=state["gripper_unclipped"],
+                    squeeze=state["squeeze_value"],
                     gripper=state["gripper"],
-                    x=xyz[0],
-                    y=xyz[1],
-                    z=xyz[2],
+                    x=xyz[0], y=xyz[1], z=xyz[2],
                 )
             )
+            lines.append(
+                "CTRL  valid={valid} age={age:.3f}s "
+                "grip={grip:.3f} trigger={trigger:.3f} "
+                "btn_a={btn_a} btn_b={btn_b} "
+                "pos=({px:.3f},{py:.3f},{pz:.3f})".format(
+                    valid=ctrl_valid,
+                    age=state.get("controller_age_s", float("inf")),
+                    grip=state.get("controller_grip", 0.0),
+                    trigger=state.get("controller_trigger", 0.0),
+                    btn_a=state.get("controller_button_a", False),
+                    btn_b=state.get("controller_button_b", False),
+                    px=state.get("controller_pos", np.zeros(3))[0],
+                    py=state.get("controller_pos", np.zeros(3))[1],
+                    pz=state.get("controller_pos", np.zeros(3))[2],
+                )
+            )
+
+            if hand_valid:
+                lines.append(
+                    "GRIP  fingertip={ft:.3f}m range=({dmin:.3f},{dmax:.3f}) unclipped={unclip:.3f}".format(
+                        ft=fingertip_distance,
+                        dmin=fingertip_distance_min if np.isfinite(fingertip_distance_min) else float("nan"),
+                        dmax=fingertip_distance_max if np.isfinite(fingertip_distance_max) else float("nan"),
+                        unclip=state["gripper_unclipped"],
+                    )
+                )
+            elif ctrl_valid:
+                lines.append(
+                    "GRIP  ctrl_gripper={g:.3f}".format(g=state.get("gripper_from_controller", 0.0))
+                )
+
+            if not hand_valid and not ctrl_valid:
+                lines.append("  (no data from either source)")
+
+            print(" | ".join(lines))
             time.sleep(period_s)
     finally:
         if teleop.is_connected:
