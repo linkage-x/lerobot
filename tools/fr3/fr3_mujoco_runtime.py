@@ -27,7 +27,19 @@ from lerobot.teleoperators.spacemouse.configuration_spacemouse import (
 
 _D435I_COLOR_WIDTH = 640
 _D435I_COLOR_HEIGHT = 480
-_VIEWER_CAMERA_CHOICES = tuple(FR3MujocoEnvConfig().camera_names)
+_DEFAULT_CAMERA_NAMES = tuple(FR3MujocoEnvConfig().camera_names)
+_HIKON_8_CAMERA_NAMES = ("hk_01", "hk_02", "hk_03", "hk_04", "hk_05", "hk_06", "hk_07", "hk_08")
+_VIEWER_CAMERA_CHOICES = _DEFAULT_CAMERA_NAMES + _HIKON_8_CAMERA_NAMES
+_HIKON_BOX_SCENE_XML = (
+    Path(__file__).resolve().parents[2]
+    / "src"
+    / "lerobot"
+    / "robots"
+    / "franka_research3"
+    / "assets"
+    / "franka_fr3"
+    / "fr3_pika_ati_box_scene.xml"
+)
 
 
 def create_runtime_arg_parser(
@@ -53,6 +65,18 @@ def create_runtime_arg_parser(
     parser.add_argument("--camera-width", type=int, default=_D435I_COLOR_WIDTH)
     parser.add_argument("--camera-height", type=int, default=_D435I_COLOR_HEIGHT)
     parser.add_argument("--camera-fps", type=float, default=30.0)
+    parser.add_argument(
+        "--camera-set",
+        choices=("default", "hikon_8"),
+        default="default",
+        help="Named MuJoCo camera set to render. Use hikon_8 with fr3_pika_ati_box_scene.xml.",
+    )
+    parser.add_argument(
+        "--sim-xml-path",
+        type=str,
+        default=None,
+        help="Override the FR3 MuJoCo scene XML path. Defaults to the standard FR3 scene, or the HIK box scene with --camera-set hikon_8.",
+    )
     parser.add_argument(
         "--arm-actuator-kp",
         type=float,
@@ -317,6 +341,14 @@ def build_runtime_env_config(
         resolved_max_episode_steps = 1_000_000
         if duration_s is not None:
             resolved_max_episode_steps = max(int(duration_s * resolved_control_frequency) + 100, 1_000)
+    config_kwargs = {}
+    if args.camera_set == "hikon_8":
+        config_kwargs["camera_names"] = _HIKON_8_CAMERA_NAMES
+        config_kwargs["camera_name_mapping"] = {name: f"{name}_cam" for name in _HIKON_8_CAMERA_NAMES}
+        config_kwargs["sim_xml_path"] = str(_HIKON_BOX_SCENE_XML)
+    if args.sim_xml_path is not None:
+        config_kwargs["sim_xml_path"] = str(Path(args.sim_xml_path).expanduser())
+
     return FR3MujocoEnvConfig(
         max_episode_steps=resolved_max_episode_steps,
         teleop_control_frequency=float(resolved_control_frequency),
@@ -328,6 +360,7 @@ def build_runtime_env_config(
         camera_height=int(args.camera_height),
         continuous_physics=bool(args.continuous_physics),
         continuous_physics_frequency=float(args.continuous_physics_frequency),
+        **config_kwargs,
     )
 
 

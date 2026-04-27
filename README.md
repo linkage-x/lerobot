@@ -41,6 +41,7 @@ lerobot-info
 Run FR3 teleoperation in Mujoco simulation with Docker:
 
 ```bash
+xhost +si:localuser:root
 docker compose -f docker/docker-compose.yml --profile sim --profile teleop run --rm \
   -e DISPLAY=$DISPLAY \
   -e PYTHONPATH=/workspace/src \

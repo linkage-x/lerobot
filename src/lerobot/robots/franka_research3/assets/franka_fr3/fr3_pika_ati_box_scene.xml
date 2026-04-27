@@ -1,0 +1,64 @@
+<mujoco model="fr3_pika_ati_box_scene">
+  <include file="fr3_pika_ati.xml" />
+  <option gravity="0 0 -9.81" />
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0" />
+    <rgba haze="0.15 0.25 0.35 1" />
+    <global azimuth="-140" elevation="-30" offwidth="1280" offheight="720" />
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="flat" rgb1="0.08 0.10 0.14" rgb2="0.02 0.03 0.05" width="512" height="3072" />
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4"
+      rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300" />
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2" />
+    <material name="table_surface" rgba="0.38 0.28 0.22 1" />
+    <material name="workspace_object_material" rgba="0.85 0.25 0.18 1" />
+    <material name="peg_hole_material" rgba="0.18 0.55 0.72 1" />
+  </asset>
+
+  <worldbody>
+    <light name="key_light" pos="0.4 -0.3 1.6" dir="0.1 0.0 -1" directional="true" castshadow="true" />
+    <light name="fill_light" pos="-0.6 0.4 1.2" dir="0.2 -0.1 -1" directional="true" diffuse="0.35 0.35 0.35" />
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" />
+
+    <!-- HIK fixed-camera rig from hikon_8camera_calibration_0424.
+         Poses use joint_solution.cameras[*].base_to_camera. OpenCV camera axes are converted to MuJoCo
+         camera axes as x_mj=x_cv, y_mj=-y_cv, z_mj=-z_cv. Distortion coefficients are not modeled here. -->
+    <camera name="hk_01_cam" pos="0.946226132 0.043782963 1.302607257" xyaxes="-0.078753324 -0.996893249 0.001328151 0.996729534 -0.078716041 0.018276256" focalpixel="1790.330077 1786.274851" principalpixel="696.827219 551.202723" resolution="1280 720" sensorsize="1.28 0.72"/>
+    <camera name="hk_02_cam" pos="1.051215175 0.637145455 1.332656844" xyaxes="-0.972484207 0.154225892 0.174610542 -0.055430828 -0.881155124 0.469566896" focalpixel="1802.621362 1802.891025" principalpixel="712.788139 564.583920" resolution="1280 720" sensorsize="1.28 0.72"/>
+    <camera name="hk_03_cam" pos="1.037806091 -0.597752324 1.325206220" xyaxes="0.966183545 0.185050839 -0.179570443 -0.081104234 0.879148303 0.469595959" focalpixel="1804.254180 1804.969303" principalpixel="725.617291 570.832283" resolution="1280 720" sensorsize="1.28 0.72"/>
+    <camera name="hk_04_cam" pos="1.097226173 -0.705923116 0.912999862" xyaxes="0.957754415 0.257649683 -0.127761973 -0.080312747 0.666202692 0.741433636" focalpixel="1795.163888 1795.061077" principalpixel="707.838769 548.636978" resolution="1280 720" sensorsize="1.28 0.72"/>
+    <camera name="hk_05_cam" pos="1.119152396 0.744961479 0.887333646" xyaxes="-0.967712486 0.236492738 0.087199364 -0.080255401 -0.617042738 0.782826501" focalpixel="1801.842882 1799.774625" principalpixel="699.212947 551.475178" resolution="1280 720" sensorsize="1.28 0.72"/>
+    <camera name="hk_06_cam" pos="0.523291198 0.796468182 0.372927645" xyaxes="-0.915803913 -0.389913773 -0.096283138 -0.057263114 -0.110518201 0.992223091" focalpixel="1753.724248 1765.623159" principalpixel="700.432491 614.007499" resolution="1280 720" sensorsize="1.28 0.72"/>
+    <camera name="hk_07_cam" pos="1.254183479 0.063467355 1.014526305" xyaxes="0.026557500 0.999229524 -0.028897368 -0.692848138 0.039237090 0.720015214" focalpixel="1802.080200 1801.077657" principalpixel="702.488233 557.521343" resolution="1280 720" sensorsize="1.28 0.72"/>
+    <camera name="hk_08_cam" pos="0.499396092 -0.751100211 0.364821011" xyaxes="0.933805947 -0.354709310 0.046773486 -0.030662772 0.050908546 0.998232495" focalpixel="1801.293298 1795.399274" principalpixel="700.406455 548.167561" resolution="1280 720" sensorsize="1.28 0.72"/>
+
+    <body name="table_body" pos="0.52 0 0.38">
+      <geom name="table" type="box" size="0.34 0.46 0.02" material="table_surface" friction="1.2 0.05 0.01"/>
+      <geom type="box" pos="0.28 0.40 -0.34" size="0.03 0.03 0.34" material="table_surface"/>
+      <geom type="box" pos="0.28 -0.40 -0.34" size="0.03 0.03 0.34" material="table_surface"/>
+      <geom type="box" pos="-0.28 0.40 -0.34" size="0.03 0.03 0.34" material="table_surface"/>
+      <geom type="box" pos="-0.28 -0.40 -0.34" size="0.03 0.03 0.34" material="table_surface"/>
+
+      <body name="peg_hole_fixture_body" pos="0.10 -0.16 0.02">
+        <geom name="peg_hole_base" type="box" pos="0 0 0.005" size="0.035 0.035 0.005"
+              material="peg_hole_material" friction="1.4 0.05 0.01" condim="4"/>
+        <geom name="peg_hole_wall_x_pos" type="box" pos="0.034 0 0.0375" size="0.004 0.035 0.0275"
+              material="peg_hole_material" friction="1.4 0.05 0.01" condim="4"/>
+        <geom name="peg_hole_wall_x_neg" type="box" pos="-0.034 0 0.0375" size="0.004 0.035 0.0275"
+              material="peg_hole_material" friction="1.4 0.05 0.01" condim="4"/>
+        <geom name="peg_hole_wall_y_pos" type="box" pos="0 0.034 0.0375" size="0.030 0.004 0.0275"
+              material="peg_hole_material" friction="1.4 0.05 0.01" condim="4"/>
+        <geom name="peg_hole_wall_y_neg" type="box" pos="0 -0.034 0.0375" size="0.030 0.004 0.0275"
+              material="peg_hole_material" friction="1.4 0.05 0.01" condim="4"/>
+      </body>
+    </body>
+
+    <body name="workspace_object_body" pos="0.48 0.00 0.44">
+      <freejoint/>
+      <geom name="workspace_object" type="box" size="0.025 0.025 0.04" material="workspace_object_material" density="500" friction="1.8 0.05 0.01" condim="4" />
+    </body>
+  </worldbody>
+</mujoco>

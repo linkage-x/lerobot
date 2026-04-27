@@ -53,6 +53,8 @@ def main(argv: list[str] | None = None) -> int:
                 "viewer": not args.no_viewer,
                 "viewer_camera": args.viewer_camera,
                 "enable_cameras": args.enable_cameras,
+                "camera_set": args.camera_set,
+                "sim_xml_path": env.cfg.sim_xml_path,
                 "camera_width": args.camera_width,
                 "camera_height": args.camera_height,
                 "camera_fps": args.camera_fps,

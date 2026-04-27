@@ -24,6 +24,8 @@ x-lerobot-common: &lerobot-common
     TRITON_CACHE_DIR: /home/user_lerobot/.cache/triton
     HIKROBOT_MVS_HOME: /opt/MVS
     MVCAM_COMMON_RUNENV: /opt/MVS/lib
+    NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+    NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility,graphics,display,video}
     http_proxy: ${http_proxy:-}
     https_proxy: ${https_proxy:-}
     no_proxy: ${no_proxy:-}
@@ -34,7 +36,7 @@ x-lerobot-common: &lerobot-common
     - ${HOME}/.cache/triton:/home/user_lerobot/.cache/triton
     - ${HOME}/.config/libsurvive:/home/user_lerobot/.config/libsurvive
     - /tmp/.X11-unix:/tmp/.X11-unix
-    - ${HOME}/.Xauthority:/root/.Xauthority:ro
+    - ${XAUTHORITY:-${HOME}/.Xauthority}:/root/.Xauthority:ro
     - /sys/bus/usb:/sys/bus/usb:ro
     - /sys/class/input:/sys/class/input:ro
     - /dev:/dev
@@ -64,7 +66,7 @@ x-lerobot-sim-common: &lerobot-sim-common
     - ${HOME}/.cache/torch:/home/user_lerobot/.cache/torch
     - ${HOME}/.cache/triton:/home/user_lerobot/.cache/triton
     - /tmp/.X11-unix:/tmp/.X11-unix
-    - ${HOME}/.Xauthority:/root/.Xauthority:ro
+    - ${XAUTHORITY:-${HOME}/.Xauthority}:/root/.Xauthority:ro
   shm_size: "8gb"
 
 x-lerobot-train-env: &lerobot-train-env
@@ -121,7 +123,7 @@ services:
       - ${HOME}/.cache/triton:/home/user_lerobot/.cache/triton
       - ${HOME}/.config/libsurvive:/home/user_lerobot/.config/libsurvive
       - /tmp/.X11-unix:/tmp/.X11-unix
-      - ${HOME}/.Xauthority:/root/.Xauthority:ro
+      - ${XAUTHORITY:-${HOME}/.Xauthority}:/root/.Xauthority:ro
       - /sys/bus/usb:/sys/bus/usb:ro
       - /sys/class/input:/sys/class/input:ro
       - /dev:/dev

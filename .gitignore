@@ -179,6 +179,7 @@ outputs/
 *.part
 !src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_ati.xml
 !src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_ati_scene.xml
+!src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_ati_box_scene.xml
 !src/lerobot/robots/franka_research3/assets/franka_fr3/quest3_pika_gripper_scene.xml
 !src/lerobot/robots/franka_research3/assets/franka_fr3/assets/hand.stl
 !src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_franka_hand.urdf
