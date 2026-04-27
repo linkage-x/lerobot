@@ -165,7 +165,8 @@ dataset:
   single_task: Handheld multimodal capture
   root: /workspace/outputs/datasets/handheld_multimodal_v1
   fps: 30
-  num_episodes: 20
+  # 0 means unlimited saved episodes; press Esc while recording to stop the session.
+  num_episodes: 0
   episode_time_s: 10
   video: true
   streaming_encoding: true

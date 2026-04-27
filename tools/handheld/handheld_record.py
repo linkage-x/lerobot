@@ -134,7 +134,7 @@ class HandheldDatasetConfig:
     root: str | Path | None = None
     fps: int = 30
     episode_time_s: float = 10.0
-    num_episodes: int = 20
+    num_episodes: int = 0
     video: bool = True
     push_to_hub: bool = False
     private: bool = False
@@ -157,8 +157,8 @@ class HandheldDatasetConfig:
             raise ValueError(f"`dataset.fps` must be > 0, but {self.fps} is provided.")
         if self.episode_time_s <= 0:
             raise ValueError(f"`dataset.episode_time_s` must be > 0, but {self.episode_time_s} is provided.")
-        if self.num_episodes <= 0:
-            raise ValueError(f"`dataset.num_episodes` must be > 0, but {self.num_episodes} is provided.")
+        if self.num_episodes < 0:
+            raise ValueError(f"`dataset.num_episodes` must be >= 0, but {self.num_episodes} is provided.")
         if self.capture_queue_size <= 0:
             raise ValueError(
                 f"`dataset.capture_queue_size` must be > 0, but {self.capture_queue_size} is provided."
@@ -199,6 +199,7 @@ class EpisodeStopAction(str, Enum):
     TIMED_OUT = "timed_out"
     SAVE_EARLY = "save_early"
     DISCARD_EARLY = "discard_early"
+    EXIT = "exit"
 
 
 @dataclass(frozen=True)
@@ -921,6 +922,10 @@ def _format_device_summary(devices: dict[str, Any]) -> str:
     return ", ".join(devices)
 
 
+def _format_target_episodes(num_episodes: int) -> str:
+    return "unlimited" if num_episodes == 0 else str(num_episodes)
+
+
 def _print_intro(
     cfg: HandheldRecordingConfig,
     cameras: dict[str, Any],
@@ -941,7 +946,7 @@ def _print_intro(
     print(f"Handheld grippers: {_format_device_summary(handheld_grippers)}")
     print(
         f"Episode length: {cfg.dataset.episode_time_s:.2f}s | Dataset FPS: {cfg.dataset.fps} | "
-        f"Target saved episodes: {cfg.dataset.num_episodes}"
+        f"Target saved episodes: {_format_target_episodes(cfg.dataset.num_episodes)}"
     )
     if cfg.sensors.soft_sync.enabled:
         print(
@@ -1062,11 +1067,17 @@ def _read_terminal_key_nonblocking() -> str | None:
         return None
     if not pressed:
         return None
+    if pressed == b"\x1b":
+        return "esc"
     return pressed.decode("utf-8", errors="ignore").lower()
 
 
 def _has_episode_data(dataset: LeRobotDataset) -> bool:
     return dataset.episode_buffer is not None and int(dataset.episode_buffer["size"]) > 0
+
+
+def _recording_target_reached(dataset: LeRobotDataset, target_num_episodes: int) -> bool:
+    return target_num_episodes > 0 and dataset.num_episodes >= target_num_episodes
 
 
 def _capture_episode_frames(
@@ -1090,13 +1101,24 @@ def _capture_episode_frames(
                     EpisodeCaptureComplete(
                         EpisodeRecordResult(
                             recorded_frames=frame_index,
-                            stop_action=EpisodeStopAction.DISCARD_EARLY,
+                            stop_action=EpisodeStopAction.EXIT,
                         )
                     )
                 )
                 return
 
             pressed = _read_terminal_key_nonblocking()
+            if pressed == "esc":
+                logging.info("Detected Esc during recording; stopping recording session.")
+                output_queue.put(
+                    EpisodeCaptureComplete(
+                        EpisodeRecordResult(
+                            recorded_frames=frame_index,
+                            stop_action=EpisodeStopAction.EXIT,
+                        )
+                    )
+                )
+                return
             if pressed == "s":
                 logging.info("Detected 's' during recording; stopping early and saving the episode.")
                 output_queue.put(
@@ -1194,7 +1216,7 @@ def _record_episode(
 
     with _terminal_cbreak_mode() as keyboard_enabled:
         if keyboard_enabled:
-            print("Recording... press 's' to stop+save now, or 'n' to stop+discard now.")
+            print("Recording... press 's' to stop+save, 'n' to stop+discard, or Esc to exit.")
 
         capture_thread = Thread(
             target=_capture_episode_frames,
@@ -1321,7 +1343,7 @@ def record(cfg: HandheldRecordingConfig) -> LeRobotDataset:
 
         attempted_episodes = 0
         with VideoEncodingManager(dataset):
-            while dataset.num_episodes < cfg.dataset.num_episodes:
+            while not _recording_target_reached(dataset, cfg.dataset.num_episodes):
                 attempted_episodes += 1
                 _wait_for_enter(attempted_episodes, cfg.play_sounds)
 
@@ -1349,7 +1371,8 @@ def record(cfg: HandheldRecordingConfig) -> LeRobotDataset:
                         dataset.save_episode()
                         print(
                             "Episode saved early by 's'. "
-                            f"Total saved episodes: {dataset.num_episodes}/{cfg.dataset.num_episodes}"
+                            f"Total saved episodes: {dataset.num_episodes}/"
+                            f"{_format_target_episodes(cfg.dataset.num_episodes)}"
                         )
                     else:
                         logging.warning("Received 's' but no frames were recorded; discarding empty episode.")
@@ -1364,9 +1387,19 @@ def record(cfg: HandheldRecordingConfig) -> LeRobotDataset:
                     print("Episode discarded early by 'n'.")
                     continue
 
+                if record_result.stop_action == EpisodeStopAction.EXIT:
+                    if _has_episode_data(dataset):
+                        dataset.clear_episode_buffer(delete_images=len(dataset.meta.image_keys) > 0)
+                    print("Recording stopped by Esc. Current episode discarded.")
+                    break
+
                 if _confirm_keep_episode(cfg.play_sounds):
                     dataset.save_episode()
-                    print(f"Episode saved. Total saved episodes: {dataset.num_episodes}/{cfg.dataset.num_episodes}")
+                    print(
+                        "Episode saved. "
+                        f"Total saved episodes: {dataset.num_episodes}/"
+                        f"{_format_target_episodes(cfg.dataset.num_episodes)}"
+                    )
                 else:
                     dataset.clear_episode_buffer(delete_images=len(dataset.meta.image_keys) > 0)
                     print("Episode discarded.")

@@ -17,7 +17,8 @@
 from __future__ import annotations
 
 import sys
-from threading import Lock
+from queue import Queue
+from threading import Event, Lock
 from types import SimpleNamespace
 
 import numpy as np
@@ -338,6 +339,84 @@ def test_wait_for_soft_sync_samples_selects_nearest_buffered_samples():
     assert selection.samples["camera.front"].value == "near"
     assert selection.samples["handheld_gripper.pika"].value == 12.0
     assert selection.result.max_skew_s == pytest.approx(0.01)
+
+
+def test_dataset_num_episodes_zero_means_unlimited():
+    cfg = handheld_record.HandheldDatasetConfig(
+        repo_id="local/test",
+        single_task="demo",
+        num_episodes=0,
+    )
+
+    assert cfg.num_episodes == 0
+    dataset = SimpleNamespace(num_episodes=999)
+    assert handheld_record._recording_target_reached(dataset, cfg.num_episodes) is False
+    assert handheld_record._format_target_episodes(cfg.num_episodes) == "unlimited"
+
+
+def test_dataset_num_episodes_rejects_negative_values():
+    with pytest.raises(ValueError, match="num_episodes.*>= 0"):
+        handheld_record.HandheldDatasetConfig(
+            repo_id="local/test",
+            single_task="demo",
+            num_episodes=-1,
+        )
+
+
+def test_recording_target_reached_only_for_positive_episode_limit():
+    assert handheld_record._recording_target_reached(SimpleNamespace(num_episodes=2), 3) is False
+    assert handheld_record._recording_target_reached(SimpleNamespace(num_episodes=3), 3) is True
+    assert handheld_record._recording_target_reached(SimpleNamespace(num_episodes=4), 3) is True
+
+
+def test_read_terminal_key_nonblocking_maps_escape(monkeypatch):
+    class FakeStdin:
+        def isatty(self):
+            return True
+
+        def fileno(self):
+            return 0
+
+    monkeypatch.setattr(handheld_record.sys, "stdin", FakeStdin())
+    monkeypatch.setattr(handheld_record.select, "select", lambda *args, **kwargs: ([0], [], []))
+    monkeypatch.setattr(handheld_record.os, "read", lambda fd, size: b"\x1b")
+
+    assert handheld_record._read_terminal_key_nonblocking() == "esc"
+
+
+def test_capture_episode_frames_escape_returns_exit_without_frame(monkeypatch):
+    cfg = handheld_record.HandheldRecordingConfig(
+        sensors=handheld_record.HandheldSensorsConfig(
+            cameras={"front": object()},
+            soft_sync=handheld_record.HandheldSoftSyncConfig(enabled=False),
+        ),
+        dataset=handheld_record.HandheldDatasetConfig(
+            repo_id="local/test",
+            single_task="demo",
+            fps=30,
+            episode_time_s=1.0,
+            num_episodes=0,
+        ),
+    )
+    output_queue = Queue()
+
+    monkeypatch.setattr(handheld_record, "_read_terminal_key_nonblocking", lambda: "esc")
+
+    handheld_record._capture_episode_frames(
+        cfg=cfg,
+        cameras={"front": object()},
+        tactiles={},
+        handheld_grippers={},
+        soft_sync_buffers={},
+        output_queue=output_queue,
+        stop_event=Event(),
+    )
+
+    item = output_queue.get_nowait()
+    assert isinstance(item, handheld_record.EpisodeCaptureComplete)
+    assert item.result is not None
+    assert item.result.recorded_frames == 0
+    assert item.result.stop_action == handheld_record.EpisodeStopAction.EXIT
 
 
 def test_build_handheld_tactile_observation_rejects_unexpected_shape():

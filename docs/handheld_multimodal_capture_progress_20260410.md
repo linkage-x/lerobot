@@ -38,6 +38,7 @@ The following capture-path fixes have been applied in-repo:
 - Paxini tactile config now uses `connect_ids` only
 - The example config now leaves Paxini tactile commented out so camera + Pika smoke runs do not require the tactile controller
 - During an interactive TTY recording, press `s` to stop and save the current episode immediately, or `n` to stop and discard it immediately
+- `dataset.num_episodes=0` means unlimited saved episodes; press Esc while recording to stop the session.
 - Handheld recording now supports host-clock soft synchronization before each dataset row:
   - `sensors.soft_sync.enabled`
   - `sensors.soft_sync.tolerance_ms`
@@ -77,6 +78,7 @@ Current `tools/handheld/handheld_record_example.yaml` assumptions:
   - `poll_interval_ms`: `1.0`
   - `buffer_duration_s`: `0.25`
 - `dataset.capture_queue_size`: `16`
+- `dataset.num_episodes`: `0` means unlimited; positive values stop after that many saved episodes.
 - Hikrobot cameras:
   - `cam_0`: `DA9342700`
   - `cam_1`: `DA9342716`
@@ -113,7 +115,7 @@ uv run --python .venv/bin/python python tools/handheld/handheld_record.py \
   --config_path tools/handheld/handheld_record_example.yaml \
   --display_data false \
   --dataset.root "${DATASET_ROOT}" \
-  --dataset.num_episodes 3 \
+  --dataset.num_episodes 0 \
   --dataset.episode_time_s 10
 ```
 
@@ -122,8 +124,9 @@ Notes:
 - The script waits for Enter before each episode.
 - While an episode is recording in an interactive terminal, press `s` to stop and save that episode immediately.
 - While an episode is recording in an interactive terminal, press `n` to stop and discard that episode immediately.
+- While an episode is recording in an interactive terminal, press Esc to stop the recording session and discard the current in-progress episode.
 - If the episode reaches `dataset.episode_time_s`, confirm `Save current episode? [Y/n]:`.
-- `dataset.num_episodes` counts saved episodes. Discarded attempts do not advance the saved episode count.
+- `dataset.num_episodes` counts saved episodes. `0` means unlimited saved episodes; discarded attempts do not advance the saved episode count.
 - The early-stop shortcuts require a TTY. In non-interactive stdin environments, recording runs to the configured duration and then uses the normal save prompt when input is available.
 - Paxini tactile is disabled in `tools/handheld/handheld_record_example.yaml`. Uncomment `sensors.tactiles.paxini` before running if tactile data should be included.
 - Soft sync is enabled by default. It buffers timestamped samples per device, waits for each device to reach the current dataset-row target time within `sensors.soft_sync.tolerance_ms`, then records the buffered sample nearest to the target time.

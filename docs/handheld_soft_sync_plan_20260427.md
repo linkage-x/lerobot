@@ -26,6 +26,14 @@ Add `sensors.soft_sync` to `tools/handheld/handheld_record_example.yaml`:
 - `poll_interval_ms`: polling interval while waiting for timestamps to reach the target.
 - `buffer_duration_s`: per-device timestamped sample history retained for nearest-target selection.
 
+Recording session control:
+
+- `dataset.num_episodes = 0`: record unlimited saved episodes.
+- `dataset.num_episodes > 0`: stop after that many saved episodes.
+- `s`: stop and save the current episode immediately.
+- `n`: stop and discard the current episode immediately.
+- `Esc`: stop the recording session and discard the current in-progress episode.
+
 Initial defaults:
 
 - `enabled: true`
