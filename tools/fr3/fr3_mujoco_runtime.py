@@ -272,6 +272,7 @@ def build_runtime_teleop_config(
             clutch_source=args.quest3_clutch_source,
             clutch_threshold=args.quest3_clutch_threshold,
             gripper_mapping=Quest3GripperMapping(args.quest3_gripper_mapping),
+            initial_gripper=1.0 if args.quest3_use_hand_tracking else 0.0,
             open_pinch_value=args.quest3_open_pinch_value,
             closed_pinch_value=args.quest3_closed_pinch_value,
             open_fingertip_distance_m=args.quest3_open_fingertip_distance_m,

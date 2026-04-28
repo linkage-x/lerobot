@@ -74,7 +74,7 @@ class Quest3Teleop(Teleoperator):
         self._last_clutch_active = False
         self._last_gripper = float(np.clip(config.initial_gripper, 0.0, 1.0))
         self._filtered_gripper = self._last_gripper
-        self._last_filtered_gripper_time = float("-inf")
+        self._last_filtered_gripper_time = time.perf_counter()
         self._last_hand_parse_warning_s = float("-inf")
         self._last_controller_parse_warning_s = float("-inf")
         self._controller_mats: dict[str, np.ndarray] = {
@@ -370,9 +370,11 @@ class Quest3Teleop(Teleoperator):
     def _controller_gripper(self, right_states: dict[str, float | bool], left_states: dict[str, float | bool]) -> float:
         r_trigger = float(right_states.get("trigger", 0.0))
         l_trigger = float(left_states.get("trigger", 0.0))
-        if r_trigger > 0.01 or l_trigger > 0.01:
-            return float(np.clip(1.0 - r_trigger + l_trigger, 0.0, 1.0))
-        return float(np.clip(self._filtered_gripper, 0.0, 1.0))
+        if r_trigger > 0.01:
+            return 1.0
+        if l_trigger > 0.01:
+            return 0.0
+        return 0.0
 
     def _compute_incremental_deltas(
         self,

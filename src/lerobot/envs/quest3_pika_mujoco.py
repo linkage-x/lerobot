@@ -39,7 +39,8 @@ class Quest3PikaMujocoEnvConfig(FR3MujocoEnvConfig):
     quest3_follow_orientation: bool = True
     quest3_rotation_alignment_xyzw: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
     quest3_fixed_tcp_quat_xyzw: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 0.0)
-    initial_tcp_position: tuple[float, float, float] = (0.48, 0.0, 0.45)
+    initial_tcp_position: tuple[float, float, float] = (0.48, 0.0, 0.37)
+    initial_gripper: float = 0.0
     workspace_min: tuple[float, float, float] = (0.20, -0.80, -0.20)
     workspace_max: tuple[float, float, float] = (1.10, 0.80, 1.40)
     continuous_physics_frequency: float | None = 500.0
@@ -49,7 +50,7 @@ class Quest3PikaMujocoEnvConfig(FR3MujocoEnvConfig):
     quest3_env_max_step_rot_rad: float = 3.14
     quest3_env_filter_alpha_pos: float = 1.0
     quest3_env_filter_alpha_rot: float = 1.0
-    quest3_gripper_binary: bool = True
+    quest3_gripper_binary: bool = False
     quest3_gripper_binary_threshold: float = 0.5
 
 
@@ -85,8 +86,8 @@ class Quest3PikaMujocoEnv(gym.Env):
         self._workspace_object_geom_id = self._geom_id("workspace_object")
         self._gripper_left_geom_id = self._geom_id("gripper_left_collision")
         self._gripper_right_geom_id = self._geom_id("gripper_right_collision")
-        self._gripper_left_pad_geom_id = -1
-        self._gripper_right_pad_geom_id = -1
+        self._gripper_left_pad_geom_id = self._geom_id("gripper_left_pad_collision")
+        self._gripper_right_pad_geom_id = self._geom_id("gripper_right_pad_collision")
 
         self._mocap_id = int(self.model.body_mocapid[self._gripper_base_body_id])
         if self._mocap_id < 0:
