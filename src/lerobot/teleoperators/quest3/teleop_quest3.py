@@ -369,12 +369,10 @@ class Quest3Teleop(Teleoperator):
 
     def _controller_gripper(self, right_states: dict[str, float | bool], left_states: dict[str, float | bool]) -> float:
         r_trigger = float(right_states.get("trigger", 0.0))
-        l_trigger = float(left_states.get("trigger", 0.0))
+        del left_states
         if r_trigger > 0.01:
-            return 0.0
-        if l_trigger > 0.01:
             return 1.0
-        return 1.0
+        return 0.0
 
     def _compute_incremental_deltas(
         self,

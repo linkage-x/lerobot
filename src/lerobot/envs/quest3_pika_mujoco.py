@@ -51,6 +51,7 @@ class Quest3PikaMujocoEnvConfig(FR3MujocoEnvConfig):
     quest3_env_max_step_rot_rad: float = 3.14
     quest3_env_filter_alpha_pos: float = 1.0
     quest3_env_filter_alpha_rot: float = 1.0
+    quest3_gripper_close_settle_steps: int = 120
     quest3_gripper_binary: bool = False
     quest3_gripper_binary_threshold: float = 0.5
 
@@ -485,7 +486,11 @@ class Quest3PikaMujocoEnv(gym.Env):
             previous_gripper = self._last_gripper
             self._last_gripper = float(np.clip(action.get("gripper", self._last_gripper), 0.0, 1.0))
             if not np.isclose(previous_gripper, self._last_gripper):
-                self._set_gripper_command(self._last_gripper)
+                self._set_gripper_command(self._last_gripper, simulate=not self.cfg.continuous_physics)
+                if self.cfg.continuous_physics and self._last_gripper < previous_gripper:
+                    settle_steps = max(int(self.cfg.quest3_gripper_close_settle_steps), 0)
+                    if settle_steps > 0:
+                        self._step_physics(settle_steps)
 
             if not self.cfg.continuous_physics:
                 duration = self.cfg.teleop_dt if control_period_s is None else max(float(control_period_s), 0.0)
