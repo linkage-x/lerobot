@@ -23,8 +23,12 @@
     <material name="button_green" rgba="0.102241 0.571125 0.102242 1"/>
     <material name="button_red" rgba="0.520996 0.008023 0.013702 1"/>
     <material name="button_blue" rgba="0.024157 0.445201 0.737911 1"/>
-    <texture name="charuco_300_texture" type="2d" file="assets/charuco_300.png"/>
-    <material name="charuco_300_board" texture="charuco_300_texture" specular="0.1" reflectance="0"/>
+    <texture name="charuco_300_board_1_texture" type="2d" file="assets/charuco_300_dict5x5_1000_board_1.png"/>
+    <texture name="charuco_300_board_2_texture" type="2d" file="assets/charuco_300_dict5x5_1000_board_2.png"/>
+    <texture name="charuco_300_board_3_texture" type="2d" file="assets/charuco_300_dict5x5_1000_board_3.png"/>
+    <material name="charuco_300_board_1" texture="charuco_300_board_1_texture" specular="0.1" reflectance="0"/>
+    <material name="charuco_300_board_2" texture="charuco_300_board_2_texture" specular="0.1" reflectance="0"/>
+    <material name="charuco_300_board_3" texture="charuco_300_board_3_texture" specular="0.1" reflectance="0"/>
 
     <mesh name="link0_0" file="link0_0.obj"/>
     <mesh name="link0_1" file="link0_1.obj"/>
@@ -149,12 +153,20 @@
                              and y aligns with base -y at the nominal reset pose. This is a -45deg local-z rotation
                              relative to gripper_base. -->
                         <body name="pika_task_tcp" pos="0 0 0.366842" quat="0.92387953 0 0 -0.38268343">
-                          <!-- ChArUco-300 board: 14x9 squares, 20 mm square, 15 mm marker, DICT_5X5_100.
-                               Fixed transform from hikon_fixed_camera_in_base_from_moving_charuco
-                               joint_solution.tool_to_board. Board origin is the OpenCV ChArUco object frame. -->
-                          <body name="charuco_300_board" pos="0.089891842 -0.289594829 -0.010731971" quat="0.918198920 -0.019022678 0.006583592 0.395607807">
+                          <!-- ChArUco-300 boards: 14x9 squares, 20 mm square, 15 mm marker, DICT_5X5_1000.
+                               Board 1 uses marker ids 0-62, board 2 uses 100-162, board 3 uses 200-262.
+                               Board origin is the OpenCV ChArUco object frame. -->
+                          <body name="charuco_300_board" pos="0.14 -0.09 0.5" quat="0.70710678 0 0.70710678 0">
                             <geom name="charuco_300_board_visual" type="box" pos="0.14 0.09 0" size="0.14 0.09 0.0015"
-                                  material="charuco_300_board" group="2" contype="0" conaffinity="0"/>
+                                  material="charuco_300_board_1" group="2" contype="0" conaffinity="0"/>
+                            <body name="charuco_300_board_2" pos="0 0.18 0" quat="0.86602540 -0.5 0 0">
+                              <geom name="charuco_300_board_2_visual" type="box" pos="0.14 0.09 0" size="0.14 0.09 0.0015"
+                                    material="charuco_300_board_2" group="2" contype="0" conaffinity="0"/>
+                            </body>
+                            <body name="charuco_300_board_3" pos="0 -0.09 -0.15588457" quat="0.86602540 0.5 0 0">
+                              <geom name="charuco_300_board_3_visual" type="box" pos="0.14 0.09 0" size="0.14 0.09 0.0015"
+                                    material="charuco_300_board_3" group="2" contype="0" conaffinity="0"/>
+                            </body>
                           </body>
                         </body>
                       </body>

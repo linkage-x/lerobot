@@ -103,7 +103,8 @@ class FR3MujocoEnvConfig:
     camera_height: int = 256
     camera_width: int = 256
     enable_cameras: bool = False
-    initial_joint_positions: tuple[float, ...] = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
+    # initial_joint_positions: tuple[float, ...] = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
+    initial_joint_positions: tuple[float, ...] = (0.0, -0.785, 0.0, -2.356, 0.0, 3.14, 0.785)
     initial_gripper: float = 1.0
     gripper_sim_steps: int = 640
     workspace_min: tuple[float, float, float] = (0.2, -0.6, 0.05)
