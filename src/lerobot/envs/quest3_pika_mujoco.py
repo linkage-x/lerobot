@@ -272,6 +272,38 @@ class Quest3PikaMujocoEnv(gym.Env):
         self._mujoco.mj_forward(self.model, self.data)
         if simulate:
             self._step_physics(max(int(self.cfg.gripper_sim_steps), 1))
+        self._debug_gripper_state(gripper_command)
+
+    def _debug_gripper_state(self, command: float) -> None:
+        import numpy as np
+
+        left_qpos = self._gripper_joint_indices["left"]
+        right_qpos = self._gripper_joint_indices["right"]
+        act_id = self._gripper_actuator_id
+        ctrl_val = float(self.data.ctrl[act_id])
+        left_val = float(self.data.qpos[left_qpos])
+        right_val = float(self.data.qpos[right_qpos])
+        force_val = float(self.data.actuator_force[act_id])
+        ten_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_TENDON, "split")
+        ten_len = float(self.data.ten_length[ten_id]) if ten_id >= 0 else 0.0
+
+        contact_pairs = []
+        for i in range(self.data.ncon):
+            c = self.data.contact[i]
+            g1 = self._mujoco.mj_id2name(self.model, self._mujoco.mjtObj.mjOBJ_GEOM, c.geom1)
+            g2 = self._mujoco.mj_id2name(self.model, self._mujoco.mjtObj.mjOBJ_GEOM, c.geom2)
+            if g1 is not None and g2 is not None and "workspace_object" in (g1, g2):
+                f = np.zeros(6, dtype=np.float64)
+                self._mujoco.mj_contactForce(self.model, self.data, i, f)
+                contact_pairs.append(f"{g1}<->{g2} dist={c.dist:.4f} force={f[:3]}")
+
+        if contact_pairs:
+            print(
+                f"[GRIPPER_DEBUG] cmd={command:.3f} ctrl={ctrl_val:.4f} "
+                f"left={left_val:.4f} right={right_val:.4f} "
+                f"tendon_len={ten_len:.4f} force={force_val:.2f} "
+                f"contacts=[{'; '.join(contact_pairs)}]"
+            )
 
     def _step_physics(self, steps: int) -> None:
         for _ in range(max(int(steps), 1)):
