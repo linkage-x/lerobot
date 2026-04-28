@@ -371,10 +371,10 @@ class Quest3Teleop(Teleoperator):
         r_trigger = float(right_states.get("trigger", 0.0))
         l_trigger = float(left_states.get("trigger", 0.0))
         if r_trigger > 0.01:
-            return 1.0
-        if l_trigger > 0.01:
             return 0.0
-        return 0.0
+        if l_trigger > 0.01:
+            return 1.0
+        return 1.0
 
     def _compute_incremental_deltas(
         self,

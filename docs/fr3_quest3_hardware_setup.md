@@ -154,6 +154,9 @@ uv run --extra fr3_teleop python tools/fr3/fr3_mujoco_record.py \
 
 `--quest3-scene-mode pika_gripper` is the default when `teleop.type=quest3`. Use `--quest3-scene-mode fr3_arm` only when you want Quest3 to drive the original full FR3 arm scene.
 
+For current Quest3 Pika-only collision and gripper tuning findings, see
+[`fr3_quest3_pika_mujoco_collision_findings_20260428.md`](./fr3_quest3_pika_mujoco_collision_findings_20260428.md).
+
 Default VR-to-scene alignment:
 
 - The first valid Quest3 wrist pose is mapped to the initial Pika TCP pose.

@@ -37,10 +37,11 @@ class Quest3PikaMujocoEnvConfig(FR3MujocoEnvConfig):
     quest3_recenter_on_first_tracking: bool = True
     quest3_incremental_mode: bool = True
     quest3_follow_orientation: bool = True
+    quest3_lock_roll_pitch: bool = True
     quest3_rotation_alignment_xyzw: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
     quest3_fixed_tcp_quat_xyzw: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 0.0)
-    initial_tcp_position: tuple[float, float, float] = (0.48, 0.0, 0.37)
-    initial_gripper: float = 0.0
+    initial_tcp_position: tuple[float, float, float] = (0.48, 0.0, 0.55)
+    initial_gripper: float = 1.0
     workspace_min: tuple[float, float, float] = (0.20, -0.80, -0.20)
     workspace_max: tuple[float, float, float] = (1.10, 0.80, 1.40)
     continuous_physics_frequency: float | None = 500.0
@@ -86,8 +87,6 @@ class Quest3PikaMujocoEnv(gym.Env):
         self._workspace_object_geom_id = self._geom_id("workspace_object")
         self._gripper_left_geom_id = self._geom_id("gripper_left_collision")
         self._gripper_right_geom_id = self._geom_id("gripper_right_collision")
-        self._gripper_left_pad_geom_id = self._geom_id("gripper_left_pad_collision")
-        self._gripper_right_pad_geom_id = self._geom_id("gripper_right_pad_collision")
 
         self._mocap_id = int(self.model.body_mocapid[self._gripper_base_body_id])
         if self._mocap_id < 0:
@@ -225,7 +224,8 @@ class Quest3PikaMujocoEnv(gym.Env):
                 dtype=np.float64,
             )
             if np.linalg.norm(wrist_quat) > 1e-6 and np.all(np.isfinite(wrist_quat)):
-                pose[:3, :3] = (Rotation.from_quat(wrist_quat) * self._rotation_alignment).as_matrix()
+                target_rotation = Rotation.from_quat(wrist_quat) * self._rotation_alignment
+                pose[:3, :3] = self._yaw_only_tcp_rotation(target_rotation).as_matrix()
             else:
                 pose[:3, :3] = self._fixed_tcp_rotation.as_matrix()
         else:
@@ -344,6 +344,18 @@ class Quest3PikaMujocoEnv(gym.Env):
     def _quat_xyzw_to_wxyz(self, quat_xyzw: np.ndarray) -> np.ndarray:
         return np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=np.float64)
 
+    def _yaw_only_rotvec(self, rotvec: np.ndarray) -> np.ndarray:
+        if not self.cfg.quest3_lock_roll_pitch:
+            return rotvec
+        return np.array([0.0, 0.0, float(rotvec[2])], dtype=np.float64)
+
+    def _yaw_only_tcp_rotation(self, rotation: Rotation) -> Rotation:
+        if not self.cfg.quest3_lock_roll_pitch:
+            return rotation
+        matrix = rotation.as_matrix()
+        yaw = float(np.arctan2(matrix[1, 0], matrix[0, 0]))
+        return Rotation.from_rotvec(np.array([0.0, 0.0, yaw], dtype=np.float64)) * self._fixed_tcp_rotation
+
     def _apply_env_filtering(self, dp: np.ndarray, dr_rotvec: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         norm_p = float(np.linalg.norm(dp))
         deadband_p = float(self.cfg.quest3_env_deadband_m)
@@ -402,7 +414,7 @@ class Quest3PikaMujocoEnv(gym.Env):
         if self._mocap_baseline_pos is None or self._mocap_baseline_quat_wxyz is None:
             return
 
-        dp, dr = self._apply_env_filtering(delta_pos.copy(), delta_rotvec.copy())
+        dp, dr = self._apply_env_filtering(delta_pos.copy(), self._yaw_only_rotvec(delta_rotvec.copy()))
         p_target = self._mocap_baseline_pos + dp
         p_target = np.clip(p_target, self._workspace_min, self._workspace_max)
 

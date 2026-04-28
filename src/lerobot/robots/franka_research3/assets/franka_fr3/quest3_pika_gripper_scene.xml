@@ -29,7 +29,6 @@
     <material name="table_surface" rgba="0.38 0.28 0.22 1"/>
     <material name="workspace_object_material" rgba="0.85 0.25 0.18 1"/>
     <material name="peg_hole_material" rgba="0.18 0.55 0.72 1"/>
-    <material name="gripper_pad_debug" rgba="0.15 0.85 0.35 0.35"/>
     <material name="black" rgba=".2 .2 .2 1"/>
     <material name="white" rgba="1 1 1 1"/>
 
@@ -71,7 +70,7 @@
 
     <body name="workspace_object_body" pos="0.48 0.00 0.44">
       <freejoint/>
-      <geom name="workspace_object" type="box" size="0.025 0.025 0.04" material="workspace_object_material" density="150" friction="3.0 0.2 0.04" condim="4"/>
+      <geom name="workspace_object" type="box" size="0.025 0.025 0.04" material="workspace_object_material" density="500" friction="1.8 0.05 0.01" condim="4"/>
     </body>
 
     <body name="gripper_base" mocap="true" pos="0.48 0 0.083158" quat="1 0 0 0" childclass="pika">
@@ -90,17 +89,13 @@
         <inertial pos="0.033255 -0.014661 -0.0057614" quat="0.606445 0.607197 0.362695 0.363302" mass="0.033674" diaginertia="4.22483e-05 3.9744e-05 7.51567e-06"/>
         <joint name="gripper_left_joint" pos="0 0 0" axis="0 1 0" type="slide" range="-0.05 0" actuatorfrcrange="-100 100"/>
         <geom type="mesh" material="black" class="visual" mesh="pika_gripper_left_link"/>
-        <geom name="gripper_left_collision" type="mesh" mesh="pika_gripper_left_link" class="collision" contype="0" conaffinity="0"/>
-        <geom name="gripper_left_pad_collision" type="box" pos="0.03785 -0.01748 -0.00575" quat="0.25564 -0.659279 0.25564 -0.659279" size="0.032 0.018 0.038" class="collision" friction="8.0 1.0 0.1" condim="4" solref="0.001 0.6" solimp="0.995 0.9995 0.00005" priority="3"/>
-        <geom name="gripper_left_pad_visual" type="box" pos="0.03785 -0.01748 -0.00575" quat="0.25564 -0.659279 0.25564 -0.659279" size="0.032 0.018 0.038" material="gripper_pad_debug" class="visual"/>
+        <geom name="gripper_left_collision" type="mesh" mesh="pika_gripper_left_link" class="collision" friction="2.0 0.4 0.03" condim="4" solref="0.001 0.6" solimp="0.995 0.9995 0.00005" priority="2"/>
       </body>
       <body name="gripper_right_link" pos="0.0634224 0.0610601 0.258" quat="0.25564 0.659279 -0.25564 0.659279">
         <inertial pos="0.033255 0.014661 -0.0058113" quat="0.362693 0.363304 0.606443 0.607199" mass="0.033674" diaginertia="4.22483e-05 3.9744e-05 7.51567e-06"/>
         <joint name="gripper_right_joint" pos="0 0 0" axis="0 1 0" type="slide" range="0 0.05" actuatorfrcrange="-100 100"/>
         <geom type="mesh" material="black" class="visual" mesh="pika_gripper_right_link"/>
-        <geom name="gripper_right_collision" type="mesh" mesh="pika_gripper_right_link" class="collision" contype="0" conaffinity="0"/>
-        <geom name="gripper_right_pad_collision" type="box" pos="0.03785 0.01748 -0.00581" quat="0.25564 -0.659279 0.25564 -0.659279" size="0.032 0.018 0.038" class="collision" friction="8.0 1.0 0.1" condim="4" solref="0.001 0.6" solimp="0.995 0.9995 0.00005" priority="3"/>
-        <geom name="gripper_right_pad_visual" type="box" pos="0.03785 0.01748 -0.00581" quat="0.25564 -0.659279 0.25564 -0.659279" size="0.032 0.018 0.038" material="gripper_pad_debug" class="visual"/>
+        <geom name="gripper_right_collision" type="mesh" mesh="pika_gripper_right_link" class="collision" friction="2.0 0.4 0.03" condim="4" solref="0.001 0.6" solimp="0.995 0.9995 0.00005" priority="2"/>
       </body>
     </body>
   </worldbody>
@@ -122,6 +117,6 @@
   </equality>
 
   <actuator>
-    <position name="pika_gripper_actuator" tendon="split" ctrlrange="-0.11 0" kp="300" dampratio="1"/>
+    <position name="pika_gripper_actuator" tendon="split" ctrlrange="-0.11 0" kp="50" dampratio="1"/>
   </actuator>
 </mujoco>
