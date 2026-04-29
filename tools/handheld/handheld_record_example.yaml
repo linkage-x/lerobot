@@ -123,19 +123,18 @@ sensors:
       timeout_ms: 1000
     # Placeholder camera config for a future Pika Sense-associated RGB stream via OpenCV.
     # Replace these fields with the real camera entry once the actual Pika Sense camera API is wired in.
-    pika_left_opencv:
+    pika_right_opencv:
       type: opencv
-      index_or_path: /dev/video7
+      index_or_path: /dev/video14
       width: 640
       height: 480
       fps: 30
       color_mode: rgb
       warmup_s: 1
       fourcc: MJPG
-
-    pika_right_opencv:
+    pika_left_opencv:
       type: opencv
-      index_or_path: /dev/video15
+      index_or_path: /dev/video12
       width: 640
       height: 480
       fps: 30
@@ -173,12 +172,12 @@ sensors:
   handheld_grippers:
     pika_right:
       type: pika_sense
-      port: /dev/ttyUSB1
+      port: /dev/ttyUSB0
       fps: 120
       warmup_s: 1.0
     pika_left:
       type: pika_sense
-      port: /dev/ttyUSB2
+      port: /dev/ttyUSB1
       fps: 120
       warmup_s: 1.0
 

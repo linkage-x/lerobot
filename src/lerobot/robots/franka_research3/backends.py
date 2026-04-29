@@ -262,6 +262,7 @@ class PikaGripperHardwareDriver:
     max_width_mm: float = 90.0
     command_rate_limit_hz: float | None = 15.0
     command_deadband_mm: float = 0.5
+    enable_settle_s: float = 0.5
 
     def __post_init__(self):
         _silence_pika_logs()
@@ -285,6 +286,8 @@ class PikaGripperHardwareDriver:
             raise ConnectionError(f"Could not connect to Pika gripper on {self.serial_port}.")
         if not self._gripper.enable():
             raise ConnectionError("Could not enable the Pika gripper.")
+        if self.enable_settle_s > 0.0:
+            time.sleep(float(self.enable_settle_s))
 
     def disconnect(self) -> None:
         if self._gripper is not None:
