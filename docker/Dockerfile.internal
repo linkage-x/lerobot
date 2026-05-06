@@ -21,7 +21,7 @@
 # TODO(Steven): Bump these versions
 ARG CUDA_VERSION=12.4.1
 ARG OS_VERSION=22.04
-FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu${OS_VERSION}
+FROM hub.rat.dev/nvidia/cuda:${CUDA_VERSION}-base-ubuntu${OS_VERSION}
 
 ARG UBUNTU_MIRROR=https://mirrors.aliyun.com
 ARG UBUNTU_SECURITY_MIRROR=https://mirrors.aliyun.com
@@ -118,9 +118,9 @@ RUN resolved_extra="${PIP_EXTRA_INDEX_URL}"; \
       resolved_extra="${PIP_FALLBACK_INDEX_URL}"; \
     fi; \
     if [ -n "${resolved_extra}" ] && [ "${resolved_extra}" != "${PIP_INDEX_URL}" ]; then \
-      uv pip install --default-index "${PIP_INDEX_URL}" --index "${resolved_extra}" --no-cache ".[all]"; \
+      uv pip install --default-index "${PIP_INDEX_URL}" --index "${resolved_extra}" --no-cache ".[all,fr3_teleop]"; \
     else \
-      uv pip install --default-index "${PIP_INDEX_URL}" --no-cache ".[all]"; \
+      uv pip install --default-index "${PIP_INDEX_URL}" --no-cache ".[all,fr3_teleop]"; \
     fi
 
 USER root
@@ -194,7 +194,8 @@ RUN resolved_extra="${PIP_EXTRA_INDEX_URL}"; \
     && python -c "from pika.gripper import Gripper; print('pika_gripper_ok')" \
     && PYTHONPATH="$(dirname "${GEN_CON_SDK_HOME}")" python -c "from gen_con_sdk_python_release import DataBus; print('gen_con_sdk_ok')" \
     && python -c "import ruckig; print('ruckig_ok')" \
-    && python -c "import pyspacemouse; print('pyspacemouse_ok')"
+    && python -c "import pyspacemouse; print('pyspacemouse_ok')" \
+    && python -c "import vuer; print('vuer_ok')"
 
 RUN chmod +x /lerobot/.venv/lib/python${PYTHON_VERSION}/site-packages/triton/backends/nvidia/bin/ptxas
 

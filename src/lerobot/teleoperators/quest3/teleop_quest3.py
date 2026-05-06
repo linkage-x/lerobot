@@ -88,6 +88,7 @@ class Quest3Teleop(Teleoperator):
         self._controller_last_update_s: dict[str, float] = {"left": float("-inf"), "right": float("-inf")}
         self._clutch_baseline_vr_pos: np.ndarray | None = None
         self._clutch_baseline_vr_rot: Rotation | None = None
+        self._prev_controller_pose: np.ndarray | None = None
         self._prev_delta_pos: np.ndarray | None = None
         self._prev_delta_rotvec: np.ndarray | None = None
 
@@ -135,6 +136,7 @@ class Quest3Teleop(Teleoperator):
         self._baseline_pose = None
         self._clutch_baseline_vr_pos = None
         self._clutch_baseline_vr_rot = None
+        self._prev_controller_pose = None
         self._prev_delta_pos = None
         self._prev_delta_rotvec = None
 
@@ -371,8 +373,8 @@ class Quest3Teleop(Teleoperator):
         r_trigger = float(right_states.get("trigger", 0.0))
         del left_states
         if r_trigger > 0.01:
-            return 1.0
-        return 0.0
+            return 0.0
+        return 1.0
 
     def _compute_incremental_deltas(
         self,
@@ -488,6 +490,7 @@ class Quest3Teleop(Teleoperator):
         if not tracking_valid:
             self._baseline_pose = None
             self._last_clutch_active = False
+            self._prev_controller_pose = None
             self._prev_delta_pos = None
             self._prev_delta_rotvec = None
             return self._zero_action()
@@ -499,6 +502,7 @@ class Quest3Teleop(Teleoperator):
         if not clutch_active:
             self._baseline_pose = None
             self._last_clutch_active = False
+            self._prev_controller_pose = None
             self._prev_delta_pos = None
             self._prev_delta_rotvec = None
             action = self._zero_action()
@@ -512,11 +516,13 @@ class Quest3Teleop(Teleoperator):
             self._clutch_baseline_vr_pos = pose[:3, 3].copy()
             self._clutch_baseline_vr_rot = Rotation.from_matrix(pose[:3, :3])
             self._last_clutch_active = True
+            self._prev_controller_pose = pose.copy()
             self._prev_delta_pos = None
             self._prev_delta_rotvec = None
 
-        dp, dr_rotvec = self._compute_incremental_deltas(pose, self._baseline_pose)
-        dp, dr_rotvec = self._low_pass_filter_deltas(dp, dr_rotvec)
+        previous_pose = pose if self._prev_controller_pose is None else self._prev_controller_pose
+        dp, dr_rotvec = self._compute_incremental_deltas(pose, previous_pose)
+        self._prev_controller_pose = pose.copy()
 
         action = {
             "enabled": True,
@@ -561,6 +567,7 @@ class Quest3Teleop(Teleoperator):
             self._last_clutch_active = False
             self._clutch_baseline_vr_pos = None
             self._clutch_baseline_vr_rot = None
+            self._prev_controller_pose = None
             self._prev_delta_pos = None
             self._prev_delta_rotvec = None
 
