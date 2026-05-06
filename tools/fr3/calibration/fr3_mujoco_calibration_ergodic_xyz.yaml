@@ -61,6 +61,8 @@ calibration:
     ergodic_speed: 0.05
     ergodic_boundary: reflect
     ergodic_device: auto
+    ergodic_plan_only: false
+    pause_after_ergodic_plan: false
 
   camera:
     camera_set: hikon_8

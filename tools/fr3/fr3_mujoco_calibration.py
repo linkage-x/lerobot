@@ -130,6 +130,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="auto",
         help="Device for SMC ergodic trajectory generation. auto uses CUDA when torch reports it available.",
     )
+    parser.add_argument(
+        "--ergodic-plan-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Generate and save the ergodic trajectory visualization/report, then exit before tracking/capture.",
+    )
+    parser.add_argument(
+        "--pause-after-ergodic-plan",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pause after saving the ergodic trajectory preview and before tracking/capture.",
+    )
     parser.add_argument("--cartesian-position-tolerance-m", type=float, default=0.004)
     parser.add_argument("--cartesian-orientation-tolerance-rad", type=float, default=0.05)
     parser.add_argument("--cartesian-max-position-step-m", type=float, default=0.015)
@@ -291,6 +303,8 @@ def _flatten_calibration_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "ergodic_speed",
             "ergodic_boundary",
             "ergodic_device",
+            "ergodic_plan_only",
+            "pause_after_ergodic_plan",
         ),
         "cartesian_impedance": (
             "cartesian_position_tolerance_m",
@@ -985,12 +999,34 @@ def _maybe_hold_for_viewer(args: argparse.Namespace, sample_index: int) -> None:
         input(f"Paused after sample {sample_index}. Press Enter to continue...")
 
 
+def _maybe_pause_after_ergodic_plan(args: argparse.Namespace, ergodic_visualization_files: dict[str, str]) -> None:
+    if not bool(args.pause_after_ergodic_plan):
+        return
+    print(
+        pformat(
+            {
+                "ergodic_plan_ready": True,
+                "ergodic_visualizations": ergodic_visualization_files,
+                "next_step": "tracking_and_capture",
+            }
+        )
+    )
+    try:
+        input("Paused after ergodic planning. Press Enter to start tracking/capture...")
+    except EOFError:
+        print("No stdin available; continuing to tracking/capture.")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.num_samples <= 0:
         raise ValueError("--num-samples must be > 0.")
     if args.dataset_fps <= 0:
         raise ValueError("--dataset-fps must be > 0.")
+    if bool(args.ergodic_plan_only) and not str(args.sample_mode).startswith("ergodic_"):
+        raise ValueError("--ergodic-plan-only requires sample-mode=ergodic_xyz or ergodic_6d.")
+    if bool(args.pause_after_ergodic_plan) and not str(args.sample_mode).startswith("ergodic_"):
+        raise ValueError("--pause-after-ergodic-plan requires sample-mode=ergodic_xyz or ergodic_6d.")
     resolved_motion_mode = _resolve_motion_mode(args)
     explicit_dests = getattr(args, "_explicit_cli_dests", set())
     requested_mujoco_gl = args.mujoco_gl
@@ -1019,6 +1055,51 @@ def main(argv: list[str] | None = None) -> int:
         ergodic_visualization_files: dict[str, str] = {}
         if str(args.sample_mode).startswith("ergodic_"):
             ergodic_targets, ergodic_summary = _build_ergodic_pose_targets(env, args)
+            if bool(args.ergodic_plan_only):
+                ergodic_visualization_files = _save_ergodic_visualization(
+                    targets=ergodic_targets,
+                    ergodic_summary=ergodic_summary,
+                    output_dir=root / "visualizations" / "ergodic",
+                )
+                report_path = args.report_json
+                if report_path is None:
+                    report_path = root / "mujoco_calibration_report.json"
+                _save_report(
+                    report_path.expanduser(),
+                    {
+                        "dataset_root": str(root),
+                        "repo_id": args.repo_id,
+                        "num_samples": int(args.num_samples),
+                        "motion_mode": resolved_motion_mode,
+                        "sample_mode": args.sample_mode,
+                        "ergodic_plan_only": True,
+                        "ergodic": {
+                            key: value
+                            for key, value in ergodic_summary.items()
+                            if key not in {"x_traj", "metric_log"}
+                        },
+                        "ergodic_visualizations": ergodic_visualization_files,
+                    },
+                )
+                print(
+                    pformat(
+                        {
+                            "dataset_root": str(root),
+                            "num_samples": args.num_samples,
+                            "motion_mode": resolved_motion_mode,
+                            "sample_mode": args.sample_mode,
+                            "ergodic_plan_only": True,
+                            "ergodic": {
+                                key: value
+                                for key, value in ergodic_summary.items()
+                                if key not in {"x_traj", "metric_log"}
+                            },
+                            "ergodic_visualizations": ergodic_visualization_files,
+                            "report_json": str(report_path.expanduser()),
+                        }
+                    )
+                )
+                return 0
         selected_viewer_camera = ""
         if args.viewer:
             import mujoco.viewer
@@ -1050,6 +1131,7 @@ def main(argv: list[str] | None = None) -> int:
                 ergodic_summary=ergodic_summary,
                 output_dir=Path(dataset.root) / "visualizations" / "ergodic",
             )
+            _maybe_pause_after_ergodic_plan(args, ergodic_visualization_files)
 
         print(
             pformat(
