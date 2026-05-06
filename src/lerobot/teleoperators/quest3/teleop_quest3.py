@@ -75,6 +75,7 @@ class Quest3Teleop(Teleoperator):
         self._last_gripper = float(np.clip(config.initial_gripper, 0.0, 1.0))
         self._filtered_gripper = self._last_gripper
         self._last_filtered_gripper_time = time.perf_counter()
+        self._controller_gripper_closed = False
         self._last_hand_parse_warning_s = float("-inf")
         self._last_controller_parse_warning_s = float("-inf")
         self._controller_mats: dict[str, np.ndarray] = {
@@ -201,12 +202,15 @@ class Quest3Teleop(Teleoperator):
             "gripper": self._filtered_gripper,
             "tracking_valid": False,
             "clutch_active": False,
+            "delta_is_per_frame": False,
             "delta_x": 0.0,
             "delta_y": 0.0,
             "delta_z": 0.0,
             "delta_wx": 0.0,
             "delta_wy": 0.0,
             "delta_wz": 0.0,
+            "controller_trigger_raw": 0.0,
+            "controller_close_latch": False,
             "wrist_x": 0.0,
             "wrist_y": 0.0,
             "wrist_z": 0.0,
@@ -373,8 +377,8 @@ class Quest3Teleop(Teleoperator):
         r_trigger = float(right_states.get("trigger", 0.0))
         del left_states
         if r_trigger > 0.01:
-            return 0.0
-        return 1.0
+            return 1.0
+        return 0.0
 
     def _compute_incremental_deltas(
         self,
@@ -490,7 +494,6 @@ class Quest3Teleop(Teleoperator):
         if not tracking_valid:
             self._baseline_pose = None
             self._last_clutch_active = False
-            self._prev_controller_pose = None
             self._prev_delta_pos = None
             self._prev_delta_rotvec = None
             return self._zero_action()
@@ -502,12 +505,13 @@ class Quest3Teleop(Teleoperator):
         if not clutch_active:
             self._baseline_pose = None
             self._last_clutch_active = False
-            self._prev_controller_pose = None
             self._prev_delta_pos = None
             self._prev_delta_rotvec = None
             action = self._zero_action()
             action["tracking_valid"] = True
             action["gripper"] = filtered_gripper
+            action["controller_trigger_raw"] = float(states.get("trigger", 0.0))
+            action["controller_close_latch"] = bool(self._controller_gripper_closed)
             action.update(self._wrist_action_fields(pose, tracking_valid=True))
             return action
 
@@ -516,13 +520,10 @@ class Quest3Teleop(Teleoperator):
             self._clutch_baseline_vr_pos = pose[:3, 3].copy()
             self._clutch_baseline_vr_rot = Rotation.from_matrix(pose[:3, :3])
             self._last_clutch_active = True
-            self._prev_controller_pose = pose.copy()
             self._prev_delta_pos = None
             self._prev_delta_rotvec = None
 
-        previous_pose = pose if self._prev_controller_pose is None else self._prev_controller_pose
-        dp, dr_rotvec = self._compute_incremental_deltas(pose, previous_pose)
-        self._prev_controller_pose = pose.copy()
+        dp, dr_rotvec = self._compute_incremental_deltas(pose, self._baseline_pose)
 
         action = {
             "enabled": True,
@@ -535,12 +536,15 @@ class Quest3Teleop(Teleoperator):
             "gripper": filtered_gripper,
             "tracking_valid": True,
             "clutch_active": True,
+            "delta_is_per_frame": False,
             "delta_x": float(dp[0]),
             "delta_y": float(dp[1]),
             "delta_z": float(dp[2]),
             "delta_wx": float(dr_rotvec[0]),
             "delta_wy": float(dr_rotvec[1]),
             "delta_wz": float(dr_rotvec[2]),
+            "controller_trigger_raw": float(states.get("trigger", 0.0)),
+            "controller_close_latch": bool(self._controller_gripper_closed),
         }
         action.update(self._wrist_action_fields(pose, tracking_valid=True))
         return action

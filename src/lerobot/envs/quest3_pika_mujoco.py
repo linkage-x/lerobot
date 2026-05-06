@@ -89,9 +89,10 @@ class Quest3PikaMujocoEnv(gym.Env):
         self._gripper_left_geom_id = self._geom_id("gripper_left_collision")
         self._gripper_right_geom_id = self._geom_id("gripper_right_collision")
 
-        self._mocap_id = int(self.model.body_mocapid[self._gripper_base_body_id])
+        self._mocap_body_id = self._body_id("gripper_target")
+        self._mocap_id = int(self.model.body_mocapid[self._mocap_body_id])
         if self._mocap_id < 0:
-            raise ValueError("Body 'gripper_base' must be a mocap body in the Quest3 Pika scene.")
+            raise ValueError("Body 'gripper_target' must be a mocap body in the Quest3 Pika scene.")
 
         self._base_to_tcp = self._local_body_pose(self._tcp_body_id)
         self._tcp_to_base = np.linalg.inv(self._base_to_tcp)

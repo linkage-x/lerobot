@@ -81,6 +81,8 @@ class Quest3TeleopConfig(TeleoperatorConfig):
     max_step_rot_rad: float = 0.3
     # --- Phase 2: controller mode ---
     grip_threshold: float = 0.5
+    controller_gripper_close_threshold: float = 0.8
+    controller_gripper_open_threshold: float = 0.2
     # --- Phase 3: stability ---
     filter_alpha_pos: float = 0.3
     filter_alpha_rot: float = 0.3
