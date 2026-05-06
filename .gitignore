@@ -187,3 +187,7 @@ outputs/
 .agents
 _bmad
 .claude
+
+
+#
+src/lerobot/robots/franka_research3/assets/franka_fr3/assets/charuco_board
