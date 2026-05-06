@@ -1,0 +1,90 @@
+calibration:
+  dataset:
+    repo_id: local/fr3_mujoco_calibration_ergodic_xyz
+    root: outputs/datasets/fr3_mujoco_calibration_ergodic_xyz
+    task: FR3 MuJoCo ergodic xyz calibration
+    overwrite: true
+    num_samples: 10000
+    dataset_fps: 10
+
+  sampling:
+    sample_mode: ergodic_xyz
+    seed: 7
+
+  motion:
+    # auto -> cartesian_impedance for ergodic_xyz.
+    motion_mode: auto
+    control_frequency: 20.0
+    max_command_steps: 100
+    settle_steps: 40
+    arm_actuator_kp: 20000.0
+    arm_gravity_comp_scale: 0.5
+    continuous_physics: false
+    continuous_physics_frequency: 800.0
+
+  controller:
+    # Matches third_party/opencv_kalibr/fr3_data_collection_replay/replay_cube_pose_in_robot_base.host.yaml.
+    use_otg: true
+    damping: null
+    stiffness: null
+    filter_coeff: null
+    otg_control_frequency: 800.0
+    otg_async_control_frequency: 1000.0
+    otg_synchronization: true
+    otg_sync_mode: time
+    otg_max_velocity: [2.096, 2.096, 2.096, 2.096, 4.208, 3.344, 4.208]
+    otg_max_acceleration: [8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0]
+    otg_max_jerk: [4000.0, 4000.0, 4000.0, 4000.0, 4000.0, 4000.0, 4000.0]
+
+  cartesian_impedance:
+    cartesian_position_tolerance_m: 0.004
+    cartesian_orientation_tolerance_rad: 0.05235987755982989
+    cartesian_max_position_step_m: 0.01
+    cartesian_max_rotation_step_rad: 0.013962634015954637
+    cartesian_orientation_weight: 2.0
+
+  replay:
+    command_interval_s: 0.05
+    max_translation_step_m: 0.01
+    max_rotation_step_deg: 0.8
+    max_command_steps_for_initial_pose: 100
+    position_tolerance_m: 0.004
+    orientation_tolerance_deg: 3.0
+
+  ergodic:
+    # null means: build a conservative box around the initial TCP pose.
+    ergodic_low: null
+    ergodic_high: null
+    ergodic_x0: null
+    ergodic_num_k_per_dim: 20
+    ergodic_dt: 0.05
+    ergodic_speed: 0.05
+    ergodic_boundary: reflect
+    ergodic_device: auto
+
+  camera:
+    camera_set: hikon_8
+    camera_names: ""
+    camera_width: 1280
+    camera_height: 720
+    sim_xml_path: null
+
+  viewer:
+    viewer: false
+    # viewer_camera: hk_01_cam
+    viewer_hold_s: 0.02
+    viewer_pause_every: 0
+    viewer_final_hold_s: 0.0
+
+  encoding:
+    # auto selects h264_nvenc/hevc_nvenc when PyAV/FFmpeg exposes NVIDIA encoders.
+    vcodec: auto
+    streaming_encoding: true
+    encoder_threads: 1
+    encoder_queue_maxsize: 8
+
+  runtime:
+    mujoco_gl: egl
+
+  output:
+    report_json: null
