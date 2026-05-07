@@ -22,7 +22,7 @@ teleop:
 dataset:
   repo_id: local/fr3_quest3_pika_gripper
   single_task: Quest3 Pika Gripper Pick Place
-  root: /workspace/outputs/datasets/fr3_quest3_pika_gripper
+  root: outputs/datasets/fr3_quest3_pika_gripper
   fps: 30
   num_episodes: 30
   episode_time_s: 20

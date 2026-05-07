@@ -88,6 +88,9 @@ _D435I_IMAGE_SHAPE = (480, 640, 3)
 _WORKSPACE_OBJECT_BODY_NAME = "workspace_object_body"
 _WORKSPACE_OBJECT_RANDOM_RADIUS_M = 0.10
 _RUNTIME_ARGS: argparse.Namespace | None = None
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CONTAINER_WORKSPACE = "/workspace"
+_LEGACY_CONTAINER_WORKSPACE = "/lerobot"
 
 
 class _LatestEpisodeControlState:
@@ -158,6 +161,20 @@ def _zero_teleop_action(gripper: float) -> dict[str, float | bool]:
         "target_wz": 0.0,
         "gripper": float(gripper),
     }
+
+
+def _resolve_dataset_root(path_value: str | Path, *, workspace: Path = _REPO_ROOT) -> Path:
+    path = Path(path_value).expanduser()
+    path_str = str(path)
+    resolved_workspace = workspace.resolve()
+
+    if path_str.startswith(f"{_CONTAINER_WORKSPACE}/"):
+        return resolved_workspace / path_str.removeprefix(f"{_CONTAINER_WORKSPACE}/")
+    if path_str.startswith(f"{_LEGACY_CONTAINER_WORKSPACE}/"):
+        return resolved_workspace / path_str.removeprefix(f"{_LEGACY_CONTAINER_WORKSPACE}/")
+    if path.is_absolute():
+        return path
+    return resolved_workspace / path
 
 
 def _chmod_dataset_tree(root: Path, mode: int = 0o777) -> None:
@@ -422,9 +439,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     )
 
     from datetime import datetime
-    dataset_root = Path(cfg.dataset.root)
-    if not str(dataset_root).startswith("/workspace/"):
-        dataset_root = Path("/workspace") / dataset_root
+    dataset_root = _resolve_dataset_root(cfg.dataset.root)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dataset_root = dataset_root.parent / f"{dataset_root.name}_{timestamp}"
 

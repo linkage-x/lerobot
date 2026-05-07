@@ -7,8 +7,10 @@ import numpy as np
 import pytest
 
 from lerobot.envs.fr3_mujoco import FR3MujocoEnv
+from lerobot.teleoperators.quest3.configuration_quest3 import Quest3TeleopConfig
 
 from tools.fr3 import fr3_mujoco_record
+from tools.fr3.fr3_mujoco_runtime import build_runtime_teleop_config, parse_runtime_args
 
 
 def test_get_env_observation_includes_camera_images():
@@ -196,6 +198,52 @@ def test_build_teleop_features_returns_expected_keys():
     assert features["target_wz"] is float
     assert features["gripper"] is float
     assert len(features) == 8
+
+
+def test_resolve_dataset_root_maps_container_path_into_workspace(tmp_path):
+    resolved = fr3_mujoco_record._resolve_dataset_root(
+        "/workspace/outputs/datasets/demo",
+        workspace=tmp_path,
+    )
+
+    assert resolved == tmp_path / "outputs" / "datasets" / "demo"
+
+
+def test_resolve_dataset_root_preserves_host_absolute_path(tmp_path):
+    host_root = tmp_path / "datasets" / "demo"
+
+    resolved = fr3_mujoco_record._resolve_dataset_root(host_root, workspace=tmp_path / "repo")
+
+    assert resolved == host_root
+
+
+def test_resolve_dataset_root_expands_relative_path_from_workspace(tmp_path):
+    resolved = fr3_mujoco_record._resolve_dataset_root(
+        "outputs/datasets/demo",
+        workspace=tmp_path,
+    )
+
+    assert resolved == tmp_path / "outputs" / "datasets" / "demo"
+
+
+def test_build_runtime_teleop_config_allows_quest3_controller_override_for_record():
+    runtime_args, remaining = parse_runtime_args(
+        ["--teleop-type", "quest3", "--quest3-use-controller", "--quest3-clutch-source", "always"],
+        description="test",
+    )
+    assert remaining == []
+
+    base_config = Quest3TeleopConfig(use_hand_tracking=True, clutch_source="squeeze", frequency=200)
+
+    teleop_cfg = build_runtime_teleop_config(runtime_args, frequency=123, base_config=base_config)
+
+    assert isinstance(teleop_cfg, Quest3TeleopConfig)
+    assert teleop_cfg is not base_config
+    assert teleop_cfg.frequency == 123
+    assert teleop_cfg.use_hand_tracking is False
+    assert teleop_cfg.clutch_source == "always"
+    assert base_config.use_hand_tracking is True
+    assert base_config.clutch_source == "squeeze"
 
 
 def test_run_episode_control_loop_publishes_pre_step_observation_and_action():

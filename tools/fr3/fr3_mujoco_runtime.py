@@ -242,6 +242,32 @@ def _set_frequency(config: TeleoperatorConfig, frequency: int) -> TeleoperatorCo
     return config
 
 
+def _apply_runtime_quest3_overrides(config: Quest3TeleopConfig, args: argparse.Namespace) -> Quest3TeleopConfig:
+    config.host = args.quest3_host
+    config.port = int(args.quest3_port)
+    config.cert_file = args.quest3_cert_file
+    config.key_file = args.quest3_key_file
+    config.calibration_dir = args.quest3_calibration_dir
+    config.hand = Quest3Hand(args.quest3_hand)
+    config.use_hand_tracking = bool(args.quest3_use_hand_tracking)
+    config.translation_scale = float(args.quest3_translation_scale)
+    config.rotation_scale = float(args.quest3_rotation_scale)
+    config.translation_deadband_m = float(args.quest3_translation_deadband_m)
+    config.rotation_deadband_rad = float(args.quest3_rotation_deadband_rad)
+    config.enable_rotation = bool(args.enable_rotation)
+    config.clutch_source = str(args.quest3_clutch_source)
+    config.clutch_threshold = float(args.quest3_clutch_threshold)
+    config.gripper_mapping = Quest3GripperMapping(args.quest3_gripper_mapping)
+    config.open_pinch_value = float(args.quest3_open_pinch_value)
+    config.closed_pinch_value = float(args.quest3_closed_pinch_value)
+    config.open_fingertip_distance_m = float(args.quest3_open_fingertip_distance_m)
+    config.closed_fingertip_distance_m = float(args.quest3_closed_fingertip_distance_m)
+    config.gripper_cmd_ema_alpha = float(args.gripper_cmd_ema_alpha)
+    config.gripper_cmd_max_rate = float(args.gripper_cmd_max_rate)
+    config.lost_tracking_timeout_s = float(args.quest3_lost_tracking_timeout_s)
+    return config
+
+
 def build_runtime_teleop_config(
     args: argparse.Namespace,
     *,
@@ -252,7 +278,9 @@ def build_runtime_teleop_config(
     if base_config is not None:
         teleop_type = getattr(base_config, "type", None)
         if teleop_type == "quest3":
-            return _set_frequency(copy.deepcopy(base_config), resolved_frequency)
+            config = copy.deepcopy(base_config)
+            _set_frequency(config, resolved_frequency)
+            return _apply_runtime_quest3_overrides(config, args)
 
     if getattr(args, "teleop_type", "spacemouse") == "quest3":
         return Quest3TeleopConfig(
