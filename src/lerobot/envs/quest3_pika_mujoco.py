@@ -298,13 +298,13 @@ class Quest3PikaMujocoEnv(gym.Env):
                 self._mujoco.mj_contactForce(self.model, self.data, i, f)
                 contact_pairs.append(f"{g1}<->{g2} dist={c.dist:.4f} force={f[:3]}")
 
-        if contact_pairs:
-            print(
-                f"[GRIPPER_DEBUG] cmd={command:.3f} ctrl={ctrl_val:.4f} "
-                f"left={left_val:.4f} right={right_val:.4f} "
-                f"tendon_len={ten_len:.4f} force={force_val:.2f} "
-                f"contacts=[{'; '.join(contact_pairs)}]"
-            )
+        # if contact_pairs:
+        #     print(
+        #         f"[GRIPPER_DEBUG] cmd={command:.3f} ctrl={ctrl_val:.4f} "
+        #         f"left={left_val:.4f} right={right_val:.4f} "
+        #         f"tendon_len={ten_len:.4f} force={force_val:.2f} "
+        #         f"contacts=[{'; '.join(contact_pairs)}]"
+        #     )
 
     def _step_physics(self, steps: int) -> None:
         for _ in range(max(int(steps), 1)):
