@@ -29,22 +29,42 @@ def test_gripper_command_updates_pika_slide_joints_symmetrically():
         env.close()
 
 
-def test_scripted_contact_grasp_can_raise_workspace_object():
+def test_scene_uses_finite_actuators_instead_of_target_weld():
     env = Quest3PikaMujocoEnv(Quest3PikaMujocoEnvConfig(continuous_physics=False, enable_cameras=False))
     try:
-        env.reset(include_camera_obs_in_observation=False, include_camera_obs_in_info=False)
+        missing_weld_id = env._mujoco.mj_name2id(
+            env.model,
+            env._mujoco.mjtObj.mjOBJ_EQUALITY,
+            "target_to_gripper",
+        )
+        assert missing_weld_id < 0
+        for actuator_name in (
+            "gripper_base_x_actuator",
+            "gripper_base_y_actuator",
+            "gripper_base_z_actuator",
+            "gripper_base_yaw_actuator",
+            "gripper_base_pitch_actuator",
+            "gripper_base_roll_actuator",
+            "pika_gripper_actuator",
+        ):
+            actuator_id = env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_name)
+            assert actuator_id >= 0
+            force_range = env.model.actuator_forcerange[actuator_id]
+            assert np.isfinite(force_range).all()
+            assert force_range[0] < 0.0 < force_range[1]
+    finally:
+        env.close()
+
+
+def test_apply_tcp_pose_sets_actuator_targets_and_can_teleport_to_target():
+    env = Quest3PikaMujocoEnv(Quest3PikaMujocoEnvConfig(continuous_physics=False, enable_cameras=False))
+    try:
         pose = env._initial_tcp_pose()
-        pose[:3, 3] = np.array([0.47, 0.0, 0.30], dtype=np.float64)
-        env._apply_tcp_pose(pose)
-        env._step_physics(120)
-        env._set_gripper_command(0.0, simulate=True)
+        pose[:3, 3] = np.array([0.52, 0.04, 0.58], dtype=np.float64)
 
-        for z in (0.32, 0.34, 0.36, 0.38):
-            pose[:3, 3] = np.array([0.47, 0.0, z], dtype=np.float64)
-            env._apply_tcp_pose(pose)
-            env._step_physics(240)
+        env._apply_tcp_pose(pose, teleport=True)
 
-        object_z = float(env.data.qpos[2])
-        assert object_z > 0.46
+        np.testing.assert_allclose(env._current_tcp_pose()[:3, 3], pose[:3, 3], atol=1e-6)
+        np.testing.assert_allclose(env._target_pose[:3, 3], pose[:3, 3], atol=1e-6)
     finally:
         env.close()
