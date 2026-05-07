@@ -45,6 +45,9 @@ class FrankaResearch3Config(RobotConfig):
     workspace_max: tuple[float, float, float] = (0.9, 0.6, 0.8)
     max_target_delta_pos: tuple[float, float, float] | None = None
     max_target_delta_rot: tuple[float, float, float] | None = None
+    ik_solver: str = "hirol_lm"
+    ik_tolerance: float = 1e-6
+    ik_max_iterations: int = 200
     gripper_max_width_mm: float = 90.0
     gripper_command_rate_limit_hz: float | None = 15.0
     gripper_command_deadband_mm: float = 0.5
@@ -85,6 +88,12 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("max_target_delta_pos must be a 3D tuple when provided.")
         if self.max_target_delta_rot is not None and len(self.max_target_delta_rot) != 3:
             raise ValueError("max_target_delta_rot must be a 3D tuple when provided.")
+        if self.ik_solver not in {"hirol_lm", "hirol_gaussian_newton", "placo"}:
+            raise ValueError("ik_solver must be one of 'hirol_lm', 'hirol_gaussian_newton', or 'placo'.")
+        if self.ik_tolerance <= 0:
+            raise ValueError("ik_tolerance must be positive.")
+        if self.ik_max_iterations <= 0:
+            raise ValueError("ik_max_iterations must be positive.")
         if any(mn >= mx for mn, mx in zip(self.workspace_min, self.workspace_max, strict=True)):
             raise ValueError("workspace_min must be strictly smaller than workspace_max.")
         if self.gripper_max_width_mm <= 0:

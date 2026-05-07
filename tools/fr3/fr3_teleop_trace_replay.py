@@ -64,8 +64,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--move-s", type=float, default=0.75)
     parser.add_argument("--hold-s", type=float, default=0.5)
     parser.add_argument("--settle-s", type=float, default=1.0)
-    parser.add_argument("--robot-ip", default="192.168.1.206")
+    parser.add_argument("--robot-ip", default="192.168.11.102")
     parser.add_argument("--gripper-port", default=DEFAULT_GRIPPER_PORT)
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Validate a hardware dataset replay and write the report without connecting to the robot.",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Execute a hardware dataset replay after validation and an explicit typed confirmation.",
+    )
+    parser.add_argument("--min-z", type=float, default=0.05, help="Minimum allowed EE Z height for hardware replay.")
+    parser.add_argument("--max-step-pos", type=float, default=0.03, help="Maximum per-frame EE translation step in meters.")
+    parser.add_argument("--max-step-rot", type=float, default=0.35, help="Maximum per-frame EE rotation step in radians.")
+    parser.add_argument("--max-ee-speed", type=float, default=0.25, help="Maximum EE translation speed in m/s.")
+    parser.add_argument("--max-ee-rot-speed", type=float, default=2.0, help="Maximum EE rotation speed in rad/s.")
     parser.add_argument(
         "--ik-solver",
         choices=["hirol_lm", "hirol_gaussian_newton", "placo"],
@@ -130,6 +145,15 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
     if args.mode == "hardware":
         runtime_args.append(f"--robot-ip={args.robot_ip}")
         runtime_args.append(f"--gripper-port={args.gripper_port}")
+        runtime_args.append(f"--min-z={args.min_z}")
+        runtime_args.append(f"--max-step-pos={args.max_step_pos}")
+        runtime_args.append(f"--max-step-rot={args.max_step_rot}")
+        runtime_args.append(f"--max-ee-speed={args.max_ee_speed}")
+        runtime_args.append(f"--max-ee-rot-speed={args.max_ee_rot_speed}")
+        if args.validate_only:
+            runtime_args.append("--validate-only")
+        if args.execute:
+            runtime_args.append("--execute")
 
     docker_run_extra: list[str] = []
     if args.mode == "sim" and not args.no_viewer:
@@ -146,6 +170,7 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         "-f",
         str(compose_file),
         "run",
+        "-T",
         "--rm",
         *docker_run_extra,
         service,

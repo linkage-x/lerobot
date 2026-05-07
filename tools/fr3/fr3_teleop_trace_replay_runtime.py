@@ -25,7 +25,7 @@ from lerobot.robots.franka_research3 import FrankaResearch3, FrankaResearch3Conf
 from lerobot.utils.robot_utils import precise_sleep
 
 
-DEFAULT_ROBOT_IP = "192.168.1.206"
+DEFAULT_ROBOT_IP = "192.168.11.102"
 DEFAULT_GRIPPER_PORT = "/dev/ttyUSB0"
 DEFAULT_TRANSLATION_MAX_TARGET_DELTA_ROT = (0.0, 0.0, 0.0)
 DEFAULT_COMBINED_MAX_TARGET_DELTA_ROT = (0.01, 0.01, 0.01)
@@ -80,6 +80,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workspace-max", type=_parse_tuple, default=(0.9, 0.6, 0.8))
     parser.add_argument("--max-target-delta-pos", type=_parse_tuple, default=(0.001, 0.001, 0.001))
     parser.add_argument("--max-target-delta-rot", type=_parse_tuple, default=None)
+    parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--min-z", type=float, default=0.05)
+    parser.add_argument("--max-step-pos", type=float, default=0.03)
+    parser.add_argument("--max-step-rot", type=float, default=0.35)
+    parser.add_argument("--max-ee-speed", type=float, default=0.25)
+    parser.add_argument("--max-ee-rot-speed", type=float, default=2.0)
     args = parser.parse_args()
     if args.max_target_delta_rot is None:
         if args.trace_profile in ("combined", "wz"):
@@ -133,7 +140,12 @@ def _sanitize_pose_stream(poses: np.ndarray) -> tuple[np.ndarray, list[int]]:
     return sanitized, invalid_indices
 
 
-def _load_dataset_episode(dataset_path: Path, episode_idx: int) -> dict[str, np.ndarray]:
+def _load_dataset_episode(
+    dataset_path: Path,
+    episode_idx: int,
+    *,
+    sanitize_invalid_poses: bool = True,
+) -> dict[str, np.ndarray]:
     import pyarrow.parquet as pq
 
     meta_dir = dataset_path / "meta" / "episodes"
@@ -190,8 +202,12 @@ def _load_dataset_episode(dataset_path: Path, episode_idx: int) -> dict[str, np.
         raise ValueError(f"observation.state must contain at least 7 pose values, got shape {states.shape}.")
     if actions.ndim != 2 or actions.shape[1] < 7:
         raise ValueError(f"action must contain at least 7 pose values, got shape {actions.shape}.")
-    states, invalid_state_indices = _sanitize_pose_stream(states)
-    actions, invalid_action_indices = _sanitize_pose_stream(actions)
+    if sanitize_invalid_poses:
+        states, invalid_state_indices = _sanitize_pose_stream(states)
+        actions, invalid_action_indices = _sanitize_pose_stream(actions)
+    else:
+        invalid_state_indices = [idx for idx, pose in enumerate(states) if not _is_valid_pose7d(pose)]
+        invalid_action_indices = [idx for idx, pose in enumerate(actions) if not _is_valid_pose7d(pose)]
 
     return {
         "episode_index": np.asarray([int(episode_idx)], dtype=np.int64),
@@ -229,6 +245,309 @@ def _load_dataset_fps(dataset_path: Path) -> int | None:
     if fps is None:
         return None
     return int(fps)
+
+
+def _normalize_quat(quat: np.ndarray) -> np.ndarray:
+    quat = np.asarray(quat, dtype=np.float64)
+    quat_norm = float(np.linalg.norm(quat))
+    if not np.all(np.isfinite(quat)) or quat_norm <= 1e-12:
+        raise ValueError(f"Invalid quaternion for replay: {quat.tolist()}")
+    return quat / quat_norm
+
+
+def _pose7d_to_robot_action(pose_7d: np.ndarray, *, gripper: float = 1.0) -> dict[str, float]:
+    pose_7d = np.asarray(pose_7d, dtype=np.float64)
+    rotvec = Rotation.from_quat(_normalize_quat(pose_7d[3:7])).as_rotvec()
+    return {
+        "ee.x": float(pose_7d[0]),
+        "ee.y": float(pose_7d[1]),
+        "ee.z": float(pose_7d[2]),
+        "ee.wx": float(rotvec[0]),
+        "ee.wy": float(rotvec[1]),
+        "ee.wz": float(rotvec[2]),
+        "gripper.pos": float(np.clip(gripper, 0.0, 1.0)),
+    }
+
+
+def _rot_step_rad(first_pose_7d: np.ndarray, second_pose_7d: np.ndarray) -> float:
+    first_rot = Rotation.from_quat(_normalize_quat(np.asarray(first_pose_7d, dtype=np.float64)[3:7]))
+    second_rot = Rotation.from_quat(_normalize_quat(np.asarray(second_pose_7d, dtype=np.float64)[3:7]))
+    return float((second_rot * first_rot.inv()).magnitude())
+
+
+def _episode_gripper(actions: np.ndarray, index: int) -> float:
+    return float(np.clip(actions[index, 7], 0.0, 1.0)) if actions.shape[1] > 7 else 1.0
+
+
+def _hardware_dataset_profile(args: argparse.Namespace, episodes: list[dict[str, np.ndarray]]) -> dict[str, object]:
+    total_action_count = int(sum(len(episode["actions"]) for episode in episodes))
+    return {
+        "name": f"hardware_dataset_episode_{args.episode}" if args.episode is not None else "hardware_dataset_all_episodes",
+        "fps": args.fps,
+        "actions": [None] * total_action_count,
+        "segments": [
+            {
+                "name": "hardware_dataset_replay",
+                "kind": "absolute_pose",
+                "start_step": 0,
+                "end_step": max(total_action_count - 1, 0),
+                "sample_start_index": 0,
+                "sample_end_index": total_action_count,
+                "step_count": total_action_count,
+            }
+        ],
+    }
+
+
+def _append_violation(
+    violations: list[dict[str, object]],
+    violation_counts: dict[str, int],
+    *,
+    kind: str,
+    episode: int,
+    frame: int,
+    value: object,
+    limit: object,
+) -> None:
+    violation_counts[kind] = violation_counts.get(kind, 0) + 1
+    if len(violations) < 100:
+        violations.append(
+            {
+                "kind": kind,
+                "episode": int(episode),
+                "frame": int(frame),
+                "value": value,
+                "limit": limit,
+            }
+        )
+
+
+def _build_hardware_dataset_report(
+    *,
+    dataset_path: Path,
+    requested_episode_indices: list[int],
+    episodes: list[dict[str, np.ndarray]],
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    workspace_min = np.asarray(args.workspace_min, dtype=np.float64)
+    workspace_max = np.asarray(args.workspace_max, dtype=np.float64)
+    all_valid_positions: list[np.ndarray] = []
+    violations: list[dict[str, object]] = []
+    violation_counts: dict[str, int] = {}
+    invalid_pose_rows: list[dict[str, object]] = []
+    max_step_pos = 0.0
+    max_step_rot = 0.0
+    max_ee_speed = 0.0
+    max_ee_rot_speed = 0.0
+    total_frames = 0
+
+    for episode in episodes:
+        episode_idx = int(episode["episode_index"][0])
+        actions = episode["actions"]
+        states = episode["states"]
+        timestamps = episode["timestamps"]
+        frame_indices = episode["frame_indices"]
+        total_frames += int(len(actions))
+
+        invalid_state_indices = episode["invalid_state_indices"].tolist()
+        invalid_action_indices = episode["invalid_action_indices"].tolist()
+        if invalid_state_indices or invalid_action_indices:
+            invalid_pose_rows.append(
+                {
+                    "episode": episode_idx,
+                    "invalid_state_frame_indices": [int(frame_indices[idx]) for idx in invalid_state_indices],
+                    "invalid_action_frame_indices": [int(frame_indices[idx]) for idx in invalid_action_indices],
+                }
+            )
+        invalid_action_set = set(int(idx) for idx in invalid_action_indices)
+        for idx in invalid_state_indices:
+            _append_violation(
+                violations,
+                violation_counts,
+                kind="invalid_state_pose",
+                episode=episode_idx,
+                frame=int(frame_indices[idx]),
+                value=states[idx, :7].tolist(),
+                limit="finite xyz and non-zero xyzw quaternion",
+            )
+        for idx in invalid_action_indices:
+            _append_violation(
+                violations,
+                violation_counts,
+                kind="invalid_action_pose",
+                episode=episode_idx,
+                frame=int(frame_indices[idx]),
+                value=actions[idx, :7].tolist(),
+                limit="finite xyz and non-zero xyzw quaternion",
+            )
+
+        valid_indices = [idx for idx in range(len(actions)) if idx not in invalid_action_set]
+        for idx in valid_indices:
+            position = np.asarray(actions[idx, :3], dtype=np.float64)
+            all_valid_positions.append(position)
+            frame = int(frame_indices[idx])
+            if np.any(position < workspace_min) or np.any(position > workspace_max):
+                _append_violation(
+                    violations,
+                    violation_counts,
+                    kind="workspace",
+                    episode=episode_idx,
+                    frame=frame,
+                    value=position.tolist(),
+                    limit={"min": workspace_min.tolist(), "max": workspace_max.tolist()},
+                )
+            if float(position[2]) < float(args.min_z):
+                _append_violation(
+                    violations,
+                    violation_counts,
+                    kind="min_z",
+                    episode=episode_idx,
+                    frame=frame,
+                    value=float(position[2]),
+                    limit=float(args.min_z),
+                )
+
+        for prev_idx, idx in zip(valid_indices, valid_indices[1:], strict=False):
+            if idx != prev_idx + 1:
+                continue
+            frame = int(frame_indices[idx])
+            pos_step = float(np.linalg.norm(actions[idx, :3] - actions[prev_idx, :3]))
+            rot_step = _rot_step_rad(actions[prev_idx, :7], actions[idx, :7])
+            max_step_pos = max(max_step_pos, pos_step)
+            max_step_rot = max(max_step_rot, rot_step)
+            if pos_step > float(args.max_step_pos):
+                _append_violation(
+                    violations,
+                    violation_counts,
+                    kind="max_step_pos",
+                    episode=episode_idx,
+                    frame=frame,
+                    value=pos_step,
+                    limit=float(args.max_step_pos),
+                )
+            if rot_step > float(args.max_step_rot):
+                _append_violation(
+                    violations,
+                    violation_counts,
+                    kind="max_step_rot",
+                    episode=episode_idx,
+                    frame=frame,
+                    value=rot_step,
+                    limit=float(args.max_step_rot),
+                )
+            dt = float(timestamps[idx] - timestamps[prev_idx]) if len(timestamps) > idx else 1.0 / args.fps
+            if dt <= 0:
+                _append_violation(
+                    violations,
+                    violation_counts,
+                    kind="non_positive_dt",
+                    episode=episode_idx,
+                    frame=frame,
+                    value=dt,
+                    limit="> 0",
+                )
+                continue
+            ee_speed = pos_step / dt
+            ee_rot_speed = rot_step / dt
+            max_ee_speed = max(max_ee_speed, ee_speed)
+            max_ee_rot_speed = max(max_ee_rot_speed, ee_rot_speed)
+            if ee_speed > float(args.max_ee_speed):
+                _append_violation(
+                    violations,
+                    violation_counts,
+                    kind="max_ee_speed",
+                    episode=episode_idx,
+                    frame=frame,
+                    value=ee_speed,
+                    limit=float(args.max_ee_speed),
+                )
+            if ee_rot_speed > float(args.max_ee_rot_speed):
+                _append_violation(
+                    violations,
+                    violation_counts,
+                    kind="max_ee_rot_speed",
+                    episode=episode_idx,
+                    frame=frame,
+                    value=ee_rot_speed,
+                    limit=float(args.max_ee_rot_speed),
+                )
+
+    if all_valid_positions:
+        positions = np.vstack(all_valid_positions)
+        xyz_min = positions.min(axis=0).tolist()
+        xyz_max = positions.max(axis=0).tolist()
+    else:
+        xyz_min = None
+        xyz_max = None
+
+    invalid_pose_count = int(
+        sum(
+            len(row["invalid_state_frame_indices"]) + len(row["invalid_action_frame_indices"])
+            for row in invalid_pose_rows
+        )
+    )
+    return {
+        "dataset": str(dataset_path),
+        "episode": int(args.episode) if args.episode is not None else None,
+        "episode_indices": requested_episode_indices,
+        "episode_count": len(requested_episode_indices),
+        "total_frames": total_frames,
+        "fps": int(args.fps),
+        "ik_solver": args.ik_solver,
+        "workspace_min": workspace_min.tolist(),
+        "workspace_max": workspace_max.tolist(),
+        "min_z": float(args.min_z),
+        "trajectory_xyz_min": xyz_min,
+        "trajectory_xyz_max": xyz_max,
+        "max_step_pos_m": max_step_pos,
+        "max_step_rot_rad": max_step_rot,
+        "max_ee_speed_mps": max_ee_speed,
+        "max_ee_rot_speed_radps": max_ee_rot_speed,
+        "limits": {
+            "max_step_pos_m": float(args.max_step_pos),
+            "max_step_rot_rad": float(args.max_step_rot),
+            "max_ee_speed_mps": float(args.max_ee_speed),
+            "max_ee_rot_speed_radps": float(args.max_ee_rot_speed),
+        },
+        "bad_pose_replacement_enabled": False,
+        "contains_bad_pose": invalid_pose_count > 0,
+        "invalid_pose_count": invalid_pose_count,
+        "invalid_poses": invalid_pose_rows,
+        "violation_count": int(sum(violation_counts.values())),
+        "violation_counts": violation_counts,
+        "violations": violations,
+        "violations_truncated": int(sum(violation_counts.values())) > len(violations),
+        "validation_passed": int(sum(violation_counts.values())) == 0,
+        "startup_alignment_checked": False,
+    }
+
+
+def _print_hardware_dataset_report(report: dict[str, object]) -> None:
+    print("fr3_hardware_dataset_replay_report=START")
+    print(f"dataset={report['dataset']}")
+    print(f"episode={report['episode']}")
+    print(f"episode_count={report['episode_count']}")
+    print(f"total_frames={report['total_frames']}")
+    print(f"fps={report['fps']}")
+    print(f"ik_solver={report['ik_solver']}")
+    print(f"workspace_min={report['workspace_min']}")
+    print(f"workspace_max={report['workspace_max']}")
+    print(f"min_z={report['min_z']}")
+    print(f"trajectory_xyz_min={report['trajectory_xyz_min']}")
+    print(f"trajectory_xyz_max={report['trajectory_xyz_max']}")
+    print(f"max_step_pos_m={report['max_step_pos_m']} limit={report['limits']['max_step_pos_m']}")
+    print(f"max_step_rot_rad={report['max_step_rot_rad']} limit={report['limits']['max_step_rot_rad']}")
+    print(f"max_ee_speed_mps={report['max_ee_speed_mps']} limit={report['limits']['max_ee_speed_mps']}")
+    print(f"max_ee_rot_speed_radps={report['max_ee_rot_speed_radps']} limit={report['limits']['max_ee_rot_speed_radps']}")
+    print(f"bad_pose_replacement_enabled={report['bad_pose_replacement_enabled']}")
+    print(f"contains_bad_pose={report['contains_bad_pose']}")
+    print(f"invalid_pose_count={report['invalid_pose_count']}")
+    print(f"violation_count={report['violation_count']}")
+    print(f"validation={'PASS' if report['validation_passed'] else 'FAIL'}")
+    if report["violation_count"]:
+        print(f"violation_counts={report['violation_counts']}")
+        print(f"first_violations={report['violations'][:10]}")
+    print("fr3_hardware_dataset_replay_report=END")
 
 
 def _observation_to_sample(*, profile_step: int, scheduled_time_s: float, measured_time_s: float, action, observation, target_pose):
@@ -584,6 +903,7 @@ def run_hardware_trace(args: argparse.Namespace, profile: dict[str, object]) -> 
             workspace_max=args.workspace_max,
             max_target_delta_pos=args.max_target_delta_pos,
             max_target_delta_rot=args.max_target_delta_rot,
+            ik_solver=args.ik_solver,
         )
     )
     samples: list[dict[str, object]] = []
@@ -631,6 +951,203 @@ def run_hardware_trace(args: argparse.Namespace, profile: dict[str, object]) -> 
             "gripper_is_mock": bool(getattr(robot, "_gripper_is_mock", False)),
             "urdf_path": str(args.urdf_path),
             "target_frame_name": args.target_frame_name,
+            "ik_solver": args.ik_solver,
+        },
+    )
+
+
+def _observation_pose7d(observation: dict[str, object]) -> np.ndarray:
+    rot = Rotation.from_rotvec(
+        [
+            float(observation["ee.wx"]),
+            float(observation["ee.wy"]),
+            float(observation["ee.wz"]),
+        ]
+    )
+    return np.array(
+        [
+            float(observation["ee.x"]),
+            float(observation["ee.y"]),
+            float(observation["ee.z"]),
+            *rot.as_quat().tolist(),
+        ],
+        dtype=np.float64,
+    )
+
+
+def run_hardware_dataset_replay(args: argparse.Namespace) -> dict[str, object]:
+    if args.dataset is None:
+        raise ValueError("--dataset is required for hardware dataset replay.")
+
+    dataset_path = args.dataset.resolve()
+    requested_episode_indices = [int(args.episode)] if args.episode is not None else _load_dataset_episode_indices(dataset_path)
+    episodes = [
+        _load_dataset_episode(dataset_path, episode_idx, sanitize_invalid_poses=False)
+        for episode_idx in requested_episode_indices
+    ]
+    if not episodes:
+        raise ValueError(f"No episodes found in {dataset_path}.")
+
+    profile = _hardware_dataset_profile(args, episodes)
+    report = _build_hardware_dataset_report(
+        dataset_path=dataset_path,
+        requested_episode_indices=requested_episode_indices,
+        episodes=episodes,
+        args=args,
+    )
+    _print_hardware_dataset_report(report)
+
+    samples: list[dict[str, object]] = []
+    base_metadata = {
+        **report,
+        "robot_ip": args.robot_ip,
+        "gripper_port": args.gripper_port,
+        "urdf_path": str(args.urdf_path),
+        "target_frame_name": args.target_frame_name,
+        "execute_requested": bool(args.execute),
+        "validate_only": bool(args.validate_only or not args.execute),
+    }
+    if not report["validation_passed"]:
+        return build_trace_bundle(
+            mode="hardware_dataset_validation",
+            profile=profile,
+            samples=samples,
+            metadata={**base_metadata, "execution_aborted": True, "abort_reason": "validation_failed"},
+        )
+    if args.validate_only or not args.execute:
+        return build_trace_bundle(
+            mode="hardware_dataset_validation",
+            profile=profile,
+            samples=samples,
+            metadata={**base_metadata, "execution_aborted": False},
+        )
+    if args.episode is None:
+        print("hardware_execute_blocked=episode_required")
+        return build_trace_bundle(
+            mode="hardware_dataset_validation",
+            profile=profile,
+            samples=samples,
+            metadata={**base_metadata, "execution_aborted": True, "abort_reason": "episode_required_for_execute"},
+        )
+
+    print("hardware_execute_requires_confirmation=Type REPLAY and press Enter to send this trajectory to the real FR3")
+    try:
+        confirmation = input("> ").strip()
+    except EOFError:
+        confirmation = ""
+    if confirmation != "REPLAY":
+        print("hardware_execute_aborted=confirmation_mismatch")
+        return build_trace_bundle(
+            mode="hardware_dataset_validation",
+            profile=profile,
+            samples=samples,
+            metadata={**base_metadata, "execution_aborted": True, "abort_reason": "confirmation_mismatch"},
+        )
+
+    episode = episodes[0]
+    actions = episode["actions"]
+    timestamps = episode["timestamps"]
+    frame_indices = episode["frame_indices"]
+    episode_idx = int(episode["episode_index"][0])
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip=args.robot_ip,
+            gripper_port=args.gripper_port,
+            allow_mock_gripper=False,
+            urdf_path=str(args.urdf_path),
+            target_frame_name=args.target_frame_name,
+            workspace_min=args.workspace_min,
+            workspace_max=args.workspace_max,
+            max_target_delta_pos=args.max_target_delta_pos,
+            max_target_delta_rot=args.max_target_delta_rot,
+            ik_solver=args.ik_solver,
+        )
+    )
+    execution_metadata = {**base_metadata, "startup_alignment_checked": True}
+    try:
+        robot.connect()
+        observation = robot.get_observation(include_cameras=False)
+        current_pose_7d = _observation_pose7d(observation)
+        first_pose_7d = np.asarray(actions[0, :7], dtype=np.float64)
+        startup_step_pos = float(np.linalg.norm(first_pose_7d[:3] - current_pose_7d[:3]))
+        startup_step_rot = _rot_step_rad(current_pose_7d, first_pose_7d)
+        execution_metadata.update(
+            {
+                "startup_step_pos_m": startup_step_pos,
+                "startup_step_rot_rad": startup_step_rot,
+                "gripper_is_mock": bool(getattr(robot, "_gripper_is_mock", False)),
+            }
+        )
+        samples.append(
+            _observation_to_sample(
+                profile_step=-1,
+                scheduled_time_s=0.0,
+                measured_time_s=0.0,
+                action=None,
+                observation=observation,
+                target_pose=getattr(robot, "_last_command_pose", None),
+            )
+        )
+        if startup_step_pos > float(args.max_step_pos) or startup_step_rot > float(args.max_step_rot):
+            print("hardware_execute_aborted=startup_alignment_failed")
+            return build_trace_bundle(
+                mode="hardware_dataset",
+                profile=profile,
+                samples=samples,
+                metadata={
+                    **execution_metadata,
+                    "execution_aborted": True,
+                    "abort_reason": "startup_alignment_failed",
+                },
+            )
+
+        start_time = time.perf_counter()
+        first_timestamp = float(timestamps[0]) if len(timestamps) else 0.0
+        for step_index, action_pose_7d in enumerate(actions[:, :7]):
+            gripper = _episode_gripper(actions, step_index)
+            robot_action = _pose7d_to_robot_action(action_pose_7d, gripper=gripper)
+            sent_action = robot.send_action(robot_action)
+            observation = robot.get_observation(include_cameras=False)
+            measured_time_s = time.perf_counter() - start_time
+            scheduled_time_s = float(timestamps[step_index] - first_timestamp) if len(timestamps) else step_index / args.fps
+            sample = _observation_to_sample(
+                profile_step=step_index,
+                scheduled_time_s=scheduled_time_s,
+                measured_time_s=measured_time_s,
+                action=None,
+                observation=observation,
+                target_pose=getattr(robot, "_last_command_pose", None),
+            )
+            sample.update(
+                {
+                    "dataset_episode_index": episode_idx,
+                    "dataset_frame_index": int(frame_indices[step_index]),
+                    "dataset_timestamp_s": float(timestamps[step_index]) if len(timestamps) else scheduled_time_s,
+                    "dataset_action_pose": np.asarray(action_pose_7d[:7], dtype=np.float64).tolist(),
+                    "sent_action": sent_action,
+                }
+            )
+            samples.append(sample)
+            if step_index + 1 < len(actions):
+                next_scheduled_time_s = (
+                    float(timestamps[step_index + 1] - first_timestamp)
+                    if len(timestamps)
+                    else (step_index + 1) / args.fps
+                )
+                precise_sleep(max(start_time + next_scheduled_time_s - time.perf_counter(), 0.0))
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
+
+    return build_trace_bundle(
+        mode="hardware_dataset",
+        profile=profile,
+        samples=samples,
+        metadata={
+            **execution_metadata,
+            "execution_aborted": False,
+            "executed_episode": episode_idx,
+            "gripper_is_mock": bool(getattr(robot, "_gripper_is_mock", False)),
         },
     )
 
@@ -698,12 +1215,18 @@ def main() -> int:
         else:
             bundle = run_sim_trace(args, profile)
     else:
-        bundle = run_hardware_trace(args, profile)
+        if args.dataset is not None:
+            bundle = run_hardware_dataset_replay(args)
+        else:
+            bundle = run_hardware_trace(args, profile)
     output_path = _resolve_output_path(args)
     save_trace_bundle(output_path, bundle)
     print(f"fr3_trace_replay={args.mode}")
     print(f"output={output_path}")
     print(f"samples={len(bundle['samples'])}")
+    metadata = bundle.get("metadata", {})
+    if metadata.get("validation_passed") is False or metadata.get("execution_aborted"):
+        return 1
     return 0
 
 

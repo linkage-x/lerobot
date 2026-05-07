@@ -32,6 +32,8 @@ from ..robot import Robot
 from .backends import (
     DasGripperHardwareDriver,
     FrankaHandGripperHardwareDriver,
+    HirolGaussianNewtonKinematicsDriver,
+    HirolLMKinematicsDriver,
     MockGripperDriver,
     PandaPyArmDriver,
     PikaGripperHardwareDriver,
@@ -255,6 +257,26 @@ class FrankaResearch3(Robot):
             command_deadband_mm=self.config.gripper_command_deadband_mm,
         )
 
+    def _make_kinematics_driver(self):
+        kwargs = {
+            "urdf_path": self.config.urdf_path,
+            "target_frame_name": self.config.target_frame_name,
+            "joint_names": self.config.joint_names,
+        }
+        if self.config.ik_solver == "hirol_lm":
+            return HirolLMKinematicsDriver(
+                **kwargs,
+                tolerance=self.config.ik_tolerance,
+                max_iterations=self.config.ik_max_iterations,
+            )
+        if self.config.ik_solver == "hirol_gaussian_newton":
+            return HirolGaussianNewtonKinematicsDriver(
+                **kwargs,
+                tolerance=self.config.ik_tolerance,
+                max_iterations=self.config.ik_max_iterations,
+            )
+        return self.kinematics_driver_cls(**kwargs)
+
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         del calibrate
@@ -265,11 +287,7 @@ class FrankaResearch3(Robot):
             filter_coeff=self.config.filter_coeff,
         )
         gripper = None
-        kinematics = self.kinematics_driver_cls(
-            urdf_path=self.config.urdf_path,
-            target_frame_name=self.config.target_frame_name,
-            joint_names=self.config.joint_names,
-        )
+        kinematics = self._make_kinematics_driver()
         otg = None
         connected_cameras = []
 
