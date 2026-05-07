@@ -119,6 +119,20 @@ Current non-blocking warnings:
 - local X11 viewer use currently expects the host to allow container root via
   `xhost +si:localuser:root`
 
+## Dataset Viewer Replay
+
+To replay the `single_cube2` 7D EE-pose dataset episode in MuJoCo with the
+passive viewer on display `:1`:
+
+```bash
+export DISPLAY=:1 && python tools/fr3/fr3_teleop_trace_replay.py --mode sim --dataset data/single_cube2_20260429_165325 --episode 0 --fps 30 --output outputs/fr3_traces/single_cube2_ep0_trace.json
+```
+
+The sim replay path defaults to the HIROL-style Pinocchio Levenberg-Marquardt
+IK solver used by `left_fr3_with_pika_ati_ik_3d_mouse.yaml`. Use
+`--ik-solver hirol_gaussian_newton` for HIROL-style Gaussian-Newton IK, or
+`--ik-solver placo` to run the previous Placo-based IK path.
+
 ## Next Calibration Step
 
 The next recommended step is not more ad hoc scale tuning. The next step is a
