@@ -150,6 +150,16 @@ uv run --python .venv/bin/python python -m lerobot.scripts.lerobot_dataset_viz \
   --episode-index 0
 ```
 
+source "$HOME/.local/bin/env"
+DATASET_ROOT=/home/corenetic/Code/lerobot/data/single_cube2_20260429_165325
+
+UV_CACHE_DIR=/tmp/uv-cache \
+PYTHONPATH=src \
+uv run --python .venv/bin/python python -m lerobot.scripts.lerobot_dataset_viz \
+  --repo-id local/handheld_multimodal_v1 \
+  --root "${DATASET_ROOT}" \
+  --episode-index 0
+
 ## Validation
 
 Targeted tests covering the current handheld capture path:

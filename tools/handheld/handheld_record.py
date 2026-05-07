@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import select
@@ -25,7 +26,7 @@ import time
 import tty
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
 from pathlib import Path
 from queue import Queue
@@ -68,7 +69,7 @@ HANDHELD_SOFT_SYNC_FEATURE_NAMES = (
 
 @dataclass
 class HandheldSoftSyncConfig:
-    enabled: bool = True
+    enabled: bool = False
     tolerance_ms: float = 20.0
     wait_timeout_ms: float = 150.0
     poll_interval_ms: float = 1.0
@@ -328,7 +329,7 @@ def build_dataset_features(
     handheld_grippers: dict[str, Any],
     *,
     use_videos: bool,
-    include_soft_sync_diagnostics: bool = True,
+    include_soft_sync_diagnostics: bool = False,
 ) -> dict[str, dict[str, Any]]:
     features: dict[str, dict[str, Any]] = {}
 
@@ -373,6 +374,78 @@ def build_dataset_features(
         }
 
     return features
+
+
+def _jsonify(value: Any) -> Any:
+    if is_dataclass(value):
+        return _jsonify(asdict(value))
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _jsonify(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonify(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _device_raw_metadata(device: Any) -> dict[str, Any]:
+    config = getattr(device, "config", None)
+    return {
+        "class": type(device).__name__,
+        "config": _jsonify(config) if config is not None else None,
+        "height": _jsonify(getattr(device, "height", None)),
+        "width": _jsonify(getattr(device, "width", None)),
+        "fps": _jsonify(getattr(config, "fps", None) if config is not None else getattr(device, "fps", None)),
+    }
+
+
+def write_raw_capture_metadata(
+    *,
+    dataset_root: Path,
+    cfg: HandheldRecordingConfig,
+    cameras: dict[str, Any],
+    tactiles: dict[str, Any],
+    handheld_grippers: dict[str, Any],
+    features: dict[str, dict[str, Any]],
+) -> Path:
+    capture_timestamp_feature = features.get("observation.device_capture_timestamp", {})
+    soft_sync_applied = bool(cfg.sensors.soft_sync.enabled)
+    metadata = {
+        "schema_version": 1,
+        "recording_mode": "soft_sync_buffered_samples" if soft_sync_applied else "raw_latest_samples",
+        "soft_sync_applied": soft_sync_applied,
+        "offline_soft_sync_script": "tools/handheld/handheld_soft_sync.py",
+        "dataset": {
+            "repo_id": cfg.dataset.repo_id,
+            "fps": cfg.dataset.fps,
+            "episode_time_s": cfg.dataset.episode_time_s,
+            "video": cfg.dataset.video,
+            "streaming_encoding": cfg.dataset.streaming_encoding,
+            "vcodec": cfg.dataset.vcodec,
+        },
+        "capture": {
+            "max_read_age_ms": cfg.sensors.max_read_age_ms,
+            "device_capture_timestamp_names": capture_timestamp_feature.get("names", []),
+            "soft_sync_config": _jsonify(cfg.sensors.soft_sync),
+        },
+        "devices": {
+            "cameras": {name: _device_raw_metadata(device) for name, device in cameras.items()},
+            "tactiles": {name: _device_raw_metadata(device) for name, device in tactiles.items()},
+            "handheld_grippers": {
+                name: _device_raw_metadata(device) for name, device in handheld_grippers.items()
+            },
+        },
+    }
+    metadata_path = dataset_root / "meta" / "handheld_raw_capture.json"
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+    return metadata_path
 
 
 def _normalize_camera_frame_to_rgb(camera: Any, frame: np.ndarray) -> np.ndarray:
@@ -1324,6 +1397,15 @@ def record(cfg: HandheldRecordingConfig) -> LeRobotDataset:
             include_soft_sync_diagnostics=cfg.sensors.soft_sync.enabled,
         )
         dataset = _create_or_resume_dataset(cfg, features=features, num_cameras=len(cameras))
+        raw_metadata_path = write_raw_capture_metadata(
+            dataset_root=dataset.root,
+            cfg=cfg,
+            cameras=cameras,
+            tactiles=tactiles,
+            handheld_grippers=handheld_grippers,
+            features=features,
+        )
+        logging.info("Raw capture metadata written to %s", raw_metadata_path)
         rerun_enabled = _init_rerun(cfg)
 
         _print_intro(cfg, cameras, tactiles, handheld_grippers, dataset.root)

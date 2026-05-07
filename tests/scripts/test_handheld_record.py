@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from queue import Queue
 from threading import Event, Lock
@@ -116,6 +117,25 @@ def test_build_dataset_features_includes_camera_tactile_and_gripper_streams():
         "tactile.paxini.capture_timestamp_s",
         "handheld_gripper.pika.capture_timestamp_s",
     ]
+    assert "observation.soft_sync" not in features
+    assert features["observation.tactile.paxini.left_xyz"]["shape"] == (3, 10, 12)
+    assert features["observation.tactile.paxini.right_xyz"]["shape"] == (3, 10, 12)
+    assert features["observation.tactile.paxini.left_magnitude"]["shape"] == (10, 12)
+    assert features["observation.tactile.paxini.right_magnitude"]["shape"] == (10, 12)
+    assert features["observation.tactile.paxini.raw_xyz"]["shape"] == (2, 120, 3)
+
+
+def test_build_dataset_features_can_include_soft_sync_diagnostics_when_requested():
+    cameras = {"front": FakeCamera(height=720, width=1280, color_mode=ColorMode.RGB, timestamp=0.0)}
+
+    features = handheld_record.build_dataset_features(
+        cameras,
+        tactiles={},
+        handheld_grippers={},
+        use_videos=True,
+        include_soft_sync_diagnostics=True,
+    )
+
     assert features["observation.soft_sync"]["names"] == [
         "target_timestamp_s",
         "max_skew_s",
@@ -123,11 +143,43 @@ def test_build_dataset_features_includes_camera_tactile_and_gripper_streams():
         "global_lag_s",
         "timed_out",
     ]
-    assert features["observation.tactile.paxini.left_xyz"]["shape"] == (3, 10, 12)
-    assert features["observation.tactile.paxini.right_xyz"]["shape"] == (3, 10, 12)
-    assert features["observation.tactile.paxini.left_magnitude"]["shape"] == (10, 12)
-    assert features["observation.tactile.paxini.right_magnitude"]["shape"] == (10, 12)
-    assert features["observation.tactile.paxini.raw_xyz"]["shape"] == (2, 120, 3)
+
+
+def test_soft_sync_is_disabled_by_default():
+    assert handheld_record.HandheldSoftSyncConfig().enabled is False
+
+
+def test_write_raw_capture_metadata_records_device_and_timestamp_contract(tmp_path):
+    cameras = {"front": FakeCamera(height=720, width=1280, color_mode=ColorMode.RGB, timestamp=0.0)}
+    cfg = handheld_record.HandheldRecordingConfig(
+        sensors=handheld_record.HandheldSensorsConfig(cameras={"front": object()}),
+        dataset=handheld_record.HandheldDatasetConfig(
+            repo_id="local/test",
+            single_task="demo",
+            root=tmp_path,
+        ),
+    )
+    features = handheld_record.build_dataset_features(
+        cameras,
+        tactiles={},
+        handheld_grippers={},
+        use_videos=True,
+    )
+
+    metadata_path = handheld_record.write_raw_capture_metadata(
+        dataset_root=tmp_path,
+        cfg=cfg,
+        cameras=cameras,
+        tactiles={},
+        handheld_grippers={},
+        features=features,
+    )
+
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert payload["recording_mode"] == "raw_latest_samples"
+    assert payload["soft_sync_applied"] is False
+    assert payload["capture"]["device_capture_timestamp_names"] == ["camera.front.capture_timestamp_s"]
+    assert "front" in payload["devices"]["cameras"]
 
 
 def test_collect_dataset_frame_normalizes_bgr_images_and_preserves_capture_times():

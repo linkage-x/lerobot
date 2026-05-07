@@ -2,25 +2,34 @@
 
 ## Problem
 
-The handheld multimodal recorder currently samples each device with `read_latest()` on the dataset clock. It preserves per-device capture timestamps, but it does not wait for camera, tactile, and gripper streams to reach the same target capture time before committing a dataset frame.
+The handheld multimodal recorder samples each device with `read_latest()` on the dataset clock. It preserves per-device capture timestamps in `observation.device_capture_timestamp`.
 
-This means a nominal `timestamp = frame_index / fps` row can contain device observations captured at noticeably different host times.
+The default recording path should preserve raw samples and raw capture metadata first. Soft-sync analysis is now an offline step so that the original data remains auditable and can be reprocessed with different sync thresholds.
 
 ## Target Behavior
 
 - Keep the LeRobot dataset clock canonical: dataset rows still use `frame_index / dataset.fps`.
-- Before each row is collected, compute the target host capture time from `episode_start_time_s + frame_index / fps`.
-- Keep a short timestamped sample buffer for each configured device.
-- Wait until every configured device has buffered at least one sample with `timestamp >= target_time - tolerance`.
-- If all devices enter the window before timeout, select the buffered sample nearest to the target time.
-- If timeout expires, keep recording with the latest available samples, but mark the row as timed out so bad sync can be filtered or inspected later.
+- During recording, collect the latest sample from each connected device and store the raw per-device capture timestamps.
+- Write `meta/handheld_raw_capture.json` with device/config metadata, capture timestamp feature names, and the fact that soft sync was or was not applied during recording.
+- By default, do not add `observation.soft_sync` to newly recorded datasets.
+- Run `tools/handheld/handheld_soft_sync.py` after recording to compute sync diagnostics from the raw capture timestamps.
 - Do not move hardware-specific logic into handheld orchestration. Device adapters continue to own background capture and `latest_timestamp` updates.
 
 ## Configuration
 
-Add `sensors.soft_sync` to `tools/handheld/handheld_record_example.yaml`:
+`sensors.soft_sync` remains in `tools/handheld/handheld_record_example.yaml` for compatibility, but the default is now:
 
-- `enabled`: turn soft sync waiting on/off.
+```yaml
+sensors:
+  soft_sync:
+    enabled: false
+```
+
+When explicitly enabled, the recorder can still write `observation.soft_sync`, but normal collection should leave this disabled and use the offline script.
+
+Soft-sync fields:
+
+- `enabled`: turn live soft sync waiting on/off.
 - `tolerance_ms`: accepted early-arrival margin against the target time.
 - `wait_timeout_ms`: maximum wait per dataset row before falling back to latest samples.
 - `poll_interval_ms`: polling interval while waiting for timestamps to reach the target.
@@ -34,9 +43,9 @@ Recording session control:
 - `n`: stop and discard the current episode immediately.
 - `Esc`: stop the recording session and discard the current in-progress episode.
 
-Initial defaults:
+Defaults:
 
-- `enabled: true`
+- `enabled: false`
 - `tolerance_ms: 20.0`
 - `wait_timeout_ms: 150.0`
 - `poll_interval_ms: 1.0`
@@ -44,7 +53,21 @@ Initial defaults:
 
 ## Dataset Diagnostics
 
-When soft sync is enabled, add `observation.soft_sync` with:
+Raw recording always keeps `observation.device_capture_timestamp` as the per-device source of truth.
+
+The recorder also writes:
+
+```text
+meta/handheld_raw_capture.json
+```
+
+The offline script writes:
+
+```text
+meta/handheld_soft_sync_report.json
+```
+
+When live soft sync is explicitly enabled, `observation.soft_sync` contains:
 
 - `target_timestamp_s`: target dataset-relative capture time.
 - `max_skew_s`: `max(device_capture_timestamp) - min(device_capture_timestamp)` at collection time.
@@ -52,7 +75,34 @@ When soft sync is enabled, add `observation.soft_sync` with:
 - `global_lag_s`: `median(device_capture_timestamp) - target_timestamp_s`, used to detect full-pipeline lag.
 - `timed_out`: `1.0` when the synchronizer had to fall back after timeout, otherwise `0.0`.
 
-The existing `observation.device_capture_timestamp` remains the per-device source of truth.
+For default raw recordings, the same quantities are computed offline in the JSON report instead of being stored per row in the dataset.
+
+## Commands
+
+Raw smoke recording, no soft sync by default:
+
+```bash
+TS=$(date +%Y%m%d_%H%M%S) &&
+PYTHONPATH=src:/opt/MVS/Samples/64/Python:/opt/MVS/Samples/32/Python \
+LD_LIBRARY_PATH=/opt/MVS/lib/64:/opt/MVS/lib:/usr/local/lib \
+HIKROBOT_MVS_HOME=/opt/MVS \
+MVCAM_COMMON_RUNENV=/opt/MVS/lib \
+UV_CACHE_DIR=/tmp/uv-cache \
+uv run --python .venv/bin/python python tools/handheld/handheld_record.py \
+  --config_path tools/handheld/handheld_record_example.yaml \
+  --display_data false \
+  --dataset.root "/tmp/handheld_multimodal_v1_smoke_${TS}" \
+  --dataset.episode_time_s 10
+```
+
+Offline soft-sync report:
+
+```bash
+PYTHONPATH=src uv run --python .venv/bin/python python tools/handheld/handheld_soft_sync.py \
+  --dataset "/tmp/handheld_multimodal_v1_smoke_${TS}" \
+  --tolerance-ms 20 \
+  --global-lag-tolerance-ms 50
+```
 
 ## Execution Steps
 
@@ -67,6 +117,8 @@ The existing `observation.device_capture_timestamp` remains the per-device sourc
 9. Done: Replace latest-only row collection with short timestamped buffers and nearest-target sample selection.
 10. Done: Decouple scheduled capture from dataset writes with a bounded episode queue.
 11. Done: Add `global_lag_s` to the soft-sync diagnostics.
+12. Done: Change the default recorder behavior back to raw latest-sample capture with raw metadata.
+13. Done: Add `tools/handheld/handheld_soft_sync.py` for offline soft-sync diagnostics.
 
 ## Validation
 
