@@ -125,6 +125,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ergodic-speed", type=float, default=0.04)
     parser.add_argument("--ergodic-boundary", choices=("reflect", "clip", "none"), default="reflect")
     parser.add_argument(
+        "--ergodic-position-x0-offset-m",
+        type=float,
+        nargs=3,
+        default=(0.055, -0.045, -0.035),
+        help=(
+            "Default xyz offset from the initial TCP pose when --ergodic-x0 is null. "
+            "A nonzero offset breaks center-start symmetry in the uniform-box ergodic field."
+        ),
+    )
+    parser.add_argument(
+        "--ergodic-rotation-x0-rad",
+        type=float,
+        nargs=3,
+        default=(0.08, -0.06, 0.05),
+        help=(
+            "Default initial local rotvec offset for ergodic_6d when --ergodic-x0 is null. "
+            "A nonzero value breaks the uniform-box symmetry that otherwise keeps rx/ry/rz at zero."
+        ),
+    )
+    parser.add_argument(
         "--ergodic-device",
         choices=("auto", "cpu", "cuda"),
         default="auto",
@@ -302,6 +322,8 @@ def _flatten_calibration_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "ergodic_dt",
             "ergodic_speed",
             "ergodic_boundary",
+            "ergodic_position_x0_offset_m",
+            "ergodic_rotation_x0_rad",
             "ergodic_device",
             "ergodic_plan_only",
             "pause_after_ergodic_plan",
@@ -543,7 +565,13 @@ def _clip_vector_norm(vector: np.ndarray, max_norm: float) -> np.ndarray:
     return vec * (float(max_norm) / norm)
 
 
-def _default_ergodic_bounds(env: FR3MujocoEnv, dim: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _default_ergodic_bounds(
+    env: FR3MujocoEnv,
+    dim: int,
+    *,
+    position_x0_offset_m: np.ndarray | None = None,
+    rotation_x0_rad: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     current_pose = np.asarray(env._current_tcp_pose(), dtype=np.float64)
     xyz = current_pose[:3, 3]
     low_xyz = xyz + np.array([-0.14, -0.16, -0.08], dtype=np.float64)
@@ -552,12 +580,22 @@ def _default_ergodic_bounds(env: FR3MujocoEnv, dim: int) -> tuple[np.ndarray, np
     workspace_max = np.asarray(env.cfg.workspace_max, dtype=np.float64)
     low_xyz = np.maximum(low_xyz, workspace_min)
     high_xyz = np.minimum(high_xyz, workspace_max)
+    pos_offset = np.asarray(
+        [0.055, -0.045, -0.035] if position_x0_offset_m is None else position_x0_offset_m,
+        dtype=np.float64,
+    ).reshape(3)
+    x0_xyz = np.clip(xyz + pos_offset, low_xyz, high_xyz)
     if dim == 3:
-        return low_xyz, high_xyz, np.clip(xyz, low_xyz, high_xyz)
+        return low_xyz, high_xyz, x0_xyz
     if dim == 6:
         low = np.concatenate((low_xyz, np.full(3, -0.35, dtype=np.float64)))
         high = np.concatenate((high_xyz, np.full(3, 0.35, dtype=np.float64)))
-        x0 = np.concatenate((np.clip(xyz, low_xyz, high_xyz), np.zeros(3, dtype=np.float64)))
+        rot_x0 = np.asarray(
+            [0.08, -0.06, 0.05] if rotation_x0_rad is None else rotation_x0_rad,
+            dtype=np.float64,
+        ).reshape(3)
+        rot_x0 = np.clip(rot_x0, low[3:6], high[3:6])
+        x0 = np.concatenate((x0_xyz, rot_x0))
         return low, high, x0
     raise ValueError(f"Unsupported ergodic dim: {dim}")
 
@@ -597,7 +635,14 @@ def _build_ergodic_pose_targets(env: FR3MujocoEnv, args: argparse.Namespace) -> 
         from ergodic.smc import SMCErgodicConfig, run_uniform_box_smc
 
     dim = 3 if args.sample_mode == "ergodic_xyz" else 6
-    default_low, default_high, default_x0 = _default_ergodic_bounds(env, dim)
+    position_x0_offset_m = np.asarray(args.ergodic_position_x0_offset_m, dtype=np.float64).reshape(3)
+    rotation_x0_rad = np.asarray(args.ergodic_rotation_x0_rad, dtype=np.float64).reshape(3)
+    default_low, default_high, default_x0 = _default_ergodic_bounds(
+        env,
+        dim,
+        position_x0_offset_m=position_x0_offset_m,
+        rotation_x0_rad=rotation_x0_rad,
+    )
     low = _coerce_ergodic_vector(args.ergodic_low, dim=dim, name="ergodic_low", default=default_low)
     high = _coerce_ergodic_vector(args.ergodic_high, dim=dim, name="ergodic_high", default=default_high)
     x0 = _coerce_ergodic_vector(args.ergodic_x0, dim=dim, name="ergodic_x0", default=default_x0)

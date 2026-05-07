@@ -4,7 +4,7 @@ calibration:
     root: outputs/datasets/fr3_mujoco_calibration_ergodic_6d
     task: FR3 MuJoCo ergodic 6D calibration
     overwrite: true
-    num_samples: 2000
+    num_samples: 500
     dataset_fps: 10
 
   sampling:
@@ -55,12 +55,16 @@ calibration:
     # 6D state is [x, y, z, rx, ry, rz].
     # xyz null bounds are built around the initial TCP pose; rotation bounds are
     # +/-0.35 rad local rotvec offsets from the initial orientation.
+    # Nonzero x0 offsets break the symmetric uniform-box start that otherwise can
+    # keep x/y or rx/ry/rz fixed.
     ergodic_low: null
     ergodic_high: null
     ergodic_x0: null
+    ergodic_position_x0_offset_m: [0.055, -0.045, -0.035]
+    ergodic_rotation_x0_rad: [0.08, -0.06, 0.05]
     ergodic_num_k_per_dim: 3
     ergodic_dt: 0.05
-    ergodic_speed: 0.045
+    ergodic_speed: 0.10 # 0.045
     ergodic_boundary: reflect
     ergodic_device: auto
     ergodic_plan_only: false

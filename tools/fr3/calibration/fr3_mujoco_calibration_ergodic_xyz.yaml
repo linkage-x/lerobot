@@ -53,9 +53,13 @@ calibration:
 
   ergodic:
     # null means: build a conservative box around the initial TCP pose.
+    # Nonzero xyz x0 offset breaks the symmetric uniform-box start that otherwise
+    # can keep x/y fixed.
     ergodic_low: null
     ergodic_high: null
     ergodic_x0: null
+    ergodic_position_x0_offset_m: [0.055, -0.045, -0.035]
+    ergodic_rotation_x0_rad: [0.08, -0.06, 0.05]
     ergodic_num_k_per_dim: 20
     ergodic_dt: 0.05
     ergodic_speed: 0.05
