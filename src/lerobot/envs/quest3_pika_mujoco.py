@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 from pathlib import Path
 import threading
 import time
@@ -14,6 +15,9 @@ from gymnasium import spaces
 
 from lerobot.envs.fr3_mujoco import FR3MujocoEnvConfig
 from lerobot.utils.rotation import Rotation
+
+
+logger = logging.getLogger(__name__)
 
 
 def _default_quest3_pika_xml_path() -> str:
@@ -54,6 +58,8 @@ class Quest3PikaMujocoEnvConfig(FR3MujocoEnvConfig):
     quest3_gripper_close_settle_steps: int = 120
     quest3_gripper_binary: bool = False
     quest3_gripper_binary_threshold: float = 0.5
+    quest3_release_telemetry_steps: int = 30
+    quest3_release_telemetry_log: bool = True
 
 
 class Quest3PikaMujocoEnv(gym.Env):
@@ -85,9 +91,13 @@ class Quest3PikaMujocoEnv(gym.Env):
         self._gripper_left_body_id = self._body_id("gripper_left_link")
         self._gripper_right_body_id = self._body_id("gripper_right_link")
         self._table_geom_id = self._geom_id("table")
+        self._workspace_object_body_id = self._body_id("workspace_object_body")
         self._workspace_object_geom_id = self._geom_id("workspace_object")
         self._gripper_left_geom_id = self._geom_id("gripper_left_collision")
         self._gripper_right_geom_id = self._geom_id("gripper_right_collision")
+        self._workspace_object_qpos_adr, self._workspace_object_qvel_adr = self._freejoint_addresses(
+            self._workspace_object_body_id,
+        )
 
         self._mocap_body_id = self._body_id("gripper_target")
         self._mocap_id = int(self.model.body_mocapid[self._mocap_body_id])
@@ -153,6 +163,7 @@ class Quest3PikaMujocoEnv(gym.Env):
         self._mocap_baseline_quat_wxyz: np.ndarray | None = None
         self._prev_filtered_dp: np.ndarray | None = None
         self._prev_filtered_dr_rotvec: np.ndarray | None = None
+        self._release_telemetry_frames_remaining = 0
 
         self.action_space = spaces.Box(low=-np.inf, high=np.inf, shape=(len(self.cfg.joint_names),), dtype=np.float32)
         self.observation_space = spaces.Dict(
@@ -193,6 +204,12 @@ class Quest3PikaMujocoEnv(gym.Env):
         if actuator_id < 0:
             raise ValueError(f"Actuator '{name}' not found in MuJoCo model.")
         return int(actuator_id)
+
+    def _freejoint_addresses(self, body_id: int) -> tuple[int, int]:
+        if int(self.model.body_jntnum[body_id]) != 1:
+            raise ValueError("Workspace object body must have exactly one freejoint.")
+        joint_id = int(self.model.body_jntadr[body_id])
+        return int(self.model.jnt_qposadr[joint_id]), int(self.model.jnt_dofadr[joint_id])
 
     def _local_body_pose(self, body_id: int) -> np.ndarray:
         pose = np.eye(4, dtype=np.float64)
@@ -379,6 +396,66 @@ class Quest3PikaMujocoEnv(gym.Env):
         #         f"tendon_len={ten_len:.4f} force={force_val:.2f} "
         #         f"contacts=[{'; '.join(contact_pairs)}]"
         #     )
+
+    def _workspace_object_state(self) -> dict[str, np.ndarray]:
+        qpos_adr = self._workspace_object_qpos_adr
+        qvel_adr = self._workspace_object_qvel_adr
+        return {
+            "position": self.data.qpos[qpos_adr : qpos_adr + 3].copy(),
+            "quaternion_wxyz": self.data.qpos[qpos_adr + 3 : qpos_adr + 7].copy(),
+            "linear_velocity": self.data.qvel[qvel_adr : qvel_adr + 3].copy(),
+            "angular_velocity": self.data.qvel[qvel_adr + 3 : qvel_adr + 6].copy(),
+        }
+
+    def _workspace_object_contacts(self) -> list[dict[str, Any]]:
+        contacts: list[dict[str, Any]] = []
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            if self._workspace_object_geom_id not in (contact.geom1, contact.geom2):
+                continue
+            geom1 = self._mujoco.mj_id2name(self.model, self._mujoco.mjtObj.mjOBJ_GEOM, contact.geom1)
+            geom2 = self._mujoco.mj_id2name(self.model, self._mujoco.mjtObj.mjOBJ_GEOM, contact.geom2)
+            force = np.zeros(6, dtype=np.float64)
+            self._mujoco.mj_contactForce(self.model, self.data, i, force)
+            contacts.append(
+                {
+                    "geom1": geom1,
+                    "geom2": geom2,
+                    "distance": float(contact.dist),
+                    "position": np.asarray(contact.pos, dtype=np.float64).copy(),
+                    "normal": np.asarray(contact.frame[:3], dtype=np.float64).copy(),
+                    "force": force.copy(),
+                }
+            )
+        return contacts
+
+    def _build_release_telemetry(self, *, release_event: bool) -> dict[str, Any]:
+        return {
+            "release_event": bool(release_event),
+            "frames_remaining": int(self._release_telemetry_frames_remaining),
+            "object": self._workspace_object_state(),
+            "contacts": self._workspace_object_contacts(),
+        }
+
+    def _log_release_telemetry(self, telemetry: dict[str, Any]) -> None:
+        if not self.cfg.quest3_release_telemetry_log:
+            return
+        if not telemetry["release_event"] and telemetry["frames_remaining"] <= 0:
+            return
+
+        obj = telemetry["object"]
+        contact_summary = ", ".join(
+            f"{c['geom1']}<->{c['geom2']} dist={c['distance']:.5f} force={np.linalg.norm(c['force'][:3]):.2f}"
+            for c in telemetry["contacts"]
+        )
+        logger.info(
+            "Quest3 release telemetry event=%s frames_remaining=%s object_pos=%s object_vel=%s contacts=[%s]",
+            telemetry["release_event"],
+            telemetry["frames_remaining"],
+            np.array2string(obj["position"], precision=4, suppress_small=True),
+            np.array2string(obj["linear_velocity"], precision=4, suppress_small=True),
+            contact_summary,
+        )
 
     def _step_physics(self, steps: int) -> None:
         for _ in range(max(int(steps), 1)):
@@ -588,9 +665,16 @@ class Quest3PikaMujocoEnv(gym.Env):
 
             previous_gripper = self._last_gripper
             self._last_gripper = float(np.clip(action.get("gripper", self._last_gripper), 0.0, 1.0))
+            release_event = self._last_gripper < previous_gripper - 1e-4
+            close_event = self._last_gripper > previous_gripper + 1e-4
             if not np.isclose(previous_gripper, self._last_gripper):
-                self._set_gripper_command(self._last_gripper, simulate=not self.cfg.continuous_physics)
-                if self.cfg.continuous_physics and self._last_gripper < previous_gripper:
+                self._set_gripper_command(self._last_gripper, simulate=(not self.cfg.continuous_physics and close_event))
+                if release_event:
+                    self._release_telemetry_frames_remaining = max(
+                        int(self.cfg.quest3_release_telemetry_steps),
+                        0,
+                    )
+                if self.cfg.continuous_physics and close_event:
                     settle_steps = max(int(self.cfg.quest3_gripper_close_settle_steps), 0)
                     if settle_steps > 0:
                         self._step_physics(settle_steps)
@@ -609,6 +693,11 @@ class Quest3PikaMujocoEnv(gym.Env):
             info["otg_enabled"] = False
             info["otg_steps"] = 0
             info["sender_steps"] = 0
+            release_telemetry = self._build_release_telemetry(release_event=release_event)
+            info["release_telemetry"] = release_telemetry
+            self._log_release_telemetry(release_telemetry)
+            if self._release_telemetry_frames_remaining > 0:
+                self._release_telemetry_frames_remaining -= 1
             return observation, 0.0, False, truncated, info
 
     def _build_observation(self, *, include_camera_obs: bool = True) -> dict[str, Any]:
@@ -661,6 +750,7 @@ class Quest3PikaMujocoEnv(gym.Env):
             self._mocap_baseline_quat_wxyz = None
             self._prev_filtered_dp = None
             self._prev_filtered_dr_rotvec = None
+            self._release_telemetry_frames_remaining = 0
             if options and "tcp_pose" in options:
                 self._last_command_pose = np.asarray(options["tcp_pose"], dtype=np.float64).reshape(4, 4)
             self._last_gripper = float(np.clip(self.cfg.initial_gripper, 0.0, 1.0))
