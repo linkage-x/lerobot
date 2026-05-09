@@ -30,6 +30,13 @@ Run `lerobot-edit-dataset --help` for more information on the configuration of e
 Remove specific episodes from a dataset. This is useful for filtering out undesired data.
 
 ```bash
+# Convenience wrapper for manual cleanup after replay/rerun checks.
+# Supports "--episodes 0 2 5", "--episodes 0,2,5", or "--episodes \"[0, 2, 5]\"".
+lerobot-clean-episodes \
+    --repo-id lerobot/pusht \
+    --episodes 0 2 5 \
+    --yes
+
 # Delete episodes 0, 2, and 5 (modifies original dataset)
 lerobot-edit-dataset \
     --repo_id lerobot/pusht \
