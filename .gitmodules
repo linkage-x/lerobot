@@ -1,0 +1,4 @@
+[submodule "third_party/opencv_kalibr"]
+	path = third_party/opencv_kalibr
+	url = git@github.com:linkage-x/opencv_kalibr.git
+	branch = deploy

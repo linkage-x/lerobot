@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import shutil
@@ -64,6 +65,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task", default="FR3 MuJoCo calibration")
     parser.add_argument("--overwrite", action="store_true", help="Remove --root before creating the dataset.")
     parser.add_argument("--num-samples", type=int, default=120)
+    parser.add_argument(
+        "--episode-frames",
+        type=int,
+        default=0,
+        help="Save and start a new LeRobot episode every N captured frames. 0 keeps one long episode.",
+    )
     parser.add_argument("--dataset-fps", type=int, default=10)
     parser.add_argument("--control-frequency", type=float, default=20.0)
     parser.add_argument("--max-command-steps", type=int, default=160)
@@ -257,6 +264,7 @@ def _flatten_calibration_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "task",
             "overwrite",
             "num_samples",
+            "episode_frames",
             "dataset_fps",
         ),
         "sampling": (
@@ -1066,6 +1074,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.num_samples <= 0:
         raise ValueError("--num-samples must be > 0.")
+    if args.episode_frames < 0:
+        raise ValueError("--episode-frames must be >= 0.")
     if args.dataset_fps <= 0:
         raise ValueError("--dataset-fps must be > 0.")
     if bool(args.ergodic_plan_only) and not str(args.sample_mode).startswith("ergodic_"):
@@ -1184,6 +1194,7 @@ def main(argv: list[str] | None = None) -> int:
                     "dataset_root": str(dataset.root),
                     "repo_id": args.repo_id,
                     "num_samples": args.num_samples,
+                    "episode_frames": int(args.episode_frames),
                     "camera_names": env.cfg.camera_names,
                     "camera_size": [env.cfg.camera_width, env.cfg.camera_height],
                     "sim_xml_path": env.cfg.sim_xml_path,
@@ -1272,6 +1283,13 @@ def main(argv: list[str] | None = None) -> int:
                 frame, quick_view = _capture_frame(env, task=args.task, episode_start_time_s=episode_start_time_s)
                 dataset.add_frame(frame)
                 sample_idx = int(dataset.episode_buffer["size"])
+                remaining_after_this_sample = int(args.num_samples) - int(index)
+                should_save_episode = (
+                    int(args.episode_frames) > 0
+                    and sample_idx >= int(args.episode_frames)
+                    and index < int(args.num_samples)
+                    and remaining_after_this_sample >= 2
+                )
                 if "final_joint_max_abs_error_rad" in move_result:
                     error_text = f"joint_max_err={move_result['final_joint_max_abs_error_rad']:.5f}rad"
                 else:
@@ -1292,10 +1310,21 @@ def main(argv: list[str] | None = None) -> int:
                         "capture_quick_view": quick_view,
                     }
                 )
+                if should_save_episode:
+                    episode_index = int(dataset.episode_buffer["episode_index"])
+                    dataset.save_episode()
+                    gc.collect()
+                    print(
+                        f"Saved MuJoCo calibration episode #{episode_index} "
+                        f"after {sample_idx} frames; continuing capture."
+                    )
 
             if dataset.episode_buffer is not None and int(dataset.episode_buffer["size"]) > 0:
+                episode_index = int(dataset.episode_buffer["episode_index"])
+                episode_frames = int(dataset.episode_buffer["size"])
                 dataset.save_episode()
-                print("Saved one MuJoCo calibration episode.")
+                gc.collect()
+                print(f"Saved final MuJoCo calibration episode #{episode_index} with {episode_frames} frames.")
 
         report_path = args.report_json
         if report_path is None:
@@ -1305,6 +1334,8 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "dataset_root": str(dataset.root),
                 "repo_id": args.repo_id,
+                "num_samples": int(args.num_samples),
+                "episode_frames": int(args.episode_frames),
                 "camera_names": list(env.cfg.camera_names),
                 "sim_xml_path": env.cfg.sim_xml_path,
                 "motion_mode": resolved_motion_mode,

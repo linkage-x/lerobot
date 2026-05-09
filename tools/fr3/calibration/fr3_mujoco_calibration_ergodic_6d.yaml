@@ -5,6 +5,7 @@ calibration:
     task: FR3 MuJoCo ergodic 6D calibration
     overwrite: true
     num_samples: 500
+    episode_frames: 250
     dataset_fps: 10
 
   sampling:
