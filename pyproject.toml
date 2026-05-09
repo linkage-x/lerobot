@@ -116,6 +116,7 @@ robstride = ["lerobot[can-dep]"]
 # Robots
 openarms = ["lerobot[damiao]"]
 gamepad = ["lerobot[pygame-dep]", "hidapi>=0.14.0,<0.15.0"]
+nintendo = ["hidapi>=0.14.0,<0.15.0"]
 hopejr = ["lerobot[feetech]", "lerobot[pygame-dep]"]
 lekiwi = ["lerobot[feetech]", "pyzmq>=26.2.1,<28.0.0"]
 unitree_g1 = [
@@ -142,6 +143,7 @@ fr3_teleop = [
     "lerobot[kinematics]",
     "lerobot[quest3]",
     "lerobot[spacemouse]",
+    "lerobot[nintendo]",
     "cffi>=1.17.1,<3.0.0",
     "ruckig>=0.15,<0.16",
 ]

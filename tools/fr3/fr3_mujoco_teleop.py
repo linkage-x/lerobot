@@ -30,7 +30,9 @@ except ModuleNotFoundError:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = create_runtime_arg_parser(
-        description="Run FR3 MuJoCo teleoperation with SpaceMouse or Quest3 and marker viewer.",
+        description=(
+            "Run FR3 MuJoCo teleoperation with SpaceMouse, Quest3, or Nintendo controller and marker viewer."
+        ),
         include_duration=True,
     )
     return parser.parse_args(argv)
@@ -68,6 +70,9 @@ def main(argv: list[str] | None = None) -> int:
                 "quest3_follow_orientation": args.quest3_follow_orientation,
                 "quest3_position_scale": args.quest3_position_scale,
                 "quest3_position_offset": args.quest3_position_offset,
+                "nintendo_controller": args.nintendo_controller,
+                "nintendo_side": args.nintendo_side,
+                "nintendo_device_id": args.nintendo_device_id,
                 "tool_mode": args.tool_mode,
                 "motion_enable_button": args.motion_enable_button,
                 "enable_rotation": args.enable_rotation,

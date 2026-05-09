@@ -370,7 +370,7 @@ def _run_episode_control_loop(
 def record(cfg: RecordConfig) -> LeRobotDataset:
     runtime_args = _RUNTIME_ARGS or parse_runtime_args(
         [],
-        description="Run FR3 MuJoCo simulation recording with the default ee2ee dataset contract.",
+        description="Run FR3 MuJoCo simulation recording with SpaceMouse, Quest3, or Nintendo controller.",
     )[0]
     init_logging()
     mujoco_gl_backend = configure_mujoco_gl_backend(runtime_args)
@@ -388,6 +388,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     "mujoco_gl": mujoco_gl_backend,
                     "teleop_type": getattr(cfg.teleop, "type", getattr(runtime_args, "teleop_type", None)),
                     "quest3_scene_mode": getattr(runtime_args, "quest3_scene_mode", None),
+                    "nintendo_controller": getattr(runtime_args, "nintendo_controller", None),
+                    "nintendo_side": getattr(runtime_args, "nintendo_side", None),
+                    "nintendo_device_id": getattr(runtime_args, "nintendo_device_id", None),
                     "tool_mode": runtime_args.tool_mode,
                     "motion_enable_button": runtime_args.motion_enable_button,
                     "enable_rotation": runtime_args.enable_rotation,
@@ -779,7 +782,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 def main(argv: list[str] | None = None) -> None:
     runtime_args, remaining = parse_runtime_args(
         argv,
-        description="Run FR3 MuJoCo simulation recording with the default ee2ee dataset contract.",
+        description="Run FR3 MuJoCo simulation recording with SpaceMouse, Quest3, or Nintendo controller.",
     )
     global _RUNTIME_ARGS
     _RUNTIME_ARGS = runtime_args

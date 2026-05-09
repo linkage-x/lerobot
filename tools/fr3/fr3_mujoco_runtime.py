@@ -11,6 +11,11 @@ from lerobot.envs.fr3_mujoco import FR3MujocoEnv, FR3MujocoEnvConfig
 from lerobot.envs.fr3_mujoco_teleop import MarkerStyle
 from lerobot.envs.quest3_pika_mujoco import Quest3PikaMujocoEnv, Quest3PikaMujocoEnvConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
+from lerobot.teleoperators.nintendo.configuration_nintendo import (
+    NintendoController,
+    NintendoGripperMode,
+    NintendoTeleopConfig,
+)
 from lerobot.teleoperators.quest3.configuration_quest3 import (
     DEFAULT_QUEST3_CALIBRATION_DIR,
     DEFAULT_QUEST3_CERT_FILE,
@@ -42,7 +47,7 @@ def create_runtime_arg_parser(
         parser.add_argument("--duration-s", type=float, default=None)
     parser.add_argument(
         "--teleop-type",
-        choices=("spacemouse", "quest3"),
+        choices=("spacemouse", "quest3", "nintendo"),
         default="spacemouse",
         help="Teleoperator type for argparse-only FR3 MuJoCo tools. fr3_mujoco_record.py also accepts draccus --teleop.type.",
     )
@@ -223,6 +228,28 @@ def create_runtime_arg_parser(
     parser.add_argument("--axis-length", type=float, default=0.06)
     parser.add_argument("--quest3-debug-pose", action="store_true", help="Print Quest3 wrist to MuJoCo TCP mapping diagnostics.")
     parser.add_argument("--quest3-debug-pose-period-s", type=float, default=1.0)
+    parser.add_argument(
+        "--nintendo-controller",
+        choices=[controller.value for controller in NintendoController],
+        default=NintendoController.ANY.value,
+    )
+    parser.add_argument(
+        "--nintendo-side",
+        choices=[controller.value for controller in NintendoController],
+        default=NintendoController.ANY.value,
+    )
+    parser.add_argument("--nintendo-device-id", type=int, default=None)
+    parser.add_argument("--nintendo-translation-scale", type=float, default=0.0015)
+    parser.add_argument("--nintendo-vertical-scale", type=float, default=0.0015)
+    parser.add_argument("--nintendo-rotation-scale", type=float, default=0.006)
+    parser.add_argument("--nintendo-stick-deadband", type=float, default=0.12)
+    parser.add_argument(
+        "--nintendo-gripper-mode",
+        choices=[mode.value for mode in NintendoGripperMode],
+        default=NintendoGripperMode.INCREMENTAL.value,
+    )
+    parser.add_argument("--nintendo-gripper-step", type=float, default=0.03)
+    parser.add_argument("--nintendo-stale-timeout-s", type=float, default=0.25)
     return parser
 
 
@@ -268,6 +295,26 @@ def _apply_runtime_quest3_overrides(config: Quest3TeleopConfig, args: argparse.N
     return config
 
 
+def _apply_runtime_nintendo_overrides(
+    config: NintendoTeleopConfig,
+    args: argparse.Namespace,
+) -> NintendoTeleopConfig:
+    config.device_id = args.nintendo_device_id
+    config.controller = NintendoController(args.nintendo_controller)
+    config.side = NintendoController(args.nintendo_side)
+    config.translation_scale = float(args.nintendo_translation_scale)
+    config.vertical_scale = float(args.nintendo_vertical_scale)
+    config.rotation_scale = float(args.nintendo_rotation_scale)
+    config.stick_deadband = float(args.nintendo_stick_deadband)
+    config.enable_rotation = bool(args.enable_rotation)
+    config.gripper_mode = NintendoGripperMode(args.nintendo_gripper_mode)
+    config.gripper_step = float(args.nintendo_gripper_step)
+    config.gripper_cmd_ema_alpha = float(args.gripper_cmd_ema_alpha)
+    config.gripper_cmd_max_rate = float(args.gripper_cmd_max_rate)
+    config.stale_timeout_s = float(args.nintendo_stale_timeout_s)
+    return config
+
+
 def build_runtime_teleop_config(
     args: argparse.Namespace,
     *,
@@ -281,6 +328,10 @@ def build_runtime_teleop_config(
             config = copy.deepcopy(base_config)
             _set_frequency(config, resolved_frequency)
             return _apply_runtime_quest3_overrides(config, args)
+        if teleop_type == "nintendo":
+            config = copy.deepcopy(base_config)
+            _set_frequency(config, resolved_frequency)
+            return _apply_runtime_nintendo_overrides(config, args)
 
     if getattr(args, "teleop_type", "spacemouse") == "quest3":
         return Quest3TeleopConfig(
@@ -308,6 +359,24 @@ def build_runtime_teleop_config(
             gripper_cmd_ema_alpha=args.gripper_cmd_ema_alpha,
             gripper_cmd_max_rate=args.gripper_cmd_max_rate,
             lost_tracking_timeout_s=args.quest3_lost_tracking_timeout_s,
+        )
+
+    if getattr(args, "teleop_type", "spacemouse") == "nintendo":
+        return NintendoTeleopConfig(
+            device_id=args.nintendo_device_id,
+            controller=NintendoController(args.nintendo_controller),
+            side=NintendoController(args.nintendo_side),
+            frequency=resolved_frequency,
+            translation_scale=args.nintendo_translation_scale,
+            vertical_scale=args.nintendo_vertical_scale,
+            rotation_scale=args.nintendo_rotation_scale,
+            stick_deadband=args.nintendo_stick_deadband,
+            enable_rotation=args.enable_rotation,
+            gripper_mode=NintendoGripperMode(args.nintendo_gripper_mode),
+            gripper_step=args.nintendo_gripper_step,
+            gripper_cmd_ema_alpha=args.gripper_cmd_ema_alpha,
+            gripper_cmd_max_rate=args.gripper_cmd_max_rate,
+            stale_timeout_s=args.nintendo_stale_timeout_s,
         )
 
     return SpaceMouseTeleopConfig(
