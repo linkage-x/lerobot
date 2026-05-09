@@ -182,3 +182,6 @@ outputs/
 
 .agents
 _bmad
+
+MUJOCO_LOG.TXT
+.claude

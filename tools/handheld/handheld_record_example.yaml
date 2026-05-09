@@ -175,16 +175,16 @@ sensors:
       port: /dev/ttyUSB0
       fps: 120
       warmup_s: 1.0
-    pika_left:
-      type: pika_sense
-      port: /dev/ttyUSB1
-      fps: 120
-      warmup_s: 1.0
+    # pika_left:
+    #   type: pika_sense
+    #   port: /dev/ttyUSB1
+    #   fps: 120
+    #   warmup_s: 1.0
 
 dataset:
   repo_id: local/handheld_multimodal_v1
   single_task: Handheld multimodal capture
-  root: /workspace/outputs/datasets/handheld_multimodal_v1
+  root: outputs/datasets/handheld_multimodal_v1
   fps: 30
   # 0 means unlimited saved episodes; press Esc while recording to stop the session.
   num_episodes: 0

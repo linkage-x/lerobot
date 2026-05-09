@@ -292,16 +292,20 @@ EOF
 
 require_cmd "${UV_BIN}"
 require_cmd git
-require_cmd sudo
 
 if [[ "${INSTALL_SYSTEM_DEPS}" == "1" ]]; then
+  require_cmd sudo
   install_system_deps
 fi
 
 ensure_venv
 sync_python_deps
-build_libfranka_if_needed
-install_panda_py
+
+if [[ "${BUILD_LIBFRANKA}" == "1" ]]; then
+  require_cmd sudo
+  build_libfranka_if_needed
+  install_panda_py
+fi
 
 install_optional_sdk "${WITH_PIKA_SDK}" "pika_sdk" "${PIKA_SDK_SRC}" "${PIKA_SDK_REPO}" "/opt/dependencies/pika_sdk"
 

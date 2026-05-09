@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import select
+import signal
 import sys
 import termios
 import time
@@ -65,6 +66,23 @@ HANDHELD_SOFT_SYNC_FEATURE_NAMES = (
     "global_lag_s",
     "timed_out",
 )
+
+
+def _raise_keyboard_interrupt_on_signal(signum: int, _frame: Any) -> None:
+    raise KeyboardInterrupt(f"Received signal {signum}")
+
+
+def _install_termination_signal_handlers() -> dict[int, Any]:
+    previous_handlers: dict[int, Any] = {}
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, _raise_keyboard_interrupt_on_signal)
+    return previous_handlers
+
+
+def _restore_signal_handlers(previous_handlers: dict[int, Any]) -> None:
+    for signum, handler in previous_handlers.items():
+        signal.signal(signum, handler)
 
 
 @dataclass
@@ -876,6 +894,10 @@ def collect_dataset_frame(
 
 
 def _init_rerun(cfg: HandheldRecordingConfig) -> bool:
+    if os.getenv("LEROBOT_GUI_HEADLESS") == "1" and cfg.rerun_save_path is None:
+        logging.info("GUI headless mode is enabled; skipping Rerun viewer startup.")
+        return False
+
     if not cfg.display_data and cfg.rerun_save_path is None:
         return False
 
@@ -897,10 +919,18 @@ def _init_rerun(cfg: HandheldRecordingConfig) -> bool:
         return True
 
     if cfg.display_ip is not None and cfg.display_port is not None:
-        rr.connect_grpc(url=f"rerun+http://{cfg.display_ip}:{cfg.display_port}/proxy")
+        try:
+            rr.connect_grpc(url=f"rerun+http://{cfg.display_ip}:{cfg.display_port}/proxy")
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to connect to Rerun viewer; continuing without visualization: %s", exc)
+            return False
     else:
         memory_limit = os.getenv("LEROBOT_RERUN_MEMORY_LIMIT", "10%")
-        rr.spawn(memory_limit=memory_limit)
+        try:
+            rr.spawn(memory_limit=memory_limit)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to spawn Rerun viewer; continuing without visualization: %s", exc)
+            return False
 
     return True
 
@@ -1105,9 +1135,17 @@ def _confirm_keep_episode(play_sounds: bool) -> bool:
         print("Please answer with 'Y' or 'n'.")
 
 
-def _wait_for_enter(episode_attempt_index: int, play_sounds: bool) -> None:
+def _wait_for_enter(episode_attempt_index: int, play_sounds: bool) -> bool:
     log_say(f"Episode {episode_attempt_index} ready", play_sounds)
-    input(f"Episode {episode_attempt_index}: press Enter to start recording...")
+    try:
+        response = input(f"Episode {episode_attempt_index}: press Enter to start recording...")
+    except EOFError:
+        print("Input stream closed; stopping recording session.")
+        return False
+    if response.strip().lower() in ("q", "quit", "exit", "esc"):
+        print("Recording exit requested before episode start.")
+        return False
+    return True
 
 
 @contextmanager
@@ -1126,10 +1164,21 @@ def _terminal_cbreak_mode() -> Iterator[bool]:
         termios.tcflush(fd, termios.TCIFLUSH)
 
 
-def _read_terminal_key_nonblocking() -> str | None:
-    if not sys.stdin.isatty():
-        return None
+def _drain_non_tty_stdin_line() -> None:
+    if sys.stdin.isatty():
+        return
+    try:
+        while True:
+            ready, _, _ = select.select([sys.stdin], [], [], 0.0)
+            if not ready:
+                return
+            if os.read(sys.stdin.fileno(), 1) in (b"", b"\n"):
+                return
+    except OSError:
+        return
 
+
+def _read_terminal_key_nonblocking() -> str | None:
     ready, _, _ = select.select([sys.stdin], [], [], 0.0)
     if not ready:
         return None
@@ -1142,7 +1191,10 @@ def _read_terminal_key_nonblocking() -> str | None:
         return None
     if pressed == b"\x1b":
         return "esc"
-    return pressed.decode("utf-8", errors="ignore").lower()
+    key = pressed.decode("utf-8", errors="ignore").lower()
+    if not sys.stdin.isatty() and key not in ("\n", "\r"):
+        _drain_non_tty_stdin_line()
+    return key
 
 
 def _has_episode_data(dataset: LeRobotDataset) -> bool:
@@ -1183,6 +1235,17 @@ def _capture_episode_frames(
             pressed = _read_terminal_key_nonblocking()
             if pressed == "esc":
                 logging.info("Detected Esc during recording; stopping recording session.")
+                output_queue.put(
+                    EpisodeCaptureComplete(
+                        EpisodeRecordResult(
+                            recorded_frames=frame_index,
+                            stop_action=EpisodeStopAction.EXIT,
+                        )
+                    )
+                )
+                return
+            if pressed in ("q", "x"):
+                logging.info("Detected exit command during recording; stopping recording session.")
                 output_queue.put(
                     EpisodeCaptureComplete(
                         EpisodeRecordResult(
@@ -1356,6 +1419,7 @@ def _create_or_resume_dataset(
             )
         return dataset
 
+    cfg.dataset.root = _timestamped_dataset_root(cfg.dataset.root)
     return LeRobotDataset.create(
         cfg.dataset.repo_id,
         cfg.dataset.fps,
@@ -1373,9 +1437,29 @@ def _create_or_resume_dataset(
     )
 
 
+def _timestamped_dataset_root(root: str | Path | None) -> Path | None:
+    if root is None:
+        return None
+
+    path = Path(root)
+    if not path.name:
+        raise ValueError(f"`dataset.root` must include a directory name, but got {root!s}.")
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    candidate = path.with_name(f"{path.name}_{timestamp}")
+    suffix_index = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}_{timestamp}_{suffix_index:02d}")
+        suffix_index += 1
+
+    logging.info("Using timestamped dataset root: %s", candidate)
+    return candidate
+
+
 @parser.wrap()
 def record(cfg: HandheldRecordingConfig) -> LeRobotDataset:
     init_logging()
+    previous_signal_handlers = _install_termination_signal_handlers()
 
     all_cameras = make_cameras_from_configs(cfg.sensors.cameras)
     cameras = all_cameras
@@ -1427,7 +1511,8 @@ def record(cfg: HandheldRecordingConfig) -> LeRobotDataset:
         with VideoEncodingManager(dataset):
             while not _recording_target_reached(dataset, cfg.dataset.num_episodes):
                 attempted_episodes += 1
-                _wait_for_enter(attempted_episodes, cfg.play_sounds)
+                if not _wait_for_enter(attempted_episodes, cfg.play_sounds):
+                    break
 
                 try:
                     record_result = _record_episode(
@@ -1486,11 +1571,15 @@ def record(cfg: HandheldRecordingConfig) -> LeRobotDataset:
                     dataset.clear_episode_buffer(delete_images=len(dataset.meta.image_keys) > 0)
                     print("Episode discarded.")
 
+        dataset.finalize()
         if cfg.dataset.push_to_hub:
             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
 
         return dataset
     finally:
+        if dataset is not None:
+            dataset.finalize()
+        _restore_signal_handlers(previous_signal_handlers)
         _stop_soft_sync_sample_buffers(soft_sync_buffers)
         _disconnect_devices(cameras, tactiles, handheld_grippers)
 
