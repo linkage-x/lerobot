@@ -35,6 +35,7 @@ class NintendoTeleop(Teleoperator):
     name = "nintendo"
 
     driver_cls = NintendoHIDDriver
+    GRAVITY_MPS2 = 9.80665
 
     def __init__(self, config: NintendoTeleopConfig):
         super().__init__(config)
@@ -47,6 +48,13 @@ class NintendoTeleop(Teleoperator):
         self._filtered_gripper = self._last_gripper
         self._last_gripper_update_s = float("-inf")
         self._last_filtered_gripper_time = float("-inf")
+        self._last_clutch_active = False
+        self._imu_baseline_accel_g: np.ndarray | None = None
+        self._imu_baseline_gyro_dps: np.ndarray | None = None
+        self._imu_position_m = np.zeros(3, dtype=np.float64)
+        self._imu_velocity_mps = np.zeros(3, dtype=np.float64)
+        self._imu_rotvec_rad = np.zeros(3, dtype=np.float64)
+        self._last_imu_time_s = float("-inf")
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -111,78 +119,182 @@ class NintendoTeleop(Teleoperator):
             "gripper": self._filtered_gripper,
         }
 
-    def _latest_reading(self) -> NintendoControllerReading | None:
+    def _latest_reading(self, now: float | None = None) -> tuple[NintendoControllerReading | None, bool]:
         if self._driver is None:
-            return None
+            return None, False
         reading = self._driver.poll()
-        now = time.perf_counter()
+        now = time.perf_counter() if now is None else float(now)
         if reading is not None:
             self._last_reading = reading
             self._last_update_s = now
-            return reading
+            return reading, True
         if self._last_reading is not None and now - self._last_update_s <= float(self.config.stale_timeout_s):
-            return self._last_reading
-        return None
+            return self._last_reading, False
+        return None, False
 
     @staticmethod
-    def _deadband(value: float, threshold: float) -> float:
+    def _deadband_vector(values: np.ndarray, threshold: float) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64)
+        threshold = float(abs(threshold))
+        return np.where(np.abs(values) >= threshold, values, 0.0)
+
+    @staticmethod
+    def _deadband_scalar(value: float, threshold: float) -> float:
         value = float(value)
         threshold = float(abs(threshold))
         if abs(value) < threshold:
             return 0.0
-        if threshold >= 1.0:
-            return float(np.clip(value, -1.0, 1.0))
-        scaled = (abs(value) - threshold) / (1.0 - threshold)
-        return float(np.sign(value) * np.clip(scaled, 0.0, 1.0))
+        return value
 
     @staticmethod
-    def _button_axis(buttons: frozenset[str], positive: tuple[str, ...], negative: tuple[str, ...]) -> float:
-        pos = any(button in buttons for button in positive)
-        neg = any(button in buttons for button in negative)
-        if pos and not neg:
-            return 1.0
-        if neg and not pos:
-            return -1.0
-        return 0.0
-
-    def _primary_stick(self, reading: NintendoControllerReading) -> tuple[float, float]:
-        if reading.controller_type == "right":
-            return reading.right_stick
-        return reading.left_stick
-
-    def _motion_inputs(self, reading: NintendoControllerReading) -> np.ndarray:
-        primary_x, primary_y = self._primary_stick(reading)
-        right_x, right_y = reading.right_stick
-        buttons = reading.buttons
-
-        x = primary_y
-        y = primary_x
-        z = right_y if reading.controller_type == "pro" else 0.0
-        wz = right_x if reading.controller_type == "pro" else 0.0
-
-        z_button_axis = self._button_axis(buttons, self.config.z_up_buttons, self.config.z_down_buttons)
-        yaw_button_axis = self._button_axis(
-            buttons,
-            self.config.yaw_positive_buttons,
-            self.config.yaw_negative_buttons,
-        )
-        if z_button_axis != 0.0:
-            z = z_button_axis
-        if yaw_button_axis != 0.0:
-            wz = yaw_button_axis
-
-        values = np.array([x, y, z, 0.0, 0.0, wz], dtype=np.float64)
-        threshold = float(self.config.stick_deadband)
-        values = np.array([self._deadband(value, threshold) for value in values], dtype=np.float64)
-        if self.config.invert_x:
-            values[0] *= -1.0
-        if self.config.invert_y:
-            values[1] *= -1.0
-        if self.config.invert_z:
-            values[2] *= -1.0
-        if self.config.invert_wz:
-            values[5] *= -1.0
+    def _clamp_norm(values: np.ndarray, max_norm: float) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64)
+        max_norm = float(max_norm)
+        if max_norm <= 0.0:
+            return values
+        norm = float(np.linalg.norm(values))
+        if norm > max_norm:
+            return values / norm * max_norm
         return values
+
+    @cached_property
+    def accel_axis_map(self) -> np.ndarray:
+        matrix = np.asarray(self.config.accel_axis_map, dtype=np.float64)
+        if matrix.shape != (3, 3):
+            raise ValueError(f"accel_axis_map must be 3x3, got {matrix.shape}")
+        return matrix
+
+    @cached_property
+    def gyro_axis_map(self) -> np.ndarray:
+        matrix = np.asarray(self.config.gyro_axis_map, dtype=np.float64)
+        if matrix.shape != (3, 3):
+            raise ValueError(f"gyro_axis_map must be 3x3, got {matrix.shape}")
+        return matrix
+
+    def _reading_accel_g(self, reading: NintendoControllerReading) -> np.ndarray:
+        accel = self.accel_axis_map @ np.asarray(reading.accel_g, dtype=np.float64)
+        if self.config.invert_x:
+            accel[0] *= -1.0
+        if self.config.invert_y:
+            accel[1] *= -1.0
+        if self.config.invert_z:
+            accel[2] *= -1.0
+        return accel
+
+    def _reading_gyro_dps(self, reading: NintendoControllerReading) -> np.ndarray:
+        gyro = self.gyro_axis_map @ np.asarray(reading.gyro_dps, dtype=np.float64)
+        if self.config.invert_wx:
+            gyro[0] *= -1.0
+        if self.config.invert_wy:
+            gyro[1] *= -1.0
+        if self.config.invert_wz:
+            gyro[2] *= -1.0
+        return gyro
+
+    def _reset_imu_clutch_state(self) -> None:
+        self._last_clutch_active = False
+        self._imu_baseline_accel_g = None
+        self._imu_baseline_gyro_dps = None
+        self._imu_position_m.fill(0.0)
+        self._imu_velocity_mps.fill(0.0)
+        self._imu_rotvec_rad.fill(0.0)
+        self._last_imu_time_s = float("-inf")
+
+    def _imu_relative_target(
+        self,
+        reading: NintendoControllerReading,
+        now: float,
+        *,
+        is_fresh: bool,
+    ) -> tuple[np.ndarray, bool]:
+        clutch_active = self._clutch_active(reading.buttons)
+        if not clutch_active:
+            self._reset_imu_clutch_state()
+            return np.zeros(6, dtype=np.float64), False
+
+        accel_g = self._reading_accel_g(reading)
+        gyro_dps = self._reading_gyro_dps(reading)
+        if self._imu_baseline_accel_g is None or self._imu_baseline_gyro_dps is None or not self._last_clutch_active:
+            self._imu_baseline_accel_g = accel_g.copy()
+            self._imu_baseline_gyro_dps = gyro_dps.copy()
+            self._imu_position_m.fill(0.0)
+            self._imu_velocity_mps.fill(0.0)
+            self._imu_rotvec_rad.fill(0.0)
+            self._last_imu_time_s = now
+            self._last_clutch_active = True
+            return np.zeros(6, dtype=np.float64), True
+
+        if not is_fresh:
+            return np.zeros(6, dtype=np.float64), True
+
+        dt = now - self._last_imu_time_s
+        if not np.isfinite(dt) or dt <= 0.0:
+            dt = 1.0 / max(float(self.config.frequency), 1.0)
+        dt = min(float(dt), float(self.config.max_imu_dt_s))
+        self._last_imu_time_s = now
+
+        rel_accel_g = self._deadband_vector(
+            accel_g - self._imu_baseline_accel_g,
+            self.config.imu_accel_deadband_g,
+        )
+        rel_gyro_dps = self._deadband_vector(
+            gyro_dps - self._imu_baseline_gyro_dps,
+            self.config.imu_gyro_deadband_dps,
+        )
+
+        accel_norm_delta_g = abs(float(np.linalg.norm(accel_g)) - float(np.linalg.norm(self._imu_baseline_accel_g)))
+        stationary_gyro_threshold_dps = float(self.config.imu_stationary_gyro_dps)
+        stationary_imu = (
+            stationary_gyro_threshold_dps > 0.0
+            and min(float(np.linalg.norm(rel_gyro_dps)), float(np.linalg.norm(gyro_dps)))
+            <= stationary_gyro_threshold_dps
+            and accel_norm_delta_g <= float(self.config.imu_stationary_accel_norm_tolerance_g)
+        )
+        if stationary_imu:
+            rel_accel_g = np.zeros(3, dtype=np.float64)
+            rel_gyro_dps = np.zeros(3, dtype=np.float64)
+            self._imu_baseline_accel_g = accel_g.copy()
+            self._imu_baseline_gyro_dps = gyro_dps.copy()
+            self._imu_velocity_mps.fill(0.0)
+
+        step_pos_m = np.zeros(3, dtype=np.float64)
+        if self.config.experimental_imu_translation:
+            self._imu_velocity_mps += rel_accel_g * self.GRAVITY_MPS2 * dt
+            self._imu_velocity_mps *= float(np.clip(self.config.imu_velocity_decay, 0.0, 1.0))
+            step_pos_m = self._imu_velocity_mps * dt
+            self._imu_position_m += step_pos_m
+            self._imu_position_m = self._clamp_norm(self._imu_position_m, self.config.max_step_pos_m)
+            step_pos_m = self._clamp_norm(step_pos_m, self.config.max_step_pos_m)
+        else:
+            self._imu_velocity_mps.fill(0.0)
+
+        step_rotvec_rad = np.deg2rad(rel_gyro_dps) * dt
+
+        self._imu_rotvec_rad += step_rotvec_rad
+        self._imu_rotvec_rad = self._clamp_norm(self._imu_rotvec_rad, self.config.max_step_rot_rad)
+
+        step_rotvec_rad = self._clamp_norm(step_rotvec_rad, self.config.max_step_rot_rad)
+        return np.concatenate((step_pos_m, step_rotvec_rad)), True
+
+    def _stick_translation_target(self, reading: NintendoControllerReading) -> tuple[np.ndarray, bool]:
+        left_x, left_y = reading.left_stick
+        _right_x, right_y = reading.right_stick
+        deadband = float(self.config.stick_deadband)
+        translation = np.array(
+            [
+                self._deadband_scalar(left_y, deadband),
+                -self._deadband_scalar(left_x, deadband),
+                self._deadband_scalar(right_y, deadband),
+            ],
+            dtype=np.float64,
+        )
+        if self.config.invert_x:
+            translation[0] *= -1.0
+        if self.config.invert_y:
+            translation[1] *= -1.0
+        if self.config.invert_z:
+            translation[2] *= -1.0
+        return translation, bool(np.any(translation))
 
     def _scale_vector(self) -> np.ndarray:
         defaults = np.array(
@@ -221,7 +333,7 @@ class NintendoTeleop(Teleoperator):
     def _update_gripper(self, buttons: frozenset[str]) -> None:
         close_pressed = any(button in buttons for button in self.config.gripper_close_buttons)
         open_pressed = any(button in buttons for button in self.config.gripper_open_buttons)
-        if close_pressed == open_pressed:
+        if close_pressed and open_pressed:
             return
 
         now = time.perf_counter()
@@ -279,6 +391,11 @@ class NintendoTeleop(Teleoperator):
             "buttons": () if reading is None else tuple(sorted(reading.buttons)),
             "left_stick": (0.0, 0.0) if reading is None else reading.left_stick,
             "right_stick": (0.0, 0.0) if reading is None else reading.right_stick,
+            "accel_g": (0.0, 0.0, 0.0) if reading is None else reading.accel_g,
+            "gyro_dps": (0.0, 0.0, 0.0) if reading is None else reading.gyro_dps,
+            "clutch_active": self._last_clutch_active,
+            "imu_position_m": tuple(float(v) for v in self._imu_position_m),
+            "imu_rotvec_rad": tuple(float(v) for v in self._imu_rotvec_rad),
             "last_update_age_s": (
                 float("inf")
                 if not np.isfinite(self._last_update_s)
@@ -305,10 +422,12 @@ class NintendoTeleop(Teleoperator):
         deadline = None if timeout_s is None else time.perf_counter() + timeout_s
         idle_samples = 0
         while True:
-            reading = self._latest_reading()
+            now = time.perf_counter()
+            reading, _is_fresh = self._latest_reading(now)
             motion = False
             if reading is not None:
-                motion = bool(np.any(np.abs(self._motion_inputs(reading)) > 0.0))
+                _stick_translation, translation_enabled = self._stick_translation_target(reading)
+                motion = self._clutch_active(reading.buttons) or translation_enabled
             if motion:
                 idle_samples = 0
             else:
@@ -323,17 +442,25 @@ class NintendoTeleop(Teleoperator):
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:
-        reading = self._latest_reading()
+        now = time.perf_counter()
+        reading, is_fresh = self._latest_reading(now)
         if reading is None:
+            self._reset_imu_clutch_state()
             return self._zero_action()
 
         self._update_gripper(reading.buttons)
         filtered_gripper = self._filter_gripper_command(self._last_gripper)
-        inputs = self._motion_inputs(reading)
+        stick_translation, translation_enabled = self._stick_translation_target(reading)
+        inputs, rotation_enabled = self._imu_relative_target(reading, now, is_fresh=is_fresh)
+        if not self.config.experimental_imu_translation:
+            inputs[:3] = stick_translation
+        else:
+            inputs[:3] += stick_translation
         if not self.config.enable_rotation:
             inputs[3:] = 0.0
+            rotation_enabled = False
         target = inputs * self._scale_vector()
-        enabled = self._clutch_active(reading.buttons) and bool(np.any(np.abs(target) > 0.0))
+        enabled = translation_enabled or rotation_enabled
         if not enabled:
             action = self._zero_action()
             action["gripper"] = filtered_gripper
@@ -366,3 +493,4 @@ class NintendoTeleop(Teleoperator):
             self._is_connected = False
             self._last_reading = None
             self._last_update_s = float("-inf")
+            self._reset_imu_clutch_state()

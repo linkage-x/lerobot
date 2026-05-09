@@ -45,35 +45,56 @@ class NintendoTeleopConfig(TeleoperatorConfig):
     side: NintendoController = NintendoController.ANY
     frequency: int = 200
 
-    translation_scale: float = 0.0015
-    vertical_scale: float = 0.0015
-    rotation_scale: float = 0.006
+    translation_scale: float = 0.001
+    vertical_scale: float = 0.001
+    rotation_scale: float = 1.0
     scale_x: float | None = None
     scale_y: float | None = None
     scale_z: float | None = None
-    scale_wx: float | None = 0.0
-    scale_wy: float | None = 0.0
+    scale_wx: float | None = None
+    scale_wy: float | None = None
     scale_wz: float | None = None
-    stick_deadband: float = 0.12
     enable_rotation: bool = True
     invert_x: bool = False
     invert_y: bool = False
     invert_z: bool = False
-    invert_wz: bool = False
+    invert_wx: bool = False
+    invert_wy: bool = True
+    invert_wz: bool = True
 
-    # Hold one of these buttons to enable robot motion. Empty tuple means always enabled.
-    clutch_buttons: tuple[str, ...] = ("R", "L")
-    z_up_buttons: tuple[str, ...] = ("X", "UP")
-    z_down_buttons: tuple[str, ...] = ("B", "DOWN")
-    yaw_positive_buttons: tuple[str, ...] = ("Y", "LEFT")
-    yaw_negative_buttons: tuple[str, ...] = ("A", "RIGHT")
+    # Left stick X/Y and right stick Z are used for translation by default. IMU
+    # translation is kept as an opt-in experimental mode because accelerometer
+    # double integration drifts without external tracking.
+    stick_deadband: float = 0.12
+    experimental_imu_translation: bool = False
+
+    # Hold one of these buttons to set the IMU origin and enable relative rotation.
+    clutch_buttons: tuple[str, ...] = ("ZL",)
+    imu_accel_deadband_g: float = 0.03
+    imu_gyro_deadband_dps: float = 1.5
+    imu_stationary_gyro_dps: float = 3.0
+    imu_stationary_accel_norm_tolerance_g: float = 0.08
+    imu_velocity_decay: float = 0.98
+    max_imu_dt_s: float = 0.05
+    max_step_pos_m: float = 0.18
+    max_step_rot_rad: float = 0.6
+    accel_axis_map: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    gyro_axis_map: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
 
     gripper_mode: NintendoGripperMode = NintendoGripperMode.INCREMENTAL
     initial_gripper: float = 1.0
     gripper_step: float = 0.03
     gripper_move_time: float = 0.006
-    gripper_close_buttons: tuple[str, ...] = ("ZR", "A")
-    gripper_open_buttons: tuple[str, ...] = ("ZL", "B")
+    gripper_close_buttons: tuple[str, ...] = ("R",)
+    gripper_open_buttons: tuple[str, ...] = ()
     gripper_cmd_ema_alpha: float = 0.8
     gripper_cmd_max_rate: float = 12.0
 

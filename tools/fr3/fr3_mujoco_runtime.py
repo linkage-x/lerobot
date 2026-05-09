@@ -239,10 +239,22 @@ def create_runtime_arg_parser(
         default=NintendoController.ANY.value,
     )
     parser.add_argument("--nintendo-device-id", type=int, default=None)
-    parser.add_argument("--nintendo-translation-scale", type=float, default=0.0015)
-    parser.add_argument("--nintendo-vertical-scale", type=float, default=0.0015)
-    parser.add_argument("--nintendo-rotation-scale", type=float, default=0.006)
+    parser.add_argument("--nintendo-translation-scale", type=float, default=0.001)
+    parser.add_argument("--nintendo-vertical-scale", type=float, default=0.001)
+    parser.add_argument("--nintendo-rotation-scale", type=float, default=1.0)
     parser.add_argument("--nintendo-stick-deadband", type=float, default=0.12)
+    parser.add_argument(
+        "--nintendo-experimental-imu-translation",
+        action="store_true",
+        help="Also integrate IMU acceleration into target_x/y/z. Disabled by default because it drifts without external tracking.",
+    )
+    parser.add_argument("--nintendo-imu-accel-deadband-g", type=float, default=0.03)
+    parser.add_argument("--nintendo-imu-gyro-deadband-dps", type=float, default=1.5)
+    parser.add_argument("--nintendo-imu-stationary-gyro-dps", type=float, default=3.0)
+    parser.add_argument("--nintendo-imu-stationary-accel-norm-tolerance-g", type=float, default=0.08)
+    parser.add_argument("--nintendo-imu-velocity-decay", type=float, default=0.98)
+    parser.add_argument("--nintendo-max-step-pos-m", type=float, default=0.18)
+    parser.add_argument("--nintendo-max-step-rot-rad", type=float, default=0.6)
     parser.add_argument(
         "--nintendo-gripper-mode",
         choices=[mode.value for mode in NintendoGripperMode],
@@ -306,6 +318,16 @@ def _apply_runtime_nintendo_overrides(
     config.vertical_scale = float(args.nintendo_vertical_scale)
     config.rotation_scale = float(args.nintendo_rotation_scale)
     config.stick_deadband = float(args.nintendo_stick_deadband)
+    config.experimental_imu_translation = bool(args.nintendo_experimental_imu_translation)
+    config.imu_accel_deadband_g = float(args.nintendo_imu_accel_deadband_g)
+    config.imu_gyro_deadband_dps = float(args.nintendo_imu_gyro_deadband_dps)
+    config.imu_stationary_gyro_dps = float(args.nintendo_imu_stationary_gyro_dps)
+    config.imu_stationary_accel_norm_tolerance_g = float(
+        args.nintendo_imu_stationary_accel_norm_tolerance_g
+    )
+    config.imu_velocity_decay = float(args.nintendo_imu_velocity_decay)
+    config.max_step_pos_m = float(args.nintendo_max_step_pos_m)
+    config.max_step_rot_rad = float(args.nintendo_max_step_rot_rad)
     config.enable_rotation = bool(args.enable_rotation)
     config.gripper_mode = NintendoGripperMode(args.nintendo_gripper_mode)
     config.gripper_step = float(args.nintendo_gripper_step)
@@ -371,6 +393,14 @@ def build_runtime_teleop_config(
             vertical_scale=args.nintendo_vertical_scale,
             rotation_scale=args.nintendo_rotation_scale,
             stick_deadband=args.nintendo_stick_deadband,
+            experimental_imu_translation=bool(args.nintendo_experimental_imu_translation),
+            imu_accel_deadband_g=args.nintendo_imu_accel_deadband_g,
+            imu_gyro_deadband_dps=args.nintendo_imu_gyro_deadband_dps,
+            imu_stationary_gyro_dps=args.nintendo_imu_stationary_gyro_dps,
+            imu_stationary_accel_norm_tolerance_g=args.nintendo_imu_stationary_accel_norm_tolerance_g,
+            imu_velocity_decay=args.nintendo_imu_velocity_decay,
+            max_step_pos_m=args.nintendo_max_step_pos_m,
+            max_step_rot_rad=args.nintendo_max_step_rot_rad,
             enable_rotation=args.enable_rotation,
             gripper_mode=NintendoGripperMode(args.nintendo_gripper_mode),
             gripper_step=args.nintendo_gripper_step,
