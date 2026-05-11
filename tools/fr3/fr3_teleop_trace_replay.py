@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -40,7 +41,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Trace output path inside the repo. Defaults to outputs/fr3_traces/<mode>_trace.json.",
     )
-    parser.add_argument("--fps", type=int, default=60)
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=None,
+        help="Optional LeRobot dataset root to replay in sim mode instead of the built-in trace profile.",
+    )
+    parser.add_argument(
+        "--episode",
+        type=int,
+        default=None,
+        help="Dataset episode index to replay when --dataset is set. Defaults to all episodes.",
+    )
+    parser.add_argument("--fps", type=int, default=None)
     parser.add_argument("--step-x", type=float, default=0.0002)
     parser.add_argument("--step-y", type=float, default=0.0002)
     parser.add_argument("--step-z", type=float, default=0.0002)
@@ -51,9 +64,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--move-s", type=float, default=0.75)
     parser.add_argument("--hold-s", type=float, default=0.5)
     parser.add_argument("--settle-s", type=float, default=1.0)
-    parser.add_argument("--robot-ip", default="192.168.1.206")
+    parser.add_argument("--robot-ip", default="192.168.11.102")
     parser.add_argument("--gripper-port", default=DEFAULT_GRIPPER_PORT)
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Validate a hardware dataset replay and write the report without connecting to the robot.",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Execute a hardware dataset replay after validation and an explicit typed confirmation.",
+    )
+    parser.add_argument("--min-z", type=float, default=0.05, help="Minimum allowed EE Z height for hardware replay.")
+    parser.add_argument("--max-step-pos", type=float, default=0.03, help="Maximum per-frame EE translation step in meters.")
+    parser.add_argument("--max-step-rot", type=float, default=0.35, help="Maximum per-frame EE rotation step in radians.")
+    parser.add_argument("--max-ee-speed", type=float, default=0.25, help="Maximum EE translation speed in m/s.")
+    parser.add_argument("--max-ee-rot-speed", type=float, default=2.0, help="Maximum EE rotation speed in rad/s.")
+    parser.add_argument(
+        "--ik-solver",
+        choices=["hirol_lm", "hirol_gaussian_newton", "placo"],
+        default="hirol_lm",
+        help=(
+            "IK solver for sim mode. Defaults to HIROL-style Pinocchio LM; "
+            "use 'hirol_gaussian_newton' for HIROL Gaussian-Newton or 'placo' for the previous solver."
+        ),
+    )
     parser.add_argument("--service", default=None)
+    parser.add_argument("--no-viewer", action="store_true", help="Disable the MuJoCo viewer in sim mode.")
+    parser.add_argument(
+        "--close-viewer-on-finish",
+        action="store_true",
+        help="Close the MuJoCo viewer when replay ends instead of keeping it open.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -64,6 +107,10 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
     output_path = args.output.resolve() if args.output is not None else workspace / "outputs" / "fr3_traces" / f"{args.mode}_trace.json"
     repo_relative_output = output_path.relative_to(workspace)
     service = args.service or (DEFAULT_SIM_SERVICE if args.mode == "sim" else DEFAULT_HARDWARE_SERVICE)
+    dataset_path = None
+    if args.dataset is not None:
+        candidate = args.dataset if args.dataset.is_absolute() else workspace / args.dataset
+        dataset_path = candidate.resolve().relative_to(workspace)
 
     runtime_args = [
         "cd /workspace &&",
@@ -73,7 +120,6 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         f"--mode={args.mode}",
         f"--trace-profile={args.trace_profile}",
         f"--output=/workspace/{repo_relative_output.as_posix()}",
-        f"--fps={args.fps}",
         f"--step-x={args.step_x}",
         f"--step-y={args.step_y}",
         f"--step-z={args.step_z}",
@@ -84,10 +130,39 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         f"--move-s={args.move_s}",
         f"--hold-s={args.hold_s}",
         f"--settle-s={args.settle_s}",
+        f"--ik-solver={args.ik_solver}",
     ]
+    if args.fps is not None:
+        runtime_args.append(f"--fps={args.fps}")
+    if dataset_path is not None:
+        runtime_args.append(f"--dataset=/workspace/{dataset_path.as_posix()}")
+        if args.episode is not None:
+            runtime_args.append(f"--episode={args.episode}")
+    if args.mode == "sim" and not args.no_viewer:
+        runtime_args.append("--viewer")
+        if not args.close_viewer_on_finish:
+            runtime_args.append("--keep-viewer-open")
     if args.mode == "hardware":
         runtime_args.append(f"--robot-ip={args.robot_ip}")
         runtime_args.append(f"--gripper-port={args.gripper_port}")
+        runtime_args.append(f"--min-z={args.min_z}")
+        runtime_args.append(f"--max-step-pos={args.max_step_pos}")
+        runtime_args.append(f"--max-step-rot={args.max_step_rot}")
+        runtime_args.append(f"--max-ee-speed={args.max_ee_speed}")
+        runtime_args.append(f"--max-ee-rot-speed={args.max_ee_rot_speed}")
+        if args.validate_only:
+            runtime_args.append("--validate-only")
+        if args.execute:
+            runtime_args.append("--execute")
+
+    docker_run_extra: list[str] = []
+    if args.mode == "sim" and not args.no_viewer:
+        docker_run_extra = [
+            "-e",
+            f"DISPLAY={os.environ.get('DISPLAY', ':0')}",
+            "-v",
+            "/tmp/.X11-unix:/tmp/.X11-unix",
+        ]
 
     return [
         "docker",
@@ -95,7 +170,9 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         "-f",
         str(compose_file),
         "run",
+        "-T",
         "--rm",
+        *docker_run_extra,
         service,
         "bash",
         "-lc",

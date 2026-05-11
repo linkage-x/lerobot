@@ -262,6 +262,7 @@ class PikaGripperHardwareDriver:
     max_width_mm: float = 90.0
     command_rate_limit_hz: float | None = 15.0
     command_deadband_mm: float = 0.5
+    enable_settle_s: float = 0.5
 
     def __post_init__(self):
         _silence_pika_logs()
@@ -285,6 +286,8 @@ class PikaGripperHardwareDriver:
             raise ConnectionError(f"Could not connect to Pika gripper on {self.serial_port}.")
         if not self._gripper.enable():
             raise ConnectionError("Could not enable the Pika gripper.")
+        if self.enable_settle_s > 0.0:
+            time.sleep(float(self.enable_settle_s))
 
     def disconnect(self) -> None:
         if self._gripper is not None:
@@ -983,6 +986,159 @@ class PlacoKinematicsDriver:
         current_joint_positions_deg = np.rad2deg(np.asarray(current_joint_positions_rad, dtype=np.float64))
         solution_deg = self._kinematics.inverse_kinematics(current_joint_positions_deg, desired_pose)
         return np.deg2rad(np.asarray(solution_deg, dtype=np.float64))
+
+
+@dataclass
+class HirolLMKinematicsDriver:
+    urdf_path: str
+    target_frame_name: str
+    joint_names: list[str]
+    tolerance: float = 1e-6
+    max_iterations: int = 200
+
+    def __post_init__(self):
+        try:
+            import pinocchio as pin
+        except Exception as e:  # pragma: no cover - exercised in docker / sim runtime
+            raise ImportError(
+                "HIROL-style FR3 IK requires pinocchio. Install the `pin` package or use the FR3 sim container."
+            ) from e
+
+        self._pin = pin
+        full_model = pin.buildModelFromUrdf(self.urdf_path)
+        neutral_q = pin.neutral(full_model)
+        joints_to_lock = [
+            joint_id
+            for joint_id, joint_name in enumerate(full_model.names)
+            if joint_id > 0 and joint_name not in set(self.joint_names)
+        ]
+        self._model = pin.buildReducedModel(full_model, joints_to_lock, neutral_q)
+        self._data = self._model.createData()
+        if not self._model.existFrame(self.target_frame_name):
+            raise ValueError(f"Frame '{self.target_frame_name}' not found in Pinocchio model.")
+        self._frame_id = self._model.getFrameId(self.target_frame_name)
+        self._lower_limits = np.asarray(self._model.lowerPositionLimit, dtype=np.float64)
+        self._upper_limits = np.asarray(self._model.upperPositionLimit, dtype=np.float64)
+
+    def forward_kinematics(self, joint_positions_rad: np.ndarray) -> np.ndarray:
+        q = np.asarray(joint_positions_rad, dtype=np.float64).reshape(self._model.nq)
+        self._pin.forwardKinematics(self._model, self._data, q)
+        self._pin.updateFramePlacements(self._model, self._data)
+        return np.asarray(self._data.oMf[self._frame_id].homogeneous, dtype=np.float64)
+
+    def inverse_kinematics(self, current_joint_positions_rad: np.ndarray, desired_pose: np.ndarray) -> np.ndarray:
+        q = np.asarray(current_joint_positions_rad, dtype=np.float64).reshape(self._model.nq)
+        q = np.clip(q, self._lower_limits, self._upper_limits)
+        target_pose = np.asarray(desired_pose, dtype=np.float64).reshape(4, 4)
+        target_placement = self._pin.SE3(target_pose[:3, :3], target_pose[:3, 3])
+
+        lambda_k = 0.1
+        lambda_min = 1e-6
+        lambda_max = 1e-3
+        lambda_factor = 10.0
+        error_norm = float("inf")
+
+        for _ in range(int(self.max_iterations)):
+            self._pin.forwardKinematics(self._model, self._data, q)
+            self._pin.updateFramePlacements(self._model, self._data)
+            current_placement = self._data.oMf[self._frame_id]
+            err_se3 = self._pin.log(current_placement.inverse() * target_placement).vector
+            error_norm = float(np.linalg.norm(err_se3))
+            if error_norm < self.tolerance:
+                break
+
+            self._pin.computeJointJacobians(self._model, self._data, q)
+            jacobian = self._pin.getFrameJacobian(self._model, self._data, self._frame_id, self._pin.LOCAL)
+            jtj = jacobian.T @ jacobian
+            jt_err = jacobian.T @ err_se3
+            try:
+                delta_q = np.linalg.solve(jtj + lambda_k * np.eye(self._model.nv), jt_err)
+            except np.linalg.LinAlgError:
+                lambda_k = min(lambda_max, lambda_k * lambda_factor)
+                continue
+
+            q_candidate = np.clip(q + delta_q, self._lower_limits, self._upper_limits)
+            self._pin.forwardKinematics(self._model, self._data, q_candidate)
+            self._pin.updateFramePlacements(self._model, self._data)
+            candidate_error = self._pin.log(self._data.oMf[self._frame_id].inverse() * target_placement).vector
+            if float(np.linalg.norm(candidate_error)) < error_norm:
+                q = q_candidate
+                lambda_k = max(lambda_min, lambda_k / lambda_factor)
+            else:
+                lambda_k = min(lambda_max, lambda_k * lambda_factor)
+
+        return q
+
+
+@dataclass
+class HirolGaussianNewtonKinematicsDriver:
+    urdf_path: str
+    target_frame_name: str
+    joint_names: list[str]
+    tolerance: float = 1e-6
+    max_iterations: int = 200
+    damping: float = 1e-3
+
+    def __post_init__(self):
+        try:
+            import pinocchio as pin
+        except Exception as e:  # pragma: no cover - exercised in docker / sim runtime
+            raise ImportError(
+                "HIROL-style FR3 IK requires pinocchio. Install the `pin` package or use the FR3 sim container."
+            ) from e
+
+        self._pin = pin
+        full_model = pin.buildModelFromUrdf(self.urdf_path)
+        neutral_q = pin.neutral(full_model)
+        active_joint_names = set(self.joint_names)
+        joints_to_lock = [
+            joint_id
+            for joint_id, joint_name in enumerate(full_model.names)
+            if joint_id > 0 and joint_name not in active_joint_names
+        ]
+        self._model = pin.buildReducedModel(full_model, joints_to_lock, neutral_q)
+        self._data = self._model.createData()
+        if not self._model.existFrame(self.target_frame_name):
+            raise ValueError(f"Frame '{self.target_frame_name}' not found in Pinocchio model.")
+        self._frame_id = self._model.getFrameId(self.target_frame_name)
+        self._lower_limits = np.asarray(self._model.lowerPositionLimit, dtype=np.float64)
+        self._upper_limits = np.asarray(self._model.upperPositionLimit, dtype=np.float64)
+
+    def forward_kinematics(self, joint_positions_rad: np.ndarray) -> np.ndarray:
+        q = np.asarray(joint_positions_rad, dtype=np.float64).reshape(self._model.nq)
+        self._pin.forwardKinematics(self._model, self._data, q)
+        self._pin.updateFramePlacements(self._model, self._data)
+        return np.asarray(self._data.oMf[self._frame_id].homogeneous, dtype=np.float64)
+
+    def inverse_kinematics(self, current_joint_positions_rad: np.ndarray, desired_pose: np.ndarray) -> np.ndarray:
+        q = np.asarray(current_joint_positions_rad, dtype=np.float64).reshape(self._model.nq)
+        q = np.clip(q, self._lower_limits, self._upper_limits)
+        target_pose = np.asarray(desired_pose, dtype=np.float64).reshape(4, 4)
+        target_placement = self._pin.SE3(target_pose[:3, :3], target_pose[:3, 3])
+        error_norm = float("inf")
+
+        for _ in range(int(self.max_iterations)):
+            self._pin.forwardKinematics(self._model, self._data, q)
+            self._pin.updateFramePlacements(self._model, self._data)
+            current_placement = self._data.oMf[self._frame_id]
+            err_se3 = self._pin.log(current_placement.inverse() * target_placement).vector
+            error_norm = float(np.linalg.norm(err_se3))
+            if error_norm < self.tolerance:
+                break
+
+            self._pin.computeJointJacobians(self._model, self._data, q)
+            jacobian = self._pin.getFrameJacobian(self._model, self._data, self._frame_id, self._pin.LOCAL)
+            jjt = jacobian @ jacobian.T
+            try:
+                step_twist = np.linalg.solve(jjt, err_se3)
+            except np.linalg.LinAlgError:
+                step_twist = np.linalg.solve(jjt + self.damping * np.eye(6), err_se3)
+            delta_q = jacobian.T @ step_twist
+            q = np.clip(q + delta_q, self._lower_limits, self._upper_limits)
+
+        if error_norm >= self.tolerance:
+            logger.debug("HIROL Gaussian-Newton IK did not converge. Best error: %.6f", error_norm)
+        return q
 
 
 @dataclass

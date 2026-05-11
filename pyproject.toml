@@ -58,39 +58,34 @@ classifiers = [
 keywords = ["lerobot", "huggingface", "robotics",  "machine learning", "artificial intelligence"]
 
 dependencies = [
-
     # Hugging Face dependencies
     "datasets>=4.0.0,<5.0.0",
     "diffusers>=0.27.2,<0.36.0",
     "huggingface-hub>=1.0.0,<2.0.0",
     "accelerate>=1.10.0,<2.0.0",
-
     # Core dependencies
     "numpy>=2.0.0,<2.3.0", # NOTE: Explicitly listing numpy helps the resolver converge faster. Upper bound imposed by opencv-python-headless.
     "setuptools>=71.0.0,<81.0.0",
     "cmake>=3.29.0.1,<4.2.0",
     "packaging>=24.2,<26.0",
-
     "torch>=2.2.1,<2.11.0",
     "torchcodec>=0.2.1,<0.11.0; sys_platform != 'win32' and (sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')) and (sys_platform != 'darwin' or platform_machine != 'x86_64')",
     "torchvision>=0.21.0,<0.26.0",
-
     "einops>=0.8.0,<0.9.0",
     "opencv-python-headless>=4.9.0,<4.13.0",
     "av>=15.0.0,<16.0.0",
     "jsonlines>=4.0.0,<5.0.0",
     "pynput>=1.7.8,<1.9.0",
     "pyserial>=3.5,<4.0",
-
     "wandb>=0.24.0,<0.25.0",
     "draccus==0.10.0", # TODO: Relax version constraint
     "gymnasium>=1.1.1,<2.0.0",
     "rerun-sdk>=0.24.0,<0.27.0",
-
     # Support dependencies
     "deepdiff>=7.0.1,<9.0.0",
     "imageio[ffmpeg]>=2.34.0,<3.0.0",
     "termcolor>=2.4.0,<4.0.0",
+    "httpx[socks]>=0.28.1",
 ]
 
 # Optional dependencies
@@ -229,6 +224,7 @@ lerobot-info="lerobot.scripts.lerobot_info:main"
 lerobot-find-joint-limits="lerobot.scripts.lerobot_find_joint_limits:main"
 lerobot-imgtransform-viz="lerobot.scripts.lerobot_imgtransform_viz:main"
 lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
+lerobot-clean-episodes="lerobot.scripts.lerobot_clean_episodes:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 
 # ---------------- Tool Configurations ----------------

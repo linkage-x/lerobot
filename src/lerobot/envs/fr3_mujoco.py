@@ -73,6 +73,9 @@ class FR3MujocoEnvConfig:
     otg_sync_mode: str = "time"
     max_episode_steps: int = 300
     render_mode: str | None = None
+    ik_solver: str = "hirol_lm"
+    ik_tolerance: float = 1e-6
+    ik_max_iterations: int = 200
 
     @property
     def teleop_dt(self) -> float:
@@ -181,13 +184,35 @@ class FR3MujocoEnv(gym.Env):
         return mujoco
 
     def _build_kinematics(self):
-        from lerobot.robots.franka_research3.backends import PlacoKinematicsDriver
-
-        return PlacoKinematicsDriver(
-            urdf_path=self.cfg.urdf_path,
-            target_frame_name=self.cfg.target_frame_name,
-            joint_names=list(self.cfg.joint_names),
+        from lerobot.robots.franka_research3.backends import (
+            HirolGaussianNewtonKinematicsDriver,
+            HirolLMKinematicsDriver,
+            PlacoKinematicsDriver,
         )
+
+        if self.cfg.ik_solver == "hirol_lm":
+            return HirolLMKinematicsDriver(
+                urdf_path=self.cfg.urdf_path,
+                target_frame_name=self.cfg.target_frame_name,
+                joint_names=list(self.cfg.joint_names),
+                tolerance=self.cfg.ik_tolerance,
+                max_iterations=self.cfg.ik_max_iterations,
+            )
+        if self.cfg.ik_solver == "hirol_gaussian_newton":
+            return HirolGaussianNewtonKinematicsDriver(
+                urdf_path=self.cfg.urdf_path,
+                target_frame_name=self.cfg.target_frame_name,
+                joint_names=list(self.cfg.joint_names),
+                tolerance=self.cfg.ik_tolerance,
+                max_iterations=self.cfg.ik_max_iterations,
+            )
+        if self.cfg.ik_solver == "placo":
+            return PlacoKinematicsDriver(
+                urdf_path=self.cfg.urdf_path,
+                target_frame_name=self.cfg.target_frame_name,
+                joint_names=list(self.cfg.joint_names),
+            )
+        raise ValueError(f"Unsupported FR3 IK solver: {self.cfg.ik_solver!r}.")
 
     def _build_otg(self):
         if not self.cfg.use_otg:
@@ -355,6 +380,44 @@ class FR3MujocoEnv(gym.Env):
         truncated = self._step_count >= self.cfg.max_episode_steps
         info = self._build_info()
         info["teleop_action"] = teleop_action.copy()
+        info["target_joint_positions"] = target_joints.copy()
+        info["otg_enabled"] = self._otg is not None
+        info["otg_steps"] = otg_steps
+        info["sender_steps"] = sender_steps
+        return observation, 0.0, terminated, truncated, info
+
+    def step_target_pose(
+        self,
+        target_pose: np.ndarray,
+        *,
+        gripper: float | None = None,
+        control_period_s: float | None = None,
+    ):
+        target_pose = np.asarray(target_pose, dtype=np.float64).reshape(4, 4)
+        current_joints = self._get_joint_positions()
+        target_joints = np.asarray(self._kinematics.inverse_kinematics(current_joints, target_pose), dtype=np.float64)
+        target_joints = np.clip(target_joints[: len(self.cfg.joint_names)], self._joint_lower, self._joint_upper)
+
+        if self._otg is not None:
+            self._otg_target_joints = target_joints.copy()
+            otg_steps, sender_steps = self._advance_otg_window(control_period_s)
+        else:
+            self._set_joint_state(target_joints)
+            otg_steps, sender_steps = 0, 0
+
+        if gripper is not None:
+            self._last_gripper = float(np.clip(gripper, 0.0, 1.0))
+        self._last_command_pose = target_pose.copy()
+        self._target_pose = target_pose.copy()
+        self._reference_pose = None
+        self._hold_joint_target = None
+        self._prev_enabled = False
+
+        self._step_count += 1
+        observation = self._build_observation()
+        terminated = False
+        truncated = self._step_count >= self.cfg.max_episode_steps
+        info = self._build_info()
         info["target_joint_positions"] = target_joints.copy()
         info["otg_enabled"] = self._otg is not None
         info["otg_steps"] = otg_steps
