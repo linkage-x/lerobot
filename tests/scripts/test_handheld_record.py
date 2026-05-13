@@ -436,6 +436,30 @@ def test_read_terminal_key_nonblocking_maps_escape(monkeypatch):
     assert handheld_record._read_terminal_key_nonblocking() == "esc"
 
 
+def test_wait_for_enter_accepts_exit_command(monkeypatch):
+    monkeypatch.setattr(handheld_record, "log_say", lambda *args, **kwargs: None)
+    monkeypatch.setattr("builtins.input", lambda prompt: "exit")
+
+    assert handheld_record._wait_for_enter(1, play_sounds=False) is False
+
+
+def test_read_terminal_key_nonblocking_reads_pipe_commands(monkeypatch):
+    class FakeStdin:
+        def isatty(self):
+            return False
+
+        def fileno(self):
+            return 0
+
+    reads = iter([b"s", b"\n"])
+
+    monkeypatch.setattr(handheld_record.sys, "stdin", FakeStdin())
+    monkeypatch.setattr(handheld_record.select, "select", lambda *args, **kwargs: ([0], [], []))
+    monkeypatch.setattr(handheld_record.os, "read", lambda fd, size: next(reads))
+
+    assert handheld_record._read_terminal_key_nonblocking() == "s"
+
+
 def test_capture_episode_frames_escape_returns_exit_without_frame(monkeypatch):
     cfg = handheld_record.HandheldRecordingConfig(
         sensors=handheld_record.HandheldSensorsConfig(
