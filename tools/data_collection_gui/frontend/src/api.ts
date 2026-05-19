@@ -53,6 +53,7 @@ export type GuiSnapshot = {
   processing: ProcessingItem[];
   trajectory: TrajectoryPoint[];
   events: EventLogItem[];
+  notice?: string;
 };
 
 export class DataCollectionGuiApi {
@@ -78,7 +79,11 @@ export class DataCollectionGuiApi {
       streamingEncoding: handheldConfigSummary.streamingEncoding,
       vcodec: handheldConfigSummary.vcodec,
       softSync: handheldConfigSummary.softSync,
-      rerun: handheldConfigSummary.rerun
+      rerun: handheldConfigSummary.rerun,
+      recorderScript: handheldConfigSummary.recorderScript,
+      rigType: handheldConfigSummary.rigType,
+      hardwareSync: handheldConfigSummary.hardwareSync,
+      cameraDefaults: handheldConfigSummary.cameraDefaults
     },
     devices: initialDevices,
     recording: {
@@ -439,6 +444,9 @@ export class DataCollectionGuiApi {
   async setDatasetsRoot(path: string): Promise<GuiSnapshot> {
     const remote = await this.postRemoteSnapshot(`/api/processing/datasets-root?path=${encodeURIComponent(path)}`);
     if (remote) {
+      if (remote.notice) {
+        window.alert(remote.notice);
+      }
       return remote;
     }
     await wait(120);
@@ -673,6 +681,8 @@ export class DataCollectionGuiApi {
         state: "error",
         message: `Export ${command} failed: ${message}`
       };
+    } else if (endpoint.includes("/processing/datasets-root")) {
+      window.alert(`Datasets Root save failed: ${message}`);
     } else if (endpoint.includes("/processing/traj-gen")) {
       const fallbackMessage = "待实现：Generate EE Trajectory 功能尚未接入。";
       const displayMessage = message || fallbackMessage;

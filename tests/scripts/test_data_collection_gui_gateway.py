@@ -57,6 +57,175 @@ def test_make_state_loads_handheld_config_contract():
     assert any(device["kind"] == "handheld_gripper" for device in snapshot["devices"])
 
 
+def test_default_config_is_thor_gmsl2_box():
+    assert str(gateway.DEFAULT_CONFIG_PATH) == "tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml"
+    state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
+    snapshot = gateway._snapshot(state)
+
+    assert snapshot["configSummary"]["repoId"] == "local/thor_gmsl2_11ch_v1"
+    assert snapshot["configSummary"]["fps"] == 60
+    devices_by_kind: dict[str, list[str]] = {}
+    for device in snapshot["devices"]:
+        devices_by_kind.setdefault(device["kind"], []).append(device["id"])
+    # 11-camera GMSL2 rig (detect_all => sids 0..15 placeholder before connect).
+    assert "camera" in devices_by_kind
+    assert all(cid.startswith("cam_") for cid in devices_by_kind["camera"])
+    assert len(devices_by_kind["camera"]) >= 11
+    # Box collection sensors are surfaced as a distinct device kind.
+    assert "box_collection" in devices_by_kind
+    assert {"box_gripper", "box_imu", "box_trigger"}.issubset(set(devices_by_kind["box_collection"]))
+    # Old Hikrobot / Pika devices are no longer in the default rig.
+    assert "handheld_gripper" not in devices_by_kind
+
+
+def test_gmsl2_timeline_applies_replay_warmup(tmp_path):
+    dataset_root = tmp_path / "gmsl2"
+    ep_dir = dataset_root / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    (ep_dir / "cam_00.mkv").write_bytes(b"0" * 2048)
+    (ep_dir / "meta.json").write_text(
+        json.dumps({
+            "duration_s": 10.0,
+            "video": {"fps": 60, "replay_warmup_s": 1.5},
+        }),
+        encoding="utf-8",
+    )
+
+    timeline = gateway._read_gmsl2_timeline(dataset_root, episode=0)
+
+    assert timeline["videoWarmupS"] == 1.5
+    assert timeline["totalFrames"] == 510
+    assert timeline["cameraKeys"] == ["cam_00"]
+    assert timeline["frames"][0]["timestamp"] == 0
+
+
+def test_gmsl2_timeline_includes_touch_heatmap_samples(tmp_path):
+    dataset_root = tmp_path / "gmsl2"
+    ep_dir = dataset_root / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    (ep_dir / "cam_00.mkv").write_bytes(b"0" * 2048)
+    (ep_dir / "meta.json").write_text(
+        json.dumps({
+            "duration_s": 1.0,
+            "video": {"fps": 2, "replay_warmup_s": 0.5},
+        }),
+        encoding="utf-8",
+    )
+    left_fz = [0.0] * 239
+    right_fz = [0.0] * 239
+    left_fz[0] = 7.0
+    right_fz[238] = 11.0
+    rows = [
+        {
+            "sid": "box_touch_left",
+            "t_rel_s": 0.5,
+            "data": {"timestamp": 101, "fz_0p1N": left_fz},
+        },
+        {
+            "sid": "box_touch_right",
+            "t_rel_s": 0.5,
+            "data": {"timestamp": 202, "fz_0p1N": right_fz},
+        },
+    ]
+    with (ep_dir / "box_sensors.jsonl").open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+    timeline = gateway._read_gmsl2_timeline(dataset_root, episode=0)
+
+    touch = timeline["frames"][0]["touch"]
+    assert touch["left"]["timestamp"] == 101
+    assert touch["left"]["fz"][0] == 7.0
+    assert touch["left"]["activePoints"] == 1
+    assert touch["right"]["timestamp"] == 202
+    assert touch["right"]["fz"][238] == 11.0
+
+
+def test_box_collection_devices_use_remote_endpoint_in_detail():
+    config = {
+        "sensors": {"cameras": {"defaults": {"fps": 60}, "detect_all": False, "sensor_ids": [0, 4]}},
+        "box_collection": {
+            "enabled": True,
+            "remote_ip": "10.20.30.40",
+            "remote_port": 15000,
+            "poll_interval_s": 0.05,
+            "expected_devices": ["box_gripper", "box_imu"],
+        },
+    }
+    devices = gateway._device_statuses(config)
+    box_devices = [d for d in devices if d["kind"] == "box_collection"]
+    assert [d["id"] for d in box_devices] == ["box_gripper", "box_imu"]
+    assert all(d["detail"] == "UDP 10.20.30.40:15000" for d in box_devices)
+    assert all(d["fps"] == 20 for d in box_devices)  # 1 / 0.05 -> 20 Hz
+
+
+def test_box_collection_disabled_hides_devices():
+    config = {
+        "sensors": {"cameras": {"defaults": {"fps": 60}}},
+        "box_collection": {"enabled": False, "expected_devices": ["box_gripper"]},
+    }
+    devices = gateway._device_statuses(config)
+    assert not any(d["kind"] == "box_collection" for d in devices)
+
+
+def test_recorder_output_marks_box_collection_devices(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=Path.cwd(),
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 60, "episode_time_s": 10}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        devices=[
+            {"id": "cam_00", "kind": "camera", "label": "cam_00", "state": "warning", "fps": 60, "latencyMs": 0, "detail": ""},
+            {"id": "box_gripper", "kind": "box_collection", "label": "g", "state": "warning", "fps": 20, "latencyMs": 0, "detail": ""},
+            {"id": "box_imu", "kind": "box_collection", "label": "i", "state": "warning", "fps": 20, "latencyMs": 0, "detail": ""},
+            {"id": "box_trigger", "kind": "box_collection", "label": "t", "state": "warning", "fps": 20, "latencyMs": 0, "detail": ""},
+        ],
+    )
+
+    gateway._apply_recorder_output(state, "Cameras: cam_00")
+    gateway._apply_recorder_output(state, "Box devices: box_gripper, box_imu")
+
+    states = {device["id"]: device["state"] for device in state.devices}
+    assert states["cam_00"] == "running"
+    assert states["box_gripper"] == "running"
+    assert states["box_imu"] == "running"
+    # Devices listed in the YAML but not in the connected announcement
+    # transition to "error" so the operator sees what's missing.
+    assert states["box_trigger"] == "error"
+
+
+def test_recorder_script_picks_thor_when_configured(tmp_path):
+    repo_root = tmp_path
+    (repo_root / "tools" / "thor" / "gmsl2").mkdir(parents=True)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={
+            "recorder": {"script": "tools/thor/gmsl2/thor_record.py"},
+            "dataset": {"repo_id": "local/test", "fps": 60},
+        },
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+    script, flag = gateway._recorder_script(state)
+    assert script == repo_root / "tools" / "thor" / "gmsl2" / "thor_record.py"
+    assert flag == "--config-path"
+
+
+def test_recorder_script_defaults_to_handheld_for_legacy_configs(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+    script, flag = gateway._recorder_script(state)
+    assert script == tmp_path / "tools" / "handheld" / "handheld_record.py"
+    assert flag == "--config_path"
+
+
 def test_device_statuses_include_camera_resolution_and_ports():
     config = {
         "sensors": {
@@ -210,6 +379,43 @@ def test_replay_episode_selection_defaults_to_first_and_can_switch(tmp_path):
     assert first_timeline["episode"] == 0
     assert selected_timeline["episode"] == 1
     assert [frame["frame"] for frame in selected_timeline["frames"]] == [0, 1]
+
+
+def test_processing_items_accepts_dataset_root_as_datasets_root(tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(repo_root / "missing"), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test", datasetRoot=str(repo_root / "missing")),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root,
+    )
+
+    items = gateway._processing_items(state)
+
+    assert [item["path"] for item in items] == [str(dataset_root)]
+    assert items[0]["name"] == "episode_set"
+
+
+def test_set_datasets_root_creates_missing_directory(tmp_path):
+    repo_root = tmp_path / "repo"
+    missing_root = repo_root / "data"
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+
+    created = gateway._set_datasets_root(state, str(missing_root))
+
+    assert created is True
+    assert missing_root.is_dir()
+    assert state.datasets_root == missing_root.resolve()
 
 
 def test_traj_gen_is_explicitly_not_implemented(tmp_path):

@@ -1,6 +1,6 @@
 export type ServiceState = "offline" | "idle" | "running" | "warning" | "error";
 
-export type DeviceKind = "camera" | "tactile" | "handheld_gripper";
+export type DeviceKind = "camera" | "tactile" | "handheld_gripper" | "box_collection";
 
 export type DeviceStatus = {
   id: string;
@@ -20,6 +20,26 @@ export type GatewayStatus = {
   datasetsRoot?: string;
 };
 
+export type HardwareSyncStatus = {
+  enabled: boolean;
+  fps: number;
+  trigMode: number;
+  pwmChip: string;
+  pwmId: number;
+};
+
+export type CameraDefaults = {
+  codec: string;
+  bitrateKbps: number;
+  width: number;
+  height: number;
+  pipeline: string;
+  exposureUs: number;
+  gain: number;
+  iframeInterval: number;
+  container: string;
+};
+
 export type ConfigSummary = {
   configPath: string;
   repoId: string;
@@ -36,6 +56,10 @@ export type ConfigSummary = {
     displayData: boolean;
     savePath: string;
   };
+  recorderScript?: string;
+  rigType?: "gmsl2" | "handheld";
+  hardwareSync?: HardwareSyncStatus;
+  cameraDefaults?: CameraDefaults;
 };
 
 export type RecordingStatus = {
@@ -198,12 +222,24 @@ export type EePose = {
   gripper?: number | null;
 };
 
+export type TouchPadFrame = {
+  timestamp?: number;
+  tRelS?: number;
+  fz: number[];
+  maxFz?: number;
+  activePoints?: number;
+};
+
 export type ReplayTimelineFrame = {
   frame: number;
   timestamp: number;
   state: number[];
   action: number[];
   eePose?: Partial<EePose>;
+  touch?: {
+    left?: TouchPadFrame;
+    right?: TouchPadFrame;
+  };
 };
 
 export type ReplayTimeline = {
@@ -220,6 +256,7 @@ export type ReplayTimeline = {
   videoFileIndex: number;
   frames: ReplayTimelineFrame[];
   sourcePath: string;
+  videoWarmupS?: number;
   error?: string;
 };
 

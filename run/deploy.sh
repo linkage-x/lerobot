@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# One-shot: sync code → restart Thor gateway → start local frontend.
+#
+# Usage:
+#   bash run/deploy.sh              # full deploy
+#   bash run/deploy.sh --sync-only  # only sync, skip restart & frontend
+#   bash run/deploy.sh --no-frontend # sync + restart, skip frontend
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+THOR="nvidia@192.168.111.122"
+THOR_DIR="~/lerobot"
+GATEWAY_LOG="/tmp/gateway.log"
+
+sync_only=false
+no_frontend=false
+for arg in "$@"; do
+  case "$arg" in
+    --sync-only)  sync_only=true ;;
+    --no-frontend) no_frontend=true ;;
+  esac
+done
+
+# ---- 1. Sync ----
+echo "==> Syncing to ${THOR}..."
+bash "$SCRIPT_DIR/sync_to_thor.sh"
+
+if $sync_only; then
+  exit 0
+fi
+
+# ---- 2. Restart gateway on Thor ----
+echo "==> Restarting gateway on Thor..."
+ssh -o ConnectTimeout=5 "$THOR" bash -s <<'REMOTE'
+set -e
+pkill -f "tools.data_collection_gui.gateway" 2>/dev/null || true
+sleep 1
+
+cd ~/lerobot
+bash tools/thor/box_sdk/ensure_box_net.sh >/dev/null 2>&1 || true
+. tools/thor/box_sdk/setup_env.sh
+
+mkdir -p ~/lerobot/run/logs
+setsid env PYTHONPATH=src:. PYTHONUNBUFFERED=1 \
+  python3 -m tools.data_collection_gui.gateway \
+  --config-path tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml \
+  --datasets-root outputs/datasets \
+  --port 8765 --host 0.0.0.0 \
+  --repo-root /home/nvidia/lerobot \
+  </dev/null >~/lerobot/run/logs/gateway.log 2>&1 &
+disown
+
+sleep 3
+if pgrep -f "tools.data_collection_gui.gateway" >/dev/null; then
+  echo "gateway started (pid $(pgrep -f 'tools.data_collection_gui.gateway' | head -1))"
+  tail -3 ~/lerobot/run/logs/gateway.log
+else
+  echo "ERROR: gateway failed to start"
+  tail -20 ~/lerobot/run/logs/gateway.log
+  exit 1
+fi
+REMOTE
+
+if $no_frontend; then
+  echo "==> Done (--no-frontend). Open http://192.168.111.122:5173/ from a browser."
+  exit 0
+fi
+
+# ---- 3. Start local frontend ----
+echo "==> Starting local frontend (vite)..."
+cd "$REPO_ROOT/tools/data_collection_gui/frontend"
+
+if ! command -v npm &>/dev/null; then
+  export NVM_DIR="$HOME/.nvm"
+  [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+fi
+
+if [ ! -d node_modules ]; then
+  echo "    npm install..."
+  npm install --silent
+fi
+
+echo "    http://localhost:5173/ -> gateway@192.168.111.122:8765"
+exec npm run dev -- --host 0.0.0.0 --port 5173
