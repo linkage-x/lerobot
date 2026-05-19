@@ -654,6 +654,7 @@ function EpisodeSelector({
   onSelectEpisode: (episode: number) => void;
 }) {
   const [pendingEpisode, setPendingEpisode] = useState<number | null>(null);
+  const [episodeInput, setEpisodeInput] = useState(String(status.episode ?? 0));
   const options = status.episodeOptions?.length
     ? status.episodeOptions
     : Array.from({ length: status.totalEpisodes ?? 0 }, (_item, index) => index);
@@ -662,6 +663,10 @@ function EpisodeSelector({
   const hasPrevious = currentIndex > 0;
   const hasNext = currentIndex >= 0 && currentIndex < options.length - 1;
   const switching = pendingEpisode != null && (busy || pendingEpisode !== current);
+  const inputEpisode = episodeInput.trim() === "" ? NaN : Number(episodeInput);
+  const inputIsInteger = Number.isInteger(inputEpisode);
+  const inputInOptions = inputIsInteger && options.includes(inputEpisode);
+  const canGoToInput = !busy && inputInOptions && inputEpisode !== current;
 
   useEffect(() => {
     if (!busy && pendingEpisode === current) {
@@ -669,9 +674,22 @@ function EpisodeSelector({
     }
   }, [busy, current, pendingEpisode]);
 
+  useEffect(() => {
+    if (!switching) {
+      setEpisodeInput(String(current));
+    }
+  }, [current, switching]);
+
   const selectEpisode = (episode: number) => {
+    setEpisodeInput(String(episode));
     setPendingEpisode(episode);
     onSelectEpisode(episode);
+  };
+
+  const submitEpisodeInput = () => {
+    if (canGoToInput) {
+      selectEpisode(inputEpisode);
+    }
   };
 
   return (
@@ -697,6 +715,25 @@ function EpisodeSelector({
             <option value={current}>Episode {current}</option>
           )}
         </select>
+        <div className="episode-input-group">
+          <input
+            aria-label="Episode number"
+            disabled={busy || options.length === 0}
+            inputMode="numeric"
+            min={options[0] ?? 0}
+            max={options[options.length - 1] ?? current}
+            step={1}
+            type="number"
+            value={episodeInput}
+            onChange={(event) => setEpisodeInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                submitEpisodeInput();
+              }
+            }}
+          />
+          <button disabled={!canGoToInput} onClick={submitEpisodeInput}>Go</button>
+        </div>
         <button disabled={busy || !hasNext} onClick={() => selectEpisode(options[currentIndex + 1])}>Next</button>
       </div>
       <p className="panel-note">

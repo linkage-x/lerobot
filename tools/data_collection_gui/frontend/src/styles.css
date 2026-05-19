@@ -1060,10 +1060,11 @@ button.danger {
   align-items: center;
   display: grid;
   gap: 8px;
-  grid-template-columns: auto minmax(160px, 1fr) auto;
+  grid-template-columns: auto minmax(160px, 1fr) minmax(120px, auto) auto;
 }
 
-.episode-selector-row select {
+.episode-selector-row select,
+.episode-input-group input {
   background: #ffffff;
   border: 1px solid #aeb9c2;
   border-radius: 6px;
@@ -1074,9 +1075,17 @@ button.danger {
   width: 100%;
 }
 
-.episode-selector-row select:focus {
+.episode-selector-row select:focus,
+.episode-input-group input:focus {
   border-color: #26746f;
   outline: none;
+}
+
+.episode-input-group {
+  align-items: center;
+  display: grid;
+  gap: 6px;
+  grid-template-columns: minmax(72px, 1fr) auto;
 }
 
 .inspector-panel {
