@@ -31,10 +31,12 @@ function ensureFullPose(pose: ReplayTimelineFrame["eePose"]): EePose | null {
 export function ReplayInspector({
   api,
   datasetPath,
+  episode,
   fallbackFps
 }: {
   api: DataCollectionGuiApi;
   datasetPath: string;
+  episode: number;
   fallbackFps: number;
 }) {
   const [timeline, setTimeline] = useState<ReplayTimeline | null>(null);
@@ -53,8 +55,10 @@ export function ReplayInspector({
     setLoading(true);
     setError(null);
     setCurrentFrame(0);
+    setPlaying(false);
+    setTimeline(null);
     api
-      .fetchReplayTimeline(datasetPath)
+      .fetchReplayTimeline(datasetPath, episode)
       .then((result) => {
         if (cancelled) {
           return;
@@ -77,7 +81,7 @@ export function ReplayInspector({
     return () => {
       cancelled = true;
     };
-  }, [api, datasetPath]);
+  }, [api, datasetPath, episode]);
 
   const fps = timeline?.fps ?? fallbackFps;
   const totalFrames = timeline?.totalFrames ?? 0;
@@ -168,7 +172,13 @@ export function ReplayInspector({
   if (loading && !timeline) {
     return (
       <section className="panel inspector-panel">
-        <p className="panel-note">Loading replay timeline…</p>
+        <div className="panel-heading">
+          <h2>Replay Inspector</h2>
+          <span>switching episode</span>
+        </div>
+        <p className="panel-note">
+          Releasing the previous episode video streams and loading episode {episode} timeline. This can take a moment for large videos or cold parquet reads.
+        </p>
       </section>
     );
   }

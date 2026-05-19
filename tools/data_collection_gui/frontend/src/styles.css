@@ -298,6 +298,7 @@ button.danger {
 .status-replaying,
 .status-active,
 .status-dry_run,
+.status-sim_replay,
 .status-armed {
   background: #0f766e;
 }
@@ -735,6 +736,30 @@ button.danger {
   font-weight: 650;
 }
 
+.validation-note {
+  border-radius: 6px;
+  font-size: 12px;
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+  padding: 7px 9px;
+}
+
+.validation-passed {
+  background: #eefbf6;
+  color: #0f6b4d;
+}
+
+.validation-running,
+.validation-required {
+  background: #f5f7f8;
+  color: #43525e;
+}
+
+.validation-failed {
+  background: #fff1ed;
+  color: #9a3412;
+}
+
 .diagnostic-box {
   background: #fff8ed;
   border: 1px solid #f1d6ad;
@@ -958,6 +983,100 @@ button.danger {
   overflow: auto;
   padding: 8px;
   white-space: pre-wrap;
+}
+
+.annotation-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.annotation-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.annotation-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.annotation-field-wide {
+  grid-column: 1 / -1;
+}
+
+.annotation-field span,
+.annotation-hint {
+  color: #60707c;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.annotation-field input,
+.annotation-field select,
+.annotation-field textarea {
+  background: #ffffff;
+  border: 1px solid #aeb9c2;
+  border-radius: 6px;
+  color: #172026;
+  font: inherit;
+  min-height: 36px;
+  padding: 8px 10px;
+  width: 100%;
+}
+
+.annotation-field textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.annotation-field input:focus,
+.annotation-field select:focus,
+.annotation-field textarea:focus {
+  border-color: #26746f;
+  outline: none;
+}
+
+.annotation-toggle {
+  align-content: end;
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  min-height: 66px;
+}
+
+.annotation-toggle input {
+  min-height: 0;
+  width: auto;
+}
+
+.episode-selector-panel {
+  display: grid;
+  gap: 8px;
+}
+
+.episode-selector-row {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: auto minmax(160px, 1fr) auto;
+}
+
+.episode-selector-row select {
+  background: #ffffff;
+  border: 1px solid #aeb9c2;
+  border-radius: 6px;
+  color: #172026;
+  font: inherit;
+  min-height: 36px;
+  padding: 0 10px;
+  width: 100%;
+}
+
+.episode-selector-row select:focus {
+  border-color: #26746f;
+  outline: none;
 }
 
 .inspector-panel {

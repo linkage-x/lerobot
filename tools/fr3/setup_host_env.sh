@@ -105,10 +105,7 @@ ensure_venv() {
 
 sync_python_deps() {
   log "Syncing lerobot Python dependencies with uv"
-  "${UV_BIN}" sync --python .venv/bin/python --extra kinematics
-  log "Installing FR3 host runtime Python extras"
-  "${UV_BIN}" pip install --python .venv/bin/python --no-cache cffi
-  "${UV_BIN}" pip install --python .venv/bin/python --no-deps easyhid pyspacemouse "ruckig>=0.15,<0.16"
+  "${UV_BIN}" sync --python .venv/bin/python --extra fr3_teleop
 }
 
 discover_cmeel_prefix() {

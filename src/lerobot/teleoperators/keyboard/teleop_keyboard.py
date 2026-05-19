@@ -204,7 +204,10 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
                 # this is useful for retrieving other events like interventions for RL, episode success, etc.
                 self.misc_keys_queue.put(key)
 
-        self.current_pressed.clear()
+        # NOTE: unlike the base KeyboardTeleop, we do NOT clear current_pressed here.
+        # Held movement keys must persist across get_action() calls so each key-press
+        # frame produces a non-zero delta.  Only individual released keys are popped
+        # below after their state has been consumed.
 
         action_dict = {
             "delta_x": delta_x,

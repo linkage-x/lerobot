@@ -53,7 +53,7 @@ export type RecordingStatus = {
 };
 
 export type ReplayStatus = {
-  state: "idle" | "preflight" | "armed" | "dry_run" | "replaying" | "paused" | "aborted" | "complete";
+  state: "idle" | "preflight" | "armed" | "dry_run" | "sim_replay" | "replaying" | "paused" | "aborted" | "complete";
   dataset: string;
   episode: number;
   frameIndex: number;
@@ -67,8 +67,56 @@ export type ReplayStatus = {
   dataStatus?: "loaded" | "missing" | "unfinalized" | "unreadable" | "empty";
   trajectoryKind?: "pose" | "gripper_width" | "none";
   totalEpisodes?: number;
+  episodeOptions?: number[];
   recordedFrames?: number;
   diagnostics?: string[];
+  pid?: number | null;
+  lastOutput?: string;
+  mujocoValidation?: MujocoValidation;
+};
+
+export type MujocoValidation = {
+  status: "not_run" | "running" | "passed" | "failed";
+  datasetRoot: string;
+  episode: number;
+  fps: number;
+  exitCode: number | null;
+  completedFrames: number;
+  totalFrames: number;
+  avgPositionErrorMm: number | null;
+  maxPositionErrorMm: number | null;
+  avgRotationErrorDeg: number | null;
+  maxRotationErrorDeg: number | null;
+  maxPositionThresholdMm: number;
+  maxRotationThresholdDeg: number;
+  hasStructuredResult?: boolean;
+  trajectoryContract?: {
+    status?: "passed" | "failed";
+    frames?: number;
+    checks?: Array<Record<string, unknown>>;
+    failures?: string[];
+  };
+  isCurrentForSelection?: boolean;
+  message: string;
+  updatedAt: string;
+};
+
+export type AnnotationOutcome = "unreviewed" | "success" | "failure" | "partial";
+
+export type AnnotationQuality = "unreviewed" | "good" | "needs_review" | "bad";
+
+export type EpisodeAnnotation = {
+  datasetRoot: string;
+  episode: number;
+  taskPrompt: string;
+  outcome: AnnotationOutcome;
+  quality: AnnotationQuality;
+  includeInTraining: boolean;
+  tags: string[];
+  notes: string;
+  annotator: string;
+  updatedAt: string;
+  source: "dataset" | "manual" | "default";
 };
 
 export type RecordedDataset = {

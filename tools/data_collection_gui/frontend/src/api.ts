@@ -1,5 +1,6 @@
 import { handheldConfigSummary, initialDevices } from "./defaultHandheldConfig";
 import type {
+  EpisodeAnnotation,
   CalibrationCamera,
   CalibrationStatus,
   ConfigSummary,
@@ -18,12 +19,34 @@ import type {
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
+const defaultMujocoValidation = (datasetRoot: string, episode: number, fps: number): ReplayStatus["mujocoValidation"] => ({
+  status: "not_run",
+  datasetRoot: "",
+  episode,
+  fps,
+  exitCode: null,
+  completedFrames: 0,
+  totalFrames: 0,
+  avgPositionErrorMm: null,
+  maxPositionErrorMm: null,
+  avgRotationErrorDeg: null,
+  maxRotationErrorDeg: null,
+  maxPositionThresholdMm: 20,
+  maxRotationThresholdDeg: 15,
+  hasStructuredResult: false,
+  trajectoryContract: {},
+  isCurrentForSelection: false,
+  message: datasetRoot ? "Run MuJoCo replay before real-robot replay." : "Select a recorded dataset before validation.",
+  updatedAt: ""
+});
+
 export type GuiSnapshot = {
   gateway: GatewayStatus;
   configSummary: ConfigSummary;
   devices: DeviceStatus[];
   recording: RecordingStatus;
   replay: ReplayStatus;
+  annotation: EpisodeAnnotation;
   calibration: CalibrationStatus;
   datasetExport: DatasetExportStatus;
   recordedDatasets: RecordedDataset[];
@@ -84,8 +107,25 @@ export class DataCollectionGuiApi {
       dataStatus: "missing",
       trajectoryKind: "none",
       totalEpisodes: 0,
+      episodeOptions: [],
       recordedFrames: 0,
-      diagnostics: []
+      diagnostics: [],
+      pid: null,
+      lastOutput: "",
+      mujocoValidation: defaultMujocoValidation(handheldConfigSummary.root, 0, handheldConfigSummary.fps)
+    },
+    annotation: {
+      datasetRoot: handheldConfigSummary.root,
+      episode: 0,
+      taskPrompt: handheldConfigSummary.repoId,
+      outcome: "unreviewed",
+      quality: "unreviewed",
+      includeInTraining: true,
+      tags: [],
+      notes: "",
+      annotator: "",
+      updatedAt: "",
+      source: "default"
     },
     calibration: {
       state: "idle",
@@ -133,7 +173,7 @@ export class DataCollectionGuiApi {
       return remote;
     }
     await wait(120);
-    this.snapshot = this.withDatasetExportFallback(this.snapshot);
+    this.snapshot = this.withFrontendFallbacks(this.snapshot);
     return structuredClone(this.snapshot);
   }
 
@@ -177,7 +217,7 @@ export class DataCollectionGuiApi {
   async prepareDatasetExport(target: DatasetExportStatus["target"]): Promise<GuiSnapshot> {
     const remote = await this.postRemoteSnapshot(`/api/dataset/export/prepare?target=${target}`);
     if (remote) {
-      return this.withDatasetExportFallback(remote);
+      return this.withFrontendFallbacks(remote);
     }
     await wait(180);
     const totalFrames = this.snapshot.replay.recordedFrames || this.snapshot.trajectory.length;
@@ -200,7 +240,7 @@ export class DataCollectionGuiApi {
   async startDatasetExport(): Promise<GuiSnapshot> {
     const remote = await this.postRemoteSnapshot("/api/dataset/export/start");
     if (remote) {
-      return this.withDatasetExportFallback(remote);
+      return this.withFrontendFallbacks(remote);
     }
     await wait(260);
     this.snapshot.datasetExport = {
@@ -249,11 +289,11 @@ export class DataCollectionGuiApi {
     await wait(220);
     this.snapshot.replay = {
       ...this.snapshot.replay,
-      state: "armed",
-      safety: "ready",
-      message: "Preflight passed: robot connection and action contract ready"
+      state: "aborted",
+      safety: "fault",
+      message: "Gateway unavailable; preflight cannot be mocked for real-robot safety"
     };
-    this.log("info", "Replay preflight passed");
+    this.log("error", "Replay preflight blocked because gateway is unavailable");
     return this.getSnapshot();
   }
 
@@ -268,6 +308,7 @@ export class DataCollectionGuiApi {
       ...this.snapshot.replay,
       state: "idle",
       safety: "locked",
+      episode: 0,
       frameIndex: 0,
       trackingErrorMm: 0,
       dataset: path,
@@ -275,11 +316,33 @@ export class DataCollectionGuiApi {
       sourcePath: selected?.sourcePath ?? "",
       dataStatus: selected?.dataStatus ?? "missing",
       totalEpisodes: selected?.totalEpisodes ?? 0,
+      episodeOptions: Array.from({ length: selected?.totalEpisodes ?? 0 }, (_item, index) => index),
       recordedFrames: selected?.totalFrames ?? 0,
       totalFrames: selected?.totalFrames || this.snapshot.replay.totalFrames,
-      message: selected ? `Selected recorded dataset: ${selected.name}` : `Selected recorded dataset: ${path}`
+      message: selected ? `Selected recorded dataset: ${selected.name}` : `Selected recorded dataset: ${path}`,
+      mujocoValidation: defaultMujocoValidation(path, 0, this.snapshot.replay.fps)
     };
     this.log("info", `Selected replay dataset: ${path}`);
+    return this.getSnapshot();
+  }
+
+  async selectReplayEpisode(episode: number): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot(`/api/replay/select-episode?episode=${episode}`);
+    if (remote) {
+      return remote;
+    }
+    await wait(120);
+    this.snapshot.replay = {
+      ...this.snapshot.replay,
+      state: "idle",
+      safety: "locked",
+      episode,
+      frameIndex: 0,
+      trackingErrorMm: 0,
+      message: `Selected episode ${episode}`,
+      mujocoValidation: defaultMujocoValidation(this.snapshot.replay.datasetRoot ?? this.snapshot.replay.dataset, episode, this.snapshot.replay.fps)
+    };
+    this.log("info", `Selected replay episode: ${episode}`);
     return this.getSnapshot();
   }
 
@@ -291,13 +354,53 @@ export class DataCollectionGuiApi {
     await wait(220);
     this.snapshot.replay = {
       ...this.snapshot.replay,
-      state: realRobot ? "replaying" : "dry_run",
-      safety: realRobot ? "active" : "ready",
+      state: "aborted",
+      safety: "fault",
       frameIndex: 0,
-      trackingErrorMm: realRobot ? 2.4 : 0,
-      message: realRobot ? "Real robot replay active" : "Dry-run replay active"
+      trackingErrorMm: 0,
+      message: `Gateway unavailable; ${realRobot ? "real-robot replay" : "dry-run replay"} cannot be mocked for safety`
     };
-    this.log(realRobot ? "warn" : "info", realRobot ? "Real robot replay started" : "Dry-run replay started");
+    this.log("error", `${realRobot ? "Real robot replay" : "Dry-run replay"} blocked because gateway is unavailable`);
+    return this.getSnapshot();
+  }
+
+  async startMujocoReplay(): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot("/api/replay/start-mujoco");
+    if (remote) {
+      return remote;
+    }
+    await wait(220);
+    this.snapshot.replay = {
+      ...this.snapshot.replay,
+      state: "aborted",
+      safety: "fault",
+      frameIndex: 0,
+      trackingErrorMm: 0,
+      pid: null,
+      message: "Gateway unavailable; MuJoCo validation cannot be mocked for real-robot safety",
+      mujocoValidation: defaultMujocoValidation(
+        this.snapshot.replay.datasetRoot ?? this.snapshot.replay.dataset,
+        this.snapshot.replay.episode,
+        this.snapshot.replay.fps
+      )
+    };
+    this.log("error", "MuJoCo validation blocked because gateway is unavailable");
+    return this.getSnapshot();
+  }
+
+  async saveEpisodeAnnotation(annotation: EpisodeAnnotation): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteJsonSnapshot("/api/annotation/save", annotation);
+    if (remote) {
+      return remote;
+    }
+    await wait(160);
+    this.snapshot.annotation = {
+      ...annotation,
+      tags: this.normalizeTags(annotation.tags),
+      updatedAt: new Date().toISOString(),
+      source: "manual"
+    };
+    this.log("info", `Annotation saved: episode ${annotation.episode}`);
     return this.getSnapshot();
   }
 
@@ -350,17 +453,19 @@ export class DataCollectionGuiApi {
       return remote;
     }
     await wait(140);
+    const message = "待实现：Generate EE Trajectory 功能尚未接入。";
+    window.alert(message);
     this.snapshot.processing = this.snapshot.processing.map((item) =>
       item.path === path
         ? {
             ...item,
-            status: "queued" as ProcessingStatus,
-            message: "Traj-gen job queued",
-            logTail: [...item.logTail, "[traj-gen] queued"]
+            status: "pose_missing" as ProcessingStatus,
+            message,
+            logTail: [...item.logTail, `[traj-gen] ${message}`]
           }
         : item
     );
-    this.log("info", `Traj-gen queued: ${path}`);
+    this.log("warn", `Traj-gen unavailable: ${path}`);
     return this.getSnapshot();
   }
 
@@ -391,9 +496,12 @@ export class DataCollectionGuiApi {
     return `${this.apiBase}/api/replay/video?${params.toString()}`;
   }
 
-  async fetchReplayTimeline(datasetPath: string): Promise<ReplayTimeline | null> {
+  async fetchReplayTimeline(datasetPath: string, episode?: number): Promise<ReplayTimeline | null> {
     try {
       const params = new URLSearchParams({ path: datasetPath });
+      if (episode != null) {
+        params.set("episode", String(episode));
+      }
       const response = await fetch(`${this.apiBase}/api/replay/timeline?${params.toString()}`, {
         headers: { Accept: "application/json" }
       });
@@ -438,7 +546,7 @@ export class DataCollectionGuiApi {
       };
     }
 
-    if (this.snapshot.replay.state === "dry_run" || this.snapshot.replay.state === "replaying") {
+    if (this.snapshot.replay.state === "dry_run" || this.snapshot.replay.state === "sim_replay" || this.snapshot.replay.state === "replaying") {
       const nextFrame = Math.min(this.snapshot.replay.frameIndex + 2, this.snapshot.replay.totalFrames);
       this.snapshot.replay = {
         ...this.snapshot.replay,
@@ -446,6 +554,7 @@ export class DataCollectionGuiApi {
         trackingErrorMm: this.snapshot.replay.state === "replaying" ? 2 + Math.sin(nextFrame / 18) * 1.2 : 0,
         state: nextFrame >= this.snapshot.replay.totalFrames ? "complete" : this.snapshot.replay.state,
         safety: nextFrame >= this.snapshot.replay.totalFrames ? "locked" : this.snapshot.replay.safety,
+        pid: nextFrame >= this.snapshot.replay.totalFrames ? null : this.snapshot.replay.pid,
         message: nextFrame >= this.snapshot.replay.totalFrames ? "Replay complete" : this.snapshot.replay.message
       };
     }
@@ -474,7 +583,7 @@ export class DataCollectionGuiApi {
         throw new Error(`HTTP ${response.status}`);
       }
       const snapshot = (await response.json()) as GuiSnapshot;
-      this.snapshot = this.withDatasetExportFallback(snapshot);
+      this.snapshot = this.withFrontendFallbacks(snapshot);
       this.usingRemote = true;
       return structuredClone(this.snapshot);
     } catch {
@@ -497,7 +606,31 @@ export class DataCollectionGuiApi {
         return structuredClone(this.snapshot);
       }
       const snapshot = (await response.json()) as GuiSnapshot;
-      this.snapshot = this.withDatasetExportFallback(snapshot);
+      this.snapshot = this.withFrontendFallbacks(snapshot);
+      this.usingRemote = true;
+      return structuredClone(this.snapshot);
+    } catch {
+      this.usingRemote = false;
+      this.log("warn", "Gateway command failed; using mock adapter");
+      return null;
+    }
+  }
+
+  private async postRemoteJsonSnapshot(endpoint: string, payload: unknown): Promise<GuiSnapshot | null> {
+    try {
+      const response = await fetch(`${this.apiBase}${endpoint}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) {
+        const message = await this.remoteErrorMessage(response);
+        this.applyRemoteCommandError(endpoint, message);
+        this.usingRemote = true;
+        return structuredClone(this.snapshot);
+      }
+      const snapshot = (await response.json()) as GuiSnapshot;
+      this.snapshot = this.withFrontendFallbacks(snapshot);
       this.usingRemote = true;
       return structuredClone(this.snapshot);
     } catch {
@@ -540,20 +673,47 @@ export class DataCollectionGuiApi {
         state: "error",
         message: `Export ${command} failed: ${message}`
       };
+    } else if (endpoint.includes("/processing/traj-gen")) {
+      const fallbackMessage = "待实现：Generate EE Trajectory 功能尚未接入。";
+      const displayMessage = message || fallbackMessage;
+      const targetPath = new URLSearchParams(endpoint.split("?")[1] ?? "").get("path");
+      window.alert(displayMessage);
+      this.snapshot.processing = this.snapshot.processing.map((item) =>
+        !targetPath || item.path === targetPath
+          ? {
+              ...item,
+              status: "pose_missing" as ProcessingStatus,
+              message: displayMessage,
+              logTail: [...item.logTail, `[traj-gen] ${displayMessage}`]
+            }
+          : item
+      );
     }
     this.log("error", `${command} failed: ${message}`);
   }
 
-  private withDatasetExportFallback(snapshot: GuiSnapshot): GuiSnapshot {
+  private withFrontendFallbacks(snapshot: GuiSnapshot): GuiSnapshot {
     const recordedDatasets =
       snapshot.recordedDatasets?.length || snapshot.gateway.state !== "mock"
         ? snapshot.recordedDatasets ?? []
         : this.mockRecordedDatasets(snapshot);
     const processing = snapshot.processing ?? this.snapshot.processing ?? [];
+    const activeAnnotationPath = snapshot.replay.datasetRoot || snapshot.replay.dataset || snapshot.recording.datasetRoot;
+    const annotation =
+      snapshot.annotation?.datasetRoot === activeAnnotationPath && snapshot.annotation.episode === snapshot.replay.episode
+        ? snapshot.annotation
+        : this.mockAnnotation(snapshot, false);
     return {
       ...snapshot,
+      replay: {
+        ...snapshot.replay,
+        mujocoValidation:
+          snapshot.replay.mujocoValidation ??
+          defaultMujocoValidation(snapshot.replay.datasetRoot || snapshot.replay.dataset, snapshot.replay.episode, snapshot.replay.fps)
+      },
       recordedDatasets,
       processing,
+      annotation,
       calibration: snapshot.calibration ?? this.snapshot.calibration,
       datasetExport: snapshot.datasetExport ?? {
         ...this.snapshot.datasetExport,
@@ -564,6 +724,31 @@ export class DataCollectionGuiApi {
         message: "Export planning is available in the frontend mock adapter"
       }
     };
+  }
+
+  private mockAnnotation(snapshot: GuiSnapshot, reuseExisting = true): EpisodeAnnotation {
+    const datasetRoot = snapshot.replay.datasetRoot || snapshot.replay.dataset || snapshot.recording.datasetRoot;
+    const existing = this.snapshot.annotation;
+    if (reuseExisting && existing?.datasetRoot === datasetRoot && existing.episode === snapshot.replay.episode) {
+      return existing;
+    }
+    return {
+      datasetRoot,
+      episode: snapshot.replay.episode ?? 0,
+      taskPrompt: snapshot.configSummary.repoId,
+      outcome: "unreviewed",
+      quality: "unreviewed",
+      includeInTraining: true,
+      tags: [],
+      notes: "",
+      annotator: "",
+      updatedAt: "",
+      source: "default"
+    };
+  }
+
+  private normalizeTags(tags: string[]): string[] {
+    return tags.map((tag) => tag.trim()).filter(Boolean).slice(0, 12);
   }
 
   private mockRecordedDatasets(snapshot: GuiSnapshot): RecordedDataset[] {

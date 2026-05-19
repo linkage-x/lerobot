@@ -1,0 +1,72 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Notify box branch updates to Feishu
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Remote branch name to report as origin/<branch>."
+        required: true
+        default: "box"
+      dry_run:
+        description: "Print the Feishu payload without sending."
+        required: false
+        type: boolean
+        default: false
+  pull_request_target:
+    branches:
+      - box
+    types:
+      - opened
+      - reopened
+      - closed
+  push:
+    branches:
+      - box
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    name: Send Feishu notification
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request_target' || github.event.action != 'closed' || github.event.pull_request.merged == true
+    env:
+      NOTIFY_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || 'box' }}
+      FEISHU_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+      FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+      FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+      SKIP_PUSH_WITH_ASSOCIATED_PR: "true"
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Send notification
+        run: python scripts/notify_feishu_branch_update.py

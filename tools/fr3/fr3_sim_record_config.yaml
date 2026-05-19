@@ -1,0 +1,23 @@
+robot:
+  type: franka_research3
+  urdf_path: /lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.urdf
+  workspace_min: [0.2, -0.6, 0.05]
+  workspace_max: [0.9, 0.6, 0.8]
+  max_target_delta_pos: [0.001, 0.001, 0.001]
+  max_target_delta_rot: [0.01, 0.01, 0.01]
+
+teleop:
+  type: spacemouse
+  device_id: 0
+
+dataset:
+  repo_id: local/fr3_sim_record
+  single_task: Sim Test
+  root: /workspace/outputs/datasets/fr3_sim_record
+  fps: 30
+  num_episodes: 2
+  episode_time_s: 20
+  video: true
+
+control_fps: 200
+play_sounds: false
