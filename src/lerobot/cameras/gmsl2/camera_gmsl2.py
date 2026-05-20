@@ -384,9 +384,13 @@ class Gmsl2Camera(Camera):
             bayer16 = np.frombuffer(data, dtype=dtype, count=width * height).reshape(
                 (height, width)
             )
-            # The SG16A AR0234 driver writes LSB-aligned 10-bit values into the
-            # 16-bit container. cv2.cvtColor accepts uint8 here; shift to 8-bit.
-            shift = max(0, bits - 8)
+            # The SG16A AR0234 driver writes the 10-bit value into the *high*
+            # bits of the 16-bit container (observed peak == 0xFFFF), so taking
+            # the high byte is the right downcast to uint8 for OpenCV.
+            # If we ever meet a sensor that uses LSB alignment (V4L2 spec
+            # default, peak == (1 << bits) - 1), `>> (bits - 8)` would be the
+            # correct shift instead -- pick by the observed maximum.
+            shift = 16 - 8 if bayer16.max() > (1 << bits) - 1 else max(0, bits - 8)
             bayer = (bayer16 >> shift).astype(np.uint8, copy=False)
 
         bgr = cv2.cvtColor(bayer, cv_code_map[pattern])
