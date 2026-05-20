@@ -428,6 +428,8 @@ def _scan_datasets_root(state: GatewayState) -> list[Path]:
     root = state.datasets_root
     if root is None or not root.is_dir():
         return []
+    if _is_dataset_root(root):
+        return [root]
     return [entry for entry in root.iterdir() if _is_dataset_root(entry)]
 
 
@@ -859,6 +861,31 @@ def _complete_dataset_candidates(state: GatewayState) -> list[Path]:
 
 def _processing_items(state: GatewayState) -> list[dict[str, Any]]:
     return [_processing_item_from_dataset(root) for root in _complete_dataset_candidates(state)]
+
+
+def _set_datasets_root(state: GatewayState, raw_path: str) -> bool:
+    requested = raw_path.strip()
+    if not requested:
+        raise ValueError("missing path")
+    candidate = Path(requested)
+    if not candidate.is_absolute():
+        candidate = state.repo_root / candidate
+    try:
+        resolved = candidate.resolve()
+    except OSError as exc:
+        raise ValueError(f"cannot resolve path: {exc}") from exc
+    created = False
+    if not resolved.is_dir():
+        if resolved.exists():
+            raise ValueError(f"not a directory: {resolved}")
+        try:
+            resolved.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError(f"failed to create directory: {exc}") from exc
+        created = True
+    state.datasets_root = resolved
+    state.selected_replay_root = None
+    return created
 
 
 def _mock_calibrate_cameras(state: GatewayState) -> None:
@@ -2906,24 +2933,22 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/processing/datasets-root":
                     requested = (query.get("path", [""])[0] or "").strip()
-                    if not requested:
-                        _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing path"})
-                        return
-                    candidate = Path(requested)
-                    if not candidate.is_absolute():
-                        candidate = self.server.state.repo_root / candidate
                     try:
-                        resolved = candidate.resolve()
-                    except OSError as exc:
-                        _json_response(self, HTTPStatus.BAD_REQUEST, {"error": f"cannot resolve path: {exc}"})
+                        created = _set_datasets_root(self.server.state, requested)
+                    except ValueError as exc:
+                        _json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
-                    if not resolved.is_dir():
-                        _json_response(self, HTTPStatus.BAD_REQUEST, {"error": f"not a directory: {resolved}"})
-                        return
-                    self.server.state.datasets_root = resolved
-                    self.server.state.selected_replay_root = None
-                    self.server.state.log("info", f"Datasets root changed to {resolved}")
-                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    resolved = self.server.state.datasets_root
+                    message = (
+                        f"Datasets root did not exist; created {resolved}"
+                        if created
+                        else f"Datasets root changed to {resolved}"
+                    )
+                    self.server.state.log("info", message)
+                    snapshot = _snapshot(self.server.state)
+                    if created:
+                        snapshot["notice"] = message
+                    _json_response(self, HTTPStatus.OK, snapshot)
                     return
                 if path == "/api/annotation/save":
                     _save_annotation(self.server.state, _read_json_body(self))

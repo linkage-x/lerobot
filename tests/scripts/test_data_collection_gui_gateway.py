@@ -212,6 +212,43 @@ def test_replay_episode_selection_defaults_to_first_and_can_switch(tmp_path):
     assert [frame["frame"] for frame in selected_timeline["frames"]] == [0, 1]
 
 
+def test_processing_items_accepts_dataset_root_as_datasets_root(tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(repo_root / "missing"), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test", datasetRoot=str(repo_root / "missing")),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root,
+    )
+
+    items = gateway._processing_items(state)
+
+    assert [item["path"] for item in items] == [str(dataset_root)]
+    assert items[0]["name"] == "episode_set"
+
+
+def test_set_datasets_root_creates_missing_directory(tmp_path):
+    repo_root = tmp_path / "repo"
+    missing_root = repo_root / "data"
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+
+    created = gateway._set_datasets_root(state, str(missing_root))
+
+    assert created is True
+    assert missing_root.is_dir()
+    assert state.datasets_root == missing_root.resolve()
+
+
 def test_traj_gen_is_explicitly_not_implemented(tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
