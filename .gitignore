@@ -189,3 +189,6 @@ _bmad
 MUJOCO_LOG.TXT
 .claude
 core
+
+tools/gmsl2/records
+tools/gmsl2/captures

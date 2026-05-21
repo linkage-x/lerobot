@@ -1,28 +1,35 @@
 #!/usr/bin/env bash
-# Configure the SG16A_AGTH_G3Y_A1 GMSL2 board for hardware-synchronous capture.
+# Cold-boot bring-up for the SG16A_AGTH_G3Y_A1 GMSL2 board.
 #
-# This script is the runtime equivalent of `load_modules.sh` + `pwm.sh` from the
-# SDK, with one important difference: every connected camera is put into SLAVE
-# trigger mode (`trig_mode=1`) and the Jetson's own PWM is used as the trigger
-# source for all of them. AR0234 in 1920x1080 is locked to 60 fps in the dtbo
-# (see `dtb/SG2_AR0234C_G2F/...`), so the default PWM period below matches that
-# (16.666 ms = 60 Hz, 50% duty).
+# This is the runtime equivalent of the SDK's `load_modules.sh` + `pwm.sh`
+# combined: it (1) unloads stale camera modules, (2) insmods the three
+# kernel objects we vendor under `tools/gmsl2/sdk/ko/`, (3) runs
+# `boost_clock.sh` to lock VI/ISP/NVCSI/EMC at max, (4) arms `pwmchip4/pwm0`
+# at the requested frequency, and (5) puts every `/dev/videoN` into slave
+# trigger mode (`trig_mode=1`).
 #
-# Usage (on the Jetson, with the SDK directory available):
-#   sudo ./tools/gmsl2/setup_sync.sh [--sdk DIR] [--fps 60] [--num 11]
+# Once this has run, each subsequent session only needs `sudo sh
+# tools/gmsl2/sdk/pwm.sh` (which `gmsl2_record.py` invokes automatically).
+#
+# Usage (from the repo root):
+#   sudo ./tools/gmsl2/setup_sync.sh [--sdk DIR] [--fps 60] [--num 16]
 #                                    [--trig-pin 0x00020007] [--master-id N]
+#                                    [--dry-run]
+#
+# `--sdk` defaults to the vendored copy at `tools/gmsl2/sdk/`. Pass it
+# explicitly if you want to point at a different driver pack.
 #
 # Notes:
-#   * The script must run as root.
-#   * Re-runs are safe -- existing modules are unloaded first.
-#   * `--master-id N` makes camera N free-running (trig_mode=0) and useful when
-#     a PWM signal is not available; the remaining cameras are still slaves.
+#   * Must run as root (use `sudo`).
+#   * `--master-id N` keeps camera N free-running (trig_mode=0) -- useful
+#     when no PWM wire is hooked up to the SG16A trigger pin.
 
 set -euo pipefail
 
-SDK_DIR="${SDK_DIR:-$HOME/Desktop/SG16A_AGTH_G3Y_A1}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SDK_DIR="${SDK_DIR:-${SCRIPT_DIR}/sdk}"
 FPS=60
-NUM=11
+NUM=16
 TRIG_PIN="0x00020007"
 MASTER_ID="-1"
 SENSOR_MODE=0

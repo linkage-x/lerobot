@@ -17,14 +17,24 @@ key: `type: gmsl2`.
 
 ## Hardware sync, in one paragraph
 
-The board exposes a trigger pin (`trig_pin=0x00020007` in the SDK). When a sensor
-is put into `trig_mode=1`, its frame start is gated by a falling/rising edge on
-that pin. By feeding the pin with the Jetson PWM (`pwmchip4/pwm0`) we get every
-channel locked to the same frame clock -- no master-camera daisy-chain required.
+The board exposes a trigger pin (`trig_pin=0x00020007` in the SDK). When a
+sensor is put into `trig_mode=1` ("slave"), its frame start is gated by the
+PWM edge on that pin. The Jetson PWM output (`pwmchip4/pwm0`) is wired to the
+SG16A trigger input on this rig (confirmed), so every channel's frame N is
+physically locked to the same edge -- cross-camera alignment is bounded by
+PWM jitter, well under a microsecond.
 
 `setup_sync.sh` programs the PWM to `1/<fps>` seconds with 50% duty (60 Hz by
 default -- matches the AR0234 dtbo, which hard-codes
 `min_framerate=max_framerate=60000000` with `framerate_factor=1000000`).
+
+**Exposure-vs-period constraint.** In `trig_mode=1` the per-frame
+`exposure_us` must fit inside one PWM period minus the sensor's row-readout
+window. At 60 Hz the period is 16666 µs and AR0234 needs roughly 2 ms of
+readout headroom, so keep `exposure_us <= ~14000`. Going over makes the
+sensor miss the next trigger and fall back to ~0.8 fps. The recorder clamps
+this automatically (default cap = 0.85 * period) and logs a warning when a
+configured value is too high.
 
 ## Bring-up
 
@@ -45,6 +55,10 @@ GST_DEBUG=2 gst-launch-1.0 \
   nvarguscamerasrc sensor-id=0 sensor-mode=0 \
   ! 'video/x-raw(memory:NVMM),format=NV12,width=1920,height=1080,framerate=60/1' \
   ! nvvidconv ! 'video/x-raw,format=BGRx' ! fakesink -v
+
+# 4. Check which MAX96726 links are physically locked before choosing the
+#    recorder camera list. The output includes LOCKED_VIDEO_IDS=...
+./tools/gmsl2/check_max96726_locks.sh
 ```
 
 If step 3 prints a stable `current-fps:` close to 60 you are good to go.

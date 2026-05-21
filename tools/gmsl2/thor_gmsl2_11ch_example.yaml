@@ -1,252 +1,94 @@
-# 11-channel GMSL2 (SG2-AR0234C-G2F) capture on a Jetson Thor through the
-# SG16A-AGTH-G3Y-A1 adapter. All cameras are SLAVE-triggered; the Jetson PWM
-# (pwmchip4/pwm0) is the master sync source at 60 Hz -- see
-# tools/gmsl2/setup_sync.sh.
+# Thor + SG16A-AGTH-G3Y-A1 + 11 x SG2-AR0234C-G2F GMSL2 cameras.
 #
-# AR0234 + this board's dtbo is hard-coded to 1920x1080 @ 60 fps (see
-# dtb/SG2_AR0234C_G2F/...overlay.dtbo: min/max/default_framerate=60000000,
-# framerate_factor=1000000).
+# The recording path runs entirely inside GStreamer:
+#
+#     nvarguscamerasrc --(ISP, AE/AWB/CCM via camera_overrides.isp)--> NV12
+#         --(nvv4l2h265enc)--> H.265 elementary stream --(matroskamux)--> .mkv
+#
+# Python's job is to (a) decide which sensor-ids to record, (b) start/stop the
+# GStreamer pipelines around each episode, and (c) write a metadata sidecar
+# with hardware-sync info + capture timestamps. The frame pixels never enter
+# the Python process.
+#
+# AR0234 + this board's dtbo is hard-locked to 1920x1080 @ 60 fps
+# (min/max/default_framerate = 60000000, framerate_factor = 1000000 in
+# dtb/SG2_AR0234C_G2F/...overlay.dtbo).
 
 sensors:
-  max_read_age_ms: 250
-  soft_sync:
-    # Hardware sync is active; soft sync is disabled. The recorder still aligns
-    # samples by writing the per-camera capture timestamp on every step.
-    enabled: false
-    tolerance_ms: 20.0
-    wait_timeout_ms: 150.0
-    poll_interval_ms: 1.0
-    buffer_duration_s: 0.25
   cameras:
-    cam_00:
-      type: gmsl2
-      sensor_id: 0
-      pipeline: v4l2_bayer
-      bayer_format: grbg10le
+    # `detect_all: true` runs `tools/gmsl2/check_max96726_locks.sh` at
+    # session start and uses every sid the MAX96726 reports as locked. The
+    # recorder additionally probes each locked sid through nvarguscamerasrc
+    # and drops any that fail to open. Override with `sensor_ids: [0, 4, ...]`
+    # to pin a specific subset.
+    detect_all: true
+    sensor_ids: []        # only used when detect_all is false
+    name_prefix: "cam"    # produces cam_00, cam_01, ... in the dataset
+    spawn_stagger_s: 0.0  # delay between gst-launch opens; override for Argus diagnostics
+    stop_on_stream_exit: true  # set false/--ignore-stream-exit for diagnostics only
+
+    # Per-camera capture/encoding defaults. nvarguscamerasrc handles ISP +
+    # AE/AWB before the encoder sees the data. The hardware H.265 encoder
+    # writes a complete MKV per camera per episode.
+    defaults:
+      pipeline: argus          # 'argus' = nvarguscamerasrc + ISP
       sensor_mode: 0
       width: 1920
       height: 1080
-      fps: 60
-      color_mode: bgr
-      sync_role: slave
-      trig_pin: 0x00020007
-      apply_sync_at_connect: true
-      # Driver defaults are exposure=14 (effectively black) and gain=100. Set
-      # reasonable values for typical indoor lighting; tune per scene.
-      exposure_us: 15000
-      gain: 300
-      warmup_s: 2
-      timeout_ms: 5000
-    cam_01:
-      type: gmsl2
-      sensor_id: 1
-      pipeline: v4l2_bayer
-      bayer_format: grbg10le
-      sensor_mode: 0
-      width: 1920
-      height: 1080
-      fps: 60
-      color_mode: bgr
-      sync_role: slave
-      trig_pin: 0x00020007
-      apply_sync_at_connect: true
-      # Driver defaults are exposure=14 (effectively black) and gain=100. Set
-      # reasonable values for typical indoor lighting; tune per scene.
-      exposure_us: 15000
-      gain: 300
-      warmup_s: 2
-      timeout_ms: 5000
-    cam_02:
-      type: gmsl2
-      sensor_id: 2
-      pipeline: v4l2_bayer
-      bayer_format: grbg10le
-      sensor_mode: 0
-      width: 1920
-      height: 1080
-      fps: 60
-      color_mode: bgr
-      sync_role: slave
-      trig_pin: 0x00020007
-      apply_sync_at_connect: true
-      # Driver defaults are exposure=14 (effectively black) and gain=100. Set
-      # reasonable values for typical indoor lighting; tune per scene.
-      exposure_us: 15000
-      gain: 300
-      warmup_s: 2
-      timeout_ms: 5000
-    cam_03:
-      type: gmsl2
-      sensor_id: 3
-      pipeline: v4l2_bayer
-      bayer_format: grbg10le
-      sensor_mode: 0
-      width: 1920
-      height: 1080
-      fps: 60
-      color_mode: bgr
-      sync_role: slave
-      trig_pin: 0x00020007
-      apply_sync_at_connect: true
-      # Driver defaults are exposure=14 (effectively black) and gain=100. Set
-      # reasonable values for typical indoor lighting; tune per scene.
-      exposure_us: 15000
-      gain: 300
-      warmup_s: 2
-      timeout_ms: 5000
-    cam_04:
-      type: gmsl2
-      sensor_id: 4
-      pipeline: v4l2_bayer
-      bayer_format: grbg10le
-      sensor_mode: 0
-      width: 1920
-      height: 1080
-      fps: 60
-      color_mode: bgr
-      sync_role: slave
-      trig_pin: 0x00020007
-      apply_sync_at_connect: true
-      # Driver defaults are exposure=14 (effectively black) and gain=100. Set
-      # reasonable values for typical indoor lighting; tune per scene.
-      exposure_us: 15000
-      gain: 300
-      warmup_s: 2
-      timeout_ms: 5000
-    cam_05:
-      type: gmsl2
-      sensor_id: 5
-      pipeline: v4l2_bayer
-      bayer_format: grbg10le
-      sensor_mode: 0
-      width: 1920
-      height: 1080
-      fps: 60
-      color_mode: bgr
-      sync_role: slave
-      trig_pin: 0x00020007
-      apply_sync_at_connect: true
-      # Driver defaults are exposure=14 (effectively black) and gain=100. Set
-      # reasonable values for typical indoor lighting; tune per scene.
-      exposure_us: 15000
-      gain: 300
-      warmup_s: 2
-      timeout_ms: 5000
-    cam_06:
-      type: gmsl2
-      sensor_id: 6
-      pipeline: v4l2_bayer
-      bayer_format: grbg10le
-      sensor_mode: 0
-      width: 1920
-      height: 1080
-      fps: 60
-      color_mode: bgr
-      sync_role: slave
-      trig_pin: 0x00020007
-      apply_sync_at_connect: true
-      # Driver defaults are exposure=14 (effectively black) and gain=100. Set
-      # reasonable values for typical indoor lighting; tune per scene.
-      exposure_us: 15000
-      gain: 300
-      warmup_s: 2
-      timeout_ms: 5000
-    cam_07:
-      type: gmsl2
-      sensor_id: 7
-      pipeline: v4l2_bayer
-      bayer_format: grbg10le
-      sensor_mode: 0
-      width: 1920
-      height: 1080
-      fps: 60
-      color_mode: bgr
-      sync_role: slave
-      trig_pin: 0x00020007
-      apply_sync_at_connect: true
-      # Driver defaults are exposure=14 (effectively black) and gain=100. Set
-      # reasonable values for typical indoor lighting; tune per scene.
-      exposure_us: 15000
-      gain: 300
-      warmup_s: 2
-      timeout_ms: 5000
-    cam_08:
-      type: gmsl2
-      sensor_id: 8
-      pipeline: v4l2_bayer
-      bayer_format: grbg10le
-      sensor_mode: 0
-      width: 1920
-      height: 1080
-      fps: 60
-      color_mode: bgr
-      sync_role: slave
-      trig_pin: 0x00020007
-      apply_sync_at_connect: true
-      # Driver defaults are exposure=14 (effectively black) and gain=100. Set
-      # reasonable values for typical indoor lighting; tune per scene.
-      exposure_us: 15000
-      gain: 300
-      warmup_s: 2
-      timeout_ms: 5000
-    cam_09:
-      type: gmsl2
-      sensor_id: 9
-      pipeline: v4l2_bayer
-      bayer_format: grbg10le
-      sensor_mode: 0
-      width: 1920
-      height: 1080
-      fps: 60
-      color_mode: bgr
-      sync_role: slave
-      trig_pin: 0x00020007
-      apply_sync_at_connect: true
-      # Driver defaults are exposure=14 (effectively black) and gain=100. Set
-      # reasonable values for typical indoor lighting; tune per scene.
-      exposure_us: 15000
-      gain: 300
-      warmup_s: 2
-      timeout_ms: 5000
-    cam_10:
-      type: gmsl2
-      sensor_id: 10
-      pipeline: v4l2_bayer
-      bayer_format: grbg10le
-      sensor_mode: 0
-      width: 1920
-      height: 1080
-      fps: 60
-      color_mode: bgr
-      sync_role: slave
-      trig_pin: 0x00020007
-      apply_sync_at_connect: true
-      # Driver defaults are exposure=14 (effectively black) and gain=100. Set
-      # reasonable values for typical indoor lighting; tune per scene.
-      exposure_us: 15000
-      gain: 300
-      warmup_s: 2
-      timeout_ms: 5000
+      fps: 60                  # must match the AR0234 dtbo (60 only)
+      # AR0234 sensor controls applied via v4l2-ctl before recording.
+      # Defaults match the user's verified-good state on this rig; set to 0
+      # to leave nvargus's auto-exposure / auto-gain in charge.
+      exposure_us: 9999
+      gain: 320
+      # Hardware encoder configuration -- consumed by nvv4l2h265enc.
+      codec: h265
+      bitrate_kbps: 20000
+      iframe_interval: 60      # one keyframe per second @60 fps
+      preset_level: 1          # 1=UltraFastPreset, 4=SlowPreset (NV preset enum)
+      control_rate: 1          # 1 = constant-bitrate, 0 = variable
+      profile: main            # h265: main / main10 ; h264: high / main / baseline
+      container: mkv           # mkv or mp4 (matroskamux / qtmux)
+
+  hardware_sync:
+    # ON by default. The recorder will (1) run `sudo sh sdk/pwm.sh` to arm
+    # `pwmchip4/pwm0` at the configured frequency and (2) push the chosen
+    # `sensor_trig_mode` to every recorded camera via v4l2-ctl.
+    #
+    # The user has confirmed the Jetson PWM output is wired to the SG16A
+    # trigger input on this rig, so we default to true PWM-edge-locked sync
+    # (`sensor_trig_mode: 1`). Cross-camera alignment is then bounded by
+    # PWM jitter (sub-microsecond) rather than per-pipeline clock skew.
+    #
+    # IMPORTANT: in slave mode the per-frame exposure time must fit within
+    # one PWM period minus the sensor's row-readout window, otherwise the
+    # sensor misses the next trigger edge and falls back to ~0.8 fps. At
+    # 60 Hz (period = 16666 us) keep `exposure_us` <= ~14000. The recorder
+    # auto-clamps `cameras.defaults.exposure_us` to 0.85 * period_us at
+    # start time and logs a warning when the original value is too high.
+    enabled: true
+    sdk_dir: tools/gmsl2/sdk    # repo-relative; vendored pwm.sh lives here
+    setup_script: pwm.sh        # relative to sdk_dir, or absolute path
+    fps: 60                     # PWM frequency in Hz
+    sensor_trig_mode: 1         # 1 = slave (PWM-edge locked), 0 = free_run
+    trig_pin: 0x00020007        # written to each camera via v4l2-ctl
+    # Informational only -- recorded in episode meta.json.
+    pwm_chip: pwmchip4
+    pwm_id: 0
 
 dataset:
   repo_id: local/thor_gmsl2_11ch_v1
-  single_task: Thor GMSL2 11-camera hardware-synced capture
+  single_task: Thor GMSL2 11-camera capture
   root: outputs/datasets/thor_gmsl2_11ch_v1
-  # AR0234 dtbo is locked to 60 fps and the recorder writes one row per tick.
-  # Lower this together with the PWM frequency (e.g. --fps 30) if disk I/O is tight.
+  # The orchestrator writes one MKV per camera per episode plus
+  # `episode_<idx>/meta.json` describing the cameras, codecs, wallclock
+  # timestamps, and hardware-sync settings. There is no LeRobotDataset
+  # parquet (the GUI consumer reads the MKV streams + meta.json directly).
   fps: 60
-  num_episodes: 0
+  num_episodes: 0              # 0 = unlimited; press the GUI's Save/Stop
   episode_time_s: 10
-  video: true
-  streaming_encoding: true
-  vcodec: h264
-  encoder_threads: 2
-  capture_queue_size: 16
   push_to_hub: false
 
 display_data: true
-display_ip:
-display_port:
-rerun_save_path:
 play_sounds: false
 resume: false
