@@ -178,7 +178,7 @@ def load_config(path: Path) -> RecorderConfig:
 def detect_locked_sids(cfg: RecorderConfig, repo_root: Path) -> list[int]:
     if not cfg.detect_all:
         return list(cfg.sensor_ids)
-    script = repo_root / "tools" / "gmsl2" / "check_max96726_locks.sh"
+    script = repo_root / "tools" / "thor" / "gmsl2" / "check_max96726_locks.sh"
     if not script.exists():
         raise FileNotFoundError(f"missing lock-check script: {script}")
     logger.info("running lock-check: %s", script)
