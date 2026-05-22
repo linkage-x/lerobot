@@ -15,8 +15,8 @@
 #   The frequency was bumped to 60 Hz here to match the AR0234 dtbo, where
 #   min/max/default_framerate are hard-locked to 60000000 (* 1/1e6 = 60 fps).
 #
-# Usage: sudo sh tools/gmsl2/sdk/pwm.sh
-#        FPS=30 sudo -E sh tools/gmsl2/sdk/pwm.sh   # override
+# Usage: sudo sh tools/thor/gmsl2/sdk/pwm.sh
+#        FPS=30 sudo -E sh tools/thor/gmsl2/sdk/pwm.sh   # override
 
 set -eu
 

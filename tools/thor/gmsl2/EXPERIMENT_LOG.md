@@ -44,15 +44,15 @@ loading + PWM trigger source setup.
 | `src/lerobot/cameras/gmsl2/__init__.py` | Public exports. |
 | `src/lerobot/cameras/utils.py` | `make_cameras_from_configs` dispatch for `gmsl2`. |
 | `tools/handheld/handheld_record.py` | Added `Gmsl2CameraConfig` import so the recorder's draccus registry resolves the type. |
-| `tools/gmsl2/setup_sync.sh` | Runtime equivalent of `load_modules.sh` + `pwm.sh` with hardware-sync defaults. Loads modules, boosts clocks, sets PWM `pwmchip4/pwm0`, puts every channel in slave trigger mode. |
-| `tools/gmsl2/thor_gmsl2_11ch_example.yaml` | 11-channel handheld recorder config. No grippers, no tactiles. |
-| `tools/gmsl2/README.md` | Bring-up / deploy / troubleshooting notes. |
+| `tools/thor/gmsl2/setup_sync.sh` | Runtime equivalent of `load_modules.sh` + `pwm.sh` with hardware-sync defaults. Loads modules, boosts clocks, sets PWM `pwmchip4/pwm0`, puts every channel in slave trigger mode. |
+| `tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml` | 11-channel handheld recorder config. No grippers, no tactiles. |
+| `tools/thor/gmsl2/README.md` | Bring-up / deploy / troubleshooting notes. |
 
 **Verification on host:**
 - `python3 -c "from lerobot.cameras.gmsl2 import Gmsl2CameraConfig; ..."` — config
   loads, draccus registers `gmsl2`.
 - Full `draccus.decode(HandheldRecordingConfig, yaml.safe_load(...))` on
-  `tools/gmsl2/thor_gmsl2_11ch_example.yaml` produces 11 `Gmsl2CameraConfig`
+  `tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml` produces 11 `Gmsl2CameraConfig`
   instances, every field validated.
 
 ---
@@ -402,7 +402,7 @@ failures. Suggested escalation order:
 5. **Gateway / GUI smoke test.** Install gateway deps on Thor (the existing
    handheld stack, plus `pyav`, `pandas`, etc.), then run
    `python -m tools.data_collection_gui.gateway --config-path
-   tools/gmsl2/thor_gmsl2_11ch_example.yaml ...` per
+   tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml ...` per
    `tools/data_collection_gui/frontend/README.md`.
 6. **High-fps debayer path.** Software `cv2.cvtColor` is enough for a single
    camera at 60 Hz. With 11 channels we will either need:
@@ -446,7 +446,7 @@ Board mapping used for this test:
 ```bash
 sudo service nvargus-daemon stop
 cd ~/lerobot
-sudo ./tools/gmsl2/setup_sync.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1 --fps 60 --num 16
+sudo ./tools/thor/gmsl2/setup_sync.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1 --fps 60 --num 16
 for i in $(seq 0 15); do
   sudo v4l2-ctl -d /dev/video$i -c sensor_mode=0,trig_mode=0,bypass_mode=0
 done
@@ -543,7 +543,7 @@ as an operator-induced wiring state, not as the clean-reload result.
 **Helper script added:**
 
 ```bash
-tools/gmsl2/check_max96726_locks.sh
+tools/thor/gmsl2/check_max96726_locks.sh
 ```
 
 The script reads all four MAX96726 instances, prints the raw `REG0x0008`
@@ -557,7 +557,7 @@ UNLOCKED_VIDEO_IDS=...
 It was copied to the Thor at:
 
 ```bash
-~/lerobot/tools/gmsl2/check_max96726_locks.sh
+~/lerobot/tools/thor/gmsl2/check_max96726_locks.sh
 ```
 
 **Current conclusion:**
@@ -599,7 +599,7 @@ connected at the `video1` position to the `video7` position.
 ```bash
 sudo service nvargus-daemon stop
 cd ~/lerobot
-sudo ./tools/gmsl2/setup_sync.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1 --fps 60 --num 16
+sudo ./tools/thor/gmsl2/setup_sync.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1 --fps 60 --num 16
 for i in $(seq 0 15); do
   sudo v4l2-ctl -d /dev/video$i -c sensor_mode=0,trig_mode=0,bypass_mode=0
 done
@@ -699,7 +699,7 @@ remaining failure is port/driver-side.
 已整理供应商问题单：
 
 ```text
-tools/gmsl2/SUPPLIER_ISSUE_MAX96726_STREAMON.md
+tools/thor/gmsl2/SUPPLIER_ISSUE_MAX96726_STREAMON.md
 ```
 
 ---
@@ -714,11 +714,11 @@ stream 测试，确认问题是否只是旧驱动状态残留。
 ```bash
 sudo service nvargus-daemon stop
 cd ~/lerobot
-sudo ./tools/gmsl2/setup_sync.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1 --fps 60 --num 16
+sudo ./tools/thor/gmsl2/setup_sync.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1 --fps 60 --num 16
 for i in $(seq 0 15); do
   sudo v4l2-ctl -d /dev/video$i -c sensor_mode=0,trig_mode=0,bypass_mode=0
 done
-./tools/gmsl2/check_max96726_locks.sh
+./tools/thor/gmsl2/check_max96726_locks.sh
 ```
 
 模块重载成功。
@@ -804,10 +804,10 @@ link-to-video 映射，而不是 LeRobot 上层录制逻辑。
 已落盘文件：
 
 ```text
-tools/gmsl2/records/debug_logs/dmesg_load_to_video7.log
-tools/gmsl2/records/debug_logs/video7_open_stream.log
-tools/gmsl2/records/debug_logs/setup_sync.log
-tools/gmsl2/records/debug_logs/link_locks_before_video7.log
+tools/thor/gmsl2/records/debug_logs/dmesg_load_to_video7.log
+tools/thor/gmsl2/records/debug_logs/video7_open_stream.log
+tools/thor/gmsl2/records/debug_logs/setup_sync.log
+tools/thor/gmsl2/records/debug_logs/link_locks_before_video7.log
 ```
 
 `video7_open_stream.log` 显示 `/dev/video7` 对应 `vi-output, ar0234c 18-0023`，
@@ -845,11 +845,11 @@ VIDIOC_STREAMON returned -1 (Operation not permitted)
 已落盘文件：
 
 ```text
-tools/gmsl2/records/cam00_1080p60_no_nvcam_settings_h265_3s.h265
-tools/gmsl2/records/cam00_1080p60_no_nvcam_settings_h265_3s.mp4
-tools/gmsl2/records/cam00_isp_frame.jpg
-tools/gmsl2/records/cam00_no_nvcam_settings_frame.jpg
-tools/gmsl2/records/debug_logs/record_no_isp.log
+tools/thor/gmsl2/records/cam00_1080p60_no_nvcam_settings_h265_3s.h265
+tools/thor/gmsl2/records/cam00_1080p60_no_nvcam_settings_h265_3s.mp4
+tools/thor/gmsl2/records/cam00_isp_frame.jpg
+tools/thor/gmsl2/records/cam00_no_nvcam_settings_frame.jpg
+tools/thor/gmsl2/records/debug_logs/record_no_isp.log
 ```
 
 MP4 校验结果：
@@ -907,7 +907,7 @@ camera_index=3:
 本轮落盘目录：
 
 ```text
-tools/gmsl2/records/gmsl2_red_isp_compare_20260521_060346/
+tools/thor/gmsl2/records/gmsl2_red_isp_compare_20260521_060346/
 ```
 
 关键文件：
@@ -961,7 +961,7 @@ Argus H.265 录制测试。
 本轮落盘目录：
 
 ```text
-tools/gmsl2/records/gmsl2_powercycle_retest_20260521_061404/
+tools/thor/gmsl2/records/gmsl2_powercycle_retest_20260521_061404/
 ```
 
 流程：
@@ -1107,9 +1107,9 @@ Error generated. main.cpp, execute:623 No cameras available
 相关日志已落盘：
 
 ```text
-tools/gmsl2/records/gst_argus_after_install/gst_sensor0_fakesink.log
-tools/gmsl2/records/gst_argus_after_install/gst_sensor0_h265_file.log
-tools/gmsl2/records/gst_argus_after_install/gst_sensor0_xvimagesink.log
+tools/thor/gmsl2/records/gst_argus_after_install/gst_sensor0_fakesink.log
+tools/thor/gmsl2/records/gst_argus_after_install/gst_sensor0_h265_file.log
+tools/thor/gmsl2/records/gst_argus_after_install/gst_sensor0_xvimagesink.log
 ```
 
 结论：
@@ -1213,7 +1213,7 @@ Failed to create CameraProvider
 本轮日志目录：
 
 ```text
-tools/gmsl2/records/gmsl2_gst_locked_retest_20260521_065006/
+tools/thor/gmsl2/records/gmsl2_gst_locked_retest_20260521_065006/
 ```
 
 结论：
@@ -1327,13 +1327,13 @@ nvv4l2h265enc=0
 恢复过程快照已落盘：
 
 ```text
-tools/gmsl2/records/restore_logs/restore_process_snapshot.log
+tools/thor/gmsl2/records/restore_logs/restore_process_snapshot.log
 ```
 
 最终验证：
 
 ```text
-tools/gmsl2/records/gmsl2_post_restore_final_verify_20260521_070505/
+tools/thor/gmsl2/records/gmsl2_post_restore_final_verify_20260521_070505/
 ```
 
 结果：
@@ -1387,7 +1387,7 @@ nvv4l2h265enc=0
 本轮日志目录：
 
 ```text
-tools/gmsl2/records/gmsl2_rerun_after_restore_20260521_071200/
+tools/thor/gmsl2/records/gmsl2_rerun_after_restore_20260521_071200/
 ```
 
 `setup_sync.sh` 成功：
@@ -1496,9 +1496,9 @@ AR0234 行扫描读出时间，sensor 错过下一个触发边沿便回落到默
 
 | 文件 | 改动 |
 | --- | --- |
-| `tools/gmsl2/thor_gmsl2_11ch_example.yaml` | `hardware_sync.sensor_trig_mode: 0 → 1`（默认走真正的 PWM 边沿锁相）；`cameras.defaults.exposure_us: 0 → 9999`、`gain: 0 → 320`（用户验证的安全曝光）；注释里写明 60Hz 下 `exposure_us` 应 ≤ ~14000 µs。 |
-| `tools/gmsl2/gmsl2_record.py` | `HardwareSync.sensor_trig_mode = 1`（与 yaml 保持一致）；新增曝光预检：当 `sensor_trig_mode=1` 且 `exposure_us > 0.85 × (1e6 / pwm_fps)` 时打 warning，自动 clamp 到该上限。 |
-| `tools/gmsl2/README.md` | 标注 PWM 触发路径已确认可用；明确"真硬同步"的两步条件（trig_mode=1 + exposure 在周期上限内）。 |
+| `tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml` | `hardware_sync.sensor_trig_mode: 0 → 1`（默认走真正的 PWM 边沿锁相）；`cameras.defaults.exposure_us: 0 → 9999`、`gain: 0 → 320`（用户验证的安全曝光）；注释里写明 60Hz 下 `exposure_us` 应 ≤ ~14000 µs。 |
+| `tools/thor/gmsl2/gmsl2_record.py` | `HardwareSync.sensor_trig_mode = 1`（与 yaml 保持一致）；新增曝光预检：当 `sensor_trig_mode=1` 且 `exposure_us > 0.85 × (1e6 / pwm_fps)` 时打 warning，自动 clamp 到该上限。 |
+| `tools/thor/gmsl2/README.md` | 标注 PWM 触发路径已确认可用；明确"真硬同步"的两步条件（trig_mode=1 + exposure 在周期上限内）。 |
 
 **关于跨相机时间戳对齐含义的修正：**
 
@@ -1520,10 +1520,10 @@ AR0234 行扫描读出时间，sensor 错过下一个触发边沿便回落到默
 
 ```bash
 # 1. 把 PWM 拉到 60 Hz（vendored pwm.sh; 自动 unexport→重写 period/duty→enable）
-cd ~/lerobot/tools/gmsl2/sdk && sudo sh pwm.sh
+cd ~/lerobot/tools/thor/gmsl2/sdk && sudo sh pwm.sh
 
 # 2. 拿 MAX96726 物理 lock 列表
-~/lerobot/tools/gmsl2/check_max96726_locks.sh | grep ^LOCKED_VIDEO_IDS=
+~/lerobot/tools/thor/gmsl2/check_max96726_locks.sh | grep ^LOCKED_VIDEO_IDS=
 #   实测: LOCKED_VIDEO_IDS=0,2,3,4,5,7,9,10,11,14,15  (11 路)
 
 # 3. 把每路相机推到 slave + 安全曝光
@@ -1576,9 +1576,9 @@ PROBE_OK   sid=15
 
 | 文件 | 关键变更 |
 | --- | --- |
-| `tools/gmsl2/thor_gmsl2_11ch_example.yaml` | `hardware_sync.sensor_trig_mode: 1`；`cameras.defaults.exposure_us: 9999`、`gain: 320`；曝光-vs-周期注释 |
-| `tools/gmsl2/gmsl2_record.py` | `HardwareSync.sensor_trig_mode = 1` 默认；新增 `_clamp_exposure_for_pwm_period()`：`exposure_us > 0.85 × 1e6/fps` 时自动 clamp + WARNING |
-| `tools/gmsl2/README.md` | 标注 PWM 路径已 verified；明确"真硬同步"两步条件 + exposure 上限计算 |
+| `tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml` | `hardware_sync.sensor_trig_mode: 1`；`cameras.defaults.exposure_us: 9999`、`gain: 320`；曝光-vs-周期注释 |
+| `tools/thor/gmsl2/gmsl2_record.py` | `HardwareSync.sensor_trig_mode = 1` 默认；新增 `_clamp_exposure_for_pwm_period()`：`exposure_us > 0.85 × 1e6/fps` 时自动 clamp + WARNING |
+| `tools/thor/gmsl2/README.md` | 标注 PWM 路径已 verified；明确"真硬同步"两步条件 + exposure 上限计算 |
 
 **留给后续：**
 
@@ -1595,8 +1595,8 @@ PROBE_OK   sid=15
 ```bash
 cd ~/lerobot && rm -rf outputs/datasets/thor_gmsl2_11ch_v1
 # 前置：E22 已完成 PWM 60Hz + 11 路 trig_mode=1 + exposure=9999 + gain=320
-PYTHONPATH=src:. python3 -u -m tools.gmsl2.gmsl2_record \
-  --config-path tools/gmsl2/thor_gmsl2_11ch_example.yaml \
+PYTHONPATH=src:. python3 -u -m tools.thor.gmsl2.gmsl2_record \
+  --config-path tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml \
   --num-episodes 1 --episode-time-s 5 \
   --skip-argus-probe
 ```
@@ -1678,7 +1678,7 @@ EOS on shutdown` 后报的 `NvBufSurfaceFromFd Failed` 是关闭时旁路错误�
 
 **代码改动：**
 
-* `tools/gmsl2/gmsl2_record.py`
+* `tools/thor/gmsl2/gmsl2_record.py`
   * 新增 `RecorderConfig.spawn_stagger_s`，从 yaml 的
     `sensors.cameras.spawn_stagger_s` 读取，默认 0.0。
   * 新增 CLI 参数 `--spawn-stagger-s`，用于临时覆盖配置。
@@ -1687,7 +1687,7 @@ EOS on shutdown` 后报的 `NvBufSurfaceFromFd Failed` 是关闭时旁路错误�
   * 把 `episode_time_s` 的倒计时起点移到 `session.start()` 完成之后，
     避免 8/11 路 stagger 吃掉正式采集窗口。
   * `meta.json` 记录 `spawn_stagger_s`，方便回看实验条件。
-* `tools/gmsl2/thor_gmsl2_11ch_example.yaml`
+* `tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml`
   * 新增 `sensors.cameras.spawn_stagger_s: 0.0`，保持默认行为不变。
 
 **补充诊断开关：**
@@ -1705,8 +1705,8 @@ E24 首轮 8 路实测中，`cam_02` 提前 EOS 会触发 orchestrator 立刻停
 cd ~/lerobot && rm -rf outputs/datasets/thor_gmsl2_11ch_v1
 sudo service nvargus-daemon restart
 
-PYTHONPATH=src:. python3 -u -m tools.gmsl2.gmsl2_record \
-  --config-path tools/gmsl2/thor_gmsl2_11ch_example.yaml \
+PYTHONPATH=src:. python3 -u -m tools.thor.gmsl2.gmsl2_record \
+  --config-path tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml \
   --sensor-ids 0,2,3,4,5,7,9,10 \
   --num-episodes 1 --episode-time-s 30 \
   --spawn-stagger-s 0.5 \
@@ -1729,3 +1729,109 @@ ls -lh outputs/datasets/thor_gmsl2_11ch_v1/episodes/episode_000000/*.mkv
 rg -n "spawn \\+|Producer has connected|Acquired Frame|NvBufSurfaceFromFd|Error generated" \
   outputs/datasets/thor_gmsl2_11ch_v1/episodes/episode_000000/*.gst.log
 ```
+
+**远端实测结果（Thor: `nvidia@192.168.1.44`, 2026-05-21 UTC）：**
+
+先将 E24 recorder 补丁同步到 `~/lerobot/tools/thor/gmsl2/`；远端原文件备份：
+
+```text
+/tmp/lerobot_gmsl2_backup_20260521_094839
+```
+
+远端 `~/lerobot` 不是 git checkout，因此本轮直接同步文件测试。
+
+1. `episode_000001`: `0,2,3,4,5,7,9,10`, `--spawn-stagger-s 0.5`,
+   `episode_time_s=30`，未加 `--ignore-stream-exit`。
+
+   * `cam_02` 提前退出，orchestrator 在约 13s 停止整集。
+   * 只有 `cam_04.mkv` 非空（2.4 MB）；其它 7 路都是 336 B 空容器。
+   * 空路日志统一出现：
+
+```text
+Error generated. ... gstnvarguscamerasrc.cpp, threadExecute:743 NvBufSurfaceFromFd Failed.
+nvbuf_utils: dmabuf_fd -1 mapped entry NOT found
+```
+
+2. 追加诊断开关：`--ignore-stream-exit`
+
+   E24 首轮说明单个坏路会截断其它通道窗口，因此在默认行为不变的前提下新增：
+
+   * `RecorderConfig.stop_on_stream_exit`，默认 `true`
+   * CLI `--ignore-stream-exit`：坏路提前退出只打 warning，episode 继续跑满
+     `episode_time_s`
+
+3. `episode_000002`: 排除已知不稳的 `0/2`，跑
+   `3,4,5,7,9,10,11,14`, `--spawn-stagger-s 0.5`,
+   `--ignore-stream-exit`。
+
+   * 8 路都能 `Producer has connected`。
+   * 仍只有 `cam_04.mkv` 非空（3.7 MB）。
+   * 其它 7 路都是 336 B 空容器，3-9s 内陆续提前 EOS。
+   * `dmesg` 同时出现供应商驱动/解串器层错误，例如：
+
+```text
+max96726 20-0033: i2c-w, write failed
+ar0234c 20-0022: Error turning on streaming
+WARNING ... v4l2_subdev_has_pad_interdep ... tegra_channel_set_stream
+```
+
+4. `episode_000003`: 同一组
+   `3,4,5,7,9,10,11,14`, `--spawn-stagger-s 2.0`,
+   `--ignore-stream-exit`。
+
+   * 2.0s ultra-stagger 没有改善。
+   * 仍只有 `cam_04.mkv` 非空（6.7 MB）。
+   * 其它 7 路仍是 336 B 空容器，`NvBufSurfaceFromFd Failed`。
+   * `cam_11` / `cam_14` stop 阶段不响应 SIGINT，被 SIGTERM 结束。
+
+5. `episode_000004`: 4 路并发对照
+   `4,5,7,9`, `--spawn-stagger-s 0.5`, `--ignore-stream-exit`。
+
+   * `cam_04.mkv` 正常录满 30s（68 MB），日志：
+
+```text
+CONSUMER: Producer has connected; continuing.
+Got EOS from element "pipeline0".
+Execution ended after 0:00:31.473493074
+CONSUMER: Done Success
+```
+
+   * `cam_05/07/09` 均为空容器（336 B），并在 3-4.5s 内
+     `NvBufSurfaceFromFd Failed`。
+
+6. `episode_000005`: 单路 `sid=5`，10s。
+
+   * 单路也失败，`cam_05.mkv` 仍为 336 B。
+   * 日志同样是 `NvBufSurfaceFromFd Failed` + `dmabuf_fd -1`。
+
+7. `episode_000006`: 单路 `sid=4`，10s 正对照。
+
+   * 单路成功，`cam_04.mkv` 23 MB。
+   * 日志正常结束：
+
+```text
+CONSUMER: Producer has connected; continuing.
+Execution ended after 0:00:10.011839888
+CONSUMER: Done Success
+```
+
+**E24 结论更新：**
+
+* `spawn_stagger_s=0.5` 和 `2.0` 都不能让 8 路恢复；问题不是简单的
+  simultaneous open 风暴。
+* 降到 4 路后仍只有 `sid=4` 有有效帧，说明当前状态下不是纯粹的 8 路资源
+  阈值。
+* `sid=5` 单路也失败，而 `sid=4` 单路成功，因此当前根因更接近
+  **部分 sensor-id / deserializer link 的 Argus buffer export / VI stream-on
+  路径失败**。
+* 关键失败签名已经稳定收敛：
+
+```text
+gstnvarguscamerasrc.cpp, threadExecute:743 NvBufSurfaceFromFd Failed
+nvbuf_utils: dmabuf_fd -1 mapped entry NOT found
+max96726 xx-0033: i2c-w, write failed
+ar0234c xx-002x: Error turning on streaming
+```
+
+下一步不应继续调 Python spawn 策略；应回到供应商驱动 / dtbo / link-to-video
+映射定位，优先拿 `sid=4` 成功 vs `sid=5` 失败的完整 `dmesg -C` 对照包给供应商。

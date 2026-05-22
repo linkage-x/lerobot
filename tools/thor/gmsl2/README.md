@@ -44,7 +44,7 @@ The driver and config are pushed from the host to the Thor over rsync (see
 ```bash
 # 1. One-time per boot: load modules, boost clocks, program PWM, put cameras
 #    into slave trigger mode.
-sudo ./tools/gmsl2/setup_sync.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1 --fps 60 --num 11
+sudo ./tools/thor/gmsl2/setup_sync.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1 --fps 60 --num 11
 
 # 2. (Optional) start the Argus daemon explicitly. If you skip this, GStreamer
 #    will start it on demand.
@@ -58,7 +58,7 @@ GST_DEBUG=2 gst-launch-1.0 \
 
 # 4. Check which MAX96726 links are physically locked before choosing the
 #    recorder camera list. The output includes LOCKED_VIDEO_IDS=...
-./tools/gmsl2/check_max96726_locks.sh
+./tools/thor/gmsl2/check_max96726_locks.sh
 ```
 
 If step 3 prints a stable `current-fps:` close to 60 you are good to go.
@@ -69,11 +69,11 @@ If step 3 prints a stable `current-fps:` close to 60 you are good to go.
 # Headless recorder (no GUI):
 cd ~/lerobot
 PYTHONPATH=src:. python -m tools.handheld.handheld_record \
-  --config-path tools/gmsl2/thor_gmsl2_11ch_example.yaml
+  --config-path tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml
 
 # GUI gateway:
 PYTHONPATH=src:. python -m tools.data_collection_gui.gateway \
-  --config-path tools/gmsl2/thor_gmsl2_11ch_example.yaml \
+  --config-path tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml \
   --datasets-root outputs/datasets \
   --port 8765
 

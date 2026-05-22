@@ -1,4 +1,5 @@
-# Thor + SG16A-AGTH-G3Y-A1 + 11 x SG2-AR0234C-G2F GMSL2 cameras.
+# Thor + SG16A-AGTH-G3Y-A1 + 11 x SG2-AR0234C-G2F GMSL2 cameras + BOX 采集板
+# (gripper, IMU, trigger, six-d force, two Paxini touch pads).
 #
 # The recording path runs entirely inside GStreamer:
 #
@@ -6,17 +7,24 @@
 #         --(nvv4l2h265enc)--> H.265 elementary stream --(matroskamux)--> .mkv
 #
 # Python's job is to (a) decide which sensor-ids to record, (b) start/stop the
-# GStreamer pipelines around each episode, and (c) write a metadata sidecar
-# with hardware-sync info + capture timestamps. The frame pixels never enter
-# the Python process.
+# GStreamer pipelines around each episode, (c) talk UDP to the BOX 采集板 MCU
+# via the vendored `box_sdk` wheel and snapshot its sensors into the episode
+# metadata, and (d) write a metadata sidecar with hardware-sync info +
+# capture timestamps. The frame pixels never enter the Python process.
 #
 # AR0234 + this board's dtbo is hard-locked to 1920x1080 @ 60 fps
 # (min/max/default_framerate = 60000000, framerate_factor = 1000000 in
 # dtb/SG2_AR0234C_G2F/...overlay.dtbo).
 
+# `recorder.script` is what the data-collection GUI's gateway spawns when
+# the operator presses Connect. Default points at the Thor orchestrator
+# below; override here if you're integrating a different recorder.
+recorder:
+  script: tools/thor/gmsl2/thor_record.py
+
 sensors:
   cameras:
-    # `detect_all: true` runs `tools/gmsl2/check_max96726_locks.sh` at
+    # `detect_all: true` runs `tools/thor/gmsl2/check_max96726_locks.sh` at
     # session start and uses every sid the MAX96726 reports as locked. The
     # recorder additionally probes each locked sid through nvarguscamerasrc
     # and drops any that fail to open. Override with `sensor_ids: [0, 4, ...]`
@@ -67,7 +75,7 @@ sensors:
     # auto-clamps `cameras.defaults.exposure_us` to 0.85 * period_us at
     # start time and logs a warning when the original value is too high.
     enabled: true
-    sdk_dir: tools/gmsl2/sdk    # repo-relative; vendored pwm.sh lives here
+    sdk_dir: tools/thor/gmsl2/sdk    # repo-relative; vendored pwm.sh lives here
     setup_script: pwm.sh        # relative to sdk_dir, or absolute path
     fps: 60                     # PWM frequency in Hz
     sensor_trig_mode: 1         # 1 = slave (PWM-edge locked), 0 = free_run
@@ -75,6 +83,34 @@ sensors:
     # Informational only -- recorded in episode meta.json.
     pwm_chip: pwmchip4
     pwm_id: 0
+
+# BOX 采集板 SDK over UDP. See `tools/thor/box_sdk/README.md` for the install
+# steps (apt + setup_env.sh + pip install the wheel). UDP ports are pinned
+# to 15000 in both directions per the vendor docs (`需求整理 §5.1`).
+#
+# `expected_devices` is the full set the gateway will surface on the
+# frontend; `BoxClient.detect()` then trims it to whichever subset is
+# actually publishing (a rig may have zero, one, or two Paxini touch pads
+# attached). Set `enabled: false` for camera-only sessions.
+box_collection:
+  enabled: true
+  bind_ip: "0.0.0.0"
+  bind_port: 15000
+  remote_ip: "192.168.2.60"
+  remote_port: 15000
+  sdk_dir: tools/thor/box_sdk
+  sdk_setup_script: setup_env.sh
+  urdf_relpath: share/monte_gripper.urdf
+  startup_mode: 0          # 0 = collection (trigger-controlled), 1 = control
+  poll_interval_s: 0.05    # 20 Hz snapshot cache
+  stale_threshold_s: 1.0   # consider a sensor offline after this gap
+  expected_devices:
+    - box_gripper
+    - box_imu
+    - box_trigger
+    - box_six_d_force
+    - box_touch_left
+    - box_touch_right
 
 dataset:
   repo_id: local/thor_gmsl2_11ch_v1

@@ -83,7 +83,7 @@ class Gmsl2Camera(Camera):
     Hardware-trigger configuration (``sensor_mode``, ``trig_pin``, ``trig_mode``) is
     applied via ``v4l2-ctl`` at ``connect()`` time when ``apply_sync_at_connect`` is
     True. The PWM that drives the trigger pin -- if any -- is *not* set up here; use
-    ``tools/gmsl2/setup_sync.sh`` to configure it once per boot.
+    ``tools/thor/gmsl2/setup_sync.sh`` to configure it once per boot.
     """
 
     def __init__(self, config: Gmsl2CameraConfig):

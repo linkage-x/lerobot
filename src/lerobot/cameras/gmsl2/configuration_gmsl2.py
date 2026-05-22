@@ -50,7 +50,7 @@ class Gmsl2CameraConfig(CameraConfig):
     driver puts the sensor in external-trigger mode; one of the cameras must act as
     ``master`` (or, more commonly on this board, a PWM signal from the Jetson is fed
     into the adapter's trigger pin and *all* cameras are slaves -- see
-    ``tools/gmsl2/setup_sync.sh``).
+    ``tools/thor/gmsl2/setup_sync.sh``).
 
     Attributes:
         sensor_id: Argus sensor-id. Maps 1:1 to ``/dev/video{sensor_id}`` in the

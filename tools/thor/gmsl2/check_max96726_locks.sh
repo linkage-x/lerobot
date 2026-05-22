@@ -2,7 +2,7 @@
 # Read MAX96726 link-lock status and map locked links to /dev/video IDs.
 #
 # Run on the Jetson/Thor:
-#   ./tools/gmsl2/check_max96726_locks.sh
+#   ./tools/thor/gmsl2/check_max96726_locks.sh
 #
 # MAX96726 REG0x0008:
 #   bit0 = LOCKED_A

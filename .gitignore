@@ -190,5 +190,5 @@ MUJOCO_LOG.TXT
 .claude
 core
 
-tools/gmsl2/records
-tools/gmsl2/captures
+tools/thor/gmsl2/records
+tools/thor/gmsl2/captures

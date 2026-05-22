@@ -2,6 +2,11 @@
 
 Browser UI for local data collection, recorded dataset review, episode annotation, MuJoCo validation, and guarded FR3 replay.
 
+The default rig is **Thor + 11 x GMSL2 (SG2-AR0234C-G2F) + BOX 采集板** — see
+`tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml` and
+`tools/thor/box_sdk/README.md`. It replaces the previous Hikrobot 8-camera +
+Pika Sense gripper / RealSense default.
+
 ## Start The GUI
 
 Run the local Python gateway first:
@@ -9,10 +14,28 @@ Run the local Python gateway first:
 ```bash
 cd /home/hanyu/Codes/lerobot
 PYTHONPATH=src:. python -m tools.data_collection_gui.gateway \
-  --config-path tools/handheld/handheld_record_example.yaml \
+  --config-path tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml \
   --datasets-root outputs/datasets \
   --port 8765
 ```
+
+The `--config-path` argument is optional; the gateway defaults to that
+GMSL2/BOX YAML when no override is given. To run the legacy Hikrobot +
+Pika capture pass `--config-path tools/handheld/handheld_record_example.yaml`.
+
+Before first use of the BOX 采集板 on the Thor host:
+
+```bash
+sudo apt update && sudo apt install -y libeigen3-dev liburdfdom-dev
+source tools/thor/box_sdk/setup_env.sh
+python3 -m pip install --force-reinstall \
+  tools/thor/box_sdk/python/box_collection_sdk-0.1.0-py3-none-any.whl
+```
+
+`setup_env.sh` exports `LD_LIBRARY_PATH` so the wheel's
+`libbox_controller.so` can find the runtime dependencies vendored under
+`tools/thor/box_sdk/lib/`, and `BOX_SDK_URDF` so the controller knows where
+to find `share/monte_gripper.urdf`.
 
 Then start Vite:
 

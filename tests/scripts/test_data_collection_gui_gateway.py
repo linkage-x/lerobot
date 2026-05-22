@@ -57,6 +57,112 @@ def test_make_state_loads_handheld_config_contract():
     assert any(device["kind"] == "handheld_gripper" for device in snapshot["devices"])
 
 
+def test_default_config_is_thor_gmsl2_box():
+    assert str(gateway.DEFAULT_CONFIG_PATH) == "tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml"
+    state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
+    snapshot = gateway._snapshot(state)
+
+    assert snapshot["configSummary"]["repoId"] == "local/thor_gmsl2_11ch_v1"
+    assert snapshot["configSummary"]["fps"] == 60
+    devices_by_kind: dict[str, list[str]] = {}
+    for device in snapshot["devices"]:
+        devices_by_kind.setdefault(device["kind"], []).append(device["id"])
+    # 11-camera GMSL2 rig (detect_all => sids 0..15 placeholder before connect).
+    assert "camera" in devices_by_kind
+    assert all(cid.startswith("cam_") for cid in devices_by_kind["camera"])
+    assert len(devices_by_kind["camera"]) >= 11
+    # Box collection sensors are surfaced as a distinct device kind.
+    assert "box_collection" in devices_by_kind
+    assert {"box_gripper", "box_imu", "box_trigger"}.issubset(set(devices_by_kind["box_collection"]))
+    # Old Hikrobot / Pika devices are no longer in the default rig.
+    assert "handheld_gripper" not in devices_by_kind
+
+
+def test_box_collection_devices_use_remote_endpoint_in_detail():
+    config = {
+        "sensors": {"cameras": {"defaults": {"fps": 60}, "detect_all": False, "sensor_ids": [0, 4]}},
+        "box_collection": {
+            "enabled": True,
+            "remote_ip": "10.20.30.40",
+            "remote_port": 15000,
+            "poll_interval_s": 0.05,
+            "expected_devices": ["box_gripper", "box_imu"],
+        },
+    }
+    devices = gateway._device_statuses(config)
+    box_devices = [d for d in devices if d["kind"] == "box_collection"]
+    assert [d["id"] for d in box_devices] == ["box_gripper", "box_imu"]
+    assert all(d["detail"] == "UDP 10.20.30.40:15000" for d in box_devices)
+    assert all(d["fps"] == 20 for d in box_devices)  # 1 / 0.05 -> 20 Hz
+
+
+def test_box_collection_disabled_hides_devices():
+    config = {
+        "sensors": {"cameras": {"defaults": {"fps": 60}}},
+        "box_collection": {"enabled": False, "expected_devices": ["box_gripper"]},
+    }
+    devices = gateway._device_statuses(config)
+    assert not any(d["kind"] == "box_collection" for d in devices)
+
+
+def test_recorder_output_marks_box_collection_devices(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=Path.cwd(),
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 60, "episode_time_s": 10}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        devices=[
+            {"id": "cam_00", "kind": "camera", "label": "cam_00", "state": "warning", "fps": 60, "latencyMs": 0, "detail": ""},
+            {"id": "box_gripper", "kind": "box_collection", "label": "g", "state": "warning", "fps": 20, "latencyMs": 0, "detail": ""},
+            {"id": "box_imu", "kind": "box_collection", "label": "i", "state": "warning", "fps": 20, "latencyMs": 0, "detail": ""},
+            {"id": "box_trigger", "kind": "box_collection", "label": "t", "state": "warning", "fps": 20, "latencyMs": 0, "detail": ""},
+        ],
+    )
+
+    gateway._apply_recorder_output(state, "Cameras: cam_00")
+    gateway._apply_recorder_output(state, "Box devices: box_gripper, box_imu")
+
+    states = {device["id"]: device["state"] for device in state.devices}
+    assert states["cam_00"] == "running"
+    assert states["box_gripper"] == "running"
+    assert states["box_imu"] == "running"
+    # Devices listed in the YAML but not in the connected announcement
+    # transition to "error" so the operator sees what's missing.
+    assert states["box_trigger"] == "error"
+
+
+def test_recorder_script_picks_thor_when_configured(tmp_path):
+    repo_root = tmp_path
+    (repo_root / "tools" / "thor" / "gmsl2").mkdir(parents=True)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={
+            "recorder": {"script": "tools/thor/gmsl2/thor_record.py"},
+            "dataset": {"repo_id": "local/test", "fps": 60},
+        },
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+    script, flag = gateway._recorder_script(state)
+    assert script == repo_root / "tools" / "thor" / "gmsl2" / "thor_record.py"
+    assert flag == "--config-path"
+
+
+def test_recorder_script_defaults_to_handheld_for_legacy_configs(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+    script, flag = gateway._recorder_script(state)
+    assert script == tmp_path / "tools" / "handheld" / "handheld_record.py"
+    assert flag == "--config_path"
+
+
 def test_device_statuses_include_camera_resolution_and_ports():
     config = {
         "sensors": {

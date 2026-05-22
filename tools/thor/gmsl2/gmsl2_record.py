@@ -18,8 +18,8 @@ with ``ffprobe`` -- the recorder does not pull it inline.
 
 Usage:
     cd ~/lerobot
-    PYTHONPATH=src:. python -m tools.gmsl2.gmsl2_record \\
-        --config-path tools/gmsl2/thor_gmsl2_11ch_example.yaml
+    PYTHONPATH=src:. python -m tools.thor.gmsl2.gmsl2_record \\
+        --config-path tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml
 
 Press Ctrl+C to stop the current episode and exit cleanly. The first SIGINT
 ends the in-flight episode; the second exits the program.
@@ -87,11 +87,11 @@ class HardwareSync:
     ``setup_script`` is interpreted relative to ``sdk_dir`` when it is a
     bare filename; absolute paths are honored as-is. Module loading and
     ``trig_mode=1`` are assumed to already be in place -- if not, run
-    ``tools/gmsl2/setup_sync.sh`` once at cold boot.
+    ``tools/thor/gmsl2/setup_sync.sh`` once at cold boot.
     """
 
     enabled: bool = True
-    sdk_dir: str = "tools/gmsl2/sdk"
+    sdk_dir: str = "tools/thor/gmsl2/sdk"
     setup_script: str = "pwm.sh"
     fps: int = 60
     # `sensor_trig_mode` decides what we push to each camera before capture:

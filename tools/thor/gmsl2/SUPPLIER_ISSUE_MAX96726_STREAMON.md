@@ -26,7 +26,7 @@ JetPack / L4T: JetPack 7.0 / L4T R38.2.x
 ```bash
 sudo service nvargus-daemon stop
 cd ~/lerobot
-sudo ./tools/gmsl2/setup_sync.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1 --fps 60 --num 16
+sudo ./tools/thor/gmsl2/setup_sync.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1 --fps 60 --num 16
 
 for i in $(seq 0 15); do
   sudo v4l2-ctl -d /dev/video$i -c sensor_mode=0,trig_mode=0,bypass_mode=0
@@ -119,9 +119,9 @@ timeout 8s v4l2-ctl -d /dev/videoN \
 
 ```bash
 ffmpeg -y -r 60 \
-  -i tools/gmsl2/records/camXX_1080p60_isp_h265_3s.h265 \
+  -i tools/thor/gmsl2/records/camXX_1080p60_isp_h265_3s.h265 \
   -c copy -tag:v hvc1 \
-  tools/gmsl2/records/camXX_1080p60_isp_h265_3s.mp4
+  tools/thor/gmsl2/records/camXX_1080p60_isp_h265_3s.mp4
 ```
 
 ## 基线 Stream 测试结果
@@ -295,10 +295,10 @@ video ID 会随当前接线/重载状态变化，但核心问题稳定复现：�
 已按供应商要求补充“加载驱动到打开 video7 节点”的完整日志：
 
 ```text
-tools/gmsl2/records/debug_logs/dmesg_load_to_video7.log
-tools/gmsl2/records/debug_logs/video7_open_stream.log
-tools/gmsl2/records/debug_logs/setup_sync.log
-tools/gmsl2/records/debug_logs/link_locks_before_video7.log
+tools/thor/gmsl2/records/debug_logs/dmesg_load_to_video7.log
+tools/thor/gmsl2/records/debug_logs/video7_open_stream.log
+tools/thor/gmsl2/records/debug_logs/setup_sync.log
+tools/thor/gmsl2/records/debug_logs/link_locks_before_video7.log
 ```
 
 `video7` 当前识别为 `vi-output, ar0234c 18-0023`，1920x1080 BA10 60 fps，
@@ -318,10 +318,10 @@ VIDIOC_STREAMON returned -1 (Operation not permitted)
 对比文件：
 
 ```text
-tools/gmsl2/records/cam00_1080p60_isp_h265_3s.mp4
-tools/gmsl2/records/cam00_1080p60_no_nvcam_settings_h265_3s.mp4
-tools/gmsl2/records/cam00_isp_frame.jpg
-tools/gmsl2/records/cam00_no_nvcam_settings_frame.jpg
+tools/thor/gmsl2/records/cam00_1080p60_isp_h265_3s.mp4
+tools/thor/gmsl2/records/cam00_1080p60_no_nvcam_settings_h265_3s.mp4
+tools/thor/gmsl2/records/cam00_isp_frame.jpg
+tools/thor/gmsl2/records/cam00_no_nvcam_settings_frame.jpg
 ```
 
 本次样本中，删除 nvcam settings 前后画面颜色没有肉眼明显变化。
@@ -344,7 +344,7 @@ tools/gmsl2/records/cam00_no_nvcam_settings_frame.jpg
    “清空 settings -> 无 ISP 录制 -> 清空 settings -> 放回 ISP -> 录制”的对比流程。
 5. 转接板供电规格需要现场确认电源适配器标签和接线，软件侧无法可靠读出是否为 12V3A。
 6. 当前驱动包已打包：
-   `tools/gmsl2/SG16A_AGTH_G3Y_A1_20260521.tar.gz`，
+   `tools/thor/gmsl2/SG16A_AGTH_G3Y_A1_20260521.tar.gz`，
    SHA256:
    `e0d4b34d9f1514101ca5243f3d05afef7b0536c1b7afddceb8fe1db3d8d88716`。
 
@@ -372,7 +372,7 @@ tools/gmsl2/records/cam00_no_nvcam_settings_frame.jpg
 落盘目录：
 
 ```text
-tools/gmsl2/records/gmsl2_red_isp_compare_20260521_060346/
+tools/thor/gmsl2/records/gmsl2_red_isp_compare_20260521_060346/
 ```
 
 对比文件：
@@ -422,7 +422,7 @@ ARGUS_RC=139
 完整日志已落盘：
 
 ```text
-tools/gmsl2/records/gmsl2_powercycle_retest_20260521_061404/
+tools/thor/gmsl2/records/gmsl2_powercycle_retest_20260521_061404/
 ```
 
 该结果说明电源插拔后问题没有缓解，当前状态反而从“少数通道可 stream”退化为
@@ -477,7 +477,7 @@ main.cpp, execute:623 No cameras available
 日志位置：
 
 ```text
-tools/gmsl2/records/gst_argus_after_install/
+tools/thor/gmsl2/records/gst_argus_after_install/
 ```
 
 当前结论：已按建议切到 Argus/GStreamer 路径验证，但 Argus 当前枚举不到相机。
@@ -537,7 +537,7 @@ gstnvarguscamerasrc.cpp, execute:803 No cameras available
 完整日志：
 
 ```text
-tools/gmsl2/records/gmsl2_gst_locked_retest_20260521_065006/
+tools/thor/gmsl2/records/gmsl2_gst_locked_retest_20260521_065006/
 ```
 
 请供应商提供适配当前 L4T 38.2.2 / kernel `6.8.12-tegra-38.2.2`
@@ -580,13 +580,13 @@ OVERLAYS /boot/tegra264-camera-ar0234cx16-overlay.dtbo
 恢复过程快照：
 
 ```text
-tools/gmsl2/records/restore_logs/restore_process_snapshot.log
+tools/thor/gmsl2/records/restore_logs/restore_process_snapshot.log
 ```
 
 恢复后最终验证：
 
 ```text
-tools/gmsl2/records/gmsl2_post_restore_final_verify_20260521_070505/
+tools/thor/gmsl2/records/gmsl2_post_restore_final_verify_20260521_070505/
 ```
 
 验证结果：
@@ -631,7 +631,7 @@ nvv4l2h265enc=0
 复测日志：
 
 ```text
-tools/gmsl2/records/gmsl2_rerun_after_restore_20260521_071200/
+tools/thor/gmsl2/records/gmsl2_rerun_after_restore_20260521_071200/
 ```
 
 `setup_sync.sh` 成功，lock 状态为：

@@ -15,7 +15,7 @@ if you ever wire those in.
 | --- | --- | --- |
 | `pwm.sh` | Arms `pwmchip4/pwm0` at 60 Hz (50% duty). Replaces the SDK's pwm.sh, which ships at 25 Hz. Set `FPS=N sudo -E sh pwm.sh` to override. | ~1 KB |
 | `boost_clock.sh` | Locks VI / ISP / NVCSI / EMC clocks to max. Verbatim copy from SDK. | ~700 B |
-| `camera_overrides.isp` | NVIDIA Argus ISP override; verbatim copy from SDK. Symlinked into `/var/nvidia/nvcam/settings/` by `tools/gmsl2/setup_sync.sh`. | 109 KB |
+| `camera_overrides.isp` | NVIDIA Argus ISP override; verbatim copy from SDK. Symlinked into `/var/nvidia/nvcam/settings/` by `tools/thor/gmsl2/setup_sync.sh`. | 109 KB |
 | `ko/max96726.ko` | GMSL2 deserializer kernel module (handles the 4 deserializers on the SG16A board). | 67 KB |
 | `ko/pwm-gpio.ko` | Tegra PWM GPIO driver used by `pwm.sh`. | 45 KB |
 | `ko/sg2-ar0234c-g2f.ko` | AR0234 sensor + V4L2 driver. | 90 KB |
@@ -40,13 +40,13 @@ board.
 
 ## How the rest of the repo uses these
 
-* `tools/gmsl2/setup_sync.sh` — cold-boot helper. Unloads stale modules,
+* `tools/thor/gmsl2/setup_sync.sh` — cold-boot helper. Unloads stale modules,
   insmods the three `.ko` files from `ko/`, runs `boost_clock.sh`, then
   programs PWM via `pwm.sh`, and finally sets `trig_mode=1` on every
   `/dev/videoN`.
-* `tools/gmsl2/sdk/pwm.sh` — invoked at every session start by
-  `tools/gmsl2/gmsl2_record.py` when `hardware_sync.enabled: true`. This is
+* `tools/thor/gmsl2/sdk/pwm.sh` — invoked at every session start by
+  `tools/thor/gmsl2/gmsl2_record.py` when `hardware_sync.enabled: true`. This is
   the only step required between fresh boots once `setup_sync.sh` has been
   run once.
-* `tools/gmsl2/gmsl2_record.py` — default `hardware_sync.sdk_dir` is
-  `tools/gmsl2/sdk/` so no external paths are referenced.
+* `tools/thor/gmsl2/gmsl2_record.py` — default `hardware_sync.sdk_dir` is
+  `tools/thor/gmsl2/sdk/` so no external paths are referenced.

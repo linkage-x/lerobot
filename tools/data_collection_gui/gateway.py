@@ -19,7 +19,8 @@ from threading import Lock, Thread
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-DEFAULT_CONFIG_PATH = Path("tools/handheld/handheld_record_example.yaml")
+DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
+DEFAULT_RECORDER_SCRIPT = Path("tools/handheld/handheld_record.py")
 DEFAULT_DATASETS_ROOT = Path("outputs/datasets")
 DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM = 20.0
 DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG = 15.0
@@ -337,14 +338,60 @@ def _replay_status_from_config(config: dict[str, Any]) -> ReplayStatus:
     )
 
 
+_BOX_COLLECTION_DEVICE_LABELS: dict[str, str] = {
+    "box_gripper": "BOX gripper (distance)",
+    "box_imu": "BOX IMU (acc/gyr/euler/quat)",
+    "box_trigger": "BOX trigger travel",
+    "box_six_d_force": "BOX 6D force",
+    "box_touch_left": "Paxini touch pad L",
+    "box_touch_right": "Paxini touch pad R",
+}
+
+
 def _device_statuses(config: dict[str, Any]) -> list[dict[str, Any]]:
     sensors = config.get("sensors") or {}
     if not isinstance(sensors, dict):
         sensors = {}
 
     devices: list[dict[str, Any]] = []
+    cameras_section = sensors.get("cameras")
+
+    # GMSL2 11-channel rig: `cameras` is a flat config block (not a mapping
+    # of device-id to device) and the sensor_id list is detected at connect
+    # time. Surface the configured slots up front so the GUI shows what to
+    # expect; the recorder then narrows to `usable` via the "Cameras:" line.
+    if isinstance(cameras_section, dict) and "defaults" in cameras_section:
+        defaults = cameras_section.get("defaults") if isinstance(cameras_section.get("defaults"), dict) else {}
+        prefix = str(cameras_section.get("name_prefix") or "cam")
+        sensor_ids = cameras_section.get("sensor_ids") or []
+        detect_all = bool(cameras_section.get("detect_all", False))
+        if sensor_ids:
+            slot_ids = [int(x) for x in sensor_ids]
+        elif detect_all:
+            slot_ids = list(range(16))  # MAX96726 has up to 16 logical sids
+        else:
+            slot_ids = []
+        for sid in slot_ids:
+            devices.append(
+                {
+                    "id": f"{prefix}_{sid:02d}",
+                    "kind": "camera",
+                    "label": f"GMSL2 sensor-id {sid}",
+                    "state": "idle",
+                    "fps": int(defaults.get("fps") or 0),
+                    "latencyMs": 0,
+                    "detail": _format_device_detail(defaults),
+                }
+            )
+    else:
+        # Mapping-style camera section (Hikrobot / OpenCV / RealSense).
+        section = cameras_section or {}
+        if isinstance(section, dict):
+            for device_id, raw_device in section.items():
+                device = raw_device if isinstance(raw_device, dict) else {}
+                devices.append(_make_mapping_device(device_id, device, "camera"))
+
     for section_name, kind in (
-        ("cameras", "camera"),
         ("tactiles", "tactile"),
         ("handheld_grippers", "handheld_gripper"),
     ):
@@ -353,28 +400,53 @@ def _device_statuses(config: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         for device_id, raw_device in section.items():
             device = raw_device if isinstance(raw_device, dict) else {}
-            fps = int(device.get("fps") or 0)
-            detail_parts = [str(device.get("type") or kind)]
-            if "serial" in device:
-                detail_parts.append(str(device["serial"]))
-            if "port" in device:
-                detail_parts.append(str(device["port"]))
-            if "index_or_path" in device:
-                detail_parts.append(str(device["index_or_path"]))
-            if "serial_number_or_name" in device:
-                detail_parts.append(str(device["serial_number_or_name"]))
+            devices.append(_make_mapping_device(device_id, device, kind))
+
+    box_cfg = config.get("box_collection")
+    if isinstance(box_cfg, dict) and box_cfg.get("enabled", True):
+        expected = box_cfg.get("expected_devices") or list(_BOX_COLLECTION_DEVICE_LABELS)
+        poll_hz = 0
+        try:
+            poll_hz = int(round(1.0 / float(box_cfg.get("poll_interval_s") or 0.05)))
+        except (TypeError, ValueError, ZeroDivisionError):
+            poll_hz = 0
+        detail = f"UDP {box_cfg.get('remote_ip', '?')}:{box_cfg.get('remote_port', 15000)}"
+        for sensor_id in expected:
+            label = _BOX_COLLECTION_DEVICE_LABELS.get(str(sensor_id), str(sensor_id))
             devices.append(
                 {
-                    "id": str(device_id),
-                    "kind": kind,
-                    "label": " ".join(detail_parts),
+                    "id": str(sensor_id),
+                    "kind": "box_collection",
+                    "label": label,
                     "state": "idle",
-                    "fps": fps,
+                    "fps": poll_hz,
                     "latencyMs": 0,
-                    "detail": _format_device_detail(device),
+                    "detail": detail,
                 }
             )
     return devices
+
+
+def _make_mapping_device(device_id: str, device: dict[str, Any], kind: str) -> dict[str, Any]:
+    fps = int(device.get("fps") or 0)
+    detail_parts = [str(device.get("type") or kind)]
+    if "serial" in device:
+        detail_parts.append(str(device["serial"]))
+    if "port" in device:
+        detail_parts.append(str(device["port"]))
+    if "index_or_path" in device:
+        detail_parts.append(str(device["index_or_path"]))
+    if "serial_number_or_name" in device:
+        detail_parts.append(str(device["serial_number_or_name"]))
+    return {
+        "id": str(device_id),
+        "kind": kind,
+        "label": " ".join(detail_parts),
+        "state": "idle",
+        "fps": fps,
+        "latencyMs": 0,
+        "detail": _format_device_detail(device),
+    }
 
 
 def _format_device_detail(device: dict[str, Any]) -> str:
@@ -2050,6 +2122,26 @@ def _mark_connected_devices(state: GatewayState, kind: str, summary: str) -> Non
         device["state"] = "running" if str(device.get("id")) in connected_ids else "error"
 
 
+def _recorder_script(state: GatewayState) -> tuple[Path, str]:
+    """Resolve which recorder process the gateway should spawn for this config.
+
+    Returns ``(script_path, config_flag)`` so callers can build the command.
+    Legacy handheld configs (no ``recorder`` block) keep the old
+    ``--config_path`` underscore flag; the Thor GMSL2 recorder uses the
+    hyphenated ``--config-path`` argparse convention.
+    """
+
+    raw = state.config.get("recorder") if isinstance(state.config.get("recorder"), dict) else {}
+    script_path = raw.get("script") if isinstance(raw, dict) else None
+    if script_path:
+        script = Path(str(script_path))
+        if not script.is_absolute():
+            script = state.repo_root / script
+        flag = str(raw.get("config_flag") or "--config-path")
+        return script, flag
+    return state.repo_root / DEFAULT_RECORDER_SCRIPT, "--config_path"
+
+
 def _ensure_recorder_running(state: GatewayState) -> subprocess.Popen[str]:
     process = state.process
     if process is None or process.poll() is not None:
@@ -2072,10 +2164,11 @@ def _connect_recorder(state: GatewayState) -> None:
         return
 
     state.recording.datasetRoot = str(_dataset_config(state.config).get("root") or "")
+    recorder_script, config_flag = _recorder_script(state)
     command = [
         str(_venv_python(state.repo_root)),
-        str(state.repo_root / "tools" / "handheld" / "handheld_record.py"),
-        f"--config_path={state.config_path}",
+        str(recorder_script),
+        f"{config_flag}={state.config_path}",
     ]
     state.process = subprocess.Popen(
         command,
@@ -2396,6 +2489,7 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         ("Cameras:", "camera"),
         ("Tactiles:", "tactile"),
         ("Handheld grippers:", "handheld_gripper"),
+        ("Box devices:", "box_collection"),
     ):
         if output.startswith(prefix):
             _mark_connected_devices(state, kind, output.removeprefix(prefix).strip())

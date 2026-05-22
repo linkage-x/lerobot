@@ -1,6 +1,6 @@
 export type ServiceState = "offline" | "idle" | "running" | "warning" | "error";
 
-export type DeviceKind = "camera" | "tactile" | "handheld_gripper";
+export type DeviceKind = "camera" | "tactile" | "handheld_gripper" | "box_collection";
 
 export type DeviceStatus = {
   id: string;

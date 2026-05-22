@@ -3,20 +3,20 @@
 #
 # This is the runtime equivalent of the SDK's `load_modules.sh` + `pwm.sh`
 # combined: it (1) unloads stale camera modules, (2) insmods the three
-# kernel objects we vendor under `tools/gmsl2/sdk/ko/`, (3) runs
+# kernel objects we vendor under `tools/thor/gmsl2/sdk/ko/`, (3) runs
 # `boost_clock.sh` to lock VI/ISP/NVCSI/EMC at max, (4) arms `pwmchip4/pwm0`
 # at the requested frequency, and (5) puts every `/dev/videoN` into slave
 # trigger mode (`trig_mode=1`).
 #
 # Once this has run, each subsequent session only needs `sudo sh
-# tools/gmsl2/sdk/pwm.sh` (which `gmsl2_record.py` invokes automatically).
+# tools/thor/gmsl2/sdk/pwm.sh` (which `gmsl2_record.py` invokes automatically).
 #
 # Usage (from the repo root):
-#   sudo ./tools/gmsl2/setup_sync.sh [--sdk DIR] [--fps 60] [--num 16]
+#   sudo ./tools/thor/gmsl2/setup_sync.sh [--sdk DIR] [--fps 60] [--num 16]
 #                                    [--trig-pin 0x00020007] [--master-id N]
 #                                    [--dry-run]
 #
-# `--sdk` defaults to the vendored copy at `tools/gmsl2/sdk/`. Pass it
+# `--sdk` defaults to the vendored copy at `tools/thor/gmsl2/sdk/`. Pass it
 # explicitly if you want to point at a different driver pack.
 #
 # Notes:
