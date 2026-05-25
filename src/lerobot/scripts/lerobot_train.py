@@ -15,6 +15,7 @@
 # limitations under the License.
 import dataclasses
 import logging
+import random
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -56,6 +57,66 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+
+
+def _sample_wandb_image_steps(cfg: TrainPipelineConfig, initial_step: int) -> set[int]:
+    if cfg.wandb_log_images_n_steps <= 0:
+        return set()
+
+    candidate_steps = list(range(initial_step + 1, cfg.steps + 1))
+    if len(candidate_steps) <= cfg.wandb_log_images_n_steps:
+        return set(candidate_steps)
+
+    rng = random.Random(cfg.seed)
+    return set(rng.sample(candidate_steps, cfg.wandb_log_images_n_steps))
+
+
+def _image_tensor_to_numpy(image: torch.Tensor):
+    image = image.detach().float().cpu()
+    if image.ndim != 3:
+        raise ValueError(f"Expected image tensor with 3 dims, got {tuple(image.shape)}")
+    if image.shape[0] in (1, 3, 4):
+        image = image.permute(1, 2, 0)
+    array = image.numpy()
+    if array.dtype.kind == "f":
+        if array.min() >= 0.0 and array.max() <= 1.0:
+            array = array * 255.0
+        array = array.clip(0, 255)
+    return array.astype("uint8")
+
+
+def _make_wandb_observation_images(wandb_logger, images_batch: dict[str, torch.Tensor], n_samples: int):
+    payload = {}
+    for camera_key, images in images_batch.items():
+        if not isinstance(images, torch.Tensor) or images.ndim not in (4, 5):
+            continue
+
+        camera_name = camera_key.removeprefix("observation.images.")
+        samples = []
+        batch_size = min(n_samples, images.shape[0])
+        for sample_idx in range(batch_size):
+            sample = images[sample_idx]
+            if sample.ndim == 3:
+                samples.append(
+                    wandb_logger.make_image(
+                        _image_tensor_to_numpy(sample),
+                        caption=f"{camera_key} sample={sample_idx}",
+                    )
+                )
+                continue
+
+            for obs_idx in range(sample.shape[0]):
+                samples.append(
+                    wandb_logger.make_image(
+                        _image_tensor_to_numpy(sample[obs_idx]),
+                        caption=f"{camera_key} sample={sample_idx} obs_step={obs_idx}",
+                    )
+                )
+
+        if samples:
+            payload[f"observation_images/{camera_name}"] = samples
+
+    return payload
 
 
 def update_policy(
@@ -327,6 +388,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if cfg.resume:
         step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
 
+    wandb_image_steps = _sample_wandb_image_steps(cfg, step)
+    camera_keys = list(dataset.meta.camera_keys)
+
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
@@ -416,6 +480,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
+        should_log_wandb_images = (
+            wandb_logger is not None and is_main_process and (step + 1) in wandb_image_steps
+        )
+        wandb_image_batch = None
+        if should_log_wandb_images:
+            wandb_image_batch = {
+                key: value.detach().cpu()
+                for key, value in batch.items()
+                if key in camera_keys and isinstance(value, torch.Tensor)
+            }
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
@@ -458,6 +532,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     )
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
+
+        if should_log_wandb_images and wandb_image_batch:
+            wandb_images = _make_wandb_observation_images(
+                wandb_logger,
+                wandb_image_batch,
+                cfg.wandb_log_images_n_samples,
+            )
+            if wandb_images:
+                wandb_logger.log_images(wandb_images, step)
 
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:

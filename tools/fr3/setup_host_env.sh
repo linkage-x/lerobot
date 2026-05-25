@@ -105,10 +105,7 @@ ensure_venv() {
 
 sync_python_deps() {
   log "Syncing lerobot Python dependencies with uv"
-  "${UV_BIN}" sync --python .venv/bin/python --extra kinematics
-  log "Installing FR3 host runtime Python extras"
-  "${UV_BIN}" pip install --python .venv/bin/python --no-cache cffi
-  "${UV_BIN}" pip install --python .venv/bin/python --no-deps easyhid pyspacemouse "ruckig>=0.15,<0.16"
+  "${UV_BIN}" sync --python .venv/bin/python --extra fr3_teleop
 }
 
 discover_cmeel_prefix() {
@@ -292,16 +289,20 @@ EOF
 
 require_cmd "${UV_BIN}"
 require_cmd git
-require_cmd sudo
 
 if [[ "${INSTALL_SYSTEM_DEPS}" == "1" ]]; then
+  require_cmd sudo
   install_system_deps
 fi
 
 ensure_venv
 sync_python_deps
-build_libfranka_if_needed
-install_panda_py
+
+if [[ "${BUILD_LIBFRANKA}" == "1" ]]; then
+  require_cmd sudo
+  build_libfranka_if_needed
+  install_panda_py
+fi
 
 install_optional_sdk "${WITH_PIKA_SDK}" "pika_sdk" "${PIKA_SDK_SRC}" "${PIKA_SDK_REPO}" "/opt/dependencies/pika_sdk"
 

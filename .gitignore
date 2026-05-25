@@ -173,12 +173,9 @@ outputs/
 
 # Dev folders
 .cache/*
-*.stl
-*.urdf
-*.xml
 *.part
-!src/lerobot/robots/franka_research3/assets/franka_fr3/assets/hand.stl
-!src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_franka_hand.urdf
 
 .agents
 _bmad
+dataset_test
+*.zip

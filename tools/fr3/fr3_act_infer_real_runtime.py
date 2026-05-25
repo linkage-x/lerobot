@@ -14,9 +14,15 @@ Execution model:
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 from pathlib import Path
+import select
+import sys
+import termios
+import threading
 import time
+import tty
 from typing import Any
 
 import numpy as np
@@ -52,7 +58,10 @@ _DEFAULT_CAMERA_CONFIG = _REPO_ROOT / 'tools/fr3/fr3_act_infer_camera_config.yam
 _DEFAULT_ROBOT_IP = '192.168.1.208'
 _DEFAULT_GRIPPER_PORT = '/dev/ttyUSB0'
 _DEFAULT_GRIPPER_BACKEND = 'das'
+_DAS_XML = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_das_ati.xml'
+_PIKA_XML = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.xml'
 _DAS_URDF = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_das_ati.urdf'
+_PIKA_URDF = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf'
 _DEFAULT_TACTILE_VALID_MASK_PATH = _REPO_ROOT / 'docs/tactile/tactile_valid_mask_50x10.json'
 _DEFAULT_TACTILE_BASELINE_PATH = _REPO_ROOT / 'docs/tactile/idle_baseline.json'
 _DEFAULT_STATE_NAMES = ['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw', 'gripper']
@@ -65,6 +74,15 @@ _DEFAULT_FIRST_FRAME_MAX_ROT_DELTA_DEG = 10.0
 _DEFAULT_MAX_STEP_POS_DELTA_MM = 5.0
 _DEFAULT_MAX_STEP_ROT_DELTA_DEG = 3.0
 _DEFAULT_DATASET_START_GRIPPER_TOLERANCE = 0.05
+_DEFAULT_USE_OTG = bool(FrankaResearch3Config.__dataclass_fields__['use_otg'].default)
+_DEFAULT_OTG_CONTROL_FREQUENCY = float(
+    FrankaResearch3Config.__dataclass_fields__['otg_control_frequency'].default
+)
+_DEFAULT_OTG_ASYNC_CONTROL_FREQUENCY = float(
+    FrankaResearch3Config.__dataclass_fields__['otg_async_control_frequency'].default
+)
+_DEFAULT_CONTROLLER_STIFFNESS = (600.0, 600.0, 600.0, 600.0, 280.0, 180.0, 70.0)
+_DEFAULT_CONTROLLER_DAMPING = (50.0, 50.0, 50.0, 50.0, 20.0, 15.0, 10.0)
 _DAS_START_JOINTS_RAD = np.array(
     [
         -0.053397256451184094,
@@ -77,18 +95,16 @@ _DAS_START_JOINTS_RAD = np.array(
     ],
     dtype=np.float64,
 )
-# Replay uses I=gripper_base_link and E=das_gripper_ee with this fixed DAS extrinsic.
-_T_IE = np.array(
-    [
-        [0.0, 0.0, 1.0, 0.13],
-        [0.0, -1.0, 0.0, 0.00],
-        [1.0, 0.0, 0.0, -0.04],
-        [0.0, 0.0, 0.0, 1.00],
-    ],
-    dtype=np.float64,
-)
-_T_EI = np.linalg.inv(_T_IE)
 _TACTILE_FALLBACK_CHOICES = ('baseline_idle',)
+_JOINT_NAMES = [
+    'fr3_joint1',
+    'fr3_joint2',
+    'fr3_joint3',
+    'fr3_joint4',
+    'fr3_joint5',
+    'fr3_joint6',
+    'fr3_joint7',
+]
 
 
 def _load_dataset_info(dataset_root: Path) -> dict[str, Any]:
@@ -117,20 +133,20 @@ def _resolve_dataset_data_file(dataset_root: Path, *, chunk_index: int, file_ind
     )
 
 
-def _load_observation_state_feature_names(dataset_root: Path) -> list[str]:
+def _load_observation_state_feature_names(dataset_root: Path, state_key: str = 'observation.state') -> list[str]:
     info = _load_dataset_info(dataset_root)
-    names = info.get('features', {}).get('observation.state', {}).get('names')
+    names = info.get('features', {}).get(state_key, {}).get('names')
     if not isinstance(names, list):
         return [*EE_POSITION_KEYS, *EE_QUAT_KEYS, 'gripper.pos']
     return [str(name) for name in names]
 
 
-def _extract_dataset_state_contract_indices(dataset_root: Path) -> dict[str, int]:
-    state_names = _load_observation_state_feature_names(dataset_root)
+def _extract_dataset_state_contract_indices(dataset_root: Path, state_key: str = 'observation.state') -> dict[str, int]:
+    state_names = _load_observation_state_feature_names(dataset_root, state_key=state_key)
     required_names = ['ee.x', 'ee.y', 'ee.z', 'ee.qx', 'ee.qy', 'ee.qz', 'ee.qw']
     missing_names = [name for name in required_names if name not in state_names]
     if missing_names:
-        raise KeyError(f'Dataset observation.state names are missing required entries: {missing_names}')
+        raise KeyError(f'Dataset {state_key} names are missing required entries: {missing_names}')
     indices = {name: state_names.index(name) for name in required_names}
     if 'gripper.pos' in state_names:
         indices['gripper.pos'] = state_names.index('gripper.pos')
@@ -162,6 +178,111 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument('--dataset-root', default=None, help='Optional dataset root override.')
     parser.add_argument('--policy-fps', type=float, default=None, help='Optional low-rate policy update FPS override.')
+    parser.add_argument(
+        '--policy-n-action-steps',
+        type=int,
+        default=None,
+        help=(
+            'Optional runtime override for policy.config.n_action_steps. '
+            'Use 1 for receding-horizon inference that replans every control step.'
+        ),
+    )
+    parser.add_argument(
+        '--act-temporal-ensemble-coeff',
+        type=float,
+        default=None,
+        help=(
+            'Optional ACT temporal ensembling coefficient. The original ACT default is 0.01. '
+            'Positive values favor older chunk predictions; negative values favor newer predictions. '
+            'When enabled, policy.config.n_action_steps is forced to 1 because ACT must be queried every step.'
+        ),
+    )
+    parser.add_argument(
+        '--act-temporal-action-offset',
+        type=int,
+        default=0,
+        help=(
+            'When ACT temporal ensembling is enabled, execute this many frames ahead in the ensembled action '
+            'sequence instead of the immediate first action. Use 0 for the default immediate action.'
+        ),
+    )
+    parser.add_argument(
+        '--act-temporal-stuck-max-offset',
+        type=int,
+        default=None,
+        help=(
+            'Optional maximum temporal action offset to use when closed-gripper policy targets are stuck. '
+            'When set, the runtime gradually increases the ACT temporal offset toward this value instead of '
+            'always executing the immediate/near action from the ensembled chunk.'
+        ),
+    )
+    parser.add_argument(
+        '--act-temporal-stuck-offset-step',
+        type=int,
+        default=2,
+        help='Temporal action offset increment applied each time the closed-gripper stuck detector fires.',
+    )
+    parser.add_argument(
+        '--act-temporal-stuck-steps',
+        type=int,
+        default=12,
+        help='Consecutive closed-gripper low-motion steps required before increasing temporal offset.',
+    )
+    parser.add_argument(
+        '--act-temporal-stuck-pos-delta-mm',
+        type=float,
+        default=3.0,
+        help='Unassisted EE target distance below which the policy is considered stuck for temporal offset advance.',
+    )
+    parser.add_argument(
+        '--act-temporal-stuck-closed-gripper-max',
+        type=float,
+        default=0.05,
+        help='Normalized gripper command at or below this value is considered closed for temporal offset advance.',
+    )
+    parser.add_argument(
+        '--command-ema-alpha',
+        type=float,
+        default=None,
+        help=(
+            'Optional EMA smoothing for decoded EE commands before safety clamp. '
+            'Use with ACT action queue to reduce jitter without temporal-ensemble target sticking. '
+            '1.0 disables smoothing; smaller values are smoother.'
+        ),
+    )
+    parser.add_argument(
+        '--place-assist-offset-base-xyz',
+        default=None,
+        help=(
+            'Optional comma-separated xyz offset in robot base frame, in meters. '
+            'When enabled, the offset is ramped into the EE command only after the policy is closed-gripper '
+            'and appears stuck for --place-assist-stuck-steps consecutive steps.'
+        ),
+    )
+    parser.add_argument(
+        '--place-assist-stuck-steps',
+        type=int,
+        default=20,
+        help='Consecutive closed-gripper low-motion policy steps required before place assist starts.',
+    )
+    parser.add_argument(
+        '--place-assist-stuck-pos-delta-mm',
+        type=float,
+        default=3.0,
+        help='Policy is considered stuck when the unassisted EE target is within this distance of current EE.',
+    )
+    parser.add_argument(
+        '--place-assist-ramp-step-mm',
+        type=float,
+        default=1.5,
+        help='Maximum place-assist offset ramp speed per policy step, in mm.',
+    )
+    parser.add_argument(
+        '--place-assist-closed-gripper-max',
+        type=float,
+        default=0.05,
+        help='Normalized gripper command at or below this value is considered closed for place assist.',
+    )
     parser.add_argument('--max-steps', type=int, default=None, help='Optional inference loop step limit.')
     parser.add_argument(
         '--preview',
@@ -171,6 +292,92 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--robot-ip', default=_DEFAULT_ROBOT_IP)
     parser.add_argument('--gripper-port', default=_DEFAULT_GRIPPER_PORT)
     parser.add_argument('--gripper-backend', choices=['pika', 'das'], default=_DEFAULT_GRIPPER_BACKEND)
+    parser.add_argument(
+        '--gripper-close-below',
+        type=float,
+        default=None,
+        help=(
+            'Optional raw policy gripper threshold. If the model gripper output is below this value, '
+            'force the robot gripper command to 0 before unit normalization. Disabled by default.'
+        ),
+    )
+    parser.add_argument(
+        '--gripper-change-delay-s',
+        type=float,
+        default=None,
+        help=(
+            'Optional minimum seconds between accepted gripper command changes. '
+            'Comparison is done in normalized [0, 1] gripper scale.'
+        ),
+    )
+    parser.add_argument(
+        '--gripper-change-min-delta',
+        type=float,
+        default=0.08,
+        help=(
+            'Minimum normalized [0, 1] difference between observed gripper state and desired command '
+            'before accepting a gripper command change when --gripper-change-delay-s is enabled.'
+        ),
+    )
+    parser.add_argument(
+        '--gripper-change-settle-tolerance',
+        type=float,
+        default=0.12,
+        help=(
+            'Normalized [0, 1] tolerance for considering the observed gripper state settled near the '
+            'latched command before another gripper command change is allowed.'
+        ),
+    )
+    parser.add_argument(
+        '--gripper-change-settle-timeout-s',
+        type=float,
+        default=1.5,
+        help=(
+            'Maximum seconds to wait for observed gripper state to settle near the latched command before '
+            'allowing a new gripper change. This prevents permanent lockout when grasping an object.'
+        ),
+    )
+    parser.add_argument(
+        '--use-otg',
+        dest='use_otg',
+        action='store_true',
+        default=_DEFAULT_USE_OTG,
+        help='Enable FR3 joint-space Ruckig OTG smoothing after IK.',
+    )
+    parser.add_argument(
+        '--no-use-otg',
+        dest='use_otg',
+        action='store_false',
+        help='Disable FR3 joint-space Ruckig OTG smoothing and send IK joint targets directly.',
+    )
+    parser.add_argument(
+        '--otg-control-frequency',
+        type=float,
+        default=_DEFAULT_OTG_CONTROL_FREQUENCY,
+        help='FR3 Ruckig OTG planning frequency in Hz.',
+    )
+    parser.add_argument(
+        '--otg-async-control-frequency',
+        type=float,
+        default=_DEFAULT_OTG_ASYNC_CONTROL_FREQUENCY,
+        help='FR3 joint command sender frequency in Hz when OTG is enabled.',
+    )
+    parser.add_argument(
+        '--controller-stiffness',
+        default=None,
+        help='Optional comma-separated 7D FR3 joint-position controller stiffness. Disabled when omitted.',
+    )
+    parser.add_argument(
+        '--controller-damping',
+        default=None,
+        help='Optional comma-separated 7D FR3 joint-position controller damping. Disabled when omitted.',
+    )
+    parser.add_argument(
+        '--controller-filter-coeff',
+        type=float,
+        default=None,
+        help='Optional panda_py joint-position controller filter coefficient.',
+    )
     parser.add_argument('--device', default=None, help='Optional torch device override.')
     parser.add_argument('--log-interval', type=int, default=30, help='Step interval for runtime logging.')
     parser.add_argument(
@@ -210,6 +417,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Optional output directory to dump the exact step0 policy input bundle for offline comparison.',
     )
     parser.add_argument(
+        '--camera-preview-window',
+        action='store_true',
+        help='Show the policy input camera frames in one OpenCV window with camera-name labels.',
+    )
+    parser.add_argument(
         '--no-move-to-das-start',
         dest='move_to_das_start',
         action='store_false',
@@ -227,6 +439,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_DEFAULT_DATASET_START_GRIPPER_TOLERANCE,
         help='Absolute normalized gripper tolerance used for startup diagnostics and optional auto-alignment.',
     )
+    parser.add_argument(
+        '--robot-init-state',
+        default=None,
+        help=(
+            'Optional robot startup state before inference. Accepts a YAML/JSON file path, '
+            'an inline YAML/JSON object, or shorthand like joints=7 comma-separated radians '
+            'or ee_xyzquat=x,y,z,qx,qy,qz,qw. File/object examples: '
+            '{type: joints, joints_rad: [...], gripper: 0.5} or '
+            '{type: ee_xyzquat, xyzquat: [x,y,z,qx,qy,qz,qw], gripper: 0.5}.'
+        ),
+    )
+    parser.add_argument(
+        '--interactive-rollouts',
+        action='store_true',
+        help='Wait for keyboard input between rollouts. Requires sshkeyboard inside the runtime.',
+    )
+    parser.add_argument('--rollout-start-key', default='s', help='Interactive key to start a rollout.')
+    parser.add_argument('--rollout-stop-key', default='x', help='Interactive key to stop the current rollout.')
+    parser.add_argument('--rollout-quit-key', default='q', help='Interactive key to quit inference.')
+    parser.add_argument(
+        '--mujoco-viewer',
+        action='store_true',
+        help='Open a passive MuJoCo viewer that mirrors real FR3 joints and overlays policy EE targets.',
+    )
+    parser.add_argument(
+        '--mujoco-model',
+        type=Path,
+        default=None,
+        help=(
+            'Optional MuJoCo XML model for the viewer. Defaults to the DAS XML for --gripper-backend=das '
+            'and the Pika XML for --gripper-backend=pika.'
+        ),
+    )
+    parser.add_argument(
+        '--mujoco-max-chunk-points',
+        type=int,
+        default=64,
+        help='Maximum policy action-chunk target points to draw in the MuJoCo viewer.',
+    )
     parser.set_defaults(move_to_das_start=True, align_gripper_to_dataset_start=True)
     return parser.parse_args(argv)
 
@@ -236,6 +487,24 @@ def _resolve_repo_path(path: str | Path) -> Path:
     if path.is_absolute():
         return path
     return (_REPO_ROOT / path).resolve()
+
+
+def _parse_optional_float_tuple(
+    value: str | None,
+    *,
+    expected_len: int,
+    argument_name: str,
+) -> list[float] | None:
+    if value is None:
+        return None
+    raw_value = str(value).strip()
+    if not raw_value:
+        return None
+    parts = [part.strip() for part in raw_value.split(',') if part.strip()]
+    values = [float(part) for part in parts]
+    if len(values) != expected_len:
+        raise ValueError(f'{argument_name} expects {expected_len} comma-separated values, got {len(values)}.')
+    return values
 
 
 def resolve_pretrained_model_dir(checkpoint_path: str | Path) -> Path:
@@ -261,6 +530,88 @@ def resolve_dataset_root(pretrained_dir: Path, train_cfg: TrainPipelineConfig, d
     return _resolve_repo_path(root_value)
 
 
+def _feature_has_ee_pose(info: dict[str, Any], state_key: str) -> bool:
+    names = info.get('features', {}).get(state_key, {}).get('names')
+    if not isinstance(names, list):
+        return False
+    required_names = {'ee.x', 'ee.y', 'ee.z', 'ee.qx', 'ee.qy', 'ee.qz', 'ee.qw'}
+    return required_names.issubset({str(name) for name in names})
+
+
+def _resolve_existing_dataset_root(path_value: str | Path) -> Path:
+    candidate = _resolve_repo_path(path_value)
+    if candidate.exists():
+        return candidate
+
+    basename = Path(path_value).name
+    for root in (
+        _REPO_ROOT / 'outputs' / 'datasets',
+        Path('/home/corenetic/Code/lerobot/outputs/datasets'),
+        Path('/home/corenetic/Code/lerobot/data'),
+    ):
+        replacement = root / basename
+        if replacement.exists():
+            print(
+                '[WARN] alignment_dataset_root_path_remapped='
+                f'from={candidate} to={replacement.resolve()}'
+            )
+            return replacement.resolve()
+    return candidate
+
+
+def _infer_source_state_key(manifest: dict[str, Any], source_info: dict[str, Any]) -> str:
+    for key in ('source_state_key', 'alignment_state_key'):
+        state_key = manifest.get(key)
+        if isinstance(state_key, str) and _feature_has_ee_pose(source_info, state_key):
+            return state_key
+
+    action_key = manifest.get('action_key') or manifest.get('action_source_key')
+    if isinstance(action_key, str) and action_key.startswith('action.'):
+        suffix = action_key.split('.', 1)[1]
+        state_key = f'observation.state.{suffix}'
+        if _feature_has_ee_pose(source_info, state_key):
+            return state_key
+
+    if _feature_has_ee_pose(source_info, 'observation.state'):
+        return 'observation.state'
+
+    for state_key in sorted(source_info.get('features', {})):
+        if state_key.startswith('observation.state') and _feature_has_ee_pose(source_info, state_key):
+            return str(state_key)
+
+    raise KeyError('Could not find an EE-pose observation.state feature in source dataset metadata.')
+
+
+def resolve_alignment_dataset_root_and_state_key(dataset_root: Path) -> tuple[Path, str]:
+    """Resolve a dataset root that contains EE state for start-frame alignment.
+
+    Image-only policy views intentionally omit observation.state from policy metadata.
+    Their manifest records the source dataset root, which still contains the EE
+    state needed to align dataset-world actions to the live robot base frame.
+    """
+    dataset_root = _resolve_repo_path(dataset_root)
+    try:
+        info = _load_dataset_info(dataset_root)
+    except FileNotFoundError:
+        return dataset_root, 'observation.state'
+    if _feature_has_ee_pose(info, 'observation.state'):
+        return dataset_root, 'observation.state'
+
+    manifest_path = dataset_root / 'meta' / 'il_view_manifest.json'
+    if not manifest_path.is_file():
+        raise ValueError(
+            f"{dataset_root} has no EE-pose observation.state and no {manifest_path}; "
+            "cannot estimate dataset start pose for real-robot inference."
+        )
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    source_dataset_root = manifest.get('source_dataset_root')
+    if not source_dataset_root:
+        raise ValueError(f"{manifest_path} does not define source_dataset_root.")
+    source_root = _resolve_existing_dataset_root(source_dataset_root)
+    source_info = _load_dataset_info(source_root)
+    return source_root, _infer_source_state_key(manifest, source_info)
+
+
 def move_to_das_start_if_requested(*, robot_ip: str, enabled: bool) -> None:
     if not enabled:
         return
@@ -274,6 +625,476 @@ def move_to_das_start_if_requested(*, robot_ip: str, enabled: bool) -> None:
     del panda
     time.sleep(0.5)
     print('[INFO] 已到达 DAS 起始关节角')
+
+
+def _parse_numeric_sequence(value: Any, *, expected_len: int, label: str) -> list[float]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith('['):
+            value = yaml.safe_load(stripped)
+        else:
+            value = [item.strip() for item in stripped.split(',') if item.strip()]
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f'{label} must be a list or comma-separated string.')
+    values = [float(item) for item in value]
+    if len(values) != expected_len:
+        raise ValueError(f'{label} must contain {expected_len} values, got {len(values)}.')
+    return values
+
+
+def _load_robot_init_state_payload(spec: str | None) -> dict[str, Any] | None:
+    if spec in (None, ''):
+        return None
+
+    spec = str(spec).strip()
+    path: Path | None = None
+    if len(spec) < 512 and '\n' not in spec and not spec.lstrip().startswith(('{', '[')):
+        path = _resolve_repo_path(spec)
+    if path is not None and path.is_file():
+        with path.open('r', encoding='utf-8') as f:
+            payload = yaml.safe_load(f) or {}
+        if isinstance(payload, dict) and 'robot_init_state' in payload:
+            payload = payload['robot_init_state']
+        if not isinstance(payload, dict):
+            raise ValueError(f'robot-init-state file {path} must contain a mapping/object.')
+        return payload
+
+    for prefix in ('joints=', 'joints:', 'joint_rad=', 'joint_rad:'):
+        if spec.startswith(prefix):
+            return {'type': 'joints', 'joints_rad': spec[len(prefix) :]}
+    for prefix in ('ee_xyzquat=', 'ee_xyzquat:', 'xyzquat=', 'xyzquat:'):
+        if spec.startswith(prefix):
+            return {'type': 'ee_xyzquat', 'xyzquat': spec[len(prefix) :]}
+    for prefix in ('ee_xyzrotvec=', 'ee_xyzrotvec:', 'xyzrotvec=', 'xyzrotvec:'):
+        if spec.startswith(prefix):
+            return {'type': 'ee_xyzrotvec', 'xyzrotvec': spec[len(prefix) :]}
+
+    payload = yaml.safe_load(spec)
+    if not isinstance(payload, dict):
+        raise ValueError(
+            'robot-init-state must be a file path, mapping/object, or shorthand like '
+            'joints=q1,...,q7 / ee_xyzquat=x,y,z,qx,qy,qz,qw.'
+        )
+    return payload
+
+
+def parse_robot_init_state(spec: str | None) -> dict[str, Any] | None:
+    payload = _load_robot_init_state_payload(spec)
+    if payload is None:
+        return None
+
+    state_type = str(payload.get('type', payload.get('kind', ''))).strip().lower()
+    gripper = payload.get('gripper', payload.get('gripper_pos'))
+    parsed: dict[str, Any]
+
+    if state_type in {'joint', 'joints', 'joint_positions', 'joint_rad', 'joints_rad'} or 'joints_rad' in payload:
+        joints = _parse_numeric_sequence(
+            payload.get('joints_rad', payload.get('joints', payload.get('values'))),
+            expected_len=7,
+            label='robot init joints_rad',
+        )
+        parsed = {'type': 'joints', 'joints_rad': joints}
+    elif state_type in {'ee_pose', 'ee_xyzquat', 'xyzquat'} or 'xyzquat' in payload:
+        xyzquat = _parse_numeric_sequence(
+            payload.get('xyzquat', payload.get('ee_xyzquat', payload.get('values'))),
+            expected_len=7,
+            label='robot init xyzquat',
+        )
+        parsed = {'type': 'ee_xyzquat', 'xyzquat': xyzquat}
+    elif state_type in {'ee_xyzrotvec', 'xyzrotvec', 'ee_rotvec'} or 'xyzrotvec' in payload:
+        xyzrotvec = _parse_numeric_sequence(
+            payload.get('xyzrotvec', payload.get('ee_xyzrotvec', payload.get('values'))),
+            expected_len=6,
+            label='robot init xyzrotvec',
+        )
+        parsed = {'type': 'ee_xyzrotvec', 'xyzrotvec': xyzrotvec}
+    else:
+        raise ValueError(
+            "robot-init-state type must be one of 'joints', 'ee_xyzquat', or 'ee_xyzrotvec'."
+        )
+
+    if gripper is not None:
+        parsed['gripper'] = float(gripper)
+    parsed['timeout_s'] = float(payload.get('timeout_s', 20.0))
+    parsed['joint_tolerance_rad'] = float(payload.get('joint_tolerance_rad', 0.01))
+    parsed['ee_pos_tolerance_m'] = float(payload.get('ee_pos_tolerance_m', 0.005))
+    parsed['ee_rot_tolerance_deg'] = float(payload.get('ee_rot_tolerance_deg', 2.0))
+    parsed['gripper_tolerance'] = float(payload.get('gripper_tolerance', 0.02))
+    return parsed
+
+
+def _observation_joint_positions(observation: RobotObservation) -> np.ndarray:
+    return np.asarray([float(observation[f'joint_{idx}.pos']) for idx in range(1, 8)], dtype=np.float64)
+
+
+def _observation_pose_rotvec(observation: RobotObservation) -> tuple[np.ndarray, np.ndarray]:
+    position = np.asarray([float(observation[key]) for key in EE_POSITION_KEYS], dtype=np.float64)
+    rotvec = np.asarray([float(observation[key]) for key in ('ee.wx', 'ee.wy', 'ee.wz')], dtype=np.float64)
+    return position, rotvec
+
+
+def _rotation_error_rad(current_rotvec: np.ndarray, target_rotvec: np.ndarray) -> float:
+    current = Rotation.from_rotvec(current_rotvec)
+    target = Rotation.from_rotvec(target_rotvec)
+    return float(np.linalg.norm((target * current.inv()).as_rotvec()))
+
+
+def _wait_until_robot_init_reached(
+    robot: Any,
+    init_state: dict[str, Any],
+    *,
+    target_joints_rad: np.ndarray | None = None,
+    target_position: np.ndarray | None = None,
+    target_rotvec: np.ndarray | None = None,
+    target_gripper: float | None = None,
+) -> None:
+    deadline = time.perf_counter() + float(init_state['timeout_s'])
+    last_status = ''
+    while time.perf_counter() < deadline:
+        observation = robot.get_observation(include_cameras=False)
+        checks: list[bool] = []
+        status_parts: list[str] = []
+        if target_joints_rad is not None:
+            joint_error = float(np.max(np.abs(_observation_joint_positions(observation) - target_joints_rad)))
+            checks.append(joint_error <= float(init_state['joint_tolerance_rad']))
+            status_parts.append(f'joint_max_err_rad={joint_error:.4f}')
+        if target_position is not None and target_rotvec is not None:
+            current_position, current_rotvec = _observation_pose_rotvec(observation)
+            pos_error_m = float(np.linalg.norm(current_position - target_position))
+            rot_error_deg = float(np.rad2deg(_rotation_error_rad(current_rotvec, target_rotvec)))
+            checks.append(pos_error_m <= float(init_state['ee_pos_tolerance_m']))
+            checks.append(rot_error_deg <= float(init_state['ee_rot_tolerance_deg']))
+            status_parts.append(f'ee_pos_err_mm={pos_error_m * 1000.0:.2f}')
+            status_parts.append(f'ee_rot_err_deg={rot_error_deg:.2f}')
+        if target_gripper is not None:
+            gripper_error = float(abs(float(observation['gripper.pos']) - target_gripper))
+            checks.append(gripper_error <= float(init_state['gripper_tolerance']))
+            status_parts.append(f'gripper_err={gripper_error:.3f}')
+        last_status = ' '.join(status_parts)
+        if checks and all(checks):
+            print(f'[INFO] robot_init_state reached: {last_status}')
+            return
+        precise_sleep(0.05)
+    raise TimeoutError(f'Timed out waiting for robot_init_state: {last_status}')
+
+
+def move_to_robot_init_state_if_requested(robot: Any, init_state: dict[str, Any] | None) -> None:
+    if init_state is None:
+        return
+
+    target_gripper = float(init_state['gripper']) if 'gripper' in init_state else None
+    if init_state['type'] == 'joints':
+        target_joints_rad = np.asarray(init_state['joints_rad'], dtype=np.float64)
+        print(
+            '[INFO] moving_to_robot_init_state='
+            f"type=joints joints_rad={target_joints_rad.tolist()} gripper={target_gripper}"
+        )
+        robot.send_joint_positions(target_joints_rad, gripper_pos=target_gripper)
+        _wait_until_robot_init_reached(
+            robot,
+            init_state,
+            target_joints_rad=target_joints_rad,
+            target_gripper=target_gripper,
+        )
+        return
+
+    if init_state['type'] == 'ee_xyzquat':
+        xyzquat = np.asarray(init_state['xyzquat'], dtype=np.float64)
+        target_position = xyzquat[:3]
+        target_rotvec = Rotation.from_quat(xyzquat[3:7]).as_rotvec()
+    else:
+        xyzrotvec = np.asarray(init_state['xyzrotvec'], dtype=np.float64)
+        target_position = xyzrotvec[:3]
+        target_rotvec = xyzrotvec[3:6]
+
+    current_observation = robot.get_observation(include_cameras=False)
+    if target_gripper is None:
+        target_gripper = float(current_observation['gripper.pos'])
+    command = {
+        'ee.x': float(target_position[0]),
+        'ee.y': float(target_position[1]),
+        'ee.z': float(target_position[2]),
+        'ee.wx': float(target_rotvec[0]),
+        'ee.wy': float(target_rotvec[1]),
+        'ee.wz': float(target_rotvec[2]),
+        'gripper.pos': float(target_gripper),
+    }
+    print(
+        '[INFO] moving_to_robot_init_state='
+        f"type={init_state['type']} xyz={target_position.tolist()} rotvec={target_rotvec.tolist()} "
+        f'gripper={target_gripper}'
+    )
+    robot.send_action(command)
+    _wait_until_robot_init_reached(
+        robot,
+        init_state,
+        target_position=target_position,
+        target_rotvec=target_rotvec,
+        target_gripper=target_gripper,
+    )
+
+
+def resolve_mujoco_model_path(gripper_backend: str, model_path: str | Path | None) -> Path:
+    if model_path is not None:
+        return _resolve_repo_path(model_path)
+    return _PIKA_XML if gripper_backend == 'pika' else _DAS_XML
+
+
+class FR3InferenceMujocoVisualizer:
+    def __init__(self, *, model_path: str | Path, max_chunk_points: int = 64):
+        self.model_path = _resolve_repo_path(model_path)
+        self.max_chunk_points = max(1, int(max_chunk_points))
+        self._mujoco = None
+        self._viewer = None
+        self._model = None
+        self._data = None
+        self._joint_qpos_addresses: list[int] = []
+
+    def start(self) -> None:
+        import mujoco
+        import mujoco.viewer
+
+        self._mujoco = mujoco
+        self._model = mujoco.MjModel.from_xml_path(str(self.model_path))
+        self._data = mujoco.MjData(self._model)
+        self._joint_qpos_addresses = []
+        for joint_name in _JOINT_NAMES:
+            joint_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+            if joint_id < 0:
+                raise ValueError(f"Joint '{joint_name}' not found in MuJoCo model {self.model_path}")
+            self._joint_qpos_addresses.append(int(self._model.jnt_qposadr[joint_id]))
+        self._viewer = mujoco.viewer.launch_passive(self._model, self._data)
+        print(f'[INFO] mujoco_viewer=enabled model={self.model_path}')
+
+    @property
+    def is_running(self) -> bool:
+        return self._viewer is not None and self._viewer.is_running()
+
+    def _sync_joint_state(self, robot_observation: RobotObservation) -> None:
+        assert self._mujoco is not None and self._model is not None and self._data is not None
+        joint_positions = _observation_joint_positions(robot_observation)
+        for qpos_address, joint_position in zip(self._joint_qpos_addresses, joint_positions, strict=True):
+            self._data.qpos[qpos_address] = float(joint_position)
+        self._data.qvel[:] = 0.0
+        self._mujoco.mj_forward(self._model, self._data)
+
+    def _add_box(self, scene: Any, pose: np.ndarray, rgba: tuple[float, float, float, float]) -> None:
+        assert self._mujoco is not None
+        if scene.ngeom >= scene.maxgeom:
+            return
+        self._mujoco.mjv_initGeom(
+            scene.geoms[scene.ngeom],
+            type=self._mujoco.mjtGeom.mjGEOM_BOX,
+            size=np.array([0.018, 0.018, 0.018], dtype=np.float64),
+            pos=np.asarray(pose[:3, 3], dtype=np.float64),
+            mat=np.asarray(pose[:3, :3], dtype=np.float64).reshape(-1),
+            rgba=np.asarray(rgba, dtype=np.float32),
+        )
+        scene.ngeom += 1
+
+    def _add_sphere(self, scene: Any, point: np.ndarray, rgba: np.ndarray, radius: float = 0.006) -> None:
+        assert self._mujoco is not None
+        if scene.ngeom >= scene.maxgeom:
+            return
+        self._mujoco.mjv_initGeom(
+            scene.geoms[scene.ngeom],
+            type=self._mujoco.mjtGeom.mjGEOM_SPHERE,
+            size=np.array([radius, 0.0, 0.0], dtype=np.float64),
+            pos=np.asarray(point, dtype=np.float64),
+            mat=np.eye(3, dtype=np.float64).reshape(-1),
+            rgba=np.asarray(rgba, dtype=np.float32),
+        )
+        scene.ngeom += 1
+
+    def _add_capsule(self, scene: Any, start: np.ndarray, end: np.ndarray, rgba: np.ndarray) -> None:
+        assert self._mujoco is not None
+        if scene.ngeom >= scene.maxgeom:
+            return
+        geom = scene.geoms[scene.ngeom]
+        self._mujoco.mjv_initGeom(
+            geom,
+            type=self._mujoco.mjtGeom.mjGEOM_CAPSULE,
+            size=np.array([0.003, 0.0, 0.0], dtype=np.float64),
+            pos=np.zeros(3, dtype=np.float64),
+            mat=np.eye(3, dtype=np.float64).reshape(-1),
+            rgba=np.asarray(rgba, dtype=np.float32),
+        )
+        self._mujoco.mjv_connector(
+            geom,
+            self._mujoco.mjtGeom.mjGEOM_CAPSULE,
+            0.003,
+            np.asarray(start, dtype=np.float64),
+            np.asarray(end, dtype=np.float64),
+        )
+        geom.rgba[:] = np.asarray(rgba, dtype=np.float32)
+        scene.ngeom += 1
+
+    def _draw_chunk_trajectory(self, scene: Any, chunk_poses: list[np.ndarray]) -> None:
+        if not chunk_poses:
+            return
+        available_points = max((scene.maxgeom - scene.ngeom + 1) // 2, 1)
+        point_count = min(len(chunk_poses), self.max_chunk_points, available_points)
+        if point_count <= 0:
+            return
+        if len(chunk_poses) > point_count:
+            indices = np.linspace(0, len(chunk_poses) - 1, point_count).round().astype(int)
+            poses = [chunk_poses[int(index)] for index in indices]
+        else:
+            poses = chunk_poses
+        points = [np.asarray(pose[:3, 3], dtype=np.float64) for pose in poses]
+        start_rgba = np.array([0.10, 0.55, 1.00, 0.78], dtype=np.float32)
+        end_rgba = np.array([1.00, 0.15, 0.55, 0.92], dtype=np.float32)
+        denom = max(len(points) - 1, 1)
+        for idx, point in enumerate(points):
+            alpha = float(idx / denom)
+            rgba = (1.0 - alpha) * start_rgba + alpha * end_rgba
+            self._add_sphere(scene, point, rgba)
+            if idx > 0:
+                self._add_capsule(scene, points[idx - 1], point, rgba)
+
+    def update(
+        self,
+        *,
+        robot_observation: RobotObservation,
+        current_ee_pose: np.ndarray,
+        target_ee_pose: np.ndarray,
+        safe_target_ee_pose: np.ndarray | None = None,
+        chunk_ee_poses: list[np.ndarray] | None,
+    ) -> None:
+        if self._viewer is None or not self._viewer.is_running():
+            return
+        self._sync_joint_state(robot_observation)
+        with self._viewer.lock():
+            scene = self._viewer.user_scn
+            scene.ngeom = 0
+            self._add_box(scene, current_ee_pose, (1.00, 0.42, 0.12, 0.85))
+            self._add_box(scene, target_ee_pose, (0.10, 0.85, 0.35, 0.85))
+            if safe_target_ee_pose is not None:
+                self._add_box(scene, safe_target_ee_pose, (1.00, 0.92, 0.10, 0.90))
+            self._draw_chunk_trajectory(scene, chunk_ee_poses or [])
+        self._viewer.sync()
+
+    def close(self) -> None:
+        if self._viewer is not None:
+            try:
+                self._viewer.close()
+            except Exception:
+                pass
+
+
+class InteractiveRolloutKeyboard:
+    def __init__(self, *, start_key: str, stop_key: str, quit_key: str):
+        self.start_key = self._normalize_key(start_key)
+        self.stop_key = self._normalize_key(stop_key)
+        self.quit_key = self._normalize_key(quit_key)
+        self.start_requested = threading.Event()
+        self.stop_requested = threading.Event()
+        self.quit_requested = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._stop_listening = None
+
+    @staticmethod
+    def _normalize_key(key: str) -> str:
+        return str(key).strip().lower()
+
+    def _on_press(self, key: str) -> None:
+        key_name = self._normalize_key(key)
+        if key_name == self.start_key:
+            print('[INFO] interactive_key=start')
+            self.start_requested.set()
+            self.stop_requested.clear()
+        elif key_name == self.stop_key:
+            print('[INFO] interactive_key=stop_current_rollout')
+            self.stop_requested.set()
+        elif key_name == self.quit_key:
+            print('[INFO] interactive_key=quit')
+            self.quit_requested.set()
+            self.stop_requested.set()
+            self.start_requested.set()
+
+    def _listen_keyboard_loop(self, listen_keyboard: Any) -> None:
+        try:
+            listen_keyboard(on_press=self._on_press, sequential=False)
+        except TypeError:
+            listen_keyboard(on_press=self._on_press)
+
+    def _listen_stdin_loop(self) -> None:
+        if not sys.stdin.isatty():
+            raise RuntimeError('Interactive rollout fallback requires a TTY stdin.')
+
+        fd = sys.stdin.fileno()
+        original_termios = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while not self.quit_requested.is_set():
+                readable, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if not readable:
+                    continue
+                char = sys.stdin.read(1)
+                if char == '\x03':
+                    self._on_press(self.quit_key)
+                    break
+                if char == '\x1b':
+                    self._on_press(self.quit_key)
+                    continue
+                self._on_press(char)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, original_termios)
+
+    def start(self) -> None:
+        try:
+            from sshkeyboard import listen_keyboard, stop_listening
+        except ImportError:
+            if not sys.stdin.isatty():
+                raise RuntimeError(
+                    'Interactive rollout mode requires `sshkeyboard` or a TTY stdin fallback. '
+                    'Install sshkeyboard in the runtime or run Docker with an interactive TTY.'
+                )
+            self._thread = threading.Thread(target=self._listen_stdin_loop, daemon=True)
+            self._thread.start()
+            backend = 'stdin'
+        else:
+            self._stop_listening = stop_listening
+            self._thread = threading.Thread(
+                target=self._listen_keyboard_loop,
+                args=(listen_keyboard,),
+                daemon=True,
+            )
+            self._thread.start()
+            backend = 'sshkeyboard'
+
+        print(
+            '[INFO] interactive_rollouts=enabled '
+            f'keyboard_backend={backend} '
+            f"start_key='{self.start_key}' stop_key='{self.stop_key}' quit_key='{self.quit_key}'"
+        )
+
+    def wait_for_start_or_quit(self) -> bool:
+        self.start_requested.clear()
+        self.stop_requested.clear()
+        print(
+            '[INFO] interactive_waiting_for_start '
+            f"press '{self.start_key}' to start, '{self.quit_key}' to quit."
+        )
+        while not self.quit_requested.is_set():
+            if self.start_requested.wait(timeout=0.1):
+                self.start_requested.clear()
+                self.stop_requested.clear()
+                return True
+        return False
+
+    def should_stop_rollout(self) -> bool:
+        return self.stop_requested.is_set() or self.quit_requested.is_set()
+
+    def close(self) -> None:
+        self.quit_requested.set()
+        if callable(self._stop_listening):
+            try:
+                self._stop_listening()
+            except Exception:
+                pass
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
 
 def _coerce_opencv_index_or_path(value: Any) -> int | Path:
@@ -477,17 +1298,25 @@ def build_tactile_fallback_observation(fallback_mode: str | None) -> dict[str, n
     }
 
 
-def normalize_dataset_gripper(aperture_m: float, cfg: FrankaResearch3Config) -> float:
-    aperture_m = float(max(0.0, aperture_m))
+def normalize_dataset_gripper(aperture_value: float, cfg: FrankaResearch3Config) -> float:
+    aperture_value = float(max(0.0, aperture_value))
     if cfg.gripper_backend == 'das':
         span_m = float(cfg.das_max_distance_m - cfg.das_min_distance_m)
         if span_m <= 0.0:
             return 0.0
-        return float(np.clip((aperture_m - cfg.das_min_distance_m) / span_m, 0.0, 1.0))
+        return float(np.clip((aperture_value - cfg.das_min_distance_m) / span_m, 0.0, 1.0))
     max_width_m = float(cfg.gripper_max_width_mm) / 1000.0
-    if max_width_m <= 0.0:
+    max_width_mm = float(cfg.gripper_max_width_mm)
+    if max_width_m <= 0.0 or max_width_mm <= 0.0:
         return 0.0
-    return float(np.clip(aperture_m / max_width_m, 0.0, 1.0))
+
+    # Historical datasets used meters, live robot commands use normalized [0, 1],
+    # and Pika collection data often stores aperture directly in millimeters.
+    if aperture_value <= max_width_m * 1.25:
+        return float(np.clip(aperture_value / max_width_m, 0.0, 1.0))
+    if aperture_value <= 1.0:
+        return float(np.clip(aperture_value, 0.0, 1.0))
+    return float(np.clip(aperture_value / max_width_mm, 0.0, 1.0))
 
 
 def denormalize_live_gripper_observation(gripper_pos: float, cfg: FrankaResearch3Config) -> float:
@@ -528,8 +1357,40 @@ def _state_name_to_observation_key(name: str) -> str:
         'qy': 'ee.qy',
         'qz': 'ee.qz',
         'qw': 'ee.qw',
+        'state.ee.x': 'ee.x',
+        'state.ee.y': 'ee.y',
+        'state.ee.z': 'ee.z',
+        'state.ee.qx': 'ee.qx',
+        'state.ee.qy': 'ee.qy',
+        'state.ee.qz': 'ee.qz',
+        'state.ee.qw': 'ee.qw',
+        'observation.state.ee.x': 'ee.x',
+        'observation.state.ee.y': 'ee.y',
+        'observation.state.ee.z': 'ee.z',
+        'observation.state.ee.qx': 'ee.qx',
+        'observation.state.ee.qy': 'ee.qy',
+        'observation.state.ee.qz': 'ee.qz',
+        'observation.state.ee.qw': 'ee.qw',
+        'observation.state.left.ee.x': 'ee.x',
+        'observation.state.left.ee.y': 'ee.y',
+        'observation.state.left.ee.z': 'ee.z',
+        'observation.state.left.ee.qx': 'ee.qx',
+        'observation.state.left.ee.qy': 'ee.qy',
+        'observation.state.left.ee.qz': 'ee.qz',
+        'observation.state.left.ee.qw': 'ee.qw',
+        'observation.state.right.ee.x': 'ee.x',
+        'observation.state.right.ee.y': 'ee.y',
+        'observation.state.right.ee.z': 'ee.z',
+        'observation.state.right.ee.qx': 'ee.qx',
+        'observation.state.right.ee.qy': 'ee.qy',
+        'observation.state.right.ee.qz': 'ee.qz',
+        'observation.state.right.ee.qw': 'ee.qw',
         'gripper': 'gripper.pos',
         'prev_cmd.gripper': PREV_CMD_GRIPPER_KEY,
+        'handheld_gripper.pika_left.width_mm': 'gripper.pos',
+        'handheld_gripper.pika_right.width_mm': 'gripper.pos',
+        'observation.state_raw.handheld_gripper.pika_left.width_mm': 'gripper.pos',
+        'observation.state_raw.handheld_gripper.pika_right.width_mm': 'gripper.pos',
     }
     return aliases.get(name, name)
 
@@ -541,6 +1402,35 @@ def _action_value(action_map: dict[str, float], *keys: str) -> float:
     raise KeyError(f'Missing action keys {keys!r} in decoded policy action.')
 
 
+def extract_action_gripper_raw(action_tensor: torch.Tensor, action_names: list[str]) -> float:
+    action_np = np.asarray(action_tensor.squeeze(0).detach().cpu().numpy(), dtype=np.float64)
+    if action_np.shape != (len(action_names),):
+        raise ValueError(f'Expected policy action shape {(len(action_names),)}, got {action_np.shape}')
+    action_map = {name: float(action_np[i]) for i, name in enumerate(action_names)}
+    return _action_value(
+        action_map,
+        'gripper',
+        'gripper.pos',
+        'observation.state_raw.handheld_gripper.pika_left.width_mm',
+        'observation.state_raw.handheld_gripper.pika_right.width_mm',
+    )
+
+
+def resize_image_to_policy_shape(image: np.ndarray, image_feature: Any) -> np.ndarray:
+    shape = tuple(getattr(image_feature, 'shape', ()))
+    if len(shape) != 3:
+        return image
+
+    _, expected_h, expected_w = shape
+    if image.shape[:2] == (expected_h, expected_w):
+        return np.ascontiguousarray(image)
+
+    import cv2
+
+    interpolation = cv2.INTER_AREA if image.shape[0] > expected_h or image.shape[1] > expected_w else cv2.INTER_LINEAR
+    return np.ascontiguousarray(cv2.resize(image, (expected_w, expected_h), interpolation=interpolation))
+
+
 def build_policy_observation(
     state_observation: RobotObservation,
     *,
@@ -549,12 +1439,12 @@ def build_policy_observation(
     tactile_fallback_observation: dict[str, np.ndarray] | None = None,
     camera_configs: dict[str, OpenCVCameraConfig | RealSenseCameraConfig | HikrobotCameraConfig] | None = None,
 ) -> dict[str, np.ndarray]:
-    observation: dict[str, np.ndarray] = {
-        'observation.state': np.asarray(
+    observation: dict[str, np.ndarray] = {}
+    if 'observation.state' in input_features:
+        observation['observation.state'] = np.asarray(
             [state_observation[_state_name_to_observation_key(name)] for name in state_names],
             dtype=np.float32,
         )
-    }
 
     for camera_key in extract_required_image_keys(input_features):
         if camera_key not in state_observation:
@@ -568,7 +1458,18 @@ def build_policy_observation(
                 color_mode = None
             if color_mode == ColorMode.BGR:
                 image = np.ascontiguousarray(image[..., ::-1])
-        observation[f'{_OBS_IMAGES_PREFIX}{camera_key}'] = image
+        feature_key = f'{_OBS_IMAGES_PREFIX}{camera_key}'
+        logged_shapes = getattr(build_policy_observation, '_logged_image_shapes', set())
+        if camera_key not in logged_shapes:
+            feature_shape = tuple(getattr(input_features[feature_key], 'shape', ()))
+            print(
+                '[INFO] policy_image_preprocess '
+                f'camera={camera_key} raw_shape_hwc={tuple(image.shape)} policy_feature_chw={feature_shape} '
+                'method=cv2.resize_no_crop'
+            )
+            logged_shapes.add(camera_key)
+            setattr(build_policy_observation, '_logged_image_shapes', logged_shapes)
+        observation[feature_key] = resize_image_to_policy_shape(image, input_features[feature_key])
 
     required_tactile_keys = extract_required_tactile_keys(input_features)
     missing_tactile_keys = [feature_key for feature_key in required_tactile_keys if feature_key not in state_observation]
@@ -597,6 +1498,75 @@ def build_policy_observation(
         observation[feature_key] = np.zeros(tuple(feature.shape), dtype=np.float32)
 
     return observation
+
+
+def show_policy_camera_preview_window(
+    policy_observation: dict[str, np.ndarray],
+    *,
+    camera_keys: list[str],
+    window_name: str = 'FR3 policy camera inputs',
+) -> bool:
+    import cv2
+
+    labeled_images: list[np.ndarray] = []
+    for camera_key in camera_keys:
+        feature_key = f'{_OBS_IMAGES_PREFIX}{camera_key}'
+        if feature_key not in policy_observation:
+            continue
+        image_rgb = np.asarray(policy_observation[feature_key], dtype=np.uint8)
+        if image_rgb.ndim != 3 or image_rgb.shape[-1] != 3:
+            continue
+        image_bgr = np.ascontiguousarray(image_rgb[..., ::-1])
+        label = camera_key
+        label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        label_width, label_height = label_size
+        cv2.rectangle(image_bgr, (0, 0), (label_width + 18, label_height + 18), (0, 0, 0), thickness=-1)
+        cv2.putText(
+            image_bgr,
+            label,
+            (9, label_height + 9),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        labeled_images.append(image_bgr)
+
+    if not labeled_images:
+        return True
+
+    target_height = max(image.shape[0] for image in labeled_images)
+    resized_images: list[np.ndarray] = []
+    for image in labeled_images:
+        if image.shape[0] == target_height:
+            resized_images.append(image)
+            continue
+        scale = target_height / float(image.shape[0])
+        resized_images.append(cv2.resize(image, (int(round(image.shape[1] * scale)), target_height)))
+
+    canvas = np.ascontiguousarray(np.concatenate(resized_images, axis=1))
+    try:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.imshow(window_name, canvas)
+        key = cv2.waitKey(1) & 0xFF
+    except cv2.error as exc:
+        print(f'[WARN] camera_preview_window=disabled reason=cv2_error: {exc}')
+        return False
+    if key in (ord('q'), 27):
+        cv2.destroyWindow(window_name)
+        print('[INFO] camera_preview_window=closed_by_user')
+        return False
+    return True
+
+
+def close_camera_preview_window(window_name: str = 'FR3 policy camera inputs') -> None:
+    try:
+        import cv2
+
+        cv2.destroyWindow(window_name)
+    except Exception:
+        pass
 
 
 def _pose_from_position_and_quaternion(position_xyz: np.ndarray, quaternion_xyzw: np.ndarray) -> np.ndarray:
@@ -651,34 +1621,7 @@ def _pose_from_quaternion_observation(
 
 
 def convert_absolute_observation_from_E_to_I(absolute_observation_e: RobotObservation) -> RobotObservation:
-    absolute_observation_i = dict(absolute_observation_e)
-    for position_keys, quaternion_keys in (
-        (EE_POSITION_KEYS, EE_QUAT_KEYS),
-        (PREV_CMD_POSITION_KEYS, PREV_CMD_QUAT_KEYS),
-    ):
-        if not all(key in absolute_observation_e for key in position_keys + quaternion_keys):
-            continue
-        input_quaternion_xyzw = np.asarray([absolute_observation_e[key] for key in quaternion_keys], dtype=np.float64)
-        absolute_pose_e = _pose_from_quaternion_observation(
-            absolute_observation_e,
-            position_keys=position_keys,
-            quaternion_keys=quaternion_keys,
-        )
-        absolute_pose_i = absolute_pose_e @ _T_EI
-        quaternion_xyzw = Rotation.from_matrix(absolute_pose_i[:3, :3]).as_quat()
-        quaternion_xyzw = _continuous_quaternion(quaternion_xyzw, input_quaternion_xyzw)
-        absolute_observation_i.update(
-            {
-                position_keys[0]: float(absolute_pose_i[0, 3]),
-                position_keys[1]: float(absolute_pose_i[1, 3]),
-                position_keys[2]: float(absolute_pose_i[2, 3]),
-                quaternion_keys[0]: float(quaternion_xyzw[0]),
-                quaternion_keys[1]: float(quaternion_xyzw[1]),
-                quaternion_keys[2]: float(quaternion_xyzw[2]),
-                quaternion_keys[3]: float(quaternion_xyzw[3]),
-            }
-        )
-    return absolute_observation_i
+    return dict(absolute_observation_e)
 
 
 def localize_observation_to_start_frame(
@@ -733,7 +1676,11 @@ def convert_local_command_to_base_frame(
     return base_robot_command
 
 
-def _load_episode_start_state_rows(dataset_root: Path) -> list[tuple[int, np.ndarray]]:
+def _load_episode_start_state_rows(
+    dataset_root: Path,
+    *,
+    state_key: str = 'observation.state',
+) -> list[tuple[int, np.ndarray]]:
     import pyarrow.parquet as pq
 
     dataset_root = _resolve_repo_path(dataset_root)
@@ -755,8 +1702,8 @@ def _load_episode_start_state_rows(dataset_root: Path) -> list[tuple[int, np.nda
     start_state_rows: list[tuple[int, np.ndarray]] = []
     for episode_index, chunk_index, file_index in episode_rows:
         data_file = _resolve_dataset_data_file(dataset_root, chunk_index=chunk_index, file_index=file_index)
-        table = pq.read_table(str(data_file), columns=['episode_index', 'observation.state']).to_pydict()
-        for row_episode_index, state in zip(table['episode_index'], table['observation.state'], strict=True):
+        table = pq.read_table(str(data_file), columns=['episode_index', state_key]).to_pydict()
+        for row_episode_index, state in zip(table['episode_index'], table[state_key], strict=True):
             if int(row_episode_index) != episode_index:
                 continue
             start_state_rows.append((episode_index, np.asarray(state, dtype=np.float64)))
@@ -769,8 +1716,12 @@ def _load_episode_start_state_rows(dataset_root: Path) -> list[tuple[int, np.nda
     return start_state_rows
 
 
-def _load_episode_start_states(dataset_root: Path) -> np.ndarray:
-    start_state_rows = _load_episode_start_state_rows(dataset_root)
+def _load_episode_start_states(
+    dataset_root: Path,
+    *,
+    state_key: str = 'observation.state',
+) -> np.ndarray:
+    start_state_rows = _load_episode_start_state_rows(dataset_root, state_key=state_key)
     return np.asarray([state for _, state in start_state_rows], dtype=np.float64)
 
 
@@ -781,9 +1732,13 @@ def _quaternion_angle_deg(quaternion_a_xyzw: np.ndarray, quaternion_b_xyzw: np.n
     return float(np.degrees(2.0 * np.arccos(dot)))
 
 
-def estimate_dataset_start_pose_contract(dataset_root: Path) -> tuple[np.ndarray, dict[str, Any]]:
-    start_states = _load_episode_start_states(dataset_root)
-    state_indices = _extract_dataset_state_contract_indices(dataset_root)
+def estimate_dataset_start_pose_contract(
+    dataset_root: Path,
+    *,
+    state_key: str = 'observation.state',
+) -> tuple[np.ndarray, dict[str, Any]]:
+    start_states = _load_episode_start_states(dataset_root, state_key=state_key)
+    state_indices = _extract_dataset_state_contract_indices(dataset_root, state_key=state_key)
     positions = np.asarray([[state[state_indices[key]] for key in EE_POSITION_KEYS] for state in start_states], dtype=np.float64)
     quaternions = np.asarray([[state[state_indices[key]] for key in EE_QUAT_KEYS] for state in start_states], dtype=np.float64)
     gripper_values = (
@@ -808,6 +1763,7 @@ def estimate_dataset_start_pose_contract(dataset_root: Path) -> tuple[np.ndarray
         dtype=np.float64,
     )
     stats: dict[str, Any] = {
+        'state_key': state_key,
         'episodes': int(len(start_states)),
         'mean_position_xyz_m': mean_position.copy(),
         'position_std_xyz_mm': positions.std(axis=0) * 1000.0,
@@ -827,10 +1783,11 @@ def summarize_live_start_alignment_to_dataset_starts(
     T_B_Ws: np.ndarray,
     live_start_pose_i: np.ndarray,
     *,
+    state_key: str = 'observation.state',
     live_gripper: float | None = None,
 ) -> dict[str, Any]:
-    start_state_rows = _load_episode_start_state_rows(dataset_root)
-    state_indices = _extract_dataset_state_contract_indices(dataset_root)
+    start_state_rows = _load_episode_start_state_rows(dataset_root, state_key=state_key)
+    state_indices = _extract_dataset_state_contract_indices(dataset_root, state_key=state_key)
     live_position = np.asarray(live_start_pose_i[:3, 3], dtype=np.float64)
     live_rotation = Rotation.from_matrix(live_start_pose_i[:3, :3])
 
@@ -975,24 +1932,7 @@ def convert_dataset_command_to_base_frame(
 
 
 def convert_base_command_from_I_to_E(base_robot_command_i: dict[str, float]) -> dict[str, float]:
-    base_pose_i = _pose_from_position_and_rotvec(
-        np.asarray([base_robot_command_i['ee.x'], base_robot_command_i['ee.y'], base_robot_command_i['ee.z']], dtype=np.float64),
-        np.asarray([base_robot_command_i['ee.wx'], base_robot_command_i['ee.wy'], base_robot_command_i['ee.wz']], dtype=np.float64),
-    )
-    base_pose_e = base_pose_i @ _T_IE
-    base_rotvec_xyz = Rotation.from_matrix(base_pose_e[:3, :3]).as_rotvec()
-    base_robot_command_e = dict(base_robot_command_i)
-    base_robot_command_e.update(
-        {
-            'ee.x': float(base_pose_e[0, 3]),
-            'ee.y': float(base_pose_e[1, 3]),
-            'ee.z': float(base_pose_e[2, 3]),
-            'ee.wx': float(base_rotvec_xyz[0]),
-            'ee.wy': float(base_rotvec_xyz[1]),
-            'ee.wz': float(base_rotvec_xyz[2]),
-        }
-    )
-    return base_robot_command_e
+    return dict(base_robot_command_i)
 
 
 def decode_action_to_robot_command(
@@ -1000,6 +1940,7 @@ def decode_action_to_robot_command(
     *,
     action_names: list[str],
     robot_cfg: FrankaResearch3Config,
+    gripper_close_below: float | None = None,
 ) -> dict[str, float]:
     action_np = np.asarray(action_tensor.squeeze(0).detach().cpu().numpy(), dtype=np.float64)
     if action_np.shape != (len(action_names),):
@@ -1016,10 +1957,17 @@ def decode_action_to_robot_command(
         dtype=np.float64,
     )
     rotvec_xyz = Rotation.from_quat(quaternion_xyzw).as_rotvec()
-    gripper_normalized = normalize_dataset_gripper(
-        _action_value(action_map, 'gripper', 'gripper.pos'),
-        robot_cfg,
+    raw_gripper_value = _action_value(
+        action_map,
+        'gripper',
+        'gripper.pos',
+        'observation.state_raw.handheld_gripper.pika_left.width_mm',
+        'observation.state_raw.handheld_gripper.pika_right.width_mm',
     )
+    if gripper_close_below is not None and raw_gripper_value < float(gripper_close_below):
+        gripper_normalized = 0.0
+    else:
+        gripper_normalized = normalize_dataset_gripper(raw_gripper_value, robot_cfg)
 
     return {
         'ee.x': _action_value(action_map, 'x', 'ee.x'),
@@ -1030,6 +1978,166 @@ def decode_action_to_robot_command(
         'ee.wz': float(rotvec_xyz[2]),
         'gripper.pos': gripper_normalized,
     }
+
+
+def _pose_from_rotvec_command(robot_command: dict[str, float]) -> np.ndarray:
+    return _pose_from_position_and_rotvec(
+        np.asarray([robot_command['ee.x'], robot_command['ee.y'], robot_command['ee.z']], dtype=np.float64),
+        np.asarray([robot_command['ee.wx'], robot_command['ee.wy'], robot_command['ee.wz']], dtype=np.float64),
+    )
+
+
+def extract_new_action_chunk_for_visualization(
+    policy: Any,
+    current_action_tensor: torch.Tensor,
+    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+) -> list[torch.Tensor] | None:
+    temporal_ensembler = getattr(policy, 'temporal_ensembler', None)
+    ensembled_actions = getattr(temporal_ensembler, 'ensembled_actions', None)
+    if ensembled_actions is not None:
+        action_tensors = [current_action_tensor.detach().cpu()]
+        try:
+            preview_postprocessor = deepcopy(postprocessor)
+            remaining_actions = ensembled_actions.detach()
+            for action_idx in range(remaining_actions.shape[1]):
+                processed_action = preview_postprocessor(remaining_actions[:, action_idx, :])
+                action_tensors.append(processed_action.detach().cpu())
+        except Exception as exc:
+            print(f'[WARN] mujoco_temporal_ensemble_preview=unavailable reason={type(exc).__name__}: {exc}')
+            return None
+        return action_tensors
+
+    action_queue = getattr(policy, '_action_queue', None)
+    n_action_steps = getattr(getattr(policy, 'config', None), 'n_action_steps', None)
+    if action_queue is None or n_action_steps is None:
+        return None
+    if len(action_queue) != max(int(n_action_steps) - 1, 0):
+        return None
+
+    action_tensors = [current_action_tensor.detach().cpu()]
+    if len(action_queue) == 0:
+        return action_tensors
+
+    try:
+        preview_postprocessor = deepcopy(postprocessor)
+        for raw_action in list(action_queue):
+            processed_action = preview_postprocessor(raw_action)
+            action_tensors.append(processed_action.detach().cpu())
+    except Exception as exc:
+        print(f'[WARN] mujoco_chunk_preview=unavailable reason={type(exc).__name__}: {exc}')
+        return None
+    return action_tensors
+
+
+def select_temporal_ensemble_offset_action(
+    action_tensor: torch.Tensor,
+    *,
+    policy: Any,
+    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    offset: int,
+) -> torch.Tensor:
+    offset = int(offset)
+    if offset <= 0:
+        return action_tensor
+    temporal_ensembler = getattr(policy, 'temporal_ensembler', None)
+    ensembled_actions = getattr(temporal_ensembler, 'ensembled_actions', None)
+    if ensembled_actions is None:
+        raise ValueError('--act-temporal-action-offset requires ACT temporal ensembling to be enabled.')
+    if ensembled_actions.shape[1] <= 0:
+        return action_tensor
+
+    future_index = min(offset - 1, int(ensembled_actions.shape[1]) - 1)
+    raw_future_action = ensembled_actions[:, future_index, :]
+    return postprocessor(raw_future_action)
+
+
+def resolve_temporal_ensemble_max_offset(policy: Any, requested_max_offset: int | None) -> int | None:
+    if requested_max_offset is None:
+        return None
+    requested_max_offset = int(requested_max_offset)
+    if requested_max_offset <= 0:
+        return None
+    temporal_ensembler = getattr(policy, 'temporal_ensembler', None)
+    ensembled_actions = getattr(temporal_ensembler, 'ensembled_actions', None)
+    if ensembled_actions is None or int(ensembled_actions.shape[1]) <= 0:
+        return requested_max_offset
+    return min(requested_max_offset, int(ensembled_actions.shape[1]))
+
+
+def update_temporal_offset_on_stuck(
+    temporal_offset_state: dict[str, int],
+    *,
+    base_offset: int,
+    max_offset: int | None,
+    offset_step: int,
+    stuck_steps: int,
+    stuck_pos_delta_m: float,
+    closed_gripper_max: float,
+    unassisted_command: dict[str, float],
+    robot_observation: RobotObservation,
+) -> dict[str, Any]:
+    if max_offset is None:
+        temporal_offset_state['current_offset'] = max(int(base_offset), 0)
+        temporal_offset_state['stuck_count'] = 0
+        return {'status': 'disabled', 'current_offset': int(temporal_offset_state['current_offset']), 'stuck_count': 0}
+
+    base_offset = max(int(base_offset), 0)
+    max_offset = max(int(max_offset), base_offset)
+    current_offset = int(temporal_offset_state.get('current_offset', base_offset))
+    stuck_count = int(temporal_offset_state.get('stuck_count', 0))
+
+    position_delta, _ = compute_pose_delta_from_current(unassisted_command, robot_observation)
+    unassisted_delta_m = float(np.linalg.norm(position_delta))
+    closed_gripper = float(unassisted_command['gripper.pos']) <= float(closed_gripper_max)
+    low_motion = unassisted_delta_m <= float(stuck_pos_delta_m)
+
+    if closed_gripper and low_motion:
+        stuck_count += 1
+        if stuck_count >= max(int(stuck_steps), 1):
+            current_offset = min(max_offset, current_offset + max(int(offset_step), 1))
+            stuck_count = 0
+            status = 'advance'
+        else:
+            status = f'waiting:{stuck_count}/{max(int(stuck_steps), 1)}'
+    else:
+        if current_offset != base_offset:
+            status = 'reset_moving'
+        else:
+            status = 'base'
+        current_offset = base_offset
+        stuck_count = 0
+
+    temporal_offset_state['current_offset'] = current_offset
+    temporal_offset_state['stuck_count'] = stuck_count
+    return {
+        'status': status,
+        'current_offset': current_offset,
+        'stuck_count': stuck_count,
+        'unassisted_delta_m': unassisted_delta_m,
+        'closed_gripper': closed_gripper,
+    }
+
+
+def build_chunk_ee_poses_for_visualization(
+    action_tensors: list[torch.Tensor] | None,
+    *,
+    action_names: list[str],
+    robot_cfg: FrankaResearch3Config,
+    T_B_Ws: np.ndarray,
+) -> list[np.ndarray] | None:
+    if not action_tensors:
+        return None
+    chunk_ee_poses: list[np.ndarray] = []
+    for action_tensor in action_tensors:
+        dataset_robot_command_i = decode_action_to_robot_command(
+            action_tensor,
+            action_names=action_names,
+            robot_cfg=robot_cfg,
+        )
+        base_robot_command_i = convert_dataset_command_to_base_frame(dataset_robot_command_i, T_B_Ws)
+        robot_command_e = convert_base_command_from_I_to_E(base_robot_command_i)
+        chunk_ee_poses.append(_pose_from_rotvec_command(robot_command_e))
+    return chunk_ee_poses
 
 
 def build_hold_command(
@@ -1134,6 +2242,177 @@ def compute_pose_delta_from_current(
     position_delta = target_position - current_position
     rotation_delta = (current_rotation.inv() * target_rotation).as_rotvec()
     return position_delta, rotation_delta
+
+
+def smooth_robot_command_ema(
+    robot_command: dict[str, float],
+    previous_command: dict[str, float] | None,
+    *,
+    alpha: float | None,
+) -> dict[str, float]:
+    if alpha is None:
+        return dict(robot_command)
+    alpha = float(alpha)
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError('--command-ema-alpha must be in (0, 1] when provided.')
+    if previous_command is None or alpha >= 1.0:
+        return dict(robot_command)
+
+    previous_position, previous_rotation = _extract_command_pose(previous_command)
+    target_position, target_rotation = _extract_command_pose(robot_command)
+    smoothed_position = previous_position + alpha * (target_position - previous_position)
+    relative_rotation = previous_rotation.inv() * target_rotation
+    smoothed_rotation = previous_rotation * Rotation.from_rotvec(alpha * relative_rotation.as_rotvec())
+    smoothed_rotvec = smoothed_rotation.as_rotvec()
+
+    smoothed_command = dict(robot_command)
+    smoothed_command.update(
+        {
+            'ee.x': float(smoothed_position[0]),
+            'ee.y': float(smoothed_position[1]),
+            'ee.z': float(smoothed_position[2]),
+            'ee.wx': float(smoothed_rotvec[0]),
+            'ee.wy': float(smoothed_rotvec[1]),
+            'ee.wz': float(smoothed_rotvec[2]),
+        }
+    )
+    return smoothed_command
+
+
+def apply_place_assist_offset(
+    robot_command: dict[str, float],
+    robot_observation: RobotObservation,
+    assist_state: dict[str, Any],
+    *,
+    target_offset_xyz_m: np.ndarray | None,
+    stuck_steps: int,
+    stuck_pos_delta_m: float,
+    ramp_step_m: float,
+    closed_gripper_max: float,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    if target_offset_xyz_m is None:
+        return dict(robot_command), {'status': 'disabled', 'offset_xyz_m': np.zeros(3, dtype=np.float64)}
+
+    target_offset_xyz_m = np.asarray(target_offset_xyz_m, dtype=np.float64)
+    if target_offset_xyz_m.shape != (3,):
+        raise ValueError('--place-assist-offset-base-xyz expects exactly 3 values.')
+
+    current_offset = np.asarray(assist_state.get('offset_xyz_m', np.zeros(3, dtype=np.float64)), dtype=np.float64)
+    stuck_count = int(assist_state.get('stuck_count', 0))
+    position_delta, _ = compute_pose_delta_from_current(robot_command, robot_observation)
+    unassisted_delta_m = float(np.linalg.norm(position_delta))
+    closed_gripper = float(robot_command['gripper.pos']) <= float(closed_gripper_max)
+    low_motion = unassisted_delta_m <= float(stuck_pos_delta_m)
+
+    if not closed_gripper:
+        stuck_count = 0
+        current_offset = np.zeros(3, dtype=np.float64)
+        status = 'reset_open_gripper'
+    elif low_motion:
+        stuck_count += 1
+        if stuck_count >= max(int(stuck_steps), 1):
+            remaining = target_offset_xyz_m - current_offset
+            remaining_norm = float(np.linalg.norm(remaining))
+            max_step = max(float(ramp_step_m), 0.0)
+            if remaining_norm > 0.0 and max_step > 0.0:
+                scale = min(1.0, max_step / remaining_norm)
+                current_offset = current_offset + remaining * scale
+            status = 'active'
+        else:
+            status = f'waiting:{stuck_count}/{max(int(stuck_steps), 1)}'
+    else:
+        stuck_count = 0
+        status = 'armed_moving'
+
+    assist_state['offset_xyz_m'] = current_offset
+    assist_state['stuck_count'] = stuck_count
+
+    assisted_command = dict(robot_command)
+    assisted_command['ee.x'] = float(assisted_command['ee.x'] + current_offset[0])
+    assisted_command['ee.y'] = float(assisted_command['ee.y'] + current_offset[1])
+    assisted_command['ee.z'] = float(assisted_command['ee.z'] + current_offset[2])
+    return assisted_command, {
+        'status': status,
+        'offset_xyz_m': current_offset,
+        'stuck_count': stuck_count,
+        'unassisted_delta_m': unassisted_delta_m,
+        'closed_gripper': closed_gripper,
+    }
+
+
+def apply_gripper_change_delay(
+    robot_command: dict[str, float],
+    robot_observation: RobotObservation,
+    latch_state: dict[str, float | None],
+    *,
+    delay_s: float | None,
+    min_delta: float,
+    settle_tolerance: float,
+    settle_timeout_s: float,
+) -> tuple[dict[str, float], dict[str, float | str]]:
+    desired = float(np.clip(robot_command['gripper.pos'], 0.0, 1.0))
+    observed = float(np.clip(float(robot_observation['gripper.pos']), 0.0, 1.0))
+    debug: dict[str, float | str] = {
+        'observed': observed,
+        'desired': desired,
+        'delta': abs(desired - observed),
+        'status': 'disabled',
+    }
+    if delay_s is None:
+        command = dict(robot_command)
+        command['gripper.pos'] = desired
+        debug['command'] = desired
+        debug['latched'] = desired
+        debug['latch_error'] = abs(observed - desired)
+        return command, debug
+
+    delay_s = max(0.0, float(delay_s))
+    min_delta = max(0.0, float(min_delta))
+    settle_tolerance = max(0.0, float(settle_tolerance))
+    settle_timeout_s = max(delay_s, float(settle_timeout_s))
+    latched = latch_state.get('command')
+    if latched is None:
+        latched = observed
+        latch_state['command'] = latched
+
+    latched = float(np.clip(float(latched), 0.0, 1.0))
+    last_change_time_s = latch_state.get('last_change_time_s')
+    now_s = time.perf_counter()
+    elapsed_s = float('inf') if last_change_time_s is None else now_s - float(last_change_time_s)
+    latch_error = abs(observed - latched)
+    debug['latched'] = latched
+    debug['latch_error'] = latch_error
+
+    if last_change_time_s is not None and elapsed_s < delay_s:
+        command = dict(robot_command)
+        command['gripper.pos'] = latched
+        debug['command'] = latched
+        debug['status'] = f'locked_discard:{delay_s - elapsed_s:.2f}s'
+        return command, debug
+
+    if last_change_time_s is not None and latch_error > settle_tolerance and elapsed_s < settle_timeout_s:
+        command = dict(robot_command)
+        command['gripper.pos'] = latched
+        debug['command'] = latched
+        debug['status'] = f'settling_discard:{settle_timeout_s - elapsed_s:.2f}s'
+        return command, debug
+
+    desired_delta_from_observed = abs(desired - observed)
+    desired_delta_from_latched = abs(desired - latched)
+    should_change = desired_delta_from_observed >= min_delta and desired_delta_from_latched >= 1e-6
+
+    if should_change:
+        latched = desired
+        latch_state['command'] = latched
+        latch_state['last_change_time_s'] = now_s
+        debug['status'] = 'change'
+    else:
+        debug['status'] = 'hold'
+
+    command = dict(robot_command)
+    command['gripper.pos'] = latched
+    debug['command'] = latched
+    return command, debug
 
 
 def should_reject_first_command(
@@ -1271,14 +2550,57 @@ def dump_step0_capture_bundle(
         'start_alignment_stats': _jsonify_value(start_alignment_stats),
         'policy_observation_files': observation_files,
         'policy_image_files': image_files,
-        'policy_observation_state': _jsonify_value(np.asarray(policy_observation['observation.state'], dtype=np.float64)),
         'robot_observation_scalars': _extract_numeric_observation_scalars(robot_observation),
         'absolute_state_observation_e_scalars': _extract_numeric_observation_scalars(absolute_state_observation_e),
         'absolute_state_observation_i_scalars': _extract_numeric_observation_scalars(absolute_state_observation_i),
         'dataset_state_observation_i_scalars': _extract_numeric_observation_scalars(dataset_state_observation_i),
     }
+    if 'observation.state' in policy_observation:
+        metadata['policy_observation_state'] = _jsonify_value(
+            np.asarray(policy_observation['observation.state'], dtype=np.float64)
+        )
+    else:
+        metadata['policy_observation_state'] = None
+        metadata['policy_observation_state_note'] = 'not present; policy appears to be image-only'
     (output_dir / 'metadata.json').write_text(json.dumps(_jsonify_value(metadata), indent=2), encoding='utf-8')
     return output_dir
+
+
+def dump_step0_action_debug(
+    output_dir: Path,
+    *,
+    action_names: list[str],
+    action_tensor: torch.Tensor,
+    dataset_robot_command_i: dict[str, float],
+    base_robot_command_i: dict[str, float],
+    robot_command: dict[str, float],
+    command_to_send: dict[str, float],
+    command_status: str,
+    position_delta: np.ndarray,
+    rotation_delta: np.ndarray,
+    clamped: bool,
+) -> None:
+    output_dir = _resolve_repo_path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    action_np = np.asarray(action_tensor.squeeze(0).detach().cpu().numpy(), dtype=np.float64)
+    payload = {
+        'action_names': list(action_names),
+        'action_values': {name: float(action_np[idx]) for idx, name in enumerate(action_names)},
+        'dataset_robot_command_i': _jsonify_value(dataset_robot_command_i),
+        'base_robot_command_i': _jsonify_value(base_robot_command_i),
+        'raw_robot_command_e': _jsonify_value(robot_command),
+        'safe_command_e': _jsonify_value(command_to_send),
+        'command_status': str(command_status),
+        'clamped': bool(clamped),
+        'position_delta_m': _jsonify_value(position_delta),
+        'position_delta_mm': _jsonify_value(np.asarray(position_delta, dtype=np.float64) * 1000.0),
+        'rotation_delta_rad': _jsonify_value(rotation_delta),
+        'rotation_delta_deg': _jsonify_value(np.rad2deg(rotation_delta)),
+    }
+    (output_dir / 'step0_action_debug.json').write_text(
+        json.dumps(_jsonify_value(payload), indent=2),
+        encoding='utf-8',
+    )
 
 
 def load_policy_stack(
@@ -1286,10 +2608,43 @@ def load_policy_stack(
     *,
     ds_meta: LeRobotDatasetMetadata,
     device: torch.device,
+    n_action_steps_override: int | None = None,
+    act_temporal_ensemble_coeff: float | None = None,
 ) -> tuple[Any, PolicyProcessorPipeline[dict[str, Any], dict[str, Any]], PolicyProcessorPipeline[PolicyAction, PolicyAction]]:
     policy_cfg = load_train_config(pretrained_dir).policy
     if policy_cfg is None:
         raise ValueError(f"No policy config found in {pretrained_dir / 'train_config.json'}")
+
+    if n_action_steps_override is not None:
+        n_action_steps = int(n_action_steps_override)
+        if n_action_steps <= 0:
+            raise ValueError('--policy-n-action-steps must be > 0 when provided.')
+        chunk_size = int(getattr(policy_cfg, 'chunk_size', n_action_steps))
+        if n_action_steps > chunk_size:
+            raise ValueError(
+                f'--policy-n-action-steps={n_action_steps} exceeds policy chunk_size={chunk_size}.'
+            )
+        old_n_action_steps = getattr(policy_cfg, 'n_action_steps', None)
+        policy_cfg.n_action_steps = n_action_steps
+        print(
+            '[INFO] policy_n_action_steps_override='
+            f'from={old_n_action_steps} to={n_action_steps} chunk_size={chunk_size}'
+        )
+
+    if act_temporal_ensemble_coeff is not None:
+        if not hasattr(policy_cfg, 'temporal_ensemble_coeff'):
+            raise ValueError('--act-temporal-ensemble-coeff is only supported by ACT-style policy configs.')
+        temporal_ensemble_coeff = float(act_temporal_ensemble_coeff)
+        chunk_size = int(getattr(policy_cfg, 'chunk_size', 1))
+        old_temporal_ensemble_coeff = getattr(policy_cfg, 'temporal_ensemble_coeff', None)
+        old_n_action_steps = getattr(policy_cfg, 'n_action_steps', None)
+        policy_cfg.temporal_ensemble_coeff = temporal_ensemble_coeff
+        policy_cfg.n_action_steps = 1
+        print(
+            '[INFO] act_temporal_ensemble_override='
+            f'coeff_from={old_temporal_ensemble_coeff} coeff_to={temporal_ensemble_coeff:.6g} '
+            f'n_action_steps_from={old_n_action_steps} n_action_steps_to=1 chunk_size={chunk_size}'
+        )
 
     policy_cfg.device = str(device)
     policy_cfg.pretrained_path = pretrained_dir
@@ -1307,12 +2662,22 @@ def run_inference(args: argparse.Namespace) -> int:
     pretrained_dir = resolve_pretrained_model_dir(args.checkpoint)
     train_cfg = load_train_config(pretrained_dir)
     dataset_root = resolve_dataset_root(pretrained_dir, train_cfg, args.dataset_root)
+    alignment_dataset_root, alignment_state_key = resolve_alignment_dataset_root_and_state_key(dataset_root)
     ds_meta = load_dataset_metadata(dataset_root, train_cfg.dataset.repo_id)
-    dataset_start_pose_contract_xyzquat, dataset_start_pose_stats = estimate_dataset_start_pose_contract(dataset_root)
+    dataset_start_pose_contract_xyzquat, dataset_start_pose_stats = estimate_dataset_start_pose_contract(
+        alignment_dataset_root,
+        state_key=alignment_state_key,
+    )
     camera_configs = load_camera_configs(args.camera_config)
     device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
 
-    policy, preprocessor, postprocessor = load_policy_stack(pretrained_dir, ds_meta=ds_meta, device=device)
+    policy, preprocessor, postprocessor = load_policy_stack(
+        pretrained_dir,
+        ds_meta=ds_meta,
+        device=device,
+        n_action_steps_override=args.policy_n_action_steps,
+        act_temporal_ensemble_coeff=args.act_temporal_ensemble_coeff,
+    )
     required_image_keys = extract_required_image_keys(policy.config.input_features)
     required_tactile_keys = extract_required_tactile_keys(policy.config.input_features)
     validate_camera_keys(required_image_keys=required_image_keys, available_camera_keys=list(camera_configs))
@@ -1327,8 +2692,34 @@ def run_inference(args: argparse.Namespace) -> int:
     max_step_pos_delta_m = float(args.max_step_pos_delta_mm) / 1000.0
     max_step_rot_delta_rad = np.deg2rad(float(args.max_step_rot_delta_deg))
     dataset_start_gripper_tolerance = float(args.dataset_start_gripper_tolerance)
-    state_names = extract_feature_names(ds_meta.features['observation.state'], _DEFAULT_STATE_NAMES)
+    state_names = (
+        extract_feature_names(ds_meta.features['observation.state'], _DEFAULT_STATE_NAMES)
+        if 'observation.state' in ds_meta.features
+        else []
+    )
     action_names = extract_feature_names(ds_meta.features['action'], _DEFAULT_ACTION_NAMES)
+    robot_init_state = parse_robot_init_state(args.robot_init_state)
+    mujoco_model_path = resolve_mujoco_model_path(args.gripper_backend, args.mujoco_model)
+    controller_stiffness = _parse_optional_float_tuple(
+        args.controller_stiffness,
+        expected_len=7,
+        argument_name='--controller-stiffness',
+    )
+    controller_damping = _parse_optional_float_tuple(
+        args.controller_damping,
+        expected_len=7,
+        argument_name='--controller-damping',
+    )
+    place_assist_offset_base_xyz = _parse_optional_float_tuple(
+        args.place_assist_offset_base_xyz,
+        expected_len=3,
+        argument_name='--place-assist-offset-base-xyz',
+    )
+    place_assist_offset_base_xyz_m = (
+        np.asarray(place_assist_offset_base_xyz, dtype=np.float64)
+        if place_assist_offset_base_xyz is not None
+        else None
+    )
 
     tactile_fallback_observation = build_tactile_fallback_observation(args.tactile_fallback)
     tactile_enabled = bool(required_tactile_keys) and tactile_fallback_observation is None
@@ -1337,10 +2728,16 @@ def run_inference(args: argparse.Namespace) -> int:
         gripper_port=args.gripper_port,
         gripper_backend=args.gripper_backend,
         allow_mock_gripper=False,
-        urdf_path=str(_DAS_URDF),
-        target_frame_name='das_gripper_ee',
+        urdf_path=str(_PIKA_URDF if args.gripper_backend == 'pika' else _DAS_URDF),
+        target_frame_name='pika_gripper_ee' if args.gripper_backend == 'pika' else 'das_gripper_ee',
         workspace_min=(0.1, -0.6, 0.05),
         workspace_max=(0.9, 0.6, 0.8),
+        stiffness=controller_stiffness,
+        damping=controller_damping,
+        filter_coeff=args.controller_filter_coeff,
+        use_otg=bool(args.use_otg),
+        otg_control_frequency=float(args.otg_control_frequency),
+        otg_async_control_frequency=float(args.otg_async_control_frequency),
         das_tactile_frequency_hz=policy_fps if tactile_enabled else None,
         das_tactile_valid_mask_path=str(_DEFAULT_TACTILE_VALID_MASK_PATH) if tactile_enabled else None,
         das_tactile_baseline_path=str(_DEFAULT_TACTILE_BASELINE_PATH) if tactile_enabled else None,
@@ -1348,7 +2745,10 @@ def run_inference(args: argparse.Namespace) -> int:
         cameras={name: cfg for name, cfg in camera_configs.items()},
     )
 
-    move_to_das_start_if_requested(robot_ip=args.robot_ip, enabled=bool(args.move_to_das_start))
+    if robot_init_state is not None and args.move_to_das_start:
+        print('[INFO] robot_init_state is set; skipping default move_to_das_start startup motion.')
+    else:
+        move_to_das_start_if_requested(robot_ip=args.robot_ip, enabled=bool(args.move_to_das_start))
 
     from lerobot.robots.franka_research3 import FrankaResearch3
 
@@ -1371,6 +2771,9 @@ def run_inference(args: argparse.Namespace) -> int:
 
     print(f'[INFO] checkpoint={pretrained_dir}')
     print(f'[INFO] dataset_root={dataset_root}')
+    if alignment_dataset_root != dataset_root:
+        print(f'[INFO] alignment_dataset_root={alignment_dataset_root}')
+    print(f'[INFO] alignment_state_key={alignment_state_key}')
     print(f'[INFO] policy_device={device}')
     print(f'[INFO] policy_fps={policy_fps:.3f}')
     print('[INFO] policy_image_keys=' + ', '.join(required_image_keys) if required_image_keys else '[INFO] policy_image_keys=<none>')
@@ -1397,7 +2800,8 @@ def run_inference(args: argparse.Namespace) -> int:
             f"{dataset_start_pose_stats['gripper_std']:.3f}"
         )
     print(dataset_start_spread_line)
-    print('[INFO] state_frame=absolute_pose(gripper_base_link) in dataset_world(W_s)')
+    print(f'[INFO] state_frame=absolute_pose({robot_cfg.target_frame_name}) in dataset_world(W_s)')
+    print('[INFO] tool_frame_transform=identity; no DAS gripper_base_link<->EE fixed transform is applied')
     print(
         '[INFO] safety='
         f'first_frame<{args.first_frame_max_pos_delta_mm:.1f}mm/{args.first_frame_max_rot_delta_deg:.1f}deg, '
@@ -1406,31 +2810,138 @@ def run_inference(args: argparse.Namespace) -> int:
     )
     print(
         '[INFO] joint-space smoothing='
+        f"{'enabled' if robot_cfg.use_otg else 'disabled'} "
         f'FR3 OTG @ {robot_cfg.otg_control_frequency:.1f}Hz / sender @ {robot_cfg.otg_async_control_frequency:.1f}Hz'
     )
+    print(
+        '[INFO] controller_gains='
+        f"stiffness={'set' if robot_cfg.stiffness is not None else 'default'} "
+        f"damping={'set' if robot_cfg.damping is not None else 'default'} "
+        f"filter_coeff={robot_cfg.filter_coeff if robot_cfg.filter_coeff is not None else 'default'}"
+    )
+    print(
+        '[INFO] gripper_close_below='
+        + ('disabled' if args.gripper_close_below is None else f'raw<{float(args.gripper_close_below):.6g}->0')
+    )
+    print(
+        '[INFO] gripper_change_delay='
+        + (
+            'disabled'
+            if args.gripper_change_delay_s is None
+            else f'{float(args.gripper_change_delay_s):.3f}s min_delta={float(args.gripper_change_min_delta):.3f} normalized'
+            f' settle_tol={float(args.gripper_change_settle_tolerance):.3f}'
+            f' settle_timeout={float(args.gripper_change_settle_timeout_s):.3f}s'
+        )
+    )
+    print(f'[INFO] act_temporal_action_offset={int(args.act_temporal_action_offset)}')
+    print(
+        '[INFO] act_temporal_stuck_offset='
+        + (
+            'disabled'
+            if args.act_temporal_stuck_max_offset is None
+            else (
+                f"base={int(args.act_temporal_action_offset)} "
+                f"max={int(args.act_temporal_stuck_max_offset)} "
+                f"step={int(args.act_temporal_stuck_offset_step)} "
+                f"stuck_steps={int(args.act_temporal_stuck_steps)} "
+                f"stuck_pos_delta={float(args.act_temporal_stuck_pos_delta_mm):.2f}mm "
+                f"closed_gripper_max={float(args.act_temporal_stuck_closed_gripper_max):.3f}"
+            )
+        )
+    )
+    print(
+        '[INFO] command_ema_alpha='
+        + ('disabled' if args.command_ema_alpha is None else f'{float(args.command_ema_alpha):.3f}')
+    )
+    print(
+        '[INFO] place_assist='
+        + (
+            'disabled'
+            if place_assist_offset_base_xyz_m is None
+            else (
+                f"offset_base_xyz_m=({place_assist_offset_base_xyz_m[0]:+.4f}, "
+                f"{place_assist_offset_base_xyz_m[1]:+.4f}, {place_assist_offset_base_xyz_m[2]:+.4f}) "
+                f"stuck_steps={int(args.place_assist_stuck_steps)} "
+                f"stuck_pos_delta={float(args.place_assist_stuck_pos_delta_mm):.2f}mm "
+                f"ramp_step={float(args.place_assist_ramp_step_mm):.2f}mm "
+                f"closed_gripper_max={float(args.place_assist_closed_gripper_max):.3f}"
+            )
+        )
+    )
+    print(
+        '[INFO] mujoco_viewer='
+        f"{'enabled' if args.mujoco_viewer else 'disabled'} model={mujoco_model_path}"
+    )
+    print(f"[INFO] camera_preview_window={'enabled' if args.camera_preview_window else 'disabled'}")
 
     if args.preview and args.align_gripper_to_dataset_start:
         print('[INFO] preview_gripper_alignment=requested; using virtual observation correction without moving hardware.')
+    if args.interactive_rollouts and robot_init_state is None:
+        print('[WARN] interactive_rollouts enabled without robot_init_state; rollout reset will hold the current robot state.')
 
+    mujoco_visualizer: FR3InferenceMujocoVisualizer | None = None
     robot.connect()
+    if args.mujoco_viewer:
+        mujoco_visualizer = FR3InferenceMujocoVisualizer(
+            model_path=mujoco_model_path,
+            max_chunk_points=args.mujoco_max_chunk_points,
+        )
+        mujoco_visualizer.start()
     if args.align_gripper_to_dataset_start and not args.preview:
         if dataset_start_gripper_mean_normalized is None:
-            raise ValueError('Dataset start states do not include gripper values; cannot auto-align gripper.')
-        align_gripper_to_dataset_start(
-            robot,
-            target_gripper_pos=float(dataset_start_gripper_mean_normalized),
-            tolerance=dataset_start_gripper_tolerance,
-        )
-    policy.reset()
-    state_processor.reset()
-    preprocessor.reset()
-    postprocessor.reset()
+            print(
+                '[WARN] align_gripper_to_dataset_start=fallback_open_gripper '
+                'reason=dataset_start_states_do_not_include_gripper_values target=1.000'
+            )
+            align_gripper_to_dataset_start(
+                robot,
+                target_gripper_pos=1.0,
+                tolerance=dataset_start_gripper_tolerance,
+            )
+        else:
+            align_gripper_to_dataset_start(
+                robot,
+                target_gripper_pos=float(dataset_start_gripper_mean_normalized),
+                tolerance=dataset_start_gripper_tolerance,
+            )
+    def reset_policy_runtime_state() -> None:
+        policy.reset()
+        state_processor.reset()
+        preprocessor.reset()
+        postprocessor.reset()
 
-    try:
+    def run_policy_rollout(interactive_keyboard: InteractiveRolloutKeyboard | None = None) -> str:
+        reset_policy_runtime_state()
+        T_B_Ws: np.ndarray | None = None
+        start_alignment_stats: dict[str, Any] | None = None
+        previous_dataset_quaternion_xyzw: np.ndarray | None = None
+        preview_gripper_offset: float | None = None
+        latest_chunk_ee_poses: list[np.ndarray] | None = None
+        camera_preview_enabled = bool(args.camera_preview_window)
+        previous_sent_command: dict[str, float] | None = None
+        previous_smoothed_command: dict[str, float] | None = None
+        gripper_latch_state: dict[str, float | None] = {'command': None, 'last_change_time_s': None}
+        place_assist_state: dict[str, Any] = {
+            'offset_xyz_m': np.zeros(3, dtype=np.float64),
+            'stuck_count': 0,
+        }
+        temporal_offset_state: dict[str, int] = {
+            'current_offset': max(int(args.act_temporal_action_offset), 0),
+            'stuck_count': 0,
+        }
         step_idx = 0
         while args.max_steps is None or step_idx < args.max_steps:
+            if interactive_keyboard is not None and interactive_keyboard.should_stop_rollout():
+                return 'quit' if interactive_keyboard.quit_requested.is_set() else 'stopped'
             loop_start_t = time.perf_counter()
             robot_observation = robot.get_observation()
+            previous_tracking_position_delta: np.ndarray | None = None
+            previous_tracking_rotation_delta: np.ndarray | None = None
+            if previous_sent_command is not None:
+                previous_tracking_position_delta, previous_tracking_rotation_delta = compute_pose_delta_from_current(
+                    previous_sent_command,
+                    robot_observation,
+                )
             absolute_state_observation_e = state_processor.observation(dict(robot_observation))
             absolute_state_observation_i = convert_absolute_observation_from_E_to_I(absolute_state_observation_e)
             live_gripper_dataset_units = denormalize_live_gripper_observation(
@@ -1441,9 +2952,10 @@ def run_inference(args: argparse.Namespace) -> int:
                 current_start_pose_i = _pose_from_quaternion_observation(absolute_state_observation_i)
                 T_B_Ws = current_start_pose_i @ _invert_pose(dataset_start_pose_contract)
                 start_alignment_stats = summarize_live_start_alignment_to_dataset_starts(
-                    dataset_root,
+                    alignment_dataset_root,
                     T_B_Ws,
                     current_start_pose_i,
+                    state_key=alignment_state_key,
                     live_gripper=live_gripper_dataset_units,
                 )
                 dataset_alignment_line = (
@@ -1522,6 +3034,11 @@ def run_inference(args: argparse.Namespace) -> int:
                 tactile_fallback_observation=tactile_fallback_observation,
                 camera_configs=camera_configs,
             )
+            if camera_preview_enabled:
+                camera_preview_enabled = show_policy_camera_preview_window(
+                    policy_observation,
+                    camera_keys=required_image_keys,
+                )
             if step_idx == 0 and args.debug_step0_dump_dir is not None:
                 if start_alignment_stats is None:
                     raise RuntimeError('start_alignment_stats must be initialized before step0 capture dump.')
@@ -1550,13 +3067,61 @@ def run_inference(args: argparse.Namespace) -> int:
                 use_amp=bool(policy.config.use_amp),
                 robot_type=robot.name,
             )
+            temporal_offset_used = int(temporal_offset_state.get('current_offset', int(args.act_temporal_action_offset)))
+            action_tensor = select_temporal_ensemble_offset_action(
+                action_tensor,
+                policy=policy,
+                postprocessor=postprocessor,
+                offset=temporal_offset_used,
+            )
+            model_gripper_raw = extract_action_gripper_raw(action_tensor, action_names)
+            if mujoco_visualizer is not None:
+                maybe_chunk_actions = extract_new_action_chunk_for_visualization(
+                    policy,
+                    action_tensor,
+                    postprocessor,
+                )
+                if maybe_chunk_actions is not None:
+                    latest_chunk_ee_poses = build_chunk_ee_poses_for_visualization(
+                        maybe_chunk_actions,
+                        action_names=action_names,
+                        robot_cfg=robot_cfg,
+                        T_B_Ws=T_B_Ws,
+                    )
             dataset_robot_command_i = decode_action_to_robot_command(
                 action_tensor,
                 action_names=action_names,
                 robot_cfg=robot_cfg,
+                gripper_close_below=args.gripper_close_below,
             )
             base_robot_command_i = convert_dataset_command_to_base_frame(dataset_robot_command_i, T_B_Ws)
             robot_command = convert_base_command_from_I_to_E(base_robot_command_i)
+            temporal_offset_debug = update_temporal_offset_on_stuck(
+                temporal_offset_state,
+                base_offset=int(args.act_temporal_action_offset),
+                max_offset=resolve_temporal_ensemble_max_offset(policy, args.act_temporal_stuck_max_offset),
+                offset_step=int(args.act_temporal_stuck_offset_step),
+                stuck_steps=int(args.act_temporal_stuck_steps),
+                stuck_pos_delta_m=float(args.act_temporal_stuck_pos_delta_mm) / 1000.0,
+                closed_gripper_max=float(args.act_temporal_stuck_closed_gripper_max),
+                unassisted_command=robot_command,
+                robot_observation=robot_observation,
+            )
+            robot_command, place_assist_debug = apply_place_assist_offset(
+                robot_command,
+                robot_observation,
+                place_assist_state,
+                target_offset_xyz_m=place_assist_offset_base_xyz_m,
+                stuck_steps=int(args.place_assist_stuck_steps),
+                stuck_pos_delta_m=float(args.place_assist_stuck_pos_delta_mm) / 1000.0,
+                ramp_step_m=float(args.place_assist_ramp_step_mm) / 1000.0,
+                closed_gripper_max=float(args.place_assist_closed_gripper_max),
+            )
+            robot_command = smooth_robot_command_ema(
+                robot_command,
+                previous_smoothed_command,
+                alpha=args.command_ema_alpha,
+            )
             safe_command, position_delta, rotation_delta, clamped = clamp_command_relative_to_current(
                 robot_command,
                 robot_observation,
@@ -1583,8 +3148,52 @@ def run_inference(args: argparse.Namespace) -> int:
             if command_status == 'pass' and clamped:
                 command_status = 'clamped'
 
+            gripper_command_before_latch = float(command_to_send['gripper.pos'])
+            command_to_send, gripper_latch_debug = apply_gripper_change_delay(
+                command_to_send,
+                robot_observation,
+                gripper_latch_state,
+                delay_s=args.gripper_change_delay_s,
+                min_delta=float(args.gripper_change_min_delta),
+                settle_tolerance=float(args.gripper_change_settle_tolerance),
+                settle_timeout_s=float(args.gripper_change_settle_timeout_s),
+            )
+
+            previous_smoothed_command = dict(command_to_send)
+
+            if mujoco_visualizer is not None:
+                current_ee_pose = _pose_from_quaternion_observation(absolute_state_observation_e)
+                target_ee_pose = _pose_from_rotvec_command(robot_command)
+                safe_target_ee_pose = _pose_from_rotvec_command(command_to_send)
+                mujoco_visualizer.update(
+                    robot_observation=robot_observation,
+                    current_ee_pose=current_ee_pose,
+                    target_ee_pose=target_ee_pose,
+                    safe_target_ee_pose=safe_target_ee_pose,
+                    chunk_ee_poses=latest_chunk_ee_poses,
+                )
+
+            if step_idx == 0 and args.debug_step0_dump_dir is not None:
+                dump_step0_action_debug(
+                    args.debug_step0_dump_dir,
+                    action_names=action_names,
+                    action_tensor=action_tensor,
+                    dataset_robot_command_i=dataset_robot_command_i,
+                    base_robot_command_i=base_robot_command_i,
+                    robot_command=robot_command,
+                    command_to_send=command_to_send,
+                    command_status=command_status,
+                    position_delta=position_delta,
+                    rotation_delta=rotation_delta,
+                    clamped=clamped,
+                )
+
+            if interactive_keyboard is not None and interactive_keyboard.should_stop_rollout():
+                return 'quit' if interactive_keyboard.quit_requested.is_set() else 'stopped'
+
             if not args.preview:
                 robot.send_action(command_to_send)
+                previous_sent_command = dict(command_to_send)
 
             if args.preview or command_status != 'pass' or step_idx % max(args.log_interval, 1) == 0:
                 log_message = (
@@ -1593,7 +3202,29 @@ def run_inference(args: argparse.Namespace) -> int:
                     + f"status={command_status} "
                     + f"raw_ee=({robot_command['ee.x']:.4f}, {robot_command['ee.y']:.4f}, {robot_command['ee.z']:.4f}) "
                     + f"safe_ee=({command_to_send['ee.x']:.4f}, {command_to_send['ee.y']:.4f}, {command_to_send['ee.z']:.4f}) "
-                    + f"gripper={command_to_send['gripper.pos']:.3f}"
+                    + f"model_gripper_raw={model_gripper_raw:.2f} "
+                    + f"gripper_obs={float(gripper_latch_debug['observed']):.3f} "
+                    + f"gripper_des={gripper_command_before_latch:.3f} "
+                    + f"gripper_cmd={command_to_send['gripper.pos']:.3f} "
+                    + f"gripper_latched={float(gripper_latch_debug['latched']):.3f} "
+                    + f"gripper_latch_err={float(gripper_latch_debug['latch_error']):.3f} "
+                    + f"gripper_latch={gripper_latch_debug['status']}"
+                    + (
+                        ''
+                        if args.act_temporal_stuck_max_offset is None
+                        else (
+                            f" temporal_offset={temporal_offset_used}->{int(temporal_offset_debug['current_offset'])} "
+                            f"temporal_offset_status={temporal_offset_debug['status']}"
+                        )
+                    )
+                    + (
+                        ''
+                        if place_assist_offset_base_xyz_m is None
+                        else (
+                            f" place_assist={place_assist_debug['status']} "
+                            f"place_assist_xyz_mm=({_format_vector(np.asarray(place_assist_debug['offset_xyz_m']), scale=1000.0)})"
+                        )
+                    )
                     + (
                         ''
                         if command_status == 'hold_first_frame'
@@ -1603,14 +3234,52 @@ def run_inference(args: argparse.Namespace) -> int:
                         )
                     )
                 )
+                if previous_tracking_position_delta is not None and previous_tracking_rotation_delta is not None:
+                    log_message += (
+                        f" prev_cmd_err_mm={np.linalg.norm(previous_tracking_position_delta) * 1000.0:.2f} "
+                        f"prev_cmd_err_rot_deg={np.linalg.norm(np.rad2deg(previous_tracking_rotation_delta)):.2f}"
+                    )
                 print(log_message)
 
             elapsed_s = time.perf_counter() - loop_start_t
             precise_sleep(max(1.0 / policy_fps - elapsed_s, 0.0))
             step_idx += 1
+        return 'completed'
+
+    interactive_keyboard: InteractiveRolloutKeyboard | None = None
+    try:
+        if args.interactive_rollouts:
+            interactive_keyboard = InteractiveRolloutKeyboard(
+                start_key=args.rollout_start_key,
+                stop_key=args.rollout_stop_key,
+                quit_key=args.rollout_quit_key,
+            )
+            interactive_keyboard.start()
+            rollout_index = 0
+            while not interactive_keyboard.quit_requested.is_set():
+                move_to_robot_init_state_if_requested(robot, robot_init_state)
+                should_start = interactive_keyboard.wait_for_start_or_quit()
+                if not should_start:
+                    break
+                rollout_index += 1
+                print(f'[INFO] interactive_rollout_start index={rollout_index}')
+                rollout_status = run_policy_rollout(interactive_keyboard)
+                print(f'[INFO] interactive_rollout_end index={rollout_index} status={rollout_status}')
+                if rollout_status == 'quit':
+                    break
+            print('[INFO] interactive_rollouts=stopped')
+        else:
+            move_to_robot_init_state_if_requested(robot, robot_init_state)
+            run_policy_rollout()
     except KeyboardInterrupt:
         print('[INFO] KeyboardInterrupt received, stopping inference loop.')
     finally:
+        if interactive_keyboard is not None:
+            interactive_keyboard.close()
+        if mujoco_visualizer is not None:
+            mujoco_visualizer.close()
+        if args.camera_preview_window:
+            close_camera_preview_window()
         robot.disconnect()
 
     return 0
