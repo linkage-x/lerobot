@@ -35,13 +35,14 @@ SOFTWARE.
 """,
     install_requires=[
         "numpy",
-        "opencv-python",
         "pyserial",
-        "pyrealsense2",
-        "pysurvive",
-        "wxpython",
-        "Gooey"
     ],
+    extras_require={
+        "camera": ["opencv-python", "pyrealsense2"],
+        "tracker": ["pysurvive"],
+        "ui": ["Gooey", "wxpython"],
+        "all": ["opencv-python", "pyrealsense2", "pysurvive", "Gooey", "wxpython"],
+    },
     platforms=['Linux'],
     classifiers=[
         "Intended Audience :: Developers",

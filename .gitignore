@@ -173,9 +173,6 @@ outputs/
 
 # Dev folders
 .cache/*
-*.stl
-*.urdf
-*.xml
 *.part
 !src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_ati.xml
 !src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_ati_scene.xml
@@ -192,3 +189,5 @@ core
 
 tools/thor/gmsl2/records
 tools/thor/gmsl2/captures
+dataset_test/
+*.zip

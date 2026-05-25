@@ -33,6 +33,7 @@ x-lerobot-common: &lerobot-common
     - ${HOME}/.cache/torch:/home/user_lerobot/.cache/torch
     - ${HOME}/.cache/triton:/home/user_lerobot/.cache/triton
     - ${HOME}/.config/libsurvive:/home/user_lerobot/.config/libsurvive
+    - /opt/MVS:/opt/MVS:ro
     - /tmp/.X11-unix:/tmp/.X11-unix
     - ${HOME}/.Xauthority:/root/.Xauthority:ro
     - /sys/bus/usb:/sys/bus/usb:ro

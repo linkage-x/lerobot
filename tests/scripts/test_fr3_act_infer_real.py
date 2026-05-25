@@ -116,6 +116,53 @@ def test_build_docker_command_can_disable_default_startup_actions(tmp_path: Path
     assert '--no-align-gripper-to-dataset-start' in command_text
 
 
+def test_build_docker_command_passes_robot_init_state(tmp_path: Path):
+    args = fr3_act_infer_real.parse_args(
+        [
+            '--workspace',
+            str(tmp_path),
+            '--checkpoint=/lerobot/outputs/train/2026-03-19/10-48-39_act/checkpoints/060000',
+            '--camera-config=/lerobot/tools/fr3/fr3_act_infer_camera_config.yaml',
+            '--robot-init-state',
+            'joints=0,0,0,0,0,0,0',
+        ]
+    )
+
+    command_text = ' '.join(fr3_act_infer_real.build_docker_command(args))
+
+    assert '--robot-init-state=joints=0,0,0,0,0,0,0' in command_text
+
+
+def test_build_docker_command_passes_mujoco_viewer_model(tmp_path: Path):
+    model_path = tmp_path / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.xml'
+    model_path.parent.mkdir(parents=True)
+    model_path.write_text('<mujoco/>', encoding='utf-8')
+    args = fr3_act_infer_real.parse_args(
+        [
+            '--workspace',
+            str(tmp_path),
+            '--checkpoint=/lerobot/outputs/train/2026-03-19/10-48-39_act/checkpoints/060000',
+            '--camera-config=/lerobot/tools/fr3/fr3_act_infer_camera_config.yaml',
+            '--mujoco-viewer',
+            '--mujoco-model',
+            str(model_path.relative_to(tmp_path)),
+            '--mujoco-max-chunk-points',
+            '24',
+        ]
+    )
+
+    command_text = ' '.join(fr3_act_infer_real.build_docker_command(args))
+
+    assert '--mujoco-viewer' in command_text
+    assert '--mujoco-model=/workspace/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.xml' in command_text
+    assert '--mujoco-max-chunk-points=24' in command_text
+
+
+def test_resolve_mujoco_model_path_uses_gripper_backend_defaults():
+    assert fr3_act_infer_real_runtime.resolve_mujoco_model_path('das', None) == fr3_act_infer_real_runtime._DAS_XML
+    assert fr3_act_infer_real_runtime.resolve_mujoco_model_path('pika', None) == fr3_act_infer_real_runtime._PIKA_XML
+
+
 def test_main_returns_subprocess_exit_code(monkeypatch):
     calls = []
 
@@ -157,6 +204,36 @@ def test_move_to_das_start_if_requested_calls_integrated_helper(monkeypatch):
         ('connect', '192.168.1.208'),
         ('move', fr3_act_infer_real_runtime._DAS_START_JOINTS_RAD.tolist()),
     ]
+
+
+def test_parse_robot_init_state_shorthand_joints():
+    parsed = fr3_act_infer_real_runtime.parse_robot_init_state('joints=0,1,2,3,4,5,6')
+
+    assert parsed is not None
+    assert parsed['type'] == 'joints'
+    assert parsed['joints_rad'] == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert parsed['timeout_s'] == 20.0
+
+
+def test_parse_robot_init_state_yaml_file(tmp_path: Path):
+    init_path = tmp_path / 'init.yaml'
+    init_path.write_text(
+        """robot_init_state:
+  type: ee_xyzquat
+  xyzquat: [0.4, 0.0, 0.3, 0.0, 0.0, 0.0, 1.0]
+  gripper: 0.25
+  timeout_s: 3
+""",
+        encoding='utf-8',
+    )
+
+    parsed = fr3_act_infer_real_runtime.parse_robot_init_state(str(init_path))
+
+    assert parsed is not None
+    assert parsed['type'] == 'ee_xyzquat'
+    assert parsed['xyzquat'] == [0.4, 0.0, 0.3, 0.0, 0.0, 0.0, 1.0]
+    assert parsed['gripper'] == 0.25
+    assert parsed['timeout_s'] == 3.0
 
 
 def test_extract_required_image_keys():
@@ -329,6 +406,39 @@ def test_build_policy_observation_supports_prev_cmd_state_names():
         observation['observation.state'],
         [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0, 0.4, 0.11, 0.22, 0.33, 0.0, 0.0, 0.0, 1.0, 0.5],
     )
+
+
+def test_build_policy_observation_supports_prefixed_training_state_names():
+    input_features = {
+        'observation.state': PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+    }
+    state_observation = {
+        'ee.x': 0.1,
+        'ee.y': 0.2,
+        'ee.z': 0.3,
+        'ee.qx': 0.0,
+        'ee.qy': 0.0,
+        'ee.qz': 0.0,
+        'ee.qw': 1.0,
+        'gripper.pos': 61.0,
+    }
+
+    observation = fr3_act_infer_real_runtime.build_policy_observation(
+        state_observation,
+        state_names=[
+            'observation.state.right.ee.x',
+            'observation.state.right.ee.y',
+            'observation.state.right.ee.z',
+            'observation.state.right.ee.qx',
+            'observation.state.right.ee.qy',
+            'observation.state.right.ee.qz',
+            'observation.state.right.ee.qw',
+            'observation.state_raw.handheld_gripper.pika_left.width_mm',
+        ],
+        input_features=input_features,
+    )
+
+    assert np.allclose(observation['observation.state'], [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0, 61.0])
 
 
 def test_build_policy_observation_normalizes_bgr_hikrobot_frames_to_rgb():

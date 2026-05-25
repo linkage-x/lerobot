@@ -219,6 +219,26 @@ all = [
     "lerobot[peft]",
     # "lerobot[unitree_g1]", TODO: Unitree requires specific installation instructions for unitree_sdk2
 ]
+cv2-gui = [
+    "opencv-python>=4.9.0,<4.13.0",
+]
+fr3-host = [
+    "lerobot[kinematics]",
+    "cffi>=1.17.0,<3.0.0 ; python_version < '3.15'",
+    "cmeel-tinyxml2==10.0.0 ; python_version < '3.15'",
+    "cmeel-urdfdom==4.0.1 ; python_version < '3.15'",
+    "easyhid>=0.0.10,<0.1.0 ; python_version < '3.15'",
+    "mujoco>=3.2.7,<4.0.0 ; python_version < '3.15'",
+    "opencv-python>=4.9.0,<4.13.0 ; python_version < '3.15'",
+    "panda-python==0.8.1 ; python_version < '3.15'",
+    "pika-sdk ; python_version < '3.15'",
+    "pyspacemouse>=2.0.0,<3.0.0 ; python_version < '3.15'",
+    "ruckig>=0.15.0,<0.16.0 ; python_version < '3.15'",
+]
+
+[tool.uv.sources]
+panda-python = { git = "https://github.com/linkage-x/panda-py.git", rev = "47c304f9b8147ae7582dcfe8a97af554c363021d" }
+pika-sdk = { path = "third_party/pika_sdk" }
 
 [project.scripts]
 lerobot-calibrate="lerobot.scripts.lerobot_calibrate:main"
@@ -229,6 +249,7 @@ lerobot-replay="lerobot.scripts.lerobot_replay:main"
 lerobot-setup-motors="lerobot.scripts.lerobot_setup_motors:main"
 lerobot-teleoperate="lerobot.scripts.lerobot_teleoperate:main"
 lerobot-eval="lerobot.scripts.lerobot_eval:main"
+lerobot-eval-offline="lerobot.scripts.lerobot_eval_offline:main"
 lerobot-train="lerobot.scripts.lerobot_train:main"
 lerobot-train-tokenizer="lerobot.scripts.lerobot_train_tokenizer:main"
 lerobot-dataset-viz="lerobot.scripts.lerobot_dataset_viz:main"

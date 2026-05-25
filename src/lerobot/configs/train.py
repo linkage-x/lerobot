@@ -79,6 +79,10 @@ class TrainPipelineConfig(HubMixin):
 
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    # Optional visual logging for offline IL debugging. When > 0, sample this many training steps
+    # uniformly and log raw batch observation images to WandB.
+    wandb_log_images_n_steps: int = 0
+    wandb_log_images_n_samples: int = 2
     checkpoint_path: Path | None = field(init=False, default=None)
 
     def validate(self) -> None:
@@ -136,7 +140,8 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")
         elif self.use_policy_training_preset and not self.resume:
             self.optimizer = self.policy.get_optimizer_preset()
-            self.scheduler = self.policy.get_scheduler_preset()
+            if self.scheduler is None:
+                self.scheduler = self.policy.get_scheduler_preset()
 
         if self.policy.push_to_hub and not self.policy.repo_id:
             raise ValueError(
