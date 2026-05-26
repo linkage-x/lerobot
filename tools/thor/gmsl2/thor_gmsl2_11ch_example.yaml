@@ -32,7 +32,7 @@ sensors:
     detect_all: true
     sensor_ids: []        # only used when detect_all is false
     name_prefix: "cam"    # produces cam_00, cam_01, ... in the dataset
-    spawn_stagger_s: 0.0  # delay between gst-launch opens; override for Argus diagnostics
+    spawn_stagger_s: 1.0  # 11 concurrent nvarguscamerasrc inits race on NVMM buffers; 1s stagger avoids NvBufSurfaceFromFd failures
     stop_on_stream_exit: true  # set false/--ignore-stream-exit for diagnostics only
 
     # Per-camera capture/encoding defaults. nvarguscamerasrc handles ISP +

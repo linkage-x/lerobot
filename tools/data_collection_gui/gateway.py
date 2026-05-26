@@ -376,7 +376,28 @@ _BOX_COLLECTION_DEVICE_LABELS: dict[str, str] = {
 }
 
 
-def _device_statuses(config: dict[str, Any]) -> list[dict[str, Any]]:
+def _detect_locked_sids(repo_root: Path | None) -> list[int] | None:
+    if repo_root is None:
+        return None
+    script = repo_root / "tools" / "thor" / "gmsl2" / "check_max96726_locks.sh"
+    if not script.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [str(script)], capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode not in (0, 1):
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("LOCKED_VIDEO_IDS="):
+            csv = line.split("=", 1)[1].strip()
+            return [int(x) for x in csv.split(",") if x.strip()] if csv else []
+    return None
+
+
+def _device_statuses(config: dict[str, Any], repo_root: Path | None = None) -> list[dict[str, Any]]:
     sensors = config.get("sensors") or {}
     if not isinstance(sensors, dict):
         sensors = {}
@@ -384,10 +405,6 @@ def _device_statuses(config: dict[str, Any]) -> list[dict[str, Any]]:
     devices: list[dict[str, Any]] = []
     cameras_section = sensors.get("cameras")
 
-    # GMSL2 11-channel rig: `cameras` is a flat config block (not a mapping
-    # of device-id to device) and the sensor_id list is detected at connect
-    # time. Surface the configured slots up front so the GUI shows what to
-    # expect; the recorder then narrows to `usable` via the "Cameras:" line.
     if isinstance(cameras_section, dict) and "defaults" in cameras_section:
         defaults = cameras_section.get("defaults") if isinstance(cameras_section.get("defaults"), dict) else {}
         prefix = str(cameras_section.get("name_prefix") or "cam")
@@ -396,7 +413,11 @@ def _device_statuses(config: dict[str, Any]) -> list[dict[str, Any]]:
         if sensor_ids:
             slot_ids = [int(x) for x in sensor_ids]
         elif detect_all:
-            slot_ids = list(range(16))  # MAX96726 has up to 16 logical sids
+            locked = _detect_locked_sids(repo_root)
+            if locked is not None:
+                slot_ids = locked
+            else:
+                slot_ids = list(range(16))
         else:
             slot_ids = []
         for sid in slot_ids:
@@ -2873,7 +2894,7 @@ def _stop_recorder(state: GatewayState, action: str) -> None:
 
     if action == "save":
         try:
-            _write_recorder_stdin(process, "s\n" if state.recording.state == "recording" else "y\n")
+            _write_recorder_stdin(process, "save\n")
             state.recording.state = "saving"
             state.recording.message = "Save requested; waiting for next episode"
             state.log("info", "Requested recorder save")
@@ -3142,7 +3163,7 @@ def make_state(repo_root: Path, config_path: Path, datasets_root: Path | None = 
         recording=_recording_status_from_config(config),
         replay=_replay_status_from_config(config),
         datasets_root=resolved_datasets_root,
-        devices=_device_statuses(config),
+        devices=_device_statuses(config, resolved_root),
     )
     state.replay.mujocoValidation = _new_mujoco_validation(state)
     state.log("info", f"Loaded handheld config {resolved_config}")

@@ -202,3 +202,4 @@ PYTHONPATH=src:tools/fr3:. python tools/fr3/fr3_sim_replay_validate_joint_target
 - Relative dataset paths are resolved from the repository root.
 - Host DISPLAY/X11 is used for MuJoCo viewer paths inside the Docker launcher.
 - Real Robot replay is intentionally stricter than Preflight/Dry Run: MuJoCo is recommended for the latter two, but required for Real Robot.
+- Connect on the 11-camera GMSL2 rig takes ~10 seconds because `spawn_stagger_s: 1.0` — this is required to avoid Argus ISP NVMM buffer allocation races that corrupt MKV output.

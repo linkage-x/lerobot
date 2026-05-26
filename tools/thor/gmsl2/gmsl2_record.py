@@ -194,7 +194,8 @@ def detect_locked_sids(cfg: RecorderConfig, repo_root: Path) -> list[int]:
     raise RuntimeError("lock-check script did not emit LOCKED_VIDEO_IDS=")
 
 
-def probe_argus(sids: list[int], width: int, height: int, fps: int) -> tuple[list[int], list[int]]:
+def probe_argus(sids: list[int], width: int, height: int, fps: int,
+                timeout_s: float = 8) -> tuple[list[int], list[int]]:
     """For each sid, try a tiny nvarguscamerasrc capture. Returns (ok, fail)."""
     ok: list[int] = []
     fail: list[int] = []
@@ -209,17 +210,21 @@ def probe_argus(sids: list[int], width: int, height: int, fps: int) -> tuple[lis
             "!", caps,
             "!", "fakesink", "sync=false", "async=false",
         ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+            stdout, _ = proc.communicate(timeout=timeout_s)
         except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
             fail.append(sid)
-            logger.warning("sid=%s argus probe timed out", sid)
+            logger.warning("sid=%s argus probe timed out (killed pid %s)", sid, proc.pid)
             continue
-        if r.returncode == 0:
+        if proc.returncode == 0:
             ok.append(sid)
         else:
             fail.append(sid)
-            tail = (r.stderr or r.stdout).strip().splitlines()[-1:][:1]
+            tail = (stdout or "").strip().splitlines()[-1:][:1]
             logger.warning("sid=%s argus probe failed: %s",
                            sid, tail[0][:120] if tail else "no output")
     return ok, fail

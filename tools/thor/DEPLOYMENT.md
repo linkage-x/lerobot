@@ -200,7 +200,49 @@ bash ~/lerobot/run/run_vite.sh &
 # 开发机访问 http://<jetson-ip>:5173/
 ```
 
-## 8. 已知问题（部署完成不代表能用）
+## 8. 本地开发 → Thor 同步
+
+开发机改完代码后用 rsync 同步到 Thor：
+
+```bash
+bash run/sync_to_thor.sh            # 增量同步 (~1s)
+bash run/sync_to_thor.sh --dry-run  # 预览
+```
+
+脚本自动排除 `.git/`、`node_modules/`、`__pycache__/`、`outputs/` 等。
+同步后在 Thor 上重启 gateway：
+
+```bash
+ssh nvidia@192.168.111.122
+pkill -f "tools.data_collection_gui.gateway"; sleep 1
+cd ~/lerobot && PYTHONPATH=src:. PYTHONUNBUFFERED=1 \
+  setsid python3 -m tools.data_collection_gui.gateway \
+  --config-path tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml \
+  --datasets-root outputs/datasets --port 8765 --host 0.0.0.0 \
+  </dev/null >/tmp/gateway.log 2>&1 &
+```
+
+本地前端 vite 代理默认指向 `http://192.168.111.122:8765`，改完代码
+`npm run dev` 即可连到 Thor 上的 gateway。
+
+## 9. 已知问题与已修复的坑
+
+### 已修复（2026-05-26）
+
+* **11 路同时启动 NvBufSurfaceFromFd Failed**：11 路 nvarguscamerasrc
+  同时初始化时 Argus ISP 内部 NVMM buffer 分配竞争导致大部分管道在
+  几秒内自行 EOS 退出，产出空 MKV（336 字节头）。**修复**：YAML
+  `spawn_stagger_s: 0.0` → `1.0`，错开 1 秒启动后 11/11 路全部正常
+  录制。Connect 多花 ~10 秒是预期行为。
+* **Save 按钮不停止录制**：gateway 发 `"s\n"` 给 recorder stdin，但
+  thor_record.py 只认 `"save"` / `"y"` / `"yes"`。`"s"` 被忽略。
+  **修复**：改为发 `"save\n"`。
+* **probe_argus 超时后 gst-launch 僵尸进程**：`subprocess.run(timeout=8)`
+  超时只抛异常不杀子进程，gst-launch 变成孤儿占住 Argus 资源，后续
+  所有同 sensor-id 的 probe 也会超时。**修复**：改用 `Popen` +
+  `proc.kill()` + `proc.wait()`。
+
+### 仍存在
 
 * **BOX 采集板传感器流上行**：`Box()` 起得来、`set_mode` ACK、夹爪可动，
   但 `get_sensor_cache` 一直返回 rc=4 / no cached sensor data。供应商已确认
