@@ -518,7 +518,10 @@ def _resolve_dataset_root(repo_root: Path, raw_root: str | Path | None) -> Path 
 
 
 def _dataset_data_files(dataset_root: Path) -> list[Path]:
-    return sorted((dataset_root / "data").glob("chunk-*/*.parquet"))
+    parquets = sorted((dataset_root / "data").glob("chunk-*/*.parquet"))
+    if parquets:
+        return parquets
+    return sorted((dataset_root / "episodes").glob("episode_*/*.mkv"))
 
 
 def _path_modified_s(path: Path) -> float:
@@ -529,7 +532,9 @@ def _path_modified_s(path: Path) -> float:
 
 
 def _dataset_modified_s(dataset_root: Path) -> float:
-    candidates = [dataset_root, dataset_root / "meta" / "info.json", *_dataset_data_files(dataset_root)]
+    candidates = [dataset_root, dataset_root / "meta" / "info.json", dataset_root / "episodes"]
+    data_files = _dataset_data_files(dataset_root)
+    candidates.extend(data_files[:5])
     return max((_path_modified_s(path) for path in candidates), default=0.0)
 
 
@@ -541,8 +546,15 @@ def _dataset_name_prefixes(name: str) -> set[str]:
     return prefixes
 
 
+def _has_gmsl2_episodes(path: Path) -> bool:
+    eps_dir = path / "episodes"
+    if not eps_dir.is_dir():
+        return False
+    return any(eps_dir.glob("episode_*/meta.json"))
+
+
 def _is_dataset_root(path: Path) -> bool:
-    return path.is_dir() and (path / "meta" / "info.json").is_file()
+    return path.is_dir() and ((path / "meta" / "info.json").is_file() or _has_gmsl2_episodes(path))
 
 
 def _scan_datasets_root(state: GatewayState) -> list[Path]:
@@ -829,6 +841,9 @@ def _recorded_dataset_status(dataset_root: Path) -> str:
     data_files = _dataset_data_files(dataset_root)
     if not data_files:
         return "missing"
+    if data_files[0].suffix == ".mkv":
+        valid = sum(1 for f in data_files if f.stat().st_size > 1024)
+        return "loaded" if valid > 0 else "empty"
     has_empty_file = False
     for data_file in data_files:
         try:
@@ -873,8 +888,11 @@ def _load_processing_meta(dataset_root: Path) -> dict[str, Any] | None:
 def _processing_item_from_dataset(dataset_root: Path) -> dict[str, Any]:
     info = _load_dataset_info(dataset_root)
     modified_s = _dataset_modified_s(dataset_root)
-    total_episodes = int(info.get("total_episodes") or 0)
-    total_frames = int(info.get("total_frames") or 0)
+    if _has_gmsl2_episodes(dataset_root):
+        total_episodes, total_frames = _gmsl2_dataset_stats(dataset_root)
+    else:
+        total_episodes = int(info.get("total_episodes") or 0)
+        total_frames = int(info.get("total_frames") or 0)
     base_item = {
         "path": str(dataset_root),
         "name": dataset_root.name,
@@ -947,6 +965,11 @@ def _processing_item_from_dataset(dataset_root: Path) -> dict[str, Any]:
 
 
 def _dataset_is_complete(dataset_root: Path) -> bool:
+    if _has_gmsl2_episodes(dataset_root):
+        return any(
+            f.stat().st_size > 1024
+            for f in (dataset_root / "episodes").glob("episode_*/*.mkv")
+        )
     info = _load_dataset_info(dataset_root)
     if not info:
         return False
@@ -1520,20 +1543,53 @@ def _queue_traj_gen(_state: GatewayState, dataset_root: Path) -> None:
     raise NotImplementedError(f"待实现：Generate EE Trajectory 功能尚未接入，dataset={dataset_root}")
 
 
+def _gmsl2_episode_dirs(dataset_root: Path) -> list[Path]:
+    eps_dir = dataset_root / "episodes"
+    if not eps_dir.is_dir():
+        return []
+    return sorted(
+        (d for d in eps_dir.iterdir() if d.is_dir() and d.name.startswith("episode_")),
+        key=lambda p: p.name,
+    )
+
+
+def _gmsl2_dataset_stats(dataset_root: Path) -> tuple[int, int]:
+    ep_dirs = _gmsl2_episode_dirs(dataset_root)
+    total_frames = 0
+    for ep_dir in ep_dirs:
+        meta_path = ep_dir / "meta.json"
+        if meta_path.is_file():
+            try:
+                with meta_path.open() as f:
+                    ep_meta = json.load(f)
+                dur = float(ep_meta.get("duration_s") or 0)
+                fps = int(ep_meta.get("video", {}).get("fps") or 60)
+                total_frames += int(dur * fps)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+    return len(ep_dirs), total_frames
+
+
 def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for index, dataset_root in enumerate(_complete_dataset_candidates(state)):
         info = _load_dataset_info(dataset_root)
         data_files = _dataset_data_files(dataset_root)
         modified_s = _dataset_modified_s(dataset_root)
+        is_gmsl2 = _has_gmsl2_episodes(dataset_root)
+        if is_gmsl2:
+            total_episodes, total_frames = _gmsl2_dataset_stats(dataset_root)
+        else:
+            total_episodes = int(info.get("total_episodes") or 0)
+            total_frames = int(info.get("total_frames") or 0)
         items.append(
             {
                 "path": str(dataset_root),
                 "name": dataset_root.name,
                 "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(modified_s)) if modified_s else "",
                 "updatedAtMs": int(modified_s * 1000),
-                "totalEpisodes": int(info.get("total_episodes") or 0),
-                "totalFrames": int(info.get("total_frames") or 0),
+                "totalEpisodes": total_episodes,
+                "totalFrames": total_frames,
                 "dataStatus": _recorded_dataset_status(dataset_root),
                 "sourcePath": str(data_files[-1]) if data_files else "",
                 "isLatest": index == 0,
