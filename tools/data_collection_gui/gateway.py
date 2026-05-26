@@ -2054,12 +2054,36 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
     }
 
 
+def _remux_mkv_to_mp4(mkv_path: Path) -> Path | None:
+    mp4_path = mkv_path.with_suffix(".mp4")
+    if mp4_path.is_file() and mp4_path.stat().st_mtime >= mkv_path.stat().st_mtime:
+        return mp4_path
+    cmd = [
+        "gst-launch-1.0", "-q",
+        "filesrc", f"location={mkv_path}",
+        "!", "matroskademux",
+        "!", "h265parse",
+        "!", "nvv4l2decoder",
+        "!", "nvv4l2h264enc", "bitrate=10000000",
+        "!", "h264parse",
+        "!", "mp4mux", "faststart=true",
+        "!", "filesink", f"location={mp4_path}",
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=60)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return mp4_path if mp4_path.is_file() else None
+
+
 def _resolve_video_path(state: GatewayState, dataset_root: Path, camera_key: str) -> Path | None:
     if _has_gmsl2_episodes(dataset_root):
         episode = int(state.replay.episode or 0)
         ep_dir = dataset_root / "episodes" / f"episode_{episode:06d}"
         mkv = ep_dir / f"{camera_key}.mkv"
-        return mkv if mkv.is_file() else None
+        if not mkv.is_file():
+            return None
+        return _remux_mkv_to_mp4(mkv) or mkv
     info = _load_dataset_info(dataset_root)
     template = str(info.get("video_path") or "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
     relative = template.format(video_key=camera_key, chunk_index=0, file_index=0)

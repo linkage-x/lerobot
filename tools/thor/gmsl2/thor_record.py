@@ -187,11 +187,13 @@ def main(argv: list[str] | None = None) -> int:
 
     _emit(f"Dataset root: {cfg.dataset_root}")
 
+    _emit("Connecting: detecting MAX96726 locked cameras...")
     locked = gr.detect_locked_sids(cfg, repo_root)
     logger.info("MAX96726 locked sids: %s", locked)
     if not locked:
         _emit("ERROR: no locked GMSL2 cameras detected")
         return 1
+    _emit(f"Connecting: {len(locked)} cameras locked, probing Argus ISP...")
 
     if args.skip_argus_probe:
         usable = list(locked)
@@ -203,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
     if not usable:
         _emit("ERROR: no cameras stream through nvargus")
         return 1
+    _emit(f"Connecting: {len(usable)}/{len(locked)} cameras verified")
 
     camera_ids = [f"{cfg.name_prefix}_{sid:02d}" for sid in usable]
     _emit(f"Cameras: {', '.join(camera_ids)}")
