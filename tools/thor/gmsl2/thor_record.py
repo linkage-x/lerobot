@@ -266,8 +266,8 @@ def main(argv: list[str] | None = None) -> int:
             wall_start = datetime.now(timezone.utc).isoformat()
             t0_wall = time.time()
             t0_mono = time.monotonic()
-            t_start = t0_wall
             streams = session.start(ep_dir)
+            t_start = time.time()
             logger.info("episode %d started @ %s -> %s", ep_idx, wall_start, ep_dir)
             box_snapshots: list[dict[str, Any]] = []
             target_s = cfg.episode_time_s if cfg.episode_time_s > 0 else float("inf")
