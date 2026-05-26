@@ -6,8 +6,9 @@
 # `.so.4.0`. The ABIs we touch (URDF parsing) are compatible, so a name-only
 # symlink lets the loader find them.
 #
-# Idempotent. Run once after `sudo apt install -y liburdfdom-dev` (which is
-# what supplies the underlying system libraries).
+# Idempotent. Run once after installing the BOX runtime packages listed in
+# tools/thor/DEPLOYMENT.md (`liburdfdom-dev`, `libtinyxml2-dev`, and the
+# Boost 1.74 compatibility runtime packages).
 #
 # Usage:
 #   bash tools/thor/box_sdk/install_compat_links.sh
@@ -44,7 +45,22 @@ link_compat() {
     echo "linked: $LIB_DIR/$link_name -> $target"
 }
 
+
+check_required_runtime() {
+    local soname="$1" apt_hint="$2"
+    if ldconfig -p 2>/dev/null | grep -Fq "$soname"; then
+        return
+    fi
+    if [ -e "$SYS_LIB/$soname" ]; then
+        return
+    fi
+    echo "WARN: missing runtime $soname"
+    echo "      run: sudo apt install -y $apt_hint"
+}
+
 link_compat libtinyxml2.so.9 "$SYS_LIB/libtinyxml2.so.1*"
 link_compat liburdfdom_model.so.3.0 "$SYS_LIB/liburdfdom_model.so.4*"
+check_required_runtime libboost_filesystem.so.1.74.0 "libboost-filesystem1.74.0 libboost-system1.74.0"
+check_required_runtime libboost_system.so.1.74.0 "libboost-filesystem1.74.0 libboost-system1.74.0"
 
 echo "done. \`source tools/thor/box_sdk/setup_env.sh\` to enable LD_LIBRARY_PATH."

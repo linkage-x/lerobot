@@ -163,11 +163,39 @@ def decode_sensor_cache(snap) -> dict[str, Any]:
         out["sensors"]["box_trigger"] = _decode_trigger(data.trigger_data)
     if data.six_d_force_data.timestamp:
         out["sensors"]["box_six_d_force"] = _decode_six_d_force(data.six_d_force_data)
-    if data.touch_sensor_data_first.timestamp:
-        out["sensors"]["box_touch_left"] = _decode_touch(data.touch_sensor_data_first)
-    if data.touch_sensor_data_sec.timestamp:
-        out["sensors"]["box_touch_right"] = _decode_touch(data.touch_sensor_data_sec)
+    touch_left = data.touch_sensor_data_first
+    touch_right = data.touch_sensor_data_sec
+    touch_array = getattr(snap, "touch_sensor_data", None)
+    if not getattr(touch_left, "timestamp", 0) and touch_array is not None and len(touch_array) >= 1:
+        touch_left = touch_array[0]
+    if not getattr(touch_right, "timestamp", 0) and touch_array is not None and len(touch_array) >= 2:
+        touch_right = touch_array[1]
+    if touch_left.timestamp:
+        out["sensors"]["box_touch_left"] = _decode_touch(touch_left)
+    if touch_right.timestamp:
+        out["sensors"]["box_touch_right"] = _decode_touch(touch_right)
     return out
+
+
+def _decode_sensor_timestamps(snap) -> dict[str, int]:
+    """Return raw per-sensor timestamps, including zeros for absent samples."""
+
+    data = snap.data
+    touch_left = data.touch_sensor_data_first
+    touch_right = data.touch_sensor_data_sec
+    touch_array = getattr(snap, "touch_sensor_data", None)
+    if not getattr(touch_left, "timestamp", 0) and touch_array is not None and len(touch_array) >= 1:
+        touch_left = touch_array[0]
+    if not getattr(touch_right, "timestamp", 0) and touch_array is not None and len(touch_array) >= 2:
+        touch_right = touch_array[1]
+    return {
+        "box_gripper": int(getattr(data.gripper_data, "timestamp", 0)),
+        "box_imu": int(getattr(data.imu_data, "timestamp", 0)),
+        "box_trigger": int(getattr(data.trigger_data, "timestamp", 0)),
+        "box_six_d_force": int(getattr(data.six_d_force_data, "timestamp", 0)),
+        "box_touch_left": int(getattr(touch_left, "timestamp", 0)),
+        "box_touch_right": int(getattr(touch_right, "timestamp", 0)),
+    }
 
 
 class BoxClient:
@@ -196,7 +224,18 @@ class BoxClient:
         self._lock = Lock()
         self._latest: dict[str, Any] = {"valid": False, "sensors": {}}
         self._latest_at_s: float = 0.0
+        self._latest_wall_time_s: float = 0.0
         self._first_seen_at_s: dict[str, float] = {}
+        self._last_seen_at_s: dict[str, float] = {}
+        self._last_sensor_timestamps: dict[str, int] = {sid: 0 for sid in KNOWN_SENSOR_IDS}
+        self._poll_count = 0
+        self._valid_poll_count = 0
+        self._last_poll_at_s: float = 0.0
+        self._last_poll_wall_time_s: float = 0.0
+        self._last_rc: int | None = None
+        self._last_error: str | None = None
+        self._started_at_s: float = 0.0
+        self._started_wall_time_s: float = 0.0
 
     # ---- lifecycle ----
 
@@ -213,10 +252,15 @@ class BoxClient:
             return False
 
         self._box = Box(so_path=self._so_path) if self._so_path else Box()
-        self._box.start(
+        rc = self._box.start(
             self.cfg.bind_ip, self.cfg.bind_port,
             self.cfg.remote_ip, self.cfg.remote_port,
         )
+        if rc != 0:
+            logger.warning("box.start rc=%d", rc)
+            return False
+        self._started_at_s = time.monotonic()
+        self._started_wall_time_s = time.time()
         # set_mode is best-effort -- on dev boards the BOX MCU may not be
         # alive yet, and we still want the poll loop running so the recorder
         # can decide what to do.
@@ -258,22 +302,81 @@ class BoxClient:
                 rc, snap = self._box.get_sensor_cache()
             except Exception as exc:
                 logger.error("box.get_sensor_cache raised: %s", exc)
-                self._stop_event.wait(interval)
-                continue
-            if rc == 0 and getattr(snap, "valid", 0):
-                decoded = decode_sensor_cache(snap)
                 now = time.monotonic()
                 with self._lock:
+                    self._poll_count += 1
+                    self._last_poll_at_s = now
+                    self._last_poll_wall_time_s = time.time()
+                    self._last_rc = None
+                    self._last_error = str(exc)
+                self._stop_event.wait(interval)
+                continue
+            now = time.monotonic()
+            wall_now = time.time()
+            valid = rc == 0 and bool(getattr(snap, "valid", 0))
+            decoded = decode_sensor_cache(snap) if rc == 0 else None
+            sensor_timestamps = _decode_sensor_timestamps(snap) if rc == 0 else {}
+            err = self._err_str(rc) if rc != 0 else None
+            with self._lock:
+                self._poll_count += 1
+                self._last_poll_at_s = now
+                self._last_poll_wall_time_s = wall_now
+                self._last_rc = int(rc)
+                self._last_error = err
+                for sid, sensor_ts in sensor_timestamps.items():
+                    if sensor_ts:
+                        self._last_sensor_timestamps[sid] = sensor_ts
+                        self._first_seen_at_s.setdefault(sid, now)
+                        self._last_seen_at_s[sid] = now
+                if valid and decoded is not None:
+                    self._valid_poll_count += 1
                     self._latest = decoded
                     self._latest_at_s = now
-                    for sid in decoded["sensors"]:
-                        self._first_seen_at_s.setdefault(sid, now)
+                    self._latest_wall_time_s = wall_now
             self._stop_event.wait(interval)
+
+    def _err_str(self, rc: int) -> str:
+        if self._box is None:
+            return str(rc)
+        try:
+            return str(self._box.err_str(rc))
+        except Exception:
+            return str(rc)
+
+    def _status_locked(self) -> dict[str, Any]:
+        now = time.monotonic()
+        sensor_status = {}
+        for sid in self.cfg.expected_devices or list(KNOWN_SENSOR_IDS):
+            last_seen = self._last_seen_at_s.get(sid, 0.0)
+            fresh = bool(last_seen and now - last_seen <= self.cfg.stale_threshold_s)
+            sensor_status[sid] = {
+                "seen": bool(last_seen),
+                "fresh": fresh,
+                "last_seen_age_s": max(0.0, now - last_seen) if last_seen else None,
+                "last_timestamp": int(self._last_sensor_timestamps.get(sid, 0)),
+            }
+        return {
+            "active": self._box is not None and not self._stop_event.is_set(),
+            "started_at_s": self._started_at_s,
+            "started_wall_time_s": self._started_wall_time_s,
+            "poll_count": self._poll_count,
+            "valid_poll_count": self._valid_poll_count,
+            "last_poll_at_s": self._last_poll_at_s,
+            "last_poll_wall_time_s": self._last_poll_wall_time_s,
+            "last_rc": self._last_rc,
+            "last_error": self._last_error,
+            "latest_valid_at_s": self._latest_at_s,
+            "latest_valid_wall_time_s": self._latest_wall_time_s,
+            "latest_age_s": max(0.0, now - self._latest_at_s) if self._latest_at_s else None,
+            "sensor_status": sensor_status,
+        }
 
     def read(self) -> dict[str, Any]:
         with self._lock:
             snap = dict(self._latest)
             snap["received_at_s"] = self._latest_at_s
+            snap["received_wall_time_s"] = self._latest_wall_time_s
+            snap["status"] = self._status_locked()
         return snap
 
     def detect(self) -> list[str]:
@@ -294,6 +397,13 @@ class BoxClient:
         # Filter to fresh sensors when possible; otherwise return all-ever-seen
         # so the caller can decide.
         return [sid for sid in present if sid in fresh] or present
+
+    def connected_devices(self) -> list[str]:
+        """Return configured BOX rows whose SDK transport session is active."""
+
+        if not self.is_active():
+            return []
+        return list(self.cfg.expected_devices or KNOWN_SENSOR_IDS)
 
     # ---- introspection ----
 

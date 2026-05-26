@@ -18,7 +18,8 @@ GMSL2 + BOX 采集板）部署到一台新的 Thor / Jetson 主机时，按顺�
 ```bash
 sudo apt update
 sudo apt install -y \
-  libeigen3-dev liburdfdom-dev tinyxml2 \
+  libeigen3-dev liburdfdom-dev libtinyxml2-dev \
+  libboost-filesystem1.74.0 libboost-system1.74.0 \
   curl rsync git \
   v4l-utils python3-pip
 ```
@@ -27,7 +28,8 @@ sudo apt install -y \
 | --- | --- | --- |
 | `libeigen3-dev` | `libgripper_kinematics.so` 链接时 | Box 控制器 dlopen 失败 |
 | `liburdfdom-dev` | `libpinocchio_parsers.so` 运行时 | `Box()` 构造时报缺 `liburdfdom_model.so.*` |
-| `tinyxml2` | 同上 | `Box()` 构造时报缺 `libtinyxml2.so.*` |
+| `libtinyxml2-dev` | 同上 | `Box()` 构造时报缺 `libtinyxml2.so.*` |
+| `libboost-filesystem1.74.0` / `libboost-system1.74.0` | BOX SDK wheel 的旧 Boost soname | `Box()` 构造时报缺 `libboost_filesystem.so.1.74.0` 或 `libboost_system.so.1.74.0` |
 | `curl` | nvm 安装脚本、本清单后续命令 | `curl: command not found` |
 | `v4l-utils` | GMSL2 录制时 v4l2-ctl push 控件 | hardware_sync 启用时报错（默认禁用时不影响） |
 | `python3-pip` | 安装 pyarrow / box_sdk wheel | `pip: command not found` |
@@ -35,15 +37,16 @@ sudo apt install -y \
 ## 2. BOX SDK 兼容 symlink
 
 SDK 的 `.so` 是按旧 soname 编的（`libtinyxml2.so.9` / `liburdfdom_model.so.3.0`），
-JetPack 6 系统装的是 `.so.10` / `.so.4.0`。一个 helper 脚本自动建符号链接：
+JetPack 6 系统装的是 `.so.10` / `.so.4.0`。一个 helper 脚本自动建符号链接，
+并检查 Boost 1.74 运行时包是否已安装：
 
 ```bash
 bash ~/lerobot/tools/thor/box_sdk/install_compat_links.sh
 ```
 
 幂等。脚本会自动判断 aarch64 / x86_64，并选 `/usr/lib/<multiarch>/` 下版本
-最高的同名库。不装好 §1 的 `liburdfdom-dev` / `tinyxml2` 这步会报 "no
-system candidate" 警告。
+最高的同名库。不装好 §1 的 `liburdfdom-dev` / `libtinyxml2-dev` 这步会报 "no
+system candidate" 警告；不装 Boost 1.74 兼容包时会报 missing runtime。
 
 ## 3. Python 运行时依赖
 
@@ -245,8 +248,11 @@ cd ~/lerobot && PYTHONPATH=src:. PYTHONUNBUFFERED=1 \
 ### 仍存在
 
 * **BOX 采集板传感器流上行**：`Box()` 起得来、`set_mode` ACK、夹爪可动，
-  但 `get_sensor_cache` 一直返回 rc=4 / no cached sensor data。供应商已确认
-  下行通路 OK，方向是 ARM 网关 / 接收路径。诊断步骤见
+  但 `get_sensor_cache` 一直返回 rc=4 / no cached sensor data。当前 gateway
+  会把 BOX SDK 会话启动成功视为 6 个 BOX 设备连通，并把 rc / 错误文本 /
+  poll 时间 / 每个传感器最后 timestamp 写入 episode `meta.json` 的
+  `box_collection.snapshots[*].status`。供应商已确认下行通路 OK，方向是
+  ARM 网关 / 接收路径。诊断步骤见
   `tools/thor/box_sdk/TROUBLESHOOTING.md`（tcpdump 范围扩、`rp_filter`、
   RX offload、IGMP、`set_packet_observer` 探测等 8 步）。
 * **MAX96726 sid 锁定数 ≠ YAML 槽位**：YAML 默认 detect_all + `sensor_ids: []`

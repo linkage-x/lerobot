@@ -223,10 +223,11 @@ def main(argv: list[str] | None = None) -> int:
     box = bc.BoxClient(box_cfg)
     box_started = box.start() if box_cfg.enabled else False
     if box_started:
-        # Give the SDK ~`stale_threshold` to start receiving packets so the
-        # initial detect() reflects reality.
+        # A successful SDK transport session means the configured BOX rows are
+        # connected from the GUI's perspective. Sensor-cache freshness is
+        # recorded separately in box_collection.snapshots/status.
         time.sleep(min(0.5, box_cfg.stale_threshold_s))
-        present = box.detect()
+        present = box.connected_devices()
         _emit(f"Box devices: {', '.join(present) if present else '(none)'}")
     elif box_cfg.enabled:
         _emit("Box devices: (none)")
@@ -297,9 +298,8 @@ def main(argv: list[str] | None = None) -> int:
                     last_progress_at = now
                 if box_started and now - box_sample_at > 0.5:
                     snap = box.read()
-                    if snap.get("valid"):
-                        snap["t_relative_s"] = elapsed
-                        box_snapshots.append(snap)
+                    snap["t_relative_s"] = elapsed
+                    box_snapshots.append(snap)
                     box_sample_at = now
                 time.sleep(0.05)
 

@@ -111,7 +111,10 @@ class _FakeBox:
     def get_sensor_cache(self):
         if self.snaps:
             return 0, self.snaps[0]
-        return -1, _SensorCache(valid=0)
+        return 4, _SensorCache(valid=0)
+
+    def err_str(self, rc):
+        return "no cached sensor data" if rc == 4 else f"rc={rc}"
 
 
 @pytest.fixture
@@ -220,6 +223,31 @@ def test_box_client_start_stop_pulls_snapshot_and_marks_detected(fake_box_module
     client.stop()
     assert client.is_active() is False
 
+
+
+def test_box_client_reports_connected_session_and_no_cache_status(fake_box_module):
+    cfg = box_client.BoxClientConfig(
+        enabled=True,
+        poll_interval_s=0.01,
+        stale_threshold_s=5.0,
+        expected_devices=["box_gripper", "box_imu"],
+    )
+    client = box_client.BoxClient(cfg)
+
+    assert client.start() is True
+    import time as _t
+    _t.sleep(0.05)
+
+    assert client.connected_devices() == ["box_gripper", "box_imu"]
+    snap = client.read()
+    assert snap["valid"] is False
+    assert snap["status"]["active"] is True
+    assert snap["status"]["poll_count"] > 0
+    assert snap["status"]["valid_poll_count"] == 0
+    assert snap["status"]["last_rc"] == 4
+    assert snap["status"]["last_error"] == "no cached sensor data"
+    assert snap["status"]["sensor_status"]["box_gripper"]["seen"] is False
+    client.stop()
 
 def test_box_client_start_is_noop_when_wheel_missing(monkeypatch):
     monkeypatch.delitem(sys.modules, "box_sdk", raising=False)
