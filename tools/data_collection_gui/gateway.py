@@ -777,16 +777,29 @@ def _normalize_series(values: list[float], low: float = 8.0, high: float = 92.0)
 def _dataset_replay_meta(dataset_root: Path, info: dict[str, Any]) -> dict[str, Any]:
     data_files = _dataset_data_files(dataset_root)
     episode_options = _dataset_episode_indices(dataset_root, info)
+    if _has_gmsl2_episodes(dataset_root):
+        total_episodes, total_frames = _gmsl2_dataset_stats(dataset_root)
+    else:
+        total_episodes = int(info.get("total_episodes") or 0)
+        total_frames = int(info.get("total_frames") or 0)
     return {
         "datasetRoot": str(dataset_root),
         "sourcePath": str(data_files[-1]) if data_files else "",
-        "totalEpisodes": int(info.get("total_episodes") or 0),
+        "totalEpisodes": total_episodes,
         "episodeOptions": episode_options,
-        "recordedFrames": int(info.get("total_frames") or 0),
+        "recordedFrames": total_frames,
     }
 
 
 def _dataset_episode_indices(dataset_root: Path, info: dict[str, Any] | None = None) -> list[int]:
+    if _has_gmsl2_episodes(dataset_root):
+        indices = []
+        for d in _gmsl2_episode_dirs(dataset_root):
+            try:
+                indices.append(int(d.name.split("_", 1)[1]))
+            except (ValueError, IndexError):
+                pass
+        return sorted(indices)
     try:
         import pyarrow.parquet as pq
     except Exception:
@@ -1606,6 +1619,16 @@ def _parquet_status_from_error(exc: Exception) -> str:
 
 
 def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    for dataset_root in _replay_dataset_candidates(state):
+        if _has_gmsl2_episodes(dataset_root):
+            meta = _dataset_replay_meta(dataset_root, {})
+            return [], {
+                **meta,
+                "dataStatus": "loaded",
+                "trajectoryKind": "none",
+                "message": f"GMSL2 raw capture: {meta['totalEpisodes']} episodes, video-only (no robot state)",
+            }
+
     try:
         import pyarrow.compute as pc
         import pyarrow.parquet as pq
@@ -1899,7 +1922,56 @@ def _empty_timeline(
     return payload
 
 
+def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict[str, Any]:
+    ep_dirs = _gmsl2_episode_dirs(dataset_root)
+    if not ep_dirs:
+        return _empty_timeline(dataset_root, error="no episodes found")
+    ep_idx = episode if episode is not None else 0
+    ep_dir = dataset_root / "episodes" / f"episode_{ep_idx:06d}"
+    if not ep_dir.is_dir():
+        return _empty_timeline(dataset_root, episode=ep_idx, error=f"episode_{ep_idx:06d} not found")
+    meta_path = ep_dir / "meta.json"
+    ep_meta: dict[str, Any] = {}
+    if meta_path.is_file():
+        try:
+            with meta_path.open() as f:
+                ep_meta = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
+    fps = int(ep_meta.get("video", {}).get("fps") or ep_meta.get("fps") or 60)
+    duration_s = float(ep_meta.get("duration_s") or 10)
+    total_frames = int(duration_s * fps)
+    mkv_files = sorted(ep_dir.glob("*.mkv"))
+    camera_keys = [f.stem for f in mkv_files if f.stat().st_size > 1024]
+    frames: list[dict[str, Any]] = []
+    for i in range(total_frames):
+        frames.append({
+            "frame": i,
+            "timestamp": i / max(fps, 1),
+            "state": [],
+            "action": [],
+            "eePose": {},
+        })
+    return {
+        "datasetRoot": str(dataset_root),
+        "name": dataset_root.name,
+        "episode": ep_idx,
+        "totalFrames": total_frames,
+        "fps": fps,
+        "stateNames": [],
+        "actionNames": [],
+        "cameraKeys": camera_keys,
+        "videoTemplate": "",
+        "videoChunkIndex": 0,
+        "videoFileIndex": 0,
+        "frames": frames,
+        "sourcePath": str(ep_dir),
+    }
+
+
 def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int | None = None) -> dict[str, Any]:
+    if _has_gmsl2_episodes(dataset_root):
+        return _read_gmsl2_timeline(dataset_root, episode)
     try:
         import pyarrow.compute as pc
         import pyarrow.parquet as pq
@@ -1983,6 +2055,11 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
 
 
 def _resolve_video_path(state: GatewayState, dataset_root: Path, camera_key: str) -> Path | None:
+    if _has_gmsl2_episodes(dataset_root):
+        episode = int(state.replay.episode or 0)
+        ep_dir = dataset_root / "episodes" / f"episode_{episode:06d}"
+        mkv = ep_dir / f"{camera_key}.mkv"
+        return mkv if mkv.is_file() else None
     info = _load_dataset_info(dataset_root)
     template = str(info.get("video_path") or "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
     relative = template.format(video_key=camera_key, chunk_index=0, file_index=0)
@@ -1992,7 +2069,6 @@ def _resolve_video_path(state: GatewayState, dataset_root: Path, camera_key: str
     except ValueError:
         return None
     if not candidate.is_file():
-        # fall back to scanning chunk-* directories for the first mp4
         camera_dir = dataset_root / "videos" / camera_key
         if camera_dir.is_dir():
             for mp4 in sorted(camera_dir.glob("chunk-*/*.mp4")):

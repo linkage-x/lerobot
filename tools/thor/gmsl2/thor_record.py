@@ -177,6 +177,9 @@ def main(argv: list[str] | None = None) -> int:
         raw_yaml = yaml.safe_load(f) or {}
     box_cfg = bc.from_yaml_dict(raw_yaml.get("box_collection") if not args.no_box else None)
 
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    cfg.dataset_root = cfg.dataset_root.parent / f"{cfg.dataset_root.name}_{stamp}"
+
     repo_root = args.repo_root.resolve()
     if args.skip_hardware_sync:
         cfg.hardware_sync.enabled = False
