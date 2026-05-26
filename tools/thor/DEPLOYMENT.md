@@ -247,14 +247,12 @@ cd ~/lerobot && PYTHONPATH=src:. PYTHONUNBUFFERED=1 \
 
 ### 仍存在
 
-* **BOX 采集板传感器流上行**：`Box()` 起得来、`set_mode` ACK、夹爪可动，
-  但 `get_sensor_cache` 一直返回 rc=4 / no cached sensor data。当前 gateway
-  会把 BOX SDK 会话启动成功视为 6 个 BOX 设备连通，并把 rc / 错误文本 /
-  poll 时间 / 每个传感器最后 timestamp 写入 episode `meta.json` 的
-  `box_collection.snapshots[*].status`。供应商已确认下行通路 OK，方向是
-  ARM 网关 / 接收路径。诊断步骤见
-  `tools/thor/box_sdk/TROUBLESHOOTING.md`（tcpdump 范围扩、`rp_filter`、
-  RX offload、IGMP、`set_packet_observer` 探测等 8 步）。
+* **BOX 采集板传感器流上行**：供应商确认夹爪端固定只向
+  `192.168.2.45` 上行。Thor 已在 `enP2p1s0` 配置 `192.168.2.45/24`，
+  `box_collection.bind_ip` 已改为 `192.168.2.45`；按该地址复测后，
+  原始抓包可见 `192.168.2.60 -> 192.168.2.45 UDP/15000`，
+  `get_sensor_cache` 已由 rc=4 变为 rc=0 / valid=1。后续重点是确认
+  各传感器 timestamp/字段和 `get_gripper_pos` 在当前模式下的预期行为。
 * **MAX96726 sid 锁定数 ≠ YAML 槽位**：YAML 默认 detect_all + `sensor_ids: []`
   的 16 个相机槽是"期望"；实际锁到几个看插了几路相机线。多出来的槽位
   Connect 后会变红 `error`，正常现象。

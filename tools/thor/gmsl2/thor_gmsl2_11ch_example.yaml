@@ -94,7 +94,7 @@ sensors:
 # attached). Set `enabled: false` for camera-only sessions.
 box_collection:
   enabled: true
-  bind_ip: "0.0.0.0"
+  bind_ip: "192.168.2.45"
   bind_port: 15000
   remote_ip: "192.168.2.60"
   remote_port: 15000
