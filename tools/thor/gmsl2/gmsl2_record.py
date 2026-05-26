@@ -310,6 +310,8 @@ class EpisodeResult:
     wallclock_end_utc: str
     duration_s: float
     streams: list[CameraStream] = field(default_factory=list)
+    t0_wall_s: float = 0.0
+    t0_mono_s: float = 0.0
 
 
 class EpisodeSession:
@@ -414,6 +416,23 @@ def write_episode_meta(
             "pwm_id": cfg.hardware_sync.pwm_id,
             "pwm_fps": cfg.hardware_sync.fps,
             "trig_pin": f"0x{cfg.hardware_sync.trig_pin:08x}",
+        },
+        "sync_reference": {
+            "t0_wall_s": ep.t0_wall_s,
+            "t0_mono_s": ep.t0_mono_s,
+            "camera_spawn_wall_s": {
+                s.name: s.started_at for s in ep.streams
+            },
+            "camera_spawn_offset_s": {
+                s.name: s.started_at - ep.t0_wall_s for s in ep.streams
+            },
+            "note": (
+                "t0_wall_s is time.time() at episode start (before first camera spawn). "
+                "camera_spawn_offset_s is each camera's gst-launch spawn time relative to t0. "
+                "MKV PTS tracks start from the pipeline clock origin; subtract spawn_offset "
+                "to align all cameras to t0. BOX snapshots carry t_relative_s = time.time() - t0 "
+                "and per-sensor MCU timestamps. Use t_relative_s for camera-BOX alignment."
+            ),
         },
         "max96726_locked_sids": locked_sids,
         "argus_failed_sids": argus_failed_sids,
@@ -659,7 +678,8 @@ def main(argv: list[str] | None = None) -> int:
         ep_dir = cfg.dataset_root / "episodes" / f"episode_{ep_idx:06d}"
         session = EpisodeSession(usable, cfg)
         wall_start = datetime.now(timezone.utc).isoformat()
-        t_start = time.time()
+        t0_wall = time.time()
+        t0_mono = time.monotonic()
         streams = session.start(ep_dir)
         logger.info("episode %d started @ %s -> %s", ep_idx, wall_start, ep_dir)
         capture_start = time.time()
@@ -684,8 +704,10 @@ def main(argv: list[str] | None = None) -> int:
             directory=ep_dir,
             wallclock_start_utc=wall_start,
             wallclock_end_utc=wall_end,
-            duration_s=time.time() - t_start,
+            duration_s=time.time() - t0_wall,
             streams=streams,
+            t0_wall_s=t0_wall,
+            t0_mono_s=t0_mono,
         )
         meta_path = write_episode_meta(ep, cfg, locked, argus_failed)
         ok_count = sum(1 for s in streams if s.exit_code in (0, None))

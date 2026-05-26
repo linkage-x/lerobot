@@ -264,7 +264,9 @@ def main(argv: list[str] | None = None) -> int:
             ep_dir = cfg.dataset_root / "episodes" / f"episode_{ep_idx:06d}"
             session = gr.EpisodeSession(usable, cfg)
             wall_start = datetime.now(timezone.utc).isoformat()
-            t_start = time.time()
+            t0_wall = time.time()
+            t0_mono = time.monotonic()
+            t_start = t0_wall
             streams = session.start(ep_dir)
             logger.info("episode %d started @ %s -> %s", ep_idx, wall_start, ep_dir)
             box_snapshots: list[dict[str, Any]] = []
@@ -327,6 +329,8 @@ def main(argv: list[str] | None = None) -> int:
                     wallclock_end_utc=wall_end,
                     duration_s=duration_s,
                     streams=streams,
+                    t0_wall_s=t0_wall,
+                    t0_mono_s=t0_mono,
                 )
                 _write_episode_meta(ep, cfg, locked, argus_failed, box_cfg, box_snapshots)
                 saved += 1
