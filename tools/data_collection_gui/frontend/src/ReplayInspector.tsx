@@ -108,7 +108,7 @@ export function ReplayInspector({
     if (!timeline) {
       return;
     }
-    const t = (timeline.frames[currentFrame]?.timestamp ?? currentFrame / Math.max(fps, 1));
+    const t = (timeline.frames?.[currentFrame]?.timestamp ?? currentFrame / Math.max(fps, 1));
     Object.values(videoRefs.current).forEach((video) => {
       if (!video) {
         return;
@@ -139,24 +139,29 @@ export function ReplayInspector({
     });
   }, [playing]);
 
-  const frame: ReplayTimelineFrame | undefined = timeline?.frames[currentFrame];
+  // Backend may legitimately omit `frames` on error responses (pyarrow
+  // missing, episode out of range, etc). Don't dereference frames[idx]
+  // without a `?.` guard or this component crashes before the totalFrames
+  // early-return below has a chance to render the placeholder panel.
+  const frame: ReplayTimelineFrame | undefined = timeline?.frames?.[currentFrame];
   const pose = ensureFullPose(frame?.eePose);
   const trajectory = useMemo(() => {
-    if (!timeline) {
+    const frames = timeline?.frames;
+    if (!frames || frames.length === 0) {
       return [] as Array<[number, number, number]>;
     }
-    return timeline.frames
+    return frames
       .map((entry) => entry.eePose)
       .filter((entry): entry is EePose => !!entry && entry.x != null && entry.y != null && entry.z != null)
       .map((entry) => [entry.x as number, entry.y as number, entry.z as number] as [number, number, number]);
   }, [timeline]);
 
   const pickState = useCallback(
-    (frameIndex: number, dim: number) => timeline?.frames[frameIndex]?.state[dim] ?? Number.NaN,
+    (frameIndex: number, dim: number) => timeline?.frames?.[frameIndex]?.state?.[dim] ?? Number.NaN,
     [timeline]
   );
   const pickAction = useCallback(
-    (frameIndex: number, dim: number) => timeline?.frames[frameIndex]?.action[dim] ?? Number.NaN,
+    (frameIndex: number, dim: number) => timeline?.frames?.[frameIndex]?.action?.[dim] ?? Number.NaN,
     [timeline]
   );
 
@@ -183,14 +188,18 @@ export function ReplayInspector({
     );
   }
 
-  if (!timeline || timeline.totalFrames === 0) {
+  if (!timeline || timeline.totalFrames === 0 || !timeline.frames || timeline.frames.length === 0) {
+    const note =
+      error ??
+      timeline?.error ??
+      "No replay data available for this dataset.";
     return (
       <section className="panel inspector-panel">
         <div className="panel-heading">
           <h2>Replay Inspector</h2>
           <span>no data</span>
         </div>
-        <p className="panel-note">{error ?? "No replay data available for this dataset."}</p>
+        <p className="panel-note">{note}</p>
       </section>
     );
   }

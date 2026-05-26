@@ -33,7 +33,7 @@ function Metric({ label, value }: { label: string; value: string | number }) {
   );
 }
 
-function DeviceList({ devices }: { devices: DeviceStatus[] }) {
+function DeviceList({ devices, config }: { devices: DeviceStatus[]; config: ConfigSummary }) {
   const grouped = useMemo(() => {
     return devices.reduce<Record<string, DeviceStatus[]>>((acc, device) => {
       acc[device.kind] = [...(acc[device.kind] ?? []), device];
@@ -41,34 +41,83 @@ function DeviceList({ devices }: { devices: DeviceStatus[] }) {
     }, {});
   }, [devices]);
 
+  const cameraCount = grouped["camera"]?.length ?? 0;
+  const runningCameras = grouped["camera"]?.filter((d) => d.state === "running").length ?? 0;
+  const errorCameras = grouped["camera"]?.filter((d) => d.state === "error").length ?? 0;
+
   return (
     <section className="panel">
       <div className="panel-heading">
         <h2>Devices</h2>
         <span>{devices.length} streams</span>
       </div>
-      {Object.entries(grouped).map(([kind, items]) => (
-        <div className="device-group" key={kind}>
-          <h3>{kind.replace("_", " ")}</h3>
-          {items.map((device) => (
-            <div className="device-row" key={device.id}>
-              <div>
-                <div className="row-title">
-                  <StatusDot state={device.state} />
-                  <strong>{device.id}</strong>
-                </div>
-                <p>{device.label}</p>
-              </div>
-              <div className="device-stats">
-                <span>{device.fps} fps</span>
-                <span>{device.latencyMs} ms</span>
-                <small>{device.detail}</small>
-              </div>
+      {Object.entries(grouped).map(([kind, items]) => {
+        const kindLabel = kind === "camera" && config.rigType === "gmsl2"
+          ? `GMSL2 cameras`
+          : kind === "box_collection"
+            ? "BOX sensors"
+            : kind.replace("_", " ");
+        const kindSummary = kind === "camera" && config.rigType === "gmsl2"
+          ? `${runningCameras}/${cameraCount} running${errorCameras ? `, ${errorCameras} error` : ""}`
+          : `${items.length} devices`;
+        return (
+          <div className="device-group" key={kind}>
+            <div className="device-group-header">
+              <h3>{kindLabel}</h3>
+              <small>{kindSummary}</small>
             </div>
-          ))}
-        </div>
-      ))}
+            {items.map((device) => (
+              <div className="device-row" key={device.id}>
+                <div>
+                  <div className="row-title">
+                    <StatusDot state={device.state} />
+                    <strong>{device.id}</strong>
+                  </div>
+                  <p>{device.label}</p>
+                </div>
+                <div className="device-stats">
+                  <span>{device.fps} fps</span>
+                  <span>{device.latencyMs} ms</span>
+                  <small>{device.detail}</small>
+                </div>
+              </div>
+            ))}
+          </div>
+        );
+      })}
     </section>
+  );
+}
+
+function HardwareSyncBadge({ config }: { config: ConfigSummary }) {
+  const hw = config.hardwareSync;
+  if (!hw) return null;
+  const trigLabel = hw.trigMode === 1 ? "PWM slave" : hw.trigMode === 0 ? "free-run" : `trig ${hw.trigMode}`;
+  return (
+    <div className={`hw-sync-badge ${hw.enabled ? "hw-sync-on" : "hw-sync-off"}`}>
+      <span className="hw-sync-icon">{hw.enabled ? "◉" : "○"}</span>
+      <span>HW Sync {hw.enabled ? "ON" : "OFF"}</span>
+      {hw.enabled && <small>{hw.fps} Hz {trigLabel}{hw.pwmChip ? ` · ${hw.pwmChip}` : ""}</small>}
+    </div>
+  );
+}
+
+function CameraEncodingInfo({ config }: { config: ConfigSummary }) {
+  const cam = config.cameraDefaults;
+  if (!cam || !cam.codec) return null;
+  const res = cam.width && cam.height ? `${cam.width}x${cam.height}` : "";
+  const bitrate = cam.bitrateKbps ? `${cam.bitrateKbps} kbps` : "";
+  const exposure = cam.exposureUs ? `exp ${cam.exposureUs} us` : "";
+  const gain = cam.gain ? `gain ${cam.gain}` : "";
+  return (
+    <div className="encoding-info">
+      <Metric label="Codec" value={`${cam.codec.toUpperCase()} / ${cam.container || "mkv"}`} />
+      <Metric label="Resolution" value={res || "—"} />
+      <Metric label="Bitrate" value={bitrate || "—"} />
+      <Metric label="Pipeline" value={cam.pipeline || "—"} />
+      <Metric label="Exposure" value={exposure || "auto"} />
+      <Metric label="Gain" value={gain || "auto"} />
+    </div>
   );
 }
 
@@ -92,16 +141,19 @@ function RecordingPanel({
   const canStartEpisode = status.state === "armed";
   const canResolveEpisode = status.state === "recording" || status.state === "review";
   const canExit = isConnected;
+  const isGmsl = config.rigType === "gmsl2";
+  const panelTitle = isGmsl ? "GMSL2 Record" : "Handheld Record";
 
   return (
     <section className="panel">
       <div className="panel-heading">
-        <h2>Handheld Record</h2>
+        <h2>{panelTitle}</h2>
         <span className="state-pill">
           <StatusDot state={status.state} />
           {stateLabel(status.state)}
         </span>
       </div>
+      {isGmsl && <HardwareSyncBadge config={config} />}
       <div className="config-grid">
         <Metric label="Config" value={config.configPath} />
         <Metric label="Repo" value={status.repoId} />
@@ -110,6 +162,7 @@ function RecordingPanel({
         <Metric label="Episode" value={`${config.episodeTimeS}s / ${status.targetFrames} frames`} />
         <Metric label="Encoding" value={`${config.vcodec || "raw"}${config.streamingEncoding ? ", streaming" : ""}`} />
       </div>
+      {isGmsl && <CameraEncodingInfo config={config} />}
       <div className="progress">
         <div className="progress-bar" style={{ width: `${progress}%` }} />
       </div>
@@ -443,10 +496,15 @@ function LiveRecordPage({
   const showSavedBanner = snapshot.recording.savedEpisodes > 0;
   return (
     <div className="page-stack">
-      <PageHeader title="Live Record" subtitle="capture raw multi-camera handheld data; post-processing lives on the Processing page" />
+      <PageHeader
+        title="Live Record"
+        subtitle={snapshot.configSummary.rigType === "gmsl2"
+          ? `GMSL2 ${snapshot.devices.filter((d) => d.kind === "camera").length}-camera capture with${snapshot.configSummary.hardwareSync?.enabled ? "" : "out"} hardware sync`
+          : "capture raw multi-camera handheld data; post-processing lives on the Processing page"}
+      />
       <div className="split-layout">
         <RecordingPanel status={snapshot.recording} config={snapshot.configSummary} busy={busy} onConnect={onConnect} onStart={onStart} onStop={onStop} />
-        <DeviceList devices={snapshot.devices} />
+        <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />
       </div>
       <CalibrationPanel status={snapshot.calibration} busy={busy} onRun={onRunCalibration} />
       {showSavedBanner ? (
@@ -1342,11 +1400,21 @@ function App() {
       <header className="topbar">
         <div>
           <h1>Robot Data Factory</h1>
-          <p>Live collection, processing, replay, and export for LeRobot data workflows</p>
+          <p>
+            {snapshot.configSummary.rigType === "gmsl2"
+              ? `Thor GMSL2 · ${snapshot.devices.filter((d) => d.kind === "camera").length} cameras · ${snapshot.configSummary.fps} fps`
+              : "Live collection, processing, replay, and export for LeRobot data workflows"}
+          </p>
         </div>
         <div className="topbar-status">
           <span><StatusDot state={snapshot.gateway.state === "online" ? "running" : "warning"} /> Gateway {snapshot.gateway.state}</span>
           <span><StatusDot state={snapshot.recording.state} /> Recorder</span>
+          {snapshot.configSummary.hardwareSync && (
+            <span>
+              <StatusDot state={snapshot.configSummary.hardwareSync.enabled ? "running" : "warning"} />
+              {" "}HW Sync {snapshot.configSummary.hardwareSync.enabled ? "ON" : "OFF"}
+            </span>
+          )}
           <span><StatusDot state={snapshot.replay.safety === "fault" ? "error" : snapshot.replay.safety === "active" ? "running" : "idle"} /> Replay safety {snapshot.replay.safety}</span>
         </div>
       </header>

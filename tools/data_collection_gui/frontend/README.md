@@ -7,6 +7,11 @@ The default rig is **Thor + 11 x GMSL2 (SG2-AR0234C-G2F) + BOX 采集板** — s
 `tools/thor/box_sdk/README.md`. It replaces the previous Hikrobot 8-camera +
 Pika Sense gripper / RealSense default.
 
+> **首次在 Thor / Jetson 上部署？** 先按 [`tools/thor/DEPLOYMENT.md`](../../thor/DEPLOYMENT.md)
+> 跑完 apt / pyarrow / box_sdk wheel / 兼容 symlink / nvm + node / npm
+> 国内源那几步 —— 列出了所有曾经踩过的坑，新机零踩坑。下面的 Start The
+> GUI 假设这些前置依赖已经就位。
+
 ## Start The GUI
 
 Run the local Python gateway first:

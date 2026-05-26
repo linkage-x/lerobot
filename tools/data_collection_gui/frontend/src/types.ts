@@ -20,6 +20,26 @@ export type GatewayStatus = {
   datasetsRoot?: string;
 };
 
+export type HardwareSyncStatus = {
+  enabled: boolean;
+  fps: number;
+  trigMode: number;
+  pwmChip: string;
+  pwmId: number;
+};
+
+export type CameraDefaults = {
+  codec: string;
+  bitrateKbps: number;
+  width: number;
+  height: number;
+  pipeline: string;
+  exposureUs: number;
+  gain: number;
+  iframeInterval: number;
+  container: string;
+};
+
 export type ConfigSummary = {
   configPath: string;
   repoId: string;
@@ -36,6 +56,10 @@ export type ConfigSummary = {
     displayData: boolean;
     savePath: string;
   };
+  recorderScript?: string;
+  rigType?: "gmsl2" | "handheld";
+  hardwareSync?: HardwareSyncStatus;
+  cameraDefaults?: CameraDefaults;
 };
 
 export type RecordingStatus = {

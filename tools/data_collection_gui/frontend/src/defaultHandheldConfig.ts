@@ -19,6 +19,26 @@ export const handheldConfigSummary = {
   rerun: {
     displayData: true,
     savePath: "(not set)"
+  },
+  recorderScript: "tools/thor/gmsl2/thor_record.py",
+  rigType: "gmsl2" as const,
+  hardwareSync: {
+    enabled: true,
+    fps: 60,
+    trigMode: 1,
+    pwmChip: "pwmchip6",
+    pwmId: 0
+  },
+  cameraDefaults: {
+    codec: "h265",
+    bitrateKbps: 20000,
+    width: 1920,
+    height: 1080,
+    pipeline: "argus",
+    exposureUs: 9999,
+    gain: 320,
+    iframeInterval: 60,
+    container: "mkv"
   }
 };
 

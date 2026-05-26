@@ -74,11 +74,11 @@ sensors:
     #   * make sure `exposure_us` fits inside one PWM period -- the
     #     recorder auto-clamps to 0.85 * (1e6 / fps) and warns if not.
     # In slave mode at 60 Hz (period = 16666 us) keep `exposure_us` <= ~14000.
-    enabled: false
+    enabled: true
     sdk_dir: tools/thor/gmsl2/sdk    # repo-relative; vendored pwm.sh lives here
     setup_script: pwm.sh        # relative to sdk_dir, or absolute path
     fps: 60                     # PWM frequency in Hz (only used when enabled)
-    sensor_trig_mode: 0         # 0 = free_run (default), 1 = slave (PWM-edge locked)
+    sensor_trig_mode: 1         # 0 = free_run (default), 1 = slave (PWM-edge locked)
     trig_pin: 0x00020007        # written to each camera via v4l2-ctl when enabled
     # Informational only -- recorded in episode meta.json.
     pwm_chip: pwmchip6 # vendor's suggested default; confirm with `ls /sys/class/pwm` and `tools/thor/gmsl2/sdk/pwm.sh --status`

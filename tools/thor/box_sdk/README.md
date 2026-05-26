@@ -6,6 +6,10 @@ Thor box hosts the 11 GMSL2 cameras (see `../gmsl2/`) and the BOX MCU board
 that aggregates the gripper, IMU, trigger, 6D force, and two Paxini touch
 sensors over UDP/15000.
 
+> **首次部署？** 把整套 Thor 主机带起来的完整 checklist 在
+> [`../DEPLOYMENT.md`](../DEPLOYMENT.md)（apt 依赖、兼容 symlink、pyarrow、
+> 国内 pip/npm 镜像、启动脚本模板都在那里）。本 README 只覆盖 box_sdk 自身。
+
 ## Layout
 
 | Path | Source |

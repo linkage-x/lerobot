@@ -20,7 +20,7 @@
 
 set -eu
 
-PWM_CHIP=${PWM_CHIP:-pwmchip4}
+PWM_CHIP=${PWM_CHIP:-pwmchip6}
 PWM_ID=${PWM_ID:-0}
 FPS=${FPS:-60}
 

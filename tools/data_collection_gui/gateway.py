@@ -299,6 +299,14 @@ def _config_summary(config: dict[str, Any], config_path: Path) -> dict[str, Any]
     dataset = _dataset_config(config)
     sensors = config.get("sensors") if isinstance(config.get("sensors"), dict) else {}
     soft_sync = sensors.get("soft_sync") if isinstance(sensors.get("soft_sync"), dict) else {}
+    cameras = sensors.get("cameras") if isinstance(sensors.get("cameras"), dict) else {}
+    cam_defaults = cameras.get("defaults") if isinstance(cameras.get("defaults"), dict) else {}
+    hw_sync = sensors.get("hardware_sync") if isinstance(sensors.get("hardware_sync"), dict) else {}
+    recorder = config.get("recorder") if isinstance(config.get("recorder"), dict) else {}
+    recorder_script = str(recorder.get("script") or "")
+    is_gmsl = "gmsl" in recorder_script or "defaults" in cameras
+
+    vcodec = str(dataset.get("vcodec") or cam_defaults.get("codec") or "")
     return {
         "configPath": str(config_path),
         "repoId": str(dataset.get("repo_id") or ""),
@@ -309,11 +317,31 @@ def _config_summary(config: dict[str, Any], config_path: Path) -> dict[str, Any]
         "numEpisodes": int(dataset.get("num_episodes") or 0),
         "video": bool(dataset.get("video", True)),
         "streamingEncoding": bool(dataset.get("streaming_encoding", False)),
-        "vcodec": str(dataset.get("vcodec") or ""),
+        "vcodec": vcodec,
         "softSync": bool(soft_sync.get("enabled", False)),
         "rerun": {
             "displayData": bool(config.get("display_data", False)),
             "savePath": str(config.get("rerun_save_path") or ""),
+        },
+        "recorderScript": recorder_script,
+        "rigType": "gmsl2" if is_gmsl else "handheld",
+        "hardwareSync": {
+            "enabled": bool(hw_sync.get("enabled", False)),
+            "fps": int(hw_sync.get("fps") or 0),
+            "trigMode": int(hw_sync.get("sensor_trig_mode") or 0),
+            "pwmChip": str(hw_sync.get("pwm_chip") or ""),
+            "pwmId": int(hw_sync.get("pwm_id") or 0),
+        },
+        "cameraDefaults": {
+            "codec": str(cam_defaults.get("codec") or ""),
+            "bitrateKbps": int(cam_defaults.get("bitrate_kbps") or 0),
+            "width": int(cam_defaults.get("width") or 0),
+            "height": int(cam_defaults.get("height") or 0),
+            "pipeline": str(cam_defaults.get("pipeline") or ""),
+            "exposureUs": int(cam_defaults.get("exposure_us") or 0),
+            "gain": int(cam_defaults.get("gain") or 0),
+            "iframeInterval": int(cam_defaults.get("iframe_interval") or 0),
+            "container": str(cam_defaults.get("container") or ""),
         },
     }
 
@@ -1757,12 +1785,49 @@ def _extract_gripper(names: list[str], values: list[float]) -> float | None:
     return None
 
 
+def _empty_timeline(
+    dataset_root: Path,
+    *,
+    fps: int = 0,
+    episode: int | None = None,
+    state_names: list[str] | None = None,
+    action_names: list[str] | None = None,
+    camera_keys: list[str] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Return a fully-shaped ReplayTimeline payload with no frames.
+
+    Every ``/api/replay/timeline`` response must satisfy the ``ReplayTimeline``
+    contract the frontend declares -- in particular ``frames`` must be a list,
+    not absent -- otherwise ``ReplayInspector`` blows up when it dereferences
+    ``timeline.frames[currentFrame]`` before its own early-return guard runs.
+    """
+    payload: dict[str, Any] = {
+        "datasetRoot": str(dataset_root),
+        "name": dataset_root.name,
+        "episode": int(episode) if episode is not None else 0,
+        "totalFrames": 0,
+        "frames": [],
+        "fps": int(fps or 0),
+        "stateNames": list(state_names or []),
+        "actionNames": list(action_names or []),
+        "cameraKeys": list(camera_keys or []),
+        "videoTemplate": "",
+        "videoChunkIndex": 0,
+        "videoFileIndex": 0,
+        "sourcePath": "",
+    }
+    if error:
+        payload["error"] = error
+    return payload
+
+
 def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int | None = None) -> dict[str, Any]:
     try:
         import pyarrow.compute as pc
         import pyarrow.parquet as pq
     except Exception as exc:  # noqa: BLE001
-        return {"datasetRoot": str(dataset_root), "error": f"pyarrow unavailable: {exc}"}
+        return _empty_timeline(dataset_root, error=f"pyarrow unavailable: {exc}")
 
     info = _load_dataset_info(dataset_root)
     state_names = _feature_names(info, "observation.state")
@@ -1771,17 +1836,14 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
     fps = int(info.get("fps") or state.replay.fps or 30)
     data_files = _dataset_data_files(dataset_root)
     if not data_files:
-        return {
-            "datasetRoot": str(dataset_root),
-            "name": dataset_root.name,
-            "totalFrames": 0,
-            "frames": [],
-            "cameraKeys": camera_keys,
-            "stateNames": state_names,
-            "actionNames": action_names,
-            "fps": fps,
-            "error": "no parquet files",
-        }
+        return _empty_timeline(
+            dataset_root,
+            fps=fps,
+            state_names=state_names,
+            action_names=action_names,
+            camera_keys=camera_keys,
+            error="no parquet files",
+        )
 
     data_file = data_files[-1]
     table = pq.read_table(data_file)
@@ -1790,18 +1852,15 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         episode_options = sorted(set(episodes))
         selected_episode = episode if episode is not None else _selected_episode_for_dataset(state, dataset_root, episode_options)
         if episode_options and selected_episode not in episode_options:
-            return {
-                "datasetRoot": str(dataset_root),
-                "name": dataset_root.name,
-                "episode": selected_episode,
-                "totalFrames": 0,
-                "frames": [],
-                "cameraKeys": camera_keys,
-                "stateNames": state_names,
-                "actionNames": action_names,
-                "fps": fps,
-                "error": f"episode {selected_episode} not found",
-            }
+            return _empty_timeline(
+                dataset_root,
+                fps=fps,
+                episode=selected_episode,
+                state_names=state_names,
+                action_names=action_names,
+                camera_keys=camera_keys,
+                error=f"episode {selected_episode} not found",
+            )
         table = table.filter(pc.equal(table["episode_index"], selected_episode))
         episode = selected_episode
     else:

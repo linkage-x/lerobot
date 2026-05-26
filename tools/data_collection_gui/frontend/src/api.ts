@@ -79,7 +79,11 @@ export class DataCollectionGuiApi {
       streamingEncoding: handheldConfigSummary.streamingEncoding,
       vcodec: handheldConfigSummary.vcodec,
       softSync: handheldConfigSummary.softSync,
-      rerun: handheldConfigSummary.rerun
+      rerun: handheldConfigSummary.rerun,
+      recorderScript: handheldConfigSummary.recorderScript,
+      rigType: handheldConfigSummary.rigType,
+      hardwareSync: handheldConfigSummary.hardwareSync,
+      cameraDefaults: handheldConfigSummary.cameraDefaults
     },
     devices: initialDevices,
     recording: {
