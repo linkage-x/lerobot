@@ -260,3 +260,64 @@ cd ~/lerobot && PYTHONPATH=src:. PYTHONUNBUFFERED=1 \
   Connect 后会变红 `error`，正常现象。
 * **未跟踪的本地脚本**：`~/lerobot/run/` 下三个脚本不在 git 里 —— 是因为
   端口 / IP / venv 路径会因部署点而不同，复制本文 §6 的模板自己填。
+
+## 10. 相机-传感器时间同步架构
+
+### 当前状态（2026-05-26）
+
+11 路 GMSL2 相机通过 60Hz PWM 信号硬同步（`sensor_trig_mode=1`），所有相机
+帧对齐到同一 PWM 上升沿（亚微秒精度）。BOX 采集板传感器（gripper / IMU /
+trigger / 6D force / touch）通过 UDP/15000 发送，MCU 内部时钟独立于主机。
+
+**两套数据源的时钟域完全独立，没有硬件级公共时间基准。**
+
+### 已实现：sync_reference 元数据
+
+每个 episode 的 `meta.json` 包含 `sync_reference` 块：
+
+```json
+{
+  "sync_reference": {
+    "t0_wall_s": 1716700000.123,
+    "t0_mono_s": 12345.678,
+    "camera_spawn_wall_s": { "cam_02": 1716700000.123, "cam_07": 1716700001.124 },
+    "camera_spawn_offset_s": { "cam_02": 0.000, "cam_07": 1.001 }
+  }
+}
+```
+
+- `t0_wall_s`：`time.time()` at episode start，公共纪元锚点
+- `camera_spawn_offset_s`：各相机 gst-launch 启动相对 t0 的偏移（因 stagger 不同）
+- BOX snapshot 携带 `t_relative_s = time.time() - t0`，直接对齐到同一时间轴
+
+### 后处理对齐公式
+
+```
+相机帧 N 的时间 = t0_wall_s + camera_spawn_offset_s[cam_id] + N / fps
+BOX snapshot 时间 = t0_wall_s + t_relative_s
+```
+
+最近邻插值即可。20Hz BOX poll 下精度 ±25ms。
+
+### 待实现：导出阶段对齐
+
+数据集导出（Dataset Export 页面 / CLI）时应将原始 MKV + meta.json 转换为
+LeRobot v3 parquet 训练格式，在此阶段执行对齐：
+
+1. 从 MKV 提取 per-frame PTS（`gst-discoverer` 或 `ffprobe`）
+2. 用 `sync_reference` 将各相机帧映射到公共 wall-clock 时间线
+3. 将 BOX snapshot 按 `t_relative_s` 插值到每个相机帧时间点
+4. 写入 `observation.state`（BOX 传感器值）和 `observation.images.*`（视频引用）
+
+**前提**：BOX 传感器上行修复后才有可对齐的数据（当前 rc=4）。
+`sync_reference` 元数据已就位，导出代码待 BOX 上行通后实现。
+
+### 同步级别路线图
+
+| 级别 | 精度 | 状态 | 说明 |
+| --- | --- | --- | --- |
+| L0 硬同步（相机间） | <1μs | ✅ 已工作 | PWM slave mode，11 路帧对齐 |
+| L1 软同步元数据 | ±25ms | ✅ 已实现 | sync_reference in meta.json |
+| L2 导出时对齐 | ±25ms | 🔲 待实现 | BOX 上行通后实现，写入 parquet |
+| L3 录制时高频对齐 | ±8ms | 🔲 可选 | BOX poll 提到 60Hz，帧级对齐表 |
+| L4 硬件级全同步 | <1μs | 🔲 需硬件改 | BOX MCU 也由 PWM 触发 |
