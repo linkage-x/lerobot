@@ -57,6 +57,7 @@ class CameraDefaults:
     fps: int = 60
     exposure_us: int = 0
     gain: int = 0
+    replay_warmup_s: float = 0.0
     codec: str = "h265"
     bitrate_kbps: int = 20000
     iframe_interval: int = 60
@@ -408,6 +409,7 @@ def write_episode_meta(
             "preset_level": cfg.cameras.preset_level,
             "control_rate": cfg.cameras.control_rate,
             "color_format": "NV12 (YUV420)",
+            "replay_warmup_s": float(cfg.cameras.replay_warmup_s),
             "pipeline": "nvarguscamerasrc | nvv4l2h{265,264}enc | matroskamux | filesink",
         },
         "hardware_sync": {

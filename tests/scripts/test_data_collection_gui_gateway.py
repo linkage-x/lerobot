@@ -78,6 +78,27 @@ def test_default_config_is_thor_gmsl2_box():
     assert "handheld_gripper" not in devices_by_kind
 
 
+def test_gmsl2_timeline_applies_replay_warmup(tmp_path):
+    dataset_root = tmp_path / "gmsl2"
+    ep_dir = dataset_root / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    (ep_dir / "cam_00.mkv").write_bytes(b"0" * 2048)
+    (ep_dir / "meta.json").write_text(
+        json.dumps({
+            "duration_s": 10.0,
+            "video": {"fps": 60, "replay_warmup_s": 1.5},
+        }),
+        encoding="utf-8",
+    )
+
+    timeline = gateway._read_gmsl2_timeline(dataset_root, episode=0)
+
+    assert timeline["videoWarmupS"] == 1.5
+    assert timeline["totalFrames"] == 510
+    assert timeline["cameraKeys"] == ["cam_00"]
+    assert timeline["frames"][0]["timestamp"] == 0
+
+
 def test_box_collection_devices_use_remote_endpoint_in_detail():
     config = {
         "sensors": {"cameras": {"defaults": {"fps": 60}, "detect_all": False, "sensor_ids": [0, 4]}},

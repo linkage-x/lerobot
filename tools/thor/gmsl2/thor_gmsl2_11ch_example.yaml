@@ -49,6 +49,7 @@ sensors:
       # to leave nvargus's auto-exposure / auto-gain in charge.
       exposure_us: 9999
       gain: 320
+      replay_warmup_s: 1.0  # preview skips the first second while Argus ISP/AWB color settles; raw MKV frames are kept
       # Hardware encoder configuration -- consumed by nvv4l2h265enc.
       codec: h265
       bitrate_kbps: 20000

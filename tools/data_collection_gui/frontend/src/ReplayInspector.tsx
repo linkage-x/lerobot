@@ -85,6 +85,7 @@ export function ReplayInspector({
 
   const fps = timeline?.fps ?? fallbackFps;
   const totalFrames = timeline?.totalFrames ?? 0;
+  const videoWarmupS = Math.max(0, timeline?.videoWarmupS ?? 0);
 
   useEffect(() => {
     if (!playing || totalFrames === 0) {
@@ -113,7 +114,9 @@ export function ReplayInspector({
       if (!video) {
         return;
       }
-      const clamped = Math.max(0, Math.min(t, (video.duration || t)));
+      const target = t + videoWarmupS;
+      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : Number.POSITIVE_INFINITY;
+      const clamped = Math.max(0, Math.min(target, duration));
       if (!playing && Math.abs(video.currentTime - clamped) > 0.05) {
         try {
           video.currentTime = clamped;
@@ -122,7 +125,7 @@ export function ReplayInspector({
         }
       }
     });
-  }, [timeline, currentFrame, fps, playing]);
+  }, [timeline, currentFrame, fps, playing, videoWarmupS]);
 
   useEffect(() => {
     Object.values(videoRefs.current).forEach((video) => {

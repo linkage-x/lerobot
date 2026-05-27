@@ -1920,10 +1920,20 @@ def _empty_timeline(
         "videoChunkIndex": 0,
         "videoFileIndex": 0,
         "sourcePath": "",
+        "videoWarmupS": 0.0,
     }
     if error:
         payload["error"] = error
     return payload
+
+
+def _gmsl2_replay_warmup_s(ep_meta: dict[str, Any]) -> float:
+    video = ep_meta.get("video") if isinstance(ep_meta.get("video"), dict) else {}
+    return max(0.0, _first_finite([
+        video.get("replay_warmup_s"),
+        video.get("warmup_s"),
+        ep_meta.get("replay_warmup_s"),
+    ]))
 
 
 def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict[str, Any]:
@@ -1944,7 +1954,8 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
             pass
     fps = int(ep_meta.get("video", {}).get("fps") or ep_meta.get("fps") or 60)
     duration_s = float(ep_meta.get("duration_s") or 10)
-    total_frames = int(duration_s * fps)
+    video_warmup_s = _gmsl2_replay_warmup_s(ep_meta)
+    total_frames = max(0, int(max(0.0, duration_s - video_warmup_s) * fps))
     mkv_files = sorted(ep_dir.glob("*.mkv"))
     camera_keys = [f.stem for f in mkv_files if f.stat().st_size > 1024]
     frames: list[dict[str, Any]] = []
@@ -1970,6 +1981,7 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
         "videoFileIndex": 0,
         "frames": frames,
         "sourcePath": str(ep_dir),
+        "videoWarmupS": video_warmup_s,
     }
 
 
@@ -2023,6 +2035,17 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
     else:
         episode = 0
 
+    video_warmup_s = 0.0
+    if _has_gmsl2_episodes(dataset_root):
+        ep_dir = dataset_root / "episodes" / f"episode_{int(episode or 0):06d}"
+        meta_path = ep_dir / "meta.json"
+        if meta_path.is_file():
+            try:
+                with meta_path.open() as f:
+                    video_warmup_s = _gmsl2_replay_warmup_s(json.load(f))
+            except (OSError, json.JSONDecodeError):
+                video_warmup_s = 0.0
+
     rows = table.to_pylist()
     rows.sort(key=lambda row: int(row.get("frame_index") or 0))
 
@@ -2059,6 +2082,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         "videoFileIndex": 0,
         "frames": frames,
         "sourcePath": str(data_file),
+        "videoWarmupS": video_warmup_s,
     }
 
 
@@ -2073,7 +2097,8 @@ def _remux_mkv_to_mp4(mkv_path: Path) -> Path | None:
         "!", "h265parse",
         "!", "nvv4l2decoder",
         "!", "nvv4l2h264enc", "bitrate=10000000",
-        "!", "h264parse",
+        "iframeinterval=60", "idrinterval=60", "insert-sps-pps=1", "insert-vui=1",
+        "!", "h264parse", "config-interval=-1",
         "!", "mp4mux", "faststart=true",
         "!", "filesink", f"location={mp4_path}",
     ]

@@ -244,6 +244,7 @@ export type ReplayTimeline = {
   videoFileIndex: number;
   frames: ReplayTimelineFrame[];
   sourcePath: string;
+  videoWarmupS?: number;
   error?: string;
 };
 
