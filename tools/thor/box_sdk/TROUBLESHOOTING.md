@@ -16,6 +16,13 @@
 
 ## 2. 修正后的配置
 
+Thor 重启后必须保留 `192.168.2.45/24`。repo 已提供开机恢复服务：
+
+```bash
+cd ~/lerobot
+bash tools/thor/box_sdk/install_box_net_service.sh
+```
+
 运行配置已改为固定绑定 `.45`：
 
 ```yaml
@@ -99,7 +106,7 @@ box_touch_right.timestamp = 9364164
 
 ## 5. 当前结论
 
-BOX 传感器流上行链路已打通，LeRobot wrapper 已能把 6 个 BOX sensor 标记为 seen/fresh，并记录 gripper distance 与各 sensor timestamp。后续如仍出现 `rc=4`，优先检查 Thor 是否仍持有 `192.168.2.45/24`，以及当前 recorder/gateway 是否使用了 `bind_ip: "192.168.2.45"` 的配置。
+BOX 传感器流上行链路已打通，LeRobot wrapper 已能把 6 个 BOX sensor 标记为 seen/fresh，并记录 gripper distance 与各 sensor timestamp。后续如仍出现 `rc=4`，优先检查 `thor-box-net.service` 是否 active、Thor 是否仍持有 `192.168.2.45/24`，以及当前 recorder/gateway 是否使用了 `bind_ip: "192.168.2.45"` 的配置。
 
 ## 6. 给供应商的简短结论
 

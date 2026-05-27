@@ -119,7 +119,38 @@ npm install
 正常在 5 秒内装完 77 个包（国内 registry 速度 1MB/s+）。要是慢到 1 分钟
 以上 —— 检查是不是又用回了官方 registry。
 
-## 6. 启动脚本
+## 6. BOX 网口地址持久化
+
+BOX 固件固定向 `192.168.2.45:15000` 推送传感器 UDP。Thor 重启后手动添加的
+`192.168.2.45/24` 会丢失，因此首次部署或重刷网络后必须安装 repo 内的
+systemd 服务：
+
+```bash
+cd ~/lerobot
+bash tools/thor/box_sdk/install_box_net_service.sh
+```
+
+该服务会在开机后执行 `tools/thor/box_sdk/ensure_box_net.sh`，幂等地完成：
+
+- `enP2p1s0` up
+- 添加 `192.168.2.45/24`
+- 默认不修改内核过滤策略
+- 打印到 `192.168.2.60` 的实际源地址路由
+
+临时检查或手动恢复也可以直接运行：
+
+```bash
+cd ~/lerobot
+bash tools/thor/box_sdk/ensure_box_net.sh
+```
+
+只有在确认需要关闭反向路径过滤时，才显式传入：
+
+```bash
+BOX_NET_DISABLE_RPFILTER=1 bash tools/thor/box_sdk/ensure_box_net.sh
+```
+
+## 7. 启动脚本
 
 仓库里已有 `~/lerobot/run/run_gateway.sh` / `run_vite.sh` / `restart_gateway.sh`
 三个本地脚本（**当前不在 git 跟踪范围内**，按本机环境写）。模板：
@@ -129,6 +160,7 @@ npm install
 #!/usr/bin/env bash
 set -e
 cd ~/lerobot
+bash tools/thor/box_sdk/ensure_box_net.sh >/dev/null
 . tools/thor/box_sdk/setup_env.sh
 exec env PYTHONPATH=src:. PYTHONUNBUFFERED=1 \
   python3 -m tools.data_collection_gui.gateway \
@@ -164,7 +196,7 @@ tail -5 ~/lerobot/run/logs/gateway.log
 **ssh 后台启动注意**：直接 `nohup ... &` 在 ssh 退出时 exit 255。要用
 `setsid bash <script> </dev/null >log 2>&1 &; disown` 才能干净 detach。
 
-## 7. 一次性自检
+## 8. 一次性自检
 
 ```bash
 # 7.1 box_sdk 能起来
@@ -203,7 +235,7 @@ bash ~/lerobot/run/run_vite.sh &
 # 开发机访问 http://<jetson-ip>:5173/
 ```
 
-## 8. 本地开发 → Thor 同步
+## 9. 本地开发 → Thor 同步
 
 开发机改完代码后用 rsync 同步到 Thor：
 
@@ -228,7 +260,7 @@ cd ~/lerobot && PYTHONPATH=src:. PYTHONUNBUFFERED=1 \
 本地前端 vite 代理默认指向 `http://192.168.111.122:8765`，改完代码
 `npm run dev` 即可连到 Thor 上的 gateway。
 
-## 9. 已知问题与已修复的坑
+## 10. 已知问题与已修复的坑
 
 ### 已修复（2026-05-26）
 
@@ -249,7 +281,7 @@ cd ~/lerobot && PYTHONPATH=src:. PYTHONUNBUFFERED=1 \
 
 * **BOX 采集板传感器流上行**：供应商确认夹爪端固定只向
   `192.168.2.45` 上行。Thor 已在 `enP2p1s0` 配置 `192.168.2.45/24`，
-  `box_collection.bind_ip` 已改为 `192.168.2.45`；按该地址复测后，
+  `box_collection.bind_ip` 已改为 `192.168.2.45`，并由 `thor-box-net.service` 开机恢复该地址；按该地址复测后，
   原始抓包可见 `192.168.2.60 -> 192.168.2.45 UDP/15000`，
   `get_sensor_cache` 已由 rc=4 变为 rc=0 / valid=1。LeRobot wrapper
   已确认 6 个 BOX sensor 全部 seen/fresh，gripper distance 与各 sensor
@@ -258,9 +290,9 @@ cd ~/lerobot && PYTHONPATH=src:. PYTHONUNBUFFERED=1 \
   的 16 个相机槽是"期望"；实际锁到几个看插了几路相机线。多出来的槽位
   Connect 后会变红 `error`，正常现象。
 * **未跟踪的本地脚本**：`~/lerobot/run/` 下三个脚本不在 git 里 —— 是因为
-  端口 / IP / venv 路径会因部署点而不同，复制本文 §6 的模板自己填。
+  端口 / IP / venv 路径会因部署点而不同，复制本文 §7 的模板自己填。
 
-## 10. 相机-传感器时间同步架构
+## 11. 相机-传感器时间同步架构
 
 ### 当前状态（2026-05-26）
 
