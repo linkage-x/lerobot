@@ -553,6 +553,10 @@ def _has_gmsl2_episodes(path: Path) -> bool:
     return any(eps_dir.glob("episode_*/meta.json"))
 
 
+def _has_lerobot_v3_data(path: Path) -> bool:
+    return any((path / "data").glob("chunk-*/*.parquet"))
+
+
 def _is_dataset_root(path: Path) -> bool:
     return path.is_dir() and ((path / "meta" / "info.json").is_file() or _has_gmsl2_episodes(path))
 
@@ -1970,7 +1974,7 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
 
 
 def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int | None = None) -> dict[str, Any]:
-    if _has_gmsl2_episodes(dataset_root):
+    if _has_gmsl2_episodes(dataset_root) and not _has_lerobot_v3_data(dataset_root):
         return _read_gmsl2_timeline(dataset_root, episode)
     try:
         import pyarrow.compute as pc
@@ -1982,6 +1986,10 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
     state_names = _feature_names(info, "observation.state")
     action_names = _feature_names(info, "action")
     camera_keys = _camera_keys(info)
+    if _has_gmsl2_episodes(dataset_root) and not camera_keys:
+        ep_idx = episode if episode is not None else int(state.replay.episode or 0)
+        ep_dir = dataset_root / "episodes" / f"episode_{ep_idx:06d}"
+        camera_keys = [f.stem for f in sorted(ep_dir.glob("*.mkv")) if f.stat().st_size > 1024]
     fps = int(info.get("fps") or state.replay.fps or 30)
     data_files = _dataset_data_files(dataset_root)
     if not data_files:

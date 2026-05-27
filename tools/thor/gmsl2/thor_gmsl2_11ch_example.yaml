@@ -32,7 +32,7 @@ sensors:
     detect_all: true
     sensor_ids: []        # only used when detect_all is false
     name_prefix: "cam"    # produces cam_00, cam_01, ... in the dataset
-    spawn_stagger_s: 1.0  # concurrent nvarguscamerasrc inits race on NVMM buffers; 1.0s is verified stable for 11/11 cameras; 0.5s works for 9 cameras but sid=10/11 have independent HW faults
+    spawn_stagger_s: 0.5  # concurrent nvarguscamerasrc inits race on NVMM buffers; 1.0s is verified stable for 11/11 cameras; 0.5s works for 9 cameras but sid=10/11 have independent HW faults
     stop_on_stream_exit: true  # set false/--ignore-stream-exit for diagnostics only
 
     # Per-camera capture/encoding defaults. nvarguscamerasrc handles ISP +

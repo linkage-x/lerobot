@@ -357,3 +357,7 @@ LeRobot v3 parquet 训练格式，在此阶段执行对齐：
 | L2 导出时对齐 | ±25ms | 🔲 待实现 | BOX 上行通后实现，写入 parquet |
 | L3 录制时高频对齐 | ±8ms | 🔲 可选 | BOX poll 提到 60Hz，帧级对齐表 |
 | L4 硬件级全同步 | <1μs | 🔲 需硬件改 | BOX MCU 也由 PWM 触发 |
+
+
+备注:
+thor的isp文件路径/var/nvidia/nvcam/settings/camera_overrides.isp(从驱动sdk拷过去)

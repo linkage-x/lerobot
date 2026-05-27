@@ -54,6 +54,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools.thor.gmsl2 import gmsl2_record as gr  # noqa: E402
+from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
 
 logger = logging.getLogger("thor_record")
@@ -345,6 +346,22 @@ def main(argv: list[str] | None = None) -> int:
                 _write_episode_meta(
                     ep, cfg, locked, argus_failed, box_cfg, box_snapshots, decision,
                 )
+                try:
+                    v3_path = lr3.write_box_lerobot_v3_episode(
+                        cfg.dataset_root,
+                        repo_id=cfg.repo_id,
+                        task=cfg.single_task,
+                        fps=cfg.fps,
+                        episode_index=ep_idx,
+                        snapshots=box_snapshots,
+                        duration_s=duration_s,
+                    )
+                    if v3_path is not None:
+                        logger.info("wrote BOX LeRobot v3 rows: %s", v3_path)
+                    elif box_snapshots:
+                        logger.warning("BOX LeRobot v3 rows skipped; pyarrow is unavailable")
+                except Exception as exc:
+                    logger.warning("failed to write BOX LeRobot v3 rows: %s", exc)
                 saved += 1
                 if decision == "stream_exit":
                     _emit("Episode saved with stream exits.")
