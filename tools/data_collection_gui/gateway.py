@@ -2717,7 +2717,12 @@ def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> Non
     state.replay.message = validation["message"]
 
 
+_RECORDER_NOISE_PREFIXES = ("[TLV_LOG_UPLOAD]", "GST_ARGUS:", "NvMMLite")
+
+
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
+    if any(output.startswith(p) for p in _RECORDER_NOISE_PREFIXES):
+        return
     state.recording.lastOutput = output
     state.recording.message = output
     state.log("info", f"recorder: {output}")
@@ -2737,6 +2742,9 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
     ):
         if output.startswith(prefix):
             _mark_connected_devices(state, kind, output.removeprefix(prefix).strip())
+
+    if output.startswith("Box rates:"):
+        _apply_box_rates(state, output.removeprefix("Box rates:").strip())
 
     recorded_match = re.search(r"Recorded\s+(\d+)\s+frames", output)
     if recorded_match:
@@ -2774,6 +2782,23 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         state.recording.frameIndex = 0
     elif "Input stream closed; stopping recording session." in output:
         state.recording.message = "Recorder input closed; finalizing dataset"
+
+
+def _apply_box_rates(state: GatewayState, rates_str: str) -> None:
+    """Parse ``box_imu=200, box_gripper=200, ...`` and update device fps."""
+    for part in rates_str.split(","):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        sid, hz_str = part.split("=", 1)
+        sid = sid.strip()
+        try:
+            hz = int(round(float(hz_str)))
+        except (TypeError, ValueError):
+            continue
+        for device in state.devices:
+            if device.get("kind") == "box_collection" and device.get("id") == sid:
+                device["fps"] = hz
 
 
 def _dataset_arg_for_container_replay(repo_root: Path, dataset_root: Path) -> str:

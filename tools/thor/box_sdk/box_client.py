@@ -254,6 +254,10 @@ class BoxClient:
         self._last_error: str | None = None
         self._started_at_s: float = 0.0
         self._started_wall_time_s: float = 0.0
+        self._sensor_update_count: dict[str, int] = {sid: 0 for sid in KNOWN_SENSOR_IDS}
+        self._sensor_rate_window_start_s: float = 0.0
+        self._sensor_rate_count: dict[str, int] = {sid: 0 for sid in KNOWN_SENSOR_IDS}
+        self._sensor_observed_hz: dict[str, float] = {sid: 0.0 for sid in KNOWN_SENSOR_IDS}
         self._recording = False
         self._record_t0_wall_s = 0.0
         self._record_samples: dict[str, list[SensorSample]] = {}
@@ -348,9 +352,20 @@ class BoxClient:
                 self._last_error = err
                 for sid, sensor_ts in sensor_timestamps.items():
                     if sensor_ts:
+                        if sensor_ts != self._last_sensor_timestamps.get(sid, 0):
+                            self._sensor_update_count[sid] = self._sensor_update_count.get(sid, 0) + 1
+                            self._sensor_rate_count[sid] = self._sensor_rate_count.get(sid, 0) + 1
                         self._last_sensor_timestamps[sid] = sensor_ts
                         self._first_seen_at_s.setdefault(sid, now)
                         self._last_seen_at_s[sid] = now
+                if self._sensor_rate_window_start_s == 0.0:
+                    self._sensor_rate_window_start_s = now
+                window = now - self._sensor_rate_window_start_s
+                if window >= 2.0:
+                    for sid in self._sensor_rate_count:
+                        self._sensor_observed_hz[sid] = self._sensor_rate_count[sid] / window
+                        self._sensor_rate_count[sid] = 0
+                    self._sensor_rate_window_start_s = now
                 if valid and decoded is not None:
                     for sid in decoded.get("sensors", {}):
                         self._first_seen_at_s.setdefault(sid, now)
@@ -396,6 +411,8 @@ class BoxClient:
                 "fresh": fresh,
                 "last_seen_age_s": max(0.0, now - last_seen) if last_seen else None,
                 "last_timestamp": int(self._last_sensor_timestamps.get(sid, 0)),
+                "observed_hz": round(self._sensor_observed_hz.get(sid, 0.0), 1),
+                "update_count": self._sensor_update_count.get(sid, 0),
             }
         return {
             "active": self._box is not None and not self._stop_event.is_set(),
@@ -493,6 +510,11 @@ class BoxClient:
         return list(self.cfg.expected_devices or KNOWN_SENSOR_IDS)
 
     # ---- introspection ----
+
+    def observed_rates(self) -> dict[str, float]:
+        """Return per-sensor observed update rates in Hz."""
+        with self._lock:
+            return dict(self._sensor_observed_hz)
 
     def is_active(self) -> bool:
         return self._box is not None and not self._stop_event.is_set()

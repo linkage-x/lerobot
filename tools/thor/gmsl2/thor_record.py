@@ -265,12 +265,15 @@ def main(argv: list[str] | None = None) -> int:
     box = bc.BoxClient(box_cfg)
     box_started = box.start() if box_cfg.enabled else False
     if box_started:
-        # A successful SDK transport session means the configured BOX rows are
-        # connected from the GUI's perspective. Sensor-cache freshness is
-        # recorded separately in box_collection.snapshots/status.
-        time.sleep(min(0.5, box_cfg.stale_threshold_s))
+        # Wait for the rate-estimation window (2s) to fill so we can report
+        # real per-sensor frequencies instead of the poll rate.
+        time.sleep(2.5)
         present = box.connected_devices()
         _emit(f"Box devices: {', '.join(present) if present else '(none)'}")
+        rates = box.observed_rates()
+        if any(rates.values()):
+            parts = [f"{sid}={hz:.0f}" for sid, hz in rates.items() if hz > 0]
+            _emit(f"Box rates: {', '.join(parts)}")
     elif box_cfg.enabled:
         _emit("Box devices: (none)")
         logger.warning("box_collection enabled but BoxClient.start() returned False")
