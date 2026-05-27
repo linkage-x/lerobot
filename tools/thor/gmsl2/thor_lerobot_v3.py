@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -203,8 +204,19 @@ def _feature(dtype: str, shape: list[int], names: list[str] | None = None) -> di
     return {"dtype": dtype, "shape": shape, "names": names}
 
 
-def extract_pts(mkv_path: Path, *, timeout_s: float = 30) -> list[float]:
-    """Extract per-frame PTS (seconds) from an MKV using ffprobe."""
+def _parse_ffprobe_pts(stdout: str) -> list[float]:
+    pts: list[float] = []
+    for line in stdout.strip().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                pts.append(float(line))
+            except ValueError:
+                pass
+    return pts
+
+
+def _extract_pts_ffprobe(mkv_path: Path, *, timeout_s: float) -> list[float] | None:
     cmd = [
         "ffprobe", "-v", "quiet",
         "-select_streams", "v:0",
@@ -215,23 +227,113 @@ def extract_pts(mkv_path: Path, *, timeout_s: float = 30) -> list[float]:
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except FileNotFoundError:
-        logger.warning("ffprobe not found; PTS extraction unavailable")
-        return []
+        logger.warning("ffprobe not found; falling back to GStreamer PTS extraction")
+        return None
     except subprocess.TimeoutExpired:
         logger.warning("ffprobe timed out on %s", mkv_path)
         return []
     if r.returncode != 0:
         logger.warning("ffprobe failed on %s: %s", mkv_path, r.stderr.strip()[:200])
         return []
+    return _parse_ffprobe_pts(r.stdout)
+
+
+def _extract_pts_gstreamer(mkv_path: Path, *, timeout_s: float) -> list[float]:
+    try:
+        import gi  # type: ignore
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst  # type: ignore
+    except Exception as exc:
+        logger.warning("GStreamer PTS extraction unavailable: %s", exc)
+        return []
+
+    Gst.init(None)
+    pipeline = Gst.Pipeline.new("thor-pts-probe")
+    filesrc = Gst.ElementFactory.make("filesrc", None)
+    demux = Gst.ElementFactory.make("matroskademux", None)
+    sink = Gst.ElementFactory.make("appsink", None)
+    if pipeline is None or filesrc is None or demux is None or sink is None:
+        logger.warning("GStreamer PTS extraction missing required elements")
+        return []
+
+    filesrc.set_property("location", str(mkv_path))
+    sink.set_property("emit-signals", False)
+    sink.set_property("sync", False)
+    sink.set_property("max-buffers", 4096)
+    sink.set_property("drop", False)
+
+    for element in (filesrc, demux, sink):
+        pipeline.add(element)
+    if not filesrc.link(demux):
+        logger.warning(
+            "GStreamer PTS extraction failed to link filesrc -> matroskademux"
+        )
+        pipeline.set_state(Gst.State.NULL)
+        return []
+
+    sink_pad = sink.get_static_pad("sink")
+    linked = {"done": False}
+
+    def _on_pad_added(_demux, pad) -> None:
+        if linked["done"] or sink_pad is None or sink_pad.is_linked():
+            return
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        caps_text = caps.to_string() if caps is not None else ""
+        if "video/" not in caps_text:
+            return
+        if pad.link(sink_pad) == Gst.PadLinkReturn.OK:
+            linked["done"] = True
+
+    demux.connect("pad-added", _on_pad_added)
+    bus = pipeline.get_bus()
     pts: list[float] = []
-    for line in r.stdout.strip().splitlines():
-        line = line.strip()
-        if line:
-            try:
-                pts.append(float(line))
-            except ValueError:
-                pass
+    deadline = time.monotonic() + max(float(timeout_s), 0.1)
+
+    try:
+        state_ret = pipeline.set_state(Gst.State.PLAYING)
+        if state_ret == Gst.StateChangeReturn.FAILURE:
+            logger.warning(
+                "GStreamer PTS extraction failed to start pipeline for %s", mkv_path
+            )
+            return []
+        while time.monotonic() < deadline:
+            sample = sink.emit("try-pull-sample", int(0.2 * Gst.SECOND))
+            if sample is not None:
+                buf = sample.get_buffer()
+                if buf is not None and buf.pts != Gst.CLOCK_TIME_NONE:
+                    pts.append(float(buf.pts) / float(Gst.SECOND))
+                continue
+            msg = bus.timed_pop_filtered(0, Gst.MessageType.ERROR | Gst.MessageType.EOS)
+            if msg is None:
+                continue
+            if msg.type == Gst.MessageType.ERROR:
+                err, debug = msg.parse_error()
+                logger.warning(
+                    "GStreamer PTS extraction failed on %s: %s (%s)",
+                    mkv_path, err, debug,
+                )
+                return []
+            if msg.type == Gst.MessageType.EOS:
+                break
+        else:
+            logger.warning("GStreamer PTS extraction timed out on %s", mkv_path)
+    finally:
+        pipeline.set_state(Gst.State.NULL)
     return pts
+
+
+def extract_pts(mkv_path: Path, *, timeout_s: float = 30) -> list[float]:
+    """Extract per-frame PTS (seconds) from an MKV.
+
+    Prefer ffprobe when it is installed.  Thor images do not always include
+    FFmpeg, so fall back to GStreamer, which is already required for capture.
+    """
+
+    pts = _extract_pts_ffprobe(mkv_path, timeout_s=timeout_s)
+    if pts is not None:
+        return pts
+    return _extract_pts_gstreamer(mkv_path, timeout_s=timeout_s)
 
 
 def calibrate_mcu_clock(
