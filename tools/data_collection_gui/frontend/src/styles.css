@@ -1161,8 +1161,9 @@ button.danger {
 
 .touch-heatmaps {
   display: grid;
-  gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 180px));
+  justify-content: start;
 }
 
 .touch-map {
@@ -1170,9 +1171,9 @@ button.danger {
   border: 1px solid #dce3e8;
   border-radius: 6px;
   display: grid;
-  gap: 8px;
+  gap: 5px;
   min-width: 0;
-  padding: 10px;
+  padding: 6px;
 }
 
 .touch-map-heading,
@@ -1180,14 +1181,14 @@ button.danger {
   align-items: center;
   color: #60707c;
   display: flex;
-  font-size: 11px;
-  gap: 8px;
+  font-size: 10px;
+  gap: 6px;
   justify-content: space-between;
 }
 
 .touch-map-heading strong {
   color: #172026;
-  font-size: 13px;
+  font-size: 11px;
 }
 
 .touch-grid {
@@ -1195,13 +1196,13 @@ button.danger {
   border: 1px solid #263241;
   border-radius: 5px;
   display: grid;
-  gap: 3px;
-  padding: 8px;
+  gap: 2px;
+  padding: 5px;
 }
 
 .touch-row {
   display: grid;
-  gap: 3px;
+  gap: 2px;
   grid-template-columns: repeat(17, minmax(0, 1fr));
 }
 
@@ -1226,9 +1227,9 @@ button.danger {
   border-radius: 5px;
   color: #60707c;
   display: flex;
-  font-size: 12px;
+  font-size: 11px;
   justify-content: center;
-  min-height: 180px;
+  min-height: 90px;
 }
 
 .touch-legend {

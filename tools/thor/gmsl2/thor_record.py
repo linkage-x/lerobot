@@ -361,11 +361,18 @@ def main(argv: list[str] | None = None) -> int:
                     box_sample_at = now
                 time.sleep(0.05)
 
-            session.stop(streams)
-            recorded_samples = box.stop_recording() if box_started else {}
-            pts_offset = _extract_pts_offset(streams)
+            capture_end_wall_s = time.time()
+            capture_end_mono_s = time.monotonic()
             wall_end = datetime.now(timezone.utc).isoformat()
-            duration_s = time.time() - t_start
+            duration_s = capture_end_wall_s - t_start
+            if box_started:
+                recorded_samples = box.stop_recording()
+            else:
+                recorded_samples = {}
+
+            session.stop(streams)
+            cleanup_duration_s = max(0.0, time.monotonic() - capture_end_mono_s)
+            pts_offset = _extract_pts_offset(streams)
 
             decision = stop_reason
             if decision == "duration_reached":
@@ -390,9 +397,16 @@ def main(argv: list[str] | None = None) -> int:
                     t0_wall_s=t0_wall,
                     t0_mono_s=t0_mono,
                 )
-                _write_episode_meta(
+                meta_path = _write_episode_meta(
                     ep, cfg, locked, argus_failed, box_cfg, box_snapshots, decision,
                 )
+                try:
+                    payload = json.loads(meta_path.read_text())
+                    payload["cleanup_duration_s"] = cleanup_duration_s
+                    payload["capture_end_before_stream_stop"] = True
+                    meta_path.write_text(json.dumps(payload, indent=2))
+                except (OSError, json.JSONDecodeError) as exc:
+                    logger.warning("failed to annotate cleanup duration: %s", exc)
                 if recorded_samples:
                     _write_sensor_samples(ep_dir, recorded_samples, t_start)
                 sensor_data = {
