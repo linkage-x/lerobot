@@ -132,17 +132,18 @@ def _write_episode_meta(
     argus_failed: list[int],
     box_cfg: bc.BoxClientConfig,
     box_snapshots: list[dict[str, Any]],
+    stop_reason: str,
 ) -> Path:
     meta_path = gr.write_episode_meta(ep, cfg, locked, argus_failed)
-    if not box_cfg.enabled:
-        return meta_path
-    # Augment the GMSL2 meta with box_collection info so downstream tools
-    # have everything in one file.
     payload = json.loads(meta_path.read_text())
-    payload["box_collection"] = {
-        "config": asdict(box_cfg),
-        "snapshots": box_snapshots,
-    }
+    payload["recording_stop_reason"] = stop_reason
+    if box_cfg.enabled:
+        # Augment the GMSL2 meta with box_collection info so downstream tools
+        # have everything in one file.
+        payload["box_collection"] = {
+            "config": asdict(box_cfg),
+            "snapshots": box_snapshots,
+        }
     meta_path.write_text(json.dumps(payload, indent=2))
     return meta_path
 
@@ -292,6 +293,15 @@ def main(argv: list[str] | None = None) -> int:
                         break
                 dead = [s for s in streams if s.proc and s.proc.poll() is not None]
                 if dead and cfg.stop_on_stream_exit:
+                    if box_started:
+                        snap = box.read()
+                        snap["t_relative_s"] = elapsed
+                        box_snapshots.append(snap)
+                    details = ", ".join(
+                        f"{s.name}(rc={s.proc.poll()}, log={s.log_file.name})" for s in dead
+                    )
+                    logger.warning("streams exited early: %s", details)
+                    _emit(f"Stream exited early: {details}")
                     stop_reason = "stream_exit"
                     break
                 if now - last_progress_at > 0.5:
@@ -321,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 decision = (decision_cmd.kind if decision_cmd else "save")
 
-            if decision in ("save", "operator_save"):
+            if decision in ("save", "operator_save", "stream_exit"):
                 ep = gr.EpisodeResult(
                     index=ep_idx,
                     directory=ep_dir,
@@ -332,9 +342,14 @@ def main(argv: list[str] | None = None) -> int:
                     t0_wall_s=t0_wall,
                     t0_mono_s=t0_mono,
                 )
-                _write_episode_meta(ep, cfg, locked, argus_failed, box_cfg, box_snapshots)
+                _write_episode_meta(
+                    ep, cfg, locked, argus_failed, box_cfg, box_snapshots, decision,
+                )
                 saved += 1
-                _emit("Episode saved.")
+                if decision == "stream_exit":
+                    _emit("Episode saved with stream exits.")
+                else:
+                    _emit("Episode saved.")
                 _emit(f"Total saved episodes: {saved}/{budget_str}")
                 ep_idx += 1
             else:
