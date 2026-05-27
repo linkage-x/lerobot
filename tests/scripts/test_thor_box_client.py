@@ -80,6 +80,7 @@ class _SensorCache:
     liwp_index: int = 0
     liwp_timestemp: int = 0  # SDK typo preserved
     data: _AllSensor = field(default_factory=_AllSensor)
+    touch_sensor_data: tuple = field(default_factory=tuple)
 
 
 class _FakeBox:
@@ -180,6 +181,39 @@ def test_decode_sensor_cache_filters_zero_timestamp_sensors():
     assert out["sensors"]["box_six_d_force"]["fxyz_mxyz"] == [1, 2, 3, 4, 5, 6]
     touch = out["sensors"]["box_touch_left"]
     assert len(touch["fx_0p1N"]) == 239 == len(touch["fy_0p1N"]) == len(touch["fz_0p1N"])
+
+
+def test_decode_sensor_cache_prefers_top_level_touch_array_over_legacy_fields():
+    legacy_left = _Touch(
+        timestamp=999,
+        forces=tuple(_TouchForce(fx=9, fy=9, fz=9) for _ in range(239)),
+    )
+    legacy_right = _Touch(timestamp=998)
+    array_left = _Touch(
+        timestamp=101,
+        forces=tuple(_TouchForce(fx=1, fy=2, fz=3) for _ in range(239)),
+    )
+    array_right = _Touch(
+        timestamp=202,
+        forces=tuple(_TouchForce(fx=-1, fy=-2, fz=4) for _ in range(239)),
+    )
+    snap = _SensorCache(
+        data=_AllSensor(
+            touch_sensor_data_first=legacy_left,
+            touch_sensor_data_sec=legacy_right,
+        ),
+        touch_sensor_data=(array_left, array_right),
+    )
+
+    out = box_client.decode_sensor_cache(snap)
+    timestamps = box_client._decode_sensor_timestamps(snap)
+
+    assert out["sensors"]["box_touch_left"]["timestamp"] == 101
+    assert out["sensors"]["box_touch_left"]["fz_0p1N"][0] == 3
+    assert out["sensors"]["box_touch_right"]["timestamp"] == 202
+    assert out["sensors"]["box_touch_right"]["fz_0p1N"][0] == 4
+    assert timestamps["box_touch_left"] == 101
+    assert timestamps["box_touch_right"] == 202
 
 
 def test_decode_sensor_cache_keeps_gripper_distance_when_timestamp_is_zero():

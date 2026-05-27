@@ -154,6 +154,24 @@ def _decode_touch(ts) -> dict[str, Any]:
     return {"timestamp": int(ts.timestamp), "fx_0p1N": fx, "fy_0p1N": fy, "fz_0p1N": fz}
 
 
+def _touch_sensor_pair(snap) -> tuple[Any, Any]:
+    """Return the left/right Paxini frames from the stable SDK cache fields.
+
+    The BOX wheel exposes touch data twice: as legacy flattened members under
+    ``snap.data`` and as the explicit two-element ``snap.touch_sensor_data``.
+    On current firmware the legacy members can report different effective
+    rates after power cycling, so use the explicit array whenever it exists.
+    """
+
+    data = snap.data
+    touch_array = getattr(snap, "touch_sensor_data", None)
+    if touch_array is not None and len(touch_array) >= 2:
+        return touch_array[0], touch_array[1]
+    if touch_array is not None and len(touch_array) == 1:
+        return touch_array[0], data.touch_sensor_data_sec
+    return data.touch_sensor_data_first, data.touch_sensor_data_sec
+
+
 def decode_sensor_cache(snap) -> dict[str, Any]:
     """Turn a ``box_sdk.SensorCache`` into a JSON-friendly dict.
 
@@ -181,13 +199,7 @@ def decode_sensor_cache(snap) -> dict[str, Any]:
         out["sensors"]["box_trigger"] = _decode_trigger(data.trigger_data)
     if data.six_d_force_data.timestamp:
         out["sensors"]["box_six_d_force"] = _decode_six_d_force(data.six_d_force_data)
-    touch_left = data.touch_sensor_data_first
-    touch_right = data.touch_sensor_data_sec
-    touch_array = getattr(snap, "touch_sensor_data", None)
-    if not getattr(touch_left, "timestamp", 0) and touch_array is not None and len(touch_array) >= 1:
-        touch_left = touch_array[0]
-    if not getattr(touch_right, "timestamp", 0) and touch_array is not None and len(touch_array) >= 2:
-        touch_right = touch_array[1]
+    touch_left, touch_right = _touch_sensor_pair(snap)
     if touch_left.timestamp:
         out["sensors"]["box_touch_left"] = _decode_touch(touch_left)
     if touch_right.timestamp:
@@ -199,13 +211,7 @@ def _decode_sensor_timestamps(snap) -> dict[str, int]:
     """Return raw per-sensor timestamps, including zeros for absent samples."""
 
     data = snap.data
-    touch_left = data.touch_sensor_data_first
-    touch_right = data.touch_sensor_data_sec
-    touch_array = getattr(snap, "touch_sensor_data", None)
-    if not getattr(touch_left, "timestamp", 0) and touch_array is not None and len(touch_array) >= 1:
-        touch_left = touch_array[0]
-    if not getattr(touch_right, "timestamp", 0) and touch_array is not None and len(touch_array) >= 2:
-        touch_right = touch_array[1]
+    touch_left, touch_right = _touch_sensor_pair(snap)
     return {
         "box_gripper": int(getattr(data.gripper_data, "timestamp", 0)),
         "box_imu": int(getattr(data.imu_data, "timestamp", 0)),
