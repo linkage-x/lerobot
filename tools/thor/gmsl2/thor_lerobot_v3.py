@@ -9,10 +9,15 @@ side of the dataset from BOX snapshots without changing the camera pipeline.
 
 from __future__ import annotations
 
+import bisect
 import json
+import logging
 import math
+import subprocess
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("thor_lerobot_v3")
 
 
 _TOUCH_SUMMARY_NAMES = (
@@ -198,6 +203,128 @@ def _feature(dtype: str, shape: list[int], names: list[str] | None = None) -> di
     return {"dtype": dtype, "shape": shape, "names": names}
 
 
+def extract_pts(mkv_path: Path, *, timeout_s: float = 30) -> list[float]:
+    """Extract per-frame PTS (seconds) from an MKV using ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time",
+        "-of", "csv=p=0",
+        str(mkv_path),
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+    except FileNotFoundError:
+        logger.warning("ffprobe not found; PTS extraction unavailable")
+        return []
+    except subprocess.TimeoutExpired:
+        logger.warning("ffprobe timed out on %s", mkv_path)
+        return []
+    if r.returncode != 0:
+        logger.warning("ffprobe failed on %s: %s", mkv_path, r.stderr.strip()[:200])
+        return []
+    pts: list[float] = []
+    for line in r.stdout.strip().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                pts.append(float(line))
+            except ValueError:
+                pass
+    return pts
+
+
+def calibrate_mcu_clock(
+    mcu_timestamps: list[int],
+    host_times: list[float],
+) -> tuple[float, float, float]:
+    """Fit mcu_timestamp → host_time via least-squares linear regression.
+
+    Returns ``(slope, intercept, residual_std)`` where
+    ``host_time ≈ slope * mcu_ts + intercept``.  *residual_std* is the
+    standard deviation of the fit residuals (an estimate of calibration
+    accuracy).  Returns ``(0, 0, inf)`` when there are fewer than 2 points.
+    """
+    n = len(mcu_timestamps)
+    if n < 2:
+        return (0.0, 0.0, float("inf"))
+    sx = sum(mcu_timestamps)
+    sy = sum(host_times)
+    sxx = sum(x * x for x in mcu_timestamps)
+    sxy = sum(x * y for x, y in zip(mcu_timestamps, host_times))
+    denom = n * sxx - sx * sx
+    if abs(denom) < 1e-30:
+        return (0.0, 0.0, float("inf"))
+    slope = (n * sxy - sx * sy) / denom
+    intercept = (sy - slope * sx) / n
+    residuals = [y - (slope * x + intercept)
+                 for x, y in zip(mcu_timestamps, host_times)]
+    res_std = (sum(r * r for r in residuals) / n) ** 0.5
+    return (slope, intercept, res_std)
+
+
+def calibrate_sensor_samples(
+    sensor_samples: dict[str, list[dict[str, Any]]],
+    t0_wall_s: float,
+) -> dict[str, list[dict[str, Any]]]:
+    """Replace ``t_rel_s`` with MCU-clock-calibrated times when possible.
+
+    For each sensor with enough samples, fits a linear MCU→host mapping and
+    recomputes ``t_rel_s`` from MCU timestamps.  Sensors with <10 samples or
+    poor fits (residual_std > 0.05s) keep their original poll-based times.
+
+    Returns a *new* dict (original is not mutated).
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    for sid, slist in sensor_samples.items():
+        if len(slist) < 10:
+            out[sid] = list(slist)
+            continue
+        mcu_ts = [s["data"].get("timestamp", 0) for s in slist]
+        host_ts = [s.get("wall_s", t0_wall_s + s["t_rel_s"]) for s in slist]
+        if not any(mcu_ts):
+            out[sid] = list(slist)
+            continue
+        slope, intercept, res_std = calibrate_mcu_clock(mcu_ts, host_ts)
+        if res_std > 0.05 or slope == 0.0:
+            logger.warning("MCU clock calibration poor for %s (std=%.4fs); "
+                           "keeping poll-based times", sid, res_std)
+            out[sid] = list(slist)
+            continue
+        logger.info("MCU clock calibration for %s: slope=%.9f intercept=%.3f "
+                    "residual_std=%.6fs (%d samples)",
+                    sid, slope, intercept, res_std, len(slist))
+        calibrated: list[dict[str, Any]] = []
+        for s in slist:
+            ts = s["data"].get("timestamp", 0)
+            if ts:
+                cal_wall = slope * ts + intercept
+                cal_rel = cal_wall - t0_wall_s
+            else:
+                cal_rel = s["t_rel_s"]
+            calibrated.append({**s, "t_rel_s": cal_rel})
+        out[sid] = calibrated
+    return out
+
+
+def _nearest_sample_data(
+    times: list[float],
+    samples: list[dict[str, Any]],
+    t: float,
+) -> dict[str, Any]:
+    """Find the sensor sample whose ``t_rel_s`` is nearest to *t*."""
+    if not samples:
+        return {}
+    idx = bisect.bisect_left(times, t)
+    if idx == 0:
+        return samples[0].get("data", {})
+    if idx >= len(samples):
+        return samples[-1].get("data", {})
+    if t - times[idx - 1] <= times[idx] - t:
+        return samples[idx - 1].get("data", {})
+    return samples[idx].get("data", {})
+
+
 def _rows_to_table(pa, rows: list[dict[str, Any]]):
     state_width = len(BOX_STATE_NAMES)
 
@@ -232,15 +359,31 @@ def write_box_lerobot_v3_episode(
     episode_index: int,
     snapshots: list[dict[str, Any]],
     duration_s: float | None = None,
+    sensor_samples: dict[str, list[dict[str, Any]]] | None = None,
+    t0_wall_s: float = 0.0,
+    pts_offset_s: float | None = None,
 ) -> Path | None:
     """Append BOX snapshots for one episode to a minimal LeRobot v3 dataset.
 
+    When *sensor_samples* is provided (high-frequency per-sensor data from
+    ``BoxClient.stop_recording``), each camera frame is composed via
+    per-sensor nearest-neighbor interpolation for maximum accuracy.
+    Otherwise falls back to the legacy snapshot path.
+
+    Enhanced alignment (L3b):
+      - *t0_wall_s*: episode start wall time, used for MCU clock calibration.
+      - *pts_offset_s*: first-frame PTS from the reference camera MKV.  When
+        provided, the frame time grid shifts by this offset so that frame 0
+        aligns with the actual first capture instant rather than the pipeline
+        spawn time.
+
     Returns the parquet path when rows were written. If ``pyarrow`` is missing
-    or no snapshots were captured, returns ``None`` so the recorder can keep
+    or no data was captured, returns ``None`` so the recorder can keep
     the hardware capture path alive.
     """
 
-    if not snapshots:
+    use_hf = bool(sensor_samples and any(sensor_samples.values()))
+    if not snapshots and not use_hf:
         return None
     try:
         import pyarrow as pa
@@ -259,43 +402,64 @@ def write_box_lerobot_v3_episode(
     if data_path.exists():
         existing_rows = pq.read_table(data_path).to_pylist()
 
-    frame_count = len(snapshots)
+    frame_count = len(snapshots) if snapshots else 0
     if duration_s is not None and duration_s > 0:
         frame_count = max(frame_count, int(round(float(duration_s) * max(int(fps), 1))))
 
-    ordered_snapshots = sorted(
-        snapshots,
-        key=lambda snap: _finite_float(snap.get("t_relative_s")),
-    )
-
-    def snapshot_for_timestamp(timestamp_s: float) -> dict[str, Any]:
-        selected = ordered_snapshots[0]
-        for candidate in ordered_snapshots:
-            if _finite_float(candidate.get("t_relative_s")) <= timestamp_s + 1e-9:
-                selected = candidate
-            else:
-                break
-        return selected
-
     rows: list[dict[str, Any]] = []
-    for local_frame in range(frame_count):
-        timestamp_s = local_frame / max(int(fps), 1)
-        snapshot = snapshot_for_timestamp(timestamp_s)
-        state = box_snapshot_to_state(snapshot)
-        rows.append(
-            {
+    if use_hf:
+        calibrated = calibrate_sensor_samples(sensor_samples, t0_wall_s) if t0_wall_s else sensor_samples
+        frame_origin_s = pts_offset_s if pts_offset_s is not None else 0.0
+
+        per_sensor: dict[str, tuple[list[float], list[dict[str, Any]]]] = {}
+        for sid, slist_raw in calibrated.items():
+            slist = sorted(slist_raw, key=lambda s: s["t_rel_s"])
+            per_sensor[sid] = ([s["t_rel_s"] for s in slist], slist)
+        for local_frame in range(frame_count):
+            timestamp_s = frame_origin_s + local_frame / max(int(fps), 1)
+            sensors: dict[str, Any] = {}
+            for sid, (times, slist) in per_sensor.items():
+                data = _nearest_sample_data(times, slist, timestamp_s)
+                if data:
+                    sensors[sid] = data
+            state = box_snapshot_to_state({"valid": bool(sensors), "sensors": sensors})
+            rows.append({
                 "observation.state": state,
-                # BOX collection has no separate command stream. Mirror the
-                # latest measured state so replay exposes the same named values
-                # through its action panel instead of leaving action blank.
                 "action": list(state),
                 "timestamp": timestamp_s,
                 "frame_index": local_frame,
                 "episode_index": episode_index,
                 "index": 0,
                 "task_index": 0,
-            }
+            })
+    else:
+        ordered_snapshots = sorted(
+            snapshots,
+            key=lambda snap: _finite_float(snap.get("t_relative_s")),
         )
+
+        def snapshot_for_timestamp(timestamp_s: float) -> dict[str, Any]:
+            selected = ordered_snapshots[0]
+            for candidate in ordered_snapshots:
+                if _finite_float(candidate.get("t_relative_s")) <= timestamp_s + 1e-9:
+                    selected = candidate
+                else:
+                    break
+            return selected
+
+        for local_frame in range(frame_count):
+            timestamp_s = local_frame / max(int(fps), 1)
+            snapshot = snapshot_for_timestamp(timestamp_s)
+            state = box_snapshot_to_state(snapshot)
+            rows.append({
+                "observation.state": state,
+                "action": list(state),
+                "timestamp": timestamp_s,
+                "frame_index": local_frame,
+                "episode_index": episode_index,
+                "index": 0,
+                "task_index": 0,
+            })
 
     existing_rows = [
         row for row in existing_rows

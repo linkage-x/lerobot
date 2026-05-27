@@ -22,6 +22,10 @@ rsync -avz --delete \
   --exclude='notes/' \
   --exclude='.claude/' \
   --exclude='core' \
+  --exclude='run/run_gateway.sh' \
+  --exclude='run/run_vite.sh' \
+  --exclude='run/restart_gateway.sh' \
+  --exclude='run/logs/' \
   "$@" \
   "$LOCAL_DIR" "${THOR}:${REMOTE_DIR}"
 

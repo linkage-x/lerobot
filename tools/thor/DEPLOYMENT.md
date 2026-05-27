@@ -235,30 +235,33 @@ bash ~/lerobot/run/run_vite.sh &
 # 开发机访问 http://<jetson-ip>:5173/
 ```
 
-## 9. 本地开发 → Thor 同步
+## 9. 本地开发 → Thor 部署
 
-开发机改完代码后用 rsync 同步到 Thor：
+### 一键部署
 
-```bash
-bash run/sync_to_thor.sh            # 增量同步 (~1s)
-bash run/sync_to_thor.sh --dry-run  # 预览
-```
-
-脚本自动排除 `.git/`、`node_modules/`、`__pycache__/`、`outputs/` 等。
-同步后在 Thor 上重启 gateway：
+开发机改完代码后一条命令完成 同步 → 重启 gateway → 启动前端：
 
 ```bash
-ssh nvidia@192.168.111.122
-pkill -f "tools.data_collection_gui.gateway"; sleep 1
-cd ~/lerobot && PYTHONPATH=src:. PYTHONUNBUFFERED=1 \
-  setsid python3 -m tools.data_collection_gui.gateway \
-  --config-path tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml \
-  --datasets-root outputs/datasets --port 8765 --host 0.0.0.0 \
-  </dev/null >/tmp/gateway.log 2>&1 &
+bash run/deploy.sh              # 全流程：sync + restart gateway + start vite
+bash run/deploy.sh --sync-only  # 只同步代码，不重启/不启前端
+bash run/deploy.sh --no-frontend # 同步 + 重启 gateway，不启前端
 ```
 
-本地前端 vite 代理默认指向 `http://192.168.111.122:8765`，改完代码
-`npm run dev` 即可连到 Thor 上的 gateway。
+脚本执行：
+1. `rsync` 增量同步到 `nvidia@192.168.111.122:~/lerobot`（~1s）
+2. SSH 到 Thor：kill 旧 gateway → `ensure_box_net.sh` → `setup_env.sh` → 后台启动 gateway
+3. 本地 `npm run dev` 启动 vite，代理 → `192.168.111.122:8765`
+4. 浏览器打开 `http://localhost:5173/`
+
+### 单独操作
+
+```bash
+bash run/sync_to_thor.sh            # 只同步（增量 ~1s）
+bash run/sync_to_thor.sh --dry-run  # 预览同步内容
+```
+
+`sync_to_thor.sh` 排除 `.git/`、`node_modules/`、`outputs/`、Thor 本地的
+`run/run_gateway.sh` / `run/restart_gateway.sh` / `run/logs/` 等。
 
 ## 10. 已知问题与已修复的坑
 
@@ -333,7 +336,72 @@ trigger / 6D force / touch）通过 UDP/15000 发送，MCU 内部时钟独立于
 BOX snapshot 时间 = t0_wall_s + t_relative_s
 ```
 
-最近邻插值即可。20Hz BOX poll 下精度 ±25ms。
+### 已实现：高频独立采样 + 逐传感器软同步（L3）
+
+录制时 `BoxClient` 以 500Hz (`record_poll_interval_s=0.002`) 轮询 SDK 的
+`get_sensor_cache()`，通过比较各传感器的 MCU 时间戳去重，每个传感器按 MCU
+原生推送频率独立记录。每个样本标注：
+
+- **MCU 时间戳**：传感器硬件时钟，仅用于去重（检测新样本），不参与对齐
+- **主机 `time.time()`**：轮询到数据的时刻，用于与相机帧对齐
+
+对齐基于主机 wall-clock：相机帧时间 `t0 + frame_index / 60` 和 BOX 样本时间
+`time.time()` 都引用主机时钟。但注意两侧均有抖动来源：
+
+- 相机侧：spawn offset 是 gst-launch 进程启动时刻，非首帧 PWM 边沿时刻
+- BOX 侧：UDP 传输延迟 + 轮询时机（`time.time()` 是收到时刻，非 MCU 采集时刻）
+
+录制结束时：
+- 原始数据写入 `box_sensors.jsonl`（每行一个传感器样本，按时间排序）
+- LeRobot v3 parquet 中对每个 60Hz 相机帧，逐传感器做最近邻插值（下采样）
+
+**对齐精度取决于传感器推送频率和主机侧抖动**：
+- IMU (典型 200Hz) → ±2.5ms + 轮询抖动
+- 六维力 (典型 100Hz) → ±5ms + 轮询抖动
+- Gripper (典型 50Hz) → ±10ms + 轮询抖动
+- 触觉 (典型 100Hz) → ±5ms + 轮询抖动
+
+### 已实现：增强对齐（PTS 提取 + MCU 时钟校准）
+
+L3 基础对齐依赖两个近似：相机帧时间用 `spawn_offset + N/fps` 推算（忽略
+管道启动延迟），BOX 样本时间用轮询时刻 `time.time()` 代替（包含 UDP 延迟
+和 poll 抖动）。增强对齐从两侧消除这些抖动源：
+
+**相机侧：MKV PTS 提取**
+
+Episode 结束后用 `ffprobe` 从参考相机的 MKV 中提取逐帧 PTS。PTS 由
+`nvarguscamerasrc do-timestamp=true` 写入，反映实际帧采集时刻相对管道时钟
+的偏移。由于 11 路相机共享 PWM 触发，帧间间隔严格为 `1/fps`，只需一路的
+PTS 即可重建整个帧时间网格：
+
+```
+actual_frame_time[N] = camera_spawn_wall_s + pts[0] + N / fps
+```
+
+其中 `pts[0]` 是首帧实际到达时刻，包含了管道启动延迟（典型 100-500ms）。
+
+**BOX 侧：MCU↔Host 时钟线性回归**
+
+录制期间每个传感器有大量 `(mcu_timestamp, host_wall_time)` 观测对。对每个
+传感器做最小二乘线性回归：
+
+```
+host_time_estimated = slope × mcu_ts + intercept
+```
+
+- `slope` ≈ MCU 时钟周期（ticks → seconds）
+- `intercept` = 两个时钟域的偏移量
+
+拟合后用 `mcu_timestamp` 反推更准确的主机时间，消除逐次 poll 的 UDP 延迟
+和抖动。残差标准差即为校准精度（典型 <0.5ms）。
+
+**对齐流程**
+
+1. `ffprobe` 提取参考相机 PTS → 得到实际帧时间网格
+2. 逐传感器线性回归 → 得到每个样本的校准后主机时间
+3. 对每个相机帧，逐传感器在校准后时间线上做最近邻 → 组成 state 向量
+
+精度从 ±2.5~10ms 提升到 ±0.5~1ms，代价是 episode 结束后 ~1s 后处理。
 
 ### 待实现：导出阶段对齐
 
@@ -355,7 +423,8 @@ LeRobot v3 parquet 训练格式，在此阶段执行对齐：
 | L0 硬同步（相机间） | <1μs | ✅ 已工作 | PWM slave mode，11 路帧对齐 |
 | L1 软同步元数据 | ±25ms | ✅ 已实现 | sync_reference in meta.json |
 | L2 导出时对齐 | ±25ms | 🔲 待实现 | BOX 上行通后实现，写入 parquet |
-| L3 录制时高频对齐 | ±8ms | 🔲 可选 | BOX poll 提到 60Hz，帧级对齐表 |
+| L3a 录制时高频对齐 | ±2.5ms~±10ms | ✅ 已实现 | 500Hz poll + per-sensor MCU 时间戳去重 + 逐传感器最近邻插值 |
+| L3b 增强对齐 | ±0.5~1ms | ✅ 已实现 | MKV PTS 提取 + MCU↔Host 时钟线性回归 |
 | L4 硬件级全同步 | <1μs | 🔲 需硬件改 | BOX MCU 也由 PWM 触发 |
 
 

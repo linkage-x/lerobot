@@ -48,6 +48,16 @@ KNOWN_SENSOR_IDS = (
 
 
 @dataclass
+class SensorSample:
+    """One timestamped sample from a single BOX sensor, deduplicated by MCU timestamp."""
+    sensor_id: str
+    mcu_timestamp: int
+    wall_time_s: float
+    mono_time_s: float
+    data: dict[str, Any]
+
+
+@dataclass
 class BoxClientConfig:
     enabled: bool = True
     bind_ip: str = "0.0.0.0"
@@ -59,6 +69,7 @@ class BoxClientConfig:
     urdf_relpath: str = "share/monte_gripper.urdf"
     startup_mode: int = 0  # 0 = collection / trigger-controlled, 1 = control
     poll_interval_s: float = 0.05
+    record_poll_interval_s: float = 0.002
     stale_threshold_s: float = 1.0
     expected_devices: list[str] = field(default_factory=lambda: list(KNOWN_SENSOR_IDS))
 
@@ -95,6 +106,7 @@ def from_yaml_dict(raw: dict[str, Any] | None) -> BoxClientConfig:
         urdf_relpath=str(raw.get("urdf_relpath", "share/monte_gripper.urdf")),
         startup_mode=int(raw.get("startup_mode", 0)),
         poll_interval_s=float(raw.get("poll_interval_s", 0.05)),
+        record_poll_interval_s=float(raw.get("record_poll_interval_s", 0.002)),
         stale_threshold_s=float(raw.get("stale_threshold_s", 1.0)),
         expected_devices=[str(x) for x in expected],
     )
@@ -242,6 +254,10 @@ class BoxClient:
         self._last_error: str | None = None
         self._started_at_s: float = 0.0
         self._started_wall_time_s: float = 0.0
+        self._recording = False
+        self._record_t0_wall_s = 0.0
+        self._record_samples: dict[str, list[SensorSample]] = {}
+        self._record_last_ts: dict[str, int] = {}
 
     # ---- lifecycle ----
 
@@ -302,7 +318,6 @@ class BoxClient:
 
     def _poll_loop(self) -> None:
         assert self._box is not None
-        interval = max(0.005, float(self.cfg.poll_interval_s))
         while not self._stop_event.is_set():
             try:
                 rc, snap = self._box.get_sensor_cache()
@@ -315,7 +330,9 @@ class BoxClient:
                     self._last_poll_wall_time_s = time.time()
                     self._last_rc = None
                     self._last_error = str(exc)
-                self._stop_event.wait(interval)
+                    recording = self._recording
+                interval = self.cfg.record_poll_interval_s if recording else self.cfg.poll_interval_s
+                self._stop_event.wait(max(0.001, interval))
                 continue
             now = time.monotonic()
             wall_now = time.time()
@@ -342,7 +359,23 @@ class BoxClient:
                     self._latest = decoded
                     self._latest_at_s = now
                     self._latest_wall_time_s = wall_now
-            self._stop_event.wait(interval)
+                if self._recording and decoded is not None:
+                    sensors = decoded.get("sensors", {})
+                    for sid, ts in sensor_timestamps.items():
+                        if ts and ts != self._record_last_ts.get(sid, 0) and sid in sensors:
+                            self._record_last_ts[sid] = ts
+                            self._record_samples.setdefault(sid, []).append(
+                                SensorSample(
+                                    sensor_id=sid,
+                                    mcu_timestamp=ts,
+                                    wall_time_s=wall_now,
+                                    mono_time_s=now,
+                                    data=sensors[sid],
+                                )
+                            )
+                recording = self._recording
+            interval = self.cfg.record_poll_interval_s if recording else self.cfg.poll_interval_s
+            self._stop_event.wait(max(0.001, interval))
 
     def _err_str(self, rc: int) -> str:
         if self._box is None:
@@ -387,6 +420,51 @@ class BoxClient:
             snap["received_wall_time_s"] = self._latest_wall_time_s
             snap["status"] = self._status_locked()
         return snap
+
+    def start_recording(self, t0_wall_s: float) -> None:
+        """Begin high-frequency per-sensor sample recording for an episode.
+
+        Switches the poll loop to ``record_poll_interval_s`` and starts
+        deduplicating sensor samples by MCU timestamp into per-sensor buffers.
+        """
+        with self._lock:
+            self._recording = True
+            self._record_t0_wall_s = t0_wall_s
+            self._record_samples = {sid: [] for sid in KNOWN_SENSOR_IDS}
+            self._record_last_ts = dict(self._last_sensor_timestamps)
+        logger.info("recording started (t0=%.3f, poll=%.1fms)",
+                    t0_wall_s, self.cfg.record_poll_interval_s * 1000)
+
+    def stop_recording(self) -> dict[str, list[SensorSample]]:
+        """Stop recording and return all per-sensor samples collected."""
+        with self._lock:
+            self._recording = False
+            samples = self._record_samples
+            self._record_samples = {}
+            self._record_last_ts = {}
+        total = sum(len(v) for v in samples.values())
+        per_sensor = {sid: len(v) for sid, v in samples.items() if v}
+        logger.info("recording stopped: %d total samples, per-sensor: %s", total, per_sensor)
+        return samples
+
+    @staticmethod
+    def serialize_recorded_samples(
+        samples: dict[str, list[SensorSample]],
+        t0_wall_s: float,
+    ) -> list[dict[str, Any]]:
+        """Flatten per-sensor samples into a time-sorted list for JSON serialization."""
+        out: list[dict[str, Any]] = []
+        for sample_list in samples.values():
+            for s in sample_list:
+                out.append({
+                    "sid": s.sensor_id,
+                    "mcu_ts": s.mcu_timestamp,
+                    "wall_s": s.wall_time_s,
+                    "t_rel_s": s.wall_time_s - t0_wall_s,
+                    "data": s.data,
+                })
+        out.sort(key=lambda x: x["wall_s"])
+        return out
 
     def detect(self) -> list[str]:
         """Return which expected sensors have published at least once."""

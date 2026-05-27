@@ -126,6 +126,46 @@ def _drain_until(queue: list[StdinCommand], accept: tuple[str, ...],
 # ----------------------------------------------------------------- meta ---
 
 
+def _extract_pts_offset(streams: list[gr.CameraStream]) -> float | None:
+    """Extract the first-frame PTS from the earliest camera's MKV.
+
+    All cameras share the same PWM trigger so the inter-frame interval is
+    identical.  Only the absolute offset of the first frame matters — use the
+    camera with the smallest spawn_stagger (earliest start).  Returns
+    ``None`` when ffprobe is unavailable or the MKV is empty/corrupt.
+    """
+    candidates = sorted(streams, key=lambda s: s.started_at)
+    for stream in candidates:
+        if not stream.file.exists() or stream.file.stat().st_size < 1024:
+            continue
+        pts_list = lr3.extract_pts(stream.file)
+        if pts_list:
+            logger.info("PTS offset from %s: %.6fs (first of %d frames)",
+                        stream.name, pts_list[0], len(pts_list))
+            return pts_list[0]
+    logger.warning("could not extract PTS from any camera MKV")
+    return None
+
+
+def _write_sensor_samples(
+    ep_dir: Path,
+    samples: dict[str, list[bc.SensorSample]],
+    t0_wall_s: float,
+) -> Path:
+    """Write high-frequency per-sensor samples to box_sensors.jsonl."""
+    all_samples = bc.BoxClient.serialize_recorded_samples(samples, t0_wall_s)
+    path = ep_dir / "box_sensors.jsonl"
+    with open(path, "w") as f:
+        for sample in all_samples:
+            f.write(json.dumps(sample) + "\n")
+    per_sensor = {}
+    for s in all_samples:
+        sid = s["sid"]
+        per_sensor[sid] = per_sensor.get(sid, 0) + 1
+    logger.info("wrote %d sensor samples to %s (%s)", len(all_samples), path, per_sensor)
+    return path
+
+
 def _write_episode_meta(
     ep: gr.EpisodeResult,
     cfg: gr.RecorderConfig,
@@ -271,6 +311,8 @@ def main(argv: list[str] | None = None) -> int:
             streams = session.start(ep_dir)
             t_start = time.time()
             logger.info("episode %d started @ %s -> %s", ep_idx, wall_start, ep_dir)
+            if box_started:
+                box.start_recording(t0_wall)
             box_snapshots: list[dict[str, Any]] = []
             target_s = cfg.episode_time_s if cfg.episode_time_s > 0 else float("inf")
             last_progress_at = 0.0
@@ -317,6 +359,8 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(0.05)
 
             session.stop(streams)
+            recorded_samples = box.stop_recording() if box_started else {}
+            pts_offset = _extract_pts_offset(streams)
             wall_end = datetime.now(timezone.utc).isoformat()
             duration_s = time.time() - t_start
 
@@ -346,6 +390,15 @@ def main(argv: list[str] | None = None) -> int:
                 _write_episode_meta(
                     ep, cfg, locked, argus_failed, box_cfg, box_snapshots, decision,
                 )
+                if recorded_samples:
+                    _write_sensor_samples(ep_dir, recorded_samples, t0_wall)
+                sensor_data = {
+                    sid: [{"t_rel_s": s.wall_time_s - t0_wall,
+                           "wall_s": s.wall_time_s,
+                           "data": s.data}
+                          for s in slist]
+                    for sid, slist in recorded_samples.items()
+                } if recorded_samples else None
                 try:
                     v3_path = lr3.write_box_lerobot_v3_episode(
                         cfg.dataset_root,
@@ -355,6 +408,9 @@ def main(argv: list[str] | None = None) -> int:
                         episode_index=ep_idx,
                         snapshots=box_snapshots,
                         duration_s=duration_s,
+                        sensor_samples=sensor_data,
+                        t0_wall_s=t0_wall,
+                        pts_offset_s=pts_offset,
                     )
                     if v3_path is not None:
                         logger.info("wrote BOX LeRobot v3 rows: %s", v3_path)
