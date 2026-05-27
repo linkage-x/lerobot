@@ -29,3 +29,9 @@ fi
 
 ip -br addr show "$IFACE"
 ip route get "$BOX_IP" || true
+
+# After the BOX board is power-cycled independently, its ARP cache may not
+# contain Thor's 192.168.2.45 MAC yet. Probe once so the board can relearn it
+# before the SDK waits for UDP/15000 sensor packets.
+ping -I "${ADDR%/*}" -c 1 -W 1 "$BOX_IP" >/dev/null 2>&1 || true
+ip neigh show "$BOX_IP" || true

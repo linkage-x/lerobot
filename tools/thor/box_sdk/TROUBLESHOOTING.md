@@ -106,7 +106,7 @@ box_touch_right.timestamp = 9364164
 
 ## 5. 当前结论
 
-BOX 传感器流上行链路已打通，LeRobot wrapper 已能把 6 个 BOX sensor 标记为 seen/fresh，并记录 gripper distance 与各 sensor timestamp。后续如仍出现 `rc=4`，优先检查 `thor-box-net.service` 是否 active、Thor 是否仍持有 `192.168.2.45/24`，以及当前 recorder/gateway 是否使用了 `bind_ip: "192.168.2.45"` 的配置。
+BOX 传感器流上行链路已打通，LeRobot wrapper 已能把 6 个 BOX sensor 标记为 seen/fresh，并记录 gripper distance 与各 sensor timestamp。后续如仍出现 `rc=4`，优先检查 `thor-box-net.service` 是否 active、Thor 是否仍持有 `192.168.2.45/24`，当前 recorder/gateway 是否使用了 `bind_ip: "192.168.2.45"`，并从 `192.168.2.45` 主动 probe 一次 `192.168.2.60` 以刷新 BOX 重上电后的 ARP/邻居状态。
 
 ## 6. 给供应商的简短结论
 
