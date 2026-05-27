@@ -1154,6 +1154,100 @@ button.danger {
   grid-template-columns: minmax(320px, 1.4fr) minmax(220px, 1fr) minmax(220px, 1fr);
 }
 
+.touch-panel {
+  display: grid;
+  gap: 8px;
+}
+
+.touch-heatmaps {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.touch-map {
+  background: #f8fafb;
+  border: 1px solid #dce3e8;
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+}
+
+.touch-map-heading,
+.touch-map-footer {
+  align-items: center;
+  color: #60707c;
+  display: flex;
+  font-size: 11px;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.touch-map-heading strong {
+  color: #172026;
+  font-size: 13px;
+}
+
+.touch-grid {
+  background: #111827;
+  border: 1px solid #263241;
+  border-radius: 5px;
+  display: grid;
+  gap: 3px;
+  padding: 8px;
+}
+
+.touch-row {
+  display: grid;
+  gap: 3px;
+  grid-template-columns: repeat(17, minmax(0, 1fr));
+}
+
+.touch-cell {
+  aspect-ratio: 1;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 2px;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.16);
+  min-width: 0;
+}
+
+.touch-cell-empty {
+  border-color: transparent;
+  box-shadow: none;
+  opacity: 0;
+}
+
+.touch-empty {
+  align-items: center;
+  background: #f1f5f8;
+  border: 1px dashed #c8d2da;
+  border-radius: 5px;
+  color: #60707c;
+  display: flex;
+  font-size: 12px;
+  justify-content: center;
+  min-height: 180px;
+}
+
+.touch-legend {
+  align-items: center;
+  color: #60707c;
+  display: grid;
+  font-size: 11px;
+  gap: 8px;
+  grid-template-columns: auto minmax(140px, 240px) auto;
+  justify-content: end;
+}
+
+.touch-legend div {
+  background: linear-gradient(90deg, #111827, #2563eb, #14b8a6, #facc15, #ef4444);
+  border: 1px solid #c8d2da;
+  border-radius: 999px;
+  height: 8px;
+}
+
 .pose-panel {
   display: grid;
   gap: 8px;

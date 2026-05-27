@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import os
@@ -1936,6 +1937,96 @@ def _gmsl2_replay_warmup_s(ep_meta: dict[str, Any]) -> float:
     ]))
 
 
+def _touch_payload(data: Any) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    fz = _as_float_list(data.get("fz_0p1N"))[:239]
+    if len(fz) != 239:
+        return None
+    timestamp = int(_first_finite(data.get("timestamp"), default=0.0))
+    active_points = sum(1 for value in fz if abs(value) > 0.0)
+    return {
+        "timestamp": timestamp,
+        "fz": fz,
+        "maxFz": max(fz) if fz else 0.0,
+        "activePoints": active_points,
+    }
+
+
+def _read_touch_samples(ep_dir: Path) -> dict[str, list[tuple[float, dict[str, Any]]]]:
+    samples: dict[str, list[tuple[float, dict[str, Any]]]] = {"left": [], "right": []}
+    path = ep_dir / "box_sensors.jsonl"
+    if not path.is_file():
+        return samples
+    side_by_sid = {"box_touch_left": "left", "box_touch_right": "right"}
+    try:
+        with path.open() as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                side = side_by_sid.get(str(row.get("sid") or ""))
+                if side is None:
+                    continue
+                t_rel_s = _first_finite(row.get("t_rel_s"), default=float("nan"))
+                if t_rel_s != t_rel_s:
+                    continue
+                payload = _touch_payload(row.get("data"))
+                if payload is None:
+                    continue
+                payload["tRelS"] = t_rel_s
+                samples[side].append((t_rel_s, payload))
+    except OSError:
+        return {"left": [], "right": []}
+    for side in samples:
+        samples[side].sort(key=lambda item: item[0])
+    return samples
+
+
+def _nearest_touch_payload(
+    samples: list[tuple[float, dict[str, Any]]],
+    target_s: float,
+    *,
+    max_age_s: float = 0.25,
+) -> dict[str, Any] | None:
+    if not samples:
+        return None
+    times = [item[0] for item in samples]
+    index = bisect.bisect_left(times, target_s)
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    if index < len(samples):
+        candidates.append(samples[index])
+    if index > 0:
+        candidates.append(samples[index - 1])
+    if not candidates:
+        return None
+    sample_t, payload = min(candidates, key=lambda item: abs(item[0] - target_s))
+    if abs(sample_t - target_s) > max_age_s:
+        return None
+    return payload
+
+
+def _attach_touch_frames(frames: list[dict[str, Any]], ep_dir: Path, *, video_warmup_s: float = 0.0) -> None:
+    samples = _read_touch_samples(ep_dir)
+    if not samples["left"] and not samples["right"]:
+        return
+    for frame in frames:
+        target_s = _first_finite(frame.get("timestamp"), default=0.0) + max(0.0, video_warmup_s)
+        left = _nearest_touch_payload(samples["left"], target_s)
+        right = _nearest_touch_payload(samples["right"], target_s)
+        if left is None and right is None:
+            continue
+        touch: dict[str, Any] = {}
+        if left is not None:
+            touch["left"] = left
+        if right is not None:
+            touch["right"] = right
+        frame["touch"] = touch
+
+
 def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict[str, Any]:
     ep_dirs = _gmsl2_episode_dirs(dataset_root)
     if not ep_dirs:
@@ -1967,6 +2058,7 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
             "action": [],
             "eePose": {},
         })
+    _attach_touch_frames(frames, ep_dir, video_warmup_s=video_warmup_s)
     return {
         "datasetRoot": str(dataset_root),
         "name": dataset_root.name,
@@ -2049,6 +2141,10 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
     rows = table.to_pylist()
     rows.sort(key=lambda row: int(row.get("frame_index") or 0))
 
+    ep_dir: Path | None = None
+    if _has_gmsl2_episodes(dataset_root):
+        ep_dir = dataset_root / "episodes" / f"episode_{int(episode or 0):06d}"
+
     frames: list[dict[str, Any]] = []
     for row_index, row in enumerate(rows):
         frame_index = int(row.get("frame_index") if row.get("frame_index") is not None else row_index)
@@ -2065,6 +2161,9 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
                 "eePose": pose,
             }
         )
+
+    if ep_dir is not None and ep_dir.is_dir():
+        _attach_touch_frames(frames, ep_dir, video_warmup_s=video_warmup_s)
 
     video_template = str(info.get("video_path") or "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
 

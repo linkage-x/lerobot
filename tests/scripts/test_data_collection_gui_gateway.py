@@ -99,6 +99,48 @@ def test_gmsl2_timeline_applies_replay_warmup(tmp_path):
     assert timeline["frames"][0]["timestamp"] == 0
 
 
+def test_gmsl2_timeline_includes_touch_heatmap_samples(tmp_path):
+    dataset_root = tmp_path / "gmsl2"
+    ep_dir = dataset_root / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    (ep_dir / "cam_00.mkv").write_bytes(b"0" * 2048)
+    (ep_dir / "meta.json").write_text(
+        json.dumps({
+            "duration_s": 1.0,
+            "video": {"fps": 2, "replay_warmup_s": 0.5},
+        }),
+        encoding="utf-8",
+    )
+    left_fz = [0.0] * 239
+    right_fz = [0.0] * 239
+    left_fz[0] = 7.0
+    right_fz[238] = 11.0
+    rows = [
+        {
+            "sid": "box_touch_left",
+            "t_rel_s": 0.5,
+            "data": {"timestamp": 101, "fz_0p1N": left_fz},
+        },
+        {
+            "sid": "box_touch_right",
+            "t_rel_s": 0.5,
+            "data": {"timestamp": 202, "fz_0p1N": right_fz},
+        },
+    ]
+    with (ep_dir / "box_sensors.jsonl").open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+    timeline = gateway._read_gmsl2_timeline(dataset_root, episode=0)
+
+    touch = timeline["frames"][0]["touch"]
+    assert touch["left"]["timestamp"] == 101
+    assert touch["left"]["fz"][0] == 7.0
+    assert touch["left"]["activePoints"] == 1
+    assert touch["right"]["timestamp"] == 202
+    assert touch["right"]["fz"][238] == 11.0
+
+
 def test_box_collection_devices_use_remote_endpoint_in_detail():
     config = {
         "sensors": {"cameras": {"defaults": {"fps": 60}, "detect_all": False, "sensor_ids": [0, 4]}},

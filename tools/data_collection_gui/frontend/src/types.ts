@@ -222,12 +222,24 @@ export type EePose = {
   gripper?: number | null;
 };
 
+export type TouchPadFrame = {
+  timestamp?: number;
+  tRelS?: number;
+  fz: number[];
+  maxFz?: number;
+  activePoints?: number;
+};
+
 export type ReplayTimelineFrame = {
   frame: number;
   timestamp: number;
   state: number[];
   action: number[];
   eePose?: Partial<EePose>;
+  touch?: {
+    left?: TouchPadFrame;
+    right?: TouchPadFrame;
+  };
 };
 
 export type ReplayTimeline = {

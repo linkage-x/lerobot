@@ -2,11 +2,112 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pose3DViewer } from "./Pose3DViewer";
 import { SeriesPlot } from "./SeriesPlot";
 import type { DataCollectionGuiApi } from "./api";
-import type { EePose, ReplayTimeline, ReplayTimelineFrame } from "./types";
+import type { EePose, ReplayTimeline, ReplayTimelineFrame, TouchPadFrame } from "./types";
 
 function shortCameraName(key: string): string {
   return key.replace(/^observation\.images\./, "");
 }
+
+const TOUCH_ROW_LENGTHS = [13, 13, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 13, 13];
+const TOUCH_COLUMNS = 17;
+
+function interpolateChannel(a: number, b: number, t: number): number {
+  return Math.round(a + (b - a) * t);
+}
+
+function touchColor(value: number, scaleMax: number): string {
+  const stops = [
+    [17, 24, 39],
+    [37, 99, 235],
+    [20, 184, 166],
+    [250, 204, 21],
+    [239, 68, 68]
+  ];
+  const normalized = Math.max(0, Math.min(1, value / Math.max(scaleMax, 1)));
+  const scaled = normalized * (stops.length - 1);
+  const index = Math.min(Math.floor(scaled), stops.length - 2);
+  const t = scaled - index;
+  const a = stops[index];
+  const b = stops[index + 1];
+  return `rgb(${interpolateChannel(a[0], b[0], t)}, ${interpolateChannel(a[1], b[1], t)}, ${interpolateChannel(a[2], b[2], t)})`;
+}
+
+function touchScaleMax(timeline: ReplayTimeline | null): number {
+  let maxValue = 1;
+  for (const entry of timeline?.frames ?? []) {
+    for (const sample of [entry.touch?.left, entry.touch?.right]) {
+      for (const value of sample?.fz ?? []) {
+        if (Number.isFinite(value)) {
+          maxValue = Math.max(maxValue, Math.abs(value));
+        }
+      }
+    }
+  }
+  return maxValue;
+}
+
+function TouchHeatmap({
+  title,
+  sample,
+  scaleMax
+}: {
+  title: string;
+  sample?: TouchPadFrame;
+  scaleMax: number;
+}) {
+  const values = sample?.fz ?? [];
+  const hasData = values.length >= 239;
+  let cursor = 0;
+  const localMax = hasData ? Math.max(...values.map((value) => Math.abs(value))) : 0;
+  const activePoints = sample?.activePoints ?? values.filter((value) => Math.abs(value) > 0).length;
+
+  return (
+    <div className="touch-map">
+      <div className="touch-map-heading">
+        <strong>{title}</strong>
+        <span>max {localMax.toFixed(1)} · active {activePoints}</span>
+      </div>
+      {hasData ? (
+        <div className="touch-grid" aria-label={title}>
+          {TOUCH_ROW_LENGTHS.map((length, rowIndex) => {
+            const offset = Math.floor((TOUCH_COLUMNS - length) / 2);
+            const row = values.slice(cursor, cursor + length);
+            const startIndex = cursor;
+            cursor += length;
+            return (
+              <div className="touch-row" key={rowIndex}>
+                {Array.from({ length: offset }).map((_, index) => (
+                  <span className="touch-cell touch-cell-empty" key={`pre-${index}`} />
+                ))}
+                {row.map((value, index) => {
+                  const pointIndex = startIndex + index + 1;
+                  return (
+                    <span
+                      className="touch-cell"
+                      key={pointIndex}
+                      title={`#${pointIndex} fz=${value.toFixed(1)} (0.1N)`}
+                      style={{ backgroundColor: touchColor(Math.abs(value), scaleMax) }}
+                    />
+                  );
+                })}
+                {Array.from({ length: TOUCH_COLUMNS - length - offset }).map((_, index) => (
+                  <span className="touch-cell touch-cell-empty" key={`post-${index}`} />
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="touch-empty">no touch sample</div>
+      )}
+      <div className="touch-map-footer">
+        <span>ts {sample?.timestamp ?? "—"}</span>
+        <span>t {sample?.tRelS == null ? "—" : `${sample.tRelS.toFixed(3)}s`}</span>
+      </div>
+    </div>
+  );
+}
+
 
 function ensureFullPose(pose: ReplayTimelineFrame["eePose"]): EePose | null {
   if (!pose) {
@@ -148,6 +249,7 @@ export function ReplayInspector({
   // early-return below has a chance to render the placeholder panel.
   const frame: ReplayTimelineFrame | undefined = timeline?.frames?.[currentFrame];
   const pose = ensureFullPose(frame?.eePose);
+  const touchMax = useMemo(() => touchScaleMax(timeline), [timeline]);
   const trajectory = useMemo(() => {
     const frames = timeline?.frames;
     if (!frames || frames.length === 0) {
@@ -250,6 +352,21 @@ export function ReplayInspector({
           </div>
         ))}
       </div>
+      <section className="panel touch-panel">
+        <div className="panel-heading">
+          <h2>Paxini touch</h2>
+          <span>fz pseudo color · 239 points</span>
+        </div>
+        <div className="touch-heatmaps">
+          <TouchHeatmap title="Left sensor" sample={frame?.touch?.left} scaleMax={touchMax} />
+          <TouchHeatmap title="Right sensor" sample={frame?.touch?.right} scaleMax={touchMax} />
+        </div>
+        <div className="touch-legend" aria-hidden="true">
+          <span>0</span>
+          <div />
+          <span>{touchMax.toFixed(1)}</span>
+        </div>
+      </section>
       <section className="panel pose-panel">
         <div className="panel-heading">
           <h2>End-effector pose</h2>
