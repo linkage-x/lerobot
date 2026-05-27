@@ -24,6 +24,7 @@ described in the BOX SDK 需求整理 doc.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -155,7 +156,12 @@ def decode_sensor_cache(snap) -> dict[str, Any]:
         "sensors": {},
     }
     data = snap.data
-    if data.gripper_data.timestamp:
+    gripper_distance = float(getattr(data.gripper_data, "distance", 0.0))
+    gripper_has_sample = (
+        bool(data.gripper_data.timestamp)
+        or (out["valid"] and math.isfinite(gripper_distance) and gripper_distance != 0.0)
+    )
+    if gripper_has_sample:
         out["sensors"]["box_gripper"] = _decode_gripper(data.gripper_data)
     if data.imu_data.timestamp:
         out["sensors"]["box_imu"] = _decode_imu(data.imu_data)
@@ -329,6 +335,9 @@ class BoxClient:
                         self._first_seen_at_s.setdefault(sid, now)
                         self._last_seen_at_s[sid] = now
                 if valid and decoded is not None:
+                    for sid in decoded.get("sensors", {}):
+                        self._first_seen_at_s.setdefault(sid, now)
+                        self._last_seen_at_s[sid] = now
                     self._valid_poll_count += 1
                     self._latest = decoded
                     self._latest_at_s = now

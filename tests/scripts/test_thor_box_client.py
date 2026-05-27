@@ -182,6 +182,20 @@ def test_decode_sensor_cache_filters_zero_timestamp_sensors():
     assert len(touch["fx_0p1N"]) == 239 == len(touch["fy_0p1N"]) == len(touch["fz_0p1N"])
 
 
+def test_decode_sensor_cache_keeps_gripper_distance_when_timestamp_is_zero():
+    snap = _SensorCache(
+        valid=1,
+        data=_AllSensor(gripper_data=_Gripper(timestamp=0, distance=0.09785686433315277)),
+    )
+
+    out = box_client.decode_sensor_cache(snap)
+
+    assert out["sensors"]["box_gripper"] == {
+        "timestamp": 0,
+        "distance_m": pytest.approx(0.09785686433315277),
+    }
+
+
 def test_box_client_start_stop_pulls_snapshot_and_marks_detected(fake_box_module):
     cfg = box_client.BoxClientConfig(
         enabled=True, poll_interval_s=0.01, stale_threshold_s=5.0,
@@ -222,6 +236,43 @@ def test_box_client_start_stop_pulls_snapshot_and_marks_detected(fake_box_module
     assert "box_six_d_force" not in detected
     client.stop()
     assert client.is_active() is False
+
+
+def test_box_client_marks_gripper_seen_from_distance_without_timestamp(fake_box_module):
+    cfg = box_client.BoxClientConfig(
+        enabled=True,
+        poll_interval_s=0.01,
+        stale_threshold_s=5.0,
+        expected_devices=["box_gripper"],
+    )
+    client = box_client.BoxClient(cfg)
+
+    fake_module = fake_box_module
+
+    def _factory(*a, **kw):
+        b = _FakeBox()
+        b.snaps.append(
+            _SensorCache(
+                valid=1,
+                data=_AllSensor(
+                    gripper_data=_Gripper(timestamp=0, distance=0.09785686433315277),
+                ),
+            ),
+        )
+        return b
+
+    fake_module.Box = _factory  # type: ignore[assignment]
+
+    assert client.start() is True
+    import time as _t
+    _t.sleep(0.05)
+
+    snap = client.read()
+    assert snap["sensors"]["box_gripper"]["distance_m"] == pytest.approx(0.09785686433315277)
+    assert snap["status"]["sensor_status"]["box_gripper"]["seen"] is True
+    assert snap["status"]["sensor_status"]["box_gripper"]["last_timestamp"] == 0
+    assert client.detect() == ["box_gripper"]
+    client.stop()
 
 
 

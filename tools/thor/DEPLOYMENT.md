@@ -251,8 +251,9 @@ cd ~/lerobot && PYTHONPATH=src:. PYTHONUNBUFFERED=1 \
   `192.168.2.45` 上行。Thor 已在 `enP2p1s0` 配置 `192.168.2.45/24`，
   `box_collection.bind_ip` 已改为 `192.168.2.45`；按该地址复测后，
   原始抓包可见 `192.168.2.60 -> 192.168.2.45 UDP/15000`，
-  `get_sensor_cache` 已由 rc=4 变为 rc=0 / valid=1。后续重点是确认
-  各传感器 timestamp/字段和 `get_gripper_pos` 在当前模式下的预期行为。
+  `get_sensor_cache` 已由 rc=4 变为 rc=0 / valid=1。LeRobot wrapper
+  已确认 6 个 BOX sensor 全部 seen/fresh，gripper distance 与各 sensor
+  timestamp 可正常记录。
 * **MAX96726 sid 锁定数 ≠ YAML 槽位**：YAML 默认 detect_all + `sensor_ids: []`
   的 16 个相机槽是"期望"；实际锁到几个看插了几路相机线。多出来的槽位
   Connect 后会变红 `error`，正常现象。

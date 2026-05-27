@@ -71,24 +71,36 @@ sniff_count 9636
 
 因此，之前 `get_sensor_cache rc=4 / no cached sensor data` 的直接原因是 Thor 绑定/验证地址使用了 `192.168.2.44`，而板端固定只向 `192.168.2.45` 上行。
 
-## 4. 当前剩余现象
+## 4. LeRobot wrapper 验证结果
 
-`.45` 修正后，SDK 已能收到上行 UDP，`get_sensor_cache` 也已返回 `rc=0 valid=1`。本轮最小脚本里仍观察到：
+修正 `bind_ip=192.168.2.45` 后，LeRobot `BoxClient` 已能解码并记录 6 个 BOX sensor：
 
 ```text
-get_gripper_pos -> rc=5 timeout 0.0
-cache valid=1, liwp=0 0, gripper timestamp=0, imu timestamp=0
+valid=true
+last_rc=0
+valid_poll_count=39
+connected=[box_gripper, box_imu, box_trigger, box_six_d_force, box_touch_left, box_touch_right]
+detected=[box_gripper, box_imu, box_trigger, box_six_d_force, box_touch_left, box_touch_right]
 ```
 
-这表示 UDP 上行链路已经恢复，但具体字段是否应有非零 timestamp、`get_gripper_pos` 是否应在 collection 模式下返回，还需要结合板端模式和传感器实际接入状态确认。
+典型传感器字段：
 
-## 5. 后续验证重点
+```text
+box_gripper.distance_m = 0.09785686433315277
+box_gripper.timestamp  = 9386808
+box_imu.timestamp      = 9388459
+box_trigger.timestamp  = 9388423
+box_six_d_force.timestamp = 9386732
+box_touch_left.timestamp  = 3601178947
+box_touch_right.timestamp = 9364164
+```
 
-1. 点击 connect 后确认 6 个 BOX sensor 行是否全部进入 connected/running。
-2. 保存一段 episode，检查 `meta.json` 中 `box_collection.snapshots[*].status.last_rc` 是否为 `0`，`last_error` 是否为 `ok`。
-3. 如果 sensor timestamp 仍为 0，继续确认当前固件在 collection 模式下哪些 TLV 字段应填充 timestamp。
-4. 如果 `get_gripper_pos` 仍 timeout，向供应商确认该接口是否只在 control 模式或特定 enable 命令后可用。
+代码侧也已兼容供应商 demo 中出现过的启动瞬态：如果 `gripper_data.distance` 已有有效非零值，即使 timestamp 暂时为 0，也会先记录 `box_gripper`，避免误判为无数据。
+
+## 5. 当前结论
+
+BOX 传感器流上行链路已打通，LeRobot wrapper 已能把 6 个 BOX sensor 标记为 seen/fresh，并记录 gripper distance 与各 sensor timestamp。后续如仍出现 `rc=4`，优先检查 Thor 是否仍持有 `192.168.2.45/24`，以及当前 recorder/gateway 是否使用了 `bind_ip: "192.168.2.45"` 的配置。
 
 ## 6. 给供应商的简短结论
 
-板端固定上行 IP 为 `192.168.2.45`。Thor 改为 `192.168.2.45/24` 并让 SDK 绑定 `192.168.2.45:15000` 后，网卡层已收到 `BOX 192.168.2.60 -> Thor 192.168.2.45 UDP/15000`，`get_sensor_cache` 已由 `rc=4 no cached sensor data` 变为 `rc=0 ok valid=1`。当前剩余问题不是 UDP 上行不到达，而是确认各传感器字段/timestamp 和 `get_gripper_pos` 在当前模式下的预期行为。
+板端固定上行 IP 为 `192.168.2.45`。Thor 改为 `192.168.2.45/24` 并让 SDK 绑定 `192.168.2.45:15000` 后，网卡层已收到 `BOX 192.168.2.60 -> Thor 192.168.2.45 UDP/15000`，`get_sensor_cache` 已由 `rc=4 no cached sensor data` 变为 `rc=0 ok valid=1`；LeRobot `BoxClient` 进一步确认 6 个 BOX sensor 全部 seen/fresh，相关 timestamp 和 gripper distance 已可记录。
