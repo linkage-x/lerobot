@@ -312,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
             t_start = time.time()
             logger.info("episode %d started @ %s -> %s", ep_idx, wall_start, ep_dir)
             if box_started:
-                box.start_recording(t0_wall)
+                box.start_recording(t_start)
             box_snapshots: list[dict[str, Any]] = []
             target_s = cfg.episode_time_s if cfg.episode_time_s > 0 else float("inf")
             last_progress_at = 0.0
@@ -391,9 +391,9 @@ def main(argv: list[str] | None = None) -> int:
                     ep, cfg, locked, argus_failed, box_cfg, box_snapshots, decision,
                 )
                 if recorded_samples:
-                    _write_sensor_samples(ep_dir, recorded_samples, t0_wall)
+                    _write_sensor_samples(ep_dir, recorded_samples, t_start)
                 sensor_data = {
-                    sid: [{"t_rel_s": s.wall_time_s - t0_wall,
+                    sid: [{"t_rel_s": s.wall_time_s - t_start,
                            "wall_s": s.wall_time_s,
                            "data": s.data}
                           for s in slist]
@@ -409,7 +409,7 @@ def main(argv: list[str] | None = None) -> int:
                         snapshots=box_snapshots,
                         duration_s=duration_s,
                         sensor_samples=sensor_data,
-                        t0_wall_s=t0_wall,
+                        t0_wall_s=t_start,
                         pts_offset_s=pts_offset,
                     )
                     if v3_path is not None:
