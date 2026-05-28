@@ -10,6 +10,7 @@ export type DeviceStatus = {
   fps: number;
   latencyMs: number;
   detail: string;
+  config?: Record<string, unknown>;
 };
 
 export type GatewayStatus = {
@@ -129,6 +130,15 @@ export type AnnotationOutcome = "unreviewed" | "success" | "failure" | "partial"
 
 export type AnnotationQuality = "unreviewed" | "good" | "needs_review" | "bad";
 
+export type ReviewStatus = "pending" | "approved" | "rejected";
+
+export type SubtaskSegment = {
+  id: string;
+  startFrame: number;
+  endFrame: number;
+  description: string;
+};
+
 export type EpisodeAnnotation = {
   datasetRoot: string;
   episode: number;
@@ -141,6 +151,25 @@ export type EpisodeAnnotation = {
   annotator: string;
   updatedAt: string;
   source: "dataset" | "manual" | "default";
+  segments: SubtaskSegment[];
+  reviewStatus: ReviewStatus;
+  reviewComment: string;
+};
+
+export type TaskStatus = "pending" | "in_progress" | "completed" | "paused";
+
+export type CollectionTask = {
+  id: string;
+  name: string;
+  description: string;
+  targetEpisodes: number;
+  completedEpisodes: number;
+  status: TaskStatus;
+  assignee: string;
+  datasetRepoId: string;
+  tags: string[];
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type RecordedDataset = {

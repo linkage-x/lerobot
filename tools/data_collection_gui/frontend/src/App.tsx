@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { DataCollectionGuiApi, type GuiSnapshot } from "./api";
 import { ReplayInspector } from "./ReplayInspector";
 import type {
+  CollectionTask,
   ConfigSummary,
   DeviceStatus,
   EpisodeAnnotation,
@@ -10,7 +11,9 @@ import type {
   ProcessingStatus,
   RecordedDataset,
   RecordingStatus,
-  ReplayStatus
+  ReplayStatus,
+  SubtaskSegment,
+  TaskStatus
 } from "./types";
 import "./styles.css";
 
@@ -349,15 +352,15 @@ const mvpPages: PageMeta[] = [
   { id: "live-record", label: "Live Record", kind: "mvp" },
   { id: "dataset-processing", label: "Dataset Processing", kind: "mvp" },
   { id: "episode-replay", label: "Episode Replay", kind: "mvp" },
-  { id: "dataset-export", label: "Dataset Export", kind: "mvp" }
+  { id: "dataset-export", label: "Dataset Export", kind: "mvp" },
+  { id: "task-library", label: "Task Library", kind: "mvp" },
+  { id: "device-manager", label: "Device Manager", kind: "mvp" }
 ];
 
 const deferredPages: PageMeta[] = [
   { id: "dashboard", label: "Dashboard", kind: "deferred" },
   { id: "qc-report", label: "QC Report", kind: "deferred" },
   { id: "model-evaluation", label: "Model Evaluation", kind: "deferred" },
-  { id: "device-manager", label: "Device Manager", kind: "deferred" },
-  { id: "task-library", label: "Task Library", kind: "deferred" },
   { id: "annotation-audit", label: "Annotation & Audit", kind: "deferred" }
 ];
 
@@ -577,14 +580,112 @@ function ReplayReadinessCard({
   );
 }
 
+function SubtaskSegmentEditor({
+  segments,
+  totalFrames,
+  onChange
+}: {
+  segments: SubtaskSegment[];
+  totalFrames: number;
+  onChange: (segments: SubtaskSegment[]) => void;
+}) {
+  const colors = ["#2563eb", "#0d9488", "#d97706", "#dc2626", "#7c3aed", "#059669"];
+
+  const addSegment = () => {
+    const lastEnd = segments.length > 0 ? segments[segments.length - 1].endFrame : 0;
+    const newSeg: SubtaskSegment = {
+      id: `seg-${Date.now()}`,
+      startFrame: lastEnd,
+      endFrame: Math.max(lastEnd, totalFrames - 1),
+      description: ""
+    };
+    onChange([...segments, newSeg]);
+  };
+
+  const updateSegment = (id: string, patch: Partial<SubtaskSegment>) => {
+    onChange(segments.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+  };
+
+  const removeSegment = (id: string) => {
+    onChange(segments.filter((s) => s.id !== id));
+  };
+
+  return (
+    <section className="panel segment-panel">
+      <div className="panel-heading">
+        <h2>Subtask Segments</h2>
+        <span>{segments.length} segments</span>
+      </div>
+      {totalFrames > 0 && segments.length > 0 && (
+        <div className="segment-timeline">
+          {segments.map((seg, i) => {
+            const left = (seg.startFrame / Math.max(totalFrames - 1, 1)) * 100;
+            const width = ((seg.endFrame - seg.startFrame) / Math.max(totalFrames - 1, 1)) * 100;
+            return (
+              <div
+                key={seg.id}
+                className="segment-bar"
+                title={seg.description || `Segment ${i + 1}`}
+                style={{
+                  left: `${left}%`,
+                  width: `${Math.max(width, 0.5)}%`,
+                  backgroundColor: colors[i % colors.length]
+                }}
+              />
+            );
+          })}
+        </div>
+      )}
+      <div className="segment-list">
+        {segments.map((seg, i) => (
+          <div className="segment-row" key={seg.id}>
+            <span className="segment-index" style={{ color: colors[i % colors.length] }}>#{i + 1}</span>
+            <input
+              type="number"
+              min={0}
+              max={totalFrames - 1}
+              value={seg.startFrame}
+              onChange={(e) => updateSegment(seg.id, { startFrame: Math.max(0, Number(e.target.value)) })}
+              aria-label="Start frame"
+              className="segment-frame-input"
+            />
+            <span>-</span>
+            <input
+              type="number"
+              min={0}
+              max={totalFrames - 1}
+              value={seg.endFrame}
+              onChange={(e) => updateSegment(seg.id, { endFrame: Math.max(0, Number(e.target.value)) })}
+              aria-label="End frame"
+              className="segment-frame-input"
+            />
+            <input
+              value={seg.description}
+              onChange={(e) => updateSegment(seg.id, { description: e.target.value })}
+              placeholder="Subtask description"
+              className="segment-desc-input"
+            />
+            <button onClick={() => removeSegment(seg.id)} className="segment-remove">x</button>
+          </div>
+        ))}
+      </div>
+      <div className="control-row">
+        <button onClick={addSegment}>Add Segment</button>
+      </div>
+    </section>
+  );
+}
+
 function EpisodeAnnotationPanel({
   annotation,
   datasetPath,
+  totalFrames,
   busy,
   onSave
 }: {
   annotation: EpisodeAnnotation;
   datasetPath: string;
+  totalFrames: number;
   busy: boolean;
   onSave: (annotation: EpisodeAnnotation) => void;
 }) {
@@ -608,106 +709,168 @@ function EpisodeAnnotationPanel({
     .slice(0, 12);
   const canSave = draft.taskPrompt.trim().length > 0;
 
+  const buildSavePayload = (overrides?: Partial<EpisodeAnnotation>): EpisodeAnnotation => ({
+    ...draft,
+    datasetRoot: datasetPath,
+    tags: normalizedTags,
+    taskPrompt: draft.taskPrompt.trim(),
+    annotator: draft.annotator.trim(),
+    notes: draft.notes.trim(),
+    ...overrides
+  });
+
+  const markFailure = (tag: string) => {
+    const existingTags = new Set(normalizedTags);
+    existingTags.add(tag);
+    onSave(buildSavePayload({
+      outcome: "failure",
+      quality: "bad",
+      includeInTraining: false,
+      tags: [...existingTags]
+    }));
+  };
+
+  const reviewBorder = draft.reviewStatus === "rejected" ? "2px solid #dc2626" : undefined;
+
   return (
-    <section className="panel annotation-panel">
-      <div className="panel-heading">
-        <h2>Episode Annotation</h2>
-        <span>{draft.updatedAt ? `saved ${new Date(draft.updatedAt).toLocaleString()}` : "not saved"}</span>
-      </div>
-      <div className="annotation-grid">
-        <label className="annotation-field annotation-field-wide">
-          <span>Task Prompt</span>
-          <textarea
-            value={draft.taskPrompt}
-            onChange={(event) => setDraft({ ...draft, taskPrompt: event.target.value })}
-            placeholder="Pick up the red cube and place it into the fixture"
-          />
-        </label>
-        <label className="annotation-field">
-          <span>Outcome</span>
-          <select
-            value={draft.outcome}
-            onChange={(event) => setDraft({ ...draft, outcome: event.target.value as EpisodeAnnotation["outcome"] })}
+    <>
+      <section className="panel annotation-panel" style={{ borderLeft: reviewBorder }}>
+        <div className="panel-heading">
+          <h2>Episode Annotation</h2>
+          <span>
+            {draft.reviewStatus !== "pending" && (
+              <span className={`review-badge review-${draft.reviewStatus}`}>{draft.reviewStatus}</span>
+            )}
+            {draft.updatedAt ? ` saved ${new Date(draft.updatedAt).toLocaleString()}` : " not saved"}
+          </span>
+        </div>
+        <div className="annotation-grid">
+          <label className="annotation-field annotation-field-wide">
+            <span>Task Prompt</span>
+            <textarea
+              value={draft.taskPrompt}
+              onChange={(event) => setDraft({ ...draft, taskPrompt: event.target.value })}
+              placeholder="Pick up the red cube and place it into the fixture"
+            />
+          </label>
+          <label className="annotation-field">
+            <span>Outcome</span>
+            <select
+              value={draft.outcome}
+              onChange={(event) => setDraft({ ...draft, outcome: event.target.value as EpisodeAnnotation["outcome"] })}
+            >
+              <option value="unreviewed">Unreviewed</option>
+              <option value="success">Success</option>
+              <option value="partial">Partial</option>
+              <option value="failure">Failure</option>
+            </select>
+          </label>
+          <label className="annotation-field">
+            <span>Quality</span>
+            <select
+              value={draft.quality}
+              onChange={(event) => setDraft({ ...draft, quality: event.target.value as EpisodeAnnotation["quality"] })}
+            >
+              <option value="unreviewed">Unreviewed</option>
+              <option value="good">Good</option>
+              <option value="needs_review">Needs review</option>
+              <option value="bad">Bad</option>
+            </select>
+          </label>
+          <label className="annotation-field annotation-toggle">
+            <input
+              checked={draft.includeInTraining}
+              type="checkbox"
+              onChange={(event) => setDraft({ ...draft, includeInTraining: event.target.checked })}
+            />
+            <span>Use for training</span>
+          </label>
+          <label className="annotation-field">
+            <span>Annotator</span>
+            <input
+              value={draft.annotator}
+              onChange={(event) => setDraft({ ...draft, annotator: event.target.value })}
+              placeholder="operator"
+            />
+          </label>
+          <label className="annotation-field annotation-field-wide">
+            <span>Tags</span>
+            <input
+              value={tagsText}
+              onChange={(event) => setTagsText(event.target.value)}
+              placeholder="occlusion, collision, retry, object-slip"
+            />
+          </label>
+          <label className="annotation-field annotation-field-wide">
+            <span>Notes</span>
+            <textarea
+              value={draft.notes}
+              onChange={(event) => setDraft({ ...draft, notes: event.target.value })}
+              placeholder="Short review notes, failure reason, or scene details"
+            />
+          </label>
+          <label className="annotation-field">
+            <span>Review Status</span>
+            <select
+              value={draft.reviewStatus}
+              onChange={(event) => setDraft({ ...draft, reviewStatus: event.target.value as EpisodeAnnotation["reviewStatus"] })}
+            >
+              <option value="pending">Pending</option>
+              <option value="approved">Approved</option>
+              <option value="rejected">Rejected</option>
+            </select>
+          </label>
+          <label className="annotation-field annotation-field-wide">
+            <span>Review Comment</span>
+            <textarea
+              value={draft.reviewComment}
+              onChange={(event) => setDraft({ ...draft, reviewComment: event.target.value })}
+              placeholder="Reason for rejection or review notes"
+              className={draft.reviewStatus === "rejected" ? "review-rejected-input" : ""}
+            />
+          </label>
+        </div>
+        <div className="control-row">
+          <button
+            disabled={busy || !datasetPath || !canSave}
+            onClick={() => onSave(buildSavePayload())}
           >
-            <option value="unreviewed">Unreviewed</option>
-            <option value="success">Success</option>
-            <option value="partial">Partial</option>
-            <option value="failure">Failure</option>
-          </select>
-        </label>
-        <label className="annotation-field">
-          <span>Quality</span>
-          <select
-            value={draft.quality}
-            onChange={(event) => setDraft({ ...draft, quality: event.target.value as EpisodeAnnotation["quality"] })}
+            Save Annotation
+          </button>
+          <button
+            className="danger"
+            disabled={busy || !datasetPath}
+            onClick={() => markFailure("collision")}
           >
-            <option value="unreviewed">Unreviewed</option>
-            <option value="good">Good</option>
-            <option value="needs_review">Needs review</option>
-            <option value="bad">Bad</option>
-          </select>
-        </label>
-        <label className="annotation-field annotation-toggle">
-          <input
-            checked={draft.includeInTraining}
-            type="checkbox"
-            onChange={(event) => setDraft({ ...draft, includeInTraining: event.target.checked })}
-          />
-          <span>Use for training</span>
-        </label>
-        <label className="annotation-field">
-          <span>Annotator</span>
-          <input
-            value={draft.annotator}
-            onChange={(event) => setDraft({ ...draft, annotator: event.target.value })}
-            placeholder="operator"
-          />
-        </label>
-        <label className="annotation-field annotation-field-wide">
-          <span>Tags</span>
-          <input
-            value={tagsText}
-            onChange={(event) => setTagsText(event.target.value)}
-            placeholder="occlusion, collision, retry, object-slip"
-          />
-        </label>
-        <label className="annotation-field annotation-field-wide">
-          <span>Notes</span>
-          <textarea
-            value={draft.notes}
-            onChange={(event) => setDraft({ ...draft, notes: event.target.value })}
-            placeholder="Short review notes, failure reason, or scene details"
-          />
-        </label>
-      </div>
-      <div className="control-row">
-        <button
-          disabled={busy || !datasetPath || !canSave}
-          onClick={() =>
-            onSave({
-              ...draft,
-              datasetRoot: datasetPath,
-              tags: normalizedTags,
-              taskPrompt: draft.taskPrompt.trim(),
-              annotator: draft.annotator.trim(),
-              notes: draft.notes.trim()
-            })
-          }
-        >
-          Save Annotation
-        </button>
-        <span className="annotation-hint">Episode {draft.episode} · {draft.source}</span>
-      </div>
-    </section>
+            Mark Collision
+          </button>
+          <button
+            className="danger"
+            disabled={busy || !datasetPath}
+            onClick={() => markFailure("abandoned")}
+          >
+            Mark Abandoned
+          </button>
+          <span className="annotation-hint">Episode {draft.episode} · {draft.source}</span>
+        </div>
+      </section>
+      <SubtaskSegmentEditor
+        segments={draft.segments ?? []}
+        totalFrames={totalFrames}
+        onChange={(segments) => setDraft({ ...draft, segments })}
+      />
+    </>
   );
 }
 
 function EpisodeSelector({
   status,
+  annotation,
   busy,
   onSelectEpisode
 }: {
   status: ReplayStatus;
+  annotation?: EpisodeAnnotation;
   busy: boolean;
   onSelectEpisode: (episode: number) => void;
 }) {
@@ -794,6 +957,14 @@ function EpisodeSelector({
         </div>
         <button disabled={busy || !hasNext} onClick={() => selectEpisode(options[currentIndex + 1])}>Next</button>
       </div>
+      <div className="episode-badges">
+        {annotation?.outcome && annotation.outcome !== "unreviewed" && (
+          <span className={`outcome-badge outcome-${annotation.outcome}`}>{annotation.outcome}</span>
+        )}
+        {annotation?.reviewStatus && annotation.reviewStatus !== "pending" && (
+          <span className={`review-badge review-${annotation.reviewStatus}`}>{annotation.reviewStatus}</span>
+        )}
+      </div>
       <p className="panel-note">
         {switching
           ? `Switching to episode ${pendingEpisode}: reading episode metadata and preparing video/timeline resources.`
@@ -857,11 +1028,12 @@ function EpisodeReplayPage({
           onAbort={onAbort}
         />
       </div>
-      <EpisodeSelector status={snapshot.replay} busy={busy} onSelectEpisode={onSelectEpisode} />
+      <EpisodeSelector status={snapshot.replay} annotation={snapshot.annotation} busy={busy} onSelectEpisode={onSelectEpisode} />
       <ReplayInspector api={api} datasetPath={activePath} episode={snapshot.replay.episode} fallbackFps={snapshot.replay.fps} />
       <EpisodeAnnotationPanel
         annotation={snapshot.annotation}
         datasetPath={activePath}
+        totalFrames={snapshot.replay.totalFrames}
         busy={busy}
         onSave={onSaveAnnotation}
       />
@@ -1241,6 +1413,291 @@ function DatasetExportPage({
   );
 }
 
+const taskStatusLabel: Record<TaskStatus, string> = {
+  pending: "Pending",
+  in_progress: "In Progress",
+  completed: "Completed",
+  paused: "Paused"
+};
+
+const taskStatusDot: Record<TaskStatus, string> = {
+  pending: "idle",
+  in_progress: "running",
+  completed: "running",
+  paused: "warning"
+};
+
+function TaskLibraryPage({
+  snapshot,
+  busy,
+  onCreate,
+  onUpdate,
+  onDelete,
+  onNavigate
+}: {
+  snapshot: GuiSnapshot;
+  busy: boolean;
+  onCreate: (task: Partial<CollectionTask>) => void;
+  onUpdate: (task: Partial<CollectionTask>) => void;
+  onDelete: (id: string) => void;
+  onNavigate: (page: PageId) => void;
+}) {
+  const tasks = snapshot.tasks ?? [];
+  const [showForm, setShowForm] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [formName, setFormName] = useState("");
+  const [formDesc, setFormDesc] = useState("");
+  const [formTarget, setFormTarget] = useState(100);
+  const [formAssignee, setFormAssignee] = useState("");
+  const [formRepoId, setFormRepoId] = useState("");
+
+  const selected = tasks.find((t) => t.id === selectedId) ?? null;
+
+  const resetForm = () => {
+    setFormName("");
+    setFormDesc("");
+    setFormTarget(100);
+    setFormAssignee("");
+    setFormRepoId("");
+  };
+
+  const submitCreate = () => {
+    if (!formName.trim()) return;
+    onCreate({
+      name: formName.trim(),
+      description: formDesc.trim(),
+      targetEpisodes: formTarget,
+      assignee: formAssignee.trim(),
+      datasetRepoId: formRepoId.trim()
+    });
+    resetForm();
+    setShowForm(false);
+  };
+
+  const inProgress = tasks.filter((t) => t.status === "in_progress").length;
+  const completed = tasks.filter((t) => t.status === "completed").length;
+
+  return (
+    <div className="page-stack">
+      <PageHeader title="Task Library" subtitle="create and manage data collection tasks with target episode counts and progress tracking" />
+      <section className="panel">
+        <div className="panel-heading">
+          <h2>Overview</h2>
+          <span>{tasks.length} tasks</span>
+        </div>
+        <div className="summary-grid">
+          <Metric label="Total" value={tasks.length} />
+          <Metric label="In Progress" value={inProgress} />
+          <Metric label="Completed" value={completed} />
+        </div>
+      </section>
+      <section className="panel">
+        <div className="panel-heading">
+          <h2>Tasks</h2>
+          <button disabled={busy} onClick={() => setShowForm(!showForm)}>{showForm ? "Cancel" : "New Task"}</button>
+        </div>
+        {showForm && (
+          <div className="task-form">
+            <label className="annotation-field">
+              <span>Name</span>
+              <input value={formName} onChange={(e) => setFormName(e.target.value)} placeholder="Task name" />
+            </label>
+            <label className="annotation-field annotation-field-wide">
+              <span>Description</span>
+              <textarea value={formDesc} onChange={(e) => setFormDesc(e.target.value)} placeholder="What to collect" />
+            </label>
+            <label className="annotation-field">
+              <span>Target Episodes</span>
+              <input type="number" min={1} value={formTarget} onChange={(e) => setFormTarget(Number(e.target.value))} />
+            </label>
+            <label className="annotation-field">
+              <span>Assignee</span>
+              <input value={formAssignee} onChange={(e) => setFormAssignee(e.target.value)} placeholder="operator" />
+            </label>
+            <label className="annotation-field">
+              <span>Dataset Repo ID</span>
+              <input value={formRepoId} onChange={(e) => setFormRepoId(e.target.value)} placeholder="local/my_task" />
+            </label>
+            <div className="control-row">
+              <button disabled={busy || !formName.trim()} onClick={submitCreate}>Create Task</button>
+            </div>
+          </div>
+        )}
+        {tasks.length === 0 && !showForm ? (
+          <div className="empty-dataset-list">No tasks yet. Click "New Task" to create one.</div>
+        ) : (
+          <div className="processing-list">
+            {tasks.map((task) => {
+              const progress = task.targetEpisodes > 0
+                ? Math.min(100, Math.round((task.completedEpisodes / task.targetEpisodes) * 100))
+                : 0;
+              return (
+                <div
+                  className={task.id === selectedId ? "processing-row active" : "processing-row"}
+                  key={task.id}
+                >
+                  <button className="processing-row-main" onClick={() => setSelectedId(task.id)} disabled={busy}>
+                    <div>
+                      <div className="row-title">
+                        <StatusDot state={taskStatusDot[task.status]} />
+                        <strong>{task.name}</strong>
+                        <em>{taskStatusLabel[task.status]}</em>
+                      </div>
+                      <p>{task.description || "No description"}</p>
+                    </div>
+                    <div className="processing-stats">
+                      <span>{task.completedEpisodes} / {task.targetEpisodes} episodes</span>
+                      <div className="progress" style={{ width: 80, height: 6 }}>
+                        <div className="progress-bar" style={{ width: `${progress}%` }} />
+                      </div>
+                      <small>{task.assignee || "unassigned"}</small>
+                    </div>
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+      {selected && (
+        <section className="panel">
+          <div className="panel-heading">
+            <h2>{selected.name}</h2>
+            <span className="state-pill">
+              <StatusDot state={taskStatusDot[selected.status]} />
+              {taskStatusLabel[selected.status]}
+            </span>
+          </div>
+          <div className="summary-grid">
+            <Metric label="Target" value={selected.targetEpisodes} />
+            <Metric label="Completed" value={selected.completedEpisodes} />
+            <Metric label="Assignee" value={selected.assignee || "—"} />
+            <Metric label="Dataset" value={selected.datasetRepoId || "—"} />
+            <Metric label="Created" value={selected.createdAt ? new Date(selected.createdAt).toLocaleString() : "—"} />
+            <Metric label="Updated" value={selected.updatedAt ? new Date(selected.updatedAt).toLocaleString() : "—"} />
+          </div>
+          <div className="control-row">
+            <button
+              disabled={busy || selected.status === "in_progress"}
+              onClick={() => onUpdate({ id: selected.id, status: "in_progress" })}
+            >
+              Start
+            </button>
+            <button
+              disabled={busy || selected.status === "paused"}
+              onClick={() => onUpdate({ id: selected.id, status: "paused" })}
+            >
+              Pause
+            </button>
+            <button
+              disabled={busy || selected.status === "completed"}
+              onClick={() => onUpdate({ id: selected.id, status: "completed" })}
+            >
+              Complete
+            </button>
+            <button disabled={busy} onClick={() => onNavigate("live-record")}>Go to Record</button>
+            <button className="danger" disabled={busy} onClick={() => { onDelete(selected.id); setSelectedId(null); }}>Delete</button>
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
+  const [hideErrors, setHideErrors] = useState(false);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+
+  const devices = hideErrors
+    ? snapshot.devices.filter((d) => d.state !== "error")
+    : snapshot.devices;
+
+  const grouped = useMemo(() => {
+    return devices.reduce<Record<string, typeof devices>>((acc, d) => {
+      acc[d.kind] = [...(acc[d.kind] ?? []), d];
+      return acc;
+    }, {});
+  }, [devices]);
+
+  const onlineCount = snapshot.devices.filter((d) => d.state === "running").length;
+  const errorCount = snapshot.devices.filter((d) => d.state === "error").length;
+
+  const kindLabel = (kind: string): string => {
+    if (kind === "camera") return snapshot.configSummary.rigType === "gmsl2" ? "GMSL2 Cameras" : "Cameras";
+    if (kind === "box_collection") return "BOX Sensors";
+    if (kind === "tactile") return "Tactile Sensors";
+    if (kind === "handheld_gripper") return "Handheld Grippers";
+    return kind.replace("_", " ");
+  };
+
+  return (
+    <div className="page-stack">
+      <PageHeader title="Device Manager" subtitle="view connected hardware devices, configuration details, and connection status" />
+      <section className="panel">
+        <div className="panel-heading">
+          <h2>Summary</h2>
+          <span>{snapshot.devices.length} devices</span>
+        </div>
+        <div className="summary-grid">
+          <Metric label="Total" value={snapshot.devices.length} />
+          <Metric label="Online" value={onlineCount} />
+          <Metric label="Error" value={errorCount} />
+        </div>
+        <div className="control-row">
+          <label className="annotation-field annotation-toggle">
+            <input type="checkbox" checked={hideErrors} onChange={(e) => setHideErrors(e.target.checked)} />
+            <span>Hide error devices</span>
+          </label>
+        </div>
+      </section>
+      {Object.entries(grouped).map(([kind, items]) => (
+        <section className="panel" key={kind}>
+          <div className="panel-heading">
+            <h2>{kindLabel(kind)}</h2>
+            <span>{items.filter((d) => d.state === "running").length}/{items.length} online</span>
+          </div>
+          {items.map((device) => {
+            const isExpanded = device.id === expandedId;
+            const config = device.config ?? {};
+            const configEntries = Object.entries(config).filter(
+              ([, v]) => v != null && typeof v !== "object"
+            );
+            return (
+              <div className="device-manager-row" key={device.id}>
+                <button
+                  className="device-manager-header"
+                  onClick={() => setExpandedId(isExpanded ? null : device.id)}
+                >
+                  <div className="row-title">
+                    <StatusDot state={device.state} />
+                    <strong>{device.id}</strong>
+                  </div>
+                  <div className="device-stats">
+                    <span>{device.fps} fps</span>
+                    <span>{device.latencyMs} ms</span>
+                    <small>{device.detail}</small>
+                    <small>{isExpanded ? "collapse" : "expand"}</small>
+                  </div>
+                </button>
+                {isExpanded && configEntries.length > 0 && (
+                  <div className="device-config-detail">
+                    {configEntries.map(([key, value]) => (
+                      <div className="device-config-row" key={key}>
+                        <span className="device-config-key">{key}</span>
+                        <span className="device-config-value">{String(value)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </section>
+      ))}
+    </div>
+  );
+}
+
 function PlaceholderPage({ title }: { title: string }) {
   return (
     <div className="page-stack">
@@ -1394,6 +1851,17 @@ function App() {
         onExport={() => run(() => api.startDatasetExport())}
         onOpenProcessing={() => navigate("dataset-processing")}
       />
+    ) : activePage === "task-library" ? (
+      <TaskLibraryPage
+        snapshot={snapshot}
+        busy={busy}
+        onCreate={(task) => run(() => api.createTask(task))}
+        onUpdate={(task) => run(() => api.updateTask(task))}
+        onDelete={(id) => run(() => api.deleteTask(id))}
+        onNavigate={navigate}
+      />
+    ) : activePage === "device-manager" ? (
+      <DeviceManagerPage snapshot={snapshot} />
     ) : (
       <PlaceholderPage title={activeMeta.label} />
     );

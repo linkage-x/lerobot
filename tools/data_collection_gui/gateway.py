@@ -431,6 +431,7 @@ def _device_statuses(config: dict[str, Any], repo_root: Path | None = None) -> l
                     "fps": int(defaults.get("fps") or 0),
                     "latencyMs": 0,
                     "detail": _format_device_detail(defaults),
+                    "config": {**defaults, "sensor_id": sid},
                 }
             )
     else:
@@ -472,6 +473,13 @@ def _device_statuses(config: dict[str, Any], repo_root: Path | None = None) -> l
                     "fps": poll_hz,
                     "latencyMs": 0,
                     "detail": detail,
+                    "config": {
+                        "remote_ip": box_cfg.get("remote_ip", ""),
+                        "remote_port": box_cfg.get("remote_port", 15000),
+                        "poll_interval_s": box_cfg.get("poll_interval_s", 0.05),
+                        "bind_ip": box_cfg.get("bind_ip", ""),
+                        "sensor_id": str(sensor_id),
+                    },
                 }
             )
     return devices
@@ -496,6 +504,7 @@ def _make_mapping_device(device_id: str, device: dict[str, Any], kind: str) -> d
         "fps": fps,
         "latencyMs": 0,
         "detail": _format_device_detail(device),
+        "config": dict(device),
     }
 
 
@@ -1100,6 +1109,120 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
 
 
+# ---------------------------------------------------------------------------
+# Task management (local JSON store)
+# ---------------------------------------------------------------------------
+
+def _tasks_store_path(state: GatewayState) -> Path:
+    return state.repo_root / "outputs" / "tasks.json"
+
+
+def _read_tasks(state: GatewayState) -> list[dict[str, Any]]:
+    path = _tasks_store_path(state)
+    if not path.is_file():
+        return []
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(loaded, dict):
+        tasks = loaded.get("tasks", [])
+        return tasks if isinstance(tasks, list) else []
+    return []
+
+
+def _write_tasks(state: GatewayState, tasks: list[dict[str, Any]]) -> None:
+    path = _tasks_store_path(state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"version": 1, "tasks": tasks}, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _normalize_task(payload: dict[str, Any], *, task_id: str | None = None) -> dict[str, Any]:
+    status = str(payload.get("status") or "pending")
+    if status not in {"pending", "in_progress", "completed", "paused"}:
+        status = "pending"
+    raw_tags = payload.get("tags") if isinstance(payload.get("tags"), list) else []
+    tags = [str(t).strip() for t in raw_tags if str(t).strip()][:12]
+    now = _now_iso()
+    return {
+        "id": task_id or str(payload.get("id") or f"task-{time.time_ns()}"),
+        "name": str(payload.get("name") or "").strip(),
+        "description": str(payload.get("description") or "").strip(),
+        "targetEpisodes": max(0, int(payload.get("targetEpisodes", 0))),
+        "completedEpisodes": max(0, int(payload.get("completedEpisodes", 0))),
+        "status": status,
+        "assignee": str(payload.get("assignee") or "").strip(),
+        "datasetRepoId": str(payload.get("datasetRepoId") or "").strip(),
+        "tags": tags,
+        "createdAt": str(payload.get("createdAt") or now),
+        "updatedAt": now,
+    }
+
+
+def _count_completed_episodes(state: GatewayState, repo_id: str) -> int:
+    if not repo_id or not state.datasets_root:
+        return 0
+    total = 0
+    try:
+        for candidate in state.datasets_root.iterdir():
+            if not candidate.is_dir():
+                continue
+            if repo_id and repo_id not in candidate.name:
+                continue
+            info = _load_dataset_info(candidate)
+            if info:
+                total += int(info.get("total_episodes", 0))
+    except OSError:
+        pass
+    return total
+
+
+def _tasks_with_progress(state: GatewayState) -> list[dict[str, Any]]:
+    tasks = _read_tasks(state)
+    for task in tasks:
+        if task.get("datasetRepoId"):
+            task["completedEpisodes"] = _count_completed_episodes(state, task["datasetRepoId"])
+    return tasks
+
+
+def _create_task(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    tasks = _read_tasks(state)
+    task = _normalize_task(payload)
+    if not task["name"]:
+        raise ValueError("Task name is required.")
+    tasks.append(task)
+    _write_tasks(state, tasks)
+    state.log("info", f"Created task: {task['name']}")
+    return task
+
+
+def _update_task(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    task_id = str(payload.get("id") or "")
+    if not task_id:
+        raise ValueError("Task id is required.")
+    tasks = _read_tasks(state)
+    for i, existing in enumerate(tasks):
+        if existing.get("id") == task_id:
+            merged = {**existing, **payload}
+            tasks[i] = _normalize_task(merged, task_id=task_id)
+            tasks[i]["createdAt"] = existing.get("createdAt", tasks[i]["createdAt"])
+            _write_tasks(state, tasks)
+            state.log("info", f"Updated task: {tasks[i]['name']}")
+            return tasks[i]
+    raise ValueError(f"Task not found: {task_id}")
+
+
+def _delete_task(state: GatewayState, task_id: str) -> None:
+    tasks = _read_tasks(state)
+    filtered = [t for t in tasks if t.get("id") != task_id]
+    if len(filtered) == len(tasks):
+        raise ValueError(f"Task not found: {task_id}")
+    _write_tasks(state, filtered)
+    state.log("info", f"Deleted task: {task_id}")
+
+
 def _annotation_store_path(dataset_root: Path) -> Path:
     return dataset_root / "meta" / "gui_annotations.json"
 
@@ -1160,6 +1283,23 @@ def _normalize_annotation(
         quality = "unreviewed"
     raw_tags = payload.get("tags") if isinstance(payload.get("tags"), list) else []
     tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()][:12]
+    review_status = str(payload.get("reviewStatus") or "pending")
+    if review_status not in {"pending", "approved", "rejected"}:
+        review_status = "pending"
+    raw_segments = payload.get("segments") if isinstance(payload.get("segments"), list) else []
+    segments = []
+    for seg in raw_segments:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            segments.append({
+                "id": str(seg.get("id") or f"{len(segments)}"),
+                "startFrame": max(0, int(seg.get("startFrame", 0))),
+                "endFrame": max(0, int(seg.get("endFrame", 0))),
+                "description": str(seg.get("description") or "").strip(),
+            })
+        except (TypeError, ValueError):
+            continue
     return {
         "datasetRoot": str(dataset_root),
         "episode": episode,
@@ -1172,6 +1312,9 @@ def _normalize_annotation(
         "annotator": str(payload.get("annotator") or "").strip(),
         "updatedAt": str(payload.get("updatedAt") or ""),
         "source": source,
+        "segments": segments,
+        "reviewStatus": review_status,
+        "reviewComment": str(payload.get("reviewComment") or "").strip(),
     }
 
 
@@ -2402,6 +2545,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "processing": _processing_items(state),
         "trajectory": trajectory,
         "events": [asdict(event) for event in state.events],
+        "tasks": _tasks_with_progress(state),
     }
 
 
@@ -3311,6 +3455,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             if path == "/api/handheld/config":
                 _json_response(self, HTTPStatus.OK, self.server.state.config)
                 return
+            if path == "/api/tasks":
+                _json_response(self, HTTPStatus.OK, {"tasks": _tasks_with_progress(self.server.state)})
+                return
             if path == "/api/replay/timeline":
                 requested = query.get("path", [""])[0]
                 dataset_root = _resolve_known_dataset(self.server.state, requested) or (
@@ -3444,6 +3591,19 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 if path == "/api/replay/abort":
                     _abort_replay(self.server.state)
                     self.server.state.log("warn", "Replay aborted")
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/tasks/create":
+                    task = _create_task(self.server.state, _read_json_body(self))
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/tasks/update":
+                    task = _update_task(self.server.state, _read_json_body(self))
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/tasks/delete":
+                    task_id = (query.get("id", [""])[0] or "").strip()
+                    _delete_task(self.server.state, task_id)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
         except Exception as exc:  # noqa: BLE001

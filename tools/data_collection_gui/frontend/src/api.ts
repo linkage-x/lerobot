@@ -1,5 +1,6 @@
 import { handheldConfigSummary, initialDevices } from "./defaultHandheldConfig";
 import type {
+  CollectionTask,
   EpisodeAnnotation,
   CalibrationCamera,
   CalibrationStatus,
@@ -53,6 +54,7 @@ export type GuiSnapshot = {
   processing: ProcessingItem[];
   trajectory: TrajectoryPoint[];
   events: EventLogItem[];
+  tasks: CollectionTask[];
   notice?: string;
 };
 
@@ -130,7 +132,10 @@ export class DataCollectionGuiApi {
       notes: "",
       annotator: "",
       updatedAt: "",
-      source: "default"
+      source: "default",
+      segments: [],
+      reviewStatus: "pending",
+      reviewComment: ""
     },
     calibration: {
       state: "idle",
@@ -162,6 +167,7 @@ export class DataCollectionGuiApi {
     recordedDatasets: [],
     processing: [],
     trajectory: [],
+    tasks: [],
     events: [
       {
         id: "boot",
@@ -538,6 +544,54 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
+  async createTask(task: Partial<CollectionTask>): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteJsonSnapshot("/api/tasks/create", task);
+    if (remote) {
+      return remote;
+    }
+    await wait(140);
+    const newTask: CollectionTask = {
+      id: `task-${Date.now()}`,
+      name: task.name ?? "",
+      description: task.description ?? "",
+      targetEpisodes: task.targetEpisodes ?? 0,
+      completedEpisodes: 0,
+      status: "pending",
+      assignee: task.assignee ?? "",
+      datasetRepoId: task.datasetRepoId ?? "",
+      tags: task.tags ?? [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    this.snapshot.tasks = [...this.snapshot.tasks, newTask];
+    this.log("info", `Created task: ${newTask.name}`);
+    return this.getSnapshot();
+  }
+
+  async updateTask(task: Partial<CollectionTask>): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteJsonSnapshot("/api/tasks/update", task);
+    if (remote) {
+      return remote;
+    }
+    await wait(120);
+    this.snapshot.tasks = this.snapshot.tasks.map((t) =>
+      t.id === task.id ? { ...t, ...task, updatedAt: new Date().toISOString() } : t
+    );
+    this.log("info", `Updated task: ${task.name ?? task.id}`);
+    return this.getSnapshot();
+  }
+
+  async deleteTask(taskId: string): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot(`/api/tasks/delete?id=${encodeURIComponent(taskId)}`);
+    if (remote) {
+      return remote;
+    }
+    await wait(120);
+    this.snapshot.tasks = this.snapshot.tasks.filter((t) => t.id !== taskId);
+    this.log("info", `Deleted task: ${taskId}`);
+    return this.getSnapshot();
+  }
+
   tick(): GuiSnapshot {
     if (this.usingRemote) {
       return structuredClone(this.snapshot);
@@ -713,6 +767,12 @@ export class DataCollectionGuiApi {
       snapshot.annotation?.datasetRoot === activeAnnotationPath && snapshot.annotation.episode === snapshot.replay.episode
         ? snapshot.annotation
         : this.mockAnnotation(snapshot, false);
+    const annotationWithDefaults: typeof annotation = {
+      ...annotation,
+      segments: annotation.segments ?? [],
+      reviewStatus: annotation.reviewStatus ?? "pending",
+      reviewComment: annotation.reviewComment ?? ""
+    };
     return {
       ...snapshot,
       replay: {
@@ -723,7 +783,8 @@ export class DataCollectionGuiApi {
       },
       recordedDatasets,
       processing,
-      annotation,
+      annotation: annotationWithDefaults,
+      tasks: snapshot.tasks ?? this.snapshot.tasks ?? [],
       calibration: snapshot.calibration ?? this.snapshot.calibration,
       datasetExport: snapshot.datasetExport ?? {
         ...this.snapshot.datasetExport,
@@ -753,7 +814,10 @@ export class DataCollectionGuiApi {
       notes: "",
       annotator: "",
       updatedAt: "",
-      source: "default"
+      source: "default",
+      segments: [],
+      reviewStatus: "pending",
+      reviewComment: ""
     };
   }
 
