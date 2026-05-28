@@ -427,6 +427,53 @@ def _nearest_sample_data(
     return samples[idx].get("data", {})
 
 
+def _table_column_stats(table, col_name: str, *, width: int) -> dict[str, list]:
+    """Per-channel min/max/mean/std/quantiles from a pyarrow Table column.
+
+    Bypasses to_pylist()/sorted() which the old _stats(list[list[float]]) helper
+    forced, and which produced O(N^2) Python heap growth as the dataset
+    accumulated episodes (see development_status.md). Streams Arrow buffers
+    into a single numpy view per column instead.
+
+    ``width=1`` is for scalar columns (timestamp / frame_index / etc.) and
+    returns length-1 lists matching the legacy schema. ``width>1`` is for
+    fixed-size-list columns (observation.state / action) and returns
+    per-channel lists.
+    """
+    import numpy as np
+
+    arr = table[col_name]
+    n = arr.length()
+    if n == 0:
+        empty: list[float] = []
+        return {
+            "min": empty, "max": empty, "mean": empty, "std": empty,
+            "count": [0],
+            "q01": empty, "q10": empty, "q50": empty, "q90": empty, "q99": empty,
+        }
+
+    if width == 1:
+        np_arr = arr.combine_chunks().to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
+        np_arr = np_arr.reshape(n, 1)
+    else:
+        flat = arr.combine_chunks().flatten().to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
+        np_arr = flat.reshape(n, width)
+
+    quantiles = np.quantile(np_arr, [0.01, 0.10, 0.50, 0.90, 0.99], axis=0)
+    return {
+        "min": np_arr.min(axis=0).tolist(),
+        "max": np_arr.max(axis=0).tolist(),
+        "mean": np_arr.mean(axis=0).tolist(),
+        "std": np_arr.std(axis=0).tolist(),
+        "count": [int(n)],
+        "q01": quantiles[0].tolist(),
+        "q10": quantiles[1].tolist(),
+        "q50": quantiles[2].tolist(),
+        "q90": quantiles[3].tolist(),
+        "q99": quantiles[4].tolist(),
+    }
+
+
 def _rows_to_table(pa, rows: list[dict[str, Any]]):
     state_width = len(BOX_STATE_NAMES)
 
@@ -489,6 +536,7 @@ def write_box_lerobot_v3_episode(
         return None
     try:
         import pyarrow as pa
+        import pyarrow.compute as pc
         import pyarrow.parquet as pq
     except Exception:
         return None
@@ -500,9 +548,6 @@ def write_box_lerobot_v3_episode(
     episodes_dir.mkdir(parents=True, exist_ok=True)
 
     data_path = data_dir / "file-000.parquet"
-    existing_rows: list[dict[str, Any]] = []
-    if data_path.exists():
-        existing_rows = pq.read_table(data_path).to_pylist()
 
     frame_count = len(snapshots) if snapshots else 0
     if duration_s is not None and duration_s > 0:
@@ -563,20 +608,73 @@ def write_box_lerobot_v3_episode(
                 "task_index": 0,
             })
 
-    existing_rows = [
-        row for row in existing_rows
-        if int(row.get("episode_index") if row.get("episode_index") is not None else -1) != episode_index
-    ]
-    all_rows = sorted(
-        [*existing_rows, *rows],
-        key=lambda row: (int(row.get("episode_index") or 0), int(row.get("frame_index") or 0)),
+    # Merge current-episode rows into existing parquet using Arrow Table
+    # operations end-to-end. The old path did pq.read_table().to_pylist()
+    # then sorted([*existing, *rows]) then rebuilt every row dict, which
+    # peaked at N * per_ep_rows * ~10 Python dict copies per episode and
+    # caused permanent glibc malloc arena growth — ~7.7 MB/ep on Thor
+    # at 50 ep with no GStreamer involved (see development_status.md).
+    new_table = _rows_to_table(pa, rows)
+    if data_path.exists():
+        existing_table = pq.read_table(data_path)
+        # Drop any prior rows for this same episode_index (idempotent overwrite).
+        mask = pc.not_equal(
+            existing_table["episode_index"],
+            pa.scalar(int(episode_index), type=pa.int64()),
+        )
+        existing_table = existing_table.filter(mask)
+        combined = pa.concat_tables([existing_table, new_table])
+    else:
+        combined = new_table
+    combined = combined.sort_by(
+        [("episode_index", "ascending"), ("frame_index", "ascending")]
     )
-    for global_index, row in enumerate(all_rows):
-        row["index"] = global_index
-    pq.write_table(_rows_to_table(pa, all_rows), data_path)
+    n_total = combined.num_rows
+    combined = combined.set_column(
+        combined.schema.get_field_index("index"),
+        "index",
+        pa.array(range(n_total), type=pa.int64()),
+    )
+    pq.write_table(combined, data_path)
 
-    total_episodes = len({int(row["episode_index"]) for row in all_rows})
-    total_frames = len(all_rows)
+    # Per-column stats via numpy on Arrow buffers (no row-level Python loop).
+    state_width = len(BOX_STATE_NAMES)
+    stats = {
+        "observation.state": _table_column_stats(combined, "observation.state", width=state_width),
+        "action": _table_column_stats(combined, "action", width=state_width),
+        "timestamp": _table_column_stats(combined, "timestamp", width=1),
+        "frame_index": _table_column_stats(combined, "frame_index", width=1),
+        "episode_index": _table_column_stats(combined, "episode_index", width=1),
+        "index": _table_column_stats(combined, "index", width=1),
+        "task_index": _table_column_stats(combined, "task_index", width=1),
+    }
+    (meta_dir / "stats.json").write_text(json.dumps(stats, indent=4), encoding="utf-8")
+
+    # Episode-level rollup via group_by aggregation on Arrow. group_by
+    # produces columns named "<col>_<agg>" (e.g. index_min, index_count).
+    ep_groups = combined.select(["episode_index", "index"]).group_by("episode_index").aggregate([
+        ("index", "min"),
+        ("index", "max"),
+        ("index", "count"),
+    ]).sort_by([("episode_index", "ascending")])
+    n_eps = ep_groups.num_rows
+    ep_idx_list = ep_groups["episode_index"].to_pylist()
+    ep_count_list = ep_groups["index_count"].to_pylist()
+    ep_from_list = ep_groups["index_min"].to_pylist()
+    ep_to_list = [int(v) + 1 for v in ep_groups["index_max"].to_pylist()]
+    ep_table = pa.table({
+        "episode_index": pa.array(ep_idx_list, type=pa.int64()),
+        "tasks": pa.array([[task]] * n_eps, type=pa.list_(pa.string())),
+        "length": pa.array(ep_count_list, type=pa.int64()),
+        "data/chunk_index": pa.array([0] * n_eps, type=pa.int64()),
+        "data/file_index": pa.array([0] * n_eps, type=pa.int64()),
+        "dataset_from_index": pa.array(ep_from_list, type=pa.int64()),
+        "dataset_to_index": pa.array(ep_to_list, type=pa.int64()),
+        "meta/episodes/chunk_index": pa.array([0] * n_eps, type=pa.int64()),
+        "meta/episodes/file_index": pa.array([0] * n_eps, type=pa.int64()),
+    })
+    pq.write_table(ep_table, episodes_dir / "file-000.parquet")
+
     features = {
         "observation.state": _feature("float32", [len(BOX_STATE_NAMES)], list(BOX_STATE_NAMES)),
         "action": _feature("float32", [len(BOX_STATE_NAMES)], list(BOX_STATE_NAMES)),
@@ -590,51 +688,18 @@ def write_box_lerobot_v3_episode(
         "codebase_version": "v3.0",
         "robot_type": "thor_gmsl2_box",
         "repo_id": repo_id,
-        "total_episodes": total_episodes,
-        "total_frames": total_frames,
+        "total_episodes": int(n_eps),
+        "total_frames": int(n_total),
         "total_tasks": 1,
         "chunks_size": 1000,
         "data_files_size_in_mb": 100,
         "video_files_size_in_mb": 200,
         "fps": int(fps),
-        "splits": {"train": f"0:{total_episodes}"},
+        "splits": {"train": f"0:{n_eps}"},
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
         "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
         "features": features,
     }
     (meta_dir / "info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
-
     pq.write_table(pa.Table.from_pylist([{"task_index": 0, "task": task}]), meta_dir / "tasks.parquet")
-
-    state_values = [list(row["observation.state"]) for row in all_rows]
-    action_values = [list(row["action"]) for row in all_rows]
-    stats = {
-        "observation.state": _stats(state_values),
-        "action": _stats(action_values),
-        "timestamp": _stats([[float(row["timestamp"])] for row in all_rows]),
-        "frame_index": _stats([[float(row["frame_index"])] for row in all_rows]),
-        "episode_index": _stats([[float(row["episode_index"])] for row in all_rows]),
-        "index": _stats([[float(row["index"])] for row in all_rows]),
-        "task_index": _stats([[float(row["task_index"])] for row in all_rows]),
-    }
-    (meta_dir / "stats.json").write_text(json.dumps(stats, indent=4), encoding="utf-8")
-
-    episode_rows = []
-    for ep in sorted({int(row["episode_index"]) for row in all_rows}):
-        ep_rows = [row for row in all_rows if int(row["episode_index"]) == ep]
-        indices = [int(row["index"]) for row in ep_rows]
-        episode_rows.append(
-            {
-                "episode_index": ep,
-                "tasks": [task],
-                "length": len(ep_rows),
-                "data/chunk_index": 0,
-                "data/file_index": 0,
-                "dataset_from_index": min(indices),
-                "dataset_to_index": max(indices) + 1,
-                "meta/episodes/chunk_index": 0,
-                "meta/episodes/file_index": 0,
-            }
-        )
-    pq.write_table(pa.Table.from_pylist(episode_rows), episodes_dir / "file-000.parquet")
     return data_path

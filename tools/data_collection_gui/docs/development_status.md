@@ -104,33 +104,72 @@
 
 **注意**：测试用的 yaml 默认 `iframe_interval=60` → 首 episode 切片延迟 305-725ms。生产建议改为 30（PR1 burn-in 用的就是 30）。
 
-### 100-ep burn-in RSS 增长（follow-up）
+### 100-ep burn-in RSS 增长（已定位 + 部分修复）
 
-PR1 mock 单测时 RSS 是 ~23 KB/ep（无泄漏）。真实硬件 100 ep burn-in 上：
+PR1 mock 单测时 RSS 是 ~23 KB/ep（无泄漏）。真实硬件 100 ep burn-in 上 PR2 commit
+时观测到 **~2.8 MB/ep**（100×）。最初列了 4 个猜测（nvargus / glib bus / box
+SDK / BoxClient `_record_samples`），**全部错了**。
 
-| t | saved | RSS |
-|---|---|---|
-| 0s | 0 | 17 MB |
-| 10s | 0 | 343 MB（pipeline spawning） |
-| 20s | 2 | 462 MB（2 路 PLAYING + warmup pool） |
-| 100s | 22 | 683 MB |
-| 200s | 46 | 711 MB |
-| 300s | 67 | 808 MB |
-| 400s | 86 | 867 MB |
-| 471s | 100 | 901 MB |
+#### 根因定位（系列 ablation）
 
-从稳态起算（22 ep / 683 MB → 100 ep / 901 MB）：**~2.8 MB/ep**。
+| 测试 | RSS 涨幅 |
+|---|---|
+| `--no-box` 50 ep（GStreamer-only） | ~0 |
+| Box-only idle 90s（SDK 跑 UDP + 写 CSV，无 recording） | ~0 |
+| Box-only + `start_recording`/`stop_recording` 循环 50 ep | 140 KB/ep |
+| Box-only + `lr3.write_box_lerobot_v3_episode` 50 ep（**无 GStreamer**） | **7.7 MB/ep** |
+| 全栈 thor_record + GStreamer + BOX + lr3 100 ep | **2.9 MB/ep**（被 GStreamer baseline 稀释） |
 
-不是 leak（没有崩、GStreamer 干净退出、单测验证过 fragment 清理），但增长率比 mock 高
-100×。可能根因（待 PR3 之前确认）：
-- nvargus / Argus driver 内部 buffer pool 在 long session 下扩张
-- splitmuxsink async-finalize 期间临时 buffer 没及时回收
-- BoxClient 的 `_record_samples` 在 200Hz × 5 sensors × 数秒可能不小
+**根因**：`tools/thor/gmsl2/thor_lerobot_v3.py:write_box_lerobot_v3_episode`
+是个 O(N²) 增量写法。每个 episode 都：
 
-实际生产工况（11 路 + 30 ep 中等 session）下 RSS 大约会涨 350MB+830MB ≈ 1.2GB，
-Thor 32GB 内存富裕。但要长期跑（数百 ep）就需要：
-- ramp up 阶段（前 20s, ~300MB → ~700MB）+ 线性段（2.8 MB/ep）
-- 估算公式：`rss_mb ≈ 700 + 2.8 * ep_count`（2 路情形；11 路按比例放大）
+1. `pq.read_table(data_path).to_pylist()` —— N×per_ep_rows 个 Python dict
+2. `existing_rows = [row for row in existing_rows if ...]` —— 又一份 copy
+3. `sorted([*existing_rows, *rows], ...)` —— 又一份
+4. `state_values = [list(row["observation.state"]) for row in all_rows]` —— 又一份
+5. `action_values = [list(row["action"]) for row in all_rows]` —— 又一份
+6. `_stats([[float(row[col])] for row in all_rows])` × 5 列 —— 5 份
+7. 每个 episode 又 filter `all_rows` 重建 episode_rows
+
+每 ep peak Python heap ≈ N × per_ep_rows × ~10 副本。glibc malloc arena
+跟着峰值需求扩张后**不归还 OS**，所以 RSS 永久跟着最大需求增长。
+
+#### 修复（已合）
+
+用 Arrow Table-native 路径替换 to_pylist + sorted + dict comprehension：
+- `pa.concat_tables` + `Table.sort_by` 在 Arrow columnar buffer 上做，不再
+  把整个 table 解 to 成 Python dict
+- 新 helper `_table_column_stats(table, col, width=)` 用 numpy + `np.quantile`
+  直接对 Arrow buffer 做向量化 stats（zero_copy_only=False，必要时单次拷贝
+  到 float64 numpy view）
+- Episode rollup 用 `table.group_by("episode_index").aggregate([(index, min),
+  (index, max), (index, count)])`，O(N) Arrow agg 替代两层 Python for + filter
+
+#### Fix 后实测
+
+`lr3.write_box_lerobot_v3_episode` 单独 ablation：
+- 修复前 50 ep：29 MB → 417 MB（**+388 MB / 7.7 MB/ep**）
+- 修复后 50 ep：30 MB → 350 MB（+320 MB / 6.4 MB/ep）
+- 修复后 100 ep：29 MB → 475 MB（+446 MB / 4.5 MB/ep；ep 25-50 / 60-75 plateau）
+
+全栈 100 ep（thor_record + GStreamer + BOX）：
+- 修复前：462 MB (ep 2) → 901 MB (ep 100) = **+439 MB / 4.5 MB/ep**
+- 修复后：488 MB (ep 4) → 764 MB (ep 99) = **+276 MB / 2.9 MB/ep（改善 36%）**
+- 模式：plateau-跳级（典型 glibc arena 扩张），不再是平滑线性
+
+#### 残留（follow-up）
+
+剩 ~2.9 MB/ep 是 `sort_by` + `read existing` 的 fundamental O(N) working
+memory：每 ep peak heap = O(N)，glibc arena 跟着 max-N 扩张。要根治需要
+重构 dataset spec：
+- **方案 1**：每 ep 独立 `file-{ep:06d}.parquet`，info.json 列多个 files。
+  下游 loader 需要适配多文件 chunk-000 目录。
+- **方案 2**：用 `pyarrow.parquet.ParquetWriter` 跨 thor_record 进程持有
+  writer 句柄，跨 ep 直接 append row group。需要重构 lr3 API 改成"open /
+  append / close"模型而不是当前的"write episode"模型。
+
+当前 11 路实际工况 100 ep RSS < 800 MB，Thor 32GB 内存富裕。建议留到独立
+PR 处理。
 
 ### 操作员 stdin "Enter Enter" 修复
 
