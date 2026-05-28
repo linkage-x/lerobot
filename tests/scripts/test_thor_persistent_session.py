@@ -224,6 +224,41 @@ def test_next_episode_index_empty(tmp_path):
     assert ps._next_episode_index(tmp_path) == 0
 
 
+def test_cleanup_warmup_files_keeps_recent_per_sid(tmp_path):
+    warmup = tmp_path / "warmup"
+    warmup.mkdir()
+    # 5 fragments for sid 0, 3 for sid 7
+    for i in range(5):
+        (warmup / f"cam_00_warmup_{i:05d}.mkv").write_bytes(b"x")
+    for i in range(3):
+        (warmup / f"cam_07_warmup_{i:05d}.mkv").write_bytes(b"x")
+    # Non-matching files should be ignored.
+    (warmup / "other_file.mkv").write_bytes(b"x")
+    session = ps.PersistentCameraSession(streams=[], warmup_dir=warmup)
+    deleted = session.cleanup_warmup_files(keep_last_n=2)
+    assert deleted == 3 + 1  # sid 0: 5-2=3 deleted; sid 7: 3-2=1 deleted
+    remaining = sorted(p.name for p in warmup.glob("cam_*_warmup_*.mkv"))
+    assert remaining == [
+        "cam_00_warmup_00003.mkv",
+        "cam_00_warmup_00004.mkv",
+        "cam_07_warmup_00001.mkv",
+        "cam_07_warmup_00002.mkv",
+    ]
+    # Non-matching file untouched.
+    assert (warmup / "other_file.mkv").exists()
+
+
+def test_cleanup_warmup_files_zero_keeps_none(tmp_path):
+    warmup = tmp_path / "warmup"
+    warmup.mkdir()
+    for i in range(3):
+        (warmup / f"cam_00_warmup_{i:05d}.mkv").write_bytes(b"x")
+    session = ps.PersistentCameraSession(streams=[], warmup_dir=warmup)
+    deleted = session.cleanup_warmup_files(keep_last_n=0)
+    assert deleted == 3
+    assert not list(warmup.glob("cam_*_warmup_*.mkv"))
+
+
 def test_next_episode_index_skips_non_episode_dirs(tmp_path):
     (tmp_path / "episode_000000").mkdir()
     (tmp_path / "episode_000004").mkdir()

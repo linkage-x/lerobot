@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -275,6 +276,25 @@ class BoxClient:
         if not self.cfg.enabled:
             logger.info("box_collection disabled in config; skipping start")
             return False
+
+        # The native SDK reads its gripper URDF from $BOX_SDK_URDF; without
+        # this it falls back to relative path "thirdpart/monte_gripper.urdf"
+        # that doesn't exist in the deploy layout, and the C++ urdf_parser
+        # throws std::invalid_argument -> std::terminate -> SIGABRT on the
+        # first incoming UDP packet. Resolve to an absolute path here so
+        # callers don't have to source tools/thor/box_sdk/setup_env.sh.
+        # box_client.py lives at <repo>/tools/thor/box_sdk/, alongside
+        # share/monte_gripper.urdf, so we resolve relative to __file__.
+        urdf_abs = Path(__file__).resolve().parent / self.cfg.urdf_relpath
+        if urdf_abs.exists():
+            os.environ.setdefault("BOX_SDK_URDF", str(urdf_abs))
+        else:
+            logger.warning(
+                "box_sdk URDF not found at %s; native SDK will likely abort "
+                "(set $BOX_SDK_URDF manually or fix urdf_relpath in "
+                "box_collection config)", urdf_abs,
+            )
+
         try:
             from box_sdk import Box  # type: ignore
         except Exception as exc:

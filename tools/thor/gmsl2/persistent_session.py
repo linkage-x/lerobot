@@ -551,6 +551,60 @@ class PersistentCameraSession:
                         pass
                     stream.last_episode_fragment = None
 
+    # -- maintenance -----------------------------------------------------
+
+    def cleanup_warmup_files(self, *, keep_last_n: int = 3) -> int:
+        """Delete warmup-state fragments, keeping the most recent N per camera.
+
+        splitmuxsink doesn't auto-rotate fragments in async-finalize mode,
+        so this prevents the warmup directory from growing unbounded across
+        long sessions. Call once per episode.
+
+        Returns the number of files deleted.
+        """
+        if not self.warmup_dir.is_dir():
+            return 0
+        per_sid: dict[int, list[Path]] = {}
+        for path in self.warmup_dir.glob("cam_*_warmup_*.mkv"):
+            try:
+                # cam_00_warmup_00003.mkv -> sid=0
+                sid = int(path.name.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            per_sid.setdefault(sid, []).append(path)
+        deleted = 0
+        for paths in per_sid.values():
+            paths.sort(key=lambda p: p.name)
+            for old in paths[:-keep_last_n] if keep_last_n > 0 else paths:
+                try:
+                    old.unlink()
+                    deleted += 1
+                except OSError:
+                    pass
+        return deleted
+
+    def restart_stream(self, sid: int) -> bool:
+        """NULL -> PLAYING the pipeline for one stream.
+
+        Useful when ``poll_errors()`` flags that stream as failed: drops the
+        Argus session, rebuilds the pipeline (cheap; the elements are already
+        constructed), and brings it back to PLAYING. Returns True on success.
+        """
+        Gst = self._Gst
+        if Gst is None or sid not in self._streams:
+            return False
+        stream = self._streams[sid]
+        try:
+            stream.pipeline.set_state(Gst.State.NULL)
+            stream.pipeline.get_state(timeout=Gst.SECOND)
+            ret = stream.pipeline.set_state(Gst.State.PLAYING)
+            ok = ret != Gst.StateChangeReturn.FAILURE
+            logger.info("restart_stream sid=%s -> %s", sid, "ok" if ok else "FAIL")
+            return ok
+        except Exception as exc:
+            logger.warning("restart_stream sid=%s raised: %s", sid, exc)
+            return False
+
     # -- diagnostics -----------------------------------------------------
 
     def poll_errors(self) -> list[StreamError]:

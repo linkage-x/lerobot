@@ -54,6 +54,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools.thor.gmsl2 import gmsl2_record as gr  # noqa: E402
+from tools.thor.gmsl2 import persistent_session as ps  # noqa: E402
 from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
 
@@ -112,13 +113,21 @@ def _wait_for_command(queue: list[StdinCommand], stop: threading.Event,
 
 def _drain_until(queue: list[StdinCommand], accept: tuple[str, ...],
                  stop: threading.Event, deadline_s: float) -> StdinCommand | None:
-    """Non-blocking poll for an accepted command, with a deadline."""
+    """Non-blocking poll for an accepted command, with a deadline.
+
+    Non-accepted commands (e.g. ``start`` queued while we're waiting for
+    save/discard) are left in the queue so the next main-loop iteration
+    can pick them up — otherwise a GUI that emits "Enter Enter" to
+    "save current + start next" would lose the second Enter.
+    """
     end = time.monotonic() + deadline_s
     while time.monotonic() < end and not stop.is_set():
         if queue:
-            cmd = queue.pop(0)
-            if cmd.kind in accept:
-                return cmd
+            if queue[0].kind in accept:
+                return queue.pop(0)
+            # First queued cmd is something else (operator moved on); fall
+            # through to the caller's default behavior.
+            return None
         time.sleep(0.05)
     return None
 
@@ -126,25 +135,38 @@ def _drain_until(queue: list[StdinCommand], accept: tuple[str, ...],
 # ----------------------------------------------------------------- meta ---
 
 
-def _extract_pts_offset(streams: list[gr.CameraStream]) -> float | None:
-    """Extract the first-frame PTS from the earliest camera's MKV.
+def _pts_offset_from_handle(handle: ps.EpisodeHandle) -> float | None:
+    """Per-camera (wall_s - split_now_wall_s), averaged across streams.
 
-    All cameras share the same PWM trigger so the inter-frame interval is
-    identical.  Only the absolute offset of the first frame matters — use the
-    camera with the smallest spawn_stagger (earliest start).  Returns
-    ``None`` when ffprobe is unavailable or the MKV is empty/corrupt.
+    This replaces the legacy ffprobe-based first-PTS extraction. PR1 burn-in
+    on Thor showed that splitmuxsink's `format-location-full` callback's
+    `first_sample.pts` is an unreliable cross-stream anchor (pipeline
+    clocks are per-stream, so `first_pts_s` varies by up to 10s across
+    cameras even when they actually started ~20ms apart). The real
+    cross-stream clock is host wall time, captured into FragmentInfo at
+    callback time.
+
+    We return one scalar (the mean per-camera delay between split-now and
+    the first sample actually opening on disk) so callers that previously
+    passed ``pts_offset_s`` to ``thor_lerobot_v3.write_box_lerobot_v3_episode``
+    keep working unchanged. The full per-camera breakdown is preserved in
+    meta.json under ``sync_reference.camera_first_wall_s``.
     """
-    candidates = sorted(streams, key=lambda s: s.started_at)
-    for stream in candidates:
-        if not stream.file.exists() or stream.file.stat().st_size < 1024:
-            continue
-        pts_list = lr3.extract_pts(stream.file)
-        if pts_list:
-            logger.info("PTS offset from %s: %.6fs (first of %d frames)",
-                        stream.name, pts_list[0], len(pts_list))
-            return pts_list[0]
-    logger.warning("could not extract PTS from any camera MKV")
-    return None
+    if not handle.fragments:
+        return None
+    deltas = [
+        info.first_wall_s - handle.t0_wall_s
+        for info in handle.fragments.values()
+        if info.first_wall_s > 0
+    ]
+    if not deltas:
+        return None
+    avg = sum(deltas) / len(deltas)
+    logger.info(
+        "pts_offset (avg first_wall - split_now across %d cams): %.4fs",
+        len(deltas), avg,
+    )
+    return avg
 
 
 def _write_sensor_samples(
@@ -167,26 +189,133 @@ def _write_sensor_samples(
 
 
 def _write_episode_meta(
-    ep: gr.EpisodeResult,
+    handle: ps.EpisodeHandle,
     cfg: gr.RecorderConfig,
     locked: list[int],
     argus_failed: list[int],
     box_cfg: bc.BoxClientConfig,
     box_snapshots: list[dict[str, Any]],
     stop_reason: str,
+    wallclock_start_utc: str,
+    wallclock_end_utc: str,
 ) -> Path:
-    meta_path = gr.write_episode_meta(ep, cfg, locked, argus_failed)
-    payload = json.loads(meta_path.read_text())
-    payload["recording_stop_reason"] = stop_reason
+    """Write per-episode meta.json under the persistent-pipeline model.
+
+    Mirrors the schema produced by gr.write_episode_meta (so downstream
+    consumers don't break), but the ``sync_reference`` block is the new
+    PR2 model:
+
+      * ``split_now_wall_s``: host wall time when start_episode() emitted
+        split-now on every splitmuxsink
+      * ``camera_first_wall_s``: per-camera wall time when the new fragment
+        actually opened (from format-location-full callback). This is the
+        anchor downstream consumers should align BOX/touch samples to.
+      * ``camera_first_pts_s``: per-camera buffer PTS of the first frame in
+        the new fragment. Useful for single-stream analysis but NOT
+        comparable across cameras (pipeline clocks are independent).
+
+    The legacy ``camera_spawn_wall_s`` / ``camera_spawn_offset_s`` fields
+    are gone; the closest replacement is ``camera_first_wall_s``.
+    """
+    fragments = handle.fragments
+    duration_s = max(0.0, handle.stop_wall_s - handle.t0_wall_s)
+    meta = {
+        "episode_index": handle.idx,
+        "repo_id": cfg.repo_id,
+        "single_task": cfg.single_task,
+        "wallclock_start_utc": wallclock_start_utc,
+        "wallclock_end_utc": wallclock_end_utc,
+        "duration_s": duration_s,
+        "recording_stop_reason": stop_reason,
+        "video": {
+            "fps": cfg.cameras.fps,
+            "width": cfg.cameras.width,
+            "height": cfg.cameras.height,
+            "codec": cfg.cameras.codec,
+            "container": cfg.cameras.container,
+            "bitrate_kbps": cfg.cameras.bitrate_kbps,
+            "iframe_interval": cfg.cameras.iframe_interval,
+            "idr_interval": cfg.cameras.iframe_interval,
+            "preset_level": cfg.cameras.preset_level,
+            "control_rate": cfg.cameras.control_rate,
+            "color_format": "NV12 (YUV420)",
+            "replay_warmup_s": float(cfg.cameras.replay_warmup_s),
+            "pipeline": "nvarguscamerasrc | nvv4l2h{265,264}enc | splitmuxsink (persistent)",
+        },
+        "hardware_sync": {
+            "enabled": cfg.hardware_sync.enabled,
+            "pwm_chip": cfg.hardware_sync.pwm_chip,
+            "pwm_id": cfg.hardware_sync.pwm_id,
+            "pwm_fps": cfg.hardware_sync.fps,
+            "trig_pin": f"0x{cfg.hardware_sync.trig_pin:08x}",
+        },
+        "sync_reference": {
+            "t0_wall_s": handle.t0_wall_s,
+            "t0_mono_s": handle.t0_mono_s,
+            "split_now_wall_s": handle.t0_wall_s,
+            "camera_first_wall_s": {
+                name: info.first_wall_s for name, info in fragments.items()
+            },
+            "camera_first_pts_s": {
+                name: info.first_pts_s for name, info in fragments.items()
+            },
+            "note": (
+                "Persistent-pipeline model (PR2). split_now_wall_s is host "
+                "time when start_episode() emitted split-now. "
+                "camera_first_wall_s is the host time each splitmuxsink "
+                "actually opened its new fragment — use this as the "
+                "cross-camera alignment anchor (~20ms spread in PR1 "
+                "burn-in). camera_first_pts_s is per-stream buffer PTS "
+                "and is NOT cross-camera comparable. BOX snapshots carry "
+                "t_relative_s = time.time() - split_now_wall_s."
+            ),
+        },
+        "max96726_locked_sids": locked,
+        "argus_failed_sids": argus_failed,
+        "spawn_stagger_s": cfg.spawn_stagger_s,
+        "stop_on_stream_exit": cfg.stop_on_stream_exit,
+        "cameras": [
+            {
+                "sensor_id": info.sid,
+                "name": name,
+                "file": info.path.name,
+                "fragment_id": info.fragment_id,
+                "first_pts_s": info.first_pts_s,
+                "first_wall_s": info.first_wall_s,
+            }
+            for name, info in fragments.items()
+        ],
+    }
     if box_cfg.enabled:
-        # Augment the GMSL2 meta with box_collection info so downstream tools
-        # have everything in one file.
-        payload["box_collection"] = {
+        meta["box_collection"] = {
             "config": asdict(box_cfg),
             "snapshots": box_snapshots,
         }
-    meta_path.write_text(json.dumps(payload, indent=2))
+    meta_path = handle.directory / "meta.json"
+    meta_path.write_text(json.dumps(meta, indent=2))
     return meta_path
+
+
+def _stream_configs(usable: list[int], cfg: gr.RecorderConfig) -> list[ps.StreamConfig]:
+    """Translate RecorderConfig + sids -> per-stream PersistentCameraSession config."""
+    return [
+        ps.StreamConfig(
+            sid=sid,
+            name=f"{cfg.name_prefix}_{sid:02d}",
+            width=cfg.cameras.width,
+            height=cfg.cameras.height,
+            fps=cfg.cameras.fps,
+            codec=cfg.cameras.codec,
+            bitrate_kbps=cfg.cameras.bitrate_kbps,
+            iframe_interval=cfg.cameras.iframe_interval,
+            preset_level=cfg.cameras.preset_level,
+            control_rate=cfg.cameras.control_rate,
+            sensor_mode=cfg.cameras.sensor_mode,
+            exposure_us=cfg.cameras.exposure_us,
+            gain=cfg.cameras.gain,
+        )
+        for sid in usable
+    ]
 
 
 # ----------------------------------------------------------------- main ---
@@ -261,7 +390,13 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     cfg.dataset_root.mkdir(parents=True, exist_ok=True)
+    warmup_dir = cfg.dataset_root / "_warmup"
 
+    # Start BOX SDK BEFORE GStreamer pipelines: BOX SDK loads its own
+    # native .so + UDP listener; starting it while 11 nvarguscamerasrc
+    # pipelines and a GLib MainLoop are already running triggers
+    # SIGABRT on the first incoming UDP packet (see
+    # tools/data_collection_gui/docs/development_status.md).
     box = bc.BoxClient(box_cfg)
     box_started = box.start() if box_cfg.enabled else False
     if box_started:
@@ -277,6 +412,19 @@ def main(argv: list[str] | None = None) -> int:
     elif box_cfg.enabled:
         _emit("Box devices: (none)")
         logger.warning("box_collection enabled but BoxClient.start() returned False")
+
+    # Persistent GStreamer pipelines: spawn the N nvarguscamerasrc
+    # pipelines once here, then slice on demand inside the loop. This
+    # replaces the per-episode `gr.EpisodeSession(...)` model that paid
+    # ~stagger * N seconds of warmup before every StartEpisode.
+    pcs = ps.PersistentCameraSession(
+        _stream_configs(usable, cfg),
+        warmup_dir,
+        spawn_stagger_s=cfg.spawn_stagger_s,
+    )
+    _emit(f"Connecting: spawning {len(usable)} persistent pipelines...")
+    pcs.connect()
+    _emit(f"Connected {len(usable)} pipelines in {pcs.connect_duration_s:.1f}s")
 
     # Stdin reader thread -- gateway writes single lines per command.
     stop_event = threading.Event()
@@ -307,13 +455,15 @@ def main(argv: list[str] | None = None) -> int:
                 break
 
             ep_dir = cfg.dataset_root / "episodes" / f"episode_{ep_idx:06d}"
-            session = gr.EpisodeSession(usable, cfg)
             wall_start = datetime.now(timezone.utc).isoformat()
-            t0_wall = time.time()
-            t0_mono = time.monotonic()
-            streams = session.start(ep_dir)
-            t_start = time.time()
-            logger.info("episode %d started @ %s -> %s", ep_idx, wall_start, ep_dir)
+            t0_split_start_mono = time.monotonic()
+            handle = pcs.start_episode(ep_dir, ep_idx)
+            t_start = handle.t0_wall_s
+            split_emit_ms = (time.monotonic() - t0_split_start_mono) * 1000
+            logger.info(
+                "episode %d started @ %s -> %s (split-now emit %.1fms)",
+                ep_idx, wall_start, ep_dir, split_emit_ms,
+            )
             if box_started:
                 box.start_recording(t_start)
             box_snapshots: list[dict[str, Any]] = []
@@ -337,16 +487,21 @@ def main(argv: list[str] | None = None) -> int:
                             stop_episode = True
                             stop_event.set()
                         break
-                dead = [s for s in streams if s.proc and s.proc.poll() is not None]
-                if dead and cfg.stop_on_stream_exit:
+                # Persistent-pipeline equivalent of "stream exited early":
+                # GLib bus dispatches ERROR messages into pcs._errors via the
+                # signal-watch on its MainLoop thread. PR1 burn-in measured
+                # dispatch at ~0.14ms so this poll loop sees them within
+                # ~50ms of the actual error.
+                stream_errs = pcs.poll_errors()
+                if stream_errs and cfg.stop_on_stream_exit:
                     if box_started:
                         snap = box.read()
                         snap["t_relative_s"] = elapsed
                         box_snapshots.append(snap)
                     details = ", ".join(
-                        f"{s.name}(rc={s.proc.poll()}, log={s.log_file.name})" for s in dead
+                        f"{e.name}({(e.message or '')[:60]})" for e in stream_errs
                     )
-                    logger.warning("streams exited early: %s", details)
+                    logger.warning("streams reported errors: %s", details)
                     _emit(f"Stream exited early: {details}")
                     stop_reason = "stream_exit"
                     break
@@ -370,9 +525,9 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 recorded_samples = {}
 
-            session.stop(streams)
+            pcs.stop_episode(handle)
             cleanup_duration_s = max(0.0, time.monotonic() - capture_end_mono_s)
-            pts_offset = _extract_pts_offset(streams)
+            pts_offset = _pts_offset_from_handle(handle)
 
             decision = stop_reason
             if decision == "duration_reached":
@@ -387,23 +542,14 @@ def main(argv: list[str] | None = None) -> int:
                 decision = (decision_cmd.kind if decision_cmd else "save")
 
             if decision in ("save", "operator_save", "stream_exit"):
-                ep = gr.EpisodeResult(
-                    index=ep_idx,
-                    directory=ep_dir,
-                    wallclock_start_utc=wall_start,
-                    wallclock_end_utc=wall_end,
-                    duration_s=duration_s,
-                    streams=streams,
-                    t0_wall_s=t0_wall,
-                    t0_mono_s=t0_mono,
-                )
                 meta_path = _write_episode_meta(
-                    ep, cfg, locked, argus_failed, box_cfg, box_snapshots, decision,
+                    handle, cfg, locked, argus_failed, box_cfg, box_snapshots,
+                    decision, wall_start, wall_end,
                 )
                 try:
                     payload = json.loads(meta_path.read_text())
                     payload["cleanup_duration_s"] = cleanup_duration_s
-                    payload["capture_end_before_stream_stop"] = True
+                    payload["split_emit_ms"] = split_emit_ms
                     meta_path.write_text(json.dumps(payload, indent=2))
                 except (OSError, json.JSONDecodeError) as exc:
                     logger.warning("failed to annotate cleanup duration: %s", exc)
@@ -443,14 +589,25 @@ def main(argv: list[str] | None = None) -> int:
                 _emit(f"Total saved episodes: {saved}/{budget_str}")
                 ep_idx += 1
             else:
-                # Discard: nuke the episode directory we just produced so it
-                # doesn't show up in dataset scans.
+                # Discard: delete the per-camera .mkv fragments the
+                # splitmuxsink just closed, then drop the (now-empty)
+                # episode directory so it doesn't show up in dataset scans.
+                pcs.discard_episode(handle)
                 try:
-                    import shutil
-                    shutil.rmtree(ep_dir, ignore_errors=True)
-                except Exception as exc:
+                    if ep_dir.is_dir():
+                        # Remove ep_dir only if nothing else slipped in.
+                        leftovers = list(ep_dir.iterdir())
+                        if not leftovers:
+                            ep_dir.rmdir()
+                        else:
+                            import shutil
+                            shutil.rmtree(ep_dir, ignore_errors=True)
+                except OSError as exc:
                     logger.warning("failed to clean discarded episode dir: %s", exc)
                 _emit("Episode discarded")
+
+            # Keep the warmup directory bounded across long sessions.
+            pcs.cleanup_warmup_files(keep_last_n=3)
 
             if stop_episode or stop_event.is_set():
                 break
@@ -459,6 +616,10 @@ def main(argv: list[str] | None = None) -> int:
             _emit(f"Episode {ep_idx} ready")
     finally:
         stop_event.set()
+        try:
+            pcs.disconnect()
+        except Exception as exc:
+            logger.warning("pcs.disconnect on shutdown: %s", exc)
         try:
             box.stop()
         except Exception as exc:

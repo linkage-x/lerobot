@@ -201,6 +201,9 @@ tail -5 ~/lerobot/run/logs/gateway.log
 
 ```bash
 # 7.1 box_sdk 能起来
+# 注：BOX_SDK_URDF 现在由 BoxClient.start() 自动设置，无需 source setup_env.sh
+# 即可调通；但 LD_LIBRARY_PATH 仍需要包含 box_sdk/lib（setup_env.sh 顺手设了，
+# 也可手动 export）。
 . ~/lerobot/tools/thor/box_sdk/setup_env.sh
 python3 -c "
 from tools.thor.box_sdk import box_client
@@ -270,9 +273,12 @@ bash run/sync_to_thor.sh --dry-run  # 预览同步内容
 
 * **11 路同时启动 NvBufSurfaceFromFd Failed**：11 路 nvarguscamerasrc
   同时初始化时 Argus ISP 内部 NVMM buffer 分配竞争导致大部分管道在
-  几秒内自行 EOS 退出，产出空 MKV（336 字节头）。**修复**：YAML
-  `spawn_stagger_s: 0.0` → `1.0`，错开 1 秒启动后 11/11 路全部正常
-  录制。Connect 多花 ~10 秒是预期行为。
+  几秒内自行 EOS 退出，产出空 MKV（336 字节头）。**修复（2026-05-26）**：
+  YAML `spawn_stagger_s: 0.0` → `1.0`，错开 1 秒启动后 11/11 路全部正常
+  录制；Connect 多花 ~10 秒。**进一步修复（2026-05-28，PR2）**：切到
+  `PersistentCameraSession`，11 路 nvarguscamerasrc 在 Connect 时一次
+  spawn 完毕，后续 episode 切片靠 splitmuxsink `split-now`，每个
+  StartEpisode 不再付 ~11s 启动开销。
 * **Save 按钮不停止录制**：gateway 发 `"s\n"` 给 recorder stdin，但
   thor_record.py 只认 `"save"` / `"y"` / `"yes"`。`"s"` 被忽略。
   **修复**：改为发 `"save\n"`。
@@ -280,6 +286,20 @@ bash run/sync_to_thor.sh --dry-run  # 预览同步内容
   超时只抛异常不杀子进程，gst-launch 变成孤儿占住 Argus 资源，后续
   所有同 sensor-id 的 probe 也会超时。**修复**：改用 `Popen` +
   `proc.kill()` + `proc.wait()`。
+* **BOX SDK 首个 UDP 包后 SIGABRT**：BOX SDK C++ 端初始化 gripper
+  kinematics 时加载 URDF，未设 `$BOX_SDK_URDF` 时 fallback 到相对路径
+  `thirdpart/monte_gripper.urdf`，文件不存在 → `std::invalid_argument`
+  未捕获 → `std::terminate()` → SIGABRT。从命令行直接跑 thor_record
+  / pytest 而忘 `source setup_env.sh` 时必触发。**修复（2026-05-28）**：
+  `BoxClient.start()` 进入时 `os.environ.setdefault("BOX_SDK_URDF",
+  Path(__file__).resolve().parent / cfg.urdf_relpath)`，跟 cwd 无关，
+  不再依赖外部 source。`LD_LIBRARY_PATH` 仍由调用方在 `dlopen` 前设好
+  （gateway 启动包装脚本 / `setup_env.sh` 一直在做）。
+* **operator stdin "Enter Enter" 第二个被吞**：`_drain_until` 在
+  duration_reached 之后 0.2s 内会把队列里非 save/discard/quit 命令一并
+  pop 当 noise，导致 GUI 连发 `\n\n` 想 "save + start next" 时第二个
+  `\n` 丢掉。**修复（2026-05-28）**：drain 看到队首不是接受的 kind
+  时立即 return None，不消费队列。
 
 ### 仍存在
 
@@ -313,29 +333,43 @@ trigger / 6D force / touch）通过 UDP/15000 发送，MCU 内部时钟独立于
 
 ### 已实现：sync_reference 元数据
 
-每个 episode 的 `meta.json` 包含 `sync_reference` 块：
+每个 episode 的 `meta.json` 包含 `sync_reference` 块。PR2（持久 pipeline）后
+字段从 `camera_spawn_*` 改成 `camera_first_*`，含义不同（见下）：
 
 ```json
 {
   "sync_reference": {
     "t0_wall_s": 1716700000.123,
     "t0_mono_s": 12345.678,
-    "camera_spawn_wall_s": { "cam_02": 1716700000.123, "cam_07": 1716700001.124 },
-    "camera_spawn_offset_s": { "cam_02": 0.000, "cam_07": 1.001 }
+    "split_now_wall_s": 1716700000.125,
+    "camera_first_wall_s": { "cam_02": 1716700000.430, "cam_07": 1716700000.850 },
+    "camera_first_pts_s":  { "cam_02": 1.234, "cam_07": 2.456 }
   }
 }
 ```
 
-- `t0_wall_s`：`time.time()` at episode start，公共纪元锚点
-- `camera_spawn_offset_s`：各相机 gst-launch 启动相对 t0 的偏移（因 stagger 不同）
-- BOX snapshot 携带 `t_relative_s = time.time() - t0`，直接对齐到同一时间轴
+- `t0_wall_s` / `t0_mono_s`：`time.time()` / `time.monotonic()` at
+  StartEpisode 触发时刻
+- `split_now_wall_s`：`splitmuxsink.emit("split-now")` 真正发出的 wall time
+- `camera_first_wall_s[cam]`：该相机首个 EPISODE fragment 在 host wall-clock
+  上真正开新文件的时刻（FragmentInfo capture），**跨相机可比**，与
+  `split_now_wall_s` 之差即每路切换延迟（典型 100–500 ms，取决于
+  `iframe_interval` 和最近一帧 PWM 时刻）
+- `camera_first_pts_s[cam]`：该 fragment 首个 buffer 的管道 PTS（per-stream
+  时钟，**跨相机不可比**，PR1 burn-in 实测偏差 10s 量级）
+
+旧字段 `camera_spawn_wall_s` / `camera_spawn_offset_s` 在持久 pipeline 模式
+下已无意义（11 路只在 Connect 时 spawn 一次，每个 episode 不再 spawn）。
 
 ### 后处理对齐公式
 
 ```
-相机帧 N 的时间 = t0_wall_s + camera_spawn_offset_s[cam_id] + N / fps
+相机帧 N 的时间 = camera_first_wall_s[cam_id] + N / fps
 BOX snapshot 时间 = t0_wall_s + t_relative_s
 ```
+
+跨相机对齐用 `camera_first_wall_s` 做锚点，PR1 burn-in 实测跨相机
+精度 19.5 ms（被 `iframe_interval` 主导，调小可改善）。
 
 ### 已实现：高频独立采样 + 逐传感器软同步（L3）
 
