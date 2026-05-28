@@ -46,9 +46,12 @@ sensors:
       fps: 60                  # must match the AR0234 dtbo (60 only)
       # AR0234 sensor controls applied via v4l2-ctl before recording.
       # Defaults match the user's verified-good state on this rig; set to 0
-      # to leave nvargus's auto-exposure / auto-gain in charge.
+      # to leave the kernel driver's defaults in place. Do not reuse this
+      # driver-unit gain as nvarguscamerasrc gainrange. Argus gain is a
+      # separate 0..4 float scale and is disabled by default here.
       exposure_us: 9999
       gain: 320
+      argus_gain: 0.0
       replay_warmup_s: 1.0  # preview skips the first second while Argus ISP/AWB color settles; raw MKV frames are kept
       # Hardware encoder configuration -- consumed by nvv4l2h265enc.
       codec: h265

@@ -313,6 +313,7 @@ def _stream_configs(usable: list[int], cfg: gr.RecorderConfig) -> list[ps.Stream
             sensor_mode=cfg.cameras.sensor_mode,
             exposure_us=cfg.cameras.exposure_us,
             gain=cfg.cameras.gain,
+            argus_gain=cfg.cameras.argus_gain,
         )
         for sid in usable
     ]

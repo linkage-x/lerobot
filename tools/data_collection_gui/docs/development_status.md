@@ -312,6 +312,7 @@ sleep 30 && tail -80 /tmp/log
 4. **warmup 目录定期清理 keep_last_n=3**：splitmuxsink async-finalize 不会自动 rotate，长 session 必须主动清。
 5. **错误恢复用 poll_errors，pipeline 重启留 PR3**：PR1 burn-in 验证 bus dispatch 0.14ms，PR2 只做检测+中止 episode，pipeline 自动重启（已加 `restart_stream` 方法但未调用）留下个 PR。
 6. **保留 `gmsl2_record.EpisodeSession` 不动**：`gmsl2_record.py` 的 CLI 入口仍然能跑（独立 gst-launch 子进程），PR2 只切了 `thor_record.py` 这条 gateway 入口。
+7. **V4L2 gain 与 Argus gainrange 必须拆开**：AR0234 已验证的 `gain: 320` 是驱动单位，只能用于 `v4l2-ctl`；`nvarguscamerasrc gainrange` 使用 0..4 float scale。2026-05-28 的 `Error 0x00000005` / `Bad gain range: [320.00, 4.00]` 指向该混用问题，因此 recorder 新增 `argus_gain`，默认 0.0，不再把 `gain` 传给 Argus。
 
 ---
 

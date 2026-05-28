@@ -56,7 +56,10 @@ class CameraDefaults:
     height: int = 1080
     fps: int = 60
     exposure_us: int = 0
+    # Driver-unit V4L2 gain. Keep separate from Argus gainrange, which uses
+    # a 0..4 float scale and rejects values such as the AR0234 driver gain 320.
     gain: int = 0
+    argus_gain: float = 0.0
     replay_warmup_s: float = 0.0
     codec: str = "h265"
     bitrate_kbps: int = 20000
@@ -277,8 +280,12 @@ def build_pipeline(sid: int, out_path: Path, c: CameraDefaults) -> list[str]:
     ]
     if c.exposure_us > 0:
         cmd += [f"exposuretimerange={c.exposure_us * 1000} {c.exposure_us * 1000}"]
-    if c.gain > 0:
-        cmd += [f"gainrange={c.gain} {c.gain}"]
+    if c.argus_gain > 0:
+        if c.argus_gain > 4.0:
+            raise ValueError(
+                f"argus_gain must be <= 4.0 for nvarguscamerasrc, got {c.argus_gain}"
+            )
+        cmd += [f"gainrange={c.argus_gain:g} {c.argus_gain:g}"]
     cmd += ["!", caps, "!"]
     cmd += _enc_element(c)
     cmd += ["!", _parser_element(c)]

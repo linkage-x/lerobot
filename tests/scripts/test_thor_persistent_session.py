@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from tools.thor.gmsl2 import gmsl2_record as gr
 from tools.thor.gmsl2 import persistent_session as ps
 
 
@@ -43,15 +44,45 @@ def test_pipeline_desc_real_hardware_h265():
     assert iframe in desc and idr in desc
 
 
-def test_pipeline_desc_real_hardware_h264_with_exposure_and_gain():
+def test_pipeline_desc_real_hardware_h264_with_exposure_and_argus_gain():
     cfg = ps.StreamConfig(
-        sid=2, name="cam_02", codec="h264", exposure_us=8000, gain=4,
+        sid=2, name="cam_02", codec="h264", exposure_us=8000, argus_gain=4,
     )
     desc = ps.build_pipeline_desc(cfg, "/tmp/w.mkv")
     assert "nvv4l2h264enc" in desc
     assert "h264parse" in desc
     assert "exposuretimerange=\"8000000 8000000\"" in desc
     assert "gainrange=\"4 4\"" in desc
+
+
+def test_pipeline_desc_driver_gain_does_not_become_argus_gainrange():
+    cfg = ps.StreamConfig(sid=2, name="cam_02", exposure_us=9999, gain=320)
+    desc = ps.build_pipeline_desc(cfg, "/tmp/w.mkv")
+    assert "exposuretimerange=\"9999000 9999000\"" in desc
+    assert "gainrange" not in desc
+
+
+def test_pipeline_desc_rejects_invalid_argus_gain():
+    cfg = ps.StreamConfig(sid=2, name="cam_02", argus_gain=320)
+    try:
+        ps.build_pipeline_desc(cfg, "/tmp/w.mkv")
+    except ValueError as exc:
+        assert "argus_gain must be <= 4.0" in str(exc)
+    else:
+        raise AssertionError("expected invalid argus_gain to raise ValueError")
+
+
+def test_gmsl2_record_pipeline_driver_gain_does_not_become_argus_gainrange(tmp_path):
+    defaults = gr.CameraDefaults(exposure_us=9999, gain=320)
+    cmd = gr.build_pipeline(2, tmp_path / "cam_02.mkv", defaults)
+    assert "exposuretimerange=9999000 9999000" in cmd
+    assert not any(part.startswith("gainrange=") for part in cmd)
+
+
+def test_gmsl2_record_pipeline_uses_explicit_argus_gain(tmp_path):
+    defaults = gr.CameraDefaults(argus_gain=4.0)
+    cmd = gr.build_pipeline(2, tmp_path / "cam_02.mkv", defaults)
+    assert "gainrange=4 4" in cmd
 
 
 def test_pipeline_desc_test_source_uses_software_encoder():

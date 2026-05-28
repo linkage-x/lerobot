@@ -135,7 +135,10 @@ class StreamConfig:
     control_rate: int = 1
     sensor_mode: int = 0
     exposure_us: int = 0
+    # Driver-unit V4L2 gain. This is intentionally not forwarded to
+    # nvarguscamerasrc; Argus gainrange uses a different 0..4 float scale.
     gain: int = 0
+    argus_gain: float = 0.0
     use_test_source: bool = False  # dev-host fallback (videotestsrc + x264enc)
 
 
@@ -214,8 +217,12 @@ def build_pipeline_desc(stream: StreamConfig, warmup_location: str) -> str:
                 f"{stream.exposure_us * 1000}\" "
             )
         gain_clause = ""
-        if stream.gain > 0:
-            gain_clause = f"gainrange=\"{stream.gain} {stream.gain}\" "
+        if stream.argus_gain > 0:
+            if stream.argus_gain > 4.0:
+                raise ValueError(
+                    f"argus_gain must be <= 4.0 for nvarguscamerasrc, got {stream.argus_gain}"
+                )
+            gain_clause = f"gainrange=\"{stream.argus_gain:g} {stream.argus_gain:g}\" "
 
         source = (
             f"nvarguscamerasrc sensor-id={stream.sid} "
