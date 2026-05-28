@@ -426,6 +426,20 @@ def main(argv: list[str] | None = None) -> int:
     pcs.connect()
     _emit(f"Connected {len(usable)} pipelines in {pcs.connect_duration_s:.1f}s")
 
+    lr3_writer: lr3.Lr3Writer | None = None
+    if box_cfg.enabled:
+        try:
+            lr3_writer = lr3.open_box_lerobot_v3_writer(
+                cfg.dataset_root,
+                repo_id=cfg.repo_id,
+                task=cfg.single_task,
+                fps=cfg.fps,
+            )
+            if lr3_writer is None:
+                logger.warning("BOX LeRobot v3 writer disabled; pyarrow is unavailable")
+        except Exception as exc:
+            logger.warning("failed to open BOX LeRobot v3 writer: %s", exc)
+
     # Stdin reader thread -- gateway writes single lines per command.
     stop_event = threading.Event()
     cmd_queue: list[StdinCommand] = []
@@ -563,22 +577,19 @@ def main(argv: list[str] | None = None) -> int:
                     for sid, slist in recorded_samples.items()
                 } if recorded_samples else None
                 try:
-                    v3_path = lr3.write_box_lerobot_v3_episode(
-                        cfg.dataset_root,
-                        repo_id=cfg.repo_id,
-                        task=cfg.single_task,
-                        fps=cfg.fps,
-                        episode_index=ep_idx,
-                        snapshots=box_snapshots,
-                        duration_s=duration_s,
-                        sensor_samples=sensor_data,
-                        t0_wall_s=t_start,
-                        pts_offset_s=pts_offset,
-                    )
-                    if v3_path is not None:
-                        logger.info("wrote BOX LeRobot v3 rows: %s", v3_path)
-                    elif box_snapshots:
-                        logger.warning("BOX LeRobot v3 rows skipped; pyarrow is unavailable")
+                    if lr3_writer is not None:
+                        v3_path = lr3_writer.append_episode(
+                            episode_index=ep_idx,
+                            snapshots=box_snapshots,
+                            duration_s=duration_s,
+                            sensor_samples=sensor_data,
+                            t0_wall_s=t_start,
+                            pts_offset_s=pts_offset,
+                        )
+                        if v3_path is not None:
+                            logger.info("wrote BOX LeRobot v3 rows: %s", v3_path)
+                    elif box_snapshots or sensor_data:
+                        logger.warning("BOX LeRobot v3 rows skipped; writer is unavailable")
                 except Exception as exc:
                     logger.warning("failed to write BOX LeRobot v3 rows: %s", exc)
                 saved += 1
@@ -616,6 +627,11 @@ def main(argv: list[str] | None = None) -> int:
             _emit(f"Episode {ep_idx} ready")
     finally:
         stop_event.set()
+        if lr3_writer is not None:
+            try:
+                lr3_writer.finalize()
+            except Exception as exc:
+                logger.warning("failed to finalize BOX LeRobot v3 writer: %s", exc)
         try:
             pcs.disconnect()
         except Exception as exc:

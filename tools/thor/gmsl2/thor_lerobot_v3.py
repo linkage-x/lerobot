@@ -487,17 +487,311 @@ def _rows_to_table(pa, rows: list[dict[str, Any]]):
         return pa.FixedSizeListArray.from_arrays(pa.array(flat, type=pa.float32()), state_width)
 
     return pa.table(
-        {
-            "observation.state": vector_column("observation.state"),
-            "action": vector_column("action"),
-            "timestamp": pa.array([row["timestamp"] for row in rows], type=pa.float32()),
-            "frame_index": pa.array([row["frame_index"] for row in rows], type=pa.int64()),
-            "episode_index": pa.array([row["episode_index"] for row in rows], type=pa.int64()),
-            "index": pa.array([row["index"] for row in rows], type=pa.int64()),
-            "task_index": pa.array([row["task_index"] for row in rows], type=pa.int64()),
-        }
+        [
+            vector_column("observation.state"),
+            vector_column("action"),
+            pa.array([row["timestamp"] for row in rows], type=pa.float32()),
+            pa.array([row["frame_index"] for row in rows], type=pa.int64()),
+            pa.array([row["episode_index"] for row in rows], type=pa.int64()),
+            pa.array([row["index"] for row in rows], type=pa.int64()),
+            pa.array([row["task_index"] for row in rows], type=pa.int64()),
+        ],
+        schema=_box_table_schema(pa),
     )
 
+
+def _box_table_schema(pa):
+    state_width = len(BOX_STATE_NAMES)
+    return pa.schema([
+        ("observation.state", pa.list_(pa.float32(), state_width)),
+        ("action", pa.list_(pa.float32(), state_width)),
+        ("timestamp", pa.float32()),
+        ("frame_index", pa.int64()),
+        ("episode_index", pa.int64()),
+        ("index", pa.int64()),
+        ("task_index", pa.int64()),
+    ])
+
+
+def _box_features() -> dict[str, Any]:
+    return {
+        "observation.state": _feature("float32", [len(BOX_STATE_NAMES)], list(BOX_STATE_NAMES)),
+        "action": _feature("float32", [len(BOX_STATE_NAMES)], list(BOX_STATE_NAMES)),
+        "timestamp": _feature("float32", [1]),
+        "frame_index": _feature("int64", [1]),
+        "episode_index": _feature("int64", [1]),
+        "index": _feature("int64", [1]),
+        "task_index": _feature("int64", [1]),
+    }
+
+
+def _build_episode_rows(
+    *,
+    fps: int,
+    episode_index: int,
+    snapshots: list[dict[str, Any]],
+    duration_s: float | None = None,
+    sensor_samples: dict[str, list[dict[str, Any]]] | None = None,
+    t0_wall_s: float = 0.0,
+    pts_offset_s: float | None = None,
+    start_index: int = 0,
+) -> list[dict[str, Any]]:
+    use_hf = bool(sensor_samples and any(sensor_samples.values()))
+    if not snapshots and not use_hf:
+        return []
+
+    frame_count = len(snapshots) if snapshots else 0
+    if duration_s is not None and duration_s > 0:
+        frame_count = max(frame_count, int(round(float(duration_s) * max(int(fps), 1))))
+
+    rows: list[dict[str, Any]] = []
+    if use_hf:
+        calibrated = calibrate_sensor_samples(sensor_samples, t0_wall_s) if t0_wall_s else sensor_samples
+        frame_origin_s = pts_offset_s if pts_offset_s is not None else 0.0
+
+        per_sensor: dict[str, tuple[list[float], list[dict[str, Any]]]] = {}
+        for sid, slist_raw in calibrated.items():
+            slist = sorted(slist_raw, key=lambda s: s["t_rel_s"])
+            per_sensor[sid] = ([s["t_rel_s"] for s in slist], slist)
+        for local_frame in range(frame_count):
+            timestamp_s = frame_origin_s + local_frame / max(int(fps), 1)
+            sensors: dict[str, Any] = {}
+            for sid, (times, slist) in per_sensor.items():
+                data = _nearest_sample_data(times, slist, timestamp_s)
+                if data:
+                    sensors[sid] = data
+            state = box_snapshot_to_state({"valid": bool(sensors), "sensors": sensors})
+            rows.append({
+                "observation.state": state,
+                "action": list(state),
+                "timestamp": timestamp_s,
+                "frame_index": local_frame,
+                "episode_index": episode_index,
+                "index": start_index + local_frame,
+                "task_index": 0,
+            })
+    else:
+        ordered_snapshots = sorted(
+            snapshots,
+            key=lambda snap: _finite_float(snap.get("t_relative_s")),
+        )
+
+        def snapshot_for_timestamp(timestamp_s: float) -> dict[str, Any]:
+            selected = ordered_snapshots[0]
+            for candidate in ordered_snapshots:
+                if _finite_float(candidate.get("t_relative_s")) <= timestamp_s + 1e-9:
+                    selected = candidate
+                else:
+                    break
+            return selected
+
+        for local_frame in range(frame_count):
+            timestamp_s = local_frame / max(int(fps), 1)
+            snapshot = snapshot_for_timestamp(timestamp_s)
+            state = box_snapshot_to_state(snapshot)
+            rows.append({
+                "observation.state": state,
+                "action": list(state),
+                "timestamp": timestamp_s,
+                "frame_index": local_frame,
+                "episode_index": episode_index,
+                "index": start_index + local_frame,
+                "task_index": 0,
+            })
+
+    return rows
+
+
+class Lr3Writer:
+    """Stateful BOX LeRobot v3 writer backed by one long-lived ParquetWriter."""
+
+    def __init__(
+        self,
+        dataset_root: Path,
+        *,
+        repo_id: str,
+        task: str,
+        fps: int,
+    ) -> None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        self.dataset_root = dataset_root
+        self.repo_id = repo_id
+        self.task = task
+        self.fps = int(fps)
+        self.pa = pa
+        self.pq = pq
+        self.data_dir = dataset_root / "data" / "chunk-000"
+        self.meta_dir = dataset_root / "meta"
+        self.episodes_dir = self.meta_dir / "episodes" / "chunk-000"
+        self.data_path = self.data_dir / "file-000.parquet"
+        self.episodes_path = self.episodes_dir / "file-000.parquet"
+        self.total_frames = 0
+        self._episode_rows: list[dict[str, Any]] = []
+        self._episode_indices: set[int] = set()
+        self._closed = False
+        self._finalized = False
+
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.episodes_dir.mkdir(parents=True, exist_ok=True)
+        if self.data_path.exists():
+            raise FileExistsError(
+                f"{self.data_path} already exists; Lr3Writer cannot append to an existing parquet file"
+            )
+        self._schema = _box_table_schema(pa)
+        self._writer = pq.ParquetWriter(
+            self.data_path,
+            schema=self._schema,
+            compression="snappy",
+            use_dictionary=True,
+        )
+        self._write_tasks()
+        self._write_episodes()
+        self._write_info()
+
+    def append_episode(
+        self,
+        *,
+        episode_index: int,
+        snapshots: list[dict[str, Any]],
+        duration_s: float | None = None,
+        sensor_samples: dict[str, list[dict[str, Any]]] | None = None,
+        t0_wall_s: float = 0.0,
+        pts_offset_s: float | None = None,
+    ) -> Path | None:
+        if self._closed:
+            raise RuntimeError("cannot append to a closed Lr3Writer")
+        if int(episode_index) in self._episode_indices:
+            raise ValueError(f"episode_index {episode_index} was already appended")
+
+        rows = _build_episode_rows(
+            fps=self.fps,
+            episode_index=episode_index,
+            snapshots=snapshots,
+            duration_s=duration_s,
+            sensor_samples=sensor_samples,
+            t0_wall_s=t0_wall_s,
+            pts_offset_s=pts_offset_s,
+            start_index=self.total_frames,
+        )
+        if not rows:
+            return None
+
+        table = _rows_to_table(self.pa, rows)
+        self._writer.write_table(table)
+        n_rows = table.num_rows
+        start = self.total_frames
+        stop = start + n_rows
+        self.total_frames = stop
+        self._episode_indices.add(int(episode_index))
+        self._episode_rows.append({
+            "episode_index": int(episode_index),
+            "tasks": [self.task],
+            "length": int(n_rows),
+            "data/chunk_index": 0,
+            "data/file_index": 0,
+            "dataset_from_index": int(start),
+            "dataset_to_index": int(stop),
+            "meta/episodes/chunk_index": 0,
+            "meta/episodes/file_index": 0,
+        })
+        self._write_episodes()
+        self._write_info()
+        return self.data_path
+
+    def finalize(self) -> None:
+        if self._finalized:
+            return
+        self.close()
+        table = self.pq.read_table(self.data_path)
+        self._write_stats(table)
+        self._write_episodes()
+        self._write_info()
+        self._write_tasks()
+        self._finalized = True
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._writer.close()
+        self._closed = True
+
+    def _write_stats(self, table) -> None:
+        state_width = len(BOX_STATE_NAMES)
+        stats = {
+            "observation.state": _table_column_stats(table, "observation.state", width=state_width),
+            "action": _table_column_stats(table, "action", width=state_width),
+            "timestamp": _table_column_stats(table, "timestamp", width=1),
+            "frame_index": _table_column_stats(table, "frame_index", width=1),
+            "episode_index": _table_column_stats(table, "episode_index", width=1),
+            "index": _table_column_stats(table, "index", width=1),
+            "task_index": _table_column_stats(table, "task_index", width=1),
+        }
+        (self.meta_dir / "stats.json").write_text(json.dumps(stats, indent=4), encoding="utf-8")
+
+    def _write_episodes(self) -> None:
+        rows = sorted(self._episode_rows, key=lambda row: int(row["episode_index"]))
+        if rows:
+            table = self.pa.Table.from_pylist(rows)
+        else:
+            table = self.pa.table({
+                "episode_index": self.pa.array([], type=self.pa.int64()),
+                "tasks": self.pa.array([], type=self.pa.list_(self.pa.string())),
+                "length": self.pa.array([], type=self.pa.int64()),
+                "data/chunk_index": self.pa.array([], type=self.pa.int64()),
+                "data/file_index": self.pa.array([], type=self.pa.int64()),
+                "dataset_from_index": self.pa.array([], type=self.pa.int64()),
+                "dataset_to_index": self.pa.array([], type=self.pa.int64()),
+                "meta/episodes/chunk_index": self.pa.array([], type=self.pa.int64()),
+                "meta/episodes/file_index": self.pa.array([], type=self.pa.int64()),
+            })
+        self.pq.write_table(table, self.episodes_path)
+
+    def _write_info(self) -> None:
+        n_eps = len(self._episode_rows)
+        info = {
+            "codebase_version": "v3.0",
+            "robot_type": "thor_gmsl2_box",
+            "repo_id": self.repo_id,
+            "total_episodes": int(n_eps),
+            "total_frames": int(self.total_frames),
+            "total_tasks": 1,
+            "chunks_size": 1000,
+            "data_files_size_in_mb": 100,
+            "video_files_size_in_mb": 200,
+            "fps": int(self.fps),
+            "splits": {"train": f"0:{n_eps}"},
+            "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+            "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+            "features": _box_features(),
+        }
+        (self.meta_dir / "info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
+
+    def _write_tasks(self) -> None:
+        self.pq.write_table(
+            self.pa.Table.from_pylist([{"task_index": 0, "task": self.task}]),
+            self.meta_dir / "tasks.parquet",
+        )
+
+    def __enter__(self) -> "Lr3Writer":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self.finalize()
+
+
+def open_box_lerobot_v3_writer(
+    dataset_root: Path,
+    *,
+    repo_id: str,
+    task: str,
+    fps: int,
+) -> Lr3Writer | None:
+    try:
+        return Lr3Writer(dataset_root, repo_id=repo_id, task=task, fps=fps)
+    except ImportError:
+        return None
 
 def write_box_lerobot_v3_episode(
     dataset_root: Path,
