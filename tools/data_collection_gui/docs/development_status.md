@@ -104,7 +104,7 @@
 
 **注意**：测试用的 yaml 默认 `iframe_interval=60` → 首 episode 切片延迟 305-725ms。生产建议改为 30（PR1 burn-in 用的就是 30）。
 
-### 100-ep burn-in RSS 增长（已定位 + 部分修复）
+### 100-ep burn-in RSS 增长（已定位 + 两阶段修复）
 
 PR1 mock 单测时 RSS 是 ~23 KB/ep（无泄漏）。真实硬件 100 ep burn-in 上 PR2 commit
 时观测到 **~2.8 MB/ep**（100×）。最初列了 4 个猜测（nvargus / glib bus / box
@@ -134,7 +134,7 @@ SDK / BoxClient `_record_samples`），**全部错了**。
 每 ep peak Python heap ≈ N × per_ep_rows × ~10 副本。glibc malloc arena
 跟着峰值需求扩张后**不归还 OS**，所以 RSS 永久跟着最大需求增长。
 
-#### 修复（已合）
+#### 第一阶段修复（已合）
 
 用 Arrow Table-native 路径替换 to_pylist + sorted + dict comprehension：
 - `pa.concat_tables` + `Table.sort_by` 在 Arrow columnar buffer 上做，不再
@@ -157,19 +157,32 @@ SDK / BoxClient `_record_samples`），**全部错了**。
 - 修复后：488 MB (ep 4) → 764 MB (ep 99) = **+276 MB / 2.9 MB/ep（改善 36%）**
 - 模式：plateau-跳级（典型 glibc arena 扩张），不再是平滑线性
 
-#### 残留（follow-up）
+#### 第二阶段修复（已合）
 
-剩 ~2.9 MB/ep 是 `sort_by` + `read existing` 的 fundamental O(N) working
-memory：每 ep peak heap = O(N)，glibc arena 跟着 max-N 扩张。要根治需要
-重构 dataset spec：
-- **方案 1**：每 ep 独立 `file-{ep:06d}.parquet`，info.json 列多个 files。
-  下游 loader 需要适配多文件 chunk-000 目录。
-- **方案 2**：用 `pyarrow.parquet.ParquetWriter` 跨 thor_record 进程持有
-  writer 句柄，跨 ep 直接 append row group。需要重构 lr3 API 改成"open /
-  append / close"模型而不是当前的"write episode"模型。
+剩余 ~2.9 MB/ep 的根因是第一阶段仍然每 ep 执行 `pq.read_table(data_path)`、
+`pa.concat_tables(...)`、`Table.sort_by(...)`、再 `pq.write_table(...)`：虽然已经
+避免 Python dict 级别的 O(N²) 副本，但每次保存仍有 O(N) Arrow working memory。
+glibc arena 会跟着最大 episode 数时的峰值扩张，所以 RSS 仍呈 plateau-jump 增长。
 
-当前 11 路实际工况 100 ep RSS < 800 MB，Thor 32GB 内存富裕。建议留到独立
-PR 处理。
+落地方案选 **长生命周期 `pyarrow.parquet.ParquetWriter`**，而不是每 ep 独立
+parquet 文件：
+- 保持 LeRobot v3 现有单 `data/chunk-000/file-000.parquet` layout，不需要改
+  downstream loader。
+- 新增 `tools/thor/gmsl2/thor_lerobot_v3.py:Lr3Writer`，生命周期为
+  `open_box_lerobot_v3_writer(...)` / `append_episode(...)` / `finalize()`。
+- `append_episode(...)` 只把当前 episode rows 写成一个 row group，热路径不再读
+  existing parquet、不 concat、不 sort，peak heap 只跟当前 episode 行数相关。
+- `thor_record.py` 在 `pcs.connect()` 后打开 writer，在保存分支 append；discard
+  分支不调用 writer，因此不会写 partial episode。
+- `finally` 中先 `lr3_writer.finalize()`，再 `pcs.disconnect()` / `box.stop()`：
+  `finalize()` 关闭 parquet footer，并基于最终 parquet 写 `meta/stats.json`、
+  `meta/episodes/chunk-000/file-000.parquet`、`meta/info.json`。
+- 保留旧 `write_box_lerobot_v3_episode(...)` 兼容入口；真实 GUI recorder 走新的
+  stateful writer 路径。
+
+回归测试：`tests/scripts/test_thor_lerobot_v3_pts.py` 覆盖连续 append 两个 episode
+时 `pq.read_table` 在热路径中不被调用，只允许 `finalize()` 读最终 parquet 一次来
+计算 stats。
 
 ### 操作员 stdin "Enter Enter" 修复
 
