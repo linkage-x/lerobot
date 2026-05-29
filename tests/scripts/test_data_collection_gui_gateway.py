@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from tools.data_collection_gui import gateway
 
 
@@ -212,10 +214,132 @@ def test_replay_episode_selection_defaults_to_first_and_can_switch(tmp_path):
     assert [frame["frame"] for frame in selected_timeline["frames"]] == [0, 1]
 
 
-def test_traj_gen_is_explicitly_not_implemented(tmp_path):
+def test_replay_timeline_includes_generated_cube_pose_sidecars(tmp_path):
+    dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=2)
+    sidecar = dataset_root / "derived" / "hikon_cube_tracking_in_robot_base"
+    sidecar.mkdir(parents=True)
+    for cube, offset in (("left", 0.0), ("right", 0.1), ("head", 0.2)):
+        (sidecar / f"state_action.{cube}.csv").write_text(
+            "\n".join(
+                [
+                    "episode_index,frame_index,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw",
+                    f"1,0,{0.3 + offset},0.0,0.2,0.0,0.0,0.0,1.0",
+                    f"1,1,{0.31 + offset},0.0,0.21,0.0,0.0,0.0,1.0",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root.parent,
+    )
+
+    timeline = gateway._read_dataset_timeline(state, dataset_root, episode=1)
+
+    assert timeline["cubePoseNames"] == ["left", "right", "head"]
+    assert timeline["frames"][0]["cubePoses"]["left"]["x"] == 0.3
+    assert timeline["frames"][1]["cubePoses"]["right"]["x"] == pytest.approx(0.41)
+    assert timeline["frames"][0]["cubePoses"]["head"]["qw"] == 1.0
+
+
+def test_replay_timeline_includes_camera_cube_overlays(tmp_path):
+    dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    tracking_run = tmp_path / "outputs" / "tracking_analysis" / "episode_set_tracking_in_robot_base"
+    per_camera = tracking_run / "per_camera"
+    per_camera.mkdir(parents=True)
+    intrinsics = tmp_path / "calibration" / "intrinsics.json"
+    intrinsics.parent.mkdir(parents=True)
+    fixed_summary = tmp_path / "calibration" / "fixed_summary.json"
+    intrinsics.write_text(
+        json.dumps({"camera_matrix": [[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]]}),
+        encoding="utf-8",
+    )
+    fixed_summary.write_text(
+        json.dumps(
+            {
+                "joint_solution": {
+                    "status": "ok",
+                    "cameras": {
+                        "hk_01": {
+                            "base_to_camera": {
+                                "matrix_4x4": [
+                                    [1.0, 0.0, 0.0, 0.0],
+                                    [0.0, 1.0, 0.0, 0.0],
+                                    [0.0, 0.0, 1.0, 0.0],
+                                    [0.0, 0.0, 0.0, 1.0],
+                                ]
+                            }
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tracking_run / "summary.json").write_text(
+        json.dumps(
+            {
+                "dataset_root": str(dataset_root),
+                "calibration_inputs": {"fixed_camera_summary": str(fixed_summary)},
+                "cube_tracker": {"cube_size_cm": 7.0},
+                "active_streams": [
+                    {
+                        "stream_key": "cam_0",
+                        "camera_name": "hk_01",
+                        "serial": "S1",
+                        "intrinsics_path": str(intrinsics),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (per_camera / "camera_S1_records.csv").write_text(
+        "\n".join(
+            [
+                "frame_global_index,episode_index,frame_index,cube_name,camera_serial,camera_name,stream_key,cube_detected,cube_num_markers,cube_reprojection_rmse_px,used_for_fusion,cube_base_x_m,cube_base_y_m,cube_base_z_m,cube_base_qx,cube_base_qy,cube_base_qz,cube_base_qw",
+                "0,0,0,left,S1,hk_01,cam_0,1,2,1.25,1,0.0,0.0,1.0,0.0,0.0,0.0,1.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root.parent,
+    )
+
+    timeline = gateway._read_dataset_timeline(state, dataset_root, episode=0)
+    overlay = timeline["frames"][0]["videoOverlays"]["observation.images.cam_0"][0]
+
+    assert overlay["cubeName"] == "left"
+    assert overlay["numMarkers"] == 2
+    assert overlay["usedForFusion"] is True
+    assert overlay["corners"][0] is not None
+    assert overlay["axes"]["origin"] == pytest.approx([320.0, 240.0])
+
+
+def test_traj_gen_starts_hikon_tracking_with_selected_dataset_root(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
     _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    script_path = repo_root / gateway.DEFAULT_EE_TRAJECTORY_SCRIPT
+    config_path = repo_root / gateway.DEFAULT_EE_TRAJECTORY_CONFIG
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text("print('tracking')\n", encoding="utf-8")
+    config_path.write_text("input:\n  dataset_root: /wrong/from/yaml\n", encoding="utf-8")
     state = gateway.GatewayState(
         repo_root=repo_root,
         config_path=repo_root / "config.yaml",
@@ -225,13 +349,35 @@ def test_traj_gen_is_explicitly_not_implemented(tmp_path):
         datasets_root=dataset_root.parent,
     )
 
-    try:
-        gateway._queue_traj_gen(state, dataset_root)
-    except NotImplementedError as exc:
-        assert "待实现" in str(exc)
-        assert "Generate EE Trajectory" in str(exc)
-    else:
-        raise AssertionError("traj-gen should report that it is not implemented")
+    launched: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 1234
+        stdout = []
+
+        def poll(self):
+            return None
+
+    def fake_popen(command, **kwargs):
+        launched["command"] = command
+        launched["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(gateway, "_start_traj_gen_output_reader", lambda *_args: None)
+
+    gateway._queue_traj_gen(state, dataset_root)
+
+    command = launched["command"]
+    assert str(script_path) in command
+    assert "--config" in command
+    assert str(config_path) in command
+    assert "--dataset-root" in command
+    assert command[command.index("--dataset-root") + 1] == str(dataset_root)
+    assert str(dataset_root) in state.processing_processes
+    item = gateway._processing_item_from_dataset(dataset_root)
+    assert item["status"] == "running"
+    assert "Hikon cube tracking" in item["message"]
 
 
 def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_replay(tmp_path):

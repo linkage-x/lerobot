@@ -453,7 +453,7 @@ export class DataCollectionGuiApi {
       return remote;
     }
     await wait(140);
-    const message = "待实现：Generate EE Trajectory 功能尚未接入。";
+    const message = "Gateway unavailable: cannot start EE trajectory generation.";
     window.alert(message);
     this.snapshot.processing = this.snapshot.processing.map((item) =>
       item.path === path
@@ -674,7 +674,7 @@ export class DataCollectionGuiApi {
         message: `Export ${command} failed: ${message}`
       };
     } else if (endpoint.includes("/processing/traj-gen")) {
-      const fallbackMessage = "待实现：Generate EE Trajectory 功能尚未接入。";
+      const fallbackMessage = "Generate EE Trajectory failed.";
       const displayMessage = message || fallbackMessage;
       const targetPath = new URLSearchParams(endpoint.split("?")[1] ?? "").get("path");
       window.alert(displayMessage);

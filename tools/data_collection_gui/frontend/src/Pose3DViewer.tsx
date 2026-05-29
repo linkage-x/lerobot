@@ -5,6 +5,8 @@ import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import type { EePose } from "./types";
 
 type Vec3 = [number, number, number];
+type NamedTrajectory = { name: string; points: Vec3[]; color: number };
+type NamedPose = { name: string; pose: EePose | null; color: number };
 
 const PIKA_ASSET_BASE = "/api/assets/pika";
 
@@ -109,10 +111,14 @@ function makeGroundGrid(size: number, divisions: number): THREE.GridHelper {
 
 export function Pose3DViewer({
   trajectory,
-  currentPose
+  currentPose,
+  extraTrajectories = [],
+  currentExtraPoses = []
 }: {
   trajectory: Vec3[];
   currentPose: EePose | null;
+  extraTrajectories?: NamedTrajectory[];
+  currentExtraPoses?: NamedPose[];
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [meshStatus, setMeshStatus] = useState<"loading" | "ready" | "error">("loading");
@@ -127,25 +133,28 @@ export function Pose3DViewer({
     leftJaw: THREE.Mesh | null;
     rightJaw: THREE.Mesh | null;
     trajectoryLine: THREE.Line | null;
+    extraTrajectoryLines: THREE.Line[];
+    extraPoseMarkers: THREE.Mesh[];
     eeFrame: THREE.LineSegments;
     requestRender: () => void;
     dispose: () => void;
   } | null>(null);
 
   const targetCenter = useMemo<Vec3>(() => {
-    if (!trajectory.length) {
+    const allPoints = [trajectory, ...extraTrajectories.map((entry) => entry.points)].flat();
+    if (!allPoints.length) {
       return [0, 0, 0];
     }
     let sx = 0;
     let sy = 0;
     let sz = 0;
-    for (const [x, y, z] of trajectory) {
+    for (const [x, y, z] of allPoints) {
       sx += x;
       sy += y;
       sz += z;
     }
-    return [sx / trajectory.length, sy / trajectory.length, sz / trajectory.length];
-  }, [trajectory]);
+    return [sx / allPoints.length, sy / allPoints.length, sz / allPoints.length];
+  }, [trajectory, extraTrajectories]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -231,6 +240,8 @@ export function Pose3DViewer({
       leftJaw: null,
       rightJaw: null,
       trajectoryLine: null,
+      extraTrajectoryLines: [],
+      extraPoseMarkers: [],
       eeFrame,
       requestRender,
       dispose: () => {
@@ -341,9 +352,57 @@ export function Pose3DViewer({
       state.scene.add(line);
       state.trajectoryLine = line;
     }
+    for (const line of state.extraTrajectoryLines) {
+      state.scene.remove(line);
+      line.geometry.dispose();
+      (line.material as THREE.Material).dispose();
+    }
+    state.extraTrajectoryLines = [];
+    for (const entry of extraTrajectories) {
+      if (entry.points.length <= 1) {
+        continue;
+      }
+      const positions = new Float32Array(entry.points.length * 3);
+      for (let i = 0; i < entry.points.length; i++) {
+        positions[i * 3 + 0] = entry.points[i][0];
+        positions[i * 3 + 1] = entry.points[i][1];
+        positions[i * 3 + 2] = entry.points[i][2];
+      }
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      const material = new THREE.LineBasicMaterial({ color: entry.color, linewidth: 2 });
+      const line = new THREE.Line(geometry, material);
+      state.scene.add(line);
+      state.extraTrajectoryLines.push(line);
+    }
     state.controls.target.set(targetCenter[0], targetCenter[1], targetCenter[2]);
     state.requestRender();
-  }, [trajectory, targetCenter]);
+  }, [trajectory, extraTrajectories, targetCenter]);
+
+  useEffect(() => {
+    const state = sceneStateRef.current;
+    if (!state) {
+      return;
+    }
+    for (const marker of state.extraPoseMarkers) {
+      state.scene.remove(marker);
+      marker.geometry.dispose();
+      (marker.material as THREE.Material).dispose();
+    }
+    state.extraPoseMarkers = [];
+    for (const entry of currentExtraPoses) {
+      if (!entry.pose) {
+        continue;
+      }
+      const geometry = new THREE.SphereGeometry(0.012, 16, 12);
+      const material = new THREE.MeshStandardMaterial({ color: entry.color, roughness: 0.45 });
+      const marker = new THREE.Mesh(geometry, material);
+      marker.position.set(entry.pose.x, entry.pose.y, entry.pose.z);
+      state.scene.add(marker);
+      state.extraPoseMarkers.push(marker);
+    }
+    state.requestRender();
+  }, [currentExtraPoses]);
 
   return (
     <div className="pose-3d" ref={containerRef}>

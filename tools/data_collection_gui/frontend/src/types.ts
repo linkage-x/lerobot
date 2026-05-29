@@ -204,6 +204,25 @@ export type ReplayTimelineFrame = {
   state: number[];
   action: number[];
   eePose?: Partial<EePose>;
+  cubePoses?: Record<string, Partial<EePose>>;
+  videoOverlays?: Record<string, CubeVideoOverlay[]>;
+};
+
+export type CubeVideoOverlay = {
+  cubeName: string;
+  color: string;
+  corners: Array<[number, number] | null>;
+  axes: {
+    origin: [number, number] | null;
+    x: [number, number] | null;
+    y: [number, number] | null;
+    z: [number, number] | null;
+  };
+  label: [number, number] | null;
+  detected: number;
+  numMarkers: number;
+  rmsePx: number | null;
+  usedForFusion: boolean;
 };
 
 export type ReplayTimeline = {
@@ -214,6 +233,7 @@ export type ReplayTimeline = {
   fps: number;
   stateNames: string[];
   actionNames: string[];
+  cubePoseNames?: string[];
   cameraKeys: string[];
   videoTemplate: string;
   videoChunkIndex: number;

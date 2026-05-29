@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -27,6 +28,17 @@ DEFAULT_REPLAY_MAX_EE_STEP_MM = 120.0
 DEFAULT_REPLAY_MAX_GRIPPER_STEP = 0.35
 DEFAULT_REAL_PREFLIGHT_TIMEOUT_S = 30.0
 DEFAULT_REAL_ROBOT_IP = "192.168.1.208"
+DEFAULT_EE_TRAJECTORY_SCRIPT = Path("third_party/opencv_kalibr/hikon_cube_tracking_offline/hikon_cube_tracking_in_robot_base.py")
+DEFAULT_EE_TRAJECTORY_CONFIG = Path(
+    "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_hikon/hikon_cube_tracking_in_robot_base_umi.yaml"
+)
+DEFAULT_CUBE_TRAJECTORY_NAMES = ("left", "right", "head")
+DEFAULT_CUBE_SIZE_M = 0.07
+CUBE_OVERLAY_COLORS = {
+    "left": "#c2410c",
+    "right": "#0f766e",
+    "head": "#2563eb",
+}
 
 
 @dataclass
@@ -101,6 +113,7 @@ class GatewayState:
     process: subprocess.Popen[str] | None = None
     replay_process: subprocess.Popen[str] | None = None
     replay_process_kind: str = ""
+    processing_processes: dict[str, subprocess.Popen[str]] = field(default_factory=dict)
     process_started_at_s: float | None = None
     replay_started_at_s: float | None = None
     lock: Lock = field(default_factory=Lock)
@@ -736,7 +749,7 @@ def _action_has_ee_pose(info: dict[str, Any]) -> bool:
 
 
 def _load_processing_meta(dataset_root: Path) -> dict[str, Any] | None:
-    meta_path = dataset_root / "meta" / "processing.json"
+    meta_path = _processing_meta_path(dataset_root)
     if not meta_path.is_file():
         return None
     try:
@@ -745,6 +758,18 @@ def _load_processing_meta(dataset_root: Path) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _processing_meta_path(dataset_root: Path) -> Path:
+    return dataset_root / "meta" / "processing.json"
+
+
+def _write_processing_meta(dataset_root: Path, payload: dict[str, Any]) -> None:
+    meta_path = _processing_meta_path(dataset_root)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = meta_path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(meta_path)
 
 
 def _processing_item_from_dataset(dataset_root: Path) -> dict[str, Any]:
@@ -775,6 +800,9 @@ def _processing_item_from_dataset(dataset_root: Path) -> dict[str, Any]:
         if isinstance(current_job, dict) and current_job.get("status") in ("queued", "running"):
             status = current_job["status"]
             message = current_job.get("message") or f"{current_job.get('kind') or 'job'} {status}"
+        elif isinstance(current_job, dict) and current_job.get("status") in ("failed", "error"):
+            status = "error"
+            message = current_job.get("message") or f"{current_job.get('kind') or 'job'} failed"
         elif isinstance(qc, dict):
             qc_status = str(qc.get("status") or "").lower()
             if qc_status == "pass":
@@ -1072,6 +1100,7 @@ def _run_qc(dataset_root: Path) -> dict[str, Any]:
 
     state_names = _feature_names(info, "observation.state")
     action_names = _feature_names(info, "action")
+    cube_pose_names = _cube_names_for_timeline(dataset_root, info)
     camera_keys = _camera_keys(info)
     declared_total = int(info.get("total_frames") or 0)
 
@@ -1334,8 +1363,6 @@ def _first_named_index(names: list[str], suffixes: tuple[str, ...]) -> int | Non
 
 
 def _write_processing_meta_qc(dataset_root: Path, qc_result: dict[str, Any]) -> dict[str, Any]:
-    meta_path = dataset_root / "meta" / "processing.json"
-    meta_path.parent.mkdir(parents=True, exist_ok=True)
     existing = _load_processing_meta(dataset_root) or {}
     versions = existing.get("versions") if isinstance(existing.get("versions"), dict) else {}
     active_version = existing.get("active_version") if isinstance(existing.get("active_version"), str) else None
@@ -1362,14 +1389,190 @@ def _write_processing_meta_qc(dataset_root: Path, qc_result: dict[str, Any]) -> 
             ][-12:],
         },
     }
-    tmp_path = meta_path.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(updated, indent=2), encoding="utf-8")
-    tmp_path.replace(meta_path)
+    _write_processing_meta(dataset_root, updated)
     return updated
 
 
-def _queue_traj_gen(_state: GatewayState, dataset_root: Path) -> None:
-    raise NotImplementedError(f"待实现：Generate EE Trajectory 功能尚未接入，dataset={dataset_root}")
+def _next_processing_version(versions: dict[str, Any]) -> str:
+    index = 1
+    while f"v{index}" in versions:
+        index += 1
+    return f"v{index}"
+
+
+def _ee_trajectory_command(state: GatewayState, dataset_root: Path) -> list[str]:
+    script_path = state.repo_root / DEFAULT_EE_TRAJECTORY_SCRIPT
+    config_path = state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG
+    if not script_path.is_file():
+        raise FileNotFoundError(f"EE trajectory script not found: {script_path}")
+    if not config_path.is_file():
+        raise FileNotFoundError(f"EE trajectory config not found: {config_path}")
+    return [
+        str(_venv_python3(state.repo_root)),
+        str(script_path),
+        "--config",
+        str(config_path),
+        "--dataset-root",
+        str(dataset_root),
+    ]
+
+
+def _update_traj_gen_meta(
+    dataset_root: Path,
+    *,
+    job_id: str,
+    status: str,
+    command: list[str] | None = None,
+    message: str,
+    log_tail: list[str] | None = None,
+    version: str | None = None,
+    exit_code: int | None = None,
+) -> None:
+    existing = _load_processing_meta(dataset_root) or {}
+    current_job = existing.get("current_job") if isinstance(existing.get("current_job"), dict) else {}
+    inherited_tail = [str(line) for line in current_job.get("log_tail", [])] if isinstance(current_job, dict) else []
+    tail = inherited_tail if log_tail is None else [str(line) for line in log_tail]
+    job = {
+        "id": job_id,
+        "kind": "traj-gen",
+        "status": status,
+        "message": message,
+        "updated_at": _now_iso(),
+        "log_tail": tail[-24:],
+    }
+    if command is not None:
+        job["command"] = command
+    elif isinstance(current_job, dict) and isinstance(current_job.get("command"), list):
+        job["command"] = current_job["command"]
+    if exit_code is not None:
+        job["exit_code"] = exit_code
+    if status == "running" and not job.get("started_at"):
+        job["started_at"] = (current_job.get("started_at") if isinstance(current_job, dict) else None) or _now_iso()
+    if status in ("complete", "failed", "error"):
+        job["completed_at"] = _now_iso()
+
+    updated = {**existing, "current_job": job}
+    if version is not None:
+        versions = updated.get("versions") if isinstance(updated.get("versions"), dict) else {}
+        versions[version] = {
+            "created_at": _now_iso(),
+            "algorithm": "hikon_cube_tracking_in_robot_base",
+            "dataset_root": str(dataset_root),
+            "sidecar_dir": str(dataset_root / "derived" / "hikon_cube_tracking_in_robot_base"),
+            "command": job.get("command") or command or [],
+            "qc": versions.get(version, {}).get("qc") if isinstance(versions.get(version), dict) else None,
+        }
+        updated["active_version"] = version
+        updated["versions"] = versions
+    _write_processing_meta(dataset_root, updated)
+
+
+def _start_traj_gen_output_reader(state: GatewayState, dataset_root: Path, process: subprocess.Popen[str], job_id: str) -> None:
+    thread = Thread(
+        target=_read_traj_gen_output,
+        args=(state, dataset_root, process, job_id),
+        daemon=True,
+        name=f"ee-trajectory-output-{process.pid}",
+    )
+    thread.start()
+
+
+def _read_traj_gen_output(
+    state: GatewayState,
+    dataset_root: Path,
+    process: subprocess.Popen[str],
+    job_id: str,
+) -> None:
+    log_tail: list[str] = []
+    if process.stdout is not None:
+        for line in process.stdout:
+            output = line.strip()
+            if not output:
+                continue
+            log_tail = [*log_tail, output][-24:]
+            with state.lock:
+                if state.processing_processes.get(str(dataset_root)) is not process:
+                    return
+                _update_traj_gen_meta(
+                    dataset_root,
+                    job_id=job_id,
+                    status="running",
+                    message=output,
+                    log_tail=log_tail,
+                )
+    exit_code = process.wait()
+    with state.lock:
+        if state.processing_processes.get(str(dataset_root)) is process:
+            state.processing_processes.pop(str(dataset_root), None)
+        existing = _load_processing_meta(dataset_root) or {}
+        versions = existing.get("versions") if isinstance(existing.get("versions"), dict) else {}
+        if exit_code == 0:
+            version = _next_processing_version(versions)
+            message = "EE trajectory generated from Hikon cube tracking"
+            _update_traj_gen_meta(
+                dataset_root,
+                job_id=job_id,
+                status="complete",
+                message=message,
+                log_tail=[*log_tail, f"[traj-gen] complete exit_code={exit_code}"][-24:],
+                version=version,
+                exit_code=exit_code,
+            )
+            state.log("info", f"Generated EE trajectory for {dataset_root.name} as {version}")
+        else:
+            message = f"EE trajectory generation failed with exit code {exit_code}"
+            _update_traj_gen_meta(
+                dataset_root,
+                job_id=job_id,
+                status="failed",
+                message=message,
+                log_tail=[*log_tail, f"[traj-gen] failed exit_code={exit_code}"][-24:],
+                exit_code=exit_code,
+            )
+            state.log("warn", f"{message}: {dataset_root}")
+
+
+def _queue_traj_gen(state: GatewayState, dataset_root: Path) -> None:
+    key = str(dataset_root)
+    running = state.processing_processes.get(key)
+    if running is not None and running.poll() is None:
+        state.log("info", f"EE trajectory generation already running for {dataset_root.name}")
+        return
+    state.processing_processes.pop(key, None)
+
+    command = _ee_trajectory_command(state, dataset_root)
+    job_id = f"traj-gen-{int(time.time())}"
+    _update_traj_gen_meta(
+        dataset_root,
+        job_id=job_id,
+        status="running",
+        command=command,
+        message=f"Running Hikon cube tracking for {dataset_root.name}",
+        log_tail=[f"[traj-gen] {' '.join(command)}"],
+    )
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=state.repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=_tool_env(state.repo_root),
+            start_new_session=True,
+        )
+    except OSError as exc:
+        _update_traj_gen_meta(
+            dataset_root,
+            job_id=job_id,
+            status="failed",
+            command=command,
+            message=f"Failed to start EE trajectory generation: {exc}",
+            log_tail=[f"[traj-gen] failed to start: {exc}"],
+        )
+        raise
+    state.processing_processes[key] = process
+    state.log("info", f"Started EE trajectory generation pid={process.pid} dataset={dataset_root}")
+    _start_traj_gen_output_reader(state, dataset_root, process, job_id)
 
 
 def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
@@ -1610,6 +1813,395 @@ def _ee_pose_from_row(row: dict[str, Any], action_names: list[str], state_names:
     return {**pose, "gripper": gripper}
 
 
+def _cube_pose_from_parquet_row(row: dict[str, Any], info: dict[str, Any], cube_name: str) -> dict[str, Any] | None:
+    state_key = f"observation.state.{cube_name}"
+    action_key = f"action.{cube_name}"
+    state_values = _as_float_list(row.get(state_key))
+    action_values = _as_float_list(row.get(action_key))
+    state_names = _feature_names(info, state_key)
+    action_names = _feature_names(info, action_key)
+    pose = _extract_ee_axes(state_names, state_values) or _extract_ee_axes(action_names, action_values)
+    if pose is None:
+        return None
+    return pose
+
+
+def _csv_float(row: dict[str, Any], key: str) -> float | None:
+    raw_value = row.get(key)
+    if raw_value in (None, ""):
+        return None
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _pose_from_csv_row(row: dict[str, Any]) -> dict[str, float] | None:
+    candidates = (
+        ("cube_base_x_m", "cube_base_y_m", "cube_base_z_m", "cube_base_qx", "cube_base_qy", "cube_base_qz", "cube_base_qw"),
+        ("state_x_m", "state_y_m", "state_z_m", "state_qx", "state_qy", "state_qz", "state_qw"),
+        ("ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw"),
+        (
+            "ee_est_base_x_m",
+            "ee_est_base_y_m",
+            "ee_est_base_z_m",
+            "ee_est_base_qx",
+            "ee_est_base_qy",
+            "ee_est_base_qz",
+            "ee_est_base_qw",
+        ),
+    )
+    for x_key, y_key, z_key, qx_key, qy_key, qz_key, qw_key in candidates:
+        x = _csv_float(row, x_key)
+        y = _csv_float(row, y_key)
+        z = _csv_float(row, z_key)
+        if x is None or y is None or z is None:
+            continue
+        qx = _csv_float(row, qx_key)
+        qy = _csv_float(row, qy_key)
+        qz = _csv_float(row, qz_key)
+        qw = _csv_float(row, qw_key)
+        return {
+            "x": x,
+            "y": y,
+            "z": z,
+            "qx": qx if qx is not None else 0.0,
+            "qy": qy if qy is not None else 0.0,
+            "qz": qz if qz is not None else 0.0,
+            "qw": qw if qw is not None else 1.0,
+        }
+    return None
+
+
+def _sidecar_cube_pose_files(dataset_root: Path) -> dict[str, Path]:
+    sidecar_dir = dataset_root / "derived" / "hikon_cube_tracking_in_robot_base"
+    files: dict[str, Path] = {}
+    for cube_name in DEFAULT_CUBE_TRAJECTORY_NAMES:
+        candidate = sidecar_dir / f"state_action.{cube_name}.csv"
+        if candidate.is_file():
+            files[cube_name] = candidate
+    for candidate in sidecar_dir.glob("state_action.*.csv"):
+        name = candidate.name.removeprefix("state_action.").removesuffix(".csv")
+        if name:
+            files.setdefault(name, candidate)
+    return files
+
+
+def _read_sidecar_cube_poses(dataset_root: Path, episode: int) -> dict[str, dict[int, dict[str, float]]]:
+    cube_files = _sidecar_cube_pose_files(dataset_root)
+    cube_poses: dict[str, dict[int, dict[str, float]]] = {}
+    for cube_name, csv_path in cube_files.items():
+        poses_by_frame: dict[int, dict[str, float]] = {}
+        try:
+            with csv_path.open("r", encoding="utf-8", newline="") as csv_file:
+                reader = csv.DictReader(csv_file)
+                for row in reader:
+                    try:
+                        row_episode = int(float(row.get("episode_index", "0") or 0))
+                        frame_index = int(float(row.get("frame_index", "0") or 0))
+                    except ValueError:
+                        continue
+                    if row_episode != episode:
+                        continue
+                    pose = _pose_from_csv_row(row)
+                    if pose is not None:
+                        poses_by_frame[frame_index] = pose
+        except OSError:
+            continue
+        if poses_by_frame:
+            cube_poses[cube_name] = poses_by_frame
+    return cube_poses
+
+
+def _tracking_run_dir(state: GatewayState, dataset_root: Path) -> Path:
+    return state.repo_root / "outputs" / "tracking_analysis" / f"{dataset_root.name}_tracking_in_robot_base"
+
+
+def _mat4_inverse_rigid(matrix: list[list[float]]) -> list[list[float]]:
+    rotation = [[float(matrix[r][c]) for c in range(3)] for r in range(3)]
+    translation = [float(matrix[r][3]) for r in range(3)]
+    rotation_t = [[rotation[c][r] for c in range(3)] for r in range(3)]
+    inv_translation = [-sum(rotation_t[r][c] * translation[c] for c in range(3)) for r in range(3)]
+    return [
+        [rotation_t[0][0], rotation_t[0][1], rotation_t[0][2], inv_translation[0]],
+        [rotation_t[1][0], rotation_t[1][1], rotation_t[1][2], inv_translation[1]],
+        [rotation_t[2][0], rotation_t[2][1], rotation_t[2][2], inv_translation[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def _mat4_mul(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
+    return [[sum(float(a[r][k]) * float(b[k][c]) for k in range(4)) for c in range(4)] for r in range(4)]
+
+
+def _transform_point(matrix: list[list[float]], point: tuple[float, float, float]) -> tuple[float, float, float]:
+    x, y, z = point
+    return (
+        matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z + matrix[0][3],
+        matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z + matrix[1][3],
+        matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z + matrix[2][3],
+    )
+
+
+def _quat_to_rotation_matrix(qx: float, qy: float, qz: float, qw: float) -> list[list[float]] | None:
+    norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if norm <= 1e-12 or not math.isfinite(norm):
+        return None
+    x, y, z, w = qx / norm, qy / norm, qz / norm, qw / norm
+    return [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ]
+
+
+def _pose_matrix_from_csv_row(row: dict[str, Any], prefix: str) -> list[list[float]] | None:
+    x = _csv_float(row, f"{prefix}_x_m")
+    y = _csv_float(row, f"{prefix}_y_m")
+    z = _csv_float(row, f"{prefix}_z_m")
+    qx = _csv_float(row, f"{prefix}_qx")
+    qy = _csv_float(row, f"{prefix}_qy")
+    qz = _csv_float(row, f"{prefix}_qz")
+    qw = _csv_float(row, f"{prefix}_qw")
+    if None in (x, y, z, qx, qy, qz, qw):
+        return None
+    rotation = _quat_to_rotation_matrix(float(qx), float(qy), float(qz), float(qw))
+    if rotation is None:
+        return None
+    return [
+        [rotation[0][0], rotation[0][1], rotation[0][2], float(x)],
+        [rotation[1][0], rotation[1][1], rotation[1][2], float(y)],
+        [rotation[2][0], rotation[2][1], rotation[2][2], float(z)],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def _project_point(
+    camera_matrix: list[list[float]],
+    dist_coeffs: list[float],
+    point_cam: tuple[float, float, float],
+) -> list[float] | None:
+    x, y, z = point_cam
+    if z <= 1e-6 or not all(math.isfinite(value) for value in (x, y, z)):
+        return None
+    fx = float(camera_matrix[0][0])
+    fy = float(camera_matrix[1][1])
+    cx = float(camera_matrix[0][2])
+    cy = float(camera_matrix[1][2])
+    xn = x / z
+    yn = y / z
+    if dist_coeffs:
+        coeffs = [float(value) for value in dist_coeffs]
+        k1 = coeffs[0] if len(coeffs) > 0 else 0.0
+        k2 = coeffs[1] if len(coeffs) > 1 else 0.0
+        p1 = coeffs[2] if len(coeffs) > 2 else 0.0
+        p2 = coeffs[3] if len(coeffs) > 3 else 0.0
+        k3 = coeffs[4] if len(coeffs) > 4 else 0.0
+        k4 = coeffs[5] if len(coeffs) > 5 else 0.0
+        k5 = coeffs[6] if len(coeffs) > 6 else 0.0
+        k6 = coeffs[7] if len(coeffs) > 7 else 0.0
+        s1 = coeffs[8] if len(coeffs) > 8 else 0.0
+        s2 = coeffs[9] if len(coeffs) > 9 else 0.0
+        s3 = coeffs[10] if len(coeffs) > 10 else 0.0
+        s4 = coeffs[11] if len(coeffs) > 11 else 0.0
+        r2 = xn * xn + yn * yn
+        r4 = r2 * r2
+        r6 = r4 * r2
+        denominator = 1.0 + k4 * r2 + k5 * r4 + k6 * r6
+        radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+        if abs(denominator) > 1e-12:
+            radial /= denominator
+        x_tangential = 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn * xn)
+        y_tangential = p1 * (r2 + 2.0 * yn * yn) + 2.0 * p2 * xn * yn
+        xn = xn * radial + x_tangential + s1 * r2 + s2 * r4
+        yn = yn * radial + y_tangential + s3 * r2 + s4 * r4
+    return [fx * xn + cx, fy * yn + cy]
+
+
+def _load_camera_poses_in_base(summary_path: Path) -> dict[str, list[list[float]]]:
+    summary = _load_json_file(summary_path)
+    poses: dict[str, list[list[float]]] = {}
+    joint_cameras = ((summary.get("joint_solution") or {}).get("cameras") or {}) if isinstance(summary, dict) else {}
+    if isinstance(joint_cameras, dict):
+        for camera_name, camera_info in joint_cameras.items():
+            matrix = (((camera_info or {}).get("base_to_camera") or {}).get("matrix_4x4") or [])
+            if isinstance(matrix, list) and len(matrix) == 4 and all(isinstance(row, list) and len(row) == 4 for row in matrix):
+                poses[str(camera_name)] = [[float(value) for value in row] for row in matrix]
+    if poses:
+        return poses
+    cameras = summary.get("cameras") or {}
+    if isinstance(cameras, dict):
+        for camera_name, camera_info in cameras.items():
+            matrix = (((camera_info or {}).get("base_to_camera") or {}).get("matrix_4x4") or [])
+            if isinstance(matrix, list) and len(matrix) == 4 and all(isinstance(row, list) and len(row) == 4 for row in matrix):
+                poses[str(camera_name)] = [[float(value) for value in row] for row in matrix]
+    return poses
+
+
+def _load_json_file(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as json_file:
+            payload = json.load(json_file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _flatten_float_list(values: Any) -> list[float]:
+    if isinstance(values, (int, float)):
+        return [float(values)]
+    if isinstance(values, list):
+        flattened: list[float] = []
+        for item in values:
+            flattened.extend(_flatten_float_list(item))
+        return flattened
+    return []
+
+
+def _load_camera_intrinsics(path: Path) -> tuple[list[list[float]], list[float]] | None:
+    payload = _load_json_file(path)
+    matrix = payload.get("camera_matrix")
+    if isinstance(matrix, list) and len(matrix) == 3 and all(isinstance(row, list) and len(row) == 3 for row in matrix):
+        try:
+            return [[float(value) for value in row] for row in matrix], _flatten_float_list(payload.get("dist_coeffs"))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _cube_corners(size_m: float) -> list[tuple[float, float, float]]:
+    half = float(size_m) / 2.0
+    return [
+        (-half, -half, -half),
+        (half, -half, -half),
+        (half, half, -half),
+        (-half, half, -half),
+        (-half, -half, half),
+        (half, -half, half),
+        (half, half, half),
+        (-half, half, half),
+    ]
+
+
+def _cube_overlay_from_row(
+    row: dict[str, Any],
+    *,
+    camera_matrix: list[list[float]],
+    dist_coeffs: list[float],
+    t_cam_base: list[list[float]],
+    cube_size_m: float,
+) -> dict[str, Any] | None:
+    if int(float(row.get("cube_detected", "0") or 0)) <= 0:
+        return None
+    t_base_cube = _pose_matrix_from_csv_row(row, "cube_base")
+    if t_base_cube is None:
+        return None
+    t_cam_cube = _mat4_mul(t_cam_base, t_base_cube)
+    corners = [_project_point(camera_matrix, dist_coeffs, _transform_point(t_cam_cube, point)) for point in _cube_corners(cube_size_m)]
+    axis_points = [
+        (0.0, 0.0, 0.0),
+        (cube_size_m, 0.0, 0.0),
+        (0.0, cube_size_m, 0.0),
+        (0.0, 0.0, cube_size_m),
+    ]
+    axes = [_project_point(camera_matrix, dist_coeffs, _transform_point(t_cam_cube, point)) for point in axis_points]
+    finite = [point for point in corners if point is not None]
+    label = None
+    if finite:
+        label = [sum(point[0] for point in finite) / len(finite), sum(point[1] for point in finite) / len(finite)]
+    elif axes[0] is not None:
+        label = axes[0]
+    cube_name = str(row.get("cube_name") or "cube")
+    return {
+        "cubeName": cube_name,
+        "color": CUBE_OVERLAY_COLORS.get(cube_name, "#ffffff"),
+        "corners": corners,
+        "axes": {
+            "origin": axes[0],
+            "x": axes[1],
+            "y": axes[2],
+            "z": axes[3],
+        },
+        "label": label,
+        "detected": int(float(row.get("cube_detected", "0") or 0)),
+        "numMarkers": int(float(row.get("cube_num_markers", "0") or 0)),
+        "rmsePx": _csv_float(row, "cube_reprojection_rmse_px"),
+        "usedForFusion": int(float(row.get("used_for_fusion", "0") or 0)) > 0,
+    }
+
+
+def _read_video_cube_overlays(state: GatewayState, dataset_root: Path, episode: int) -> dict[int, dict[str, list[dict[str, Any]]]]:
+    tracking_run = _tracking_run_dir(state, dataset_root)
+    summary = _load_json_file(tracking_run / "summary.json")
+    if not summary:
+        return {}
+    fixed_summary = Path(str(((summary.get("calibration_inputs") or {}).get("fixed_camera_summary") or "")))
+    if not fixed_summary.is_absolute():
+        fixed_summary = state.repo_root / fixed_summary
+    camera_poses = _load_camera_poses_in_base(fixed_summary)
+    cube_size_m = float(((summary.get("cube_tracker") or {}).get("cube_size_cm") or DEFAULT_CUBE_SIZE_M * 100.0)) / 100.0
+    overlays: dict[int, dict[str, list[dict[str, Any]]]] = {}
+    active_streams = summary.get("active_streams") if isinstance(summary.get("active_streams"), list) else []
+    for stream in active_streams:
+        if not isinstance(stream, dict):
+            continue
+        stream_key = str(stream.get("stream_key") or "")
+        camera_name = str(stream.get("camera_name") or "")
+        serial = str(stream.get("serial") or "")
+        if not stream_key or not serial:
+            continue
+        intrinsics = _load_camera_intrinsics(Path(str(stream.get("intrinsics_path") or "")))
+        t_base_cam = camera_poses.get(camera_name)
+        if intrinsics is None or t_base_cam is None:
+            continue
+        camera_matrix, dist_coeffs = intrinsics
+        t_cam_base = _mat4_inverse_rigid(t_base_cam)
+        per_camera_csv = tracking_run / "per_camera" / f"camera_{serial}_records.csv"
+        if not per_camera_csv.is_file():
+            continue
+        try:
+            with per_camera_csv.open("r", encoding="utf-8", newline="") as csv_file:
+                reader = csv.DictReader(csv_file)
+                for row in reader:
+                    try:
+                        row_episode = int(float(row.get("episode_index", "-1") or -1))
+                        frame_index = int(float(row.get("frame_index", "0") or 0))
+                    except ValueError:
+                        continue
+                    if row_episode != int(episode):
+                        continue
+                    overlay = _cube_overlay_from_row(
+                        row,
+                        camera_matrix=camera_matrix,
+                        dist_coeffs=dist_coeffs,
+                        t_cam_base=t_cam_base,
+                        cube_size_m=cube_size_m,
+                    )
+                    if overlay is None:
+                        continue
+                    overlays.setdefault(frame_index, {}).setdefault(f"observation.images.{stream_key}", []).append(overlay)
+        except OSError:
+            continue
+    return overlays
+
+
+def _cube_names_for_timeline(dataset_root: Path, info: dict[str, Any]) -> list[str]:
+    names = list(DEFAULT_CUBE_TRAJECTORY_NAMES)
+    for name in _sidecar_cube_pose_files(dataset_root):
+        if name not in names:
+            names.append(name)
+    features = info.get("features") or {}
+    if isinstance(features, dict):
+        for key in features:
+            for prefix in ("observation.state.", "action."):
+                if isinstance(key, str) and key.startswith(prefix):
+                    cube_name = key[len(prefix) :]
+                    if cube_name and cube_name not in names:
+                        names.append(cube_name)
+    return names
+
+
 def _extract_ee_axes(names: list[str], values: list[float]) -> dict[str, float] | None:
     if not names or not values:
         return None
@@ -1668,6 +2260,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
     info = _load_dataset_info(dataset_root)
     state_names = _feature_names(info, "observation.state")
     action_names = _feature_names(info, "action")
+    cube_pose_names = _cube_names_for_timeline(dataset_root, info)
     camera_keys = _camera_keys(info)
     fps = int(info.get("fps") or state.replay.fps or 30)
     data_files = _dataset_data_files(dataset_root)
@@ -1678,6 +2271,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
             "totalFrames": 0,
             "frames": [],
             "cameraKeys": camera_keys,
+            "cubePoseNames": cube_pose_names,
             "stateNames": state_names,
             "actionNames": action_names,
             "fps": fps,
@@ -1698,6 +2292,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
                 "totalFrames": 0,
                 "frames": [],
                 "cameraKeys": camera_keys,
+                "cubePoseNames": cube_pose_names,
                 "stateNames": state_names,
                 "actionNames": action_names,
                 "fps": fps,
@@ -1710,6 +2305,11 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
 
     rows = table.to_pylist()
     rows.sort(key=lambda row: int(row.get("frame_index") or 0))
+    sidecar_cube_poses = _read_sidecar_cube_poses(dataset_root, int(episode or 0))
+    video_cube_overlays = _read_video_cube_overlays(state, dataset_root, int(episode or 0))
+    for cube_name in sidecar_cube_poses:
+        if cube_name not in cube_pose_names:
+            cube_pose_names.append(cube_name)
 
     frames: list[dict[str, Any]] = []
     for row_index, row in enumerate(rows):
@@ -1718,6 +2318,13 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         state_values = _as_float_list(row.get("observation.state"))
         action_values = _as_float_list(row.get("action"))
         pose = _ee_pose_from_row(row, action_names, state_names) or {}
+        cube_poses: dict[str, dict[str, Any]] = {}
+        for cube_name in cube_pose_names:
+            cube_pose = sidecar_cube_poses.get(cube_name, {}).get(frame_index)
+            if cube_pose is None:
+                cube_pose = _cube_pose_from_parquet_row(row, info, cube_name)
+            if cube_pose is not None:
+                cube_poses[cube_name] = cube_pose
         frames.append(
             {
                 "frame": frame_index,
@@ -1725,6 +2332,8 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
                 "state": state_values,
                 "action": action_values,
                 "eePose": pose,
+                "cubePoses": cube_poses,
+                "videoOverlays": video_cube_overlays.get(frame_index, {}),
             }
         )
 
@@ -1738,6 +2347,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         "fps": fps,
         "stateNames": state_names,
         "actionNames": action_names,
+        "cubePoseNames": [name for name in cube_pose_names if any(name in frame.get("cubePoses", {}) for frame in frames)],
         "cameraKeys": camera_keys,
         "videoTemplate": video_template,
         "videoChunkIndex": 0,
@@ -1969,6 +2579,15 @@ def _venv_python(repo_root: Path) -> Path:
         candidate = repo_root / name / "bin" / "python"
         if candidate.is_file():
             return candidate
+    return Path(sys.executable)
+
+
+def _venv_python3(repo_root: Path) -> Path:
+    for name in (".venv", "venv"):
+        for executable in ("python3", "python"):
+            candidate = repo_root / name / "bin" / executable
+            if candidate.is_file():
+                return candidate
     return Path(sys.executable)
 
 
@@ -2994,6 +3613,10 @@ def main() -> None:
         with state.lock:
             if state.process is not None and state.process.poll() is None:
                 os.killpg(state.process.pid, signal.SIGTERM)
+            for process in list(state.processing_processes.values()):
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+            state.processing_processes.clear()
         server.server_close()
 
 
