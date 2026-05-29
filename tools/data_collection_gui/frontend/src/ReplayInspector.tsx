@@ -2,7 +2,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pose3DViewer } from "./Pose3DViewer";
 import { SeriesPlot } from "./SeriesPlot";
 import type { DataCollectionGuiApi } from "./api";
-import type { EePose, ReplayTimeline, ReplayTimelineFrame } from "./types";
+import type { CubeVideoOverlay, EePose, ReplayTimeline, ReplayTimelineFrame } from "./types";
+
+const cubeColors: Record<string, number> = {
+  left: 0xc2410c,
+  right: 0x0f766e,
+  head: 0x2563eb
+};
+
+const cubePoseDims = ["x", "y", "z", "qx", "qy", "qz", "qw"] as const;
+const cubeEdges: Array<[number, number]> = [
+  [0, 1], [1, 2], [2, 3], [3, 0],
+  [4, 5], [5, 6], [6, 7], [7, 4],
+  [0, 4], [1, 5], [2, 6], [3, 7]
+];
 
 function shortCameraName(key: string): string {
   return key.replace(/^observation\.images\./, "");
@@ -26,6 +39,83 @@ function ensureFullPose(pose: ReplayTimelineFrame["eePose"]): EePose | null {
     qw: qw ?? 1,
     gripper: gripper == null ? null : gripper
   };
+}
+
+function CubeOverlayCanvas({
+  overlays,
+  video
+}: {
+  overlays: CubeVideoOverlay[];
+  video: HTMLVideoElement | null;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !video) {
+      return;
+    }
+    const width = video.clientWidth || canvas.clientWidth;
+    const height = video.clientHeight || canvas.clientHeight;
+    if (width <= 0 || height <= 0) {
+      return;
+    }
+    const dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+    }
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    const sourceWidth = video.videoWidth || width;
+    const sourceHeight = video.videoHeight || height;
+    const sx = width / Math.max(sourceWidth, 1);
+    const sy = height / Math.max(sourceHeight, 1);
+    const scalePoint = (point: [number, number] | null | undefined): [number, number] | null => {
+      if (!point) return null;
+      return [point[0] * sx, point[1] * sy];
+    };
+    const drawLine = (a: [number, number] | null, b: [number, number] | null, color: string, lineWidth = 2) => {
+      if (!a || !b) return;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = lineWidth;
+      ctx.beginPath();
+      ctx.moveTo(a[0], a[1]);
+      ctx.lineTo(b[0], b[1]);
+      ctx.stroke();
+    };
+
+    for (const overlay of overlays) {
+      const corners = overlay.corners.map(scalePoint);
+      for (const [a, b] of cubeEdges) {
+        drawLine(corners[a], corners[b], overlay.color, 2);
+      }
+      const origin = scalePoint(overlay.axes.origin);
+      drawLine(origin, scalePoint(overlay.axes.x), "#ef4444", 2.5);
+      drawLine(origin, scalePoint(overlay.axes.y), "#22c55e", 2.5);
+      drawLine(origin, scalePoint(overlay.axes.z), "#3b82f6", 2.5);
+      const label = scalePoint(overlay.label);
+      if (label) {
+        const text = `${overlay.cubeName} m=${overlay.numMarkers} rmse=${overlay.rmsePx == null ? "-" : overlay.rmsePx.toFixed(1)} ${overlay.usedForFusion ? "in" : "out"}`;
+        ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+        const metrics = ctx.measureText(text);
+        const x = Math.max(4, Math.min(width - metrics.width - 10, label[0]));
+        const y = Math.max(18, Math.min(height - 6, label[1]));
+        ctx.fillStyle = "rgba(0, 0, 0, 0.72)";
+        ctx.fillRect(x - 4, y - 14, metrics.width + 8, 18);
+        ctx.fillStyle = overlay.color;
+        ctx.fillText(text, x, y);
+      }
+    }
+  }, [overlays, video]);
+
+  return <canvas className="camera-overlay" ref={canvasRef} />;
 }
 
 export function ReplayInspector({
@@ -141,6 +231,20 @@ export function ReplayInspector({
 
   const frame: ReplayTimelineFrame | undefined = timeline?.frames[currentFrame];
   const pose = ensureFullPose(frame?.eePose);
+  const cubePoseNames = useMemo(() => {
+    if (!timeline) {
+      return [] as string[];
+    }
+    const discovered = new Set<string>(timeline.cubePoseNames ?? []);
+    for (const entry of timeline.frames) {
+      for (const name of Object.keys(entry.cubePoses ?? {})) {
+        discovered.add(name);
+      }
+    }
+    return Array.from(discovered).filter((name) =>
+      timeline.frames.some((entry) => ensureFullPose(entry.cubePoses?.[name]) !== null)
+    );
+  }, [timeline]);
   const trajectory = useMemo(() => {
     if (!timeline) {
       return [] as Array<[number, number, number]>;
@@ -150,6 +254,26 @@ export function ReplayInspector({
       .filter((entry): entry is EePose => !!entry && entry.x != null && entry.y != null && entry.z != null)
       .map((entry) => [entry.x as number, entry.y as number, entry.z as number] as [number, number, number]);
   }, [timeline]);
+  const cubeTrajectories = useMemo(() => {
+    if (!timeline) {
+      return [];
+    }
+    return cubePoseNames.map((name, index) => ({
+      name,
+      color: cubeColors[name] ?? [0x7c3aed, 0x0891b2, 0x65a30d, 0xbe123c][index % 4],
+      points: timeline.frames
+        .map((entry) => ensureFullPose(entry.cubePoses?.[name]))
+        .filter((entry): entry is EePose => !!entry)
+        .map((entry) => [entry.x, entry.y, entry.z] as [number, number, number])
+    }));
+  }, [timeline, cubePoseNames]);
+  const currentCubePoses = useMemo(() => {
+    return cubePoseNames.map((name, index) => ({
+      name,
+      color: cubeColors[name] ?? [0x7c3aed, 0x0891b2, 0x65a30d, 0xbe123c][index % 4],
+      pose: ensureFullPose(frame?.cubePoses?.[name])
+    }));
+  }, [cubePoseNames, frame]);
 
   const pickState = useCallback(
     (frameIndex: number, dim: number) => timeline?.frames[frameIndex]?.state[dim] ?? Number.NaN,
@@ -158,6 +282,18 @@ export function ReplayInspector({
   const pickAction = useCallback(
     (frameIndex: number, dim: number) => timeline?.frames[frameIndex]?.action[dim] ?? Number.NaN,
     [timeline]
+  );
+  const cubeSeriesNames = useMemo(() => {
+    return cubePoseNames.flatMap((name) => cubePoseDims.map((dim) => `${name}.${dim}`));
+  }, [cubePoseNames]);
+  const pickCubePose = useCallback(
+    (frameIndex: number, dim: number) => {
+      const cubeName = cubePoseNames[Math.floor(dim / cubePoseDims.length)];
+      const poseDim = cubePoseDims[dim % cubePoseDims.length];
+      const cubePose = ensureFullPose(timeline?.frames[frameIndex]?.cubePoses?.[cubeName]);
+      return cubePose?.[poseDim] ?? Number.NaN;
+    },
+    [timeline, cubePoseNames]
   );
 
   const seek = useCallback((nextFrame: number) => {
@@ -234,6 +370,7 @@ export function ReplayInspector({
               playsInline
               preload="auto"
             />
+            <CubeOverlayCanvas overlays={frame?.videoOverlays?.[key] ?? []} video={videoRefs.current[key]} />
             <span>{shortCameraName(key)}</span>
           </div>
         ))}
@@ -241,7 +378,9 @@ export function ReplayInspector({
       <section className="panel pose-panel">
         <div className="panel-heading">
           <h2>End-effector pose</h2>
-          <span>drag to orbit · wheel to zoom</span>
+          <span>
+            drag to orbit · wheel to zoom{cubePoseNames.length ? ` · cubes ${cubePoseNames.join(", ")}` : ""}
+          </span>
         </div>
         {pose ? (
           <div className="pose-summary">
@@ -261,7 +400,23 @@ export function ReplayInspector({
         ) : (
           <p className="panel-note">No EE pose in this frame.</p>
         )}
-        <Pose3DViewer trajectory={trajectory} currentPose={pose} />
+        {cubePoseNames.length ? (
+          <div className="pose-summary">
+            {currentCubePoses.map((entry) => (
+              <span key={entry.name}>
+                {entry.name} [<strong>{entry.pose?.x.toFixed(3) ?? "—"}</strong>,{" "}
+                <strong>{entry.pose?.y.toFixed(3) ?? "—"}</strong>,{" "}
+                <strong>{entry.pose?.z.toFixed(3) ?? "—"}</strong>]
+              </span>
+            ))}
+          </div>
+        ) : null}
+        <Pose3DViewer
+          trajectory={trajectory}
+          currentPose={pose}
+          extraTrajectories={cubeTrajectories}
+          currentExtraPoses={currentCubePoses}
+        />
       </section>
       <div className="series-grid">
         <SeriesPlot
@@ -280,6 +435,17 @@ export function ReplayInspector({
           totalFrames={totalFrames}
           onSeek={seek}
         />
+        {cubeSeriesNames.length ? (
+          <SeriesPlot
+            title="cube pose trajectories"
+            names={cubeSeriesNames}
+            pickValue={pickCubePose}
+            currentFrame={currentFrame}
+            totalFrames={totalFrames}
+            onSeek={seek}
+            rowHeight={22}
+          />
+        ) : null}
       </div>
       {error ? <p className="panel-note error">{error}</p> : null}
     </section>
