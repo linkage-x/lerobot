@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 from tools.thor.gmsl2 import gmsl2_record as gr
 from tools.thor.gmsl2 import persistent_session as ps
+from tools.thor.gmsl2 import persistent_session_worker as psw
 
 
 # ---------------------------------------------------------------------------
@@ -101,18 +102,7 @@ def test_pipeline_desc_test_source_uses_software_encoder():
 # ---------------------------------------------------------------------------
 
 
-def _make_stream(tmp_path, sid=0, name="cam_00") -> ps._Stream:
-    cfg = ps.StreamConfig(sid=sid, name=name)
-    warmup = tmp_path / "warmup"
-    warmup.mkdir(exist_ok=True)
-    # The session is only used as a host for `_on_fragment_opened`; we don't
-    # need its real lifecycle methods here.
-    fake_session = SimpleNamespace(
-        _Gst=SimpleNamespace(MessageType=SimpleNamespace()),
-        _on_fragment_opened=lambda stream, info: None,
-        _record_error=lambda err: None,
-    )
-    return ps._Stream(cfg, warmup, fake_session)  # type: ignore[arg-type]
+_GST_CLOCK_TIME_NONE = 2**64 - 1
 
 
 def _make_first_sample(pts_ns: int):
@@ -121,47 +111,58 @@ def _make_first_sample(pts_ns: int):
     return SimpleNamespace(get_buffer=lambda: buf)
 
 
-def test_format_location_warmup_returns_warmup_path(tmp_path):
-    stream = _make_stream(tmp_path)
+def _warmup_cfg(tmp_path, sid=0, name="cam_00"):
+    warmup = tmp_path / "warmup"
+    warmup.mkdir(exist_ok=True)
+    return ps.StreamConfig(sid=sid, name=name), warmup
+
+
+def test_fragment_dict_warmup_returns_warmup_path(tmp_path):
+    cfg, warmup = _warmup_cfg(tmp_path)
     sample = _make_first_sample(int(0.5 * 1e9))
-    path = stream._on_format_location_full(None, 3, sample)
-    assert path.startswith(str(tmp_path / "warmup"))
-    assert path.endswith("_00003.mkv")
-    assert stream.fragment_history[-1].state == ps.FragmentState.WARMUP
-    assert stream.fragment_history[-1].first_pts_s == 0.5
-    # WARMUP fragments must not be advertised as "last episode fragment".
-    assert stream.last_episode_fragment is None
+    info = psw._fragment_dict(
+        cfg, 3, sample, ps.FragmentState.WARMUP, None, warmup,
+        _GST_CLOCK_TIME_NONE,
+    )
+    assert info["path"].startswith(str(warmup))
+    assert info["path"].endswith("_00003.mkv")
+    assert info["state"] == ps.FragmentState.WARMUP.value
+    assert info["first_pts_s"] == 0.5
 
 
-def test_format_location_episode_returns_episode_path_and_records_pts(tmp_path):
-    stream = _make_stream(tmp_path, sid=2, name="cam_02")
+def test_fragment_dict_episode_returns_episode_path_and_records_pts(tmp_path):
+    cfg, warmup = _warmup_cfg(tmp_path, sid=2, name="cam_02")
     episode_dir = tmp_path / "episode_000000"
     episode_dir.mkdir()
-    stream.state = ps.FragmentState.EPISODE
-    stream.current_episode_dir = episode_dir
     sample = _make_first_sample(int(12.345 * 1e9))
-    path = stream._on_format_location_full(None, 4, sample)
-    assert path == str(episode_dir / "cam_02.mkv")
-    info = stream.last_episode_fragment
-    assert info is not None
-    assert info.fragment_id == 4
-    assert info.first_pts_s == 12.345
-    assert info.state == ps.FragmentState.EPISODE
+    info = psw._fragment_dict(
+        cfg, 4, sample, ps.FragmentState.EPISODE, episode_dir, warmup,
+        _GST_CLOCK_TIME_NONE,
+    )
+    assert info["path"] == str(episode_dir / "cam_02.mkv")
+    assert info["fragment_id"] == 4
+    assert info["first_pts_s"] == 12.345
+    assert info["state"] == ps.FragmentState.EPISODE.value
 
 
-def test_format_location_handles_clock_time_none(tmp_path):
-    stream = _make_stream(tmp_path)
-    # Gst.CLOCK_TIME_NONE is 2**64 - 1; we filter that out.
-    sample = _make_first_sample(2**64 - 1)
-    stream._on_format_location_full(None, 0, sample)
-    assert stream.fragment_history[-1].first_pts_s is None
+def test_fragment_dict_handles_clock_time_none(tmp_path):
+    cfg, warmup = _warmup_cfg(tmp_path)
+    sample = _make_first_sample(_GST_CLOCK_TIME_NONE)
+    info = psw._fragment_dict(
+        cfg, 0, sample, ps.FragmentState.WARMUP, None, warmup,
+        _GST_CLOCK_TIME_NONE,
+    )
+    assert info["first_pts_s"] is None
 
 
-def test_format_location_handles_missing_buffer(tmp_path):
-    stream = _make_stream(tmp_path)
+def test_fragment_dict_handles_missing_buffer(tmp_path):
+    cfg, warmup = _warmup_cfg(tmp_path)
     sample = SimpleNamespace(get_buffer=lambda: None)
-    stream._on_format_location_full(None, 0, sample)
-    assert stream.fragment_history[-1].first_pts_s is None
+    info = psw._fragment_dict(
+        cfg, 0, sample, ps.FragmentState.WARMUP, None, warmup,
+        _GST_CLOCK_TIME_NONE,
+    )
+    assert info["first_pts_s"] is None
 
 
 # ---------------------------------------------------------------------------

@@ -81,32 +81,19 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import multiprocessing as mp
+import queue as queue_module
 import shutil
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
 logger = logging.getLogger("persistent_session")
-
-
-# ---------------------------------------------------------------------------
-# Lazy GStreamer import
-# ---------------------------------------------------------------------------
-
-
-def _gst_module():
-    """Import gi.repository.Gst lazily so unit tests can mock the module."""
-    import gi  # type: ignore
-
-    gi.require_version("Gst", "1.0")
-    from gi.repository import Gst, GLib  # type: ignore
-
-    Gst.init(None)
-    return Gst, GLib
 
 
 # ---------------------------------------------------------------------------
@@ -257,148 +244,204 @@ def build_pipeline_desc(stream: StreamConfig, warmup_location: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Stream handle
+# Per-stream worker proxy
 # ---------------------------------------------------------------------------
+#
+# Each pipeline lives in its own subprocess (see persistent_session_worker.py).
+# The parent process holds one _StreamProxy per camera which owns:
+#   - the child mp.Process
+#   - the two mp.Queue's the protocol uses
+#   - a reader thread that drains evt_q into local state
+#
+# The proxy turns child-side events into parent-side state:
+#   ready_evt      set when the child reports "playing" OR any terminal error
+#                  (so connect() never blocks waiting for a dead worker)
+#   episode_done_evt set after a stop_episode finalize round trips
+#   last_episode_fragment   most recent EPISODE fragment opened
+#   errors         queued StreamError's (drained by poll_errors())
+#
+# This file intentionally does NOT import gi.repository. All Gst-dependent
+# code lives in the worker module, which is only imported inside the child.
 
 
-class _Stream:
-    """One persistent pipeline, owned by the session."""
+def _apply_event_to_proxy(proxy: "_StreamProxy", event: tuple) -> None:
+    """Dispatch one worker event into a proxy's state.
 
-    def __init__(self, cfg: StreamConfig, warmup_dir: Path, session: "PersistentCameraSession"):
+    Pulled out as a module-level free function so the unit tests can drive
+    arbitrary event sequences without spinning up a real subprocess. The
+    reader thread is the only place that calls this in production.
+    """
+    if not isinstance(event, tuple) or not event:
+        return
+    kind = event[0]
+    if kind == "playing":
+        proxy.ready_evt.set()
+        return
+    if kind == "fragment":
+        info_dict = event[1]
+        info = FragmentInfo(
+            sid=int(info_dict["sid"]),
+            name=str(info_dict["name"]),
+            fragment_id=int(info_dict["fragment_id"]),
+            path=Path(info_dict["path"]),
+            first_pts_s=info_dict["first_pts_s"],
+            first_wall_s=float(info_dict["first_wall_s"]),
+            state=FragmentState(info_dict["state"]),
+        )
+        proxy.fragment_history.append(info)
+        if info.state == FragmentState.EPISODE:
+            proxy.last_episode_fragment = info
+        if proxy._on_fragment_opened_cb is not None:
+            try:
+                proxy._on_fragment_opened_cb(proxy, info)
+            except Exception as exc:
+                logger.warning("on_fragment_opened callback failed: %s", exc)
+        return
+    if kind == "error":
+        message = str(event[1]) if len(event) > 1 else "unspecified error"
+        debug = str(event[2]) if len(event) > 2 else ""
+        proxy.errors.append(StreamError(
+            sid=proxy.cfg.sid, name=proxy.cfg.name,
+            message=message, debug=debug,
+        ))
+        proxy.ready_evt.set()  # unblock connect() — terminal failure
+        return
+    if kind == "eos":
+        proxy.errors.append(StreamError(
+            sid=proxy.cfg.sid, name=proxy.cfg.name,
+            message="bus EOS (upstream stopped delivering buffers)",
+        ))
+        proxy.ready_evt.set()
+        return
+    if kind == "episode_done":
+        info_dict = event[1] if len(event) > 1 else None
+        if info_dict is not None:
+            proxy.last_episode_fragment = FragmentInfo(
+                sid=int(info_dict["sid"]),
+                name=str(info_dict["name"]),
+                fragment_id=int(info_dict["fragment_id"]),
+                path=Path(info_dict["path"]),
+                first_pts_s=info_dict["first_pts_s"],
+                first_wall_s=float(info_dict["first_wall_s"]),
+                state=FragmentState(info_dict["state"]),
+            )
+        proxy.episode_done_evt.set()
+        return
+    if kind == "disconnected":
+        proxy.disconnected_evt.set()
+        return
+    logger.warning("[%s] unknown worker event %r", proxy.cfg.name, event)
+
+
+class _StreamProxy:
+    """Parent-side handle for one worker subprocess."""
+
+    def __init__(
+        self,
+        cfg: StreamConfig,
+        warmup_dir: Path,
+        ctx: Any,
+        *,
+        on_fragment_opened: Callable[["_StreamProxy", FragmentInfo], None] | None = None,
+    ):
         self.cfg = cfg
         self.warmup_dir = warmup_dir
-        self.session = session
-        self.state: FragmentState = FragmentState.WARMUP
-        self.current_episode_dir: Path | None = None
-        self.fragment_history: list[FragmentInfo] = []
-        # The most recently opened fragment per (state, episode_dir):
+        self._ctx = ctx
+        self.cmd_q: Any = ctx.Queue()
+        self.evt_q: Any = ctx.Queue()
+        self.proc: Any = None
+        self.reader_thread: threading.Thread | None = None
+        self._reader_stop = threading.Event()
+        self.ready_evt = threading.Event()
+        self.episode_done_evt = threading.Event()
+        self.disconnected_evt = threading.Event()
         self.last_episode_fragment: FragmentInfo | None = None
-        # `gi` objects
-        self.pipeline: Any = None
-        self.splitmux: Any = None
-        self.encoder: Any = None
-        self.bus: Any = None
-        self.bus_watch_id: int | None = None
+        self.fragment_history: list[FragmentInfo] = []
+        self.errors: list[StreamError] = []
+        self._on_fragment_opened_cb = on_fragment_opened
 
-    @property
-    def warmup_location_template(self) -> str:
-        return str(self.warmup_dir / f"cam_{self.cfg.sid:02d}_warmup_%05d.mkv")
+    # -- lifecycle --------------------------------------------------------
 
-    def build(self, Gst: Any) -> None:
-        desc = build_pipeline_desc(self.cfg, self.warmup_location_template)
-        logger.debug("[%s] pipeline desc: %s", self.cfg.name, desc)
-        self.pipeline = Gst.parse_launch(desc)
-        self.splitmux = self.pipeline.get_by_name(f"mux_{self.cfg.sid}")
-        if self.splitmux is None:
-            raise RuntimeError(f"[{self.cfg.name}] splitmuxsink not found by name")
-        # nvv4l2h{265,264}enc exposes the `force-IDR` action signal so we can
-        # cut the IDR latency on episode boundaries down to ~one frame.
-        self.encoder = None
-        it = self.pipeline.iterate_elements()
-        while True:
-            result, elem = it.next()
-            if result == Gst.IteratorResult.DONE or elem is None:
-                break
-            if result != Gst.IteratorResult.OK:
-                continue
-            factory = elem.get_factory()
-            name = factory.get_name() if factory else ""
-            if name in {"nvv4l2h265enc", "nvv4l2h264enc", "x264enc", "x265enc"}:
-                self.encoder = elem
-        self.splitmux.connect("format-location-full", self._on_format_location_full)
-        self.bus = self.pipeline.get_bus()
-        self.bus.add_signal_watch()
-        self.bus_watch_id = self.bus.connect("message", self._on_bus_message)
+    def spawn(self) -> None:
+        # Imported lazily so the parent can still be imported on machines
+        # without gi.repository (e.g. dev hosts where only build_pipeline_desc
+        # is unit-tested).
+        from tools.thor.gmsl2 import persistent_session_worker as worker
 
-    def start(self, Gst: Any) -> None:
-        ret = self.pipeline.set_state(Gst.State.PLAYING)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError(f"[{self.cfg.name}] pipeline set_state(PLAYING) returned FAILURE")
-
-    def stop(self, Gst: Any) -> None:
-        if self.bus is not None and self.bus_watch_id is not None:
-            try:
-                self.bus.disconnect(self.bus_watch_id)
-            except Exception:
-                pass
-            self.bus.remove_signal_watch()
-            self.bus_watch_id = None
-        if self.pipeline is not None:
-            self.pipeline.set_state(Gst.State.NULL)
-
-    def force_split(self) -> None:
-        """Ask the encoder for an IDR and the muxer for a new fragment."""
-        if self.encoder is not None:
-            try:
-                self.encoder.emit("force-IDR")
-            except Exception as exc:
-                # x264enc / x265enc may not expose force-IDR on all platforms;
-                # the muxer will still cut on the next natural keyframe.
-                logger.debug("[%s] force-IDR not supported: %s", self.cfg.name, exc)
-        try:
-            self.splitmux.emit("split-now")
-        except Exception as exc:
-            logger.warning("[%s] split-now emit failed: %s", self.cfg.name, exc)
-
-    # -- callbacks --------------------------------------------------------
-
-    def _on_format_location_full(self, _mux, fragment_id, first_sample, *_user) -> str:
-        # `first_sample` is a Gst.Sample for the buffer that triggered the
-        # split; its PTS is the actual first frame of the new fragment.
-        first_pts_s: float | None = None
-        try:
-            if first_sample is not None:
-                buf = first_sample.get_buffer()
-                if buf is not None and buf.pts is not None:
-                    # Gst.CLOCK_TIME_NONE == 2**64 - 1
-                    if buf.pts < (1 << 60):
-                        first_pts_s = float(buf.pts) / 1e9
-        except Exception as exc:
-            logger.debug("[%s] could not parse first_sample pts: %s", self.cfg.name, exc)
-
-        wall_s = time.time()
-        state = self.state
-        if state == FragmentState.EPISODE and self.current_episode_dir is not None:
-            path = self.current_episode_dir / f"{self.cfg.name}.mkv"
-        else:
-            path = self.warmup_dir / f"cam_{self.cfg.sid:02d}_warmup_{fragment_id:05d}.mkv"
-
-        info = FragmentInfo(
-            sid=self.cfg.sid,
-            name=self.cfg.name,
-            fragment_id=int(fragment_id),
-            path=path,
-            first_pts_s=first_pts_s,
-            first_wall_s=wall_s,
-            state=state,
+        self.proc = self._ctx.Process(
+            target=worker.run_worker,
+            args=(self.cfg, self.warmup_dir, self.cmd_q, self.evt_q),
+            name=f"ps-worker-{self.cfg.sid:02d}",
+            daemon=True,
         )
-        self.fragment_history.append(info)
-        if state == FragmentState.EPISODE:
-            self.last_episode_fragment = info
-        self.session._on_fragment_opened(self, info)
-        logger.debug(
-            "[%s] format-location-full fragment=%d state=%s pts=%.6fs -> %s",
-            self.cfg.name, fragment_id, state.value,
-            first_pts_s if first_pts_s is not None else -1.0,
-            path,
+        self.proc.start()
+        self.reader_thread = threading.Thread(
+            target=self._reader_loop,
+            name=f"ps-reader-{self.cfg.sid:02d}",
+            daemon=True,
         )
-        return str(path)
+        self.reader_thread.start()
 
-    def _on_bus_message(self, _bus, message) -> None:
-        Gst = self.session._Gst
-        t = message.type
-        if t == Gst.MessageType.ERROR:
-            err, debug = message.parse_error()
-            self.session._record_error(StreamError(
+    def wait_ready(self, timeout_s: float) -> bool:
+        """Block until the worker reports PLAYING or a terminal failure.
+
+        Returns True iff the worker reached PLAYING with no error queued.
+        """
+        if not self.ready_evt.wait(timeout_s):
+            # No event from the child within the deadline — record a
+            # synthetic error so poll_errors() surfaces it to the operator.
+            self.errors.append(StreamError(
                 sid=self.cfg.sid, name=self.cfg.name,
-                message=str(err), debug=str(debug or ""),
+                message=f"worker did not become ready within {timeout_s:.1f}s",
             ))
-            logger.warning("[%s] bus ERROR: %s | %s", self.cfg.name, err, debug)
-        elif t == Gst.MessageType.EOS:
-            logger.info("[%s] bus EOS", self.cfg.name)
-        elif t == Gst.MessageType.WARNING:
-            err, debug = message.parse_warning()
-            logger.warning("[%s] bus WARNING: %s | %s", self.cfg.name, err, debug)
+            return False
+        return not self.errors
+
+    def start_episode(self, episode_dir: Path) -> None:
+        self.episode_done_evt.clear()
+        self.last_episode_fragment = None
+        self.cmd_q.put(("start_episode", str(episode_dir)))
+
+    def stop_episode(self) -> None:
+        self.cmd_q.put(("stop_episode",))
+
+    def wait_episode_done(self, timeout_s: float) -> bool:
+        return self.episode_done_evt.wait(timeout_s)
+
+    def disconnect(self, *, grace_s: float = 3.0) -> None:
+        try:
+            self.cmd_q.put(("disconnect",))
+        except Exception:
+            pass
+        if self.proc is None:
+            return
+        # First give the child a chance to drain async-finalize cleanly.
+        self.proc.join(timeout=grace_s)
+        if self.proc.is_alive():
+            self.proc.terminate()
+            self.proc.join(timeout=1.0)
+            if self.proc.is_alive():
+                self.proc.kill()
+                self.proc.join(timeout=1.0)
+        self._reader_stop.set()
+        if self.reader_thread is not None:
+            self.reader_thread.join(timeout=1.0)
+
+    # -- error/event drain ----------------------------------------------
+
+    def drain_errors(self) -> list[StreamError]:
+        out, self.errors = self.errors, []
+        return out
+
+    def _reader_loop(self) -> None:
+        while not self._reader_stop.is_set():
+            try:
+                evt = self.evt_q.get(timeout=0.2)
+            except queue_module.Empty:
+                continue
+            except (EOFError, OSError):
+                return
+            _apply_event_to_proxy(self, evt)
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +450,13 @@ class _Stream:
 
 
 class PersistentCameraSession:
-    """N persistent GStreamer pipelines with on-demand episode slicing."""
+    """N persistent GStreamer pipelines with on-demand episode slicing.
+
+    Each pipeline runs in its own subprocess (see persistent_session_worker)
+    so nvargus-daemon sees N independent RPC clients instead of one client
+    holding N CaptureSession's — that was the post-PR2 regression that
+    deadlocked set_state(PLAYING) and produced the empty-episode-dir bug.
+    """
 
     def __init__(
         self,
@@ -416,76 +465,167 @@ class PersistentCameraSession:
         *,
         spawn_stagger_s: float = 1.0,
         finalize_grace_s: float = 0.5,
-        on_fragment_opened: Callable[["_Stream", FragmentInfo], None] | None = None,
+        ready_timeout_s: float = 12.0,
+        on_fragment_opened: Callable[["_StreamProxy", FragmentInfo], None] | None = None,
     ):
         self._stream_cfgs = list(streams)
         self.warmup_dir = warmup_dir
         self.spawn_stagger_s = float(spawn_stagger_s)
         self.finalize_grace_s = float(finalize_grace_s)
+        self.ready_timeout_s = float(ready_timeout_s)
         self._on_fragment_opened_cb = on_fragment_opened
-        self._streams: dict[int, _Stream] = {}
+        self._streams: dict[int, _StreamProxy] = {}
         self._errors: list[StreamError] = []
         self._lock = threading.Lock()
-        self._Gst: Any = None
-        self._GLib: Any = None
-        self._glib_loop: Any = None
-        self._glib_thread: threading.Thread | None = None
+        # Subprocess context is chosen at connect() time; tests can also
+        # inject a fake by patching self._ctx_factory before calling connect.
+        self._ctx_factory: Callable[[], Any] = lambda: mp.get_context("spawn")
         self.connect_duration_s: float = 0.0
 
     # -- lifecycle --------------------------------------------------------
 
+    @property
+    def active_sids(self) -> list[int]:
+        """sids whose worker reached PLAYING and is still up.
+
+        Updated as ``connect()`` drops failed workers and as
+        ``restart_stream()`` swaps them in/out.
+        """
+        return sorted(self._streams)
+
     def connect(self) -> None:
         if self._streams:
             raise RuntimeError("connect() called twice without disconnect()")
-        Gst, GLib = _gst_module()
-        self._Gst, self._GLib = Gst, GLib
         self.warmup_dir.mkdir(parents=True, exist_ok=True)
-        # The signal-watch bus delivers messages on the default GLib main
-        # context, so we need a MainLoop running on a dedicated thread for
-        # the callbacks to actually fire.
-        self._glib_loop = GLib.MainLoop.new(None, False)
-        self._glib_thread = threading.Thread(
-            target=self._glib_loop.run, name="pcs-glib-mainloop", daemon=True,
-        )
-        self._glib_thread.start()
+        ctx = self._ctx_factory()
+        for cfg in self._stream_cfgs:
+            self._streams[cfg.sid] = _StreamProxy(
+                cfg, self.warmup_dir, ctx,
+                on_fragment_opened=self._on_fragment_opened_cb,
+            )
 
         t0 = time.time()
-        for cfg in self._stream_cfgs:
-            stream = _Stream(cfg, self.warmup_dir, self)
-            stream.build(Gst)
-            self._streams[cfg.sid] = stream
-        # Stagger only the PLAYING transition (where Argus actually does
-        # buffer allocation) — building the elements is cheap.
-        for i, sid in enumerate(sorted(self._streams)):
+        sids = sorted(self._streams)
+
+        # Phase 1 — rolling spawn.
+        #   Each worker is its own subprocess (separate RPC socket to
+        #   nvargus-daemon), so the daemon sees independent clients and
+        #   isolation holds. We still pace SPAWNS by spawn_stagger_s to
+        #   bound the daemon's per-tick OpenCaptureSession load, but we do
+        #   NOT wait for PLAYING here. Workers run their Argus open in
+        #   parallel from this point on — that's where the wall-clock win
+        #   comes from vs. the strictly-serial version (which made
+        #   connect() take stagger * N * (Argus open time) seconds).
+        for i, sid in enumerate(sids):
             if i > 0 and self.spawn_stagger_s > 0:
                 time.sleep(self.spawn_stagger_s)
-            self._streams[sid].start(Gst)
-            logger.info("[%s] PLAYING (+%.2fs)", self._streams[sid].cfg.name, time.time() - t0)
-        # Brief warm-up so the encoders are actually producing data before
-        # the first start_episode().
-        time.sleep(0.5)
+            proxy = self._streams[sid]
+            proxy.spawn()
+            logger.info(
+                "[%s] spawned (+%.2fs)", proxy.cfg.name, time.time() - t0,
+            )
+
+        # Phase 2 — serial wait_ready.
+        #   By the time Phase 1 finishes, the earliest-spawned workers have
+        #   typically already reached PLAYING (their wait_ready returns
+        #   immediately because ready_evt is already set). Only the last
+        #   few stragglers actually block here.
+        for sid in sids:
+            proxy = self._streams[sid]
+            ok = proxy.wait_ready(self.ready_timeout_s)
+            elapsed = time.time() - t0
+            if ok:
+                logger.info("[%s] PLAYING (+%.2fs)", proxy.cfg.name, elapsed)
+            else:
+                logger.warning(
+                    "[%s] failed to reach PLAYING (+%.2fs)", proxy.cfg.name, elapsed,
+                )
+
+        # Phase 3 — parallel retry round.
+        #   recover_argus.sh proved daemon-side per-sid retry works: when
+        #   a single sid's first OpenCaptureSession is mid-air during a
+        #   daemon state-machine glitch, restarting that sid alone usually
+        #   succeeds. PR3's restart_stream(sid) is the equivalent at the
+        #   worker level (terminate the worker -> daemon drops its
+        #   sessions -> respawn -> wait_ready).
+        #
+        #   We retry in parallel: each worker has its own subprocess and
+        #   its own RPC socket to nvargus-daemon, so concurrent
+        #   terminate+respawn is exactly N independent "client disconnect
+        #   + new client connect" pairs — daemon-side serialization holds
+        #   per socket, not across them, which is the multi-process
+        #   isolation argument PR3 was designed around. Wall-clock cost
+        #   collapses from sum(per-sid) to max(per-sid) (~5s instead of
+        #   ~25-30s on the 7-fail external test).
+        #
+        #   At most once per sid per connect() so a permanently-dead
+        #   camera doesn't loop.
+        first_round_errors = self.poll_errors()
+        if first_round_errors:
+            retry_sids = sorted({e.sid for e in first_round_errors})
+            logger.warning(
+                "connect first pass: %d/%d failed; retrying %s in parallel",
+                len(retry_sids), len(self._streams), retry_sids,
+            )
+            live_retry_sids = [sid for sid in retry_sids if sid in self._streams]
+            if live_retry_sids:
+                with ThreadPoolExecutor(
+                    max_workers=len(live_retry_sids),
+                    thread_name_prefix="pcs-retry",
+                ) as ex:
+                    list(ex.map(self.restart_stream, live_retry_sids))
+            # Only what survived the retry counts toward partial failure.
+            errors = self.poll_errors()
+        else:
+            errors = []
+
         self.connect_duration_s = time.time() - t0
+
+        # Partial-failure policy: drop failed workers, keep the rest live.
+        # connect() only raises when EVERY worker failed; otherwise it
+        # returns success and the caller is expected to poll_errors() to
+        # see who fell off and emit a warning to the operator.
+        if errors:
+            failed_sids = {e.sid for e in errors}
+            for sid in list(self._streams):
+                if sid in failed_sids:
+                    try:
+                        self._streams[sid].disconnect(grace_s=1.0)
+                    except Exception:
+                        pass
+                    del self._streams[sid]
+            if not self._streams:
+                bad = ", ".join(
+                    f"{e.name}({(e.message or '')[:60]})" for e in errors
+                )
+                raise RuntimeError(
+                    f"connect() failed on all {len(errors)} stream(s): {bad}"
+                )
+            # Partial: leave the errors in the bag so poll_errors() can
+            # surface them to the caller.
+            with self._lock:
+                self._errors.extend(errors)
+            bad = ", ".join(
+                f"{e.name}({(e.message or '')[:60]})" for e in errors
+            )
+            logger.warning(
+                "connect() partial success: %d/%d streams up; failed: %s",
+                len(self._streams), len(self._stream_cfgs), bad,
+            )
+            return
+
         logger.info(
             "connected %d streams in %.2fs (stagger=%.2fs)",
             len(self._streams), self.connect_duration_s, self.spawn_stagger_s,
         )
 
     def disconnect(self) -> None:
-        Gst = self._Gst
-        if Gst is None:
-            return
-        for stream in self._streams.values():
+        for proxy in self._streams.values():
             try:
-                stream.stop(Gst)
+                proxy.disconnect()
             except Exception as exc:
-                logger.warning("[%s] stop failed: %s", stream.cfg.name, exc)
+                logger.warning("[%s] disconnect failed: %s", proxy.cfg.name, exc)
         self._streams.clear()
-        if self._glib_loop is not None and self._glib_loop.is_running():
-            self._glib_loop.quit()
-        if self._glib_thread is not None:
-            self._glib_thread.join(timeout=2.0)
-        self._glib_loop = None
-        self._glib_thread = None
 
     # -- episode control -------------------------------------------------
 
@@ -496,11 +636,8 @@ class PersistentCameraSession:
         with self._lock:
             t0_wall = time.time()
             t0_mono = time.monotonic()
-            for stream in self._streams.values():
-                stream.state = FragmentState.EPISODE
-                stream.current_episode_dir = episode_dir
-            for stream in self._streams.values():
-                stream.force_split()
+            for proxy in self._streams.values():
+                proxy.start_episode(episode_dir)
             handle = EpisodeHandle(
                 idx=idx, directory=episode_dir,
                 t0_wall_s=t0_wall, t0_mono_s=t0_mono,
@@ -510,53 +647,32 @@ class PersistentCameraSession:
     def stop_episode(self, handle: EpisodeHandle) -> EpisodeHandle:
         with self._lock:
             handle.stop_wall_s = time.time()
-            for stream in self._streams.values():
-                stream.state = FragmentState.WARMUP
-                stream.current_episode_dir = None
-            for stream in self._streams.values():
-                stream.force_split()
-        # Wait for async-finalize to actually flush the just-closed EPISODE
-        # fragments to disk. splitmuxsink doesn't expose a finalize-done
-        # signal in the GStreamer 1.20 line, so we sleep a small grace
-        # window. Real fix lands when we add a pad probe for EOS on the
-        # muxer's src pad in PR2.
-        time.sleep(self.finalize_grace_s)
-        # Now snapshot each stream's last EPISODE fragment into the handle.
-        for stream in self._streams.values():
-            if stream.last_episode_fragment is not None:
-                handle.fragments[stream.cfg.name] = stream.last_episode_fragment
-                stream.last_episode_fragment = None
+            for proxy in self._streams.values():
+                proxy.stop_episode()
+        # Each worker runs its own finalize_grace_s sleep before emitting
+        # episode_done; we just have to wait for those events to land.
+        per_worker_timeout = self.finalize_grace_s + 1.5
+        for proxy in self._streams.values():
+            if not proxy.wait_episode_done(per_worker_timeout):
+                logger.warning(
+                    "[%s] episode_done not received within %.1fs",
+                    proxy.cfg.name, per_worker_timeout,
+                )
+        for proxy in self._streams.values():
+            if proxy.last_episode_fragment is not None:
+                handle.fragments[proxy.cfg.name] = proxy.last_episode_fragment
+                proxy.last_episode_fragment = None
         return handle
 
     def discard_episode(self, handle: EpisodeHandle) -> None:
-        # `stop_episode` already closed the EPISODE fragment; just delete
-        # the files it produced.
+        # stop_episode already had each worker close its EPISODE fragment;
+        # all we need to do here is delete the .mkv files on disk.
         for info in handle.fragments.values():
             try:
                 info.path.unlink(missing_ok=True)
                 logger.info("discarded fragment %s", info.path)
             except OSError as exc:
                 logger.warning("failed to unlink %s: %s", info.path, exc)
-        # If discard is called *while still in EPISODE state*, flip back to
-        # WARMUP and split first.
-        with self._lock:
-            need_split = any(
-                s.state == FragmentState.EPISODE for s in self._streams.values()
-            )
-            if need_split:
-                for stream in self._streams.values():
-                    stream.state = FragmentState.WARMUP
-                    stream.current_episode_dir = None
-                    stream.force_split()
-        if need_split:
-            time.sleep(self.finalize_grace_s)
-            for stream in self._streams.values():
-                if stream.last_episode_fragment is not None:
-                    try:
-                        stream.last_episode_fragment.path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    stream.last_episode_fragment = None
 
     # -- maintenance -----------------------------------------------------
 
@@ -591,25 +707,33 @@ class PersistentCameraSession:
         return deleted
 
     def restart_stream(self, sid: int) -> bool:
-        """NULL -> PLAYING the pipeline for one stream.
+        """Kill and respawn the worker for one stream.
 
-        Useful when ``poll_errors()`` flags that stream as failed: drops the
-        Argus session, rebuilds the pipeline (cheap; the elements are already
-        constructed), and brings it back to PLAYING. Returns True on success.
+        Useful when ``poll_errors()`` flags that stream as failed: terminates
+        the child process (which drops its Argus session daemon-side),
+        spawns a fresh worker, and waits for it to reach PLAYING. Returns
+        True on success.
         """
-        Gst = self._Gst
-        if Gst is None or sid not in self._streams:
+        if sid not in self._streams:
             return False
-        stream = self._streams[sid]
+        old = self._streams[sid]
         try:
-            stream.pipeline.set_state(Gst.State.NULL)
-            stream.pipeline.get_state(timeout=Gst.SECOND)
-            ret = stream.pipeline.set_state(Gst.State.PLAYING)
-            ok = ret != Gst.StateChangeReturn.FAILURE
+            old.disconnect(grace_s=1.0)
+        except Exception as exc:
+            logger.warning("restart_stream sid=%s disconnect raised: %s", sid, exc)
+        ctx = self._ctx_factory()
+        new = _StreamProxy(
+            old.cfg, self.warmup_dir, ctx,
+            on_fragment_opened=self._on_fragment_opened_cb,
+        )
+        self._streams[sid] = new
+        try:
+            new.spawn()
+            ok = new.wait_ready(self.ready_timeout_s)
             logger.info("restart_stream sid=%s -> %s", sid, "ok" if ok else "FAIL")
             return ok
         except Exception as exc:
-            logger.warning("restart_stream sid=%s raised: %s", sid, exc)
+            logger.warning("restart_stream sid=%s spawn raised: %s", sid, exc)
             return False
 
     # -- diagnostics -----------------------------------------------------
@@ -618,18 +742,9 @@ class PersistentCameraSession:
         with self._lock:
             errors = list(self._errors)
             self._errors.clear()
+            for proxy in self._streams.values():
+                errors.extend(proxy.drain_errors())
         return errors
-
-    def _record_error(self, err: StreamError) -> None:
-        with self._lock:
-            self._errors.append(err)
-
-    def _on_fragment_opened(self, stream: _Stream, info: FragmentInfo) -> None:
-        if self._on_fragment_opened_cb is not None:
-            try:
-                self._on_fragment_opened_cb(stream, info)
-            except Exception as exc:
-                logger.warning("on_fragment_opened callback failed: %s", exc)
 
     # -- meta helpers ----------------------------------------------------
 

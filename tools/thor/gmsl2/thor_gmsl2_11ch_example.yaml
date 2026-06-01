@@ -49,8 +49,8 @@ sensors:
       # to leave the kernel driver's defaults in place. Do not reuse this
       # driver-unit gain as nvarguscamerasrc gainrange. Argus gain is a
       # separate 0..4 float scale and is disabled by default here.
-      exposure_us: 9999
-      gain: 320
+      exposure_us: 0
+      gain: 0
       argus_gain: 0.0
       replay_warmup_s: 1.0  # preview skips the first second while Argus ISP/AWB color settles; raw MKV frames are kept
       # Hardware encoder configuration -- consumed by nvv4l2h265enc.
@@ -116,6 +116,22 @@ box_collection:
     - box_six_d_force
     - box_touch_left
     - box_touch_right
+
+# When Connect finds nvargus-daemon in a wedged state, the recorder can run
+# `tools/thor/gmsl2/recover_argus.sh` automatically and reconnect once,
+# instead of asking the operator to ssh in and run it by hand. Trigger
+# conditions: connect() raised (every worker dead) OR fewer than
+# `threshold_fraction` of the verified cameras came up. Capped by
+# `max_attempts` (default 1) so a permanently broken rig doesn't loop.
+auto_recover:
+  enabled: true
+  # Path passed as `--sdk` to recover_argus.sh. Defaults to
+  # `hardware_sync.sdk_dir` when unset. Operators with the vendor SDK in a
+  # non-default location override here.
+  sdk_dir: ~/Desktop/SG16A_AGTH_G3Y_A1
+  threshold_fraction: 0.6
+  max_attempts: 1
+  timeout_s: 300
 
 dataset:
   repo_id: local/thor_gmsl2_11ch_v1

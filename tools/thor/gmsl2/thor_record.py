@@ -39,14 +39,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
+import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Allow `python tools/thor/gmsl2/thor_record.py` invocation without PYTHONPATH.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -296,6 +298,104 @@ def _write_episode_meta(
     return meta_path
 
 
+# ----------------------------------------------------------------- auto-recover ---
+#
+# When the operator presses Connect, the recorder may find that nvargus-daemon
+# is in a wedged state from a previous crashed session: some sids time out
+# during PLAYING, retries can't rescue them, and the operator currently has
+# to ssh in and run `tools/thor/gmsl2/recover_argus.sh` by hand. This block
+# wraps that recovery script as a fallback inside Connect.
+
+
+@dataclass
+class AutoRecoverConfig:
+    enabled: bool = True
+    # Path passed as ``--sdk`` to recover_argus.sh. When None, the recorder
+    # falls back to ``cfg.hardware_sync.sdk_dir`` resolved against repo root.
+    sdk_dir: str | None = None
+    # Trigger recover when fewer than ``threshold_fraction`` of the expected
+    # cameras came up — 0.6 means "if 7+ of 11 fall off, recover".
+    threshold_fraction: float = 0.6
+    # Hard cap on the number of recover+retry rounds inside one Connect
+    # call so a permanently broken daemon doesn't trap the operator.
+    max_attempts: int = 1
+    # Wall-clock budget for the recover_argus.sh invocation itself.
+    timeout_s: float = 300.0
+
+
+def _auto_recover_from_yaml(yaml_dict: dict[str, Any] | None) -> AutoRecoverConfig:
+    """Build an AutoRecoverConfig from the optional YAML ``auto_recover`` block."""
+    if not isinstance(yaml_dict, dict):
+        return AutoRecoverConfig()
+    return AutoRecoverConfig(
+        enabled=bool(yaml_dict.get("enabled", True)),
+        sdk_dir=yaml_dict.get("sdk_dir"),
+        threshold_fraction=float(yaml_dict.get("threshold_fraction", 0.6)),
+        max_attempts=int(yaml_dict.get("max_attempts", 1)),
+        timeout_s=float(yaml_dict.get("timeout_s", 300.0)),
+    )
+
+
+def _resolve_recover_sdk_dir(
+    auto_cfg: AutoRecoverConfig,
+    fallback_sdk_dir: str,
+    repo_root: Path,
+) -> Path:
+    """Resolve which directory to pass as ``--sdk`` to recover_argus.sh.
+
+    Explicit ``auto_cfg.sdk_dir`` wins. Otherwise we reuse the hardware-sync
+    SDK path so deployments don't have to repeat themselves in YAML.
+    """
+    chosen = auto_cfg.sdk_dir or fallback_sdk_dir
+    expanded = Path(os.path.expanduser(chosen))
+    if not expanded.is_absolute():
+        expanded = (repo_root / expanded).resolve()
+    return expanded
+
+
+def _run_recover_argus(
+    repo_root: Path, sdk_dir: Path, *, timeout_s: float = 300.0,
+    _runner: Callable[..., subprocess.CompletedProcess] | None = None,
+) -> tuple[bool, str]:
+    """Run ``tools/thor/gmsl2/recover_argus.sh --sdk <sdk_dir>``.
+
+    Returns ``(ok, tail)`` where ``tail`` is up to 400 chars of stderr/stdout
+    captured from the script — useful for emitting a one-line failure
+    summary to the GUI without flooding the recorder log.
+
+    ``_runner`` is injectable for tests so we don't have to spawn a real
+    subprocess just to verify the rc-handling logic.
+    """
+    script = repo_root / "tools" / "thor" / "gmsl2" / "recover_argus.sh"
+    if not script.is_file():
+        return False, f"recover_argus.sh not found at {script}"
+    cmd = ["bash", str(script), "--sdk", str(sdk_dir)]
+    runner = _runner or subprocess.run
+    try:
+        r = runner(cmd, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return False, f"recover_argus.sh timed out after {timeout_s:.0f}s"
+    except Exception as exc:
+        return False, f"recover_argus.sh raised: {exc}"
+    if r.returncode == 0:
+        return True, ""
+    tail = (r.stderr or r.stdout or "").strip()
+    return False, tail[-400:]
+
+
+def _should_trigger_recovery(
+    active_count: int, expected_count: int, threshold_fraction: float,
+) -> bool:
+    """Decide whether a partial-success outcome is bad enough to recover.
+
+    ``expected_count`` is what passed Argus probe / detect-locked, NOT 11.
+    ``active_count`` is ``len(pcs.active_sids)`` after connect() returned.
+    """
+    if expected_count <= 0:
+        return False
+    return active_count < expected_count * threshold_fraction
+
+
 def _stream_configs(usable: list[int], cfg: gr.RecorderConfig) -> list[ps.StreamConfig]:
     """Translate RecorderConfig + sids -> per-stream PersistentCameraSession config."""
     return [
@@ -334,6 +434,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="trust the MAX96726 lock list verbatim")
     ap.add_argument("--no-box", action="store_true",
                     help="ignore the YAML box_collection block (camera-only)")
+    ap.add_argument("--no-auto-recover", action="store_true",
+                    help="disable the automatic recover_argus.sh round triggered "
+                         "by a wedged nvargus-daemon (default: enabled)")
     args = ap.parse_args(argv)
 
     logging.basicConfig(
@@ -348,6 +451,9 @@ def main(argv: list[str] | None = None) -> int:
         import yaml
         raw_yaml = yaml.safe_load(f) or {}
     box_cfg = bc.from_yaml_dict(raw_yaml.get("box_collection") if not args.no_box else None)
+    auto_cfg = _auto_recover_from_yaml(raw_yaml.get("auto_recover"))
+    if args.no_auto_recover:
+        auto_cfg.enabled = False
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     cfg.dataset_root = cfg.dataset_root.parent / f"{cfg.dataset_root.name}_{stamp}"
@@ -418,14 +524,99 @@ def main(argv: list[str] | None = None) -> int:
     # pipelines once here, then slice on demand inside the loop. This
     # replaces the per-episode `gr.EpisodeSession(...)` model that paid
     # ~stagger * N seconds of warmup before every StartEpisode.
-    pcs = ps.PersistentCameraSession(
-        _stream_configs(usable, cfg),
-        warmup_dir,
-        spawn_stagger_s=cfg.spawn_stagger_s,
-    )
-    _emit(f"Connecting: spawning {len(usable)} persistent pipelines...")
-    pcs.connect()
-    _emit(f"Connected {len(usable)} pipelines in {pcs.connect_duration_s:.1f}s")
+    def _make_pcs() -> ps.PersistentCameraSession:
+        return ps.PersistentCameraSession(
+            _stream_configs(usable, cfg),
+            warmup_dir,
+            spawn_stagger_s=cfg.spawn_stagger_s,
+        )
+
+    def _attempt_connect() -> tuple[ps.PersistentCameraSession | None, str]:
+        new_pcs = _make_pcs()
+        _emit(f"Connecting: spawning {len(usable)} persistent pipelines...")
+        try:
+            new_pcs.connect()
+            return new_pcs, ""
+        except RuntimeError as exc:
+            try:
+                new_pcs.disconnect()
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "pcs.disconnect after connect failure: %s", cleanup_exc,
+                )
+            return None, str(exc)
+
+    pcs, attempt_error = _attempt_connect()
+    expected = len(usable)
+    recover_attempts = 0
+
+    while True:
+        # Decide whether the current outcome warrants an auto-recover round.
+        recover_reason: str | None = None
+        if pcs is None:
+            recover_reason = f"connect raised: {attempt_error}"
+        else:
+            active = len(pcs.active_sids)
+            if _should_trigger_recovery(active, expected, auto_cfg.threshold_fraction):
+                recover_reason = (
+                    f"only {active}/{expected} cameras up "
+                    f"(threshold {int(auto_cfg.threshold_fraction * 100)}%)"
+                )
+        if (recover_reason is None
+                or not auto_cfg.enabled
+                or recover_attempts >= auto_cfg.max_attempts):
+            break
+
+        # Tear down whatever partial session we have so recover_argus.sh
+        # doesn't see lingering workers holding Argus sockets.
+        if pcs is not None:
+            try:
+                pcs.disconnect()
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "pcs.disconnect before auto-recover: %s", cleanup_exc,
+                )
+            pcs = None
+
+        sdk_dir = _resolve_recover_sdk_dir(
+            auto_cfg, cfg.hardware_sync.sdk_dir, repo_root,
+        )
+        _emit(f"Auto-recover: {recover_reason}; running recover_argus.sh "
+              f"(sdk={sdk_dir})")
+        ok, tail = _run_recover_argus(
+            repo_root, sdk_dir, timeout_s=auto_cfg.timeout_s,
+        )
+        recover_attempts += 1
+        if not ok:
+            _emit(f"Auto-recover failed: {tail or 'see recorder log'}")
+            break
+        _emit("Auto-recover OK; retrying connect")
+        pcs, attempt_error = _attempt_connect()
+
+    if pcs is None:
+        _emit(f"ERROR: persistent pipeline connect failed: {attempt_error}")
+        if box_started:
+            try:
+                box.stop()
+            except Exception as cleanup_exc:
+                logger.warning("box.stop after connect failure: %s", cleanup_exc)
+        return 1
+
+    # Partial-failure path: connect() returns success even when some workers
+    # fell off, leaving their errors in pcs.poll_errors(). Surface those to
+    # the operator and re-emit the active camera list so the GUI's status
+    # reflects what is actually recording.
+    connect_errors = pcs.poll_errors()
+    if connect_errors:
+        bad = ", ".join(
+            f"{e.name}({(e.message or '')[:60]})" for e in connect_errors
+        )
+        _emit(f"WARNING: {len(connect_errors)} stream(s) failed: {bad}")
+        active_camera_ids = [
+            f"{cfg.name_prefix}_{sid:02d}" for sid in pcs.active_sids
+        ]
+        _emit(f"Cameras (active): {', '.join(active_camera_ids)}")
+    _emit(f"Connected {len(pcs.active_sids)} pipelines in {pcs.connect_duration_s:.1f}s")
 
     lr3_writer: lr3.Lr3Writer | None = None
     if box_cfg.enabled:

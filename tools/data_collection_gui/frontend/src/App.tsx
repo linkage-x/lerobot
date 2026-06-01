@@ -124,13 +124,50 @@ function CameraEncodingInfo({ config }: { config: ConfigSummary }) {
   );
 }
 
+function RecorderLogStream({ lines }: { lines: string[] }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  // Stop auto-scrolling once the user has manually scrolled up; resume once
+  // they scroll back to within the bottom threshold.
+  const stickToBottomRef = useRef(true);
+
+  const handleScroll = () => {
+    const el = containerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom < 24;
+  };
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (el && stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [lines]);
+
+  if (lines.length === 0) return null;
+  return (
+    <div
+      className="process-output-log"
+      ref={containerRef}
+      onScroll={handleScroll}
+      role="log"
+      aria-live="polite"
+    >
+      {lines.map((line, i) => (
+        <div className="process-output-line" key={`${i}-${line}`}>{line}</div>
+      ))}
+    </div>
+  );
+}
+
 function RecordingPanel({
   status,
   config,
   busy,
   onConnect,
   onStart,
-  onStop
+  onStop,
+  logLines
 }: {
   status: RecordingStatus;
   config: ConfigSummary;
@@ -138,6 +175,7 @@ function RecordingPanel({
   onConnect: () => void;
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
+  logLines?: string[];
 }) {
   const progress = Math.round((status.frameIndex / Math.max(status.targetFrames, 1)) * 100);
   const isConnected = status.pid != null || ["connecting", "armed", "recording", "review", "saving", "discarding"].includes(status.state);
@@ -183,7 +221,11 @@ function RecordingPanel({
         <Metric label="PID" value={status.pid ?? "none"} />
       </div>
       <p className="panel-note">{status.message}</p>
-      {status.lastOutput ? <p className="process-output">{status.lastOutput}</p> : null}
+      {logLines && logLines.length > 0
+        ? <RecorderLogStream lines={logLines} />
+        : status.lastOutput
+          ? <p className="process-output">{status.lastOutput}</p>
+          : null}
     </section>
   );
 }
@@ -497,6 +539,12 @@ function LiveRecordPage({
   onRunCalibration: () => void;
 }) {
   const showSavedBanner = snapshot.recording.savedEpisodes > 0;
+  // The backend keeps a per-session ring buffer (RecordingStatus.recentOutput)
+  // and clears it when the operator clicks Connect, so we can render it
+  // directly. The pre-PR6 approach of accumulating `lastOutput` lost any
+  // line that didn't land at the top of a snapshot poll window.
+  const logLines = snapshot.recording.recentOutput ?? [];
+
   return (
     <div className="page-stack">
       <PageHeader
@@ -506,7 +554,7 @@ function LiveRecordPage({
           : "capture raw multi-camera handheld data; post-processing lives on the Processing page"}
       />
       <div className="split-layout">
-        <RecordingPanel status={snapshot.recording} config={snapshot.configSummary} busy={busy} onConnect={onConnect} onStart={onStart} onStop={onStop} />
+        <RecordingPanel status={snapshot.recording} config={snapshot.configSummary} busy={busy} onConnect={onConnect} onStart={onStart} onStop={onStop} logLines={logLines} />
         <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />
       </div>
       <CalibrationPanel status={snapshot.calibration} busy={busy} onRun={onRunCalibration} />

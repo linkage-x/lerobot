@@ -220,6 +220,30 @@ button.danger {
   padding: 8px;
 }
 
+.process-output-log {
+  background: #f5f7f8;
+  border: 1px solid #dfe5e9;
+  border-radius: 6px;
+  color: #43525e;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 10px 0 0;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  scrollbar-gutter: stable;
+}
+
+.process-output-line {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.process-output-line + .process-output-line {
+  margin-top: 2px;
+}
+
 .topbar-status {
   display: flex;
   flex-wrap: wrap;

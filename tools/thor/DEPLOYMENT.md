@@ -301,6 +301,296 @@ bash run/sync_to_thor.sh --dry-run  # 预览同步内容
   `\n` 丢掉。**修复（2026-05-28）**：drain 看到队首不是接受的 kind
   时立即 return None，不消费队列。
 
+### 已修复（2026-05-29）
+
+* **PR2 持久 pipeline 在 11 路 + hardware_sync 下挂死（"全绿假阳性 + 空 episode 目录"）**：
+  - **表现**：Connect 后 11 路 camera 状态全绿；StartEpisode 进度条照走、
+    `episodes/episode_NNNNNN/` 目录已创建；但目录下没有 `cam_*.mkv`。
+    日志里能看到 `bus EOS` 被静默 + `set_state(PLAYING)` 卡死整个 Python 线程
+    （后续 `cam_NN PLAYING (+x.xs)` log 直接断流）。错误冒泡是
+    `NvArgusCameraSrc: UNAVAILABLE/TIMEOUT/CANCELLED` 满天飞 + 末尾
+    `(Argus) Error 0x00000005 ... ClientSocketManager.cpp send()`。
+  - **根因（PR2，`6cfa9236`）**：旧 `EpisodeSession` 每个 episode 启动 11
+    个独立 `gst-launch` 子进程，nvargus-daemon 看到的是 11 个独立 RPC client
+    （11 条独立 socket）；PR2 切到 `PersistentCameraSession` 后变成**1 个
+    Python 进程持 11 个 `Argus::CaptureSession` 共用一条 socket**，daemon
+    对"单 client 同时持 N sessions"的恢复路径不稳定，且 pipeline 长期 PLAYING
+    意味着错误状态长期不重置。PR2 的 burn-in 只在 2 cams + `--skip-hardware-sync`
+    下验证（commit message 有写），没覆盖 11 cams + PWM slave 的生产负载。
+  - **修复（2026-05-29）**：每路相机一个子进程，恢复 daemon-client 隔离性
+    （详见下"PR3 多进程隔离"段）。
+* **bus EOS 被静默吞**：`persistent_session._Stream._on_bus_message` 仅对
+  EOS 打 INFO，不当作 stream error，导致 start_episode() 在上游已死的
+  pipeline 上 happily emit split-now → `format-location-full` 永远不回调 →
+  episode dir 创建但永远没有 mkv。**修复**：EOS 走 `_record_error`，
+  并在 connect() 末尾 `poll_errors()` 一次，任何累积错误立刻 raise
+  `RuntimeError` 给 thor_record，前端看到一行清楚的 `ERROR: persistent
+  pipeline connect failed: …` 而非"卡 30s 后没消息"。
+* **`set_state(PLAYING)` 不响应任何 timeout**：nvarguscamerasrc 在 Argus
+  死锁状态下，`pipeline.set_state(Gst.State.PLAYING)` 返回 `ASYNC` 后内部
+  线程被 Argus library 锁住，整个 Python 线程跟着挂。**修复**：start
+  路径在 `set_state(PLAYING)` 后立刻 `get_state(timeout=6s)` 真等 PLAYING
+  到位；超时即 raise，错误带 sid 与 "Argus daemon likely needs
+  recover_argus.sh" 提示。多进程化后这条 timeout 被继承到 worker 内部，
+  即便 worker 整个挂死，父进程的 `wait_ready` 仍能限时退出。
+* **probe_argus 在 connect 路径里再压一遍 daemon**：旧模型下 probe 完进程
+  退出，子进程后续再上来时 Argus 已清理；PR2 后变成 probe → 立刻并发 11 路
+  PLAYING，daemon 同一会话上压力翻倍，导致 recover 末尾 11/11 都过的
+  sid 在 thor_record 自己的 probe 里又会 timeout。**修复**：gateway
+  spawn thor_record（任何 `thor_record` 的脚本路径）时自动追加
+  `--skip-argus-probe`，相机健康检查全部交给 `recover_argus.sh` 那一轮。
+
+#### PR3 多进程隔离（本次重点）
+
+| 维度 | PR2（5/28~5/29 早） | PR3（5/29 本次） |
+| --- | --- | --- |
+| 进程数 | 1 个 Python | 1 个父 Python + N 个 worker |
+| nvargus-daemon 看到的 RPC client 数 | 1 | N |
+| set_state(PLAYING) 死锁影响范围 | 全部相机 | 仅该 worker |
+| connect 失败诊断 | "假绿、空 episode" 不可见 | 单路 raise 带 sid + 原因 |
+| burn-in 覆盖 | 2 cams + skip-hw-sync | 11 cams + PWM slave 待外场验证 |
+
+实现：
+- 新增 `tools/thor/gmsl2/persistent_session_worker.py`：子进程入口，
+  持一条 `nvarguscamerasrc → ... → splitmuxsink` pipeline + 自己的 GLib
+  MainLoop + bus watch + `format-location-full` 回调。
+- 父子两条 `multiprocessing.Queue` 通信：
+  - `cmd_q`（父→子）：`start_episode(episode_dir)` / `stop_episode` / `disconnect`
+  - `evt_q`（子→父）：`playing` / `fragment(dict)` / `error(msg,debug)` /
+    `eos` / `episode_done(dict|None)` / `disconnected`
+- `PersistentCameraSession` 公共 API（`connect/disconnect/start_episode/
+  stop_episode/discard_episode/poll_errors/cleanup_warmup_files/
+  restart_stream`）和 `EpisodeHandle/FragmentInfo` 都不变，`thor_record.py`
+  一行不动。
+- `connect()` 改成**严格串行 spawn**：每 spawn 一个 worker，调
+  `wait_ready(timeout)` 阻塞到 `playing` 事件或任何 terminal error，再 sleep
+  `spawn_stagger_s` 让 daemon settle，然后 spawn 下一个。N 路 PLAYING 不再
+  并发，daemon 一次只面对一个新 client。
+- `restart_stream(sid)` 现在是"terminate 老 worker → spawn 新 worker → 等
+  PLAYING"，对应 daemon 视角的"踢掉一个 client + 接受一个新 client"，预期
+  在错误恢复路径上比旧的 NULL→PLAYING 更可靠。
+- `_apply_event_to_proxy` 是 module-level 自由函数，整个事件分发协议
+  在不依赖 `gi.repository` / 真子进程的情况下可单测。
+
+测试：
+- `tests/scripts/test_thor_persistent_session.py` 17/17（旧契约不破）
+- `tests/scripts/test_thor_persistent_session_multiprocess.py` 23/23（新）
+  覆盖事件分发全 6 种事件、`wait_ready` 三个分支、connect raise 与
+  cleanup、poll_errors 聚合、stop_episode 收 fragments、隔离性
+  （一路 error 不阻塞另一路 ready）
+- 总 40/40 通过；测试纯 Python，dev host 无 gi 也能跑
+
+外场验证步骤：
+1. `~/lerobot/tools/thor/gmsl2/recover_argus.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1`
+2. 重启 gateway 让代码生效
+3. 前端 Connect → 期待 11 路 PLAYING 后 emit `Connected 11 pipelines …`；
+   若有路失败，前端会拿到 `ERROR: persistent pipeline connect failed:
+   [cam_NN] (具体原因)`，可按 sid recover 或单测重启该 worker
+
+#### PR3 后续：connect 速度优化 + partial-failure 容忍
+
+PR3 首版串行 spawn × wait_ready 让 Connect 总时间从 PR2 的 ~11s 拉长到
+外场实测 ~55s（11 路 × ~5s/路）。原因是 Phase 1 严格串行：每路 worker
+spawn → 等 PLAYING → stagger → 下一路 spawn。
+
+调整为**滚动 spawn**：
+
+* **Phase 1 — rolling spawn**：按 `spawn_stagger_s` 节奏依次 `proxy.spawn()`，
+  但**不**等 PLAYING。每个 worker 一被父 spawn 出来就自己跑 Argus open；
+  daemon 看到的仍是按 stagger 节奏到达的独立 client，过载保护不变。
+* **Phase 2 — serial wait_ready**：父进程随后串行调 `wait_ready`，
+  早 spawn 的 worker 这时往往已经 PLAYING，`ready_evt` 已经 set，
+  `wait_ready` 立即返回。只有真正的 straggler 在这阶段阻塞。
+* 总时长降到 ≈ N × stagger + max(单路 Argus open)。在 stagger=1s
+  的设置下，11 路从 ~55s 压到外场预估 ~12–18s。
+
+同时把 connect 改成**容忍 partial failure**：
+
+* 单路 worker fail 不再立即 `raise`；失败的 sid 立即 disconnect 且从
+  `_streams` 移除，剩余 sid 继续录制。
+* 错误留在 `session.poll_errors()` 里。`thor_record.py` 在 connect 之后
+  立刻 poll 一次，把 `WARNING: N stream(s) failed: cam_XX(...)` emit 给
+  gateway，并再 emit 一行 `Cameras (active): cam_02, cam_04, ...` 让
+  GUI 的相机列表跟实际录制路一致。
+* 只有当**所有**路都失败时 `connect()` 才 raise（用 `failed on all N
+  stream(s)` 措辞），thor_record 才走 ERROR + exit(1) 路径。
+* 公共 API 新增 `pcs.active_sids` 只读 property。
+
+测试矩阵：
+
+* `tests/scripts/test_thor_persistent_session_multiprocess.py`
+  - `test_connect_partial_failure_keeps_successful_proxies`（一路 error）
+  - `test_connect_partial_failure_handles_timeout`（一路 timeout）
+  - `test_connect_raises_when_all_proxies_fail`（全 fail 才 raise）
+  - `test_active_sids_starts_empty`
+  - `test_rolling_spawn_calls_spawn_for_all_streams_before_first_wait_ready`
+    （验证 Phase 1 全部 spawn 完成才进 Phase 2）
+* 合计 43/43 通过（17 旧 + 26 新）。
+
+#### PR4：connect 末尾自动 restart 失败 sid
+
+外场观察 11 路 lock + connect 仍只有 4/11 路落盘 mkv 的情况下，调查指向
+两类失败：(1) 部分 sid 在第一次 worker spawn 时撞上 daemon 短暂 race，
+recover_argus.sh 的"daemon restart + per-sid retry"模式总能救回；
+(2) 极少数 sid 是 sensor lock 真挂或 PWM 触发错位，重启也救不回。
+
+PR4 在 `connect()` 末尾加 **Phase 3 retry 一轮**：
+
+* `poll_errors()` 拿到第一轮失败的 sid 列表。
+* 对每个失败 sid 调一次 `restart_stream(sid)`：terminate 老 worker
+  （daemon 端那条 socket 关闭、对应的 CaptureSession 被回收）→ spawn
+  新 worker → `wait_ready`。这是 PR3 已经实现的 API，仅在这里被调用。
+* 再 `poll_errors()`：survived 的 sid 错误清掉；仍 fail 的 sid 才计入
+  partial-failure 分支，最终从 `_streams` 移除并出现在 `WARNING:` 行。
+* **每路最多 1 次 retry**：永久故障的相机不会让 connect 陷入循环。
+
+测试：
+
+* `test_connect_retry_rescues_flaky_sid`：第一次 fail 第二次 OK 的 sid
+  最终在 `active_sids` 里，`poll_errors()` 不返回它的错误。
+* `test_connect_retry_drops_sid_that_keeps_failing`：双 fail 的 sid 被
+  正确 drop，错误留在 poll_errors。
+* `test_connect_retry_does_not_retry_more_than_once_per_sid`：断言总
+  spawn 调用次数 = 2（原始 + 1 retry），不能更多。
+* 合计 46/46（17 旧 + 29 新）。
+
+#### PR4.1：retry 并行化（连续外场实测后）
+
+外场 11 路 lock + 7 路第一轮 fail 的实况显示，PR4 的**串行**
+restart_stream 把 Phase 3 撑到 ~25-30s，整次 Connect ~44s，不及预期。
+
+时间归因（实测 08:58:46 那次）：
+```
+Phase 1 滚动 spawn (11 路)  ~10s   ✅
+Phase 2 wait_ready          ~7s    ✅
+Phase 3 串行 retry (7 路)   ~26s   🚧 瓶颈
+合计                        ~44s
+```
+
+并行 retry 是直接修复：每个 worker 是独立子进程、独立 RPC socket，
+N 路并发 terminate+respawn 在 nvargus-daemon 视角就是 N 个独立 client
+断线+重连，daemon 的内部 serialization 是 per-socket 的，不会跨 socket
+塞死。这正是 PR3 多进程隔离的设计目标。
+
+实现：用 `concurrent.futures.ThreadPoolExecutor(max_workers=N)` 并行
+对每个 fail sid 调 `restart_stream`：
+
+```python
+with ThreadPoolExecutor(max_workers=len(live_retry_sids),
+                        thread_name_prefix="pcs-retry") as ex:
+    list(ex.map(self.restart_stream, live_retry_sids))
+```
+
+线程安全性：`restart_stream` 内部对 `self._streams[sid]` 的写是
+不同 sid → 写不同 dict key（CPython GIL atomic）；`mp.get_context` /
+`mp.Process` / `mp.Queue` 都是 thread-safe；不需要额外加锁。
+
+测试：
+
+* `test_connect_retries_run_in_parallel_not_serially`：5 路同时 retry，
+  每路 retry 后延迟 200ms 才推 `playing`；串行 lower bound = 5 × 200ms
+  = 1.0s，断言实测 elapsed < 0.6 × lower_bound，强制证明 retry 是并行。
+* `test_parallel_retry_drops_only_truly_dead_sids`：4 路同时 retry，
+  even sid 成功 / odd sid 永久 fail，验证并发条件下不会"成功 sid 被
+  错误判 fail"或"fail sid 错误留在 active"。
+* 合计 48/48（17 旧 + 31 新）。
+
+预期：
+* Phase 3 从 26s 压到 max(单路 retry) ≈ 5s
+* 总 Connect 时间 ~17-22s，接近 ~15s 目标
+* 成功率与 PR4 相同（7/11 → 接近 9-11/11，hard fail 路仍 hard fail）
+
+#### PR5：Connect 时自动 recover_argus.sh
+
+外场使用模式：每次开机/上次崩溃后，操作员要先 ssh 到 thor 跑
+`tools/thor/gmsl2/recover_argus.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1`
+让 nvargus-daemon 进入干净状态，再回到前端点 Connect。PR3 + PR4 +
+PR4.1 把 daemon 恢复"健康初始状态后"的稳定性做到位了，但**没有解决
+"daemon 当前就不健康"** 这件事 — 操作员仍要手工干预。
+
+PR5 把这一步集成进 Connect 路径：
+
+- thor_record.py 在 `PersistentCameraSession.connect()` 之后判断：
+  * 抛出 `RuntimeError`（全 fail）→ 触发
+  * `len(pcs.active_sids) < threshold_fraction × verified_count` → 触发
+    （默认 60%，即 11 路里 < 7 路成功就 recover）
+- 触发时：把当前 `pcs` 整个 `disconnect()` 释放掉所有 Argus session
+  → `subprocess.run("bash recover_argus.sh --sdk <path>")` → 重建一个新
+  pcs 重新 connect 一次。
+- `max_attempts` 默认 1：永久故障的硬件不会让 connect 陷入循环。
+- 失败路径：recover 自身 fail 或 retry 后仍 fail，emit 清晰的 `ERROR:`
+  到前端并 `return 1`，操作员仍能手工 ssh 上去诊断。
+
+YAML 新增可选块（`thor_gmsl2_11ch_example.yaml`）：
+
+```yaml
+auto_recover:
+  enabled: true
+  sdk_dir: ~/Desktop/SG16A_AGTH_G3Y_A1   # 未设则用 hardware_sync.sdk_dir
+  threshold_fraction: 0.6
+  max_attempts: 1
+  timeout_s: 300
+```
+
+命令行 `--no-auto-recover` 关掉。
+
+前端可见的新 emit 行：
+
+* `Auto-recover: only K/N cameras up (threshold 60%); running recover_argus.sh (sdk=...)`
+* `Auto-recover OK; retrying connect` 或 `Auto-recover failed: <tail>`
+* （成功路径继续原有 `Connected K pipelines in X.Xs`）
+
+测试：
+
+* `tests/scripts/test_thor_record_auto_recover.py` 共 18 个测试覆盖：
+  - `_auto_recover_from_yaml`：None / 空 dict / 完整覆写 / 非 dict 防御
+  - `_resolve_recover_sdk_dir`：explicit 优先 / hardware_sync fallback /
+    `~` 展开 / 相对路径解析
+  - `_should_trigger_recovery`：< / = / > 阈值，零 expected 防御，
+    零 active 触发
+  - `_run_recover_argus`：脚本缺失、rc=0、rc≠0、timeout、未预期异常、
+    tail 截断 400 字符
+* 测试不真起 subprocess（runner 通过依赖注入 mock）
+* 合计 66/66 通过（17 旧 + 31 multiprocess 新 + 18 auto-recover 新）
+
+外场预期：
+- 操作员只需点 Connect；recover_argus.sh 不再需要手工执行
+- 健康 daemon 下零开销（不触发 recover）
+- 不健康 daemon 下 connect 总时间 ≈ 第一次 connect (~22s) + recover.sh
+  (~30-40s) + 第二次 connect (~15-22s) ≈ 80s 上下，但**操作员不用动手**
+- 永久硬件故障（线松、PWM 不通）仍走原有 ERROR + exit 路径，便于诊断
+
+#### PR6：前端日志丢失修复（recorder log ring buffer）
+
+外场观察：connect 阶段后端 log 应该有 30+ 行
+（spawned×11 + PLAYING/failed×11 + retry decision + restart_stream×N），
+但前端 Live Record 面板里只看到 4-5 行，让操作员误以为程序卡死。
+
+根因：gateway `_apply_recorder_output(state, line)` 把每行**覆盖式**
+写入 `state.recording.lastOutput`。前端每秒拉一次 snapshot，只拿到
+当前那一行 — 中间 N-1 行被悄无声息丢掉。前端旧版"useState 累积
+lastOutput"逻辑无法补救：它只能累积自己看见的，看不见的累积不到。
+
+PR6 改成**服务端 ring buffer**：
+
+* `RecordingStatus.recentOutput: list[str]` 字段，cap 300 行（足够覆盖
+  最差 connect 周期：11 路 × 6 events/路 + recover round + retry round）。
+* `_apply_recorder_output` 每收到一行就 append 到 ring buffer，超过
+  cap 时原地裁剪（`del recentOutput[:len-cap]`，O(1) 摊销）。
+* `_connect_recorder` 在新建 recorder process 时清空 `recentOutput` 和
+  `lastOutput`，避免上次 crash 的尾巴混进新 session。
+* 前端 `RecordingStatus.recentOutput?: string[]`；`LiveRecordPage` 直接
+  `const logLines = snapshot.recording.recentOutput ?? []` 渲染。
+  旧的"useState/useRef/useEffect 累积 lastOutput"逻辑整段删掉。
+* `RecorderLogStream`（auto-scroll-to-bottom + 用户上滚时不打断）保留。
+
+效果：以后从 thor stderr 写出的每一行都会出现在前端 log 框里，操作员
+能直接看到 Phase 1/2/3 / Auto-recover 的全部决策行，"看不到等于挂了"
+的误判消失。
+
+代码量：gateway.py +14 行 / +字段；types.ts +5 行；App.tsx 净 -27 行
+（删掉了脆弱的客户端累积逻辑）。
+
 ### 仍存在
 
 * **BOX 采集板传感器流上行**：供应商确认夹爪端固定只向

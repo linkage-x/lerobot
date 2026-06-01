@@ -39,6 +39,9 @@ class EventLogItem:
     message: str
 
 
+_RECORDER_OUTPUT_RING_CAP = 300
+
+
 @dataclass
 class RecordingStatus:
     state: str = "idle"
@@ -52,6 +55,12 @@ class RecordingStatus:
     message: str = "Gateway ready"
     pid: int | None = None
     lastOutput: str = ""
+    # Ring buffer of recent recorder stdout lines. Bounded to
+    # _RECORDER_OUTPUT_RING_CAP entries so the frontend's polling snapshot
+    # can show every line the recorder emitted between polls, instead of
+    # only the most recent one (which is what lastOutput captures and is
+    # what was losing 9+ lines per Connect cycle).
+    recentOutput: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -2682,6 +2691,14 @@ def _connect_recorder(state: GatewayState) -> None:
         str(recorder_script),
         f"{config_flag}={state.config_path}",
     ]
+    # Thor GMSL2 recorder: skip its own nvarguscamerasrc probe pass.
+    # Operators run tools/thor/gmsl2/recover_argus.sh before Connect, which
+    # already opens each sensor once through Argus; re-probing here adds an
+    # extra 11x open/close cycle that has been observed to destabilise
+    # nvargus-daemon (sids that recover saw as OK time out 8s later, then
+    # the first PLAYING transition deadlocks the Python thread).
+    if "thor_record" in str(recorder_script):
+        command.append("--skip-argus-probe")
     state.process = subprocess.Popen(
         command,
         cwd=state.repo_root,
@@ -2698,6 +2715,10 @@ def _connect_recorder(state: GatewayState) -> None:
     state.recording.frameIndex = 0
     state.recording.queueDepth = 0
     state.recording.message = "Connecting handheld devices"
+    # Drop the previous session's log lines so the frontend doesn't show
+    # stale output from a prior crashed recorder mixed in with the new one.
+    state.recording.lastOutput = ""
+    state.recording.recentOutput = []
     _set_all_device_states(state, "warning")
     state.log("info", f"Started handheld recorder pid={state.process.pid}")
     _start_output_reader(state, state.process)
@@ -2993,6 +3014,16 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         return
     state.recording.lastOutput = output
     state.recording.message = output
+    # Append to the ring buffer so the frontend can render every line the
+    # recorder wrote between two snapshot polls. Without this, all the
+    # rapid bursts (Phase 1 spawn × 11, Phase 2 wait_ready × 11, parallel
+    # retry × N, Auto-recover decision) collapse to whatever line happened
+    # to land last in the poll window.
+    state.recording.recentOutput.append(output)
+    if len(state.recording.recentOutput) > _RECORDER_OUTPUT_RING_CAP:
+        del state.recording.recentOutput[
+            : len(state.recording.recentOutput) - _RECORDER_OUTPUT_RING_CAP
+        ]
     state.log("info", f"recorder: {output}")
 
     failed_camera_match = re.search(r"Camera '([^']+)' failed to connect", output)

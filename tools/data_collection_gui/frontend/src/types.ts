@@ -75,6 +75,11 @@ export type RecordingStatus = {
   message: string;
   pid?: number | null;
   lastOutput?: string;
+  // Backend-side ring buffer of recent recorder stdout lines. Bounded at
+  // the gateway (default 300). The frontend renders these directly so
+  // rapid bursts (Phase 1 spawn × 11, parallel retry, etc.) don't get
+  // collapsed into the last line that happened to land at poll time.
+  recentOutput?: string[];
 };
 
 export type ReplayStatus = {
