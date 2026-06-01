@@ -24,3 +24,7 @@ docker/hik-sdk/**/*.deb filter=lfs diff=lfs merge=lfs -text
 docker/hik-sdk/**/*.dll filter=lfs diff=lfs merge=lfs -text
 docker/hik-sdk/**/*.jar filter=lfs diff=lfs merge=lfs -text
 docker/hik-sdk/**/*.qm filter=lfs diff=lfs merge=lfs -text
+tools/thor/gmsl2/sdk/dtb/*.dtbo filter=lfs diff=lfs merge=lfs -text
+tools/thor/box_sdk/lib/*.so* filter=lfs diff=lfs merge=lfs -text
+tools/thor/box_sdk/python/*.whl filter=lfs diff=lfs merge=lfs -text
+tools/thor/gmsl2/sdk/ko/*.ko filter=lfs diff=lfs merge=lfs -text

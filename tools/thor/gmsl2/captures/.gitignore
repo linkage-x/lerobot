@@ -1,0 +1,5 @@
+# Test artifacts captured during bring-up. Kept out of git.
+*.png
+*.raw
+*.log
+*.txt

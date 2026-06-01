@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pose3DViewer } from "./Pose3DViewer";
 import { SeriesPlot } from "./SeriesPlot";
 import type { DataCollectionGuiApi } from "./api";
-import type { CubeVideoOverlay, EePose, ReplayTimeline, ReplayTimelineFrame } from "./types";
+import type { CubeVideoOverlay, EePose, ReplayTimeline, ReplayTimelineFrame, TouchPadFrame } from "./types";
 
 const cubeColors: Record<string, number> = {
   left: 0xc2410c,
@@ -20,6 +20,107 @@ const cubeEdges: Array<[number, number]> = [
 function shortCameraName(key: string): string {
   return key.replace(/^observation\.images\./, "");
 }
+
+const TOUCH_ROW_LENGTHS = [13, 13, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 13, 13];
+const TOUCH_COLUMNS = 17;
+
+function interpolateChannel(a: number, b: number, t: number): number {
+  return Math.round(a + (b - a) * t);
+}
+
+function touchColor(value: number, scaleMax: number): string {
+  const stops = [
+    [17, 24, 39],
+    [37, 99, 235],
+    [20, 184, 166],
+    [250, 204, 21],
+    [239, 68, 68]
+  ];
+  const normalized = Math.max(0, Math.min(1, value / Math.max(scaleMax, 1)));
+  const scaled = normalized * (stops.length - 1);
+  const index = Math.min(Math.floor(scaled), stops.length - 2);
+  const t = scaled - index;
+  const a = stops[index];
+  const b = stops[index + 1];
+  return `rgb(${interpolateChannel(a[0], b[0], t)}, ${interpolateChannel(a[1], b[1], t)}, ${interpolateChannel(a[2], b[2], t)})`;
+}
+
+function touchScaleMax(timeline: ReplayTimeline | null): number {
+  let maxValue = 1;
+  for (const entry of timeline?.frames ?? []) {
+    for (const sample of [entry.touch?.left, entry.touch?.right]) {
+      for (const value of sample?.fz ?? []) {
+        if (Number.isFinite(value)) {
+          maxValue = Math.max(maxValue, Math.abs(value));
+        }
+      }
+    }
+  }
+  return maxValue;
+}
+
+function TouchHeatmap({
+  title,
+  sample,
+  scaleMax
+}: {
+  title: string;
+  sample?: TouchPadFrame;
+  scaleMax: number;
+}) {
+  const values = sample?.fz ?? [];
+  const hasData = values.length >= 239;
+  let cursor = 0;
+  const localMax = hasData ? Math.max(...values.map((value) => Math.abs(value))) : 0;
+  const activePoints = sample?.activePoints ?? values.filter((value) => Math.abs(value) > 0).length;
+
+  return (
+    <div className="touch-map">
+      <div className="touch-map-heading">
+        <strong>{title}</strong>
+        <span>max {localMax.toFixed(1)} · active {activePoints}</span>
+      </div>
+      {hasData ? (
+        <div className="touch-grid" aria-label={title}>
+          {TOUCH_ROW_LENGTHS.map((length, rowIndex) => {
+            const offset = Math.floor((TOUCH_COLUMNS - length) / 2);
+            const row = values.slice(cursor, cursor + length);
+            const startIndex = cursor;
+            cursor += length;
+            return (
+              <div className="touch-row" key={rowIndex}>
+                {Array.from({ length: offset }).map((_, index) => (
+                  <span className="touch-cell touch-cell-empty" key={`pre-${index}`} />
+                ))}
+                {row.map((value, index) => {
+                  const pointIndex = startIndex + index + 1;
+                  return (
+                    <span
+                      className="touch-cell"
+                      key={pointIndex}
+                      title={`#${pointIndex} fz=${value.toFixed(1)} (0.1N)`}
+                      style={{ backgroundColor: touchColor(Math.abs(value), scaleMax) }}
+                    />
+                  );
+                })}
+                {Array.from({ length: TOUCH_COLUMNS - length - offset }).map((_, index) => (
+                  <span className="touch-cell touch-cell-empty" key={`post-${index}`} />
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="touch-empty">no touch sample</div>
+      )}
+      <div className="touch-map-footer">
+        <span>ts {sample?.timestamp ?? "—"}</span>
+        <span>t {sample?.tRelS == null ? "—" : `${sample.tRelS.toFixed(3)}s`}</span>
+      </div>
+    </div>
+  );
+}
+
 
 function ensureFullPose(pose: ReplayTimelineFrame["eePose"]): EePose | null {
   if (!pose) {
@@ -135,6 +236,11 @@ export function ReplayInspector({
   const [currentFrame, setCurrentFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
+  // Frame counts read from loaded video metadata, keyed per camera. A single
+  // corrupt remux cache can report a tiny duration (e.g. 56 frames); using
+  // the maximum across cameras keeps that one bad stream from truncating the
+  // whole episode timeline.
+  const [videoFrameCounts, setVideoFrameCounts] = useState<Record<string, number>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -147,6 +253,7 @@ export function ReplayInspector({
     setCurrentFrame(0);
     setPlaying(false);
     setTimeline(null);
+    setVideoFrameCounts({});
     api
       .fetchReplayTimeline(datasetPath, episode)
       .then((result) => {
@@ -174,36 +281,84 @@ export function ReplayInspector({
   }, [api, datasetPath, episode]);
 
   const fps = timeline?.fps ?? fallbackFps;
-  const totalFrames = timeline?.totalFrames ?? 0;
+  const backendTotalFrames = timeline?.totalFrames ?? 0;
+  // Effective playable frame count: keep the backend timeline as the primary
+  // source, but allow a consistent shorter video duration to trim it. Taking
+  // the max across cameras avoids one truncated MP4 cache shrinking every
+  // plot and slider to its bogus duration.
+  const videoFrameCountValues = Object.values(videoFrameCounts);
+  const plausibleVideoFrameCounts = backendTotalFrames > 0
+    ? videoFrameCountValues.filter((frames) => frames >= backendTotalFrames * 0.5)
+    : videoFrameCountValues;
+  const maxVideoFrameCount = plausibleVideoFrameCounts.length > 0 ? Math.max(...plausibleVideoFrameCounts) : null;
+  const totalFrames = maxVideoFrameCount != null
+    ? Math.min(backendTotalFrames || maxVideoFrameCount, maxVideoFrameCount)
+    : backendTotalFrames;
+  const videoWarmupS = Math.max(0, timeline?.videoWarmupS ?? 0);
+
+  const handleVideoMetadataLoaded = useCallback(
+    (key: string, event: React.SyntheticEvent<HTMLVideoElement>) => {
+      const target = event.currentTarget;
+      const dur = target.duration;
+      if (!Number.isFinite(dur) || dur <= 0) return;
+      const frames = Math.max(1, Math.round(dur * Math.max(fps, 1)));
+      setVideoFrameCounts((prev) => (prev[key] === frames ? prev : { ...prev, [key]: frames }));
+    },
+    [fps],
+  );
 
   useEffect(() => {
     if (!playing || totalFrames === 0) {
       return;
     }
-    const intervalMs = 1000 / Math.max(fps, 1);
-    const timer = window.setInterval(() => {
-      setCurrentFrame((value) => {
-        const next = value + 1;
-        if (next >= totalFrames) {
+    // Drive currentFrame from the first available <video>'s wall-clock
+    // currentTime, not setInterval. setInterval(1000/fps) drifts in
+    // browsers (16.67ms ticks get throttled to ~20ms under GPU/tab load),
+    // so the timeline used to lag behind the video and the operator saw
+    // the video finish ~1s before the slider reached the end.
+    // requestAnimationFrame fires at display refresh and reads the same
+    // wall-clock the video element uses, so the two stay locked.
+    let rafId = 0;
+    const tick = () => {
+      const videos = Object.values(videoRefs.current).filter((v): v is HTMLVideoElement => v != null);
+      const liveVideos = videos.filter((v) => !v.ended && Number.isFinite(v.currentTime));
+      const candidates = liveVideos.length > 0 ? liveVideos : videos.filter((v) => Number.isFinite(v.currentTime));
+      const master = candidates.reduce<HTMLVideoElement | null>(
+        (best, video) => (best == null || video.currentTime > best.currentTime ? video : best),
+        null,
+      );
+      if (master && Number.isFinite(master.currentTime)) {
+        const t = Math.max(0, master.currentTime - videoWarmupS);
+        const frame = Math.min(totalFrames - 1, Math.max(0, Math.round(t * fps)));
+        setCurrentFrame(frame);
+        const allEnded = videos.length > 0 && videos.every((video) => video.ended);
+        if (frame >= totalFrames - 1 || allEnded) {
           setPlaying(false);
-          return totalFrames - 1;
+          return;
         }
-        return next;
-      });
-    }, intervalMs);
-    return () => window.clearInterval(timer);
-  }, [playing, fps, totalFrames]);
+      }
+      rafId = window.requestAnimationFrame(tick);
+    };
+    rafId = window.requestAnimationFrame(tick);
+    return () => {
+      if (rafId) {
+        window.cancelAnimationFrame(rafId);
+      }
+    };
+  }, [playing, fps, totalFrames, videoWarmupS]);
 
   useEffect(() => {
     if (!timeline) {
       return;
     }
-    const t = (timeline.frames[currentFrame]?.timestamp ?? currentFrame / Math.max(fps, 1));
+    const t = (timeline.frames?.[currentFrame]?.timestamp ?? currentFrame / Math.max(fps, 1));
     Object.values(videoRefs.current).forEach((video) => {
       if (!video) {
         return;
       }
-      const clamped = Math.max(0, Math.min(t, (video.duration || t)));
+      const target = t + videoWarmupS;
+      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : Number.POSITIVE_INFINITY;
+      const clamped = Math.max(0, Math.min(target, duration));
       if (!playing && Math.abs(video.currentTime - clamped) > 0.05) {
         try {
           video.currentTime = clamped;
@@ -212,7 +367,7 @@ export function ReplayInspector({
         }
       }
     });
-  }, [timeline, currentFrame, fps, playing]);
+  }, [timeline, currentFrame, fps, playing, videoWarmupS]);
 
   useEffect(() => {
     Object.values(videoRefs.current).forEach((video) => {
@@ -229,8 +384,13 @@ export function ReplayInspector({
     });
   }, [playing]);
 
-  const frame: ReplayTimelineFrame | undefined = timeline?.frames[currentFrame];
+  // Backend may legitimately omit `frames` on error responses (pyarrow
+  // missing, episode out of range, etc). Don't dereference frames[idx]
+  // without a `?.` guard or this component crashes before the totalFrames
+  // early-return below has a chance to render the placeholder panel.
+  const frame: ReplayTimelineFrame | undefined = timeline?.frames?.[currentFrame];
   const pose = ensureFullPose(frame?.eePose);
+  const touchMax = useMemo(() => touchScaleMax(timeline), [timeline]);
   const cubePoseNames = useMemo(() => {
     if (!timeline) {
       return [] as string[];
@@ -246,10 +406,11 @@ export function ReplayInspector({
     );
   }, [timeline]);
   const trajectory = useMemo(() => {
-    if (!timeline) {
+    const frames = timeline?.frames;
+    if (!frames || frames.length === 0) {
       return [] as Array<[number, number, number]>;
     }
-    return timeline.frames
+    return frames
       .map((entry) => entry.eePose)
       .filter((entry): entry is EePose => !!entry && entry.x != null && entry.y != null && entry.z != null)
       .map((entry) => [entry.x as number, entry.y as number, entry.z as number] as [number, number, number]);
@@ -276,11 +437,11 @@ export function ReplayInspector({
   }, [cubePoseNames, frame]);
 
   const pickState = useCallback(
-    (frameIndex: number, dim: number) => timeline?.frames[frameIndex]?.state[dim] ?? Number.NaN,
+    (frameIndex: number, dim: number) => timeline?.frames?.[frameIndex]?.state?.[dim] ?? Number.NaN,
     [timeline]
   );
   const pickAction = useCallback(
-    (frameIndex: number, dim: number) => timeline?.frames[frameIndex]?.action[dim] ?? Number.NaN,
+    (frameIndex: number, dim: number) => timeline?.frames?.[frameIndex]?.action?.[dim] ?? Number.NaN,
     [timeline]
   );
   const cubeSeriesNames = useMemo(() => {
@@ -319,14 +480,18 @@ export function ReplayInspector({
     );
   }
 
-  if (!timeline || timeline.totalFrames === 0) {
+  if (!timeline || timeline.totalFrames === 0 || !timeline.frames || timeline.frames.length === 0) {
+    const note =
+      error ??
+      timeline?.error ??
+      "No replay data available for this dataset.";
     return (
       <section className="panel inspector-panel">
         <div className="panel-heading">
           <h2>Replay Inspector</h2>
           <span>no data</span>
         </div>
-        <p className="panel-note">{error ?? "No replay data available for this dataset."}</p>
+        <p className="panel-note">{note}</p>
       </section>
     );
   }
@@ -368,13 +533,35 @@ export function ReplayInspector({
               src={api.videoUrl(timeline.datasetRoot, key)}
               muted
               playsInline
-              preload="auto"
+              // metadata: fetch the mkv header + first frame so the
+              // tile renders immediately, but skip downloading the full
+              // file until the user clicks Play. preload=auto here used
+              // to queue 11 full mkvs at once on Connect, hitting the
+              // browser's 6-per-origin HTTP/1.1 cap; cams 7-11 would
+              // load slowly or only after a manual refresh.
+              preload="metadata"
+              onLoadedMetadata={(event) => handleVideoMetadataLoaded(key, event)}
             />
             <CubeOverlayCanvas overlays={frame?.videoOverlays?.[key] ?? []} video={videoRefs.current[key]} />
             <span>{shortCameraName(key)}</span>
           </div>
         ))}
       </div>
+      <section className="panel touch-panel">
+        <div className="panel-heading">
+          <h2>Paxini touch</h2>
+          <span>fz pseudo color · 239 points</span>
+        </div>
+        <div className="touch-heatmaps">
+          <TouchHeatmap title="Left sensor" sample={frame?.touch?.left} scaleMax={touchMax} />
+          <TouchHeatmap title="Right sensor" sample={frame?.touch?.right} scaleMax={touchMax} />
+        </div>
+        <div className="touch-legend" aria-hidden="true">
+          <span>0</span>
+          <div />
+          <span>{touchMax.toFixed(1)}</span>
+        </div>
+      </section>
       <section className="panel pose-panel">
         <div className="panel-heading">
           <h2>End-effector pose</h2>
