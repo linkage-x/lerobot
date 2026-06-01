@@ -78,7 +78,7 @@ def test_default_config_is_thor_gmsl2_box():
     assert "handheld_gripper" not in devices_by_kind
 
 
-def test_gmsl2_timeline_applies_replay_warmup(tmp_path):
+def test_gmsl2_timeline_ignores_replay_warmup_for_splitmux_episode(tmp_path):
     dataset_root = tmp_path / "gmsl2"
     ep_dir = dataset_root / "episodes" / "episode_000000"
     ep_dir.mkdir(parents=True)
@@ -93,10 +93,87 @@ def test_gmsl2_timeline_applies_replay_warmup(tmp_path):
 
     timeline = gateway._read_gmsl2_timeline(dataset_root, episode=0)
 
-    assert timeline["videoWarmupS"] == 1.5
-    assert timeline["totalFrames"] == 510
+    assert timeline["videoWarmupS"] == 0.0
+    assert timeline["totalFrames"] == 600
     assert timeline["cameraKeys"] == ["cam_00"]
     assert timeline["frames"][0]["timestamp"] == 0
+
+
+def test_lerobot_v3_gmsl2_timeline_ignores_replay_warmup(tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    ep_dir = dataset_root / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    (ep_dir / "cam_00.mkv").write_bytes(b"0" * 2048)
+    (ep_dir / "meta.json").write_text(
+        json.dumps({
+            "duration_s": 10.0,
+            "video": {"fps": 30, "replay_warmup_s": 1.0},
+        }),
+        encoding="utf-8",
+    )
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root.parent,
+    )
+
+    timeline = gateway._read_dataset_timeline(state, dataset_root, episode=0)
+
+    assert timeline["videoWarmupS"] == 0.0
+    assert timeline["totalFrames"] == 2
+    assert timeline["cameraKeys"] == ["cam_00"]
+    assert [frame["timestamp"] for frame in timeline["frames"]] == [0.0, 1 / 30.0]
+
+
+def test_cached_mp4_rejects_short_duration(tmp_path, monkeypatch):
+    mkv = tmp_path / "cam_00.mkv"
+    mp4 = tmp_path / "cam_00.mp4"
+    mkv.write_bytes(b"m" * 100_000)
+    mp4.write_bytes(b"p" * 80_000)
+    newer = mkv.stat().st_mtime + 1
+    import os
+    os.utime(mp4, (newer, newer))
+    monkeypatch.setattr(gateway, "_probe_video_duration_s", lambda _path: 0.93)
+
+    assert gateway._cached_mp4_is_usable(mp4, mkv, expected_duration_s=10.0) is False
+
+
+def test_remux_writes_tmp_then_replaces_mp4(tmp_path, monkeypatch):
+    mkv = tmp_path / "cam_00.mkv"
+    mp4 = tmp_path / "cam_00.mp4"
+    mkv.write_bytes(b"m" * 100_000)
+    mp4.write_bytes(b"bad-cache")
+    calls: list[Path] = []
+
+    def fake_cache_ok(candidate: Path, _mkv: Path, _expected: float | None = None) -> bool:
+        calls.append(candidate)
+        return candidate.name.startswith(".cam_00.") and candidate.suffix == ".mp4" and candidate.exists()
+
+    class FakeResult:
+        returncode = 0
+
+    def fake_run(cmd, **_kwargs):
+        location_args = [part for part in cmd if isinstance(part, str) and part.startswith("location=")]
+        output = Path(location_args[-1].split("=", 1)[1])
+        assert output.name.startswith(".cam_00.")
+        output.write_bytes(b"good-remux")
+        return FakeResult()
+
+    monkeypatch.setattr(gateway, "_cached_mp4_is_usable", fake_cache_ok)
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+
+    result = gateway._remux_mkv_to_mp4(mkv, expected_duration_s=10.0)
+
+    assert result == mp4
+    assert mp4.read_bytes() == b"good-remux"
+    assert any(path == mp4 for path in calls)
+    assert any(path.name.startswith(".cam_00.") for path in calls)
+    assert not list(tmp_path.glob("*.tmp.mp4"))
 
 
 def test_gmsl2_timeline_includes_touch_heatmap_samples(tmp_path):
@@ -133,7 +210,7 @@ def test_gmsl2_timeline_includes_touch_heatmap_samples(tmp_path):
 
     timeline = gateway._read_gmsl2_timeline(dataset_root, episode=0)
 
-    touch = timeline["frames"][0]["touch"]
+    touch = timeline["frames"][1]["touch"]
     assert touch["left"]["timestamp"] == 101
     assert touch["left"]["fz"][0] == 7.0
     assert touch["left"]["activePoints"] == 1

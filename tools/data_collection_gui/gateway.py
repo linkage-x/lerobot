@@ -9,6 +9,7 @@ import math
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -2289,15 +2290,10 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         episode = 0
 
     video_warmup_s = 0.0
-    if _has_gmsl2_episodes(dataset_root):
-        ep_dir = dataset_root / "episodes" / f"episode_{int(episode or 0):06d}"
-        meta_path = ep_dir / "meta.json"
-        if meta_path.is_file():
-            try:
-                with meta_path.open() as f:
-                    video_warmup_s = _gmsl2_replay_warmup_s(json.load(f))
-            except (OSError, json.JSONDecodeError):
-                video_warmup_s = 0.0
+    # GMSL2 splitmux episode files are already cut at the playable fragment
+    # boundary. The legacy replay_warmup_s field should not be applied to
+    # LeRobot v3 timelines; doing so maps a 10s/603-frame episode to only
+    # about 9s/540 displayed frames.
 
     rows = table.to_pylist()
     rows.sort(key=lambda row: int(row.get("frame_index") or 0))
@@ -2346,10 +2342,66 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
     }
 
 
-def _remux_mkv_to_mp4(mkv_path: Path) -> Path | None:
+def _probe_video_duration_s(video_path: Path, *, timeout_s: float = 5.0) -> float | None:
+    if shutil.which("ffprobe") is None:
+        return None
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        duration = float(result.stdout.strip())
+    except (TypeError, ValueError):
+        return None
+    return duration if math.isfinite(duration) and duration > 0 else None
+
+
+def _cached_mp4_is_usable(mp4_path: Path, mkv_path: Path, expected_duration_s: float | None = None) -> bool:
+    try:
+        mp4_stat = mp4_path.stat()
+        mkv_stat = mkv_path.stat()
+    except OSError:
+        return False
+    if mp4_stat.st_size <= 4096 or mp4_stat.st_mtime < mkv_stat.st_mtime:
+        return False
+
+    if expected_duration_s is not None and expected_duration_s > 0:
+        duration_s = _probe_video_duration_s(mp4_path)
+        if duration_s is not None:
+            min_duration_s = max(0.5, min(expected_duration_s * 0.75, expected_duration_s - 0.5))
+            return duration_s >= min_duration_s
+        # If ffprobe is unavailable, reject obviously truncated cache files.
+        if mkv_stat.st_size > 0 and mp4_stat.st_size < mkv_stat.st_size * 0.12:
+            return False
+
+    return True
+
+
+def _remux_mkv_to_mp4(mkv_path: Path, expected_duration_s: float | None = None) -> Path | None:
     mp4_path = mkv_path.with_suffix(".mp4")
-    if mp4_path.is_file() and mp4_path.stat().st_mtime >= mkv_path.stat().st_mtime:
+    if mp4_path.is_file() and _cached_mp4_is_usable(mp4_path, mkv_path, expected_duration_s):
         return mp4_path
+    if mp4_path.exists():
+        try:
+            mp4_path.unlink()
+        except OSError:
+            return None
+
+    tmp_path = mp4_path.with_name(f".{mp4_path.stem}.{os.getpid()}.tmp.mp4")
+    if tmp_path.exists():
+        try:
+            tmp_path.unlink()
+        except OSError:
+            return None
+
     cmd = [
         "gst-launch-1.0", "-q",
         "filesrc", f"location={mkv_path}",
@@ -2360,13 +2412,31 @@ def _remux_mkv_to_mp4(mkv_path: Path) -> Path | None:
         "iframeinterval=60", "idrinterval=60", "insert-sps-pps=1", "insert-vui=1",
         "!", "h264parse", "config-interval=-1",
         "!", "mp4mux", "faststart=true",
-        "!", "filesink", f"location={mp4_path}",
+        "!", "filesink", f"location={tmp_path}",
     ]
     try:
-        subprocess.run(cmd, capture_output=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, timeout=60, check=False)
     except (subprocess.TimeoutExpired, OSError):
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
         return None
-    return mp4_path if mp4_path.is_file() else None
+    if result.returncode != 0 or not _cached_mp4_is_usable(tmp_path, mkv_path, expected_duration_s):
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return None
+    try:
+        tmp_path.replace(mp4_path)
+    except OSError:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return None
+    return mp4_path
 
 
 def _resolve_video_path(state: GatewayState, dataset_root: Path, camera_key: str) -> Path | None:
@@ -2376,7 +2446,15 @@ def _resolve_video_path(state: GatewayState, dataset_root: Path, camera_key: str
         mkv = ep_dir / f"{camera_key}.mkv"
         if not mkv.is_file():
             return None
-        return _remux_mkv_to_mp4(mkv) or mkv
+        expected_duration_s = None
+        meta_path = ep_dir / "meta.json"
+        if meta_path.is_file():
+            try:
+                with meta_path.open() as f:
+                    expected_duration_s = _first_finite(json.load(f).get("duration_s"), default=0.0)
+            except (OSError, json.JSONDecodeError):
+                expected_duration_s = None
+        return _remux_mkv_to_mp4(mkv, expected_duration_s=expected_duration_s) or mkv
     info = _load_dataset_info(dataset_root)
     template = str(info.get("video_path") or "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
     relative = template.format(video_key=camera_key, chunk_index=0, file_index=0)

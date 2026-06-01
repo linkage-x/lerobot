@@ -146,13 +146,11 @@ export function ReplayInspector({
   const [currentFrame, setCurrentFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
-  // Real frame count read out of the master video element on
-  // loadedmetadata. When non-null, this overrides timeline.totalFrames
-  // because the mkv container is the ground truth — if the recorder
-  // wrote fewer frames than meta.json's wall-clock duration_s implied
-  // (e.g. splitmuxsink waited an IDR boundary to cut), the slider
-  // would otherwise stop short of its max while the video has ended.
-  const [videoFrameCount, setVideoFrameCount] = useState<number | null>(null);
+  // Frame counts read from loaded video metadata, keyed per camera. A single
+  // corrupt remux cache can report a tiny duration (e.g. 56 frames); using
+  // the maximum across cameras keeps that one bad stream from truncating the
+  // whole episode timeline.
+  const [videoFrameCounts, setVideoFrameCounts] = useState<Record<string, number>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -165,7 +163,7 @@ export function ReplayInspector({
     setCurrentFrame(0);
     setPlaying(false);
     setTimeline(null);
-    setVideoFrameCount(null);
+    setVideoFrameCounts({});
     api
       .fetchReplayTimeline(datasetPath, episode)
       .then((result) => {
@@ -194,23 +192,27 @@ export function ReplayInspector({
 
   const fps = timeline?.fps ?? fallbackFps;
   const backendTotalFrames = timeline?.totalFrames ?? 0;
-  // Effective playable frame count: take the min of what the backend
-  // reports (wall-clock duration_s * fps) and what the master video
-  // element actually decoded (video.duration * fps). Video wins when it
-  // is shorter — that's how the slider stays in sync with the picture
-  // even if the recorder lost frames at the tail.
-  const totalFrames = videoFrameCount != null
-    ? Math.min(backendTotalFrames || videoFrameCount, videoFrameCount)
+  // Effective playable frame count: keep the backend timeline as the primary
+  // source, but allow a consistent shorter video duration to trim it. Taking
+  // the max across cameras avoids one truncated MP4 cache shrinking every
+  // plot and slider to its bogus duration.
+  const videoFrameCountValues = Object.values(videoFrameCounts);
+  const plausibleVideoFrameCounts = backendTotalFrames > 0
+    ? videoFrameCountValues.filter((frames) => frames >= backendTotalFrames * 0.5)
+    : videoFrameCountValues;
+  const maxVideoFrameCount = plausibleVideoFrameCounts.length > 0 ? Math.max(...plausibleVideoFrameCounts) : null;
+  const totalFrames = maxVideoFrameCount != null
+    ? Math.min(backendTotalFrames || maxVideoFrameCount, maxVideoFrameCount)
     : backendTotalFrames;
   const videoWarmupS = Math.max(0, timeline?.videoWarmupS ?? 0);
 
-  const handleMasterMetadataLoaded = useCallback(
-    (event: React.SyntheticEvent<HTMLVideoElement>) => {
+  const handleVideoMetadataLoaded = useCallback(
+    (key: string, event: React.SyntheticEvent<HTMLVideoElement>) => {
       const target = event.currentTarget;
       const dur = target.duration;
       if (!Number.isFinite(dur) || dur <= 0) return;
       const frames = Math.max(1, Math.round(dur * Math.max(fps, 1)));
-      setVideoFrameCount((prev) => (prev === frames ? prev : frames));
+      setVideoFrameCounts((prev) => (prev[key] === frames ? prev : { ...prev, [key]: frames }));
     },
     [fps],
   );
@@ -228,12 +230,19 @@ export function ReplayInspector({
     // wall-clock the video element uses, so the two stay locked.
     let rafId = 0;
     const tick = () => {
-      const master = Object.values(videoRefs.current).find((v) => v != null) ?? null;
+      const videos = Object.values(videoRefs.current).filter((v): v is HTMLVideoElement => v != null);
+      const liveVideos = videos.filter((v) => !v.ended && Number.isFinite(v.currentTime));
+      const candidates = liveVideos.length > 0 ? liveVideos : videos.filter((v) => Number.isFinite(v.currentTime));
+      const master = candidates.reduce<HTMLVideoElement | null>(
+        (best, video) => (best == null || video.currentTime > best.currentTime ? video : best),
+        null,
+      );
       if (master && Number.isFinite(master.currentTime)) {
         const t = Math.max(0, master.currentTime - videoWarmupS);
         const frame = Math.min(totalFrames - 1, Math.max(0, Math.round(t * fps)));
         setCurrentFrame(frame);
-        if (master.ended || frame >= totalFrames - 1) {
+        const allEnded = videos.length > 0 && videos.every((video) => video.ended);
+        if (frame >= totalFrames - 1 || allEnded) {
           setPlaying(false);
           return;
         }
@@ -379,7 +388,7 @@ export function ReplayInspector({
         </div>
       </div>
       <div className="camera-grid">
-        {timeline.cameraKeys.map((key, idx) => (
+        {timeline.cameraKeys.map((key) => (
           <div className="camera-tile" key={key}>
             <video
               ref={(element) => {
@@ -395,7 +404,7 @@ export function ReplayInspector({
               // browser's 6-per-origin HTTP/1.1 cap; cams 7-11 would
               // load slowly or only after a manual refresh.
               preload="metadata"
-              onLoadedMetadata={idx === 0 ? handleMasterMetadataLoaded : undefined}
+              onLoadedMetadata={(event) => handleVideoMetadataLoaded(key, event)}
             />
             <span>{shortCameraName(key)}</span>
           </div>
