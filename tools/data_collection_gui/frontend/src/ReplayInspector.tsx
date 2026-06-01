@@ -192,19 +192,34 @@ export function ReplayInspector({
     if (!playing || totalFrames === 0) {
       return;
     }
-    const intervalMs = 1000 / Math.max(fps, 1);
-    const timer = window.setInterval(() => {
-      setCurrentFrame((value) => {
-        const next = value + 1;
-        if (next >= totalFrames) {
+    // Drive currentFrame from the first available <video>'s wall-clock
+    // currentTime, not setInterval. setInterval(1000/fps) drifts in
+    // browsers (16.67ms ticks get throttled to ~20ms under GPU/tab load),
+    // so the timeline used to lag behind the video and the operator saw
+    // the video finish ~1s before the slider reached the end.
+    // requestAnimationFrame fires at display refresh and reads the same
+    // wall-clock the video element uses, so the two stay locked.
+    let rafId = 0;
+    const tick = () => {
+      const master = Object.values(videoRefs.current).find((v) => v != null) ?? null;
+      if (master && Number.isFinite(master.currentTime)) {
+        const t = Math.max(0, master.currentTime - videoWarmupS);
+        const frame = Math.min(totalFrames - 1, Math.max(0, Math.round(t * fps)));
+        setCurrentFrame(frame);
+        if (master.ended || frame >= totalFrames - 1) {
           setPlaying(false);
-          return totalFrames - 1;
+          return;
         }
-        return next;
-      });
-    }, intervalMs);
-    return () => window.clearInterval(timer);
-  }, [playing, fps, totalFrames]);
+      }
+      rafId = window.requestAnimationFrame(tick);
+    };
+    rafId = window.requestAnimationFrame(tick);
+    return () => {
+      if (rafId) {
+        window.cancelAnimationFrame(rafId);
+      }
+    };
+  }, [playing, fps, totalFrames, videoWarmupS]);
 
   useEffect(() => {
     if (!timeline) {

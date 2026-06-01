@@ -510,11 +510,18 @@ def main(argv: list[str] | None = None) -> int:
         # Wait for the rate-estimation window (2s) to fill so we can report
         # real per-sensor frequencies instead of the poll rate.
         time.sleep(2.5)
-        present = box.connected_devices()
-        _emit(f"Box devices: {', '.join(present) if present else '(none)'}")
+        # Use observed_rates() (real UDP arrivals) as the source of truth for
+        # "Box devices:" instead of connected_devices() (SDK's static
+        # registry). connected_devices() reports whatever was registered at
+        # init time and stays the same even when the BOX MCU is unplugged,
+        # which let the gateway keep BOX entries green after a physical
+        # disconnect. With this change, unplugging BOX -> rates all 0 ->
+        # emit "Box devices: (none)" -> gateway flips all box rows to red.
         rates = box.observed_rates()
-        if any(rates.values()):
-            parts = [f"{sid}={hz:.0f}" for sid, hz in rates.items() if hz > 0]
+        live_sids = sorted(sid for sid, hz in rates.items() if hz > 0)
+        _emit(f"Box devices: {', '.join(live_sids) if live_sids else '(none)'}")
+        if live_sids:
+            parts = [f"{sid}={rates[sid]:.0f}" for sid in live_sids]
             _emit(f"Box rates: {', '.join(parts)}")
     elif box_cfg.enabled:
         _emit("Box devices: (none)")
