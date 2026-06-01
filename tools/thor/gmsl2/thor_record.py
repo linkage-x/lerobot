@@ -79,6 +79,19 @@ def _emit(text: str) -> None:
     print(text, flush=True)
 
 
+def _emit_box_live(box: bc.BoxClient, *, last_emit_s: float, min_interval_s: float = 0.1) -> float:
+    now = time.monotonic()
+    if now - last_emit_s < min_interval_s:
+        return last_emit_s
+    try:
+        snap = box.read()
+    except Exception as exc:  # noqa: BLE001 - preview must never break recording
+        logger.debug("box live read failed: %s", exc)
+        return now
+    _emit("BOX_LIVE " + json.dumps(snap, separators=(",", ":")))
+    return now
+
+
 def _read_stdin_loop(queue: list[StdinCommand], stop: threading.Event) -> None:
     while not stop.is_set():
         line = sys.stdin.readline()
@@ -99,8 +112,12 @@ def _read_stdin_loop(queue: list[StdinCommand], stop: threading.Event) -> None:
             logger.warning("ignoring unrecognized stdin command: %r", line)
 
 
-def _wait_for_command(queue: list[StdinCommand], stop: threading.Event,
-                      accept: tuple[str, ...]) -> StdinCommand:
+def _wait_for_command(
+    queue: list[StdinCommand],
+    stop: threading.Event,
+    accept: tuple[str, ...],
+    on_wait: Callable[[], None] | None = None,
+) -> StdinCommand:
     """Block until the operator queues one of the accepted commands."""
     while not stop.is_set():
         if queue:
@@ -109,6 +126,8 @@ def _wait_for_command(queue: list[StdinCommand], stop: threading.Event,
                 return cmd
             logger.info("ignoring %s while waiting for %s", cmd.kind, accept)
         else:
+            if on_wait is not None:
+                on_wait()
             time.sleep(0.05)
     return StdinCommand(kind="quit", raw="")
 
@@ -661,9 +680,18 @@ def main(argv: list[str] | None = None) -> int:
     _emit(f"Episode {ep_idx} ready")
 
     rc = 0
+    last_box_live_at = 0.0
+
+    def _tick_idle_preview() -> None:
+        nonlocal last_box_live_at
+        if box_started:
+            last_box_live_at = _emit_box_live(box, last_emit_s=last_box_live_at)
+
     try:
         while not stop_event.is_set():
-            cmd = _wait_for_command(cmd_queue, stop_event, accept=("start", "quit"))
+            cmd = _wait_for_command(
+                cmd_queue, stop_event, accept=("start", "quit"), on_wait=_tick_idle_preview,
+            )
             if cmd.kind == "quit":
                 break
 
@@ -722,6 +750,8 @@ def main(argv: list[str] | None = None) -> int:
                     approx_frames = int(elapsed * cfg.cameras.fps)
                     _emit(f"Recorded {approx_frames} frames for the current episode.")
                     last_progress_at = now
+                if box_started:
+                    last_box_live_at = _emit_box_live(box, last_emit_s=last_box_live_at)
                 if box_started and now - box_sample_at > 0.5:
                     snap = box.read()
                     snap["t_relative_s"] = elapsed

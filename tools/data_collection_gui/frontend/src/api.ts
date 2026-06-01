@@ -7,6 +7,7 @@ import type {
   ConfigSummary,
   DatasetExportStatus,
   DeviceStatus,
+  BoxPreviewPayload,
   EventLogItem,
   GatewayStatus,
   ProcessingItem,
@@ -508,6 +509,26 @@ export class DataCollectionGuiApi {
   videoUrl(datasetPath: string, cameraKey: string): string {
     const params = new URLSearchParams({ path: datasetPath, key: cameraKey });
     return `${this.apiBase}/api/replay/video?${params.toString()}`;
+  }
+
+  cameraPreviewUrl(deviceId: string): string {
+    const params = new URLSearchParams({ key: deviceId });
+    return `${this.apiBase}/api/device-preview/camera.mjpeg?${params.toString()}`;
+  }
+
+  async fetchBoxPreview(deviceId: string): Promise<BoxPreviewPayload | null> {
+    try {
+      const params = new URLSearchParams({ device: deviceId });
+      const response = await fetch(`${this.apiBase}/api/device-preview/box?${params.toString()}`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as BoxPreviewPayload;
+    } catch {
+      return null;
+    }
   }
 
   async fetchReplayTimeline(datasetPath: string, episode?: number): Promise<ReplayTimeline | null> {

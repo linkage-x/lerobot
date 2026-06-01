@@ -13,6 +13,18 @@ export type DeviceStatus = {
   config?: Record<string, unknown>;
 };
 
+export type BoxPreviewPayload = {
+  active: boolean;
+  deviceId: string;
+  updatedAt?: number;
+  staleS?: number | null;
+  receivedAtS?: number | null;
+  receivedWallTimeS?: number | null;
+  sensor?: Record<string, unknown> | null;
+  sensors?: Record<string, Record<string, unknown>>;
+  status?: Record<string, unknown>;
+};
+
 export type GatewayStatus = {
   configPath: string;
   pid: number | null;

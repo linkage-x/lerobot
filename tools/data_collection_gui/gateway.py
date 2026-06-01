@@ -115,6 +115,8 @@ class GatewayState:
     replay_process_kind: str = ""
     process_started_at_s: float | None = None
     replay_started_at_s: float | None = None
+    device_preview: dict[str, Any] = field(default_factory=dict)
+    camera_preview_process: subprocess.Popen[bytes] | None = None
     lock: Lock = field(default_factory=Lock)
 
     def log(self, level: str, message: str) -> None:
@@ -2491,6 +2493,138 @@ def _serve_static_file(handler: BaseHTTPRequestHandler, asset_path: Path, conten
                 return
 
 
+def _stop_camera_preview_process(state: GatewayState) -> None:
+    proc = state.camera_preview_process
+    state.camera_preview_process = None
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def _serve_camera_preview_mjpeg(
+    handler: BaseHTTPRequestHandler,
+    *,
+    state: GatewayState,
+    sensor_id: int,
+    sensor_mode: int,
+    source_width: int,
+    source_height: int,
+    source_fps: int,
+) -> None:
+    if shutil.which("gst-launch-1.0") is None:
+        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "gst-launch-1.0 not found"})
+        return
+    output_width = 480
+    output_height = max(1, round(output_width * source_height / max(source_width, 1)))
+    output_fps = 10
+    caps_in = (
+        "video/x-raw(memory:NVMM),"
+        f"format=NV12,width={source_width},height={source_height},framerate={source_fps}/1"
+    )
+    caps_out = f"video/x-raw,format=I420,width={output_width},height={output_height}"
+    cmd = [
+        "gst-launch-1.0",
+        "-q",
+        "nvarguscamerasrc",
+        f"sensor-id={sensor_id}",
+        f"sensor-mode={sensor_mode}",
+        "do-timestamp=true",
+        "!",
+        caps_in,
+        "!",
+        "nvvidconv",
+        "!",
+        caps_out,
+        "!",
+        "videorate",
+        "!",
+        f"video/x-raw,framerate={output_fps}/1",
+        "!",
+        "jpegenc",
+        "quality=65",
+        "!",
+        "multipartmux",
+        "boundary=frame",
+        "!",
+        "fdsink",
+        "fd=1",
+    ]
+    with state.lock:
+        _stop_camera_preview_process(state)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        cwd=str(Path.cwd()),
+    )
+    with state.lock:
+        state.camera_preview_process = proc
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    try:
+        assert proc.stdout is not None
+        while True:
+            chunk = proc.stdout.read(64 * 1024)
+            if not chunk:
+                break
+            try:
+                handler.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                break
+    finally:
+        with state.lock:
+            if state.camera_preview_process is proc:
+                state.camera_preview_process = None
+        proc.terminate()
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _camera_preview_params(state: GatewayState, device_id: str) -> tuple[int, int, int, int, int] | None:
+    device = next((d for d in state.devices if d.get("id") == device_id and d.get("kind") == "camera"), None)
+    if device is None:
+        return None
+    config = device.get("config") if isinstance(device.get("config"), dict) else {}
+    try:
+        sensor_id = int(config.get("sensor_id", str(device_id).rsplit("_", 1)[-1]))
+    except (TypeError, ValueError):
+        return None
+    sensor_mode = int(config.get("sensor_mode") or 0)
+    width = int(config.get("width") or 1920)
+    height = int(config.get("height") or 1080)
+    fps = int(config.get("fps") or 60)
+    return sensor_id, max(sensor_mode, 0), max(width, 1), max(height, 1), max(fps, 1)
+
+
+def _box_preview_payload(state: GatewayState, device_id: str) -> dict[str, Any]:
+    box = state.device_preview.get("box")
+    if not isinstance(box, dict):
+        box = {}
+    sensors = box.get("sensors") if isinstance(box.get("sensors"), dict) else {}
+    updated_at = float(box.get("updatedAt") or 0.0)
+    stale_s = max(0.0, time.time() - updated_at) if updated_at else None
+    return {
+        "active": bool(box.get("active")) and (stale_s is None or stale_s < 2.0),
+        "deviceId": device_id,
+        "updatedAt": updated_at,
+        "staleS": stale_s,
+        "receivedAtS": box.get("received_at_s"),
+        "receivedWallTimeS": box.get("received_wall_time_s"),
+        "status": box.get("status") if isinstance(box.get("status"), dict) else {},
+        "sensor": sensors.get(device_id) if isinstance(sensors, dict) else None,
+        "sensors": sensors,
+    }
+
+
 def _serve_video(handler: BaseHTTPRequestHandler, video_path: Path) -> None:
     file_size = video_path.stat().st_size
     range_header = handler.headers.get("Range") or handler.headers.get("range")
@@ -2552,6 +2686,8 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         state.recording.pid = None
         state.recording.frameIndex = 0 if process.returncode == 0 else state.recording.frameIndex
         state.recording.queueDepth = 0
+        if isinstance(state.device_preview.get("box"), dict):
+            state.device_preview["box"] = {**state.device_preview["box"], "active": False}
         if state.recording.lastOutput:
             state.recording.message = f"Recorder exited with code {process.returncode}: {state.recording.lastOutput}"
         else:
@@ -3099,6 +3235,15 @@ _RECORDER_NOISE_PREFIXES = ("[TLV_LOG_UPLOAD]", "GST_ARGUS:", "NvMMLite")
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
     if any(output.startswith(p) for p in _RECORDER_NOISE_PREFIXES):
         return
+    if output.startswith("BOX_LIVE "):
+        try:
+            payload = json.loads(output.removeprefix("BOX_LIVE ").strip())
+        except json.JSONDecodeError:
+            state.log("warn", "recorder: malformed BOX_LIVE payload")
+            return
+        if isinstance(payload, dict):
+            state.device_preview["box"] = {**payload, "active": True, "updatedAt": time.time()}
+        return
     state.recording.lastOutput = output
     state.recording.message = output
     # Append to the ring buffer so the frontend can render every line the
@@ -3551,6 +3696,42 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"asset missing: {name}"})
                 return
             _serve_static_file(self, asset_path, "model/stl")
+            return
+        if path == "/api/device-preview/box":
+            device_id = query.get("device", [""])[0]
+            if not device_id:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing device"})
+                return
+            with self.server.state.lock:
+                _json_response(self, HTTPStatus.OK, _box_preview_payload(self.server.state, device_id))
+                return
+        if path == "/api/device-preview/camera.mjpeg":
+            device_id = query.get("key", [""])[0]
+            if not device_id:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing key"})
+                return
+            with self.server.state.lock:
+                if self.server.state.process is not None:
+                    _json_response(
+                        self,
+                        HTTPStatus.CONFLICT,
+                        {"error": "camera preview is idle-only; stop the recorder before previewing"},
+                    )
+                    return
+                params = _camera_preview_params(self.server.state, device_id)
+            if params is None:
+                _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"camera not found: {device_id}"})
+                return
+            sensor_id, sensor_mode, source_width, source_height, source_fps = params
+            _serve_camera_preview_mjpeg(
+                self,
+                state=self.server.state,
+                sensor_id=sensor_id,
+                sensor_mode=sensor_mode,
+                source_width=source_width,
+                source_height=source_height,
+                source_fps=source_fps,
+            )
             return
         if path == "/api/replay/video":
             requested = query.get("path", [""])[0]

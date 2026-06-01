@@ -320,6 +320,29 @@ def test_device_statuses_include_camera_resolution_and_ports():
     assert pika["fps"] == 120
 
 
+def test_box_live_output_updates_preview_without_log_noise(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=Path.cwd(),
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+
+    gateway._apply_recorder_output(
+        state,
+        'BOX_LIVE {"sensors":{"box_touch_left":{"timestamp":7,"fz_0p1N":[1,2,3]},"box_six_d_force":{"fxyz_mxyz":[1,2,3,4,5,6]}},"status":{"queue_size":2},"received_at_s":12.5}',
+    )
+
+    payload = gateway._box_preview_payload(state, "box_touch_left")
+    assert payload["active"] is True
+    assert payload["sensor"]["timestamp"] == 7
+    assert payload["status"]["queue_size"] == 2
+    assert state.recording.lastOutput == ""
+    assert state.recording.recentOutput == []
+    assert state.events == []
+
+
 def test_recorder_output_updates_status_and_event_log(tmp_path):
     state = gateway.GatewayState(
         repo_root=Path.cwd(),

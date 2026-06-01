@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { DataCollectionGuiApi, type GuiSnapshot } from "./api";
 import { ReplayInspector } from "./ReplayInspector";
 import type {
+  BoxPreviewPayload,
   CollectionTask,
   ConfigSummary,
   DeviceStatus,
@@ -1652,13 +1653,216 @@ function TaskLibraryPage({
   );
 }
 
+const DEVICE_TOUCH_ROW_LENGTHS = [13, 13, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 13, 13];
+const DEVICE_TOUCH_COLUMNS = 17;
+
+function interpolatePreviewChannel(a: number, b: number, t: number): number {
+  return Math.round(a + (b - a) * t);
+}
+
+function previewTouchColor(value: number, scaleMax: number): string {
+  const stops = [
+    [17, 24, 39],
+    [37, 99, 235],
+    [20, 184, 166],
+    [250, 204, 21],
+    [239, 68, 68]
+  ];
+  const normalized = Math.max(0, Math.min(1, value / Math.max(scaleMax, 1)));
+  const scaled = normalized * (stops.length - 1);
+  const index = Math.min(Math.floor(scaled), stops.length - 2);
+  const t = scaled - index;
+  const a = stops[index];
+  const b = stops[index + 1];
+  return `rgb(${interpolatePreviewChannel(a[0], b[0], t)}, ${interpolatePreviewChannel(a[1], b[1], t)}, ${interpolatePreviewChannel(a[2], b[2], t)})`;
+}
+
+function numberArray(value: unknown): number[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((item) => Number(item)).filter((item) => Number.isFinite(item));
+}
+
+function numberValue(value: unknown): number | null {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function DeviceTouchPreview({ sensor }: { sensor?: Record<string, unknown> | null }) {
+  const values = numberArray(sensor?.fz_0p1N);
+  const hasData = values.length >= 239;
+  const scaleMax = hasData ? Math.max(1, ...values.map((value) => Math.abs(value))) : 1;
+  const localMax = hasData ? Math.max(...values.map((value) => Math.abs(value))) : 0;
+  const activePoints = values.filter((value) => Math.abs(value) > 0).length;
+  let cursor = 0;
+
+  return (
+    <div className="touch-map device-touch-map">
+      <div className="touch-map-heading">
+        <strong>tactile</strong>
+        <span>max {localMax.toFixed(1)} · active {activePoints}</span>
+      </div>
+      {hasData ? (
+        <div className="touch-grid" aria-label="live tactile preview">
+          {DEVICE_TOUCH_ROW_LENGTHS.map((length, rowIndex) => {
+            const offset = Math.floor((DEVICE_TOUCH_COLUMNS - length) / 2);
+            const row = values.slice(cursor, cursor + length);
+            const startIndex = cursor;
+            cursor += length;
+            return (
+              <div className="touch-row" key={rowIndex}>
+                {Array.from({ length: offset }).map((_, index) => (
+                  <span className="touch-cell touch-cell-empty" key={`pre-${index}`} />
+                ))}
+                {row.map((value, index) => {
+                  const pointIndex = startIndex + index + 1;
+                  return (
+                    <span
+                      className="touch-cell"
+                      key={pointIndex}
+                      title={`#${pointIndex} fz=${value.toFixed(1)} (0.1N)`}
+                      style={{ backgroundColor: previewTouchColor(Math.abs(value), scaleMax) }}
+                    />
+                  );
+                })}
+                {Array.from({ length: DEVICE_TOUCH_COLUMNS - length - offset }).map((_, index) => (
+                  <span className="touch-cell touch-cell-empty" key={`post-${index}`} />
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="touch-empty">no touch sample</div>
+      )}
+      <div className="touch-map-footer">
+        <span>ts {String(sensor?.timestamp ?? "-")}</span>
+        <span>fz 0.1N</span>
+      </div>
+    </div>
+  );
+}
+
+function DeviceForcePreview({ sensor }: { sensor?: Record<string, unknown> | null }) {
+  const values = numberArray(sensor?.fxyz_mxyz);
+  const labels = ["Fx", "Fy", "Fz", "Mx", "My", "Mz"];
+  const maxAbs = Math.max(1, ...values.slice(0, 6).map((value) => Math.abs(value)));
+  if (values.length < 6) {
+    return <div className="preview-empty">no force sample</div>;
+  }
+  return (
+    <div className="force-preview-grid">
+      {labels.map((label, index) => {
+        const value = values[index] ?? 0;
+        return (
+          <div className="force-preview-row" key={label}>
+            <span>{label}</span>
+            <div className="force-preview-track">
+              <i style={{ width: `${Math.min(100, Math.abs(value) / maxAbs * 100)}%` }} />
+            </div>
+            <strong>{value.toFixed(2)}</strong>
+          </div>
+        );
+      })}
+      <small>ts {String(sensor?.timestamp ?? "-")}</small>
+    </div>
+  );
+}
+
+function RawSensorPreview({ sensor }: { sensor?: Record<string, unknown> | null }) {
+  const entries = Object.entries(sensor ?? {}).filter(([, value]) => typeof value !== "object").slice(0, 12);
+  if (entries.length === 0) {
+    return <div className="preview-empty">no live sample</div>;
+  }
+  return (
+    <div className="device-config-detail device-preview-kv">
+      {entries.map(([key, value]) => (
+        <div className="device-config-row" key={key}>
+          <span className="device-config-key">{key}</span>
+          <span className="device-config-value">{String(value)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function BoxLivePreview({ device }: { device: DeviceStatus }) {
+  const [preview, setPreview] = useState<BoxPreviewPayload | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    const load = async () => {
+      const next = await api.fetchBoxPreview(device.id);
+      if (mounted) {
+        setPreview(next);
+      }
+    };
+    load();
+    const timer = window.setInterval(load, 100);
+    return () => {
+      mounted = false;
+      window.clearInterval(timer);
+    };
+  }, [device.id]);
+
+  const sensor = preview?.sensor ?? null;
+  const staleS = preview?.staleS == null ? null : preview.staleS;
+  const isTouch = device.id.startsWith("box_touch") || Array.isArray(sensor?.fz_0p1N);
+  const isForce = device.id === "box_six_d_force" || Array.isArray(sensor?.fxyz_mxyz);
+  const sampleAge = staleS == null ? "-" : `${staleS.toFixed(1)}s`;
+  const queueSize = numberValue(preview?.status?.queue_size);
+
+  return (
+    <div className="device-preview-live">
+      <div className="device-live-stats">
+        <Metric label="Live" value={preview?.active ? "yes" : "no"} />
+        <Metric label="Age" value={sampleAge} />
+        <Metric label="Queue" value={queueSize ?? "-"} />
+      </div>
+      {isTouch ? <DeviceTouchPreview sensor={sensor} /> : isForce ? <DeviceForcePreview sensor={sensor} /> : <RawSensorPreview sensor={sensor} />}
+    </div>
+  );
+}
+
+function DeviceInlinePreview({ device, snapshot }: { device: DeviceStatus; snapshot: GuiSnapshot }) {
+  const cameraIdle = device.kind === "camera" && snapshot.recording.pid == null;
+
+  return (
+    <div className="device-inline-preview">
+      {device.kind === "box_collection" ? (
+        <BoxLivePreview device={device} />
+      ) : device.kind === "camera" ? (
+        cameraIdle ? (
+          <img className="device-camera-preview" src={api.cameraPreviewUrl(device.id)} alt={`${device.id} preview`} />
+        ) : (
+          <div className="preview-empty">camera preview idle-only</div>
+        )
+      ) : (
+        <div className="preview-empty">no preview stream</div>
+      )}
+    </div>
+  );
+}
+
 function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
   const [hideErrors, setHideErrors] = useState(false);
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
 
   const devices = hideErrors
     ? snapshot.devices.filter((d) => d.state !== "error")
     : snapshot.devices;
+  const selectedDevice = devices.find((device) => device.id === selectedId) ?? devices[0] ?? null;
+
+  useEffect(() => {
+    if (devices.length === 0) {
+      setSelectedId(null);
+      return;
+    }
+    if (!selectedId || !devices.some((device) => device.id === selectedId)) {
+      setSelectedId(devices[0].id);
+    }
+  }, [devices, selectedId]);
 
   const grouped = useMemo(() => {
     return devices.reduce<Record<string, typeof devices>>((acc, d) => {
@@ -1705,16 +1909,16 @@ function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
             <span>{items.filter((d) => d.state === "running").length}/{items.length} online</span>
           </div>
           {items.map((device) => {
-            const isExpanded = device.id === expandedId;
+            const isExpanded = device.id === selectedDevice?.id;
             const config = device.config ?? {};
             const configEntries = Object.entries(config).filter(
               ([, v]) => v != null && typeof v !== "object"
             );
             return (
-              <div className="device-manager-row" key={device.id}>
+              <div className={`device-manager-row ${isExpanded ? "device-manager-row-active" : ""}`} key={device.id}>
                 <button
                   className="device-manager-header"
-                  onClick={() => setExpandedId(isExpanded ? null : device.id)}
+                  onClick={() => setSelectedId(device.id)}
                 >
                   <div className="row-title">
                     <StatusDot state={device.state} />
@@ -1724,17 +1928,22 @@ function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
                     <span>{device.fps} fps</span>
                     <span>{device.latencyMs} ms</span>
                     <small>{device.detail}</small>
-                    <small>{isExpanded ? "collapse" : "expand"}</small>
+                    <small>{isExpanded ? "selected" : "select"}</small>
                   </div>
                 </button>
-                {isExpanded && configEntries.length > 0 && (
-                  <div className="device-config-detail">
-                    {configEntries.map(([key, value]) => (
-                      <div className="device-config-row" key={key}>
-                        <span className="device-config-key">{key}</span>
-                        <span className="device-config-value">{String(value)}</span>
+                {isExpanded && (
+                  <div className="device-config-detail device-config-detail-expanded">
+                    {configEntries.length > 0 && (
+                      <div className="device-config-grid">
+                        {configEntries.map(([key, value]) => (
+                          <div className="device-config-row" key={key}>
+                            <span className="device-config-key">{key}</span>
+                            <span className="device-config-value">{String(value)}</span>
+                          </div>
+                        ))}
                       </div>
-                    ))}
+                    )}
+                    <DeviceInlinePreview device={device} snapshot={snapshot} />
                   </div>
                 )}
               </div>

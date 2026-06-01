@@ -1488,7 +1488,8 @@ button.danger {
 
   .config-grid,
   .summary-grid,
-  .quality-list {
+  .quality-list,
+  .device-config-detail-expanded {
     grid-template-columns: 1fr;
   }
 }
@@ -1714,12 +1715,24 @@ button.danger {
 }
 
 .device-config-detail {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 4px 16px;
-  padding: 4px 8px 12px 32px;
   background: #f8fafc;
   border-radius: 0 0 6px 6px;
+  display: grid;
+  gap: 8px 16px;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  padding: 4px 8px 12px 32px;
+}
+
+.device-config-detail-expanded {
+  grid-template-columns: minmax(320px, 0.75fr) minmax(360px, 1.25fr);
+  padding: 8px 8px 12px 32px;
+}
+
+.device-config-grid {
+  display: grid;
+  gap: 4px 16px;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  min-width: 0;
 }
 
 .device-config-row {
@@ -1737,4 +1750,106 @@ button.danger {
 .device-config-value {
   color: #1e293b;
   word-break: break-all;
+}
+
+.device-manager-row-active {
+  background: #f8fafc;
+}
+
+.device-manager-row-active .device-manager-header {
+  background: #edf7f6;
+}
+
+.device-inline-preview,
+.device-preview-live {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.device-live-stats {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+}
+
+.device-preview-kv {
+  border-radius: 6px;
+  padding: 10px;
+}
+
+.device-inline-preview {
+  min-width: 0;
+}
+
+.device-camera-preview {
+  aspect-ratio: 16 / 9;
+  background: #0f172a;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  display: block;
+  object-fit: contain;
+  width: 100%;
+}
+
+.device-touch-map {
+  max-width: 360px;
+}
+
+.force-preview-grid {
+  background: #f8fafc;
+  border: 1px solid #dce3e8;
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.force-preview-row {
+  align-items: center;
+  display: grid;
+  font-size: 12px;
+  gap: 8px;
+  grid-template-columns: 32px minmax(120px, 1fr) 76px;
+}
+
+.force-preview-row span {
+  color: #64748b;
+  font-weight: 700;
+}
+
+.force-preview-row strong {
+  color: #0f172a;
+  font-size: 12px;
+  text-align: right;
+}
+
+.force-preview-track {
+  background: #e2e8f0;
+  border-radius: 999px;
+  height: 8px;
+  overflow: hidden;
+}
+
+.force-preview-track i {
+  background: linear-gradient(90deg, #2563eb, #14b8a6);
+  display: block;
+  height: 100%;
+}
+
+.force-preview-grid small,
+.preview-empty {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.preview-empty {
+  align-items: center;
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+  border-radius: 6px;
+  display: flex;
+  justify-content: center;
+  min-height: 120px;
+  padding: 12px;
 }
