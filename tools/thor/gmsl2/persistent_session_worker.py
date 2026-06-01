@@ -234,6 +234,17 @@ def run_worker(
             with state.lock:
                 state.state = FragmentState.WARMUP
                 state.current_episode_dir = None
+            # Mirror start_episode: splitmuxsink can only cut on an IDR
+            # boundary, and idrinterval=60 means the natural cadence is
+            # ~1 frame/sec. Without force-IDR here the EPISODE fragment
+            # loses 0-1s of frames at the tail because splitmux silently
+            # waits for the next natural IDR before swapping out. Users
+            # saw the slider freeze ~60 frames short of duration_s * fps.
+            if encoder is not None:
+                try:
+                    encoder.emit("force-IDR")
+                except Exception as exc:
+                    logger.debug("[%s] force-IDR (stop) not supported: %s", cfg.name, exc)
             try:
                 splitmux.emit("split-now")
             except Exception as exc:
