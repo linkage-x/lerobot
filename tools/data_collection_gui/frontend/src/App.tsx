@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { DataCollectionGuiApi, type GuiSnapshot } from "./api";
 import { ReplayInspector } from "./ReplayInspector";
 import type {
+  BoxPreviewPayload,
+  CollectionTask,
   ConfigSummary,
   DeviceStatus,
   EpisodeAnnotation,
@@ -10,7 +12,9 @@ import type {
   ProcessingStatus,
   RecordedDataset,
   RecordingStatus,
-  ReplayStatus
+  ReplayStatus,
+  SubtaskSegment,
+  TaskStatus
 } from "./types";
 import "./styles.css";
 
@@ -33,7 +37,7 @@ function Metric({ label, value }: { label: string; value: string | number }) {
   );
 }
 
-function DeviceList({ devices }: { devices: DeviceStatus[] }) {
+function DeviceList({ devices, config }: { devices: DeviceStatus[]; config: ConfigSummary }) {
   const grouped = useMemo(() => {
     return devices.reduce<Record<string, DeviceStatus[]>>((acc, device) => {
       acc[device.kind] = [...(acc[device.kind] ?? []), device];
@@ -41,34 +45,119 @@ function DeviceList({ devices }: { devices: DeviceStatus[] }) {
     }, {});
   }, [devices]);
 
+  const cameraCount = grouped["camera"]?.length ?? 0;
+  const runningCameras = grouped["camera"]?.filter((d) => d.state === "running").length ?? 0;
+  const errorCameras = grouped["camera"]?.filter((d) => d.state === "error").length ?? 0;
+
   return (
     <section className="panel">
       <div className="panel-heading">
         <h2>Devices</h2>
         <span>{devices.length} streams</span>
       </div>
-      {Object.entries(grouped).map(([kind, items]) => (
-        <div className="device-group" key={kind}>
-          <h3>{kind.replace("_", " ")}</h3>
-          {items.map((device) => (
-            <div className="device-row" key={device.id}>
-              <div>
-                <div className="row-title">
-                  <StatusDot state={device.state} />
-                  <strong>{device.id}</strong>
-                </div>
-                <p>{device.label}</p>
-              </div>
-              <div className="device-stats">
-                <span>{device.fps} fps</span>
-                <span>{device.latencyMs} ms</span>
-                <small>{device.detail}</small>
-              </div>
+      {Object.entries(grouped).map(([kind, items]) => {
+        const kindLabel = kind === "camera" && config.rigType === "gmsl2"
+          ? `GMSL2 cameras`
+          : kind === "box_collection"
+            ? "BOX sensors"
+            : kind.replace("_", " ");
+        const kindSummary = kind === "camera" && config.rigType === "gmsl2"
+          ? `${runningCameras}/${cameraCount} running${errorCameras ? `, ${errorCameras} error` : ""}`
+          : `${items.length} devices`;
+        return (
+          <div className="device-group" key={kind}>
+            <div className="device-group-header">
+              <h3>{kindLabel}</h3>
+              <small>{kindSummary}</small>
             </div>
-          ))}
-        </div>
-      ))}
+            {items.map((device) => (
+              <div className="device-row" key={device.id}>
+                <div>
+                  <div className="row-title">
+                    <StatusDot state={device.state} />
+                    <strong>{device.id}</strong>
+                  </div>
+                  <p>{device.label}</p>
+                </div>
+                <div className="device-stats">
+                  <span>{device.fps} fps</span>
+                  <span>{device.latencyMs} ms</span>
+                  <small>{device.detail}</small>
+                </div>
+              </div>
+            ))}
+          </div>
+        );
+      })}
     </section>
+  );
+}
+
+function HardwareSyncBadge({ config }: { config: ConfigSummary }) {
+  const hw = config.hardwareSync;
+  if (!hw) return null;
+  const trigLabel = hw.trigMode === 1 ? "PWM slave" : hw.trigMode === 0 ? "free-run" : `trig ${hw.trigMode}`;
+  return (
+    <div className={`hw-sync-badge ${hw.enabled ? "hw-sync-on" : "hw-sync-off"}`}>
+      <span className="hw-sync-icon">{hw.enabled ? "◉" : "○"}</span>
+      <span>HW Sync {hw.enabled ? "ON" : "OFF"}</span>
+      {hw.enabled && <small>{hw.fps} Hz {trigLabel}{hw.pwmChip ? ` · ${hw.pwmChip}` : ""}</small>}
+    </div>
+  );
+}
+
+function CameraEncodingInfo({ config }: { config: ConfigSummary }) {
+  const cam = config.cameraDefaults;
+  if (!cam || !cam.codec) return null;
+  const res = cam.width && cam.height ? `${cam.width}x${cam.height}` : "";
+  const bitrate = cam.bitrateKbps ? `${cam.bitrateKbps} kbps` : "";
+  const exposure = cam.exposureUs ? `exp ${cam.exposureUs} us` : "";
+  const gain = cam.gain ? `gain ${cam.gain}` : "";
+  return (
+    <div className="encoding-info">
+      <Metric label="Codec" value={`${cam.codec.toUpperCase()} / ${cam.container || "mkv"}`} />
+      <Metric label="Resolution" value={res || "—"} />
+      <Metric label="Bitrate" value={bitrate || "—"} />
+      <Metric label="Pipeline" value={cam.pipeline || "—"} />
+      <Metric label="Exposure" value={exposure || "auto"} />
+      <Metric label="Gain" value={gain || "auto"} />
+    </div>
+  );
+}
+
+function RecorderLogStream({ lines }: { lines: string[] }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  // Stop auto-scrolling once the user has manually scrolled up; resume once
+  // they scroll back to within the bottom threshold.
+  const stickToBottomRef = useRef(true);
+
+  const handleScroll = () => {
+    const el = containerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom < 24;
+  };
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (el && stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [lines]);
+
+  if (lines.length === 0) return null;
+  return (
+    <div
+      className="process-output-log"
+      ref={containerRef}
+      onScroll={handleScroll}
+      role="log"
+      aria-live="polite"
+    >
+      {lines.map((line, i) => (
+        <div className="process-output-line" key={`${i}-${line}`}>{line}</div>
+      ))}
+    </div>
   );
 }
 
@@ -78,7 +167,8 @@ function RecordingPanel({
   busy,
   onConnect,
   onStart,
-  onStop
+  onStop,
+  logLines
 }: {
   status: RecordingStatus;
   config: ConfigSummary;
@@ -86,22 +176,26 @@ function RecordingPanel({
   onConnect: () => void;
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
+  logLines?: string[];
 }) {
   const progress = Math.round((status.frameIndex / Math.max(status.targetFrames, 1)) * 100);
   const isConnected = status.pid != null || ["connecting", "armed", "recording", "review", "saving", "discarding"].includes(status.state);
   const canStartEpisode = status.state === "armed";
   const canResolveEpisode = status.state === "recording" || status.state === "review";
   const canExit = isConnected;
+  const isGmsl = config.rigType === "gmsl2";
+  const panelTitle = isGmsl ? "GMSL2 Record" : "Handheld Record";
 
   return (
     <section className="panel">
       <div className="panel-heading">
-        <h2>Handheld Record</h2>
+        <h2>{panelTitle}</h2>
         <span className="state-pill">
           <StatusDot state={status.state} />
           {stateLabel(status.state)}
         </span>
       </div>
+      {isGmsl && <HardwareSyncBadge config={config} />}
       <div className="config-grid">
         <Metric label="Config" value={config.configPath} />
         <Metric label="Repo" value={status.repoId} />
@@ -110,6 +204,7 @@ function RecordingPanel({
         <Metric label="Episode" value={`${config.episodeTimeS}s / ${status.targetFrames} frames`} />
         <Metric label="Encoding" value={`${config.vcodec || "raw"}${config.streamingEncoding ? ", streaming" : ""}`} />
       </div>
+      {isGmsl && <CameraEncodingInfo config={config} />}
       <div className="progress">
         <div className="progress-bar" style={{ width: `${progress}%` }} />
       </div>
@@ -127,7 +222,11 @@ function RecordingPanel({
         <Metric label="PID" value={status.pid ?? "none"} />
       </div>
       <p className="panel-note">{status.message}</p>
-      {status.lastOutput ? <p className="process-output">{status.lastOutput}</p> : null}
+      {logLines && logLines.length > 0
+        ? <RecorderLogStream lines={logLines} />
+        : status.lastOutput
+          ? <p className="process-output">{status.lastOutput}</p>
+          : null}
     </section>
   );
 }
@@ -296,15 +395,15 @@ const mvpPages: PageMeta[] = [
   { id: "live-record", label: "Live Record", kind: "mvp" },
   { id: "dataset-processing", label: "Dataset Processing", kind: "mvp" },
   { id: "episode-replay", label: "Episode Replay", kind: "mvp" },
-  { id: "dataset-export", label: "Dataset Export", kind: "mvp" }
+  { id: "dataset-export", label: "Dataset Export", kind: "mvp" },
+  { id: "task-library", label: "Task Library", kind: "mvp" },
+  { id: "device-manager", label: "Device Manager", kind: "mvp" }
 ];
 
 const deferredPages: PageMeta[] = [
   { id: "dashboard", label: "Dashboard", kind: "deferred" },
   { id: "qc-report", label: "QC Report", kind: "deferred" },
   { id: "model-evaluation", label: "Model Evaluation", kind: "deferred" },
-  { id: "device-manager", label: "Device Manager", kind: "deferred" },
-  { id: "task-library", label: "Task Library", kind: "deferred" },
   { id: "annotation-audit", label: "Annotation & Audit", kind: "deferred" }
 ];
 
@@ -441,12 +540,23 @@ function LiveRecordPage({
   onRunCalibration: () => void;
 }) {
   const showSavedBanner = snapshot.recording.savedEpisodes > 0;
+  // The backend keeps a per-session ring buffer (RecordingStatus.recentOutput)
+  // and clears it when the operator clicks Connect, so we can render it
+  // directly. The pre-PR6 approach of accumulating `lastOutput` lost any
+  // line that didn't land at the top of a snapshot poll window.
+  const logLines = snapshot.recording.recentOutput ?? [];
+
   return (
     <div className="page-stack">
-      <PageHeader title="Live Record" subtitle="capture raw multi-camera handheld data; post-processing lives on the Processing page" />
+      <PageHeader
+        title="Live Record"
+        subtitle={snapshot.configSummary.rigType === "gmsl2"
+          ? `GMSL2 ${snapshot.devices.filter((d) => d.kind === "camera").length}-camera capture with${snapshot.configSummary.hardwareSync?.enabled ? "" : "out"} hardware sync`
+          : "capture raw multi-camera handheld data; post-processing lives on the Processing page"}
+      />
       <div className="split-layout">
-        <RecordingPanel status={snapshot.recording} config={snapshot.configSummary} busy={busy} onConnect={onConnect} onStart={onStart} onStop={onStop} />
-        <DeviceList devices={snapshot.devices} />
+        <RecordingPanel status={snapshot.recording} config={snapshot.configSummary} busy={busy} onConnect={onConnect} onStart={onStart} onStop={onStop} logLines={logLines} />
+        <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />
       </div>
       <CalibrationPanel status={snapshot.calibration} busy={busy} onRun={onRunCalibration} />
       {showSavedBanner ? (
@@ -519,14 +629,112 @@ function ReplayReadinessCard({
   );
 }
 
+function SubtaskSegmentEditor({
+  segments,
+  totalFrames,
+  onChange
+}: {
+  segments: SubtaskSegment[];
+  totalFrames: number;
+  onChange: (segments: SubtaskSegment[]) => void;
+}) {
+  const colors = ["#2563eb", "#0d9488", "#d97706", "#dc2626", "#7c3aed", "#059669"];
+
+  const addSegment = () => {
+    const lastEnd = segments.length > 0 ? segments[segments.length - 1].endFrame : 0;
+    const newSeg: SubtaskSegment = {
+      id: `seg-${Date.now()}`,
+      startFrame: lastEnd,
+      endFrame: Math.max(lastEnd, totalFrames - 1),
+      description: ""
+    };
+    onChange([...segments, newSeg]);
+  };
+
+  const updateSegment = (id: string, patch: Partial<SubtaskSegment>) => {
+    onChange(segments.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+  };
+
+  const removeSegment = (id: string) => {
+    onChange(segments.filter((s) => s.id !== id));
+  };
+
+  return (
+    <section className="panel segment-panel">
+      <div className="panel-heading">
+        <h2>Subtask Segments</h2>
+        <span>{segments.length} segments</span>
+      </div>
+      {totalFrames > 0 && segments.length > 0 && (
+        <div className="segment-timeline">
+          {segments.map((seg, i) => {
+            const left = (seg.startFrame / Math.max(totalFrames - 1, 1)) * 100;
+            const width = ((seg.endFrame - seg.startFrame) / Math.max(totalFrames - 1, 1)) * 100;
+            return (
+              <div
+                key={seg.id}
+                className="segment-bar"
+                title={seg.description || `Segment ${i + 1}`}
+                style={{
+                  left: `${left}%`,
+                  width: `${Math.max(width, 0.5)}%`,
+                  backgroundColor: colors[i % colors.length]
+                }}
+              />
+            );
+          })}
+        </div>
+      )}
+      <div className="segment-list">
+        {segments.map((seg, i) => (
+          <div className="segment-row" key={seg.id}>
+            <span className="segment-index" style={{ color: colors[i % colors.length] }}>#{i + 1}</span>
+            <input
+              type="number"
+              min={0}
+              max={totalFrames - 1}
+              value={seg.startFrame}
+              onChange={(e) => updateSegment(seg.id, { startFrame: Math.max(0, Number(e.target.value)) })}
+              aria-label="Start frame"
+              className="segment-frame-input"
+            />
+            <span>-</span>
+            <input
+              type="number"
+              min={0}
+              max={totalFrames - 1}
+              value={seg.endFrame}
+              onChange={(e) => updateSegment(seg.id, { endFrame: Math.max(0, Number(e.target.value)) })}
+              aria-label="End frame"
+              className="segment-frame-input"
+            />
+            <input
+              value={seg.description}
+              onChange={(e) => updateSegment(seg.id, { description: e.target.value })}
+              placeholder="Subtask description"
+              className="segment-desc-input"
+            />
+            <button onClick={() => removeSegment(seg.id)} className="segment-remove">x</button>
+          </div>
+        ))}
+      </div>
+      <div className="control-row">
+        <button onClick={addSegment}>Add Segment</button>
+      </div>
+    </section>
+  );
+}
+
 function EpisodeAnnotationPanel({
   annotation,
   datasetPath,
+  totalFrames,
   busy,
   onSave
 }: {
   annotation: EpisodeAnnotation;
   datasetPath: string;
+  totalFrames: number;
   busy: boolean;
   onSave: (annotation: EpisodeAnnotation) => void;
 }) {
@@ -550,110 +758,173 @@ function EpisodeAnnotationPanel({
     .slice(0, 12);
   const canSave = draft.taskPrompt.trim().length > 0;
 
+  const buildSavePayload = (overrides?: Partial<EpisodeAnnotation>): EpisodeAnnotation => ({
+    ...draft,
+    datasetRoot: datasetPath,
+    tags: normalizedTags,
+    taskPrompt: draft.taskPrompt.trim(),
+    annotator: draft.annotator.trim(),
+    notes: draft.notes.trim(),
+    ...overrides
+  });
+
+  const markFailure = (tag: string) => {
+    const existingTags = new Set(normalizedTags);
+    existingTags.add(tag);
+    onSave(buildSavePayload({
+      outcome: "failure",
+      quality: "bad",
+      includeInTraining: false,
+      tags: [...existingTags]
+    }));
+  };
+
+  const reviewBorder = draft.reviewStatus === "rejected" ? "2px solid #dc2626" : undefined;
+
   return (
-    <section className="panel annotation-panel">
-      <div className="panel-heading">
-        <h2>Episode Annotation</h2>
-        <span>{draft.updatedAt ? `saved ${new Date(draft.updatedAt).toLocaleString()}` : "not saved"}</span>
-      </div>
-      <div className="annotation-grid">
-        <label className="annotation-field annotation-field-wide">
-          <span>Task Prompt</span>
-          <textarea
-            value={draft.taskPrompt}
-            onChange={(event) => setDraft({ ...draft, taskPrompt: event.target.value })}
-            placeholder="Pick up the red cube and place it into the fixture"
-          />
-        </label>
-        <label className="annotation-field">
-          <span>Outcome</span>
-          <select
-            value={draft.outcome}
-            onChange={(event) => setDraft({ ...draft, outcome: event.target.value as EpisodeAnnotation["outcome"] })}
+    <>
+      <section className="panel annotation-panel" style={{ borderLeft: reviewBorder }}>
+        <div className="panel-heading">
+          <h2>Episode Annotation</h2>
+          <span>
+            {draft.reviewStatus !== "pending" && (
+              <span className={`review-badge review-${draft.reviewStatus}`}>{draft.reviewStatus}</span>
+            )}
+            {draft.updatedAt ? ` saved ${new Date(draft.updatedAt).toLocaleString()}` : " not saved"}
+          </span>
+        </div>
+        <div className="annotation-grid">
+          <label className="annotation-field annotation-field-wide">
+            <span>Task Prompt</span>
+            <textarea
+              value={draft.taskPrompt}
+              onChange={(event) => setDraft({ ...draft, taskPrompt: event.target.value })}
+              placeholder="Pick up the red cube and place it into the fixture"
+            />
+          </label>
+          <label className="annotation-field">
+            <span>Outcome</span>
+            <select
+              value={draft.outcome}
+              onChange={(event) => setDraft({ ...draft, outcome: event.target.value as EpisodeAnnotation["outcome"] })}
+            >
+              <option value="unreviewed">Unreviewed</option>
+              <option value="success">Success</option>
+              <option value="partial">Partial</option>
+              <option value="failure">Failure</option>
+            </select>
+          </label>
+          <label className="annotation-field">
+            <span>Quality</span>
+            <select
+              value={draft.quality}
+              onChange={(event) => setDraft({ ...draft, quality: event.target.value as EpisodeAnnotation["quality"] })}
+            >
+              <option value="unreviewed">Unreviewed</option>
+              <option value="good">Good</option>
+              <option value="needs_review">Needs review</option>
+              <option value="bad">Bad</option>
+            </select>
+          </label>
+          <label className="annotation-field annotation-toggle">
+            <input
+              checked={draft.includeInTraining}
+              type="checkbox"
+              onChange={(event) => setDraft({ ...draft, includeInTraining: event.target.checked })}
+            />
+            <span>Use for training</span>
+          </label>
+          <label className="annotation-field">
+            <span>Annotator</span>
+            <input
+              value={draft.annotator}
+              onChange={(event) => setDraft({ ...draft, annotator: event.target.value })}
+              placeholder="operator"
+            />
+          </label>
+          <label className="annotation-field annotation-field-wide">
+            <span>Tags</span>
+            <input
+              value={tagsText}
+              onChange={(event) => setTagsText(event.target.value)}
+              placeholder="occlusion, collision, retry, object-slip"
+            />
+          </label>
+          <label className="annotation-field annotation-field-wide">
+            <span>Notes</span>
+            <textarea
+              value={draft.notes}
+              onChange={(event) => setDraft({ ...draft, notes: event.target.value })}
+              placeholder="Short review notes, failure reason, or scene details"
+            />
+          </label>
+          <label className="annotation-field">
+            <span>Review Status</span>
+            <select
+              value={draft.reviewStatus}
+              onChange={(event) => setDraft({ ...draft, reviewStatus: event.target.value as EpisodeAnnotation["reviewStatus"] })}
+            >
+              <option value="pending">Pending</option>
+              <option value="approved">Approved</option>
+              <option value="rejected">Rejected</option>
+            </select>
+          </label>
+          <label className="annotation-field annotation-field-wide">
+            <span>Review Comment</span>
+            <textarea
+              value={draft.reviewComment}
+              onChange={(event) => setDraft({ ...draft, reviewComment: event.target.value })}
+              placeholder="Reason for rejection or review notes"
+              className={draft.reviewStatus === "rejected" ? "review-rejected-input" : ""}
+            />
+          </label>
+        </div>
+        <div className="control-row">
+          <button
+            disabled={busy || !datasetPath || !canSave}
+            onClick={() => onSave(buildSavePayload())}
           >
-            <option value="unreviewed">Unreviewed</option>
-            <option value="success">Success</option>
-            <option value="partial">Partial</option>
-            <option value="failure">Failure</option>
-          </select>
-        </label>
-        <label className="annotation-field">
-          <span>Quality</span>
-          <select
-            value={draft.quality}
-            onChange={(event) => setDraft({ ...draft, quality: event.target.value as EpisodeAnnotation["quality"] })}
+            Save Annotation
+          </button>
+          <button
+            className="danger"
+            disabled={busy || !datasetPath}
+            onClick={() => markFailure("collision")}
           >
-            <option value="unreviewed">Unreviewed</option>
-            <option value="good">Good</option>
-            <option value="needs_review">Needs review</option>
-            <option value="bad">Bad</option>
-          </select>
-        </label>
-        <label className="annotation-field annotation-toggle">
-          <input
-            checked={draft.includeInTraining}
-            type="checkbox"
-            onChange={(event) => setDraft({ ...draft, includeInTraining: event.target.checked })}
-          />
-          <span>Use for training</span>
-        </label>
-        <label className="annotation-field">
-          <span>Annotator</span>
-          <input
-            value={draft.annotator}
-            onChange={(event) => setDraft({ ...draft, annotator: event.target.value })}
-            placeholder="operator"
-          />
-        </label>
-        <label className="annotation-field annotation-field-wide">
-          <span>Tags</span>
-          <input
-            value={tagsText}
-            onChange={(event) => setTagsText(event.target.value)}
-            placeholder="occlusion, collision, retry, object-slip"
-          />
-        </label>
-        <label className="annotation-field annotation-field-wide">
-          <span>Notes</span>
-          <textarea
-            value={draft.notes}
-            onChange={(event) => setDraft({ ...draft, notes: event.target.value })}
-            placeholder="Short review notes, failure reason, or scene details"
-          />
-        </label>
-      </div>
-      <div className="control-row">
-        <button
-          disabled={busy || !datasetPath || !canSave}
-          onClick={() =>
-            onSave({
-              ...draft,
-              datasetRoot: datasetPath,
-              tags: normalizedTags,
-              taskPrompt: draft.taskPrompt.trim(),
-              annotator: draft.annotator.trim(),
-              notes: draft.notes.trim()
-            })
-          }
-        >
-          Save Annotation
-        </button>
-        <span className="annotation-hint">Episode {draft.episode} · {draft.source}</span>
-      </div>
-    </section>
+            Mark Collision
+          </button>
+          <button
+            className="danger"
+            disabled={busy || !datasetPath}
+            onClick={() => markFailure("abandoned")}
+          >
+            Mark Abandoned
+          </button>
+          <span className="annotation-hint">Episode {draft.episode} · {draft.source}</span>
+        </div>
+      </section>
+      <SubtaskSegmentEditor
+        segments={draft.segments ?? []}
+        totalFrames={totalFrames}
+        onChange={(segments) => setDraft({ ...draft, segments })}
+      />
+    </>
   );
 }
 
 function EpisodeSelector({
   status,
+  annotation,
   busy,
   onSelectEpisode
 }: {
   status: ReplayStatus;
+  annotation?: EpisodeAnnotation;
   busy: boolean;
   onSelectEpisode: (episode: number) => void;
 }) {
   const [pendingEpisode, setPendingEpisode] = useState<number | null>(null);
+  const [episodeInput, setEpisodeInput] = useState(String(status.episode ?? 0));
   const options = status.episodeOptions?.length
     ? status.episodeOptions
     : Array.from({ length: status.totalEpisodes ?? 0 }, (_item, index) => index);
@@ -662,6 +933,10 @@ function EpisodeSelector({
   const hasPrevious = currentIndex > 0;
   const hasNext = currentIndex >= 0 && currentIndex < options.length - 1;
   const switching = pendingEpisode != null && (busy || pendingEpisode !== current);
+  const inputEpisode = episodeInput.trim() === "" ? NaN : Number(episodeInput);
+  const inputIsInteger = Number.isInteger(inputEpisode);
+  const inputInOptions = inputIsInteger && options.includes(inputEpisode);
+  const canGoToInput = !busy && inputInOptions && inputEpisode !== current;
 
   useEffect(() => {
     if (!busy && pendingEpisode === current) {
@@ -669,9 +944,22 @@ function EpisodeSelector({
     }
   }, [busy, current, pendingEpisode]);
 
+  useEffect(() => {
+    if (!switching) {
+      setEpisodeInput(String(current));
+    }
+  }, [current, switching]);
+
   const selectEpisode = (episode: number) => {
+    setEpisodeInput(String(episode));
     setPendingEpisode(episode);
     onSelectEpisode(episode);
+  };
+
+  const submitEpisodeInput = () => {
+    if (canGoToInput) {
+      selectEpisode(inputEpisode);
+    }
   };
 
   return (
@@ -697,7 +985,34 @@ function EpisodeSelector({
             <option value={current}>Episode {current}</option>
           )}
         </select>
+        <div className="episode-input-group">
+          <input
+            aria-label="Episode number"
+            disabled={busy || options.length === 0}
+            inputMode="numeric"
+            min={options[0] ?? 0}
+            max={options[options.length - 1] ?? current}
+            step={1}
+            type="number"
+            value={episodeInput}
+            onChange={(event) => setEpisodeInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                submitEpisodeInput();
+              }
+            }}
+          />
+          <button disabled={!canGoToInput} onClick={submitEpisodeInput}>Go</button>
+        </div>
         <button disabled={busy || !hasNext} onClick={() => selectEpisode(options[currentIndex + 1])}>Next</button>
+      </div>
+      <div className="episode-badges">
+        {annotation?.outcome && annotation.outcome !== "unreviewed" && (
+          <span className={`outcome-badge outcome-${annotation.outcome}`}>{annotation.outcome}</span>
+        )}
+        {annotation?.reviewStatus && annotation.reviewStatus !== "pending" && (
+          <span className={`review-badge review-${annotation.reviewStatus}`}>{annotation.reviewStatus}</span>
+        )}
       </div>
       <p className="panel-note">
         {switching
@@ -762,11 +1077,12 @@ function EpisodeReplayPage({
           onAbort={onAbort}
         />
       </div>
-      <EpisodeSelector status={snapshot.replay} busy={busy} onSelectEpisode={onSelectEpisode} />
+      <EpisodeSelector status={snapshot.replay} annotation={snapshot.annotation} busy={busy} onSelectEpisode={onSelectEpisode} />
       <ReplayInspector api={api} datasetPath={activePath} episode={snapshot.replay.episode} fallbackFps={snapshot.replay.fps} />
       <EpisodeAnnotationPanel
         annotation={snapshot.annotation}
         datasetPath={activePath}
+        totalFrames={snapshot.replay.totalFrames}
         busy={busy}
         onSave={onSaveAnnotation}
       />
@@ -819,8 +1135,11 @@ function ProcessingRow({
       <button disabled={busy} onClick={onSelect}>View Log</button>
     ) : item.status === "qc_pass" ? (
       <button disabled={busy} onClick={onOpenReplay}>Open Replay</button>
+    ) : item.status === "error" && !item.trajectoryVersion ? (
+      // trajectory generation failed: no trajectory to QC, offer to regenerate instead
+      <button disabled={busy} onClick={onGenerate}>Regenerate Trajectory</button>
     ) : item.status === "qc_failed" || item.status === "error" ? (
-      <button disabled={busy} onClick={onRunQc}>Run QC</button>
+      <button disabled={busy} onClick={onRunQc}>Re-run QC</button>
     ) : (
       <button disabled={busy} onClick={onRunQc}>Run QC</button>
     );
@@ -926,9 +1245,12 @@ function DatasetProcessingPage({
           {items.length === 0 ? (
             snapshot.gateway.state !== "online" ? (
               <div className="empty-dataset-list">
-                Gateway not connected (state: {snapshot.gateway.state}). Start
-                <code> python -m tools.data_collection_gui.gateway</code>
-                and point the Vite proxy at it via <code>GUI_API_TARGET</code>.
+                <p>Gateway not connected (state: {snapshot.gateway.state}).</p>
+                <p>Ensure the gateway is running on Thor:</p>
+                <code>ssh nvidia@192.168.111.122</code>
+                <code>bash ~/lerobot/run/restart_gateway.sh</code>
+                <p>Then set the Vite proxy target:</p>
+                <code>GUI_API_TARGET=http://192.168.111.122:8765 npm run dev</code>
               </div>
             ) : (
               <div className="empty-dataset-list">
@@ -976,10 +1298,17 @@ function DatasetProcessingPage({
                 {selected.trajectoryVersion ? "Regenerate Trajectory" : "Generate EE Trajectory"}
               </button>
               <button
-                disabled={busy || !["pose_ready", "qc_pass", "qc_failed", "error"].includes(selected.status)}
+                disabled={
+                  busy ||
+                  !["pose_ready", "qc_pass", "qc_failed", "error"].includes(selected.status) ||
+                  // trajectory generation failed: nothing to QC until a trajectory exists
+                  (selected.status === "error" && !selected.trajectoryVersion)
+                }
                 onClick={() => onRunQc(selected.path)}
               >
-                {selected.status === "qc_failed" || selected.status === "error" ? "Re-run QC" : "Run QC"}
+                {selected.status === "qc_failed" || (selected.status === "error" && selected.trajectoryVersion)
+                  ? "Re-run QC"
+                  : "Run QC"}
               </button>
               <button
                 disabled={busy || !["pose_ready", "qc_pass"].includes(selected.status)}
@@ -1143,6 +1472,499 @@ function DatasetExportPage({
   );
 }
 
+const taskStatusLabel: Record<TaskStatus, string> = {
+  pending: "Pending",
+  in_progress: "In Progress",
+  completed: "Completed",
+  paused: "Paused"
+};
+
+const taskStatusDot: Record<TaskStatus, string> = {
+  pending: "idle",
+  in_progress: "running",
+  completed: "running",
+  paused: "warning"
+};
+
+function TaskLibraryPage({
+  snapshot,
+  busy,
+  onCreate,
+  onUpdate,
+  onDelete,
+  onNavigate
+}: {
+  snapshot: GuiSnapshot;
+  busy: boolean;
+  onCreate: (task: Partial<CollectionTask>) => void;
+  onUpdate: (task: Partial<CollectionTask>) => void;
+  onDelete: (id: string) => void;
+  onNavigate: (page: PageId) => void;
+}) {
+  const tasks = snapshot.tasks ?? [];
+  const [showForm, setShowForm] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [formName, setFormName] = useState("");
+  const [formDesc, setFormDesc] = useState("");
+  const [formTarget, setFormTarget] = useState(100);
+  const [formAssignee, setFormAssignee] = useState("");
+  const [formRepoId, setFormRepoId] = useState("");
+
+  const selected = tasks.find((t) => t.id === selectedId) ?? null;
+
+  const resetForm = () => {
+    setFormName("");
+    setFormDesc("");
+    setFormTarget(100);
+    setFormAssignee("");
+    setFormRepoId("");
+  };
+
+  const submitCreate = () => {
+    if (!formName.trim()) return;
+    onCreate({
+      name: formName.trim(),
+      description: formDesc.trim(),
+      targetEpisodes: formTarget,
+      assignee: formAssignee.trim(),
+      datasetRepoId: formRepoId.trim()
+    });
+    resetForm();
+    setShowForm(false);
+  };
+
+  const inProgress = tasks.filter((t) => t.status === "in_progress").length;
+  const completed = tasks.filter((t) => t.status === "completed").length;
+
+  return (
+    <div className="page-stack">
+      <PageHeader title="Task Library" subtitle="create and manage data collection tasks with target episode counts and progress tracking" />
+      <section className="panel">
+        <div className="panel-heading">
+          <h2>Overview</h2>
+          <span>{tasks.length} tasks</span>
+        </div>
+        <div className="summary-grid">
+          <Metric label="Total" value={tasks.length} />
+          <Metric label="In Progress" value={inProgress} />
+          <Metric label="Completed" value={completed} />
+        </div>
+      </section>
+      <section className="panel">
+        <div className="panel-heading">
+          <h2>Tasks</h2>
+          <button disabled={busy} onClick={() => setShowForm(!showForm)}>{showForm ? "Cancel" : "New Task"}</button>
+        </div>
+        {showForm && (
+          <div className="task-form">
+            <label className="annotation-field">
+              <span>Name</span>
+              <input value={formName} onChange={(e) => setFormName(e.target.value)} placeholder="Task name" />
+            </label>
+            <label className="annotation-field annotation-field-wide">
+              <span>Description</span>
+              <textarea value={formDesc} onChange={(e) => setFormDesc(e.target.value)} placeholder="What to collect" />
+            </label>
+            <label className="annotation-field">
+              <span>Target Episodes</span>
+              <input type="number" min={1} value={formTarget} onChange={(e) => setFormTarget(Number(e.target.value))} />
+            </label>
+            <label className="annotation-field">
+              <span>Assignee</span>
+              <input value={formAssignee} onChange={(e) => setFormAssignee(e.target.value)} placeholder="operator" />
+            </label>
+            <label className="annotation-field">
+              <span>Dataset Repo ID</span>
+              <input value={formRepoId} onChange={(e) => setFormRepoId(e.target.value)} placeholder="local/my_task" />
+            </label>
+            <div className="control-row">
+              <button disabled={busy || !formName.trim()} onClick={submitCreate}>Create Task</button>
+            </div>
+          </div>
+        )}
+        {tasks.length === 0 && !showForm ? (
+          <div className="empty-dataset-list">No tasks yet. Click "New Task" to create one.</div>
+        ) : (
+          <div className="processing-list">
+            {tasks.map((task) => {
+              const progress = task.targetEpisodes > 0
+                ? Math.min(100, Math.round((task.completedEpisodes / task.targetEpisodes) * 100))
+                : 0;
+              return (
+                <div
+                  className={task.id === selectedId ? "processing-row active" : "processing-row"}
+                  key={task.id}
+                >
+                  <button className="processing-row-main" onClick={() => setSelectedId(task.id)} disabled={busy}>
+                    <div>
+                      <div className="row-title">
+                        <StatusDot state={taskStatusDot[task.status]} />
+                        <strong>{task.name}</strong>
+                        <em>{taskStatusLabel[task.status]}</em>
+                      </div>
+                      <p>{task.description || "No description"}</p>
+                    </div>
+                    <div className="processing-stats">
+                      <span>{task.completedEpisodes} / {task.targetEpisodes} episodes</span>
+                      <div className="progress" style={{ width: 80, height: 6 }}>
+                        <div className="progress-bar" style={{ width: `${progress}%` }} />
+                      </div>
+                      <small>{task.assignee || "unassigned"}</small>
+                    </div>
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+      {selected && (
+        <section className="panel">
+          <div className="panel-heading">
+            <h2>{selected.name}</h2>
+            <span className="state-pill">
+              <StatusDot state={taskStatusDot[selected.status]} />
+              {taskStatusLabel[selected.status]}
+            </span>
+          </div>
+          <div className="summary-grid">
+            <Metric label="Target" value={selected.targetEpisodes} />
+            <Metric label="Completed" value={selected.completedEpisodes} />
+            <Metric label="Assignee" value={selected.assignee || "—"} />
+            <Metric label="Dataset" value={selected.datasetRepoId || "—"} />
+            <Metric label="Created" value={selected.createdAt ? new Date(selected.createdAt).toLocaleString() : "—"} />
+            <Metric label="Updated" value={selected.updatedAt ? new Date(selected.updatedAt).toLocaleString() : "—"} />
+          </div>
+          <div className="control-row">
+            <button
+              disabled={busy || selected.status === "in_progress"}
+              onClick={() => onUpdate({ id: selected.id, status: "in_progress" })}
+            >
+              Start
+            </button>
+            <button
+              disabled={busy || selected.status === "paused"}
+              onClick={() => onUpdate({ id: selected.id, status: "paused" })}
+            >
+              Pause
+            </button>
+            <button
+              disabled={busy || selected.status === "completed"}
+              onClick={() => onUpdate({ id: selected.id, status: "completed" })}
+            >
+              Complete
+            </button>
+            <button disabled={busy} onClick={() => onNavigate("live-record")}>Go to Record</button>
+            <button className="danger" disabled={busy} onClick={() => { onDelete(selected.id); setSelectedId(null); }}>Delete</button>
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+const DEVICE_TOUCH_ROW_LENGTHS = [13, 13, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 13, 13];
+const DEVICE_TOUCH_COLUMNS = 17;
+
+function interpolatePreviewChannel(a: number, b: number, t: number): number {
+  return Math.round(a + (b - a) * t);
+}
+
+function previewTouchColor(value: number, scaleMax: number): string {
+  const stops = [
+    [17, 24, 39],
+    [37, 99, 235],
+    [20, 184, 166],
+    [250, 204, 21],
+    [239, 68, 68]
+  ];
+  const normalized = Math.max(0, Math.min(1, value / Math.max(scaleMax, 1)));
+  const scaled = normalized * (stops.length - 1);
+  const index = Math.min(Math.floor(scaled), stops.length - 2);
+  const t = scaled - index;
+  const a = stops[index];
+  const b = stops[index + 1];
+  return `rgb(${interpolatePreviewChannel(a[0], b[0], t)}, ${interpolatePreviewChannel(a[1], b[1], t)}, ${interpolatePreviewChannel(a[2], b[2], t)})`;
+}
+
+function numberArray(value: unknown): number[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((item) => Number(item)).filter((item) => Number.isFinite(item));
+}
+
+function numberValue(value: unknown): number | null {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function DeviceTouchPreview({ sensor }: { sensor?: Record<string, unknown> | null }) {
+  const values = numberArray(sensor?.fz_0p1N);
+  const hasData = values.length >= 239;
+  const scaleMax = hasData ? Math.max(1, ...values.map((value) => Math.abs(value))) : 1;
+  const localMax = hasData ? Math.max(...values.map((value) => Math.abs(value))) : 0;
+  const activePoints = values.filter((value) => Math.abs(value) > 0).length;
+  let cursor = 0;
+
+  return (
+    <div className="touch-map device-touch-map">
+      <div className="touch-map-heading">
+        <strong>tactile</strong>
+        <span>max {localMax.toFixed(1)} · active {activePoints}</span>
+      </div>
+      {hasData ? (
+        <div className="touch-grid" aria-label="live tactile preview">
+          {DEVICE_TOUCH_ROW_LENGTHS.map((length, rowIndex) => {
+            const offset = Math.floor((DEVICE_TOUCH_COLUMNS - length) / 2);
+            const row = values.slice(cursor, cursor + length);
+            const startIndex = cursor;
+            cursor += length;
+            return (
+              <div className="touch-row" key={rowIndex}>
+                {Array.from({ length: offset }).map((_, index) => (
+                  <span className="touch-cell touch-cell-empty" key={`pre-${index}`} />
+                ))}
+                {row.map((value, index) => {
+                  const pointIndex = startIndex + index + 1;
+                  return (
+                    <span
+                      className="touch-cell"
+                      key={pointIndex}
+                      title={`#${pointIndex} fz=${value.toFixed(1)} (0.1N)`}
+                      style={{ backgroundColor: previewTouchColor(Math.abs(value), scaleMax) }}
+                    />
+                  );
+                })}
+                {Array.from({ length: DEVICE_TOUCH_COLUMNS - length - offset }).map((_, index) => (
+                  <span className="touch-cell touch-cell-empty" key={`post-${index}`} />
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="touch-empty">no touch sample</div>
+      )}
+      <div className="touch-map-footer">
+        <span>ts {String(sensor?.timestamp ?? "-")}</span>
+        <span>fz 0.1N</span>
+      </div>
+    </div>
+  );
+}
+
+function DeviceForcePreview({ sensor }: { sensor?: Record<string, unknown> | null }) {
+  const values = numberArray(sensor?.fxyz_mxyz);
+  const labels = ["Fx", "Fy", "Fz", "Mx", "My", "Mz"];
+  const maxAbs = Math.max(1, ...values.slice(0, 6).map((value) => Math.abs(value)));
+  if (values.length < 6) {
+    return <div className="preview-empty">no force sample</div>;
+  }
+  return (
+    <div className="force-preview-grid">
+      {labels.map((label, index) => {
+        const value = values[index] ?? 0;
+        return (
+          <div className="force-preview-row" key={label}>
+            <span>{label}</span>
+            <div className="force-preview-track">
+              <i style={{ width: `${Math.min(100, Math.abs(value) / maxAbs * 100)}%` }} />
+            </div>
+            <strong>{value.toFixed(2)}</strong>
+          </div>
+        );
+      })}
+      <small>ts {String(sensor?.timestamp ?? "-")}</small>
+    </div>
+  );
+}
+
+function RawSensorPreview({ sensor }: { sensor?: Record<string, unknown> | null }) {
+  const entries = Object.entries(sensor ?? {}).filter(([, value]) => typeof value !== "object").slice(0, 12);
+  if (entries.length === 0) {
+    return <div className="preview-empty">no live sample</div>;
+  }
+  return (
+    <div className="device-config-detail device-preview-kv">
+      {entries.map(([key, value]) => (
+        <div className="device-config-row" key={key}>
+          <span className="device-config-key">{key}</span>
+          <span className="device-config-value">{String(value)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function BoxLivePreview({ device }: { device: DeviceStatus }) {
+  const [preview, setPreview] = useState<BoxPreviewPayload | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    const load = async () => {
+      const next = await api.fetchBoxPreview(device.id);
+      if (mounted) {
+        setPreview(next);
+      }
+    };
+    load();
+    const timer = window.setInterval(load, 100);
+    return () => {
+      mounted = false;
+      window.clearInterval(timer);
+    };
+  }, [device.id]);
+
+  const sensor = preview?.sensor ?? null;
+  const staleS = preview?.staleS == null ? null : preview.staleS;
+  const isTouch = device.id.startsWith("box_touch") || Array.isArray(sensor?.fz_0p1N);
+  const isForce = device.id === "box_six_d_force" || Array.isArray(sensor?.fxyz_mxyz);
+  const sampleAge = staleS == null ? "-" : `${staleS.toFixed(1)}s`;
+  const queueSize = numberValue(preview?.status?.queue_size);
+
+  return (
+    <div className="device-preview-live">
+      <div className="device-live-stats">
+        <Metric label="Live" value={preview?.active ? "yes" : "no"} />
+        <Metric label="Age" value={sampleAge} />
+        <Metric label="Queue" value={queueSize ?? "-"} />
+      </div>
+      {isTouch ? <DeviceTouchPreview sensor={sensor} /> : isForce ? <DeviceForcePreview sensor={sensor} /> : <RawSensorPreview sensor={sensor} />}
+    </div>
+  );
+}
+
+function DeviceInlinePreview({ device, snapshot }: { device: DeviceStatus; snapshot: GuiSnapshot }) {
+  const cameraIdle = device.kind === "camera" && snapshot.recording.pid == null;
+
+  return (
+    <div className="device-inline-preview">
+      {device.kind === "box_collection" ? (
+        <BoxLivePreview device={device} />
+      ) : device.kind === "camera" ? (
+        cameraIdle ? (
+          <img className="device-camera-preview" src={api.cameraPreviewUrl(device.id)} alt={`${device.id} preview`} />
+        ) : (
+          <div className="preview-empty">camera preview idle-only</div>
+        )
+      ) : (
+        <div className="preview-empty">no preview stream</div>
+      )}
+    </div>
+  );
+}
+
+function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
+  const [hideErrors, setHideErrors] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  const devices = hideErrors
+    ? snapshot.devices.filter((d) => d.state !== "error")
+    : snapshot.devices;
+  const selectedDevice = devices.find((device) => device.id === selectedId) ?? devices[0] ?? null;
+
+  useEffect(() => {
+    if (devices.length === 0) {
+      setSelectedId(null);
+      return;
+    }
+    if (!selectedId || !devices.some((device) => device.id === selectedId)) {
+      setSelectedId(devices[0].id);
+    }
+  }, [devices, selectedId]);
+
+  const grouped = useMemo(() => {
+    return devices.reduce<Record<string, typeof devices>>((acc, d) => {
+      acc[d.kind] = [...(acc[d.kind] ?? []), d];
+      return acc;
+    }, {});
+  }, [devices]);
+
+  const onlineCount = snapshot.devices.filter((d) => d.state === "running").length;
+  const errorCount = snapshot.devices.filter((d) => d.state === "error").length;
+
+  const kindLabel = (kind: string): string => {
+    if (kind === "camera") return snapshot.configSummary.rigType === "gmsl2" ? "GMSL2 Cameras" : "Cameras";
+    if (kind === "box_collection") return "BOX Sensors";
+    if (kind === "tactile") return "Tactile Sensors";
+    if (kind === "handheld_gripper") return "Handheld Grippers";
+    return kind.replace("_", " ");
+  };
+
+  return (
+    <div className="page-stack">
+      <PageHeader title="Device Manager" subtitle="view connected hardware devices, configuration details, and connection status" />
+      <section className="panel">
+        <div className="panel-heading">
+          <h2>Summary</h2>
+          <span>{snapshot.devices.length} devices</span>
+        </div>
+        <div className="summary-grid">
+          <Metric label="Total" value={snapshot.devices.length} />
+          <Metric label="Online" value={onlineCount} />
+          <Metric label="Error" value={errorCount} />
+        </div>
+        <div className="control-row">
+          <label className="annotation-field annotation-toggle">
+            <input type="checkbox" checked={hideErrors} onChange={(e) => setHideErrors(e.target.checked)} />
+            <span>Hide error devices</span>
+          </label>
+        </div>
+      </section>
+      {Object.entries(grouped).map(([kind, items]) => (
+        <section className="panel" key={kind}>
+          <div className="panel-heading">
+            <h2>{kindLabel(kind)}</h2>
+            <span>{items.filter((d) => d.state === "running").length}/{items.length} online</span>
+          </div>
+          {items.map((device) => {
+            const isExpanded = device.id === selectedDevice?.id;
+            const config = device.config ?? {};
+            const configEntries = Object.entries(config).filter(
+              ([, v]) => v != null && typeof v !== "object"
+            );
+            return (
+              <div className={`device-manager-row ${isExpanded ? "device-manager-row-active" : ""}`} key={device.id}>
+                <button
+                  className="device-manager-header"
+                  onClick={() => setSelectedId(device.id)}
+                >
+                  <div className="row-title">
+                    <StatusDot state={device.state} />
+                    <strong>{device.id}</strong>
+                  </div>
+                  <div className="device-stats">
+                    <span>{device.fps} fps</span>
+                    <span>{device.latencyMs} ms</span>
+                    <small>{device.detail}</small>
+                    <small>{isExpanded ? "selected" : "select"}</small>
+                  </div>
+                </button>
+                {isExpanded && (
+                  <div className="device-config-detail device-config-detail-expanded">
+                    {configEntries.length > 0 && (
+                      <div className="device-config-grid">
+                        {configEntries.map(([key, value]) => (
+                          <div className="device-config-row" key={key}>
+                            <span className="device-config-key">{key}</span>
+                            <span className="device-config-value">{String(value)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <DeviceInlinePreview device={device} snapshot={snapshot} />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </section>
+      ))}
+    </div>
+  );
+}
+
 function PlaceholderPage({ title }: { title: string }) {
   return (
     <div className="page-stack">
@@ -1296,6 +2118,17 @@ function App() {
         onExport={() => run(() => api.startDatasetExport())}
         onOpenProcessing={() => navigate("dataset-processing")}
       />
+    ) : activePage === "task-library" ? (
+      <TaskLibraryPage
+        snapshot={snapshot}
+        busy={busy}
+        onCreate={(task) => run(() => api.createTask(task))}
+        onUpdate={(task) => run(() => api.updateTask(task))}
+        onDelete={(id) => run(() => api.deleteTask(id))}
+        onNavigate={navigate}
+      />
+    ) : activePage === "device-manager" ? (
+      <DeviceManagerPage snapshot={snapshot} />
     ) : (
       <PlaceholderPage title={activeMeta.label} />
     );
@@ -1305,11 +2138,21 @@ function App() {
       <header className="topbar">
         <div>
           <h1>Robot Data Factory</h1>
-          <p>Live collection, processing, replay, and export for LeRobot data workflows</p>
+          <p>
+            {snapshot.configSummary.rigType === "gmsl2"
+              ? `Thor GMSL2 · ${snapshot.devices.filter((d) => d.kind === "camera").length} cameras · ${snapshot.configSummary.fps} fps`
+              : "Live collection, processing, replay, and export for LeRobot data workflows"}
+          </p>
         </div>
         <div className="topbar-status">
           <span><StatusDot state={snapshot.gateway.state === "online" ? "running" : "warning"} /> Gateway {snapshot.gateway.state}</span>
           <span><StatusDot state={snapshot.recording.state} /> Recorder</span>
+          {snapshot.configSummary.hardwareSync && (
+            <span>
+              <StatusDot state={snapshot.configSummary.hardwareSync.enabled ? "running" : "warning"} />
+              {" "}HW Sync {snapshot.configSummary.hardwareSync.enabled ? "ON" : "OFF"}
+            </span>
+          )}
           <span><StatusDot state={snapshot.replay.safety === "fault" ? "error" : snapshot.replay.safety === "active" ? "running" : "idle"} /> Replay safety {snapshot.replay.safety}</span>
         </div>
       </header>

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import json
 import math
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -20,7 +22,8 @@ from threading import Lock, Thread
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-DEFAULT_CONFIG_PATH = Path("tools/handheld/handheld_record_example.yaml")
+DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
+DEFAULT_RECORDER_SCRIPT = Path("tools/handheld/handheld_record.py")
 DEFAULT_DATASETS_ROOT = Path("outputs/datasets")
 DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM = 20.0
 DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG = 15.0
@@ -49,6 +52,9 @@ class EventLogItem:
     message: str
 
 
+_RECORDER_OUTPUT_RING_CAP = 300
+
+
 @dataclass
 class RecordingStatus:
     state: str = "idle"
@@ -62,6 +68,12 @@ class RecordingStatus:
     message: str = "Gateway ready"
     pid: int | None = None
     lastOutput: str = ""
+    # Ring buffer of recent recorder stdout lines. Bounded to
+    # _RECORDER_OUTPUT_RING_CAP entries so the frontend's polling snapshot
+    # can show every line the recorder emitted between polls, instead of
+    # only the most recent one (which is what lastOutput captures and is
+    # what was losing 9+ lines per Connect cycle).
+    recentOutput: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -116,6 +128,8 @@ class GatewayState:
     processing_processes: dict[str, subprocess.Popen[str]] = field(default_factory=dict)
     process_started_at_s: float | None = None
     replay_started_at_s: float | None = None
+    device_preview: dict[str, Any] = field(default_factory=dict)
+    camera_preview_process: subprocess.Popen[bytes] | None = None
     lock: Lock = field(default_factory=Lock)
 
     def log(self, level: str, message: str) -> None:
@@ -311,6 +325,14 @@ def _config_summary(config: dict[str, Any], config_path: Path) -> dict[str, Any]
     dataset = _dataset_config(config)
     sensors = config.get("sensors") if isinstance(config.get("sensors"), dict) else {}
     soft_sync = sensors.get("soft_sync") if isinstance(sensors.get("soft_sync"), dict) else {}
+    cameras = sensors.get("cameras") if isinstance(sensors.get("cameras"), dict) else {}
+    cam_defaults = cameras.get("defaults") if isinstance(cameras.get("defaults"), dict) else {}
+    hw_sync = sensors.get("hardware_sync") if isinstance(sensors.get("hardware_sync"), dict) else {}
+    recorder = config.get("recorder") if isinstance(config.get("recorder"), dict) else {}
+    recorder_script = str(recorder.get("script") or "")
+    is_gmsl = "gmsl" in recorder_script or "defaults" in cameras
+
+    vcodec = str(dataset.get("vcodec") or cam_defaults.get("codec") or "")
     return {
         "configPath": str(config_path),
         "repoId": str(dataset.get("repo_id") or ""),
@@ -321,11 +343,31 @@ def _config_summary(config: dict[str, Any], config_path: Path) -> dict[str, Any]
         "numEpisodes": int(dataset.get("num_episodes") or 0),
         "video": bool(dataset.get("video", True)),
         "streamingEncoding": bool(dataset.get("streaming_encoding", False)),
-        "vcodec": str(dataset.get("vcodec") or ""),
+        "vcodec": vcodec,
         "softSync": bool(soft_sync.get("enabled", False)),
         "rerun": {
             "displayData": bool(config.get("display_data", False)),
             "savePath": str(config.get("rerun_save_path") or ""),
+        },
+        "recorderScript": recorder_script,
+        "rigType": "gmsl2" if is_gmsl else "handheld",
+        "hardwareSync": {
+            "enabled": bool(hw_sync.get("enabled", False)),
+            "fps": int(hw_sync.get("fps") or 0),
+            "trigMode": int(hw_sync.get("sensor_trig_mode") or 0),
+            "pwmChip": str(hw_sync.get("pwm_chip") or ""),
+            "pwmId": int(hw_sync.get("pwm_id") or 0),
+        },
+        "cameraDefaults": {
+            "codec": str(cam_defaults.get("codec") or ""),
+            "bitrateKbps": int(cam_defaults.get("bitrate_kbps") or 0),
+            "width": int(cam_defaults.get("width") or 0),
+            "height": int(cam_defaults.get("height") or 0),
+            "pipeline": str(cam_defaults.get("pipeline") or ""),
+            "exposureUs": int(cam_defaults.get("exposure_us") or 0),
+            "gain": int(cam_defaults.get("gain") or 0),
+            "iframeInterval": int(cam_defaults.get("iframe_interval") or 0),
+            "container": str(cam_defaults.get("container") or ""),
         },
     }
 
@@ -350,14 +392,82 @@ def _replay_status_from_config(config: dict[str, Any]) -> ReplayStatus:
     )
 
 
-def _device_statuses(config: dict[str, Any]) -> list[dict[str, Any]]:
+_BOX_COLLECTION_DEVICE_LABELS: dict[str, str] = {
+    "box_gripper": "BOX gripper (distance)",
+    "box_imu": "BOX IMU (acc/gyr/euler/quat)",
+    "box_trigger": "BOX trigger travel",
+    "box_six_d_force": "BOX 6D force",
+    "box_touch_left": "Paxini touch pad L",
+    "box_touch_right": "Paxini touch pad R",
+}
+
+
+def _detect_locked_sids(repo_root: Path | None) -> list[int] | None:
+    if repo_root is None:
+        return None
+    script = repo_root / "tools" / "thor" / "gmsl2" / "check_max96726_locks.sh"
+    if not script.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [str(script)], capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode not in (0, 1):
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("LOCKED_VIDEO_IDS="):
+            csv = line.split("=", 1)[1].strip()
+            return [int(x) for x in csv.split(",") if x.strip()] if csv else []
+    return None
+
+
+def _device_statuses(config: dict[str, Any], repo_root: Path | None = None) -> list[dict[str, Any]]:
     sensors = config.get("sensors") or {}
     if not isinstance(sensors, dict):
         sensors = {}
 
     devices: list[dict[str, Any]] = []
+    cameras_section = sensors.get("cameras")
+
+    if isinstance(cameras_section, dict) and "defaults" in cameras_section:
+        defaults = cameras_section.get("defaults") if isinstance(cameras_section.get("defaults"), dict) else {}
+        prefix = str(cameras_section.get("name_prefix") or "cam")
+        sensor_ids = cameras_section.get("sensor_ids") or []
+        detect_all = bool(cameras_section.get("detect_all", False))
+        if sensor_ids:
+            slot_ids = [int(x) for x in sensor_ids]
+        elif detect_all:
+            locked = _detect_locked_sids(repo_root)
+            if locked is not None:
+                slot_ids = locked
+            else:
+                slot_ids = list(range(16))
+        else:
+            slot_ids = []
+        for sid in slot_ids:
+            devices.append(
+                {
+                    "id": f"{prefix}_{sid:02d}",
+                    "kind": "camera",
+                    "label": f"GMSL2 sensor-id {sid}",
+                    "state": "idle",
+                    "fps": int(defaults.get("fps") or 0),
+                    "latencyMs": 0,
+                    "detail": _format_device_detail(defaults),
+                    "config": {**defaults, "sensor_id": sid},
+                }
+            )
+    else:
+        # Mapping-style camera section (Hikrobot / OpenCV / RealSense).
+        section = cameras_section or {}
+        if isinstance(section, dict):
+            for device_id, raw_device in section.items():
+                device = raw_device if isinstance(raw_device, dict) else {}
+                devices.append(_make_mapping_device(device_id, device, "camera"))
+
     for section_name, kind in (
-        ("cameras", "camera"),
         ("tactiles", "tactile"),
         ("handheld_grippers", "handheld_gripper"),
     ):
@@ -366,28 +476,61 @@ def _device_statuses(config: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         for device_id, raw_device in section.items():
             device = raw_device if isinstance(raw_device, dict) else {}
-            fps = int(device.get("fps") or 0)
-            detail_parts = [str(device.get("type") or kind)]
-            if "serial" in device:
-                detail_parts.append(str(device["serial"]))
-            if "port" in device:
-                detail_parts.append(str(device["port"]))
-            if "index_or_path" in device:
-                detail_parts.append(str(device["index_or_path"]))
-            if "serial_number_or_name" in device:
-                detail_parts.append(str(device["serial_number_or_name"]))
+            devices.append(_make_mapping_device(device_id, device, kind))
+
+    box_cfg = config.get("box_collection")
+    if isinstance(box_cfg, dict) and box_cfg.get("enabled", True):
+        expected = box_cfg.get("expected_devices") or list(_BOX_COLLECTION_DEVICE_LABELS)
+        poll_hz = 0
+        try:
+            poll_hz = int(round(1.0 / float(box_cfg.get("poll_interval_s") or 0.05)))
+        except (TypeError, ValueError, ZeroDivisionError):
+            poll_hz = 0
+        detail = f"UDP {box_cfg.get('remote_ip', '?')}:{box_cfg.get('remote_port', 15000)}"
+        for sensor_id in expected:
+            label = _BOX_COLLECTION_DEVICE_LABELS.get(str(sensor_id), str(sensor_id))
             devices.append(
                 {
-                    "id": str(device_id),
-                    "kind": kind,
-                    "label": " ".join(detail_parts),
+                    "id": str(sensor_id),
+                    "kind": "box_collection",
+                    "label": label,
                     "state": "idle",
-                    "fps": fps,
+                    "fps": poll_hz,
                     "latencyMs": 0,
-                    "detail": _format_device_detail(device),
+                    "detail": detail,
+                    "config": {
+                        "remote_ip": box_cfg.get("remote_ip", ""),
+                        "remote_port": box_cfg.get("remote_port", 15000),
+                        "poll_interval_s": box_cfg.get("poll_interval_s", 0.05),
+                        "bind_ip": box_cfg.get("bind_ip", ""),
+                        "sensor_id": str(sensor_id),
+                    },
                 }
             )
     return devices
+
+
+def _make_mapping_device(device_id: str, device: dict[str, Any], kind: str) -> dict[str, Any]:
+    fps = int(device.get("fps") or 0)
+    detail_parts = [str(device.get("type") or kind)]
+    if "serial" in device:
+        detail_parts.append(str(device["serial"]))
+    if "port" in device:
+        detail_parts.append(str(device["port"]))
+    if "index_or_path" in device:
+        detail_parts.append(str(device["index_or_path"]))
+    if "serial_number_or_name" in device:
+        detail_parts.append(str(device["serial_number_or_name"]))
+    return {
+        "id": str(device_id),
+        "kind": kind,
+        "label": " ".join(detail_parts),
+        "state": "idle",
+        "fps": fps,
+        "latencyMs": 0,
+        "detail": _format_device_detail(device),
+        "config": dict(device),
+    }
 
 
 def _format_device_detail(device: dict[str, Any]) -> str:
@@ -410,7 +553,10 @@ def _resolve_dataset_root(repo_root: Path, raw_root: str | Path | None) -> Path 
 
 
 def _dataset_data_files(dataset_root: Path) -> list[Path]:
-    return sorted((dataset_root / "data").glob("chunk-*/*.parquet"))
+    parquets = sorted((dataset_root / "data").glob("chunk-*/*.parquet"))
+    if parquets:
+        return parquets
+    return sorted((dataset_root / "episodes").glob("episode_*/*.mkv"))
 
 
 def _path_modified_s(path: Path) -> float:
@@ -421,7 +567,9 @@ def _path_modified_s(path: Path) -> float:
 
 
 def _dataset_modified_s(dataset_root: Path) -> float:
-    candidates = [dataset_root, dataset_root / "meta" / "info.json", *_dataset_data_files(dataset_root)]
+    candidates = [dataset_root, dataset_root / "meta" / "info.json", dataset_root / "episodes"]
+    data_files = _dataset_data_files(dataset_root)
+    candidates.extend(data_files[:5])
     return max((_path_modified_s(path) for path in candidates), default=0.0)
 
 
@@ -433,14 +581,27 @@ def _dataset_name_prefixes(name: str) -> set[str]:
     return prefixes
 
 
+def _has_gmsl2_episodes(path: Path) -> bool:
+    eps_dir = path / "episodes"
+    if not eps_dir.is_dir():
+        return False
+    return any(eps_dir.glob("episode_*/meta.json"))
+
+
+def _has_lerobot_v3_data(path: Path) -> bool:
+    return any((path / "data").glob("chunk-*/*.parquet"))
+
+
 def _is_dataset_root(path: Path) -> bool:
-    return path.is_dir() and (path / "meta" / "info.json").is_file()
+    return path.is_dir() and ((path / "meta" / "info.json").is_file() or _has_gmsl2_episodes(path))
 
 
 def _scan_datasets_root(state: GatewayState) -> list[Path]:
     root = state.datasets_root
     if root is None or not root.is_dir():
         return []
+    if _is_dataset_root(root):
+        return [root]
     return [entry for entry in root.iterdir() if _is_dataset_root(entry)]
 
 
@@ -655,16 +816,29 @@ def _normalize_series(values: list[float], low: float = 8.0, high: float = 92.0)
 def _dataset_replay_meta(dataset_root: Path, info: dict[str, Any]) -> dict[str, Any]:
     data_files = _dataset_data_files(dataset_root)
     episode_options = _dataset_episode_indices(dataset_root, info)
+    if _has_gmsl2_episodes(dataset_root):
+        total_episodes, total_frames = _gmsl2_dataset_stats(dataset_root)
+    else:
+        total_episodes = int(info.get("total_episodes") or 0)
+        total_frames = int(info.get("total_frames") or 0)
     return {
         "datasetRoot": str(dataset_root),
         "sourcePath": str(data_files[-1]) if data_files else "",
-        "totalEpisodes": int(info.get("total_episodes") or 0),
+        "totalEpisodes": total_episodes,
         "episodeOptions": episode_options,
-        "recordedFrames": int(info.get("total_frames") or 0),
+        "recordedFrames": total_frames,
     }
 
 
 def _dataset_episode_indices(dataset_root: Path, info: dict[str, Any] | None = None) -> list[int]:
+    if _has_gmsl2_episodes(dataset_root):
+        indices = []
+        for d in _gmsl2_episode_dirs(dataset_root):
+            try:
+                indices.append(int(d.name.split("_", 1)[1]))
+            except (ValueError, IndexError):
+                pass
+        return sorted(indices)
     try:
         import pyarrow.parquet as pq
     except Exception:
@@ -719,6 +893,9 @@ def _recorded_dataset_status(dataset_root: Path) -> str:
     data_files = _dataset_data_files(dataset_root)
     if not data_files:
         return "missing"
+    if data_files[0].suffix == ".mkv":
+        valid = sum(1 for f in data_files if f.stat().st_size > 1024)
+        return "loaded" if valid > 0 else "empty"
     has_empty_file = False
     for data_file in data_files:
         try:
@@ -775,8 +952,11 @@ def _write_processing_meta(dataset_root: Path, payload: dict[str, Any]) -> None:
 def _processing_item_from_dataset(dataset_root: Path) -> dict[str, Any]:
     info = _load_dataset_info(dataset_root)
     modified_s = _dataset_modified_s(dataset_root)
-    total_episodes = int(info.get("total_episodes") or 0)
-    total_frames = int(info.get("total_frames") or 0)
+    if _has_gmsl2_episodes(dataset_root):
+        total_episodes, total_frames = _gmsl2_dataset_stats(dataset_root)
+    else:
+        total_episodes = int(info.get("total_episodes") or 0)
+        total_frames = int(info.get("total_frames") or 0)
     base_item = {
         "path": str(dataset_root),
         "name": dataset_root.name,
@@ -852,6 +1032,11 @@ def _processing_item_from_dataset(dataset_root: Path) -> dict[str, Any]:
 
 
 def _dataset_is_complete(dataset_root: Path) -> bool:
+    if _has_gmsl2_episodes(dataset_root):
+        return any(
+            f.stat().st_size > 1024
+            for f in (dataset_root / "episodes").glob("episode_*/*.mkv")
+        )
     info = _load_dataset_info(dataset_root)
     if not info:
         return False
@@ -887,6 +1072,31 @@ def _complete_dataset_candidates(state: GatewayState) -> list[Path]:
 
 def _processing_items(state: GatewayState) -> list[dict[str, Any]]:
     return [_processing_item_from_dataset(root) for root in _complete_dataset_candidates(state)]
+
+
+def _set_datasets_root(state: GatewayState, raw_path: str) -> bool:
+    requested = raw_path.strip()
+    if not requested:
+        raise ValueError("missing path")
+    candidate = Path(requested)
+    if not candidate.is_absolute():
+        candidate = state.repo_root / candidate
+    try:
+        resolved = candidate.resolve()
+    except OSError as exc:
+        raise ValueError(f"cannot resolve path: {exc}") from exc
+    created = False
+    if not resolved.is_dir():
+        if resolved.exists():
+            raise ValueError(f"not a directory: {resolved}")
+        try:
+            resolved.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError(f"failed to create directory: {exc}") from exc
+        created = True
+    state.datasets_root = resolved
+    state.selected_replay_root = None
+    return created
 
 
 def _mock_calibrate_cameras(state: GatewayState) -> None:
@@ -937,6 +1147,120 @@ def _mock_calibrate_cameras(state: GatewayState) -> None:
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
+
+
+# ---------------------------------------------------------------------------
+# Task management (local JSON store)
+# ---------------------------------------------------------------------------
+
+def _tasks_store_path(state: GatewayState) -> Path:
+    return state.repo_root / "outputs" / "tasks.json"
+
+
+def _read_tasks(state: GatewayState) -> list[dict[str, Any]]:
+    path = _tasks_store_path(state)
+    if not path.is_file():
+        return []
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(loaded, dict):
+        tasks = loaded.get("tasks", [])
+        return tasks if isinstance(tasks, list) else []
+    return []
+
+
+def _write_tasks(state: GatewayState, tasks: list[dict[str, Any]]) -> None:
+    path = _tasks_store_path(state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"version": 1, "tasks": tasks}, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _normalize_task(payload: dict[str, Any], *, task_id: str | None = None) -> dict[str, Any]:
+    status = str(payload.get("status") or "pending")
+    if status not in {"pending", "in_progress", "completed", "paused"}:
+        status = "pending"
+    raw_tags = payload.get("tags") if isinstance(payload.get("tags"), list) else []
+    tags = [str(t).strip() for t in raw_tags if str(t).strip()][:12]
+    now = _now_iso()
+    return {
+        "id": task_id or str(payload.get("id") or f"task-{time.time_ns()}"),
+        "name": str(payload.get("name") or "").strip(),
+        "description": str(payload.get("description") or "").strip(),
+        "targetEpisodes": max(0, int(payload.get("targetEpisodes", 0))),
+        "completedEpisodes": max(0, int(payload.get("completedEpisodes", 0))),
+        "status": status,
+        "assignee": str(payload.get("assignee") or "").strip(),
+        "datasetRepoId": str(payload.get("datasetRepoId") or "").strip(),
+        "tags": tags,
+        "createdAt": str(payload.get("createdAt") or now),
+        "updatedAt": now,
+    }
+
+
+def _count_completed_episodes(state: GatewayState, repo_id: str) -> int:
+    if not repo_id or not state.datasets_root:
+        return 0
+    total = 0
+    try:
+        for candidate in state.datasets_root.iterdir():
+            if not candidate.is_dir():
+                continue
+            if repo_id and repo_id not in candidate.name:
+                continue
+            info = _load_dataset_info(candidate)
+            if info:
+                total += int(info.get("total_episodes", 0))
+    except OSError:
+        pass
+    return total
+
+
+def _tasks_with_progress(state: GatewayState) -> list[dict[str, Any]]:
+    tasks = _read_tasks(state)
+    for task in tasks:
+        if task.get("datasetRepoId"):
+            task["completedEpisodes"] = _count_completed_episodes(state, task["datasetRepoId"])
+    return tasks
+
+
+def _create_task(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    tasks = _read_tasks(state)
+    task = _normalize_task(payload)
+    if not task["name"]:
+        raise ValueError("Task name is required.")
+    tasks.append(task)
+    _write_tasks(state, tasks)
+    state.log("info", f"Created task: {task['name']}")
+    return task
+
+
+def _update_task(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    task_id = str(payload.get("id") or "")
+    if not task_id:
+        raise ValueError("Task id is required.")
+    tasks = _read_tasks(state)
+    for i, existing in enumerate(tasks):
+        if existing.get("id") == task_id:
+            merged = {**existing, **payload}
+            tasks[i] = _normalize_task(merged, task_id=task_id)
+            tasks[i]["createdAt"] = existing.get("createdAt", tasks[i]["createdAt"])
+            _write_tasks(state, tasks)
+            state.log("info", f"Updated task: {tasks[i]['name']}")
+            return tasks[i]
+    raise ValueError(f"Task not found: {task_id}")
+
+
+def _delete_task(state: GatewayState, task_id: str) -> None:
+    tasks = _read_tasks(state)
+    filtered = [t for t in tasks if t.get("id") != task_id]
+    if len(filtered) == len(tasks):
+        raise ValueError(f"Task not found: {task_id}")
+    _write_tasks(state, filtered)
+    state.log("info", f"Deleted task: {task_id}")
 
 
 def _annotation_store_path(dataset_root: Path) -> Path:
@@ -999,6 +1323,23 @@ def _normalize_annotation(
         quality = "unreviewed"
     raw_tags = payload.get("tags") if isinstance(payload.get("tags"), list) else []
     tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()][:12]
+    review_status = str(payload.get("reviewStatus") or "pending")
+    if review_status not in {"pending", "approved", "rejected"}:
+        review_status = "pending"
+    raw_segments = payload.get("segments") if isinstance(payload.get("segments"), list) else []
+    segments = []
+    for seg in raw_segments:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            segments.append({
+                "id": str(seg.get("id") or f"{len(segments)}"),
+                "startFrame": max(0, int(seg.get("startFrame", 0))),
+                "endFrame": max(0, int(seg.get("endFrame", 0))),
+                "description": str(seg.get("description") or "").strip(),
+            })
+        except (TypeError, ValueError):
+            continue
     return {
         "datasetRoot": str(dataset_root),
         "episode": episode,
@@ -1011,6 +1352,9 @@ def _normalize_annotation(
         "annotator": str(payload.get("annotator") or "").strip(),
         "updatedAt": str(payload.get("updatedAt") or ""),
         "source": source,
+        "segments": segments,
+        "reviewStatus": review_status,
+        "reviewComment": str(payload.get("reviewComment") or "").strip(),
     }
 
 
@@ -1575,20 +1919,53 @@ def _queue_traj_gen(state: GatewayState, dataset_root: Path) -> None:
     _start_traj_gen_output_reader(state, dataset_root, process, job_id)
 
 
+def _gmsl2_episode_dirs(dataset_root: Path) -> list[Path]:
+    eps_dir = dataset_root / "episodes"
+    if not eps_dir.is_dir():
+        return []
+    return sorted(
+        (d for d in eps_dir.iterdir() if d.is_dir() and d.name.startswith("episode_")),
+        key=lambda p: p.name,
+    )
+
+
+def _gmsl2_dataset_stats(dataset_root: Path) -> tuple[int, int]:
+    ep_dirs = _gmsl2_episode_dirs(dataset_root)
+    total_frames = 0
+    for ep_dir in ep_dirs:
+        meta_path = ep_dir / "meta.json"
+        if meta_path.is_file():
+            try:
+                with meta_path.open() as f:
+                    ep_meta = json.load(f)
+                dur = float(ep_meta.get("duration_s") or 0)
+                fps = int(ep_meta.get("video", {}).get("fps") or 60)
+                total_frames += int(dur * fps)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+    return len(ep_dirs), total_frames
+
+
 def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for index, dataset_root in enumerate(_complete_dataset_candidates(state)):
         info = _load_dataset_info(dataset_root)
         data_files = _dataset_data_files(dataset_root)
         modified_s = _dataset_modified_s(dataset_root)
+        is_gmsl2 = _has_gmsl2_episodes(dataset_root)
+        if is_gmsl2:
+            total_episodes, total_frames = _gmsl2_dataset_stats(dataset_root)
+        else:
+            total_episodes = int(info.get("total_episodes") or 0)
+            total_frames = int(info.get("total_frames") or 0)
         items.append(
             {
                 "path": str(dataset_root),
                 "name": dataset_root.name,
                 "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(modified_s)) if modified_s else "",
                 "updatedAtMs": int(modified_s * 1000),
-                "totalEpisodes": int(info.get("total_episodes") or 0),
-                "totalFrames": int(info.get("total_frames") or 0),
+                "totalEpisodes": total_episodes,
+                "totalFrames": total_frames,
                 "dataStatus": _recorded_dataset_status(dataset_root),
                 "sourcePath": str(data_files[-1]) if data_files else "",
                 "isLatest": index == 0,
@@ -1605,6 +1982,16 @@ def _parquet_status_from_error(exc: Exception) -> str:
 
 
 def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    for dataset_root in _replay_dataset_candidates(state):
+        if _has_gmsl2_episodes(dataset_root):
+            meta = _dataset_replay_meta(dataset_root, {})
+            return [], {
+                **meta,
+                "dataStatus": "loaded",
+                "trajectoryKind": "none",
+                "message": f"GMSL2 raw capture: {meta['totalEpisodes']} episodes, video-only (no robot state)",
+            }
+
     try:
         import pyarrow.compute as pc
         import pyarrow.parquet as pq
@@ -2250,33 +2637,234 @@ def _extract_gripper(names: list[str], values: list[float]) -> float | None:
     return None
 
 
+def _empty_timeline(
+    dataset_root: Path,
+    *,
+    fps: int = 0,
+    episode: int | None = None,
+    state_names: list[str] | None = None,
+    action_names: list[str] | None = None,
+    camera_keys: list[str] | None = None,
+    cube_pose_names: list[str] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Return a fully-shaped ReplayTimeline payload with no frames.
+
+    Every ``/api/replay/timeline`` response must satisfy the ``ReplayTimeline``
+    contract the frontend declares -- in particular ``frames`` must be a list,
+    not absent -- otherwise ``ReplayInspector`` blows up when it dereferences
+    ``timeline.frames[currentFrame]`` before its own early-return guard runs.
+    """
+    payload: dict[str, Any] = {
+        "datasetRoot": str(dataset_root),
+        "name": dataset_root.name,
+        "episode": int(episode) if episode is not None else 0,
+        "totalFrames": 0,
+        "frames": [],
+        "fps": int(fps or 0),
+        "stateNames": list(state_names or []),
+        "actionNames": list(action_names or []),
+        "cameraKeys": list(camera_keys or []),
+        "cubePoseNames": list(cube_pose_names or []),
+        "videoTemplate": "",
+        "videoChunkIndex": 0,
+        "videoFileIndex": 0,
+        "sourcePath": "",
+        "videoWarmupS": 0.0,
+    }
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def _gmsl2_replay_warmup_s(ep_meta: dict[str, Any]) -> float:
+    video = ep_meta.get("video") if isinstance(ep_meta.get("video"), dict) else {}
+    return max(0.0, _first_finite([
+        video.get("replay_warmup_s"),
+        video.get("warmup_s"),
+        ep_meta.get("replay_warmup_s"),
+    ]))
+
+
+def _touch_payload(data: Any) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    fz = _as_float_list(data.get("fz_0p1N"))[:239]
+    if len(fz) != 239:
+        return None
+    timestamp = int(_first_finite(data.get("timestamp"), default=0.0))
+    active_points = sum(1 for value in fz if abs(value) > 0.0)
+    return {
+        "timestamp": timestamp,
+        "fz": fz,
+        "maxFz": max(fz) if fz else 0.0,
+        "activePoints": active_points,
+    }
+
+
+def _read_touch_samples(ep_dir: Path) -> dict[str, list[tuple[float, dict[str, Any]]]]:
+    samples: dict[str, list[tuple[float, dict[str, Any]]]] = {"left": [], "right": []}
+    path = ep_dir / "box_sensors.jsonl"
+    if not path.is_file():
+        return samples
+    side_by_sid = {"box_touch_left": "left", "box_touch_right": "right"}
+    try:
+        with path.open() as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                side = side_by_sid.get(str(row.get("sid") or ""))
+                if side is None:
+                    continue
+                t_rel_s = _first_finite(row.get("t_rel_s"), default=float("nan"))
+                if t_rel_s != t_rel_s:
+                    continue
+                payload = _touch_payload(row.get("data"))
+                if payload is None:
+                    continue
+                payload["tRelS"] = t_rel_s
+                samples[side].append((t_rel_s, payload))
+    except OSError:
+        return {"left": [], "right": []}
+    for side in samples:
+        samples[side].sort(key=lambda item: item[0])
+    return samples
+
+
+def _nearest_touch_payload(
+    samples: list[tuple[float, dict[str, Any]]],
+    target_s: float,
+    *,
+    max_age_s: float = 0.25,
+) -> dict[str, Any] | None:
+    if not samples:
+        return None
+    times = [item[0] for item in samples]
+    index = bisect.bisect_left(times, target_s)
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    if index < len(samples):
+        candidates.append(samples[index])
+    if index > 0:
+        candidates.append(samples[index - 1])
+    if not candidates:
+        return None
+    sample_t, payload = min(candidates, key=lambda item: abs(item[0] - target_s))
+    if abs(sample_t - target_s) > max_age_s:
+        return None
+    return payload
+
+
+def _attach_touch_frames(frames: list[dict[str, Any]], ep_dir: Path, *, video_warmup_s: float = 0.0) -> None:
+    samples = _read_touch_samples(ep_dir)
+    if not samples["left"] and not samples["right"]:
+        return
+    for frame in frames:
+        target_s = _first_finite(frame.get("timestamp"), default=0.0) + max(0.0, video_warmup_s)
+        left = _nearest_touch_payload(samples["left"], target_s)
+        right = _nearest_touch_payload(samples["right"], target_s)
+        if left is None and right is None:
+            continue
+        touch: dict[str, Any] = {}
+        if left is not None:
+            touch["left"] = left
+        if right is not None:
+            touch["right"] = right
+        frame["touch"] = touch
+
+
+def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict[str, Any]:
+    ep_dirs = _gmsl2_episode_dirs(dataset_root)
+    if not ep_dirs:
+        return _empty_timeline(dataset_root, error="no episodes found")
+    ep_idx = episode if episode is not None else 0
+    ep_dir = dataset_root / "episodes" / f"episode_{ep_idx:06d}"
+    if not ep_dir.is_dir():
+        return _empty_timeline(dataset_root, episode=ep_idx, error=f"episode_{ep_idx:06d} not found")
+    meta_path = ep_dir / "meta.json"
+    ep_meta: dict[str, Any] = {}
+    if meta_path.is_file():
+        try:
+            with meta_path.open() as f:
+                ep_meta = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
+    fps = int(ep_meta.get("video", {}).get("fps") or ep_meta.get("fps") or 60)
+    duration_s = float(ep_meta.get("duration_s") or 10)
+    # PR3+ EPISODE mkv files come from splitmuxsink split-now boundaries, so
+    # they no longer contain the pre-episode warmup frames the
+    # `replay_warmup_s` field was originally designed to skip. Frame 0 in
+    # the timeline now corresponds to video.currentTime == 0 directly. If
+    # we kept subtracting warmup here totalFrames would lose
+    # replay_warmup_s * fps frames AND the frontend would offset by the
+    # same amount when reverse-computing frame from currentTime — the
+    # slider used to freeze ~1s short of the end because both layers
+    # double-counted the same trim. Force 0 so the math collapses cleanly.
+    video_warmup_s = 0.0
+    total_frames = max(0, int(duration_s * fps))
+    mkv_files = sorted(ep_dir.glob("*.mkv"))
+    camera_keys = [f.stem for f in mkv_files if f.stat().st_size > 1024]
+    frames: list[dict[str, Any]] = []
+    for i in range(total_frames):
+        frames.append({
+            "frame": i,
+            "timestamp": i / max(fps, 1),
+            "state": [],
+            "action": [],
+            "eePose": {},
+        })
+    _attach_touch_frames(frames, ep_dir, video_warmup_s=video_warmup_s)
+    return {
+        "datasetRoot": str(dataset_root),
+        "name": dataset_root.name,
+        "episode": ep_idx,
+        "totalFrames": total_frames,
+        "fps": fps,
+        "stateNames": [],
+        "actionNames": [],
+        "cameraKeys": camera_keys,
+        "videoTemplate": "",
+        "videoChunkIndex": 0,
+        "videoFileIndex": 0,
+        "frames": frames,
+        "sourcePath": str(ep_dir),
+        "videoWarmupS": video_warmup_s,
+    }
+
+
 def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int | None = None) -> dict[str, Any]:
+    if _has_gmsl2_episodes(dataset_root) and not _has_lerobot_v3_data(dataset_root):
+        return _read_gmsl2_timeline(dataset_root, episode)
     try:
         import pyarrow.compute as pc
         import pyarrow.parquet as pq
     except Exception as exc:  # noqa: BLE001
-        return {"datasetRoot": str(dataset_root), "error": f"pyarrow unavailable: {exc}"}
+        return _empty_timeline(dataset_root, error=f"pyarrow unavailable: {exc}")
 
     info = _load_dataset_info(dataset_root)
     state_names = _feature_names(info, "observation.state")
     action_names = _feature_names(info, "action")
     cube_pose_names = _cube_names_for_timeline(dataset_root, info)
     camera_keys = _camera_keys(info)
+    if _has_gmsl2_episodes(dataset_root) and not camera_keys:
+        ep_idx = episode if episode is not None else int(state.replay.episode or 0)
+        ep_dir = dataset_root / "episodes" / f"episode_{ep_idx:06d}"
+        camera_keys = [f.stem for f in sorted(ep_dir.glob("*.mkv")) if f.stat().st_size > 1024]
     fps = int(info.get("fps") or state.replay.fps or 30)
     data_files = _dataset_data_files(dataset_root)
     if not data_files:
-        return {
-            "datasetRoot": str(dataset_root),
-            "name": dataset_root.name,
-            "totalFrames": 0,
-            "frames": [],
-            "cameraKeys": camera_keys,
-            "cubePoseNames": cube_pose_names,
-            "stateNames": state_names,
-            "actionNames": action_names,
-            "fps": fps,
-            "error": "no parquet files",
-        }
+        return _empty_timeline(
+            dataset_root,
+            fps=fps,
+            state_names=state_names,
+            action_names=action_names,
+            camera_keys=camera_keys,
+            cube_pose_names=cube_pose_names,
+            error="no parquet files",
+        )
 
     data_file = data_files[-1]
     table = pq.read_table(data_file)
@@ -2285,23 +2873,26 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         episode_options = sorted(set(episodes))
         selected_episode = episode if episode is not None else _selected_episode_for_dataset(state, dataset_root, episode_options)
         if episode_options and selected_episode not in episode_options:
-            return {
-                "datasetRoot": str(dataset_root),
-                "name": dataset_root.name,
-                "episode": selected_episode,
-                "totalFrames": 0,
-                "frames": [],
-                "cameraKeys": camera_keys,
-                "cubePoseNames": cube_pose_names,
-                "stateNames": state_names,
-                "actionNames": action_names,
-                "fps": fps,
-                "error": f"episode {selected_episode} not found",
-            }
+            return _empty_timeline(
+                dataset_root,
+                fps=fps,
+                episode=selected_episode,
+                state_names=state_names,
+                action_names=action_names,
+                camera_keys=camera_keys,
+                cube_pose_names=cube_pose_names,
+                error=f"episode {selected_episode} not found",
+            )
         table = table.filter(pc.equal(table["episode_index"], selected_episode))
         episode = selected_episode
     else:
         episode = 0
+
+    video_warmup_s = 0.0
+    # GMSL2 splitmux episode files are already cut at the playable fragment
+    # boundary. The legacy replay_warmup_s field should not be applied to
+    # LeRobot v3 timelines; doing so maps a 10s/603-frame episode to only
+    # about 9s/540 displayed frames.
 
     rows = table.to_pylist()
     rows.sort(key=lambda row: int(row.get("frame_index") or 0))
@@ -2310,6 +2901,10 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
     for cube_name in sidecar_cube_poses:
         if cube_name not in cube_pose_names:
             cube_pose_names.append(cube_name)
+
+    ep_dir: Path | None = None
+    if _has_gmsl2_episodes(dataset_root):
+        ep_dir = dataset_root / "episodes" / f"episode_{int(episode or 0):06d}"
 
     frames: list[dict[str, Any]] = []
     for row_index, row in enumerate(rows):
@@ -2337,6 +2932,9 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
             }
         )
 
+    if ep_dir is not None and ep_dir.is_dir():
+        _attach_touch_frames(frames, ep_dir, video_warmup_s=video_warmup_s)
+
     video_template = str(info.get("video_path") or "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
 
     return {
@@ -2354,10 +2952,123 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         "videoFileIndex": 0,
         "frames": frames,
         "sourcePath": str(data_file),
+        "videoWarmupS": video_warmup_s,
     }
 
 
+def _probe_video_duration_s(video_path: Path, *, timeout_s: float = 5.0) -> float | None:
+    if shutil.which("ffprobe") is None:
+        return None
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        duration = float(result.stdout.strip())
+    except (TypeError, ValueError):
+        return None
+    return duration if math.isfinite(duration) and duration > 0 else None
+
+
+def _cached_mp4_is_usable(mp4_path: Path, mkv_path: Path, expected_duration_s: float | None = None) -> bool:
+    try:
+        mp4_stat = mp4_path.stat()
+        mkv_stat = mkv_path.stat()
+    except OSError:
+        return False
+    if mp4_stat.st_size <= 4096 or mp4_stat.st_mtime < mkv_stat.st_mtime:
+        return False
+
+    if expected_duration_s is not None and expected_duration_s > 0:
+        duration_s = _probe_video_duration_s(mp4_path)
+        if duration_s is not None:
+            min_duration_s = max(0.5, min(expected_duration_s * 0.75, expected_duration_s - 0.5))
+            return duration_s >= min_duration_s
+        # If ffprobe is unavailable, reject obviously truncated cache files.
+        if mkv_stat.st_size > 0 and mp4_stat.st_size < mkv_stat.st_size * 0.12:
+            return False
+
+    return True
+
+
+def _remux_mkv_to_mp4(mkv_path: Path, expected_duration_s: float | None = None) -> Path | None:
+    mp4_path = mkv_path.with_suffix(".mp4")
+    if mp4_path.is_file() and _cached_mp4_is_usable(mp4_path, mkv_path, expected_duration_s):
+        return mp4_path
+    if mp4_path.exists():
+        try:
+            mp4_path.unlink()
+        except OSError:
+            return None
+
+    tmp_path = mp4_path.with_name(f".{mp4_path.stem}.{os.getpid()}.tmp.mp4")
+    if tmp_path.exists():
+        try:
+            tmp_path.unlink()
+        except OSError:
+            return None
+
+    cmd = [
+        "gst-launch-1.0", "-q",
+        "filesrc", f"location={mkv_path}",
+        "!", "matroskademux",
+        "!", "h265parse",
+        "!", "nvv4l2decoder",
+        "!", "nvv4l2h264enc", "bitrate=10000000",
+        "iframeinterval=60", "idrinterval=60", "insert-sps-pps=1", "insert-vui=1",
+        "!", "h264parse", "config-interval=-1",
+        "!", "mp4mux", "faststart=true",
+        "!", "filesink", f"location={tmp_path}",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=60, check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return None
+    if result.returncode != 0 or not _cached_mp4_is_usable(tmp_path, mkv_path, expected_duration_s):
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return None
+    try:
+        tmp_path.replace(mp4_path)
+    except OSError:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return None
+    return mp4_path
+
+
 def _resolve_video_path(state: GatewayState, dataset_root: Path, camera_key: str) -> Path | None:
+    if _has_gmsl2_episodes(dataset_root):
+        episode = int(state.replay.episode or 0)
+        ep_dir = dataset_root / "episodes" / f"episode_{episode:06d}"
+        mkv = ep_dir / f"{camera_key}.mkv"
+        if not mkv.is_file():
+            return None
+        expected_duration_s = None
+        meta_path = ep_dir / "meta.json"
+        if meta_path.is_file():
+            try:
+                with meta_path.open() as f:
+                    expected_duration_s = _first_finite(json.load(f).get("duration_s"), default=0.0)
+            except (OSError, json.JSONDecodeError):
+                expected_duration_s = None
+        return _remux_mkv_to_mp4(mkv, expected_duration_s=expected_duration_s) or mkv
     info = _load_dataset_info(dataset_root)
     template = str(info.get("video_path") or "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
     relative = template.format(video_key=camera_key, chunk_index=0, file_index=0)
@@ -2367,7 +3078,6 @@ def _resolve_video_path(state: GatewayState, dataset_root: Path, camera_key: str
     except ValueError:
         return None
     if not candidate.is_file():
-        # fall back to scanning chunk-* directories for the first mp4
         camera_dir = dataset_root / "videos" / camera_key
         if camera_dir.is_dir():
             for mp4 in sorted(camera_dir.glob("chunk-*/*.mp4")):
@@ -2393,6 +3103,138 @@ def _serve_static_file(handler: BaseHTTPRequestHandler, asset_path: Path, conten
                 handler.wfile.write(chunk)
             except (BrokenPipeError, ConnectionResetError):
                 return
+
+
+def _stop_camera_preview_process(state: GatewayState) -> None:
+    proc = state.camera_preview_process
+    state.camera_preview_process = None
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def _serve_camera_preview_mjpeg(
+    handler: BaseHTTPRequestHandler,
+    *,
+    state: GatewayState,
+    sensor_id: int,
+    sensor_mode: int,
+    source_width: int,
+    source_height: int,
+    source_fps: int,
+) -> None:
+    if shutil.which("gst-launch-1.0") is None:
+        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "gst-launch-1.0 not found"})
+        return
+    output_width = 480
+    output_height = max(1, round(output_width * source_height / max(source_width, 1)))
+    output_fps = 10
+    caps_in = (
+        "video/x-raw(memory:NVMM),"
+        f"format=NV12,width={source_width},height={source_height},framerate={source_fps}/1"
+    )
+    caps_out = f"video/x-raw,format=I420,width={output_width},height={output_height}"
+    cmd = [
+        "gst-launch-1.0",
+        "-q",
+        "nvarguscamerasrc",
+        f"sensor-id={sensor_id}",
+        f"sensor-mode={sensor_mode}",
+        "do-timestamp=true",
+        "!",
+        caps_in,
+        "!",
+        "nvvidconv",
+        "!",
+        caps_out,
+        "!",
+        "videorate",
+        "!",
+        f"video/x-raw,framerate={output_fps}/1",
+        "!",
+        "jpegenc",
+        "quality=65",
+        "!",
+        "multipartmux",
+        "boundary=frame",
+        "!",
+        "fdsink",
+        "fd=1",
+    ]
+    with state.lock:
+        _stop_camera_preview_process(state)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        cwd=str(Path.cwd()),
+    )
+    with state.lock:
+        state.camera_preview_process = proc
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    try:
+        assert proc.stdout is not None
+        while True:
+            chunk = proc.stdout.read(64 * 1024)
+            if not chunk:
+                break
+            try:
+                handler.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                break
+    finally:
+        with state.lock:
+            if state.camera_preview_process is proc:
+                state.camera_preview_process = None
+        proc.terminate()
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _camera_preview_params(state: GatewayState, device_id: str) -> tuple[int, int, int, int, int] | None:
+    device = next((d for d in state.devices if d.get("id") == device_id and d.get("kind") == "camera"), None)
+    if device is None:
+        return None
+    config = device.get("config") if isinstance(device.get("config"), dict) else {}
+    try:
+        sensor_id = int(config.get("sensor_id", str(device_id).rsplit("_", 1)[-1]))
+    except (TypeError, ValueError):
+        return None
+    sensor_mode = int(config.get("sensor_mode") or 0)
+    width = int(config.get("width") or 1920)
+    height = int(config.get("height") or 1080)
+    fps = int(config.get("fps") or 60)
+    return sensor_id, max(sensor_mode, 0), max(width, 1), max(height, 1), max(fps, 1)
+
+
+def _box_preview_payload(state: GatewayState, device_id: str) -> dict[str, Any]:
+    box = state.device_preview.get("box")
+    if not isinstance(box, dict):
+        box = {}
+    sensors = box.get("sensors") if isinstance(box.get("sensors"), dict) else {}
+    updated_at = float(box.get("updatedAt") or 0.0)
+    stale_s = max(0.0, time.time() - updated_at) if updated_at else None
+    return {
+        "active": bool(box.get("active")) and (stale_s is None or stale_s < 2.0),
+        "deviceId": device_id,
+        "updatedAt": updated_at,
+        "staleS": stale_s,
+        "receivedAtS": box.get("received_at_s"),
+        "receivedWallTimeS": box.get("received_wall_time_s"),
+        "status": box.get("status") if isinstance(box.get("status"), dict) else {},
+        "sensor": sensors.get(device_id) if isinstance(sensors, dict) else None,
+        "sensors": sensors,
+    }
 
 
 def _serve_video(handler: BaseHTTPRequestHandler, video_path: Path) -> None:
@@ -2456,6 +3298,8 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         state.recording.pid = None
         state.recording.frameIndex = 0 if process.returncode == 0 else state.recording.frameIndex
         state.recording.queueDepth = 0
+        if isinstance(state.device_preview.get("box"), dict):
+            state.device_preview["box"] = {**state.device_preview["box"], "active": False}
         if state.recording.lastOutput:
             state.recording.message = f"Recorder exited with code {process.returncode}: {state.recording.lastOutput}"
         else:
@@ -2545,6 +3389,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "processing": _processing_items(state),
         "trajectory": trajectory,
         "events": [asdict(event) for event in state.events],
+        "tasks": _tasks_with_progress(state),
     }
 
 
@@ -2642,6 +3487,26 @@ def _mark_connected_devices(state: GatewayState, kind: str, summary: str) -> Non
         device["state"] = "running" if str(device.get("id")) in connected_ids else "error"
 
 
+def _recorder_script(state: GatewayState) -> tuple[Path, str]:
+    """Resolve which recorder process the gateway should spawn for this config.
+
+    Returns ``(script_path, config_flag)`` so callers can build the command.
+    Legacy handheld configs (no ``recorder`` block) keep the old
+    ``--config_path`` underscore flag; the Thor GMSL2 recorder uses the
+    hyphenated ``--config-path`` argparse convention.
+    """
+
+    raw = state.config.get("recorder") if isinstance(state.config.get("recorder"), dict) else {}
+    script_path = raw.get("script") if isinstance(raw, dict) else None
+    if script_path:
+        script = Path(str(script_path))
+        if not script.is_absolute():
+            script = state.repo_root / script
+        flag = str(raw.get("config_flag") or "--config-path")
+        return script, flag
+    return state.repo_root / DEFAULT_RECORDER_SCRIPT, "--config_path"
+
+
 def _ensure_recorder_running(state: GatewayState) -> subprocess.Popen[str]:
     process = state.process
     if process is None or process.poll() is not None:
@@ -2664,11 +3529,20 @@ def _connect_recorder(state: GatewayState) -> None:
         return
 
     state.recording.datasetRoot = str(_dataset_config(state.config).get("root") or "")
+    recorder_script, config_flag = _recorder_script(state)
     command = [
         str(_venv_python(state.repo_root)),
-        str(state.repo_root / "tools" / "handheld" / "handheld_record.py"),
-        f"--config_path={state.config_path}",
+        str(recorder_script),
+        f"{config_flag}={state.config_path}",
     ]
+    # Thor GMSL2 recorder: skip its own nvarguscamerasrc probe pass.
+    # Operators run tools/thor/gmsl2/recover_argus.sh before Connect, which
+    # already opens each sensor once through Argus; re-probing here adds an
+    # extra 11x open/close cycle that has been observed to destabilise
+    # nvargus-daemon (sids that recover saw as OK time out 8s later, then
+    # the first PLAYING transition deadlocks the Python thread).
+    if "thor_record" in str(recorder_script):
+        command.append("--skip-argus-probe")
     state.process = subprocess.Popen(
         command,
         cwd=state.repo_root,
@@ -2685,6 +3559,10 @@ def _connect_recorder(state: GatewayState) -> None:
     state.recording.frameIndex = 0
     state.recording.queueDepth = 0
     state.recording.message = "Connecting handheld devices"
+    # Drop the previous session's log lines so the frontend doesn't show
+    # stale output from a prior crashed recorder mixed in with the new one.
+    state.recording.lastOutput = ""
+    state.recording.recentOutput = []
     _set_all_device_states(state, "warning")
     state.log("info", f"Started handheld recorder pid={state.process.pid}")
     _start_output_reader(state, state.process)
@@ -2972,9 +3850,33 @@ def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> Non
     state.replay.message = validation["message"]
 
 
+_RECORDER_NOISE_PREFIXES = ("[TLV_LOG_UPLOAD]", "GST_ARGUS:", "NvMMLite")
+
+
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
+    if any(output.startswith(p) for p in _RECORDER_NOISE_PREFIXES):
+        return
+    if output.startswith("BOX_LIVE "):
+        try:
+            payload = json.loads(output.removeprefix("BOX_LIVE ").strip())
+        except json.JSONDecodeError:
+            state.log("warn", "recorder: malformed BOX_LIVE payload")
+            return
+        if isinstance(payload, dict):
+            state.device_preview["box"] = {**payload, "active": True, "updatedAt": time.time()}
+        return
     state.recording.lastOutput = output
     state.recording.message = output
+    # Append to the ring buffer so the frontend can render every line the
+    # recorder wrote between two snapshot polls. Without this, all the
+    # rapid bursts (Phase 1 spawn × 11, Phase 2 wait_ready × 11, parallel
+    # retry × N, Auto-recover decision) collapse to whatever line happened
+    # to land last in the poll window.
+    state.recording.recentOutput.append(output)
+    if len(state.recording.recentOutput) > _RECORDER_OUTPUT_RING_CAP:
+        del state.recording.recentOutput[
+            : len(state.recording.recentOutput) - _RECORDER_OUTPUT_RING_CAP
+        ]
     state.log("info", f"recorder: {output}")
 
     failed_camera_match = re.search(r"Camera '([^']+)' failed to connect", output)
@@ -2988,9 +3890,13 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         ("Cameras:", "camera"),
         ("Tactiles:", "tactile"),
         ("Handheld grippers:", "handheld_gripper"),
+        ("Box devices:", "box_collection"),
     ):
         if output.startswith(prefix):
             _mark_connected_devices(state, kind, output.removeprefix(prefix).strip())
+
+    if output.startswith("Box rates:"):
+        _apply_box_rates(state, output.removeprefix("Box rates:").strip())
 
     recorded_match = re.search(r"Recorded\s+(\d+)\s+frames", output)
     if recorded_match:
@@ -3028,6 +3934,23 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         state.recording.frameIndex = 0
     elif "Input stream closed; stopping recording session." in output:
         state.recording.message = "Recorder input closed; finalizing dataset"
+
+
+def _apply_box_rates(state: GatewayState, rates_str: str) -> None:
+    """Parse ``box_imu=200, box_gripper=200, ...`` and update device fps."""
+    for part in rates_str.split(","):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        sid, hz_str = part.split("=", 1)
+        sid = sid.strip()
+        try:
+            hz = int(round(float(hz_str)))
+        except (TypeError, ValueError):
+            continue
+        for device in state.devices:
+            if device.get("kind") == "box_collection" and device.get("id") == sid:
+                device["fps"] = hz
 
 
 def _dataset_arg_for_container_replay(repo_root: Path, dataset_root: Path) -> str:
@@ -3312,7 +4235,7 @@ def _stop_recorder(state: GatewayState, action: str) -> None:
 
     if action == "save":
         try:
-            _write_recorder_stdin(process, "s\n" if state.recording.state == "recording" else "y\n")
+            _write_recorder_stdin(process, "save\n")
             state.recording.state = "saving"
             state.recording.message = "Save requested; waiting for next episode"
             state.log("info", "Requested recorder save")
@@ -3395,6 +4318,42 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 return
             _serve_static_file(self, asset_path, "model/stl")
             return
+        if path == "/api/device-preview/box":
+            device_id = query.get("device", [""])[0]
+            if not device_id:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing device"})
+                return
+            with self.server.state.lock:
+                _json_response(self, HTTPStatus.OK, _box_preview_payload(self.server.state, device_id))
+                return
+        if path == "/api/device-preview/camera.mjpeg":
+            device_id = query.get("key", [""])[0]
+            if not device_id:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing key"})
+                return
+            with self.server.state.lock:
+                if self.server.state.process is not None:
+                    _json_response(
+                        self,
+                        HTTPStatus.CONFLICT,
+                        {"error": "camera preview is idle-only; stop the recorder before previewing"},
+                    )
+                    return
+                params = _camera_preview_params(self.server.state, device_id)
+            if params is None:
+                _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"camera not found: {device_id}"})
+                return
+            sensor_id, sensor_mode, source_width, source_height, source_fps = params
+            _serve_camera_preview_mjpeg(
+                self,
+                state=self.server.state,
+                sensor_id=sensor_id,
+                sensor_mode=sensor_mode,
+                source_width=source_width,
+                source_height=source_height,
+                source_fps=source_fps,
+            )
+            return
         if path == "/api/replay/video":
             requested = query.get("path", [""])[0]
             camera_key = query.get("key", [""])[0]
@@ -3415,6 +4374,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/handheld/config":
                 _json_response(self, HTTPStatus.OK, self.server.state.config)
+                return
+            if path == "/api/tasks":
+                _json_response(self, HTTPStatus.OK, {"tasks": _tasks_with_progress(self.server.state)})
                 return
             if path == "/api/replay/timeline":
                 requested = query.get("path", [""])[0]
@@ -3525,24 +4487,22 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/processing/datasets-root":
                     requested = (query.get("path", [""])[0] or "").strip()
-                    if not requested:
-                        _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing path"})
-                        return
-                    candidate = Path(requested)
-                    if not candidate.is_absolute():
-                        candidate = self.server.state.repo_root / candidate
                     try:
-                        resolved = candidate.resolve()
-                    except OSError as exc:
-                        _json_response(self, HTTPStatus.BAD_REQUEST, {"error": f"cannot resolve path: {exc}"})
+                        created = _set_datasets_root(self.server.state, requested)
+                    except ValueError as exc:
+                        _json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
-                    if not resolved.is_dir():
-                        _json_response(self, HTTPStatus.BAD_REQUEST, {"error": f"not a directory: {resolved}"})
-                        return
-                    self.server.state.datasets_root = resolved
-                    self.server.state.selected_replay_root = None
-                    self.server.state.log("info", f"Datasets root changed to {resolved}")
-                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    resolved = self.server.state.datasets_root
+                    message = (
+                        f"Datasets root did not exist; created {resolved}"
+                        if created
+                        else f"Datasets root changed to {resolved}"
+                    )
+                    self.server.state.log("info", message)
+                    snapshot = _snapshot(self.server.state)
+                    if created:
+                        snapshot["notice"] = message
+                    _json_response(self, HTTPStatus.OK, snapshot)
                     return
                 if path == "/api/annotation/save":
                     _save_annotation(self.server.state, _read_json_body(self))
@@ -3551,6 +4511,19 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 if path == "/api/replay/abort":
                     _abort_replay(self.server.state)
                     self.server.state.log("warn", "Replay aborted")
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/tasks/create":
+                    task = _create_task(self.server.state, _read_json_body(self))
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/tasks/update":
+                    task = _update_task(self.server.state, _read_json_body(self))
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/tasks/delete":
+                    task_id = (query.get("id", [""])[0] or "").strip()
+                    _delete_task(self.server.state, task_id)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
         except Exception as exc:  # noqa: BLE001
@@ -3583,7 +4556,7 @@ def make_state(repo_root: Path, config_path: Path, datasets_root: Path | None = 
         recording=_recording_status_from_config(config),
         replay=_replay_status_from_config(config),
         datasets_root=resolved_datasets_root,
-        devices=_device_statuses(config),
+        devices=_device_statuses(config, resolved_root),
     )
     state.replay.mujocoValidation = _new_mujoco_validation(state)
     state.log("info", f"Loaded handheld config {resolved_config}")

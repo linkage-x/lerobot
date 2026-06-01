@@ -37,6 +37,7 @@ from typing import Any, Callable, Iterator
 import numpy as np
 
 from lerobot.cameras.configs import CameraConfig, ColorMode
+from lerobot.cameras.gmsl2.configuration_gmsl2 import Gmsl2CameraConfig  # noqa: F401
 from lerobot.cameras.hikrobot.configuration_hikrobot import HikrobotCameraConfig  # noqa: F401
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401

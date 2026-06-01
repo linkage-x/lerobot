@@ -1,11 +1,13 @@
 import { handheldConfigSummary, initialDevices } from "./defaultHandheldConfig";
 import type {
+  CollectionTask,
   EpisodeAnnotation,
   CalibrationCamera,
   CalibrationStatus,
   ConfigSummary,
   DatasetExportStatus,
   DeviceStatus,
+  BoxPreviewPayload,
   EventLogItem,
   GatewayStatus,
   ProcessingItem,
@@ -53,6 +55,8 @@ export type GuiSnapshot = {
   processing: ProcessingItem[];
   trajectory: TrajectoryPoint[];
   events: EventLogItem[];
+  tasks: CollectionTask[];
+  notice?: string;
 };
 
 export class DataCollectionGuiApi {
@@ -78,7 +82,11 @@ export class DataCollectionGuiApi {
       streamingEncoding: handheldConfigSummary.streamingEncoding,
       vcodec: handheldConfigSummary.vcodec,
       softSync: handheldConfigSummary.softSync,
-      rerun: handheldConfigSummary.rerun
+      rerun: handheldConfigSummary.rerun,
+      recorderScript: handheldConfigSummary.recorderScript,
+      rigType: handheldConfigSummary.rigType,
+      hardwareSync: handheldConfigSummary.hardwareSync,
+      cameraDefaults: handheldConfigSummary.cameraDefaults
     },
     devices: initialDevices,
     recording: {
@@ -125,7 +133,10 @@ export class DataCollectionGuiApi {
       notes: "",
       annotator: "",
       updatedAt: "",
-      source: "default"
+      source: "default",
+      segments: [],
+      reviewStatus: "pending",
+      reviewComment: ""
     },
     calibration: {
       state: "idle",
@@ -157,6 +168,7 @@ export class DataCollectionGuiApi {
     recordedDatasets: [],
     processing: [],
     trajectory: [],
+    tasks: [],
     events: [
       {
         id: "boot",
@@ -439,6 +451,9 @@ export class DataCollectionGuiApi {
   async setDatasetsRoot(path: string): Promise<GuiSnapshot> {
     const remote = await this.postRemoteSnapshot(`/api/processing/datasets-root?path=${encodeURIComponent(path)}`);
     if (remote) {
+      if (remote.notice) {
+        window.alert(remote.notice);
+      }
       return remote;
     }
     await wait(120);
@@ -496,6 +511,26 @@ export class DataCollectionGuiApi {
     return `${this.apiBase}/api/replay/video?${params.toString()}`;
   }
 
+  cameraPreviewUrl(deviceId: string): string {
+    const params = new URLSearchParams({ key: deviceId });
+    return `${this.apiBase}/api/device-preview/camera.mjpeg?${params.toString()}`;
+  }
+
+  async fetchBoxPreview(deviceId: string): Promise<BoxPreviewPayload | null> {
+    try {
+      const params = new URLSearchParams({ device: deviceId });
+      const response = await fetch(`${this.apiBase}/api/device-preview/box?${params.toString()}`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as BoxPreviewPayload;
+    } catch {
+      return null;
+    }
+  }
+
   async fetchReplayTimeline(datasetPath: string, episode?: number): Promise<ReplayTimeline | null> {
     try {
       const params = new URLSearchParams({ path: datasetPath });
@@ -527,6 +562,54 @@ export class DataCollectionGuiApi {
       message: "Replay aborted; robot command stream stopped"
     };
     this.log("warn", "Replay aborted");
+    return this.getSnapshot();
+  }
+
+  async createTask(task: Partial<CollectionTask>): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteJsonSnapshot("/api/tasks/create", task);
+    if (remote) {
+      return remote;
+    }
+    await wait(140);
+    const newTask: CollectionTask = {
+      id: `task-${Date.now()}`,
+      name: task.name ?? "",
+      description: task.description ?? "",
+      targetEpisodes: task.targetEpisodes ?? 0,
+      completedEpisodes: 0,
+      status: "pending",
+      assignee: task.assignee ?? "",
+      datasetRepoId: task.datasetRepoId ?? "",
+      tags: task.tags ?? [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    this.snapshot.tasks = [...this.snapshot.tasks, newTask];
+    this.log("info", `Created task: ${newTask.name}`);
+    return this.getSnapshot();
+  }
+
+  async updateTask(task: Partial<CollectionTask>): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteJsonSnapshot("/api/tasks/update", task);
+    if (remote) {
+      return remote;
+    }
+    await wait(120);
+    this.snapshot.tasks = this.snapshot.tasks.map((t) =>
+      t.id === task.id ? { ...t, ...task, updatedAt: new Date().toISOString() } : t
+    );
+    this.log("info", `Updated task: ${task.name ?? task.id}`);
+    return this.getSnapshot();
+  }
+
+  async deleteTask(taskId: string): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot(`/api/tasks/delete?id=${encodeURIComponent(taskId)}`);
+    if (remote) {
+      return remote;
+    }
+    await wait(120);
+    this.snapshot.tasks = this.snapshot.tasks.filter((t) => t.id !== taskId);
+    this.log("info", `Deleted task: ${taskId}`);
     return this.getSnapshot();
   }
 
@@ -673,6 +756,8 @@ export class DataCollectionGuiApi {
         state: "error",
         message: `Export ${command} failed: ${message}`
       };
+    } else if (endpoint.includes("/processing/datasets-root")) {
+      window.alert(`Datasets Root save failed: ${message}`);
     } else if (endpoint.includes("/processing/traj-gen")) {
       const fallbackMessage = "Generate EE Trajectory failed.";
       const displayMessage = message || fallbackMessage;
@@ -703,6 +788,12 @@ export class DataCollectionGuiApi {
       snapshot.annotation?.datasetRoot === activeAnnotationPath && snapshot.annotation.episode === snapshot.replay.episode
         ? snapshot.annotation
         : this.mockAnnotation(snapshot, false);
+    const annotationWithDefaults: typeof annotation = {
+      ...annotation,
+      segments: annotation.segments ?? [],
+      reviewStatus: annotation.reviewStatus ?? "pending",
+      reviewComment: annotation.reviewComment ?? ""
+    };
     return {
       ...snapshot,
       replay: {
@@ -713,7 +804,8 @@ export class DataCollectionGuiApi {
       },
       recordedDatasets,
       processing,
-      annotation,
+      annotation: annotationWithDefaults,
+      tasks: snapshot.tasks ?? this.snapshot.tasks ?? [],
       calibration: snapshot.calibration ?? this.snapshot.calibration,
       datasetExport: snapshot.datasetExport ?? {
         ...this.snapshot.datasetExport,
@@ -743,7 +835,10 @@ export class DataCollectionGuiApi {
       notes: "",
       annotator: "",
       updatedAt: "",
-      source: "default"
+      source: "default",
+      segments: [],
+      reviewStatus: "pending",
+      reviewComment: ""
     };
   }
 
