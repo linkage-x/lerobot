@@ -56,6 +56,7 @@ export type GuiSnapshot = {
   trajectory: TrajectoryPoint[];
   events: EventLogItem[];
   tasks: CollectionTask[];
+  activeTaskId?: string;
   notice?: string;
 };
 
@@ -609,7 +610,21 @@ export class DataCollectionGuiApi {
     }
     await wait(120);
     this.snapshot.tasks = this.snapshot.tasks.filter((t) => t.id !== taskId);
+    if (this.snapshot.activeTaskId === taskId) {
+      this.snapshot.activeTaskId = "";
+    }
     this.log("info", `Deleted task: ${taskId}`);
+    return this.getSnapshot();
+  }
+
+  async setActiveTask(taskId: string): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot(`/api/tasks/activate?id=${encodeURIComponent(taskId)}`);
+    if (remote) {
+      return remote;
+    }
+    await wait(80);
+    this.snapshot.activeTaskId = taskId;
+    this.log("info", taskId ? `Recording bound to task: ${taskId}` : "Cleared active recording task");
     return this.getSnapshot();
   }
 

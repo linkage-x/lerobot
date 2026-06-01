@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import copy
 import csv
 import json
 import math
@@ -122,6 +123,7 @@ class GatewayState:
     calibration: CalibrationStatus = field(default_factory=CalibrationStatus)
     events: list[EventLogItem] = field(default_factory=list)
     selected_replay_root: Path | None = None
+    active_task_id: str | None = None
     process: subprocess.Popen[str] | None = None
     replay_process: subprocess.Popen[str] | None = None
     replay_process_kind: str = ""
@@ -1201,19 +1203,31 @@ def _normalize_task(payload: dict[str, Any], *, task_id: str | None = None) -> d
     }
 
 
+def _dataset_episode_count(dataset_root: Path) -> int:
+    if _has_gmsl2_episodes(dataset_root):
+        episodes, _ = _gmsl2_dataset_stats(dataset_root)
+        return episodes
+    return int(_load_dataset_info(dataset_root).get("total_episodes") or 0)
+
+
 def _count_completed_episodes(state: GatewayState, repo_id: str) -> int:
     if not repo_id or not state.datasets_root:
+        return 0
+    # datasetRepoId carries a namespace ("local/pick_and_place") but on-disk
+    # dataset directories use only the trailing name, optionally suffixed with a
+    # capture timestamp ("pick_and_place_20260528_103422"). Match on the base
+    # name against each candidate's name prefixes so both forms count.
+    base_name = repo_id.split("/")[-1].strip()
+    if not base_name:
         return 0
     total = 0
     try:
         for candidate in state.datasets_root.iterdir():
-            if not candidate.is_dir():
+            if not _is_dataset_root(candidate):
                 continue
-            if repo_id and repo_id not in candidate.name:
+            if base_name not in _dataset_name_prefixes(candidate.name):
                 continue
-            info = _load_dataset_info(candidate)
-            if info:
-                total += int(info.get("total_episodes", 0))
+            total += _dataset_episode_count(candidate)
     except OSError:
         pass
     return total
@@ -1260,7 +1274,131 @@ def _delete_task(state: GatewayState, task_id: str) -> None:
     if len(filtered) == len(tasks):
         raise ValueError(f"Task not found: {task_id}")
     _write_tasks(state, filtered)
+    if state.active_task_id == task_id:
+        state.active_task_id = None
     state.log("info", f"Deleted task: {task_id}")
+
+
+_ACTIVE_TASK_OVERLAY_NAME = ".active_task_config.yaml"
+
+
+def _find_task(state: GatewayState, task_id: str | None) -> dict[str, Any] | None:
+    if not task_id:
+        return None
+    for task in _read_tasks(state):
+        if task.get("id") == task_id:
+            return task
+    return None
+
+
+def _recorder_is_running(state: GatewayState) -> bool:
+    return state.process is not None and state.process.poll() is None
+
+
+def _set_active_task(state: GatewayState, task_id: str) -> dict[str, Any] | None:
+    """Bind (or clear) the task that the next Connect records into.
+
+    Passing an empty id clears the binding (records into the YAML default).
+    The binding is consumed at Connect time when the overlay config is built,
+    so switching while a recorder process is live is rejected: dataset_root is
+    fixed at recorder spawn and cannot change mid-session.
+    """
+
+    task_id = (task_id or "").strip()
+    if not task_id:
+        if _recorder_is_running(state) and state.active_task_id is not None:
+            raise ValueError("Disconnect the recorder before unbinding the active task.")
+        state.active_task_id = None
+        state.log("info", "Cleared active recording task")
+        return None
+    task = _find_task(state, task_id)
+    if task is None:
+        raise ValueError(f"Task not found: {task_id}")
+    if not str(task.get("datasetRepoId") or "").strip():
+        raise ValueError("Task has no dataset repo id; set one before recording into it.")
+    if _recorder_is_running(state) and state.active_task_id not in (None, task_id):
+        raise ValueError("Disconnect the recorder before binding a different task.")
+    state.active_task_id = task_id
+    state.log("info", f"Recording bound to task: {task['name']} ({task['datasetRepoId']})")
+    return task
+
+
+def _task_datasets_dir(state: GatewayState) -> Path | None:
+    """Directory under which task datasets live and are counted from."""
+    if state.datasets_root is not None:
+        return state.datasets_root
+    base = _resolve_dataset_root(state.repo_root, _dataset_config(state.config).get("root"))
+    return base.parent if base is not None else None
+
+
+def _build_task_overlay_config(
+    base_config: dict[str, Any], task: dict[str, Any], datasets_dir: Path
+) -> dict[str, Any]:
+    """Deep-copy ``base_config`` and patch only ``dataset.*`` so the recorder
+    writes into the task's dataset.
+
+    The on-disk ``root`` basename is kept equal to the ``repo_id`` trailing
+    segment because ``_count_completed_episodes`` attributes episodes to a task
+    by matching that name against the (timestamp-suffixed) directory names.
+    """
+
+    repo_id = str(task.get("datasetRepoId") or "").strip()
+    if not repo_id:
+        raise ValueError("Task has no datasetRepoId.")
+    name = repo_id.split("/")[-1].strip()
+    if not name:
+        raise ValueError(f"Task datasetRepoId has no name segment: {repo_id!r}")
+    overlay = copy.deepcopy(base_config)
+    dataset = overlay.get("dataset")
+    if not isinstance(dataset, dict):
+        dataset = {}
+        overlay["dataset"] = dataset
+    dataset["repo_id"] = repo_id
+    dataset["root"] = str(datasets_dir / name)
+    prompt = str(task.get("description") or task.get("name") or "").strip()
+    if prompt:
+        dataset["single_task"] = prompt
+    return overlay
+
+
+def _write_overlay_config(state: GatewayState, overlay: dict[str, Any]) -> Path:
+    import yaml
+
+    path = state.repo_root / "outputs" / _ACTIVE_TASK_OVERLAY_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as overlay_file:
+        yaml.safe_dump(overlay, overlay_file, sort_keys=False, allow_unicode=True)
+    return path
+
+
+def _resolve_recorder_config_path(state: GatewayState) -> Path:
+    """Config path to spawn the recorder with.
+
+    Returns the active task's overlay config when one is bound, else the
+    repo's literal config file (current behaviour). Sets
+    ``state.recording.datasetRoot`` to whichever dataset root will be used.
+    """
+
+    active_task = _find_task(state, state.active_task_id)
+    if active_task is None or not str(active_task.get("datasetRepoId") or "").strip():
+        state.active_task_id = None
+        state.recording.datasetRoot = str(_dataset_config(state.config).get("root") or "")
+        return state.config_path
+    datasets_dir = _task_datasets_dir(state)
+    if datasets_dir is None:
+        raise RuntimeError(
+            "Cannot record into a task without a datasets root; start the gateway "
+            "with --datasets-root or set dataset.root in the config."
+        )
+    overlay = _build_task_overlay_config(state.config, active_task, datasets_dir)
+    overlay_path = _write_overlay_config(state, overlay)
+    state.recording.datasetRoot = str(_dataset_config(overlay).get("root") or "")
+    state.log(
+        "info",
+        f"Recording into task '{active_task['name']}' dataset {active_task['datasetRepoId']} "
+        f"(config {overlay_path})",
+    )
+    return overlay_path
 
 
 def _annotation_store_path(dataset_root: Path) -> Path:
@@ -3390,6 +3528,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "trajectory": trajectory,
         "events": [asdict(event) for event in state.events],
         "tasks": _tasks_with_progress(state),
+        "activeTaskId": state.active_task_id or "",
     }
 
 
@@ -3528,12 +3667,12 @@ def _connect_recorder(state: GatewayState) -> None:
         state.recording.message = "Devices are already connected"
         return
 
-    state.recording.datasetRoot = str(_dataset_config(state.config).get("root") or "")
+    config_path = _resolve_recorder_config_path(state)
     recorder_script, config_flag = _recorder_script(state)
     command = [
         str(_venv_python(state.repo_root)),
         str(recorder_script),
-        f"{config_flag}={state.config_path}",
+        f"{config_flag}={config_path}",
     ]
     # Thor GMSL2 recorder: skip its own nvarguscamerasrc probe pass.
     # Operators run tools/thor/gmsl2/recover_argus.sh before Connect, which
@@ -4524,6 +4663,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 if path == "/api/tasks/delete":
                     task_id = (query.get("id", [""])[0] or "").strip()
                     _delete_task(self.server.state, task_id)
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/tasks/activate":
+                    task_id = (query.get("id", [""])[0] or "").strip()
+                    _set_active_task(self.server.state, task_id)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
         except Exception as exc:  # noqa: BLE001

@@ -346,6 +346,15 @@ button.danger {
   background: #c2410c;
 }
 
+.status-completed,
+.status-done {
+  background: #2563eb;
+}
+
+.task-binding-banner {
+  border-left: 3px solid #2563eb;
+}
+
 .config-grid,
 .summary-grid,
 .quality-list {

@@ -527,7 +527,8 @@ function LiveRecordPage({
   onOpenInReplay,
   onQueueTrajGen,
   onGoToProcessing,
-  onRunCalibration
+  onRunCalibration,
+  onClearActiveTask
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
@@ -538,8 +539,15 @@ function LiveRecordPage({
   onQueueTrajGen: () => void;
   onGoToProcessing: () => void;
   onRunCalibration: () => void;
+  onClearActiveTask: () => void;
 }) {
   const showSavedBanner = snapshot.recording.savedEpisodes > 0;
+  const activeTask = snapshot.activeTaskId
+    ? snapshot.tasks.find((t) => t.id === snapshot.activeTaskId) ?? null
+    : null;
+  const recorderConnected = ["connecting", "armed", "recording", "review", "saving", "discarding"].includes(
+    snapshot.recording.state
+  );
   // The backend keeps a per-session ring buffer (RecordingStatus.recentOutput)
   // and clears it when the operator clicks Connect, so we can render it
   // directly. The pre-PR6 approach of accumulating `lastOutput` lost any
@@ -554,6 +562,18 @@ function LiveRecordPage({
           ? `GMSL2 ${snapshot.devices.filter((d) => d.kind === "camera").length}-camera capture with${snapshot.configSummary.hardwareSync?.enabled ? "" : "out"} hardware sync`
           : "capture raw multi-camera handheld data; post-processing lives on the Processing page"}
       />
+      {activeTask && (
+        <section className="panel task-binding-banner">
+          <div className="panel-heading">
+            <h2>Recording for task: {activeTask.name}</h2>
+            <button disabled={busy || recorderConnected} onClick={onClearActiveTask}>Unbind</button>
+          </div>
+          <p className="panel-note">
+            Episodes save into <strong>{activeTask.datasetRepoId}</strong> and count toward this task ({activeTask.completedEpisodes}/{activeTask.targetEpisodes}).
+            {recorderConnected ? " Disconnect to unbind or switch tasks." : " Binding applies on the next Connect."}
+          </p>
+        </section>
+      )}
       <div className="split-layout">
         <RecordingPanel status={snapshot.recording} config={snapshot.configSummary} busy={busy} onConnect={onConnect} onStart={onStart} onStop={onStop} logLines={logLines} />
         <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />
@@ -1482,7 +1502,7 @@ const taskStatusLabel: Record<TaskStatus, string> = {
 const taskStatusDot: Record<TaskStatus, string> = {
   pending: "idle",
   in_progress: "running",
-  completed: "running",
+  completed: "completed",
   paused: "warning"
 };
 
@@ -1492,6 +1512,7 @@ function TaskLibraryPage({
   onCreate,
   onUpdate,
   onDelete,
+  onActivate,
   onNavigate
 }: {
   snapshot: GuiSnapshot;
@@ -1499,6 +1520,7 @@ function TaskLibraryPage({
   onCreate: (task: Partial<CollectionTask>) => void;
   onUpdate: (task: Partial<CollectionTask>) => void;
   onDelete: (id: string) => void;
+  onActivate: (id: string) => void;
   onNavigate: (page: PageId) => void;
 }) {
   const tasks = snapshot.tasks ?? [];
@@ -1511,6 +1533,8 @@ function TaskLibraryPage({
   const [formRepoId, setFormRepoId] = useState("");
 
   const selected = tasks.find((t) => t.id === selectedId) ?? null;
+  const selectedTargetReached =
+    selected != null && selected.targetEpisodes > 0 && selected.completedEpisodes >= selected.targetEpisodes;
 
   const resetForm = () => {
     setFormName("");
@@ -1628,22 +1652,27 @@ function TaskLibraryPage({
             </span>
           </div>
           <div className="summary-grid">
-            <Metric label="Target" value={selected.targetEpisodes} />
-            <Metric label="Completed" value={selected.completedEpisodes} />
+            <Metric label="Progress" value={`${selected.completedEpisodes} / ${selected.targetEpisodes}`} />
             <Metric label="Assignee" value={selected.assignee || "—"} />
             <Metric label="Dataset" value={selected.datasetRepoId || "—"} />
             <Metric label="Created" value={selected.createdAt ? new Date(selected.createdAt).toLocaleString() : "—"} />
             <Metric label="Updated" value={selected.updatedAt ? new Date(selected.updatedAt).toLocaleString() : "—"} />
           </div>
+          {!selected.datasetRepoId && (
+            <p className="panel-note">No dataset linked — progress can't be tracked. Set a Dataset Repo ID so recorded episodes count toward this task.</p>
+          )}
+          {selectedTargetReached && selected.status !== "completed" && (
+            <p className="panel-note">Target reached ({selected.completedEpisodes}/{selected.targetEpisodes}). Mark the task Complete when collection is done.</p>
+          )}
           <div className="control-row">
             <button
               disabled={busy || selected.status === "in_progress"}
               onClick={() => onUpdate({ id: selected.id, status: "in_progress" })}
             >
-              Start
+              {selected.status === "paused" ? "Resume" : selected.status === "completed" ? "Reopen" : "Start"}
             </button>
             <button
-              disabled={busy || selected.status === "paused"}
+              disabled={busy || selected.status !== "in_progress"}
               onClick={() => onUpdate({ id: selected.id, status: "paused" })}
             >
               Pause
@@ -1654,8 +1683,31 @@ function TaskLibraryPage({
             >
               Complete
             </button>
-            <button disabled={busy} onClick={() => onNavigate("live-record")}>Go to Record</button>
-            <button className="danger" disabled={busy} onClick={() => { onDelete(selected.id); setSelectedId(null); }}>Delete</button>
+            <button
+              disabled={busy || selected.status === "completed" || !selected.datasetRepoId}
+              title={selected.datasetRepoId ? "Bind recording to this task's dataset and open Live Record" : "Set a Dataset Repo ID first"}
+              onClick={() => {
+                onActivate(selected.id);
+                if (selected.status !== "in_progress") {
+                  onUpdate({ id: selected.id, status: "in_progress" });
+                }
+                onNavigate("live-record");
+              }}
+            >
+              Go to Record
+            </button>
+            <button
+              className="danger"
+              disabled={busy}
+              onClick={() => {
+                if (window.confirm(`Delete task "${selected.name}"? This removes the task entry only — recorded datasets are not touched.`)) {
+                  onDelete(selected.id);
+                  setSelectedId(null);
+                }
+              }}
+            >
+              Delete
+            </button>
           </div>
         </section>
       )}
@@ -2084,6 +2136,7 @@ function App() {
         onQueueTrajGen={() => queueTrajGenAndOpenProcessing(firstMissingPath)}
         onGoToProcessing={() => navigate("dataset-processing")}
         onRunCalibration={() => run(() => api.runCalibration())}
+        onClearActiveTask={() => run(() => api.setActiveTask(""))}
       />
     ) : activePage === "dataset-processing" ? (
       <DatasetProcessingPage
@@ -2125,6 +2178,7 @@ function App() {
         onCreate={(task) => run(() => api.createTask(task))}
         onUpdate={(task) => run(() => api.updateTask(task))}
         onDelete={(id) => run(() => api.deleteTask(id))}
+        onActivate={(id) => run(() => api.setActiveTask(id))}
         onNavigate={navigate}
       />
     ) : activePage === "device-manager" ? (

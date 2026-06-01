@@ -676,7 +676,13 @@ def main(argv: list[str] | None = None) -> int:
     ep_idx = gr._next_episode_index(cfg.dataset_root)
     budget = cfg.num_episodes if cfg.num_episodes > 0 else None
     budget_str = str(budget) if budget else "unlimited"
-    logger.info(_STDIN_HINT)
+    # The stdin hint is a CLI affordance for a human running this in a terminal.
+    # Under the GUI gateway our stdin is a pipe (not a TTY) and the gateway
+    # drives commands programmatically, so emitting it there only leaks a
+    # misleading "press <Enter>" line into the frontend log. Match the
+    # isatty() guard handheld_record.py already uses for interactive prompts.
+    if sys.stdin.isatty():
+        logger.info(_STDIN_HINT)
     _emit(f"Episode {ep_idx} ready")
 
     rc = 0

@@ -805,3 +805,168 @@ def test_mujoco_validation_requires_structured_result(tmp_path):
 
     assert state.replay.mujocoValidation["status"] == "failed"
     assert "missing structured mujoco_replay_result" in state.replay.mujocoValidation["message"]
+
+
+def test_count_completed_episodes_strips_namespace_and_matches_timestamped_dirs(tmp_path):
+    repo_root = tmp_path / "repo"
+    datasets_root = repo_root / "outputs" / "datasets"
+    _write_minimal_episode_dataset(datasets_root / "pick_and_place", total_episodes=3)
+    _write_minimal_episode_dataset(datasets_root / "pick_and_place_20260528_103422", total_episodes=2)
+    _write_minimal_episode_dataset(datasets_root / "fold_towel", total_episodes=5)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+        datasets_root=datasets_root,
+    )
+
+    # "local/" namespace stripped; exact + timestamped captures counted, others ignored.
+    assert gateway._count_completed_episodes(state, "local/pick_and_place") == 5
+    assert gateway._count_completed_episodes(state, "local/fold_towel") == 5
+    assert gateway._count_completed_episodes(state, "") == 0
+
+
+def test_tasks_with_progress_reflects_recorded_episodes(tmp_path):
+    repo_root = tmp_path / "repo"
+    datasets_root = repo_root / "outputs" / "datasets"
+    _write_minimal_episode_dataset(datasets_root / "pick_and_place", total_episodes=4)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+        datasets_root=datasets_root,
+    )
+    gateway._create_task(
+        state,
+        {
+            "name": "Pick and Place",
+            "targetEpisodes": 100,
+            "datasetRepoId": "local/pick_and_place",
+            "completedEpisodes": 0,
+        },
+    )
+
+    tasks = gateway._tasks_with_progress(state)
+
+    assert len(tasks) == 1
+    assert tasks[0]["completedEpisodes"] == 4
+    assert tasks[0]["targetEpisodes"] == 100
+
+
+def _task_state(tmp_path):
+    repo_root = tmp_path / "repo"
+    datasets_root = repo_root / "outputs" / "datasets"
+    datasets_root.mkdir(parents=True)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={
+            "dataset": {
+                "repo_id": "local/thor_gmsl2_11ch_v1",
+                "root": "outputs/datasets/thor_gmsl2_11ch_v1",
+                "single_task": "default capture",
+                "fps": 60,
+            },
+            "cameras": {"width": 1920, "height": 1080},
+        },
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+        datasets_root=datasets_root,
+    )
+    return state, datasets_root
+
+
+def test_build_task_overlay_patches_only_dataset_and_aligns_root_with_repo_id(tmp_path):
+    state, datasets_root = _task_state(tmp_path)
+    task = {
+        "id": "task-1",
+        "name": "Pick and Place",
+        "description": "pick the cube",
+        "datasetRepoId": "local/pick_and_place",
+    }
+
+    overlay = gateway._build_task_overlay_config(state.config, task, datasets_root)
+
+    assert overlay["dataset"]["repo_id"] == "local/pick_and_place"
+    # root basename must equal repo_id trailing segment so episodes are counted.
+    assert Path(overlay["dataset"]["root"]).name == "pick_and_place"
+    assert overlay["dataset"]["single_task"] == "pick the cube"
+    # non-dataset blocks untouched; base config not mutated.
+    assert overlay["cameras"] == state.config["cameras"]
+    assert state.config["dataset"]["repo_id"] == "local/thor_gmsl2_11ch_v1"
+
+
+def test_resolve_recorder_config_path_uses_overlay_for_active_task(tmp_path):
+    state, datasets_root = _task_state(tmp_path)
+    gateway._create_task(
+        state,
+        {
+            "name": "Pick and Place",
+            "targetEpisodes": 100,
+            "datasetRepoId": "local/pick_and_place",
+        },
+    )
+    task_id = gateway._read_tasks(state)[0]["id"]
+    gateway._set_active_task(state, task_id)
+
+    config_path = gateway._resolve_recorder_config_path(state)
+
+    assert config_path != state.config_path
+    assert config_path.is_file()
+    assert Path(state.recording.datasetRoot).name == "pick_and_place"
+    overlay = gateway._load_yaml(config_path)
+    assert overlay["dataset"]["repo_id"] == "local/pick_and_place"
+
+
+def test_resolve_recorder_config_path_falls_back_without_active_task(tmp_path):
+    state, _ = _task_state(tmp_path)
+
+    config_path = gateway._resolve_recorder_config_path(state)
+
+    assert config_path == state.config_path
+    assert state.recording.datasetRoot == "outputs/datasets/thor_gmsl2_11ch_v1"
+
+
+def test_set_active_task_rejects_task_without_repo_id(tmp_path):
+    state, _ = _task_state(tmp_path)
+    gateway._create_task(state, {"name": "No Dataset", "targetEpisodes": 10})
+    task_id = gateway._read_tasks(state)[0]["id"]
+
+    with pytest.raises(ValueError, match="dataset repo id"):
+        gateway._set_active_task(state, task_id)
+    assert state.active_task_id is None
+
+
+def test_recorded_task_dataset_counts_toward_task_end_to_end(tmp_path):
+    state, datasets_root = _task_state(tmp_path)
+    gateway._create_task(
+        state,
+        {"name": "Pick and Place", "targetEpisodes": 100, "datasetRepoId": "local/pick_and_place"},
+    )
+    task_id = gateway._read_tasks(state)[0]["id"]
+    gateway._set_active_task(state, task_id)
+    gateway._resolve_recorder_config_path(state)
+
+    # Simulate the recorder writing a timestamped capture under the overlay root.
+    _write_minimal_episode_dataset(datasets_root / "pick_and_place_20260601_120000", total_episodes=7)
+
+    tasks = gateway._tasks_with_progress(state)
+    assert tasks[0]["completedEpisodes"] == 7
+
+
+def test_delete_active_task_clears_binding(tmp_path):
+    state, _ = _task_state(tmp_path)
+    gateway._create_task(
+        state,
+        {"name": "Pick and Place", "targetEpisodes": 100, "datasetRepoId": "local/pick_and_place"},
+    )
+    task_id = gateway._read_tasks(state)[0]["id"]
+    gateway._set_active_task(state, task_id)
+
+    gateway._delete_task(state, task_id)
+
+    assert state.active_task_id is None
