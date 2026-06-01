@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pose3DViewer } from "./Pose3DViewer";
 import { SeriesPlot } from "./SeriesPlot";
 import type { DataCollectionGuiApi } from "./api";
@@ -146,6 +146,13 @@ export function ReplayInspector({
   const [currentFrame, setCurrentFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
+  // Real frame count read out of the master video element on
+  // loadedmetadata. When non-null, this overrides timeline.totalFrames
+  // because the mkv container is the ground truth — if the recorder
+  // wrote fewer frames than meta.json's wall-clock duration_s implied
+  // (e.g. splitmuxsink waited an IDR boundary to cut), the slider
+  // would otherwise stop short of its max while the video has ended.
+  const [videoFrameCount, setVideoFrameCount] = useState<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -158,6 +165,7 @@ export function ReplayInspector({
     setCurrentFrame(0);
     setPlaying(false);
     setTimeline(null);
+    setVideoFrameCount(null);
     api
       .fetchReplayTimeline(datasetPath, episode)
       .then((result) => {
@@ -185,8 +193,27 @@ export function ReplayInspector({
   }, [api, datasetPath, episode]);
 
   const fps = timeline?.fps ?? fallbackFps;
-  const totalFrames = timeline?.totalFrames ?? 0;
+  const backendTotalFrames = timeline?.totalFrames ?? 0;
+  // Effective playable frame count: take the min of what the backend
+  // reports (wall-clock duration_s * fps) and what the master video
+  // element actually decoded (video.duration * fps). Video wins when it
+  // is shorter — that's how the slider stays in sync with the picture
+  // even if the recorder lost frames at the tail.
+  const totalFrames = videoFrameCount != null
+    ? Math.min(backendTotalFrames || videoFrameCount, videoFrameCount)
+    : backendTotalFrames;
   const videoWarmupS = Math.max(0, timeline?.videoWarmupS ?? 0);
+
+  const handleMasterMetadataLoaded = useCallback(
+    (event: React.SyntheticEvent<HTMLVideoElement>) => {
+      const target = event.currentTarget;
+      const dur = target.duration;
+      if (!Number.isFinite(dur) || dur <= 0) return;
+      const frames = Math.max(1, Math.round(dur * Math.max(fps, 1)));
+      setVideoFrameCount((prev) => (prev === frames ? prev : frames));
+    },
+    [fps],
+  );
 
   useEffect(() => {
     if (!playing || totalFrames === 0) {
@@ -352,7 +379,7 @@ export function ReplayInspector({
         </div>
       </div>
       <div className="camera-grid">
-        {timeline.cameraKeys.map((key) => (
+        {timeline.cameraKeys.map((key, idx) => (
           <div className="camera-tile" key={key}>
             <video
               ref={(element) => {
@@ -361,7 +388,14 @@ export function ReplayInspector({
               src={api.videoUrl(timeline.datasetRoot, key)}
               muted
               playsInline
-              preload="auto"
+              // metadata: fetch the mkv header + first frame so the
+              // tile renders immediately, but skip downloading the full
+              // file until the user clicks Play. preload=auto here used
+              // to queue 11 full mkvs at once on Connect, hitting the
+              // browser's 6-per-origin HTTP/1.1 cap; cams 7-11 would
+              // load slowly or only after a manual refresh.
+              preload="metadata"
+              onLoadedMetadata={idx === 0 ? handleMasterMetadataLoaded : undefined}
             />
             <span>{shortCameraName(key)}</span>
           </div>
