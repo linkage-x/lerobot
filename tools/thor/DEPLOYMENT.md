@@ -603,13 +603,13 @@ PR6 改成**服务端 ring buffer**：
 * **MAX96726 sid 锁定数 ≠ YAML 槽位**：YAML 默认 detect_all + `sensor_ids: []`
   的 16 个相机槽是"期望"；实际锁到几个看插了几路相机线。多出来的槽位
   Connect 后会变红 `error`，正常现象。
-* **StartEpisode 后没有数据落盘**：已定位到 GUI recorder 旧逻辑在任一路
-  GStreamer stream 提前退出时走 discard，并删除整个 episode 目录。现在
-  `thor_record.py` 会保留该 episode、写 `meta.json`，并在前端输出类似
-  `Stream exited early: cam_03(rc=0, log=cam_03.gst.log)` 的根因。2026-05-27
-  实测失败相机为 `cam_03` / `cam_04`，日志为 `NvBufSurfaceFromFd Failed` 后 EOS。
 * **未跟踪的本地脚本**：`~/lerobot/run/` 下三个脚本不在 git 里 —— 是因为
   端口 / IP / venv 路径会因部署点而不同，复制本文 §7 的模板自己填。
+* **`NvBufSurfaceFromFd Failed` (NVMM dmabuf race)**：多路 `nvarguscamerasrc`
+  在并发 Argus open 阶段偶发，是 driver 层 dmabuf pool 状态竞争。当前
+  PR4/PR4.1 的自动 retry 能救回大部分，PR5 的 auto-recover 兜底剩下的；
+  彻底消除需 PR7（worker 两阶段 spawn：先 READY 再由父进程串行触发 PLAYING）
+  或更新到修了这条 race 的 nvargus driver。
 
 ## 11. 相机-传感器时间同步架构
 
