@@ -2197,8 +2197,17 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
             pass
     fps = int(ep_meta.get("video", {}).get("fps") or ep_meta.get("fps") or 60)
     duration_s = float(ep_meta.get("duration_s") or 10)
-    video_warmup_s = _gmsl2_replay_warmup_s(ep_meta)
-    total_frames = max(0, int(max(0.0, duration_s - video_warmup_s) * fps))
+    # PR3+ EPISODE mkv files come from splitmuxsink split-now boundaries, so
+    # they no longer contain the pre-episode warmup frames the
+    # `replay_warmup_s` field was originally designed to skip. Frame 0 in
+    # the timeline now corresponds to video.currentTime == 0 directly. If
+    # we kept subtracting warmup here totalFrames would lose
+    # replay_warmup_s * fps frames AND the frontend would offset by the
+    # same amount when reverse-computing frame from currentTime — the
+    # slider used to freeze ~1s short of the end because both layers
+    # double-counted the same trim. Force 0 so the math collapses cleanly.
+    video_warmup_s = 0.0
+    total_frames = max(0, int(duration_s * fps))
     mkv_files = sorted(ep_dir.glob("*.mkv"))
     camera_keys = [f.stem for f in mkv_files if f.stat().st_size > 1024]
     frames: list[dict[str, Any]] = []
