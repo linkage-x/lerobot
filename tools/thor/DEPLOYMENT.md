@@ -779,6 +779,52 @@ session（`<name>_<时间戳>/`，按时间戳排序）合并成**一个** LeRob
   产物在 full-deps 机上经 `LeRobotDataset` 加载 + 逐帧解码（首/中/末帧 ×
   全 10 路）通过。
 
+#### 设计取舍记录（为什么是 pyarrow+gst per-episode，而不是官方 API / 单文件拼接）
+
+> 背景前提：**采集机是最小 Python 环境**（`pyarrow + pyyaml + box_sdk`，
+> 外加系统 `gstreamer`；**无 torch / torchvision / datasets / av / ffmpeg**），
+> 这是 §3 故意的"采集机最小化、训练依赖单独 venv 解耦"的结果。下面所有取舍
+> 都以"导出必须能在这个最小环境里原地跑"为约束。已实测确认 Thor 缺
+> torch/torchvision/datasets/av/huggingface_hub，仅有 pandas/PIL/numpy/pyarrow。
+
+**为什么不直接在 Thor 用官方 `LeRobotDataset` API（最省事、布局最标准）**
+- `from lerobot.datasets.lerobot_dataset import LeRobotDataset` 顶层硬 import
+  `torch`/`torch.utils`/`datasets`/`pandas`/`PIL`/`huggingface_hub`，且其
+  `video_utils` 顶层 import `av`/`torch`/`torchvision`——少一个这个类都 import 不了。
+- 真正的卡点是 **torch/torchvision 在 Jetson**：要 NVIDIA 专供、与 JetPack/CUDA
+  版本死锁的 aarch64 wheel（GB 级、易装错、升级 JetPack 要重配），违背采集机最小化。
+- 即便装上，**它也不会用 Jetson 硬件编解码**：`encode_video_frames` 走 `av`
+  软编（v3 默认 `libsvtav1`/AV1，ARM 上个位数 fps），`add_frame` 还逐帧落 PNG
+  再读回。实测对比：方案二硬件通路 **92s**；方案一软编 + 逐帧 PNG 预计**慢约一个
+  数量级**。讽刺点：编码本身只用 `av` 不用 torch，torch 纯粹因为类/`add_frame`
+  跟张量耦合——为写视频得拖进整个训练栈。
+- 结论：官方 API 适合**训练机**（GPU/强 x86，软编也快、布局标准），不适合采集机。
+
+**为什么不拼接成单文件（官方 v3 那种一相机一文件 + `from/to_timestamp` 切片）**
+- 在最小 gst 环境里**帧级精确拼接做不干净**，实测三种都在 episode 衔接处引入
+  ±1 帧 PTS 缺口（步长 2/60）：无损拼编码后的 mp4（2 个缺口）、解码层拼+末端
+  videorate（多 1 帧 + 1 缺口）。而 LeRobot 解码按 `timestamp` 用 **1e-4s** 容差
+  找帧，边界帧一超容差就 `FrameTimestampError`。
+- per-episode 单段 CFR 文件实测 `PTS == i/60` 偏差 **0.0**、全帧解码通过。官方那种
+  拼接是 `LeRobotDataset` 编码器在全依赖机上逐帧精确写时间戳做到的，gst `concat`
+  元件给不了这个精度。
+- 代价仅是每相机文件数 = episode 数（有上界），且仍是合法可加载的 v3 布局。
+
+**最终方案（方案二）的关键技术选择**
+- **pyarrow 手写 v3 meta**（复用 `thor_lerobot_v3` 的 pyarrow-only helpers），
+  不依赖 torch/datasets。
+- **gst `nvv4l2` 硬件转码**：源 HEVC → **H.264**（torchvision 兜底解码器偏 h264）。
+- **CFR `videorate` 把 PTS 重排到 `i/fps`**：v3 loader 用单个 timestamp 查一个
+  episode 的**所有**相机，源容器 PTS（`do-timestamp` 记的到达时刻）抖动且各路不一，
+  必须落到同一网格；PWM 本就是 60fps 硬同步，这是物理正确的（实测偏差 0）。
+- **逐相机帧数取 min**（不均匀丢帧），单 timestamp 服务所有相机。
+- **相机并行转码**（默认 `--jobs 8`）：Thor 实测 336s → **92s（~3.6×）**；没到 8×
+  是因 videorate 的 NVMM↔CPU 拷贝卡在 CPU/带宽，不是线性扩展。
+
+**何时重新考虑**：若"官方单文件布局"成为硬需求，**优先走训练机导出**（把 raw
+session rsync 过去用官方 API），而**不是**在采集机装 torch——后者又慢又重又违背
+最小化原则。
+
 ### 同步级别路线图
 
 | 级别 | 精度 | 状态 | 说明 |

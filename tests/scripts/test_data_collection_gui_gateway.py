@@ -387,6 +387,37 @@ def test_recorder_output_marks_connected_and_failed_devices(tmp_path):
     assert state.recording.state == "armed"
 
 
+def test_recorder_output_marks_gmsl2_failed_stream_camera_error(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=Path.cwd(),
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 60, "episode_time_s": 10}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        devices=[
+            {"id": "cam_02", "kind": "camera", "label": "cam_02", "state": "running", "fps": 60, "latencyMs": 0, "detail": ""},
+            {"id": "cam_03", "kind": "camera", "label": "cam_03", "state": "running", "fps": 60, "latencyMs": 0, "detail": ""},
+        ],
+    )
+
+    gateway._apply_recorder_output(
+        state,
+        "WARNING: 1 stream(s) failed: cam_02(bus EOS (upstream stopped delivering buffers))",
+    )
+
+    device_states = {device["id"]: device["state"] for device in state.devices}
+    assert device_states == {"cam_02": "error", "cam_03": "running"}
+
+    gateway._apply_recorder_output(
+        state,
+        "2026-06-02 03:39:27,829 WARNING persistent_session connect() partial success: "
+        "10/11 streams up; failed: cam_03(bus EOS (upstream stopped delivering buffers))",
+    )
+
+    device_states = {device["id"]: device["state"] for device in state.devices}
+    assert device_states == {"cam_02": "error", "cam_03": "error"}
+
+
 def test_recorder_env_adds_repo_import_paths(monkeypatch, tmp_path):
     monkeypatch.setenv("PYTHONPATH", "/existing/path")
 

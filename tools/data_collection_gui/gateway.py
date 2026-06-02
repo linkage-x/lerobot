@@ -3764,6 +3764,32 @@ def _mark_connected_devices(state: GatewayState, kind: str, summary: str) -> Non
         device["state"] = "running" if str(device.get("id")) in connected_ids else "error"
 
 
+def _mark_failed_camera_devices(state: GatewayState, failed_ids: set[str]) -> None:
+    if not failed_ids:
+        return
+    for device in state.devices:
+        if device.get("kind") == "camera" and str(device.get("id")) in failed_ids:
+            device["state"] = "error"
+
+
+def _failed_camera_ids_from_recorder_output(output: str) -> set[str]:
+    failed_ids: set[str] = set()
+
+    failed_camera_match = re.search(r"Camera '([^']+)' failed to connect", output)
+    if failed_camera_match:
+        failed_ids.add(failed_camera_match.group(1))
+
+    stream_failed_match = re.search(r"\bstream\(s\) failed:\s*(?P<failed>.+)$", output)
+    if stream_failed_match:
+        failed_ids.update(re.findall(r"\bcam_\d+\b", stream_failed_match.group("failed")))
+
+    partial_success_match = re.search(r"\bpartial success:.*\bfailed:\s*(?P<failed>.+)$", output)
+    if partial_success_match:
+        failed_ids.update(re.findall(r"\bcam_\d+\b", partial_success_match.group("failed")))
+
+    return failed_ids
+
+
 def _recorder_script(state: GatewayState) -> tuple[Path, str]:
     """Resolve which recorder process the gateway should spawn for this config.
 
@@ -4156,12 +4182,7 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         ]
     state.log("info", f"recorder: {output}")
 
-    failed_camera_match = re.search(r"Camera '([^']+)' failed to connect", output)
-    if failed_camera_match:
-        failed_id = failed_camera_match.group(1)
-        for device in state.devices:
-            if device.get("kind") == "camera" and device.get("id") == failed_id:
-                device["state"] = "error"
+    _mark_failed_camera_devices(state, _failed_camera_ids_from_recorder_output(output))
 
     for prefix, kind in (
         ("Cameras:", "camera"),
