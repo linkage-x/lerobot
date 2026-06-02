@@ -24,6 +24,35 @@ function stateLabel(state: string) {
   return state.replace("_", " ");
 }
 
+function datasetNamePrefixes(name: string): Set<string> {
+  const prefixes = new Set([name]);
+  const match = name.match(/^(?<base>.+)_\d{8}_\d{6}(?:_\d{2})?$/);
+  if (match?.groups?.base) {
+    prefixes.add(match.groups.base);
+  }
+  return prefixes;
+}
+
+function taskDatasetBaseName(task: CollectionTask): string {
+  return task.datasetRepoId.split("/").pop()?.trim() ?? "";
+}
+
+function processingItemsForTask(task: CollectionTask, processing: ProcessingItem[]): ProcessingItem[] {
+  const baseName = taskDatasetBaseName(task);
+  if (!baseName) {
+    return [];
+  }
+  return processing.filter((item) => datasetNamePrefixes(item.name).has(baseName));
+}
+
+function taskNeedsQcExportConfirmation(task: CollectionTask, processing: ProcessingItem[]) {
+  const taskItems = processingItemsForTask(task, processing);
+  const notQcPassed = taskItems.filter((item) => item.status !== "qc_pass");
+  const processingEpisodes = taskItems.reduce((total, item) => total + item.totalEpisodes, 0);
+  const missingEpisodeCount = Math.max(task.completedEpisodes - processingEpisodes, 0);
+  return { taskItems, notQcPassed, missingEpisodeCount };
+}
+
 function StatusDot({ state }: { state: string }) {
   return <span className={`status-dot status-${state}`} aria-hidden="true" />;
 }
@@ -2174,6 +2203,35 @@ function App() {
     run(() => api.startReplay(realRobot));
   };
 
+  const exportTaskWithQcGuard = (taskId: string) => {
+    const task = (snapshot.tasks ?? []).find((item) => item.id === taskId);
+    if (!task) {
+      run(() => api.exportTask(taskId));
+      return;
+    }
+    const { notQcPassed, missingEpisodeCount } = taskNeedsQcExportConfirmation(task, snapshot.processing);
+    if (missingEpisodeCount > 0 || notQcPassed.length > 0) {
+      const statusLines = notQcPassed
+        .slice(0, 4)
+        .map((item) => `${item.name}: ${processingStatusLabel[item.status]}`);
+      const moreCount = Math.max(notQcPassed.length - 4, 0);
+      const confirmLines = [
+        `Task "${task.name}" has dataset sessions that are not QC-passed.`,
+        "",
+        missingEpisodeCount > 0 ? `${missingEpisodeCount} recorded episode(s) have no QC record.` : "",
+        ...statusLines,
+        moreCount > 0 ? `...and ${moreCount} more` : "",
+        "",
+        "Continue exporting LeRobot v3?"
+      ].filter((line) => line !== "");
+      const ok = window.confirm(confirmLines.join("\n"));
+      if (!ok) {
+        return;
+      }
+    }
+    run(() => api.exportTask(taskId));
+  };
+
   const pageNode =
     activePage === "live-record" ? (
       <LiveRecordPage
@@ -2219,7 +2277,7 @@ function App() {
         busy={busy}
         onPrepare={(target) => run(() => api.prepareDatasetExport(target))}
         onExport={() => run(() => api.startDatasetExport())}
-        onExportTask={(id) => run(() => api.exportTask(id))}
+        onExportTask={exportTaskWithQcGuard}
         onOpenProcessing={() => navigate("dataset-processing")}
       />
     ) : activePage === "task-library" ? (
