@@ -33,6 +33,7 @@ sensors:
     sensor_ids: []        # only used when detect_all is false
     name_prefix: "cam"    # produces cam_00, cam_01, ... in the dataset
     spawn_stagger_s: 1.0  # concurrent nvarguscamerasrc inits race on NVMM buffers; 1.0s is verified stable for 11/11 cameras; 0.5s causes NvBufSurfaceFromFd failures on 6/11 cameras
+    preview_spawn_stagger_s: 0.8  # Device Manager grid stagger for the live MJPEG previews; defaults to min(spawn_stagger_s, 0.5). Raise (e.g. 0.8) if some tiles stay blank from the same NVMM race; lower toward 0 to fill the grid faster on rigs that tolerate it
     stop_on_stream_exit: true  # set false/--ignore-stream-exit for diagnostics only
 
     # Per-camera capture/encoding defaults. nvarguscamerasrc handles ISP +

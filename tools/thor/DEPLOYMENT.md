@@ -611,6 +611,65 @@ PR6 改成**服务端 ring buffer**：
   彻底消除需 PR7（worker 两阶段 spawn：先 READY 再由父进程串行触发 PLAYING）
   或更新到修了这条 race 的 nvargus driver。
 
+### Device Manager 实时预览管线（per-device 快照轮询 + 错峰 spawn）
+
+Device Manager 页面把 11 路相机摆成 4×3 网格做"摆位监看"（调物体位置时
+不用进录制就能看每路画面，hover 单格弹出该相机的 fps / latency / config
+详情）。这套预览管线和录制管线**完全独立**，但踩的是同一类 NVMM/Argus 坑，
+设计时把录制路径的两条教训直接搬了过来。
+
+**为什么不是"每路一条 MJPEG 长连接"（最直觉的做法）**
+
+最初版给每个格子挂一个 `<img src=.../camera.mjpeg>`，11 路画面只亮起
+4–6 路，根因有两条、缺一不可：
+
+1. **后端单进程槽互杀**：旧 `_serve_camera_preview_mjpeg` 用单个
+   `state.camera_preview_process`，每来一个请求第一件事就 kill 上一个。
+   网格同时发 11 个请求（gateway 是 `ThreadingHTTPServer`，每请求一线程），
+   它们互相 kill，最后只剩最后启动的一路。
+2. **浏览器 per-origin 连接上限**：MJPEG 是**长连接**，Chrome/Firefox 对
+   同一 origin 只允许 ~6 条并发连接。11 条流 → 只有 6 条能建立，剩下 5 条
+   在浏览器里**无限排队**，永远拿不到数据。这条是硬上限，跟 NVMM 无关。
+
+**最终方案：服务端持久管线 + 短快照轮询**
+
+- 后端每路相机一条**持久** gst pipeline（`nvarguscamerasrc ! nvvidconv !
+  videorate ! jpegenc ! fdsink`，输出裸 JPEG 流），由一个 reader 线程按
+  SOI(FFD8)/EOI(FFD9) 切帧，只在内存里留**最新一帧**
+  （`state.camera_preview_frames[device_id]`）。
+- 前端不再用长连接：每个格子按 ~5fps 轮询 `GET /api/device-preview/
+  camera.jpg?key=cam_NN&t=<ts>`，返回内存里那张最新 JPEG。每个请求**极短**
+  （命中缓存即返回），6 条连接轮着用 11 路绰绰有余，连接上限问题消失。
+  轮询循环靠 `<img>` 的 onLoad/onError 自节流，慢相机不会堆叠请求。
+- **错峰 spawn（NVMM race）**：`camera_preview_spawn_lock` + `_camera_preview_
+  stagger_s()` 串行化各路 Argus open，两次 spawn 间隔
+  `cameras.preview_spawn_stagger_s`（未设则回退 `min(spawn_stagger_s, 0.5)`）。
+  这就是录制路径躲 `NvBufSurfaceFromFd Failed` 的同一招。冷启首帧前端会
+  连续 503，前端按退避重试（~15s 内不报错），等 Argus open + AWB settle
+  出第一帧后转入稳态轮询。
+- **空闲自动回收（TTL）**：reader 线程发现某路 `_PREVIEW_IDLE_TTL_S`（5s）
+  内没有任何快照轮询，就自行 terminate 该 pipeline、释放 Argus session。
+  离开 Device Manager 页面 → 轮询停 → 5s 后所有预览管线自动收掉，不泄漏
+  Argus。reader 用 `select` 唤醒，即便管线卡住也能按 TTL 退出。
+
+**Connect 卡死修复（预览占用相机）**
+
+外场现象：在 Device Manager 预览过之后点 Connect，录制一直卡住——预览
+pipeline 还持着那几路 sensor 的 Argus session，recorder 的
+`nvarguscamerasrc` open 撞上去就 hang（"相机还在被占用"）。
+
+修复：`/api/handheld/record/connect` 在 spawn recorder **之前**先
+
+1. 置 `state.camera_preview_suspended = True`（快照路由看到该标志立刻 409，
+   防止并发轮询在空档里又把预览 respawn 回来）；
+2. `_stop_all_camera_previews()` 杀掉所有预览 pipeline（在 state lock **之外**
+   做，因为 `terminate()/wait()` 会阻塞）；
+3. sleep 一个 stagger 间隔让 nvargus-daemon settle，再进 `_connect_recorder`。
+
+`camera_preview_suspended` 在 recorder 退出（`_snapshot` 检测到 exit）、
+`_stop_recorder`、以及 connect 失败的 except 分支里复位为 False，录制一结束
+预览即可恢复。
+
 ## 11. 相机-传感器时间同步架构
 
 ### 当前状态（2026-05-26）

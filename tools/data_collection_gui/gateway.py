@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import select
 import signal
 import shutil
 import subprocess
@@ -152,7 +153,22 @@ class GatewayState:
     process_started_at_s: float | None = None
     replay_started_at_s: float | None = None
     device_preview: dict[str, Any] = field(default_factory=dict)
-    camera_preview_process: subprocess.Popen[bytes] | None = None
+    # One live preview pipeline per camera device id, so the Device Manager grid
+    # can show many cameras at once. Each pipeline's reader thread keeps only the
+    # latest JPEG in `camera_preview_frames`; the HTTP layer serves that cached
+    # frame as a short snapshot request (NOT a long-lived MJPEG stream), so 11
+    # tiles don't exhaust the browser's ~6-connections-per-origin limit. A
+    # dedicated spawn lock serializes nvarguscamerasrc Argus opens to dodge the
+    # NVMM dmabuf race (NvBufSurfaceFromFd Failed). Pipelines self-terminate
+    # once no tile has polled them for `_PREVIEW_IDLE_TTL_S`.
+    camera_preview_processes: dict[str, subprocess.Popen[bytes]] = field(default_factory=dict)
+    camera_preview_frames: dict[str, tuple[bytes, float]] = field(default_factory=dict)
+    camera_preview_last_access: dict[str, float] = field(default_factory=dict)
+    camera_preview_spawn_lock: Lock = field(default_factory=Lock)
+    camera_preview_last_spawn_s: float = 0.0
+    # Set while the recorder owns the cameras so snapshot polls don't respawn a
+    # preview pipeline that would re-occupy a sensor the recorder needs.
+    camera_preview_suspended: bool = False
     lock: Lock = field(default_factory=Lock)
 
     def log(self, level: str, message: str) -> None:
@@ -3380,9 +3396,7 @@ def _serve_static_file(handler: BaseHTTPRequestHandler, asset_path: Path, conten
                 return
 
 
-def _stop_camera_preview_process(state: GatewayState) -> None:
-    proc = state.camera_preview_process
-    state.camera_preview_process = None
+def _terminate_preview_proc(proc: subprocess.Popen[bytes] | None) -> None:
     if proc is None or proc.poll() is not None:
         return
     proc.terminate()
@@ -3392,19 +3406,52 @@ def _stop_camera_preview_process(state: GatewayState) -> None:
         proc.kill()
 
 
-def _serve_camera_preview_mjpeg(
-    handler: BaseHTTPRequestHandler,
+def _stop_all_camera_previews(state: GatewayState) -> None:
+    with state.lock:
+        procs = list(state.camera_preview_processes.values())
+        state.camera_preview_processes.clear()
+    for proc in procs:
+        _terminate_preview_proc(proc)
+
+
+def _camera_preview_stagger_s(state: GatewayState) -> float:
+    """Gap between consecutive preview Argus opens.
+
+    Honors a dedicated ``cameras.preview_spawn_stagger_s`` knob; otherwise falls
+    back to the recording ``spawn_stagger_s`` capped at 0.5s so the grid still
+    fills quickly while keeping concurrent Argus opens serialized.
+    """
+    cams = state.config.get("cameras") if isinstance(state.config.get("cameras"), dict) else {}
+    raw = cams.get("preview_spawn_stagger_s")
+    if raw is None:
+        try:
+            base = float(cams.get("spawn_stagger_s", 0.5))
+        except (TypeError, ValueError):
+            base = 0.5
+        return max(0.0, min(base, 0.5))
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.5
+
+
+# A preview pipeline is reaped once no tile has polled its snapshot for this
+# long. The frontend polls every ~250ms, so 5s tolerates a few dropped polls
+# / a page that is briefly backgrounded without leaking Argus sessions.
+_PREVIEW_IDLE_TTL_S = 5.0
+# How long a snapshot request waits for the first frame after a cold spawn
+# (Argus open + ISP/AWB settle) before giving up with 503.
+_PREVIEW_FIRST_FRAME_TIMEOUT_S = 6.0
+
+
+def _camera_preview_cmd(
     *,
-    state: GatewayState,
     sensor_id: int,
     sensor_mode: int,
     source_width: int,
     source_height: int,
     source_fps: int,
-) -> None:
-    if shutil.which("gst-launch-1.0") is None:
-        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "gst-launch-1.0 not found"})
-        return
+) -> list[str]:
     output_width = 480
     output_height = max(1, round(output_width * source_height / max(source_width, 1)))
     output_fps = 10
@@ -3413,7 +3460,9 @@ def _serve_camera_preview_mjpeg(
         f"format=NV12,width={source_width},height={source_height},framerate={source_fps}/1"
     )
     caps_out = f"video/x-raw,format=I420,width={output_width},height={output_height}"
-    cmd = [
+    # Raw concatenated JPEGs on stdout (no multipartmux): the reader thread
+    # splits them on SOI/EOI markers and caches the latest one.
+    return [
         "gst-launch-1.0",
         "-q",
         "nvarguscamerasrc",
@@ -3434,46 +3483,178 @@ def _serve_camera_preview_mjpeg(
         "jpegenc",
         "quality=65",
         "!",
-        "multipartmux",
-        "boundary=frame",
-        "!",
         "fdsink",
         "fd=1",
     ]
+
+
+def _camera_preview_reader(state: GatewayState, device_id: str, proc: subprocess.Popen[bytes]) -> None:
+    """Pump JPEG frames from one preview pipeline into the latest-frame cache.
+
+    Splits the raw concatenated JPEG stream on SOI (FFD8) / EOI (FFD9) markers
+    and keeps only the most recent complete frame. Uses ``select`` so it wakes
+    even when the pipeline stalls, letting it self-terminate on the idle TTL
+    (which releases the Argus session — important so a later Connect doesn't
+    find the camera still occupied).
+    """
+    buf = bytearray()
+    stdout = proc.stdout
+    assert stdout is not None
+    fd = stdout.fileno()
+    try:
+        while True:
+            if proc.poll() is not None:
+                break
+            with state.lock:
+                last = state.camera_preview_last_access.get(device_id, 0.0)
+            if time.time() - last > _PREVIEW_IDLE_TTL_S:
+                break
+            ready, _, _ = select.select([fd], [], [], 1.0)
+            if not ready:
+                continue
+            chunk = os.read(fd, 256 * 1024)
+            if not chunk:
+                break
+            buf += chunk
+            # Extract every complete JPEG currently buffered; keep the last.
+            latest: bytes | None = None
+            while True:
+                soi = buf.find(b"\xff\xd8")
+                if soi < 0:
+                    buf.clear()
+                    break
+                eoi = buf.find(b"\xff\xd9", soi + 2)
+                if eoi < 0:
+                    if soi > 0:
+                        del buf[:soi]
+                    break
+                latest = bytes(buf[soi : eoi + 2])
+                del buf[: eoi + 2]
+            if latest is not None:
+                with state.lock:
+                    state.camera_preview_frames[device_id] = (latest, time.time())
+    finally:
+        _terminate_preview_proc(proc)
+        with state.lock:
+            if state.camera_preview_processes.get(device_id) is proc:
+                state.camera_preview_processes.pop(device_id, None)
+            state.camera_preview_frames.pop(device_id, None)
+
+
+def _ensure_camera_preview(
+    state: GatewayState,
+    *,
+    device_id: str,
+    sensor_id: int,
+    sensor_mode: int,
+    source_width: int,
+    source_height: int,
+    source_fps: int,
+) -> bool:
+    """Spawn the preview pipeline for ``device_id`` if it isn't already running.
+
+    Returns False only when gst-launch is unavailable. The Argus open is
+    serialized + staggered across cameras to dodge the NVMM dmabuf race.
+    """
+    if shutil.which("gst-launch-1.0") is None:
+        return False
     with state.lock:
-        _stop_camera_preview_process(state)
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        cwd=str(Path.cwd()),
+        proc = state.camera_preview_processes.get(device_id)
+        if proc is not None and proc.poll() is None:
+            return True
+    cmd = _camera_preview_cmd(
+        sensor_id=sensor_id,
+        sensor_mode=sensor_mode,
+        source_width=source_width,
+        source_height=source_height,
+        source_fps=source_fps,
     )
+    stagger = _camera_preview_stagger_s(state)
+    with state.camera_preview_spawn_lock:
+        # Re-check under the spawn lock: another request may have raced us.
+        with state.lock:
+            proc = state.camera_preview_processes.get(device_id)
+            if proc is not None and proc.poll() is None:
+                return True
+        if stagger > 0:
+            gap = stagger - (time.monotonic() - state.camera_preview_last_spawn_s)
+            if gap > 0:
+                time.sleep(gap)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=str(Path.cwd()),
+        )
+        state.camera_preview_last_spawn_s = time.monotonic()
+        with state.lock:
+            state.camera_preview_processes[device_id] = proc
+    Thread(
+        target=_camera_preview_reader,
+        args=(state, device_id, proc),
+        daemon=True,
+        name=f"camera-preview-{device_id}",
+    ).start()
+    return True
+
+
+def _serve_camera_preview_snapshot(
+    handler: BaseHTTPRequestHandler,
+    *,
+    state: GatewayState,
+    device_id: str,
+    sensor_id: int,
+    sensor_mode: int,
+    source_width: int,
+    source_height: int,
+    source_fps: int,
+) -> None:
     with state.lock:
-        state.camera_preview_process = proc
+        state.camera_preview_last_access[device_id] = time.time()
+    ok = _ensure_camera_preview(
+        state,
+        device_id=device_id,
+        sensor_id=sensor_id,
+        sensor_mode=sensor_mode,
+        source_width=source_width,
+        source_height=source_height,
+        source_fps=source_fps,
+    )
+    if not ok:
+        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "gst-launch-1.0 not found"})
+        return
+    # Wait briefly for a frame (cold spawn must open Argus + settle ISP/AWB).
+    deadline = time.monotonic() + _PREVIEW_FIRST_FRAME_TIMEOUT_S
+    frame: bytes | None = None
+    while True:
+        with state.lock:
+            cached = state.camera_preview_frames.get(device_id)
+            # Keep the pipeline marked live while we wait so the reader's TTL
+            # check doesn't reap it out from under a slow first frame.
+            state.camera_preview_last_access[device_id] = time.time()
+        if cached is not None:
+            frame = cached[0]
+            break
+        with state.lock:
+            proc = state.camera_preview_processes.get(device_id)
+        if proc is not None and proc.poll() is not None:
+            break  # pipeline died before producing a frame
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    if frame is None:
+        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "no preview frame yet"})
+        return
     handler.send_response(HTTPStatus.OK)
-    handler.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("Content-Type", "image/jpeg")
+    handler.send_header("Content-Length", str(len(frame)))
+    handler.send_header("Cache-Control", "no-store")
     handler.send_header("Access-Control-Allow-Origin", "*")
     handler.end_headers()
     try:
-        assert proc.stdout is not None
-        while True:
-            chunk = proc.stdout.read(64 * 1024)
-            if not chunk:
-                break
-            try:
-                handler.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                break
-    finally:
-        with state.lock:
-            if state.camera_preview_process is proc:
-                state.camera_preview_process = None
-        proc.terminate()
-        try:
-            proc.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        handler.wfile.write(frame)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
 
 
 def _camera_preview_params(state: GatewayState, device_id: str) -> tuple[int, int, int, int, int] | None:
@@ -3568,6 +3749,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         state.log("warn", f"Handheld recorder exited with code {process.returncode}")
         exited_from = state.recording.state
         state.process = None
+        state.camera_preview_suspended = False
         state.process_started_at_s = None
         state.recording.state = "idle" if process.returncode == 0 else "error"
         state.recording.pid = None
@@ -4519,6 +4701,8 @@ def _abort_replay(state: GatewayState) -> None:
 
 
 def _stop_recorder(state: GatewayState, action: str) -> None:
+    # Recorder is going away (or already gone): re-allow Device Manager previews.
+    state.camera_preview_suspended = False
     try:
         process = _ensure_recorder_running(state)
     except RuntimeError:
@@ -4624,13 +4808,13 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             with self.server.state.lock:
                 _json_response(self, HTTPStatus.OK, _box_preview_payload(self.server.state, device_id))
                 return
-        if path == "/api/device-preview/camera.mjpeg":
+        if path == "/api/device-preview/camera.jpg":
             device_id = query.get("key", [""])[0]
             if not device_id:
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing key"})
                 return
             with self.server.state.lock:
-                if self.server.state.process is not None:
+                if self.server.state.process is not None or self.server.state.camera_preview_suspended:
                     _json_response(
                         self,
                         HTTPStatus.CONFLICT,
@@ -4642,9 +4826,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"camera not found: {device_id}"})
                 return
             sensor_id, sensor_mode, source_width, source_height, source_fps = params
-            _serve_camera_preview_mjpeg(
+            _serve_camera_preview_snapshot(
                 self,
                 state=self.server.state,
+                device_id=device_id,
                 sensor_id=sensor_id,
                 sensor_mode=sensor_mode,
                 source_width=source_width,
@@ -4702,6 +4887,20 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         parsed_url = urlparse(self.path)
         path = parsed_url.path
         query = parse_qs(parsed_url.query)
+        if path == "/api/handheld/record/connect":
+            # Free the cameras before the recorder opens them: live Device
+            # Manager previews hold Argus sessions on the same sensor-ids, and
+            # leaving them up makes the recorder's nvarguscamerasrc open hang.
+            # Done outside the state lock (terminate() blocks) and gated by the
+            # suspend flag so a concurrent snapshot poll can't respawn one in
+            # the gap before the recorder takes over.
+            state = self.server.state
+            with state.lock:
+                state.camera_preview_suspended = True
+            _stop_all_camera_previews(state)
+            settle_s = _camera_preview_stagger_s(state)
+            if settle_s > 0:
+                time.sleep(settle_s)
         try:
             with self.server.state.lock:
                 if path == "/api/handheld/record/connect":
@@ -4835,6 +5034,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
         except Exception as exc:  # noqa: BLE001
+            if path == "/api/handheld/record/connect":
+                # Connect failed before the recorder took the cameras; re-allow
+                # previews so the operator can keep inspecting the grid.
+                with self.server.state.lock:
+                    self.server.state.camera_preview_suspended = False
             _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
         _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"Unknown endpoint: {path}"})
