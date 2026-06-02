@@ -970,3 +970,60 @@ def test_delete_active_task_clears_binding(tmp_path):
     gateway._delete_task(state, task_id)
 
     assert state.active_task_id is None
+
+
+def test_export_command_builds_args_from_task(tmp_path):
+    state, datasets_root = _task_state(tmp_path)
+    state.exports_root = tmp_path / "repo" / "outputs" / "exports"
+    task = {
+        "id": "task-1",
+        "name": "Pick and Place",
+        "description": "pick the cube",
+        "datasetRepoId": "local/pick_and_place",
+    }
+
+    command, out_root = gateway._export_command(state, task)
+
+    assert out_root == state.exports_root / "pick_and_place"
+    assert "--base-name" in command and command[command.index("--base-name") + 1] == "pick_and_place"
+    assert command[command.index("--repo-id") + 1] == "local/pick_and_place"
+    assert command[command.index("--task") + 1] == "pick the cube"
+    assert command[command.index("--datasets-root") + 1] == str(datasets_root)
+    assert "--overwrite" in command
+    assert command[1].endswith("tools/thor/gmsl2/export_v3.py")
+
+
+def test_export_command_rejects_task_without_repo_id(tmp_path):
+    state, _ = _task_state(tmp_path)
+    with pytest.raises(ValueError, match="dataset repo id"):
+        gateway._export_command(state, {"id": "t", "name": "x", "datasetRepoId": ""})
+
+
+def test_apply_export_output_tracks_progress_and_terminal_state(tmp_path):
+    state, _ = _task_state(tmp_path)
+    state.dataset_export = gateway.DatasetExportStatus(state="exporting")
+
+    gateway._apply_export_output(state, "Export plan: 9 episodes from 2 session(s) -> local/pick_and_place")
+    assert state.dataset_export.selectedEpisodes == 9
+
+    gateway._apply_export_output(state, "Episode 0 written (5 frames) from s/episode_000000")
+    gateway._apply_export_output(state, "Episode 1 written (4 frames) from s/episode_000000")
+    assert state.dataset_export.totalFrames == 9
+
+    gateway._apply_export_output(state, "Export complete: 2 episodes at /x/pick_and_place")
+    assert state.dataset_export.state == "complete"
+
+
+def test_apply_export_output_marks_error(tmp_path):
+    state, _ = _task_state(tmp_path)
+    state.dataset_export = gateway.DatasetExportStatus(state="exporting")
+    gateway._apply_export_output(state, "ERROR: No recorded sessions found")
+    assert state.dataset_export.state == "error"
+
+
+def test_snapshot_includes_dataset_export_and_active_task(tmp_path):
+    state, _ = _task_state(tmp_path)
+    snap = gateway._snapshot(state)
+    assert "datasetExport" in snap
+    assert snap["datasetExport"]["state"] == "idle"
+    assert snap["activeTaskId"] == ""

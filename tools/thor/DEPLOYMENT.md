@@ -739,7 +739,45 @@ LeRobot v3 parquet 训练格式，在此阶段执行对齐：
 4. 写入 `observation.state`（BOX 传感器值）和 `observation.images.*`（视频引用）
 
 **前提**：BOX 传感器上行修复后才有可对齐的数据（当前 rc=4）。
-`sync_reference` 元数据已就位，导出代码待 BOX 上行通后实现。
+`sync_reference` 元数据已就位，完整 PTS 级对齐（L2）待 BOX 上行通后实现。
+
+### 已实现：按任务合并导出（best-effort，无 L2 对齐）
+
+Dataset Export 页面的「Consolidate a Task」：选一个任务 → 把它所有
+session（`<name>_<时间戳>/`，按时间戳排序）合并成**一个** LeRobot v3
+数据集，写到独立 exports 根（默认 `outputs/exports/<name>/`，gateway
+`--exports-root` 可改）。原始 session 不动、可重跑。
+
+- 实现：`tools/thor/gmsl2/export_v3.py`（CLI + `export_task_to_v3()`），
+  gateway 端点 `/api/tasks/export?id=<taskId>` spawn 它并把进度 stream 到
+  `datasetExport` 状态。
+- **只依赖 `pyarrow` + `gstreamer`**，跑在采集机最小 Python 环境里
+  （**不**走 `LeRobotDataset` / torch / datasets / av —— 那些 Thor 上没有，
+  见 §3）。v3 元数据用 pyarrow 手写（沿用 `Lr3Writer` 的方式）。
+- **视频转 H.264 + CFR**：源 MKV 是 HEVC（`nvv4l2h265enc`）。每个 episode
+  每路相机用 gst `nvv4l2decoder ! videorate ! framerate=fps ! nvv4l2h264enc`
+  转成 **H.264** 的 per-episode mp4（`videos/<key>/chunk-000/file-<ep>.mp4`），
+  dev 机无 nvv4l2 时回退 `ffmpeg -vf fps -c:v libx264`。
+  - **为什么必须 CFR + H.264**：v3 loader 用**单个** timestamp 查询一个
+    episode 的**所有**相机，源 MKV 的容器 PTS 是 `do-timestamp` 记的到达
+    时刻、抖动且各路不一；`videorate` 强制重排到 `i/fps` 网格（PWM 本就是
+    60fps 硬同步，这是物理正确的），使所有相机帧落在同一时钟、查询
+    tolerance(1e-4) 内命中。H.264 则兼容 torchvision 兜底解码器。
+- **逐相机帧数可能不同**（不均匀丢帧），而单 timestamp 要服务所有相机，
+  所以 `n_frames = min(所有相机帧数, box 行数)`，多出的尾帧截掉
+  （日志里 emit `camera frame counts vary ...; truncating to N`）。
+  相机帧数从源 MKV 的 `extract_pts`（gst 读容器 PTS，不解码，Thor 可用）得到。
+- box parquet（录制时 `Lr3Writer` 写的）按 `(episode_index, frame_index)`
+  对齐到相机帧，截到较短一方写入 `observation.state` / `action`。
+- **best-effort 限制**：跨相机/与 box 的对齐是按帧序号（CFR 网格），中途若
+  有相机丢帧则丢帧点之后跨相机不再严格对齐；**不做** PTS 级 wall-clock
+  对齐（那是下面 L2）。`meta/export_sources.json` 记录每个全局 episode 来自
+  哪个 session 便于溯源。
+- 输出根与原始 `outputs/datasets/` 分开，避免被 Task 进度计数当成 session
+  重复统计。
+- 已在 Thor 实测：6 episodes / 2 sessions / 10 cam @ 1920×1080 @ 60fps，
+  产物在 full-deps 机上经 `LeRobotDataset` 加载 + 逐帧解码（首/中/末帧 ×
+  全 10 路）通过。
 
 ### 同步级别路线图
 
@@ -747,7 +785,7 @@ LeRobot v3 parquet 训练格式，在此阶段执行对齐：
 | --- | --- | --- | --- |
 | L0 硬同步（相机间） | <1μs | ✅ 已工作 | PWM slave mode，11 路帧对齐 |
 | L1 软同步元数据 | ±25ms | ✅ 已实现 | sync_reference in meta.json |
-| L2 导出时对齐 | ±25ms | 🔲 待实现 | BOX 上行通后实现，写入 parquet |
+| L2 导出时对齐 | ±25ms | 🔲 待实现 | PTS 级对齐待 BOX 上行通后实现（best-effort 合并导出已可用，见上） |
 | L3a 录制时高频对齐 | ±2.5ms~±10ms | ✅ 已实现 | 500Hz poll + per-sensor MCU 时间戳去重 + 逐传感器最近邻插值 |
 | L3b 增强对齐 | ±0.5~1ms | ✅ 已实现 | MKV PTS 提取 + MCU↔Host 时钟线性回归 |
 | L4 硬件级全同步 | <1μs | 🔲 需硬件改 | BOX MCU 也由 PWM 触发 |

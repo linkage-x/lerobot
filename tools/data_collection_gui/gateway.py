@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlparse
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
 DEFAULT_RECORDER_SCRIPT = Path("tools/handheld/handheld_record.py")
 DEFAULT_DATASETS_ROOT = Path("outputs/datasets")
+DEFAULT_EXPORTS_ROOT = Path("outputs/exports")
 DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM = 20.0
 DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG = 15.0
 DEFAULT_REPLAY_MAX_EE_STEP_MM = 120.0
@@ -102,6 +103,23 @@ class ReplayStatus:
 
 
 @dataclass
+class DatasetExportStatus:
+    state: str = "idle"  # idle | exporting | complete | error
+    target: str = "lerobot_v3"
+    datasetRoot: str = ""
+    outputPath: str = ""
+    selectedEpisodes: int = 0
+    totalFrames: int = 0
+    includeRaw: bool = True
+    includeDebug: bool = False
+    includeTraining: bool = True
+    message: str = "Select a task to consolidate its sessions into one v3 dataset"
+    manifest: list[str] = field(default_factory=list)
+    pid: int | None = None
+    taskId: str = ""
+
+
+@dataclass
 class CalibrationStatus:
     state: str = "idle"
     pattern: str = "ChArUco 5x7 (mock)"
@@ -119,8 +137,11 @@ class GatewayState:
     recording: RecordingStatus
     replay: ReplayStatus
     datasets_root: Path | None = None
+    exports_root: Path | None = None
     devices: list[dict[str, Any]] = field(default_factory=list)
     calibration: CalibrationStatus = field(default_factory=CalibrationStatus)
+    dataset_export: DatasetExportStatus = field(default_factory=DatasetExportStatus)
+    export_process: subprocess.Popen[str] | None = None
     events: list[EventLogItem] = field(default_factory=list)
     selected_replay_root: Path | None = None
     active_task_id: str | None = None
@@ -1399,6 +1420,122 @@ def _resolve_recorder_config_path(state: GatewayState) -> Path:
         f"(config {overlay_path})",
     )
     return overlay_path
+
+
+# ----------------------------------------------------- task v3 consolidation ---
+
+
+def _export_is_running(state: GatewayState) -> bool:
+    return state.export_process is not None and state.export_process.poll() is None
+
+
+def _task_exports_root(state: GatewayState) -> Path:
+    if state.exports_root is not None:
+        return state.exports_root
+    return state.repo_root / "outputs" / "exports"
+
+
+def _export_command(state: GatewayState, task: dict[str, Any]) -> tuple[list[str], Path]:
+    """Build the export_v3 subprocess command and return (cmd, out_root).
+
+    Consolidates every session whose name shares the task's repo_id trailing
+    segment into one LeRobot v3 dataset under the exports root.
+    """
+
+    repo_id = str(task.get("datasetRepoId") or "").strip()
+    if not repo_id:
+        raise ValueError("Task has no dataset repo id; nothing to export.")
+    base_name = repo_id.split("/")[-1].strip()
+    datasets_dir = _task_datasets_dir(state)
+    if datasets_dir is None:
+        raise RuntimeError(
+            "Cannot export without a datasets root; start the gateway with --datasets-root."
+        )
+    exports_root = _task_exports_root(state)
+    out_root = exports_root / base_name
+    task_prompt = str(task.get("description") or task.get("name") or base_name).strip()
+    script = state.repo_root / "tools" / "thor" / "gmsl2" / "export_v3.py"
+    command = [
+        str(_venv_python(state.repo_root)),
+        str(script),
+        "--datasets-root", str(datasets_dir),
+        "--exports-root", str(exports_root),
+        "--base-name", base_name,
+        "--repo-id", repo_id,
+        "--task", task_prompt,
+        "--overwrite",
+    ]
+    return command, out_root
+
+
+def _start_task_export(state: GatewayState, task_id: str) -> None:
+    if _export_is_running(state):
+        raise RuntimeError("An export is already running; wait for it to finish.")
+    task = _find_task(state, task_id)
+    if task is None:
+        raise ValueError(f"Task not found: {task_id}")
+    command, out_root = _export_command(state, task)
+    state.export_process = subprocess.Popen(
+        command,
+        cwd=state.repo_root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=_recorder_env(state.repo_root),
+        start_new_session=True,
+    )
+    state.dataset_export = DatasetExportStatus(
+        state="exporting",
+        target="lerobot_v3",
+        datasetRoot=str(_task_datasets_dir(state) or ""),
+        outputPath=str(out_root),
+        message=f"Consolidating sessions for {task['name']}…",
+        pid=state.export_process.pid,
+        taskId=task_id,
+    )
+    state.log("info", f"Started v3 export for task {task['name']} -> {out_root}")
+    Thread(
+        target=_read_export_output,
+        args=(state, state.export_process),
+        daemon=True,
+        name=f"task-export-output-{state.export_process.pid}",
+    ).start()
+
+
+def _apply_export_output(state: GatewayState, output: str) -> None:
+    state.dataset_export.message = output
+    match = re.search(r"Export plan: (\d+) episodes", output)
+    if match:
+        state.dataset_export.selectedEpisodes = int(match.group(1))
+    if output.startswith("Episode ") and "written" in output:
+        frames = re.search(r"\((\d+) frames\)", output)
+        if frames:
+            state.dataset_export.totalFrames += int(frames.group(1))
+    if output.startswith("Export complete"):
+        state.dataset_export.state = "complete"
+    elif output.startswith("ERROR:"):
+        state.dataset_export.state = "error"
+    state.log("info", f"export: {output}")
+
+
+def _read_export_output(state: GatewayState, process: subprocess.Popen[str]) -> None:
+    if process.stdout is None:
+        return
+    for line in process.stdout:
+        output = line.strip()
+        if not output:
+            continue
+        with state.lock:
+            if state.export_process is not process:
+                return
+            _apply_export_output(state, output)
+    return_code = process.wait()
+    with state.lock:
+        if state.export_process is process and state.dataset_export.state == "exporting":
+            state.dataset_export.state = "error" if return_code else "complete"
+            if return_code:
+                state.dataset_export.message = f"Export exited with code {return_code}"
 
 
 def _annotation_store_path(dataset_root: Path) -> Path:
@@ -3529,6 +3666,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "events": [asdict(event) for event in state.events],
         "tasks": _tasks_with_progress(state),
         "activeTaskId": state.active_task_id or "",
+        "datasetExport": asdict(state.dataset_export),
     }
 
 
@@ -4670,6 +4808,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _set_active_task(self.server.state, task_id)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
+                if path == "/api/tasks/export":
+                    task_id = (query.get("id", [""])[0] or "").strip()
+                    _start_task_export(self.server.state, task_id)
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
         except Exception as exc:  # noqa: BLE001
             _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
@@ -4685,7 +4828,12 @@ class DataCollectionGuiServer(ThreadingHTTPServer):
         self.state = state
 
 
-def make_state(repo_root: Path, config_path: Path, datasets_root: Path | None = None) -> GatewayState:
+def make_state(
+    repo_root: Path,
+    config_path: Path,
+    datasets_root: Path | None = None,
+    exports_root: Path | None = None,
+) -> GatewayState:
     resolved_root = repo_root.resolve()
     resolved_config = config_path if config_path.is_absolute() else resolved_root / config_path
     config = _load_yaml(resolved_config)
@@ -4693,6 +4841,10 @@ def make_state(repo_root: Path, config_path: Path, datasets_root: Path | None = 
     if datasets_root is not None:
         resolved_datasets_root = datasets_root if datasets_root.is_absolute() else resolved_root / datasets_root
         resolved_datasets_root = resolved_datasets_root.resolve()
+    resolved_exports_root: Path | None = None
+    if exports_root is not None:
+        resolved_exports_root = exports_root if exports_root.is_absolute() else resolved_root / exports_root
+        resolved_exports_root = resolved_exports_root.resolve()
     state = GatewayState(
         repo_root=resolved_root,
         config_path=resolved_config,
@@ -4700,6 +4852,7 @@ def make_state(repo_root: Path, config_path: Path, datasets_root: Path | None = 
         recording=_recording_status_from_config(config),
         replay=_replay_status_from_config(config),
         datasets_root=resolved_datasets_root,
+        exports_root=resolved_exports_root,
         devices=_device_statuses(config, resolved_root),
     )
     state.replay.mujocoValidation = _new_mujoco_validation(state)
@@ -4716,12 +4869,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--config-path", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--datasets-root", type=Path, default=DEFAULT_DATASETS_ROOT)
+    parser.add_argument("--exports-root", type=Path, default=DEFAULT_EXPORTS_ROOT)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    state = make_state(args.repo_root, args.config_path, args.datasets_root)
+    state = make_state(args.repo_root, args.config_path, args.datasets_root, args.exports_root)
     server = DataCollectionGuiServer((args.host, args.port), state)
     print(f"Data collection GUI gateway listening on http://{args.host}:{args.port}")
     try:

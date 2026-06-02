@@ -230,6 +230,7 @@ export type DatasetExportStatus = {
   includeTraining: boolean;
   message: string;
   manifest: string[];
+  taskId?: string;
 };
 
 export type ProcessingStatus =

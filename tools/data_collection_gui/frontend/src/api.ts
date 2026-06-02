@@ -617,6 +617,22 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
+  async exportTask(taskId: string): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot(`/api/tasks/export?id=${encodeURIComponent(taskId)}`);
+    if (remote) {
+      return remote;
+    }
+    await wait(120);
+    this.snapshot.datasetExport = {
+      ...this.snapshot.datasetExport,
+      state: "exporting",
+      target: "lerobot_v3",
+      message: `Consolidating sessions for task ${taskId}… (mock)`
+    };
+    this.log("info", `Started v3 export for task: ${taskId}`);
+    return this.getSnapshot();
+  }
+
   async setActiveTask(taskId: string): Promise<GuiSnapshot> {
     const remote = await this.postRemoteSnapshot(`/api/tasks/activate?id=${encodeURIComponent(taskId)}`);
     if (remote) {

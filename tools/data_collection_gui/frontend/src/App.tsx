@@ -1392,20 +1392,70 @@ function DatasetExportPage({
   busy,
   onPrepare,
   onExport,
+  onExportTask,
   onOpenProcessing
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
   onPrepare: (target: GuiSnapshot["datasetExport"]["target"]) => void;
   onExport: () => void;
+  onExportTask: (id: string) => void;
   onOpenProcessing: () => void;
 }) {
   const exportStatus = snapshot.datasetExport;
   const eligible = snapshot.processing.filter((item) => item.status === "qc_pass");
   const hasEligible = eligible.length > 0;
+  const exportableTasks = (snapshot.tasks ?? []).filter((t) => t.datasetRepoId);
+  const exporting = exportStatus.state === "exporting";
   return (
     <div className="page-stack">
       <PageHeader title="Dataset Export" subtitle="package QC-approved datasets into LeRobot, MCAP, or Parquet bundles" />
+      <section className="panel">
+        <div className="panel-heading">
+          <h2>Consolidate a Task</h2>
+          <span>{exportableTasks.length} exportable</span>
+        </div>
+        <p className="panel-note">
+          Merge every recorded session of a task into one LeRobot v3 dataset under the exports root. Raw sessions are left untouched; re-run any time.
+        </p>
+        {exportableTasks.length === 0 ? (
+          <div className="empty-dataset-list">No tasks with a dataset repo id. Create one in Task Library first.</div>
+        ) : (
+          <div className="processing-list">
+            {exportableTasks.map((task) => (
+              <div className="processing-row" key={task.id}>
+                <div className="processing-row-main static">
+                  <div>
+                    <div className="row-title">
+                      <StatusDot state={taskStatusDot[task.status]} />
+                      <strong>{task.name}</strong>
+                      <em>{task.datasetRepoId}</em>
+                    </div>
+                    <p>{task.completedEpisodes} episode(s) recorded across its sessions</p>
+                  </div>
+                  <div className="processing-stats">
+                    <button
+                      disabled={busy || exporting}
+                      onClick={() => onExportTask(task.id)}
+                    >
+                      {exporting && exportStatus.taskId === task.id ? "Exporting…" : "Export v3"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        {exportStatus.state !== "idle" && (
+          <div className="summary-grid">
+            <Metric label="Export state" value={stateLabel(exportStatus.state)} />
+            <Metric label="Output" value={exportStatus.outputPath || "—"} />
+            <Metric label="Episodes" value={exportStatus.selectedEpisodes} />
+            <Metric label="Frames" value={exportStatus.totalFrames} />
+            <Metric label="Message" value={exportStatus.message} />
+          </div>
+        )}
+      </section>
       <section className="panel">
         <div className="panel-heading">
           <h2>Approved Datasets</h2>
@@ -2169,6 +2219,7 @@ function App() {
         busy={busy}
         onPrepare={(target) => run(() => api.prepareDatasetExport(target))}
         onExport={() => run(() => api.startDatasetExport())}
+        onExportTask={(id) => run(() => api.exportTask(id))}
         onOpenProcessing={() => navigate("dataset-processing")}
       />
     ) : activePage === "task-library" ? (
