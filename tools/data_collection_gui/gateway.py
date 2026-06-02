@@ -9,12 +9,15 @@ import csv
 import json
 import math
 import os
+import queue
 import re
+import select
 import signal
 import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -151,9 +154,45 @@ class GatewayState:
     processing_processes: dict[str, subprocess.Popen[str]] = field(default_factory=dict)
     process_started_at_s: float | None = None
     replay_started_at_s: float | None = None
+    log_dir: Path | None = None
+    gateway_log_path: Path | None = None
+    recorder_log_path: Path | None = None
     device_preview: dict[str, Any] = field(default_factory=dict)
-    camera_preview_process: subprocess.Popen[bytes] | None = None
+    # One live preview pipeline per camera device id, so the Device Manager grid
+    # can show many cameras at once. Each pipeline's reader thread keeps only the
+    # latest JPEG in `camera_preview_frames`; the HTTP layer serves that cached
+    # frame as a short snapshot request (NOT a long-lived MJPEG stream), so 11
+    # tiles don't exhaust the browser's ~6-connections-per-origin limit. A
+    # dedicated spawn lock serializes nvarguscamerasrc Argus opens to dodge the
+    # NVMM dmabuf race (NvBufSurfaceFromFd Failed). Pipelines self-terminate
+    # once no tile has polled them for `_PREVIEW_IDLE_TTL_S`.
+    camera_preview_processes: dict[str, subprocess.Popen[bytes]] = field(default_factory=dict)
+    camera_preview_frames: dict[str, tuple[bytes, float]] = field(default_factory=dict)
+    camera_preview_last_access: dict[str, float] = field(default_factory=dict)
+    camera_preview_lock: Lock = field(default_factory=Lock)
+    camera_preview_spawn_lock: Lock = field(default_factory=Lock)
+    camera_preview_last_spawn_s: float = 0.0
+    # Set while the recorder owns the cameras so snapshot polls don't respawn a
+    # preview pipeline that would re-occupy a sensor the recorder needs.
+    camera_preview_suspended: bool = False
+    # monotonic() of the last "preview_demand" heartbeat written to recorder
+    # stdin; debounces those writes (see _maybe_send_preview_demand).
+    recorder_preview_demand_sent_s: float = 0.0
     lock: Lock = field(default_factory=Lock)
+    # Recorder stdout lines are pushed here by the reader thread WITHOUT taking
+    # `lock`, so a slow snapshot can never back up the pipe and freeze the
+    # recorder + camera worker subprocesses. A dedicated consumer thread applies
+    # them under `lock`.
+    recorder_output_queue: "queue.Queue[tuple[Any, str]]" = field(default_factory=queue.Queue)
+    # Cached results of the expensive dataset filesystem scan (298G / 600+
+    # episodes on Thor takes 4-12s). A background thread refreshes these OFF the
+    # lock; `_snapshot` only reads the cache, so it never walks the dataset tree
+    # while holding `lock` (which previously starved the recorder-stdout drain
+    # and every camera.jpg preview request for seconds).
+    cached_recorded_datasets: list[dict[str, Any]] = field(default_factory=list)
+    cached_trajectory: list[Any] = field(default_factory=list)
+    cached_trajectory_meta: dict[str, Any] = field(default_factory=dict)
+    dataset_cache_ready: bool = False
 
     def log(self, level: str, message: str) -> None:
         self.events.insert(
@@ -2204,20 +2243,39 @@ def _gmsl2_episode_dirs(dataset_root: Path) -> list[Path]:
     )
 
 
+# Per-episode frame-count memo keyed by meta.json path -> (mtime, frames).
+# An episode's meta.json is immutable once written, so completed sessions are
+# never re-parsed; only the actively-recording episode's meta changes. This
+# turns a full 600-episode rescan from "open+parse 600 JSON files" into "stat
+# 600 files" (tens of ms), which keeps the background refresher cheap.
+_GMSL2_EP_FRAMES_MEMO: dict[str, tuple[float, int]] = {}
+
+
 def _gmsl2_dataset_stats(dataset_root: Path) -> tuple[int, int]:
     ep_dirs = _gmsl2_episode_dirs(dataset_root)
     total_frames = 0
     for ep_dir in ep_dirs:
         meta_path = ep_dir / "meta.json"
-        if meta_path.is_file():
-            try:
-                with meta_path.open() as f:
-                    ep_meta = json.load(f)
-                dur = float(ep_meta.get("duration_s") or 0)
-                fps = int(ep_meta.get("video", {}).get("fps") or 60)
-                total_frames += int(dur * fps)
-            except (OSError, json.JSONDecodeError, TypeError, ValueError):
-                pass
+        try:
+            mtime = meta_path.stat().st_mtime
+        except OSError:
+            continue  # no meta.json yet (episode mid-write)
+        key = str(meta_path)
+        cached = _GMSL2_EP_FRAMES_MEMO.get(key)
+        if cached is not None and cached[0] == mtime:
+            total_frames += cached[1]
+            continue
+        frames = 0
+        try:
+            with meta_path.open() as f:
+                ep_meta = json.load(f)
+            dur = float(ep_meta.get("duration_s") or 0)
+            fps = int(ep_meta.get("video", {}).get("fps") or 60)
+            frames = int(dur * fps)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            frames = 0
+        _GMSL2_EP_FRAMES_MEMO[key] = (mtime, frames)
+        total_frames += frames
     return len(ep_dirs), total_frames
 
 
@@ -3380,9 +3438,7 @@ def _serve_static_file(handler: BaseHTTPRequestHandler, asset_path: Path, conten
                 return
 
 
-def _stop_camera_preview_process(state: GatewayState) -> None:
-    proc = state.camera_preview_process
-    state.camera_preview_process = None
+def _terminate_preview_proc(proc: subprocess.Popen[bytes] | None) -> None:
     if proc is None or proc.poll() is not None:
         return
     proc.terminate()
@@ -3392,19 +3448,148 @@ def _stop_camera_preview_process(state: GatewayState) -> None:
         proc.kill()
 
 
-def _serve_camera_preview_mjpeg(
-    handler: BaseHTTPRequestHandler,
+def _stop_all_camera_previews(state: GatewayState) -> None:
+    with state.camera_preview_lock:
+        procs = list(state.camera_preview_processes.values())
+        state.camera_preview_processes.clear()
+    for proc in procs:
+        _terminate_preview_proc(proc)
+
+
+@contextmanager
+def _previews_suspended_for_connect(state: GatewayState):
+    """Hold ``camera_preview_suspended`` across the Connect preflight + spawn.
+
+    Setting the flag makes the snapshot route reject preview polls (409) so a
+    concurrent poll can't respawn a Device Manager preview pipeline in the gap
+    before the recorder's ``nvarguscamerasrc`` takes the sensors. The previous
+    code set the flag inline before the request's ``try`` and relied on four
+    scattered reset sites (``_snapshot`` on recorder exit, ``_stop_recorder``,
+    and the connect ``except``); any new early-return in Connect that forgot to
+    reset would wedge previews at 409 forever.
+
+    Lifecycle here is total: on **any** exception before the recorder is
+    running the flag is reset so the operator can keep inspecting the grid; on
+    success it stays set (the recorder now owns the cameras) and is later
+    cleared by ``_stop_recorder`` / ``_snapshot`` when the recorder exits.
+    """
+    with state.lock:
+        state.camera_preview_suspended = True
+    ok = False
+    try:
+        yield
+        ok = True
+    finally:
+        if not ok:
+            with state.lock:
+                state.camera_preview_suspended = False
+
+
+def _camera_preview_stagger_s(state: GatewayState) -> float:
+    """Gap between consecutive preview Argus opens.
+
+    Honors a dedicated ``cameras.preview_spawn_stagger_s`` knob; otherwise falls
+    back to the recording ``spawn_stagger_s`` capped at 0.5s so the grid still
+    fills quickly while keeping concurrent Argus opens serialized.
+    """
+    cams = state.config.get("cameras") if isinstance(state.config.get("cameras"), dict) else {}
+    raw = cams.get("preview_spawn_stagger_s")
+    if raw is None:
+        try:
+            base = float(cams.get("spawn_stagger_s", 0.5))
+        except (TypeError, ValueError):
+            base = 0.5
+        return max(0.0, min(base, 0.5))
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.5
+
+
+# A preview pipeline is reaped once no tile has polled its snapshot for this
+# long. The frontend polls every ~250ms, so 5s tolerates a few dropped polls
+# / a page that is briefly backgrounded without leaking Argus sessions.
+_PREVIEW_IDLE_TTL_S = 5.0
+# How long a snapshot request waits for the first frame after a cold spawn
+# (Argus open + ISP/AWB settle) before giving up with 503.
+_PREVIEW_FIRST_FRAME_TIMEOUT_S = 6.0
+# Recorder-owned preview files are produced at ~5 fps; tolerate short pauses
+# without showing a stale frame as live.
+_RECORDER_PREVIEW_STALE_S = 2.0
+_RECORDER_PREVIEW_DIR = Path("/dev/shm/lerobot_preview")
+# Debounce interval for the viewer-demand heartbeat sent to the recorder while
+# the Device Manager grid polls camera.jpg. Must stay well under the recorder's
+# recording_preview_idle_ttl_s (default 6s) so a steadily-polling grid never
+# lets previews lapse.
+_RECORDER_PREVIEW_DEMAND_INTERVAL_S = 1.0
+
+
+def _state_is_gmsl2(state: GatewayState) -> bool:
+    recorder = state.config.get("recorder") if isinstance(state.config.get("recorder"), dict) else {}
+    sensors = state.config.get("sensors") if isinstance(state.config.get("sensors"), dict) else {}
+    cameras = sensors.get("cameras") if isinstance(sensors.get("cameras"), dict) else {}
+    recorder_script = str(recorder.get("script") or "")
+    return "gmsl" in recorder_script or "defaults" in cameras
+
+
+def _should_use_recorder_camera_preview(state: GatewayState) -> bool:
+    return (
+        state.process is not None
+        or state.camera_preview_suspended
+        or _state_is_gmsl2(state)
+    )
+
+
+def _recorder_preview_frame(device_id: str) -> bytes | None:
+    path = _RECORDER_PREVIEW_DIR / f"{device_id}.jpg"
+    try:
+        stat = path.stat()
+        if time.time() - stat.st_mtime > _RECORDER_PREVIEW_STALE_S:
+            return None
+        frame = path.read_bytes()
+    except OSError:
+        return None
+    return frame or None
+
+
+def _serve_recorder_camera_preview_snapshot(
+    handler: BaseHTTPRequestHandler, *, state: GatewayState, device_id: str,
+) -> None:
+    known = any(
+        d.get("id") == device_id and d.get("kind") == "camera"
+        for d in state.devices
+    )
+    if not known:
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"camera not found: {device_id}"})
+        return
+    # Signal viewer demand so the recorder attaches preview branches on demand.
+    # Do this BEFORE reading the frame: when previews are idle-reclaimed the JPEG
+    # is absent and this poll (which would 503) is precisely what re-enables them.
+    _maybe_send_preview_demand(state)
+    frame = _recorder_preview_frame(device_id)
+    if frame is None:
+        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "no recorder preview frame yet"})
+        return
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("Content-Type", "image/jpeg")
+    handler.send_header("Content-Length", str(len(frame)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    try:
+        handler.wfile.write(frame)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
+def _camera_preview_cmd(
     *,
-    state: GatewayState,
     sensor_id: int,
     sensor_mode: int,
     source_width: int,
     source_height: int,
     source_fps: int,
-) -> None:
-    if shutil.which("gst-launch-1.0") is None:
-        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "gst-launch-1.0 not found"})
-        return
+) -> list[str]:
     output_width = 480
     output_height = max(1, round(output_width * source_height / max(source_width, 1)))
     output_fps = 10
@@ -3413,7 +3598,9 @@ def _serve_camera_preview_mjpeg(
         f"format=NV12,width={source_width},height={source_height},framerate={source_fps}/1"
     )
     caps_out = f"video/x-raw,format=I420,width={output_width},height={output_height}"
-    cmd = [
+    # Raw concatenated JPEGs on stdout (no multipartmux): the reader thread
+    # splits them on SOI/EOI markers and caches the latest one.
+    return [
         "gst-launch-1.0",
         "-q",
         "nvarguscamerasrc",
@@ -3434,46 +3621,178 @@ def _serve_camera_preview_mjpeg(
         "jpegenc",
         "quality=65",
         "!",
-        "multipartmux",
-        "boundary=frame",
-        "!",
         "fdsink",
         "fd=1",
     ]
-    with state.lock:
-        _stop_camera_preview_process(state)
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        cwd=str(Path.cwd()),
+
+
+def _camera_preview_reader(state: GatewayState, device_id: str, proc: subprocess.Popen[bytes]) -> None:
+    """Pump JPEG frames from one preview pipeline into the latest-frame cache.
+
+    Splits the raw concatenated JPEG stream on SOI (FFD8) / EOI (FFD9) markers
+    and keeps only the most recent complete frame. Uses ``select`` so it wakes
+    even when the pipeline stalls, letting it self-terminate on the idle TTL
+    (which releases the Argus session — important so a later Connect doesn't
+    find the camera still occupied).
+    """
+    buf = bytearray()
+    stdout = proc.stdout
+    assert stdout is not None
+    fd = stdout.fileno()
+    try:
+        while True:
+            if proc.poll() is not None:
+                break
+            with state.camera_preview_lock:
+                last = state.camera_preview_last_access.get(device_id, 0.0)
+            if time.time() - last > _PREVIEW_IDLE_TTL_S:
+                break
+            ready, _, _ = select.select([fd], [], [], 1.0)
+            if not ready:
+                continue
+            chunk = os.read(fd, 256 * 1024)
+            if not chunk:
+                break
+            buf += chunk
+            # Extract every complete JPEG currently buffered; keep the last.
+            latest: bytes | None = None
+            while True:
+                soi = buf.find(b"\xff\xd8")
+                if soi < 0:
+                    buf.clear()
+                    break
+                eoi = buf.find(b"\xff\xd9", soi + 2)
+                if eoi < 0:
+                    if soi > 0:
+                        del buf[:soi]
+                    break
+                latest = bytes(buf[soi : eoi + 2])
+                del buf[: eoi + 2]
+            if latest is not None:
+                with state.camera_preview_lock:
+                    state.camera_preview_frames[device_id] = (latest, time.time())
+    finally:
+        _terminate_preview_proc(proc)
+        with state.camera_preview_lock:
+            if state.camera_preview_processes.get(device_id) is proc:
+                state.camera_preview_processes.pop(device_id, None)
+            state.camera_preview_frames.pop(device_id, None)
+
+
+def _ensure_camera_preview(
+    state: GatewayState,
+    *,
+    device_id: str,
+    sensor_id: int,
+    sensor_mode: int,
+    source_width: int,
+    source_height: int,
+    source_fps: int,
+) -> bool:
+    """Spawn the preview pipeline for ``device_id`` if it isn't already running.
+
+    Returns False only when gst-launch is unavailable. The Argus open is
+    serialized + staggered across cameras to dodge the NVMM dmabuf race.
+    """
+    if shutil.which("gst-launch-1.0") is None:
+        return False
+    with state.camera_preview_lock:
+        proc = state.camera_preview_processes.get(device_id)
+        if proc is not None and proc.poll() is None:
+            return True
+    cmd = _camera_preview_cmd(
+        sensor_id=sensor_id,
+        sensor_mode=sensor_mode,
+        source_width=source_width,
+        source_height=source_height,
+        source_fps=source_fps,
     )
-    with state.lock:
-        state.camera_preview_process = proc
+    stagger = _camera_preview_stagger_s(state)
+    with state.camera_preview_spawn_lock:
+        # Re-check under the spawn lock: another request may have raced us.
+        with state.camera_preview_lock:
+            proc = state.camera_preview_processes.get(device_id)
+            if proc is not None and proc.poll() is None:
+                return True
+        if stagger > 0:
+            gap = stagger - (time.monotonic() - state.camera_preview_last_spawn_s)
+            if gap > 0:
+                time.sleep(gap)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=str(Path.cwd()),
+        )
+        state.camera_preview_last_spawn_s = time.monotonic()
+        with state.camera_preview_lock:
+            state.camera_preview_processes[device_id] = proc
+    Thread(
+        target=_camera_preview_reader,
+        args=(state, device_id, proc),
+        daemon=True,
+        name=f"camera-preview-{device_id}",
+    ).start()
+    return True
+
+
+def _serve_camera_preview_snapshot(
+    handler: BaseHTTPRequestHandler,
+    *,
+    state: GatewayState,
+    device_id: str,
+    sensor_id: int,
+    sensor_mode: int,
+    source_width: int,
+    source_height: int,
+    source_fps: int,
+) -> None:
+    with state.camera_preview_lock:
+        state.camera_preview_last_access[device_id] = time.time()
+    ok = _ensure_camera_preview(
+        state,
+        device_id=device_id,
+        sensor_id=sensor_id,
+        sensor_mode=sensor_mode,
+        source_width=source_width,
+        source_height=source_height,
+        source_fps=source_fps,
+    )
+    if not ok:
+        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "gst-launch-1.0 not found"})
+        return
+    # Wait briefly for a frame (cold spawn must open Argus + settle ISP/AWB).
+    deadline = time.monotonic() + _PREVIEW_FIRST_FRAME_TIMEOUT_S
+    frame: bytes | None = None
+    while True:
+        with state.camera_preview_lock:
+            cached = state.camera_preview_frames.get(device_id)
+            # Keep the pipeline marked live while we wait so the reader's TTL
+            # check doesn't reap it out from under a slow first frame.
+            state.camera_preview_last_access[device_id] = time.time()
+        if cached is not None:
+            frame = cached[0]
+            break
+        with state.camera_preview_lock:
+            proc = state.camera_preview_processes.get(device_id)
+        if proc is not None and proc.poll() is not None:
+            break  # pipeline died before producing a frame
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    if frame is None:
+        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "no preview frame yet"})
+        return
     handler.send_response(HTTPStatus.OK)
-    handler.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("Content-Type", "image/jpeg")
+    handler.send_header("Content-Length", str(len(frame)))
+    handler.send_header("Cache-Control", "no-store")
     handler.send_header("Access-Control-Allow-Origin", "*")
     handler.end_headers()
     try:
-        assert proc.stdout is not None
-        while True:
-            chunk = proc.stdout.read(64 * 1024)
-            if not chunk:
-                break
-            try:
-                handler.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                break
-    finally:
-        with state.lock:
-            if state.camera_preview_process is proc:
-                state.camera_preview_process = None
-        proc.terminate()
-        try:
-            proc.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        handler.wfile.write(frame)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
 
 
 def _camera_preview_params(state: GatewayState, device_id: str) -> tuple[int, int, int, int, int] | None:
@@ -3568,6 +3887,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         state.log("warn", f"Handheld recorder exited with code {process.returncode}")
         exited_from = state.recording.state
         state.process = None
+        state.camera_preview_suspended = False
         state.process_started_at_s = None
         state.recording.state = "idle" if process.returncode == 0 else "error"
         state.recording.pid = None
@@ -3575,8 +3895,12 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         state.recording.queueDepth = 0
         if isinstance(state.device_preview.get("box"), dict):
             state.device_preview["box"] = {**state.device_preview["box"], "active": False}
-        if state.recording.lastOutput:
-            state.recording.message = f"Recorder exited with code {process.returncode}: {state.recording.lastOutput}"
+        summary = (
+            _recorder_failure_summary(state.recording)
+            if process.returncode != 0 else state.recording.lastOutput
+        )
+        if summary:
+            state.recording.message = f"Recorder exited with code {process.returncode}: {summary}"
         else:
             state.recording.message = f"Recorder exited with code {process.returncode}"
         state.recording.datasetRoot = str(_dataset_config(state.config).get("root") or state.recording.datasetRoot)
@@ -3604,12 +3928,23 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
             else:
                 state.replay.message = f"{label} exited with code {replay_process.returncode}"
 
+    for line in state.recording.recentOutput:
+        _mark_failed_camera_devices(state, _failed_camera_ids_from_recorder_output(line))
+    if state.recording.state == "connecting" and any(
+        _recorder_output_is_failure(line) for line in state.recording.recentOutput
+    ):
+        state.recording.state = "error"
     recording_state = state.recording.state
     elapsed_s = None
     if state.process_started_at_s is not None:
         elapsed_s = max(0.0, time.monotonic() - state.process_started_at_s)
-    recorded_datasets = _recorded_dataset_items(state)
-    trajectory, trajectory_meta = _read_recorded_trajectory(state)
+    # Read the dataset scan results from the cache the background refresher
+    # maintains off-lock. NEVER scan the dataset tree here: _snapshot runs under
+    # state.lock, and walking 298G/600ep would block the recorder-stdout drain
+    # and all camera.jpg requests for seconds (the preview-freeze root cause).
+    recorded_datasets = list(state.cached_recorded_datasets)
+    trajectory = list(state.cached_trajectory)
+    trajectory_meta = dict(state.cached_trajectory_meta)
     if recorded_datasets and not trajectory_meta.get("datasetRoot"):
         latest_dataset = recorded_datasets[0]
         trajectory_meta = {
@@ -3787,6 +4122,10 @@ def _failed_camera_ids_from_recorder_output(output: str) -> set[str]:
     if partial_success_match:
         failed_ids.update(re.findall(r"\bcam_\d+\b", partial_success_match.group("failed")))
 
+    if any(token in output for token in ("connect stable window failed", "bus EOS", "stream(s) failed", "failed to reach PLAYING")):
+        failed_ids.update(re.findall(r"\bcam_\d+\b(?=\()", output))
+        failed_ids.update(re.findall(r"\[(cam_\d+)\]", output))
+
     return failed_ids
 
 
@@ -3810,6 +4149,36 @@ def _recorder_script(state: GatewayState) -> tuple[Path, str]:
     return state.repo_root / DEFAULT_RECORDER_SCRIPT, "--config_path"
 
 
+def _default_log_dir(repo_root: Path) -> Path:
+    return repo_root / "outputs" / "logs" / "data_collection_gui"
+
+
+def _timestamp_for_log() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def _ensure_log_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _new_recorder_log_path(state: GatewayState) -> Path:
+    log_dir = _ensure_log_dir(state.log_dir or _default_log_dir(state.repo_root))
+    return log_dir / f"recorder_{_timestamp_for_log()}.log"
+
+
+def _append_line(path: Path | None, line: str) -> None:
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.write("\n")
+    except OSError:
+        pass
+
+
 def _ensure_recorder_running(state: GatewayState) -> subprocess.Popen[str]:
     process = state.process
     if process is None or process.poll() is not None:
@@ -3819,11 +4188,52 @@ def _ensure_recorder_running(state: GatewayState) -> subprocess.Popen[str]:
     return process
 
 
+# Serialize all writes to the recorder's stdin pipe. The control commands
+# (connect "\n", save, discard, quit) come from request-handler threads, while
+# the preview-demand heartbeat is sent from the camera.jpg snapshot threads;
+# without a lock two writes could interleave at the byte level and corrupt a
+# command line. One recorder process exists at a time, so a module-level lock
+# is sufficient.
+_RECORDER_STDIN_LOCK = Lock()
+
+
 def _write_recorder_stdin(process: subprocess.Popen[str], text: str) -> None:
     if process.stdin is None:
         raise RuntimeError("Handheld recorder stdin is unavailable.")
-    process.stdin.write(text)
-    process.stdin.flush()
+    with _RECORDER_STDIN_LOCK:
+        process.stdin.write(text)
+        process.stdin.flush()
+
+
+def _maybe_send_preview_demand(state: GatewayState) -> None:
+    """Tell the recorder a viewer is polling camera.jpg, debounced to ~1/s.
+
+    The recorder attaches preview tee branches on demand and reclaims them
+    after an idle TTL (recording_preview_idle_ttl_s), so this heartbeat must
+    keep arriving while the Device Manager grid is open. Debouncing caps the
+    stdin chatter at one line per second no matter how many tiles poll. Sent
+    even when the JPEG does not exist yet (a poll that 503s is exactly what
+    must wake the previews up).
+    """
+    process = state.process
+    if process is None or process.stdin is None:
+        return
+    # Only the GMSL2 recorder understands "preview_demand" and produces
+    # recorder-owned preview JPEGs. The handheld recorder reads stdin byte by
+    # byte as keypresses, so a heartbeat there would be mis-handled — never
+    # send it to a non-GMSL2 recorder.
+    if not _state_is_gmsl2(state):
+        return
+    now = time.monotonic()
+    with _RECORDER_STDIN_LOCK:
+        if now - state.recorder_preview_demand_sent_s < _RECORDER_PREVIEW_DEMAND_INTERVAL_S:
+            return
+        state.recorder_preview_demand_sent_s = now
+        try:
+            process.stdin.write("preview_demand\n")
+            process.stdin.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            pass
 
 
 def _connect_recorder(state: GatewayState) -> None:
@@ -3846,6 +4256,7 @@ def _connect_recorder(state: GatewayState) -> None:
     # the first PLAYING transition deadlocks the Python thread).
     if "thor_record" in str(recorder_script):
         command.append("--skip-argus-probe")
+    recorder_log_path = _new_recorder_log_path(state)
     state.process = subprocess.Popen(
         command,
         cwd=state.repo_root,
@@ -3862,12 +4273,17 @@ def _connect_recorder(state: GatewayState) -> None:
     state.recording.frameIndex = 0
     state.recording.queueDepth = 0
     state.recording.message = "Connecting handheld devices"
+    state.recorder_log_path = recorder_log_path
+    _append_line(recorder_log_path, f"# command: {' '.join(command)}")
+    _append_line(recorder_log_path, f"# cwd: {state.repo_root}")
     # Drop the previous session's log lines so the frontend doesn't show
     # stale output from a prior crashed recorder mixed in with the new one.
     state.recording.lastOutput = ""
     state.recording.recentOutput = []
+    # Force the first viewer poll of the new session to send a demand heartbeat.
+    state.recorder_preview_demand_sent_s = 0.0
     _set_all_device_states(state, "warning")
-    state.log("info", f"Started handheld recorder pid={state.process.pid}")
+    state.log("info", f"Started handheld recorder pid={state.process.pid} log={recorder_log_path}")
     _start_output_reader(state, state.process)
 
 
@@ -3905,17 +4321,89 @@ def _start_replay_output_reader(state: GatewayState, process: subprocess.Popen[s
     thread.start()
 
 
+def _consume_recorder_output(state: GatewayState) -> None:
+    """Apply queued recorder stdout lines under the lock, off the pipe path.
+
+    The reader thread (``_read_process_output``) only drains the pipe and
+    enqueues; this single long-lived consumer is the only place that takes
+    ``state.lock`` for recorder output. If a snapshot briefly holds the lock the
+    queue just buffers in memory — the pipe is still drained, so the recorder
+    and camera workers never block on stdout. Started once at gateway startup.
+    """
+    q = state.recorder_output_queue
+    while True:
+        process, output = q.get()
+        if not output:
+            continue
+        try:
+            with state.lock:
+                if state.process is not process:
+                    continue  # line from an already-replaced recorder
+                _apply_recorder_output(state, output)
+        except Exception as exc:  # never let the consumer thread die
+            state.log("warn", f"recorder output consumer error: {exc}")
+
+
+def _refresh_dataset_stats_cache(state: GatewayState) -> None:
+    """Compute the expensive dataset scan OFF the lock and publish the result.
+
+    ``_recorded_dataset_items`` / ``_read_recorded_trajectory`` walk the dataset
+    tree (298G / 600+ episodes on Thor => 4-12s) and are read-only on ``state``.
+    Running them here (no lock held during the scan) and storing the result lets
+    ``_snapshot`` read O(1) cached values under the lock instead of scanning,
+    which is what kept the recorder-stdout drain and camera.jpg serving from
+    blocking for seconds. Per-episode memoization in ``_gmsl2_dataset_stats``
+    keeps each refresh cheap once warm.
+    """
+    items = _recorded_dataset_items(state)
+    trajectory, meta = _read_recorded_trajectory(state)
+    with state.lock:
+        state.cached_recorded_datasets = items
+        state.cached_trajectory = trajectory
+        state.cached_trajectory_meta = meta
+        state.dataset_cache_ready = True
+
+
+def _dataset_stats_refresher(state: GatewayState, interval_s: float = 4.0) -> None:
+    while True:
+        try:
+            _refresh_dataset_stats_cache(state)
+        except Exception as exc:  # keep refreshing despite transient FS errors
+            state.log("warn", f"dataset stats refresh failed: {exc}")
+        time.sleep(interval_s)
+
+
+def _start_background_workers(state: GatewayState) -> None:
+    """Launch the gateway's always-on helper threads (output consumer + dataset
+    stats refresher). Idempotent-ish: intended to be called once from main()."""
+    Thread(
+        target=_consume_recorder_output, args=(state,),
+        daemon=True, name="recorder-output-consumer",
+    ).start()
+    Thread(
+        target=_dataset_stats_refresher, args=(state,),
+        daemon=True, name="dataset-stats-refresher",
+    ).start()
+
+
 def _read_process_output(state: GatewayState, process: subprocess.Popen[str]) -> None:
     if process.stdout is None:
         return
+    # Drain the recorder's stdout pipe as fast as the OS delivers lines and
+    # NEVER take state.lock here. The old code did `with state.lock:
+    # _apply_recorder_output(...)` per line; when a snapshot held the lock for
+    # seconds (scanning 298G), this thread stalled, the 64KB pipe filled, and
+    # the recorder + all camera worker subprocesses blocked on their stdout
+    # writes — freezing preview production and the stale-preview watchdog.
+    # Now the reader only appends to the log file and hands the line to a queue
+    # that a dedicated consumer applies under the lock.
     for line in process.stdout:
-        output = line.strip()
+        raw = line.rstrip("\n")
+        _append_line(state.recorder_log_path, raw)
+        output = raw.strip()
         if not output:
             continue
-        with state.lock:
-            if state.process is not process:
-                return
-            _apply_recorder_output(state, output)
+        state.recorder_output_queue.put((process, output))
 
 
 def _read_replay_process_output(state: GatewayState, process: subprocess.Popen[str]) -> None:
@@ -4156,6 +4644,61 @@ def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> Non
 _RECORDER_NOISE_PREFIXES = ("[TLV_LOG_UPLOAD]", "GST_ARGUS:", "NvMMLite")
 
 
+_RECORDER_FAILURE_KEYWORDS = (
+    "connect exceeded global deadline",
+    "persistent pipeline connect failed",
+    "Auto-recover failed",
+    "recover_argus.sh timed out",
+    "connect stable window failed",
+    "failed to reach PLAYING",
+    "did not reach PLAYING",
+    "connect() partial success",
+    "stream(s) failed",
+    "restart_stream",
+    "NvBufSurfaceFromFd Failed",
+    "dmabuf_fd -1",
+    "Failed to create CaptureSession",
+    "Argus Error Status",
+    "Error turning on streaming",
+    "TIMEOUT",
+    "bus EOS",
+    "CONSUMER: ERROR OCCURRED",
+)
+
+
+def _compact_recorder_summary(line: str, *, max_len: int = 240) -> str:
+    summary = " ".join(line.strip().split())
+    if len(summary) <= max_len:
+        return summary
+    return summary[: max(0, max_len - 3)].rstrip() + "..."
+
+
+def _recorder_output_is_failure(line: str) -> bool:
+    return line.startswith("ERROR:") or any(
+        token in line for token in _RECORDER_FAILURE_KEYWORDS
+    )
+
+
+def _recorder_failure_summary(recording: RecordingStatus, *, max_len: int = 240) -> str:
+    """Pick the most useful recorder failure line for process-exit UI text.
+
+    Recorder stdout often ends with generic Argus chatter such as
+    "CONSUMER: Waiting until producer is connected...".  For a failed
+    process, prefer explicit protocol errors and then known Argus/GStreamer
+    failure signatures from the recent-output ring.
+    """
+    lines = [line.strip() for line in recording.recentOutput if line.strip()]
+    for line in reversed(lines):
+        if line.startswith("ERROR:"):
+            return _compact_recorder_summary(line, max_len=max_len)
+    for line in reversed(lines):
+        if _recorder_output_is_failure(line):
+            return _compact_recorder_summary(line, max_len=max_len)
+    if recording.lastOutput:
+        return _compact_recorder_summary(recording.lastOutput, max_len=max_len)
+    return ""
+
+
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
     if any(output.startswith(p) for p in _RECORDER_NOISE_PREFIXES):
         return
@@ -4183,6 +4726,8 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
     state.log("info", f"recorder: {output}")
 
     _mark_failed_camera_devices(state, _failed_camera_ids_from_recorder_output(output))
+    if _recorder_output_is_failure(output):
+        state.recording.state = "error"
 
     for prefix, kind in (
         ("Cameras:", "camera"),
@@ -4519,6 +5064,8 @@ def _abort_replay(state: GatewayState) -> None:
 
 
 def _stop_recorder(state: GatewayState, action: str) -> None:
+    # Recorder is going away (or already gone): re-allow Device Manager previews.
+    state.camera_preview_suspended = False
     try:
         process = _ensure_recorder_running(state)
     except RuntimeError:
@@ -4624,27 +5171,26 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             with self.server.state.lock:
                 _json_response(self, HTTPStatus.OK, _box_preview_payload(self.server.state, device_id))
                 return
-        if path == "/api/device-preview/camera.mjpeg":
+        if path == "/api/device-preview/camera.jpg":
             device_id = query.get("key", [""])[0]
             if not device_id:
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing key"})
                 return
-            with self.server.state.lock:
-                if self.server.state.process is not None:
-                    _json_response(
-                        self,
-                        HTTPStatus.CONFLICT,
-                        {"error": "camera preview is idle-only; stop the recorder before previewing"},
-                    )
-                    return
-                params = _camera_preview_params(self.server.state, device_id)
+            use_recorder_preview = _should_use_recorder_camera_preview(self.server.state)
+            params = None if use_recorder_preview else _camera_preview_params(self.server.state, device_id)
+            if use_recorder_preview:
+                _serve_recorder_camera_preview_snapshot(
+                    self, state=self.server.state, device_id=device_id,
+                )
+                return
             if params is None:
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"camera not found: {device_id}"})
                 return
             sensor_id, sensor_mode, source_width, source_height, source_fps = params
-            _serve_camera_preview_mjpeg(
+            _serve_camera_preview_snapshot(
                 self,
                 state=self.server.state,
+                device_id=device_id,
                 sensor_id=sensor_id,
                 sensor_mode=sensor_mode,
                 source_width=source_width,
@@ -4702,12 +5248,32 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         parsed_url = urlparse(self.path)
         path = parsed_url.path
         query = parse_qs(parsed_url.query)
+        if path == "/api/handheld/record/connect":
+            # Free the cameras before the recorder opens them: live Device
+            # Manager previews hold Argus sessions on the same sensor-ids, and
+            # leaving them up makes the recorder's nvarguscamerasrc open hang.
+            # The whole preflight + spawn runs inside the suspension context
+            # manager so the flag is reset on any failure (terminate(), sleep,
+            # or _connect_recorder raising), not just the ones a hand-written
+            # except remembered to cover.
+            state = self.server.state
+            try:
+                with _previews_suspended_for_connect(state):
+                    # Done outside the state lock (terminate() blocks).
+                    _stop_all_camera_previews(state)
+                    settle_s = _camera_preview_stagger_s(state)
+                    if settle_s > 0:
+                        time.sleep(settle_s)
+                    with state.lock:
+                        _connect_recorder(state)
+                        response = _snapshot(state)
+                _json_response(self, HTTPStatus.OK, response)
+            except Exception as exc:  # noqa: BLE001
+                state.log("warn", f"{path} failed: {exc}")
+                _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            return
         try:
             with self.server.state.lock:
-                if path == "/api/handheld/record/connect":
-                    _connect_recorder(self.server.state)
-                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
-                    return
                 if path == "/api/handheld/record/start":
                     _start_episode(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
@@ -4835,6 +5401,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
         except Exception as exc:  # noqa: BLE001
+            self.server.state.log("warn", f"{path} failed: {exc}")
             _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
         _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"Unknown endpoint: {path}"})
@@ -4854,6 +5421,8 @@ def make_state(
     config_path: Path,
     datasets_root: Path | None = None,
     exports_root: Path | None = None,
+    log_dir: Path | None = None,
+    gateway_log_path: Path | None = None,
 ) -> GatewayState:
     resolved_root = repo_root.resolve()
     resolved_config = config_path if config_path.is_absolute() else resolved_root / config_path
@@ -4874,6 +5443,8 @@ def make_state(
         replay=_replay_status_from_config(config),
         datasets_root=resolved_datasets_root,
         exports_root=resolved_exports_root,
+        log_dir=log_dir,
+        gateway_log_path=gateway_log_path,
         devices=_device_statuses(config, resolved_root),
     )
     state.replay.mujocoValidation = _new_mujoco_validation(state)
@@ -4891,14 +5462,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config-path", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--datasets-root", type=Path, default=DEFAULT_DATASETS_ROOT)
     parser.add_argument("--exports-root", type=Path, default=DEFAULT_EXPORTS_ROOT)
+    parser.add_argument("--log-dir", type=Path, default=None)
     return parser.parse_args()
+
+
+def _setup_gateway_log(repo_root: Path, requested_log_dir: Path | None) -> tuple[Path, Path]:
+    log_dir = requested_log_dir or _default_log_dir(repo_root)
+    if not log_dir.is_absolute():
+        log_dir = repo_root / log_dir
+    log_dir = _ensure_log_dir(log_dir.resolve())
+    log_path = log_dir / f"gateway_{_timestamp_for_log()}_{os.getpid()}.log"
+    # Replace process stdout/stderr with a line-buffered file so gateway and
+    # HTTP handler diagnostics survive when launched from the frontend/dev shell.
+    fh = log_path.open("a", encoding="utf-8", buffering=1)
+    sys.stdout = fh
+    sys.stderr = fh
+    return log_dir, log_path
 
 
 def main() -> None:
     args = parse_args()
-    state = make_state(args.repo_root, args.config_path, args.datasets_root, args.exports_root)
+    repo_root = args.repo_root.resolve()
+    log_dir, gateway_log_path = _setup_gateway_log(repo_root, args.log_dir)
+    state = make_state(
+        repo_root, args.config_path, args.datasets_root, args.exports_root,
+        log_dir=log_dir, gateway_log_path=gateway_log_path,
+    )
     server = DataCollectionGuiServer((args.host, args.port), state)
+    _start_background_workers(state)
     print(f"Data collection GUI gateway listening on http://{args.host}:{args.port}")
+    print(f"Gateway log: {gateway_log_path}")
     try:
         server.serve_forever()
     finally:

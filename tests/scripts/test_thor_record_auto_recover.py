@@ -16,6 +16,7 @@ functions that make that decision testable without spawning a subprocess:
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,6 +41,57 @@ def test_auto_recover_from_yaml_empty_dict_returns_defaults():
     cfg = tr._auto_recover_from_yaml({})
     assert cfg.enabled is True
     assert cfg.threshold_fraction == 0.6
+
+
+# ---------------------------------------------------------------------------
+# _preview_demand_decision — on-demand preview enable/disable gating
+#
+# Drives _preview_control_loop: with on_demand the previews follow the gateway's
+# viewer-demand heartbeat (enabled iff a heartbeat landed within ttl); without
+# on_demand previews are always-on (legacy) and the decision just mirrors the
+# current state so the controller never auto-toggles them.
+# ---------------------------------------------------------------------------
+
+
+def test_preview_demand_decision_enables_when_recent_demand():
+    assert tr._preview_demand_decision(
+        on_demand=True, active=False,
+        last_demand_mono=100.0, now_mono=103.0, ttl_s=6.0,
+    ) is True
+
+
+def test_preview_demand_decision_disables_after_ttl_lapses():
+    assert tr._preview_demand_decision(
+        on_demand=True, active=True,
+        last_demand_mono=100.0, now_mono=107.0, ttl_s=6.0,
+    ) is False
+
+
+def test_preview_demand_decision_stays_off_until_first_demand():
+    # last_demand_mono == 0.0 sentinel: no viewer has ever polled yet.
+    assert tr._preview_demand_decision(
+        on_demand=True, active=False,
+        last_demand_mono=0.0, now_mono=1000.0, ttl_s=6.0,
+    ) is False
+
+
+def test_preview_demand_decision_ttl_boundary_is_inclusive():
+    assert tr._preview_demand_decision(
+        on_demand=True, active=True,
+        last_demand_mono=100.0, now_mono=106.0, ttl_s=6.0,
+    ) is True
+
+
+def test_preview_demand_decision_legacy_mode_mirrors_active_state():
+    # on_demand False -> never auto-toggle, regardless of demand recency.
+    assert tr._preview_demand_decision(
+        on_demand=False, active=True,
+        last_demand_mono=0.0, now_mono=1000.0, ttl_s=6.0,
+    ) is True
+    assert tr._preview_demand_decision(
+        on_demand=False, active=False,
+        last_demand_mono=999.0, now_mono=1000.0, ttl_s=6.0,
+    ) is False
 
 
 def test_auto_recover_from_yaml_picks_up_overrides():
@@ -169,7 +221,8 @@ def test_run_recover_argus_returns_true_on_zero_rc(tmp_path):
     assert tail == ""
     assert len(runner_calls) == 1
     assert runner_calls[0][0] == "bash"
-    assert runner_calls[0][-2:] == ["--sdk", "/some/sdk"]
+    assert runner_calls[0][runner_calls[0].index("--sdk") + 1] == "/some/sdk"
+    assert "--skip-kill" in runner_calls[0]
 
 
 def test_run_recover_argus_returns_false_on_nonzero_rc(tmp_path):
@@ -215,3 +268,59 @@ def test_run_recover_argus_caps_tail_to_400_chars(tmp_path):
     ok, tail = tr._run_recover_argus(repo, Path("/sdk"), _runner=runner)
     assert ok is False
     assert len(tail) == 400
+
+
+# ---------------------------------------------------------------------------
+# _connect_session_with_deadline
+# ---------------------------------------------------------------------------
+
+
+class _ConnectSessionOk:
+    def connect(self) -> None:
+        return None
+
+
+class _ConnectSessionRaises:
+    def connect(self) -> None:
+        raise RuntimeError("Argus refused CaptureSession")
+
+
+class _ConnectSessionBlocks:
+    def __init__(self) -> None:
+        self.disconnect_called = False
+
+    def connect(self) -> None:
+        time.sleep(1.0)
+
+    def disconnect(self) -> None:
+        self.disconnect_called = True
+
+
+def test_connect_session_with_deadline_success():
+    ok, message = tr._connect_session_with_deadline(
+        _ConnectSessionOk(), timeout_s=1.0,
+    )
+
+    assert ok is True
+    assert message == ""
+
+
+def test_connect_session_with_deadline_reports_runtime_error():
+    ok, message = tr._connect_session_with_deadline(
+        _ConnectSessionRaises(), timeout_s=1.0,
+    )
+
+    assert ok is False
+    assert message == "Argus refused CaptureSession"
+
+
+def test_connect_session_with_deadline_times_out_and_disconnects():
+    session = _ConnectSessionBlocks()
+    started = time.monotonic()
+
+    ok, message = tr._connect_session_with_deadline(session, timeout_s=0.02)
+
+    assert ok is False
+    assert "connect exceeded global deadline" in message
+    assert session.disconnect_called is True
+    assert time.monotonic() - started < 0.5

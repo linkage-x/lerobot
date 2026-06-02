@@ -1799,14 +1799,98 @@ button.danger {
   min-width: 0;
 }
 
-.device-camera-preview {
+.camera-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.camera-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.camera-tile-media {
+  position: relative;
   aspect-ratio: 16 / 9;
   background: #0f172a;
   border: 1px solid #cbd5e1;
   border-radius: 6px;
+  overflow: hidden;
+}
+
+.camera-tile-img {
   display: block;
-  object-fit: contain;
   width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.camera-tile-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.camera-tile-overlay {
+  position: absolute;
+  inset: 0;
+  padding: 10px;
+  overflow: auto;
+  background: rgba(15, 23, 42, 0.9);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+
+.camera-tile-media:hover .camera-tile-overlay {
+  opacity: 1;
+  pointer-events: auto;
+  overscroll-behavior: contain;
+}
+
+.camera-tile-overlay .device-config-grid {
+  grid-template-columns: 1fr;
+  gap: 2px 16px;
+}
+
+.camera-tile-overlay .device-config-key {
+  color: #94a3b8;
+}
+
+.camera-tile-overlay .device-config-value {
+  color: #e2e8f0;
+}
+
+.camera-tile-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.camera-tile-stat {
+  margin-left: auto;
+  color: #64748b;
+  font-size: 12px;
+}
+
+@media (max-width: 1100px) {
+  .camera-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .camera-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .device-touch-map {

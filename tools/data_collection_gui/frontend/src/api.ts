@@ -512,9 +512,9 @@ export class DataCollectionGuiApi {
     return `${this.apiBase}/api/replay/video?${params.toString()}`;
   }
 
-  cameraPreviewUrl(deviceId: string): string {
+  cameraSnapshotUrl(deviceId: string): string {
     const params = new URLSearchParams({ key: deviceId });
-    return `${this.apiBase}/api/device-preview/camera.mjpeg?${params.toString()}`;
+    return `${this.apiBase}/api/device-preview/camera.jpg?${params.toString()}`;
   }
 
   async fetchBoxPreview(deviceId: string): Promise<BoxPreviewPayload | null> {

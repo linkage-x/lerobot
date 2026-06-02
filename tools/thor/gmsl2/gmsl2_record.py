@@ -131,7 +131,18 @@ class RecorderConfig:
     sensor_ids: list[int]
     name_prefix: str
     spawn_stagger_s: float
+    connect_stable_s: float
+    connect_timeout_s: float
+    connect_first_fragment_timeout_s: float
+    two_phase_connect: bool
     stop_on_stream_exit: bool
+    recording_preview_enabled: bool
+    recording_preview_on_demand: bool
+    recording_preview_idle_ttl_s: float
+    recording_preview_stagger_s: float
+    recording_preview_stale_s: float
+    recording_preview_watchdog_s: float
+    stream_health_poll_s: float
 
 
 def _resolve(p: str | Path) -> Path:
@@ -172,7 +183,18 @@ def load_config(path: Path) -> RecorderConfig:
         sensor_ids=list(cams.get("sensor_ids", []) or []),
         name_prefix=str(cams.get("name_prefix", "cam")),
         spawn_stagger_s=float(cams.get("spawn_stagger_s", 0.0)),
+        connect_stable_s=float(cams.get("connect_stable_s", 2.0)),
+        connect_timeout_s=float(cams.get("connect_timeout_s", 120.0)),
+        connect_first_fragment_timeout_s=float(cams.get("connect_first_fragment_timeout_s", 0.0)),
+        two_phase_connect=bool(cams.get("two_phase_connect", False)),
         stop_on_stream_exit=bool(cams.get("stop_on_stream_exit", True)),
+        recording_preview_enabled=bool(cams.get("recording_preview_enabled", True)),
+        recording_preview_on_demand=bool(cams.get("recording_preview_on_demand", True)),
+        recording_preview_idle_ttl_s=float(cams.get("recording_preview_idle_ttl_s", 6.0)),
+        recording_preview_stagger_s=float(cams.get("recording_preview_stagger_s", 0.5)),
+        recording_preview_stale_s=float(cams.get("recording_preview_stale_s", 3.0)),
+        recording_preview_watchdog_s=float(cams.get("recording_preview_watchdog_s", 2.0)),
+        stream_health_poll_s=float(cams.get("stream_health_poll_s", 1.0)),
     )
 
 

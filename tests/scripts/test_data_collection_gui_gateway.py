@@ -80,6 +80,48 @@ def test_default_config_is_thor_gmsl2_box():
     assert "handheld_gripper" not in devices_by_kind
 
 
+def test_gmsl2_device_preview_uses_recorder_owned_frames_only():
+    gmsl2_state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
+
+    assert gateway._state_is_gmsl2(gmsl2_state) is True
+    assert gateway._should_use_recorder_camera_preview(gmsl2_state) is True
+
+    handheld_state = gateway.make_state(Path.cwd(), Path("tools/handheld/handheld_record_example.yaml"))
+
+    assert gateway._state_is_gmsl2(handheld_state) is False
+    assert gateway._should_use_recorder_camera_preview(handheld_state) is False
+
+    handheld_state.camera_preview_suspended = True
+
+    assert gateway._should_use_recorder_camera_preview(handheld_state) is True
+
+
+def test_previews_suspended_for_connect_keeps_flag_on_success():
+    """Success path: recorder now owns the cameras, so the suspend flag must
+    stay set (later cleared by _stop_recorder / _snapshot on recorder exit)."""
+    state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
+    assert state.camera_preview_suspended is False
+    with gateway._previews_suspended_for_connect(state):
+        assert state.camera_preview_suspended is True
+    assert state.camera_preview_suspended is True
+
+
+def test_previews_suspended_for_connect_resets_flag_on_any_exception():
+    """Failure path: any error before the recorder takes the cameras (a
+    blocking terminate(), the settle sleep, or _connect_recorder raising) must
+    reset the flag so the operator can keep inspecting the Device Manager grid.
+    This is the regression the context manager closes — previously only the
+    hand-written connect except reset it, and the preflight ran outside it."""
+    state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
+    try:
+        with gateway._previews_suspended_for_connect(state):
+            assert state.camera_preview_suspended is True
+            raise RuntimeError("connect blew up mid-preflight")
+    except RuntimeError:
+        pass
+    assert state.camera_preview_suspended is False
+
+
 def test_gmsl2_timeline_ignores_replay_warmup_for_splitmux_episode(tmp_path):
     dataset_root = tmp_path / "gmsl2"
     ep_dir = dataset_root / "episodes" / "episode_000000"
@@ -392,7 +434,7 @@ def test_recorder_output_marks_gmsl2_failed_stream_camera_error(tmp_path):
         repo_root=Path.cwd(),
         config_path=tmp_path / "config.yaml",
         config={"dataset": {"repo_id": "local/test", "fps": 60, "episode_time_s": 10}},
-        recording=gateway.RecordingStatus(repoId="local/test"),
+        recording=gateway.RecordingStatus(repoId="local/test", state="connecting"),
         replay=gateway.ReplayStatus(dataset="local/test"),
         devices=[
             {"id": "cam_02", "kind": "camera", "label": "cam_02", "state": "running", "fps": 60, "latencyMs": 0, "detail": ""},
@@ -402,11 +444,24 @@ def test_recorder_output_marks_gmsl2_failed_stream_camera_error(tmp_path):
 
     gateway._apply_recorder_output(
         state,
-        "WARNING: 1 stream(s) failed: cam_02(bus EOS (upstream stopped delivering buffers))",
+        "2026-06-03 09:21:35,120 WARNING persistent_session "
+        "[cam_00] failed to reach PLAYING (+12.01s)",
+    )
+
+    device_states = {device["id"]: device["state"] for device in state.devices}
+    assert device_states == {"cam_02": "running", "cam_03": "running"}
+    assert state.recording.state == "error"
+
+    gateway._apply_recorder_output(
+        state,
+        "2026-06-03 09:15:39,981 WARNING persistent_session "
+        "connect stable window failed after sid=2 first pass: "
+        "cam_02(bus EOS (upstream stopped delivering buffers))",
     )
 
     device_states = {device["id"]: device["state"] for device in state.devices}
     assert device_states == {"cam_02": "error", "cam_03": "running"}
+    assert state.recording.state == "error"
 
     gateway._apply_recorder_output(
         state,
@@ -416,6 +471,51 @@ def test_recorder_output_marks_gmsl2_failed_stream_camera_error(tmp_path):
 
     device_states = {device["id"]: device["state"] for device in state.devices}
     assert device_states == {"cam_02": "error", "cam_03": "error"}
+    assert state.recording.state == "error"
+
+
+def test_snapshot_replays_recent_recorder_failures_into_red_status(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=Path.cwd(),
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 60, "episode_time_s": 10}},
+        recording=gateway.RecordingStatus(
+            repoId="local/test",
+            state="connecting",
+            recentOutput=[
+                "2026-06-03 09:21:49,130 WARNING persistent_session "
+                "[cam_02] failed to reach PLAYING (+26.03s)",
+            ],
+        ),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        devices=[
+            {"id": "cam_02", "kind": "camera", "label": "cam_02", "state": "running", "fps": 60, "latencyMs": 0, "detail": ""},
+        ],
+    )
+
+    snapshot = gateway._snapshot(state)
+
+    assert snapshot["recording"]["state"] == "error"
+    assert snapshot["devices"][0]["state"] == "error"
+
+
+def test_recorder_error_state_recovers_when_episode_ready(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=Path.cwd(),
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 60, "episode_time_s": 10}},
+        recording=gateway.RecordingStatus(repoId="local/test", state="connecting"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        devices=[
+            {"id": "cam_02", "kind": "camera", "label": "cam_02", "state": "running", "fps": 60, "latencyMs": 0, "detail": ""},
+        ],
+    )
+
+    gateway._apply_recorder_output(state, "NvBufSurfaceFromFd Failed")
+    assert state.recording.state == "error"
+
+    gateway._apply_recorder_output(state, "Episode 0 ready")
+    assert state.recording.state == "armed"
 
 
 def test_recorder_env_adds_repo_import_paths(monkeypatch, tmp_path):
@@ -1058,3 +1158,133 @@ def test_snapshot_includes_dataset_export_and_active_task(tmp_path):
     assert "datasetExport" in snap
     assert snap["datasetExport"]["state"] == "idle"
     assert snap["activeTaskId"] == ""
+
+
+def test_recorder_preview_frame_reads_fresh_tmpfs_jpeg(tmp_path, monkeypatch):
+    preview_dir = tmp_path / "preview"
+    preview_dir.mkdir()
+    frame = b"\xff\xd8fake-jpeg\xff\xd9"
+    (preview_dir / "cam_02.jpg").write_bytes(frame)
+    monkeypatch.setattr(gateway, "_RECORDER_PREVIEW_DIR", preview_dir)
+    monkeypatch.setattr(gateway, "_RECORDER_PREVIEW_STALE_S", 10.0)
+
+    assert gateway._recorder_preview_frame("cam_02") == frame
+    assert gateway._recorder_preview_frame("cam_03") is None
+
+
+def test_recorder_failure_summary_prefers_error_over_last_stdout():
+    recording = gateway.RecordingStatus(repoId="local/test")
+    recording.recentOutput = [
+        "Connecting: spawning 11 persistent pipelines...",
+        "ERROR: persistent pipeline connect failed: connect exceeded global deadline 120.0s",
+        "CONSUMER: Waiting until producer is connected...",
+    ]
+    recording.lastOutput = "CONSUMER: Waiting until producer is connected..."
+
+    summary = gateway._recorder_failure_summary(recording)
+
+    assert summary == (
+        "ERROR: persistent pipeline connect failed: "
+        "connect exceeded global deadline 120.0s"
+    )
+
+
+def test_recorder_failure_summary_uses_argus_failure_keyword():
+    recording = gateway.RecordingStatus(repoId="local/test")
+    recording.recentOutput = [
+        "Camera index = 10",
+        "nvbuf_utils: dmabuf_fd -1 mapped entry NOT found",
+        "CONSUMER: Waiting until producer is connected...",
+    ]
+    recording.lastOutput = "CONSUMER: Waiting until producer is connected..."
+
+    summary = gateway._recorder_failure_summary(recording)
+
+    assert summary == "nvbuf_utils: dmabuf_fd -1 mapped entry NOT found"
+
+
+# ---------------------------------------------------------------------------
+# _maybe_send_preview_demand — viewer-demand heartbeat to the recorder
+#
+# On-demand recorder previews depend on the gateway pinging the recorder while
+# the Device Manager grid polls camera.jpg. The write is debounced to ~1/s so a
+# grid of 11 tiles polling at ~5fps doesn't flood the recorder's stdin.
+# ---------------------------------------------------------------------------
+
+
+class _FakeStdin:
+    def __init__(self):
+        self.writes = []
+
+    def write(self, text):
+        self.writes.append(text)
+
+    def flush(self):
+        pass
+
+
+class _FakeRecorderProcess:
+    pid = 4321
+
+    def __init__(self):
+        self.stdin = _FakeStdin()
+
+    def poll(self):
+        return None
+
+
+def _preview_demand_state(tmp_path):
+    return gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        # Heartbeats only go to a GMSL2 recorder (recorder.script gates it).
+        config={
+            "dataset": {"repo_id": "local/test", "root": str(tmp_path), "fps": 30},
+            "recorder": {"script": "tools/thor/gmsl2/thor_record.py"},
+        },
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path,
+    )
+
+
+def test_maybe_send_preview_demand_writes_heartbeat(tmp_path):
+    state = _preview_demand_state(tmp_path)
+    state.process = _FakeRecorderProcess()
+    gateway._maybe_send_preview_demand(state)
+    assert state.process.stdin.writes == ["preview_demand\n"]
+
+
+def test_maybe_send_preview_demand_debounces_rapid_polls(tmp_path, monkeypatch):
+    state = _preview_demand_state(tmp_path)
+    state.process = _FakeRecorderProcess()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(gateway.time, "monotonic", lambda: clock["t"])
+
+    # A burst of polls inside the debounce window sends exactly one heartbeat.
+    for _ in range(20):
+        gateway._maybe_send_preview_demand(state)
+    assert state.process.stdin.writes == ["preview_demand\n"]
+
+    # Once the interval elapses, the next poll heartbeats again.
+    clock["t"] += gateway._RECORDER_PREVIEW_DEMAND_INTERVAL_S + 0.01
+    gateway._maybe_send_preview_demand(state)
+    assert state.process.stdin.writes == ["preview_demand\n", "preview_demand\n"]
+
+
+def test_maybe_send_preview_demand_noop_without_recorder(tmp_path):
+    state = _preview_demand_state(tmp_path)
+    state.process = None
+    gateway._maybe_send_preview_demand(state)  # must not raise
+    assert state.recorder_preview_demand_sent_s == 0.0
+
+
+def test_maybe_send_preview_demand_skips_non_gmsl2_recorder(tmp_path):
+    # The handheld recorder reads stdin as keypresses; it must never receive a
+    # preview_demand heartbeat.
+    state = _preview_demand_state(tmp_path)
+    state.config = {"dataset": {"repo_id": "local/test", "root": str(tmp_path), "fps": 30},
+                    "recorder": {"script": "tools/handheld/handheld_record.py"}}
+    state.process = _FakeRecorderProcess()
+    gateway._maybe_send_preview_demand(state)
+    assert state.process.stdin.writes == []
