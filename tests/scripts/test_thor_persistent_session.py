@@ -86,6 +86,24 @@ def test_gmsl2_record_pipeline_uses_explicit_argus_gain(tmp_path):
     assert "gainrange=4 4" in cmd
 
 
+def test_pipeline_desc_with_recorder_preview_defers_preview_branch():
+    cfg = ps.StreamConfig(
+        sid=7, name="cam_07",
+        preview_jpeg_path="/dev/shm/lerobot_preview/cam_07.jpg",
+    )
+    desc = ps.build_pipeline_desc(cfg, "/tmp/w.mkv")
+    assert "tee name=t_7" in desc
+    assert "queue name=recq_7" in desc
+    assert "splitmuxsink name=mux_7" in desc
+    assert desc.index("nvv4l2h265enc") < desc.index("h265parse")
+    assert desc.index("h265parse") < desc.index("tee name=t_7")
+    assert "prevq_7" not in desc
+    assert "prevvalve_7" not in desc
+    assert "nvvidconv name=prevconv_7" not in desc
+    assert "jpegenc name=prevenc_7" not in desc
+    assert "appsink name=preview_7" not in desc
+
+
 def test_pipeline_desc_test_source_uses_software_encoder():
     cfg = ps.StreamConfig(sid=0, name="cam_00", use_test_source=True, codec="h264")
     desc = ps.build_pipeline_desc(cfg, "/tmp/w.mkv")

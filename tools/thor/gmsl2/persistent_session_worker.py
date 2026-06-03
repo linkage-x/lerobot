@@ -42,6 +42,7 @@ them into ``persistent_session.FragmentInfo``.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -50,6 +51,8 @@ from pathlib import Path
 from typing import Any
 
 from tools.thor.gmsl2.persistent_session import (
+    PREVIEW_FPS,
+    PREVIEW_WIDTH,
     FragmentState,
     StreamConfig,
     build_pipeline_desc,
@@ -168,13 +171,286 @@ def run_worker(
 
     splitmux.connect("format-location-full", on_format_location_full)
 
+    preview_path = cfg.preview_jpeg_path
+    preview_tmp_path = f"{preview_path}.{os.getpid()}.tmp" if preview_path else None
+    preview_lock = threading.Lock()
+    preview_elements: list[Any] = []
+    preview_tee_pad: Any | None = None
+
+    def _drop_preview_frame() -> None:
+        if not preview_path:
+            return
+        for path in (preview_path, preview_tmp_path):
+            if not path:
+                continue
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def _make_element(factory: str, name: str):
+        elem = Gst.ElementFactory.make(factory, name)
+        if elem is None:
+            raise RuntimeError(f"GStreamer element {factory!r} is unavailable")
+        return elem
+
+    def _link_elements(elements: list[Any]) -> None:
+        for left, right in zip(elements, elements[1:]):
+            if not left.link(right):
+                raise RuntimeError(
+                    f"could not link {left.get_name()} -> {right.get_name()}"
+                )
+
+    def _pad_link_return_name(ret: Any) -> str:
+        nick = getattr(ret, "value_nick", None)
+        if nick:
+            return str(nick)
+        try:
+            return Gst.PadLinkReturn(ret).value_nick
+        except Exception:
+            return str(ret)
+
+    def _pad_link_ok(ret: Any) -> bool:
+        if ret == Gst.PadLinkReturn.OK:
+            return True
+        try:
+            return int(ret) == int(Gst.PadLinkReturn.OK)
+        except Exception:
+            return False
+
+    def _link_tee_to_queue(tee_pad: Any, queue_sink_pad: Any) -> None:
+        ret = tee_pad.link(queue_sink_pad)
+        if _pad_link_ok(ret) or (tee_pad.is_linked() and queue_sink_pad.is_linked()):
+            return
+        link_full = getattr(tee_pad, "link_full", None)
+        if callable(link_full):
+            fallback_ret = link_full(queue_sink_pad, Gst.PadLinkCheck.NOTHING)
+            if (
+                _pad_link_ok(fallback_ret)
+                or (tee_pad.is_linked() and queue_sink_pad.is_linked())
+            ):
+                logger.info(
+                    "[%s] preview tee link used fallback after %s",
+                    cfg.name, _pad_link_return_name(ret),
+                )
+                return
+            ret = fallback_ret
+        try:
+            src_caps = tee_pad.query_caps(None).to_string()
+        except Exception:
+            src_caps = "<unknown>"
+        try:
+            sink_caps = queue_sink_pad.query_caps(None).to_string()
+        except Exception:
+            sink_caps = "<unknown>"
+        raise RuntimeError(
+            "could not link tee to preview queue "
+            f"(ret={_pad_link_return_name(ret)}, "
+            f"tee_caps={src_caps}, queue_caps={sink_caps})"
+        )
+
+    def _request_tee_src_pad(tee):
+        get_request_pad = getattr(tee, "get_request_pad", None)
+        if callable(get_request_pad):
+            return get_request_pad("src_%u")
+        tmpl = tee.get_pad_template("src_%u")
+        if tmpl is None:
+            return None
+        return tee.request_pad(tmpl, None, None)
+
+    def _release_preview_branch_locked() -> None:
+        nonlocal preview_elements, preview_tee_pad
+        tee = pipeline.get_by_name(f"t_{cfg.sid}")
+        if preview_tee_pad is not None:
+            if preview_elements:
+                q_sink = preview_elements[0].get_static_pad("sink")
+                if q_sink is not None:
+                    try:
+                        preview_tee_pad.unlink(q_sink)
+                    except Exception:
+                        pass
+            if tee is not None:
+                try:
+                    tee.release_request_pad(preview_tee_pad)
+                except Exception:
+                    pass
+            preview_tee_pad = None
+        for elem in reversed(preview_elements):
+            try:
+                elem.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+        for elem in list(preview_elements):
+            try:
+                pipeline.remove(elem)
+            except Exception:
+                pass
+        preview_elements = []
+
+    def _disable_preview_branch() -> None:
+        with preview_lock:
+            _release_preview_branch_locked()
+            _drop_preview_frame()
+
+    def _enable_preview_branch() -> None:
+        nonlocal preview_elements, preview_tee_pad
+        if not preview_path:
+            return
+        with preview_lock:
+            if preview_elements:
+                return
+            tee = pipeline.get_by_name(f"t_{cfg.sid}")
+            if tee is None:
+                logger.warning("[%s] preview tee not found", cfg.name)
+                return
+            try:
+                Path(preview_path).parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.warning("[%s] preview dir create failed: %s", cfg.name, exc)
+                return
+
+            elements: list[Any] = []
+            tee_pad = None
+            try:
+                pw = PREVIEW_WIDTH
+                ph = max(2, int(round(pw * cfg.height / max(cfg.width, 1))) // 2 * 2)
+                q = _make_element("queue", f"prevq_{cfg.sid}")
+                q.set_property("leaky", 2)  # downstream
+                q.set_property("max-size-buffers", 1)
+                q.set_property("max-size-bytes", 0)
+                q.set_property("max-size-time", 0)
+                elements.append(q)
+
+                parse_factory = "h265parse" if cfg.codec == "h265" else "h264parse"
+                prev_parser = _make_element(parse_factory, f"prevparse_{cfg.sid}")
+                if prev_parser.find_property("config-interval") is not None:
+                    prev_parser.set_property("config-interval", -1)
+                elements.append(prev_parser)
+
+                if cfg.use_test_source:
+                    decoder_factory = "avdec_h265" if cfg.codec == "h265" else "avdec_h264"
+                    elements.extend([
+                        _make_element(decoder_factory, f"prevdec_{cfg.sid}"),
+                        _make_element("videoconvert", f"prevvc_{cfg.sid}"),
+                        _make_element("videoscale", f"prevscale_{cfg.sid}"),
+                    ])
+                    size_filter = _make_element("capsfilter", f"prevcaps_{cfg.sid}")
+                    size_filter.set_property(
+                        "caps", Gst.Caps.from_string(f"video/x-raw,width={pw},height={ph}"),
+                    )
+                else:
+                    decoder = _make_element("nvv4l2decoder", f"prevdec_{cfg.sid}")
+                    if decoder.find_property("enable-max-performance") is not None:
+                        decoder.set_property("enable-max-performance", True)
+                    elements.extend([decoder, _make_element("nvvidconv", f"prevconv_{cfg.sid}")])
+                    size_filter = _make_element("capsfilter", f"prevcaps_{cfg.sid}")
+                    size_filter.set_property(
+                        "caps",
+                        Gst.Caps.from_string(
+                            f"video/x-raw,format=I420,width={pw},height={ph}"
+                        ),
+                    )
+                elements.append(size_filter)
+
+                elements.append(_make_element("videorate", f"prevrate_{cfg.sid}"))
+                fps_filter = _make_element("capsfilter", f"prevfps_{cfg.sid}")
+                fps_filter.set_property(
+                    "caps", Gst.Caps.from_string(f"video/x-raw,framerate={PREVIEW_FPS}/1"),
+                )
+                elements.append(fps_filter)
+
+                enc = _make_element("jpegenc", f"prevenc_{cfg.sid}")
+                enc.set_property("quality", 60)
+                elements.append(enc)
+
+                appsink = _make_element("appsink", f"preview_{cfg.sid}")
+                appsink.set_property("emit-signals", True)
+                appsink.set_property("max-buffers", 1)
+                appsink.set_property("drop", True)
+                appsink.set_property("sync", False)
+
+                def on_preview_sample(sink):
+                    sample = sink.emit("pull-sample")
+                    if sample is None:
+                        return Gst.FlowReturn.OK
+                    buf = sample.get_buffer()
+                    ok, mapinfo = buf.map(Gst.MapFlags.READ)
+                    if not ok:
+                        return Gst.FlowReturn.OK
+                    try:
+                        data = bytes(mapinfo.data)
+                    finally:
+                        buf.unmap(mapinfo)
+                    try:
+                        if preview_tmp_path is not None:
+                            with open(preview_tmp_path, "wb") as fh:
+                                fh.write(data)
+                            os.replace(preview_tmp_path, preview_path)
+                    except OSError as exc:
+                        logger.debug("[%s] preview write failed: %s", cfg.name, exc)
+                    return Gst.FlowReturn.OK
+
+                appsink.connect("new-sample", on_preview_sample)
+                elements.append(appsink)
+
+                for elem in elements:
+                    pipeline.add(elem)
+                _link_elements(elements)
+                tee_pad = _request_tee_src_pad(tee)
+                if tee_pad is None:
+                    raise RuntimeError("could not request tee src pad")
+                q_sink = q.get_static_pad("sink")
+                if q_sink is None:
+                    raise RuntimeError("preview queue sink pad missing")
+                _link_tee_to_queue(tee_pad, q_sink)
+                for elem in elements:
+                    elem.sync_state_with_parent()
+                preview_elements = elements
+                preview_tee_pad = tee_pad
+                if encoder is not None:
+                    try:
+                        encoder.emit("force-IDR")
+                    except Exception as exc:
+                        logger.debug("[%s] force-IDR (preview) not supported: %s", cfg.name, exc)
+                logger.info("[%s] preview branch enabled", cfg.name)
+            except Exception as exc:
+                if tee_pad is not None:
+                    try:
+                        tee.release_request_pad(tee_pad)
+                    except Exception:
+                        pass
+                for elem in reversed(elements):
+                    try:
+                        elem.set_state(Gst.State.NULL)
+                    except Exception:
+                        pass
+                for elem in elements:
+                    try:
+                        pipeline.remove(elem)
+                    except Exception:
+                        pass
+                logger.warning("[%s] preview branch enable failed: %s", cfg.name, exc)
+                _drop_preview_frame()
+
+    def _set_preview_enabled(enabled: bool) -> None:
+        if enabled:
+            _enable_preview_branch()
+        else:
+            _disable_preview_branch()
+
     bus = pipeline.get_bus()
     bus.add_signal_watch()
 
     def on_bus(_bus, message):
         t = message.type
         if t == Gst.MessageType.ERROR:
+            src = message.src
+            src_name = src.get_name() if src is not None else ""
             err, debug = message.parse_error()
+            if src_name.startswith("prev") or src_name.startswith("preview"):
+                logger.warning("[%s] preview branch error (ignored): %s", cfg.name, err)
+                _set_preview_enabled(False)
+                return
             evt_q.put(("error", str(err), str(debug or "")))
         elif t == Gst.MessageType.EOS:
             evt_q.put(("eos",))
@@ -257,7 +533,12 @@ def run_worker(
                 fragment = state.last_episode_fragment
                 state.last_episode_fragment = None
             evt_q.put(("episode_done", fragment))
+        elif kind == "enable_preview":
+            _set_preview_enabled(True)
+        elif kind == "disable_preview":
+            _set_preview_enabled(False)
         elif kind == "disconnect":
+            _set_preview_enabled(False)
             pipeline.set_state(Gst.State.NULL)
             glib_loop.quit()
             evt_q.put(("disconnected",))

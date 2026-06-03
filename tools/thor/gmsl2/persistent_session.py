@@ -127,6 +127,22 @@ class StreamConfig:
     gain: int = 0
     argus_gain: float = 0.0
     use_test_source: bool = False  # dev-host fallback (videotestsrc + x264enc)
+    # Recorder-owned live preview. The initial pipeline only includes the
+    # recording branch plus an encoded-stream tee; the worker attaches/removes
+    # the preview branch after connect() so Argus raw-surface readiness is not
+    # perturbed by preview conversion.
+    preview_jpeg_path: str | None = None
+
+
+# Latest recorder-owned preview frames. The gateway serves these files while
+# the recorder owns the cameras, avoiding a second nvarguscamerasrc client.
+PREVIEW_DIR = Path("/dev/shm/lerobot_preview")
+PREVIEW_WIDTH = 480
+PREVIEW_FPS = 5
+
+
+def preview_frame_path(name: str) -> Path:
+    return PREVIEW_DIR / f"{name}.jpg"
 
 
 @dataclass
@@ -231,15 +247,22 @@ def build_pipeline_desc(stream: StreamConfig, warmup_location: str) -> str:
             f"control-rate={stream.control_rate} insert-sps-pps=1"
         )
 
-    return (
-        f"{source} "
-        f"! {encoder} "
-        f"! {parser} "
+    encode_chain = f"! {encoder} ! {parser}"
+    sink_chain = (
         f"! splitmuxsink name=mux_{stream.sid} "
         f"  muxer-factory={muxer_factory} "
         f"  async-finalize=true "
         f"  max-size-time=0 max-size-bytes=0 "
         f"  location=\"{warmup_location}\""
+    )
+
+    if not stream.preview_jpeg_path:
+        return f"{source} {encode_chain} {sink_chain}"
+
+    sid = stream.sid
+    return (
+        f"{source} {encode_chain} ! tee name=t_{sid} "
+        f"t_{sid}. ! queue name=recq_{sid} {sink_chain}"
     )
 
 
@@ -342,11 +365,13 @@ class _StreamProxy:
         warmup_dir: Path,
         ctx: Any,
         *,
+        ready_timeout_s: float = 6.0,
         on_fragment_opened: Callable[["_StreamProxy", FragmentInfo], None] | None = None,
     ):
         self.cfg = cfg
         self.warmup_dir = warmup_dir
         self._ctx = ctx
+        self.ready_timeout_s = float(ready_timeout_s)
         self.cmd_q: Any = ctx.Queue()
         self.evt_q: Any = ctx.Queue()
         self.proc: Any = None
@@ -371,6 +396,7 @@ class _StreamProxy:
         self.proc = self._ctx.Process(
             target=worker.run_worker,
             args=(self.cfg, self.warmup_dir, self.cmd_q, self.evt_q),
+            kwargs={"ready_timeout_s": self.ready_timeout_s},
             name=f"ps-worker-{self.cfg.sid:02d}",
             daemon=True,
         )
@@ -404,6 +430,12 @@ class _StreamProxy:
 
     def stop_episode(self) -> None:
         self.cmd_q.put(("stop_episode",))
+
+    def enable_preview(self) -> None:
+        self.cmd_q.put(("enable_preview",))
+
+    def disable_preview(self) -> None:
+        self.cmd_q.put(("disable_preview",))
 
     def wait_episode_done(self, timeout_s: float) -> bool:
         return self.episode_done_evt.wait(timeout_s)
@@ -501,6 +533,7 @@ class PersistentCameraSession:
         for cfg in self._stream_cfgs:
             self._streams[cfg.sid] = _StreamProxy(
                 cfg, self.warmup_dir, ctx,
+                ready_timeout_s=self.ready_timeout_s,
                 on_fragment_opened=self._on_fragment_opened_cb,
             )
 
@@ -674,6 +707,28 @@ class PersistentCameraSession:
             except OSError as exc:
                 logger.warning("failed to unlink %s: %s", info.path, exc)
 
+    # -- live preview ----------------------------------------------------
+
+    def enable_previews(self, *, stagger_s: float = 0.5) -> None:
+        """Enable recorder-owned preview branches after connect().
+
+        The worker dynamically attaches each branch to the recording tee, so
+        connect() only has to prove the recording path can reach PLAYING. We
+        still stagger branch creation to avoid a burst of nvvidconv/jpegenc
+        allocation across all cameras.
+        """
+        for i, proxy in enumerate(self._streams.values()):
+            if not proxy.cfg.preview_jpeg_path:
+                continue
+            if i > 0 and stagger_s > 0:
+                time.sleep(stagger_s)
+            proxy.enable_preview()
+
+    def disable_previews(self) -> None:
+        for proxy in self._streams.values():
+            if proxy.cfg.preview_jpeg_path:
+                proxy.disable_preview()
+
     # -- maintenance -----------------------------------------------------
 
     def cleanup_warmup_files(self, *, keep_last_n: int = 3) -> int:
@@ -724,6 +779,7 @@ class PersistentCameraSession:
         ctx = self._ctx_factory()
         new = _StreamProxy(
             old.cfg, self.warmup_dir, ctx,
+            ready_timeout_s=self.ready_timeout_s,
             on_fragment_opened=self._on_fragment_opened_cb,
         )
         self._streams[sid] = new

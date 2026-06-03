@@ -132,6 +132,8 @@ class RecorderConfig:
     name_prefix: str
     spawn_stagger_s: float
     stop_on_stream_exit: bool
+    recording_preview_enabled: bool
+    recording_preview_stagger_s: float
 
 
 def _resolve(p: str | Path) -> Path:
@@ -173,6 +175,8 @@ def load_config(path: Path) -> RecorderConfig:
         name_prefix=str(cams.get("name_prefix", "cam")),
         spawn_stagger_s=float(cams.get("spawn_stagger_s", 0.0)),
         stop_on_stream_exit=bool(cams.get("stop_on_stream_exit", True)),
+        recording_preview_enabled=bool(cams.get("recording_preview_enabled", True)),
+        recording_preview_stagger_s=float(cams.get("recording_preview_stagger_s", 0.5)),
     )
 
 

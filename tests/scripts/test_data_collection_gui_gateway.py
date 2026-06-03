@@ -1058,3 +1058,15 @@ def test_snapshot_includes_dataset_export_and_active_task(tmp_path):
     assert "datasetExport" in snap
     assert snap["datasetExport"]["state"] == "idle"
     assert snap["activeTaskId"] == ""
+
+
+def test_recorder_preview_frame_reads_fresh_tmpfs_jpeg(tmp_path, monkeypatch):
+    preview_dir = tmp_path / "preview"
+    preview_dir.mkdir()
+    frame = b"\xff\xd8fake-jpeg\xff\xd9"
+    (preview_dir / "cam_02.jpg").write_bytes(frame)
+    monkeypatch.setattr(gateway, "_RECORDER_PREVIEW_DIR", preview_dir)
+    monkeypatch.setattr(gateway, "_RECORDER_PREVIEW_STALE_S", 10.0)
+
+    assert gateway._recorder_preview_frame("cam_02") == frame
+    assert gateway._recorder_preview_frame("cam_03") is None

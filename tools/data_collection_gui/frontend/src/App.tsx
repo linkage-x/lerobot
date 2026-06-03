@@ -1986,8 +1986,9 @@ function DeviceInlinePreview({ device }: { device: DeviceStatus }) {
 const PREVIEW_MAX_FAILURES = 30;
 
 function CameraTile({ device, snapshot }: { device: DeviceStatus; snapshot: GuiSnapshot }) {
-  const cameraIdle = snapshot.recording.pid == null;
-  const previewable = cameraIdle && device.state !== "error";
+  // Idle snapshots use the gateway's temporary preview pipeline; while the
+  // recorder owns the cameras, snapshots come from recorder-owned tmpfs JPEGs.
+  const previewable = device.state !== "error";
   const config = device.config ?? {};
   const configEntries = Object.entries(config).filter(
     ([, v]) => v != null && typeof v !== "object"
@@ -2042,13 +2043,11 @@ function CameraTile({ device, snapshot }: { device: DeviceStatus; snapshot: GuiS
     scheduleNext(failuresRef.current >= PREVIEW_MAX_FAILURES ? 2000 : 500);
   };
 
-  const placeholder = !cameraIdle
-    ? "preview idle-only"
-    : device.state === "error"
-      ? "no signal"
-      : failuresRef.current >= PREVIEW_MAX_FAILURES
-        ? "preview unavailable"
-        : device.state;
+  const placeholder = device.state === "error"
+    ? "no signal"
+    : failuresRef.current >= PREVIEW_MAX_FAILURES
+      ? "preview unavailable"
+      : device.state;
 
   return (
     <div className="camera-tile">

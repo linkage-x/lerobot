@@ -3442,6 +3442,49 @@ _PREVIEW_IDLE_TTL_S = 5.0
 # How long a snapshot request waits for the first frame after a cold spawn
 # (Argus open + ISP/AWB settle) before giving up with 503.
 _PREVIEW_FIRST_FRAME_TIMEOUT_S = 6.0
+# Recorder-owned preview files are produced at ~5 fps; tolerate short pauses
+# without showing a stale frame as live.
+_RECORDER_PREVIEW_STALE_S = 2.0
+_RECORDER_PREVIEW_DIR = Path("/dev/shm/lerobot_preview")
+
+
+def _recorder_preview_frame(device_id: str) -> bytes | None:
+    path = _RECORDER_PREVIEW_DIR / f"{device_id}.jpg"
+    try:
+        stat = path.stat()
+        if time.time() - stat.st_mtime > _RECORDER_PREVIEW_STALE_S:
+            return None
+        frame = path.read_bytes()
+    except OSError:
+        return None
+    return frame or None
+
+
+def _serve_recorder_camera_preview_snapshot(
+    handler: BaseHTTPRequestHandler, *, state: GatewayState, device_id: str,
+) -> None:
+    with state.lock:
+        known = any(
+            d.get("id") == device_id and d.get("kind") == "camera"
+            for d in state.devices
+        )
+    if not known:
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"camera not found: {device_id}"})
+        return
+    frame = _recorder_preview_frame(device_id)
+    if frame is None:
+        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "no recorder preview frame yet"})
+        return
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("Content-Type", "image/jpeg")
+    handler.send_header("Content-Length", str(len(frame)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    try:
+        handler.wfile.write(frame)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
 
 
 def _camera_preview_cmd(
@@ -4814,14 +4857,16 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing key"})
                 return
             with self.server.state.lock:
-                if self.server.state.process is not None or self.server.state.camera_preview_suspended:
-                    _json_response(
-                        self,
-                        HTTPStatus.CONFLICT,
-                        {"error": "camera preview is idle-only; stop the recorder before previewing"},
-                    )
-                    return
-                params = _camera_preview_params(self.server.state, device_id)
+                recorder_owns_cameras = (
+                    self.server.state.process is not None
+                    or self.server.state.camera_preview_suspended
+                )
+                params = None if recorder_owns_cameras else _camera_preview_params(self.server.state, device_id)
+            if recorder_owns_cameras:
+                _serve_recorder_camera_preview_snapshot(
+                    self, state=self.server.state, device_id=device_id,
+                )
+                return
             if params is None:
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"camera not found: {device_id}"})
                 return

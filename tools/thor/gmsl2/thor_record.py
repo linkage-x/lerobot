@@ -433,6 +433,10 @@ def _stream_configs(usable: list[int], cfg: gr.RecorderConfig) -> list[ps.Stream
             exposure_us=cfg.cameras.exposure_us,
             gain=cfg.cameras.gain,
             argus_gain=cfg.cameras.argus_gain,
+            preview_jpeg_path=(
+                str(ps.preview_frame_path(f"{cfg.name_prefix}_{sid:02d}"))
+                if cfg.recording_preview_enabled else None
+            ),
         )
         for sid in usable
     ]
@@ -643,6 +647,10 @@ def main(argv: list[str] | None = None) -> int:
         ]
         _emit(f"Cameras (active): {', '.join(active_camera_ids)}")
     _emit(f"Connected {len(pcs.active_sids)} pipelines in {pcs.connect_duration_s:.1f}s")
+    if cfg.recording_preview_enabled:
+        _emit("Preview: enabling recorder-owned camera previews...")
+        pcs.enable_previews(stagger_s=max(0.0, cfg.recording_preview_stagger_s))
+        _emit("Preview: recorder-owned camera previews enabled")
 
     lr3_writer: lr3.Lr3Writer | None = None
     if box_cfg.enabled:

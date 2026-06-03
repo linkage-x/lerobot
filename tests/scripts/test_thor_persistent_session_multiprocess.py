@@ -49,8 +49,15 @@ from tools.thor.gmsl2 import persistent_session as ps
 class _FakeProcess:
     """Minimal stand-in for mp.Process — never actually forks."""
 
+    last_kwargs = None
+    all_kwargs = []
+
     def __init__(self, *args, **kwargs):
         self._alive = True
+        self.args = args
+        self.kwargs = kwargs
+        _FakeProcess.last_kwargs = kwargs
+        _FakeProcess.all_kwargs.append(kwargs)
 
     def start(self):
         return None
@@ -114,6 +121,44 @@ def _frag_event(sid, name, fragment_id, *, state, path,
 # ---------------------------------------------------------------------------
 # _apply_event_to_proxy — event dispatch contract
 # ---------------------------------------------------------------------------
+
+
+def test_stream_proxy_preview_commands_enqueue_worker_messages(tmp_path):
+    proxy = _make_proxy(tmp_path)
+    proxy.enable_preview()
+    proxy.disable_preview()
+    assert proxy.cmd_q.get_nowait() == ("enable_preview",)
+    assert proxy.cmd_q.get_nowait() == ("disable_preview",)
+
+
+def test_stream_proxy_spawn_passes_ready_timeout_to_worker(tmp_path):
+    _FakeProcess.last_kwargs = None
+    _FakeProcess.all_kwargs = []
+    cfg = ps.StreamConfig(sid=2, name="cam_02")
+    proxy = ps._StreamProxy(
+        cfg, tmp_path / "warmup", _FakeCtx(), ready_timeout_s=0.42,
+    )
+    proxy.spawn()
+    assert _FakeProcess.last_kwargs["kwargs"] == {"ready_timeout_s": 0.42}
+    proxy.disconnect()
+
+
+def test_session_preview_controls_skip_streams_without_preview_path(tmp_path):
+    cfg_preview = ps.StreamConfig(
+        sid=2, name="cam_02",
+        preview_jpeg_path="/dev/shm/lerobot_preview/cam_02.jpg",
+    )
+    cfg_plain = ps.StreamConfig(sid=3, name="cam_03")
+    session = ps.PersistentCameraSession([cfg_preview, cfg_plain], tmp_path / "warmup")
+    session._streams = {
+        2: ps._StreamProxy(cfg_preview, tmp_path / "warmup", _FakeCtx()),
+        3: ps._StreamProxy(cfg_plain, tmp_path / "warmup", _FakeCtx()),
+    }
+    session.enable_previews(stagger_s=0.0)
+    session.disable_previews()
+    assert session._streams[2].cmd_q.get_nowait() == ("enable_preview",)
+    assert session._streams[2].cmd_q.get_nowait() == ("disable_preview",)
+    assert session._streams[3].cmd_q.empty()
 
 
 def test_apply_event_playing_sets_ready_evt(tmp_path):
