@@ -884,6 +884,114 @@ session（`<name>_<时间戳>/`，按时间戳排序）合并成**一个** LeRob
 session rsync 过去用官方 API），而**不是**在采集机装 torch——后者又慢又重又违背
 最小化原则。
 
+
+### 2026-06-03 实机排障记录：Connect/Preview/Argus 资源状态
+
+背景：Thor 11 路 GMSL2 在前端点击 Connect 后，早期日志表现为多路
+`NvBufSurfaceFromFd Failed`、`dmabuf_fd -1`、`failed to reach PLAYING`，
+随后 Device Manager 11 个 preview 窗口显示 `running` 但无画面；点击
+StartEpisode 时 recorder 没有进入录制，前端看起来像卡死。
+
+本轮确认的三个独立问题：
+
+1. **preview 解码分支会耗尽 VIC/NVDEC 资源**
+   - 旧 recorder-owned preview 从编码后的 H26x tee 出来再 `nvv4l2decoder`
+     回 JPEG。11 路 preview 等于额外开 11 路 `prevdec_*`。
+   - 内核日志证据：`tegra-vic ... prevdec_*:src: all memory contexts are busy`。
+   - 修复：preview tee 改到 encoder 前的 raw NVMM 分支，走
+     `nvvidconv -> I420 -> videorate -> jpegenc -> appsink`，不再为 preview
+     创建 11 个硬解码器。
+
+2. **Device Manager idle preview 会偷偷启动独立 `nvarguscamerasrc`**
+   - gateway idle 状态下的 `/api/device-preview/camera.jpg` 原本会为每个相机
+     启动独立 `gst-launch-1.0 nvarguscamerasrc ... jpegenc`，这会和 recorder
+     抢同一批 Argus sensor，并可能留下 stuck/leaked session。
+   - 证据：idle preview 请求后 `ps` 可见 `gst-launch-1.0 ... nvarguscamerasrc
+     sensor-id=...`，`fuser/lsof` 显示 nvargus-daemon 持有 `/dev/video*`。
+   - 修复：GMSL2 配置下 Device Manager 永远只读 recorder-owned
+     `/dev/shm/lerobot_preview/cam_XX.jpg`。recorder 未连接或还没有 JPEG 时返回
+     `503 {"error":"no recorder preview frame yet"}`，**不再启动外部 Argus client**。
+   - 验证：idle 请求 `cam_00/cam_10/cam_11/cam_14/cam_15` 均返回 503；之后
+     `ps` 无 `gst-launch-1.0.*nvarguscamerasrc`，`fuser /dev/video0/10/11/14/15`
+     无占用。
+
+3. **recorder 内部 auto-recover 会误杀 gateway/自身**
+   - `recover_argus.sh` 设计给人工恢复用，默认会：
+     `pkill -TERM -f 'python.*tools\.thor\.gmsl2\.thor_record'` 和
+     `pkill -TERM -f 'python.*tools\.data_collection_gui\.gateway'`。
+   - `thor_record.py` 内部 auto-recover 调用该脚本时没有带 `--skip-kill`，所以
+     partial/fail 后会把 recorder 自己和 GUI gateway 一起杀掉。前端表现就是
+     StartEpisode/Connect 后 snapshot connection refused 或 UI 卡住。
+   - 修复：`thor_record._run_recover_argus()` 调用
+     `bash recover_argus.sh --sdk <sdk> --skip-kill`。人工 SSH 执行 recover 仍保留
+     默认 kill stale process 行为。
+   - 回归测试：`tests/scripts/test_thor_record_auto_recover.py` 覆盖 recover 命令
+     必须包含 `--skip-kill`。
+
+本轮保留/新增的稳定性策略：
+
+- Connect 采用保守模型：`spawn one -> wait PLAYING -> stable window -> next`，
+  retry 顺序执行，不再 parallel retry。这样避免 11 路 Argus/NVMM/NVENC 启动窗口重叠。
+- `PLAYING` 后仍要有 `connect_stable_s` 稳定窗口。实机日志证明某些 sid 会先
+  `PLAYING`，随后立刻 EOS/TIMEOUT；stable window 可以把这种假成功抓出来并进入 retry。
+- recorder-owned preview 必须在全部 active recording streams 通过 connect/stable 后再启用。
+- gateway/recorder stdout 固定落盘：
+  `outputs/logs/data_collection_gui/gateway_*.log` 和
+  `outputs/logs/data_collection_gui/recorder_*.log`，以后排查不要依赖 UI 截图。
+- Connect 新增全局 wall-clock deadline：YAML 字段
+  `sensors.cameras.connect_timeout_s` 默认 120s，覆盖首轮 connect、sequential
+  retry 以及内部 auto-recover 的剩余时间预算。超过预算时 recorder 会主动 teardown
+  当前 persistent session，并输出明确协议行：
+  `ERROR: persistent pipeline connect failed: connect exceeded global deadline ...`。
+- gateway 退出摘要不再直接使用最后一行 stdout。非零退出时优先从
+  `recentOutput` 里选择 `ERROR:` 行，其次选择 `NvBufSurfaceFromFd Failed`、
+  `dmabuf_fd -1`、`Failed to create CaptureSession`、`TIMEOUT`、`bus EOS` 等
+  Argus/GStreamer 关键故障行，避免 UI 只显示
+  `CONSUMER: Waiting until producer is connected...` 这类无诊断价值的尾行。
+
+2026-06-03 06:00 UTC 后的关键实机事实：
+
+- 手工 clean recover 后，lock check 仍为 11 路：
+  `0,2,3,4,5,7,9,10,11,14,15`。
+- 但 `recover_argus.sh` 的**单路 probe**第一轮仍出现底层失败：
+  `sid=10/11/14/15` `PROBE_FAIL rc=124`，包含
+  `NvBufSurfaceFromFd Failed` / `Argus Error Status UNAVAILABLE`。
+- 同一个 recover 脚本重启 nvargus-daemon 后 retry 这四路，全部 `PROBE_OK`。
+- 这说明剩余问题已经不是前端 preview 或 recorder 并发独有问题，而是
+  Argus/driver/sensor stream-on 状态机会进入可恢复坏状态。
+- 后续 Connect 期间内核继续出现硬件层错误，例如：
+  - `ar0234c 20-0023: i2c write failed, 0x3060 = 00`
+  - `ar0234c 20-0023: i2c write failed, 0x3012 = 02`
+  - `ar0234c 20-0023: Error turning on streaming`
+  - `ar0234c 17-0022: Error turning on streaming`
+  - Argus 日志里对应 `Sensor GUID 16/17 is in error state`、`waitForIdle() timed out`、
+    `Forced destruction will now proceed, which may leave the libargus server in a bad state`。
+
+当前根因分层结论：
+
+- 已修复的软件层问题：
+  - preview 不再消耗硬解码资源；
+  - Device Manager idle preview 不再抢 Argus；
+  - recorder 内部 auto-recover 不再杀 gateway/自身；
+  - Connect 不再用 parallel retry 制造第二波 Argus 启动风暴。
+- 仍存在的底层问题：clean recover 后单路 probe 也会出现 stream-on/I2C/Argus
+  timeout，说明至少部分链路在驱动/serializer-deserializer/sensor/CSI/RCE 层不稳定。
+  Python/GStreamer 编排只能做到隔离、降载、检测、recover，不能从根上修复这类
+  `ar0234c ... i2c write failed`。
+
+后续排查建议：
+
+1. 在完全无 gateway/recorder/preview 进程时反复运行：
+   `recover_argus.sh --sdk ~/Desktop/SG16A_AGTH_G3Y_A1`，统计第一轮 probe 失败 sid
+   和 retry 是否总能救回。若同一 bus/address 反复失败，优先查线束/供电/serializer/deserializer。
+2. 保留最近三类日志给驱动/供应商：
+   - `outputs/logs/data_collection_gui/recorder_*.log`
+   - `journalctl -u nvargus-daemon --since <connect-start>`
+   - `journalctl -k --since <connect-start>` 中 `ar0234|max96726|nvcsi|vi|timeout|i2c|streaming` 行
+3. 若 UI 需要更好的失败体验，下一步工程项是给 Connect 加全局 wall-clock deadline：
+   超过预算则主动终止 recorder、提示需要 recover，而不是让 operator 等单路 Argus
+   timeout 串行耗尽。
+
 ### 同步级别路线图
 
 | 级别 | 精度 | 状态 | 说明 |

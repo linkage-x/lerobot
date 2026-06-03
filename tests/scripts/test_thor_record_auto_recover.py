@@ -16,6 +16,7 @@ functions that make that decision testable without spawning a subprocess:
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -169,7 +170,8 @@ def test_run_recover_argus_returns_true_on_zero_rc(tmp_path):
     assert tail == ""
     assert len(runner_calls) == 1
     assert runner_calls[0][0] == "bash"
-    assert runner_calls[0][-2:] == ["--sdk", "/some/sdk"]
+    assert runner_calls[0][runner_calls[0].index("--sdk") + 1] == "/some/sdk"
+    assert "--skip-kill" in runner_calls[0]
 
 
 def test_run_recover_argus_returns_false_on_nonzero_rc(tmp_path):
@@ -215,3 +217,59 @@ def test_run_recover_argus_caps_tail_to_400_chars(tmp_path):
     ok, tail = tr._run_recover_argus(repo, Path("/sdk"), _runner=runner)
     assert ok is False
     assert len(tail) == 400
+
+
+# ---------------------------------------------------------------------------
+# _connect_session_with_deadline
+# ---------------------------------------------------------------------------
+
+
+class _ConnectSessionOk:
+    def connect(self) -> None:
+        return None
+
+
+class _ConnectSessionRaises:
+    def connect(self) -> None:
+        raise RuntimeError("Argus refused CaptureSession")
+
+
+class _ConnectSessionBlocks:
+    def __init__(self) -> None:
+        self.disconnect_called = False
+
+    def connect(self) -> None:
+        time.sleep(1.0)
+
+    def disconnect(self) -> None:
+        self.disconnect_called = True
+
+
+def test_connect_session_with_deadline_success():
+    ok, message = tr._connect_session_with_deadline(
+        _ConnectSessionOk(), timeout_s=1.0,
+    )
+
+    assert ok is True
+    assert message == ""
+
+
+def test_connect_session_with_deadline_reports_runtime_error():
+    ok, message = tr._connect_session_with_deadline(
+        _ConnectSessionRaises(), timeout_s=1.0,
+    )
+
+    assert ok is False
+    assert message == "Argus refused CaptureSession"
+
+
+def test_connect_session_with_deadline_times_out_and_disconnects():
+    session = _ConnectSessionBlocks()
+    started = time.monotonic()
+
+    ok, message = tr._connect_session_with_deadline(session, timeout_s=0.02)
+
+    assert ok is False
+    assert "connect exceeded global deadline" in message
+    assert session.disconnect_called is True
+    assert time.monotonic() - started < 0.5

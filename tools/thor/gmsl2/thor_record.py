@@ -79,6 +79,61 @@ def _emit(text: str) -> None:
     print(text, flush=True)
 
 
+def _connect_session_with_deadline(
+    session: ps.PersistentCameraSession,
+    *,
+    timeout_s: float | None,
+) -> tuple[bool, str]:
+    """Run PersistentCameraSession.connect() inside a wall-clock budget.
+
+    Argus failures can leave worker startup stuck long enough that the GUI only
+    sees a meaningless last stdout line.  This helper gives Connect one bounded
+    budget and forces session teardown when the budget is exhausted.
+    """
+    if timeout_s is not None and timeout_s <= 0:
+        return False, "connect exceeded global deadline before starting attempt"
+
+    if timeout_s is None:
+        try:
+            session.connect()
+        except RuntimeError as exc:
+            return False, str(exc)
+        return True, ""
+
+    done = threading.Event()
+    result: dict[str, Exception] = {}
+
+    def _target() -> None:
+        try:
+            session.connect()
+        except Exception as exc:  # noqa: BLE001 - convert worker failures to GUI text
+            result["error"] = exc
+        finally:
+            done.set()
+
+    started = time.monotonic()
+    worker = threading.Thread(
+        target=_target, name="thor-connect-deadline", daemon=True,
+    )
+    worker.start()
+    if done.wait(timeout_s):
+        exc = result.get("error")
+        if exc is not None:
+            return False, str(exc)
+        return True, ""
+
+    elapsed = time.monotonic() - started
+    try:
+        session.disconnect()
+    except Exception as exc:  # noqa: BLE001 - timeout path should still report timeout
+        logger.warning("pcs.disconnect after connect deadline: %s", exc)
+    return (
+        False,
+        f"connect exceeded global deadline {timeout_s:.1f}s "
+        f"(elapsed {elapsed:.1f}s); session teardown requested",
+    )
+
+
 def _emit_box_live(box: bc.BoxClient, *, last_emit_s: float, min_interval_s: float = 0.1) -> float:
     now = time.monotonic()
     if now - last_emit_s < min_interval_s:
@@ -294,6 +349,8 @@ def _write_episode_meta(
         "max96726_locked_sids": locked,
         "argus_failed_sids": argus_failed,
         "spawn_stagger_s": cfg.spawn_stagger_s,
+        "connect_stable_s": cfg.connect_stable_s,
+        "connect_timeout_s": cfg.connect_timeout_s,
         "stop_on_stream_exit": cfg.stop_on_stream_exit,
         "cameras": [
             {
@@ -388,7 +445,11 @@ def _run_recover_argus(
     script = repo_root / "tools" / "thor" / "gmsl2" / "recover_argus.sh"
     if not script.is_file():
         return False, f"recover_argus.sh not found at {script}"
-    cmd = ["bash", str(script), "--sdk", str(sdk_dir)]
+    # recover_argus.sh is also used manually, where killing stale gateway /
+    # recorder processes is useful. From inside thor_record.py that would kill
+    # this recorder and the GUI gateway that spawned it, so keep only the
+    # Argus/module/probe recovery actions here.
+    cmd = ["bash", str(script), "--sdk", str(sdk_dir), "--skip-kill"]
     runner = _runner or subprocess.run
     try:
         r = runner(cmd, capture_output=True, text=True, timeout=timeout_s)
@@ -559,22 +620,45 @@ def main(argv: list[str] | None = None) -> int:
             _stream_configs(usable, cfg),
             warmup_dir,
             spawn_stagger_s=cfg.spawn_stagger_s,
+            connect_stable_s=cfg.connect_stable_s,
         )
 
+    connect_timeout_s = max(0.0, float(cfg.connect_timeout_s))
+    connect_deadline_at = (
+        time.monotonic() + connect_timeout_s if connect_timeout_s > 0 else None
+    )
+
+    def _connect_deadline_remaining_s() -> float | None:
+        if connect_deadline_at is None:
+            return None
+        return max(0.0, connect_deadline_at - time.monotonic())
+
     def _attempt_connect() -> tuple[ps.PersistentCameraSession | None, str]:
+        remaining_s = _connect_deadline_remaining_s()
+        if remaining_s is not None and remaining_s <= 0:
+            return (
+                None,
+                f"connect exceeded global deadline {connect_timeout_s:.1f}s "
+                "before starting attempt",
+            )
         new_pcs = _make_pcs()
-        _emit(f"Connecting: spawning {len(usable)} persistent pipelines...")
-        try:
-            new_pcs.connect()
+        suffix = (
+            f" (deadline remaining {remaining_s:.1f}s)"
+            if remaining_s is not None else ""
+        )
+        _emit(f"Connecting: spawning {len(usable)} persistent pipelines...{suffix}")
+        ok, message = _connect_session_with_deadline(
+            new_pcs, timeout_s=remaining_s,
+        )
+        if ok:
             return new_pcs, ""
-        except RuntimeError as exc:
-            try:
-                new_pcs.disconnect()
-            except Exception as cleanup_exc:
-                logger.warning(
-                    "pcs.disconnect after connect failure: %s", cleanup_exc,
-                )
-            return None, str(exc)
+        try:
+            new_pcs.disconnect()
+        except Exception as cleanup_exc:
+            logger.warning(
+                "pcs.disconnect after connect failure: %s", cleanup_exc,
+            )
+        return None, message
 
     pcs, attempt_error = _attempt_connect()
     expected = len(usable)
@@ -608,17 +692,33 @@ def main(argv: list[str] | None = None) -> int:
                 )
             pcs = None
 
+        remaining_s = _connect_deadline_remaining_s()
+        if remaining_s is not None and remaining_s <= 0:
+            attempt_error = (
+                f"connect exceeded global deadline {connect_timeout_s:.1f}s "
+                "before auto-recover"
+            )
+            break
+
         sdk_dir = _resolve_recover_sdk_dir(
             auto_cfg, cfg.hardware_sync.sdk_dir, repo_root,
         )
+        recover_timeout_s = auto_cfg.timeout_s
+        if remaining_s is not None:
+            recover_timeout_s = min(recover_timeout_s, remaining_s)
         _emit(f"Auto-recover: {recover_reason}; running recover_argus.sh "
-              f"(sdk={sdk_dir})")
+              f"(sdk={sdk_dir}, timeout={recover_timeout_s:.1f}s)")
         ok, tail = _run_recover_argus(
-            repo_root, sdk_dir, timeout_s=auto_cfg.timeout_s,
+            repo_root, sdk_dir, timeout_s=recover_timeout_s,
         )
         recover_attempts += 1
         if not ok:
-            _emit(f"Auto-recover failed: {tail or 'see recorder log'}")
+            recover_tail = tail or 'see recorder log'
+            _emit(f"Auto-recover failed: {recover_tail}")
+            attempt_error = (
+                f"auto-recover failed: {recover_tail}; "
+                f"previous connect outcome: {recover_reason}"
+            )
             break
         _emit("Auto-recover OK; retrying connect")
         pcs, attempt_error = _attempt_connect()
@@ -647,10 +747,21 @@ def main(argv: list[str] | None = None) -> int:
         ]
         _emit(f"Cameras (active): {', '.join(active_camera_ids)}")
     _emit(f"Connected {len(pcs.active_sids)} pipelines in {pcs.connect_duration_s:.1f}s")
+    preview_watchdog_grace_until = 0.0
     if cfg.recording_preview_enabled:
         _emit("Preview: enabling recorder-owned camera previews...")
-        pcs.enable_previews(stagger_s=max(0.0, cfg.recording_preview_stagger_s))
-        _emit("Preview: recorder-owned camera previews enabled")
+        preview_stagger_s = max(0.0, cfg.recording_preview_stagger_s)
+        pcs.enable_previews(stagger_s=preview_stagger_s)
+        preview_wait_s = max(5.0, preview_stagger_s * max(1, len(pcs.active_sids)) + 2.0)
+        missing_previews = pcs.wait_preview_frames(timeout_s=preview_wait_s)
+        preview_watchdog_grace_until = time.monotonic() + max(
+            max(0.0, cfg.recording_preview_stale_s),
+            preview_wait_s,
+        )
+        if missing_previews:
+            _emit(f"Preview warning: no initial frame for {', '.join(missing_previews)}")
+        else:
+            _emit("Preview: recorder-owned camera previews enabled")
 
     lr3_writer: lr3.Lr3Writer | None = None
     if box_cfg.enabled:
@@ -695,16 +806,63 @@ def main(argv: list[str] | None = None) -> int:
 
     rc = 0
     last_box_live_at = 0.0
+    last_stream_health_at = 0.0
+    last_preview_watchdog_at = 0.0
 
-    def _tick_idle_preview() -> None:
+    def _format_stream_errors(errors: list[ps.StreamError]) -> str:
+        return ", ".join(
+            f"{e.name}({(e.message or '')[:60]})" for e in errors
+        )
+
+    def _poll_stream_health(*, context: str) -> list[ps.StreamError]:
+        nonlocal rc, last_stream_health_at
+        poll_s = max(0.0, cfg.stream_health_poll_s)
+        now = time.monotonic()
+        if poll_s > 0 and now - last_stream_health_at < poll_s:
+            return []
+        last_stream_health_at = now
+        stream_errs = pcs.poll_errors()
+        if not stream_errs:
+            return []
+        details = _format_stream_errors(stream_errs)
+        logger.warning("stream health errors during %s: %s", context, details)
+        _emit(f"WARNING: {len(stream_errs)} stream(s) failed: {details}")
+        if context == "idle":
+            logger.warning(
+                "stream health errors while armed; recorder remains alive until "
+                "operator starts, quits, or reconnects"
+            )
+        return stream_errs
+
+    def _tick_preview_watchdog() -> None:
+        nonlocal last_preview_watchdog_at
+        if not cfg.recording_preview_enabled:
+            return
+        interval_s = max(0.0, cfg.recording_preview_watchdog_s)
+        if interval_s <= 0:
+            return
+        now = time.monotonic()
+        if now < preview_watchdog_grace_until:
+            return
+        if now - last_preview_watchdog_at < interval_s:
+            return
+        last_preview_watchdog_at = now
+        restarted = pcs.refresh_stale_previews(max_age_s=max(0.0, cfg.recording_preview_stale_s))
+        if restarted:
+            names = ", ".join(restarted)
+            _emit(f"Preview stale: restarted {names}")
+
+    def _tick_connected_idle() -> None:
         nonlocal last_box_live_at
+        _poll_stream_health(context="idle")
+        _tick_preview_watchdog()
         if box_started:
             last_box_live_at = _emit_box_live(box, last_emit_s=last_box_live_at)
 
     try:
         while not stop_event.is_set():
             cmd = _wait_for_command(
-                cmd_queue, stop_event, accept=("start", "quit"), on_wait=_tick_idle_preview,
+                cmd_queue, stop_event, accept=("start", "quit"), on_wait=_tick_connected_idle,
             )
             if cmd.kind == "quit":
                 break
@@ -747,19 +905,17 @@ def main(argv: list[str] | None = None) -> int:
                 # signal-watch on its MainLoop thread. PR1 burn-in measured
                 # dispatch at ~0.14ms so this poll loop sees them within
                 # ~50ms of the actual error.
-                stream_errs = pcs.poll_errors()
+                stream_errs = _poll_stream_health(context="recording")
                 if stream_errs and cfg.stop_on_stream_exit:
                     if box_started:
                         snap = box.read()
                         snap["t_relative_s"] = elapsed
                         box_snapshots.append(snap)
-                    details = ", ".join(
-                        f"{e.name}({(e.message or '')[:60]})" for e in stream_errs
-                    )
-                    logger.warning("streams reported errors: %s", details)
+                    details = _format_stream_errors(stream_errs)
                     _emit(f"Stream exited early: {details}")
                     stop_reason = "stream_exit"
                     break
+                _tick_preview_watchdog()
                 if now - last_progress_at > 0.5:
                     approx_frames = int(elapsed * cfg.cameras.fps)
                     _emit(f"Recorded {approx_frames} frames for the current episode.")

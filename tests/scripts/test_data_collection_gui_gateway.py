@@ -80,6 +80,22 @@ def test_default_config_is_thor_gmsl2_box():
     assert "handheld_gripper" not in devices_by_kind
 
 
+def test_gmsl2_device_preview_uses_recorder_owned_frames_only():
+    gmsl2_state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
+
+    assert gateway._state_is_gmsl2(gmsl2_state) is True
+    assert gateway._should_use_recorder_camera_preview(gmsl2_state) is True
+
+    handheld_state = gateway.make_state(Path.cwd(), Path("tools/handheld/handheld_record_example.yaml"))
+
+    assert gateway._state_is_gmsl2(handheld_state) is False
+    assert gateway._should_use_recorder_camera_preview(handheld_state) is False
+
+    handheld_state.camera_preview_suspended = True
+
+    assert gateway._should_use_recorder_camera_preview(handheld_state) is True
+
+
 def test_gmsl2_timeline_ignores_replay_warmup_for_splitmux_episode(tmp_path):
     dataset_root = tmp_path / "gmsl2"
     ep_dir = dataset_root / "episodes" / "episode_000000"
@@ -1070,3 +1086,34 @@ def test_recorder_preview_frame_reads_fresh_tmpfs_jpeg(tmp_path, monkeypatch):
 
     assert gateway._recorder_preview_frame("cam_02") == frame
     assert gateway._recorder_preview_frame("cam_03") is None
+
+
+def test_recorder_failure_summary_prefers_error_over_last_stdout():
+    recording = gateway.RecordingStatus(repoId="local/test")
+    recording.recentOutput = [
+        "Connecting: spawning 11 persistent pipelines...",
+        "ERROR: persistent pipeline connect failed: connect exceeded global deadline 120.0s",
+        "CONSUMER: Waiting until producer is connected...",
+    ]
+    recording.lastOutput = "CONSUMER: Waiting until producer is connected..."
+
+    summary = gateway._recorder_failure_summary(recording)
+
+    assert summary == (
+        "ERROR: persistent pipeline connect failed: "
+        "connect exceeded global deadline 120.0s"
+    )
+
+
+def test_recorder_failure_summary_uses_argus_failure_keyword():
+    recording = gateway.RecordingStatus(repoId="local/test")
+    recording.recentOutput = [
+        "Camera index = 10",
+        "nvbuf_utils: dmabuf_fd -1 mapped entry NOT found",
+        "CONSUMER: Waiting until producer is connected...",
+    ]
+    recording.lastOutput = "CONSUMER: Waiting until producer is connected..."
+
+    summary = gateway._recorder_failure_summary(recording)
+
+    assert summary == "nvbuf_utils: dmabuf_fd -1 mapped entry NOT found"

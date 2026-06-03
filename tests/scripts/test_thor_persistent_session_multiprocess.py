@@ -433,6 +433,36 @@ def test_active_sids_starts_empty(tmp_path):
     assert session.active_sids == []
 
 
+def test_connect_stable_window_retries_post_playing_error(tmp_path):
+    cfgs = [ps.StreamConfig(sid=2, name="cam_02")]
+    session = ps.PersistentCameraSession(
+        cfgs, tmp_path / "warmup",
+        spawn_stagger_s=0.0, ready_timeout_s=0.3, connect_stable_s=0.05,
+    )
+
+    spawn_count = {"n": 0}
+
+    def flaky_after_playing(self):
+        spawn_count["n"] += 1
+        attempt = spawn_count["n"]
+        ps._apply_event_to_proxy(self, ("playing",))
+        if attempt == 1:
+            threading.Timer(
+                0.01,
+                lambda: ps._apply_event_to_proxy(
+                    self, ("error", "post-playing timeout", ""),
+                ),
+            ).start()
+
+    session._ctx_factory = lambda: _FakeCtx()
+    with patch.object(ps._StreamProxy, "spawn", flaky_after_playing):
+        session.connect()
+
+    assert session.active_sids == [2]
+    assert spawn_count["n"] == 2
+    assert session.poll_errors() == []
+
+
 def test_connect_retry_rescues_flaky_sid(tmp_path):
     """A sid that fails on first spawn but succeeds on retry must end up
     active and produce no surviving error. This mirrors the recover_argus.sh
@@ -511,12 +541,11 @@ def test_connect_retry_drops_sid_that_keeps_failing(tmp_path):
     )
 
 
-def test_connect_retries_run_in_parallel_not_serially(tmp_path):
-    """Phase 3 retry must overlap restart_stream calls across sids, not
-    chain them. We measure wall-clock cost vs. theoretical serial cost.
+def test_connect_retries_run_sequentially_not_in_parallel(tmp_path):
+    """Retry one sid at a time so Argus/NVMM allocation storms do not repeat.
 
-    Each retry's spawn posts the rescue event after a fixed delay; if
-    retries serialize, total time = N * delay; if parallel, total ≈ delay.
+    Each retry posts the rescue event after a fixed delay. Sequential retry
+    should take roughly N * delay; a parallel retry would complete near delay.
     """
     fail_sids = (2, 3, 4, 5, 7)
     cfgs = [
@@ -528,13 +557,12 @@ def test_connect_retries_run_in_parallel_not_serially(tmp_path):
     )
 
     spawn_count: dict[int, int] = {}
-    rescue_delay_s = 0.2
+    rescue_delay_s = 0.05
 
     def flaky_spawn(self):
         sid = self.cfg.sid
         spawn_count[sid] = spawn_count.get(sid, 0) + 1
         if spawn_count[sid] == 1:
-            # First attempt: fail immediately so Phase 1+2 returns fast.
             threading.Timer(
                 0.01,
                 lambda: ps._apply_event_to_proxy(
@@ -542,8 +570,6 @@ def test_connect_retries_run_in_parallel_not_serially(tmp_path):
                 ),
             ).start()
         else:
-            # Retry attempt: succeed only after rescue_delay_s. If retries
-            # run serially, total Phase 3 time >= N * rescue_delay_s.
             threading.Timer(
                 rescue_delay_s,
                 lambda: ps._apply_event_to_proxy(self, ("playing",)),
@@ -557,14 +583,11 @@ def test_connect_retries_run_in_parallel_not_serially(tmp_path):
 
     assert sorted(session.active_sids) == sorted(fail_sids)
     assert all(spawn_count[s] == 2 for s in fail_sids)
-    # Generous bound: serial would be N * rescue_delay = 1.0s. Parallel
-    # should be well under 2x rescue_delay even on a loaded CI runner.
     serial_lower_bound = len(fail_sids) * rescue_delay_s
-    assert elapsed < serial_lower_bound * 0.6, (
-        f"Phase 3 retry appears serial: elapsed={elapsed:.3f}s, "
-        f"serial would have taken ~{serial_lower_bound:.3f}s"
+    assert elapsed >= serial_lower_bound * 0.8, (
+        f"Phase 3 retry appears parallel: elapsed={elapsed:.3f}s, "
+        f"serial should take at least ~{serial_lower_bound:.3f}s"
     )
-
 
 def test_parallel_retry_drops_only_truly_dead_sids(tmp_path):
     """When some retries succeed and others permanently fail concurrently,
@@ -648,9 +671,12 @@ def test_connect_retry_does_not_retry_more_than_once_per_sid(tmp_path):
     )
 
 
-def test_rolling_spawn_calls_spawn_for_all_streams_before_first_wait_ready(tmp_path):
-    """The wall-clock win comes from spawning all workers (Phase 1) before
-    waiting for any of them (Phase 2). Verify that order."""
+def test_connect_spawns_and_waits_each_stream_before_next_spawn(tmp_path):
+    """Connect must not start all Argus clients before waiting for PLAYING.
+
+    The hardware-stable strategy is spawn -> wait_ready -> optional stable
+    window -> next spawn, which bounds concurrent CaptureSession/NVMM setup.
+    """
     cfgs = [
         ps.StreamConfig(sid=sid, name=f"cam_{sid:02d}") for sid in (2, 3, 4)
     ]
@@ -663,7 +689,6 @@ def test_rolling_spawn_calls_spawn_for_all_streams_before_first_wait_ready(tmp_p
 
     def recording_spawn(self):
         events.append(f"spawn:{self.cfg.sid}")
-        # Post "playing" immediately so wait_ready returns fast for all.
         ps._apply_event_to_proxy(self, ("playing",))
 
     real_wait_ready = ps._StreamProxy.wait_ready
@@ -677,14 +702,11 @@ def test_rolling_spawn_calls_spawn_for_all_streams_before_first_wait_ready(tmp_p
          patch.object(ps._StreamProxy, "wait_ready", recording_wait_ready):
         session.connect()
 
-    # All spawn:* events must come before any wait:* event.
-    spawn_indexes = [i for i, e in enumerate(events) if e.startswith("spawn:")]
-    wait_indexes = [i for i, e in enumerate(events) if e.startswith("wait:")]
-    assert spawn_indexes and wait_indexes
-    assert max(spawn_indexes) < min(wait_indexes), (
-        f"rolling spawn must finish Phase 1 before Phase 2; got order: {events}"
-    )
-
+    assert events == [
+        "spawn:2", "wait:2",
+        "spawn:3", "wait:3",
+        "spawn:4", "wait:4",
+    ]
 
 def test_persistent_session_poll_errors_aggregates_across_proxies(tmp_path):
     cfgs = [

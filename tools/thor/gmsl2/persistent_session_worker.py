@@ -321,35 +321,25 @@ def run_worker(
                 q.set_property("max-size-time", 0)
                 elements.append(q)
 
-                parse_factory = "h265parse" if cfg.codec == "h265" else "h264parse"
-                prev_parser = _make_element(parse_factory, f"prevparse_{cfg.sid}")
-                if prev_parser.find_property("config-interval") is not None:
-                    prev_parser.set_property("config-interval", -1)
-                elements.append(prev_parser)
-
                 if cfg.use_test_source:
-                    decoder_factory = "avdec_h265" if cfg.codec == "h265" else "avdec_h264"
                     elements.extend([
-                        _make_element(decoder_factory, f"prevdec_{cfg.sid}"),
                         _make_element("videoconvert", f"prevvc_{cfg.sid}"),
                         _make_element("videoscale", f"prevscale_{cfg.sid}"),
                     ])
-                    size_filter = _make_element("capsfilter", f"prevcaps_{cfg.sid}")
-                    size_filter.set_property(
-                        "caps", Gst.Caps.from_string(f"video/x-raw,width={pw},height={ph}"),
-                    )
                 else:
-                    decoder = _make_element("nvv4l2decoder", f"prevdec_{cfg.sid}")
-                    if decoder.find_property("enable-max-performance") is not None:
-                        decoder.set_property("enable-max-performance", True)
-                    elements.extend([decoder, _make_element("nvvidconv", f"prevconv_{cfg.sid}")])
-                    size_filter = _make_element("capsfilter", f"prevcaps_{cfg.sid}")
-                    size_filter.set_property(
-                        "caps",
-                        Gst.Caps.from_string(
-                            f"video/x-raw,format=I420,width={pw},height={ph}"
-                        ),
-                    )
+                    # Preview is fed from the raw pre-encoder tee. Avoid opening
+                    # an extra H26x decoder per camera; 11 decoder branches can
+                    # exhaust VIC/NVDEC contexts on Thor. nvvidconv only does the
+                    # low-resolution colorspace/scale step needed for JPEG.
+                    elements.append(_make_element("nvvidconv", f"prevconv_{cfg.sid}"))
+
+                size_filter = _make_element("capsfilter", f"prevcaps_{cfg.sid}")
+                size_filter.set_property(
+                    "caps",
+                    Gst.Caps.from_string(
+                        f"video/x-raw,format=I420,width={pw},height={ph}"
+                    ),
+                )
                 elements.append(size_filter)
 
                 elements.append(_make_element("videorate", f"prevrate_{cfg.sid}"))

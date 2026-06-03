@@ -152,6 +152,9 @@ class GatewayState:
     processing_processes: dict[str, subprocess.Popen[str]] = field(default_factory=dict)
     process_started_at_s: float | None = None
     replay_started_at_s: float | None = None
+    log_dir: Path | None = None
+    gateway_log_path: Path | None = None
+    recorder_log_path: Path | None = None
     device_preview: dict[str, Any] = field(default_factory=dict)
     # One live preview pipeline per camera device id, so the Device Manager grid
     # can show many cameras at once. Each pipeline's reader thread keeps only the
@@ -3448,6 +3451,22 @@ _RECORDER_PREVIEW_STALE_S = 2.0
 _RECORDER_PREVIEW_DIR = Path("/dev/shm/lerobot_preview")
 
 
+def _state_is_gmsl2(state: GatewayState) -> bool:
+    recorder = state.config.get("recorder") if isinstance(state.config.get("recorder"), dict) else {}
+    sensors = state.config.get("sensors") if isinstance(state.config.get("sensors"), dict) else {}
+    cameras = sensors.get("cameras") if isinstance(sensors.get("cameras"), dict) else {}
+    recorder_script = str(recorder.get("script") or "")
+    return "gmsl" in recorder_script or "defaults" in cameras
+
+
+def _should_use_recorder_camera_preview(state: GatewayState) -> bool:
+    return (
+        state.process is not None
+        or state.camera_preview_suspended
+        or _state_is_gmsl2(state)
+    )
+
+
 def _recorder_preview_frame(device_id: str) -> bytes | None:
     path = _RECORDER_PREVIEW_DIR / f"{device_id}.jpg"
     try:
@@ -3800,8 +3819,12 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         state.recording.queueDepth = 0
         if isinstance(state.device_preview.get("box"), dict):
             state.device_preview["box"] = {**state.device_preview["box"], "active": False}
-        if state.recording.lastOutput:
-            state.recording.message = f"Recorder exited with code {process.returncode}: {state.recording.lastOutput}"
+        summary = (
+            _recorder_failure_summary(state.recording)
+            if process.returncode != 0 else state.recording.lastOutput
+        )
+        if summary:
+            state.recording.message = f"Recorder exited with code {process.returncode}: {summary}"
         else:
             state.recording.message = f"Recorder exited with code {process.returncode}"
         state.recording.datasetRoot = str(_dataset_config(state.config).get("root") or state.recording.datasetRoot)
@@ -4035,6 +4058,36 @@ def _recorder_script(state: GatewayState) -> tuple[Path, str]:
     return state.repo_root / DEFAULT_RECORDER_SCRIPT, "--config_path"
 
 
+def _default_log_dir(repo_root: Path) -> Path:
+    return repo_root / "outputs" / "logs" / "data_collection_gui"
+
+
+def _timestamp_for_log() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def _ensure_log_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _new_recorder_log_path(state: GatewayState) -> Path:
+    log_dir = _ensure_log_dir(state.log_dir or _default_log_dir(state.repo_root))
+    return log_dir / f"recorder_{_timestamp_for_log()}.log"
+
+
+def _append_line(path: Path | None, line: str) -> None:
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.write("\n")
+    except OSError:
+        pass
+
+
 def _ensure_recorder_running(state: GatewayState) -> subprocess.Popen[str]:
     process = state.process
     if process is None or process.poll() is not None:
@@ -4071,6 +4124,7 @@ def _connect_recorder(state: GatewayState) -> None:
     # the first PLAYING transition deadlocks the Python thread).
     if "thor_record" in str(recorder_script):
         command.append("--skip-argus-probe")
+    recorder_log_path = _new_recorder_log_path(state)
     state.process = subprocess.Popen(
         command,
         cwd=state.repo_root,
@@ -4087,12 +4141,15 @@ def _connect_recorder(state: GatewayState) -> None:
     state.recording.frameIndex = 0
     state.recording.queueDepth = 0
     state.recording.message = "Connecting handheld devices"
+    state.recorder_log_path = recorder_log_path
+    _append_line(recorder_log_path, f"# command: {' '.join(command)}")
+    _append_line(recorder_log_path, f"# cwd: {state.repo_root}")
     # Drop the previous session's log lines so the frontend doesn't show
     # stale output from a prior crashed recorder mixed in with the new one.
     state.recording.lastOutput = ""
     state.recording.recentOutput = []
     _set_all_device_states(state, "warning")
-    state.log("info", f"Started handheld recorder pid={state.process.pid}")
+    state.log("info", f"Started handheld recorder pid={state.process.pid} log={recorder_log_path}")
     _start_output_reader(state, state.process)
 
 
@@ -4134,7 +4191,9 @@ def _read_process_output(state: GatewayState, process: subprocess.Popen[str]) ->
     if process.stdout is None:
         return
     for line in process.stdout:
-        output = line.strip()
+        raw = line.rstrip("\n")
+        _append_line(state.recorder_log_path, raw)
+        output = raw.strip()
         if not output:
             continue
         with state.lock:
@@ -4379,6 +4438,55 @@ def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> Non
 
 
 _RECORDER_NOISE_PREFIXES = ("[TLV_LOG_UPLOAD]", "GST_ARGUS:", "NvMMLite")
+
+
+_RECORDER_FAILURE_KEYWORDS = (
+    "connect exceeded global deadline",
+    "persistent pipeline connect failed",
+    "Auto-recover failed",
+    "recover_argus.sh timed out",
+    "connect stable window failed",
+    "failed to reach PLAYING",
+    "did not reach PLAYING",
+    "connect() partial success",
+    "stream(s) failed",
+    "restart_stream",
+    "NvBufSurfaceFromFd Failed",
+    "dmabuf_fd -1",
+    "Failed to create CaptureSession",
+    "Argus Error Status",
+    "Error turning on streaming",
+    "TIMEOUT",
+    "bus EOS",
+    "CONSUMER: ERROR OCCURRED",
+)
+
+
+def _compact_recorder_summary(line: str, *, max_len: int = 240) -> str:
+    summary = " ".join(line.strip().split())
+    if len(summary) <= max_len:
+        return summary
+    return summary[: max(0, max_len - 3)].rstrip() + "..."
+
+
+def _recorder_failure_summary(recording: RecordingStatus, *, max_len: int = 240) -> str:
+    """Pick the most useful recorder failure line for process-exit UI text.
+
+    Recorder stdout often ends with generic Argus chatter such as
+    "CONSUMER: Waiting until producer is connected...".  For a failed
+    process, prefer explicit protocol errors and then known Argus/GStreamer
+    failure signatures from the recent-output ring.
+    """
+    lines = [line.strip() for line in recording.recentOutput if line.strip()]
+    for line in reversed(lines):
+        if line.startswith("ERROR:"):
+            return _compact_recorder_summary(line, max_len=max_len)
+    for line in reversed(lines):
+        if any(token in line for token in _RECORDER_FAILURE_KEYWORDS):
+            return _compact_recorder_summary(line, max_len=max_len)
+    if recording.lastOutput:
+        return _compact_recorder_summary(recording.lastOutput, max_len=max_len)
+    return ""
 
 
 def _apply_recorder_output(state: GatewayState, output: str) -> None:
@@ -4857,12 +4965,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing key"})
                 return
             with self.server.state.lock:
-                recorder_owns_cameras = (
-                    self.server.state.process is not None
-                    or self.server.state.camera_preview_suspended
-                )
-                params = None if recorder_owns_cameras else _camera_preview_params(self.server.state, device_id)
-            if recorder_owns_cameras:
+                use_recorder_preview = _should_use_recorder_camera_preview(self.server.state)
+                params = None if use_recorder_preview else _camera_preview_params(self.server.state, device_id)
+            if use_recorder_preview:
                 _serve_recorder_camera_preview_snapshot(
                     self, state=self.server.state, device_id=device_id,
                 )
@@ -5079,6 +5184,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
         except Exception as exc:  # noqa: BLE001
+            self.server.state.log("warn", f"{path} failed: {exc}")
             if path == "/api/handheld/record/connect":
                 # Connect failed before the recorder took the cameras; re-allow
                 # previews so the operator can keep inspecting the grid.
@@ -5103,6 +5209,8 @@ def make_state(
     config_path: Path,
     datasets_root: Path | None = None,
     exports_root: Path | None = None,
+    log_dir: Path | None = None,
+    gateway_log_path: Path | None = None,
 ) -> GatewayState:
     resolved_root = repo_root.resolve()
     resolved_config = config_path if config_path.is_absolute() else resolved_root / config_path
@@ -5123,6 +5231,8 @@ def make_state(
         replay=_replay_status_from_config(config),
         datasets_root=resolved_datasets_root,
         exports_root=resolved_exports_root,
+        log_dir=log_dir,
+        gateway_log_path=gateway_log_path,
         devices=_device_statuses(config, resolved_root),
     )
     state.replay.mujocoValidation = _new_mujoco_validation(state)
@@ -5140,14 +5250,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config-path", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--datasets-root", type=Path, default=DEFAULT_DATASETS_ROOT)
     parser.add_argument("--exports-root", type=Path, default=DEFAULT_EXPORTS_ROOT)
+    parser.add_argument("--log-dir", type=Path, default=None)
     return parser.parse_args()
+
+
+def _setup_gateway_log(repo_root: Path, requested_log_dir: Path | None) -> tuple[Path, Path]:
+    log_dir = requested_log_dir or _default_log_dir(repo_root)
+    if not log_dir.is_absolute():
+        log_dir = repo_root / log_dir
+    log_dir = _ensure_log_dir(log_dir.resolve())
+    log_path = log_dir / f"gateway_{_timestamp_for_log()}_{os.getpid()}.log"
+    # Replace process stdout/stderr with a line-buffered file so gateway and
+    # HTTP handler diagnostics survive when launched from the frontend/dev shell.
+    fh = log_path.open("a", encoding="utf-8", buffering=1)
+    sys.stdout = fh
+    sys.stderr = fh
+    return log_dir, log_path
 
 
 def main() -> None:
     args = parse_args()
-    state = make_state(args.repo_root, args.config_path, args.datasets_root, args.exports_root)
+    repo_root = args.repo_root.resolve()
+    log_dir, gateway_log_path = _setup_gateway_log(repo_root, args.log_dir)
+    state = make_state(
+        repo_root, args.config_path, args.datasets_root, args.exports_root,
+        log_dir=log_dir, gateway_log_path=gateway_log_path,
+    )
     server = DataCollectionGuiServer((args.host, args.port), state)
     print(f"Data collection GUI gateway listening on http://{args.host}:{args.port}")
+    print(f"Gateway log: {gateway_log_path}")
     try:
         server.serve_forever()
     finally:
