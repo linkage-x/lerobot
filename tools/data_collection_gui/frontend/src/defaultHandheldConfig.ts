@@ -1,34 +1,48 @@
 import type { DeviceStatus } from "./types";
 
+// Frontend mock fallback used when the gateway is unreachable. Production
+// state comes from /api/state, which `tools/data_collection_gui/gateway.py`
+// builds from `tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml` -- the GMSL2
+// 11-camera + BOX 采集板 rig that replaced the old Hikrobot + Pika setup.
 export const handheldConfigSummary = {
-  configPath: "tools/handheld/handheld_record_example.yaml",
-  repoId: "local/handheld_multimodal_v1",
-  root: "outputs/datasets/handheld_multimodal_v1",
-  fps: 30,
+  configPath: "tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml",
+  repoId: "local/thor_gmsl2_11ch_v1",
+  root: "outputs/datasets/thor_gmsl2_11ch_v1",
+  fps: 60,
   episodeTimeS: 10,
-  targetFrames: 300,
+  targetFrames: 600,
   numEpisodes: "unlimited",
   video: true,
-  streamingEncoding: true,
-  vcodec: "h264",
+  streamingEncoding: false,
+  vcodec: "h265",
   softSync: false,
   rerun: {
     displayData: true,
     savePath: "(not set)"
+  },
+  recorderScript: "tools/thor/gmsl2/thor_record.py",
+  rigType: "gmsl2" as const,
+  hardwareSync: {
+    enabled: true,
+    fps: 60,
+    trigMode: 1,
+    pwmChip: "pwmchip6",
+    pwmId: 0
+  },
+  cameraDefaults: {
+    codec: "h265",
+    bitrateKbps: 20000,
+    width: 1920,
+    height: 1080,
+    pipeline: "argus",
+    exposureUs: 9999,
+    gain: 320,
+    iframeInterval: 60,
+    container: "mkv"
   }
 };
 
-export const initialDevices: DeviceStatus[] = [
-  { id: "cam_0", kind: "camera", label: "Hikrobot DA9342700", state: "idle", fps: 30, latencyMs: 12, detail: "1280x720 GigE" },
-  { id: "cam_1", kind: "camera", label: "Hikrobot DA9342716", state: "idle", fps: 30, latencyMs: 13, detail: "1280x720 GigE" },
-  { id: "cam_2", kind: "camera", label: "Hikrobot DA9342685", state: "idle", fps: 30, latencyMs: 12, detail: "1280x720 GigE" },
-  { id: "cam_3", kind: "camera", label: "Hikrobot DA9342471", state: "idle", fps: 30, latencyMs: 15, detail: "1280x720 GigE" },
-  { id: "cam_4", kind: "camera", label: "Hikrobot DA9342477", state: "idle", fps: 30, latencyMs: 14, detail: "1280x720 GigE" },
-  { id: "cam_5", kind: "camera", label: "Hikrobot DA9342673", state: "idle", fps: 30, latencyMs: 14, detail: "1280x720 GigE" },
-  { id: "cam_6", kind: "camera", label: "Hikrobot DA9342615", state: "idle", fps: 30, latencyMs: 16, detail: "1280x720 GigE" },
-  { id: "cam_7", kind: "camera", label: "Hikrobot DA9342583", state: "idle", fps: 30, latencyMs: 15, detail: "1280x720 GigE" },
-  { id: "pika_left_realsense", kind: "camera", label: "RealSense 315122271700", state: "idle", fps: 30, latencyMs: 18, detail: "640x480 RGB" },
-  { id: "pika_right_realsense", kind: "camera", label: "RealSense 315122271805", state: "idle", fps: 30, latencyMs: 18, detail: "640x480 RGB" },
-  { id: "pika_left", kind: "handheld_gripper", label: "Pika Sense left", state: "idle", fps: 120, latencyMs: 5, detail: "/dev/ttyUSB1" },
-  { id: "pika_right", kind: "handheld_gripper", label: "Pika Sense right", state: "idle", fps: 120, latencyMs: 5, detail: "/dev/ttyUSB0" }
-];
+// Fallback device list for mock mode (gateway unreachable). When the real
+// gateway is running on Thor it detects actually locked cameras via
+// check_max96726_locks.sh and only surfaces those.
+export const initialDevices: DeviceStatus[] = [];

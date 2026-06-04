@@ -1,0 +1,6 @@
+# Bring-up artifacts captured live on Thor (videos, dmesg dumps, debug
+# trees). Kept out of git; the supplier-facing summaries live alongside in
+# tools/thor/gmsl2/*.md.
+*
+!.gitignore
+!readme.md

@@ -2,6 +2,16 @@
 
 Browser UI for local data collection, recorded dataset review, episode annotation, MuJoCo validation, and guarded FR3 replay.
 
+The default rig is **Thor + 11 x GMSL2 (SG2-AR0234C-G2F) + BOX 采集板** — see
+`tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml` and
+`tools/thor/box_sdk/README.md`. It replaces the previous Hikrobot 8-camera +
+Pika Sense gripper / RealSense default.
+
+> **首次在 Thor / Jetson 上部署？** 先按 [`tools/thor/DEPLOYMENT.md`](../../thor/DEPLOYMENT.md)
+> 跑完 apt / pyarrow / box_sdk wheel / 兼容 symlink / nvm + node / npm
+> 国内源那几步 —— 列出了所有曾经踩过的坑，新机零踩坑。下面的 Start The
+> GUI 假设这些前置依赖已经就位。
+
 ## Start The GUI
 
 Run the local Python gateway first:
@@ -9,10 +19,28 @@ Run the local Python gateway first:
 ```bash
 cd /home/hanyu/Codes/lerobot
 PYTHONPATH=src:. python -m tools.data_collection_gui.gateway \
-  --config-path tools/handheld/handheld_record_example.yaml \
+  --config-path tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml \
   --datasets-root outputs/datasets \
   --port 8765
 ```
+
+The `--config-path` argument is optional; the gateway defaults to that
+GMSL2/BOX YAML when no override is given. To run the legacy Hikrobot +
+Pika capture pass `--config-path tools/handheld/handheld_record_example.yaml`.
+
+Before first use of the BOX 采集板 on the Thor host:
+
+```bash
+sudo apt update && sudo apt install -y libeigen3-dev liburdfdom-dev
+source tools/thor/box_sdk/setup_env.sh
+python3 -m pip install --force-reinstall \
+  tools/thor/box_sdk/python/box_collection_sdk-0.1.0-py3-none-any.whl
+```
+
+`setup_env.sh` exports `LD_LIBRARY_PATH` so the wheel's
+`libbox_controller.so` can find the runtime dependencies vendored under
+`tools/thor/box_sdk/lib/`, and `BOX_SDK_URDF` so the controller knows where
+to find `share/monte_gripper.urdf`.
 
 Then start Vite:
 
@@ -174,3 +202,4 @@ PYTHONPATH=src:tools/fr3:. python tools/fr3/fr3_sim_replay_validate_joint_target
 - Relative dataset paths are resolved from the repository root.
 - Host DISPLAY/X11 is used for MuJoCo viewer paths inside the Docker launcher.
 - Real Robot replay is intentionally stricter than Preflight/Dry Run: MuJoCo is recommended for the latter two, but required for Real Robot.
+- Connect on the 11-camera GMSL2 rig takes ~10 seconds because `spawn_stagger_s: 1.0` — this is required to avoid Argus ISP NVMM buffer allocation races that corrupt MKV output.
