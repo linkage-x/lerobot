@@ -32,7 +32,19 @@ sensors:
     detect_all: true
     sensor_ids: []        # only used when detect_all is false
     name_prefix: "cam"    # produces cam_00, cam_01, ... in the dataset
-    spawn_stagger_s: 1.0  # concurrent nvarguscamerasrc inits race on NVMM buffers; 1.0s is verified stable for 11/11 cameras; 0.5s causes NvBufSurfaceFromFd failures on 6/11 cameras
+    spawn_stagger_s: 1.0  # delay between sequential camera worker startups; keeps Argus/NVMM allocation from overlapping
+    connect_stable_s: 2.0  # after each PLAYING transition, wait and poll for immediate EOS/TIMEOUT before starting the next camera
+    connect_first_fragment_timeout_s: 3.0  # after PLAYING, require the first warmup MKV fragment to open; catches false PLAYING with no frames
+    connect_timeout_s: 120.0  # global wall-clock budget for Connect, including retry/auto-recover; 0 disables
+    two_phase_connect: false  # PR7: spawn all workers to PAUSED at once (overlaps ~1.2s/worker python+Gst.init), then serialize only PAUSED->PLAYING. PAUSED opens no Argus session so Phase 1 is contention-free; the risky bring-up stays serialized. Cuts ~N*startup off Connect. Default off pending field burn-in.
+    preview_spawn_stagger_s: 0.8  # idle-only Device Manager preview stagger; recorder-owned preview uses recording_preview_stagger_s below
+    recording_preview_enabled: true  # recording-time preview is produced inside recorder workers; no second nvarguscamerasrc client
+    recording_preview_on_demand: true  # only attach preview branches while the frontend grid is actually polling camera.jpg; reclaims them after recording_preview_idle_ttl_s of no viewer (cuts idle nvvidconv/jpegenc load that aggravates Argus). false = always-on (eager enable at Connect)
+    recording_preview_idle_ttl_s: 6.0  # on-demand: disable previews after this many seconds without a viewer-demand heartbeat from the gateway (must exceed the gateway's ~1s heartbeat cadence)
+    recording_preview_stagger_s: 0.5  # post-Connect preview branch creation cadence
+    recording_preview_stale_s: 3.0  # restart a preview branch if its JPEG has not refreshed within this many seconds
+    recording_preview_watchdog_s: 2.0  # how often the recorder checks preview JPEG freshness
+    stream_health_poll_s: 1.0  # while connected but idle, poll recording streams for EOS/TIMEOUT at this cadence
     stop_on_stream_exit: true  # set false/--ignore-stream-exit for diagnostics only
 
     # Per-camera capture/encoding defaults. nvarguscamerasrc handles ISP +

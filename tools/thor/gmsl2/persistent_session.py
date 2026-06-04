@@ -87,7 +87,6 @@ import shutil
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -127,6 +126,32 @@ class StreamConfig:
     gain: int = 0
     argus_gain: float = 0.0
     use_test_source: bool = False  # dev-host fallback (videotestsrc + x264enc)
+    # Recorder-owned live preview. The initial pipeline only includes the
+    # recording branch plus an encoded-stream tee; the worker attaches/removes
+    # the preview branch after connect() so Argus raw-surface readiness is not
+    # perturbed by preview conversion.
+    preview_jpeg_path: str | None = None
+
+
+# Bounded wait for splitmuxsink to finalize the just-closed EPISODE fragment
+# to disk. GStreamer 1.18+ posts a ``splitmuxsink-fragment-closed`` element
+# message when async-finalize completes; the worker waits for it instead of
+# blind-sleeping. This is only the fallback ceiling — in the normal case the
+# message lands within a few ms of the stop split-now and the worker proceeds
+# immediately. Kept module-level so the parent's stop_episode timeout stays in
+# sync with the worker's worst-case finalize wait.
+FINALIZE_FRAGMENT_TIMEOUT_S = 3.0
+
+
+# Latest recorder-owned preview frames. The gateway serves these files while
+# the recorder owns the cameras, avoiding a second nvarguscamerasrc client.
+PREVIEW_DIR = Path("/dev/shm/lerobot_preview")
+PREVIEW_WIDTH = 480
+PREVIEW_FPS = 5
+
+
+def preview_frame_path(name: str) -> Path:
+    return PREVIEW_DIR / f"{name}.jpg"
 
 
 @dataclass
@@ -162,6 +187,18 @@ class StreamError:
     message: str
     debug: str = ""
     wall_s: float = field(default_factory=time.time)
+
+
+def format_stream_error(error: StreamError, *, max_detail: int = 180) -> str:
+    """Compact one-line error text for operator-facing logs."""
+    message = " ".join(str(error.message or "").split())
+    debug = " ".join(str(error.debug or "").split())
+    detail = message or "unknown error"
+    if debug:
+        detail = f"{detail} | {debug}"
+    if len(detail) > max_detail:
+        detail = detail[: max(0, max_detail - 3)] + "..."
+    return f"{error.name}({detail})"
 
 
 # ---------------------------------------------------------------------------
@@ -231,15 +268,22 @@ def build_pipeline_desc(stream: StreamConfig, warmup_location: str) -> str:
             f"control-rate={stream.control_rate} insert-sps-pps=1"
         )
 
-    return (
-        f"{source} "
-        f"! {encoder} "
-        f"! {parser} "
+    encode_chain = f"! {encoder} ! {parser}"
+    sink_chain = (
         f"! splitmuxsink name=mux_{stream.sid} "
         f"  muxer-factory={muxer_factory} "
         f"  async-finalize=true "
         f"  max-size-time=0 max-size-bytes=0 "
         f"  location=\"{warmup_location}\""
+    )
+
+    if not stream.preview_jpeg_path:
+        return f"{source} {encode_chain} {sink_chain}"
+
+    sid = stream.sid
+    return (
+        f"{source} ! tee name=t_{sid} "
+        f"t_{sid}. ! queue name=recq_{sid} {encode_chain} {sink_chain}"
     )
 
 
@@ -274,11 +318,18 @@ def _apply_event_to_proxy(proxy: "_StreamProxy", event: tuple) -> None:
     if not isinstance(event, tuple) or not event:
         return
     kind = event[0]
+    if kind == "paused":
+        proxy.paused_evt.set()
+        return
     if kind == "playing":
+        # A worker that reached PLAYING necessarily passed PAUSED; set both so
+        # a two-phase wait_paused() can never miss a fast worker.
+        proxy.paused_evt.set()
         proxy.ready_evt.set()
         return
     if kind == "fragment":
         info_dict = event[1]
+        proxy.first_fragment_evt.set()
         info = FragmentInfo(
             sid=int(info_dict["sid"]),
             name=str(info_dict["name"]),
@@ -304,13 +355,19 @@ def _apply_event_to_proxy(proxy: "_StreamProxy", event: tuple) -> None:
             sid=proxy.cfg.sid, name=proxy.cfg.name,
             message=message, debug=debug,
         ))
-        proxy.ready_evt.set()  # unblock connect() — terminal failure
+        proxy.recording_failed = True
+        # Unblock connect() on terminal failure — both the two-phase PAUSED
+        # wait and the PLAYING wait, so a dead worker never hangs either phase.
+        proxy.paused_evt.set()
+        proxy.ready_evt.set()
         return
     if kind == "eos":
         proxy.errors.append(StreamError(
             sid=proxy.cfg.sid, name=proxy.cfg.name,
             message="bus EOS (upstream stopped delivering buffers)",
         ))
+        proxy.recording_failed = True
+        proxy.paused_evt.set()
         proxy.ready_evt.set()
         return
     if kind == "episode_done":
@@ -342,27 +399,41 @@ class _StreamProxy:
         warmup_dir: Path,
         ctx: Any,
         *,
+        ready_timeout_s: float = 6.0,
         on_fragment_opened: Callable[["_StreamProxy", FragmentInfo], None] | None = None,
     ):
         self.cfg = cfg
         self.warmup_dir = warmup_dir
         self._ctx = ctx
+        self.ready_timeout_s = float(ready_timeout_s)
         self.cmd_q: Any = ctx.Queue()
         self.evt_q: Any = ctx.Queue()
         self.proc: Any = None
         self.reader_thread: threading.Thread | None = None
         self._reader_stop = threading.Event()
         self.ready_evt = threading.Event()
+        self.paused_evt = threading.Event()
+        self.first_fragment_evt = threading.Event()
         self.episode_done_evt = threading.Event()
         self.disconnected_evt = threading.Event()
         self.last_episode_fragment: FragmentInfo | None = None
         self.fragment_history: list[FragmentInfo] = []
         self.errors: list[StreamError] = []
         self._on_fragment_opened_cb = on_fragment_opened
+        # Sticky "the recording pipeline died" marker. Unlike ``errors`` (drained
+        # by poll_errors), this survives error draining so the preview watchdog
+        # can tell "lossy preview branch wedged, recording still alive" (restart
+        # the branch) from "upstream nvarguscamerasrc is gone" (restarting the
+        # branch is futile). Set on any error/EOS worker event; reset only by
+        # replacing the proxy via restart_stream.
+        self.recording_failed = False
+        # One-shot guard so refresh_stale_previews reports a dead stream once
+        # instead of every watchdog tick.
+        self._preview_down_logged = False
 
     # -- lifecycle --------------------------------------------------------
 
-    def spawn(self) -> None:
+    def spawn(self, *, two_phase: bool = False) -> None:
         # Imported lazily so the parent can still be imported on machines
         # without gi.repository (e.g. dev hosts where only build_pipeline_desc
         # is unit-tested).
@@ -371,6 +442,10 @@ class _StreamProxy:
         self.proc = self._ctx.Process(
             target=worker.run_worker,
             args=(self.cfg, self.warmup_dir, self.cmd_q, self.evt_q),
+            kwargs={
+                "ready_timeout_s": self.ready_timeout_s,
+                "two_phase": two_phase,
+            },
             name=f"ps-worker-{self.cfg.sid:02d}",
             daemon=True,
         )
@@ -397,6 +472,43 @@ class _StreamProxy:
             return False
         return not self.errors
 
+    def wait_first_fragment(self, timeout_s: float) -> bool:
+        """Block until the worker opens its first warmup fragment.
+
+        A worker can report PLAYING before Argus/NVMM failures surface. The
+        first splitmux fragment is the stronger signal that encoded camera
+        buffers are actually flowing through the production path.
+        """
+        if timeout_s <= 0:
+            return True
+        if self.first_fragment_evt.wait(timeout_s):
+            return True
+        self.errors.append(StreamError(
+            sid=self.cfg.sid, name=self.cfg.name,
+            message=f"no warmup fragment within {timeout_s:.1f}s after PLAYING",
+        ))
+        self.ready_evt.set()
+        return False
+
+    def wait_paused(self, timeout_s: float) -> bool:
+        """Block until a two-phase worker reports PAUSED or a terminal failure.
+
+        Returns True iff the worker reached PAUSED with no error queued. This
+        is the cheap Phase-1 gate: PAUSED opens no Argus session, so all
+        workers can be waited on concurrently.
+        """
+        if not self.paused_evt.wait(timeout_s):
+            self.errors.append(StreamError(
+                sid=self.cfg.sid, name=self.cfg.name,
+                message=f"worker did not reach PAUSED within {timeout_s:.1f}s",
+            ))
+            return False
+        return not self.errors
+
+    def play(self) -> None:
+        """Release a two-phase worker from PAUSED into the PLAYING bring-up."""
+        self.cmd_q.put(("play",))
+
     def start_episode(self, episode_dir: Path) -> None:
         self.episode_done_evt.clear()
         self.last_episode_fragment = None
@@ -404,6 +516,12 @@ class _StreamProxy:
 
     def stop_episode(self) -> None:
         self.cmd_q.put(("stop_episode",))
+
+    def enable_preview(self) -> None:
+        self.cmd_q.put(("enable_preview",))
+
+    def disable_preview(self) -> None:
+        self.cmd_q.put(("disable_preview",))
 
     def wait_episode_done(self, timeout_s: float) -> bool:
         return self.episode_done_evt.wait(timeout_s)
@@ -466,6 +584,9 @@ class PersistentCameraSession:
         spawn_stagger_s: float = 1.0,
         finalize_grace_s: float = 0.5,
         ready_timeout_s: float = 12.0,
+        connect_stable_s: float = 0.0,
+        first_fragment_timeout_s: float = 0.0,
+        two_phase_connect: bool = False,
         on_fragment_opened: Callable[["_StreamProxy", FragmentInfo], None] | None = None,
     ):
         self._stream_cfgs = list(streams)
@@ -473,6 +594,13 @@ class PersistentCameraSession:
         self.spawn_stagger_s = float(spawn_stagger_s)
         self.finalize_grace_s = float(finalize_grace_s)
         self.ready_timeout_s = float(ready_timeout_s)
+        self.connect_stable_s = max(0.0, float(connect_stable_s))
+        self.first_fragment_timeout_s = max(0.0, float(first_fragment_timeout_s))
+        # When True, connect() spawns all workers to PAUSED at once (overlapping
+        # their python/Gst.init startup) and then serializes only the
+        # PAUSED->PLAYING Argus bring-up. Default keeps the proven one-at-a-time
+        # spawn-then-PLAYING path.
+        self.two_phase_connect = bool(two_phase_connect)
         self._on_fragment_opened_cb = on_fragment_opened
         self._streams: dict[int, _StreamProxy] = {}
         self._errors: list[StreamError] = []
@@ -493,121 +621,229 @@ class PersistentCameraSession:
         """
         return sorted(self._streams)
 
+    def _new_stream_proxy(self, cfg: StreamConfig, ctx: Any) -> _StreamProxy:
+        return _StreamProxy(
+            cfg, self.warmup_dir, ctx,
+            ready_timeout_s=self.ready_timeout_s,
+            on_fragment_opened=self._on_fragment_opened_cb,
+        )
+
+    def _drop_streams(self, sids: set[int]) -> None:
+        for sid in sorted(sids):
+            proxy = self._streams.get(sid)
+            if proxy is None:
+                continue
+            try:
+                proxy.disconnect(grace_s=1.0)
+            except Exception:
+                pass
+            self._streams.pop(sid, None)
+
+    def _wait_connect_stable(self, *, reason: str) -> list[StreamError]:
+        if self.connect_stable_s <= 0 or not self._streams:
+            return []
+        time.sleep(self.connect_stable_s)
+        errors = self.poll_errors()
+        if errors:
+            logger.warning(
+                "connect stable window failed after %s: %s",
+                reason, ", ".join(format_stream_error(e) for e in errors),
+            )
+        return errors
+
+    def _wait_proxy_ready_and_stable(
+        self, proxy: _StreamProxy, *, t0: float, reason: str,
+    ) -> tuple[bool, list[StreamError]]:
+        ok = proxy.wait_ready(self.ready_timeout_s)
+        elapsed = time.time() - t0
+        if ok and not proxy.wait_first_fragment(self.first_fragment_timeout_s):
+            ok = False
+        if ok:
+            logger.info("[%s] PLAYING (+%.2fs)", proxy.cfg.name, elapsed)
+        else:
+            logger.warning(
+                "[%s] failed to reach PLAYING (+%.2fs)",
+                proxy.cfg.name, elapsed,
+            )
+        errors = self.poll_errors()
+        if ok:
+            errors.extend(self._wait_connect_stable(reason=reason))
+        failed_sids = {e.sid for e in errors}
+        if not ok and proxy.cfg.sid not in failed_sids:
+            errors.append(StreamError(
+                sid=proxy.cfg.sid,
+                name=proxy.cfg.name,
+                message=(
+                    f"did not reach PLAYING within {self.ready_timeout_s:.1f}s "
+                    "(stuck before ready)"
+                ),
+            ))
+            failed_sids.add(proxy.cfg.sid)
+        if failed_sids:
+            self._drop_streams(failed_sids)
+        return ok and proxy.cfg.sid not in failed_sids, errors
+
+    def _first_pass_serial(
+        self, ctx: Any, cfg_by_sid: dict[int, StreamConfig],
+        sids: list[int], t0: float,
+    ) -> list[StreamError]:
+        """Proven path: spawn one Argus client, wait until it reaches PLAYING,
+        then give already-live streams a small stability window before moving
+        to the next. This avoids overlapping N CaptureSession/NVMM/NVENC
+        bring-ups, which produces dmabuf_fd=-1 / NvBufSurfaceFromFd failures."""
+        first_round_errors: list[StreamError] = []
+        for i, sid in enumerate(sids):
+            if i > 0 and self.spawn_stagger_s > 0:
+                time.sleep(self.spawn_stagger_s)
+            proxy = self._new_stream_proxy(cfg_by_sid[sid], ctx)
+            self._streams[sid] = proxy
+            proxy.spawn()
+            logger.info("[%s] spawned (+%.2fs)", proxy.cfg.name, time.time() - t0)
+            _ok, errors = self._wait_proxy_ready_and_stable(
+                proxy, t0=t0, reason=f"sid={sid} first pass",
+            )
+            first_round_errors.extend(errors)
+        return first_round_errors
+
+    def _first_pass_two_phase(
+        self, ctx: Any, cfg_by_sid: dict[int, StreamConfig],
+        sids: list[int], t0: float,
+    ) -> list[StreamError]:
+        """Two-phase path. Phase 1: spawn every worker to PAUSED concurrently
+        (PAUSED opens no Argus session, so there is no daemon contention and
+        the ~1.2s python+Gst.init startup overlaps across cameras). Phase 2:
+        serialize PAUSED->PLAYING exactly like the serial path — same ordering,
+        same per-camera stability window — so the contentious Argus bring-up is
+        never concurrent. The net win is the overlapped startup, not any change
+        to how the risky transition is sequenced."""
+        first_round_errors: list[StreamError] = []
+
+        # Phase 1: spawn all, no stagger — they touch nothing shared yet.
+        for sid in sids:
+            proxy = self._new_stream_proxy(cfg_by_sid[sid], ctx)
+            self._streams[sid] = proxy
+            proxy.spawn(two_phase=True)
+        logger.info("two-phase: spawned %d workers (+%.2fs)", len(sids), time.time() - t0)
+
+        # Wait for each worker to reach PAUSED (concurrent; cheap).
+        paused_failed: set[int] = set()
+        for sid in sids:
+            proxy = self._streams.get(sid)
+            if proxy is None:
+                continue
+            if not proxy.wait_paused(self.ready_timeout_s):
+                paused_failed.add(sid)
+        if paused_failed:
+            errors = self.poll_errors()
+            seen = {e.sid for e in errors}
+            for sid in paused_failed:
+                if sid not in seen:
+                    errors.append(StreamError(
+                        sid=sid, name=cfg_by_sid[sid].name,
+                        message="worker failed before reaching PAUSED",
+                    ))
+            self._drop_streams(paused_failed)
+            first_round_errors.extend(errors)
+        logger.info(
+            "two-phase: %d/%d PAUSED (+%.2fs)",
+            len(self._streams), len(sids), time.time() - t0,
+        )
+
+        # Phase 2: serialize the PAUSED->PLAYING Argus bring-up.
+        for i, sid in enumerate(sids):
+            proxy = self._streams.get(sid)
+            if proxy is None:  # dropped in Phase 1
+                continue
+            if i > 0 and self.spawn_stagger_s > 0:
+                time.sleep(self.spawn_stagger_s)
+            proxy.play()
+            logger.info("[%s] play (+%.2fs)", proxy.cfg.name, time.time() - t0)
+            _ok, errors = self._wait_proxy_ready_and_stable(
+                proxy, t0=t0, reason=f"sid={sid} first pass (two-phase)",
+            )
+            first_round_errors.extend(errors)
+        return first_round_errors
+
     def connect(self) -> None:
         if self._streams:
             raise RuntimeError("connect() called twice without disconnect()")
         self.warmup_dir.mkdir(parents=True, exist_ok=True)
         ctx = self._ctx_factory()
-        for cfg in self._stream_cfgs:
-            self._streams[cfg.sid] = _StreamProxy(
-                cfg, self.warmup_dir, ctx,
-                on_fragment_opened=self._on_fragment_opened_cb,
-            )
+        cfg_by_sid = {cfg.sid: cfg for cfg in self._stream_cfgs}
 
         t0 = time.time()
-        sids = sorted(self._streams)
+        sids = sorted(cfg_by_sid)
+        retry_sids: set[int] = set()
 
-        # Phase 1 — rolling spawn.
-        #   Each worker is its own subprocess (separate RPC socket to
-        #   nvargus-daemon), so the daemon sees independent clients and
-        #   isolation holds. We still pace SPAWNS by spawn_stagger_s to
-        #   bound the daemon's per-tick OpenCaptureSession load, but we do
-        #   NOT wait for PLAYING here. Workers run their Argus open in
-        #   parallel from this point on — that's where the wall-clock win
-        #   comes from vs. the strictly-serial version (which made
-        #   connect() take stagger * N * (Argus open time) seconds).
-        for i, sid in enumerate(sids):
-            if i > 0 and self.spawn_stagger_s > 0:
-                time.sleep(self.spawn_stagger_s)
-            proxy = self._streams[sid]
-            proxy.spawn()
-            logger.info(
-                "[%s] spawned (+%.2fs)", proxy.cfg.name, time.time() - t0,
-            )
-
-        # Phase 2 — serial wait_ready.
-        #   By the time Phase 1 finishes, the earliest-spawned workers have
-        #   typically already reached PLAYING (their wait_ready returns
-        #   immediately because ready_evt is already set). Only the last
-        #   few stragglers actually block here.
-        for sid in sids:
-            proxy = self._streams[sid]
-            ok = proxy.wait_ready(self.ready_timeout_s)
-            elapsed = time.time() - t0
-            if ok:
-                logger.info("[%s] PLAYING (+%.2fs)", proxy.cfg.name, elapsed)
-            else:
-                logger.warning(
-                    "[%s] failed to reach PLAYING (+%.2fs)", proxy.cfg.name, elapsed,
-                )
-
-        # Phase 3 — parallel retry round.
-        #   recover_argus.sh proved daemon-side per-sid retry works: when
-        #   a single sid's first OpenCaptureSession is mid-air during a
-        #   daemon state-machine glitch, restarting that sid alone usually
-        #   succeeds. PR3's restart_stream(sid) is the equivalent at the
-        #   worker level (terminate the worker -> daemon drops its
-        #   sessions -> respawn -> wait_ready).
-        #
-        #   We retry in parallel: each worker has its own subprocess and
-        #   its own RPC socket to nvargus-daemon, so concurrent
-        #   terminate+respawn is exactly N independent "client disconnect
-        #   + new client connect" pairs — daemon-side serialization holds
-        #   per socket, not across them, which is the multi-process
-        #   isolation argument PR3 was designed around. Wall-clock cost
-        #   collapses from sum(per-sid) to max(per-sid) (~5s instead of
-        #   ~25-30s on the 7-fail external test).
-        #
-        #   At most once per sid per connect() so a permanently-dead
-        #   camera doesn't loop.
-        first_round_errors = self.poll_errors()
-        if first_round_errors:
-            retry_sids = sorted({e.sid for e in first_round_errors})
-            logger.warning(
-                "connect first pass: %d/%d failed; retrying %s in parallel",
-                len(retry_sids), len(self._streams), retry_sids,
-            )
-            live_retry_sids = [sid for sid in retry_sids if sid in self._streams]
-            if live_retry_sids:
-                with ThreadPoolExecutor(
-                    max_workers=len(live_retry_sids),
-                    thread_name_prefix="pcs-retry",
-                ) as ex:
-                    list(ex.map(self.restart_stream, live_retry_sids))
-            # Only what survived the retry counts toward partial failure.
-            errors = self.poll_errors()
+        if self.two_phase_connect:
+            first_round_errors = self._first_pass_two_phase(ctx, cfg_by_sid, sids, t0)
         else:
-            errors = []
+            first_round_errors = self._first_pass_serial(ctx, cfg_by_sid, sids, t0)
+        retry_sids.update(e.sid for e in first_round_errors)
+
+        # Final all-live stability window before retry. PLAYING alone is not
+        # sufficient on Argus: recent hardware logs show EOS/TIMEOUT can land
+        # immediately after readiness.
+        final_first_errors = self._wait_connect_stable(reason="first pass all-live")
+        if final_first_errors:
+            first_round_errors.extend(final_first_errors)
+            retry_sids.update(e.sid for e in final_first_errors)
+            self._drop_streams({e.sid for e in final_first_errors})
+
+        retry_errors: list[StreamError] = []
+        if retry_sids:
+            retry_queue = sorted(sid for sid in retry_sids if sid in cfg_by_sid)
+            retried: set[int] = set()
+            logger.warning(
+                "connect first pass: %d/%d failed; retrying %s sequentially",
+                len(retry_queue), len(cfg_by_sid), retry_queue,
+            )
+            while retry_queue:
+                sid = retry_queue.pop(0)
+                if sid in retried or sid not in cfg_by_sid:
+                    continue
+                retried.add(sid)
+                if self.spawn_stagger_s > 0:
+                    time.sleep(self.spawn_stagger_s)
+                ok = self.restart_stream(sid)
+                errors = self.poll_errors()
+                failed_sids = {e.sid for e in errors}
+                if not ok and sid not in failed_sids:
+                    errors.append(StreamError(
+                        sid=sid, name=cfg_by_sid[sid].name,
+                        message="restart_stream did not reach PLAYING",
+                    ))
+                    failed_sids.add(sid)
+                if failed_sids:
+                    self._drop_streams(failed_sids)
+                for err in errors:
+                    if err.sid in retried:
+                        retry_errors.append(err)
+                    elif err.sid not in retry_queue:
+                        retry_queue.append(err.sid)
+
+        final_errors = self._wait_connect_stable(reason="post-retry all-live")
+        if final_errors:
+            failed_sids = {e.sid for e in final_errors}
+            self._drop_streams(failed_sids)
+            retry_errors.extend(final_errors)
 
         self.connect_duration_s = time.time() - t0
 
-        # Partial-failure policy: drop failed workers, keep the rest live.
-        # connect() only raises when EVERY worker failed; otherwise it
-        # returns success and the caller is expected to poll_errors() to
-        # see who fell off and emit a warning to the operator.
+        # Only retry-surviving errors are surfaced. First-pass errors for sids
+        # that were rescued are intentionally swallowed.
+        errors = retry_errors
         if errors:
             failed_sids = {e.sid for e in errors}
-            for sid in list(self._streams):
-                if sid in failed_sids:
-                    try:
-                        self._streams[sid].disconnect(grace_s=1.0)
-                    except Exception:
-                        pass
-                    del self._streams[sid]
+            self._drop_streams(failed_sids)
             if not self._streams:
-                bad = ", ".join(
-                    f"{e.name}({(e.message or '')[:60]})" for e in errors
-                )
+                bad = ", ".join(format_stream_error(e) for e in errors)
                 raise RuntimeError(
                     f"connect() failed on all {len(errors)} stream(s): {bad}"
                 )
-            # Partial: leave the errors in the bag so poll_errors() can
-            # surface them to the caller.
             with self._lock:
                 self._errors.extend(errors)
-            bad = ", ".join(
-                f"{e.name}({(e.message or '')[:60]})" for e in errors
-            )
+            bad = ", ".join(format_stream_error(e) for e in errors)
             logger.warning(
                 "connect() partial success: %d/%d streams up; failed: %s",
                 len(self._streams), len(self._stream_cfgs), bad,
@@ -615,8 +851,9 @@ class PersistentCameraSession:
             return
 
         logger.info(
-            "connected %d streams in %.2fs (stagger=%.2fs)",
-            len(self._streams), self.connect_duration_s, self.spawn_stagger_s,
+            "connected %d streams in %.2fs (stagger=%.2fs stable=%.2fs)",
+            len(self._streams), self.connect_duration_s,
+            self.spawn_stagger_s, self.connect_stable_s,
         )
 
     def disconnect(self) -> None:
@@ -649,9 +886,14 @@ class PersistentCameraSession:
             handle.stop_wall_s = time.time()
             for proxy in self._streams.values():
                 proxy.stop_episode()
-        # Each worker runs its own finalize_grace_s sleep before emitting
-        # episode_done; we just have to wait for those events to land.
-        per_worker_timeout = self.finalize_grace_s + 1.5
+        # Each worker waits (bounded by FINALIZE_FRAGMENT_TIMEOUT_S) for the
+        # splitmuxsink-fragment-closed message before emitting episode_done;
+        # we just have to wait for those events to land. Cover the worker's
+        # worst case (message never arrives -> message timeout + fallback
+        # grace) plus a margin.
+        per_worker_timeout = (
+            FINALIZE_FRAGMENT_TIMEOUT_S + self.finalize_grace_s + 1.5
+        )
         for proxy in self._streams.values():
             if not proxy.wait_episode_done(per_worker_timeout):
                 logger.warning(
@@ -673,6 +915,113 @@ class PersistentCameraSession:
                 logger.info("discarded fragment %s", info.path)
             except OSError as exc:
                 logger.warning("failed to unlink %s: %s", info.path, exc)
+
+    # -- live preview ----------------------------------------------------
+
+    def enable_previews(self, *, stagger_s: float = 0.5) -> None:
+        """Enable recorder-owned preview branches after connect().
+
+        The worker dynamically attaches each branch to the recording tee, so
+        connect() only has to prove the recording path can reach PLAYING. We
+        still stagger branch creation to avoid a burst of nvvidconv/jpegenc
+        allocation across all cameras.
+        """
+        for i, proxy in enumerate(self._streams.values()):
+            if not proxy.cfg.preview_jpeg_path:
+                continue
+            if i > 0 and stagger_s > 0:
+                time.sleep(stagger_s)
+            proxy.enable_preview()
+
+    def wait_preview_frames(self, *, timeout_s: float = 5.0) -> list[str]:
+        """Wait briefly for recorder-owned preview JPEGs to appear.
+
+        Returns camera names whose preview path did not produce a frame before
+        the timeout. This is only a preview readiness check; stream health is
+        still reported through poll_errors().
+        """
+        deadline = time.time() + max(0.0, timeout_s)
+        missing: set[str] = {
+            proxy.cfg.name
+            for proxy in self._streams.values()
+            if proxy.cfg.preview_jpeg_path
+        }
+        while missing and time.time() < deadline:
+            for proxy in list(self._streams.values()):
+                if proxy.cfg.name not in missing or not proxy.cfg.preview_jpeg_path:
+                    continue
+                path = Path(proxy.cfg.preview_jpeg_path)
+                try:
+                    if path.stat().st_size > 0:
+                        missing.discard(proxy.cfg.name)
+                except OSError:
+                    pass
+            if missing:
+                time.sleep(0.1)
+        return sorted(missing)
+
+    def disable_previews(self) -> None:
+        for proxy in self._streams.values():
+            if proxy.cfg.preview_jpeg_path:
+                proxy.disable_preview()
+
+    def refresh_stale_previews(self, *, max_age_s: float) -> list[str]:
+        """Restart recorder-owned preview branches whose JPEG stopped updating.
+
+        This only touches the lossy preview branch in each worker; it does not
+        restart the recording pipeline. A stale preview JPEG has two very
+        different causes that must be handled differently:
+
+        * The lossy preview branch alone wedged while the recording pipeline is
+          still PLAYING -> restarting just that branch is the right, cheap fix.
+        * The whole recording pipeline died (Argus error / bus EOS), so the
+          upstream ``nvarguscamerasrc`` is gone -> restarting the preview branch
+          can never produce a frame. Doing it every watchdog tick spins forever
+          (the 2026-06-03 "Preview stale: restarted ..." storm, where 11 dead
+          cameras were "restarted" every 2s indefinitely).
+
+        ``proxy.recording_failed`` (set on any worker error/EOS event) tells the
+        two apart: dead streams are reported once, then skipped. Their recovery
+        belongs to poll_errors() / an operator reconnect, not this watchdog.
+        """
+        if max_age_s <= 0:
+            return []
+        now = time.time()
+        restarted: list[str] = []
+        for proxy in list(self._streams.values()):
+            path_raw = proxy.cfg.preview_jpeg_path
+            if not path_raw:
+                continue
+            path = Path(path_raw)
+            try:
+                age_s = now - path.stat().st_mtime
+            except OSError:
+                age_s = max_age_s + 1.0
+            if age_s <= max_age_s:
+                proxy._preview_down_logged = False
+                continue
+            if proxy.recording_failed:
+                # Upstream camera is dead; restarting the preview fork is futile
+                # and the source of the restart storm. Report once, then stay
+                # quiet until the cameras are reconnected (a fresh proxy clears
+                # the flag). NOTE: keep this message free of the gateway's
+                # recorder-failure keywords so it stays purely informational.
+                if not proxy._preview_down_logged:
+                    proxy._preview_down_logged = True
+                    logger.warning(
+                        "[%s] preview down: recording stream is dead; preview "
+                        "cannot recover until the cameras are reconnected",
+                        proxy.cfg.name,
+                    )
+                continue
+            logger.warning(
+                "[%s] recorder preview stale (age %.1fs); restarting preview branch",
+                proxy.cfg.name, age_s,
+            )
+            proxy.disable_preview()
+            proxy.enable_preview()
+            restarted.append(proxy.cfg.name)
+        return restarted
 
     # -- maintenance -----------------------------------------------------
 
@@ -712,24 +1061,33 @@ class PersistentCameraSession:
         Useful when ``poll_errors()`` flags that stream as failed: terminates
         the child process (which drops its Argus session daemon-side),
         spawns a fresh worker, and waits for it to reach PLAYING. Returns
-        True on success.
+        True on success. The retry path is intentionally sequential and uses
+        the same post-PLAYING stability window as the first pass.
         """
-        if sid not in self._streams:
-            return False
-        old = self._streams[sid]
-        try:
-            old.disconnect(grace_s=1.0)
-        except Exception as exc:
-            logger.warning("restart_stream sid=%s disconnect raised: %s", sid, exc)
+        cfg_by_sid = {cfg.sid: cfg for cfg in self._stream_cfgs}
+        old = self._streams.get(sid)
+        if old is not None:
+            cfg = old.cfg
+            try:
+                old.disconnect(grace_s=1.0)
+            except Exception as exc:
+                logger.warning("restart_stream sid=%s disconnect raised: %s", sid, exc)
+        else:
+            cfg = cfg_by_sid.get(sid)
+            if cfg is None:
+                return False
         ctx = self._ctx_factory()
-        new = _StreamProxy(
-            old.cfg, self.warmup_dir, ctx,
-            on_fragment_opened=self._on_fragment_opened_cb,
-        )
+        new = self._new_stream_proxy(cfg, ctx)
         self._streams[sid] = new
         try:
             new.spawn()
-            ok = new.wait_ready(self.ready_timeout_s)
+            ok, errors = self._wait_proxy_ready_and_stable(
+                new, t0=time.time(), reason=f"sid={sid} retry",
+            )
+            if errors:
+                self._drop_streams({e.sid for e in errors})
+                with self._lock:
+                    self._errors.extend(errors)
             logger.info("restart_stream sid=%s -> %s", sid, "ok" if ok else "FAIL")
             return ok
         except Exception as exc:
@@ -826,6 +1184,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--iframe-interval", type=int, default=30,
                     help="encoder GOP size; smaller = lower split latency")
     ap.add_argument("--spawn-stagger-s", type=float, default=1.0)
+    ap.add_argument("--two-phase", action="store_true",
+                    help="PR7: spawn all workers to PAUSED concurrently, then "
+                         "serialize PAUSED->PLAYING (overlaps per-worker startup)")
+    ap.add_argument("--connect-stable-s", type=float, default=0.0,
+                    help="post-PLAYING stability window per camera before next")
     ap.add_argument("--use-test-source", action="store_true",
                     help="dev host fallback: videotestsrc + x{264,265}enc instead of nvarguscamerasrc")
     ap.add_argument("--name-prefix", default="cam")
@@ -870,6 +1233,8 @@ def _run_demo(args: argparse.Namespace) -> int:
 
     session = PersistentCameraSession(
         streams, args.warmup_dir, spawn_stagger_s=args.spawn_stagger_s,
+        connect_stable_s=args.connect_stable_s,
+        two_phase_connect=args.two_phase,
     )
 
     print(f"connecting {len(sids)} streams (stagger {args.spawn_stagger_s}s)...", flush=True)

@@ -1966,19 +1966,13 @@ function BoxLivePreview({ device }: { device: DeviceStatus }) {
   );
 }
 
-function DeviceInlinePreview({ device, snapshot }: { device: DeviceStatus; snapshot: GuiSnapshot }) {
-  const cameraIdle = device.kind === "camera" && snapshot.recording.pid == null;
-
+function DeviceInlinePreview({ device }: { device: DeviceStatus }) {
+  // Cameras render their live snapshot through CameraTile in the grid; this
+  // inline preview only covers the non-camera expandable rows.
   return (
     <div className="device-inline-preview">
       {device.kind === "box_collection" ? (
         <BoxLivePreview device={device} />
-      ) : device.kind === "camera" ? (
-        cameraIdle ? (
-          <img className="device-camera-preview" src={api.cameraPreviewUrl(device.id)} alt={`${device.id} preview`} />
-        ) : (
-          <div className="preview-empty">camera preview idle-only</div>
-        )
       ) : (
         <div className="preview-empty">no preview stream</div>
       )}
@@ -1986,24 +1980,144 @@ function DeviceInlinePreview({ device, snapshot }: { device: DeviceStatus; snaps
   );
 }
 
+// Cold-spawn (Argus open + AWB settle) can 503 for a few seconds before the
+// first frame; keep retrying with backoff this many times (~15s) before
+// surfacing "preview unavailable", then keep probing in case it recovers.
+const PREVIEW_MAX_FAILURES = 30;
+
+function CameraTile({ device, snapshot }: { device: DeviceStatus; snapshot: GuiSnapshot }) {
+  // Idle snapshots use the gateway's temporary preview pipeline; while the
+  // recorder owns the cameras, snapshots come from recorder-owned tmpfs JPEGs.
+  const previewable = device.state !== "error";
+  const config = device.config ?? {};
+  const configEntries = Object.entries(config).filter(
+    ([, v]) => v != null && typeof v !== "object"
+  );
+
+  // Snapshot polling: each request is short, so 11 tiles don't exhaust the
+  // browser's ~6-connections-per-origin limit the way 11 live MJPEG streams
+  // would. The loop is self-throttled off onLoad/onError, so a slow camera
+  // never piles up overlapping requests.
+  const [src, setSrc] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const failuresRef = useRef(0);
+  const activeRef = useRef(false);
+  const timerRef = useRef<number | null>(null);
+
+  const refresh = () => {
+    if (activeRef.current) setSrc(`${api.cameraSnapshotUrl(device.id)}&t=${Date.now()}`);
+  };
+  const scheduleNext = (delayMs: number) => {
+    if (timerRef.current != null) window.clearTimeout(timerRef.current);
+    timerRef.current = window.setTimeout(refresh, delayMs);
+  };
+
+  useEffect(() => {
+    if (!previewable) {
+      activeRef.current = false;
+      if (timerRef.current != null) window.clearTimeout(timerRef.current);
+      setSrc("");
+      setLoaded(false);
+      failuresRef.current = 0;
+      return;
+    }
+    activeRef.current = true;
+    failuresRef.current = 0;
+    setLoaded(false);
+    refresh();
+    return () => {
+      activeRef.current = false;
+      if (timerRef.current != null) window.clearTimeout(timerRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewable, device.id]);
+
+  const handleLoad = () => {
+    failuresRef.current = 0;
+    setLoaded(true);
+    scheduleNext(200); // ~5 fps poll
+  };
+  const handleError = () => {
+    failuresRef.current += 1;
+    setLoaded(false);
+    scheduleNext(failuresRef.current >= PREVIEW_MAX_FAILURES ? 2000 : 500);
+  };
+
+  const placeholder = device.state === "error"
+    ? "no signal"
+    : failuresRef.current >= PREVIEW_MAX_FAILURES
+      ? "preview unavailable"
+      : device.state;
+
+  return (
+    <div className="camera-tile">
+      <div className="camera-tile-media">
+        {previewable && src ? (
+          <img
+            className="camera-tile-img"
+            src={src}
+            alt={`${device.id} preview`}
+            style={{ display: loaded ? "block" : "none" }}
+            onLoad={handleLoad}
+            onError={handleError}
+          />
+        ) : null}
+        {(!previewable || !loaded) && (
+          <div className="camera-tile-empty">{placeholder}</div>
+        )}
+        <div className="camera-tile-overlay">
+          <div className="device-config-grid">
+            <div className="device-config-row">
+              <span className="device-config-key">fps</span>
+              <span className="device-config-value">{device.fps}</span>
+            </div>
+            <div className="device-config-row">
+              <span className="device-config-key">latency</span>
+              <span className="device-config-value">{device.latencyMs} ms</span>
+            </div>
+            {device.detail && (
+              <div className="device-config-row">
+                <span className="device-config-key">detail</span>
+                <span className="device-config-value">{device.detail}</span>
+              </div>
+            )}
+            {configEntries.map(([key, value]) => (
+              <div className="device-config-row" key={key}>
+                <span className="device-config-key">{key}</span>
+                <span className="device-config-value">{String(value)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="camera-tile-label">
+        <StatusDot state={device.state} />
+        <strong>{device.id}</strong>
+        <span className="camera-tile-stat">{device.fps} fps</span>
+      </div>
+    </div>
+  );
+}
+
 function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
   const [hideErrors, setHideErrors] = useState(false);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
   const devices = hideErrors
     ? snapshot.devices.filter((d) => d.state !== "error")
     : snapshot.devices;
-  const selectedDevice = devices.find((device) => device.id === selectedId) ?? devices[0] ?? null;
 
-  useEffect(() => {
-    if (devices.length === 0) {
-      setSelectedId(null);
-      return;
-    }
-    if (!selectedId || !devices.some((device) => device.id === selectedId)) {
-      setSelectedId(devices[0].id);
-    }
-  }, [devices, selectedId]);
+  const toggleExpanded = (id: string) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
 
   const grouped = useMemo(() => {
     return devices.reduce<Record<string, typeof devices>>((acc, d) => {
@@ -2049,8 +2163,15 @@ function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
             <h2>{kindLabel(kind)}</h2>
             <span>{items.filter((d) => d.state === "running").length}/{items.length} online</span>
           </div>
-          {items.map((device) => {
-            const isExpanded = device.id === selectedDevice?.id;
+          {kind === "camera" ? (
+            <div className="camera-grid">
+              {items.map((device) => (
+                <CameraTile key={device.id} device={device} snapshot={snapshot} />
+              ))}
+            </div>
+          ) : (
+          items.map((device) => {
+            const isExpanded = expandedIds.has(device.id);
             const config = device.config ?? {};
             const configEntries = Object.entries(config).filter(
               ([, v]) => v != null && typeof v !== "object"
@@ -2059,7 +2180,7 @@ function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
               <div className={`device-manager-row ${isExpanded ? "device-manager-row-active" : ""}`} key={device.id}>
                 <button
                   className="device-manager-header"
-                  onClick={() => setSelectedId(device.id)}
+                  onClick={() => toggleExpanded(device.id)}
                 >
                   <div className="row-title">
                     <StatusDot state={device.state} />
@@ -2069,7 +2190,7 @@ function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
                     <span>{device.fps} fps</span>
                     <span>{device.latencyMs} ms</span>
                     <small>{device.detail}</small>
-                    <small>{isExpanded ? "selected" : "select"}</small>
+                    <small>{isExpanded ? "close" : "open"}</small>
                   </div>
                 </button>
                 {isExpanded && (
@@ -2084,12 +2205,13 @@ function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
                         ))}
                       </div>
                     )}
-                    <DeviceInlinePreview device={device} snapshot={snapshot} />
+                    <DeviceInlinePreview device={device} />
                   </div>
                 )}
               </div>
             );
-          })}
+          })
+          )}
         </section>
       ))}
     </div>

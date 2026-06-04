@@ -31,6 +31,7 @@ What's verified
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import queue
 import threading
 import time
@@ -49,8 +50,15 @@ from tools.thor.gmsl2 import persistent_session as ps
 class _FakeProcess:
     """Minimal stand-in for mp.Process — never actually forks."""
 
+    last_kwargs = None
+    all_kwargs = []
+
     def __init__(self, *args, **kwargs):
         self._alive = True
+        self.args = args
+        self.kwargs = kwargs
+        _FakeProcess.last_kwargs = kwargs
+        _FakeProcess.all_kwargs.append(kwargs)
 
     def start(self):
         return None
@@ -116,6 +124,46 @@ def _frag_event(sid, name, fragment_id, *, state, path,
 # ---------------------------------------------------------------------------
 
 
+def test_stream_proxy_preview_commands_enqueue_worker_messages(tmp_path):
+    proxy = _make_proxy(tmp_path)
+    proxy.enable_preview()
+    proxy.disable_preview()
+    assert proxy.cmd_q.get_nowait() == ("enable_preview",)
+    assert proxy.cmd_q.get_nowait() == ("disable_preview",)
+
+
+def test_stream_proxy_spawn_passes_ready_timeout_to_worker(tmp_path):
+    _FakeProcess.last_kwargs = None
+    _FakeProcess.all_kwargs = []
+    cfg = ps.StreamConfig(sid=2, name="cam_02")
+    proxy = ps._StreamProxy(
+        cfg, tmp_path / "warmup", _FakeCtx(), ready_timeout_s=0.42,
+    )
+    proxy.spawn()
+    assert _FakeProcess.last_kwargs["kwargs"] == {
+        "ready_timeout_s": 0.42, "two_phase": False,
+    }
+    proxy.disconnect()
+
+
+def test_session_preview_controls_skip_streams_without_preview_path(tmp_path):
+    cfg_preview = ps.StreamConfig(
+        sid=2, name="cam_02",
+        preview_jpeg_path="/dev/shm/lerobot_preview/cam_02.jpg",
+    )
+    cfg_plain = ps.StreamConfig(sid=3, name="cam_03")
+    session = ps.PersistentCameraSession([cfg_preview, cfg_plain], tmp_path / "warmup")
+    session._streams = {
+        2: ps._StreamProxy(cfg_preview, tmp_path / "warmup", _FakeCtx()),
+        3: ps._StreamProxy(cfg_plain, tmp_path / "warmup", _FakeCtx()),
+    }
+    session.enable_previews(stagger_s=0.0)
+    session.disable_previews()
+    assert session._streams[2].cmd_q.get_nowait() == ("enable_preview",)
+    assert session._streams[2].cmd_q.get_nowait() == ("disable_preview",)
+    assert session._streams[3].cmd_q.empty()
+
+
 def test_apply_event_playing_sets_ready_evt(tmp_path):
     proxy = _make_proxy(tmp_path)
     assert not proxy.ready_evt.is_set()
@@ -174,6 +222,8 @@ def test_apply_event_error_appends_and_unblocks_ready(tmp_path):
     assert proxy.ready_evt.is_set()
     assert len(proxy.errors) == 1
     assert "TIMEOUT" in proxy.errors[0].message
+    # Sticky failure marker drives the preview watchdog (see refresh_stale_previews).
+    assert proxy.recording_failed
 
 
 def test_apply_event_eos_appends_and_unblocks_ready(tmp_path):
@@ -182,6 +232,7 @@ def test_apply_event_eos_appends_and_unblocks_ready(tmp_path):
     assert proxy.ready_evt.is_set()
     assert len(proxy.errors) == 1
     assert "EOS" in proxy.errors[0].message
+    assert proxy.recording_failed
 
 
 def test_apply_event_episode_done_with_fragment_updates_last(tmp_path):
@@ -221,6 +272,78 @@ def test_apply_event_ignores_garbage(tmp_path):
     # Nothing should have been recorded.
     assert proxy.errors == []
     assert not proxy.ready_evt.is_set()
+    assert not proxy.recording_failed
+
+
+# ---------------------------------------------------------------------------
+# refresh_stale_previews — a dead recording stream must not spin the watchdog
+#
+# Regression guard for the 2026-06-03 "Preview stale: restarted ..." storm:
+# once all cameras EOS while armed/idle, the preview JPEGs go permanently stale
+# and the watchdog used to disable+enable the (futile) preview branch on every
+# dead pipeline every 2s forever. recording_failed now gates that.
+# ---------------------------------------------------------------------------
+
+
+def _session_with_preview_proxy(tmp_path, sid=2, name="cam_02"):
+    jpg = tmp_path / f"{name}.jpg"
+    jpg.write_bytes(b"x")
+    cfg = ps.StreamConfig(sid=sid, name=name, preview_jpeg_path=str(jpg))
+    session = ps.PersistentCameraSession([cfg], tmp_path / "warmup")
+    proxy = ps._StreamProxy(cfg, tmp_path / "warmup", _FakeCtx())
+    session._streams = {sid: proxy}
+    return session, proxy, jpg
+
+
+def _set_jpeg_age(jpg, age_s):
+    stamp = time.time() - age_s
+    os.utime(jpg, (stamp, stamp))
+
+
+def test_refresh_stale_previews_restarts_branch_when_recording_alive(tmp_path):
+    session, proxy, jpg = _session_with_preview_proxy(tmp_path)
+    _set_jpeg_age(jpg, age_s=10.0)
+    restarted = session.refresh_stale_previews(max_age_s=3.0)
+    # Recording alive + stale preview -> bounce the lossy branch (legit case).
+    assert restarted == ["cam_02"]
+    assert proxy.cmd_q.get_nowait() == ("disable_preview",)
+    assert proxy.cmd_q.get_nowait() == ("enable_preview",)
+
+
+def test_refresh_stale_previews_skips_dead_recording_stream(tmp_path):
+    session, proxy, jpg = _session_with_preview_proxy(tmp_path)
+    _set_jpeg_age(jpg, age_s=10.0)
+    proxy.recording_failed = True
+    restarted = session.refresh_stale_previews(max_age_s=3.0)
+    # Dead upstream -> nothing restarted, no worker command enqueued.
+    assert restarted == []
+    assert proxy.cmd_q.empty()
+
+
+def test_refresh_stale_previews_reports_dead_stream_once_no_storm(tmp_path):
+    session, proxy, jpg = _session_with_preview_proxy(tmp_path)
+    _set_jpeg_age(jpg, age_s=10.0)
+    proxy.recording_failed = True
+    assert not proxy._preview_down_logged
+    session.refresh_stale_previews(max_age_s=3.0)
+    assert proxy._preview_down_logged  # reported on first detection only
+    # Many subsequent ticks stay silent and restart nothing -> the storm is gone.
+    for _ in range(5):
+        assert session.refresh_stale_previews(max_age_s=3.0) == []
+    assert proxy.cmd_q.empty()
+
+
+def test_refresh_stale_previews_resets_down_flag_when_jpeg_fresh(tmp_path):
+    session, proxy, jpg = _session_with_preview_proxy(tmp_path)
+    _set_jpeg_age(jpg, age_s=10.0)
+    proxy.recording_failed = True
+    session.refresh_stale_previews(max_age_s=3.0)
+    assert proxy._preview_down_logged
+    # A fresh JPEG (preview producing frames again) resets the one-shot guard so
+    # a later failure is reported anew instead of being permanently muted.
+    _set_jpeg_age(jpg, age_s=0.0)
+    session.refresh_stale_previews(max_age_s=3.0)
+    assert not proxy._preview_down_logged
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +384,21 @@ def test_stream_proxy_drain_errors_consumes_buffer(tmp_path):
     out = proxy.drain_errors()
     assert [e.message for e in out] == ["a", "b"]
     assert proxy.drain_errors() == []
+
+
+def test_format_stream_error_includes_debug_source():
+    err = ps.StreamError(
+        sid=3,
+        name="cam_03",
+        message="Internal data stream error.",
+        debug="src=nvarguscamerasrc3; NvBufSurfaceFromFd Failed.",
+    )
+
+    text = ps.format_stream_error(err)
+
+    assert text.startswith("cam_03(Internal data stream error.")
+    assert "src=nvarguscamerasrc3" in text
+    assert "NvBufSurfaceFromFd Failed" in text
 
 
 def test_stream_proxy_start_episode_emits_command(tmp_path):
@@ -388,6 +526,70 @@ def test_active_sids_starts_empty(tmp_path):
     assert session.active_sids == []
 
 
+def test_connect_stable_window_retries_post_playing_error(tmp_path):
+    cfgs = [ps.StreamConfig(sid=2, name="cam_02")]
+    session = ps.PersistentCameraSession(
+        cfgs, tmp_path / "warmup",
+        spawn_stagger_s=0.0, ready_timeout_s=0.3, connect_stable_s=0.05,
+    )
+
+    spawn_count = {"n": 0}
+
+    def flaky_after_playing(self):
+        spawn_count["n"] += 1
+        attempt = spawn_count["n"]
+        ps._apply_event_to_proxy(self, ("playing",))
+        if attempt == 1:
+            threading.Timer(
+                0.01,
+                lambda: ps._apply_event_to_proxy(
+                    self, ("error", "post-playing timeout", ""),
+                ),
+            ).start()
+
+    session._ctx_factory = lambda: _FakeCtx()
+    with patch.object(ps._StreamProxy, "spawn", flaky_after_playing):
+        session.connect()
+
+    assert session.active_sids == [2]
+    assert spawn_count["n"] == 2
+    assert session.poll_errors() == []
+
+
+def test_connect_retries_playing_stream_without_first_fragment(tmp_path):
+    cfgs = [ps.StreamConfig(sid=2, name="cam_02")]
+    session = ps.PersistentCameraSession(
+        cfgs, tmp_path / "warmup",
+        spawn_stagger_s=0.0,
+        ready_timeout_s=0.3,
+        first_fragment_timeout_s=0.05,
+    )
+    spawn_count = {"n": 0}
+
+    def spawn_without_fragment_first(self):
+        spawn_count["n"] += 1
+        attempt = spawn_count["n"]
+        ps._apply_event_to_proxy(self, ("playing",))
+        if attempt == 2:
+            ps._apply_event_to_proxy(self, ("fragment", {
+                "sid": 2,
+                "name": "cam_02",
+                "fragment_id": 0,
+                "path": str(tmp_path / "warmup" / "cam_02_warmup_00000.mkv"),
+                "first_pts_s": 0.0,
+                "first_wall_s": time.time(),
+                "state": ps.FragmentState.WARMUP.value,
+            }))
+
+    session._ctx_factory = lambda: _FakeCtx()
+    with patch.object(ps._StreamProxy, "spawn", spawn_without_fragment_first):
+        session.connect()
+
+    assert spawn_count["n"] == 2
+    assert session.active_sids == [2]
+    assert session.poll_errors() == []
+
+
 def test_connect_retry_rescues_flaky_sid(tmp_path):
     """A sid that fails on first spawn but succeeds on retry must end up
     active and produce no surviving error. This mirrors the recover_argus.sh
@@ -466,12 +668,11 @@ def test_connect_retry_drops_sid_that_keeps_failing(tmp_path):
     )
 
 
-def test_connect_retries_run_in_parallel_not_serially(tmp_path):
-    """Phase 3 retry must overlap restart_stream calls across sids, not
-    chain them. We measure wall-clock cost vs. theoretical serial cost.
+def test_connect_retries_run_sequentially_not_in_parallel(tmp_path):
+    """Retry one sid at a time so Argus/NVMM allocation storms do not repeat.
 
-    Each retry's spawn posts the rescue event after a fixed delay; if
-    retries serialize, total time = N * delay; if parallel, total ≈ delay.
+    Each retry posts the rescue event after a fixed delay. Sequential retry
+    should take roughly N * delay; a parallel retry would complete near delay.
     """
     fail_sids = (2, 3, 4, 5, 7)
     cfgs = [
@@ -483,13 +684,12 @@ def test_connect_retries_run_in_parallel_not_serially(tmp_path):
     )
 
     spawn_count: dict[int, int] = {}
-    rescue_delay_s = 0.2
+    rescue_delay_s = 0.05
 
     def flaky_spawn(self):
         sid = self.cfg.sid
         spawn_count[sid] = spawn_count.get(sid, 0) + 1
         if spawn_count[sid] == 1:
-            # First attempt: fail immediately so Phase 1+2 returns fast.
             threading.Timer(
                 0.01,
                 lambda: ps._apply_event_to_proxy(
@@ -497,8 +697,6 @@ def test_connect_retries_run_in_parallel_not_serially(tmp_path):
                 ),
             ).start()
         else:
-            # Retry attempt: succeed only after rescue_delay_s. If retries
-            # run serially, total Phase 3 time >= N * rescue_delay_s.
             threading.Timer(
                 rescue_delay_s,
                 lambda: ps._apply_event_to_proxy(self, ("playing",)),
@@ -512,14 +710,11 @@ def test_connect_retries_run_in_parallel_not_serially(tmp_path):
 
     assert sorted(session.active_sids) == sorted(fail_sids)
     assert all(spawn_count[s] == 2 for s in fail_sids)
-    # Generous bound: serial would be N * rescue_delay = 1.0s. Parallel
-    # should be well under 2x rescue_delay even on a loaded CI runner.
     serial_lower_bound = len(fail_sids) * rescue_delay_s
-    assert elapsed < serial_lower_bound * 0.6, (
-        f"Phase 3 retry appears serial: elapsed={elapsed:.3f}s, "
-        f"serial would have taken ~{serial_lower_bound:.3f}s"
+    assert elapsed >= serial_lower_bound * 0.8, (
+        f"Phase 3 retry appears parallel: elapsed={elapsed:.3f}s, "
+        f"serial should take at least ~{serial_lower_bound:.3f}s"
     )
-
 
 def test_parallel_retry_drops_only_truly_dead_sids(tmp_path):
     """When some retries succeed and others permanently fail concurrently,
@@ -603,9 +798,12 @@ def test_connect_retry_does_not_retry_more_than_once_per_sid(tmp_path):
     )
 
 
-def test_rolling_spawn_calls_spawn_for_all_streams_before_first_wait_ready(tmp_path):
-    """The wall-clock win comes from spawning all workers (Phase 1) before
-    waiting for any of them (Phase 2). Verify that order."""
+def test_connect_spawns_and_waits_each_stream_before_next_spawn(tmp_path):
+    """Connect must not start all Argus clients before waiting for PLAYING.
+
+    The hardware-stable strategy is spawn -> wait_ready -> optional stable
+    window -> next spawn, which bounds concurrent CaptureSession/NVMM setup.
+    """
     cfgs = [
         ps.StreamConfig(sid=sid, name=f"cam_{sid:02d}") for sid in (2, 3, 4)
     ]
@@ -618,7 +816,6 @@ def test_rolling_spawn_calls_spawn_for_all_streams_before_first_wait_ready(tmp_p
 
     def recording_spawn(self):
         events.append(f"spawn:{self.cfg.sid}")
-        # Post "playing" immediately so wait_ready returns fast for all.
         ps._apply_event_to_proxy(self, ("playing",))
 
     real_wait_ready = ps._StreamProxy.wait_ready
@@ -632,13 +829,116 @@ def test_rolling_spawn_calls_spawn_for_all_streams_before_first_wait_ready(tmp_p
          patch.object(ps._StreamProxy, "wait_ready", recording_wait_ready):
         session.connect()
 
-    # All spawn:* events must come before any wait:* event.
-    spawn_indexes = [i for i, e in enumerate(events) if e.startswith("spawn:")]
-    wait_indexes = [i for i, e in enumerate(events) if e.startswith("wait:")]
-    assert spawn_indexes and wait_indexes
-    assert max(spawn_indexes) < min(wait_indexes), (
-        f"rolling spawn must finish Phase 1 before Phase 2; got order: {events}"
+    assert events == [
+        "spawn:2", "wait:2",
+        "spawn:3", "wait:3",
+        "spawn:4", "wait:4",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Two-phase connect (PR7): spawn-all-to-PAUSED, then serialize PLAYING
+# ---------------------------------------------------------------------------
+
+
+def _two_phase_connect(session, behaviors):
+    """Drive a two-phase connect() with fake workers.
+
+    ``behaviors`` maps sid -> (pause, play, retry), each "ok"/"fail":
+      * pause  -> Phase 1 result (reach PAUSED, or fail before it)
+      * play   -> Phase 2 result (reach PLAYING after play(), or fail)
+      * retry  -> single-phase restart_stream result (straight to PLAYING)
+    Returns the ordered list of spawn/play/respawn events so tests can assert
+    that every worker is spawned to PAUSED before any is told to play.
+    """
+    session._ctx_factory = lambda: _FakeCtx()
+    order = []
+
+    def _emit(proxy, ok, playing):
+        if ok:
+            evt = ("playing",) if playing else ("paused",)
+        else:
+            evt = ("error", f"sid={proxy.cfg.sid} fail", "")
+        threading.Timer(0.02, lambda: ps._apply_event_to_proxy(proxy, evt)).start()
+
+    def fake_spawn(self, *, two_phase=False):
+        b = behaviors.get(self.cfg.sid, ("ok", "ok", "ok"))
+        if two_phase:
+            order.append(f"spawn:{self.cfg.sid}")
+            _emit(self, b[0] == "ok", playing=False)
+        else:  # restart_stream path is single-phase -> straight to PLAYING
+            order.append(f"respawn:{self.cfg.sid}")
+            _emit(self, b[2] == "ok", playing=True)
+
+    def fake_play(self):
+        b = behaviors.get(self.cfg.sid, ("ok", "ok", "ok"))
+        order.append(f"play:{self.cfg.sid}")
+        _emit(self, b[1] == "ok", playing=True)
+
+    with patch.object(ps._StreamProxy, "spawn", fake_spawn), \
+         patch.object(ps._StreamProxy, "play", fake_play):
+        session.connect()
+    return order
+
+
+def test_two_phase_connect_spawns_all_to_paused_before_any_play(tmp_path):
+    """The whole point of PR7: every worker is spawned (to PAUSED, overlapping
+    python/Gst.init) before the first PAUSED->PLAYING is triggered, and the
+    PLAYING bring-ups are then issued one at a time."""
+    cfgs = [ps.StreamConfig(sid=sid, name=f"cam_{sid:02d}") for sid in (2, 3, 4)]
+    session = ps.PersistentCameraSession(
+        cfgs, tmp_path / "warmup",
+        spawn_stagger_s=0.0, connect_stable_s=0.0, ready_timeout_s=0.3,
+        two_phase_connect=True,
     )
+    order = _two_phase_connect(session, {})
+
+    spawn_idx = [i for i, e in enumerate(order) if e.startswith("spawn:")]
+    play_idx = [i for i, e in enumerate(order) if e.startswith("play:")]
+    assert len(spawn_idx) == 3 and len(play_idx) == 3
+    assert max(spawn_idx) < min(play_idx), (
+        f"all PAUSED spawns must precede the first play(): {order}"
+    )
+    assert session.active_sids == [2, 3, 4]
+    assert session.poll_errors() == []
+
+
+def test_two_phase_connect_drops_sid_that_fails_to_pause(tmp_path):
+    """A worker that dies before PAUSED is dropped; the retry (single-phase)
+    also fails here, so its error surfaces and the others stay active."""
+    cfgs = [ps.StreamConfig(sid=sid, name=f"cam_{sid:02d}") for sid in (2, 3, 4)]
+    session = ps.PersistentCameraSession(
+        cfgs, tmp_path / "warmup",
+        spawn_stagger_s=0.0, connect_stable_s=0.0, ready_timeout_s=0.2,
+        two_phase_connect=True,
+    )
+    order = _two_phase_connect(
+        session, {3: ("fail", "ok", "fail")},
+    )
+    # cam_03 never gets a play() in Phase 2 (it was dropped in Phase 1) but is
+    # retried single-phase (respawn), which also fails.
+    assert "play:3" not in order
+    assert "respawn:3" in order
+    assert session.active_sids == [2, 4]
+    errs = session.poll_errors()
+    assert any(e.sid == 3 for e in errs)
+
+
+def test_two_phase_connect_play_failure_rescued_by_retry(tmp_path):
+    """A worker that reaches PAUSED but fails its first PAUSED->PLAYING is
+    rescued by the single-phase restart in the retry round."""
+    cfgs = [ps.StreamConfig(sid=sid, name=f"cam_{sid:02d}") for sid in (2, 3)]
+    session = ps.PersistentCameraSession(
+        cfgs, tmp_path / "warmup",
+        spawn_stagger_s=0.0, connect_stable_s=0.0, ready_timeout_s=0.3,
+        two_phase_connect=True,
+    )
+    order = _two_phase_connect(
+        session, {3: ("ok", "fail", "ok")},
+    )
+    assert "play:3" in order and "respawn:3" in order
+    assert sorted(session.active_sids) == [2, 3]
+    assert session.poll_errors() == []
 
 
 def test_persistent_session_poll_errors_aggregates_across_proxies(tmp_path):
