@@ -26,7 +26,7 @@
 
 ## Data Collection GUI
 
-For the thor workflow(with sensing's gmsl2 cams), use [this guide](./tools/thor/DEPLOYMENT.md)
+For the thor workflow(with sensing's gmsl2 cams), use [Thor Data Collection GUI guide](./tools/thor/README.md)
 
 For the local FR3 data-collection workflow(with hikrobot cams), use the [Data Collection GUI guide](./tools/data_collection_gui/frontend/README.md). It documents the browser entry points for Live Record, Dataset Processing, Episode Replay, annotation, MuJoCo validation, guarded real-robot replay, and the command-line fallbacks for functionality that is not fully wired into the GUI yet.
 

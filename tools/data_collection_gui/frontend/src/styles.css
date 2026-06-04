@@ -639,6 +639,22 @@ button.danger {
   margin: 12px 0;
 }
 
+/* Keyboard-shortcut hint rendered inside the record control buttons. */
+.control-row button kbd {
+  margin-left: 6px;
+  padding: 1px 5px;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  opacity: 0.65;
+}
+
+.control-row button:disabled kbd {
+  opacity: 0.4;
+}
+
 .device-group {
   margin-top: 12px;
 }
