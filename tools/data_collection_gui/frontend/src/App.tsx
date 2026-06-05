@@ -190,6 +190,23 @@ function RecorderLogStream({ lines }: { lines: string[] }) {
   );
 }
 
+// Single source of truth for which record controls are available in a given
+// recorder state. Shared by the RecordingPanel buttons AND the LiveRecord
+// keyboard shortcuts, so a shortcut can never fire an action that a disabled
+// button wouldn't.
+function recordingControlAvailability(status: RecordingStatus) {
+  const isConnected =
+    status.pid != null ||
+    ["connecting", "armed", "recording", "review", "saving", "discarding"].includes(status.state);
+  return {
+    isConnected,
+    canConnect: !isConnected,
+    canStartEpisode: status.state === "armed",
+    canResolveEpisode: status.state === "recording" || status.state === "review",
+    canExit: isConnected,
+  };
+}
+
 function RecordingPanel({
   status,
   config,
@@ -208,10 +225,8 @@ function RecordingPanel({
   logLines?: string[];
 }) {
   const progress = Math.round((status.frameIndex / Math.max(status.targetFrames, 1)) * 100);
-  const isConnected = status.pid != null || ["connecting", "armed", "recording", "review", "saving", "discarding"].includes(status.state);
-  const canStartEpisode = status.state === "armed";
-  const canResolveEpisode = status.state === "recording" || status.state === "review";
-  const canExit = isConnected;
+  const { isConnected, canStartEpisode, canResolveEpisode, canExit } =
+    recordingControlAvailability(status);
   const isGmsl = config.rigType === "gmsl2";
   const panelTitle = isGmsl ? "GMSL2 Record" : "Handheld Record";
 
@@ -238,11 +253,11 @@ function RecordingPanel({
         <div className="progress-bar" style={{ width: `${progress}%` }} />
       </div>
       <div className="control-row">
-        <button disabled={busy || isConnected} onClick={onConnect}>Connect</button>
-        <button disabled={busy || !canStartEpisode} onClick={onStart}>StartEpisode</button>
-        <button disabled={busy || !canResolveEpisode} onClick={() => onStop("save")}>Save</button>
-        <button disabled={busy || !canResolveEpisode} onClick={() => onStop("discard")}>Discard</button>
-        <button disabled={busy || !canExit} onClick={() => onStop("exit")}>Exit</button>
+        <button disabled={busy || isConnected} onClick={onConnect} title="Shortcut: C">Connect <kbd>C</kbd></button>
+        <button disabled={busy || !canStartEpisode} onClick={onStart} title="Shortcut: E">StartEpisode <kbd>E</kbd></button>
+        <button disabled={busy || !canResolveEpisode} onClick={() => onStop("save")} title="Shortcut: S">Save <kbd>S</kbd></button>
+        <button disabled={busy || !canResolveEpisode} onClick={() => onStop("discard")} title="Shortcut: D">Discard <kbd>D</kbd></button>
+        <button disabled={busy || !canExit} onClick={() => onStop("exit")} title="Shortcut: Esc">Exit <kbd>Esc</kbd></button>
       </div>
       <div className="summary-grid">
         <Metric label="Frame" value={`${status.frameIndex}/${status.targetFrames}`} />
@@ -582,6 +597,43 @@ function LiveRecordPage({
   // directly. The pre-PR6 approach of accumulating `lastOutput` lost any
   // line that didn't land at the top of a snapshot poll window.
   const logLines = snapshot.recording.recentOutput ?? [];
+
+  // Keyboard shortcuts for the record controls. This component is mounted only
+  // while activePage === "live-record", so the window listener is naturally
+  // scoped to this page. Each key mirrors the matching button's enabled gating
+  // exactly (recordingControlAvailability), is suppressed while busy, ignores
+  // modifier combos (so Ctrl/Cmd+S etc. stay with the browser), and never fires
+  // while the operator is typing in an input/textarea/select.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.repeat || event.isComposing) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      const el = document.activeElement as HTMLElement | null;
+      const tag = el?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el?.isContentEditable) return;
+      if (busy) return;
+      const controls = recordingControlAvailability(snapshot.recording);
+      const key = event.key.toLowerCase();
+      if (key === "c" && controls.canConnect) {
+        event.preventDefault();
+        onConnect();
+      } else if (key === "e" && controls.canStartEpisode) {
+        event.preventDefault();
+        onStart();
+      } else if (key === "s" && controls.canResolveEpisode) {
+        event.preventDefault();
+        onStop("save");
+      } else if (key === "d" && controls.canResolveEpisode) {
+        event.preventDefault();
+        onStop("discard");
+      } else if (event.key === "Escape" && controls.canExit) {
+        event.preventDefault();
+        onStop("exit");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [busy, snapshot.recording, onConnect, onStart, onStop]);
 
   return (
     <div className="page-stack">
