@@ -591,6 +591,29 @@ PR6 改成**服务端 ring buffer**：
 代码量：gateway.py +14 行 / +字段；types.ts +5 行；App.tsx 净 -27 行
 （删掉了脆弱的客户端累积逻辑）。
 
+### 已修复（2026-06-08）
+
+* **`_warmup` 撑爆磁盘（gateway 长时间挂在 Connected 不录制）**
+  - **表现**：周末过后 `outputs/datasets/<dataset>/_warmup` 涨到 120G，
+    整盘被占满。`du -ah outputs/datasets` 显示体积几乎全在某个 dataset 的
+    `_warmup` 子目录里。
+  - **根因**：持久管线在 Connect 后一直 PLAYING（为秒开 episode + 实时预览），
+    `splitmuxsink` 配的是 `max-size-time=0 max-size-bytes=0`（让单条 EPISODE
+    保持一个 .mkv），因此**它从不自动切片**。idle 期间每路相机只往一个
+    `cam_NN_warmup_00000.mkv` 无限追加；唯一的回收 `cleanup_warmup_files()`
+    只在每条 episode 结束时跑，于是"挂着 armed 但不录"就让 `_warmup` 无界增长。
+  - **修复**：worker 新增 `roll_warmup` 命令（仅 WARMUP 态 `force-IDR`+`split-now`，
+    对 EPISODE 态是 no-op，绝不会切断录制中的分片）；`thor_record` 的 idle tick
+    每 `dataset.warmup_roll_s`（默认 30s）`roll_warmup()` 后 `cleanup_warmup_files
+    (keep_last_n=dataset.warmup_keep_last_n)`，把 `_warmup` 钳制在「N 路 ×
+    keep_last_n × roll_s 码流」。`fragment_history` 同步改成 `deque(maxlen=256)`
+    堵掉 idle 滚动放大的小泄漏。EPISODE 录制路径字节不变。
+  - **运维提示**：**长时间不录制时按 Disconnect**，从源头停掉持久管线（省电、
+    省 Argus/NVENC 占用，也不再写 `_warmup`）。清理盘上已有的旧 `_warmup`：
+    先停 gateway/recorder，再
+    `find outputs/datasets -maxdepth 2 -type d -name _warmup -exec rm -rf {} +`
+    （`_warmup` 全是可丢弃的热身码流，删了不影响已录 episode）。
+
 ### 仍存在
 
 * **BOX 采集板传感器流上行**：供应商确认夹爪端固定只向

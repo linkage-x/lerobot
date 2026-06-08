@@ -143,6 +143,12 @@ class RecorderConfig:
     recording_preview_stale_s: float
     recording_preview_watchdog_s: float
     stream_health_poll_s: float
+    # While armed-but-idle, roll + prune the throwaway warmup fragments every
+    # this many seconds so the _warmup dir can't fill the disk between episodes
+    # (0 disables idle maintenance). keep_last_n bounds how many fragments per
+    # camera survive each prune.
+    warmup_roll_s: float
+    warmup_keep_last_n: int
 
 
 def _resolve(p: str | Path) -> Path:
@@ -195,6 +201,8 @@ def load_config(path: Path) -> RecorderConfig:
         recording_preview_stale_s=float(cams.get("recording_preview_stale_s", 3.0)),
         recording_preview_watchdog_s=float(cams.get("recording_preview_watchdog_s", 2.0)),
         stream_health_poll_s=float(cams.get("stream_health_poll_s", 1.0)),
+        warmup_roll_s=float(ds.get("warmup_roll_s", 30.0)),
+        warmup_keep_last_n=int(ds.get("warmup_keep_last_n", 3)),
     )
 
 

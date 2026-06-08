@@ -87,10 +87,11 @@ import shutil
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Deque
 
 logger = logging.getLogger("persistent_session")
 
@@ -417,7 +418,10 @@ class _StreamProxy:
         self.episode_done_evt = threading.Event()
         self.disconnected_evt = threading.Event()
         self.last_episode_fragment: FragmentInfo | None = None
-        self.fragment_history: list[FragmentInfo] = []
+        # Bounded so a long-armed session (idle warmup rolls every few seconds)
+        # cannot grow this list without limit. Only appended to and read via
+        # [-1]/len(), both of which deque supports.
+        self.fragment_history: Deque[FragmentInfo] = deque(maxlen=256)
         self.errors: list[StreamError] = []
         self._on_fragment_opened_cb = on_fragment_opened
         # Sticky "the recording pipeline died" marker. Unlike ``errors`` (drained
@@ -516,6 +520,10 @@ class _StreamProxy:
 
     def stop_episode(self) -> None:
         self.cmd_q.put(("stop_episode",))
+
+    def roll_warmup(self) -> None:
+        """Ask the worker to roll its open warmup fragment (idle maintenance)."""
+        self.cmd_q.put(("roll_warmup",))
 
     def enable_preview(self) -> None:
         self.cmd_q.put(("enable_preview",))
@@ -1025,12 +1033,31 @@ class PersistentCameraSession:
 
     # -- maintenance -----------------------------------------------------
 
+    def roll_warmup(self) -> None:
+        """Roll each camera's open warmup fragment so it becomes prunable.
+
+        splitmuxsink runs with ``max-size-time=0`` so an EPISODE stays a single
+        file; the price is that the warmup fragment open while the recorder sits
+        armed/idle never rotates on its own and grows until the disk fills (the
+        2026-06 Thor ``_warmup`` blow-up: 120G accumulated over a weekend with
+        the gateway connected but never recording). Calling this on an idle
+        timer, then ``cleanup_warmup_files()``, keeps ``_warmup`` bounded even
+        when no episode is ever recorded. Each worker no-ops unless it is in the
+        WARMUP state, so this can never cut an EPISODE fragment in half.
+        """
+        for proxy in self._streams.values():
+            try:
+                proxy.roll_warmup()
+            except Exception as exc:  # noqa: BLE001 - maintenance must not crash idle
+                logger.debug("roll_warmup sid=%s raised: %s", proxy.cfg.sid, exc)
+
     def cleanup_warmup_files(self, *, keep_last_n: int = 3) -> int:
         """Delete warmup-state fragments, keeping the most recent N per camera.
 
-        splitmuxsink doesn't auto-rotate fragments in async-finalize mode,
-        so this prevents the warmup directory from growing unbounded across
-        long sessions. Call once per episode.
+        splitmuxsink doesn't auto-rotate fragments in async-finalize mode, so
+        this prevents the warmup directory from growing unbounded across long
+        sessions. Pair it with ``roll_warmup()`` on an idle timer so the
+        currently-open fragment also stays bounded between episodes.
 
         Returns the number of files deleted.
         """

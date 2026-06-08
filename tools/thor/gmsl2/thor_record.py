@@ -916,6 +916,7 @@ def main(argv: list[str] | None = None) -> int:
     rc = 0
     last_box_live_at = 0.0
     last_stream_health_at = 0.0
+    last_warmup_roll_at = 0.0
 
     def _format_stream_errors(errors: list[ps.StreamError]) -> str:
         return ", ".join(ps.format_stream_error(e) for e in errors)
@@ -941,8 +942,24 @@ def main(argv: list[str] | None = None) -> int:
         return stream_errs
 
     def _tick_connected_idle() -> None:
-        nonlocal last_box_live_at
+        nonlocal last_box_live_at, last_warmup_roll_at
         _poll_stream_health(context="idle")
+        # Bound the throwaway warmup stream while we sit armed but not recording.
+        # splitmuxsink never auto-rotates (max-size-time=0), so the open warmup
+        # fragment grows until the disk fills if we only ever cleaned up at
+        # episode boundaries (the 2026-06 Thor _warmup blow-up: gateway left
+        # connected over a weekend -> 120G). Roll then prune on a timer here.
+        roll_s = max(0.0, cfg.warmup_roll_s)
+        now = time.monotonic()
+        if roll_s > 0 and now - last_warmup_roll_at >= roll_s:
+            last_warmup_roll_at = now
+            try:
+                pcs.roll_warmup()
+                deleted = pcs.cleanup_warmup_files(keep_last_n=cfg.warmup_keep_last_n)
+                if deleted:
+                    logger.info("idle warmup maintenance pruned %d fragment(s)", deleted)
+            except Exception as exc:  # noqa: BLE001 - maintenance must not break idle
+                logger.warning("idle warmup maintenance failed: %s", exc)
         # Preview lifecycle (enable/disable on demand + stale watchdog) runs in
         # its own thread (_preview_control_loop) so its staggered enable never
         # blocks command handling here.

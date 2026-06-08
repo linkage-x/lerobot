@@ -640,6 +640,25 @@ def run_worker(
                 fragment = state.last_episode_fragment
                 state.last_episode_fragment = None
             evt_q.put(("episode_done", fragment))
+        elif kind == "roll_warmup":
+            # Idle maintenance: while the recorder is armed but not recording,
+            # splitmuxsink (max-size-time=0) keeps appending to a single warmup
+            # fragment that grows without bound. Closing it here and opening a
+            # fresh one lets the parent's cleanup_warmup_files() prune the old
+            # ones. Guarded on WARMUP so a stray roll can never split an EPISODE
+            # fragment mid-recording.
+            with state.lock:
+                in_warmup = state.state == FragmentState.WARMUP
+            if in_warmup:
+                if encoder is not None:
+                    try:
+                        encoder.emit("force-IDR")
+                    except Exception as exc:
+                        logger.debug("[%s] force-IDR (roll) not supported: %s", cfg.name, exc)
+                try:
+                    splitmux.emit("split-now")
+                except Exception as exc:
+                    evt_q.put(("error", f"warmup roll split-now failed: {exc}", ""))
         elif kind == "enable_preview":
             _set_preview_enabled(True)
         elif kind == "disable_preview":
