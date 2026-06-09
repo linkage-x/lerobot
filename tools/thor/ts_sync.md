@@ -1,6 +1,7 @@
 # Thor 相机-传感器时间同步技术文档
 
-> 适用于 Thor 数据采集平台（11 × GMSL2 相机 + BOX 采集板），2026-05-27
+> 适用于 Thor 数据采集平台（11 × GMSL2 相机 + BOX 采集板）
+> 初版 2026-05-27；2026-06-09 按实际代码实现校订（PTS offset 机制、meta 字段、ffprobe 角色）
 
 ## 1. 系统总览
 
@@ -158,24 +159,40 @@ L3a 的两个主要误差源：
 1. **相机侧**：帧时间用 `t_start + N/fps` 推算，但 `t_start` 是 gst-launch 进程启动时刻，不是第一帧 PWM 边沿时刻。管道启动延迟（ISP 初始化、编码器预热）典型 100-500ms，不计入则首帧时间偏移数百毫秒
 2. **BOX 侧**：每个样本的 `wall_time_s` 是主机**收到**时刻，包含 UDP 传输延迟和 poll 调度抖动（每次不同）
 
-### 5.1 相机侧修正：MKV PTS 提取
+### 5.1 相机侧修正：首帧 host wall-time 偏移（pts_offset）
 
-Episode 结束后从参考相机（最早启动的那路）的 MKV 中用 `ffprobe` 提取帧级 PTS：
-
-```bash
-ffprobe -v quiet -select_streams v:0 \
-  -show_entries packet=pts_time -of csv=p=0 cam_00.mkv
-```
-
-PTS 由 `nvarguscamerasrc do-timestamp=true` 写入，反映帧到达 GStreamer pipeline clock 的实际时刻。首帧 PTS（`pts[0]`）即管道启动延迟。
-
-由于所有相机共享 PWM 触发，帧间间隔严格 = 1/fps，只需一路 PTS 即可重建帧时间网格：
+> **实现说明（2026-06 校订）**：早期设计用 `ffprobe` 提取参考相机 MKV 的容器内首帧 PTS
+> 作为管道启动延迟。Thor 真机 burn-in 发现 `splitmuxsink` 的 `format-location-full`
+> 回调里 `first_sample.pts` **跨流不可用**——每路相机有各自的 pipeline clock，即使物理
+> 上只差 ~20ms 起始，`first_pts_s` 在 11 路之间能差出 10s 量级，不能作为跨流锚点。
+>
+> 真正的跨流公共时钟是 **host wall-time**。现在每个 worker 在 `splitmuxsink` 首帧真正
+> 落盘时记录 `first_wall_s = time.time()`（`persistent_session_worker.py`），父进程把它聚进
+> `FragmentInfo`。Episode 结束后由 `thor_record._pts_offset_from_handle()` 计算：
 
 ```
-actual_frame_time[N] = t_start + pts[0] + N / fps
-                                 ^^^^^^
-                            管道启动延迟修正
+pts_offset = mean_over_cams( first_wall_s[cam] - t0_wall_s )
 ```
+
+其中 `t0_wall_s` 是 StartEpisode 发出 `split-now` 的时刻（相机/BOX 共用的录制起点）。
+`first_wall_s - t0_wall_s` 衡量的就是「split-now 命令 → 该路首帧实际落盘」的延迟，
+即管道启动延迟，只是用主机墙钟而非容器 PTS 测量。逐路 delta 的完整明细写入
+`meta.json` 的 `sync_reference.camera_first_wall_s`。
+
+由于所有相机共享 PWM 触发，帧间间隔严格 = 1/fps，单个标量 `pts_offset` 即可重建帧时间网格。
+对齐在 **t0 相对域** 内进行（BOX 样本时间也是 `t_rel_s = wall_s - t0_wall_s`）：
+
+```
+frame_time[N] = pts_offset + N / fps        （相对 t0_wall_s）
+                ^^^^^^^^^^
+            管道启动延迟修正（frame_origin_s）
+```
+
+代码见 `thor_lerobot_v3._build_episode_rows()`：`frame_origin_s = pts_offset_s`。
+
+> **注**：`thor_lerobot_v3.extract_pts()`（ffprobe + GStreamer 双路）仍然存在，但**只在
+> 离线 `export_v3.py` 数帧时使用**，不在录制对齐路径里。录制路径的 `pts_offset` 完全来自
+> worker 上报的 `first_wall_s`，与 ffprobe 无关。
 
 ### 5.2 BOX 侧修正：MCU↔Host 时钟线性回归
 
@@ -198,17 +215,21 @@ host_time = slope × mcu_ts + intercept
 
 ### 5.3 安全阈值
 
-校准不总是有效。以下情况自动回退到 L3a 的原始 poll 时间：
+校准不总是有效。`calibrate_sensor_samples()` 在以下情况自动回退到 L3a 的原始 poll 时间
+（`t_rel_s` 原值不变）：
 
-- 该传感器样本数 < 10（不足以拟合）
-- 回归残差标准差 > 50ms（拟合质量差，可能 MCU 时钟不是线性的）
-- MCU 时间戳全为 0（传感器未上报有效时间戳）
+- 该传感器样本数 < 10（`len(slist) < 10`，不足以拟合）
+- MCU 时间戳全为 0（`not any(mcu_ts)`，传感器未上报有效时间戳）
+- 回归残差标准差 > 50ms（`res_std > 0.05`，拟合质量差，可能 MCU 时钟不是线性的）
+- 退化拟合（`slope == 0.0`，含样本 < 2 或 x 方差为 0 的情形，`calibrate_mcu_clock` 返回 `(0, 0, inf)`）
+
+注意回退是**逐传感器**的：某个传感器拟合差不影响其他传感器使用校准时间。
 
 ### 5.4 合成精度
 
 | 修正项 | 消除的误差 | 修正前 | 修正后 |
 |--------|-----------|--------|--------|
-| PTS 提取 | 管道启动延迟（100-500ms 偏移） | 全局偏移 | 偏移 <1ms |
+| 首帧 wall-time 偏移（pts_offset） | 管道启动延迟（100-500ms 偏移） | 全局偏移 | 偏移 ~主机墙钟精度（亚毫秒~毫秒级） |
 | MCU 时钟校准 | 逐次 poll 随机抖动（1-3ms） | ±1-3ms/样本 | <0.5ms/样本（回归残差） |
 | 合计 | | ±3~13ms | **±0.5~1ms** |
 
@@ -230,14 +251,15 @@ host_time = slope × mcu_ts + intercept
   ├─ box.stop_recording()
   │    └─ 返回 {sensor_id: [SensorSample, ...]}
   │
-  ├─ PTS 提取
-  │    └─ ffprobe 参考相机 MKV → pts[0]（管道启动延迟）
+  ├─ pts_offset 计算（_pts_offset_from_handle）
+  │    └─ mean(first_wall_s[cam] - t0_wall_s)，逐路 first_wall_s 来自 worker 上报
+  │       （非 ffprobe；明细写入 meta.json sync_reference.camera_first_wall_s）
   │
   ├─ 写入 box_sensors.jsonl（原始数据归档）
   │
-  └─ 写入 LeRobot v3 parquet
-       ├─ 逐传感器 MCU 时钟校准（线性回归）
-       ├─ 帧时间网格 = pts[0] + frame_index / 60
+  └─ 写入 LeRobot v3 parquet（_build_episode_rows）
+       ├─ 逐传感器 MCU 时钟校准（calibrate_sensor_samples 线性回归 + 安全回退）
+       ├─ 帧时间网格 = pts_offset + frame_index / 60   （t0 相对域）
        └─ 对每帧逐传感器二分查找最近邻 → 组成 state 向量
 ```
 
@@ -246,10 +268,24 @@ host_time = slope × mcu_ts + intercept
 | 级别 | 精度 | 状态 | 机制 |
 |------|------|------|------|
 | **L0** 相机间硬同步 | <1μs | ✅ | PWM slave mode，11 路帧锁定同一边沿 |
-| **L1** 软同步元数据 | — | ✅ | meta.json 记录 t0_wall_s / spawn_offset / sync_reference |
+| **L1** 软同步元数据 | — | ✅ | meta.json `sync_reference` 记录 t0_wall_s / split_now_wall_s / camera_first_wall_s（逐路，跨相机锚点）/ camera_first_pts_s（per-stream，不可跨相机比较） |
 | **L3a** 高频独立采样 | ±3~13ms | ✅ | 500Hz poll + MCU 时间戳去重 + 逐传感器最近邻 |
-| **L3b** 增强对齐 | ±0.5~1ms | ✅ | MKV PTS 提取 + MCU↔Host 时钟线性回归 |
+| **L3b** 增强对齐 | ±0.5~1ms | ✅ | 首帧 host wall-time 偏移（pts_offset）+ MCU↔Host 时钟线性回归 |
 | **L4** 硬件级全同步 | <1μs | 🔲 | BOX MCU 也由 PWM 触发（需硬件改动） |
+
+### 7.1 代码位置 & 测试映射
+
+| 机制 | 代码 | 测试（无需真机） |
+|------|------|----------------|
+| 500Hz poll + MCU 去重 | `box_sdk/box_client.py` `_poll_loop`（`record_poll_interval_s=0.002`；录制外 `poll_interval_s=0.05`=20Hz） | `tests/scripts/test_thor_box_client.py`（`_FakeBox` 内存 stub） |
+| pts_offset（首帧 wall-time） | `gmsl2/thor_record.py` `_pts_offset_from_handle`；worker 侧 `persistent_session_worker.py` `first_wall_s` | （需 worker 事件，部分覆盖于 multiprocess 测试） |
+| 帧网格 + 最近邻对齐 | `gmsl2/thor_lerobot_v3.py` `_build_episode_rows` / `_nearest_sample_data` | `tests/scripts/test_thor_ts_sync_alignment.py` |
+| MCU 时钟校准 + 回退 | `gmsl2/thor_lerobot_v3.py` `calibrate_mcu_clock` / `calibrate_sensor_samples` | `tests/scripts/test_thor_ts_sync_alignment.py` |
+| ffprobe/GStreamer PTS（**离线数帧**） | `gmsl2/thor_lerobot_v3.py` `extract_pts`；`gmsl2/export_v3.py` | `tests/scripts/test_thor_lerobot_v3_pts.py` |
+
+> 这些测试只覆盖纯 Python 对齐逻辑与数据契约。真机才能确认的内容（MCU 时钟是否线性/单调、
+> `mcu_timestamp` 真实语义与单位、各传感器真实频率与 poll 抖动、BOX↔相机端到端实测精度）
+> 仍需 BOX 到位后验证，见 §8.2 / §8.5。
 
 ## 8. 注意事项
 
@@ -265,7 +301,13 @@ host_time = slope × mcu_ts + intercept
 
 ### 8.3 ffprobe 依赖
 
-PTS 提取依赖 Jetson 上安装 `ffprobe`（FFmpeg 套件）。若不可用，回退到 `pts_offset = 0`（即 L3a 精度）。录制器会在日志中输出警告。
+**录制对齐路径不依赖 ffprobe。** `pts_offset` 来自 worker 上报的 `first_wall_s`（见
+§5.1），与 FFmpeg 无关。若某路相机未上报有效 `first_wall_s`，`_pts_offset_from_handle`
+返回 `None`，writer 用 `frame_origin_s = 0`（即退回 L3a 精度，仅丢失管道启动延迟修正）。
+
+ffprobe 仅在**离线** `export_v3.py` 数帧时用到（`extract_pts`，反映容器内 PTS）：
+Jetson 镜像不一定带 ffprobe，所以 `extract_pts` 在 ffprobe 缺失时自动回退到
+`_extract_pts_gstreamer`（用 GStreamer `matroskademux` 读 PTS）。二者都不可用才告警。
 
 ### 8.4 训练数据 vs 原始数据
 
