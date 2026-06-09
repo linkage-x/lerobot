@@ -111,3 +111,17 @@ BOX 传感器流上行链路已打通，LeRobot wrapper 已能把 6 个 BOX sens
 ## 6. 给供应商的简短结论
 
 板端固定上行 IP 为 `192.168.2.45`。Thor 改为 `192.168.2.45/24` 并让 SDK 绑定 `192.168.2.45:15000` 后，网卡层已收到 `BOX 192.168.2.60 -> Thor 192.168.2.45 UDP/15000`，`get_sensor_cache` 已由 `rc=4 no cached sensor data` 变为 `rc=0 ok valid=1`；LeRobot `BoxClient` 进一步确认 6 个 BOX sensor 全部 seen/fresh，相关 timestamp 和 gripper distance 已可记录。
+
+## 7. SDK 自动写 CSV 撑爆磁盘（临时绕过，待 SDK 修复）
+
+`libbox_controller.so` 每次 `Box.start()` 后会在**进程 CWD** 无条件写一个
+`box_sensor_data_<时间戳>.csv`（`append_sensor_csv`，路径是静态常量 `kCsvPath`），
+约 **35 MB/分钟**。`.so` 里只暴露 `BOX_SDK_URDF` 一个 env，**没有关闭开关**。
+
+**临时绕过**：`BoxClient.stop()` 会删除本会话新产生的 `box_sensor_data_*.csv`
+（`cleanup_box_csv: true` 默认开启，按 `start()` 前后快照差集，只删本会话的）。
+注意录制**进行中**该文件仍按 35 MB/min 增长，只有 `stop()` 后才回收——长 episode
+仍需留意峰值占用。
+
+**给供应商的请求**：为 CSV dump 增加 env 开关（如 `BOX_SDK_NO_CSV=1`）或可配置输出路径。
+SDK 侧修复后，移除 `box_client.py` 的 `_cleanup_session_csv` / `cleanup_box_csv`。

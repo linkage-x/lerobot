@@ -1,6 +1,8 @@
 # Thor 相机-传感器时间同步技术文档
 
-> 适用于 Thor 数据采集平台（11 × GMSL2 相机 + BOX 采集板），2026-05-27
+> 适用于 Thor 数据采集平台（11 × GMSL2 相机 + BOX 采集板）
+> 初版 2026-05-27；2026-06-09 按实际代码实现校订（PTS offset 机制、meta 字段、ffprobe 角色）
+> 2026-06-15 按真机实测校订（各传感器频率、L3b 校准残差；MCU 时钟 = 1µs/tick，6 路全 engage）
 
 ## 1. 系统总览
 
@@ -115,14 +117,17 @@ for sid, ts in sensor_timestamps.items():
 
 500Hz 轮询保证对任何 ≤250Hz 的传感器都满足 Nyquist 条件。每个传感器按 MCU 实际推送频率独立记录：
 
-| 传感器 | 典型观测频率 | 每 10s episode 样本数 |
+| 传感器 | 实测观测频率 | 每 10s episode 样本数 |
 |--------|------------|---------------------|
-| IMU | ~200 Hz | ~2000 |
-| 六维力 | ~200 Hz | ~2000 |
-| Gripper | ~200 Hz | ~2000 |
-| Trigger | ~200 Hz | ~2000 |
-| Touch L | ~200 Hz | ~2000 |
-| Touch R | ~50 Hz | ~500 |
+| IMU | 199 Hz | ~1998 |
+| 六维力 | 199 Hz | ~1998 |
+| Gripper | 199 Hz | ~1998 |
+| Trigger | 199 Hz | ~1998 |
+| Touch L | **50 Hz** | ~500 |
+| Touch R | 50 Hz | ~500 |
+
+> 频率为 2026-06-15 真机实测（左右触觉垫**均为 50Hz**——早期文档误记 Touch L 为 200Hz）。
+> 这影响最近邻对齐误差：touch 在 50Hz 下为 ±10ms（而非 200Hz 的 ±2.5ms）。
 
 ### 数据持久化
 
@@ -158,24 +163,40 @@ L3a 的两个主要误差源：
 1. **相机侧**：帧时间用 `t_start + N/fps` 推算，但 `t_start` 是 gst-launch 进程启动时刻，不是第一帧 PWM 边沿时刻。管道启动延迟（ISP 初始化、编码器预热）典型 100-500ms，不计入则首帧时间偏移数百毫秒
 2. **BOX 侧**：每个样本的 `wall_time_s` 是主机**收到**时刻，包含 UDP 传输延迟和 poll 调度抖动（每次不同）
 
-### 5.1 相机侧修正：MKV PTS 提取
+### 5.1 相机侧修正：首帧 host wall-time 偏移（pts_offset）
 
-Episode 结束后从参考相机（最早启动的那路）的 MKV 中用 `ffprobe` 提取帧级 PTS：
-
-```bash
-ffprobe -v quiet -select_streams v:0 \
-  -show_entries packet=pts_time -of csv=p=0 cam_00.mkv
-```
-
-PTS 由 `nvarguscamerasrc do-timestamp=true` 写入，反映帧到达 GStreamer pipeline clock 的实际时刻。首帧 PTS（`pts[0]`）即管道启动延迟。
-
-由于所有相机共享 PWM 触发，帧间间隔严格 = 1/fps，只需一路 PTS 即可重建帧时间网格：
+> **实现说明（2026-06 校订）**：早期设计用 `ffprobe` 提取参考相机 MKV 的容器内首帧 PTS
+> 作为管道启动延迟。Thor 真机 burn-in 发现 `splitmuxsink` 的 `format-location-full`
+> 回调里 `first_sample.pts` **跨流不可用**——每路相机有各自的 pipeline clock，即使物理
+> 上只差 ~20ms 起始，`first_pts_s` 在 11 路之间能差出 10s 量级，不能作为跨流锚点。
+>
+> 真正的跨流公共时钟是 **host wall-time**。现在每个 worker 在 `splitmuxsink` 首帧真正
+> 落盘时记录 `first_wall_s = time.time()`（`persistent_session_worker.py`），父进程把它聚进
+> `FragmentInfo`。Episode 结束后由 `thor_record._pts_offset_from_handle()` 计算：
 
 ```
-actual_frame_time[N] = t_start + pts[0] + N / fps
-                                 ^^^^^^
-                            管道启动延迟修正
+pts_offset = mean_over_cams( first_wall_s[cam] - t0_wall_s )
 ```
+
+其中 `t0_wall_s` 是 StartEpisode 发出 `split-now` 的时刻（相机/BOX 共用的录制起点）。
+`first_wall_s - t0_wall_s` 衡量的就是「split-now 命令 → 该路首帧实际落盘」的延迟，
+即管道启动延迟，只是用主机墙钟而非容器 PTS 测量。逐路 delta 的完整明细写入
+`meta.json` 的 `sync_reference.camera_first_wall_s`。
+
+由于所有相机共享 PWM 触发，帧间间隔严格 = 1/fps，单个标量 `pts_offset` 即可重建帧时间网格。
+对齐在 **t0 相对域** 内进行（BOX 样本时间也是 `t_rel_s = wall_s - t0_wall_s`）：
+
+```
+frame_time[N] = pts_offset + N / fps        （相对 t0_wall_s）
+                ^^^^^^^^^^
+            管道启动延迟修正（frame_origin_s）
+```
+
+代码见 `thor_lerobot_v3._build_episode_rows()`：`frame_origin_s = pts_offset_s`。
+
+> **注**：`thor_lerobot_v3.extract_pts()`（ffprobe + GStreamer 双路）仍然存在，但**只在
+> 离线 `export_v3.py` 数帧时使用**，不在录制对齐路径里。录制路径的 `pts_offset` 完全来自
+> worker 上报的 `first_wall_s`，与 ffprobe 无关。
 
 ### 5.2 BOX 侧修正：MCU↔Host 时钟线性回归
 
@@ -198,19 +219,28 @@ host_time = slope × mcu_ts + intercept
 
 ### 5.3 安全阈值
 
-校准不总是有效。以下情况自动回退到 L3a 的原始 poll 时间：
+校准不总是有效。`calibrate_sensor_samples()` 在以下情况自动回退到 L3a 的原始 poll 时间
+（`t_rel_s` 原值不变）：
 
-- 该传感器样本数 < 10（不足以拟合）
-- 回归残差标准差 > 50ms（拟合质量差，可能 MCU 时钟不是线性的）
-- MCU 时间戳全为 0（传感器未上报有效时间戳）
+- 该传感器样本数 < 10（`len(slist) < 10`，不足以拟合）
+- MCU 时间戳全为 0（`not any(mcu_ts)`，传感器未上报有效时间戳）
+- 回归残差标准差 > 50ms（`res_std > 0.05`，拟合质量差，可能 MCU 时钟不是线性的）
+- 退化拟合（`slope == 0.0`，含样本 < 2 或 x 方差为 0 的情形，`calibrate_mcu_clock` 返回 `(0, 0, inf)`）
+
+注意回退是**逐传感器**的：某个传感器拟合差不影响其他传感器使用校准时间。
 
 ### 5.4 合成精度
 
 | 修正项 | 消除的误差 | 修正前 | 修正后 |
 |--------|-----------|--------|--------|
-| PTS 提取 | 管道启动延迟（100-500ms 偏移） | 全局偏移 | 偏移 <1ms |
-| MCU 时钟校准 | 逐次 poll 随机抖动（1-3ms） | ±1-3ms/样本 | <0.5ms/样本（回归残差） |
-| 合计 | | ±3~13ms | **±0.5~1ms** |
+| 首帧 wall-time 偏移（pts_offset） | 管道启动延迟（100-500ms 偏移） | 全局偏移 | 偏移 ~主机墙钟精度（亚毫秒~毫秒级） |
+| MCU 时钟校准 | 逐次 poll 随机抖动（1-3ms） | ±1-3ms/样本 | ~1ms/样本（200Hz 主传感器），~2-3ms（50Hz touch） |
+| 合计 | | ±3~13ms | **±1~3ms** |
+
+> 修正后数值为 2026-06-15 真机实测的回归残差标准差（`recorder_*.log` 的 `MCU clock calibration`）：
+> gripper 1.12ms · imu 1.07ms · trigger 1.07ms · 六维力 1.18ms · touch L 2.02ms · touch R 1.97ms。
+> 比早期文档估计的 <0.5ms 略保守，但仍远优于 L3a 的 ±3~13ms。`slope` 实测恒为 `1.0e-6`，
+> 即 **MCU 时间戳单位 = 微秒**；6 路传感器在真机上全部 engage（无回退）。
 
 ## 6. 完整对齐流程（per episode）
 
@@ -230,14 +260,15 @@ host_time = slope × mcu_ts + intercept
   ├─ box.stop_recording()
   │    └─ 返回 {sensor_id: [SensorSample, ...]}
   │
-  ├─ PTS 提取
-  │    └─ ffprobe 参考相机 MKV → pts[0]（管道启动延迟）
+  ├─ pts_offset 计算（_pts_offset_from_handle）
+  │    └─ mean(first_wall_s[cam] - t0_wall_s)，逐路 first_wall_s 来自 worker 上报
+  │       （非 ffprobe；明细写入 meta.json sync_reference.camera_first_wall_s）
   │
   ├─ 写入 box_sensors.jsonl（原始数据归档）
   │
-  └─ 写入 LeRobot v3 parquet
-       ├─ 逐传感器 MCU 时钟校准（线性回归）
-       ├─ 帧时间网格 = pts[0] + frame_index / 60
+  └─ 写入 LeRobot v3 parquet（_build_episode_rows）
+       ├─ 逐传感器 MCU 时钟校准（calibrate_sensor_samples 线性回归 + 安全回退）
+       ├─ 帧时间网格 = pts_offset + frame_index / 60   （t0 相对域）
        └─ 对每帧逐传感器二分查找最近邻 → 组成 state 向量
 ```
 
@@ -246,10 +277,24 @@ host_time = slope × mcu_ts + intercept
 | 级别 | 精度 | 状态 | 机制 |
 |------|------|------|------|
 | **L0** 相机间硬同步 | <1μs | ✅ | PWM slave mode，11 路帧锁定同一边沿 |
-| **L1** 软同步元数据 | — | ✅ | meta.json 记录 t0_wall_s / spawn_offset / sync_reference |
+| **L1** 软同步元数据 | — | ✅ | meta.json `sync_reference` 记录 t0_wall_s / split_now_wall_s / camera_first_wall_s（逐路，跨相机锚点）/ camera_first_pts_s（per-stream，不可跨相机比较） |
 | **L3a** 高频独立采样 | ±3~13ms | ✅ | 500Hz poll + MCU 时间戳去重 + 逐传感器最近邻 |
-| **L3b** 增强对齐 | ±0.5~1ms | ✅ | MKV PTS 提取 + MCU↔Host 时钟线性回归 |
+| **L3b** 增强对齐 | ±1~3ms（实测） | ✅ | 首帧 host wall-time 偏移（pts_offset）+ MCU↔Host 时钟线性回归 |
 | **L4** 硬件级全同步 | <1μs | 🔲 | BOX MCU 也由 PWM 触发（需硬件改动） |
+
+### 7.1 代码位置 & 测试映射
+
+| 机制 | 代码 | 测试（无需真机） |
+|------|------|----------------|
+| 500Hz poll + MCU 去重 | `box_sdk/box_client.py` `_poll_loop`（`record_poll_interval_s=0.002`；录制外 `poll_interval_s=0.05`=20Hz） | `tests/scripts/test_thor_box_client.py`（`_FakeBox` 内存 stub） |
+| pts_offset（首帧 wall-time） | `gmsl2/thor_record.py` `_pts_offset_from_handle`；worker 侧 `persistent_session_worker.py` `first_wall_s` | （需 worker 事件，部分覆盖于 multiprocess 测试） |
+| 帧网格 + 最近邻对齐 | `gmsl2/thor_lerobot_v3.py` `_build_episode_rows` / `_nearest_sample_data` | `tests/scripts/test_thor_ts_sync_alignment.py` |
+| MCU 时钟校准 + 回退 | `gmsl2/thor_lerobot_v3.py` `calibrate_mcu_clock` / `calibrate_sensor_samples` | `tests/scripts/test_thor_ts_sync_alignment.py` |
+| ffprobe/GStreamer PTS（**离线数帧**） | `gmsl2/thor_lerobot_v3.py` `extract_pts`；`gmsl2/export_v3.py` | `tests/scripts/test_thor_lerobot_v3_pts.py` |
+
+> 这些测试只覆盖纯 Python 对齐逻辑与数据契约。真机才能确认的内容（MCU 时钟是否线性/单调、
+> `mcu_timestamp` 真实语义与单位、各传感器真实频率与 poll 抖动、BOX↔相机端到端实测精度）
+> 仍需 BOX 到位后验证，见 §8.2 / §8.5。
 
 ## 8. 注意事项
 
@@ -265,7 +310,13 @@ host_time = slope × mcu_ts + intercept
 
 ### 8.3 ffprobe 依赖
 
-PTS 提取依赖 Jetson 上安装 `ffprobe`（FFmpeg 套件）。若不可用，回退到 `pts_offset = 0`（即 L3a 精度）。录制器会在日志中输出警告。
+**录制对齐路径不依赖 ffprobe。** `pts_offset` 来自 worker 上报的 `first_wall_s`（见
+§5.1），与 FFmpeg 无关。若某路相机未上报有效 `first_wall_s`，`_pts_offset_from_handle`
+返回 `None`，writer 用 `frame_origin_s = 0`（即退回 L3a 精度，仅丢失管道启动延迟修正）。
+
+ffprobe 仅在**离线** `export_v3.py` 数帧时用到（`extract_pts`，反映容器内 PTS）：
+Jetson 镜像不一定带 ffprobe，所以 `extract_pts` 在 ffprobe 缺失时自动回退到
+`_extract_pts_gstreamer`（用 GStreamer `matroskademux` 读 PTS）。二者都不可用才告警。
 
 ### 8.4 训练数据 vs 原始数据
 
@@ -277,3 +328,49 @@ LeRobot v3 parquet 中的 `observation.state` 是 **60Hz 下采样** 后的对�
 - 确保 NTP 同步（`timedatectl status` 检查）
 - 避免在录制期间手动修改系统时间
 - `time.monotonic()` 用于持续时间测量不受 NTP 步进影响，但跨进程对齐仍需 wall-clock
+
+## 9. v3 数据集 schema（2026-06-15 重构）
+
+录制器（`thor_lerobot_v3.py`）写的是 **box-only 的最小 v3** parquet（数值特征 + 时间戳元数据），
+相机以 `cam_*.mkv` 原始文件并排存在每个 episode 目录里；离线 `export_v3.py` 再把相机转码并
+合并出带 `observation.images.*` 的训练数据集。两侧共享同一 `t0_wall_s`（见 §5.1）。
+
+### 9.1 `observation.state` / `action`（float32，**33** 维）
+
+只放可训练的传感器读数，**不含任何时间戳**。通道分组（`BOX_STATE_NAMES`）：
+
+| 组 | 通道 | 数量 |
+|----|------|------|
+| gripper | `box_gripper.distance_m` | 1 |
+| trigger | `box_trigger.travel_pct` | 1 |
+| IMU | `acc_{x,y,z}_g` / `gyr_{x,y,z}_deg_s` / `roll,pitch,yaw_deg` / `quat_{w,x,y,z}` | 13 |
+| 六维力 | `box_six_d_force.{fx,fy,fz,mx,my,mz}` | 6 |
+| 触觉 L/R | 各 `mean_f{x,y,z}_0p1N` / `max_abs_fz_0p1N` / `active_points`（239 点聚合） | 5+5 |
+| 状态 | `box_status.{valid,liwp_index}` | 2 |
+
+> 早期版本把 `gripper.pos`（与 `box_gripper.distance_m` 重复）和 7 个 `*.timestamp` 也塞在
+> state 里（共 42 维）。重构去掉重复 gripper、并把时间戳移出（见 §9.2），降为 33 维——避免把
+> 单调递增的原始计数当成可训练特征（归一化被带歪 + 时间泄漏）。
+
+### 9.2 `box.timestamps` 元数据列（float64，**8** 维，非训练）
+
+每帧对齐用的原始时间戳单独成列（`BOX_TIMESTAMP_NAMES`）：6 个传感器 `*.timestamp` +
+`box_status.liwp_timestamp` + `box_status.received_wall_time_s`。
+
+- **float64**：MCU 计数实测达 2–4e9（µs），超 float32 的 2²⁴ 整数精度；float64 在磁盘 parquet 上无损。
+- **caveat**：`LeRobotDataset` 把数值特征统一出成 `torch.float32`，经 loader 读会再被量化
+  （2e9 处 ULP≈256µs）。需精确 mcu_ts 时**直接读 parquet**；训练不受影响（它只是对齐元数据）。
+- CSV：SDK `.so` 另会向 CWD 写 `box_sensor_data_*.csv`，`BoxClient.stop()` 会清理本会话的
+  （见 `box_sdk/TROUBLESHOOTING.md` §7，待 SDK 加关闭开关）。
+
+### 9.3 真机验证状态（2026-06-15）
+
+| 项 | 结果 |
+|----|------|
+| 6 路传感器频率 | gripper/imu/trigger/六维力 199Hz，touch L/R 各 50Hz |
+| MCU 校准（L3b） | slope=1µs/tick，6 路全 engage，残差 1–2ms |
+| 夹爪/扳机运动 | episode 实测 distance 0.0007–0.098m、trigger 0→100% 正确进 `state[0/1]` |
+| 触觉接触 | `active_points` 1–52、`max_abs_fz` 饱和 255、239 点原始帧完整 |
+| 多模态采集 | 9 路相机（argus_failed=[]）+ 夹爪 + 双触觉同步采集；相机 first_wall_s 展布 ~10ms，pts_offset≈11ms |
+| LeRobotDataset 加载 | ✅ 可加载（box.timestamps 经 loader 降为 float32，见 §9.2） |
+| 待验 | 跨域 tap-test（§7.1）、相机视频经 `export_v3` 合并后的端到端 |
