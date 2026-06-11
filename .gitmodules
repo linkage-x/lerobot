@@ -2,3 +2,6 @@
 	path = third_party/opencv_kalibr
 	url = git@github.com:linkage-x/opencv_kalibr.git
 	branch = deploy
+[submodule "third_party/panda-py"]
+	path = third_party/panda-py
+	url = git@github.com:linkage-x/panda-py.git

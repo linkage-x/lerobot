@@ -134,11 +134,15 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.user
       args:
-        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-docker.m.daocloud.io/library/python:3.12-slim}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-https://mirrors.aliyun.com}
+        DEBIAN_SECURITY_MIRROR: ${DEBIAN_SECURITY_MIRROR:-https://mirrors.aliyun.com}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
-        PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-https://pypi.org/simple/}
-        PIP_FALLBACK_INDEX_URL: ${PIP_FALLBACK_INDEX_URL:-https://pypi.org/simple/}
+        PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-}
+        PIP_FALLBACK_INDEX_URL: ${PIP_FALLBACK_INDEX_URL:-}
+        LIBFRANKA_REPO: ${LIBFRANKA_REPO:-https://gh-proxy.com/https://github.com/frankarobotics/libfranka.git}
         UNBOUND_DEPS: ${UNBOUND_DEPS:-false}
+        INSTALL_GEN_CON_SDK: ${INSTALL_GEN_CON_SDK:-false}
         INSTALL_HIKROBOT_SDK: ${INSTALL_HIKROBOT_SDK:-false}
 
   lerobot-internal:

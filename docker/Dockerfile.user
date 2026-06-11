@@ -19,8 +19,8 @@
 # docker run -it --rm lerobot-user
 
 # Configure the base image
-ARG PYTHON_VERSION=3.12
-FROM python:${PYTHON_VERSION}-slim
+ARG PYTHON_IMAGE=python:3.12-slim
+FROM ${PYTHON_IMAGE}
 
 ARG DEBIAN_MIRROR=https://mirrors.ustc.edu.cn
 ARG DEBIAN_SECURITY_MIRROR=https://mirrors.ustc.edu.cn
@@ -110,6 +110,7 @@ RUN resolved_extra="${PIP_EXTRA_INDEX_URL}"; \
 USER root
 
 ARG LIBFRANKA_REF=0.15.0
+ARG LIBFRANKA_REPO=https://github.com/frankarobotics/libfranka.git
 
 RUN export CMEEL_PREFIX="$(find /lerobot/.venv/lib -path '*/site-packages/cmeel.prefix' -type d | head -n 1)" \
     && test -n "${CMEEL_PREFIX}" \
@@ -117,7 +118,7 @@ RUN export CMEEL_PREFIX="$(find /lerobot/.venv/lib -path '*/site-packages/cmeel.
     && find "${CMEEL_PREFIX}" -path '*/pinocchioConfig.cmake' -print -quit | grep -q . \
     && printf "%s\n%s\n" "${CMEEL_PREFIX}/lib" "/usr/local/lib" > /etc/ld.so.conf.d/lerobot-cmeel.conf \
     && ldconfig \
-    && git clone --recursive --depth 1 --branch "${LIBFRANKA_REF}" https://github.com/frankarobotics/libfranka.git /tmp/libfranka
+    && git clone --recursive --depth 1 --branch "${LIBFRANKA_REF}" "${LIBFRANKA_REPO}" /tmp/libfranka
 
 RUN export CMEEL_PREFIX="$(find /lerobot/.venv/lib -path '*/site-packages/cmeel.prefix' -type d | head -n 1)" \
     && test -n "${CMEEL_PREFIX}" \
@@ -143,12 +144,17 @@ RUN cd /tmp/libfranka \
 
 USER user_lerobot
 
+COPY --chown=user_lerobot:user_lerobot third_party/ third_party/
+
 ARG PANDA_PY_REF=main
 ARG PANDA_PY_REPO=https://github.com/linkage-x/panda-py.git
+ARG PANDA_PY_SRC=/lerobot/third_party/panda-py
 ARG PIKA_SDK_REF=master
 ARG PIKA_SDK_REPO=https://github.com/linkage-x/pika_sdk.git
+ARG PIKA_SDK_SRC=/lerobot/third_party/pika_sdk
 ARG GEN_CON_SDK_REF=master
 ARG GEN_CON_SDK_REPO=https://github.com/genrobot-ai/gen_con_sdk_python_release.git
+ARG INSTALL_GEN_CON_SDK=false
 ENV GEN_CON_SDK_HOME=/opt/dependencies/gen_con_sdk_python_release
 
 RUN resolved_extra="${PIP_EXTRA_INDEX_URL}"; \
@@ -163,20 +169,35 @@ RUN resolved_extra="${PIP_EXTRA_INDEX_URL}"; \
     && install_with_indexes --no-cache easyhid pyspacemouse "ruckig>=0.15,<0.16" --no-deps \
     && export CMEEL_PREFIX="$(find /lerobot/.venv/lib -path '*/site-packages/cmeel.prefix' -type d | head -n 1)" \
     && test -n "${CMEEL_PREFIX}" \
-    && git clone --depth 1 --branch "${PANDA_PY_REF}" "${PANDA_PY_REPO}" /tmp/panda-py \
-    && git clone --depth 1 --branch "${PIKA_SDK_REF}" "${PIKA_SDK_REPO}" /tmp/pika_sdk \
-    && git clone --depth 1 --branch "${GEN_CON_SDK_REF}" "${GEN_CON_SDK_REPO}" "${GEN_CON_SDK_HOME}" \
+    && if [ -d "${PANDA_PY_SRC}" ] && [ -n "$(find "${PANDA_PY_SRC}" -mindepth 1 -maxdepth 1 -print -quit)" ]; then \
+         cp -a "${PANDA_PY_SRC}" /tmp/panda-py; \
+       else \
+         git clone --depth 1 --branch "${PANDA_PY_REF}" "${PANDA_PY_REPO}" /tmp/panda-py; \
+       fi \
+    && if [ -f /tmp/panda-py/pyproject.toml ]; then \
+         sed -i 's|"pybind11@git+https://github.com/pybind/pybind11.git@master"|"pybind11>=2.13"|g' /tmp/panda-py/pyproject.toml; \
+       fi \
+    && if [ -d "${PIKA_SDK_SRC}" ] && [ -n "$(find "${PIKA_SDK_SRC}" -mindepth 1 -maxdepth 1 -print -quit)" ]; then \
+         cp -a "${PIKA_SDK_SRC}" /tmp/pika_sdk; \
+       else \
+         git clone --depth 1 --branch "${PIKA_SDK_REF}" "${PIKA_SDK_REPO}" /tmp/pika_sdk; \
+       fi \
     && CMAKE_PREFIX_PATH="${CMEEL_PREFIX};/usr/local" \
        LD_LIBRARY_PATH="${CMEEL_PREFIX}/lib:/usr/local/lib" \
        install_with_indexes --python /lerobot/.venv/bin/python --no-cache /tmp/panda-py \
     && install_with_indexes --python /lerobot/.venv/bin/python --no-cache --no-deps /tmp/pika_sdk \
-    && install_with_indexes --python /lerobot/.venv/bin/python --no-cache -r "${GEN_CON_SDK_HOME}/requirements.txt" \
+    && if [ "${INSTALL_GEN_CON_SDK}" = "true" ]; then \
+         git clone --depth 1 --branch "${GEN_CON_SDK_REF}" "${GEN_CON_SDK_REPO}" "${GEN_CON_SDK_HOME}"; \
+         install_with_indexes --python /lerobot/.venv/bin/python --no-cache -r "${GEN_CON_SDK_HOME}/requirements.txt"; \
+       fi \
     && rm -rf /tmp/panda-py \
     && rm -rf /tmp/pika_sdk \
     && python -c "import placo; print('placo_ok')" \
     && LD_LIBRARY_PATH="${CMEEL_PREFIX}/lib:/usr/local/lib" python -c "import panda_py; print('panda_py_ok')" \
     && python -c "from pika.gripper import Gripper; print('pika_gripper_ok')" \
-    && PYTHONPATH="$(dirname "${GEN_CON_SDK_HOME}")" python -c "from gen_con_sdk_python_release import DataBus; print('gen_con_sdk_ok')" \
+    && if [ "${INSTALL_GEN_CON_SDK}" = "true" ]; then \
+         PYTHONPATH="$(dirname "${GEN_CON_SDK_HOME}")" python -c "from gen_con_sdk_python_release import DataBus; print('gen_con_sdk_ok')"; \
+       fi \
     && python -c "import ruckig; print('ruckig_ok')" \
     && python -c "import pyspacemouse; print('pyspacemouse_ok')" \
     && python -c "import vuer; print('vuer_ok')"
