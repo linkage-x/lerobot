@@ -95,3 +95,10 @@ class PeftConfig:
     # the rank used for the adapter. In general a higher rank means more trainable parameters and closer to full
     # fine-tuning.
     r: int = 16
+
+    # LoRA scaling. If left unset, PEFT uses its own default, which can be much smaller than the rank.
+    # OpenPI sets alpha equal to rank for its built-in LoRA variants.
+    lora_alpha: int | None = None
+
+    # LoRA dropout. OpenPI's built-in LoRA variants use no dropout.
+    lora_dropout: float | None = None

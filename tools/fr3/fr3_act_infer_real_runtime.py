@@ -14,6 +14,8 @@ Execution model:
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
+from copy import copy
 import json
 from pathlib import Path
 import time
@@ -43,6 +45,7 @@ from lerobot.robots.franka_research3.processor_franka_research3 import (
     _continuous_quaternion,
 )
 from lerobot.utils.control_utils import predict_action
+from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.utils.rotation import Rotation
 from lerobot.utils.robot_utils import precise_sleep
 
@@ -53,6 +56,7 @@ _DEFAULT_ROBOT_IP = '192.168.1.208'
 _DEFAULT_GRIPPER_PORT = '/dev/ttyUSB0'
 _DEFAULT_GRIPPER_BACKEND = 'das'
 _DAS_URDF = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_das_ati.urdf'
+_PIKA_URDF = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.urdf'
 _DEFAULT_TACTILE_VALID_MASK_PATH = _REPO_ROOT / 'docs/tactile/tactile_valid_mask_50x10.json'
 _DEFAULT_TACTILE_BASELINE_PATH = _REPO_ROOT / 'docs/tactile/idle_baseline.json'
 _DEFAULT_STATE_NAMES = ['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw', 'gripper']
@@ -168,9 +172,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action='store_true',
         help='Run policy and print safe targets without sending robot actions.',
     )
+    parser.add_argument('--preflight', dest='preflight', action='store_true', default=True)
+    parser.add_argument('--no-preflight', dest='preflight', action='store_false')
+    parser.add_argument('--preflight-max-actions', type=int, default=None)
+    parser.add_argument('--preflight-max-step-pos-delta-mm', type=float, default=None)
+    parser.add_argument('--preflight-max-step-rot-delta-deg', type=float, default=None)
+    parser.add_argument('--preflight-max-step-gripper-delta', type=float, default=None)
     parser.add_argument('--robot-ip', default=_DEFAULT_ROBOT_IP)
     parser.add_argument('--gripper-port', default=_DEFAULT_GRIPPER_PORT)
     parser.add_argument('--gripper-backend', choices=['pika', 'das'], default=_DEFAULT_GRIPPER_BACKEND)
+    parser.add_argument('--urdf-path', type=Path, default=None, help='Optional FR3 tool URDF override.')
+    parser.add_argument('--target-frame-name', default=None, help='Optional target EE frame override.')
+    parser.add_argument(
+        '--dataset-frame',
+        choices=['tool_base', 'target_ee'],
+        default='target_ee',
+        help='Frame used by dataset observation/action EE pose.',
+    )
     parser.add_argument('--device', default=None, help='Optional torch device override.')
     parser.add_argument('--log-interval', type=int, default=30, help='Step interval for runtime logging.')
     parser.add_argument(
@@ -477,30 +495,30 @@ def build_tactile_fallback_observation(fallback_mode: str | None) -> dict[str, n
     }
 
 
-def normalize_dataset_gripper(aperture_m: float, cfg: FrankaResearch3Config) -> float:
-    aperture_m = float(max(0.0, aperture_m))
+def normalize_dataset_gripper(dataset_gripper: float, cfg: FrankaResearch3Config) -> float:
+    """Convert a dataset gripper value into the robot command's normalized width.
+
+    Pika datasets in this repo store gripper values as normalized width already.
+    DAS datasets store aperture in meters and need conversion through the DAS range.
+    """
+    dataset_gripper = float(max(0.0, dataset_gripper))
     if cfg.gripper_backend == 'das':
         span_m = float(cfg.das_max_distance_m - cfg.das_min_distance_m)
         if span_m <= 0.0:
             return 0.0
-        return float(np.clip((aperture_m - cfg.das_min_distance_m) / span_m, 0.0, 1.0))
-    max_width_m = float(cfg.gripper_max_width_mm) / 1000.0
-    if max_width_m <= 0.0:
-        return 0.0
-    return float(np.clip(aperture_m / max_width_m, 0.0, 1.0))
+        return float(np.clip((dataset_gripper - cfg.das_min_distance_m) / span_m, 0.0, 1.0))
+    return float(np.clip(dataset_gripper, 0.0, 1.0))
 
 
 def denormalize_live_gripper_observation(gripper_pos: float, cfg: FrankaResearch3Config) -> float:
+    """Convert live normalized robot gripper observation into dataset units."""
     gripper_pos = float(np.clip(gripper_pos, 0.0, 1.0))
     if cfg.gripper_backend == 'das':
         span_m = float(cfg.das_max_distance_m - cfg.das_min_distance_m)
         if span_m <= 0.0:
             return 0.0
         return float(cfg.das_min_distance_m + gripper_pos * span_m)
-    max_width_m = float(cfg.gripper_max_width_mm) / 1000.0
-    if max_width_m <= 0.0:
-        return 0.0
-    return float(gripper_pos * max_width_m)
+    return gripper_pos
 
 
 def convert_gripper_observation_to_dataset_units(
@@ -540,6 +558,129 @@ def _action_value(action_map: dict[str, float], *keys: str) -> float:
             return float(action_map[key])
     raise KeyError(f'Missing action keys {keys!r} in decoded policy action.')
 
+
+
+def predict_action_chunk_for_preflight(
+    observation: dict[str, np.ndarray],
+    *,
+    policy: Any,
+    device: torch.device,
+    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    use_amp: bool,
+    task: str | None = None,
+    robot_type: str | None = None,
+) -> torch.Tensor:
+    observation = copy(observation)
+    with (
+        torch.inference_mode(),
+        torch.autocast(device_type=device.type) if device.type == 'cuda' and use_amp else nullcontext(),
+    ):
+        observation = prepare_observation_for_inference(observation, device, task, robot_type)
+        observation = preprocessor(observation)
+        if hasattr(policy, 'predict_action_chunk'):
+            actions = policy.predict_action_chunk(observation)
+        else:
+            actions = policy.select_action(observation).unsqueeze(1)
+        actions = postprocessor(actions)
+    return actions
+
+
+def run_action_chunk_preflight(
+    policy_observation: dict[str, np.ndarray],
+    *,
+    policy: Any,
+    device: torch.device,
+    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    use_amp: bool,
+    robot_type: str,
+    task: str | None,
+    action_names: list[str],
+    robot_cfg: FrankaResearch3Config,
+    robot_observation: RobotObservation,
+    T_B_Ws: np.ndarray,
+    dataset_frame: str,
+    max_actions: int | None,
+    first_frame_max_pos_delta_m: float,
+    first_frame_max_rot_delta_rad: float,
+    max_step_pos_delta_m: float,
+    max_step_rot_delta_rad: float,
+    max_step_gripper_delta: float,
+) -> None:
+    chunk = predict_action_chunk_for_preflight(
+        policy_observation,
+        policy=policy,
+        device=device,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        use_amp=use_amp,
+        robot_type=robot_type,
+        task=task,
+    )
+    action_count = int(chunk.shape[1]) if chunk.ndim >= 3 else 1
+    check_count = min(action_count, int(max_actions or action_count))
+    commands: list[dict[str, float]] = []
+    for action_idx in range(check_count):
+        action_tensor = chunk[:, action_idx, :] if chunk.ndim >= 3 else chunk
+        dataset_command = decode_action_to_robot_command(action_tensor, action_names=action_names, robot_cfg=robot_cfg)
+        base_command = convert_dataset_command_to_base_frame(dataset_command, T_B_Ws)
+        robot_command = (
+            convert_base_command_from_I_to_E(base_command)
+            if dataset_frame == 'tool_base'
+            else base_command
+        )
+        commands.append(robot_command)
+
+    first_position_delta = np.asarray(
+        [commands[0][key] - robot_observation[key] for key in ('ee.x', 'ee.y', 'ee.z')], dtype=np.float64
+    )
+    _, current_rotation = _extract_observation_pose(robot_observation)
+    _, first_rotation = _extract_command_pose(commands[0])
+    first_rotation_delta = (current_rotation.inv() * first_rotation).as_rotvec()
+    if np.any(np.abs(first_position_delta) > first_frame_max_pos_delta_m) or np.any(
+        np.abs(first_rotation_delta) > first_frame_max_rot_delta_rad
+    ):
+        raise RuntimeError(
+            'Preflight failed: first action is discontinuous relative to current target; '
+            f'pos_delta_mm=({_format_vector(first_position_delta, scale=1000.0)}) '
+            f'rot_delta_deg=({_format_vector(np.rad2deg(first_rotation_delta))})'
+        )
+
+    max_pos_delta = np.zeros(3, dtype=np.float64)
+    max_rot_delta = np.zeros(3, dtype=np.float64)
+    max_gripper_delta = 0.0
+    previous = commands[0]
+    z_values = [float(previous['ee.z'])]
+    for idx_cmd, command in enumerate(commands[1:], start=1):
+        pos_delta = np.asarray([command[key] - previous[key] for key in ('ee.x', 'ee.y', 'ee.z')], dtype=np.float64)
+        _, previous_rotation = _extract_command_pose(previous)
+        _, command_rotation = _extract_command_pose(command)
+        rot_delta = (previous_rotation.inv() * command_rotation).as_rotvec()
+        gripper_delta = float(command['gripper.pos'] - previous['gripper.pos'])
+        max_pos_delta = np.maximum(max_pos_delta, np.abs(pos_delta))
+        max_rot_delta = np.maximum(max_rot_delta, np.abs(rot_delta))
+        max_gripper_delta = max(max_gripper_delta, abs(gripper_delta))
+        z_values.append(float(command['ee.z']))
+        if np.any(np.abs(pos_delta) > max_step_pos_delta_m) or np.any(np.abs(rot_delta) > max_step_rot_delta_rad) or abs(gripper_delta) > max_step_gripper_delta:
+            raise RuntimeError(
+                f'Preflight failed: action[{idx_cmd}] is discontinuous relative to previous target; '
+                f'pos_delta_mm=({_format_vector(pos_delta, scale=1000.0)}) '
+                f'rot_delta_deg=({_format_vector(np.rad2deg(rot_delta))}) '
+                f'gripper_delta={gripper_delta:+.3f}'
+            )
+        previous = command
+    z_arr = np.asarray(z_values, dtype=np.float64)
+    print(
+        '[PREFLIGHT] action_chunk=pass '
+        f'checked_actions={check_count}/{action_count} '
+        f'first_pos_delta_mm=({_format_vector(first_position_delta, scale=1000.0)}) '
+        f'first_rot_delta_deg=({_format_vector(np.rad2deg(first_rotation_delta))}) '
+        f'max_step_pos_delta_mm=({_format_vector(max_pos_delta, scale=1000.0)}) '
+        f'max_step_rot_delta_deg=({_format_vector(np.rad2deg(max_rot_delta))}) '
+        f'max_step_gripper_delta={max_gripper_delta:.3f} '
+        f'z_min/max/net_mm={float(z_arr.min() * 1000.0):.1f}/{float(z_arr.max() * 1000.0):.1f}/{float((z_arr[-1] - z_arr[0]) * 1000.0):+.1f}'
+    )
 
 def build_policy_observation(
     state_observation: RobotObservation,
@@ -1332,13 +1473,17 @@ def run_inference(args: argparse.Namespace) -> int:
 
     tactile_fallback_observation = build_tactile_fallback_observation(args.tactile_fallback)
     tactile_enabled = bool(required_tactile_keys) and tactile_fallback_observation is None
+    default_urdf_path = _DAS_URDF if args.gripper_backend == 'das' else _PIKA_URDF
+    default_target_frame_name = 'das_gripper_ee' if args.gripper_backend == 'das' else 'pika_gripper_ee'
+    urdf_path = _resolve_repo_path(args.urdf_path) if args.urdf_path is not None else default_urdf_path
+    target_frame_name = args.target_frame_name or default_target_frame_name
     robot_cfg = FrankaResearch3Config(
         robot_ip=args.robot_ip,
         gripper_port=args.gripper_port,
         gripper_backend=args.gripper_backend,
         allow_mock_gripper=False,
-        urdf_path=str(_DAS_URDF),
-        target_frame_name='das_gripper_ee',
+        urdf_path=str(urdf_path),
+        target_frame_name=target_frame_name,
         workspace_min=(0.1, -0.6, 0.05),
         workspace_max=(0.9, 0.6, 0.8),
         das_tactile_frequency_hz=policy_fps if tactile_enabled else None,
@@ -1348,7 +1493,9 @@ def run_inference(args: argparse.Namespace) -> int:
         cameras={name: cfg for name, cfg in camera_configs.items()},
     )
 
-    move_to_das_start_if_requested(robot_ip=args.robot_ip, enabled=bool(args.move_to_das_start))
+    if args.move_to_das_start and args.gripper_backend != 'das':
+        print('[INFO] move_to_das_start skipped because gripper_backend is not das.')
+    move_to_das_start_if_requested(robot_ip=args.robot_ip, enabled=bool(args.move_to_das_start and args.gripper_backend == 'das'))
 
     from lerobot.robots.franka_research3 import FrankaResearch3
 
@@ -1376,6 +1523,7 @@ def run_inference(args: argparse.Namespace) -> int:
     print('[INFO] policy_image_keys=' + ', '.join(required_image_keys) if required_image_keys else '[INFO] policy_image_keys=<none>')
     print('[INFO] policy_tactile_keys=' + ', '.join(required_tactile_keys) if required_tactile_keys else '[INFO] policy_tactile_keys=<none>')
     print('[INFO] tactile_fallback=' + args.tactile_fallback if args.tactile_fallback is not None else '[INFO] tactile_fallback=<none>')
+    print(f'[INFO] gripper_backend={args.gripper_backend} target_frame={target_frame_name} urdf_path={urdf_path}')
     print(
         '[INFO] dataset_start_contract='
         f"episodes={dataset_start_pose_stats['episodes']} "
@@ -1397,7 +1545,14 @@ def run_inference(args: argparse.Namespace) -> int:
             f"{dataset_start_pose_stats['gripper_std']:.3f}"
         )
     print(dataset_start_spread_line)
-    print('[INFO] state_frame=absolute_pose(gripper_base_link) in dataset_world(W_s)')
+    print(
+        '[INFO] state_frame='
+        + (
+            'absolute_pose(gripper_base_link) in dataset_world(W_s)'
+            if args.dataset_frame == 'tool_base'
+            else 'absolute_pose(target_ee) in dataset_world(W_s)'
+        )
+    )
     print(
         '[INFO] safety='
         f'first_frame<{args.first_frame_max_pos_delta_mm:.1f}mm/{args.first_frame_max_rot_delta_deg:.1f}deg, '
@@ -1432,7 +1587,11 @@ def run_inference(args: argparse.Namespace) -> int:
             loop_start_t = time.perf_counter()
             robot_observation = robot.get_observation()
             absolute_state_observation_e = state_processor.observation(dict(robot_observation))
-            absolute_state_observation_i = convert_absolute_observation_from_E_to_I(absolute_state_observation_e)
+            absolute_state_observation_i = (
+                convert_absolute_observation_from_E_to_I(absolute_state_observation_e)
+                if args.dataset_frame == 'tool_base'
+                else dict(absolute_state_observation_e)
+            )
             live_gripper_dataset_units = denormalize_live_gripper_observation(
                 float(robot_observation['gripper.pos']),
                 robot_cfg,
@@ -1522,6 +1681,28 @@ def run_inference(args: argparse.Namespace) -> int:
                 tactile_fallback_observation=tactile_fallback_observation,
                 camera_configs=camera_configs,
             )
+            if step_idx == 0 and args.preflight:
+                run_action_chunk_preflight(
+                    policy_observation,
+                    policy=policy,
+                    device=device,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    use_amp=bool(policy.config.use_amp),
+                    robot_type=robot.name,
+                    task=getattr(train_cfg, 'task', None),
+                    action_names=action_names,
+                    robot_cfg=robot_cfg,
+                    robot_observation=robot_observation,
+                    T_B_Ws=T_B_Ws,
+                    dataset_frame=args.dataset_frame,
+                    max_actions=args.preflight_max_actions,
+                    first_frame_max_pos_delta_m=first_frame_max_pos_delta_m,
+                    first_frame_max_rot_delta_rad=first_frame_max_rot_delta_rad,
+                    max_step_pos_delta_m=float(args.preflight_max_step_pos_delta_mm or args.max_step_pos_delta_mm) / 1000.0,
+                    max_step_rot_delta_rad=np.deg2rad(float(args.preflight_max_step_rot_delta_deg or args.max_step_rot_delta_deg)),
+                    max_step_gripper_delta=float(args.preflight_max_step_gripper_delta or 0.05),
+                )
             if step_idx == 0 and args.debug_step0_dump_dir is not None:
                 if start_alignment_stats is None:
                     raise RuntimeError('start_alignment_stats must be initialized before step0 capture dump.')
@@ -1556,7 +1737,11 @@ def run_inference(args: argparse.Namespace) -> int:
                 robot_cfg=robot_cfg,
             )
             base_robot_command_i = convert_dataset_command_to_base_frame(dataset_robot_command_i, T_B_Ws)
-            robot_command = convert_base_command_from_I_to_E(base_robot_command_i)
+            robot_command = (
+                convert_base_command_from_I_to_E(base_robot_command_i)
+                if args.dataset_frame == 'tool_base'
+                else base_robot_command_i
+            )
             safe_command, position_delta, rotation_delta, clamped = clamp_command_relative_to_current(
                 robot_command,
                 robot_observation,

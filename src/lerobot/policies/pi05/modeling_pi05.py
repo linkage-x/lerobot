@@ -1096,10 +1096,13 @@ class PI05Policy(PreTrainedPolicy):
                 logging.warning(f"Skipping state_proj key in pi05 mode: {key}")
                 continue
 
-            # Handle vision tower embedding layer potential differences
-            if "patch_embedding" in key:
-                # Some checkpoints might have this, but current model expects different structure
-                logging.warning(f"Vision embedding key might need handling: {key}")
+            # Older pi05 checkpoints may include an extra ``vision_model``
+            # wrapper under the SigLIP vision tower. The current Transformers
+            # module exposes those layers directly under ``vision_tower``.
+            if ".vision_tower.vision_model." in new_key:
+                new_key = new_key.replace(".vision_tower.vision_model.", ".vision_tower.")
+            elif new_key.endswith(".vision_tower.vision_model"):
+                new_key = new_key[: -len(".vision_model")]
 
             if (
                 key == "model.paligemma_with_expert.paligemma.lm_head.weight"
@@ -1283,12 +1286,25 @@ class PI05Policy(PreTrainedPolicy):
             return loss, loss_dict
 
     def _get_default_peft_targets(self) -> dict[str, any]:
-        """Return default PEFT target modules for PI0.5 fine-tuning."""
-        common_projections = (
-            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
+        """Return OpenPI-style PEFT targets for PI0.5 fine-tuning.
+
+        OpenPI's LoRA variants adapt both the PaliGemma language model and the
+        action expert attention/FFN blocks. Its freeze filter still leaves the
+        non-LLM action/time projection layers trainable, so we save those modules
+        fully instead of wrapping them with LoRA.
+        """
+        transformer_linear = r"(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"
+        target_modules = (
+            rf".*\.paligemma_with_expert\."
+            rf"(paligemma\.model\.language_model|gemma_expert\.model)"
+            rf"\.layers\.\d+\.{transformer_linear}"
         )
-        target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
         return {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            "modules_to_save": [
+                "action_in_proj",
+                "action_out_proj",
+                "time_mlp_in",
+                "time_mlp_out",
+            ],
         }
