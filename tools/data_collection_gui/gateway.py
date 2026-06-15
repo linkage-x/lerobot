@@ -2931,13 +2931,13 @@ def _extract_ee_axes(names: list[str], values: list[float]) -> dict[str, float] 
         "qx": None, "qy": None, "qz": None, "qw": None,
     }
     suffixes = {
-        "x": ("ee.x", ".x", "_x"),
-        "y": ("ee.y", ".y", "_y"),
-        "z": ("ee.z", ".z", "_z"),
-        "qx": ("ee.qx", ".qx", "_qx", "quat.x"),
-        "qy": ("ee.qy", ".qy", "_qy", "quat.y"),
-        "qz": ("ee.qz", ".qz", "_qz", "quat.z"),
-        "qw": ("ee.qw", ".qw", "_qw", "quat.w"),
+        "x": ("ee.x", ".x", "_x_m"),
+        "y": ("ee.y", ".y", "_y_m"),
+        "z": ("ee.z", ".z", "_z_m"),
+        "qx": ("ee.qx", ".qx", "_qx", "quat.x", "quat_x"),
+        "qy": ("ee.qy", ".qy", "_qy", "quat.y", "quat_y"),
+        "qz": ("ee.qz", ".qz", "_qz", "quat.z", "quat_z"),
+        "qw": ("ee.qw", ".qw", "_qw", "quat.w", "quat_w"),
     }
     for index, name in enumerate(lowered):
         if index >= len(values):
