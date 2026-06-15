@@ -31,11 +31,8 @@ _TOUCH_SUMMARY_NAMES = (
 
 
 BOX_STATE_NAMES: tuple[str, ...] = (
-    "gripper.pos",
     "box_gripper.distance_m",
-    "box_gripper.timestamp",
     "box_trigger.travel_pct",
-    "box_trigger.timestamp",
     "box_imu.acc_x_g",
     "box_imu.acc_y_g",
     "box_imu.acc_z_g",
@@ -49,20 +46,30 @@ BOX_STATE_NAMES: tuple[str, ...] = (
     "box_imu.quat_x",
     "box_imu.quat_y",
     "box_imu.quat_z",
-    "box_imu.timestamp",
     "box_six_d_force.fx",
     "box_six_d_force.fy",
     "box_six_d_force.fz",
     "box_six_d_force.mx",
     "box_six_d_force.my",
     "box_six_d_force.mz",
-    "box_six_d_force.timestamp",
     *tuple(f"box_touch_left.{name}" for name in _TOUCH_SUMMARY_NAMES),
-    "box_touch_left.timestamp",
     *tuple(f"box_touch_right.{name}" for name in _TOUCH_SUMMARY_NAMES),
-    "box_touch_right.timestamp",
     "box_status.valid",
     "box_status.liwp_index",
+)
+
+# Per-frame timestamp metadata, emitted as a SEPARATE non-observation parquet
+# column ``box.timestamps`` (float64 to preserve the µs-resolution MCU counters
+# that overflow float32's 2**24 exact-integer range). These are diagnostic
+# alignment values, NOT trainable observations, so they are deliberately kept
+# out of ``observation.state`` / ``action``.
+BOX_TIMESTAMP_NAMES: tuple[str, ...] = (
+    "box_gripper.timestamp",
+    "box_trigger.timestamp",
+    "box_imu.timestamp",
+    "box_six_d_force.timestamp",
+    "box_touch_left.timestamp",
+    "box_touch_right.timestamp",
     "box_status.liwp_timestamp",
     "box_status.received_wall_time_s",
 )
@@ -114,7 +121,13 @@ def _touch_summary(sensor: dict[str, Any]) -> list[float]:
 
 
 def box_snapshot_to_state(snapshot: dict[str, Any]) -> list[float]:
-    """Flatten one BOX snapshot into the named LeRobot state vector."""
+    """Flatten one BOX snapshot into the named LeRobot state vector.
+
+    Per-sensor MCU timestamps are intentionally excluded -- they are diagnostic
+    alignment metadata, not trainable observations, and are emitted separately
+    via :func:`box_snapshot_to_timestamps` into the ``box.timestamps`` column.
+    See :data:`BOX_STATE_NAMES` / :data:`BOX_TIMESTAMP_NAMES`.
+    """
 
     gripper = _sensor(snapshot, "box_gripper")
     trigger = _sensor(snapshot, "box_trigger")
@@ -123,34 +136,56 @@ def box_snapshot_to_state(snapshot: dict[str, Any]) -> list[float]:
     touch_left = _sensor(snapshot, "box_touch_left")
     touch_right = _sensor(snapshot, "box_touch_right")
 
-    distance_m = _finite_float(gripper.get("distance_m"))
     state = [
-        distance_m,
-        distance_m,
-        _timestamp(gripper),
+        _finite_float(gripper.get("distance_m")),
         _finite_float(trigger.get("travel_pct")),
-        _timestamp(trigger),
         *_list_values(imu, "acc_g", 3),
         *_list_values(imu, "gyr_deg_s", 3),
         _finite_float(imu.get("roll_deg")),
         _finite_float(imu.get("pitch_deg")),
         _finite_float(imu.get("yaw_deg")),
         *_list_values(imu, "quat_wxyz", 4),
-        _timestamp(imu),
         *_list_values(six_d, "fxyz_mxyz", 6),
-        _timestamp(six_d),
         *_touch_summary(touch_left),
-        _timestamp(touch_left),
         *_touch_summary(touch_right),
-        _timestamp(touch_right),
         1.0 if bool(snapshot.get("valid")) else 0.0,
         _finite_float(snapshot.get("liwp_index")),
-        _finite_float(snapshot.get("liwp_timestamp")),
-        _finite_float(snapshot.get("received_wall_time_s")),
     ]
     if len(state) != len(BOX_STATE_NAMES):
         raise RuntimeError(f"BOX state length mismatch: {len(state)} != {len(BOX_STATE_NAMES)}")
     return [float(v) for v in state]
+
+
+def box_snapshot_to_timestamps(snapshot: dict[str, Any]) -> list[float]:
+    """Per-frame timestamp metadata for the ``box.timestamps`` column.
+
+    Returned as floats (stored as float64) so the µs-resolution MCU counters
+    keep full integer precision -- which they would lose inside the float32
+    ``observation.state`` vector. Order follows :data:`BOX_TIMESTAMP_NAMES`.
+    """
+
+    gripper = _sensor(snapshot, "box_gripper")
+    trigger = _sensor(snapshot, "box_trigger")
+    imu = _sensor(snapshot, "box_imu")
+    six_d = _sensor(snapshot, "box_six_d_force")
+    touch_left = _sensor(snapshot, "box_touch_left")
+    touch_right = _sensor(snapshot, "box_touch_right")
+
+    timestamps = [
+        _timestamp(gripper),
+        _timestamp(trigger),
+        _timestamp(imu),
+        _timestamp(six_d),
+        _timestamp(touch_left),
+        _timestamp(touch_right),
+        _finite_float(snapshot.get("liwp_timestamp")),
+        _finite_float(snapshot.get("received_wall_time_s")),
+    ]
+    if len(timestamps) != len(BOX_TIMESTAMP_NAMES):
+        raise RuntimeError(
+            f"BOX timestamp length mismatch: {len(timestamps)} != {len(BOX_TIMESTAMP_NAMES)}"
+        )
+    return [float(v) for v in timestamps]
 
 
 def _stats(values: list[list[float]]) -> dict[str, list[float] | list[int]]:
@@ -476,20 +511,22 @@ def _table_column_stats(table, col_name: str, *, width: int) -> dict[str, list]:
 
 def _rows_to_table(pa, rows: list[dict[str, Any]]):
     state_width = len(BOX_STATE_NAMES)
+    ts_width = len(BOX_TIMESTAMP_NAMES)
 
-    def vector_column(key: str):
+    def vector_column(key: str, width: int, dtype):
         flat: list[float] = []
         for row in rows:
             values = list(row[key])
-            if len(values) != state_width:
-                raise ValueError(f"{key} width mismatch: {len(values)} != {state_width}")
+            if len(values) != width:
+                raise ValueError(f"{key} width mismatch: {len(values)} != {width}")
             flat.extend(values)
-        return pa.FixedSizeListArray.from_arrays(pa.array(flat, type=pa.float32()), state_width)
+        return pa.FixedSizeListArray.from_arrays(pa.array(flat, type=dtype), width)
 
     return pa.table(
         [
-            vector_column("observation.state"),
-            vector_column("action"),
+            vector_column("observation.state", state_width, pa.float32()),
+            vector_column("action", state_width, pa.float32()),
+            vector_column("box.timestamps", ts_width, pa.float64()),
             pa.array([row["timestamp"] for row in rows], type=pa.float32()),
             pa.array([row["frame_index"] for row in rows], type=pa.int64()),
             pa.array([row["episode_index"] for row in rows], type=pa.int64()),
@@ -502,9 +539,11 @@ def _rows_to_table(pa, rows: list[dict[str, Any]]):
 
 def _box_table_schema(pa):
     state_width = len(BOX_STATE_NAMES)
+    ts_width = len(BOX_TIMESTAMP_NAMES)
     return pa.schema([
         ("observation.state", pa.list_(pa.float32(), state_width)),
         ("action", pa.list_(pa.float32(), state_width)),
+        ("box.timestamps", pa.list_(pa.float64(), ts_width)),
         ("timestamp", pa.float32()),
         ("frame_index", pa.int64()),
         ("episode_index", pa.int64()),
@@ -517,6 +556,7 @@ def _box_features() -> dict[str, Any]:
     return {
         "observation.state": _feature("float32", [len(BOX_STATE_NAMES)], list(BOX_STATE_NAMES)),
         "action": _feature("float32", [len(BOX_STATE_NAMES)], list(BOX_STATE_NAMES)),
+        "box.timestamps": _feature("float64", [len(BOX_TIMESTAMP_NAMES)], list(BOX_TIMESTAMP_NAMES)),
         "timestamp": _feature("float32", [1]),
         "frame_index": _feature("int64", [1]),
         "episode_index": _feature("int64", [1]),
@@ -560,10 +600,12 @@ def _build_episode_rows(
                 data = _nearest_sample_data(times, slist, timestamp_s)
                 if data:
                     sensors[sid] = data
-            state = box_snapshot_to_state({"valid": bool(sensors), "sensors": sensors})
+            snap = {"valid": bool(sensors), "sensors": sensors}
+            state = box_snapshot_to_state(snap)
             rows.append({
                 "observation.state": state,
                 "action": list(state),
+                "box.timestamps": box_snapshot_to_timestamps(snap),
                 "timestamp": timestamp_s,
                 "frame_index": local_frame,
                 "episode_index": episode_index,
@@ -592,6 +634,7 @@ def _build_episode_rows(
             rows.append({
                 "observation.state": state,
                 "action": list(state),
+                "box.timestamps": box_snapshot_to_timestamps(snapshot),
                 "timestamp": timestamp_s,
                 "frame_index": local_frame,
                 "episode_index": episode_index,
@@ -722,6 +765,7 @@ class Lr3Writer:
         stats = {
             "observation.state": _table_column_stats(table, "observation.state", width=state_width),
             "action": _table_column_stats(table, "action", width=state_width),
+            "box.timestamps": _table_column_stats(table, "box.timestamps", width=len(BOX_TIMESTAMP_NAMES)),
             "timestamp": _table_column_stats(table, "timestamp", width=1),
             "frame_index": _table_column_stats(table, "frame_index", width=1),
             "episode_index": _table_column_stats(table, "episode_index", width=1),
@@ -863,10 +907,12 @@ def write_box_lerobot_v3_episode(
                 data = _nearest_sample_data(times, slist, timestamp_s)
                 if data:
                     sensors[sid] = data
-            state = box_snapshot_to_state({"valid": bool(sensors), "sensors": sensors})
+            snap = {"valid": bool(sensors), "sensors": sensors}
+            state = box_snapshot_to_state(snap)
             rows.append({
                 "observation.state": state,
                 "action": list(state),
+                "box.timestamps": box_snapshot_to_timestamps(snap),
                 "timestamp": timestamp_s,
                 "frame_index": local_frame,
                 "episode_index": episode_index,
@@ -895,6 +941,7 @@ def write_box_lerobot_v3_episode(
             rows.append({
                 "observation.state": state,
                 "action": list(state),
+                "box.timestamps": box_snapshot_to_timestamps(snapshot),
                 "timestamp": timestamp_s,
                 "frame_index": local_frame,
                 "episode_index": episode_index,
@@ -936,6 +983,7 @@ def write_box_lerobot_v3_episode(
     stats = {
         "observation.state": _table_column_stats(combined, "observation.state", width=state_width),
         "action": _table_column_stats(combined, "action", width=state_width),
+        "box.timestamps": _table_column_stats(combined, "box.timestamps", width=len(BOX_TIMESTAMP_NAMES)),
         "timestamp": _table_column_stats(combined, "timestamp", width=1),
         "frame_index": _table_column_stats(combined, "frame_index", width=1),
         "episode_index": _table_column_stats(combined, "episode_index", width=1),
@@ -972,6 +1020,7 @@ def write_box_lerobot_v3_episode(
     features = {
         "observation.state": _feature("float32", [len(BOX_STATE_NAMES)], list(BOX_STATE_NAMES)),
         "action": _feature("float32", [len(BOX_STATE_NAMES)], list(BOX_STATE_NAMES)),
+        "box.timestamps": _feature("float64", [len(BOX_TIMESTAMP_NAMES)], list(BOX_TIMESTAMP_NAMES)),
         "timestamp": _feature("float32", [1]),
         "frame_index": _feature("int64", [1]),
         "episode_index": _feature("int64", [1]),

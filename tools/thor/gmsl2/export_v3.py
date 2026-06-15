@@ -163,13 +163,14 @@ def _load_box_rows(session_dir: Path) -> dict[int, list[dict[str, Any]]]:
     by_ep: dict[int, list[dict[str, Any]]] = {}
     for i in range(len(cols["episode_index"])):
         ep = int(cols["episode_index"][i])
-        by_ep.setdefault(ep, []).append(
-            {
-                "frame_index": int(cols["frame_index"][i]),
-                "observation.state": [float(v) for v in cols["observation.state"][i]],
-                "action": [float(v) for v in cols["action"][i]],
-            }
-        )
+        row: dict[str, Any] = {
+            "frame_index": int(cols["frame_index"][i]),
+            "observation.state": [float(v) for v in cols["observation.state"][i]],
+            "action": [float(v) for v in cols["action"][i]],
+        }
+        if "box.timestamps" in cols:
+            row["box.timestamps"] = [float(v) for v in cols["box.timestamps"][i]]
+        by_ep.setdefault(ep, []).append(row)
     for rows in by_ep.values():
         rows.sort(key=lambda r: r["frame_index"])
     return by_ep
@@ -287,6 +288,8 @@ class _V3Writer:
         video_keys: list[_VideoKey],
         state_width: int,
         state_names: list[str] | None,
+        ts_width: int = 0,
+        ts_names: list[str] | None = None,
     ) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -302,6 +305,8 @@ class _V3Writer:
         self.video_keys = video_keys
         self.state_width = state_width
         self.state_names = state_names
+        self.ts_width = ts_width
+        self.ts_names = ts_names
 
         self.meta_dir = dataset_root / "meta"
         self.episodes_dir = self.meta_dir / "episodes" / "chunk-000"
@@ -320,6 +325,8 @@ class _V3Writer:
         if self.state_width > 0:
             fields.append(("observation.state", pa.list_(pa.float32(), self.state_width)))
             fields.append(("action", pa.list_(pa.float32(), self.state_width)))
+        if self.ts_width > 0:
+            fields.append(("box.timestamps", pa.list_(pa.float64(), self.ts_width)))
         fields += [
             ("timestamp", pa.float32()),
             ("frame_index", pa.int64()),
@@ -337,6 +344,7 @@ class _V3Writer:
         state_rows: list[list[float]] | None,
         action_rows: list[list[float]] | None,
         video_files: dict[str, Path],  # camera -> mp4 path already written
+        ts_rows: list[list[float]] | None = None,
     ) -> None:
         start = self.total_frames
         cols: dict[str, list[Any]] = {
@@ -349,6 +357,8 @@ class _V3Writer:
         if self.state_width > 0:
             cols["observation.state"] = state_rows or [[0.0] * self.state_width] * n_frames
             cols["action"] = action_rows or [[0.0] * self.state_width] * n_frames
+        if self.ts_width > 0:
+            cols["box.timestamps"] = ts_rows or [[0.0] * self.ts_width] * n_frames
         self._writer.write_table(self.pa.table(cols, schema=self._schema))
 
         stop = start + n_frames
@@ -387,6 +397,9 @@ class _V3Writer:
             names = self.state_names if self.state_names and len(self.state_names) == self.state_width else None
             features["observation.state"] = lr3._feature("float32", [self.state_width], names)
             features["action"] = lr3._feature("float32", [self.state_width], names)
+        if self.ts_width > 0:
+            ts_names = self.ts_names if self.ts_names and len(self.ts_names) == self.ts_width else None
+            features["box.timestamps"] = lr3._feature("float64", [self.ts_width], ts_names)
         for vk in self.video_keys:
             features[vk.feature] = {
                 "dtype": "video",
@@ -432,6 +445,8 @@ class _V3Writer:
         if self.state_width > 0:
             stats["observation.state"] = lr3._table_column_stats(table, "observation.state", width=self.state_width)
             stats["action"] = lr3._table_column_stats(table, "action", width=self.state_width)
+        if self.ts_width > 0:
+            stats["box.timestamps"] = lr3._table_column_stats(table, "box.timestamps", width=self.ts_width)
         (self.meta_dir / "stats.json").write_text(json.dumps(stats, indent=4), encoding="utf-8")
 
     def _write_info(self) -> None:
@@ -500,11 +515,15 @@ def export_task_to_v3(
     video_keys = [_VideoKey(feature=f"observation.images.{c}", camera=c) for c in camera_keys]
 
     box_state_names = list(lr3.BOX_STATE_NAMES)
+    box_ts_names = list(lr3.BOX_TIMESTAMP_NAMES)
     first_box = _load_box_rows(first.session_dir)
     has_box = bool(first_box)
     state_width = 0
+    ts_width = 0
     if has_box and first.local_index in first_box and first_box[first.local_index]:
-        state_width = len(first_box[first.local_index][0]["observation.state"])
+        first_row = first_box[first.local_index][0]
+        state_width = len(first_row["observation.state"])
+        ts_width = len(first_row.get("box.timestamps", []))
 
     _emit(f"Schema: {len(camera_keys)} camera(s) {width}x{height} @ {fps}fps, state_width={state_width}")
 
@@ -518,6 +537,8 @@ def export_task_to_v3(
         video_keys=video_keys,
         state_width=state_width,
         state_names=box_state_names if state_width else None,
+        ts_width=ts_width,
+        ts_names=box_ts_names if ts_width else None,
     )
 
     box_cache: dict[Path, dict[int, list[dict[str, Any]]]] = {}
@@ -554,9 +575,11 @@ def export_task_to_v3(
             n_frames = min(cam_frame_count, len(box_rows))
             state_rows = [r["observation.state"] for r in box_rows[:n_frames]]
             action_rows = [r["action"] for r in box_rows[:n_frames]]
+            ts_rows = [r["box.timestamps"] for r in box_rows[:n_frames]] if ts_width else None
         else:
             n_frames = cam_frame_count
             state_rows = action_rows = None
+            ts_rows = None
 
         # Transcode each camera's clip to a per-episode CFR H.264 mp4 (PTS=i/fps).
         # Cameras are independent nvv4l2 jobs, so run them concurrently (the
@@ -580,6 +603,7 @@ def export_task_to_v3(
             state_rows=state_rows,
             action_rows=action_rows,
             video_files=video_files,
+            ts_rows=ts_rows,
         )
         sources.append(
             {
