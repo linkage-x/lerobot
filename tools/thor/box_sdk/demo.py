@@ -1,14 +1,21 @@
+import os
 import sys
 import time
 
 from box_sdk import Box
 
 
+def _local_controller_so() -> str | None:
+    root = os.path.dirname(os.path.abspath(__file__))
+    so = os.path.join(root, "lib", "libbox_controller.so")
+    return so if os.path.isfile(so) else None
+
+
 def main():
     bind_port = int(sys.argv[1]) if len(sys.argv) >= 2 else 15000
     remote_port = int(sys.argv[2]) if len(sys.argv) >= 3 else 15000
 
-    box = Box()
+    box = Box(so_path=_local_controller_so())
     box.start(bind_ip="0.0.0.0", bind_port=bind_port, remote_ip="192.168.2.60", remote_port=remote_port)
 
     rc = box.set_mode(1)
@@ -41,3 +48,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

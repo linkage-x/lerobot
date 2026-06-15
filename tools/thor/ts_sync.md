@@ -2,6 +2,7 @@
 
 > 适用于 Thor 数据采集平台（11 × GMSL2 相机 + BOX 采集板）
 > 初版 2026-05-27；2026-06-09 按实际代码实现校订（PTS offset 机制、meta 字段、ffprobe 角色）
+> 2026-06-15 按真机实测校订（各传感器频率、L3b 校准残差；MCU 时钟 = 1µs/tick，6 路全 engage）
 
 ## 1. 系统总览
 
@@ -116,14 +117,17 @@ for sid, ts in sensor_timestamps.items():
 
 500Hz 轮询保证对任何 ≤250Hz 的传感器都满足 Nyquist 条件。每个传感器按 MCU 实际推送频率独立记录：
 
-| 传感器 | 典型观测频率 | 每 10s episode 样本数 |
+| 传感器 | 实测观测频率 | 每 10s episode 样本数 |
 |--------|------------|---------------------|
-| IMU | ~200 Hz | ~2000 |
-| 六维力 | ~200 Hz | ~2000 |
-| Gripper | ~200 Hz | ~2000 |
-| Trigger | ~200 Hz | ~2000 |
-| Touch L | ~200 Hz | ~2000 |
-| Touch R | ~50 Hz | ~500 |
+| IMU | 199 Hz | ~1998 |
+| 六维力 | 199 Hz | ~1998 |
+| Gripper | 199 Hz | ~1998 |
+| Trigger | 199 Hz | ~1998 |
+| Touch L | **50 Hz** | ~500 |
+| Touch R | 50 Hz | ~500 |
+
+> 频率为 2026-06-15 真机实测（左右触觉垫**均为 50Hz**——早期文档误记 Touch L 为 200Hz）。
+> 这影响最近邻对齐误差：touch 在 50Hz 下为 ±10ms（而非 200Hz 的 ±2.5ms）。
 
 ### 数据持久化
 
@@ -230,8 +234,13 @@ host_time = slope × mcu_ts + intercept
 | 修正项 | 消除的误差 | 修正前 | 修正后 |
 |--------|-----------|--------|--------|
 | 首帧 wall-time 偏移（pts_offset） | 管道启动延迟（100-500ms 偏移） | 全局偏移 | 偏移 ~主机墙钟精度（亚毫秒~毫秒级） |
-| MCU 时钟校准 | 逐次 poll 随机抖动（1-3ms） | ±1-3ms/样本 | <0.5ms/样本（回归残差） |
-| 合计 | | ±3~13ms | **±0.5~1ms** |
+| MCU 时钟校准 | 逐次 poll 随机抖动（1-3ms） | ±1-3ms/样本 | ~1ms/样本（200Hz 主传感器），~2-3ms（50Hz touch） |
+| 合计 | | ±3~13ms | **±1~3ms** |
+
+> 修正后数值为 2026-06-15 真机实测的回归残差标准差（`recorder_*.log` 的 `MCU clock calibration`）：
+> gripper 1.12ms · imu 1.07ms · trigger 1.07ms · 六维力 1.18ms · touch L 2.02ms · touch R 1.97ms。
+> 比早期文档估计的 <0.5ms 略保守，但仍远优于 L3a 的 ±3~13ms。`slope` 实测恒为 `1.0e-6`，
+> 即 **MCU 时间戳单位 = 微秒**；6 路传感器在真机上全部 engage（无回退）。
 
 ## 6. 完整对齐流程（per episode）
 
@@ -270,7 +279,7 @@ host_time = slope × mcu_ts + intercept
 | **L0** 相机间硬同步 | <1μs | ✅ | PWM slave mode，11 路帧锁定同一边沿 |
 | **L1** 软同步元数据 | — | ✅ | meta.json `sync_reference` 记录 t0_wall_s / split_now_wall_s / camera_first_wall_s（逐路，跨相机锚点）/ camera_first_pts_s（per-stream，不可跨相机比较） |
 | **L3a** 高频独立采样 | ±3~13ms | ✅ | 500Hz poll + MCU 时间戳去重 + 逐传感器最近邻 |
-| **L3b** 增强对齐 | ±0.5~1ms | ✅ | 首帧 host wall-time 偏移（pts_offset）+ MCU↔Host 时钟线性回归 |
+| **L3b** 增强对齐 | ±1~3ms（实测） | ✅ | 首帧 host wall-time 偏移（pts_offset）+ MCU↔Host 时钟线性回归 |
 | **L4** 硬件级全同步 | <1μs | 🔲 | BOX MCU 也由 PWM 触发（需硬件改动） |
 
 ### 7.1 代码位置 & 测试映射

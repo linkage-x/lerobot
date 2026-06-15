@@ -219,3 +219,62 @@ def test_export_raises_when_no_sessions(tmp_path):
             repo_id="local/missing",
             task="t",
         )
+
+
+def test_load_box_rows_reads_box_timestamps(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    session = tmp_path / "sess_20260615_120000"
+    data_dir = session / "data" / "chunk-000"
+    data_dir.mkdir(parents=True)
+    schema = pa.schema([
+        ("observation.state", pa.list_(pa.float32(), 2)),
+        ("action", pa.list_(pa.float32(), 2)),
+        ("box.timestamps", pa.list_(pa.float64(), 2)),
+        ("timestamp", pa.float32()),
+        ("frame_index", pa.int64()),
+        ("episode_index", pa.int64()),
+        ("index", pa.int64()),
+        ("task_index", pa.int64()),
+    ])
+    tbl = pa.table({
+        "observation.state": [[1.0, 2.0]],
+        "action": [[1.0, 2.0]],
+        "box.timestamps": [[1.0e8, 3.5]],
+        "timestamp": [0.0],
+        "frame_index": [0],
+        "episode_index": [0],
+        "index": [0],
+        "task_index": [0],
+    }, schema=schema)
+    pq.write_table(tbl, data_dir / "file-000.parquet")
+
+    rows = export_v3._load_box_rows(session)
+    assert rows[0][0]["box.timestamps"] == [1.0e8, 3.5]
+
+
+def test_v3writer_carries_box_timestamps_through(tmp_path):
+    pa = pytest.importorskip("pyarrow")  # noqa: F841
+    pq = pytest.importorskip("pyarrow.parquet")
+    out = tmp_path / "out"
+    writer = export_v3._V3Writer(
+        out, repo_id="x/y", task="t", fps=30, height=0, width=0,
+        video_keys=[], state_width=4, state_names=None,
+        ts_width=3, ts_names=["a.timestamp", "b.timestamp", "received_wall_time_s"],
+    )
+    writer.append_episode(
+        episode_index=0, n_frames=2,
+        state_rows=[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+        action_rows=[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+        video_files={},
+        ts_rows=[[1.0e8, 2.0e8, 1.5], [1.0e8 + 5, 2.0e8 + 5, 2.5]],
+    )
+    writer.finalize()
+
+    table = pq.read_table(out / "data" / "chunk-000" / "file-000.parquet")
+    assert "box.timestamps" in table.column_names
+    assert table.column("box.timestamps").to_pylist()[0] == [1.0e8, 2.0e8, 1.5]
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["features"]["box.timestamps"]["dtype"] == "float64"
+    stats = json.loads((out / "meta" / "stats.json").read_text())
+    assert "box.timestamps" in stats

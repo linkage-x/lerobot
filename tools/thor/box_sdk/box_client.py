@@ -72,6 +72,10 @@ class BoxClientConfig:
     poll_interval_s: float = 0.05
     record_poll_interval_s: float = 0.002
     stale_threshold_s: float = 1.0
+    # The vendored SDK .so unconditionally dumps box_sensor_data_*.csv into CWD
+    # at ~35 MB/min with no disable switch; delete this session's file on stop()
+    # until the SDK ships an opt-out (see tools/thor/box_sdk/TROUBLESHOOTING.md).
+    cleanup_box_csv: bool = True
     expected_devices: list[str] = field(default_factory=lambda: list(KNOWN_SENSOR_IDS))
 
     def __post_init__(self) -> None:
@@ -109,6 +113,7 @@ def from_yaml_dict(raw: dict[str, Any] | None) -> BoxClientConfig:
         poll_interval_s=float(raw.get("poll_interval_s", 0.05)),
         record_poll_interval_s=float(raw.get("record_poll_interval_s", 0.002)),
         stale_threshold_s=float(raw.get("stale_threshold_s", 1.0)),
+        cleanup_box_csv=bool(raw.get("cleanup_box_csv", True)),
         expected_devices=[str(x) for x in expected],
     )
 
@@ -244,6 +249,8 @@ class BoxClient:
         self.cfg = cfg
         self._so_path = so_path
         self._box = None
+        self._csv_dir: Path | None = None
+        self._pre_session_csv: set[Path] = set()
         self._poll_thread: Thread | None = None
         self._stop_event = Event()
         self._lock = Lock()
@@ -304,6 +311,13 @@ class BoxClient:
             return False
 
         self._box = Box(so_path=self._so_path) if self._so_path else Box()
+        # Snapshot pre-existing SDK CSV dumps so stop() removes only the
+        # box_sensor_data_*.csv this session creates in CWD.
+        self._csv_dir = Path.cwd()
+        try:
+            self._pre_session_csv = set(self._csv_dir.glob("box_sensor_data_*.csv"))
+        except OSError:
+            self._pre_session_csv = set()
         rc = self._box.start(
             self.cfg.bind_ip, self.cfg.bind_port,
             self.cfg.remote_ip, self.cfg.remote_port,
@@ -343,6 +357,31 @@ class BoxClient:
             except Exception:
                 pass
             self._box = None
+        self._cleanup_session_csv()
+
+    def _cleanup_session_csv(self) -> None:
+        """Delete the box_sensor_data_*.csv the SDK .so dumped this session.
+
+        The vendored ``libbox_controller.so`` unconditionally appends a
+        high-rate CSV (~35 MB/min) to CWD with no disable switch, so it would
+        otherwise fill the disk across recording sessions. Only files that
+        appeared after :meth:`start` are removed, leaving concurrent or older
+        dumps untouched. Drop this workaround once the SDK gains an opt-out
+        (see tools/thor/box_sdk/TROUBLESHOOTING.md).
+        """
+        if not self.cfg.cleanup_box_csv or self._csv_dir is None:
+            return
+        try:
+            current = set(self._csv_dir.glob("box_sensor_data_*.csv"))
+        except OSError:
+            return
+        for path in current - self._pre_session_csv:
+            try:
+                path.unlink()
+                logger.info("removed box SDK debug CSV %s", path.name)
+            except OSError as exc:
+                logger.warning("could not remove box CSV %s: %s", path, exc)
+        self._pre_session_csv = set()
 
     # ---- polling ----
 

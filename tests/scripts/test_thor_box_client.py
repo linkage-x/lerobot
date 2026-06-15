@@ -351,3 +351,38 @@ def test_box_client_start_is_noop_when_wheel_missing(monkeypatch):
     client = box_client.BoxClient(cfg)
     assert client.start() is False
     client.stop()  # idempotent / safe
+
+
+def test_cleanup_session_csv_removes_only_session_files(tmp_path):
+    # The SDK .so dumps box_sensor_data_*.csv to CWD; stop() must delete only
+    # the file(s) that appeared this session, leaving older/unrelated ones.
+    cfg = box_client.BoxClientConfig()
+    assert cfg.cleanup_box_csv is True
+    client = box_client.BoxClient(cfg)
+    pre = tmp_path / "box_sensor_data_20260101_000000.csv"
+    pre.write_text("old")
+    client._csv_dir = tmp_path
+    client._pre_session_csv = {pre}
+    new = tmp_path / "box_sensor_data_20260615_120000.csv"
+    new.write_text("session")
+    unrelated = tmp_path / "keep.txt"
+    unrelated.write_text("z")
+
+    client._cleanup_session_csv()
+
+    assert pre.exists()        # pre-existing dump untouched
+    assert not new.exists()    # this session's CSV removed
+    assert unrelated.exists()  # non-matching file untouched
+
+
+def test_cleanup_session_csv_respects_disable_flag(tmp_path):
+    cfg = box_client.BoxClientConfig(cleanup_box_csv=False)
+    client = box_client.BoxClient(cfg)
+    f = tmp_path / "box_sensor_data_20260615_120000.csv"
+    f.write_text("session")
+    client._csv_dir = tmp_path
+    client._pre_session_csv = set()
+
+    client._cleanup_session_csv()
+
+    assert f.exists()  # cleanup disabled -> file kept

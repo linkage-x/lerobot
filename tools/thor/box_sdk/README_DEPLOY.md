@@ -27,11 +27,16 @@ pip install --user ./box_collection_sdk-*.whl
 
 ### 2) 运行示例
 
-在交付目录或已解压的 `release_bundle` 根目录下（已 `source setup_env.sh` 时）：
+在交付目录或已解压的 `release_bundle` 根目录下：
 
 ```bash
+./check_libs.sh
+pip install ./python/box_collection_sdk-*.whl
 python3 demo.py 5000 5000 192.168.2.60
 ```
+
+`demo.py` 会优先加载同目录下 `lib/libbox_controller.so`（与全部依赖在同一目录）。
+若仍有库问题，可先 `source ./setup_env.sh` 再运行。
 
 参数：
 - 第 1 个：本地 bind 端口
@@ -42,3 +47,4 @@ python3 demo.py 5000 5000 192.168.2.60
 
 - **ImportError / OSError 加载 .so 失败**：请确认机器架构一致（例如都是 x86_64 Linux），以及 wheel 文件完整未损坏。
 - **端口占用**：换一个 bind 端口，比如 `55000`。
+

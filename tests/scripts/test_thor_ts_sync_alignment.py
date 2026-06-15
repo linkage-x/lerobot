@@ -230,3 +230,49 @@ def test_end_to_end_alignment_via_parquet(tmp_path):
     timestamps = table["timestamp"].to_pylist()
     assert timestamps[0] == pytest.approx(pts_offset, abs=1e-4)
     assert timestamps[5] == pytest.approx(pts_offset + 5 / FPS, abs=1e-4)
+
+
+# --------------------------------------------------------------------------
+# 6. schema contract: MCU timestamps live in metadata, not observation.state
+# --------------------------------------------------------------------------
+
+def test_timestamps_excluded_from_state_and_emitted_as_metadata_column(tmp_path):
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    # observation.state must carry no timestamp/wall-clock channels and only
+    # one gripper distance channel (the former duplicate ``gripper.pos`` is gone).
+    assert "gripper.pos" not in lr3.BOX_STATE_NAMES
+    assert lr3.BOX_STATE_NAMES[0] == "box_gripper.distance_m"
+    assert sum(n == "box_gripper.distance_m" for n in lr3.BOX_STATE_NAMES) == 1
+    assert not any(
+        n.endswith("timestamp") or n.endswith("received_wall_time_s")
+        for n in lr3.BOX_STATE_NAMES
+    )
+    # ...and they are preserved in the dedicated metadata vector instead.
+    assert all(
+        n.endswith("timestamp") or n.endswith("received_wall_time_s")
+        for n in lr3.BOX_TIMESTAMP_NAMES
+    )
+    assert lr3.BOX_TIMESTAMP_NAMES[0] == "box_gripper.timestamp"
+
+    clean = _make_gripper_samples(N_SAMPLES)
+    writer = lr3.Lr3Writer(tmp_path, repo_id="thor_sync_test", task="pick", fps=FPS)
+    writer.append_episode(
+        episode_index=0, snapshots=[], duration_s=DURATION_S,
+        sensor_samples=clean, t0_wall_s=T0_WALL_S, pts_offset_s=0.0,
+    )
+    writer.finalize()
+
+    table = pq.read_table(tmp_path / "data" / "chunk-000" / "file-000.parquet")
+    assert len(table["observation.state"].to_pylist()[0]) == len(lr3.BOX_STATE_NAMES)
+
+    # The MCU timestamp rides in box.timestamps (gripper at column 0), not state,
+    # and is stored float64 so the µs counter keeps full integer precision.
+    box_ts = table["box.timestamps"].to_pylist()
+    assert len(box_ts[0]) == len(lr3.BOX_TIMESTAMP_NAMES)
+    gripper_mcu = [int(round(row[0])) for row in box_ts]
+    # By construction distance_m == sample index k and data.timestamp == k*ticks,
+    # so the aligned gripper MCU stamp is the selected index times the period.
+    aligned_idx = _aligned_distances(clean, 0.0)
+    expected_mcu = [idx * SAMPLE_PERIOD_TICKS for idx in aligned_idx]
+    assert gripper_mcu == expected_mcu
