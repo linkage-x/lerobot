@@ -156,6 +156,14 @@ dataset:
   fps: 60
   num_episodes: 0              # 0 = unlimited; press the GUI's Save/Stop
   episode_time_s: 10
+  # While Connected but not recording, the persistent pipelines keep streaming
+  # into a throwaway warmup fragment under <root>/_warmup. splitmuxsink never
+  # auto-rotates (max-size-time=0 so each EPISODE stays one file), so that open
+  # fragment grows until the disk fills if the gateway is left armed (the
+  # 2026-06 _warmup blow-up: 120G over a weekend). The recorder rolls + prunes
+  # those fragments on this idle timer; keep_last_n bounds survivors per camera.
+  warmup_roll_s: 30            # idle roll+prune cadence in seconds; 0 disables
+  warmup_keep_last_n: 3        # warmup fragments kept per camera each prune
   push_to_hub: false
 
 display_data: true
