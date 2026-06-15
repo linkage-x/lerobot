@@ -328,3 +328,49 @@ LeRobot v3 parquet 中的 `observation.state` 是 **60Hz 下采样** 后的对�
 - 确保 NTP 同步（`timedatectl status` 检查）
 - 避免在录制期间手动修改系统时间
 - `time.monotonic()` 用于持续时间测量不受 NTP 步进影响，但跨进程对齐仍需 wall-clock
+
+## 9. v3 数据集 schema（2026-06-15 重构）
+
+录制器（`thor_lerobot_v3.py`）写的是 **box-only 的最小 v3** parquet（数值特征 + 时间戳元数据），
+相机以 `cam_*.mkv` 原始文件并排存在每个 episode 目录里；离线 `export_v3.py` 再把相机转码并
+合并出带 `observation.images.*` 的训练数据集。两侧共享同一 `t0_wall_s`（见 §5.1）。
+
+### 9.1 `observation.state` / `action`（float32，**33** 维）
+
+只放可训练的传感器读数，**不含任何时间戳**。通道分组（`BOX_STATE_NAMES`）：
+
+| 组 | 通道 | 数量 |
+|----|------|------|
+| gripper | `box_gripper.distance_m` | 1 |
+| trigger | `box_trigger.travel_pct` | 1 |
+| IMU | `acc_{x,y,z}_g` / `gyr_{x,y,z}_deg_s` / `roll,pitch,yaw_deg` / `quat_{w,x,y,z}` | 13 |
+| 六维力 | `box_six_d_force.{fx,fy,fz,mx,my,mz}` | 6 |
+| 触觉 L/R | 各 `mean_f{x,y,z}_0p1N` / `max_abs_fz_0p1N` / `active_points`（239 点聚合） | 5+5 |
+| 状态 | `box_status.{valid,liwp_index}` | 2 |
+
+> 早期版本把 `gripper.pos`（与 `box_gripper.distance_m` 重复）和 7 个 `*.timestamp` 也塞在
+> state 里（共 42 维）。重构去掉重复 gripper、并把时间戳移出（见 §9.2），降为 33 维——避免把
+> 单调递增的原始计数当成可训练特征（归一化被带歪 + 时间泄漏）。
+
+### 9.2 `box.timestamps` 元数据列（float64，**8** 维，非训练）
+
+每帧对齐用的原始时间戳单独成列（`BOX_TIMESTAMP_NAMES`）：6 个传感器 `*.timestamp` +
+`box_status.liwp_timestamp` + `box_status.received_wall_time_s`。
+
+- **float64**：MCU 计数实测达 2–4e9（µs），超 float32 的 2²⁴ 整数精度；float64 在磁盘 parquet 上无损。
+- **caveat**：`LeRobotDataset` 把数值特征统一出成 `torch.float32`，经 loader 读会再被量化
+  （2e9 处 ULP≈256µs）。需精确 mcu_ts 时**直接读 parquet**；训练不受影响（它只是对齐元数据）。
+- CSV：SDK `.so` 另会向 CWD 写 `box_sensor_data_*.csv`，`BoxClient.stop()` 会清理本会话的
+  （见 `box_sdk/TROUBLESHOOTING.md` §7，待 SDK 加关闭开关）。
+
+### 9.3 真机验证状态（2026-06-15）
+
+| 项 | 结果 |
+|----|------|
+| 6 路传感器频率 | gripper/imu/trigger/六维力 199Hz，touch L/R 各 50Hz |
+| MCU 校准（L3b） | slope=1µs/tick，6 路全 engage，残差 1–2ms |
+| 夹爪/扳机运动 | episode 实测 distance 0.0007–0.098m、trigger 0→100% 正确进 `state[0/1]` |
+| 触觉接触 | `active_points` 1–52、`max_abs_fz` 饱和 255、239 点原始帧完整 |
+| 多模态采集 | 9 路相机（argus_failed=[]）+ 夹爪 + 双触觉同步采集；相机 first_wall_s 展布 ~10ms，pts_offset≈11ms |
+| LeRobotDataset 加载 | ✅ 可加载（box.timestamps 经 loader 降为 float32，见 §9.2） |
+| 待验 | 跨域 tap-test（§7.1）、相机视频经 `export_v3` 合并后的端到端 |
