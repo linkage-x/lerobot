@@ -13,6 +13,7 @@ rsync -avz --delete \
   --exclude='.git/' \
   --exclude='node_modules/' \
   --exclude='dist/' \
+  --exclude='.venv' \
   --exclude='.venv/' \
   --exclude='__pycache__/' \
   --exclude='*.pyc' \

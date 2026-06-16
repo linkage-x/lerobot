@@ -418,6 +418,8 @@ class Gmsl2Camera(Camera):
             raise RuntimeError(f"{self}: stop_event not initialised before read loop.")
 
         failures = 0
+        timeout_backoff_s = max(0.05, min(0.25, self.timeout_ms / 1000.0))
+        max_consecutive_timeouts = 120
         while not stop_event.is_set():
             try:
                 raw = self._pull_frame()
@@ -425,6 +427,14 @@ class Gmsl2Camera(Camera):
                     failures += 1
                     if failures % 10 == 1:
                         logger.warning("%s read timeout (%d in a row).", self, failures)
+                    if failures >= max_consecutive_timeouts:
+                        logger.error(
+                            "%s read loop stopped after %d consecutive timeouts.",
+                            self,
+                            failures,
+                        )
+                        return
+                    stop_event.wait(timeout=timeout_backoff_s)
                     continue
                 frame = self._postprocess(raw)
                 with self._frame_lock:
