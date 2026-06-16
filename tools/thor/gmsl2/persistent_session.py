@@ -1141,19 +1141,15 @@ class PersistentCameraSession:
             "stop_wall_s": handle.stop_wall_s,
             "duration_s": handle.stop_wall_s - handle.t0_wall_s,
             "sync_reference": {
-                "split_now_wall_s": handle.t0_wall_s,
-                "camera_first_pts_s": {
-                    name: info.first_pts_s for name, info in handle.fragments.items()
-                },
                 "camera_first_wall_s": {
                     name: info.first_wall_s for name, info in handle.fragments.items()
                 },
                 "note": (
-                    "split_now_wall_s is host time when split-now was emitted. "
-                    "camera_first_pts_s is the PTS of the first frame in the new "
-                    "fragment (extracted from splitmuxsink format-location-full "
-                    "first_sample). Use these to align cameras to BOX wall-clock "
-                    "samples without re-running ffprobe."
+                    "camera_first_wall_s is the host wall time each splitmuxsink "
+                    "opened its new fragment — the cross-camera anchor to align "
+                    "cameras to BOX wall-clock samples (t0_wall_s is the shared "
+                    "origin). Per-stream first PTS is in cameras[].first_pts_s "
+                    "(single-stream only, NOT cross-camera comparable)."
                 ),
             },
             "cameras": [

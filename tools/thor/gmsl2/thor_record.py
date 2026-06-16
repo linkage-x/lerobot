@@ -316,14 +316,16 @@ def _write_episode_meta(
     consumers don't break), but the ``sync_reference`` block is the new
     PR2 model:
 
-      * ``split_now_wall_s``: host wall time when start_episode() emitted
-        split-now on every splitmuxsink
+      * ``t0_wall_s`` / ``t0_mono_s``: recording origin (host wall / monotonic
+        clock) shared by cameras and BOX; BOX samples carry
+        ``t_relative_s = wall - t0_wall_s``.
       * ``camera_first_wall_s``: per-camera wall time when the new fragment
         actually opened (from format-location-full callback). This is the
-        anchor downstream consumers should align BOX/touch samples to.
-      * ``camera_first_pts_s``: per-camera buffer PTS of the first frame in
-        the new fragment. Useful for single-stream analysis but NOT
-        comparable across cameras (pipeline clocks are independent).
+        cross-camera anchor downstream consumers align BOX/touch samples to.
+
+    Per-stream first PTS is kept per-camera in ``cameras[].first_pts_s`` (it is
+    single-stream only — NOT cross-camera comparable — so it is intentionally
+    not duplicated into ``sync_reference``).
 
     The legacy ``camera_spawn_wall_s`` / ``camera_spawn_offset_s`` fields
     are gone; the closest replacement is ``camera_first_wall_s``.
@@ -363,22 +365,18 @@ def _write_episode_meta(
         "sync_reference": {
             "t0_wall_s": handle.t0_wall_s,
             "t0_mono_s": handle.t0_mono_s,
-            "split_now_wall_s": handle.t0_wall_s,
             "camera_first_wall_s": {
                 name: info.first_wall_s for name, info in fragments.items()
             },
-            "camera_first_pts_s": {
-                name: info.first_pts_s for name, info in fragments.items()
-            },
             "note": (
-                "Persistent-pipeline model (PR2). split_now_wall_s is host "
-                "time when start_episode() emitted split-now. "
+                "Persistent-pipeline model (PR2). t0_wall_s is the recording "
+                "origin (host time when start_episode() emitted split-now); "
+                "BOX snapshots carry t_relative_s = time.time() - t0_wall_s. "
                 "camera_first_wall_s is the host time each splitmuxsink "
                 "actually opened its new fragment — use this as the "
-                "cross-camera alignment anchor (~20ms spread in PR1 "
-                "burn-in). camera_first_pts_s is per-stream buffer PTS "
-                "and is NOT cross-camera comparable. BOX snapshots carry "
-                "t_relative_s = time.time() - split_now_wall_s."
+                "cross-camera alignment anchor (~20ms spread in PR1 burn-in). "
+                "Per-stream first PTS is in cameras[].first_pts_s (single-"
+                "stream only, NOT cross-camera comparable)."
             ),
         },
         "max96726_locked_sids": locked,

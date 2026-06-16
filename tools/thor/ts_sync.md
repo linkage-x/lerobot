@@ -3,6 +3,7 @@
 > 适用于 Thor 数据采集平台（11 × GMSL2 相机 + BOX 采集板）
 > 初版 2026-05-27；2026-06-09 按实际代码实现校订（PTS offset 机制、meta 字段、ffprobe 角色）
 > 2026-06-15 按真机实测校订（各传感器频率、L3b 校准残差；MCU 时钟 = 1µs/tick，6 路全 engage）
+> 2026-06-16 schema 精简（observation.state 31 维 / box.timestamps 6 维）+ 去 meta 冗余（`sync_reference` 删 split_now_wall_s、camera_first_pts_s）
 
 ## 1. 系统总览
 
@@ -42,6 +43,19 @@ Thor 采集系统包含两套独立的数据源：
 │  └──────────────────────────────────────────┘       │
 └─────────────────────────────────────────────────────┘
 ```
+
+### 1.1 软同步工作原理（TL;DR）
+
+**一句话**：以**主机墙钟**为唯一公共时间轴，把硬件同步的相机与独立晶振时钟的 BOX 都换算到这条轴上，再按 60Hz 帧网格做最近邻对齐。
+
+1. **公共原点**：每条 episode 开录记一个 `t0_wall_s`（split-now 的主机墙钟时刻），相机与 BOX 共用它为零点。
+2. **相机**（详 §3 / §5.1）：11 路共用一路 PWM 硬触发 → 帧间 <1µs；管道启动延迟用 `pts_offset = mean(camera_first_wall_s − t0_wall_s)` 修正，**帧 N 时间 = pts_offset + N/fps**（t0 相对域）。
+3. **BOX**（详 §4 / §5.2）：500Hz 轮询，按各传感器 MCU 时间戳变化去重（原生 199/50Hz 独立记录）；再对每个传感器做 `host = slope·mcu + intercept` 最小二乘回归（实测 slope = 1µs/tick，残差 1–2ms）消除轮询抖动，得 `t_rel_s = 校准时间 − t0_wall_s`。
+4. **合并**（详 §6）：对每个 60Hz 相机帧时间，在每个传感器序列里二分查找最近样本 → 拼成 `observation.state`（§9.1）；对齐所用的原始 MCU 戳单独存入 `box.timestamps`（§9.2）。
+
+**精度**：相机间 <1µs；BOX↔相机 ≈ ±1–3ms（L3b 校准后，详 §7）。
+
+**信息载体**：`meta.json` 的 `sync_reference`（`t0_wall_s` / `camera_first_wall_s` 跨相机锚点）+ 训练 parquet（`timestamp` 帧网格 / `box.timestamps` 对齐戳）+ `box_sensors.jsonl`（原始全速率，可重算校准）。三者经审计：完备、无冗余。
 
 ## 2. 三个时钟域
 
@@ -242,6 +256,25 @@ host_time = slope × mcu_ts + intercept
 > 比早期文档估计的 <0.5ms 略保守，但仍远优于 L3a 的 ±3~13ms。`slope` 实测恒为 `1.0e-6`，
 > 即 **MCU 时间戳单位 = 微秒**；6 路传感器在真机上全部 engage（无回退）。
 
+**±1~3ms 的理论来源**：该列即 MCU↔Host 线性回归的**残差标准差**。拟合 `host = slope·mcu + intercept`
+把延迟里的**固定偏移**收进 `intercept`、**两时钟频率差/漂移**（晶振 ±50ppm）收进 `slope`；**残差 =
+剩下既非常量也非线性的部分**，也就是「MCU 给样本打戳 → 主机 `time.time()` 记录」之间延迟的**随机
+抖动**。校准能去掉延迟的恒定与线性成分，抖动去不掉，就留成这 1~3ms。抖动按量级：
+
+1. **poll 相位抖动（主因）**：样本落入 SDK 缓存后，要等下一拍 500Hz 轮询才被读到并记 `time.time()` → 0~2ms 近似均匀。
+2. **UDP / 内核 / 网卡传输抖动**：打包、网络传输、中断合并、收包缓冲。
+3. **Python 调度抖动**：GIL 争用 / GC 暂停 / OS 调度 poll 线程。
+4. **设备侧采样→发包延迟波动**。（MCU 时钟 1µs 量化、10s 窗口内高度线性，可忽略。）
+
+touch 残差约为 200Hz 传感器的 2×：样本少 4×（501 vs 1998，拟合更糙）+ UDP 包更大（~744B vs ~120B，传输抖动更大）+ §4 提到的 touch 投递速率 quirk。
+
+> **口径提醒（避免误读这个数）**：±1~3ms 只是 **BOX 侧的「定时」残差**（已知某样本发生在主机时间
+> 几时的不确定度）。**每帧端到端**对齐误差还要再叠两项校准**消不掉**的：(a) **最近邻量化 ±采样间隔/2**
+> ——199Hz ±2.5ms、**touch 50Hz ±10ms**（见 §4）；(b) 相机侧 `pts_offset` 的测量抖动
+> （`camera_first_wall_s` 落盘时刻波动）。另外延迟的**平均值**被 `intercept` 吸收、不进残差，但它在
+> BOX↔相机之间留下一个固定 skew（BOX 内部各传感器对齐时相消）。**所以对 touch，主导误差是 ±10ms
+> 的最近邻量化，而非 ±2ms 的校准残差。**
+
 ## 6. 完整对齐流程（per episode）
 
 ```
@@ -277,9 +310,9 @@ host_time = slope × mcu_ts + intercept
 | 级别 | 精度 | 状态 | 机制 |
 |------|------|------|------|
 | **L0** 相机间硬同步 | <1μs | ✅ | PWM slave mode，11 路帧锁定同一边沿 |
-| **L1** 软同步元数据 | — | ✅ | meta.json `sync_reference` 记录 t0_wall_s / split_now_wall_s / camera_first_wall_s（逐路，跨相机锚点）/ camera_first_pts_s（per-stream，不可跨相机比较） |
+| **L1** 软同步元数据 | — | ✅ | meta.json `sync_reference` 记录 t0_wall_s / t0_mono_s / camera_first_wall_s（逐路，跨相机锚点）；per-stream PTS 在 `cameras[].first_pts_s`（不可跨相机比较，不进 sync_reference） |
 | **L3a** 高频独立采样 | ±3~13ms | ✅ | 500Hz poll + MCU 时间戳去重 + 逐传感器最近邻 |
-| **L3b** 增强对齐 | ±1~3ms（实测） | ✅ | 首帧 host wall-time 偏移（pts_offset）+ MCU↔Host 时钟线性回归 |
+| **L3b** 增强对齐 | ±1~3ms（校准残差，实测；端到端另叠最近邻 ±间隔/2，见 §5.4） | ✅ | 首帧 host wall-time 偏移（pts_offset）+ MCU↔Host 时钟线性回归 |
 | **L4** 硬件级全同步 | <1μs | 🔲 | BOX MCU 也由 PWM 触发（需硬件改动） |
 
 ### 7.1 代码位置 & 测试映射
@@ -335,9 +368,9 @@ LeRobot v3 parquet 中的 `observation.state` 是 **60Hz 下采样** 后的对�
 相机以 `cam_*.mkv` 原始文件并排存在每个 episode 目录里；离线 `export_v3.py` 再把相机转码并
 合并出带 `observation.images.*` 的训练数据集。两侧共享同一 `t0_wall_s`（见 §5.1）。
 
-### 9.1 `observation.state` / `action`（float32，**33** 维）
+### 9.1 `observation.state` / `action`（float32，**31** 维）
 
-只放可训练的传感器读数，**不含任何时间戳**。通道分组（`BOX_STATE_NAMES`）：
+只放可训练的传感器读数，**不含任何时间戳、不含状态位**。通道分组（`BOX_STATE_NAMES`）：
 
 | 组 | 通道 | 数量 |
 |----|------|------|
@@ -346,20 +379,26 @@ LeRobot v3 parquet 中的 `observation.state` 是 **60Hz 下采样** 后的对�
 | IMU | `acc_{x,y,z}_g` / `gyr_{x,y,z}_deg_s` / `roll,pitch,yaw_deg` / `quat_{w,x,y,z}` | 13 |
 | 六维力 | `box_six_d_force.{fx,fy,fz,mx,my,mz}` | 6 |
 | 触觉 L/R | 各 `mean_f{x,y,z}_0p1N` / `max_abs_fz_0p1N` / `active_points`（239 点聚合） | 5+5 |
-| 状态 | `box_status.{valid,liwp_index}` | 2 |
 
-> 早期版本把 `gripper.pos`（与 `box_gripper.distance_m` 重复）和 7 个 `*.timestamp` 也塞在
-> state 里（共 42 维）。重构去掉重复 gripper、并把时间戳移出（见 §9.2），降为 33 维——避免把
-> 单调递增的原始计数当成可训练特征（归一化被带歪 + 时间泄漏）。
+> 演进：42 维（含重复 `gripper.pos`、7 个 `*.timestamp`、恒定死通道 `box_status.{valid,liwp_index}`）
+> → 33 维（去重 gripper + 时间戳移出, 见 §9.2）→ **31 维**（再删掉恒为常量的 `box_status.valid`(恒 1)
+> 和 `liwp_index`(HF 路径恒 0)）。原则：state 只留可训练的传感器读数, 不放单调计数/常量, 避免归一化被带歪与时间泄漏。
 
-### 9.2 `box.timestamps` 元数据列（float64，**8** 维，非训练）
+### 9.2 `box.timestamps` 元数据列（float64，**6** 维，非训练）
 
-每帧对齐用的原始时间戳单独成列（`BOX_TIMESTAMP_NAMES`）：6 个传感器 `*.timestamp` +
-`box_status.liwp_timestamp` + `box_status.received_wall_time_s`。
+每帧对齐用的原始时间戳单独成列（`BOX_TIMESTAMP_NAMES`）：**6 个传感器各一个 `*.timestamp`**
+（gripper / trigger / imu / six_d_force / touch_left / touch_right）。曾经一并放进来的
+`box_status.liwp_timestamp` / `received_wall_time_s` 因 **HF 录制路径恒为 0** 且与 per-sensor
+mcu_ts 冗余，已移除（liwp 是包级时间戳，对齐用 per-sensor 更细更准）。
 
 - **float64**：MCU 计数实测达 2–4e9（µs），超 float32 的 2²⁴ 整数精度；float64 在磁盘 parquet 上无损。
 - **caveat**：`LeRobotDataset` 把数值特征统一出成 `torch.float32`，经 loader 读会再被量化
   （2e9 处 ULP≈256µs）。需精确 mcu_ts 时**直接读 parquet**；训练不受影响（它只是对齐元数据）。
+- **uint32 回绕（暂不处理，后续优化）**：所有 box 时间戳底层是 SDK 的 uint32 µs，2³²µs ≈ **71.6 分钟**
+  回绕一次。当前 episode 远短于此（~10s），**暂不处理**；极少数骑在回绕边界的 episode 会被
+  L3b 校准残差阈值(50ms)自动回退到 L3a，不污染数据。**不要求 SDK 改 uint64**（结构体字段偏移
+  全变, 属 ABI/协议破坏性改动, 代价高于收益）；将来若做长会话/连续录制, 在客户端 poll 循环里
+  unwrap（检测 ts 回退则累加 2³²）即可彻底消除, 无需供应商配合。
 - CSV：SDK `.so` 另会向 CWD 写 `box_sensor_data_*.csv`，`BoxClient.stop()` 会清理本会话的
   （见 `box_sdk/TROUBLESHOOTING.md` §7，待 SDK 加关闭开关）。
 

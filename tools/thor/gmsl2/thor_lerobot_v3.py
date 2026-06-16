@@ -54,8 +54,6 @@ BOX_STATE_NAMES: tuple[str, ...] = (
     "box_six_d_force.mz",
     *tuple(f"box_touch_left.{name}" for name in _TOUCH_SUMMARY_NAMES),
     *tuple(f"box_touch_right.{name}" for name in _TOUCH_SUMMARY_NAMES),
-    "box_status.valid",
-    "box_status.liwp_index",
 )
 
 # Per-frame timestamp metadata, emitted as a SEPARATE non-observation parquet
@@ -70,8 +68,6 @@ BOX_TIMESTAMP_NAMES: tuple[str, ...] = (
     "box_six_d_force.timestamp",
     "box_touch_left.timestamp",
     "box_touch_right.timestamp",
-    "box_status.liwp_timestamp",
-    "box_status.received_wall_time_s",
 )
 
 
@@ -148,8 +144,6 @@ def box_snapshot_to_state(snapshot: dict[str, Any]) -> list[float]:
         *_list_values(six_d, "fxyz_mxyz", 6),
         *_touch_summary(touch_left),
         *_touch_summary(touch_right),
-        1.0 if bool(snapshot.get("valid")) else 0.0,
-        _finite_float(snapshot.get("liwp_index")),
     ]
     if len(state) != len(BOX_STATE_NAMES):
         raise RuntimeError(f"BOX state length mismatch: {len(state)} != {len(BOX_STATE_NAMES)}")
@@ -178,8 +172,6 @@ def box_snapshot_to_timestamps(snapshot: dict[str, Any]) -> list[float]:
         _timestamp(six_d),
         _timestamp(touch_left),
         _timestamp(touch_right),
-        _finite_float(snapshot.get("liwp_timestamp")),
-        _finite_float(snapshot.get("received_wall_time_s")),
     ]
     if len(timestamps) != len(BOX_TIMESTAMP_NAMES):
         raise RuntimeError(
