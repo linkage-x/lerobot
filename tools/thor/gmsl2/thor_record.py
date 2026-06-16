@@ -134,7 +134,7 @@ def _connect_session_with_deadline(
     )
 
 
-def _emit_box_live(box: bc.BoxClient, *, last_emit_s: float, min_interval_s: float = 0.1) -> float:
+def _emit_box_live(box: bc.BoxPool, *, last_emit_s: float, min_interval_s: float = 0.1) -> float:
     now = time.monotonic()
     if now - last_emit_s < min_interval_s:
         return last_emit_s
@@ -147,10 +147,53 @@ def _emit_box_live(box: bc.BoxClient, *, last_emit_s: float, min_interval_s: flo
     return now
 
 
+_FORCE_CHANNEL_LABELS = ("Fx", "Fy", "Fz", "Mx", "My", "Mz")
+
+
+def _fmt_force_vec(vec: list[float] | None) -> str:
+    if not vec:
+        return "n/a"
+    n = min(len(_FORCE_CHANNEL_LABELS), len(vec))
+    return ", ".join(f"{_FORCE_CHANNEL_LABELS[i]}={vec[i]:.4f}" for i in range(n))
+
+
+def _run_six_d_force_cali(box: bc.BoxPool) -> None:
+    """Trigger a 6D force-sensor calibration and stream progress as CALI_LOG lines.
+
+    Runs on its own thread: the stdin reader must not block on the ~0.5s+ SDK
+    round-trip. Emits a terminal ``CALI_DONE ok|error`` line so the gateway can
+    mark the run complete and the frontend can stop spinning.
+    """
+    _emit("CALI_LOG 6D force sensor calibration requested")
+    try:
+        results = box.calibrate_six_d_force()
+    except Exception as exc:  # noqa: BLE001 - calibration must never crash the recorder
+        _emit(f"CALI_LOG ERROR calibration raised: {exc}")
+        _emit("CALI_DONE error")
+        return
+    ok_all = bool(results)
+    for res in results:
+        label = res.get("box_id") or "box"
+        if res.get("ok"):
+            _emit(f"CALI_LOG [{label}] calibration OK (rc={res.get('rc')})")
+        else:
+            ok_all = False
+            _emit(
+                f"CALI_LOG [{label}] calibration FAILED (rc={res.get('rc')}): "
+                f"{res.get('error') or 'unknown error'}"
+            )
+        before, after = res.get("before"), res.get("after")
+        if before is not None or after is not None:
+            _emit(f"CALI_LOG [{label}] before: {_fmt_force_vec(before)}")
+            _emit(f"CALI_LOG [{label}] after:  {_fmt_force_vec(after)}")
+    _emit(f"CALI_DONE {'ok' if ok_all else 'error'}")
+
+
 def _read_stdin_loop(
     queue: list[StdinCommand],
     stop: threading.Event,
     on_demand: Callable[[], None] | None = None,
+    on_calibrate: Callable[[], None] | None = None,
 ) -> None:
     while not stop.is_set():
         line = sys.stdin.readline()
@@ -175,6 +218,14 @@ def _read_stdin_loop(
             # and drop.
             if on_demand is not None:
                 on_demand()
+        elif stripped == "cali_6dforce":
+            # Out-of-band 6D force-sensor calibration request from the gateway
+            # (Device Manager button). Like preview_demand it's a side-effect,
+            # not an FSM start/save/quit command, so fire the callback instead
+            # of enqueuing it. The callback offloads the actual SDK call to its
+            # own thread so reading further stdin lines never blocks on it.
+            if on_calibrate is not None:
+                on_calibrate()
         else:
             logger.warning("ignoring unrecognized stdin command: %r", line)
 
@@ -304,7 +355,7 @@ def _write_episode_meta(
     cfg: gr.RecorderConfig,
     locked: list[int],
     argus_failed: list[int],
-    box_cfg: bc.BoxClientConfig,
+    box_cfg: bc.BoxFleetConfig,
     box_snapshots: list[dict[str, Any]],
     stop_reason: str,
     wallclock_start_utc: str,
@@ -316,14 +367,16 @@ def _write_episode_meta(
     consumers don't break), but the ``sync_reference`` block is the new
     PR2 model:
 
-      * ``split_now_wall_s``: host wall time when start_episode() emitted
-        split-now on every splitmuxsink
+      * ``t0_wall_s`` / ``t0_mono_s``: recording origin (host wall / monotonic
+        clock) shared by cameras and BOX; BOX samples carry
+        ``t_relative_s = wall - t0_wall_s``.
       * ``camera_first_wall_s``: per-camera wall time when the new fragment
         actually opened (from format-location-full callback). This is the
-        anchor downstream consumers should align BOX/touch samples to.
-      * ``camera_first_pts_s``: per-camera buffer PTS of the first frame in
-        the new fragment. Useful for single-stream analysis but NOT
-        comparable across cameras (pipeline clocks are independent).
+        cross-camera anchor downstream consumers align BOX/touch samples to.
+
+    Per-stream first PTS is kept per-camera in ``cameras[].first_pts_s`` (it is
+    single-stream only — NOT cross-camera comparable — so it is intentionally
+    not duplicated into ``sync_reference``).
 
     The legacy ``camera_spawn_wall_s`` / ``camera_spawn_offset_s`` fields
     are gone; the closest replacement is ``camera_first_wall_s``.
@@ -363,22 +416,18 @@ def _write_episode_meta(
         "sync_reference": {
             "t0_wall_s": handle.t0_wall_s,
             "t0_mono_s": handle.t0_mono_s,
-            "split_now_wall_s": handle.t0_wall_s,
             "camera_first_wall_s": {
                 name: info.first_wall_s for name, info in fragments.items()
             },
-            "camera_first_pts_s": {
-                name: info.first_pts_s for name, info in fragments.items()
-            },
             "note": (
-                "Persistent-pipeline model (PR2). split_now_wall_s is host "
-                "time when start_episode() emitted split-now. "
+                "Persistent-pipeline model (PR2). t0_wall_s is the recording "
+                "origin (host time when start_episode() emitted split-now); "
+                "BOX snapshots carry t_relative_s = time.time() - t0_wall_s. "
                 "camera_first_wall_s is the host time each splitmuxsink "
                 "actually opened its new fragment — use this as the "
-                "cross-camera alignment anchor (~20ms spread in PR1 "
-                "burn-in). camera_first_pts_s is per-stream buffer PTS "
-                "and is NOT cross-camera comparable. BOX snapshots carry "
-                "t_relative_s = time.time() - split_now_wall_s."
+                "cross-camera alignment anchor (~20ms spread in PR1 burn-in). "
+                "Per-stream first PTS is in cameras[].first_pts_s (single-"
+                "stream only, NOT cross-camera comparable)."
             ),
         },
         "max96726_locked_sids": locked,
@@ -570,7 +619,7 @@ def main(argv: list[str] | None = None) -> int:
     with args.config_path.open() as f:
         import yaml
         raw_yaml = yaml.safe_load(f) or {}
-    box_cfg = bc.from_yaml_dict(raw_yaml.get("box_collection") if not args.no_box else None)
+    box_cfg = bc.fleet_from_yaml_dict(raw_yaml.get("box_collection") if not args.no_box else None)
     auto_cfg = _auto_recover_from_yaml(raw_yaml.get("auto_recover"))
     if args.no_auto_recover:
         auto_cfg.enabled = False
@@ -624,9 +673,16 @@ def main(argv: list[str] | None = None) -> int:
     # pipelines and a GLib MainLoop are already running triggers
     # SIGABRT on the first incoming UDP packet (see
     # tools/data_collection_gui/docs/development_status.md).
-    box = bc.BoxClient(box_cfg)
+    box = bc.BoxPool(box_cfg)
     box_started = box.start() if box_cfg.enabled else False
     if box_started:
+        # Surface the discovered BOX roster (device_id / sn / ip / capabilities)
+        # so the gateway renders one GUI row per (discovered box × sensor)
+        # instead of relying on the static YAML config -- this is what makes
+        # "click Connect -> list all box devices" reflect the real subnet.
+        roster = box.discovered_devices()
+        if roster:
+            _emit("BOX_DEVICES_JSON " + json.dumps(roster, separators=(",", ":")))
         # Wait for the rate-estimation window (2s) to fill so we can report
         # real per-sensor frequencies instead of the poll rate.
         time.sleep(2.5)
@@ -843,8 +899,18 @@ def main(argv: list[str] | None = None) -> int:
     # from the start/save/quit FSM).
     stop_event = threading.Event()
     cmd_queue: list[StdinCommand] = []
+
+    def _trigger_six_d_force_cali() -> None:
+        # Offload to a dedicated thread so the stdin reader keeps draining lines
+        # (including preview_demand heartbeats) during the SDK round-trip.
+        threading.Thread(
+            target=_run_six_d_force_cali, args=(box,),
+            daemon=True, name="thor-record-cali",
+        ).start()
+
     stdin_thread = threading.Thread(
-        target=_read_stdin_loop, args=(cmd_queue, stop_event, _note_preview_demand),
+        target=_read_stdin_loop,
+        args=(cmd_queue, stop_event, _note_preview_demand, _trigger_six_d_force_cali),
         daemon=True, name="thor-record-stdin",
     )
     stdin_thread.start()

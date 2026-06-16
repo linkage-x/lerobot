@@ -36,10 +36,20 @@ DEFAULT_REPLAY_MAX_EE_STEP_MM = 120.0
 DEFAULT_REPLAY_MAX_GRIPPER_STEP = 0.35
 DEFAULT_REAL_PREFLIGHT_TIMEOUT_S = 30.0
 DEFAULT_REAL_ROBOT_IP = "192.168.1.208"
-DEFAULT_EE_TRAJECTORY_SCRIPT = Path("third_party/opencv_kalibr/hikon_cube_tracking_offline/hikon_cube_tracking_in_robot_base.py")
+# EE trajectory generation now tracks gmsl2 (Thor) datasets with AprilTag cubes
+# instead of the legacy Hikon-camera route. The gateway runs on Thor, so it
+# invokes the local runner directly (no SSH / copy-back) -- the runner picks the
+# opencv_kalibr venv that actually has cv2/pupil_apriltags and wires PYTHONPATH.
+DEFAULT_EE_TRAJECTORY_RUNNER = Path("third_party/opencv_kalibr/run_april_cube_tracking_local.sh")
 DEFAULT_EE_TRAJECTORY_CONFIG = Path(
-    "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_hikon/hikon_cube_tracking_in_robot_base_umi.yaml"
+    "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/april_cube_tracking_in_robot_base_thor.yaml"
 )
+# Algorithm id + on-disk sidecar/analysis names produced by the april thor config
+# (save_to_dataset.sidecar_dir and output.run_name_suffix). Kept in sync here so
+# the gateway reads back exactly what the tracker writes.
+DEFAULT_EE_TRAJECTORY_ALGORITHM = "april_cube_tracking_in_robot_base"
+DEFAULT_TRAJ_SIDECAR_NAME = "april_cube_tracking_in_robot_base"
+DEFAULT_TRACKING_RUN_SUFFIX = "_thor_april_tracking_in_robot_base"
 DEFAULT_CUBE_TRAJECTORY_NAMES = ("left", "right", "head")
 DEFAULT_CUBE_SIZE_M = 0.07
 CUBE_OVERLAY_COLORS = {
@@ -158,6 +168,19 @@ class GatewayState:
     gateway_log_path: Path | None = None
     recorder_log_path: Path | None = None
     device_preview: dict[str, Any] = field(default_factory=dict)
+    # BOX 6D force-sensor calibration: the recorder streams CALI_LOG/CALI_DONE
+    # lines on stdout after a `cali_6dforce` stdin command; the reader thread
+    # appends them here and the Device Manager polls them into its log box.
+    # Guarded by its own lock since the stdout reader and the GET handler run on
+    # different threads.
+    box_cali_running: bool = False
+    box_cali_log: list[dict[str, Any]] = field(default_factory=list)
+    box_cali_lock: Lock = field(default_factory=Lock)
+    # Roster of BOX devices the recorder discovered by broadcast at Connect
+    # (BOX_DEVICES_JSON). When non-empty it replaces the static YAML-derived
+    # box_collection rows so the Device Manager lists exactly the boxes actually
+    # on the subnet (one row per discovered box × sensor).
+    box_devices_roster: list[dict[str, Any]] = field(default_factory=list)
     # One live preview pipeline per camera device id, so the Device Manager grid
     # can show many cameras at once. Each pipeline's reader thread keeps only the
     # latest JPEG in `camera_preview_frames`; the HTTP layer serves that cached
@@ -542,34 +565,99 @@ def _device_statuses(config: dict[str, Any], repo_root: Path | None = None) -> l
 
     box_cfg = config.get("box_collection")
     if isinstance(box_cfg, dict) and box_cfg.get("enabled", True):
-        expected = box_cfg.get("expected_devices") or list(_BOX_COLLECTION_DEVICE_LABELS)
+        # Accept both the legacy flat single-box block and the new multi-box
+        # `boxes:` list. A single empty-id box keeps bare sensor IDs so existing
+        # rigs render identically; with >1 box each row's id is namespaced.
+        raw_boxes = box_cfg.get("boxes")
+        if isinstance(raw_boxes, list):
+            box_entries = [b for b in raw_boxes if isinstance(b, dict)]
+        else:
+            box_entries = [box_cfg]
+        for box in box_entries:
+            devices.extend(_box_collection_devices(box))
+    return devices
+
+
+def _box_collection_devices(box: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build one frontend row per expected sensor for a single BOX config."""
+    box_id = str(box.get("box_id", "") or "")
+    expected = box.get("expected_devices") or list(_BOX_COLLECTION_DEVICE_LABELS)
+    try:
+        poll_hz = int(round(1.0 / float(box.get("poll_interval_s") or 0.05)))
+    except (TypeError, ValueError, ZeroDivisionError):
         poll_hz = 0
-        try:
-            poll_hz = int(round(1.0 / float(box_cfg.get("poll_interval_s") or 0.05)))
-        except (TypeError, ValueError, ZeroDivisionError):
-            poll_hz = 0
-        detail = f"UDP {box_cfg.get('remote_ip', '?')}:{box_cfg.get('remote_port', 15000)}"
-        for sensor_id in expected:
-            label = _BOX_COLLECTION_DEVICE_LABELS.get(str(sensor_id), str(sensor_id))
-            devices.append(
+    detail = f"UDP {box.get('remote_ip', '?')}:{box.get('remote_port', 15000)}"
+    out: list[dict[str, Any]] = []
+    for sensor_id in expected:
+        sid = str(sensor_id)
+        device_id = f"{box_id}/{sid}" if box_id else sid
+        out.append(
+            {
+                "id": device_id,
+                "kind": "box_collection",
+                "label": _BOX_COLLECTION_DEVICE_LABELS.get(sid, sid),
+                "state": "idle",
+                "fps": poll_hz,
+                "latencyMs": 0,
+                "detail": detail,
+                "config": {
+                    "box_id": box_id,
+                    "remote_ip": box.get("remote_ip", ""),
+                    "remote_port": box.get("remote_port", 15000),
+                    "poll_interval_s": box.get("poll_interval_s", 0.05),
+                    "bind_ip": box.get("bind_ip", ""),
+                    "sensor_id": sid,
+                },
+            }
+        )
+    return out
+
+
+def _box_devices_from_roster(roster: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build Device Manager rows from the recorder's discovered BOX roster.
+
+    One row per (discovered box × sensor). Mirrors :func:`_box_collection_devices`
+    so the frontend renders discovered boxes identically to configured ones, but
+    sourced from the live broadcast enumeration (device_id / sn / ip) rather than
+    static YAML. A single box with an empty ``box_id`` keeps bare sensor IDs so
+    legacy single-box rigs render and namespace exactly as before.
+    """
+    out: list[dict[str, Any]] = []
+    for entry in roster:
+        if not isinstance(entry, dict):
+            continue
+        box_id = str(entry.get("box_id", "") or "")
+        sensors = entry.get("expected_devices") or entry.get("capability_names") or []
+        ip = str(entry.get("ip", "") or "?")
+        sn = str(entry.get("sn", "") or "")
+        device_num = entry.get("device_id")
+        detail_id = sn or (f"id={device_num}" if device_num is not None else "")
+        detail = f"UDP {ip}:{entry.get('data_port', 15000)}"
+        if detail_id:
+            detail = f"{detail} ({detail_id})"
+        for sensor_id in sensors:
+            sid = str(sensor_id)
+            row_id = f"{box_id}/{sid}" if box_id else sid
+            out.append(
                 {
-                    "id": str(sensor_id),
+                    "id": row_id,
                     "kind": "box_collection",
-                    "label": label,
+                    "label": _BOX_COLLECTION_DEVICE_LABELS.get(sid, sid),
                     "state": "idle",
-                    "fps": poll_hz,
+                    "fps": 0,
                     "latencyMs": 0,
                     "detail": detail,
                     "config": {
-                        "remote_ip": box_cfg.get("remote_ip", ""),
-                        "remote_port": box_cfg.get("remote_port", 15000),
-                        "poll_interval_s": box_cfg.get("poll_interval_s", 0.05),
-                        "bind_ip": box_cfg.get("bind_ip", ""),
-                        "sensor_id": str(sensor_id),
+                        "box_id": box_id,
+                        "device_id": device_num,
+                        "sn": sn,
+                        "remote_ip": ip,
+                        "data_port": entry.get("data_port", 15000),
+                        "sensor_id": sid,
                     },
                 }
             )
-    return devices
+    return out
 
 
 def _make_mapping_device(device_id: str, device: dict[str, Any], kind: str) -> dict[str, Any]:
@@ -1507,6 +1595,42 @@ def _export_command(state: GatewayState, task: dict[str, Any]) -> tuple[list[str
     return command, out_root
 
 
+def _matching_task_for_dataset(state: GatewayState, dataset_root: Path) -> dict[str, Any] | None:
+    prefixes = _dataset_name_prefixes(dataset_root.name)
+    for task in _read_tasks(state):
+        repo_id = str(task.get("datasetRepoId") or "").strip()
+        base_name = repo_id.split("/")[-1].strip()
+        if base_name and base_name in prefixes:
+            return task
+    return None
+
+
+def _approved_dataset_export_command(state: GatewayState, dataset_root: Path) -> tuple[list[str], Path]:
+    """Build an export_v3 command scoped to one approved raw GMSL2 session."""
+
+    if not _has_gmsl2_episodes(dataset_root):
+        raise ValueError("Approved raw export requires a GMSL2 session dataset.")
+    base_name = dataset_root.name
+    exports_root = _task_exports_root(state)
+    out_root = exports_root / base_name
+    task = _matching_task_for_dataset(state, dataset_root)
+    task_prompt = str((task or {}).get("description") or (task or {}).get("name") or base_name).strip()
+    namespace = str((task or {}).get("datasetRepoId") or "local").split("/")[0] or "local"
+    repo_id = f"{namespace}/{base_name}"
+    script = state.repo_root / "tools" / "thor" / "gmsl2" / "export_v3.py"
+    command = [
+        str(_venv_python(state.repo_root)),
+        str(script),
+        "--datasets-root", str(dataset_root.parent),
+        "--exports-root", str(exports_root),
+        "--base-name", base_name,
+        "--repo-id", repo_id,
+        "--task", task_prompt,
+        "--overwrite",
+    ]
+    return command, out_root
+
+
 def _start_task_export(state: GatewayState, task_id: str) -> None:
     if _export_is_running(state):
         raise RuntimeError("An export is already running; wait for it to finish.")
@@ -1539,6 +1663,76 @@ def _start_task_export(state: GatewayState, task_id: str) -> None:
         args=(state, state.export_process),
         daemon=True,
         name=f"task-export-output-{state.export_process.pid}",
+    ).start()
+
+
+def _copy_approved_v3_dataset_export(
+    state: GatewayState, dataset_root: Path, processing_item: dict[str, Any]
+) -> None:
+    exports_root = _task_exports_root(state)
+    out_root = exports_root / dataset_root.name
+    try:
+        if dataset_root.resolve() == out_root.resolve():
+            raise ValueError("Export output path is the same as the source dataset path.")
+    except OSError as exc:
+        raise ValueError(f"Cannot resolve export paths: {exc}") from exc
+    if out_root.exists():
+        shutil.rmtree(out_root)
+    out_root.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(dataset_root, out_root)
+    state.dataset_export = DatasetExportStatus(
+        state="complete",
+        target="lerobot_v3",
+        datasetRoot=str(dataset_root),
+        outputPath=str(out_root),
+        selectedEpisodes=int(processing_item.get("totalEpisodes") or 0),
+        totalFrames=int(processing_item.get("totalFrames") or 0),
+        message=f"Export complete: approved dataset copied to {out_root}",
+    )
+    state.log("info", f"Exported approved LeRobot v3 dataset {dataset_root} -> {out_root}")
+
+
+def _start_approved_dataset_export(state: GatewayState, raw_path: str) -> None:
+    if _export_is_running(state):
+        raise RuntimeError("An export is already running; wait for it to finish.")
+    dataset_root = _resolve_known_dataset(state, raw_path)
+    if dataset_root is None:
+        raise ValueError("Dataset not found in the approved/candidate dataset list.")
+    processing_item = _processing_item_from_dataset(dataset_root)
+    if processing_item.get("status") != "qc_pass":
+        raise ValueError("Dataset must pass QC before export.")
+    if _has_lerobot_v3_data(dataset_root):
+        _copy_approved_v3_dataset_export(state, dataset_root, processing_item)
+        return
+    if not _has_gmsl2_episodes(dataset_root):
+        raise ValueError("Approved dataset export supports LeRobot v3 datasets or raw GMSL2 session datasets.")
+    command, out_root = _approved_dataset_export_command(state, dataset_root)
+    state.export_process = subprocess.Popen(
+        command,
+        cwd=state.repo_root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=_recorder_env(state.repo_root),
+        start_new_session=True,
+    )
+    state.dataset_export = DatasetExportStatus(
+        state="exporting",
+        target="lerobot_v3",
+        datasetRoot=str(dataset_root),
+        outputPath=str(out_root),
+        selectedEpisodes=int(processing_item.get("totalEpisodes") or 0),
+        totalFrames=0,
+        message=f"Exporting approved dataset {dataset_root.name}…",
+        pid=state.export_process.pid,
+    )
+    state.log("info", f"Started approved dataset v3 export for {dataset_root} -> {out_root}")
+    Thread(
+        target=_read_export_output,
+        args=(state, state.export_process),
+        daemon=True,
+        name=f"dataset-export-output-{state.export_process.pid}",
     ).start()
 
 
@@ -2059,19 +2253,19 @@ def _next_processing_version(versions: dict[str, Any]) -> str:
 
 
 def _ee_trajectory_command(state: GatewayState, dataset_root: Path) -> list[str]:
-    script_path = state.repo_root / DEFAULT_EE_TRAJECTORY_SCRIPT
+    runner_path = state.repo_root / DEFAULT_EE_TRAJECTORY_RUNNER
     config_path = state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG
-    if not script_path.is_file():
-        raise FileNotFoundError(f"EE trajectory script not found: {script_path}")
+    if not runner_path.is_file():
+        raise FileNotFoundError(f"EE trajectory runner not found: {runner_path}")
     if not config_path.is_file():
         raise FileNotFoundError(f"EE trajectory config not found: {config_path}")
     return [
-        str(_venv_python3(state.repo_root)),
-        str(script_path),
-        "--config",
-        str(config_path),
+        "bash",
+        str(runner_path),
         "--dataset-root",
         str(dataset_root),
+        "--config",
+        str(config_path),
     ]
 
 
@@ -2114,9 +2308,9 @@ def _update_traj_gen_meta(
         versions = updated.get("versions") if isinstance(updated.get("versions"), dict) else {}
         versions[version] = {
             "created_at": _now_iso(),
-            "algorithm": "hikon_cube_tracking_in_robot_base",
+            "algorithm": DEFAULT_EE_TRAJECTORY_ALGORITHM,
             "dataset_root": str(dataset_root),
-            "sidecar_dir": str(dataset_root / "derived" / "hikon_cube_tracking_in_robot_base"),
+            "sidecar_dir": str(dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME),
             "command": job.get("command") or command or [],
             "qc": versions.get(version, {}).get("qc") if isinstance(versions.get(version), dict) else None,
         }
@@ -2166,7 +2360,7 @@ def _read_traj_gen_output(
         versions = existing.get("versions") if isinstance(existing.get("versions"), dict) else {}
         if exit_code == 0:
             version = _next_processing_version(versions)
-            message = "EE trajectory generated from Hikon cube tracking"
+            message = "EE trajectory generated from AprilTag cube tracking"
             _update_traj_gen_meta(
                 dataset_root,
                 job_id=job_id,
@@ -2205,7 +2399,7 @@ def _queue_traj_gen(state: GatewayState, dataset_root: Path) -> None:
         job_id=job_id,
         status="running",
         command=command,
-        message=f"Running Hikon cube tracking for {dataset_root.name}",
+        message=f"Running AprilTag cube tracking for {dataset_root.name}",
         log_tail=[f"[traj-gen] {' '.join(command)}"],
     )
     try:
@@ -2595,7 +2789,7 @@ def _pose_from_csv_row(row: dict[str, Any]) -> dict[str, float] | None:
 
 
 def _sidecar_cube_pose_files(dataset_root: Path) -> dict[str, Path]:
-    sidecar_dir = dataset_root / "derived" / "hikon_cube_tracking_in_robot_base"
+    sidecar_dir = dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME
     files: dict[str, Path] = {}
     for cube_name in DEFAULT_CUBE_TRAJECTORY_NAMES:
         candidate = sidecar_dir / f"state_action.{cube_name}.csv"
@@ -2635,7 +2829,7 @@ def _read_sidecar_cube_poses(dataset_root: Path, episode: int) -> dict[str, dict
 
 
 def _tracking_run_dir(state: GatewayState, dataset_root: Path) -> Path:
-    return state.repo_root / "outputs" / "tracking_analysis" / f"{dataset_root.name}_tracking_in_robot_base"
+    return state.repo_root / "outputs" / "tracking_analysis" / f"{dataset_root.name}{DEFAULT_TRACKING_RUN_SUFFIX}"
 
 
 def _mat4_inverse_rigid(matrix: list[list[float]]) -> list[list[float]]:
@@ -3019,6 +3213,73 @@ def _gmsl2_replay_warmup_s(ep_meta: dict[str, Any]) -> float:
     ]))
 
 
+def _load_episode_meta(ep_dir: Path) -> dict[str, Any]:
+    meta_path = ep_dir / "meta.json"
+    if not meta_path.is_file():
+        return {}
+    try:
+        with meta_path.open(encoding="utf-8") as handle:
+            meta = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _box_snapshots_from_episode_meta(ep_meta: dict[str, Any]) -> list[dict[str, Any]]:
+    box_meta = ep_meta.get("box_collection") if isinstance(ep_meta, dict) else None
+    snapshots = box_meta.get("snapshots") if isinstance(box_meta, dict) else None
+    if not isinstance(snapshots, list):
+        return []
+    return [snapshot for snapshot in snapshots if isinstance(snapshot, dict)]
+
+
+def _box_snapshot_rows_for_replay(
+    ep_meta: dict[str, Any],
+    *,
+    fps: int,
+    total_frames: int,
+) -> tuple[list[str], list[str], dict[int, dict[str, list[float]]]] | None:
+    snapshots = _box_snapshots_from_episode_meta(ep_meta)
+    if not snapshots or total_frames <= 0:
+        return None
+    try:
+        from tools.thor.gmsl2 import thor_lerobot_v3 as lr3
+    except Exception:
+        return None
+    box_ids = lr3.box_ids_from_snapshots(snapshots)
+    rows = lr3._build_episode_rows(
+        fps=fps,
+        episode_index=0,
+        snapshots=snapshots,
+        duration_s=total_frames / max(int(fps), 1),
+        box_ids=box_ids,
+    )
+    if not rows:
+        return None
+    by_frame: dict[int, dict[str, list[float]]] = {}
+    for row in rows:
+        frame_index = int(row.get("frame_index") or 0)
+        by_frame[frame_index] = {
+            "state": _as_float_list(row.get("observation.state")),
+            "action": _as_float_list(row.get("action")),
+        }
+    if not any(any(abs(value) > 0.0 for value in entry["state"]) for entry in by_frame.values()):
+        return None
+    state_names = list(lr3.box_state_names(box_ids))
+    return state_names, list(state_names), by_frame
+
+
+def _rows_vector_all_zero(rows: list[dict[str, Any]], column: str) -> bool:
+    saw_value = False
+    for row in rows:
+        values = _as_float_list(row.get(column))
+        if values:
+            saw_value = True
+        if any(abs(value) > 0.0 for value in values):
+            return False
+    return saw_value
+
+
 def _touch_payload(data: Any) -> dict[str, Any] | None:
     if not isinstance(data, dict):
         return None
@@ -3035,36 +3296,72 @@ def _touch_payload(data: Any) -> dict[str, Any] | None:
     }
 
 
+def _touch_key_from_sid(sensor_id: str) -> str | None:
+    suffix_by_sid = {"box_touch_left": "left", "box_touch_right": "right"}
+    if sensor_id in suffix_by_sid:
+        return suffix_by_sid[sensor_id]
+    if "/" not in sensor_id:
+        return None
+    box_id, bare = sensor_id.split("/", 1)
+    suffix = suffix_by_sid.get(bare)
+    if not box_id or suffix is None:
+        return None
+    return f"{box_id}.{suffix}"
+
+
+def _read_touch_samples_from_snapshots(ep_meta: dict[str, Any]) -> dict[str, list[tuple[float, dict[str, Any]]]]:
+    samples: dict[str, list[tuple[float, dict[str, Any]]]] = {}
+    for snapshot in _box_snapshots_from_episode_meta(ep_meta):
+        sensors = snapshot.get("sensors")
+        if not isinstance(sensors, dict):
+            continue
+        t_rel_s = _first_finite(snapshot.get("t_relative_s"), default=float("nan"))
+        if t_rel_s != t_rel_s:
+            continue
+        for sid, data in sensors.items():
+            key = _touch_key_from_sid(str(sid))
+            if key is None:
+                continue
+            payload = _touch_payload(data)
+            if payload is None:
+                continue
+            payload["tRelS"] = t_rel_s
+            samples.setdefault(key, []).append((t_rel_s, payload))
+    for key in samples:
+        samples[key].sort(key=lambda item: item[0])
+    return samples
+
+
 def _read_touch_samples(ep_dir: Path) -> dict[str, list[tuple[float, dict[str, Any]]]]:
-    samples: dict[str, list[tuple[float, dict[str, Any]]]] = {"left": [], "right": []}
+    samples: dict[str, list[tuple[float, dict[str, Any]]]] = {}
     path = ep_dir / "box_sensors.jsonl"
-    if not path.is_file():
-        return samples
-    side_by_sid = {"box_touch_left": "left", "box_touch_right": "right"}
-    try:
-        with path.open() as f:
-            for line in f:
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(row, dict):
-                    continue
-                side = side_by_sid.get(str(row.get("sid") or ""))
-                if side is None:
-                    continue
-                t_rel_s = _first_finite(row.get("t_rel_s"), default=float("nan"))
-                if t_rel_s != t_rel_s:
-                    continue
-                payload = _touch_payload(row.get("data"))
-                if payload is None:
-                    continue
-                payload["tRelS"] = t_rel_s
-                samples[side].append((t_rel_s, payload))
-    except OSError:
-        return {"left": [], "right": []}
-    for side in samples:
-        samples[side].sort(key=lambda item: item[0])
+    if path.is_file():
+        try:
+            with path.open() as f:
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    key = _touch_key_from_sid(str(row.get("sid") or ""))
+                    if key is None:
+                        continue
+                    t_rel_s = _first_finite(row.get("t_rel_s"), default=float("nan"))
+                    if t_rel_s != t_rel_s:
+                        continue
+                    payload = _touch_payload(row.get("data"))
+                    if payload is None:
+                        continue
+                    payload["tRelS"] = t_rel_s
+                    samples.setdefault(key, []).append((t_rel_s, payload))
+        except OSError:
+            samples = {}
+    if not samples:
+        samples = _read_touch_samples_from_snapshots(_load_episode_meta(ep_dir))
+    for key in samples:
+        samples[key].sort(key=lambda item: item[0])
     return samples
 
 
@@ -3093,20 +3390,43 @@ def _nearest_touch_payload(
 
 def _attach_touch_frames(frames: list[dict[str, Any]], ep_dir: Path, *, video_warmup_s: float = 0.0) -> None:
     samples = _read_touch_samples(ep_dir)
-    if not samples["left"] and not samples["right"]:
+    if not any(samples.values()):
         return
     for frame in frames:
         target_s = _first_finite(frame.get("timestamp"), default=0.0) + max(0.0, video_warmup_s)
-        left = _nearest_touch_payload(samples["left"], target_s)
-        right = _nearest_touch_payload(samples["right"], target_s)
-        if left is None and right is None:
-            continue
         touch: dict[str, Any] = {}
-        if left is not None:
-            touch["left"] = left
-        if right is not None:
-            touch["right"] = right
-        frame["touch"] = touch
+        for key, key_samples in samples.items():
+            payload = _nearest_touch_payload(key_samples, target_s)
+            if payload is not None:
+                touch[key] = payload
+        if touch:
+            frame["touch"] = touch
+
+
+def _gmsl2_pts_offset_s(ep_meta: dict[str, Any]) -> float:
+    """Pipeline-start delay correction for the camera frame-time grid.
+
+    ``pts_offset = mean(camera_first_wall_s[cam] - t0_wall_s)`` -- the same value
+    the recorder bakes into the v3 parquet ``timestamp`` column (ts_sync.md
+    §5.1), so EE-pose timestamps stay on the PWM-synced camera axis whether the
+    replay timeline is read from parquet or from raw gmsl2 episodes. Returns 0.0
+    when the ``sync_reference`` anchors are absent.
+    """
+    sync_reference = ep_meta.get("sync_reference") if isinstance(ep_meta, dict) else None
+    if not isinstance(sync_reference, dict):
+        return 0.0
+    t0_wall_s = sync_reference.get("t0_wall_s")
+    camera_first_wall_s = sync_reference.get("camera_first_wall_s")
+    if not isinstance(t0_wall_s, (int, float)) or not isinstance(camera_first_wall_s, dict):
+        return 0.0
+    deltas = [
+        float(wall_s) - float(t0_wall_s)
+        for wall_s in camera_first_wall_s.values()
+        if isinstance(wall_s, (int, float))
+    ]
+    if not deltas:
+        return 0.0
+    return sum(deltas) / len(deltas)
 
 
 def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict[str, Any]:
@@ -3140,14 +3460,40 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
     total_frames = max(0, int(duration_s * fps))
     mkv_files = sorted(ep_dir.glob("*.mkv"))
     camera_keys = [f.stem for f in mkv_files if f.stat().st_size > 1024]
+
+    # PWM-synced camera frame-time grid (ts_sync.md §5.1): frame N time =
+    # pts_offset + N/fps in the t0-relative domain. pts_offset corrects the
+    # pipeline-start delay and matches the v3 parquet `timestamp` column, so
+    # EE-pose timestamps agree whether the timeline is read from parquet or here.
+    pts_offset_s = _gmsl2_pts_offset_s(ep_meta)
+
+    # AprilTag EE-pose sidecar (derived/april_cube_tracking_in_robot_base) is
+    # produced straight from the raw episodes by run_april_cube_tracking_* and
+    # needs no v3 parquet. Surface it here too -- otherwise camera-only datasets
+    # (no BOX parquet -> this gmsl2 path) would generate an EE pose that never
+    # reaches the replay view.
+    sidecar_cube_poses = _read_sidecar_cube_poses(dataset_root, ep_idx)
+    cube_pose_names = [n for n in DEFAULT_CUBE_TRAJECTORY_NAMES if n in sidecar_cube_poses]
+    cube_pose_names += [n for n in sidecar_cube_poses if n not in cube_pose_names]
+    box_fallback = _box_snapshot_rows_for_replay(ep_meta, fps=fps, total_frames=total_frames)
+    state_names = box_fallback[0] if box_fallback else []
+    action_names = box_fallback[1] if box_fallback else []
+    box_rows = box_fallback[2] if box_fallback else {}
+
     frames: list[dict[str, Any]] = []
     for i in range(total_frames):
+        cube_poses: dict[str, dict[str, Any]] = {}
+        for cube_name in cube_pose_names:
+            cube_pose = sidecar_cube_poses.get(cube_name, {}).get(i)
+            if cube_pose is not None:
+                cube_poses[cube_name] = cube_pose
         frames.append({
             "frame": i,
-            "timestamp": i / max(fps, 1),
-            "state": [],
-            "action": [],
+            "timestamp": pts_offset_s + i / max(fps, 1),
+            "state": list(box_rows.get(i, {}).get("state", [])),
+            "action": list(box_rows.get(i, {}).get("action", [])),
             "eePose": {},
+            "cubePoses": cube_poses,
         })
     _attach_touch_frames(frames, ep_dir, video_warmup_s=video_warmup_s)
     return {
@@ -3156,8 +3502,9 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
         "episode": ep_idx,
         "totalFrames": total_frames,
         "fps": fps,
-        "stateNames": [],
-        "actionNames": [],
+        "stateNames": state_names,
+        "actionNames": action_names,
+        "cubePoseNames": [n for n in cube_pose_names if any(n in f.get("cubePoses", {}) for f in frames)],
         "cameraKeys": camera_keys,
         "videoTemplate": "",
         "videoChunkIndex": 0,
@@ -3236,15 +3583,27 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
             cube_pose_names.append(cube_name)
 
     ep_dir: Path | None = None
+    box_fallback: tuple[list[str], list[str], dict[int, dict[str, list[float]]]] | None = None
     if _has_gmsl2_episodes(dataset_root):
         ep_dir = dataset_root / "episodes" / f"episode_{int(episode or 0):06d}"
+        if ep_dir.is_dir() and (not state_names or _rows_vector_all_zero(rows, "observation.state")):
+            box_fallback = _box_snapshot_rows_for_replay(
+                _load_episode_meta(ep_dir),
+                fps=fps,
+                total_frames=len(rows),
+            )
+            if box_fallback is not None:
+                state_names = box_fallback[0]
+                action_names = box_fallback[1]
+    box_rows = box_fallback[2] if box_fallback is not None else {}
 
     frames: list[dict[str, Any]] = []
     for row_index, row in enumerate(rows):
         frame_index = int(row.get("frame_index") if row.get("frame_index") is not None else row_index)
         timestamp = _first_finite(row.get("timestamp"), default=frame_index / max(fps, 1))
-        state_values = _as_float_list(row.get("observation.state"))
-        action_values = _as_float_list(row.get("action"))
+        fallback_box = box_rows.get(frame_index)
+        state_values = list(fallback_box.get("state", [])) if fallback_box else _as_float_list(row.get("observation.state"))
+        action_values = list(fallback_box.get("action", [])) if fallback_box else _as_float_list(row.get("action"))
         pose = _ee_pose_from_row(row, action_names, state_names) or {}
         cube_poses: dict[str, dict[str, Any]] = {}
         for cube_name in cube_pose_names:
@@ -4236,6 +4595,41 @@ def _maybe_send_preview_demand(state: GatewayState) -> None:
             pass
 
 
+def _trigger_box_six_d_force_cali(state: GatewayState) -> dict[str, Any]:
+    """Ask the running GMSL2 recorder to calibrate the BOX 6D force sensor.
+
+    The recorder owns the live box connection, so the command rides its stdin
+    (``cali_6dforce``) and progress comes back as CALI_LOG/CALI_DONE stdout
+    lines. Returns a small status dict for the POST response.
+    """
+    process = state.process
+    if process is None or process.poll() is not None:
+        return {"ok": False, "error": "recorder is not connected; press Connect first"}
+    if not _state_is_gmsl2(state):
+        return {"ok": False, "error": "6D force calibration requires the GMSL2/BOX recorder"}
+    with state.box_cali_lock:
+        state.box_cali_running = True
+        state.box_cali_log.append(
+            {"ts": time.time(), "line": "calibration command sent to recorder", "done": False}
+        )
+        del state.box_cali_log[:-200]
+    try:
+        _write_recorder_stdin(process, "cali_6dforce\n")
+    except (BrokenPipeError, ValueError, OSError, RuntimeError) as exc:
+        with state.box_cali_lock:
+            state.box_cali_running = False
+            state.box_cali_log.append(
+                {"ts": time.time(), "line": f"failed to send command: {exc}", "done": True}
+            )
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True}
+
+
+def _box_cali_log_payload(state: GatewayState) -> dict[str, Any]:
+    with state.box_cali_lock:
+        return {"running": state.box_cali_running, "lines": list(state.box_cali_log)}
+
+
 def _connect_recorder(state: GatewayState) -> None:
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
@@ -4711,6 +5105,24 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         if isinstance(payload, dict):
             state.device_preview["box"] = {**payload, "active": True, "updatedAt": time.time()}
         return
+    if output.startswith("BOX_DEVICES_JSON "):
+        try:
+            roster = json.loads(output.removeprefix("BOX_DEVICES_JSON ").strip())
+        except json.JSONDecodeError:
+            state.log("warn", "recorder: malformed BOX_DEVICES_JSON payload")
+            return
+        if isinstance(roster, list):
+            _apply_box_roster(state, roster)
+        return
+    if output.startswith("CALI_LOG ") or output.startswith("CALI_DONE "):
+        done = output.startswith("CALI_DONE ")
+        line = output.removeprefix("CALI_DONE " if done else "CALI_LOG ").strip()
+        with state.box_cali_lock:
+            state.box_cali_log.append({"ts": time.time(), "line": line, "done": done})
+            del state.box_cali_log[:-200]  # keep the buffer bounded
+            if done:
+                state.box_cali_running = False
+        return
     state.recording.lastOutput = output
     state.recording.message = output
     # Append to the ring buffer so the frontend can render every line the
@@ -4777,6 +5189,27 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         state.recording.frameIndex = 0
     elif "Input stream closed; stopping recording session." in output:
         state.recording.message = "Recorder input closed; finalizing dataset"
+
+
+def _apply_box_roster(state: GatewayState, roster: list[dict[str, Any]]) -> None:
+    """Replace the box_collection device rows with the discovered roster.
+
+    The recorder emits this once at Connect after broadcast discovery. We swap
+    the static YAML-derived box rows for one row per (discovered box × sensor)
+    so the Device Manager lists exactly the boxes on the subnet. A subsequent
+    ``Box devices:`` line then marks each row live/error by id.
+    """
+    state.box_devices_roster = roster
+    new_rows = _box_devices_from_roster(roster)
+    if not new_rows:
+        return
+    # Drop existing box rows, keep every other device, append the discovered set.
+    state.devices = [d for d in state.devices if d.get("kind") != "box_collection"]
+    state.devices.extend(new_rows)
+    labels = ", ".join(
+        f"{e.get('box_id') or e.get('sn') or e.get('device_id')}" for e in roster
+    )
+    state.log("info", f"discovered {len(roster)} BOX device(s): {labels}")
 
 
 def _apply_box_rates(state: GatewayState, rates_str: str) -> None:
@@ -5171,6 +5604,12 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             with self.server.state.lock:
                 _json_response(self, HTTPStatus.OK, _box_preview_payload(self.server.state, device_id))
                 return
+        if path == "/api/device/box-cali-log":
+            # Calibration log buffer (polled by the Device Manager log box).
+            # Uses its own box_cali_lock inside the payload helper, so it never
+            # contends with the main state lock or the recorder-stdout drain.
+            _json_response(self, HTTPStatus.OK, _box_cali_log_payload(self.server.state))
+            return
         if path == "/api/device-preview/camera.jpg":
             device_id = query.get("key", [""])[0]
             if not device_id:
@@ -5318,6 +5757,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _mock_calibrate_cameras(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
+                if path == "/api/device/calibrate-6dforce":
+                    result = _trigger_box_six_d_force_cali(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
                 if path == "/api/processing/qc":
                     requested = (query.get("path", [""])[0] or "").strip()
                     dataset_root = _resolve_known_dataset(self.server.state, requested)
@@ -5398,6 +5842,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 if path == "/api/tasks/export":
                     task_id = (query.get("id", [""])[0] or "").strip()
                     _start_task_export(self.server.state, task_id)
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/datasets/export":
+                    requested = (query.get("path", [""])[0] or "").strip()
+                    _start_approved_dataset_export(self.server.state, requested)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
         except Exception as exc:  # noqa: BLE001

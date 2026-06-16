@@ -8,6 +8,7 @@ import type {
   DatasetExportStatus,
   DeviceStatus,
   BoxPreviewPayload,
+  BoxCaliLog,
   EventLogItem,
   GatewayStatus,
   ProcessingItem,
@@ -155,14 +156,12 @@ export class DataCollectionGuiApi {
       selectedEpisodes: 0,
       totalFrames: 0,
       includeRaw: true,
-      includeDebug: true,
+      includeDebug: false,
       includeTraining: true,
-      message: "Prepare an export after recording or loading an episode",
+      message: "Select a task or QC-passed dataset to export",
       manifest: [
         "raw/videos/*.mp4",
         "raw/events.jsonl",
-        "debug/session.mcap",
-        "debug/rerun.rrd",
         "training/lerobot_v3"
       ]
     },
@@ -224,44 +223,6 @@ export class DataCollectionGuiApi {
     };
     this.snapshot.devices = this.snapshot.devices.map((device) => ({ ...device, state: "running" }));
     this.log("info", "Episode recording started");
-    return this.getSnapshot();
-  }
-
-  async prepareDatasetExport(target: DatasetExportStatus["target"]): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot(`/api/dataset/export/prepare?target=${target}`);
-    if (remote) {
-      return this.withFrontendFallbacks(remote);
-    }
-    await wait(180);
-    const totalFrames = this.snapshot.replay.recordedFrames || this.snapshot.trajectory.length;
-    const selectedEpisodes = Math.max(this.snapshot.replay.totalEpisodes ?? 0, this.snapshot.recording.savedEpisodes);
-    this.snapshot.datasetExport = {
-      ...this.snapshot.datasetExport,
-      state: "ready",
-      target,
-      datasetRoot: this.snapshot.replay.datasetRoot || this.snapshot.recording.datasetRoot,
-      outputPath: `${this.snapshot.replay.datasetRoot || this.snapshot.recording.datasetRoot}/exports/${target}`,
-      selectedEpisodes,
-      totalFrames,
-      message: `Export plan ready for ${target}`,
-      manifest: this.exportManifest(target)
-    };
-    this.log("info", `Dataset export prepared: ${target}`);
-    return this.getSnapshot();
-  }
-
-  async startDatasetExport(): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot("/api/dataset/export/start");
-    if (remote) {
-      return this.withFrontendFallbacks(remote);
-    }
-    await wait(260);
-    this.snapshot.datasetExport = {
-      ...this.snapshot.datasetExport,
-      state: "complete",
-      message: `Export complete at ${this.snapshot.datasetExport.outputPath}`
-    };
-    this.log("info", `Dataset export complete: ${this.snapshot.datasetExport.outputPath}`);
     return this.getSnapshot();
   }
 
@@ -532,6 +493,33 @@ export class DataCollectionGuiApi {
     }
   }
 
+  async triggerSixDForceCalibration(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/device/calibrate-6dforce`, {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      const body = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      return { ok: response.ok && body.ok !== false, error: body.error };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  async fetchBoxCaliLog(): Promise<BoxCaliLog | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/device/box-cali-log`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as BoxCaliLog;
+    } catch {
+      return null;
+    }
+  }
+
   async fetchReplayTimeline(datasetPath: string, episode?: number): Promise<ReplayTimeline | null> {
     try {
       const params = new URLSearchParams({ path: datasetPath });
@@ -630,6 +618,24 @@ export class DataCollectionGuiApi {
       message: `Consolidating sessions for task ${taskId}… (mock)`
     };
     this.log("info", `Started v3 export for task: ${taskId}`);
+    return this.getSnapshot();
+  }
+
+  async exportApprovedDataset(path: string): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot(`/api/datasets/export?path=${encodeURIComponent(path)}`);
+    if (remote) {
+      return remote;
+    }
+    await wait(120);
+    this.snapshot.datasetExport = {
+      ...this.snapshot.datasetExport,
+      state: "exporting",
+      target: "lerobot_v3",
+      datasetRoot: path,
+      outputPath: `${path}/exports/lerobot_v3`,
+      message: `Exporting approved dataset ${path}… (mock)`
+    };
+    this.log("info", `Started approved dataset v3 export: ${path}`);
     return this.getSnapshot();
   }
 
@@ -767,7 +773,7 @@ export class DataCollectionGuiApi {
   }
 
   private applyRemoteCommandError(endpoint: string, message: string) {
-    const command = endpoint.split("/").filter(Boolean).at(-1) ?? "command";
+    const command = endpoint.split("?")[0].split("/").filter(Boolean).at(-1) ?? "command";
     if (endpoint.includes("/handheld/record/")) {
       this.snapshot.recording = {
         ...this.snapshot.recording,
@@ -781,7 +787,7 @@ export class DataCollectionGuiApi {
         safety: "fault",
         message: `Replay ${command} failed: ${message}`
       };
-    } else if (endpoint.includes("/dataset/export/")) {
+    } else if (endpoint.includes("/tasks/export") || endpoint.includes("/datasets/export")) {
       this.snapshot.datasetExport = {
         ...this.snapshot.datasetExport,
         state: "error",
@@ -897,18 +903,4 @@ export class DataCollectionGuiApi {
     ];
   }
 
-  private exportManifest(target: DatasetExportStatus["target"]): string[] {
-    if (target === "mcap") {
-      return ["debug/session.mcap", "debug/timeline_index.json", "debug/rerun.rrd"];
-    }
-    if (target === "parquet") {
-      return ["training/data/chunk-*/episode_*.parquet", "training/meta/info.json", "training/meta/stats.json"];
-    }
-    return [
-      "training/lerobot_v3/data/chunk-*/episode_*.parquet",
-      "training/lerobot_v3/videos/chunk-*/*.mp4",
-      "training/lerobot_v3/meta/info.json",
-      "training/lerobot_v3/meta/episodes.jsonl"
-    ];
-  }
 }

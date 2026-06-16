@@ -276,3 +276,49 @@ def test_timestamps_excluded_from_state_and_emitted_as_metadata_column(tmp_path)
     aligned_idx = _aligned_distances(clean, 0.0)
     expected_mcu = [idx * SAMPLE_PERIOD_TICKS for idx in aligned_idx]
     assert gripper_mcu == expected_mcu
+
+
+
+def test_multi_box_namespaced_snapshots_expand_state_and_timestamps(tmp_path):
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    snapshots = [
+        {
+            "t_relative_s": 0.0,
+            "sensors": {
+                "box1672693301/box_gripper": {"timestamp": 100.0, "distance_m": 0.031},
+                "box1672693301/box_trigger": {"timestamp": 101.0, "travel_pct": 0.25},
+                "box1819152274/box_gripper": {"timestamp": 200.0, "distance_m": 0.044},
+                "box1819152274/box_trigger": {"timestamp": 201.0, "travel_pct": 0.75},
+            },
+        }
+    ]
+    box_ids = lr3.box_ids_from_snapshots(snapshots)
+    assert box_ids == ("box1672693301", "box1819152274")
+
+    rows = lr3._build_episode_rows(
+        fps=FPS,
+        episode_index=0,
+        snapshots=snapshots,
+        duration_s=1 / FPS,
+        box_ids=box_ids,
+    )
+    state_names = lr3.box_state_names(box_ids)
+    ts_names = lr3.box_timestamp_names(box_ids)
+    assert len(rows[0]["observation.state"]) == len(lr3.BOX_STATE_NAMES) * 2
+    assert len(rows[0]["box.timestamps"]) == len(lr3.BOX_TIMESTAMP_NAMES) * 2
+    assert state_names[0] == "box1672693301.box_gripper.distance_m"
+    assert "box1819152274.box_trigger.travel_pct" in state_names
+    first_gripper = state_names.index("box1672693301.box_gripper.distance_m")
+    second_gripper = state_names.index("box1819152274.box_gripper.distance_m")
+    assert rows[0]["observation.state"][first_gripper] == pytest.approx(0.031)
+    assert rows[0]["observation.state"][second_gripper] == pytest.approx(0.044)
+
+    writer = lr3.Lr3Writer(tmp_path, repo_id="thor_multi_box_test", task="pick", fps=FPS)
+    writer.append_episode(episode_index=0, snapshots=snapshots, duration_s=1 / FPS)
+    writer.finalize()
+    table = pq.read_table(tmp_path / "data" / "chunk-000" / "file-000.parquet")
+    assert len(table["observation.state"].to_pylist()[0]) == len(state_names)
+    info = __import__("json").loads((tmp_path / "meta" / "info.json").read_text())
+    assert info["features"]["observation.state"]["names"] == list(state_names)
+    assert info["features"]["box.timestamps"]["names"] == list(ts_names)

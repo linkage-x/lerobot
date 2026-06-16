@@ -322,5 +322,5 @@ sleep 30 && tail -80 /tmp/log
 - `tools/data_collection_gui/docs/option_a_persistent_pipeline_design.md` — 方案 A 完整设计 + burn-in 数据
 - `tools/data_collection_gui/docs/pr1_implementation_log.md` — PR1 实施日志（4 个问题处理 + 3 项验证）
 - `tools/data_collection_gui/docs/development_status.md` — 本文档
-- `tools/data_collection_gui/docs/traj_gen_thor_gmsl2_compatibility.md` — traj-gen（EE 轨迹生成）对 Thor gmsl2 数据的兼容性结论：hikon 专属，目前不适用，需完善
+- `tools/data_collection_gui/docs/traj_gen_thor_gmsl2_compatibility.md` — traj-gen（EE 轨迹生成）已切到 gmsl2 AprilTag 追踪，Thor 真机可用：按钮跑 `run_april_cube_tracking_local.sh` 生成 sidecar，v3 与 gmsl2 两条 timeline 路径都显示 EE pose，时间戳走 PWM 网格
 - `tools/thor/DEPLOYMENT.md` — Thor 部署清单（PR2 完成后需更新）

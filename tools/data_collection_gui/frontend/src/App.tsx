@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DataCollectionGuiApi, type GuiSnapshot } from "./api";
 import { ReplayInspector } from "./ReplayInspector";
 import type {
   BoxPreviewPayload,
+  BoxCaliLogLine,
   CollectionTask,
   ConfigSummary,
   DeviceStatus,
@@ -1471,16 +1472,14 @@ function QcReportPage({ snapshot }: { snapshot: GuiSnapshot }) {
 function DatasetExportPage({
   snapshot,
   busy,
-  onPrepare,
-  onExport,
   onExportTask,
+  onExportApprovedDataset,
   onOpenProcessing
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
-  onPrepare: (target: GuiSnapshot["datasetExport"]["target"]) => void;
-  onExport: () => void;
   onExportTask: (id: string) => void;
+  onExportApprovedDataset: (path: string) => void;
   onOpenProcessing: () => void;
 }) {
   const exportStatus = snapshot.datasetExport;
@@ -1490,7 +1489,7 @@ function DatasetExportPage({
   const exporting = exportStatus.state === "exporting";
   return (
     <div className="page-stack">
-      <PageHeader title="Dataset Export" subtitle="package QC-approved datasets into LeRobot, MCAP, or Parquet bundles" />
+      <PageHeader title="Dataset Export" subtitle="consolidate task sessions or QC-approved datasets into LeRobot v3" />
       <section className="panel">
         <div className="panel-heading">
           <h2>Consolidate a Task</h2>
@@ -1558,6 +1557,12 @@ function DatasetExportPage({
                   <div className="processing-stats">
                     <span>{item.totalEpisodes} ep · {item.totalFrames} fr</span>
                     <small>{item.updatedAt}</small>
+                    <button
+                      disabled={busy || exporting}
+                      onClick={() => onExportApprovedDataset(item.path)}
+                    >
+                      {exporting && exportStatus.datasetRoot === item.path ? "Exporting…" : "Export v3"}
+                    </button>
                   </div>
                 </div>
               </div>
@@ -1579,12 +1584,6 @@ function DatasetExportPage({
             <StatusDot state={exportStatus.state} />
             {stateLabel(exportStatus.state)}
           </span>
-        </div>
-        <div className="control-row">
-          <button disabled={busy || !hasEligible} onClick={() => onPrepare("lerobot_v3")}>LeRobot v3</button>
-          <button disabled={busy || !hasEligible} onClick={() => onPrepare("mcap")}>MCAP</button>
-          <button disabled={busy || !hasEligible} onClick={() => onPrepare("parquet")}>Parquet</button>
-          <button disabled={busy || exportStatus.state !== "ready" || !hasEligible} onClick={onExport}>Run Export</button>
         </div>
         <div className="summary-grid">
           <Metric label="Target" value={exportStatus.target} />
@@ -2032,6 +2031,269 @@ function DeviceInlinePreview({ device }: { device: DeviceStatus }) {
   );
 }
 
+// BOX device ids are namespaced as `<box_id>/<sensor>` when more than one BOX
+// is configured; strip the prefix so we match on the bare sensor name.
+function boxSensorSuffix(deviceId: string): string {
+  const slash = deviceId.lastIndexOf("/");
+  return slash >= 0 ? deviceId.slice(slash + 1) : deviceId;
+}
+
+// The Paxini touch pads and the 6D force sensor carry array payloads that read
+// far better as a full-frame visualization (like a camera tile) than as the
+// scalar key/value rows the gripper/IMU/trigger use.
+function isVisualBoxSensor(deviceId: string): boolean {
+  const sid = boxSensorSuffix(deviceId);
+  return sid.startsWith("box_touch") || sid === "box_six_d_force";
+}
+
+// Full-frame tactile heatmap: same point layout as DeviceTouchPreview but sized
+// to fill the tile media (height-bound, centered) instead of a fixed map.
+function BoxTouchTileView({ sensor }: { sensor?: Record<string, unknown> | null }) {
+  const values = numberArray(sensor?.fz_0p1N);
+  const hasData = values.length >= 239;
+  if (!hasData) {
+    return <div className="camera-tile-empty">no touch sample</div>;
+  }
+  const scaleMax = Math.max(1, ...values.map((value) => Math.abs(value)));
+  let cursor = 0;
+  return (
+    <div className="box-touch-fill" aria-label="live tactile preview">
+      {DEVICE_TOUCH_ROW_LENGTHS.map((length, rowIndex) => {
+        const offset = Math.floor((DEVICE_TOUCH_COLUMNS - length) / 2);
+        const row = values.slice(cursor, cursor + length);
+        const startIndex = cursor;
+        cursor += length;
+        return (
+          <div className="touch-row" key={rowIndex}>
+            {Array.from({ length: offset }).map((_, index) => (
+              <span className="touch-cell touch-cell-empty" key={`pre-${index}`} />
+            ))}
+            {row.map((value, index) => {
+              const pointIndex = startIndex + index + 1;
+              return (
+                <span
+                  className="touch-cell"
+                  key={pointIndex}
+                  title={`#${pointIndex} fz=${value.toFixed(1)} (0.1N)`}
+                  style={{ backgroundColor: previewTouchColor(Math.abs(value), scaleMax) }}
+                />
+              );
+            })}
+            {Array.from({ length: DEVICE_TOUCH_COLUMNS - length - offset }).map((_, index) => (
+              <span className="touch-cell touch-cell-empty" key={`post-${index}`} />
+            ))}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+const FORCE_TILE_CHANNELS: { label: string; unit: string }[] = [
+  { label: "Fx", unit: "N" },
+  { label: "Fy", unit: "N" },
+  { label: "Fz", unit: "N" },
+  { label: "Mx", unit: "N·m" },
+  { label: "My", unit: "N·m" },
+  { label: "Mz", unit: "N·m" },
+];
+
+// Full-frame 6D force/torque: bipolar bars centered on zero (force can push or
+// pull on every axis), forces and moments scaled independently so neither
+// dwarfs the other.
+function BoxForceTileView({ sensor }: { sensor?: Record<string, unknown> | null }) {
+  const values = numberArray(sensor?.fxyz_mxyz);
+  if (values.length < 6) {
+    return <div className="camera-tile-empty">no force sample</div>;
+  }
+  const forceMax = Math.max(1, ...values.slice(0, 3).map((value) => Math.abs(value)));
+  const momentMax = Math.max(0.1, ...values.slice(3, 6).map((value) => Math.abs(value)));
+  return (
+    <div className="box-force-fill" aria-label="live 6D force preview">
+      {FORCE_TILE_CHANNELS.map((channel, index) => {
+        const value = values[index] ?? 0;
+        const max = index < 3 ? forceMax : momentMax;
+        const ratio = Math.max(-1, Math.min(1, value / max));
+        const pct = Math.abs(ratio) * 50;
+        const positive = ratio >= 0;
+        return (
+          <div className="force-bipolar-row" key={channel.label}>
+            <span className="force-bipolar-label">{channel.label}</span>
+            <div className="force-bipolar-track">
+              <i
+                className={positive ? "pos" : "neg"}
+                style={positive ? { left: "50%", width: `${pct}%` } : { right: "50%", width: `${pct}%` }}
+              />
+            </div>
+            <strong className="force-bipolar-value">
+              {value.toFixed(2)}
+              <small>{channel.unit}</small>
+            </strong>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Camera-tile lookalike for the array BOX sensors: the live visualization fills
+// the media, and the scalar config / liveness stats live in the hover overlay,
+// mirroring CameraTile so the Device Manager grid stays visually uniform.
+// Calibrate button + scrolling log box for the BOX 6D force sensor. Triggering
+// rides the recorder's stdin (gateway POST), and progress streams back as
+// CALI_LOG/CALI_DONE lines the gateway buffers; we poll that buffer while a run
+// is active and auto-scroll the box to the newest line.
+function SixDForceCalibration() {
+  const [lines, setLines] = useState<BoxCaliLogLine[]>([]);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const logRef = useRef<HTMLDivElement | null>(null);
+  const pollRef = useRef<number | null>(null);
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current != null) {
+      window.clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  const poll = useCallback(async () => {
+    const log = await api.fetchBoxCaliLog();
+    if (!log) {
+      return;
+    }
+    setLines(log.lines);
+    setRunning(log.running);
+    if (!log.running) {
+      stopPolling();
+    }
+  }, [stopPolling]);
+
+  // Load any prior log once on mount; only poll continuously while a run is live.
+  useEffect(() => {
+    poll();
+    return stopPolling;
+  }, [poll, stopPolling]);
+
+  // Keep the newest line in view as the log grows.
+  useEffect(() => {
+    const el = logRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [lines]);
+
+  const onCalibrate = useCallback(async () => {
+    setError(null);
+    setRunning(true);
+    const res = await api.triggerSixDForceCalibration();
+    if (!res.ok) {
+      setError(res.error ?? "calibration failed to start");
+      setRunning(false);
+      poll(); // surface whatever the gateway appended (e.g. "recorder not connected")
+      return;
+    }
+    stopPolling();
+    pollRef.current = window.setInterval(poll, 300);
+    poll();
+  }, [poll, stopPolling]);
+
+  return (
+    <div className="force-cali">
+      <div className="force-cali-controls">
+        <button className="force-cali-btn" onClick={onCalibrate} disabled={running}>
+          {running ? "Calibrating…" : "Calibrate 6D force"}
+        </button>
+        {error && <span className="force-cali-error">{error}</span>}
+      </div>
+      <div className="force-cali-log" ref={logRef}>
+        {lines.length === 0 ? (
+          <div className="force-cali-log-empty">No calibration run yet.</div>
+        ) : (
+          lines.map((entry, i) => (
+            <div className="force-cali-log-line" key={`${entry.ts}-${i}`}>
+              {entry.line}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+function BoxSensorTile({ device }: { device: DeviceStatus }) {
+  const [preview, setPreview] = useState<BoxPreviewPayload | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    const load = async () => {
+      const next = await api.fetchBoxPreview(device.id);
+      if (mounted) {
+        setPreview(next);
+      }
+    };
+    load();
+    const timer = window.setInterval(load, 100);
+    return () => {
+      mounted = false;
+      window.clearInterval(timer);
+    };
+  }, [device.id]);
+
+  const sensor = preview?.sensor ?? null;
+  const isForce = boxSensorSuffix(device.id) === "box_six_d_force" || Array.isArray(sensor?.fxyz_mxyz);
+  const staleS = preview?.staleS == null ? null : preview.staleS;
+  const sampleAge = staleS == null ? "-" : `${staleS.toFixed(1)}s`;
+  const queueSize = numberValue(preview?.status?.queue_size);
+  const config = device.config ?? {};
+  const configEntries = Object.entries(config).filter(
+    ([, v]) => v != null && typeof v !== "object"
+  );
+
+  return (
+    <div className="camera-tile">
+      <div className="camera-tile-media box-sensor-media">
+        {isForce ? <BoxForceTileView sensor={sensor} /> : <BoxTouchTileView sensor={sensor} />}
+        <div className="camera-tile-overlay">
+          <div className="device-live-stats">
+            <Metric label="Live" value={preview?.active ? "yes" : "no"} />
+            <Metric label="Age" value={sampleAge} />
+            <Metric label="Queue" value={queueSize ?? "-"} />
+          </div>
+          <div className="device-config-grid">
+            <div className="device-config-row">
+              <span className="device-config-key">label</span>
+              <span className="device-config-value">{device.label}</span>
+            </div>
+            <div className="device-config-row">
+              <span className="device-config-key">timestamp</span>
+              <span className="device-config-value">{String(sensor?.timestamp ?? "-")}</span>
+            </div>
+            {device.detail && (
+              <div className="device-config-row">
+                <span className="device-config-key">detail</span>
+                <span className="device-config-value">{device.detail}</span>
+              </div>
+            )}
+            {configEntries.map(([key, value]) => (
+              <div className="device-config-row" key={key}>
+                <span className="device-config-key">{key}</span>
+                <span className="device-config-value">{String(value)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="camera-tile-label">
+        <StatusDot state={device.state} />
+        <strong>{device.id}</strong>
+        <span className="camera-tile-stat">{device.fps} Hz</span>
+      </div>
+      {isForce && <SixDForceCalibration />}
+    </div>
+  );
+}
+
 // Cold-spawn (Argus open + AWB settle) can 503 for a few seconds before the
 // first frame; keep retrying with backoff this many times (~15s) before
 // surfacing "preview unavailable", then keep probing in case it recovers.
@@ -2151,6 +2413,55 @@ function CameraTile({ device, snapshot }: { device: DeviceStatus; snapshot: GuiS
   );
 }
 
+// Expandable scalar-sensor row used for every non-camera device (and the BOX
+// gripper/IMU/trigger). Factored out so the box_collection section can mix tile
+// and row rendering without duplicating the markup.
+function DeviceRow({
+  device,
+  isExpanded,
+  onToggle,
+}: {
+  device: DeviceStatus;
+  isExpanded: boolean;
+  onToggle: (id: string) => void;
+}) {
+  const config = device.config ?? {};
+  const configEntries = Object.entries(config).filter(
+    ([, v]) => v != null && typeof v !== "object"
+  );
+  return (
+    <div className={`device-manager-row ${isExpanded ? "device-manager-row-active" : ""}`}>
+      <button className="device-manager-header" onClick={() => onToggle(device.id)}>
+        <div className="row-title">
+          <StatusDot state={device.state} />
+          <strong>{device.id}</strong>
+        </div>
+        <div className="device-stats">
+          <span>{device.fps} fps</span>
+          <span>{device.latencyMs} ms</span>
+          <small>{device.detail}</small>
+          <small>{isExpanded ? "close" : "open"}</small>
+        </div>
+      </button>
+      {isExpanded && (
+        <div className="device-config-detail device-config-detail-expanded">
+          {configEntries.length > 0 && (
+            <div className="device-config-grid">
+              {configEntries.map(([key, value]) => (
+                <div className="device-config-row" key={key}>
+                  <span className="device-config-key">{key}</span>
+                  <span className="device-config-value">{String(value)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <DeviceInlinePreview device={device} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
   const [hideErrors, setHideErrors] = useState(false);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
@@ -2221,48 +2532,37 @@ function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
                 <CameraTile key={device.id} device={device} snapshot={snapshot} />
               ))}
             </div>
+          ) : kind === "box_collection" ? (
+            <>
+              {items.some((d) => isVisualBoxSensor(d.id)) && (
+                <div className="camera-grid box-sensor-grid">
+                  {items
+                    .filter((d) => isVisualBoxSensor(d.id))
+                    .map((device) => (
+                      <BoxSensorTile key={device.id} device={device} />
+                    ))}
+                </div>
+              )}
+              {items
+                .filter((d) => !isVisualBoxSensor(d.id))
+                .map((device) => (
+                  <DeviceRow
+                    key={device.id}
+                    device={device}
+                    isExpanded={expandedIds.has(device.id)}
+                    onToggle={toggleExpanded}
+                  />
+                ))}
+            </>
           ) : (
-          items.map((device) => {
-            const isExpanded = expandedIds.has(device.id);
-            const config = device.config ?? {};
-            const configEntries = Object.entries(config).filter(
-              ([, v]) => v != null && typeof v !== "object"
-            );
-            return (
-              <div className={`device-manager-row ${isExpanded ? "device-manager-row-active" : ""}`} key={device.id}>
-                <button
-                  className="device-manager-header"
-                  onClick={() => toggleExpanded(device.id)}
-                >
-                  <div className="row-title">
-                    <StatusDot state={device.state} />
-                    <strong>{device.id}</strong>
-                  </div>
-                  <div className="device-stats">
-                    <span>{device.fps} fps</span>
-                    <span>{device.latencyMs} ms</span>
-                    <small>{device.detail}</small>
-                    <small>{isExpanded ? "close" : "open"}</small>
-                  </div>
-                </button>
-                {isExpanded && (
-                  <div className="device-config-detail device-config-detail-expanded">
-                    {configEntries.length > 0 && (
-                      <div className="device-config-grid">
-                        {configEntries.map(([key, value]) => (
-                          <div className="device-config-row" key={key}>
-                            <span className="device-config-key">{key}</span>
-                            <span className="device-config-value">{String(value)}</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    <DeviceInlinePreview device={device} />
-                  </div>
-                )}
-              </div>
-            );
-          })
+            items.map((device) => (
+              <DeviceRow
+                key={device.id}
+                device={device}
+                isExpanded={expandedIds.has(device.id)}
+                onToggle={toggleExpanded}
+              />
+            ))
           )}
         </section>
       ))}
@@ -2449,9 +2749,8 @@ function App() {
       <DatasetExportPage
         snapshot={snapshot}
         busy={busy}
-        onPrepare={(target) => run(() => api.prepareDatasetExport(target))}
-        onExport={() => run(() => api.startDatasetExport())}
         onExportTask={exportTaskWithQcGuard}
+        onExportApprovedDataset={(path) => run(() => api.exportApprovedDataset(path))}
         onOpenProcessing={() => navigate("dataset-processing")}
       />
     ) : activePage === "task-library" ? (

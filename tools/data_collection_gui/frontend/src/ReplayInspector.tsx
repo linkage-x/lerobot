@@ -48,7 +48,7 @@ function touchColor(value: number, scaleMax: number): string {
 function touchScaleMax(timeline: ReplayTimeline | null): number {
   let maxValue = 1;
   for (const entry of timeline?.frames ?? []) {
-    for (const sample of [entry.touch?.left, entry.touch?.right]) {
+    for (const sample of Object.values(entry.touch ?? {})) {
       for (const value of sample?.fz ?? []) {
         if (Number.isFinite(value)) {
           maxValue = Math.max(maxValue, Math.abs(value));
@@ -57,6 +57,15 @@ function touchScaleMax(timeline: ReplayTimeline | null): number {
     }
   }
   return maxValue;
+}
+
+function touchEntries(frame: ReplayTimelineFrame | undefined): Array<[string, TouchPadFrame | undefined]> {
+  const entries = Object.entries(frame?.touch ?? {});
+  if (entries.length === 0) {
+    return [["left", undefined], ["right", undefined]];
+  }
+  const sideRank = (key: string) => key.endsWith(".left") || key === "left" ? 0 : 1;
+  return entries.sort(([a], [b]) => sideRank(a) - sideRank(b) || a.localeCompare(b));
 }
 
 function TouchHeatmap({
@@ -462,6 +471,31 @@ export function ReplayInspector({
     setCurrentFrame(Math.max(0, Math.min(nextFrame, totalFrames - 1)));
   }, [totalFrames]);
 
+  const togglePlay = useCallback(() => {
+    if (playing) {
+      setPlaying(false);
+      return;
+    }
+    // Starting playback while already parked on the last frame would be
+    // killed instantly by the raf tick's end-of-clip check, so rewind to the
+    // start first. The currentFrame->video sync effect skips seeking while
+    // `playing` is true, so rewind the <video> elements here directly.
+    if (totalFrames > 0 && currentFrame >= totalFrames - 1) {
+      setCurrentFrame(0);
+      Object.values(videoRefs.current).forEach((video) => {
+        if (!video) {
+          return;
+        }
+        try {
+          video.currentTime = videoWarmupS;
+        } catch {
+          // ignore: browsers may throw if metadata is not yet loaded
+        }
+      });
+    }
+    setPlaying(true);
+  }, [playing, currentFrame, totalFrames, videoWarmupS]);
+
   if (!datasetPath) {
     return null;
   }
@@ -505,7 +539,7 @@ export function ReplayInspector({
         </span>
       </div>
       <div className="inspector-toolbar">
-        <button onClick={() => setPlaying((value) => !value)}>{playing ? "Pause" : "Play"}</button>
+        <button onClick={togglePlay}>{playing ? "Pause" : "Play"}</button>
         <input
           type="range"
           min={0}
@@ -553,8 +587,9 @@ export function ReplayInspector({
           <span>fz pseudo color · 239 points</span>
         </div>
         <div className="touch-heatmaps">
-          <TouchHeatmap title="Left sensor" sample={frame?.touch?.left} scaleMax={touchMax} />
-          <TouchHeatmap title="Right sensor" sample={frame?.touch?.right} scaleMax={touchMax} />
+          {touchEntries(frame).map(([key, sample]) => (
+            <TouchHeatmap key={key} title={key} sample={sample} scaleMax={touchMax} />
+          ))}
         </div>
         <div className="touch-legend" aria-hidden="true">
           <span>0</span>

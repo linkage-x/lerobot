@@ -129,6 +129,27 @@ box_collection:
     - box_touch_left
     - box_touch_right
 
+# Multi-box form (forward-looking; needs vendor SDK support to actually run --
+# see tools/thor/box_sdk/MULTI_BOX_PROTOCOL.md). The flat block above is the
+# single-box special case. To drive several BOXes on one subnet, drop the flat
+# fields and list them under `boxes:`; each needs a unique `box_id` that
+# namespaces its sensor IDs (box0/box_gripper, box1/box_gripper, ...). Set
+# `discovery: sdk` to defer the box list to the vendor enumeration API once it
+# ships; until then it falls back to the static `boxes` list with a warning.
+#
+# box_collection:
+#   enabled: true
+#   discovery: static          # static | sdk
+#   boxes:
+#     - box_id: box0
+#       bind_ip: "192.168.2.45"
+#       remote_ip: "192.168.2.60"
+#       expected_devices: [box_gripper, box_imu, box_trigger]
+#     - box_id: box1
+#       bind_ip: "192.168.2.45"
+#       remote_ip: "192.168.2.61"
+#       expected_devices: [box_gripper, box_imu, box_trigger]
+
 # When Connect finds nvargus-daemon in a wedged state, the recorder can run
 # `tools/thor/gmsl2/recover_argus.sh` automatically and reconnect once,
 # instead of asking the operator to ssh in and run it by hand. Trigger
