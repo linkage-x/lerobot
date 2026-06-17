@@ -722,26 +722,110 @@ class StaticBoxDiscovery(BoxDiscovery):
         return list(self._boxes)
 
 
-class SdkBoxDiscovery(BoxDiscovery):
-    """Placeholder for vendor-SDK subnet enumeration.
+# Proposed ``sensor_mask`` bit order for ``box_discover()`` / self-describing
+# packets: bit i set => ``KNOWN_SENSOR_IDS[i]`` is present on that box. The
+# vendor must match this layout (documented in MULTI_BOX_PROTOCOL.md §2.2);
+# if they pick a different order, adjust this single tuple.
+SENSOR_MASK_BITS: tuple[str, ...] = KNOWN_SENSOR_IDS
 
-    Real auto-detection needs the SDK to attribute UDP packets to their source
-    box (the firmware pushes every box to the same host:port and the current
-    ``get_sensor_cache()`` merges them with no source field) or to expose a
-    discovery call. Until that ships this degrades to the statically configured
-    boxes with a warning, so ``discovery: sdk`` is safe to set in advance.
-    See ``tools/thor/box_sdk/MULTI_BOX_PROTOCOL.md``.
+
+def decode_sensor_mask(mask: int) -> list[str]:
+    """Turn a ``sensor_mask`` bitfield into the sensor IDs a box advertises."""
+    return [sid for i, sid in enumerate(SENSOR_MASK_BITS) if mask & (1 << i)]
+
+
+@dataclass
+class BoxInfo:
+    """Host-side mirror of the SDK ``BoxInfo`` record from ``box_discover()``.
+
+    Field names follow MULTI_BOX_PROTOCOL.md §2.2. ``box_serial`` is the stable
+    identity (survives IP changes); ``sensor_mask`` advertises which sensors the
+    box carries so the host need not hardcode the full set.
     """
 
-    def __init__(self, fallback: list[BoxClientConfig]):
+    box_serial: str
+    ip: str = ""
+    model: str = ""
+    fw_version: int = 0
+    proto_version: int = 0
+    sensor_mask: int = 0
+
+
+def box_info_to_config(
+    info: BoxInfo,
+    template: BoxClientConfig,
+    *,
+    aliases: dict[str, str] | None = None,
+) -> BoxClientConfig:
+    """Map one discovered :class:`BoxInfo` onto a :class:`BoxClientConfig`.
+
+    Shared transport defaults (bind_ip, ports, poll intervals, sdk_dir, urdf)
+    come from ``template``; per-box fields come from the discovery record. The
+    namespace ``box_id`` defaults to the stable serial; ``aliases`` lets an
+    operator pin a friendly label (``{serial: "box0"}``) so dataset keys stay
+    short. An empty ``sensor_mask`` falls back to the template's expected list.
+    """
+    box_id = (aliases or {}).get(info.box_serial, info.box_serial)
+    expected = decode_sensor_mask(info.sensor_mask) or list(template.expected_devices)
+    return replace(
+        template,
+        box_id=box_id,
+        remote_ip=info.ip or template.remote_ip,
+        expected_devices=expected,
+    )
+
+
+class SdkBoxDiscovery(BoxDiscovery):
+    """SDK-backed subnet enumeration (option A in MULTI_BOX_PROTOCOL.md).
+
+    Only the raw enumeration call into the vendor SDK (``box_discover()``) is
+    still missing -- everything downstream is implemented and tested: mapping
+    ``BoxInfo`` records onto namespaced :class:`BoxClientConfig`s that inherit
+    shared transport defaults from a template. When the SDK ships, pass its
+    binding as ``enumerate_fn`` (a zero-arg callable returning ``list[BoxInfo]``)
+    and the rest works unchanged. Until then ``discover()`` logs a warning and
+    returns the statically configured boxes, so ``discovery: sdk`` is safe to
+    set in advance.
+    """
+
+    def __init__(
+        self,
+        fallback: list[BoxClientConfig],
+        *,
+        enumerate_fn: Any = None,
+        template: BoxClientConfig | None = None,
+        aliases: dict[str, str] | None = None,
+    ):
         self._fallback = StaticBoxDiscovery(fallback)
+        self._enumerate_fn = enumerate_fn
+        # Shared transport defaults for discovered boxes: reuse the first
+        # configured box if present, else library defaults.
+        self._template = template or (fallback[0] if fallback else BoxClientConfig())
+        self._aliases = dict(aliases or {})
+
+    def _enumerate(self) -> list[BoxInfo]:
+        if self._enumerate_fn is None:
+            raise NotImplementedError(
+                "box_discover() not available in the vendored SDK yet; "
+                "see tools/thor/box_sdk/MULTI_BOX_PROTOCOL.md"
+            )
+        return list(self._enumerate_fn())
 
     def discover(self) -> list[BoxClientConfig]:
-        logger.warning(
-            "SdkBoxDiscovery: vendor enumeration API not available yet; "
-            "falling back to statically configured boxes"
-        )
-        return self._fallback.discover()
+        try:
+            infos = self._enumerate()
+        except NotImplementedError as exc:
+            logger.warning("SdkBoxDiscovery: %s; falling back to static boxes", exc)
+            return self._fallback.discover()
+        except Exception as exc:  # SDK present but the enumeration call failed
+            logger.warning(
+                "SdkBoxDiscovery enumeration raised (%s); falling back to static boxes", exc
+            )
+            return self._fallback.discover()
+        if not infos:
+            logger.warning("SdkBoxDiscovery: no boxes discovered; falling back to static boxes")
+            return self._fallback.discover()
+        return [box_info_to_config(i, self._template, aliases=self._aliases) for i in infos]
 
 
 def make_discovery(cfg: BoxFleetConfig) -> BoxDiscovery:

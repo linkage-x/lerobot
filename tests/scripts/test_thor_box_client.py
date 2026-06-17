@@ -443,9 +443,76 @@ def test_fleet_config_rejects_missing_or_duplicate_box_ids():
 
 def test_sdk_discovery_falls_back_to_static_boxes():
     boxes = [box_client.BoxClientConfig(box_id="box0")]
+    # No enumerate_fn -> box_discover() unavailable -> fall back to static.
     assert box_client.SdkBoxDiscovery(boxes).discover()[0].box_id == "box0"
     fleet = box_client.BoxFleetConfig(discovery="sdk", boxes=boxes)
     assert isinstance(box_client.make_discovery(fleet), box_client.SdkBoxDiscovery)
+
+
+def test_decode_sensor_mask_follows_known_sensor_bit_order():
+    assert box_client.decode_sensor_mask(0) == []
+    # bit 0 -> box_gripper, bit 1 -> box_imu (KNOWN_SENSOR_IDS order)
+    assert box_client.decode_sensor_mask(0b1) == ["box_gripper"]
+    assert box_client.decode_sensor_mask(0b11) == ["box_gripper", "box_imu"]
+    assert box_client.decode_sensor_mask((1 << len(box_client.KNOWN_SENSOR_IDS)) - 1) == list(
+        box_client.KNOWN_SENSOR_IDS
+    )
+
+
+def test_box_info_to_config_maps_identity_ip_and_sensor_mask():
+    template = box_client.BoxClientConfig(
+        bind_ip="192.168.2.45", remote_ip="0.0.0.0", poll_interval_s=0.002
+    )
+    info = box_client.BoxInfo(box_serial="SN-AAA", ip="192.168.2.61", sensor_mask=0b11)
+    cfg = box_client.box_info_to_config(info, template)
+    assert cfg.box_id == "SN-AAA"  # serial is the default namespace id
+    assert cfg.remote_ip == "192.168.2.61"
+    assert cfg.bind_ip == "192.168.2.45"  # shared default inherited from template
+    assert cfg.poll_interval_s == 0.002
+    assert cfg.expected_devices == ["box_gripper", "box_imu"]
+
+    # aliases pin a friendly id; empty sensor_mask inherits the template list.
+    template2 = box_client.BoxClientConfig(expected_devices=["box_gripper"])
+    info2 = box_client.BoxInfo(box_serial="SN-BBB", ip="192.168.2.62", sensor_mask=0)
+    cfg2 = box_client.box_info_to_config(info2, template2, aliases={"SN-BBB": "box1"})
+    assert cfg2.box_id == "box1"
+    assert cfg2.expected_devices == ["box_gripper"]
+
+
+def test_sdk_discovery_with_injected_enumerate_maps_to_configs():
+    template = box_client.BoxClientConfig(bind_ip="192.168.2.45")
+
+    def _fake_box_discover():
+        return [
+            box_client.BoxInfo(box_serial="SN-0", ip="192.168.2.60", sensor_mask=0b1),
+            box_client.BoxInfo(box_serial="SN-1", ip="192.168.2.61", sensor_mask=0b11),
+        ]
+
+    disco = box_client.SdkBoxDiscovery(
+        fallback=[], enumerate_fn=_fake_box_discover, template=template,
+        aliases={"SN-0": "box0", "SN-1": "box1"},
+    )
+    configs = disco.discover()
+    assert [c.box_id for c in configs] == ["box0", "box1"]
+    assert [c.remote_ip for c in configs] == ["192.168.2.60", "192.168.2.61"]
+    assert configs[0].expected_devices == ["box_gripper"]
+    assert configs[1].expected_devices == ["box_gripper", "box_imu"]
+    assert all(c.bind_ip == "192.168.2.45" for c in configs)  # template default
+
+
+def test_sdk_discovery_empty_or_failing_enumerate_falls_back():
+    fallback = [box_client.BoxClientConfig(box_id="static0")]
+
+    # enumerate returns nothing -> fall back.
+    empty = box_client.SdkBoxDiscovery(fallback, enumerate_fn=lambda: [])
+    assert [c.box_id for c in empty.discover()] == ["static0"]
+
+    # enumerate raises -> fall back (SDK present but the call failed).
+    def _boom():
+        raise RuntimeError("sdk discovery error")
+
+    failing = box_client.SdkBoxDiscovery(fallback, enumerate_fn=_boom)
+    assert [c.box_id for c in failing.discover()] == ["static0"]
 
 
 def _preloaded_box_factory(distance: float):
