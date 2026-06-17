@@ -134,7 +134,7 @@ def _connect_session_with_deadline(
     )
 
 
-def _emit_box_live(box: bc.BoxClient, *, last_emit_s: float, min_interval_s: float = 0.1) -> float:
+def _emit_box_live(box: bc.BoxPool, *, last_emit_s: float, min_interval_s: float = 0.1) -> float:
     now = time.monotonic()
     if now - last_emit_s < min_interval_s:
         return last_emit_s
@@ -304,7 +304,7 @@ def _write_episode_meta(
     cfg: gr.RecorderConfig,
     locked: list[int],
     argus_failed: list[int],
-    box_cfg: bc.BoxClientConfig,
+    box_cfg: bc.BoxFleetConfig,
     box_snapshots: list[dict[str, Any]],
     stop_reason: str,
     wallclock_start_utc: str,
@@ -568,7 +568,7 @@ def main(argv: list[str] | None = None) -> int:
     with args.config_path.open() as f:
         import yaml
         raw_yaml = yaml.safe_load(f) or {}
-    box_cfg = bc.from_yaml_dict(raw_yaml.get("box_collection") if not args.no_box else None)
+    box_cfg = bc.fleet_from_yaml_dict(raw_yaml.get("box_collection") if not args.no_box else None)
     auto_cfg = _auto_recover_from_yaml(raw_yaml.get("auto_recover"))
     if args.no_auto_recover:
         auto_cfg.enabled = False
@@ -622,7 +622,7 @@ def main(argv: list[str] | None = None) -> int:
     # pipelines and a GLib MainLoop are already running triggers
     # SIGABRT on the first incoming UDP packet (see
     # tools/data_collection_gui/docs/development_status.md).
-    box = bc.BoxClient(box_cfg)
+    box = bc.BoxPool(box_cfg)
     box_started = box.start() if box_cfg.enabled else False
     if box_started:
         # Wait for the rate-estimation window (2s) to fill so we can report

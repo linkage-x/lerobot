@@ -542,34 +542,52 @@ def _device_statuses(config: dict[str, Any], repo_root: Path | None = None) -> l
 
     box_cfg = config.get("box_collection")
     if isinstance(box_cfg, dict) and box_cfg.get("enabled", True):
-        expected = box_cfg.get("expected_devices") or list(_BOX_COLLECTION_DEVICE_LABELS)
-        poll_hz = 0
-        try:
-            poll_hz = int(round(1.0 / float(box_cfg.get("poll_interval_s") or 0.05)))
-        except (TypeError, ValueError, ZeroDivisionError):
-            poll_hz = 0
-        detail = f"UDP {box_cfg.get('remote_ip', '?')}:{box_cfg.get('remote_port', 15000)}"
-        for sensor_id in expected:
-            label = _BOX_COLLECTION_DEVICE_LABELS.get(str(sensor_id), str(sensor_id))
-            devices.append(
-                {
-                    "id": str(sensor_id),
-                    "kind": "box_collection",
-                    "label": label,
-                    "state": "idle",
-                    "fps": poll_hz,
-                    "latencyMs": 0,
-                    "detail": detail,
-                    "config": {
-                        "remote_ip": box_cfg.get("remote_ip", ""),
-                        "remote_port": box_cfg.get("remote_port", 15000),
-                        "poll_interval_s": box_cfg.get("poll_interval_s", 0.05),
-                        "bind_ip": box_cfg.get("bind_ip", ""),
-                        "sensor_id": str(sensor_id),
-                    },
-                }
-            )
+        # Accept both the legacy flat single-box block and the new multi-box
+        # `boxes:` list. A single empty-id box keeps bare sensor IDs so existing
+        # rigs render identically; with >1 box each row's id is namespaced.
+        raw_boxes = box_cfg.get("boxes")
+        if isinstance(raw_boxes, list):
+            box_entries = [b for b in raw_boxes if isinstance(b, dict)]
+        else:
+            box_entries = [box_cfg]
+        for box in box_entries:
+            devices.extend(_box_collection_devices(box))
     return devices
+
+
+def _box_collection_devices(box: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build one frontend row per expected sensor for a single BOX config."""
+    box_id = str(box.get("box_id", "") or "")
+    expected = box.get("expected_devices") or list(_BOX_COLLECTION_DEVICE_LABELS)
+    try:
+        poll_hz = int(round(1.0 / float(box.get("poll_interval_s") or 0.05)))
+    except (TypeError, ValueError, ZeroDivisionError):
+        poll_hz = 0
+    detail = f"UDP {box.get('remote_ip', '?')}:{box.get('remote_port', 15000)}"
+    out: list[dict[str, Any]] = []
+    for sensor_id in expected:
+        sid = str(sensor_id)
+        device_id = f"{box_id}/{sid}" if box_id else sid
+        out.append(
+            {
+                "id": device_id,
+                "kind": "box_collection",
+                "label": _BOX_COLLECTION_DEVICE_LABELS.get(sid, sid),
+                "state": "idle",
+                "fps": poll_hz,
+                "latencyMs": 0,
+                "detail": detail,
+                "config": {
+                    "box_id": box_id,
+                    "remote_ip": box.get("remote_ip", ""),
+                    "remote_port": box.get("remote_port", 15000),
+                    "poll_interval_s": box.get("poll_interval_s", 0.05),
+                    "bind_ip": box.get("bind_ip", ""),
+                    "sensor_id": sid,
+                },
+            }
+        )
+    return out
 
 
 def _make_mapping_device(device_id: str, device: dict[str, Any], kind: str) -> dict[str, Any]:
