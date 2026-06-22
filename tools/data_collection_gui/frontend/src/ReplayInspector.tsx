@@ -462,6 +462,31 @@ export function ReplayInspector({
     setCurrentFrame(Math.max(0, Math.min(nextFrame, totalFrames - 1)));
   }, [totalFrames]);
 
+  const togglePlay = useCallback(() => {
+    if (playing) {
+      setPlaying(false);
+      return;
+    }
+    // Starting playback while already parked on the last frame would be
+    // killed instantly by the raf tick's end-of-clip check, so rewind to the
+    // start first. The currentFrame->video sync effect skips seeking while
+    // `playing` is true, so rewind the <video> elements here directly.
+    if (totalFrames > 0 && currentFrame >= totalFrames - 1) {
+      setCurrentFrame(0);
+      Object.values(videoRefs.current).forEach((video) => {
+        if (!video) {
+          return;
+        }
+        try {
+          video.currentTime = videoWarmupS;
+        } catch {
+          // ignore: browsers may throw if metadata is not yet loaded
+        }
+      });
+    }
+    setPlaying(true);
+  }, [playing, currentFrame, totalFrames, videoWarmupS]);
+
   if (!datasetPath) {
     return null;
   }
@@ -505,7 +530,7 @@ export function ReplayInspector({
         </span>
       </div>
       <div className="inspector-toolbar">
-        <button onClick={() => setPlaying((value) => !value)}>{playing ? "Pause" : "Play"}</button>
+        <button onClick={togglePlay}>{playing ? "Pause" : "Play"}</button>
         <input
           type="range"
           min={0}
