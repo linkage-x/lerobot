@@ -1897,6 +1897,52 @@ button.danger {
   font-size: 12px;
 }
 
+.force-cali {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.force-cali-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.force-cali-btn {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+.force-cali-error {
+  color: #8d2d12;
+  font-size: 12px;
+}
+
+.force-cali-log {
+  height: 96px;
+  overflow-y: auto;
+  background: #0f172a;
+  color: #cbd5e1;
+  border: 1px solid #1f2a3a;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.force-cali-log-empty {
+  color: #64748b;
+}
+
+.force-cali-log-line {
+  white-space: pre-wrap;
+}
+
 @media (max-width: 1100px) {
   .camera-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));

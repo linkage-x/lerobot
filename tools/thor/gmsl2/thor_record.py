@@ -147,10 +147,53 @@ def _emit_box_live(box: bc.BoxPool, *, last_emit_s: float, min_interval_s: float
     return now
 
 
+_FORCE_CHANNEL_LABELS = ("Fx", "Fy", "Fz", "Mx", "My", "Mz")
+
+
+def _fmt_force_vec(vec: list[float] | None) -> str:
+    if not vec:
+        return "n/a"
+    n = min(len(_FORCE_CHANNEL_LABELS), len(vec))
+    return ", ".join(f"{_FORCE_CHANNEL_LABELS[i]}={vec[i]:.4f}" for i in range(n))
+
+
+def _run_six_d_force_cali(box: bc.BoxPool) -> None:
+    """Trigger a 6D force-sensor calibration and stream progress as CALI_LOG lines.
+
+    Runs on its own thread: the stdin reader must not block on the ~0.5s+ SDK
+    round-trip. Emits a terminal ``CALI_DONE ok|error`` line so the gateway can
+    mark the run complete and the frontend can stop spinning.
+    """
+    _emit("CALI_LOG 6D force sensor calibration requested")
+    try:
+        results = box.calibrate_six_d_force()
+    except Exception as exc:  # noqa: BLE001 - calibration must never crash the recorder
+        _emit(f"CALI_LOG ERROR calibration raised: {exc}")
+        _emit("CALI_DONE error")
+        return
+    ok_all = bool(results)
+    for res in results:
+        label = res.get("box_id") or "box"
+        if res.get("ok"):
+            _emit(f"CALI_LOG [{label}] calibration OK (rc={res.get('rc')})")
+        else:
+            ok_all = False
+            _emit(
+                f"CALI_LOG [{label}] calibration FAILED (rc={res.get('rc')}): "
+                f"{res.get('error') or 'unknown error'}"
+            )
+        before, after = res.get("before"), res.get("after")
+        if before is not None or after is not None:
+            _emit(f"CALI_LOG [{label}] before: {_fmt_force_vec(before)}")
+            _emit(f"CALI_LOG [{label}] after:  {_fmt_force_vec(after)}")
+    _emit(f"CALI_DONE {'ok' if ok_all else 'error'}")
+
+
 def _read_stdin_loop(
     queue: list[StdinCommand],
     stop: threading.Event,
     on_demand: Callable[[], None] | None = None,
+    on_calibrate: Callable[[], None] | None = None,
 ) -> None:
     while not stop.is_set():
         line = sys.stdin.readline()
@@ -175,6 +218,14 @@ def _read_stdin_loop(
             # and drop.
             if on_demand is not None:
                 on_demand()
+        elif stripped == "cali_6dforce":
+            # Out-of-band 6D force-sensor calibration request from the gateway
+            # (Device Manager button). Like preview_demand it's a side-effect,
+            # not an FSM start/save/quit command, so fire the callback instead
+            # of enqueuing it. The callback offloads the actual SDK call to its
+            # own thread so reading further stdin lines never blocks on it.
+            if on_calibrate is not None:
+                on_calibrate()
         else:
             logger.warning("ignoring unrecognized stdin command: %r", line)
 
@@ -841,8 +892,18 @@ def main(argv: list[str] | None = None) -> int:
     # from the start/save/quit FSM).
     stop_event = threading.Event()
     cmd_queue: list[StdinCommand] = []
+
+    def _trigger_six_d_force_cali() -> None:
+        # Offload to a dedicated thread so the stdin reader keeps draining lines
+        # (including preview_demand heartbeats) during the SDK round-trip.
+        threading.Thread(
+            target=_run_six_d_force_cali, args=(box,),
+            daemon=True, name="thor-record-cali",
+        ).start()
+
     stdin_thread = threading.Thread(
-        target=_read_stdin_loop, args=(cmd_queue, stop_event, _note_preview_demand),
+        target=_read_stdin_loop,
+        args=(cmd_queue, stop_event, _note_preview_demand, _trigger_six_d_force_cali),
         daemon=True, name="thor-record-stdin",
     )
     stdin_thread.start()

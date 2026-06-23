@@ -509,6 +509,51 @@ class BoxClient:
             snap["status"] = self._status_locked()
         return snap
 
+    # ---- control ----
+
+    def _six_d_force_vector(self) -> list[float] | None:
+        """Latest decoded 6D force/torque vector (Fx,Fy,Fz,Mx,My,Mz) or None."""
+        with self._lock:
+            force = self._latest.get("sensors", {}).get("box_six_d_force")
+        if isinstance(force, dict) and isinstance(force.get("fxyz_mxyz"), list):
+            return [float(v) for v in force["fxyz_mxyz"]]
+        return None
+
+    def calibrate_six_d_force(self) -> dict[str, Any]:
+        """Trigger the native 6D force-sensor calibration (zeroing).
+
+        Calls box_sdk's ``cali_6d_force_sensor()`` (TLV_TYPE_CALI_6D_FORCE_SENSOR)
+        on the live handle, sampling the live force vector just before and ~0.5s
+        after so the caller can show the effect (matches the vendor demo). The
+        native SDK serializes its command channel, so this is safe to call from a
+        thread other than the poll loop (same as ``set_clamp_pos`` mid-recording).
+
+        Never raises: when the box never started, ``box_sdk`` is absent, or the
+        installed wheel predates ``cali_6d_force_sensor()`` (e.g. 0.1.0), it
+        returns ``ok=False`` with an explanatory ``error`` instead.
+        """
+        if self._box is None:
+            return {"ok": False, "rc": None, "error": "box not started"}
+        fn = getattr(self._box, "cali_6d_force_sensor", None)
+        if not callable(fn):
+            return {
+                "ok": False, "rc": None,
+                "error": "installed box_sdk lacks cali_6d_force_sensor(); "
+                         "needs a newer SDK build than the current wheel",
+            }
+        before = self._six_d_force_vector()
+        try:
+            rc = int(fn())
+        except Exception as exc:  # noqa: BLE001 - report, never crash the recorder
+            return {"ok": False, "rc": None, "before": before,
+                    "error": f"cali_6d_force_sensor() raised: {exc}"}
+        time.sleep(0.5)  # let the post-cal reading settle before sampling
+        return {
+            "ok": rc == 0, "rc": rc,
+            "error": None if rc == 0 else self._err_str(rc),
+            "before": before, "after": self._six_d_force_vector(),
+        }
+
     def start_recording(self, t0_wall_s: float) -> None:
         """Begin high-frequency per-sensor sample recording for an episode.
 
@@ -958,5 +1003,26 @@ class BoxPool:
                 nsid = namespace_sid(box_id, sid)
                 merged[nsid] = [replace(s, sensor_id=nsid) for s in samples]
         return merged
+
+    # ---- control ----
+
+    def calibrate_six_d_force(self) -> list[dict[str, Any]]:
+        """Dispatch a 6D force calibration to each box exposing that sensor.
+
+        Returns one result dict per attempted box, tagged with ``box_id`` (empty
+        string for the single-box passthrough rig). Boxes that don't advertise a
+        6D force sensor are skipped; if none advertise one, every client is still
+        attempted so a not-yet-detected sensor isn't silently ignored.
+        """
+        targets = [
+            (box_id, client) for box_id, client in self._clients
+            if "box_six_d_force" in (set(client.detect()) | set(client.cfg.expected_devices or []))
+        ]
+        if not targets:
+            targets = list(self._clients)
+        return [
+            {"box_id": box_id, **client.calibrate_six_d_force()}
+            for box_id, client in targets
+        ]
 
     serialize_recorded_samples = staticmethod(BoxClient.serialize_recorded_samples)

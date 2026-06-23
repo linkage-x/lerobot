@@ -272,6 +272,84 @@ def test_box_client_start_stop_pulls_snapshot_and_marks_detected(fake_box_module
     assert client.is_active() is False
 
 
+def _force_box_factory(force=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0), *, with_cali):
+    """Fake Box that publishes a 6D force sample; optionally exposes cali()."""
+    calls: list[bool] = []
+
+    class _Box(_FakeBox):
+        if with_cali:
+            def cali_6d_force_sensor(self):  # mirrors the newer vendor SDK
+                calls.append(True)
+                return 0
+
+    def _factory(*a, **kw):
+        b = _Box()
+        b.snaps.append(
+            _SensorCache(
+                valid=1,
+                data=_AllSensor(six_d_force_data=_SixD(timestamp=7, data=tuple(force))),
+            ),
+        )
+        return b
+
+    return _factory, calls
+
+
+def test_calibrate_six_d_force_gracefully_handles_missing_sdk_method(fake_box_module):
+    # The currently shipped wheel (0.1.0) has no cali_6d_force_sensor(); the
+    # wrapper must report ok=False with an explanatory error, never raise.
+    fake_box_module.Box, _ = _force_box_factory(with_cali=False)
+    cfg = box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01)
+    client = box_client.BoxClient(cfg)
+    assert client.start() is True
+    try:
+        result = client.calibrate_six_d_force()
+    finally:
+        client.stop()
+
+    assert result["ok"] is False
+    assert result["rc"] is None
+    assert "cali_6d_force_sensor" in result["error"]
+
+
+def test_calibrate_six_d_force_invokes_sdk_and_reports_before_after(fake_box_module):
+    fake_box_module.Box, calls = _force_box_factory(with_cali=True)
+    cfg = box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01)
+    client = box_client.BoxClient(cfg)
+    assert client.start() is True
+    import time as _t
+    _t.sleep(0.05)  # let the poll loop populate _latest for the before-read
+    try:
+        result = client.calibrate_six_d_force()
+    finally:
+        client.stop()
+
+    assert calls == [True]
+    assert result["ok"] is True
+    assert result["rc"] == 0
+    assert result["error"] is None
+    assert result["before"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert result["after"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+
+def test_box_pool_calibrate_six_d_force_targets_force_box(fake_box_module):
+    fake_box_module.Box, _ = _force_box_factory(with_cali=True)
+    fleet = box_client.fleet_from_yaml_dict({"enabled": True, "poll_interval_s": 0.01})
+    pool = box_client.BoxPool(fleet)
+    assert pool.start() is True
+    import time as _t
+    _t.sleep(0.05)
+    try:
+        results = pool.calibrate_six_d_force()
+    finally:
+        pool.stop()
+
+    assert len(results) == 1
+    assert results[0]["box_id"] == ""
+    assert results[0]["ok"] is True
+    assert results[0]["rc"] == 0
+
+
 def test_box_client_marks_gripper_seen_from_distance_without_timestamp(fake_box_module):
     cfg = box_client.BoxClientConfig(
         enabled=True,

@@ -25,6 +25,17 @@ export type BoxPreviewPayload = {
   status?: Record<string, unknown>;
 };
 
+export type BoxCaliLogLine = {
+  ts: number;
+  line: string;
+  done: boolean;
+};
+
+export type BoxCaliLog = {
+  running: boolean;
+  lines: BoxCaliLogLine[];
+};
+
 export type GatewayStatus = {
   configPath: string;
   pid: number | null;

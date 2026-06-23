@@ -158,6 +158,14 @@ class GatewayState:
     gateway_log_path: Path | None = None
     recorder_log_path: Path | None = None
     device_preview: dict[str, Any] = field(default_factory=dict)
+    # BOX 6D force-sensor calibration: the recorder streams CALI_LOG/CALI_DONE
+    # lines on stdout after a `cali_6dforce` stdin command; the reader thread
+    # appends them here and the Device Manager polls them into its log box.
+    # Guarded by its own lock since the stdout reader and the GET handler run on
+    # different threads.
+    box_cali_running: bool = False
+    box_cali_log: list[dict[str, Any]] = field(default_factory=list)
+    box_cali_lock: Lock = field(default_factory=Lock)
     # One live preview pipeline per camera device id, so the Device Manager grid
     # can show many cameras at once. Each pipeline's reader thread keeps only the
     # latest JPEG in `camera_preview_frames`; the HTTP layer serves that cached
@@ -4254,6 +4262,41 @@ def _maybe_send_preview_demand(state: GatewayState) -> None:
             pass
 
 
+def _trigger_box_six_d_force_cali(state: GatewayState) -> dict[str, Any]:
+    """Ask the running GMSL2 recorder to calibrate the BOX 6D force sensor.
+
+    The recorder owns the live box connection, so the command rides its stdin
+    (``cali_6dforce``) and progress comes back as CALI_LOG/CALI_DONE stdout
+    lines. Returns a small status dict for the POST response.
+    """
+    process = state.process
+    if process is None or process.poll() is not None:
+        return {"ok": False, "error": "recorder is not connected; press Connect first"}
+    if not _state_is_gmsl2(state):
+        return {"ok": False, "error": "6D force calibration requires the GMSL2/BOX recorder"}
+    with state.box_cali_lock:
+        state.box_cali_running = True
+        state.box_cali_log.append(
+            {"ts": time.time(), "line": "calibration command sent to recorder", "done": False}
+        )
+        del state.box_cali_log[:-200]
+    try:
+        _write_recorder_stdin(process, "cali_6dforce\n")
+    except (BrokenPipeError, ValueError, OSError, RuntimeError) as exc:
+        with state.box_cali_lock:
+            state.box_cali_running = False
+            state.box_cali_log.append(
+                {"ts": time.time(), "line": f"failed to send command: {exc}", "done": True}
+            )
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True}
+
+
+def _box_cali_log_payload(state: GatewayState) -> dict[str, Any]:
+    with state.box_cali_lock:
+        return {"running": state.box_cali_running, "lines": list(state.box_cali_log)}
+
+
 def _connect_recorder(state: GatewayState) -> None:
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
@@ -4729,6 +4772,15 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         if isinstance(payload, dict):
             state.device_preview["box"] = {**payload, "active": True, "updatedAt": time.time()}
         return
+    if output.startswith("CALI_LOG ") or output.startswith("CALI_DONE "):
+        done = output.startswith("CALI_DONE ")
+        line = output.removeprefix("CALI_DONE " if done else "CALI_LOG ").strip()
+        with state.box_cali_lock:
+            state.box_cali_log.append({"ts": time.time(), "line": line, "done": done})
+            del state.box_cali_log[:-200]  # keep the buffer bounded
+            if done:
+                state.box_cali_running = False
+        return
     state.recording.lastOutput = output
     state.recording.message = output
     # Append to the ring buffer so the frontend can render every line the
@@ -5189,6 +5241,12 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             with self.server.state.lock:
                 _json_response(self, HTTPStatus.OK, _box_preview_payload(self.server.state, device_id))
                 return
+        if path == "/api/device/box-cali-log":
+            # Calibration log buffer (polled by the Device Manager log box).
+            # Uses its own box_cali_lock inside the payload helper, so it never
+            # contends with the main state lock or the recorder-stdout drain.
+            _json_response(self, HTTPStatus.OK, _box_cali_log_payload(self.server.state))
+            return
         if path == "/api/device-preview/camera.jpg":
             device_id = query.get("key", [""])[0]
             if not device_id:
@@ -5335,6 +5393,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 if path == "/api/calibration/run":
                     _mock_calibrate_cameras(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/device/calibrate-6dforce":
+                    result = _trigger_box_six_d_force_cali(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
                     return
                 if path == "/api/processing/qc":
                     requested = (query.get("path", [""])[0] or "").strip()

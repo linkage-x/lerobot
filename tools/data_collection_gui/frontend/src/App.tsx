@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DataCollectionGuiApi, type GuiSnapshot } from "./api";
 import { ReplayInspector } from "./ReplayInspector";
 import type {
   BoxPreviewPayload,
+  BoxCaliLogLine,
   CollectionTask,
   ConfigSummary,
   DeviceStatus,
@@ -2140,6 +2141,88 @@ function BoxForceTileView({ sensor }: { sensor?: Record<string, unknown> | null 
 // Camera-tile lookalike for the array BOX sensors: the live visualization fills
 // the media, and the scalar config / liveness stats live in the hover overlay,
 // mirroring CameraTile so the Device Manager grid stays visually uniform.
+// Calibrate button + scrolling log box for the BOX 6D force sensor. Triggering
+// rides the recorder's stdin (gateway POST), and progress streams back as
+// CALI_LOG/CALI_DONE lines the gateway buffers; we poll that buffer while a run
+// is active and auto-scroll the box to the newest line.
+function SixDForceCalibration() {
+  const [lines, setLines] = useState<BoxCaliLogLine[]>([]);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const logRef = useRef<HTMLDivElement | null>(null);
+  const pollRef = useRef<number | null>(null);
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current != null) {
+      window.clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  const poll = useCallback(async () => {
+    const log = await api.fetchBoxCaliLog();
+    if (!log) {
+      return;
+    }
+    setLines(log.lines);
+    setRunning(log.running);
+    if (!log.running) {
+      stopPolling();
+    }
+  }, [stopPolling]);
+
+  // Load any prior log once on mount; only poll continuously while a run is live.
+  useEffect(() => {
+    poll();
+    return stopPolling;
+  }, [poll, stopPolling]);
+
+  // Keep the newest line in view as the log grows.
+  useEffect(() => {
+    const el = logRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [lines]);
+
+  const onCalibrate = useCallback(async () => {
+    setError(null);
+    setRunning(true);
+    const res = await api.triggerSixDForceCalibration();
+    if (!res.ok) {
+      setError(res.error ?? "calibration failed to start");
+      setRunning(false);
+      poll(); // surface whatever the gateway appended (e.g. "recorder not connected")
+      return;
+    }
+    stopPolling();
+    pollRef.current = window.setInterval(poll, 300);
+    poll();
+  }, [poll, stopPolling]);
+
+  return (
+    <div className="force-cali">
+      <div className="force-cali-controls">
+        <button className="force-cali-btn" onClick={onCalibrate} disabled={running}>
+          {running ? "Calibrating…" : "Calibrate 6D force"}
+        </button>
+        {error && <span className="force-cali-error">{error}</span>}
+      </div>
+      <div className="force-cali-log" ref={logRef}>
+        {lines.length === 0 ? (
+          <div className="force-cali-log-empty">No calibration run yet.</div>
+        ) : (
+          lines.map((entry, i) => (
+            <div className="force-cali-log-line" key={`${entry.ts}-${i}`}>
+              {entry.line}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 function BoxSensorTile({ device }: { device: DeviceStatus }) {
   const [preview, setPreview] = useState<BoxPreviewPayload | null>(null);
 
@@ -2208,6 +2291,7 @@ function BoxSensorTile({ device }: { device: DeviceStatus }) {
         <strong>{device.id}</strong>
         <span className="camera-tile-stat">{device.fps} Hz</span>
       </div>
+      {isForce && <SixDForceCalibration />}
     </div>
   );
 }

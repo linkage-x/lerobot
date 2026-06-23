@@ -8,6 +8,7 @@ import type {
   DatasetExportStatus,
   DeviceStatus,
   BoxPreviewPayload,
+  BoxCaliLog,
   EventLogItem,
   GatewayStatus,
   ProcessingItem,
@@ -527,6 +528,33 @@ export class DataCollectionGuiApi {
         return null;
       }
       return (await response.json()) as BoxPreviewPayload;
+    } catch {
+      return null;
+    }
+  }
+
+  async triggerSixDForceCalibration(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/device/calibrate-6dforce`, {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      const body = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      return { ok: response.ok && body.ok !== false, error: body.error };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  async fetchBoxCaliLog(): Promise<BoxCaliLog | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/device/box-cali-log`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as BoxCaliLog;
     } catch {
       return null;
     }
