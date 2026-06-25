@@ -25,6 +25,17 @@ export type BoxPreviewPayload = {
   status?: Record<string, unknown>;
 };
 
+export type BoxCaliLogLine = {
+  ts: number;
+  line: string;
+  done: boolean;
+};
+
+export type BoxCaliLog = {
+  running: boolean;
+  lines: BoxCaliLogLine[];
+};
+
 export type GatewayStatus = {
   configPath: string;
   pid: number | null;
@@ -219,8 +230,8 @@ export type EventLogItem = {
 };
 
 export type DatasetExportStatus = {
-  state: "idle" | "preparing" | "ready" | "exporting" | "complete" | "error";
-  target: "lerobot_v3" | "mcap" | "parquet";
+  state: "idle" | "exporting" | "complete" | "error";
+  target: "lerobot_v3";
   datasetRoot: string;
   outputPath: string;
   selectedEpisodes: number;
@@ -283,10 +294,7 @@ export type ReplayTimelineFrame = {
   state: number[];
   action: number[];
   eePose?: Partial<EePose>;
-  touch?: {
-    left?: TouchPadFrame;
-    right?: TouchPadFrame;
-  };
+  touch?: Record<string, TouchPadFrame | undefined>;
   cubePoses?: Record<string, Partial<EePose>>;
   videoOverlays?: Record<string, CubeVideoOverlay[]>;
 };

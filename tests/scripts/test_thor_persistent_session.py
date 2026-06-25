@@ -191,7 +191,7 @@ def test_fragment_dict_handles_missing_buffer(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_write_episode_meta_emits_sync_reference_with_first_pts(tmp_path):
+def test_write_episode_meta_emits_sync_reference_anchor(tmp_path):
     session = ps.PersistentCameraSession(
         streams=[], warmup_dir=tmp_path / "w",
     )
@@ -222,12 +222,20 @@ def test_write_episode_meta_emits_sync_reference_with_first_pts(tmp_path):
     assert meta["episode_index"] == 3
     assert meta["duration_s"] == 5.5
     sync = meta["sync_reference"]
-    assert sync["split_now_wall_s"] == 1716700000.0
-    assert sync["camera_first_pts_s"] == {"cam_02": 0.0166, "cam_07": 0.0333}
-    assert sync["camera_first_wall_s"]["cam_02"] == 1716700000.05
-    # cameras[] preserves per-stream entries.
+    # Redundant split_now_wall_s (== t0_wall_s) and camera_first_pts_s
+    # (per-stream, not cross-camera comparable) were dropped from sync_reference.
+    assert "split_now_wall_s" not in sync
+    assert "camera_first_pts_s" not in sync
+    # The cross-camera anchor stays.
+    assert sync["camera_first_wall_s"] == {
+        "cam_02": 1716700000.05, "cam_07": 1716700000.07,
+    }
+    # cameras[] preserves per-stream entries, including the per-stream first PTS.
     names = {entry["name"] for entry in meta["cameras"]}
     assert names == {"cam_02", "cam_07"}
+    assert {e["name"]: e["first_pts_s"] for e in meta["cameras"]} == {
+        "cam_02": 0.0166, "cam_07": 0.0333,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -1,59 +1,72 @@
-# Traj-Gen（EE 轨迹生成）对 Thor gmsl2 数据的兼容性结论
+# Traj-Gen（EE 轨迹生成）on Thor gmsl2 数据
 
-> 记录时间：2026-06-01 · 关联 merge commit `caf4315e`（把 box0529 的 traj-gen 实现合入 `hph/thor_release_v0`）
+> 2026-06-01 初版：当时合入的是 **hikon 专属** 实现，对 Thor gmsl2 数据不适用（见文末「历史背景」）。
+> 2026-06-25 重写：traj-gen 已切到 **gmsl2 AprilTag cube 追踪**，在 Thor 上真机验证可用（生成 + 显示 + PWM 时间戳）。
 
 ## 一句话结论
 
-合入的 traj-gen 是 **hikon 传感器/标定专属** 的实现，**对 Thor gmsl2 录制的数据（如 `outputs/datasets/thor_gmsl2_11ch_v1_20260601_071432`）目前不适用**。在 Thor 数据上跑不会得到"空轨迹"，而是会在标定/布局检查处 **直接 `raise`，子进程 `exit_code != 0`**，gateway 把任务标成 `failed`。
+GUI 的 **Generate EE Trajectory / Queue Traj Gen** 按钮（`POST /api/processing/traj-gen`）现在对 Thor gmsl2 数据集**可正常生成 EE pose 并在 Replay 视图显示**。追踪直接吃 `episodes/episode_*/cam_*.mkv` 原始流，**不需要 LeRobot v3 导出**。
 
-"空轨迹符合预期"只在 **gateway 回放/读取侧** 成立；**生成侧（hikon 脚本本体）会报错**。
+## 数据流
 
-## 两侧分别的行为
+```
+按钮 / API
+  → gateway._queue_traj_gen → _ee_trajectory_command
+  → ["bash", run_april_cube_tracking_local.sh, --dataset-root <ds>, --config <thor yaml>]
+  → (gateway 跑在 Thor 上，本地直接执行，无 SSH / 无 copy-back)
+  → april_cube_tracking_in_robot_base.py 追踪 episodes/*.mkv
+  → 写 sidecar: <ds>/derived/april_cube_tracking_in_robot_base/state_action.{left,right,head}.csv
+  → gateway timeline 读 sidecar → 前端 Pose3DViewer 渲染 EE 轨迹
+```
 
-### ✅ Gateway 回放/读取侧 —— 对无 cube 数据健壮
+关键文件与常量（`gateway.py`）：
 
-`tools/data_collection_gui/gateway.py` 里消费 traj-gen 产物的链路，对 Thor 数据（无 cube 信息）会优雅降级为空轨迹，不崩：
+- `DEFAULT_EE_TRAJECTORY_RUNNER = third_party/opencv_kalibr/run_april_cube_tracking_local.sh`
+- `DEFAULT_EE_TRAJECTORY_CONFIG = .../config_thor/april_cube_tracking_in_robot_base_thor.yaml`
+- `DEFAULT_TRAJ_SIDECAR_NAME = "april_cube_tracking_in_robot_base"`
+- `DEFAULT_TRACKING_RUN_SUFFIX = "_thor_april_tracking_in_robot_base"`（`outputs/tracking_analysis/<ds>...` 分析产物 + 视频 overlay 用）
 
-- `_read_sidecar_cube_poses`（gateway.py:2278）：无 `derived/hikon_cube_tracking_in_robot_base/` 目录 → 返回 `{}`
-- `_read_video_cube_overlays`（gateway.py:2521）：无 `outputs/tracking_analysis/<name>_tracking_in_robot_base/summary.json` → 直接 `return {}`
-- `_cube_pose_from_parquet_row`（gateway.py:2203）：parquet 无 `observation.state.<cube>` 列 → `None`
-- 最终 `cubePoseNames`（gateway.py:2948）过滤成"只保留实际出现在帧里的名字" → `[]`，每帧 `cubePoses={}` / `videoOverlays={}`
+`run_april_cube_tracking_local.sh` 封装了 python 解释器选择（追踪依赖 cv2/pupil_apriltags 只在 `third_party/opencv_kalibr/.venv`，**不在跑 gateway 的系统 python3**）+ `PYTHONPATH` + 依赖自检 + 数据布局检查。它被两处共用：
 
-### ❌ 生成侧 —— hikon 脚本对 Thor 数据有 3 处硬性前置依赖会先 `raise`
+1. gateway（Thor 上本地直接调）。
+2. `run_april_cube_tracking_on_thor.sh`（开发机用，SSH 到 Thor 跑同一 runner，再 copy-back，附 replay 提示）。
 
-脚本：`third_party/opencv_kalibr/hikon_cube_tracking_offline/hikon_cube_tracking_in_robot_base.py`
-配置：`.../config_hikon/hikon_cube_tracking_in_robot_base_umi.yaml`
-（gateway 默认值见 `gateway.py:34-37` 的 `DEFAULT_EE_TRAJECTORY_SCRIPT` / `DEFAULT_EE_TRAJECTORY_CONFIG`）
+## 前提（Thor 上需就位）
 
-在做任何 cube 检测之前，以下检查会按顺序触发：
+- 标定产物：`outputs/calibration/thor_gmsl2_tag36h11_id6_160mm_intrinsics_latest` 和 `..._fixed_camera_in_base_from_moving_tag36h11_id6_160mm`（thor yaml 的 `calibration.*_run_name` 指过去；fixed 模式不需要 auxiliary marker）。
+- cube 物理贴标与 thor yaml 的 `cube_tracker.cubes[*].marker_ids` 一致（left/right/head）。
 
-1. **hikon 专属标定产物缺失**（脚本 `main()` 行 1644-1649）— 要求这三个 summary 存在，否则 `FileNotFoundError`：
-   ```
-   outputs/calibration/hikon_intrinsics_latest/summary.json
-   outputs/calibration/hikon_fixed_camera_in_base_from_moving_charuco/summary.json
-   outputs/calibration/hikon_auxiliary_aruco_markers_in_base_single_hk07/summary.json
-   ```
-   这些是 hikon 相机的内参 / 固定相机在 base 下位姿 / 辅助 aruco 标记基座变换。Thor 设备上没有这套 hikon 标定。
+## 显示路径：v3 vs gmsl2（两条都已支持）
 
-2. **视频目录布局不匹配**（`list_dataset_video_streams` 行 1059-1072）— 脚本要求
-   `dataset_root/videos/observation.images.*/chunk-*/file-*.mp4`；
-   而 Thor gmsl2 数据是 `episodes/episode_*/*.mkv` 布局（参见 `gateway.py:584` 的 `_has_gmsl2_episodes`：gmsl2 按 `episodes/.../meta.json` + per-episode mkv 组织）。→ `FileNotFoundError` / `No observation.images.* videos found`。
+`gateway._read_dataset_timeline` 按数据集形态分流：
 
-3. **parquet 布局不匹配**（脚本行 722-724 / 1227-1229，以及 `load_ee_ground_truth_from_lerobot_dataset` 行 1826）— 脚本要求
-   `dataset_root/data/chunk-*/file-*.parquet`；gmsl2 数据同样走 `episodes/` 布局，没有这棵 `data/` 树。
+| 数据集形态 | 路由 | EE pose 来源 |
+| --- | --- | --- |
+| 有 `data/chunk-*/*.parquet`（BOX v3 sidecar，如 dadada） | v3 路径 | parquet 行（按 `frame_index` 匹配 sidecar cube poses）|
+| 只有 `episodes/`、无 v3 parquet（如 `--no-box` 相机-only 采集） | `_read_gmsl2_timeline` | **直接读 sidecar**（2026-06-25 补；此前该路径不读 sidecar，EE pose 不显示）|
 
-## 给完善 traj-gen 的同事的方向
+两条路径都把 sidecar 的 `state_*`（即 EE pose）按 **per-episode 局部 `frame_index`** 挂到帧上，填 `cubePoses` / `cubePoseNames`，前端据此渲染。
 
-这不是改一行能解决的，核心是 hikon 脚本对 **gmsl2 布局 + hikon 标定** 有强假设。两个可选方向：
+## 时间戳：PWM 硬同步相机轴
 
-1. **真正支持 Thor 数据生成轨迹**：
-   - 准备 gmsl2 相机的内参/外参标定 summary，把 config 的 `calibration.{root_dir, *_run_name}` 指过去；
-   - 解决布局差异：在脚本里增加 `episodes/*.mkv` + episodes 布局的读取分支，或在 traj-gen 前做一步 gmsl2 → lerobot-v3（`videos/observation.images.*` + `data/chunk-*`）的格式适配。
+每帧时间戳 = `pts_offset + N/fps`（t0 相对域，见 `tools/thor/ts_sync.md` §5.1/§6），即 PWM 60Hz 帧网格 + 首帧落盘 wall-time 偏移修正：
 
-2. **只让 GUI "生成 EE 轨迹" 在 Thor 数据上不崩、给空结果**：
-   - 在脚本入口对"无适用相机/标定"做 **软失败**（打印 warning + 写空 sidecar + `exit 0`），而不是 `raise`；
-   - 这样 gateway 会把任务标成 `complete`（空轨迹），与回放侧的健壮行为对齐。
+- v3 路径：直接用 parquet 的 `timestamp` 列（录制器写入时已是该值）。
+- gmsl2 路径：`_gmsl2_pts_offset_s()` 从 `meta.json.sync_reference`（`t0_wall_s` + `camera_first_wall_s`）算出同一个 `pts_offset`，再 `+ N/fps`。
 
-## 相关测试
+EE pose 由多路硬同步相机估算，因此落在相机/PWM 时间轴上；**不使用 BOX MCU 钟**（那是单独的 `box.timestamps` 列，仅作对齐元数据）。
 
-合并时把 HEAD 过时的 `test_traj_gen_is_explicitly_not_implemented`（断言抛 `NotImplementedError`）删掉，改用 box0529 的 `test_traj_gen_starts_hikon_tracking_with_selected_dataset_root`（`tests/scripts/test_data_collection_gui_gateway.py`）。该测试 mock 了 `subprocess.Popen`，只验证命令拼装，**不覆盖脚本对 Thor 数据的实际行为**，所以上面的报错风险不会被这个单测发现。
+> 注意（非当前 bug）：parquet 帧网格长度 = `round(duration_s×fps)`，可能与真实相机帧数差几帧（box-only 幽灵行）；只有真发生丢帧时均匀网格才会与真实 PWM 边沿漂移。本数据实测 PTS 抖动相消、无真实丢帧，对齐良好。
+
+## 性能
+
+瓶颈是全图 AprilTag 检测（N 相机 × 3 cube × 全分辨率）。已做 **每相机检测一次、3 cube 共享**（`CubeTracker.detect_markers_raw` + `_blocks_from_raw`，数值与逐 cube 检测**完全一致**），dadada（7 相机 / 1251 帧）实测 ~16.5 分钟 → ~7.2 分钟（约 2.3×）。进一步可调 `cube_tracker.apriltag_detector.quad_decimate`（1.0→2.0）或 `--frame-step`。
+
+## 真机验证（2026-06-25，nvidia@192.168.111.122）
+
+- `dadada_20260616_084743`（有 v3 parquet，走 v3 路径）：按钮 → `pose_ready`，3 episode 的 timeline 返回 left/right/head EE pose（ep0 603/603、ep1 394/394、ep2 254/291），ts 吻合 `pts_offset + N/60`。
+- `thor_gmsl2_apriltag_raw_April_cam8_0618_thor_*`（无 v3 parquet，走 gmsl2 路径）：runner 生成 sidecar 后 timeline 正确返回 EE pose（修复前该路径返回 0 个 pose）。
+
+## 历史背景（已不适用）
+
+初版合入的是 `hikon_cube_tracking_in_robot_base.py` + `config_hikon/...umi.yaml`，对 Thor gmsl2 数据有 3 处硬性前置依赖会先 `raise`（hikon 专属标定产物缺失、`videos/observation.images.*` 布局不匹配、`data/chunk-*` parquet 布局不匹配），因此当时「在 Thor 数据上跑会 fail」。现已改用 gmsl2 专属的 april thor 实现 + 直接吃 `episodes/`，上述限制不再存在。

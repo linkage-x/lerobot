@@ -316,6 +316,45 @@ def test_recorder_output_marks_box_collection_devices(tmp_path):
     assert states["box_trigger"] == "error"
 
 
+def test_box_devices_json_roster_replaces_static_rows_and_marks_live(tmp_path):
+    # BOX_DEVICES_JSON (broadcast discovery at Connect) swaps the static
+    # single-box rows for one row per (discovered box × sensor); a following
+    # "Box devices:" line marks them live by namespaced id.
+    state = gateway.GatewayState(
+        repo_root=Path.cwd(),
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 60, "episode_time_s": 10}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        devices=[
+            {"id": "cam_00", "kind": "camera", "label": "cam_00", "state": "warning", "fps": 60, "latencyMs": 0, "detail": ""},
+            {"id": "box_gripper", "kind": "box_collection", "label": "g", "state": "idle", "fps": 20, "latencyMs": 0, "detail": ""},
+        ],
+    )
+    roster = [
+        {"device_id": 1, "sn": "box0", "ip": "192.168.2.61", "data_port": 15000,
+         "box_id": "box0", "expected_devices": ["box_gripper", "box_imu"],
+         "capability_names": ["box_gripper", "box_imu"]},
+        {"device_id": 2, "sn": "box1", "ip": "192.168.2.62", "data_port": 15000,
+         "box_id": "box1", "expected_devices": ["box_gripper"],
+         "capability_names": ["box_gripper"]},
+    ]
+    gateway._apply_recorder_output(state, "BOX_DEVICES_JSON " + json.dumps(roster))
+
+    box_ids = {d["id"] for d in state.devices if d["kind"] == "box_collection"}
+    assert box_ids == {"box0/box_gripper", "box0/box_imu", "box1/box_gripper"}
+    # The static unnamespaced row is gone; the camera row survives.
+    assert "box_gripper" not in box_ids
+    assert any(d["id"] == "cam_00" for d in state.devices)
+    assert state.box_devices_roster == roster
+
+    gateway._apply_recorder_output(state, "Box devices: box0/box_gripper, box1/box_gripper")
+    states = {d["id"]: d["state"] for d in state.devices if d["kind"] == "box_collection"}
+    assert states["box0/box_gripper"] == "running"
+    assert states["box1/box_gripper"] == "running"
+    assert states["box0/box_imu"] == "error"  # discovered but not reporting yet
+
+
 def test_recorder_script_picks_thor_when_configured(tmp_path):
     repo_root = tmp_path
     (repo_root / "tools" / "thor" / "gmsl2").mkdir(parents=True)
@@ -654,7 +693,7 @@ def test_set_datasets_root_creates_missing_directory(tmp_path):
 def test_replay_timeline_includes_generated_cube_pose_sidecars(tmp_path):
     dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
     _write_minimal_episode_dataset(dataset_root, total_episodes=2)
-    sidecar = dataset_root / "derived" / "hikon_cube_tracking_in_robot_base"
+    sidecar = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
     sidecar.mkdir(parents=True)
     for cube, offset in (("left", 0.0), ("right", 0.1), ("head", 0.2)):
         (sidecar / f"state_action.{cube}.csv").write_text(
@@ -685,10 +724,72 @@ def test_replay_timeline_includes_generated_cube_pose_sidecars(tmp_path):
     assert timeline["frames"][0]["cubePoses"]["head"]["qw"] == 1.0
 
 
+def test_gmsl2_timeline_surfaces_ee_pose_sidecar_without_v3_parquet(tmp_path):
+    # Camera-only (--no-box) datasets have raw episodes but no data/chunk parquet,
+    # so _read_dataset_timeline takes the _read_gmsl2_timeline path. The AprilTag
+    # EE-pose sidecar produced by run_april_cube_tracking_* (no v3 parquet needed)
+    # must still reach the replay view, with timestamps on the PWM-synced camera
+    # grid (pts_offset + N/fps).
+    dataset_root = tmp_path / "outputs" / "datasets" / "cam_only_set"
+    ep_dir = dataset_root / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    t0 = 1000.0
+    ep_dir.joinpath("meta.json").write_text(
+        json.dumps(
+            {
+                "duration_s": 0.05,  # 0.05 * 60 -> 3 frames
+                "video": {"fps": 60},
+                "sync_reference": {
+                    "t0_wall_s": t0,
+                    # mean(first_wall - t0) = (0.01 + 0.03) / 2 = 0.02
+                    "camera_first_wall_s": {"cam_00": t0 + 0.01, "cam_01": t0 + 0.03},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ep_dir.joinpath("cam_00.mkv").write_bytes(b"\0" * 2048)  # >1024 -> counts as a camera
+    sidecar = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    sidecar.mkdir(parents=True)
+    (sidecar / "state_action.left.csv").write_text(
+        "\n".join(
+            [
+                "episode_index,frame_index,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw",
+                "0,0,0.30,0.0,0.20,0.0,0.0,0.0,1.0",
+                "0,1,0.31,0.0,0.21,0.0,0.0,0.0,1.0",
+                "0,2,0.32,0.0,0.22,0.0,0.0,0.0,1.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root.parent,
+    )
+
+    # No v3 parquet -> the gmsl2 timeline path is exercised.
+    assert gateway._has_gmsl2_episodes(dataset_root)
+    assert not gateway._has_lerobot_v3_data(dataset_root)
+
+    timeline = gateway._read_dataset_timeline(state, dataset_root, episode=0)
+
+    assert timeline["cubePoseNames"] == ["left"]
+    assert timeline["frames"][0]["cubePoses"]["left"]["x"] == pytest.approx(0.30)
+    assert timeline["frames"][2]["cubePoses"]["left"]["x"] == pytest.approx(0.32)
+    # PWM grid: timestamp = pts_offset(0.02) + N / fps(60)
+    assert timeline["frames"][0]["timestamp"] == pytest.approx(0.02)
+    assert timeline["frames"][1]["timestamp"] == pytest.approx(0.02 + 1.0 / 60.0)
+
+
 def test_replay_timeline_includes_camera_cube_overlays(tmp_path):
     dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
     _write_minimal_episode_dataset(dataset_root, total_episodes=1)
-    tracking_run = tmp_path / "outputs" / "tracking_analysis" / "episode_set_tracking_in_robot_base"
+    tracking_run = tmp_path / "outputs" / "tracking_analysis" / f"episode_set{gateway.DEFAULT_TRACKING_RUN_SUFFIX}"
     per_camera = tracking_run / "per_camera"
     per_camera.mkdir(parents=True)
     intrinsics = tmp_path / "calibration" / "intrinsics.json"
@@ -767,15 +868,15 @@ def test_replay_timeline_includes_camera_cube_overlays(tmp_path):
     assert overlay["axes"]["origin"] == pytest.approx([320.0, 240.0])
 
 
-def test_traj_gen_starts_hikon_tracking_with_selected_dataset_root(tmp_path, monkeypatch):
+def test_traj_gen_starts_april_tracking_with_selected_dataset_root(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
     _write_minimal_episode_dataset(dataset_root, total_episodes=1)
-    script_path = repo_root / gateway.DEFAULT_EE_TRAJECTORY_SCRIPT
+    runner_path = repo_root / gateway.DEFAULT_EE_TRAJECTORY_RUNNER
     config_path = repo_root / gateway.DEFAULT_EE_TRAJECTORY_CONFIG
-    script_path.parent.mkdir(parents=True, exist_ok=True)
+    runner_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    script_path.write_text("print('tracking')\n", encoding="utf-8")
+    runner_path.write_text("#!/usr/bin/env bash\necho tracking\n", encoding="utf-8")
     config_path.write_text("input:\n  dataset_root: /wrong/from/yaml\n", encoding="utf-8")
     state = gateway.GatewayState(
         repo_root=repo_root,
@@ -806,7 +907,8 @@ def test_traj_gen_starts_hikon_tracking_with_selected_dataset_root(tmp_path, mon
     gateway._queue_traj_gen(state, dataset_root)
 
     command = launched["command"]
-    assert str(script_path) in command
+    assert command[0] == "bash"
+    assert str(runner_path) in command
     assert "--config" in command
     assert str(config_path) in command
     assert "--dataset-root" in command
@@ -814,7 +916,7 @@ def test_traj_gen_starts_hikon_tracking_with_selected_dataset_root(tmp_path, mon
     assert str(dataset_root) in state.processing_processes
     item = gateway._processing_item_from_dataset(dataset_root)
     assert item["status"] == "running"
-    assert "Hikon cube tracking" in item["message"]
+    assert "AprilTag cube tracking" in item["message"]
 
 
 def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_replay(tmp_path):
@@ -1128,6 +1230,84 @@ def test_export_command_rejects_task_without_repo_id(tmp_path):
     state, _ = _task_state(tmp_path)
     with pytest.raises(ValueError, match="dataset repo id"):
         gateway._export_command(state, {"id": "t", "name": "x", "datasetRepoId": ""})
+
+
+def _write_qc_pass_gmsl2_session(dataset_root: Path) -> None:
+    episode = dataset_root / "episodes" / "episode_000000"
+    episode.mkdir(parents=True)
+    (episode / "meta.json").write_text(
+        json.dumps({"video": {"fps": 60, "height": 480, "width": 640}}),
+        encoding="utf-8",
+    )
+    gateway._write_processing_meta(
+        dataset_root,
+        {
+            "active_version": "v1",
+            "versions": {"v1": {"qc": {"status": "pass", "summary": "ok"}}},
+        },
+    )
+
+
+def test_approved_dataset_export_command_scopes_to_selected_session(tmp_path):
+    state, datasets_root = _task_state(tmp_path)
+    state.exports_root = tmp_path / "repo" / "outputs" / "exports"
+    session = datasets_root / "pick_and_place_20260601_101046"
+    _write_qc_pass_gmsl2_session(session)
+    gateway._write_tasks(
+        state,
+        [
+            {
+                "id": "task-1",
+                "name": "Pick and Place",
+                "description": "pick cube carefully",
+                "datasetRepoId": "local/pick_and_place",
+            }
+        ],
+    )
+
+    command, out_root = gateway._approved_dataset_export_command(state, session)
+
+    assert out_root == state.exports_root / "pick_and_place_20260601_101046"
+    assert command[command.index("--datasets-root") + 1] == str(datasets_root)
+    assert command[command.index("--base-name") + 1] == "pick_and_place_20260601_101046"
+    assert command[command.index("--repo-id") + 1] == "local/pick_and_place_20260601_101046"
+    assert command[command.index("--task") + 1] == "pick cube carefully"
+
+
+def test_start_approved_dataset_export_copies_qc_pass_lerobot_v3_dataset(tmp_path):
+    state, datasets_root = _task_state(tmp_path)
+    state.exports_root = tmp_path / "repo" / "outputs" / "exports"
+    dataset_root = datasets_root / "approved_v3"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=2)
+    gateway._write_processing_meta(
+        dataset_root,
+        {
+            "active_version": "v1",
+            "versions": {"v1": {"qc": {"status": "pass", "summary": "ok"}}},
+        },
+    )
+
+    gateway._start_approved_dataset_export(state, str(dataset_root))
+
+    out_root = state.exports_root / "approved_v3"
+    assert state.dataset_export.state == "complete"
+    assert state.dataset_export.datasetRoot == str(dataset_root)
+    assert state.dataset_export.outputPath == str(out_root)
+    assert state.dataset_export.selectedEpisodes == 2
+    assert (out_root / "meta" / "info.json").is_file()
+    assert (out_root / "data" / "chunk-000" / "file-000.parquet").is_file()
+
+
+def test_start_approved_dataset_export_rejects_non_qc_pass_dataset(tmp_path):
+    state, datasets_root = _task_state(tmp_path)
+    session = datasets_root / "pick_and_place_20260601_101046"
+    episode = session / "episodes" / "episode_000000"
+    episode.mkdir(parents=True)
+    (episode / "meta.json").write_text("{}", encoding="utf-8")
+    (episode / "cam_0.mkv").write_bytes(b"0" * 2048)
+
+    with pytest.raises(ValueError, match="pass QC"):
+        gateway._start_approved_dataset_export(state, str(session))
 
 
 def test_apply_export_output_tracks_progress_and_terminal_state(tmp_path):

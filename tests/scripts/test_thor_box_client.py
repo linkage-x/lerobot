@@ -83,16 +83,45 @@ class _SensorCache:
     touch_sensor_data: tuple = field(default_factory=tuple)
 
 
-class _FakeBox:
-    """In-memory stand-in for ``box_sdk.Box``."""
+@dataclass
+class _FakeDiscovered:
+    """Stand-in for ``box_sdk.DiscoveredDevice`` (v3 broadcast enumeration)."""
+
+    device_id: int
+    sn: str = ""
+    ip: str = "192.168.2.60"
+    data_port: int = 15000
+    fw_version: int = 0
+    capabilities: int = 0
+
+
+class _FakeKeepAlive:
+    """Stand-in for ``box_sdk.DiscoveryKeepAlive``."""
 
     def __init__(self, *_, **__):
+        self.closed = False
+
+    def send_req(self, *_, **__):
+        return 0
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeBox:
+    """In-memory stand-in for the v3 multi-device ``box_sdk.Box``."""
+
+    def __init__(self, *_, **__):
+        # snaps -> the most-recent / default-device cache (device_id=None path);
+        # snaps_by_id -> per-device caches keyed by device_id.
         self.snaps: list[_SensorCache] = []
-        self.mode = 0
+        self.snaps_by_id: dict[int, _SensorCache] = {}
+        self.mode: dict[int | None, int] = {}
         self.started = False
         self.stopped = False
+        self.registered: list[tuple] = []
 
-    # --- protocol Box exposes to BoxClient -----------------------------
+    # --- protocol the v3 Box exposes to BoxClient ----------------------
     def start(self, bind_ip, bind_port, remote_ip, remote_port):
         self.started = True
         self.bind = (bind_ip, bind_port)
@@ -105,11 +134,32 @@ class _FakeBox:
     def close(self):
         pass
 
-    def set_mode(self, mode):
-        self.mode = mode
+    def set_mode(self, mode, device_id=None):
+        self.mode[device_id] = mode
         return 0
 
-    def get_sensor_cache(self):
+    def set_clamp_pos(self, pos_m, device_id=None):
+        return 0
+
+    def set_trigger_zero(self, device_id=None):
+        return 0
+
+    def register_device(self, device_id, ip, port=15000):
+        self.registered.append((int(device_id), ip, port))
+        return 0
+
+    def get_device_ids(self, *_):
+        ids = set(self.snaps_by_id) | {r[0] for r in self.registered}
+        if self.snaps:
+            ids.add(1)  # synthetic id for the most-recent-device path
+        return sorted(ids)
+
+    def get_known_device_ids(self, *_):
+        return sorted({r[0] for r in self.registered})
+
+    def get_sensor_cache(self, device_id=None):
+        if device_id is not None and device_id in self.snaps_by_id:
+            return 0, self.snaps_by_id[device_id]
         if self.snaps:
             return 0, self.snaps[0]
         return 4, _SensorCache(valid=0)
@@ -122,6 +172,8 @@ class _FakeBox:
 def fake_box_module(monkeypatch):
     module = types.ModuleType("box_sdk")
     module.Box = _FakeBox
+    module.discover = lambda **kw: []  # default: no broadcast discovery
+    module.DiscoveryKeepAlive = _FakeKeepAlive
     monkeypatch.setitem(sys.modules, "box_sdk", module)
     return module
 
@@ -272,6 +324,84 @@ def test_box_client_start_stop_pulls_snapshot_and_marks_detected(fake_box_module
     assert client.is_active() is False
 
 
+def _force_box_factory(force=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0), *, with_cali):
+    """Fake Box that publishes a 6D force sample; optionally exposes cali()."""
+    calls: list[bool] = []
+
+    class _Box(_FakeBox):
+        if with_cali:
+            def cali_6d_force_sensor(self, device_id=None):  # mirrors the v3 SDK
+                calls.append(True)
+                return 0
+
+    def _factory(*a, **kw):
+        b = _Box()
+        b.snaps.append(
+            _SensorCache(
+                valid=1,
+                data=_AllSensor(six_d_force_data=_SixD(timestamp=7, data=tuple(force))),
+            ),
+        )
+        return b
+
+    return _factory, calls
+
+
+def test_calibrate_six_d_force_gracefully_handles_missing_sdk_method(fake_box_module):
+    # The currently shipped wheel (0.1.0) has no cali_6d_force_sensor(); the
+    # wrapper must report ok=False with an explanatory error, never raise.
+    fake_box_module.Box, _ = _force_box_factory(with_cali=False)
+    cfg = box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01)
+    client = box_client.BoxClient(cfg)
+    assert client.start() is True
+    try:
+        result = client.calibrate_six_d_force()
+    finally:
+        client.stop()
+
+    assert result["ok"] is False
+    assert result["rc"] is None
+    assert "cali_6d_force_sensor" in result["error"]
+
+
+def test_calibrate_six_d_force_invokes_sdk_and_reports_before_after(fake_box_module):
+    fake_box_module.Box, calls = _force_box_factory(with_cali=True)
+    cfg = box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01)
+    client = box_client.BoxClient(cfg)
+    assert client.start() is True
+    import time as _t
+    _t.sleep(0.05)  # let the poll loop populate _latest for the before-read
+    try:
+        result = client.calibrate_six_d_force()
+    finally:
+        client.stop()
+
+    assert calls == [True]
+    assert result["ok"] is True
+    assert result["rc"] == 0
+    assert result["error"] is None
+    assert result["before"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert result["after"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+
+def test_box_pool_calibrate_six_d_force_targets_force_box(fake_box_module):
+    fake_box_module.Box, _ = _force_box_factory(with_cali=True)
+    fleet = box_client.fleet_from_yaml_dict({"enabled": True, "poll_interval_s": 0.01})
+    pool = box_client.BoxPool(fleet)
+    assert pool.start() is True
+    import time as _t
+    _t.sleep(0.05)
+    try:
+        results = pool.calibrate_six_d_force()
+    finally:
+        pool.stop()
+
+    assert len(results) == 1
+    assert results[0]["box_id"] == ""
+    assert results[0]["ok"] is True
+    assert results[0]["rc"] == 0
+
+
 def test_box_client_marks_gripper_seen_from_distance_without_timestamp(fake_box_module):
     cfg = box_client.BoxClientConfig(
         enabled=True,
@@ -386,3 +516,349 @@ def test_cleanup_session_csv_respects_disable_flag(tmp_path):
     client._cleanup_session_csv()
 
     assert f.exists()  # cleanup disabled -> file kept
+
+
+# --- multi-box scaffolding --------------------------------------------------
+
+
+def test_namespace_sid_only_prefixes_when_box_id_present():
+    assert box_client.namespace_sid("", "box_gripper") == "box_gripper"
+    assert box_client.namespace_sid("box1", "box_gripper") == "box1/box_gripper"
+
+
+def test_fleet_from_yaml_legacy_flat_block_is_single_unnamespaced_box():
+    raw = {"enabled": True, "remote_ip": "10.0.0.1", "expected_devices": ["box_gripper"]}
+    fleet = box_client.fleet_from_yaml_dict(raw)
+    assert fleet.enabled is True
+    assert fleet.discovery == "static"
+    assert len(fleet.boxes) == 1
+    assert fleet.boxes[0].box_id == ""  # legacy -> bare sensor ids
+    assert fleet.boxes[0].remote_ip == "10.0.0.1"
+
+
+def test_fleet_from_yaml_disabled_and_missing():
+    assert box_client.fleet_from_yaml_dict(None).enabled is False
+    assert box_client.fleet_from_yaml_dict(None).boxes == []
+    assert box_client.fleet_from_yaml_dict({"enabled": False}).enabled is False
+
+
+def test_fleet_from_yaml_boxes_list_inherits_enabled_and_keeps_ids():
+    raw = {
+        "enabled": True,
+        "discovery": "sdk",
+        "boxes": [
+            {"box_id": "box0", "remote_ip": "192.168.2.60", "expected_devices": ["box_gripper"]},
+            {"box_id": "box1", "remote_ip": "192.168.2.61", "expected_devices": ["box_gripper"]},
+        ],
+    }
+    fleet = box_client.fleet_from_yaml_dict(raw)
+    assert fleet.discovery == "sdk"
+    assert [b.box_id for b in fleet.boxes] == ["box0", "box1"]
+    assert [b.remote_ip for b in fleet.boxes] == ["192.168.2.60", "192.168.2.61"]
+    assert all(b.enabled for b in fleet.boxes)  # inherited from fleet
+
+
+def test_fleet_config_rejects_missing_or_duplicate_box_ids():
+    with pytest.raises(ValueError):
+        box_client.BoxFleetConfig(
+            boxes=[box_client.BoxClientConfig(box_id="box0"), box_client.BoxClientConfig()]
+        )
+    with pytest.raises(ValueError):
+        box_client.BoxFleetConfig(
+            boxes=[box_client.BoxClientConfig(box_id="dup"), box_client.BoxClientConfig(box_id="dup")]
+        )
+    with pytest.raises(ValueError):
+        box_client.BoxFleetConfig(discovery="bogus")
+
+
+def test_sdk_discovery_falls_back_to_static_boxes():
+    boxes = [box_client.BoxClientConfig(box_id="box0")]
+    # No enumerate_fn -> box_discover() unavailable -> fall back to static.
+    assert box_client.SdkBoxDiscovery(boxes).discover()[0].box_id == "box0"
+    fleet = box_client.BoxFleetConfig(discovery="sdk", boxes=boxes)
+    assert isinstance(box_client.make_discovery(fleet), box_client.SdkBoxDiscovery)
+
+
+def test_decode_sensor_mask_follows_known_sensor_bit_order():
+    assert box_client.decode_sensor_mask(0) == []
+    # bit 0 -> box_gripper, bit 1 -> box_imu (KNOWN_SENSOR_IDS order)
+    assert box_client.decode_sensor_mask(0b1) == ["box_gripper"]
+    assert box_client.decode_sensor_mask(0b11) == ["box_gripper", "box_imu"]
+    assert box_client.decode_sensor_mask((1 << len(box_client.KNOWN_SENSOR_IDS)) - 1) == list(
+        box_client.KNOWN_SENSOR_IDS
+    )
+
+
+def test_box_info_to_config_maps_identity_ip_and_sensor_mask():
+    template = box_client.BoxClientConfig(
+        bind_ip="192.168.2.45", remote_ip="0.0.0.0", poll_interval_s=0.002
+    )
+    info = box_client.BoxInfo(box_serial="SN-AAA", ip="192.168.2.61", sensor_mask=0b11)
+    cfg = box_client.box_info_to_config(info, template)
+    assert cfg.box_id == "SN-AAA"  # serial is the default namespace id
+    assert cfg.remote_ip == "192.168.2.61"
+    assert cfg.bind_ip == "192.168.2.45"  # shared default inherited from template
+    assert cfg.poll_interval_s == 0.002
+    assert cfg.expected_devices == ["box_gripper", "box_imu"]
+
+    # aliases pin a friendly id; empty sensor_mask inherits the template list.
+    template2 = box_client.BoxClientConfig(expected_devices=["box_gripper"])
+    info2 = box_client.BoxInfo(box_serial="SN-BBB", ip="192.168.2.62", sensor_mask=0)
+    cfg2 = box_client.box_info_to_config(info2, template2, aliases={"SN-BBB": "box1"})
+    assert cfg2.box_id == "box1"
+    assert cfg2.expected_devices == ["box_gripper"]
+
+
+def test_sdk_discovery_with_injected_enumerate_maps_to_configs():
+    template = box_client.BoxClientConfig(bind_ip="192.168.2.45")
+
+    def _fake_box_discover():
+        return [
+            box_client.BoxInfo(box_serial="SN-0", ip="192.168.2.60", sensor_mask=0b1),
+            box_client.BoxInfo(box_serial="SN-1", ip="192.168.2.61", sensor_mask=0b11),
+        ]
+
+    disco = box_client.SdkBoxDiscovery(
+        fallback=[], enumerate_fn=_fake_box_discover, template=template,
+        aliases={"SN-0": "box0", "SN-1": "box1"},
+    )
+    configs = disco.discover()
+    assert [c.box_id for c in configs] == ["box0", "box1"]
+    assert [c.remote_ip for c in configs] == ["192.168.2.60", "192.168.2.61"]
+    assert configs[0].expected_devices == ["box_gripper"]
+    assert configs[1].expected_devices == ["box_gripper", "box_imu"]
+    assert all(c.bind_ip == "192.168.2.45" for c in configs)  # template default
+
+
+def test_sdk_discovery_empty_or_failing_enumerate_falls_back():
+    fallback = [box_client.BoxClientConfig(box_id="static0")]
+
+    # enumerate returns nothing -> fall back.
+    empty = box_client.SdkBoxDiscovery(fallback, enumerate_fn=lambda: [])
+    assert [c.box_id for c in empty.discover()] == ["static0"]
+
+    # enumerate raises -> fall back (SDK present but the call failed).
+    def _boom():
+        raise RuntimeError("sdk discovery error")
+
+    failing = box_client.SdkBoxDiscovery(fallback, enumerate_fn=_boom)
+    assert [c.box_id for c in failing.discover()] == ["static0"]
+
+
+def _preloaded_box_factory(distance: float):
+    def _factory(*a, **kw):
+        b = _FakeBox()
+        b.snaps.append(
+            _SensorCache(
+                valid=1,
+                data=_AllSensor(gripper_data=_Gripper(timestamp=1, distance=distance)),
+            ),
+        )
+        return b
+
+    return _factory
+
+
+def test_box_pool_single_empty_id_delegates_without_namespacing(fake_box_module):
+    fake_box_module.Box = _preloaded_box_factory(0.05)  # type: ignore[assignment]
+    fleet = box_client.BoxFleetConfig(
+        boxes=[box_client.BoxClientConfig(box_id="", poll_interval_s=0.01, stale_threshold_s=5.0)]
+    )
+    pool = box_client.BoxPool(fleet)
+    assert pool.start() is True
+    import time as _t
+    _t.sleep(0.05)
+
+    snap = pool.read()
+    assert "box_gripper" in snap["sensors"]  # bare, no prefix
+    assert "boxes" not in snap  # passthrough returns the lone client's dict
+    assert pool.detect() == ["box_gripper"]
+    assert pool.is_active() is True
+    pool.stop()
+    assert pool.is_active() is False
+
+
+class _MultiDeviceBox(_FakeBox):
+    """Shared v3 Box that serves per-device gripper snaps whose MCU timestamp
+    increments each poll so the recorder's timestamp-dedup captures samples."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._ts: dict[int, int] = {}
+
+    def get_sensor_cache(self, device_id=None):
+        if device_id is None:
+            return 4, _SensorCache(valid=0)
+        self._ts[device_id] = self._ts.get(device_id, 0) + 1
+        return 0, _SensorCache(
+            valid=1,
+            data=_AllSensor(
+                gripper_data=_Gripper(timestamp=self._ts[device_id], distance=0.05)
+            ),
+        )
+
+
+def test_box_pool_two_boxes_namespace_sensors(fake_box_module):
+    # 方案A: one shared Box, two devices enumerated by broadcast discovery.
+    fake_box_module.Box = _MultiDeviceBox
+    fake_box_module.discover = lambda **kw: [
+        _FakeDiscovered(device_id=1, sn="box0", ip="192.168.2.61",
+                        capabilities=box_client.CAP_GRIPPER),
+        _FakeDiscovered(device_id=2, sn="box1", ip="192.168.2.62",
+                        capabilities=box_client.CAP_GRIPPER),
+    ]
+    fleet = box_client.BoxFleetConfig(
+        boxes=[
+            box_client.BoxClientConfig(box_id="box0", poll_interval_s=0.01, stale_threshold_s=5.0),
+            box_client.BoxClientConfig(box_id="box1", poll_interval_s=0.01, stale_threshold_s=5.0),
+        ]
+    )
+    pool = box_client.BoxPool(fleet)
+    assert pool.start() is True
+    import time as _t
+    _t.sleep(0.05)
+
+    # Discovery roster surfaces both devices for the GUI/recorder.
+    roster = pool.discovered_devices()
+    assert {d["box_id"] for d in roster} == {"box0", "box1"}
+    assert {d["device_id"] for d in roster} == {1, 2}
+    assert all(d["capability_names"] == ["box_gripper"] for d in roster)
+
+    snap = pool.read()
+    assert set(snap["sensors"]) == {"box0/box_gripper", "box1/box_gripper"}
+    assert set(snap["boxes"]) == {"box0", "box1"}
+    assert set(pool.detect()) == {"box0/box_gripper", "box1/box_gripper"}
+    # observed_rates() reports every known sensor (0.0 when absent); just check
+    # the keys are namespaced per box and never bare.
+    rates = pool.observed_rates()
+    assert {"box0/box_gripper", "box1/box_gripper"} <= set(rates)
+    assert all("/" in sid for sid in rates)
+
+    pool.start_recording(t0_wall_s=100.0)
+    _t.sleep(0.05)
+    samples = pool.stop_recording()
+    # Keys cover every known sensor per box (empty lists for absent ones); the
+    # grippers actually produced samples and every key is namespaced.
+    assert all("/" in sid for sid in samples)
+    assert samples["box0/box_gripper"] and samples["box1/box_gripper"]
+    # SensorSample.sensor_id is re-tagged so serialization emits namespaced ids.
+    for nsid, sample_list in samples.items():
+        assert all(s.sensor_id == nsid for s in sample_list)
+    pool.stop()
+
+
+# --- v3 discovery helpers ---------------------------------------------------
+
+
+def test_caps_to_sensor_ids_expands_touch_and_keeps_canonical_order():
+    assert box_client.caps_to_sensor_ids(0) == []
+    assert box_client.caps_to_sensor_ids(box_client.CAP_GRIPPER) == ["box_gripper"]
+    # CAP_TOUCH is a single vendor bit covering both Paxini pads.
+    assert box_client.caps_to_sensor_ids(box_client.CAP_TOUCH) == [
+        "box_touch_left", "box_touch_right",
+    ]
+    # All caps -> full KNOWN_SENSOR_IDS in canonical order.
+    all_caps = (
+        box_client.CAP_GRIPPER | box_client.CAP_IMU | box_client.CAP_TRIGGER
+        | box_client.CAP_6D_FORCE | box_client.CAP_TOUCH
+    )
+    assert box_client.caps_to_sensor_ids(all_caps) == list(box_client.KNOWN_SENSOR_IDS)
+
+
+def test_discover_boxes_returns_empty_when_wheel_missing(monkeypatch):
+    # No box_sdk on dev hosts -> graceful [] (never raises) so the gateway can
+    # still render the Device Manager.
+    monkeypatch.delitem(sys.modules, "box_sdk", raising=False)
+    real_import = __import__
+
+    def _import(name, *args, **kw):
+        if name == "box_sdk":
+            raise ImportError("synthetic-missing")
+        return real_import(name, *args, **kw)
+
+    monkeypatch.setattr("builtins.__import__", _import)
+    assert box_client.discover_boxes() == []
+
+
+def test_discover_boxes_maps_capabilities_to_expected_devices(fake_box_module):
+    fake_box_module.discover = lambda **kw: [
+        _FakeDiscovered(device_id=107, sn="SN-7", ip="192.168.2.61",
+                        capabilities=box_client.CAP_GRIPPER | box_client.CAP_IMU),
+    ]
+    found = box_client.discover_boxes()
+    assert len(found) == 1
+    d = found[0]
+    assert d.device_id == 107
+    assert d.expected_devices == ["box_gripper", "box_imu"]
+    pub = d.to_public_dict()
+    assert pub["device_id"] == 107 and pub["sn"] == "SN-7"
+    assert pub["capability_names"] == ["box_gripper", "box_imu"]
+
+
+def test_box_pool_duplicate_serials_namespace_by_device_id(fake_box_module):
+    # Un-personalized firmware ships every unit with the same box_serial; the
+    # pool must still give each a UNIQUE namespace (by device_id) instead of
+    # merging both physical boxes under one colliding serial.
+    class _Multi(_FakeBox):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self._ts: dict[int, int] = {}
+
+        def get_sensor_cache(self, device_id=None):
+            if device_id is None:
+                return 4, _SensorCache(valid=0)
+            self._ts[device_id] = self._ts.get(device_id, 0) + 1
+            return 0, _SensorCache(
+                valid=1,
+                data=_AllSensor(gripper_data=_Gripper(timestamp=self._ts[device_id], distance=0.05)),
+            )
+
+    fake_box_module.Box = _Multi
+    fake_box_module.discover = lambda **kw: [
+        _FakeDiscovered(device_id=111, sn="dup", ip="192.168.122.75",
+                        capabilities=box_client.CAP_GRIPPER),
+        _FakeDiscovered(device_id=222, sn="dup", ip="192.168.216.196",
+                        capabilities=box_client.CAP_GRIPPER),
+    ]
+    fleet = box_client.fleet_from_yaml_dict({"enabled": True, "poll_interval_s": 0.01})
+    pool = box_client.BoxPool(fleet)
+    assert pool.start() is True
+    import time as _t
+    _t.sleep(0.05)
+    snap = pool.read()
+    # Two distinct device_id namespaces despite identical serials -> no merge.
+    assert set(snap["sensors"]) == {"box111/box_gripper", "box222/box_gripper"}
+    assert {d["box_id"] for d in pool.discovered_devices()} == {"box111", "box222"}
+    pool.stop()
+
+
+def test_box_pool_single_discovered_device_stays_unnamespaced(fake_box_module):
+    # A lone discovered device on a legacy single-box fleet keeps bare ids so
+    # existing datasets/rows are byte-compatible.
+    fake_box_module.Box = _preloaded_box_factory(0.05)  # type: ignore[assignment]
+
+    def _shared(*a, **kw):
+        b = _FakeBox()
+        b.snaps_by_id[55] = _SensorCache(
+            valid=1, data=_AllSensor(gripper_data=_Gripper(timestamp=3, distance=0.05))
+        )
+        return b
+
+    fake_box_module.Box = _shared  # type: ignore[assignment]
+    fake_box_module.discover = lambda **kw: [
+        _FakeDiscovered(device_id=55, sn="SN-1", ip="192.168.2.60",
+                        capabilities=box_client.CAP_GRIPPER),
+    ]
+    fleet = box_client.BoxFleetConfig(
+        boxes=[box_client.BoxClientConfig(box_id="", poll_interval_s=0.01, stale_threshold_s=5.0)]
+    )
+    pool = box_client.BoxPool(fleet)
+    assert pool.start() is True
+    import time as _t
+    _t.sleep(0.05)
+    snap = pool.read()
+    assert "box_gripper" in snap["sensors"]  # bare, no prefix
+    assert "boxes" not in snap  # passthrough delegates to the lone client
+    # roster still reports the real device_id/sn for the GUI.
+    assert pool.discovered_devices()[0]["device_id"] == 55
+    pool.stop()

@@ -54,8 +54,6 @@ BOX_STATE_NAMES: tuple[str, ...] = (
     "box_six_d_force.mz",
     *tuple(f"box_touch_left.{name}" for name in _TOUCH_SUMMARY_NAMES),
     *tuple(f"box_touch_right.{name}" for name in _TOUCH_SUMMARY_NAMES),
-    "box_status.valid",
-    "box_status.liwp_index",
 )
 
 # Per-frame timestamp metadata, emitted as a SEPARATE non-observation parquet
@@ -70,8 +68,15 @@ BOX_TIMESTAMP_NAMES: tuple[str, ...] = (
     "box_six_d_force.timestamp",
     "box_touch_left.timestamp",
     "box_touch_right.timestamp",
-    "box_status.liwp_timestamp",
-    "box_status.received_wall_time_s",
+)
+
+BOX_SENSOR_IDS: tuple[str, ...] = (
+    "box_gripper",
+    "box_trigger",
+    "box_imu",
+    "box_six_d_force",
+    "box_touch_left",
+    "box_touch_right",
 )
 
 
@@ -89,6 +94,99 @@ def _sensor(snapshot: dict[str, Any], sensor_id: str) -> dict[str, Any]:
         return {}
     sensor = sensors.get(sensor_id)
     return sensor if isinstance(sensor, dict) else {}
+
+
+def _split_box_sensor_id(sensor_id: str) -> tuple[str, str] | None:
+    if sensor_id in BOX_SENSOR_IDS:
+        return ("", sensor_id)
+    if "/" not in sensor_id:
+        return None
+    box_id, bare = sensor_id.split("/", 1)
+    if box_id and bare in BOX_SENSOR_IDS:
+        return (box_id, bare)
+    return None
+
+
+def _box_ids_from_sensor_ids(sensor_ids: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    box_ids = {
+        split[0]
+        for sid in sensor_ids
+        if (split := _split_box_sensor_id(str(sid))) is not None
+    }
+    if not box_ids:
+        return ("",)
+    return tuple(sorted(box_ids, key=lambda item: (item != "", item)))
+
+
+def box_ids_from_snapshot(snapshot: dict[str, Any]) -> tuple[str, ...]:
+    sensors = snapshot.get("sensors")
+    if not isinstance(sensors, dict):
+        return ("",)
+    return _box_ids_from_sensor_ids(tuple(str(sid) for sid in sensors))
+
+
+def box_ids_from_snapshots(snapshots: list[dict[str, Any]]) -> tuple[str, ...]:
+    sensor_ids: list[str] = []
+    for snapshot in snapshots:
+        sensors = snapshot.get("sensors")
+        if isinstance(sensors, dict):
+            sensor_ids.extend(str(sid) for sid in sensors)
+    return _box_ids_from_sensor_ids(sensor_ids)
+
+
+def box_ids_from_sensor_samples(sensor_samples: dict[str, list[dict[str, Any]]] | None) -> tuple[str, ...]:
+    if not sensor_samples:
+        return ("",)
+    return _box_ids_from_sensor_ids(tuple(str(sid) for sid in sensor_samples))
+
+
+def box_ids_from_inputs(
+    snapshots: list[dict[str, Any]],
+    sensor_samples: dict[str, list[dict[str, Any]]] | None = None,
+) -> tuple[str, ...]:
+    ids = set(box_ids_from_snapshots(snapshots))
+    if sensor_samples:
+        ids.update(box_ids_from_sensor_samples(sensor_samples))
+    ids.discard("")
+    if ids:
+        return tuple(sorted(ids))
+    return ("",)
+
+
+def _prefix_box_name(box_id: str, name: str) -> str:
+    return f"{box_id}.{name}" if box_id else name
+
+
+def box_state_names(box_ids: tuple[str, ...] | list[str] | None = None) -> tuple[str, ...]:
+    ids = tuple(box_ids or ("",))
+    if ids == ("",):
+        return BOX_STATE_NAMES
+    return tuple(_prefix_box_name(box_id, name) for box_id in ids for name in BOX_STATE_NAMES)
+
+
+def box_timestamp_names(box_ids: tuple[str, ...] | list[str] | None = None) -> tuple[str, ...]:
+    ids = tuple(box_ids or ("",))
+    if ids == ("",):
+        return BOX_TIMESTAMP_NAMES
+    return tuple(_prefix_box_name(box_id, name) for box_id in ids for name in BOX_TIMESTAMP_NAMES)
+
+
+def _snapshot_for_box(snapshot: dict[str, Any], box_id: str) -> dict[str, Any]:
+    sensors = snapshot.get("sensors")
+    if not isinstance(sensors, dict):
+        return {"valid": False, "sensors": {}}
+    if not box_id:
+        return snapshot
+    grouped: dict[str, Any] = {}
+    prefix = f"{box_id}/"
+    for sid, payload in sensors.items():
+        sid_str = str(sid)
+        if not sid_str.startswith(prefix):
+            continue
+        bare = sid_str[len(prefix):]
+        if bare in BOX_SENSOR_IDS and isinstance(payload, dict):
+            grouped[bare] = payload
+    return {"valid": bool(grouped), "sensors": grouped}
 
 
 def _timestamp(sensor: dict[str, Any]) -> float:
@@ -148,8 +246,6 @@ def box_snapshot_to_state(snapshot: dict[str, Any]) -> list[float]:
         *_list_values(six_d, "fxyz_mxyz", 6),
         *_touch_summary(touch_left),
         *_touch_summary(touch_right),
-        1.0 if bool(snapshot.get("valid")) else 0.0,
-        _finite_float(snapshot.get("liwp_index")),
     ]
     if len(state) != len(BOX_STATE_NAMES):
         raise RuntimeError(f"BOX state length mismatch: {len(state)} != {len(BOX_STATE_NAMES)}")
@@ -178,14 +274,38 @@ def box_snapshot_to_timestamps(snapshot: dict[str, Any]) -> list[float]:
         _timestamp(six_d),
         _timestamp(touch_left),
         _timestamp(touch_right),
-        _finite_float(snapshot.get("liwp_timestamp")),
-        _finite_float(snapshot.get("received_wall_time_s")),
     ]
     if len(timestamps) != len(BOX_TIMESTAMP_NAMES):
         raise RuntimeError(
             f"BOX timestamp length mismatch: {len(timestamps)} != {len(BOX_TIMESTAMP_NAMES)}"
         )
     return [float(v) for v in timestamps]
+
+
+def box_snapshot_to_state_for_boxes(
+    snapshot: dict[str, Any],
+    box_ids: tuple[str, ...] | list[str] | None = None,
+) -> list[float]:
+    ids = tuple(box_ids or box_ids_from_snapshot(snapshot))
+    if ids == ("",):
+        return box_snapshot_to_state(snapshot)
+    state: list[float] = []
+    for box_id in ids:
+        state.extend(box_snapshot_to_state(_snapshot_for_box(snapshot, str(box_id))))
+    return state
+
+
+def box_snapshot_to_timestamps_for_boxes(
+    snapshot: dict[str, Any],
+    box_ids: tuple[str, ...] | list[str] | None = None,
+) -> list[float]:
+    ids = tuple(box_ids or box_ids_from_snapshot(snapshot))
+    if ids == ("",):
+        return box_snapshot_to_timestamps(snapshot)
+    timestamps: list[float] = []
+    for box_id in ids:
+        timestamps.extend(box_snapshot_to_timestamps(_snapshot_for_box(snapshot, str(box_id))))
+    return timestamps
 
 
 def _stats(values: list[list[float]]) -> dict[str, list[float] | list[int]]:
@@ -509,9 +629,15 @@ def _table_column_stats(table, col_name: str, *, width: int) -> dict[str, list]:
     }
 
 
-def _rows_to_table(pa, rows: list[dict[str, Any]]):
-    state_width = len(BOX_STATE_NAMES)
-    ts_width = len(BOX_TIMESTAMP_NAMES)
+def _rows_to_table(
+    pa,
+    rows: list[dict[str, Any]],
+    *,
+    state_names: tuple[str, ...] | list[str] = BOX_STATE_NAMES,
+    ts_names: tuple[str, ...] | list[str] = BOX_TIMESTAMP_NAMES,
+):
+    state_width = len(state_names)
+    ts_width = len(ts_names)
 
     def vector_column(key: str, width: int, dtype):
         flat: list[float] = []
@@ -533,13 +659,16 @@ def _rows_to_table(pa, rows: list[dict[str, Any]]):
             pa.array([row["index"] for row in rows], type=pa.int64()),
             pa.array([row["task_index"] for row in rows], type=pa.int64()),
         ],
-        schema=_box_table_schema(pa),
+        schema=_box_table_schema(pa, state_width=state_width, ts_width=ts_width),
     )
 
 
-def _box_table_schema(pa):
-    state_width = len(BOX_STATE_NAMES)
-    ts_width = len(BOX_TIMESTAMP_NAMES)
+def _box_table_schema(
+    pa,
+    *,
+    state_width: int = len(BOX_STATE_NAMES),
+    ts_width: int = len(BOX_TIMESTAMP_NAMES),
+):
     return pa.schema([
         ("observation.state", pa.list_(pa.float32(), state_width)),
         ("action", pa.list_(pa.float32(), state_width)),
@@ -552,11 +681,14 @@ def _box_table_schema(pa):
     ])
 
 
-def _box_features() -> dict[str, Any]:
+def _box_features(
+    state_names: tuple[str, ...] | list[str] = BOX_STATE_NAMES,
+    ts_names: tuple[str, ...] | list[str] = BOX_TIMESTAMP_NAMES,
+) -> dict[str, Any]:
     return {
-        "observation.state": _feature("float32", [len(BOX_STATE_NAMES)], list(BOX_STATE_NAMES)),
-        "action": _feature("float32", [len(BOX_STATE_NAMES)], list(BOX_STATE_NAMES)),
-        "box.timestamps": _feature("float64", [len(BOX_TIMESTAMP_NAMES)], list(BOX_TIMESTAMP_NAMES)),
+        "observation.state": _feature("float32", [len(state_names)], list(state_names)),
+        "action": _feature("float32", [len(state_names)], list(state_names)),
+        "box.timestamps": _feature("float64", [len(ts_names)], list(ts_names)),
         "timestamp": _feature("float32", [1]),
         "frame_index": _feature("int64", [1]),
         "episode_index": _feature("int64", [1]),
@@ -575,8 +707,10 @@ def _build_episode_rows(
     t0_wall_s: float = 0.0,
     pts_offset_s: float | None = None,
     start_index: int = 0,
+    box_ids: tuple[str, ...] | list[str] | None = None,
 ) -> list[dict[str, Any]]:
     use_hf = bool(sensor_samples and any(sensor_samples.values()))
+    resolved_box_ids = tuple(box_ids or box_ids_from_inputs(snapshots, sensor_samples))
     if not snapshots and not use_hf:
         return []
 
@@ -601,11 +735,11 @@ def _build_episode_rows(
                 if data:
                     sensors[sid] = data
             snap = {"valid": bool(sensors), "sensors": sensors}
-            state = box_snapshot_to_state(snap)
+            state = box_snapshot_to_state_for_boxes(snap, resolved_box_ids)
             rows.append({
                 "observation.state": state,
                 "action": list(state),
-                "box.timestamps": box_snapshot_to_timestamps(snap),
+                "box.timestamps": box_snapshot_to_timestamps_for_boxes(snap, resolved_box_ids),
                 "timestamp": timestamp_s,
                 "frame_index": local_frame,
                 "episode_index": episode_index,
@@ -630,11 +764,11 @@ def _build_episode_rows(
         for local_frame in range(frame_count):
             timestamp_s = local_frame / max(int(fps), 1)
             snapshot = snapshot_for_timestamp(timestamp_s)
-            state = box_snapshot_to_state(snapshot)
+            state = box_snapshot_to_state_for_boxes(snapshot, resolved_box_ids)
             rows.append({
                 "observation.state": state,
                 "action": list(state),
-                "box.timestamps": box_snapshot_to_timestamps(snapshot),
+                "box.timestamps": box_snapshot_to_timestamps_for_boxes(snapshot, resolved_box_ids),
                 "timestamp": timestamp_s,
                 "frame_index": local_frame,
                 "episode_index": episode_index,
@@ -675,6 +809,10 @@ class Lr3Writer:
         self._episode_indices: set[int] = set()
         self._closed = False
         self._finalized = False
+        self.state_names: tuple[str, ...] = BOX_STATE_NAMES
+        self.ts_names: tuple[str, ...] = BOX_TIMESTAMP_NAMES
+        self._schema = None
+        self._writer = None
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.episodes_dir.mkdir(parents=True, exist_ok=True)
@@ -682,13 +820,6 @@ class Lr3Writer:
             raise FileExistsError(
                 f"{self.data_path} already exists; Lr3Writer cannot append to an existing parquet file"
             )
-        self._schema = _box_table_schema(pa)
-        self._writer = pq.ParquetWriter(
-            self.data_path,
-            schema=self._schema,
-            compression="snappy",
-            use_dictionary=True,
-        )
         self._write_tasks()
         self._write_episodes()
         self._write_info()
@@ -708,6 +839,16 @@ class Lr3Writer:
         if int(episode_index) in self._episode_indices:
             raise ValueError(f"episode_index {episode_index} was already appended")
 
+        box_ids = box_ids_from_inputs(snapshots, sensor_samples)
+        state_names = box_state_names(box_ids)
+        ts_names = box_timestamp_names(box_ids)
+        if self._writer is not None and (state_names != self.state_names or ts_names != self.ts_names):
+            raise ValueError(
+                "BOX schema changed across episodes: "
+                f"state {len(state_names)} != {len(self.state_names)} or "
+                f"timestamps {len(ts_names)} != {len(self.ts_names)}"
+            )
+
         rows = _build_episode_rows(
             fps=self.fps,
             episode_index=episode_index,
@@ -717,11 +858,27 @@ class Lr3Writer:
             t0_wall_s=t0_wall_s,
             pts_offset_s=pts_offset_s,
             start_index=self.total_frames,
+            box_ids=box_ids,
         )
         if not rows:
             return None
 
-        table = _rows_to_table(self.pa, rows)
+        if self._writer is None:
+            self.state_names = state_names
+            self.ts_names = ts_names
+            self._schema = _box_table_schema(
+                self.pa,
+                state_width=len(self.state_names),
+                ts_width=len(self.ts_names),
+            )
+            self._writer = self.pq.ParquetWriter(
+                self.data_path,
+                schema=self._schema,
+                compression="snappy",
+                use_dictionary=True,
+            )
+
+        table = _rows_to_table(self.pa, rows, state_names=self.state_names, ts_names=self.ts_names)
         self._writer.write_table(table)
         n_rows = table.num_rows
         start = self.total_frames
@@ -746,6 +903,12 @@ class Lr3Writer:
     def finalize(self) -> None:
         if self._finalized:
             return
+        if self._writer is None:
+            self._write_episodes()
+            self._write_info()
+            self._write_tasks()
+            self._finalized = True
+            return
         self.close()
         table = self.pq.read_table(self.data_path)
         self._write_stats(table)
@@ -757,15 +920,16 @@ class Lr3Writer:
     def close(self) -> None:
         if self._closed:
             return
-        self._writer.close()
+        if self._writer is not None:
+            self._writer.close()
         self._closed = True
 
     def _write_stats(self, table) -> None:
-        state_width = len(BOX_STATE_NAMES)
+        state_width = len(self.state_names)
         stats = {
             "observation.state": _table_column_stats(table, "observation.state", width=state_width),
             "action": _table_column_stats(table, "action", width=state_width),
-            "box.timestamps": _table_column_stats(table, "box.timestamps", width=len(BOX_TIMESTAMP_NAMES)),
+            "box.timestamps": _table_column_stats(table, "box.timestamps", width=len(self.ts_names)),
             "timestamp": _table_column_stats(table, "timestamp", width=1),
             "frame_index": _table_column_stats(table, "frame_index", width=1),
             "episode_index": _table_column_stats(table, "episode_index", width=1),
@@ -808,7 +972,7 @@ class Lr3Writer:
             "splits": {"train": f"0:{n_eps}"},
             "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
             "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
-            "features": _box_features(),
+            "features": _box_features(self.state_names, self.ts_names),
         }
         (self.meta_dir / "info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
 
@@ -887,67 +1051,21 @@ def write_box_lerobot_v3_episode(
 
     data_path = data_dir / "file-000.parquet"
 
-    frame_count = len(snapshots) if snapshots else 0
-    if duration_s is not None and duration_s > 0:
-        frame_count = max(frame_count, int(round(float(duration_s) * max(int(fps), 1))))
-
-    rows: list[dict[str, Any]] = []
-    if use_hf:
-        calibrated = calibrate_sensor_samples(sensor_samples, t0_wall_s) if t0_wall_s else sensor_samples
-        frame_origin_s = pts_offset_s if pts_offset_s is not None else 0.0
-
-        per_sensor: dict[str, tuple[list[float], list[dict[str, Any]]]] = {}
-        for sid, slist_raw in calibrated.items():
-            slist = sorted(slist_raw, key=lambda s: s["t_rel_s"])
-            per_sensor[sid] = ([s["t_rel_s"] for s in slist], slist)
-        for local_frame in range(frame_count):
-            timestamp_s = frame_origin_s + local_frame / max(int(fps), 1)
-            sensors: dict[str, Any] = {}
-            for sid, (times, slist) in per_sensor.items():
-                data = _nearest_sample_data(times, slist, timestamp_s)
-                if data:
-                    sensors[sid] = data
-            snap = {"valid": bool(sensors), "sensors": sensors}
-            state = box_snapshot_to_state(snap)
-            rows.append({
-                "observation.state": state,
-                "action": list(state),
-                "box.timestamps": box_snapshot_to_timestamps(snap),
-                "timestamp": timestamp_s,
-                "frame_index": local_frame,
-                "episode_index": episode_index,
-                "index": 0,
-                "task_index": 0,
-            })
-    else:
-        ordered_snapshots = sorted(
-            snapshots,
-            key=lambda snap: _finite_float(snap.get("t_relative_s")),
-        )
-
-        def snapshot_for_timestamp(timestamp_s: float) -> dict[str, Any]:
-            selected = ordered_snapshots[0]
-            for candidate in ordered_snapshots:
-                if _finite_float(candidate.get("t_relative_s")) <= timestamp_s + 1e-9:
-                    selected = candidate
-                else:
-                    break
-            return selected
-
-        for local_frame in range(frame_count):
-            timestamp_s = local_frame / max(int(fps), 1)
-            snapshot = snapshot_for_timestamp(timestamp_s)
-            state = box_snapshot_to_state(snapshot)
-            rows.append({
-                "observation.state": state,
-                "action": list(state),
-                "box.timestamps": box_snapshot_to_timestamps(snapshot),
-                "timestamp": timestamp_s,
-                "frame_index": local_frame,
-                "episode_index": episode_index,
-                "index": 0,
-                "task_index": 0,
-            })
+    box_ids = box_ids_from_inputs(snapshots, sensor_samples)
+    state_names = box_state_names(box_ids)
+    ts_names = box_timestamp_names(box_ids)
+    rows = _build_episode_rows(
+        fps=fps,
+        episode_index=episode_index,
+        snapshots=snapshots,
+        duration_s=duration_s,
+        sensor_samples=sensor_samples,
+        t0_wall_s=t0_wall_s,
+        pts_offset_s=pts_offset_s,
+        box_ids=box_ids,
+    )
+    if not rows:
+        return None
 
     # Merge current-episode rows into existing parquet using Arrow Table
     # operations end-to-end. The old path did pq.read_table().to_pylist()
@@ -955,7 +1073,7 @@ def write_box_lerobot_v3_episode(
     # peaked at N * per_ep_rows * ~10 Python dict copies per episode and
     # caused permanent glibc malloc arena growth — ~7.7 MB/ep on Thor
     # at 50 ep with no GStreamer involved (see development_status.md).
-    new_table = _rows_to_table(pa, rows)
+    new_table = _rows_to_table(pa, rows, state_names=state_names, ts_names=ts_names)
     if data_path.exists():
         existing_table = pq.read_table(data_path)
         # Drop any prior rows for this same episode_index (idempotent overwrite).
@@ -979,11 +1097,11 @@ def write_box_lerobot_v3_episode(
     pq.write_table(combined, data_path)
 
     # Per-column stats via numpy on Arrow buffers (no row-level Python loop).
-    state_width = len(BOX_STATE_NAMES)
+    state_width = len(state_names)
     stats = {
         "observation.state": _table_column_stats(combined, "observation.state", width=state_width),
         "action": _table_column_stats(combined, "action", width=state_width),
-        "box.timestamps": _table_column_stats(combined, "box.timestamps", width=len(BOX_TIMESTAMP_NAMES)),
+        "box.timestamps": _table_column_stats(combined, "box.timestamps", width=len(ts_names)),
         "timestamp": _table_column_stats(combined, "timestamp", width=1),
         "frame_index": _table_column_stats(combined, "frame_index", width=1),
         "episode_index": _table_column_stats(combined, "episode_index", width=1),
@@ -1018,9 +1136,9 @@ def write_box_lerobot_v3_episode(
     pq.write_table(ep_table, episodes_dir / "file-000.parquet")
 
     features = {
-        "observation.state": _feature("float32", [len(BOX_STATE_NAMES)], list(BOX_STATE_NAMES)),
-        "action": _feature("float32", [len(BOX_STATE_NAMES)], list(BOX_STATE_NAMES)),
-        "box.timestamps": _feature("float64", [len(BOX_TIMESTAMP_NAMES)], list(BOX_TIMESTAMP_NAMES)),
+        "observation.state": _feature("float32", [len(state_names)], list(state_names)),
+        "action": _feature("float32", [len(state_names)], list(state_names)),
+        "box.timestamps": _feature("float64", [len(ts_names)], list(ts_names)),
         "timestamp": _feature("float32", [1]),
         "frame_index": _feature("int64", [1]),
         "episode_index": _feature("int64", [1]),

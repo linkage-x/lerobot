@@ -278,3 +278,122 @@ def test_v3writer_carries_box_timestamps_through(tmp_path):
     assert info["features"]["box.timestamps"]["dtype"] == "float64"
     stats = json.loads((out / "meta" / "stats.json").read_text())
     assert "box.timestamps" in stats
+
+
+# ----------------------------------------------- box ↔ camera time sync ----
+
+
+def test_pts_offset_s_averages_camera_first_wall_minus_t0():
+    meta = {
+        "sync_reference": {
+            "t0_wall_s": 1000.0,
+            "camera_first_wall_s": {"cam_00": 1000.01, "cam_01": 1000.03},
+        }
+    }
+    assert export_v3._pts_offset_s(meta) == pytest.approx(0.02)
+    # Missing anchors -> 0.0 (no pipeline-start correction available).
+    assert export_v3._pts_offset_s({}) == 0.0
+    assert export_v3._pts_offset_s({"sync_reference": {"t0_wall_s": 1000.0}}) == 0.0
+
+
+def _box_row(frame_index: int, value: float, ts_width: int = 1) -> dict:
+    return {
+        "frame_index": frame_index,
+        "observation.state": [value],
+        "action": [value * 10],
+        "box.timestamps": [float(frame_index)] * ts_width,
+    }
+
+
+def test_align_box_by_frame_index_drops_phantom_grid_tail():
+    # Recorder box grid (round(duration*fps)) is often a few frames longer than
+    # the real camera clip; the extra phantom rows must be dropped, not shift
+    # the remaining ones.
+    box_rows = [_box_row(i, float(i)) for i in range(5)]  # frame_index 0..4
+    state, action, ts, missing = export_v3._align_box_rows_by_frame_index(
+        box_rows, n_frames=3, state_width=1, ts_width=1
+    )
+    assert missing == 0
+    assert state == [[0.0], [1.0], [2.0]]
+    assert action == [[0.0], [10.0], [20.0]]
+    assert ts == [[0.0], [1.0], [2.0]]
+
+
+def test_align_box_by_frame_index_carries_last_when_camera_longer():
+    # Camera clip longer than the box grid: trailing frames have an image but no
+    # box sample -> hold the last reading and count them.
+    box_rows = [_box_row(0, 0.0), _box_row(1, 1.0)]  # frame_index 0,1
+    state, action, ts, missing = export_v3._align_box_rows_by_frame_index(
+        box_rows, n_frames=4, state_width=1, ts_width=1
+    )
+    assert missing == 2
+    assert state == [[0.0], [1.0], [1.0], [1.0]]  # frames 2,3 hold frame 1
+
+
+def test_align_box_by_frame_index_uses_frame_index_not_position():
+    # A gap at frame_index 1 (rows are 0 and 2). Positional slicing would put the
+    # fi=2 row at output frame 1; frame_index keying must place it at frame 2.
+    box_rows = [_box_row(0, 10.0), _box_row(2, 12.0)]
+    state, _action, _ts, missing = export_v3._align_box_rows_by_frame_index(
+        box_rows, n_frames=3, state_width=1, ts_width=1
+    )
+    assert missing == 1  # frame 1 has no row
+    assert state == [[10.0], [10.0], [12.0]]  # frame 1 holds frame 0, frame 2 correct
+
+
+def test_align_box_by_frame_index_no_timestamps_when_ts_width_zero():
+    box_rows = [_box_row(0, 0.0), _box_row(1, 1.0)]
+    _state, _action, ts, _missing = export_v3._align_box_rows_by_frame_index(
+        box_rows, n_frames=2, state_width=1, ts_width=0
+    )
+    assert ts is None
+
+
+def test_box_rows_from_raw_realigns_on_pwm_grid(tmp_path):
+    fps = 10
+    ep_dir = tmp_path / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    t0 = 1000.0
+    # pts_offset = mean(camera_first_wall_s - t0) = (0.0 + 0.2) / 2 = 0.1
+    meta = {
+        "video": {"fps": fps},
+        "sync_reference": {
+            "t0_wall_s": t0,
+            "camera_first_wall_s": {"cam_00": t0 + 0.0, "cam_01": t0 + 0.2},
+        },
+    }
+    # Gripper samples at t_rel 0.10/0.20/0.30 -> distances 0.01/0.02/0.03.
+    # mcu_ts=0 keeps poll times (no MCU calibration), so t_rel_s is used as-is.
+    lines = []
+    for trel, dist in [(0.10, 0.01), (0.20, 0.02), (0.30, 0.03)]:
+        lines.append(
+            json.dumps(
+                {
+                    "sid": "box_gripper",
+                    "mcu_ts": 0,
+                    "wall_s": t0 + trel,
+                    "t_rel_s": trel,
+                    "data": {"timestamp": 0, "distance_m": dist},
+                }
+            )
+        )
+    (ep_dir / "box_sensors.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = export_v3._box_rows_from_raw(ep_dir, meta, fps=fps, n_frames=3)
+    assert result is not None
+    state_rows, action_rows, ts_rows, state_names, ts_names = result
+
+    assert state_names == list(export_v3.lr3.BOX_STATE_NAMES)
+    assert ts_names == list(export_v3.lr3.BOX_TIMESTAMP_NAMES)
+    gi = export_v3.lr3.BOX_STATE_NAMES.index("box_gripper.distance_m")
+    # grid times pts_offset(0.1) + N/fps -> 0.10/0.20/0.30 -> nearest dist
+    assert [round(r[gi], 3) for r in state_rows] == [0.01, 0.02, 0.03]
+    assert action_rows == state_rows
+    assert len(state_rows[0]) == len(export_v3.lr3.BOX_STATE_NAMES)
+    assert len(ts_rows[0]) == len(export_v3.lr3.BOX_TIMESTAMP_NAMES)
+
+
+def test_box_rows_from_raw_returns_none_when_no_jsonl(tmp_path):
+    ep_dir = tmp_path / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    assert export_v3._box_rows_from_raw(ep_dir, {}, fps=30, n_frames=3) is None
