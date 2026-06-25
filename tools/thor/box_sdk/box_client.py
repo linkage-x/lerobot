@@ -76,6 +76,12 @@ class BoxClientConfig:
     startup_mode: int = 0  # 0 = collection / trigger-controlled, 1 = control
     poll_interval_s: float = 0.05
     record_poll_interval_s: float = 0.002
+    # The BOX data stream (UDP -> :15000) ages out ~10-15s after the last unicast
+    # command to the device; the DiscoveryKeepAlive broadcast on :15001 does NOT
+    # refresh it. Without this the box stops streaming during the gap between
+    # Connect and Start (or mid-episode), so the poll loop re-arms each device
+    # with set_mode every rearm_interval_s to keep samples flowing (0 disables).
+    rearm_interval_s: float = 3.0
     stale_threshold_s: float = 1.0
     # The vendored SDK .so unconditionally dumps box_sensor_data_*.csv into CWD
     # at ~35 MB/min with no disable switch; delete this session's file on stop()
@@ -118,6 +124,7 @@ def from_yaml_dict(raw: dict[str, Any] | None) -> BoxClientConfig:
         startup_mode=int(raw.get("startup_mode", 0)),
         poll_interval_s=float(raw.get("poll_interval_s", 0.05)),
         record_poll_interval_s=float(raw.get("record_poll_interval_s", 0.002)),
+        rearm_interval_s=float(raw.get("rearm_interval_s", 3.0)),
         stale_threshold_s=float(raw.get("stale_threshold_s", 1.0)),
         cleanup_box_csv=bool(raw.get("cleanup_box_csv", True)),
         expected_devices=[str(x) for x in expected],
@@ -547,6 +554,7 @@ class BoxClient:
         self._record_t0_wall_s = 0.0
         self._record_samples: dict[str, list[SensorSample]] = {}
         self._record_last_ts: dict[str, int] = {}
+        self._last_rearm_at_s: float = 0.0
 
     # ---- lifecycle ----
 
@@ -571,6 +579,7 @@ class BoxClient:
                 logger.warning("box.set_mode(%d) rc=%d", self.cfg.startup_mode, rc)
         except Exception as exc:  # noqa: BLE001
             logger.warning("box.set_mode failed: %s", exc)
+        self._last_rearm_at_s = time.monotonic()
 
         self._stop_event.clear()
         self._poll_thread = Thread(target=self._poll_loop, daemon=True, name="box-poll")
@@ -751,6 +760,21 @@ class BoxClient:
                                 )
                             )
                 recording = self._recording
+            # Keep the device's data stream alive: re-arm with set_mode on a fixed
+            # cadence. The BOX firmware ages out its per-device data master ~10-15s
+            # after the last unicast command, and the broadcast DiscoveryKeepAlive
+            # on :15001 does NOT refresh it -- without this re-arm the box stops
+            # streaming during the Connect->Start gap (or a long episode), so
+            # stop_recording() returns 0 samples. Done outside the lock (network
+            # round-trip) and best-effort (a transient failure is retried next tick).
+            if self.cfg.rearm_interval_s > 0:
+                now_rearm = time.monotonic()
+                if now_rearm - self._last_rearm_at_s >= self.cfg.rearm_interval_s:
+                    self._last_rearm_at_s = now_rearm
+                    try:
+                        self._box.set_mode(int(self.cfg.startup_mode))
+                    except Exception:  # noqa: BLE001 - best-effort keepalive
+                        pass
             interval = self.cfg.record_poll_interval_s if recording else self.cfg.poll_interval_s
             self._stop_event.wait(max(0.001, interval))
 
