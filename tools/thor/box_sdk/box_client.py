@@ -76,13 +76,20 @@ class BoxClientConfig:
     startup_mode: int = 0  # 0 = collection / trigger-controlled, 1 = control
     poll_interval_s: float = 0.05
     record_poll_interval_s: float = 0.002
-    # The BOX only streams data (UDP -> :15000) for a short window after each
-    # unicast command; the DiscoveryKeepAlive broadcast on :15001 does NOT keep
-    # the data channel alive. Without a re-arm it stops streaming within ~1s, so
-    # the poll loop re-arms each device with set_mode every rearm_interval_s.
-    # Measured on Thor: rearm off -> 0 Hz, 3.0s -> ~0.5 Hz (sporadic bursts),
-    # 0.5s -> ~166 Hz (near the ~199 Hz native rate). 0 disables.
-    rearm_interval_s: float = 0.5
+    # Keepalive strategy. The BOX firmware ages out its per-device data master
+    # if it hears nothing for a while and stops streaming (UDP -> :15000). The
+    # DiscoveryKeepAlive (3 s broadcast REQ on :15001, started in start()) resets
+    # that timer and is what keeps the stream alive. Measured on Thor (fw 0x0100,
+    # 2026-06-25; repro + data in TROUBLESHOOTING.md §8): with NO keepalive the
+    # stream dies ~16 s after the last contact; with the 3 s DiscoveryKeepAlive
+    # alone it streams indefinitely. So keepalive alone suffices and rearm is OFF
+    # by default. Setting rearm_interval_s > 0 re-enables a fallback where the
+    # poll loop also re-arms each device with set_mode that often (a unicast that
+    # likewise resets the ageout timer). Only needed if a firmware's ageout
+    # window is shorter than the 3 s keepalive period -- an earlier firmware
+    # showed a ~1 s window where 3 s keepalive was too slow and 0.5 s rearm was
+    # required. 0 disables.
+    rearm_interval_s: float = 0.0
     stale_threshold_s: float = 1.0
     # The vendored SDK .so unconditionally dumps box_sensor_data_*.csv into CWD
     # at ~35 MB/min with no disable switch; delete this session's file on stop()
@@ -125,7 +132,7 @@ def from_yaml_dict(raw: dict[str, Any] | None) -> BoxClientConfig:
         startup_mode=int(raw.get("startup_mode", 0)),
         poll_interval_s=float(raw.get("poll_interval_s", 0.05)),
         record_poll_interval_s=float(raw.get("record_poll_interval_s", 0.002)),
-        rearm_interval_s=float(raw.get("rearm_interval_s", 0.5)),
+        rearm_interval_s=float(raw.get("rearm_interval_s", 0.0)),
         stale_threshold_s=float(raw.get("stale_threshold_s", 1.0)),
         cleanup_box_csv=bool(raw.get("cleanup_box_csv", True)),
         expected_devices=[str(x) for x in expected],
@@ -256,6 +263,10 @@ def _decode_sensor_timestamps(snap) -> dict[str, int]:
 
 DATA_PORT_DEFAULT = 15000
 DISCOVERY_PORT_DEFAULT = 15001
+# DiscoveryKeepAlive broadcast period -- mirrors demo.py's KEEPALIVE_INTERVAL_S=3.0.
+# This is the primary mechanism that keeps the BOX data stream from ageing out
+# (see BoxClientConfig.rearm_interval_s and TROUBLESHOOTING.md §8).
+KEEPALIVE_INTERVAL_MS = 3000
 
 # Vendor SDK capability bits (box_sdk._internal.ctypes_backend CAP_*). Mirrored
 # here so caps→sensor mapping works without importing the ARM-only wheel.
@@ -620,7 +631,8 @@ class BoxClient:
             logger.warning("box.start rc=%d", rc)
             return None
         # Broadcast-discover so we learn + register the device_id up front; also
-        # start a keepalive (the firmware ages out its master after ~15s silence).
+        # start the keepalive -- the 3 s broadcast REQ is what keeps the BOX data
+        # stream from ageing out (see BoxClientConfig.rearm_interval_s).
         device_id = self._device_id
         try:
             found = box_sdk.discover(timeout=2.0)
@@ -639,7 +651,9 @@ class BoxClient:
             )
             device_id = int(primary.device_id)
         try:
-            self._keepalive = box_sdk.DiscoveryKeepAlive()
+            self._keepalive = box_sdk.DiscoveryKeepAlive(
+                bind_port=DISCOVERY_PORT_DEFAULT, interval_ms=KEEPALIVE_INTERVAL_MS,
+            )
         except Exception as exc:  # noqa: BLE001
             self._keepalive = None
             logger.warning("DiscoveryKeepAlive unavailable: %s", exc)
@@ -761,12 +775,12 @@ class BoxClient:
                                 )
                             )
                 recording = self._recording
-            # Keep the device's data stream alive: re-arm with set_mode on a fixed
-            # cadence. The BOX firmware ages out its per-device data master ~10-15s
-            # after the last unicast command, and the broadcast DiscoveryKeepAlive
-            # on :15001 does NOT refresh it -- without this re-arm the box stops
-            # streaming during the Connect->Start gap (or a long episode), so
-            # stop_recording() returns 0 samples. Done outside the lock (network
+            # Optional fallback keepalive (OFF by default; see
+            # BoxClientConfig.rearm_interval_s). The DiscoveryKeepAlive started in
+            # start() is the primary mechanism that keeps the data stream from
+            # ageing out; this re-arms each device with set_mode on a fixed cadence
+            # as a belt-and-suspenders for firmwares whose ageout window is shorter
+            # than the 3 s keepalive period. Done outside the lock (network
             # round-trip) and best-effort (a transient failure is retried next tick).
             if self.cfg.rearm_interval_s > 0:
                 now_rearm = time.monotonic()
@@ -1295,9 +1309,12 @@ class BoxPool:
             logger.warning(
                 "no BOX devices discovered; falling back to a single passthrough view"
             )
-        # Keepalive so the firmware doesn't age out its master after ~15s silence.
+        # Keepalive: the 3 s broadcast REQ keeps every box's data stream from
+        # ageing out (see BoxClientConfig.rearm_interval_s / TROUBLESHOOTING.md §8).
         try:
-            self._keepalive = box_sdk.DiscoveryKeepAlive()
+            self._keepalive = box_sdk.DiscoveryKeepAlive(
+                bind_port=DISCOVERY_PORT_DEFAULT, interval_ms=KEEPALIVE_INTERVAL_MS,
+            )
         except Exception as exc:  # noqa: BLE001
             self._keepalive = None
             logger.warning("DiscoveryKeepAlive unavailable: %s", exc)
