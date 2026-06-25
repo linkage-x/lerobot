@@ -79,6 +79,42 @@ def _emit(text: str) -> None:
     print(text, flush=True)
 
 
+# Healthy BOX sensors stream at ~199 Hz (touch ~50 Hz). A box that answers
+# discovery but has stalled/aged out shows 0 Hz; a degraded one limps at ~8 Hz.
+# 30 Hz cleanly separates healthy (>=50) from both failure modes and is the floor
+# below which recorded box data is too sparse to be usable.
+_MIN_HEALTHY_STREAM_HZ = 30.0
+
+
+def _streaming_sensor_ids(observed_rates: dict[str, float]) -> list[str]:
+    """Sensor ids that are actually pushing data (observed update rate > 0 Hz).
+
+    ``observed_rates`` is derived from MCU-timestamp *advancement* (not raw poll
+    count), so an empty result distinguishes a BOX that answers discovery but is
+    not streaming -- including the "frozen cache" state where get_sensor_cache
+    keeps returning the same stale snapshot -- from one that is streaming.
+    """
+    return sorted(sid for sid, hz in observed_rates.items() if hz > 0)
+
+
+def _box_stream_health(
+    observed_rates: dict[str, float],
+    *,
+    min_hz: float = _MIN_HEALTHY_STREAM_HZ,
+) -> tuple[bool, float]:
+    """Return ``(healthy, peak_hz)`` for the pre-record BOX health check.
+
+    Healthy only when the fastest sensor clears ``min_hz`` -- this catches both a
+    fully stalled box (0 Hz: discovery OK but no data) and a *degraded* one (e.g.
+    ~8 Hz instead of ~199 Hz) that would otherwise record sparse, unusable box
+    data and "no touch sample" frames. The box data stream can age out; a host
+    re-arm helps but cannot always revive it (see box_client + ts_sync.md), so we
+    warn the operator to power-cycle instead of failing silently.
+    """
+    peak_hz = max(observed_rates.values(), default=0.0)
+    return (peak_hz >= min_hz, peak_hz)
+
+
 def _connect_session_with_deadline(
     session: ps.PersistentCameraSession,
     *,
@@ -694,11 +730,21 @@ def main(argv: list[str] | None = None) -> int:
         # disconnect. With this change, unplugging BOX -> rates all 0 ->
         # emit "Box devices: (none)" -> gateway flips all box rows to red.
         rates = box.observed_rates()
-        live_sids = sorted(sid for sid, hz in rates.items() if hz > 0)
+        live_sids = _streaming_sensor_ids(rates)
         _emit(f"Box devices: {', '.join(live_sids) if live_sids else '(none)'}")
         if live_sids:
             parts = [f"{sid}={rates[sid]:.0f}" for sid in live_sids]
             _emit(f"Box rates: {', '.join(parts)}")
+        healthy, peak_hz = _box_stream_health(rates)
+        if not healthy:
+            # Discovery succeeded (box answered :15001) but the data stream on
+            # :15000 is stalled (0 Hz) or degraded (e.g. ~8 Hz vs ~199 Hz) and a
+            # host re-arm can't always revive it. Warn loudly so the operator
+            # power-cycles instead of recording empty/sparse box episodes.
+            _emit(
+                f"WARNING: BOX stream unhealthy (peak {peak_hz:.0f} Hz, expected ~199); "
+                "recordings will have missing/sparse box data. Power-cycle the box and reconnect."
+            )
     elif box_cfg.enabled:
         _emit("Box devices: (none)")
         logger.warning("box_collection enabled but BoxClient.start() returned False")
@@ -1051,6 +1097,18 @@ def main(argv: list[str] | None = None) -> int:
                 ep_idx, wall_start, ep_dir, split_emit_ms,
             )
             if box_started:
+                # Pre-record health check: if the box stalled/degraded between
+                # Connect and Start (or mid-session), it answers discovery but
+                # pushes no (or too-sparse) data, so this episode would record
+                # empty/sparse box data. Surface it instead of failing silently --
+                # the operator can discard + power-cycle.
+                healthy, peak_hz = _box_stream_health(box.observed_rates())
+                if not healthy:
+                    _emit(
+                        f"WARNING: BOX stream unhealthy at episode start (peak {peak_hz:.0f} Hz); "
+                        "this episode will have missing/sparse box data. Discard it, "
+                        "power-cycle the box, and reconnect."
+                    )
                 box.start_recording(t_start)
             box_snapshots: list[dict[str, Any]] = []
             target_s = cfg.episode_time_s if cfg.episode_time_s > 0 else float("inf")

@@ -324,3 +324,38 @@ def test_connect_session_with_deadline_times_out_and_disconnects():
     assert "connect exceeded global deadline" in message
     assert session.disconnect_called is True
     assert time.monotonic() - started < 0.5
+
+
+def test_streaming_sensor_ids_filters_to_advancing_sensors():
+    # observed_rates is derived from MCU-timestamp advancement, so >0 means the
+    # sensor is genuinely pushing fresh data. The pre-record health check uses an
+    # empty result to flag a box that answers discovery but isn't streaming.
+    rates = {
+        "box_gripper": 199.0,
+        "box_imu": 198.0,
+        "box_touch_left": 50.0,
+        "box_six_d_force": 0.0,  # present but not advancing -> excluded
+    }
+    assert tr._streaming_sensor_ids(rates) == ["box_gripper", "box_imu", "box_touch_left"]
+    assert tr._streaming_sensor_ids({"box_gripper": 0.0, "box_imu": 0.0}) == []
+    assert tr._streaming_sensor_ids({}) == []
+
+
+def test_box_stream_health_flags_dead_and_degraded_boxes():
+    # Healthy: high-freq sensors near 199 Hz -> peak clears the floor.
+    healthy, peak = tr._box_stream_health(
+        {"box_gripper": 199.0, "box_imu": 198.0, "box_touch_left": 50.0}
+    )
+    assert healthy is True
+    assert peak == 199.0
+    # Fully stalled box (discovery OK, no data): all-zero -> unhealthy.
+    assert tr._box_stream_health({"box_gripper": 0.0, "box_imu": 0.0}) == (False, 0.0)
+    # Degraded / ageing-out box (~8 Hz instead of ~199): peak below the floor ->
+    # flagged. This is the 073552 failure mode that a bare >0 check wrongly passes.
+    healthy, peak = tr._box_stream_health(
+        {"box_gripper": 8.5, "box_imu": 8.5, "box_touch_left": 2.5}
+    )
+    assert healthy is False
+    assert peak == 8.5
+    # Empty (no box) -> unhealthy, peak 0.
+    assert tr._box_stream_health({}) == (False, 0.0)
