@@ -76,12 +76,13 @@ class BoxClientConfig:
     startup_mode: int = 0  # 0 = collection / trigger-controlled, 1 = control
     poll_interval_s: float = 0.05
     record_poll_interval_s: float = 0.002
-    # The BOX data stream (UDP -> :15000) ages out ~10-15s after the last unicast
-    # command to the device; the DiscoveryKeepAlive broadcast on :15001 does NOT
-    # refresh it. Without this the box stops streaming during the gap between
-    # Connect and Start (or mid-episode), so the poll loop re-arms each device
-    # with set_mode every rearm_interval_s to keep samples flowing (0 disables).
-    rearm_interval_s: float = 3.0
+    # The BOX only streams data (UDP -> :15000) for a short window after each
+    # unicast command; the DiscoveryKeepAlive broadcast on :15001 does NOT keep
+    # the data channel alive. Without a re-arm it stops streaming within ~1s, so
+    # the poll loop re-arms each device with set_mode every rearm_interval_s.
+    # Measured on Thor: rearm off -> 0 Hz, 3.0s -> ~0.5 Hz (sporadic bursts),
+    # 0.5s -> ~166 Hz (near the ~199 Hz native rate). 0 disables.
+    rearm_interval_s: float = 0.5
     stale_threshold_s: float = 1.0
     # The vendored SDK .so unconditionally dumps box_sensor_data_*.csv into CWD
     # at ~35 MB/min with no disable switch; delete this session's file on stop()
@@ -124,7 +125,7 @@ def from_yaml_dict(raw: dict[str, Any] | None) -> BoxClientConfig:
         startup_mode=int(raw.get("startup_mode", 0)),
         poll_interval_s=float(raw.get("poll_interval_s", 0.05)),
         record_poll_interval_s=float(raw.get("record_poll_interval_s", 0.002)),
-        rearm_interval_s=float(raw.get("rearm_interval_s", 3.0)),
+        rearm_interval_s=float(raw.get("rearm_interval_s", 0.5)),
         stale_threshold_s=float(raw.get("stale_threshold_s", 1.0)),
         cleanup_box_csv=bool(raw.get("cleanup_box_csv", True)),
         expected_devices=[str(x) for x in expected],
