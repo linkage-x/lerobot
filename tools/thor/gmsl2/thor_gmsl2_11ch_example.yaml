@@ -104,15 +104,24 @@ sensors:
 # steps (apt + setup_env.sh + pip install the wheel). UDP ports are pinned
 # to 15000 in both directions per the vendor docs (`需求整理 §5.1`).
 #
+# bind_ip MUST be 0.0.0.0 (wildcard): the v3 firmware box gets a DHCP address
+# on any subnet (e.g. 192.168.122.75) and streams to whatever host address it
+# learned from our command packets -- which the kernel picks by route, not from
+# bind_ip. Binding to a specific address (the old fixed 192.168.2.45) silently
+# receives NOTHING whenever the box is off that subnet -> 0 box samples, frozen
+# observation.state/action. See TROUBLESHOOTING.md §8/§9. remote_ip is only the
+# initial start() target; BoxClient.start() then discover()s + register_device()s
+# the box's real address, so a stale value here is corrected automatically.
+#
 # `expected_devices` is the full set the gateway will surface on the
 # frontend; `BoxClient.detect()` then trims it to whichever subset is
 # actually publishing (a rig may have zero, one, or two Paxini touch pads
 # attached). Set `enabled: false` for camera-only sessions.
 box_collection:
   enabled: true
-  bind_ip: "192.168.2.45"
+  bind_ip: "0.0.0.0"       # wildcard -- box IP is DHCP/dynamic (see note above)
   bind_port: 15000
-  remote_ip: "192.168.2.60"
+  remote_ip: "192.168.2.60"  # initial target only; discover() corrects to the real box
   remote_port: 15000
   sdk_dir: tools/thor/box_sdk
   sdk_setup_script: setup_env.sh
@@ -142,11 +151,11 @@ box_collection:
 #   discovery: static          # static | sdk
 #   boxes:
 #     - box_id: box0
-#       bind_ip: "192.168.2.45"
+#       bind_ip: "0.0.0.0"
 #       remote_ip: "192.168.2.60"
 #       expected_devices: [box_gripper, box_imu, box_trigger]
 #     - box_id: box1
-#       bind_ip: "192.168.2.45"
+#       bind_ip: "0.0.0.0"
 #       remote_ip: "192.168.2.61"
 #       expected_devices: [box_gripper, box_imu, box_trigger]
 

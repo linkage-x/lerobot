@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -278,6 +279,132 @@ def test_v3writer_carries_box_timestamps_through(tmp_path):
     assert info["features"]["box.timestamps"]["dtype"] == "float64"
     stats = json.loads((out / "meta" / "stats.json").read_text())
     assert "box.timestamps" in stats
+
+
+def test_export_task_to_v3_merges_tracking_pose_sidecars(tmp_path, monkeypatch):
+    pq = pytest.importorskip("pyarrow.parquet")
+    pytest.importorskip("pyarrow")
+
+    datasets = tmp_path / "datasets"
+    exports = tmp_path / "exports"
+    datasets.mkdir()
+    session = _make_session(datasets, "pick_and_place_20260601_101046", [0], cams=("cam_00",))
+    _write_box_parquet(session, {0: 2}, state_width=4)
+
+    sidecar = session / "derived" / "april_cube_tracking_in_robot_base"
+    sidecar.mkdir(parents=True)
+    (sidecar / "state_action.left.csv").write_text(
+        """episode_index,frame_index,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw,action_x_m,action_y_m,action_z_m,action_qx,action_qy,action_qz,action_qw
+0,0,0.1,0.2,0.3,0,0,0,1,1.1,1.2,1.3,0,0,0,1
+0,1,0.4,0.5,0.6,0,0,0,1,1.4,1.5,1.6,0,0,0,1
+0,2,9.0,9.0,9.0,0,0,0,1,9.0,9.0,9.0,0,0,0,1
+""",
+        encoding="utf-8",
+    )
+    (sidecar / "cube_pose.left.cam_00.csv").write_text(
+        """episode_index,frame_index,cube_name,stream_key,cube_cam_x_m,cube_cam_y_m,cube_cam_z_m,cube_cam_qx,cube_cam_qy,cube_cam_qz,cube_cam_qw
+0,0,left,cam_00,2.1,2.2,2.3,0,0,0,1
+0,1,left,cam_00,2.4,2.5,2.6,0,0,0,1
+""",
+        encoding="utf-8",
+    )
+    repo_root = tmp_path / "repo"
+    tracking = repo_root / "outputs" / "tracking_analysis" / f"{session.name}_thor_april_tracking_in_robot_base"
+    tracking.mkdir(parents=True)
+    (tracking / "fused_ee_pose_in_robot_base_records_left.csv").write_text(
+        """episode_index,frame_index,cube_name,cube_base_x_m,cube_base_y_m,cube_base_z_m,cube_base_qx,cube_base_qy,cube_base_qz,cube_base_qw
+0,0,left,3.1,3.2,3.3,0,0,0,1
+0,1,left,3.4,3.5,3.6,0,0,0,1
+""",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(export_v3, "_REPO_ROOT", repo_root)
+    monkeypatch.setattr(export_v3, "_mkv_frame_count", lambda _path: 2)
+
+    def fake_transcode(_src, dst, _codec, _fps):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"mp4")
+
+    monkeypatch.setattr(export_v3, "transcode_to_h264_mp4", fake_transcode)
+
+    out = export_v3.export_task_to_v3(
+        datasets_root=datasets,
+        exports_root=exports,
+        base_name="pick_and_place",
+        repo_id="local/pick_and_place",
+        task="pick the cube",
+    )
+
+    table = pq.read_table(out / "data" / "chunk-000" / "file-000.parquet")
+    assert "observation.ee_pose.left.base" in table.column_names
+    assert "action.ee_pose.left.base" in table.column_names
+    assert "observation.cube_pose.left.camera.cam_00" in table.column_names
+    assert "observation.cube_pose.left.base" in table.column_names
+    ee_rows = table.column("observation.ee_pose.left.base").to_pylist()
+    assert ee_rows[0] == pytest.approx([0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0])
+    assert ee_rows[1] == pytest.approx([0.4, 0.5, 0.6, 0.0, 0.0, 0.0, 1.0])
+    assert table.column("action.ee_pose.left.base").to_pylist()[1][:3] == pytest.approx([1.4, 1.5, 1.6])
+    assert table.column("observation.cube_pose.left.camera.cam_00").to_pylist()[0][:3] == pytest.approx([2.1, 2.2, 2.3])
+    assert table.column("observation.cube_pose.left.base").to_pylist()[1][:3] == pytest.approx([3.4, 3.5, 3.6])
+
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["features"]["observation.cube_pose.left.base"]["names"] == list(export_v3._POSE7_FEATURE_NAMES)
+    stats = json.loads((out / "meta" / "stats.json").read_text())
+    assert stats["observation.ee_pose.left.base"]["count"] == [2] * 7
+    assert not math.isnan(table.column("observation.ee_pose.left.base").to_pylist()[1][0])
+
+
+def test_export_task_to_v3_falls_back_to_sidecar_cube_base(tmp_path, monkeypatch):
+    pq = pytest.importorskip("pyarrow.parquet")
+    pytest.importorskip("pyarrow")
+
+    datasets = tmp_path / "datasets"
+    exports = tmp_path / "exports"
+    datasets.mkdir()
+    session = _make_session(datasets, "pick_and_place_20260601_101046", [0], cams=("cam_00",))
+    _write_box_parquet(session, {0: 2}, state_width=4)
+
+    sidecar = session / "derived" / "april_cube_tracking_in_robot_base"
+    sidecar.mkdir(parents=True)
+    (sidecar / "state_action.left.csv").write_text(
+        """episode_index,frame_index,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw,action_x_m,action_y_m,action_z_m,action_qx,action_qy,action_qz,action_qw
+0,0,0.1,0.2,0.3,0,0,0,1,1.1,1.2,1.3,0,0,0,1
+0,1,0.4,0.5,0.6,0,0,0,1,1.4,1.5,1.6,0,0,0,1
+""",
+        encoding="utf-8",
+    )
+    (sidecar / "cube_pose.left.cam_00.csv").write_text(
+        """episode_index,frame_index,cube_name,stream_key,used_for_fusion,cube_cam_x_m,cube_cam_y_m,cube_cam_z_m,cube_cam_qx,cube_cam_qy,cube_cam_qz,cube_cam_qw,cube_base_x_m,cube_base_y_m,cube_base_z_m,cube_base_qx,cube_base_qy,cube_base_qz,cube_base_qw
+0,0,left,cam_00,0,2.1,2.2,2.3,0,0,0,1,3.1,3.2,3.3,0,0,0,1
+0,1,left,cam_00,1,2.4,2.5,2.6,0,0,0,1,3.4,3.5,3.6,0,0,0,1
+""",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(export_v3, "_REPO_ROOT", tmp_path / "repo_without_tracking_analysis")
+    monkeypatch.setattr(export_v3, "_mkv_frame_count", lambda _path: 2)
+
+    def fake_transcode(_src, dst, _codec, _fps):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"mp4")
+
+    monkeypatch.setattr(export_v3, "transcode_to_h264_mp4", fake_transcode)
+
+    out = export_v3.export_task_to_v3(
+        datasets_root=datasets,
+        exports_root=exports,
+        base_name="pick_and_place",
+        repo_id="local/pick_and_place",
+        task="pick the cube",
+    )
+
+    table = pq.read_table(out / "data" / "chunk-000" / "file-000.parquet")
+    assert "observation.cube_pose.left.base" in table.column_names
+    assert table.column("observation.cube_pose.left.base").to_pylist()[0][:3] == pytest.approx([3.1, 3.2, 3.3])
+    assert table.column("observation.cube_pose.left.base").to_pylist()[1][:3] == pytest.approx([3.4, 3.5, 3.6])
+    stats = json.loads((out / "meta" / "stats.json").read_text())
+    assert stats["observation.cube_pose.left.base"]["count"] == [2] * 7
 
 
 # ----------------------------------------------- box ↔ camera time sync ----

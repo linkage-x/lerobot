@@ -1298,6 +1298,52 @@ def test_start_approved_dataset_export_copies_qc_pass_lerobot_v3_dataset(tmp_pat
     assert (out_root / "data" / "chunk-000" / "file-000.parquet").is_file()
 
 
+def test_start_approved_dataset_export_consolidates_raw_gmsl2_even_with_parquet(tmp_path, monkeypatch):
+    state, datasets_root = _task_state(tmp_path)
+    state.exports_root = tmp_path / "repo" / "outputs" / "exports"
+    dataset_root = datasets_root / "pick_and_place_20260601_101046"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    _write_qc_pass_gmsl2_session(dataset_root)
+    (dataset_root / "episodes" / "episode_000000" / "cam_00.mkv").write_bytes(b"0" * 2048)
+
+    launched: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 4321
+        stdout = []
+
+        def poll(self):
+            return None
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            launched["thread_args"] = args
+            launched["thread_kwargs"] = kwargs
+
+        def start(self):
+            launched["thread_started"] = True
+
+    def fake_popen(command, **kwargs):
+        launched["command"] = command
+        launched["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(gateway, "Thread", FakeThread)
+
+    gateway._start_approved_dataset_export(state, str(dataset_root))
+
+    command = launched["command"]
+    assert command[1].endswith("tools/thor/gmsl2/export_v3.py")
+    assert command[command.index("--datasets-root") + 1] == str(datasets_root)
+    assert command[command.index("--base-name") + 1] == dataset_root.name
+    assert "--overwrite" in command
+    assert state.dataset_export.state == "exporting"
+    assert state.dataset_export.outputPath == str(state.exports_root / dataset_root.name)
+    assert launched["thread_started"] is True
+    assert not (state.exports_root / dataset_root.name / "meta" / "info.json").exists()
+
+
 def test_start_approved_dataset_export_rejects_non_qc_pass_dataset(tmp_path):
     state, datasets_root = _task_state(tmp_path)
     session = datasets_root / "pick_and_place_20260601_101046"
