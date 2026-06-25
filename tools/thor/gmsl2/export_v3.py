@@ -46,6 +46,7 @@ to ``i/fps`` to match the re-anchored per-episode video.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import math
@@ -72,6 +73,11 @@ from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
 _CHUNKS_SIZE = 1000
 _DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
 _VIDEO_PATH = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+_TRAJ_SIDECAR_NAME = "april_cube_tracking_in_robot_base"
+_TRACKING_RUN_SUFFIX = "_thor_april_tracking_in_robot_base"
+_POSE7_NAMES = ("x_m", "y_m", "z_m", "qx", "qy", "qz", "qw")
+_POSE7_FEATURE_NAMES = ("pose.x_m", "pose.y_m", "pose.z_m", "pose.qx", "pose.qy", "pose.qz", "pose.qw")
+_POSE7_NAN = [math.nan] * 7
 
 
 def _emit(text: str) -> None:
@@ -450,6 +456,249 @@ def _mkv_frame_count(mkv_path: Path) -> int:
         return 0
 
 
+# ----------------------------------------------------------- tracking poses ---
+
+
+def _parse_float(value: Any, default: float = math.nan) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
+def _parse_int(value: Any, default: int = -1) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _pose_feature() -> dict[str, Any]:
+    return {"dtype": "float32", "shape": [7], "names": list(_POSE7_FEATURE_NAMES)}
+
+
+def _pose7_from_row(row: dict[str, Any], prefix: str) -> list[float] | None:
+    values = [_parse_float(row.get(f"{prefix}_{suffix}")) for suffix in _POSE7_NAMES]
+    if not all(math.isfinite(value) for value in values):
+        return None
+    return values
+
+
+def _read_pose_csv(
+    csv_path: Path,
+    *,
+    episode_index: int,
+    prefix: str,
+    cube_name: str | None = None,
+) -> dict[int, list[float]]:
+    poses: dict[int, list[float]] = {}
+    try:
+        with csv_path.open("r", encoding="utf-8", newline="") as csv_file:
+            reader = csv.DictReader(csv_file)
+            for row in reader:
+                if cube_name is not None and row.get("cube_name") not in (None, "", cube_name):
+                    continue
+                if _parse_int(row.get("episode_index"), 0) != int(episode_index):
+                    continue
+                frame_index = _parse_int(row.get("frame_index"), -1)
+                if frame_index < 0:
+                    continue
+                pose = _pose7_from_row(row, prefix)
+                if pose is not None:
+                    poses[frame_index] = pose
+    except OSError:
+        return {}
+    return poses
+
+
+def _pose_rows_for_frames(poses_by_frame: dict[int, list[float]], n_frames: int) -> list[list[float]]:
+    return [list(poses_by_frame.get(frame_index, _POSE7_NAN)) for frame_index in range(int(n_frames))]
+
+
+def _sidecar_dir(session_dir: Path) -> Path:
+    return session_dir / "derived" / _TRAJ_SIDECAR_NAME
+
+
+def _tracking_run_dir(session_dir: Path) -> Path:
+    return _REPO_ROOT / "outputs" / "tracking_analysis" / f"{session_dir.name}{_TRACKING_RUN_SUFFIX}"
+
+
+def _state_action_csv(session_dir: Path, cube: str) -> Path:
+    return _sidecar_dir(session_dir) / f"state_action.{cube}.csv"
+
+
+def _cube_camera_csv(session_dir: Path, cube: str, camera: str) -> Path:
+    return _sidecar_dir(session_dir) / f"cube_pose.{cube}.{camera}.csv"
+
+
+def _cube_pose_csvs(session_dir: Path, cube: str) -> list[Path]:
+    return sorted(_sidecar_dir(session_dir).glob(f"cube_pose.{cube}.*.csv"))
+
+
+def _fused_cube_csv_candidates(session_dir: Path, cube: str) -> list[Path]:
+    run_dir = _tracking_run_dir(session_dir)
+    return [
+        run_dir / f"fused_ee_pose_in_robot_base_records_{cube}.csv",
+        run_dir / "fused_ee_pose_in_robot_base_records.csv",
+    ]
+
+
+def _fused_cube_csv(session_dir: Path, cube: str) -> Path | None:
+    for candidate in _fused_cube_csv_candidates(session_dir, cube):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _read_cube_base_from_camera_csvs(session_dir: Path, *, cube: str, episode_index: int) -> dict[int, list[float]]:
+    poses: dict[int, list[float]] = {}
+    used_for_fusion: dict[int, bool] = {}
+    for csv_path in _cube_pose_csvs(session_dir, cube):
+        try:
+            with csv_path.open("r", encoding="utf-8", newline="") as csv_file:
+                reader = csv.DictReader(csv_file)
+                for row in reader:
+                    if row.get("cube_name") not in (None, "", cube):
+                        continue
+                    if _parse_int(row.get("episode_index"), 0) != int(episode_index):
+                        continue
+                    frame_index = _parse_int(row.get("frame_index"), -1)
+                    if frame_index < 0:
+                        continue
+                    pose = _pose7_from_row(row, "cube_base")
+                    if pose is None:
+                        continue
+                    row_used = str(row.get("used_for_fusion", "")).strip().lower() in {"1", "true", "yes", "y"}
+                    if frame_index not in poses or (row_used and not used_for_fusion.get(frame_index, False)):
+                        poses[frame_index] = pose
+                        used_for_fusion[frame_index] = row_used
+        except OSError:
+            continue
+    return poses
+
+
+def _discover_tracking_pose_columns(sessions: list[Path]) -> list[_PoseColumn]:
+    columns: dict[str, _PoseColumn] = {}
+    for session_dir in sessions:
+        sidecar = _sidecar_dir(session_dir)
+        if not sidecar.is_dir():
+            continue
+        for state_action_csv in sorted(sidecar.glob("state_action.*.csv")):
+            cube = state_action_csv.name.removeprefix("state_action.").removesuffix(".csv")
+            if not cube:
+                continue
+            columns.setdefault(
+                f"observation.ee_pose.{cube}.base",
+                _PoseColumn(f"observation.ee_pose.{cube}.base", "ee_state", cube),
+            )
+            columns.setdefault(
+                f"action.ee_pose.{cube}.base",
+                _PoseColumn(f"action.ee_pose.{cube}.base", "ee_action", cube),
+            )
+            if _fused_cube_csv(session_dir, cube) is not None or _cube_pose_csvs(session_dir, cube):
+                columns.setdefault(
+                    f"observation.cube_pose.{cube}.base",
+                    _PoseColumn(f"observation.cube_pose.{cube}.base", "cube_base", cube),
+                )
+        for cube_pose_csv in sorted(sidecar.glob("cube_pose.*.*.csv")):
+            stem = cube_pose_csv.name.removeprefix("cube_pose.").removesuffix(".csv")
+            cube, sep, camera = stem.partition(".")
+            if not sep or not cube or not camera:
+                continue
+            columns.setdefault(
+                f"observation.cube_pose.{cube}.camera.{camera}",
+                _PoseColumn(f"observation.cube_pose.{cube}.camera.{camera}", "cube_camera", cube, camera),
+            )
+    return [columns[key] for key in sorted(columns)]
+
+
+def _load_tracking_pose_rows(
+    src: EpisodeSource,
+    *,
+    pose_columns: list[_PoseColumn],
+    n_frames: int,
+) -> dict[str, list[list[float]]]:
+    out: dict[str, list[list[float]]] = {}
+    cache: dict[tuple[Path, str, str | None], dict[int, list[float]]] = {}
+    for col in pose_columns:
+        csv_path: Path | None = None
+        prefix = ""
+        cube_filter: str | None = None
+        if col.kind == "ee_state":
+            csv_path = _state_action_csv(src.session_dir, col.cube)
+            prefix = "state"
+        elif col.kind == "ee_action":
+            csv_path = _state_action_csv(src.session_dir, col.cube)
+            prefix = "action"
+        elif col.kind == "cube_camera" and col.camera is not None:
+            csv_path = _cube_camera_csv(src.session_dir, col.cube, col.camera)
+            prefix = "cube_cam"
+        elif col.kind == "cube_base":
+            csv_path = _fused_cube_csv(src.session_dir, col.cube)
+            prefix = "cube_base"
+            cube_filter = col.cube
+            if csv_path is None or not csv_path.is_file():
+                poses = _read_cube_base_from_camera_csvs(
+                    src.session_dir,
+                    cube=col.cube,
+                    episode_index=src.local_index,
+                )
+                out[col.key] = _pose_rows_for_frames(poses, n_frames)
+                continue
+        if csv_path is None or not csv_path.is_file():
+            out[col.key] = _pose_rows_for_frames({}, n_frames)
+            continue
+        cache_key = (csv_path, prefix, cube_filter)
+        if cache_key not in cache:
+            cache[cache_key] = _read_pose_csv(
+                csv_path,
+                episode_index=src.local_index,
+                prefix=prefix,
+                cube_name=cube_filter,
+            )
+        out[col.key] = _pose_rows_for_frames(cache[cache_key], n_frames)
+    return out
+
+
+def _pose_table_column_stats(table, col_name: str) -> dict[str, list[Any]]:
+    import numpy as np
+
+    arr = table[col_name]
+    n = arr.length()
+    if n == 0:
+        empty = [None] * 7
+        return {
+            "min": empty, "max": empty, "mean": empty, "std": empty,
+            "count": [0] * 7,
+            "q01": empty, "q10": empty, "q50": empty, "q90": empty, "q99": empty,
+        }
+    flat = arr.combine_chunks().flatten().to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
+    np_arr = flat.reshape(n, 7)
+    stat_names = ("min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99")
+    out: dict[str, list[Any]] = {name: [] for name in stat_names}
+    for col in range(7):
+        values = np_arr[:, col]
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            for name in ("min", "max", "mean", "std", "q01", "q10", "q50", "q90", "q99"):
+                out[name].append(None)
+            out["count"].append(0)
+            continue
+        quantiles = np.percentile(finite, [1.0, 10.0, 50.0, 90.0, 99.0])
+        out["min"].append(float(np.min(finite)))
+        out["max"].append(float(np.max(finite)))
+        out["mean"].append(float(np.mean(finite)))
+        out["std"].append(float(np.std(finite)))
+        out["count"].append(int(finite.size))
+        out["q01"].append(float(quantiles[0]))
+        out["q10"].append(float(quantiles[1]))
+        out["q50"].append(float(quantiles[2]))
+        out["q90"].append(float(quantiles[3]))
+        out["q99"].append(float(quantiles[4]))
+    return out
+
+
 # ---------------------------------------------------------------- v3 writer ---
 
 
@@ -457,6 +706,14 @@ def _mkv_frame_count(mkv_path: Path) -> int:
 class _VideoKey:
     feature: str  # observation.images.cam_00
     camera: str  # cam_00
+
+
+@dataclass(frozen=True)
+class _PoseColumn:
+    key: str
+    kind: str
+    cube: str
+    camera: str | None = None
 
 
 class _V3Writer:
@@ -477,6 +734,7 @@ class _V3Writer:
         state_names: list[str] | None,
         ts_width: int = 0,
         ts_names: list[str] | None = None,
+        pose_columns: list[_PoseColumn] | None = None,
     ) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -494,6 +752,7 @@ class _V3Writer:
         self.state_names = state_names
         self.ts_width = ts_width
         self.ts_names = ts_names
+        self.pose_columns = list(pose_columns or [])
 
         self.meta_dir = dataset_root / "meta"
         self.episodes_dir = self.meta_dir / "episodes" / "chunk-000"
@@ -514,6 +773,8 @@ class _V3Writer:
             fields.append(("action", pa.list_(pa.float32(), self.state_width)))
         if self.ts_width > 0:
             fields.append(("box.timestamps", pa.list_(pa.float64(), self.ts_width)))
+        for pose_col in self.pose_columns:
+            fields.append((pose_col.key, pa.list_(pa.float32(), 7)))
         fields += [
             ("timestamp", pa.float32()),
             ("frame_index", pa.int64()),
@@ -532,6 +793,7 @@ class _V3Writer:
         action_rows: list[list[float]] | None,
         video_files: dict[str, Path],  # camera -> mp4 path already written
         ts_rows: list[list[float]] | None = None,
+        pose_rows: dict[str, list[list[float]]] | None = None,
     ) -> None:
         start = self.total_frames
         cols: dict[str, list[Any]] = {
@@ -546,6 +808,14 @@ class _V3Writer:
             cols["action"] = action_rows or [[0.0] * self.state_width] * n_frames
         if self.ts_width > 0:
             cols["box.timestamps"] = ts_rows or [[0.0] * self.ts_width] * n_frames
+        pose_rows = pose_rows or {}
+        for pose_col in self.pose_columns:
+            rows = pose_rows.get(pose_col.key)
+            if rows is None:
+                rows = _pose_rows_for_frames({}, n_frames)
+            if len(rows) != n_frames:
+                raise ValueError(f"{pose_col.key} row count mismatch: {len(rows)} != {n_frames}")
+            cols[pose_col.key] = rows
         self._writer.write_table(self.pa.table(cols, schema=self._schema))
 
         stop = start + n_frames
@@ -587,6 +857,8 @@ class _V3Writer:
         if self.ts_width > 0:
             ts_names = self.ts_names if self.ts_names and len(self.ts_names) == self.ts_width else None
             features["box.timestamps"] = lr3._feature("float64", [self.ts_width], ts_names)
+        for pose_col in self.pose_columns:
+            features[pose_col.key] = _pose_feature()
         for vk in self.video_keys:
             features[vk.feature] = {
                 "dtype": "video",
@@ -634,6 +906,8 @@ class _V3Writer:
             stats["action"] = lr3._table_column_stats(table, "action", width=self.state_width)
         if self.ts_width > 0:
             stats["box.timestamps"] = lr3._table_column_stats(table, "box.timestamps", width=self.ts_width)
+        for pose_col in self.pose_columns:
+            stats[pose_col.key] = _pose_table_column_stats(table, pose_col.key)
         (self.meta_dir / "stats.json").write_text(json.dumps(stats, indent=4), encoding="utf-8")
 
     def _write_info(self) -> None:
@@ -700,6 +974,11 @@ def export_task_to_v3(
         raise RuntimeError(f"meta.json for {first.ep_dir} lacks video.height/width")
     camera_keys = [name for name, _ in camera_entries]
     video_keys = [_VideoKey(feature=f"observation.images.{c}", camera=c) for c in camera_keys]
+    pose_columns = _discover_tracking_pose_columns(sessions)
+    if pose_columns:
+        _emit(f"Tracking pose schema: {len(pose_columns)} column(s) from {_TRAJ_SIDECAR_NAME}")
+    else:
+        _emit(f"Tracking pose schema: no {_TRAJ_SIDECAR_NAME} sidecar found; exporting video/box only")
 
     box_state_names = list(lr3.BOX_STATE_NAMES)
     box_ts_names = list(lr3.BOX_TIMESTAMP_NAMES)
@@ -752,6 +1031,7 @@ def export_task_to_v3(
         state_names=box_state_names if state_width else None,
         ts_width=ts_width,
         ts_names=box_ts_names if ts_width else None,
+        pose_columns=pose_columns,
     )
 
     box_cache: dict[Path, dict[int, list[dict[str, Any]]]] = {}
@@ -852,6 +1132,11 @@ def export_task_to_v3(
             for cam, dst in pool.map(_transcode_cam, cams):
                 video_files[cam] = dst
 
+        pose_rows = (
+            _load_tracking_pose_rows(src, pose_columns=pose_columns, n_frames=n_frames)
+            if pose_columns
+            else None
+        )
         writer.append_episode(
             episode_index=global_index,
             n_frames=n_frames,
@@ -859,6 +1144,7 @@ def export_task_to_v3(
             action_rows=action_rows,
             video_files=video_files,
             ts_rows=ts_rows,
+            pose_rows=pose_rows,
         )
         sources.append(
             {

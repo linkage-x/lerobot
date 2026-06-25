@@ -1701,10 +1701,10 @@ def _start_approved_dataset_export(state: GatewayState, raw_path: str) -> None:
     processing_item = _processing_item_from_dataset(dataset_root)
     if processing_item.get("status") != "qc_pass":
         raise ValueError("Dataset must pass QC before export.")
-    if _has_lerobot_v3_data(dataset_root):
-        _copy_approved_v3_dataset_export(state, dataset_root, processing_item)
-        return
     if not _has_gmsl2_episodes(dataset_root):
+        if _has_lerobot_v3_data(dataset_root):
+            _copy_approved_v3_dataset_export(state, dataset_root, processing_item)
+            return
         raise ValueError("Approved dataset export supports LeRobot v3 datasets or raw GMSL2 session datasets.")
     command, out_root = _approved_dataset_export_command(state, dataset_root)
     state.export_process = subprocess.Popen(
