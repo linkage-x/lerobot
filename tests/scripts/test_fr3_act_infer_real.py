@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from lerobot.cameras.configs import ColorMode, Cv2Backends
+from lerobot.cameras.gmsl2.configuration_gmsl2 import Gmsl2CameraConfig
 from lerobot.cameras.hikrobot.configuration_hikrobot import HikrobotCameraConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.robots.franka_research3 import FrankaResearch3Config
@@ -98,6 +99,61 @@ def test_build_docker_command_passes_tactile_fallback(tmp_path: Path):
     assert '--tactile-fallback=baseline_idle' in command_text
 
 
+def test_build_docker_command_passes_corenetic_gripper_options(tmp_path: Path):
+    urdf_path = tmp_path / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic.urdf'
+    urdf_path.parent.mkdir(parents=True)
+    urdf_path.write_text('<robot name="fr3_corenetic"/>', encoding='utf-8')
+    args = fr3_act_infer_real.parse_args(
+        [
+            '--workspace',
+            str(tmp_path),
+            '--checkpoint=/lerobot/outputs/train/2026-03-19/10-48-39_act/checkpoints/060000',
+            '--camera-config=/lerobot/tools/fr3/fr3_act_infer_camera_config.yaml',
+            '--gripper-backend',
+            'corenetic',
+            '--gripper-max-width-mm',
+            '98',
+            '--corenetic-bind-ip',
+            '192.168.2.45',
+            '--corenetic-remote-ip',
+            '192.168.2.60',
+            '--robot-urdf-path',
+            str(urdf_path.relative_to(tmp_path)),
+            '--target-frame-name',
+            'corenetic_gripper_ee',
+        ]
+    )
+
+    command_text = ' '.join(fr3_act_infer_real.build_docker_command(args))
+
+    assert '--gripper-backend=corenetic' in command_text
+    assert '--gripper-max-width-mm=98.0' in command_text
+    assert '--corenetic-bind-ip=192.168.2.45' in command_text
+    assert '--corenetic-remote-ip=192.168.2.60' in command_text
+    assert '--robot-urdf-path=/workspace/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic.urdf' in command_text
+    assert '--target-frame-name=corenetic_gripper_ee' in command_text
+
+
+def test_build_docker_command_maps_legacy_box_backend_to_corenetic(tmp_path: Path):
+    args = fr3_act_infer_real.parse_args(
+        [
+            '--workspace',
+            str(tmp_path),
+            '--checkpoint=/lerobot/outputs/train/2026-03-19/10-48-39_act/checkpoints/060000',
+            '--camera-config=/lerobot/tools/fr3/fr3_act_infer_camera_config.yaml',
+            '--gripper-backend',
+            'box',
+            '--box-bind-ip',
+            '192.168.2.45',
+        ]
+    )
+
+    command_text = ' '.join(fr3_act_infer_real.build_docker_command(args))
+
+    assert '--gripper-backend=corenetic' in command_text
+    assert '--corenetic-bind-ip=192.168.2.45' in command_text
+
+
 def test_build_docker_command_can_disable_default_startup_actions(tmp_path: Path):
     args = fr3_act_infer_real.parse_args(
         [
@@ -161,6 +217,13 @@ def test_build_docker_command_passes_mujoco_viewer_model(tmp_path: Path):
 def test_resolve_mujoco_model_path_uses_gripper_backend_defaults():
     assert fr3_act_infer_real_runtime.resolve_mujoco_model_path('das', None) == fr3_act_infer_real_runtime._DAS_XML
     assert fr3_act_infer_real_runtime.resolve_mujoco_model_path('pika', None) == fr3_act_infer_real_runtime._PIKA_XML
+
+
+def test_fr3_config_accepts_corenetic_gripper_backend():
+    cfg = FrankaResearch3Config(gripper_backend='corenetic', gripper_max_width_mm=98.0)
+
+    assert cfg.gripper_backend == 'corenetic'
+    assert cfg.gripper_max_width_mm == 98.0
 
 
 def test_main_returns_subprocess_exit_code(monkeypatch):
@@ -318,6 +381,41 @@ def test_load_camera_configs_respects_hikrobot_color_mode(tmp_path: Path):
     camera_configs = fr3_act_infer_real_runtime.load_camera_configs(config_path)
 
     assert camera_configs['wrist'].color_mode == ColorMode.RGB
+
+
+def test_load_camera_configs_supports_gmsl2(tmp_path: Path):
+    config_path = tmp_path / 'camera.yaml'
+    config_path.write_text(
+        """robot:
+  cameras:
+    front:
+      type: gmsl2
+      sensor_id: 2
+      device: /dev/video2
+      pipeline: v4l2_bayer
+      image_shape: [720, 1280]
+      fps: 30
+      color_mode: bgr
+      rotation: rotate_180
+      sync_role: slave
+      trig_pin: "0x00020007"
+      exposure_us: 5000
+      gain: 3
+""",
+        encoding='utf-8',
+    )
+
+    camera_configs = fr3_act_infer_real_runtime.load_camera_configs(config_path)
+
+    assert isinstance(camera_configs['front'], Gmsl2CameraConfig)
+    assert camera_configs['front'].sensor_id == 2
+    assert camera_configs['front'].resolved_device == '/dev/video2'
+    assert camera_configs['front'].pipeline == 'v4l2_bayer'
+    assert camera_configs['front'].height == 720
+    assert camera_configs['front'].width == 1280
+    assert camera_configs['front'].sync_role == 'slave'
+    assert camera_configs['front'].trig_pin == 0x00020007
+    assert camera_configs['front'].rotation.value == 180
 
 
 def test_build_policy_observation_maps_state_images_and_tactile_passthrough():

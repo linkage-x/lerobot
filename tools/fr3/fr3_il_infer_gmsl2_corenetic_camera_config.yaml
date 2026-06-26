@@ -1,0 +1,45 @@
+robot:
+  cameras:
+    gmsl2_front:
+      type: gmsl2
+      sensor_id: 0
+      device: /dev/video0
+      pipeline: v4l2_bayer
+      sensor_mode: 0
+      bayer_format: grbg10le
+      width: 1280
+      height: 720
+      fps: 30
+      color_mode: bgr
+      rotation: no_rotation
+      sync_role: auto
+      trig_pin: "0x00020007"
+      apply_sync_at_connect: true
+      exposure_us:
+      gain:
+      warmup_s: 2
+      timeout_ms: 2000
+    gmsl2_wrist:
+      type: gmsl2
+      sensor_id: 1
+      device: /dev/video1
+      pipeline: v4l2_bayer
+      sensor_mode: 0
+      bayer_format: grbg10le
+      width: 1280
+      height: 720
+      fps: 30
+      color_mode: bgr
+      rotation: no_rotation
+      sync_role: auto
+      trig_pin: "0x00020007"
+      apply_sync_at_connect: true
+      exposure_us:
+      gain:
+      warmup_s: 2
+      timeout_ms: 2000
+
+# Use this file with:
+#   FR3_INFER_CAMERA_CONFIG=tools/fr3/fr3_il_infer_gmsl2_corenetic_camera_config.yaml
+#   FR3_GRIPPER_BACKEND=corenetic
+# Camera keys must match the image suffixes used during training.
