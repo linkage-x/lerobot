@@ -227,6 +227,30 @@ uv run python tools/fr3/fr3_train_il_policy.py \
   --overwrite-view
 ```
 
+For GMSL2 data, training does not need a different policy path. Use the camera
+feature suffixes recorded in the dataset, for example:
+
+```bash
+uv run python tools/fr3/fr3_train_il_policy.py \
+  --dataset-root dataset_test/<gmsl2_collection> \
+  --policy act \
+  --cameras gmsl2_front,gmsl2_wrist \
+  --state-keys observation.state \
+  --image-resize-shape 360,640 \
+  --action-key action \
+  --action-append-selectors observation.state_raw:corenetic_gripper.distance_m \
+  --steps 2000 \
+  --batch-size 4 \
+  --device cuda \
+  --smoke \
+  --overwrite-view
+```
+
+The important rule is that the infer camera config later must contain matching
+keys under `robot.cameras`, here `gmsl2_front` and `gmsl2_wrist`. If an older
+dataset still stores the vendor BOX SDK sensor key as `box_gripper.distance_m`,
+use that exact selector instead; the infer runtime recognizes both names.
+
 ACT smoke/overfit:
 
 ```bash

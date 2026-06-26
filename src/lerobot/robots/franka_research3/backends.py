@@ -83,6 +83,22 @@ def _silence_pika_logs() -> None:
     logging.getLogger("pika.serial_comm").setLevel(logging.WARNING)
 
 
+def _import_box_client():
+    repo_root = Path(__file__).resolve().parents[4]
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+    try:
+        from tools.thor.box_sdk import box_client
+    except Exception as e:  # pragma: no cover - exercised with real hardware only
+        raise ImportError(
+            "franka_research3 Corenetic gripper backend requires tools.thor.box_sdk.box_client "
+            "and the vendored box_sdk wheel. Install the wheel and source tools/thor/box_sdk/setup_env.sh "
+            "on the host before using this backend."
+        ) from e
+    return box_client
+
+
 _DAS_SDK_ENV_VAR = "GEN_CON_SDK_HOME"
 _DEFAULT_DAS_SDK_ROOTS = (
     Path("/opt/dependencies/gen_con_sdk_python_release"),
@@ -341,6 +357,139 @@ class PikaGripperHardwareDriver:
         self._last_command_width_mm = pending_width_mm
         self._last_command_time_s = now
         self._pending_command_width_mm = None
+
+
+@dataclass
+class CoreneticGripperHardwareDriver:
+    bind_ip: str = "0.0.0.0"
+    bind_port: int = 15000
+    remote_ip: str = "192.168.2.60"
+    remote_port: int = 15000
+    sdk_dir: str = "tools/thor/box_sdk"
+    urdf_relpath: str = "share/monte_gripper.urdf"
+    max_width_m: float = 0.09
+    poll_interval_s: float = 0.01
+    stale_threshold_s: float = 1.0
+    connect_timeout_s: float = 3.0
+    command_rate_limit_hz: float | None = 15.0
+    command_deadband_m: float = 0.0005
+    release_mode_on_disconnect: bool = True
+
+    def __post_init__(self):
+        if self.max_width_m <= 0:
+            raise ValueError("Corenetic gripper max_width_m must be positive.")
+        if self.poll_interval_s <= 0:
+            raise ValueError("Corenetic gripper poll_interval_s must be positive.")
+        if self.stale_threshold_s <= 0:
+            raise ValueError("Corenetic gripper stale_threshold_s must be positive.")
+        if self.connect_timeout_s <= 0:
+            raise ValueError("Corenetic gripper connect_timeout_s must be positive.")
+        if self.command_rate_limit_hz is not None and self.command_rate_limit_hz <= 0:
+            raise ValueError("Corenetic gripper command_rate_limit_hz must be positive when provided.")
+        if self.command_deadband_m < 0:
+            raise ValueError("Corenetic gripper command_deadband_m must be non-negative.")
+        self._box_client_module = _import_box_client()
+        self._client = None
+        self._last_command_distance_m: float | None = None
+        self._last_command_time_s: float | None = None
+        self._pending_command_distance_m: float | None = None
+
+    def connect(self) -> None:
+        cfg = self._box_client_module.BoxClientConfig(
+            enabled=True,
+            bind_ip=self.bind_ip,
+            bind_port=self.bind_port,
+            remote_ip=self.remote_ip,
+            remote_port=self.remote_port,
+            sdk_dir=self.sdk_dir,
+            urdf_relpath=self.urdf_relpath,
+            startup_mode=1,
+            poll_interval_s=self.poll_interval_s,
+            stale_threshold_s=self.stale_threshold_s,
+            expected_devices=["box_gripper"],
+        )
+        client = self._box_client_module.BoxClient(cfg)
+        if not client.start():
+            raise ConnectionError(
+                "Could not start Corenetic gripper client. Check BOX SDK installation, "
+                f"host bind {self.bind_ip}:{self.bind_port}, and BOX MCU {self.remote_ip}:{self.remote_port}."
+            )
+        self._client = client
+
+        deadline = time.perf_counter() + self.connect_timeout_s
+        while True:
+            if self._latest_distance_m() is not None:
+                break
+            if time.perf_counter() >= deadline:
+                self.disconnect()
+                raise TimeoutError("Corenetic gripper did not publish box_gripper.distance_m during connect.")
+            time.sleep(0.01)
+
+    def disconnect(self) -> None:
+        if self._client is not None:
+            if self.release_mode_on_disconnect:
+                try:
+                    self._client.set_mode(0)
+                except Exception:
+                    logger.warning("Could not switch Corenetic gripper back to collection mode on disconnect.", exc_info=True)
+            self._client.stop()
+            self._client = None
+        self._last_command_distance_m = None
+        self._last_command_time_s = None
+        self._pending_command_distance_m = None
+
+    def _latest_distance_m(self) -> float | None:
+        if self._client is None:
+            return None
+        sample = self._client.read()
+        gripper = sample.get("sensors", {}).get("box_gripper")
+        if not isinstance(gripper, dict):
+            return None
+        distance_m = gripper.get("distance_m")
+        if distance_m is None:
+            return None
+        distance_m = float(distance_m)
+        if not np.isfinite(distance_m):
+            return None
+        return max(0.0, distance_m)
+
+    def get_position(self) -> float:
+        if self._client is None:
+            raise RuntimeError("Corenetic gripper backend is not connected.")
+        distance_m = self._latest_distance_m()
+        if distance_m is None:
+            raise RuntimeError("Corenetic gripper has no fresh box_gripper.distance_m sample.")
+        return float(np.clip(distance_m / self.max_width_m, 0.0, 1.0))
+
+    def set_position(self, normalized_position: float) -> None:
+        if self._client is None:
+            raise RuntimeError("Corenetic gripper backend is not connected.")
+        target_distance_m = float(np.clip(normalized_position, 0.0, 1.0) * self.max_width_m)
+        if (
+            self._last_command_distance_m is not None
+            and abs(target_distance_m - self._last_command_distance_m) < self.command_deadband_m
+        ):
+            self._pending_command_distance_m = None
+            return
+
+        self._pending_command_distance_m = target_distance_m
+
+        now = time.perf_counter()
+        if self.command_rate_limit_hz is not None and self._last_command_time_s is not None:
+            min_interval_s = 1.0 / self.command_rate_limit_hz
+            if now - self._last_command_time_s < min_interval_s:
+                return
+
+        pending_distance_m = self._pending_command_distance_m
+        if pending_distance_m is None:
+            return
+
+        rc = self._client.set_clamp_pos(pending_distance_m)
+        if rc != 0:
+            raise RuntimeError(f"Corenetic gripper set_clamp_pos({pending_distance_m:.4f}) failed with rc={rc}.")
+        self._last_command_distance_m = pending_distance_m
+        self._last_command_time_s = now
+        self._pending_command_distance_m = None
 
 
 @dataclass
