@@ -51,6 +51,16 @@ class FrankaResearch3Config(RobotConfig):
     gripper_max_width_mm: float = 90.0
     gripper_command_rate_limit_hz: float | None = 15.0
     gripper_command_deadband_mm: float = 0.5
+    corenetic_bind_ip: str = "0.0.0.0"
+    corenetic_bind_port: int = 15000
+    corenetic_remote_ip: str = "192.168.2.60"
+    corenetic_remote_port: int = 15000
+    corenetic_sdk_dir: str = "tools/thor/box_sdk"
+    corenetic_urdf_relpath: str = "share/monte_gripper.urdf"
+    corenetic_poll_interval_s: float = 0.01
+    corenetic_stale_threshold_s: float = 1.0
+    corenetic_connect_timeout_s: float = 3.0
+    corenetic_release_mode_on_disconnect: bool = True
     gen_con_sdk_path: str | None = None
     das_baudrate: int = 921600
     das_update_frequency_hz: float = 50.0
@@ -80,8 +90,8 @@ class FrankaResearch3Config(RobotConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.gripper_backend not in {"pika", "das", "franka_hand"}:
-            raise ValueError("gripper_backend must be one of 'pika', 'das', or 'franka_hand'.")
+        if self.gripper_backend not in {"pika", "das", "franka_hand", "corenetic"}:
+            raise ValueError("gripper_backend must be one of 'pika', 'das', 'franka_hand', or 'corenetic'.")
         if len(self.workspace_min) != 3 or len(self.workspace_max) != 3:
             raise ValueError("workspace_min and workspace_max must be 3D tuples.")
         if self.max_target_delta_pos is not None and len(self.max_target_delta_pos) != 3:
@@ -102,6 +112,14 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("gripper_command_rate_limit_hz must be positive when provided.")
         if self.gripper_command_deadband_mm < 0:
             raise ValueError("gripper_command_deadband_mm must be non-negative.")
+        if self.corenetic_bind_port <= 0 or self.corenetic_remote_port <= 0:
+            raise ValueError("corenetic_bind_port and corenetic_remote_port must be positive.")
+        if self.corenetic_poll_interval_s <= 0:
+            raise ValueError("corenetic_poll_interval_s must be positive.")
+        if self.corenetic_stale_threshold_s <= 0:
+            raise ValueError("corenetic_stale_threshold_s must be positive.")
+        if self.corenetic_connect_timeout_s <= 0:
+            raise ValueError("corenetic_connect_timeout_s must be positive.")
         if self.das_baudrate <= 0:
             raise ValueError("das_baudrate must be positive.")
         if self.das_update_frequency_hz <= 0:

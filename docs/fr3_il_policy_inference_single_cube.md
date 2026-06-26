@@ -1,8 +1,9 @@
 # FR3 single-cube IL policy inference
 
 This note describes how to run a trained single-cube IL policy on the real FR3
-hardware stack with selectable Hikrobot cameras and a Pika/DAS gripper. It is
-the inference companion to `docs/fr3_il_policy_training_single_cube.md`.
+hardware stack with selectable Hikrobot/OpenCV/RealSense/GMSL2 cameras and a
+Pika/DAS/Franka Hand/Corenetic gripper. It is the inference companion to
+`docs/fr3_il_policy_training_single_cube.md`.
 
 ## What Must Match Training
 
@@ -27,7 +28,7 @@ Required alignment points:
   the generated `observation.state` is 8D:
   `[observation.state.right.ee.x, ..., observation.state.right.ee.qw, observation.state_raw.handheld_gripper.pika_left.width_mm]`.
   The real-robot runtime maps these prefixed names back to the live FR3 EE pose
-  and current Pika gripper width.
+  and current gripper width.
 - `action`: default single-cube view is 8D
   `[ee.x, ee.y, ee.z, ee.qx, ee.qy, ee.qz, ee.qw, gripper]`
 - `gripper`: the helper appends
@@ -170,6 +171,71 @@ ls outputs/debug/<job_name>_step0
 
 This dump contains the exact `observation.state`, selected camera frames, state
 names, action names, and start-alignment diagnostics used by the policy.
+
+## GMSL2 Cameras
+
+GMSL2 camera config uses the same `robot.cameras.<key>` contract. The `<key>`
+must still match training, for example a policy trained with
+`--cameras gmsl2_front,gmsl2_wrist` expects config keys `gmsl2_front` and
+`gmsl2_wrist`.
+
+Example:
+
+```yaml
+robot:
+  cameras:
+    gmsl2_front:
+      type: gmsl2
+      sensor_id: 0
+      device: /dev/video0
+      pipeline: v4l2_bayer
+      image_shape: [720, 1280]
+      fps: 30
+      color_mode: bgr
+      rotation: no_rotation
+      sync_role: auto
+      trig_pin: "0x00020007"
+      apply_sync_at_connect: true
+      timeout_ms: 2000
+```
+
+The repo includes a starter file:
+
+```text
+tools/fr3/fr3_il_infer_gmsl2_corenetic_camera_config.yaml
+```
+
+On the Jetson/Thor host, install the GStreamer/PyGObject dependencies required
+by `src/lerobot/cameras/gmsl2`, configure `/dev/video*` and trigger mode first,
+then verify the camera stream before real rollout.
+
+## Corenetic Gripper
+
+The Corenetic gripper backend uses `tools/thor/box_sdk/box_client.py` as the
+vendor transport/control API and maps the policy gripper output to
+`box_sdk.Box.set_clamp_pos(distance_m)`. The policy contract stays the same:
+action names still end in `gripper`, and live state still provides
+`gripper.pos` normalized to `[0, 1]`.
+
+Use `--gripper-max-width-mm` to match the physical Corenetic gripper aperture.
+If the BOX tool TCP differs from the Pika/DAS TCP, also pass a calibrated FR3
+tool URDF and target frame:
+
+```bash
+FR3_INFER_CAMERA_CONFIG=tools/fr3/fr3_il_infer_gmsl2_corenetic_camera_config.yaml \
+FR3_GRIPPER_BACKEND=corenetic \
+FR3_GRIPPER_MAX_WIDTH_MM=98 \
+FR3_CORENETIC_BIND_IP=192.168.2.45 \
+FR3_CORENETIC_REMOTE_IP=192.168.2.60 \
+FR3_ROBOT_URDF_PATH=src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf \
+FR3_TARGET_FRAME_NAME=corenetic_gripper_ee \
+tools/fr3/run_pick_place_infer_host.sh preview
+```
+
+If `FR3_ROBOT_URDF_PATH` and `FR3_TARGET_FRAME_NAME` are omitted, the runtime
+falls back to the Pika FR3 URDF/TCP for IK. That is useful for software smoke
+tests but should be replaced before evaluating real success rate with a
+different physical gripper geometry.
 
 ## Real Robot Run
 

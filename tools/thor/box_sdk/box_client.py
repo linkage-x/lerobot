@@ -276,6 +276,7 @@ class BoxClient:
         self._record_t0_wall_s = 0.0
         self._record_samples: dict[str, list[SensorSample]] = {}
         self._record_last_ts: dict[str, int] = {}
+        self._sdk_lock = Lock()
 
     # ---- lifecycle ----
 
@@ -318,10 +319,11 @@ class BoxClient:
             self._pre_session_csv = set(self._csv_dir.glob("box_sensor_data_*.csv"))
         except OSError:
             self._pre_session_csv = set()
-        rc = self._box.start(
-            self.cfg.bind_ip, self.cfg.bind_port,
-            self.cfg.remote_ip, self.cfg.remote_port,
-        )
+        with self._sdk_lock:
+            rc = self._box.start(
+                self.cfg.bind_ip, self.cfg.bind_port,
+                self.cfg.remote_ip, self.cfg.remote_port,
+            )
         if rc != 0:
             logger.warning("box.start rc=%d", rc)
             return False
@@ -331,7 +333,7 @@ class BoxClient:
         # alive yet, and we still want the poll loop running so the recorder
         # can decide what to do.
         try:
-            rc = self._box.set_mode(int(self.cfg.startup_mode))
+            rc = self.set_mode(int(self.cfg.startup_mode))
             if rc != 0:
                 logger.warning("box.set_mode(%d) rc=%d", self.cfg.startup_mode, rc)
         except Exception as exc:
@@ -349,11 +351,13 @@ class BoxClient:
             self._poll_thread = None
         if self._box is not None:
             try:
-                self._box.stop()
+                with self._sdk_lock:
+                    self._box.stop()
             except Exception as exc:
                 logger.warning("box.stop failed: %s", exc)
             try:
-                self._box.close()
+                with self._sdk_lock:
+                    self._box.close()
             except Exception:
                 pass
             self._box = None
@@ -389,7 +393,8 @@ class BoxClient:
         assert self._box is not None
         while not self._stop_event.is_set():
             try:
-                rc, snap = self._box.get_sensor_cache()
+                with self._sdk_lock:
+                    rc, snap = self._box.get_sensor_cache()
             except Exception as exc:
                 logger.error("box.get_sensor_cache raised: %s", exc)
                 now = time.monotonic()
@@ -461,9 +466,22 @@ class BoxClient:
         if self._box is None:
             return str(rc)
         try:
-            return str(self._box.err_str(rc))
+            with self._sdk_lock:
+                return str(self._box.err_str(rc))
         except Exception:
             return str(rc)
+
+    def set_mode(self, mode: int) -> int:
+        if self._box is None:
+            raise RuntimeError("BoxClient is not active.")
+        with self._sdk_lock:
+            return int(self._box.set_mode(int(mode)))
+
+    def set_clamp_pos(self, distance_m: float) -> int:
+        if self._box is None:
+            raise RuntimeError("BoxClient is not active.")
+        with self._sdk_lock:
+            return int(self._box.set_clamp_pos(float(distance_m)))
 
     def _status_locked(self) -> dict[str, Any]:
         now = time.monotonic()

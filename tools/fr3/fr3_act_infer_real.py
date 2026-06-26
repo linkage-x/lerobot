@@ -34,6 +34,14 @@ ROBOT_INIT_STATE_SHORTHAND_PREFIXES = (
     'xyzrotvec=',
     'xyzrotvec:',
 )
+GRIPPER_BACKEND_CHOICES = ('pika', 'das', 'franka_hand', 'corenetic')
+
+
+def _normalize_gripper_backend(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized == 'box':
+        return 'corenetic'
+    return normalized
 
 
 def _normalize_workspace_path(path_value: str) -> str:
@@ -91,10 +99,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--gripper-port', default=None, help='Optional DAS gripper serial port override.')
     parser.add_argument(
         '--gripper-backend',
-        choices=['pika', 'das'],
+        type=_normalize_gripper_backend,
+        choices=GRIPPER_BACKEND_CHOICES,
         default=None,
         help='Hardware gripper backend to use inside the container.',
     )
+    parser.add_argument('--gripper-max-width-mm', type=float, default=None)
+    parser.add_argument('--corenetic-bind-ip', dest='corenetic_bind_ip', default=None)
+    parser.add_argument('--box-bind-ip', dest='corenetic_bind_ip', help=argparse.SUPPRESS)
+    parser.add_argument('--corenetic-bind-port', dest='corenetic_bind_port', type=int, default=None)
+    parser.add_argument('--box-bind-port', dest='corenetic_bind_port', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--corenetic-remote-ip', dest='corenetic_remote_ip', default=None)
+    parser.add_argument('--box-remote-ip', dest='corenetic_remote_ip', help=argparse.SUPPRESS)
+    parser.add_argument('--corenetic-remote-port', dest='corenetic_remote_port', type=int, default=None)
+    parser.add_argument('--box-remote-port', dest='corenetic_remote_port', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--corenetic-sdk-dir', dest='corenetic_sdk_dir', default=None)
+    parser.add_argument('--box-sdk-dir', dest='corenetic_sdk_dir', help=argparse.SUPPRESS)
+    parser.add_argument('--corenetic-connect-timeout-s', dest='corenetic_connect_timeout_s', type=float, default=None)
+    parser.add_argument('--box-connect-timeout-s', dest='corenetic_connect_timeout_s', type=float, help=argparse.SUPPRESS)
+    parser.add_argument('--corenetic-poll-interval-s', dest='corenetic_poll_interval_s', type=float, default=None)
+    parser.add_argument('--box-poll-interval-s', dest='corenetic_poll_interval_s', type=float, help=argparse.SUPPRESS)
+    parser.add_argument('--corenetic-stale-threshold-s', dest='corenetic_stale_threshold_s', type=float, default=None)
+    parser.add_argument('--box-stale-threshold-s', dest='corenetic_stale_threshold_s', type=float, help=argparse.SUPPRESS)
+    parser.add_argument(
+        '--no-corenetic-release-mode-on-disconnect',
+        dest='corenetic_release_mode_on_disconnect',
+        action='store_false',
+        default=None,
+    )
+    parser.add_argument(
+        '--no-box-release-mode-on-disconnect',
+        dest='corenetic_release_mode_on_disconnect',
+        action='store_false',
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument('--robot-urdf-path', type=Path, default=None)
+    parser.add_argument('--target-frame-name', default=None)
     parser.add_argument(
         '--gripper-close-below',
         type=float,
@@ -243,7 +283,74 @@ def apply_inference_config_defaults(args: argparse.Namespace) -> argparse.Namesp
     args.preview = bool(_nested(raw, 'runtime', 'preview')) if args.preview is None else args.preview
     args.robot_ip = args.robot_ip or _nested(raw, 'runtime', 'hardware', 'robot_ip')
     args.gripper_port = args.gripper_port or _nested(raw, 'runtime', 'hardware', 'gripper_port')
-    args.gripper_backend = args.gripper_backend or _nested(raw, 'runtime', 'hardware', 'gripper_backend') or 'das'
+    args.gripper_backend = _normalize_gripper_backend(
+        args.gripper_backend or _nested(raw, 'runtime', 'hardware', 'gripper_backend') or 'das'
+    )
+    args.gripper_max_width_mm = (
+        args.gripper_max_width_mm
+        if args.gripper_max_width_mm is not None
+        else _nested(raw, 'runtime', 'hardware', 'gripper_max_width_mm')
+    )
+    args.corenetic_bind_ip = (
+        args.corenetic_bind_ip
+        or _nested(raw, 'runtime', 'hardware', 'corenetic_bind_ip')
+        or _nested(raw, 'runtime', 'hardware', 'box_bind_ip')
+    )
+    args.corenetic_bind_port = (
+        args.corenetic_bind_port
+        if args.corenetic_bind_port is not None
+        else _nested(raw, 'runtime', 'hardware', 'corenetic_bind_port')
+        or _nested(raw, 'runtime', 'hardware', 'box_bind_port')
+    )
+    args.corenetic_remote_ip = (
+        args.corenetic_remote_ip
+        or _nested(raw, 'runtime', 'hardware', 'corenetic_remote_ip')
+        or _nested(raw, 'runtime', 'hardware', 'box_remote_ip')
+    )
+    args.corenetic_remote_port = (
+        args.corenetic_remote_port
+        if args.corenetic_remote_port is not None
+        else _nested(raw, 'runtime', 'hardware', 'corenetic_remote_port')
+        or _nested(raw, 'runtime', 'hardware', 'box_remote_port')
+    )
+    args.corenetic_sdk_dir = (
+        args.corenetic_sdk_dir
+        or _nested(raw, 'runtime', 'hardware', 'corenetic_sdk_dir')
+        or _nested(raw, 'runtime', 'hardware', 'box_sdk_dir')
+    )
+    args.corenetic_connect_timeout_s = (
+        args.corenetic_connect_timeout_s
+        if args.corenetic_connect_timeout_s is not None
+        else _nested(raw, 'runtime', 'hardware', 'corenetic_connect_timeout_s')
+        or _nested(raw, 'runtime', 'hardware', 'box_connect_timeout_s')
+    )
+    args.corenetic_poll_interval_s = (
+        args.corenetic_poll_interval_s
+        if args.corenetic_poll_interval_s is not None
+        else _nested(raw, 'runtime', 'hardware', 'corenetic_poll_interval_s')
+        or _nested(raw, 'runtime', 'hardware', 'box_poll_interval_s')
+    )
+    args.corenetic_stale_threshold_s = (
+        args.corenetic_stale_threshold_s
+        if args.corenetic_stale_threshold_s is not None
+        else _nested(raw, 'runtime', 'hardware', 'corenetic_stale_threshold_s')
+        or _nested(raw, 'runtime', 'hardware', 'box_stale_threshold_s')
+    )
+    corenetic_release_default = (
+        _nested(raw, 'runtime', 'hardware', 'corenetic_release_mode_on_disconnect')
+        if _nested(raw, 'runtime', 'hardware', 'corenetic_release_mode_on_disconnect') is not None
+        else _nested(raw, 'runtime', 'hardware', 'box_release_mode_on_disconnect')
+    )
+    args.corenetic_release_mode_on_disconnect = (
+        bool(corenetic_release_default)
+        if args.corenetic_release_mode_on_disconnect is None and corenetic_release_default is not None
+        else args.corenetic_release_mode_on_disconnect
+    )
+    args.robot_urdf_path = args.robot_urdf_path or _path_or_default(
+        _nested(raw, 'runtime', 'hardware', 'robot_urdf_path'),
+        None,
+    )
+    args.target_frame_name = args.target_frame_name or _nested(raw, 'runtime', 'hardware', 'target_frame_name')
     args.gripper_close_below = (
         args.gripper_close_below
         if args.gripper_close_below is not None
@@ -345,7 +452,7 @@ def _to_container_path(path: Path, workspace: Path) -> str:
         return f"{CONTAINER_WORKSPACE}/{path_str.removeprefix(f'{LEGACY_CONTAINER_WORKSPACE}/')}"
 
     resolved_workspace = workspace.resolve()
-    resolved_path = path.resolve()
+    resolved_path = path.resolve() if path.is_absolute() else (resolved_workspace / path).resolve()
     try:
         relative = resolved_path.relative_to(resolved_workspace)
     except ValueError as exc:
@@ -415,6 +522,22 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         *([f'--mujoco-max-chunk-points={args.mujoco_max_chunk_points}'] if args.mujoco_max_chunk_points is not None else []),
         *([f'--robot-ip={shlex.quote(args.robot_ip)}'] if args.robot_ip is not None else []),
         *([f'--gripper-port={shlex.quote(args.gripper_port)}'] if args.gripper_port is not None else []),
+        *([f'--gripper-max-width-mm={args.gripper_max_width_mm}'] if args.gripper_max_width_mm is not None else []),
+        *([f'--corenetic-bind-ip={shlex.quote(args.corenetic_bind_ip)}'] if args.corenetic_bind_ip is not None else []),
+        *([f'--corenetic-bind-port={args.corenetic_bind_port}'] if args.corenetic_bind_port is not None else []),
+        *([f'--corenetic-remote-ip={shlex.quote(args.corenetic_remote_ip)}'] if args.corenetic_remote_ip is not None else []),
+        *([f'--corenetic-remote-port={args.corenetic_remote_port}'] if args.corenetic_remote_port is not None else []),
+        *([f'--corenetic-sdk-dir={shlex.quote(args.corenetic_sdk_dir)}'] if args.corenetic_sdk_dir is not None else []),
+        *([f'--corenetic-connect-timeout-s={args.corenetic_connect_timeout_s}'] if args.corenetic_connect_timeout_s is not None else []),
+        *([f'--corenetic-poll-interval-s={args.corenetic_poll_interval_s}'] if args.corenetic_poll_interval_s is not None else []),
+        *([f'--corenetic-stale-threshold-s={args.corenetic_stale_threshold_s}'] if args.corenetic_stale_threshold_s is not None else []),
+        *(['--no-corenetic-release-mode-on-disconnect'] if args.corenetic_release_mode_on_disconnect is False else []),
+        *(
+            [f'--robot-urdf-path={shlex.quote(_to_container_path(args.robot_urdf_path, workspace))}']
+            if args.robot_urdf_path is not None
+            else []
+        ),
+        *([f'--target-frame-name={shlex.quote(args.target_frame_name)}'] if args.target_frame_name is not None else []),
         *(
             [f'--first-frame-max-pos-delta-mm={args.first_frame_max_pos_delta_mm}']
             if args.first_frame_max_pos_delta_mm is not None
