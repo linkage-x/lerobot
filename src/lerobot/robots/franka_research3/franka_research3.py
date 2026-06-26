@@ -31,6 +31,7 @@ from lerobot.utils.robot_utils import precise_sleep
 from ..robot import Robot
 from .backends import (
     DasGripperHardwareDriver,
+    CoreneticGripperHardwareDriver,
     FrankaHandGripperHardwareDriver,
     HirolGaussianNewtonKinematicsDriver,
     HirolLMKinematicsDriver,
@@ -53,6 +54,7 @@ class FrankaResearch3(Robot):
     arm_driver_cls = PandaPyArmDriver
     gripper_driver_cls = PikaGripperHardwareDriver
     das_gripper_driver_cls = DasGripperHardwareDriver
+    corenetic_gripper_driver_cls = CoreneticGripperHardwareDriver
     franka_hand_gripper_driver_cls = FrankaHandGripperHardwareDriver
     mock_gripper_driver_cls = MockGripperDriver
     kinematics_driver_cls = PlacoKinematicsDriver
@@ -249,6 +251,22 @@ class FrankaResearch3(Robot):
                 robot_ip=self.config.robot_ip,
                 command_rate_limit_hz=self.config.gripper_command_rate_limit_hz,
                 command_deadband_m=self.config.gripper_command_deadband_mm / 1000.0,
+            )
+        if self.config.gripper_backend == "corenetic":
+            return self.corenetic_gripper_driver_cls(
+                bind_ip=self.config.corenetic_bind_ip,
+                bind_port=self.config.corenetic_bind_port,
+                remote_ip=self.config.corenetic_remote_ip,
+                remote_port=self.config.corenetic_remote_port,
+                sdk_dir=self.config.corenetic_sdk_dir,
+                urdf_relpath=self.config.corenetic_urdf_relpath,
+                max_width_m=self.config.gripper_max_width_mm / 1000.0,
+                poll_interval_s=self.config.corenetic_poll_interval_s,
+                stale_threshold_s=self.config.corenetic_stale_threshold_s,
+                connect_timeout_s=self.config.corenetic_connect_timeout_s,
+                command_rate_limit_hz=self.config.gripper_command_rate_limit_hz,
+                command_deadband_m=self.config.gripper_command_deadband_mm / 1000.0,
+                release_mode_on_disconnect=self.config.corenetic_release_mode_on_disconnect,
             )
         return self.gripper_driver_cls(
             serial_port=self.config.gripper_port,

@@ -37,6 +37,23 @@ max_step_rot_delta_deg="${FR3_MAX_STEP_ROT_DELTA_DEG-2}"
 checkpoint="${FR3_INFER_CHECKPOINT-outputs/train/pick_place_act_cam2_cam3_pika_right_imgonly/checkpoints/060000}"
 dataset_root="${FR3_INFER_DATASET_ROOT-}"
 camera_config="${FR3_INFER_CAMERA_CONFIG-tools/fr3/fr3_il_infer_hikrobot_camera_config.yaml}"
+gripper_backend="${FR3_GRIPPER_BACKEND-pika}"
+gripper_port="${FR3_GRIPPER_PORT-/dev/ttyUSB0}"
+gripper_max_width_mm="${FR3_GRIPPER_MAX_WIDTH_MM-90}"
+if [[ "${gripper_backend}" == "box" ]]; then
+  echo "[WARN] FR3_GRIPPER_BACKEND=box is deprecated; use FR3_GRIPPER_BACKEND=corenetic." >&2
+  gripper_backend="corenetic"
+fi
+corenetic_bind_ip="${FR3_CORENETIC_BIND_IP-${FR3_BOX_BIND_IP-0.0.0.0}}"
+corenetic_bind_port="${FR3_CORENETIC_BIND_PORT-${FR3_BOX_BIND_PORT-15000}}"
+corenetic_remote_ip="${FR3_CORENETIC_REMOTE_IP-${FR3_BOX_REMOTE_IP-192.168.2.60}}"
+corenetic_remote_port="${FR3_CORENETIC_REMOTE_PORT-${FR3_BOX_REMOTE_PORT-15000}}"
+corenetic_sdk_dir="${FR3_CORENETIC_SDK_DIR-${FR3_BOX_SDK_DIR-tools/thor/box_sdk}}"
+corenetic_connect_timeout_s="${FR3_CORENETIC_CONNECT_TIMEOUT_S-${FR3_BOX_CONNECT_TIMEOUT_S-3.0}}"
+corenetic_poll_interval_s="${FR3_CORENETIC_POLL_INTERVAL_S-${FR3_BOX_POLL_INTERVAL_S-0.01}}"
+corenetic_stale_threshold_s="${FR3_CORENETIC_STALE_THRESHOLD_S-${FR3_BOX_STALE_THRESHOLD_S-1.0}}"
+robot_urdf_path="${FR3_ROBOT_URDF_PATH-}"
+target_frame_name="${FR3_TARGET_FRAME_NAME-}"
 
 select_python() {
   if [[ -n "${FR3_HOST_PYTHON:-}" ]]; then
@@ -67,12 +84,22 @@ export HIKROBOT_MVS_HOME=/opt/MVS
 export MVCAM_COMMON_RUNENV=/opt/MVS/lib
 export LD_LIBRARY_PATH="${cmeel_prefix:+${cmeel_prefix}/lib:}/usr/local/lib:/opt/MVS/lib/64:/opt/MVS/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+if [[ "${gripper_backend}" == "corenetic" ]]; then
+  corenetic_sdk_abs="${corenetic_sdk_dir}"
+  if [[ "${corenetic_sdk_abs}" != /* ]]; then
+    corenetic_sdk_abs="${PWD}/${corenetic_sdk_abs}"
+  fi
+  export BOX_SDK_URDF="${BOX_SDK_URDF:-${corenetic_sdk_abs}/share/monte_gripper.urdf}"
+  export LD_LIBRARY_PATH="${corenetic_sdk_abs}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
 common_args=(
   tools/fr3/fr3_act_infer_real_runtime.py
   --checkpoint "${checkpoint}"
   --camera-config "${camera_config}"
-  --gripper-backend pika
-  --gripper-port /dev/ttyUSB0
+  --gripper-backend "${gripper_backend}"
+  --gripper-port "${gripper_port}"
+  --gripper-max-width-mm "${gripper_max_width_mm}"
   --robot-ip 192.168.11.102
   --first-frame-max-pos-delta-mm "${first_frame_max_pos_delta_mm}"
   --first-frame-max-rot-delta-deg "${first_frame_max_rot_delta_deg}"
@@ -80,6 +107,22 @@ common_args=(
   --max-step-rot-delta-deg "${max_step_rot_delta_deg}"
 )
 
+if [[ "${gripper_backend}" == "corenetic" ]]; then
+  common_args+=(--corenetic-bind-ip "${corenetic_bind_ip}")
+  common_args+=(--corenetic-bind-port "${corenetic_bind_port}")
+  common_args+=(--corenetic-remote-ip "${corenetic_remote_ip}")
+  common_args+=(--corenetic-remote-port "${corenetic_remote_port}")
+  common_args+=(--corenetic-sdk-dir "${corenetic_sdk_dir}")
+  common_args+=(--corenetic-connect-timeout-s "${corenetic_connect_timeout_s}")
+  common_args+=(--corenetic-poll-interval-s "${corenetic_poll_interval_s}")
+  common_args+=(--corenetic-stale-threshold-s "${corenetic_stale_threshold_s}")
+fi
+if [[ -n "${robot_urdf_path}" ]]; then
+  common_args+=(--robot-urdf-path "${robot_urdf_path}")
+fi
+if [[ -n "${target_frame_name}" ]]; then
+  common_args+=(--target-frame-name "${target_frame_name}")
+fi
 if [[ -n "${dataset_root}" ]]; then
   common_args+=(--dataset-root "${dataset_root}")
 fi
@@ -214,6 +257,15 @@ case "$mode" in
     echo "FR3_INFER_CHECKPOINT=${checkpoint}"
     echo "FR3_INFER_DATASET_ROOT=${dataset_root}"
     echo "FR3_INFER_CAMERA_CONFIG=${camera_config}"
+    echo "FR3_GRIPPER_BACKEND=${gripper_backend}"
+    echo "FR3_GRIPPER_PORT=${gripper_port}"
+    echo "FR3_GRIPPER_MAX_WIDTH_MM=${gripper_max_width_mm}"
+    echo "FR3_CORENETIC_BIND_IP=${corenetic_bind_ip}"
+    echo "FR3_CORENETIC_REMOTE_IP=${corenetic_remote_ip}"
+    echo "FR3_CORENETIC_SDK_DIR=${corenetic_sdk_dir}"
+    echo "FR3_ROBOT_URDF_PATH=${robot_urdf_path}"
+    echo "FR3_TARGET_FRAME_NAME=${target_frame_name}"
+    echo "BOX_SDK_URDF=${BOX_SDK_URDF:-}"
     echo "PYTHONPATH=${PYTHONPATH}"
     echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
     ;;

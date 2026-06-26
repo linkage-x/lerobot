@@ -29,7 +29,8 @@ import numpy as np
 import torch
 import yaml
 
-from lerobot.cameras.configs import ColorMode, Cv2Backends
+from lerobot.cameras.configs import ColorMode, Cv2Backends, Cv2Rotation
+from lerobot.cameras.gmsl2.configuration_gmsl2 import Gmsl2CameraConfig
 from lerobot.cameras.hikrobot.configuration_hikrobot import HikrobotCameraConfig
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
@@ -58,6 +59,7 @@ _DEFAULT_CAMERA_CONFIG = _REPO_ROOT / 'tools/fr3/fr3_act_infer_camera_config.yam
 _DEFAULT_ROBOT_IP = '192.168.1.208'
 _DEFAULT_GRIPPER_PORT = '/dev/ttyUSB0'
 _DEFAULT_GRIPPER_BACKEND = 'das'
+_GRIPPER_BACKEND_CHOICES = ('pika', 'das', 'franka_hand', 'corenetic')
 _DAS_XML = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_das_ati.xml'
 _PIKA_XML = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.xml'
 _DAS_URDF = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_das_ati.urdf'
@@ -105,6 +107,13 @@ _JOINT_NAMES = [
     'fr3_joint6',
     'fr3_joint7',
 ]
+
+
+def _normalize_gripper_backend(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized == 'box':
+        return 'corenetic'
+    return normalized
 
 
 def _load_dataset_info(dataset_root: Path) -> dict[str, Any]:
@@ -291,7 +300,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument('--robot-ip', default=_DEFAULT_ROBOT_IP)
     parser.add_argument('--gripper-port', default=_DEFAULT_GRIPPER_PORT)
-    parser.add_argument('--gripper-backend', choices=['pika', 'das'], default=_DEFAULT_GRIPPER_BACKEND)
+    parser.add_argument(
+        '--gripper-backend',
+        type=_normalize_gripper_backend,
+        choices=_GRIPPER_BACKEND_CHOICES,
+        default=_DEFAULT_GRIPPER_BACKEND,
+    )
+    parser.add_argument(
+        '--gripper-max-width-mm',
+        type=float,
+        default=90.0,
+        help='Physical gripper maximum opening in millimeters, used to normalize dataset gripper units.',
+    )
+    parser.add_argument('--corenetic-bind-ip', dest='corenetic_bind_ip', default='0.0.0.0', help='Local IP for Corenetic gripper UDP bind.')
+    parser.add_argument('--box-bind-ip', dest='corenetic_bind_ip', help=argparse.SUPPRESS)
+    parser.add_argument('--corenetic-bind-port', dest='corenetic_bind_port', type=int, default=15000, help='Local UDP port for Corenetic gripper.')
+    parser.add_argument('--box-bind-port', dest='corenetic_bind_port', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--corenetic-remote-ip', dest='corenetic_remote_ip', default='192.168.2.60', help='Corenetic gripper MCU IP.')
+    parser.add_argument('--box-remote-ip', dest='corenetic_remote_ip', help=argparse.SUPPRESS)
+    parser.add_argument('--corenetic-remote-port', dest='corenetic_remote_port', type=int, default=15000, help='Corenetic gripper MCU UDP port.')
+    parser.add_argument('--box-remote-port', dest='corenetic_remote_port', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--corenetic-sdk-dir', dest='corenetic_sdk_dir', default='tools/thor/box_sdk', help='Corenetic/BOX SDK directory relative to repo root.')
+    parser.add_argument('--box-sdk-dir', dest='corenetic_sdk_dir', help=argparse.SUPPRESS)
+    parser.add_argument('--corenetic-connect-timeout-s', dest='corenetic_connect_timeout_s', type=float, default=3.0)
+    parser.add_argument('--box-connect-timeout-s', dest='corenetic_connect_timeout_s', type=float, help=argparse.SUPPRESS)
+    parser.add_argument('--corenetic-poll-interval-s', dest='corenetic_poll_interval_s', type=float, default=0.01)
+    parser.add_argument('--box-poll-interval-s', dest='corenetic_poll_interval_s', type=float, help=argparse.SUPPRESS)
+    parser.add_argument('--corenetic-stale-threshold-s', dest='corenetic_stale_threshold_s', type=float, default=1.0)
+    parser.add_argument('--box-stale-threshold-s', dest='corenetic_stale_threshold_s', type=float, help=argparse.SUPPRESS)
+    parser.add_argument(
+        '--no-corenetic-release-mode-on-disconnect',
+        dest='corenetic_release_mode_on_disconnect',
+        action='store_false',
+        help='Do not switch Corenetic gripper back to collection mode on disconnect.',
+    )
+    parser.add_argument('--no-box-release-mode-on-disconnect', dest='corenetic_release_mode_on_disconnect', action='store_false', help=argparse.SUPPRESS)
+    parser.add_argument('--robot-urdf-path', type=Path, default=None, help='Optional FR3 tool URDF override for IK.')
+    parser.add_argument('--target-frame-name', default=None, help='Optional IK target frame override.')
     parser.add_argument(
         '--gripper-close-below',
         type=float,
@@ -478,7 +523,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=64,
         help='Maximum policy action-chunk target points to draw in the MuJoCo viewer.',
     )
-    parser.set_defaults(move_to_das_start=True, align_gripper_to_dataset_start=True)
+    parser.set_defaults(
+        move_to_das_start=True,
+        align_gripper_to_dataset_start=True,
+        corenetic_release_mode_on_disconnect=True,
+    )
     return parser.parse_args(argv)
 
 
@@ -837,7 +886,30 @@ def move_to_robot_init_state_if_requested(robot: Any, init_state: dict[str, Any]
 def resolve_mujoco_model_path(gripper_backend: str, model_path: str | Path | None) -> Path:
     if model_path is not None:
         return _resolve_repo_path(model_path)
-    return _PIKA_XML if gripper_backend == 'pika' else _DAS_XML
+    return _DAS_XML if gripper_backend == 'das' else _PIKA_XML
+
+
+def resolve_robot_tool_model(gripper_backend: str, urdf_path: str | Path | None, target_frame_name: str | None) -> tuple[Path, str]:
+    if urdf_path is not None:
+        resolved_urdf = _resolve_repo_path(urdf_path)
+    elif gripper_backend == 'das':
+        resolved_urdf = _DAS_URDF
+    else:
+        resolved_urdf = _PIKA_URDF
+
+    if target_frame_name is not None:
+        resolved_target_frame = str(target_frame_name)
+    elif gripper_backend == 'das':
+        resolved_target_frame = 'das_gripper_ee'
+    else:
+        resolved_target_frame = 'pika_gripper_ee'
+
+    if gripper_backend == 'corenetic' and urdf_path is None:
+        print(
+            '[WARN] Corenetic gripper is using the Pika FR3 URDF/TCP fallback for IK. '
+            'Pass --robot-urdf-path and --target-frame-name when you have the calibrated Corenetic tool model.'
+        )
+    return resolved_urdf, resolved_target_frame
 
 
 class FR3InferenceMujocoVisualizer:
@@ -1123,9 +1195,44 @@ def _coerce_opencv_backend(value: Any) -> Cv2Backends:
     raise ValueError(f'Unsupported OpenCV backend identifier: {value!r}')
 
 
+def _coerce_cv2_rotation(value: Any) -> Cv2Rotation:
+    if isinstance(value, Cv2Rotation):
+        return value
+    if value is None:
+        return Cv2Rotation.NO_ROTATION
+    if isinstance(value, int):
+        return Cv2Rotation(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return Cv2Rotation.NO_ROTATION
+        if stripped.lstrip('-').isdigit():
+            return Cv2Rotation(int(stripped))
+        aliases = {
+            'none': Cv2Rotation.NO_ROTATION,
+            'no_rotation': Cv2Rotation.NO_ROTATION,
+            'rotate_90': Cv2Rotation.ROTATE_90,
+            '90': Cv2Rotation.ROTATE_90,
+            'rotate_180': Cv2Rotation.ROTATE_180,
+            '180': Cv2Rotation.ROTATE_180,
+            'rotate_270': Cv2Rotation.ROTATE_270,
+            '-90': Cv2Rotation.ROTATE_270,
+        }
+        normalized = stripped.lower()
+        if normalized in aliases:
+            return aliases[normalized]
+    raise ValueError(f'Unsupported cv2 rotation identifier: {value!r}')
+
+
+def _coerce_int(value: Any) -> int:
+    if isinstance(value, str):
+        return int(value, 0)
+    return int(value)
+
+
 def load_camera_configs(
     camera_config_path: str | Path,
-) -> dict[str, OpenCVCameraConfig | RealSenseCameraConfig | HikrobotCameraConfig]:
+) -> dict[str, OpenCVCameraConfig | RealSenseCameraConfig | HikrobotCameraConfig | Gmsl2CameraConfig]:
     config_path = _resolve_repo_path(camera_config_path)
     with config_path.open('r', encoding='utf-8') as f:
         raw = yaml.safe_load(f) or {}
@@ -1134,7 +1241,7 @@ def load_camera_configs(
     if not camera_entries:
         raise ValueError(f'No robot.cameras entries found in {config_path}')
 
-    camera_configs: dict[str, OpenCVCameraConfig | RealSenseCameraConfig | HikrobotCameraConfig] = {}
+    camera_configs: dict[str, OpenCVCameraConfig | RealSenseCameraConfig | HikrobotCameraConfig | Gmsl2CameraConfig] = {}
     for camera_name, cfg in camera_entries.items():
         camera_type = cfg.get('type')
         if camera_type == 'intelrealsense':
@@ -1194,6 +1301,39 @@ def load_camera_configs(
                 exposure_us=float(cfg['exposure_us']) if cfg.get('exposure_us') is not None else None,
                 gain_db=float(cfg['gain_db']) if cfg.get('gain_db') is not None else None,
                 timeout_ms=int(cfg.get('timeout_ms', 1000)),
+            )
+            continue
+        if camera_type == 'gmsl2':
+            image_shape = cfg.get('image_shape')
+            width = cfg.get('width')
+            height = cfg.get('height')
+            if image_shape is not None:
+                if not isinstance(image_shape, (list, tuple)) or len(image_shape) != 2:
+                    raise ValueError(f"gmsl2 camera '{camera_name}' must use image_shape=[height, width]")
+                height, width = int(image_shape[0]), int(image_shape[1])
+            if width is None or height is None:
+                raise ValueError(f"gmsl2 camera '{camera_name}' requires width/height or image_shape")
+            sensor_id = cfg.get('sensor_id')
+            device = cfg.get('device')
+            camera_configs[camera_name] = Gmsl2CameraConfig(
+                sensor_id=int(sensor_id) if sensor_id is not None else None,
+                device=str(device) if device is not None else None,
+                pipeline=str(cfg.get('pipeline', 'argus')),
+                sensor_mode=int(cfg.get('sensor_mode', 0)),
+                v4l2_pixel_format=str(cfg.get('v4l2_pixel_format', 'UYVY')),
+                bayer_format=str(cfg.get('bayer_format', 'grbg10le')),
+                sync_role=str(cfg.get('sync_role', 'auto')),
+                trig_pin=_coerce_int(cfg.get('trig_pin', 0x00020007)),
+                apply_sync_at_connect=bool(cfg.get('apply_sync_at_connect', True)),
+                exposure_us=int(cfg['exposure_us']) if cfg.get('exposure_us') is not None else None,
+                gain=int(cfg['gain']) if cfg.get('gain') is not None else None,
+                width=int(width),
+                height=int(height),
+                fps=int(cfg['fps']),
+                color_mode=cfg.get('color_mode', ColorMode.BGR),
+                rotation=_coerce_cv2_rotation(cfg.get('rotation', Cv2Rotation.NO_ROTATION)),
+                warmup_s=int(cfg.get('warmup_s', 2)),
+                timeout_ms=int(cfg.get('timeout_ms', 2000)),
             )
             continue
         raise ValueError(f"Unsupported camera type '{camera_type}' in {config_path} for {camera_name}")
@@ -1389,8 +1529,12 @@ def _state_name_to_observation_key(name: str) -> str:
         'prev_cmd.gripper': PREV_CMD_GRIPPER_KEY,
         'handheld_gripper.pika_left.width_mm': 'gripper.pos',
         'handheld_gripper.pika_right.width_mm': 'gripper.pos',
+        'corenetic_gripper.distance_m': 'gripper.pos',
+        'box_gripper.distance_m': 'gripper.pos',
         'observation.state_raw.handheld_gripper.pika_left.width_mm': 'gripper.pos',
         'observation.state_raw.handheld_gripper.pika_right.width_mm': 'gripper.pos',
+        'observation.state_raw.corenetic_gripper.distance_m': 'gripper.pos',
+        'observation.state_raw.box_gripper.distance_m': 'gripper.pos',
     }
     return aliases.get(name, name)
 
@@ -1413,6 +1557,10 @@ def extract_action_gripper_raw(action_tensor: torch.Tensor, action_names: list[s
         'gripper.pos',
         'observation.state_raw.handheld_gripper.pika_left.width_mm',
         'observation.state_raw.handheld_gripper.pika_right.width_mm',
+        'corenetic_gripper.distance_m',
+        'observation.state_raw.corenetic_gripper.distance_m',
+        'box_gripper.distance_m',
+        'observation.state_raw.box_gripper.distance_m',
     )
 
 
@@ -2700,6 +2848,11 @@ def run_inference(args: argparse.Namespace) -> int:
     action_names = extract_feature_names(ds_meta.features['action'], _DEFAULT_ACTION_NAMES)
     robot_init_state = parse_robot_init_state(args.robot_init_state)
     mujoco_model_path = resolve_mujoco_model_path(args.gripper_backend, args.mujoco_model)
+    robot_urdf_path, target_frame_name = resolve_robot_tool_model(
+        args.gripper_backend,
+        args.robot_urdf_path,
+        args.target_frame_name,
+    )
     controller_stiffness = _parse_optional_float_tuple(
         args.controller_stiffness,
         expected_len=7,
@@ -2728,13 +2881,23 @@ def run_inference(args: argparse.Namespace) -> int:
         gripper_port=args.gripper_port,
         gripper_backend=args.gripper_backend,
         allow_mock_gripper=False,
-        urdf_path=str(_PIKA_URDF if args.gripper_backend == 'pika' else _DAS_URDF),
-        target_frame_name='pika_gripper_ee' if args.gripper_backend == 'pika' else 'das_gripper_ee',
+        urdf_path=str(robot_urdf_path),
+        target_frame_name=target_frame_name,
         workspace_min=(0.1, -0.6, 0.05),
         workspace_max=(0.9, 0.6, 0.8),
         stiffness=controller_stiffness,
         damping=controller_damping,
         filter_coeff=args.controller_filter_coeff,
+        gripper_max_width_mm=float(args.gripper_max_width_mm),
+        corenetic_bind_ip=str(args.corenetic_bind_ip),
+        corenetic_bind_port=int(args.corenetic_bind_port),
+        corenetic_remote_ip=str(args.corenetic_remote_ip),
+        corenetic_remote_port=int(args.corenetic_remote_port),
+        corenetic_sdk_dir=str(args.corenetic_sdk_dir),
+        corenetic_connect_timeout_s=float(args.corenetic_connect_timeout_s),
+        corenetic_poll_interval_s=float(args.corenetic_poll_interval_s),
+        corenetic_stale_threshold_s=float(args.corenetic_stale_threshold_s),
+        corenetic_release_mode_on_disconnect=bool(args.corenetic_release_mode_on_disconnect),
         use_otg=bool(args.use_otg),
         otg_control_frequency=float(args.otg_control_frequency),
         otg_async_control_frequency=float(args.otg_async_control_frequency),

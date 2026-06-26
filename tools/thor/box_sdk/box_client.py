@@ -710,7 +710,8 @@ class BoxClient:
         assert self._box is not None
         while not self._stop_event.is_set():
             try:
-                rc, snap = self._box.get_sensor_cache()
+                with self._sdk_lock:
+                    rc, snap = self._box.get_sensor_cache()
             except Exception as exc:
                 logger.error("box.get_sensor_cache raised: %s", exc)
                 now = time.monotonic()
@@ -797,9 +798,22 @@ class BoxClient:
         if self._box is None:
             return str(rc)
         try:
-            return str(self._box.err_str(rc))
+            with self._sdk_lock:
+                return str(self._box.err_str(rc))
         except Exception:
             return str(rc)
+
+    def set_mode(self, mode: int) -> int:
+        if self._box is None:
+            raise RuntimeError("BoxClient is not active.")
+        with self._sdk_lock:
+            return int(self._box.set_mode(int(mode)))
+
+    def set_clamp_pos(self, distance_m: float) -> int:
+        if self._box is None:
+            raise RuntimeError("BoxClient is not active.")
+        with self._sdk_lock:
+            return int(self._box.set_clamp_pos(float(distance_m)))
 
     def _status_locked(self) -> dict[str, Any]:
         now = time.monotonic()
