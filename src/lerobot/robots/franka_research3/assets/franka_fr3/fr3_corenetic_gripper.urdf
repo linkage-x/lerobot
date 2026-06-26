@@ -1,0 +1,676 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="fr3_corenetic_gripper">
+  <mujoco>
+    <compiler meshdir="assets" balanceinertia="true" discardvisual="false" />
+  </mujoco>
+  <link name="base" />
+  <joint name="fr3_base_joint" type="fixed">
+    <parent link="base" />
+    <child link="fr3_link0" />
+    <origin rpy="0 0 0" xyz="0 0 0" />
+  </joint>
+  <link name="fr3_link0">
+    <visual name="fr3_link0_visual">
+      <geometry>
+        <mesh filename="assets/link0_0.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link0_1.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link0_2.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link0_3.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link0_4.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link0_5.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link0_6.obj" />
+      </geometry>
+    </visual>
+    <collision name="fr3_link0_collision">
+      <geometry>
+        <mesh filename="assets/link0.stl" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.0172 0.0004 0.0745" />
+      <mass value="2.3966" />
+      <inertia ixx="0.009" ixy="0.0" ixz="0.002" iyy="0.0115" iyz="0.0" izz="0.0085" />
+    </inertial>
+  </link>
+  <link name="fr3_link1">
+    <visual name="fr3_link1_visual">
+      <geometry>
+        <mesh filename="assets/link1.obj" />
+      </geometry>
+    </visual>
+    <collision name="fr3_link1_collision">
+      <geometry>
+        <mesh filename="assets/link1.stl" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0000004128 -0.0181251324 -0.0386035970" />
+      <mass value="2.9274653454" />
+      <inertia ixx="0.023927316485107913" ixy="1.3317903455714081e-05" ixz="-0.00011404774918616684" iyy="0.0224821613275756" iyz="-0.0019950320628240115" izz="0.006350098258530016" />
+    </inertial>
+  </link>
+  <joint name="fr3_joint1" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0.333" />
+    <parent link="fr3_link0" />
+    <child link="fr3_link1" />
+    <axis xyz="0 0 1" />
+    <limit effort="87.0" lower="-2.7437" upper="2.7437" velocity="2.62" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-2.7437" soft_upper_limit="2.7437" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  <link name="fr3_link2">
+    <visual name="fr3_link2_visual">
+      <geometry>
+        <mesh filename="assets/link2.obj" />
+      </geometry>
+    </visual>
+    <collision name="fr3_link2_collision">
+      <geometry>
+        <mesh filename="assets/link2.stl" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0031828864 -0.0743221644 0.0088146084" />
+      <mass value="2.9355370338" />
+      <inertia ixx="0.041938946257609425" ixy="0.00020257331521090626" ixz="0.004077784227179924" iyy="0.02514514885014724" iyz="-0.0042252158006570156" izz="0.06170214472888839" />
+    </inertial>
+  </link>
+  <joint name="fr3_joint2" type="revolute">
+    <origin rpy="-1.570796326794897 0 0" xyz="0 0 0" />
+    <parent link="fr3_link1" />
+    <child link="fr3_link2" />
+    <axis xyz="0 0 1" />
+    <limit effort="87.0" lower="-1.7837" upper="1.7837" velocity="2.62" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-1.7837" soft_upper_limit="1.7837" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  <link name="fr3_link3">
+    <visual name="fr3_link3_visual">
+      <geometry>
+        <mesh filename="assets/link3_0.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link3_1.obj" />
+      </geometry>
+    </visual>
+    <collision name="fr3_link3_collision">
+      <geometry>
+        <mesh filename="assets/link3.stl" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0407015686 -0.0048200565 -0.0289730823" />
+      <mass value="2.2449013699" />
+      <inertia ixx="0.02410142547240885" ixy="0.002404694559042109" ixz="-0.002856269270114313" iyy="0.01974053266708178" iyz="-0.002104212683891874" izz="0.019044494482244823" />
+    </inertial>
+  </link>
+  <joint name="fr3_joint3" type="revolute">
+    <origin rpy="1.570796326794897 0 0" xyz="0 -0.316 0" />
+    <parent link="fr3_link2" />
+    <child link="fr3_link3" />
+    <axis xyz="0 0 1" />
+    <limit effort="87.0" lower="-2.9007" upper="2.9007" velocity="2.62" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-2.9007" soft_upper_limit="2.9007" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  <link name="fr3_link4">
+    <visual name="fr3_link4_visual">
+      <geometry>
+        <mesh filename="assets/link4_0.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link4_1.obj" />
+      </geometry>
+    </visual>
+    <collision name="fr3_link4_collision">
+      <geometry>
+        <mesh filename="assets/link4.stl" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.0459100965 0.0630492960 -0.0085187868" />
+      <mass value="2.6155955791" />
+      <inertia ixx="0.03452998321913202" ixy="0.01322552265982813" ixz="0.01015142998484113" iyy="0.028881621933049058" iyz="-0.0009762833870704552" izz="0.04125471171146641" />
+    </inertial>
+  </link>
+  <joint name="fr3_joint4" type="revolute">
+    <origin rpy="1.570796326794897 0 0" xyz="0.0825 0 0" />
+    <parent link="fr3_link3" />
+    <child link="fr3_link4" />
+    <axis xyz="0 0 1" />
+    <limit effort="87.0" lower="-3.0421" upper="-0.1518" velocity="2.62" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-3.0421" soft_upper_limit="-0.1518" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  <link name="fr3_link5">
+    <visual name="fr3_link5_visual">
+      <geometry>
+        <mesh filename="assets/link5_0.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link5_1.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link5_2.obj" />
+      </geometry>
+    </visual>
+    <collision name="fr3_link5_collision">
+      <geometry>
+        <mesh filename="assets/link5.stl" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.0016039605 0.0292536262 -0.0972965990" />
+      <mass value="2.3271207594" />
+      <inertia ixx="0.051610278463662895" ixy="-0.005715173387783472" ixz="-0.0035673167625872135" iyy="0.04787729713371481" iyz="0.010673985108535986" izz="0.016423625579357254" />
+    </inertial>
+  </link>
+  <joint name="fr3_joint5" type="revolute">
+    <origin rpy="-1.570796326794897 0 0" xyz="-0.0825 0.384 0" />
+    <parent link="fr3_link4" />
+    <child link="fr3_link5" />
+    <axis xyz="0 0 1" />
+    <limit effort="12.0" lower="-2.8065" upper="2.8065" velocity="5.26" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-2.8065" soft_upper_limit="2.8065" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  <link name="fr3_link6">
+    <visual name="fr3_link6_visual">
+      <geometry>
+        <mesh filename="assets/link6_0.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link6_1.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link6_2.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link6_3.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link6_4.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link6_5.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link6_6.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link6_7.obj" />
+      </geometry>
+    </visual>
+    <collision name="fr3_link6_collision">
+      <geometry>
+        <mesh filename="assets/link6.stl" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0597131221 -0.0410294666 -0.0101692726" />
+      <mass value="1.8170376524" />
+      <inertia ixx="0.005412333594383447" ixy="0.006193456360285834" ixz="0.0014219289306117652" iyy="0.014058329545509979" iyz="-0.0013140753741120031" izz="0.016080817924212554" />
+    </inertial>
+  </link>
+  <joint name="fr3_joint6" type="revolute">
+    <origin rpy="1.570796326794897 0 0" xyz="0 0 0" />
+    <parent link="fr3_link5" />
+    <child link="fr3_link6" />
+    <axis xyz="0 0 1" />
+    <limit effort="12.0" lower="0.5445" upper="4.5169" velocity="4.18" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="0.5445" soft_upper_limit="4.5169" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  <link name="fr3_link7">
+    <visual name="fr3_link7_visual">
+      <geometry>
+        <mesh filename="assets/link7_0.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link7_1.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link7_2.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="assets/link7_3.obj" />
+      </geometry>
+    </visual>
+    <collision name="fr3_link7_collision">
+      <geometry>
+        <mesh filename="assets/link7.stl" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0045225817 0.0086261921 -0.0161633251" />
+      <mass value="0.6271432862" />
+      <inertia ixx="0.00021092389150104718" ixy="-2.433299114461931e-05" ixz="4.564480393778983e-05" iyy="0.00017718568002411474" iyz="8.744070223226438e-05" izz="5.993190599659971e-05" />
+    </inertial>
+  </link>
+  <joint name="fr3_joint7" type="revolute">
+    <origin rpy="1.570796326794897 0 0" xyz="0.088 0 0" />
+    <parent link="fr3_link6" />
+    <child link="fr3_link7" />
+    <axis xyz="0 0 1" />
+    <limit effort="12.0" lower="-3.0159" upper="3.0159" velocity="5.26" />
+    <safety_controller k_position="100.0" k_velocity="40.0" soft_lower_limit="-3.0159" soft_upper_limit="3.0159" />
+    <dynamics D="1" K="7000" damping="0.003" friction="0.2" mu_coulomb="0" mu_viscous="16" />
+  </joint>
+  <link name="fr3_link8" />
+  <joint name="fr3_joint8" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0.107" />
+    <parent link="fr3_link7" />
+    <child link="fr3_link8" />
+  </joint>
+  <!-- corenetic gripper -->
+  <joint name="fr3_corenetic_gripper_joint" type="fixed">
+    <origin rpy="0 0 -0.7853981633974483" xyz="0 0 0" />
+    <parent link="fr3_link8" />
+    <child link="base_link" />
+  </joint>
+  <link name="base_link">
+    <inertial>
+      <origin xyz="-0.00016355520799417 8.86199750735339E-17 0.00499219128724902" rpy="0 0 0" />
+      <mass value="0.0280919165597075" />
+      <inertia ixx="7.71480419171194E-06" ixy="-1.01643953670516E-20" ixz="-8.00463594817873E-09" iyy="7.59918824294922E-06" iyz="-6.76716459129632E-21" izz="1.48469947210806E-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/base_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="link_franka_corenetic_gripper_1">
+    <inertial>
+      <origin xyz="0.0161338715170421 0.0125880277735246 0.0194975860884886" rpy="0 0 0" />
+      <mass value="0.0703171182690708" />
+      <inertia ixx="4.59868816471546E-05" ixy="5.55292758067126E-08" ixz="1.26619746987241E-07" iyy="2.23221112183621E-05" iyz="1.80134605881265E-06" izz="4.71431067802039E-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_franka_corenetic_gripper_1.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_franka_corenetic_gripper_1.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint_franka_corenetic_gripper_1" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="base_link" />
+    <child link="link_franka_corenetic_gripper_1" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <link name="link_franka_corenetic_gripper_2">
+    <inertial>
+      <origin xyz="-2.22998821206779E-07 0.000242859796049694 -0.00179806963458283" rpy="0 0 0" />
+      <mass value="0.0525656216796275" />
+      <inertia ixx="6.19283398828473E-06" ixy="2.42485036327412E-11" ixz="4.85793694902877E-11" iyy="5.88633887296662E-06" iyz="6.9704769797314E-08" izz="8.28323273216034E-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_franka_corenetic_gripper_2.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_franka_corenetic_gripper_2.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint_franka_corenetic_gripper_2" type="fixed">
+    <origin xyz="0 0 0.02225" rpy="0 0 -1.57079632679492" />
+    <parent link="base_link" />
+    <child link="link_franka_corenetic_gripper_2" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <link name="link_franka_corenetic_gripper_3">
+    <inertial>
+      <origin xyz="5.77614836709886E-06 -0.0149927548599076 -0.0628131545384932" rpy="0 0 0" />
+      <mass value="0.164242231833142" />
+      <inertia ixx="6.30244354225942E-05" ixy="-9.38288815215088E-09" ixz="2.51310759694031E-09" iyy="6.19665148020467E-05" iyz="7.40719185513878E-06" izz="7.18689033492371E-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_franka_corenetic_gripper_3.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_franka_corenetic_gripper_3.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint_franka_corenetic_gripper_3" type="fixed">
+    <origin xyz="0.0424995051043118 0 0.123603823164162" rpy="0.349067575421447 0 -1.5707048724157" />
+    <parent link="base_link" />
+    <child link="link_franka_corenetic_gripper_3" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="joint_lt_gripper_base" type="fixed">
+    <origin xyz="0 0 0.036" rpy="-3.14159265358979 0 9.13324118289264E-05" />
+    <parent link="base_link" />
+    <child link="link_lt_gripper_base" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <link name="link_lt_gripper_base">
+    <inertial>
+      <origin xyz="-0.000980332060006024 -0.000165460803064683 -0.0380637297528955" rpy="0 0 0" />
+      <mass value="0.148362683973387" />
+      <inertia ixx="0.000108524117304559" ixy="-1.98918959340993E-07" ixz="-5.04558013460517E-07" iyy="8.91872435110639E-05" iyz="-8.37372786805607E-08" izz="7.54521906672916E-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_base.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_base.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="link_lt_gripper_drive">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_drive.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_drive.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint_lt_gripper_drive" type="revolute">
+    <origin xyz="-0.00079195 0 -0.031" rpy="0 0 0" />
+    <parent link="link_lt_gripper_base" />
+    <child link="link_lt_gripper_drive" />
+    <axis xyz="0 0 -1" />
+    <limit lower="0" upper="1.44862" effort="6" velocity="0.78540" />
+  </joint>
+  <link name="link_lt_gripper_knuckle_left_outer">
+    <inertial>
+      <origin xyz="2.86107331813327E-05 -0.0235652743366583 -0.037949799327442" rpy="0 0 0" />
+      <mass value="0.0542841793588412" />
+      <inertia ixx="2.49252404499279E-05" ixy="1.5522825054212E-11" ixz="-2.63456908981634E-11" iyy="2.61457716782546E-05" iyz="3.1465581323358E-06" izz="3.63669814336204E-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_knuckle_left_outer.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_knuckle_left_outer.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint_lt_gripper_knuckle_left_outer" type="revolute">
+    <origin xyz="-0.00079195 0.018992 -0.05" rpy="0 0 0" />
+    <parent link="link_lt_gripper_base" />
+    <child link="link_lt_gripper_knuckle_left_outer" />
+    <axis xyz="1 0 0" />
+    <limit lower="0" upper="1.44862" effort="6" velocity="0.78540" />
+    <mimic joint="joint_lt_gripper_drive" multiplier="1" offset="0" />
+  </joint>
+  <link name="link_lt_gripper_finger_left">
+    <inertial>
+      <origin xyz="2.56595310106296E-05 -0.0254574097735164 -0.0218146948643816" rpy="0 0 0" />
+      <mass value="0.0864607010067869" />
+      <inertia ixx="3.23998364747912E-05" ixy="1.91414144920886E-09" ixz="-5.61810150104366E-09" iyy="3.47600641615956E-05" iyz="2.11804671469973E-06" izz="5.51801591712787E-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_finger_left.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_finger_left.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint_lt_gripper_finger_left" type="revolute">
+    <origin xyz="0 0.0043547 -0.04981" rpy="0 0 0" />
+    <parent link="link_lt_gripper_knuckle_left_outer" />
+    <child link="link_lt_gripper_finger_left" />
+    <axis xyz="-1 0 0" />
+    <limit lower="0" upper="1.44862" effort="6" velocity="0.78540" />
+    <mimic joint="joint_lt_gripper_drive" multiplier="1" offset="0" />
+  </joint>
+  <link name="link_lt_gripper_knuckle_left_inner">
+    <inertial>
+      <origin xyz="4.40656810463356E-05 0.00379719277771037 -0.0284917519280255" rpy="0 0 0" />
+      <mass value="0.0231471998062083" />
+      <inertia ixx="4.33507368102839E-06" ixy="8.31321371397514E-12" ixz="-1.63717540455618E-11" iyy="8.89789850261164E-06" iyz="3.34501127650135E-07" izz="4.92665747896934E-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_knuckle_left_inner.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_knuckle_left_inner.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint_lt_gripper_knuckle_left_inner" type="revolute">
+    <origin xyz="-0.00079195 0.0074222 -0.06378" rpy="0 0 0" />
+    <parent link="link_lt_gripper_base" />
+    <child link="link_lt_gripper_knuckle_left_inner" />
+    <axis xyz="1 0 0" />
+    <limit lower="0" upper="1.44862" effort="6" velocity="0.78540" />
+    <mimic joint="joint_lt_gripper_drive" multiplier="1" offset="0" />
+  </joint>
+  <link name="link_lt_gripper_knuckle_right_outer">
+    <inertial>
+      <origin xyz="2.81848398361E-05 0.0235652741269535 -0.0379497987923611" rpy="0 0 0" />
+      <mass value="0.0542841781980837" />
+      <inertia ixx="2.49252400290207E-05" ixy="1.55006019846684E-11" ixz="2.62589216274227E-11" iyy="2.61457712806372E-05" iyz="-3.14655803207556E-06" izz="3.63669809325367E-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_knuckle_right_outer.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_knuckle_right_outer.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint_lt_gripper_knuckle_right_outer" type="revolute">
+    <origin xyz="-0.00079195 -0.019008 -0.05" rpy="0 0 0" />
+    <parent link="link_lt_gripper_base" />
+    <child link="link_lt_gripper_knuckle_right_outer" />
+    <axis xyz="-1 0 0" />
+    <limit lower="0" upper="1.44862" effort="6" velocity="0.78540" />
+    <mimic joint="joint_lt_gripper_drive" multiplier="1" offset="0" />
+  </joint>
+  <link name="link_lt_gripper_finger_right">
+    <inertial>
+      <origin xyz="1.17830297459924E-05 0.0254574075050252 -0.0218146965213329" rpy="0 0 0" />
+      <mass value="0.0864606849680532" />
+      <inertia ixx="3.23998306352358E-05" ixy="1.91367598294277E-09" ixz="5.61632016171255E-09" iyy="3.47600582303323E-05" iyz="-2.11804532167411E-06" izz="5.51801482447027E-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_finger_right.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_finger_right.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint_lt_gripper_finger_right" type="revolute">
+    <origin xyz="0 -0.0043547 -0.04981" rpy="0 0 0" />
+    <parent link="link_lt_gripper_knuckle_right_outer" />
+    <child link="link_lt_gripper_finger_right" />
+    <axis xyz="1 0 0" />
+    <limit lower="0" upper="1.44862" effort="6" velocity="0.78540" />
+    <mimic joint="joint_lt_gripper_drive" multiplier="1" offset="0" />
+  </joint>
+  <link name="link_lt_gripper_knuckle_right_inner">
+    <inertial>
+      <origin xyz="4.43116565245756E-05 -0.00379719277771036 -0.0284917519280255" rpy="0 0 0" />
+      <mass value="0.0231471998062083" />
+      <inertia ixx="4.33507368102844E-06" ixy="8.31321371314128E-12" ixz="1.63717540521109E-11" iyy="8.89789850261162E-06" iyz="-3.34501127650164E-07" izz="4.92665747896941E-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_knuckle_right_inner.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.866666666666667 0.866666666666667 0.890196078431372 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="URDF_franka_corenetic_gripper/meshes/link_lt_gripper_knuckle_right_inner.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint_lt_gripper_knuckle_right_inner" type="revolute">
+    <origin xyz="-0.00079195 -0.0074378 -0.06378" rpy="0 0 0" />
+    <parent link="link_lt_gripper_base" />
+    <child link="link_lt_gripper_knuckle_right_inner" />
+    <axis xyz="-1 0 0" />
+    <limit lower="0" upper="1.44862" effort="6" velocity="0.78540" />
+    <mimic joint="joint_lt_gripper_drive" multiplier="1" offset="0" />
+  </joint>
+  <link name="link_lt_gripper_tcp">
+</link>
+  <joint name="joint_lt_gripper_tcp" type="fixed">
+    <origin xyz="0 0 -0.155" rpy="0 0 0" />
+    <parent link="link_lt_gripper_base" />
+    <child link="link_lt_gripper_tcp" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <!-- stable end-effector alias for runtime configs -->
+  <link name="corenetic_gripper_ee" />
+  <joint name="fr3_hand_tcp_joint" type="fixed">
+    <origin rpy="3.141592653589793 0 0" xyz="0 0 -0.0" />
+    <parent link="link_lt_gripper_tcp" />
+    <child link="corenetic_gripper_ee" />
+  </joint>
+</robot>

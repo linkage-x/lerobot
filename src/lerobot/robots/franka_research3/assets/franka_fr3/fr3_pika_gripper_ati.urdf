@@ -666,7 +666,7 @@
   </joint>
 
   <link name="pika_gripper_ee" />
-  <joint name="fr3_hand_tcp_joint" type="fixed">
+  <joint name="fr3_hand_tcp_joint" type="revolute">
     <origin rpy="3.1415926 -1.5707963 0" xyz="0.185 0 0" />
     <parent link="gripper_base_link" />
     <child link="pika_gripper_ee" />
