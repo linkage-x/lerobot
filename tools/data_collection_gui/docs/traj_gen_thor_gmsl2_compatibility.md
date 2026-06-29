@@ -62,6 +62,13 @@ EE pose 由多路硬同步相机估算，因此落在相机/PWM 时间轴上；*
 
 瓶颈是全图 AprilTag 检测（N 相机 × 3 cube × 全分辨率）。已做 **每相机检测一次、3 cube 共享**（`CubeTracker.detect_markers_raw` + `_blocks_from_raw`，数值与逐 cube 检测**完全一致**），dadada（7 相机 / 1251 帧）实测 ~16.5 分钟 → ~7.2 分钟（约 2.3×）。进一步可调 `cube_tracker.apriltag_detector.quad_decimate`（1.0→2.0）或 `--frame-step`。
 
+当前 Thor YAML 还默认设置 `processing.parallel_camera_workers: 4`，在每个
+processed frame 内按 camera stream 并行执行 AprilTag/OpenCV detector；GUI 和
+`run_april_cube_tracking_on_thor.sh` 都复用 `run_april_cube_tracking_local.sh`，
+所以这个并行行为两边一致。注意这是 CPU-backed detector 的 camera-level
+parallelism，不是 CUDA/GPU AprilTag kernel；如需排查性能或线程竞争，可临时设为
+`1` 回到串行行为。
+
 ## 真机验证（2026-06-25，nvidia@192.168.111.122）
 
 - `dadada_20260616_084743`（有 v3 parquet，走 v3 路径）：按钮 → `pose_ready`，3 episode 的 timeline 返回 left/right/head EE pose（ep0 603/603、ep1 394/394、ep2 254/291），ts 吻合 `pts_offset + N/60`。
