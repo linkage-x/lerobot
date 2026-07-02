@@ -203,6 +203,8 @@ class EpisodeHandle:
     stop_mono_ns: int = 0
     start_request_wall_s: float = 0.0
     stop_request_wall_s: float = 0.0
+    split_schedule_ok: bool = True
+    split_schedule_failures: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -411,6 +413,19 @@ def _apply_event_to_proxy(proxy: "_StreamProxy", event: tuple) -> None:
             )
         proxy.episode_done_evt.set()
         return
+    if kind == "split_scheduled":
+        if len(event) < 5:
+            return
+        label = str(event[1])
+        payload = {
+            "target_mono_ns": int(event[2]),
+            "running_time_ns": int(event[3]),
+            "scheduled_mono_ns": int(event[4]),
+        }
+        with proxy._split_cv:
+            proxy.split_scheduled[label] = payload
+            proxy._split_cv.notify_all()
+        return
     if kind == "disconnected":
         proxy.disconnected_evt.set()
         return
@@ -449,6 +464,8 @@ class _StreamProxy:
         # [-1]/len(), both of which deque supports.
         self.fragment_history: Deque[FragmentInfo] = deque(maxlen=256)
         self.errors: list[StreamError] = []
+        self.split_scheduled: dict[str, dict[str, int]] = {}
+        self._split_cv = threading.Condition()
         self._on_fragment_opened_cb = on_fragment_opened
         # Sticky "the recording pipeline died" marker. Unlike ``errors`` (drained
         # by poll_errors), this survives error draining so the preview watchdog
@@ -554,6 +571,7 @@ class _StreamProxy:
     ) -> None:
         self.episode_done_evt.clear()
         self.last_episode_fragment = None
+        self._clear_split_scheduled("start")
         self.cmd_q.put((
             "start_episode_at", str(episode_dir), int(target_mono_ns),
             int(target_frame_index), int(frame_period_ns),
@@ -570,6 +588,7 @@ class _StreamProxy:
         target_frame_index: int = 0,
         frame_period_ns: int = 0,
     ) -> None:
+        self._clear_split_scheduled("stop")
         self.cmd_q.put((
             "stop_episode_at", int(target_mono_ns), int(expected_frames),
             int(target_frame_index), int(frame_period_ns),
@@ -587,6 +606,27 @@ class _StreamProxy:
 
     def wait_episode_done(self, timeout_s: float) -> bool:
         return self.episode_done_evt.wait(timeout_s)
+
+    def _clear_split_scheduled(self, label: str) -> None:
+        with self._split_cv:
+            self.split_scheduled.pop(label, None)
+
+    def wait_split_scheduled(
+        self,
+        label: str,
+        target_mono_ns: int,
+        timeout_s: float,
+    ) -> dict[str, int] | None:
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._split_cv:
+            while True:
+                payload = self.split_scheduled.get(label)
+                if payload is not None and payload.get("target_mono_ns") == int(target_mono_ns):
+                    return dict(payload)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._split_cv.wait(remaining)
 
     def disconnect(self, *, grace_s: float = 3.0) -> None:
         try:
@@ -961,6 +1001,47 @@ class PersistentCameraSession:
         expected_frames = max(1, stop_frame_index - int(handle.start_frame_index))
         return self._target_for_frame_index(stop_frame_index), stop_frame_index, expected_frames
 
+    def _wait_all_split_scheduled(self, label: str, target_mono_ns: int) -> list[str]:
+        """Require every active worker to arm its split before the shared target.
+
+        This is the software-level synchronization guarantee: all independent
+        worker processes must confirm that splitmuxsink has been given the same
+        future target before that target time arrives. It does not assert sensor
+        exposure identity; that remains the job of hardware trigger sync.
+        """
+        failures: list[str] = []
+        for proxy in self._streams.values():
+            timeout_s = max(0.0, (int(target_mono_ns) - time.monotonic_ns()) / 1e9)
+            payload = proxy.wait_split_scheduled(label, target_mono_ns, timeout_s)
+            if payload is None:
+                failures.append(
+                    f"{proxy.cfg.name}(no {label} split_scheduled before target)"
+                )
+                continue
+            scheduled_mono_ns = int(payload.get("scheduled_mono_ns", 0))
+            if scheduled_mono_ns > int(target_mono_ns):
+                late_ms = (scheduled_mono_ns - int(target_mono_ns)) / 1e6
+                failures.append(f"{proxy.cfg.name}({label} scheduled {late_ms:.2f}ms late)")
+        if failures:
+            logger.error(
+                "%s split scheduling did not meet shared target: %s",
+                label, ", ".join(failures),
+            )
+        return failures
+
+    @staticmethod
+    def _mark_split_schedule_failures(
+        handle: EpisodeHandle,
+        label: str,
+        failures: list[str],
+    ) -> None:
+        if not failures:
+            return
+        handle.split_schedule_ok = False
+        handle.split_schedule_failures.extend(
+            f"{label}: {failure}" for failure in failures
+        )
+
     def start_episode(self, episode_dir: Path, idx: int) -> EpisodeHandle:
         if not self._streams:
             raise RuntimeError("start_episode() before connect()")
@@ -987,6 +1068,8 @@ class PersistentCameraSession:
                 start_frame_index=start_frame_index,
                 start_request_wall_s=start_request_wall_s,
             )
+        failures = self._wait_all_split_scheduled("start", target_mono_ns)
+        self._mark_split_schedule_failures(handle, "start", failures)
         return handle
 
     def schedule_stop_episode(self, handle: EpisodeHandle) -> EpisodeHandle:
@@ -1006,6 +1089,8 @@ class PersistentCameraSession:
                     target_frame_index=stop_frame_index,
                     frame_period_ns=handle.frame_period_ns or self._frame_period_ns,
                 )
+        failures = self._wait_all_split_scheduled("stop", target_mono_ns)
+        self._mark_split_schedule_failures(handle, "stop", failures)
         return handle
 
     def wait_episode_done(self, handle: EpisodeHandle) -> EpisodeHandle:
@@ -1269,6 +1354,8 @@ class PersistentCameraSession:
             "start_frame_index": handle.start_frame_index,
             "stop_frame_index": handle.stop_frame_index,
             "expected_video_frames": handle.expected_video_frames,
+            "split_schedule_ok": handle.split_schedule_ok,
+            "split_schedule_failures": handle.split_schedule_failures,
             "duration_s": handle.stop_wall_s - handle.t0_wall_s,
             "sync_reference": {
                 "camera_first_wall_s": {
@@ -1420,6 +1507,14 @@ def _run_demo(args: argparse.Namespace) -> int:
         session.wait_episode_done(handle)
         actual = max(0.0, (handle.stop_mono_ns - handle.t0_mono_ns) / 1e9)
         session.write_episode_meta(handle)
+        if not handle.split_schedule_ok:
+            session.discard_episode(handle)
+            print(
+                "episode {} discarded: split scheduling missed shared target ({})"
+                .format(idx, "; ".join(handle.split_schedule_failures)),
+                flush=True,
+            )
+            return handle, actual
         sizes = ", ".join(
             f"{name}={_human_size(info.path)}@{info.first_pts_s if info.first_pts_s is not None else -1:.3f}s"
             for name, info in handle.fragments.items()

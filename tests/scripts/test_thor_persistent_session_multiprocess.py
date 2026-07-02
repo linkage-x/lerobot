@@ -974,11 +974,16 @@ def test_persistent_session_stop_episode_collects_fragments_from_each_proxy(tmp_
 
     ep_dir = tmp_path / "episode_000004"
     ep_dir.mkdir()
+
+    def _ack_start(proxy):
+        cmd = proxy.cmd_q.get(timeout=0.5)
+        ps._apply_event_to_proxy(proxy, (
+            "split_scheduled", "start", cmd[2], 123, time.monotonic_ns(),
+        ))
+
+    threading.Thread(target=_ack_start, args=(p2,), daemon=True).start()
+    threading.Thread(target=_ack_start, args=(p3,), daemon=True).start()
     handle = session.start_episode(ep_dir, 4)
-    # Drain the start-episode commands from each proxy's cmd_q so the test
-    # doesn't have to assert on them here.
-    p2.cmd_q.get(timeout=0.5)
-    p3.cmd_q.get(timeout=0.5)
 
     # Simulate the workers reporting episode_done with a fragment after a
     # short delay (mimicking finalize_grace_s).
@@ -997,10 +1002,15 @@ def test_persistent_session_stop_episode_collects_fragments_from_each_proxy(tmp_
     threading.Thread(target=_later, args=(p2, 2), daemon=True).start()
     threading.Thread(target=_later, args=(p3, 3), daemon=True).start()
 
+    def _ack_stop(proxy):
+        cmd = proxy.cmd_q.get(timeout=0.5)
+        ps._apply_event_to_proxy(proxy, (
+            "split_scheduled", "stop", cmd[1], 456, time.monotonic_ns(),
+        ))
+
+    threading.Thread(target=_ack_stop, args=(p2,), daemon=True).start()
+    threading.Thread(target=_ack_stop, args=(p3,), daemon=True).start()
     session.stop_episode(handle)
-    # stop_episode also pushes its own command — drain so the test is clean.
-    p2.cmd_q.get(timeout=0.5)
-    p3.cmd_q.get(timeout=0.5)
 
     assert set(handle.fragments.keys()) == {"cam_02", "cam_03"}
     assert handle.fragments["cam_02"].fragment_id == 1
@@ -1022,9 +1032,20 @@ def test_persistent_session_start_stop_commands_share_frame_grid(tmp_path):
     session._streams = {2: p2, 3: p3}
 
     ep_dir = tmp_path / "episode_000005"
+    start_cmds = {}
+
+    def _capture_start(proxy, key):
+        cmd = proxy.cmd_q.get(timeout=0.5)
+        start_cmds[key] = cmd
+        ps._apply_event_to_proxy(proxy, (
+            "split_scheduled", "start", cmd[2], 123, time.monotonic_ns(),
+        ))
+
+    threading.Thread(target=_capture_start, args=(p2, 2), daemon=True).start()
+    threading.Thread(target=_capture_start, args=(p3, 3), daemon=True).start()
     handle = session.start_episode(ep_dir, 5)
-    start_cmd_2 = p2.cmd_q.get(timeout=0.5)
-    start_cmd_3 = p3.cmd_q.get(timeout=0.5)
+    start_cmd_2 = start_cmds[2]
+    start_cmd_3 = start_cmds[3]
 
     assert start_cmd_2[0] == "start_episode_at"
     assert start_cmd_3[0] == "start_episode_at"
@@ -1032,9 +1053,20 @@ def test_persistent_session_start_stop_commands_share_frame_grid(tmp_path):
     assert start_cmd_2[3] == handle.start_frame_index
     assert start_cmd_2[4] == handle.frame_period_ns
 
+    stop_cmds = {}
+
+    def _capture_stop(proxy, key):
+        cmd = proxy.cmd_q.get(timeout=0.5)
+        stop_cmds[key] = cmd
+        ps._apply_event_to_proxy(proxy, (
+            "split_scheduled", "stop", cmd[1], 456, time.monotonic_ns(),
+        ))
+
+    threading.Thread(target=_capture_stop, args=(p2, 2), daemon=True).start()
+    threading.Thread(target=_capture_stop, args=(p3, 3), daemon=True).start()
     session.schedule_stop_episode(handle)
-    stop_cmd_2 = p2.cmd_q.get(timeout=0.5)
-    stop_cmd_3 = p3.cmd_q.get(timeout=0.5)
+    stop_cmd_2 = stop_cmds[2]
+    stop_cmd_3 = stop_cmds[3]
 
     assert stop_cmd_2[0] == "stop_episode_at"
     assert stop_cmd_3[0] == "stop_episode_at"
@@ -1046,6 +1078,73 @@ def test_persistent_session_start_stop_commands_share_frame_grid(tmp_path):
         handle.stop_frame_index - handle.start_frame_index
     )
     assert handle.stop_mono_ns == session._target_for_frame_index(handle.stop_frame_index)
+
+
+def test_persistent_session_missing_start_split_ack_marks_episode_invalid(tmp_path):
+    cfgs = [
+        ps.StreamConfig(sid=sid, name=f"cam_{sid:02d}", fps=60)
+        for sid in (2, 3)
+    ]
+    session = ps.PersistentCameraSession(
+        cfgs,
+        tmp_path / "warmup",
+        target_slice_guard_s=0.01,
+    )
+    p2 = _make_proxy(tmp_path, sid=2, name="cam_02")
+    p3 = _make_proxy(tmp_path, sid=3, name="cam_03")
+    session._streams = {2: p2, 3: p3}
+
+    def _ack_start(proxy):
+        cmd = proxy.cmd_q.get(timeout=0.5)
+        ps._apply_event_to_proxy(proxy, (
+            "split_scheduled", "start", cmd[2], 123, time.monotonic_ns(),
+        ))
+
+    threading.Thread(target=_ack_start, args=(p2,), daemon=True).start()
+    handle = session.start_episode(tmp_path / "episode_000006", 6)
+
+    assert not handle.split_schedule_ok
+    assert any("start:" in failure for failure in handle.split_schedule_failures)
+    assert any("cam_03" in failure for failure in handle.split_schedule_failures)
+
+
+def test_persistent_session_missing_stop_split_ack_marks_episode_invalid(tmp_path):
+    cfgs = [
+        ps.StreamConfig(sid=sid, name=f"cam_{sid:02d}", fps=60)
+        for sid in (2, 3)
+    ]
+    session = ps.PersistentCameraSession(
+        cfgs,
+        tmp_path / "warmup",
+        target_slice_guard_s=0.01,
+    )
+    p2 = _make_proxy(tmp_path, sid=2, name="cam_02")
+    p3 = _make_proxy(tmp_path, sid=3, name="cam_03")
+    session._streams = {2: p2, 3: p3}
+
+    def _ack_start(proxy):
+        cmd = proxy.cmd_q.get(timeout=0.5)
+        ps._apply_event_to_proxy(proxy, (
+            "split_scheduled", "start", cmd[2], 123, time.monotonic_ns(),
+        ))
+
+    threading.Thread(target=_ack_start, args=(p2,), daemon=True).start()
+    threading.Thread(target=_ack_start, args=(p3,), daemon=True).start()
+    handle = session.start_episode(tmp_path / "episode_000007", 7)
+    assert handle.split_schedule_ok
+
+    def _ack_stop(proxy):
+        cmd = proxy.cmd_q.get(timeout=0.5)
+        ps._apply_event_to_proxy(proxy, (
+            "split_scheduled", "stop", cmd[1], 456, time.monotonic_ns(),
+        ))
+
+    threading.Thread(target=_ack_stop, args=(p2,), daemon=True).start()
+    session.schedule_stop_episode(handle)
+
+    assert not handle.split_schedule_ok
+    assert any("stop:" in failure for failure in handle.split_schedule_failures)
+    assert any("cam_03" in failure for failure in handle.split_schedule_failures)
 
 
 def test_persistent_session_start_episode_before_connect_raises(tmp_path):

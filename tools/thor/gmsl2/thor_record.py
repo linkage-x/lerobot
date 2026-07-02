@@ -490,6 +490,8 @@ def _write_episode_meta(
             "start_frame_index": handle.start_frame_index,
             "stop_frame_index": handle.stop_frame_index,
             "expected_video_frames": handle.expected_video_frames,
+            "split_schedule_ok": handle.split_schedule_ok,
+            "split_schedule_failures": handle.split_schedule_failures,
             "camera_first_wall_s": {
                 name: info.first_wall_s for name, info in fragments.items()
             },
@@ -1155,64 +1157,81 @@ def main(argv: list[str] | None = None) -> int:
                 ep_idx, wall_start, ep_dir, target_start_delay_ms, start_schedule_ms,
             )
             _sleep_until_mono_ns(handle.t0_mono_ns)
-            if box_started:
+            start_sync_failed = not handle.split_schedule_ok
+            if start_sync_failed:
+                details = "; ".join(handle.split_schedule_failures)
+                _emit(
+                    "WARNING: camera split scheduling missed the shared start target; "
+                    f"this episode will be discarded. {details}"
+                )
+            box_episode_started = False
+            if box_started and not start_sync_failed:
                 box.start_recording(t_start)
+                box_episode_started = True
             box_snapshots: list[dict[str, Any]] = []
             target_s = cfg.episode_time_s if cfg.episode_time_s > 0 else float("inf")
             last_progress_at = 0.0
             box_sample_at = 0.0
             stop_episode = False
-            stop_reason = "operator_save"
-            while True:
-                now = time.monotonic()
-                elapsed = max(0.0, time.time() - t_start)
-                if elapsed >= target_s:
-                    stop_reason = "duration_reached"
-                    break
-                if cmd_queue:
-                    nxt = cmd_queue[0]
-                    if nxt.kind in ("save", "discard", "quit"):
-                        cmd_queue.pop(0)
-                        stop_reason = nxt.kind
-                        if nxt.kind == "quit":
-                            stop_episode = True
-                            stop_event.set()
+            stop_reason = "sync_schedule_failed" if start_sync_failed else "operator_save"
+            if not start_sync_failed:
+                while True:
+                    now = time.monotonic()
+                    elapsed = max(0.0, time.time() - t_start)
+                    if elapsed >= target_s:
+                        stop_reason = "duration_reached"
                         break
-                # Persistent-pipeline equivalent of "stream exited early":
-                # GLib bus dispatches ERROR messages into pcs._errors via the
-                # signal-watch on its MainLoop thread. PR1 burn-in measured
-                # dispatch at ~0.14ms so this poll loop sees them within
-                # ~50ms of the actual error.
-                stream_errs = _poll_stream_health(context="recording")
-                if stream_errs and cfg.stop_on_stream_exit:
+                    if cmd_queue:
+                        nxt = cmd_queue[0]
+                        if nxt.kind in ("save", "discard", "quit"):
+                            cmd_queue.pop(0)
+                            stop_reason = nxt.kind
+                            if nxt.kind == "quit":
+                                stop_episode = True
+                                stop_event.set()
+                            break
+                    # Persistent-pipeline equivalent of "stream exited early":
+                    # GLib bus dispatches ERROR messages into pcs._errors via the
+                    # signal-watch on its MainLoop thread. PR1 burn-in measured
+                    # dispatch at ~0.14ms so this poll loop sees them within
+                    # ~50ms of the actual error.
+                    stream_errs = _poll_stream_health(context="recording")
+                    if stream_errs and cfg.stop_on_stream_exit:
+                        if box_episode_started:
+                            snap = box.read()
+                            snap["t_relative_s"] = elapsed
+                            box_snapshots.append(snap)
+                        details = _format_stream_errors(stream_errs)
+                        _emit(f"Stream exited early: {details}")
+                        stop_reason = "stream_exit"
+                        break
+                    # Preview lifecycle (incl. stale watchdog) runs in
+                    # _preview_control_loop across the whole session, recording included.
+                    if now - last_progress_at > 0.5:
+                        approx_frames = int(elapsed * cfg.cameras.fps)
+                        _emit(f"Recorded {approx_frames} frames for the current episode.")
+                        last_progress_at = now
                     if box_started:
+                        last_box_live_at = _emit_box_live(box, last_emit_s=last_box_live_at)
+                    if box_episode_started and now - box_sample_at > 0.5:
                         snap = box.read()
                         snap["t_relative_s"] = elapsed
                         box_snapshots.append(snap)
-                    details = _format_stream_errors(stream_errs)
-                    _emit(f"Stream exited early: {details}")
-                    stop_reason = "stream_exit"
-                    break
-                # Preview lifecycle (incl. stale watchdog) runs in
-                # _preview_control_loop across the whole session, recording included.
-                if now - last_progress_at > 0.5:
-                    approx_frames = int(elapsed * cfg.cameras.fps)
-                    _emit(f"Recorded {approx_frames} frames for the current episode.")
-                    last_progress_at = now
-                if box_started:
-                    last_box_live_at = _emit_box_live(box, last_emit_s=last_box_live_at)
-                if box_started and now - box_sample_at > 0.5:
-                    snap = box.read()
-                    snap["t_relative_s"] = elapsed
-                    box_snapshots.append(snap)
-                    box_sample_at = now
-                time.sleep(0.05)
+                        box_sample_at = now
+                    time.sleep(0.05)
 
             pcs.schedule_stop_episode(handle)
+            if not handle.split_schedule_ok and stop_reason != "sync_schedule_failed":
+                details = "; ".join(handle.split_schedule_failures)
+                _emit(
+                    "WARNING: camera split scheduling missed the shared stop target; "
+                    f"this episode will be discarded. {details}"
+                )
+                stop_reason = "sync_schedule_failed"
             capture_end_mono_s = handle.stop_mono_s
             wall_end = datetime.fromtimestamp(handle.stop_wall_s, timezone.utc).isoformat()
             duration_s = max(0.0, handle.stop_wall_s - t_start)
-            if box_started:
+            if box_episode_started:
                 _sleep_until_mono_ns(handle.stop_mono_ns)
                 recorded_samples = box.stop_recording()
             else:
@@ -1225,7 +1244,7 @@ def main(argv: list[str] | None = None) -> int:
             cleanup_duration_s = max(0.0, time.monotonic() - capture_end_mono_s)
             pts_offset = _pts_offset_from_handle(handle)
 
-            decision = stop_reason
+            decision = "sync_schedule_failed" if not handle.split_schedule_ok else stop_reason
             if decision == "duration_reached":
                 # Auto-save when the episode wall clock ran out unless the operator
                 # discards explicitly within a short window.
