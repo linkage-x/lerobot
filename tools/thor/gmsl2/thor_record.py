@@ -79,6 +79,15 @@ def _emit(text: str) -> None:
     print(text, flush=True)
 
 
+def _sleep_until_mono_ns(target_mono_ns: int) -> None:
+    """Sleep until a monotonic-ns target while keeping signal latency bounded."""
+    while True:
+        remaining_s = (int(target_mono_ns) - time.monotonic_ns()) / 1e9
+        if remaining_s <= 0:
+            return
+        time.sleep(min(0.02, remaining_s))
+
+
 # Healthy BOX sensors stream at ~199 Hz (touch ~50 Hz). A box that answers
 # discovery but has stalled/aged out shows 0 Hz; a degraded one limps at ~8 Hz.
 # 30 Hz cleanly separates healthy (>=50) from both failure modes and is the floor
@@ -334,7 +343,7 @@ def _drain_until(queue: list[StdinCommand], accept: tuple[str, ...],
 
 
 def _pts_offset_from_handle(handle: ps.EpisodeHandle) -> float | None:
-    """Per-camera (wall_s - split_now_wall_s), averaged across streams.
+    """Per-camera (first fragment wall_s - target start wall_s), averaged.
 
     This replaces the legacy ffprobe-based first-PTS extraction. PR1 burn-in
     on Thor showed that splitmuxsink's `format-location-full` callback's
@@ -344,8 +353,8 @@ def _pts_offset_from_handle(handle: ps.EpisodeHandle) -> float | None:
     cross-stream clock is host wall time, captured into FragmentInfo at
     callback time.
 
-    We return one scalar (the mean per-camera delay between split-now and
-    the first sample actually opening on disk) so callers that previously
+    We return one scalar (the mean per-camera delay between the scheduled
+    target start and the first sample actually opening on disk) so callers that previously
     passed ``pts_offset_s`` to ``thor_lerobot_v3.write_box_lerobot_v3_episode``
     keep working unchanged. The full per-camera breakdown is preserved in
     meta.json under ``sync_reference.camera_first_wall_s``.
@@ -361,7 +370,7 @@ def _pts_offset_from_handle(handle: ps.EpisodeHandle) -> float | None:
         return None
     avg = sum(deltas) / len(deltas)
     logger.info(
-        "pts_offset (avg first_wall - split_now across %d cams): %.4fs",
+        "pts_offset (avg first_wall - target_start across %d cams): %.4fs",
         len(deltas), avg,
     )
     return avg
@@ -386,6 +395,23 @@ def _write_sensor_samples(
     return path
 
 
+def _clip_sensor_samples(
+    samples: dict[str, list[bc.SensorSample]],
+    start_wall_s: float,
+    stop_wall_s: float,
+) -> dict[str, list[bc.SensorSample]]:
+    """Keep BOX samples inside the same target-time interval as the cameras."""
+    if not samples or stop_wall_s <= start_wall_s:
+        return samples
+    return {
+        sid: [
+            sample for sample in sample_list
+            if start_wall_s <= sample.wall_time_s <= stop_wall_s
+        ]
+        for sid, sample_list in samples.items()
+    }
+
+
 def _write_episode_meta(
     handle: ps.EpisodeHandle,
     cfg: gr.RecorderConfig,
@@ -404,7 +430,8 @@ def _write_episode_meta(
     PR2 model:
 
       * ``t0_wall_s`` / ``t0_mono_s``: recording origin (host wall / monotonic
-        clock) shared by cameras and BOX; BOX samples carry
+        clock) shared by cameras and BOX. In the target-slice model this is the
+        scheduled future split time, not the operator command time; BOX samples carry
         ``t_relative_s = wall - t0_wall_s``.
       * ``camera_first_wall_s``: per-camera wall time when the new fragment
         actually opened (from format-location-full callback). This is the
@@ -452,18 +479,24 @@ def _write_episode_meta(
         "sync_reference": {
             "t0_wall_s": handle.t0_wall_s,
             "t0_mono_s": handle.t0_mono_s,
+            "t0_mono_ns": handle.t0_mono_ns,
+            "stop_wall_s": handle.stop_wall_s,
+            "stop_mono_s": handle.stop_mono_s,
+            "stop_mono_ns": handle.stop_mono_ns,
+            "start_request_wall_s": handle.start_request_wall_s,
+            "stop_request_wall_s": handle.stop_request_wall_s,
+            "target_slice_guard_s": ps.DEFAULT_TARGET_SLICE_GUARD_S,
             "camera_first_wall_s": {
                 name: info.first_wall_s for name, info in fragments.items()
             },
             "note": (
-                "Persistent-pipeline model (PR2). t0_wall_s is the recording "
-                "origin (host time when start_episode() emitted split-now); "
-                "BOX snapshots carry t_relative_s = time.time() - t0_wall_s. "
-                "camera_first_wall_s is the host time each splitmuxsink "
-                "actually opened its new fragment — use this as the "
-                "cross-camera alignment anchor (~20ms spread in PR1 burn-in). "
-                "Per-stream first PTS is in cameras[].first_pts_s (single-"
-                "stream only, NOT cross-camera comparable)."
+                "Persistent-pipeline target-slice model. t0_wall_s/t0_mono_ns "
+                "and stop_wall_s/stop_mono_ns are shared future target times "
+                "used for split-at-running-time on every camera; BOX recording "
+                "is started/stopped against the same host target times. "
+                "camera_first_wall_s is the host time each splitmuxsink actually "
+                "opened its new fragment. Per-stream first PTS is in cameras[]."
+                "first_pts_s (single-stream only, NOT cross-camera comparable)."
             ),
         },
         "max96726_locked_sids": locked,
@@ -1087,21 +1120,12 @@ def main(argv: list[str] | None = None) -> int:
                 break
 
             ep_dir = cfg.dataset_root / "episodes" / f"episode_{ep_idx:06d}"
-            wall_start = datetime.now(timezone.utc).isoformat()
-            t0_split_start_mono = time.monotonic()
-            handle = pcs.start_episode(ep_dir, ep_idx)
-            t_start = handle.t0_wall_s
-            split_emit_ms = (time.monotonic() - t0_split_start_mono) * 1000
-            logger.info(
-                "episode %d started @ %s -> %s (split-now emit %.1fms)",
-                ep_idx, wall_start, ep_dir, split_emit_ms,
-            )
             if box_started:
                 # Pre-record health check: if the box stalled/degraded between
                 # Connect and Start (or mid-session), it answers discovery but
                 # pushes no (or too-sparse) data, so this episode would record
-                # empty/sparse box data. Surface it instead of failing silently --
-                # the operator can discard + power-cycle.
+                # empty/sparse box data. Surface it before scheduling the
+                # target camera split so the guard window is not consumed here.
                 healthy, peak_hz = _box_stream_health(box.observed_rates())
                 if not healthy:
                     _emit(
@@ -1109,6 +1133,21 @@ def main(argv: list[str] | None = None) -> int:
                         "this episode will have missing/sparse box data. Discard it, "
                         "power-cycle the box, and reconnect."
                     )
+
+            t0_schedule_mono = time.monotonic()
+            handle = pcs.start_episode(ep_dir, ep_idx)
+            t_start = handle.t0_wall_s
+            wall_start = datetime.fromtimestamp(t_start, timezone.utc).isoformat()
+            start_schedule_ms = (time.monotonic() - t0_schedule_mono) * 1000
+            target_start_delay_ms = max(
+                0.0, (handle.t0_mono_ns - time.monotonic_ns()) / 1e6,
+            )
+            logger.info(
+                "episode %d scheduled @ %s -> %s (target in %.1fms, dispatch %.1fms)",
+                ep_idx, wall_start, ep_dir, target_start_delay_ms, start_schedule_ms,
+            )
+            _sleep_until_mono_ns(handle.t0_mono_ns)
+            if box_started:
                 box.start_recording(t_start)
             box_snapshots: list[dict[str, Any]] = []
             target_s = cfg.episode_time_s if cfg.episode_time_s > 0 else float("inf")
@@ -1118,7 +1157,7 @@ def main(argv: list[str] | None = None) -> int:
             stop_reason = "operator_save"
             while True:
                 now = time.monotonic()
-                elapsed = time.time() - t_start
+                elapsed = max(0.0, time.time() - t_start)
                 if elapsed >= target_s:
                     stop_reason = "duration_reached"
                     break
@@ -1161,16 +1200,20 @@ def main(argv: list[str] | None = None) -> int:
                     box_sample_at = now
                 time.sleep(0.05)
 
-            capture_end_wall_s = time.time()
-            capture_end_mono_s = time.monotonic()
-            wall_end = datetime.now(timezone.utc).isoformat()
-            duration_s = capture_end_wall_s - t_start
+            pcs.schedule_stop_episode(handle)
+            capture_end_mono_s = handle.stop_mono_s
+            wall_end = datetime.fromtimestamp(handle.stop_wall_s, timezone.utc).isoformat()
+            duration_s = max(0.0, handle.stop_wall_s - t_start)
             if box_started:
+                _sleep_until_mono_ns(handle.stop_mono_ns)
                 recorded_samples = box.stop_recording()
             else:
                 recorded_samples = {}
+            recorded_samples = _clip_sensor_samples(
+                recorded_samples, t_start, handle.stop_wall_s,
+            )
 
-            pcs.stop_episode(handle)
+            pcs.wait_episode_done(handle)
             cleanup_duration_s = max(0.0, time.monotonic() - capture_end_mono_s)
             pts_offset = _pts_offset_from_handle(handle)
 
@@ -1194,7 +1237,8 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     payload = json.loads(meta_path.read_text())
                     payload["cleanup_duration_s"] = cleanup_duration_s
-                    payload["split_emit_ms"] = split_emit_ms
+                    payload["start_schedule_ms"] = start_schedule_ms
+                    payload["target_start_delay_ms"] = target_start_delay_ms
                     meta_path.write_text(json.dumps(payload, indent=2))
                 except (OSError, json.JSONDecodeError) as exc:
                     logger.warning("failed to annotate cleanup duration: %s", exc)

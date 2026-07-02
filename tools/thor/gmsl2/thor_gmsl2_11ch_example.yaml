@@ -67,8 +67,8 @@ sensors:
       replay_warmup_s: 1.0  # preview skips the first second while Argus ISP/AWB color settles; raw MKV frames are kept
       # Hardware encoder configuration -- consumed by nvv4l2h265enc.
       codec: h265
-      bitrate_kbps: 20000
-      iframe_interval: 60      # one keyframe per second @60 fps
+      bitrate_kbps: 40000      # higher bitrate offsets all-IDR compression loss
+      iframe_interval: 1       # every frame is IDR for deterministic 60 Hz slicing
       preset_level: 1          # 1=UltraFastPreset, 4=SlowPreset (NV preset enum)
       control_rate: 1          # 1 = constant-bitrate, 0 = variable
       profile: main            # h265: main / main10 ; h264: high / main / baseline

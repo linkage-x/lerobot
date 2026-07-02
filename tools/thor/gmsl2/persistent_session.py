@@ -22,21 +22,21 @@ Each camera gets a long-lived ``Gst.Pipeline``::
           location=<warmup-dir>/cam_NN_warmup_%05d.mkv
 
 The pipeline is created with the Python ``gi.repository.Gst`` binding so we
-can ``emit("split-now")`` on the splitmuxsink at episode boundaries — that's
-the part ``gst-launch-1.0`` cannot do from CLI.
+can schedule ``split-at-running-time`` on the splitmuxsink at episode
+boundaries — that's the part ``gst-launch-1.0`` cannot do from CLI.
 
 State machine per stream::
 
     WARMUP   -- format-location returns /tmp/cam_NN_warmup_*.mkv
        │
-       └── start_episode() -> emit("force-IDR"), emit("split-now")
+       └── start_episode() -> split-at-running-time(shared target)
               │
               ▼
     EPISODE  -- format-location returns <episode-dir>/cam_NN.mkv
        │       first-sample PTS recorded into the EpisodeHandle for L3b
        │       alignment downstream
        │
-       └── stop_episode() -> emit("split-now")
+       └── stop_episode() -> split-at-running-time(shared target)
               │
               ▼
     WARMUP   -- back to /tmp until next start_episode()
@@ -44,10 +44,10 @@ State machine per stream::
 Discard
 -------
 
-Discard is implemented as "split now + delete the just-written fragment":
+Discard is implemented as "close the episode fragment + delete it":
 
     discard_episode(handle):
-        emit("split-now") on all muxes  # closes the EPISODE fragment
+        schedule the shared stop target  # closes the EPISODE fragment
         wait_for_finalize()              # async-finalize must drain to disk
         unlink <episode-dir>/cam_*.mkv
 
@@ -81,6 +81,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import multiprocessing as mp
 import queue as queue_module
 import shutil
@@ -116,8 +117,8 @@ class StreamConfig:
     height: int = 1080
     fps: int = 60
     codec: str = "h265"           # h264 | h265
-    bitrate_kbps: int = 20000
-    iframe_interval: int = 30
+    bitrate_kbps: int = 40000
+    iframe_interval: int = 1
     preset_level: int = 1
     control_rate: int = 1
     sensor_mode: int = 0
@@ -137,11 +138,25 @@ class StreamConfig:
 # Bounded wait for splitmuxsink to finalize the just-closed EPISODE fragment
 # to disk. GStreamer 1.18+ posts a ``splitmuxsink-fragment-closed`` element
 # message when async-finalize completes; the worker waits for it instead of
-# blind-sleeping. This is only the fallback ceiling — in the normal case the
-# message lands within a few ms of the stop split-now and the worker proceeds
-# immediately. Kept module-level so the parent's stop_episode timeout stays in
-# sync with the worker's worst-case finalize wait.
+# blind-sleeping. This is only the fallback ceiling; in the normal case the
+# message lands within a few ms of the scheduled stop target and the worker
+# proceeds immediately. Kept module-level so the parent's stop_episode timeout
+# stays in sync with the worker's worst-case finalize wait.
 FINALIZE_FRAGMENT_TIMEOUT_S = 3.0
+DEFAULT_TARGET_SLICE_GUARD_S = 0.5
+
+
+def _target_wall_from_mono_ns(target_mono_ns: int) -> float:
+    """Map a future monotonic target to wall time using the current host pair."""
+    now_mono_ns = time.monotonic_ns()
+    now_wall_s = time.time()
+    return now_wall_s + (int(target_mono_ns) - now_mono_ns) / 1e9
+
+
+def _frame_period_ns(fps: int) -> int:
+    if fps <= 0:
+        raise ValueError(f"fps must be positive, got {fps}")
+    return max(1, int(round(1_000_000_000 / float(fps))))
 
 
 # Latest recorder-owned preview frames. The gateway serves these files while
@@ -174,11 +189,16 @@ class EpisodeHandle:
 
     idx: int
     directory: Path
-    t0_wall_s: float           # host wall time just before split-now emit
+    t0_wall_s: float           # shared target wall time for the first frame
     t0_mono_s: float
+    t0_mono_ns: int
     # name -> fragment opened in EPISODE state for that stream
     fragments: dict[str, FragmentInfo] = field(default_factory=dict)
     stop_wall_s: float = 0.0
+    stop_mono_s: float = 0.0
+    stop_mono_ns: int = 0
+    start_request_wall_s: float = 0.0
+    stop_request_wall_s: float = 0.0
 
 
 @dataclass
@@ -259,7 +279,7 @@ def build_pipeline_desc(stream: StreamConfig, warmup_location: str) -> str:
         # nvv4l2h{264,265}enc distinguishes I-frame interval (iframeinterval)
         # from IDR-frame interval (idrinterval). splitmuxsink can only cut on
         # an IDR boundary, so we pin both to the same period — otherwise the
-        # default idrinterval (~256 frames on JetPack 6) makes split-now
+        # default idrinterval (~256 frames on JetPack 6) makes split requests
         # spread the actual cut across several seconds across cameras.
         encoder = (
             f"{enc_factory} bitrate={stream.bitrate_kbps * 1000} "
@@ -518,8 +538,16 @@ class _StreamProxy:
         self.last_episode_fragment = None
         self.cmd_q.put(("start_episode", str(episode_dir)))
 
+    def start_episode_at(self, episode_dir: Path, target_mono_ns: int) -> None:
+        self.episode_done_evt.clear()
+        self.last_episode_fragment = None
+        self.cmd_q.put(("start_episode_at", str(episode_dir), int(target_mono_ns)))
+
     def stop_episode(self) -> None:
         self.cmd_q.put(("stop_episode",))
+
+    def stop_episode_at(self, target_mono_ns: int) -> None:
+        self.cmd_q.put(("stop_episode_at", int(target_mono_ns)))
 
     def roll_warmup(self) -> None:
         """Ask the worker to roll its open warmup fragment (idle maintenance)."""
@@ -595,6 +623,7 @@ class PersistentCameraSession:
         connect_stable_s: float = 0.0,
         first_fragment_timeout_s: float = 0.0,
         two_phase_connect: bool = False,
+        target_slice_guard_s: float = DEFAULT_TARGET_SLICE_GUARD_S,
         on_fragment_opened: Callable[["_StreamProxy", FragmentInfo], None] | None = None,
     ):
         self._stream_cfgs = list(streams)
@@ -604,6 +633,7 @@ class PersistentCameraSession:
         self.ready_timeout_s = float(ready_timeout_s)
         self.connect_stable_s = max(0.0, float(connect_stable_s))
         self.first_fragment_timeout_s = max(0.0, float(first_fragment_timeout_s))
+        self.target_slice_guard_s = max(0.0, float(target_slice_guard_s))
         # When True, connect() spawns all workers to PAUSED at once (overlapping
         # their python/Gst.init startup) and then serializes only the
         # PAUSED->PLAYING Argus bring-up. Default keeps the proven one-at-a-time
@@ -874,33 +904,59 @@ class PersistentCameraSession:
 
     # -- episode control -------------------------------------------------
 
+    def _guard_ns(self) -> int:
+        return max(0, int(round(self.target_slice_guard_s * 1e9)))
+
+    def _episode_stop_target_ns(self, handle: EpisodeHandle) -> int:
+        fps = self._stream_cfgs[0].fps if self._stream_cfgs else 60
+        period_ns = _frame_period_ns(fps)
+        min_stop_ns = time.monotonic_ns() + self._guard_ns()
+        elapsed_ns = max(period_ns, min_stop_ns - int(handle.t0_mono_ns))
+        frames = max(1, math.ceil(elapsed_ns / period_ns))
+        return int(handle.t0_mono_ns) + frames * period_ns
+
     def start_episode(self, episode_dir: Path, idx: int) -> EpisodeHandle:
         if not self._streams:
             raise RuntimeError("start_episode() before connect()")
         episode_dir.mkdir(parents=True, exist_ok=True)
+        start_request_wall_s = time.time()
+        target_mono_ns = time.monotonic_ns() + self._guard_ns()
+        target_wall_s = _target_wall_from_mono_ns(target_mono_ns)
         with self._lock:
-            t0_wall = time.time()
-            t0_mono = time.monotonic()
             for proxy in self._streams.values():
-                proxy.start_episode(episode_dir)
+                proxy.start_episode_at(episode_dir, target_mono_ns)
             handle = EpisodeHandle(
                 idx=idx, directory=episode_dir,
-                t0_wall_s=t0_wall, t0_mono_s=t0_mono,
+                t0_wall_s=target_wall_s,
+                t0_mono_s=target_mono_ns / 1e9,
+                t0_mono_ns=target_mono_ns,
+                start_request_wall_s=start_request_wall_s,
             )
         return handle
 
-    def stop_episode(self, handle: EpisodeHandle) -> EpisodeHandle:
+    def schedule_stop_episode(self, handle: EpisodeHandle) -> EpisodeHandle:
+        """Schedule all streams to leave EPISODE on the same future frame time."""
         with self._lock:
-            handle.stop_wall_s = time.time()
+            handle.stop_request_wall_s = time.time()
+            target_mono_ns = self._episode_stop_target_ns(handle)
+            handle.stop_mono_ns = target_mono_ns
+            handle.stop_mono_s = target_mono_ns / 1e9
+            handle.stop_wall_s = _target_wall_from_mono_ns(target_mono_ns)
             for proxy in self._streams.values():
-                proxy.stop_episode()
+                proxy.stop_episode_at(target_mono_ns)
+        return handle
+
+    def wait_episode_done(self, handle: EpisodeHandle) -> EpisodeHandle:
         # Each worker waits (bounded by FINALIZE_FRAGMENT_TIMEOUT_S) for the
         # splitmuxsink-fragment-closed message before emitting episode_done;
         # we just have to wait for those events to land. Cover the worker's
         # worst case (message never arrives -> message timeout + fallback
         # grace) plus a margin.
+        target_wait_s = 0.0
+        if handle.stop_mono_ns:
+            target_wait_s = max(0.0, (handle.stop_mono_ns - time.monotonic_ns()) / 1e9)
         per_worker_timeout = (
-            FINALIZE_FRAGMENT_TIMEOUT_S + self.finalize_grace_s + 1.5
+            target_wait_s + FINALIZE_FRAGMENT_TIMEOUT_S + self.finalize_grace_s + 1.5
         )
         for proxy in self._streams.values():
             if not proxy.wait_episode_done(per_worker_timeout):
@@ -913,6 +969,10 @@ class PersistentCameraSession:
                 handle.fragments[proxy.cfg.name] = proxy.last_episode_fragment
                 proxy.last_episode_fragment = None
         return handle
+
+    def stop_episode(self, handle: EpisodeHandle) -> EpisodeHandle:
+        self.schedule_stop_episode(handle)
+        return self.wait_episode_done(handle)
 
     def discard_episode(self, handle: EpisodeHandle) -> None:
         # stop_episode already had each worker close its EPISODE fragment;
@@ -1138,17 +1198,22 @@ class PersistentCameraSession:
             "episode_index": handle.idx,
             "t0_wall_s": handle.t0_wall_s,
             "t0_mono_s": handle.t0_mono_s,
+            "t0_mono_ns": handle.t0_mono_ns,
             "stop_wall_s": handle.stop_wall_s,
+            "stop_mono_s": handle.stop_mono_s,
+            "stop_mono_ns": handle.stop_mono_ns,
+            "target_slice_guard_s": self.target_slice_guard_s,
             "duration_s": handle.stop_wall_s - handle.t0_wall_s,
             "sync_reference": {
                 "camera_first_wall_s": {
                     name: info.first_wall_s for name, info in handle.fragments.items()
                 },
                 "note": (
-                    "camera_first_wall_s is the host wall time each splitmuxsink "
-                    "opened its new fragment — the cross-camera anchor to align "
-                    "cameras to BOX wall-clock samples (t0_wall_s is the shared "
-                    "origin). Per-stream first PTS is in cameras[].first_pts_s "
+                    "Target-slice model: t0_wall_s/t0_mono_ns and "
+                    "stop_wall_s/stop_mono_ns are the shared scheduled cut "
+                    "times used for every camera. camera_first_wall_s is the "
+                    "host wall time each splitmuxsink opened its new fragment. "
+                    "Per-stream first PTS is in cameras[].first_pts_s "
                     "(single-stream only, NOT cross-camera comparable)."
                 ),
             },
@@ -1203,9 +1268,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--height", type=int, default=1080)
     ap.add_argument("--fps", type=int, default=60)
     ap.add_argument("--codec", choices=["h264", "h265"], default="h265")
-    ap.add_argument("--bitrate-kbps", type=int, default=20000)
-    ap.add_argument("--iframe-interval", type=int, default=30,
-                    help="encoder GOP size; smaller = lower split latency")
+    ap.add_argument("--bitrate-kbps", type=int, default=40000)
+    ap.add_argument("--iframe-interval", type=int, default=1,
+                    help="encoder GOP size; 1 makes every frame an IDR boundary")
     ap.add_argument("--spawn-stagger-s", type=float, default=1.0)
     ap.add_argument("--two-phase", action="store_true",
                     help="PR7: spawn all workers to PAUSED concurrently, then "
@@ -1266,19 +1331,24 @@ def _run_demo(args: argparse.Namespace) -> int:
 
     def record_one_episode(idx: int) -> tuple[EpisodeHandle, float]:
         ep_dir = args.episode_root / f"episode_{idx:06d}"
-        t_split_start = time.monotonic()
+        t_schedule_start = time.monotonic()
         handle = session.start_episode(ep_dir, idx)
-        split_emit_ms = (time.monotonic() - t_split_start) * 1000
+        schedule_ms = (time.monotonic() - t_schedule_start) * 1000
+        while time.monotonic_ns() < handle.t0_mono_ns:
+            time.sleep(0.01)
         print(
-            f"episode {idx} started -> {ep_dir} (split-now emit "
-            f"in {split_emit_ms:.1f}ms)",
+            f"episode {idx} started -> {ep_dir} (target scheduled "
+            f"in {schedule_ms:.1f}ms)",
             flush=True,
         )
         ep_t0 = time.monotonic()
         while time.monotonic() - ep_t0 < args.episode_time_s:
             time.sleep(0.05)
-        actual = time.monotonic() - ep_t0
-        session.stop_episode(handle)
+        session.schedule_stop_episode(handle)
+        while time.monotonic_ns() < handle.stop_mono_ns:
+            time.sleep(0.01)
+        session.wait_episode_done(handle)
+        actual = max(0.0, (handle.stop_mono_ns - handle.t0_mono_ns) / 1e9)
         session.write_episode_meta(handle)
         sizes = ", ".join(
             f"{name}={_human_size(info.path)}@{info.first_pts_s if info.first_pts_s is not None else -1:.3f}s"

@@ -490,8 +490,8 @@ def _parse_args(argv=None):
     ap.add_argument("--height", type=int, default=1080)
     ap.add_argument("--fps", type=int, default=60)
     ap.add_argument("--codec", choices=["h264", "h265"], default="h265")
-    ap.add_argument("--bitrate-kbps", type=int, default=20000)
-    ap.add_argument("--iframe-interval", type=int, default=60)
+    ap.add_argument("--bitrate-kbps", type=int, default=40000)
+    ap.add_argument("--iframe-interval", type=int, default=1)
     ap.add_argument("--stagger-s", type=float, default=1.0,
                     help="delay between sequential camera bring-ups")
     ap.add_argument("--stable-s", type=float, default=2.0,

@@ -62,8 +62,8 @@ class CameraDefaults:
     argus_gain: float = 0.0
     replay_warmup_s: float = 0.0
     codec: str = "h265"
-    bitrate_kbps: int = 20000
-    iframe_interval: int = 60
+    bitrate_kbps: int = 40000
+    iframe_interval: int = 1
     preset_level: int = 1
     control_rate: int = 1
     profile: str = "main"
@@ -274,6 +274,7 @@ def _enc_element(c: CameraDefaults) -> list[str]:
             "nvv4l2h265enc",
             f"bitrate={bitrate_bps}",
             f"iframeinterval={c.iframe_interval}",
+            f"idrinterval={c.iframe_interval}",
             f"preset-level={c.preset_level}",
             f"control-rate={c.control_rate}",
             "insert-sps-pps=1",
@@ -282,6 +283,7 @@ def _enc_element(c: CameraDefaults) -> list[str]:
         "nvv4l2h264enc",
         f"bitrate={bitrate_bps}",
         f"iframeinterval={c.iframe_interval}",
+        f"idrinterval={c.iframe_interval}",
         f"preset-level={c.preset_level}",
         f"control-rate={c.control_rate}",
         "insert-sps-pps=1",

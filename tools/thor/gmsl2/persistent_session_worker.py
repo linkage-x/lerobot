@@ -15,7 +15,7 @@ deadlocks that hang the parent Python thread.
 
 Wrapping each pipeline in its own subprocess restores the pre-PR2
 ``daemon-client`` relationship (N clients, one daemon) while keeping PR2's
-"connect once, slice per-episode with split-now" UX.
+"connect once, slice per-episode" UX.
 
 Protocol
 --------
@@ -23,7 +23,9 @@ Parent <-> child use two ``multiprocessing.Queue``\\s, passed as args::
 
     cmd_q  parent -> child:
         ("start_episode", str(episode_dir))
+        ("start_episode_at", str(episode_dir), target_mono_ns)
         ("stop_episode",)
+        ("stop_episode_at", target_mono_ns)
         ("disconnect",)
 
     evt_q  child -> parent:
@@ -141,7 +143,8 @@ def run_worker(
     import gi  # type: ignore
 
     gi.require_version("Gst", "1.0")
-    from gi.repository import Gst, GLib  # type: ignore
+    gi.require_version("GstVideo", "1.0")
+    from gi.repository import Gst, GLib, GstVideo  # type: ignore
 
     Gst.init(None)
 
@@ -167,6 +170,48 @@ def run_worker(
         name = factory.get_name() if factory else ""
         if name in {"nvv4l2h265enc", "nvv4l2h264enc", "x264enc", "x265enc"}:
             encoder = elem
+
+    def _target_running_time_ns(target_mono_ns: int) -> int:
+        """Convert the parent's monotonic target into this pipeline running-time."""
+        clock = pipeline.get_clock()
+        delta_ns = int(target_mono_ns) - time.monotonic_ns()
+        delta_ns = max(0, delta_ns)
+        if clock is None:
+            return delta_ns
+        target_clock_ns = int(clock.get_time()) + delta_ns
+        return max(0, target_clock_ns - int(pipeline.get_base_time()))
+
+    def _request_key_unit_at(running_time_ns: int, label: str) -> None:
+        if encoder is None:
+            return
+        try:
+            event = GstVideo.video_event_new_upstream_force_key_unit(
+                int(running_time_ns), True, 0,
+            )
+            srcpad = encoder.get_static_pad("src")
+            if srcpad is not None and srcpad.send_event(event):
+                return
+        except Exception as exc:
+            logger.debug(
+                "[%s] timed force-key-unit (%s) not supported: %s",
+                cfg.name, label, exc,
+            )
+        try:
+            encoder.emit("force-IDR")
+        except Exception as exc:
+            logger.debug("[%s] force-IDR (%s) not supported: %s", cfg.name, label, exc)
+
+    def _split_at_target(target_mono_ns: int, label: str) -> None:
+        running_time_ns = _target_running_time_ns(target_mono_ns)
+        _request_key_unit_at(running_time_ns, label)
+        try:
+            splitmux.emit("split-at-running-time", running_time_ns)
+        except Exception as exc:
+            logger.warning(
+                "[%s] split-at-running-time (%s) failed: %s; falling back to split-now",
+                cfg.name, label, exc,
+            )
+            splitmux.emit("split-now")
 
     def on_format_location_full(_mux, fragment_id, first_sample, *_user):
         with state.lock:
@@ -481,15 +526,16 @@ def run_worker(
         elif t == Gst.MessageType.EOS:
             evt_q.put(("eos",))
 
-    def _wait_fragment_finalized(location: str) -> bool:
+    def _wait_fragment_finalized(location: str, target_mono_ns: int = 0) -> bool:
         """Block until splitmuxsink reports ``location`` closed, bounded.
 
         Returns True if the fragment-closed message arrived, False if the wait
-        timed out (caller falls back to a short grace sleep). The split-now in
-        stop_episode is what triggers the close, so this is normally a few-ms
-        wait; the timeout only guards against a lost/late message.
+        timed out (caller falls back to a short grace sleep). The scheduled
+        split is what triggers the close, so this is normally a few-ms wait
+        after target time; the timeout only guards against a lost/late message.
         """
-        deadline = time.monotonic() + FINALIZE_FRAGMENT_TIMEOUT_S
+        target_mono_s = (int(target_mono_ns) / 1e9) if target_mono_ns else time.monotonic()
+        deadline = max(time.monotonic(), target_mono_s) + FINALIZE_FRAGMENT_TIMEOUT_S
         with finalize_cv:
             while location not in closed_locations:
                 remaining = deadline - time.monotonic()
@@ -577,56 +623,43 @@ def run_worker(
         if not isinstance(cmd, tuple) or len(cmd) == 0:
             continue
         kind = cmd[0]
-        if kind == "start_episode":
+        if kind in {"start_episode", "start_episode_at"}:
             ep_dir = Path(cmd[1])
+            target_mono_ns = int(cmd[2]) if kind == "start_episode_at" else time.monotonic_ns()
             with state.lock:
                 state.state = FragmentState.EPISODE
                 state.current_episode_dir = ep_dir
                 state.last_episode_fragment = None
-            if encoder is not None:
-                try:
-                    encoder.emit("force-IDR")
-                except Exception as exc:
-                    logger.debug("[%s] force-IDR not supported: %s", cfg.name, exc)
             try:
-                splitmux.emit("split-now")
+                _split_at_target(target_mono_ns, "start")
             except Exception as exc:
-                evt_q.put(("error", f"split-now failed: {exc}", ""))
-        elif kind == "stop_episode":
+                evt_q.put(("error", f"target split start failed: {exc}", ""))
+        elif kind in {"stop_episode", "stop_episode_at"}:
+            target_mono_ns = int(cmd[1]) if kind == "stop_episode_at" else time.monotonic_ns()
             with state.lock:
                 state.state = FragmentState.WARMUP
                 state.current_episode_dir = None
                 ep_fragment = state.last_episode_fragment
-            # The EPISODE fragment splitmuxsink is about to close on the stop
-            # split-now. Its location is what fragment-closed will report.
+            # The EPISODE fragment splitmuxsink is about to close on the
+            # scheduled stop target. Its location is what fragment-closed will
+            # report.
             episode_location = ep_fragment.get("path") if ep_fragment else None
             if episode_location:
                 with finalize_cv:
                     closed_locations.discard(episode_location)
-            # Mirror start_episode: splitmuxsink can only cut on an IDR
-            # boundary, and idrinterval=60 means the natural cadence is
-            # ~1 frame/sec. Without force-IDR here the EPISODE fragment
-            # loses 0-1s of frames at the tail because splitmux silently
-            # waits for the next natural IDR before swapping out. Users
-            # saw the slider freeze ~60 frames short of duration_s * fps.
-            if encoder is not None:
-                try:
-                    encoder.emit("force-IDR")
-                except Exception as exc:
-                    logger.debug("[%s] force-IDR (stop) not supported: %s", cfg.name, exc)
             try:
-                splitmux.emit("split-now")
+                _split_at_target(target_mono_ns, "stop")
             except Exception as exc:
-                logger.warning("[%s] split-now (stop) failed: %s", cfg.name, exc)
+                logger.warning("[%s] target split stop failed: %s", cfg.name, exc)
             # async-finalize drains to disk asynchronously. Rather than
             # blind-sleeping a fixed grace, wait for splitmuxsink to confirm
             # this fragment closed (GStreamer 1.18+ posts the message; verified
-            # on Thor's 1.24). The split-now we just emitted is what triggers
-            # the close, so this normally returns within a few ms; the grace
-            # sleep is only a fallback if the message is lost or no EPISODE
-            # fragment was ever opened.
+            # on Thor's 1.24). The scheduled split is what triggers the close,
+            # so this normally returns within a few ms after target time; the
+            # grace sleep is only a fallback if the message is lost or no
+            # EPISODE fragment was ever opened.
             if episode_location:
-                if not _wait_fragment_finalized(episode_location):
+                if not _wait_fragment_finalized(episode_location, target_mono_ns):
                     logger.warning(
                         "[%s] fragment-closed not seen within %.1fs for %s; "
                         "falling back to %.2fs grace sleep",
