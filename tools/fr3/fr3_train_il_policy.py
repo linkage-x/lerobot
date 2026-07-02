@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -24,12 +26,17 @@ import pyarrow.parquet as pq
 import yaml
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 DEFAULT_DATASET_ROOT = Path("dataset_test/single_cube2_20260429_165325")
 DEFAULT_CAMERAS = "observation.images.cam_1,observation.images.cam_3"
 DEFAULT_STATE_KEYS = "observation.state"
 DEFAULT_DERIVED_ACTION = Path("derived/hikon_cube_tracking_in_robot_base/action.npy")
 DEFAULT_ACTION_APPEND_SELECTORS = "observation.state_raw:handheld_gripper.pika_left.width_mm"
 DEFAULT_ACTION_APPEND_NAMES = "gripper"
+DEFAULT_GMSL2_EXPORT_ROOT = Path("outputs/exported_datasets")
 
 
 def parse_csv(value: str | None) -> list[str]:
@@ -219,6 +226,21 @@ def fill_nonfinite_matrix_within_episode(
     return repaired_values
 
 
+def unrepairable_nonfinite_episodes(values: np.ndarray, episode_indices: pd.Series) -> set[int]:
+    values = np.asarray(values, dtype=np.float32)
+    if values.size == 0 or np.isfinite(values).all():
+        return set()
+
+    bad: set[int] = set()
+    episodes = episode_indices.to_numpy()
+    for episode in pd.unique(episode_indices):
+        mask = episodes == episode
+        repaired = pd.DataFrame(values[mask]).replace([np.inf, -np.inf], np.nan).ffill().bfill()
+        if not np.isfinite(repaired.to_numpy(dtype=np.float32)).all():
+            bad.add(int(episode))
+    return bad
+
+
 def copy_or_symlink_file(src: Path, dst: Path, *, copy: bool) -> None:
     if dst.exists() or dst.is_symlink():
         return
@@ -244,6 +266,536 @@ def discover_dataset_roots(dataset_root: Path) -> list[Path]:
     raise FileNotFoundError(
         f"{dataset_root} is neither a LeRobot dataset root nor a directory containing dataset roots."
     )
+
+
+def dataset_has_training_contract(
+    dataset_root: Path,
+    *,
+    camera_keys: list[str],
+    state_keys: list[str],
+    action_key: str,
+    action_npy: Path | None,
+    action_append_selectors: list[str],
+) -> tuple[bool, str]:
+    try:
+        roots = discover_dataset_roots(dataset_root)
+    except FileNotFoundError as exc:
+        return False, str(exc)
+
+    for root in roots:
+        info_path = root / "meta/info.json"
+        if not info_path.is_file():
+            return False, f"missing {info_path}"
+        try:
+            features = load_json(info_path)["features"]
+        except (KeyError, json.JSONDecodeError, OSError) as exc:
+            return False, f"could not read features from {info_path}: {exc}"
+
+        for key in camera_keys:
+            feature = features.get(key)
+            if not isinstance(feature, dict) or feature.get("dtype") not in ("video", "image"):
+                return False, f"camera feature not found or not decodable image/video in {root}: {key}"
+        for selector in state_keys:
+            try:
+                key, _, _ = parse_feature_selector(selector, features)
+            except (KeyError, IndexError, ValueError) as exc:
+                return False, f"state selector unavailable in {root}: {selector} ({exc})"
+            if not key.startswith("observation.") or features[key].get("dtype") not in ("float32", "float64"):
+                return False, f"state selector is not a numeric observation in {root}: {selector}"
+        if action_npy is None:
+            if action_key not in features:
+                return False, f"action feature not found in {root}: {action_key}"
+            try:
+                feature_dim(features[action_key])
+            except ValueError as exc:
+                return False, f"action feature has unsupported shape in {root}: {action_key} ({exc})"
+        for selector in action_append_selectors:
+            try:
+                parse_feature_selector(selector, features)
+            except (KeyError, IndexError, ValueError) as exc:
+                return False, f"action append selector unavailable in {root}: {selector} ({exc})"
+    return True, "ok"
+
+
+def looks_like_gmsl2_raw_dataset(dataset_root: Path) -> bool:
+    episodes = dataset_root / "episodes"
+    return episodes.is_dir() and any(episodes.glob("episode_*/meta.json")) and any(episodes.glob("episode_*/*.mkv"))
+
+
+def _parse_rate(value: str) -> float | None:
+    if "/" in value:
+        num, den = value.split("/", 1)
+        try:
+            den_f = float(den)
+            return float(num) / den_f if den_f else None
+        except ValueError:
+            return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def video_file_has_cfr_grid(video_path: Path, fps: int) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=avg_frame_rate,r_frame_rate,nb_frames,duration",
+                "-of",
+                "json",
+                str(video_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        info = json.loads(result.stdout)
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+        return False, f"ffprobe failed for {video_path}: {exc}"
+
+    streams = info.get("streams") or []
+    if not streams:
+        return False, f"no video stream in {video_path}"
+    stream = streams[0]
+    avg = _parse_rate(str(stream.get("avg_frame_rate", "")))
+    nominal = _parse_rate(str(stream.get("r_frame_rate", "")))
+    try:
+        duration = float(stream.get("duration"))
+        nb_frames = int(stream.get("nb_frames"))
+    except (TypeError, ValueError):
+        return False, f"missing duration/nb_frames in {video_path}"
+
+    if avg is None or abs(avg - fps) > 1e-6:
+        return False, f"{video_path} avg_frame_rate={stream.get('avg_frame_rate')} expected {fps}/1"
+    if nominal is None or abs(nominal - fps) > 1e-6:
+        return False, f"{video_path} r_frame_rate={stream.get('r_frame_rate')} expected {fps}/1"
+    if abs(duration - nb_frames / fps) > max(1e-4, 0.25 / fps):
+        return False, f"{video_path} duration={duration} nb_frames={nb_frames} expected duration={nb_frames / fps}"
+    return True, "ok"
+
+
+def video_file_frame_count(video_path: Path) -> int | None:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_frames",
+                "-show_entries",
+                "stream=nb_read_frames,nb_frames",
+                "-of",
+                "json",
+                str(video_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        info = json.loads(result.stdout)
+        stream = (info.get("streams") or [{}])[0]
+        for key in ("nb_read_frames", "nb_frames"):
+            value = stream.get(key)
+            if value not in (None, "N/A"):
+                return int(value)
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, ValueError):
+        return None
+    return None
+
+
+def dataset_videos_have_cfr_grid(dataset_root: Path, camera_keys: list[str]) -> tuple[bool, str]:
+    info = load_json(dataset_root / "meta/info.json")
+    fps = int(info.get("fps") or 0)
+    video_path_template = info.get("video_path")
+    if fps <= 0 or not video_path_template:
+        return False, f"missing fps/video_path in {dataset_root / 'meta/info.json'}"
+
+    episodes_files = sorted((dataset_root / "meta/episodes").glob("*/*.parquet"))
+    if not episodes_files:
+        return False, f"missing episode metadata under {dataset_root / 'meta/episodes'}"
+    episodes = pd.concat([pq.read_table(path).to_pandas() for path in episodes_files], ignore_index=True)
+    for cam in camera_keys:
+        chunk_col = f"videos/{cam}/chunk_index"
+        file_col = f"videos/{cam}/file_index"
+        if chunk_col not in episodes or file_col not in episodes:
+            return False, f"missing video metadata columns for {cam}"
+        pairs = sorted({(int(chunk), int(file)) for chunk, file in zip(episodes[chunk_col], episodes[file_col], strict=True)})
+        for chunk_index, file_index in pairs:
+            video_path = dataset_root / chunk_file_path(
+                video_path_template,
+                video_key=cam,
+                chunk_index=chunk_index,
+                file_index=file_index,
+            )
+            if not video_path.is_file():
+                return False, f"missing video file: {video_path}"
+            ok, reason = video_file_has_cfr_grid(video_path, fps)
+            if not ok:
+                return False, reason
+            frame_count = video_file_frame_count(video_path)
+            if frame_count is None:
+                return False, f"could not read frame count for {video_path}"
+            rows = episodes[
+                (episodes[chunk_col].astype(int) == chunk_index)
+                & (episodes[file_col].astype(int) == file_index)
+            ]
+            max_length = int(rows["length"].max())
+            if max_length > frame_count:
+                return (
+                    False,
+                    f"{video_path} has {frame_count} frames but episode metadata requires {max_length}",
+                )
+    return True, "ok"
+
+
+def dataset_camera_shapes_match(
+    dataset_root: Path,
+    *,
+    camera_keys: list[str],
+    image_resize_shape: list[int] | None,
+) -> tuple[bool, str]:
+    if image_resize_shape is None:
+        return True, "ok"
+    info = load_json(dataset_root / "meta/info.json")
+    features = info.get("features") or {}
+    expected = [int(image_resize_shape[0]), int(image_resize_shape[1]), 3]
+    for cam in camera_keys:
+        shape = (features.get(cam) or {}).get("shape")
+        if shape != expected:
+            return False, f"{cam} shape={shape} expected {expected}"
+    return True, "ok"
+
+
+def optimized_lerobot_video_export_root(dataset_root: Path, export_root: Path, image_resize_shape: list[int]) -> Path:
+    height, width = int(image_resize_shape[0]), int(image_resize_shape[1])
+    return (export_root / f"{dataset_root.name}_{height}x{width}").resolve()
+
+
+def lerobot_video_dataset_selected_cameras(dataset_root: Path, camera_keys: list[str]) -> bool:
+    info_path = dataset_root / "meta/info.json"
+    if not info_path.is_file():
+        return False
+    try:
+        features = load_json(info_path)["features"]
+    except (KeyError, json.JSONDecodeError, OSError):
+        return False
+    return all((features.get(key) or {}).get("dtype") == "video" for key in camera_keys)
+
+
+def copy_lerobot_dataset_without_videos(src_root: Path, dst_root: Path) -> None:
+    for child in src_root.iterdir():
+        if child.name == "videos":
+            continue
+        dst_child = dst_root / child.name
+        if child.is_dir():
+            shutil.copytree(child, dst_child)
+        else:
+            dst_child.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(child, dst_child)
+
+
+def optimize_lerobot_video_dataset(
+    *,
+    src_root: Path,
+    dst_root: Path,
+    camera_keys: list[str],
+    image_resize_shape: list[int],
+    jobs: int,
+) -> Path:
+    from tools.thor.gmsl2.export_v3 import transcode_to_h264_mp4
+
+    if dst_root.exists():
+        shutil.rmtree(dst_root)
+    dst_root.mkdir(parents=True)
+    copy_lerobot_dataset_without_videos(src_root, dst_root)
+
+    info = load_json(src_root / "meta/info.json")
+    fps = int(info.get("fps") or 0)
+    video_path_template = info.get("video_path")
+    if fps <= 0 or not video_path_template:
+        raise ValueError(f"missing fps/video_path in {src_root / 'meta/info.json'}")
+
+    episodes_files = sorted((src_root / "meta/episodes").glob("*/*.parquet"))
+    if not episodes_files:
+        raise FileNotFoundError(f"missing episode metadata under {src_root / 'meta/episodes'}")
+    episodes = pd.concat([pq.read_table(path).to_pandas() for path in episodes_files], ignore_index=True)
+
+    work_items: list[tuple[str, tuple[int, int], Path, Path, int]] = []
+    for cam in camera_keys:
+        chunk_col = f"videos/{cam}/chunk_index"
+        file_col = f"videos/{cam}/file_index"
+        if chunk_col not in episodes or file_col not in episodes:
+            raise KeyError(f"missing video metadata columns for {cam} in {src_root}")
+        pairs = sorted({(int(chunk), int(file)) for chunk, file in zip(episodes[chunk_col], episodes[file_col], strict=True)})
+        for chunk_index, file_index in pairs:
+            rows = episodes[
+                (episodes[chunk_col].astype(int) == chunk_index)
+                & (episodes[file_col].astype(int) == file_index)
+            ]
+            required_frames = int(rows["length"].max())
+            src_video = src_root / chunk_file_path(
+                video_path_template,
+                video_key=cam,
+                chunk_index=chunk_index,
+                file_index=file_index,
+            )
+            dst_video = dst_root / chunk_file_path(
+                video_path_template,
+                video_key=cam,
+                chunk_index=chunk_index,
+                file_index=file_index,
+            )
+            if not src_video.is_file():
+                raise FileNotFoundError(f"missing video file: {src_video}")
+            work_items.append((cam, (chunk_index, file_index), src_video, dst_video, required_frames))
+
+    resize_shape = (int(image_resize_shape[0]), int(image_resize_shape[1]))
+    print(
+        f"[prepare] optimizing {len(work_items)} selected camera video(s) to "
+        f"CFR H.264 {resize_shape[1]}x{resize_shape[0]} under {dst_root}"
+    )
+
+    def _transcode(item: tuple[str, tuple[int, int], Path, Path, int]) -> tuple[str, tuple[int, int], Path, int, int]:
+        cam, pair, src_video, dst_video, required_frames = item
+        transcode_to_h264_mp4(src_video, dst_video, "h264", fps, resize_shape=resize_shape)
+        frame_count = video_file_frame_count(dst_video)
+        if frame_count is None:
+            raise RuntimeError(f"could not read optimized video frame count: {dst_video}")
+        return cam, pair, dst_video, frame_count, required_frames
+
+    max_workers = max(1, int(jobs))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for cam, pair, dst_video, frame_count, required_frames in pool.map(_transcode, work_items):
+            if frame_count < required_frames:
+                raise RuntimeError(
+                    f"optimized video for {cam} {pair} has {frame_count} frames but episode metadata "
+                    f"requires {required_frames}: {dst_video}"
+                )
+
+    optimized_info = copy.deepcopy(info)
+    optimized_features = copy.deepcopy(info["features"])
+    for key, feature in list(optimized_features.items()):
+        if isinstance(feature, dict) and feature.get("dtype") == "video" and key not in camera_keys:
+            del optimized_features[key]
+    for cam in camera_keys:
+        optimized_features[cam] = resize_camera_feature(optimized_features[cam], image_resize_shape)
+    optimized_info["features"] = optimized_features
+    optimized_info["repo_id"] = f"{info.get('repo_id', src_root.name)}_optimized_{resize_shape[0]}x{resize_shape[1]}"
+    write_json(dst_root / "meta/info.json", optimized_info)
+
+    stats_path = dst_root / "meta/stats.json"
+    if stats_path.is_file():
+        stats = load_json(stats_path)
+        for key in list(stats):
+            feature = info.get("features", {}).get(key)
+            if isinstance(feature, dict) and feature.get("dtype") == "video" and key not in camera_keys:
+                del stats[key]
+        write_json(stats_path, stats)
+
+    manifest = {
+        "source_dataset_root": str(src_root),
+        "camera_keys": camera_keys,
+        "image_resize_shape": image_resize_shape,
+        "fps": fps,
+        "video_count": len(work_items),
+    }
+    write_json(dst_root / "meta/video_optimization_manifest.json", manifest)
+    return dst_root
+
+
+def maybe_optimize_lerobot_video_dataset(
+    args: argparse.Namespace,
+    *,
+    dataset_root: Path,
+    camera_keys: list[str],
+    image_resize_shape: list[int] | None,
+) -> Path:
+    if not args.auto_export_gmsl2 or image_resize_shape is None:
+        return dataset_root
+    if not lerobot_video_dataset_selected_cameras(dataset_root, camera_keys):
+        return dataset_root
+
+    shape_ok, shape_reason = dataset_camera_shapes_match(
+        dataset_root,
+        camera_keys=camera_keys,
+        image_resize_shape=image_resize_shape,
+    )
+    timing_ok = False
+    timing_reason = "skipped timing check because camera shape is incompatible"
+    if shape_ok:
+        timing_ok, timing_reason = dataset_videos_have_cfr_grid(dataset_root, camera_keys=camera_keys)
+
+    if shape_ok and timing_ok and not args.force_export_gmsl2:
+        return dataset_root
+
+    export_root = optimized_lerobot_video_export_root(dataset_root, args.gmsl2_export_root.resolve(), image_resize_shape)
+    if not args.force_export_gmsl2 and export_root.exists():
+        try:
+            export_shape_ok, export_shape_reason = dataset_camera_shapes_match(
+                export_root,
+                camera_keys=camera_keys,
+                image_resize_shape=image_resize_shape,
+            )
+            export_timing_ok, export_timing_reason = (
+                dataset_videos_have_cfr_grid(export_root, camera_keys=camera_keys)
+                if export_shape_ok
+                else (False, "skipped timing check because camera shape is incompatible")
+            )
+        except (OSError, KeyError, json.JSONDecodeError) as exc:
+            export_shape_ok = False
+            export_timing_ok = False
+            export_shape_reason = f"could not read optimized export metadata: {exc}"
+            export_timing_reason = export_shape_reason
+        if export_shape_ok and export_timing_ok:
+            print(f"[prepare] using existing optimized LeRobot video export: {export_root}")
+            return export_root
+        print(
+            "[prepare] existing optimized LeRobot video export is incompatible: "
+            f"{export_shape_reason if not export_shape_ok else export_timing_reason}"
+        )
+
+    if not shape_ok:
+        print(f"[prepare] LeRobot video dataset needs optimization: {shape_reason}")
+    elif not timing_ok:
+        print(f"[prepare] LeRobot video dataset needs CFR optimization: {timing_reason}")
+    else:
+        print("[prepare] rebuilding optimized LeRobot video export because --force-export-gmsl2 was supplied")
+    optimized = optimize_lerobot_video_dataset(
+        src_root=dataset_root,
+        dst_root=export_root,
+        camera_keys=camera_keys,
+        image_resize_shape=image_resize_shape,
+        jobs=args.gmsl2_export_jobs,
+    )
+    optimized_shape_ok, optimized_shape_reason = dataset_camera_shapes_match(
+        optimized,
+        camera_keys=camera_keys,
+        image_resize_shape=image_resize_shape,
+    )
+    if not optimized_shape_ok:
+        raise RuntimeError(f"optimized LeRobot video export has incompatible camera shape: {optimized_shape_reason}")
+    optimized_timing_ok, optimized_timing_reason = dataset_videos_have_cfr_grid(optimized, camera_keys=camera_keys)
+    if not optimized_timing_ok:
+        raise RuntimeError(f"optimized LeRobot video export has incompatible video timing: {optimized_timing_reason}")
+    return optimized
+
+
+def infer_gmsl2_task_name(dataset_root: Path) -> str:
+    name = dataset_root.name
+    match = re.match(r"^(?P<base>.+)_\d{8}_\d{6}(?:_\d{2})?$", name)
+    if match:
+        name = match.group("base")
+    return name.replace("_", " ").replace("-", " ").strip() or dataset_root.name
+
+
+def maybe_export_gmsl2_dataset(
+    args: argparse.Namespace,
+    *,
+    camera_keys: list[str],
+    state_keys: list[str],
+    action_append_selectors: list[str],
+    image_resize_shape: list[int] | None,
+) -> Path:
+    dataset_root = args.dataset_root.resolve()
+    ok, reason = dataset_has_training_contract(
+        dataset_root,
+        camera_keys=camera_keys,
+        state_keys=state_keys,
+        action_key=args.action_key,
+        action_npy=args.action_npy,
+        action_append_selectors=action_append_selectors,
+    )
+    if ok:
+        return maybe_optimize_lerobot_video_dataset(
+            args,
+            dataset_root=dataset_root,
+            camera_keys=camera_keys,
+            image_resize_shape=image_resize_shape,
+        )
+
+    if not args.auto_export_gmsl2:
+        print(f"[prepare] dataset is not directly trainable: {reason}")
+        return dataset_root
+
+    if not looks_like_gmsl2_raw_dataset(dataset_root):
+        print(f"[prepare] dataset does not look like a raw GMSL2 recording: {dataset_root}")
+        print(f"[prepare] keeping original dataset root; prepare step will report the exact error. First mismatch: {reason}")
+        return dataset_root
+
+    export_root = (args.gmsl2_export_root / dataset_root.name).resolve()
+    if not args.force_export_gmsl2 and export_root.exists():
+        export_ok, export_reason = dataset_has_training_contract(
+            export_root,
+            camera_keys=camera_keys,
+            state_keys=state_keys,
+            action_key=args.action_key,
+            action_npy=args.action_npy,
+            action_append_selectors=action_append_selectors,
+        )
+        if export_ok:
+            shape_ok, shape_reason = dataset_camera_shapes_match(
+                export_root,
+                camera_keys=camera_keys,
+                image_resize_shape=image_resize_shape,
+            )
+            if not shape_ok:
+                print(f"[prepare] existing GMSL2 export has incompatible camera shape: {shape_reason}")
+                timing_ok = False
+                timing_reason = "skipped timing check because camera shape is incompatible"
+            else:
+                timing_ok, timing_reason = dataset_videos_have_cfr_grid(export_root, camera_keys=camera_keys)
+            if not timing_ok:
+                print(f"[prepare] existing GMSL2 export has incompatible video timing: {timing_reason}")
+            else:
+                print(f"[prepare] using existing GMSL2 export: {export_root}")
+                return export_root
+        else:
+            print(f"[prepare] existing GMSL2 export is incomplete or incompatible: {export_reason}")
+
+    from tools.thor.gmsl2.export_v3 import export_task_to_v3
+
+    task = args.gmsl2_export_task or infer_gmsl2_task_name(dataset_root)
+    repo_id = args.gmsl2_export_repo_id or f"local/{dataset_root.name}"
+    print(f"[prepare] exporting raw GMSL2 dataset before training: {dataset_root} -> {export_root}")
+    exported = export_task_to_v3(
+        datasets_root=dataset_root.parent,
+        exports_root=args.gmsl2_export_root.resolve(),
+        base_name=dataset_root.name,
+        repo_id=repo_id,
+        task=task,
+        overwrite=True,
+        jobs=args.gmsl2_export_jobs,
+        resize_shape=tuple(image_resize_shape) if image_resize_shape is not None else None,
+    ).resolve()
+    export_ok, export_reason = dataset_has_training_contract(
+        exported,
+        camera_keys=camera_keys,
+        state_keys=state_keys,
+        action_key=args.action_key,
+        action_npy=args.action_npy,
+        action_append_selectors=action_append_selectors,
+    )
+    if not export_ok:
+        raise RuntimeError(f"GMSL2 export completed but still does not match training contract: {export_reason}")
+    shape_ok, shape_reason = dataset_camera_shapes_match(
+        exported,
+        camera_keys=camera_keys,
+        image_resize_shape=image_resize_shape,
+    )
+    if not shape_ok:
+        raise RuntimeError(f"GMSL2 export completed but camera shape is still incompatible: {shape_reason}")
+    timing_ok, timing_reason = dataset_videos_have_cfr_grid(exported, camera_keys=camera_keys)
+    if not timing_ok:
+        raise RuntimeError(f"GMSL2 export completed but video timing is still incompatible: {timing_reason}")
+    return exported
 
 
 def chunk_file_from_path(path: Path) -> tuple[int, int]:
@@ -319,6 +871,7 @@ def prepare_dataset_view(
     action_append_shift: int,
     image_resize_shape: list[int] | None,
     copy_videos: bool,
+    drop_nonfinite_episodes: bool,
     overwrite: bool,
 ) -> None:
     src_roots = discover_dataset_roots(src_root)
@@ -406,10 +959,6 @@ def prepare_dataset_view(
     source_data_files: list[list[Path]] = []
     source_episodes: list[pd.DataFrame] = []
     source_file_maps: list[dict[tuple[int, int], tuple[int, int]]] = []
-    source_frame_offsets: list[int] = []
-    source_episode_offsets: list[int] = []
-    total_rows = 0
-    total_episodes = 0
 
     for root in src_roots:
         data_files = sorted((root / "data").glob("*/*.parquet"))
@@ -421,20 +970,97 @@ def prepare_dataset_view(
         episodes = pd.concat([pq.read_table(path).to_pandas() for path in episodes_files], ignore_index=True)
         source_data_files.append(data_files)
         source_episodes.append(episodes)
-        source_frame_offsets.append(total_rows)
-        source_episode_offsets.append(total_episodes)
         file_map: dict[tuple[int, int], tuple[int, int]] = {}
         for src_file in data_files:
             old_pair = chunk_file_from_path(src_file.relative_to(root))
             file_map[old_pair] = chunk_file_for_index(len(file_map) + sum(len(m) for m in source_file_maps), chunks_size)
         source_file_maps.append(file_map)
-        total_rows += int(episodes["length"].sum())
-        total_episodes += len(episodes)
+
+    dropped_episodes_by_source: list[set[int]] = []
+    for source_idx, (root, data_files) in enumerate(zip(src_roots, source_data_files, strict=True)):
+        features = source_infos[source_idx]["features"]
+        bad_episodes: set[int] = set()
+        source_action_npy = action_npy
+        if source_action_npy is not None and not source_action_npy.is_absolute():
+            source_action_npy = root / source_action_npy
+        loaded_action_npy = np.load(source_action_npy).astype(np.float32) if source_action_npy is not None else None
+        source_processed_rows = 0
+        for src_file in data_files:
+            df = pq.read_table(src_file).to_pandas()
+            if state_keys:
+                state = select_state_matrix(df, features, state_keys)
+                bad_episodes.update(unrepairable_nonfinite_episodes(state, df["episode_index"]))
+            if loaded_action_npy is not None:
+                action = loaded_action_npy[source_processed_rows : source_processed_rows + len(df)]
+            else:
+                action = as_matrix(df[action_key], action_key, feature_dim(features[action_key]))
+            action_append = select_action_append_matrix(
+                df,
+                features,
+                action_append_selectors,
+                action_append_shift,
+            )
+            if action_append is not None:
+                action = np.concatenate([action, action_append], axis=1)
+            bad_episodes.update(unrepairable_nonfinite_episodes(action, df["episode_index"]))
+            source_processed_rows += len(df)
+        if bad_episodes:
+            if not drop_nonfinite_episodes:
+                examples = sorted(bad_episodes)[:10]
+                raise ValueError(
+                    f"Selected state/action contains non-finite values that cannot be repaired in "
+                    f"{root}; bad episode_index examples: {examples}. "
+                    "Pass --drop-nonfinite-episodes to skip these episodes."
+                )
+            print(f"[prepare] dropping {len(bad_episodes)} non-finite episode(s) from {root}: {sorted(bad_episodes)}")
+        dropped_episodes_by_source.append(bad_episodes)
+
+    source_episode_maps: list[dict[int, int]] = []
+    source_episode_frame_ranges: list[dict[int, tuple[int, int]]] = []
+    total_rows = 0
+    total_episodes = 0
+    for episodes, dropped in zip(source_episodes, dropped_episodes_by_source, strict=True):
+        episode_map: dict[int, int] = {}
+        frame_ranges: dict[int, tuple[int, int]] = {}
+        for _, row in episodes.sort_values("episode_index").iterrows():
+            old_episode = int(row["episode_index"])
+            if old_episode in dropped:
+                continue
+            length = int(row["length"])
+            episode_map[old_episode] = total_episodes
+            frame_ranges[old_episode] = (total_rows, total_rows + length)
+            total_rows += length
+            total_episodes += 1
+        source_episode_maps.append(episode_map)
+        source_episode_frame_ranges.append(frame_ranges)
+
+    source_video_maps: list[dict[str, dict[tuple[int, int], tuple[int, int]]]] = []
+    next_video_file_index = {cam: 0 for cam in camera_keys}
+    for source_idx, episodes in enumerate(source_episodes):
+        dropped = dropped_episodes_by_source[source_idx]
+        kept_episodes = episodes[~episodes["episode_index"].astype(int).isin(dropped)]
+        camera_maps: dict[str, dict[tuple[int, int], tuple[int, int]]] = {}
+        for cam in camera_keys:
+            chunk_col = f"videos/{cam}/chunk_index"
+            file_col = f"videos/{cam}/file_index"
+            if chunk_col not in kept_episodes or file_col not in kept_episodes:
+                raise KeyError(f"Episode metadata missing video columns for {cam} in {src_roots[source_idx]}")
+            pairs = sorted(
+                {
+                    (int(chunk), int(file))
+                    for chunk, file in zip(kept_episodes[chunk_col], kept_episodes[file_col], strict=True)
+                }
+            )
+            camera_map: dict[tuple[int, int], tuple[int, int]] = {}
+            for pair in pairs:
+                camera_map[pair] = chunk_file_for_index(next_video_file_index[cam], chunks_size)
+                next_video_file_index[cam] += 1
+            camera_maps[cam] = camera_map
+        source_video_maps.append(camera_maps)
 
     for source_idx, root in enumerate(src_roots):
-        file_map = source_file_maps[source_idx]
         for cam in camera_keys:
-            for old_pair, new_pair in file_map.items():
+            for old_pair, new_pair in source_video_maps[source_idx][cam].items():
                 old_chunk, old_file = old_pair
                 new_chunk, new_file = new_pair
                 src_video = root / chunk_file_path(
@@ -457,8 +1083,7 @@ def prepare_dataset_view(
     for source_idx, (root, data_files) in enumerate(zip(src_roots, source_data_files, strict=True)):
         features = source_infos[source_idx]["features"]
         file_map = source_file_maps[source_idx]
-        frame_offset = source_frame_offsets[source_idx]
-        episode_offset = source_episode_offsets[source_idx]
+        episode_map = source_episode_maps[source_idx]
         task_index_map = task_index_maps[source_idx]
         source_processed_rows = 0
 
@@ -477,12 +1102,19 @@ def prepare_dataset_view(
             )
             dst_file.parent.mkdir(parents=True, exist_ok=True)
 
-            df = pq.read_table(src_file).to_pandas()
+            df_raw = pq.read_table(src_file).to_pandas()
+            source_row_count = len(df_raw)
+            keep_mask = df_raw["episode_index"].astype(int).isin(episode_map)
+            df = df_raw.loc[keep_mask].reset_index(drop=True)
+            if df.empty:
+                source_processed_rows += source_row_count
+                continue
+
             out = pd.DataFrame()
             out["timestamp"] = df["timestamp"]
             out["frame_index"] = df["frame_index"]
-            out["episode_index"] = df["episode_index"] + episode_offset
-            out["index"] = df["index"] + frame_offset
+            out["episode_index"] = df["episode_index"].astype(int).map(episode_map)
+            out["index"] = np.arange(processed_rows, processed_rows + len(df), dtype=np.int64)
             out["task_index"] = df["task_index"].map(task_index_map)
             if out["task_index"].isna().any():
                 missing = sorted(set(df.loc[out["task_index"].isna(), "task_index"].tolist()))
@@ -491,11 +1123,17 @@ def prepare_dataset_view(
 
             if state_keys:
                 state = select_state_matrix(df, features, state_keys)
+                state = fill_nonfinite_matrix_within_episode(
+                    state,
+                    out["episode_index"],
+                    label=f"state in {src_file.relative_to(root)}",
+                )
                 out["observation.state"] = list(state)
                 state_parts.append(state)
 
             if loaded_action_npy is not None:
-                action = loaded_action_npy[source_processed_rows : source_processed_rows + len(df)]
+                action_raw = loaded_action_npy[source_processed_rows : source_processed_rows + source_row_count]
+                action = action_raw[keep_mask.to_numpy()]
             else:
                 action = as_matrix(df[action_key], action_key, feature_dim(features[action_key]))
             action_append = select_action_append_matrix(
@@ -517,7 +1155,7 @@ def prepare_dataset_view(
                 scalar_parts[key].append(np.asarray(out[key]).reshape(-1, 1))
 
             pq.write_table(pa.Table.from_pandas(out, preserve_index=False), dst_file)
-            source_processed_rows += len(df)
+            source_processed_rows += source_row_count
             processed_rows += len(df)
 
         if loaded_action_npy is not None and len(loaded_action_npy) != source_processed_rows:
@@ -549,19 +1187,31 @@ def prepare_dataset_view(
         )
     for source_idx, episodes in enumerate(source_episodes):
         file_map = source_file_maps[source_idx]
-        frame_offset = source_frame_offsets[source_idx]
-        episode_offset = source_episode_offsets[source_idx]
-        out_episodes = episodes.copy()
-        out_episodes["episode_index"] = out_episodes["episode_index"] + episode_offset
-        out_episodes["dataset_from_index"] = out_episodes["dataset_from_index"] + frame_offset
-        out_episodes["dataset_to_index"] = out_episodes["dataset_to_index"] + frame_offset
-        for col_prefix in ["data", *[f"videos/{cam}" for cam in camera_keys]]:
-            chunk_col = f"{col_prefix}/chunk_index"
-            file_col = f"{col_prefix}/file_index"
+        episode_map = source_episode_maps[source_idx]
+        frame_ranges = source_episode_frame_ranges[source_idx]
+        out_episodes = episodes[episodes["episode_index"].astype(int).isin(episode_map)].copy()
+        out_episodes["episode_index"] = out_episodes["episode_index"].astype(int).map(episode_map)
+        out_episodes["dataset_from_index"] = [
+            frame_ranges[int(old_episode)][0] for old_episode in episodes.loc[out_episodes.index, "episode_index"]
+        ]
+        out_episodes["dataset_to_index"] = [
+            frame_ranges[int(old_episode)][1] for old_episode in episodes.loc[out_episodes.index, "episode_index"]
+        ]
+
+        data_pairs = [
+            file_map[(int(chunk), int(file))]
+            for chunk, file in zip(out_episodes["data/chunk_index"], out_episodes["data/file_index"], strict=True)
+        ]
+        out_episodes["data/chunk_index"] = [chunk for chunk, _ in data_pairs]
+        out_episodes["data/file_index"] = [file for _, file in data_pairs]
+        for cam in camera_keys:
+            chunk_col = f"videos/{cam}/chunk_index"
+            file_col = f"videos/{cam}/file_index"
             if chunk_col not in out_episodes or file_col not in out_episodes:
                 continue
+            video_map = source_video_maps[source_idx][cam]
             new_pairs = [
-                file_map[(int(chunk), int(file))]
+                video_map[(int(chunk), int(file))]
                 for chunk, file in zip(out_episodes[chunk_col], out_episodes[file_col], strict=True)
             ]
             out_episodes[chunk_col] = [chunk for chunk, _ in new_pairs]
@@ -907,6 +1557,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--repo-id", default="single_cube2_il_view")
+    parser.add_argument("--auto-export-gmsl2", action="store_true")
+    parser.add_argument("--force-export-gmsl2", action="store_true")
+    parser.add_argument("--gmsl2-export-root", type=Path, default=DEFAULT_GMSL2_EXPORT_ROOT)
+    parser.add_argument("--gmsl2-export-repo-id", default=None)
+    parser.add_argument("--gmsl2-export-task", default=None)
+    parser.add_argument("--gmsl2-export-jobs", type=int, default=8)
     parser.add_argument("--policy", choices=["act", "diffusion"], default="act")
     parser.add_argument("--cameras", default=DEFAULT_CAMERAS)
     parser.add_argument("--state-keys", default=DEFAULT_STATE_KEYS)
@@ -922,6 +1578,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--job-name", default=None)
     parser.add_argument("--overwrite-view", action="store_true")
     parser.add_argument("--copy-videos", action="store_true")
+    parser.add_argument("--drop-nonfinite-episodes", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--resume", action="store_true")
@@ -992,6 +1649,13 @@ def main() -> None:
     if args.resume and view_root.exists() and not args.overwrite_view:
         print(f"[prepare] resume: keeping existing dataset view: {view_root}")
     else:
+        args.dataset_root = maybe_export_gmsl2_dataset(
+            args,
+            camera_keys=cameras,
+            state_keys=state_keys,
+            action_append_selectors=action_append_selectors,
+            image_resize_shape=image_resize_shape,
+        )
         prepare_dataset_view(
             src_root=args.dataset_root,
             dst_root=view_root,
@@ -1005,6 +1669,7 @@ def main() -> None:
             action_append_shift=args.action_append_shift,
             image_resize_shape=image_resize_shape,
             copy_videos=args.copy_videos,
+            drop_nonfinite_episodes=args.drop_nonfinite_episodes,
             overwrite=args.overwrite_view,
         )
         manifest = load_json(view_root / "meta/il_view_manifest.json")

@@ -85,6 +85,21 @@ def _emit(text: str) -> None:
     print(text, flush=True)
 
 
+def _parse_resize_shape(value: str | None) -> tuple[int, int] | None:
+    if value is None or value.strip().lower() in {"", "none", "null"}:
+        return None
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("--resize-shape must be H,W")
+    try:
+        height, width = (int(parts[0]), int(parts[1]))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--resize-shape must be integer H,W") from exc
+    if height <= 0 or width <= 0:
+        raise argparse.ArgumentTypeError("--resize-shape must be positive H,W")
+    return height, width
+
+
 # --------------------------------------------------------------- discovery ---
 
 
@@ -372,7 +387,13 @@ def _box_rows_from_raw(
 # -------------------------------------------------------------- transcoding ---
 
 
-def _gst_transcode_to_h264(src_mkv: Path, dst_mp4: Path, src_codec: str, fps: int) -> bool:
+def _gst_transcode_to_h264(
+    src_mkv: Path,
+    dst_mp4: Path,
+    src_codec: str,
+    fps: int,
+    resize_shape: tuple[int, int] | None = None,
+) -> bool:
     """HEVC/H264 MKV -> CFR H.264 MP4 via the Jetson nvv4l2 pipeline (Thor).
 
     ``videorate`` forces a constant frame rate so the output PTS land exactly on
@@ -390,6 +411,11 @@ def _gst_transcode_to_h264(src_mkv: Path, dst_mp4: Path, src_codec: str, fps: in
         "!", parse,
         "!", "nvv4l2decoder",
         "!", "nvvidconv",
+    ]
+    if resize_shape is not None:
+        height, width = resize_shape
+        cmd.extend(["!", f"video/x-raw,width={width},height={height}"])
+    cmd.extend([
         "!", "videorate",
         "!", f"video/x-raw,framerate={fps}/1",
         "!", "nvvidconv",
@@ -398,7 +424,7 @@ def _gst_transcode_to_h264(src_mkv: Path, dst_mp4: Path, src_codec: str, fps: in
         "!", "h264parse", "config-interval=-1",
         "!", "mp4mux", "faststart=true",
         "!", "filesink", f"location={dst_mp4}",
-    ]
+    ])
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=180, check=False)
     except (subprocess.TimeoutExpired, OSError):
@@ -406,18 +432,27 @@ def _gst_transcode_to_h264(src_mkv: Path, dst_mp4: Path, src_codec: str, fps: in
     return result.returncode == 0 and dst_mp4.is_file() and dst_mp4.stat().st_size > 0
 
 
-def _ffmpeg_transcode_to_h264(src_mkv: Path, dst_mp4: Path, fps: int) -> bool:
+def _ffmpeg_transcode_to_h264(
+    src_mkv: Path,
+    dst_mp4: Path,
+    fps: int,
+    resize_shape: tuple[int, int] | None = None,
+) -> bool:
     """CFR H.264 fallback for dev hosts without nvv4l2 (uses libx264).
 
     ``-vf fps`` resamples to a constant frame rate so PTS == i/fps (same grid
     contract as the gst path above)."""
     if shutil.which("ffmpeg") is None:
         return False
+    vf_parts = [f"fps={fps}"]
+    if resize_shape is not None:
+        height, width = resize_shape
+        vf_parts.append(f"scale={width}:{height}")
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(src_mkv),
-        "-vf", f"fps={fps}",
-        "-fps_mode", "cfr",
+        "-vf", ",".join(vf_parts),
+        "-vsync", "cfr",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an",
         "-movflags", "+faststart",
         str(dst_mp4),
@@ -429,13 +464,21 @@ def _ffmpeg_transcode_to_h264(src_mkv: Path, dst_mp4: Path, fps: int) -> bool:
     return result.returncode == 0 and dst_mp4.is_file() and dst_mp4.stat().st_size > 0
 
 
-def transcode_to_h264_mp4(src_mkv: Path, dst_mp4: Path, src_codec: str, fps: int) -> None:
+def transcode_to_h264_mp4(
+    src_mkv: Path,
+    dst_mp4: Path,
+    src_codec: str,
+    fps: int,
+    resize_shape: tuple[int, int] | None = None,
+) -> None:
     dst_mp4.parent.mkdir(parents=True, exist_ok=True)
     if dst_mp4.exists():
         dst_mp4.unlink()
-    if _gst_transcode_to_h264(src_mkv, dst_mp4, src_codec, fps):
+    # Do not reuse recorder-side sibling mp4 files here. Some are H.264 but
+    # carry non-CFR timestamps, while LeRobot queries the exact i/fps grid.
+    if _gst_transcode_to_h264(src_mkv, dst_mp4, src_codec, fps, resize_shape=resize_shape):
         return
-    if _ffmpeg_transcode_to_h264(src_mkv, dst_mp4, fps):
+    if _ffmpeg_transcode_to_h264(src_mkv, dst_mp4, fps, resize_shape=resize_shape):
         return
     raise RuntimeError(
         f"could not transcode {src_mkv.name} to H.264 (need gst-launch-1.0 with "
@@ -454,6 +497,58 @@ def _mkv_frame_count(mkv_path: Path) -> int:
         return len(lr3.extract_pts(mkv_path))
     except Exception:  # noqa: BLE001
         return 0
+
+
+def _video_frame_count(video_path: Path) -> int:
+    try:
+        count = len(lr3.extract_pts(video_path))
+        if count > 0:
+            return count
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_frames",
+                "-show_entries",
+                "stream=nb_read_frames,nb_frames",
+                "-of",
+                "json",
+                str(video_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        info = json.loads(result.stdout)
+        stream = (info.get("streams") or [{}])[0]
+        for key in ("nb_read_frames", "nb_frames"):
+            value = stream.get(key)
+            if value not in (None, "N/A"):
+                return int(value)
+    except Exception:  # noqa: BLE001
+        return 0
+    return 0
+
+
+def _truncate_rows(rows: list[list[float]] | None, n_frames: int) -> list[list[float]] | None:
+    if rows is None:
+        return None
+    return rows[:n_frames]
+
+
+def _truncate_pose_rows(
+    pose_rows: dict[str, list[list[float]]] | None,
+    n_frames: int,
+) -> dict[str, list[list[float]]] | None:
+    if pose_rows is None:
+        return None
+    return {key: rows[:n_frames] for key, rows in pose_rows.items()}
 
 
 # ----------------------------------------------------------- tracking poses ---
@@ -943,6 +1038,7 @@ def export_task_to_v3(
     task: str,
     overwrite: bool = False,
     jobs: int = _DEFAULT_JOBS,
+    resize_shape: tuple[int, int] | None = None,
 ) -> Path:
     name = base_name.split("/")[-1].strip()
     if not name:
@@ -1017,15 +1113,19 @@ def export_task_to_v3(
         ts_width = len(box_ts_names)
     has_box = state_width > 0
 
-    _emit(f"Schema: {len(camera_keys)} camera(s) {width}x{height} @ {fps}fps, state_width={state_width}")
+    export_height, export_width = resize_shape if resize_shape is not None else (height, width)
+    _emit(
+        f"Schema: {len(camera_keys)} camera(s) {width}x{height} -> "
+        f"{export_width}x{export_height} @ {fps}fps, state_width={state_width}"
+    )
 
     writer = _V3Writer(
         out_root,
         repo_id=repo_id,
         task=task,
         fps=fps,
-        height=height,
-        width=width,
+        height=export_height,
+        width=export_width,
         video_keys=video_keys,
         state_width=state_width,
         state_names=box_state_names if state_width else None,
@@ -1124,13 +1224,36 @@ def export_task_to_v3(
             cam, mkv = cam_mkv
             feature = f"observation.images.{cam}"
             dst = out_root / _VIDEO_PATH.format(video_key=feature, chunk_index=0, file_index=global_index)
-            transcode_to_h264_mp4(mkv, dst, src_codec, fps)
+            transcode_to_h264_mp4(mkv, dst, src_codec, fps, resize_shape=resize_shape)
             return cam, dst
 
         video_files: dict[str, Path] = {}
         with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
             for cam, dst in pool.map(_transcode_cam, cams):
                 video_files[cam] = dst
+
+        mp4_counts = {cam: _video_frame_count(dst) for cam, dst in video_files.items()}
+        bad_counts = {cam: count for cam, count in mp4_counts.items() if count <= 0}
+        if bad_counts:
+            _emit(
+                f"WARNING: skipping {src.session_dir.name}/{src.ep_dir.name}: "
+                f"could not read transcoded mp4 frame counts {bad_counts}"
+            )
+            continue
+        actual_n_frames = min(mp4_counts.values())
+        if actual_n_frames <= 0:
+            _emit(f"WARNING: skipping {src.session_dir.name}/{src.ep_dir.name}: transcoded mp4 has no frames")
+            continue
+        if actual_n_frames != n_frames:
+            _emit(
+                f"  note: {src.ep_dir.name} transcoded mp4 frame counts {dict(sorted(mp4_counts.items()))}; "
+                f"metadata length {n_frames} -> {min(n_frames, actual_n_frames)}"
+            )
+        if actual_n_frames < n_frames:
+            n_frames = actual_n_frames
+            state_rows = _truncate_rows(state_rows, n_frames)
+            action_rows = _truncate_rows(action_rows, n_frames)
+            ts_rows = _truncate_rows(ts_rows, n_frames)
 
         pose_rows = (
             _load_tracking_pose_rows(src, pose_columns=pose_columns, n_frames=n_frames)
@@ -1181,6 +1304,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--task", required=True, help="single_task prompt string")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--jobs", type=int, default=_DEFAULT_JOBS, help="parallel camera transcodes")
+    ap.add_argument("--resize-shape", default=None, help="optional output video resize as H,W, e.g. 360,640")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s", stream=sys.stderr)
@@ -1193,6 +1317,7 @@ def main(argv: list[str] | None = None) -> int:
             task=args.task,
             overwrite=args.overwrite,
             jobs=args.jobs,
+            resize_shape=_parse_resize_shape(args.resize_shape),
         )
     except Exception as exc:  # noqa: BLE001
         _emit(f"ERROR: {exc}")

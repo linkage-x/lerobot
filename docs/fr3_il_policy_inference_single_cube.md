@@ -237,6 +237,69 @@ falls back to the Pika FR3 URDF/TCP for IK. That is useful for software smoke
 tests but should be replaced before evaluating real success rate with a
 different physical gripper geometry.
 
+For the `place_bread_act_cam02_imgonly_gripper1d` ACT policy trained with one
+GMSL2 camera (`cam_02`) and image-only observations, the repo includes a
+ready-to-use runtime config:
+
+```text
+tools/fr3/fr3_place_bread_cam02_corenetic_inference.yaml
+```
+
+It binds the deployment contract to:
+
+- checkpoint:
+  `outputs/train/place_bread_act_cam02_imgonly_gripper1d/checkpoints/060000`
+- dataset view:
+  `outputs/datasets/place_bread_act_cam02_imgonly_gripper1d`
+- camera key: `cam_02`, matching `observation.images.cam_02`
+- camera config:
+  `tools/fr3/fr3_il_infer_gmsl2_corenetic_camera_config.yaml`
+- gripper backend: `corenetic`
+- IK model:
+  `src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf`
+- IK target frame: `corenetic_gripper_ee`
+- MuJoCo model:
+  `src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.xml`
+
+Host-runtime preview:
+
+```bash
+tools/fr3/run_pick_place_infer_host.sh preview
+```
+
+Host-runtime interactive debug with camera preview and MuJoCo overlays:
+
+```bash
+tools/fr3/run_pick_place_infer_host.sh real_debug
+```
+
+Equivalent explicit environment form:
+
+```bash
+FR3_INFER_CHECKPOINT=outputs/train/place_bread_act_cam02_imgonly_gripper1d/checkpoints/060000 \
+FR3_INFER_DATASET_ROOT=outputs/datasets/place_bread_act_cam02_imgonly_gripper1d \
+FR3_INFER_CAMERA_CONFIG=tools/fr3/fr3_il_infer_gmsl2_corenetic_camera_config.yaml \
+FR3_GRIPPER_BACKEND=corenetic \
+FR3_GRIPPER_MAX_WIDTH_MM=98 \
+FR3_ROBOT_URDF_PATH=src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf \
+FR3_TARGET_FRAME_NAME=corenetic_gripper_ee \
+FR3_MUJOCO_MODEL=src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.xml \
+tools/fr3/run_pick_place_infer_host.sh real_debug
+```
+
+Docker-wrapper preview from the same config:
+
+```bash
+python3 tools/fr3/fr3_act_infer_real.py \
+  --inference-config tools/fr3/fr3_place_bread_cam02_corenetic_inference.yaml \
+  --preview \
+  --max-steps 20
+```
+
+The lower-level runtime now also defaults to the Corenetic URDF/TCP/XML when
+`--gripper-backend corenetic` is selected, so these overrides are no longer
+required unless you want to test another calibrated tool model.
+
 ## Real Robot Run
 
 After preview looks sane, run with conservative safety gates:

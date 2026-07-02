@@ -62,8 +62,10 @@ _DEFAULT_GRIPPER_BACKEND = 'das'
 _GRIPPER_BACKEND_CHOICES = ('pika', 'das', 'franka_hand', 'corenetic')
 _DAS_XML = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_das_ati.xml'
 _PIKA_XML = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.xml'
+_CORENETIC_XML = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.xml'
 _DAS_URDF = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_das_ati.urdf'
 _PIKA_URDF = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf'
+_CORENETIC_URDF = _REPO_ROOT / 'src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf'
 _DEFAULT_TACTILE_VALID_MASK_PATH = _REPO_ROOT / 'docs/tactile/tactile_valid_mask_50x10.json'
 _DEFAULT_TACTILE_BASELINE_PATH = _REPO_ROOT / 'docs/tactile/idle_baseline.json'
 _DEFAULT_STATE_NAMES = ['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw', 'gripper']
@@ -886,7 +888,11 @@ def move_to_robot_init_state_if_requested(robot: Any, init_state: dict[str, Any]
 def resolve_mujoco_model_path(gripper_backend: str, model_path: str | Path | None) -> Path:
     if model_path is not None:
         return _resolve_repo_path(model_path)
-    return _DAS_XML if gripper_backend == 'das' else _PIKA_XML
+    if gripper_backend == 'das':
+        return _DAS_XML
+    if gripper_backend == 'corenetic':
+        return _CORENETIC_XML
+    return _PIKA_XML
 
 
 def resolve_robot_tool_model(gripper_backend: str, urdf_path: str | Path | None, target_frame_name: str | None) -> tuple[Path, str]:
@@ -894,6 +900,8 @@ def resolve_robot_tool_model(gripper_backend: str, urdf_path: str | Path | None,
         resolved_urdf = _resolve_repo_path(urdf_path)
     elif gripper_backend == 'das':
         resolved_urdf = _DAS_URDF
+    elif gripper_backend == 'corenetic':
+        resolved_urdf = _CORENETIC_URDF
     else:
         resolved_urdf = _PIKA_URDF
 
@@ -901,14 +909,10 @@ def resolve_robot_tool_model(gripper_backend: str, urdf_path: str | Path | None,
         resolved_target_frame = str(target_frame_name)
     elif gripper_backend == 'das':
         resolved_target_frame = 'das_gripper_ee'
+    elif gripper_backend == 'corenetic':
+        resolved_target_frame = 'corenetic_gripper_ee'
     else:
         resolved_target_frame = 'pika_gripper_ee'
-
-    if gripper_backend == 'corenetic' and urdf_path is None:
-        print(
-            '[WARN] Corenetic gripper is using the Pika FR3 URDF/TCP fallback for IK. '
-            'Pass --robot-urdf-path and --target-frame-name when you have the calibrated Corenetic tool model.'
-        )
     return resolved_urdf, resolved_target_frame
 
 

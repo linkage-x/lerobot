@@ -108,11 +108,18 @@ Dataset and output arguments:
 | --- | --- | --- |
 | `--dataset-root` | `dataset_test/single_cube2_20260429_165325` | Source LeRobot dataset root, or a parent directory whose direct children are separate LeRobot dataset roots. The script does not modify source datasets. |
 | `--repo-id` | `single_cube2_il_view` | Repo id stored in the generated dataset view metadata. It is local-only unless you later upload it. |
+| `--auto-export-gmsl2` | off | If `--dataset-root` is a raw THOR/GMSL2 recording, export it to a reusable LeRobot v3 dataset before creating the IL view. If the root is already a LeRobot video dataset but selected camera videos do not match `--image-resize-shape` or CFR timing, create an optimized video export instead. |
+| `--gmsl2-export-root` | `outputs/exported_datasets` | Parent directory for auto-exported GMSL2 datasets. Raw exports use `<root>/<dataset-name>`; optimized existing LeRobot video exports use `<root>/<dataset-name>_<H>x<W>`. |
+| `--gmsl2-export-task` | inferred | Task text stored in the exported dataset. If omitted, a name like `place_bread_20260626_070237` becomes `place bread`. |
+| `--gmsl2-export-repo-id` | `local/<dataset-name>` | Repo id stored in the exported GMSL2 dataset metadata. |
+| `--gmsl2-export-jobs` | `8` | Number of parallel camera transcode jobs used during GMSL2 export. |
+| `--force-export-gmsl2` | off | Recreate the raw GMSL2 export or optimized LeRobot video export even if an existing export already matches the requested cameras/state/action contract, camera shape, and CFR timing. |
 | `--view-root` | `outputs/datasets/<job_name>` | Output path for the derived training dataset view. |
 | `--output-dir` | `outputs/train/<job_name>` | Training output directory. Checkpoints and offline WandB logs are written here. |
 | `--job-name` | auto-generated | Name used for the training run and default output paths. |
 | `--overwrite-view` | off | Delete and recreate `--view-root` if it already exists. Use only when you intentionally want to replace the generated view. |
 | `--copy-videos` | off | Copy selected videos into the view. By default videos are symlinked to avoid duplicating large files. |
+| `--drop-nonfinite-episodes` | off | Drop source episodes whose selected state/action features contain non-finite values that cannot be repaired by per-episode forward/backward fill. Use this for tracking-pose datasets where some whole episodes have missing pose estimates. |
 | `--prepare-only` | off | Build the dataset view and train config, then stop before training. Useful for inspection. |
 | `--smoke` | off | Load the generated view with the policy's temporal indexing and print tensor shapes. |
 | `--resume` | off | Resume LeRobot training from an existing checkpoint instead of starting from scratch. The helper keeps the existing view unless `--overwrite-view` is also set. |
@@ -227,8 +234,8 @@ uv run python tools/fr3/fr3_train_il_policy.py \
   --overwrite-view
 ```
 
-For GMSL2 data, training does not need a different policy path. Use the camera
-feature suffixes recorded in the dataset, for example:
+For already-exported GMSL2 data, training does not need a different policy
+path. Use the camera feature suffixes recorded in the dataset, for example:
 
 ```bash
 uv run python tools/fr3/fr3_train_il_policy.py \
@@ -250,6 +257,51 @@ The important rule is that the infer camera config later must contain matching
 keys under `robot.cameras`, here `gmsl2_front` and `gmsl2_wrist`. If an older
 dataset still stores the vendor BOX SDK sensor key as `box_gripper.distance_m`,
 use that exact selector instead; the infer runtime recognizes both names.
+
+For raw THOR/GMSL2 recordings, pass `--auto-export-gmsl2`. The helper first
+checks whether `--dataset-root` already has decodable video features for the
+selected cameras. If not, and the path has `episodes/episode_*/meta.json` plus
+per-camera `.mkv` files, it exports a reusable H.264 MP4 LeRobot v3 dataset
+under `outputs/exported_datasets/<dataset-name>` and then trains from that
+export.
+
+The same flag also handles already-exported LeRobot video datasets. If
+`--dataset-root` already has `meta/info.json` but the selected camera feature
+shape does not match `--image-resize-shape H,W`, or the selected MP4s are not on
+a strict CFR grid, the helper writes an optimized copy under
+`outputs/exported_datasets/<dataset-name>_<H>x<W>`. The optimized copy keeps the
+same parquet data and metadata contract, but re-encodes the selected camera
+videos as H.264 CFR MP4 at the requested policy resolution. This avoids decoding
+1080p video and resizing every batch during training.
+
+A later run with the same selected cameras/state/action contract, camera shape,
+and CFR timing reuses the export; use `--force-export-gmsl2` only when you
+intentionally want to re-transcode.
+
+Example for `dataset_test/place_bread_20260626_070237` with left-arm EE pose
+and one Corenetic/BOX gripper distance dimension:
+
+```bash
+uv run python tools/fr3/fr3_train_il_policy.py \
+  --dataset-root dataset_test/place_bread_20260626_070237 \
+  --auto-export-gmsl2 \
+  --policy act \
+  --cameras cam_06,cam_08,cam_12,cam_14 \
+  --state-keys observation.ee_pose.left.base,observation.state:box_gripper.distance_m \
+  --image-resize-shape 360,640 \
+  --action-key action.ee_pose.left.base \
+  --action-append-selectors observation.state:box_gripper.distance_m \
+  --action-append-names gripper \
+  --drop-nonfinite-episodes \
+  --act-chunk-size 50 \
+  --act-n-action-steps 50 \
+  --steps 100 \
+  --batch-size 4 \
+  --num-workers 0 \
+  --device cuda \
+  --smoke \
+  --overwrite-view
+```
 
 ACT smoke/overfit:
 

@@ -19,6 +19,7 @@ from lerobot.scripts.lerobot_dataset_viz import (
     build_episode_switch_visualize_kwargs,
     build_ee_axis_ruler_strips,
     create_episode_process,
+    collate_without_none_features,
     extract_ee_pose,
     flatten_feature_name_paths,
     format_host_for_url,
@@ -149,6 +150,19 @@ def test_tensor_to_rerun_image_numpy_converts_bool_masks_to_uint8():
 
     assert image.dtype == np.uint8
     assert np.array_equal(image, np.array([[255, 0], [0, 255]], dtype=np.uint8))
+
+
+def test_collate_without_none_features_drops_unavailable_columns():
+    batch = [
+        {"index": torch.tensor(0), "observation.state": torch.tensor([1.0]), "derived.pose": None},
+        {"index": torch.tensor(1), "observation.state": torch.tensor([2.0]), "derived.pose": None},
+    ]
+
+    collated = collate_without_none_features(batch)
+
+    assert "derived.pose" not in collated
+    assert collated["index"].tolist() == [0, 1]
+    assert collated["observation.state"].tolist() == [[1.0], [2.0]]
 
 
 def test_get_auto_visualization_keys_keeps_unhandled_numeric_observations():

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/corenetic/Code/zyx/lerobot
+repo_root="${FR3_REPO_ROOT-/home/corenetic/Code/zyx/lerobot}"
+cd "${repo_root}"
 
 mode="${1:-smoke}"
 if [[ $# -gt 0 ]]; then
@@ -34,12 +35,12 @@ first_frame_max_pos_delta_mm="${FR3_FIRST_FRAME_MAX_POS_DELTA_MM-20}"
 first_frame_max_rot_delta_deg="${FR3_FIRST_FRAME_MAX_ROT_DELTA_DEG-8}"
 max_step_pos_delta_mm="${FR3_MAX_STEP_POS_DELTA_MM-3}"
 max_step_rot_delta_deg="${FR3_MAX_STEP_ROT_DELTA_DEG-2}"
-checkpoint="${FR3_INFER_CHECKPOINT-outputs/train/pick_place_act_cam2_cam3_pika_right_imgonly/checkpoints/060000}"
-dataset_root="${FR3_INFER_DATASET_ROOT-}"
-camera_config="${FR3_INFER_CAMERA_CONFIG-tools/fr3/fr3_il_infer_hikrobot_camera_config.yaml}"
-gripper_backend="${FR3_GRIPPER_BACKEND-pika}"
+checkpoint="${FR3_INFER_CHECKPOINT-outputs/train/place_bread_act_cam02_imgonly_gripper1d/checkpoints/060000}"
+dataset_root="${FR3_INFER_DATASET_ROOT-outputs/datasets/place_bread_act_cam02_imgonly_gripper1d}"
+camera_config="${FR3_INFER_CAMERA_CONFIG-tools/fr3/fr3_il_infer_gmsl2_corenetic_camera_config.yaml}"
+gripper_backend="${FR3_GRIPPER_BACKEND-corenetic}"
 gripper_port="${FR3_GRIPPER_PORT-/dev/ttyUSB0}"
-gripper_max_width_mm="${FR3_GRIPPER_MAX_WIDTH_MM-90}"
+gripper_max_width_mm="${FR3_GRIPPER_MAX_WIDTH_MM-98}"
 if [[ "${gripper_backend}" == "box" ]]; then
   echo "[WARN] FR3_GRIPPER_BACKEND=box is deprecated; use FR3_GRIPPER_BACKEND=corenetic." >&2
   gripper_backend="corenetic"
@@ -52,8 +53,14 @@ corenetic_sdk_dir="${FR3_CORENETIC_SDK_DIR-${FR3_BOX_SDK_DIR-tools/thor/box_sdk}
 corenetic_connect_timeout_s="${FR3_CORENETIC_CONNECT_TIMEOUT_S-${FR3_BOX_CONNECT_TIMEOUT_S-3.0}}"
 corenetic_poll_interval_s="${FR3_CORENETIC_POLL_INTERVAL_S-${FR3_BOX_POLL_INTERVAL_S-0.01}}"
 corenetic_stale_threshold_s="${FR3_CORENETIC_STALE_THRESHOLD_S-${FR3_BOX_STALE_THRESHOLD_S-1.0}}"
+mujoco_model="${FR3_MUJOCO_MODEL-}"
 robot_urdf_path="${FR3_ROBOT_URDF_PATH-}"
 target_frame_name="${FR3_TARGET_FRAME_NAME-}"
+if [[ "${gripper_backend}" == "corenetic" ]]; then
+  robot_urdf_path="${robot_urdf_path:-src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf}"
+  target_frame_name="${target_frame_name:-corenetic_gripper_ee}"
+  mujoco_model="${mujoco_model:-src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.xml}"
+fi
 
 select_python() {
   if [[ -n "${FR3_HOST_PYTHON:-}" ]]; then
@@ -78,11 +85,24 @@ select_python() {
 FR3_HOST_PYTHON="$(select_python)"
 venv_root="$(cd "$(dirname "${FR3_HOST_PYTHON}")/.." && pwd)"
 cmeel_prefix="$(find "${venv_root}/lib" -path '*/site-packages/cmeel.prefix' -type d | head -n 1 || true)"
+libfranka_compat_lib_dir="${FR3_LIBFRANKA_COMPAT_LIB_DIR-}"
+if [[ -z "${libfranka_compat_lib_dir}" ]]; then
+  for candidate in \
+    "${CONDA_PREFIX:-}/lib" \
+    "${HOME}/miniconda3/envs/hirol/lib" \
+    "/home/corenetic/miniconda3/envs/hirol/lib" \
+    "/home/yuxuan/miniconda3/envs/hirol/lib"; do
+    if [[ -n "${candidate}" && -f "${candidate}/libstdc++.so.6" ]]; then
+      libfranka_compat_lib_dir="${candidate}"
+      break
+    fi
+  done
+fi
 
 export PYTHONPATH="$PWD/src:/opt/MVS/Samples/64/Python:/opt/MVS/Samples/32/Python${PYTHONPATH:+:$PYTHONPATH}"
 export HIKROBOT_MVS_HOME=/opt/MVS
 export MVCAM_COMMON_RUNENV=/opt/MVS/lib
-export LD_LIBRARY_PATH="${cmeel_prefix:+${cmeel_prefix}/lib:}/usr/local/lib:/opt/MVS/lib/64:/opt/MVS/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${libfranka_compat_lib_dir:+${libfranka_compat_lib_dir}:}${cmeel_prefix:+${cmeel_prefix}/lib:}/usr/local/lib:/opt/MVS/lib/64:/opt/MVS/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 if [[ "${gripper_backend}" == "corenetic" ]]; then
   corenetic_sdk_abs="${corenetic_sdk_dir}"
@@ -122,6 +142,9 @@ if [[ -n "${robot_urdf_path}" ]]; then
 fi
 if [[ -n "${target_frame_name}" ]]; then
   common_args+=(--target-frame-name "${target_frame_name}")
+fi
+if [[ -n "${mujoco_model}" ]]; then
+  common_args+=(--mujoco-model "${mujoco_model}")
 fi
 if [[ -n "${dataset_root}" ]]; then
   common_args+=(--dataset-root "${dataset_root}")
@@ -265,6 +288,8 @@ case "$mode" in
     echo "FR3_CORENETIC_SDK_DIR=${corenetic_sdk_dir}"
     echo "FR3_ROBOT_URDF_PATH=${robot_urdf_path}"
     echo "FR3_TARGET_FRAME_NAME=${target_frame_name}"
+    echo "FR3_MUJOCO_MODEL=${mujoco_model}"
+    echo "FR3_LIBFRANKA_COMPAT_LIB_DIR=${libfranka_compat_lib_dir}"
     echo "BOX_SDK_URDF=${BOX_SDK_URDF:-}"
     echo "PYTHONPATH=${PYTHONPATH}"
     echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"

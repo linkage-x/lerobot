@@ -1,0 +1,66 @@
+version: 1
+training:
+  policy: act
+  repo_id: single_cube2_il_view
+  dataset_root: outputs/datasets/place_bread_act_cam02_imgonly_gripper1d
+  train_config: outputs/datasets/place_bread_act_cam02_imgonly_gripper1d/train_config.generated.json
+  checkpoint: outputs/train/place_bread_act_cam02_imgonly_gripper1d/checkpoints/060000
+  camera_features:
+    - observation.images.cam_02
+  camera_keys:
+    - cam_02
+  image_resize_shape:
+    - 360
+    - 640
+  state_keys: []
+  state_observation:
+  action_key: action
+  action_source_key: action.ee_pose.left.base
+  action_append_selectors:
+    - observation.state:box_gripper.distance_m
+  action_append_names:
+    - gripper
+  action_append_shift: 1
+runtime:
+  checkpoint: outputs/train/place_bread_act_cam02_imgonly_gripper1d/checkpoints/060000
+  dataset_root: outputs/datasets/place_bread_act_cam02_imgonly_gripper1d
+  camera_config: tools/fr3/fr3_il_infer_gmsl2_corenetic_camera_config.yaml
+  preview: true
+  hardware:
+    robot_ip: 192.168.11.102
+    gripper_backend: corenetic
+    gripper_max_width_mm: 98
+    corenetic_bind_ip: 0.0.0.0
+    corenetic_bind_port: 15000
+    corenetic_remote_ip: 192.168.2.60
+    corenetic_remote_port: 15000
+    corenetic_sdk_dir: tools/thor/box_sdk
+    robot_urdf_path: src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.urdf
+    target_frame_name: corenetic_gripper_ee
+  startup:
+    move_to_das_start: false
+    align_gripper_to_dataset_start: true
+    dataset_start_gripper_tolerance: 0.05
+    robot_init_state:
+      type: ee_xyzquat
+      xyzquat: [0.584972, -0.198668, 0.270659, 0.959580, 0.006716, 0.281263, -0.007254]
+      gripper: 0.5
+  interactive:
+    enabled: true
+    start_key: s
+    stop_key: x
+    quit_key: q
+  mujoco:
+    enabled: true
+    model: src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_corenetic_gripper.xml
+    max_chunk_points: 64
+  safety:
+    first_frame_max_pos_delta_mm: 20.0
+    first_frame_max_rot_delta_deg: 8.0
+    max_step_pos_delta_mm: 3.0
+    max_step_rot_delta_deg: 2.0
+  control:
+    gripper_close_below: 70
+  debug:
+    camera_preview_window: true
+  debug_step0_dump_dir: outputs/debug/place_bread_act_cam02_corenetic_step0
