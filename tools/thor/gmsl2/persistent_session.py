@@ -258,9 +258,10 @@ def build_pipeline_desc(stream: StreamConfig, warmup_location: str) -> str:
         )
         # nvv4l2h{264,265}enc distinguishes I-frame interval (iframeinterval)
         # from IDR-frame interval (idrinterval). splitmuxsink can only cut on
-        # an IDR boundary, so we pin both to the same period — otherwise the
-        # default idrinterval (~256 frames on JetPack 6) makes split-now
-        # spread the actual cut across several seconds across cameras.
+        # an IDR boundary, so we pin both to the same period. For frame-exact
+        # multi-camera episode slicing, the Thor GUI config uses interval=1;
+        # longer GOPs can make different cameras cut at different keyframe
+        # phases even when hardware frame trigger is locked.
         encoder = (
             f"{enc_factory} bitrate={stream.bitrate_kbps * 1000} "
             f"iframeinterval={stream.iframe_interval} "

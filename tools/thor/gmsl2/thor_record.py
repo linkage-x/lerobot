@@ -668,6 +668,14 @@ def main(argv: list[str] | None = None) -> int:
         cfg.hardware_sync.enabled = False
     gr.maybe_setup_sync(cfg, repo_root)
 
+    if cfg.cameras.iframe_interval > 1:
+        _emit(
+            "WARNING: cameras.defaults.iframe_interval="
+            f"{cfg.cameras.iframe_interval}; splitmuxsink can only cut on IDR "
+            "frames, so per-camera episode files may be offset by up to one "
+            "GOP. Use iframe_interval=1 for frame-exact multi-camera tracking."
+        )
+
     _emit(f"Dataset root: {cfg.dataset_root}")
 
     _emit("Connecting: detecting MAX96726 locked cameras...")

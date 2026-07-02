@@ -68,7 +68,11 @@ sensors:
       # Hardware encoder configuration -- consumed by nvv4l2h265enc.
       codec: h265
       bitrate_kbps: 20000
-      iframe_interval: 60      # one keyframe per second @60 fps
+      # Keep every frame as an IDR frame so splitmuxsink can cut all cameras at
+      # the same episode frame. With a 60-frame GOP, each camera can wait for a
+      # different next keyframe boundary after split-now, producing up to ~1s
+      # cross-camera frame-index mismatch even under PWM hardware sync.
+      iframe_interval: 1
       preset_level: 1          # 1=UltraFastPreset, 4=SlowPreset (NV preset enum)
       control_rate: 1          # 1 = constant-bitrate, 0 = variable
       profile: main            # h265: main / main10 ; h264: high / main / baseline
