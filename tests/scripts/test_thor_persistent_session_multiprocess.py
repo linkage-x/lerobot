@@ -1007,6 +1007,47 @@ def test_persistent_session_stop_episode_collects_fragments_from_each_proxy(tmp_
     assert handle.fragments["cam_03"].path == ep_dir / "cam_03.mkv"
 
 
+def test_persistent_session_start_stop_commands_share_frame_grid(tmp_path):
+    cfgs = [
+        ps.StreamConfig(sid=sid, name=f"cam_{sid:02d}", fps=60)
+        for sid in (2, 3)
+    ]
+    session = ps.PersistentCameraSession(
+        cfgs,
+        tmp_path / "warmup",
+        target_slice_guard_s=0.05,
+    )
+    p2 = _make_proxy(tmp_path, sid=2, name="cam_02")
+    p3 = _make_proxy(tmp_path, sid=3, name="cam_03")
+    session._streams = {2: p2, 3: p3}
+
+    ep_dir = tmp_path / "episode_000005"
+    handle = session.start_episode(ep_dir, 5)
+    start_cmd_2 = p2.cmd_q.get(timeout=0.5)
+    start_cmd_3 = p3.cmd_q.get(timeout=0.5)
+
+    assert start_cmd_2[0] == "start_episode_at"
+    assert start_cmd_3[0] == "start_episode_at"
+    assert start_cmd_2[2:] == start_cmd_3[2:]
+    assert start_cmd_2[3] == handle.start_frame_index
+    assert start_cmd_2[4] == handle.frame_period_ns
+
+    session.schedule_stop_episode(handle)
+    stop_cmd_2 = p2.cmd_q.get(timeout=0.5)
+    stop_cmd_3 = p3.cmd_q.get(timeout=0.5)
+
+    assert stop_cmd_2[0] == "stop_episode_at"
+    assert stop_cmd_3[0] == "stop_episode_at"
+    assert stop_cmd_2[1:] == stop_cmd_3[1:]
+    assert stop_cmd_2[2] == handle.expected_video_frames
+    assert stop_cmd_2[3] == handle.stop_frame_index
+    assert stop_cmd_2[4] == handle.frame_period_ns
+    assert handle.expected_video_frames == (
+        handle.stop_frame_index - handle.start_frame_index
+    )
+    assert handle.stop_mono_ns == session._target_for_frame_index(handle.stop_frame_index)
+
+
 def test_persistent_session_start_episode_before_connect_raises(tmp_path):
     session = ps.PersistentCameraSession([], tmp_path / "warmup")
     try:

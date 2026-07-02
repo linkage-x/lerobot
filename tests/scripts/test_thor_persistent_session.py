@@ -149,6 +149,7 @@ def test_fragment_dict_warmup_returns_warmup_path(tmp_path):
     assert info["path"].endswith("_00003.mkv")
     assert info["state"] == ps.FragmentState.WARMUP.value
     assert info["first_pts_s"] == 0.5
+    assert info["first_pts_ns"] == int(0.5 * 1e9)
 
 
 def test_fragment_dict_episode_returns_episode_path_and_records_pts(tmp_path):
@@ -163,6 +164,7 @@ def test_fragment_dict_episode_returns_episode_path_and_records_pts(tmp_path):
     assert info["path"] == str(episode_dir / "cam_02.mkv")
     assert info["fragment_id"] == 4
     assert info["first_pts_s"] == 12.345
+    assert info["first_pts_ns"] == int(12.345 * 1e9)
     assert info["state"] == ps.FragmentState.EPISODE.value
 
 

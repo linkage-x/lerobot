@@ -23,9 +23,11 @@ Parent <-> child use two ``multiprocessing.Queue``\\s, passed as args::
 
     cmd_q  parent -> child:
         ("start_episode", str(episode_dir))
-        ("start_episode_at", str(episode_dir), target_mono_ns)
+        ("start_episode_at", str(episode_dir), target_mono_ns,
+         target_frame_index, frame_period_ns)
         ("stop_episode",)
-        ("stop_episode_at", target_mono_ns)
+        ("stop_episode_at", target_mono_ns, expected_frames,
+         target_frame_index, frame_period_ns)
         ("disconnect",)
 
     evt_q  child -> parent:
@@ -59,6 +61,7 @@ from tools.thor.gmsl2.persistent_session import (
     FragmentState,
     StreamConfig,
     build_pipeline_desc,
+    _frame_period_ns,
 )
 
 logger = logging.getLogger("ps_worker")
@@ -74,7 +77,25 @@ class _WorkerState:
     state: FragmentState = FragmentState.WARMUP
     current_episode_dir: Path | None = None
     last_episode_fragment: dict | None = None
+    episode_start_running_time_ns: int | None = None
+    episode_first_pts_ns: int | None = None
+    latest_frame_running_time_ns: int | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def _sample_pts_ns(first_sample: Any, gst_clock_time_none: int) -> int | None:
+    try:
+        if first_sample is None:
+            return None
+        buf = first_sample.get_buffer()
+        if buf is None or buf.pts is None:
+            return None
+        pts = int(buf.pts)
+        if pts >= int(gst_clock_time_none):
+            return None
+        return pts
+    except Exception:
+        return None
 
 
 def _fragment_dict(
@@ -91,15 +112,8 @@ def _fragment_dict(
     Pulled out as a free function so the unit tests can exercise the
     pts-extraction + path-selection logic without spinning up Gst.
     """
-    first_pts_s: float | None = None
-    try:
-        if first_sample is not None:
-            buf = first_sample.get_buffer()
-            if buf is not None and buf.pts is not None:
-                if buf.pts < gst_clock_time_none:
-                    first_pts_s = float(buf.pts) / 1e9
-    except Exception as exc:
-        logger.debug("[%s] could not parse first_sample pts: %s", cfg.name, exc)
+    first_pts_ns = _sample_pts_ns(first_sample, gst_clock_time_none)
+    first_pts_s = None if first_pts_ns is None else float(first_pts_ns) / 1e9
 
     if state == FragmentState.EPISODE and current_episode_dir is not None:
         path = current_episode_dir / f"{cfg.name}.mkv"
@@ -112,6 +126,7 @@ def _fragment_dict(
         "fragment_id": int(fragment_id),
         "path": str(path),
         "first_pts_s": first_pts_s,
+        "first_pts_ns": first_pts_ns,
         "first_wall_s": time.time(),
         "state": state.value,
     }
@@ -171,6 +186,19 @@ def run_worker(
         if name in {"nvv4l2h265enc", "nvv4l2h264enc", "x264enc", "x265enc"}:
             encoder = elem
 
+    frame_period_ns = _frame_period_ns(cfg.fps)
+
+    def _valid_buffer_pts_ns(buf: Any) -> int | None:
+        try:
+            if buf is None or buf.pts is None:
+                return None
+            pts = int(buf.pts)
+            if pts >= int(Gst.CLOCK_TIME_NONE):
+                return None
+            return pts
+        except Exception:
+            return None
+
     def _target_running_time_ns(target_mono_ns: int) -> int:
         """Convert the parent's monotonic target into this pipeline running-time."""
         clock = pipeline.get_clock()
@@ -180,6 +208,35 @@ def run_worker(
             return delta_ns
         target_clock_ns = int(clock.get_time()) + delta_ns
         return max(0, target_clock_ns - int(pipeline.get_base_time()))
+
+    def _current_running_time_ns() -> int:
+        clock = pipeline.get_clock()
+        if clock is None:
+            return 0
+        return max(0, int(clock.get_time()) - int(pipeline.get_base_time()))
+
+    def _snap_running_time_to_frame_grid(
+        raw_running_time_ns: int,
+        period_ns: int,
+        label: str,
+    ) -> int:
+        """Snap a target to this stream's observed encoded-frame PTS phase."""
+        period_ns = int(period_ns or frame_period_ns)
+        with state.lock:
+            anchor = state.latest_frame_running_time_ns
+        if anchor is None or period_ns <= 0:
+            return int(raw_running_time_ns)
+        delta_ns = int(raw_running_time_ns) - int(anchor)
+        if delta_ns <= 0:
+            snapped = int(anchor) + period_ns
+        else:
+            steps = (delta_ns + period_ns - 1) // period_ns
+            snapped = int(anchor) + int(steps) * period_ns
+        logger.debug(
+            "[%s] %s target snapped raw=%dns anchor=%dns period=%dns -> %dns",
+            cfg.name, label, int(raw_running_time_ns), int(anchor), period_ns, snapped,
+        )
+        return snapped
 
     def _request_key_unit_at(running_time_ns: int, label: str) -> None:
         if encoder is None:
@@ -201,8 +258,7 @@ def run_worker(
         except Exception as exc:
             logger.debug("[%s] force-IDR (%s) not supported: %s", cfg.name, label, exc)
 
-    def _split_at_target(target_mono_ns: int, label: str) -> None:
-        running_time_ns = _target_running_time_ns(target_mono_ns)
+    def _split_at_running_time(running_time_ns: int, label: str) -> None:
         _request_key_unit_at(running_time_ns, label)
         try:
             splitmux.emit("split-at-running-time", running_time_ns)
@@ -212,6 +268,34 @@ def run_worker(
                 cfg.name, label, exc,
             )
             splitmux.emit("split-now")
+
+    def _split_at_target(
+        target_mono_ns: int,
+        label: str,
+        *,
+        period_ns: int = 0,
+        snap_to_frame: bool = True,
+    ) -> int:
+        raw_running_time_ns = _target_running_time_ns(target_mono_ns)
+        running_time_ns = (
+            _snap_running_time_to_frame_grid(raw_running_time_ns, period_ns, label)
+            if snap_to_frame else raw_running_time_ns
+        )
+        _split_at_running_time(running_time_ns, label)
+        return running_time_ns
+
+    if encoder is not None:
+        srcpad = encoder.get_static_pad("src")
+        if srcpad is not None:
+            def _on_encoded_buffer(_pad, probe_info):
+                buf = probe_info.get_buffer()
+                pts_ns = _valid_buffer_pts_ns(buf)
+                if pts_ns is not None:
+                    with state.lock:
+                        state.latest_frame_running_time_ns = pts_ns
+                return Gst.PadProbeReturn.OK
+
+            srcpad.add_probe(Gst.PadProbeType.BUFFER, _on_encoded_buffer)
 
     def on_format_location_full(_mux, fragment_id, first_sample, *_user):
         with state.lock:
@@ -224,6 +308,7 @@ def run_worker(
         if cur_state == FragmentState.EPISODE:
             with state.lock:
                 state.last_episode_fragment = info
+                state.episode_first_pts_ns = info.get("first_pts_ns")
         evt_q.put(("fragment", info))
         return info["path"]
 
@@ -626,20 +711,35 @@ def run_worker(
         if kind in {"start_episode", "start_episode_at"}:
             ep_dir = Path(cmd[1])
             target_mono_ns = int(cmd[2]) if kind == "start_episode_at" else time.monotonic_ns()
+            cmd_frame_period_ns = int(cmd[4]) if len(cmd) > 4 else frame_period_ns
             with state.lock:
                 state.state = FragmentState.EPISODE
                 state.current_episode_dir = ep_dir
                 state.last_episode_fragment = None
+                state.episode_start_running_time_ns = None
+                state.episode_first_pts_ns = None
             try:
-                _split_at_target(target_mono_ns, "start")
+                start_running_time_ns = _split_at_target(
+                    target_mono_ns,
+                    "start",
+                    period_ns=cmd_frame_period_ns,
+                    snap_to_frame=True,
+                )
+                with state.lock:
+                    state.episode_start_running_time_ns = start_running_time_ns
             except Exception as exc:
                 evt_q.put(("error", f"target split start failed: {exc}", ""))
         elif kind in {"stop_episode", "stop_episode_at"}:
             target_mono_ns = int(cmd[1]) if kind == "stop_episode_at" else time.monotonic_ns()
+            expected_frames = int(cmd[2]) if kind == "stop_episode_at" and len(cmd) > 2 else 0
+            cmd_frame_period_ns = int(cmd[4]) if kind == "stop_episode_at" and len(cmd) > 4 else frame_period_ns
+            cmd_frame_period_ns = cmd_frame_period_ns or frame_period_ns
             with state.lock:
                 state.state = FragmentState.WARMUP
                 state.current_episode_dir = None
                 ep_fragment = state.last_episode_fragment
+                first_pts_ns = state.episode_first_pts_ns
+                start_running_time_ns = state.episode_start_running_time_ns
             # The EPISODE fragment splitmuxsink is about to close on the
             # scheduled stop target. Its location is what fragment-closed will
             # report.
@@ -648,7 +748,26 @@ def run_worker(
                 with finalize_cv:
                     closed_locations.discard(episode_location)
             try:
-                _split_at_target(target_mono_ns, "stop")
+                stop_running_time_ns = None
+                if expected_frames > 0:
+                    anchor_ns = first_pts_ns if first_pts_ns is not None else start_running_time_ns
+                    if anchor_ns is not None:
+                        stop_running_time_ns = int(anchor_ns) + expected_frames * cmd_frame_period_ns
+                        # A delayed command with a past running-time target
+                        # would split immediately and shorten the episode. In
+                        # that case, keep the shared future wall-clock target
+                        # and snap it to this stream's frame phase.
+                        if stop_running_time_ns <= _current_running_time_ns():
+                            stop_running_time_ns = None
+                if stop_running_time_ns is not None:
+                    _split_at_running_time(stop_running_time_ns, "stop")
+                else:
+                    _split_at_target(
+                        target_mono_ns,
+                        "stop",
+                        period_ns=cmd_frame_period_ns,
+                        snap_to_frame=True,
+                    )
             except Exception as exc:
                 logger.warning("[%s] target split stop failed: %s", cfg.name, exc)
             # async-finalize drains to disk asynchronously. Rather than

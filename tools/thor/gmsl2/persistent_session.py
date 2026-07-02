@@ -81,7 +81,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import multiprocessing as mp
 import queue as queue_module
 import shutil
@@ -181,6 +180,7 @@ class FragmentInfo:
     first_pts_s: float | None  # filled from format-location-full first-sample
     first_wall_s: float        # host wall time when the new file opened
     state: FragmentState
+    first_pts_ns: int | None = None
 
 
 @dataclass
@@ -191,7 +191,11 @@ class EpisodeHandle:
     directory: Path
     t0_wall_s: float           # shared target wall time for the first frame
     t0_mono_s: float
-    t0_mono_ns: int
+    t0_mono_ns: int = 0
+    frame_period_ns: int = 0
+    start_frame_index: int = 0
+    stop_frame_index: int = 0
+    expected_video_frames: int = 0
     # name -> fragment opened in EPISODE state for that stream
     fragments: dict[str, FragmentInfo] = field(default_factory=dict)
     stop_wall_s: float = 0.0
@@ -359,6 +363,7 @@ def _apply_event_to_proxy(proxy: "_StreamProxy", event: tuple) -> None:
             first_pts_s=info_dict["first_pts_s"],
             first_wall_s=float(info_dict["first_wall_s"]),
             state=FragmentState(info_dict["state"]),
+            first_pts_ns=info_dict.get("first_pts_ns"),
         )
         proxy.fragment_history.append(info)
         if info.state == FragmentState.EPISODE:
@@ -402,6 +407,7 @@ def _apply_event_to_proxy(proxy: "_StreamProxy", event: tuple) -> None:
                 first_pts_s=info_dict["first_pts_s"],
                 first_wall_s=float(info_dict["first_wall_s"]),
                 state=FragmentState(info_dict["state"]),
+                first_pts_ns=info_dict.get("first_pts_ns"),
             )
         proxy.episode_done_evt.set()
         return
@@ -538,16 +544,36 @@ class _StreamProxy:
         self.last_episode_fragment = None
         self.cmd_q.put(("start_episode", str(episode_dir)))
 
-    def start_episode_at(self, episode_dir: Path, target_mono_ns: int) -> None:
+    def start_episode_at(
+        self,
+        episode_dir: Path,
+        target_mono_ns: int,
+        *,
+        target_frame_index: int = 0,
+        frame_period_ns: int = 0,
+    ) -> None:
         self.episode_done_evt.clear()
         self.last_episode_fragment = None
-        self.cmd_q.put(("start_episode_at", str(episode_dir), int(target_mono_ns)))
+        self.cmd_q.put((
+            "start_episode_at", str(episode_dir), int(target_mono_ns),
+            int(target_frame_index), int(frame_period_ns),
+        ))
 
     def stop_episode(self) -> None:
         self.cmd_q.put(("stop_episode",))
 
-    def stop_episode_at(self, target_mono_ns: int) -> None:
-        self.cmd_q.put(("stop_episode_at", int(target_mono_ns)))
+    def stop_episode_at(
+        self,
+        target_mono_ns: int,
+        *,
+        expected_frames: int = 0,
+        target_frame_index: int = 0,
+        frame_period_ns: int = 0,
+    ) -> None:
+        self.cmd_q.put((
+            "stop_episode_at", int(target_mono_ns), int(expected_frames),
+            int(target_frame_index), int(frame_period_ns),
+        ))
 
     def roll_warmup(self) -> None:
         """Ask the worker to roll its open warmup fragment (idle maintenance)."""
@@ -647,6 +673,12 @@ class PersistentCameraSession:
         # inject a fake by patching self._ctx_factory before calling connect.
         self._ctx_factory: Callable[[], Any] = lambda: mp.get_context("spawn")
         self.connect_duration_s: float = 0.0
+        fps = self._stream_cfgs[0].fps if self._stream_cfgs else 60
+        self._frame_period_ns = _frame_period_ns(fps)
+        # A process-local software frame grid used only for scheduling split
+        # targets. The worker still snaps to its observed encoded-frame PTS
+        # phase before calling splitmuxsink.
+        self._frame_grid_epoch_mono_ns = time.monotonic_ns()
 
     # -- lifecycle --------------------------------------------------------
 
@@ -907,29 +939,52 @@ class PersistentCameraSession:
     def _guard_ns(self) -> int:
         return max(0, int(round(self.target_slice_guard_s * 1e9)))
 
-    def _episode_stop_target_ns(self, handle: EpisodeHandle) -> int:
-        fps = self._stream_cfgs[0].fps if self._stream_cfgs else 60
-        period_ns = _frame_period_ns(fps)
+    def _target_for_frame_index(self, frame_index: int) -> int:
+        return self._frame_grid_epoch_mono_ns + int(frame_index) * self._frame_period_ns
+
+    def _frame_index_at_or_after(self, min_target_ns: int) -> int:
+        delta_ns = int(min_target_ns) - self._frame_grid_epoch_mono_ns
+        if delta_ns <= 0:
+            return 0
+        return int((delta_ns + self._frame_period_ns - 1) // self._frame_period_ns)
+
+    def _next_frame_target(self, min_target_ns: int) -> tuple[int, int]:
+        frame_index = self._frame_index_at_or_after(min_target_ns)
+        return self._target_for_frame_index(frame_index), frame_index
+
+    def _episode_stop_target(self, handle: EpisodeHandle) -> tuple[int, int, int]:
         min_stop_ns = time.monotonic_ns() + self._guard_ns()
-        elapsed_ns = max(period_ns, min_stop_ns - int(handle.t0_mono_ns))
-        frames = max(1, math.ceil(elapsed_ns / period_ns))
-        return int(handle.t0_mono_ns) + frames * period_ns
+        stop_frame_index = max(
+            int(handle.start_frame_index) + 1,
+            self._frame_index_at_or_after(min_stop_ns),
+        )
+        expected_frames = max(1, stop_frame_index - int(handle.start_frame_index))
+        return self._target_for_frame_index(stop_frame_index), stop_frame_index, expected_frames
 
     def start_episode(self, episode_dir: Path, idx: int) -> EpisodeHandle:
         if not self._streams:
             raise RuntimeError("start_episode() before connect()")
         episode_dir.mkdir(parents=True, exist_ok=True)
         start_request_wall_s = time.time()
-        target_mono_ns = time.monotonic_ns() + self._guard_ns()
+        target_mono_ns, start_frame_index = self._next_frame_target(
+            time.monotonic_ns() + self._guard_ns(),
+        )
         target_wall_s = _target_wall_from_mono_ns(target_mono_ns)
         with self._lock:
             for proxy in self._streams.values():
-                proxy.start_episode_at(episode_dir, target_mono_ns)
+                proxy.start_episode_at(
+                    episode_dir,
+                    target_mono_ns,
+                    target_frame_index=start_frame_index,
+                    frame_period_ns=self._frame_period_ns,
+                )
             handle = EpisodeHandle(
                 idx=idx, directory=episode_dir,
                 t0_wall_s=target_wall_s,
                 t0_mono_s=target_mono_ns / 1e9,
                 t0_mono_ns=target_mono_ns,
+                frame_period_ns=self._frame_period_ns,
+                start_frame_index=start_frame_index,
                 start_request_wall_s=start_request_wall_s,
             )
         return handle
@@ -938,12 +993,19 @@ class PersistentCameraSession:
         """Schedule all streams to leave EPISODE on the same future frame time."""
         with self._lock:
             handle.stop_request_wall_s = time.time()
-            target_mono_ns = self._episode_stop_target_ns(handle)
+            target_mono_ns, stop_frame_index, expected_frames = self._episode_stop_target(handle)
             handle.stop_mono_ns = target_mono_ns
             handle.stop_mono_s = target_mono_ns / 1e9
             handle.stop_wall_s = _target_wall_from_mono_ns(target_mono_ns)
+            handle.stop_frame_index = stop_frame_index
+            handle.expected_video_frames = expected_frames
             for proxy in self._streams.values():
-                proxy.stop_episode_at(target_mono_ns)
+                proxy.stop_episode_at(
+                    target_mono_ns,
+                    expected_frames=expected_frames,
+                    target_frame_index=stop_frame_index,
+                    frame_period_ns=handle.frame_period_ns or self._frame_period_ns,
+                )
         return handle
 
     def wait_episode_done(self, handle: EpisodeHandle) -> EpisodeHandle:
@@ -1203,6 +1265,10 @@ class PersistentCameraSession:
             "stop_mono_s": handle.stop_mono_s,
             "stop_mono_ns": handle.stop_mono_ns,
             "target_slice_guard_s": self.target_slice_guard_s,
+            "frame_period_ns": handle.frame_period_ns,
+            "start_frame_index": handle.start_frame_index,
+            "stop_frame_index": handle.stop_frame_index,
+            "expected_video_frames": handle.expected_video_frames,
             "duration_s": handle.stop_wall_s - handle.t0_wall_s,
             "sync_reference": {
                 "camera_first_wall_s": {
@@ -1211,7 +1277,10 @@ class PersistentCameraSession:
                 "note": (
                     "Target-slice model: t0_wall_s/t0_mono_ns and "
                     "stop_wall_s/stop_mono_ns are the shared scheduled cut "
-                    "times used for every camera. camera_first_wall_s is the "
+                    "times used for every camera. start_frame_index, "
+                    "stop_frame_index, and expected_video_frames describe the "
+                    "software frame grid used to make all workers cut the same "
+                    "relative frame range. camera_first_wall_s is the "
                     "host wall time each splitmuxsink opened its new fragment. "
                     "Per-stream first PTS is in cameras[].first_pts_s "
                     "(single-stream only, NOT cross-camera comparable)."
@@ -1224,6 +1293,7 @@ class PersistentCameraSession:
                     "fragment_id": info.fragment_id,
                     "file": info.path.name,
                     "first_pts_s": info.first_pts_s,
+                    "first_pts_ns": info.first_pts_ns,
                     "first_wall_s": info.first_wall_s,
                 }
                 for name, info in handle.fragments.items()

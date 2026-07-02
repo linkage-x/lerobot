@@ -486,13 +486,20 @@ def _write_episode_meta(
             "start_request_wall_s": handle.start_request_wall_s,
             "stop_request_wall_s": handle.stop_request_wall_s,
             "target_slice_guard_s": ps.DEFAULT_TARGET_SLICE_GUARD_S,
+            "frame_period_ns": handle.frame_period_ns,
+            "start_frame_index": handle.start_frame_index,
+            "stop_frame_index": handle.stop_frame_index,
+            "expected_video_frames": handle.expected_video_frames,
             "camera_first_wall_s": {
                 name: info.first_wall_s for name, info in fragments.items()
             },
             "note": (
                 "Persistent-pipeline target-slice model. t0_wall_s/t0_mono_ns "
                 "and stop_wall_s/stop_mono_ns are shared future target times "
-                "used for split-at-running-time on every camera; BOX recording "
+                "used for split-at-running-time on every camera. "
+                "start_frame_index/stop_frame_index/expected_video_frames are "
+                "the software frame-grid contract used by workers to cut the "
+                "same relative frame range; BOX recording "
                 "is started/stopped against the same host target times. "
                 "camera_first_wall_s is the host time each splitmuxsink actually "
                 "opened its new fragment. Per-stream first PTS is in cameras[]."
@@ -513,6 +520,7 @@ def _write_episode_meta(
                 "file": info.path.name,
                 "fragment_id": info.fragment_id,
                 "first_pts_s": info.first_pts_s,
+                "first_pts_ns": info.first_pts_ns,
                 "first_wall_s": info.first_wall_s,
             }
             for name, info in fragments.items()
