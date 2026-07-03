@@ -116,6 +116,7 @@ class StreamConfig:
     height: int = 1080
     fps: int = 60
     codec: str = "h265"           # h264 | h265
+    container: str = "mkv"         # mkv | mp4
     bitrate_kbps: int = 20000
     iframe_interval: int = 30
     preset_level: int = 1

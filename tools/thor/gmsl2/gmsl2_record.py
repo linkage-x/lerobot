@@ -1,7 +1,10 @@
-"""GMSL2 hardware-encoded multi-camera recorder for Thor + SG16A_AGTH_G3Y_A1.
+"""GMSL2 recorder configuration and legacy CLI for Thor GMSL2 cameras.
 
-The pixel data never enters Python -- each camera is captured by its own
-``gst-launch-1.0`` subprocess that runs::
+The production GUI entrypoint is ``thor_record.py``. By default the shared
+configuration selects the Libargus metadata-integrated backend there, which
+records video and one per-frame metadata sidecar for each camera. The legacy
+standalone CLI in this file still runs one ``gst-launch-1.0`` process per
+camera::
 
     nvarguscamerasrc sensor-id=N do-timestamp=true sensor-mode=M
       ! video/x-raw(memory:NVMM),format=NV12,width=W,height=H,framerate=F/1
@@ -10,11 +13,9 @@ The pixel data never enters Python -- each camera is captured by its own
       ! matroskamux
       ! filesink location=<dataset>/episodes/episode_NNNNNN/<name>.mkv
 
-Python orchestrates the lifecycle (lock detection, Argus open-probe, start
-and stop per episode) and writes a ``meta.json`` sidecar per episode with
-the hardware-sync settings and per-stream wall-clock timestamps. Frame-level
-PTS is preserved inside the MKV container itself and can be extracted later
-with ``ffprobe`` -- the recorder does not pull it inline.
+The legacy CLI is kept for diagnostics and fallback capture. It does not pull
+Libargus frame metadata inline; the production sync path lives in
+``argus_metadata_session.py`` and ``thor_record.py``.
 
 Usage:
     cd ~/lerobot
@@ -51,6 +52,7 @@ logger = logging.getLogger("gmsl2_record")
 @dataclass
 class CameraDefaults:
     pipeline: str = "argus"
+    recorder_backend: str = "argus_metadata"
     sensor_mode: int = 0
     width: int = 1920
     height: int = 1080
@@ -70,8 +72,14 @@ class CameraDefaults:
     container: str = "mkv"
 
     def __post_init__(self) -> None:
+        self.recorder_backend = self.recorder_backend.lower()
         self.codec = self.codec.lower()
         self.container = self.container.lower()
+        if self.recorder_backend not in {"gstreamer_splitmux", "argus_metadata"}:
+            raise ValueError(
+                "recorder_backend must be 'gstreamer_splitmux' or "
+                f"'argus_metadata', got {self.recorder_backend!r}"
+            )
         if self.codec not in {"h265", "h264"}:
             raise ValueError(f"codec must be 'h265' or 'h264', got {self.codec!r}")
         if self.container not in {"mkv", "mp4"}:
@@ -118,9 +126,26 @@ class HardwareSync:
 
 
 @dataclass
+class ArgusFrameSync:
+    """Per-frame SOF timestamp synchronization gate.
+
+    The metadata-integrated Libargus backend writes one
+    ``<camera>.argus_frame_metadata.csv`` sidecar per episode. When enabled,
+    ``thor_record.py`` aligns all cameras by SOF TSC before saving.
+    """
+
+    enabled: bool = False
+    required: bool = False
+    reference_camera: str = ""
+    tolerance_ms: float = 1.0
+    report_name: str = "argus_frame_alignment.json"
+
+
+@dataclass
 class RecorderConfig:
     cameras: CameraDefaults
     hardware_sync: HardwareSync
+    argus_frame_sync: ArgusFrameSync
     repo_id: str
     single_task: str
     dataset_root: Path
@@ -173,12 +198,15 @@ def load_config(path: Path) -> RecorderConfig:
     if isinstance(hw_raw.get("trig_pin"), str):
         hw_raw["trig_pin"] = int(hw_raw["trig_pin"], 0)
     hwsync = HardwareSync(**_filter_kwargs(HardwareSync, hw_raw))
+    frame_sync_raw = cams.get("argus_frame_sync", {}) or {}
+    frame_sync = ArgusFrameSync(**_filter_kwargs(ArgusFrameSync, frame_sync_raw))
 
     ds = raw.get("dataset", {}) or {}
 
     return RecorderConfig(
         cameras=defaults,
         hardware_sync=hwsync,
+        argus_frame_sync=frame_sync,
         repo_id=str(ds.get("repo_id", "local/gmsl2")),
         single_task=str(ds.get("single_task", "GMSL2 capture")),
         dataset_root=_resolve(ds.get("root", "outputs/datasets/gmsl2")),
@@ -610,6 +638,22 @@ def maybe_setup_sync(cfg: RecorderConfig, repo_root: Path) -> None:
         logger.info("pwm: %s", r.stdout.strip().splitlines()[-1])
 
 
+def _legacy_cli_backend_error(cfg: RecorderConfig) -> str | None:
+    """Return an error when this legacy CLI cannot honor the configured backend."""
+
+    if cfg.cameras.recorder_backend == "gstreamer_splitmux":
+        return None
+    return (
+        "tools.thor.gmsl2.gmsl2_record is the legacy standalone "
+        "GStreamer/splitmux CLI and cannot run "
+        f"recorder_backend={cfg.cameras.recorder_backend!r}. Use "
+        "tools/thor/gmsl2/thor_record.py for the production "
+        "metadata-integrated recorder, or set "
+        "sensors.cameras.defaults.recorder_backend: gstreamer_splitmux "
+        "for this legacy CLI."
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="GMSL2 hardware-encoded multi-camera recorder",
@@ -656,6 +700,11 @@ def main(argv: list[str] | None = None) -> int:
         cfg.spawn_stagger_s = max(0.0, args.spawn_stagger_s)
     if args.ignore_stream_exit:
         cfg.stop_on_stream_exit = False
+
+    backend_error = _legacy_cli_backend_error(cfg)
+    if backend_error is not None:
+        logger.error(backend_error)
+        return 2
 
     repo_root = args.repo_root.resolve()
     if args.skip_hardware_sync:
