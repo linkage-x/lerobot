@@ -92,6 +92,12 @@ sensors:
       single_preflight_timeout_s: 10.0
       missing_frame_policy: fail_episode
       stop_mode: full_cluster
+      # Optional recorder-owned live frame bus for online inference. Leave
+      # disabled for pure recording. When enabled, the recorder publishes the
+      # latest accepted full SOF cluster as NV12 frames plus latest_cluster.json;
+      # consumers read only from this bus and must not open Argus themselves.
+      frame_bus_dir: ""
+      frame_bus_every_n: 1
 
     # Per-camera capture/encoding defaults. Libargus handles capture/ISP and
     # the hardware H.265 encoder writes a complete MKV per camera per episode.

@@ -176,14 +176,18 @@ class ArgusOnlineSync:
     single_preflight_timeout_s: float = 10.0
     missing_frame_policy: str = "fail_episode"
     stop_mode: str = "full_cluster"
+    frame_bus_dir: str = ""
+    frame_bus_every_n: int = 1
 
     def __post_init__(self) -> None:
         self.sync_source = str(self.sync_source).lower()
         self.missing_frame_policy = str(self.missing_frame_policy).lower()
         self.stop_mode = str(self.stop_mode).lower()
+        self.frame_bus_dir = str(self.frame_bus_dir)
         self.frame_timeout_ms = int(self.frame_timeout_ms)
         self.preflight_timeout_s = float(self.preflight_timeout_s)
         self.single_preflight_timeout_s = float(self.single_preflight_timeout_s)
+        self.frame_bus_every_n = int(self.frame_bus_every_n)
         if self.sync_source != "sof_tsc_ns":
             raise ValueError(
                 "online_sync.sync_source currently supports only 'sof_tsc_ns', "
@@ -203,6 +207,11 @@ class ArgusOnlineSync:
             raise ValueError(
                 "online_sync.single_preflight_timeout_s must be > 0, "
                 f"got {self.single_preflight_timeout_s!r}"
+            )
+        if self.frame_bus_every_n <= 0:
+            raise ValueError(
+                "online_sync.frame_bus_every_n must be > 0, "
+                f"got {self.frame_bus_every_n!r}"
             )
         if self.missing_frame_policy != "fail_episode":
             raise ValueError(

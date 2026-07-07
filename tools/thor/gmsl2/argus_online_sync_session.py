@@ -54,6 +54,8 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
         single_preflight_timeout_s: float = 10.0,
         missing_frame_policy: str = "fail_episode",
         stop_mode: str = "full_cluster",
+        frame_bus_dir: str | Path = "",
+        frame_bus_every_n: int = 1,
     ):
         super().__init__(
             streams,
@@ -74,6 +76,8 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
         self.single_preflight_timeout_s = max(1.0, float(single_preflight_timeout_s))
         self.missing_frame_policy = str(missing_frame_policy)
         self.stop_mode = str(stop_mode)
+        self.frame_bus_dir = str(frame_bus_dir) if frame_bus_dir else ""
+        self.frame_bus_every_n = max(1, int(frame_bus_every_n))
         self.start_retry_settle_s = 2.0
         self.start_retries = 1
         self._persistent_ready_evt = threading.Event()
@@ -159,6 +163,7 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
         episode_dir: Path,
         *,
         frames: int,
+        include_frame_bus: bool = True,
     ) -> list[str]:
         cmd = super()._build_record_command(streams, episode_dir, frames=frames)
         startup_full_clusters = self.startup_full_clusters
@@ -176,6 +181,13 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
             "--stop-mode",
             self.stop_mode,
         ])
+        if include_frame_bus and self.frame_bus_dir:
+            cmd.extend([
+                "--frame-bus-dir",
+                self.frame_bus_dir,
+                "--frame-bus-every-n",
+                str(self.frame_bus_every_n),
+            ])
         return cmd
 
     def _build_persistent_command(self) -> list[str]:
@@ -422,7 +434,9 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
 
         probe_dir = Path(tempfile.mkdtemp(prefix="lerobot_argus_online_sync_preflight_"))
         frames = self.preflight_frames
-        cmd = self._build_record_command(streams, probe_dir, frames=frames)
+        cmd = self._build_record_command(
+            streams, probe_dir, frames=frames, include_frame_bus=False
+        )
         timeout_s = (
             self.single_preflight_timeout_s
             if len(streams) == 1 else self.preflight_timeout_s

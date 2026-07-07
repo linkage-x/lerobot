@@ -522,6 +522,8 @@ def _write_episode_meta(
             "frame_timeout_ms": cfg.online_sync.frame_timeout_ms,
             "missing_frame_policy": cfg.online_sync.missing_frame_policy,
             "stop_mode": cfg.online_sync.stop_mode,
+            "frame_bus_dir": cfg.online_sync.frame_bus_dir,
+            "frame_bus_every_n": cfg.online_sync.frame_bus_every_n,
         },
         "cameras": [
             {
@@ -1046,6 +1048,8 @@ def main(argv: list[str] | None = None) -> int:
                 single_preflight_timeout_s=cfg.online_sync.single_preflight_timeout_s,
                 missing_frame_policy=cfg.online_sync.missing_frame_policy,
                 stop_mode=cfg.online_sync.stop_mode,
+                frame_bus_dir=cfg.online_sync.frame_bus_dir,
+                frame_bus_every_n=cfg.online_sync.frame_bus_every_n,
             )
         return ps.PersistentCameraSession(
             streams,

@@ -163,6 +163,8 @@ def test_argus_online_sync_preflight_timeout_defaults() -> None:
     assert cfg.frame_timeout_ms == 1000
     assert cfg.preflight_timeout_s == 30.0
     assert cfg.single_preflight_timeout_s == 10.0
+    assert cfg.frame_bus_dir == ""
+    assert cfg.frame_bus_every_n == 1
 
 
 def test_argus_online_sync_rejects_non_positive_frame_timeout() -> None:
@@ -172,6 +174,15 @@ def test_argus_online_sync_rejects_non_positive_frame_timeout() -> None:
         assert "frame_timeout_ms must be > 0" in str(exc)
     else:
         raise AssertionError("expected invalid frame_timeout_ms to raise ValueError")
+
+
+def test_argus_online_sync_rejects_non_positive_frame_bus_every_n() -> None:
+    try:
+        gr.ArgusOnlineSync(frame_bus_every_n=0)
+    except ValueError as exc:
+        assert "frame_bus_every_n must be > 0" in str(exc)
+    else:
+        raise AssertionError("expected invalid frame_bus_every_n to raise ValueError")
 
 
 def test_argus_online_sync_record_command_passes_frame_timeout(tmp_path: Path) -> None:
@@ -187,6 +198,59 @@ def test_argus_online_sync_record_command_passes_frame_timeout(tmp_path: Path) -
     cmd = session._build_record_command(session._stream_cfgs, tmp_path / "episode", frames=60)
 
     assert cmd[cmd.index("--frame-timeout-ms") + 1] == "750"
+
+
+def test_argus_online_sync_record_command_passes_frame_bus_options(tmp_path: Path) -> None:
+    session = aos.ArgusOnlineSyncCameraSession(
+        _streams(6, 7),
+        tmp_path / "warmup",
+        repo_root=tmp_path,
+        binary_path=tmp_path / "argus_online_sync_video_recorder",
+        auto_build=False,
+        frame_bus_dir=tmp_path / "frame_bus",
+        frame_bus_every_n=3,
+    )
+
+    cmd = session._build_record_command(session._stream_cfgs, tmp_path / "episode", frames=60)
+
+    assert cmd[cmd.index("--frame-bus-dir") + 1] == str(tmp_path / "frame_bus")
+    assert cmd[cmd.index("--frame-bus-every-n") + 1] == "3"
+
+
+def test_argus_online_sync_record_command_omits_disabled_frame_bus(tmp_path: Path) -> None:
+    session = aos.ArgusOnlineSyncCameraSession(
+        _streams(6, 7),
+        tmp_path / "warmup",
+        repo_root=tmp_path,
+        binary_path=tmp_path / "argus_online_sync_video_recorder",
+        auto_build=False,
+    )
+
+    cmd = session._build_record_command(session._stream_cfgs, tmp_path / "episode", frames=60)
+
+    assert "--frame-bus-dir" not in cmd
+    assert "--frame-bus-every-n" not in cmd
+
+
+def test_argus_online_sync_preflight_command_can_omit_frame_bus(tmp_path: Path) -> None:
+    session = aos.ArgusOnlineSyncCameraSession(
+        _streams(6, 7),
+        tmp_path / "warmup",
+        repo_root=tmp_path,
+        binary_path=tmp_path / "argus_online_sync_video_recorder",
+        auto_build=False,
+        frame_bus_dir=tmp_path / "frame_bus",
+    )
+
+    cmd = session._build_record_command(
+        session._stream_cfgs,
+        tmp_path / "preflight",
+        frames=2,
+        include_frame_bus=False,
+    )
+
+    assert "--frame-bus-dir" not in cmd
+    assert "--frame-bus-every-n" not in cmd
 
 
 def test_legacy_gmsl2_cli_rejects_argus_metadata_backend(tmp_path: Path) -> None:

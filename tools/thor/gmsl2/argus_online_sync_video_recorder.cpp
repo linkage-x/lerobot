@@ -31,6 +31,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -42,6 +43,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <linux/videodev2.h>
@@ -79,6 +81,8 @@ struct Options {
     std::string stop_mode = "full_cluster";
     std::string name_prefix = "cam";
     std::string episode_dir = ".";
+    std::string frame_bus_dir;
+    uint32_t frame_bus_every_n = 1;
     bool persistent = false;
 };
 
@@ -99,6 +103,8 @@ std::mutex g_command_mutex;
 std::deque<Command> g_commands;
 std::atomic<bool> g_episode_stop_requested(false);
 std::atomic<bool> g_quit_requested(false);
+std::mutex g_frame_bus_mutex;
+uint64_t g_frame_bus_success_count = 0;
 
 struct FrameMetadata {
     uint64_t local_frame_number = 0;
@@ -184,6 +190,16 @@ std::string camera_name(const std::string& prefix, uint32_t sid) {
     char suffix[16];
     std::snprintf(suffix, sizeof(suffix), "_%02u", sid);
     return prefix + std::string(suffix);
+}
+
+std::string path_join(const std::string& dir, const std::string& name) {
+    if (dir.empty()) {
+        return name;
+    }
+    if (dir[dir.size() - 1] == '/') {
+        return dir + name;
+    }
+    return dir + "/" + name;
 }
 
 bool mkdir_p(const std::string& path) {
@@ -330,6 +346,18 @@ bool parse_args(int argc, char** argv, Options* options) {
             const char* value = require_value("--name-prefix");
             if (!value) return false;
             options->name_prefix = value;
+        } else if (arg == "--frame-bus-dir") {
+            const char* value = require_value("--frame-bus-dir");
+            if (!value) return false;
+            options->frame_bus_dir = value;
+        } else if (arg == "--frame-bus-every-n") {
+            const char* value = require_value("--frame-bus-every-n");
+            if (!value) return false;
+            options->frame_bus_every_n = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+            if (options->frame_bus_every_n == 0) {
+                std::cerr << "--frame-bus-every-n must be > 0" << std::endl;
+                return false;
+            }
         } else if (arg == "--persistent") {
             options->persistent = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -339,6 +367,8 @@ bool parse_args(int argc, char** argv, Options* options) {
                       << " [--iframe-interval 60] [--container mkv]"
                       << " [--tolerance-ms 1.0] [--startup-full-clusters 30]"
                       << " [--frame-timeout-ms 1000]"
+                      << " [--frame-bus-dir /dev/shm/lerobot_online_sync]"
+                      << " [--frame-bus-every-n 1]"
                       << " [--name-prefix cam]"
                       << " [--persistent]"
                       << "\n       --frames 0 records until SIGINT/SIGTERM"
@@ -930,6 +960,8 @@ struct CamCtx {
     std::string name;
     CameraDevice* camera_device = nullptr;
     SensorMode* sensor_mode = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
     UniqueObj<CaptureSession> session;
     ICaptureSession* i_session = nullptr;
     UniqueObj<OutputStream> stream;
@@ -1094,6 +1126,9 @@ bool init_camera(ICameraProvider* provider, UniqueObj<CameraProvider>& provider_
         std::cerr << cam->name << ": sensor mode unavailable" << std::endl;
         return false;
     }
+    const Size2D<uint32_t> resolution = i_sensor_mode->getResolution();
+    cam->width = resolution.width();
+    cam->height = resolution.height();
     cam->session = UniqueObj<CaptureSession>(provider->createCaptureSession(cam->camera_device));
     cam->i_session = interface_cast<ICaptureSession>(cam->session);
     if (!cam->i_session) {
@@ -1105,7 +1140,7 @@ bool init_camera(ICameraProvider* provider, UniqueObj<CameraProvider>& provider_
         std::cerr << cam->name << ": OutputStream failed" << std::endl;
         return false;
     }
-    if (!allocate_argus_buffers(cam, i_sensor_mode->getResolution())) {
+    if (!allocate_argus_buffers(cam, resolution)) {
         return false;
     }
     cam->request = UniqueObj<Request>(cam->i_session->createRequest(CAPTURE_INTENT_VIDEO_RECORD));
@@ -1210,6 +1245,184 @@ void release_cluster(std::vector<std::unique_ptr<FrameBundle>>* cluster) {
         release_bundle(bundle.get());
     }
     cluster->clear();
+}
+
+bool write_text_atomic(const std::string& path, const std::string& content) {
+    const std::string tmp_path = path + ".tmp";
+    {
+        std::ofstream out(tmp_path.c_str(), std::ios::out | std::ios::trunc);
+        if (!out) {
+            std::cerr << "frame bus: failed to open " << tmp_path << std::endl;
+            return false;
+        }
+        out << content;
+        out.flush();
+        if (!out) {
+            std::cerr << "frame bus: failed to write " << tmp_path << std::endl;
+            return false;
+        }
+    }
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        std::cerr << "frame bus: failed to rename " << tmp_path
+                  << " to " << path << ": " << std::strerror(errno) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool copy_nv12_to_file(DmaBuffer* dma, uint32_t width, uint32_t height, const std::string& path) {
+    if (!dma || width == 0 || height == 0) {
+        return false;
+    }
+    NvBufSurface* surf = nullptr;
+    if (NvBufSurfaceFromFd(dma->get_fd(), reinterpret_cast<void**>(&surf)) != 0 || !surf) {
+        std::cerr << "frame bus: NvBufSurfaceFromFd failed" << std::endl;
+        return false;
+    }
+    if (NvBufSurfaceMap(surf, 0, -1, NVBUF_MAP_READ) != 0) {
+        std::cerr << "frame bus: NvBufSurfaceMap failed" << std::endl;
+        return false;
+    }
+    if (NvBufSurfaceSyncForCpu(surf, 0, -1) != 0) {
+        std::cerr << "frame bus: NvBufSurfaceSyncForCpu failed" << std::endl;
+        NvBufSurfaceUnMap(surf, 0, -1);
+        return false;
+    }
+
+    const NvBufSurfaceParams& params = surf->surfaceList[0];
+    const NvBufSurfacePlaneParams& planes = params.planeParams;
+    const uint32_t y_pitch = planes.pitch[0];
+    const uint32_t uv_pitch = planes.pitch[1] > 0 ? planes.pitch[1] : y_pitch;
+    uint8_t* y = static_cast<uint8_t*>(params.mappedAddr.addr[0]);
+    uint8_t* uv = static_cast<uint8_t*>(params.mappedAddr.addr[1]);
+    if (!uv && y) {
+        uv = y + static_cast<size_t>(y_pitch) * height;
+    }
+    if (!y || !uv || y_pitch < width || uv_pitch < width) {
+        std::cerr << "frame bus: mapped NV12 surface has invalid planes" << std::endl;
+        NvBufSurfaceUnMap(surf, 0, -1);
+        return false;
+    }
+
+    const std::string tmp_path = path + ".tmp";
+    std::ofstream out(tmp_path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!out) {
+        std::cerr << "frame bus: failed to open " << tmp_path << std::endl;
+        NvBufSurfaceUnMap(surf, 0, -1);
+        return false;
+    }
+    for (uint32_t row = 0; row < height; ++row) {
+        out.write(reinterpret_cast<const char*>(y + static_cast<size_t>(row) * y_pitch), width);
+    }
+    for (uint32_t row = 0; row < height / 2; ++row) {
+        out.write(reinterpret_cast<const char*>(uv + static_cast<size_t>(row) * uv_pitch), width);
+    }
+    out.flush();
+    const bool write_ok = static_cast<bool>(out);
+    out.close();
+    NvBufSurfaceUnMap(surf, 0, -1);
+    if (!write_ok) {
+        std::cerr << "frame bus: failed to write " << tmp_path << std::endl;
+        return false;
+    }
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        std::cerr << "frame bus: failed to rename " << tmp_path
+                  << " to " << path << ": " << std::strerror(errno) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool should_publish_frame_bus(const Options& options, uint64_t logical_index) {
+    return (
+        !options.frame_bus_dir.empty()
+        && options.frame_bus_every_n > 0
+        && (logical_index % options.frame_bus_every_n) == 0
+    );
+}
+
+bool publish_frame_bus_cluster(
+    const Options& options,
+    const std::vector<std::unique_ptr<FrameBundle>>& cluster,
+    uint64_t logical_index,
+    uint64_t min_sof,
+    uint64_t max_sof,
+    bool recording,
+    int episode_idx
+) {
+    if (!should_publish_frame_bus(options, logical_index)) {
+        return true;
+    }
+    if (cluster.empty()) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_frame_bus_mutex);
+    if (!mkdir_p(options.frame_bus_dir)) {
+        return false;
+    }
+
+    const uint64_t publish_seq = g_frame_bus_success_count;
+    const uint64_t slot = publish_seq % 2;
+    std::vector<std::pair<std::string, FrameBundle*>> published;
+    published.reserve(cluster.size());
+    for (const auto& item : cluster) {
+        FrameBundle* bundle = item.get();
+        if (!bundle || !bundle->cam || !bundle->dma_buffer) {
+            return false;
+        }
+        std::ostringstream raw_name;
+        raw_name << "slot" << slot << "_" << bundle->cam->name << ".nv12";
+        const std::string raw_path = path_join(options.frame_bus_dir, raw_name.str());
+        if (!copy_nv12_to_file(
+                bundle->dma_buffer,
+                bundle->cam->width,
+                bundle->cam->height,
+                raw_path)) {
+            return false;
+        }
+        published.push_back(std::make_pair(raw_path, bundle));
+    }
+
+    const CamCtx* first_cam = cluster.front()->cam;
+    std::ostringstream json;
+    json << "{\n"
+         << "  \"version\": 1,\n"
+         << "  \"publish_seq\": " << publish_seq << ",\n"
+         << "  \"slot\": " << slot << ",\n"
+         << "  \"recording\": " << (recording ? "true" : "false") << ",\n"
+         << "  \"episode_index\": " << episode_idx << ",\n"
+         << "  \"logical_frame_index\": " << logical_index << ",\n"
+         << "  \"sync_source\": \"sof_tsc_ns\",\n"
+         << "  \"format\": \"nv12\",\n"
+         << "  \"width\": " << (first_cam ? first_cam->width : 0) << ",\n"
+         << "  \"height\": " << (first_cam ? first_cam->height : 0) << ",\n"
+         << "  \"min_sof_tsc_ns\": " << min_sof << ",\n"
+         << "  \"max_sof_tsc_ns\": " << max_sof << ",\n"
+         << "  \"max_delta_ns\": " << (max_sof >= min_sof ? max_sof - min_sof : 0) << ",\n"
+         << "  \"cameras\": {\n";
+    for (size_t i = 0; i < published.size(); ++i) {
+        FrameBundle* bundle = published[i].second;
+        json << "    \"" << json_escape(bundle->cam->name) << "\": {"
+             << "\"path\": \"" << json_escape(published[i].first) << "\", "
+             << "\"camera\": \"" << json_escape(bundle->cam->name) << "\", "
+             << "\"logical_frame_index\": " << logical_index << ", "
+             << "\"local_frame_number\": " << bundle->meta.local_frame_number << ", "
+             << "\"sensor_timestamp_ns\": " << bundle->meta.sensor_timestamp_ns << ", "
+             << "\"sof_tsc_ns\": " << bundle->meta.sof_tsc_ns << ", "
+             << "\"eof_tsc_ns\": " << bundle->meta.eof_tsc_ns << ", "
+             << "\"internal_frame_count\": " << bundle->meta.internal_frame_count
+             << "}" << (i + 1 == published.size() ? "\n" : ",\n");
+    }
+    json << "  }\n"
+         << "}\n";
+
+    const std::string latest_path = path_join(options.frame_bus_dir, "latest_cluster.json");
+    if (!write_text_atomic(latest_path, json.str())) {
+        return false;
+    }
+    g_frame_bus_success_count += 1;
+    return true;
 }
 
 using FrameQueue = std::deque<std::unique_ptr<FrameBundle>>;
@@ -1376,6 +1589,9 @@ void write_manifest(
         << "  \"frame_timeout_ms\": " << options.frame_timeout_ms << ",\n"
         << "  \"missing_frame_policy\": \"" << json_escape(options.missing_frame_policy) << "\",\n"
         << "  \"stop_mode\": \"" << json_escape(options.stop_mode) << "\",\n"
+        << "  \"frame_bus_enabled\": " << (!options.frame_bus_dir.empty() ? "true" : "false") << ",\n"
+        << "  \"frame_bus_dir\": \"" << json_escape(options.frame_bus_dir) << "\",\n"
+        << "  \"frame_bus_every_n\": " << options.frame_bus_every_n << ",\n"
         << "  \"dropped_clusters_before_start\": " << dropped_before_start << ",\n"
         << "  \"dropped_clusters_after_stop\": " << dropped_after_stop << ",\n";
     out << "  \"active_cameras\": [";
@@ -1600,6 +1816,17 @@ RecordingResult record_episode(
             release_cluster(&cluster);
             break;
         }
+        if (!publish_frame_bus_cluster(
+                options,
+                cluster,
+                logical_index,
+                min_sof,
+                max_sof,
+                true,
+                episode_idx)) {
+            std::cerr << "frame bus: failed to publish recording cluster "
+                      << logical_index << std::endl;
+        }
         if (!push_cluster(cluster, logical_index, min_sof, max_sof)) {
             result.ok = false;
             result.failure = "failed to push synchronized cluster into encoder";
@@ -1754,6 +1981,7 @@ int run_persistent(
     FrameQueues queues(cameras.size());
     std::thread(stdin_command_loop).detach();
     std::cerr << "persistent ready" << std::endl;
+    uint64_t idle_logical_index = 0;
 
     while (!g_quit_requested.load() && !g_stop_requested.load()) {
         Command command;
@@ -1802,6 +2030,18 @@ int run_persistent(
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
+        if (!publish_frame_bus_cluster(
+                options,
+                idle_cluster,
+                idle_logical_index,
+                min_sof,
+                max_sof,
+                false,
+                -1)) {
+            std::cerr << "frame bus: failed to publish idle cluster "
+                      << idle_logical_index << std::endl;
+        }
+        idle_logical_index += 1;
         release_cluster(&idle_cluster);
     }
 
