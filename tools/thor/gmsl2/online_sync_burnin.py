@@ -282,6 +282,7 @@ def analyze_dataset(
             "episodes_found": len(episode_reports),
             "expected_episodes": expected_episodes,
             "expected_frames": expected_frames,
+            "nominal_frames": None,
             "expected_cameras": expected_cameras,
             "max_delta_ns": max_delta_ns,
             "failures": failures,
@@ -497,6 +498,7 @@ def write_report(report: dict[str, Any], path: Path) -> None:
         f"- episodes_found: `{summary['episodes_found']}`",
         f"- expected_episodes: `{summary.get('expected_episodes')}`",
         f"- expected_frames: `{summary.get('expected_frames')}`",
+        f"- nominal_frames: `{summary.get('nominal_frames')}`",
         f"- max_delta_ns: `{summary.get('max_delta_ns')}`",
         "- postprocessing: no ffmpeg materialization/re-encode; "
         f"ffprobe QC enabled = `{report['postprocessing']['ffprobe_enabled']}`",
@@ -593,6 +595,15 @@ def build_parser() -> argparse.ArgumentParser:
             "wedged camera stack"
         ),
     )
+    run.add_argument(
+        "--enforce-exact-frames",
+        action="store_true",
+        help=(
+            "require actual_frames == round(episode_time_s * fps). Leave this "
+            "off for true UI-time start/stop tests, where STOP is driven by "
+            "wall time and the contract is equal full-cluster frame counts."
+        ),
+    )
     run.add_argument("--run-timeout-s", type=float)
     run.add_argument("--ffprobe", action="store_true", help="read-only video frame-count QC")
     run.add_argument("--debug", action="store_true")
@@ -650,7 +661,8 @@ def main(argv: list[str] | None = None) -> int:
         debug=args.debug,
     )
     dataset_root = driver.dataset_root or dataset_base
-    expected_frames = int(round(args.episode_time_s * args.fps))
+    nominal_frames = int(round(args.episode_time_s * args.fps))
+    expected_frames = nominal_frames if args.enforce_exact_frames else None
     report = analyze_dataset(
         dataset_root,
         expected_episodes=args.episodes,
@@ -662,6 +674,7 @@ def main(argv: list[str] | None = None) -> int:
         tolerance_ns=1_000_000,
         run_ffprobe=args.ffprobe,
     )
+    report["summary"]["nominal_frames"] = nominal_frames
     report["driver"] = {
         "rc": driver.rc,
         "elapsed_s": driver.elapsed_s,

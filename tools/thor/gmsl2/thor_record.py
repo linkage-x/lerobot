@@ -1027,16 +1027,18 @@ def main(argv: list[str] | None = None) -> int:
                 connect_stable_s=cfg.connect_stable_s,
             )
         if cfg.cameras.recorder_backend == "argus_online_sync":
-            target_frames = 0
-            if cfg.episode_time_s > 0:
-                target_frames = int(round(float(cfg.episode_time_s) * int(cfg.cameras.fps)))
             return aos.ArgusOnlineSyncCameraSession(
                 streams,
                 warmup_dir,
                 repo_root=repo_root,
                 connect_timeout_s=max(30.0, float(cfg.connect_timeout_s or 0.0)),
                 connect_stable_s=cfg.connect_stable_s,
-                target_frames=target_frames,
+                # UI recording is time-driven. thor_record.py starts the
+                # episode, waits for operator/auto-duration Stop, then sends
+                # STOP. Keep target_frames=0 so the recorder closes on the
+                # next full SOF cluster instead of converting the UI path into
+                # a fixed-frame direct-recorder test.
+                target_frames=0,
                 tolerance_ms=cfg.online_sync.tolerance_ms,
                 startup_full_clusters=cfg.online_sync.startup_full_clusters,
                 frame_timeout_ms=cfg.online_sync.frame_timeout_ms,

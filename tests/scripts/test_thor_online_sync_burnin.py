@@ -134,6 +134,7 @@ def test_run_ui_burnin_fail_fast_on_recorder_error(tmp_path: Path) -> None:
         preview=False,
         box_enabled=False,
         no_auto_recover=True,
+        skip_argus_probe=False,
         run_timeout_s=5.0,
         continue_on_failure=False,
         debug=False,

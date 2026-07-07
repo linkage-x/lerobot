@@ -1767,7 +1767,9 @@ int run_persistent(
                 episode_options.episode_dir = command.episode_dir;
                 g_episode_stop_requested.store(false);
                 RecordingResult result = record_episode(
-                    cameras, episode_options, &queues, 0, &g_episode_stop_requested,
+                    cameras, episode_options, &queues,
+                    episode_options.startup_full_clusters,
+                    &g_episode_stop_requested,
                     static_cast<int>(command.idx)
                 );
                 release_all_queues(&queues);
@@ -1794,11 +1796,11 @@ int run_persistent(
             if (g_quit_requested.load() || g_stop_requested.load()) {
                 break;
             }
-            std::cerr << "persistent idle cluster failure: " << failure << std::endl;
+            std::cerr << "persistent idle cluster miss: " << failure << std::endl;
             release_cluster(&idle_cluster);
             release_all_queues(&queues);
-            stop_argus_repeat(cameras);
-            return 5;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
         }
         release_cluster(&idle_cluster);
     }

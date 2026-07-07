@@ -28,8 +28,10 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
 
     It intentionally reuses the metadata session's process lifecycle and
     preflight/drop-bad-camera behavior, but the recorder itself aligns frames
-    before hardware encoding. Therefore fixed-duration episodes pass a finite
-    frame target to the C++ process instead of relying on post-save slicing.
+    before hardware encoding. The normal UI path passes ``target_frames=0`` and
+    stops by sending ``STOP`` at the UI episode boundary; the C++ process then
+    closes on the next full SOF cluster. Finite ``target_frames`` remains
+    available for direct recorder smoke tests.
     """
 
     def __init__(
