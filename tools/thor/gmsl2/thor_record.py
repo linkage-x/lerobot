@@ -62,6 +62,7 @@ if str(_REPO_ROOT) not in sys.path:
 from tools.thor.gmsl2 import gmsl2_record as gr  # noqa: E402
 from tools.thor.gmsl2 import argus_frame_sync as afs  # noqa: E402
 from tools.thor.gmsl2 import argus_metadata_session as ams  # noqa: E402
+from tools.thor.gmsl2 import argus_online_sync_session as aos  # noqa: E402
 from tools.thor.gmsl2 import argus_video_materialize as avm  # noqa: E402
 from tools.thor.gmsl2 import persistent_session as ps  # noqa: E402
 from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
@@ -505,9 +506,22 @@ def _write_episode_meta(
         "argus_frame_sync": {
             "enabled": cfg.argus_frame_sync.enabled,
             "required": cfg.argus_frame_sync.required,
+            "reference_strategy": cfg.argus_frame_sync.reference_strategy,
             "reference_camera": cfg.argus_frame_sync.reference_camera or None,
             "tolerance_ms": cfg.argus_frame_sync.tolerance_ms,
+            "cadence_tolerance_ms": cfg.argus_frame_sync.cadence_tolerance_ms,
             "report_name": cfg.argus_frame_sync.report_name,
+            "materialize_verify": cfg.argus_frame_sync.materialize_verify,
+            "materialize_workers": cfg.argus_frame_sync.materialize_workers,
+        },
+        "online_sync": {
+            "enabled": cfg.online_sync.enabled,
+            "sync_source": cfg.online_sync.sync_source,
+            "tolerance_ms": cfg.online_sync.tolerance_ms,
+            "startup_full_clusters": cfg.online_sync.startup_full_clusters,
+            "frame_timeout_ms": cfg.online_sync.frame_timeout_ms,
+            "missing_frame_policy": cfg.online_sync.missing_frame_policy,
+            "stop_mode": cfg.online_sync.stop_mode,
         },
         "cameras": [
             {
@@ -550,9 +564,13 @@ def _evaluate_argus_frame_sync(
     payload: dict[str, Any] = {
         "enabled": True,
         "required": sync_cfg.required,
+        "reference_strategy": sync_cfg.reference_strategy,
         "reference_camera": sync_cfg.reference_camera or None,
         "tolerance_ms": sync_cfg.tolerance_ms,
+        "cadence_tolerance_ms": sync_cfg.cadence_tolerance_ms,
         "report_name": sync_cfg.report_name,
+        "materialize_verify": sync_cfg.materialize_verify,
+        "materialize_workers": sync_cfg.materialize_workers,
         "sidecars": {},
     }
     if not camera_names:
@@ -602,8 +620,15 @@ def _evaluate_argus_frame_sync(
         }
         alignment = afs.align_episode_frames(
             frames_by_camera,
-            reference_camera=sync_cfg.reference_camera or markers.get("reference_camera") or None,
+            reference_camera=(
+                sync_cfg.reference_camera
+                or (markers.get("reference_camera") if sync_cfg.reference_strategy == "camera" else None)
+                or None
+            ),
+            reference_strategy=sync_cfg.reference_strategy,
             tolerance_ns=int(round(sync_cfg.tolerance_ms * 1_000_000)),
+            expected_period_ns=int(round(1_000_000_000 / max(int(cfg.cameras.fps), 1))),
+            cadence_tolerance_ns=int(round(sync_cfg.cadence_tolerance_ms * 1_000_000)),
             start_sof_tsc_ns=start_sof_tsc_ns,
             stop_sof_tsc_ns=stop_sof_tsc_ns,
         )
@@ -622,6 +647,8 @@ def _evaluate_argus_frame_sync(
                 alignment,
                 fps=cfg.cameras.fps,
                 codec=cfg.cameras.codec,
+                verify_frame_counts=sync_cfg.materialize_verify,
+                max_workers=sync_cfg.materialize_workers,
             )
     except Exception as exc:  # noqa: BLE001 - convert metadata failures to episode gate
         payload["ok"] = False
@@ -631,8 +658,11 @@ def _evaluate_argus_frame_sync(
 
     payload.update({
         "ok": alignment.ok,
+        "reference_strategy": sync_cfg.reference_strategy,
         "reference_camera": alignment.reference_camera,
         "tolerance_ns": alignment.tolerance_ns,
+        "expected_period_ns": alignment.expected_period_ns,
+        "cadence_tolerance_ns": alignment.cadence_tolerance_ns,
         "recording_markers": markers,
         "reference_frame_count": alignment.reference_frame_count,
         "accepted_reference_indices": alignment.accepted_reference_indices,
@@ -640,6 +670,8 @@ def _evaluate_argus_frame_sync(
         "drop_reasons": alignment.drop_reasons,
         "frame_windows": frame_windows,
         "materialized_videos": materialized_videos,
+        "materialize_verify": sync_cfg.materialize_verify,
+        "materialize_workers": sync_cfg.materialize_workers,
         "frame_count_by_camera": alignment.frame_count_by_camera(),
         "max_abs_delta_ns_by_camera": {
             name: camera_alignment.max_abs_delta_ns
@@ -650,6 +682,78 @@ def _evaluate_argus_frame_sync(
     })
     failure = "argus_frame_sync_failed" if sync_cfg.required and not alignment.ok else None
     return payload, failure
+
+
+def _sidecar_data_row_count(path: Path) -> int:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return max(0, sum(1 for _ in f) - 1)
+    except OSError:
+        return 0
+
+
+def _evaluate_online_sync_manifest(
+    handle: ps.EpisodeHandle,
+    cfg: gr.RecorderConfig,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate the encoder-front online-sync contract before saving."""
+
+    manifest_path = handle.directory / "online_sync_manifest.json"
+    payload: dict[str, Any] = {
+        "enabled": True,
+        "manifest": str(manifest_path),
+        "sync_source": cfg.online_sync.sync_source,
+        "tolerance_ms": cfg.online_sync.tolerance_ms,
+        "tolerance_ns": int(round(cfg.online_sync.tolerance_ms * 1_000_000)),
+        "sidecar_counts": {},
+        "failures": [],
+    }
+    if not manifest_path.exists():
+        payload["ok"] = False
+        payload["failures"] = ["missing online_sync_manifest.json"]
+        return payload, "online_sync_missing_manifest"
+
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        payload["ok"] = False
+        payload["failures"] = [f"failed to read online sync manifest: {exc}"]
+        return payload, "online_sync_manifest_invalid"
+
+    payload["manifest_payload"] = manifest
+    failures: list[str] = []
+    if not manifest.get("ok"):
+        failures.append(str(manifest.get("failure") or "online_sync_manifest.ok is false"))
+
+    actual_frames = int(manifest.get("actual_frames") or 0)
+    frame_count_by_camera = manifest.get("frame_count_by_camera") or {}
+    active_cameras = sorted(handle.fragments)
+    if actual_frames <= 0:
+        failures.append("online sync actual_frames is zero")
+    for camera in active_cameras:
+        count = int(frame_count_by_camera.get(camera) or 0)
+        if count != actual_frames:
+            failures.append(f"{camera} manifest frame count {count} != {actual_frames}")
+        sidecar = afs.frame_metadata_sidecar_path(handle.directory, camera)
+        sidecar_count = _sidecar_data_row_count(sidecar)
+        payload["sidecar_counts"][camera] = sidecar_count
+        if sidecar_count != actual_frames:
+            failures.append(f"{camera} sidecar rows {sidecar_count} != {actual_frames}")
+
+    tolerance_ns = int(round(cfg.online_sync.tolerance_ms * 1_000_000))
+    for camera, delta in (manifest.get("max_abs_delta_ns_by_camera") or {}).items():
+        try:
+            if int(delta) > tolerance_ns:
+                failures.append(f"{camera} max SOF delta {delta} ns > {tolerance_ns} ns")
+        except (TypeError, ValueError):
+            failures.append(f"{camera} invalid SOF delta {delta!r}")
+
+    payload["ok"] = not failures
+    payload["actual_frames"] = actual_frames
+    payload["frame_count_by_camera"] = frame_count_by_camera
+    payload["max_abs_delta_ns_by_camera"] = manifest.get("max_abs_delta_ns_by_camera") or {}
+    payload["failures"] = failures
+    return payload, None if not failures else "online_sync_failed"
 
 
 # ----------------------------------------------------------------- auto-recover ---
@@ -921,6 +1025,25 @@ def main(argv: list[str] | None = None) -> int:
                 repo_root=repo_root,
                 connect_timeout_s=max(30.0, float(cfg.connect_timeout_s or 0.0)),
                 connect_stable_s=cfg.connect_stable_s,
+            )
+        if cfg.cameras.recorder_backend == "argus_online_sync":
+            target_frames = 0
+            if cfg.episode_time_s > 0:
+                target_frames = int(round(float(cfg.episode_time_s) * int(cfg.cameras.fps)))
+            return aos.ArgusOnlineSyncCameraSession(
+                streams,
+                warmup_dir,
+                repo_root=repo_root,
+                connect_timeout_s=max(30.0, float(cfg.connect_timeout_s or 0.0)),
+                connect_stable_s=cfg.connect_stable_s,
+                target_frames=target_frames,
+                tolerance_ms=cfg.online_sync.tolerance_ms,
+                startup_full_clusters=cfg.online_sync.startup_full_clusters,
+                frame_timeout_ms=cfg.online_sync.frame_timeout_ms,
+                preflight_timeout_s=cfg.online_sync.preflight_timeout_s,
+                single_preflight_timeout_s=cfg.online_sync.single_preflight_timeout_s,
+                missing_frame_policy=cfg.online_sync.missing_frame_policy,
+                stop_mode=cfg.online_sync.stop_mode,
             )
         return ps.PersistentCameraSession(
             streams,
@@ -1356,7 +1479,12 @@ def main(argv: list[str] | None = None) -> int:
                 decision = (decision_cmd.kind if decision_cmd else "save")
 
             frame_sync_payload: dict[str, Any] | None = None
-            if decision in ("save", "operator_save", "stream_exit") and cfg.argus_frame_sync.enabled:
+            online_sync_payload: dict[str, Any] | None = None
+            if (
+                decision in ("save", "operator_save", "stream_exit")
+                and cfg.cameras.recorder_backend == "argus_metadata"
+                and cfg.argus_frame_sync.enabled
+            ):
                 frame_sync_payload, frame_sync_failure = _evaluate_argus_frame_sync(handle, cfg)
                 if frame_sync_failure is not None:
                     details = ""
@@ -1370,6 +1498,23 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     decision = frame_sync_failure
 
+            if (
+                decision in ("save", "operator_save", "stream_exit")
+                and cfg.cameras.recorder_backend == "argus_online_sync"
+            ):
+                online_sync_payload, online_sync_failure = _evaluate_online_sync_manifest(handle, cfg)
+                if online_sync_failure is not None:
+                    details = ""
+                    if online_sync_payload:
+                        failures = online_sync_payload.get("failures") or []
+                        details = "; ".join(str(f) for f in failures)
+                    logger.error("online sync gate failed: %s %s", online_sync_failure, details)
+                    _emit(
+                        "ERROR: Online sync failed; episode will be discarded. "
+                        f"{details or online_sync_failure}"
+                    )
+                    decision = online_sync_failure
+
             if decision in ("save", "operator_save", "stream_exit"):
                 meta_path = _write_episode_meta(
                     handle, cfg, locked, argus_failed, connect_errors,
@@ -1381,6 +1526,8 @@ def main(argv: list[str] | None = None) -> int:
                     payload["split_emit_ms"] = split_emit_ms
                     if frame_sync_payload is not None:
                         payload["argus_frame_sync"] = frame_sync_payload
+                    if online_sync_payload is not None:
+                        payload["online_sync"] = online_sync_payload
                     meta_path.write_text(json.dumps(payload, indent=2))
                 except (OSError, json.JSONDecodeError) as exc:
                     logger.warning("failed to annotate cleanup duration: %s", exc)

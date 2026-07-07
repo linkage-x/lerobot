@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -32,6 +33,8 @@ class MaterializedVideo:
     stop_frame_index: int
     frame_count: int
     raw_frame_count: int | None
+    verified_frame_count: int | None
+    verify_frame_counts: bool
     rewritten: bool
 
 
@@ -199,6 +202,83 @@ def _ensure_selected_frames_exist(
         raise ValueError(f"{window.camera} sidecar missing selected frames: {missing}")
 
 
+def _materialize_one_camera(
+    episode_dir: Path,
+    camera: str,
+    src: Path,
+    frames: list[ArgusFrameMetadata],
+    window: CameraFrameWindow,
+    *,
+    fps: int,
+    codec: str,
+    encoder: str,
+    timeout_s: float,
+    verify_frame_counts: bool,
+) -> tuple[str, dict]:
+    if not src.exists():
+        raise FileNotFoundError(f"{camera} video not found: {src}")
+    _ensure_selected_frames_exist(frames, window)
+
+    raw_count = _ffprobe_frame_count(src) if verify_frame_counts else None
+    verified_count: int | None = None
+    rewritten = False
+    needs_rewrite = (
+        not verify_frame_counts
+        or raw_count != window.frame_count
+        or window.start_frame_index != 0
+    )
+    if needs_rewrite:
+        tmp = src.with_name(f".{src.stem}.aligned.tmp{src.suffix}")
+        backup = src.with_name(f"{src.name}.raw")
+        if tmp.exists():
+            tmp.unlink()
+        cmd = build_ffmpeg_select_command(
+            src,
+            tmp,
+            window,
+            fps=fps,
+            codec=codec,
+            encoder=encoder,
+        )
+        result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout_s, check=False)
+        if result.returncode != 0 or not tmp.exists() or tmp.stat().st_size <= 0:
+            tmp.unlink(missing_ok=True)
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"{camera} ffmpeg materialization failed: {detail}")
+        if verify_frame_counts:
+            verified_count = _ffprobe_frame_count(tmp)
+            if verified_count is not None and verified_count != window.frame_count:
+                tmp.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"{camera} materialized frame count "
+                    f"{verified_count} != {window.frame_count}"
+                )
+        src.replace(backup)
+        try:
+            tmp.replace(src)
+        except Exception:
+            backup.replace(src)
+            raise
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError:
+            pass
+        rewritten = True
+
+    _rewrite_sidecar(episode_dir, camera, frames, window)
+    return camera, asdict(MaterializedVideo(
+        camera=camera,
+        path=str(src),
+        start_frame_index=window.start_frame_index,
+        stop_frame_index=window.stop_frame_index,
+        frame_count=window.frame_count,
+        raw_frame_count=raw_count,
+        verified_frame_count=verified_count,
+        verify_frame_counts=verify_frame_counts,
+        rewritten=rewritten,
+    ))
+
+
 def materialize_aligned_videos(
     episode_dir: Path,
     fragments: dict[str, Path],
@@ -208,6 +288,8 @@ def materialize_aligned_videos(
     fps: int,
     codec: str,
     timeout_s: float = 600.0,
+    verify_frame_counts: bool = True,
+    max_workers: int = 1,
 ) -> dict[str, dict]:
     """Rewrite raw videos to the synchronized frame window.
 
@@ -220,59 +302,51 @@ def materialize_aligned_videos(
     windows = camera_frame_windows(alignment)
     encoder = _select_materialization_encoder(codec)
     results: dict[str, dict] = {}
-    for camera, window in windows.items():
-        src = fragments[camera]
-        if not src.exists():
-            raise FileNotFoundError(f"{camera} video not found: {src}")
-        _ensure_selected_frames_exist(frames_by_camera[camera], window)
-
-        raw_count = _ffprobe_frame_count(src)
-        rewritten = False
-        if raw_count != window.frame_count or window.start_frame_index != 0:
-            tmp = src.with_name(f".{src.stem}.aligned.tmp{src.suffix}")
-            backup = src.with_name(f"{src.name}.raw")
-            if tmp.exists():
-                tmp.unlink()
-            cmd = build_ffmpeg_select_command(
+    worker_count = max(1, min(int(max_workers), len(windows)))
+    tasks = [
+        (
+            camera,
+            fragments[camera],
+            frames_by_camera[camera],
+            window,
+        )
+        for camera, window in sorted(windows.items())
+    ]
+    if worker_count == 1:
+        for camera, src, frames, window in tasks:
+            name, payload = _materialize_one_camera(
+                episode_dir,
+                camera,
                 src,
-                tmp,
+                frames,
                 window,
                 fps=fps,
                 codec=codec,
                 encoder=encoder,
+                timeout_s=timeout_s,
+                verify_frame_counts=verify_frame_counts,
             )
-            result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout_s, check=False)
-            if result.returncode != 0 or not tmp.exists() or tmp.stat().st_size <= 0:
-                tmp.unlink(missing_ok=True)
-                detail = (result.stderr or result.stdout or "").strip()
-                raise RuntimeError(f"{camera} ffmpeg materialization failed: {detail}")
-            out_count = _ffprobe_frame_count(tmp)
-            if out_count is not None and out_count != window.frame_count:
-                tmp.unlink(missing_ok=True)
-                raise RuntimeError(
-                    f"{camera} materialized frame count {out_count} != {window.frame_count}"
-                )
-            src.replace(backup)
-            try:
-                tmp.replace(src)
-            except Exception:
-                backup.replace(src)
-                raise
-            try:
-                backup.unlink(missing_ok=True)
-            except OSError:
-                pass
-            rewritten = True
+            results[name] = payload
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            future_to_camera = {
+                pool.submit(
+                    _materialize_one_camera,
+                    episode_dir,
+                    camera,
+                    src,
+                    frames,
+                    window,
+                    fps=fps,
+                    codec=codec,
+                    encoder=encoder,
+                    timeout_s=timeout_s,
+                    verify_frame_counts=verify_frame_counts,
+                ): camera
+                for camera, src, frames, window in tasks
+            }
+            for future in as_completed(future_to_camera):
+                name, payload = future.result()
+                results[name] = payload
 
-        _rewrite_sidecar(episode_dir, camera, frames_by_camera[camera], window)
-        results[camera] = asdict(MaterializedVideo(
-            camera=camera,
-            path=str(src),
-            start_frame_index=window.start_frame_index,
-            stop_frame_index=window.stop_frame_index,
-            frame_count=window.frame_count,
-            raw_frame_count=raw_count,
-            rewritten=rewritten,
-        ))
-
-    return results
+    return dict(sorted(results.items()))

@@ -1,16 +1,18 @@
 # Thor + SG16A-AGTH-G3Y-A1 + 11 x SG2-AR0234C-G2F GMSL2 cameras + BOX 采集板
 # (gripper, IMU, trigger, six-d force, two Paxini touch pads).
 #
-# The default recording path is the metadata-integrated Libargus recorder:
+# The default recording path is the online-synchronized Libargus recorder:
 #
-#     Libargus capture request
-#       |-> video stream    -> nveglstreamsrc -> nvv4l2h265enc -> matroskamux -> .mkv
-#       |-> metadata stream -> FrameConsumer  -> <camera>.argus_frame_metadata.csv
+#     Argus BufferOutputStream
+#       -> same-buffer SOF metadata
+#       -> full SOF cluster alignment across cameras
+#       -> hardware encoder
+#       -> per-camera MKV
 #
 # Python's job is to (a) decide which sensor-ids to record, (b) start/stop the
 # recorder around each episode, (c) talk UDP to the BOX 采集板 MCU via the
 # vendored `box_sdk` wheel and snapshot its sensors into the episode metadata,
-# and (d) align/materialize camera videos by Libargus per-frame SOF timestamps.
+# and (d) check the recorder's online sync manifest before saving the episode.
 # The frame pixels never enter the Python process.
 #
 # AR0234 + this board's dtbo is hard-locked to 1920x1080 @ 60 fps
@@ -47,27 +49,60 @@ sensors:
     recording_preview_watchdog_s: 2.0  # how often the recorder checks preview JPEG freshness
     stream_health_poll_s: 1.0  # while connected but idle, poll recording streams for EOS/TIMEOUT at this cadence
     stop_on_stream_exit: true  # set false/--ignore-stream-exit for diagnostics only
-    # Production frame sync gate. The default metadata-integrated Libargus
-    # backend writes one `<camera>.argus_frame_metadata.csv` sidecar per
-    # episode. thor_record.py aligns every camera to the reference camera by
-    # nearest SOF TSC before saving, then rewrites the videos to the accepted
-    # common frame window. These flags are also forced on when
-    # defaults.recorder_backend=argus_metadata.
+    # Fallback metadata-backend frame sync gate. The argus_metadata backend
+    # writes one `<camera>.argus_frame_metadata.csv` sidecar per episode.
+    # thor_record.py aligns all cameras by SOF TSC before saving, then rewrites
+    # the videos to the accepted common frame window. These flags are forced on
+    # only when defaults.recorder_backend=argus_metadata.
     argus_frame_sync:
       enabled: true
       required: true
-      reference_camera: ""  # empty = first active camera
+      # virtual_cluster = build a common SOF-time grid from all cameras instead
+      # of treating one camera's frame sequence as the truth. Set to "camera"
+      # only for diagnostics/fallback with reference_camera below.
+      reference_strategy: virtual_cluster
+      reference_camera: ""
       tolerance_ms: 1.0
+      cadence_tolerance_ms: 1.0
+      # false = skip expensive ffprobe frame-count scans after materialization.
+      # The metadata sync gate and ffmpeg -frames:v target still enforce equal
+      # logical output frame counts. Set true for strict burn-in QC.
+      materialize_verify: false
+      materialize_workers: 2
       report_name: argus_frame_alignment.json
+
+    # Production online sync backend. This recorder aligns frames before they
+    # enter the encoder, so saved videos should already have equal frame counts
+    # and do not require post-save ffmpeg materialization.
+    online_sync:
+      enabled: true
+      sync_source: sof_tsc_ns
+      tolerance_ms: 1.0
+      startup_full_clusters: 30
+      # Per-camera Argus acquire timeout while forming a full SOF cluster. At
+      # 60 Hz a healthy camera should produce the next frame within ~16.7 ms;
+      # 1000 ms is intentionally generous but fails much faster than the old
+      # hard-coded 8 s when one stream stops delivering buffers.
+      frame_timeout_ms: 1000
+      # Connect/preflight budgets are intentionally shorter than the episode
+      # stop/mux-close timeout. A wedged 8-camera preflight should fail fast
+      # and expose logs instead of blocking the UI for the full 120s Connect
+      # deadline.
+      preflight_timeout_s: 30.0
+      single_preflight_timeout_s: 10.0
+      missing_frame_policy: fail_episode
+      stop_mode: full_cluster
 
     # Per-camera capture/encoding defaults. Libargus handles capture/ISP and
     # the hardware H.265 encoder writes a complete MKV per camera per episode.
     defaults:
       pipeline: argus          # 'argus' = NVIDIA Argus camera stack + ISP
-      # argus_metadata: production path. One Libargus owner records video plus
-      # per-frame SOF metadata sidecars; UI start/stop/save API stays the same.
+      # argus_online_sync: production default. One Libargus owner aligns full
+      # SOF clusters before hardware encoding; UI start/stop/save API stays the same.
+      # argus_metadata: fallback path. Records video plus per-frame metadata,
+      # then trims/materializes videos by SOF timestamps after recording.
       # gstreamer_splitmux: legacy fallback, no Libargus metadata sync gate.
-      recorder_backend: argus_metadata
+      recorder_backend: argus_online_sync
       sensor_mode: 0
       width: 1920
       height: 1080

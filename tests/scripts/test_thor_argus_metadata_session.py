@@ -1,6 +1,8 @@
+import time
 from pathlib import Path
 
 from tools.thor.gmsl2 import argus_metadata_session as ams
+from tools.thor.gmsl2 import argus_online_sync_session as aos
 from tools.thor.gmsl2 import gmsl2_record as gr
 from tools.thor.gmsl2 import persistent_session as ps
 
@@ -10,6 +12,7 @@ def _recorder_config(tmp_path: Path, *, recorder_backend: str) -> gr.RecorderCon
         cameras=gr.CameraDefaults(recorder_backend=recorder_backend),
         hardware_sync=gr.HardwareSync(),
         argus_frame_sync=gr.ArgusFrameSync(),
+        online_sync=gr.ArgusOnlineSync(),
         repo_id="local/test",
         single_task="test",
         dataset_root=tmp_path / "dataset",
@@ -49,6 +52,29 @@ class _PreflightSession(ams.ArgusMetadataCameraSession):
             repo_root=tmp_path,
             binary_path=tmp_path / "argus_metadata_video_recorder",
             auto_build=False,
+        )
+        self.outcomes = list(outcomes)
+        self.calls: list[tuple[int, ...]] = []
+
+    def _run_preflight_for_streams(self, streams: list[ps.StreamConfig]) -> None:
+        self.calls.append(tuple(stream.sid for stream in streams))
+        if not self.outcomes:
+            return
+        outcome = self.outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+
+
+class _OnlinePreflightSession(aos.ArgusOnlineSyncCameraSession):
+    def __init__(self, tmp_path: Path, outcomes: list[Exception | None]):
+        super().__init__(
+            _streams(6, 7),
+            tmp_path / "warmup",
+            repo_root=tmp_path,
+            binary_path=tmp_path / "argus_online_sync_video_recorder",
+            auto_build=False,
+            preflight_timeout_s=1.0,
+            single_preflight_timeout_s=1.0,
         )
         self.outcomes = list(outcomes)
         self.calls: list[tuple[int, ...]] = []
@@ -123,8 +149,44 @@ class _ExitedTextProc:
         return 0
 
 
-def test_camera_defaults_select_argus_metadata_backend() -> None:
-    assert gr.CameraDefaults().recorder_backend == "argus_metadata"
+def test_camera_defaults_select_argus_online_sync_backend() -> None:
+    assert gr.CameraDefaults().recorder_backend == "argus_online_sync"
+
+
+def test_camera_defaults_still_accept_argus_metadata_fallback() -> None:
+    assert gr.CameraDefaults(recorder_backend="argus_metadata").recorder_backend == "argus_metadata"
+
+
+def test_argus_online_sync_preflight_timeout_defaults() -> None:
+    cfg = gr.ArgusOnlineSync()
+
+    assert cfg.frame_timeout_ms == 1000
+    assert cfg.preflight_timeout_s == 30.0
+    assert cfg.single_preflight_timeout_s == 10.0
+
+
+def test_argus_online_sync_rejects_non_positive_frame_timeout() -> None:
+    try:
+        gr.ArgusOnlineSync(frame_timeout_ms=0)
+    except ValueError as exc:
+        assert "frame_timeout_ms must be > 0" in str(exc)
+    else:
+        raise AssertionError("expected invalid frame_timeout_ms to raise ValueError")
+
+
+def test_argus_online_sync_record_command_passes_frame_timeout(tmp_path: Path) -> None:
+    session = aos.ArgusOnlineSyncCameraSession(
+        _streams(6, 7),
+        tmp_path / "warmup",
+        repo_root=tmp_path,
+        binary_path=tmp_path / "argus_online_sync_video_recorder",
+        auto_build=False,
+        frame_timeout_ms=750,
+    )
+
+    cmd = session._build_record_command(session._stream_cfgs, tmp_path / "episode", frames=60)
+
+    assert cmd[cmd.index("--frame-timeout-ms") + 1] == "750"
 
 
 def test_legacy_gmsl2_cli_rejects_argus_metadata_backend(tmp_path: Path) -> None:
@@ -394,3 +456,164 @@ def test_argus_metadata_preflight_raises_when_every_camera_fails(tmp_path: Path)
         assert "cam_07" in str(exc)
     else:
         raise AssertionError("expected all-camera preflight failure to raise")
+
+
+def test_argus_online_sync_group_timeout_fails_fast_without_single_isolation(tmp_path: Path) -> None:
+    session = _OnlinePreflightSession(
+        tmp_path,
+        outcomes=[RuntimeError("Argus online-sync recorder preflight timed out after 1.0s")],
+    )
+
+    try:
+        session._preflight_streams(_streams(6, 7))
+    except RuntimeError as exc:
+        assert "group preflight timed out" in str(exc)
+        assert "not running sequential single-camera isolation" in str(exc)
+    else:
+        raise AssertionError("expected group timeout to fail fast")
+    assert session.calls == [(6, 7)]
+
+
+def test_argus_online_sync_preflight_drops_camera_named_by_group_error(tmp_path: Path) -> None:
+    session = _OnlinePreflightSession(
+        tmp_path,
+        outcomes=[
+            RuntimeError("cam_07: missing full SOF cluster"),
+            None,
+        ],
+    )
+
+    selected = session._preflight_streams(_streams(6, 7))
+    errors = session.poll_errors()
+
+    assert [stream.sid for stream in selected] == [6]
+    assert session.calls == [(6, 7), (6,)]
+    assert len(errors) == 1
+    assert errors[0].sid == 7
+    assert "cam_07" in errors[0].message
+
+
+def test_argus_online_sync_timeout_drops_only_recorder_error_prefix_camera(tmp_path: Path) -> None:
+    session = _OnlinePreflightSession(
+        tmp_path,
+        outcomes=[
+            RuntimeError(
+                "Argus online-sync recorder preflight timed out after 30.0s "
+                "for cam_06,cam_09,cam_13,cam_14: "
+                "cam_06: timed out waiting for Argus buffer after 1000 ms"
+            ),
+            None,
+        ],
+    )
+
+    selected = session._preflight_streams(_streams(6, 9, 13, 14))
+    errors = session.poll_errors()
+
+    assert [stream.sid for stream in selected] == [9, 13, 14]
+    assert session.calls == [(6, 9, 13, 14), (9, 13, 14)]
+    assert len(errors) == 1
+    assert errors[0].sid == 6
+    assert "cam_06: timed out waiting" in errors[0].message
+    assert "cam_09" in errors[0].message
+
+
+def _write_fake_online_sync_recorder(tmp_path: Path, *, mode: str) -> Path:
+    script = tmp_path / f"fake_online_sync_{mode}.py"
+    if mode == "success":
+        body = """#!/usr/bin/env python3
+import pathlib
+import sys
+
+args = sys.argv[1:]
+def value(flag, default=""):
+    return args[args.index(flag) + 1] if flag in args else default
+
+sids = [int(x) for x in value("--sids").split(",") if x]
+frames = int(value("--frames", "0"))
+out_dir = pathlib.Path(value("--episode-dir"))
+prefix = value("--name-prefix", "cam")
+out_dir.mkdir(parents=True, exist_ok=True)
+for sid in sids:
+    name = f"{prefix}_{sid:02d}"
+    path = out_dir / f"{name}.argus_frame_metadata.csv"
+    with path.open("w", encoding="utf-8") as f:
+        f.write("camera,encoded_frame_index,local_frame_number,sensor_timestamp_ns,sof_tsc_ns,eof_tsc_ns,internal_frame_count\\n")
+        for i in range(frames):
+            sof = 100000000 + i * 16666667
+            f.write(f"{name},{i},{i + 1},{sof - 1000},{sof},{sof + 1000},{i + 1}\\n")
+print("recording started")
+"""
+    elif mode == "sleep":
+        body = """#!/usr/bin/env python3
+import time
+print("fake recorder sleeping", flush=True)
+time.sleep(20)
+"""
+    else:
+        raise ValueError(mode)
+    script.write_text(body)
+    script.chmod(0o755)
+    return script
+
+
+def test_argus_online_sync_preflight_accepts_complete_sidecars(tmp_path: Path) -> None:
+    fake = _write_fake_online_sync_recorder(tmp_path, mode="success")
+    session = aos.ArgusOnlineSyncCameraSession(
+        _streams(6, 7),
+        tmp_path / "warmup",
+        repo_root=tmp_path,
+        binary_path=fake,
+        auto_build=False,
+        preflight_timeout_s=5.0,
+        single_preflight_timeout_s=2.0,
+        preflight_frames=2,
+    )
+
+    session._run_preflight_for_streams(_streams(6, 7))
+
+
+def test_argus_online_sync_preflight_times_out_and_kills_group(tmp_path: Path) -> None:
+    fake = _write_fake_online_sync_recorder(tmp_path, mode="sleep")
+    session = aos.ArgusOnlineSyncCameraSession(
+        _streams(6, 7),
+        tmp_path / "warmup",
+        repo_root=tmp_path,
+        binary_path=fake,
+        auto_build=False,
+        preflight_timeout_s=1.0,
+        single_preflight_timeout_s=1.0,
+        preflight_frames=2,
+    )
+
+    started = time.monotonic()
+    try:
+        session._run_preflight_for_streams(_streams(6, 7))
+    except RuntimeError as exc:
+        elapsed = time.monotonic() - started
+        assert "preflight timed out after 1.0s" in str(exc)
+        assert "cam_06,cam_07" in str(exc)
+        assert elapsed < 5.0
+    else:
+        raise AssertionError("expected preflight timeout")
+
+
+def test_argus_online_sync_single_preflight_uses_shorter_timeout(tmp_path: Path) -> None:
+    fake = _write_fake_online_sync_recorder(tmp_path, mode="sleep")
+    session = aos.ArgusOnlineSyncCameraSession(
+        _streams(6),
+        tmp_path / "warmup",
+        repo_root=tmp_path,
+        binary_path=fake,
+        auto_build=False,
+        preflight_timeout_s=20.0,
+        single_preflight_timeout_s=1.0,
+        preflight_frames=2,
+    )
+
+    try:
+        session._run_preflight_for_streams(_streams(6))
+    except RuntimeError as exc:
+        assert "preflight timed out after 1.0s" in str(exc)
+        assert "cam_06" in str(exc)
+    else:
+        raise AssertionError("expected single-camera preflight timeout")

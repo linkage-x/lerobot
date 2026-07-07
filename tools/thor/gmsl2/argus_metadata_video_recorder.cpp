@@ -129,6 +129,8 @@ struct Options {
     uint32_t control_rate = 1;
     bool use_h264 = false;
     bool use_mp4 = false;
+    uint32_t startup_min_rows = 0;
+    uint32_t startup_timeout_ms = 15000;
     std::string name_prefix = "cam";
     std::string episode_dir = ".";
 };
@@ -236,6 +238,14 @@ bool parse_args(int argc, char** argv, Options* options) {
             const char* value = require_value("--control-rate");
             if (!value) return false;
             options->control_rate = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+        } else if (arg == "--startup-min-rows") {
+            const char* value = require_value("--startup-min-rows");
+            if (!value) return false;
+            options->startup_min_rows = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+        } else if (arg == "--startup-timeout-ms") {
+            const char* value = require_value("--startup-timeout-ms");
+            if (!value) return false;
+            options->startup_timeout_ms = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
         } else if (arg == "--codec") {
             const char* value = require_value("--codec");
             if (!value) return false;
@@ -273,6 +283,7 @@ bool parse_args(int argc, char** argv, Options* options) {
                       << " --sids 6,7 --frames 600 --episode-dir DIR"
                       << " [--fps 60] [--codec h265] [--bitrate 40000000]"
                       << " [--iframe-interval 1] [--container mkv]"
+                      << " [--startup-min-rows N] [--startup-timeout-ms MS]"
                       << " [--name-prefix cam]"
                       << "\n       --frames 0 records until SIGINT/SIGTERM"
                       << std::endl;
@@ -640,6 +651,17 @@ bool wait_for_recording_marker(
     return false;
 }
 
+uint64_t startup_min_rows(const Options& options) {
+    if (options.startup_min_rows > 0) {
+        return options.startup_min_rows;
+    }
+    if (options.frames == 0) {
+        uint32_t half_second = options.fps / 2;
+        return half_second > 2 ? half_second : 2;
+    }
+    return options.frames < 2 ? options.frames : 2;
+}
+
 void write_recording_markers(
     const Options& options,
     const std::string& reference_name,
@@ -733,7 +755,12 @@ int main(int argc, char** argv) {
         }
     }
     CamCtx* reference = cameras.front().get();
-    bool start_ready = wait_for_recording_marker(cameras, 2, 3000);
+    uint64_t min_start_rows = startup_min_rows(options);
+    bool start_ready = wait_for_recording_marker(
+        cameras,
+        min_start_rows,
+        options.startup_timeout_ms
+    );
     uint64_t start_encoded_frame_index =
         encoded_marker_value(reference->latest_encoded_frame_index.load());
     uint64_t start_sof_tsc_ns = reference->latest_sof_tsc_ns.load();

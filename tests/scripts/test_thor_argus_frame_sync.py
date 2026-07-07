@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.thor.gmsl2.argus_frame_sync import (
     ArgusFrameMetadata,
@@ -10,6 +11,7 @@ from tools.thor.gmsl2.argus_frame_sync import (
     write_alignment_report_json,
     write_frame_metadata_csv,
 )
+from tools.thor.gmsl2 import argus_video_materialize as avm
 from tools.thor.gmsl2.argus_video_materialize import build_ffmpeg_select_command
 from tools.thor.gmsl2.argus_video_materialize import _select_materialization_encoder
 
@@ -113,6 +115,102 @@ def test_align_episode_frames_fails_on_interior_drops() -> None:
     assert "dropped 1 reference frames inside synchronized window" in alignment.failures
 
 
+def test_virtual_cluster_strategy_trims_boundary_without_reference_camera() -> None:
+    period = 16_666_667
+    base = 100_000_000
+    cam06 = _rows("cam_06", [base + i * period for i in range(10)])
+    # cam_07 starts later during camera startup but then keeps a contiguous
+    # encoded-frame run. The virtual strategy should trim the boundary startup
+    # frames instead of anchoring to cam_06.
+    cam07 = _rows(
+        "cam_07",
+        [
+            base + 2 * period + 5_000,
+            base + 3 * period + 5_000,
+            base + 4 * period + 5_000,
+            base + 5 * period + 5_000,
+            base + 6 * period + 5_000,
+            base + 7 * period + 5_000,
+            base + 8 * period + 5_000,
+            base + 9 * period + 5_000,
+        ],
+    )
+
+    alignment = align_episode_frames(
+        {"cam_06": cam06, "cam_07": cam07},
+        reference_strategy="virtual_cluster",
+        tolerance_ns=50_000,
+        expected_period_ns=period,
+        cadence_tolerance_ns=50_000,
+    )
+
+    assert alignment.ok
+    assert alignment.reference_camera == "__virtual_sof_cluster__"
+    assert alignment.accepted_reference_indices == [2, 3, 4, 5, 6, 7, 8, 9]
+    assert alignment.frame_count_by_camera() == {"cam_06": 8, "cam_07": 8}
+    assert "cam_07:missing" in alignment.drop_reasons[0]
+    assert "cam_07:missing" in alignment.drop_reasons[1]
+
+    windows = camera_frame_windows(alignment)
+    assert windows["cam_06"].start_frame_index == 2
+    assert windows["cam_06"].stop_frame_index == 10
+    assert windows["cam_07"].start_frame_index == 0
+    assert windows["cam_07"].stop_frame_index == 8
+    assert windows["cam_06"].frame_count == windows["cam_07"].frame_count == 8
+
+
+def test_virtual_cluster_strategy_fails_on_interior_missing_cluster() -> None:
+    period = 16_666_667
+    base = 100_000_000
+    cam06 = _rows("cam_06", [base + i * period for i in range(6)])
+    cam07 = _rows(
+        "cam_07",
+        [
+            base + 5_000,
+            base + period + 5_000,
+            base + 2 * period + 5_000,
+            base + 4 * period + 5_000,
+            base + 5 * period + 5_000,
+        ],
+    )
+
+    alignment = align_episode_frames(
+        {"cam_06": cam06, "cam_07": cam07},
+        reference_strategy="virtual_cluster",
+        tolerance_ns=50_000,
+        expected_period_ns=period,
+        cadence_tolerance_ns=50_000,
+    )
+
+    assert not alignment.ok
+    assert "dropped 1 SOF clusters inside synchronized window" in alignment.failures
+    assert "cam_07:missing" in alignment.drop_reasons[3]
+
+
+def test_virtual_cluster_strategy_fails_on_60hz_cadence_break() -> None:
+    period = 16_666_667
+    base = 100_000_000
+    values = [
+        base,
+        base + period,
+        base + 2 * period,
+        base + 4 * period,
+    ]
+    cam06 = _rows("cam_06", values)
+    cam07 = _rows("cam_07", [sof + 5_000 for sof in values])
+
+    alignment = align_episode_frames(
+        {"cam_06": cam06, "cam_07": cam07},
+        reference_strategy="virtual_cluster",
+        tolerance_ns=50_000,
+        expected_period_ns=period,
+        cadence_tolerance_ns=50_000,
+    )
+
+    assert not alignment.ok
+    assert any("SOF cadence break" in failure for failure in alignment.failures)
+
+
 def test_frame_metadata_csv_round_trip_and_report(tmp_path: Path) -> None:
     rows = _rows("cam_06", [100_000_000, 116_666_667])
     sidecar = frame_metadata_sidecar_path(tmp_path, "cam_06")
@@ -179,3 +277,63 @@ def test_select_materialization_encoder_reports_missing_ffmpeg_encoder() -> None
         assert "Argus-aligned videos" in str(exc)
     else:
         raise AssertionError("expected missing materialization encoder to fail")
+
+
+def test_materialize_aligned_videos_accepts_parallel_workers(tmp_path: Path) -> None:
+    period = 16_666_667
+    cam06 = _rows("cam_06", [100_000_000 + i * period for i in range(2)])
+    cam07 = _rows("cam_07", [100_005_000 + i * period for i in range(2)])
+    frames = {"cam_06": cam06, "cam_07": cam07}
+    for camera, rows in frames.items():
+        write_frame_metadata_csv(frame_metadata_sidecar_path(tmp_path, camera), rows)
+        (tmp_path / f"{camera}.mkv").write_bytes(b"raw")
+
+    alignment = align_episode_frames(
+        frames,
+        reference_strategy="virtual_cluster",
+        tolerance_ns=50_000,
+    )
+
+    def fake_one_camera(
+        episode_dir,
+        camera,
+        src,
+        camera_frames,
+        window,
+        *,
+        fps,
+        codec,
+        encoder,
+        timeout_s,
+        verify_frame_counts,
+    ):
+        return camera, {
+            "camera": camera,
+            "path": str(src),
+            "start_frame_index": window.start_frame_index,
+            "stop_frame_index": window.stop_frame_index,
+            "frame_count": window.frame_count,
+            "raw_frame_count": None,
+            "verified_frame_count": None,
+            "verify_frame_counts": verify_frame_counts,
+            "rewritten": True,
+        }
+
+    with (
+        patch.object(avm, "_select_materialization_encoder", lambda codec: "libx265"),
+        patch.object(avm, "_materialize_one_camera", fake_one_camera),
+    ):
+        result = avm.materialize_aligned_videos(
+            tmp_path,
+            {"cam_06": tmp_path / "cam_06.mkv", "cam_07": tmp_path / "cam_07.mkv"},
+            frames,
+            alignment,
+            fps=60,
+            codec="h265",
+            verify_frame_counts=False,
+            max_workers=2,
+        )
+
+    assert list(result) == ["cam_06", "cam_07"]
+    assert result["cam_06"]["frame_count"] == 2
+    assert result["cam_07"]["frame_count"] == 2
