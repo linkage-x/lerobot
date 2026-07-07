@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from tools.thor.gmsl2 import argus_metadata_session as ams
 from tools.thor.gmsl2 import persistent_session as ps
@@ -73,6 +74,10 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
         self.stop_mode = str(stop_mode)
         self.start_retry_settle_s = 2.0
         self.start_retries = 1
+        self._persistent_ready_evt = threading.Event()
+        self._episode_done_evt = threading.Event()
+        self._episode_result: dict[str, Any] | None = None
+        self._preview_warning_emitted = False
 
     def _recorder_source(self) -> Path:
         return Path(__file__).with_name("argus_online_sync_video_recorder.cpp")
@@ -170,6 +175,121 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
             self.stop_mode,
         ])
         return cmd
+
+    def _build_persistent_command(self) -> list[str]:
+        daemon_dir = self.warmup_dir / "argus_online_sync_persistent"
+        cmd = self._build_record_command(self._stream_cfgs, daemon_dir, frames=0)
+        cmd.append("--persistent")
+        return cmd
+
+    def connect(self) -> None:
+        super().connect()
+        try:
+            self._start_persistent_daemon()
+        except Exception:
+            self.disconnect()
+            raise
+
+    def _start_persistent_daemon(self) -> None:
+        if self._proc and self._proc.poll() is None:
+            return
+        self.disable_previews()
+        self.warmup_dir.mkdir(parents=True, exist_ok=True)
+        cmd = self._build_persistent_command()
+        self._persistent_ready_evt.clear()
+        self._recording_started_evt.clear()
+        self._episode_done_evt.clear()
+        self._reader_stop.clear()
+        with self._lock:
+            self._recent_output = []
+            self._episode_result = None
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=self.repo_root,
+                text=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                start_new_session=True,
+            )
+        except Exception:
+            with self._lock:
+                self._proc = None
+            raise
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop,
+            args=(proc,),
+            name="argus-online-sync-persistent-log",
+            daemon=True,
+        )
+        self._reader_thread.start()
+        with self._lock:
+            self._proc = proc
+        deadline = time.monotonic() + max(1.0, self.connect_timeout_s)
+        while not self._persistent_ready_evt.is_set():
+            rc = proc.poll()
+            if rc is not None:
+                if self._reader_thread is not None:
+                    self._reader_thread.join(timeout=1.0)
+                    self._reader_thread = None
+                with self._lock:
+                    recent = "; ".join(self._recent_output[-8:])
+                    self._proc = None
+                message = f"online-sync persistent recorder exited during connect rc={rc}"
+                if recent:
+                    message = f"{message}: {recent}"
+                self._errors.append(ps.StreamError(
+                    sid=-1,
+                    name="argus_online_sync",
+                    message=message,
+                ))
+                raise RuntimeError(message)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        if not self._persistent_ready_evt.is_set():
+            self._terminate_proc(proc)
+            if self._reader_thread is not None:
+                self._reader_thread.join(timeout=1.0)
+                self._reader_thread = None
+            with self._lock:
+                self._proc = None
+                recent = "; ".join(self._recent_output[-8:])
+            message = "online-sync persistent recorder did not report persistent ready"
+            if recent:
+                message = f"{message}: {recent}"
+            self._errors.append(ps.StreamError(
+                sid=-1,
+                name="argus_online_sync",
+                message=message,
+            ))
+            raise RuntimeError(message)
+
+    def _send_daemon_command(self, line: str) -> None:
+        with self._lock:
+            proc = self._proc
+        if proc is None or proc.poll() is not None or proc.stdin is None:
+            raise RuntimeError("Argus online-sync persistent recorder is not running")
+        proc.stdin.write(line.rstrip("\n") + "\n")
+        proc.stdin.flush()
+
+    def _terminate_proc(self, proc: subprocess.Popen[str], *, timeout_s: float = 2.0) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            proc.wait(timeout=timeout_s)
 
     @staticmethod
     def _is_preflight_timeout(message: str) -> bool:
@@ -376,6 +496,10 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
     def _reader_loop(self, proc: subprocess.Popen[str]) -> None:
         if proc.stdout is None:
             return
+        done_re = re.compile(
+            r"episode done idx=(?P<idx>\d+) ok=(?P<ok>true|false) "
+            r"frames=(?P<frames>\d+)(?: failure=(?P<failure>.*))?$"
+        )
         for line in proc.stdout:
             if self._reader_stop.is_set():
                 break
@@ -385,29 +509,24 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
                     self._recent_output.append(text)
                     self._recent_output = self._recent_output[-20:]
                 logger.info("[argus-online-sync] %s", text)
+                if text == "persistent ready":
+                    self._persistent_ready_evt.set()
                 if "recording started" in text:
                     self._recording_started_evt.set()
+                match = done_re.search(text)
+                if match:
+                    result = {
+                        "idx": int(match.group("idx")),
+                        "ok": match.group("ok") == "true",
+                        "frames": int(match.group("frames")),
+                        "failure": match.group("failure") or "",
+                    }
+                    with self._lock:
+                        self._episode_result = result
+                    self._episode_done_evt.set()
 
     def start_episode(self, episode_dir: Path, idx: int) -> ps.EpisodeHandle:
-        last_exc: RuntimeError | None = None
-        for attempt in range(self.start_retries + 1):
-            try:
-                return self._start_episode_once(episode_dir, idx)
-            except RuntimeError as exc:
-                last_exc = exc
-                message = str(exc)
-                if attempt >= self.start_retries or not self._is_transient_start_failure(message):
-                    raise
-                logger.warning(
-                    "Argus online-sync recorder start failed with a transient "
-                    "Argus provider error; retrying once after %.1fs: %s",
-                    self.start_retry_settle_s,
-                    message,
-                )
-                self._drop_start_failure_error(message)
-                time.sleep(self.start_retry_settle_s)
-        assert last_exc is not None
-        raise last_exc
+        return self._start_episode_once(episode_dir, idx)
 
     def _drop_start_failure_error(self, message: str) -> None:
         with self._lock:
@@ -434,52 +553,30 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
     def _start_episode_once(self, episode_dir: Path, idx: int) -> ps.EpisodeHandle:
         if not self._active_sids:
             raise RuntimeError("start_episode() before connect()")
-        if self._proc and self._proc.poll() is None:
-            raise RuntimeError("previous Argus online-sync recorder is still running")
+        with self._lock:
+            proc = self._proc
+        if proc is None or proc.poll() is not None:
+            raise RuntimeError("Argus online-sync persistent recorder is not running")
         self._recording_active = True
         self.disable_previews()
         episode_dir.mkdir(parents=True, exist_ok=True)
-        cmd = self._build_record_command(
-            self._stream_cfgs,
-            episode_dir,
-            frames=self.target_frames,
-        )
         self._recording_started_evt.clear()
+        self._episode_done_evt.clear()
         with self._lock:
-            self._recent_output = []
+            self._episode_result = None
         try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=self.repo_root,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,
-            )
+            self._send_daemon_command(f"START {int(idx)} {int(self.target_frames)} {episode_dir}")
         except Exception:
             self._recording_active = False
             raise
-        self._reader_stop.clear()
-        self._reader_thread = threading.Thread(
-            target=self._reader_loop,
-            args=(proc,),
-            name="argus-online-sync-recorder-log",
-            daemon=True,
-        )
-        self._reader_thread.start()
-        with self._lock:
-            self._proc = proc
         deadline = time.monotonic() + max(1.0, self.connect_timeout_s)
         while not self._recording_started_evt.is_set():
             rc = proc.poll()
             if rc is not None:
-                if self._reader_thread is not None:
-                    self._reader_thread.join(timeout=1.0)
-                    self._reader_thread = None
                 with self._lock:
                     recent = "; ".join(self._recent_output[-6:])
                     self._proc = None
-                message = f"online-sync recorder exited before recording started rc={rc}"
+                message = f"online-sync persistent recorder exited before recording started rc={rc}"
                 if recent:
                     message = f"{message}: {recent}"
                 self._errors.append(ps.StreamError(
@@ -493,18 +590,7 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
                 break
             time.sleep(0.05)
         if not self._recording_started_evt.is_set():
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=2.0)
-            if self._reader_thread is not None:
-                self._reader_thread.join(timeout=1.0)
-                self._reader_thread = None
             with self._lock:
-                self._proc = None
                 recent = "; ".join(self._recent_output[-6:])
             message = "online-sync recorder did not report recording started"
             if recent:
@@ -525,9 +611,131 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
             t0_mono_s=t0_mono,
         )
 
+    def stop_episode(self, handle: ps.EpisodeHandle) -> ps.EpisodeHandle:
+        handle.stop_wall_s = time.time()
+        with self._lock:
+            proc = self._proc
+        if proc is None:
+            rc = 0
+        else:
+            rc = proc.poll()
+
+        if proc is not None and rc is None and not self._episode_done_evt.is_set():
+            # Fixed-frame episodes normally complete by themselves. Give that
+            # path a short grace window before sending STOP so automatic
+            # duration-based captures keep the exact episode_time_s * 60 frame
+            # count whenever the recorder is on pace.
+            if self.target_frames > 0:
+                self._episode_done_evt.wait(timeout=min(2.0, max(0.0, self.stop_timeout_s)))
+            if not self._episode_done_evt.is_set():
+                try:
+                    self._send_daemon_command("STOP")
+                except Exception as exc:
+                    self._errors.append(ps.StreamError(
+                        sid=-1,
+                        name="argus_online_sync",
+                        message=f"failed to send STOP to persistent recorder: {exc}",
+                    ))
+
+        deadline = time.monotonic() + max(1.0, self.stop_timeout_s)
+        while not self._episode_done_evt.is_set():
+            if proc is None:
+                break
+            rc = proc.poll()
+            if rc is not None:
+                break
+            if time.monotonic() >= deadline:
+                self._errors.append(ps.StreamError(
+                    sid=-1,
+                    name="argus_online_sync",
+                    message="persistent recorder did not finish episode within timeout",
+                ))
+                self._terminate_proc(proc)
+                with self._lock:
+                    self._proc = None
+                break
+            time.sleep(0.05)
+
+        with self._lock:
+            result = dict(self._episode_result or {})
+        if result and not result.get("ok", False):
+            self._errors.append(ps.StreamError(
+                sid=-1,
+                name="argus_online_sync",
+                message=(
+                    "persistent recorder episode failed: "
+                    f"{result.get('failure') or 'unknown failure'}"
+                ),
+            ))
+
+        rc = proc.poll() if proc is not None else 0
+        if rc not in (0, None) and not result:
+            self._errors.append(ps.StreamError(
+                sid=-1,
+                name="argus_online_sync",
+                message=f"persistent recorder exited with rc={rc}",
+            ))
+            with self._lock:
+                self._proc = None
+        self._recording_active = False
+
+        for stream in self._stream_cfgs:
+            suffix = ".mp4" if stream.container == "mp4" else ".mkv"
+            path = handle.directory / f"{stream.name}{suffix}"
+            handle.fragments[stream.name] = ps.FragmentInfo(
+                sid=stream.sid,
+                name=stream.name,
+                fragment_id=handle.idx,
+                path=path,
+                first_pts_s=None,
+                first_wall_s=handle.t0_wall_s,
+                state=ps.FragmentState.EPISODE,
+            )
+        return handle
+
     def discard_episode(self, handle: ps.EpisodeHandle) -> None:
         super().discard_episode(handle)
         try:
             (handle.directory / "online_sync_manifest.json").unlink(missing_ok=True)
         except OSError as exc:
             logger.warning("failed to unlink online_sync_manifest.json: %s", exc)
+
+    def disconnect(self) -> None:
+        self.disable_previews()
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+        if proc and proc.poll() is None:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.write("QUIT\n")
+                    proc.stdin.flush()
+                proc.wait(timeout=max(1.0, self.stop_timeout_s))
+            except (BrokenPipeError, subprocess.TimeoutExpired):
+                self._terminate_proc(proc)
+        self._reader_stop.set()
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=1.0)
+            self._reader_thread = None
+        self._recording_active = False
+        self._active_sids = []
+
+    def enable_previews(self, *, stagger_s: float = 0.5) -> None:
+        if not self._preview_warning_emitted:
+            logger.info(
+                "Argus online-sync persistent recorder owns camera sessions; "
+                "external nvarguscamerasrc previews are disabled for this backend"
+            )
+            self._preview_warning_emitted = True
+        return None
+
+    def disable_previews(self) -> None:
+        # The persistent online-sync recorder owns the Argus sessions; there are
+        # no separate preview processes to stop in this backend.
+        return None
+
+    def wait_preview_frames(self, *, timeout_s: float = 5.0) -> list[str]:
+        return []
+
+    def refresh_stale_previews(self, *, max_age_s: float) -> list[str]:
+        return []

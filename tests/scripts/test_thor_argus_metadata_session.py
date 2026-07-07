@@ -525,6 +525,9 @@ import pathlib
 import sys
 
 args = sys.argv[1:]
+if "--help" in args or "-h" in args:
+    print("fake online sync recorder")
+    raise SystemExit(0)
 def value(flag, default=""):
     return args[args.index(flag) + 1] if flag in args else default
 
@@ -542,6 +545,65 @@ for sid in sids:
             sof = 100000000 + i * 16666667
             f.write(f"{name},{i},{i + 1},{sof - 1000},{sof},{sof + 1000},{i + 1}\\n")
 print("recording started")
+"""
+    elif mode == "persistent_success":
+        body = """#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+args = sys.argv[1:]
+if "--help" in args or "-h" in args:
+    print("fake online sync recorder")
+    raise SystemExit(0)
+
+def value(flag, default=""):
+    return args[args.index(flag) + 1] if flag in args else default
+
+sids = [int(x) for x in value("--sids").split(",") if x]
+prefix = value("--name-prefix", "cam")
+print("persistent ready", flush=True)
+for line in sys.stdin:
+    parts = line.strip().split(maxsplit=3)
+    if not parts:
+        continue
+    if parts[0] == "QUIT":
+        print("persistent exiting", flush=True)
+        break
+    if parts[0] == "STOP":
+        continue
+    if parts[0] != "START" or len(parts) != 4:
+        print(f"unknown command {line.strip()}", flush=True)
+        continue
+    idx = int(parts[1])
+    frames = int(parts[2])
+    out_dir = pathlib.Path(parts[3])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    counts = {}
+    for sid in sids:
+        name = f"{prefix}_{sid:02d}"
+        counts[name] = frames
+        (out_dir / f"{name}.mkv").write_bytes(b"fake")
+        path = out_dir / f"{name}.argus_frame_metadata.csv"
+        with path.open("w", encoding="utf-8") as f:
+            f.write("camera,logical_frame_index,local_frame_number,sensor_timestamp_ns,sof_tsc_ns,eof_tsc_ns,internal_frame_count\\n")
+            for i in range(frames):
+                sof = 100000000 + i * 16666667
+                f.write(f"{name},{i},{i + 1},{sof - 1000},{sof},{sof + 1000},{i + 1}\\n")
+    manifest = {
+        "ok": True,
+        "failure": "",
+        "fps": 60,
+        "target_frames": frames,
+        "actual_frames": frames,
+        "sync_source": "sof_tsc_ns",
+        "tolerance_ns": 1000000,
+        "frame_count_by_camera": counts,
+        "max_abs_delta_ns_by_camera": {name: 1000 for name in counts},
+    }
+    (out_dir / "online_sync_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    print(f"recording started idx={idx}", flush=True)
+    print(f"episode done idx={idx} ok=true frames={frames}", flush=True)
 """
     elif mode == "sleep":
         body = """#!/usr/bin/env python3
@@ -617,3 +679,34 @@ def test_argus_online_sync_single_preflight_uses_shorter_timeout(tmp_path: Path)
         assert "cam_06" in str(exc)
     else:
         raise AssertionError("expected single-camera preflight timeout")
+
+
+def test_argus_online_sync_persistent_session_records_episode_without_respawn(tmp_path: Path) -> None:
+    fake = _write_fake_online_sync_recorder(tmp_path, mode="persistent_success")
+    session = aos.ArgusOnlineSyncCameraSession(
+        _streams(6, 7),
+        tmp_path / "warmup",
+        repo_root=tmp_path,
+        binary_path=fake,
+        auto_build=False,
+        preflight_frames=0,
+        target_frames=60,
+        connect_timeout_s=2.0,
+        stop_timeout_s=2.0,
+    )
+
+    session.connect()
+    assert session._proc is not None
+    first_pid = session._proc.pid
+    handle = session.start_episode(tmp_path / "episode_000000", 0)
+    handle = session.stop_episode(handle)
+
+    assert session._proc is not None
+    assert session._proc.pid == first_pid
+    assert session._proc.poll() is None
+    assert (handle.directory / "online_sync_manifest.json").exists()
+    assert set(handle.fragments) == {"cam_06", "cam_07"}
+    assert handle.fragments["cam_06"].path == handle.directory / "cam_06.mkv"
+
+    session.disconnect()
+    assert session._proc is None

@@ -79,7 +79,26 @@ struct Options {
     std::string stop_mode = "full_cluster";
     std::string name_prefix = "cam";
     std::string episode_dir = ".";
+    bool persistent = false;
 };
+
+enum class CommandType {
+    Start,
+    Stop,
+    Quit,
+};
+
+struct Command {
+    CommandType type = CommandType::Quit;
+    uint32_t idx = 0;
+    uint32_t frames = 0;
+    std::string episode_dir;
+};
+
+std::mutex g_command_mutex;
+std::deque<Command> g_commands;
+std::atomic<bool> g_episode_stop_requested(false);
+std::atomic<bool> g_quit_requested(false);
 
 struct FrameMetadata {
     uint64_t local_frame_number = 0;
@@ -311,6 +330,8 @@ bool parse_args(int argc, char** argv, Options* options) {
             const char* value = require_value("--name-prefix");
             if (!value) return false;
             options->name_prefix = value;
+        } else if (arg == "--persistent") {
+            options->persistent = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "usage: " << argv[0]
                       << " --sids 6,7 --frames 600 --episode-dir DIR"
@@ -319,7 +340,12 @@ bool parse_args(int argc, char** argv, Options* options) {
                       << " [--tolerance-ms 1.0] [--startup-full-clusters 30]"
                       << " [--frame-timeout-ms 1000]"
                       << " [--name-prefix cam]"
+                      << " [--persistent]"
                       << "\n       --frames 0 records until SIGINT/SIGTERM"
+                      << "\n       --persistent keeps Argus streams open and reads stdin commands:"
+                      << "\n           START <idx> <frames> <episode_dir>"
+                      << "\n           STOP"
+                      << "\n           QUIT"
                       << std::endl;
             std::exit(0);
         } else {
@@ -1099,7 +1125,7 @@ bool init_camera(ICameraProvider* provider, UniqueObj<CameraProvider>& provider_
     }
     i_source_settings->setSensorMode(cam->sensor_mode);
     i_source_settings->setFrameDurationRange(1000000000ULL / options.fps);
-    return open_episode_outputs(cam, options, i_sensor_mode->getResolution(), options.episode_dir);
+    return true;
 }
 
 bool extract_metadata(Buffer* buffer, FrameMetadata* out) {
@@ -1372,6 +1398,419 @@ void write_manifest(
     out << "}\n";
 }
 
+void release_all_queues(FrameQueues* queues) {
+    if (!queues) {
+        return;
+    }
+    for (auto& queue : *queues) {
+        while (!queue.empty()) {
+            release_bundle(queue.front().get());
+            queue.pop_front();
+        }
+    }
+}
+
+bool open_episode_outputs_for_all(
+    const std::vector<std::unique_ptr<CamCtx>>& cameras,
+    const Options& options,
+    std::string* failure
+) {
+    if (!mkdir_p(options.episode_dir)) {
+        if (failure) {
+            *failure = "failed to create episode directory";
+        }
+        return false;
+    }
+    for (auto& cam : cameras) {
+        ISensorMode* i_sensor_mode = interface_cast<ISensorMode>(cam->sensor_mode);
+        if (!i_sensor_mode) {
+            if (failure) {
+                *failure = cam->name + ": sensor mode unavailable while opening episode outputs";
+            }
+            return false;
+        }
+        if (!open_episode_outputs(cam.get(), options, i_sensor_mode->getResolution(), options.episode_dir)) {
+            if (failure) {
+                *failure = cam->name + ": failed to open episode outputs";
+            }
+            for (auto& opened : cameras) {
+                close_episode_outputs(opened.get());
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+bool start_encoders_for_all(
+    const std::vector<std::unique_ptr<CamCtx>>& cameras,
+    std::string* failure
+) {
+    for (auto& cam : cameras) {
+        if (!cam->encoder || !cam->encoder->start()) {
+            if (failure) {
+                *failure = cam->name + ": encoder start failed";
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+bool stop_encoders_for_all(
+    const std::vector<std::unique_ptr<CamCtx>>& cameras,
+    std::string* failure
+) {
+    bool ok = true;
+    for (auto& cam : cameras) {
+        if (cam->csv) {
+            cam->csv.flush();
+        }
+    }
+    for (auto& cam : cameras) {
+        if (cam->encoder && !cam->encoder->stop()) {
+            ok = false;
+            if (failure && failure->empty()) {
+                *failure = "encoder EOS failed";
+            }
+        }
+        if (cam->csv) {
+            cam->csv.flush();
+            cam->csv.close();
+        }
+        if (cam->encoder) {
+            cam->encoder.reset();
+        }
+    }
+    return ok;
+}
+
+struct RecordingResult {
+    bool ok = true;
+    std::string failure;
+    uint64_t target_frames = 0;
+    uint64_t actual_frames = 0;
+    uint64_t dropped_before_start = 0;
+    uint64_t dropped_after_stop = 0;
+    bool stopped_by_request = false;
+};
+
+RecordingResult record_episode(
+    const std::vector<std::unique_ptr<CamCtx>>& cameras,
+    const Options& options,
+    FrameQueues* queues,
+    uint32_t startup_full_clusters,
+    std::atomic<bool>* episode_stop_requested,
+    int episode_idx
+) {
+    RecordingResult result;
+    result.target_frames = options.frames;
+    const uint64_t target_frames = options.frames;
+    std::vector<std::unique_ptr<FrameBundle>> cluster;
+    uint64_t logical_index = 0;
+    uint64_t warmup_full_clusters = 0;
+    uint64_t min_sof = 0;
+    uint64_t max_sof = 0;
+
+    if (!open_episode_outputs_for_all(cameras, options, &result.failure)) {
+        result.ok = false;
+        write_manifest(options, cameras, false, result.failure, target_frames, 0, 0, 0);
+        return result;
+    }
+    if (!start_encoders_for_all(cameras, &result.failure)) {
+        result.ok = false;
+        stop_encoders_for_all(cameras, &result.failure);
+        write_manifest(options, cameras, false, result.failure, target_frames, 0, 0, 0);
+        return result;
+    }
+
+    auto startup_deadline = (
+        std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(options.startup_timeout_ms)
+    );
+    while (
+        warmup_full_clusters < startup_full_clusters
+        && !g_stop_requested.load()
+        && !(episode_stop_requested && episode_stop_requested->load())
+    ) {
+        uint64_t unmatched_drops = 0;
+        std::string cluster_failure;
+        bool got = acquire_cluster(
+            cameras, queues, options, &cluster, &min_sof, &max_sof,
+            &unmatched_drops, &cluster_failure
+        );
+        result.dropped_before_start += unmatched_drops;
+        if (got) {
+            warmup_full_clusters += 1;
+            result.dropped_before_start += 1;
+            release_cluster(&cluster);
+            continue;
+        }
+        if (g_stop_requested.load() || (episode_stop_requested && episode_stop_requested->load())) {
+            result.stopped_by_request = true;
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= startup_deadline) {
+            result.ok = false;
+            result.failure = "startup did not produce enough full SOF clusters";
+            if (!cluster_failure.empty()) {
+                result.failure += ": " + cluster_failure;
+            }
+            break;
+        }
+    }
+
+    if (result.ok && !result.stopped_by_request && !g_stop_requested.load()) {
+        if (episode_idx >= 0) {
+            std::cerr << "recording started idx=" << episode_idx << std::endl;
+        } else {
+            std::cerr << "recording started" << std::endl;
+        }
+    }
+
+    while (
+        result.ok
+        && !g_stop_requested.load()
+        && !(episode_stop_requested && episode_stop_requested->load())
+        && (target_frames == 0 || logical_index < target_frames)
+    ) {
+        uint64_t unmatched_drops = 0;
+        std::string cluster_failure;
+        if (!acquire_cluster(
+                cameras, queues, options, &cluster, &min_sof, &max_sof,
+                &unmatched_drops, &cluster_failure
+            )) {
+            if (g_stop_requested.load() && target_frames == 0) {
+                result.stopped_by_request = true;
+                break;
+            }
+            result.ok = false;
+            result.failure = "missing or out-of-tolerance full SOF cluster after recording start";
+            if (!cluster_failure.empty()) {
+                result.failure += ": " + cluster_failure;
+            }
+            break;
+        }
+        if (unmatched_drops > 0) {
+            result.ok = false;
+            std::ostringstream oss;
+            oss << "missing full SOF cluster inside recording window; unmatched_drops="
+                << unmatched_drops;
+            result.failure = oss.str();
+            release_cluster(&cluster);
+            break;
+        }
+        if (!push_cluster(cluster, logical_index, min_sof, max_sof)) {
+            result.ok = false;
+            result.failure = "failed to push synchronized cluster into encoder";
+            release_cluster(&cluster);
+            break;
+        }
+        logical_index += 1;
+    }
+
+    if ((episode_stop_requested && episode_stop_requested->load()) || (g_stop_requested.load() && target_frames == 0)) {
+        result.stopped_by_request = true;
+    }
+
+    result.actual_frames = logical_index;
+    bool stop_ok = stop_encoders_for_all(cameras, &result.failure);
+    if (!stop_ok) {
+        result.ok = false;
+    }
+
+    if (target_frames > 0 && logical_index != target_frames && !result.stopped_by_request) {
+        result.ok = false;
+        if (result.failure.empty()) {
+            result.failure = "actual frame count did not reach target";
+        }
+    }
+    for (const auto& cam : cameras) {
+        if (cam->accepted_frames != logical_index) {
+            result.ok = false;
+            if (result.failure.empty()) {
+                result.failure = "camera frame counts diverged";
+            }
+        }
+    }
+
+    write_manifest(
+        options,
+        cameras,
+        result.ok,
+        result.failure,
+        target_frames,
+        logical_index,
+        result.dropped_before_start,
+        result.dropped_after_stop
+    );
+    return result;
+}
+
+bool start_argus_repeat(const std::vector<std::unique_ptr<CamCtx>>& cameras) {
+    for (auto& cam : cameras) {
+        if (cam->i_session->repeat(cam->request.get()) != STATUS_OK) {
+            std::cerr << cam->name << ": repeat request failed" << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
+void stop_argus_repeat(const std::vector<std::unique_ptr<CamCtx>>& cameras) {
+    for (auto& cam : cameras) {
+        if (cam->i_session) {
+            cam->i_session->stopRepeat();
+            if (cam->i_buffer_stream) {
+                cam->i_buffer_stream->endOfStream();
+            }
+        }
+    }
+}
+
+void push_command(const Command& command) {
+    std::lock_guard<std::mutex> lock(g_command_mutex);
+    g_commands.push_back(command);
+}
+
+bool pop_command(Command* command) {
+    std::lock_guard<std::mutex> lock(g_command_mutex);
+    if (g_commands.empty()) {
+        return false;
+    }
+    *command = g_commands.front();
+    g_commands.pop_front();
+    return true;
+}
+
+void stdin_command_loop() {
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        std::stringstream ss(line);
+        std::string verb;
+        ss >> verb;
+        if (verb.empty()) {
+            continue;
+        }
+        if (verb == "START") {
+            Command command;
+            command.type = CommandType::Start;
+            ss >> command.idx >> command.frames >> command.episode_dir;
+            if (command.episode_dir.empty()) {
+                std::cerr << "invalid START command: " << line << std::endl;
+                continue;
+            }
+            g_episode_stop_requested.store(false);
+            push_command(command);
+        } else if (verb == "STOP") {
+            g_episode_stop_requested.store(true);
+        } else if (verb == "QUIT") {
+            g_quit_requested.store(true);
+            g_stop_requested.store(true);
+            push_command(Command{CommandType::Quit, 0, 0, ""});
+            break;
+        } else {
+            std::cerr << "unknown persistent command: " << line << std::endl;
+        }
+    }
+    if (std::cin.eof()) {
+        g_quit_requested.store(true);
+        g_stop_requested.store(true);
+    }
+}
+
+int run_finite(
+    const std::vector<std::unique_ptr<CamCtx>>& cameras,
+    const Options& options
+) {
+    if (!start_argus_repeat(cameras)) {
+        return 4;
+    }
+    FrameQueues queues(cameras.size());
+    RecordingResult result = record_episode(
+        cameras, options, &queues, options.startup_full_clusters, nullptr, -1
+    );
+    release_all_queues(&queues);
+    stop_argus_repeat(cameras);
+    if (!result.ok) {
+        std::cerr << "recording failed: " << result.failure << std::endl;
+        std::cerr.flush();
+        std::cout.flush();
+        _exit(5);
+    }
+    std::cerr << "online sync frames captured per camera: " << result.actual_frames << std::endl;
+    std::cerr.flush();
+    std::cout.flush();
+    _exit(0);
+}
+
+int run_persistent(
+    const std::vector<std::unique_ptr<CamCtx>>& cameras,
+    const Options& options
+) {
+    if (!start_argus_repeat(cameras)) {
+        return 4;
+    }
+    FrameQueues queues(cameras.size());
+    std::thread(stdin_command_loop).detach();
+    std::cerr << "persistent ready" << std::endl;
+
+    while (!g_quit_requested.load() && !g_stop_requested.load()) {
+        Command command;
+        if (pop_command(&command)) {
+            if (command.type == CommandType::Quit) {
+                break;
+            }
+            if (command.type == CommandType::Start) {
+                Options episode_options = options;
+                episode_options.frames = command.frames;
+                episode_options.episode_dir = command.episode_dir;
+                g_episode_stop_requested.store(false);
+                RecordingResult result = record_episode(
+                    cameras, episode_options, &queues, 0, &g_episode_stop_requested,
+                    static_cast<int>(command.idx)
+                );
+                release_all_queues(&queues);
+                std::cerr << "episode done idx=" << command.idx
+                          << " ok=" << (result.ok ? "true" : "false")
+                          << " frames=" << result.actual_frames;
+                if (!result.failure.empty()) {
+                    std::cerr << " failure=" << result.failure;
+                }
+                std::cerr << std::endl;
+                continue;
+            }
+        }
+
+        std::vector<std::unique_ptr<FrameBundle>> idle_cluster;
+        uint64_t min_sof = 0;
+        uint64_t max_sof = 0;
+        uint64_t unmatched_drops = 0;
+        std::string failure;
+        if (!acquire_cluster(
+                cameras, &queues, options, &idle_cluster, &min_sof, &max_sof,
+                &unmatched_drops, &failure
+            )) {
+            if (g_quit_requested.load() || g_stop_requested.load()) {
+                break;
+            }
+            std::cerr << "persistent idle cluster failure: " << failure << std::endl;
+            release_cluster(&idle_cluster);
+            release_all_queues(&queues);
+            stop_argus_repeat(cameras);
+            return 5;
+        }
+        release_cluster(&idle_cluster);
+    }
+
+    release_all_queues(&queues);
+    stop_argus_repeat(cameras);
+    std::cerr << "persistent exiting" << std::endl;
+    std::cerr.flush();
+    std::cout.flush();
+    _exit(0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1409,162 +1848,8 @@ int main(int argc, char** argv) {
         cameras.push_back(std::move(cam));
     }
 
-    for (auto& cam : cameras) {
-        if (!cam->encoder->start()) {
-            return 4;
-        }
+    if (options.persistent) {
+        return run_persistent(cameras, options);
     }
-    for (auto& cam : cameras) {
-        if (cam->i_session->repeat(cam->request.get()) != STATUS_OK) {
-            std::cerr << cam->name << ": repeat request failed" << std::endl;
-            return 4;
-        }
-    }
-
-    bool ok = true;
-    std::string failure;
-    uint64_t dropped_before_start = 0;
-    uint64_t dropped_after_stop = 0;
-    uint64_t logical_index = 0;
-    uint64_t warmup_full_clusters = 0;
-    uint64_t min_sof = 0;
-    uint64_t max_sof = 0;
-    FrameQueues queues(cameras.size());
-    std::vector<std::unique_ptr<FrameBundle>> cluster;
-
-    auto startup_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(options.startup_timeout_ms);
-    while (warmup_full_clusters < options.startup_full_clusters && !g_stop_requested.load()) {
-        uint64_t unmatched_drops = 0;
-        std::string cluster_failure;
-        bool got = acquire_cluster(
-            cameras, &queues, options, &cluster, &min_sof, &max_sof,
-            &unmatched_drops, &cluster_failure
-        );
-        dropped_before_start += unmatched_drops;
-        if (got) {
-            warmup_full_clusters += 1;
-            dropped_before_start += 1;
-            release_cluster(&cluster);
-            continue;
-        }
-        if (std::chrono::steady_clock::now() >= startup_deadline) {
-            ok = false;
-            failure = "startup did not produce enough full SOF clusters";
-            if (!cluster_failure.empty()) {
-                failure += ": " + cluster_failure;
-            }
-            break;
-        }
-    }
-
-    if (ok && !g_stop_requested.load()) {
-        std::cerr << "recording started" << std::endl;
-    }
-
-    const uint64_t target_frames = options.frames;
-    while (ok && !g_stop_requested.load() && (target_frames == 0 || logical_index < target_frames)) {
-        uint64_t unmatched_drops = 0;
-        std::string cluster_failure;
-        if (!acquire_cluster(
-                cameras, &queues, options, &cluster, &min_sof, &max_sof,
-                &unmatched_drops, &cluster_failure
-            )) {
-            ok = false;
-            failure = "missing or out-of-tolerance full SOF cluster after recording start";
-            if (!cluster_failure.empty()) {
-                failure += ": " + cluster_failure;
-            }
-            break;
-        }
-        if (unmatched_drops > 0) {
-            ok = false;
-            std::ostringstream oss;
-            oss << "missing full SOF cluster inside recording window; unmatched_drops="
-                << unmatched_drops;
-            failure = oss.str();
-            break;
-        }
-        if (!push_cluster(cluster, logical_index, min_sof, max_sof)) {
-            ok = false;
-            failure = "failed to push synchronized cluster into encoder";
-            break;
-        }
-        logical_index += 1;
-    }
-
-    if (g_stop_requested.load() && target_frames == 0) {
-        // Stop is implemented as a full-cluster boundary: all clusters already
-        // counted were pushed to every encoder. We do not push partial frames.
-        dropped_after_stop = 0;
-    }
-
-    for (auto& cam : cameras) {
-        if (cam->csv) {
-            cam->csv.flush();
-        }
-    }
-
-    for (auto& cam : cameras) {
-        if (cam->i_session) {
-            cam->i_session->stopRepeat();
-            if (cam->i_buffer_stream) {
-                cam->i_buffer_stream->endOfStream();
-            }
-            // Do not waitForIdle() here: accepted Argus buffers are still owned
-            // by the encoder output plane until encoder->stop() drains EOS and
-            // releases its slots. Waiting for Argus idle first can deadlock the
-            // short preflight path after the synchronized frames were already
-            // encoded and the manifest is ready to write.
-        }
-    }
-
-    for (auto& cam : cameras) {
-        if (!cam->encoder->stop()) {
-            ok = false;
-            if (failure.empty()) {
-                failure = "encoder EOS failed";
-            }
-        }
-        if (cam->csv) {
-            cam->csv.flush();
-            cam->csv.close();
-        }
-    }
-
-    if (target_frames > 0 && logical_index != target_frames) {
-        ok = false;
-        if (failure.empty()) {
-            failure = "actual frame count did not reach target";
-        }
-    }
-    for (const auto& cam : cameras) {
-        if (cam->accepted_frames != logical_index) {
-            ok = false;
-            if (failure.empty()) {
-                failure = "camera frame counts diverged";
-            }
-        }
-    }
-
-    write_manifest(
-        options,
-        cameras,
-        ok,
-        failure,
-        target_frames,
-        logical_index,
-        dropped_before_start,
-        dropped_after_stop
-    );
-
-    if (!ok) {
-        std::cerr << "recording failed: " << failure << std::endl;
-        std::cerr.flush();
-        std::cout.flush();
-        _exit(5);
-    }
-    std::cerr << "online sync frames captured per camera: " << logical_index << std::endl;
-    std::cerr.flush();
-    std::cout.flush();
-    _exit(0);
+    return run_finite(cameras, options);
 }

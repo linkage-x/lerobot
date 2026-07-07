@@ -346,17 +346,52 @@ stop cleanup 总和: 2.44s
 - 记录每次 transient provider retry 的次数和是否成功，作为 Argus 生命周期健康指标。
 - 对少量 episode 抽样跑 ffprobe，确认视频容器帧数和 manifest/sidecar 一致。
 
-### 长期
+### 已完成的结构性优化
 
-- 做长驻 recorder daemon：
+已在当前分支实现长驻 `argus_online_sync` recorder daemon：
 
 ```text
-Connect 时打开 Argus/camera/encoder 资源并保持 warm
-Start 时只切换 episode 文件写入
-Stop 时在 full cluster 边界关闭当前文件
+Connect 时打开 Argus provider/session/stream/buffer，并持续消费 full SOF cluster
+Start 时只新建当前 episode 的 encoder/mux/sidecar，并从下一个 full cluster 写 logical frame 0
+Stop 时在 full cluster 边界停止当前 episode 的 encoder/mux
+Disconnect 时关闭长驻 Argus recorder
 ```
 
-这能把每个 episode 的 start 开销从约 `9s` 降到接近 warmup cluster 时间，但实现复杂度更高。
+这个改动保留了“encoder 前同步”的本质路径，不引入保存后的 ffmpeg
+decode/encode 后处理。UI 仍然调用同一个 `connect -> start_episode ->
+stop_episode -> disconnect` session API；变化只在 recorder 内部生命周期。
+
+新增 stdin 协议由 Python session 内部使用，GUI 不需要直接感知：
+
+```text
+START <idx> <frames> <episode_dir>
+STOP
+QUIT
+```
+
+当前验证：
+
+- Thor C++ 编译通过；
+- 2 路 direct persistent smoke：
+  - `cam_06.mkv`: 120 帧；
+  - `cam_07.mkv`: 120 帧；
+  - 两路 sidecar 均 120 行；
+  - `online_sync_manifest.ok=true`；
+  - `max_abs_delta_ns_by_camera=6000 ns`；
+- Python `ArgusOnlineSyncCameraSession` smoke：
+  - Connect 后 daemon 常驻；
+  - Start/Stop 不重新 spawn recorder；
+  - 输出 120/120 帧；
+  - `max_abs_delta_ns_by_camera=4000 ns`；
+- `thor_record.py` UI-protocol smoke：
+  - GUI 入口和 stdin 流程不变；
+  - recorder 输出 `recording started idx=0` 和 `episode done idx=0 ok=true frames=60`；
+  - episode 成功保存。
+
+当前 Thor 8 路 direct persistent smoke 在 idle 阶段失败于
+`cam_03: timed out waiting for Argus buffer after 1000 ms`，随后 Argus socket
+输出底层错误。这说明当前硬件/驱动状态下 `cam_03` 未稳定出帧；该失败发生在
+episode 开始前，没有进入不完整保存路径。
 
 - 如果森云提供硬件 trigger id / exposure timestamp，应把 SyncManager 的同步 key
   从 `sof_tsc_ns` 升级到硬件同步字段。
