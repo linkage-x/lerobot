@@ -8,6 +8,7 @@ import re
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -21,6 +22,7 @@ logger = logging.getLogger("argus_online_sync_session")
 
 
 DEFAULT_BINARY_PATH = Path("/tmp/lerobot_argus_online_sync_video_recorder")
+DEFAULT_PREVIEW_FRAME_BUS_DIR = Path("/dev/shm/lerobot_online_sync_preview")
 
 
 class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
@@ -56,6 +58,8 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
         stop_mode: str = "full_cluster",
         frame_bus_dir: str | Path = "",
         frame_bus_every_n: int = 1,
+        preview_frame_bus_dir: str | Path = "",
+        preview_frame_bus_every_n: int = 12,
     ):
         super().__init__(
             streams,
@@ -78,12 +82,18 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
         self.stop_mode = str(stop_mode)
         self.frame_bus_dir = str(frame_bus_dir) if frame_bus_dir else ""
         self.frame_bus_every_n = max(1, int(frame_bus_every_n))
+        self.preview_frame_bus_dir = (
+            str(preview_frame_bus_dir) if preview_frame_bus_dir else ""
+        )
+        self.preview_frame_bus_every_n = max(1, int(preview_frame_bus_every_n))
         self.start_retry_settle_s = 2.0
         self.start_retries = 1
         self._persistent_ready_evt = threading.Event()
         self._episode_done_evt = threading.Event()
         self._episode_result: dict[str, Any] | None = None
         self._preview_warning_emitted = False
+        self._preview_bridge_proc: subprocess.Popen[str] | None = None
+        self._preview_down_logged = False
 
     def _recorder_source(self) -> Path:
         return Path(__file__).with_name("argus_online_sync_video_recorder.cpp")
@@ -187,6 +197,13 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
                 self.frame_bus_dir,
                 "--frame-bus-every-n",
                 str(self.frame_bus_every_n),
+            ])
+        if include_frame_bus and self.preview_frame_bus_dir:
+            cmd.extend([
+                "--preview-frame-bus-dir",
+                self.preview_frame_bus_dir,
+                "--preview-frame-bus-every-n",
+                str(self.preview_frame_bus_every_n),
             ])
         return cmd
 
@@ -736,22 +753,149 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
         self._recording_active = False
         self._active_sids = []
 
+    def _preview_streams(self) -> list[ps.StreamConfig]:
+        return [stream for stream in self._stream_cfgs if stream.preview_jpeg_path]
+
+    def _preview_bridge_command(self) -> list[str]:
+        script = Path(__file__).with_name("online_sync_preview_bridge.py")
+        cmd = [
+            sys.executable,
+            str(script),
+            "--frame-bus-dir",
+            self.preview_frame_bus_dir,
+            "--fps",
+            str(ps.PREVIEW_FPS),
+            "--preview-width",
+            str(ps.PREVIEW_WIDTH),
+        ]
+        for stream in self._preview_streams():
+            cmd.extend(["--camera", f"{stream.name}={stream.preview_jpeg_path}"])
+        return cmd
+
+    def _start_preview_bridge(self) -> None:
+        proc = self._preview_bridge_proc
+        if proc is not None and proc.poll() is None:
+            return
+        streams = self._preview_streams()
+        if not self.preview_frame_bus_dir or not streams:
+            return
+        for stream in streams:
+            if stream.preview_jpeg_path:
+                path = Path(stream.preview_jpeg_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        self._preview_bridge_proc = subprocess.Popen(
+            self._preview_bridge_command(),
+            cwd=self.repo_root,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    def _stop_preview_bridge(self) -> None:
+        proc = self._preview_bridge_proc
+        self._preview_bridge_proc = None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2.0)
+
     def enable_previews(self, *, stagger_s: float = 0.5) -> None:
-        if not self._preview_warning_emitted:
-            logger.info(
-                "Argus online-sync persistent recorder owns camera sessions; "
-                "external nvarguscamerasrc previews are disabled for this backend"
-            )
-            self._preview_warning_emitted = True
-        return None
+        del stagger_s
+        if self._recording_active:
+            return
+        if not self.preview_frame_bus_dir:
+            if not self._preview_warning_emitted:
+                logger.info(
+                    "Argus online-sync preview requested but preview frame bus "
+                    "is not configured"
+                )
+                self._preview_warning_emitted = True
+            return
+        if not self._preview_streams():
+            return
+        try:
+            self._send_daemon_command("PREVIEW_ON")
+            self._start_preview_bridge()
+            self._preview_down_logged = False
+        except Exception as exc:  # noqa: BLE001 - preview must not break recording
+            try:
+                self._send_daemon_command("PREVIEW_OFF")
+            except Exception:
+                pass
+            self._stop_preview_bridge()
+            self._errors.append(ps.StreamError(
+                sid=-1,
+                name="argus_online_sync_preview",
+                message=f"failed to enable online-sync preview: {exc}",
+            ))
 
     def disable_previews(self) -> None:
-        # The persistent online-sync recorder owns the Argus sessions; there are
-        # no separate preview processes to stop in this backend.
-        return None
+        try:
+            with self._lock:
+                proc = self._proc
+            if proc is not None and proc.poll() is None:
+                self._send_daemon_command("PREVIEW_OFF")
+        except Exception:
+            pass
+        self._stop_preview_bridge()
+        for stream in self._preview_streams():
+            if not stream.preview_jpeg_path:
+                continue
+            try:
+                Path(stream.preview_jpeg_path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def wait_preview_frames(self, *, timeout_s: float = 5.0) -> list[str]:
-        return []
+        pending = {
+            stream.name: Path(stream.preview_jpeg_path)
+            for stream in self._preview_streams()
+            if stream.preview_jpeg_path
+        }
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while pending and time.monotonic() < deadline:
+            for name, path in list(pending.items()):
+                try:
+                    if path.exists() and path.stat().st_size > 0:
+                        pending.pop(name, None)
+                except OSError:
+                    pass
+            if pending:
+                time.sleep(0.05)
+        return sorted(pending)
 
     def refresh_stale_previews(self, *, max_age_s: float) -> list[str]:
-        return []
+        if self._recording_active:
+            return []
+        now = time.time()
+        stale: list[str] = []
+        for stream in self._preview_streams():
+            if not stream.preview_jpeg_path:
+                continue
+            path = Path(stream.preview_jpeg_path)
+            try:
+                mtime = path.stat().st_mtime
+                if now - mtime <= max_age_s:
+                    continue
+            except OSError:
+                pass
+            stale.append(stream.name)
+        proc = self._preview_bridge_proc
+        bridge_dead = proc is not None and proc.poll() is not None
+        if not stale and not bridge_dead:
+            self._preview_down_logged = False
+            return []
+        if stale and not self._preview_down_logged:
+            logger.warning("online-sync preview stale for %s", ", ".join(stale))
+            self._preview_down_logged = True
+        self._stop_preview_bridge()
+        self.enable_previews(stagger_s=0.0)
+        return stale

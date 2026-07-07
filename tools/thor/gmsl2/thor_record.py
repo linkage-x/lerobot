@@ -441,6 +441,7 @@ def _write_episode_meta(
         *argus_failed,
         *(err.sid for err in connect_stream_errors if err.sid >= 0),
     })
+    preview_frame_bus_dir, preview_frame_bus_every_n = _effective_online_sync_preview_bus(cfg)
     meta = {
         "episode_index": handle.idx,
         "repo_id": cfg.repo_id,
@@ -524,6 +525,8 @@ def _write_episode_meta(
             "stop_mode": cfg.online_sync.stop_mode,
             "frame_bus_dir": cfg.online_sync.frame_bus_dir,
             "frame_bus_every_n": cfg.online_sync.frame_bus_every_n,
+            "preview_frame_bus_dir": preview_frame_bus_dir,
+            "preview_frame_bus_every_n": preview_frame_bus_every_n,
         },
         "cameras": [
             {
@@ -888,6 +891,23 @@ def _stream_configs(usable: list[int], cfg: gr.RecorderConfig) -> list[ps.Stream
     ]
 
 
+def _effective_online_sync_preview_bus(cfg: gr.RecorderConfig) -> tuple[str, int]:
+    preview_frame_bus_dir = cfg.online_sync.preview_frame_bus_dir
+    if (
+        cfg.cameras.recorder_backend == "argus_online_sync"
+        and cfg.recording_preview_enabled
+        and not preview_frame_bus_dir
+    ):
+        preview_frame_bus_dir = str(aos.DEFAULT_PREVIEW_FRAME_BUS_DIR)
+    preview_frame_bus_every_n = cfg.online_sync.preview_frame_bus_every_n
+    if preview_frame_bus_every_n <= 0:
+        preview_frame_bus_every_n = max(
+            1,
+            int(round(cfg.cameras.fps / max(1, ps.PREVIEW_FPS))),
+        )
+    return preview_frame_bus_dir, preview_frame_bus_every_n
+
+
 # ----------------------------------------------------------------- main ---
 
 
@@ -1018,6 +1038,8 @@ def main(argv: list[str] | None = None) -> int:
     # Session backend: production default is the Libargus metadata-integrated
     # recorder. The legacy persistent GStreamer/splitmux backend remains
     # available only when explicitly selected in YAML.
+    preview_frame_bus_dir, preview_frame_bus_every_n = _effective_online_sync_preview_bus(cfg)
+
     def _make_pcs():
         streams = _stream_configs(usable, cfg)
         if cfg.cameras.recorder_backend == "argus_metadata":
@@ -1050,6 +1072,8 @@ def main(argv: list[str] | None = None) -> int:
                 stop_mode=cfg.online_sync.stop_mode,
                 frame_bus_dir=cfg.online_sync.frame_bus_dir,
                 frame_bus_every_n=cfg.online_sync.frame_bus_every_n,
+                preview_frame_bus_dir=preview_frame_bus_dir,
+                preview_frame_bus_every_n=preview_frame_bus_every_n,
             )
         return ps.PersistentCameraSession(
             streams,

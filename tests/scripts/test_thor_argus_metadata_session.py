@@ -4,6 +4,7 @@ from pathlib import Path
 from tools.thor.gmsl2 import argus_metadata_session as ams
 from tools.thor.gmsl2 import argus_online_sync_session as aos
 from tools.thor.gmsl2 import gmsl2_record as gr
+from tools.thor.gmsl2 import online_sync_preview_bridge as preview_bridge
 from tools.thor.gmsl2 import persistent_session as ps
 
 
@@ -142,6 +143,38 @@ class _FakePreviewProc:
         self.killed = True
 
 
+class _OnlinePreviewSession(aos.ArgusOnlineSyncCameraSession):
+    def __init__(self, tmp_path: Path):
+        streams = [
+            ps.StreamConfig(
+                sid=6,
+                name="cam_06",
+                preview_jpeg_path=str(tmp_path / "cam_06.jpg"),
+            ),
+            ps.StreamConfig(sid=7, name="cam_07"),
+        ]
+        super().__init__(
+            streams,
+            tmp_path / "warmup",
+            repo_root=tmp_path,
+            binary_path=tmp_path / "argus_online_sync_video_recorder",
+            auto_build=False,
+            preview_frame_bus_dir=tmp_path / "preview_bus",
+            preview_frame_bus_every_n=12,
+        )
+        self.commands: list[str] = []
+        self.started_bridge = 0
+        self._active_sids = [6, 7]
+        self._proc = _FakePreviewProc()  # type: ignore[assignment]
+
+    def _send_daemon_command(self, line: str) -> None:
+        self.commands.append(line)
+
+    def _start_preview_bridge(self) -> None:
+        self.started_bridge += 1
+        self._preview_bridge_proc = _FakePreviewProc()  # type: ignore[assignment]
+
+
 class _ExitedTextProc:
     returncode = 0
 
@@ -165,6 +198,8 @@ def test_argus_online_sync_preflight_timeout_defaults() -> None:
     assert cfg.single_preflight_timeout_s == 10.0
     assert cfg.frame_bus_dir == ""
     assert cfg.frame_bus_every_n == 1
+    assert cfg.preview_frame_bus_dir == ""
+    assert cfg.preview_frame_bus_every_n == 0
 
 
 def test_argus_online_sync_rejects_non_positive_frame_timeout() -> None:
@@ -183,6 +218,15 @@ def test_argus_online_sync_rejects_non_positive_frame_bus_every_n() -> None:
         assert "frame_bus_every_n must be > 0" in str(exc)
     else:
         raise AssertionError("expected invalid frame_bus_every_n to raise ValueError")
+
+
+def test_argus_online_sync_rejects_negative_preview_frame_bus_every_n() -> None:
+    try:
+        gr.ArgusOnlineSync(preview_frame_bus_every_n=-1)
+    except ValueError as exc:
+        assert "preview_frame_bus_every_n must be >= 0" in str(exc)
+    else:
+        raise AssertionError("expected invalid preview_frame_bus_every_n to raise ValueError")
 
 
 def test_argus_online_sync_record_command_passes_frame_timeout(tmp_path: Path) -> None:
@@ -217,6 +261,23 @@ def test_argus_online_sync_record_command_passes_frame_bus_options(tmp_path: Pat
     assert cmd[cmd.index("--frame-bus-every-n") + 1] == "3"
 
 
+def test_argus_online_sync_record_command_passes_preview_frame_bus_options(tmp_path: Path) -> None:
+    session = aos.ArgusOnlineSyncCameraSession(
+        _streams(6, 7),
+        tmp_path / "warmup",
+        repo_root=tmp_path,
+        binary_path=tmp_path / "argus_online_sync_video_recorder",
+        auto_build=False,
+        preview_frame_bus_dir=tmp_path / "preview_bus",
+        preview_frame_bus_every_n=12,
+    )
+
+    cmd = session._build_record_command(session._stream_cfgs, tmp_path / "episode", frames=60)
+
+    assert cmd[cmd.index("--preview-frame-bus-dir") + 1] == str(tmp_path / "preview_bus")
+    assert cmd[cmd.index("--preview-frame-bus-every-n") + 1] == "12"
+
+
 def test_argus_online_sync_record_command_omits_disabled_frame_bus(tmp_path: Path) -> None:
     session = aos.ArgusOnlineSyncCameraSession(
         _streams(6, 7),
@@ -230,6 +291,8 @@ def test_argus_online_sync_record_command_omits_disabled_frame_bus(tmp_path: Pat
 
     assert "--frame-bus-dir" not in cmd
     assert "--frame-bus-every-n" not in cmd
+    assert "--preview-frame-bus-dir" not in cmd
+    assert "--preview-frame-bus-every-n" not in cmd
 
 
 def test_argus_online_sync_preflight_command_can_omit_frame_bus(tmp_path: Path) -> None:
@@ -248,9 +311,51 @@ def test_argus_online_sync_preflight_command_can_omit_frame_bus(tmp_path: Path) 
         frames=2,
         include_frame_bus=False,
     )
-
     assert "--frame-bus-dir" not in cmd
     assert "--frame-bus-every-n" not in cmd
+    assert "--preview-frame-bus-dir" not in cmd
+    assert "--preview-frame-bus-every-n" not in cmd
+
+
+def test_online_sync_preview_bridge_parse_camera_specs(tmp_path: Path) -> None:
+    parsed = preview_bridge.parse_camera_specs([
+        f"cam_06={tmp_path / 'cam_06.jpg'}",
+        f"cam_07={tmp_path / 'cam_07.jpg'}",
+    ])
+
+    assert parsed == {
+        "cam_06": tmp_path / "cam_06.jpg",
+        "cam_07": tmp_path / "cam_07.jpg",
+    }
+
+
+def test_argus_online_sync_enable_preview_uses_frame_bus_bridge(tmp_path: Path) -> None:
+    session = _OnlinePreviewSession(tmp_path)
+
+    session.enable_previews()
+
+    assert session.commands == ["PREVIEW_ON"]
+    assert session.started_bridge == 1
+    cmd = session._preview_bridge_command()
+    assert "--frame-bus-dir" in cmd
+    assert str(tmp_path / "preview_bus") in cmd
+    assert f"cam_06={tmp_path / 'cam_06.jpg'}" in cmd
+    assert not any("cam_07=" in item for item in cmd)
+
+
+def test_argus_online_sync_disable_preview_stops_bridge_and_unlinks(tmp_path: Path) -> None:
+    session = _OnlinePreviewSession(tmp_path)
+    preview_path = tmp_path / "cam_06.jpg"
+    preview_path.write_bytes(b"jpeg")
+    session.enable_previews()
+    proc = session._preview_bridge_proc
+
+    session.disable_previews()
+
+    assert session.commands == ["PREVIEW_ON", "PREVIEW_OFF"]
+    assert isinstance(proc, _FakePreviewProc)
+    assert proc.terminated
+    assert not preview_path.exists()
 
 
 def test_legacy_gmsl2_cli_rejects_argus_metadata_backend(tmp_path: Path) -> None:

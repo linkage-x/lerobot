@@ -83,12 +83,16 @@ struct Options {
     std::string episode_dir = ".";
     std::string frame_bus_dir;
     uint32_t frame_bus_every_n = 1;
+    std::string preview_frame_bus_dir;
+    uint32_t preview_frame_bus_every_n = 12;
     bool persistent = false;
 };
 
 enum class CommandType {
     Start,
     Stop,
+    PreviewOn,
+    PreviewOff,
     Quit,
 };
 
@@ -103,6 +107,7 @@ std::mutex g_command_mutex;
 std::deque<Command> g_commands;
 std::atomic<bool> g_episode_stop_requested(false);
 std::atomic<bool> g_quit_requested(false);
+std::atomic<bool> g_preview_requested(false);
 std::mutex g_frame_bus_mutex;
 uint64_t g_frame_bus_success_count = 0;
 
@@ -358,6 +363,18 @@ bool parse_args(int argc, char** argv, Options* options) {
                 std::cerr << "--frame-bus-every-n must be > 0" << std::endl;
                 return false;
             }
+        } else if (arg == "--preview-frame-bus-dir") {
+            const char* value = require_value("--preview-frame-bus-dir");
+            if (!value) return false;
+            options->preview_frame_bus_dir = value;
+        } else if (arg == "--preview-frame-bus-every-n") {
+            const char* value = require_value("--preview-frame-bus-every-n");
+            if (!value) return false;
+            options->preview_frame_bus_every_n = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+            if (options->preview_frame_bus_every_n == 0) {
+                std::cerr << "--preview-frame-bus-every-n must be > 0" << std::endl;
+                return false;
+            }
         } else if (arg == "--persistent") {
             options->persistent = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -369,12 +386,16 @@ bool parse_args(int argc, char** argv, Options* options) {
                       << " [--frame-timeout-ms 1000]"
                       << " [--frame-bus-dir /dev/shm/lerobot_online_sync]"
                       << " [--frame-bus-every-n 1]"
+                      << " [--preview-frame-bus-dir /dev/shm/lerobot_online_sync_preview]"
+                      << " [--preview-frame-bus-every-n 12]"
                       << " [--name-prefix cam]"
                       << " [--persistent]"
                       << "\n       --frames 0 records until SIGINT/SIGTERM"
                       << "\n       --persistent keeps Argus streams open and reads stdin commands:"
                       << "\n           START <idx> <frames> <episode_dir>"
                       << "\n           STOP"
+                      << "\n           PREVIEW_ON"
+                      << "\n           PREVIEW_OFF"
                       << "\n           QUIT"
                       << std::endl;
             std::exit(0);
@@ -1333,16 +1354,21 @@ bool copy_nv12_to_file(DmaBuffer* dma, uint32_t width, uint32_t height, const st
     return true;
 }
 
-bool should_publish_frame_bus(const Options& options, uint64_t logical_index) {
+bool should_publish_frame_bus(
+    const std::string& frame_bus_dir,
+    uint32_t frame_bus_every_n,
+    uint64_t logical_index
+) {
     return (
-        !options.frame_bus_dir.empty()
-        && options.frame_bus_every_n > 0
-        && (logical_index % options.frame_bus_every_n) == 0
+        !frame_bus_dir.empty()
+        && frame_bus_every_n > 0
+        && (logical_index % frame_bus_every_n) == 0
     );
 }
 
 bool publish_frame_bus_cluster(
-    const Options& options,
+    const std::string& frame_bus_dir,
+    uint32_t frame_bus_every_n,
     const std::vector<std::unique_ptr<FrameBundle>>& cluster,
     uint64_t logical_index,
     uint64_t min_sof,
@@ -1350,7 +1376,7 @@ bool publish_frame_bus_cluster(
     bool recording,
     int episode_idx
 ) {
-    if (!should_publish_frame_bus(options, logical_index)) {
+    if (!should_publish_frame_bus(frame_bus_dir, frame_bus_every_n, logical_index)) {
         return true;
     }
     if (cluster.empty()) {
@@ -1358,7 +1384,7 @@ bool publish_frame_bus_cluster(
     }
 
     std::lock_guard<std::mutex> lock(g_frame_bus_mutex);
-    if (!mkdir_p(options.frame_bus_dir)) {
+    if (!mkdir_p(frame_bus_dir)) {
         return false;
     }
 
@@ -1373,7 +1399,7 @@ bool publish_frame_bus_cluster(
         }
         std::ostringstream raw_name;
         raw_name << "slot" << slot << "_" << bundle->cam->name << ".nv12";
-        const std::string raw_path = path_join(options.frame_bus_dir, raw_name.str());
+        const std::string raw_path = path_join(frame_bus_dir, raw_name.str());
         if (!copy_nv12_to_file(
                 bundle->dma_buffer,
                 bundle->cam->width,
@@ -1417,12 +1443,52 @@ bool publish_frame_bus_cluster(
     json << "  }\n"
          << "}\n";
 
-    const std::string latest_path = path_join(options.frame_bus_dir, "latest_cluster.json");
+    const std::string latest_path = path_join(frame_bus_dir, "latest_cluster.json");
     if (!write_text_atomic(latest_path, json.str())) {
         return false;
     }
     g_frame_bus_success_count += 1;
     return true;
+}
+
+bool publish_frame_bus_cluster(
+    const Options& options,
+    const std::vector<std::unique_ptr<FrameBundle>>& cluster,
+    uint64_t logical_index,
+    uint64_t min_sof,
+    uint64_t max_sof,
+    bool recording,
+    int episode_idx
+) {
+    return publish_frame_bus_cluster(
+        options.frame_bus_dir,
+        options.frame_bus_every_n,
+        cluster,
+        logical_index,
+        min_sof,
+        max_sof,
+        recording,
+        episode_idx
+    );
+}
+
+bool publish_preview_frame_bus_cluster(
+    const Options& options,
+    const std::vector<std::unique_ptr<FrameBundle>>& cluster,
+    uint64_t logical_index,
+    uint64_t min_sof,
+    uint64_t max_sof
+) {
+    return publish_frame_bus_cluster(
+        options.preview_frame_bus_dir,
+        options.preview_frame_bus_every_n,
+        cluster,
+        logical_index,
+        min_sof,
+        max_sof,
+        false,
+        -1
+    );
 }
 
 using FrameQueue = std::deque<std::unique_ptr<FrameBundle>>;
@@ -1928,12 +1994,20 @@ void stdin_command_loop() {
                 continue;
             }
             g_episode_stop_requested.store(false);
+            g_preview_requested.store(false);
             push_command(command);
         } else if (verb == "STOP") {
             g_episode_stop_requested.store(true);
+        } else if (verb == "PREVIEW_ON") {
+            g_preview_requested.store(true);
+            push_command(Command{CommandType::PreviewOn, 0, 0, ""});
+        } else if (verb == "PREVIEW_OFF") {
+            g_preview_requested.store(false);
+            push_command(Command{CommandType::PreviewOff, 0, 0, ""});
         } else if (verb == "QUIT") {
             g_quit_requested.store(true);
             g_stop_requested.store(true);
+            g_preview_requested.store(false);
             push_command(Command{CommandType::Quit, 0, 0, ""});
             break;
         } else {
@@ -1989,6 +2063,14 @@ int run_persistent(
             if (command.type == CommandType::Quit) {
                 break;
             }
+            if (command.type == CommandType::PreviewOn) {
+                std::cerr << "preview publishing enabled" << std::endl;
+                continue;
+            }
+            if (command.type == CommandType::PreviewOff) {
+                std::cerr << "preview publishing disabled" << std::endl;
+                continue;
+            }
             if (command.type == CommandType::Start) {
                 Options episode_options = options;
                 episode_options.frames = command.frames;
@@ -2039,6 +2121,19 @@ int run_persistent(
                 false,
                 -1)) {
             std::cerr << "frame bus: failed to publish idle cluster "
+                      << idle_logical_index << std::endl;
+        }
+        if (
+            g_preview_requested.load()
+            && !publish_preview_frame_bus_cluster(
+                options,
+                idle_cluster,
+                idle_logical_index,
+                min_sof,
+                max_sof
+            )
+        ) {
+            std::cerr << "preview frame bus: failed to publish idle cluster "
                       << idle_logical_index << std::endl;
         }
         idle_logical_index += 1;

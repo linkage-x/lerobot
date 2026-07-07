@@ -98,6 +98,12 @@ sensors:
       # consumers read only from this bus and must not open Argus themselves.
       frame_bus_dir: ""
       frame_bus_every_n: 1
+      # UI preview uses a separate on-demand frame bus so it cannot disable or
+      # throttle the online-inference bus. The recorder publishes this bus only
+      # while the UI viewer is polling preview frames; Python converts the
+      # synchronized NV12 cluster into /dev/shm/lerobot_preview/*.jpg.
+      preview_frame_bus_dir: /dev/shm/lerobot_online_sync_preview
+      preview_frame_bus_every_n: 12
 
     # Per-camera capture/encoding defaults. Libargus handles capture/ISP and
     # the hardware H.265 encoder writes a complete MKV per camera per episode.

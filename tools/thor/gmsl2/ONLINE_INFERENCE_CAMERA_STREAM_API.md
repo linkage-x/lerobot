@@ -73,6 +73,31 @@ sensors:
 
 注意：发布 raw NV12 会多一次 CPU/内存拷贝。纯采集时保持关闭；在线推理时再打开。
 
+## UI 预览不是这个接口
+
+应用层 UI 预览使用独立的 on-demand preview bus，避免 UI 的启停影响在线推理
+frame bus：
+
+```yaml
+sensors:
+  cameras:
+    online_sync:
+      preview_frame_bus_dir: /dev/shm/lerobot_online_sync_preview
+      preview_frame_bus_every_n: 12
+```
+
+当 UI viewer 打开时，`thor_record.py` 会通过 session 发送 `PREVIEW_ON`；
+recorder 只在 idle 阶段低频发布同步 NV12 cluster 到 preview bus，
+`online_sync_preview_bridge.py` 再转换为：
+
+```text
+/dev/shm/lerobot_preview/cam_XX.jpg
+```
+
+UI 继续读取原有 JPEG 路径。录制开始前 session 会发送 `PREVIEW_OFF` 并停止
+bridge；episode 内仍然只由 full SOF cluster 进入 encoder，不会因为预览改变
+同步合同。
+
 ## Python 使用方式
 
 ```python
@@ -226,4 +251,3 @@ recorder 统一采集和同步；
 如果森云后续提供真正的 PWM trigger timestamp 或 trigger frame id，应把
 `sync_source` 从 `sof_tsc_ns` 升级为厂商硬件时间/帧号；frame bus 的 JSON
 结构可以保持不变，只替换同步字段来源。
-
