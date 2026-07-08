@@ -6,7 +6,12 @@ import argparse
 import os
 from pathlib import Path
 import signal
+import sys
 import time
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from tools.thor.gmsl2.online_sync_frame_client import ThorOnlineSyncFrameClient
 
@@ -49,8 +54,14 @@ def _write_preview_jpeg(frame, out_path: Path, *, preview_width: int, quality: i
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_name(f".{out_path.name}.tmp")
-    if not cv2.imwrite(str(tmp_path), bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]):
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        bgr,
+        [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)],
+    )
+    if not ok:
         raise RuntimeError(f"failed to encode preview JPEG for {frame.camera}")
+    tmp_path.write_bytes(encoded.tobytes())
     os.replace(tmp_path, out_path)
 
 
