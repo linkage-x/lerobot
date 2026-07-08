@@ -248,6 +248,7 @@ class RecorderConfig:
     episode_time_s: float
     detect_all: bool
     sensor_ids: list[int]
+    exclude_sensor_ids: list[int]
     name_prefix: str
     spawn_stagger_s: float
     connect_stable_s: float
@@ -312,6 +313,7 @@ def load_config(path: Path) -> RecorderConfig:
         episode_time_s=float(ds.get("episode_time_s", 10)),
         detect_all=bool(cams.get("detect_all", True)),
         sensor_ids=list(cams.get("sensor_ids", []) or []),
+        exclude_sensor_ids=list(cams.get("exclude_sensor_ids", []) or []),
         name_prefix=str(cams.get("name_prefix", "cam")),
         spawn_stagger_s=float(cams.get("spawn_stagger_s", 0.0)),
         connect_stable_s=float(cams.get("connect_stable_s", 2.0)),
@@ -335,8 +337,9 @@ def load_config(path: Path) -> RecorderConfig:
 
 
 def detect_locked_sids(cfg: RecorderConfig, repo_root: Path) -> list[int]:
+    excluded = {int(x) for x in cfg.exclude_sensor_ids}
     if not cfg.detect_all:
-        return list(cfg.sensor_ids)
+        return [int(sid) for sid in cfg.sensor_ids if int(sid) not in excluded]
     script = repo_root / "tools" / "thor" / "gmsl2" / "check_max96726_locks.sh"
     if not script.exists():
         raise FileNotFoundError(f"missing lock-check script: {script}")
@@ -349,7 +352,8 @@ def detect_locked_sids(cfg: RecorderConfig, repo_root: Path) -> list[int]:
     for line in p.stdout.splitlines():
         if line.startswith("LOCKED_VIDEO_IDS="):
             csv = line.split("=", 1)[1].strip()
-            return [int(x) for x in csv.split(",") if x.strip()] if csv else []
+            locked = [int(x) for x in csv.split(",") if x.strip()] if csv else []
+            return [sid for sid in locked if sid not in excluded]
     raise RuntimeError("lock-check script did not emit LOCKED_VIDEO_IDS=")
 
 

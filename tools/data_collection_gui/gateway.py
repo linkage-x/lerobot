@@ -520,6 +520,7 @@ def _device_statuses(config: dict[str, Any], repo_root: Path | None = None) -> l
         defaults = cameras_section.get("defaults") if isinstance(cameras_section.get("defaults"), dict) else {}
         prefix = str(cameras_section.get("name_prefix") or "cam")
         sensor_ids = cameras_section.get("sensor_ids") or []
+        exclude_sensor_ids = {int(x) for x in (cameras_section.get("exclude_sensor_ids") or [])}
         detect_all = bool(cameras_section.get("detect_all", False))
         if sensor_ids:
             slot_ids = [int(x) for x in sensor_ids]
@@ -531,6 +532,7 @@ def _device_statuses(config: dict[str, Any], repo_root: Path | None = None) -> l
                 slot_ids = list(range(16))
         else:
             slot_ids = []
+        slot_ids = [sid for sid in slot_ids if sid not in exclude_sensor_ids]
         for sid in slot_ids:
             devices.append(
                 {
