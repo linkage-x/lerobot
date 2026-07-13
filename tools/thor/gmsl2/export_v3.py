@@ -24,23 +24,19 @@ torchvision fallback is H.264-centric) and written as its own v3 video file
 ``from_timestamp=0``. Transcode prefers the Jetson ``nvv4l2`` gst pipeline and
 falls back to ``ffmpeg`` libx264 on dev hosts.
 
-Multi-sensor time sync (see tools/thor/ts_sync.md): the camera grid is
-authoritative — the minimum PWM-locked frame count across an episode's cameras,
-transcoded to a constant ``i/fps`` grid so one query timestamp serves every
-camera. Box state is matched onto that grid per episode, in priority order:
+Multi-sensor time sync (see tools/thor/ts_sync.md): online-sync episodes use
+``online_sync_manifest.json`` as the camera-grid source of truth. Its
+``actual_frames`` is the number of accepted full SOF clusters, and every camera's
+sidecar/video frame ``N`` shares the same ``logical_frame_index == N``. Box state
+is not re-derived during export: the recorder's already-synced session parquet is
+paired to camera frames by ``frame_index`` (not list position), so a box grid that
+is longer than the online-sync clip is dropped and a shorter one carry-forwards
+its last reading.
 
-  1. the recorder's pre-synced session box parquet — paired to camera frames by
-     ``frame_index`` (not list position), so a box grid that is longer than the
-     camera clip (the ``round(duration*fps)`` rounding tail) is dropped and a
-     shorter one carry-forwards its last reading;
-  2. fallback when no session parquet exists — re-derive box state from the raw
-     per-episode ``box_sensors.jsonl`` (MCU-clock calibration + per-sensor
-     nearest-neighbour on the ``pts_offset + N/fps`` grid), i.e. the recorder's
-     L3b alignment redone at export time.
-
-The 6 box sensors are already nearest-neighbour-merged onto the camera grid (by
-the recorder, or by the fallback); per-episode output ``timestamp`` is re-based
-to ``i/fps`` to match the re-anchored per-episode video.
+The 6 box sensors are already nearest-neighbour-merged onto the camera grid by
+the recorder; per-episode output ``timestamp`` is re-based to ``i/fps`` to match
+the re-anchored per-episode video. Legacy ``pts_offset``/raw ``box_sensors.jsonl``
+re-alignment is intentionally not part of this exporter.
 """
 
 from __future__ import annotations
@@ -197,31 +193,6 @@ def _load_box_rows(session_dir: Path) -> dict[int, list[dict[str, Any]]]:
 # ----------------------------------------------------- box ↔ camera sync ---
 
 
-def _pts_offset_s(meta: dict[str, Any]) -> float:
-    """Camera pipeline-start delay correction for the frame-time grid.
-
-    ``pts_offset = mean(camera_first_wall_s[cam] - t0_wall_s)`` from
-    ``meta.json.sync_reference`` — the same value the recorder bakes into the box
-    parquet ``timestamp`` column (ts_sync.md §5.1). Used as the t0-relative
-    origin when re-aligning raw box samples onto the camera frame grid. Returns
-    0.0 when the anchors are missing.
-    """
-    sync_reference = meta.get("sync_reference") if isinstance(meta, dict) else None
-    if not isinstance(sync_reference, dict):
-        return 0.0
-    t0_wall_s = sync_reference.get("t0_wall_s")
-    camera_first_wall_s = sync_reference.get("camera_first_wall_s")
-    if not isinstance(t0_wall_s, (int, float)) or not isinstance(camera_first_wall_s, dict):
-        return 0.0
-    deltas = [
-        float(wall_s) - float(t0_wall_s)
-        for wall_s in camera_first_wall_s.values()
-        if isinstance(wall_s, (int, float))
-    ]
-    if not deltas:
-        return 0.0
-    return sum(deltas) / len(deltas)
-
 
 def _align_box_rows_by_frame_index(
     box_rows: list[dict[str, Any]],
@@ -233,8 +204,9 @@ def _align_box_rows_by_frame_index(
     ``frame_index`` (not list position).
 
     The recorder already nearest-neighbour-merges the 6 box sensors onto the
-    ``pts_offset + N/fps`` grid (ts_sync.md §6), so row ``frame_index == N``
-    belongs to camera frame ``N``. Indexing by ``frame_index`` (rather than the
+    online-sync ``logical_frame_index / fps`` grid (ts_sync.md §6), so row
+    ``frame_index == N`` belongs to camera frame ``N``. Indexing by
+    ``frame_index`` (rather than the
     old positional ``box_rows[:n]`` slice) keeps that pairing correct even if the
     box grid is longer than the camera clip (phantom duration-rounding tail),
     shorter (carry-forward the last sample), or not 0-based contiguous.
@@ -275,98 +247,43 @@ def _box_snapshots_from_meta(meta: dict[str, Any]) -> list[dict[str, Any]]:
     return [snap for snap in snapshots if isinstance(snap, dict)]
 
 
-def _rows_from_lr3_rows(
-    rows: list[dict[str, Any]],
-) -> tuple[list[list[float]], list[list[float]], list[list[float]]]:
-    return (
-        [list(row.get("observation.state") or []) for row in rows],
-        [list(row.get("action") or []) for row in rows],
-        [list(row.get("box.timestamps") or []) for row in rows],
-    )
-
-
-def _box_rows_from_snapshots(
-    meta: dict[str, Any],
-    fps: int,
-    n_frames: int,
-) -> tuple[list[list[float]], list[list[float]], list[list[float]], list[str], list[str]] | None:
-    snapshots = _box_snapshots_from_meta(meta)
-    if not snapshots:
-        return None
-    box_ids = lr3.box_ids_from_snapshots(snapshots)
-    rows = lr3._build_episode_rows(
-        fps=fps,
-        episode_index=0,
-        snapshots=snapshots,
-        duration_s=n_frames / max(int(fps), 1),
-        box_ids=box_ids,
-    )
-    if not rows:
-        return None
-    state_rows, action_rows, ts_rows = _rows_from_lr3_rows(rows)
-    return state_rows, action_rows, ts_rows, list(lr3.box_state_names(box_ids)), list(lr3.box_timestamp_names(box_ids))
-
-
-def _box_rows_from_raw(
-    ep_dir: Path,
-    meta: dict[str, Any],
-    fps: int,
-    n_frames: int,
-) -> tuple[list[list[float]], list[list[float]], list[list[float]], list[str], list[str]] | None:
-    """Fallback: re-derive box state on the camera frame grid from the raw
-    per-sensor ``box_sensors.jsonl`` when no session box parquet exists.
-
-    Mirrors the recorder's L3b alignment (ts_sync.md §5/§6): per-sensor MCU-clock
-    calibration, then nearest-neighbour selection at each grid time
-    ``pts_offset + N/fps`` for N in ``range(n_frames)``. Returns canonical-width
-    ``(state_rows, action_rows, ts_rows)`` or ``None`` when the file is absent or
-    has no usable samples.
-    """
-    jsonl = ep_dir / "box_sensors.jsonl"
-    if not jsonl.is_file():
-        return None
-    sensor_samples: dict[str, list[dict[str, Any]]] = {}
+def _online_sync_grid_from_manifest(ep_dir: Path, camera_names: list[str]) -> tuple[int, dict[str, Any]]:
+    manifest_path = ep_dir / "online_sync_manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError("missing online_sync_manifest.json; export requires online-sync episodes")
     try:
-        with jsonl.open(encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                rec = json.loads(line)
-                sid = rec.get("sid")
-                if not sid:
-                    continue
-                sensor_samples.setdefault(sid, []).append(
-                    {
-                        "data": rec.get("data", {}),
-                        "t_rel_s": float(rec.get("t_rel_s", 0.0)),
-                        "wall_s": float(rec.get("wall_s", 0.0)),
-                    }
-                )
-    except (OSError, json.JSONDecodeError, ValueError, TypeError):
-        return None
-    if not any(sensor_samples.values()):
-        return None
-
-    sync_reference = meta.get("sync_reference") if isinstance(meta, dict) else {}
-    t0_wall_s = float((sync_reference or {}).get("t0_wall_s") or 0.0)
-    pts_offset = _pts_offset_s(meta)
-
-    box_ids = lr3.box_ids_from_sensor_samples(sensor_samples)
-    rows = lr3._build_episode_rows(
-        fps=fps,
-        episode_index=0,
-        snapshots=[],
-        duration_s=n_frames / max(int(fps), 1),
-        sensor_samples=sensor_samples,
-        t0_wall_s=t0_wall_s,
-        pts_offset_s=pts_offset,
-        box_ids=box_ids,
-    )
-    if not rows:
-        return None
-    state_rows, action_rows, ts_rows = _rows_from_lr3_rows(rows)
-    return state_rows, action_rows, ts_rows, list(lr3.box_state_names(box_ids)), list(lr3.box_timestamp_names(box_ids))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid online_sync_manifest.json: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError("invalid online_sync_manifest.json payload")
+    if not manifest.get("ok"):
+        failure = str(manifest.get("failure") or "online_sync_manifest.ok is false")
+        raise RuntimeError(f"online-sync manifest failed: {failure}")
+    try:
+        actual_frames = int(manifest.get("actual_frames") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("online-sync manifest actual_frames is invalid") from exc
+    if actual_frames <= 0:
+        raise RuntimeError("online-sync manifest actual_frames must be > 0")
+    counts = manifest.get("frame_count_by_camera") if isinstance(manifest.get("frame_count_by_camera"), dict) else {}
+    missing = [camera for camera in camera_names if camera not in counts]
+    if missing:
+        raise RuntimeError(f"online-sync manifest missing frame counts for {missing}")
+    mismatched: dict[str, Any] = {}
+    for camera in camera_names:
+        try:
+            count = int(counts[camera])
+        except (TypeError, ValueError):
+            mismatched[camera] = counts.get(camera)
+            continue
+        if count != actual_frames:
+            mismatched[camera] = count
+    if mismatched:
+        raise RuntimeError(
+            f"online-sync manifest frame counts {mismatched} != actual_frames {actual_frames}"
+        )
+    return actual_frames, manifest
 
 
 # -------------------------------------------------------------- transcoding ---
@@ -995,8 +912,8 @@ def export_task_to_v3(
         ts_width = len(box_ts_names)
 
     # Prefer the recorder's already-synced session parquet when it already has
-    # the selected schema. Multi-BOX snapshots win over old all-zero single-BOX
-    # parquet so re-exporting affected sessions can recover visible BOX data.
+    # the selected schema. Export no longer re-derives BOX rows from raw jsonl or
+    # low-rate meta snapshots; the recording path owns BOX↔camera alignment.
     if state_width == 0 and first_box:
         sample_row = None
         if first.local_index in first_box and first_box[first.local_index]:
@@ -1010,11 +927,6 @@ def export_task_to_v3(
             state_width = len(sample_row["observation.state"])
             ts_width = len(sample_row.get("box.timestamps", []))
 
-    # No session parquet, but raw per-sensor samples exist -> export re-aligns
-    # from box_sensors.jsonl using the canonical/dynamic box schema.
-    if state_width == 0 and (first.ep_dir / "box_sensors.jsonl").is_file():
-        state_width = len(box_state_names)
-        ts_width = len(box_ts_names)
     has_box = state_width > 0
 
     _emit(f"Schema: {len(camera_keys)} camera(s) {width}x{height} @ {fps}fps, state_width={state_width}")
@@ -1048,19 +960,25 @@ def export_task_to_v3(
         if src.session_dir not in box_cache:
             box_cache[src.session_dir] = _load_box_rows(src.session_dir)
 
-        # Per-camera frame counts can differ (uneven frame drops during capture).
-        # One query timestamp serves all cameras, so cap at the *minimum* count.
-        # The camera grid is authoritative: it defines how many frames the v3
-        # loader can actually serve, and box samples are matched onto it.
-        cam_counts = {cam: _mkv_frame_count(mkv) for cam, mkv in cams}
-        cam_frame_count = min(cam_counts.values()) if cam_counts else 0
-        if cam_frame_count <= 0:
-            _emit(f"WARNING: skipping {src.session_dir.name}/{src.ep_dir.name}: could not read camera frame count")
+        try:
+            n_frames, online_sync_manifest = _online_sync_grid_from_manifest(src.ep_dir, [cam for cam, _ in cams])
+        except RuntimeError as exc:
+            _emit(f"WARNING: skipping {src.session_dir.name}/{src.ep_dir.name}: {exc}")
             continue
-        if max(cam_counts.values()) != cam_frame_count:
-            _emit(f"  note: {src.ep_dir.name} camera frame counts vary {dict(sorted(cam_counts.items()))}; truncating to {cam_frame_count}")
 
-        n_frames = cam_frame_count
+        cam_counts = {cam: _mkv_frame_count(mkv) for cam, mkv in cams}
+        unreadable = [cam for cam, count in cam_counts.items() if count <= 0]
+        if unreadable:
+            _emit(f"WARNING: skipping {src.session_dir.name}/{src.ep_dir.name}: could not read camera frame count for {unreadable}")
+            continue
+        mismatched_video_counts = {cam: count for cam, count in cam_counts.items() if count != n_frames}
+        if mismatched_video_counts:
+            _emit(
+                f"WARNING: skipping {src.session_dir.name}/{src.ep_dir.name}: video frame counts "
+                f"{dict(sorted(mismatched_video_counts.items()))} != online-sync actual_frames {n_frames}"
+            )
+            continue
+
         state_rows = action_rows = ts_rows = None
         if has_box:
             box_rows = box_cache[src.session_dir].get(src.local_index, [])
@@ -1083,38 +1001,11 @@ def export_task_to_v3(
                         f"aligned by frame_index"
                     )
             else:
-                # Fallback: no usable session parquet rows for this episode ->
-                # re-align raw samples, then fall back to low-rate meta snapshots.
-                raw = _box_rows_from_raw(src.ep_dir, meta, fps, n_frames)
-                if (
-                    raw is not None
-                    and len(raw[0][0]) == state_width
-                    and (ts_width == 0 or len(raw[2][0]) == ts_width)
-                ):
-                    state_rows, action_rows, raw_ts, _raw_state_names, _raw_ts_names = raw
-                    ts_rows = raw_ts if ts_width else None
-                    _emit(
-                        f"  note: {src.ep_dir.name} re-aligned {n_frames} frames "
-                        f"from box_sensors.jsonl"
-                    )
-                else:
-                    snap = _box_rows_from_snapshots(meta, fps, n_frames)
-                    if (
-                        snap is not None
-                        and len(snap[0][0]) == state_width
-                        and (ts_width == 0 or len(snap[2][0]) == ts_width)
-                    ):
-                        state_rows, action_rows, snap_ts, _snap_state_names, _snap_ts_names = snap
-                        ts_rows = snap_ts if ts_width else None
-                        _emit(
-                            f"  note: {src.ep_dir.name} used BOX meta snapshots for {n_frames} frames"
-                        )
-                    else:
-                        _emit(
-                            f"WARNING: skipping {src.session_dir.name}/{src.ep_dir.name}: "
-                            f"no usable box parquet, box_sensors.jsonl, or BOX snapshots"
-                        )
-                        continue
+                _emit(
+                    f"WARNING: skipping {src.session_dir.name}/{src.ep_dir.name}: "
+                    f"no usable recorder-synced box parquet for online-sync export"
+                )
+                continue
 
         # Transcode each camera's clip to a per-episode CFR H.264 mp4 (PTS=i/fps).
         # Cameras are independent nvv4l2 jobs, so run them concurrently (the
@@ -1152,6 +1043,8 @@ def export_task_to_v3(
                 "session": src.session_dir.name,
                 "source_episode": src.ep_dir.name,
                 "frames": n_frames,
+                "sync_grid_source": "online_sync_manifest",
+                "online_sync_actual_frames": int(online_sync_manifest.get("actual_frames") or n_frames),
             }
         )
         _emit(f"Episode {global_index} written ({n_frames} frames) from {src.session_dir.name}/{src.ep_dir.name}")

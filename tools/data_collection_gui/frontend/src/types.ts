@@ -253,6 +253,31 @@ export type ProcessingStatus =
   | "qc_failed"
   | "error";
 
+export type OnlineSyncEpisodeSummary = {
+  episode: number;
+  present: boolean;
+  ok: boolean;
+  actualFrames: number | null;
+  frameCountByCamera: Record<string, number>;
+  maxSofDeltaMs: number | null;
+  failure: string;
+};
+
+export type OnlineSyncSummary = {
+  status: "pass" | "fail" | "missing";
+  message: string;
+  present: number;
+  missing: number;
+  ok: number;
+  failed: number;
+  totalEpisodes: number;
+  actualFrames: number;
+  maxSofDeltaMs: number | null;
+  frameCountMismatch: number;
+  failureReasons: string[];
+  episodes: OnlineSyncEpisodeSummary[];
+};
+
 export type CalibrationCamera = {
   id: string;
   reprojectionMm: number;
@@ -348,4 +373,5 @@ export type ProcessingItem = {
   totalFrames: number;
   validFramesPct: number | null;
   logTail: string[];
+  onlineSync?: OnlineSyncSummary | null;
 };

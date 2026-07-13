@@ -1267,6 +1267,48 @@ function ProcessingRow({
   );
 }
 
+
+function OnlineSyncManifestBlock({ item }: { item: ProcessingItem }) {
+  const summary = item.onlineSync;
+  if (!summary) {
+    return null;
+  }
+  const maxDelta = summary.maxSofDeltaMs;
+  const statusLabel = summary.status === "pass" ? "pass" : summary.status === "missing" ? "missing" : "fail";
+  const shownEpisodes = summary.episodes.slice(0, 6);
+  return (
+    <div className="qc-block online-sync-block">
+      <div className="qc-block-heading">
+        <h3>Online Sync Manifest</h3>
+        <span className={`sync-status sync-status-${statusLabel}`}>{statusLabel}</span>
+      </div>
+      <div className="summary-grid compact-summary-grid">
+        <Metric label="Episodes" value={`${summary.ok}/${summary.totalEpisodes}`} />
+        <Metric label="Actual frames" value={summary.actualFrames} />
+        <Metric label="Max SOF delta" value={maxDelta != null ? `${maxDelta.toFixed(3)} ms` : "—"} />
+        <Metric label="Missing" value={summary.missing} />
+      </div>
+      <div className="online-sync-episodes">
+        {shownEpisodes.map((episode) => {
+          const countText = Object.entries(episode.frameCountByCamera)
+            .slice(0, 4)
+            .map(([camera, count]) => `${camera}:${count}`)
+            .join(" ");
+          return (
+            <div className="online-sync-episode" key={episode.episode}>
+              <strong>ep {episode.episode}</strong>
+              <span>{episode.actualFrames != null ? `${episode.actualFrames} frames` : "no manifest"}</span>
+              <span>{episode.maxSofDeltaMs != null ? `${episode.maxSofDeltaMs.toFixed(3)} ms` : "—"}</span>
+              <small>{episode.ok ? countText || "counts ok" : episode.failure || "failed"}</small>
+            </div>
+          );
+        })}
+      </div>
+      {summary.failureReasons.length ? <p className="panel-note">{summary.failureReasons[0]}</p> : null}
+    </div>
+  );
+}
+
 function DatasetProcessingPage({
   snapshot,
   busy,
@@ -1423,6 +1465,7 @@ function DatasetProcessingPage({
               <h3>QC summary</h3>
               <p>{selected.qcSummary}</p>
             </div>
+            <OnlineSyncManifestBlock item={selected} />
             <div className="log-block">
               <h3>Log</h3>
               {selected.logTail.length === 0 ? (

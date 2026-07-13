@@ -1099,6 +1099,141 @@ def _write_processing_meta(dataset_root: Path, payload: dict[str, Any]) -> None:
     tmp_path.replace(meta_path)
 
 
+def _online_sync_manifest_summary(dataset_root: Path) -> dict[str, Any] | None:
+    if not _has_gmsl2_episodes(dataset_root):
+        return None
+    ep_dirs = _gmsl2_episode_dirs(dataset_root)
+    if not ep_dirs:
+        return None
+    episodes: list[dict[str, Any]] = []
+    present = 0
+    ok_count = 0
+    failed_count = 0
+    missing_count = 0
+    actual_frames_total = 0
+    max_delta_ns: int | None = None
+    failure_reasons: list[str] = []
+    frame_count_mismatch = 0
+    for ep_dir in ep_dirs:
+        match = re.search(r"episode_(\d+)$", ep_dir.name)
+        ep_index = int(match.group(1)) if match else len(episodes)
+        manifest_path = ep_dir / "online_sync_manifest.json"
+        item: dict[str, Any] = {
+            "episode": ep_index,
+            "present": manifest_path.is_file(),
+            "ok": False,
+            "actualFrames": None,
+            "frameCountByCamera": {},
+            "maxSofDeltaMs": None,
+            "failure": "missing online_sync_manifest.json",
+        }
+        if not manifest_path.is_file():
+            missing_count += 1
+            failure_reasons.append(f"episode {ep_index}: missing online_sync_manifest.json")
+            episodes.append(item)
+            continue
+        present += 1
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            failed_count += 1
+            item["failure"] = f"invalid online_sync_manifest.json: {exc}"
+            failure_reasons.append(f"episode {ep_index}: {item['failure']}")
+            episodes.append(item)
+            continue
+        if not isinstance(manifest, dict):
+            failed_count += 1
+            item["failure"] = "invalid online_sync_manifest.json payload"
+            failure_reasons.append(f"episode {ep_index}: {item['failure']}")
+            episodes.append(item)
+            continue
+        counts = manifest.get("frame_count_by_camera") if isinstance(manifest.get("frame_count_by_camera"), dict) else {}
+        max_by_camera = manifest.get("max_abs_delta_ns_by_camera") if isinstance(manifest.get("max_abs_delta_ns_by_camera"), dict) else {}
+        try:
+            actual_frames = int(manifest.get("actual_frames") or 0)
+        except (TypeError, ValueError):
+            actual_frames = 0
+        deltas: list[int] = []
+        for value in max_by_camera.values():
+            try:
+                delta = int(value)
+            except (TypeError, ValueError):
+                continue
+            deltas.append(delta)
+            max_delta_ns = delta if max_delta_ns is None else max(max_delta_ns, delta)
+        mismatch = False
+        for camera, value in counts.items():
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                mismatch = True
+                continue
+            if actual_frames and count != actual_frames:
+                mismatch = True
+        if mismatch:
+            frame_count_mismatch += 1
+        ok = bool(manifest.get("ok")) and actual_frames > 0 and not mismatch
+        failure = str(manifest.get("failure") or "").strip()
+        if not ok and not failure:
+            failure = "manifest ok=false" if not manifest.get("ok") else "frame count mismatch"
+        if ok:
+            ok_count += 1
+            actual_frames_total += actual_frames
+        else:
+            failed_count += 1
+            failure_reasons.append(f"episode {ep_index}: {failure}")
+        item.update({
+            "ok": ok,
+            "actualFrames": actual_frames,
+            "frameCountByCamera": {str(k): int(v) for k, v in counts.items() if isinstance(v, (int, float))},
+            "maxSofDeltaMs": (max(deltas) / 1_000_000.0) if deltas else None,
+            "failure": failure,
+        })
+        episodes.append(item)
+    summary: dict[str, Any] = {
+        "present": present,
+        "missing": missing_count,
+        "ok": ok_count,
+        "failed": failed_count,
+        "totalEpisodes": len(ep_dirs),
+        "actualFrames": actual_frames_total,
+        "maxSofDeltaMs": (max_delta_ns / 1_000_000.0) if max_delta_ns is not None else None,
+        "frameCountMismatch": frame_count_mismatch,
+        "failureReasons": failure_reasons[:8],
+        "episodes": episodes[:12],
+    }
+    if present == 0:
+        summary["status"] = "missing"
+        summary["message"] = "No online_sync_manifest.json files found"
+    elif failed_count or missing_count:
+        summary["status"] = "fail"
+        summary["message"] = f"{ok_count}/{len(ep_dirs)} episodes passed online-sync manifest checks"
+    else:
+        summary["status"] = "pass"
+        max_delta = summary["maxSofDeltaMs"]
+        suffix = f", max SOF delta {max_delta:.3f} ms" if isinstance(max_delta, (int, float)) else ""
+        summary["message"] = f"{ok_count}/{len(ep_dirs)} episodes passed online-sync manifest checks{suffix}"
+    return summary
+
+
+def _online_sync_manifest_check(dataset_root: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    summary = _online_sync_manifest_summary(dataset_root)
+    if summary is None:
+        return None, None
+    status = str(summary.get("status") or "missing")
+    if status == "pass":
+        check_status = "pass"
+    elif status == "missing":
+        check_status = "warn"
+    else:
+        check_status = "fail"
+    return summary, {
+        "name": "online_sync_manifest",
+        "status": check_status,
+        "message": summary.get("message") or "online sync manifest unavailable",
+    }
+
+
 def _processing_item_from_dataset(dataset_root: Path) -> dict[str, Any]:
     info = _load_dataset_info(dataset_root)
     modified_s = _dataset_modified_s(dataset_root)
@@ -1118,6 +1253,7 @@ def _processing_item_from_dataset(dataset_root: Path) -> dict[str, Any]:
         "totalFrames": total_frames,
         "validFramesPct": None,
         "logTail": [],
+        "onlineSync": _online_sync_manifest_summary(dataset_root),
     }
 
     meta = _load_processing_meta(dataset_root)
@@ -1967,6 +2103,9 @@ def _run_qc(dataset_root: Path) -> dict[str, Any]:
         }
 
     checks: list[dict[str, Any]] = []
+    online_sync_summary, online_sync_check = _online_sync_manifest_check(dataset_root)
+    if online_sync_check is not None:
+        checks.append(online_sync_check)
     total_rows = 0
     invalid_rows = 0
     schema_failed_files = 0
@@ -2191,6 +2330,7 @@ def _run_qc(dataset_root: Path) -> dict[str, Any]:
         "summary": summary,
         "valid_frames_pct": round(valid_pct, 1),
         "checks": checks,
+        "online_sync": online_sync_summary,
         "completed_at": _now_iso(),
     }
 

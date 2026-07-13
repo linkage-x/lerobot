@@ -199,6 +199,39 @@ def test_resolve_gmsl2_video_path_accepts_lerobot_feature_key(tmp_path, monkeypa
     assert gateway._resolve_video_path(state, dataset_root, "observation.images.cam_00") == mkv
 
 
+def test_processing_item_and_qc_include_online_sync_manifest(tmp_path):
+    dataset_root = tmp_path / "gmsl2_v3"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    ep_dir = dataset_root / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    (ep_dir / "meta.json").write_text(json.dumps({"duration_s": 2 / 30.0, "video": {"fps": 30}}), encoding="utf-8")
+    (ep_dir / "online_sync_manifest.json").write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "failure": "",
+                "actual_frames": 2,
+                "sync_source": "sof_tsc_ns",
+                "tolerance_ns": 1_000_000,
+                "frame_count_by_camera": {"cam_00": 2, "cam_01": 2},
+                "max_abs_delta_ns_by_camera": {"cam_00": 12_000, "cam_01": 18_000},
+                "active_cameras": ["cam_00", "cam_01"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    item = gateway._processing_item_from_dataset(dataset_root)
+    qc = gateway._run_qc(dataset_root)
+
+    assert item["onlineSync"]["status"] == "pass"
+    assert item["onlineSync"]["actualFrames"] == 2
+    assert item["onlineSync"]["maxSofDeltaMs"] == pytest.approx(0.018)
+    check = next(check for check in qc["checks"] if check["name"] == "online_sync_manifest")
+    assert check["status"] == "pass"
+    assert qc["online_sync"]["episodes"][0]["frameCountByCamera"] == {"cam_00": 2, "cam_01": 2}
+
+
 def test_lerobot_v3_gmsl2_timeline_ignores_replay_warmup(tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"

@@ -493,12 +493,11 @@ mcu_ts 冗余，已移除（liwp 是包级时间戳，对齐用 per-sensor 更�
 
 ## 10. TODO / 后续工作
 
+2026-07-13 已完成：Dataset Processing/QC 展示 `online_sync_manifest.json` 的 actual_frames、frame_count_by_camera、max SOF delta 和 failure reason；`export_v3` 改为要求 online-sync manifest，以 `actual_frames` 作为相机网格来源，并移除 legacy `pts_offset` / raw `box_sensors.jsonl` 重对齐路径。
+
 | 优先级 | TODO | 说明 |
 |--------|------|------|
 | P0 | 在 Thor GUI 实际服务目录重启/发布 replay 修复 | 源码更新后必须重启 gateway/Vite 或重新 build 前端；浏览器需强刷，避免旧 bundle 保留 50ms seek 容差。 |
 | P1 | BOX↔相机 tap-test | 用可见敲击/触觉/力事件验证 `logical_frame_index/fps` 与 BOX 校准时间之间的固定 skew 和 jitter。 |
-| P1 | 把 `online_sync_manifest.json` 纳入 Dataset Processing/QC 展示 | 对用户直接显示 actual_frames、frame_count_by_camera、max SOF delta、failure reason。 |
-| P2 | export_v3 确认使用 online-sync 网格来源, 将legacy来源相关代码移除,确认对整个同步采集链路无影响|
-| P2 | frame bus 性能升级（仅在线推理需要） | 纯数据采集落盘无需处理。当前 tmpfs NV12 双缓冲用于实时推理/预览，若 8 路 60Hz 在线推理吞吐吃紧，再升级 CUDA/DMABUF zero-copy IPC 或共享内存 ring
-  buffer。 |
+| P2 | frame bus 性能升级（仅在线推理需要） | 纯数据采集落盘无需处理。当前 tmpfs NV12 双缓冲用于实时推理/预览；若 8 路 60Hz 在线推理吞吐吃紧，再升级 CUDA/DMABUF zero-copy IPC 或共享内存 ring buffer。 |
 | P3 | BOX uint32 µs 时间戳 unwrap | 当前短 episode 不受影响；长会话/连续录制前在客户端 poll loop 检测回绕并累加 2^32。 |
