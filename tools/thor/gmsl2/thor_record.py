@@ -1107,7 +1107,13 @@ def main(argv: list[str] | None = None) -> int:
             f" (deadline remaining {remaining_s:.1f}s)"
             if remaining_s is not None else ""
         )
-        _emit(f"Connecting: spawning {len(usable)} persistent pipelines...{suffix}")
+        if cfg.cameras.recorder_backend == "argus_online_sync":
+            _emit(
+                f"Connecting: validating {len(usable)}-camera online sync, then "
+                f"starting one persistent recorder...{suffix}"
+            )
+        else:
+            _emit(f"Connecting: spawning {len(usable)} persistent pipelines...{suffix}")
         ok, message = _connect_session_with_deadline(
             new_pcs, timeout_s=remaining_s,
         )
@@ -1205,7 +1211,13 @@ def main(argv: list[str] | None = None) -> int:
             f"{cfg.name_prefix}_{sid:02d}" for sid in pcs.active_sids
         ]
         _emit(f"Cameras (active): {', '.join(active_camera_ids)}")
-    _emit(f"Connected {len(pcs.active_sids)} pipelines in {pcs.connect_duration_s:.1f}s")
+    if cfg.cameras.recorder_backend == "argus_online_sync":
+        _emit(
+            f"Connected {len(pcs.active_sids)} camera streams with one persistent "
+            f"recorder in {pcs.connect_duration_s:.1f}s"
+        )
+    else:
+        _emit(f"Connected {len(pcs.active_sids)} pipelines in {pcs.connect_duration_s:.1f}s")
 
     # --- recorder-owned preview lifecycle (on-demand) -------------------
     # Previews are a lossy tee branch off each recording pipeline. Keeping 11

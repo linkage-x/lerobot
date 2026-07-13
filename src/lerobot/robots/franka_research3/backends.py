@@ -154,6 +154,7 @@ class PandaPyArmDriver:
     damping: list[float] | None = None
     stiffness: list[float] | None = None
     filter_coeff: float | None = None
+    move_to_start_speed_factor: float = 0.2
     state_poll_frequency_hz: float = 200.0
 
     def __post_init__(self):
@@ -272,7 +273,16 @@ class PandaPyArmDriver:
         if controller_was_running:
             self._stop_controller()
         try:
-            self._robot.move_to_start()
+            move_kwargs: dict[str, object] = {
+                "speed_factor": float(self.move_to_start_speed_factor),
+            }
+            if self.stiffness is not None:
+                move_kwargs["stiffness"] = self.stiffness
+            if self.damping is not None:
+                move_kwargs["damping"] = self.damping
+            moved = self._robot.move_to_start(**move_kwargs)
+            if moved is False:
+                raise RuntimeError("FR3 move_to_start motion did not reach the SDK start pose.")
             self._refresh_joint_positions_cache()
         finally:
             if controller_was_running:

@@ -77,6 +77,7 @@ class FrankaResearch3Config(RobotConfig):
     damping: list[float] | None = None
     stiffness: list[float] | None = None
     filter_coeff: float | None = None
+    move_to_start_speed_factor: float = 0.2
     use_otg: bool = True
     otg_control_frequency: float = 800.0
     otg_async_control_frequency: float = 1000.0
@@ -112,6 +113,8 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("gripper_command_rate_limit_hz must be positive when provided.")
         if self.gripper_command_deadband_mm < 0:
             raise ValueError("gripper_command_deadband_mm must be non-negative.")
+        if not 0.0 < self.move_to_start_speed_factor <= 1.0:
+            raise ValueError("move_to_start_speed_factor must be within (0.0, 1.0].")
         if self.corenetic_bind_port <= 0 or self.corenetic_remote_port <= 0:
             raise ValueError("corenetic_bind_port and corenetic_remote_port must be positive.")
         if self.corenetic_poll_interval_s <= 0:

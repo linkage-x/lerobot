@@ -216,6 +216,11 @@ class ArgusOnlineSyncCameraSession(ams.ArgusMetadataCameraSession):
     def connect(self) -> None:
         super().connect()
         try:
+            logger.info(
+                "Argus online-sync preflight passed for %d cameras; "
+                "starting the persistent recorder",
+                len(self._stream_cfgs),
+            )
             self._start_persistent_daemon()
         except Exception:
             self.disconnect()

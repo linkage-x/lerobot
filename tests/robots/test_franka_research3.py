@@ -294,6 +294,65 @@ def test_pandapy_arm_driver_get_joint_positions_uses_cached_state(monkeypatch):
     driver.disconnect()
 
 
+def test_pandapy_arm_driver_move_to_start_uses_configured_motion_parameters(monkeypatch):
+    class DummyJointPositionController:
+        def set_control(self, joint_positions):
+            del joint_positions
+
+        def set_damping(self, damping):
+            del damping
+
+        def set_stiffness(self, stiffness):
+            del stiffness
+
+    class DummyPanda:
+        instances: list["DummyPanda"] = []
+
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.move_to_start_calls = []
+            self.state = types.SimpleNamespace(q=np.zeros(7, dtype=np.float64))
+            type(self).instances.append(self)
+
+        def start_controller(self, controller):
+            del controller
+
+        def stop_controller(self):
+            return None
+
+        def get_state(self):
+            return self.state
+
+        def move_to_start(self, **kwargs):
+            self.move_to_start_calls.append(kwargs)
+            return True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "panda_py",
+        types.SimpleNamespace(
+            Panda=DummyPanda,
+            controllers=types.SimpleNamespace(JointPosition=DummyJointPositionController),
+        ),
+    )
+    stiffness = [260, 260, 260, 240, 100, 65, 22]
+    damping = [40, 40, 40, 36, 18, 14, 8]
+    driver = PandaPyArmDriver(
+        robot_ip="192.168.1.206",
+        stiffness=stiffness,
+        damping=damping,
+        move_to_start_speed_factor=0.08,
+        state_poll_frequency_hz=0.0,
+    )
+    driver.connect()
+    driver.move_to_start()
+
+    assert DummyPanda.instances[-1].move_to_start_calls == [
+        {"speed_factor": 0.08, "stiffness": stiffness, "damping": damping}
+    ]
+    driver.disconnect()
+
+
 def test_pika_gripper_hardware_driver_deduplicates_and_rate_limits(monkeypatch):
     class FakeSDKGripper:
         instances: list["FakeSDKGripper"] = []

@@ -303,6 +303,7 @@ class FrankaResearch3(Robot):
             damping=self.config.damping,
             stiffness=self.config.stiffness,
             filter_coeff=self.config.filter_coeff,
+            move_to_start_speed_factor=self.config.move_to_start_speed_factor,
         )
         gripper = None
         kinematics = self._make_kinematics_driver()

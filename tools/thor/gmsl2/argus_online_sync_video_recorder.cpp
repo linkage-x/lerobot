@@ -1209,6 +1209,12 @@ std::unique_ptr<FrameBundle> acquire_one(
     Status status = STATUS_OK;
     Buffer* raw = cam->i_buffer_stream->acquireBuffer(timeout_ns, &status);
     if (!raw) {
+        // QUIT/STOP can arrive while Libargus is blocked in acquireBuffer.
+        // A timeout used only to unblock shutdown is expected, not a camera
+        // health failure, so leave the normal exit path quiet.
+        if (g_stop_requested.load() || g_episode_stop_requested.load()) {
+            return nullptr;
+        }
         std::ostringstream oss;
         if (status == STATUS_TIMEOUT) {
             oss << cam->name << ": timed out waiting for Argus buffer after "
