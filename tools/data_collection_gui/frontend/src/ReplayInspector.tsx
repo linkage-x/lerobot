@@ -304,6 +304,36 @@ export function ReplayInspector({
     ? Math.min(backendTotalFrames || maxVideoFrameCount, maxVideoFrameCount)
     : backendTotalFrames;
   const videoWarmupS = Math.max(0, timeline?.videoWarmupS ?? 0);
+  const firstTimelineTime = timeline?.frames?.[0]?.timestamp ?? 0;
+  const cameraVideoOffsetsS: Record<string, number> = timeline?.cameraVideoOffsetsS ?? {};
+  const cameraVideoOffsetS = useCallback((key: string): number => {
+    const offset = cameraVideoOffsetsS[key];
+    return Number.isFinite(offset) ? offset : 0;
+  }, [cameraVideoOffsetsS]);
+  const timelineTimeToVideoTime = useCallback((key: string, timelineTimeS: number): number => {
+    return Math.max(0, timelineTimeS - cameraVideoOffsetS(key) + videoWarmupS);
+  }, [cameraVideoOffsetS, videoWarmupS]);
+  const videoTimeToTimelineTime = useCallback((key: string, videoTimeS: number): number => {
+    return Math.max(0, videoTimeS + cameraVideoOffsetS(key) - videoWarmupS);
+  }, [cameraVideoOffsetS, videoWarmupS]);
+  const syncVideoToTimelineTime = useCallback((
+    key: string,
+    video: HTMLVideoElement,
+    timelineTimeS: number,
+    toleranceS: number,
+  ) => {
+    const target = timelineTimeToVideoTime(key, timelineTimeS);
+    const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : Number.POSITIVE_INFINITY;
+    const clamped = Math.max(0, Math.min(target, duration));
+    if (Math.abs(video.currentTime - clamped) <= toleranceS) {
+      return;
+    }
+    try {
+      video.currentTime = clamped;
+    } catch {
+      // ignore: browsers may throw if metadata is not yet loaded
+    }
+  }, [timelineTimeToVideoTime]);
 
   const handleVideoMetadataLoaded = useCallback(
     (key: string, event: React.SyntheticEvent<HTMLVideoElement>) => {
@@ -312,8 +342,12 @@ export function ReplayInspector({
       if (!Number.isFinite(dur) || dur <= 0) return;
       const frames = Math.max(1, Math.round(dur * Math.max(fps, 1)));
       setVideoFrameCounts((prev) => (prev[key] === frames ? prev : { ...prev, [key]: frames }));
+      if (!playing && timeline) {
+        const timelineTimeS = timeline.frames?.[currentFrame]?.timestamp ?? currentFrame / Math.max(fps, 1);
+        syncVideoToTimelineTime(key, target, timelineTimeS, 0.0);
+      }
     },
-    [fps],
+    [currentFrame, fps, playing, syncVideoToTimelineTime, timeline],
   );
 
   useEffect(() => {
@@ -329,18 +363,34 @@ export function ReplayInspector({
     // wall-clock the video element uses, so the two stay locked.
     let rafId = 0;
     const tick = () => {
-      const videos = Object.values(videoRefs.current).filter((v): v is HTMLVideoElement => v != null);
-      const liveVideos = videos.filter((v) => !v.ended && Number.isFinite(v.currentTime));
-      const candidates = liveVideos.length > 0 ? liveVideos : videos.filter((v) => Number.isFinite(v.currentTime));
-      const master = candidates.reduce<HTMLVideoElement | null>(
-        (best, video) => (best == null || video.currentTime > best.currentTime ? video : best),
+      const videos = Object.entries(videoRefs.current)
+        .filter((entry): entry is [string, HTMLVideoElement] => entry[1] != null);
+      const liveVideos = videos.filter(([, video]) => !video.ended && Number.isFinite(video.currentTime));
+      const candidates = liveVideos.length > 0
+        ? liveVideos
+        : videos.filter(([, video]) => Number.isFinite(video.currentTime));
+      const master = candidates.reduce<[string, HTMLVideoElement] | null>(
+        (best, entry) => {
+          if (best == null) {
+            return entry;
+          }
+          const entryTime = videoTimeToTimelineTime(entry[0], entry[1].currentTime);
+          const bestTime = videoTimeToTimelineTime(best[0], best[1].currentTime);
+          return entryTime > bestTime ? entry : best;
+        },
         null,
       );
-      if (master && Number.isFinite(master.currentTime)) {
-        const t = Math.max(0, master.currentTime - videoWarmupS);
+      if (master && Number.isFinite(master[1].currentTime)) {
+        const t = videoTimeToTimelineTime(master[0], master[1].currentTime);
         const frame = Math.min(totalFrames - 1, Math.max(0, Math.round(t * fps)));
         setCurrentFrame(frame);
-        const allEnded = videos.length > 0 && videos.every((video) => video.ended);
+        const syncToleranceS = Math.max(0.006, 0.5 / Math.max(fps, 1));
+        videos.forEach(([key, video]) => {
+          if (key !== master[0]) {
+            syncVideoToTimelineTime(key, video, t, syncToleranceS);
+          }
+        });
+        const allEnded = videos.length > 0 && videos.every(([, video]) => video.ended);
         if (frame >= totalFrames - 1 || allEnded) {
           setPlaying(false);
           return;
@@ -354,29 +404,22 @@ export function ReplayInspector({
         window.cancelAnimationFrame(rafId);
       }
     };
-  }, [playing, fps, totalFrames, videoWarmupS]);
+  }, [playing, fps, totalFrames, syncVideoToTimelineTime, videoTimeToTimelineTime]);
 
   useEffect(() => {
     if (!timeline) {
       return;
     }
     const t = (timeline.frames?.[currentFrame]?.timestamp ?? currentFrame / Math.max(fps, 1));
-    Object.values(videoRefs.current).forEach((video) => {
-      if (!video) {
-        return;
-      }
-      const target = t + videoWarmupS;
-      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : Number.POSITIVE_INFINITY;
-      const clamped = Math.max(0, Math.min(target, duration));
-      if (!playing && Math.abs(video.currentTime - clamped) > 0.05) {
-        try {
-          video.currentTime = clamped;
-        } catch {
-          // ignore: browsers may throw if metadata is not yet loaded
+    if (!playing) {
+      const seekToleranceS = Math.max(0.002, 0.25 / Math.max(fps, 1));
+      Object.entries(videoRefs.current).forEach(([key, video]) => {
+        if (video) {
+          syncVideoToTimelineTime(key, video, t, seekToleranceS);
         }
-      }
-    });
-  }, [timeline, currentFrame, fps, playing, videoWarmupS]);
+      });
+    }
+  }, [timeline, currentFrame, fps, playing, syncVideoToTimelineTime]);
 
   useEffect(() => {
     Object.values(videoRefs.current).forEach((video) => {
@@ -482,19 +525,14 @@ export function ReplayInspector({
     // `playing` is true, so rewind the <video> elements here directly.
     if (totalFrames > 0 && currentFrame >= totalFrames - 1) {
       setCurrentFrame(0);
-      Object.values(videoRefs.current).forEach((video) => {
-        if (!video) {
-          return;
-        }
-        try {
-          video.currentTime = videoWarmupS;
-        } catch {
-          // ignore: browsers may throw if metadata is not yet loaded
+      Object.entries(videoRefs.current).forEach(([key, video]) => {
+        if (video) {
+          syncVideoToTimelineTime(key, video, firstTimelineTime, 0.0);
         }
       });
     }
     setPlaying(true);
-  }, [playing, currentFrame, totalFrames, videoWarmupS]);
+  }, [playing, currentFrame, totalFrames, firstTimelineTime, syncVideoToTimelineTime]);
 
   if (!datasetPath) {
     return null;

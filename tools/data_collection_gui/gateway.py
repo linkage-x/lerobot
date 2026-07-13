@@ -3198,6 +3198,7 @@ def _empty_timeline(
         "videoFileIndex": 0,
         "sourcePath": "",
         "videoWarmupS": 0.0,
+        "cameraVideoOffsetsS": {},
     }
     if error:
         payload["error"] = error
@@ -3429,6 +3430,48 @@ def _gmsl2_pts_offset_s(ep_meta: dict[str, Any]) -> float:
     return sum(deltas) / len(deltas)
 
 
+def _camera_stem_from_key(camera_key: str) -> str:
+    return camera_key.rsplit(".", 1)[-1]
+
+
+def _gmsl2_camera_first_offsets_s(ep_meta: dict[str, Any]) -> dict[str, float]:
+    sync_reference = ep_meta.get("sync_reference") if isinstance(ep_meta, dict) else None
+    if not isinstance(sync_reference, dict):
+        return {}
+    t0_wall_s = sync_reference.get("t0_wall_s")
+    camera_first_wall_s = sync_reference.get("camera_first_wall_s")
+    if not isinstance(t0_wall_s, (int, float)) or not isinstance(camera_first_wall_s, dict):
+        return {}
+    offsets: dict[str, float] = {}
+    for camera, wall_s in camera_first_wall_s.items():
+        if not isinstance(wall_s, (int, float)):
+            continue
+        offset_s = float(wall_s) - float(t0_wall_s)
+        if math.isfinite(offset_s):
+            offsets[str(camera)] = offset_s
+    return offsets
+
+
+def _gmsl2_camera_video_offsets_s(ep_meta: dict[str, Any], camera_keys: list[str]) -> dict[str, float]:
+    """Map replay camera keys to their file-local zero point in t0-relative time.
+
+    Timeline timestamps are on the shared t0-relative axis, while browser
+    ``video.currentTime`` is local to each remuxed camera file. For a camera
+    whose first frame landed at ``camera_first_wall_s - t0_wall_s == offset``,
+    the frontend must seek to ``timeline_timestamp - offset``.
+    """
+    raw_offsets = _gmsl2_camera_first_offsets_s(ep_meta)
+    if not raw_offsets:
+        return {}
+    offsets: dict[str, float] = {}
+    for key in camera_keys:
+        offset = raw_offsets.get(key)
+        if offset is None:
+            offset = raw_offsets.get(_camera_stem_from_key(key))
+        if offset is not None:
+            offsets[key] = offset
+    return offsets
+
 def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict[str, Any]:
     ep_dirs = _gmsl2_episode_dirs(dataset_root)
     if not ep_dirs:
@@ -3512,6 +3555,7 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
         "frames": frames,
         "sourcePath": str(ep_dir),
         "videoWarmupS": video_warmup_s,
+        "cameraVideoOffsetsS": _gmsl2_camera_video_offsets_s(ep_meta, camera_keys),
     }
 
 
@@ -3583,12 +3627,14 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
             cube_pose_names.append(cube_name)
 
     ep_dir: Path | None = None
+    ep_meta: dict[str, Any] = {}
     box_fallback: tuple[list[str], list[str], dict[int, dict[str, list[float]]]] | None = None
     if _has_gmsl2_episodes(dataset_root):
         ep_dir = dataset_root / "episodes" / f"episode_{int(episode or 0):06d}"
+        ep_meta = _load_episode_meta(ep_dir) if ep_dir.is_dir() else {}
         if ep_dir.is_dir() and (not state_names or _rows_vector_all_zero(rows, "observation.state")):
             box_fallback = _box_snapshot_rows_for_replay(
-                _load_episode_meta(ep_dir),
+                ep_meta,
                 fps=fps,
                 total_frames=len(rows),
             )
@@ -3645,6 +3691,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         "frames": frames,
         "sourcePath": str(data_file),
         "videoWarmupS": video_warmup_s,
+        "cameraVideoOffsetsS": _gmsl2_camera_video_offsets_s(ep_meta, camera_keys),
     }
 
 
@@ -3749,7 +3796,7 @@ def _resolve_video_path(state: GatewayState, dataset_root: Path, camera_key: str
     if _has_gmsl2_episodes(dataset_root):
         episode = int(state.replay.episode or 0)
         ep_dir = dataset_root / "episodes" / f"episode_{episode:06d}"
-        mkv = ep_dir / f"{camera_key}.mkv"
+        mkv = ep_dir / f"{_camera_stem_from_key(camera_key)}.mkv"
         if not mkv.is_file():
             return None
         expected_duration_s = None

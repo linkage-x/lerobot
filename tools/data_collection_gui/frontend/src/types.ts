@@ -332,6 +332,7 @@ export type ReplayTimeline = {
   frames: ReplayTimelineFrame[];
   sourcePath: string;
   videoWarmupS?: number;
+  cameraVideoOffsetsS?: Record<string, number>;
   error?: string;
 };
 

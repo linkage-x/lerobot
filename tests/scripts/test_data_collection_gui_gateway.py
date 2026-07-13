@@ -143,6 +143,62 @@ def test_gmsl2_timeline_ignores_replay_warmup_for_splitmux_episode(tmp_path):
     assert timeline["frames"][0]["timestamp"] == 0
 
 
+def test_gmsl2_timeline_exposes_per_camera_video_offsets(tmp_path):
+    dataset_root = tmp_path / "gmsl2"
+    ep_dir = dataset_root / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    t0 = 1000.0
+    (ep_dir / "cam_00.mkv").write_bytes(b"0" * 2048)
+    (ep_dir / "cam_01.mkv").write_bytes(b"1" * 2048)
+    (ep_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "duration_s": 1.0,
+                "video": {"fps": 60},
+                "sync_reference": {
+                    "t0_wall_s": t0,
+                    "camera_first_wall_s": {"cam_00": t0 + 0.10, "cam_01": t0 + 0.14},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    timeline = gateway._read_gmsl2_timeline(dataset_root, episode=0)
+
+    assert timeline["frames"][0]["timestamp"] == pytest.approx(0.12)
+    assert timeline["cameraVideoOffsetsS"] == {"cam_00": pytest.approx(0.10), "cam_01": pytest.approx(0.14)}
+    assert gateway._gmsl2_camera_video_offsets_s(
+        {
+            "sync_reference": {
+                "t0_wall_s": t0,
+                "camera_first_wall_s": {"cam_00": t0 + 0.10},
+            }
+        },
+        ["observation.images.cam_00"],
+    ) == {"observation.images.cam_00": pytest.approx(0.10)}
+
+
+def test_resolve_gmsl2_video_path_accepts_lerobot_feature_key(tmp_path, monkeypatch):
+    dataset_root = tmp_path / "gmsl2"
+    ep_dir = dataset_root / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    mkv = ep_dir / "cam_00.mkv"
+    mkv.write_bytes(b"0" * 2048)
+    (ep_dir / "meta.json").write_text(json.dumps({"duration_s": 1.0}), encoding="utf-8")
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test", episode=0),
+        datasets_root=dataset_root.parent,
+    )
+    monkeypatch.setattr(gateway, "_remux_mkv_to_mp4", lambda *_args, **_kwargs: None)
+
+    assert gateway._resolve_video_path(state, dataset_root, "observation.images.cam_00") == mkv
+
+
 def test_lerobot_v3_gmsl2_timeline_ignores_replay_warmup(tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
