@@ -213,6 +213,40 @@ def test_export_task_to_v3_produces_loadable_dataset(tmp_path, with_box):
     ]
 
 
+def test_export_task_to_v3_can_write_to_distinct_output_name(tmp_path, monkeypatch):
+    datasets = tmp_path / "datasets"
+    exports = tmp_path / "exports"
+    datasets.mkdir()
+    _make_session(datasets, "thor_gmsl2_11ch_v1_20260713_075106", [0], cams=("cam_00", "cam_06"))
+    _write_online_sync_manifest(
+        datasets / "thor_gmsl2_11ch_v1_20260713_075106" / "episodes" / "episode_000000",
+        ("cam_00", "cam_06"),
+        n_frames=1,
+    )
+    monkeypatch.setattr(export_v3, "_mkv_frame_count", lambda _path: 1)
+
+    def fake_transcode(_src, dst, _codec, _fps):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"mp4")
+
+    monkeypatch.setattr(export_v3, "transcode_to_h264_mp4", fake_transcode)
+
+    out = export_v3.export_task_to_v3(
+        datasets_root=datasets,
+        exports_root=exports,
+        base_name="thor_gmsl2_11ch_v1_20260713_075106",
+        output_name="thor_gmsl2_2ch_v1_20260713_075106",
+        repo_id="local/thor_gmsl2_2ch_v1_20260713_075106",
+        task="t",
+    )
+
+    assert out == exports / "thor_gmsl2_2ch_v1_20260713_075106"
+    sources = json.loads((out / "meta" / "export_sources.json").read_text())
+    assert sources["base_name"] == "thor_gmsl2_11ch_v1_20260713_075106"
+    assert sources["output_name"] == "thor_gmsl2_2ch_v1_20260713_075106"
+    assert sources["repo_id"] == "local/thor_gmsl2_2ch_v1_20260713_075106"
+
+
 def test_export_refuses_existing_output_without_overwrite(tmp_path):
     pytest.importorskip("av")
     datasets = tmp_path / "datasets"

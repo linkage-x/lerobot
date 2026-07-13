@@ -64,12 +64,12 @@ def test_default_config_is_thor_gmsl2_box():
     state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
     snapshot = gateway._snapshot(state)
 
-    assert snapshot["configSummary"]["repoId"] == "local/thor_gmsl2_11ch_v1"
+    assert snapshot["configSummary"]["repoId"] == "local/thor_gmsl2_Nch_v1"
     assert snapshot["configSummary"]["fps"] == 60
     devices_by_kind: dict[str, list[str]] = {}
     for device in snapshot["devices"]:
         devices_by_kind.setdefault(device["kind"], []).append(device["id"])
-    # 11-camera GMSL2 rig (detect_all => sids 0..15 placeholder before connect).
+    # detected-camera GMSL2 rig (detect_all => sids 0..15 placeholder before connect).
     assert "camera" in devices_by_kind
     assert all(cid.startswith("cam_") for cid in devices_by_kind["camera"])
     assert len(devices_by_kind["camera"]) >= 11
@@ -1188,8 +1188,8 @@ def _task_state(tmp_path):
         config_path=repo_root / "config.yaml",
         config={
             "dataset": {
-                "repo_id": "local/thor_gmsl2_11ch_v1",
-                "root": "outputs/datasets/thor_gmsl2_11ch_v1",
+                "repo_id": "local/thor_gmsl2_Nch_v1",
+                "root": "outputs/datasets/thor_gmsl2_Nch_v1",
                 "single_task": "default capture",
                 "fps": 60,
             },
@@ -1219,7 +1219,7 @@ def test_build_task_overlay_patches_only_dataset_and_aligns_root_with_repo_id(tm
     assert overlay["dataset"]["single_task"] == "pick the cube"
     # non-dataset blocks untouched; base config not mutated.
     assert overlay["cameras"] == state.config["cameras"]
-    assert state.config["dataset"]["repo_id"] == "local/thor_gmsl2_11ch_v1"
+    assert state.config["dataset"]["repo_id"] == "local/thor_gmsl2_Nch_v1"
 
 
 def test_resolve_recorder_config_path_uses_overlay_for_active_task(tmp_path):
@@ -1250,7 +1250,7 @@ def test_resolve_recorder_config_path_falls_back_without_active_task(tmp_path):
     config_path = gateway._resolve_recorder_config_path(state)
 
     assert config_path == state.config_path
-    assert state.recording.datasetRoot == "outputs/datasets/thor_gmsl2_11ch_v1"
+    assert state.recording.datasetRoot == "outputs/datasets/thor_gmsl2_Nch_v1"
 
 
 def test_set_active_task_rejects_task_without_repo_id(tmp_path):
@@ -1321,13 +1321,27 @@ def test_export_command_rejects_task_without_repo_id(tmp_path):
         gateway._export_command(state, {"id": "t", "name": "x", "datasetRepoId": ""})
 
 
-def _write_qc_pass_gmsl2_session(dataset_root: Path) -> None:
+def _write_qc_pass_gmsl2_session(dataset_root: Path, cams: tuple[str, ...] = ()) -> None:
     episode = dataset_root / "episodes" / "episode_000000"
     episode.mkdir(parents=True)
     (episode / "meta.json").write_text(
         json.dumps({"video": {"fps": 60, "height": 480, "width": 640}}),
         encoding="utf-8",
     )
+    if cams:
+        for cam in cams:
+            (episode / f"{cam}.mkv").write_bytes(b"0" * 2048)
+        (episode / "online_sync_manifest.json").write_text(
+            json.dumps(
+                {
+                    "ok": True,
+                    "actual_frames": 1,
+                    "active_cameras": list(cams),
+                    "frame_count_by_camera": {cam: 1 for cam in cams},
+                }
+            ),
+            encoding="utf-8",
+        )
     gateway._write_processing_meta(
         dataset_root,
         {
@@ -1335,6 +1349,21 @@ def _write_qc_pass_gmsl2_session(dataset_root: Path) -> None:
             "versions": {"v1": {"qc": {"status": "pass", "summary": "ok"}}},
         },
     )
+
+
+def test_approved_dataset_export_command_uses_actual_camera_count_for_output_name(tmp_path):
+    state, datasets_root = _task_state(tmp_path)
+    state.exports_root = tmp_path / "repo" / "outputs" / "exports"
+    session = datasets_root / "thor_gmsl2_11ch_v1_20260713_075106"
+    cams = ("cam_00", "cam_06", "cam_07", "cam_08", "cam_09", "cam_12", "cam_13", "cam_14")
+    _write_qc_pass_gmsl2_session(session, cams=cams)
+
+    command, out_root = gateway._approved_dataset_export_command(state, session)
+
+    assert command[command.index("--base-name") + 1] == "thor_gmsl2_11ch_v1_20260713_075106"
+    assert command[command.index("--output-name") + 1] == "thor_gmsl2_8ch_v1_20260713_075106"
+    assert command[command.index("--repo-id") + 1] == "local/thor_gmsl2_8ch_v1_20260713_075106"
+    assert out_root == state.exports_root / "thor_gmsl2_8ch_v1_20260713_075106"
 
 
 def test_approved_dataset_export_command_scopes_to_selected_session(tmp_path):

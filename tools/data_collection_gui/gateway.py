@@ -1747,12 +1747,13 @@ def _approved_dataset_export_command(state: GatewayState, dataset_root: Path) ->
     if not _has_gmsl2_episodes(dataset_root):
         raise ValueError("Approved raw export requires a GMSL2 session dataset.")
     base_name = dataset_root.name
+    output_name = _dataset_name_with_actual_camera_count(dataset_root)
     exports_root = _task_exports_root(state)
-    out_root = exports_root / base_name
+    out_root = exports_root / output_name
     task = _matching_task_for_dataset(state, dataset_root)
-    task_prompt = str((task or {}).get("description") or (task or {}).get("name") or base_name).strip()
+    task_prompt = str((task or {}).get("description") or (task or {}).get("name") or output_name).strip()
     namespace = str((task or {}).get("datasetRepoId") or "local").split("/")[0] or "local"
-    repo_id = f"{namespace}/{base_name}"
+    repo_id = f"{namespace}/{output_name}"
     script = state.repo_root / "tools" / "thor" / "gmsl2" / "export_v3.py"
     command = [
         str(_venv_python(state.repo_root)),
@@ -1760,6 +1761,7 @@ def _approved_dataset_export_command(state: GatewayState, dataset_root: Path) ->
         "--datasets-root", str(dataset_root.parent),
         "--exports-root", str(exports_root),
         "--base-name", base_name,
+        "--output-name", output_name,
         "--repo-id", repo_id,
         "--task", task_prompt,
         "--overwrite",
@@ -2575,6 +2577,38 @@ def _gmsl2_episode_dirs(dataset_root: Path) -> list[Path]:
         (d for d in eps_dir.iterdir() if d.is_dir() and d.name.startswith("episode_")),
         key=lambda p: p.name,
     )
+
+
+def _name_with_camera_count(name: str, camera_count: int) -> str:
+    if camera_count <= 0:
+        return name
+    label = f"{camera_count}ch"
+    if re.search(r"(?<![A-Za-z0-9])(?:\d+|[Nn])ch(?![A-Za-z0-9])", name):
+        return re.sub(r"(?<![A-Za-z0-9])(?:\d+|[Nn])ch(?![A-Za-z0-9])", label, name, count=1)
+    return name
+
+
+def _gmsl2_camera_names(dataset_root: Path) -> list[str]:
+    names: set[str] = set()
+    for ep_dir in _gmsl2_episode_dirs(dataset_root):
+        manifest_path = ep_dir / "online_sync_manifest.json"
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                manifest = {}
+            active = manifest.get("active_cameras")
+            if isinstance(active, list):
+                names.update(str(cam) for cam in active if str(cam).strip())
+            counts = manifest.get("frame_count_by_camera")
+            if isinstance(counts, dict):
+                names.update(str(cam) for cam in counts if str(cam).strip())
+        names.update(p.stem for p in ep_dir.glob("cam_*.mkv"))
+    return sorted(names)
+
+
+def _dataset_name_with_actual_camera_count(dataset_root: Path) -> str:
+    return _name_with_camera_count(dataset_root.name, len(_gmsl2_camera_names(dataset_root)))
 
 
 # Per-episode frame-count memo keyed by meta.json path -> (mtime, frames).

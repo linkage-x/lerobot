@@ -44,6 +44,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -69,6 +70,15 @@ from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
 
 logger = logging.getLogger("thor_record")
+
+
+def _name_with_camera_count(name: str, camera_count: int) -> str:
+    if camera_count <= 0:
+        return name
+    label = f"{camera_count}ch"
+    if re.search(r"(?<![A-Za-z0-9])(?:\d+|[Nn])ch(?![A-Za-z0-9])", name):
+        return re.sub(r"(?<![A-Za-z0-9])(?:\d+|[Nn])ch(?![A-Za-z0-9])", label, name, count=1)
+    return name
 
 
 _STDIN_HINT = (
@@ -948,14 +958,12 @@ def main(argv: list[str] | None = None) -> int:
         auto_cfg.enabled = False
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    cfg.dataset_root = cfg.dataset_root.parent / f"{cfg.dataset_root.name}_{stamp}"
+    dataset_root_base = cfg.dataset_root
 
     repo_root = args.repo_root.resolve()
     if args.skip_hardware_sync:
         cfg.hardware_sync.enabled = False
     gr.maybe_setup_sync(cfg, repo_root)
-
-    _emit(f"Dataset root: {cfg.dataset_root}")
 
     _emit("Connecting: detecting MAX96726 locked cameras...")
     locked = gr.detect_locked_sids(cfg, repo_root)
@@ -978,6 +986,11 @@ def main(argv: list[str] | None = None) -> int:
     _emit(f"Connecting: {len(usable)}/{len(locked)} cameras verified")
 
     camera_ids = [f"{cfg.name_prefix}_{sid:02d}" for sid in usable]
+    camera_count = len(camera_ids)
+    dataset_name = _name_with_camera_count(dataset_root_base.name, camera_count)
+    cfg.dataset_root = dataset_root_base.parent / f"{dataset_name}_{stamp}"
+    cfg.repo_id = _name_with_camera_count(cfg.repo_id, camera_count)
+    _emit(f"Dataset root: {cfg.dataset_root}")
     _emit(f"Cameras: {', '.join(camera_ids)}")
 
     if cfg.hardware_sync.enabled:

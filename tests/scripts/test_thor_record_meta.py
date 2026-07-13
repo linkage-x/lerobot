@@ -18,6 +18,14 @@ def _load_thor_record_module():
     return mod
 
 
+def test_name_with_camera_count_replaces_existing_channel_label() -> None:
+    thor_record = _load_thor_record_module()
+
+    assert thor_record._name_with_camera_count("thor_gmsl2_11ch_v1", 8) == "thor_gmsl2_8ch_v1"
+    assert thor_record._name_with_camera_count("thor_gmsl2_Nch_v1", 8) == "thor_gmsl2_8ch_v1"
+    assert thor_record._name_with_camera_count("pick_and_place", 8) == "pick_and_place"
+
+
 def _recorder_config(tmp_path: Path) -> gr.RecorderConfig:
     return gr.RecorderConfig(
         cameras=gr.CameraDefaults(recorder_backend="argus_metadata"),

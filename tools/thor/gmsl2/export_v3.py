@@ -858,12 +858,16 @@ def export_task_to_v3(
     base_name: str,
     repo_id: str,
     task: str,
+    output_name: str | None = None,
     overwrite: bool = False,
     jobs: int = _DEFAULT_JOBS,
 ) -> Path:
     name = base_name.split("/")[-1].strip()
     if not name:
         raise RuntimeError(f"Invalid task base name: {base_name!r}")
+    export_name = (output_name or name).split("/")[-1].strip()
+    if not export_name:
+        raise RuntimeError(f"Invalid export output name: {output_name!r}")
     sessions = find_task_sessions(datasets_root, name)
     if not sessions:
         raise RuntimeError(f"No recorded sessions found for '{name}' under {datasets_root}")
@@ -872,7 +876,7 @@ def export_task_to_v3(
         raise RuntimeError(f"Sessions for '{name}' contain no episodes")
     _emit(f"Export plan: {len(episodes)} episodes from {len(sessions)} session(s) -> {repo_id}")
 
-    out_root = exports_root / name
+    out_root = exports_root / export_name
     if out_root.exists():
         if not overwrite:
             raise RuntimeError(f"Output already exists: {out_root} (pass --overwrite to replace)")
@@ -1055,7 +1059,17 @@ def export_task_to_v3(
 
     writer.finalize()
     (out_root / "meta" / "export_sources.json").write_text(
-        json.dumps({"repo_id": repo_id, "task": task, "base_name": name, "episodes": sources}, indent=2, ensure_ascii=False),
+        json.dumps(
+            {
+                "repo_id": repo_id,
+                "task": task,
+                "base_name": name,
+                "output_name": export_name,
+                "episodes": sources,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
     _emit(f"Export complete: {global_index} episodes at {out_root}")
@@ -1071,6 +1085,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--exports-root", required=True, type=Path)
     ap.add_argument("--base-name", required=True, help="task dataset base name, e.g. pick_and_place")
     ap.add_argument("--repo-id", required=True, help="e.g. local/pick_and_place")
+    ap.add_argument("--output-name", help="optional output directory name; defaults to --base-name")
     ap.add_argument("--task", required=True, help="single_task prompt string")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--jobs", type=int, default=_DEFAULT_JOBS, help="parallel camera transcodes")
@@ -1084,6 +1099,7 @@ def main(argv: list[str] | None = None) -> int:
             base_name=args.base_name,
             repo_id=args.repo_id,
             task=args.task,
+            output_name=args.output_name,
             overwrite=args.overwrite,
             jobs=args.jobs,
         )
