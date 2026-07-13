@@ -4,6 +4,7 @@
 > 初版 2026-05-27；2026-06-09 按实际代码实现校订（PTS offset 机制、meta 字段、ffprobe 角色）
 > 2026-06-15 按真机实测校订（各传感器频率、L3b 校准残差；MCU 时钟 = 1µs/tick，6 路全 engage）
 > 2026-06-16 schema 精简（observation.state 31 维 / box.timestamps 6 维）+ 去 meta 冗余（`sync_reference` 删 split_now_wall_s、camera_first_pts_s）
+> 2026-07-13 按最近 8 次同步相关改动校订：生产默认相机路径切到 `argus_online_sync`，SOF full-cluster 在 encoder 前对齐；新增 online frame bus / preview bus / replay 多视频同步说明。
 
 ## 1. 系统总览
 
@@ -11,7 +12,7 @@ Thor 采集系统包含两套独立的数据源：
 
 | 数据源 | 硬件 | 传输方式 | 帧率 |
 |--------|------|----------|------|
-| 11 路 GMSL2 相机 | SG16A + AR0234C 传感器 | nvarguscamerasrc → H.265 MKV | 60 fps |
+| 8-11 路 GMSL2 相机 | SG16A + AR0234C 传感器 | Libargus online-sync → H.265 MKV + metadata sidecar | 60 fps |
 | BOX 采集板传感器 | MCU + gripper / IMU / trigger / 6D force / touch×2 | UDP/15000 | 各传感器独立，~50-200 Hz |
 
 **核心挑战：两套数据源的时钟域完全独立，没有硬件级公共时间基准。**
@@ -27,9 +28,9 @@ Thor 采集系统包含两套独立的数据源：
 │                             └──────┬───────────┘    │
 │                                    │ GMSL2          │
 │                     ┌──────────────▼──────────┐     │
-│                     │ nvarguscamerasrc ×11     │     │
-│                     │ do-timestamp=true        │     │
-│                     │ → H.265 → MKV per cam   │     │
+│                     │ Libargus BufferOutput    │     │
+│                     │ SOF full-cluster gate    │     │
+│                     │ → H.265 MKV + sidecar    │     │
 │                     └─────────────────────────┘     │
 │                                                     │
 │  ┌──────────┐  UDP/15000   ┌──────────────────┐    │
@@ -46,16 +47,20 @@ Thor 采集系统包含两套独立的数据源：
 
 ### 1.1 软同步工作原理（TL;DR）
 
-**一句话**：以**主机墙钟**为唯一公共时间轴，把硬件同步的相机与独立晶振时钟的 BOX 都换算到这条轴上，再按 60Hz 帧网格做最近邻对齐。
+**一句话**：生产默认相机路径现在先在 Libargus recorder 内按同一次 SOF 聚成 full cluster，再把同步帧送入 encoder；BOX 仍以主机时间为桥，通过 MCU→host 线性校准后贴到相机帧网格。
 
-1. **公共原点**：每条 episode 开录记一个 `t0_wall_s`（split-now 的主机墙钟时刻），相机与 BOX 共用它为零点。
-2. **相机**（详 §3 / §5.1）：11 路共用一路 PWM 硬触发 → 帧间 <1µs；管道启动延迟用 `pts_offset = mean(camera_first_wall_s − t0_wall_s)` 修正，**帧 N 时间 = pts_offset + N/fps**（t0 相对域）。
-3. **BOX**（详 §4 / §5.2）：500Hz 轮询，按各传感器 MCU 时间戳变化去重（原生 199/50Hz 独立记录）；再对每个传感器做 `host = slope·mcu + intercept` 最小二乘回归（实测 slope = 1µs/tick，残差 1–2ms）消除轮询抖动，得 `t_rel_s = 校准时间 − t0_wall_s`。
-4. **合并**（详 §6）：对每个 60Hz 相机帧时间，在每个传感器序列里二分查找最近样本 → 拼成 `observation.state`（§9.1）；对齐所用的原始 MCU 戳单独存入 `box.timestamps`（§9.2）。
+1. **公共 episode 原点**：每条 episode 记录 `t0_wall_s` / `t0_mono_s`。BOX 样本用 `t_rel_s = wall_s - t0_wall_s`；相机生产路径用 recorder 的 `logical_frame_index` 表示已通过 SOF gate 的同步帧序号。
+2. **相机生产默认路径：`argus_online_sync`**（详 §3.2 / §5.1）：recorder 从每路 Argus Buffer 取 same-buffer metadata，以 `sof_tsc_ns` 找到所有 active camera 都存在、且 SOF spread 不超过 `online_sync.tolerance_ms` 的 full cluster；只有 full cluster 才进入硬件 encoder/mux。视频第 N 帧、sidecar 第 N 行、online frame bus 的 `logical_frame_index=N` 指向同一个同步 cluster。
+3. **相机 legacy 路径**（详 §5.1.2）：`gstreamer_splitmux` / 早期 persistent pipeline 仍使用 `pts_offset = mean(camera_first_wall_s - t0_wall_s)` 重建 `pts_offset + N/fps` 的 t0 相对帧网格。`argus_metadata` 可保存后按 SOF 对齐并 materialize，但不再是生产默认。
+4. **BOX**（详 §4 / §5.2）：500Hz 轮询，按各传感器 MCU 时间戳变化去重（原生 199/50Hz 独立记录）；再对每个传感器做 `host = slope·mcu + intercept` 最小二乘回归（实测 slope = 1µs/tick，残差 1–2ms）消除轮询抖动，得 `t_rel_s = 校准时间 − t0_wall_s`。
+5. **合并**（详 §6 / §9）：对每个 60Hz 相机 logical frame，在每个传感器序列里二分查找最近样本 → 拼成 `observation.state`；对齐所用的原始 MCU 戳单独存入 `box.timestamps`。
 
-**精度**：相机间 <1µs；BOX↔相机 ≈ ±1–3ms（L3b 校准后，详 §7）。
+**精度口径**：
 
-**信息载体**：`meta.json` 的 `sync_reference`（`t0_wall_s` / `camera_first_wall_s` 跨相机锚点）+ 训练 parquet（`timestamp` 帧网格 / `box.timestamps` 对齐戳）+ `box_sensors.jsonl`（原始全速率，可重算校准）。三者经审计：完备、无冗余。
+- 相机视频间：`argus_online_sync` 以 SOF TSC 在 encoder 前 gate；2026-07-07 8 路 10×60s burn-in 最大 SOF spread 0.401ms，典型单 episode 可到十几微秒量级。
+- BOX↔相机：仍受 BOX MCU 校准残差与最近邻量化影响；200Hz 传感器约 ±1–3ms 校准残差并另叠 ±2.5ms 采样量化，touch 50Hz 主导项为 ±10ms 最近邻量化。
+
+**信息载体**：`meta.json` 的 `sync_reference`（episode 原点 + legacy/兼容锚点）+ `cam_XX.argus_frame_metadata.csv`（每个最终视频帧的 SOF/EOF/sensor timestamp）+ `online_sync_manifest.json`（保存 gate 结果）+ 训练 parquet（`timestamp` 帧网格 / `box.timestamps` 对齐戳）+ `box_sensors.jsonl`（原始全速率，可重算校准）。
 
 ## 2. 三个时钟域
 
@@ -65,7 +70,7 @@ Thor 采集系统包含两套独立的数据源：
 | **主机 wall-clock** | Linux `time.time()` / `CLOCK_REALTIME` | 微秒级（NTP 校准后） | 所有软件层的公共参考 |
 | **BOX MCU 时钟** | 采集板内部晶振 | 未知精度（典型 ±50ppm） | 仅在 MCU 侧单调递增，与主机无校准关系 |
 
-PWM 时钟只负责触发相机快门，不产生可读取的时间戳。相机和传感器的时间对齐完全依赖主机 wall-clock 作为桥梁。
+PWM 时钟只负责触发相机快门，不产生可读取的时间戳。当前生产路径用 Argus SOF TSC 验证并保存相机 full cluster；BOX↔相机跨域对齐仍依赖主机 wall-clock 作为桥梁。
 
 ## 3. L0：相机间硬同步（PWM slave mode）
 
@@ -103,7 +108,28 @@ hardware_sync:
 ### 注意事项
 
 - **曝光时间约束**：slave mode 下 `exposure_us + readout_time` 必须 < PWM 周期，否则 AR0234 回退到 ~0.8fps。录制器自动 clamp 到 `0.85 × (1e6 / fps)` = 14,166 μs
-- **spawn stagger**：11 路 nvarguscamerasrc 同时初始化会触发 Argus ISP 的 NVMM buffer 分配竞争（`NvBufSurfaceFromFd Failed`），需错开 1.0s 逐路启动。这不影响帧对齐（PWM 触发与进程启动时间无关），只影响各路的**起始帧偏移**
+- **spawn stagger / legacy 路径**：旧 `gstreamer_splitmux` 路径中，11 路 `nvarguscamerasrc` 同时初始化会触发 Argus ISP 的 NVMM buffer 分配竞争（`NvBufSurfaceFromFd Failed`），需错开 1.0s 逐路启动。这不影响 PWM 物理触发，只影响各路开始落盘的起始帧。生产默认 `argus_online_sync` 改为 recorder 内部统一打开 Argus stream，并以 SOF full cluster 作为保存边界。
+
+### 3.2 Encoder 前 SOF full-cluster gate（生产默认）
+
+`argus_online_sync` 在硬件 encoder 之前执行同步判断：
+
+```text
+Argus BufferOutputStream
+  -> IBuffer::getMetadata() / ISensorTimestampTsc
+  -> 按 sof_tsc_ns 找 full cluster
+  -> 只有完整且 SOF spread <= tolerance 的 cluster 进入 encoder/mux
+  -> cam_XX.mkv + cam_XX.argus_frame_metadata.csv + online_sync_manifest.json
+```
+
+每个 accepted cluster 的合同：
+
+- 所有 active camera 都有一帧；
+- cluster 内 `max(sof_tsc_ns) - min(sof_tsc_ns) <= online_sync.tolerance_ms`；
+- `logical_frame_index` 从 0 连续递增，且每路 sidecar 第 N 行对应视频第 N 帧；
+- 录制窗口中间缺任一路 full cluster 时 episode 失败，不补帧、不复制帧、不静默裁剪。
+
+`online_sync_manifest.json` 是保存 gate：`ok=true`、每路 `frame_count_by_camera` 一致、`max_abs_delta_ns_by_camera` 不超过阈值才允许保存。2026-07-07 8 路 10×60s burn-in 结果为每路 3600 帧，最大 SOF spread 0.401ms，无 ffmpeg materialization。
 
 ## 4. L3a：高频独立采样 + 逐传感器软同步
 
@@ -153,14 +179,15 @@ for sid, ts in sensor_timestamps.items():
 
 ### 对齐方式
 
-对齐基于主机 wall-clock：
+对齐基于每个 episode 的相机帧网格：
 
 ```
-相机帧 N 的时间 = t_start + N / 60         （t_start = 相机全部启动后）
-BOX 样本时间   = time.time() at poll       （主机收到 SDK 返回的时刻）
+argus_online_sync: camera frame N = logical_frame_index N / fps
+legacy splitmux:   camera frame N = pts_offset + N / fps   （t0 相对域）
+BOX sample time:   calibrated_t_rel_s 或 poll t_rel_s
 ```
 
-对每个相机帧时间点 t，在每个传感器的时间序列中用**二分查找**找到 wall-clock 最接近的样本，组成该帧的 state 向量。
+对每个相机帧时间点 t，在每个传感器的时间序列中用**二分查找**找到 t0 相对时间最接近的样本，组成该帧的 state 向量。
 
 ### 理论精度
 
@@ -170,47 +197,55 @@ BOX 样本时间   = time.time() at poll       （主机收到 SDK 返回的时�
 - 主机侧抖动：UDP 传输延迟 + Python poll 调度抖动（典型 ~1-3ms）
 - **合计：±3~13ms**
 
-## 5. L3b：增强对齐（PTS 提取 + MCU 时钟校准）
+## 5. L3b：相机帧网格 + MCU 时钟校准
 
 L3a 的两个主要误差源：
 
-1. **相机侧**：帧时间用 `t_start + N/fps` 推算，但 `t_start` 是 gst-launch 进程启动时刻，不是第一帧 PWM 边沿时刻。管道启动延迟（ISP 初始化、编码器预热）典型 100-500ms，不计入则首帧时间偏移数百毫秒
-2. **BOX 侧**：每个样本的 `wall_time_s` 是主机**收到**时刻，包含 UDP 传输延迟和 poll 调度抖动（每次不同）
+1. **相机侧**：legacy splitmux 需要从每路独立视频文件推断共同帧网格；生产默认 `argus_online_sync` 已在 encoder 前只保存 full SOF cluster，因此相机侧核心合同变为 `logical_frame_index` 连续且跨相机同义。
+2. **BOX 侧**：每个样本的 `wall_time_s` 是主机**收到**时刻，包含 UDP 传输延迟和 poll 调度抖动（每次不同）。
 
-### 5.1 相机侧修正：首帧 host wall-time 偏移（pts_offset）
+### 5.1 相机侧：online-sync logical frame 与 legacy pts_offset
 
-> **实现说明（2026-06 校订）**：早期设计用 `ffprobe` 提取参考相机 MKV 的容器内首帧 PTS
-> 作为管道启动延迟。Thor 真机 burn-in 发现 `splitmuxsink` 的 `format-location-full`
-> 回调里 `first_sample.pts` **跨流不可用**——每路相机有各自的 pipeline clock，即使物理
-> 上只差 ~20ms 起始，`first_pts_s` 在 11 路之间能差出 10s 量级，不能作为跨流锚点。
->
-> 真正的跨流公共时钟是 **host wall-time**。现在每个 worker 在 `splitmuxsink` 首帧真正
-> 落盘时记录 `first_wall_s = time.time()`（`persistent_session_worker.py`），父进程把它聚进
-> `FragmentInfo`。Episode 结束后由 `thor_record._pts_offset_from_handle()` 计算：
+#### 5.1.1 `argus_online_sync`（生产默认）
 
-```
-pts_offset = mean_over_cams( first_wall_s[cam] - t0_wall_s )
+`argus_online_sync` 不再把“同步”推迟到保存后处理，而是在 recorder 内部按 Argus same-buffer metadata 做 encoder 前 gate：
+
+```text
+raw Argus frame + metadata
+  -> sof_tsc_ns full-cluster matcher
+  -> logical_frame_index = accepted_cluster_count
+  -> encoder/mux + sidecar + optional frame bus
 ```
 
-其中 `t0_wall_s` 是 StartEpisode 发出 `split-now` 的时刻（相机/BOX 共用的录制起点）。
-`first_wall_s - t0_wall_s` 衡量的就是「split-now 命令 → 该路首帧实际落盘」的延迟，
-即管道启动延迟，只是用主机墙钟而非容器 PTS 测量。逐路 delta 的完整明细写入
-`meta.json` 的 `sync_reference.camera_first_wall_s`。
-
-由于所有相机共享 PWM 触发，帧间间隔严格 = 1/fps，单个标量 `pts_offset` 即可重建帧时间网格。
-对齐在 **t0 相对域** 内进行（BOX 样本时间也是 `t_rel_s = wall_s - t0_wall_s`）：
+因此相机侧训练/回放网格以 logical frame 为准：
 
 ```
-frame_time[N] = pts_offset + N / fps        （相对 t0_wall_s）
-                ^^^^^^^^^^
-            管道启动延迟修正（frame_origin_s）
+camera_time[N] = N / fps
 ```
 
-代码见 `thor_lerobot_v3._build_episode_rows()`：`frame_origin_s = pts_offset_s`。
+对应产物合同：
 
-> **注**：`thor_lerobot_v3.extract_pts()`（ffprobe + GStreamer 双路）仍然存在，但**只在
-> 离线 `export_v3.py` 数帧时使用**，不在录制对齐路径里。录制路径的 `pts_offset` 完全来自
-> worker 上报的 `first_wall_s`，与 ffprobe 无关。
+- `cam_XX.mkv`：第 N 帧就是第 N 个 accepted full SOF cluster；
+- `cam_XX.argus_frame_metadata.csv`：第 N 行含同一帧的 `logical_frame_index=N`、`sensor_timestamp_ns`、`sof_tsc_ns`、`eof_tsc_ns`；
+- `online_sync_manifest.json`：记录 `actual_frames`、每路 frame count、每路最大 SOF delta、`sync_source=sof_tsc_ns`；
+- `meta.json.sync_reference.camera_first_wall_s` 在该 backend 下是兼容字段，通常等于 `t0_wall_s`，**不是硬件帧时间戳**；不要用它判断 online-sync 视频内部跨相机同步。
+
+UI 录制路径是 **time-driven**：`thor_record.py` 按操作者 Stop / `episode_time_s` 到时发送 `STOP`，recorder 在下一个 full cluster 边界关闭；因此 `actual_frames` 可能与 `round(duration_s * fps)` 或 parquet 行数差 1-2 帧。合同是“各相机同帧数、同 logical frame 同 SOF cluster”，不是强制固定帧数。`online_sync_burnin.py --enforce-exact-frames` 只用于直接测试固定帧数场景。
+
+#### 5.1.2 legacy `gstreamer_splitmux` / `argus_metadata`
+
+早期 `gstreamer_splitmux` 路径无法在 encoder 前证明“第 N 帧同 SOF”，只能在保存后用首帧 host wall-time 估计共同帧网格。真机 burn-in 发现 `first_sample.pts` 跨流不可比（每路 pipeline clock 独立，`first_pts_s` 可差 10s 量级），因此 legacy 对齐使用 host wall-time：
+
+```
+pts_offset = mean_over_cams(first_wall_s[cam] - t0_wall_s)
+frame_time[N] = pts_offset + N / fps        （t0 相对域）
+```
+
+其中 `first_wall_s` 来自 worker 在 fragment 首帧落盘时记录的 `time.time()`，明细写入 `meta.json.sync_reference.camera_first_wall_s`。这条路径仍用于兼容旧数据和无 online-sync sidecar 的 camera-only 数据。
+
+`argus_metadata` 是过渡方案：先写完整视频，再用 `cam_XX.argus_frame_metadata.csv` 和 `argus_frame_alignment.json` 找同步窗口，必要时 materialize。它比 splitmux 可验证，但保存后 H.265 任意窗口切片/重编码太慢，因此已被 `argus_online_sync` 替代为生产默认。
+
+> **ffprobe 角色**：录制对齐路径不依赖 ffprobe。ffprobe/GStreamer PTS 只用于离线数帧、QC 或 export_v3 转码检查，不能作为跨相机同步锚点。
 
 ### 5.2 BOX 侧修正：MCU↔Host 时钟线性回归
 
@@ -228,7 +263,7 @@ host_time = slope × mcu_ts + intercept
 ```python
 # 校准前：wall_time_s 包含 ~1-3ms 随机 poll 抖动
 # 校准后：calibrated_time = slope * mcu_ts + intercept
-#         残差标准差典型 <0.5ms
+#         残差标准差实测约 1-3ms
 ```
 
 ### 5.3 安全阈值
@@ -245,11 +280,12 @@ host_time = slope × mcu_ts + intercept
 
 ### 5.4 合成精度
 
-| 修正项 | 消除的误差 | 修正前 | 修正后 |
-|--------|-----------|--------|--------|
-| 首帧 wall-time 偏移（pts_offset） | 管道启动延迟（100-500ms 偏移） | 全局偏移 | 偏移 ~主机墙钟精度（亚毫秒~毫秒级） |
+| 修正项 | 消除/约束的误差 | 修正前 | 修正后 |
+|--------|----------------|--------|--------|
+| `argus_online_sync` SOF full-cluster gate | 多视频第 N 帧是否同一次相机曝光/读出 | 保存后才检查或无法证明 | encoder 前只保存同一 SOF cluster；burn-in 最大 spread 0.401ms |
+| legacy 首帧 wall-time 偏移（pts_offset） | splitmux 管道启动延迟（100-500ms 偏移） | 全局偏移 | 偏移 ~主机墙钟精度（亚毫秒~毫秒级） |
 | MCU 时钟校准 | 逐次 poll 随机抖动（1-3ms） | ±1-3ms/样本 | ~1ms/样本（200Hz 主传感器），~2-3ms（50Hz touch） |
-| 合计 | | ±3~13ms | **±1~3ms** |
+| BOX↔相机端到端 | BOX 定时残差 + 最近邻量化 | ±3~13ms | 200Hz 传感器约 ±1-3ms 残差并另叠 ±2.5ms；touch 50Hz 另叠 ±10ms |
 
 > 修正后数值为 2026-06-15 真机实测的回归残差标准差（`recorder_*.log` 的 `MCU clock calibration`）：
 > gripper 1.12ms · imu 1.07ms · trigger 1.07ms · 六维力 1.18ms · touch L 2.02ms · touch R 1.97ms。
@@ -270,72 +306,95 @@ touch 残差约为 200Hz 传感器的 2×：样本少 4×（501 vs 1998，拟合
 
 > **口径提醒（避免误读这个数）**：±1~3ms 只是 **BOX 侧的「定时」残差**（已知某样本发生在主机时间
 > 几时的不确定度）。**每帧端到端**对齐误差还要再叠两项校准**消不掉**的：(a) **最近邻量化 ±采样间隔/2**
-> ——199Hz ±2.5ms、**touch 50Hz ±10ms**（见 §4）；(b) 相机侧 `pts_offset` 的测量抖动
-> （`camera_first_wall_s` 落盘时刻波动）。另外延迟的**平均值**被 `intercept` 吸收、不进残差，但它在
+> ——199Hz ±2.5ms、**touch 50Hz ±10ms**（见 §4）；(b) legacy splitmux 相机侧 `pts_offset` 的测量抖动
+> （online-sync 数据则由 SOF full-cluster gate 约束相机间同帧）。另外延迟的**平均值**被 `intercept` 吸收、不进残差，但它在
 > BOX↔相机之间留下一个固定 skew（BOX 内部各传感器对齐时相消）。**所以对 touch，主导误差是 ±10ms
 > 的最近邻量化，而非 ±2ms 的校准残差。**
 
 ## 6. 完整对齐流程（per episode）
 
-```
-录制开始
-  │
-  ├─ box.start_recording(t_start)
-  │    └─ poll loop 切到 500Hz，开始 per-sensor MCU 时间戳去重
-  │
-  ├─ 录制进行中...
-  │    ├─ 11 路 gst-launch 写 MKV（H.265，帧级 PTS 在容器内）
-  │    └─ poll loop 每次检测新 MCU 时间戳 → 存入 per-sensor buffer
-  │
-  ├─ session.stop()
-  │    └─ SIGINT → gst-launch EOS → MKV 正常封口
-  │
-  ├─ box.stop_recording()
-  │    └─ 返回 {sensor_id: [SensorSample, ...]}
-  │
-  ├─ pts_offset 计算（_pts_offset_from_handle）
-  │    └─ mean(first_wall_s[cam] - t0_wall_s)，逐路 first_wall_s 来自 worker 上报
-  │       （非 ffprobe；明细写入 meta.json sync_reference.camera_first_wall_s）
-  │
-  ├─ 写入 box_sensors.jsonl（原始数据归档）
-  │
-  └─ 写入 LeRobot v3 parquet（_build_episode_rows）
+### 6.1 生产默认：`argus_online_sync`
+
+```text
+Connect
+  ├─ detect locked GMSL2 cameras + Argus preflight
+  ├─ apply PWM / trig_mode / exposure clamp
+  ├─ start BOX SDK first（避免 Argus/GStreamer 高负载下 SDK .so/UDP 初始化崩溃）
+  └─ start persistent argus_online_sync recorder daemon
+       └─ idle 阶段持续消费 full SOF cluster，可选发布 preview bus
+
+Start episode
+  ├─ box.start_recording(t0_wall_s)
+  ├─ recorder START idx frames=0 episode_dir
+  └─ recorder 丢弃 startup_full_clusters 后进入 recording window
+
+Recording window
+  ├─ 每个 full SOF cluster 进入 encoder/mux
+  ├─ 写 cam_XX.argus_frame_metadata.csv 第 N 行
+  ├─ 可选发布 /dev/shm/lerobot_online_sync latest cluster 给在线推理
+  └─ BOX poll loop 500Hz 去重记录 per-sensor samples
+
+Stop / auto-duration
+  ├─ thor_record.py 发送 STOP（time-driven）
+  ├─ recorder 在下一个 full cluster 边界关闭 episode
+  ├─ 写 online_sync_manifest.json（actual_frames、frame_count_by_camera、max_delta）
+  ├─ box.stop_recording() 返回 {sensor_id: [SensorSample, ...]}
+  ├─ 写 box_sensors.jsonl（原始数据归档）
+  └─ 写 LeRobot v3 parquet
        ├─ 逐传感器 MCU 时钟校准（calibrate_sensor_samples 线性回归 + 安全回退）
-       ├─ 帧时间网格 = pts_offset + frame_index / 60   （t0 相对域）
+       ├─ 帧时间网格 = logical_frame_index / fps
        └─ 对每帧逐传感器二分查找最近邻 → 组成 state 向量
 ```
+
+保存 gate：`online_sync_manifest.ok` 必须为 true，且所有 active camera 的 `frame_count_by_camera` 一致；`missing_frame_policy=fail_episode` 时 recording window 内缺 full cluster 会丢弃该 episode。
+
+### 6.2 legacy splitmux / argus_metadata
+
+```text
+旧 splitmux: 多路独立写 MKV -> 用 first_wall_s 计算 pts_offset -> 写 parquet
+argus_metadata: 写完整视频 + sidecar -> 保存后按 SOF 对齐窗口 -> 必要时 materialize
+```
+
+这些路径保留用于旧数据兼容和调试，不是当前生产默认。
 
 ## 7. 同步级别总览
 
 | 级别 | 精度 | 状态 | 机制 |
 |------|------|------|------|
-| **L0** 相机间硬同步 | <1μs | ✅ | PWM slave mode，11 路帧锁定同一边沿 |
-| **L1** 软同步元数据 | — | ✅ | meta.json `sync_reference` 记录 t0_wall_s / t0_mono_s / camera_first_wall_s（逐路，跨相机锚点）；per-stream PTS 在 `cameras[].first_pts_s`（不可跨相机比较，不进 sync_reference） |
-| **L3a** 高频独立采样 | ±3~13ms | ✅ | 500Hz poll + MCU 时间戳去重 + 逐传感器最近邻 |
-| **L3b** 增强对齐 | ±1~3ms（校准残差，实测；端到端另叠最近邻 ±间隔/2，见 §5.4） | ✅ | 首帧 host wall-time 偏移（pts_offset）+ MCU↔Host 时钟线性回归 |
-| **L4** 硬件级全同步 | <1μs | 🔲 | BOX MCU 也由 PWM 触发（需硬件改动） |
+| **L0** 相机硬件触发 | <1µs（物理触发） | ✅ | PWM slave mode，AR0234C 锁定同一触发边沿 |
+| **L1** episode 元数据 | — | ✅ | `meta.json.sync_reference` 记录 t0；online-sync 下 `camera_first_wall_s` 为兼容字段，不是硬件帧时间 |
+| **L2** encoder 前相机同步 | µs~0.4ms 级（SOF spread） | ✅ | `argus_online_sync` 按 `sof_tsc_ns` 接受 full cluster 后再编码；manifest gate |
+| **L2b** online frame bus | 与 L2 同 cluster | ✅ 可选 | recorder-owned `/dev/shm/lerobot_online_sync` 双缓冲 NV12 latest cluster，推理端只读不抢相机 |
+| **L2c** replay 多视频同步 | 半帧内重同步 | ✅ | GUI timeline 暴露 per-camera file offset；前端以 master timeline time 持续校正其他 `<video>` |
+| **L3a** BOX 高频独立采样 | ±3~13ms | ✅ | 500Hz poll + MCU 时间戳去重 + 逐传感器最近邻 |
+| **L3b** BOX 增强对齐 | ±1~3ms（校准残差；端到端另叠最近邻量化） | ✅ | MCU↔Host 时钟线性回归 + 安全回退 |
+| **L4** 硬件级全同步 | <1µs | 🔲 | BOX MCU 也由 PWM/硬件 trigger 打戳或触发（需硬件/固件支持） |
 
 ### 7.1 代码位置 & 测试映射
 
-| 机制 | 代码 | 测试（无需真机） |
-|------|------|----------------|
-| 500Hz poll + MCU 去重 | `box_sdk/box_client.py` `_poll_loop`（`record_poll_interval_s=0.002`；录制外 `poll_interval_s=0.05`=20Hz） | `tests/scripts/test_thor_box_client.py`（`_FakeBox` 内存 stub） |
-| pts_offset（首帧 wall-time） | `gmsl2/thor_record.py` `_pts_offset_from_handle`；worker 侧 `persistent_session_worker.py` `first_wall_s` | （需 worker 事件，部分覆盖于 multiprocess 测试） |
+| 机制 | 代码 | 测试 / 验证 |
+|------|------|-------------|
+| PWM / trig_mode / exposure clamp | `gmsl2/gmsl2_record.py` / `gmsl2/thor_record.py` | 真机 v4l2/PWM 检查 |
+| legacy splitmux first_wall / pts_offset | `gmsl2/persistent_session.py` / `gmsl2/thor_record.py` `_pts_offset_from_handle` | `tests/scripts/test_thor_record_meta.py`、persistent session tests |
+| Argus metadata SOF alignment（保存后） | `gmsl2/argus_frame_sync.py` / `argus_video_materialize.py` | `tests/scripts/test_thor_argus_frame_sync.py` |
+| `argus_online_sync` encoder-front recorder | `gmsl2/argus_online_sync_session.py` / `argus_online_sync_video_recorder.cpp` | `tests/scripts/test_thor_argus_metadata_session.py`、`test_thor_online_sync_burnin.py`、Thor burn-in |
+| online inference frame bus | `gmsl2/online_sync_frame_client.py` / recorder `--frame-bus-dir` | `tests/scripts/test_thor_online_sync_frame_client.py` |
+| preview bus / JPEG bridge | `gmsl2/online_sync_preview_bridge.py` / `PREVIEW_ON/OFF` | `tests/scripts/test_thor_argus_metadata_session.py` preview tests |
+| Episode Replay video sync | `tools/data_collection_gui/gateway.py` / `frontend/src/ReplayInspector.tsx` | `tests/scripts/test_data_collection_gui_gateway.py` + browser validation |
+| 500Hz poll + MCU 去重 | `box_sdk/box_client.py` `_poll_loop` | `tests/scripts/test_thor_box_client.py` |
 | 帧网格 + 最近邻对齐 | `gmsl2/thor_lerobot_v3.py` `_build_episode_rows` / `_nearest_sample_data` | `tests/scripts/test_thor_ts_sync_alignment.py` |
 | MCU 时钟校准 + 回退 | `gmsl2/thor_lerobot_v3.py` `calibrate_mcu_clock` / `calibrate_sensor_samples` | `tests/scripts/test_thor_ts_sync_alignment.py` |
-| ffprobe/GStreamer PTS（**离线数帧**） | `gmsl2/thor_lerobot_v3.py` `extract_pts`；`gmsl2/export_v3.py` | `tests/scripts/test_thor_lerobot_v3_pts.py` |
+| ffprobe/GStreamer PTS（离线数帧/QC） | `gmsl2/thor_lerobot_v3.py` `extract_pts`；`gmsl2/export_v3.py` | `tests/scripts/test_thor_lerobot_v3_pts.py` |
 
-> 这些测试只覆盖纯 Python 对齐逻辑与数据契约。真机才能确认的内容（MCU 时钟是否线性/单调、
-> `mcu_timestamp` 真实语义与单位、各传感器真实频率与 poll 抖动、BOX↔相机端到端实测精度）
-> 仍需 BOX 到位后验证，见 §8.2 / §8.5。
+> 这些测试覆盖纯 Python 逻辑、stdin 协议、sidecar/manifest 合同和前端时间轴逻辑。相机硬件 SOF spread、Argus provider 稳定性、BOX↔相机端到端 tap-test 仍需要 Thor 真机验证。
 
 ## 8. 注意事项
 
-### 8.1 spawn stagger 与首 episode
+### 8.1 legacy spawn stagger 与 online-sync persistent recorder
 
-11 路相机以 1.0s 间隔错开启动（`spawn_stagger_s: 1.0`），共需 ~11s。这期间 PWM 已经在发送触发信号，但各相机在不同时刻开始响应。`t_start` 设在全部相机启动完成之后，BOX 录制也从此刻开始，确保帧时间和传感器时间使用同一基准。
+`spawn_stagger_s: 1.0` 主要是 legacy `gstreamer_splitmux` 路径的工程约束：11 路 `nvarguscamerasrc` 同时初始化会触发 Argus ISP / NVMM buffer 竞争（`NvBufSurfaceFromFd Failed`），导致部分相机 EOS 或空 MKV。
 
-若 stagger 改小（如 0.5s），会触发 Argus ISP 的 `NvBufSurfaceFromFd Failed` 竞争错误，导致部分相机在几秒后 EOS 退出、MKV 仅含 336 字节空头。经验值：`1.0s` 可保证 11/11 路全部成功。
+生产默认 `argus_online_sync` 使用长驻 recorder daemon 独占 Argus session：Connect 时打开 stream 并持续消费 idle full cluster；Start/Stop 只切 recording window。该路径的 UI 录制是 time-driven，停止时等待下一个 full cluster 收口，因此不要用 `duration_s * fps` 强行解释为唯一合法帧数。
 
 ### 8.2 MCU 时钟假设
 
@@ -343,13 +402,9 @@ touch 残差约为 200Hz 传感器的 2×：样本少 4×（501 vs 1998，拟合
 
 ### 8.3 ffprobe 依赖
 
-**录制对齐路径不依赖 ffprobe。** `pts_offset` 来自 worker 上报的 `first_wall_s`（见
-§5.1），与 FFmpeg 无关。若某路相机未上报有效 `first_wall_s`，`_pts_offset_from_handle`
-返回 `None`，writer 用 `frame_origin_s = 0`（即退回 L3a 精度，仅丢失管道启动延迟修正）。
+**录制同步路径不依赖 ffprobe。** `argus_online_sync` 的保存 gate 来自 recorder 内部的 SOF metadata 和 `online_sync_manifest.json`；legacy `pts_offset` 来自 worker 上报的 `first_wall_s`，也与 FFmpeg 无关。
 
-ffprobe 仅在**离线** `export_v3.py` 数帧时用到（`extract_pts`，反映容器内 PTS）：
-Jetson 镜像不一定带 ffprobe，所以 `extract_pts` 在 ffprobe 缺失时自动回退到
-`_extract_pts_gstreamer`（用 GStreamer `matroskademux` 读 PTS）。二者都不可用才告警。
+ffprobe 仅在**离线** `export_v3.py` 数帧、QC 或调试时用到（`extract_pts`，反映容器内 PTS）。Jetson 镜像不一定带 ffprobe，所以 `extract_pts` 在 ffprobe 缺失时自动回退到 `_extract_pts_gstreamer`（用 GStreamer `matroskademux` 读 PTS）。二者都不可用才告警。
 
 ### 8.4 训练数据 vs 原始数据
 
@@ -357,33 +412,37 @@ LeRobot v3 parquet 中的 `observation.state` 是 **60Hz 下采样** 后的对�
 
 ### 8.5 wall-clock 精度
 
-整个软同步依赖 `time.time()` 的绝对精度。如果 Jetson 未配置 NTP 或系统时间有跳变，对齐质量会下降。建议：
-- 确保 NTP 同步（`timedatectl status` 检查）
-- 避免在录制期间手动修改系统时间
-- `time.monotonic()` 用于持续时间测量不受 NTP 步进影响，但跨进程对齐仍需 wall-clock
+`argus_online_sync` 的相机间同步依赖 Argus SOF TSC，不依赖 `time.time()` 判断同帧；但 BOX↔相机对齐、legacy splitmux `pts_offset`、以及 episode 元数据仍依赖主机时间。建议：
 
-### 8.6 EE pose 轨迹生成复用同一帧网格（2026-06-25）
+- 确保 NTP 同步（`timedatectl status` 检查）；
+- 避免在录制期间手动修改系统时间；
+- `time.monotonic()` 用于持续时间测量不受 NTP 步进影响，但跨进程/跨设备对齐仍需 wall-clock 或硬件时间戳。
 
-离线 EE 轨迹生成（GUI「Generate EE Trajectory」/ `april_cube_tracking_in_robot_base.py`）由多路 PWM 硬同步相机流估算 cube/EE pose，按 **per-episode 相机帧序号 N** 写 sidecar（`derived/april_cube_tracking_in_robot_base/state_action.*.csv`）。GUI replay timeline 给每帧的时间戳走的就是本文 §5.1 的帧网格 `pts_offset + N/fps`：
+### 8.6 EE pose 与 Episode Replay 帧网格
 
-- 有 v3 parquet 的数据集：直接用 parquet `timestamp` 列。
-- 无 v3 parquet（相机-only / `--no-box`）的数据集：`gateway._gmsl2_pts_offset_s()` 从 `meta.json.sync_reference`（`t0_wall_s` + `camera_first_wall_s`）现算同一个 `pts_offset`。
+离线 EE 轨迹生成（GUI「Generate EE Trajectory」/ `april_cube_tracking_in_robot_base.py`）由多路硬同步相机流估算 cube/EE pose，按 **per-episode 相机帧序号 N** 写 sidecar（`derived/april_cube_tracking_in_robot_base/state_action.*.csv`）。GUI replay timeline 使用：
 
-即 EE pose 落在相机/PWM 时间轴上，与 BOX MCU 钟（`box.timestamps`）无关。详见 `tools/data_collection_gui/docs/traj_gen_thor_gmsl2_compatibility.md`。
+- 有 v3 parquet 的数据集：直接用 parquet `timestamp` 列；online-sync 导出的常见口径是 `N/fps`。
+- 无 v3 parquet 的 legacy camera-only 数据：`gateway._gmsl2_pts_offset_s()` 从 `meta.json.sync_reference` 估算 `pts_offset + N/fps`。
+
+Episode Replay 不能把多个 `<video>` 元素当成天然同步：浏览器 video clocks 会 drift，且暂停态 seek 容差如果大于半帧会保留可见错位。当前前端用 master video 反推 timeline time，并持续把其他相机 seek 到同一 timeline frame；后端还返回 `cameraVideoOffsetsS` 以兼容 legacy per-camera 文件起点。
+
+### 8.7 Online frame bus 与 preview bus
+
+在线推理不要另开 `nvarguscamerasrc` 或 Argus session。正确路径是打开 recorder-owned frame bus：
+
+```text
+/dev/shm/lerobot_online_sync/latest_cluster.json
+/dev/shm/lerobot_online_sync/slot{0,1}_cam_XX.nv12
+```
+
+该 bus 发布 recorder 接受的 latest full cluster，读端使用 latest-frame 语义，模型慢时跳过旧帧，不反压 recorder。UI 预览使用独立 `preview_frame_bus_dir` 和 `online_sync_preview_bridge.py` 转 JPEG；录制开始前 session 发送 `PREVIEW_OFF`，避免 preview 影响 recording window。
 
 ## 9. v3 数据集 schema（2026-06-15 重构）
 
-录制器（`thor_lerobot_v3.py`）写的是 **box-only 的最小 v3** parquet（数值特征 + 时间戳元数据），
-相机以 `cam_*.mkv` 原始文件并排存在每个 episode 目录里；离线 `export_v3.py` 再把相机转码并
-合并出带 `observation.images.*` 的训练数据集。两侧共享同一 `t0_wall_s`（见 §5.1）。
+录制器（`thor_lerobot_v3.py`）写的是 **box/state 最小 v3** parquet（数值特征 + 时间戳元数据）；相机原始文件仍并排存在每个 episode 目录里：`cam_*.mkv`、`cam_*.argus_frame_metadata.csv`、`online_sync_manifest.json`。离线 `export_v3.py` 再把相机转码并合并出带 `observation.images.*` 的训练数据集。
 
-`export_v3` 的多传感器对齐：相机网格为权威（episode 内各相机 PWM 锁定帧数取最小，转码到恒定
-`i/fps` 网格）。box 状态按优先级挂到该网格：① 复用录制器已对齐的 session parquet，**按
-`frame_index`（而非列表位置）** 配相机帧（box 网格比相机长的 `round(duration*fps)` 尾部丢弃、
-短的 carry-forward）；② 无 parquet 时回退到每集 `box_sensors.jsonl`，用 §5/§6 同一套（MCU 校准
-+ 逐传感器最近邻于 `pts_offset + N/fps`）在 export 内重做 L3b。每集输出 `timestamp` 重基到
-`i/fps` 以匹配重锚定的逐集视频。代码见 `export_v3._align_box_rows_by_frame_index` /
-`_box_rows_from_raw`。
+`export_v3` 的多传感器对齐：相机网格为权威。online-sync 数据使用 `logical_frame_index / fps`；legacy splitmux 数据使用 `pts_offset + N/fps`。box 状态按优先级挂到该网格：① 复用录制器已对齐的 session parquet，**按 `frame_index`（而非列表位置）** 配相机帧（box 网格比相机视频长的尾部丢弃、短的 carry-forward）；② 无 parquet 时回退到每集 `box_sensors.jsonl`，用 §5/§6 同一套 MCU 校准 + 逐传感器最近邻在 export 内重做 L3b。每集输出 `timestamp` 重基到 `i/fps` 以匹配重锚定的逐集视频。代码见 `export_v3._align_box_rows_by_frame_index` / `_box_rows_from_raw`。
 
 ### 9.1 `observation.state` / `action`（float32，**31** 维）
 
@@ -419,14 +478,27 @@ mcu_ts 冗余，已移除（liwp 是包级时间戳，对齐用 per-sensor 更�
 - CSV：SDK `.so` 另会向 CWD 写 `box_sensor_data_*.csv`，`BoxClient.stop()` 会清理本会话的
   （见 `box_sdk/TROUBLESHOOTING.md` §7，待 SDK 加关闭开关）。
 
-### 9.3 真机验证状态（2026-06-15）
+### 9.3 真机验证状态
 
-| 项 | 结果 |
-|----|------|
-| 6 路传感器频率 | gripper/imu/trigger/六维力 199Hz，touch L/R 各 50Hz |
-| MCU 校准（L3b） | slope=1µs/tick，6 路全 engage，残差 1–2ms |
-| 夹爪/扳机运动 | episode 实测 distance 0.0007–0.098m、trigger 0→100% 正确进 `state[0/1]` |
-| 触觉接触 | `active_points` 1–52、`max_abs_fz` 饱和 255、239 点原始帧完整 |
-| 多模态采集 | 9 路相机（argus_failed=[]）+ 夹爪 + 双触觉同步采集；相机 first_wall_s 展布 ~10ms，pts_offset≈11ms |
-| LeRobotDataset 加载 | ✅ 可加载（box.timestamps 经 loader 降为 float32，见 §9.2） |
-| 待验 | 跨域 tap-test（§7.1）、相机视频经 `export_v3` 合并后的端到端 |
+| 日期 | 项 | 结果 |
+|------|----|------|
+| 2026-06-15 | 6 路 BOX 传感器频率 | gripper/imu/trigger/六维力 199Hz，touch L/R 各 50Hz |
+| 2026-06-15 | MCU 校准（L3b） | slope=1µs/tick，6 路全 engage，残差 1–2ms |
+| 2026-06-15 | 夹爪/扳机运动 | episode 实测 distance 0.0007–0.098m、trigger 0→100% 正确进 `state[0/1]` |
+| 2026-06-15 | 触觉接触 | `active_points` 1–52、`max_abs_fz` 饱和 255、239 点原始帧完整 |
+| 2026-07-07 | `argus_online_sync` 8 路 10×60s burn-in | 每路 3600 帧，sidecar 3600 行，max SOF delta 0.401ms，ffmpeg materialization=false |
+| 2026-07-13 | `sync_test_lht_20260707_090407` episode 0 spot check | 8 路 MP4 均 1330 帧 / 60fps；frame 1235 附近 SOF delta 12–13µs；MP4 第 1235 帧 PTS 均 20.583s |
+| 2026-07-13 | Episode Replay | 修复多 `<video>` 独立 clock/seek 容差导致的可见错位；原始视频与 sidecar 本身同步 |
+| 待验 | BOX↔相机跨域 tap-test | 需要设计同时可见于相机和 BOX 触觉/力传感器的事件，量化端到端固定 skew 与 jitter |
+
+## 10. TODO / 后续工作
+
+| 优先级 | TODO | 说明 |
+|--------|------|------|
+| P0 | 在 Thor GUI 实际服务目录重启/发布 replay 修复 | 源码更新后必须重启 gateway/Vite 或重新 build 前端；浏览器需强刷，避免旧 bundle 保留 50ms seek 容差。 |
+| P1 | BOX↔相机 tap-test | 用可见敲击/触觉/力事件验证 `logical_frame_index/fps` 与 BOX 校准时间之间的固定 skew 和 jitter。 |
+| P1 | 把 `online_sync_manifest.json` 纳入 Dataset Processing/QC 展示 | 对用户直接显示 actual_frames、frame_count_by_camera、max SOF delta、failure reason。 |
+| P2 | export_v3 确认使用 online-sync 网格来源, 将legacy来源相关代码移除,确认对整个同步采集链路无影响|
+| P2 | frame bus 性能升级（仅在线推理需要） | 纯数据采集落盘无需处理。当前 tmpfs NV12 双缓冲用于实时推理/预览，若 8 路 60Hz 在线推理吞吐吃紧，再升级 CUDA/DMABUF zero-copy IPC 或共享内存 ring
+  buffer。 |
+| P3 | BOX uint32 µs 时间戳 unwrap | 当前短 episode 不受影响；长会话/连续录制前在客户端 poll loop 检测回绕并累加 2^32。 |
