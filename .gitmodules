@@ -2,3 +2,6 @@
 	path = third_party/opencv_kalibr
 	url = git@github.com:linkage-x/opencv_kalibr.git
 	branch = sengyun
+[submodule "tools/thor/box_sdk"]
+	path = tools/thor/box_sdk
+	url = git@github.com:linkage-x/box-sdk.git
