@@ -3,8 +3,9 @@
 Thor records camera streams as hardware-encoded MKV files. Those files are
 kept as-is, but the GUI replay path expects LeRobot v3 tabular data under
 ``meta/info.json`` and ``data/chunk-*/*.parquet`` when it displays
-``observation.state`` / ``action``. This module writes that lightweight v3
-side of the dataset from BOX snapshots without changing the camera pipeline.
+``observation.state``. This module writes that lightweight v3 side of the
+dataset from BOX snapshots without changing the camera pipeline. ``action`` is
+left for the export step, where it can be derived from the next aligned state.
 """
 
 from __future__ import annotations
@@ -60,7 +61,7 @@ BOX_STATE_NAMES: tuple[str, ...] = (
 # column ``box.timestamps`` (float64 to preserve the µs-resolution MCU counters
 # that overflow float32's 2**24 exact-integer range). These are diagnostic
 # alignment values, NOT trainable observations, so they are deliberately kept
-# out of ``observation.state`` / ``action``.
+# out of ``observation.state``.
 BOX_TIMESTAMP_NAMES: tuple[str, ...] = (
     "box_gripper.timestamp",
     "box_trigger.timestamp",
@@ -592,7 +593,7 @@ def _table_column_stats(table, col_name: str, *, width: int) -> dict[str, list]:
 
     ``width=1`` is for scalar columns (timestamp / frame_index / etc.) and
     returns length-1 lists matching the legacy schema. ``width>1`` is for
-    fixed-size-list columns (observation.state / action) and returns
+    fixed-size-list observation.state column and returns
     per-channel lists.
     """
     import numpy as np
@@ -651,7 +652,6 @@ def _rows_to_table(
     return pa.table(
         [
             vector_column("observation.state", state_width, pa.float32()),
-            vector_column("action", state_width, pa.float32()),
             vector_column("box.timestamps", ts_width, pa.float64()),
             pa.array([row["timestamp"] for row in rows], type=pa.float32()),
             pa.array([row["frame_index"] for row in rows], type=pa.int64()),
@@ -671,7 +671,6 @@ def _box_table_schema(
 ):
     return pa.schema([
         ("observation.state", pa.list_(pa.float32(), state_width)),
-        ("action", pa.list_(pa.float32(), state_width)),
         ("box.timestamps", pa.list_(pa.float64(), ts_width)),
         ("timestamp", pa.float32()),
         ("frame_index", pa.int64()),
@@ -687,7 +686,6 @@ def _box_features(
 ) -> dict[str, Any]:
     return {
         "observation.state": _feature("float32", [len(state_names)], list(state_names)),
-        "action": _feature("float32", [len(state_names)], list(state_names)),
         "box.timestamps": _feature("float64", [len(ts_names)], list(ts_names)),
         "timestamp": _feature("float32", [1]),
         "frame_index": _feature("int64", [1]),
@@ -738,7 +736,6 @@ def _build_episode_rows(
             state = box_snapshot_to_state_for_boxes(snap, resolved_box_ids)
             rows.append({
                 "observation.state": state,
-                "action": list(state),
                 "box.timestamps": box_snapshot_to_timestamps_for_boxes(snap, resolved_box_ids),
                 "timestamp": timestamp_s,
                 "frame_index": local_frame,
@@ -767,7 +764,6 @@ def _build_episode_rows(
             state = box_snapshot_to_state_for_boxes(snapshot, resolved_box_ids)
             rows.append({
                 "observation.state": state,
-                "action": list(state),
                 "box.timestamps": box_snapshot_to_timestamps_for_boxes(snapshot, resolved_box_ids),
                 "timestamp": timestamp_s,
                 "frame_index": local_frame,
@@ -928,7 +924,6 @@ class Lr3Writer:
         state_width = len(self.state_names)
         stats = {
             "observation.state": _table_column_stats(table, "observation.state", width=state_width),
-            "action": _table_column_stats(table, "action", width=state_width),
             "box.timestamps": _table_column_stats(table, "box.timestamps", width=len(self.ts_names)),
             "timestamp": _table_column_stats(table, "timestamp", width=1),
             "frame_index": _table_column_stats(table, "frame_index", width=1),
@@ -1100,7 +1095,6 @@ def write_box_lerobot_v3_episode(
     state_width = len(state_names)
     stats = {
         "observation.state": _table_column_stats(combined, "observation.state", width=state_width),
-        "action": _table_column_stats(combined, "action", width=state_width),
         "box.timestamps": _table_column_stats(combined, "box.timestamps", width=len(ts_names)),
         "timestamp": _table_column_stats(combined, "timestamp", width=1),
         "frame_index": _table_column_stats(combined, "frame_index", width=1),
@@ -1137,7 +1131,6 @@ def write_box_lerobot_v3_episode(
 
     features = {
         "observation.state": _feature("float32", [len(state_names)], list(state_names)),
-        "action": _feature("float32", [len(state_names)], list(state_names)),
         "box.timestamps": _feature("float64", [len(ts_names)], list(ts_names)),
         "timestamp": _feature("float32", [1]),
         "frame_index": _feature("int64", [1]),

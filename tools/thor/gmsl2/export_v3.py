@@ -2,8 +2,8 @@
 
 Each Connect→record session writes its own ``<name>_<timestamp>/`` directory
 (raw per-camera MKV under ``episodes/episode_NNNNNN/`` plus, when BOX is
-enabled, a per-session ``data/chunk-000/file-000.parquet`` of box state/action
-on the camera-frame grid). Progress tracking already groups these sessions by
+enabled, a per-session ``data/chunk-000/file-000.parquet`` of box state on the
+camera-frame grid). Progress tracking already groups these sessions by
 the ``repo_id`` trailing name; this script is the *consolidation* step the GUI
 calls from Dataset Export: gather every session whose directory name shares the
 task's base name, concatenate their episodes with a contiguous global
@@ -180,7 +180,6 @@ def _load_box_rows(session_dir: Path) -> dict[int, list[dict[str, Any]]]:
         row: dict[str, Any] = {
             "frame_index": int(cols["frame_index"][i]),
             "observation.state": [float(v) for v in cols["observation.state"][i]],
-            "action": [float(v) for v in cols["action"][i]],
         }
         if "box.timestamps" in cols:
             row["box.timestamps"] = [float(v) for v in cols["box.timestamps"][i]]
@@ -192,6 +191,13 @@ def _load_box_rows(session_dir: Path) -> dict[int, list[dict[str, Any]]]:
 
 # ----------------------------------------------------- box ↔ camera sync ---
 
+
+
+def _next_state_actions(state_rows: list[list[float]]) -> list[list[float]]:
+    """Derive action[i] as the next aligned state, holding the final state."""
+    if not state_rows:
+        return []
+    return [list(state_rows[min(i + 1, len(state_rows) - 1)]) for i in range(len(state_rows))]
 
 
 def _align_box_rows_by_frame_index(
@@ -211,11 +217,11 @@ def _align_box_rows_by_frame_index(
     box grid is longer than the camera clip (phantom duration-rounding tail),
     shorter (carry-forward the last sample), or not 0-based contiguous.
 
-    Returns ``(state_rows, action_rows, ts_rows_or_None, missing_count)``.
+    Returns ``(state_rows, action_rows, ts_rows_or_None, missing_count)`` where
+    ``action_rows[i]`` is derived as ``state_rows[i + 1]`` (final frame holds).
     """
     by_frame = {int(r["frame_index"]): r for r in box_rows}
     state_rows: list[list[float]] = []
-    action_rows: list[list[float]] = []
     ts_rows: list[list[float]] | None = [] if ts_width else None
     last: dict[str, Any] | None = None
     missing = 0
@@ -228,15 +234,13 @@ def _align_box_rows_by_frame_index(
             last = row
         if row is None:
             state_rows.append([0.0] * state_width)
-            action_rows.append([0.0] * state_width)
             if ts_rows is not None:
                 ts_rows.append([0.0] * ts_width)
         else:
             state_rows.append(list(row["observation.state"]))
-            action_rows.append(list(row["action"]))
             if ts_rows is not None:
                 ts_rows.append(list(row.get("box.timestamps", [0.0] * ts_width)))
-    return state_rows, action_rows, ts_rows, missing
+    return state_rows, _next_state_actions(state_rows), ts_rows, missing
 
 
 def _box_snapshots_from_meta(meta: dict[str, Any]) -> list[dict[str, Any]]:

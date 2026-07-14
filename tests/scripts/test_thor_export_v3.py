@@ -87,35 +87,45 @@ def _write_mkv(path: Path, n_frames: int, w: int, h: int, fps: int) -> None:
     container.close()
 
 
-def _write_box_parquet(session: Path, ep_frames: dict[int, int], state_width: int) -> None:
+def _write_box_parquet(
+    session: Path,
+    ep_frames: dict[int, int],
+    state_width: int,
+    *,
+    include_action: bool = True,
+) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     data_dir = session / "data" / "chunk-000"
     data_dir.mkdir(parents=True)
-    rows = {k: [] for k in ("observation.state", "action", "timestamp", "frame_index", "episode_index", "index", "task_index")}
+    keys = ["observation.state", "timestamp", "frame_index", "episode_index", "index", "task_index"]
+    if include_action:
+        keys.insert(1, "action")
+    rows = {k: [] for k in keys}
     idx = 0
     for ep, n in ep_frames.items():
         for f in range(n):
             rows["observation.state"].append([float(f)] * state_width)
-            rows["action"].append([float(f)] * state_width)
+            if include_action:
+                rows["action"].append([float(f)] * state_width)
             rows["timestamp"].append(float(f) / 30.0)
             rows["frame_index"].append(f)
             rows["episode_index"].append(ep)
             rows["index"].append(idx)
             rows["task_index"].append(0)
             idx += 1
-    schema = pa.schema(
-        [
-            ("observation.state", pa.list_(pa.float32(), state_width)),
-            ("action", pa.list_(pa.float32(), state_width)),
-            ("timestamp", pa.float32()),
-            ("frame_index", pa.int64()),
-            ("episode_index", pa.int64()),
-            ("index", pa.int64()),
-            ("task_index", pa.int64()),
-        ]
-    )
+    fields = [("observation.state", pa.list_(pa.float32(), state_width))]
+    if include_action:
+        fields.append(("action", pa.list_(pa.float32(), state_width)))
+    fields.extend([
+        ("timestamp", pa.float32()),
+        ("frame_index", pa.int64()),
+        ("episode_index", pa.int64()),
+        ("index", pa.int64()),
+        ("task_index", pa.int64()),
+    ])
+    schema = pa.schema(fields)
     pq.write_table(pa.table(rows, schema=schema), data_dir / "file-000.parquet")
 
 
@@ -510,7 +520,7 @@ def test_align_box_by_frame_index_drops_phantom_grid_tail():
     )
     assert missing == 0
     assert state == [[0.0], [1.0], [2.0]]
-    assert action == [[0.0], [10.0], [20.0]]
+    assert action == [[1.0], [2.0], [2.0]]
     assert ts == [[0.0], [1.0], [2.0]]
 
 
@@ -523,17 +533,38 @@ def test_align_box_by_frame_index_carries_last_when_camera_longer():
     )
     assert missing == 2
     assert state == [[0.0], [1.0], [1.0], [1.0]]  # frames 2,3 hold frame 1
+    assert action == [[1.0], [1.0], [1.0], [1.0]]
 
 
 def test_align_box_by_frame_index_uses_frame_index_not_position():
     # A gap at frame_index 1 (rows are 0 and 2). Positional slicing would put the
     # fi=2 row at output frame 1; frame_index keying must place it at frame 2.
     box_rows = [_box_row(0, 10.0), _box_row(2, 12.0)]
-    state, _action, _ts, missing = export_v3._align_box_rows_by_frame_index(
+    state, action, _ts, missing = export_v3._align_box_rows_by_frame_index(
         box_rows, n_frames=3, state_width=1, ts_width=1
     )
     assert missing == 1  # frame 1 has no row
     assert state == [[10.0], [10.0], [12.0]]  # frame 1 holds frame 0, frame 2 correct
+    assert action == [[10.0], [12.0], [12.0]]
+
+
+
+
+def test_load_box_rows_accepts_recorder_parquet_without_action(tmp_path: Path):
+    pq = pytest.importorskip("pyarrow.parquet")
+    session = tmp_path / "session"
+    _write_box_parquet(session, {0: 3}, state_width=1, include_action=False)
+
+    rows_by_ep = export_v3._load_box_rows(session)
+    assert "action" not in pq.read_table(session / "data" / "chunk-000" / "file-000.parquet").column_names
+    rows = rows_by_ep[0]
+    state, action, _ts, missing = export_v3._align_box_rows_by_frame_index(
+        rows, n_frames=3, state_width=1, ts_width=0
+    )
+
+    assert missing == 0
+    assert state == [[0.0], [1.0], [2.0]]
+    assert action == [[1.0], [2.0], [2.0]]
 
 
 def test_align_box_by_frame_index_no_timestamps_when_ts_width_zero():

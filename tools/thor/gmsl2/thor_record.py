@@ -212,13 +212,13 @@ def _fmt_force_vec(vec: list[float] | None) -> str:
 
 
 def _run_six_d_force_cali(box: bc.BoxPool) -> None:
-    """Trigger a 6D force-sensor calibration and stream progress as CALI_LOG lines.
+    """Trigger 6D force-sensor software zeroing and stream progress as CALI_LOG lines.
 
-    Runs on its own thread: the stdin reader must not block on the ~0.5s+ SDK
+    Runs on its own thread: the stdin reader must not block on the ~1s SDK
     round-trip. Emits a terminal ``CALI_DONE ok|error`` line so the gateway can
     mark the run complete and the frontend can stop spinning.
     """
-    _emit("CALI_LOG 6D force sensor calibration requested")
+    _emit("CALI_LOG 6D force sensor software zero requested")
     try:
         results = box.calibrate_six_d_force()
     except Exception as exc:  # noqa: BLE001 - calibration must never crash the recorder
@@ -229,11 +229,15 @@ def _run_six_d_force_cali(box: bc.BoxPool) -> None:
     for res in results:
         label = res.get("box_id") or "box"
         if res.get("ok"):
-            _emit(f"CALI_LOG [{label}] calibration OK (rc={res.get('rc')})")
+            _emit(
+                f"CALI_LOG [{label}] {res.get('method', 'calibration')} OK "
+                f"(rc={res.get('rc')})"
+            )
         else:
             ok_all = False
             _emit(
-                f"CALI_LOG [{label}] calibration FAILED (rc={res.get('rc')}): "
+                f"CALI_LOG [{label}] {res.get('method', 'calibration')} FAILED "
+                f"(rc={res.get('rc')}): "
                 f"{res.get('error') or 'unknown error'}"
             )
         before, after = res.get("before"), res.get("after")
@@ -402,6 +406,10 @@ def _write_sensor_samples(
         per_sensor[sid] = per_sensor.get(sid, 0) + 1
     logger.info("wrote %d sensor samples to %s (%s)", len(all_samples), path, per_sensor)
     return path
+
+
+def _has_recorded_sensor_samples(samples: dict[str, list[bc.SensorSample]] | None) -> bool:
+    return any(bool(sensor_samples) for sensor_samples in (samples or {}).values())
 
 
 def _wallclock_utc_from_wall_s(wall_s: float) -> str:
@@ -1574,7 +1582,8 @@ def main(argv: list[str] | None = None) -> int:
                     meta_path.write_text(json.dumps(payload, indent=2))
                 except (OSError, json.JSONDecodeError) as exc:
                     logger.warning("failed to annotate cleanup duration: %s", exc)
-                if recorded_samples:
+                has_recorded_samples = _has_recorded_sensor_samples(recorded_samples)
+                if has_recorded_samples:
                     _write_sensor_samples(ep_dir, recorded_samples, t_start)
                 sensor_data = {
                     sid: [{"t_rel_s": s.wall_time_s - t_start,
@@ -1582,12 +1591,22 @@ def main(argv: list[str] | None = None) -> int:
                            "data": s.data}
                           for s in slist]
                     for sid, slist in recorded_samples.items()
-                } if recorded_samples else None
+                } if has_recorded_samples else None
+                # Only high-frequency recorded samples are valid per-frame BOX data.
+                # If the BOX stream stalls, box_snapshots can still contain a fresh-looking
+                # SDK cache with non-advancing MCU timestamps; using those snapshots as the
+                # legacy fallback would fill the whole parquet with stale sensor values.
+                v3_snapshots = box_snapshots if sensor_data else []
                 try:
                     if lr3_writer is not None:
+                        if box_started and not sensor_data:
+                            logger.warning(
+                                "BOX LeRobot v3 rows skipped: no recorded BOX samples; "
+                                "not using stale live snapshots as frame observations"
+                            )
                         v3_path = lr3_writer.append_episode(
                             episode_index=ep_idx,
-                            snapshots=box_snapshots,
+                            snapshots=v3_snapshots,
                             duration_s=duration_s,
                             sensor_samples=sensor_data,
                             t0_wall_s=t_start,
@@ -1595,7 +1614,7 @@ def main(argv: list[str] | None = None) -> int:
                         )
                         if v3_path is not None:
                             logger.info("wrote BOX LeRobot v3 rows: %s", v3_path)
-                    elif box_snapshots or sensor_data:
+                    elif v3_snapshots or sensor_data:
                         logger.warning("BOX LeRobot v3 rows skipped; writer is unavailable")
                 except Exception as exc:
                     logger.warning("failed to write BOX LeRobot v3 rows: %s", exc)

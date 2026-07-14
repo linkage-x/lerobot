@@ -2410,7 +2410,7 @@ def _run_qc(dataset_root: Path) -> dict[str, Any]:
             schema_failed_files += 1
             continue
 
-        missing_columns = [col for col in ("action", "observation.state", "timestamp", "frame_index") if col not in table.column_names]
+        missing_columns = [col for col in ("observation.state", "timestamp", "frame_index") if col not in table.column_names]
         if missing_columns:
             checks.append({
                 "name": "schema",
@@ -3721,12 +3721,12 @@ def _box_snapshot_rows_for_replay(
         frame_index = int(row.get("frame_index") or 0)
         by_frame[frame_index] = {
             "state": _as_float_list(row.get("observation.state")),
-            "action": _as_float_list(row.get("action")),
+            "action": [],
         }
     if not any(any(abs(value) > 0.0 for value in entry["state"]) for entry in by_frame.values()):
         return None
     state_names = list(lr3.box_state_names(box_ids))
-    return state_names, list(state_names), by_frame
+    return state_names, [], by_frame
 
 
 def _rows_vector_all_zero(rows: list[dict[str, Any]], column: str) -> bool:

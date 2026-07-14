@@ -61,6 +61,7 @@ class _TouchForce:
 @dataclass
 class _Touch:
     timestamp: int = 0
+    total_force: _TouchForce = field(default_factory=_TouchForce)
     forces: tuple = field(default_factory=lambda: tuple(_TouchForce() for _ in range(239)))
 
 
@@ -70,6 +71,7 @@ class _AllSensor:
     imu_data: _Imu = field(default_factory=_Imu)
     trigger_data: _Trigger = field(default_factory=_Trigger)
     six_d_force_data: _SixD = field(default_factory=_SixD)
+    six_d_force_data_filter: _SixD = field(default_factory=_SixD)
     touch_sensor_data_first: _Touch = field(default_factory=_Touch)
     touch_sensor_data_sec: _Touch = field(default_factory=_Touch)
 
@@ -98,8 +100,13 @@ class _FakeDiscovered:
 class _FakeKeepAlive:
     """Stand-in for ``box_sdk.DiscoveryKeepAlive``."""
 
-    def __init__(self, *_, **__):
+    instances: list["_FakeKeepAlive"] = []
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
         self.closed = False
+        self.instances.append(self)
 
     def send_req(self, *_, **__):
         return 0
@@ -170,6 +177,7 @@ class _FakeBox:
 
 @pytest.fixture
 def fake_box_module(monkeypatch):
+    _FakeKeepAlive.instances = []
     module = types.ModuleType("box_sdk")
     module.Box = _FakeBox
     module.discover = lambda **kw: []  # default: no broadcast discovery
@@ -212,8 +220,10 @@ def test_decode_sensor_cache_filters_zero_timestamp_sensors():
             imu_data=_Imu(),  # timestamp=0 -> dropped
             trigger_data=_Trigger(timestamp=20, distance=42.0),
             six_d_force_data=_SixD(timestamp=30, data=(1, 2, 3, 4, 5, 6)),
+            six_d_force_data_filter=_SixD(timestamp=31, data=(10, 20, 30, 40, 50, 60)),
             touch_sensor_data_first=_Touch(
                 timestamp=40,
+                total_force=_TouchForce(fx=7, fy=-8, fz=9),
                 forces=tuple(
                     _TouchForce(fx=i % 7, fy=-(i % 5), fz=(i % 11))
                     for i in range(239)
@@ -230,9 +240,30 @@ def test_decode_sensor_cache_filters_zero_timestamp_sensors():
         "box_gripper", "box_trigger", "box_six_d_force", "box_touch_left",
     }
     assert out["sensors"]["box_gripper"]["distance_m"] == pytest.approx(0.04)
-    assert out["sensors"]["box_six_d_force"]["fxyz_mxyz"] == [1, 2, 3, 4, 5, 6]
+    force = out["sensors"]["box_six_d_force"]
+    assert force["timestamp"] == 31
+    assert force["source"] == "filtered"
+    assert force["fxyz_mxyz"] == [10, 20, 30, 40, 50, 60]
+    assert force["fxyz_mxyz_raw"] == [1, 2, 3, 4, 5, 6]
     touch = out["sensors"]["box_touch_left"]
+    assert touch["total_force_0p1N"] == [7, -8, 9]
     assert len(touch["fx_0p1N"]) == 239 == len(touch["fy_0p1N"]) == len(touch["fz_0p1N"])
+
+
+def test_decode_sensor_cache_falls_back_to_raw_six_d_when_filter_absent():
+    snap = _SensorCache(
+        data=_AllSensor(
+            six_d_force_data=_SixD(timestamp=30, data=(1, 2, 3, 4, 5, 6)),
+        ),
+    )
+
+    out = box_client.decode_sensor_cache(snap)
+    timestamps = box_client._decode_sensor_timestamps(snap)
+
+    assert out["sensors"]["box_six_d_force"]["source"] == "raw"
+    assert out["sensors"]["box_six_d_force"]["timestamp"] == 30
+    assert timestamps["box_six_d_force"] == 30
+
 
 
 def test_decode_sensor_cache_prefers_top_level_touch_array_over_legacy_fields():
@@ -324,14 +355,24 @@ def test_box_client_start_stop_pulls_snapshot_and_marks_detected(fake_box_module
     assert client.is_active() is False
 
 
-def _force_box_factory(force=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0), *, with_cali):
+def _force_box_factory(
+    force=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+    *,
+    with_cali,
+    with_origin=False,
+):
     """Fake Box that publishes a 6D force sample; optionally exposes cali()."""
-    calls: list[bool] = []
+    calls: list[str] = []
 
     class _Box(_FakeBox):
         if with_cali:
             def cali_6d_force_sensor(self, device_id=None):  # mirrors the v3 SDK
-                calls.append(True)
+                calls.append("software")
+                return 0
+
+        if with_origin:
+            def cali_6d_force_sensor_origin(self, device_id=None):
+                calls.append("origin")
                 return 0
 
     def _factory(*a, **kw):
@@ -376,12 +417,30 @@ def test_calibrate_six_d_force_invokes_sdk_and_reports_before_after(fake_box_mod
     finally:
         client.stop()
 
-    assert calls == [True]
+    assert calls == ["software"]
     assert result["ok"] is True
     assert result["rc"] == 0
+    assert result["method"] == "cali_6d_force_sensor"
     assert result["error"] is None
     assert result["before"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
     assert result["after"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+
+def test_calibrate_six_d_force_origin_invokes_origin_sdk_method(fake_box_module):
+    fake_box_module.Box, calls = _force_box_factory(with_cali=True, with_origin=True)
+    cfg = box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01)
+    client = box_client.BoxClient(cfg)
+    assert client.start() is True
+    import time as _t
+    _t.sleep(0.05)
+    try:
+        result = client.calibrate_six_d_force(origin=True)
+    finally:
+        client.stop()
+
+    assert calls == ["origin"]
+    assert result["ok"] is True
+    assert result["method"] == "cali_6d_force_sensor_origin"
 
 
 def test_box_pool_calibrate_six_d_force_targets_force_box(fake_box_module):
@@ -674,6 +733,8 @@ def test_box_pool_single_empty_id_delegates_without_namespacing(fake_box_module)
     assert "boxes" not in snap  # passthrough returns the lone client's dict
     assert pool.detect() == ["box_gripper"]
     assert pool.is_active() is True
+    assert _FakeKeepAlive.instances
+    assert "so_path" in _FakeKeepAlive.instances[-1].kwargs
     pool.stop()
     assert pool.is_active() is False
 
@@ -862,3 +923,28 @@ def test_box_pool_single_discovered_device_stays_unnamespaced(fake_box_module):
     # roster still reports the real device_id/sn for the GUI.
     assert pool.discovered_devices()[0]["device_id"] == 55
     pool.stop()
+
+
+def test_ensure_box_sdk_importable_prefers_vendored_wheel(tmp_path, monkeypatch) -> None:
+    wheel_dir = tmp_path / "box_collection_sdk-9.9.9-py3-none-any.whl"
+    package_dir = wheel_dir / "box_sdk"
+    package_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text("MARKER = 'vendored'\n")
+
+    system_box_sdk = types.ModuleType("box_sdk")
+    system_box_sdk.__file__ = "/usr/lib/python3/dist-packages/box_sdk/__init__.py"
+    submodule = types.ModuleType("box_sdk.old_submodule")
+    monkeypatch.setitem(sys.modules, "box_sdk", system_box_sdk)
+    monkeypatch.setitem(sys.modules, "box_sdk.old_submodule", submodule)
+    monkeypatch.setattr(box_client, "_vendored_wheel_path", lambda: wheel_dir)
+    old_path = list(sys.path)
+    try:
+        box_client._ensure_box_sdk_importable()
+        imported = __import__("box_sdk")
+        assert imported.MARKER == "vendored"
+        assert str(wheel_dir) == sys.path[0]
+        assert "box_sdk.old_submodule" not in sys.modules
+    finally:
+        sys.path[:] = old_path
+        sys.modules.pop("box_sdk", None)
+        sys.modules.pop("box_sdk.old_submodule", None)

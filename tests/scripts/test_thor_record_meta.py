@@ -292,3 +292,19 @@ def test_online_sync_manifest_gate_rejects_frame_count_mismatch(tmp_path: Path) 
     assert failure == "online_sync_failed"
     assert payload["ok"] is False
     assert "cam_07 manifest frame count 2 != 3" in payload["failures"]
+
+
+def test_has_recorded_sensor_samples_treats_keyed_empty_buffers_as_empty() -> None:
+    thor_record = _load_thor_record_module()
+
+    assert thor_record._has_recorded_sensor_samples({}) is False
+    assert thor_record._has_recorded_sensor_samples({sid: [] for sid in bc.KNOWN_SENSOR_IDS}) is False
+    assert thor_record._has_recorded_sensor_samples({
+        "box_imu": [bc.SensorSample(
+            sensor_id="box_imu",
+            mcu_timestamp=123,
+            wall_time_s=1.0,
+            mono_time_s=2.0,
+            data={"accel": [0.0, 0.0, 9.8]},
+        )],
+    }) is True
