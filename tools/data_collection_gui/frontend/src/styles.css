@@ -2206,3 +2206,39 @@ button.danger {
 .camera-tile-overlay .metric strong {
   color: #e2e8f0;
 }
+
+.error-boundary {
+  padding: 24px;
+  min-height: 100vh;
+  background: #1a1a1a;
+  color: #e2e8f0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow: auto;
+}
+.error-boundary-title {
+  color: #ff6b6b;
+  margin: 0 0 8px;
+}
+.error-boundary-hint {
+  color: #94a3b8;
+  margin: 0 0 16px;
+}
+.error-boundary-stack {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #0f0f0f;
+  border: 1px solid #333;
+  border-radius: 6px;
+  padding: 12px;
+  color: #ffd479;
+  font-size: 12px;
+  margin: 0 0 12px;
+}
+.error-boundary-reload {
+  padding: 6px 14px;
+  background: #2563eb;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}

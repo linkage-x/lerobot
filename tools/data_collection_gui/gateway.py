@@ -183,6 +183,12 @@ class GatewayState:
     box_cali_running: bool = False
     box_cali_log: list[dict[str, Any]] = field(default_factory=list)
     box_cali_lock: Lock = field(default_factory=Lock)
+    # Touch calibration streams on its own TOUCHCALI_LOG/TOUCHCALI_DONE channel
+    # into a separate buffer so its log box shows only touch lines (the 6D force
+    # and touch buttons now live in separate viewers and must not cross-show).
+    box_touch_cali_running: bool = False
+    box_touch_cali_log: list[dict[str, Any]] = field(default_factory=list)
+    box_touch_cali_lock: Lock = field(default_factory=Lock)
     # Roster of BOX devices the recorder discovered by broadcast at Connect
     # (BOX_DEVICES_JSON). When non-empty it replaces the static YAML-derived
     # box_collection rows so the Device Manager lists exactly the boxes actually
@@ -222,7 +228,12 @@ class GatewayState:
     cached_recorded_datasets: list[dict[str, Any]] = field(default_factory=list)
     cached_trajectory: list[Any] = field(default_factory=list)
     cached_trajectory_meta: dict[str, Any] = field(default_factory=dict)
+    cached_processing_items: list[dict[str, Any]] = field(default_factory=list)
     dataset_cache_ready: bool = False
+    # Cheap fingerprint (dataset dir names + top-level mtimes) of the last scan;
+    # lets the refresher skip the expensive 253-dataset walk when nothing changed
+    # so its GIL-heavy scan stops starving the HTTP handlers (snapshot/camera.jpg).
+    dataset_scan_signature: tuple = ()
 
     def log(self, level: str, message: str) -> None:
         self.events.insert(
@@ -805,12 +816,28 @@ def _dataset_kind(state: GatewayState, dataset_root: Path) -> str:
     return "exported"
 
 
+_REPLAY_CANDIDATES_MEMO: tuple[float, list[Path]] | None = None
+_REPLAY_CANDIDATES_TTL_S = 3.0
+
+
 def _complete_replay_dataset_candidates(state: GatewayState) -> list[Path]:
+    # Short-TTL memo: this globs every dataset (253 on Thor) and is the single
+    # chokepoint reached by several _snapshot helpers (annotation resolve,
+    # replay candidates, known-dataset resolve) on every ~1s poll. Without it
+    # those repeated full scans kept /api/snapshot at ~1s+ (gateway-slow root).
+    # The dataset set changes rarely, so a few seconds of staleness is fine.
+    global _REPLAY_CANDIDATES_MEMO
+    now = time.monotonic()
+    memo = _REPLAY_CANDIDATES_MEMO
+    if memo is not None and now - memo[0] < _REPLAY_CANDIDATES_TTL_S:
+        return list(memo[1])
     candidates = list(_complete_dataset_candidates(state))
     for entry in _scan_exports_root(state):
         if entry not in candidates and _dataset_is_complete(entry):
             candidates.append(entry)
-    return sorted(candidates, key=_dataset_modified_s, reverse=True)
+    result = sorted(candidates, key=_dataset_modified_s, reverse=True)
+    _REPLAY_CANDIDATES_MEMO = (now, result)
+    return list(result)
 
 
 def _replay_dataset_candidates(state: GatewayState) -> list[Path]:
@@ -1814,7 +1841,7 @@ def _dataset_episode_count(dataset_root: Path) -> int:
 
 
 def _count_completed_episodes(state: GatewayState, repo_id: str) -> int:
-    if not repo_id or not state.datasets_root:
+    if not repo_id:
         return 0
     # datasetRepoId carries a namespace ("local/pick_and_place") but on-disk
     # dataset directories use only the trailing name, optionally suffixed with a
@@ -1823,16 +1850,16 @@ def _count_completed_episodes(state: GatewayState, repo_id: str) -> int:
     base_name = repo_id.split("/")[-1].strip()
     if not base_name:
         return 0
+    # Read from the cached dataset scan (maintained off-snapshot by the
+    # background refresher) instead of walking every dataset on disk. This is
+    # called for EACH task inside _snapshot on every ~1s poll; the old
+    # iterdir()+glob was O(tasks x datasets) FS ops (9 x 253 here) and made
+    # /api/snapshot take 1-5s -- the gateway-slow / preview-demand-starved root.
     total = 0
-    try:
-        for candidate in state.datasets_root.iterdir():
-            if not _is_dataset_root(candidate):
-                continue
-            if base_name not in _dataset_name_prefixes(candidate.name):
-                continue
-            total += _dataset_episode_count(candidate)
-    except OSError:
-        pass
+    for item in state.cached_recorded_datasets:
+        name = str(item.get("name") or "")
+        if base_name in _dataset_name_prefixes(name):
+            total += int(item.get("totalEpisodes") or 0)
     return total
 
 
@@ -4905,7 +4932,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "annotation": _active_annotation(state),
         "calibration": asdict(state.calibration),
         "recordedDatasets": recorded_datasets,
-        "processing": _processing_items(state),
+        "processing": list(state.cached_processing_items),
         "trajectory": trajectory,
         "events": [asdict(event) for event in state.events],
         "tasks": _tasks_with_progress(state),
@@ -5145,26 +5172,30 @@ def _maybe_send_preview_demand(state: GatewayState) -> None:
             pass
 
 
-def _trigger_box_six_d_force_cali(state: GatewayState) -> dict[str, Any]:
+def _trigger_box_six_d_force_cali(state: GatewayState, *, origin: bool = False) -> dict[str, Any]:
     """Ask the running GMSL2 recorder to calibrate the BOX 6D force sensor.
 
     The recorder owns the live box connection, so the command rides its stdin
-    (``cali_6dforce``) and progress comes back as CALI_LOG/CALI_DONE stdout
-    lines. Returns a small status dict for the POST response.
+    and progress comes back as CALI_LOG/CALI_DONE stdout lines. ``origin=False``
+    (default) requests software zeroing (``cali_6dforce``); ``origin=True``
+    requests the MCU-side TLV origin calibration (``cali_6dforce_origin``).
+    Returns a small status dict for the POST response.
     """
     process = state.process
     if process is None or process.poll() is not None:
         return {"ok": False, "error": "recorder is not connected; press Connect first"}
     if not _state_is_gmsl2(state):
         return {"ok": False, "error": "6D force calibration requires the GMSL2/BOX recorder"}
+    stdin_cmd = "cali_6dforce_origin\n" if origin else "cali_6dforce\n"
+    label = "6D force MCU-origin" if origin else "6D force software-zero"
     with state.box_cali_lock:
         state.box_cali_running = True
         state.box_cali_log.append(
-            {"ts": time.time(), "line": "calibration command sent to recorder", "done": False}
+            {"ts": time.time(), "line": f"{label} calibration command sent to recorder", "done": False}
         )
         del state.box_cali_log[:-200]
     try:
-        _write_recorder_stdin(process, "cali_6dforce\n")
+        _write_recorder_stdin(process, stdin_cmd)
     except (BrokenPipeError, ValueError, OSError, RuntimeError) as exc:
         with state.box_cali_lock:
             state.box_cali_running = False
@@ -5175,9 +5206,44 @@ def _trigger_box_six_d_force_cali(state: GatewayState) -> dict[str, Any]:
     return {"ok": True}
 
 
+def _trigger_box_touch_cali(state: GatewayState) -> dict[str, Any]:
+    """Ask the running GMSL2 recorder to calibrate (re-zero) the BOX touch pads.
+
+    Mirrors :func:`_trigger_box_six_d_force_cali` but rides its own
+    TOUCHCALI_LOG/TOUCHCALI_DONE stdout channel into ``box_touch_cali_log`` so
+    the touch viewer never shows 6D force lines (and vice versa).
+    """
+    process = state.process
+    if process is None or process.poll() is not None:
+        return {"ok": False, "error": "recorder is not connected; press Connect first"}
+    if not _state_is_gmsl2(state):
+        return {"ok": False, "error": "touch calibration requires the GMSL2/BOX recorder"}
+    with state.box_touch_cali_lock:
+        state.box_touch_cali_running = True
+        state.box_touch_cali_log.append(
+            {"ts": time.time(), "line": "touch calibration command sent to recorder", "done": False}
+        )
+        del state.box_touch_cali_log[:-200]
+    try:
+        _write_recorder_stdin(process, "calitouch\n")
+    except (BrokenPipeError, ValueError, OSError, RuntimeError) as exc:
+        with state.box_touch_cali_lock:
+            state.box_touch_cali_running = False
+            state.box_touch_cali_log.append(
+                {"ts": time.time(), "line": f"failed to send command: {exc}", "done": True}
+            )
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True}
+
+
 def _box_cali_log_payload(state: GatewayState) -> dict[str, Any]:
     with state.box_cali_lock:
         return {"running": state.box_cali_running, "lines": list(state.box_cali_log)}
+
+
+def _box_touch_cali_log_payload(state: GatewayState) -> dict[str, Any]:
+    with state.box_touch_cali_lock:
+        return {"running": state.box_touch_cali_running, "lines": list(state.box_touch_cali_log)}
 
 
 def _connect_recorder(state: GatewayState) -> None:
@@ -5288,27 +5354,61 @@ def _consume_recorder_output(state: GatewayState) -> None:
             state.log("warn", f"recorder output consumer error: {exc}")
 
 
+def _dataset_scan_signature(state: GatewayState) -> tuple:
+    """Cheap fingerprint of the dataset dirs: (path, top-level mtime) per entry.
+
+    Just ``scandir`` + ``stat`` of the top-level dirs under the datasets/exports
+    roots -- no per-dataset globbing or episode walks -- so it is a few ms even
+    with hundreds of datasets. Used to decide whether the expensive full scan can
+    be skipped.
+    """
+    roots = [state.datasets_root, _task_exports_root(state)]
+    sig: list[tuple[str, int]] = []
+    for root in roots:
+        if root is None or not root.is_dir():
+            continue
+        try:
+            with os.scandir(root) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir():
+                            sig.append((entry.path, entry.stat().st_mtime_ns))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    sig.sort()
+    return tuple(sig)
+
+
 def _refresh_dataset_stats_cache(state: GatewayState) -> None:
     """Compute the expensive dataset scan OFF the lock and publish the result.
 
     ``_recorded_dataset_items`` / ``_read_recorded_trajectory`` walk the dataset
-    tree (298G / 600+ episodes on Thor => 4-12s) and are read-only on ``state``.
-    Running them here (no lock held during the scan) and storing the result lets
-    ``_snapshot`` read O(1) cached values under the lock instead of scanning,
-    which is what kept the recorder-stdout drain and camera.jpg serving from
-    blocking for seconds. Per-episode memoization in ``_gmsl2_dataset_stats``
-    keeps each refresh cheap once warm.
+    tree (253 datasets / 298G / 600+ episodes on Thor => 4-12s of GIL-held CPU)
+    and are read-only on ``state``. Even off ``state.lock`` that scan holds the
+    GIL and starves every HTTP handler (snapshot/camera.jpg/cali-log polls),
+    which is what made the UI freeze. So first take a cheap dir-mtime fingerprint
+    and skip the whole walk when nothing changed; only rescan on a real change.
     """
+    signature = _dataset_scan_signature(state)
+    with state.lock:
+        unchanged = state.dataset_cache_ready and signature == state.dataset_scan_signature
+    if unchanged:
+        return
     items = _recorded_dataset_items(state)
     trajectory, meta = _read_recorded_trajectory(state)
+    processing = _processing_items(state)  # also an O(datasets) FS scan; cache it
     with state.lock:
         state.cached_recorded_datasets = items
         state.cached_trajectory = trajectory
         state.cached_trajectory_meta = meta
+        state.cached_processing_items = processing
         state.dataset_cache_ready = True
+        state.dataset_scan_signature = signature
 
 
-def _dataset_stats_refresher(state: GatewayState, interval_s: float = 4.0) -> None:
+def _dataset_stats_refresher(state: GatewayState, interval_s: float = 10.0) -> None:
     while True:
         try:
             _refresh_dataset_stats_cache(state)
@@ -5663,6 +5763,15 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
             return
         if isinstance(roster, list):
             _apply_box_roster(state, roster)
+        return
+    if output.startswith("TOUCHCALI_LOG ") or output.startswith("TOUCHCALI_DONE "):
+        done = output.startswith("TOUCHCALI_DONE ")
+        line = output.removeprefix("TOUCHCALI_DONE " if done else "TOUCHCALI_LOG ").strip()
+        with state.box_touch_cali_lock:
+            state.box_touch_cali_log.append({"ts": time.time(), "line": line, "done": done})
+            del state.box_touch_cali_log[:-200]  # keep the buffer bounded
+            if done:
+                state.box_touch_cali_running = False
         return
     if output.startswith("CALI_LOG ") or output.startswith("CALI_DONE "):
         done = output.startswith("CALI_DONE ")
@@ -6159,10 +6268,14 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.OK, _box_preview_payload(self.server.state, device_id))
                 return
         if path == "/api/device/box-cali-log":
-            # Calibration log buffer (polled by the Device Manager log box).
+            # 6D force calibration log buffer (polled by the force tile's log box).
             # Uses its own box_cali_lock inside the payload helper, so it never
             # contends with the main state lock or the recorder-stdout drain.
             _json_response(self, HTTPStatus.OK, _box_cali_log_payload(self.server.state))
+            return
+        if path == "/api/device/box-touch-cali-log":
+            # Separate touch calibration log buffer (polled by the touch viewer).
+            _json_response(self, HTTPStatus.OK, _box_touch_cali_log_payload(self.server.state))
             return
         if path == "/api/device-preview/camera.jpg":
             device_id = query.get("key", [""])[0]
@@ -6317,6 +6430,16 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/device/calibrate-6dforce":
                     result = _trigger_box_six_d_force_cali(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/device/calibrate-6dforce-origin":
+                    result = _trigger_box_six_d_force_cali(self.server.state, origin=True)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/device/calibrate-touch":
+                    result = _trigger_box_touch_cali(self.server.state)
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
                     return

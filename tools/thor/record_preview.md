@@ -325,3 +325,39 @@ graph LR
 | `thor_gmsl2_11ch_example.yaml` | 新增 `two_phase_connect: false`（带说明） |
 | `gateway.py` | `@contextmanager _previews_suspended_for_connect`；connect 分支整体收口，删 generic except 特判 |
 | 测试 | multiprocess +3（两阶段 ordering/paused-fail/play-retry）、gateway +2（CM 成功/异常）、修正 1 个 stale `build_pipeline_desc` 断言 + 1 个 spawn-kwargs 断言；合计 125 passed |
+
+## 7. Gateway snapshot 性能修复 + 预览 on-demand 回归（2026-07-15）
+
+### 7.1 `/api/snapshot` O(tasks×datasets) 扫盘 → gateway "假死"
+
+**症状**：GUI 白屏良久、传感器数据不即时更新、校准很慢；Thor 上 gateway 进程 ~99% CPU。但整机健康（`load` 4/14 核、内存 113G 空闲、无 swap、无 D 状态/僵尸、温度 50℃）——**不是机器死了，是单进程单核被打满**。
+
+**根因**：`_snapshot`（前端每秒轮询）每次都做**多次"遍历全部数据集（Thor 上 253 个）glob"的扫盘，完全不缓存**：
+- `_tasks_with_progress` → `_count_completed_episodes`：对 **每个 task** 都 `datasets_root.iterdir()` + `_is_dataset_root` glob（9 tasks × 253）。
+- `_processing_items` → `_complete_dataset_candidates`（253）。
+- `_active_annotation` → `_resolve_known_dataset` → `_complete_replay_dataset_candidates`（253）。
+
+即 O(tasks×datasets)，随 task/数据集增多而爆炸（表现像"最近回归"，其实是数据量长大触发）。**排障关键**：逐端点比延迟 `curl -w %{time_total}` —— `/api/snapshot` 1-5s，而 `/api/device/box-cali-log` 等只 1-3ms → 锁定是 snapshot 自身，不是 GIL/前端轮询。
+
+**修复（`gateway.py`）**：
+1. `_count_completed_episodes` 改读内存 `state.cached_recorded_datasets`（已含 name+totalEpisodes），不再扫盘。
+2. `_processing_items` 结果搬进后台 `_refresh_dataset_stats_cache`（新增 `cached_processing_items` 字段），snapshot 读缓存。
+3. `_complete_replay_dataset_candidates`（所有候选发现的唯一 chokepoint）加 3s TTL memo（`_REPLAY_CANDIDATES_MEMO`）。
+
+**效果**：snapshot **4.5s → 10ms**，gateway CPU **97% → 18%**。
+
+### 7.2 相机预览没图像 = on-demand 门控回归 + 在线同步聚簇不稳
+
+**现象**：录制正常出视频，但预览"8 路 running 却无图"。
+
+**定位**：预览走独立支路（recorder→NV12 `/dev/shm/lerobot_online_sync_preview` → `online_sync_preview_bridge.py` 转 JPEG → `/dev/shm/lerobot_preview/{cam}.jpg` → gateway `_recorder_preview_frame` 读，>2s 陈旧即 503），**录制不经它**，所以录制正常、只预览没图。回归 commit **`3bb0eb7d "Fix recorder preview restart storm and add on-demand preview gating"`** 把预览改成 on-demand：浏览器需持续拉 camera.jpg、gateway 每秒发 `preview_demand` 心跳，recorder 才起 bridge；6s（`recording_preview_idle_ttl_s`）无心跳就关。§7.1 gateway 慢时心跳顶不住 → 预览关 → 无图。gateway 修好后预览仍闪（camera.jpg 200 命中 ~6/15），剩余是**在线同步聚簇**：cam_00 领头相机在簇里超时 → 整簇 miss → `preview stale` → recorder 重启预览管线（一串连续 503）。
+
+**注**：`spawn_stagger_s` / `two_phase_connect` 只对旧的 per-camera gst-worker 后端有效，对当前 `argus_online_sync`（单个 C++ 二进制 `lerobot_argus_online_sync_video_recorder`）是 legacy、无效。可试 `recording_preview_on_demand: false`（eager 常开）绕开 demand 依赖；"领头相机"聚簇超时需在 C++ 二进制 / nvargus 侧继续排（各路单独 `nvarguscamerasrc` probe 均 PASS，8 路并发才掉，换谁在第一位谁掉 → 非某台硬件坏）。
+
+### 7.3 本轮改动清单（2026-07-15）
+
+| 文件 | 改动 |
+| --- | --- |
+| `gateway.py` | `_count_completed_episodes` 读缓存；`_processing_items` 缓存进 refresher（`cached_processing_items`）；`_complete_replay_dataset_candidates` 加 3s TTL memo |
+| `run/deploy.sh` | 重启段一并 kill `thor_record.py`（recorder 是 gateway 子进程、把 box_client.py 载内存，否则 deploy 后旧 recorder 孤儿化仍跑旧代码/占 box+Argus，下次 Connect 冲突） |
+| `box-sdk`（submodule） | 补回 `box_client.py` 的 `BoxClient/BoxPool.calibrate_touch`（回退代码时丢失，而 `thor_record.py` 仍调 `box.calibrate_touch()` → `'BoxPool' object has no attribute 'calibrate_touch'`） |

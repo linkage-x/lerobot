@@ -62,6 +62,32 @@ if [[ -n "$left_pids" ]]; then
   sleep 1
 fi
 
+# The gateway spawns the recorder (thor_record.py) as a child; killing the
+# gateway can orphan it, and it holds box_client.py + the box/camera (Argus)
+# sessions in memory. Stop it too so the next Connect respawns a fresh recorder
+# with the just-synced code instead of a stale orphan clashing over the hardware.
+_recorder_pids() {
+  python3 - <<'PY'
+import os
+for name in os.listdir('/proc'):
+    if not name.isdigit():
+        continue
+    try:
+        raw = open(f'/proc/{name}/cmdline', 'rb').read().split(b'\0')
+    except OSError:
+        continue
+    args = [x.decode('utf-8', 'ignore') for x in raw if x]
+    if any(a.endswith('thor_record.py') for a in args):
+        print(name)
+PY
+}
+rec_pids="$(_recorder_pids || true)"
+if [[ -n "$rec_pids" ]]; then
+  echo "$rec_pids" | xargs -r kill 2>/dev/null || true
+  sleep 1
+  echo "$(_recorder_pids || true)" | xargs -r kill -9 2>/dev/null || true
+fi
+
 cd ~/lerobot
 bash tools/thor/box_sdk/ensure_box_net.sh >/dev/null 2>&1 || true
 . tools/thor/box_sdk/setup_env.sh

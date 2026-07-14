@@ -523,9 +523,49 @@ export class DataCollectionGuiApi {
     }
   }
 
+  async triggerSixDForceOriginCalibration(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/device/calibrate-6dforce-origin`, {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      const body = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      return { ok: response.ok && body.ok !== false, error: body.error };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  async triggerTouchCalibration(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/device/calibrate-touch`, {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      const body = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      return { ok: response.ok && body.ok !== false, error: body.error };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   async fetchBoxCaliLog(): Promise<BoxCaliLog | null> {
     try {
       const response = await fetch(`${this.apiBase}/api/device/box-cali-log`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as BoxCaliLog;
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchBoxTouchCaliLog(): Promise<BoxCaliLog | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/device/box-touch-cali-log`, {
         headers: { Accept: "application/json" }
       });
       if (!response.ok) {

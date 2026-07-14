@@ -211,40 +211,99 @@ def _fmt_force_vec(vec: list[float] | None) -> str:
     return ", ".join(f"{_FORCE_CHANNEL_LABELS[i]}={vec[i]:.4f}" for i in range(n))
 
 
-def _run_six_d_force_cali(box: bc.BoxPool) -> None:
-    """Trigger 6D force-sensor software zeroing and stream progress as CALI_LOG lines.
+# Serialize calibrations: concurrent native SDK calibration calls (e.g. a rapid
+# 6D-then-touch click, now that the two buttons have independent running flags)
+# can wedge the SDK, after which EVERY later calibration hangs and the recorder
+# must be restarted. This lock rejects an overlapping request instead of piling
+# up threads on a blocked SDK.
+_CALI_LOCK = threading.Lock()
 
-    Runs on its own thread: the stdin reader must not block on the ~1s SDK
-    round-trip. Emits a terminal ``CALI_DONE ok|error`` line so the gateway can
-    mark the run complete and the frontend can stop spinning.
+
+def _run_six_d_force_cali(box: bc.BoxPool, *, origin: bool = False) -> None:
+    """Trigger 6D force-sensor zeroing and stream progress as CALI_LOG lines.
+
+    ``origin=False`` (default) runs box_sdk's software zeroing
+    (``cali_6d_force_sensor``); ``origin=True`` runs the MCU-side TLV origin
+    calibration (``cali_6d_force_sensor_origin``). Runs on its own thread: the
+    stdin reader must not block on the ~1s SDK round-trip. Emits a terminal
+    ``CALI_DONE ok|error`` line so the gateway can mark the run complete and the
+    frontend can stop spinning.
     """
-    _emit("CALI_LOG 6D force sensor software zero requested")
-    try:
-        results = box.calibrate_six_d_force()
-    except Exception as exc:  # noqa: BLE001 - calibration must never crash the recorder
-        _emit(f"CALI_LOG ERROR calibration raised: {exc}")
+    kind = "MCU origin" if origin else "software zero"
+    if not _CALI_LOCK.acquire(blocking=False):
+        _emit(f"CALI_LOG 6D force {kind}: another calibration in progress, ignored")
         _emit("CALI_DONE error")
         return
-    ok_all = bool(results)
-    for res in results:
-        label = res.get("box_id") or "box"
-        if res.get("ok"):
-            _emit(
-                f"CALI_LOG [{label}] {res.get('method', 'calibration')} OK "
-                f"(rc={res.get('rc')})"
-            )
-        else:
-            ok_all = False
-            _emit(
-                f"CALI_LOG [{label}] {res.get('method', 'calibration')} FAILED "
-                f"(rc={res.get('rc')}): "
-                f"{res.get('error') or 'unknown error'}"
-            )
-        before, after = res.get("before"), res.get("after")
-        if before is not None or after is not None:
-            _emit(f"CALI_LOG [{label}] before: {_fmt_force_vec(before)}")
-            _emit(f"CALI_LOG [{label}] after:  {_fmt_force_vec(after)}")
-    _emit(f"CALI_DONE {'ok' if ok_all else 'error'}")
+    try:
+        _emit(f"CALI_LOG 6D force sensor {kind} requested")
+        try:
+            results = box.calibrate_six_d_force(origin=origin)
+        except Exception as exc:  # noqa: BLE001 - calibration must never crash the recorder
+            _emit(f"CALI_LOG ERROR calibration raised: {exc}")
+            _emit("CALI_DONE error")
+            return
+        ok_all = bool(results)
+        for res in results:
+            label = res.get("box_id") or "box"
+            if res.get("ok"):
+                _emit(
+                    f"CALI_LOG [{label}] {res.get('method', 'calibration')} OK "
+                    f"(rc={res.get('rc')})"
+                )
+            else:
+                ok_all = False
+                _emit(
+                    f"CALI_LOG [{label}] {res.get('method', 'calibration')} FAILED "
+                    f"(rc={res.get('rc')}): "
+                    f"{res.get('error') or 'unknown error'}"
+                )
+            before, after = res.get("before"), res.get("after")
+            if before is not None or after is not None:
+                _emit(f"CALI_LOG [{label}] before: {_fmt_force_vec(before)}")
+                _emit(f"CALI_LOG [{label}] after:  {_fmt_force_vec(after)}")
+        _emit(f"CALI_DONE {'ok' if ok_all else 'error'}")
+    finally:
+        _CALI_LOCK.release()
+
+
+def _run_touch_cali(box: bc.BoxPool) -> None:
+    """Trigger touch-sensor re-zeroing and stream progress as TOUCHCALI_LOG lines.
+
+    Uses its own TOUCHCALI_LOG/TOUCHCALI_DONE stdout channel (distinct from the
+    6D force CALI_LOG/CALI_DONE) so the gateway routes it to a separate buffer
+    and the touch viewer never shows 6D force lines. Runs on its own thread so
+    the stdin reader never blocks on the SDK round-trip.
+    """
+    if not _CALI_LOCK.acquire(blocking=False):
+        _emit("TOUCHCALI_LOG touch: another calibration in progress, ignored")
+        _emit("TOUCHCALI_DONE error")
+        return
+    try:
+        _emit("TOUCHCALI_LOG touch sensor re-zero requested")
+        try:
+            results = box.calibrate_touch()
+        except Exception as exc:  # noqa: BLE001 - calibration must never crash the recorder
+            _emit(f"TOUCHCALI_LOG ERROR calibration raised: {exc}")
+            _emit("TOUCHCALI_DONE error")
+            return
+        ok_all = bool(results)
+        for res in results:
+            label = res.get("box_id") or "box"
+            if res.get("ok"):
+                _emit(
+                    f"TOUCHCALI_LOG [{label}] {res.get('method', 'calibration')} OK "
+                    f"(rc={res.get('rc')})"
+                )
+            else:
+                ok_all = False
+                _emit(
+                    f"TOUCHCALI_LOG [{label}] {res.get('method', 'calibration')} FAILED "
+                    f"(rc={res.get('rc')}): "
+                    f"{res.get('error') or 'unknown error'}"
+                )
+        _emit(f"TOUCHCALI_DONE {'ok' if ok_all else 'error'}")
+    finally:
+        _CALI_LOCK.release()
 
 
 def _read_stdin_loop(
@@ -252,6 +311,8 @@ def _read_stdin_loop(
     stop: threading.Event,
     on_demand: Callable[[], None] | None = None,
     on_calibrate: Callable[[], None] | None = None,
+    on_calibrate_origin: Callable[[], None] | None = None,
+    on_calibrate_touch: Callable[[], None] | None = None,
 ) -> None:
     while not stop.is_set():
         line = sys.stdin.readline()
@@ -284,6 +345,15 @@ def _read_stdin_loop(
             # own thread so reading further stdin lines never blocks on it.
             if on_calibrate is not None:
                 on_calibrate()
+        elif stripped == "cali_6dforce_origin":
+            # MCU-side TLV origin calibration variant of cali_6dforce above.
+            if on_calibrate_origin is not None:
+                on_calibrate_origin()
+        elif stripped == "calitouch":
+            # Out-of-band touch-sensor calibration request from the gateway,
+            # analogous to cali_6dforce above: a side-effect, not an FSM command.
+            if on_calibrate_touch is not None:
+                on_calibrate_touch()
         else:
             logger.warning("ignoring unrecognized stdin command: %r", line)
 
@@ -1296,9 +1366,27 @@ def main(argv: list[str] | None = None) -> int:
             daemon=True, name="thor-record-cali",
         ).start()
 
+    def _trigger_six_d_force_cali_origin() -> None:
+        # MCU-side origin calibration variant; same offload pattern.
+        threading.Thread(
+            target=_run_six_d_force_cali, args=(box,), kwargs={"origin": True},
+            daemon=True, name="thor-record-cali-origin",
+        ).start()
+
+    def _trigger_touch_cali() -> None:
+        # Same offload pattern as the 6D force calibration above.
+        threading.Thread(
+            target=_run_touch_cali, args=(box,),
+            daemon=True, name="thor-record-touch-cali",
+        ).start()
+
     stdin_thread = threading.Thread(
         target=_read_stdin_loop,
-        args=(cmd_queue, stop_event, _note_preview_demand, _trigger_six_d_force_cali),
+        args=(
+            cmd_queue, stop_event, _note_preview_demand,
+            _trigger_six_d_force_cali, _trigger_six_d_force_cali_origin,
+            _trigger_touch_cali,
+        ),
         daemon=True, name="thor-record-stdin",
     )
     stdin_thread.start()
