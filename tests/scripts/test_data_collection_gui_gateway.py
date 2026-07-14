@@ -1008,6 +1008,47 @@ def test_traj_gen_starts_april_tracking_with_selected_dataset_root(tmp_path, mon
     assert "AprilTag cube tracking" in item["message"]
 
 
+def test_exported_v3_dataset_is_replay_selectable_but_blocks_real_robot(tmp_path):
+    repo_root = tmp_path / "repo"
+    recorded_root = repo_root / "outputs" / "datasets" / "recorded_set"
+    exported_root = repo_root / "outputs" / "exports" / "exported_set"
+    _write_minimal_episode_dataset(recorded_root, total_episodes=1)
+    _write_minimal_episode_dataset(exported_root, total_episodes=2)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(recorded_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test", fps=30),
+        datasets_root=recorded_root.parent,
+        exports_root=exported_root.parent,
+    )
+
+    replay_items = gateway._recorded_dataset_items(state)
+    exported_item = next(item for item in replay_items if item["path"] == str(exported_root))
+    assert exported_item["datasetKind"] == "exported"
+
+    processing_paths = {item["path"] for item in gateway._processing_items(state)}
+    assert str(recorded_root) in processing_paths
+    assert str(exported_root) not in processing_paths
+
+    gateway._select_replay_dataset(state, str(exported_root))
+    assert state.replay.datasetRoot == str(exported_root)
+    assert state.replay.datasetKind == "exported"
+    assert state.replay.episodeOptions == [0, 1]
+    snapshot = gateway._snapshot(state)
+    assert snapshot["replay"]["datasetRoot"] == str(exported_root)
+    assert snapshot["replay"]["datasetKind"] == "exported"
+
+    timeline = gateway._read_dataset_timeline(state, exported_root, episode=1)
+    assert timeline["datasetKind"] == "exported"
+    assert timeline["episode"] == 1
+    assert timeline["totalFrames"] == 2
+
+    with pytest.raises(RuntimeError, match="Real-robot replay is disabled for exported datasets"):
+        gateway._require_mujoco_validation(state)
+
+
 def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_replay(tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"

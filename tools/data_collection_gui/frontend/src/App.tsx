@@ -311,7 +311,19 @@ function ReplayPanel({
   const validationGuidance = mujocoPassed
     ? "MuJoCo replay is current for this episode."
     : "Strongly recommended before Preflight/Dry Run; required before Real Robot.";
-  const realRobotDisabled = busy || isActive || status.safety !== "ready" || !mujocoPassed;
+  const isExportedDataset = status.datasetKind === "exported";
+  const realRobotDisabledReason = isExportedDataset
+    ? "Real Robot is disabled for exported datasets: exported action is next-frame observation.state, not a verified robot command stream."
+    : busy
+      ? "Gateway command is already running."
+      : isActive
+        ? "Replay is already active."
+        : status.safety !== "ready"
+          ? "Run Preflight before real-robot replay."
+          : !mujocoPassed
+            ? "Run MuJoCo replay successfully before real-robot replay."
+            : "";
+  const realRobotDisabled = busy || isActive || status.safety !== "ready" || !mujocoPassed || isExportedDataset;
   return (
     <section className="panel replay-panel">
       <div className="panel-heading">
@@ -325,7 +337,9 @@ function ReplayPanel({
         <button disabled={busy || isActive || !canReplayData} onClick={onPreflight}>Preflight</button>
         <button disabled={busy || isActive || status.safety !== "ready"} onClick={() => onReplay(false)}>Dry Run</button>
         <button disabled={busy || isActive || !canReplayData} onClick={onMujocoReplay}>MuJoCo</button>
-        <button className="danger" disabled={realRobotDisabled} onClick={() => onReplay(true)}>Real Robot</button>
+        <span className="button-tooltip" title={realRobotDisabled ? realRobotDisabledReason : "Start real-robot replay"}>
+          <button className="danger" disabled={realRobotDisabled} onClick={() => onReplay(true)}>Real Robot</button>
+        </span>
         <button disabled={busy || !isActive} onClick={onAbort}>Abort</button>
       </div>
       <p className="panel-note">Safety {status.safety} · {status.message}</p>
@@ -379,7 +393,7 @@ function RecordedDatasetList({
   return (
     <section className="panel dataset-list-panel">
       <div className="panel-heading">
-        <h2>Recorded Datasets</h2>
+        <h2>Replay Datasets</h2>
         <span>{datasets.length} found</span>
       </div>
       {latest ? (
@@ -389,7 +403,7 @@ function RecordedDatasetList({
           <small>{latest.path}</small>
         </div>
       ) : (
-        <div className="empty-dataset-list">No recorded datasets found under the configured dataset root.</div>
+        <div className="empty-dataset-list">No replay datasets found under the configured dataset or exports roots.</div>
       )}
       <div className="dataset-list">
         {datasets.map((dataset) => {
@@ -405,6 +419,7 @@ function RecordedDatasetList({
                 <div className="row-title">
                   <StatusDot state={dataset.dataStatus === "loaded" ? "running" : "warning"} />
                   <strong>{dataset.name}</strong>
+                  {dataset.datasetKind === "exported" ? <em>exported</em> : null}
                   {dataset.isLatest ? <em>latest</em> : null}
                 </div>
                 <p>{dataset.path}</p>
@@ -1548,13 +1563,15 @@ function DatasetExportPage({
   busy,
   onExportTask,
   onExportApprovedDataset,
-  onOpenProcessing
+  onOpenProcessing,
+  onOpenReplay
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
   onExportTask: (id: string) => void;
   onExportApprovedDataset: (path: string) => void;
   onOpenProcessing: () => void;
+  onOpenReplay: (path: string) => void;
 }) {
   const exportStatus = snapshot.datasetExport;
   const eligible = snapshot.processing.filter((item) => item.status === "qc_pass");
@@ -1609,6 +1626,11 @@ function DatasetExportPage({
             <Metric label="Message" value={exportStatus.message} />
           </div>
         )}
+        {exportStatus.outputPath ? (
+          <div className="control-row">
+            <button disabled={busy || exporting} onClick={() => onOpenReplay(exportStatus.outputPath)}>Open Replay</button>
+          </div>
+        ) : null}
       </section>
       <section className="panel">
         <div className="panel-heading">
@@ -2827,6 +2849,7 @@ function App() {
         onExportTask={exportTaskWithQcGuard}
         onExportApprovedDataset={(path) => run(() => api.exportApprovedDataset(path))}
         onOpenProcessing={() => navigate("dataset-processing")}
+        onOpenReplay={(path) => selectAndOpenReplay(path)}
       />
     ) : activePage === "task-library" ? (
       <TaskLibraryPage

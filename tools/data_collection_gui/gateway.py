@@ -103,6 +103,7 @@ class ReplayStatus:
     safety: str = "locked"
     message: str = "Replay gateway ready"
     datasetRoot: str = ""
+    datasetKind: str = "recorded"
     sourcePath: str = ""
     dataStatus: str = "missing"
     trajectoryKind: str = "none"
@@ -761,6 +762,15 @@ def _scan_datasets_root(state: GatewayState) -> list[Path]:
     return [entry for entry in root.iterdir() if _is_dataset_root(entry)]
 
 
+def _scan_exports_root(state: GatewayState) -> list[Path]:
+    root = _task_exports_root(state)
+    if not root.is_dir():
+        return []
+    if _is_dataset_root(root):
+        return [root]
+    return [entry for entry in root.iterdir() if _is_dataset_root(entry)]
+
+
 def _dataset_root_candidates(state: GatewayState) -> list[Path]:
     dataset = _dataset_config(state.config)
     configured_root = _resolve_dataset_root(state.repo_root, dataset.get("root"))
@@ -787,8 +797,24 @@ def _dataset_root_candidates(state: GatewayState) -> list[Path]:
     return sorted(candidates, key=_dataset_modified_s, reverse=True)
 
 
+def _dataset_kind(state: GatewayState, dataset_root: Path) -> str:
+    try:
+        dataset_root.resolve().relative_to(_task_exports_root(state).resolve())
+    except (OSError, ValueError):
+        return "recorded"
+    return "exported"
+
+
+def _complete_replay_dataset_candidates(state: GatewayState) -> list[Path]:
+    candidates = list(_complete_dataset_candidates(state))
+    for entry in _scan_exports_root(state):
+        if entry not in candidates and _dataset_is_complete(entry):
+            candidates.append(entry)
+    return sorted(candidates, key=_dataset_modified_s, reverse=True)
+
+
 def _replay_dataset_candidates(state: GatewayState) -> list[Path]:
-    candidates = _complete_dataset_candidates(state)
+    candidates = _complete_replay_dataset_candidates(state)
     selected = state.selected_replay_root.resolve() if state.selected_replay_root is not None else None
     if selected is None:
         return candidates
@@ -804,7 +830,7 @@ def _select_replay_dataset(state: GatewayState, raw_path: str) -> None:
     if requested is None:
         raise ValueError("Missing dataset path.")
     requested = requested.resolve()
-    candidates = _complete_dataset_candidates(state)
+    candidates = _complete_replay_dataset_candidates(state)
     matched = next((candidate for candidate in candidates if candidate.resolve() == requested), None)
     if matched is None:
         raise ValueError(f"Dataset is not in the recorded dataset list: {requested}")
@@ -818,14 +844,18 @@ def _select_replay_dataset(state: GatewayState, raw_path: str) -> None:
     state.replay.frameIndex = 0
     state.replay.trackingErrorMm = 0.0
     state.replay.datasetRoot = str(matched)
+    state.replay.datasetKind = _dataset_kind(state, matched)
     state.replay.dataset = str(matched)
-    state.replay.message = f"Selected recorded dataset: {matched.name}"
+    state.replay.message = f"Selected {_dataset_kind(state, matched)} dataset: {matched.name}"
     _invalidate_mujoco_validation(state, "Dataset changed; run MuJoCo replay again before real-robot replay.")
     persisted_validation = _load_persisted_mujoco_validation(state, matched, state.replay.episode)
     if persisted_validation is not None:
         state.replay.mujocoValidation = persisted_validation
         _refresh_mujoco_validation_current(state)
-        state.replay.message = f"Selected recorded dataset: {matched.name}; MuJoCo validation restored"
+        state.replay.message = f"Selected {_dataset_kind(state, matched)} dataset: {matched.name}; MuJoCo validation restored"
+    state.cached_recorded_datasets = _recorded_dataset_items(state)
+    state.cached_trajectory, state.cached_trajectory_meta = _read_recorded_trajectory(state)
+    state.dataset_cache_ready = True
     state.log("info", f"Selected replay dataset {matched}")
 
 
@@ -849,6 +879,7 @@ def _select_replay_episode(state: GatewayState, raw_episode: str) -> None:
     state.replay.safety = "locked"
     state.replay.frameIndex = 0
     state.replay.trackingErrorMm = 0.0
+    state.replay.datasetKind = _dataset_kind(state, dataset_root)
     state.replay.message = f"Selected episode {episode} from {dataset_root.name}"
     _invalidate_mujoco_validation(state, "Episode changed; run MuJoCo replay again before real-robot replay.")
     persisted_validation = _load_persisted_mujoco_validation(state, dataset_root, episode)
@@ -856,6 +887,8 @@ def _select_replay_episode(state: GatewayState, raw_episode: str) -> None:
         state.replay.mujocoValidation = persisted_validation
         _refresh_mujoco_validation_current(state)
         state.replay.message = f"Selected episode {episode} from {dataset_root.name}; MuJoCo validation restored"
+    state.cached_trajectory, state.cached_trajectory_meta = _read_recorded_trajectory(state)
+    state.dataset_cache_ready = True
     state.log("info", f"Selected replay episode {episode} for {dataset_root}")
 
 
@@ -1248,7 +1281,7 @@ def _normalize_series(values: list[float], low: float = 8.0, high: float = 92.0)
     return [low + (value - min_value) * scale if value == value else 50.0 for value in values]
 
 
-def _dataset_replay_meta(dataset_root: Path, info: dict[str, Any]) -> dict[str, Any]:
+def _dataset_replay_meta(state: GatewayState, dataset_root: Path, info: dict[str, Any]) -> dict[str, Any]:
     data_files = _dataset_data_files(dataset_root)
     episode_options = _dataset_episode_indices(dataset_root, info)
     if _has_gmsl2_episodes(dataset_root):
@@ -1258,6 +1291,7 @@ def _dataset_replay_meta(dataset_root: Path, info: dict[str, Any]) -> dict[str, 
         total_frames = int(info.get("total_frames") or 0)
     return {
         "datasetRoot": str(dataset_root),
+        "datasetKind": _dataset_kind(state, dataset_root),
         "sourcePath": str(data_files[-1]) if data_files else "",
         "totalEpisodes": total_episodes,
         "episodeOptions": episode_options,
@@ -2934,7 +2968,7 @@ def _gmsl2_dataset_stats(dataset_root: Path) -> tuple[int, int]:
 
 def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for index, dataset_root in enumerate(_complete_dataset_candidates(state)):
+    for index, dataset_root in enumerate(_complete_replay_dataset_candidates(state)):
         info = _load_dataset_info(dataset_root)
         data_files = _dataset_data_files(dataset_root)
         modified_s = _dataset_modified_s(dataset_root)
@@ -2948,6 +2982,7 @@ def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
             {
                 "path": str(dataset_root),
                 "name": dataset_root.name,
+                "datasetKind": _dataset_kind(state, dataset_root),
                 "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(modified_s)) if modified_s else "",
                 "updatedAtMs": int(modified_s * 1000),
                 "totalEpisodes": total_episodes,
@@ -2970,7 +3005,7 @@ def _parquet_status_from_error(exc: Exception) -> str:
 def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     for dataset_root in _replay_dataset_candidates(state):
         if _has_gmsl2_episodes(dataset_root):
-            meta = _dataset_replay_meta(dataset_root, {})
+            meta = _dataset_replay_meta(state, dataset_root, {})
             return [], {
                 **meta,
                 "dataStatus": "loaded",
@@ -2985,9 +3020,10 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
         dataset_roots = _replay_dataset_candidates(state)
         latest = dataset_roots[0] if dataset_roots else None
         latest_info = _load_dataset_info(latest) if latest is not None else {}
-        latest_meta = _dataset_replay_meta(latest, latest_info) if latest is not None else {}
+        latest_meta = _dataset_replay_meta(state, latest, latest_info) if latest is not None else {}
         return [], {
             "datasetRoot": latest_meta.get("datasetRoot") or "",
+            "datasetKind": latest_meta.get("datasetKind") or "recorded",
             "sourcePath": latest_meta.get("sourcePath") or "",
             "totalEpisodes": latest_meta.get("totalEpisodes") or 0,
             "recordedFrames": latest_meta.get("recordedFrames") or 0,
@@ -2999,7 +3035,7 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
     best_meta: dict[str, Any] | None = None
     for dataset_root in _replay_dataset_candidates(state):
         info = _load_dataset_info(dataset_root)
-        dataset_meta = _dataset_replay_meta(dataset_root, info)
+        dataset_meta = _dataset_replay_meta(state, dataset_root, info)
         if best_meta is None:
             best_meta = {**dataset_meta, "dataStatus": "missing", "message": "No recorded parquet files found"}
         data_files = _dataset_data_files(dataset_root)
@@ -3147,7 +3183,7 @@ def _resolve_known_dataset(state: GatewayState, raw_path: str) -> Path | None:
         resolved = requested.resolve()
     except OSError:
         return None
-    candidates = _complete_dataset_candidates(state)
+    candidates = _complete_replay_dataset_candidates(state)
     for candidate in candidates:
         try:
             if candidate.resolve() == resolved:
@@ -3633,6 +3669,7 @@ def _empty_timeline(
     camera_keys: list[str] | None = None,
     cube_pose_names: list[str] | None = None,
     error: str | None = None,
+    dataset_kind: str = "recorded",
 ) -> dict[str, Any]:
     """Return a fully-shaped ReplayTimeline payload with no frames.
 
@@ -3643,6 +3680,7 @@ def _empty_timeline(
     """
     payload: dict[str, Any] = {
         "datasetRoot": str(dataset_root),
+        "datasetKind": dataset_kind,
         "name": dataset_root.name,
         "episode": int(episode) if episode is not None else 0,
         "totalFrames": 0,
@@ -4000,6 +4038,7 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
     _attach_touch_frames(frames, ep_dir, video_warmup_s=video_warmup_s)
     return {
         "datasetRoot": str(dataset_root),
+        "datasetKind": "recorded",
         "name": dataset_root.name,
         "episode": ep_idx,
         "totalFrames": total_frames,
@@ -4025,7 +4064,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         import pyarrow.compute as pc
         import pyarrow.parquet as pq
     except Exception as exc:  # noqa: BLE001
-        return _empty_timeline(dataset_root, error=f"pyarrow unavailable: {exc}")
+        return _empty_timeline(dataset_root, error=f"pyarrow unavailable: {exc}", dataset_kind=_dataset_kind(state, dataset_root))
 
     info = _load_dataset_info(dataset_root)
     state_names = _feature_names(info, "observation.state")
@@ -4047,6 +4086,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
             camera_keys=camera_keys,
             cube_pose_names=cube_pose_names,
             error="no parquet files",
+            dataset_kind=_dataset_kind(state, dataset_root),
         )
 
     data_file = data_files[-1]
@@ -4065,6 +4105,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
                 camera_keys=camera_keys,
                 cube_pose_names=cube_pose_names,
                 error=f"episode {selected_episode} not found",
+                dataset_kind=_dataset_kind(state, dataset_root),
             )
         table = table.filter(pc.equal(table["episode_index"], selected_episode))
         episode = selected_episode
@@ -4136,6 +4177,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
 
     return {
         "datasetRoot": str(dataset_root),
+        "datasetKind": _dataset_kind(state, dataset_root),
         "name": dataset_root.name,
         "episode": episode,
         "totalFrames": len(frames),
@@ -4815,11 +4857,13 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         trajectory_meta = {
             **trajectory_meta,
             "datasetRoot": latest_dataset["path"],
+            "datasetKind": latest_dataset.get("datasetKind") or "recorded",
             "sourcePath": latest_dataset["sourcePath"],
             "totalEpisodes": latest_dataset["totalEpisodes"],
             "recordedFrames": latest_dataset["totalFrames"],
         }
     state.replay.datasetRoot = str(trajectory_meta.get("datasetRoot") or state.replay.datasetRoot)
+    state.replay.datasetKind = str(trajectory_meta.get("datasetKind") or state.replay.datasetKind or "recorded")
     state.replay.sourcePath = str(trajectory_meta.get("sourcePath") or "")
     state.replay.dataStatus = str(trajectory_meta.get("dataStatus") or "missing")
     state.replay.trajectoryKind = str(trajectory_meta.get("trajectoryKind") or "none")
@@ -5862,6 +5906,10 @@ def _require_mujoco_validation(state: GatewayState) -> Path:
     dataset_root = _active_replay_dataset_root(state)
     if not _is_dataset_root(dataset_root):
         raise RuntimeError(f"Selected replay dataset is not finalized: {dataset_root}")
+    if _dataset_kind(state, dataset_root) == "exported":
+        raise RuntimeError(
+            "Real-robot replay is disabled for exported datasets because exported action is next-frame observation.state, not a verified robot command stream."
+        )
     if not _mujoco_validation_is_for_active_episode(state, dataset_root):
         validation = state.replay.mujocoValidation or {}
         message = str(validation.get("message") or "Run MuJoCo replay successfully before real-robot replay.")

@@ -116,6 +116,7 @@ export type ReplayStatus = {
   safety: "locked" | "ready" | "active" | "fault";
   message: string;
   datasetRoot?: string;
+  datasetKind?: "recorded" | "exported";
   sourcePath?: string;
   dataStatus?: "loaded" | "missing" | "unfinalized" | "unreadable" | "empty";
   trajectoryKind?: "pose" | "gripper_width" | "none";
@@ -206,6 +207,7 @@ export type CollectionTask = {
 export type RecordedDataset = {
   path: string;
   name: string;
+  datasetKind?: "recorded" | "exported";
   updatedAt: string;
   updatedAtMs: number;
   totalEpisodes: number;
@@ -346,6 +348,7 @@ export type CubeVideoOverlay = {
 
 export type ReplayTimeline = {
   datasetRoot: string;
+  datasetKind?: "recorded" | "exported";
   name: string;
   episode: number;
   totalFrames: number;

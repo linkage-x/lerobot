@@ -639,6 +639,10 @@ button.danger {
   margin: 12px 0;
 }
 
+.button-tooltip {
+  display: inline-flex;
+}
+
 /* Keyboard-shortcut hint rendered inside the record control buttons. */
 .control-row button kbd {
   margin-left: 6px;

@@ -113,6 +113,7 @@ export class DataCollectionGuiApi {
       safety: "locked",
       message: "Start the local gateway to load recorded trajectory data",
       datasetRoot: handheldConfigSummary.root,
+      datasetKind: "recorded",
       sourcePath: "",
       dataStatus: "missing",
       trajectoryKind: "none",
