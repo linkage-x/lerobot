@@ -113,6 +113,12 @@ class ReplayStatus:
     pid: int | None = None
     lastOutput: str = ""
     mujocoValidation: dict[str, Any] = field(default_factory=dict)
+    # Bumped whenever the on-disk dataset content changes under a stable
+    # (datasetRoot, episode) selection — e.g. deleting an episode keeps the
+    # selection on the same slot but swaps in different frames/videos. The UI
+    # keys its timeline fetch on this so it refetches instead of showing stale
+    # data for the now-different episode.
+    revision: int = 0
 
 
 @dataclass
@@ -851,6 +857,285 @@ def _select_replay_episode(state: GatewayState, raw_episode: str) -> None:
         _refresh_mujoco_validation_current(state)
         state.replay.message = f"Selected episode {episode} from {dataset_root.name}; MuJoCo validation restored"
     state.log("info", f"Selected replay episode {episode} for {dataset_root}")
+
+
+def _delete_replay_episode(state: GatewayState, raw_episode: str) -> None:
+    if raw_episode == "":
+        raise ValueError("Missing episode index.")
+    try:
+        episode = int(raw_episode)
+    except ValueError as exc:
+        raise ValueError(f"Invalid episode index: {raw_episode}") from exc
+    dataset_root = state.selected_replay_root or _resolve_known_dataset(
+        state, state.replay.datasetRoot or state.replay.dataset
+    )
+    if dataset_root is None:
+        raise ValueError("Select a recorded dataset before deleting an episode.")
+    episode_options = _dataset_episode_indices(dataset_root, _load_dataset_info(dataset_root))
+    if episode not in episode_options:
+        raise ValueError(f"Episode {episode} is not available for {dataset_root.name}.")
+    if len(episode_options) <= 1:
+        raise ValueError("Cannot delete the only remaining episode in the dataset.")
+
+    # old episode index -> new contiguous index for every episode we keep. This
+    # is the same construction dataset_tools.delete_episodes uses internally, so
+    # the v3 core and the side metadata stay in lockstep.
+    kept = [ep for ep in episode_options if ep != episode]
+    mapping = {old: new for new, old in enumerate(kept)}
+
+    # Dispatch by what the replay timeline actually reads. When a v3 parquet is
+    # present the timeline reads *it* (see _read_dataset_timeline's
+    # `not _has_lerobot_v3_data` guard), so reindexing the parquet/meta is what
+    # makes the per-episode frames change. gmsl2 episode dirs (the mkv videos)
+    # are renumbered alongside inside the v3 path for hybrid datasets. Only a
+    # pure gmsl2 dataset (no parquet) takes the dir-only path.
+    if _has_lerobot_v3_data(dataset_root):
+        _delete_lerobot_v3_episode(dataset_root, episode, mapping)
+    elif _has_gmsl2_episodes(dataset_root):
+        _delete_gmsl2_episode(dataset_root, episode, mapping)
+    else:
+        raise ValueError(f"Dataset layout not supported for deletion: {dataset_root.name}")
+
+    # Remap episode-keyed side files at the final root for both formats. Derived
+    # EE-pose trajectories are intentionally dropped by the per-format helpers
+    # (they can't be trusted after a frame renumber) and are regenerated later.
+    _reindex_episode_side_metadata(dataset_root, mapping, episode)
+
+    # gmsl2 renumber renames meta.json paths, so stale frame-count memo entries
+    # would otherwise linger; the memo is cheap to rebuild.
+    _GMSL2_EP_FRAMES_MEMO.clear()
+
+    new_options = _dataset_episode_indices(dataset_root, _load_dataset_info(dataset_root))
+    state.selected_replay_root = dataset_root
+    state.replay.episodeOptions = new_options
+    # Deleting shifts the survivors down, so the slot we stay on (see below) now
+    # holds a different episode's frames/videos. Bump the revision so the UI
+    # refetches the timeline even though (datasetRoot, episode) is unchanged.
+    state.replay.revision += 1
+    # Stay on the slot the deleted episode occupied (the next episode shifts into
+    # it); clamp to the new last episode when we deleted the tail.
+    next_episode = min(episode, new_options[-1]) if new_options else 0
+    state.replay.episode = next_episode
+    state.replay.state = "idle"
+    state.replay.safety = "locked"
+    state.replay.frameIndex = 0
+    state.replay.trackingErrorMm = 0.0
+    state.replay.datasetRoot = str(dataset_root)
+    state.replay.dataset = str(dataset_root)
+    state.replay.message = (
+        f"Deleted episode {episode} from {dataset_root.name}; "
+        f"{len(new_options)} episode(s) remain (reindexed)."
+    )
+    # _snapshot re-derives episodeOptions/totalEpisodes/message from the
+    # background scan cache, which still describes the pre-delete tree until the
+    # ~4s refresher runs — so without this the response (and every poll until
+    # then) would still report the old episode count. We already hold state.lock
+    # here, so recompute the cache inline rather than calling
+    # _refresh_dataset_stats_cache (which re-acquires the lock and would
+    # deadlock). The scan functions are read-only on state.
+    state.selected_replay_root = dataset_root
+    state.replay.episode = next_episode
+    state.cached_recorded_datasets = _recorded_dataset_items(state)
+    state.cached_trajectory, state.cached_trajectory_meta = _read_recorded_trajectory(state)
+    state.dataset_cache_ready = True
+    _invalidate_mujoco_validation(
+        state, "Episode deleted; run MuJoCo replay again before real-robot replay."
+    )
+    persisted_validation = _load_persisted_mujoco_validation(state, dataset_root, next_episode)
+    if persisted_validation is not None:
+        state.replay.mujocoValidation = persisted_validation
+        _refresh_mujoco_validation_current(state)
+    state.log("warn", f"Deleted replay episode {episode} from {dataset_root}")
+
+
+def _delete_lerobot_v3_episode(dataset_root: Path, episode: int, mapping: dict[int, int]) -> None:
+    # The gateway runs under a slim python (pyarrow + pandas, but no
+    # datasets/torch/av), so lerobot.datasets.dataset_tools.delete_episodes is
+    # unimportable here. Reindex the v3 parquet + meta in place with pyarrow
+    # instead. This is only correct when there are no *embedded* v3 videos to
+    # re-cut; the gmsl2-hybrid datasets keep their mkv videos in episodes/ (the
+    # v3 rep is data-only), which the dir renumber below handles.
+    info = _load_dataset_info(dataset_root)
+    video_keys = [
+        key
+        for key, feature in (info.get("features") or {}).items()
+        if isinstance(feature, dict) and feature.get("dtype") == "video"
+    ]
+    if video_keys and not _has_gmsl2_episodes(dataset_root):
+        raise ValueError(
+            "Deleting an episode from a packed v3 dataset with embedded videos is not "
+            "supported from the gateway (needs ffmpeg/av to re-cut the concatenated "
+            "clips); use scripts/lerobot_edit_dataset.py instead."
+        )
+
+    _reindex_v3_data_and_meta_inplace(dataset_root, episode, mapping)
+
+    # Hybrid datasets keep the raw gmsl2 per-episode dirs (mkv videos + remux
+    # caches); renumber them to match the reindexed parquet.
+    if _has_gmsl2_episodes(dataset_root):
+        _renumber_gmsl2_episode_dirs(dataset_root, episode, mapping)
+    # Derived AprilTag EE-pose sidecars are indexed by the old episode numbers
+    # and can't be trusted after renumbering; drop them so replay regenerates.
+    derived = dataset_root / "derived"
+    if derived.is_dir():
+        shutil.rmtree(derived, ignore_errors=True)
+
+
+def _reindex_v3_data_and_meta_inplace(
+    dataset_root: Path, deleted_episode: int, mapping: dict[int, int]
+) -> None:
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    def _atomic_write_table(table: "pa.Table", path: Path) -> None:
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        pq.write_table(table, tmp)
+        os.replace(tmp, path)
+
+    def _replace_col(table: "pa.Table", name: str, values: list) -> "pa.Table":
+        idx = table.schema.get_field_index(name)
+        if idx < 0:
+            return table
+        arr = pa.array(values, type=table.schema.field(name).type)
+        return table.set_column(idx, name, arr)
+
+    # 1) data parquet: drop the deleted episode's rows, remap episode_index for
+    #    the survivors, and rebuild the contiguous global `index` across files.
+    running = 0
+    for data_file in sorted((dataset_root / "data").glob("chunk-*/*.parquet")):
+        table = pq.read_table(data_file)
+        if "episode_index" in table.column_names:
+            table = table.filter(pc.not_equal(table["episode_index"], deleted_episode))
+            table = _replace_col(
+                table,
+                "episode_index",
+                [mapping.get(int(e), int(e)) for e in table["episode_index"].to_pylist()],
+            )
+        n = table.num_rows
+        if "index" in table.column_names:
+            table = _replace_col(table, "index", list(range(running, running + n)))
+        running += n
+        _atomic_write_table(table, data_file)
+    total_frames = running
+
+    # 2) meta/episodes: drop the deleted row, remap episode_index, and recompute
+    #    the global row ranges from the surviving per-episode lengths.
+    meta_ep_files = sorted((dataset_root / "meta" / "episodes").glob("chunk-*/*.parquet"))
+    if meta_ep_files:
+        tables = [pq.read_table(f) for f in meta_ep_files]
+        combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+        combined = combined.filter(pc.not_equal(combined["episode_index"], deleted_episode))
+        new_ep = [mapping[int(e)] for e in combined["episode_index"].to_pylist()]
+        order = sorted(range(len(new_ep)), key=lambda i: new_ep[i])
+        combined = combined.take(pa.array(order))
+        combined = _replace_col(combined, "episode_index", sorted(new_ep))
+        lengths = [int(x) for x in combined["length"].to_pylist()]
+        starts: list[int] = []
+        cursor = 0
+        for length in lengths:
+            starts.append(cursor)
+            cursor += length
+        combined = _replace_col(combined, "dataset_from_index", starts)
+        combined = _replace_col(combined, "dataset_to_index", [s + length for s, length in zip(starts, lengths)])
+        # Collapse to a single meta/episodes file (index 0/0) so the layout stays
+        # consistent after removing a row.
+        combined = _replace_col(combined, "meta/episodes/chunk_index", [0] * combined.num_rows)
+        combined = _replace_col(combined, "meta/episodes/file_index", [0] * combined.num_rows)
+        _atomic_write_table(combined, meta_ep_files[0])
+        for extra in meta_ep_files[1:]:
+            extra.unlink()
+
+    # 3) info.json: episode/frame totals and the single-split range.
+    info_path = dataset_root / "meta" / "info.json"
+    info = _load_dataset_info(dataset_root)
+    if info:
+        info["total_episodes"] = max(int(info.get("total_episodes") or 0) - 1, 0)
+        info["total_frames"] = total_frames
+        splits = info.get("splits")
+        if isinstance(splits, dict) and "train" in splits:
+            splits["train"] = f"0:{info['total_episodes']}"
+        tmp = info_path.with_name(f".info.json.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, info_path)
+
+
+def _renumber_gmsl2_episode_dirs(dataset_root: Path, episode: int, mapping: dict[int, int]) -> None:
+    # gmsl2 datasets store one self-contained directory per episode and derive
+    # the episode index purely from the directory name, so renumbering is a
+    # rmtree of the victim plus a contiguous rename of the survivors.
+    eps_dir = dataset_root / "episodes"
+    victim = eps_dir / f"episode_{episode:06d}"
+    if victim.is_dir():
+        shutil.rmtree(victim)
+    # Rename in ascending old-index order so every destination slot is free
+    # before we move into it.
+    for old in sorted(k for k in mapping if k > episode):
+        src = eps_dir / f"episode_{old:06d}"
+        dst = eps_dir / f"episode_{mapping[old]:06d}"
+        if src.is_dir() and not dst.exists():
+            os.replace(src, dst)
+
+
+def _delete_gmsl2_episode(dataset_root: Path, episode: int, mapping: dict[int, int]) -> None:
+    # Pure gmsl2 dataset (no v3 parquet): the episode dirs *are* the dataset.
+    _renumber_gmsl2_episode_dirs(dataset_root, episode, mapping)
+    # Derived AprilTag EE-pose sidecars are indexed by the old episode numbers
+    # and can't be trusted after renumbering; drop them so replay regenerates.
+    derived = dataset_root / "derived"
+    if derived.is_dir():
+        shutil.rmtree(derived, ignore_errors=True)
+
+
+def _reindex_episode_side_metadata(
+    dataset_root: Path, mapping: dict[int, int], deleted_episode: int
+) -> None:
+    # Annotations: { "annotations": { "<episode>": {..., "episode": <n>} } }
+    try:
+        store = _read_annotation_store(dataset_root)
+        annotations = store.get("annotations")
+        if isinstance(annotations, dict):
+            remapped: dict[str, Any] = {}
+            for key, value in annotations.items():
+                try:
+                    old = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if old == deleted_episode or old not in mapping:
+                    continue
+                new = mapping[old]
+                if isinstance(value, dict):
+                    value = {**value, "episode": new}
+                remapped[str(new)] = value
+            store["annotations"] = remapped
+            _write_annotation_store(dataset_root, store)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    # Mujoco validations: { "validations": [ {..., "episode": n, "datasetRoot": p} ] }
+    try:
+        payload = _read_validation_store(dataset_root)
+        validations = payload.get("validations")
+        if isinstance(validations, list):
+            reindexed: list[dict[str, Any]] = []
+            for item in validations:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    old = int(item.get("episode"))
+                except (TypeError, ValueError):
+                    continue
+                if old == deleted_episode or old not in mapping:
+                    continue
+                reindexed.append({**item, "episode": mapping[old], "datasetRoot": str(dataset_root)})
+            payload["validations"] = reindexed
+            path = _validation_store_path(dataset_root)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            tmp_path.replace(path)
+    except (OSError, json.JSONDecodeError):
+        pass
 
 
 def _load_dataset_info(dataset_root: Path) -> dict[str, Any]:
@@ -5960,6 +6245,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/replay/select-episode":
                     _select_replay_episode(self.server.state, query.get("episode", [""])[0])
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/replay/delete-episode":
+                    _delete_replay_episode(self.server.state, query.get("episode", [""])[0])
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/replay/start":

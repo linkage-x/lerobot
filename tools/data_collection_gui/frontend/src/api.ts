@@ -320,6 +320,22 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
+  async deleteReplayEpisode(episode: number): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot(`/api/replay/delete-episode?episode=${episode}`);
+    if (remote) {
+      return remote;
+    }
+    // No gateway: deletion rewrites on-disk parquet/videos and cannot be mocked.
+    // Surface the failure instead of pretending the episode is gone.
+    await wait(140);
+    this.snapshot.replay = {
+      ...this.snapshot.replay,
+      message: "Gateway unavailable; episode deletion needs the backend and cannot be mocked"
+    };
+    this.log("error", `Delete episode ${episode} blocked because gateway is unavailable`);
+    return this.getSnapshot();
+  }
+
   async startReplay(realRobot: boolean): Promise<GuiSnapshot> {
     const remote = await this.postRemoteSnapshot(realRobot ? "/api/replay/start-real" : "/api/replay/start");
     if (remote) {

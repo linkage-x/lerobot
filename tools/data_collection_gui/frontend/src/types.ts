@@ -126,6 +126,9 @@ export type ReplayStatus = {
   pid?: number | null;
   lastOutput?: string;
   mujocoValidation?: MujocoValidation;
+  // Bumped when the dataset content changes under an unchanged (root, episode)
+  // selection (e.g. after deleting an episode); the inspector refetches on it.
+  revision?: number;
 };
 
 export type MujocoValidation = {

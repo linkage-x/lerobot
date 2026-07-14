@@ -232,12 +232,17 @@ export function ReplayInspector({
   api,
   datasetPath,
   episode,
-  fallbackFps
+  fallbackFps,
+  revision = 0
 }: {
   api: DataCollectionGuiApi;
   datasetPath: string;
   episode: number;
   fallbackFps: number;
+  // Changes when the dataset content behind an unchanged (datasetPath, episode)
+  // selection is mutated (e.g. deleting an episode renumbers the survivors into
+  // the same slot). Part of the fetch effect deps so the timeline refetches.
+  revision?: number;
 }) {
   const [timeline, setTimeline] = useState<ReplayTimeline | null>(null);
   const [loading, setLoading] = useState(false);
@@ -287,7 +292,7 @@ export function ReplayInspector({
     return () => {
       cancelled = true;
     };
-  }, [api, datasetPath, episode]);
+  }, [api, datasetPath, episode, revision]);
 
   const fps = timeline?.fps ?? fallbackFps;
   const backendTotalFrames = timeline?.totalFrames ?? 0;

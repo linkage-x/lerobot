@@ -1018,12 +1018,14 @@ function EpisodeSelector({
   status,
   annotation,
   busy,
-  onSelectEpisode
+  onSelectEpisode,
+  onDeleteEpisode
 }: {
   status: ReplayStatus;
   annotation?: EpisodeAnnotation;
   busy: boolean;
   onSelectEpisode: (episode: number) => void;
+  onDeleteEpisode: (episode: number) => void;
 }) {
   const [pendingEpisode, setPendingEpisode] = useState<number | null>(null);
   const [episodeInput, setEpisodeInput] = useState(String(status.episode ?? 0));
@@ -1034,6 +1036,25 @@ function EpisodeSelector({
   const currentIndex = options.indexOf(current);
   const hasPrevious = currentIndex > 0;
   const hasNext = currentIndex >= 0 && currentIndex < options.length - 1;
+  // Guard against wiping the dataset: the backend also refuses, but hide the
+  // action entirely when only one episode is left so it can't be attempted.
+  const canDelete = !busy && currentIndex >= 0 && options.length > 1;
+
+  const requestDelete = () => {
+    if (!canDelete) {
+      return;
+    }
+    const confirmed = window.confirm(
+      `Delete episode ${current}? This permanently removes its frames and videos from disk and ` +
+        `renumbers the remaining ${options.length - 1} episode(s). This cannot be undone.`
+    );
+    if (confirmed) {
+      // Don't touch pendingEpisode here: that state tracks episode *switches* and
+      // deleting the tail lands on a different index, which would leave it stuck.
+      // The busy flag already disables the controls while the delete runs.
+      onDeleteEpisode(current);
+    }
+  };
   const switching = pendingEpisode != null && (busy || pendingEpisode !== current);
   const inputEpisode = episodeInput.trim() === "" ? NaN : Number(episodeInput);
   const inputIsInteger = Number.isInteger(inputEpisode);
@@ -1107,6 +1128,14 @@ function EpisodeSelector({
           <button disabled={!canGoToInput} onClick={submitEpisodeInput}>Go</button>
         </div>
         <button disabled={busy || !hasNext} onClick={() => selectEpisode(options[currentIndex + 1])}>Next</button>
+        <button
+          className="danger"
+          disabled={!canDelete}
+          title="Delete this episode from disk and reindex the rest"
+          onClick={requestDelete}
+        >
+          Delete
+        </button>
       </div>
       <div className="episode-badges">
         {annotation?.outcome && annotation.outcome !== "unreviewed" && (
@@ -1134,6 +1163,7 @@ function EpisodeReplayPage({
   onAbort,
   onSelectDataset,
   onSelectEpisode,
+  onDeleteEpisode,
   onGenerateForActive,
   onOpenProcessing,
   onSaveAnnotation
@@ -1146,6 +1176,7 @@ function EpisodeReplayPage({
   onAbort: () => void;
   onSelectDataset: (path: string) => void;
   onSelectEpisode: (episode: number) => void;
+  onDeleteEpisode: (episode: number) => void;
   onGenerateForActive: () => void;
   onOpenProcessing: () => void;
   onSaveAnnotation: (annotation: EpisodeAnnotation) => void;
@@ -1179,8 +1210,8 @@ function EpisodeReplayPage({
           onAbort={onAbort}
         />
       </div>
-      <EpisodeSelector status={snapshot.replay} annotation={snapshot.annotation} busy={busy} onSelectEpisode={onSelectEpisode} />
-      <ReplayInspector api={api} datasetPath={activePath} episode={snapshot.replay.episode} fallbackFps={snapshot.replay.fps} />
+      <EpisodeSelector status={snapshot.replay} annotation={snapshot.annotation} busy={busy} onSelectEpisode={onSelectEpisode} onDeleteEpisode={onDeleteEpisode} />
+      <ReplayInspector api={api} datasetPath={activePath} episode={snapshot.replay.episode} fallbackFps={snapshot.replay.fps} revision={snapshot.replay.revision ?? 0} />
       <EpisodeAnnotationPanel
         annotation={snapshot.annotation}
         datasetPath={activePath}
@@ -2782,6 +2813,7 @@ function App() {
         onAbort={() => run(() => api.abortReplay())}
         onSelectDataset={(path) => run(() => api.selectRecordedDataset(path))}
         onSelectEpisode={(episode) => run(() => api.selectReplayEpisode(episode))}
+        onDeleteEpisode={(episode) => run(() => api.deleteReplayEpisode(episode))}
         onGenerateForActive={() => replayMatch && queueTrajGenAndOpenProcessing(replayMatch.path)}
         onOpenProcessing={() => navigate("dataset-processing")}
         onSaveAnnotation={(annotation) => run(() => api.saveEpisodeAnnotation(annotation))}
