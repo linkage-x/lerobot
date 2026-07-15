@@ -23,7 +23,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
@@ -230,10 +230,15 @@ class GatewayState:
     cached_trajectory_meta: dict[str, Any] = field(default_factory=dict)
     cached_processing_items: list[dict[str, Any]] = field(default_factory=list)
     dataset_cache_ready: bool = False
+    processing_cache_ready: bool = False
     # Cheap fingerprint (dataset dir names + top-level mtimes) of the last scan;
     # lets the refresher skip the expensive 253-dataset walk when nothing changed
     # so its GIL-heavy scan stops starving the HTTP handlers (snapshot/camera.jpg).
     dataset_scan_signature: tuple = ()
+    # Processing is intentionally cached separately from recordedDatasets and
+    # trajectory. Trajectory scans are expensive; processing status changes often
+    # during EE generation and must not force a full dataset/trajectory rescan.
+    processing_scan_signature: tuple = ()
 
     def log(self, level: str, message: str) -> None:
         self.events.insert(
@@ -818,6 +823,7 @@ def _dataset_kind(state: GatewayState, dataset_root: Path) -> str:
 
 _REPLAY_CANDIDATES_MEMO: tuple[float, list[Path]] | None = None
 _REPLAY_CANDIDATES_TTL_S = 3.0
+_PROCESSING_STALE_RUNNING_S = 120.0
 
 
 def _complete_replay_dataset_candidates(state: GatewayState) -> list[Path]:
@@ -1675,7 +1681,12 @@ def _online_sync_manifest_check(dataset_root: Path) -> tuple[dict[str, Any] | No
     }
 
 
-def _processing_item_from_dataset(dataset_root: Path) -> dict[str, Any]:
+def _processing_item_from_dataset(
+    dataset_root: Path,
+    *,
+    attached_processes: set[str] | None = None,
+    now_s: float | None = None,
+) -> dict[str, Any]:
     info = _load_dataset_info(dataset_root)
     modified_s = _dataset_modified_s(dataset_root)
     if _has_gmsl2_episodes(dataset_root):
@@ -1705,8 +1716,17 @@ def _processing_item_from_dataset(dataset_root: Path) -> dict[str, Any]:
         version_info = versions.get(active_version) if isinstance(active_version, str) else None
         qc = version_info.get("qc") if isinstance(version_info, dict) else None
         if isinstance(current_job, dict) and current_job.get("status") in ("queued", "running"):
-            status = current_job["status"]
+            status = str(current_job["status"])
             message = current_job.get("message") or f"{current_job.get('kind') or 'job'} {status}"
+            if attached_processes is not None and str(dataset_root) not in attached_processes:
+                updated_s = _parse_iso_epoch_s(current_job.get("updated_at"))
+                age_s = (time.time() if now_s is None else now_s) - updated_s if updated_s is not None else None
+                if age_s is None or age_s > _PROCESSING_STALE_RUNNING_S:
+                    status = "error"
+                    message = (
+                        "EE trajectory job is stale: metadata says running, "
+                        "but this gateway is not attached to a live process"
+                    )
         elif isinstance(current_job, dict) and current_job.get("status") in ("failed", "error"):
             status = "error"
             message = current_job.get("message") or f"{current_job.get('kind') or 'job'} failed"
@@ -1797,8 +1817,16 @@ def _complete_dataset_candidates(state: GatewayState) -> list[Path]:
     return [root for root in _dataset_root_candidates(state) if _dataset_is_complete(root)]
 
 
-def _processing_items(state: GatewayState) -> list[dict[str, Any]]:
-    return [_processing_item_from_dataset(root) for root in _complete_dataset_candidates(state)]
+def _processing_items(
+    state: GatewayState,
+    *,
+    attached_processes: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    now_s = time.time()
+    return [
+        _processing_item_from_dataset(root, attached_processes=attached_processes, now_s=now_s)
+        for root in _complete_dataset_candidates(state)
+    ]
 
 
 def _set_datasets_root(state: GatewayState, raw_path: str) -> bool:
@@ -1823,6 +1851,10 @@ def _set_datasets_root(state: GatewayState, raw_path: str) -> bool:
         created = True
     state.datasets_root = resolved
     state.selected_replay_root = None
+    state.dataset_cache_ready = False
+    state.processing_cache_ready = False
+    state.dataset_scan_signature = ()
+    state.processing_scan_signature = ()
     return created
 
 
@@ -1874,6 +1906,18 @@ def _mock_calibrate_cameras(state: GatewayState) -> None:
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
+
+
+def _parse_iso_epoch_s(value: Any) -> float | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        if text.endswith("Z"):
+            return time.mktime(time.strptime(text[:-1], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+        return time.mktime(time.strptime(text, "%Y-%m-%dT%H:%M:%S"))
+    except (OverflowError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -2926,44 +2970,54 @@ def _read_traj_gen_output(
                 continue
             log_tail = [*log_tail, output][-24:]
             with state.lock:
-                if state.processing_processes.get(str(dataset_root)) is not process:
-                    return
-                _update_traj_gen_meta(
-                    dataset_root,
-                    job_id=job_id,
-                    status="running",
-                    message=output,
-                    log_tail=log_tail,
-                )
+                still_current = state.processing_processes.get(str(dataset_root)) is process
+            if not still_current:
+                return
+            _update_traj_gen_meta(
+                dataset_root,
+                job_id=job_id,
+                status="running",
+                message=output,
+                log_tail=log_tail,
+            )
+            _refresh_cached_processing_item(state, dataset_root)
     exit_code = process.wait()
     with state.lock:
-        if state.processing_processes.get(str(dataset_root)) is process:
+        still_current = state.processing_processes.get(str(dataset_root)) is process
+        if still_current:
             state.processing_processes.pop(str(dataset_root), None)
-        existing = _load_processing_meta(dataset_root) or {}
-        versions = existing.get("versions") if isinstance(existing.get("versions"), dict) else {}
-        if exit_code == 0:
-            version = _next_processing_version(versions)
-            message = "EE trajectory generated from AprilTag cube tracking"
-            _update_traj_gen_meta(
-                dataset_root,
-                job_id=job_id,
-                status="complete",
-                message=message,
-                log_tail=[*log_tail, f"[traj-gen] complete exit_code={exit_code}"][-24:],
-                version=version,
-                exit_code=exit_code,
-            )
+    if not still_current:
+        return
+
+    existing = _load_processing_meta(dataset_root) or {}
+    versions = existing.get("versions") if isinstance(existing.get("versions"), dict) else {}
+    if exit_code == 0:
+        version = _next_processing_version(versions)
+        message = "EE trajectory generated from AprilTag cube tracking"
+        _update_traj_gen_meta(
+            dataset_root,
+            job_id=job_id,
+            status="complete",
+            message=message,
+            log_tail=[*log_tail, f"[traj-gen] complete exit_code={exit_code}"][-24:],
+            version=version,
+            exit_code=exit_code,
+        )
+        _refresh_cached_processing_item(state, dataset_root)
+        with state.lock:
             state.log("info", f"Generated EE trajectory for {dataset_root.name} as {version}")
-        else:
-            message = f"EE trajectory generation failed with exit code {exit_code}"
-            _update_traj_gen_meta(
-                dataset_root,
-                job_id=job_id,
-                status="failed",
-                message=message,
-                log_tail=[*log_tail, f"[traj-gen] failed exit_code={exit_code}"][-24:],
-                exit_code=exit_code,
-            )
+    else:
+        message = f"EE trajectory generation failed with exit code {exit_code}"
+        _update_traj_gen_meta(
+            dataset_root,
+            job_id=job_id,
+            status="failed",
+            message=message,
+            log_tail=[*log_tail, f"[traj-gen] failed exit_code={exit_code}"][-24:],
+            exit_code=exit_code,
+        )
+        _refresh_cached_processing_item(state, dataset_root)
+        with state.lock:
             state.log("warn", f"{message}: {dataset_root}")
 
 
@@ -2985,6 +3039,7 @@ def _queue_traj_gen(state: GatewayState, dataset_root: Path) -> None:
         message=f"Running AprilTag cube tracking for {dataset_root.name}",
         log_tail=[f"[traj-gen] {' '.join(command)}"],
     )
+    _refresh_cached_processing_item(state, dataset_root)
     try:
         process = subprocess.Popen(
             command,
@@ -3004,8 +3059,10 @@ def _queue_traj_gen(state: GatewayState, dataset_root: Path) -> None:
             message=f"Failed to start EE trajectory generation: {exc}",
             log_tail=[f"[traj-gen] failed to start: {exc}"],
         )
+        _refresh_cached_processing_item(state, dataset_root)
         raise
     state.processing_processes[key] = process
+    _refresh_cached_processing_item(state, dataset_root)
     state.log("info", f"Started EE trajectory generation pid={process.pid} dataset={dataset_root}")
     _start_traj_gen_output_reader(state, dataset_root, process, job_id)
 
@@ -3326,13 +3383,63 @@ def _camera_keys(info: dict[str, Any]) -> list[str]:
     return keys
 
 
-def _ee_pose_from_row(row: dict[str, Any], action_names: list[str], state_names: list[str]) -> dict[str, Any] | None:
+def _fixed_pose7_from_row(row: dict[str, Any], key: str) -> dict[str, float] | None:
+    values = _as_float_list(row.get(key))
+    if len(values) < 3:
+        return None
+    x, y, z = values[:3]
+    if not all(math.isfinite(value) for value in (x, y, z)):
+        return None
+    qx = values[3] if len(values) > 3 and math.isfinite(values[3]) else 0.0
+    qy = values[4] if len(values) > 4 and math.isfinite(values[4]) else 0.0
+    qz = values[5] if len(values) > 5 and math.isfinite(values[5]) else 0.0
+    qw = values[6] if len(values) > 6 and math.isfinite(values[6]) else 1.0
+    return {"x": x, "y": y, "z": z, "qx": qx, "qy": qy, "qz": qz, "qw": qw}
+
+
+def _preferred_exported_ee_pose_cube(info: dict[str, Any]) -> str | None:
+    features = info.get("features") or {}
+    if not isinstance(features, dict):
+        return None
+    for cube_name in DEFAULT_CUBE_TRAJECTORY_NAMES:
+        if (
+            f"observation.ee_pose.{cube_name}.base" in features
+            or f"action.ee_pose.{cube_name}.base" in features
+        ):
+            return cube_name
+    return None
+
+
+def _preferred_cube_pose_name(names: Iterable[str]) -> str | None:
+    available = set(names)
+    for cube_name in DEFAULT_CUBE_TRAJECTORY_NAMES:
+        if cube_name in available:
+            return cube_name
+    return next(iter(available), None)
+
+
+def _ee_pose_from_row(
+    row: dict[str, Any],
+    action_names: list[str],
+    state_names: list[str],
+    *,
+    exported_pose_cube: str | None = None,
+) -> dict[str, Any] | None:
     action_values = _as_float_list(row.get("action"))
     state_values = _as_float_list(row.get("observation.state"))
 
-    # observation.state holds the actual robot pose (smooth); action holds commanded
-    # waypoints that jump between targets. Prefer state for the EE transform.
-    pose = _extract_ee_axes(state_names, state_values) or _extract_ee_axes(action_names, action_values)
+    # Exported datasets store EE pose as independent fixed-size pose columns.
+    # Use one stable source for the whole timeline; per-frame fallback between
+    # left/right/head mixes different tracked objects into one impossible path.
+    pose = None
+    if exported_pose_cube is not None:
+        pose = _fixed_pose7_from_row(row, f"observation.ee_pose.{exported_pose_cube}.base")
+        if pose is None:
+            pose = _fixed_pose7_from_row(row, f"action.ee_pose.{exported_pose_cube}.base")
+
+    # Legacy v3 datasets embed EE pose dimensions inside observation.state/action.
+    if pose is None:
+        pose = _extract_ee_axes(state_names, state_values) or _extract_ee_axes(action_names, action_values)
     if pose is None:
         return None
 
@@ -3342,6 +3449,29 @@ def _ee_pose_from_row(row: dict[str, Any], action_names: list[str], state_names:
         gripper = _extract_gripper(action_names, action_values)
 
     return {**pose, "gripper": gripper}
+
+
+def _force_vector_from_state(state_names: list[str], state_values: list[float]) -> dict[str, float] | None:
+    values: dict[str, float] = {}
+    for axis in ("fx", "fy", "fz"):
+        target = f"box_six_d_force.{axis}"
+        try:
+            index = state_names.index(target)
+        except ValueError:
+            return None
+        if index >= len(state_values):
+            return None
+        value = float(state_values[index])
+        values[axis] = value if math.isfinite(value) else 0.0
+    magnitude = math.sqrt(values["fx"] ** 2 + values["fy"] ** 2 + values["fz"] ** 2)
+    return {"x": values["fx"], "y": values["fy"], "z": values["fz"], "magnitude": magnitude}
+
+
+def _ee_pose_from_cube_poses(
+    cube_poses: dict[str, dict[str, Any]],
+    cube_name: str | None,
+) -> dict[str, Any] | None:
+    return cube_poses.get(cube_name) if cube_name is not None else None
 
 
 def _cube_pose_from_parquet_row(row: dict[str, Any], info: dict[str, Any], cube_name: str) -> dict[str, Any] | None:
@@ -4184,6 +4314,7 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
     sidecar_cube_poses = _read_sidecar_cube_poses(dataset_root, ep_idx)
     cube_pose_names = [n for n in DEFAULT_CUBE_TRAJECTORY_NAMES if n in sidecar_cube_poses]
     cube_pose_names += [n for n in sidecar_cube_poses if n not in cube_pose_names]
+    ee_pose_cube_name = _preferred_cube_pose_name(cube_pose_names)
     box_fallback = _box_snapshot_rows_for_replay(ep_meta, fps=fps, total_frames=total_frames)
     state_names = box_fallback[0] if box_fallback else []
     action_names = box_fallback[1] if box_fallback else []
@@ -4196,14 +4327,20 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
             cube_pose = sidecar_cube_poses.get(cube_name, {}).get(i)
             if cube_pose is not None:
                 cube_poses[cube_name] = cube_pose
-        frames.append({
+        state_values = list(box_rows.get(i, {}).get("state", []))
+        action_values = list(box_rows.get(i, {}).get("action", []))
+        frame = {
             "frame": i,
             "timestamp": pts_offset_s + i / max(fps, 1),
-            "state": list(box_rows.get(i, {}).get("state", [])),
-            "action": list(box_rows.get(i, {}).get("action", [])),
-            "eePose": {},
+            "state": state_values,
+            "action": action_values,
+            "eePose": _ee_pose_from_cube_poses(cube_poses, ee_pose_cube_name) or {},
             "cubePoses": cube_poses,
-        })
+        }
+        force_vector = _force_vector_from_state(state_names, state_values)
+        if force_vector is not None:
+            frame["forceVector"] = force_vector
+        frames.append(frame)
     _attach_touch_frames(frames, ep_dir, video_warmup_s=video_warmup_s)
     return {
         "datasetRoot": str(dataset_root),
@@ -4306,6 +4443,8 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
     for cube_name in sidecar_cube_poses:
         if cube_name not in cube_pose_names:
             cube_pose_names.append(cube_name)
+    exported_ee_pose_cube = _preferred_exported_ee_pose_cube(info)
+    sidecar_ee_pose_cube = _preferred_cube_pose_name(cube_pose_names)
 
     ep_dir: Path | None = None
     ep_meta: dict[str, Any] = {}
@@ -4331,7 +4470,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         fallback_box = box_rows.get(frame_index)
         state_values = list(fallback_box.get("state", [])) if fallback_box else _as_float_list(row.get("observation.state"))
         action_values = list(fallback_box.get("action", [])) if fallback_box else _as_float_list(row.get("action"))
-        pose = _ee_pose_from_row(row, action_names, state_names) or {}
+        pose = _ee_pose_from_row(row, action_names, state_names, exported_pose_cube=exported_ee_pose_cube) or {}
         cube_poses: dict[str, dict[str, Any]] = {}
         for cube_name in cube_pose_names:
             cube_pose = sidecar_cube_poses.get(cube_name, {}).get(frame_index)
@@ -4339,6 +4478,8 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
                 cube_pose = _cube_pose_from_parquet_row(row, info, cube_name)
             if cube_pose is not None:
                 cube_poses[cube_name] = cube_pose
+        if not pose:
+            pose = _ee_pose_from_cube_poses(cube_poses, sidecar_ee_pose_cube) or {}
         frame = {
             "frame": frame_index,
             "timestamp": timestamp,
@@ -4348,6 +4489,9 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
             "cubePoses": cube_poses,
             "videoOverlays": video_cube_overlays.get(frame_index, {}),
         }
+        force_vector = _force_vector_from_state(state_names, state_values)
+        if force_vector is not None:
+            frame["forceVector"] = force_vector
         touch = _touch_from_parquet_row(row, info)
         if touch:
             frame["touch"] = touch
@@ -5565,6 +5709,74 @@ def _dataset_scan_signature(state: GatewayState) -> tuple:
     return tuple(sig)
 
 
+def _processing_scan_signature(state: GatewayState) -> tuple:
+    """Fingerprint processing metadata without walking trajectory outputs.
+
+    It intentionally includes ``meta/processing.json`` mtime/size so EE trajectory
+    progress and completion can update the Processing page without invalidating
+    the heavier recorded dataset / trajectory cache.
+    """
+    sig: list[tuple[str, int, int, int]] = []
+    for root in _complete_dataset_candidates(state):
+        try:
+            root_mtime_ns = root.stat().st_mtime_ns
+        except OSError:
+            root_mtime_ns = 0
+        meta_path = _processing_meta_path(root)
+        try:
+            meta_stat = meta_path.stat()
+            meta_mtime_ns = meta_stat.st_mtime_ns
+            meta_size = meta_stat.st_size
+        except OSError:
+            meta_mtime_ns = 0
+            meta_size = 0
+        sig.append((str(root), root_mtime_ns, meta_mtime_ns, meta_size))
+    sig.sort()
+    return tuple(sig)
+
+
+def _processing_cache_has_inflight(state: GatewayState) -> bool:
+    return any(
+        item.get("status") in ("queued", "running")
+        for item in state.cached_processing_items
+    )
+
+
+def _refresh_cached_processing_item(state: GatewayState, dataset_root: Path) -> None:
+    with state.lock:
+        attached = set(state.processing_processes.keys())
+    item = _processing_item_from_dataset(dataset_root, attached_processes=attached, now_s=time.time())
+    target = str(dataset_root)
+    with state.lock:
+        items = list(state.cached_processing_items)
+        for index, existing in enumerate(items):
+            if existing.get("path") == target:
+                items[index] = item
+                break
+        else:
+            items.insert(0, item)
+        state.cached_processing_items = items
+        state.processing_cache_ready = True
+
+
+def _refresh_processing_cache(state: GatewayState) -> None:
+    signature = _processing_scan_signature(state)
+    with state.lock:
+        attached = set(state.processing_processes.keys())
+        unchanged = (
+            state.processing_cache_ready
+            and signature == state.processing_scan_signature
+            and not _processing_cache_has_inflight(state)
+        )
+    if unchanged:
+        return
+    processing = _processing_items(state, attached_processes=attached)
+    with state.lock:
+        state.cached_processing_items = processing
+        state.processing_cache_ready = True
+        state.processing_scan_signature = signature
+
+
 def _refresh_dataset_stats_cache(state: GatewayState) -> None:
     """Compute the expensive dataset scan OFF the lock and publish the result.
 
@@ -5584,7 +5796,6 @@ def _refresh_dataset_stats_cache(state: GatewayState) -> None:
         return
     items = _recorded_dataset_items(state)
     trajectory, meta = _read_recorded_trajectory(state)
-    processing = _processing_items(state)  # also an O(datasets) FS scan; cache it
     with state.lock:
         selected_now = str(state.selected_replay_root.resolve()) if state.selected_replay_root is not None else ""
         episode_now = int(state.replay.episode or 0)
@@ -5597,7 +5808,6 @@ def _refresh_dataset_stats_cache(state: GatewayState) -> None:
         state.cached_recorded_datasets = items
         state.cached_trajectory = trajectory
         state.cached_trajectory_meta = meta
-        state.cached_processing_items = processing
         state.dataset_cache_ready = True
         state.dataset_scan_signature = signature
 
@@ -5608,6 +5818,10 @@ def _dataset_stats_refresher(state: GatewayState, interval_s: float = 10.0) -> N
             _refresh_dataset_stats_cache(state)
         except Exception as exc:  # keep refreshing despite transient FS errors
             state.log("warn", f"dataset stats refresh failed: {exc}")
+        try:
+            _refresh_processing_cache(state)
+        except Exception as exc:
+            state.log("warn", f"processing cache refresh failed: {exc}")
         time.sleep(interval_s)
 
 
@@ -6659,6 +6873,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     except OSError as exc:
                         _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"failed to persist QC: {exc}"})
                         return
+                    _refresh_cached_processing_item(self.server.state, dataset_root)
                     self.server.state.log(
                         "info" if qc_result["status"] == "pass" else "warn",
                         f"QC {qc_result['status']} for {dataset_root.name}: {qc_result['summary']}",

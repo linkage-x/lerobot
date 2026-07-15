@@ -318,6 +318,13 @@ export type TouchPadFrame = {
   activePoints?: number;
 };
 
+export type ForceVector = {
+  x: number;
+  y: number;
+  z: number;
+  magnitude?: number;
+};
+
 export type ReplayTimelineFrame = {
   frame: number;
   timestamp: number;
@@ -325,6 +332,7 @@ export type ReplayTimelineFrame = {
   action: number[];
   eePose?: Partial<EePose>;
   touch?: Record<string, TouchPadFrame | undefined>;
+  forceVector?: ForceVector;
   cubePoses?: Record<string, Partial<EePose>>;
   videoOverlays?: Record<string, CubeVideoOverlay[]>;
 };

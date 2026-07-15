@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Pose3DViewer } from "./Pose3DViewer";
 import { SeriesPlot } from "./SeriesPlot";
 import type { DataCollectionGuiApi } from "./api";
-import type { CubeVideoOverlay, EePose, ReplayTimeline, ReplayTimelineFrame, TouchPadFrame } from "./types";
+import type { CubeVideoOverlay, EePose, ForceVector, ReplayTimeline, ReplayTimelineFrame, TouchPadFrame } from "./types";
 
 const cubeColors: Record<string, number> = {
   left: 0xc2410c,
@@ -149,6 +149,17 @@ function ensureFullPose(pose: ReplayTimelineFrame["eePose"]): EePose | null {
     qw: qw ?? 1,
     gripper: gripper == null ? null : gripper
   };
+}
+
+function ensureForceVector(force: ReplayTimelineFrame["forceVector"]): ForceVector | null {
+  if (!force || force.x == null || force.y == null || force.z == null) {
+    return null;
+  }
+  const magnitude = force.magnitude ?? Math.hypot(force.x, force.y, force.z);
+  if (![force.x, force.y, force.z, magnitude].every(Number.isFinite)) {
+    return null;
+  }
+  return { x: force.x, y: force.y, z: force.z, magnitude };
 }
 
 function CubeOverlayCanvas({
@@ -447,6 +458,7 @@ export function ReplayInspector({
   // early-return below has a chance to render the placeholder panel.
   const frame: ReplayTimelineFrame | undefined = timeline?.frames?.[currentFrame];
   const pose = ensureFullPose(frame?.eePose);
+  const forceVector = ensureForceVector(frame?.forceVector);
   const touchMax = useMemo(() => touchScaleMax(timeline), [timeline]);
   const cubePoseNames = useMemo(() => {
     if (!timeline) {
@@ -658,6 +670,9 @@ export function ReplayInspector({
             <span>
               gripper <strong>{pose.gripper == null ? "—" : pose.gripper.toFixed(3)}</strong>
             </span>
+            <span>
+              F [<strong>{forceVector?.x.toFixed(3) ?? "—"}</strong>, <strong>{forceVector?.y.toFixed(3) ?? "—"}</strong>, <strong>{forceVector?.z.toFixed(3) ?? "—"}</strong>] N |F| <strong>{forceVector?.magnitude?.toFixed(3) ?? "—"}</strong>
+            </span>
             <span className="pose-debug">
               raw fields: [{frame?.eePose ? Object.keys(frame.eePose).join(", ") : "(none)"}]
             </span>
@@ -679,6 +694,7 @@ export function ReplayInspector({
         <Pose3DViewer
           trajectory={trajectory}
           currentPose={pose}
+          forceVector={forceVector}
           extraTrajectories={cubeTrajectories}
           currentExtraPoses={currentCubePoses}
         />
