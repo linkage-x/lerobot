@@ -1199,7 +1199,7 @@ function EpisodeReplayPage({
 }) {
   const activePath = snapshot.replay.datasetRoot ?? snapshot.replay.dataset;
   const matchingProcessing =
-    snapshot.processing.find((item) => item.path === activePath) ?? snapshot.processing[0] ?? null;
+    snapshot.processing.find((item) => item.path === activePath) ?? null;
   return (
     <div className="page-stack">
       <PageHeader title="Episode Replay" subtitle="consume processed trajectories: timeline review, safety preflight, dry-run, and real-robot replay" />

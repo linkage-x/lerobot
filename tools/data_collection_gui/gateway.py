@@ -3181,17 +3181,89 @@ def _parquet_status_from_error(exc: Exception) -> str:
     return "unreadable"
 
 
-def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    for dataset_root in _replay_dataset_candidates(state):
-        if _has_gmsl2_episodes(dataset_root):
-            meta = _dataset_replay_meta(state, dataset_root, {})
-            return [], {
-                **meta,
-                "dataStatus": "loaded",
-                "trajectoryKind": "none",
-                "message": f"GMSL2 raw capture: {meta['totalEpisodes']} episodes, video-only (no robot state)",
-            }
+def _pose_xyz(pose: Any) -> tuple[float, float, float] | None:
+    if not isinstance(pose, dict):
+        return None
+    try:
+        x = float(pose["x"])
+        y = float(pose["y"])
+        z = float(pose["z"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (x, y, z)):
+        return None
+    return x, y, z
 
+
+def _dataset_has_replay_pose_hint(dataset_root: Path, info: dict[str, Any]) -> bool:
+    return bool(
+        _preferred_exported_ee_pose_cube(info)
+        or _action_has_ee_pose(info)
+        or _sidecar_cube_pose_files(dataset_root)
+    )
+
+
+def _trajectory_points_from_timeline(timeline: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    frames = timeline.get("frames") if isinstance(timeline, dict) else []
+    frames = frames if isinstance(frames, list) else []
+    state_names = timeline.get("stateNames") if isinstance(timeline, dict) else []
+    state_names = [str(name) for name in state_names] if isinstance(state_names, list) else []
+    fps = int(timeline.get("fps") or 30) if isinstance(timeline, dict) else 30
+
+    raw_x: list[float] = []
+    raw_y: list[float] = []
+    raw_z: list[float] = []
+    points: list[dict[str, Any]] = []
+    used_pose = False
+    previous_frame: int | None = None
+    previous_timestamp: float | None = None
+
+    for row_index, frame_row in enumerate(frames):
+        if not isinstance(frame_row, dict):
+            continue
+        frame = int(frame_row.get("frame") if frame_row.get("frame") is not None else row_index)
+        timestamp = _first_finite(frame_row.get("timestamp"), default=frame / max(fps, 1))
+        state_values = _as_float_list(frame_row.get("state"))
+        pose_xyz = _pose_xyz(frame_row.get("eePose"))
+        if pose_xyz is not None:
+            used_pose = True
+            raw_x.append(pose_xyz[0])
+            raw_y.append(pose_xyz[1])
+            raw_z.append(pose_xyz[2])
+        else:
+            raw_x.append(float(row_index))
+            raw_y.append(_gripper_width(state_values, state_names))
+            raw_z.append(0.0)
+
+        point: dict[str, Any] = {
+            "frame": frame,
+            "x": 0.0,
+            "y": 0.0,
+            "z": raw_z[-1],
+            "gripperWidthMm": _gripper_width(state_values, state_names),
+            "skewMs": 0.0,
+        }
+        if previous_frame is not None and previous_timestamp is not None:
+            if frame - previous_frame > 1 or timestamp - previous_timestamp > 1.5 / max(fps, 1):
+                point["event"] = "gap"
+        previous_frame = frame
+        previous_timestamp = timestamp
+        points.append(point)
+
+    if not points:
+        return [], False
+
+    normalized_x = _normalize_series(raw_x)
+    normalized_y = _normalize_series(raw_y)
+    normalized_z = _normalize_series(raw_z, low=0.0, high=100.0)
+    for point, x_value, y_value, z_value in zip(points, normalized_x, normalized_y, normalized_z, strict=True):
+        point["x"] = x_value
+        point["y"] = 100.0 - y_value
+        point["z"] = z_value
+    return points, used_pose
+
+
+def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     try:
         import pyarrow.compute as pc
         import pyarrow.parquet as pq
@@ -3217,11 +3289,38 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
         dataset_meta = _dataset_replay_meta(state, dataset_root, info)
         if best_meta is None:
             best_meta = {**dataset_meta, "dataStatus": "missing", "message": "No recorded parquet files found"}
+
+        if _has_gmsl2_episodes(dataset_root):
+            timeline = _read_dataset_timeline(state, dataset_root, None)
+            frames = timeline.get("frames") if isinstance(timeline, dict) else []
+            frames = frames if isinstance(frames, list) else []
+            if frames:
+                points, used_pose = _trajectory_points_from_timeline(timeline)
+                return points, {
+                    **dataset_meta,
+                    "sourcePath": str(timeline.get("sourcePath") or dataset_meta.get("sourcePath") or dataset_root),
+                    "datasetRoot": str(dataset_root),
+                    "episode": int(timeline.get("episode") or 0),
+                    "frames": len(points),
+                    "dataStatus": "loaded",
+                    "trajectoryKind": "pose" if used_pose else "gripper_width",
+                    "message": (
+                        f"Loaded GMSL2 replay episode {int(timeline.get('episode') or 0)} from {dataset_root} ({len(points)} frames with EE pose)"
+                        if used_pose
+                        else f"Loaded GMSL2 replay episode {int(timeline.get('episode') or 0)} from {dataset_root} ({len(points)} frames)"
+                    ),
+                }
+
         data_files = _dataset_data_files(dataset_root)
         for data_file in sorted(data_files, key=lambda path: path.stat().st_mtime, reverse=True):
             try:
                 parquet = pq.ParquetFile(data_file)
                 column_names = parquet.schema_arrow.names
+                pose_columns = [
+                    f"{prefix}.ee_pose.{cube_name}.base"
+                    for prefix in ("observation", "action")
+                    for cube_name in DEFAULT_CUBE_TRAJECTORY_NAMES
+                ]
                 wanted_columns = [
                     column
                     for column in (
@@ -3231,6 +3330,7 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
                         "action",
                         "observation.state",
                         "observation.device_capture_timestamp",
+                        *pose_columns,
                     )
                     if column in column_names
                 ]
@@ -3281,6 +3381,7 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
 
             state_names = _feature_names(info, "observation.state")
             action_names = _feature_names(info, "action")
+            exported_ee_pose_cube = _preferred_exported_ee_pose_cube(info)
             raw_x: list[float] = []
             raw_y: list[float] = []
             raw_z: list[float] = []
@@ -3293,11 +3394,17 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
                 state_values = _as_float_list(row.get("observation.state"))
                 action_values = _as_float_list(row.get("action"))
 
+                pose_xyz = _pose_xyz(_ee_pose_from_row(row, action_names, state_names, exported_pose_cube=exported_ee_pose_cube))
                 vector_values = action_values if len(action_values) >= 3 else state_values
                 vector_names = action_names if len(action_values) >= 3 else state_names
                 x_index, y_index, z_index = _axis_indices(vector_names, vector_values)
 
-                if x_index is not None and y_index is not None and x_index < len(vector_values) and y_index < len(vector_values):
+                if pose_xyz is not None:
+                    used_pose = True
+                    raw_x.append(pose_xyz[0])
+                    raw_y.append(pose_xyz[1])
+                    raw_z.append(pose_xyz[2])
+                elif x_index is not None and y_index is not None and x_index < len(vector_values) and y_index < len(vector_values):
                     used_pose = True
                     raw_x.append(vector_values[x_index])
                     raw_y.append(vector_values[y_index])
@@ -5204,7 +5311,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
             trajectory_meta = {
                 **selected_meta,
                 "dataStatus": _recorded_dataset_status(selected_replay_root),
-                "trajectoryKind": "none",
+                "trajectoryKind": "pose" if _dataset_has_replay_pose_hint(selected_replay_root, selected_info) else "none",
                 "message": f"Selected {_dataset_kind(state, selected_replay_root)} dataset: {selected_replay_root.name}",
             }
     if recorded_datasets and not trajectory_meta.get("datasetRoot"):
