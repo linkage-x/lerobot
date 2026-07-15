@@ -607,7 +607,7 @@ export function ReplayInspector({
               ref={(element) => {
                 videoRefs.current[key] = element;
               }}
-              src={api.videoUrl(timeline.datasetRoot, key)}
+              src={api.videoUrl(timeline.datasetRoot, key, timeline.episode)}
               muted
               playsInline
               // metadata: fetch the mkv header + first frame so the

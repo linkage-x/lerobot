@@ -34,14 +34,16 @@ is longer than the online-sync clip is dropped and a shorter one carry-forwards
 its last reading.
 
 The 6 box sensors are already nearest-neighbour-merged onto the camera grid by
-the recorder; per-episode output ``timestamp`` is re-based to ``i/fps`` to match
-the re-anchored per-episode video. Legacy ``pts_offset``/raw ``box_sensors.jsonl``
-re-alignment is intentionally not part of this exporter.
+the recorder for ``observation.state`` / ``box.timestamps``; per-episode output
+``timestamp`` is re-based to ``i/fps`` to match the re-anchored per-episode
+video. Full touch taxel arrays are preserved from each raw episode's
+``box_sensors.jsonl`` as independent fixed-size v3 columns.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import json
 import logging
@@ -74,6 +76,15 @@ _TRACKING_RUN_SUFFIX = "_thor_april_tracking_in_robot_base"
 _POSE7_NAMES = ("x_m", "y_m", "z_m", "qx", "qy", "qz", "qw")
 _POSE7_FEATURE_NAMES = ("pose.x_m", "pose.y_m", "pose.z_m", "pose.qx", "pose.qy", "pose.qz", "pose.qw")
 _POSE7_NAN = [math.nan] * 7
+_TOUCH_SAMPLE_WIDTH = 239
+_TOUCH_SENSOR_KEYS = ("box_touch_left", "box_touch_right")
+_TOUCH_ARRAY_KEYS = ("fx_0p1N", "fy_0p1N", "fz_0p1N")
+_TOUCH_ARRAY_COLUMNS = tuple(
+    (f"observation.touch.{sensor}.{axis}", sensor, axis)
+    for sensor in _TOUCH_SENSOR_KEYS
+    for axis in _TOUCH_ARRAY_KEYS
+)
+
 
 
 def _emit(text: str) -> None:
@@ -166,6 +177,24 @@ def _camera_entries(meta: dict[str, Any], ep_dir: Path) -> list[tuple[str, Path]
     return [(p.stem, p) for p in sorted(ep_dir.glob("cam_*.mkv"))]
 
 
+def _gmsl2_pts_offset_s(meta: dict[str, Any]) -> float:
+    sync_reference = meta.get("sync_reference") if isinstance(meta, dict) else None
+    if not isinstance(sync_reference, dict):
+        return 0.0
+    t0_wall_s = sync_reference.get("t0_wall_s")
+    camera_first_wall_s = sync_reference.get("camera_first_wall_s")
+    if not isinstance(t0_wall_s, (int, float)) or not isinstance(camera_first_wall_s, dict):
+        return 0.0
+    deltas = [
+        float(wall_s) - float(t0_wall_s)
+        for wall_s in camera_first_wall_s.values()
+        if isinstance(wall_s, (int, float))
+    ]
+    if not deltas:
+        return 0.0
+    return sum(deltas) / len(deltas)
+
+
 def _load_box_rows(session_dir: Path) -> dict[int, list[dict[str, Any]]]:
     """Per-session box parquet rows grouped by local episode_index ({} if none)."""
     parquet = session_dir / "data" / "chunk-000" / "file-000.parquet"
@@ -187,6 +216,120 @@ def _load_box_rows(session_dir: Path) -> dict[int, list[dict[str, Any]]]:
     for rows in by_ep.values():
         rows.sort(key=lambda r: r["frame_index"])
     return by_ep
+
+
+def _touch_sensor_key(sensor_id: str) -> str | None:
+    if sensor_id in _TOUCH_SENSOR_KEYS:
+        return sensor_id
+    if "/" not in sensor_id:
+        return None
+    bare = sensor_id.rsplit("/", 1)[-1]
+    return bare if bare in _TOUCH_SENSOR_KEYS else None
+
+
+def _touch_array_from_data(data: Any, axis: str) -> list[float] | None:
+    if not isinstance(data, dict):
+        return None
+    values = data.get(axis)
+    if not isinstance(values, (list, tuple)):
+        return None
+    out: list[float] = []
+    for value in values[:_TOUCH_SAMPLE_WIDTH]:
+        try:
+            f_value = float(value)
+        except (TypeError, ValueError):
+            f_value = 0.0
+        out.append(f_value if math.isfinite(f_value) else 0.0)
+    if len(out) < _TOUCH_SAMPLE_WIDTH:
+        out.extend([0.0] * (_TOUCH_SAMPLE_WIDTH - len(out)))
+    return out
+
+
+def _touch_sample_from_data(data: Any) -> dict[str, list[float]] | None:
+    sample: dict[str, list[float]] = {}
+    found_array = False
+    for axis in _TOUCH_ARRAY_KEYS:
+        values = _touch_array_from_data(data, axis)
+        if values is not None:
+            found_array = True
+        sample[axis] = values if values is not None else [0.0] * _TOUCH_SAMPLE_WIDTH
+    return sample if found_array else None
+
+
+def _load_touch_samples(ep_dir: Path) -> dict[str, list[tuple[float, dict[str, list[float]]]]]:
+    samples: dict[str, list[tuple[float, dict[str, list[float]]]]] = {sensor: [] for sensor in _TOUCH_SENSOR_KEYS}
+    path = ep_dir / "box_sensors.jsonl"
+    if not path.is_file():
+        return samples
+    try:
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                sensor = _touch_sensor_key(str(row.get("sid") or ""))
+                if sensor is None:
+                    continue
+                try:
+                    t_rel_s = float(row.get("t_rel_s"))
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(t_rel_s):
+                    continue
+                sample = _touch_sample_from_data(row.get("data"))
+                if sample is None:
+                    continue
+                samples[sensor].append((t_rel_s, sample))
+    except OSError:
+        return {sensor: [] for sensor in _TOUCH_SENSOR_KEYS}
+    for sensor_samples in samples.values():
+        sensor_samples.sort(key=lambda item: item[0])
+    return samples
+
+
+def _nearest_touch_sample(
+    samples: list[tuple[float, dict[str, list[float]]]],
+    target_s: float,
+    *,
+    max_age_s: float = 0.25,
+) -> dict[str, list[float]] | None:
+    if not samples:
+        return None
+    times = [item[0] for item in samples]
+    index = bisect.bisect_left(times, target_s)
+    candidates: list[tuple[float, dict[str, list[float]]]] = []
+    if index < len(samples):
+        candidates.append(samples[index])
+    if index > 0:
+        candidates.append(samples[index - 1])
+    if not candidates:
+        return None
+    sample_t, sample = min(candidates, key=lambda item: abs(item[0] - target_s))
+    if abs(sample_t - target_s) > max_age_s:
+        return None
+    return sample
+
+
+def _align_touch_rows(
+    ep_dir: Path,
+    n_frames: int,
+    fps: int,
+    *,
+    pts_offset_s: float = 0.0,
+) -> tuple[dict[str, list[list[float]]], bool]:
+    touch_samples = _load_touch_samples(ep_dir)
+    touch_rows: dict[str, list[list[float]]] = {column: [] for column, _, _ in _TOUCH_ARRAY_COLUMNS}
+    zero = [0.0] * _TOUCH_SAMPLE_WIDTH
+    saw_sample = any(touch_samples.values())
+    for frame_index in range(n_frames):
+        target_s = pts_offset_s + frame_index / max(int(fps), 1)
+        for column, sensor, axis in _TOUCH_ARRAY_COLUMNS:
+            sample = _nearest_touch_sample(touch_samples.get(sensor, []), target_s)
+            touch_rows[column].append(list(sample.get(axis, zero)) if sample is not None else list(zero))
+    return touch_rows, saw_sample
 
 
 # ----------------------------------------------------- box ↔ camera sync ---
@@ -656,6 +799,7 @@ class _V3Writer:
         ts_width: int = 0,
         ts_names: list[str] | None = None,
         pose_columns: list[_PoseColumn] | None = None,
+        touch_columns: tuple[tuple[str, str, str], ...] | None = None,
     ) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -674,6 +818,7 @@ class _V3Writer:
         self.ts_width = ts_width
         self.ts_names = ts_names
         self.pose_columns = list(pose_columns or [])
+        self.touch_columns = list(touch_columns or [])
 
         self.meta_dir = dataset_root / "meta"
         self.episodes_dir = self.meta_dir / "episodes" / "chunk-000"
@@ -696,6 +841,8 @@ class _V3Writer:
             fields.append(("box.timestamps", pa.list_(pa.float64(), self.ts_width)))
         for pose_col in self.pose_columns:
             fields.append((pose_col.key, pa.list_(pa.float32(), 7)))
+        for column, _, _ in self.touch_columns:
+            fields.append((column, pa.list_(pa.float32(), _TOUCH_SAMPLE_WIDTH)))
         fields += [
             ("timestamp", pa.float32()),
             ("frame_index", pa.int64()),
@@ -715,6 +862,7 @@ class _V3Writer:
         video_files: dict[str, Path],  # camera -> mp4 path already written
         ts_rows: list[list[float]] | None = None,
         pose_rows: dict[str, list[list[float]]] | None = None,
+        touch_rows: dict[str, list[list[float]]] | None = None,
     ) -> None:
         start = self.total_frames
         cols: dict[str, list[Any]] = {
@@ -737,6 +885,15 @@ class _V3Writer:
             if len(rows) != n_frames:
                 raise ValueError(f"{pose_col.key} row count mismatch: {len(rows)} != {n_frames}")
             cols[pose_col.key] = rows
+        touch_rows = touch_rows or {}
+        zero_touch = [0.0] * _TOUCH_SAMPLE_WIDTH
+        for column, _, _ in self.touch_columns:
+            rows = touch_rows.get(column)
+            if rows is None:
+                rows = [list(zero_touch) for _ in range(n_frames)]
+            if len(rows) != n_frames:
+                raise ValueError(f"{column} row count mismatch: {len(rows)} != {n_frames}")
+            cols[column] = rows
         self._writer.write_table(self.pa.table(cols, schema=self._schema))
 
         stop = start + n_frames
@@ -780,6 +937,9 @@ class _V3Writer:
             features["box.timestamps"] = lr3._feature("float64", [self.ts_width], ts_names)
         for pose_col in self.pose_columns:
             features[pose_col.key] = _pose_feature()
+        touch_names = [f"taxel_{i:03d}" for i in range(_TOUCH_SAMPLE_WIDTH)]
+        for column, _, _ in self.touch_columns:
+            features[column] = lr3._feature("float32", [_TOUCH_SAMPLE_WIDTH], touch_names)
         for vk in self.video_keys:
             features[vk.feature] = {
                 "dtype": "video",
@@ -829,6 +989,8 @@ class _V3Writer:
             stats["box.timestamps"] = lr3._table_column_stats(table, "box.timestamps", width=self.ts_width)
         for pose_col in self.pose_columns:
             stats[pose_col.key] = _pose_table_column_stats(table, pose_col.key)
+        for column, _, _ in self.touch_columns:
+            stats[column] = lr3._table_column_stats(table, column, width=_TOUCH_SAMPLE_WIDTH)
         (self.meta_dir / "stats.json").write_text(json.dumps(stats, indent=4), encoding="utf-8")
 
     def _write_info(self) -> None:
@@ -952,6 +1114,7 @@ def export_task_to_v3(
         ts_width=ts_width,
         ts_names=box_ts_names if ts_width else None,
         pose_columns=pose_columns,
+        touch_columns=_TOUCH_ARRAY_COLUMNS,
     )
 
     box_cache: dict[Path, dict[int, list[dict[str, Any]]]] = {}
@@ -1036,6 +1199,14 @@ def export_task_to_v3(
             if pose_columns
             else None
         )
+        touch_rows, touch_samples_found = _align_touch_rows(
+            src.ep_dir,
+            n_frames,
+            fps,
+            pts_offset_s=_gmsl2_pts_offset_s(meta),
+        )
+        if not touch_samples_found:
+            _emit(f"  note: {src.ep_dir.name} has no box_sensors.jsonl touch arrays; exported touch columns are zero-filled")
         writer.append_episode(
             episode_index=global_index,
             n_frames=n_frames,
@@ -1044,6 +1215,7 @@ def export_task_to_v3(
             video_files=video_files,
             ts_rows=ts_rows,
             pose_rows=pose_rows,
+            touch_rows=touch_rows,
         )
         sources.append(
             {
@@ -1053,6 +1225,7 @@ def export_task_to_v3(
                 "frames": n_frames,
                 "sync_grid_source": "online_sync_manifest",
                 "online_sync_actual_frames": int(online_sync_manifest.get("actual_frames") or n_frames),
+                "touch_arrays": "box_sensors.jsonl" if touch_samples_found else "zero_filled_missing_source",
             }
         )
         _emit(f"Episode {global_index} written ({n_frames} frames) from {src.session_dir.name}/{src.ep_dir.name}")

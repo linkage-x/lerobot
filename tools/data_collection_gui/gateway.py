@@ -1365,6 +1365,101 @@ def _dataset_episode_indices(dataset_root: Path, info: dict[str, Any] | None = N
     return [0] if has_rows else []
 
 
+def _episode_metadata_row(dataset_root: Path, episode: int) -> dict[str, Any] | None:
+    try:
+        import pyarrow.parquet as pq
+    except Exception:
+        return None
+
+    for meta_file in sorted((dataset_root / "meta" / "episodes").glob("*/*.parquet")):
+        try:
+            table = pq.read_table(meta_file)
+        except Exception:
+            continue
+        if "episode_index" not in table.column_names:
+            continue
+        for row in table.to_pylist():
+            try:
+                if int(row.get("episode_index")) == int(episode):
+                    return row
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _dataset_child_from_template(dataset_root: Path, template: str, **values: Any) -> Path | None:
+    try:
+        relative = template.format(**values)
+    except (KeyError, IndexError, ValueError):
+        return None
+    candidate = (dataset_root / relative).resolve()
+    try:
+        candidate.relative_to(dataset_root.resolve())
+    except ValueError:
+        return None
+    return candidate
+
+
+def _resolve_data_file_for_episode(dataset_root: Path, info: dict[str, Any], episode: int) -> Path | None:
+    row = _episode_metadata_row(dataset_root, episode)
+    if row is None:
+        return None
+    try:
+        chunk_index = int(row["data/chunk_index"])
+        file_index = int(row["data/file_index"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    template = str(info.get("data_path") or "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet")
+    candidates = [
+        _dataset_child_from_template(
+            dataset_root,
+            template,
+            chunk_index=chunk_index,
+            file_index=file_index,
+        ),
+        dataset_root / "data" / f"chunk-{chunk_index:03d}" / f"file-{file_index:03d}.parquet",
+        dataset_root / "data" / f"chunk-{chunk_index:03d}" / f"file-{file_index:06d}.parquet",
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.is_file():
+            return candidate
+    return None
+
+
+def _resolve_video_file_for_episode(
+    dataset_root: Path,
+    info: dict[str, Any],
+    camera_key: str,
+    episode: int,
+) -> Path | None:
+    row = _episode_metadata_row(dataset_root, episode)
+    if row is None:
+        return None
+    try:
+        chunk_index = int(row[f"videos/{camera_key}/chunk_index"])
+        file_index = int(row[f"videos/{camera_key}/file_index"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    template = str(info.get("video_path") or "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
+    candidates = [
+        _dataset_child_from_template(
+            dataset_root,
+            template,
+            video_key=camera_key,
+            chunk_index=chunk_index,
+            file_index=file_index,
+        ),
+        dataset_root / "videos" / camera_key / f"chunk-{chunk_index:03d}" / f"file-{file_index:03d}.mp4",
+        dataset_root / "videos" / camera_key / f"chunk-{chunk_index:03d}" / f"file-{file_index:06d}.mp4",
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.is_file():
+            return candidate
+    return None
+
+
 def _selected_episode_for_dataset(state: GatewayState, dataset_root: Path, episode_options: list[int]) -> int:
     if not episode_options:
         return int(state.replay.episode or 0)
@@ -3821,6 +3916,53 @@ def _touch_payload(data: Any) -> dict[str, Any] | None:
     }
 
 
+_TOUCH_EXPORT_FZ_COLUMNS = {
+    "left": "observation.touch.box_touch_left.fz_0p1N",
+    "right": "observation.touch.box_touch_right.fz_0p1N",
+}
+
+
+def _touch_payload_from_fz(values: Any, *, timestamp: int = 0) -> dict[str, Any] | None:
+    fz = _as_float_list(values)[:239]
+    if not fz:
+        return None
+    if len(fz) < 239:
+        fz.extend([0.0] * (239 - len(fz)))
+    active_points = sum(1 for value in fz if abs(value) > 0.0)
+    return {
+        "timestamp": int(timestamp),
+        "fz": fz,
+        "maxFz": max(fz) if fz else 0.0,
+        "activePoints": active_points,
+    }
+
+
+def _touch_timestamp_from_parquet_row(row: dict[str, Any], info: dict[str, Any], sensor: str) -> int:
+    timestamps = _as_float_list(row.get("box.timestamps"))
+    if timestamps:
+        names = _feature_names(info, "box.timestamps")
+        wanted = f"{sensor}.timestamp"
+        for index, name in enumerate(names):
+            if index < len(timestamps) and (name == wanted or name.endswith(f".{wanted}")):
+                return int(timestamps[index])
+    return int(_first_finite(row.get("timestamp"), default=0.0) * 1_000_000)
+
+
+def _touch_from_parquet_row(row: dict[str, Any], info: dict[str, Any]) -> dict[str, Any]:
+    touch: dict[str, Any] = {}
+    for side, column in _TOUCH_EXPORT_FZ_COLUMNS.items():
+        if column not in row or row.get(column) is None:
+            continue
+        sensor = "box_touch_left" if side == "left" else "box_touch_right"
+        payload = _touch_payload_from_fz(
+            row.get(column),
+            timestamp=_touch_timestamp_from_parquet_row(row, info, sensor),
+        )
+        if payload is not None:
+            touch[side] = payload
+    return touch
+
+
 def _touch_key_from_sid(sensor_id: str) -> str | None:
     suffix_by_sid = {"box_touch_left": "left", "box_touch_right": "right"}
     if sensor_id in suffix_by_sid:
@@ -4116,13 +4258,26 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
             dataset_kind=_dataset_kind(state, dataset_root),
         )
 
-    data_file = data_files[-1]
+    episode_options = _dataset_episode_indices(dataset_root, info)
+    selected_episode = episode if episode is not None else _selected_episode_for_dataset(state, dataset_root, episode_options)
+    if episode_options and selected_episode not in episode_options:
+        return _empty_timeline(
+            dataset_root,
+            fps=fps,
+            episode=selected_episode,
+            state_names=state_names,
+            action_names=action_names,
+            camera_keys=camera_keys,
+            cube_pose_names=cube_pose_names,
+            error=f"episode {selected_episode} not found",
+            dataset_kind=_dataset_kind(state, dataset_root),
+        )
+
+    data_file = _resolve_data_file_for_episode(dataset_root, info, selected_episode) or data_files[-1]
     table = pq.read_table(data_file)
     if "episode_index" in table.column_names:
-        episodes = [int(value) for value in table["episode_index"].to_pylist() if value is not None]
-        episode_options = sorted(set(episodes))
-        selected_episode = episode if episode is not None else _selected_episode_for_dataset(state, dataset_root, episode_options)
-        if episode_options and selected_episode not in episode_options:
+        table = table.filter(pc.equal(table["episode_index"], selected_episode))
+        if table.num_rows == 0:
             return _empty_timeline(
                 dataset_root,
                 fps=fps,
@@ -4131,10 +4286,9 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
                 action_names=action_names,
                 camera_keys=camera_keys,
                 cube_pose_names=cube_pose_names,
-                error=f"episode {selected_episode} not found",
+                error=f"episode {selected_episode} not found in {data_file.name}",
                 dataset_kind=_dataset_kind(state, dataset_root),
             )
-        table = table.filter(pc.equal(table["episode_index"], selected_episode))
         episode = selected_episode
     else:
         episode = 0
@@ -4185,17 +4339,19 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
                 cube_pose = _cube_pose_from_parquet_row(row, info, cube_name)
             if cube_pose is not None:
                 cube_poses[cube_name] = cube_pose
-        frames.append(
-            {
-                "frame": frame_index,
-                "timestamp": timestamp,
-                "state": state_values,
-                "action": action_values,
-                "eePose": pose,
-                "cubePoses": cube_poses,
-                "videoOverlays": video_cube_overlays.get(frame_index, {}),
-            }
-        )
+        frame = {
+            "frame": frame_index,
+            "timestamp": timestamp,
+            "state": state_values,
+            "action": action_values,
+            "eePose": pose,
+            "cubePoses": cube_poses,
+            "videoOverlays": video_cube_overlays.get(frame_index, {}),
+        }
+        touch = _touch_from_parquet_row(row, info)
+        if touch:
+            frame["touch"] = touch
+        frames.append(frame)
 
     if ep_dir is not None and ep_dir.is_dir():
         _attach_touch_frames(frames, ep_dir, video_warmup_s=video_warmup_s)
@@ -4320,10 +4476,15 @@ def _remux_mkv_to_mp4(mkv_path: Path, expected_duration_s: float | None = None) 
     return mp4_path
 
 
-def _resolve_video_path(state: GatewayState, dataset_root: Path, camera_key: str) -> Path | None:
+def _resolve_video_path(
+    state: GatewayState,
+    dataset_root: Path,
+    camera_key: str,
+    episode: int | None = None,
+) -> Path | None:
+    selected_episode = int(state.replay.episode if episode is None else episode)
     if _has_gmsl2_episodes(dataset_root):
-        episode = int(state.replay.episode or 0)
-        ep_dir = dataset_root / "episodes" / f"episode_{episode:06d}"
+        ep_dir = dataset_root / "episodes" / f"episode_{selected_episode:06d}"
         mkv = ep_dir / f"{_camera_stem_from_key(camera_key)}.mkv"
         if not mkv.is_file():
             return None
@@ -4336,21 +4497,28 @@ def _resolve_video_path(state: GatewayState, dataset_root: Path, camera_key: str
             except (OSError, json.JSONDecodeError):
                 expected_duration_s = None
         return _remux_mkv_to_mp4(mkv, expected_duration_s=expected_duration_s) or mkv
+
     info = _load_dataset_info(dataset_root)
+    episode_video = _resolve_video_file_for_episode(dataset_root, info, camera_key, selected_episode)
+    if episode_video is not None:
+        return episode_video
+
     template = str(info.get("video_path") or "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
-    relative = template.format(video_key=camera_key, chunk_index=0, file_index=0)
-    candidate = (dataset_root / relative).resolve()
-    try:
-        candidate.relative_to(dataset_root.resolve())
-    except ValueError:
-        return None
-    if not candidate.is_file():
-        camera_dir = dataset_root / "videos" / camera_key
-        if camera_dir.is_dir():
-            for mp4 in sorted(camera_dir.glob("chunk-*/*.mp4")):
-                return mp4
-        return None
-    return candidate
+    candidate = _dataset_child_from_template(
+        dataset_root,
+        template,
+        video_key=camera_key,
+        chunk_index=0,
+        file_index=selected_episode,
+    )
+    if candidate is not None and candidate.is_file():
+        return candidate
+
+    camera_dir = dataset_root / "videos" / camera_key
+    if camera_dir.is_dir():
+        for mp4 in sorted(camera_dir.glob("chunk-*/*.mp4")):
+            return mp4
+    return None
 
 
 def _serve_static_file(handler: BaseHTTPRequestHandler, asset_path: Path, content_type: str) -> None:
@@ -4879,6 +5047,22 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
     recorded_datasets = list(state.cached_recorded_datasets)
     trajectory = list(state.cached_trajectory)
     trajectory_meta = dict(state.cached_trajectory_meta)
+    selected_replay_root = state.selected_replay_root.resolve() if state.selected_replay_root is not None else None
+    if selected_replay_root is not None:
+        try:
+            cached_root = Path(str(trajectory_meta.get("datasetRoot") or "")).resolve()
+        except OSError:
+            cached_root = None
+        if cached_root != selected_replay_root:
+            selected_info = _load_dataset_info(selected_replay_root)
+            selected_meta = _dataset_replay_meta(state, selected_replay_root, selected_info)
+            trajectory = []
+            trajectory_meta = {
+                **selected_meta,
+                "dataStatus": _recorded_dataset_status(selected_replay_root),
+                "trajectoryKind": "none",
+                "message": f"Selected {_dataset_kind(state, selected_replay_root)} dataset: {selected_replay_root.name}",
+            }
     if recorded_datasets and not trajectory_meta.get("datasetRoot"):
         latest_dataset = recorded_datasets[0]
         trajectory_meta = {
@@ -5393,6 +5577,8 @@ def _refresh_dataset_stats_cache(state: GatewayState) -> None:
     """
     signature = _dataset_scan_signature(state)
     with state.lock:
+        selected_before = str(state.selected_replay_root.resolve()) if state.selected_replay_root is not None else ""
+        episode_before = int(state.replay.episode or 0)
         unchanged = state.dataset_cache_ready and signature == state.dataset_scan_signature
     if unchanged:
         return
@@ -5400,6 +5586,14 @@ def _refresh_dataset_stats_cache(state: GatewayState) -> None:
     trajectory, meta = _read_recorded_trajectory(state)
     processing = _processing_items(state)  # also an O(datasets) FS scan; cache it
     with state.lock:
+        selected_now = str(state.selected_replay_root.resolve()) if state.selected_replay_root is not None else ""
+        episode_now = int(state.replay.episode or 0)
+        if selected_now != selected_before or episode_now != episode_before:
+            # A user changed replay selection while this slow scan was running.
+            # Publishing the stale meta would make _snapshot jump back to the old
+            # latest dataset/episode, so drop this scan and let the next cycle
+            # recompute for the current selection.
+            return
         state.cached_recorded_datasets = items
         state.cached_trajectory = trajectory
         state.cached_trajectory_meta = meta
@@ -6310,9 +6504,19 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             if not camera_key:
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing camera key"})
                 return
+            requested_episode = query.get("episode", [None])[0]
+            try:
+                episode = int(requested_episode) if requested_episode not in (None, "") else None
+            except ValueError:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"error": f"invalid episode: {requested_episode}"})
+                return
             with self.server.state.lock:
                 dataset_root = _resolve_known_dataset(self.server.state, requested)
-                video_path = _resolve_video_path(self.server.state, dataset_root, camera_key) if dataset_root else None
+                video_path = (
+                    _resolve_video_path(self.server.state, dataset_root, camera_key, episode)
+                    if dataset_root
+                    else None
+                )
             if video_path is None:
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"video not found: {camera_key}"})
                 return

@@ -485,8 +485,11 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  videoUrl(datasetPath: string, cameraKey: string): string {
+  videoUrl(datasetPath: string, cameraKey: string, episode?: number): string {
     const params = new URLSearchParams({ path: datasetPath, key: cameraKey });
+    if (episode != null) {
+      params.set("episode", String(episode));
+    }
     return `${this.apiBase}/api/replay/video?${params.toString()}`;
   }
 
