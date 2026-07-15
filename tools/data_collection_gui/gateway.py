@@ -1997,6 +1997,8 @@ def _count_completed_episodes(state: GatewayState, repo_id: str) -> int:
     # /api/snapshot take 1-5s -- the gateway-slow / preview-demand-starved root.
     total = 0
     for item in state.cached_recorded_datasets:
+        if str(item.get("datasetKind") or "recorded") != "recorded":
+            continue
         name = str(item.get("name") or "")
         if base_name in _dataset_name_prefixes(name):
             total += int(item.get("totalEpisodes") or 0)

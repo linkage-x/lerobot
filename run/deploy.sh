@@ -32,7 +32,7 @@ fi
 
 # ---- 2. Restart gateway on Thor ----
 echo "==> Restarting gateway on Thor..."
-ssh -o ConnectTimeout=5 "$THOR" 'exec 9>/tmp/lerobot_gateway_deploy.lock; if ! flock -n 9; then echo "ERROR: another deploy is already restarting the Thor gateway" >&2; exit 75; fi; bash -s' <<'REMOTE'
+ssh -o ConnectTimeout=5 "$THOR" 'flock -n /tmp/lerobot_gateway_deploy.lock bash -s || { echo "ERROR: another deploy is already restarting the Thor gateway" >&2; exit 75; }' <<'REMOTE'
 set -e
 
 _gateway_pids() {
@@ -93,12 +93,12 @@ bash tools/thor/box_sdk/ensure_box_net.sh >/dev/null 2>&1 || true
 . tools/thor/box_sdk/setup_env.sh
 
 mkdir -p ~/lerobot/run/logs
-setsid env PYTHONPATH=src:. PYTHONUNBUFFERED=1 \
+setsid bash -c '''exec 3>&-; exec env PYTHONPATH=src:. PYTHONUNBUFFERED=1 \
   python3 -m tools.data_collection_gui.gateway \
   --config-path tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml \
   --datasets-root outputs/datasets \
   --port 8765 --host 0.0.0.0 \
-  --repo-root /home/nvidia/lerobot \
+  --repo-root /home/nvidia/lerobot''' \
   </dev/null >~/lerobot/run/logs/gateway.log 2>&1 &
 disown
 
