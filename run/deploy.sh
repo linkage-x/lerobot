@@ -32,7 +32,7 @@ fi
 
 # ---- 2. Restart gateway on Thor ----
 echo "==> Restarting gateway on Thor..."
-ssh -o ConnectTimeout=5 "$THOR" bash -s <<'REMOTE'
+ssh -o ConnectTimeout=5 "$THOR" 'exec 9>/tmp/lerobot_gateway_deploy.lock; if ! flock -n 9; then echo "ERROR: another deploy is already restarting the Thor gateway" >&2; exit 75; fi; bash -s' <<'REMOTE'
 set -e
 
 _gateway_pids() {

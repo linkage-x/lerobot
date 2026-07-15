@@ -169,6 +169,7 @@ class GatewayState:
     replay_process: subprocess.Popen[str] | None = None
     replay_process_kind: str = ""
     processing_processes: dict[str, subprocess.Popen[str]] = field(default_factory=dict)
+    processing_starting: set[str] = field(default_factory=set)
     process_started_at_s: float | None = None
     replay_started_at_s: float | None = None
     log_dir: Path | None = None
@@ -3023,24 +3024,30 @@ def _read_traj_gen_output(
 
 def _queue_traj_gen(state: GatewayState, dataset_root: Path) -> None:
     key = str(dataset_root)
-    running = state.processing_processes.get(key)
-    if running is not None and running.poll() is None:
-        state.log("info", f"EE trajectory generation already running for {dataset_root.name}")
-        return
-    state.processing_processes.pop(key, None)
+    with state.lock:
+        running = state.processing_processes.get(key)
+        if key in state.processing_starting:
+            state.log("info", f"EE trajectory generation already starting for {dataset_root.name}")
+            return
+        if running is not None and running.poll() is None:
+            state.log("info", f"EE trajectory generation already running for {dataset_root.name}")
+            return
+        state.processing_processes.pop(key, None)
+        state.processing_starting.add(key)
 
-    command = _ee_trajectory_command(state, dataset_root)
     job_id = f"traj-gen-{int(time.time())}"
-    _update_traj_gen_meta(
-        dataset_root,
-        job_id=job_id,
-        status="running",
-        command=command,
-        message=f"Running AprilTag cube tracking for {dataset_root.name}",
-        log_tail=[f"[traj-gen] {' '.join(command)}"],
-    )
-    _refresh_cached_processing_item(state, dataset_root)
+    command: list[str] = []
     try:
+        command = _ee_trajectory_command(state, dataset_root)
+        _update_traj_gen_meta(
+            dataset_root,
+            job_id=job_id,
+            status="running",
+            command=command,
+            message=f"Running AprilTag cube tracking for {dataset_root.name}",
+            log_tail=[f"[traj-gen] {' '.join(command)}"],
+        )
+        _refresh_cached_processing_item(state, dataset_root)
         process = subprocess.Popen(
             command,
             cwd=state.repo_root,
@@ -3051,6 +3058,8 @@ def _queue_traj_gen(state: GatewayState, dataset_root: Path) -> None:
             start_new_session=True,
         )
     except OSError as exc:
+        with state.lock:
+            state.processing_starting.discard(key)
         _update_traj_gen_meta(
             dataset_root,
             job_id=job_id,
@@ -3061,9 +3070,15 @@ def _queue_traj_gen(state: GatewayState, dataset_root: Path) -> None:
         )
         _refresh_cached_processing_item(state, dataset_root)
         raise
-    state.processing_processes[key] = process
+    except Exception:
+        with state.lock:
+            state.processing_starting.discard(key)
+        raise
+    with state.lock:
+        state.processing_starting.discard(key)
+        state.processing_processes[key] = process
+        state.log("info", f"Started EE trajectory generation pid={process.pid} dataset={dataset_root}")
     _refresh_cached_processing_item(state, dataset_root)
-    state.log("info", f"Started EE trajectory generation pid={process.pid} dataset={dataset_root}")
     _start_traj_gen_output_reader(state, dataset_root, process, job_id)
 
 
@@ -6903,6 +6918,54 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 state.log("warn", f"{path} failed: {exc}")
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
+        if path == "/api/processing/qc":
+            state = self.server.state
+            requested = (query.get("path", [""])[0] or "").strip()
+            try:
+                with state.lock:
+                    dataset_root = _resolve_known_dataset(state, requested)
+                if dataset_root is None:
+                    _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
+                    return
+                qc_result = _run_qc(dataset_root)
+                try:
+                    _write_processing_meta_qc(dataset_root, qc_result)
+                except OSError as exc:
+                    _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"failed to persist QC: {exc}"})
+                    return
+                _refresh_cached_processing_item(state, dataset_root)
+                with state.lock:
+                    state.log(
+                        "info" if qc_result["status"] == "pass" else "warn",
+                        f"QC {qc_result['status']} for {dataset_root.name}: {qc_result['summary']}",
+                    )
+                    response = _snapshot(state)
+                _json_response(self, HTTPStatus.OK, response)
+            except Exception as exc:  # noqa: BLE001
+                with state.lock:
+                    state.log("warn", f"{path} failed: {exc}")
+                _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            return
+        if path == "/api/processing/traj-gen":
+            state = self.server.state
+            requested = (query.get("path", [""])[0] or "").strip()
+            try:
+                with state.lock:
+                    dataset_root = _resolve_known_dataset(state, requested)
+                if dataset_root is None:
+                    _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
+                    return
+                _queue_traj_gen(state, dataset_root)
+                with state.lock:
+                    response = _snapshot(state)
+                _json_response(self, HTTPStatus.OK, response)
+            except NotImplementedError as exc:
+                _json_response(self, HTTPStatus.NOT_IMPLEMENTED, {"error": str(exc)})
+            except Exception as exc:  # noqa: BLE001
+                with state.lock:
+                    state.log("warn", f"{path} failed: {exc}")
+                _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            return
         try:
             with self.server.state.lock:
                 if path == "/api/handheld/record/start":
@@ -6967,38 +7030,6 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     result = _trigger_box_touch_cali(self.server.state)
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
-                    return
-                if path == "/api/processing/qc":
-                    requested = (query.get("path", [""])[0] or "").strip()
-                    dataset_root = _resolve_known_dataset(self.server.state, requested)
-                    if dataset_root is None:
-                        _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
-                        return
-                    qc_result = _run_qc(dataset_root)
-                    try:
-                        _write_processing_meta_qc(dataset_root, qc_result)
-                    except OSError as exc:
-                        _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"failed to persist QC: {exc}"})
-                        return
-                    _refresh_cached_processing_item(self.server.state, dataset_root)
-                    self.server.state.log(
-                        "info" if qc_result["status"] == "pass" else "warn",
-                        f"QC {qc_result['status']} for {dataset_root.name}: {qc_result['summary']}",
-                    )
-                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
-                    return
-                if path == "/api/processing/traj-gen":
-                    requested = (query.get("path", [""])[0] or "").strip()
-                    dataset_root = _resolve_known_dataset(self.server.state, requested)
-                    if dataset_root is None:
-                        _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
-                        return
-                    try:
-                        _queue_traj_gen(self.server.state, dataset_root)
-                    except NotImplementedError as exc:
-                        _json_response(self, HTTPStatus.NOT_IMPLEMENTED, {"error": str(exc)})
-                        return
-                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/processing/datasets-root":
                     requested = (query.get("path", [""])[0] or "").strip()
