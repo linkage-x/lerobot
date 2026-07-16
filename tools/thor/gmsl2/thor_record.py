@@ -697,6 +697,87 @@ def _sidecar_data_row_count(path: Path) -> int:
         return 0
 
 
+def _percentile_int(values: list[int], percentile: float) -> int:
+    if not values:
+        raise ValueError("percentile requires at least one value")
+    ordered = sorted(int(value) for value in values)
+    rank = max(0, min(len(ordered) - 1, int(round((len(ordered) - 1) * percentile))))
+    return ordered[rank]
+
+
+def _estimate_online_sync_clock_bridge(
+    episode_dir: Path,
+    camera_names: list[str],
+) -> dict[str, Any] | None:
+    """Map Argus TSC nanoseconds to host CLOCK_MONOTONIC nanoseconds.
+
+    Argus exposes both the SoC TSC-domain SOF and a same-frame sensor timestamp
+    in the host monotonic epoch.  Their paired difference is an exact clock
+    bridge without encoder/queue latency.  The recorder's post-acquire host
+    timestamp is retained only to report pipeline/dequeue delay.
+    """
+
+    samples: list[tuple[str, int, int, int]] = []
+    per_camera_samples: dict[str, int] = {}
+    for camera in camera_names:
+        sidecar = afs.frame_metadata_sidecar_path(episode_dir, camera)
+        if not sidecar.exists():
+            continue
+        rows = afs.read_frame_metadata_csv(sidecar, camera=camera)
+        paired = [
+            (
+                int(row.sensor_timestamp_ns) - int(row.sof_tsc_ns),
+                int(row.sof_tsc_ns),
+                int(row.host_acquired_monotonic_ns),
+            )
+            for row in rows
+            if row.sensor_timestamp_ns > 0 and row.sof_tsc_ns > 0
+        ]
+        per_camera_samples[camera] = len(paired)
+        samples.extend(
+            (camera, offset, sof_tsc_ns, host_acquired_ns)
+            for offset, sof_tsc_ns, host_acquired_ns in paired
+        )
+    if not samples:
+        return None
+
+    offsets = [offset for _, offset, _, _ in samples]
+    offset_ns = _percentile_int(offsets, 0.5)
+    pair_residuals = [abs(offset - offset_ns) for offset in offsets]
+    acquire_delays = [
+        host_acquired_ns - (offset_ns + sof_tsc_ns)
+        for _, _, sof_tsc_ns, host_acquired_ns in samples
+        if host_acquired_ns > 0
+    ]
+    return {
+        "schema": "thor_argus_tsc_to_host_monotonic_v1",
+        "source_clock": "argus_sof_tsc_ns",
+        "target_clock": "CLOCK_MONOTONIC",
+        "model": "host_monotonic_ns = sof_tsc_ns * scale + offset_ns",
+        "anchor": "median(sensor_timestamp_ns - sof_tsc_ns) from same-frame Argus metadata",
+        "scale": 1.0,
+        "offset_ns": int(offset_ns),
+        "sample_count": len(samples),
+        "samples_by_camera": per_camera_samples,
+        "clock_pair_residual_ns": {
+            "min": int(min(pair_residuals)),
+            "median": int(_percentile_int(pair_residuals, 0.5)),
+            "p95": int(_percentile_int(pair_residuals, 0.95)),
+            "max": int(max(pair_residuals)),
+        },
+        "host_acquire_delay_from_sof_ns": None if not acquire_delays else {
+            "min": int(min(acquire_delays)),
+            "median": int(_percentile_int(acquire_delays, 0.5)),
+            "p95": int(_percentile_int(acquire_delays, 0.95)),
+            "max": int(max(acquire_delays)),
+        },
+        "uncertainty_note": (
+            "Clock-pair residual measures same-frame TSC-to-sensor timestamp consistency. "
+            "Host acquire delay includes exposure/readout and dequeue latency; it is not camera skew."
+        ),
+    }
+
+
 def _evaluate_online_sync_manifest(
     handle: ps.EpisodeHandle,
     cfg: gr.RecorderConfig,
@@ -757,6 +838,9 @@ def _evaluate_online_sync_manifest(
     payload["actual_frames"] = actual_frames
     payload["frame_count_by_camera"] = frame_count_by_camera
     payload["max_abs_delta_ns_by_camera"] = manifest.get("max_abs_delta_ns_by_camera") or {}
+    clock_bridge = _estimate_online_sync_clock_bridge(handle.directory, active_cameras)
+    if clock_bridge is not None:
+        payload["camera_clock_bridge"] = clock_bridge
     payload["failures"] = failures
     return payload, None if not failures else "online_sync_failed"
 
@@ -1570,6 +1654,9 @@ def main(argv: list[str] | None = None) -> int:
                         payload["argus_frame_sync"] = frame_sync_payload
                     if online_sync_payload is not None:
                         payload["online_sync"] = online_sync_payload
+                        clock_bridge = online_sync_payload.get("camera_clock_bridge")
+                        if clock_bridge is not None:
+                            payload.setdefault("sync_reference", {})["camera_clock_bridge"] = clock_bridge
                     meta_path.write_text(json.dumps(payload, indent=2))
                 except (OSError, json.JSONDecodeError) as exc:
                     logger.warning("failed to annotate cleanup duration: %s", exc)

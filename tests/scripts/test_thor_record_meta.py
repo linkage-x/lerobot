@@ -32,6 +32,7 @@ def _recorder_config(tmp_path: Path) -> gr.RecorderConfig:
         episode_time_s=1.0,
         detect_all=False,
         sensor_ids=[6],
+        exclude_sensor_ids=[],
         name_prefix="cam",
         spawn_stagger_s=0.0,
         connect_stable_s=0.0,
@@ -251,6 +252,45 @@ def test_online_sync_manifest_gate_accepts_valid_manifest(tmp_path: Path) -> Non
     assert payload["ok"] is True
     assert payload["actual_frames"] == 3
     assert payload["sidecar_counts"] == {"cam_06": 3, "cam_07": 3}
+
+
+def test_online_sync_manifest_reports_sof_to_monotonic_clock_bridge(tmp_path: Path) -> None:
+    thor_record = _load_thor_record_module()
+    handle = _online_sync_handle(tmp_path)
+    cfg = _recorder_config(tmp_path)
+    cfg.cameras.recorder_backend = "argus_online_sync"
+    for camera, acquire_delay_ns in (("cam_06", 2_000_000), ("cam_07", 1_000_000)):
+        rows = []
+        for index in range(3):
+            sof_tsc_ns = 1_000_000_000 + index * 16_666_667
+            eof_tsc_ns = sof_tsc_ns + 14_000_000
+            rows.append(afs.ArgusFrameMetadata(
+                camera=camera,
+                encoded_frame_index=index,
+                local_frame_number=index + 1,
+                sensor_timestamp_ns=sof_tsc_ns - 100_000_000,
+                sof_tsc_ns=sof_tsc_ns,
+                eof_tsc_ns=eof_tsc_ns,
+                host_acquired_monotonic_ns=eof_tsc_ns - 100_000_000 + acquire_delay_ns,
+            ))
+        afs.write_frame_metadata_csv(afs.frame_metadata_sidecar_path(handle.directory, camera), rows)
+    (handle.directory / "online_sync_manifest.json").write_text(json.dumps({
+        "ok": True,
+        "actual_frames": 3,
+        "frame_count_by_camera": {"cam_06": 3, "cam_07": 3},
+        "max_abs_delta_ns_by_camera": {"cam_06": 0, "cam_07": 4_000},
+    }))
+
+    payload, failure = thor_record._evaluate_online_sync_manifest(handle, cfg)
+
+    assert failure is None
+    bridge = payload["camera_clock_bridge"]
+    assert bridge["scale"] == 1.0
+    assert bridge["offset_ns"] == -100_000_000
+    assert bridge["sample_count"] == 6
+    assert bridge["clock_pair_residual_ns"]["max"] == 0
+    assert bridge["host_acquire_delay_from_sof_ns"]["min"] == 15_000_000
+    assert bridge["host_acquire_delay_from_sof_ns"]["max"] == 16_000_000
 
 
 def test_online_sync_manifest_gate_rejects_missing_manifest(tmp_path: Path) -> None:

@@ -43,6 +43,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <time.h>
 #include <utility>
 #include <vector>
 
@@ -117,7 +118,17 @@ struct FrameMetadata {
     uint64_t sof_tsc_ns = 0;
     uint64_t eof_tsc_ns = 0;
     uint64_t internal_frame_count = 0;
+    uint64_t host_acquired_monotonic_ns = 0;
 };
+
+uint64_t monotonic_time_ns() {
+    struct timespec ts {};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL
+        + static_cast<uint64_t>(ts.tv_nsec);
+}
 
 static constexpr uint32_t kArgusBuffers = 12;
 static EGLDisplay g_egl_display = EGL_NO_DISPLAY;
@@ -1130,7 +1141,7 @@ bool open_episode_outputs(
         return false;
     }
     cam->csv << "camera,logical_frame_index,local_frame_number,sensor_timestamp_ns,"
-             << "sof_tsc_ns,eof_tsc_ns,internal_frame_count\n";
+             << "sof_tsc_ns,eof_tsc_ns,internal_frame_count,host_acquired_monotonic_ns\n";
     return true;
 }
 
@@ -1208,6 +1219,7 @@ std::unique_ptr<FrameBundle> acquire_one(
 ) {
     Status status = STATUS_OK;
     Buffer* raw = cam->i_buffer_stream->acquireBuffer(timeout_ns, &status);
+    const uint64_t host_acquired_monotonic_ns = raw ? monotonic_time_ns() : 0;
     if (!raw) {
         // QUIT/STOP can arrive while Libargus is blocked in acquireBuffer.
         // A timeout used only to unblock shutdown is expected, not a camera
@@ -1250,6 +1262,7 @@ std::unique_ptr<FrameBundle> acquire_one(
         cam->i_buffer_stream->releaseBuffer(raw);
         return nullptr;
     }
+    bundle->meta.host_acquired_monotonic_ns = host_acquired_monotonic_ns;
     return bundle;
 }
 
@@ -1443,6 +1456,8 @@ bool publish_frame_bus_cluster(
              << "\"sensor_timestamp_ns\": " << bundle->meta.sensor_timestamp_ns << ", "
              << "\"sof_tsc_ns\": " << bundle->meta.sof_tsc_ns << ", "
              << "\"eof_tsc_ns\": " << bundle->meta.eof_tsc_ns << ", "
+             << "\"host_acquired_monotonic_ns\": "
+             << bundle->meta.host_acquired_monotonic_ns << ", "
              << "\"internal_frame_count\": " << bundle->meta.internal_frame_count
              << "}" << (i + 1 == published.size() ? "\n" : ",\n");
     }
@@ -1629,7 +1644,8 @@ bool push_cluster(
                          << bundle->meta.sensor_timestamp_ns << ","
                          << bundle->meta.sof_tsc_ns << ","
                          << bundle->meta.eof_tsc_ns << ","
-                         << bundle->meta.internal_frame_count << "\n";
+                         << bundle->meta.internal_frame_count << ","
+                         << bundle->meta.host_acquired_monotonic_ns << "\n";
     }
     return true;
 }

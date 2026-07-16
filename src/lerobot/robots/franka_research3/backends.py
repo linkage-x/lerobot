@@ -174,6 +174,8 @@ class PandaPyArmDriver:
         self._state_reader_stop = threading.Event()
         self._state_reader_thread: threading.Thread | None = None
         self._cached_joint_positions: np.ndarray | None = None
+        self._cached_state_monotonic_s: float | None = None
+        self._cached_state_wall_s: float | None = None
 
     def connect(self) -> None:
         self._robot = self._panda_cls(self.robot_ip)
@@ -203,8 +205,12 @@ class PandaPyArmDriver:
         if self._robot is None:
             raise RuntimeError("Arm backend is not connected.")
         joint_positions = np.asarray(self._robot.get_state().q, dtype=np.float64)
+        state_monotonic_s = time.monotonic()
+        state_wall_s = time.time()
         with self._state_lock:
             self._cached_joint_positions = joint_positions.copy()
+            self._cached_state_monotonic_s = state_monotonic_s
+            self._cached_state_wall_s = state_wall_s
         return joint_positions
 
     def _start_state_reader(self) -> None:
@@ -239,6 +245,8 @@ class PandaPyArmDriver:
             self._robot = None
         with self._state_lock:
             self._cached_joint_positions = None
+            self._cached_state_monotonic_s = None
+            self._cached_state_wall_s = None
 
     def get_joint_positions(self) -> np.ndarray:
         if self._robot is None:
@@ -250,6 +258,25 @@ class PandaPyArmDriver:
         if cached_joint_positions is not None:
             return cached_joint_positions
         return self._refresh_joint_positions_cache()
+
+    def get_joint_positions_with_timestamp(self) -> tuple[np.ndarray, float, float]:
+        """Return the cached joint sample and the time that cache was refreshed."""
+
+        if self._robot is None:
+            raise RuntimeError("Arm backend is not connected.")
+        with self._state_lock:
+            joints = None if self._cached_joint_positions is None else self._cached_joint_positions.copy()
+            monotonic_s = self._cached_state_monotonic_s
+            wall_s = self._cached_state_wall_s
+        if joints is None or monotonic_s is None or wall_s is None:
+            self._refresh_joint_positions_cache()
+            with self._state_lock:
+                joints = None if self._cached_joint_positions is None else self._cached_joint_positions.copy()
+                monotonic_s = self._cached_state_monotonic_s
+                wall_s = self._cached_state_wall_s
+        if joints is None or monotonic_s is None or wall_s is None:
+            raise RuntimeError("FR3 joint-state cache has no timestamped sample.")
+        return joints, float(monotonic_s), float(wall_s)
 
     def get_ee_pose(self) -> np.ndarray | None:
         if self._robot is None:

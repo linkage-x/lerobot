@@ -287,9 +287,13 @@ def test_pandapy_arm_driver_get_joint_positions_uses_cached_state(monkeypatch):
 
     first = driver.get_joint_positions()
     second = driver.get_joint_positions()
+    timestamped, monotonic_s, wall_s = driver.get_joint_positions_with_timestamp()
 
     assert np.allclose(first, DummyPanda.instances[-1].state.q)
     assert np.allclose(second, DummyPanda.instances[-1].state.q)
+    assert np.allclose(timestamped, DummyPanda.instances[-1].state.q)
+    assert monotonic_s > 0.0
+    assert wall_s > 0.0
     assert DummyPanda.instances[-1].get_state_calls == 1
     driver.disconnect()
 
@@ -1138,6 +1142,11 @@ def test_get_observation(robot):
     assert observation["ee.x"] == pytest.approx(0.4)
     assert observation["ee.y"] == pytest.approx(0.1)
     assert observation["ee.z"] == pytest.approx(0.3)
+    timing = robot.get_last_observation_state_timing()
+    assert timing is not None
+    assert timing["monotonic_s"] > 0.0
+    assert timing["wall_s"] > 0.0
+    assert timing["age_ms"] >= 0.0
     assert observation["gripper.pos"] == pytest.approx(0.25)
     assert observation["prev_cmd.ee.x"] == pytest.approx(observation["ee.x"])
     assert observation["prev_cmd.ee.y"] == pytest.approx(observation["ee.y"])

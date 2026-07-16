@@ -30,6 +30,7 @@ class ArgusFrameMetadata:
     sof_tsc_ns: int
     eof_tsc_ns: int = 0
     internal_frame_count: int = 0
+    host_acquired_monotonic_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,7 @@ def write_frame_metadata_csv(path: Path, rows: Iterable[ArgusFrameMetadata]) -> 
         "sof_tsc_ns",
         "eof_tsc_ns",
         "internal_frame_count",
+        "host_acquired_monotonic_ns",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -120,12 +122,13 @@ def read_frame_metadata_csv(path: Path, *, camera: str | None = None) -> list[Ar
             rows.append(
                 ArgusFrameMetadata(
                     camera=row_camera,
-                    encoded_frame_index=int(raw["encoded_frame_index"]),
+                    encoded_frame_index=int(raw.get("encoded_frame_index") or raw.get("logical_frame_index") or 0),
                     local_frame_number=int(raw["local_frame_number"]),
                     sensor_timestamp_ns=int(raw.get("sensor_timestamp_ns") or 0),
                     sof_tsc_ns=int(raw["sof_tsc_ns"]),
                     eof_tsc_ns=int(raw.get("eof_tsc_ns") or 0),
                     internal_frame_count=int(raw.get("internal_frame_count") or 0),
+                    host_acquired_monotonic_ns=int(raw.get("host_acquired_monotonic_ns") or 0),
                 )
             )
     return sorted(rows, key=lambda row: (row.sof_tsc_ns, row.encoded_frame_index))

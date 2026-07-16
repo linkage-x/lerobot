@@ -86,6 +86,8 @@ class FrankaResearch3(Robot):
         self._state_snapshot_lock = threading.Lock()
         self._last_observation_joint_positions_rad: np.ndarray | None = None
         self._last_observation_ee_pose: np.ndarray | None = None
+        self._last_observation_state_monotonic_s: float | None = None
+        self._last_observation_state_wall_s: float | None = None
 
     @property
     def _joint_names(self) -> list[str]:
@@ -401,10 +403,15 @@ class FrankaResearch3(Robot):
         self,
         joint_positions_rad: np.ndarray,
         ee_pose: np.ndarray,
+        *,
+        state_monotonic_s: float,
+        state_wall_s: float,
     ) -> None:
         with self._state_snapshot_lock:
             self._last_observation_joint_positions_rad = np.asarray(joint_positions_rad, dtype=np.float64).copy()
             self._last_observation_ee_pose = np.asarray(ee_pose, dtype=np.float64).copy()
+            self._last_observation_state_monotonic_s = float(state_monotonic_s)
+            self._last_observation_state_wall_s = float(state_wall_s)
 
     def _consume_observation_state_snapshot(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         with self._state_snapshot_lock:
@@ -422,11 +429,37 @@ class FrankaResearch3(Robot):
         with self._state_snapshot_lock:
             self._last_observation_joint_positions_rad = None
             self._last_observation_ee_pose = None
+            self._last_observation_state_monotonic_s = None
+            self._last_observation_state_wall_s = None
 
     def _read_joint_positions(self) -> np.ndarray:
         if self._arm is None:
             raise RuntimeError("Arm backend is not connected.")
         return np.asarray(self._arm.get_joint_positions(), dtype=np.float64)
+
+    def _read_joint_positions_with_timestamp(self) -> tuple[np.ndarray, float, float]:
+        if self._arm is None:
+            raise RuntimeError("Arm backend is not connected.")
+        read_timestamped = getattr(self._arm, "get_joint_positions_with_timestamp", None)
+        if callable(read_timestamped):
+            joints, monotonic_s, wall_s = read_timestamped()
+            return np.asarray(joints, dtype=np.float64), float(monotonic_s), float(wall_s)
+        joints = np.asarray(self._arm.get_joint_positions(), dtype=np.float64)
+        return joints, time.monotonic(), time.time()
+
+    def get_last_observation_state_timing(self) -> dict[str, float] | None:
+        """Return timing for the joint sample used by the latest observation."""
+
+        with self._state_snapshot_lock:
+            monotonic_s = self._last_observation_state_monotonic_s
+            wall_s = self._last_observation_state_wall_s
+        if monotonic_s is None or wall_s is None:
+            return None
+        return {
+            "monotonic_s": float(monotonic_s),
+            "wall_s": float(wall_s),
+            "age_ms": max(0.0, (time.monotonic() - float(monotonic_s)) * 1000.0),
+        }
 
     def _get_release_hold_joint_target(self, current_joint_positions_rad: np.ndarray) -> np.ndarray:
         if self._prev_enabled and self._otg is not None:
@@ -489,9 +522,14 @@ class FrankaResearch3(Robot):
     @check_if_not_connected
     def get_observation(self, *, include_cameras: bool = True) -> RobotObservation:
         self._raise_if_otg_failed()
-        joint_positions_rad = self._read_joint_positions()
+        joint_positions_rad, state_monotonic_s, state_wall_s = self._read_joint_positions_with_timestamp()
         ee_pose = self._compute_ee_pose(joint_positions_rad)
-        self._cache_observation_state_snapshot(joint_positions_rad, ee_pose)
+        self._cache_observation_state_snapshot(
+            joint_positions_rad,
+            ee_pose,
+            state_monotonic_s=state_monotonic_s,
+            state_wall_s=state_wall_s,
+        )
         ee_rotvec = Rotation.from_matrix(ee_pose[:3, :3]).as_rotvec()
         gripper_pos = float(self._gripper.get_position())
 
