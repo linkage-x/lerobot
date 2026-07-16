@@ -1,11 +1,14 @@
 """Thor data-collection orchestrator: 11 x GMSL2 cameras + BOX 采集板.
 
 This is the recorder script spawned by ``tools/data_collection_gui/gateway.py``
-when the operator presses *Connect* on the LeRobot data-collection GUI. It
-is a thin shell around two things that already exist in the repo:
+when the operator presses *Connect* on the LeRobot data-collection GUI. It is
+the stable UI protocol boundary around:
 
-  * ``tools/thor/gmsl2/gmsl2_record.py`` — drives 11 hardware-encoded GStreamer
-    pipelines; pixel data never enters Python.
+  * ``argus_metadata_session.py`` — the default production camera backend. It
+    owns all selected cameras through Libargus, records encoded video, and
+    writes one per-frame metadata sidecar per camera.
+  * ``persistent_session.py`` — explicit legacy fallback for
+    ``recorder_backend: gstreamer_splitmux``.
   * ``tools/thor/box_sdk/box_client.py`` — wraps the vendored ``box_sdk`` wheel
     over UDP/15000 to read the gripper / IMU / trigger / 6D force / two
     Paxini touch pads from the BOX MCU.
@@ -28,10 +31,11 @@ stdin commands accepted (the gateway writes lines to our stdin):
   * ``n`` or ``no``        → discard
   * ``q`` or ``quit``      → exit the program cleanly
 
-The recorder always runs in *streaming* mode — it never returns frames to
-Python. Frame counts shown to the operator are derived from elapsed time *
-configured fps; the authoritative timestamps live inside each MKV PTS
-stream and the ``meta.json`` sidecar we write per episode.
+The recorder always runs in *streaming* mode; frame pixels never enter Python.
+Progress shown to the operator is estimated from elapsed time * configured fps.
+For the default ``argus_metadata`` backend, authoritative cross-camera sync
+comes from the Libargus SOF timestamp sidecars and
+``argus_frame_alignment.json`` written for each saved episode.
 """
 
 from __future__ import annotations
@@ -56,6 +60,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools.thor.gmsl2 import gmsl2_record as gr  # noqa: E402
+from tools.thor.gmsl2 import argus_frame_sync as afs  # noqa: E402
+from tools.thor.gmsl2 import argus_metadata_session as ams  # noqa: E402
+from tools.thor.gmsl2 import argus_online_sync_session as aos  # noqa: E402
+from tools.thor.gmsl2 import argus_video_materialize as avm  # noqa: E402
 from tools.thor.gmsl2 import persistent_session as ps  # noqa: E402
 from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
@@ -386,11 +394,16 @@ def _write_sensor_samples(
     return path
 
 
+def _wallclock_utc_from_wall_s(wall_s: float) -> str:
+    return datetime.fromtimestamp(float(wall_s), timezone.utc).isoformat()
+
+
 def _write_episode_meta(
     handle: ps.EpisodeHandle,
     cfg: gr.RecorderConfig,
     locked: list[int],
     argus_failed: list[int],
+    connect_stream_errors: list[ps.StreamError],
     box_cfg: bc.BoxFleetConfig,
     box_snapshots: list[dict[str, Any]],
     stop_reason: str,
@@ -419,6 +432,16 @@ def _write_episode_meta(
     """
     fragments = handle.fragments
     duration_s = max(0.0, handle.stop_wall_s - handle.t0_wall_s)
+    connect_error_payload = [
+        {"sid": err.sid, "name": err.name, "message": err.message}
+        for err in connect_stream_errors
+    ]
+    active_camera_sids = sorted(info.sid for info in fragments.values())
+    connect_failed_sids = sorted({
+        *argus_failed,
+        *(err.sid for err in connect_stream_errors if err.sid >= 0),
+    })
+    preview_frame_bus_dir, preview_frame_bus_every_n = _effective_online_sync_preview_bus(cfg)
     meta = {
         "episode_index": handle.idx,
         "repo_id": cfg.repo_id,
@@ -428,6 +451,7 @@ def _write_episode_meta(
         "duration_s": duration_s,
         "recording_stop_reason": stop_reason,
         "video": {
+            "recorder_backend": cfg.cameras.recorder_backend,
             "fps": cfg.cameras.fps,
             "width": cfg.cameras.width,
             "height": cfg.cameras.height,
@@ -440,7 +464,12 @@ def _write_episode_meta(
             "control_rate": cfg.cameras.control_rate,
             "color_format": "NV12 (YUV420)",
             "replay_warmup_s": float(cfg.cameras.replay_warmup_s),
-            "pipeline": "nvarguscamerasrc | nvv4l2h{265,264}enc | splitmuxsink (persistent)",
+            "pipeline": (
+                "Libargus CaptureSession | nveglstreamsrc | nvv4l2h{265,264}enc "
+                "| mux + per-frame Argus metadata sidecar"
+                if cfg.cameras.recorder_backend == "argus_metadata"
+                else "nvarguscamerasrc | nvv4l2h{265,264}enc | splitmuxsink (persistent)"
+            ),
         },
         "hardware_sync": {
             "enabled": cfg.hardware_sync.enabled,
@@ -456,23 +485,49 @@ def _write_episode_meta(
                 name: info.first_wall_s for name, info in fragments.items()
             },
             "note": (
-                "Persistent-pipeline model (PR2). t0_wall_s is the recording "
-                "origin (host time when start_episode() emitted split-now); "
-                "BOX snapshots carry t_relative_s = time.time() - t0_wall_s. "
-                "camera_first_wall_s is the host time each splitmuxsink "
-                "actually opened its new fragment — use this as the "
-                "cross-camera alignment anchor (~20ms spread in PR1 burn-in). "
-                "Per-stream first PTS is in cameras[].first_pts_s (single-"
-                "stream only, NOT cross-camera comparable)."
+                "For recorder_backend=argus_metadata, cross-camera alignment "
+                "comes from <camera>.argus_frame_metadata.csv SOF TSC values "
+                "and argus_frame_alignment.json. For the legacy persistent "
+                "splitmux backend, t0_wall_s is the host time when "
+                "start_episode() emitted split-now; camera_first_wall_s is "
+                "only a host-side fragment-open time and is not a hardware "
+                "frame timestamp."
             ),
         },
         "max96726_locked_sids": locked,
         "argus_failed_sids": argus_failed,
+        "connect_failed_sids": connect_failed_sids,
+        "connect_stream_errors": connect_error_payload,
+        "active_camera_sids": active_camera_sids,
         "spawn_stagger_s": cfg.spawn_stagger_s,
         "connect_stable_s": cfg.connect_stable_s,
         "connect_timeout_s": cfg.connect_timeout_s,
         "connect_first_fragment_timeout_s": cfg.connect_first_fragment_timeout_s,
         "stop_on_stream_exit": cfg.stop_on_stream_exit,
+        "argus_frame_sync": {
+            "enabled": cfg.argus_frame_sync.enabled,
+            "required": cfg.argus_frame_sync.required,
+            "reference_strategy": cfg.argus_frame_sync.reference_strategy,
+            "reference_camera": cfg.argus_frame_sync.reference_camera or None,
+            "tolerance_ms": cfg.argus_frame_sync.tolerance_ms,
+            "cadence_tolerance_ms": cfg.argus_frame_sync.cadence_tolerance_ms,
+            "report_name": cfg.argus_frame_sync.report_name,
+            "materialize_verify": cfg.argus_frame_sync.materialize_verify,
+            "materialize_workers": cfg.argus_frame_sync.materialize_workers,
+        },
+        "online_sync": {
+            "enabled": cfg.online_sync.enabled,
+            "sync_source": cfg.online_sync.sync_source,
+            "tolerance_ms": cfg.online_sync.tolerance_ms,
+            "startup_full_clusters": cfg.online_sync.startup_full_clusters,
+            "frame_timeout_ms": cfg.online_sync.frame_timeout_ms,
+            "missing_frame_policy": cfg.online_sync.missing_frame_policy,
+            "stop_mode": cfg.online_sync.stop_mode,
+            "frame_bus_dir": cfg.online_sync.frame_bus_dir,
+            "frame_bus_every_n": cfg.online_sync.frame_bus_every_n,
+            "preview_frame_bus_dir": preview_frame_bus_dir,
+            "preview_frame_bus_every_n": preview_frame_bus_every_n,
+        },
         "cameras": [
             {
                 "sensor_id": info.sid,
@@ -493,6 +548,217 @@ def _write_episode_meta(
     meta_path = handle.directory / "meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))
     return meta_path
+
+
+def _evaluate_argus_frame_sync(
+    handle: ps.EpisodeHandle,
+    cfg: gr.RecorderConfig,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Run the per-frame Argus SOF alignment gate for one episode.
+
+    Returns ``(payload, failure_reason)``. ``payload`` is suitable for
+    ``meta.json``. ``failure_reason`` is non-None only when the episode should
+    not be saved.
+    """
+
+    sync_cfg = cfg.argus_frame_sync
+    if not sync_cfg.enabled:
+        return None, None
+
+    camera_names = sorted(handle.fragments)
+    payload: dict[str, Any] = {
+        "enabled": True,
+        "required": sync_cfg.required,
+        "reference_strategy": sync_cfg.reference_strategy,
+        "reference_camera": sync_cfg.reference_camera or None,
+        "tolerance_ms": sync_cfg.tolerance_ms,
+        "cadence_tolerance_ms": sync_cfg.cadence_tolerance_ms,
+        "report_name": sync_cfg.report_name,
+        "materialize_verify": sync_cfg.materialize_verify,
+        "materialize_workers": sync_cfg.materialize_workers,
+        "sidecars": {},
+    }
+    if not camera_names:
+        payload["ok"] = False
+        payload["failures"] = ["no camera fragments in episode handle"]
+        return payload, "argus_frame_sync_failed" if sync_cfg.required else None
+
+    missing: list[str] = []
+    sidecars: dict[str, Path] = {}
+    for camera in camera_names:
+        path = afs.frame_metadata_sidecar_path(handle.directory, camera)
+        payload["sidecars"][camera] = str(path)
+        if not path.exists():
+            missing.append(camera)
+        else:
+            sidecars[camera] = path
+
+    if missing:
+        payload["ok"] = False
+        payload["missing_sidecars"] = missing
+        payload["failures"] = [
+            "missing Argus frame metadata sidecars for: " + ", ".join(missing)
+        ]
+        failure = "argus_frame_sync_missing_sidecars" if sync_cfg.required else None
+        return payload, failure
+
+    try:
+        markers_path = handle.directory / "argus_recording_markers.json"
+        markers: dict[str, Any] = {}
+        start_sof_tsc_ns: int | None = None
+        stop_sof_tsc_ns: int | None = None
+        if markers_path.exists():
+            markers = json.loads(markers_path.read_text())
+            raw_start_sof = markers.get("start_sof_tsc_ns")
+            if raw_start_sof:
+                start_sof_tsc_ns = int(raw_start_sof)
+            raw_stop_sof = (
+                markers.get("stop_sof_tsc_ns_exclusive")
+                or markers.get("stop_sof_tsc_ns")
+            )
+            if raw_stop_sof:
+                stop_sof_tsc_ns = int(raw_stop_sof)
+
+        frames_by_camera = {
+            camera: afs.read_frame_metadata_csv(path, camera=camera)
+            for camera, path in sidecars.items()
+        }
+        alignment = afs.align_episode_frames(
+            frames_by_camera,
+            reference_camera=(
+                sync_cfg.reference_camera
+                or (markers.get("reference_camera") if sync_cfg.reference_strategy == "camera" else None)
+                or None
+            ),
+            reference_strategy=sync_cfg.reference_strategy,
+            tolerance_ns=int(round(sync_cfg.tolerance_ms * 1_000_000)),
+            expected_period_ns=int(round(1_000_000_000 / max(int(cfg.cameras.fps), 1))),
+            cadence_tolerance_ns=int(round(sync_cfg.cadence_tolerance_ms * 1_000_000)),
+            start_sof_tsc_ns=start_sof_tsc_ns,
+            stop_sof_tsc_ns=stop_sof_tsc_ns,
+        )
+        report_path = handle.directory / sync_cfg.report_name
+        afs.write_alignment_report_json(report_path, alignment)
+        frame_windows = {
+            camera: asdict(window)
+            for camera, window in afs.camera_frame_windows(alignment).items()
+        } if alignment.ok else {}
+        materialized_videos = None
+        if alignment.ok and cfg.cameras.recorder_backend == "argus_metadata":
+            materialized_videos = avm.materialize_aligned_videos(
+                handle.directory,
+                {name: info.path for name, info in handle.fragments.items()},
+                frames_by_camera,
+                alignment,
+                fps=cfg.cameras.fps,
+                codec=cfg.cameras.codec,
+                verify_frame_counts=sync_cfg.materialize_verify,
+                max_workers=sync_cfg.materialize_workers,
+            )
+    except Exception as exc:  # noqa: BLE001 - convert metadata failures to episode gate
+        payload["ok"] = False
+        payload["failures"] = [f"Argus frame sync evaluation failed: {exc}"]
+        failure = "argus_frame_sync_failed" if sync_cfg.required else None
+        return payload, failure
+
+    payload.update({
+        "ok": alignment.ok,
+        "reference_strategy": sync_cfg.reference_strategy,
+        "reference_camera": alignment.reference_camera,
+        "tolerance_ns": alignment.tolerance_ns,
+        "expected_period_ns": alignment.expected_period_ns,
+        "cadence_tolerance_ns": alignment.cadence_tolerance_ns,
+        "recording_markers": markers,
+        "reference_frame_count": alignment.reference_frame_count,
+        "accepted_reference_indices": alignment.accepted_reference_indices,
+        "dropped_reference_indices": alignment.dropped_reference_indices,
+        "drop_reasons": alignment.drop_reasons,
+        "frame_windows": frame_windows,
+        "materialized_videos": materialized_videos,
+        "materialize_verify": sync_cfg.materialize_verify,
+        "materialize_workers": sync_cfg.materialize_workers,
+        "frame_count_by_camera": alignment.frame_count_by_camera(),
+        "max_abs_delta_ns_by_camera": {
+            name: camera_alignment.max_abs_delta_ns
+            for name, camera_alignment in alignment.cameras.items()
+        },
+        "failures": alignment.failures,
+        "report_path": str(report_path),
+    })
+    failure = "argus_frame_sync_failed" if sync_cfg.required and not alignment.ok else None
+    return payload, failure
+
+
+def _sidecar_data_row_count(path: Path) -> int:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return max(0, sum(1 for _ in f) - 1)
+    except OSError:
+        return 0
+
+
+def _evaluate_online_sync_manifest(
+    handle: ps.EpisodeHandle,
+    cfg: gr.RecorderConfig,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate the encoder-front online-sync contract before saving."""
+
+    manifest_path = handle.directory / "online_sync_manifest.json"
+    payload: dict[str, Any] = {
+        "enabled": True,
+        "manifest": str(manifest_path),
+        "sync_source": cfg.online_sync.sync_source,
+        "tolerance_ms": cfg.online_sync.tolerance_ms,
+        "tolerance_ns": int(round(cfg.online_sync.tolerance_ms * 1_000_000)),
+        "sidecar_counts": {},
+        "failures": [],
+    }
+    if not manifest_path.exists():
+        payload["ok"] = False
+        payload["failures"] = ["missing online_sync_manifest.json"]
+        return payload, "online_sync_missing_manifest"
+
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        payload["ok"] = False
+        payload["failures"] = [f"failed to read online sync manifest: {exc}"]
+        return payload, "online_sync_manifest_invalid"
+
+    payload["manifest_payload"] = manifest
+    failures: list[str] = []
+    if not manifest.get("ok"):
+        failures.append(str(manifest.get("failure") or "online_sync_manifest.ok is false"))
+
+    actual_frames = int(manifest.get("actual_frames") or 0)
+    frame_count_by_camera = manifest.get("frame_count_by_camera") or {}
+    active_cameras = sorted(handle.fragments)
+    if actual_frames <= 0:
+        failures.append("online sync actual_frames is zero")
+    for camera in active_cameras:
+        count = int(frame_count_by_camera.get(camera) or 0)
+        if count != actual_frames:
+            failures.append(f"{camera} manifest frame count {count} != {actual_frames}")
+        sidecar = afs.frame_metadata_sidecar_path(handle.directory, camera)
+        sidecar_count = _sidecar_data_row_count(sidecar)
+        payload["sidecar_counts"][camera] = sidecar_count
+        if sidecar_count != actual_frames:
+            failures.append(f"{camera} sidecar rows {sidecar_count} != {actual_frames}")
+
+    tolerance_ns = int(round(cfg.online_sync.tolerance_ms * 1_000_000))
+    for camera, delta in (manifest.get("max_abs_delta_ns_by_camera") or {}).items():
+        try:
+            if int(delta) > tolerance_ns:
+                failures.append(f"{camera} max SOF delta {delta} ns > {tolerance_ns} ns")
+        except (TypeError, ValueError):
+            failures.append(f"{camera} invalid SOF delta {delta!r}")
+
+    payload["ok"] = not failures
+    payload["actual_frames"] = actual_frames
+    payload["frame_count_by_camera"] = frame_count_by_camera
+    payload["max_abs_delta_ns_by_camera"] = manifest.get("max_abs_delta_ns_by_camera") or {}
+    payload["failures"] = failures
+    return payload, None if not failures else "online_sync_failed"
 
 
 # ----------------------------------------------------------------- auto-recover ---
@@ -607,6 +873,7 @@ def _stream_configs(usable: list[int], cfg: gr.RecorderConfig) -> list[ps.Stream
             height=cfg.cameras.height,
             fps=cfg.cameras.fps,
             codec=cfg.cameras.codec,
+            container=cfg.cameras.container,
             bitrate_kbps=cfg.cameras.bitrate_kbps,
             iframe_interval=cfg.cameras.iframe_interval,
             preset_level=cfg.cameras.preset_level,
@@ -622,6 +889,23 @@ def _stream_configs(usable: list[int], cfg: gr.RecorderConfig) -> list[ps.Stream
         )
         for sid in usable
     ]
+
+
+def _effective_online_sync_preview_bus(cfg: gr.RecorderConfig) -> tuple[str, int]:
+    preview_frame_bus_dir = cfg.online_sync.preview_frame_bus_dir
+    if (
+        cfg.cameras.recorder_backend == "argus_online_sync"
+        and cfg.recording_preview_enabled
+        and not preview_frame_bus_dir
+    ):
+        preview_frame_bus_dir = str(aos.DEFAULT_PREVIEW_FRAME_BUS_DIR)
+    preview_frame_bus_every_n = cfg.online_sync.preview_frame_bus_every_n
+    if preview_frame_bus_every_n <= 0:
+        preview_frame_bus_every_n = max(
+            1,
+            int(round(cfg.cameras.fps / max(1, ps.PREVIEW_FPS))),
+        )
+    return preview_frame_bus_dir, preview_frame_bus_every_n
 
 
 # ----------------------------------------------------------------- main ---
@@ -651,6 +935,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     cfg = gr.load_config(args.config_path)
+    if cfg.cameras.recorder_backend == "argus_metadata":
+        cfg.argus_frame_sync.enabled = True
+        cfg.argus_frame_sync.required = True
     raw_yaml: dict[str, Any] = {}
     with args.config_path.open() as f:
         import yaml
@@ -704,11 +991,10 @@ def main(argv: list[str] | None = None) -> int:
     cfg.dataset_root.mkdir(parents=True, exist_ok=True)
     warmup_dir = cfg.dataset_root / "_warmup"
 
-    # Start BOX SDK BEFORE GStreamer pipelines: BOX SDK loads its own
-    # native .so + UDP listener; starting it while 11 nvarguscamerasrc
-    # pipelines and a GLib MainLoop are already running triggers
-    # SIGABRT on the first incoming UDP packet (see
-    # tools/data_collection_gui/docs/development_status.md).
+    # Start BOX SDK BEFORE the camera recorder: BOX SDK loads its own native
+    # .so + UDP listener; starting it after camera capture is already under
+    # heavy Argus/GStreamer load has previously triggered SIGABRT on the first
+    # incoming UDP packet (see tools/data_collection_gui/docs/development_status.md).
     box = bc.BoxPool(box_cfg)
     box_started = box.start() if box_cfg.enabled else False
     if box_started:
@@ -749,13 +1035,48 @@ def main(argv: list[str] | None = None) -> int:
         _emit("Box devices: (none)")
         logger.warning("box_collection enabled but BoxClient.start() returned False")
 
-    # Persistent GStreamer pipelines: spawn the N nvarguscamerasrc
-    # pipelines once here, then slice on demand inside the loop. This
-    # replaces the per-episode `gr.EpisodeSession(...)` model that paid
-    # ~stagger * N seconds of warmup before every StartEpisode.
-    def _make_pcs() -> ps.PersistentCameraSession:
+    # Session backend: production default is the Libargus metadata-integrated
+    # recorder. The legacy persistent GStreamer/splitmux backend remains
+    # available only when explicitly selected in YAML.
+    preview_frame_bus_dir, preview_frame_bus_every_n = _effective_online_sync_preview_bus(cfg)
+
+    def _make_pcs():
+        streams = _stream_configs(usable, cfg)
+        if cfg.cameras.recorder_backend == "argus_metadata":
+            return ams.ArgusMetadataCameraSession(
+                streams,
+                warmup_dir,
+                repo_root=repo_root,
+                connect_timeout_s=max(30.0, float(cfg.connect_timeout_s or 0.0)),
+                connect_stable_s=cfg.connect_stable_s,
+            )
+        if cfg.cameras.recorder_backend == "argus_online_sync":
+            return aos.ArgusOnlineSyncCameraSession(
+                streams,
+                warmup_dir,
+                repo_root=repo_root,
+                connect_timeout_s=max(30.0, float(cfg.connect_timeout_s or 0.0)),
+                connect_stable_s=cfg.connect_stable_s,
+                # UI recording is time-driven. thor_record.py starts the
+                # episode, waits for operator/auto-duration Stop, then sends
+                # STOP. Keep target_frames=0 so the recorder closes on the
+                # next full SOF cluster instead of converting the UI path into
+                # a fixed-frame direct-recorder test.
+                target_frames=0,
+                tolerance_ms=cfg.online_sync.tolerance_ms,
+                startup_full_clusters=cfg.online_sync.startup_full_clusters,
+                frame_timeout_ms=cfg.online_sync.frame_timeout_ms,
+                preflight_timeout_s=cfg.online_sync.preflight_timeout_s,
+                single_preflight_timeout_s=cfg.online_sync.single_preflight_timeout_s,
+                missing_frame_policy=cfg.online_sync.missing_frame_policy,
+                stop_mode=cfg.online_sync.stop_mode,
+                frame_bus_dir=cfg.online_sync.frame_bus_dir,
+                frame_bus_every_n=cfg.online_sync.frame_bus_every_n,
+                preview_frame_bus_dir=preview_frame_bus_dir,
+                preview_frame_bus_every_n=preview_frame_bus_every_n,
+            )
         return ps.PersistentCameraSession(
-            _stream_configs(usable, cfg),
+            streams,
             warmup_dir,
             spawn_stagger_s=cfg.spawn_stagger_s,
             connect_stable_s=cfg.connect_stable_s,
@@ -1087,14 +1408,15 @@ def main(argv: list[str] | None = None) -> int:
                 break
 
             ep_dir = cfg.dataset_root / "episodes" / f"episode_{ep_idx:06d}"
-            wall_start = datetime.now(timezone.utc).isoformat()
+            requested_wall_start = datetime.now(timezone.utc).isoformat()
             t0_split_start_mono = time.monotonic()
             handle = pcs.start_episode(ep_dir, ep_idx)
             t_start = handle.t0_wall_s
+            wall_start = _wallclock_utc_from_wall_s(t_start)
             split_emit_ms = (time.monotonic() - t0_split_start_mono) * 1000
             logger.info(
-                "episode %d started @ %s -> %s (split-now emit %.1fms)",
-                ep_idx, wall_start, ep_dir, split_emit_ms,
+                "episode %d started @ %s -> %s (requested %s, start %.1fms)",
+                ep_idx, wall_start, ep_dir, requested_wall_start, split_emit_ms,
             )
             if box_started:
                 # Pre-record health check: if the box stalled/degraded between
@@ -1186,15 +1508,56 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 decision = (decision_cmd.kind if decision_cmd else "save")
 
+            frame_sync_payload: dict[str, Any] | None = None
+            online_sync_payload: dict[str, Any] | None = None
+            if (
+                decision in ("save", "operator_save", "stream_exit")
+                and cfg.cameras.recorder_backend == "argus_metadata"
+                and cfg.argus_frame_sync.enabled
+            ):
+                frame_sync_payload, frame_sync_failure = _evaluate_argus_frame_sync(handle, cfg)
+                if frame_sync_failure is not None:
+                    details = ""
+                    if frame_sync_payload:
+                        failures = frame_sync_payload.get("failures") or []
+                        details = "; ".join(str(f) for f in failures)
+                    logger.error("Argus frame sync gate failed: %s %s", frame_sync_failure, details)
+                    _emit(
+                        "ERROR: Argus frame sync failed; episode will be discarded. "
+                        f"{details or frame_sync_failure}"
+                    )
+                    decision = frame_sync_failure
+
+            if (
+                decision in ("save", "operator_save", "stream_exit")
+                and cfg.cameras.recorder_backend == "argus_online_sync"
+            ):
+                online_sync_payload, online_sync_failure = _evaluate_online_sync_manifest(handle, cfg)
+                if online_sync_failure is not None:
+                    details = ""
+                    if online_sync_payload:
+                        failures = online_sync_payload.get("failures") or []
+                        details = "; ".join(str(f) for f in failures)
+                    logger.error("online sync gate failed: %s %s", online_sync_failure, details)
+                    _emit(
+                        "ERROR: Online sync failed; episode will be discarded. "
+                        f"{details or online_sync_failure}"
+                    )
+                    decision = online_sync_failure
+
             if decision in ("save", "operator_save", "stream_exit"):
                 meta_path = _write_episode_meta(
-                    handle, cfg, locked, argus_failed, box_cfg, box_snapshots,
-                    decision, wall_start, wall_end,
+                    handle, cfg, locked, argus_failed, connect_errors,
+                    box_cfg, box_snapshots, decision, wall_start, wall_end,
                 )
                 try:
                     payload = json.loads(meta_path.read_text())
                     payload["cleanup_duration_s"] = cleanup_duration_s
                     payload["split_emit_ms"] = split_emit_ms
+                    if frame_sync_payload is not None:
+                        payload["argus_frame_sync"] = frame_sync_payload
+                    if online_sync_payload is not None:
+                        payload["online_sync"] = online_sync_payload
                     meta_path.write_text(json.dumps(payload, indent=2))
                 except (OSError, json.JSONDecodeError) as exc:
                     logger.warning("failed to annotate cleanup duration: %s", exc)
