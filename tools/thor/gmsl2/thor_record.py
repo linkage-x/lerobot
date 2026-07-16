@@ -44,6 +44,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -69,6 +70,15 @@ from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
 
 logger = logging.getLogger("thor_record")
+
+
+def _name_with_camera_count(name: str, camera_count: int) -> str:
+    if camera_count <= 0:
+        return name
+    label = f"{camera_count}ch"
+    if re.search(r"(?<![A-Za-z0-9])(?:\d+|[Nn])ch(?![A-Za-z0-9])", name):
+        return re.sub(r"(?<![A-Za-z0-9])(?:\d+|[Nn])ch(?![A-Za-z0-9])", label, name, count=1)
+    return name
 
 
 _STDIN_HINT = (
@@ -201,36 +211,99 @@ def _fmt_force_vec(vec: list[float] | None) -> str:
     return ", ".join(f"{_FORCE_CHANNEL_LABELS[i]}={vec[i]:.4f}" for i in range(n))
 
 
-def _run_six_d_force_cali(box: bc.BoxPool) -> None:
-    """Trigger a 6D force-sensor calibration and stream progress as CALI_LOG lines.
+# Serialize calibrations: concurrent native SDK calibration calls (e.g. a rapid
+# 6D-then-touch click, now that the two buttons have independent running flags)
+# can wedge the SDK, after which EVERY later calibration hangs and the recorder
+# must be restarted. This lock rejects an overlapping request instead of piling
+# up threads on a blocked SDK.
+_CALI_LOCK = threading.Lock()
 
-    Runs on its own thread: the stdin reader must not block on the ~0.5s+ SDK
-    round-trip. Emits a terminal ``CALI_DONE ok|error`` line so the gateway can
-    mark the run complete and the frontend can stop spinning.
+
+def _run_six_d_force_cali(box: bc.BoxPool, *, origin: bool = False) -> None:
+    """Trigger 6D force-sensor zeroing and stream progress as CALI_LOG lines.
+
+    ``origin=False`` (default) runs box_sdk's software zeroing
+    (``cali_6d_force_sensor``); ``origin=True`` runs the MCU-side TLV origin
+    calibration (``cali_6d_force_sensor_origin``). Runs on its own thread: the
+    stdin reader must not block on the ~1s SDK round-trip. Emits a terminal
+    ``CALI_DONE ok|error`` line so the gateway can mark the run complete and the
+    frontend can stop spinning.
     """
-    _emit("CALI_LOG 6D force sensor calibration requested")
-    try:
-        results = box.calibrate_six_d_force()
-    except Exception as exc:  # noqa: BLE001 - calibration must never crash the recorder
-        _emit(f"CALI_LOG ERROR calibration raised: {exc}")
+    kind = "MCU origin" if origin else "software zero"
+    if not _CALI_LOCK.acquire(blocking=False):
+        _emit(f"CALI_LOG 6D force {kind}: another calibration in progress, ignored")
         _emit("CALI_DONE error")
         return
-    ok_all = bool(results)
-    for res in results:
-        label = res.get("box_id") or "box"
-        if res.get("ok"):
-            _emit(f"CALI_LOG [{label}] calibration OK (rc={res.get('rc')})")
-        else:
-            ok_all = False
-            _emit(
-                f"CALI_LOG [{label}] calibration FAILED (rc={res.get('rc')}): "
-                f"{res.get('error') or 'unknown error'}"
-            )
-        before, after = res.get("before"), res.get("after")
-        if before is not None or after is not None:
-            _emit(f"CALI_LOG [{label}] before: {_fmt_force_vec(before)}")
-            _emit(f"CALI_LOG [{label}] after:  {_fmt_force_vec(after)}")
-    _emit(f"CALI_DONE {'ok' if ok_all else 'error'}")
+    try:
+        _emit(f"CALI_LOG 6D force sensor {kind} requested")
+        try:
+            results = box.calibrate_six_d_force(origin=origin)
+        except Exception as exc:  # noqa: BLE001 - calibration must never crash the recorder
+            _emit(f"CALI_LOG ERROR calibration raised: {exc}")
+            _emit("CALI_DONE error")
+            return
+        ok_all = bool(results)
+        for res in results:
+            label = res.get("box_id") or "box"
+            if res.get("ok"):
+                _emit(
+                    f"CALI_LOG [{label}] {res.get('method', 'calibration')} OK "
+                    f"(rc={res.get('rc')})"
+                )
+            else:
+                ok_all = False
+                _emit(
+                    f"CALI_LOG [{label}] {res.get('method', 'calibration')} FAILED "
+                    f"(rc={res.get('rc')}): "
+                    f"{res.get('error') or 'unknown error'}"
+                )
+            before, after = res.get("before"), res.get("after")
+            if before is not None or after is not None:
+                _emit(f"CALI_LOG [{label}] before: {_fmt_force_vec(before)}")
+                _emit(f"CALI_LOG [{label}] after:  {_fmt_force_vec(after)}")
+        _emit(f"CALI_DONE {'ok' if ok_all else 'error'}")
+    finally:
+        _CALI_LOCK.release()
+
+
+def _run_touch_cali(box: bc.BoxPool) -> None:
+    """Trigger touch-sensor re-zeroing and stream progress as TOUCHCALI_LOG lines.
+
+    Uses its own TOUCHCALI_LOG/TOUCHCALI_DONE stdout channel (distinct from the
+    6D force CALI_LOG/CALI_DONE) so the gateway routes it to a separate buffer
+    and the touch viewer never shows 6D force lines. Runs on its own thread so
+    the stdin reader never blocks on the SDK round-trip.
+    """
+    if not _CALI_LOCK.acquire(blocking=False):
+        _emit("TOUCHCALI_LOG touch: another calibration in progress, ignored")
+        _emit("TOUCHCALI_DONE error")
+        return
+    try:
+        _emit("TOUCHCALI_LOG touch sensor re-zero requested")
+        try:
+            results = box.calibrate_touch()
+        except Exception as exc:  # noqa: BLE001 - calibration must never crash the recorder
+            _emit(f"TOUCHCALI_LOG ERROR calibration raised: {exc}")
+            _emit("TOUCHCALI_DONE error")
+            return
+        ok_all = bool(results)
+        for res in results:
+            label = res.get("box_id") or "box"
+            if res.get("ok"):
+                _emit(
+                    f"TOUCHCALI_LOG [{label}] {res.get('method', 'calibration')} OK "
+                    f"(rc={res.get('rc')})"
+                )
+            else:
+                ok_all = False
+                _emit(
+                    f"TOUCHCALI_LOG [{label}] {res.get('method', 'calibration')} FAILED "
+                    f"(rc={res.get('rc')}): "
+                    f"{res.get('error') or 'unknown error'}"
+                )
+        _emit(f"TOUCHCALI_DONE {'ok' if ok_all else 'error'}")
+    finally:
+        _CALI_LOCK.release()
 
 
 def _read_stdin_loop(
@@ -238,6 +311,8 @@ def _read_stdin_loop(
     stop: threading.Event,
     on_demand: Callable[[], None] | None = None,
     on_calibrate: Callable[[], None] | None = None,
+    on_calibrate_origin: Callable[[], None] | None = None,
+    on_calibrate_touch: Callable[[], None] | None = None,
 ) -> None:
     while not stop.is_set():
         line = sys.stdin.readline()
@@ -270,6 +345,15 @@ def _read_stdin_loop(
             # own thread so reading further stdin lines never blocks on it.
             if on_calibrate is not None:
                 on_calibrate()
+        elif stripped == "cali_6dforce_origin":
+            # MCU-side TLV origin calibration variant of cali_6dforce above.
+            if on_calibrate_origin is not None:
+                on_calibrate_origin()
+        elif stripped == "calitouch":
+            # Out-of-band touch-sensor calibration request from the gateway,
+            # analogous to cali_6dforce above: a side-effect, not an FSM command.
+            if on_calibrate_touch is not None:
+                on_calibrate_touch()
         else:
             logger.warning("ignoring unrecognized stdin command: %r", line)
 
@@ -392,6 +476,10 @@ def _write_sensor_samples(
         per_sensor[sid] = per_sensor.get(sid, 0) + 1
     logger.info("wrote %d sensor samples to %s (%s)", len(all_samples), path, per_sensor)
     return path
+
+
+def _has_recorded_sensor_samples(samples: dict[str, list[bc.SensorSample]] | None) -> bool:
+    return any(bool(sensor_samples) for sensor_samples in (samples or {}).values())
 
 
 def _wallclock_utc_from_wall_s(wall_s: float) -> str:
@@ -948,14 +1036,12 @@ def main(argv: list[str] | None = None) -> int:
         auto_cfg.enabled = False
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    cfg.dataset_root = cfg.dataset_root.parent / f"{cfg.dataset_root.name}_{stamp}"
+    dataset_root_base = cfg.dataset_root
 
     repo_root = args.repo_root.resolve()
     if args.skip_hardware_sync:
         cfg.hardware_sync.enabled = False
     gr.maybe_setup_sync(cfg, repo_root)
-
-    _emit(f"Dataset root: {cfg.dataset_root}")
 
     _emit("Connecting: detecting MAX96726 locked cameras...")
     locked = gr.detect_locked_sids(cfg, repo_root)
@@ -978,6 +1064,11 @@ def main(argv: list[str] | None = None) -> int:
     _emit(f"Connecting: {len(usable)}/{len(locked)} cameras verified")
 
     camera_ids = [f"{cfg.name_prefix}_{sid:02d}" for sid in usable]
+    camera_count = len(camera_ids)
+    dataset_name = _name_with_camera_count(dataset_root_base.name, camera_count)
+    cfg.dataset_root = dataset_root_base.parent / f"{dataset_name}_{stamp}"
+    cfg.repo_id = _name_with_camera_count(cfg.repo_id, camera_count)
+    _emit(f"Dataset root: {cfg.dataset_root}")
     _emit(f"Cameras: {', '.join(camera_ids)}")
 
     if cfg.hardware_sync.enabled:
@@ -1275,9 +1366,27 @@ def main(argv: list[str] | None = None) -> int:
             daemon=True, name="thor-record-cali",
         ).start()
 
+    def _trigger_six_d_force_cali_origin() -> None:
+        # MCU-side origin calibration variant; same offload pattern.
+        threading.Thread(
+            target=_run_six_d_force_cali, args=(box,), kwargs={"origin": True},
+            daemon=True, name="thor-record-cali-origin",
+        ).start()
+
+    def _trigger_touch_cali() -> None:
+        # Same offload pattern as the 6D force calibration above.
+        threading.Thread(
+            target=_run_touch_cali, args=(box,),
+            daemon=True, name="thor-record-touch-cali",
+        ).start()
+
     stdin_thread = threading.Thread(
         target=_read_stdin_loop,
-        args=(cmd_queue, stop_event, _note_preview_demand, _trigger_six_d_force_cali),
+        args=(
+            cmd_queue, stop_event, _note_preview_demand,
+            _trigger_six_d_force_cali, _trigger_six_d_force_cali_origin,
+            _trigger_touch_cali,
+        ),
         daemon=True, name="thor-record-stdin",
     )
     stdin_thread.start()
@@ -1561,7 +1670,8 @@ def main(argv: list[str] | None = None) -> int:
                     meta_path.write_text(json.dumps(payload, indent=2))
                 except (OSError, json.JSONDecodeError) as exc:
                     logger.warning("failed to annotate cleanup duration: %s", exc)
-                if recorded_samples:
+                has_recorded_samples = _has_recorded_sensor_samples(recorded_samples)
+                if has_recorded_samples:
                     _write_sensor_samples(ep_dir, recorded_samples, t_start)
                 sensor_data = {
                     sid: [{"t_rel_s": s.wall_time_s - t_start,
@@ -1569,12 +1679,22 @@ def main(argv: list[str] | None = None) -> int:
                            "data": s.data}
                           for s in slist]
                     for sid, slist in recorded_samples.items()
-                } if recorded_samples else None
+                } if has_recorded_samples else None
+                # Only high-frequency recorded samples are valid per-frame BOX data.
+                # If the BOX stream stalls, box_snapshots can still contain a fresh-looking
+                # SDK cache with non-advancing MCU timestamps; using those snapshots as the
+                # legacy fallback would fill the whole parquet with stale sensor values.
+                v3_snapshots = box_snapshots if sensor_data else []
                 try:
                     if lr3_writer is not None:
+                        if box_started and not sensor_data:
+                            logger.warning(
+                                "BOX LeRobot v3 rows skipped: no recorded BOX samples; "
+                                "not using stale live snapshots as frame observations"
+                            )
                         v3_path = lr3_writer.append_episode(
                             episode_index=ep_idx,
-                            snapshots=box_snapshots,
+                            snapshots=v3_snapshots,
                             duration_s=duration_s,
                             sensor_samples=sensor_data,
                             t0_wall_s=t_start,
@@ -1582,7 +1702,7 @@ def main(argv: list[str] | None = None) -> int:
                         )
                         if v3_path is not None:
                             logger.info("wrote BOX LeRobot v3 rows: %s", v3_path)
-                    elif box_snapshots or sensor_data:
+                    elif v3_snapshots or sensor_data:
                         logger.warning("BOX LeRobot v3 rows skipped; writer is unavailable")
                 except Exception as exc:
                     logger.warning("failed to write BOX LeRobot v3 rows: %s", exc)

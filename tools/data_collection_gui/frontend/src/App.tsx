@@ -3,6 +3,7 @@ import { DataCollectionGuiApi, type GuiSnapshot } from "./api";
 import { ReplayInspector } from "./ReplayInspector";
 import type {
   BoxPreviewPayload,
+  BoxCaliLog,
   BoxCaliLogLine,
   CollectionTask,
   ConfigSummary,
@@ -311,7 +312,19 @@ function ReplayPanel({
   const validationGuidance = mujocoPassed
     ? "MuJoCo replay is current for this episode."
     : "Strongly recommended before Preflight/Dry Run; required before Real Robot.";
-  const realRobotDisabled = busy || isActive || status.safety !== "ready" || !mujocoPassed;
+  const isExportedDataset = status.datasetKind === "exported";
+  const realRobotDisabledReason = isExportedDataset
+    ? "Real Robot is disabled for exported datasets: exported action is next-frame observation.state, not a verified robot command stream."
+    : busy
+      ? "Gateway command is already running."
+      : isActive
+        ? "Replay is already active."
+        : status.safety !== "ready"
+          ? "Run Preflight before real-robot replay."
+          : !mujocoPassed
+            ? "Run MuJoCo replay successfully before real-robot replay."
+            : "";
+  const realRobotDisabled = busy || isActive || status.safety !== "ready" || !mujocoPassed || isExportedDataset;
   return (
     <section className="panel replay-panel">
       <div className="panel-heading">
@@ -325,7 +338,9 @@ function ReplayPanel({
         <button disabled={busy || isActive || !canReplayData} onClick={onPreflight}>Preflight</button>
         <button disabled={busy || isActive || status.safety !== "ready"} onClick={() => onReplay(false)}>Dry Run</button>
         <button disabled={busy || isActive || !canReplayData} onClick={onMujocoReplay}>MuJoCo</button>
-        <button className="danger" disabled={realRobotDisabled} onClick={() => onReplay(true)}>Real Robot</button>
+        <span className="button-tooltip" title={realRobotDisabled ? realRobotDisabledReason : "Start real-robot replay"}>
+          <button className="danger" disabled={realRobotDisabled} onClick={() => onReplay(true)}>Real Robot</button>
+        </span>
         <button disabled={busy || !isActive} onClick={onAbort}>Abort</button>
       </div>
       <p className="panel-note">Safety {status.safety} · {status.message}</p>
@@ -379,7 +394,7 @@ function RecordedDatasetList({
   return (
     <section className="panel dataset-list-panel">
       <div className="panel-heading">
-        <h2>Recorded Datasets</h2>
+        <h2>Replay Datasets</h2>
         <span>{datasets.length} found</span>
       </div>
       {latest ? (
@@ -389,7 +404,7 @@ function RecordedDatasetList({
           <small>{latest.path}</small>
         </div>
       ) : (
-        <div className="empty-dataset-list">No recorded datasets found under the configured dataset root.</div>
+        <div className="empty-dataset-list">No replay datasets found under the configured dataset or exports roots.</div>
       )}
       <div className="dataset-list">
         {datasets.map((dataset) => {
@@ -405,6 +420,7 @@ function RecordedDatasetList({
                 <div className="row-title">
                   <StatusDot state={dataset.dataStatus === "loaded" ? "running" : "warning"} />
                   <strong>{dataset.name}</strong>
+                  {dataset.datasetKind === "exported" ? <em>exported</em> : null}
                   {dataset.isLatest ? <em>latest</em> : null}
                 </div>
                 <p>{dataset.path}</p>
@@ -1018,12 +1034,14 @@ function EpisodeSelector({
   status,
   annotation,
   busy,
-  onSelectEpisode
+  onSelectEpisode,
+  onDeleteEpisode
 }: {
   status: ReplayStatus;
   annotation?: EpisodeAnnotation;
   busy: boolean;
   onSelectEpisode: (episode: number) => void;
+  onDeleteEpisode: (episode: number) => void;
 }) {
   const [pendingEpisode, setPendingEpisode] = useState<number | null>(null);
   const [episodeInput, setEpisodeInput] = useState(String(status.episode ?? 0));
@@ -1034,6 +1052,25 @@ function EpisodeSelector({
   const currentIndex = options.indexOf(current);
   const hasPrevious = currentIndex > 0;
   const hasNext = currentIndex >= 0 && currentIndex < options.length - 1;
+  // Guard against wiping the dataset: the backend also refuses, but hide the
+  // action entirely when only one episode is left so it can't be attempted.
+  const canDelete = !busy && currentIndex >= 0 && options.length > 1;
+
+  const requestDelete = () => {
+    if (!canDelete) {
+      return;
+    }
+    const confirmed = window.confirm(
+      `Delete episode ${current}? This permanently removes its frames and videos from disk and ` +
+        `renumbers the remaining ${options.length - 1} episode(s). This cannot be undone.`
+    );
+    if (confirmed) {
+      // Don't touch pendingEpisode here: that state tracks episode *switches* and
+      // deleting the tail lands on a different index, which would leave it stuck.
+      // The busy flag already disables the controls while the delete runs.
+      onDeleteEpisode(current);
+    }
+  };
   const switching = pendingEpisode != null && (busy || pendingEpisode !== current);
   const inputEpisode = episodeInput.trim() === "" ? NaN : Number(episodeInput);
   const inputIsInteger = Number.isInteger(inputEpisode);
@@ -1107,6 +1144,14 @@ function EpisodeSelector({
           <button disabled={!canGoToInput} onClick={submitEpisodeInput}>Go</button>
         </div>
         <button disabled={busy || !hasNext} onClick={() => selectEpisode(options[currentIndex + 1])}>Next</button>
+        <button
+          className="danger"
+          disabled={!canDelete}
+          title="Delete this episode from disk and reindex the rest"
+          onClick={requestDelete}
+        >
+          Delete
+        </button>
       </div>
       <div className="episode-badges">
         {annotation?.outcome && annotation.outcome !== "unreviewed" && (
@@ -1134,6 +1179,7 @@ function EpisodeReplayPage({
   onAbort,
   onSelectDataset,
   onSelectEpisode,
+  onDeleteEpisode,
   onGenerateForActive,
   onOpenProcessing,
   onSaveAnnotation
@@ -1146,13 +1192,14 @@ function EpisodeReplayPage({
   onAbort: () => void;
   onSelectDataset: (path: string) => void;
   onSelectEpisode: (episode: number) => void;
+  onDeleteEpisode: (episode: number) => void;
   onGenerateForActive: () => void;
   onOpenProcessing: () => void;
   onSaveAnnotation: (annotation: EpisodeAnnotation) => void;
 }) {
   const activePath = snapshot.replay.datasetRoot ?? snapshot.replay.dataset;
   const matchingProcessing =
-    snapshot.processing.find((item) => item.path === activePath) ?? snapshot.processing[0] ?? null;
+    snapshot.processing.find((item) => item.path === activePath) ?? null;
   return (
     <div className="page-stack">
       <PageHeader title="Episode Replay" subtitle="consume processed trajectories: timeline review, safety preflight, dry-run, and real-robot replay" />
@@ -1179,8 +1226,8 @@ function EpisodeReplayPage({
           onAbort={onAbort}
         />
       </div>
-      <EpisodeSelector status={snapshot.replay} annotation={snapshot.annotation} busy={busy} onSelectEpisode={onSelectEpisode} />
-      <ReplayInspector api={api} datasetPath={activePath} episode={snapshot.replay.episode} fallbackFps={snapshot.replay.fps} />
+      <EpisodeSelector status={snapshot.replay} annotation={snapshot.annotation} busy={busy} onSelectEpisode={onSelectEpisode} onDeleteEpisode={onDeleteEpisode} />
+      <ReplayInspector api={api} datasetPath={activePath} episode={snapshot.replay.episode} fallbackFps={snapshot.replay.fps} revision={snapshot.replay.revision ?? 0} />
       <EpisodeAnnotationPanel
         annotation={snapshot.annotation}
         datasetPath={activePath}
@@ -1263,6 +1310,48 @@ function ProcessingRow({
         </div>
       </button>
       <div className="processing-actions">{primary}</div>
+    </div>
+  );
+}
+
+
+function OnlineSyncManifestBlock({ item }: { item: ProcessingItem }) {
+  const summary = item.onlineSync;
+  if (!summary) {
+    return null;
+  }
+  const maxDelta = summary.maxSofDeltaMs;
+  const statusLabel = summary.status === "pass" ? "pass" : summary.status === "missing" ? "missing" : "fail";
+  const shownEpisodes = summary.episodes.slice(0, 6);
+  return (
+    <div className="qc-block online-sync-block">
+      <div className="qc-block-heading">
+        <h3>Online Sync Manifest</h3>
+        <span className={`sync-status sync-status-${statusLabel}`}>{statusLabel}</span>
+      </div>
+      <div className="summary-grid compact-summary-grid">
+        <Metric label="Episodes" value={`${summary.ok}/${summary.totalEpisodes}`} />
+        <Metric label="Actual frames" value={summary.actualFrames} />
+        <Metric label="Max SOF delta" value={maxDelta != null ? `${maxDelta.toFixed(3)} ms` : "—"} />
+        <Metric label="Missing" value={summary.missing} />
+      </div>
+      <div className="online-sync-episodes">
+        {shownEpisodes.map((episode) => {
+          const countText = Object.entries(episode.frameCountByCamera)
+            .slice(0, 4)
+            .map(([camera, count]) => `${camera}:${count}`)
+            .join(" ");
+          return (
+            <div className="online-sync-episode" key={episode.episode}>
+              <strong>ep {episode.episode}</strong>
+              <span>{episode.actualFrames != null ? `${episode.actualFrames} frames` : "no manifest"}</span>
+              <span>{episode.maxSofDeltaMs != null ? `${episode.maxSofDeltaMs.toFixed(3)} ms` : "—"}</span>
+              <small>{episode.ok ? countText || "counts ok" : episode.failure || "failed"}</small>
+            </div>
+          );
+        })}
+      </div>
+      {summary.failureReasons.length ? <p className="panel-note">{summary.failureReasons[0]}</p> : null}
     </div>
   );
 }
@@ -1423,6 +1512,7 @@ function DatasetProcessingPage({
               <h3>QC summary</h3>
               <p>{selected.qcSummary}</p>
             </div>
+            <OnlineSyncManifestBlock item={selected} />
             <div className="log-block">
               <h3>Log</h3>
               {selected.logTail.length === 0 ? (
@@ -1474,13 +1564,15 @@ function DatasetExportPage({
   busy,
   onExportTask,
   onExportApprovedDataset,
-  onOpenProcessing
+  onOpenProcessing,
+  onOpenReplay
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
   onExportTask: (id: string) => void;
   onExportApprovedDataset: (path: string) => void;
   onOpenProcessing: () => void;
+  onOpenReplay: (path: string) => void;
 }) {
   const exportStatus = snapshot.datasetExport;
   const eligible = snapshot.processing.filter((item) => item.status === "qc_pass");
@@ -1535,6 +1627,11 @@ function DatasetExportPage({
             <Metric label="Message" value={exportStatus.message} />
           </div>
         )}
+        {exportStatus.outputPath ? (
+          <div className="control-row">
+            <button disabled={busy || exporting} onClick={() => onOpenReplay(exportStatus.outputPath)}>Open Replay</button>
+          </div>
+        ) : null}
       </section>
       <section className="panel">
         <div className="panel-heading">
@@ -1991,7 +2088,7 @@ function BoxLivePreview({ device }: { device: DeviceStatus }) {
       }
     };
     load();
-    const timer = window.setInterval(load, 100);
+    const timer = window.setInterval(load, 300);
     return () => {
       mounted = false;
       window.clearInterval(timer);
@@ -2142,13 +2239,40 @@ function BoxForceTileView({ sensor }: { sensor?: Record<string, unknown> | null 
 // Calibrate button + scrolling log box for the BOX 6D force sensor. Triggering
 // rides the recorder's stdin (gateway POST), and progress streams back as
 // CALI_LOG/CALI_DONE lines the gateway buffers; we poll that buffer while a run
-// is active and auto-scroll the box to the newest line.
-function SixDForceCalibration() {
+// is active and auto-scroll the box to the newest line. All box calibrations
+// (6D force software-zero, 6D force MCU origin, touch) share this one buffer --
+// the recorder runs them one at a time -- so a tile can expose several buttons
+// that all feed the same log panel.
+type BoxCalibrationAction = {
+  idleLabel: string;
+  busyLabel: string;
+  trigger: () => Promise<{ ok: boolean; error?: string }>;
+};
+
+// 6D force and touch each have their own log endpoint/buffer, so the viewer is
+// parametrized by fetchLog and only ever shows its own calibration's lines.
+function BoxCalibration({
+  actions,
+  fetchLog,
+}: {
+  actions: BoxCalibrationAction[];
+  fetchLog: () => Promise<BoxCaliLog | null>;
+}) {
   const [lines, setLines] = useState<BoxCaliLogLine[]>([]);
   const [running, setRunning] = useState(false);
+  const [busyIdx, setBusyIdx] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
   const pollRef = useRef<number | null>(null);
+
+  // The parent passes fetchLog as an inline arrow, so its identity changes every
+  // render. Read it through a ref so `poll` stays stable -- otherwise `poll` (and
+  // the mount effect that depends on it) would be recreated every parent render,
+  // tearing down and restarting the poll interval and firing extra requests.
+  const fetchLogRef = useRef(fetchLog);
+  useEffect(() => {
+    fetchLogRef.current = fetchLog;
+  }, [fetchLog]);
 
   const stopPolling = useCallback(() => {
     if (pollRef.current != null) {
@@ -2158,13 +2282,14 @@ function SixDForceCalibration() {
   }, []);
 
   const poll = useCallback(async () => {
-    const log = await api.fetchBoxCaliLog();
+    const log = await fetchLogRef.current();
     if (!log) {
       return;
     }
     setLines(log.lines);
     setRunning(log.running);
     if (!log.running) {
+      setBusyIdx(null);
       stopPolling();
     }
   }, [stopPolling]);
@@ -2183,27 +2308,39 @@ function SixDForceCalibration() {
     }
   }, [lines]);
 
-  const onCalibrate = useCallback(async () => {
-    setError(null);
-    setRunning(true);
-    const res = await api.triggerSixDForceCalibration();
-    if (!res.ok) {
-      setError(res.error ?? "calibration failed to start");
-      setRunning(false);
-      poll(); // surface whatever the gateway appended (e.g. "recorder not connected")
-      return;
-    }
-    stopPolling();
-    pollRef.current = window.setInterval(poll, 300);
-    poll();
-  }, [poll, stopPolling]);
+  const onCalibrate = useCallback(
+    async (idx: number, trigger: BoxCalibrationAction["trigger"]) => {
+      setError(null);
+      setRunning(true);
+      setBusyIdx(idx);
+      const res = await trigger();
+      if (!res.ok) {
+        setError(res.error ?? "calibration failed to start");
+        setRunning(false);
+        setBusyIdx(null);
+        poll(); // surface whatever the gateway appended (e.g. "recorder not connected")
+        return;
+      }
+      stopPolling();
+      pollRef.current = window.setInterval(poll, 300);
+      poll();
+    },
+    [poll, stopPolling],
+  );
 
   return (
     <div className="force-cali">
       <div className="force-cali-controls">
-        <button className="force-cali-btn" onClick={onCalibrate} disabled={running}>
-          {running ? "Calibrating…" : "Calibrate 6D force"}
-        </button>
+        {actions.map((action, idx) => (
+          <button
+            key={action.idleLabel}
+            className="force-cali-btn"
+            onClick={() => onCalibrate(idx, action.trigger)}
+            disabled={running}
+          >
+            {running && busyIdx === idx ? action.busyLabel : action.idleLabel}
+          </button>
+        ))}
         {error && <span className="force-cali-error">{error}</span>}
       </div>
       <div className="force-cali-log" ref={logRef}>
@@ -2233,7 +2370,7 @@ function BoxSensorTile({ device }: { device: DeviceStatus }) {
       }
     };
     load();
-    const timer = window.setInterval(load, 100);
+    const timer = window.setInterval(load, 300);
     return () => {
       mounted = false;
       window.clearInterval(timer);
@@ -2289,7 +2426,23 @@ function BoxSensorTile({ device }: { device: DeviceStatus }) {
         <strong>{device.id}</strong>
         <span className="camera-tile-stat">{device.fps} Hz</span>
       </div>
-      {isForce && <SixDForceCalibration />}
+      {isForce && (
+        <BoxCalibration
+          fetchLog={() => api.fetchBoxCaliLog()}
+          actions={[
+            {
+              idleLabel: "Calibrate 6D force",
+              busyLabel: "Calibrating…",
+              trigger: () => api.triggerSixDForceCalibration(),
+            },
+            {
+              idleLabel: "Calibrate 6D (origin)",
+              busyLabel: "Calibrating…",
+              trigger: () => api.triggerSixDForceOriginCalibration(),
+            },
+          ]}
+        />
+      )}
     </div>
   );
 }
@@ -2543,6 +2696,24 @@ function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
                     ))}
                 </div>
               )}
+              {/* Touch calibration is a whole-box op (cali_touch_sensor takes only
+                  a device_id; the SDK has no per-pad variant), so it lives at the
+                  box level -- not on the L or R pad tile -- to avoid implying it
+                  only affects one pad. */}
+              {items.some((d) => boxSensorSuffix(d.id).startsWith("box_touch")) && (
+                <div className="box-touch-cali">
+                  <BoxCalibration
+                    fetchLog={() => api.fetchBoxTouchCaliLog()}
+                    actions={[
+                      {
+                        idleLabel: "Calibrate touch (L+R)",
+                        busyLabel: "Calibrating…",
+                        trigger: () => api.triggerTouchCalibration(),
+                      },
+                    ]}
+                  />
+                </div>
+              )}
               {items
                 .filter((d) => !isVisualBoxSensor(d.id))
                 .map((device) => (
@@ -2739,6 +2910,7 @@ function App() {
         onAbort={() => run(() => api.abortReplay())}
         onSelectDataset={(path) => run(() => api.selectRecordedDataset(path))}
         onSelectEpisode={(episode) => run(() => api.selectReplayEpisode(episode))}
+        onDeleteEpisode={(episode) => run(() => api.deleteReplayEpisode(episode))}
         onGenerateForActive={() => replayMatch && queueTrajGenAndOpenProcessing(replayMatch.path)}
         onOpenProcessing={() => navigate("dataset-processing")}
         onSaveAnnotation={(annotation) => run(() => api.saveEpisodeAnnotation(annotation))}
@@ -2752,6 +2924,7 @@ function App() {
         onExportTask={exportTaskWithQcGuard}
         onExportApprovedDataset={(path) => run(() => api.exportApprovedDataset(path))}
         onOpenProcessing={() => navigate("dataset-processing")}
+        onOpenReplay={(path) => selectAndOpenReplay(path)}
       />
     ) : activePage === "task-library" ? (
       <TaskLibraryPage

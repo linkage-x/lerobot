@@ -2,10 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
-import type { EePose } from "./types";
+import type { EePose, ForceVector } from "./types";
 
 type Vec3 = [number, number, number];
 type NamedTrajectory = { name: string; points: Vec3[]; color: number };
+type TrajectorySegment = Vec3[];
 type NamedPose = { name: string; pose: EePose | null; color: number };
 
 const PIKA_ASSET_BASE = "/api/assets/pika";
@@ -16,6 +17,18 @@ const PIKA_TCP_ROTATION = new THREE.Euler(3.1415926, -1.5707963, 0, "ZYX");
 const PIKA_LEFT_ORIGIN = new THREE.Vector3(0.0815, 0.08851, 0.0064182);
 const PIKA_RIGHT_ORIGIN = new THREE.Vector3(0.0815, -0.088529, 0.0064182);
 const PIKA_JAW_STROKE = 0.05; // per-jaw travel in metres (URDF limit)
+const FORCE_VECTOR_METERS_PER_NEWTON = 0.03;
+const FORCE_VECTOR_MAX_LENGTH_M = 0.35;
+const TRAJECTORY_MAX_STEP_M = 0.25;
+// Approximation: use the Pika+ATI chain from fr3_pika_gripper_ati.urdf
+// (ati_pika_joint rpy=-0.739815) to orient the wrist force vector.
+// The current hardware is Monte gripper + Yuli force sensor; replace this
+// with the exact URDF/extrinsic once that model is available.
+const PIKA_ATI_TO_GRIPPER_BASE_RPY_X = -0.739815;
+const PIKA_ATI_TO_GRIPPER_BASE_ROTATION = new THREE.Quaternion().setFromEuler(
+  new THREE.Euler(PIKA_ATI_TO_GRIPPER_BASE_RPY_X, 0, 0, "XYZ")
+);
+const PIKA_FORCE_SENSOR_TO_GRIPPER_BASE_ROTATION = PIKA_ATI_TO_GRIPPER_BASE_ROTATION.clone().invert();
 
 let cachedMeshPromise: Promise<{
   base: THREE.BufferGeometry;
@@ -85,6 +98,16 @@ function buildBaseFromTcpMatrix(): THREE.Matrix4 {
   return buildTcpFromBaseMatrix().invert();
 }
 
+function forceSensorToGripperBase(force: THREE.Vector3): THREE.Vector3 {
+  return force.clone().applyQuaternion(PIKA_FORCE_SENSOR_TO_GRIPPER_BASE_ROTATION);
+}
+
+function gripperBaseToWorldVector(force: THREE.Vector3, baseGroup: THREE.Group): THREE.Vector3 {
+  const baseWorldRotation = new THREE.Quaternion();
+  baseGroup.getWorldQuaternion(baseWorldRotation);
+  return force.clone().applyQuaternion(baseWorldRotation);
+}
+
 function makeAxisHelper(length: number): THREE.LineSegments {
   const points: number[] = [
     0, 0, 0, length, 0, 0,
@@ -109,14 +132,70 @@ function makeGroundGrid(size: number, divisions: number): THREE.GridHelper {
   return grid;
 }
 
+function isFinitePoint(point: Vec3): boolean {
+  return point.every(Number.isFinite);
+}
+
+function distanceBetween(a: Vec3, b: Vec3): number {
+  return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+}
+
+function splitTrajectory(points: Vec3[], maxStepM = TRAJECTORY_MAX_STEP_M): TrajectorySegment[] {
+  const segments: TrajectorySegment[] = [];
+  let current: TrajectorySegment = [];
+  let previous: Vec3 | null = null;
+  for (const point of points) {
+    if (!isFinitePoint(point)) {
+      if (current.length > 1) {
+        segments.push(current);
+      }
+      current = [];
+      previous = null;
+      continue;
+    }
+    if (previous && distanceBetween(previous, point) > maxStepM) {
+      if (current.length > 1) {
+        segments.push(current);
+      }
+      current = [];
+    }
+    current.push(point);
+    previous = point;
+  }
+  if (current.length > 1) {
+    segments.push(current);
+  }
+  return segments;
+}
+
+function makeTrajectoryLine(points: Vec3[], color: number): THREE.Line {
+  const positions = new Float32Array(points.length * 3);
+  for (let i = 0; i < points.length; i++) {
+    positions[i * 3 + 0] = points[i][0];
+    positions[i * 3 + 1] = points[i][1];
+    positions[i * 3 + 2] = points[i][2];
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  const material = new THREE.LineBasicMaterial({ color, linewidth: 2 });
+  return new THREE.Line(geometry, material);
+}
+
+function disposeLine(line: THREE.Line): void {
+  line.geometry.dispose();
+  (line.material as THREE.Material).dispose();
+}
+
 export function Pose3DViewer({
   trajectory,
   currentPose,
+  forceVector = null,
   extraTrajectories = [],
   currentExtraPoses = []
 }: {
   trajectory: Vec3[];
   currentPose: EePose | null;
+  forceVector?: ForceVector | null;
   extraTrajectories?: NamedTrajectory[];
   currentExtraPoses?: NamedPose[];
 }) {
@@ -132,16 +211,17 @@ export function Pose3DViewer({
     baseGroup: THREE.Group;
     leftJaw: THREE.Mesh | null;
     rightJaw: THREE.Mesh | null;
-    trajectoryLine: THREE.Line | null;
+    trajectoryLines: THREE.Line[];
     extraTrajectoryLines: THREE.Line[];
     extraPoseMarkers: THREE.Mesh[];
+    forceArrow: THREE.ArrowHelper;
     eeFrame: THREE.LineSegments;
     requestRender: () => void;
     dispose: () => void;
   } | null>(null);
 
   const targetCenter = useMemo<Vec3>(() => {
-    const allPoints = [trajectory, ...extraTrajectories.map((entry) => entry.points)].flat();
+    const allPoints = [trajectory, ...extraTrajectories.map((entry) => entry.points)].flat().filter(isFinitePoint);
     if (!allPoints.length) {
       return [0, 0, 0];
     }
@@ -204,6 +284,17 @@ export function Pose3DViewer({
     baseGroup.applyMatrix4(buildBaseFromTcpMatrix());
     eeGroup.add(baseGroup);
 
+    const forceArrow = new THREE.ArrowHelper(
+      new THREE.Vector3(1, 0, 0),
+      new THREE.Vector3(0, 0, 0),
+      0.1,
+      0xdc2626,
+      0.035,
+      0.018
+    );
+    forceArrow.visible = false;
+    scene.add(forceArrow);
+
     let animationFrame = 0;
     let renderPending = false;
     function requestRender() {
@@ -239,9 +330,10 @@ export function Pose3DViewer({
       baseGroup,
       leftJaw: null,
       rightJaw: null,
-      trajectoryLine: null,
+      trajectoryLines: [],
       extraTrajectoryLines: [],
       extraPoseMarkers: [],
+      forceArrow,
       eeFrame,
       requestRender,
       dispose: () => {
@@ -324,56 +416,53 @@ export function Pose3DViewer({
     } else {
       state.eeGroup.visible = false;
     }
+
+    const rawForce = forceVector ? new THREE.Vector3(forceVector.x, forceVector.y, forceVector.z) : null;
+    const forceMagnitude = forceVector?.magnitude ?? rawForce?.length() ?? 0;
+    if (currentPose && rawForce && forceMagnitude > 1e-6) {
+      state.eeGroup.updateMatrixWorld(true);
+      const forceInGripperBase = forceSensorToGripperBase(rawForce);
+      const forceInWorld = gripperBaseToWorldVector(forceInGripperBase, state.baseGroup);
+      const direction = forceInWorld.normalize();
+      const length = Math.min(FORCE_VECTOR_MAX_LENGTH_M, forceMagnitude * FORCE_VECTOR_METERS_PER_NEWTON);
+      const forceOrigin = new THREE.Vector3();
+      state.baseGroup.getWorldPosition(forceOrigin);
+      state.forceArrow.position.copy(forceOrigin);
+      state.forceArrow.setDirection(direction);
+      state.forceArrow.setLength(length, 0.035, 0.018);
+      state.forceArrow.visible = true;
+    } else {
+      state.forceArrow.visible = false;
+    }
     state.requestRender();
-  }, [currentPose]);
+  }, [currentPose, forceVector]);
 
   useEffect(() => {
     const state = sceneStateRef.current;
     if (!state) {
       return;
     }
-    if (state.trajectoryLine) {
-      state.scene.remove(state.trajectoryLine);
-      state.trajectoryLine.geometry.dispose();
-      (state.trajectoryLine.material as THREE.Material).dispose();
-      state.trajectoryLine = null;
+    for (const line of state.trajectoryLines) {
+      state.scene.remove(line);
+      disposeLine(line);
     }
-    if (trajectory.length > 1) {
-      const positions = new Float32Array(trajectory.length * 3);
-      for (let i = 0; i < trajectory.length; i++) {
-        positions[i * 3 + 0] = trajectory[i][0];
-        positions[i * 3 + 1] = trajectory[i][1];
-        positions[i * 3 + 2] = trajectory[i][2];
-      }
-      const geometry = new THREE.BufferGeometry();
-      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-      const material = new THREE.LineBasicMaterial({ color: 0x2563eb, linewidth: 2 });
-      const line = new THREE.Line(geometry, material);
+    state.trajectoryLines = [];
+    for (const segment of splitTrajectory(trajectory)) {
+      const line = makeTrajectoryLine(segment, 0x2563eb);
       state.scene.add(line);
-      state.trajectoryLine = line;
+      state.trajectoryLines.push(line);
     }
     for (const line of state.extraTrajectoryLines) {
       state.scene.remove(line);
-      line.geometry.dispose();
-      (line.material as THREE.Material).dispose();
+      disposeLine(line);
     }
     state.extraTrajectoryLines = [];
     for (const entry of extraTrajectories) {
-      if (entry.points.length <= 1) {
-        continue;
+      for (const segment of splitTrajectory(entry.points)) {
+        const line = makeTrajectoryLine(segment, entry.color);
+        state.scene.add(line);
+        state.extraTrajectoryLines.push(line);
       }
-      const positions = new Float32Array(entry.points.length * 3);
-      for (let i = 0; i < entry.points.length; i++) {
-        positions[i * 3 + 0] = entry.points[i][0];
-        positions[i * 3 + 1] = entry.points[i][1];
-        positions[i * 3 + 2] = entry.points[i][2];
-      }
-      const geometry = new THREE.BufferGeometry();
-      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-      const material = new THREE.LineBasicMaterial({ color: entry.color, linewidth: 2 });
-      const line = new THREE.Line(geometry, material);
-      state.scene.add(line);
-      state.extraTrajectoryLines.push(line);
     }
     state.controls.target.set(targetCenter[0], targetCenter[1], targetCenter[2]);
     state.requestRender();

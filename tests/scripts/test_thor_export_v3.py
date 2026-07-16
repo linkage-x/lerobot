@@ -28,6 +28,7 @@ def _make_session(root: Path, name: str, episodes: list[int], cams=("cam_00",)) 
         )
         for c in cams:
             (ep_dir / f"{c}.mkv").write_bytes(b"0")
+        _write_online_sync_manifest(ep_dir, cams, n_frames=1)
     return session
 
 
@@ -86,36 +87,66 @@ def _write_mkv(path: Path, n_frames: int, w: int, h: int, fps: int) -> None:
     container.close()
 
 
-def _write_box_parquet(session: Path, ep_frames: dict[int, int], state_width: int) -> None:
+def _write_box_parquet(
+    session: Path,
+    ep_frames: dict[int, int],
+    state_width: int,
+    *,
+    include_action: bool = True,
+) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     data_dir = session / "data" / "chunk-000"
     data_dir.mkdir(parents=True)
-    rows = {k: [] for k in ("observation.state", "action", "timestamp", "frame_index", "episode_index", "index", "task_index")}
+    keys = ["observation.state", "timestamp", "frame_index", "episode_index", "index", "task_index"]
+    if include_action:
+        keys.insert(1, "action")
+    rows = {k: [] for k in keys}
     idx = 0
     for ep, n in ep_frames.items():
         for f in range(n):
             rows["observation.state"].append([float(f)] * state_width)
-            rows["action"].append([float(f)] * state_width)
+            if include_action:
+                rows["action"].append([float(f)] * state_width)
             rows["timestamp"].append(float(f) / 30.0)
             rows["frame_index"].append(f)
             rows["episode_index"].append(ep)
             rows["index"].append(idx)
             rows["task_index"].append(0)
             idx += 1
-    schema = pa.schema(
-        [
-            ("observation.state", pa.list_(pa.float32(), state_width)),
-            ("action", pa.list_(pa.float32(), state_width)),
-            ("timestamp", pa.float32()),
-            ("frame_index", pa.int64()),
-            ("episode_index", pa.int64()),
-            ("index", pa.int64()),
-            ("task_index", pa.int64()),
-        ]
-    )
+    fields = [("observation.state", pa.list_(pa.float32(), state_width))]
+    if include_action:
+        fields.append(("action", pa.list_(pa.float32(), state_width)))
+    fields.extend([
+        ("timestamp", pa.float32()),
+        ("frame_index", pa.int64()),
+        ("episode_index", pa.int64()),
+        ("index", pa.int64()),
+        ("task_index", pa.int64()),
+    ])
+    schema = pa.schema(fields)
     pq.write_table(pa.table(rows, schema=schema), data_dir / "file-000.parquet")
+
+
+def _write_online_sync_manifest(ep_dir: Path, cams: tuple[str, ...] | list[str], n_frames: int, *, ok: bool = True) -> None:
+    (ep_dir / "online_sync_manifest.json").write_text(
+        json.dumps(
+            {
+                "ok": ok,
+                "failure": "" if ok else "test failure",
+                "fps": 30,
+                "target_frames": 0,
+                "actual_frames": n_frames,
+                "sync_source": "sof_tsc_ns",
+                "tolerance_ns": 1_000_000,
+                "frame_count_by_camera": {camera: n_frames for camera in cams},
+                "max_abs_delta_ns_by_camera": {camera: 12_000 for camera in cams},
+                "active_cameras": list(cams),
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _make_video_session(root: Path, name: str, ep_frames: dict[int, int], *, cams, w, h, fps, with_box):
@@ -135,6 +166,7 @@ def _make_video_session(root: Path, name: str, ep_frames: dict[int, int], *, cam
         )
         for c in cams:
             _write_mkv(ep_dir / f"{c}.mkv", n, w, h, fps)
+        _write_online_sync_manifest(ep_dir, cams, n_frames=n)
     if with_box:
         _write_box_parquet(session, ep_frames, state_width=4)
     return session
@@ -189,6 +221,40 @@ def test_export_task_to_v3_produces_loadable_dataset(tmp_path, with_box):
         "pick_and_place_20260601_101046",
         "pick_and_place_20260601_101320",
     ]
+
+
+def test_export_task_to_v3_can_write_to_distinct_output_name(tmp_path, monkeypatch):
+    datasets = tmp_path / "datasets"
+    exports = tmp_path / "exports"
+    datasets.mkdir()
+    _make_session(datasets, "thor_gmsl2_11ch_v1_20260713_075106", [0], cams=("cam_00", "cam_06"))
+    _write_online_sync_manifest(
+        datasets / "thor_gmsl2_11ch_v1_20260713_075106" / "episodes" / "episode_000000",
+        ("cam_00", "cam_06"),
+        n_frames=1,
+    )
+    monkeypatch.setattr(export_v3, "_mkv_frame_count", lambda _path: 1)
+
+    def fake_transcode(_src, dst, _codec, _fps):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"mp4")
+
+    monkeypatch.setattr(export_v3, "transcode_to_h264_mp4", fake_transcode)
+
+    out = export_v3.export_task_to_v3(
+        datasets_root=datasets,
+        exports_root=exports,
+        base_name="thor_gmsl2_11ch_v1_20260713_075106",
+        output_name="thor_gmsl2_2ch_v1_20260713_075106",
+        repo_id="local/thor_gmsl2_2ch_v1_20260713_075106",
+        task="t",
+    )
+
+    assert out == exports / "thor_gmsl2_2ch_v1_20260713_075106"
+    sources = json.loads((out / "meta" / "export_sources.json").read_text())
+    assert sources["base_name"] == "thor_gmsl2_11ch_v1_20260713_075106"
+    assert sources["output_name"] == "thor_gmsl2_2ch_v1_20260713_075106"
+    assert sources["repo_id"] == "local/thor_gmsl2_2ch_v1_20260713_075106"
 
 
 def test_export_refuses_existing_output_without_overwrite(tmp_path):
@@ -290,6 +356,7 @@ def test_export_task_to_v3_merges_tracking_pose_sidecars(tmp_path, monkeypatch):
     datasets.mkdir()
     session = _make_session(datasets, "pick_and_place_20260601_101046", [0], cams=("cam_00",))
     _write_box_parquet(session, {0: 2}, state_width=4)
+    _write_online_sync_manifest(session / "episodes" / "episode_000000", ("cam_00",), n_frames=2)
 
     sidecar = session / "derived" / "april_cube_tracking_in_robot_base"
     sidecar.mkdir(parents=True)
@@ -364,6 +431,7 @@ def test_export_task_to_v3_falls_back_to_sidecar_cube_base(tmp_path, monkeypatch
     datasets.mkdir()
     session = _make_session(datasets, "pick_and_place_20260601_101046", [0], cams=("cam_00",))
     _write_box_parquet(session, {0: 2}, state_width=4)
+    _write_online_sync_manifest(session / "episodes" / "episode_000000", ("cam_00",), n_frames=2)
 
     sidecar = session / "derived" / "april_cube_tracking_in_robot_base"
     sidecar.mkdir(parents=True)
@@ -410,17 +478,27 @@ def test_export_task_to_v3_falls_back_to_sidecar_cube_base(tmp_path, monkeypatch
 # ----------------------------------------------- box ↔ camera time sync ----
 
 
-def test_pts_offset_s_averages_camera_first_wall_minus_t0():
-    meta = {
-        "sync_reference": {
-            "t0_wall_s": 1000.0,
-            "camera_first_wall_s": {"cam_00": 1000.01, "cam_01": 1000.03},
-        }
-    }
-    assert export_v3._pts_offset_s(meta) == pytest.approx(0.02)
-    # Missing anchors -> 0.0 (no pipeline-start correction available).
-    assert export_v3._pts_offset_s({}) == 0.0
-    assert export_v3._pts_offset_s({"sync_reference": {"t0_wall_s": 1000.0}}) == 0.0
+def test_online_sync_grid_from_manifest_uses_actual_frames(tmp_path):
+    ep_dir = tmp_path / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    _write_online_sync_manifest(ep_dir, ("cam_00", "cam_01"), n_frames=7)
+
+    n_frames, manifest = export_v3._online_sync_grid_from_manifest(ep_dir, ["cam_00", "cam_01"])
+
+    assert n_frames == 7
+    assert manifest["sync_source"] == "sof_tsc_ns"
+
+
+def test_online_sync_grid_from_manifest_rejects_count_mismatch(tmp_path):
+    ep_dir = tmp_path / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    _write_online_sync_manifest(ep_dir, ("cam_00", "cam_01"), n_frames=7)
+    manifest = json.loads((ep_dir / "online_sync_manifest.json").read_text())
+    manifest["frame_count_by_camera"]["cam_01"] = 6
+    (ep_dir / "online_sync_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="frame counts"):
+        export_v3._online_sync_grid_from_manifest(ep_dir, ["cam_00", "cam_01"])
 
 
 def _box_row(frame_index: int, value: float, ts_width: int = 1) -> dict:
@@ -442,7 +520,7 @@ def test_align_box_by_frame_index_drops_phantom_grid_tail():
     )
     assert missing == 0
     assert state == [[0.0], [1.0], [2.0]]
-    assert action == [[0.0], [10.0], [20.0]]
+    assert action == [[1.0], [2.0], [2.0]]
     assert ts == [[0.0], [1.0], [2.0]]
 
 
@@ -455,17 +533,38 @@ def test_align_box_by_frame_index_carries_last_when_camera_longer():
     )
     assert missing == 2
     assert state == [[0.0], [1.0], [1.0], [1.0]]  # frames 2,3 hold frame 1
+    assert action == [[1.0], [1.0], [1.0], [1.0]]
 
 
 def test_align_box_by_frame_index_uses_frame_index_not_position():
     # A gap at frame_index 1 (rows are 0 and 2). Positional slicing would put the
     # fi=2 row at output frame 1; frame_index keying must place it at frame 2.
     box_rows = [_box_row(0, 10.0), _box_row(2, 12.0)]
-    state, _action, _ts, missing = export_v3._align_box_rows_by_frame_index(
+    state, action, _ts, missing = export_v3._align_box_rows_by_frame_index(
         box_rows, n_frames=3, state_width=1, ts_width=1
     )
     assert missing == 1  # frame 1 has no row
     assert state == [[10.0], [10.0], [12.0]]  # frame 1 holds frame 0, frame 2 correct
+    assert action == [[10.0], [12.0], [12.0]]
+
+
+
+
+def test_load_box_rows_accepts_recorder_parquet_without_action(tmp_path: Path):
+    pq = pytest.importorskip("pyarrow.parquet")
+    session = tmp_path / "session"
+    _write_box_parquet(session, {0: 3}, state_width=1, include_action=False)
+
+    rows_by_ep = export_v3._load_box_rows(session)
+    assert "action" not in pq.read_table(session / "data" / "chunk-000" / "file-000.parquet").column_names
+    rows = rows_by_ep[0]
+    state, action, _ts, missing = export_v3._align_box_rows_by_frame_index(
+        rows, n_frames=3, state_width=1, ts_width=0
+    )
+
+    assert missing == 0
+    assert state == [[0.0], [1.0], [2.0]]
+    assert action == [[1.0], [2.0], [2.0]]
 
 
 def test_align_box_by_frame_index_no_timestamps_when_ts_width_zero():
@@ -474,53 +573,3 @@ def test_align_box_by_frame_index_no_timestamps_when_ts_width_zero():
         box_rows, n_frames=2, state_width=1, ts_width=0
     )
     assert ts is None
-
-
-def test_box_rows_from_raw_realigns_on_pwm_grid(tmp_path):
-    fps = 10
-    ep_dir = tmp_path / "episodes" / "episode_000000"
-    ep_dir.mkdir(parents=True)
-    t0 = 1000.0
-    # pts_offset = mean(camera_first_wall_s - t0) = (0.0 + 0.2) / 2 = 0.1
-    meta = {
-        "video": {"fps": fps},
-        "sync_reference": {
-            "t0_wall_s": t0,
-            "camera_first_wall_s": {"cam_00": t0 + 0.0, "cam_01": t0 + 0.2},
-        },
-    }
-    # Gripper samples at t_rel 0.10/0.20/0.30 -> distances 0.01/0.02/0.03.
-    # mcu_ts=0 keeps poll times (no MCU calibration), so t_rel_s is used as-is.
-    lines = []
-    for trel, dist in [(0.10, 0.01), (0.20, 0.02), (0.30, 0.03)]:
-        lines.append(
-            json.dumps(
-                {
-                    "sid": "box_gripper",
-                    "mcu_ts": 0,
-                    "wall_s": t0 + trel,
-                    "t_rel_s": trel,
-                    "data": {"timestamp": 0, "distance_m": dist},
-                }
-            )
-        )
-    (ep_dir / "box_sensors.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    result = export_v3._box_rows_from_raw(ep_dir, meta, fps=fps, n_frames=3)
-    assert result is not None
-    state_rows, action_rows, ts_rows, state_names, ts_names = result
-
-    assert state_names == list(export_v3.lr3.BOX_STATE_NAMES)
-    assert ts_names == list(export_v3.lr3.BOX_TIMESTAMP_NAMES)
-    gi = export_v3.lr3.BOX_STATE_NAMES.index("box_gripper.distance_m")
-    # grid times pts_offset(0.1) + N/fps -> 0.10/0.20/0.30 -> nearest dist
-    assert [round(r[gi], 3) for r in state_rows] == [0.01, 0.02, 0.03]
-    assert action_rows == state_rows
-    assert len(state_rows[0]) == len(export_v3.lr3.BOX_STATE_NAMES)
-    assert len(ts_rows[0]) == len(export_v3.lr3.BOX_TIMESTAMP_NAMES)
-
-
-def test_box_rows_from_raw_returns_none_when_no_jsonl(tmp_path):
-    ep_dir = tmp_path / "episodes" / "episode_000000"
-    ep_dir.mkdir(parents=True)
-    assert export_v3._box_rows_from_raw(ep_dir, {}, fps=30, n_frames=3) is None

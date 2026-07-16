@@ -18,6 +18,14 @@ def _load_thor_record_module():
     return mod
 
 
+def test_name_with_camera_count_replaces_existing_channel_label() -> None:
+    thor_record = _load_thor_record_module()
+
+    assert thor_record._name_with_camera_count("thor_gmsl2_11ch_v1", 8) == "thor_gmsl2_8ch_v1"
+    assert thor_record._name_with_camera_count("thor_gmsl2_Nch_v1", 8) == "thor_gmsl2_8ch_v1"
+    assert thor_record._name_with_camera_count("pick_and_place", 8) == "pick_and_place"
+
+
 def _recorder_config(tmp_path: Path) -> gr.RecorderConfig:
     return gr.RecorderConfig(
         cameras=gr.CameraDefaults(recorder_backend="argus_metadata"),
@@ -284,3 +292,19 @@ def test_online_sync_manifest_gate_rejects_frame_count_mismatch(tmp_path: Path) 
     assert failure == "online_sync_failed"
     assert payload["ok"] is False
     assert "cam_07 manifest frame count 2 != 3" in payload["failures"]
+
+
+def test_has_recorded_sensor_samples_treats_keyed_empty_buffers_as_empty() -> None:
+    thor_record = _load_thor_record_module()
+
+    assert thor_record._has_recorded_sensor_samples({}) is False
+    assert thor_record._has_recorded_sensor_samples({sid: [] for sid in bc.KNOWN_SENSOR_IDS}) is False
+    assert thor_record._has_recorded_sensor_samples({
+        "box_imu": [bc.SensorSample(
+            sensor_id="box_imu",
+            mcu_timestamp=123,
+            wall_time_s=1.0,
+            mono_time_s=2.0,
+            data={"accel": [0.0, 0.0, 9.8]},
+        )],
+    }) is True

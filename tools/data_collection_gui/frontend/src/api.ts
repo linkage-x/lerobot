@@ -113,6 +113,7 @@ export class DataCollectionGuiApi {
       safety: "locked",
       message: "Start the local gateway to load recorded trajectory data",
       datasetRoot: handheldConfigSummary.root,
+      datasetKind: "recorded",
       sourcePath: "",
       dataStatus: "missing",
       trajectoryKind: "none",
@@ -320,6 +321,22 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
+  async deleteReplayEpisode(episode: number): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot(`/api/replay/delete-episode?episode=${episode}`);
+    if (remote) {
+      return remote;
+    }
+    // No gateway: deletion rewrites on-disk parquet/videos and cannot be mocked.
+    // Surface the failure instead of pretending the episode is gone.
+    await wait(140);
+    this.snapshot.replay = {
+      ...this.snapshot.replay,
+      message: "Gateway unavailable; episode deletion needs the backend and cannot be mocked"
+    };
+    this.log("error", `Delete episode ${episode} blocked because gateway is unavailable`);
+    return this.getSnapshot();
+  }
+
   async startReplay(realRobot: boolean): Promise<GuiSnapshot> {
     const remote = await this.postRemoteSnapshot(realRobot ? "/api/replay/start-real" : "/api/replay/start");
     if (remote) {
@@ -468,8 +485,11 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  videoUrl(datasetPath: string, cameraKey: string): string {
+  videoUrl(datasetPath: string, cameraKey: string, episode?: number): string {
     const params = new URLSearchParams({ path: datasetPath, key: cameraKey });
+    if (episode != null) {
+      params.set("episode", String(episode));
+    }
     return `${this.apiBase}/api/replay/video?${params.toString()}`;
   }
 
@@ -506,9 +526,49 @@ export class DataCollectionGuiApi {
     }
   }
 
+  async triggerSixDForceOriginCalibration(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/device/calibrate-6dforce-origin`, {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      const body = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      return { ok: response.ok && body.ok !== false, error: body.error };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  async triggerTouchCalibration(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/device/calibrate-touch`, {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      const body = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      return { ok: response.ok && body.ok !== false, error: body.error };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   async fetchBoxCaliLog(): Promise<BoxCaliLog | null> {
     try {
       const response = await fetch(`${this.apiBase}/api/device/box-cali-log`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as BoxCaliLog;
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchBoxTouchCaliLog(): Promise<BoxCaliLog | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/device/box-touch-cali-log`, {
         headers: { Accept: "application/json" }
       });
       if (!response.ok) {

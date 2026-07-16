@@ -3,11 +3,11 @@ import type { DeviceStatus } from "./types";
 // Frontend mock fallback used when the gateway is unreachable. Production
 // state comes from /api/state, which `tools/data_collection_gui/gateway.py`
 // builds from `tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml` -- the GMSL2
-// 11-camera + BOX 采集板 rig that replaced the old Hikrobot + Pika setup.
+// detected-camera GMSL2 + BOX rig that replaced the old Hikrobot + Pika setup.
 export const handheldConfigSummary = {
   configPath: "tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml",
-  repoId: "local/thor_gmsl2_11ch_v1",
-  root: "outputs/datasets/thor_gmsl2_11ch_v1",
+  repoId: "local/thor_gmsl2_Nch_v1",
+  root: "outputs/datasets/thor_gmsl2_Nch_v1",
   fps: 60,
   episodeTimeS: 10,
   targetFrames: 600,
