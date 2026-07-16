@@ -1154,6 +1154,21 @@ def test_get_observation(robot):
     assert observation["prev_cmd.gripper.pos"] == pytest.approx(observation["gripper.pos"])
 
 
+def test_get_last_observation_state_timing_reports_age(robot):
+    monotonic_s = time.monotonic()
+    wall_s = time.time()
+    with robot._state_snapshot_lock:
+        robot._last_observation_state_monotonic_s = monotonic_s
+        robot._last_observation_state_wall_s = wall_s
+
+    timing = robot.get_last_observation_state_timing()
+
+    assert timing is not None
+    assert timing["monotonic_s"] == pytest.approx(monotonic_s)
+    assert timing["wall_s"] == pytest.approx(wall_s)
+    assert timing["age_ms"] >= 0.0
+
+
 def test_get_observation_includes_tactile_when_gripper_provides_it(robot):
     robot.connect()
     robot._gripper.get_tactile_observation = lambda: {
