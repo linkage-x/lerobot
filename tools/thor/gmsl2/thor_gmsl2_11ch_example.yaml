@@ -1,16 +1,19 @@
 # Thor + SG16A-AGTH-G3Y-A1 + 11 x SG2-AR0234C-G2F GMSL2 cameras + BOX 采集板
 # (gripper, IMU, trigger, six-d force, two Paxini touch pads).
 #
-# The recording path runs entirely inside GStreamer:
+# The default recording path is the online-synchronized Libargus recorder:
 #
-#     nvarguscamerasrc --(ISP, AE/AWB/CCM via camera_overrides.isp)--> NV12
-#         --(nvv4l2h265enc)--> H.265 elementary stream --(matroskamux)--> .mkv
+#     Argus BufferOutputStream
+#       -> same-buffer SOF metadata
+#       -> full SOF cluster alignment across cameras
+#       -> hardware encoder
+#       -> per-camera MKV
 #
 # Python's job is to (a) decide which sensor-ids to record, (b) start/stop the
-# GStreamer pipelines around each episode, (c) talk UDP to the BOX 采集板 MCU
-# via the vendored `box_sdk` wheel and snapshot its sensors into the episode
-# metadata, and (d) write a metadata sidecar with hardware-sync info +
-# capture timestamps. The frame pixels never enter the Python process.
+# recorder around each episode, (c) talk UDP to the BOX 采集板 MCU via the
+# vendored `box_sdk` wheel and snapshot its sensors into the episode metadata,
+# and (d) check the recorder's online sync manifest before saving the episode.
+# The frame pixels never enter the Python process.
 #
 # AR0234 + this board's dtbo is hard-locked to 1920x1080 @ 60 fps
 # (min/max/default_framerate = 60000000, framerate_factor = 1000000 in
@@ -38,20 +41,80 @@ sensors:
     connect_timeout_s: 120.0  # global wall-clock budget for Connect, including retry/auto-recover; 0 disables
     two_phase_connect: false  # PR7: spawn all workers to PAUSED at once (overlaps ~1.2s/worker python+Gst.init), then serialize only PAUSED->PLAYING. PAUSED opens no Argus session so Phase 1 is contention-free; the risky bring-up stays serialized. Cuts ~N*startup off Connect. Default off pending field burn-in.
     preview_spawn_stagger_s: 0.8  # idle-only Device Manager preview stagger; recorder-owned preview uses recording_preview_stagger_s below
-    recording_preview_enabled: true  # recording-time preview is produced inside recorder workers; no second nvarguscamerasrc client
-    recording_preview_on_demand: true  # only attach preview branches while the frontend grid is actually polling camera.jpg; reclaims them after recording_preview_idle_ttl_s of no viewer (cuts idle nvvidconv/jpegenc load that aggravates Argus). false = always-on (eager enable at Connect)
+    recording_preview_enabled: true  # argus_metadata: idle preview JPEGs are produced by session-owned gst-launch processes and stopped before each episode; legacy splitmux attaches preview branches inside recorder workers
+    recording_preview_on_demand: true  # only enable preview while the frontend grid is polling camera.jpg; false = eager enable at Connect
     recording_preview_idle_ttl_s: 6.0  # on-demand: disable previews after this many seconds without a viewer-demand heartbeat from the gateway (must exceed the gateway's ~1s heartbeat cadence)
-    recording_preview_stagger_s: 0.5  # post-Connect preview branch creation cadence
+    recording_preview_stagger_s: 0.5  # preview creation cadence
     recording_preview_stale_s: 3.0  # restart a preview branch if its JPEG has not refreshed within this many seconds
     recording_preview_watchdog_s: 2.0  # how often the recorder checks preview JPEG freshness
     stream_health_poll_s: 1.0  # while connected but idle, poll recording streams for EOS/TIMEOUT at this cadence
     stop_on_stream_exit: true  # set false/--ignore-stream-exit for diagnostics only
+    # Fallback metadata-backend frame sync gate. The argus_metadata backend
+    # writes one `<camera>.argus_frame_metadata.csv` sidecar per episode.
+    # thor_record.py aligns all cameras by SOF TSC before saving, then rewrites
+    # the videos to the accepted common frame window. These flags are forced on
+    # only when defaults.recorder_backend=argus_metadata.
+    argus_frame_sync:
+      enabled: true
+      required: true
+      # virtual_cluster = build a common SOF-time grid from all cameras instead
+      # of treating one camera's frame sequence as the truth. Set to "camera"
+      # only for diagnostics/fallback with reference_camera below.
+      reference_strategy: virtual_cluster
+      reference_camera: ""
+      tolerance_ms: 1.0
+      cadence_tolerance_ms: 1.0
+      # false = skip expensive ffprobe frame-count scans after materialization.
+      # The metadata sync gate and ffmpeg -frames:v target still enforce equal
+      # logical output frame counts. Set true for strict burn-in QC.
+      materialize_verify: false
+      materialize_workers: 2
+      report_name: argus_frame_alignment.json
 
-    # Per-camera capture/encoding defaults. nvarguscamerasrc handles ISP +
-    # AE/AWB before the encoder sees the data. The hardware H.265 encoder
-    # writes a complete MKV per camera per episode.
+    # Production online sync backend. This recorder aligns frames before they
+    # enter the encoder, so saved videos should already have equal frame counts
+    # and do not require post-save ffmpeg materialization.
+    online_sync:
+      enabled: true
+      sync_source: sof_tsc_ns
+      tolerance_ms: 1.0
+      startup_full_clusters: 30
+      # Per-camera Argus acquire timeout while forming a full SOF cluster. At
+      # 60 Hz a healthy camera should produce the next frame within ~16.7 ms;
+      # 1000 ms is intentionally generous but fails much faster than the old
+      # hard-coded 8 s when one stream stops delivering buffers.
+      frame_timeout_ms: 1000
+      # Connect/preflight budgets are intentionally shorter than the episode
+      # stop/mux-close timeout. A wedged 8-camera preflight should fail fast
+      # and expose logs instead of blocking the UI for the full 120s Connect
+      # deadline.
+      preflight_timeout_s: 30.0
+      single_preflight_timeout_s: 10.0
+      missing_frame_policy: fail_episode
+      stop_mode: full_cluster
+      # Optional recorder-owned live frame bus for online inference. Leave
+      # disabled for pure recording. When enabled, the recorder publishes the
+      # latest accepted full SOF cluster as NV12 frames plus latest_cluster.json;
+      # consumers read only from this bus and must not open Argus themselves.
+      frame_bus_dir: ""
+      frame_bus_every_n: 1
+      # UI preview uses a separate on-demand frame bus so it cannot disable or
+      # throttle the online-inference bus. The recorder publishes this bus only
+      # while the UI viewer is polling preview frames; Python converts the
+      # synchronized NV12 cluster into /dev/shm/lerobot_preview/*.jpg.
+      preview_frame_bus_dir: /dev/shm/lerobot_online_sync_preview
+      preview_frame_bus_every_n: 12
+
+    # Per-camera capture/encoding defaults. Libargus handles capture/ISP and
+    # the hardware H.265 encoder writes a complete MKV per camera per episode.
     defaults:
-      pipeline: argus          # 'argus' = nvarguscamerasrc + ISP
+      pipeline: argus          # 'argus' = NVIDIA Argus camera stack + ISP
+      # argus_online_sync: production default. One Libargus owner aligns full
+      # SOF clusters before hardware encoding; UI start/stop/save API stays the same.
+      # argus_metadata: fallback path. Records video plus per-frame metadata,
+      # then trims/materializes videos by SOF timestamps after recording.
+      # gstreamer_splitmux: legacy fallback, no Libargus metadata sync gate.
+      recorder_backend: argus_online_sync
       sensor_mode: 0
       width: 1920
       height: 1080
@@ -75,20 +138,13 @@ sensors:
       container: mkv           # mkv or mp4 (matroskamux / qtmux)
 
   hardware_sync:
-    # Hardware-sync DISABLED by default. With `enabled: false` the recorder
-    # skips `sudo sh sdk/pwm.sh` and does NOT push trig_mode/exposure/gain
-    # via v4l2-ctl -- the AR0234 cameras run in their dtbo-locked free-run
-    # mode at 60 fps. This trades sub-microsecond PWM-edge alignment for a
-    # bring-up path that doesn't need root / PWM wiring / sudoers tweaks,
-    # which is the right default for the GUI data-collection flow.
-    #
-    # To re-enable true PWM-edge slave sync on a rig where the SG16A
-    # trigger input is wired and the host has passwordless sudo for
-    # `sh pwm.sh` / `v4l2-ctl`:
-    #   * flip `enabled: true`
-    #   * keep `sensor_trig_mode: 1` (PWM-edge locked)
-    #   * make sure `exposure_us` fits inside one PWM period -- the
-    #     recorder auto-clamps to 0.85 * (1e6 / fps) and warns if not.
+    # Hardware-sync ENABLED by default for production synchronized capture.
+    # The recorder arms the PWM trigger and pushes trig_mode/exposure/gain via
+    # v4l2-ctl before Connect finishes. This assumes the SG16A trigger input is
+    # wired and the host has passwordless sudo for `sh pwm.sh` / `v4l2-ctl`.
+    # Keep `sensor_trig_mode: 1` and make sure `exposure_us` fits inside one
+    # PWM period; the recorder auto-clamps to 0.85 * (1e6 / fps) and warns if
+    # not.
     # In slave mode at 60 Hz (period = 16666 us) keep `exposure_us` <= ~14000.
     enabled: true
     sdk_dir: tools/thor/gmsl2/sdk    # repo-relative; vendored pwm.sh lives here
@@ -186,12 +242,10 @@ dataset:
   fps: 60
   num_episodes: 0              # 0 = unlimited; press the GUI's Save/Stop
   episode_time_s: 10
-  # While Connected but not recording, the persistent pipelines keep streaming
-  # into a throwaway warmup fragment under <root>/_warmup. splitmuxsink never
-  # auto-rotates (max-size-time=0 so each EPISODE stays one file), so that open
-  # fragment grows until the disk fills if the gateway is left armed (the
-  # 2026-06 _warmup blow-up: 120G over a weekend). The recorder rolls + prunes
-  # those fragments on this idle timer; keep_last_n bounds survivors per camera.
+  # Legacy gstreamer_splitmux only: while Connected but not recording, the
+  # persistent pipelines keep streaming into a throwaway warmup fragment under
+  # <root>/_warmup. The default argus_metadata backend starts one recorder
+  # process per episode and does not keep long-lived warmup fragments.
   warmup_roll_s: 30            # idle roll+prune cadence in seconds; 0 disables
   warmup_keep_last_n: 3        # warmup fragments kept per camera each prune
   push_to_hub: false

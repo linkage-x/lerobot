@@ -1,7 +1,10 @@
-"""GMSL2 hardware-encoded multi-camera recorder for Thor + SG16A_AGTH_G3Y_A1.
+"""GMSL2 recorder configuration and legacy CLI for Thor GMSL2 cameras.
 
-The pixel data never enters Python -- each camera is captured by its own
-``gst-launch-1.0`` subprocess that runs::
+The production GUI entrypoint is ``thor_record.py``. By default the shared
+configuration selects the Libargus online-sync backend there, which aligns
+same-frame Argus buffers by SOF metadata before hardware encoding. The legacy
+standalone CLI in this file still runs one ``gst-launch-1.0`` process per
+camera::
 
     nvarguscamerasrc sensor-id=N do-timestamp=true sensor-mode=M
       ! video/x-raw(memory:NVMM),format=NV12,width=W,height=H,framerate=F/1
@@ -10,11 +13,10 @@ The pixel data never enters Python -- each camera is captured by its own
       ! matroskamux
       ! filesink location=<dataset>/episodes/episode_NNNNNN/<name>.mkv
 
-Python orchestrates the lifecycle (lock detection, Argus open-probe, start
-and stop per episode) and writes a ``meta.json`` sidecar per episode with
-the hardware-sync settings and per-stream wall-clock timestamps. Frame-level
-PTS is preserved inside the MKV container itself and can be extracted later
-with ``ffprobe`` -- the recorder does not pull it inline.
+The legacy CLI is kept for diagnostics and fallback capture. It does not pull
+Libargus frame metadata inline; the production sync paths live in
+``argus_online_sync_session.py``, ``argus_metadata_session.py``, and
+``thor_record.py``.
 
 Usage:
     cd ~/lerobot
@@ -51,6 +53,7 @@ logger = logging.getLogger("gmsl2_record")
 @dataclass
 class CameraDefaults:
     pipeline: str = "argus"
+    recorder_backend: str = "argus_online_sync"
     sensor_mode: int = 0
     width: int = 1920
     height: int = 1080
@@ -70,8 +73,18 @@ class CameraDefaults:
     container: str = "mkv"
 
     def __post_init__(self) -> None:
+        self.recorder_backend = self.recorder_backend.lower()
         self.codec = self.codec.lower()
         self.container = self.container.lower()
+        if self.recorder_backend not in {
+            "gstreamer_splitmux",
+            "argus_metadata",
+            "argus_online_sync",
+        }:
+            raise ValueError(
+                "recorder_backend must be 'gstreamer_splitmux', "
+                f"'argus_metadata', or 'argus_online_sync', got {self.recorder_backend!r}"
+            )
         if self.codec not in {"h265", "h264"}:
             raise ValueError(f"codec must be 'h265' or 'h264', got {self.codec!r}")
         if self.container not in {"mkv", "mp4"}:
@@ -118,9 +131,115 @@ class HardwareSync:
 
 
 @dataclass
+class ArgusFrameSync:
+    """Per-frame SOF timestamp synchronization gate.
+
+    The metadata-integrated Libargus backend writes one
+    ``<camera>.argus_frame_metadata.csv`` sidecar per episode. When enabled,
+    ``thor_record.py`` aligns all cameras by SOF TSC before saving.
+    """
+
+    enabled: bool = False
+    required: bool = False
+    reference_strategy: str = "virtual_cluster"
+    reference_camera: str = ""
+    tolerance_ms: float = 1.0
+    cadence_tolerance_ms: float = 1.0
+    report_name: str = "argus_frame_alignment.json"
+    materialize_verify: bool = False
+    materialize_workers: int = 2
+
+    def __post_init__(self) -> None:
+        self.reference_strategy = self.reference_strategy.lower()
+        if self.reference_strategy not in {"virtual_cluster", "camera"}:
+            raise ValueError(
+                "argus_frame_sync.reference_strategy must be "
+                f"'virtual_cluster' or 'camera', got {self.reference_strategy!r}"
+            )
+
+
+@dataclass
+class ArgusOnlineSync:
+    """Online encoder-front synchronization settings.
+
+    ``argus_online_sync`` uses these settings inside the C++ recorder. Frames
+    are aligned before they are pushed to the hardware encoder, so post-save
+    materialization is not part of this backend's contract.
+    """
+
+    enabled: bool = True
+    sync_source: str = "sof_tsc_ns"
+    tolerance_ms: float = 1.0
+    startup_full_clusters: int = 30
+    frame_timeout_ms: int = 1000
+    preflight_timeout_s: float = 30.0
+    single_preflight_timeout_s: float = 10.0
+    missing_frame_policy: str = "fail_episode"
+    stop_mode: str = "full_cluster"
+    frame_bus_dir: str = ""
+    frame_bus_every_n: int = 1
+    preview_frame_bus_dir: str = ""
+    preview_frame_bus_every_n: int = 0
+
+    def __post_init__(self) -> None:
+        self.sync_source = str(self.sync_source).lower()
+        self.missing_frame_policy = str(self.missing_frame_policy).lower()
+        self.stop_mode = str(self.stop_mode).lower()
+        self.frame_bus_dir = str(self.frame_bus_dir)
+        self.preview_frame_bus_dir = str(self.preview_frame_bus_dir)
+        self.frame_timeout_ms = int(self.frame_timeout_ms)
+        self.preflight_timeout_s = float(self.preflight_timeout_s)
+        self.single_preflight_timeout_s = float(self.single_preflight_timeout_s)
+        self.frame_bus_every_n = int(self.frame_bus_every_n)
+        self.preview_frame_bus_every_n = int(self.preview_frame_bus_every_n)
+        if self.sync_source != "sof_tsc_ns":
+            raise ValueError(
+                "online_sync.sync_source currently supports only 'sof_tsc_ns', "
+                f"got {self.sync_source!r}"
+            )
+        if self.frame_timeout_ms <= 0:
+            raise ValueError(
+                "online_sync.frame_timeout_ms must be > 0, "
+                f"got {self.frame_timeout_ms!r}"
+            )
+        if self.preflight_timeout_s <= 0:
+            raise ValueError(
+                "online_sync.preflight_timeout_s must be > 0, "
+                f"got {self.preflight_timeout_s!r}"
+            )
+        if self.single_preflight_timeout_s <= 0:
+            raise ValueError(
+                "online_sync.single_preflight_timeout_s must be > 0, "
+                f"got {self.single_preflight_timeout_s!r}"
+            )
+        if self.frame_bus_every_n <= 0:
+            raise ValueError(
+                "online_sync.frame_bus_every_n must be > 0, "
+                f"got {self.frame_bus_every_n!r}"
+            )
+        if self.preview_frame_bus_every_n < 0:
+            raise ValueError(
+                "online_sync.preview_frame_bus_every_n must be >= 0, "
+                f"got {self.preview_frame_bus_every_n!r}"
+            )
+        if self.missing_frame_policy != "fail_episode":
+            raise ValueError(
+                "online_sync.missing_frame_policy currently supports only "
+                f"'fail_episode', got {self.missing_frame_policy!r}"
+            )
+        if self.stop_mode != "full_cluster":
+            raise ValueError(
+                "online_sync.stop_mode currently supports only 'full_cluster', "
+                f"got {self.stop_mode!r}"
+            )
+
+
+@dataclass
 class RecorderConfig:
     cameras: CameraDefaults
     hardware_sync: HardwareSync
+    argus_frame_sync: ArgusFrameSync
+    online_sync: ArgusOnlineSync
     repo_id: str
     single_task: str
     dataset_root: Path
@@ -173,12 +292,18 @@ def load_config(path: Path) -> RecorderConfig:
     if isinstance(hw_raw.get("trig_pin"), str):
         hw_raw["trig_pin"] = int(hw_raw["trig_pin"], 0)
     hwsync = HardwareSync(**_filter_kwargs(HardwareSync, hw_raw))
+    frame_sync_raw = cams.get("argus_frame_sync", {}) or {}
+    frame_sync = ArgusFrameSync(**_filter_kwargs(ArgusFrameSync, frame_sync_raw))
+    online_sync_raw = cams.get("online_sync", {}) or {}
+    online_sync = ArgusOnlineSync(**_filter_kwargs(ArgusOnlineSync, online_sync_raw))
 
     ds = raw.get("dataset", {}) or {}
 
     return RecorderConfig(
         cameras=defaults,
         hardware_sync=hwsync,
+        argus_frame_sync=frame_sync,
+        online_sync=online_sync,
         repo_id=str(ds.get("repo_id", "local/gmsl2")),
         single_task=str(ds.get("single_task", "GMSL2 capture")),
         dataset_root=_resolve(ds.get("root", "outputs/datasets/gmsl2")),
@@ -610,6 +735,22 @@ def maybe_setup_sync(cfg: RecorderConfig, repo_root: Path) -> None:
         logger.info("pwm: %s", r.stdout.strip().splitlines()[-1])
 
 
+def _legacy_cli_backend_error(cfg: RecorderConfig) -> str | None:
+    """Return an error when this legacy CLI cannot honor the configured backend."""
+
+    if cfg.cameras.recorder_backend == "gstreamer_splitmux":
+        return None
+    return (
+        "tools.thor.gmsl2.gmsl2_record is the legacy standalone "
+        "GStreamer/splitmux CLI and cannot run "
+        f"recorder_backend={cfg.cameras.recorder_backend!r}. Use "
+        "tools/thor/gmsl2/thor_record.py for the production "
+        "metadata-integrated recorder, or set "
+        "sensors.cameras.defaults.recorder_backend: gstreamer_splitmux "
+        "for this legacy CLI."
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="GMSL2 hardware-encoded multi-camera recorder",
@@ -656,6 +797,11 @@ def main(argv: list[str] | None = None) -> int:
         cfg.spawn_stagger_s = max(0.0, args.spawn_stagger_s)
     if args.ignore_stream_exit:
         cfg.stop_on_stream_exit = False
+
+    backend_error = _legacy_cli_backend_error(cfg)
+    if backend_error is not None:
+        logger.error(backend_error)
+        return 2
 
     repo_root = args.repo_root.resolve()
     if args.skip_hardware_sync:
