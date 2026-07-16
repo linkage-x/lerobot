@@ -90,7 +90,7 @@ def build_message(event_name: str, event: dict[str, Any], branch: str) -> dict[s
     if event_name in {"pull_request", "pull_request_target"}:
         action = str(event.get("action") or "")
         pull = event.get("pull_request") or {}
-        if action not in {"opened", "reopened", "closed"}:
+        if action not in {"opened", "reopened", "ready_for_review", "closed"}:
             return None
         merged = bool(pull.get("merged"))
         if action == "closed" and not merged:
@@ -101,9 +101,14 @@ def build_message(event_name: str, event: dict[str, Any], branch: str) -> dict[s
         user = (pull.get("user") or {}).get("login") or "unknown"
         head = (pull.get("head") or {}).get("ref") or "unknown"
         merge_commit = pull.get("merge_commit_sha")
-        verb = "merged into" if merged else "opened for"
+        if merged:
+            verb = "merged into"
+        elif action == "ready_for_review":
+            verb = "marked ready for"
+        else:
+            verb = "opened for"
         return {
-            "title": f"PR {verb} origin/{branch}",
+            "title": f"GitHub PR notification {verb} origin/{branch}",
             "template": "green" if merged else "blue",
             "url": html_url,
             "lines": [
@@ -128,7 +133,7 @@ def build_message(event_name: str, event: dict[str, Any], branch: str) -> dict[s
         message = str(head_commit.get("message") or "")
         first_line = message.splitlines()[0] if message else "(no commit message)"
         return {
-            "title": f"origin/{branch} updated",
+            "title": f"GitHub PR notification: origin/{branch} updated",
             "template": "blue",
             "url": compare,
             "lines": [
@@ -145,7 +150,7 @@ def build_message(event_name: str, event: dict[str, Any], branch: str) -> dict[s
     if event_name == "workflow_dispatch":
         run_url = f"{repo_link}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}" if repo_link else ""
         return {
-            "title": f"Feishu notifier test for origin/{branch}",
+            "title": f"GitHub PR notification test for origin/{branch}",
             "template": "blue",
             "url": run_url or repo_link,
             "lines": [
