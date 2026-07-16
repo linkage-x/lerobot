@@ -116,6 +116,7 @@ export type ReplayStatus = {
   safety: "locked" | "ready" | "active" | "fault";
   message: string;
   datasetRoot?: string;
+  datasetKind?: "recorded" | "exported";
   sourcePath?: string;
   dataStatus?: "loaded" | "missing" | "unfinalized" | "unreadable" | "empty";
   trajectoryKind?: "pose" | "gripper_width" | "none";
@@ -126,6 +127,9 @@ export type ReplayStatus = {
   pid?: number | null;
   lastOutput?: string;
   mujocoValidation?: MujocoValidation;
+  // Bumped when the dataset content changes under an unchanged (root, episode)
+  // selection (e.g. after deleting an episode); the inspector refetches on it.
+  revision?: number;
 };
 
 export type MujocoValidation = {
@@ -203,6 +207,7 @@ export type CollectionTask = {
 export type RecordedDataset = {
   path: string;
   name: string;
+  datasetKind?: "recorded" | "exported";
   updatedAt: string;
   updatedAtMs: number;
   totalEpisodes: number;
@@ -253,6 +258,31 @@ export type ProcessingStatus =
   | "qc_failed"
   | "error";
 
+export type OnlineSyncEpisodeSummary = {
+  episode: number;
+  present: boolean;
+  ok: boolean;
+  actualFrames: number | null;
+  frameCountByCamera: Record<string, number>;
+  maxSofDeltaMs: number | null;
+  failure: string;
+};
+
+export type OnlineSyncSummary = {
+  status: "pass" | "fail" | "missing";
+  message: string;
+  present: number;
+  missing: number;
+  ok: number;
+  failed: number;
+  totalEpisodes: number;
+  actualFrames: number;
+  maxSofDeltaMs: number | null;
+  frameCountMismatch: number;
+  failureReasons: string[];
+  episodes: OnlineSyncEpisodeSummary[];
+};
+
 export type CalibrationCamera = {
   id: string;
   reprojectionMm: number;
@@ -288,6 +318,13 @@ export type TouchPadFrame = {
   activePoints?: number;
 };
 
+export type ForceVector = {
+  x: number;
+  y: number;
+  z: number;
+  magnitude?: number;
+};
+
 export type ReplayTimelineFrame = {
   frame: number;
   timestamp: number;
@@ -295,6 +332,7 @@ export type ReplayTimelineFrame = {
   action: number[];
   eePose?: Partial<EePose>;
   touch?: Record<string, TouchPadFrame | undefined>;
+  forceVector?: ForceVector;
   cubePoses?: Record<string, Partial<EePose>>;
   videoOverlays?: Record<string, CubeVideoOverlay[]>;
 };
@@ -318,6 +356,7 @@ export type CubeVideoOverlay = {
 
 export type ReplayTimeline = {
   datasetRoot: string;
+  datasetKind?: "recorded" | "exported";
   name: string;
   episode: number;
   totalFrames: number;
@@ -332,6 +371,7 @@ export type ReplayTimeline = {
   frames: ReplayTimelineFrame[];
   sourcePath: string;
   videoWarmupS?: number;
+  cameraVideoOffsetsS?: Record<string, number>;
   error?: string;
 };
 
@@ -347,4 +387,5 @@ export type ProcessingItem = {
   totalFrames: number;
   validFramesPct: number | null;
   logTail: string[];
+  onlineSync?: OnlineSyncSummary | null;
 };

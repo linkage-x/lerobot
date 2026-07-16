@@ -23,7 +23,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
@@ -103,6 +103,7 @@ class ReplayStatus:
     safety: str = "locked"
     message: str = "Replay gateway ready"
     datasetRoot: str = ""
+    datasetKind: str = "recorded"
     sourcePath: str = ""
     dataStatus: str = "missing"
     trajectoryKind: str = "none"
@@ -113,6 +114,12 @@ class ReplayStatus:
     pid: int | None = None
     lastOutput: str = ""
     mujocoValidation: dict[str, Any] = field(default_factory=dict)
+    # Bumped whenever the on-disk dataset content changes under a stable
+    # (datasetRoot, episode) selection — e.g. deleting an episode keeps the
+    # selection on the same slot but swaps in different frames/videos. The UI
+    # keys its timeline fetch on this so it refetches instead of showing stale
+    # data for the now-different episode.
+    revision: int = 0
 
 
 @dataclass
@@ -162,6 +169,7 @@ class GatewayState:
     replay_process: subprocess.Popen[str] | None = None
     replay_process_kind: str = ""
     processing_processes: dict[str, subprocess.Popen[str]] = field(default_factory=dict)
+    processing_starting: set[str] = field(default_factory=set)
     process_started_at_s: float | None = None
     replay_started_at_s: float | None = None
     log_dir: Path | None = None
@@ -176,6 +184,12 @@ class GatewayState:
     box_cali_running: bool = False
     box_cali_log: list[dict[str, Any]] = field(default_factory=list)
     box_cali_lock: Lock = field(default_factory=Lock)
+    # Touch calibration streams on its own TOUCHCALI_LOG/TOUCHCALI_DONE channel
+    # into a separate buffer so its log box shows only touch lines (the 6D force
+    # and touch buttons now live in separate viewers and must not cross-show).
+    box_touch_cali_running: bool = False
+    box_touch_cali_log: list[dict[str, Any]] = field(default_factory=list)
+    box_touch_cali_lock: Lock = field(default_factory=Lock)
     # Roster of BOX devices the recorder discovered by broadcast at Connect
     # (BOX_DEVICES_JSON). When non-empty it replaces the static YAML-derived
     # box_collection rows so the Device Manager lists exactly the boxes actually
@@ -215,7 +229,17 @@ class GatewayState:
     cached_recorded_datasets: list[dict[str, Any]] = field(default_factory=list)
     cached_trajectory: list[Any] = field(default_factory=list)
     cached_trajectory_meta: dict[str, Any] = field(default_factory=dict)
+    cached_processing_items: list[dict[str, Any]] = field(default_factory=list)
     dataset_cache_ready: bool = False
+    processing_cache_ready: bool = False
+    # Cheap fingerprint (dataset dir names + top-level mtimes) of the last scan;
+    # lets the refresher skip the expensive 253-dataset walk when nothing changed
+    # so its GIL-heavy scan stops starving the HTTP handlers (snapshot/camera.jpg).
+    dataset_scan_signature: tuple = ()
+    # Processing is intentionally cached separately from recordedDatasets and
+    # trajectory. Trajectory scans are expensive; processing status changes often
+    # during EE generation and must not force a full dataset/trajectory rescan.
+    processing_scan_signature: tuple = ()
 
     def log(self, level: str, message: str) -> None:
         self.events.insert(
@@ -755,6 +779,15 @@ def _scan_datasets_root(state: GatewayState) -> list[Path]:
     return [entry for entry in root.iterdir() if _is_dataset_root(entry)]
 
 
+def _scan_exports_root(state: GatewayState) -> list[Path]:
+    root = _task_exports_root(state)
+    if not root.is_dir():
+        return []
+    if _is_dataset_root(root):
+        return [root]
+    return [entry for entry in root.iterdir() if _is_dataset_root(entry)]
+
+
 def _dataset_root_candidates(state: GatewayState) -> list[Path]:
     dataset = _dataset_config(state.config)
     configured_root = _resolve_dataset_root(state.repo_root, dataset.get("root"))
@@ -781,8 +814,41 @@ def _dataset_root_candidates(state: GatewayState) -> list[Path]:
     return sorted(candidates, key=_dataset_modified_s, reverse=True)
 
 
+def _dataset_kind(state: GatewayState, dataset_root: Path) -> str:
+    try:
+        dataset_root.resolve().relative_to(_task_exports_root(state).resolve())
+    except (OSError, ValueError):
+        return "recorded"
+    return "exported"
+
+
+_REPLAY_CANDIDATES_MEMO: tuple[float, list[Path]] | None = None
+_REPLAY_CANDIDATES_TTL_S = 3.0
+_PROCESSING_STALE_RUNNING_S = 120.0
+
+
+def _complete_replay_dataset_candidates(state: GatewayState) -> list[Path]:
+    # Short-TTL memo: this globs every dataset (253 on Thor) and is the single
+    # chokepoint reached by several _snapshot helpers (annotation resolve,
+    # replay candidates, known-dataset resolve) on every ~1s poll. Without it
+    # those repeated full scans kept /api/snapshot at ~1s+ (gateway-slow root).
+    # The dataset set changes rarely, so a few seconds of staleness is fine.
+    global _REPLAY_CANDIDATES_MEMO
+    now = time.monotonic()
+    memo = _REPLAY_CANDIDATES_MEMO
+    if memo is not None and now - memo[0] < _REPLAY_CANDIDATES_TTL_S:
+        return list(memo[1])
+    candidates = list(_complete_dataset_candidates(state))
+    for entry in _scan_exports_root(state):
+        if entry not in candidates and _dataset_is_complete(entry):
+            candidates.append(entry)
+    result = sorted(candidates, key=_dataset_modified_s, reverse=True)
+    _REPLAY_CANDIDATES_MEMO = (now, result)
+    return list(result)
+
+
 def _replay_dataset_candidates(state: GatewayState) -> list[Path]:
-    candidates = _complete_dataset_candidates(state)
+    candidates = _complete_replay_dataset_candidates(state)
     selected = state.selected_replay_root.resolve() if state.selected_replay_root is not None else None
     if selected is None:
         return candidates
@@ -798,7 +864,7 @@ def _select_replay_dataset(state: GatewayState, raw_path: str) -> None:
     if requested is None:
         raise ValueError("Missing dataset path.")
     requested = requested.resolve()
-    candidates = _complete_dataset_candidates(state)
+    candidates = _complete_replay_dataset_candidates(state)
     matched = next((candidate for candidate in candidates if candidate.resolve() == requested), None)
     if matched is None:
         raise ValueError(f"Dataset is not in the recorded dataset list: {requested}")
@@ -812,14 +878,18 @@ def _select_replay_dataset(state: GatewayState, raw_path: str) -> None:
     state.replay.frameIndex = 0
     state.replay.trackingErrorMm = 0.0
     state.replay.datasetRoot = str(matched)
+    state.replay.datasetKind = _dataset_kind(state, matched)
     state.replay.dataset = str(matched)
-    state.replay.message = f"Selected recorded dataset: {matched.name}"
+    state.replay.message = f"Selected {_dataset_kind(state, matched)} dataset: {matched.name}"
     _invalidate_mujoco_validation(state, "Dataset changed; run MuJoCo replay again before real-robot replay.")
     persisted_validation = _load_persisted_mujoco_validation(state, matched, state.replay.episode)
     if persisted_validation is not None:
         state.replay.mujocoValidation = persisted_validation
         _refresh_mujoco_validation_current(state)
-        state.replay.message = f"Selected recorded dataset: {matched.name}; MuJoCo validation restored"
+        state.replay.message = f"Selected {_dataset_kind(state, matched)} dataset: {matched.name}; MuJoCo validation restored"
+    state.cached_recorded_datasets = _recorded_dataset_items(state)
+    state.cached_trajectory, state.cached_trajectory_meta = _read_recorded_trajectory(state)
+    state.dataset_cache_ready = True
     state.log("info", f"Selected replay dataset {matched}")
 
 
@@ -843,6 +913,7 @@ def _select_replay_episode(state: GatewayState, raw_episode: str) -> None:
     state.replay.safety = "locked"
     state.replay.frameIndex = 0
     state.replay.trackingErrorMm = 0.0
+    state.replay.datasetKind = _dataset_kind(state, dataset_root)
     state.replay.message = f"Selected episode {episode} from {dataset_root.name}"
     _invalidate_mujoco_validation(state, "Episode changed; run MuJoCo replay again before real-robot replay.")
     persisted_validation = _load_persisted_mujoco_validation(state, dataset_root, episode)
@@ -850,7 +921,288 @@ def _select_replay_episode(state: GatewayState, raw_episode: str) -> None:
         state.replay.mujocoValidation = persisted_validation
         _refresh_mujoco_validation_current(state)
         state.replay.message = f"Selected episode {episode} from {dataset_root.name}; MuJoCo validation restored"
+    state.cached_trajectory, state.cached_trajectory_meta = _read_recorded_trajectory(state)
+    state.dataset_cache_ready = True
     state.log("info", f"Selected replay episode {episode} for {dataset_root}")
+
+
+def _delete_replay_episode(state: GatewayState, raw_episode: str) -> None:
+    if raw_episode == "":
+        raise ValueError("Missing episode index.")
+    try:
+        episode = int(raw_episode)
+    except ValueError as exc:
+        raise ValueError(f"Invalid episode index: {raw_episode}") from exc
+    dataset_root = state.selected_replay_root or _resolve_known_dataset(
+        state, state.replay.datasetRoot or state.replay.dataset
+    )
+    if dataset_root is None:
+        raise ValueError("Select a recorded dataset before deleting an episode.")
+    episode_options = _dataset_episode_indices(dataset_root, _load_dataset_info(dataset_root))
+    if episode not in episode_options:
+        raise ValueError(f"Episode {episode} is not available for {dataset_root.name}.")
+    if len(episode_options) <= 1:
+        raise ValueError("Cannot delete the only remaining episode in the dataset.")
+
+    # old episode index -> new contiguous index for every episode we keep. This
+    # is the same construction dataset_tools.delete_episodes uses internally, so
+    # the v3 core and the side metadata stay in lockstep.
+    kept = [ep for ep in episode_options if ep != episode]
+    mapping = {old: new for new, old in enumerate(kept)}
+
+    # Dispatch by what the replay timeline actually reads. When a v3 parquet is
+    # present the timeline reads *it* (see _read_dataset_timeline's
+    # `not _has_lerobot_v3_data` guard), so reindexing the parquet/meta is what
+    # makes the per-episode frames change. gmsl2 episode dirs (the mkv videos)
+    # are renumbered alongside inside the v3 path for hybrid datasets. Only a
+    # pure gmsl2 dataset (no parquet) takes the dir-only path.
+    if _has_lerobot_v3_data(dataset_root):
+        _delete_lerobot_v3_episode(dataset_root, episode, mapping)
+    elif _has_gmsl2_episodes(dataset_root):
+        _delete_gmsl2_episode(dataset_root, episode, mapping)
+    else:
+        raise ValueError(f"Dataset layout not supported for deletion: {dataset_root.name}")
+
+    # Remap episode-keyed side files at the final root for both formats. Derived
+    # EE-pose trajectories are intentionally dropped by the per-format helpers
+    # (they can't be trusted after a frame renumber) and are regenerated later.
+    _reindex_episode_side_metadata(dataset_root, mapping, episode)
+
+    # gmsl2 renumber renames meta.json paths, so stale frame-count memo entries
+    # would otherwise linger; the memo is cheap to rebuild.
+    _GMSL2_EP_FRAMES_MEMO.clear()
+
+    new_options = _dataset_episode_indices(dataset_root, _load_dataset_info(dataset_root))
+    state.selected_replay_root = dataset_root
+    state.replay.episodeOptions = new_options
+    # Deleting shifts the survivors down, so the slot we stay on (see below) now
+    # holds a different episode's frames/videos. Bump the revision so the UI
+    # refetches the timeline even though (datasetRoot, episode) is unchanged.
+    state.replay.revision += 1
+    # Stay on the slot the deleted episode occupied (the next episode shifts into
+    # it); clamp to the new last episode when we deleted the tail.
+    next_episode = min(episode, new_options[-1]) if new_options else 0
+    state.replay.episode = next_episode
+    state.replay.state = "idle"
+    state.replay.safety = "locked"
+    state.replay.frameIndex = 0
+    state.replay.trackingErrorMm = 0.0
+    state.replay.datasetRoot = str(dataset_root)
+    state.replay.dataset = str(dataset_root)
+    state.replay.message = (
+        f"Deleted episode {episode} from {dataset_root.name}; "
+        f"{len(new_options)} episode(s) remain (reindexed)."
+    )
+    # _snapshot re-derives episodeOptions/totalEpisodes/message from the
+    # background scan cache, which still describes the pre-delete tree until the
+    # ~4s refresher runs — so without this the response (and every poll until
+    # then) would still report the old episode count. We already hold state.lock
+    # here, so recompute the cache inline rather than calling
+    # _refresh_dataset_stats_cache (which re-acquires the lock and would
+    # deadlock). The scan functions are read-only on state.
+    state.selected_replay_root = dataset_root
+    state.replay.episode = next_episode
+    state.cached_recorded_datasets = _recorded_dataset_items(state)
+    state.cached_trajectory, state.cached_trajectory_meta = _read_recorded_trajectory(state)
+    state.dataset_cache_ready = True
+    _invalidate_mujoco_validation(
+        state, "Episode deleted; run MuJoCo replay again before real-robot replay."
+    )
+    persisted_validation = _load_persisted_mujoco_validation(state, dataset_root, next_episode)
+    if persisted_validation is not None:
+        state.replay.mujocoValidation = persisted_validation
+        _refresh_mujoco_validation_current(state)
+    state.log("warn", f"Deleted replay episode {episode} from {dataset_root}")
+
+
+def _delete_lerobot_v3_episode(dataset_root: Path, episode: int, mapping: dict[int, int]) -> None:
+    # The gateway runs under a slim python (pyarrow + pandas, but no
+    # datasets/torch/av), so lerobot.datasets.dataset_tools.delete_episodes is
+    # unimportable here. Reindex the v3 parquet + meta in place with pyarrow
+    # instead. This is only correct when there are no *embedded* v3 videos to
+    # re-cut; the gmsl2-hybrid datasets keep their mkv videos in episodes/ (the
+    # v3 rep is data-only), which the dir renumber below handles.
+    info = _load_dataset_info(dataset_root)
+    video_keys = [
+        key
+        for key, feature in (info.get("features") or {}).items()
+        if isinstance(feature, dict) and feature.get("dtype") == "video"
+    ]
+    if video_keys and not _has_gmsl2_episodes(dataset_root):
+        raise ValueError(
+            "Deleting an episode from a packed v3 dataset with embedded videos is not "
+            "supported from the gateway (needs ffmpeg/av to re-cut the concatenated "
+            "clips); use scripts/lerobot_edit_dataset.py instead."
+        )
+
+    _reindex_v3_data_and_meta_inplace(dataset_root, episode, mapping)
+
+    # Hybrid datasets keep the raw gmsl2 per-episode dirs (mkv videos + remux
+    # caches); renumber them to match the reindexed parquet.
+    if _has_gmsl2_episodes(dataset_root):
+        _renumber_gmsl2_episode_dirs(dataset_root, episode, mapping)
+    # Derived AprilTag EE-pose sidecars are indexed by the old episode numbers
+    # and can't be trusted after renumbering; drop them so replay regenerates.
+    derived = dataset_root / "derived"
+    if derived.is_dir():
+        shutil.rmtree(derived, ignore_errors=True)
+
+
+def _reindex_v3_data_and_meta_inplace(
+    dataset_root: Path, deleted_episode: int, mapping: dict[int, int]
+) -> None:
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    def _atomic_write_table(table: "pa.Table", path: Path) -> None:
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        pq.write_table(table, tmp)
+        os.replace(tmp, path)
+
+    def _replace_col(table: "pa.Table", name: str, values: list) -> "pa.Table":
+        idx = table.schema.get_field_index(name)
+        if idx < 0:
+            return table
+        arr = pa.array(values, type=table.schema.field(name).type)
+        return table.set_column(idx, name, arr)
+
+    # 1) data parquet: drop the deleted episode's rows, remap episode_index for
+    #    the survivors, and rebuild the contiguous global `index` across files.
+    running = 0
+    for data_file in sorted((dataset_root / "data").glob("chunk-*/*.parquet")):
+        table = pq.read_table(data_file)
+        if "episode_index" in table.column_names:
+            table = table.filter(pc.not_equal(table["episode_index"], deleted_episode))
+            table = _replace_col(
+                table,
+                "episode_index",
+                [mapping.get(int(e), int(e)) for e in table["episode_index"].to_pylist()],
+            )
+        n = table.num_rows
+        if "index" in table.column_names:
+            table = _replace_col(table, "index", list(range(running, running + n)))
+        running += n
+        _atomic_write_table(table, data_file)
+    total_frames = running
+
+    # 2) meta/episodes: drop the deleted row, remap episode_index, and recompute
+    #    the global row ranges from the surviving per-episode lengths.
+    meta_ep_files = sorted((dataset_root / "meta" / "episodes").glob("chunk-*/*.parquet"))
+    if meta_ep_files:
+        tables = [pq.read_table(f) for f in meta_ep_files]
+        combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+        combined = combined.filter(pc.not_equal(combined["episode_index"], deleted_episode))
+        new_ep = [mapping[int(e)] for e in combined["episode_index"].to_pylist()]
+        order = sorted(range(len(new_ep)), key=lambda i: new_ep[i])
+        combined = combined.take(pa.array(order))
+        combined = _replace_col(combined, "episode_index", sorted(new_ep))
+        lengths = [int(x) for x in combined["length"].to_pylist()]
+        starts: list[int] = []
+        cursor = 0
+        for length in lengths:
+            starts.append(cursor)
+            cursor += length
+        combined = _replace_col(combined, "dataset_from_index", starts)
+        combined = _replace_col(combined, "dataset_to_index", [s + length for s, length in zip(starts, lengths)])
+        # Collapse to a single meta/episodes file (index 0/0) so the layout stays
+        # consistent after removing a row.
+        combined = _replace_col(combined, "meta/episodes/chunk_index", [0] * combined.num_rows)
+        combined = _replace_col(combined, "meta/episodes/file_index", [0] * combined.num_rows)
+        _atomic_write_table(combined, meta_ep_files[0])
+        for extra in meta_ep_files[1:]:
+            extra.unlink()
+
+    # 3) info.json: episode/frame totals and the single-split range.
+    info_path = dataset_root / "meta" / "info.json"
+    info = _load_dataset_info(dataset_root)
+    if info:
+        info["total_episodes"] = max(int(info.get("total_episodes") or 0) - 1, 0)
+        info["total_frames"] = total_frames
+        splits = info.get("splits")
+        if isinstance(splits, dict) and "train" in splits:
+            splits["train"] = f"0:{info['total_episodes']}"
+        tmp = info_path.with_name(f".info.json.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, info_path)
+
+
+def _renumber_gmsl2_episode_dirs(dataset_root: Path, episode: int, mapping: dict[int, int]) -> None:
+    # gmsl2 datasets store one self-contained directory per episode and derive
+    # the episode index purely from the directory name, so renumbering is a
+    # rmtree of the victim plus a contiguous rename of the survivors.
+    eps_dir = dataset_root / "episodes"
+    victim = eps_dir / f"episode_{episode:06d}"
+    if victim.is_dir():
+        shutil.rmtree(victim)
+    # Rename in ascending old-index order so every destination slot is free
+    # before we move into it.
+    for old in sorted(k for k in mapping if k > episode):
+        src = eps_dir / f"episode_{old:06d}"
+        dst = eps_dir / f"episode_{mapping[old]:06d}"
+        if src.is_dir() and not dst.exists():
+            os.replace(src, dst)
+
+
+def _delete_gmsl2_episode(dataset_root: Path, episode: int, mapping: dict[int, int]) -> None:
+    # Pure gmsl2 dataset (no v3 parquet): the episode dirs *are* the dataset.
+    _renumber_gmsl2_episode_dirs(dataset_root, episode, mapping)
+    # Derived AprilTag EE-pose sidecars are indexed by the old episode numbers
+    # and can't be trusted after renumbering; drop them so replay regenerates.
+    derived = dataset_root / "derived"
+    if derived.is_dir():
+        shutil.rmtree(derived, ignore_errors=True)
+
+
+def _reindex_episode_side_metadata(
+    dataset_root: Path, mapping: dict[int, int], deleted_episode: int
+) -> None:
+    # Annotations: { "annotations": { "<episode>": {..., "episode": <n>} } }
+    try:
+        store = _read_annotation_store(dataset_root)
+        annotations = store.get("annotations")
+        if isinstance(annotations, dict):
+            remapped: dict[str, Any] = {}
+            for key, value in annotations.items():
+                try:
+                    old = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if old == deleted_episode or old not in mapping:
+                    continue
+                new = mapping[old]
+                if isinstance(value, dict):
+                    value = {**value, "episode": new}
+                remapped[str(new)] = value
+            store["annotations"] = remapped
+            _write_annotation_store(dataset_root, store)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    # Mujoco validations: { "validations": [ {..., "episode": n, "datasetRoot": p} ] }
+    try:
+        payload = _read_validation_store(dataset_root)
+        validations = payload.get("validations")
+        if isinstance(validations, list):
+            reindexed: list[dict[str, Any]] = []
+            for item in validations:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    old = int(item.get("episode"))
+                except (TypeError, ValueError):
+                    continue
+                if old == deleted_episode or old not in mapping:
+                    continue
+                reindexed.append({**item, "episode": mapping[old], "datasetRoot": str(dataset_root)})
+            payload["validations"] = reindexed
+            path = _validation_store_path(dataset_root)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            tmp_path.replace(path)
+    except (OSError, json.JSONDecodeError):
+        pass
 
 
 def _load_dataset_info(dataset_root: Path) -> dict[str, Any]:
@@ -963,7 +1315,7 @@ def _normalize_series(values: list[float], low: float = 8.0, high: float = 92.0)
     return [low + (value - min_value) * scale if value == value else 50.0 for value in values]
 
 
-def _dataset_replay_meta(dataset_root: Path, info: dict[str, Any]) -> dict[str, Any]:
+def _dataset_replay_meta(state: GatewayState, dataset_root: Path, info: dict[str, Any]) -> dict[str, Any]:
     data_files = _dataset_data_files(dataset_root)
     episode_options = _dataset_episode_indices(dataset_root, info)
     if _has_gmsl2_episodes(dataset_root):
@@ -973,6 +1325,7 @@ def _dataset_replay_meta(dataset_root: Path, info: dict[str, Any]) -> dict[str, 
         total_frames = int(info.get("total_frames") or 0)
     return {
         "datasetRoot": str(dataset_root),
+        "datasetKind": _dataset_kind(state, dataset_root),
         "sourcePath": str(data_files[-1]) if data_files else "",
         "totalEpisodes": total_episodes,
         "episodeOptions": episode_options,
@@ -1017,6 +1370,101 @@ def _dataset_episode_indices(dataset_root: Path, info: dict[str, Any] | None = N
     if total_episodes:
         return list(range(total_episodes))
     return [0] if has_rows else []
+
+
+def _episode_metadata_row(dataset_root: Path, episode: int) -> dict[str, Any] | None:
+    try:
+        import pyarrow.parquet as pq
+    except Exception:
+        return None
+
+    for meta_file in sorted((dataset_root / "meta" / "episodes").glob("*/*.parquet")):
+        try:
+            table = pq.read_table(meta_file)
+        except Exception:
+            continue
+        if "episode_index" not in table.column_names:
+            continue
+        for row in table.to_pylist():
+            try:
+                if int(row.get("episode_index")) == int(episode):
+                    return row
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _dataset_child_from_template(dataset_root: Path, template: str, **values: Any) -> Path | None:
+    try:
+        relative = template.format(**values)
+    except (KeyError, IndexError, ValueError):
+        return None
+    candidate = (dataset_root / relative).resolve()
+    try:
+        candidate.relative_to(dataset_root.resolve())
+    except ValueError:
+        return None
+    return candidate
+
+
+def _resolve_data_file_for_episode(dataset_root: Path, info: dict[str, Any], episode: int) -> Path | None:
+    row = _episode_metadata_row(dataset_root, episode)
+    if row is None:
+        return None
+    try:
+        chunk_index = int(row["data/chunk_index"])
+        file_index = int(row["data/file_index"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    template = str(info.get("data_path") or "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet")
+    candidates = [
+        _dataset_child_from_template(
+            dataset_root,
+            template,
+            chunk_index=chunk_index,
+            file_index=file_index,
+        ),
+        dataset_root / "data" / f"chunk-{chunk_index:03d}" / f"file-{file_index:03d}.parquet",
+        dataset_root / "data" / f"chunk-{chunk_index:03d}" / f"file-{file_index:06d}.parquet",
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.is_file():
+            return candidate
+    return None
+
+
+def _resolve_video_file_for_episode(
+    dataset_root: Path,
+    info: dict[str, Any],
+    camera_key: str,
+    episode: int,
+) -> Path | None:
+    row = _episode_metadata_row(dataset_root, episode)
+    if row is None:
+        return None
+    try:
+        chunk_index = int(row[f"videos/{camera_key}/chunk_index"])
+        file_index = int(row[f"videos/{camera_key}/file_index"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    template = str(info.get("video_path") or "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
+    candidates = [
+        _dataset_child_from_template(
+            dataset_root,
+            template,
+            video_key=camera_key,
+            chunk_index=chunk_index,
+            file_index=file_index,
+        ),
+        dataset_root / "videos" / camera_key / f"chunk-{chunk_index:03d}" / f"file-{file_index:03d}.mp4",
+        dataset_root / "videos" / camera_key / f"chunk-{chunk_index:03d}" / f"file-{file_index:06d}.mp4",
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.is_file():
+            return candidate
+    return None
 
 
 def _selected_episode_for_dataset(state: GatewayState, dataset_root: Path, episode_options: list[int]) -> int:
@@ -1099,7 +1547,147 @@ def _write_processing_meta(dataset_root: Path, payload: dict[str, Any]) -> None:
     tmp_path.replace(meta_path)
 
 
-def _processing_item_from_dataset(dataset_root: Path) -> dict[str, Any]:
+def _online_sync_manifest_summary(dataset_root: Path) -> dict[str, Any] | None:
+    if not _has_gmsl2_episodes(dataset_root):
+        return None
+    ep_dirs = _gmsl2_episode_dirs(dataset_root)
+    if not ep_dirs:
+        return None
+    episodes: list[dict[str, Any]] = []
+    present = 0
+    ok_count = 0
+    failed_count = 0
+    missing_count = 0
+    actual_frames_total = 0
+    max_delta_ns: int | None = None
+    failure_reasons: list[str] = []
+    frame_count_mismatch = 0
+    for ep_dir in ep_dirs:
+        match = re.search(r"episode_(\d+)$", ep_dir.name)
+        ep_index = int(match.group(1)) if match else len(episodes)
+        manifest_path = ep_dir / "online_sync_manifest.json"
+        item: dict[str, Any] = {
+            "episode": ep_index,
+            "present": manifest_path.is_file(),
+            "ok": False,
+            "actualFrames": None,
+            "frameCountByCamera": {},
+            "maxSofDeltaMs": None,
+            "failure": "missing online_sync_manifest.json",
+        }
+        if not manifest_path.is_file():
+            missing_count += 1
+            failure_reasons.append(f"episode {ep_index}: missing online_sync_manifest.json")
+            episodes.append(item)
+            continue
+        present += 1
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            failed_count += 1
+            item["failure"] = f"invalid online_sync_manifest.json: {exc}"
+            failure_reasons.append(f"episode {ep_index}: {item['failure']}")
+            episodes.append(item)
+            continue
+        if not isinstance(manifest, dict):
+            failed_count += 1
+            item["failure"] = "invalid online_sync_manifest.json payload"
+            failure_reasons.append(f"episode {ep_index}: {item['failure']}")
+            episodes.append(item)
+            continue
+        counts = manifest.get("frame_count_by_camera") if isinstance(manifest.get("frame_count_by_camera"), dict) else {}
+        max_by_camera = manifest.get("max_abs_delta_ns_by_camera") if isinstance(manifest.get("max_abs_delta_ns_by_camera"), dict) else {}
+        try:
+            actual_frames = int(manifest.get("actual_frames") or 0)
+        except (TypeError, ValueError):
+            actual_frames = 0
+        deltas: list[int] = []
+        for value in max_by_camera.values():
+            try:
+                delta = int(value)
+            except (TypeError, ValueError):
+                continue
+            deltas.append(delta)
+            max_delta_ns = delta if max_delta_ns is None else max(max_delta_ns, delta)
+        mismatch = False
+        for camera, value in counts.items():
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                mismatch = True
+                continue
+            if actual_frames and count != actual_frames:
+                mismatch = True
+        if mismatch:
+            frame_count_mismatch += 1
+        ok = bool(manifest.get("ok")) and actual_frames > 0 and not mismatch
+        failure = str(manifest.get("failure") or "").strip()
+        if not ok and not failure:
+            failure = "manifest ok=false" if not manifest.get("ok") else "frame count mismatch"
+        if ok:
+            ok_count += 1
+            actual_frames_total += actual_frames
+        else:
+            failed_count += 1
+            failure_reasons.append(f"episode {ep_index}: {failure}")
+        item.update({
+            "ok": ok,
+            "actualFrames": actual_frames,
+            "frameCountByCamera": {str(k): int(v) for k, v in counts.items() if isinstance(v, (int, float))},
+            "maxSofDeltaMs": (max(deltas) / 1_000_000.0) if deltas else None,
+            "failure": failure,
+        })
+        episodes.append(item)
+    summary: dict[str, Any] = {
+        "present": present,
+        "missing": missing_count,
+        "ok": ok_count,
+        "failed": failed_count,
+        "totalEpisodes": len(ep_dirs),
+        "actualFrames": actual_frames_total,
+        "maxSofDeltaMs": (max_delta_ns / 1_000_000.0) if max_delta_ns is not None else None,
+        "frameCountMismatch": frame_count_mismatch,
+        "failureReasons": failure_reasons[:8],
+        "episodes": episodes[:12],
+    }
+    if present == 0:
+        summary["status"] = "missing"
+        summary["message"] = "No online_sync_manifest.json files found"
+    elif failed_count or missing_count:
+        summary["status"] = "fail"
+        summary["message"] = f"{ok_count}/{len(ep_dirs)} episodes passed online-sync manifest checks"
+    else:
+        summary["status"] = "pass"
+        max_delta = summary["maxSofDeltaMs"]
+        suffix = f", max SOF delta {max_delta:.3f} ms" if isinstance(max_delta, (int, float)) else ""
+        summary["message"] = f"{ok_count}/{len(ep_dirs)} episodes passed online-sync manifest checks{suffix}"
+    return summary
+
+
+def _online_sync_manifest_check(dataset_root: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    summary = _online_sync_manifest_summary(dataset_root)
+    if summary is None:
+        return None, None
+    status = str(summary.get("status") or "missing")
+    if status == "pass":
+        check_status = "pass"
+    elif status == "missing":
+        check_status = "warn"
+    else:
+        check_status = "fail"
+    return summary, {
+        "name": "online_sync_manifest",
+        "status": check_status,
+        "message": summary.get("message") or "online sync manifest unavailable",
+    }
+
+
+def _processing_item_from_dataset(
+    dataset_root: Path,
+    *,
+    attached_processes: set[str] | None = None,
+    now_s: float | None = None,
+) -> dict[str, Any]:
     info = _load_dataset_info(dataset_root)
     modified_s = _dataset_modified_s(dataset_root)
     if _has_gmsl2_episodes(dataset_root):
@@ -1118,6 +1706,7 @@ def _processing_item_from_dataset(dataset_root: Path) -> dict[str, Any]:
         "totalFrames": total_frames,
         "validFramesPct": None,
         "logTail": [],
+        "onlineSync": _online_sync_manifest_summary(dataset_root),
     }
 
     meta = _load_processing_meta(dataset_root)
@@ -1128,8 +1717,17 @@ def _processing_item_from_dataset(dataset_root: Path) -> dict[str, Any]:
         version_info = versions.get(active_version) if isinstance(active_version, str) else None
         qc = version_info.get("qc") if isinstance(version_info, dict) else None
         if isinstance(current_job, dict) and current_job.get("status") in ("queued", "running"):
-            status = current_job["status"]
+            status = str(current_job["status"])
             message = current_job.get("message") or f"{current_job.get('kind') or 'job'} {status}"
+            if attached_processes is not None and str(dataset_root) not in attached_processes:
+                updated_s = _parse_iso_epoch_s(current_job.get("updated_at"))
+                age_s = (time.time() if now_s is None else now_s) - updated_s if updated_s is not None else None
+                if age_s is None or age_s > _PROCESSING_STALE_RUNNING_S:
+                    status = "error"
+                    message = (
+                        "EE trajectory job is stale: metadata says running, "
+                        "but this gateway is not attached to a live process"
+                    )
         elif isinstance(current_job, dict) and current_job.get("status") in ("failed", "error"):
             status = "error"
             message = current_job.get("message") or f"{current_job.get('kind') or 'job'} failed"
@@ -1220,8 +1818,16 @@ def _complete_dataset_candidates(state: GatewayState) -> list[Path]:
     return [root for root in _dataset_root_candidates(state) if _dataset_is_complete(root)]
 
 
-def _processing_items(state: GatewayState) -> list[dict[str, Any]]:
-    return [_processing_item_from_dataset(root) for root in _complete_dataset_candidates(state)]
+def _processing_items(
+    state: GatewayState,
+    *,
+    attached_processes: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    now_s = time.time()
+    return [
+        _processing_item_from_dataset(root, attached_processes=attached_processes, now_s=now_s)
+        for root in _complete_dataset_candidates(state)
+    ]
 
 
 def _set_datasets_root(state: GatewayState, raw_path: str) -> bool:
@@ -1246,6 +1852,10 @@ def _set_datasets_root(state: GatewayState, raw_path: str) -> bool:
         created = True
     state.datasets_root = resolved
     state.selected_replay_root = None
+    state.dataset_cache_ready = False
+    state.processing_cache_ready = False
+    state.dataset_scan_signature = ()
+    state.processing_scan_signature = ()
     return created
 
 
@@ -1297,6 +1907,18 @@ def _mock_calibrate_cameras(state: GatewayState) -> None:
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
+
+
+def _parse_iso_epoch_s(value: Any) -> float | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        if text.endswith("Z"):
+            return time.mktime(time.strptime(text[:-1], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+        return time.mktime(time.strptime(text, "%Y-%m-%dT%H:%M:%S"))
+    except (OverflowError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1359,7 +1981,7 @@ def _dataset_episode_count(dataset_root: Path) -> int:
 
 
 def _count_completed_episodes(state: GatewayState, repo_id: str) -> int:
-    if not repo_id or not state.datasets_root:
+    if not repo_id:
         return 0
     # datasetRepoId carries a namespace ("local/pick_and_place") but on-disk
     # dataset directories use only the trailing name, optionally suffixed with a
@@ -1368,16 +1990,18 @@ def _count_completed_episodes(state: GatewayState, repo_id: str) -> int:
     base_name = repo_id.split("/")[-1].strip()
     if not base_name:
         return 0
+    # Read from the cached dataset scan (maintained off-snapshot by the
+    # background refresher) instead of walking every dataset on disk. This is
+    # called for EACH task inside _snapshot on every ~1s poll; the old
+    # iterdir()+glob was O(tasks x datasets) FS ops (9 x 253 here) and made
+    # /api/snapshot take 1-5s -- the gateway-slow / preview-demand-starved root.
     total = 0
-    try:
-        for candidate in state.datasets_root.iterdir():
-            if not _is_dataset_root(candidate):
-                continue
-            if base_name not in _dataset_name_prefixes(candidate.name):
-                continue
-            total += _dataset_episode_count(candidate)
-    except OSError:
-        pass
+    for item in state.cached_recorded_datasets:
+        if str(item.get("datasetKind") or "recorded") != "recorded":
+            continue
+        name = str(item.get("name") or "")
+        if base_name in _dataset_name_prefixes(name):
+            total += int(item.get("totalEpisodes") or 0)
     return total
 
 
@@ -1611,12 +2235,13 @@ def _approved_dataset_export_command(state: GatewayState, dataset_root: Path) ->
     if not _has_gmsl2_episodes(dataset_root):
         raise ValueError("Approved raw export requires a GMSL2 session dataset.")
     base_name = dataset_root.name
+    output_name = _dataset_name_with_actual_camera_count(dataset_root)
     exports_root = _task_exports_root(state)
-    out_root = exports_root / base_name
+    out_root = exports_root / output_name
     task = _matching_task_for_dataset(state, dataset_root)
-    task_prompt = str((task or {}).get("description") or (task or {}).get("name") or base_name).strip()
+    task_prompt = str((task or {}).get("description") or (task or {}).get("name") or output_name).strip()
     namespace = str((task or {}).get("datasetRepoId") or "local").split("/")[0] or "local"
-    repo_id = f"{namespace}/{base_name}"
+    repo_id = f"{namespace}/{output_name}"
     script = state.repo_root / "tools" / "thor" / "gmsl2" / "export_v3.py"
     command = [
         str(_venv_python(state.repo_root)),
@@ -1624,6 +2249,7 @@ def _approved_dataset_export_command(state: GatewayState, dataset_root: Path) ->
         "--datasets-root", str(dataset_root.parent),
         "--exports-root", str(exports_root),
         "--base-name", base_name,
+        "--output-name", output_name,
         "--repo-id", repo_id,
         "--task", task_prompt,
         "--overwrite",
@@ -1967,6 +2593,9 @@ def _run_qc(dataset_root: Path) -> dict[str, Any]:
         }
 
     checks: list[dict[str, Any]] = []
+    online_sync_summary, online_sync_check = _online_sync_manifest_check(dataset_root)
+    if online_sync_check is not None:
+        checks.append(online_sync_check)
     total_rows = 0
     invalid_rows = 0
     schema_failed_files = 0
@@ -1984,7 +2613,7 @@ def _run_qc(dataset_root: Path) -> dict[str, Any]:
             schema_failed_files += 1
             continue
 
-        missing_columns = [col for col in ("action", "observation.state", "timestamp", "frame_index") if col not in table.column_names]
+        missing_columns = [col for col in ("observation.state", "timestamp", "frame_index") if col not in table.column_names]
         if missing_columns:
             checks.append({
                 "name": "schema",
@@ -2191,6 +2820,7 @@ def _run_qc(dataset_root: Path) -> dict[str, Any]:
         "summary": summary,
         "valid_frames_pct": round(valid_pct, 1),
         "checks": checks,
+        "online_sync": online_sync_summary,
         "completed_at": _now_iso(),
     }
 
@@ -2343,66 +2973,83 @@ def _read_traj_gen_output(
                 continue
             log_tail = [*log_tail, output][-24:]
             with state.lock:
-                if state.processing_processes.get(str(dataset_root)) is not process:
-                    return
-                _update_traj_gen_meta(
-                    dataset_root,
-                    job_id=job_id,
-                    status="running",
-                    message=output,
-                    log_tail=log_tail,
-                )
+                still_current = state.processing_processes.get(str(dataset_root)) is process
+            if not still_current:
+                return
+            _update_traj_gen_meta(
+                dataset_root,
+                job_id=job_id,
+                status="running",
+                message=output,
+                log_tail=log_tail,
+            )
+            _refresh_cached_processing_item(state, dataset_root)
     exit_code = process.wait()
     with state.lock:
-        if state.processing_processes.get(str(dataset_root)) is process:
+        still_current = state.processing_processes.get(str(dataset_root)) is process
+        if still_current:
             state.processing_processes.pop(str(dataset_root), None)
-        existing = _load_processing_meta(dataset_root) or {}
-        versions = existing.get("versions") if isinstance(existing.get("versions"), dict) else {}
-        if exit_code == 0:
-            version = _next_processing_version(versions)
-            message = "EE trajectory generated from AprilTag cube tracking"
-            _update_traj_gen_meta(
-                dataset_root,
-                job_id=job_id,
-                status="complete",
-                message=message,
-                log_tail=[*log_tail, f"[traj-gen] complete exit_code={exit_code}"][-24:],
-                version=version,
-                exit_code=exit_code,
-            )
+    if not still_current:
+        return
+
+    existing = _load_processing_meta(dataset_root) or {}
+    versions = existing.get("versions") if isinstance(existing.get("versions"), dict) else {}
+    if exit_code == 0:
+        version = _next_processing_version(versions)
+        message = "EE trajectory generated from AprilTag cube tracking"
+        _update_traj_gen_meta(
+            dataset_root,
+            job_id=job_id,
+            status="complete",
+            message=message,
+            log_tail=[*log_tail, f"[traj-gen] complete exit_code={exit_code}"][-24:],
+            version=version,
+            exit_code=exit_code,
+        )
+        _refresh_cached_processing_item(state, dataset_root)
+        with state.lock:
             state.log("info", f"Generated EE trajectory for {dataset_root.name} as {version}")
-        else:
-            message = f"EE trajectory generation failed with exit code {exit_code}"
-            _update_traj_gen_meta(
-                dataset_root,
-                job_id=job_id,
-                status="failed",
-                message=message,
-                log_tail=[*log_tail, f"[traj-gen] failed exit_code={exit_code}"][-24:],
-                exit_code=exit_code,
-            )
+    else:
+        message = f"EE trajectory generation failed with exit code {exit_code}"
+        _update_traj_gen_meta(
+            dataset_root,
+            job_id=job_id,
+            status="failed",
+            message=message,
+            log_tail=[*log_tail, f"[traj-gen] failed exit_code={exit_code}"][-24:],
+            exit_code=exit_code,
+        )
+        _refresh_cached_processing_item(state, dataset_root)
+        with state.lock:
             state.log("warn", f"{message}: {dataset_root}")
 
 
 def _queue_traj_gen(state: GatewayState, dataset_root: Path) -> None:
     key = str(dataset_root)
-    running = state.processing_processes.get(key)
-    if running is not None and running.poll() is None:
-        state.log("info", f"EE trajectory generation already running for {dataset_root.name}")
-        return
-    state.processing_processes.pop(key, None)
+    with state.lock:
+        running = state.processing_processes.get(key)
+        if key in state.processing_starting:
+            state.log("info", f"EE trajectory generation already starting for {dataset_root.name}")
+            return
+        if running is not None and running.poll() is None:
+            state.log("info", f"EE trajectory generation already running for {dataset_root.name}")
+            return
+        state.processing_processes.pop(key, None)
+        state.processing_starting.add(key)
 
-    command = _ee_trajectory_command(state, dataset_root)
     job_id = f"traj-gen-{int(time.time())}"
-    _update_traj_gen_meta(
-        dataset_root,
-        job_id=job_id,
-        status="running",
-        command=command,
-        message=f"Running AprilTag cube tracking for {dataset_root.name}",
-        log_tail=[f"[traj-gen] {' '.join(command)}"],
-    )
+    command: list[str] = []
     try:
+        command = _ee_trajectory_command(state, dataset_root)
+        _update_traj_gen_meta(
+            dataset_root,
+            job_id=job_id,
+            status="running",
+            command=command,
+            message=f"Running AprilTag cube tracking for {dataset_root.name}",
+            log_tail=[f"[traj-gen] {' '.join(command)}"],
+        )
+        _refresh_cached_processing_item(state, dataset_root)
         process = subprocess.Popen(
             command,
             cwd=state.repo_root,
@@ -2413,6 +3060,8 @@ def _queue_traj_gen(state: GatewayState, dataset_root: Path) -> None:
             start_new_session=True,
         )
     except OSError as exc:
+        with state.lock:
+            state.processing_starting.discard(key)
         _update_traj_gen_meta(
             dataset_root,
             job_id=job_id,
@@ -2421,9 +3070,17 @@ def _queue_traj_gen(state: GatewayState, dataset_root: Path) -> None:
             message=f"Failed to start EE trajectory generation: {exc}",
             log_tail=[f"[traj-gen] failed to start: {exc}"],
         )
+        _refresh_cached_processing_item(state, dataset_root)
         raise
-    state.processing_processes[key] = process
-    state.log("info", f"Started EE trajectory generation pid={process.pid} dataset={dataset_root}")
+    except Exception:
+        with state.lock:
+            state.processing_starting.discard(key)
+        raise
+    with state.lock:
+        state.processing_starting.discard(key)
+        state.processing_processes[key] = process
+        state.log("info", f"Started EE trajectory generation pid={process.pid} dataset={dataset_root}")
+    _refresh_cached_processing_item(state, dataset_root)
     _start_traj_gen_output_reader(state, dataset_root, process, job_id)
 
 
@@ -2435,6 +3092,38 @@ def _gmsl2_episode_dirs(dataset_root: Path) -> list[Path]:
         (d for d in eps_dir.iterdir() if d.is_dir() and d.name.startswith("episode_")),
         key=lambda p: p.name,
     )
+
+
+def _name_with_camera_count(name: str, camera_count: int) -> str:
+    if camera_count <= 0:
+        return name
+    label = f"{camera_count}ch"
+    if re.search(r"(?<![A-Za-z0-9])(?:\d+|[Nn])ch(?![A-Za-z0-9])", name):
+        return re.sub(r"(?<![A-Za-z0-9])(?:\d+|[Nn])ch(?![A-Za-z0-9])", label, name, count=1)
+    return name
+
+
+def _gmsl2_camera_names(dataset_root: Path) -> list[str]:
+    names: set[str] = set()
+    for ep_dir in _gmsl2_episode_dirs(dataset_root):
+        manifest_path = ep_dir / "online_sync_manifest.json"
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                manifest = {}
+            active = manifest.get("active_cameras")
+            if isinstance(active, list):
+                names.update(str(cam) for cam in active if str(cam).strip())
+            counts = manifest.get("frame_count_by_camera")
+            if isinstance(counts, dict):
+                names.update(str(cam) for cam in counts if str(cam).strip())
+        names.update(p.stem for p in ep_dir.glob("cam_*.mkv"))
+    return sorted(names)
+
+
+def _dataset_name_with_actual_camera_count(dataset_root: Path) -> str:
+    return _name_with_camera_count(dataset_root.name, len(_gmsl2_camera_names(dataset_root)))
 
 
 # Per-episode frame-count memo keyed by meta.json path -> (mtime, frames).
@@ -2475,7 +3164,7 @@ def _gmsl2_dataset_stats(dataset_root: Path) -> tuple[int, int]:
 
 def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for index, dataset_root in enumerate(_complete_dataset_candidates(state)):
+    for index, dataset_root in enumerate(_complete_replay_dataset_candidates(state)):
         info = _load_dataset_info(dataset_root)
         data_files = _dataset_data_files(dataset_root)
         modified_s = _dataset_modified_s(dataset_root)
@@ -2489,6 +3178,7 @@ def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
             {
                 "path": str(dataset_root),
                 "name": dataset_root.name,
+                "datasetKind": _dataset_kind(state, dataset_root),
                 "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(modified_s)) if modified_s else "",
                 "updatedAtMs": int(modified_s * 1000),
                 "totalEpisodes": total_episodes,
@@ -2508,17 +3198,89 @@ def _parquet_status_from_error(exc: Exception) -> str:
     return "unreadable"
 
 
-def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    for dataset_root in _replay_dataset_candidates(state):
-        if _has_gmsl2_episodes(dataset_root):
-            meta = _dataset_replay_meta(dataset_root, {})
-            return [], {
-                **meta,
-                "dataStatus": "loaded",
-                "trajectoryKind": "none",
-                "message": f"GMSL2 raw capture: {meta['totalEpisodes']} episodes, video-only (no robot state)",
-            }
+def _pose_xyz(pose: Any) -> tuple[float, float, float] | None:
+    if not isinstance(pose, dict):
+        return None
+    try:
+        x = float(pose["x"])
+        y = float(pose["y"])
+        z = float(pose["z"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (x, y, z)):
+        return None
+    return x, y, z
 
+
+def _dataset_has_replay_pose_hint(dataset_root: Path, info: dict[str, Any]) -> bool:
+    return bool(
+        _preferred_exported_ee_pose_cube(info)
+        or _action_has_ee_pose(info)
+        or _sidecar_cube_pose_files(dataset_root)
+    )
+
+
+def _trajectory_points_from_timeline(timeline: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    frames = timeline.get("frames") if isinstance(timeline, dict) else []
+    frames = frames if isinstance(frames, list) else []
+    state_names = timeline.get("stateNames") if isinstance(timeline, dict) else []
+    state_names = [str(name) for name in state_names] if isinstance(state_names, list) else []
+    fps = int(timeline.get("fps") or 30) if isinstance(timeline, dict) else 30
+
+    raw_x: list[float] = []
+    raw_y: list[float] = []
+    raw_z: list[float] = []
+    points: list[dict[str, Any]] = []
+    used_pose = False
+    previous_frame: int | None = None
+    previous_timestamp: float | None = None
+
+    for row_index, frame_row in enumerate(frames):
+        if not isinstance(frame_row, dict):
+            continue
+        frame = int(frame_row.get("frame") if frame_row.get("frame") is not None else row_index)
+        timestamp = _first_finite(frame_row.get("timestamp"), default=frame / max(fps, 1))
+        state_values = _as_float_list(frame_row.get("state"))
+        pose_xyz = _pose_xyz(frame_row.get("eePose"))
+        if pose_xyz is not None:
+            used_pose = True
+            raw_x.append(pose_xyz[0])
+            raw_y.append(pose_xyz[1])
+            raw_z.append(pose_xyz[2])
+        else:
+            raw_x.append(float(row_index))
+            raw_y.append(_gripper_width(state_values, state_names))
+            raw_z.append(0.0)
+
+        point: dict[str, Any] = {
+            "frame": frame,
+            "x": 0.0,
+            "y": 0.0,
+            "z": raw_z[-1],
+            "gripperWidthMm": _gripper_width(state_values, state_names),
+            "skewMs": 0.0,
+        }
+        if previous_frame is not None and previous_timestamp is not None:
+            if frame - previous_frame > 1 or timestamp - previous_timestamp > 1.5 / max(fps, 1):
+                point["event"] = "gap"
+        previous_frame = frame
+        previous_timestamp = timestamp
+        points.append(point)
+
+    if not points:
+        return [], False
+
+    normalized_x = _normalize_series(raw_x)
+    normalized_y = _normalize_series(raw_y)
+    normalized_z = _normalize_series(raw_z, low=0.0, high=100.0)
+    for point, x_value, y_value, z_value in zip(points, normalized_x, normalized_y, normalized_z, strict=True):
+        point["x"] = x_value
+        point["y"] = 100.0 - y_value
+        point["z"] = z_value
+    return points, used_pose
+
+
+def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     try:
         import pyarrow.compute as pc
         import pyarrow.parquet as pq
@@ -2526,9 +3288,10 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
         dataset_roots = _replay_dataset_candidates(state)
         latest = dataset_roots[0] if dataset_roots else None
         latest_info = _load_dataset_info(latest) if latest is not None else {}
-        latest_meta = _dataset_replay_meta(latest, latest_info) if latest is not None else {}
+        latest_meta = _dataset_replay_meta(state, latest, latest_info) if latest is not None else {}
         return [], {
             "datasetRoot": latest_meta.get("datasetRoot") or "",
+            "datasetKind": latest_meta.get("datasetKind") or "recorded",
             "sourcePath": latest_meta.get("sourcePath") or "",
             "totalEpisodes": latest_meta.get("totalEpisodes") or 0,
             "recordedFrames": latest_meta.get("recordedFrames") or 0,
@@ -2540,14 +3303,41 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
     best_meta: dict[str, Any] | None = None
     for dataset_root in _replay_dataset_candidates(state):
         info = _load_dataset_info(dataset_root)
-        dataset_meta = _dataset_replay_meta(dataset_root, info)
+        dataset_meta = _dataset_replay_meta(state, dataset_root, info)
         if best_meta is None:
             best_meta = {**dataset_meta, "dataStatus": "missing", "message": "No recorded parquet files found"}
+
+        if _has_gmsl2_episodes(dataset_root):
+            timeline = _read_dataset_timeline(state, dataset_root, None)
+            frames = timeline.get("frames") if isinstance(timeline, dict) else []
+            frames = frames if isinstance(frames, list) else []
+            if frames:
+                points, used_pose = _trajectory_points_from_timeline(timeline)
+                return points, {
+                    **dataset_meta,
+                    "sourcePath": str(timeline.get("sourcePath") or dataset_meta.get("sourcePath") or dataset_root),
+                    "datasetRoot": str(dataset_root),
+                    "episode": int(timeline.get("episode") or 0),
+                    "frames": len(points),
+                    "dataStatus": "loaded",
+                    "trajectoryKind": "pose" if used_pose else "gripper_width",
+                    "message": (
+                        f"Loaded GMSL2 replay episode {int(timeline.get('episode') or 0)} from {dataset_root} ({len(points)} frames with EE pose)"
+                        if used_pose
+                        else f"Loaded GMSL2 replay episode {int(timeline.get('episode') or 0)} from {dataset_root} ({len(points)} frames)"
+                    ),
+                }
+
         data_files = _dataset_data_files(dataset_root)
         for data_file in sorted(data_files, key=lambda path: path.stat().st_mtime, reverse=True):
             try:
                 parquet = pq.ParquetFile(data_file)
                 column_names = parquet.schema_arrow.names
+                pose_columns = [
+                    f"{prefix}.ee_pose.{cube_name}.base"
+                    for prefix in ("observation", "action")
+                    for cube_name in DEFAULT_CUBE_TRAJECTORY_NAMES
+                ]
                 wanted_columns = [
                     column
                     for column in (
@@ -2557,6 +3347,7 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
                         "action",
                         "observation.state",
                         "observation.device_capture_timestamp",
+                        *pose_columns,
                     )
                     if column in column_names
                 ]
@@ -2607,6 +3398,7 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
 
             state_names = _feature_names(info, "observation.state")
             action_names = _feature_names(info, "action")
+            exported_ee_pose_cube = _preferred_exported_ee_pose_cube(info)
             raw_x: list[float] = []
             raw_y: list[float] = []
             raw_z: list[float] = []
@@ -2619,11 +3411,17 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
                 state_values = _as_float_list(row.get("observation.state"))
                 action_values = _as_float_list(row.get("action"))
 
+                pose_xyz = _pose_xyz(_ee_pose_from_row(row, action_names, state_names, exported_pose_cube=exported_ee_pose_cube))
                 vector_values = action_values if len(action_values) >= 3 else state_values
                 vector_names = action_names if len(action_values) >= 3 else state_names
                 x_index, y_index, z_index = _axis_indices(vector_names, vector_values)
 
-                if x_index is not None and y_index is not None and x_index < len(vector_values) and y_index < len(vector_values):
+                if pose_xyz is not None:
+                    used_pose = True
+                    raw_x.append(pose_xyz[0])
+                    raw_y.append(pose_xyz[1])
+                    raw_z.append(pose_xyz[2])
+                elif x_index is not None and y_index is not None and x_index < len(vector_values) and y_index < len(vector_values):
                     used_pose = True
                     raw_x.append(vector_values[x_index])
                     raw_y.append(vector_values[y_index])
@@ -2688,7 +3486,7 @@ def _resolve_known_dataset(state: GatewayState, raw_path: str) -> Path | None:
         resolved = requested.resolve()
     except OSError:
         return None
-    candidates = _complete_dataset_candidates(state)
+    candidates = _complete_replay_dataset_candidates(state)
     for candidate in candidates:
         try:
             if candidate.resolve() == resolved:
@@ -2709,13 +3507,63 @@ def _camera_keys(info: dict[str, Any]) -> list[str]:
     return keys
 
 
-def _ee_pose_from_row(row: dict[str, Any], action_names: list[str], state_names: list[str]) -> dict[str, Any] | None:
+def _fixed_pose7_from_row(row: dict[str, Any], key: str) -> dict[str, float] | None:
+    values = _as_float_list(row.get(key))
+    if len(values) < 3:
+        return None
+    x, y, z = values[:3]
+    if not all(math.isfinite(value) for value in (x, y, z)):
+        return None
+    qx = values[3] if len(values) > 3 and math.isfinite(values[3]) else 0.0
+    qy = values[4] if len(values) > 4 and math.isfinite(values[4]) else 0.0
+    qz = values[5] if len(values) > 5 and math.isfinite(values[5]) else 0.0
+    qw = values[6] if len(values) > 6 and math.isfinite(values[6]) else 1.0
+    return {"x": x, "y": y, "z": z, "qx": qx, "qy": qy, "qz": qz, "qw": qw}
+
+
+def _preferred_exported_ee_pose_cube(info: dict[str, Any]) -> str | None:
+    features = info.get("features") or {}
+    if not isinstance(features, dict):
+        return None
+    for cube_name in DEFAULT_CUBE_TRAJECTORY_NAMES:
+        if (
+            f"observation.ee_pose.{cube_name}.base" in features
+            or f"action.ee_pose.{cube_name}.base" in features
+        ):
+            return cube_name
+    return None
+
+
+def _preferred_cube_pose_name(names: Iterable[str]) -> str | None:
+    available = set(names)
+    for cube_name in DEFAULT_CUBE_TRAJECTORY_NAMES:
+        if cube_name in available:
+            return cube_name
+    return next(iter(available), None)
+
+
+def _ee_pose_from_row(
+    row: dict[str, Any],
+    action_names: list[str],
+    state_names: list[str],
+    *,
+    exported_pose_cube: str | None = None,
+) -> dict[str, Any] | None:
     action_values = _as_float_list(row.get("action"))
     state_values = _as_float_list(row.get("observation.state"))
 
-    # observation.state holds the actual robot pose (smooth); action holds commanded
-    # waypoints that jump between targets. Prefer state for the EE transform.
-    pose = _extract_ee_axes(state_names, state_values) or _extract_ee_axes(action_names, action_values)
+    # Exported datasets store EE pose as independent fixed-size pose columns.
+    # Use one stable source for the whole timeline; per-frame fallback between
+    # left/right/head mixes different tracked objects into one impossible path.
+    pose = None
+    if exported_pose_cube is not None:
+        pose = _fixed_pose7_from_row(row, f"observation.ee_pose.{exported_pose_cube}.base")
+        if pose is None:
+            pose = _fixed_pose7_from_row(row, f"action.ee_pose.{exported_pose_cube}.base")
+
+    # Legacy v3 datasets embed EE pose dimensions inside observation.state/action.
+    if pose is None:
+        pose = _extract_ee_axes(state_names, state_values) or _extract_ee_axes(action_names, action_values)
     if pose is None:
         return None
 
@@ -2725,6 +3573,29 @@ def _ee_pose_from_row(row: dict[str, Any], action_names: list[str], state_names:
         gripper = _extract_gripper(action_names, action_values)
 
     return {**pose, "gripper": gripper}
+
+
+def _force_vector_from_state(state_names: list[str], state_values: list[float]) -> dict[str, float] | None:
+    values: dict[str, float] = {}
+    for axis in ("fx", "fy", "fz"):
+        target = f"box_six_d_force.{axis}"
+        try:
+            index = state_names.index(target)
+        except ValueError:
+            return None
+        if index >= len(state_values):
+            return None
+        value = float(state_values[index])
+        values[axis] = value if math.isfinite(value) else 0.0
+    magnitude = math.sqrt(values["fx"] ** 2 + values["fy"] ** 2 + values["fz"] ** 2)
+    return {"x": values["fx"], "y": values["fy"], "z": values["fz"], "magnitude": magnitude}
+
+
+def _ee_pose_from_cube_poses(
+    cube_poses: dict[str, dict[str, Any]],
+    cube_name: str | None,
+) -> dict[str, Any] | None:
+    return cube_poses.get(cube_name) if cube_name is not None else None
 
 
 def _cube_pose_from_parquet_row(row: dict[str, Any], info: dict[str, Any], cube_name: str) -> dict[str, Any] | None:
@@ -3174,6 +4045,7 @@ def _empty_timeline(
     camera_keys: list[str] | None = None,
     cube_pose_names: list[str] | None = None,
     error: str | None = None,
+    dataset_kind: str = "recorded",
 ) -> dict[str, Any]:
     """Return a fully-shaped ReplayTimeline payload with no frames.
 
@@ -3184,6 +4056,7 @@ def _empty_timeline(
     """
     payload: dict[str, Any] = {
         "datasetRoot": str(dataset_root),
+        "datasetKind": dataset_kind,
         "name": dataset_root.name,
         "episode": int(episode) if episode is not None else 0,
         "totalFrames": 0,
@@ -3198,6 +4071,7 @@ def _empty_timeline(
         "videoFileIndex": 0,
         "sourcePath": "",
         "videoWarmupS": 0.0,
+        "cameraVideoOffsetsS": {},
     }
     if error:
         payload["error"] = error
@@ -3261,12 +4135,12 @@ def _box_snapshot_rows_for_replay(
         frame_index = int(row.get("frame_index") or 0)
         by_frame[frame_index] = {
             "state": _as_float_list(row.get("observation.state")),
-            "action": _as_float_list(row.get("action")),
+            "action": [],
         }
     if not any(any(abs(value) > 0.0 for value in entry["state"]) for entry in by_frame.values()):
         return None
     state_names = list(lr3.box_state_names(box_ids))
-    return state_names, list(state_names), by_frame
+    return state_names, [], by_frame
 
 
 def _rows_vector_all_zero(rows: list[dict[str, Any]], column: str) -> bool:
@@ -3294,6 +4168,53 @@ def _touch_payload(data: Any) -> dict[str, Any] | None:
         "maxFz": max(fz) if fz else 0.0,
         "activePoints": active_points,
     }
+
+
+_TOUCH_EXPORT_FZ_COLUMNS = {
+    "left": "observation.touch.box_touch_left.fz_0p1N",
+    "right": "observation.touch.box_touch_right.fz_0p1N",
+}
+
+
+def _touch_payload_from_fz(values: Any, *, timestamp: int = 0) -> dict[str, Any] | None:
+    fz = _as_float_list(values)[:239]
+    if not fz:
+        return None
+    if len(fz) < 239:
+        fz.extend([0.0] * (239 - len(fz)))
+    active_points = sum(1 for value in fz if abs(value) > 0.0)
+    return {
+        "timestamp": int(timestamp),
+        "fz": fz,
+        "maxFz": max(fz) if fz else 0.0,
+        "activePoints": active_points,
+    }
+
+
+def _touch_timestamp_from_parquet_row(row: dict[str, Any], info: dict[str, Any], sensor: str) -> int:
+    timestamps = _as_float_list(row.get("box.timestamps"))
+    if timestamps:
+        names = _feature_names(info, "box.timestamps")
+        wanted = f"{sensor}.timestamp"
+        for index, name in enumerate(names):
+            if index < len(timestamps) and (name == wanted or name.endswith(f".{wanted}")):
+                return int(timestamps[index])
+    return int(_first_finite(row.get("timestamp"), default=0.0) * 1_000_000)
+
+
+def _touch_from_parquet_row(row: dict[str, Any], info: dict[str, Any]) -> dict[str, Any]:
+    touch: dict[str, Any] = {}
+    for side, column in _TOUCH_EXPORT_FZ_COLUMNS.items():
+        if column not in row or row.get(column) is None:
+            continue
+        sensor = "box_touch_left" if side == "left" else "box_touch_right"
+        payload = _touch_payload_from_fz(
+            row.get(column),
+            timestamp=_touch_timestamp_from_parquet_row(row, info, sensor),
+        )
+        if payload is not None:
+            touch[side] = payload
+    return touch
 
 
 def _touch_key_from_sid(sensor_id: str) -> str | None:
@@ -3429,6 +4350,48 @@ def _gmsl2_pts_offset_s(ep_meta: dict[str, Any]) -> float:
     return sum(deltas) / len(deltas)
 
 
+def _camera_stem_from_key(camera_key: str) -> str:
+    return camera_key.rsplit(".", 1)[-1]
+
+
+def _gmsl2_camera_first_offsets_s(ep_meta: dict[str, Any]) -> dict[str, float]:
+    sync_reference = ep_meta.get("sync_reference") if isinstance(ep_meta, dict) else None
+    if not isinstance(sync_reference, dict):
+        return {}
+    t0_wall_s = sync_reference.get("t0_wall_s")
+    camera_first_wall_s = sync_reference.get("camera_first_wall_s")
+    if not isinstance(t0_wall_s, (int, float)) or not isinstance(camera_first_wall_s, dict):
+        return {}
+    offsets: dict[str, float] = {}
+    for camera, wall_s in camera_first_wall_s.items():
+        if not isinstance(wall_s, (int, float)):
+            continue
+        offset_s = float(wall_s) - float(t0_wall_s)
+        if math.isfinite(offset_s):
+            offsets[str(camera)] = offset_s
+    return offsets
+
+
+def _gmsl2_camera_video_offsets_s(ep_meta: dict[str, Any], camera_keys: list[str]) -> dict[str, float]:
+    """Map replay camera keys to their file-local zero point in t0-relative time.
+
+    Timeline timestamps are on the shared t0-relative axis, while browser
+    ``video.currentTime`` is local to each remuxed camera file. For a camera
+    whose first frame landed at ``camera_first_wall_s - t0_wall_s == offset``,
+    the frontend must seek to ``timeline_timestamp - offset``.
+    """
+    raw_offsets = _gmsl2_camera_first_offsets_s(ep_meta)
+    if not raw_offsets:
+        return {}
+    offsets: dict[str, float] = {}
+    for key in camera_keys:
+        offset = raw_offsets.get(key)
+        if offset is None:
+            offset = raw_offsets.get(_camera_stem_from_key(key))
+        if offset is not None:
+            offsets[key] = offset
+    return offsets
+
 def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict[str, Any]:
     ep_dirs = _gmsl2_episode_dirs(dataset_root)
     if not ep_dirs:
@@ -3475,6 +4438,7 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
     sidecar_cube_poses = _read_sidecar_cube_poses(dataset_root, ep_idx)
     cube_pose_names = [n for n in DEFAULT_CUBE_TRAJECTORY_NAMES if n in sidecar_cube_poses]
     cube_pose_names += [n for n in sidecar_cube_poses if n not in cube_pose_names]
+    ee_pose_cube_name = _preferred_cube_pose_name(cube_pose_names)
     box_fallback = _box_snapshot_rows_for_replay(ep_meta, fps=fps, total_frames=total_frames)
     state_names = box_fallback[0] if box_fallback else []
     action_names = box_fallback[1] if box_fallback else []
@@ -3487,17 +4451,24 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
             cube_pose = sidecar_cube_poses.get(cube_name, {}).get(i)
             if cube_pose is not None:
                 cube_poses[cube_name] = cube_pose
-        frames.append({
+        state_values = list(box_rows.get(i, {}).get("state", []))
+        action_values = list(box_rows.get(i, {}).get("action", []))
+        frame = {
             "frame": i,
             "timestamp": pts_offset_s + i / max(fps, 1),
-            "state": list(box_rows.get(i, {}).get("state", [])),
-            "action": list(box_rows.get(i, {}).get("action", [])),
-            "eePose": {},
+            "state": state_values,
+            "action": action_values,
+            "eePose": _ee_pose_from_cube_poses(cube_poses, ee_pose_cube_name) or {},
             "cubePoses": cube_poses,
-        })
+        }
+        force_vector = _force_vector_from_state(state_names, state_values)
+        if force_vector is not None:
+            frame["forceVector"] = force_vector
+        frames.append(frame)
     _attach_touch_frames(frames, ep_dir, video_warmup_s=video_warmup_s)
     return {
         "datasetRoot": str(dataset_root),
+        "datasetKind": "recorded",
         "name": dataset_root.name,
         "episode": ep_idx,
         "totalFrames": total_frames,
@@ -3512,6 +4483,7 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
         "frames": frames,
         "sourcePath": str(ep_dir),
         "videoWarmupS": video_warmup_s,
+        "cameraVideoOffsetsS": _gmsl2_camera_video_offsets_s(ep_meta, camera_keys),
     }
 
 
@@ -3522,7 +4494,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         import pyarrow.compute as pc
         import pyarrow.parquet as pq
     except Exception as exc:  # noqa: BLE001
-        return _empty_timeline(dataset_root, error=f"pyarrow unavailable: {exc}")
+        return _empty_timeline(dataset_root, error=f"pyarrow unavailable: {exc}", dataset_kind=_dataset_kind(state, dataset_root))
 
     info = _load_dataset_info(dataset_root)
     state_names = _feature_names(info, "observation.state")
@@ -3544,15 +4516,29 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
             camera_keys=camera_keys,
             cube_pose_names=cube_pose_names,
             error="no parquet files",
+            dataset_kind=_dataset_kind(state, dataset_root),
         )
 
-    data_file = data_files[-1]
+    episode_options = _dataset_episode_indices(dataset_root, info)
+    selected_episode = episode if episode is not None else _selected_episode_for_dataset(state, dataset_root, episode_options)
+    if episode_options and selected_episode not in episode_options:
+        return _empty_timeline(
+            dataset_root,
+            fps=fps,
+            episode=selected_episode,
+            state_names=state_names,
+            action_names=action_names,
+            camera_keys=camera_keys,
+            cube_pose_names=cube_pose_names,
+            error=f"episode {selected_episode} not found",
+            dataset_kind=_dataset_kind(state, dataset_root),
+        )
+
+    data_file = _resolve_data_file_for_episode(dataset_root, info, selected_episode) or data_files[-1]
     table = pq.read_table(data_file)
     if "episode_index" in table.column_names:
-        episodes = [int(value) for value in table["episode_index"].to_pylist() if value is not None]
-        episode_options = sorted(set(episodes))
-        selected_episode = episode if episode is not None else _selected_episode_for_dataset(state, dataset_root, episode_options)
-        if episode_options and selected_episode not in episode_options:
+        table = table.filter(pc.equal(table["episode_index"], selected_episode))
+        if table.num_rows == 0:
             return _empty_timeline(
                 dataset_root,
                 fps=fps,
@@ -3561,9 +4547,9 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
                 action_names=action_names,
                 camera_keys=camera_keys,
                 cube_pose_names=cube_pose_names,
-                error=f"episode {selected_episode} not found",
+                error=f"episode {selected_episode} not found in {data_file.name}",
+                dataset_kind=_dataset_kind(state, dataset_root),
             )
-        table = table.filter(pc.equal(table["episode_index"], selected_episode))
         episode = selected_episode
     else:
         episode = 0
@@ -3581,14 +4567,18 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
     for cube_name in sidecar_cube_poses:
         if cube_name not in cube_pose_names:
             cube_pose_names.append(cube_name)
+    exported_ee_pose_cube = _preferred_exported_ee_pose_cube(info)
+    sidecar_ee_pose_cube = _preferred_cube_pose_name(cube_pose_names)
 
     ep_dir: Path | None = None
+    ep_meta: dict[str, Any] = {}
     box_fallback: tuple[list[str], list[str], dict[int, dict[str, list[float]]]] | None = None
     if _has_gmsl2_episodes(dataset_root):
         ep_dir = dataset_root / "episodes" / f"episode_{int(episode or 0):06d}"
+        ep_meta = _load_episode_meta(ep_dir) if ep_dir.is_dir() else {}
         if ep_dir.is_dir() and (not state_names or _rows_vector_all_zero(rows, "observation.state")):
             box_fallback = _box_snapshot_rows_for_replay(
-                _load_episode_meta(ep_dir),
+                ep_meta,
                 fps=fps,
                 total_frames=len(rows),
             )
@@ -3604,7 +4594,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         fallback_box = box_rows.get(frame_index)
         state_values = list(fallback_box.get("state", [])) if fallback_box else _as_float_list(row.get("observation.state"))
         action_values = list(fallback_box.get("action", [])) if fallback_box else _as_float_list(row.get("action"))
-        pose = _ee_pose_from_row(row, action_names, state_names) or {}
+        pose = _ee_pose_from_row(row, action_names, state_names, exported_pose_cube=exported_ee_pose_cube) or {}
         cube_poses: dict[str, dict[str, Any]] = {}
         for cube_name in cube_pose_names:
             cube_pose = sidecar_cube_poses.get(cube_name, {}).get(frame_index)
@@ -3612,17 +4602,24 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
                 cube_pose = _cube_pose_from_parquet_row(row, info, cube_name)
             if cube_pose is not None:
                 cube_poses[cube_name] = cube_pose
-        frames.append(
-            {
-                "frame": frame_index,
-                "timestamp": timestamp,
-                "state": state_values,
-                "action": action_values,
-                "eePose": pose,
-                "cubePoses": cube_poses,
-                "videoOverlays": video_cube_overlays.get(frame_index, {}),
-            }
-        )
+        if not pose:
+            pose = _ee_pose_from_cube_poses(cube_poses, sidecar_ee_pose_cube) or {}
+        frame = {
+            "frame": frame_index,
+            "timestamp": timestamp,
+            "state": state_values,
+            "action": action_values,
+            "eePose": pose,
+            "cubePoses": cube_poses,
+            "videoOverlays": video_cube_overlays.get(frame_index, {}),
+        }
+        force_vector = _force_vector_from_state(state_names, state_values)
+        if force_vector is not None:
+            frame["forceVector"] = force_vector
+        touch = _touch_from_parquet_row(row, info)
+        if touch:
+            frame["touch"] = touch
+        frames.append(frame)
 
     if ep_dir is not None and ep_dir.is_dir():
         _attach_touch_frames(frames, ep_dir, video_warmup_s=video_warmup_s)
@@ -3631,6 +4628,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
 
     return {
         "datasetRoot": str(dataset_root),
+        "datasetKind": _dataset_kind(state, dataset_root),
         "name": dataset_root.name,
         "episode": episode,
         "totalFrames": len(frames),
@@ -3645,6 +4643,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         "frames": frames,
         "sourcePath": str(data_file),
         "videoWarmupS": video_warmup_s,
+        "cameraVideoOffsetsS": _gmsl2_camera_video_offsets_s(ep_meta, camera_keys),
     }
 
 
@@ -3745,11 +4744,16 @@ def _remux_mkv_to_mp4(mkv_path: Path, expected_duration_s: float | None = None) 
     return mp4_path
 
 
-def _resolve_video_path(state: GatewayState, dataset_root: Path, camera_key: str) -> Path | None:
+def _resolve_video_path(
+    state: GatewayState,
+    dataset_root: Path,
+    camera_key: str,
+    episode: int | None = None,
+) -> Path | None:
+    selected_episode = int(state.replay.episode if episode is None else episode)
     if _has_gmsl2_episodes(dataset_root):
-        episode = int(state.replay.episode or 0)
-        ep_dir = dataset_root / "episodes" / f"episode_{episode:06d}"
-        mkv = ep_dir / f"{camera_key}.mkv"
+        ep_dir = dataset_root / "episodes" / f"episode_{selected_episode:06d}"
+        mkv = ep_dir / f"{_camera_stem_from_key(camera_key)}.mkv"
         if not mkv.is_file():
             return None
         expected_duration_s = None
@@ -3761,21 +4765,28 @@ def _resolve_video_path(state: GatewayState, dataset_root: Path, camera_key: str
             except (OSError, json.JSONDecodeError):
                 expected_duration_s = None
         return _remux_mkv_to_mp4(mkv, expected_duration_s=expected_duration_s) or mkv
+
     info = _load_dataset_info(dataset_root)
+    episode_video = _resolve_video_file_for_episode(dataset_root, info, camera_key, selected_episode)
+    if episode_video is not None:
+        return episode_video
+
     template = str(info.get("video_path") or "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
-    relative = template.format(video_key=camera_key, chunk_index=0, file_index=0)
-    candidate = (dataset_root / relative).resolve()
-    try:
-        candidate.relative_to(dataset_root.resolve())
-    except ValueError:
-        return None
-    if not candidate.is_file():
-        camera_dir = dataset_root / "videos" / camera_key
-        if camera_dir.is_dir():
-            for mp4 in sorted(camera_dir.glob("chunk-*/*.mp4")):
-                return mp4
-        return None
-    return candidate
+    candidate = _dataset_child_from_template(
+        dataset_root,
+        template,
+        video_key=camera_key,
+        chunk_index=0,
+        file_index=selected_episode,
+    )
+    if candidate is not None and candidate.is_file():
+        return candidate
+
+    camera_dir = dataset_root / "videos" / camera_key
+    if camera_dir.is_dir():
+        for mp4 in sorted(camera_dir.glob("chunk-*/*.mp4")):
+            return mp4
+    return None
 
 
 def _serve_static_file(handler: BaseHTTPRequestHandler, asset_path: Path, content_type: str) -> None:
@@ -4304,16 +5315,34 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
     recorded_datasets = list(state.cached_recorded_datasets)
     trajectory = list(state.cached_trajectory)
     trajectory_meta = dict(state.cached_trajectory_meta)
+    selected_replay_root = state.selected_replay_root.resolve() if state.selected_replay_root is not None else None
+    if selected_replay_root is not None:
+        try:
+            cached_root = Path(str(trajectory_meta.get("datasetRoot") or "")).resolve()
+        except OSError:
+            cached_root = None
+        if cached_root != selected_replay_root:
+            selected_info = _load_dataset_info(selected_replay_root)
+            selected_meta = _dataset_replay_meta(state, selected_replay_root, selected_info)
+            trajectory = []
+            trajectory_meta = {
+                **selected_meta,
+                "dataStatus": _recorded_dataset_status(selected_replay_root),
+                "trajectoryKind": "pose" if _dataset_has_replay_pose_hint(selected_replay_root, selected_info) else "none",
+                "message": f"Selected {_dataset_kind(state, selected_replay_root)} dataset: {selected_replay_root.name}",
+            }
     if recorded_datasets and not trajectory_meta.get("datasetRoot"):
         latest_dataset = recorded_datasets[0]
         trajectory_meta = {
             **trajectory_meta,
             "datasetRoot": latest_dataset["path"],
+            "datasetKind": latest_dataset.get("datasetKind") or "recorded",
             "sourcePath": latest_dataset["sourcePath"],
             "totalEpisodes": latest_dataset["totalEpisodes"],
             "recordedFrames": latest_dataset["totalFrames"],
         }
     state.replay.datasetRoot = str(trajectory_meta.get("datasetRoot") or state.replay.datasetRoot)
+    state.replay.datasetKind = str(trajectory_meta.get("datasetKind") or state.replay.datasetKind or "recorded")
     state.replay.sourcePath = str(trajectory_meta.get("sourcePath") or "")
     state.replay.dataStatus = str(trajectory_meta.get("dataStatus") or "missing")
     state.replay.trajectoryKind = str(trajectory_meta.get("trajectoryKind") or "none")
@@ -4355,7 +5384,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "annotation": _active_annotation(state),
         "calibration": asdict(state.calibration),
         "recordedDatasets": recorded_datasets,
-        "processing": _processing_items(state),
+        "processing": list(state.cached_processing_items),
         "trajectory": trajectory,
         "events": [asdict(event) for event in state.events],
         "tasks": _tasks_with_progress(state),
@@ -4595,26 +5624,30 @@ def _maybe_send_preview_demand(state: GatewayState) -> None:
             pass
 
 
-def _trigger_box_six_d_force_cali(state: GatewayState) -> dict[str, Any]:
+def _trigger_box_six_d_force_cali(state: GatewayState, *, origin: bool = False) -> dict[str, Any]:
     """Ask the running GMSL2 recorder to calibrate the BOX 6D force sensor.
 
     The recorder owns the live box connection, so the command rides its stdin
-    (``cali_6dforce``) and progress comes back as CALI_LOG/CALI_DONE stdout
-    lines. Returns a small status dict for the POST response.
+    and progress comes back as CALI_LOG/CALI_DONE stdout lines. ``origin=False``
+    (default) requests software zeroing (``cali_6dforce``); ``origin=True``
+    requests the MCU-side TLV origin calibration (``cali_6dforce_origin``).
+    Returns a small status dict for the POST response.
     """
     process = state.process
     if process is None or process.poll() is not None:
         return {"ok": False, "error": "recorder is not connected; press Connect first"}
     if not _state_is_gmsl2(state):
         return {"ok": False, "error": "6D force calibration requires the GMSL2/BOX recorder"}
+    stdin_cmd = "cali_6dforce_origin\n" if origin else "cali_6dforce\n"
+    label = "6D force MCU-origin" if origin else "6D force software-zero"
     with state.box_cali_lock:
         state.box_cali_running = True
         state.box_cali_log.append(
-            {"ts": time.time(), "line": "calibration command sent to recorder", "done": False}
+            {"ts": time.time(), "line": f"{label} calibration command sent to recorder", "done": False}
         )
         del state.box_cali_log[:-200]
     try:
-        _write_recorder_stdin(process, "cali_6dforce\n")
+        _write_recorder_stdin(process, stdin_cmd)
     except (BrokenPipeError, ValueError, OSError, RuntimeError) as exc:
         with state.box_cali_lock:
             state.box_cali_running = False
@@ -4625,9 +5658,44 @@ def _trigger_box_six_d_force_cali(state: GatewayState) -> dict[str, Any]:
     return {"ok": True}
 
 
+def _trigger_box_touch_cali(state: GatewayState) -> dict[str, Any]:
+    """Ask the running GMSL2 recorder to calibrate (re-zero) the BOX touch pads.
+
+    Mirrors :func:`_trigger_box_six_d_force_cali` but rides its own
+    TOUCHCALI_LOG/TOUCHCALI_DONE stdout channel into ``box_touch_cali_log`` so
+    the touch viewer never shows 6D force lines (and vice versa).
+    """
+    process = state.process
+    if process is None or process.poll() is not None:
+        return {"ok": False, "error": "recorder is not connected; press Connect first"}
+    if not _state_is_gmsl2(state):
+        return {"ok": False, "error": "touch calibration requires the GMSL2/BOX recorder"}
+    with state.box_touch_cali_lock:
+        state.box_touch_cali_running = True
+        state.box_touch_cali_log.append(
+            {"ts": time.time(), "line": "touch calibration command sent to recorder", "done": False}
+        )
+        del state.box_touch_cali_log[:-200]
+    try:
+        _write_recorder_stdin(process, "calitouch\n")
+    except (BrokenPipeError, ValueError, OSError, RuntimeError) as exc:
+        with state.box_touch_cali_lock:
+            state.box_touch_cali_running = False
+            state.box_touch_cali_log.append(
+                {"ts": time.time(), "line": f"failed to send command: {exc}", "done": True}
+            )
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True}
+
+
 def _box_cali_log_payload(state: GatewayState) -> dict[str, Any]:
     with state.box_cali_lock:
         return {"running": state.box_cali_running, "lines": list(state.box_cali_log)}
+
+
+def _box_touch_cali_log_payload(state: GatewayState) -> dict[str, Any]:
+    with state.box_touch_cali_lock:
+        return {"running": state.box_touch_cali_running, "lines": list(state.box_touch_cali_log)}
 
 
 def _connect_recorder(state: GatewayState) -> None:
@@ -4738,32 +5806,146 @@ def _consume_recorder_output(state: GatewayState) -> None:
             state.log("warn", f"recorder output consumer error: {exc}")
 
 
+def _dataset_scan_signature(state: GatewayState) -> tuple:
+    """Cheap fingerprint of the dataset dirs: (path, top-level mtime) per entry.
+
+    Just ``scandir`` + ``stat`` of the top-level dirs under the datasets/exports
+    roots -- no per-dataset globbing or episode walks -- so it is a few ms even
+    with hundreds of datasets. Used to decide whether the expensive full scan can
+    be skipped.
+    """
+    roots = [state.datasets_root, _task_exports_root(state)]
+    sig: list[tuple[str, int]] = []
+    for root in roots:
+        if root is None or not root.is_dir():
+            continue
+        try:
+            with os.scandir(root) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir():
+                            sig.append((entry.path, entry.stat().st_mtime_ns))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    sig.sort()
+    return tuple(sig)
+
+
+def _processing_scan_signature(state: GatewayState) -> tuple:
+    """Fingerprint processing metadata without walking trajectory outputs.
+
+    It intentionally includes ``meta/processing.json`` mtime/size so EE trajectory
+    progress and completion can update the Processing page without invalidating
+    the heavier recorded dataset / trajectory cache.
+    """
+    sig: list[tuple[str, int, int, int]] = []
+    for root in _complete_dataset_candidates(state):
+        try:
+            root_mtime_ns = root.stat().st_mtime_ns
+        except OSError:
+            root_mtime_ns = 0
+        meta_path = _processing_meta_path(root)
+        try:
+            meta_stat = meta_path.stat()
+            meta_mtime_ns = meta_stat.st_mtime_ns
+            meta_size = meta_stat.st_size
+        except OSError:
+            meta_mtime_ns = 0
+            meta_size = 0
+        sig.append((str(root), root_mtime_ns, meta_mtime_ns, meta_size))
+    sig.sort()
+    return tuple(sig)
+
+
+def _processing_cache_has_inflight(state: GatewayState) -> bool:
+    return any(
+        item.get("status") in ("queued", "running")
+        for item in state.cached_processing_items
+    )
+
+
+def _refresh_cached_processing_item(state: GatewayState, dataset_root: Path) -> None:
+    with state.lock:
+        attached = set(state.processing_processes.keys())
+    item = _processing_item_from_dataset(dataset_root, attached_processes=attached, now_s=time.time())
+    target = str(dataset_root)
+    with state.lock:
+        items = list(state.cached_processing_items)
+        for index, existing in enumerate(items):
+            if existing.get("path") == target:
+                items[index] = item
+                break
+        else:
+            items.insert(0, item)
+        state.cached_processing_items = items
+        state.processing_cache_ready = True
+
+
+def _refresh_processing_cache(state: GatewayState) -> None:
+    signature = _processing_scan_signature(state)
+    with state.lock:
+        attached = set(state.processing_processes.keys())
+        unchanged = (
+            state.processing_cache_ready
+            and signature == state.processing_scan_signature
+            and not _processing_cache_has_inflight(state)
+        )
+    if unchanged:
+        return
+    processing = _processing_items(state, attached_processes=attached)
+    with state.lock:
+        state.cached_processing_items = processing
+        state.processing_cache_ready = True
+        state.processing_scan_signature = signature
+
+
 def _refresh_dataset_stats_cache(state: GatewayState) -> None:
     """Compute the expensive dataset scan OFF the lock and publish the result.
 
     ``_recorded_dataset_items`` / ``_read_recorded_trajectory`` walk the dataset
-    tree (298G / 600+ episodes on Thor => 4-12s) and are read-only on ``state``.
-    Running them here (no lock held during the scan) and storing the result lets
-    ``_snapshot`` read O(1) cached values under the lock instead of scanning,
-    which is what kept the recorder-stdout drain and camera.jpg serving from
-    blocking for seconds. Per-episode memoization in ``_gmsl2_dataset_stats``
-    keeps each refresh cheap once warm.
+    tree (253 datasets / 298G / 600+ episodes on Thor => 4-12s of GIL-held CPU)
+    and are read-only on ``state``. Even off ``state.lock`` that scan holds the
+    GIL and starves every HTTP handler (snapshot/camera.jpg/cali-log polls),
+    which is what made the UI freeze. So first take a cheap dir-mtime fingerprint
+    and skip the whole walk when nothing changed; only rescan on a real change.
     """
+    signature = _dataset_scan_signature(state)
+    with state.lock:
+        selected_before = str(state.selected_replay_root.resolve()) if state.selected_replay_root is not None else ""
+        episode_before = int(state.replay.episode or 0)
+        unchanged = state.dataset_cache_ready and signature == state.dataset_scan_signature
+    if unchanged:
+        return
     items = _recorded_dataset_items(state)
     trajectory, meta = _read_recorded_trajectory(state)
     with state.lock:
+        selected_now = str(state.selected_replay_root.resolve()) if state.selected_replay_root is not None else ""
+        episode_now = int(state.replay.episode or 0)
+        if selected_now != selected_before or episode_now != episode_before:
+            # A user changed replay selection while this slow scan was running.
+            # Publishing the stale meta would make _snapshot jump back to the old
+            # latest dataset/episode, so drop this scan and let the next cycle
+            # recompute for the current selection.
+            return
         state.cached_recorded_datasets = items
         state.cached_trajectory = trajectory
         state.cached_trajectory_meta = meta
         state.dataset_cache_ready = True
+        state.dataset_scan_signature = signature
 
 
-def _dataset_stats_refresher(state: GatewayState, interval_s: float = 4.0) -> None:
+def _dataset_stats_refresher(state: GatewayState, interval_s: float = 10.0) -> None:
     while True:
         try:
             _refresh_dataset_stats_cache(state)
         except Exception as exc:  # keep refreshing despite transient FS errors
             state.log("warn", f"dataset stats refresh failed: {exc}")
+        try:
+            _refresh_processing_cache(state)
+        except Exception as exc:
+            state.log("warn", f"processing cache refresh failed: {exc}")
         time.sleep(interval_s)
 
 
@@ -5114,6 +6296,15 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         if isinstance(roster, list):
             _apply_box_roster(state, roster)
         return
+    if output.startswith("TOUCHCALI_LOG ") or output.startswith("TOUCHCALI_DONE "):
+        done = output.startswith("TOUCHCALI_DONE ")
+        line = output.removeprefix("TOUCHCALI_DONE " if done else "TOUCHCALI_LOG ").strip()
+        with state.box_touch_cali_lock:
+            state.box_touch_cali_log.append({"ts": time.time(), "line": line, "done": done})
+            del state.box_touch_cali_log[:-200]  # keep the buffer bounded
+            if done:
+                state.box_touch_cali_running = False
+        return
     if output.startswith("CALI_LOG ") or output.startswith("CALI_DONE "):
         done = output.startswith("CALI_DONE ")
         line = output.removeprefix("CALI_DONE " if done else "CALI_LOG ").strip()
@@ -5356,6 +6547,10 @@ def _require_mujoco_validation(state: GatewayState) -> Path:
     dataset_root = _active_replay_dataset_root(state)
     if not _is_dataset_root(dataset_root):
         raise RuntimeError(f"Selected replay dataset is not finalized: {dataset_root}")
+    if _dataset_kind(state, dataset_root) == "exported":
+        raise RuntimeError(
+            "Real-robot replay is disabled for exported datasets because exported action is next-frame observation.state, not a verified robot command stream."
+        )
     if not _mujoco_validation_is_for_active_episode(state, dataset_root):
         validation = state.replay.mujocoValidation or {}
         message = str(validation.get("message") or "Run MuJoCo replay successfully before real-robot replay.")
@@ -5605,10 +6800,14 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.OK, _box_preview_payload(self.server.state, device_id))
                 return
         if path == "/api/device/box-cali-log":
-            # Calibration log buffer (polled by the Device Manager log box).
+            # 6D force calibration log buffer (polled by the force tile's log box).
             # Uses its own box_cali_lock inside the payload helper, so it never
             # contends with the main state lock or the recorder-stdout drain.
             _json_response(self, HTTPStatus.OK, _box_cali_log_payload(self.server.state))
+            return
+        if path == "/api/device/box-touch-cali-log":
+            # Separate touch calibration log buffer (polled by the touch viewer).
+            _json_response(self, HTTPStatus.OK, _box_touch_cali_log_payload(self.server.state))
             return
         if path == "/api/device-preview/camera.jpg":
             device_id = query.get("key", [""])[0]
@@ -5643,9 +6842,19 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             if not camera_key:
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing camera key"})
                 return
+            requested_episode = query.get("episode", [None])[0]
+            try:
+                episode = int(requested_episode) if requested_episode not in (None, "") else None
+            except ValueError:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"error": f"invalid episode: {requested_episode}"})
+                return
             with self.server.state.lock:
                 dataset_root = _resolve_known_dataset(self.server.state, requested)
-                video_path = _resolve_video_path(self.server.state, dataset_root, camera_key) if dataset_root else None
+                video_path = (
+                    _resolve_video_path(self.server.state, dataset_root, camera_key, episode)
+                    if dataset_root
+                    else None
+                )
             if video_path is None:
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"video not found: {camera_key}"})
                 return
@@ -5711,6 +6920,54 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 state.log("warn", f"{path} failed: {exc}")
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
+        if path == "/api/processing/qc":
+            state = self.server.state
+            requested = (query.get("path", [""])[0] or "").strip()
+            try:
+                with state.lock:
+                    dataset_root = _resolve_known_dataset(state, requested)
+                if dataset_root is None:
+                    _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
+                    return
+                qc_result = _run_qc(dataset_root)
+                try:
+                    _write_processing_meta_qc(dataset_root, qc_result)
+                except OSError as exc:
+                    _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"failed to persist QC: {exc}"})
+                    return
+                _refresh_cached_processing_item(state, dataset_root)
+                with state.lock:
+                    state.log(
+                        "info" if qc_result["status"] == "pass" else "warn",
+                        f"QC {qc_result['status']} for {dataset_root.name}: {qc_result['summary']}",
+                    )
+                    response = _snapshot(state)
+                _json_response(self, HTTPStatus.OK, response)
+            except Exception as exc:  # noqa: BLE001
+                with state.lock:
+                    state.log("warn", f"{path} failed: {exc}")
+                _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            return
+        if path == "/api/processing/traj-gen":
+            state = self.server.state
+            requested = (query.get("path", [""])[0] or "").strip()
+            try:
+                with state.lock:
+                    dataset_root = _resolve_known_dataset(state, requested)
+                if dataset_root is None:
+                    _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
+                    return
+                _queue_traj_gen(state, dataset_root)
+                with state.lock:
+                    response = _snapshot(state)
+                _json_response(self, HTTPStatus.OK, response)
+            except NotImplementedError as exc:
+                _json_response(self, HTTPStatus.NOT_IMPLEMENTED, {"error": str(exc)})
+            except Exception as exc:  # noqa: BLE001
+                with state.lock:
+                    state.log("warn", f"{path} failed: {exc}")
+                _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            return
         try:
             with self.server.state.lock:
                 if path == "/api/handheld/record/start":
@@ -5741,6 +6998,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _select_replay_episode(self.server.state, query.get("episode", [""])[0])
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
+                if path == "/api/replay/delete-episode":
+                    _delete_replay_episode(self.server.state, query.get("episode", [""])[0])
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
                 if path == "/api/replay/start":
                     _start_dry_run_replay(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
@@ -5762,36 +7023,15 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
                     return
-                if path == "/api/processing/qc":
-                    requested = (query.get("path", [""])[0] or "").strip()
-                    dataset_root = _resolve_known_dataset(self.server.state, requested)
-                    if dataset_root is None:
-                        _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
-                        return
-                    qc_result = _run_qc(dataset_root)
-                    try:
-                        _write_processing_meta_qc(dataset_root, qc_result)
-                    except OSError as exc:
-                        _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"failed to persist QC: {exc}"})
-                        return
-                    self.server.state.log(
-                        "info" if qc_result["status"] == "pass" else "warn",
-                        f"QC {qc_result['status']} for {dataset_root.name}: {qc_result['summary']}",
-                    )
-                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                if path == "/api/device/calibrate-6dforce-origin":
+                    result = _trigger_box_six_d_force_cali(self.server.state, origin=True)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
                     return
-                if path == "/api/processing/traj-gen":
-                    requested = (query.get("path", [""])[0] or "").strip()
-                    dataset_root = _resolve_known_dataset(self.server.state, requested)
-                    if dataset_root is None:
-                        _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
-                        return
-                    try:
-                        _queue_traj_gen(self.server.state, dataset_root)
-                    except NotImplementedError as exc:
-                        _json_response(self, HTTPStatus.NOT_IMPLEMENTED, {"error": str(exc)})
-                        return
-                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                if path == "/api/device/calibrate-touch":
+                    result = _trigger_box_touch_cali(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
                     return
                 if path == "/api/processing/datasets-root":
                     requested = (query.get("path", [""])[0] or "").strip()

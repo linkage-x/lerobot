@@ -12,6 +12,7 @@
 | PR1: persistent_session 模块 + burn-in | ✅ 已提交 (commit `e1a6290e`) |
 | PR2: thor_record 集成 PersistentCameraSession | ✅ **代码就绪 + BOX 共启验证通过，未提交** |
 | BoxClient 自动设 `BOX_SDK_URDF` | ✅ 新增（消除"忘 source setup_env.sh 就崩"事故） |
+| Exported dataset derived-action replay roadmap | 🧭 已落盘：[`exported_action_replay_roadmap.md`](./exported_action_replay_roadmap.md) |
 | 长 burn-in (100+ ep with BOX) | ⏳ 待跑 |
 | DEPLOYMENT.md 更新 | ⏳ 待 PR2 落地 |
 

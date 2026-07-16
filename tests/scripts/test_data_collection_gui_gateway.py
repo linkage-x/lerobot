@@ -64,12 +64,12 @@ def test_default_config_is_thor_gmsl2_box():
     state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
     snapshot = gateway._snapshot(state)
 
-    assert snapshot["configSummary"]["repoId"] == "local/thor_gmsl2_11ch_v1"
+    assert snapshot["configSummary"]["repoId"] == "local/thor_gmsl2_Nch_v1"
     assert snapshot["configSummary"]["fps"] == 60
     devices_by_kind: dict[str, list[str]] = {}
     for device in snapshot["devices"]:
         devices_by_kind.setdefault(device["kind"], []).append(device["id"])
-    # 11-camera GMSL2 rig (detect_all => sids 0..15 placeholder before connect).
+    # detected-camera GMSL2 rig (detect_all => sids 0..15 placeholder before connect).
     assert "camera" in devices_by_kind
     assert all(cid.startswith("cam_") for cid in devices_by_kind["camera"])
     assert len(devices_by_kind["camera"]) >= 11
@@ -141,6 +141,95 @@ def test_gmsl2_timeline_ignores_replay_warmup_for_splitmux_episode(tmp_path):
     assert timeline["totalFrames"] == 600
     assert timeline["cameraKeys"] == ["cam_00"]
     assert timeline["frames"][0]["timestamp"] == 0
+
+
+def test_gmsl2_timeline_exposes_per_camera_video_offsets(tmp_path):
+    dataset_root = tmp_path / "gmsl2"
+    ep_dir = dataset_root / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    t0 = 1000.0
+    (ep_dir / "cam_00.mkv").write_bytes(b"0" * 2048)
+    (ep_dir / "cam_01.mkv").write_bytes(b"1" * 2048)
+    (ep_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "duration_s": 1.0,
+                "video": {"fps": 60},
+                "sync_reference": {
+                    "t0_wall_s": t0,
+                    "camera_first_wall_s": {"cam_00": t0 + 0.10, "cam_01": t0 + 0.14},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    timeline = gateway._read_gmsl2_timeline(dataset_root, episode=0)
+
+    assert timeline["frames"][0]["timestamp"] == pytest.approx(0.12)
+    assert timeline["cameraVideoOffsetsS"] == {"cam_00": pytest.approx(0.10), "cam_01": pytest.approx(0.14)}
+    assert gateway._gmsl2_camera_video_offsets_s(
+        {
+            "sync_reference": {
+                "t0_wall_s": t0,
+                "camera_first_wall_s": {"cam_00": t0 + 0.10},
+            }
+        },
+        ["observation.images.cam_00"],
+    ) == {"observation.images.cam_00": pytest.approx(0.10)}
+
+
+def test_resolve_gmsl2_video_path_accepts_lerobot_feature_key(tmp_path, monkeypatch):
+    dataset_root = tmp_path / "gmsl2"
+    ep_dir = dataset_root / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    mkv = ep_dir / "cam_00.mkv"
+    mkv.write_bytes(b"0" * 2048)
+    (ep_dir / "meta.json").write_text(json.dumps({"duration_s": 1.0}), encoding="utf-8")
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test", episode=0),
+        datasets_root=dataset_root.parent,
+    )
+    monkeypatch.setattr(gateway, "_remux_mkv_to_mp4", lambda *_args, **_kwargs: None)
+
+    assert gateway._resolve_video_path(state, dataset_root, "observation.images.cam_00") == mkv
+
+
+def test_processing_item_and_qc_include_online_sync_manifest(tmp_path):
+    dataset_root = tmp_path / "gmsl2_v3"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    ep_dir = dataset_root / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    (ep_dir / "meta.json").write_text(json.dumps({"duration_s": 2 / 30.0, "video": {"fps": 30}}), encoding="utf-8")
+    (ep_dir / "online_sync_manifest.json").write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "failure": "",
+                "actual_frames": 2,
+                "sync_source": "sof_tsc_ns",
+                "tolerance_ns": 1_000_000,
+                "frame_count_by_camera": {"cam_00": 2, "cam_01": 2},
+                "max_abs_delta_ns_by_camera": {"cam_00": 12_000, "cam_01": 18_000},
+                "active_cameras": ["cam_00", "cam_01"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    item = gateway._processing_item_from_dataset(dataset_root)
+    qc = gateway._run_qc(dataset_root)
+
+    assert item["onlineSync"]["status"] == "pass"
+    assert item["onlineSync"]["actualFrames"] == 2
+    assert item["onlineSync"]["maxSofDeltaMs"] == pytest.approx(0.018)
+    check = next(check for check in qc["checks"] if check["name"] == "online_sync_manifest")
+    assert check["status"] == "pass"
+    assert qc["online_sync"]["episodes"][0]["frameCountByCamera"] == {"cam_00": 2, "cam_01": 2}
 
 
 def test_lerobot_v3_gmsl2_timeline_ignores_replay_warmup(tmp_path):
@@ -919,6 +1008,47 @@ def test_traj_gen_starts_april_tracking_with_selected_dataset_root(tmp_path, mon
     assert "AprilTag cube tracking" in item["message"]
 
 
+def test_exported_v3_dataset_is_replay_selectable_but_blocks_real_robot(tmp_path):
+    repo_root = tmp_path / "repo"
+    recorded_root = repo_root / "outputs" / "datasets" / "recorded_set"
+    exported_root = repo_root / "outputs" / "exports" / "exported_set"
+    _write_minimal_episode_dataset(recorded_root, total_episodes=1)
+    _write_minimal_episode_dataset(exported_root, total_episodes=2)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(recorded_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test", fps=30),
+        datasets_root=recorded_root.parent,
+        exports_root=exported_root.parent,
+    )
+
+    replay_items = gateway._recorded_dataset_items(state)
+    exported_item = next(item for item in replay_items if item["path"] == str(exported_root))
+    assert exported_item["datasetKind"] == "exported"
+
+    processing_paths = {item["path"] for item in gateway._processing_items(state)}
+    assert str(recorded_root) in processing_paths
+    assert str(exported_root) not in processing_paths
+
+    gateway._select_replay_dataset(state, str(exported_root))
+    assert state.replay.datasetRoot == str(exported_root)
+    assert state.replay.datasetKind == "exported"
+    assert state.replay.episodeOptions == [0, 1]
+    snapshot = gateway._snapshot(state)
+    assert snapshot["replay"]["datasetRoot"] == str(exported_root)
+    assert snapshot["replay"]["datasetKind"] == "exported"
+
+    timeline = gateway._read_dataset_timeline(state, exported_root, episode=1)
+    assert timeline["datasetKind"] == "exported"
+    assert timeline["episode"] == 1
+    assert timeline["totalFrames"] == 2
+
+    with pytest.raises(RuntimeError, match="Real-robot replay is disabled for exported datasets"):
+        gateway._require_mujoco_validation(state)
+
+
 def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_replay(tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
@@ -1099,8 +1229,8 @@ def _task_state(tmp_path):
         config_path=repo_root / "config.yaml",
         config={
             "dataset": {
-                "repo_id": "local/thor_gmsl2_11ch_v1",
-                "root": "outputs/datasets/thor_gmsl2_11ch_v1",
+                "repo_id": "local/thor_gmsl2_Nch_v1",
+                "root": "outputs/datasets/thor_gmsl2_Nch_v1",
                 "single_task": "default capture",
                 "fps": 60,
             },
@@ -1130,7 +1260,7 @@ def test_build_task_overlay_patches_only_dataset_and_aligns_root_with_repo_id(tm
     assert overlay["dataset"]["single_task"] == "pick the cube"
     # non-dataset blocks untouched; base config not mutated.
     assert overlay["cameras"] == state.config["cameras"]
-    assert state.config["dataset"]["repo_id"] == "local/thor_gmsl2_11ch_v1"
+    assert state.config["dataset"]["repo_id"] == "local/thor_gmsl2_Nch_v1"
 
 
 def test_resolve_recorder_config_path_uses_overlay_for_active_task(tmp_path):
@@ -1161,7 +1291,7 @@ def test_resolve_recorder_config_path_falls_back_without_active_task(tmp_path):
     config_path = gateway._resolve_recorder_config_path(state)
 
     assert config_path == state.config_path
-    assert state.recording.datasetRoot == "outputs/datasets/thor_gmsl2_11ch_v1"
+    assert state.recording.datasetRoot == "outputs/datasets/thor_gmsl2_Nch_v1"
 
 
 def test_set_active_task_rejects_task_without_repo_id(tmp_path):
@@ -1232,13 +1362,27 @@ def test_export_command_rejects_task_without_repo_id(tmp_path):
         gateway._export_command(state, {"id": "t", "name": "x", "datasetRepoId": ""})
 
 
-def _write_qc_pass_gmsl2_session(dataset_root: Path) -> None:
+def _write_qc_pass_gmsl2_session(dataset_root: Path, cams: tuple[str, ...] = ()) -> None:
     episode = dataset_root / "episodes" / "episode_000000"
     episode.mkdir(parents=True)
     (episode / "meta.json").write_text(
         json.dumps({"video": {"fps": 60, "height": 480, "width": 640}}),
         encoding="utf-8",
     )
+    if cams:
+        for cam in cams:
+            (episode / f"{cam}.mkv").write_bytes(b"0" * 2048)
+        (episode / "online_sync_manifest.json").write_text(
+            json.dumps(
+                {
+                    "ok": True,
+                    "actual_frames": 1,
+                    "active_cameras": list(cams),
+                    "frame_count_by_camera": {cam: 1 for cam in cams},
+                }
+            ),
+            encoding="utf-8",
+        )
     gateway._write_processing_meta(
         dataset_root,
         {
@@ -1246,6 +1390,21 @@ def _write_qc_pass_gmsl2_session(dataset_root: Path) -> None:
             "versions": {"v1": {"qc": {"status": "pass", "summary": "ok"}}},
         },
     )
+
+
+def test_approved_dataset_export_command_uses_actual_camera_count_for_output_name(tmp_path):
+    state, datasets_root = _task_state(tmp_path)
+    state.exports_root = tmp_path / "repo" / "outputs" / "exports"
+    session = datasets_root / "thor_gmsl2_11ch_v1_20260713_075106"
+    cams = ("cam_00", "cam_06", "cam_07", "cam_08", "cam_09", "cam_12", "cam_13", "cam_14")
+    _write_qc_pass_gmsl2_session(session, cams=cams)
+
+    command, out_root = gateway._approved_dataset_export_command(state, session)
+
+    assert command[command.index("--base-name") + 1] == "thor_gmsl2_11ch_v1_20260713_075106"
+    assert command[command.index("--output-name") + 1] == "thor_gmsl2_8ch_v1_20260713_075106"
+    assert command[command.index("--repo-id") + 1] == "local/thor_gmsl2_8ch_v1_20260713_075106"
+    assert out_root == state.exports_root / "thor_gmsl2_8ch_v1_20260713_075106"
 
 
 def test_approved_dataset_export_command_scopes_to_selected_session(tmp_path):

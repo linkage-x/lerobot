@@ -232,9 +232,9 @@ auto_recover:
   timeout_s: 300
 
 dataset:
-  repo_id: local/thor_gmsl2_11ch_v1
-  single_task: Thor GMSL2 11-camera capture
-  root: outputs/datasets/thor_gmsl2_11ch_v1
+  repo_id: local/thor_gmsl2_Nch_v1
+  single_task: Thor GMSL2 detected-camera capture
+  root: outputs/datasets/thor_gmsl2_Nch_v1
   # The orchestrator writes one MKV per camera per episode plus
   # `episode_<idx>/meta.json` describing the cameras, codecs, wallclock
   # timestamps, and hardware-sync settings. There is no LeRobotDataset
