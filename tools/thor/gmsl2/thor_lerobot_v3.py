@@ -11,6 +11,7 @@ left for the export step, where it can be derived from the next aligned state.
 from __future__ import annotations
 
 import bisect
+import csv
 import json
 import logging
 import math
@@ -583,6 +584,64 @@ def _nearest_sample_data(
     return samples[idx].get("data", {})
 
 
+def camera_frame_times_rel(
+    ep_dir: Path,
+    t0_mono_s: float | None,
+    *,
+    camera: str | None = None,
+) -> list[float | None] | None:
+    """Camera hardware frame time per online-sync ``logical_frame_index``, in
+    the t0-relative domain shared with BOX ``t_rel_s`` (both anchored to the
+    same ``time.monotonic()`` origin)::
+
+        time[N] = sensor_timestamp_ns[N] / 1e9 - t0_mono_s
+
+    ``sensor_timestamp_ns`` is the Argus/V4L2 kernel **start-of-frame (SOF)**
+    timestamp (``getSensorTimestamp``, CLOCK_MONOTONIC) — the same clock as the
+    ``time.monotonic()`` latched into ``t0_mono_s`` at ``start_episode``.  It is
+    a hardware frame-time anchor, not a proven exposure-center; a small *fixed*
+    exposure/readout offset may remain, but being constant it does not affect
+    the per-episode-varying skew this corrects.  The idealized ``N/fps`` grid
+    instead assumes frame 0 == t0 and exactly 60.000 Hz; on real Thor data it is
+    offset from the SOF anchor by a per-episode fixed skew of ~10-55 ms
+    (ts_sync.md §5.4 / experiments/ts_sync_skew_20260716/).  Using these times
+    as the BOX nearest-neighbor target removes that skew.
+
+    Returns ``None`` (callers fall back to ``N/fps``) when ``t0_mono_s`` is
+    missing, no sidecar exists (legacy camera-only / splitmux data), or the
+    sidecar is unreadable.  Per-frame entries may be ``None`` for a gap frame,
+    which callers also fall back to ``N/fps``.  ``sof_tsc_ns`` is intentionally
+    not used here: it lives in a separate TSC domain and is the cross-*camera*
+    sync key, not a host-clock anchor.
+    """
+    if not t0_mono_s:
+        return None
+    candidates: list[Path] = []
+    if camera is not None:
+        candidates.append(ep_dir / f"{camera}.argus_frame_metadata.csv")
+    candidates.extend(sorted(ep_dir.glob("cam_*.argus_frame_metadata.csv")))
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            by_frame: dict[int, float] = {}
+            with path.open(newline="") as f:
+                for row in csv.DictReader(f):
+                    try:
+                        n = int(row["logical_frame_index"])
+                        sof = float(row["sensor_timestamp_ns"])
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    if sof > 0:
+                        by_frame[n] = sof / 1e9 - float(t0_mono_s)
+        except (OSError, csv.Error):
+            continue
+        if by_frame:
+            n_max = max(by_frame)
+            return [by_frame.get(i) for i in range(n_max + 1)]
+    return None
+
+
 def _table_column_stats(table, col_name: str, *, width: int) -> dict[str, list]:
     """Per-channel min/max/mean/std/quantiles from a pyarrow Table column.
 
@@ -706,6 +765,7 @@ def _build_episode_rows(
     pts_offset_s: float | None = None,
     start_index: int = 0,
     box_ids: tuple[str, ...] | list[str] | None = None,
+    frame_times_s: list[float | None] | None = None,
 ) -> list[dict[str, Any]]:
     use_hf = bool(sensor_samples and any(sensor_samples.values()))
     resolved_box_ids = tuple(box_ids or box_ids_from_inputs(snapshots, sensor_samples))
@@ -725,11 +785,41 @@ def _build_episode_rows(
         for sid, slist_raw in calibrated.items():
             slist = sorted(slist_raw, key=lambda s: s["t_rel_s"])
             per_sensor[sid] = ([s["t_rel_s"] for s in slist], slist)
+
+        # BOX nearest-neighbor target = the frame's hardware SOF capture time
+        # (frame_times_s, from the online-sync sidecar) instead of the idealized
+        # N/fps grid, correcting the per-episode camera skew (ts_sync.md §5.4).
+        # The parquet ``timestamp`` column stays N/fps (loader contract).
+        # Sidecar gaps / a short tail are filled by *extrapolating the same
+        # linear fit* of the available SOF times (the SOF series is linear to
+        # ~µs), NOT by dropping to N/fps mid-episode — that would splice two time
+        # bases and hide a discontinuity right at the tail. Only when there is no
+        # usable SOF at all do we fall back to a uniform N/fps grid.
+        cam_fit: tuple[float, float] | None = None
+        if frame_times_s is not None:
+            xs = [i for i, t in enumerate(frame_times_s)
+                  if t is not None and math.isfinite(t)]
+            if len(xs) >= 2:
+                slope, intercept, _ = calibrate_mcu_clock(
+                    xs, [float(frame_times_s[i]) for i in xs]
+                )
+                if slope != 0.0:
+                    cam_fit = (slope, intercept)
+        n_extrapolated = 0
+
         for local_frame in range(frame_count):
             timestamp_s = frame_origin_s + local_frame / max(int(fps), 1)
+            lookup_s = timestamp_s
+            if frame_times_s is not None:
+                ft = frame_times_s[local_frame] if local_frame < len(frame_times_s) else None
+                if ft is not None and math.isfinite(ft):
+                    lookup_s = float(ft)
+                elif cam_fit is not None:
+                    lookup_s = cam_fit[0] * local_frame + cam_fit[1]
+                    n_extrapolated += 1
             sensors: dict[str, Any] = {}
             for sid, (times, slist) in per_sensor.items():
-                data = _nearest_sample_data(times, slist, timestamp_s)
+                data = _nearest_sample_data(times, slist, lookup_s)
                 if data:
                     sensors[sid] = data
             snap = {"valid": bool(sensors), "sensors": sensors}
@@ -743,6 +833,17 @@ def _build_episode_rows(
                 "index": start_index + local_frame,
                 "task_index": 0,
             })
+        if n_extrapolated:
+            logger.warning(
+                "camera SOF times: %d/%d frames extrapolated from the linear SOF "
+                "fit (sidecar gap/short tail); single time basis preserved",
+                n_extrapolated, frame_count,
+            )
+        elif frame_times_s is not None and cam_fit is None:
+            logger.warning(
+                "camera SOF times unusable (fewer than 2 valid sensor_timestamps); "
+                "BOX alignment fell back to the uniform N/fps grid"
+            )
     else:
         ordered_snapshots = sorted(
             snapshots,
@@ -829,6 +930,7 @@ class Lr3Writer:
         sensor_samples: dict[str, list[dict[str, Any]]] | None = None,
         t0_wall_s: float = 0.0,
         pts_offset_s: float | None = None,
+        frame_times_s: list[float | None] | None = None,
     ) -> Path | None:
         if self._closed:
             raise RuntimeError("cannot append to a closed Lr3Writer")
@@ -855,6 +957,7 @@ class Lr3Writer:
             pts_offset_s=pts_offset_s,
             start_index=self.total_frames,
             box_ids=box_ids,
+            frame_times_s=frame_times_s,
         )
         if not rows:
             return None
@@ -1008,6 +1111,7 @@ def write_box_lerobot_v3_episode(
     sensor_samples: dict[str, list[dict[str, Any]]] | None = None,
     t0_wall_s: float = 0.0,
     pts_offset_s: float | None = None,
+    frame_times_s: list[float | None] | None = None,
 ) -> Path | None:
     """Append BOX snapshots for one episode to a minimal LeRobot v3 dataset.
 
@@ -1022,6 +1126,12 @@ def write_box_lerobot_v3_episode(
         provided, the frame time grid shifts by this offset so that frame 0
         aligns with the actual first capture instant rather than the pipeline
         spawn time.
+      - *frame_times_s*: per-frame *real* camera capture time (t0-relative) from
+        the online-sync sidecar (see ``camera_frame_times_rel``).  When
+        provided, the BOX nearest-neighbor lookup targets the true exposure
+        instant instead of the idealized ``N/fps`` grid, removing the
+        per-episode camera skew (~10-55 ms; ts_sync.md §5.4).  The parquet
+        ``timestamp`` column is unaffected (stays ``N/fps``).
 
     Returns the parquet path when rows were written. If ``pyarrow`` is missing
     or no data was captured, returns ``None`` so the recorder can keep
@@ -1058,6 +1168,7 @@ def write_box_lerobot_v3_episode(
         t0_wall_s=t0_wall_s,
         pts_offset_s=pts_offset_s,
         box_ids=box_ids,
+        frame_times_s=frame_times_s,
     )
     if not rows:
         return None
