@@ -2488,6 +2488,15 @@ button.danger {
   gap: 14px;
   grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
 }
+/* Per-BOX grouping panel: monitors + calibration cards for one box. */
+.cali-box-panel {
+  border-left: 3px solid #0f766e;
+  display: grid;
+  gap: 14px;
+}
+.cali-box-panel > .cali-monitor-grid,
+.cali-box-panel > .cali-op-grid { margin: 0; }
+
 .cali-op-card { position: relative; }
 .cali-meta {
   display: grid;

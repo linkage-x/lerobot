@@ -91,6 +91,22 @@ export const STABILITY = {
   touchNetPeakToPeakN: 0.6,
 } as const;
 
+// --- Environment target range -------------------------------------------------
+// Thor exposes no ambient temperature/humidity sensor (only the Jetson's
+// tmp451 board temp + ina3221 power rail), so we cannot read the room. Per
+// product decision we display the *required* range as guidance instead of a
+// fake live value.
+export const ENV_TARGET = {
+  tempC: [15, 30] as [number, number],
+  humidityPct: [30, 70] as [number, number],
+};
+
+export function envTargetLabel(): string {
+  const [tLo, tHi] = ENV_TARGET.tempC;
+  const [hLo, hHi] = ENV_TARGET.humidityPct;
+  return `${tLo}–${tHi} ℃ / ${hLo}–${hHi} %RH（目标范围）`;
+}
+
 // --- Async safety -------------------------------------------------------------
 /** A calibration request that streams no terminal line within this window fails. */
 export const CALIBRATION_TIMEOUT_MS = 45_000;

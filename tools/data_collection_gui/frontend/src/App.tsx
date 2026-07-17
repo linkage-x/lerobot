@@ -38,7 +38,7 @@ const mvpPages: PageMeta[] = [
   { id: "episode-replay", label: "Episode Replay", kind: "mvp" },
   { id: "dataset-export", label: "Dataset Export", kind: "mvp" },
   { id: "task-library", label: "Task Library", kind: "mvp" },
-  { id: "calibration", label: "标定中心", kind: "mvp" },
+  { id: "calibration", label: "Calibration", kind: "mvp" },
   { id: "device-manager", label: "Device Manager", kind: "mvp" }
 ];
 
@@ -56,10 +56,10 @@ const pages: PageMeta[] = [...mvpPages, ...deferredPages];
 type NavGroup = { label: string; ids: PageId[] };
 const navGroups: NavGroup[] = [
   { label: "Overview", ids: ["dashboard"] },
-  { label: "采集", ids: ["live-record", "task-library"] },
-  { label: "标定中心", ids: ["calibration"] },
-  { label: "设备", ids: ["device-manager"] },
-  { label: "数据", ids: ["dataset-processing", "episode-replay", "dataset-export"] }
+  { label: "Capture", ids: ["live-record", "task-library"] },
+  { label: "Calibration", ids: ["calibration"] },
+  { label: "Devices", ids: ["device-manager"] },
+  { label: "Data", ids: ["dataset-processing", "episode-replay", "dataset-export"] }
 ];
 const navPageLabels: Partial<Record<PageId, string>> = {
   dashboard: "Overview"
@@ -370,19 +370,19 @@ function SidebarNav({
           : null}
       </div>
 
-      {/* Global device status footer (spec §2). Environment temp/humidity has no
-          backend feed yet, so it renders as "--" rather than a fake value. */}
+      {/* Global device status footer (spec §2). Thor has no ambient temp/humidity
+          sensor, so environment shows a target range rather than a fake value. */}
       <div className="nav-footer">
         <div className="nav-footer-row">
           <span className={`status-dot status-${onlineCount === totalCount && totalCount > 0 ? "running" : "warning"}`} />
-          <span>{onlineCount} / {totalCount} 设备在线</span>
+          <span>{onlineCount} / {totalCount} devices online</span>
         </div>
         <div className="nav-footer-row">
           <span className={`status-dot status-${caliBadge.tone}`} />
-          <span>标定：{caliBadge.text}</span>
+          <span>Calibration: {caliBadge.text}</span>
         </div>
-        <div className="nav-footer-row nav-footer-muted">环境：-- ℃ / -- %RH</div>
-        <div className="nav-footer-row nav-footer-muted">BOX ID：{boxIdLabel}</div>
+        <div className="nav-footer-row nav-footer-muted">Env: 15–30℃ / 30–70%RH target</div>
+        <div className="nav-footer-row nav-footer-muted">BOX ID: {boxIdLabel}</div>
       </div>
     </nav>
   );

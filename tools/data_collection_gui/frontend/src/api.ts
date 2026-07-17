@@ -513,9 +513,17 @@ export class DataCollectionGuiApi {
     }
   }
 
-  async triggerSixDForceCalibration(): Promise<{ ok: boolean; error?: string }> {
+  // The three box calibrations take an optional box_id: empty (single-box rigs)
+  // keeps the whole-fleet behavior; a namespace id restricts the run to one box
+  // (the calibration center's per-device button).
+  private boxCaliUrl(path: string, boxId: string): string {
+    const qs = boxId ? `?${new URLSearchParams({ box_id: boxId }).toString()}` : "";
+    return `${this.apiBase}${path}${qs}`;
+  }
+
+  async triggerSixDForceCalibration(boxId = ""): Promise<{ ok: boolean; error?: string }> {
     try {
-      const response = await fetch(`${this.apiBase}/api/device/calibrate-6dforce`, {
+      const response = await fetch(this.boxCaliUrl("/api/device/calibrate-6dforce", boxId), {
         method: "POST",
         headers: { Accept: "application/json" }
       });
@@ -526,9 +534,9 @@ export class DataCollectionGuiApi {
     }
   }
 
-  async triggerSixDForceOriginCalibration(): Promise<{ ok: boolean; error?: string }> {
+  async triggerSixDForceOriginCalibration(boxId = ""): Promise<{ ok: boolean; error?: string }> {
     try {
-      const response = await fetch(`${this.apiBase}/api/device/calibrate-6dforce-origin`, {
+      const response = await fetch(this.boxCaliUrl("/api/device/calibrate-6dforce-origin", boxId), {
         method: "POST",
         headers: { Accept: "application/json" }
       });
@@ -539,9 +547,9 @@ export class DataCollectionGuiApi {
     }
   }
 
-  async triggerTouchCalibration(): Promise<{ ok: boolean; error?: string }> {
+  async triggerTouchCalibration(boxId = ""): Promise<{ ok: boolean; error?: string }> {
     try {
-      const response = await fetch(`${this.apiBase}/api/device/calibrate-touch`, {
+      const response = await fetch(this.boxCaliUrl("/api/device/calibrate-touch", boxId), {
         method: "POST",
         headers: { Accept: "application/json" }
       });

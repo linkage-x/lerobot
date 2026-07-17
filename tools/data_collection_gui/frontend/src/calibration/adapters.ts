@@ -4,15 +4,35 @@
 // carries a TODO describing the backend work required.
 
 import type { DeviceStatus } from "../types";
+import { envTargetLabel } from "./config";
 import type { CalibrationHistoryFilter, CalibrationRecord, ReadinessItem } from "./types";
 
 // --- Software / firmware version ---------------------------------------------
-// TODO(backend): expose the recorder/box firmware version in the snapshot or a
-// dedicated endpoint. Until then we read Vite's build-time define if present,
-// else report unknown.
+// The box firmware version comes from the SDK discovery broadcast
+// (DiscoveredBox.fw_version), surfaced by the gateway on each box device's
+// `config.fw_version`. `softwareVersion()` is the host app build (Vite define).
 export function softwareVersion(): string {
   const v = (import.meta.env.VITE_APP_VERSION as string | undefined) ?? "";
   return v || "unknown";
+}
+
+/** Box firmware version from a device's `config.fw_version` (0/absent → 未知). */
+export function firmwareVersion(devices: DeviceStatus[]): string {
+  for (const d of devices) {
+    const fw = (d.config ?? {}).fw_version;
+    const n = typeof fw === "number" ? fw : Number(fw);
+    if (Number.isFinite(n) && n > 0) return `v${n}`;
+  }
+  return "未知";
+}
+
+/** Box serial number from a device's `config.sn`, when present. */
+export function boxSerial(devices: DeviceStatus[]): string {
+  for (const d of devices) {
+    const sn = (d.config ?? {}).sn;
+    if (typeof sn === "string" && sn.trim()) return sn.trim();
+  }
+  return "";
 }
 
 // --- Derived touch quantities (from the live preview payload) -----------------
@@ -56,14 +76,18 @@ export function readinessTactileActivation(): ReadinessItem {
   };
 }
 
-/** Environment temp/humidity: no sensor feed in the snapshot. */
+/**
+ * Environment temp/humidity. Thor has no ambient sensor (only the Jetson
+ * tmp451 board temp + ina3221 power rail — neither is room temp/humidity), so
+ * we show the required target range as guidance rather than a fake reading.
+ */
 export function readinessEnvironment(): ReadinessItem {
   return {
     id: "environment",
     label: "环境温湿度正常",
     state: "unavailable",
-    detail: "-- / --",
-    todo: "backend: 暴露环境温度/湿度读数",
+    detail: envTargetLabel(),
+    todo: "Thor 无环境温湿度传感器（仅 tmp451 板温/ina3221 功耗）；如需实测须外接温湿度计",
   };
 }
 

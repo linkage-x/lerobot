@@ -1,8 +1,8 @@
-// Calibration operation cards. Origin (raw zero) and dynamic (filter) 6D force
-// are deliberately two separate cards with different pass/fail criteria, plus a
-// tactile card. Each drives one useCalibrationWorkflow instance and shares the
-// confirm modal + result panel. The backend endpoints calibrate the whole
-// fleet, so a single card reports every box/side.
+// Calibration operation cards, scoped to one BOX. Origin (raw zero) and dynamic
+// (filter) 6D force are deliberately two separate cards with different pass/fail
+// criteria, plus a tactile card. Each drives one useCalibrationWorkflow instance
+// and shares the confirm modal + result panel. Each card passes its box_id so
+// the recorder calibrates only that box (empty = the single box).
 
 import { useState } from "react";
 import type { DataCollectionGuiApi } from "../api";
@@ -27,7 +27,6 @@ import {
   FORCE_TROUBLESHOOTING,
   TOUCH_TROUBLESHOOTING,
   boxDisplayName,
-  deviceBoxId,
 } from "./adapters";
 import { ForceAxisGrid } from "./BoxSensorViews";
 import { CalibrationConfirmModal, CONFIRM_CHECKLIST } from "./ConfirmModal";
@@ -188,6 +187,7 @@ function RebootStep({ wf }: { wf: WorkflowApi }) {
 export function ForceCalibrationCard({
   variant,
   api,
+  boxId,
   devices,
   operator,
   guard,
@@ -196,6 +196,7 @@ export function ForceCalibrationCard({
 }: {
   variant: "origin" | "dynamic";
   api: DataCollectionGuiApi;
+  boxId: string;
   devices: DeviceStatus[];
   operator: string;
   guard: () => string | null;
@@ -212,8 +213,8 @@ export function ForceCalibrationCard({
     api,
     kind,
     trigger: isOrigin
-      ? () => api.triggerSixDForceOriginCalibration()
-      : () => api.triggerSixDForceCalibration(),
+      ? () => api.triggerSixDForceOriginCalibration(boxId)
+      : () => api.triggerSixDForceCalibration(boxId),
     fetchLog: () => api.fetchBoxCaliLog(),
     sampleDevices: devices,
     sampleKind: "force",
@@ -249,22 +250,6 @@ export function ForceCalibrationCard({
         <MetaRow label="当前状态" value={VALIDITY_LABELS[validity.state]} />
         <MetaRow label="有效截止" value={fmtTimestamp(validity.expiresAt)} />
         <MetaRow label="下次倒计时" value={fmtDuration(validity.remainingMs)} />
-      </div>
-
-      {/* Per-box freshness */}
-      <div className="cali-box-status">
-        {devices.map((d) => {
-          const boxId = deviceBoxId(d);
-          const recs = history.filter((r) => (r.boxId || "") === boxId);
-          const v = computeValidity(recs[0]?.timestamp ?? null, kind);
-          const dot = validityDot(v.state);
-          return (
-            <span className="cali-box-chip" key={d.id}>
-              <span className={`status-dot status-${dot}`} />
-              {boxDisplayName(boxId)}：{VALIDITY_LABELS[v.state]}
-            </span>
-          );
-        })}
       </div>
 
       {/* Procedure + warnings */}
@@ -333,6 +318,7 @@ export function ForceCalibrationCard({
 // --- tactile card -------------------------------------------------------------
 export function TactileCalibrationCard({
   api,
+  boxId,
   devices,
   operator,
   guard,
@@ -340,6 +326,7 @@ export function TactileCalibrationCard({
   history,
 }: {
   api: DataCollectionGuiApi;
+  boxId: string;
   devices: DeviceStatus[];
   operator: string;
   guard: () => string | null;
@@ -350,9 +337,9 @@ export function TactileCalibrationCard({
   const wf = useCalibrationWorkflow({
     api,
     kind: "touch",
-    // The SDK has no per-pad variant, so every button calls the same whole-box
-    // endpoint. See TODO below; results are still shown per side.
-    trigger: () => api.triggerTouchCalibration(),
+    // Per-box calibration: a box's two pads share one MCU-side re-zero, so there
+    // is one button per box (not per pad). Results are still reported per side.
+    trigger: () => api.triggerTouchCalibration(boxId),
     fetchLog: () => api.fetchBoxTouchCaliLog(),
     sampleDevices: devices,
     sampleKind: "touch",
@@ -369,9 +356,6 @@ export function TactileCalibrationCard({
   const busy = isBusyState(wf.state);
   const showModal = wf.state === "checking_prerequisites" || wf.state === "waiting_for_stability";
 
-  const left = devices.find((d) => d.id.endsWith("box_touch_left"));
-  const right = devices.find((d) => d.id.endsWith("box_touch_right"));
-
   const start = () => {
     checklist.reset();
     wf.begin();
@@ -380,7 +364,7 @@ export function TactileCalibrationCard({
   return (
     <section className="panel cali-op-card">
       <div className="panel-heading">
-        <h2>触觉标定（左右 / 单侧）</h2>
+        <h2>触觉标定</h2>
         <ValidityBadge records={history} kind="touch" />
       </div>
 
@@ -391,25 +375,19 @@ export function TactileCalibrationCard({
       </div>
 
       <div className="cali-info">
-        目标：校准后合力与分布力趋近 0；容差 净力 ±{TOUCH_TOLERANCE.netForceEpsilonN} N、单 taxel ≤ {TOUCH_TOLERANCE.maxTaxelResidual0p1N} (0.1N)。
+        按 BOX 整体校准（一次同时归零该 BOX 的两个 Paxini pad）；目标：合力与分布力趋近 0，
+        容差 净力 ±{TOUCH_TOLERANCE.netForceEpsilonN} N、单 taxel ≤ {TOUCH_TOLERANCE.maxTaxelResidual0p1N} (0.1N)。
+        结果仍按左/右分别显示。
       </div>
 
       {guardReason && <div className="cali-guard">当前不可标定：{guardReason}</div>}
 
-      <div className="cali-op-actions cali-touch-actions">
-        {/* Backend calibrates both pads together; L/R buttons are provided for
-            workflow parity and both currently trigger the whole-box op. */}
-        <button className="cali-btn-primary" disabled={busy || Boolean(guardReason) || !left} onClick={start}>
-          校准左触觉
+      <div className="cali-op-actions">
+        <button className="cali-btn-primary" disabled={busy || Boolean(guardReason) || devices.length === 0} onClick={start}>
+          校准触觉（该 BOX）
         </button>
-        <button className="cali-btn-primary" disabled={busy || Boolean(guardReason) || !right} onClick={start}>
-          校准右触觉
-        </button>
-        <button className="cali-btn-primary" disabled={busy || Boolean(guardReason)} onClick={start}>
-          校准左右触觉
-        </button>
+        <span className="cali-dev-hint">调用 cali_touch_sensor（device_id={boxId || "single"}）</span>
       </div>
-      <div className="cali-dev-hint">调用 cali_touch_sensor（整箱；TODO：后端暂无按 L/R 单独校准的接口）</div>
 
       <ProgressLine wf={wf} />
       <CalibrationResultPanel wf={wf} troubleshooting={TOUCH_TROUBLESHOOTING} limits={null} />

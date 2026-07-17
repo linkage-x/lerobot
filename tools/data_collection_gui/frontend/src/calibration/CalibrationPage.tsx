@@ -1,25 +1,29 @@
 // Calibration center (标定中心). Composes the global status bar, readiness
-// checklist, live monitors, the three calibration operation cards (origin +
-// dynamic 6D force, tactile), the operation log and the history list.
+// checklist, and — grouped per BOX device — the live monitors and the three
+// calibration operation cards (origin + dynamic 6D force, tactile), plus a
+// shared operation log and history list.
 //
 // Backwards compatible with a single BOX: single-box rigs carry an empty
-// box_id and bare sensor ids, so `forceDevices`/`touchDevices` resolve to one
-// entry each and every per-box loop degrades to a single row.
+// box_id and bare sensor ids, so `boxGroups` yields one group and every
+// per-box loop degrades to a single row.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { DataCollectionGuiApi, GuiSnapshot } from "../api";
 import type { BoxCaliLogLine, DeviceStatus } from "../types";
-import { fmtTimestamp } from "./config";
+import { envTargetLabel, fmtTimestamp } from "./config";
 import {
+  boxDisplayName,
   boxSensorSuffix,
+  boxSerial,
   deviceBoxId,
+  firmwareVersion,
   historyRepo,
   readinessEnvironment,
   readinessTactileActivation,
   readinessWarmup,
   softwareVersion,
 } from "./adapters";
-import { summarizeKinds } from "./status";
+import { computeValidity, summarizeKinds } from "./status";
 import type { CalibrationKind, CalibrationRecord, ReadinessItem } from "./types";
 import { ReadinessChecklist } from "./ReadinessChecklist";
 import { ForceSensorCard, TactileSensorCard } from "./SensorMonitors";
@@ -89,13 +93,24 @@ export function CalibrationPage({
     setHistoryTick((n) => n + 1);
   };
 
-  // --- device grouping (single-box safe) ------------------------------------
+  // --- device grouping: by BOX device, sensors nested (single-box safe) ------
   const boxDevices = snapshot.devices.filter((d) => d.kind === "box_collection");
-  const forceDevices = boxDevices.filter((d) => boxSensorSuffix(d.id) === "box_six_d_force");
-  const touchDevices = boxDevices.filter((d) => boxSensorSuffix(d.id).startsWith("box_touch"));
-
   const boxIds = [...new Set(boxDevices.map((d) => deviceBoxId(d)))];
   const boxIdLabel = boxIds.length ? boxIds.map((b) => b || "默认").join(", ") : "—";
+
+  const boxGroups = boxIds.map((bid) => {
+    const devs = boxDevices.filter((d) => deviceBoxId(d) === bid);
+    return {
+      boxId: bid,
+      devices: devs,
+      force: devs.filter((d) => boxSensorSuffix(d.id) === "box_six_d_force"),
+      touch: devs.filter((d) => boxSensorSuffix(d.id).startsWith("box_touch")),
+    };
+  });
+
+  // Per-box, per-kind calibration history (validity + result recall).
+  const historyFor = (kind: CalibrationKind, bid: string) =>
+    records.filter((r) => r.kind === kind && (r.boxId || "") === bid);
 
   const recorderConnected = ["connecting", "armed", "recording", "review", "saving", "discarding"].includes(
     snapshot.recording.state,
@@ -157,7 +172,7 @@ export function CalibrationPage({
             BOX {boxOnline ? "已连接" : "未连接"}
           </span>
           <span className="cali-statusbar-item">BOX ID：{boxIdLabel}</span>
-          <span className="cali-statusbar-item">版本：{softwareVersion()}</span>
+          <span className="cali-statusbar-item">GUI {softwareVersion()}</span>
           <span className="cali-statusbar-item">{fmtTimestamp(now)}</span>
           <span className="cali-statusbar-item">
             采集：{snapshot.recording.state}
@@ -182,69 +197,71 @@ export function CalibrationPage({
 
       <ReadinessChecklist items={readiness} />
 
-      {/* --- live monitors (spec §3, §6) --- */}
-      {forceDevices.length > 0 && (
-        <section className="panel">
-          <div className="panel-heading">
-            <h2>六维力实时监控</h2>
-            <span>{forceDevices.filter((d) => d.state === "running").length}/{forceDevices.length} 在线</span>
-          </div>
-          <div className="cali-monitor-grid">
-            {forceDevices.map((d: DeviceStatus) => (
-              <ForceSensorCard key={d.id} api={api} device={d} />
-            ))}
-          </div>
-        </section>
-      )}
+      {/* --- per-BOX groups: monitors + calibration nested by device (spec §3-6) --- */}
+      {boxGroups.map((group) => {
+        const online = group.devices.filter((d) => d.state === "running").length;
+        const fw = firmwareVersion(group.devices);
+        const sn = boxSerial(group.devices);
+        return (
+          <section className="panel cali-box-panel" key={group.boxId || "single"}>
+            <div className="panel-heading">
+              <h2>BOX {boxDisplayName(group.boxId)}</h2>
+              <span>
+                固件 {fw}
+                {sn ? ` · SN ${sn}` : ""} · {online}/{group.devices.length} 在线
+              </span>
+            </div>
 
-      {touchDevices.length > 0 && (
-        <section className="panel">
-          <div className="panel-heading">
-            <h2>触觉实时监控</h2>
-            <span>{touchDevices.filter((d) => d.state === "running").length}/{touchDevices.length} 在线</span>
-          </div>
-          <div className="cali-monitor-grid">
-            {touchDevices.map((d: DeviceStatus) => (
-              <TactileSensorCard key={d.id} api={api} device={d} />
-            ))}
-          </div>
-        </section>
-      )}
+            {/* live monitors for this box */}
+            <div className="cali-monitor-grid">
+              {group.force.map((d) => (
+                <ForceSensorCard key={d.id} api={api} device={d} />
+              ))}
+              {group.touch.map((d) => (
+                <TactileSensorCard key={d.id} api={api} device={d} />
+              ))}
+            </div>
 
-      {/* --- calibration operations (spec §4, §5, §6) --- */}
-      {forceDevices.length > 0 && (
-        <div className="cali-op-grid">
-          <ForceCalibrationCard
-            variant="origin"
-            api={api}
-            devices={forceDevices}
-            operator={operator}
-            guard={guard}
-            onRecord={onRecord}
-            history={historyByKind("force_origin")}
-          />
-          <ForceCalibrationCard
-            variant="dynamic"
-            api={api}
-            devices={forceDevices}
-            operator={operator}
-            guard={guard}
-            onRecord={onRecord}
-            history={historyByKind("force_dynamic")}
-          />
-        </div>
-      )}
+            {/* calibration operations for this box */}
+            {group.force.length > 0 && (
+              <div className="cali-op-grid">
+                <ForceCalibrationCard
+                  variant="origin"
+                  api={api}
+                  boxId={group.boxId}
+                  devices={group.force}
+                  operator={operator}
+                  guard={guard}
+                  onRecord={onRecord}
+                  history={historyFor("force_origin", group.boxId)}
+                />
+                <ForceCalibrationCard
+                  variant="dynamic"
+                  api={api}
+                  boxId={group.boxId}
+                  devices={group.force}
+                  operator={operator}
+                  guard={guard}
+                  onRecord={onRecord}
+                  history={historyFor("force_dynamic", group.boxId)}
+                />
+              </div>
+            )}
 
-      {touchDevices.length > 0 && (
-        <TactileCalibrationCard
-          api={api}
-          devices={touchDevices}
-          operator={operator}
-          guard={guard}
-          onRecord={onRecord}
-          history={historyByKind("touch")}
-        />
-      )}
+            {group.touch.length > 0 && (
+              <TactileCalibrationCard
+                api={api}
+                boxId={group.boxId}
+                devices={group.touch}
+                operator={operator}
+                guard={guard}
+                onRecord={onRecord}
+                history={historyFor("touch", group.boxId)}
+              />
+            )}
+          </section>
+        );
+      })}
 
       {boxDevices.length === 0 && (
         <section className="panel">
