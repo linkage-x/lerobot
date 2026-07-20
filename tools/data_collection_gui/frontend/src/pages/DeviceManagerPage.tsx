@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { GuiSnapshot } from "../api";
-import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
+import type { BoxPreviewPayload, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
 import { api } from "../apiClient";
 
@@ -298,127 +298,6 @@ export function BoxForceTileView({ sensor }: { sensor?: Record<string, unknown> 
 // Camera-tile lookalike for the array BOX sensors: the live visualization fills
 // the media, and the scalar config / liveness stats live in the hover overlay,
 // mirroring CameraTile so the Device Manager grid stays visually uniform.
-// Calibrate button + scrolling log box for the BOX 6D force sensor. Triggering
-// rides the recorder's stdin (gateway POST), and progress streams back as
-// CALI_LOG/CALI_DONE lines the gateway buffers; we poll that buffer while a run
-// is active and auto-scroll the box to the newest line. All box calibrations
-// (6D force software-zero, 6D force MCU origin, touch) share this one buffer --
-// the recorder runs them one at a time -- so a tile can expose several buttons
-// that all feed the same log panel.
-export type BoxCalibrationAction = {
-  idleLabel: string;
-  busyLabel: string;
-  trigger: () => Promise<{ ok: boolean; error?: string }>;
-};
-
-// 6D force and touch each have their own log endpoint/buffer, so the viewer is
-// parametrized by fetchLog and only ever shows its own calibration's lines.
-export function BoxCalibration({
-  actions,
-  fetchLog,
-}: {
-  actions: BoxCalibrationAction[];
-  fetchLog: () => Promise<BoxCaliLog | null>;
-}) {
-  const [lines, setLines] = useState<BoxCaliLogLine[]>([]);
-  const [running, setRunning] = useState(false);
-  const [busyIdx, setBusyIdx] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const logRef = useRef<HTMLDivElement | null>(null);
-  const pollRef = useRef<number | null>(null);
-
-  // The parent passes fetchLog as an inline arrow, so its identity changes every
-  // render. Read it through a ref so `poll` stays stable -- otherwise `poll` (and
-  // the mount effect that depends on it) would be recreated every parent render,
-  // tearing down and restarting the poll interval and firing extra requests.
-  const fetchLogRef = useRef(fetchLog);
-  useEffect(() => {
-    fetchLogRef.current = fetchLog;
-  }, [fetchLog]);
-
-  const stopPolling = useCallback(() => {
-    if (pollRef.current != null) {
-      window.clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-  }, []);
-
-  const poll = useCallback(async () => {
-    const log = await fetchLogRef.current();
-    if (!log) {
-      return;
-    }
-    setLines(log.lines);
-    setRunning(log.running);
-    if (!log.running) {
-      setBusyIdx(null);
-      stopPolling();
-    }
-  }, [stopPolling]);
-
-  // Load any prior log once on mount; only poll continuously while a run is live.
-  useEffect(() => {
-    poll();
-    return stopPolling;
-  }, [poll, stopPolling]);
-
-  // Keep the newest line in view as the log grows.
-  useEffect(() => {
-    const el = logRef.current;
-    if (el) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [lines]);
-
-  const onCalibrate = useCallback(
-    async (idx: number, trigger: BoxCalibrationAction["trigger"]) => {
-      setError(null);
-      setRunning(true);
-      setBusyIdx(idx);
-      const res = await trigger();
-      if (!res.ok) {
-        setError(res.error ?? "calibration failed to start");
-        setRunning(false);
-        setBusyIdx(null);
-        poll(); // surface whatever the gateway appended (e.g. "recorder not connected")
-        return;
-      }
-      stopPolling();
-      pollRef.current = window.setInterval(poll, 300);
-      poll();
-    },
-    [poll, stopPolling],
-  );
-
-  return (
-    <div className="force-cali">
-      <div className="force-cali-controls">
-        {actions.map((action, idx) => (
-          <button
-            key={action.idleLabel}
-            className="force-cali-btn"
-            onClick={() => onCalibrate(idx, action.trigger)}
-            disabled={running}
-          >
-            {running && busyIdx === idx ? action.busyLabel : action.idleLabel}
-          </button>
-        ))}
-        {error && <span className="force-cali-error">{error}</span>}
-      </div>
-      <div className="force-cali-log" ref={logRef}>
-        {lines.length === 0 ? (
-          <div className="force-cali-log-empty">No calibration run yet.</div>
-        ) : (
-          lines.map((entry, i) => (
-            <div className="force-cali-log-line" key={`${entry.ts}-${i}`}>
-              {entry.line}
-            </div>
-          ))
-        )}
-      </div>
-    </div>
-  );
-}
 
 export function BoxSensorTile({ device }: { device: DeviceStatus }) {
   const [preview, setPreview] = useState<BoxPreviewPayload | null>(null);
@@ -488,23 +367,6 @@ export function BoxSensorTile({ device }: { device: DeviceStatus }) {
         <strong>{device.id}</strong>
         <span className="camera-tile-stat">{device.fps} Hz</span>
       </div>
-      {isForce && (
-        <BoxCalibration
-          fetchLog={() => api.fetchBoxCaliLog()}
-          actions={[
-            {
-              idleLabel: "Calibrate 6D force",
-              busyLabel: "Calibrating…",
-              trigger: () => api.triggerSixDForceCalibration(),
-            },
-            {
-              idleLabel: "Calibrate 6D (origin)",
-              busyLabel: "Calibrating…",
-              trigger: () => api.triggerSixDForceOriginCalibration(),
-            },
-          ]}
-        />
-      )}
     </div>
   );
 }
@@ -756,24 +618,6 @@ export function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
                     .map((device) => (
                       <BoxSensorTile key={device.id} device={device} />
                     ))}
-                </div>
-              )}
-              {/* Touch calibration is a whole-box op (cali_touch_sensor takes only
-                  a device_id; the SDK has no per-pad variant), so it lives at the
-                  box level -- not on the L or R pad tile -- to avoid implying it
-                  only affects one pad. */}
-              {items.some((d) => boxSensorSuffix(d.id).startsWith("box_touch")) && (
-                <div className="box-touch-cali">
-                  <BoxCalibration
-                    fetchLog={() => api.fetchBoxTouchCaliLog()}
-                    actions={[
-                      {
-                        idleLabel: "Calibrate touch (L+R)",
-                        busyLabel: "Calibrating…",
-                        trigger: () => api.triggerTouchCalibration(),
-                      },
-                    ]}
-                  />
                 </div>
               )}
               {items

@@ -161,6 +161,13 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
   const mounted = useRef(true);
   const cfgRef = useRef(cfg);
   cfgRef.current = cfg;
+  // Mirror `state` so event handlers (confirm/confirmReboot) can guard on the
+  // freshest value WITHOUT doing side effects inside a setState updater — React
+  // StrictMode double-invokes updater functions in dev, which would start the
+  // polling loop twice and leak the first interval (→ runaway validate → the
+  // page "flickers"). Handlers run once, so guarding via a ref is safe.
+  const stateRef = useRef(state);
+  stateRef.current = state;
 
   const clearTimers = useCallback(() => {
     if (stabilityTimer.current != null) window.clearInterval(stabilityTimer.current);
@@ -397,41 +404,37 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
   }, [validate]);
 
   const confirm = useCallback(() => {
+    // Guard + side effects live in the event handler (runs once), never in a
+    // setState updater (StrictMode runs those twice → duplicate/leaked timers).
+    if (stateRef.current !== "waiting_for_stability") return;
     if (stabilityTimer.current != null) window.clearInterval(stabilityTimer.current);
     stabilityTimer.current = null;
-    setState((cur) => {
-      if (cur !== "waiting_for_stability") return cur;
-      startCalibrating();
-      return "calibrating";
-    });
+    startCalibrating(); // sets state → "calibrating" itself
   }, [startCalibrating]);
 
   const confirmReboot = useCallback(() => {
-    setState((cur) => {
-      if (cur !== "waiting_for_reboot") return cur;
-      // reconnecting: wait for a device to report a fresh live sample again.
-      setState("reconnecting");
-      const started = Date.now();
-      const poll = async () => {
-        const { api, sampleDevices } = cfgRef.current;
-        const previews = await Promise.all(sampleDevices.map((d) => api.fetchBoxPreview(d.id)));
-        const anyActive = previews.some((p) => p?.active);
-        if (!mounted.current) return;
-        if (anyActive) {
-          if (logTimer.current != null) window.clearInterval(logTimer.current);
-          logTimer.current = null;
-          validate();
-        } else if (Date.now() - started > CALIBRATION_TIMEOUT_MS) {
-          if (logTimer.current != null) window.clearInterval(logTimer.current);
-          logTimer.current = null;
-          setError("重新连接超时，请检查 BOX 是否已重新上电");
-          setState("failed");
-        }
-      };
-      poll();
-      logTimer.current = window.setInterval(poll, CALI_LOG_POLL_MS);
-      return "reconnecting";
-    });
+    if (stateRef.current !== "waiting_for_reboot") return;
+    // reconnecting: wait for a device to report a fresh live sample again.
+    setState("reconnecting");
+    const started = Date.now();
+    const poll = async () => {
+      const { api, sampleDevices } = cfgRef.current;
+      const previews = await Promise.all(sampleDevices.map((d) => api.fetchBoxPreview(d.id)));
+      const anyActive = previews.some((p) => p?.active);
+      if (!mounted.current) return;
+      if (anyActive) {
+        if (logTimer.current != null) window.clearInterval(logTimer.current);
+        logTimer.current = null;
+        validate();
+      } else if (Date.now() - started > CALIBRATION_TIMEOUT_MS) {
+        if (logTimer.current != null) window.clearInterval(logTimer.current);
+        logTimer.current = null;
+        setError("重新连接超时，请检查 BOX 是否已重新上电");
+        setState("failed");
+      }
+    };
+    poll();
+    logTimer.current = window.setInterval(poll, CALI_LOG_POLL_MS);
   }, [validate]);
 
   const cancel = useCallback(() => {

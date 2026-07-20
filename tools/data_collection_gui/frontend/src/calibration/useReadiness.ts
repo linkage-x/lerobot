@@ -17,7 +17,7 @@ import {
   fmtDuration,
 } from "./config";
 import type { ReadinessState } from "./types";
-import { touchMaxResidual0p1N } from "./adapters";
+import { boxSensorSuffix, touchMaxResidual0p1N } from "./adapters";
 import { numberArray } from "./useBoxPreview";
 
 function readJSON<T>(key: string, fallback: T): T {
@@ -94,10 +94,19 @@ export function useWarmup(boxId: string, now: number): WarmupApi {
 export type TactileActivationApi = {
   state: ReadinessState;
   detail: string;
+  /** Progress of the limiting (least-pressed) pad; complete once every pad hits target. */
   count: number;
   target: number;
   reset: () => void;
 };
+
+/** Short side label for a touch pad ("左"/"右", else the device label). */
+function padSideLabel(dev: DeviceStatus): string {
+  const suffix = boxSensorSuffix(dev.id).toLowerCase();
+  if (suffix.includes("left")) return "左";
+  if (suffix.includes("right")) return "右";
+  return dev.label || dev.id;
+}
 
 export function useTactileActivation(
   api: DataCollectionGuiApi,
@@ -107,44 +116,55 @@ export function useTactileActivation(
 ): TactileActivationApi {
   const key = `lerobot.calibration.tactile-activation.${boxId}`;
   const target = TACTILE_ACTIVATION_TARGET;
-  const [count, setCount] = useState<number>(() => {
-    const n = Number(readJSON<number>(key, 0));
-    return Number.isFinite(n) ? Math.max(0, Math.min(target, n)) : 0;
-  });
-  // Hysteresis latch: true once the pads have released below the low threshold,
-  // so a single sustained press is counted exactly once.
-  const armedRef = useRef(true);
-  const countRef = useRef(count);
-  countRef.current = count;
+  // Per-pad counts (keyed by device id): each pad must be pressed to full scale
+  // `target` times, so pressing only one side never completes the readiness.
+  const [counts, setCounts] = useState<Record<string, number>>(() =>
+    readJSON<Record<string, number>>(key, {}),
+  );
+  // Per-pad hysteresis latch: true once that pad has released below the low
+  // threshold, so a single sustained press on it is counted exactly once.
+  const armedRef = useRef<Record<string, boolean>>({});
+  const countsRef = useRef(counts);
+  countsRef.current = counts;
 
   const reset = useCallback(() => {
-    setCount(0);
-    writeJSON(key, 0);
-    armedRef.current = true;
+    setCounts({});
+    writeJSON(key, {});
+    armedRef.current = {};
   }, [key]);
 
   const deviceIds = touchDevices.map((d) => d.id).join(",");
-  const complete = count >= target;
+  const ids = deviceIds ? deviceIds.split(",") : [];
+  const perPad = ids.map((id) => Math.min(target, Math.max(0, counts[id] ?? 0)));
+  const minCount = perPad.length ? Math.min(...perPad) : 0;
+  const complete = perPad.length > 0 && perPad.every((c) => c >= target);
 
   useEffect(() => {
     if (!enabled || complete || touchDevices.length === 0) return;
     let cancelled = false;
-    const ids = deviceIds ? deviceIds.split(",") : [];
+    const idList = deviceIds ? deviceIds.split(",") : [];
     const tick = async () => {
-      const previews = await Promise.all(ids.map((id) => api.fetchBoxPreview(id)));
+      const previews = await Promise.all(idList.map((id) => api.fetchBoxPreview(id)));
       if (cancelled) return;
-      let max = 0;
-      for (const p of previews) {
-        const r = touchMaxResidual0p1N(numberArray(p?.sensor?.["fz_0p1N"]));
-        if (r != null) max = Math.max(max, r);
-      }
-      if (max <= TACTILE_RELEASE_0p1N) {
-        armedRef.current = true;
-      } else if (max >= TACTILE_ACTIVATE_0p1N && armedRef.current) {
-        armedRef.current = false;
-        const next = Math.min(target, countRef.current + 1);
-        countRef.current = next;
-        setCount(next);
+      const next = { ...countsRef.current };
+      let changed = false;
+      idList.forEach((id, i) => {
+        const r = touchMaxResidual0p1N(numberArray(previews[i]?.sensor?.["fz_0p1N"]));
+        if (r == null) return;
+        if (r <= TACTILE_RELEASE_0p1N) {
+          armedRef.current[id] = true;
+        } else if (r >= TACTILE_ACTIVATE_0p1N && (armedRef.current[id] ?? true)) {
+          armedRef.current[id] = false;
+          const cur = Math.min(target, (next[id] ?? 0) + 1);
+          if (cur !== (next[id] ?? 0)) {
+            next[id] = cur;
+            changed = true;
+          }
+        }
+      });
+      if (changed) {
+        countsRef.current = next;
+        setCounts(next);
         writeJSON(key, next);
       }
     };
@@ -155,10 +175,11 @@ export function useTactileActivation(
     };
   }, [api, deviceIds, enabled, complete, key, target, touchDevices.length]);
 
+  const summary = touchDevices.map((d) => `${padSideLabel(d)} ${Math.min(target, Math.max(0, counts[d.id] ?? 0))}/${target}`).join(" · ");
   return {
-    state: complete ? "complete" : count > 0 ? "warning" : "pending",
-    detail: complete ? `${count}/${target} 已激活` : `${count}/${target} · 请用力按压触觉至满量程`,
-    count,
+    state: complete ? "complete" : perPad.some((c) => c > 0) ? "warning" : "pending",
+    detail: complete ? `${summary} 已激活` : `${summary} · 请分别将每个 pad 按压至满量程`,
+    count: minCount,
     target,
     reset,
   };

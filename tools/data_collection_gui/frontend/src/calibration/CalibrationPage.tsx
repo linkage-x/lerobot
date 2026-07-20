@@ -297,11 +297,15 @@ function BoxCalibrationGroup({
       ? [
           {
             id: `${bid}-tactile`,
-            label: "触觉已完成 3 次满量程激活",
+            label: "每个 pad 各完成 3 次满量程激活",
             state: tactile.state,
             detail: tactile.detail,
             action: (
-              <button className="cali-mini-btn" disabled={tactile.count === 0} onClick={tactile.reset}>
+              <button
+                className="cali-mini-btn"
+                disabled={tactile.state === "pending"}
+                onClick={tactile.reset}
+              >
                 重置计数
               </button>
             ),

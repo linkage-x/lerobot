@@ -2466,14 +2466,19 @@ button.danger {
   text-align: right;
 }
 .cali-axis-unit { color: #94a3b8; font-size: 11px; }
+/* Light (result panel) default: dark red text on the salmon tint so it stays
+   legible. The dark monitor cards override the text color below. */
 .cali-axis-row.cali-axis-fail {
-  background: rgba(194, 65, 12, 0.22);
-  color: #ffd0bb;
+  background: rgba(194, 65, 12, 0.16);
+  color: #8d2d12;
 }
-.cali-monitor-dark .cali-axis-row.cali-axis-fail { color: #ffb896; }
+.cali-monitor-dark .cali-axis-row.cali-axis-fail {
+  background: rgba(194, 65, 12, 0.22);
+  color: #ffb896;
+}
 .cali-axis-verdict { font-size: 11px; font-weight: 800; }
 .cali-axis-verdict.pass { color: #0f9d8f; }
-.cali-axis-verdict.fail { color: #e05a2b; }
+.cali-axis-verdict.fail { color: #b91c1c; }
 .cali-axis-empty { color: #94a3b8; font-size: 12px; padding: 8px 0; }
 
 /* ---- touch metrics ---- */
