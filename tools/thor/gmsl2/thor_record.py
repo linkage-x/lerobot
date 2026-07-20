@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -484,6 +485,41 @@ def _has_recorded_sensor_samples(samples: dict[str, list[bc.SensorSample]] | Non
 
 def _wallclock_utc_from_wall_s(wall_s: float) -> str:
     return datetime.fromtimestamp(float(wall_s), timezone.utc).isoformat()
+
+
+def _box_camera_alignment_summary(
+    frame_times_s: list[float | None] | None, fps: int
+) -> dict[str, Any]:
+    """Episode-level record of how BOX state was time-aligned to the cameras.
+
+    Surfaces the per-episode camera skew (``sensor_timestamp_ns`` hardware SOF
+    vs the idealized ``N/fps`` grid) into ``meta.json`` so the correction is
+    auditable, not buried in code. See ts_sync.md §5.4 /
+    experiments/ts_sync_skew_20260716/.
+    """
+    if not frame_times_s:
+        return {
+            "mode": "n_over_fps_grid",
+            "note": "no online-sync sidecar / t0_mono; BOX aligned on idealized N/fps",
+        }
+    fps = max(int(fps), 1)
+    deltas = [
+        t - i / fps
+        for i, t in enumerate(frame_times_s)
+        if t is not None and math.isfinite(t)
+    ]
+    if not deltas:
+        return {"mode": "n_over_fps_grid", "frames_with_sof": 0}
+    mean = sum(deltas) / len(deltas)
+    jitter = (sum((d - mean) ** 2 for d in deltas) / len(deltas)) ** 0.5
+    return {
+        "mode": "sensor_timestamp_sof",
+        "reference": "sensor_timestamp_ns/1e9 - t0_mono_s (hardware SOF, CLOCK_MONOTONIC)",
+        "mean_skew_ms": round(mean * 1000.0, 3),
+        "skew_jitter_ms": round(jitter * 1000.0, 3),
+        "frames_with_sof": len(deltas),
+        "frames_total": len(frame_times_s),
+    }
 
 
 def _write_episode_meta(
@@ -1659,6 +1695,12 @@ def main(argv: list[str] | None = None) -> int:
                     handle, cfg, locked, argus_failed, connect_errors,
                     box_cfg, box_snapshots, decision, wall_start, wall_end,
                 )
+                # Hardware SOF frame times (t0-relative) that correct the
+                # BOX↔camera per-episode skew (ts_sync.md §5.4); None for
+                # legacy / no-sidecar data → BOX falls back to the N/fps grid.
+                frame_times = lr3.camera_frame_times_rel(
+                    ep_dir, getattr(handle, "t0_mono_s", None)
+                )
                 try:
                     payload = json.loads(meta_path.read_text())
                     payload["cleanup_duration_s"] = cleanup_duration_s
@@ -1667,6 +1709,9 @@ def main(argv: list[str] | None = None) -> int:
                         payload["argus_frame_sync"] = frame_sync_payload
                     if online_sync_payload is not None:
                         payload["online_sync"] = online_sync_payload
+                    payload["box_camera_alignment"] = _box_camera_alignment_summary(
+                        frame_times, cfg.cameras.fps
+                    )
                     meta_path.write_text(json.dumps(payload, indent=2))
                 except (OSError, json.JSONDecodeError) as exc:
                     logger.warning("failed to annotate cleanup duration: %s", exc)
@@ -1699,6 +1744,7 @@ def main(argv: list[str] | None = None) -> int:
                             sensor_samples=sensor_data,
                             t0_wall_s=t_start,
                             pts_offset_s=pts_offset,
+                            frame_times_s=frame_times,
                         )
                         if v3_path is not None:
                             logger.info("wrote BOX LeRobot v3 rows: %s", v3_path)

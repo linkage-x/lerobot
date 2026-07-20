@@ -285,7 +285,19 @@ host_time = slope × mcu_ts + intercept
 | `argus_online_sync` SOF full-cluster gate | 多视频第 N 帧是否同一次相机曝光/读出 | 保存后才检查或无法证明 | encoder 前只保存同一 SOF cluster；burn-in 最大 spread 0.401ms |
 | legacy 首帧 wall-time 偏移（pts_offset） | splitmux 管道启动延迟（100-500ms 偏移） | 全局偏移 | 偏移 ~主机墙钟精度（亚毫秒~毫秒级） |
 | MCU 时钟校准 | 逐次 poll 随机抖动（1-3ms） | ±1-3ms/样本 | ~1ms/样本（200Hz 主传感器），~2-3ms（50Hz touch） |
+| 相机曝光时刻对齐（2026-07-16） | `N/fps` 与硬件 SOF 之间的 per-episode 固定 skew | −11~−53ms（未量化,逐 episode 变） | ~0（BOX NN 改用 `sensor_timestamp_ns − t0_mono`） |
 | BOX↔相机端到端 | BOX 定时残差 + 最近邻量化 | ±3~13ms | 200Hz 传感器约 ±1-3ms 残差并另叠 ±2.5ms；touch 50Hz 另叠 ±10ms |
+
+> **相机帧 skew（2026-07-16 真机量化 + 修复）**：`N/fps` 网格默认假设相机 frame 0 == `t0` 且恰好 60.000Hz。
+> 但 frame 0 的**选择由软件接收/gate 时序决定,硬件采集发生在更早时刻**：相机持续采集,recorder 收到 START
+> 时管线内已有在途/缓存的 cluster,被留作 frame 0 的那帧其 SOF 早于 `t0` 被锁存(故实测 δ 为负),且缓存深度/启动相位
+> 逐次不同 → frame 0 相对 `t0` 呈**逐 episode 变化的固定相位偏移**。7 条 `water_pouring_20260715_*` episode 实测该 skew
+> **δ = −11 ~ −53ms,逐 episode 变化**（同 session 内也跳）,几乎零漂移（真实帧率 60.000±0.002fps,`N/fps`
+> 漂移 ≤0.07ms/10s,可忽略）。它比 MCU 校准残差大一个量级,给 gripper 注入最高 9mm、给 6D 力最高 4.2N 的
+> state 误差,峰值落在抓取/接触瞬间。因逐 episode 变,**不能用全局常数 offset 修**;最稳健是直接用逐帧 `sensor_timestamp_ns`（还吸收 ~1ms 帧内抖动）,sidecar 不完整时退化为每 episode 线性拟合(offset+slope)外推,而非全局固定 offset。
+> 修复:BOX 最近邻查找目标改用硬件 SOF 采集时刻 `sensor_timestamp_ns/1e9 − t0_mono_s`（`camera_frame_times_rel`）,
+> parquet `timestamp` 列仍 `N/fps`。详见 [`experiments/ts_sync_skew_20260716/`](experiments/ts_sync_skew_20260716/README.md)。
+> **注意**：这只修了训练侧;闭环真正要求「训练对齐 == 部署对齐」,部署侧（frame bus + 实时 BOX）残余 skew 待测（§10 P1）。
 
 > 修正后数值为 2026-06-15 真机实测的回归残差标准差（`recorder_*.log` 的 `MCU clock calibration`）：
 > gripper 1.12ms · imu 1.07ms · trigger 1.07ms · 六维力 1.18ms · touch L 2.02ms · touch R 1.97ms。
@@ -342,8 +354,12 @@ Stop / auto-duration
   ├─ 写 box_sensors.jsonl（原始数据归档）
   └─ 写 LeRobot v3 parquet
        ├─ 逐传感器 MCU 时钟校准（calibrate_sensor_samples 线性回归 + 安全回退）
-       ├─ 帧时间网格 = logical_frame_index / fps
-       └─ 对每帧逐传感器二分查找最近邻 → 组成 state 向量
+       ├─ parquet timestamp 网格 = logical_frame_index / fps（loader 共享网格,不变）
+       ├─ BOX 最近邻查找目标 = 每帧硬件 SOF 采集时刻 sensor_timestamp_ns/1e9 − t0_mono_s
+       │    （camera_frame_times_rel;消除 N/fps 与硬件 SOF 之间的 per-episode 固定 skew,见 §5.4）
+       │    sidecar 空洞/短尾按 SOF 线性拟合外推（单一时间基准,不与 N/fps 拼接,外推帧数会 warn）
+       ├─ 对每帧逐传感器二分查找最近邻 → 组成 state 向量
+       └─ meta.json.box_camera_alignment 记 mode / mean_skew_ms / skew_jitter_ms / frames_with_sof（可审计）
 ```
 
 保存 gate：`online_sync_manifest.ok` 必须为 true，且所有 active camera 的 `frame_count_by_camera` 一致；`missing_frame_policy=fail_episode` 时 recording window 内缺 full cluster 会丢弃该 episode。
@@ -368,6 +384,7 @@ argus_metadata: 写完整视频 + sidecar -> 保存后按 SOF 对齐窗口 -> �
 | **L2c** replay 多视频同步 | 半帧内重同步 | ✅ | GUI timeline 暴露 per-camera file offset；前端以 master timeline time 持续校正其他 `<video>` |
 | **L3a** BOX 高频独立采样 | ±3~13ms | ✅ | 500Hz poll + MCU 时间戳去重 + 逐传感器最近邻 |
 | **L3b** BOX 增强对齐 | ±1~3ms（校准残差；端到端另叠最近邻量化） | ✅ | MCU↔Host 时钟线性回归 + 安全回退 |
+| **L3b+** 相机曝光时刻对齐 | 消掉 per-episode −11~−53ms 固定 skew | ✅ | BOX NN 目标改用 `sensor_timestamp_ns − t0_mono`（`camera_frame_times_rel`,2026-07-16） |
 | **L4** 硬件级全同步 | <1µs | 🔲 | BOX MCU 也由 PWM/硬件 trigger 打戳或触发（需硬件/固件支持） |
 
 ### 7.1 代码位置 & 测试映射
@@ -384,6 +401,7 @@ argus_metadata: 写完整视频 + sidecar -> 保存后按 SOF 对齐窗口 -> �
 | 500Hz poll + MCU 去重 | `box_sdk/box_client.py` `_poll_loop` | `tests/scripts/test_thor_box_client.py` |
 | 帧网格 + 最近邻对齐 | `gmsl2/thor_lerobot_v3.py` `_build_episode_rows` / `_nearest_sample_data` | `tests/scripts/test_thor_ts_sync_alignment.py` |
 | MCU 时钟校准 + 回退 | `gmsl2/thor_lerobot_v3.py` `calibrate_mcu_clock` / `calibrate_sensor_samples` | `tests/scripts/test_thor_ts_sync_alignment.py` |
+| 相机曝光时刻对齐（skew 修复） | `gmsl2/thor_lerobot_v3.py` `camera_frame_times_rel` / `_build_episode_rows(frame_times_s=)`；`thor_record.py` 传参 | `tests/scripts/test_thor_ts_sync_alignment.py` §7–§8；`experiments/ts_sync_skew_20260716/` |
 | ffprobe/GStreamer PTS（离线数帧/QC） | `gmsl2/thor_lerobot_v3.py` `extract_pts`；`gmsl2/export_v3.py` | `tests/scripts/test_thor_lerobot_v3_pts.py` |
 
 > 这些测试覆盖纯 Python 逻辑、stdin 协议、sidecar/manifest 合同和前端时间轴逻辑。相机硬件 SOF spread、Argus provider 稳定性、BOX↔相机端到端 tap-test 仍需要 Thor 真机验证。
@@ -489,7 +507,9 @@ mcu_ts 冗余，已移除（liwp 是包级时间戳，对齐用 per-sensor 更�
 | 2026-07-07 | `argus_online_sync` 8 路 10×60s burn-in | 每路 3600 帧，sidecar 3600 行，max SOF delta 0.401ms，ffmpeg materialization=false |
 | 2026-07-13 | `sync_test_lht_20260707_090407` episode 0 spot check | 8 路 MP4 均 1330 帧 / 60fps；frame 1235 附近 SOF delta 12–13µs；MP4 第 1235 帧 PTS 均 20.583s |
 | 2026-07-13 | Episode Replay | 修复多 `<video>` 独立 clock/seek 容差导致的可见错位；原始视频与 sidecar 本身同步 |
-| 待验 | BOX↔相机跨域 tap-test | 需要设计同时可见于相机和 BOX 触觉/力传感器的事件，量化端到端固定 skew 与 jitter |
+| 2026-07-16 | BOX↔相机固定 skew 量化（7 ep, `water_pouring_20260715_*`） | `N/fps` vs 硬件 SOF δ=−11~−53ms 逐 episode 变；真实帧率 60.000±0.002fps、`N/fps` 漂移可忽略；注入 gripper≤9mm/力≤4.2N。详见 `experiments/ts_sync_skew_20260716/` |
+| 2026-07-16 | 修复:BOX NN 改用 sensor_timestamp（L3b+） | `camera_frame_times_rel`+`_build_episode_rows(frame_times_s=)`；真机数据验证 timestamp 列不变、gripper 修正 max 8.96mm；回归测试 15 passed |
+| 待验 | 部署侧 skew（frame bus + 实时 BOX） | 需先上推理部署,再量化在线路径残余 skew 并与训练侧对齐（§10 P1） |
 
 ## 10. TODO / 后续工作
 
@@ -498,6 +518,6 @@ mcu_ts 冗余，已移除（liwp 是包级时间戳，对齐用 per-sensor 更�
 | 优先级 | TODO | 说明 |
 |--------|------|------|
 | P0 | 在 Thor GUI 实际服务目录重启/发布 replay 修复 | 源码更新后必须重启 gateway/Vite 或重新 build 前端；浏览器需强刷，避免旧 bundle 保留 50ms seek 容差。 |
-| P1 | BOX↔相机 tap-test | 用可见敲击/触觉/力事件验证 `logical_frame_index/fps` 与 BOX 校准时间之间的固定 skew 和 jitter。 |
+| P1 | 部署侧 skew 实测 + 训练/部署对齐 | 训练侧固定 skew 已于 2026-07-16 用 `sensor_timestamp` 量化并修复（δ=−11~−53ms,见 `experiments/ts_sync_skew_20260716/`）。**剩余**:闭环真正要求「训练对齐 == 部署对齐」,而部署走 online frame bus + 实时 BOX 的另一条路径,其残余 skew 尚未实测。**理由:目前还没有做推理部署**,故挂 TODO;届时把在线路径也锚到硬件 SOF 采集时刻基准并量化。原 tap-test 已非必需（skew 可纯数据量化）,仅在需要绝对地锚定 BOX↔相机延迟时再做。 |
 | P2 | frame bus 性能升级（仅在线推理需要） | 纯数据采集落盘无需处理。当前 tmpfs NV12 双缓冲用于实时推理/预览；若 8 路 60Hz 在线推理吞吐吃紧，再升级 CUDA/DMABUF zero-copy IPC 或共享内存 ring buffer。 |
 | P3 | BOX uint32 µs 时间戳 unwrap | 当前短 episode 不受影响；长会话/连续录制前在客户端 poll loop 检测回绕并累加 2^32。 |

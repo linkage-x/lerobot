@@ -322,3 +322,116 @@ def test_multi_box_namespaced_snapshots_expand_state_and_timestamps(tmp_path):
     info = __import__("json").loads((tmp_path / "meta" / "info.json").read_text())
     assert info["features"]["observation.state"]["names"] == list(state_names)
     assert info["features"]["box.timestamps"]["names"] == list(ts_names)
+
+
+# --------------------------------------------------------------------------
+# 7. frame_times_s: BOX nearest-neighbor targets the camera hardware SOF time
+#    (online-sync sidecar) while the timestamp column stays N/fps. Sidecar
+#    gaps/tail extrapolate the SOF fit (single basis, no N/fps splice).
+#    Regression for the per-episode camera skew found on real Thor data
+#    (-11..-53 ms; ts_sync.md §5.4 / experiments/ts_sync_skew_20260716/).
+# --------------------------------------------------------------------------
+
+DELTA_SKEW_S = -0.030   # a realistic per-episode camera skew (frame 0 before t0)
+
+
+def _distances_with_frame_times(frame_times):
+    rows = lr3._build_episode_rows(
+        fps=FPS, episode_index=0, snapshots=[], duration_s=DURATION_S,
+        sensor_samples=_make_gripper_samples(N_SAMPLES), t0_wall_s=T0_WALL_S,
+        pts_offset_s=None, frame_times_s=frame_times,
+    )
+    return rows
+
+
+def test_frame_times_shift_box_lookup_but_not_timestamp():
+    frame_times = [DELTA_SKEW_S + f / FPS for f in range(FRAME_COUNT)]
+    rows = _distances_with_frame_times(frame_times)
+
+    # The BOX sample chosen for each frame is the one nearest the TRUE capture
+    # time (grid shifted by the skew), not the idealized N/fps instant.
+    assert [int(round(r["observation.state"][0])) for r in rows] == _ground_truth(DELTA_SKEW_S)
+    # ...and that genuinely differs from the uncorrected N/fps selection.
+    assert _ground_truth(DELTA_SKEW_S) != _ground_truth(0.0)
+    # The emitted timestamp grid is UNCHANGED (loader contract: frame N == N/fps).
+    assert [r["timestamp"] for r in rows] == pytest.approx([f / FPS for f in range(FRAME_COUNT)])
+
+
+def test_frame_times_none_matches_grid():
+    base = _distances_with_frame_times(None)
+    grid = [int(round(r["observation.state"][0])) for r in base]
+    assert grid == _ground_truth(0.0)
+
+
+def test_frame_times_no_usable_sof_uses_uniform_grid():
+    # With <2 valid SOF entries there is no fit to extrapolate, so the WHOLE
+    # episode stays on a single uniform N/fps grid (no two-basis splice).
+    frame_times = [None] * FRAME_COUNT
+    frame_times[3] = float("nan")
+    rows = _distances_with_frame_times(frame_times)
+    assert [int(round(r["observation.state"][0])) for r in rows] == _ground_truth(0.0)
+
+
+def test_frame_times_interior_gaps_extrapolate_not_grid():
+    # Interior gap frames are filled from the linear SOF fit (same basis),
+    # NOT dropped to N/fps — so the result equals the fully-corrected grid.
+    frame_times = [DELTA_SKEW_S + f / FPS for f in range(FRAME_COUNT)]
+    for f in (4, 5, 17):
+        frame_times[f] = None
+    rows = _distances_with_frame_times(frame_times)
+    assert [int(round(r["observation.state"][0])) for r in rows] == _ground_truth(DELTA_SKEW_S)
+
+
+def test_frame_times_short_tail_extrapolates_single_basis():
+    # A sidecar shorter than the camera clip must extrapolate the SOF fit for
+    # the tail (single time basis), NOT splice N/fps back in. Because the
+    # synthetic SOF is exactly linear, the extrapolated tail reproduces the
+    # fully-corrected grid across ALL frames.
+    frame_times = [DELTA_SKEW_S + f / FPS for f in range(FRAME_COUNT - 4)]
+    rows = _distances_with_frame_times(frame_times)
+    got = [int(round(r["observation.state"][0])) for r in rows]
+    assert got == _ground_truth(DELTA_SKEW_S)
+    # ...and this is genuinely different from the old N/fps-tail behavior.
+    grid = _ground_truth(0.0)
+    assert got[FRAME_COUNT - 4:] != grid[FRAME_COUNT - 4:]
+
+
+# --------------------------------------------------------------------------
+# 8. camera_frame_times_rel: read hardware SOF frame times from the online-sync
+#    sidecar in the t0-relative (monotonic) domain shared with BOX t_rel_s.
+# --------------------------------------------------------------------------
+
+def _write_sidecar(ep_dir, cam, t0_mono, frame0_skew_s, n):
+    ep_dir.mkdir(parents=True, exist_ok=True)
+    header = ("camera,logical_frame_index,local_frame_number,sensor_timestamp_ns,"
+              "sof_tsc_ns,eof_tsc_ns,internal_frame_count\n")
+    lines = [header]
+    for i in range(n):
+        sens_ns = int((t0_mono + frame0_skew_s + i / FPS) * 1e9)
+        sof_ns = sens_ns + 26_600_000_000            # separate TSC domain (must be ignored)
+        lines.append(f"{cam},{i},{i + 33},{sens_ns},{sof_ns},{sof_ns + 14_000},{i + 62}\n")
+    (ep_dir / f"{cam}.argus_frame_metadata.csv").write_text("".join(lines))
+
+
+def test_camera_frame_times_rel_reads_sidecar(tmp_path):
+    t0_mono = 6782.984511942
+    # Two PWM-locked cameras share the same sensor_timestamp per logical frame.
+    _write_sidecar(tmp_path, "cam_00", t0_mono, -0.0535, 4)
+    _write_sidecar(tmp_path, "cam_06", t0_mono, -0.0535, 4)
+
+    ft = lr3.camera_frame_times_rel(tmp_path, t0_mono)
+    assert ft is not None and len(ft) == 4
+    # time[N] = sensor_timestamp_ns/1e9 - t0_mono ; frame 0 is 53.5 ms before t0.
+    assert ft[0] == pytest.approx(-0.0535, abs=1e-6)
+    assert ft[1] == pytest.approx(-0.0535 + 1 / FPS, abs=1e-6)
+    # sof_tsc_ns (separate 26.6 s-offset TSC domain) must NOT leak in.
+    assert all(abs(t) < 1.0 for t in ft)
+
+
+def test_camera_frame_times_rel_fallbacks(tmp_path):
+    _write_sidecar(tmp_path, "cam_00", 6782.984511942, -0.02, 3)
+    # Missing t0_mono → None (caller falls back to N/fps).
+    assert lr3.camera_frame_times_rel(tmp_path, None) is None
+    assert lr3.camera_frame_times_rel(tmp_path, 0.0) is None
+    # No sidecar in the directory → None.
+    assert lr3.camera_frame_times_rel(tmp_path / "no_such_ep", 6782.98) is None
