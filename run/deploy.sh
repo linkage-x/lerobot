@@ -12,6 +12,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 THOR="nvidia@192.168.111.122"
 THOR_DIR="~/lerobot"
 GATEWAY_LOG="/tmp/gateway.log"
+CALIBRATION_PATHS=(
+  "outputs/calibration/thor_gmsl2_intrinisics_dict_0720"
+  "outputs/calibration/thor_gmsl2_extrinisics_robot_base_0720"
+)
 
 sync_only=false
 no_frontend=false
@@ -25,6 +29,23 @@ done
 # ---- 1. Sync ----
 echo "==> Syncing to ${THOR}..."
 bash "$SCRIPT_DIR/sync_to_thor.sh"
+
+# The general repo sync deliberately excludes outputs/. The gateway's EE
+# trajectory job needs these exact calibration folders, so stage them
+# explicitly before either --sync-only exits or the gateway restarts.
+echo "==> Syncing EE-trajectory calibration inputs to ${THOR}..."
+for calibration_path in "${CALIBRATION_PATHS[@]}"; do
+  local_calibration_dir="${REPO_ROOT}/${calibration_path}"
+  if [[ ! -f "${local_calibration_dir}/summary.json" ]]; then
+    echo "ERROR: calibration summary not found: ${local_calibration_dir}/summary.json" >&2
+    exit 1
+  fi
+  remote_calibration_dir="${THOR_DIR}/${calibration_path}"
+  remote_mkdir_path="${remote_calibration_dir}"
+  [[ "${remote_mkdir_path}" == "~/"* ]] && remote_mkdir_path="\$HOME/${remote_mkdir_path#\~/}"
+  ssh -o ConnectTimeout=5 "${THOR}" "mkdir -p \"${remote_mkdir_path}\""
+  rsync -avz "${local_calibration_dir}/" "${THOR}:${THOR_DIR}/${calibration_path}/"
+done
 
 if $sync_only; then
   exit 0
