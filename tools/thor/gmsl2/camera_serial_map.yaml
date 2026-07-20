@@ -1,0 +1,9 @@
+# Physical camera serial numbers mapped to Thor/Argus logical camera names.
+camera_serial_by_name:
+  cam_06: H120K-I05130029
+  cam_07: H120K-I05130066
+  cam_08: H120K-I05130024
+  cam_09: H120K-I05130058
+  cam_12: H120K-I05130067
+  cam_13: H120K-I05130031
+  cam_14: H120K-I05130057
