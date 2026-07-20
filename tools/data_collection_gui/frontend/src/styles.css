@@ -263,6 +263,30 @@ button.danger {
   white-space: nowrap;
 }
 
+/* Global Connect/Disconnect embedded in the Recorder status pill. */
+.topbar-recorder { gap: 8px; padding-right: 4px; }
+.topbar-btn {
+  background: #eef2f5;
+  border: 1px solid #cfd8de;
+  border-radius: 999px;
+  color: #1f2a30;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 5px 11px;
+}
+.topbar-btn:hover:not(:disabled) { background: #e2e8ec; }
+.topbar-btn:disabled { cursor: not-allowed; opacity: 0.5; }
+.topbar-btn-primary { background: #0f766e; border-color: #0f766e; color: #fff; }
+.topbar-btn-primary:hover:not(:disabled) { background: #0b5f5a; border-color: #0b5f5a; }
+
+/* Dashboard hub helpers. */
+.dashboard-inline-status { align-items: center; display: inline-flex; gap: 8px; }
+.dashboard-muted { color: #94a3b8; font-size: 12px; }
+.dashboard-device-list { display: flex; flex-direction: column; gap: 6px; list-style: none; margin: 0; padding: 0; }
+.dashboard-device-list li { align-items: center; display: flex; gap: 8px; }
+
 .layout {
   display: grid;
   gap: 14px;

@@ -3,8 +3,9 @@ import { type GuiSnapshot } from "./api";
 import { api } from "./apiClient";
 import "./styles.css";
 import type { CollectionTask, EpisodeAnnotation, ProcessingItem } from "./types";
-import { StatusDot, Metric, processingStatusLabel, taskNeedsQcExportConfirmation } from "./shared/ui";
+import { StatusDot, Metric, stateLabel, processingStatusLabel, taskNeedsQcExportConfirmation } from "./shared/ui";
 import { CalibrationPage } from "./calibration/CalibrationPage";
+import { DashboardPage } from "./pages/DashboardPage";
 import { historyRepo, deviceBoxId } from "./calibration/adapters";
 import { summarizeKinds } from "./calibration/status";
 import type { CalibrationKind } from "./calibration/types";
@@ -33,6 +34,7 @@ export type PageId =
 type PageMeta = { id: PageId; label: string; kind: "mvp" | "deferred" };
 
 const mvpPages: PageMeta[] = [
+  { id: "dashboard", label: "Dashboard", kind: "mvp" },
   { id: "live-record", label: "Live Record", kind: "mvp" },
   { id: "dataset-processing", label: "Dataset Processing", kind: "mvp" },
   { id: "episode-replay", label: "Episode Replay", kind: "mvp" },
@@ -43,7 +45,6 @@ const mvpPages: PageMeta[] = [
 ];
 
 const deferredPages: PageMeta[] = [
-  { id: "dashboard", label: "Dashboard", kind: "deferred" },
   { id: "qc-report", label: "QC Report", kind: "deferred" },
   { id: "model-evaluation", label: "Model Evaluation", kind: "deferred" },
   { id: "annotation-audit", label: "Annotation & Audit", kind: "deferred" }
@@ -68,7 +69,7 @@ const deferredNavIds: PageId[] = ["qc-report", "model-evaluation", "annotation-a
 
 function pageFromHash(): PageId {
   const hash = window.location.hash.replace(/^#\/?/, "") as PageId;
-  return pages.some((page) => page.id === hash) ? hash : "live-record";
+  return pages.some((page) => page.id === hash) ? hash : "dashboard";
 }
 
 
@@ -134,6 +135,14 @@ function App() {
   }
 
   const activeMeta = pages.find((page) => page.id === activePage) ?? mvpPages[0];
+
+  // The recorder session is a global prerequisite (it streams the box/camera
+  // live data Calibration and Device Manager also consume), so Connect/Disconnect
+  // lives in the topbar next to the Recorder status -- not only in Live Record.
+  const recorderConnected = ["connecting", "armed", "recording", "review", "saving", "discarding"].includes(
+    snapshot.recording.state,
+  );
+  const recorderWriting = ["recording", "saving", "discarding"].includes(snapshot.recording.state);
 
   async function selectAndOpenReplay(path: string) {
     await run(() => api.selectRecordedDataset(path));
@@ -263,6 +272,13 @@ function App() {
       />
     ) : activePage === "device-manager" ? (
       <DeviceManagerPage snapshot={snapshot} />
+    ) : activePage === "dashboard" ? (
+      <DashboardPage
+        snapshot={snapshot}
+        busy={busy}
+        onConnect={() => run(() => api.connectRecording())}
+        onNavigate={navigate}
+      />
     ) : (
       <PlaceholderPage title={activeMeta.label} />
     );
@@ -280,7 +296,28 @@ function App() {
         </div>
         <div className="topbar-status">
           <span><StatusDot state={snapshot.gateway.state === "online" ? "running" : "warning"} /> Gateway {snapshot.gateway.state}</span>
-          <span><StatusDot state={snapshot.recording.state} /> Recorder</span>
+          <span className="topbar-recorder">
+            <StatusDot state={snapshot.recording.state} /> Recorder {stateLabel(snapshot.recording.state)}
+            {recorderConnected ? (
+              <button
+                className="topbar-btn"
+                disabled={busy || recorderWriting}
+                title={recorderWriting ? "录制进行中：请先在 Live Record 保存/停止" : "断开录制器会话"}
+                onClick={() => run(() => api.stopRecording("exit"))}
+              >
+                Disconnect
+              </button>
+            ) : (
+              <button
+                className="topbar-btn topbar-btn-primary"
+                disabled={busy}
+                title="连接录制器（按当前绑定 Task 启动，供录制 / 标定 / 设备预览共用）"
+                onClick={() => run(() => api.connectRecording())}
+              >
+                Connect
+              </button>
+            )}
+          </span>
           {snapshot.configSummary.hardwareSync && (
             <span>
               <StatusDot state={snapshot.configSummary.hardwareSync.enabled ? "running" : "warning"} />

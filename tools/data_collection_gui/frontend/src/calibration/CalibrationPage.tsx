@@ -190,7 +190,7 @@ export function CalibrationPage({
       {boxDevices.length === 0 && (
         <section className="panel">
           <p className="cali-muted">
-            未检测到 BOX 传感器。请先在「设备 · Device Manager」连接 GMSL2/BOX 录制器。
+            未检测到 BOX 传感器。请先点顶栏的「Connect」连接 GMSL2/BOX 录制器（录制器供录制 / 标定 / 设备预览共用）。
           </p>
         </section>
       )}
