@@ -2357,8 +2357,23 @@ button.danger {
   border-radius: 8px;
   display: grid;
   gap: 10px;
-  grid-template-columns: 28px minmax(0, 1fr) auto auto;
+  grid-template-columns: 28px minmax(0, 1fr) auto auto auto;
   padding: 8px 12px;
+}
+.cali-readiness-action {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.cali-mini-btn {
+  font-size: 12px;
+  min-height: 28px;
+  padding: 0 8px;
+}
+@media (max-width: 900px) {
+  .cali-readiness-row { grid-template-columns: 28px minmax(0, 1fr) auto; }
+  .cali-readiness-row .cali-readiness-detail { grid-column: 2 / -1; text-align: left; }
+  .cali-readiness-action { grid-column: 2 / -1; }
 }
 .cali-readiness-row.cali-readiness-failed { border-color: #eabfab; background: #fdf3ee; }
 .cali-readiness-row.cali-readiness-warning { border-color: #ecd7a6; background: #fdf8ee; }

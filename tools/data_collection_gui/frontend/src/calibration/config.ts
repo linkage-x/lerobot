@@ -107,6 +107,21 @@ export function envTargetLabel(): string {
   return `${tLo}–${tHi} ℃ / ${hLo}–${hHi} %RH（目标范围）`;
 }
 
+// --- Warm-up (operator-driven; no power-on timestamp from the SDK) -----------
+// The box exposes no boot time, so warm-up is a per-box operator timer: start
+// it on power-on, or confirm "already warm" to skip. 30 min per the checklist.
+export const WARMUP_MS = 30 * MS.minute;
+
+// --- Tactile full-scale activation (operator-driven, detected from live data)--
+// The SDK exposes no activation counter, so we guide the operator to press each
+// pad to full scale 3× and detect each press from the live max-taxel reading
+// with hysteresis (activate high, release low), counting up to the target.
+export const TACTILE_ACTIVATION_TARGET = 3;
+/** Max single-taxel value (0.1 N units) that counts as a full-scale press. */
+export const TACTILE_ACTIVATE_0p1N = 150; // ~15 N
+/** Must fall back below this (0.1 N units) before the next press is counted. */
+export const TACTILE_RELEASE_0p1N = 50; // ~5 N
+
 // --- Async safety -------------------------------------------------------------
 /** A calibration request that streams no terminal line within this window fails. */
 export const CALIBRATION_TIMEOUT_MS = 45_000;

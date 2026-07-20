@@ -2,6 +2,7 @@
 // `types.ts` (which mirrors the gateway snapshot) so calibration-only concepts
 // don't leak into the transport types.
 
+import type { ReactNode } from "react";
 import type { CalibrationKind } from "./config";
 
 export type { CalibrationKind };
@@ -134,6 +135,8 @@ export type ReadinessItem = {
   detail: string;
   /** Set when the datum is not yet available from the backend. */
   todo?: string;
+  /** Optional interactive controls (e.g. start-timer / confirm / reset). */
+  action?: ReactNode;
 };
 
 // --- Calibration history record (spec §11) -----------------------------------

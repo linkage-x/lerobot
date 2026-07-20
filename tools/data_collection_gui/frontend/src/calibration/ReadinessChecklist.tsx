@@ -50,6 +50,7 @@ export function ReadinessChecklist({ items }: { items: ReadinessItem[] }) {
             <span className={`cali-readiness-state cali-readiness-state-${item.state}`}>
               {STATE_TEXT[item.state]}
             </span>
+            {item.action && <div className="cali-readiness-action">{item.action}</div>}
             {item.todo && <small className="cali-readiness-todo">TODO：{item.todo}</small>}
           </div>
         ))}

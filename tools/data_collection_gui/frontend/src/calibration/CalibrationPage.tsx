@@ -18,13 +18,12 @@ import {
   deviceBoxId,
   firmwareVersion,
   historyRepo,
-  readinessTactileActivation,
-  readinessWarmup,
   softwareVersion,
 } from "./adapters";
 import { computeValidity } from "./status";
 import type { CalibrationKind, CalibrationRecord, ReadinessItem } from "./types";
 import { ReadinessChecklist } from "./ReadinessChecklist";
+import { useTactileActivation, useWarmup } from "./useReadiness";
 import { ForceSensorCard, TactileSensorCard } from "./SensorMonitors";
 import { ForceCalibrationCard, TactileCalibrationCard } from "./CalibrationCards";
 import { CalibrationLogPanel, toLogEntries } from "./CalibrationLogPanel";
@@ -33,7 +32,11 @@ import { MultiCameraCalibrationPanel } from "./MultiCameraCalibrationPanel";
 
 const OPERATOR_KEY = "lerobot.calibration.operator";
 
-const RECORDING_BLOCK_STATES = new Set(["recording", "saving", "discarding", "armed"]);
+// Only block calibration while the recorder is ACTIVELY writing an episode.
+// "armed" (Connected, waiting to start) and "review" (episode finished, awaiting
+// save/discard) are connected-but-not-recording, so they must NOT block — a
+// successful Connect does not mean data is being recorded.
+const RECORDING_BLOCK_STATES = new Set(["recording", "saving", "discarding"]);
 
 function useNow(intervalMs = 1000): number {
   const [now, setNow] = useState(() => Date.now());
@@ -127,43 +130,6 @@ export function CalibrationPage({
     return null;
   };
 
-  const historyByKind = (kind: CalibrationKind) => records.filter((r) => r.kind === kind);
-  const latestByKind: Partial<Record<CalibrationKind, number | null>> = {
-    force_origin: historyByKind("force_origin")[0]?.timestamp ?? null,
-    force_dynamic: historyByKind("force_dynamic")[0]?.timestamp ?? null,
-    touch: historyByKind("touch")[0]?.timestamp ?? null,
-  };
-  const validitySummary = summarizeKinds(latestByKind, now);
-
-  // --- readiness items -------------------------------------------------------
-  const readiness: ReadinessItem[] = [
-    {
-      id: "box-connected",
-      label: "BOX 已连接",
-      state: boxOnline ? "complete" : "pending",
-      detail: boxOnline ? "在线" : "未连接",
-    },
-    readinessWarmup(),
-    readinessTactileActivation(),
-    readinessEnvironment(),
-    {
-      id: "cali-valid",
-      label: "所有必须标定的传感器仍在有效期",
-      state:
-        validitySummary.overdue > 0 || validitySummary.unknown > 0
-          ? "failed"
-          : validitySummary.dueSoon > 0
-            ? "warning"
-            : "complete",
-      detail:
-        validitySummary.overdue + validitySummary.unknown > 0
-          ? `${validitySummary.overdue + validitySummary.unknown} 项需标定`
-          : validitySummary.dueSoon > 0
-            ? `${validitySummary.dueSoon} 项即将过期`
-            : "全部有效",
-    },
-  ];
-
   const logEntries = useMemo(() => toLogEntries(forceLog, touchLog), [forceLog, touchLog]);
 
   return (
@@ -177,6 +143,7 @@ export function CalibrationPage({
           </span>
           <span className="cali-statusbar-item">BOX ID：{boxIdLabel}</span>
           <span className="cali-statusbar-item">GUI {softwareVersion()}</span>
+          <span className="cali-statusbar-item">环境 {envTargetLabel()}</span>
           <span className="cali-statusbar-item">{fmtTimestamp(now)}</span>
           <span className="cali-statusbar-item">
             采集：{snapshot.recording.state}
@@ -199,79 +166,26 @@ export function CalibrationPage({
         </div>
       </section>
 
-      <ReadinessChecklist items={readiness} />
-
       <MultiCameraCalibrationPanel
         status={snapshot.calibration}
         busy={busy}
         onRun={onRunMultiCameraCalibration}
       />
 
-      {/* --- per-BOX groups: monitors + calibration nested by device (spec §3-6) --- */}
-      {boxGroups.map((group) => {
-        const online = group.devices.filter((d) => d.state === "running").length;
-        const fw = firmwareVersion(group.devices);
-        const sn = boxSerial(group.devices);
-        return (
-          <section className="panel cali-box-panel" key={group.boxId || "single"}>
-            <div className="panel-heading">
-              <h2>BOX {boxDisplayName(group.boxId)}</h2>
-              <span>
-                固件 {fw}
-                {sn ? ` · SN ${sn}` : ""} · {online}/{group.devices.length} 在线
-              </span>
-            </div>
-
-            {/* live monitors for this box */}
-            <div className="cali-monitor-grid">
-              {group.force.map((d) => (
-                <ForceSensorCard key={d.id} api={api} device={d} />
-              ))}
-              {group.touch.map((d) => (
-                <TactileSensorCard key={d.id} api={api} device={d} />
-              ))}
-            </div>
-
-            {/* calibration operations for this box */}
-            {group.force.length > 0 && (
-              <div className="cali-op-grid">
-                <ForceCalibrationCard
-                  variant="origin"
-                  api={api}
-                  boxId={group.boxId}
-                  devices={group.force}
-                  operator={operator}
-                  guard={guard}
-                  onRecord={onRecord}
-                  history={historyFor("force_origin", group.boxId)}
-                />
-                <ForceCalibrationCard
-                  variant="dynamic"
-                  api={api}
-                  boxId={group.boxId}
-                  devices={group.force}
-                  operator={operator}
-                  guard={guard}
-                  onRecord={onRecord}
-                  history={historyFor("force_dynamic", group.boxId)}
-                />
-              </div>
-            )}
-
-            {group.touch.length > 0 && (
-              <TactileCalibrationCard
-                api={api}
-                boxId={group.boxId}
-                devices={group.touch}
-                operator={operator}
-                guard={guard}
-                onRecord={onRecord}
-                history={historyFor("touch", group.boxId)}
-              />
-            )}
-          </section>
-        );
-      })}
+      {/* --- per-BOX groups: readiness + monitors + calibration by device --- */}
+      {boxGroups.map((group) => (
+        <BoxCalibrationGroup
+          key={group.boxId || "single"}
+          api={api}
+          group={group}
+          operator={operator}
+          guard={guard}
+          onRecord={onRecord}
+          historyFor={historyFor}
+          now={now}
+          recorderConnected={recorderConnected}
+        />
+      ))}
 
       {boxDevices.length === 0 && (
         <section className="panel">
@@ -291,5 +205,179 @@ export function CalibrationPage({
         }}
       />
     </div>
+  );
+}
+
+type BoxGroup = {
+  boxId: string;
+  devices: DeviceStatus[];
+  force: DeviceStatus[];
+  touch: DeviceStatus[];
+};
+
+// One BOX device group: its own readiness (connected / warm-up timer / tactile
+// activation / validity), live monitors, and calibration cards. Extracted so the
+// per-box readiness hooks (useWarmup / useTactileActivation) obey the rules of
+// hooks — they can't be called inside the boxGroups.map() callback.
+function BoxCalibrationGroup({
+  api,
+  group,
+  operator,
+  guard,
+  onRecord,
+  historyFor,
+  now,
+  recorderConnected,
+}: {
+  api: DataCollectionGuiApi;
+  group: BoxGroup;
+  operator: string;
+  guard: () => string | null;
+  onRecord: (records: CalibrationRecord[]) => void;
+  historyFor: (kind: CalibrationKind, bid: string) => CalibrationRecord[];
+  now: number;
+  recorderConnected: boolean;
+}) {
+  const bid = group.boxId;
+  const hasTouch = group.touch.length > 0;
+  const online = group.devices.some((d) => d.state === "running") || recorderConnected;
+  const fw = firmwareVersion(group.devices);
+  const sn = boxSerial(group.devices);
+
+  const warmup = useWarmup(bid, now);
+  const tactile = useTactileActivation(api, bid, group.touch, hasTouch);
+
+  // This box's calibration validity, across only the kinds it actually has.
+  const kinds: CalibrationKind[] = [
+    ...(group.force.length ? (["force_origin", "force_dynamic"] as CalibrationKind[]) : []),
+    ...(hasTouch ? (["touch"] as CalibrationKind[]) : []),
+  ];
+  const validityStates = kinds.map((k) => computeValidity(historyFor(k, bid)[0]?.timestamp ?? null, k).state);
+  const needs = validityStates.filter((s) => s === "overdue" || s === "unknown").length;
+  const due = validityStates.filter((s) => s === "due_soon").length;
+
+  const warmupAction =
+    warmup.state === "complete" ? (
+      <button className="cali-mini-btn" onClick={warmup.reset}>
+        重置
+      </button>
+    ) : (
+      <>
+        {!warmup.running && (
+          <button className="cali-mini-btn" onClick={warmup.start}>
+            开始计时
+          </button>
+        )}
+        <button className="cali-mini-btn" onClick={warmup.confirm}>
+          确认已预热
+        </button>
+        {warmup.running && (
+          <button className="cali-mini-btn" onClick={warmup.reset}>
+            重置
+          </button>
+        )}
+      </>
+    );
+
+  const items: ReadinessItem[] = [
+    {
+      id: `${bid}-connected`,
+      label: "BOX 已连接",
+      state: online ? "complete" : "pending",
+      detail: online ? "在线" : "未连接",
+    },
+    {
+      id: `${bid}-warmup`,
+      label: "设备已预热 30 分钟",
+      state: warmup.state,
+      detail: warmup.detail,
+      action: warmupAction,
+    },
+    ...(hasTouch
+      ? [
+          {
+            id: `${bid}-tactile`,
+            label: "触觉已完成 3 次满量程激活",
+            state: tactile.state,
+            detail: tactile.detail,
+            action: (
+              <button className="cali-mini-btn" disabled={tactile.count === 0} onClick={tactile.reset}>
+                重置计数
+              </button>
+            ),
+          } satisfies ReadinessItem,
+        ]
+      : []),
+    {
+      id: `${bid}-valid`,
+      label: "必须标定仍在有效期",
+      state: needs > 0 ? "failed" : due > 0 ? "warning" : kinds.length ? "complete" : "unavailable",
+      detail:
+        needs > 0 ? `${needs} 项需标定` : due > 0 ? `${due} 项即将过期` : kinds.length ? "全部有效" : "无可标定传感器",
+    },
+  ];
+
+  return (
+    <section className="panel cali-box-panel">
+      <div className="panel-heading">
+        <h2>BOX {boxDisplayName(bid)}</h2>
+        <span>
+          固件 {fw}
+          {sn ? ` · SN ${sn}` : ""} · {group.devices.filter((d) => d.state === "running").length}/
+          {group.devices.length} 在线
+        </span>
+      </div>
+
+      {/* per-box collection readiness */}
+      <ReadinessChecklist items={items} />
+
+      {/* live monitors for this box */}
+      <div className="cali-monitor-grid">
+        {group.force.map((d) => (
+          <ForceSensorCard key={d.id} api={api} device={d} />
+        ))}
+        {group.touch.map((d) => (
+          <TactileSensorCard key={d.id} api={api} device={d} />
+        ))}
+      </div>
+
+      {/* calibration operations for this box */}
+      {group.force.length > 0 && (
+        <div className="cali-op-grid">
+          <ForceCalibrationCard
+            variant="origin"
+            api={api}
+            boxId={bid}
+            devices={group.force}
+            operator={operator}
+            guard={guard}
+            onRecord={onRecord}
+            history={historyFor("force_origin", bid)}
+          />
+          <ForceCalibrationCard
+            variant="dynamic"
+            api={api}
+            boxId={bid}
+            devices={group.force}
+            operator={operator}
+            guard={guard}
+            onRecord={onRecord}
+            history={historyFor("force_dynamic", bid)}
+          />
+        </div>
+      )}
+
+      {hasTouch && (
+        <TactileCalibrationCard
+          api={api}
+          boxId={bid}
+          devices={group.touch}
+          operator={operator}
+          guard={guard}
+          onRecord={onRecord}
+          history={historyFor("touch", bid)}
+        />
+      )}
+    </section>
   );
 }
