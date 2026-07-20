@@ -207,7 +207,6 @@ function App() {
         onOpenInReplay={() => selectAndOpenReplay(latestRecordedPath)}
         onQueueTrajGen={() => queueTrajGenAndOpenProcessing(firstMissingPath)}
         onGoToProcessing={() => navigate("dataset-processing")}
-        onRunCalibration={() => run(() => api.runCalibration())}
         onClearActiveTask={() => run(() => api.setActiveTask(""))}
       />
     ) : activePage === "dataset-processing" ? (
@@ -256,7 +255,12 @@ function App() {
         onNavigate={navigate}
       />
     ) : activePage === "calibration" ? (
-      <CalibrationPage snapshot={snapshot} api={api} />
+      <CalibrationPage
+        snapshot={snapshot}
+        api={api}
+        busy={busy}
+        onRunMultiCameraCalibration={() => run(() => api.runCalibration())}
+      />
     ) : activePage === "device-manager" ? (
       <DeviceManagerPage snapshot={snapshot} />
     ) : (

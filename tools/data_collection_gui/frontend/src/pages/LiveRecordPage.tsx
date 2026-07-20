@@ -214,51 +214,6 @@ export function RecordingPanel({
 
 
 
-export function CalibrationPanel({
-  status,
-  busy,
-  onRun
-}: {
-  status: GuiSnapshot["calibration"];
-  busy: boolean;
-  onRun: () => void;
-}) {
-  const cameraCount = status.cameras.length;
-  return (
-    <section className="panel calibration-panel">
-      <div className="panel-heading">
-        <h2>Multi-Camera Calibration</h2>
-        <span className="state-pill">
-          <StatusDot state={status.state === "complete" ? "running" : status.state === "failed" ? "error" : status.state === "running" ? "warning" : "idle"} />
-          {stateLabel(status.state)}
-        </span>
-      </div>
-      <div className="control-row">
-        <button disabled={busy || status.state === "running"} onClick={onRun}>
-          {status.state === "complete" || status.state === "failed" ? "Re-run Calibration" : "Run Calibration"}
-        </button>
-        <span className="calibration-pattern">pattern: {status.pattern}</span>
-      </div>
-      <p className="panel-note">{status.message}</p>
-      {cameraCount > 0 ? (
-        <div className="check-table calibration-table">
-          {status.cameras.map((camera) => (
-            <div className="check-row" key={camera.id}>
-              <strong>{camera.id}</strong>
-              <span>repro {camera.reprojectionMm.toFixed(3)} mm · baseline {camera.baselineMm.toFixed(1)} mm</span>
-              <em>{camera.status}</em>
-            </div>
-          ))}
-        </div>
-      ) : null}
-      <div className="summary-grid">
-        <Metric label="Last run" value={status.lastRunAt || "—"} />
-        <Metric label="Output" value={status.outputPath || "—"} />
-      </div>
-    </section>
-  );
-}
-
 export function LiveRecordPage({
   snapshot,
   busy,
@@ -268,7 +223,6 @@ export function LiveRecordPage({
   onOpenInReplay,
   onQueueTrajGen,
   onGoToProcessing,
-  onRunCalibration,
   onClearActiveTask
 }: {
   snapshot: GuiSnapshot;
@@ -279,7 +233,6 @@ export function LiveRecordPage({
   onOpenInReplay: () => void;
   onQueueTrajGen: () => void;
   onGoToProcessing: () => void;
-  onRunCalibration: () => void;
   onClearActiveTask: () => void;
 }) {
   const showSavedBanner = snapshot.recording.savedEpisodes > 0;
@@ -356,7 +309,6 @@ export function LiveRecordPage({
         <RecordingPanel status={snapshot.recording} config={snapshot.configSummary} busy={busy} onConnect={onConnect} onStart={onStart} onStop={onStop} logLines={logLines} />
         <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />
       </div>
-      <CalibrationPanel status={snapshot.calibration} busy={busy} onRun={onRunCalibration} />
       {showSavedBanner ? (
         <section className="panel saved-cta">
           <div className="panel-heading">

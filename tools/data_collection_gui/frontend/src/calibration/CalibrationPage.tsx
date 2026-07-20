@@ -18,18 +18,18 @@ import {
   deviceBoxId,
   firmwareVersion,
   historyRepo,
-  readinessEnvironment,
   readinessTactileActivation,
   readinessWarmup,
   softwareVersion,
 } from "./adapters";
-import { computeValidity, summarizeKinds } from "./status";
+import { computeValidity } from "./status";
 import type { CalibrationKind, CalibrationRecord, ReadinessItem } from "./types";
 import { ReadinessChecklist } from "./ReadinessChecklist";
 import { ForceSensorCard, TactileSensorCard } from "./SensorMonitors";
 import { ForceCalibrationCard, TactileCalibrationCard } from "./CalibrationCards";
 import { CalibrationLogPanel, toLogEntries } from "./CalibrationLogPanel";
 import { CalibrationHistory } from "./CalibrationHistory";
+import { MultiCameraCalibrationPanel } from "./MultiCameraCalibrationPanel";
 
 const OPERATOR_KEY = "lerobot.calibration.operator";
 
@@ -47,9 +47,13 @@ function useNow(intervalMs = 1000): number {
 export function CalibrationPage({
   snapshot,
   api,
+  busy,
+  onRunMultiCameraCalibration,
 }: {
   snapshot: GuiSnapshot;
   api: DataCollectionGuiApi;
+  busy: boolean;
+  onRunMultiCameraCalibration: () => void;
 }) {
   const now = useNow();
   const [operator, setOperator] = useState<string>(
@@ -196,6 +200,12 @@ export function CalibrationPage({
       </section>
 
       <ReadinessChecklist items={readiness} />
+
+      <MultiCameraCalibrationPanel
+        status={snapshot.calibration}
+        busy={busy}
+        onRun={onRunMultiCameraCalibration}
+      />
 
       {/* --- per-BOX groups: monitors + calibration nested by device (spec §3-6) --- */}
       {boxGroups.map((group) => {
