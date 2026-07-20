@@ -152,14 +152,6 @@ public:
         return buffer;
     }
 
-    static DmaBuffer* from_argus_buffer(Buffer* buffer) {
-        IBuffer* i_buffer = interface_cast<IBuffer>(buffer);
-        if (!i_buffer) {
-            return nullptr;
-        }
-        const DmaBuffer* dma = static_cast<const DmaBuffer*>(i_buffer->getClientData());
-        return const_cast<DmaBuffer*>(dma);
-    }
 
     ~DmaBuffer() {
         if (m_fd >= 0) {
@@ -169,14 +161,47 @@ public:
     }
 
     int get_fd() const { return m_fd; }
-    void set_argus_buffer(Buffer* buffer) { argus_buffer_ = buffer; }
+    void set_argus_buffer(Buffer* buffer, IBuffer* i_buffer) {
+        argus_buffer_ = buffer;
+        argus_i_buffer_ = i_buffer;
+    }
     Buffer* get_argus_buffer() const { return argus_buffer_; }
+    IBuffer* get_argus_i_buffer() const { return argus_i_buffer_; }
+    const ICaptureMetadata* get_capture_metadata_interface(const CaptureMetadata* metadata) {
+        refresh_metadata_interfaces(metadata);
+        return i_capture_metadata_;
+    }
+    const Ext::ISensorTimestampTsc* get_sensor_timestamp_tsc_interface(const CaptureMetadata* metadata) {
+        refresh_metadata_interfaces(metadata);
+        return i_sensor_timestamp_tsc_;
+    }
+    const Ext::IInternalFrameCount* get_internal_frame_count_interface(const CaptureMetadata* metadata) {
+        refresh_metadata_interfaces(metadata);
+        return i_internal_frame_count_;
+    }
 
 private:
     explicit DmaBuffer(const Size2D<uint32_t>& size)
-        : NvNativeBuffer(size), NvBuffer(0, 0), argus_buffer_(nullptr) {}
+        : NvNativeBuffer(size), NvBuffer(0, 0), argus_buffer_(nullptr), argus_i_buffer_(nullptr),
+          cached_metadata_(nullptr), i_capture_metadata_(nullptr), i_sensor_timestamp_tsc_(nullptr),
+          i_internal_frame_count_(nullptr) {}
+
+    void refresh_metadata_interfaces(const CaptureMetadata* metadata) {
+        if (metadata == cached_metadata_) {
+            return;
+        }
+        cached_metadata_ = metadata;
+        i_capture_metadata_ = interface_cast<const ICaptureMetadata>(metadata);
+        i_sensor_timestamp_tsc_ = interface_cast<const Ext::ISensorTimestampTsc>(metadata);
+        i_internal_frame_count_ = interface_cast<const Ext::IInternalFrameCount>(metadata);
+    }
 
     Buffer* argus_buffer_;
+    IBuffer* argus_i_buffer_;
+    const CaptureMetadata* cached_metadata_;
+    const ICaptureMetadata* i_capture_metadata_;
+    const Ext::ISensorTimestampTsc* i_sensor_timestamp_tsc_;
+    const Ext::IInternalFrameCount* i_internal_frame_count_;
 };
 
 std::vector<uint32_t> parse_sids(const std::string& value) {
@@ -1072,7 +1097,7 @@ bool allocate_argus_buffers(CamCtx* cam, const Size2D<uint32_t>& resolution) {
             return false;
         }
         i_buffer->setClientData(dma.get());
-        dma->set_argus_buffer(argus_buffer.get());
+        dma->set_argus_buffer(argus_buffer.get(), i_buffer);
         if (cam->i_buffer_stream->releaseBuffer(argus_buffer.get()) != STATUS_OK) {
             std::cerr << cam->name << ": failed to release initial Argus Buffer" << std::endl;
             return false;
@@ -1184,15 +1209,26 @@ bool init_camera(ICameraProvider* provider, UniqueObj<CameraProvider>& provider_
     return true;
 }
 
-bool extract_metadata(Buffer* buffer, FrameMetadata* out) {
-    IBuffer* i_buffer = interface_cast<IBuffer>(buffer);
-    if (!i_buffer) {
+DmaBuffer* find_dma_for_argus_buffer(CamCtx* cam, Buffer* buffer) {
+    if (!cam || !buffer) {
+        return nullptr;
+    }
+    for (const auto& dma : cam->native_buffers) {
+        if (dma && dma->get_argus_buffer() == buffer) {
+            return dma.get();
+        }
+    }
+    return nullptr;
+}
+
+bool extract_metadata(DmaBuffer* dma, FrameMetadata* out) {
+    if (!dma || !dma->get_argus_i_buffer()) {
         return false;
     }
-    const CaptureMetadata* metadata = i_buffer->getMetadata();
-    const ICaptureMetadata* i_meta = interface_cast<const ICaptureMetadata>(metadata);
-    const Ext::ISensorTimestampTsc* i_tsc = interface_cast<const Ext::ISensorTimestampTsc>(metadata);
-    const Ext::IInternalFrameCount* i_internal = interface_cast<const Ext::IInternalFrameCount>(metadata);
+    const CaptureMetadata* metadata = dma->get_argus_i_buffer()->getMetadata();
+    const ICaptureMetadata* i_meta = dma->get_capture_metadata_interface(metadata);
+    const Ext::ISensorTimestampTsc* i_tsc = dma->get_sensor_timestamp_tsc_interface(metadata);
+    const Ext::IInternalFrameCount* i_internal = dma->get_internal_frame_count_interface(metadata);
     out->local_frame_number = i_meta ? i_meta->getCaptureId() : 0;
     out->sensor_timestamp_ns = i_meta ? i_meta->getSensorTimestamp() : 0;
     out->sof_tsc_ns = i_tsc ? i_tsc->getSensorSofTimestampTsc() : 0;
@@ -1222,10 +1258,10 @@ std::unique_ptr<FrameBundle> acquire_one(
         std::cerr << oss.str() << std::endl;
         return nullptr;
     }
-    DmaBuffer* dma = DmaBuffer::from_argus_buffer(raw);
+    DmaBuffer* dma = find_dma_for_argus_buffer(cam, raw);
     if (!dma) {
         std::ostringstream oss;
-        oss << cam->name << ": acquired Argus Buffer without DmaBuffer client data";
+        oss << cam->name << ": acquired Argus Buffer without matching cached DmaBuffer";
         if (failure_detail) {
             *failure_detail = oss.str();
         }
@@ -1234,7 +1270,7 @@ std::unique_ptr<FrameBundle> acquire_one(
         return nullptr;
     }
     std::unique_ptr<FrameBundle> bundle(new FrameBundle(cam, raw, dma));
-    if (!extract_metadata(bundle->buffer, &bundle->meta)) {
+    if (!extract_metadata(dma, &bundle->meta)) {
         std::ostringstream oss;
         oss << cam->name << ": failed to extract same-frame metadata";
         if (failure_detail) {

@@ -232,9 +232,10 @@ class GatewayState:
     cached_processing_items: list[dict[str, Any]] = field(default_factory=list)
     dataset_cache_ready: bool = False
     processing_cache_ready: bool = False
-    # Cheap fingerprint (dataset dir names + top-level mtimes) of the last scan;
-    # lets the refresher skip the expensive 253-dataset walk when nothing changed
-    # so its GIL-heavy scan stops starving the HTTP handlers (snapshot/camera.jpg).
+    # Cheap fingerprint of dataset dirs plus key sentinel files. This lets the
+    # refresher skip the expensive 253-dataset walk when nothing changed while
+    # still noticing a just-recorded dataset becoming complete after meta/parquet
+    # files are finalized under an already-created top-level directory.
     dataset_scan_signature: tuple = ()
     # Processing is intentionally cached separately from recordedDatasets and
     # trajectory. Trajectory scans are expensive; processing status changes often
@@ -826,28 +827,46 @@ def _dataset_kind(state: GatewayState, dataset_root: Path) -> str:
     return "exported"
 
 
-_REPLAY_CANDIDATES_MEMO: tuple[float, list[Path]] | None = None
+_REPLAY_CANDIDATES_MEMO: tuple[float, tuple[Any, ...], list[Path]] | None = None
 _REPLAY_CANDIDATES_TTL_S = 3.0
 _PROCESSING_STALE_RUNNING_S = 120.0
+
+
+def _path_memo_key(path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
+def _complete_replay_candidates_memo_key(state: GatewayState) -> tuple[Any, ...]:
+    return (
+        _path_memo_key(state.repo_root),
+        _path_memo_key(state.datasets_root),
+        _path_memo_key(_task_exports_root(state)),
+        _dataset_scan_signature(state),
+    )
 
 
 def _complete_replay_dataset_candidates(state: GatewayState) -> list[Path]:
     # Short-TTL memo: this globs every dataset (253 on Thor) and is the single
     # chokepoint reached by several _snapshot helpers (annotation resolve,
-    # replay candidates, known-dataset resolve) on every ~1s poll. Without it
-    # those repeated full scans kept /api/snapshot at ~1s+ (gateway-slow root).
-    # The dataset set changes rarely, so a few seconds of staleness is fine.
+    # replay candidates, known-dataset resolve) on every ~1s poll. Key it by the
+    # cheap dataset signature so a just-finalized dataset bypasses the memo.
     global _REPLAY_CANDIDATES_MEMO
     now = time.monotonic()
+    memo_key = _complete_replay_candidates_memo_key(state)
     memo = _REPLAY_CANDIDATES_MEMO
-    if memo is not None and now - memo[0] < _REPLAY_CANDIDATES_TTL_S:
-        return list(memo[1])
+    if memo is not None and now - memo[0] < _REPLAY_CANDIDATES_TTL_S and memo[1] == memo_key:
+        return list(memo[2])
     candidates = list(_complete_dataset_candidates(state))
     for entry in _scan_exports_root(state):
         if entry not in candidates and _dataset_is_complete(entry):
             candidates.append(entry)
     result = sorted(candidates, key=_dataset_modified_s, reverse=True)
-    _REPLAY_CANDIDATES_MEMO = (now, result)
+    _REPLAY_CANDIDATES_MEMO = (now, memo_key, result)
     return list(result)
 
 
@@ -5819,16 +5838,67 @@ def _consume_recorder_output(state: GatewayState) -> None:
             state.log("warn", f"recorder output consumer error: {exc}")
 
 
-def _dataset_scan_signature(state: GatewayState) -> tuple:
-    """Cheap fingerprint of the dataset dirs: (path, top-level mtime) per entry.
+def _path_stat_signature(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return (0, 0)
+    return (stat.st_mtime_ns, stat.st_size)
 
-    Just ``scandir`` + ``stat`` of the top-level dirs under the datasets/exports
-    roots -- no per-dataset globbing or episode walks -- so it is a few ms even
-    with hundreds of datasets. Used to decide whether the expensive full scan can
-    be skipped.
+
+def _newest_shallow_file_signature(root: Path, pattern: str) -> tuple[str, int, int]:
+    newest: tuple[str, int, int] = ("", 0, 0)
+    try:
+        candidates = root.glob(pattern)
+        for path in candidates:
+            try:
+                if not path.is_file():
+                    continue
+                stat = path.stat()
+            except OSError:
+                continue
+            key = (stat.st_mtime_ns, path.name)
+            newest_key = (newest[1], newest[0])
+            if key > newest_key:
+                newest = (path.name, stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        pass
+    return newest
+
+
+def _latest_raw_episode_signature(episodes_root: Path) -> tuple[str, int, int, int, int, str, int, int]:
+    latest_name = ""
+    latest_path: Path | None = None
+    try:
+        with os.scandir(episodes_root) as it:
+            for entry in it:
+                try:
+                    if entry.is_dir() and entry.name.startswith("episode_") and entry.name > latest_name:
+                        latest_name = entry.name
+                        latest_path = Path(entry.path)
+                except OSError:
+                    continue
+    except OSError:
+        return ("", 0, 0, 0, 0, "", 0, 0)
+    if latest_path is None:
+        return ("", 0, 0, 0, 0, "", 0, 0)
+    ep_mtime_ns, ep_size = _path_stat_signature(latest_path)
+    meta_mtime_ns, meta_size = _path_stat_signature(latest_path / "meta.json")
+    mkv_name, mkv_mtime_ns, mkv_size = _newest_shallow_file_signature(latest_path, "*.mkv")
+    return (latest_name, ep_mtime_ns, ep_size, meta_mtime_ns, meta_size, mkv_name, mkv_mtime_ns, mkv_size)
+
+
+def _dataset_scan_signature(state: GatewayState) -> tuple:
+    """Cheap fingerprint of dataset dirs plus completion sentinel files.
+
+    A recorder may create the top-level dataset directory before the episode is
+    complete, then later finalize ``meta/info.json`` and parquet files without
+    changing the top-level directory mtime. Include those shallow sentinels so
+    the cache notices the dataset becoming replayable while still avoiding the
+    full per-episode scan used by ``_recorded_dataset_items``.
     """
     roots = [state.datasets_root, _task_exports_root(state)]
-    sig: list[tuple[str, int]] = []
+    sig: list[tuple[Any, ...]] = []
     for root in roots:
         if root is None or not root.is_dir():
             continue
@@ -5836,10 +5906,40 @@ def _dataset_scan_signature(state: GatewayState) -> tuple:
             with os.scandir(root) as it:
                 for entry in it:
                     try:
-                        if entry.is_dir():
-                            sig.append((entry.path, entry.stat().st_mtime_ns))
+                        if not entry.is_dir():
+                            continue
+                        entry_stat = entry.stat()
                     except OSError:
                         continue
+                    dataset_root = Path(entry.path)
+                    info_mtime_ns, info_size = _path_stat_signature(dataset_root / "meta" / "info.json")
+                    data_mtime_ns, data_size = _path_stat_signature(dataset_root / "data")
+                    parquet_name, parquet_mtime_ns, parquet_size = _newest_shallow_file_signature(
+                        dataset_root / "data", "chunk-*/*.parquet"
+                    )
+                    episodes_mtime_ns, episodes_size = _path_stat_signature(dataset_root / "episodes")
+                    raw_episode_sig: tuple[str, int, int, int, int, str, int, int]
+                    if info_mtime_ns == 0 and parquet_mtime_ns == 0:
+                        raw_episode_sig = _latest_raw_episode_signature(dataset_root / "episodes")
+                    else:
+                        raw_episode_sig = ("", 0, 0, 0, 0, "", 0, 0)
+                    sig.append(
+                        (
+                            entry.path,
+                            entry_stat.st_mtime_ns,
+                            entry_stat.st_size,
+                            info_mtime_ns,
+                            info_size,
+                            data_mtime_ns,
+                            data_size,
+                            parquet_name,
+                            parquet_mtime_ns,
+                            parquet_size,
+                            episodes_mtime_ns,
+                            episodes_size,
+                            *raw_episode_sig,
+                        )
+                    )
         except OSError:
             continue
     sig.sort()
