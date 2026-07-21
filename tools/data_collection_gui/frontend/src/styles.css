@@ -1380,6 +1380,197 @@ button.danger {
   gap: 8px;
 }
 
+.mujoco-mode-picker {
+  background: #e9eff2;
+  border-radius: 8px;
+  display: inline-flex;
+  gap: 4px;
+  justify-self: start;
+  padding: 4px;
+}
+
+.mujoco-local-controls {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.mujoco-run-button {
+  background: #0f766e;
+  border-color: #0b615b;
+  color: #ffffff;
+  min-width: 180px;
+}
+
+.mujoco-run-button:hover:not(:disabled) {
+  background: #0b615b;
+}
+
+.mujoco-mode-picker button {
+  background: transparent;
+  border-color: transparent;
+  color: #43525e;
+}
+
+.mujoco-mode-picker button.active {
+  background: #ffffff;
+  border-color: #aebbc4;
+  box-shadow: 0 1px 3px rgb(15 23 42 / 12%);
+  color: #0f766e;
+}
+
+.mujoco-3d,
+.mujoco-empty {
+  background: #f4f7f8;
+  border: 1px solid #d2d9de;
+  border-radius: 8px;
+  min-height: 430px;
+  overflow: hidden;
+  position: relative;
+  width: 100%;
+}
+
+.mujoco-native-video-wrap {
+  background: #050708;
+  border: 1px solid #27343b;
+  border-radius: 8px;
+  min-height: 430px;
+  overflow: hidden;
+  position: relative;
+  width: 100%;
+}
+
+.mujoco-native-video {
+  background: #050708;
+  display: block;
+  height: 430px;
+  object-fit: contain;
+  width: 100%;
+}
+
+.mujoco-native-labels {
+  color: #e7eef2;
+  display: grid;
+  font-size: 12px;
+  font-weight: 600;
+  grid-template-columns: 1fr 1fr;
+  left: 0;
+  pointer-events: none;
+  position: absolute;
+  right: 0;
+  text-align: center;
+  top: 10px;
+}
+
+.real-robot-panel {
+  border-color: #e1c4bc;
+}
+
+.real-robot-layout {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(280px, 0.75fr) minmax(360px, 1.25fr);
+}
+
+.real-robot-settings {
+  align-content: start;
+  display: grid;
+  gap: 12px;
+}
+
+.real-robot-ip-field {
+  display: grid;
+  gap: 5px;
+}
+
+.real-robot-ip-field span {
+  color: #52616d;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.real-robot-ip-field input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  width: 100%;
+}
+
+.real-robot-run {
+  min-height: 42px;
+  width: 100%;
+}
+
+.realsense-monitor {
+  background: #080b0d;
+  border: 1px solid #34424a;
+  border-radius: 8px;
+  min-height: 330px;
+  overflow: hidden;
+  position: relative;
+}
+
+.realsense-monitor-heading {
+  align-items: center;
+  background: rgb(8 11 13 / 82%);
+  color: #eef3f5;
+  display: flex;
+  justify-content: space-between;
+  left: 0;
+  padding: 9px 12px;
+  position: absolute;
+  right: 0;
+  top: 0;
+  z-index: 1;
+}
+
+.realsense-monitor-heading span {
+  color: #a9bac3;
+  font-size: 11px;
+}
+
+.realsense-monitor img {
+  display: block;
+  height: 330px;
+  object-fit: contain;
+  width: 100%;
+}
+
+.realsense-monitor-empty {
+  align-items: center;
+  color: #a9bac3;
+  display: flex;
+  height: 330px;
+  justify-content: center;
+  padding: 48px 24px 24px;
+  text-align: center;
+}
+
+@media (max-width: 900px) {
+  .real-robot-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.mujoco-3d {
+  cursor: grab;
+  height: 430px;
+  touch-action: none;
+}
+
+.mujoco-3d:active {
+  cursor: grabbing;
+}
+
+.mujoco-empty {
+  align-items: center;
+  color: #60707c;
+  display: flex;
+  justify-content: center;
+  padding: 24px;
+  text-align: center;
+}
+
 .pose-summary {
   background: #f8fafb;
   border: 1px solid #e1e6ea;

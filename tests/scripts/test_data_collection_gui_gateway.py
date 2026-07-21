@@ -657,7 +657,7 @@ def test_recorder_env_adds_repo_import_paths(monkeypatch, tmp_path):
     assert env["PYTHONUNBUFFERED"] == "1"
 
 
-def test_mujoco_replay_command_uses_repo_relative_dataset_path(tmp_path):
+def test_mujoco_replay_command_uses_selected_cube_sidecar_and_episode(tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "fr3_sim_record_20260421_072232"
     dataset_root.mkdir(parents=True)
@@ -671,11 +671,30 @@ def test_mujoco_replay_command_uses_repo_relative_dataset_path(tmp_path):
 
     command = gateway._mujoco_replay_command(state, dataset_root)
 
-    assert command[1] == str(repo_root / "tools" / "fr3" / "fr3_sim_record_replay.py")
-    assert "--dataset=outputs/datasets/fr3_sim_record_20260421_072232" in command
-    assert "--episode=2" in command
-    assert "--fps=60" in command
-    assert "--no-viewer" not in command
+    assert command[1] == str(
+        repo_root
+        / "third_party"
+        / "opencv_kalibr"
+        / "fr3_data_collection_replay"
+        / "replay_cube_pose_in_robot_base_mujoco.py"
+    )
+    assert command[command.index("--dataset-root") + 1] == str(dataset_root)
+    assert command[command.index("--cube") + 1] == "left"
+    assert command[command.index("--episode-index") + 1] == "2"
+    assert command[command.index("--fps") + 1] == "60"
+    assert command[command.index("--robot-spacing-m") + 1] == "0.9"
+    assert "--no-viewer" in command
+    report_path = Path(command[command.index("--report-json") + 1])
+    assert report_path.name == "mujoco_preview.left.episode_000002.json"
+    video_path = Path(command[command.index("--render-video") + 1])
+    assert video_path.name == "mujoco_preview.left.episode_000002.mp4"
+
+    both_command = gateway._mujoco_replay_command(state, dataset_root, "both")
+    assert both_command[both_command.index("--cube") + 1] == "both"
+    both_report = Path(both_command[both_command.index("--report-json") + 1])
+    assert both_report.name == "mujoco_preview.both.episode_000002.json"
+    both_video = Path(both_command[both_command.index("--render-video") + 1])
+    assert both_video.name == "mujoco_preview.both.episode_000002.mp4"
 
 
 def test_save_annotation_persists_episode_metadata(monkeypatch, tmp_path):
@@ -1091,20 +1110,40 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     )
     gateway._apply_mujoco_replay_output(
         state,
-        "mujoco_replay_result=status=complete completed_frames=2 total_frames=2 "
+        "mujoco_replay_result status=complete completed_frames=2 total_frames=2 "
         "avg_pos_mm=2.0 max_pos_mm=4.0 avg_rot_deg=1.0 max_rot_deg=3.0",
     )
     gateway._finish_mujoco_validation(state, 0)
     gateway._preflight_replay(state)
-    command = gateway._real_replay_command(state, dataset_root)
+    command = gateway._real_replay_command(
+        state,
+        dataset_root,
+        "left",
+        "192.168.1.99",
+    )
 
     assert state.replay.mujocoValidation["status"] == "passed"
     assert state.replay.safety == "ready"
     assert "current MuJoCo validation" in state.replay.message
-    assert "--dataset=outputs/datasets/episode_set" in command
-    assert "--episode=0" in command
-    assert "--robot-ip=192.168.1.99" in command
-    assert "--gripper-port=/dev/ttyUSB9" in command
+    assert command[0] == "bash"
+    assert command[1].endswith("third_party/opencv_kalibr/run_replay_cube_pose_on_thor.sh")
+    assert command[command.index("--dataset-root") + 1] == str(dataset_root)
+    assert command[command.index("--cube") + 1] == "left"
+    assert command[command.index("--robot-ip") + 1] == "192.168.1.99"
+    assert "--replay.episode_index=0" in command
+
+
+def test_real_replay_rejects_two_cube_mode(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+
+    with pytest.raises(ValueError, match="must be left or right"):
+        gateway._start_real_replay(state, "both", "192.168.1.99")
 
 
 def test_mujoco_validation_fails_when_metrics_exceed_threshold(tmp_path):

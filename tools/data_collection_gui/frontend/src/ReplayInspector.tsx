@@ -1,14 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Pose3DViewer } from "./Pose3DViewer";
+import { MujocoReplayViewer } from "./MujocoReplayViewer";
 import { SeriesPlot } from "./SeriesPlot";
 import type { DataCollectionGuiApi } from "./api";
-import type { CubeVideoOverlay, EePose, ForceVector, ReplayTimeline, ReplayTimelineFrame, TouchPadFrame } from "./types";
-
-const cubeColors: Record<string, number> = {
-  left: 0xc2410c,
-  right: 0x0f766e,
-  head: 0x2563eb
-};
+import type { CubeVideoOverlay, EePose, MujocoCubeMode, MujocoPreview, ReplayStatus, ReplayTimeline, ReplayTimelineFrame, TouchPadFrame } from "./types";
 
 const cubePoseDims = ["x", "y", "z", "qx", "qy", "qz", "qw"] as const;
 const cubeEdges: Array<[number, number]> = [
@@ -151,17 +145,6 @@ function ensureFullPose(pose: ReplayTimelineFrame["eePose"]): EePose | null {
   };
 }
 
-function ensureForceVector(force: ReplayTimelineFrame["forceVector"]): ForceVector | null {
-  if (!force || force.x == null || force.y == null || force.z == null) {
-    return null;
-  }
-  const magnitude = force.magnitude ?? Math.hypot(force.x, force.y, force.z);
-  if (![force.x, force.y, force.z, magnitude].every(Number.isFinite)) {
-    return null;
-  }
-  return { x: force.x, y: force.y, z: force.z, magnitude };
-}
-
 function CubeOverlayCanvas({
   overlays,
   video
@@ -244,7 +227,13 @@ export function ReplayInspector({
   datasetPath,
   episode,
   fallbackFps,
-  revision = 0
+  revision = 0,
+  mujocoMode,
+  onMujocoModeChange,
+  onRunMujoco,
+  replayStatus,
+  busy,
+  mujocoRefreshKey = ""
 }: {
   api: DataCollectionGuiApi;
   datasetPath: string;
@@ -254,12 +243,21 @@ export function ReplayInspector({
   // selection is mutated (e.g. deleting an episode renumbers the survivors into
   // the same slot). Part of the fetch effect deps so the timeline refetches.
   revision?: number;
+  mujocoMode: MujocoCubeMode;
+  onMujocoModeChange: (mode: MujocoCubeMode) => void;
+  onRunMujoco: (mode: MujocoCubeMode) => void;
+  replayStatus: ReplayStatus;
+  busy: boolean;
+  mujocoRefreshKey?: string;
 }) {
   const [timeline, setTimeline] = useState<ReplayTimeline | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [mujocoPreview, setMujocoPreview] = useState<MujocoPreview | null>(null);
+  const [nativeVideoFailed, setNativeVideoFailed] = useState(false);
+  const mujocoVideoRef = useRef<HTMLVideoElement | null>(null);
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
   // Frame counts read from loaded video metadata, keyed per camera. A single
   // corrupt remux cache can report a tiny duration (e.g. 56 frames); using
@@ -305,7 +303,44 @@ export function ReplayInspector({
     };
   }, [api, datasetPath, episode, revision]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setMujocoPreview(null);
+    setNativeVideoFailed(false);
+    if (!datasetPath) return;
+    api.fetchMujocoPreview(datasetPath, episode, mujocoMode).then((result) => {
+      if (!cancelled) setMujocoPreview(result);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, datasetPath, episode, mujocoMode, mujocoRefreshKey]);
+
   const fps = timeline?.fps ?? fallbackFps;
+  const mujocoRunning = replayStatus.state === "sim_replay";
+  const replayActive = mujocoRunning || replayStatus.state === "dry_run" || replayStatus.state === "replaying";
+  const canRunMujoco =
+    replayStatus.dataStatus === "loaded" &&
+    (replayStatus.recordedFrames ?? replayStatus.totalFrames) > 0;
+
+  useEffect(() => {
+    const video = mujocoVideoRef.current;
+    if (!video) return;
+    const targetTime = currentFrame / Math.max(fps, 1);
+    if (Math.abs(video.currentTime - targetTime) > 2 / Math.max(fps, 1)) {
+      video.currentTime = Math.min(targetTime, Number.isFinite(video.duration) ? video.duration : targetTime);
+    }
+  }, [currentFrame, fps, mujocoPreview]);
+
+  useEffect(() => {
+    const video = mujocoVideoRef.current;
+    if (!video) return;
+    if (playing) {
+      video.play().catch(() => undefined);
+    } else {
+      video.pause();
+    }
+  }, [playing, mujocoPreview]);
   const backendTotalFrames = timeline?.totalFrames ?? 0;
   // Effective playable frame count: keep the backend timeline as the primary
   // source, but allow a consistent shorter video duration to trim it. Taking
@@ -457,8 +492,6 @@ export function ReplayInspector({
   // without a `?.` guard or this component crashes before the totalFrames
   // early-return below has a chance to render the placeholder panel.
   const frame: ReplayTimelineFrame | undefined = timeline?.frames?.[currentFrame];
-  const pose = ensureFullPose(frame?.eePose);
-  const forceVector = ensureForceVector(frame?.forceVector);
   const touchMax = useMemo(() => touchScaleMax(timeline), [timeline]);
   const cubePoseNames = useMemo(() => {
     if (!timeline) {
@@ -474,36 +507,6 @@ export function ReplayInspector({
       timeline.frames.some((entry) => ensureFullPose(entry.cubePoses?.[name]) !== null)
     );
   }, [timeline]);
-  const trajectory = useMemo(() => {
-    const frames = timeline?.frames;
-    if (!frames || frames.length === 0) {
-      return [] as Array<[number, number, number]>;
-    }
-    return frames
-      .map((entry) => entry.eePose)
-      .filter((entry): entry is EePose => !!entry && entry.x != null && entry.y != null && entry.z != null)
-      .map((entry) => [entry.x as number, entry.y as number, entry.z as number] as [number, number, number]);
-  }, [timeline]);
-  const cubeTrajectories = useMemo(() => {
-    if (!timeline) {
-      return [];
-    }
-    return cubePoseNames.map((name, index) => ({
-      name,
-      color: cubeColors[name] ?? [0x7c3aed, 0x0891b2, 0x65a30d, 0xbe123c][index % 4],
-      points: timeline.frames
-        .map((entry) => ensureFullPose(entry.cubePoses?.[name]))
-        .filter((entry): entry is EePose => !!entry)
-        .map((entry) => [entry.x, entry.y, entry.z] as [number, number, number])
-    }));
-  }, [timeline, cubePoseNames]);
-  const currentCubePoses = useMemo(() => {
-    return cubePoseNames.map((name, index) => ({
-      name,
-      color: cubeColors[name] ?? [0x7c3aed, 0x0891b2, 0x65a30d, 0xbe123c][index % 4],
-      pose: ensureFullPose(frame?.cubePoses?.[name])
-    }));
-  }, [cubePoseNames, frame]);
 
   const pickState = useCallback(
     (frameIndex: number, dim: number) => timeline?.frames?.[frameIndex]?.state?.[dim] ?? Number.NaN,
@@ -652,52 +655,61 @@ export function ReplayInspector({
           <span>{touchMax.toFixed(1)}</span>
         </div>
       </section>
-      <section className="panel pose-panel">
+      <section className="panel pose-panel mujoco-panel">
         <div className="panel-heading">
-          <h2>End-effector pose</h2>
-          <span>
-            drag to orbit · wheel to zoom{cubePoseNames.length ? ` · cubes ${cubePoseNames.join(", ")}` : ""}
-          </span>
+          <h2>MuJoCo EE trajectory replay</h2>
+          <span>selected dataset · episode {episode} · native MuJoCo render</span>
         </div>
-        {pose ? (
-          <div className="pose-summary">
-            <span>
-              pos [<strong>{pose.x.toFixed(3)}</strong>, <strong>{pose.y.toFixed(3)}</strong>, <strong>{pose.z.toFixed(3)}</strong>]
-            </span>
-            <span>
-              quat [<strong>{pose.qx.toFixed(3)}</strong>, <strong>{pose.qy.toFixed(3)}</strong>, <strong>{pose.qz.toFixed(3)}</strong>, <strong>{pose.qw.toFixed(3)}</strong>]
-            </span>
-            <span>
-              gripper <strong>{pose.gripper == null ? "—" : pose.gripper.toFixed(3)}</strong>
-            </span>
-            <span>
-              F [<strong>{forceVector?.x.toFixed(3) ?? "—"}</strong>, <strong>{forceVector?.y.toFixed(3) ?? "—"}</strong>, <strong>{forceVector?.z.toFixed(3) ?? "—"}</strong>] N |F| <strong>{forceVector?.magnitude?.toFixed(3) ?? "—"}</strong>
-            </span>
-            <span className="pose-debug">
-              raw fields: [{frame?.eePose ? Object.keys(frame.eePose).join(", ") : "(none)"}]
-            </span>
-          </div>
-        ) : (
-          <p className="panel-note">No EE pose in this frame.</p>
-        )}
-        {cubePoseNames.length ? (
-          <div className="pose-summary">
-            {currentCubePoses.map((entry) => (
-              <span key={entry.name}>
-                {entry.name} [<strong>{entry.pose?.x.toFixed(3) ?? "—"}</strong>,{" "}
-                <strong>{entry.pose?.y.toFixed(3) ?? "—"}</strong>,{" "}
-                <strong>{entry.pose?.z.toFixed(3) ?? "—"}</strong>]
-              </span>
+        <div className="mujoco-local-controls">
+          <div className="mujoco-mode-picker" role="group" aria-label="MuJoCo cube trajectory">
+            {(["left", "right", "both"] as MujocoCubeMode[]).map((mode) => (
+              <button
+                key={mode}
+                className={mujocoMode === mode ? "active" : ""}
+                disabled={busy || replayActive}
+                onClick={() => onMujocoModeChange(mode)}
+                type="button"
+              >
+                {mode === "both" ? "Both cubes" : `${mode[0].toUpperCase()}${mode.slice(1)} cube`}
+              </button>
             ))}
           </div>
-        ) : null}
-        <Pose3DViewer
-          trajectory={trajectory}
-          currentPose={pose}
-          forceVector={forceVector}
-          extraTrajectories={cubeTrajectories}
-          currentExtraPoses={currentCubePoses}
-        />
+          <button
+            className="mujoco-run-button"
+            disabled={busy || replayActive || !canRunMujoco}
+            onClick={() => onRunMujoco(mujocoMode)}
+            type="button"
+          >
+            {mujocoRunning ? "Rendering MuJoCo…" : `Run MuJoCo · ${mujocoMode}`}
+          </button>
+        </div>
+        <p className="panel-note">
+          {mujocoMode === "both"
+            ? "Two identical FR3 models are shown in parallel with 0.90 m between bases; both trajectories remain in their own robot-base coordinates."
+            : `One FR3 follows state_action.${mujocoMode}.csv from the selected dataset and episode.`}
+        </p>
+        {mujocoPreview?.native_video_path && !nativeVideoFailed ? (
+          <div className="mujoco-native-video-wrap">
+            <video
+              ref={mujocoVideoRef}
+              className="mujoco-native-video"
+              src={api.mujocoVideoUrl(datasetPath, episode, mujocoMode)}
+              muted
+              playsInline
+              preload="metadata"
+              onError={() => setNativeVideoFailed(true)}
+            />
+            {mujocoMode === "both" ? (
+              <div className="mujoco-native-labels"><span>Left FR3</span><span>Right FR3</span></div>
+            ) : null}
+          </div>
+        ) : mujocoPreview ? (
+          <MujocoReplayViewer preview={mujocoPreview} currentFrame={currentFrame} />
+        ) : (
+          <div className="mujoco-empty">
+            Choose a cube mode and run MuJoCo here to generate the native animation for this dataset and episode.
+          </div>
+        )}
       </section>
       <div className="series-grid">
         <SeriesPlot

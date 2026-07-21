@@ -6,6 +6,7 @@ import argparse
 import bisect
 import copy
 import csv
+import ipaddress
 import json
 import math
 import os
@@ -36,6 +37,7 @@ DEFAULT_REPLAY_MAX_EE_STEP_MM = 120.0
 DEFAULT_REPLAY_MAX_GRIPPER_STEP = 0.35
 DEFAULT_REAL_PREFLIGHT_TIMEOUT_S = 30.0
 DEFAULT_REAL_ROBOT_IP = "192.168.1.208"
+DEFAULT_CUBE_REPLAY_ROBOT_IP = "192.168.11.102"
 # EE trajectory generation now tracks gmsl2 (Thor) datasets with AprilTag cubes
 # instead of the legacy Hikon-camera route. The gateway runs on Thor, so it
 # invokes the local runner directly (no SSH / copy-back) -- the runner picks the
@@ -51,6 +53,9 @@ DEFAULT_EE_TRAJECTORY_ALGORITHM = "april_cube_tracking_in_robot_base"
 DEFAULT_TRAJ_SIDECAR_NAME = "april_cube_tracking_in_robot_base"
 DEFAULT_TRACKING_RUN_SUFFIX = "_thor_april_tracking_in_robot_base"
 DEFAULT_CUBE_TRAJECTORY_NAMES = ("left", "right", "head")
+DEFAULT_MUJOCO_CUBE_MODE = "left"
+MUJOCO_CUBE_MODES = ("left", "right", "both")
+DEFAULT_MUJOCO_ROBOT_SPACING_M = 0.9
 DEFAULT_CUBE_SIZE_M = 0.07
 CUBE_OVERLAY_COLORS = {
     "left": "#c2410c",
@@ -113,7 +118,10 @@ class ReplayStatus:
     diagnostics: list[str] = field(default_factory=list)
     pid: int | None = None
     lastOutput: str = ""
+    mujocoCubeMode: str = DEFAULT_MUJOCO_CUBE_MODE
     mujocoValidation: dict[str, Any] = field(default_factory=dict)
+    realCubeMode: str = "right"
+    realRobotIp: str = ""
     # Bumped whenever the on-disk dataset content changes under a stable
     # (datasetRoot, episode) selection — e.g. deleting an episode keeps the
     # selection on the same slot but swaps in different frames/videos. The UI
@@ -168,6 +176,7 @@ class GatewayState:
     process: subprocess.Popen[str] | None = None
     replay_process: subprocess.Popen[str] | None = None
     replay_process_kind: str = ""
+    realsense_preview_process: subprocess.Popen[str] | None = None
     processing_processes: dict[str, subprocess.Popen[str]] = field(default_factory=dict)
     processing_starting: set[str] = field(default_factory=set)
     process_started_at_s: float | None = None
@@ -334,6 +343,7 @@ def _new_mujoco_validation(
         "isCurrentForSelection": False,
         "message": message,
         "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "cubeMode": str(state.replay.mujocoCubeMode),
     }
 
 
@@ -373,6 +383,7 @@ def _write_validation_store(dataset_root: Path, validation: dict[str, Any]) -> N
         int(validation.get("fps") or 0),
         float(validation.get("maxPositionThresholdMm") or 0.0),
         float(validation.get("maxRotationThresholdDeg") or 0.0),
+        str(validation.get("cubeMode") or DEFAULT_MUJOCO_CUBE_MODE),
     )
     filtered = [
         item
@@ -383,6 +394,7 @@ def _write_validation_store(dataset_root: Path, validation: dict[str, Any]) -> N
             int(item.get("fps") or 0),
             float(item.get("maxPositionThresholdMm") or 0.0),
             float(item.get("maxRotationThresholdDeg") or 0.0),
+            str(item.get("cubeMode") or DEFAULT_MUJOCO_CUBE_MODE),
         )
         != key
     ]
@@ -404,6 +416,7 @@ def _load_persisted_mujoco_validation(state: GatewayState, dataset_root: Path, e
                 and int(item.get("fps")) == int(state.replay.fps or 30)
                 and float(item.get("maxPositionThresholdMm")) == max_pos_mm
                 and float(item.get("maxRotationThresholdDeg")) == max_rot_deg
+                and str(item.get("cubeMode") or DEFAULT_MUJOCO_CUBE_MODE) == str(state.replay.mujocoCubeMode)
             )
         except (TypeError, ValueError, OSError):
             matches = False
@@ -493,11 +506,15 @@ def _recording_status_from_config(config: dict[str, Any]) -> RecordingStatus:
 
 def _replay_status_from_config(config: dict[str, Any]) -> ReplayStatus:
     dataset = _dataset_config(config)
+    replay = _replay_config(config)
+    robot = config.get("robot") if isinstance(config.get("robot"), dict) else {}
+    default_robot_ip = str(replay.get("robot_ip") or robot.get("robot_ip") or DEFAULT_CUBE_REPLAY_ROBOT_IP)
     return ReplayStatus(
         dataset=str(dataset.get("repo_id") or ""),
         datasetRoot=str(dataset.get("root") or ""),
         totalFrames=_target_frames(config),
         fps=int(dataset.get("fps") or 30),
+        realRobotIp=default_robot_ip,
     )
 
 
@@ -5291,6 +5308,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         if replay_kind == "mujoco":
             _finish_mujoco_validation(state, replay_process.returncode)
         else:
+            _stop_realsense_preview(state)
             state.replay.safety = "locked"
             state.replay.state = "complete" if replay_process.returncode == 0 else "aborted"
             if state.replay.lastOutput:
@@ -6011,7 +6029,7 @@ def _set_mujoco_validation_metric(validation: dict[str, Any], key: str, value: s
 def _apply_mujoco_replay_output(state: GatewayState, output: str) -> None:
     validation = state.replay.mujocoValidation or _new_mujoco_validation(state, status="running")
     result_match = re.search(
-        r"mujoco_replay_result=status=(?P<status>\w+)\s+"
+        r"mujoco_replay_result(?:=|\s+)status=(?P<status>\w+)\s+"
         r"completed_frames=(?P<completed>\d+)\s+total_frames=(?P<total>\d+)\s+"
         r"avg_pos_mm=(?P<avg_pos>[0-9.]+)\s+max_pos_mm=(?P<max_pos>[0-9.]+)\s+"
         r"avg_rot_deg=(?P<avg_rot>[0-9.]+)\s+max_rot_deg=(?P<max_rot>[0-9.]+)",
@@ -6055,6 +6073,7 @@ def _mujoco_validation_is_for_active_episode(state: GatewayState, dataset_root: 
         and int(validation_fps if validation_fps is not None else 0) == int(state.replay.fps or 30)
         and float(validation_pos_threshold if validation_pos_threshold is not None else -1.0) == max_pos_mm
         and float(validation_rot_threshold if validation_rot_threshold is not None else -1.0) == max_rot_deg
+        and str(validation.get("cubeMode") or DEFAULT_MUJOCO_CUBE_MODE) == str(state.replay.mujocoCubeMode)
     )
 
 
@@ -6083,34 +6102,60 @@ def _trajectory_contract_for_episode(state: GatewayState, dataset_root: Path) ->
     if not frames:
         failures.append("no timeline frames")
 
-    poses = [frame.get("eePose") for frame in frames if isinstance(frame, dict) and frame.get("eePose")]
+    cube_mode = str(state.replay.mujocoCubeMode or DEFAULT_MUJOCO_CUBE_MODE)
+    selected_cubes = ("left", "right") if cube_mode == "both" else (cube_mode,)
+    has_selected_cube_poses = any(
+        isinstance(frame, dict)
+        and any(isinstance((frame.get("cubePoses") or {}).get(cube), dict) for cube in selected_cubes)
+        for frame in frames
+    )
+    if has_selected_cube_poses:
+        pose_sequences = [
+            [
+                (frame.get("cubePoses") or {}).get(cube)
+                for frame in frames
+                if isinstance(frame, dict) and (frame.get("cubePoses") or {}).get(cube)
+            ]
+            for cube in selected_cubes
+        ]
+        expected_pose_count = len(frames) * len(selected_cubes)
+    else:
+        pose_sequences = [[frame.get("eePose") for frame in frames if isinstance(frame, dict) and frame.get("eePose")]]
+        expected_pose_count = len(frames)
+    poses = [pose for sequence in pose_sequences for pose in sequence]
     pose_count = len([pose for pose in poses if isinstance(pose, dict) and {"x", "y", "z"}.issubset(pose.keys())])
-    if pose_count != len(frames):
-        failures.append(f"missing EE pose for {len(frames) - pose_count}/{len(frames)} frames")
-    checks.append({"name": "ee_pose_present", "status": "pass" if pose_count == len(frames) and frames else "fail", "value": pose_count})
+    if pose_count != expected_pose_count:
+        failures.append(f"missing EE pose for {expected_pose_count - pose_count}/{expected_pose_count} cube-frames")
+    checks.append({
+        "name": "ee_pose_present",
+        "status": "pass" if pose_count == expected_pose_count and frames else "fail",
+        "value": pose_count,
+        "cubeMode": cube_mode if has_selected_cube_poses else "dataset_default",
+    })
 
     max_step = 0.0
-    previous_pose: dict[str, Any] | None = None
     z_values: list[float] = []
     gripper_values: list[float] = []
-    for pose in poses:
-        if not isinstance(pose, dict):
-            continue
-        if "z" in pose:
-            try:
-                z_values.append(float(pose["z"]))
-            except (TypeError, ValueError):
-                pass
-        if pose.get("gripper") is not None:
-            try:
-                gripper_values.append(float(pose["gripper"]))
-            except (TypeError, ValueError):
-                pass
-        if previous_pose is not None:
-            step = _distance_mm(previous_pose, pose)
-            if step is not None:
-                max_step = max(max_step, step)
-        previous_pose = pose
+    for sequence in pose_sequences:
+        previous_pose: dict[str, Any] | None = None
+        for pose in sequence:
+            if not isinstance(pose, dict):
+                continue
+            if "z" in pose:
+                try:
+                    z_values.append(float(pose["z"]))
+                except (TypeError, ValueError):
+                    pass
+            if pose.get("gripper") is not None:
+                try:
+                    gripper_values.append(float(pose["gripper"]))
+                except (TypeError, ValueError):
+                    pass
+            if previous_pose is not None:
+                step = _distance_mm(previous_pose, pose)
+                if step is not None:
+                    max_step = max(max_step, step)
+            previous_pose = pose
     if max_step > max_ee_step_mm:
         failures.append(f"max EE step {max_step:.2f}mm > {max_ee_step_mm:.2f}mm")
     checks.append({"name": "max_ee_step", "status": "pass" if max_step <= max_ee_step_mm else "fail", "valueMm": max_step, "thresholdMm": max_ee_step_mm})
@@ -6439,52 +6484,101 @@ def _active_replay_dataset_root(state: GatewayState) -> Path:
     return candidates[0].resolve()
 
 
-def _mujoco_replay_command(state: GatewayState, dataset_root: Path) -> list[str]:
+def _mujoco_preview_report_path(dataset_root: Path, episode: int, cube_mode: str) -> Path:
+    return (
+        dataset_root
+        / "derived"
+        / DEFAULT_TRAJ_SIDECAR_NAME
+        / f"mujoco_preview.{cube_mode}.episode_{int(episode):06d}.json"
+    )
+
+
+def _mujoco_preview_video_path(dataset_root: Path, episode: int, cube_mode: str) -> Path:
+    return (
+        dataset_root
+        / "derived"
+        / DEFAULT_TRAJ_SIDECAR_NAME
+        / f"mujoco_preview.{cube_mode}.episode_{int(episode):06d}.mp4"
+    )
+
+
+def _mujoco_replay_python(state: GatewayState) -> Path:
+    # Thor's gateway venv intentionally stays small and does not contain
+    # MuJoCo. The FR3 inference environment carries MuJoCo plus the hardware-
+    # equivalent IK backend used by cube replay. Keep local development on the
+    # repository venv when the Thor-specific environment is absent.
+    thor_python = Path("/home/nvidia/Code/infer/.venv-fr3/bin/python3")
+    return thor_python if thor_python.is_file() else _venv_python(state.repo_root)
+
+
+def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: str | None = None) -> list[str]:
+    selected_cube_mode = str(cube_mode or state.replay.mujocoCubeMode or DEFAULT_MUJOCO_CUBE_MODE)
+    if selected_cube_mode not in MUJOCO_CUBE_MODES:
+        raise ValueError(f"MuJoCo cube mode must be one of {MUJOCO_CUBE_MODES}, got {selected_cube_mode!r}")
+    report_path = _mujoco_preview_report_path(dataset_root, state.replay.episode, selected_cube_mode)
+    video_path = _mujoco_preview_video_path(dataset_root, state.replay.episode, selected_cube_mode)
     command = [
-        str(_venv_python(state.repo_root)),
-        str(state.repo_root / "tools" / "fr3" / "fr3_sim_record_replay.py"),
-        f"--dataset={_dataset_arg_for_container_replay(state.repo_root, dataset_root)}",
-        f"--fps={state.replay.fps or 30}",
+        str(_mujoco_replay_python(state)),
+        str(
+            state.repo_root
+            / "third_party"
+            / "opencv_kalibr"
+            / "fr3_data_collection_replay"
+            / "replay_cube_pose_in_robot_base_mujoco.py"
+        ),
+        "--dataset-root",
+        str(dataset_root),
+        "--cube",
+        selected_cube_mode,
+        "--episode-index",
+        str(state.replay.episode),
+        "--fps",
+        str(state.replay.fps or 30),
+        "--pose-prefix",
+        "state",
+        "--ik-solver",
+        "hardware",
+        "--robot-spacing-m",
+        str(DEFAULT_MUJOCO_ROBOT_SPACING_M),
+        "--report-json",
+        str(report_path),
+        "--render-video",
+        str(video_path),
+        "--no-viewer",
     ]
-    if state.replay.episode >= 0:
-        command.append(f"--episode={state.replay.episode}")
     return command
 
 
-def _real_replay_command(state: GatewayState, dataset_root: Path) -> list[str]:
-    replay = _replay_config(state.config)
+def _validated_robot_ip(raw: str, label: str) -> str:
+    value = str(raw).strip()
+    try:
+        parsed = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be a valid IP address, got {value!r}") from exc
+    if parsed.version != 4:
+        raise ValueError(f"{label} must be an IPv4 address, got {value!r}")
+    return value
+
+
+def _real_replay_command(
+    state: GatewayState,
+    dataset_root: Path,
+    cube_mode: str,
+    robot_ip: str,
+) -> list[str]:
     command = [
-        str(_venv_python(state.repo_root)),
-        str(state.repo_root / "tools" / "fr3" / "fr3_das_replay_real.py"),
-        f"--dataset={_dataset_arg_for_container_replay(state.repo_root, dataset_root)}",
-        f"--episode={state.replay.episode}",
-        f"--fps={state.replay.fps or 30}",
+        "bash",
+        str(state.repo_root / "third_party" / "opencv_kalibr" / "run_replay_cube_pose_on_thor.sh"),
+        "--no-sync",
+        "--dataset-root",
+        str(dataset_root),
+        "--cube",
+        cube_mode,
+        "--mode",
+        "hardware",
     ]
-    option_map = {
-        "timing_source": "--timing-source",
-        "robot_ip": "--robot-ip",
-        "filter_coeff": "--filter-coeff",
-        "damping": "--damping",
-        "stiffness": "--stiffness",
-        "otg_max_velocity": "--otg-max-velocity",
-        "otg_max_acceleration": "--otg-max-acceleration",
-        "otg_max_jerk": "--otg-max-jerk",
-        "otg_velocity_scale": "--otg-velocity-scale",
-        "otg_acceleration_scale": "--otg-acceleration-scale",
-        "otg_jerk_scale": "--otg-jerk-scale",
-        "gripper_port": "--gripper-port",
-        "gripper_backend": "--gripper-backend",
-        "reset_gripper_position": "--reset-gripper-position",
-        "reset_gripper_timeout_s": "--reset-gripper-timeout-s",
-        "analysis_output_dir": "--analysis-output-dir",
-        "compose_file": "--compose-file",
-        "service": "--service",
-    }
-    for config_key, cli_key in option_map.items():
-        if replay.get(config_key) is not None:
-            command.append(f"{cli_key}={replay[config_key]}")
-    if replay.get("disable_otg"):
-        command.append("--disable-otg")
+    command.extend(["--robot-ip", robot_ip])
+    command.extend(["--", f"--replay.episode_index={int(state.replay.episode)}"])
     return command
 
 
@@ -6494,14 +6588,14 @@ def _real_robot_ip(state: GatewayState) -> str:
     return str(replay.get("robot_ip") or robot.get("robot_ip") or DEFAULT_REAL_ROBOT_IP)
 
 
-def _real_preflight_command(state: GatewayState) -> list[str]:
+def _real_preflight_command(state: GatewayState, robot_ip: str | None = None) -> list[str]:
     replay = _replay_config(state.config)
     command = [
         str(_venv_python(state.repo_root)),
         str(state.repo_root / "tools" / "fr3" / "fr3_record_preflight.py"),
         f"--workspace={state.repo_root}",
         f"--config-path={state.config_path}",
-        f"--robot-ip={_real_robot_ip(state)}",
+        f"--robot-ip={robot_ip or _real_robot_ip(state)}",
     ]
     if _bool_config(replay, "real_preflight_skip_hikrobot", True):
         command.append("--skip-hikrobot")
@@ -6514,33 +6608,35 @@ def _real_preflight_command(state: GatewayState) -> list[str]:
     return command
 
 
-def _run_real_preflight(state: GatewayState) -> None:
+def _run_real_preflight(state: GatewayState, robot_ips: Iterable[str] | None = None) -> None:
     replay = _replay_config(state.config)
     if not _bool_config(replay, "real_preflight_enabled", True):
         state.log("warn", "Real-robot preflight skipped by replay.real_preflight_enabled=false")
         return
     timeout_s = _float_config(replay, "real_preflight_timeout_s", DEFAULT_REAL_PREFLIGHT_TIMEOUT_S)
-    command = _real_preflight_command(state)
-    state.replay.message = "Running real-robot preflight checks"
-    try:
-        result = subprocess.run(
-            command,
-            cwd=state.repo_root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=_tool_env(state.repo_root),
-            timeout=max(timeout_s, 1.0),
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Real-robot preflight timed out after {timeout_s:.1f}s") from exc
-    output_lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
-    if output_lines:
-        state.replay.lastOutput = output_lines[-1]
-    if result.returncode != 0:
-        details = output_lines[-1] if output_lines else f"exit code {result.returncode}"
-        raise RuntimeError(f"Real-robot preflight failed: {details}")
+    targets = list(dict.fromkeys(robot_ips or [_real_robot_ip(state)]))
+    for robot_ip in targets:
+        command = _real_preflight_command(state, robot_ip)
+        state.replay.message = f"Running real-robot preflight checks for {robot_ip}"
+        try:
+            result = subprocess.run(
+                command,
+                cwd=state.repo_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=_tool_env(state.repo_root),
+                timeout=max(timeout_s, 1.0),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"Real-robot preflight timed out for {robot_ip} after {timeout_s:.1f}s") from exc
+        output_lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        if output_lines:
+            state.replay.lastOutput = output_lines[-1]
+        if result.returncode != 0:
+            details = output_lines[-1] if output_lines else f"exit code {result.returncode}"
+            raise RuntimeError(f"Real-robot preflight failed for {robot_ip}: {details}")
 
 
 def _require_mujoco_validation(state: GatewayState) -> Path:
@@ -6583,7 +6679,7 @@ def _preflight_replay(state: GatewayState) -> None:
     state.log("info", state.replay.message)
 
 
-def _start_mujoco_replay(state: GatewayState) -> None:
+def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CUBE_MODE) -> None:
     if state.replay_process is not None and state.replay_process.poll() is None:
         state.replay.message = "MuJoCo replay is already running"
         return
@@ -6591,8 +6687,21 @@ def _start_mujoco_replay(state: GatewayState) -> None:
     dataset_root = _active_replay_dataset_root(state)
     if not _is_dataset_root(dataset_root):
         raise RuntimeError(f"Selected replay dataset is not finalized: {dataset_root}")
+    cube_mode = str(cube_mode).strip().lower()
+    if cube_mode not in MUJOCO_CUBE_MODES:
+        raise ValueError(f"MuJoCo cube mode must be one of {MUJOCO_CUBE_MODES}, got {cube_mode!r}")
+    required_cubes = ("left", "right") if cube_mode == "both" else (cube_mode,)
+    episode_poses = _read_sidecar_cube_poses(dataset_root, state.replay.episode)
+    missing_cubes = [cube for cube in required_cubes if not episode_poses.get(cube)]
+    if missing_cubes:
+        raise RuntimeError(
+            f"Selected dataset episode {state.replay.episode} has no valid generated EE trajectory for: "
+            f"{', '.join(missing_cubes)}. "
+            "Run Generate EE Trajectory first."
+        )
 
-    command = _mujoco_replay_command(state, dataset_root)
+    state.replay.mujocoCubeMode = cube_mode
+    command = _mujoco_replay_command(state, dataset_root, cube_mode)
     state.replay.mujocoValidation = _new_mujoco_validation(
         state,
         status="running",
@@ -6600,13 +6709,15 @@ def _start_mujoco_replay(state: GatewayState) -> None:
         episode=state.replay.episode,
         message="MuJoCo replay is running; real-robot replay remains locked until metrics pass.",
     )
+    process_env = _tool_env(state.repo_root)
+    process_env.setdefault("MUJOCO_GL", "egl")
     process = subprocess.Popen(
         command,
         cwd=state.repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        env=_tool_env(state.repo_root),
+        env=process_env,
         start_new_session=True,
     )
     state.replay_process = process
@@ -6619,27 +6730,126 @@ def _start_mujoco_replay(state: GatewayState) -> None:
     state.replay.frameIndex = 0
     state.replay.datasetRoot = str(dataset_root)
     state.replay.dataset = str(dataset_root)
-    state.replay.message = f"MuJoCo replay started for {dataset_root.name}; waiting for validation metrics"
-    state.log("info", f"Started MuJoCo replay pid={process.pid} dataset={dataset_root}")
+    state.replay.message = (
+        f"MuJoCo {cube_mode} replay started for {dataset_root.name} episode {state.replay.episode}; "
+        "waiting for validation metrics"
+    )
+    state.log(
+        "info",
+        f"Started MuJoCo replay pid={process.pid} dataset={dataset_root} episode={state.replay.episode} cube={cube_mode}",
+    )
     _start_replay_output_reader(state, process)
 
 
-def _start_real_replay(state: GatewayState) -> None:
+def _realsense_preview_paths(state: GatewayState) -> tuple[Path, Path]:
+    root = Path("/tmp") / f"lerobot_realsense_replay_{os.getpid()}"
+    return root.with_suffix(".jpg"), root.with_suffix(".json")
+
+
+def _realsense_preview_python(state: GatewayState) -> Path:
+    candidate = state.repo_root / "third_party" / "opencv_kalibr" / ".venv" / "bin" / "python3"
+    return candidate if candidate.is_file() else _venv_python3(state.repo_root)
+
+
+def _stop_realsense_preview(state: GatewayState) -> None:
+    process = state.realsense_preview_process
+    if process is not None and process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=2.0)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+    state.realsense_preview_process = None
+
+
+def _start_realsense_preview(state: GatewayState) -> None:
+    process = state.realsense_preview_process
+    if process is not None and process.poll() is None:
+        return
+    image_path, status_path = _realsense_preview_paths(state)
+    image_path.unlink(missing_ok=True)
+    status_path.unlink(missing_ok=True)
+    command = [
+        str(_realsense_preview_python(state)),
+        str(state.repo_root / "tools" / "data_collection_gui" / "realsense_live_preview.py"),
+        "--output", str(image_path),
+        "--status", str(status_path),
+    ]
+    state.realsense_preview_process = subprocess.Popen(
+        command,
+        cwd=state.repo_root,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _realsense_preview_status(state: GatewayState) -> dict[str, Any]:
+    _image_path, status_path = _realsense_preview_paths(state)
+    payload = _load_json_file(status_path)
+    process = state.realsense_preview_process
+    process_running = process is not None and process.poll() is None
+    if not payload:
+        return {
+            "available": None,
+            "running": process_running,
+            "error": "Waiting for RealSense detection" if process_running else "Preview starts with real-robot replay",
+        }
+    payload["running"] = bool(payload.get("running")) and process_running
+    return payload
+
+
+def _start_real_replay(
+    state: GatewayState,
+    cube_mode: str = "right",
+    robot_ip: str = "",
+) -> None:
     if state.replay_process is not None and state.replay_process.poll() is None:
         state.replay.message = "Replay process is already running"
         return
 
+    cube_mode = str(cube_mode).strip().lower()
+    if cube_mode not in ("left", "right"):
+        raise ValueError(f"Real replay cube mode must be left or right, got {cube_mode!r}")
     dataset_root = _require_mujoco_validation(state)
-    command = _real_replay_command(state, dataset_root)
-    process = subprocess.Popen(
-        command,
-        cwd=state.repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=_tool_env(state.repo_root),
-        start_new_session=True,
-    )
+    validation_mode = str((state.replay.mujocoValidation or {}).get("cubeMode") or state.replay.mujocoCubeMode)
+    if validation_mode != cube_mode:
+        raise RuntimeError(
+            f"Run and pass MuJoCo {cube_mode} for this dataset/episode before real replay; "
+            f"current validation is for {validation_mode}."
+        )
+    episode_poses = _read_sidecar_cube_poses(dataset_root, state.replay.episode)
+    if not episode_poses.get(cube_mode):
+        raise RuntimeError(f"No valid generated EE trajectory for: {cube_mode}")
+
+    selected_ip = _validated_robot_ip(robot_ip or _real_robot_ip(state), "Robot IP")
+
+    # Re-run hardware checks against the exact IP selected in this panel;
+    # a prior preflight for a different arm must never authorize motion here.
+    _start_realsense_preview(state)
+    try:
+        _run_real_preflight(state, [selected_ip])
+    except Exception:
+        _stop_realsense_preview(state)
+        raise
+    state.replay.safety = "ready"
+    state.replay.realCubeMode = cube_mode
+    state.replay.realRobotIp = selected_ip
+    command = _real_replay_command(state, dataset_root, cube_mode, selected_ip)
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=state.repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=_tool_env(state.repo_root),
+            start_new_session=True,
+        )
+    except Exception:
+        _stop_realsense_preview(state)
+        raise
     state.replay_process = process
     state.replay_process_kind = "real"
     state.replay_started_at_s = time.monotonic()
@@ -6650,8 +6860,15 @@ def _start_real_replay(state: GatewayState) -> None:
     state.replay.frameIndex = 0
     state.replay.datasetRoot = str(dataset_root)
     state.replay.dataset = str(dataset_root)
-    state.replay.message = f"Real robot replay started for episode {state.replay.episode} from {dataset_root.name}"
-    state.log("warn", f"Started real robot replay pid={process.pid} dataset={dataset_root} episode={state.replay.episode}")
+    state.replay.message = (
+        f"Real robot {cube_mode} replay started for episode {state.replay.episode} from {dataset_root.name}; "
+        "RealSense preview requested"
+    )
+    state.log(
+        "warn",
+        f"Started real robot replay pid={process.pid} dataset={dataset_root} "
+        f"episode={state.replay.episode} cube={cube_mode} robot_ip={selected_ip}",
+    )
     _start_replay_output_reader(state, process)
 
 
@@ -6678,6 +6895,8 @@ def _abort_replay(state: GatewayState) -> None:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=1.0)
         state.log("warn", f"Terminated {replay_kind} replay pid={process.pid}")
+    if replay_kind == "real":
+        _stop_realsense_preview(state)
     if replay_kind == "mujoco" and state.replay.mujocoValidation:
         state.replay.mujocoValidation["status"] = "failed"
         state.replay.mujocoValidation["message"] = "MuJoCo validation aborted before completion"
@@ -6836,6 +7055,19 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 source_fps=source_fps,
             )
             return
+        if path == "/api/replay/realsense-status":
+            with self.server.state.lock:
+                payload = _realsense_preview_status(self.server.state)
+            _json_response(self, HTTPStatus.OK, payload)
+            return
+        if path == "/api/replay/realsense.jpg":
+            with self.server.state.lock:
+                image_path, _status_path = _realsense_preview_paths(self.server.state)
+            if not image_path.is_file():
+                _json_response(self, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "No RealSense preview frame available"})
+                return
+            _serve_static_file(self, image_path, "image/jpeg")
+            return
         if path == "/api/replay/video":
             requested = query.get("path", [""])[0]
             camera_key = query.get("key", [""])[0]
@@ -6857,6 +7089,36 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 )
             if video_path is None:
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"video not found: {camera_key}"})
+                return
+            _serve_video(self, video_path)
+            return
+        if path == "/api/replay/mujoco-video":
+            requested = query.get("path", [""])[0]
+            cube_mode = str(query.get("cube", [DEFAULT_MUJOCO_CUBE_MODE])[0]).strip().lower()
+            if cube_mode not in MUJOCO_CUBE_MODES:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"error": f"invalid cube mode: {cube_mode}"})
+                return
+            try:
+                episode = int(query.get("episode", ["0"])[0])
+            except ValueError:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "invalid episode"})
+                return
+            with self.server.state.lock:
+                dataset_root = (
+                    _resolve_known_dataset(self.server.state, requested)
+                    or self.server.state.selected_replay_root
+                )
+                video_path = (
+                    _mujoco_preview_video_path(dataset_root, episode, cube_mode)
+                    if dataset_root is not None
+                    else None
+                )
+            if video_path is None or not video_path.is_file():
+                _json_response(
+                    self,
+                    HTTPStatus.NOT_FOUND,
+                    {"error": f"Run MuJoCo {cube_mode} replay for this dataset and episode first."},
+                )
                 return
             _serve_video(self, video_path)
             return
@@ -6889,6 +7151,36 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                     return
                 _json_response(self, HTTPStatus.OK, timeline)
+                return
+            if path == "/api/replay/mujoco-preview":
+                requested = query.get("path", [""])[0]
+                cube_mode = str(query.get("cube", [DEFAULT_MUJOCO_CUBE_MODE])[0]).strip().lower()
+                if cube_mode not in MUJOCO_CUBE_MODES:
+                    _json_response(self, HTTPStatus.BAD_REQUEST, {"error": f"invalid cube mode: {cube_mode}"})
+                    return
+                try:
+                    episode = int(query.get("episode", ["0"])[0])
+                except ValueError:
+                    _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "invalid episode"})
+                    return
+                dataset_root = _resolve_known_dataset(self.server.state, requested) or self.server.state.selected_replay_root
+                if dataset_root is None:
+                    _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not found"})
+                    return
+                report_path = _mujoco_preview_report_path(dataset_root, episode, cube_mode)
+                try:
+                    report = _load_json_file(report_path)
+                except OSError as exc:
+                    _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                    return
+                if not report:
+                    _json_response(
+                        self,
+                        HTTPStatus.NOT_FOUND,
+                        {"error": f"Run MuJoCo {cube_mode} replay for this dataset and episode first."},
+                    )
+                    return
+                _json_response(self, HTTPStatus.OK, report)
                 return
         _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"Unknown endpoint: {path}"})
 
@@ -7007,11 +7299,18 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/replay/start-mujoco":
-                    _start_mujoco_replay(self.server.state)
+                    _start_mujoco_replay(
+                        self.server.state,
+                        query.get("cube", [DEFAULT_MUJOCO_CUBE_MODE])[0],
+                    )
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/replay/start-real":
-                    _start_real_replay(self.server.state)
+                    _start_real_replay(
+                        self.server.state,
+                        query.get("cube", ["right"])[0],
+                        query.get("robot_ip", [""])[0],
+                    )
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/calibration/run":
