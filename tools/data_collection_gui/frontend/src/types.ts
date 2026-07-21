@@ -126,7 +126,10 @@ export type ReplayStatus = {
   diagnostics?: string[];
   pid?: number | null;
   lastOutput?: string;
+  mujocoCubeMode?: MujocoCubeMode;
   mujocoValidation?: MujocoValidation;
+  realCubeMode?: RealCubeMode;
+  realRobotIp?: string;
   // Bumped when the dataset content changes under an unchanged (root, episode)
   // selection (e.g. after deleting an episode); the inspector refetches on it.
   revision?: number;
@@ -156,6 +159,53 @@ export type MujocoValidation = {
   isCurrentForSelection?: boolean;
   message: string;
   updatedAt: string;
+  cubeMode?: MujocoCubeMode;
+};
+
+export type MujocoCubeMode = "left" | "right" | "both";
+export type RealCubeMode = Exclude<MujocoCubeMode, "both">;
+
+export type RealSensePreviewStatus = {
+  available: boolean | null;
+  running: boolean;
+  serial?: string;
+  width?: number;
+  height?: number;
+  fps?: number;
+  error?: string;
+  updated_at?: number;
+};
+
+export type MujocoPreviewFrame = {
+  frame_index: number;
+  joints_rad: number[];
+  target_position_m: [number, number, number];
+  target_quaternion_xyzw?: [number, number, number, number];
+  mujoco_position_m: [number, number, number];
+};
+
+export type MujocoPreviewRobot = {
+  cube: "left" | "right";
+  episode_index: number;
+  base_offset_m: [number, number, number];
+  frames: MujocoPreviewFrame[];
+  metrics: {
+    avg_position_error_mm: number;
+    max_position_error_mm: number;
+    avg_rotation_error_deg: number;
+    max_rotation_error_deg: number;
+  };
+};
+
+export type MujocoPreview = {
+  schema_version: number;
+  dataset_root: string;
+  cube_mode: MujocoCubeMode;
+  episode_index: number;
+  fps: number;
+  robot_spacing_m: number;
+  native_video_path?: string;
+  robots: Partial<Record<"left" | "right", MujocoPreviewRobot>>;
 };
 
 export type AnnotationOutcome = "unreviewed" | "success" | "failure" | "partial";

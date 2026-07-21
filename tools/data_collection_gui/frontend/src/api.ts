@@ -17,6 +17,10 @@ import type {
   RecordingStatus,
   ReplayStatus,
   ReplayTimeline,
+  MujocoCubeMode,
+  RealCubeMode,
+  MujocoPreview,
+  RealSensePreviewStatus,
   TrajectoryPoint
 } from "./types";
 
@@ -40,7 +44,8 @@ const defaultMujocoValidation = (datasetRoot: string, episode: number, fps: numb
   trajectoryContract: {},
   isCurrentForSelection: false,
   message: datasetRoot ? "Run MuJoCo replay before real-robot replay." : "Select a recorded dataset before validation.",
-  updatedAt: ""
+  updatedAt: "",
+  cubeMode: "left"
 });
 
 export type GuiSnapshot = {
@@ -123,6 +128,7 @@ export class DataCollectionGuiApi {
       diagnostics: [],
       pid: null,
       lastOutput: "",
+      mujocoCubeMode: "left",
       mujocoValidation: defaultMujocoValidation(handheldConfigSummary.root, 0, handheldConfigSummary.fps)
     },
     annotation: {
@@ -355,8 +361,8 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async startMujocoReplay(): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot("/api/replay/start-mujoco");
+  async startMujocoReplay(cubeMode: MujocoCubeMode): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot(`/api/replay/start-mujoco?cube=${encodeURIComponent(cubeMode)}`);
     if (remote) {
       return remote;
     }
@@ -368,6 +374,7 @@ export class DataCollectionGuiApi {
       frameIndex: 0,
       trackingErrorMm: 0,
       pid: null,
+      mujocoCubeMode: cubeMode,
       message: "Gateway unavailable; MuJoCo validation cannot be mocked for real-robot safety",
       mujocoValidation: defaultMujocoValidation(
         this.snapshot.replay.datasetRoot ?? this.snapshot.replay.dataset,
@@ -377,6 +384,38 @@ export class DataCollectionGuiApi {
     };
     this.log("error", "MuJoCo validation blocked because gateway is unavailable");
     return this.getSnapshot();
+  }
+
+  async startRealCubeReplay(
+    cubeMode: RealCubeMode,
+    robotIp: string
+  ): Promise<GuiSnapshot> {
+    const params = new URLSearchParams({
+      cube: cubeMode,
+      robot_ip: robotIp
+    });
+    const remote = await this.postRemoteSnapshot(`/api/replay/start-real?${params.toString()}`);
+    if (remote) return remote;
+    throw new Error("Gateway unavailable; real-robot replay cannot start.");
+  }
+
+  async fetchMujocoPreview(
+    datasetPath: string,
+    episode: number,
+    cubeMode: MujocoCubeMode
+  ): Promise<MujocoPreview | null> {
+    try {
+      const response = await fetch(
+        `${this.apiBase}/api/replay/mujoco-preview?path=${encodeURIComponent(datasetPath)}&episode=${episode}&cube=${encodeURIComponent(cubeMode)}`,
+        { headers: { Accept: "application/json" } }
+      );
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as MujocoPreview;
+    } catch {
+      return null;
+    }
   }
 
   async saveEpisodeAnnotation(annotation: EpisodeAnnotation): Promise<GuiSnapshot> {
@@ -491,6 +530,31 @@ export class DataCollectionGuiApi {
       params.set("episode", String(episode));
     }
     return `${this.apiBase}/api/replay/video?${params.toString()}`;
+  }
+
+  mujocoVideoUrl(datasetPath: string, episode: number, cubeMode: MujocoCubeMode): string {
+    const params = new URLSearchParams({
+      path: datasetPath,
+      episode: String(episode),
+      cube: cubeMode
+    });
+    return `${this.apiBase}/api/replay/mujoco-video?${params.toString()}`;
+  }
+
+  realSenseSnapshotUrl(cacheKey: number): string {
+    return `${this.apiBase}/api/replay/realsense.jpg?t=${cacheKey}`;
+  }
+
+  async fetchRealSenseStatus(): Promise<RealSensePreviewStatus | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/replay/realsense-status`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) return null;
+      return (await response.json()) as RealSensePreviewStatus;
+    } catch {
+      return null;
+    }
   }
 
   cameraSnapshotUrl(deviceId: string): string {
