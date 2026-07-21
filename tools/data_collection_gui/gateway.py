@@ -675,6 +675,10 @@ def _box_devices_from_roster(roster: list[dict[str, Any]]) -> list[dict[str, Any
                         "box_id": box_id,
                         "device_id": device_num,
                         "sn": sn,
+                        # Firmware version as reported by the box's discovery
+                        # broadcast (0 when the wheel/firmware predates it). The
+                        # calibration center surfaces this as the box's version.
+                        "fw_version": entry.get("fw_version", 0),
                         "remote_ip": ip,
                         "data_port": entry.get("data_port", 15000),
                         "sensor_id": sid,
@@ -5624,22 +5628,28 @@ def _maybe_send_preview_demand(state: GatewayState) -> None:
             pass
 
 
-def _trigger_box_six_d_force_cali(state: GatewayState, *, origin: bool = False) -> dict[str, Any]:
+def _trigger_box_six_d_force_cali(
+    state: GatewayState, *, origin: bool = False, box_id: str = ""
+) -> dict[str, Any]:
     """Ask the running GMSL2 recorder to calibrate the BOX 6D force sensor.
 
     The recorder owns the live box connection, so the command rides its stdin
     and progress comes back as CALI_LOG/CALI_DONE stdout lines. ``origin=False``
     (default) requests software zeroing (``cali_6dforce``); ``origin=True``
     requests the MCU-side TLV origin calibration (``cali_6dforce_origin``).
-    Returns a small status dict for the POST response.
+    ``box_id`` restricts the run to a single box (empty = whole fleet), sent as a
+    ``:<box_id>`` suffix on the stdin command. Returns a small status dict for
+    the POST response.
     """
     process = state.process
     if process is None or process.poll() is not None:
         return {"ok": False, "error": "recorder is not connected; press Connect first"}
     if not _state_is_gmsl2(state):
         return {"ok": False, "error": "6D force calibration requires the GMSL2/BOX recorder"}
-    stdin_cmd = "cali_6dforce_origin\n" if origin else "cali_6dforce\n"
-    label = "6D force MCU-origin" if origin else "6D force software-zero"
+    base_cmd = "cali_6dforce_origin" if origin else "cali_6dforce"
+    stdin_cmd = f"{base_cmd}:{box_id}\n" if box_id else f"{base_cmd}\n"
+    scope = f" [{box_id}]" if box_id else ""
+    label = ("6D force MCU-origin" if origin else "6D force software-zero") + scope
     with state.box_cali_lock:
         state.box_cali_running = True
         state.box_cali_log.append(
@@ -5658,26 +5668,29 @@ def _trigger_box_six_d_force_cali(state: GatewayState, *, origin: bool = False) 
     return {"ok": True}
 
 
-def _trigger_box_touch_cali(state: GatewayState) -> dict[str, Any]:
+def _trigger_box_touch_cali(state: GatewayState, *, box_id: str = "") -> dict[str, Any]:
     """Ask the running GMSL2 recorder to calibrate (re-zero) the BOX touch pads.
 
     Mirrors :func:`_trigger_box_six_d_force_cali` but rides its own
     TOUCHCALI_LOG/TOUCHCALI_DONE stdout channel into ``box_touch_cali_log`` so
-    the touch viewer never shows 6D force lines (and vice versa).
+    the touch viewer never shows 6D force lines (and vice versa). ``box_id``
+    restricts the run to a single box (empty = whole fleet); a box's two pads
+    share one MCU-side re-zero, so this is per-box, not per-pad.
     """
     process = state.process
     if process is None or process.poll() is not None:
         return {"ok": False, "error": "recorder is not connected; press Connect first"}
     if not _state_is_gmsl2(state):
         return {"ok": False, "error": "touch calibration requires the GMSL2/BOX recorder"}
+    scope = f" [{box_id}]" if box_id else ""
     with state.box_touch_cali_lock:
         state.box_touch_cali_running = True
         state.box_touch_cali_log.append(
-            {"ts": time.time(), "line": "touch calibration command sent to recorder", "done": False}
+            {"ts": time.time(), "line": f"touch calibration command sent to recorder{scope}", "done": False}
         )
         del state.box_touch_cali_log[:-200]
     try:
-        _write_recorder_stdin(process, "calitouch\n")
+        _write_recorder_stdin(process, f"calitouch:{box_id}\n" if box_id else "calitouch\n")
     except (BrokenPipeError, ValueError, OSError, RuntimeError) as exc:
         with state.box_touch_cali_lock:
             state.box_touch_cali_running = False
@@ -7019,17 +7032,20 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/device/calibrate-6dforce":
-                    result = _trigger_box_six_d_force_cali(self.server.state)
+                    box_id = (query.get("box_id", [""])[0] or "").strip()
+                    result = _trigger_box_six_d_force_cali(self.server.state, box_id=box_id)
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
                     return
                 if path == "/api/device/calibrate-6dforce-origin":
-                    result = _trigger_box_six_d_force_cali(self.server.state, origin=True)
+                    box_id = (query.get("box_id", [""])[0] or "").strip()
+                    result = _trigger_box_six_d_force_cali(self.server.state, origin=True, box_id=box_id)
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
                     return
                 if path == "/api/device/calibrate-touch":
-                    result = _trigger_box_touch_cali(self.server.state)
+                    box_id = (query.get("box_id", [""])[0] or "").strip()
+                    result = _trigger_box_touch_cali(self.server.state, box_id=box_id)
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
                     return

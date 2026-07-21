@@ -220,25 +220,29 @@ def _fmt_force_vec(vec: list[float] | None) -> str:
 _CALI_LOCK = threading.Lock()
 
 
-def _run_six_d_force_cali(box: bc.BoxPool, *, origin: bool = False) -> None:
+def _run_six_d_force_cali(
+    box: bc.BoxPool, *, origin: bool = False, box_id: str = ""
+) -> None:
     """Trigger 6D force-sensor zeroing and stream progress as CALI_LOG lines.
 
     ``origin=False`` (default) runs box_sdk's software zeroing
     (``cali_6d_force_sensor``); ``origin=True`` runs the MCU-side TLV origin
-    calibration (``cali_6d_force_sensor_origin``). Runs on its own thread: the
-    stdin reader must not block on the ~1s SDK round-trip. Emits a terminal
-    ``CALI_DONE ok|error`` line so the gateway can mark the run complete and the
-    frontend can stop spinning.
+    calibration (``cali_6d_force_sensor_origin``). ``box_id`` restricts the run
+    to a single box (empty = whole fleet, i.e. the one box on a single-box rig).
+    Runs on its own thread: the stdin reader must not block on the ~1s SDK
+    round-trip. Emits a terminal ``CALI_DONE ok|error`` line so the gateway can
+    mark the run complete and the frontend can stop spinning.
     """
     kind = "MCU origin" if origin else "software zero"
+    scope = f" [{box_id}]" if box_id else ""
     if not _CALI_LOCK.acquire(blocking=False):
-        _emit(f"CALI_LOG 6D force {kind}: another calibration in progress, ignored")
+        _emit(f"CALI_LOG 6D force {kind}{scope}: another calibration in progress, ignored")
         _emit("CALI_DONE error")
         return
     try:
-        _emit(f"CALI_LOG 6D force sensor {kind} requested")
+        _emit(f"CALI_LOG 6D force sensor {kind}{scope} requested")
         try:
-            results = box.calibrate_six_d_force(origin=origin)
+            results = box.calibrate_six_d_force(origin=origin, box_id=box_id or None)
         except Exception as exc:  # noqa: BLE001 - calibration must never crash the recorder
             _emit(f"CALI_LOG ERROR calibration raised: {exc}")
             _emit("CALI_DONE error")
@@ -267,22 +271,25 @@ def _run_six_d_force_cali(box: bc.BoxPool, *, origin: bool = False) -> None:
         _CALI_LOCK.release()
 
 
-def _run_touch_cali(box: bc.BoxPool) -> None:
+def _run_touch_cali(box: bc.BoxPool, *, box_id: str = "") -> None:
     """Trigger touch-sensor re-zeroing and stream progress as TOUCHCALI_LOG lines.
 
     Uses its own TOUCHCALI_LOG/TOUCHCALI_DONE stdout channel (distinct from the
     6D force CALI_LOG/CALI_DONE) so the gateway routes it to a separate buffer
-    and the touch viewer never shows 6D force lines. Runs on its own thread so
+    and the touch viewer never shows 6D force lines. ``box_id`` restricts the
+    run to a single box (empty = whole fleet). A box's two pads share one
+    MCU-side re-zero, so this is per-box, not per-pad. Runs on its own thread so
     the stdin reader never blocks on the SDK round-trip.
     """
+    scope = f" [{box_id}]" if box_id else ""
     if not _CALI_LOCK.acquire(blocking=False):
-        _emit("TOUCHCALI_LOG touch: another calibration in progress, ignored")
+        _emit(f"TOUCHCALI_LOG touch{scope}: another calibration in progress, ignored")
         _emit("TOUCHCALI_DONE error")
         return
     try:
-        _emit("TOUCHCALI_LOG touch sensor re-zero requested")
+        _emit(f"TOUCHCALI_LOG touch sensor re-zero{scope} requested")
         try:
-            results = box.calibrate_touch()
+            results = box.calibrate_touch(box_id=box_id or None)
         except Exception as exc:  # noqa: BLE001 - calibration must never crash the recorder
             _emit(f"TOUCHCALI_LOG ERROR calibration raised: {exc}")
             _emit("TOUCHCALI_DONE error")
@@ -311,9 +318,9 @@ def _read_stdin_loop(
     queue: list[StdinCommand],
     stop: threading.Event,
     on_demand: Callable[[], None] | None = None,
-    on_calibrate: Callable[[], None] | None = None,
-    on_calibrate_origin: Callable[[], None] | None = None,
-    on_calibrate_touch: Callable[[], None] | None = None,
+    on_calibrate: Callable[[str], None] | None = None,
+    on_calibrate_origin: Callable[[str], None] | None = None,
+    on_calibrate_touch: Callable[[str], None] | None = None,
 ) -> None:
     while not stop.is_set():
         line = sys.stdin.readline()
@@ -321,6 +328,12 @@ def _read_stdin_loop(
             queue.append(StdinCommand(kind="quit", raw=""))
             return
         stripped = line.strip().lower()
+        # Calibration commands may carry a ":<box_id>" suffix selecting a single
+        # box (the GUI per-device button). Keep the box_id case-preserved (it can
+        # be a serial); an absent suffix means whole-fleet as before.
+        cmd_key, _, cmd_box = line.strip().partition(":")
+        cmd_key = cmd_key.lower()
+        box_id = cmd_box.strip()
         if stripped == "":
             queue.append(StdinCommand(kind="start", raw=line))
         elif stripped in ("y", "yes", "save"):
@@ -338,23 +351,23 @@ def _read_stdin_loop(
             # and drop.
             if on_demand is not None:
                 on_demand()
-        elif stripped == "cali_6dforce":
+        elif cmd_key == "cali_6dforce":
             # Out-of-band 6D force-sensor calibration request from the gateway
             # (Device Manager button). Like preview_demand it's a side-effect,
             # not an FSM start/save/quit command, so fire the callback instead
             # of enqueuing it. The callback offloads the actual SDK call to its
             # own thread so reading further stdin lines never blocks on it.
             if on_calibrate is not None:
-                on_calibrate()
-        elif stripped == "cali_6dforce_origin":
+                on_calibrate(box_id)
+        elif cmd_key == "cali_6dforce_origin":
             # MCU-side TLV origin calibration variant of cali_6dforce above.
             if on_calibrate_origin is not None:
-                on_calibrate_origin()
-        elif stripped == "calitouch":
+                on_calibrate_origin(box_id)
+        elif cmd_key == "calitouch":
             # Out-of-band touch-sensor calibration request from the gateway,
             # analogous to cali_6dforce above: a side-effect, not an FSM command.
             if on_calibrate_touch is not None:
-                on_calibrate_touch()
+                on_calibrate_touch(box_id)
         else:
             logger.warning("ignoring unrecognized stdin command: %r", line)
 
@@ -1394,25 +1407,25 @@ def main(argv: list[str] | None = None) -> int:
     stop_event = threading.Event()
     cmd_queue: list[StdinCommand] = []
 
-    def _trigger_six_d_force_cali() -> None:
+    def _trigger_six_d_force_cali(box_id: str = "") -> None:
         # Offload to a dedicated thread so the stdin reader keeps draining lines
         # (including preview_demand heartbeats) during the SDK round-trip.
         threading.Thread(
-            target=_run_six_d_force_cali, args=(box,),
+            target=_run_six_d_force_cali, args=(box,), kwargs={"box_id": box_id},
             daemon=True, name="thor-record-cali",
         ).start()
 
-    def _trigger_six_d_force_cali_origin() -> None:
+    def _trigger_six_d_force_cali_origin(box_id: str = "") -> None:
         # MCU-side origin calibration variant; same offload pattern.
         threading.Thread(
-            target=_run_six_d_force_cali, args=(box,), kwargs={"origin": True},
+            target=_run_six_d_force_cali, args=(box,), kwargs={"origin": True, "box_id": box_id},
             daemon=True, name="thor-record-cali-origin",
         ).start()
 
-    def _trigger_touch_cali() -> None:
+    def _trigger_touch_cali(box_id: str = "") -> None:
         # Same offload pattern as the 6D force calibration above.
         threading.Thread(
-            target=_run_touch_cali, args=(box,),
+            target=_run_touch_cali, args=(box,), kwargs={"box_id": box_id},
             daemon=True, name="thor-record-touch-cali",
         ).start()
 

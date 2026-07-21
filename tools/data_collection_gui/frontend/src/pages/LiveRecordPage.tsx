@@ -1,0 +1,329 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { GuiSnapshot } from "../api";
+import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
+import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
+
+export function DeviceList({ devices, config }: { devices: DeviceStatus[]; config: ConfigSummary }) {
+  const grouped = useMemo(() => {
+    return devices.reduce<Record<string, DeviceStatus[]>>((acc, device) => {
+      acc[device.kind] = [...(acc[device.kind] ?? []), device];
+      return acc;
+    }, {});
+  }, [devices]);
+
+  const cameraCount = grouped["camera"]?.length ?? 0;
+  const runningCameras = grouped["camera"]?.filter((d) => d.state === "running").length ?? 0;
+  const errorCameras = grouped["camera"]?.filter((d) => d.state === "error").length ?? 0;
+
+  return (
+    <section className="panel">
+      <div className="panel-heading">
+        <h2>Devices</h2>
+        <span>{devices.length} streams</span>
+      </div>
+      {Object.entries(grouped).map(([kind, items]) => {
+        const kindLabel = kind === "camera" && config.rigType === "gmsl2"
+          ? `GMSL2 cameras`
+          : kind === "box_collection"
+            ? "BOX sensors"
+            : kind.replace("_", " ");
+        const kindSummary = kind === "camera" && config.rigType === "gmsl2"
+          ? `${runningCameras}/${cameraCount} running${errorCameras ? `, ${errorCameras} error` : ""}`
+          : `${items.length} devices`;
+        return (
+          <div className="device-group" key={kind}>
+            <div className="device-group-header">
+              <h3>{kindLabel}</h3>
+              <small>{kindSummary}</small>
+            </div>
+            {items.map((device) => (
+              <div className="device-row" key={device.id}>
+                <div>
+                  <div className="row-title">
+                    <StatusDot state={device.state} />
+                    <strong>{device.id}</strong>
+                  </div>
+                  <p>{device.label}</p>
+                </div>
+                <div className="device-stats">
+                  <span>{device.fps} fps</span>
+                  <span>{device.latencyMs} ms</span>
+                  <small>{device.detail}</small>
+                </div>
+              </div>
+            ))}
+          </div>
+        );
+      })}
+    </section>
+  );
+}
+
+export function HardwareSyncBadge({ config }: { config: ConfigSummary }) {
+  const hw = config.hardwareSync;
+  if (!hw) return null;
+  const trigLabel = hw.trigMode === 1 ? "PWM slave" : hw.trigMode === 0 ? "free-run" : `trig ${hw.trigMode}`;
+  return (
+    <div className={`hw-sync-badge ${hw.enabled ? "hw-sync-on" : "hw-sync-off"}`}>
+      <span className="hw-sync-icon">{hw.enabled ? "◉" : "○"}</span>
+      <span>HW Sync {hw.enabled ? "ON" : "OFF"}</span>
+      {hw.enabled && <small>{hw.fps} Hz {trigLabel}{hw.pwmChip ? ` · ${hw.pwmChip}` : ""}</small>}
+    </div>
+  );
+}
+
+export function CameraEncodingInfo({ config }: { config: ConfigSummary }) {
+  const cam = config.cameraDefaults;
+  if (!cam || !cam.codec) return null;
+  const res = cam.width && cam.height ? `${cam.width}x${cam.height}` : "";
+  const bitrate = cam.bitrateKbps ? `${cam.bitrateKbps} kbps` : "";
+  const exposure = cam.exposureUs ? `exp ${cam.exposureUs} us` : "";
+  const gain = cam.gain ? `gain ${cam.gain}` : "";
+  return (
+    <div className="encoding-info">
+      <Metric label="Codec" value={`${cam.codec.toUpperCase()} / ${cam.container || "mkv"}`} />
+      <Metric label="Resolution" value={res || "—"} />
+      <Metric label="Bitrate" value={bitrate || "—"} />
+      <Metric label="Pipeline" value={cam.pipeline || "—"} />
+      <Metric label="Exposure" value={exposure || "auto"} />
+      <Metric label="Gain" value={gain || "auto"} />
+    </div>
+  );
+}
+
+export function RecorderLogStream({ lines }: { lines: string[] }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  // Stop auto-scrolling once the user has manually scrolled up; resume once
+  // they scroll back to within the bottom threshold.
+  const stickToBottomRef = useRef(true);
+
+  const handleScroll = () => {
+    const el = containerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom < 24;
+  };
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (el && stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [lines]);
+
+  if (lines.length === 0) return null;
+  return (
+    <div
+      className="process-output-log"
+      ref={containerRef}
+      onScroll={handleScroll}
+      role="log"
+      aria-live="polite"
+    >
+      {lines.map((line, i) => (
+        <div className="process-output-line" key={`${i}-${line}`}>{line}</div>
+      ))}
+    </div>
+  );
+}
+
+// Single source of truth for which record controls are available in a given
+// recorder state. Shared by the RecordingPanel buttons AND the LiveRecord
+// keyboard shortcuts, so a shortcut can never fire an action that a disabled
+// button wouldn't.
+export function recordingControlAvailability(status: RecordingStatus) {
+  const isConnected =
+    status.pid != null ||
+    ["connecting", "armed", "recording", "review", "saving", "discarding"].includes(status.state);
+  return {
+    isConnected,
+    canConnect: !isConnected,
+    canStartEpisode: status.state === "armed",
+    canResolveEpisode: status.state === "recording" || status.state === "review",
+    canExit: isConnected,
+  };
+}
+
+export function RecordingPanel({
+  status,
+  config,
+  busy,
+  onConnect,
+  onStart,
+  onStop,
+  logLines
+}: {
+  status: RecordingStatus;
+  config: ConfigSummary;
+  busy: boolean;
+  onConnect: () => void;
+  onStart: () => void;
+  onStop: (action: "save" | "discard" | "exit") => void;
+  logLines?: string[];
+}) {
+  const progress = Math.round((status.frameIndex / Math.max(status.targetFrames, 1)) * 100);
+  const { isConnected, canStartEpisode, canResolveEpisode, canExit } =
+    recordingControlAvailability(status);
+  const isGmsl = config.rigType === "gmsl2";
+  const panelTitle = isGmsl ? "GMSL2 Record" : "Handheld Record";
+
+  return (
+    <section className="panel">
+      <div className="panel-heading">
+        <h2>{panelTitle}</h2>
+        <span className="state-pill">
+          <StatusDot state={status.state} />
+          {stateLabel(status.state)}
+        </span>
+      </div>
+      {isGmsl && <HardwareSyncBadge config={config} />}
+      <div className="config-grid">
+        <Metric label="Config" value={config.configPath} />
+        <Metric label="Repo" value={status.repoId} />
+        <Metric label="Root" value={status.datasetRoot} />
+        <Metric label="FPS" value={config.fps} />
+        <Metric label="Episode" value={`${config.episodeTimeS}s / ${status.targetFrames} frames`} />
+        <Metric label="Encoding" value={`${config.vcodec || "raw"}${config.streamingEncoding ? ", streaming" : ""}`} />
+      </div>
+      {isGmsl && <CameraEncodingInfo config={config} />}
+      <div className="progress">
+        <div className="progress-bar" style={{ width: `${progress}%` }} />
+      </div>
+      <div className="control-row">
+        <button disabled={busy || isConnected} onClick={onConnect} title="Shortcut: C">Connect <kbd>C</kbd></button>
+        <button disabled={busy || !canStartEpisode} onClick={onStart} title="Shortcut: E">StartEpisode <kbd>E</kbd></button>
+        <button disabled={busy || !canResolveEpisode} onClick={() => onStop("save")} title="Shortcut: S">Save <kbd>S</kbd></button>
+        <button disabled={busy || !canResolveEpisode} onClick={() => onStop("discard")} title="Shortcut: D">Discard <kbd>D</kbd></button>
+        <button disabled={busy || !canExit} onClick={() => onStop("exit")} title="Shortcut: Esc">Exit <kbd>Esc</kbd></button>
+      </div>
+      <div className="summary-grid">
+        <Metric label="Frame" value={`${status.frameIndex}/${status.targetFrames}`} />
+        <Metric label="Queue" value={status.queueDepth} />
+        <Metric label="Saved" value={status.savedEpisodes} />
+        <Metric label="PID" value={status.pid ?? "none"} />
+      </div>
+      <p className="panel-note">{status.message}</p>
+      {logLines && logLines.length > 0
+        ? <RecorderLogStream lines={logLines} />
+        : status.lastOutput
+          ? <p className="process-output">{status.lastOutput}</p>
+          : null}
+    </section>
+  );
+}
+
+
+
+export function LiveRecordPage({
+  snapshot,
+  busy,
+  onConnect,
+  onStart,
+  onStop,
+  onOpenInReplay,
+  onQueueTrajGen,
+  onGoToProcessing,
+  onClearActiveTask
+}: {
+  snapshot: GuiSnapshot;
+  busy: boolean;
+  onConnect: () => void;
+  onStart: () => void;
+  onStop: (action: "save" | "discard" | "exit") => void;
+  onOpenInReplay: () => void;
+  onQueueTrajGen: () => void;
+  onGoToProcessing: () => void;
+  onClearActiveTask: () => void;
+}) {
+  const showSavedBanner = snapshot.recording.savedEpisodes > 0;
+  const activeTask = snapshot.activeTaskId
+    ? snapshot.tasks.find((t) => t.id === snapshot.activeTaskId) ?? null
+    : null;
+  const recorderConnected = ["connecting", "armed", "recording", "review", "saving", "discarding"].includes(
+    snapshot.recording.state
+  );
+  // The backend keeps a per-session ring buffer (RecordingStatus.recentOutput)
+  // and clears it when the operator clicks Connect, so we can render it
+  // directly. The pre-PR6 approach of accumulating `lastOutput` lost any
+  // line that didn't land at the top of a snapshot poll window.
+  const logLines = snapshot.recording.recentOutput ?? [];
+
+  // Keyboard shortcuts for the record controls. This component is mounted only
+  // while activePage === "live-record", so the window listener is naturally
+  // scoped to this page. Each key mirrors the matching button's enabled gating
+  // exactly (recordingControlAvailability), is suppressed while busy, ignores
+  // modifier combos (so Ctrl/Cmd+S etc. stay with the browser), and never fires
+  // while the operator is typing in an input/textarea/select.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.repeat || event.isComposing) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      const el = document.activeElement as HTMLElement | null;
+      const tag = el?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el?.isContentEditable) return;
+      if (busy) return;
+      const controls = recordingControlAvailability(snapshot.recording);
+      const key = event.key.toLowerCase();
+      if (key === "c" && controls.canConnect) {
+        event.preventDefault();
+        onConnect();
+      } else if (key === "e" && controls.canStartEpisode) {
+        event.preventDefault();
+        onStart();
+      } else if (key === "s" && controls.canResolveEpisode) {
+        event.preventDefault();
+        onStop("save");
+      } else if (key === "d" && controls.canResolveEpisode) {
+        event.preventDefault();
+        onStop("discard");
+      } else if (event.key === "Escape" && controls.canExit) {
+        event.preventDefault();
+        onStop("exit");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [busy, snapshot.recording, onConnect, onStart, onStop]);
+
+  return (
+    <div className="page-stack">
+      <PageHeader
+        title="Live Record"
+        subtitle={snapshot.configSummary.rigType === "gmsl2"
+          ? `GMSL2 ${snapshot.devices.filter((d) => d.kind === "camera").length}-camera capture with${snapshot.configSummary.hardwareSync?.enabled ? "" : "out"} hardware sync`
+          : "capture raw multi-camera handheld data; post-processing lives on the Processing page"}
+      />
+      {activeTask && (
+        <section className="panel task-binding-banner">
+          <div className="panel-heading">
+            <h2>Recording for task: {activeTask.name}</h2>
+            <button disabled={busy || recorderConnected} onClick={onClearActiveTask}>Unbind</button>
+          </div>
+          <p className="panel-note">
+            Episodes save into <strong>{activeTask.datasetRepoId}</strong> and count toward this task ({activeTask.completedEpisodes}/{activeTask.targetEpisodes}).
+            {recorderConnected ? " Disconnect to unbind or switch tasks." : " Binding applies on the next Connect."}
+          </p>
+        </section>
+      )}
+      <div className="split-layout">
+        <RecordingPanel status={snapshot.recording} config={snapshot.configSummary} busy={busy} onConnect={onConnect} onStart={onStart} onStop={onStop} logLines={logLines} />
+        <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />
+      </div>
+      {showSavedBanner ? (
+        <section className="panel saved-cta">
+          <div className="panel-heading">
+            <h2>Raw dataset saved</h2>
+            <span>{snapshot.recording.savedEpisodes} episodes this session</span>
+          </div>
+          <p className="panel-note">{snapshot.recording.datasetRoot}</p>
+          <div className="control-row">
+            <button disabled={busy} onClick={onOpenInReplay}>Open in Replay</button>
+            <button disabled={busy} onClick={onQueueTrajGen}>Queue Traj Gen</button>
+            <button disabled={busy} onClick={onGoToProcessing}>Go to Processing</button>
+          </div>
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
