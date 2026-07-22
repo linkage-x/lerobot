@@ -263,6 +263,30 @@ button.danger {
   white-space: nowrap;
 }
 
+/* Global Connect/Disconnect embedded in the Recorder status pill. */
+.topbar-recorder { gap: 8px; padding-right: 4px; }
+.topbar-btn {
+  background: #eef2f5;
+  border: 1px solid #cfd8de;
+  border-radius: 999px;
+  color: #1f2a30;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 5px 11px;
+}
+.topbar-btn:hover:not(:disabled) { background: #e2e8ec; }
+.topbar-btn:disabled { cursor: not-allowed; opacity: 0.5; }
+.topbar-btn-primary { background: #0f766e; border-color: #0f766e; color: #fff; }
+.topbar-btn-primary:hover:not(:disabled) { background: #0b5f5a; border-color: #0b5f5a; }
+
+/* Dashboard hub helpers. */
+.dashboard-inline-status { align-items: center; display: inline-flex; gap: 8px; }
+.dashboard-muted { color: #94a3b8; font-size: 12px; }
+.dashboard-device-list { display: flex; flex-direction: column; gap: 6px; list-style: none; margin: 0; padding: 0; }
+.dashboard-device-list li { align-items: center; display: flex; gap: 8px; }
+
 .layout {
   display: grid;
   gap: 14px;
@@ -2241,4 +2265,570 @@ button.danger {
   border: none;
   border-radius: 6px;
   cursor: pointer;
+}
+
+/* =========================================================================
+   Calibration center (标定中心)
+   Palette: green #0f766e = pass/valid, amber #b7791f = due-soon/warning,
+   red #c2410c = fail/overdue, blue #2563eb = waiting/info. Status must never
+   rely on color alone — every state also carries text and/or an icon.
+   ========================================================================= */
+
+/* ---- sidebar badge + global device status footer ---- */
+.nav-badge {
+  align-items: center;
+  display: inline-flex;
+  gap: 5px;
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.nav-badge-running { background: #e6f4f1; color: #0b5f5a; }
+.nav-badge-warning { background: #fbf0dc; color: #8a5a12; }
+.nav-badge-error { background: #fbe6dc; color: #8d2d12; }
+
+.nav-footer {
+  border-top: 1px solid #e1e6ea;
+  display: grid;
+  gap: 6px;
+  margin-top: 4px;
+  padding-top: 10px;
+}
+.nav-footer-row {
+  align-items: center;
+  color: #43525e;
+  display: flex;
+  font-size: 12px;
+  gap: 7px;
+}
+.nav-footer-muted { color: #7b8791; }
+
+/* ---- shared badges + chips ---- */
+.cali-badge {
+  align-items: center;
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 700;
+  gap: 6px;
+  padding: 2px 9px;
+  white-space: nowrap;
+}
+.cali-badge-running { background: #e6f4f1; color: #0b5f5a; }
+.cali-badge-warning { background: #fbf0dc; color: #8a5a12; }
+.cali-badge-error { background: #fbe6dc; color: #8d2d12; }
+.cali-badge-idle { background: #eef1f3; color: #60707c; }
+
+.cali-chip {
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 650;
+  padding: 1px 8px;
+}
+.cali-chip-ok { background: rgba(15, 118, 110, 0.18); color: #7fe0d4; }
+.cali-chip-warn { background: rgba(194, 65, 12, 0.2); color: #f4a780; }
+
+.cali-muted { color: #7b8791; }
+
+/* ---- global status bar ---- */
+.cali-statusbar {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: space-between;
+}
+.cali-statusbar-main {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+.cali-statusbar-item {
+  align-items: center;
+  color: #43525e;
+  display: inline-flex;
+  font-size: 13px;
+  gap: 6px;
+}
+.cali-statusbar-side {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+}
+.cali-operator {
+  align-items: center;
+  color: #60707c;
+  display: inline-flex;
+  font-size: 12px;
+  gap: 6px;
+}
+.cali-operator input {
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font: inherit;
+  min-height: 32px;
+  padding: 0 8px;
+  width: 120px;
+}
+
+/* ---- readiness checklist ---- */
+.cali-readiness { display: grid; gap: 6px; }
+.cali-readiness-row {
+  align-items: center;
+  border: 1px solid #e1e6ea;
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 28px minmax(0, 1fr) auto auto auto;
+  padding: 8px 12px;
+}
+.cali-readiness-action {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.cali-mini-btn {
+  font-size: 12px;
+  min-height: 28px;
+  padding: 0 8px;
+}
+@media (max-width: 900px) {
+  .cali-readiness-row { grid-template-columns: 28px minmax(0, 1fr) auto; }
+  .cali-readiness-row .cali-readiness-detail { grid-column: 2 / -1; text-align: left; }
+  .cali-readiness-action { grid-column: 2 / -1; }
+}
+.cali-readiness-row.cali-readiness-failed { border-color: #eabfab; background: #fdf3ee; }
+.cali-readiness-row.cali-readiness-warning { border-color: #ecd7a6; background: #fdf8ee; }
+.cali-readiness-row.cali-readiness-complete { border-color: #b6ded8; }
+.cali-readiness-icon {
+  align-items: center;
+  color: #60707c;
+  display: inline-flex;
+  font-weight: 800;
+  gap: 5px;
+}
+.cali-readiness-label { color: #172026; font-weight: 600; }
+.cali-readiness-detail {
+  color: #43525e;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  text-align: right;
+}
+.cali-readiness-state { font-size: 12px; font-weight: 700; }
+.cali-readiness-state-complete { color: #0b5f5a; }
+.cali-readiness-state-warning { color: #8a5a12; }
+.cali-readiness-state-failed { color: #8d2d12; }
+.cali-readiness-state-unavailable,
+.cali-readiness-state-pending { color: #7b8791; }
+.cali-readiness-todo {
+  color: #7b8791;
+  font-size: 11px;
+  grid-column: 2 / -1;
+}
+
+/* ---- live monitors (dark) ---- */
+.cali-monitor-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+.cali-monitor {
+  border: 1px solid #d2d9de;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+}
+.cali-monitor-dark {
+  background: #0f172a;
+  border-color: #1f2a3a;
+  color: #e2e8f0;
+}
+.cali-monitor-head {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+.cali-monitor-title {
+  align-items: center;
+  display: inline-flex;
+  font-weight: 700;
+  gap: 7px;
+}
+.cali-monitor-media {
+  align-items: center;
+  aspect-ratio: 17 / 15;
+  display: flex;
+  justify-content: center;
+  max-height: 220px;
+}
+.cali-monitor-foot {
+  color: #94a3b8;
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 12px;
+  gap: 12px;
+}
+
+/* ---- per-axis 6D force grid ---- */
+.cali-axis-grid { display: grid; gap: 4px; }
+.cali-axis-row {
+  align-items: center;
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 40px minmax(0, 1fr) 44px auto;
+  padding: 3px 8px;
+}
+.cali-axis-label { color: inherit; font-weight: 700; opacity: 0.8; }
+.cali-axis-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.cali-axis-unit { color: #94a3b8; font-size: 11px; }
+/* Light (result panel) default: dark red text on the salmon tint so it stays
+   legible. The dark monitor cards override the text color below. */
+.cali-axis-row.cali-axis-fail {
+  background: rgba(194, 65, 12, 0.16);
+  color: #8d2d12;
+}
+.cali-monitor-dark .cali-axis-row.cali-axis-fail {
+  background: rgba(194, 65, 12, 0.22);
+  color: #ffb896;
+}
+.cali-axis-verdict { font-size: 11px; font-weight: 800; }
+.cali-axis-verdict.pass { color: #0f9d8f; }
+.cali-axis-verdict.fail { color: #b91c1c; }
+.cali-axis-empty { color: #94a3b8; font-size: 12px; padding: 8px 0; }
+
+/* ---- touch metrics ---- */
+.cali-touch-metrics {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.cali-touch-metric { display: flex; flex-direction: column; gap: 2px; }
+.cali-touch-metric span { color: #94a3b8; font-size: 11px; }
+.cali-touch-metric strong {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.cali-touch-result {
+  color: #43525e;
+  display: flex;
+  flex-wrap: wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  gap: 14px;
+}
+
+/* ---- calibration operation cards ---- */
+.cali-op-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+}
+/* Per-BOX grouping panel: monitors + calibration cards for one box. */
+.cali-box-panel {
+  border-left: 3px solid #0f766e;
+  display: grid;
+  gap: 14px;
+}
+.cali-box-panel > .cali-monitor-grid,
+.cali-box-panel > .cali-op-grid { margin: 0; }
+
+.cali-op-card { position: relative; }
+.cali-meta {
+  display: grid;
+  gap: 6px 16px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  margin-bottom: 10px;
+}
+.cali-meta-row { display: flex; flex-direction: column; }
+.cali-meta-row span { color: #60707c; font-size: 11px; }
+.cali-meta-row strong {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.cali-box-status { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.cali-box-chip {
+  align-items: center;
+  background: #f5f7f8;
+  border: 1px solid #e1e6ea;
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 12px;
+  gap: 6px;
+  padding: 2px 10px;
+}
+.cali-steps {
+  color: #43525e;
+  display: grid;
+  gap: 3px;
+  margin: 0 0 10px;
+  padding-left: 20px;
+}
+.cali-warn, .cali-info, .cali-guard {
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+}
+.cali-warn { background: #fdf3ee; border: 1px solid #eabfab; color: #8d2d12; }
+.cali-info { background: #eef4ff; border: 1px solid #c4d6f4; color: #234a86; }
+.cali-guard { background: #fbf0dc; border: 1px solid #ecd7a6; color: #8a5a12; }
+.cali-op-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.cali-touch-actions { gap: 8px; }
+.cali-btn-primary {
+  background: #0f766e;
+  border-color: #0f766e;
+  color: #fff;
+}
+.cali-btn-primary:hover:not(:disabled) { background: #0b5f5a; border-color: #0b5f5a; }
+.cali-btn-primary:disabled { background: #b8c2c9; border-color: #b8c2c9; color: #eef1f3; }
+.cali-dev-hint { color: #94a3b8; font-size: 11px; }
+
+.cali-progress {
+  align-items: center;
+  color: #234a86;
+  display: flex;
+  font-size: 13px;
+  gap: 8px;
+  margin: 8px 0;
+}
+.cali-spinner {
+  animation: cali-spin 0.8s linear infinite;
+  border: 2px solid #c4d6f4;
+  border-radius: 50%;
+  border-top-color: #2563eb;
+  height: 14px;
+  width: 14px;
+}
+@keyframes cali-spin { to { transform: rotate(360deg); } }
+
+.cali-reboot {
+  background: #eef4ff;
+  border: 1px solid #c4d6f4;
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  margin: 8px 0;
+  padding: 10px 12px;
+}
+.cali-reboot p { margin: 0; color: #234a86; font-size: 13px; }
+
+/* ---- result panel ---- */
+.cali-result {
+  border: 1px solid #e1e6ea;
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 12px;
+}
+.cali-result-pass { border-color: #b6ded8; background: #f2faf8; }
+.cali-result-fail { border-color: #eabfab; background: #fdf5f1; }
+.cali-result-head { align-items: center; display: flex; flex-wrap: wrap; gap: 10px; }
+.cali-result-reason { color: #8d2d12; font-size: 13px; font-weight: 600; }
+.cali-result-box {
+  background: #fff;
+  border: 1px solid #e1e6ea;
+  border-radius: 6px;
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+}
+.cali-result-box-head { align-items: center; display: flex; gap: 10px; }
+.cali-result-box-head strong { font-size: 14px; }
+.cali-troubleshoot ul { margin: 6px 0 0; padding-left: 18px; color: #43525e; }
+.cali-troubleshoot li { margin: 2px 0; }
+.cali-link {
+  background: none;
+  border: none;
+  color: #2563eb;
+  cursor: pointer;
+  font-weight: 650;
+  min-height: 0;
+  padding: 0;
+  text-decoration: underline;
+}
+.cali-result-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* ---- confirm modal ---- */
+.cali-modal-backdrop {
+  align-items: center;
+  background: rgba(15, 23, 42, 0.55);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 20px;
+  position: fixed;
+  z-index: 50;
+}
+.cali-modal {
+  background: #fff;
+  border-radius: 10px;
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.35);
+  display: flex;
+  flex-direction: column;
+  max-height: 90vh;
+  max-width: 520px;
+  overflow: hidden;
+  width: 100%;
+}
+.cali-modal-head {
+  align-items: center;
+  border-bottom: 1px solid #e1e6ea;
+  display: flex;
+  justify-content: space-between;
+  padding: 12px 16px;
+}
+.cali-modal-head h3 { margin: 0; font-size: 16px; }
+.cali-icon-btn {
+  background: none;
+  border: none;
+  color: #60707c;
+  font-size: 16px;
+  min-height: 0;
+  padding: 4px 8px;
+}
+.cali-modal-body { display: grid; gap: 12px; overflow-y: auto; padding: 16px; }
+.cali-modal-foot {
+  border-top: 1px solid #e1e6ea;
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  padding: 12px 16px;
+}
+.cali-modal-lead { color: #43525e; margin: 0; }
+.cali-checklist { display: grid; gap: 8px; }
+.cali-check { align-items: center; display: flex; gap: 8px; }
+.cali-check input { height: 16px; width: 16px; }
+.cali-stability-block {
+  background: #f5f7f8;
+  border: 1px solid #e1e6ea;
+  border-radius: 8px;
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+}
+.cali-stability-head { color: #43525e; font-size: 12px; font-weight: 700; }
+.cali-stability { align-items: center; display: flex; flex-wrap: wrap; gap: 10px; }
+.cali-stability small { color: #60707c; font-size: 12px; }
+.cali-dev-hint { color: #94a3b8; }
+
+/* ---- operation log ---- */
+.cali-log-controls {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.cali-log-controls select {
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font: inherit;
+  min-height: 32px;
+  padding: 0 8px;
+}
+.cali-log-list {
+  border: 1px solid #e1e6ea;
+  border-radius: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.cali-log-empty { color: #7b8791; padding: 12px; }
+.cali-log-row { border-top: 1px solid #eef1f3; }
+.cali-log-row:first-child { border-top: 0; }
+.cali-log-line {
+  align-items: center;
+  background: none;
+  border: none;
+  cursor: pointer;
+  display: grid;
+  font-size: 12px;
+  gap: 10px;
+  grid-template-columns: 150px 44px 70px 60px minmax(0, 1fr);
+  min-height: 32px;
+  padding: 4px 10px;
+  text-align: left;
+  width: 100%;
+}
+.cali-log-line:hover { background: #f5f7f8; }
+.cali-log-ts {
+  color: #7b8791;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.cali-log-badge { border-radius: 4px; font-size: 11px; font-weight: 700; padding: 1px 5px; text-align: center; }
+.cali-log-badge-info { background: #e6f4f1; color: #0b5f5a; }
+.cali-log-badge-warn { background: #fbf0dc; color: #8a5a12; }
+.cali-log-badge-error { background: #fbe6dc; color: #8d2d12; }
+.cali-log-box { color: #43525e; }
+.cali-log-sensor { color: #60707c; }
+.cali-log-msg { color: #172026; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cali-log-raw {
+  background: #0f172a;
+  color: #cbd5e1;
+  font-size: 11px;
+  margin: 0;
+  overflow-x: auto;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---- history ---- */
+.cali-history { border: 1px solid #e1e6ea; border-radius: 8px; }
+.cali-history-row { border-top: 1px solid #eef1f3; }
+.cali-history-row:first-child { border-top: 0; }
+.cali-history-head {
+  align-items: center;
+  background: none;
+  border: none;
+  cursor: pointer;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 72px 160px 90px minmax(0, 1fr) 120px;
+  min-height: 38px;
+  padding: 4px 12px;
+  text-align: left;
+  width: 100%;
+}
+.cali-history-head:hover { background: #f5f7f8; }
+.cali-history-time {
+  color: #43525e;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.cali-history-detail {
+  background: #f8fafb;
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  padding: 8px 14px 12px;
+}
+.cali-history-detail code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* ---- responsive: allow cards to wrap, no horizontal overflow ---- */
+@media (max-width: 900px) {
+  .cali-statusbar { flex-direction: column; align-items: flex-start; }
+  .cali-log-line { grid-template-columns: 120px 40px minmax(0, 1fr); }
+  .cali-log-line .cali-log-box, .cali-log-line .cali-log-sensor { display: none; }
+  .cali-history-head { grid-template-columns: 60px minmax(0, 1fr) 80px; }
+  .cali-history-head span:nth-child(4), .cali-history-head span:nth-child(5) { display: none; }
 }

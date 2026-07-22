@@ -36,7 +36,7 @@ GUI 的 **Generate EE Trajectory / Queue Traj Gen** 按钮（`POST /api/processi
 - 标定产物：producer 内参目录 `outputs/calibration/thor_gmsl2_intrinisics_dict_0720`
   和 joint 外参目录 `outputs/calibration/thor_gmsl2_extrinisics_robot_base_0720`
   （thor yaml 的 `calibration.*_run_name` 指向它们；fixed 模式不需要 auxiliary marker）。
-  `run/deploy.sh` 会单独同步这两个目录，因为普通 repo sync 会排除整个 `outputs/`。
+  `run/deploy.sh` 会 best-effort 单独同步这两个目录，因为普通 repo sync 会排除整个 `outputs/`；缺失时只告警并继续部署，EE trajectory 功能等标定产物补齐后再可用。需要硬校验时使用 `REQUIRE_EE_CALIBRATION=1 bash run/deploy.sh`。
 - cube 物理贴标与 thor yaml 的 `cube_tracker.cubes[*].marker_ids` 一致（left/right/head）。
 
 ## 显示路径：v3 vs gmsl2（两条都已支持）

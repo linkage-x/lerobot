@@ -31,21 +31,47 @@ echo "==> Syncing to ${THOR}..."
 bash "$SCRIPT_DIR/sync_to_thor.sh"
 
 # The general repo sync deliberately excludes outputs/. The gateway's EE
-# trajectory job needs these exact calibration folders, so stage them
-# explicitly before either --sync-only exits or the gateway restarts.
+# trajectory job can use these calibration folders when available, so stage
+# them explicitly. Missing calibration assets should not block gateway/frontend
+# deploys; set REQUIRE_EE_CALIBRATION=1 to make this section strict.
 echo "==> Syncing EE-trajectory calibration inputs to ${THOR}..."
+require_ee_calibration=false
+case "${REQUIRE_EE_CALIBRATION:-}" in
+  1|true|TRUE|yes|YES) require_ee_calibration=true ;;
+esac
+
+calibration_sync_incomplete=false
+warn_or_fail_calibration_sync() {
+  local message="$1"
+  if $require_ee_calibration; then
+    echo "ERROR: ${message}" >&2
+    exit 1
+  fi
+  calibration_sync_incomplete=true
+  echo "WARN: ${message}" >&2
+}
+
 for calibration_path in "${CALIBRATION_PATHS[@]}"; do
   local_calibration_dir="${REPO_ROOT}/${calibration_path}"
   if [[ ! -f "${local_calibration_dir}/summary.json" ]]; then
-    echo "ERROR: calibration summary not found: ${local_calibration_dir}/summary.json" >&2
-    exit 1
+    warn_or_fail_calibration_sync "calibration summary not found: ${local_calibration_dir}/summary.json"
+    continue
   fi
   remote_calibration_dir="${THOR_DIR}/${calibration_path}"
   remote_mkdir_path="${remote_calibration_dir}"
   [[ "${remote_mkdir_path}" == "~/"* ]] && remote_mkdir_path="\$HOME/${remote_mkdir_path#\~/}"
-  ssh -o ConnectTimeout=5 "${THOR}" "mkdir -p \"${remote_mkdir_path}\""
-  rsync -avz "${local_calibration_dir}/" "${THOR}:${THOR_DIR}/${calibration_path}/"
+  if ! ssh -o ConnectTimeout=5 "${THOR}" "mkdir -p \"${remote_mkdir_path}\""; then
+    warn_or_fail_calibration_sync "failed to create remote calibration directory: ${THOR}:${THOR_DIR}/${calibration_path}"
+    continue
+  fi
+  if ! rsync -avz "${local_calibration_dir}/" "${THOR}:${THOR_DIR}/${calibration_path}/"; then
+    warn_or_fail_calibration_sync "failed to sync calibration directory: ${local_calibration_dir}"
+    continue
+  fi
 done
+if $calibration_sync_incomplete; then
+  echo "WARN: EE-trajectory calibration inputs were not fully synced; continuing deploy. EE trajectory features may be unavailable until calibration outputs are generated or synced." >&2
+fi
 
 if $sync_only; then
   exit 0
