@@ -11,6 +11,11 @@ const cubeColors: Record<string, number> = {
 };
 
 const cubePoseDims = ["x", "y", "z", "qx", "qy", "qz", "qw"] as const;
+
+function cubePoseSeriesName(name: string, dim: (typeof cubePoseDims)[number]): string {
+  return dim.length === 1 ? `${name}.position_${dim}` : `${name}.quat_${dim.slice(1)}`;
+}
+
 const cubeEdges: Array<[number, number]> = [
   [0, 1], [1, 2], [2, 3], [3, 0],
   [4, 5], [5, 6], [6, 7], [7, 4],
@@ -514,7 +519,7 @@ export function ReplayInspector({
     [timeline]
   );
   const cubeSeriesNames = useMemo(() => {
-    return cubePoseNames.flatMap((name) => cubePoseDims.map((dim) => `${name}.${dim}`));
+    return cubePoseNames.flatMap((name) => cubePoseDims.map((dim) => cubePoseSeriesName(name, dim)));
   }, [cubePoseNames]);
   const pickCubePose = useCallback(
     (frameIndex: number, dim: number) => {

@@ -268,7 +268,7 @@ export function ForceCalibrationCard({
             <li>确认工具/负载处于标定姿态</li>
             <li>确认桌面稳定、无人触碰</li>
             <li>执行动态校准（滤波）</li>
-            <li>自动复核 Fz 是否落在目标负载区间</li>
+            <li>自动复核 Fz / Mx 是否落在目标负载区间</li>
           </>
         )}
       </ol>
@@ -280,7 +280,7 @@ export function ForceCalibrationCard({
         </div>
       ) : (
         <div className="cali-info">
-          动态校准后 Fz 应落在 <b>-5.8 ± 0.5 N</b>（保留负载，不应接近 0）；|Fx|,|Fy| ≤ 0.5 N，|Mx|,|My|,|Mz| ≤ 0.01 N·m。
+          动态校准后 Fz 应落在 <b>-7.784 ± 0.5 N</b>、Mx 应落在 <b>-0.168 ± 0.01 N·m</b>（保留负载，不应接近 0）；|Fx|,|Fy| ≤ 0.5 N，|My|,|Mz| ≤ 0.01 N·m。
         </div>
       )}
 
