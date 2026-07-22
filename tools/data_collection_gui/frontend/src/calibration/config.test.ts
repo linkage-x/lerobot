@@ -29,12 +29,18 @@ describe("formatting helpers handle null/NaN without faking zero", () => {
 });
 
 describe("threshold constants are distinct between origin and dynamic", () => {
-  it("origin zeroes Fz (abs) while dynamic targets a load", () => {
+  it("origin zeroes Fz/Mx (abs) while dynamic targets the residual load", () => {
     expect(ORIGIN_FORCE_LIMITS.fz.mode).toBe("abs");
+    expect(ORIGIN_FORCE_LIMITS.mx.mode).toBe("abs");
     expect(DYNAMIC_FORCE_LIMITS.fz.mode).toBe("target");
+    expect(DYNAMIC_FORCE_LIMITS.mx.mode).toBe("target");
     if (DYNAMIC_FORCE_LIMITS.fz.mode === "target") {
-      expect(DYNAMIC_FORCE_LIMITS.fz.targetN).toBe(-5.8);
+      expect(DYNAMIC_FORCE_LIMITS.fz.targetN).toBe(-7.784);
       expect(DYNAMIC_FORCE_LIMITS.fz.tolN).toBe(0.5);
+    }
+    if (DYNAMIC_FORCE_LIMITS.mx.mode === "target") {
+      expect(DYNAMIC_FORCE_LIMITS.mx.targetN).toBe(-0.168);
+      expect(DYNAMIC_FORCE_LIMITS.mx.tolN).toBe(0.01);
     }
   });
 });

@@ -20,26 +20,37 @@ export type ForceAxisLimits = {
    * `mode: "target"` checks |Fz - target| <= tol (dynamic keeps a real load).
    */
   fz: { mode: "abs"; maxN: number } | { mode: "target"; targetN: number; tolN: number };
-  /** Absolute-value ceiling for Mx/My/Mz (N·m), shared across the three axes. */
+  /**
+   * Mx acceptance. `mode: "abs"` checks |Mx| <= max (raw/origin zeroing).
+   * `mode: "target"` checks |Mx - target| <= tol (dynamic keeps the residual
+   * moment from the tool/gravity offset, so Mx is NOT near zero).
+   */
+  mx: { mode: "abs"; maxN: number } | { mode: "target"; targetN: number; tolN: number };
+  /** Absolute-value ceiling for My/Mz (N·m), shared across the two axes. */
   momentMaxNm: number;
 };
 
 // --- 6D force: raw/origin zero (sensor hardware, expects fully unloaded) ------
-// Origin zeroing drives every channel to ~0, so Fz is an absolute check.
+// Origin zeroing drives every channel to ~0, so Fz and Mx are absolute checks.
 export const ORIGIN_FORCE_LIMITS: ForceAxisLimits = {
   fxMaxN: 0.5,
   fyMaxN: 0.5,
   fz: { mode: "abs", maxN: 0.5 },
+  mx: { mode: "abs", maxN: 0.01 },
   momentMaxNm: 0.01,
 };
 
 // --- 6D force: dynamic (filter algorithm, keeps the tool/gravity load) --------
-// After dynamic calibration Fz should sit at the loaded target, NOT near zero,
-// so this deliberately does not reuse the origin Fz check.
+// After dynamic calibration Fz and Mx should sit at their loaded targets, NOT
+// near zero, so this deliberately does not reuse the origin Fz/Mx checks.
+// Spec (六维力动态校准判定标准):
+//   Fz = -7.784 ± 0.5 N; Fx/Fy within ±0.5 N.
+//   Mx = -0.168 ± 0.01 N·m; My/Mz within ±0.01 N·m.
 export const DYNAMIC_FORCE_LIMITS: ForceAxisLimits = {
   fxMaxN: 0.5,
   fyMaxN: 0.5,
-  fz: { mode: "target", targetN: -5.8, tolN: 0.5 },
+  fz: { mode: "target", targetN: -7.784, tolN: 0.5 },
+  mx: { mode: "target", targetN: -0.168, tolN: 0.01 },
   momentMaxNm: 0.01,
 };
 

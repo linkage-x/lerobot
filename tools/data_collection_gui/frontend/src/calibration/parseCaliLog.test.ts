@@ -66,14 +66,22 @@ describe("parseCaliLog", () => {
   });
 });
 
-describe("evaluateForce — origin vs dynamic Fz criteria differ", () => {
-  const loaded = { fx: 0.1, fy: 0.1, fz: -5.8, mx: 0, my: 0, mz: 0 };
+describe("evaluateForce — origin vs dynamic Fz/Mx criteria differ", () => {
+  // Dynamic keeps the residual tool/gravity load: Fz ≈ -7.784, Mx ≈ -0.168.
+  const loaded = { fx: 0.1, fy: 0.1, fz: -7.784, mx: -0.168, my: 0, mz: 0 };
   const zeroed = { fx: 0.1, fy: 0.1, fz: 0.08, mx: 0, my: 0, mz: 0 };
 
-  it("dynamic accepts Fz = -5.8 ± 0.5 (not near zero)", () => {
+  it("dynamic accepts Fz = -7.784 ± 0.5 and Mx = -0.168 ± 0.01 (not near zero)", () => {
     expect(evaluateForce(loaded, DYNAMIC_FORCE_LIMITS).pass).toBe(true);
-    // dynamic must NOT treat a near-zero Fz as valid
+    // dynamic must NOT treat a near-zero Fz/Mx as valid
     expect(evaluateForce(zeroed, DYNAMIC_FORCE_LIMITS).pass).toBe(false);
+  });
+
+  it("dynamic rejects an Mx that drifted off its target", () => {
+    const mxOff = { fx: 0.1, fy: 0.1, fz: -7.784, mx: -0.2, my: 0, mz: 0 };
+    const dyn = evaluateForce(mxOff, DYNAMIC_FORCE_LIMITS);
+    expect(dyn.pass).toBe(false);
+    expect(dyn.axes.find((a) => a.axis === "mx")?.pass).toBe(false);
   });
 
   it("origin accepts a near-zero Fz and rejects the loaded Fz", () => {
@@ -82,7 +90,7 @@ describe("evaluateForce — origin vs dynamic Fz criteria differ", () => {
   });
 
   it("flags an out-of-range Fy on both criteria with a reason", () => {
-    const skewed = { fx: 0.1, fy: 0.86, fz: -5.8, mx: 0, my: 0, mz: 0 };
+    const skewed = { fx: 0.1, fy: 0.86, fz: -7.784, mx: -0.168, my: 0, mz: 0 };
     const dyn = evaluateForce(skewed, DYNAMIC_FORCE_LIMITS);
     expect(dyn.pass).toBe(false);
     expect(dyn.firstFailure).toContain("Fy");

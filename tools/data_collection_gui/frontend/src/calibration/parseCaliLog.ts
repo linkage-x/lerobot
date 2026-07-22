@@ -130,7 +130,18 @@ function evalAxis(axis: ForceAxis, value: number, limits: ForceAxisLimits): Axis
   const isMoment = axis === "mx" || axis === "my" || axis === "mz";
   const kind: "force" | "moment" = isMoment ? "moment" : "force";
 
+  if (axis === "mx") {
+    // Mx — mode differs between origin (abs) and dynamic (target load).
+    if (limits.mx.mode === "abs") {
+      const pass = Math.abs(value) <= limits.mx.maxN;
+      return { axis, label, value, kind, pass, reason: pass ? "" : `|Mx| 超出 ±${limits.mx.maxN} N·m` };
+    }
+    const { targetN, tolN } = limits.mx;
+    const pass = Math.abs(value - targetN) <= tolN;
+    return { axis, label, value, kind, pass, reason: pass ? "" : `Mx 偏离目标 ${targetN} ± ${tolN} N·m` };
+  }
   if (isMoment) {
+    // My/Mz — always an absolute ceiling.
     const pass = Math.abs(value) <= limits.momentMaxNm;
     return {
       axis,

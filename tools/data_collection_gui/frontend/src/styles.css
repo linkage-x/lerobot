@@ -1487,7 +1487,7 @@ button.danger {
   display: grid;
   font-size: 11px;
   gap: 8px;
-  grid-template-columns: 150px minmax(0, 1fr) 90px;
+  grid-template-columns: minmax(220px, 34ch) minmax(260px, 1fr) max-content;
   padding: 2px 4px;
 }
 
@@ -1506,9 +1506,19 @@ button.danger {
   white-space: nowrap;
 }
 
+.series-values {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-width: 0;
+}
+
 .series-label strong {
   color: #172026;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  line-height: 1.2;
 }
 
 .series-canvas {
