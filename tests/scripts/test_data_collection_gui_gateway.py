@@ -1158,6 +1158,89 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     assert "--input.dataset_pose_name=left" in command
     assert "--robot.robot_ip=192.168.1.99" in command
     assert "--replay.episode_index=0" in command
+    assert "--replay.initial_pose_mode=current" in command
+    assert "--replay.fail_on_unreached_initial_pose=true" in command
+    assert "--end_effector.mode=robot_config" in command
+
+    bare_command = gateway._real_replay_command(
+        state,
+        dataset_root,
+        "left",
+        "192.168.1.99",
+        "fr3_ee",
+    )
+    assert "--end_effector.mode=fr3_ee" in bare_command
+
+
+def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    sidecar_dir = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    sidecar_dir.mkdir(parents=True)
+    (sidecar_dir / "state_action.left.csv").write_text(
+        "episode_index,frame_index,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw\n"
+        "0,0,0.30,0.0,0.20,0.0,0.0,0.0,1.0\n"
+        "0,1,0.301,0.0,0.20,0.0,0.0,0.0,1.0\n",
+        encoding="utf-8",
+    )
+    report_path = gateway._mujoco_preview_report_path(dataset_root, 0, "left")
+    video_path = gateway._mujoco_preview_video_path(dataset_root, 0, "left")
+    report_path.write_text(
+        json.dumps({
+            "dataset_root": str(dataset_root),
+            "cube_mode": "left",
+            "episode_index": 0,
+            "fps": 30,
+            "robots": {
+                "left": {
+                    "frames": [{"frame_index": 0}, {"frame_index": 1}],
+                    "metrics": {
+                        "avg_position_error_mm": 23.6,
+                        "max_position_error_mm": 104.3,
+                        "avg_rotation_error_deg": 6.2,
+                        "max_rotation_error_deg": 29.3,
+                    },
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+    video_path.write_bytes(b"rendered")
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(
+            dataset=str(dataset_root), datasetRoot=str(dataset_root), episode=0, fps=30,
+            totalFrames=2, recordedFrames=2, mujocoCubeMode="left",
+        ),
+        selected_replay_root=dataset_root,
+    )
+
+    gateway._approve_mujoco_report(state, "left")
+
+    assert state.replay.mujocoValidation["status"] == "failed"
+    assert state.replay.mujocoValidation["maxPositionErrorMm"] == pytest.approx(104.3)
+    assert state.replay.safety == "fault"
+    with pytest.raises(RuntimeError, match="MuJoCo validation required"):
+        gateway._require_mujoco_validation(state)
+
+    passing_report = json.loads(report_path.read_text(encoding="utf-8"))
+    passing_report["robots"]["left"]["metrics"].update({
+        "avg_position_error_mm": 2.0,
+        "max_position_error_mm": 4.0,
+        "avg_rotation_error_deg": 1.0,
+        "max_rotation_error_deg": 3.0,
+    })
+    report_path.write_text(json.dumps(passing_report), encoding="utf-8")
+    video_path.write_bytes(b"passing-render")
+
+    gateway._approve_mujoco_report(state, "left")
+
+    assert state.replay.mujocoValidation["status"] == "passed"
+    assert gateway._require_mujoco_validation(state) == dataset_root.resolve()
 
 
 def test_real_replay_rejects_two_cube_mode(tmp_path):

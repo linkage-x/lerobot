@@ -19,6 +19,7 @@ import type {
   ReplayTimeline,
   MujocoCubeMode,
   RealCubeMode,
+  RealEndEffectorMode,
   MujocoPreview,
   RealSensePreviewStatus,
   TrajectoryPoint
@@ -386,13 +387,21 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
+  async approveMujocoReplay(cubeMode: MujocoCubeMode): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot(`/api/replay/approve-mujoco?cube=${encodeURIComponent(cubeMode)}`);
+    if (remote) return remote;
+    throw new Error("Gateway unavailable; MuJoCo report approval cannot be completed.");
+  }
+
   async startRealCubeReplay(
     cubeMode: RealCubeMode,
-    robotIp: string
+    robotIp: string,
+    endEffectorMode: RealEndEffectorMode
   ): Promise<GuiSnapshot> {
     const params = new URLSearchParams({
       cube: cubeMode,
-      robot_ip: robotIp
+      robot_ip: robotIp,
+      end_effector: endEffectorMode
     });
     const remote = await this.postRemoteSnapshot(`/api/replay/start-real?${params.toString()}`);
     if (remote) return remote;

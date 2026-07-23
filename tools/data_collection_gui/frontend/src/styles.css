@@ -1452,6 +1452,17 @@ button.danger {
   background: #0b615b;
 }
 
+.mujoco-pass-button {
+  background: #ffffff;
+  border-color: #0f766e;
+  color: #0f766e;
+  min-width: 170px;
+}
+
+.mujoco-pass-button:hover:not(:disabled) {
+  background: #e9f7f4;
+}
+
 .mujoco-mode-picker button {
   background: transparent;
   border-color: transparent;

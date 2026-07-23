@@ -229,6 +229,8 @@ class FrankaResearch3(Robot):
         return self._is_connected
 
     def _make_gripper_driver(self):
+        if self.config.gripper_backend == "mock":
+            return self.mock_gripper_driver_cls(initial_position=1.0)
         if self.config.gripper_backend == "das":
             return self.das_gripper_driver_cls(
                 serial_port=self.config.gripper_port,
@@ -314,7 +316,7 @@ class FrankaResearch3(Robot):
             try:
                 gripper = self._make_gripper_driver()
                 gripper.connect()
-                self._gripper_is_mock = False
+                self._gripper_is_mock = self.config.gripper_backend == "mock"
             except Exception as gripper_error:
                 if not self.config.allow_mock_gripper:
                     raise RuntimeError(

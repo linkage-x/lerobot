@@ -130,6 +130,7 @@ export type ReplayStatus = {
   mujocoValidation?: MujocoValidation;
   realCubeMode?: RealCubeMode;
   realRobotIp?: string;
+  realEndEffectorMode?: RealEndEffectorMode;
   // Bumped when the dataset content changes under an unchanged (root, episode)
   // selection (e.g. after deleting an episode); the inspector refetches on it.
   revision?: number;
@@ -164,6 +165,7 @@ export type MujocoValidation = {
 
 export type MujocoCubeMode = "left" | "right" | "both";
 export type RealCubeMode = Exclude<MujocoCubeMode, "both">;
+export type RealEndEffectorMode = "corenetic_gripper_ee" | "fr3_ee";
 
 export type RealSensePreviewStatus = {
   available: boolean | null;

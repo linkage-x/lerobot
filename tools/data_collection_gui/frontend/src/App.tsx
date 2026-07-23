@@ -234,7 +234,8 @@ function App() {
         onPreflight={() => run(() => api.preflightReplay())}
         onReplay={startReplay}
         onMujocoReplay={(mode) => run(() => api.startMujocoReplay(mode))}
-        onRealReplay={(mode, robotIp) => run(() => api.startRealCubeReplay(mode, robotIp))}
+        onApproveMujoco={(mode) => run(() => api.approveMujocoReplay(mode))}
+        onRealReplay={(mode, robotIp, endEffectorMode) => run(() => api.startRealCubeReplay(mode, robotIp, endEffectorMode))}
         onAbort={() => run(() => api.abortReplay())}
         onSelectDataset={(path) => run(() => api.selectRecordedDataset(path))}
         onSelectEpisode={(episode) => run(() => api.selectReplayEpisode(episode))}

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GuiSnapshot } from "../api";
-import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, MujocoCubeMode, RealCubeMode, RealSensePreviewStatus } from "../types";
+import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, MujocoCubeMode, RealCubeMode, RealEndEffectorMode, RealSensePreviewStatus } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
 import { ReplayInspector } from "../ReplayInspector";
 import { api } from "../apiClient";
@@ -89,10 +89,13 @@ export function RealRobotReplayPanel({
 }: {
   status: ReplayStatus;
   busy: boolean;
-  onStart: (mode: RealCubeMode, robotIp: string) => void;
+  onStart: (mode: RealCubeMode, robotIp: string, endEffectorMode: RealEndEffectorMode) => void;
 }) {
   const [mode, setMode] = useState<RealCubeMode>(status.realCubeMode ?? "right");
   const [robotIp, setRobotIp] = useState(status.realRobotIp ?? "");
+  const [endEffectorMode, setEndEffectorMode] = useState<RealEndEffectorMode>(
+    status.realEndEffectorMode ?? "corenetic_gripper_ee"
+  );
   const [monitorRequested, setMonitorRequested] = useState(status.state === "replaying");
   const [cameraStatus, setCameraStatus] = useState<RealSensePreviewStatus | null>(null);
   const [frameKey, setFrameKey] = useState(0);
@@ -129,12 +132,13 @@ export function RealRobotReplayPanel({
       `Episode: ${status.episode}\n` +
       `Cube: ${mode}\n` +
       `Robot IP: ${robotIp.trim()}\n\n` +
+      `Tracked frame: ${endEffectorMode}\n\n` +
       `MuJoCo validation must match this exact selection. Keep an operator at the robot and be ready to use the physical emergency stop.`
     );
     if (!confirmed) return;
     setMonitorRequested(true);
     setCameraStatus({ available: null, running: true, error: "Connecting to the first available RealSense…" });
-    onStart(mode, robotIp.trim());
+    onStart(mode, robotIp.trim(), endEffectorMode);
   };
 
   return (
@@ -158,6 +162,24 @@ export function RealRobotReplayPanel({
               </button>
             ))}
           </div>
+          <div className="mujoco-mode-picker" role="group" aria-label="Real robot end-effector frame">
+            <button
+              className={endEffectorMode === "corenetic_gripper_ee" ? "active" : ""}
+              disabled={busy || active}
+              onClick={() => setEndEffectorMode("corenetic_gripper_ee")}
+              type="button"
+            >
+              Corenetic gripper EE
+            </button>
+            <button
+              className={endEffectorMode === "fr3_ee" ? "active" : ""}
+              disabled={busy || active}
+              onClick={() => setEndEffectorMode("fr3_ee")}
+              type="button"
+            >
+              Bare FR3 · fr3_ee
+            </button>
+          </div>
           <label className="real-robot-ip-field">
             <span>Robot IP for {mode} trajectory</span>
             <input value={robotIp} onChange={(event) => setRobotIp(event.target.value)} placeholder="192.168.x.x" />
@@ -172,7 +194,7 @@ export function RealRobotReplayPanel({
                 ? `Run and pass MuJoCo ${mode} for this dataset and episode first.`
                 : !ipValid
                   ? "Enter a valid robot IPv4 address."
-                  : "The gateway will preflight this robot IP, then run the selected cube trajectory."}
+                  : `The gateway preflights this IP, moves ${endEffectorMode} to frame 0, then streams the trajectory.`}
           </p>
         </div>
         <div className="realsense-monitor">
@@ -754,6 +776,7 @@ export function EpisodeReplayPage({
   onPreflight,
   onReplay,
   onMujocoReplay,
+  onApproveMujoco,
   onRealReplay,
   onAbort,
   onSelectDataset,
@@ -768,7 +791,8 @@ export function EpisodeReplayPage({
   onPreflight: () => void;
   onReplay: (realRobot: boolean) => void;
   onMujocoReplay: (mode: MujocoCubeMode) => void;
-  onRealReplay: (mode: RealCubeMode, robotIp: string) => void;
+  onApproveMujoco: (mode: MujocoCubeMode) => void;
+  onRealReplay: (mode: RealCubeMode, robotIp: string, endEffectorMode: RealEndEffectorMode) => void;
   onAbort: () => void;
   onSelectDataset: (path: string) => void;
   onSelectEpisode: (episode: number) => void;
@@ -817,6 +841,7 @@ export function EpisodeReplayPage({
         mujocoMode={mujocoMode}
         onMujocoModeChange={setMujocoMode}
         onRunMujoco={onMujocoReplay}
+        onApproveMujoco={onApproveMujoco}
         replayStatus={snapshot.replay}
         busy={busy}
         mujocoRefreshKey={`${snapshot.replay.mujocoValidation?.updatedAt ?? ""}:${snapshot.replay.state}`}

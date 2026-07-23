@@ -277,6 +277,7 @@ export function ReplayInspector({
   mujocoMode,
   onMujocoModeChange,
   onRunMujoco,
+  onApproveMujoco,
   replayStatus,
   busy,
   mujocoRefreshKey = ""
@@ -292,6 +293,7 @@ export function ReplayInspector({
   mujocoMode: MujocoCubeMode;
   onMujocoModeChange: (mode: MujocoCubeMode) => void;
   onRunMujoco: (mode: MujocoCubeMode) => void;
+  onApproveMujoco: (mode: MujocoCubeMode) => void;
   replayStatus: ReplayStatus;
   busy: boolean;
   mujocoRefreshKey?: string;
@@ -812,6 +814,18 @@ export function ReplayInspector({
             type="button"
           >
             {mujocoRunning ? "Rendering MuJoCo…" : `Run MuJoCo · ${mujocoMode}`}
+          </button>
+          <button
+            className="mujoco-pass-button"
+            disabled={busy || replayActive || !mujocoPreview}
+            onClick={() => onApproveMujoco(mujocoMode)}
+            type="button"
+          >
+            {replayStatus.mujocoValidation?.status === "passed" &&
+            replayStatus.mujocoValidation?.isCurrentForSelection &&
+            replayStatus.mujocoValidation?.cubeMode === mujocoMode
+              ? "MuJoCo passed"
+              : "Pass MuJoCo check"}
           </button>
         </div>
         <p className="panel-note">
