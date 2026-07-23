@@ -220,6 +220,17 @@ export function RealRobotReplayPanel({
           )}
         </div>
       </div>
+      <div className="real-replay-log-block">
+        <div className="real-replay-log-heading">
+          <strong>Real replay diagnostics</strong>
+          <span>{status.state}</span>
+        </div>
+        <pre className="real-replay-log">
+          {status.realReplayLog?.length
+            ? status.realReplayLog.join("\n")
+            : "Waiting for a replay request. Preflight, camera, initial-pose, and trajectory output will appear here."}
+        </pre>
+      </div>
       {overridePromptOpen ? (
         <div className="danger-modal-backdrop" role="presentation">
           <div aria-labelledby="mujoco-override-title" aria-modal="true" className="danger-modal" role="dialog">

@@ -1556,6 +1556,41 @@ button.danger {
   width: 100%;
 }
 
+.real-replay-log-block {
+  background: #11181c;
+  border: 1px solid #34424a;
+  border-radius: 8px;
+  margin-top: 14px;
+  overflow: hidden;
+}
+
+.real-replay-log-heading {
+  align-items: center;
+  border-bottom: 1px solid #34424a;
+  color: #eef3f5;
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 11px;
+}
+
+.real-replay-log-heading span {
+  color: #9fb1bb;
+  font-size: 11px;
+}
+
+.real-replay-log {
+  color: #c8d5db;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  margin: 0;
+  max-height: 230px;
+  min-height: 92px;
+  overflow: auto;
+  padding: 10px 12px;
+  white-space: pre-wrap;
+}
+
 .qc-diagnostic-list {
   display: grid;
   gap: 7px;

@@ -124,6 +124,7 @@ class ReplayStatus:
     realRobotIp: str = ""
     realEndEffectorMode: str = "corenetic_gripper_ee"
     mujocoOverrideAccepted: bool = False
+    realReplayLog: list[str] = field(default_factory=list)
     # Bumped whenever the on-disk dataset content changes under a stable
     # (datasetRoot, episode) selection — e.g. deleting an episode keeps the
     # selection on the same slot but swaps in different frames/videos. The UI
@@ -5465,6 +5466,11 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
             _finish_mujoco_validation(state, replay_process.returncode)
         else:
             _stop_realsense_preview(state)
+            _append_real_replay_log(
+                state,
+                "complete" if replay_process.returncode == 0 else "error",
+                f"real replay exited with code {replay_process.returncode}",
+            )
             state.replay.safety = "locked"
             state.replay.state = "complete" if replay_process.returncode == 0 else "aborted"
             if state.replay.lastOutput:
@@ -6262,6 +6268,7 @@ def _read_replay_process_output(state: GatewayState, process: subprocess.Popen[s
                 _apply_mujoco_replay_output(state, output)
                 state.log("info", f"mujoco replay: {output}")
             else:
+                _append_real_replay_log(state, "replay", output)
                 state.log("info", f"real replay: {output}")
 
 
@@ -6935,12 +6942,14 @@ def _real_robot_ip(state: GatewayState) -> str:
 def _real_preflight_command(state: GatewayState, robot_ip: str | None = None) -> list[str]:
     replay = _replay_config(state.config)
     command = [
-        str(_venv_python(state.repo_root)),
+        str(_mujoco_replay_python(state)),
         str(state.repo_root / "tools" / "fr3" / "fr3_record_preflight.py"),
         f"--workspace={state.repo_root}",
-        f"--config-path={state.config_path}",
+        f"--config-path={state.repo_root / 'third_party' / 'opencv_kalibr' / 'fr3_data_collection_replay' / 'replay_cube_pose_in_robot_base.thor.yaml'}",
         f"--robot-ip={robot_ip or _real_robot_ip(state)}",
     ]
+    if _bool_config(replay, "real_preflight_skip_host_imports", True):
+        command.append("--skip-host-imports")
     if _bool_config(replay, "real_preflight_skip_hikrobot", True):
         command.append("--skip-hikrobot")
     if _bool_config(replay, "real_preflight_skip_gripper", True):
@@ -6950,6 +6959,26 @@ def _real_preflight_command(state: GatewayState, robot_ip: str | None = None) ->
     if _bool_config(replay, "real_preflight_skip_ping", False):
         command.append("--skip-ping")
     return command
+
+
+def _append_real_replay_log(state: GatewayState, stage: str, message: str) -> None:
+    line = f"{time.strftime('%H:%M:%S')} [{stage}] {message}"
+    state.replay.realReplayLog.append(line)
+    del state.replay.realReplayLog[:-120]
+
+
+def _real_preflight_env(state: GatewayState) -> dict[str, str]:
+    env = _tool_env(state.repo_root)
+    python_path = _mujoco_replay_python(state)
+    venv_root = python_path.parent.parent
+    cmeel_libs = sorted((venv_root / "lib").glob("python*/site-packages/cmeel.prefix/lib"))
+    ld_entries = [str(path) for path in cmeel_libs]
+    ld_entries.extend(path for path in ("/usr/local/lib", "/opt/MVS/lib/64", "/opt/MVS/lib") if Path(path).exists())
+    if env.get("LD_LIBRARY_PATH"):
+        ld_entries.append(env["LD_LIBRARY_PATH"])
+    if ld_entries:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(dict.fromkeys(ld_entries))
+    return env
 
 
 def _run_real_preflight(state: GatewayState, robot_ips: Iterable[str] | None = None) -> None:
@@ -6962,6 +6991,8 @@ def _run_real_preflight(state: GatewayState, robot_ips: Iterable[str] | None = N
     for robot_ip in targets:
         command = _real_preflight_command(state, robot_ip)
         state.replay.message = f"Running real-robot preflight checks for {robot_ip}"
+        _append_real_replay_log(state, "preflight", f"checking robot {robot_ip}")
+        _append_real_replay_log(state, "preflight", f"config={next(arg.split('=', 1)[1] for arg in command if arg.startswith('--config-path='))}")
         try:
             result = subprocess.run(
                 command,
@@ -6969,18 +7000,22 @@ def _run_real_preflight(state: GatewayState, robot_ips: Iterable[str] | None = N
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                env=_tool_env(state.repo_root),
+                env=_real_preflight_env(state),
                 timeout=max(timeout_s, 1.0),
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
+            _append_real_replay_log(state, "error", f"preflight timed out after {timeout_s:.1f}s")
             raise RuntimeError(f"Real-robot preflight timed out for {robot_ip} after {timeout_s:.1f}s") from exc
         output_lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        for line in output_lines:
+            _append_real_replay_log(state, "preflight", line)
         if output_lines:
             state.replay.lastOutput = output_lines[-1]
         if result.returncode != 0:
             details = output_lines[-1] if output_lines else f"exit code {result.returncode}"
             raise RuntimeError(f"Real-robot preflight failed for {robot_ip}: {details}")
+        _append_real_replay_log(state, "preflight", f"robot {robot_ip} passed")
 
 
 def _failed_mujoco_validation_is_override_eligible(
@@ -7193,6 +7228,12 @@ def _start_real_replay(
     end_effector_mode = str(end_effector_mode).strip().lower()
     if end_effector_mode not in ("corenetic_gripper_ee", "fr3_ee"):
         raise ValueError("Real replay end effector must be corenetic_gripper_ee or fr3_ee")
+    state.replay.realReplayLog = []
+    _append_real_replay_log(
+        state,
+        "request",
+        f"cube={cube_mode} episode={state.replay.episode} robot={robot_ip or _real_robot_ip(state)} target={end_effector_mode}",
+    )
     dataset_root = _require_mujoco_validation(
         state,
         cube_mode=cube_mode,
@@ -7209,10 +7250,12 @@ def _start_real_replay(
         raise RuntimeError(f"No valid generated EE trajectory for: {cube_mode}")
 
     selected_ip = _validated_robot_ip(robot_ip or _real_robot_ip(state), "Robot IP")
+    _append_real_replay_log(state, "validation", "trajectory and MuJoCo decision accepted")
 
     # Re-run hardware checks against the exact IP selected in this panel;
     # a prior preflight for a different arm must never authorize motion here.
     _start_realsense_preview(state)
+    _append_real_replay_log(state, "camera", "RealSense monitor requested")
     try:
         _run_real_preflight(state, [selected_ip])
     except Exception:
@@ -7234,6 +7277,7 @@ def _start_real_replay(
             f"max_rotation={validation.get('maxRotationErrorDeg')}deg",
         )
     command = _real_replay_command(state, dataset_root, cube_mode, selected_ip, end_effector_mode)
+    _append_real_replay_log(state, "launch", "preflight passed; starting initial-pose-first replay process")
     try:
         process = subprocess.Popen(
             command,
@@ -7241,11 +7285,12 @@ def _start_real_replay(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            env=_tool_env(state.repo_root),
+            env=_real_preflight_env(state),
             start_new_session=True,
         )
     except Exception:
         _stop_realsense_preview(state)
+        _append_real_replay_log(state, "error", "failed to spawn real replay process")
         raise
     state.replay_process = process
     state.replay_process_kind = "real"
@@ -7294,6 +7339,7 @@ def _abort_replay(state: GatewayState) -> None:
         state.log("warn", f"Terminated {replay_kind} replay pid={process.pid}")
     if replay_kind == "real":
         _stop_realsense_preview(state)
+        _append_real_replay_log(state, "abort", "operator stopped real replay")
     if replay_kind == "mujoco" and state.replay.mujocoValidation:
         state.replay.mujocoValidation["status"] = "failed"
         state.replay.mujocoValidation["message"] = "MuJoCo validation aborted before completion"
@@ -7803,6 +7849,8 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
         except Exception as exc:  # noqa: BLE001
+            if path == "/api/replay/start-real":
+                _append_real_replay_log(self.server.state, "error", str(exc))
             self.server.state.log("warn", f"{path} failed: {exc}")
             _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return

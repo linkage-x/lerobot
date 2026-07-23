@@ -1173,6 +1173,16 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     )
     assert "--end_effector.mode=fr3_ee" in bare_command
 
+    preflight_command = gateway._real_preflight_command(state, "192.168.1.99")
+    assert preflight_command[0] == str(gateway._mujoco_replay_python(state))
+    assert (
+        f"--config-path={repo_root}/third_party/opencv_kalibr/"
+        "fr3_data_collection_replay/replay_cube_pose_in_robot_base.thor.yaml"
+    ) in preflight_command
+    assert "--skip-host-imports" in preflight_command
+    assert "--skip-hikrobot" in preflight_command
+    assert "--skip-gripper" in preflight_command
+
 
 def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp_path):
     repo_root = tmp_path / "repo"
@@ -1327,6 +1337,31 @@ def test_real_replay_rejects_two_cube_mode(tmp_path):
 
     with pytest.raises(ValueError, match="must be left or right"):
         gateway._start_real_replay(state, "both", "192.168.1.99")
+
+
+def test_real_preflight_failure_is_preserved_in_panel_log(monkeypatch, tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "camera_config.yaml",
+        config={"replay": {"real_preflight_enabled": True}},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+    monkeypatch.setattr(
+        gateway.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 1, stdout="[PASS] fr3_ping: reachable\n[FAIL] fr3_arm: connection refused\n"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="connection refused"):
+        gateway._run_real_preflight(state, ["192.168.1.99"])
+
+    joined = "\n".join(state.replay.realReplayLog)
+    assert "replay_cube_pose_in_robot_base.thor.yaml" in joined
+    assert "[PASS] fr3_ping: reachable" in joined
+    assert "[FAIL] fr3_arm: connection refused" in joined
 
 
 def test_mujoco_validation_fails_when_metrics_exceed_threshold(tmp_path):

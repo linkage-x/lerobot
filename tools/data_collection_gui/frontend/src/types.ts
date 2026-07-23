@@ -132,6 +132,7 @@ export type ReplayStatus = {
   realRobotIp?: string;
   realEndEffectorMode?: RealEndEffectorMode;
   mujocoOverrideAccepted?: boolean;
+  realReplayLog?: string[];
   // Bumped when the dataset content changes under an unchanged (root, episode)
   // selection (e.g. after deleting an episode); the inspector refetches on it.
   revision?: number;
