@@ -285,15 +285,56 @@ export function DatasetProcessingPage({
                   </span>
                 </div>
                 <p>{selected.ikEvaluation.message}</p>
-                <div className="online-sync-episodes">
+                <div className="ik-cube-list">
                   {selected.ikEvaluation.cubes.map((cube, index) => {
                     const ratio = typeof cube.reachableRatio === "number" ? cube.reachableRatio * 100 : null;
+                    const reachableEpisodes = cube.reachableEpisodeIndices ?? [];
+                    const unreachableEpisodes = cube.unreachableEpisodeIndices ?? [];
+                    const plotParams = new URLSearchParams({
+                      path: selected.path,
+                      cube: cube.cube,
+                      t: selected.updatedAt
+                    });
                     return (
-                      <div className="online-sync-episode" key={`${String(cube.cube ?? "cube")}-${index}`}>
-                        <strong>{String(cube.cube ?? "cube")}</strong>
-                        <span>{ratio == null ? "—" : `${ratio.toFixed(2)}% poses`}</span>
-                        <span>{`${Number(cube.numUnreachableTrajectories ?? 0)} unreachable trajectories`}</span>
-                        <small>{String(cube.message ?? "No IK summary")}</small>
+                      <div className="ik-cube-card" key={`${cube.cube}-${index}`}>
+                        <div className="ik-cube-summary">
+                          <strong>{cube.cube}</strong>
+                          <span className={`ik-result-badge ik-result-${cube.status}`}>{cube.status}</span>
+                          <span>{ratio == null ? "—" : `${ratio.toFixed(2)}% poses reachable`}</span>
+                          <small>{cube.message || "No IK summary"}</small>
+                        </div>
+                        {reachableEpisodes.length || unreachableEpisodes.length ? (
+                          <p className="ik-episode-answer">
+                            <strong>Reachable:</strong> {reachableEpisodes.length ? reachableEpisodes.map((episode) => `episode ${episode}`).join(", ") : "none"}
+                            <span> · </span>
+                            <strong>Unreachable:</strong> {unreachableEpisodes.length ? unreachableEpisodes.map((episode) => `episode ${episode}`).join(", ") : "none"}
+                          </p>
+                        ) : null}
+                        {cube.episodes?.length ? (
+                          <div className="ik-episode-table">
+                            <div className="ik-episode-table-header">
+                              <span>Episode</span><span>Result</span><span>Reachable poses</span><span>Max error</span>
+                            </div>
+                            {cube.episodes.map((episode) => (
+                              <div className={`ik-episode-row ik-episode-${episode.status}`} key={episode.episodeIndex}>
+                                <strong>{episode.episodeIndex}</strong>
+                                <span>{episode.status}</span>
+                                <span>{episode.numReachable}/{episode.numTargets} ({(episode.reachableRatio * 100).toFixed(2)}%)</span>
+                                <span>{episode.maxPositionErrorMm.toFixed(2)} mm · {episode.maxOrientationErrorDeg.toFixed(2)}°</span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+                        {cube.plotAvailable ? (
+                          <figure className="ik-error-plot">
+                            <img
+                              src={`/api/processing/ik-plot?${plotParams.toString()}`}
+                              alt={`${cube.cube} FR3 IK position and orientation error over time`}
+                              loading="lazy"
+                            />
+                            <figcaption>{cube.cube} IK error over time</figcaption>
+                          </figure>
+                        ) : null}
                       </div>
                     );
                   })}

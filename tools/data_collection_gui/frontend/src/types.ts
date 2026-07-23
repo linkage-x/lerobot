@@ -450,7 +450,31 @@ export type ProcessingItem = {
   }>;
   ikEvaluation?: {
     status: "pass" | "warn" | "fail" | "skipped";
-    cubes: Array<Record<string, unknown>>;
+    cubes: Array<{
+      cube: string;
+      status: "pass" | "warn" | "fail" | "skipped";
+      message: string;
+      reachableRatio?: number;
+      numTargets?: number;
+      numUnreachableTargets?: number;
+      numUnreachableTrajectories?: number;
+      reachableEpisodeIndices?: number[];
+      unreachableEpisodeIndices?: number[];
+      plotAvailable?: boolean;
+      episodes?: Array<{
+        episodeIndex: number;
+        status: "reachable" | "unreachable";
+        label: string;
+        numTargets: number;
+        numReachable: number;
+        numUnreachable: number;
+        reachableRatio: number;
+        unreachableDurationS: number;
+        maxConsecutiveUnreachableTimesteps: number;
+        maxPositionErrorMm: number;
+        maxOrientationErrorDeg: number;
+      }>;
+    }>;
     message: string;
   } | null;
 };

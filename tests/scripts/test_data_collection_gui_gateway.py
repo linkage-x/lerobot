@@ -1331,12 +1331,26 @@ def test_fr3_ik_qc_runs_each_available_arm_sidecar(monkeypatch, tmp_path):
                 "reachable_ratio": 0.8,
                 "reason_counts": {"ok": 8, "fk_residual": 2},
                 "ik_error_stats": {"mean_position_error_m": 0.004},
+                "episode_summary": [{
+                    "episode_index": 3,
+                    "num_targets": 10,
+                    "num_reachable": 8,
+                    "num_unreachable": 2,
+                    "reachable_ratio": 0.8,
+                    "trajectory_reachable": True,
+                    "ik_trajectory_label": "reachable",
+                    "unreachable_duration_s": 0.1,
+                    "max_consecutive_unreachable_timesteps": 2,
+                    "max_position_error_m": 0.004,
+                    "max_orientation_error_deg": 1.5,
+                }],
                 "trajectory_reachability": {
                     "total_trajectories": 1,
                     "num_unreachable_trajectories": 0,
                 },
             }
         }), encoding="utf-8")
+        report_path.with_name("verify_fr3_cube_pose_ik_error_over_time.png").write_bytes(b"plot")
         return subprocess.CompletedProcess(command, 0, stdout="Offline FR3 IK validation finished")
 
     monkeypatch.setattr(gateway.subprocess, "run", fake_run)
@@ -1351,6 +1365,10 @@ def test_fr3_ik_qc_runs_each_available_arm_sidecar(monkeypatch, tmp_path):
     assert result["status"] == "warn"
     assert [cube["cube"] for cube in result["cubes"]] == ["left"]
     assert result["cubes"][0]["reachableRatio"] == pytest.approx(0.8)
+    assert result["cubes"][0]["reachableEpisodeIndices"] == [3]
+    assert result["cubes"][0]["unreachableEpisodeIndices"] == []
+    assert result["cubes"][0]["episodes"][0]["maxPositionErrorMm"] == pytest.approx(4.0)
+    assert result["cubes"][0]["plotAvailable"] is True
 
 
 def test_fr3_ik_qc_skips_sidecar_without_finite_poses(monkeypatch, tmp_path):

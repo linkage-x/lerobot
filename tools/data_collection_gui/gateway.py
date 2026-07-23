@@ -2699,6 +2699,27 @@ def _run_fr3_ik_qc(
             continue
 
         trajectory = summary.get("trajectory_reachability") if isinstance(summary.get("trajectory_reachability"), dict) else {}
+        raw_episode_summary = summary.get("episode_summary") if isinstance(summary.get("episode_summary"), list) else []
+        episodes: list[dict[str, Any]] = []
+        for raw_episode in raw_episode_summary:
+            if not isinstance(raw_episode, dict):
+                continue
+            reachable = bool(raw_episode.get("trajectory_reachable"))
+            episodes.append({
+                "episodeIndex": int(raw_episode.get("episode_index") or 0),
+                "status": "reachable" if reachable else "unreachable",
+                "label": str(raw_episode.get("ik_trajectory_label") or ("reachable" if reachable else "unreachable")),
+                "numTargets": int(raw_episode.get("num_targets") or 0),
+                "numReachable": int(raw_episode.get("num_reachable") or 0),
+                "numUnreachable": int(raw_episode.get("num_unreachable") or 0),
+                "reachableRatio": float(raw_episode.get("reachable_ratio") or 0.0),
+                "unreachableDurationS": float(raw_episode.get("unreachable_duration_s") or 0.0),
+                "maxConsecutiveUnreachableTimesteps": int(
+                    raw_episode.get("max_consecutive_unreachable_timesteps") or 0
+                ),
+                "maxPositionErrorMm": float(raw_episode.get("max_position_error_m") or 0.0) * 1000.0,
+                "maxOrientationErrorDeg": float(raw_episode.get("max_orientation_error_deg") or 0.0),
+            })
         total_trajectories = int(
             trajectory.get("num_trajectories")
             or trajectory.get("total_trajectories")
@@ -2713,6 +2734,7 @@ def _run_fr3_ik_qc(
         unreachable_targets = int(summary.get("num_unreachable") or 0)
         reachable_ratio = float(summary.get("reachable_ratio") or 0.0)
         status = "fail" if unreachable_trajectories else ("warn" if unreachable_targets else "pass")
+        plot_path = report_path.with_name("verify_fr3_cube_pose_ik_error_over_time.png")
         cube_results.append({
             "cube": cube,
             "status": status,
@@ -2726,6 +2748,10 @@ def _run_fr3_ik_qc(
             "reachableRatio": reachable_ratio,
             "reasonCounts": summary.get("reason_counts") or {},
             "ikErrorStats": summary.get("ik_error_stats") or {},
+            "episodes": episodes,
+            "reachableEpisodeIndices": [row["episodeIndex"] for row in episodes if row["status"] == "reachable"],
+            "unreachableEpisodeIndices": [row["episodeIndex"] for row in episodes if row["status"] == "unreachable"],
+            "plotAvailable": plot_path.is_file(),
             "reportPath": str(report_path),
             "rowsPath": str(rows_path),
         })
@@ -7544,6 +7570,30 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "No RealSense preview frame available"})
                 return
             _serve_static_file(self, image_path, "image/jpeg")
+            return
+        if path == "/api/processing/ik-plot":
+            requested = query.get("path", [""])[0]
+            cube = str(query.get("cube", [""])[0]).strip().lower()
+            if cube not in {"left", "right"}:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "cube must be left or right"})
+                return
+            with self.server.state.lock:
+                dataset_root = _resolve_known_dataset(self.server.state, requested)
+            if dataset_root is None:
+                _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
+                return
+            plot_path = (
+                dataset_root
+                / "derived"
+                / DEFAULT_TRAJ_SIDECAR_NAME
+                / "ik_qc"
+                / cube
+                / "verify_fr3_cube_pose_ik_error_over_time.png"
+            )
+            if not plot_path.is_file():
+                _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"IK plot not found for {cube}"})
+                return
+            _serve_static_file(self, plot_path, "image/png")
             return
         if path == "/api/replay/video":
             requested = query.get("path", [""])[0]
