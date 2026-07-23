@@ -1421,6 +1421,26 @@ button.danger {
   justify-content: space-between;
 }
 
+.replay-local-transport {
+  align-items: center;
+  background: #f4f7f8;
+  border: 1px solid #dce4e8;
+  border-radius: 7px;
+  display: flex;
+  gap: 14px;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  padding: 8px 10px;
+}
+
+.replay-local-transport button {
+  min-width: 78px;
+}
+
+.replay-local-transport .inspector-readout {
+  margin-left: auto;
+}
+
 .mujoco-run-button {
   background: #0f766e;
   border-color: #0b615b;

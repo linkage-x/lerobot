@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { MujocoReplayViewer } from "./MujocoReplayViewer";
 import { Pose3DViewer } from "./Pose3DViewer";
 import { SeriesPlot } from "./SeriesPlot";
 import type { DataCollectionGuiApi } from "./api";
@@ -25,6 +24,30 @@ const cubeEdges: Array<[number, number]> = [
 
 function shortCameraName(key: string): string {
   return key.replace(/^observation\.images\./, "");
+}
+
+function ReplayTransport({
+  playing,
+  onToggle,
+  currentFrame,
+  timestamp
+}: {
+  playing: boolean;
+  onToggle: () => void;
+  currentFrame: number;
+  timestamp?: number;
+}) {
+  return (
+    <div className="replay-local-transport">
+      <button onClick={onToggle} type="button">{playing ? "Pause" : "Play"}</button>
+      <div className="inspector-readout">
+        <span>frame</span>
+        <strong>{currentFrame}</strong>
+        <span>ts</span>
+        <strong>{timestamp?.toFixed(3) ?? "—"} s</strong>
+      </div>
+    </div>
+  );
 }
 
 const TOUCH_ROW_LENGTHS = [13, 13, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 13, 13];
@@ -717,6 +740,12 @@ export function ReplayInspector({
             drag to orbit · wheel to zoom{cubePoseNames.length ? ` · cubes ${cubePoseNames.join(", ")}` : ""}
           </span>
         </div>
+        <ReplayTransport
+          playing={playing}
+          onToggle={togglePlay}
+          currentFrame={currentFrame}
+          timestamp={frame?.timestamp}
+        />
         {pose ? (
           <div className="pose-summary">
             <span>
@@ -790,6 +819,12 @@ export function ReplayInspector({
             ? "Two identical FR3 models are shown in parallel with 0.90 m between bases; both trajectories remain in their own robot-base coordinates."
             : `One FR3 follows state_action.${mujocoMode}.csv from the selected dataset and episode.`}
         </p>
+        <ReplayTransport
+          playing={playing}
+          onToggle={togglePlay}
+          currentFrame={currentFrame}
+          timestamp={frame?.timestamp}
+        />
         {mujocoPreview?.native_video_path && !nativeVideoFailed ? (
           <div className="mujoco-native-video-wrap">
             <video
@@ -805,11 +840,11 @@ export function ReplayInspector({
               <div className="mujoco-native-labels"><span>Left FR3</span><span>Right FR3</span></div>
             ) : null}
           </div>
-        ) : mujocoPreview ? (
-          <MujocoReplayViewer preview={mujocoPreview} currentFrame={currentFrame} />
         ) : (
           <div className="mujoco-empty">
-            Choose a cube mode and run MuJoCo here to generate the native animation for this dataset and episode.
+            {nativeVideoFailed
+              ? "The native MuJoCo FR3 video could not be loaded. Run MuJoCo again to regenerate it."
+              : "Choose a cube mode and run MuJoCo here to render the true FR3 model for this dataset and episode."}
           </div>
         )}
       </section>
