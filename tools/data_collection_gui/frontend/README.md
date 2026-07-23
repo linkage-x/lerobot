@@ -72,7 +72,7 @@ If the proxy cannot reach the gateway, the frontend falls back to a mock adapter
 | --- | --- | --- | --- |
 | Live Record | `#/live-record` | Integrated with gateway | Connect, StartEpisode, Save, Discard, Exit, device status, event log |
 | Dataset Processing | `#/dataset-processing` | Partial | datasets root selector, dataset scan, Run QC, processing log; Generate EE Trajectory currently shows `待实现` |
-| Episode Replay | `#/episode-replay` | Integrated for review and gated replay | recorded dataset selector, episode selector, video/timeline inspector, annotation, Replay Controls |
+| Episode Replay | `#/episode-replay` | Integrated for review and gated replay | recorded dataset/episode selector, synchronized inspector, embedded native cube MuJoCo, annotation, and single-cube hardware replay |
 | Dataset Export | `#/dataset-export` | UI scaffold only | export planning surface for LeRobot v3 / MCAP / Parquet; backend export endpoints are not implemented yet |
 | Deferred pages | dashboard, QC report, model evaluation, device manager, task library, annotation audit | UI placeholders | not part of the current production path |
 
@@ -82,8 +82,9 @@ If the proxy cannot reach the gateway, the frontend falls back to a mock adapter
 2. Select an episode with Previous / Next / dropdown. The default episode is `0`.
 3. Review the inspector timeline, camera video, EE pose/action values, and diagnostics.
 4. Fill Episode Annotation: task prompt, outcome, quality, include-in-training flag, tags, notes, annotator.
-5. Run MuJoCo replay from Replay Controls. This is strongly recommended before Preflight and Dry Run, and required before Real Robot.
-6. Run Preflight, then Dry Run or Real Robot as appropriate. Real Robot stays disabled unless the selected dataset/episode/fps has a current passed MuJoCo validation.
+5. In the inspector, select `left`, `right`, or `both`, then run MuJoCo. The native MuJoCo MP4 and fallback 3D report are embedded in the episode timeline.
+6. For hardware replay, select one cube (`left` or `right`) in the Real Robot panel and enter its FR3 IP. The panel remains locked until the same dataset, episode, FPS, thresholds, and cube mode have a current MuJoCo pass.
+7. Keep an operator at the robot and use Abort plus the physical emergency stop as appropriate. See [Cube MuJoCo and real-robot replay](../docs/cube_replay_ui.md) for prerequisites and the data-first test sequence.
 
 MuJoCo validation is persisted under:
 
@@ -107,13 +108,15 @@ Dataset processing/QC metadata is persisted under:
 
 `Run QC` is implemented in the gateway. It checks parquet readability, required columns, frame continuity, timestamp monotonicity, EE continuity when named EE pose columns exist, quaternion norm, gripper range, video presence, and frame-count consistency.
 
-`Generate EE Trajectory` is not implemented in the GUI/backend yet. Clicking it returns `501 Not Implemented` from the gateway and the frontend shows:
+`Generate EE Trajectory` runs the Thor AprilTag cube tracker through
+`third_party/opencv_kalibr/run_april_cube_tracking_local.sh`. It writes left,
+right, and head sidecars under
+`derived/april_cube_tracking_in_robot_base/`; those sidecars drive the cube
+overlays, MuJoCo replay, and guarded single-cube hardware replay.
 
-```text
-待实现：Generate EE Trajectory 功能尚未接入。
-```
-
-Datasets that already contain named EE pose columns in `observation.state` or `action` are treated as `pose_ready` with trajectory version `v1`, so they can proceed to QC and replay review without using the missing generator button.
+Datasets that already contain named EE pose columns in `observation.state` or
+`action` are also treated as `pose_ready` with trajectory version `v1` for
+ordinary replay review.
 
 ## Command-Line Entry Points
 
@@ -141,22 +144,15 @@ PYTHONPATH=src:. python src/lerobot/scripts/lerobot_dataset_viz.py \
   --mode local
 ```
 
-### MuJoCo Replay For Recorded FR3 Episodes
+### Cube MuJoCo Replay For Generated EE Trajectories
 
 ```bash
 cd /home/hanyu/Codes/lerobot
-PYTHONPATH=src:. python tools/fr3/fr3_sim_record_replay.py \
-  --dataset outputs/datasets/lerobotv3_0310_100ep \
-  --episode 0
-```
-
-For headless metric output:
-
-```bash
-PYTHONPATH=src:. python tools/fr3/fr3_sim_record_replay.py \
-  --dataset outputs/datasets/lerobotv3_0310_100ep \
-  --episode 0 \
-  --no-viewer
+MUJOCO_GL=egl /home/nvidia/Code/infer/.venv-fr3/bin/python3 \
+  third_party/opencv_kalibr/fr3_data_collection_replay/replay_cube_pose_in_robot_base_mujoco.py \
+  --dataset-root outputs/datasets/<thor_dataset> \
+  --cube left --episode-index 0 --pose-prefix state \
+  --ik-solver hardware --no-viewer
 ```
 
 ### DAS MuJoCo Replay (Deprecated)
@@ -174,12 +170,10 @@ Run with `--dry-run` first to inspect the Docker command:
 
 ```bash
 cd /home/hanyu/Codes/lerobot
-PYTHONPATH=src:. python tools/fr3/fr3_das_replay_real.py \
-  --dataset outputs/datasets/lerobotv3_0310_100ep \
-  --episode 0 \
-  --robot-ip 192.168.1.208 \
-  --gripper-port /dev/ttyUSB0 \
-  --dry-run
+bash third_party/opencv_kalibr/run_replay_cube_pose_on_thor.sh \
+  --dataset-root outputs/datasets/<thor_dataset> \
+  --cube left --robot-ip 192.168.1.208 --mode hardware \
+  --dry-run -- --replay.episode_index=0
 ```
 
 Remove `--dry-run` only after hardware preflight and MuJoCo validation are acceptable for the selected episode.

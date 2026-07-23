@@ -96,6 +96,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Timeout for the first Hikrobot frame probe.",
     )
     parser.add_argument(
+        "--skip-host-imports",
+        action="store_true",
+        help="Skip the generic recording/teleoperation import bundle; device checks still import what they use.",
+    )
+    parser.add_argument(
         "--skip-ping",
         action="store_true",
         help="Skip the FR3 ping reachability check.",
@@ -483,8 +488,11 @@ def run_preflight(args: argparse.Namespace) -> tuple[list[CheckResult], Hikrobot
         raise ValueError("Could not resolve robot IP from --robot-ip or config.robot.robot_ip.")
 
     results: list[CheckResult] = []
-    imports_ok, imports_details = check_host_runtime_imports()
-    _record(results, "host_runtime_imports", imports_ok, imports_details)
+    if args.skip_host_imports:
+        _record(results, "host_runtime_imports", True, "skipped for replay-only preflight")
+    else:
+        imports_ok, imports_details = check_host_runtime_imports()
+        _record(results, "host_runtime_imports", imports_ok, imports_details)
 
     if not args.skip_ping:
         ping_ok, ping_details = check_ping(robot_ip, args.ping_count)

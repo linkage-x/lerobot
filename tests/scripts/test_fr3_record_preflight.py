@@ -164,6 +164,28 @@ def test_main_returns_zero_when_all_checks_pass(monkeypatch, capsys):
     assert "next_command:" in captured.out
 
 
+def test_skip_host_imports_preserves_device_checks(monkeypatch):
+    args = fr3_record_preflight.parse_args(
+        ["--skip-host-imports", "--skip-ping", "--skip-arm", "--skip-gripper", "--skip-hikrobot"]
+    )
+    monkeypatch.setattr(
+        fr3_record_preflight,
+        "_load_runtime_config",
+        lambda *_args: {"robot": {"robot_ip": "192.168.1.99", "gripper_backend": "corenetic"}},
+    )
+    monkeypatch.setattr(
+        fr3_record_preflight,
+        "check_host_runtime_imports",
+        lambda: (_ for _ in ()).throw(AssertionError("generic imports must be skipped")),
+    )
+
+    results, _ = fr3_record_preflight.run_preflight(args)
+
+    assert results == [
+        fr3_record_preflight.CheckResult("host_runtime_imports", True, "skipped for replay-only preflight")
+    ]
+
+
 def test_main_returns_nonzero_when_any_check_fails(monkeypatch, capsys):
     args = fr3_record_preflight.parse_args(["--skip-ping", "--skip-arm", "--skip-gripper", "--skip-hikrobot"])
 
