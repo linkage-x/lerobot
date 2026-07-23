@@ -2610,8 +2610,12 @@ def _run_fr3_ik_qc(
     fps: int,
 ) -> dict[str, Any]:
     sidecar_dir = dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME
-    cubes = [cube for cube in ("left", "right") if (sidecar_dir / f"state_action.{cube}.csv").is_file()]
-    if not cubes:
+    cube_paths = {
+        cube: sidecar_dir / f"state_action.{cube}.csv"
+        for cube in ("left", "right")
+        if (sidecar_dir / f"state_action.{cube}.csv").is_file()
+    }
+    if not cube_paths:
         return {
             "status": "skipped",
             "message": "No left/right FR3 EE trajectory sidecar is available for offline IK evaluation.",
@@ -2628,7 +2632,25 @@ def _run_fr3_ik_qc(
         }
 
     cube_results: list[dict[str, Any]] = []
-    for cube in cubes:
+    for cube, csv_path in cube_paths.items():
+        try:
+            with csv_path.open("r", encoding="utf-8", newline="") as csv_file:
+                has_valid_pose = any(_pose_from_csv_row(row) is not None for row in csv.DictReader(csv_file))
+        except (OSError, csv.Error) as exc:
+            cube_results.append({
+                "cube": cube,
+                "status": "fail",
+                "message": f"could not read trajectory sidecar: {exc}",
+            })
+            continue
+        if not has_valid_pose:
+            cube_results.append({
+                "cube": cube,
+                "status": "skipped",
+                "message": "no finite EE target poses in trajectory sidecar",
+            })
+            continue
+
         output_dir = sidecar_dir / "ik_qc" / cube
         report_path = output_dir / "verify_fr3_cube_pose_ik_report.json"
         rows_path = output_dir / "verify_fr3_cube_pose_ik_rows.csv"
@@ -2636,7 +2658,7 @@ def _run_fr3_ik_qc(
             str(python_executable),
             str(script_path),
             f"--config_path={config_path}",
-            f"--input.csv_path={sidecar_dir / f'state_action.{cube}.csv'}",
+            f"--input.csv_path={csv_path}",
             f"--input.dataset_pose_name={cube}",
             f"--replay.replay_fps={max(int(fps), 1)}",
             f"--validation.report_json_path={report_path}",
@@ -2677,8 +2699,17 @@ def _run_fr3_ik_qc(
             continue
 
         trajectory = summary.get("trajectory_reachability") if isinstance(summary.get("trajectory_reachability"), dict) else {}
-        total_trajectories = int(trajectory.get("total_trajectories") or 0)
+        total_trajectories = int(
+            trajectory.get("num_trajectories")
+            or trajectory.get("total_trajectories")
+            or 0
+        )
         unreachable_trajectories = int(trajectory.get("num_unreachable_trajectories") or 0)
+        reachable_trajectories = int(
+            trajectory.get("num_reachable_trajectories")
+            if trajectory.get("num_reachable_trajectories") is not None
+            else max(0, total_trajectories - unreachable_trajectories)
+        )
         unreachable_targets = int(summary.get("num_unreachable") or 0)
         reachable_ratio = float(summary.get("reachable_ratio") or 0.0)
         status = "fail" if unreachable_trajectories else ("warn" if unreachable_targets else "pass")
@@ -2686,7 +2717,7 @@ def _run_fr3_ik_qc(
             "cube": cube,
             "status": status,
             "message": (
-                f"{total_trajectories - unreachable_trajectories}/{total_trajectories} trajectories reachable; "
+                f"{reachable_trajectories}/{total_trajectories} trajectories reachable; "
                 f"{reachable_ratio * 100.0:.2f}% poses reachable"
             ),
             "numTargets": int(summary.get("num_targets") or 0),

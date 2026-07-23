@@ -1309,7 +1309,11 @@ def test_fr3_ik_qc_runs_each_available_arm_sidecar(monkeypatch, tmp_path):
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
     sidecar_dir = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
     sidecar_dir.mkdir(parents=True)
-    (sidecar_dir / "state_action.left.csv").write_text("header\n", encoding="utf-8")
+    (sidecar_dir / "state_action.left.csv").write_text(
+        "state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw\n"
+        "0.4,0.0,0.3,0.0,0.0,0.0,1.0\n",
+        encoding="utf-8",
+    )
     script = repo_root / "third_party" / "opencv_kalibr" / "verification" / "verify_fr3_cube_pose_ik.py"
     config = repo_root / "third_party" / "opencv_kalibr" / "verification" / "verify_fr3_cube_pose_ik.thor.yaml"
     script.parent.mkdir(parents=True)
@@ -1347,6 +1351,42 @@ def test_fr3_ik_qc_runs_each_available_arm_sidecar(monkeypatch, tmp_path):
     assert result["status"] == "warn"
     assert [cube["cube"] for cube in result["cubes"]] == ["left"]
     assert result["cubes"][0]["reachableRatio"] == pytest.approx(0.8)
+
+
+def test_fr3_ik_qc_skips_sidecar_without_finite_poses(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    sidecar_dir = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    sidecar_dir.mkdir(parents=True)
+    (sidecar_dir / "state_action.right.csv").write_text(
+        "state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw\n"
+        "nan,nan,nan,nan,nan,nan,nan\n",
+        encoding="utf-8",
+    )
+    script = repo_root / "third_party" / "opencv_kalibr" / "verification" / "verify_fr3_cube_pose_ik.py"
+    config = repo_root / "third_party" / "opencv_kalibr" / "verification" / "verify_fr3_cube_pose_ik.thor.yaml"
+    script.parent.mkdir(parents=True)
+    script.write_text("# verifier\n", encoding="utf-8")
+    config.write_text("robot: {}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        gateway.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("verifier must not run")),
+    )
+
+    result = gateway._run_fr3_ik_qc(
+        dataset_root,
+        repo_root=repo_root,
+        python_executable=Path(sys.executable),
+        fps=60,
+    )
+
+    assert result["status"] == "pass"
+    assert result["cubes"] == [{
+        "cube": "right",
+        "status": "skipped",
+        "message": "no finite EE target poses in trajectory sidecar",
+    }]
 
 
 def test_real_replay_rejects_two_cube_mode(tmp_path):
