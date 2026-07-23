@@ -1281,6 +1281,29 @@ def test_run_qc_includes_fr3_ik_result_in_overall_status(monkeypatch, tmp_path):
     assert ik_check["status"] == "fail"
 
 
+def test_run_qc_preserves_virtualenv_python_symlink(monkeypatch, tmp_path):
+    dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    base_python = tmp_path / "python-base"
+    base_python.write_text("", encoding="utf-8")
+    venv_python = tmp_path / "fr3-venv" / "bin" / "python3"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base_python)
+    captured: dict[str, Path] = {}
+
+    def fake_ik_qc(*args, **kwargs):
+        del args
+        captured["python"] = kwargs["python_executable"]
+        return {"status": "skipped", "message": "not needed", "cubes": []}
+
+    monkeypatch.setattr(gateway, "_run_fr3_ik_qc", fake_ik_qc)
+
+    gateway._run_qc(dataset_root, repo_root=tmp_path, ik_python=venv_python)
+
+    assert captured["python"] == venv_python
+    assert captured["python"] != venv_python.resolve()
+
+
 def test_fr3_ik_qc_runs_each_available_arm_sidecar(monkeypatch, tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"

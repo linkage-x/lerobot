@@ -2961,7 +2961,10 @@ def _run_qc(
     ik_evaluation = _run_fr3_ik_qc(
         dataset_root,
         repo_root=(repo_root or Path.cwd()).resolve(),
-        python_executable=(ik_python or Path(sys.executable)).resolve(),
+        # Do not resolve this path: venv ``bin/python`` is commonly a symlink
+        # to the base interpreter, and dereferencing it bypasses pyvenv.cfg and
+        # all packages installed in the selected FR3 environment.
+        python_executable=Path(ik_python or sys.executable).expanduser(),
         fps=int(info.get("fps") or 30),
     )
     if ik_evaluation["status"] != "skipped":
