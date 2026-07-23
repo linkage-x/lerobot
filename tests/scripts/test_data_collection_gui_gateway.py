@@ -1214,7 +1214,7 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
         recording=gateway.RecordingStatus(repoId="local/test"),
         replay=gateway.ReplayStatus(
             dataset=str(dataset_root), datasetRoot=str(dataset_root), episode=0, fps=30,
-            totalFrames=2, recordedFrames=2, mujocoCubeMode="left",
+            totalFrames=2, recordedFrames=4, mujocoCubeMode="left",
         ),
         selected_replay_root=dataset_root,
     )

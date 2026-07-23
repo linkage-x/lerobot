@@ -6705,7 +6705,9 @@ def _approve_mujoco_report(state: GatewayState, cube_mode: str) -> None:
     metric_rows = [row.get("metrics") if isinstance(row.get("metrics"), dict) else {} for row in robot_rows]
     if any(not metrics for metrics in metric_rows):
         raise RuntimeError("MuJoCo report is missing error metrics.")
-    total_frames = int(state.replay.recordedFrames or state.replay.totalFrames or 0) * len(selected_cubes)
+    # totalFrames is scoped to the selected episode; recordedFrames is the
+    # dataset-wide total and would incorrectly reject multi-episode datasets.
+    total_frames = int(state.replay.totalFrames or 0) * len(selected_cubes)
     completed_frames = sum(frame_counts)
     weighted_denominator = max(completed_frames, 1)
 
