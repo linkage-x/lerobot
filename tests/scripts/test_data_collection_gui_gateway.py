@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -1226,6 +1228,11 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
     assert state.replay.safety == "fault"
     with pytest.raises(RuntimeError, match="MuJoCo validation required"):
         gateway._require_mujoco_validation(state)
+    assert gateway._require_mujoco_validation(
+        state,
+        cube_mode="left",
+        allow_failed_override=True,
+    ) == dataset_root.resolve()
 
     passing_report = json.loads(report_path.read_text(encoding="utf-8"))
     passing_report["robots"]["left"]["metrics"].update({
@@ -1241,6 +1248,72 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
 
     assert state.replay.mujocoValidation["status"] == "passed"
     assert gateway._require_mujoco_validation(state) == dataset_root.resolve()
+
+
+def test_run_qc_includes_fr3_ik_result_in_overall_status(monkeypatch, tmp_path):
+    dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    monkeypatch.setattr(
+        gateway,
+        "_run_fr3_ik_qc",
+        lambda *args, **kwargs: {
+            "status": "fail",
+            "message": "left: 0/1 trajectories reachable; 80.00% poses reachable",
+            "cubes": [{"cube": "left", "numUnreachableTrajectories": 1, "reachableRatio": 0.8}],
+        },
+    )
+
+    qc = gateway._run_qc(dataset_root, repo_root=tmp_path, ik_python=Path(sys.executable))
+
+    assert qc["status"] == "fail"
+    assert qc["ik_evaluation"]["cubes"][0]["cube"] == "left"
+    ik_check = next(check for check in qc["checks"] if check["name"] == "fr3_ik_reachability")
+    assert ik_check["status"] == "fail"
+
+
+def test_fr3_ik_qc_runs_each_available_arm_sidecar(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    sidecar_dir = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    sidecar_dir.mkdir(parents=True)
+    (sidecar_dir / "state_action.left.csv").write_text("header\n", encoding="utf-8")
+    script = repo_root / "third_party" / "opencv_kalibr" / "verification" / "verify_fr3_cube_pose_ik.py"
+    config = repo_root / "third_party" / "opencv_kalibr" / "verification" / "verify_fr3_cube_pose_ik.thor.yaml"
+    script.parent.mkdir(parents=True)
+    script.write_text("# verifier\n", encoding="utf-8")
+    config.write_text("robot: {}\n", encoding="utf-8")
+
+    def fake_run(command, **kwargs):
+        del kwargs
+        report_path = Path(next(arg.split("=", 1)[1] for arg in command if arg.startswith("--validation.report_json_path=")))
+        report_path.parent.mkdir(parents=True)
+        report_path.write_text(json.dumps({
+            "summary": {
+                "num_targets": 10,
+                "num_unreachable": 2,
+                "reachable_ratio": 0.8,
+                "reason_counts": {"ok": 8, "fk_residual": 2},
+                "ik_error_stats": {"mean_position_error_m": 0.004},
+                "trajectory_reachability": {
+                    "total_trajectories": 1,
+                    "num_unreachable_trajectories": 0,
+                },
+            }
+        }), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="Offline FR3 IK validation finished")
+
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+
+    result = gateway._run_fr3_ik_qc(
+        dataset_root,
+        repo_root=repo_root,
+        python_executable=Path(sys.executable),
+        fps=60,
+    )
+
+    assert result["status"] == "warn"
+    assert [cube["cube"] for cube in result["cubes"]] == ["left"]
+    assert result["cubes"][0]["reachableRatio"] == pytest.approx(0.8)
 
 
 def test_real_replay_rejects_two_cube_mode(tmp_path):

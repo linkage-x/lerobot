@@ -396,12 +396,14 @@ export class DataCollectionGuiApi {
   async startRealCubeReplay(
     cubeMode: RealCubeMode,
     robotIp: string,
-    endEffectorMode: RealEndEffectorMode
+    endEffectorMode: RealEndEffectorMode,
+    overrideMujocoFailure = false
   ): Promise<GuiSnapshot> {
     const params = new URLSearchParams({
       cube: cubeMode,
       robot_ip: robotIp,
-      end_effector: endEffectorMode
+      end_effector: endEffectorMode,
+      override_mujoco_failure: String(overrideMujocoFailure)
     });
     const remote = await this.postRemoteSnapshot(`/api/replay/start-real?${params.toString()}`);
     if (remote) return remote;

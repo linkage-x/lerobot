@@ -264,7 +264,42 @@ export function DatasetProcessingPage({
             <div className="qc-block">
               <h3>QC summary</h3>
               <p>{selected.qcSummary}</p>
+              {selected.qcChecks?.length ? (
+                <div className="qc-diagnostic-list">
+                  {selected.qcChecks.map((check, index) => (
+                    <div className={`qc-diagnostic-row qc-${check.status}`} key={`${check.name}-${index}`}>
+                      <strong>{check.name}</strong>
+                      <span>{check.status}</span>
+                      <p>{check.message}</p>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
             </div>
+            {selected.ikEvaluation ? (
+              <div className="qc-block ik-evaluation-block">
+                <div className="qc-block-heading">
+                  <h3>FR3 offline IK evaluation</h3>
+                  <span className={`sync-status sync-status-${selected.ikEvaluation.status === "pass" ? "pass" : selected.ikEvaluation.status === "skipped" ? "missing" : "fail"}`}>
+                    {selected.ikEvaluation.status}
+                  </span>
+                </div>
+                <p>{selected.ikEvaluation.message}</p>
+                <div className="online-sync-episodes">
+                  {selected.ikEvaluation.cubes.map((cube, index) => {
+                    const ratio = typeof cube.reachableRatio === "number" ? cube.reachableRatio * 100 : null;
+                    return (
+                      <div className="online-sync-episode" key={`${String(cube.cube ?? "cube")}-${index}`}>
+                        <strong>{String(cube.cube ?? "cube")}</strong>
+                        <span>{ratio == null ? "—" : `${ratio.toFixed(2)}% poses`}</span>
+                        <span>{`${Number(cube.numUnreachableTrajectories ?? 0)} unreachable trajectories`}</span>
+                        <small>{String(cube.message ?? "No IK summary")}</small>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
             <OnlineSyncManifestBlock item={selected} />
             <div className="log-block">
               <h3>Log</h3>
@@ -281,4 +316,3 @@ export function DatasetProcessingPage({
     </div>
   );
 }
-

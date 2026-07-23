@@ -1556,6 +1556,51 @@ button.danger {
   width: 100%;
 }
 
+.qc-diagnostic-list {
+  display: grid;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.qc-diagnostic-row {
+  align-items: baseline;
+  border-left: 3px solid #94a3b8;
+  display: grid;
+  gap: 4px 10px;
+  grid-template-columns: minmax(150px, auto) auto;
+  padding: 6px 10px;
+}
+
+.qc-diagnostic-row.qc-pass { border-left-color: #0f766e; }
+.qc-diagnostic-row.qc-warn { border-left-color: #d97706; }
+.qc-diagnostic-row.qc-fail { border-left-color: #b42318; }
+.qc-diagnostic-row span { font-size: 12px; text-transform: uppercase; }
+.qc-diagnostic-row p { grid-column: 1 / -1; margin: 0; }
+
+.danger-modal-backdrop {
+  align-items: center;
+  background: rgb(15 23 42 / 68%);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 24px;
+  position: fixed;
+  z-index: 1000;
+}
+
+.danger-modal {
+  background: #ffffff;
+  border: 2px solid #b42318;
+  border-radius: 10px;
+  box-shadow: 0 24px 70px rgb(15 23 42 / 35%);
+  max-width: 560px;
+  padding: 22px;
+  width: 100%;
+}
+
+.danger-modal h3 { color: #b42318; margin-top: 0; }
+.danger-modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
+
 .realsense-monitor {
   background: #080b0d;
   border: 1px solid #34424a;

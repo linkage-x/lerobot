@@ -89,7 +89,7 @@ export function RealRobotReplayPanel({
 }: {
   status: ReplayStatus;
   busy: boolean;
-  onStart: (mode: RealCubeMode, robotIp: string, endEffectorMode: RealEndEffectorMode) => void;
+  onStart: (mode: RealCubeMode, robotIp: string, endEffectorMode: RealEndEffectorMode, overrideMujocoFailure: boolean) => void;
 }) {
   const [mode, setMode] = useState<RealCubeMode>(status.realCubeMode ?? "right");
   const [robotIp, setRobotIp] = useState(status.realRobotIp ?? "");
@@ -97,16 +97,28 @@ export function RealRobotReplayPanel({
     status.realEndEffectorMode ?? "corenetic_gripper_ee"
   );
   const [monitorRequested, setMonitorRequested] = useState(status.state === "replaying");
+  const [overridePromptOpen, setOverridePromptOpen] = useState(false);
   const [cameraStatus, setCameraStatus] = useState<RealSensePreviewStatus | null>(null);
   const [frameKey, setFrameKey] = useState(0);
   const validation = status.mujocoValidation;
-  const validationMatches =
+  const validationPassed =
     validation?.status === "passed" &&
     validation.isCurrentForSelection === true &&
     (validation.cubeMode ?? status.mujocoCubeMode) === mode;
+  const validationFailedButReviewable =
+    validation?.status === "failed" &&
+    validation.exitCode === 0 &&
+    validation.hasStructuredResult === true &&
+    validation.completedFrames > 0 &&
+    validation.completedFrames >= validation.totalFrames &&
+    validation.datasetRoot === (status.datasetRoot ?? status.dataset) &&
+    validation.episode === status.episode &&
+    validation.fps === status.fps &&
+    (validation.cubeMode ?? status.mujocoCubeMode) === mode;
+  const validationDecisionAvailable = validationPassed || validationFailedButReviewable;
   const ipValid = validIpv4(robotIp);
   const active = status.state === "replaying" || status.state === "sim_replay" || status.state === "dry_run";
-  const disabled = busy || active || status.datasetKind === "exported" || !validationMatches || !ipValid;
+  const disabled = busy || active || status.datasetKind === "exported" || !validationDecisionAvailable || !ipValid;
 
   useEffect(() => {
     if (!monitorRequested && status.state !== "replaying") return;
@@ -125,20 +137,15 @@ export function RealRobotReplayPanel({
     };
   }, [monitorRequested, status.state]);
 
-  const run = () => {
-    const confirmed = window.confirm(
-      `Start REAL ROBOT replay?\n\n` +
-      `Dataset: ${status.datasetRoot ?? status.dataset}\n` +
-      `Episode: ${status.episode}\n` +
-      `Cube: ${mode}\n` +
-      `Robot IP: ${robotIp.trim()}\n\n` +
-      `Tracked frame: ${endEffectorMode}\n\n` +
-      `MuJoCo validation must match this exact selection. Keep an operator at the robot and be ready to use the physical emergency stop.`
-    );
-    if (!confirmed) return;
+  const startConfirmed = (overrideMujocoFailure: boolean) => {
+    setOverridePromptOpen(false);
     setMonitorRequested(true);
     setCameraStatus({ available: null, running: true, error: "Connecting to the first available RealSense…" });
-    onStart(mode, robotIp.trim(), endEffectorMode);
+    onStart(mode, robotIp.trim(), endEffectorMode, overrideMujocoFailure);
+  };
+
+  const run = () => {
+    setOverridePromptOpen(true);
   };
 
   return (
@@ -190,11 +197,13 @@ export function RealRobotReplayPanel({
           <p className="panel-note">
             {status.datasetKind === "exported"
               ? "Real robot replay is disabled for exported datasets."
-              : !validationMatches
-                ? `Run and pass MuJoCo ${mode} for this dataset and episode first.`
+              : !validationDecisionAvailable
+                ? `Run MuJoCo ${mode} to completion for this dataset and episode first.`
                 : !ipValid
                   ? "Enter a valid robot IPv4 address."
-                  : `The gateway preflights this IP, moves ${endEffectorMode} to frame 0, then streams the trajectory.`}
+                  : validationFailedButReviewable
+                    ? "MuJoCo failed. You may click Run and make the final Yes/No decision in the warning window."
+                    : `The gateway preflights this IP, moves ${endEffectorMode} to frame 0, then streams the trajectory.`}
           </p>
         </div>
         <div className="realsense-monitor">
@@ -211,6 +220,36 @@ export function RealRobotReplayPanel({
           )}
         </div>
       </div>
+      {overridePromptOpen ? (
+        <div className="danger-modal-backdrop" role="presentation">
+          <div aria-labelledby="mujoco-override-title" aria-modal="true" className="danger-modal" role="dialog">
+            <h3 id="mujoco-override-title">
+              {validationFailedButReviewable ? "MuJoCo validation failed" : "Confirm real-robot replay"}
+            </h3>
+            <p>
+              Dataset <strong>{status.datasetRoot ?? status.dataset}</strong>, episode <strong>{status.episode}</strong>, {mode} cube, target <strong>{endEffectorMode}</strong> on <strong>{robotIp.trim()}</strong>.
+            </p>
+            <p>{validationFailedButReviewable ? "The recorded trajectory did not meet the simulation limits:" : "MuJoCo passed within these limits:"}</p>
+            <ul>
+              <li>
+                Position: <strong>{validation?.maxPositionErrorMm?.toFixed(2)} mm</strong> · limit {validation?.maxPositionThresholdMm.toFixed(2)} mm
+              </li>
+              <li>
+                Rotation: <strong>{validation?.maxRotationErrorDeg?.toFixed(2)} deg</strong> · limit {validation?.maxRotationThresholdDeg.toFixed(2)} deg
+              </li>
+            </ul>
+            <p>
+              {validationFailedButReviewable
+                ? "Proceeding may cause unexpected or unsafe robot motion. Do you want to run the real robot anyway?"
+                : "A simulation pass does not guarantee safe hardware motion. Do you want to run the real robot?"}
+            </p>
+            <div className="danger-modal-actions">
+              <button autoFocus onClick={() => setOverridePromptOpen(false)} type="button">No, cancel</button>
+              <button className="danger" onClick={() => startConfirmed(validationFailedButReviewable)} type="button">Yes, proceed</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -792,7 +831,7 @@ export function EpisodeReplayPage({
   onReplay: (realRobot: boolean) => void;
   onMujocoReplay: (mode: MujocoCubeMode) => void;
   onApproveMujoco: (mode: MujocoCubeMode) => void;
-  onRealReplay: (mode: RealCubeMode, robotIp: string, endEffectorMode: RealEndEffectorMode) => void;
+  onRealReplay: (mode: RealCubeMode, robotIp: string, endEffectorMode: RealEndEffectorMode, overrideMujocoFailure: boolean) => void;
   onAbort: () => void;
   onSelectDataset: (path: string) => void;
   onSelectEpisode: (episode: number) => void;

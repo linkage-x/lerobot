@@ -131,6 +131,7 @@ export type ReplayStatus = {
   realCubeMode?: RealCubeMode;
   realRobotIp?: string;
   realEndEffectorMode?: RealEndEffectorMode;
+  mujocoOverrideAccepted?: boolean;
   // Bumped when the dataset content changes under an unchanged (root, episode)
   // selection (e.g. after deleting an episode); the inspector refetches on it.
   revision?: number;
@@ -440,4 +441,15 @@ export type ProcessingItem = {
   validFramesPct: number | null;
   logTail: string[];
   onlineSync?: OnlineSyncSummary | null;
+  qcChecks?: Array<{
+    name: string;
+    status: "pass" | "warn" | "fail";
+    message: string;
+    details?: Record<string, unknown>;
+  }>;
+  ikEvaluation?: {
+    status: "pass" | "warn" | "fail" | "skipped";
+    cubes: Array<Record<string, unknown>>;
+    message: string;
+  } | null;
 };
