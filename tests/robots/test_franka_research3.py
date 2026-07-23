@@ -1166,6 +1166,28 @@ def test_connect_falls_back_to_mock_gripper_when_hardware_unavailable(monkeypatc
     robot.disconnect()
 
 
+def test_connect_uses_explicit_mock_gripper_without_opening_hardware(monkeypatch):
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", FailingGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_backend="mock",
+            allow_mock_gripper=False,
+            urdf_path="/tmp/fr3.urdf",
+            ik_solver="placo",
+        )
+    )
+
+    robot.connect()
+    assert robot.is_connected
+    assert robot._gripper_is_mock is True
+    assert robot.get_observation()["gripper.pos"] == pytest.approx(1.0)
+    robot.disconnect()
+
+
 def test_connect_raises_when_mock_gripper_disabled(monkeypatch):
     monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
     monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", FailingGripperDriver)

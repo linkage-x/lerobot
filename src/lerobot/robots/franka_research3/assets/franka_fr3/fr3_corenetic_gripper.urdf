@@ -314,6 +314,14 @@
     <parent link="fr3_link7" />
     <child link="fr3_link8" />
   </joint>
+  <!-- Bare-arm replay target at the FR3 flange. This zero-mass alias keeps
+       the arm kinematic chain independent of the optional gripper branch. -->
+  <link name="fr3_ee" />
+  <joint name="fr3_ee_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0" />
+    <parent link="fr3_link8" />
+    <child link="fr3_ee" />
+  </joint>
   <!-- corenetic gripper -->
   <joint name="fr3_corenetic_gripper_joint" type="fixed">
     <origin rpy="0 0 -0.7853981633974483" xyz="0 0 0" />

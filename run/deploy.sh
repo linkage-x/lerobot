@@ -175,9 +175,13 @@ if ! command -v npm &>/dev/null; then
   [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 fi
 
-if [ ! -d node_modules ]; then
-  echo "    npm install..."
-  npm install --silent
+if [ ! -x node_modules/.bin/vite ]; then
+  echo "    frontend dependencies missing or incomplete; restoring from lockfile..."
+  if [ -f package-lock.json ]; then
+    npm ci --no-audit
+  else
+    npm install --no-audit
+  fi
 fi
 
 echo "    http://localhost:5173/ -> gateway@192.168.111.122:8765"

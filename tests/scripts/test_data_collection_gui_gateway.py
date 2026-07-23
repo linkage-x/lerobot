@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -682,7 +684,7 @@ def test_recorder_env_adds_repo_import_paths(monkeypatch, tmp_path):
     assert env["PYTHONUNBUFFERED"] == "1"
 
 
-def test_mujoco_replay_command_uses_repo_relative_dataset_path(tmp_path):
+def test_mujoco_replay_command_uses_selected_cube_sidecar_and_episode(tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "fr3_sim_record_20260421_072232"
     dataset_root.mkdir(parents=True)
@@ -696,11 +698,30 @@ def test_mujoco_replay_command_uses_repo_relative_dataset_path(tmp_path):
 
     command = gateway._mujoco_replay_command(state, dataset_root)
 
-    assert command[1] == str(repo_root / "tools" / "fr3" / "fr3_sim_record_replay.py")
-    assert "--dataset=outputs/datasets/fr3_sim_record_20260421_072232" in command
-    assert "--episode=2" in command
-    assert "--fps=60" in command
-    assert "--no-viewer" not in command
+    assert command[1] == str(
+        repo_root
+        / "third_party"
+        / "opencv_kalibr"
+        / "fr3_data_collection_replay"
+        / "replay_cube_pose_in_robot_base_mujoco.py"
+    )
+    assert command[command.index("--dataset-root") + 1] == str(dataset_root)
+    assert command[command.index("--cube") + 1] == "left"
+    assert command[command.index("--episode-index") + 1] == "2"
+    assert command[command.index("--fps") + 1] == "60"
+    assert command[command.index("--robot-spacing-m") + 1] == "0.9"
+    assert "--no-viewer" in command
+    report_path = Path(command[command.index("--report-json") + 1])
+    assert report_path.name == "mujoco_preview.left.episode_000002.json"
+    video_path = Path(command[command.index("--render-video") + 1])
+    assert video_path.name == "mujoco_preview.left.episode_000002.mp4"
+
+    both_command = gateway._mujoco_replay_command(state, dataset_root, "both")
+    assert both_command[both_command.index("--cube") + 1] == "both"
+    both_report = Path(both_command[both_command.index("--report-json") + 1])
+    assert both_report.name == "mujoco_preview.both.episode_000002.json"
+    both_video = Path(both_command[both_command.index("--render-video") + 1])
+    assert both_video.name == "mujoco_preview.both.episode_000002.mp4"
 
 
 def test_save_annotation_persists_episode_metadata(monkeypatch, tmp_path):
@@ -1116,20 +1137,312 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     )
     gateway._apply_mujoco_replay_output(
         state,
-        "mujoco_replay_result=status=complete completed_frames=2 total_frames=2 "
+        "mujoco_replay_result status=complete completed_frames=2 total_frames=2 "
         "avg_pos_mm=2.0 max_pos_mm=4.0 avg_rot_deg=1.0 max_rot_deg=3.0",
     )
     gateway._finish_mujoco_validation(state, 0)
     gateway._preflight_replay(state)
-    command = gateway._real_replay_command(state, dataset_root)
+    command = gateway._real_replay_command(
+        state,
+        dataset_root,
+        "left",
+        "192.168.1.99",
+    )
 
     assert state.replay.mujocoValidation["status"] == "passed"
     assert state.replay.safety == "ready"
     assert "current MuJoCo validation" in state.replay.message
-    assert "--dataset=outputs/datasets/episode_set" in command
-    assert "--episode=0" in command
-    assert "--robot-ip=192.168.1.99" in command
-    assert "--gripper-port=/dev/ttyUSB9" in command
+    assert command[1].endswith(
+        "third_party/opencv_kalibr/fr3_data_collection_replay/replay_cube_pose_in_robot_base.py"
+    )
+    assert "--input.source=csv" in command
+    assert f"--input.csv_path={dataset_root}/derived/april_cube_tracking_in_robot_base/state_action.left.csv" in command
+    assert "--input.dataset_pose_name=left" in command
+    assert "--robot.robot_ip=192.168.1.99" in command
+    assert "--replay.episode_index=0" in command
+    assert "--replay.initial_pose_mode=current" in command
+    assert "--replay.fail_on_unreached_initial_pose=true" in command
+    assert "--end_effector.mode=robot_config" in command
+
+    bare_command = gateway._real_replay_command(
+        state,
+        dataset_root,
+        "left",
+        "192.168.1.99",
+        "fr3_ee",
+    )
+    assert "--end_effector.mode=fr3_ee" in bare_command
+
+    preflight_command = gateway._real_preflight_command(state, "192.168.1.99")
+    assert preflight_command[0] == str(gateway._mujoco_replay_python(state))
+    assert (
+        f"--config-path={repo_root}/third_party/opencv_kalibr/"
+        "fr3_data_collection_replay/replay_cube_pose_in_robot_base.thor.yaml"
+    ) in preflight_command
+    assert "--skip-host-imports" in preflight_command
+    assert "--skip-hikrobot" in preflight_command
+    assert "--skip-gripper" in preflight_command
+
+
+def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    sidecar_dir = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    sidecar_dir.mkdir(parents=True)
+    (sidecar_dir / "state_action.left.csv").write_text(
+        "episode_index,frame_index,state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw\n"
+        "0,0,0.30,0.0,0.20,0.0,0.0,0.0,1.0\n"
+        "0,1,0.301,0.0,0.20,0.0,0.0,0.0,1.0\n",
+        encoding="utf-8",
+    )
+    report_path = gateway._mujoco_preview_report_path(dataset_root, 0, "left")
+    video_path = gateway._mujoco_preview_video_path(dataset_root, 0, "left")
+    report_path.write_text(
+        json.dumps({
+            "dataset_root": str(dataset_root),
+            "cube_mode": "left",
+            "episode_index": 0,
+            "fps": 30,
+            "robots": {
+                "left": {
+                    "frames": [{"frame_index": 0}, {"frame_index": 1}],
+                    "metrics": {
+                        "avg_position_error_mm": 23.6,
+                        "max_position_error_mm": 104.3,
+                        "avg_rotation_error_deg": 6.2,
+                        "max_rotation_error_deg": 29.3,
+                    },
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+    video_path.write_bytes(b"rendered")
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(
+            dataset=str(dataset_root), datasetRoot=str(dataset_root), episode=0, fps=30,
+            totalFrames=2, recordedFrames=4, mujocoCubeMode="left",
+        ),
+        selected_replay_root=dataset_root,
+    )
+
+    gateway._approve_mujoco_report(state, "left")
+
+    assert state.replay.mujocoValidation["status"] == "failed"
+    assert state.replay.mujocoValidation["maxPositionErrorMm"] == pytest.approx(104.3)
+    assert state.replay.safety == "fault"
+    with pytest.raises(RuntimeError, match="MuJoCo validation required"):
+        gateway._require_mujoco_validation(state)
+    assert gateway._require_mujoco_validation(
+        state,
+        cube_mode="left",
+        allow_failed_override=True,
+    ) == dataset_root.resolve()
+
+    passing_report = json.loads(report_path.read_text(encoding="utf-8"))
+    passing_report["robots"]["left"]["metrics"].update({
+        "avg_position_error_mm": 2.0,
+        "max_position_error_mm": 4.0,
+        "avg_rotation_error_deg": 1.0,
+        "max_rotation_error_deg": 3.0,
+    })
+    report_path.write_text(json.dumps(passing_report), encoding="utf-8")
+    video_path.write_bytes(b"passing-render")
+
+    gateway._approve_mujoco_report(state, "left")
+
+    assert state.replay.mujocoValidation["status"] == "passed"
+    assert gateway._require_mujoco_validation(state) == dataset_root.resolve()
+
+
+def test_run_qc_includes_fr3_ik_result_in_overall_status(monkeypatch, tmp_path):
+    dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    monkeypatch.setattr(
+        gateway,
+        "_run_fr3_ik_qc",
+        lambda *args, **kwargs: {
+            "status": "fail",
+            "message": "left: 0/1 trajectories reachable; 80.00% poses reachable",
+            "cubes": [{"cube": "left", "numUnreachableTrajectories": 1, "reachableRatio": 0.8}],
+        },
+    )
+
+    qc = gateway._run_qc(dataset_root, repo_root=tmp_path, ik_python=Path(sys.executable))
+
+    assert qc["status"] == "fail"
+    assert qc["ik_evaluation"]["cubes"][0]["cube"] == "left"
+    ik_check = next(check for check in qc["checks"] if check["name"] == "fr3_ik_reachability")
+    assert ik_check["status"] == "fail"
+
+
+def test_run_qc_preserves_virtualenv_python_symlink(monkeypatch, tmp_path):
+    dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    base_python = tmp_path / "python-base"
+    base_python.write_text("", encoding="utf-8")
+    venv_python = tmp_path / "fr3-venv" / "bin" / "python3"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base_python)
+    captured: dict[str, Path] = {}
+
+    def fake_ik_qc(*args, **kwargs):
+        del args
+        captured["python"] = kwargs["python_executable"]
+        return {"status": "skipped", "message": "not needed", "cubes": []}
+
+    monkeypatch.setattr(gateway, "_run_fr3_ik_qc", fake_ik_qc)
+
+    gateway._run_qc(dataset_root, repo_root=tmp_path, ik_python=venv_python)
+
+    assert captured["python"] == venv_python
+    assert captured["python"] != venv_python.resolve()
+
+
+def test_fr3_ik_qc_runs_each_available_arm_sidecar(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    sidecar_dir = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    sidecar_dir.mkdir(parents=True)
+    (sidecar_dir / "state_action.left.csv").write_text(
+        "state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw\n"
+        "0.4,0.0,0.3,0.0,0.0,0.0,1.0\n",
+        encoding="utf-8",
+    )
+    script = repo_root / "third_party" / "opencv_kalibr" / "verification" / "verify_fr3_cube_pose_ik.py"
+    config = repo_root / "third_party" / "opencv_kalibr" / "verification" / "verify_fr3_cube_pose_ik.thor.yaml"
+    script.parent.mkdir(parents=True)
+    script.write_text("# verifier\n", encoding="utf-8")
+    config.write_text("robot: {}\n", encoding="utf-8")
+
+    def fake_run(command, **kwargs):
+        del kwargs
+        report_path = Path(next(arg.split("=", 1)[1] for arg in command if arg.startswith("--validation.report_json_path=")))
+        report_path.parent.mkdir(parents=True)
+        report_path.write_text(json.dumps({
+            "summary": {
+                "num_targets": 10,
+                "num_unreachable": 2,
+                "reachable_ratio": 0.8,
+                "reason_counts": {"ok": 8, "fk_residual": 2},
+                "ik_error_stats": {"mean_position_error_m": 0.004},
+                "episode_summary": [{
+                    "episode_index": 3,
+                    "num_targets": 10,
+                    "num_reachable": 8,
+                    "num_unreachable": 2,
+                    "reachable_ratio": 0.8,
+                    "trajectory_reachable": True,
+                    "ik_trajectory_label": "reachable",
+                    "unreachable_duration_s": 0.1,
+                    "max_consecutive_unreachable_timesteps": 2,
+                    "max_position_error_m": 0.004,
+                    "max_orientation_error_deg": 1.5,
+                }],
+                "trajectory_reachability": {
+                    "total_trajectories": 1,
+                    "num_unreachable_trajectories": 0,
+                },
+            }
+        }), encoding="utf-8")
+        report_path.with_name("verify_fr3_cube_pose_ik_error_over_time.png").write_bytes(b"plot")
+        return subprocess.CompletedProcess(command, 0, stdout="Offline FR3 IK validation finished")
+
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+
+    result = gateway._run_fr3_ik_qc(
+        dataset_root,
+        repo_root=repo_root,
+        python_executable=Path(sys.executable),
+        fps=60,
+    )
+
+    assert result["status"] == "warn"
+    assert [cube["cube"] for cube in result["cubes"]] == ["left"]
+    assert result["cubes"][0]["reachableRatio"] == pytest.approx(0.8)
+    assert result["cubes"][0]["reachableEpisodeIndices"] == [3]
+    assert result["cubes"][0]["unreachableEpisodeIndices"] == []
+    assert result["cubes"][0]["episodes"][0]["maxPositionErrorMm"] == pytest.approx(4.0)
+    assert result["cubes"][0]["plotAvailable"] is True
+
+
+def test_fr3_ik_qc_skips_sidecar_without_finite_poses(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    sidecar_dir = dataset_root / "derived" / gateway.DEFAULT_TRAJ_SIDECAR_NAME
+    sidecar_dir.mkdir(parents=True)
+    (sidecar_dir / "state_action.right.csv").write_text(
+        "state_x_m,state_y_m,state_z_m,state_qx,state_qy,state_qz,state_qw\n"
+        "nan,nan,nan,nan,nan,nan,nan\n",
+        encoding="utf-8",
+    )
+    script = repo_root / "third_party" / "opencv_kalibr" / "verification" / "verify_fr3_cube_pose_ik.py"
+    config = repo_root / "third_party" / "opencv_kalibr" / "verification" / "verify_fr3_cube_pose_ik.thor.yaml"
+    script.parent.mkdir(parents=True)
+    script.write_text("# verifier\n", encoding="utf-8")
+    config.write_text("robot: {}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        gateway.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("verifier must not run")),
+    )
+
+    result = gateway._run_fr3_ik_qc(
+        dataset_root,
+        repo_root=repo_root,
+        python_executable=Path(sys.executable),
+        fps=60,
+    )
+
+    assert result["status"] == "pass"
+    assert result["cubes"] == [{
+        "cube": "right",
+        "status": "skipped",
+        "message": "no finite EE target poses in trajectory sidecar",
+    }]
+
+
+def test_real_replay_rejects_two_cube_mode(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+
+    with pytest.raises(ValueError, match="must be left or right"):
+        gateway._start_real_replay(state, "both", "192.168.1.99")
+
+
+def test_real_preflight_failure_is_preserved_in_panel_log(monkeypatch, tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "camera_config.yaml",
+        config={"replay": {"real_preflight_enabled": True}},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+    monkeypatch.setattr(
+        gateway.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 1, stdout="[PASS] fr3_ping: reachable\n[FAIL] fr3_arm: connection refused\n"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="connection refused"):
+        gateway._run_real_preflight(state, ["192.168.1.99"])
+
+    joined = "\n".join(state.replay.realReplayLog)
+    assert "replay_cube_pose_in_robot_base.thor.yaml" in joined
+    assert "[PASS] fr3_ping: reachable" in joined
+    assert "[FAIL] fr3_arm: connection refused" in joined
 
 
 def test_mujoco_validation_fails_when_metrics_exceed_threshold(tmp_path):
