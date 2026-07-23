@@ -7,56 +7,29 @@ import { fmtNum } from "./config";
 import { evaluateForce } from "./parseCaliLog";
 import type { AxisEval, ForceVec } from "./types";
 import { FORCE_AXES, FORCE_AXIS_LABELS } from "./types";
+import { TouchHeatmapGrid, touchScaleFromSamples } from "../touchVisualization";
 
-// Paxini pad hardware layout: 15 rows, 17 columns, corners trimmed. Kept here
-// (mirrors the Device Manager tile) so the calibration views don't import from
-// the monolithic App.tsx.
-export const TOUCH_ROW_LENGTHS = [13, 13, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 13, 13];
-export const TOUCH_COLUMNS = 17;
-
-export function touchColor(value: number, scaleMax: number): string {
-  const ratio = scaleMax > 0 ? Math.min(1, Math.abs(value) / scaleMax) : 0;
-  // dark slate → teal, matching the Device Manager palette
-  const light = 18 + ratio * 42;
-  return `hsl(${175 - ratio * 12}deg 55% ${light}%)`;
-}
-
-export function TouchHeatmap({ fz0p1N }: { fz0p1N: number[] }) {
-  if (fz0p1N.length < 239) {
+export function TouchHeatmap({
+  fz0p1N,
+  fx0p1N = [],
+  fy0p1N = [],
+}: {
+  fz0p1N: number[];
+  fx0p1N?: number[];
+  fy0p1N?: number[];
+}) {
+  const sample = { fz: fz0p1N, fx: fx0p1N, fy: fy0p1N };
+  if (fz0p1N.length === 0) {
     return <div className="camera-tile-empty">无触觉采样</div>;
   }
-  const scaleMax = Math.max(1, ...fz0p1N.map((v) => Math.abs(v)));
-  let cursor = 0;
   return (
-    <div className="box-touch-fill" aria-label="触觉实时热力图">
-      {TOUCH_ROW_LENGTHS.map((length, rowIndex) => {
-        const offset = Math.floor((TOUCH_COLUMNS - length) / 2);
-        const row = fz0p1N.slice(cursor, cursor + length);
-        const startIndex = cursor;
-        cursor += length;
-        return (
-          <div className="touch-row" key={rowIndex}>
-            {Array.from({ length: offset }).map((_, i) => (
-              <span className="touch-cell touch-cell-empty" key={`pre-${i}`} />
-            ))}
-            {row.map((value, i) => {
-              const pointIndex = startIndex + i + 1;
-              return (
-                <span
-                  className="touch-cell"
-                  key={pointIndex}
-                  title={`#${pointIndex} fz=${value.toFixed(1)} (0.1N)`}
-                  style={{ backgroundColor: touchColor(Math.abs(value), scaleMax) }}
-                />
-              );
-            })}
-            {Array.from({ length: TOUCH_COLUMNS - length - offset }).map((_, i) => (
-              <span className="touch-cell touch-cell-empty" key={`post-${i}`} />
-            ))}
-          </div>
-        );
-      })}
-    </div>
+    <TouchHeatmapGrid
+      sample={sample}
+      scale={touchScaleFromSamples([sample])}
+      ariaLabel="触觉实时热力图"
+      className="box-touch-fill"
+      emptyText="无触觉采样"
+    />
   );
 }
 

@@ -1468,6 +1468,53 @@ button.danger {
   min-width: 0;
 }
 
+
+.touch-coordinate-grid {
+  display: block;
+  max-height: 100%;
+  overflow: hidden;
+  position: relative;
+}
+
+.touch-coordinate-grid .touch-coordinate-cell {
+  aspect-ratio: 1;
+  height: auto;
+  min-height: 0;
+  overflow: visible;
+  position: absolute;
+  transform: translate(-50%, -50%);
+  width: clamp(5px, 3.4%, 11px);
+}
+
+.touch-shear-arrow {
+  background: var(--touch-arrow-color);
+  border-radius: 999px;
+  box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.35), 0 1px 3px rgba(15, 23, 42, 0.45);
+  height: 2px;
+  left: 50%;
+  opacity: var(--touch-arrow-opacity, 0);
+  pointer-events: none;
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%) rotate(var(--touch-arrow-angle, 0deg));
+  transform-origin: 0 50%;
+  width: var(--touch-arrow-length, 0%);
+  z-index: 1;
+}
+
+.touch-shear-arrow::after {
+  border-bottom: 3px solid transparent;
+  border-left: 5px solid var(--touch-arrow-color);
+  border-top: 3px solid transparent;
+  content: "";
+  height: 0;
+  position: absolute;
+  right: -1px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 0;
+}
+
 .touch-cell-empty {
   border-color: transparent;
   box-shadow: none;
@@ -2537,16 +2584,27 @@ button.danger {
   justify-content: center;
 }
 
-/* Full-frame tactile heatmap: 15 equal rows of the 17-column pad, sized to the
-   pad's own aspect ratio so it fills the tile height and stays centered. */
+/* Full-frame tactile heatmap. Paxini pads use the vendor XYZ coordinate map;
+   other tactile arrays fall back to a regular grid. */
 .box-touch-fill {
-  aspect-ratio: 17 / 15;
   display: grid;
   gap: 2px;
   grid-auto-rows: 1fr;
   height: 100%;
   max-width: 100%;
   padding: 6px;
+}
+
+
+.box-touch-fill.touch-coordinate-grid {
+  display: block;
+  padding: 0;
+  width: auto;
+}
+
+.box-touch-fill.touch-coordinate-grid .touch-coordinate-cell {
+  height: auto;
+  width: clamp(5px, 3.8%, 12px);
 }
 
 .box-touch-fill .touch-row {

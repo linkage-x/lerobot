@@ -4388,25 +4388,68 @@ def _rows_vector_all_zero(rows: list[dict[str, Any]], column: str) -> bool:
     return saw_value
 
 
-def _touch_payload(data: Any) -> dict[str, Any] | None:
-    if not isinstance(data, dict):
+def _touch_payload_from_axes(
+    fz_values: Any,
+    *,
+    fx_values: Any = None,
+    fy_values: Any = None,
+    timestamp: int = 0,
+    expected_count: int | None = 239,
+) -> dict[str, Any] | None:
+    fz = _as_float_list(fz_values)
+    if expected_count is not None:
+        fz = fz[:expected_count]
+        if len(fz) != expected_count:
+            return None
+    if not fz:
         return None
-    fz = _as_float_list(data.get("fz_0p1N"))[:239]
-    if len(fz) != 239:
-        return None
-    timestamp = int(_first_finite(data.get("timestamp"), default=0.0))
-    active_points = sum(1 for value in fz if abs(value) > 0.0)
-    return {
-        "timestamp": timestamp,
+
+    count = len(fz)
+    fx = _as_float_list(fx_values)[:count] if fx_values is not None else []
+    fy = _as_float_list(fy_values)[:count] if fy_values is not None else []
+    if fx_values is not None and len(fx) < count:
+        fx = []
+    if fy_values is not None and len(fy) < count:
+        fy = []
+
+    active_points = 0
+    for index, z_value in enumerate(fz):
+        x_value = fx[index] if fx else 0.0
+        y_value = fy[index] if fy else 0.0
+        if abs(x_value) > 0.0 or abs(y_value) > 0.0 or abs(z_value) > 0.0:
+            active_points += 1
+
+    payload: dict[str, Any] = {
+        "timestamp": int(timestamp),
         "fz": fz,
         "maxFz": max(fz) if fz else 0.0,
         "activePoints": active_points,
     }
+    if fx:
+        payload["fx"] = fx
+    if fy:
+        payload["fy"] = fy
+    return payload
 
 
-_TOUCH_EXPORT_FZ_COLUMNS = {
-    "left": "observation.touch.box_touch_left.fz_0p1N",
-    "right": "observation.touch.box_touch_right.fz_0p1N",
+def _touch_payload(data: Any) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    timestamp = int(_first_finite(data.get("timestamp"), default=0.0))
+    return _touch_payload_from_axes(
+        data.get("fz_0p1N"),
+        fx_values=data.get("fx_0p1N"),
+        fy_values=data.get("fy_0p1N"),
+        timestamp=timestamp,
+    )
+
+
+_TOUCH_EXPORT_COLUMNS = {
+    side: {
+        axis: f"observation.touch.box_touch_{side}.{axis}_0p1N"
+        for axis in ("fx", "fy", "fz")
+    }
+    for side in ("left", "right")
 }
 
 
@@ -4416,13 +4459,7 @@ def _touch_payload_from_fz(values: Any, *, timestamp: int = 0) -> dict[str, Any]
         return None
     if len(fz) < 239:
         fz.extend([0.0] * (239 - len(fz)))
-    active_points = sum(1 for value in fz if abs(value) > 0.0)
-    return {
-        "timestamp": int(timestamp),
-        "fz": fz,
-        "maxFz": max(fz) if fz else 0.0,
-        "activePoints": active_points,
-    }
+    return _touch_payload_from_axes(fz, timestamp=timestamp, expected_count=None)
 
 
 def _touch_timestamp_from_parquet_row(row: dict[str, Any], info: dict[str, Any], sensor: str) -> int:
@@ -4438,13 +4475,17 @@ def _touch_timestamp_from_parquet_row(row: dict[str, Any], info: dict[str, Any],
 
 def _touch_from_parquet_row(row: dict[str, Any], info: dict[str, Any]) -> dict[str, Any]:
     touch: dict[str, Any] = {}
-    for side, column in _TOUCH_EXPORT_FZ_COLUMNS.items():
-        if column not in row or row.get(column) is None:
+    for side, columns in _TOUCH_EXPORT_COLUMNS.items():
+        fz_column = columns["fz"]
+        if fz_column not in row or row.get(fz_column) is None:
             continue
         sensor = "box_touch_left" if side == "left" else "box_touch_right"
-        payload = _touch_payload_from_fz(
-            row.get(column),
+        payload = _touch_payload_from_axes(
+            row.get(fz_column),
+            fx_values=row.get(columns["fx"]),
+            fy_values=row.get(columns["fy"]),
             timestamp=_touch_timestamp_from_parquet_row(row, info, sensor),
+            expected_count=None,
         )
         if payload is not None:
             touch[side] = payload

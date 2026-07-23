@@ -325,6 +325,16 @@ touch 残差约为 200Hz 传感器的 2×：样本少 4×（501 vs 1998，拟合
 
 ## 6. 完整对齐流程（per episode）
 
+> **同步时机（避免误会）**：注意相机间同步与 box↔相机同步是**两个不同时机**。
+> **相机之间（L0/L2）在录制期在线完成**——PWM 硬触发全程锁快门，`argus_online_sync` 在 encoder 前逐帧按
+> `sof_tsc_ns` full-cluster gate 放行同一 SOF 簇（§3.2），Stop 只收口写 `online_sync_manifest.json`，**不是 Stop 才同步**。
+> 而 **box↔相机的 `observation.state` / `box.timestamps` 同步在录制 Stop 时**由录制器完成
+> （`thor_record.py` 在 save 分支算 `camera_frame_times_rel` → `Lr3Writer.append_episode` → `thor_lerobot_v3._build_episode_rows`
+> 做 MCU 校准 + 逐传感器最近邻）。**单条 session 的 `data/.../file-000.parquet` 落盘即已同步，不需要点 Export。**
+> `export_v3` 是**离线合并/打包**步骤：复用录制器已同步好的 state（按 `frame_index` 配相机帧）、额外做**触觉全阵列**对齐 +
+> 视频转码 + 多 session 合并，**不重做** box↔相机的 state 同步（§9）。判断某集是否已同步看 `meta.json.box_camera_alignment`
+> （录制时写入）。
+
 ### 6.1 生产默认：`argus_online_sync`
 
 ```text
@@ -460,7 +470,7 @@ Episode Replay 不能把多个 `<video>` 元素当成天然同步：浏览器 vi
 
 录制器（`thor_lerobot_v3.py`）写的是 **box/state 最小 v3** parquet（数值特征 + 时间戳元数据）；相机原始文件仍并排存在每个 episode 目录里：`cam_*.mkv`、`cam_*.argus_frame_metadata.csv`、`online_sync_manifest.json`。离线 `export_v3.py` 再把相机转码并合并出带 `observation.images.*` 的训练数据集。
 
-`export_v3` 的多传感器对齐：相机网格为权威。online-sync 数据使用 `logical_frame_index / fps`；legacy splitmux 数据使用 `pts_offset + N/fps`。box 状态按优先级挂到该网格：① 复用录制器已对齐的 session parquet，**按 `frame_index`（而非列表位置）** 配相机帧（box 网格比相机视频长的尾部丢弃、短的 carry-forward）；② 无 parquet 时回退到每集 `box_sensors.jsonl`，用 §5/§6 同一套 MCU 校准 + 逐传感器最近邻在 export 内重做 L3b。每集输出 `timestamp` 重基到 `i/fps` 以匹配重锚定的逐集视频。代码见 `export_v3._align_box_rows_by_frame_index` / `_box_rows_from_raw`。
+`export_v3` **不重做** box↔相机的 state 同步（那一步已在录制 Stop 时完成，见 §6 开头「同步时机」）；它只把录制器已同步好的 box state 挂到权威相机网格上。相机网格：online-sync 数据使用 `logical_frame_index / fps`，legacy splitmux 数据使用 `pts_offset + N/fps`。box state 复用录制器已对齐的 session parquet，**按 `frame_index`（而非列表位置）** 配相机帧（box 网格比相机视频长的尾部丢弃、短的 carry-forward）；**无可用 session parquet 时直接跳过该 episode**（不再从 `box_sensors.jsonl` 在 export 内重做 L3b —— 该 raw 重对齐路径已于 2026-07-13 移除，见下方更新记录）。export 另外从 `box_sensors.jsonl` 重采样**触觉全阵列**（239 维 taxel）到帧网格，这是 export 才做的对齐（`_align_touch_rows`）。每集输出 `timestamp` 重基到 `i/fps` 以匹配重锚定的逐集视频。代码见 `export_v3._align_box_rows_by_frame_index`（state）/ `_align_touch_rows`（触觉阵列）。
 
 ### 9.1 `observation.state` / `action`（float32，**31** 维）
 

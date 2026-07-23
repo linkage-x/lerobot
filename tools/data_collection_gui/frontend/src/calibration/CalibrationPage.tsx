@@ -324,7 +324,7 @@ function BoxCalibrationGroup({
   return (
     <section className="panel cali-box-panel">
       <div className="panel-heading">
-        <h2>BOX {boxDisplayName(bid)}</h2>
+        <h2>{bid ? `BOX ${boxDisplayName(bid)}` : boxDisplayName(bid)}</h2>
         <span>
           固件 {fw}
           {sn ? ` · SN ${sn}` : ""} · {group.devices.filter((d) => d.state === "running").length}/

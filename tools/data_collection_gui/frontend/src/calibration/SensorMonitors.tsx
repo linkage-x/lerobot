@@ -78,7 +78,7 @@ export function TactileSensorCard({
         <StaleChip fresh={view.fresh} staleS={view.staleS} />
       </div>
       <div className="cali-monitor-media">
-        <TouchHeatmap fz0p1N={view.touchFz0p1N} />
+        <TouchHeatmap fz0p1N={view.touchFz0p1N} fx0p1N={view.touchFx0p1N} fy0p1N={view.touchFy0p1N} />
       </div>
       <div className="cali-touch-metrics">
         {/* The Paxini pad only reports per-taxel normal force, so net Fx/Fy are
