@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,30 @@ def _write_minimal_episode_dataset(dataset_root: Path, total_episodes: int = 3) 
             rows["observation.state"].append(pose)
             rows["action"].append(pose)
     pq.write_table(pa.table(rows), dataset_root / "data" / "chunk-000" / "file-000.parquet")
+
+
+def test_dataset_scan_signature_tracks_v3_finalization_without_root_mtime_change(tmp_path):
+    datasets_root = tmp_path / "outputs" / "datasets"
+    dataset_root = datasets_root / "thor_gmsl2_7ch_v1_20260720_151325"
+    dataset_root.mkdir(parents=True)
+    fixed_ns = 1_700_000_000_000_000_000
+    os.utime(dataset_root, ns=(fixed_ns, fixed_ns))
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=datasets_root,
+    )
+    before = gateway._dataset_scan_signature(state)
+
+    info_path = dataset_root / "meta" / "info.json"
+    info_path.parent.mkdir()
+    info_path.write_text(json.dumps({"total_episodes": 1, "total_frames": 345, "fps": 60}), encoding="utf-8")
+    os.utime(dataset_root, ns=(fixed_ns, fixed_ns))
+
+    assert gateway._dataset_scan_signature(state) != before
 
 
 def test_make_state_loads_handheld_config_contract():
