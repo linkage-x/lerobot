@@ -32,7 +32,9 @@ export type BoxPreviewView = {
   fresh: boolean;
   /** Parsed 6D force vector (force sensors only). */
   force: ForceVec | null;
-  /** Touch pad taxel array in 0.1 N units (touch sensors only). */
+  /** Touch pad taxel arrays in 0.1 N units (touch sensors only). */
+  touchFx0p1N: number[];
+  touchFy0p1N: number[];
   touchFz0p1N: number[];
   touchNetN: number | null;
   touchMaxResidual: number | null;
@@ -44,6 +46,8 @@ const EMPTY_VIEW: BoxPreviewView = {
   staleS: null,
   fresh: false,
   force: null,
+  touchFx0p1N: [],
+  touchFy0p1N: [],
   touchFz0p1N: [],
   touchNetN: null,
   touchMaxResidual: null,
@@ -54,6 +58,8 @@ function toView(payload: BoxPreviewPayload | null): BoxPreviewView {
   const sensor = payload.sensor ?? null;
   const staleS = payload.staleS ?? null;
   const fresh = Boolean(payload.active) && staleS != null && staleS * 1000 <= STALE_SAMPLE_MS;
+  const touchFx0p1N = numberArray(sensor?.["fx_0p1N"]);
+  const touchFy0p1N = numberArray(sensor?.["fy_0p1N"]);
   const touchFz0p1N = numberArray(sensor?.["fz_0p1N"]);
   return {
     payload,
@@ -61,6 +67,8 @@ function toView(payload: BoxPreviewPayload | null): BoxPreviewView {
     staleS,
     fresh,
     force: forceVecFromSensor(sensor),
+    touchFx0p1N,
+    touchFy0p1N,
     touchFz0p1N,
     touchNetN: touchNetForceN(touchFz0p1N),
     touchMaxResidual: touchMaxResidual0p1N(touchFz0p1N),

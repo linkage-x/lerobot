@@ -348,15 +348,19 @@ def test_gmsl2_timeline_includes_touch_heatmap_samples(tmp_path):
         }),
         encoding="utf-8",
     )
+    left_fx = [0.0] * 239
+    left_fy = [0.0] * 239
     left_fz = [0.0] * 239
     right_fz = [0.0] * 239
+    left_fx[0] = 2.0
+    left_fy[0] = -3.0
     left_fz[0] = 7.0
     right_fz[238] = 11.0
     rows = [
         {
             "sid": "box_touch_left",
             "t_rel_s": 0.5,
-            "data": {"timestamp": 101, "fz_0p1N": left_fz},
+            "data": {"timestamp": 101, "fx_0p1N": left_fx, "fy_0p1N": left_fy, "fz_0p1N": left_fz},
         },
         {
             "sid": "box_touch_right",
@@ -372,11 +376,34 @@ def test_gmsl2_timeline_includes_touch_heatmap_samples(tmp_path):
 
     touch = timeline["frames"][1]["touch"]
     assert touch["left"]["timestamp"] == 101
+    assert touch["left"]["fx"][0] == 2.0
+    assert touch["left"]["fy"][0] == -3.0
     assert touch["left"]["fz"][0] == 7.0
     assert touch["left"]["activePoints"] == 1
     assert touch["right"]["timestamp"] == 202
     assert touch["right"]["fz"][238] == 11.0
 
+
+def test_touch_from_parquet_row_includes_shear_axes():
+    fx = [0.0] * 239
+    fy = [0.0] * 239
+    fz = [0.0] * 239
+    fx[3] = 5.0
+    fy[3] = -4.0
+    row = {
+        "timestamp": 1.25,
+        "observation.touch.box_touch_left.fx_0p1N": fx,
+        "observation.touch.box_touch_left.fy_0p1N": fy,
+        "observation.touch.box_touch_left.fz_0p1N": fz,
+    }
+
+    touch = gateway._touch_from_parquet_row(row, {})
+
+    assert touch["left"]["timestamp"] == 1_250_000
+    assert touch["left"]["fx"][3] == 5.0
+    assert touch["left"]["fy"][3] == -4.0
+    assert touch["left"]["fz"][3] == 0.0
+    assert touch["left"]["activePoints"] == 1
 
 def test_box_collection_devices_use_remote_endpoint_in_detail():
     config = {

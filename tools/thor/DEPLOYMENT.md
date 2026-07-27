@@ -810,20 +810,23 @@ host_time_estimated = slope × mcu_ts + intercept
 
 精度从 ±2.5~10ms 提升到 ±0.5~1ms，代价是 episode 结束后 ~1s 后处理。
 
-### 待实现：导出阶段对齐
+### 对齐时机：在录制时完成，不在导出阶段（本小节记录设计变更）
 
-数据集导出（Dataset Export 页面 / CLI）时应将原始 MKV + meta.json 转换为
-LeRobot v3 parquet 训练格式，在此阶段执行对齐：
+> ⚠️ 早期本节把「相机↔BOX 对齐」列为**导出阶段待实现**的 PTS 级后处理（依赖 BOX 上行修复 `rc=4`）。
+> **该设计已被取代，勿再据此理解。** BOX 上行早已打通，对齐**在录制期完成、不在导出阶段**，而且分成
+> 两个不同时机（别混为一谈）：
+>
+> - **相机之间（L0/L2）**：全程由 PWM 硬触发锁同一快门边沿（L0）；`argus_online_sync` 在**录制过程中、
+>   encoder 之前**按 `sof_tsc_ns` full-cluster gate **逐帧在线**放行同一 SOF 簇（L2）。**不是 Stop 才做**——
+>   Stop 只是收口并写 `online_sync_manifest.json`。
+> - **BOX 传感器↔相机（L3b+）**：录制中只**缓存**原始样本；**Stop 写 parquet 那一步**才由录制器
+>   （`thor_record.py` → `thor_lerobot_v3._build_episode_rows`）做 MCU 校准 + 以硬件 SOF 时刻
+>   `sensor_timestamp_ns/1e9 − t0_mono` 逐传感器最近邻。**单条 session 的 parquet 落盘即已同步。**
+>
+> PTS 只用于离线数帧/QC，不作跨相机同步锚点。完整流程见 [`ts_sync.md`](ts_sync.md) §3/§5/§6。
+> 下节的导出**不重做**这两套对齐，只复用录制期已同步的结果。
 
-1. 从 MKV 提取 per-frame PTS（`gst-discoverer` 或 `ffprobe`）
-2. 用 `sync_reference` 将各相机帧映射到公共 wall-clock 时间线
-3. 将 BOX snapshot 按 `t_relative_s` 插值到每个相机帧时间点
-4. 写入 `observation.state`（BOX 传感器值）和 `observation.images.*`（视频引用）
-
-**前提**：BOX 传感器上行修复后才有可对齐的数据（当前 rc=4）。
-`sync_reference` 元数据已就位，完整 PTS 级对齐（L2）待 BOX 上行通后实现。
-
-### 已实现：按任务合并导出（best-effort，无 L2 对齐）
+### 按任务合并导出（复用录制时对齐，不重做 box↔相机同步）
 
 Dataset Export 页面的「Consolidate a Task」：选一个任务 → 把它所有
 session（`<name>_<时间戳>/`，按时间戳排序）合并成**一个** LeRobot v3
@@ -851,10 +854,13 @@ session（`<name>_<时间戳>/`，按时间戳排序）合并成**一个** LeRob
   相机帧数从源 MKV 的 `extract_pts`（gst 读容器 PTS，不解码，Thor 可用）得到。
 - box parquet（录制时 `Lr3Writer` 写的）按 `(episode_index, frame_index)`
   对齐到相机帧，截到较短一方写入 `observation.state` / `action`。
-- **best-effort 限制**：跨相机/与 box 的对齐是按帧序号（CFR 网格），中途若
-  有相机丢帧则丢帧点之后跨相机不再严格对齐；**不做** PTS 级 wall-clock
-  对齐（那是下面 L2）。`meta/export_sources.json` 记录每个全局 episode 来自
-  哪个 session 便于溯源。
+- **对齐来源（不是 export 现算的）**：相机之间由录制期 `online_sync_manifest.json` 的
+  SOF full-cluster 保证（L2）；export 要求该 manifest 存在且校验各路帧数一致，
+  否则跳过该 episode。box↔相机 state 由录制器已做 L3b+ 同步，export 只按
+  `(episode_index, frame_index)` 复用、**不重算**，截到较短一方写入
+  `observation.state` / `action`。export 自身只负责把视频 CFR 重排到 `i/fps`
+  网格（见上）与合并，不做 PTS 级 wall-clock 对齐（PTS 仅用于数帧）。
+  `meta/export_sources.json` 记录每个全局 episode 来自哪个 session 便于溯源。
 - 输出根与原始 `outputs/datasets/` 分开，避免被 Task 进度计数当成 session
   重复统计。
 - 已在 Thor 实测：6 episodes / 2 sessions / 10 cam @ 1920×1080 @ 60fps，

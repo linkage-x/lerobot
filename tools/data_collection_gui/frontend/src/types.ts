@@ -367,6 +367,8 @@ export type EePose = {
 export type TouchPadFrame = {
   timestamp?: number;
   tRelS?: number;
+  fx?: number[];
+  fy?: number[];
   fz: number[];
   maxFz?: number;
   activePoints?: number;

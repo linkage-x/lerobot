@@ -3,37 +3,7 @@ import type { GuiSnapshot } from "../api";
 import type { BoxPreviewPayload, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
 import { api } from "../apiClient";
-
-export const DEVICE_TOUCH_ROW_LENGTHS = [13, 13, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 13, 13];
-export const DEVICE_TOUCH_COLUMNS = 17;
-
-export function interpolatePreviewChannel(a: number, b: number, t: number): number {
-  return Math.round(a + (b - a) * t);
-}
-
-export function previewTouchColor(value: number, scaleMax: number): string {
-  const stops = [
-    [17, 24, 39],
-    [37, 99, 235],
-    [20, 184, 166],
-    [250, 204, 21],
-    [239, 68, 68]
-  ];
-  const normalized = Math.max(0, Math.min(1, value / Math.max(scaleMax, 1)));
-  const scaled = normalized * (stops.length - 1);
-  const index = Math.min(Math.floor(scaled), stops.length - 2);
-  const t = scaled - index;
-  const a = stops[index];
-  const b = stops[index + 1];
-  return `rgb(${interpolatePreviewChannel(a[0], b[0], t)}, ${interpolatePreviewChannel(a[1], b[1], t)}, ${interpolatePreviewChannel(a[2], b[2], t)})`;
-}
-
-export function numberArray(value: unknown): number[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.map((item) => Number(item)).filter((item) => Number.isFinite(item));
-}
+import { TouchHeatmapGrid, numberArray, touchLayoutForCount, touchSampleActivePoints, touchSampleHasShear, touchSampleLocalMax, touchScaleFromSamples } from "../touchVisualization";
 
 export function numberValue(value: unknown): number | null {
   const numeric = Number(value);
@@ -41,12 +11,17 @@ export function numberValue(value: unknown): number | null {
 }
 
 export function DeviceTouchPreview({ sensor }: { sensor?: Record<string, unknown> | null }) {
-  const values = numberArray(sensor?.fz_0p1N);
-  const hasData = values.length >= 239;
-  const scaleMax = hasData ? Math.max(1, ...values.map((value) => Math.abs(value))) : 1;
-  const localMax = hasData ? Math.max(...values.map((value) => Math.abs(value))) : 0;
-  const activePoints = values.filter((value) => Math.abs(value) > 0).length;
-  let cursor = 0;
+  const sample = {
+    fz: numberArray(sensor?.fz_0p1N),
+    fx: numberArray(sensor?.fx_0p1N),
+    fy: numberArray(sensor?.fy_0p1N),
+  };
+  const hasData = sample.fz.length > 0;
+  const scale = touchScaleFromSamples([sample]);
+  const localMax = hasData ? touchSampleLocalMax(sample) : 0;
+  const activePoints = touchSampleActivePoints(sample);
+  const layout = hasData ? touchLayoutForCount(sample.fz.length) : null;
+  const hasShear = touchSampleHasShear(sample);
 
   return (
     <div className="touch-map device-touch-map">
@@ -55,41 +30,13 @@ export function DeviceTouchPreview({ sensor }: { sensor?: Record<string, unknown
         <span>max {localMax.toFixed(1)} · active {activePoints}</span>
       </div>
       {hasData ? (
-        <div className="touch-grid" aria-label="live tactile preview">
-          {DEVICE_TOUCH_ROW_LENGTHS.map((length, rowIndex) => {
-            const offset = Math.floor((DEVICE_TOUCH_COLUMNS - length) / 2);
-            const row = values.slice(cursor, cursor + length);
-            const startIndex = cursor;
-            cursor += length;
-            return (
-              <div className="touch-row" key={rowIndex}>
-                {Array.from({ length: offset }).map((_, index) => (
-                  <span className="touch-cell touch-cell-empty" key={`pre-${index}`} />
-                ))}
-                {row.map((value, index) => {
-                  const pointIndex = startIndex + index + 1;
-                  return (
-                    <span
-                      className="touch-cell"
-                      key={pointIndex}
-                      title={`#${pointIndex} fz=${value.toFixed(1)} (0.1N)`}
-                      style={{ backgroundColor: previewTouchColor(Math.abs(value), scaleMax) }}
-                    />
-                  );
-                })}
-                {Array.from({ length: DEVICE_TOUCH_COLUMNS - length - offset }).map((_, index) => (
-                  <span className="touch-cell touch-cell-empty" key={`post-${index}`} />
-                ))}
-              </div>
-            );
-          })}
-        </div>
+        <TouchHeatmapGrid sample={sample} scale={scale} ariaLabel="live tactile preview" />
       ) : (
         <div className="touch-empty">no touch sample</div>
       )}
       <div className="touch-map-footer">
         <span>ts {String(sensor?.timestamp ?? "-")}</span>
-        <span>fz 0.1N</span>
+        <span>{layout?.label ?? "-"}{hasShear ? " · shear hue" : " · fz"}</span>
       </div>
     </div>
   );
@@ -205,46 +152,26 @@ export function isVisualBoxSensor(deviceId: string): boolean {
   return sid.startsWith("box_touch") || sid === "box_six_d_force";
 }
 
-// Full-frame tactile heatmap: same point layout as DeviceTouchPreview but sized
-// to fill the tile media (height-bound, centered) instead of a fixed map.
+// Full-frame tactile heatmap: uses the same adaptive layout and color mapping
+// as DeviceTouchPreview, sized to fill the tile media.
 export function BoxTouchTileView({ sensor }: { sensor?: Record<string, unknown> | null }) {
-  const values = numberArray(sensor?.fz_0p1N);
-  const hasData = values.length >= 239;
-  if (!hasData) {
+  const sample = {
+    fz: numberArray(sensor?.fz_0p1N),
+    fx: numberArray(sensor?.fx_0p1N),
+    fy: numberArray(sensor?.fy_0p1N),
+  };
+  if (sample.fz.length === 0) {
     return <div className="camera-tile-empty">no touch sample</div>;
   }
-  const scaleMax = Math.max(1, ...values.map((value) => Math.abs(value)));
-  let cursor = 0;
+  const scale = touchScaleFromSamples([sample]);
   return (
-    <div className="box-touch-fill" aria-label="live tactile preview">
-      {DEVICE_TOUCH_ROW_LENGTHS.map((length, rowIndex) => {
-        const offset = Math.floor((DEVICE_TOUCH_COLUMNS - length) / 2);
-        const row = values.slice(cursor, cursor + length);
-        const startIndex = cursor;
-        cursor += length;
-        return (
-          <div className="touch-row" key={rowIndex}>
-            {Array.from({ length: offset }).map((_, index) => (
-              <span className="touch-cell touch-cell-empty" key={`pre-${index}`} />
-            ))}
-            {row.map((value, index) => {
-              const pointIndex = startIndex + index + 1;
-              return (
-                <span
-                  className="touch-cell"
-                  key={pointIndex}
-                  title={`#${pointIndex} fz=${value.toFixed(1)} (0.1N)`}
-                  style={{ backgroundColor: previewTouchColor(Math.abs(value), scaleMax) }}
-                />
-              );
-            })}
-            {Array.from({ length: DEVICE_TOUCH_COLUMNS - length - offset }).map((_, index) => (
-              <span className="touch-cell touch-cell-empty" key={`post-${index}`} />
-            ))}
-          </div>
-        );
-      })}
-    </div>
+    <TouchHeatmapGrid
+      sample={sample}
+      scale={scale}
+      ariaLabel="live tactile preview"
+      className="box-touch-fill"
+      emptyText="no touch sample"
+    />
   );
 }
 

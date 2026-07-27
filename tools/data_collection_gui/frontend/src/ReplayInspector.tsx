@@ -3,6 +3,7 @@ import { Pose3DViewer } from "./Pose3DViewer";
 import { SeriesPlot } from "./SeriesPlot";
 import type { DataCollectionGuiApi } from "./api";
 import type { CubeVideoOverlay, EePose, ForceVector, MujocoCubeMode, MujocoPreview, ReplayStatus, ReplayTimeline, ReplayTimelineFrame, TouchPadFrame } from "./types";
+import { TouchHeatmapGrid, touchLayoutForCount, touchSampleActivePoints, touchSampleHasShear, touchSampleLocalMax, touchScaleFromSamples, type TouchScale } from "./touchVisualization";
 
 const cubeColors: Record<string, number> = {
   left: 0xc2410c,
@@ -50,42 +51,24 @@ function ReplayTransport({
   );
 }
 
-const TOUCH_ROW_LENGTHS = [13, 13, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 13, 13];
-const TOUCH_COLUMNS = 17;
-
-function interpolateChannel(a: number, b: number, t: number): number {
-  return Math.round(a + (b - a) * t);
-}
-
-function touchColor(value: number, scaleMax: number): string {
-  const stops = [
-    [17, 24, 39],
-    [37, 99, 235],
-    [20, 184, 166],
-    [250, 204, 21],
-    [239, 68, 68]
-  ];
-  const normalized = Math.max(0, Math.min(1, value / Math.max(scaleMax, 1)));
-  const scaled = normalized * (stops.length - 1);
-  const index = Math.min(Math.floor(scaled), stops.length - 2);
-  const t = scaled - index;
-  const a = stops[index];
-  const b = stops[index + 1];
-  return `rgb(${interpolateChannel(a[0], b[0], t)}, ${interpolateChannel(a[1], b[1], t)}, ${interpolateChannel(a[2], b[2], t)})`;
-}
-
-function touchScaleMax(timeline: ReplayTimeline | null): number {
-  let maxValue = 1;
+function touchScaleMax(timeline: ReplayTimeline | null): TouchScale {
+  const samples: TouchPadFrame[] = [];
   for (const entry of timeline?.frames ?? []) {
     for (const sample of Object.values(entry.touch ?? {})) {
-      for (const value of sample?.fz ?? []) {
-        if (Number.isFinite(value)) {
-          maxValue = Math.max(maxValue, Math.abs(value));
-        }
+      if (sample) {
+        samples.push(sample);
       }
     }
   }
-  return maxValue;
+  return touchScaleFromSamples(samples);
+}
+
+function touchPanelSummary(frame: ReplayTimelineFrame | undefined): string {
+  const samples = Object.values(frame?.touch ?? {}).filter((sample): sample is TouchPadFrame => Boolean(sample));
+  const firstWithData = samples.find((sample) => sample.fz.length > 0);
+  const layout = firstWithData ? touchLayoutForCount(firstWithData.fz.length) : null;
+  const mode = samples.some(touchSampleHasShear) ? "fz + fx/fy shear" : "fz pseudo color";
+  return layout ? `${mode} · ${layout.label}` : mode;
 }
 
 function touchEntries(frame: ReplayTimelineFrame | undefined): Array<[string, TouchPadFrame | undefined]> {
@@ -100,17 +83,18 @@ function touchEntries(frame: ReplayTimelineFrame | undefined): Array<[string, To
 function TouchHeatmap({
   title,
   sample,
-  scaleMax
+  scale
 }: {
   title: string;
   sample?: TouchPadFrame;
-  scaleMax: number;
+  scale: TouchScale;
 }) {
   const values = sample?.fz ?? [];
-  const hasData = values.length >= 239;
-  let cursor = 0;
-  const localMax = hasData ? Math.max(...values.map((value) => Math.abs(value))) : 0;
-  const activePoints = sample?.activePoints ?? values.filter((value) => Math.abs(value) > 0).length;
+  const hasData = values.length > 0;
+  const localMax = hasData ? touchSampleLocalMax(sample) : 0;
+  const activePoints = sample?.activePoints ?? touchSampleActivePoints(sample);
+  const layout = hasData ? touchLayoutForCount(values.length) : null;
+  const hasShear = touchSampleHasShear(sample);
 
   return (
     <div className="touch-map">
@@ -119,40 +103,13 @@ function TouchHeatmap({
         <span>max {localMax.toFixed(1)} · active {activePoints}</span>
       </div>
       {hasData ? (
-        <div className="touch-grid" aria-label={title}>
-          {TOUCH_ROW_LENGTHS.map((length, rowIndex) => {
-            const offset = Math.floor((TOUCH_COLUMNS - length) / 2);
-            const row = values.slice(cursor, cursor + length);
-            const startIndex = cursor;
-            cursor += length;
-            return (
-              <div className="touch-row" key={rowIndex}>
-                {Array.from({ length: offset }).map((_, index) => (
-                  <span className="touch-cell touch-cell-empty" key={`pre-${index}`} />
-                ))}
-                {row.map((value, index) => {
-                  const pointIndex = startIndex + index + 1;
-                  return (
-                    <span
-                      className="touch-cell"
-                      key={pointIndex}
-                      title={`#${pointIndex} fz=${value.toFixed(1)} (0.1N)`}
-                      style={{ backgroundColor: touchColor(Math.abs(value), scaleMax) }}
-                    />
-                  );
-                })}
-                {Array.from({ length: TOUCH_COLUMNS - length - offset }).map((_, index) => (
-                  <span className="touch-cell touch-cell-empty" key={`post-${index}`} />
-                ))}
-              </div>
-            );
-          })}
-        </div>
+        <TouchHeatmapGrid sample={sample} scale={scale} ariaLabel={title} />
       ) : (
         <div className="touch-empty">no touch sample</div>
       )}
       <div className="touch-map-footer">
         <span>ts {sample?.timestamp ?? "—"}</span>
+        <span>{layout?.label ?? "—"}{hasShear ? " · shear hue" : ""}</span>
         <span>t {sample?.tRelS == null ? "—" : `${sample.tRelS.toFixed(3)}s`}</span>
       </div>
     </div>
@@ -543,6 +500,7 @@ export function ReplayInspector({
   const pose = ensureFullPose(frame?.eePose);
   const forceVector = ensureForceVector(frame?.forceVector);
   const touchMax = useMemo(() => touchScaleMax(timeline), [timeline]);
+  const touchSummary = useMemo(() => touchPanelSummary(frame), [frame]);
   const cubePoseNames = useMemo(() => {
     if (!timeline) {
       return [] as string[];
@@ -722,17 +680,17 @@ export function ReplayInspector({
       <section className="panel touch-panel">
         <div className="panel-heading">
           <h2>Paxini touch</h2>
-          <span>fz pseudo color · 239 points</span>
+          <span>{touchSummary}</span>
         </div>
         <div className="touch-heatmaps">
           {touchEntries(frame).map(([key, sample]) => (
-            <TouchHeatmap key={key} title={key} sample={sample} scaleMax={touchMax} />
+            <TouchHeatmap key={key} title={key} sample={sample} scale={touchMax} />
           ))}
         </div>
         <div className="touch-legend" aria-hidden="true">
           <span>0</span>
           <div />
-          <span>{touchMax.toFixed(1)}</span>
+          <span>{touchMax.normalMax.toFixed(1)}</span>
         </div>
       </section>
       <section className="panel pose-panel">
