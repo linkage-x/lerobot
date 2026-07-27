@@ -101,7 +101,7 @@ export type WorkflowApi = {
   reset: () => void;
 };
 
-type Sample = { t: number; vec: ForceVec | null; net: number | null };
+export type StabilitySample = { t: number; sourceId: string; vec: ForceVec | null; net: number | null };
 
 const IDLE_STABILITY: StabilityResult = { status: "idle", samples: 0, peakToPeak: null, detail: "" };
 
@@ -110,35 +110,68 @@ function peakToPeak(values: number[]): number {
   return Math.max(...values) - Math.min(...values);
 }
 
-function evaluateStability(samples: Sample[], sampleKind: "force" | "touch"): StabilityResult {
+export function evaluateStability(
+  samples: StabilitySample[],
+  sampleKind: "force" | "touch",
+  sourceIds: string[] = [],
+): StabilityResult {
   const fresh = samples.filter((s) => (sampleKind === "force" ? s.vec : s.net) != null);
-  if (fresh.length < STABILITY.minSamples) {
-    return { status: "sampling", samples: fresh.length, peakToPeak: null, detail: "采样中…" };
+  const ids = sourceIds.length ? sourceIds : [...new Set(fresh.map((s) => s.sourceId))];
+  if (ids.length === 0) {
+    return { status: "sampling", samples: 0, peakToPeak: null, detail: "采样中…" };
   }
+
+  const bySource = ids.map((sourceId) => ({
+    sourceId,
+    samples: fresh.filter((s) => s.sourceId === sourceId),
+  }));
+  const fewestSamples = Math.min(...bySource.map((group) => group.samples.length));
+  if (fewestSamples < STABILITY.minSamples) {
+    return { status: "sampling", samples: fewestSamples, peakToPeak: null, detail: "采样中…" };
+  }
+
   if (sampleKind === "force") {
     const axes: (keyof ForceVec)[] = ["fx", "fy", "fz", "mx", "my", "mz"];
     let worstForce = 0;
     let worstMoment = 0;
-    for (const axis of axes) {
-      const p2p = peakToPeak(fresh.map((s) => (s.vec as ForceVec)[axis]));
-      if (axis === "mx" || axis === "my" || axis === "mz") worstMoment = Math.max(worstMoment, p2p);
-      else worstForce = Math.max(worstForce, p2p);
+    let worstSource = "";
+    for (const group of bySource) {
+      for (const axis of axes) {
+        const p2p = peakToPeak(group.samples.map((s) => (s.vec as ForceVec)[axis]));
+        if (axis === "mx" || axis === "my" || axis === "mz") {
+          if (p2p > worstMoment) worstMoment = p2p;
+        } else if (p2p > worstForce) {
+          worstForce = p2p;
+          worstSource = group.sourceId;
+        }
+      }
     }
     const stable = worstForce <= STABILITY.forcePeakToPeakN && worstMoment <= STABILITY.momentPeakToPeakNm;
+    const suffix = worstSource ? `（${worstSource}）` : "";
     return {
       status: stable ? "stable" : "unstable",
-      samples: fresh.length,
+      samples: fewestSamples,
       peakToPeak: worstForce,
-      detail: `力峰峰值 ${worstForce.toFixed(2)} N / 限 ${STABILITY.forcePeakToPeakN} N`,
+      detail: `力峰峰值 ${worstForce.toFixed(2)} N / 限 ${STABILITY.forcePeakToPeakN} N${suffix}`,
     };
   }
-  const p2p = peakToPeak(fresh.map((s) => s.net as number));
-  const stable = p2p <= STABILITY.touchNetPeakToPeakN;
+
+  let worstNet = 0;
+  let worstSource = "";
+  for (const group of bySource) {
+    const p2p = peakToPeak(group.samples.map((s) => s.net as number));
+    if (p2p > worstNet) {
+      worstNet = p2p;
+      worstSource = group.sourceId;
+    }
+  }
+  const stable = worstNet <= STABILITY.touchNetPeakToPeakN;
+  const suffix = worstSource ? `（${worstSource}）` : "";
   return {
     status: stable ? "stable" : "unstable",
-    samples: fresh.length,
-    peakToPeak: p2p,
-    detail: `净力峰峰值 ${p2p.toFixed(2)} N / 限 ${STABILITY.touchNetPeakToPeakN} N`,
+    samples: fewestSamples,
+    peakToPeak: worstNet,
+    detail: `净力峰峰值 ${worstNet.toFixed(2)} N / 限 ${STABILITY.touchNetPeakToPeakN} N${suffix}`,
   };
 }
 
@@ -154,7 +187,7 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
   // Timers / mutable run context held in refs so effects stay stable.
   const stabilityTimer = useRef<number | null>(null);
   const stabilityStart = useRef(0);
-  const samples = useRef<Sample[]>([]);
+  const samples = useRef<StabilitySample[]>([]);
   const logTimer = useRef<number | null>(null);
   const logStartIndex = useRef(0);
   const calibrateDeadline = useRef(0);
@@ -197,10 +230,10 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
           const sensor = preview?.sensor ?? null;
           const now = Date.now();
           if (sampleKind === "force") {
-            samples.current.push({ t: now, vec: forceVecFromSensor(sensor), net: null });
+            samples.current.push({ t: now, sourceId: dev.id, vec: forceVecFromSensor(sensor), net: null });
           } else {
             const net = touchNetForceN(numberArray(sensor?.["fz_0p1N"]));
-            samples.current.push({ t: now, vec: null, net });
+            samples.current.push({ t: now, sourceId: dev.id, vec: null, net });
           }
         }),
       );
@@ -208,7 +241,7 @@ export function useCalibrationWorkflow(cfg: WorkflowConfig): WorkflowApi {
       const cutoff = Date.now() - STABILITY.windowMs;
       samples.current = samples.current.filter((s) => s.t >= cutoff);
       if (!mounted.current) return;
-      const result = evaluateStability(samples.current, sampleKind);
+      const result = evaluateStability(samples.current, sampleKind, sampleDevices.map((dev) => dev.id));
       // If we cannot gather enough fresh samples in twice the window, the live
       // feed is unavailable — say so instead of implying stability.
       if (
