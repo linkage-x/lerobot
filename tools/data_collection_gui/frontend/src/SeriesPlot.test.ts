@@ -26,13 +26,41 @@ describe("groupSeriesNames", () => {
     expect(groups[2].items.map((item) => item.component)).toEqual(["x", "y", "z"]);
   });
 
-  it("keeps scalar dimensions standalone and groups orientation components", () => {
+  it("keeps scalar dimensions standalone and groups the current xyzw attitude layout", () => {
+    // Current recorder schema (ts_sync.md §9.1.1): attitude is the quaternion
+    // only, stored xyzw. Dims are read from the name list position, so nothing
+    // here may depend on a fixed state offset.
     const groups = groupSeriesNames([
       "box_gripper.distance_m",
+      "box_trigger.travel_pct",
       "box_imu.quat_x",
-      "box_imu.quat_w",
-      "box_imu.quat_z",
       "box_imu.quat_y",
+      "box_imu.quat_z",
+      "box_imu.quat_w",
+      "box_six_d_force.fx"
+    ]);
+
+    expect(groups.map((group) => group.key)).toEqual([
+      "box_gripper.distance_m",
+      "box_trigger.travel_pct",
+      "box_imu.quat",
+      "box_six_d_force.fx"
+    ]);
+    // Plotted w-first regardless of the xyzw storage order, with the dims
+    // pointing back at the stored positions.
+    expect(groups[2].items.map((item) => item.component)).toEqual(["w", "x", "y", "z"]);
+    expect(groups[2].items.map((item) => item.dim)).toEqual([5, 2, 3, 4]);
+  });
+
+  it("still groups the legacy wxyz + rpy attitude layout for older datasets", () => {
+    // Datasets recorded before the 31 → 28 dim change still carry rpy and a
+    // scalar-first quaternion; replay must keep rendering them.
+    const groups = groupSeriesNames([
+      "box_gripper.distance_m",
+      "box_imu.quat_w",
+      "box_imu.quat_x",
+      "box_imu.quat_y",
+      "box_imu.quat_z",
       "box_imu.roll_deg",
       "box_imu.pitch_deg",
       "box_imu.yaw_deg",
@@ -46,7 +74,7 @@ describe("groupSeriesNames", () => {
       "box_trigger.travel_pct"
     ]);
     expect(groups[1].items.map((item) => item.component)).toEqual(["w", "x", "y", "z"]);
-    expect(groups[1].items.map((item) => item.dim)).toEqual([2, 1, 4, 3]);
+    expect(groups[1].items.map((item) => item.dim)).toEqual([1, 2, 3, 4]);
     expect(groups[2].items.map((item) => item.component)).toEqual(["roll", "pitch", "yaw"]);
     expect(groups[2].items.map((item) => item.dim)).toEqual([5, 6, 7]);
   });

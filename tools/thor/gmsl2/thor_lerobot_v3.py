@@ -41,13 +41,14 @@ BOX_STATE_NAMES: tuple[str, ...] = (
     "box_imu.gyr_x_deg_s",
     "box_imu.gyr_y_deg_s",
     "box_imu.gyr_z_deg_s",
-    "box_imu.roll_deg",
-    "box_imu.pitch_deg",
-    "box_imu.yaw_deg",
-    "box_imu.quat_w",
+    # Attitude as a quaternion only, xyzw (scalar last). The SDK also reports
+    # roll/pitch/yaw from the same solve, but those are redundant with the
+    # quaternion and ``yaw`` wraps at ±180°, which is actively harmful for
+    # normalization stats and regression losses. See ts_sync.md §9.1.1.
     "box_imu.quat_x",
     "box_imu.quat_y",
     "box_imu.quat_z",
+    "box_imu.quat_w",
     "box_six_d_force.fx",
     "box_six_d_force.fy",
     "box_six_d_force.fz",
@@ -203,6 +204,26 @@ def _list_values(sensor: dict[str, Any], key: str, count: int) -> list[float]:
     return values + [0.0] * max(0, count - len(values))
 
 
+def _imu_quat_xyzw(imu: dict[str, Any]) -> list[float]:
+    """IMU attitude as ``[x, y, z, w]`` (scalar last).
+
+    The SDK reports ``quat_wxyz`` (scalar first); the reorder happens here, at
+    state-packing time, so neither the SDK nor the raw ``box_sensors.jsonl``
+    archive changes layout. xyzw matches scipy ``Rotation``, ROS
+    ``geometry_msgs/Quaternion`` and the FR3 side of this repo.
+
+    The sign is passed through as recorded. A ``w >= 0`` hemisphere convention
+    was evaluated on 213 IMU streams / 323k samples of Thor data and rejected:
+    the SDK stream has zero antipodal steps (``dot(q[i], q[i+1]) < 0``) — it is
+    already continuous — while 31 of those streams legitimately cross ``w = 0``,
+    where forcing a hemisphere would inject a full sign flip (L2 step 2.0).
+    See ts_sync.md §9.1.1.
+    """
+
+    w, x, y, z = _list_values(imu, "quat_wxyz", 4)
+    return [x, y, z, w]
+
+
 def _touch_summary(sensor: dict[str, Any]) -> list[float]:
     fx = _list_values(sensor, "fx_0p1N", 239)
     fy = _list_values(sensor, "fy_0p1N", 239)
@@ -226,7 +247,11 @@ def box_snapshot_to_state(snapshot: dict[str, Any]) -> list[float]:
     Per-sensor MCU timestamps are intentionally excluded -- they are diagnostic
     alignment metadata, not trainable observations, and are emitted separately
     via :func:`box_snapshot_to_timestamps` into the ``box.timestamps`` column.
-    See :data:`BOX_STATE_NAMES` / :data:`BOX_TIMESTAMP_NAMES`.
+    The IMU's ``roll/pitch/yaw`` are excluded too: they encode the same 3-DoF
+    attitude as ``quat`` (same SDK solve, not an independent measurement), and
+    the wrapping ``yaw`` channel would poison normalization stats. See
+    :data:`BOX_STATE_NAMES` / :data:`BOX_TIMESTAMP_NAMES` and ts_sync.md §9.1.1;
+    the raw ``box_sensors.jsonl`` archive still keeps rpy verbatim.
     """
 
     gripper = _sensor(snapshot, "box_gripper")
@@ -241,10 +266,7 @@ def box_snapshot_to_state(snapshot: dict[str, Any]) -> list[float]:
         _finite_float(trigger.get("travel_pct")),
         *_list_values(imu, "acc_g", 3),
         *_list_values(imu, "gyr_deg_s", 3),
-        _finite_float(imu.get("roll_deg")),
-        _finite_float(imu.get("pitch_deg")),
-        _finite_float(imu.get("yaw_deg")),
-        *_list_values(imu, "quat_wxyz", 4),
+        *_imu_quat_xyzw(imu),
         *_list_values(six_d, "fxyz_mxyz", 6),
         *_touch_summary(touch_left),
         *_touch_summary(touch_right),
