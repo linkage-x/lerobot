@@ -163,8 +163,8 @@ class TeleopStatus:
     realRobotReady: bool = False
     cameraViews: list[dict[str, Any]] = field(
         default_factory=lambda: [
-            {"id": "external", "label": "External", "source": "D435I", "fps": 30},
-            {"id": "wrist", "label": "Wrist", "source": "D405", "fps": 30},
+            {"id": "external", "label": "External", "source": "D435I", "fps": 30, "deviceId": "side"},
+            {"id": "wrist", "label": "Wrist", "source": "D405", "fps": 30, "deviceId": "ee"},
         ]
     )
 
@@ -559,6 +559,12 @@ def _replay_status_from_config(config: dict[str, Any]) -> ReplayStatus:
         totalFrames=_target_frames(config),
         fps=int(dataset.get("fps") or 30),
         realRobotIp=default_robot_ip,
+        realEndEffectorMode=(
+            "pika_gripper_ee"
+            if str(robot.get("gripper_backend") or "") == "pika"
+            or "pika" in str(robot.get("urdf_path") or "").lower()
+            else "corenetic_gripper_ee"
+        ),
     )
 
 
@@ -5843,6 +5849,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         state.teleop_process = None
         state.teleop_started_at_s = None
         state.teleop.pid = None
+        state.teleop.realRobotReady = False
         state.teleop.state = "idle" if teleop_process.returncode == 0 else "error"
         if state.teleop.lastOutput:
             state.teleop.message = f"FR3 teleop exited with code {teleop_process.returncode}: {state.teleop.lastOutput}"
@@ -6094,6 +6101,15 @@ def _fr3_sim_teleop_command(state: GatewayState) -> list[str]:
     ]
 
 
+def _fr3_real_teleop_command(state: GatewayState) -> list[str]:
+    return [
+        str(_venv_python(state.repo_root, prefer_fr3=True)),
+        "-m",
+        "tools.fr3.fr3_real_teleop_runtime",
+        f"--config_path={state.config_path}",
+    ]
+
+
 def _read_teleop_process_output(state: GatewayState, process: subprocess.Popen[str]) -> None:
     if process.stdout is None:
         return
@@ -6108,11 +6124,14 @@ def _read_teleop_process_output(state: GatewayState, process: subprocess.Popen[s
                 state.log("warn", f"fr3 teleop: {output}")
                 continue
             state.teleop.lastOutput = output
-            state.teleop.message = (
-                "External and wrist simulation views are live"
-                if output.startswith("Camera streams:")
-                else output
-            )
+            if output == "fr3_real_teleop=READY":
+                state.teleop.state = "running"
+                state.teleop.realRobotReady = True
+                state.teleop.message = "FR3, Pika gripper, and SpaceMouse are connected"
+            elif output.startswith("Camera streams:"):
+                state.teleop.message = "External and wrist simulation views are live"
+            else:
+                state.teleop.message = output
             state.log("info", f"fr3 teleop: {output}")
 
 
@@ -6121,7 +6140,7 @@ def _start_teleop_output_reader(state: GatewayState, process: subprocess.Popen[s
         target=_read_teleop_process_output,
         args=(state, process),
         daemon=True,
-        name=f"fr3-sim-teleop-output-{process.pid}",
+        name=f"fr3-teleop-output-{process.pid}",
     ).start()
 
 
@@ -6166,6 +6185,46 @@ def _start_fr3_sim_teleop(state: GatewayState) -> None:
     _start_teleop_output_reader(state, process)
 
 
+def _start_fr3_real_teleop(state: GatewayState) -> None:
+    process = state.teleop_process
+    if process is not None and process.poll() is None:
+        state.teleop.message = "An FR3 teleop session is already active"
+        return
+    urdf_path, sim_xml_path = _fr3_pika_asset_paths(state.repo_root)
+    if not urdf_path.is_file():
+        raise RuntimeError(f"Missing FR3 Pika URDF: {urdf_path}")
+    if not state.config_path.is_file():
+        raise RuntimeError(f"Missing workstation FR3 config: {state.config_path}")
+
+    command = _fr3_real_teleop_command(state)
+    process = subprocess.Popen(
+        command,
+        cwd=state.repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=_tool_env(state.repo_root),
+        start_new_session=True,
+    )
+    state.teleop_process = process
+    state.teleop_started_at_s = time.monotonic()
+    state.teleop = TeleopStatus(
+        state="starting",
+        backend="real",
+        inputDevice="spacemouse",
+        robotModel="fr3_pika_gripper",
+        urdfPath=str(urdf_path),
+        simXmlPath=str(sim_xml_path),
+        targetFrameName="pika_task_tcp",
+        pid=process.pid,
+        message="Connecting to FR3 192.168.1.206, Pika gripper, and SpaceMouse",
+        command=command,
+        realRobotReady=False,
+    )
+    state.log("info", f"Started FR3 Pika real teleop without an FCI preflight gate pid={process.pid}")
+    _start_teleop_output_reader(state, process)
+
+
 def _stop_fr3_teleop(state: GatewayState) -> None:
     process = state.teleop_process
     if process is not None and process.poll() is None:
@@ -6180,6 +6239,7 @@ def _stop_fr3_teleop(state: GatewayState) -> None:
     state.teleop_started_at_s = None
     state.teleop.state = "idle"
     state.teleop.pid = None
+    state.teleop.realRobotReady = False
     state.teleop.message = "FR3 Pika teleop stopped"
 
 
@@ -7482,7 +7542,7 @@ def _real_replay_command(
         / DEFAULT_TRAJ_SIDECAR_NAME
         / f"state_action.{cube_mode}.csv"
     )
-    return [
+    command = [
         str(_mujoco_replay_python(state)),
         str(
             state.repo_root
@@ -7509,6 +7569,19 @@ def _real_replay_command(
         "--replay.fail_on_unreached_initial_pose=true",
         f"--end_effector.mode={'fr3_ee' if end_effector_mode == 'fr3_ee' else 'robot_config'}",
     ]
+    if end_effector_mode == "pika_gripper_ee":
+        robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
+        urdf_path, _sim_xml_path = _fr3_pika_asset_paths(state.repo_root)
+        command.extend(
+            [
+                "--robot.gripper_backend=pika",
+                f"--robot.gripper_port={robot.get('gripper_port') or '/dev/ttyUSB0'}",
+                "--robot.allow_mock_gripper=false",
+                f"--robot.urdf_path={urdf_path}",
+                "--robot.target_frame_name=pika_task_tcp",
+            ]
+        )
+    return command
 
 
 def _real_robot_ip(state: GatewayState) -> str:
@@ -7808,8 +7881,8 @@ def _start_real_replay(
     if cube_mode not in ("left", "right"):
         raise ValueError(f"Real replay cube mode must be left or right, got {cube_mode!r}")
     end_effector_mode = str(end_effector_mode).strip().lower()
-    if end_effector_mode not in ("corenetic_gripper_ee", "fr3_ee"):
-        raise ValueError("Real replay end effector must be corenetic_gripper_ee or fr3_ee")
+    if end_effector_mode not in ("pika_gripper_ee", "corenetic_gripper_ee", "fr3_ee"):
+        raise ValueError("Real replay end effector must be pika_gripper_ee, corenetic_gripper_ee, or fr3_ee")
     state.replay.realReplayLog = []
     _append_real_replay_log(
         state,
@@ -8418,7 +8491,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         self.server.state,
                         query.get("cube", ["right"])[0],
                         query.get("robot_ip", [""])[0],
-                        query.get("end_effector", ["corenetic_gripper_ee"])[0],
+                        query.get("end_effector", ["pika_gripper_ee"])[0],
                         str(query.get("override_mujoco_failure", ["false"])[0]).strip().lower()
                         in ("1", "true", "yes", "on"),
                     )
@@ -8431,6 +8504,15 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         )
                         return
                     _start_fr3_sim_teleop(self.server.state)
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/teleop/start-real":
+                    if self.server.state.profile != "workstation":
+                        _json_response(
+                            self, HTTPStatus.CONFLICT, {"error": "teleoperation is unavailable in the Thor profile"}
+                        )
+                        return
+                    _start_fr3_real_teleop(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/teleop/stop":

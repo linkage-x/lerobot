@@ -14,6 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Imported eagerly so that `@RobotConfig.register_subclass("franka_research3")` runs as
+# soon as this package is imported: draccus resolves `robot.type` against the registry at
+# config-parse time, so a lazy config import makes `--config_path=...` fail with
+# "Couldn't find a choice class for 'franka_research3'". This module only pulls in
+# dataclasses plus the camera/robot config bases, so it stays cheap; the driver and
+# processor modules (panda_py, placo, numpy) stay lazy below.
+from .config_franka_research3 import FrankaResearch3Config
+
 __all__ = [
     "AbsoluteEEActionToRobotAction",
     "DeltaActionToAbsoluteEEAction",
@@ -22,11 +30,8 @@ __all__ = [
     "KeepAbsoluteEEObservation",
 ]
 
-def __getattr__(name: str):
-    if name == "FrankaResearch3Config":
-        from .config_franka_research3 import FrankaResearch3Config
 
-        return FrankaResearch3Config
+def __getattr__(name: str):
     if name == "FrankaResearch3":
         from .franka_research3 import FrankaResearch3
 

@@ -131,6 +131,9 @@ def test_workstation_profile_exposes_fr3_teleop_contract():
     assert snapshot["teleop"]["simXmlPath"].endswith("fr3_pika_gripper_scene.xml")
     assert "ati" not in snapshot["teleop"]["urdfPath"].lower()
     assert [view["id"] for view in snapshot["teleop"]["cameraViews"]] == ["external", "wrist"]
+    assert [view["deviceId"] for view in snapshot["teleop"]["cameraViews"]] == ["side", "ee"]
+    assert snapshot["replay"]["realRobotIp"] == "192.168.1.206"
+    assert snapshot["replay"]["realEndEffectorMode"] == "pika_gripper_ee"
 
 
 def test_workstation_teleop_prefers_fr3_virtualenv(tmp_path: Path):
@@ -154,6 +157,58 @@ def test_workstation_teleop_prefers_fr3_virtualenv(tmp_path: Path):
     assert "--viewer-camera" not in command
     assert gateway._venv_python(tmp_path) == default_python
     assert gateway._venv_python3(tmp_path, prefer_fr3=True) == fr3_python
+
+
+def test_workstation_real_teleop_command_uses_record_config_without_preflight_gate():
+    state = gateway.make_state(
+        Path.cwd(),
+        Path("tools/fr3/fr3_record_config.yaml"),
+        profile="workstation",
+    )
+
+    command = gateway._fr3_real_teleop_command(state)
+
+    assert command[0].endswith((".venv-fr3/bin/python", ".venv/bin/python"))
+    assert command[1:3] == ["-m", "tools.fr3.fr3_real_teleop_runtime"]
+    assert command[3] == f"--config_path={state.config_path}"
+    assert all("preflight" not in part for part in command)
+
+
+def test_start_workstation_real_teleop_does_not_call_hardware_preflight(monkeypatch):
+    state = gateway.make_state(
+        Path.cwd(),
+        Path("tools/fr3/fr3_record_config.yaml"),
+        profile="workstation",
+    )
+    captured = {}
+
+    class FakeProcess:
+        pid = 4242
+        stdout = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(gateway, "_start_teleop_output_reader", lambda *_args: None)
+    monkeypatch.setattr(
+        gateway,
+        "_run_real_preflight",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("preflight must not run")),
+    )
+
+    gateway._start_fr3_real_teleop(state)
+
+    assert state.teleop.state == "starting"
+    assert state.teleop.backend == "real"
+    assert state.teleop.realRobotReady is False
+    assert state.teleop.pid == 4242
+    assert captured["command"] == gateway._fr3_real_teleop_command(state)
 
 
 def test_gmsl2_device_preview_uses_recorder_owned_frames_only():
@@ -1239,6 +1294,18 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     assert "--replay.initial_pose_mode=current" in command
     assert "--replay.fail_on_unreached_initial_pose=true" in command
     assert "--end_effector.mode=robot_config" in command
+
+    pika_command = gateway._real_replay_command(
+        state,
+        dataset_root,
+        "left",
+        "192.168.1.206",
+        "pika_gripper_ee",
+    )
+    assert "--robot.gripper_backend=pika" in pika_command
+    assert "--robot.allow_mock_gripper=false" in pika_command
+    assert "--robot.target_frame_name=pika_task_tcp" in pika_command
+    assert any(part.endswith("fr3_pika_gripper.urdf") for part in pika_command)
 
     bare_command = gateway._real_replay_command(
         state,

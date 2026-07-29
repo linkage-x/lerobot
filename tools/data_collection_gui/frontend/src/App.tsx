@@ -238,8 +238,13 @@ function App() {
         snapshot={snapshot}
         busy={busy}
         onStartSimTeleop={() => run(() => api.startSimTeleop())}
+        onStartRealTeleop={() => run(() => api.startRealTeleop())}
         onStopTeleop={() => run(() => api.stopTeleop())}
-        cameraUrl={(viewId) => api.teleopCameraUrl(viewId)}
+        cameraUrl={(view, backend) =>
+          backend === "real"
+            ? api.cameraSnapshotUrl(view.deviceId ?? (view.id === "wrist" ? "ee" : "side"))
+            : api.teleopCameraUrl(view.id)
+        }
       />
     ) : activePage === "live-record" ? (
       <LiveRecordPage

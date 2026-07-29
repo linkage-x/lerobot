@@ -14,9 +14,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 try:
     from .config import RobotConfig
     from .robot import Robot
     from .utils import make_robot_from_config
-except Exception:  # pragma: no cover - optional aggregate import for direct robot submodules
-    pass
+except ImportError as exc:  # pragma: no cover - optional aggregate import for direct robot submodules
+    # Importing a robot submodule directly must keep working even when the aggregate
+    # re-exports are unavailable (e.g. a missing optional dependency). Anything other than
+    # an ImportError is a real bug and is left to propagate.
+    logging.getLogger(__name__).warning(
+        "lerobot.robots aggregate imports unavailable (%s); "
+        "`RobotConfig`, `Robot` and `make_robot_from_config` will not be importable from "
+        "`lerobot.robots`. Import the robot submodule directly, or install the missing dependency.",
+        exc,
+    )

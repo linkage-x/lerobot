@@ -117,6 +117,7 @@ export type TeleopCameraView = {
   label: string;
   source: string;
   fps: number;
+  deviceId?: string;
 };
 
 export type TeleopStatus = {
@@ -197,7 +198,7 @@ export type MujocoValidation = {
 
 export type MujocoCubeMode = "left" | "right" | "both";
 export type RealCubeMode = Exclude<MujocoCubeMode, "both">;
-export type RealEndEffectorMode = "corenetic_gripper_ee" | "fr3_ee";
+export type RealEndEffectorMode = "pika_gripper_ee" | "corenetic_gripper_ee" | "fr3_ee";
 
 export type RealSensePreviewStatus = {
   available: boolean | null;

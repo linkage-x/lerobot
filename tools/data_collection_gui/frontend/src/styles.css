@@ -3307,6 +3307,11 @@ button.danger {
   .cali-history-head span:nth-child(4), .cali-history-head span:nth-child(5) { display: none; }
 }
 
+.teleop-backend-picker {
+  width: min(100%, 420px);
+  margin-bottom: 12px;
+}
+
 .teleop-panel .summary-grid {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
@@ -3346,6 +3351,15 @@ button.danger {
   color: var(--muted);
   font-size: 13px;
   overflow-wrap: anywhere;
+}
+
+.teleop-gate-note {
+  margin-top: 10px;
+  border-left: 3px solid #c78b23;
+  padding: 7px 10px;
+  background: #fff8e8;
+  color: #6f541f;
+  font-size: 12px;
 }
 
 @media (max-width: 900px) {

@@ -155,8 +155,8 @@ export class DataCollectionGuiApi {
       command: [],
       realRobotReady: false,
       cameraViews: [
-        { id: "external", label: "External", source: "D435I", fps: 30 },
-        { id: "wrist", label: "Wrist", source: "D405", fps: 30 }
+        { id: "external", label: "External", source: "D435I", fps: 30, deviceId: "side" },
+        { id: "wrist", label: "Wrist", source: "D405", fps: 30, deviceId: "ee" }
       ]
     },
     annotation: {
@@ -488,6 +488,23 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
+  async startRealTeleop(): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot("/api/teleop/start-real");
+    if (remote) {
+      return remote;
+    }
+    await wait(180);
+    this.snapshot.teleop = {
+      ...this.snapshot.teleop,
+      state: "error",
+      backend: "real",
+      message: "Gateway unavailable; FR3 real teleop must be started by the backend",
+      pid: null
+    };
+    this.log("error", "FR3 real teleop could not reach the gateway");
+    return this.getSnapshot();
+  }
+
   async stopTeleop(): Promise<GuiSnapshot> {
     const remote = await this.postRemoteSnapshot("/api/teleop/stop");
     if (remote) {
@@ -633,7 +650,7 @@ export class DataCollectionGuiApi {
   }
 
   cameraSnapshotUrl(deviceId: string): string {
-    const params = new URLSearchParams({ key: deviceId });
+    const params = new URLSearchParams({ key: deviceId, t: Date.now().toString() });
     return `${this.apiBase}/api/device-preview/camera.jpg?${params.toString()}`;
   }
 
