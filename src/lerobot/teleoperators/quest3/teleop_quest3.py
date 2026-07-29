@@ -376,9 +376,12 @@ class Quest3Teleop(Teleoperator):
     def _controller_gripper(self, right_states: dict[str, float | bool], left_states: dict[str, float | bool]) -> float:
         r_trigger = float(right_states.get("trigger", 0.0))
         del left_states
+        # 1.0 is open and 0.0 is closed, matching `_gripper_from_fingertips_unclipped`
+        # and the robot backends (PikaGripperHardwareDriver maps 1.0 to full width).
+        # Squeezing the trigger closes the gripper.
         if r_trigger > 0.01:
-            return 1.0
-        return 0.0
+            return 0.0
+        return 1.0
 
     def _compute_incremental_deltas(
         self,
@@ -524,6 +527,14 @@ class Quest3Teleop(Teleoperator):
             self._prev_delta_rotvec = None
 
         dp, dr_rotvec = self._compute_incremental_deltas(pose, self._baseline_pose)
+        # Emit per-frame deltas. The downstream FR3 step (DeltaActionToAbsoluteEEAction)
+        # advances its own reference pose by every delta it receives, so a delta measured
+        # against a fixed clutch baseline would be re-applied on every control cycle and
+        # the arm would keep marching while the controller is held still. Only advance the
+        # baseline once a delta actually cleared the deadband, so slow motion still
+        # accumulates instead of being swallowed frame after frame.
+        if np.any(dp) or np.any(dr_rotvec):
+            self._baseline_pose = pose.copy()
 
         action = {
             "enabled": True,
@@ -536,7 +547,7 @@ class Quest3Teleop(Teleoperator):
             "gripper": filtered_gripper,
             "tracking_valid": True,
             "clutch_active": True,
-            "delta_is_per_frame": False,
+            "delta_is_per_frame": True,
             "delta_x": float(dp[0]),
             "delta_y": float(dp[1]),
             "delta_z": float(dp[2]),
