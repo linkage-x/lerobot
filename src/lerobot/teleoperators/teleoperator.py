@@ -15,15 +15,19 @@
 import abc
 import builtins
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import draccus
 
 from lerobot.motors.motors_bus import MotorCalibration
-from lerobot.processor import RobotAction
 from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, TELEOPERATORS
 
 from .config import TeleoperatorConfig
+
+if TYPE_CHECKING:
+    from lerobot.processor import RobotAction
+else:
+    RobotAction = dict[str, Any]
 
 
 class Teleoperator(abc.ABC):

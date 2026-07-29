@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config import RobotConfig
-from .robot import Robot
-from .utils import make_robot_from_config
+try:
+    from .config import RobotConfig
+    from .robot import Robot
+    from .utils import make_robot_from_config
+except Exception:  # pragma: no cover - optional aggregate import for direct robot submodules
+    pass

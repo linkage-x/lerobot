@@ -18,6 +18,7 @@ Provides the RealSenseCamera class for capturing frames from Intel RealSense cam
 
 import logging
 import time
+from collections import deque
 from threading import Event, Lock, Thread
 from typing import Any
 
@@ -136,6 +137,7 @@ class RealSenseCamera(Camera):
         self.latest_color_frame: NDArray[Any] | None = None
         self.latest_depth_frame: NDArray[Any] | None = None
         self.latest_timestamp: float | None = None
+        self.frame_history: deque[tuple[float, NDArray[Any]]] = deque(maxlen=8)
         self.new_frame_event: Event = Event()
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
@@ -490,6 +492,7 @@ class RealSenseCamera(Camera):
                     if self.use_depth:
                         self.latest_depth_frame = processed_depth_frame
                     self.latest_timestamp = capture_time
+                    self.frame_history.append((capture_time, processed_color_frame))
                 self.new_frame_event.set()
                 failure_count = 0
 
@@ -526,6 +529,7 @@ class RealSenseCamera(Camera):
             self.latest_color_frame = None
             self.latest_depth_frame = None
             self.latest_timestamp = None
+            self.frame_history.clear()
             self.new_frame_event.clear()
 
     # NOTE(Steven): Missing implementation for depth for now
@@ -571,6 +575,43 @@ class RealSenseCamera(Camera):
 
         return frame
 
+    @check_if_not_connected
+    def read_latest_with_timestamp(self, max_age_ms: int = 500) -> tuple[NDArray[Any], float]:
+        """Return the latest frame and its host monotonic capture timestamp."""
+        if self.thread is None or not self.thread.is_alive():
+            raise RuntimeError(f"{self} read thread is not running.")
+
+        with self.frame_lock:
+            frame = self.latest_color_frame
+            timestamp = self.latest_timestamp
+
+        if frame is None or timestamp is None:
+            raise RuntimeError(f"{self} has not captured any frames yet.")
+
+        age_ms = (time.perf_counter() - timestamp) * 1e3
+        if age_ms > max_age_ms:
+            raise TimeoutError(
+                f"{self} latest frame is too old: {age_ms:.1f} ms (max allowed: {max_age_ms} ms)."
+            )
+        return frame, timestamp
+
+    @check_if_not_connected
+    def read_closest(self, timestamp_s: float, max_age_ms: int = 500) -> tuple[NDArray[Any], float]:
+        """Return the buffered frame closest to a host monotonic timestamp."""
+        if self.thread is None or not self.thread.is_alive():
+            raise RuntimeError(f"{self} read thread is not running.")
+        with self.frame_lock:
+            history = tuple(self.frame_history)
+        if not history:
+            raise RuntimeError(f"{self} has not captured any frames yet.")
+        selected_timestamp, selected_frame = min(history, key=lambda sample: abs(sample[0] - timestamp_s))
+        age_ms = (time.perf_counter() - selected_timestamp) * 1e3
+        if age_ms > max_age_ms:
+            raise TimeoutError(
+                f"{self} closest frame is too old: {age_ms:.1f} ms (max allowed: {max_age_ms} ms)."
+            )
+        return selected_frame, selected_timestamp
+
     # NOTE(Steven): Missing implementation for depth for now
     @check_if_not_connected
     def read_latest(self, max_age_ms: int = 500) -> NDArray[Any]:
@@ -589,22 +630,7 @@ class RealSenseCamera(Camera):
             RuntimeError: If the camera is connected but has not captured any frames yet.
         """
 
-        if self.thread is None or not self.thread.is_alive():
-            raise RuntimeError(f"{self} read thread is not running.")
-
-        with self.frame_lock:
-            frame = self.latest_color_frame
-            timestamp = self.latest_timestamp
-
-        if frame is None or timestamp is None:
-            raise RuntimeError(f"{self} has not captured any frames yet.")
-
-        age_ms = (time.perf_counter() - timestamp) * 1e3
-        if age_ms > max_age_ms:
-            raise TimeoutError(
-                f"{self} latest frame is too old: {age_ms:.1f} ms (max allowed: {max_age_ms} ms)."
-            )
-
+        frame, _timestamp = self.read_latest_with_timestamp(max_age_ms=max_age_ms)
         return frame
 
     def disconnect(self) -> None:
@@ -634,6 +660,7 @@ class RealSenseCamera(Camera):
             self.latest_color_frame = None
             self.latest_depth_frame = None
             self.latest_timestamp = None
+            self.frame_history.clear()
             self.new_frame_event.clear()
 
         logger.info(f"{self} disconnected.")

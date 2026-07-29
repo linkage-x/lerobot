@@ -12,4 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .configs import AlohaEnv, EnvConfig, HubEnvConfig, PushtEnv  # noqa: F401
+try:
+    from .configs import AlohaEnv, EnvConfig, HubEnvConfig, PushtEnv  # noqa: F401
+except Exception:  # pragma: no cover - optional aggregate import for direct env submodules
+    pass

@@ -5,10 +5,8 @@
 <!-- =================================================================================== -->
 <robot name="fr3">
   <mujoco>
-    <compiler
-      meshdir="assets"
-      balanceinertia="true"
-      discardvisual="false" />
+    <!-- Keep meshes relative to this URDF location so both visual and collision folders resolve -->
+    <compiler meshdir="." balanceinertia="true" discardvisual="false"/>
   </mujoco>
   <!-- safety_distance: Minimum safety distance in [m] by which the collision volumes are expanded and which is enforced during robot motions -->
   <!-- arm_id: Namespace of the robot arm. Serves to differentiate between arms in case of multiple instances. -->
@@ -26,42 +24,12 @@
   <link name="fr3_link0">
     <visual name="fr3_link0_visual">
       <geometry>
-        <mesh filename="assets/link0_0.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link0_1.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link0_2.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link0_3.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link0_4.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link0_5.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link0_6.obj"/>
+        <mesh filename="./assets/fr3/visual/link0.dae"/>
       </geometry>
     </visual>
     <collision name="fr3_link0_collision">
       <geometry>
-        <mesh filename="assets/link0.stl"/>
+        <mesh filename="./assets/fr3/collision/link0.stl"/>
       </geometry>
     </collision>
     <inertial>
@@ -74,12 +42,12 @@
   <link name="fr3_link1">
     <visual name="fr3_link1_visual">
       <geometry>
-        <mesh filename="assets/link1.obj"/>
+        <mesh filename="./assets/fr3/visual/link1.dae"/>
       </geometry>
     </visual>
     <collision name="fr3_link1_collision">
       <geometry>
-        <mesh filename="assets/link1.stl"/>
+        <mesh filename="./assets/fr3/collision/link1.stl"/>
       </geometry>
     </collision>
     <inertial>
@@ -101,12 +69,12 @@
   <link name="fr3_link2">
     <visual name="fr3_link2_visual">
       <geometry>
-        <mesh filename="assets/link2.obj"/>
+        <mesh filename="./assets/fr3/visual/link2.dae"/>
       </geometry>
     </visual>
     <collision name="fr3_link2_collision">
       <geometry>
-        <mesh filename="assets/link2.stl"/>
+        <mesh filename="./assets/fr3/collision/link2.stl"/>
       </geometry>
     </collision>
     <inertial>
@@ -128,17 +96,12 @@
   <link name="fr3_link3">
     <visual name="fr3_link3_visual">
       <geometry>
-        <mesh filename="assets/link3_0.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link3_1.obj"/>
+        <mesh filename="./assets/fr3/visual/link3.dae"/>
       </geometry>
     </visual>
     <collision name="fr3_link3_collision">
       <geometry>
-        <mesh filename="assets/link3.stl"/>
+        <mesh filename="./assets/fr3/collision/link3.stl"/>
       </geometry>
     </collision>
     <inertial>
@@ -160,17 +123,12 @@
   <link name="fr3_link4">
     <visual name="fr3_link4_visual">
       <geometry>
-        <mesh filename="assets/link4_0.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link4_1.obj"/>
+        <mesh filename="./assets/fr3/visual/link4.dae"/>
       </geometry>
     </visual>
     <collision name="fr3_link4_collision">
       <geometry>
-        <mesh filename="assets/link4.stl"/>
+        <mesh filename="./assets/fr3/collision/link4.stl"/>
       </geometry>
     </collision>
     <inertial>
@@ -192,22 +150,12 @@
   <link name="fr3_link5">
     <visual name="fr3_link5_visual">
       <geometry>
-        <mesh filename="assets/link5_0.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link5_1.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link5_2.obj"/>
+        <mesh filename="./assets/fr3/visual/link5.dae"/>
       </geometry>
     </visual>
     <collision name="fr3_link5_collision">
       <geometry>
-        <mesh filename="assets/link5.stl"/>
+        <mesh filename="./assets/fr3/collision/link5.stl"/>
       </geometry>
     </collision>
     <inertial>
@@ -229,47 +177,12 @@
   <link name="fr3_link6">
     <visual name="fr3_link6_visual">
       <geometry>
-        <mesh filename="assets/link6_0.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link6_1.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link6_2.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link6_3.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link6_4.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link6_5.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link6_6.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link6_7.obj"/>
+        <mesh filename="./assets/fr3/visual/link6.dae"/>
       </geometry>
     </visual>
     <collision name="fr3_link6_collision">
       <geometry>
-        <mesh filename="assets/link6.stl"/>
+        <mesh filename="./assets/fr3/collision/link6.stl"/>
       </geometry>
     </collision>
     <inertial>
@@ -291,27 +204,12 @@
   <link name="fr3_link7">
     <visual name="fr3_link7_visual">
       <geometry>
-        <mesh filename="assets/link7_0.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link7_1.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link7_2.obj"/>
-      </geometry>
-    </visual>
-    <visual>
-      <geometry>
-        <mesh filename="assets/link7_3.obj"/>
+        <mesh filename="./assets/fr3/visual/link7.dae"/>
       </geometry>
     </visual>
     <collision name="fr3_link7_collision">
       <geometry>
-        <mesh filename="assets/link7.stl"/>
+        <mesh filename="./assets/fr3/collision/link7.stl"/>
       </geometry>
     </collision>
     <inertial>
@@ -336,9 +234,38 @@
     <child link="fr3_link8"/>
   </joint>
 
+  <!-- adapter between fr3 flange and pika base -->
+  <link name="fr3_pika_adapter_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.0192"/>
+      <inertia ixx="6e-06" ixy="0" ixz="0" iyy="6e-06" iyz="0" izz="1.2e-05"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="./assets/fr32pika.STL" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="./assets/fr32pika.STL" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="fr3_pika_adapter_joint" type="fixed">
+    <!-- keep adapter unrotated at flange; adjust xyz here if you want to move the visual plate -->
+    <origin rpy="0 0 -0." xyz="-0.033 -0.033 -0.012"/>
+    <parent link="fr3_link8"/>
+    <child link="fr3_pika_adapter_link"/>
+  </joint>
+
   <!-- pika gripper -->
   <joint name="fr3_gripper_joint" type="fixed">
-    <origin rpy="-0.739815 -1.5707963 3.1415926" xyz="0 0 0"/>
+    <!-- mount directly to fr3_link8; adapter visual remains separate -->
+    <origin rpy="-0.739815 -1.5707963 3.1415926" xyz="0.002 0 0.008"/>
     <parent link="fr3_link8"/>
     <child link="gripper_base_link"/>
   </joint>
@@ -350,14 +277,14 @@
         xyz="0.037477 -8.1437E-07 0.0084053"
         rpy="0 0 0" />
       <mass
-        value="0.18972" />
+        value="0.4569787916" />
       <inertia
-        ixx="0.0002159"
-        ixy="3.3333E-08"
-        ixz="-2.6278E-06"
-        iyy="0.00014308"
-        iyz="1.6782E-08"
-        izz="0.00011036" />
+        ixx="0.0005200385890"
+        ixy="8.0289237089E-08"
+        ixz="-6.3295850125E-06"
+        iyy="0.0003446369677"
+        iyz="4.0422823533E-08"
+        izz="0.0002658242644" />
     </inertial>
     <visual>
       <origin
@@ -390,14 +317,14 @@
         xyz="0.033255 -0.014661 -0.0057614"
         rpy="0 0 0" />
       <mass
-        value="0.033674" />
+        value="0.0811106042" />
       <inertia
-        ixx="1.5284E-05"
-        ixy="1.4473E-05"
-        ixz="1.4911E-08"
-        iyy="3.448E-05"
-        iyz="-4.3614E-09"
-        izz="3.9744E-05" />
+        ixx="3.6814589136E-05"
+        ixy="3.4861132463E-05"
+        ixz="3.5916143588E-08"
+        iyy="8.3052017365E-05"
+        iyz="-1.0505309412E-08"
+        izz="9.5731420480E-05" />
     </inertial>
     <visual>
       <origin
@@ -448,14 +375,14 @@
         xyz="0.033255 0.014661 -0.0058113"
         rpy="0 0 0" />
       <mass
-        value="0.033674" />
+        value="0.0811106042" />
       <inertia
-        ixx="1.5284E-05"
-        ixy="-1.4473E-05"
-        ixz="-1.4956E-08"
-        iyy="3.448E-05"
-        iyz="-4.3614E-09"
-        izz="3.9744E-05" />
+        ixx="3.6814589136E-05"
+        ixy="-3.4861132463E-05"
+        ixz="-3.6024535142E-08"
+        iyy="8.3052017365E-05"
+        iyz="-1.0505309412E-08"
+        izz="9.5731420480E-05" />
     </inertial>
     <visual>
       <origin
@@ -502,10 +429,17 @@
 
   <link name="pika_gripper_ee"/>
   <joint name="fr3_hand_tcp_joint" type="fixed">
-  <!-- 0.185 -->
-    <origin rpy="3.1415926 -1.5707963 0" xyz="0.15 0 0.0285"/>
+    <origin rpy="3.1415926 -1.5707963 0" xyz="0.185 0 0"/>
     <parent link="gripper_base_link"/>
     <child link="pika_gripper_ee"/>
+  </joint>
+
+  <!-- Task-space TCP: midpoint between the two finger working points. -->
+  <link name="pika_task_tcp"/>
+  <joint name="pika_task_tcp_joint" type="fixed">
+    <origin rpy="3.1415926 -1.5707963 0" xyz="0 0 0.366842"/>
+    <parent link="gripper_base_link"/>
+    <child link="pika_task_tcp"/>
   </joint>
 
 </robot>

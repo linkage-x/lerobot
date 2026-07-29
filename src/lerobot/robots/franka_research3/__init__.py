@@ -14,14 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config_franka_research3 import FrankaResearch3Config
-from .franka_research3 import FrankaResearch3
-from .processor_franka_research3 import (
-    AbsoluteEEActionToRobotAction,
-    DeltaActionToAbsoluteEEAction,
-    KeepAbsoluteEEObservation,
-)
-
 __all__ = [
     "AbsoluteEEActionToRobotAction",
     "DeltaActionToAbsoluteEEAction",
@@ -29,3 +21,18 @@ __all__ = [
     "FrankaResearch3Config",
     "KeepAbsoluteEEObservation",
 ]
+
+def __getattr__(name: str):
+    if name == "FrankaResearch3Config":
+        from .config_franka_research3 import FrankaResearch3Config
+
+        return FrankaResearch3Config
+    if name == "FrankaResearch3":
+        from .franka_research3 import FrankaResearch3
+
+        return FrankaResearch3
+    if name in {"AbsoluteEEActionToRobotAction", "DeltaActionToAbsoluteEEAction", "KeepAbsoluteEEObservation"}:
+        from . import processor_franka_research3
+
+        return getattr(processor_franka_research3, name)
+    raise AttributeError(name)

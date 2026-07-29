@@ -16,10 +16,12 @@ import { QcReportPage } from "./pages/QcReportPage";
 import { DatasetExportPage } from "./pages/DatasetExportPage";
 import { TaskLibraryPage } from "./pages/TaskLibraryPage";
 import { DeviceManagerPage } from "./pages/DeviceManagerPage";
+import { TeleoperationPage } from "./pages/TeleoperationPage";
 import { PlaceholderPage } from "./pages/PlaceholderPage";
 
 export type PageId =
   | "live-record"
+  | "teleoperation"
   | "dataset-processing"
   | "episode-replay"
   | "dataset-export"
@@ -36,6 +38,7 @@ type PageMeta = { id: PageId; label: string; kind: "mvp" | "deferred" };
 const mvpPages: PageMeta[] = [
   { id: "dashboard", label: "Dashboard", kind: "mvp" },
   { id: "live-record", label: "Live Record", kind: "mvp" },
+  { id: "teleoperation", label: "Teleoperation", kind: "mvp" },
   { id: "dataset-processing", label: "Dataset Processing", kind: "mvp" },
   { id: "episode-replay", label: "Episode Replay", kind: "mvp" },
   { id: "dataset-export", label: "Dataset Export", kind: "mvp" },
@@ -57,11 +60,23 @@ const pages: PageMeta[] = [...mvpPages, ...deferredPages];
 type NavGroup = { label: string; ids: PageId[] };
 const navGroups: NavGroup[] = [
   { label: "Overview", ids: ["dashboard"] },
-  { label: "Capture", ids: ["live-record", "task-library"] },
+  { label: "Capture", ids: ["live-record", "teleoperation", "task-library"] },
   { label: "Calibration", ids: ["calibration"] },
   { label: "Devices", ids: ["device-manager"] },
   { label: "Data", ids: ["dataset-processing", "episode-replay", "dataset-export"] }
 ];
+
+const workstationPageIds = new Set<PageId>([
+  "teleoperation",
+  "device-manager",
+  "dataset-processing",
+  "episode-replay",
+  "dataset-export"
+]);
+
+function pageAllowedForProfile(page: PageId, profile: "thor" | "workstation"): boolean {
+  return profile === "workstation" ? workstationPageIds.has(page) : page !== "teleoperation";
+}
 const navPageLabels: Partial<Record<PageId, string>> = {
   dashboard: "Overview"
 };
@@ -103,6 +118,16 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!snapshot) return;
+    const profile = snapshot.deployment?.profile ?? "thor";
+    if (!pageAllowedForProfile(activePage, profile)) {
+      const fallback = (snapshot.deployment?.defaultRoute as PageId) ?? "live-record";
+      window.location.hash = fallback;
+      setActivePage(fallback);
+    }
+  }, [activePage, snapshot?.deployment?.profile, snapshot?.deployment?.defaultRoute]);
+
+  useEffect(() => {
     let cancelled = false;
     const timer = window.setInterval(async () => {
       const next = await api.getSnapshot();
@@ -135,6 +160,8 @@ function App() {
   }
 
   const activeMeta = pages.find((page) => page.id === activePage) ?? mvpPages[0];
+  const deployment = snapshot.deployment ?? { profile: "thor", label: "Thor Acquisition", defaultRoute: "live-record", capabilities: [] };
+  const workstationProfile = deployment.profile === "workstation";
 
   // The recorder session is a global prerequisite (it streams the box/camera
   // live data Calibration and Device Manager also consume), so Connect/Disconnect
@@ -206,7 +233,15 @@ function App() {
   };
 
   const pageNode =
-    activePage === "live-record" ? (
+    activePage === "teleoperation" ? (
+      <TeleoperationPage
+        snapshot={snapshot}
+        busy={busy}
+        onStartSimTeleop={() => run(() => api.startSimTeleop())}
+        onStopTeleop={() => run(() => api.stopTeleop())}
+        cameraUrl={(viewId) => api.teleopCameraUrl(viewId)}
+      />
+    ) : activePage === "live-record" ? (
       <LiveRecordPage
         snapshot={snapshot}
         busy={busy}
@@ -291,38 +326,42 @@ function App() {
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <h1>Robot Data Factory</h1>
+          <h1>{deployment.label}</h1>
           <p>
-            {snapshot.configSummary.rigType === "gmsl2"
-              ? `Thor GMSL2 · ${snapshot.devices.filter((d) => d.kind === "camera").length} cameras · ${snapshot.configSummary.fps} fps`
-              : "Live collection, processing, replay, and export for LeRobot data workflows"}
+            {workstationProfile
+              ? `FR3 + Pika · SpaceMouse · ${snapshot.devices.filter((d) => d.kind === "camera").length} RealSense cameras`
+              : `Thor GMSL2 · ${snapshot.devices.filter((d) => d.kind === "camera").length} cameras · ${snapshot.configSummary.fps} fps`}
           </p>
         </div>
         <div className="topbar-status">
           <span><StatusDot state={snapshot.gateway.state === "online" ? "running" : "warning"} /> Gateway {snapshot.gateway.state}</span>
-          <span className="topbar-recorder">
-            <StatusDot state={snapshot.recording.state} /> Recorder {stateLabel(snapshot.recording.state)}
-            {recorderConnected ? (
-              <button
-                className="topbar-btn"
-                disabled={busy || recorderWriting}
-                title={recorderWriting ? "录制进行中：请先在 Live Record 保存/停止" : "断开录制器会话"}
-                onClick={() => run(() => api.stopRecording("exit"))}
-              >
-                Disconnect
-              </button>
-            ) : (
-              <button
-                className="topbar-btn topbar-btn-primary"
-                disabled={busy}
-                title="连接录制器（按当前绑定 Task 启动，供录制 / 标定 / 设备预览共用）"
-                onClick={() => run(() => api.connectRecording())}
-              >
-                Connect
-              </button>
-            )}
-          </span>
-          {snapshot.configSummary.hardwareSync && (
+          {workstationProfile ? (
+            <span><StatusDot state={snapshot.teleop.state} /> Teleop {stateLabel(snapshot.teleop.state)}</span>
+          ) : (
+            <span className="topbar-recorder">
+              <StatusDot state={snapshot.recording.state} /> Recorder {stateLabel(snapshot.recording.state)}
+              {recorderConnected ? (
+                <button
+                  className="topbar-btn"
+                  disabled={busy || recorderWriting}
+                  title={recorderWriting ? "录制进行中：请先在 Live Record 保存/停止" : "断开录制器会话"}
+                  onClick={() => run(() => api.stopRecording("exit"))}
+                >
+                  Disconnect
+                </button>
+              ) : (
+                <button
+                  className="topbar-btn topbar-btn-primary"
+                  disabled={busy}
+                  title="连接录制器（按当前绑定 Task 启动，供录制 / 标定 / 设备预览共用）"
+                  onClick={() => run(() => api.connectRecording())}
+                >
+                  Connect
+                </button>
+              )}
+            </span>
+          )}
+          {!workstationProfile && snapshot.configSummary.hardwareSync && (
             <span>
               <StatusDot state={snapshot.configSummary.hardwareSync.enabled ? "running" : "warning"} />
               {" "}HW Sync {snapshot.configSummary.hardwareSync.enabled ? "ON" : "OFF"}
@@ -367,6 +406,10 @@ function SidebarNav({
   const [showDeferred, setShowDeferred] = useState(false);
   const labelFor = (id: PageId) => navPageLabels[id] ?? pages.find((p) => p.id === id)?.label ?? id;
   const caliBadge = calibrationNavBadge();
+  const profile = snapshot.deployment?.profile ?? "thor";
+  const visibleNavGroups = navGroups
+    .map((group) => ({ ...group, ids: group.ids.filter((id) => pageAllowedForProfile(id, profile)) }))
+    .filter((group) => group.ids.length > 0);
 
   const onlineCount = snapshot.devices.filter((d) => d.state === "running").length;
   const totalCount = snapshot.devices.length;
@@ -376,7 +419,7 @@ function SidebarNav({
 
   return (
     <nav className="sidebar" aria-label="Robot data factory pages">
-      {navGroups.map((group) => (
+      {visibleNavGroups.map((group) => (
         <div className="nav-group" key={group.label}>
           <small className="nav-group-label">{group.label}</small>
           {group.ids.map((id) => (
@@ -396,7 +439,7 @@ function SidebarNav({
           ))}
         </div>
       ))}
-      <div className="nav-group">
+      {profile === "thor" && <div className="nav-group">
         <button className="nav-toggle" onClick={() => setShowDeferred((value) => !value)}>
           <span>Deferred</span>
           <small>{showDeferred ? "hide" : `${deferredNavIds.length} hidden`}</small>
@@ -413,7 +456,7 @@ function SidebarNav({
               </button>
             ))
           : null}
-      </div>
+      </div>}
 
       {/* Global device status footer (spec §2). Thor has no ambient temp/humidity
           sensor, so environment shows a target range rather than a fake value. */}
@@ -422,12 +465,18 @@ function SidebarNav({
           <span className={`status-dot status-${onlineCount === totalCount && totalCount > 0 ? "running" : "warning"}`} />
           <span>{onlineCount} / {totalCount} devices online</span>
         </div>
-        <div className="nav-footer-row">
-          <span className={`status-dot status-${caliBadge.tone}`} />
-          <span>Calibration: {caliBadge.text}</span>
-        </div>
-        <div className="nav-footer-row nav-footer-muted">Env: 15–30℃ / 30–70%RH target</div>
-        <div className="nav-footer-row nav-footer-muted">BOX ID: {boxIdLabel}</div>
+        {profile === "thor" ? (
+          <>
+            <div className="nav-footer-row">
+              <span className={`status-dot status-${caliBadge.tone}`} />
+              <span>Calibration: {caliBadge.text}</span>
+            </div>
+            <div className="nav-footer-row nav-footer-muted">Env: 15–30℃ / 30–70%RH target</div>
+            <div className="nav-footer-row nav-footer-muted">BOX ID: {boxIdLabel}</div>
+          </>
+        ) : (
+          <div className="nav-footer-row nav-footer-muted">FR3 workstation · standalone</div>
+        )}
       </div>
     </nav>
   );

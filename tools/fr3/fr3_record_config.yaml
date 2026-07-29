@@ -1,12 +1,14 @@
 robot:
   type: franka_research3
   robot_ip: 192.168.1.206
-  gripper_port: /dev/ttyUSB0
+  gripper_port: /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
   allow_mock_gripper: false
-  urdf_path: /lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.urdf
-  target_frame_name: pika_gripper_ee
+  urdf_path: /lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf
+  target_frame_name: pika_task_tcp
   max_target_delta_pos: [0.001, 0.001, 0.001]
   max_target_delta_rot: [0.01, 0.01, 0.01]
+  camera_max_age_ms: 100
+  camera_max_skew_ms: 15
   cameras:
     ee:
       type: intelrealsense
@@ -17,12 +19,6 @@ robot:
     side:
       type: intelrealsense
       serial_number_or_name: "243122071795"
-      width: 640
-      height: 480
-      fps: 30
-    front:
-      type: intelrealsense
-      serial_number_or_name: "244222075350"
       width: 640
       height: 480
       fps: 30

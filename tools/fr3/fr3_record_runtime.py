@@ -303,6 +303,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             use_videos=cfg.dataset.video,
         ),
     )
+    capture_timestamp_names = tuple(getattr(robot, "capture_timestamp_feature_names", ()))
+    if capture_timestamp_names:
+        dataset_features["observation.device_capture_timestamp"] = {
+            "dtype": "float64",
+            "shape": (len(capture_timestamp_names),),
+            "names": list(capture_timestamp_names),
+        }
 
     if cfg.resume:
         dataset = LeRobotDataset(
@@ -368,6 +375,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 )
                 if events["stop_recording"]:
                     break
+                reset_capture_timestamp_origin = getattr(robot, "reset_capture_timestamp_origin", None)
+                if callable(reset_capture_timestamp_origin):
+                    reset_capture_timestamp_origin()
                 record_loop(
                     robot=robot,
                     events=events,

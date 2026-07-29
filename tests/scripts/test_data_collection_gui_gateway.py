@@ -107,6 +107,55 @@ def test_default_config_is_thor_gmsl2_box():
     assert "handheld_gripper" not in devices_by_kind
 
 
+def test_workstation_profile_exposes_fr3_teleop_contract():
+    state = gateway.make_state(
+        Path.cwd(),
+        Path("tools/fr3/fr3_record_config.yaml"),
+        profile="workstation",
+    )
+
+    snapshot = gateway._snapshot(state)
+
+    assert snapshot["deployment"]["profile"] == "workstation"
+    assert snapshot["deployment"]["defaultRoute"] == "teleoperation"
+    assert {"fr3", "pika", "spacemouse", "realsense", "mujoco"}.issubset(
+        snapshot["deployment"]["capabilities"]
+    )
+    assert {"camera", "robot", "gripper", "teleoperator"}.issubset(
+        {device["kind"] for device in snapshot["devices"]}
+    )
+    devices_by_id = {device["id"]: device for device in snapshot["devices"]}
+    assert devices_by_id["fr3"]["label"] == "Franka Research 3"
+    assert devices_by_id["pika"]["config"]["port"].startswith("/dev/serial/by-id/")
+    assert snapshot["teleop"]["urdfPath"].endswith("fr3_pika_gripper.urdf")
+    assert snapshot["teleop"]["simXmlPath"].endswith("fr3_pika_gripper_scene.xml")
+    assert "ati" not in snapshot["teleop"]["urdfPath"].lower()
+    assert [view["id"] for view in snapshot["teleop"]["cameraViews"]] == ["external", "wrist"]
+
+
+def test_workstation_teleop_prefers_fr3_virtualenv(tmp_path: Path):
+    default_python = tmp_path / ".venv" / "bin" / "python"
+    fr3_python = tmp_path / ".venv-fr3" / "bin" / "python"
+    default_python.parent.mkdir(parents=True)
+    fr3_python.parent.mkdir(parents=True)
+    default_python.touch()
+    fr3_python.touch()
+    state = gateway.make_state(
+        Path.cwd(),
+        Path("tools/fr3/fr3_record_config.yaml"),
+        profile="workstation",
+    )
+    state.repo_root = tmp_path
+
+    command = gateway._fr3_sim_teleop_command(state)
+
+    assert command[0] == str(fr3_python)
+    assert "--no-viewer" in command
+    assert "--viewer-camera" not in command
+    assert gateway._venv_python(tmp_path) == default_python
+    assert gateway._venv_python3(tmp_path, prefer_fr3=True) == fr3_python
+
+
 def test_gmsl2_device_preview_uses_recorder_owned_frames_only():
     gmsl2_state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
 

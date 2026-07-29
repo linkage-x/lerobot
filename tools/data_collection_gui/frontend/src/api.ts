@@ -6,6 +6,7 @@ import type {
   CalibrationStatus,
   ConfigSummary,
   DatasetExportStatus,
+  DeploymentProfile,
   DeviceStatus,
   BoxPreviewPayload,
   BoxCaliLog,
@@ -22,7 +23,8 @@ import type {
   RealEndEffectorMode,
   MujocoPreview,
   RealSensePreviewStatus,
-  TrajectoryPoint
+  TrajectoryPoint,
+  TeleopStatus
 } from "./types";
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -50,11 +52,13 @@ const defaultMujocoValidation = (datasetRoot: string, episode: number, fps: numb
 });
 
 export type GuiSnapshot = {
+  deployment: DeploymentProfile;
   gateway: GatewayStatus;
   configSummary: ConfigSummary;
   devices: DeviceStatus[];
   recording: RecordingStatus;
   replay: ReplayStatus;
+  teleop: TeleopStatus;
   annotation: EpisodeAnnotation;
   calibration: CalibrationStatus;
   datasetExport: DatasetExportStatus;
@@ -71,6 +75,12 @@ export class DataCollectionGuiApi {
   private readonly apiBase = import.meta.env.VITE_GUI_API_BASE ?? "";
   private usingRemote = false;
   private snapshot: GuiSnapshot = {
+    deployment: {
+      profile: "thor",
+      label: "Thor Acquisition",
+      capabilities: ["gmsl2", "box", "imu", "tactile", "force_torque", "recording"],
+      defaultRoute: "live-record"
+    },
     gateway: {
       configPath: handheldConfigSummary.configPath,
       pid: null,
@@ -131,6 +141,23 @@ export class DataCollectionGuiApi {
       lastOutput: "",
       mujocoCubeMode: "left",
       mujocoValidation: defaultMujocoValidation(handheldConfigSummary.root, 0, handheldConfigSummary.fps)
+    },
+    teleop: {
+      state: "idle",
+      backend: "mujoco",
+      inputDevice: "spacemouse",
+      robotModel: "fr3_pika_gripper",
+      urdfPath: "src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf",
+      simXmlPath: "src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_scene.xml",
+      targetFrameName: "pika_task_tcp",
+      pid: null,
+      message: "Start the local gateway to run FR3 Pika MuJoCo teleop",
+      command: [],
+      realRobotReady: false,
+      cameraViews: [
+        { id: "external", label: "External", source: "D435I", fps: 30 },
+        { id: "wrist", label: "Wrist", source: "D405", fps: 30 }
+      ]
     },
     annotation: {
       datasetRoot: handheldConfigSummary.root,
@@ -445,6 +472,38 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
+  async startSimTeleop(): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot("/api/teleop/start-sim");
+    if (remote) {
+      return remote;
+    }
+    await wait(180);
+    this.snapshot.teleop = {
+      ...this.snapshot.teleop,
+      state: "error",
+      message: "Gateway unavailable; FR3 MuJoCo teleop must be started by the backend",
+      pid: null
+    };
+    this.log("error", "FR3 MuJoCo teleop blocked because gateway is unavailable");
+    return this.getSnapshot();
+  }
+
+  async stopTeleop(): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot("/api/teleop/stop");
+    if (remote) {
+      return remote;
+    }
+    await wait(120);
+    this.snapshot.teleop = {
+      ...this.snapshot.teleop,
+      state: "idle",
+      pid: null,
+      message: "FR3 Pika teleop stopped"
+    };
+    this.log("warn", "FR3 teleop stop requested");
+    return this.getSnapshot();
+  }
+
   async runCalibration(): Promise<GuiSnapshot> {
     const remote = await this.postRemoteSnapshot("/api/calibration/run");
     if (remote) {
@@ -566,6 +625,11 @@ export class DataCollectionGuiApi {
     } catch {
       return null;
     }
+  }
+
+  teleopCameraUrl(viewId: string): string {
+    const params = new URLSearchParams({ view: viewId, t: Date.now().toString() });
+    return `${this.apiBase}/api/teleop/camera.jpg?${params.toString()}`;
   }
 
   cameraSnapshotUrl(deviceId: string): string {

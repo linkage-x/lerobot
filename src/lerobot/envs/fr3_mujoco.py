@@ -36,7 +36,7 @@ def _default_fr3_urdf_path() -> str:
         / "franka_research3"
         / "assets"
         / "franka_fr3"
-        / "fr3_pika_gripper_ati.urdf"
+        / "fr3_pika_gripper.urdf"
     )
 
 
@@ -47,7 +47,7 @@ def _default_fr3_sim_xml_path() -> str:
         / "franka_research3"
         / "assets"
         / "franka_fr3"
-        / "fr3_pika_ati_scene.xml"
+        / "fr3_pika_gripper_scene.xml"
     )
 
 
@@ -70,23 +70,10 @@ class FR3MujocoEnvConfig:
         "fr3_joint7",
     )
     gripper_joint_names: tuple[str, str] = ("gripper_left_joint", "gripper_right_joint")
-    camera_names: tuple[str, ...] = (
-        "third_person",
-        "north_east",
-        "side",
-        "west",
-        "south_west",
-        "south_east",
-        "wrist",
-    )
+    camera_names: tuple[str, ...] = ("external", "wrist")
     camera_name_mapping: dict[str, str] = field(
         default_factory=lambda: {
-            "third_person": "third_person_cam",
-            "north_east": "north_east_cam",
-            "side": "side_cam",
-            "west": "west_cam",
-            "south_west": "south_west_cam",
-            "south_east": "south_east_cam",
+            "external": "external_cam",
             "wrist": "ee_cam",
         }
     )
@@ -103,14 +90,22 @@ class FR3MujocoEnvConfig:
     camera_height: int = 256
     camera_width: int = 256
     enable_cameras: bool = False
-    initial_joint_positions: tuple[float, ...] = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
+    initial_joint_positions: tuple[float, ...] = (
+        -0.09534768,
+        0.39794592,
+        -0.23614631,
+        -2.39008542,
+        1.72320219,
+        0.61671872,
+        2.14073504,
+    )
     initial_gripper: float = 1.0
     gripper_sim_steps: int = 640
-    workspace_min: tuple[float, float, float] = (0.2, -0.6, 0.05)
+    workspace_min: tuple[float, float, float] = (0.0, -0.6, 0.05)
     workspace_max: tuple[float, float, float] = (0.9, 0.6, 1.2)
     max_target_delta_pos: tuple[float, float, float] | None = None
     max_target_delta_rot: tuple[float, float, float] | None = None
-    use_otg: bool = True
+    use_otg: bool = False
     arm_actuator_kp: float | None = None
     enable_arm_gravity_compensation: bool = True
     arm_gravity_compensation_scale: float = 0.5
@@ -128,7 +123,7 @@ class FR3MujocoEnvConfig:
     otg_sync_mode: str = "time"
     max_episode_steps: int = 300
     render_mode: str | None = None
-    ik_solver: str = "hirol_lm"
+    ik_solver: str = "mujoco"
     ik_tolerance: float = 1e-6
     ik_max_iterations: int = 200
 
@@ -386,6 +381,17 @@ class FR3MujocoEnv(gym.Env):
         return mujoco
 
     def _build_kinematics(self):
+        if self.cfg.ik_solver == "mujoco":
+            return _MujocoArmKinematics(
+                self._mujoco,
+                self.model,
+                self.cfg.target_frame_name,
+                self._qpos_indices,
+                self._qvel_indices,
+                self._joint_lower,
+                self._joint_upper,
+            )
+
         from lerobot.robots.franka_research3.backends import (
             HirolGaussianNewtonKinematicsDriver,
             HirolLMKinematicsDriver,
@@ -560,7 +566,7 @@ class FR3MujocoEnv(gym.Env):
     def _gripper_ctrl_from_command(self, gripper_command: float) -> float:
         command = float(np.clip(gripper_command, 0.0, 1.0))
         lower, upper = self._gripper_ctrl_range
-        return float(lower + command * (upper - lower))
+        return float(upper + command * (lower - upper))
 
     def _set_gripper_command(self, gripper_command: float, *, simulate: bool = False) -> None:
         with self._physics_lock:
@@ -582,6 +588,10 @@ class FR3MujocoEnv(gym.Env):
                     self._mujoco.mj_step(self.model, self.data)
                 self.data.qpos[self._qpos_indices] = frozen_arm_target
                 self.data.qvel[self._qvel_indices] = 0.0
+                targets = self._gripper_joint_targets_from_command(gripper_command)
+                for key, qpos_index in self._gripper_joint_indices.items():
+                    self.data.qpos[qpos_index] = targets[key]
+                    self.data.qvel[self._gripper_qvel_indices[key]] = 0.0
                 if self._actuator_ids:
                     self.data.ctrl[np.asarray(self._actuator_ids, dtype=np.int64)] = frozen_arm_target
                 self._mujoco.mj_forward(self.model, self.data)
@@ -945,7 +955,7 @@ class FR3MujocoEnv(gym.Env):
         info["sender_steps"] = sender_steps
         return observation, 0.0, terminated, truncated, info
 
-    def _build_observation(self) -> dict[str, np.ndarray]:
+    def _build_observation(self, *, include_camera_obs: bool = True) -> dict[str, np.ndarray]:
         joint_positions = self._get_joint_positions()
         ee_pose = self._current_tcp_pose()
         env_state = np.concatenate([ee_pose[:3, 3], ee_pose[:3, :3].reshape(-1)], dtype=np.float64)

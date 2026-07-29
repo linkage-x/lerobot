@@ -466,7 +466,7 @@ def check_hikrobot_cameras(
 def build_record_command(args: argparse.Namespace) -> str:
     config_path = fr3_record._to_host_path(args.config_path, args.workspace.resolve())
     return (
-        "uv run --python .venv/bin/python python tools/fr3/fr3_record.py "
+        "uv run --python .venv-fr3/bin/python python tools/fr3/fr3_record.py --runtime host "
         f"--config-path {config_path}"
     )
 

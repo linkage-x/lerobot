@@ -18,14 +18,18 @@ from __future__ import annotations
 
 import time
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from lerobot.processor import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ..teleoperator import Teleoperator
+if TYPE_CHECKING:
+    from lerobot.processor import RobotAction
+else:
+    RobotAction = dict[str, Any]
+
 from .backend import PySpaceMouseDriver
 from .configuration_spacemouse import SpaceMouseEnableButton, SpaceMouseTeleopConfig, SpaceMouseToolMode
 

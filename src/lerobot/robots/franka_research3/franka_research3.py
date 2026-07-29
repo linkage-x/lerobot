@@ -19,6 +19,7 @@ from __future__ import annotations
 from functools import cached_property
 import logging
 import threading
+import time
 
 import numpy as np
 
@@ -86,6 +87,7 @@ class FrankaResearch3(Robot):
         self._state_snapshot_lock = threading.Lock()
         self._last_observation_joint_positions_rad: np.ndarray | None = None
         self._last_observation_ee_pose: np.ndarray | None = None
+        self._capture_timestamp_origin_s = time.perf_counter()
 
     @property
     def _joint_names(self) -> list[str]:
@@ -228,6 +230,20 @@ class FrankaResearch3(Robot):
     def is_connected(self) -> bool:
         return self._is_connected
 
+    @property
+    def capture_timestamp_feature_names(self) -> tuple[str, ...]:
+        return (
+            "fr3.arm.capture_timestamp_s",
+            f"{self.config.gripper_backend}_gripper.capture_timestamp_s",
+            *(f"camera.{name}.capture_timestamp_s" for name in self.cameras),
+        )
+
+    def reset_capture_timestamp_origin(self) -> None:
+        self._capture_timestamp_origin_s = time.perf_counter()
+
+    def _relative_capture_timestamp(self, timestamp_s: float) -> float:
+        return float(timestamp_s - self._capture_timestamp_origin_s)
+
     def _make_gripper_driver(self):
         if self.config.gripper_backend == "mock":
             return self.mock_gripper_driver_cls(initial_position=1.0)
@@ -283,6 +299,8 @@ class FrankaResearch3(Robot):
             "target_frame_name": self.config.target_frame_name,
             "joint_names": self.config.joint_names,
         }
+        if self.kinematics_driver_cls is not PlacoKinematicsDriver:
+            return self.kinematics_driver_cls(**kwargs)
         if self.config.ik_solver == "hirol_lm":
             return HirolLMKinematicsDriver(
                 **kwargs,
@@ -373,6 +391,7 @@ class FrankaResearch3(Robot):
         self._kinematics = kinematics
         self._otg = otg
         self._is_connected = True
+        self.reset_capture_timestamp_origin()
         if self._otg is not None:
             self._start_otg_loop(np.asarray(arm.get_joint_positions(), dtype=np.float64))
         try:
@@ -491,10 +510,12 @@ class FrankaResearch3(Robot):
     def get_observation(self, *, include_cameras: bool = True) -> RobotObservation:
         self._raise_if_otg_failed()
         joint_positions_rad = self._read_joint_positions()
+        arm_capture_timestamp_s = time.perf_counter()
         ee_pose = self._compute_ee_pose(joint_positions_rad)
         self._cache_observation_state_snapshot(joint_positions_rad, ee_pose)
         ee_rotvec = Rotation.from_matrix(ee_pose[:3, :3]).as_rotvec()
         gripper_pos = float(self._gripper.get_position())
+        gripper_capture_timestamp_s = time.perf_counter()
 
         observation: RobotObservation = {
             "ee.x": float(ee_pose[0, 3]),
@@ -504,6 +525,10 @@ class FrankaResearch3(Robot):
             "ee.wy": float(ee_rotvec[1]),
             "ee.wz": float(ee_rotvec[2]),
             "gripper.pos": gripper_pos,
+            "fr3.arm.capture_timestamp_s": self._relative_capture_timestamp(arm_capture_timestamp_s),
+            f"{self.config.gripper_backend}_gripper.capture_timestamp_s": self._relative_capture_timestamp(
+                gripper_capture_timestamp_s
+            ),
             **self._make_prev_command_observation(current_ee_pose=ee_pose, current_gripper_pos=gripper_pos),
         }
         for index, joint_position in enumerate(joint_positions_rad, start=1):
@@ -512,8 +537,49 @@ class FrankaResearch3(Robot):
         if callable(get_tactile_observation):
             observation.update(get_tactile_observation())
         if include_cameras:
+            latest_samples: dict[str, tuple[np.ndarray, float]] = {}
             for camera_name, camera in self.cameras.items():
-                observation[camera_name] = camera.read_latest()
+                read_latest_with_timestamp = getattr(camera, "read_latest_with_timestamp", None)
+                if callable(read_latest_with_timestamp):
+                    latest_samples[camera_name] = read_latest_with_timestamp(
+                        max_age_ms=self.config.camera_max_age_ms
+                    )
+                else:
+                    try:
+                        frame = camera.read_latest(max_age_ms=self.config.camera_max_age_ms)
+                    except TypeError as exc:
+                        if "max_age_ms" not in str(exc):
+                            raise
+                        frame = camera.read_latest()
+                    latest_samples[camera_name] = (
+                        frame,
+                        float(getattr(camera, "latest_timestamp", time.perf_counter())),
+                    )
+
+            if latest_samples:
+                reference_timestamp_s = min(timestamp for _frame, timestamp in latest_samples.values())
+                selected_timestamps: list[float] = []
+                for camera_name, camera in self.cameras.items():
+                    read_closest = getattr(camera, "read_closest", None)
+                    if callable(read_closest):
+                        frame, timestamp_s = read_closest(
+                            reference_timestamp_s,
+                            max_age_ms=self.config.camera_max_age_ms,
+                        )
+                    else:
+                        frame, timestamp_s = latest_samples[camera_name]
+                    observation[camera_name] = frame
+                    observation[f"camera.{camera_name}.capture_timestamp_s"] = (
+                        self._relative_capture_timestamp(timestamp_s)
+                    )
+                    selected_timestamps.append(timestamp_s)
+
+                camera_skew_ms = (max(selected_timestamps) - min(selected_timestamps)) * 1e3
+                if camera_skew_ms > self.config.camera_max_skew_ms:
+                    raise RuntimeError(
+                        f"FR3 camera soft-sync skew {camera_skew_ms:.1f} ms exceeds "
+                        f"camera_max_skew_ms={self.config.camera_max_skew_ms:.1f}."
+                    )
         return observation
 
     @check_if_not_connected

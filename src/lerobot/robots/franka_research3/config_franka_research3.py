@@ -77,6 +77,8 @@ class FrankaResearch3Config(RobotConfig):
     damping: list[float] | None = None
     stiffness: list[float] | None = None
     filter_coeff: float | None = None
+    camera_max_age_ms: float = 100.0
+    camera_max_skew_ms: float = 15.0
     use_otg: bool = True
     otg_control_frequency: float = 800.0
     otg_async_control_frequency: float = 1000.0
@@ -120,6 +122,10 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("corenetic_stale_threshold_s must be positive.")
         if self.corenetic_connect_timeout_s <= 0:
             raise ValueError("corenetic_connect_timeout_s must be positive.")
+        if self.camera_max_age_ms <= 0:
+            raise ValueError("camera_max_age_ms must be positive.")
+        if self.camera_max_skew_ms < 0:
+            raise ValueError("camera_max_skew_ms must be non-negative.")
         if self.das_baudrate <= 0:
             raise ValueError("das_baudrate must be positive.")
         if self.das_update_frequency_hz <= 0:

@@ -495,7 +495,6 @@ export function DeviceManagerPage({ snapshot }: { snapshot: GuiSnapshot }) {
 
   const onlineCount = snapshot.devices.filter((d) => d.state === "running").length;
   const errorCount = snapshot.devices.filter((d) => d.state === "error").length;
-
   const kindLabel = (kind: string): string => {
     if (kind === "camera") return snapshot.configSummary.rigType === "gmsl2" ? "GMSL2 Cameras" : "Cameras";
     if (kind === "box_collection") return "BOX Sensors";

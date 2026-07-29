@@ -18,16 +18,14 @@ def test_get_env_observation_includes_camera_images():
         "ee_pose": np.eye(4, dtype=np.float64),
         "joint_positions": np.zeros(7, dtype=np.float64),
         "camera_obs": {
-            "third_person": np.zeros((480, 640, 3), dtype=np.uint8),
-            "side": np.ones((480, 640, 3), dtype=np.uint8),
+            "external": np.zeros((480, 640, 3), dtype=np.uint8),
             "wrist": np.full((480, 640, 3), 2, dtype=np.uint8),
         },
     }
 
     observation = fr3_mujoco_record._get_env_observation(info, gripper_pos=1.0)
 
-    assert observation["third_person"].shape == (480, 640, 3)
-    assert observation["side"][0, 0, 0] == 1
+    assert observation["external"].shape == (480, 640, 3)
     assert observation["wrist"][0, 0, 0] == 2
 
 

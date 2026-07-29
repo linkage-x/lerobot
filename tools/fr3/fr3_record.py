@@ -387,9 +387,10 @@ def build_host_command(
 
 
 def _host_python_executable(workspace: Path) -> Path:
-    candidate = workspace.resolve() / ".venv" / "bin" / "python"
-    if candidate.exists():
-        return candidate
+    for name in (".venv-fr3", ".venv"):
+        candidate = workspace.resolve() / name / "bin" / "python"
+        if candidate.exists():
+            return candidate
     return Path(sys.executable)
 
 
@@ -405,13 +406,12 @@ def _prepend_env_paths(env: dict[str, str], key: str, values: list[str]) -> None
 
 
 def _discover_cmeel_prefix_lib(workspace: Path) -> str | None:
-    venv_lib = workspace.resolve() / ".venv" / "lib"
-    if not venv_lib.exists():
-        return None
-    matches = sorted(venv_lib.glob("python*/site-packages/cmeel.prefix/lib"))
-    if not matches:
-        return None
-    return str(matches[0])
+    for name in (".venv-fr3", ".venv"):
+        venv_lib = workspace.resolve() / name / "lib"
+        matches = sorted(venv_lib.glob("python*/site-packages/cmeel.prefix/lib"))
+        if matches:
+            return str(matches[0])
+    return None
 
 
 def _discover_host_gen_con_sdk_root() -> str | None:

@@ -214,44 +214,6 @@ def render_camera_grid(
     return grid
 
 
-def _camera_stream_index_html() -> str:
-    return """<!DOCTYPE html>
-<html>
-<head>
-  <title>Camera Stream</title>
-  <style>
-    body { margin: 0; background: #000; display: flex; align-items: center; justify-content: center; height: 100vh; overflow: hidden; }
-    canvas { max-width: 100vw; max-height: 100vh; }
-  </style>
-</head>
-<body>
-  <canvas id="c"></canvas>
-  <script>
-    var canvas = document.getElementById('c');
-    var ctx = canvas.getContext('2d');
-    var img = new Image();
-    var w = 0, h = 0;
-
-    img.onload = function() {
-      if (w !== img.width || h !== img.height) {
-        w = img.width;
-        h = img.height;
-        canvas.width = w;
-        canvas.height = h;
-      }
-      ctx.drawImage(img, 0, 0, w, h);
-    };
-
-    function update() {
-      img.src = 'grid.jpg?t=' + Date.now();
-    }
-    update();
-    setInterval(update, 33);
-  </script>
-</body>
-</html>"""
-
-
 def _encode_grid_jpeg(grid: np.ndarray, cv2_module) -> bytes:
     ok, encoded = cv2_module.imencode(".jpg", cv2_module.cvtColor(grid, cv2_module.COLOR_RGB2BGR))
     if not ok:
@@ -280,48 +242,27 @@ def _start_camera_stream_outputs(
     camera_width: int,
     camera_height: int,
     camera_names: tuple[str, ...],
-) -> tuple[Any, _LatestCameraFrame, Any | None]:
+) -> tuple[Any, dict[str, _LatestCameraFrame]]:
     import http.server
     import socketserver
 
     import cv2
 
-    latest_frame = _LatestCameraFrame()
-    rows, cols = _camera_grid_layout(len(camera_names))
-    blank_grid = np.zeros((camera_height * rows, camera_width * cols, 3), dtype=np.uint8)
-    latest_frame.set(_encode_grid_jpeg(blank_grid, cv2))
-
-    try:
-        import pygame
-
-        pygame.init()
-        screen = pygame.display.set_mode((camera_width * cols, camera_height * rows))
-        pygame.display.set_caption("Camera Observations")
-    except Exception:
-        pygame = None
-        screen = None
+    blank_frame = np.zeros((camera_height, camera_width, 3), dtype=np.uint8)
+    blank_jpeg = _encode_grid_jpeg(blank_frame, cv2)
+    latest_frames = {camera_name: _LatestCameraFrame(blank_jpeg) for camera_name in camera_names}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             del format, args
 
         def do_GET(self):
-            if self.path == "/" or self.path.startswith("/index.html"):
-                body = _camera_stream_index_html().encode("utf-8")
-                try:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-                    self.send_header("Expires", "0")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-                return
-
-            if self.path.startswith("/grid.jpg"):
-                payload = latest_frame.get()
+            path = self.path.partition("?")[0]
+            prefix = "/camera/"
+            if path.startswith(prefix) and path.endswith(".jpg"):
+                camera_name = path[len(prefix) : -len(".jpg")]
+                frame = latest_frames.get(camera_name)
+                payload = frame.get() if frame is not None else None
                 if payload is None:
                     self.send_error(503, "Camera frame not ready")
                     return
@@ -336,17 +277,17 @@ def _start_camera_stream_outputs(
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 return
-
             self.send_error(404)
 
     class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         allow_reuse_address = True
         daemon_threads = True
 
-    http_server = ThreadedTCPServer(("", 18765), Handler)
+    http_server = ThreadedTCPServer(("127.0.0.1", 18765), Handler)
     threading.Thread(target=http_server.serve_forever, daemon=True).start()
-    print(f"Camera stream: http://localhost:18765/ ({rows}x{cols} grid)")
-    return http_server, latest_frame, screen
+    paths = ", ".join(f"/camera/{name}.jpg" for name in camera_names)
+    print(f"Camera streams: http://127.0.0.1:18765 [{paths}]")
+    return http_server, latest_frames
 
 
 def _run_control_loop(
@@ -430,8 +371,7 @@ def run_sim_teleop_loop(
         viewer.sync()
 
     http_server = None
-    latest_frame = None
-    screen = None
+    latest_frames = None
     camera_renderer = None
     camera_render_data = None
     cv2_module = None
@@ -445,7 +385,7 @@ def run_sim_teleop_loop(
         import cv2
 
         cv2_module = cv2
-        http_server, latest_frame, screen = _start_camera_stream_outputs(
+        http_server, latest_frames = _start_camera_stream_outputs(
             camera_width=camera_width,
             camera_height=camera_height,
             camera_names=tuple(env.cfg.camera_names),
@@ -509,7 +449,7 @@ def run_sim_teleop_loop(
             viewer.sync()
             next_viewer_sync = now + viewer_period_s
 
-        if render_cameras and camera_renderer is not None and camera_render_data is not None and latest_frame is not None and now >= next_camera_render:
+        if render_cameras and camera_renderer is not None and camera_render_data is not None and latest_frames is not None and now >= next_camera_render:
             env.copy_visual_state(camera_render_data)
             camera_obs = _render_camera_frames(
                 mujoco=env._mujoco,
@@ -518,21 +458,8 @@ def run_sim_teleop_loop(
                 camera_names=tuple(env.cfg.camera_names),
                 camera_name_mapping=dict(env.cfg.camera_name_mapping),
             )
-            grid = render_camera_grid(camera_obs, camera_width, camera_height, tuple(env.cfg.camera_names))
-            latest_frame.set(_encode_grid_jpeg(grid, cv2_module))
-            if screen is not None:
-                try:
-                    import pygame
-
-                    surf = pygame.surfarray.make_surface(np.transpose(grid, (1, 0, 2)))
-                    screen.fill((0, 0, 0))
-                    screen.blit(surf, (0, 0))
-                    pygame.display.flip()
-                    for event in pygame.event.get():
-                        if event.type == pygame.QUIT:
-                            stop_event.set()
-                except Exception:
-                    screen = None
+            for camera_name, frame in camera_obs.items():
+                latest_frames[camera_name].set(_encode_grid_jpeg(frame, cv2_module))
             next_camera_render = now + camera_period_s
 
         sleep_s = 0.001
@@ -557,7 +484,7 @@ def run_sim_teleop_loop(
             update_passive_viewer_markers(env._mujoco, viewer, info, marker_style)
         viewer.sync()
 
-    if render_cameras and camera_renderer is not None and camera_render_data is not None and latest_frame is not None:
+    if render_cameras and camera_renderer is not None and camera_render_data is not None and latest_frames is not None:
         env.copy_visual_state(camera_render_data)
         camera_obs = _render_camera_frames(
             mujoco=env._mujoco,
@@ -566,18 +493,8 @@ def run_sim_teleop_loop(
             camera_names=tuple(env.cfg.camera_names),
             camera_name_mapping=dict(env.cfg.camera_name_mapping),
         )
-        grid = render_camera_grid(camera_obs, camera_width, camera_height, tuple(env.cfg.camera_names))
-        latest_frame.set(_encode_grid_jpeg(grid, cv2_module))
-        if screen is not None:
-            try:
-                import pygame
-
-                surf = pygame.surfarray.make_surface(np.transpose(grid, (1, 0, 2)))
-                screen.fill((0, 0, 0))
-                screen.blit(surf, (0, 0))
-                pygame.display.flip()
-            except Exception:
-                screen = None
+        for camera_name, frame in camera_obs.items():
+            latest_frames[camera_name].set(_encode_grid_jpeg(frame, cv2_module))
 
     if http_server is not None:
         http_server.shutdown()
@@ -586,10 +503,6 @@ def run_sim_teleop_loop(
             server_close()
     if camera_renderer is not None:
         camera_renderer.close()
-    if screen is not None:
-        import pygame
-        pygame.quit()
-
     info = dict(info)
     info["loop_steps"] = loop_steps
     return info

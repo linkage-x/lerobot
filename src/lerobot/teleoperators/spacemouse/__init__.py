@@ -15,6 +15,12 @@
 # limitations under the License.
 
 from .configuration_spacemouse import SpaceMouseTeleopConfig
-from .teleop_spacemouse import SpaceMouseTeleop
 
 __all__ = ["SpaceMouseTeleop", "SpaceMouseTeleopConfig"]
+
+def __getattr__(name: str):
+    if name == "SpaceMouseTeleop":
+        from .teleop_spacemouse import SpaceMouseTeleop
+
+        return SpaceMouseTeleop
+    raise AttributeError(name)

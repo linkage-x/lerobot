@@ -1124,6 +1124,66 @@ def test_get_observation_skips_cameras_when_disabled(robot):
     assert camera.read_latest_calls == 1
 
 
+def test_get_observation_soft_syncs_cameras_from_frame_history(robot):
+    class TimestampedCamera:
+        def __init__(self, history):
+            self.history = history
+
+        def read_latest_with_timestamp(self, max_age_ms):
+            del max_age_ms
+            return self.history[-1]
+
+        def read_closest(self, timestamp_s, max_age_ms):
+            del max_age_ms
+            return min(self.history, key=lambda sample: abs(sample[1] - timestamp_s))
+
+    robot.connect()
+    robot.reset_capture_timestamp_origin()
+    origin = robot._capture_timestamp_origin_s
+    robot.cameras = {
+        "ee": TimestampedCamera(
+            [
+                (np.full((2, 2, 3), 66, dtype=np.uint8), origin + 0.066),
+                (np.full((2, 2, 3), 100, dtype=np.uint8), origin + 0.100),
+            ]
+        ),
+        "wrist": TimestampedCamera(
+            [(np.full((2, 2, 3), 72, dtype=np.uint8), origin + 0.072)]
+        ),
+    }
+
+    observation = robot.get_observation()
+
+    assert int(observation["ee"][0, 0, 0]) == 66
+    assert int(observation["wrist"][0, 0, 0]) == 72
+    assert observation["camera.ee.capture_timestamp_s"] == pytest.approx(0.066)
+    assert observation["camera.wrist.capture_timestamp_s"] == pytest.approx(0.072)
+
+
+def test_get_observation_rejects_camera_skew_above_threshold(robot):
+    class TimestampedCamera:
+        def __init__(self, timestamp_s):
+            self.timestamp_s = timestamp_s
+
+        def read_latest_with_timestamp(self, max_age_ms):
+            del max_age_ms
+            return np.zeros((2, 2, 3), dtype=np.uint8), self.timestamp_s
+
+        def read_closest(self, timestamp_s, max_age_ms):
+            del timestamp_s, max_age_ms
+            return np.zeros((2, 2, 3), dtype=np.uint8), self.timestamp_s
+
+    robot.connect()
+    origin = robot._capture_timestamp_origin_s
+    robot.cameras = {
+        "ee": TimestampedCamera(origin + 0.100),
+        "wrist": TimestampedCamera(origin + 0.120),
+    }
+
+    with pytest.raises(RuntimeError, match="camera soft-sync skew 20.0 ms"):
+        robot.get_observation()
+
+
 def test_get_observation_uses_kinematics_target_frame_even_if_arm_reports_pose(monkeypatch):
     monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", ReportingArmDriver)
     monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)

@@ -1,6 +1,13 @@
 export type ServiceState = "offline" | "idle" | "running" | "warning" | "error";
 
-export type DeviceKind = "camera" | "tactile" | "handheld_gripper" | "box_collection";
+export type DeploymentProfile = {
+  profile: "thor" | "workstation";
+  label: string;
+  capabilities: string[];
+  defaultRoute: string;
+};
+
+export type DeviceKind = "camera" | "tactile" | "handheld_gripper" | "box_collection" | "robot" | "teleoperator";
 
 export type DeviceStatus = {
   id: string;
@@ -103,6 +110,29 @@ export type RecordingStatus = {
   // rapid bursts (Phase 1 spawn × 11, parallel retry, etc.) don't get
   // collapsed into the last line that happened to land at poll time.
   recentOutput?: string[];
+};
+
+export type TeleopCameraView = {
+  id: string;
+  label: string;
+  source: string;
+  fps: number;
+};
+
+export type TeleopStatus = {
+  state: "idle" | "running" | "error" | "starting" | "stopped";
+  backend: "mujoco" | "real";
+  inputDevice: "spacemouse" | string;
+  robotModel: string;
+  urdfPath: string;
+  simXmlPath: string;
+  targetFrameName: string;
+  pid?: number | null;
+  message: string;
+  lastOutput?: string;
+  command?: string[];
+  realRobotReady?: boolean;
+  cameraViews?: TeleopCameraView[];
 };
 
 export type ReplayStatus = {
