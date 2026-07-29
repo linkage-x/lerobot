@@ -65,10 +65,18 @@ class PySpaceMouseDriver:
             {"device_index": self.device_id},
             {"device": device, "DeviceNumber": self.device_id},
         )
+        # A TypeError only means this pyspacemouse version has a different `open()`
+        # signature, so keep trying the other forms. Any other failure is the real
+        # reason the device would not open; remember it for the connect() message
+        # instead of letting a raw easyhid traceback escape.
+        self._open_error: Exception | None = None
         for kwargs in open_candidates:
             try:
                 opened = self._pyspacemouse.open(**kwargs)
             except TypeError:
+                continue
+            except Exception as exc:  # noqa: BLE001 - reported by connect()
+                self._open_error = exc
                 continue
             if opened is not None:
                 return opened
@@ -82,12 +90,44 @@ class PySpaceMouseDriver:
             raise ConnectionError(f"SpaceMouse device index {self.device_id} out of range for {len(devices)} devices.")
         self._device = self._open_device(devices[self.device_id])
         if self._device is None:
-            raise ConnectionError(f"Could not open SpaceMouse device {self.device_id}.")
+            hint = (
+                "The HID device is enumerated but could not be opened. It is usually already "
+                "held by another process (stop any running teleop first), or the hidraw node is "
+                "not readable by this user."
+            )
+            reason = f" Last open error: {self._open_error!r}." if self._open_error is not None else ""
+            raise ConnectionError(f"Could not open SpaceMouse device {self.device_id}. {hint}{reason}")
 
     def disconnect(self) -> None:
         if self._device is not None:
             self._device.close()
             self._device = None
+
+    def describe(self) -> str:
+        """Report the detected model and its button map.
+
+        `poll()` reads the gripper buttons as `state.buttons[0]` and `[1]`, but which
+        physical button lands at those indices comes from the pyspacemouse device
+        profile, not from the puck. A model whose profile declares fewer than two
+        buttons, or declares something other than LEFT/RIGHT first, silently breaks
+        gripper control while motion keeps working, so surface the map explicitly.
+        """
+        if self._device is None:
+            return "SpaceMouse backend is not connected."
+        info = getattr(self._device, "info", None)
+        model = getattr(info, "name", None) or getattr(self._device, "name", "<unknown>")
+        button_names = tuple(getattr(info, "button_names", ()) or ())
+        if not button_names:
+            button_count = len(getattr(info, "button_specs", ()) or ())
+            button_names = tuple(f"BUTTON_{index}" for index in range(button_count))
+        mapping = ", ".join(f"[{index}]={name}" for index, name in enumerate(button_names)) or "<none>"
+        summary = f"model={model} buttons={len(button_names)} map={mapping}"
+        if len(button_names) < 2:
+            summary += (
+                "  WARNING: gripper control needs buttons [0] and [1]; "
+                "this profile cannot drive the gripper."
+            )
+        return summary
 
     def poll(self) -> SpaceMouseReading | None:
         if self._device is None:

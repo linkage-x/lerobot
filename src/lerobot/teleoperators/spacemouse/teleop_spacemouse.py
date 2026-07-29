@@ -54,8 +54,6 @@ class SpaceMouseTeleop(Teleoperator):
         self._driver = None
         self._is_connected = False
         self._motion_active = False
-        self._last_active_motion_data = np.zeros(6, dtype=np.float64)
-        self._peak_active_motion_data = np.zeros(6, dtype=np.float64)
         self._last_gripper = float(np.clip(config.initial_gripper, 0.0, 1.0))
         self._last_gripper_update = 0.0
         self._filtered_gripper = self._last_gripper
@@ -353,66 +351,11 @@ class SpaceMouseTeleop(Teleoperator):
     def sync_tool_activity_baseline(self, normalized_command: float) -> float:
         return self.sync_gripper_baseline(normalized_command)
 
-    def _should_truncate_release_decay(self, data: np.ndarray, threshold: np.ndarray) -> bool:
-        previous = self._last_active_motion_data
-        previous_abs = np.abs(previous)
-        if not np.any(previous_abs > 0.0):
-            return False
-
-        current_abs = np.abs(data)
-        peak_abs = np.maximum(self._peak_active_motion_data, previous_abs)
-        dominant_axis = int(np.argmax(peak_abs))
-        dominant_peak = peak_abs[dominant_axis]
-        # pyspacemouse release decay often follows moderate motions too, not just
-        # very large peaks. Requiring a 5x-threshold peak misses those cases and
-        # lets the arm keep drifting after the puck is released.
-        if dominant_peak < threshold[dominant_axis] * 2.5:
-            return False
-
-        active_axes = previous_abs > 0.0
-        same_direction_or_zero = np.all(
-            (np.sign(data[active_axes]) == np.sign(previous[active_axes])) | np.isclose(current_abs[active_axes], 0.0)
-        )
-        if not same_direction_or_zero:
-            return False
-
-        previous_norm = float(np.linalg.norm(previous_abs[active_axes]))
-        current_norm = float(np.linalg.norm(current_abs[active_axes]))
-        dominant_axis_was_plateaued = previous_abs[dominant_axis] >= dominant_peak * 0.6
-        dominant_axis_collapsed = (
-            current_abs[dominant_axis] <= previous_abs[dominant_axis] * 0.8
-            and current_abs[dominant_axis] <= dominant_peak * 0.6
-        )
-        overall_energy_collapsed = current_norm <= previous_norm * 0.85
-        return bool(dominant_axis_was_plateaued and dominant_axis_collapsed and overall_energy_collapsed)
-
-    def _update_release_decay_state(self, *, motion_enabled: bool, data: np.ndarray | None = None) -> None:
-        if not motion_enabled or data is None:
-            self._last_active_motion_data.fill(0.0)
-            self._peak_active_motion_data.fill(0.0)
-            return
-
-        current = np.asarray(data, dtype=np.float64)
-        current_abs = np.abs(current)
-        previous = self._last_active_motion_data
-        previous_abs = np.abs(previous)
-        active_axes = previous_abs > 0.0
-        continuing_same_direction = bool(
-            np.any(active_axes)
-            and np.all((np.sign(current[active_axes]) == np.sign(previous[active_axes])) | np.isclose(current_abs[active_axes], 0.0))
-        )
-        if continuing_same_direction:
-            self._peak_active_motion_data = np.maximum(self._peak_active_motion_data, current_abs)
-        else:
-            self._peak_active_motion_data = current_abs.copy()
-        self._last_active_motion_data = current
-
     @check_if_not_connected
     def get_action(self) -> RobotAction:
         reading = self._driver.poll()
         if reading is None:
             self._motion_active = False
-            self._update_release_decay_state(motion_enabled=False)
             # Log if enabled output just went True->False (transition to stop)
             if self._prev_enabled_out and not self._prev_enabled_out:  # was True, now False
                 pass  # transition already logged below
@@ -445,7 +388,6 @@ class SpaceMouseTeleop(Teleoperator):
         if not motion_enabled:
             self._update_gripper(button_0, button_1)
             self._filter_gripper_command(self._last_gripper)
-            self._update_release_decay_state(motion_enabled=False)
             enabled_out = False
             self._prev_motion_detected = motion_detected
             self._prev_motion_enabled = motion_enabled
@@ -459,7 +401,6 @@ class SpaceMouseTeleop(Teleoperator):
 
         self._update_gripper(button_0, button_1)
         filtered_gripper = self._filter_gripper_command(self._last_gripper)
-        self._update_release_decay_state(motion_enabled=True, data=data)
         enabled_out = True
         self._prev_motion_detected = motion_detected
         self._prev_motion_enabled = motion_enabled
@@ -491,8 +432,6 @@ class SpaceMouseTeleop(Teleoperator):
             self._driver = None
             self._is_connected = False
             self._motion_active = False
-            self._last_active_motion_data.fill(0.0)
-            self._peak_active_motion_data.fill(0.0)
             self._last_button_raw = None
             self._debounced_buttons.fill(0.0)
             self._button_change_time = 0.0
