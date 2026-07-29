@@ -286,6 +286,7 @@ class PikaGripperHardwareDriver:
     command_rate_limit_hz: float | None = 15.0
     command_deadband_mm: float = 0.5
     enable_settle_s: float = 0.5
+    telemetry_timeout_s: float = 2.0
 
     def __post_init__(self):
         _silence_pika_logs()
@@ -303,6 +304,43 @@ class PikaGripperHardwareDriver:
         self._last_command_time_s: float | None = None
         self._pending_command_width_mm: float | None = None
 
+    def has_telemetry(self) -> bool:
+        """Whether the SDK has parsed at least one gripper frame off the serial link.
+
+        `Gripper.connect()` only opens the serial port and `enable()` only writes bytes
+        into it, so both succeed against *any* serial device -- a different CH340
+        adapter, or the gripper at the wrong baud rate. Until a frame carrying `motor`
+        is parsed, `get_gripper_distance()` keeps returning the SDK's initial 0.0 and
+        every commanded position is written into the void.
+        """
+        if self._gripper is None:
+            return False
+        latest = getattr(getattr(self._gripper, "serial_comm", None), "latest_data", None)
+        motor_status = getattr(self._gripper, "motor_status", None)
+        if not isinstance(latest, dict) and not isinstance(motor_status, dict):
+            # Nothing to introspect (SDK layout changed, or a stand-in object). Fail open:
+            # this gate is a diagnostic, and must not reject a working gripper.
+            return True
+        if isinstance(latest, dict) and "motor" in latest:
+            return True
+        if isinstance(motor_status, dict):
+            try:
+                return float(motor_status.get("Voltage", 0.0)) > 0.0
+            except (TypeError, ValueError):
+                return False
+        return False
+
+    def _wait_for_telemetry(self) -> bool:
+        if self.has_telemetry():
+            return True
+        deadline = time.perf_counter() + float(self.telemetry_timeout_s)
+        while True:
+            time.sleep(0.05)
+            if self.has_telemetry():
+                return True
+            if time.perf_counter() >= deadline:
+                return False
+
     def connect(self) -> None:
         self._gripper = self._gripper_cls(self.serial_port)
         if not self._gripper.connect():
@@ -311,6 +349,15 @@ class PikaGripperHardwareDriver:
             raise ConnectionError("Could not enable the Pika gripper.")
         if self.enable_settle_s > 0.0:
             time.sleep(float(self.enable_settle_s))
+        if self.telemetry_timeout_s > 0.0 and not self._wait_for_telemetry():
+            self.disconnect()
+            raise ConnectionError(
+                f"Opened {self.serial_port} but no Pika gripper telemetry arrived within "
+                f"{self.telemetry_timeout_s:.1f}s. The port opens for any serial device, so this "
+                "usually means it is not the gripper (several CH340 adapters expose the same "
+                "usb-1a86_USB_Serial by-id name), the gripper is unpowered, or the baud rate is "
+                "wrong. Readback would stay pinned at 0.0 mm and every command would be ignored."
+            )
 
     def disconnect(self) -> None:
         if self._gripper is not None:
@@ -323,11 +370,18 @@ class PikaGripperHardwareDriver:
         self._last_command_time_s = None
         self._pending_command_width_mm = None
 
-    def get_position(self) -> float:
+    def get_width_mm(self) -> float:
+        """Raw gripper opening in millimetres, before normalization and clipping.
+
+        `get_position()` clips into [0, 1], which hides a `max_width_mm` that does not
+        match the hardware; diagnostics need the unclipped reading.
+        """
         if self._gripper is None:
             raise RuntimeError("Gripper backend is not connected.")
-        width_mm = float(self._gripper.get_gripper_distance())
-        return float(np.clip(width_mm / self.max_width_mm, 0.0, 1.0))
+        return float(self._gripper.get_gripper_distance())
+
+    def get_position(self) -> float:
+        return float(np.clip(self.get_width_mm() / self.max_width_mm, 0.0, 1.0))
 
     def set_position(self, normalized_position: float) -> None:
         if self._gripper is None:

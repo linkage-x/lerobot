@@ -342,6 +342,128 @@ def test_pika_gripper_hardware_driver_deduplicates_and_rate_limits(monkeypatch):
     assert FakeSDKGripper.instances[-1].set_gripper_distance_calls == [20.0, 40.0]
 
 
+def _make_fake_pika_sdk(latest_data: dict, voltage: float = 0.0):
+    """Fake Gripper whose connect()/enable() succeed like the real SDK's always do."""
+
+    class FakeSDKGripper:
+        instances: list["FakeSDKGripper"] = []
+
+        def __init__(self, port):
+            self.port = port
+            self.serial_comm = types.SimpleNamespace(latest_data=dict(latest_data))
+            self.motor_status = {"Voltage": voltage}
+            self.disconnected = False
+            type(self).instances.append(self)
+
+        def connect(self):
+            return True
+
+        def enable(self):
+            return True
+
+        def disable(self):
+            return True
+
+        def disconnect(self):
+            self.disconnected = True
+
+        def get_gripper_distance(self):
+            return 0.0
+
+        def set_gripper_distance(self, width_mm):
+            del width_mm
+
+    return FakeSDKGripper
+
+
+def test_pika_gripper_connect_rejects_a_port_with_no_gripper_telemetry(monkeypatch):
+    # Gripper.connect() only opens the serial port and enable() only writes bytes, so
+    # both succeed against any serial device. Without a parsed frame the readback stays
+    # at the SDK's initial 0.0 and commands are silently dropped, so connect must fail.
+    fake_cls = _make_fake_pika_sdk(latest_data={})
+    monkeypatch.setitem(sys.modules, "pika.gripper", types.SimpleNamespace(Gripper=fake_cls))
+
+    driver = PikaGripperHardwareDriver(
+        serial_port="/dev/ttyUSB80",
+        enable_settle_s=0.0,
+        telemetry_timeout_s=0.1,
+    )
+
+    with pytest.raises(ConnectionError, match="no Pika gripper telemetry"):
+        driver.connect()
+    assert fake_cls.instances[-1].disconnected is True
+
+
+def test_pika_gripper_connect_accepts_a_port_streaming_motor_frames(monkeypatch):
+    fake_cls = _make_fake_pika_sdk(latest_data={"motor": {"Position": 1.2}})
+    monkeypatch.setitem(sys.modules, "pika.gripper", types.SimpleNamespace(Gripper=fake_cls))
+
+    driver = PikaGripperHardwareDriver(
+        serial_port="/dev/ttyUSB80",
+        enable_settle_s=0.0,
+        telemetry_timeout_s=0.1,
+    )
+    driver.connect()
+
+    assert driver.has_telemetry() is True
+    driver.disconnect()
+
+
+def test_pika_gripper_connect_accepts_bus_voltage_as_proof_of_life(monkeypatch):
+    # Some frames carry motorstatus without motor; a non-zero bus voltage still proves
+    # the link is really talking to a powered gripper.
+    fake_cls = _make_fake_pika_sdk(latest_data={"motorstatus": {}}, voltage=24.0)
+    monkeypatch.setitem(sys.modules, "pika.gripper", types.SimpleNamespace(Gripper=fake_cls))
+
+    driver = PikaGripperHardwareDriver(
+        serial_port="/dev/ttyUSB80",
+        enable_settle_s=0.0,
+        telemetry_timeout_s=0.1,
+    )
+    driver.connect()
+
+    assert driver.has_telemetry() is True
+    driver.disconnect()
+
+
+def test_pika_gripper_skips_the_telemetry_gate_when_it_cannot_introspect(monkeypatch):
+    # A stand-in SDK object exposes neither serial_comm nor motor_status; the gate is a
+    # diagnostic and must fail open rather than reject a working gripper.
+    class BareSDKGripper:
+        def __init__(self, port):
+            self.port = port
+
+        def connect(self):
+            return True
+
+        def enable(self):
+            return True
+
+        def disable(self):
+            return True
+
+        def disconnect(self):
+            pass
+
+        def get_gripper_distance(self):
+            return 0.0
+
+        def set_gripper_distance(self, width_mm):
+            del width_mm
+
+    monkeypatch.setitem(sys.modules, "pika.gripper", types.SimpleNamespace(Gripper=BareSDKGripper))
+
+    driver = PikaGripperHardwareDriver(
+        serial_port="/dev/ttyUSB80",
+        enable_settle_s=0.0,
+        telemetry_timeout_s=0.1,
+    )
+    driver.connect()
+
+    assert driver.has_telemetry() is True
+    driver.disconnect()
+
+
 def test_pika_gripper_hardware_driver_skips_small_target_changes(monkeypatch):
     class FakeSDKGripper:
         instances: list["FakeSDKGripper"] = []
