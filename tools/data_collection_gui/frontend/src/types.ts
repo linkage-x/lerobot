@@ -110,7 +110,17 @@ export type RecordingStatus = {
   // rapid bursts (Phase 1 spawn × 11, parallel retry, etc.) don't get
   // collapsed into the last line that happened to land at poll time.
   recentOutput?: string[];
+  // Workstation profile: which robot the recorder is driving.
+  backend?: RecordingBackend;
+  // Verdict of the per-episode capture-timestamp audit. "unknown" until the first episode is
+  // saved; "unavailable" when the audit itself could not run.
+  syncStatus?: "unknown" | "pass" | "fail" | "unavailable";
+  syncSummary?: string;
+  syncReportPath?: string;
+  syncWarnings?: string[];
 };
+
+export type RecordingBackend = "real" | "sim";
 
 export type TeleopCameraView = {
   id: string;

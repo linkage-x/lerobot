@@ -224,8 +224,13 @@ export class DataCollectionGuiApi {
     return structuredClone(this.snapshot);
   }
 
-  async connectRecording(): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot("/api/handheld/record/connect");
+  async connectRecording(backend?: "real" | "sim"): Promise<GuiSnapshot> {
+    // The workstation profile picks between the hardware FR3 and its MuJoCo twin here; the
+    // Thor profile has a single rig and sends no backend at all.
+    const endpoint = backend
+      ? `/api/handheld/record/connect?backend=${encodeURIComponent(backend)}`
+      : "/api/handheld/record/connect";
+    const remote = await this.postRemoteSnapshot(endpoint);
     if (remote) {
       return remote;
     }
@@ -845,8 +850,13 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async exportApprovedDataset(path: string): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot(`/api/datasets/export?path=${encodeURIComponent(path)}`);
+  async exportApprovedDataset(path: string, actionMode?: string): Promise<GuiSnapshot> {
+    // The workstation profile reuses this endpoint to build a training view, and picks the
+    // action contract with actionMode; Thor sends none and gets the raw->v3 consolidation.
+    const query = actionMode
+      ? `?path=${encodeURIComponent(path)}&action_mode=${encodeURIComponent(actionMode)}`
+      : `?path=${encodeURIComponent(path)}`;
+    const remote = await this.postRemoteSnapshot(`/api/datasets/export${query}`);
     if (remote) {
       return remote;
     }

@@ -68,6 +68,7 @@ const navGroups: NavGroup[] = [
 
 const workstationPageIds = new Set<PageId>([
   "teleoperation",
+  "live-record",
   "device-manager",
   "dataset-processing",
   "episode-replay",
@@ -250,7 +251,7 @@ function App() {
       <LiveRecordPage
         snapshot={snapshot}
         busy={busy}
-        onConnect={() => run(() => api.connectRecording())}
+        onConnect={(backend) => run(() => api.connectRecording(backend))}
         onStart={() => run(() => api.startRecording())}
         onStop={(action) => run(() => api.stopRecording(action))}
         onOpenInReplay={() => selectAndOpenReplay(latestRecordedPath)}
@@ -293,7 +294,7 @@ function App() {
         snapshot={snapshot}
         busy={busy}
         onExportTask={exportTaskWithQcGuard}
-        onExportApprovedDataset={(path) => run(() => api.exportApprovedDataset(path))}
+        onExportApprovedDataset={(path, actionMode) => run(() => api.exportApprovedDataset(path, actionMode))}
         onOpenProcessing={() => navigate("dataset-processing")}
         onOpenReplay={(path) => selectAndOpenReplay(path)}
       />

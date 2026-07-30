@@ -31,6 +31,15 @@ from urllib.request import urlopen
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
 DEFAULT_RECORDER_SCRIPT = Path("tools/handheld/handheld_record.py")
+# Gateway-driven FR3 SpaceMouse recorder. Handles both the hardware arm and its MuJoCo twin
+# behind one `--backend` switch, so both produce byte-identical dataset schemas.
+WORKSTATION_RECORDER_SCRIPT = Path("tools/fr3/fr3_gui_record_runtime.py")
+RECORD_BACKENDS = ("real", "sim")
+DEFAULT_RECORD_BACKEND = "real"
+# Action contracts the workstation Training View page can build. Recording always stores
+# absolute EE; the delta contracts are derived offline from consecutive dataset frames.
+TRAINING_VIEW_ACTION_MODES = ("absolute_ee", "delta_ee_from_prev_cmd", "delta_ee_from_current")
+DEFAULT_TRAINING_VIEW_ACTION_MODE = "delta_ee_from_prev_cmd"
 DEFAULT_DATASETS_ROOT = Path("outputs/datasets")
 DEFAULT_EXPORTS_ROOT = Path("outputs/exports")
 DEPLOYMENT_PROFILES: dict[str, dict[str, Any]] = {
@@ -108,6 +117,15 @@ class RecordingStatus:
     # only the most recent one (which is what lastOutput captures and is
     # what was losing 9+ lines per Connect cycle).
     recentOutput: list[str] = field(default_factory=list)
+    # Workstation profile only: which robot the recorder is driving ("real" or "sim").
+    backend: str = DEFAULT_RECORD_BACKEND
+    # Latest per-episode timestamp-synchronisation verdict parsed from the recorder's SYNC
+    # lines. Kept on the recording status (not a separate poll) so the operator sees an
+    # alignment problem on the episode that caused it, while the rig is still set up.
+    syncStatus: str = "unknown"
+    syncSummary: str = ""
+    syncReportPath: str = ""
+    syncWarnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -2591,6 +2609,102 @@ def _copy_approved_v3_dataset_export(
         message=f"Export complete: approved dataset copied to {out_root}",
     )
     state.log("info", f"Exported approved LeRobot v3 dataset {dataset_root} -> {out_root}")
+
+
+def _training_view_command(
+    state: GatewayState, dataset_root: Path, action_mode: str
+) -> tuple[list[str], Path]:
+    """Build the prepare-only training-view command for an FR3 workstation dataset.
+
+    The workstation recorder already writes a LeRobot v3 dataset, so there is no raw->v3 export
+    to run (that is the Thor GMSL2 path). What a workstation operator needs instead is the
+    *training view*: the same episodes with the action column expressed in whichever contract the
+    policy will be trained on. Delta contracts are derived here, by differencing consecutive
+    dataset frames, because a delta computed during capture would span one control tick rather
+    than one frame.
+    """
+    if action_mode not in TRAINING_VIEW_ACTION_MODES:
+        raise ValueError(
+            f"action_mode must be one of {TRAINING_VIEW_ACTION_MODES}, got {action_mode!r}"
+        )
+    if not _has_lerobot_v3_data(dataset_root):
+        raise ValueError(f"{dataset_root.name} is not a LeRobot v3 dataset; nothing to build a view from.")
+    # Cameras and state keys come from the dataset, not from the script's defaults: those
+    # defaults name another rig's cameras (observation.images.cam_1/cam_3) and would fail on
+    # every FR3 recording, which uses the config's own camera keys (ee/side).
+    info = _load_dataset_info(dataset_root) or {}
+    features = info.get("features") if isinstance(info.get("features"), dict) else {}
+    camera_keys = [
+        key
+        for key, feature in features.items()
+        if key.startswith("observation.images.")
+        and isinstance(feature, dict)
+        and feature.get("dtype") in ("video", "image")
+    ]
+    if not camera_keys:
+        raise ValueError(f"{dataset_root.name} has no camera features to build a training view from.")
+
+    view_root = _training_views_root(state) / f"{dataset_root.name}__{action_mode}"
+    command = [
+        str(_venv_python(state.repo_root, prefer_fr3=True)),
+        str(state.repo_root / "tools" / "fr3" / "fr3_train_il_policy.py"),
+        "--dataset-root", str(dataset_root),
+        "--view-root", str(view_root),
+        "--repo-id", f"local/{dataset_root.name}__{action_mode}",
+        "--cameras", ",".join(sorted(camera_keys)),
+        "--state-keys", "observation.state",
+        "--action-mode", action_mode,
+        # The default append selector pulls a handheld-gripper column that FR3 datasets do not
+        # have; the FR3 action already carries its own gripper.
+        "--action-append-selectors", "",
+        "--action-append-names", "",
+        "--overwrite-view",
+        # Build the view only; training is a separate, deliberate step.
+        "--prepare-only",
+    ]
+    return command, view_root
+
+
+def _training_views_root(state: GatewayState) -> Path:
+    root = state.exports_root or (state.repo_root / DEFAULT_EXPORTS_ROOT)
+    return root / "training_views"
+
+
+def _start_training_view(state: GatewayState, raw_path: str, action_mode: str) -> None:
+    """Workstation counterpart of the Thor v3 export: build a policy-ready training view."""
+    if _export_is_running(state):
+        raise RuntimeError("A view build is already running; wait for it to finish.")
+    dataset_root = _resolve_known_dataset(state, raw_path)
+    if dataset_root is None:
+        raise ValueError("Dataset not found in the recorded dataset list.")
+    command, view_root = _training_view_command(state, dataset_root, action_mode)
+    state.export_process = subprocess.Popen(
+        command,
+        cwd=state.repo_root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=_recorder_env(state.repo_root),
+        start_new_session=True,
+    )
+    state.dataset_export = DatasetExportStatus(
+        state="exporting",
+        target=action_mode,
+        datasetRoot=str(dataset_root),
+        outputPath=str(view_root),
+        selectedEpisodes=int(_processing_item_from_dataset(dataset_root).get("totalEpisodes") or 0),
+        totalFrames=0,
+        message=f"Building {action_mode} training view from {dataset_root.name}…",
+        pid=state.export_process.pid,
+    )
+    state.log("info", f"Started {action_mode} training view build {dataset_root} -> {view_root}")
+    Thread(
+        target=_read_export_output,
+        args=(state, state.export_process),
+        daemon=True,
+        name=f"training-view-output-{state.export_process.pid}",
+    ).start()
 
 
 def _start_approved_dataset_export(state: GatewayState, raw_path: str) -> None:
@@ -6352,6 +6466,10 @@ def _recorder_script(state: GatewayState) -> tuple[Path, str]:
             script = state.repo_root / script
         flag = str(raw.get("config_flag") or "--config-path")
         return script, flag
+    if state.profile == "workstation":
+        # The FR3 workstation config is a lerobot RecordConfig, which draccus parses strictly;
+        # it cannot carry a `recorder:` block to point here, so the profile selects the script.
+        return state.repo_root / WORKSTATION_RECORDER_SCRIPT, "--config_path"
     return state.repo_root / DEFAULT_RECORDER_SCRIPT, "--config_path"
 
 
@@ -6525,15 +6643,24 @@ def _box_touch_cali_log_payload(state: GatewayState) -> dict[str, Any]:
         return {"running": state.box_touch_cali_running, "lines": list(state.box_touch_cali_log)}
 
 
-def _connect_recorder(state: GatewayState) -> None:
+def _connect_recorder(state: GatewayState, *, backend: str | None = None) -> None:
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
         return
 
+    is_workstation = state.profile == "workstation"
+    if backend is not None:
+        if backend not in RECORD_BACKENDS:
+            raise ValueError(f"Recording backend must be one of {RECORD_BACKENDS}, got {backend!r}")
+        if not is_workstation and backend != DEFAULT_RECORD_BACKEND:
+            raise ValueError("Only the workstation profile can choose a recording backend")
+        state.recording.backend = backend
+
     config_path = _resolve_recorder_config_path(state)
     recorder_script, config_flag = _recorder_script(state)
     command = [
-        str(_venv_python(state.repo_root)),
+        # The FR3 stack (panda_py, placo, mujoco) lives in .venv-fr3 on the workstation.
+        str(_venv_python(state.repo_root, prefer_fr3=is_workstation)),
         str(recorder_script),
         f"{config_flag}={config_path}",
     ]
@@ -6545,6 +6672,12 @@ def _connect_recorder(state: GatewayState) -> None:
     # the first PLAYING transition deadlocks the Python thread).
     if "thor_record" in str(recorder_script):
         command.append("--skip-argus-probe")
+    env = _recorder_env(state.repo_root)
+    if is_workstation:
+        command.append(f"--backend={state.recording.backend}")
+        if state.recording.backend == "sim":
+            # Headless MuJoCo rendering: the recorder runs detached from any X session.
+            env["MUJOCO_GL"] = "egl"
     recorder_log_path = _new_recorder_log_path(state)
     state.process = subprocess.Popen(
         command,
@@ -6553,7 +6686,7 @@ def _connect_recorder(state: GatewayState) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        env=_recorder_env(state.repo_root),
+        env=env,
         start_new_session=True,
     )
     state.process_started_at_s = time.monotonic()
@@ -6561,7 +6694,17 @@ def _connect_recorder(state: GatewayState) -> None:
     state.recording.pid = state.process.pid
     state.recording.frameIndex = 0
     state.recording.queueDepth = 0
-    state.recording.message = "Connecting handheld devices"
+    state.recording.message = (
+        f"Starting FR3 {state.recording.backend} recorder"
+        if is_workstation
+        else "Connecting handheld devices"
+    )
+    # A new session's alignment verdict starts blank; carrying the previous run's over would
+    # let a stale "pass" vouch for data it never saw.
+    state.recording.syncStatus = "unknown"
+    state.recording.syncSummary = ""
+    state.recording.syncReportPath = ""
+    state.recording.syncWarnings = []
     state.recorder_log_path = recorder_log_path
     _append_line(recorder_log_path, f"# command: {' '.join(command)}")
     _append_line(recorder_log_path, f"# cwd: {state.repo_root}")
@@ -6572,7 +6715,16 @@ def _connect_recorder(state: GatewayState) -> None:
     # Force the first viewer poll of the new session to send a demand heartbeat.
     state.recorder_preview_demand_sent_s = 0.0
     _set_all_device_states(state, "warning")
-    state.log("info", f"Started handheld recorder pid={state.process.pid} log={recorder_log_path}")
+    if is_workstation and state.recording.backend == "sim":
+        # Nothing physical is opened in a sim session. Leaving the hardware rows at "warning"
+        # (the Connect default) would imply the gateway is still waiting on an FR3 that was
+        # never asked to come up; the SpaceMouse row stays in the warning->running flow
+        # because that device really is opened.
+        for device in state.devices:
+            if device.get("kind") in ("robot", "gripper", "camera"):
+                device["state"] = "idle"
+                device["detail"] = "simulated in MuJoCo"
+    state.log("info", f"Started {state.profile} recorder pid={state.process.pid} log={recorder_log_path}")
     _start_output_reader(state, state.process)
 
 
@@ -7250,6 +7402,9 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
             if done:
                 state.box_cali_running = False
         return
+    if output.startswith("SYNC "):
+        _apply_sync_audit_output(state, output.removeprefix("SYNC ").strip())
+        return
     state.recording.lastOutput = output
     state.recording.message = output
     # Append to the ring buffer so the frontend can render every line the
@@ -7273,6 +7428,11 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         ("Tactiles:", "tactile"),
         ("Handheld grippers:", "handheld_gripper"),
         ("Box devices:", "box_collection"),
+        # Workstation FR3 rig: the recorder reports which of these actually came up, so a
+        # sim session never marks the physical arm or gripper as connected.
+        ("Robots:", "robot"),
+        ("Grippers:", "gripper"),
+        ("Teleoperators:", "teleoperator"),
     ):
         if output.startswith(prefix):
             _mark_connected_devices(state, kind, output.removeprefix(prefix).strip())
@@ -7316,6 +7476,49 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         state.recording.frameIndex = 0
     elif "Input stream closed; stopping recording session." in output:
         state.recording.message = "Recorder input closed; finalizing dataset"
+
+
+_SYNC_WARNING_CAP = 12
+
+
+def _apply_sync_audit_output(state: GatewayState, payload: str) -> None:
+    """Fold one ``SYNC ...`` recorder line into the recording status.
+
+    The recorder emits three shapes: a ``status=... skew_p95_ms=...`` digest, a
+    ``report=<path>`` pointer once the on-disk report exists, and ``WARN:``/``bias_...``
+    detail lines. Warnings are kept as warnings on purpose -- an alignment violation must be
+    loudly visible without tearing down a live recording session.
+    """
+    if payload.startswith("report="):
+        state.recording.syncReportPath = payload.removeprefix("report=").strip()
+        state.log("info", f"sync report written: {state.recording.syncReportPath}")
+        return
+    if payload.startswith("WARN:"):
+        warning = payload.removeprefix("WARN:").strip()
+        state.recording.syncWarnings.append(warning)
+        del state.recording.syncWarnings[:-_SYNC_WARNING_CAP]
+        state.log("warn", f"timestamp sync: {warning}")
+        return
+    if payload.startswith("audit unavailable"):
+        state.recording.syncStatus = "unavailable"
+        state.recording.syncSummary = payload
+        state.log("warn", f"timestamp sync: {payload}")
+        return
+    if payload.startswith("bias_vs_arm_ms["):
+        state.log("info", f"timestamp sync: {payload}")
+        return
+
+    fields = dict(
+        item.split("=", 1) for item in payload.split() if "=" in item
+    )
+    status = str(fields.get("status") or "").strip()
+    if status in ("pass", "fail"):
+        # A new episode's verdict supersedes the previous one's warnings.
+        if status == "pass":
+            state.recording.syncWarnings = []
+        state.recording.syncStatus = status
+    state.recording.syncSummary = payload
+    state.log("info" if status == "pass" else "warn", f"timestamp sync: {payload}")
 
 
 def _apply_box_roster(state: GatewayState, roster: list[dict[str, Any]]) -> None:
@@ -7402,7 +7605,34 @@ def _mujoco_replay_python(state: GatewayState) -> Path:
     return thor_python if thor_python.is_file() else _venv_python(state.repo_root)
 
 
+def _fr3_mujoco_replay_command(state: GatewayState, dataset_root: Path) -> list[str]:
+    """Workstation MuJoCo validation: replay the recorded FR3 EE command stream.
+
+    The Thor route tracks AprilTag cubes through a scene; a workstation dataset has no cubes
+    and instead carries the arm's own absolute EE actions, so validation means feeding those
+    back through the simulated arm and scoring the tracking error.
+    """
+    return [
+        str(_venv_python(state.repo_root, prefer_fr3=True)),
+        str(state.repo_root / "tools" / "fr3" / "fr3_gui_replay_runtime.py"),
+        "--dataset",
+        str(dataset_root),
+        "--episode",
+        str(state.replay.episode),
+        "--config-path",
+        str(state.config_path),
+        "--fps",
+        str(state.replay.fps or 30),
+        "--max-position-error-mm",
+        str(DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM),
+        "--max-rotation-error-deg",
+        str(DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG),
+    ]
+
+
 def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: str | None = None) -> list[str]:
+    if state.profile == "workstation":
+        return _fr3_mujoco_replay_command(state, dataset_root)
     selected_cube_mode = str(cube_mode or state.replay.mujocoCubeMode or DEFAULT_MUJOCO_CUBE_MODE)
     if selected_cube_mode not in MUJOCO_CUBE_MODES:
         raise ValueError(f"MuJoCo cube mode must be one of {MUJOCO_CUBE_MODES}, got {selected_cube_mode!r}")
@@ -7752,15 +7982,19 @@ def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CU
     cube_mode = str(cube_mode).strip().lower()
     if cube_mode not in MUJOCO_CUBE_MODES:
         raise ValueError(f"MuJoCo cube mode must be one of {MUJOCO_CUBE_MODES}, got {cube_mode!r}")
-    required_cubes = ("left", "right") if cube_mode == "both" else (cube_mode,)
-    episode_poses = _read_sidecar_cube_poses(dataset_root, state.replay.episode)
-    missing_cubes = [cube for cube in required_cubes if not episode_poses.get(cube)]
-    if missing_cubes:
-        raise RuntimeError(
-            f"Selected dataset episode {state.replay.episode} has no valid generated EE trajectory for: "
-            f"{', '.join(missing_cubes)}. "
-            "Run Generate EE Trajectory first."
-        )
+    if state.profile != "workstation":
+        # Thor validates against AprilTag cube trajectories generated from the camera stream.
+        # A workstation dataset carries the arm's own EE actions instead, so there is no
+        # sidecar to require -- gating on one would make FR3 replay permanently unreachable.
+        required_cubes = ("left", "right") if cube_mode == "both" else (cube_mode,)
+        episode_poses = _read_sidecar_cube_poses(dataset_root, state.replay.episode)
+        missing_cubes = [cube for cube in required_cubes if not episode_poses.get(cube)]
+        if missing_cubes:
+            raise RuntimeError(
+                f"Selected dataset episode {state.replay.episode} has no valid generated EE trajectory for: "
+                f"{', '.join(missing_cubes)}. "
+                "Run Generate EE Trajectory first."
+            )
 
     state.replay.mujocoCubeMode = cube_mode
     command = _mujoco_replay_command(state, dataset_root, cube_mode)
@@ -7792,8 +8026,11 @@ def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CU
     state.replay.frameIndex = 0
     state.replay.datasetRoot = str(dataset_root)
     state.replay.dataset = str(dataset_root)
+    # "cube mode" is a Thor concept; a workstation replay tracks the arm's own EE command
+    # stream, so naming a cube there would describe something that does not exist.
+    replay_subject = "EE command" if state.profile == "workstation" else cube_mode
     state.replay.message = (
-        f"MuJoCo {cube_mode} replay started for {dataset_root.name} episode {state.replay.episode}; "
+        f"MuJoCo {replay_subject} replay started for {dataset_root.name} episode {state.replay.episode}; "
         "waiting for validation metrics"
     )
     state.log(
@@ -8341,15 +8578,17 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         parsed_url = urlparse(self.path)
         path = parsed_url.path
         query = parse_qs(parsed_url.query)
+        # Recording is available in both profiles now: Thor drives the handheld/GMSL2 rig,
+        # the workstation drives the FR3 SpaceMouse recorder. Only the BOX-sensor calibration
+        # endpoints remain Thor-specific, since no BOX exists on the workstation.
         thor_only_paths = {
-            "/api/handheld/record/connect",
-            "/api/handheld/record/start",
-            "/api/handheld/record/stop-save",
-            "/api/handheld/record/stop-discard",
-            "/api/handheld/record/exit",
             "/api/device/calibrate-6dforce",
             "/api/device/calibrate-6dforce-origin",
             "/api/device/calibrate-touch",
+            # Task-scoped v3 consolidation only exists for the multi-session GMSL2 rig; a
+            # workstation dataset is already v3 and uses /api/datasets/export for its
+            # training view instead.
+            "/api/tasks/export",
         }
         if self.server.state.profile != "thor" and path in thor_only_paths:
             _json_response(
@@ -8367,15 +8606,21 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             # or _connect_recorder raising), not just the ones a hand-written
             # except remembered to cover.
             state = self.server.state
+            requested_backend = (query.get("backend", [""])[0] or "").strip().lower() or None
             try:
                 with _previews_suspended_for_connect(state):
                     # Done outside the state lock (terminate() blocks).
                     _stop_all_camera_previews(state)
+                    if state.profile == "workstation":
+                        # The RealSense teleop preview owns the same USB devices the hardware
+                        # recorder is about to open; leaving it up makes the recorder's
+                        # pipeline_start fail with "device busy".
+                        _stop_realsense_preview(state)
                     settle_s = _camera_preview_stagger_s(state)
                     if settle_s > 0:
                         time.sleep(settle_s)
                     with state.lock:
-                        _connect_recorder(state)
+                        _connect_recorder(state, backend=requested_backend)
                         response = _snapshot(state)
                 _json_response(self, HTTPStatus.OK, response)
             except Exception as exc:  # noqa: BLE001
@@ -8599,7 +8844,17 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/datasets/export":
                     requested = (query.get("path", [""])[0] or "").strip()
-                    _start_approved_dataset_export(self.server.state, requested)
+                    if self.server.state.profile == "workstation":
+                        # The workstation recorder already writes v3, so there is no raw->v3
+                        # export here; the equivalent step is building the training view.
+                        _start_training_view(
+                            self.server.state,
+                            requested,
+                            (query.get("action_mode", [DEFAULT_TRAINING_VIEW_ACTION_MODE])[0] or "").strip()
+                            or DEFAULT_TRAINING_VIEW_ACTION_MODE,
+                        )
+                    else:
+                        _start_approved_dataset_export(self.server.state, requested)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
         except Exception as exc:  # noqa: BLE001
