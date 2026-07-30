@@ -611,6 +611,27 @@ class FR3MujocoEnv(gym.Env):
             for key, qpos_index in self._gripper_joint_indices.items()
         }
 
+    def measured_gripper_position(self) -> float:
+        """Normalized (0=closed, 1=open) gripper opening read back from simulated joint state.
+
+        This is the inverse of :pymeth:`_gripper_joint_targets_from_command`, so it lands in the
+        same 0..1 space the hardware gripper drivers report. Recorders must prefer this over
+        ``gripper_command``: the command is what was asked for, this is what the fingers
+        actually did, and only the latter is comparable to a hardware ``gripper.pos``.
+        """
+        openings: list[float] = []
+        for key, qpos_index in self._gripper_joint_indices.items():
+            lower, upper = self._gripper_joint_limits[key]
+            closed = 0.0 if lower <= 0.0 <= upper else (lower if abs(lower) < abs(upper) else upper)
+            open_target = lower if abs(lower) > abs(upper) else upper
+            span = open_target - closed
+            if abs(span) < 1e-12:
+                continue
+            openings.append((float(self.data.qpos[qpos_index]) - closed) / span)
+        if not openings:
+            return float(np.clip(self._last_gripper, 0.0, 1.0))
+        return float(np.clip(np.mean(openings), 0.0, 1.0))
+
     def _has_gripper_table_penetration(self) -> bool:
         if self._table_geom_id < 0:
             return False
@@ -954,6 +975,88 @@ class FR3MujocoEnv(gym.Env):
         info["otg_steps"] = otg_steps
         info["sender_steps"] = sender_steps
         return observation, 0.0, terminated, truncated, info
+
+    def step_absolute_pose(
+        self,
+        target_pose: np.ndarray,
+        *,
+        gripper: float | None = None,
+        control_period_s: float | None = None,
+    ):
+        """Servo to an absolute TCP pose the way the real FR3 driver does.
+
+        :pymeth:`step_target_pose` teleports the arm with ``_set_joint_state`` when OTG is
+        disabled, which skips contact physics and therefore cannot reproduce grasping. This
+        variant always advances a physics window (servo or OTG) so a simulated recording
+        session behaves like the hardware one, and it is the path the MuJoCo-backed
+        ``Robot`` adapter uses for ``send_action``.
+        """
+        target_pose = np.asarray(target_pose, dtype=np.float64).reshape(4, 4)
+        with self._physics_lock:
+            current_joints = self._get_joint_positions()
+            target_joints = np.asarray(
+                self._kinematics.inverse_kinematics(current_joints, target_pose), dtype=np.float64
+            )
+            target_joints = np.clip(target_joints[: len(self.cfg.joint_names)], self._joint_lower, self._joint_upper)
+
+            if self._otg is not None:
+                self._otg_target_joints = target_joints.copy()
+                self._servo_target_joints = None
+                if self.cfg.continuous_physics:
+                    otg_steps, sender_steps = 0, 0
+                else:
+                    otg_steps, sender_steps = self._advance_otg_window(control_period_s)
+            else:
+                self._servo_target_joints = target_joints.copy()
+                self._otg_target_joints = None
+                if self.cfg.continuous_physics:
+                    otg_steps, sender_steps = 0, 0
+                else:
+                    otg_steps, sender_steps = self._advance_servo_window(target_joints, control_period_s)
+
+            if gripper is not None:
+                previous_gripper = self._last_gripper
+                self._last_gripper = float(np.clip(gripper, 0.0, 1.0))
+                if not np.isclose(previous_gripper, self._last_gripper):
+                    self._set_gripper_command(self._last_gripper, simulate=not self.cfg.continuous_physics)
+
+            self._last_command_pose = target_pose.copy()
+            self._target_pose = target_pose.copy()
+            self._reference_pose = target_pose.copy()
+            self._hold_joint_target = None
+            self._prev_enabled = True
+
+            self._step_count += 1
+            info = self._build_info(include_camera_obs=False)
+            info["target_joint_positions"] = target_joints.copy()
+            info["otg_enabled"] = self._otg is not None
+            info["otg_steps"] = otg_steps
+            info["sender_steps"] = sender_steps
+            return info
+
+    def render_with_timestamps(self, *, blocking: bool = True) -> dict[str, tuple[np.ndarray, float]] | None:
+        """Render every configured camera and stamp each frame as it is produced.
+
+        Unlike :pymeth:`render`, the per-camera ``time.perf_counter()`` reading is taken right
+        after that camera's own ``renderer.render()`` call, so the returned timestamps carry
+        the real intra-frame render skew instead of one shared value invented for all cameras.
+        The timestamps are on the same monotonic clock the recorder uses for the arm and
+        gripper reads, which is what makes cross-modality skew auditable.
+        """
+        acquired = self._physics_lock.acquire(blocking=blocking)
+        if not acquired:
+            return None
+        try:
+            renderer = self._get_renderer()
+            frames: dict[str, tuple[np.ndarray, float]] = {}
+            for camera_name in self.cfg.camera_names:
+                model_camera_name = self.cfg.camera_name_mapping.get(camera_name, camera_name)
+                renderer.update_scene(self.data, camera=model_camera_name)
+                frame = np.asarray(renderer.render()).copy()
+                frames[camera_name] = (frame, time.perf_counter())
+            return frames
+        finally:
+            self._physics_lock.release()
 
     def _build_observation(self, *, include_camera_obs: bool = True) -> dict[str, np.ndarray]:
         joint_positions = self._get_joint_positions()

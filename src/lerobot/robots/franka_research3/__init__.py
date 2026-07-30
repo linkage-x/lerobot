@@ -21,12 +21,17 @@
 # dataclasses plus the camera/robot config bases, so it stays cheap; the driver and
 # processor modules (panda_py, placo, numpy) stay lazy below.
 from .config_franka_research3 import FrankaResearch3Config
+from .config_franka_research3_mujoco import FrankaResearch3MujocoConfig
 
 __all__ = [
     "AbsoluteEEActionToRobotAction",
+    "AbsoluteEEToDeltaEEAction",
     "DeltaActionToAbsoluteEEAction",
+    "DeltaEEToAbsoluteEEAction",
     "FrankaResearch3",
     "FrankaResearch3Config",
+    "FrankaResearch3Mujoco",
+    "FrankaResearch3MujocoConfig",
     "KeepAbsoluteEEObservation",
 ]
 
@@ -36,7 +41,17 @@ def __getattr__(name: str):
         from .franka_research3 import FrankaResearch3
 
         return FrankaResearch3
-    if name in {"AbsoluteEEActionToRobotAction", "DeltaActionToAbsoluteEEAction", "KeepAbsoluteEEObservation"}:
+    if name == "FrankaResearch3Mujoco":
+        from .franka_research3_mujoco import FrankaResearch3Mujoco
+
+        return FrankaResearch3Mujoco
+    if name in {
+        "AbsoluteEEActionToRobotAction",
+        "AbsoluteEEToDeltaEEAction",
+        "DeltaActionToAbsoluteEEAction",
+        "DeltaEEToAbsoluteEEAction",
+        "KeepAbsoluteEEObservation",
+    }:
         from . import processor_franka_research3
 
         return getattr(processor_franka_research3, name)
