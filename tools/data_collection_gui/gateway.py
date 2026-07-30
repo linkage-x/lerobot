@@ -6675,6 +6675,13 @@ def _connect_recorder(state: GatewayState, *, backend: str | None = None) -> Non
     env = _recorder_env(state.repo_root)
     if is_workstation:
         command.append(f"--backend={state.recording.backend}")
+        # The FR3 recorder only ever writes a local dataset -- it neither pulls nor pushes to the
+        # Hub. Left online, any local metadata read that misses falls back to huggingface.co, and
+        # that connect has no timeout on a workstation with no route to it: the recorder hangs
+        # before its first output line and stops reading its own stdin, so the GUI cannot even
+        # cancel it. Offline turns that class of hang into an immediate error. Not set for Thor,
+        # whose handheld recorder honours dataset.push_to_hub.
+        env["HF_HUB_OFFLINE"] = "1"
         if state.recording.backend == "sim":
             # Headless MuJoCo rendering: the recorder runs detached from any X session.
             env["MUJOCO_GL"] = "egl"

@@ -55,6 +55,7 @@ for _path in (str(_REPO_ROOT / "src"), str(_REPO_ROOT)):
 
 from lerobot.configs import parser  # noqa: E402
 from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
+from lerobot.datasets.utils import DEFAULT_TASKS_PATH, LEGACY_TASKS_PATH  # noqa: E402
 from lerobot.datasets.video_utils import VideoEncodingManager  # noqa: E402
 import lerobot.robots.franka_research3  # noqa: E402,F401  # registers both FR3 robot choices
 from lerobot.robots import make_robot_from_config  # noqa: E402
@@ -330,6 +331,32 @@ def _dataset_root_for_backend(cfg: RecordConfig, backend: str) -> str:
     return str(path) if path.name.endswith("_sim") else str(path.parent / f"{path.name}_sim")
 
 
+def _assert_resumable_or_absent(dataset_root: str) -> bool:
+    """Is there a dataset at ``dataset_root`` that can actually be resumed?
+
+    ``meta/info.json`` alone does not make one. A session that created the dataset and then
+    discarded every episode leaves ``info.json`` behind with no task metadata, and
+    ``LeRobotDatasetMetadata`` answers a missing tasks file by falling back to the Hub:
+    ``get_safe_version`` -> ``list_repo_refs`` -> ``httpx`` -> ``socket.create_connection``.
+    With no route to huggingface.co that connect has no timeout, so the recorder hangs there
+    forever, before its first output line and before it starts reading its own stdin -- the GUI
+    is left on the gateway's spawn message with no way to cancel. Decide resumability from what
+    the metadata loader actually requires, and refuse the in-between state explicitly.
+    """
+    root = Path(dataset_root)
+    if not (root / "meta" / "info.json").is_file():
+        return False
+    if (root / DEFAULT_TASKS_PATH).is_file() or (root / LEGACY_TASKS_PATH).is_file():
+        return True
+    raise RuntimeError(
+        f"{root} has meta/info.json but no task metadata ({DEFAULT_TASKS_PATH}), so it is "
+        "neither a fresh dataset nor a resumable one -- a previous session created it and then "
+        "discarded every episode without finalizing. Loading it would fall back to the "
+        "HuggingFace Hub and hang with no timeout when the Hub is unreachable. Delete "
+        f"{root} and press Connect again."
+    )
+
+
 def _audit_episode_buffer(
     dataset: LeRobotDataset,
     *,
@@ -443,7 +470,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     # the config (or by the bound task). The second session must extend that dataset, not die
     # on LeRobotDataset.create()'s exist_ok=False mkdir -- which is what an operator pressing
     # Connect twice would otherwise get, as a raw FileExistsError traceback.
-    existing_dataset = (Path(dataset_root) / "meta" / "info.json").is_file()
+    existing_dataset = _assert_resumable_or_absent(dataset_root)
     if existing_dataset:
         dataset = LeRobotDataset(
             repo_id,

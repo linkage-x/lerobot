@@ -449,3 +449,49 @@ def test_replay_rejects_an_unknown_action_contract():
             observation_names=["joint_1.pos"],
             observations=np.zeros((2, 1)),
         )
+
+
+def _write_dataset_meta(root: Path, *, with_tasks: bool) -> Path:
+    """A dataset root as the recorder finds it on disk: info.json, tasks optional."""
+    (root / "meta").mkdir(parents=True, exist_ok=True)
+    (root / "meta" / "info.json").write_text(json.dumps({"codebase_version": "v3.0", "fps": 30}))
+    if with_tasks:
+        (root / "meta" / "tasks.parquet").write_bytes(b"")
+    return root
+
+
+def test_resume_gate_accepts_a_dataset_that_has_task_metadata(tmp_path):
+    from tools.fr3.fr3_gui_record_runtime import _assert_resumable_or_absent
+
+    root = _write_dataset_meta(tmp_path / "ds", with_tasks=True)
+    assert _assert_resumable_or_absent(str(root)) is True
+
+
+def test_resume_gate_treats_a_missing_dataset_as_fresh(tmp_path):
+    from tools.fr3.fr3_gui_record_runtime import _assert_resumable_or_absent
+
+    assert _assert_resumable_or_absent(str(tmp_path / "not_created_yet")) is False
+
+
+def test_resume_gate_refuses_an_info_only_dataset_instead_of_falling_back_to_the_hub(tmp_path):
+    """The shell a create-then-discard-everything session leaves behind.
+
+    Treating it as resumable makes LeRobotDatasetMetadata miss its tasks file and pull from the
+    Hub, which blocks in TCP connect with no timeout when the Hub is unreachable -- the recorder
+    hangs before its first output line and before it reads its own stdin, so the GUI shows only
+    the gateway's spawn message and Exit cannot reach it.
+    """
+    from tools.fr3.fr3_gui_record_runtime import _assert_resumable_or_absent
+
+    root = _write_dataset_meta(tmp_path / "ds", with_tasks=False)
+    with pytest.raises(RuntimeError, match="no task metadata"):
+        _assert_resumable_or_absent(str(root))
+
+
+def test_workstation_recorder_runs_offline_so_a_hub_fallback_cannot_hang_it():
+    """The FR3 recorder writes only local datasets; Thor's honours dataset.push_to_hub."""
+    source = Path(gateway.__file__).read_text()
+    marker = 'env["HF_HUB_OFFLINE"] = "1"'
+    assert marker in source
+    workstation_branch = source.split("if is_workstation:")[-1].split("recorder_log_path =")[0]
+    assert marker in workstation_branch
