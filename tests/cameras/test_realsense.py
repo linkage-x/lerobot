@@ -19,7 +19,9 @@
 # pytest tests/cameras/test_opencv.py::test_connect
 # ```
 
+import logging
 from pathlib import Path
+import types
 from unittest.mock import patch
 
 import numpy as np
@@ -28,7 +30,7 @@ import pytest
 from lerobot.cameras.configs import Cv2Rotation
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
-pytest.importorskip("pyrealsense2")
+rs = pytest.importorskip("pyrealsense2")
 
 from lerobot.cameras.realsense import RealSenseCamera, RealSenseCameraConfig
 
@@ -226,3 +228,84 @@ def test_rotation(rotation):
             assert camera.width == 640
             assert camera.height == 480
             assert img.shape[:2] == (480, 640)
+
+
+def _frame_stub(domain, timestamp_ms):
+    """Minimal stand-in for a pyrealsense2 color frame."""
+    return types.SimpleNamespace(
+        get_frame_timestamp_domain=lambda: domain,
+        get_timestamp=lambda: timestamp_ms,
+    )
+
+
+def _unconnected_camera():
+    return RealSenseCamera(RealSenseCameraConfig(serial_number_or_name="042"))
+
+
+def test_capture_time_reports_acquisition_not_handover():
+    """The pipeline delay differs per model and must not end up in the timestamp.
+
+    Measured on the FR3 rig: a D405 hands frames over 4.8 ms after acquisition and a D435i
+    29.1 ms, so stamping the handover put 24 ms between two cameras that saw the same instant.
+    """
+    camera = _unconnected_camera()
+    handover_wall_s = 1_700_000_000.0
+    handover_perf_s = 5_000.0
+    age_s = 0.0291
+
+    capture_time = camera._frame_capture_time_s(
+        _frame_stub(rs.timestamp_domain.global_time, (handover_wall_s - age_s) * 1e3),
+        handover_perf_s=handover_perf_s,
+        handover_wall_s=handover_wall_s,
+    )
+
+    assert capture_time == pytest.approx(handover_perf_s - age_s, abs=1e-6)
+    # Stays on the monotonic basis the robot's other timestamps use.
+    assert capture_time < handover_perf_s
+
+
+def test_capture_time_refuses_to_splice_a_device_clock_onto_the_host_clock(caplog):
+    """HARDWARE_CLOCK has an arbitrary epoch; differencing it against the host clock is meaningless."""
+    camera = _unconnected_camera()
+
+    with caplog.at_level(logging.WARNING):
+        capture_time = camera._frame_capture_time_s(
+            _frame_stub(rs.timestamp_domain.hardware_clock, 12345.0),
+            handover_perf_s=5_000.0,
+            handover_wall_s=1_700_000_000.0,
+        )
+
+    assert capture_time == 5_000.0
+    assert "no fixed relation to the host clock" in caplog.text
+
+
+def test_capture_time_falls_back_when_the_wall_clock_steps(caplog):
+    """A negative or absurd age means the two clocks stopped being comparable."""
+    camera = _unconnected_camera()
+    handover_wall_s = 1_700_000_000.0
+
+    with caplog.at_level(logging.WARNING):
+        capture_time = camera._frame_capture_time_s(
+            # Frame timestamped 5 s in the future: the host clock stepped backwards.
+            _frame_stub(rs.timestamp_domain.global_time, (handover_wall_s + 5.0) * 1e3),
+            handover_perf_s=5_000.0,
+            handover_wall_s=handover_wall_s,
+        )
+
+    assert capture_time == 5_000.0
+    assert "not a plausible" in caplog.text
+
+
+def test_capture_time_warns_once_per_camera(caplog):
+    """A per-frame warning at 30 fps would bury the log it is trying to surface."""
+    camera = _unconnected_camera()
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(5):
+            camera._frame_capture_time_s(
+                _frame_stub(rs.timestamp_domain.hardware_clock, 12345.0),
+                handover_perf_s=5_000.0,
+                handover_wall_s=1_700_000_000.0,
+            )
+
+    assert caplog.text.count("no fixed relation to the host clock") == 1

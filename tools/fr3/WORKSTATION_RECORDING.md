@@ -150,15 +150,22 @@ What the numbers mean:
 `clock_semantics` says which clock produced the timestamps, because the two backends do not
 mean the same thing by them:
 
-- `hardware_mixed` — every column is a host `perf_counter` read, but not of the same event.
-  Arm and gripper are stamped when their driver read returns, inside `get_observation()`.
-  Camera columns are stamped by the camera's background read loop *after* it has converted and
-  post-processed the frame — so they are neither exposure midpoint nor driver handover, and
-  they carry the conversion cost. They are also older than the arm read by construction: the
-  loop hands over the most recent frame it already has. Measured on the rig, cameras sit
-  5.7 ms (`ee`) and 17.3 ms (`side`) ahead of the arm, each stable to ~2 ms, with `side`
-  drifting against `ee` at ~0.35 ms/s (two free-running 30 fps sensors beating). Cross-device
-  skew is therefore real but dominated by a fixed per-camera pipeline offset, not by jitter.
+- `hardware_mixed` — arm and gripper columns are host `perf_counter` reads taken when their
+  driver read returns. Camera columns are the **acquisition** instant: the sensor reports it on
+  the device clock, global time maps that onto the host wall clock, and the camera subtracts the
+  frame's age at handover to put it on the same monotonic basis. Not the exposure midpoint —
+  it is what the sensor calls acquisition.
+
+  Cameras are older than the arm read by construction: the arm is read on demand, while a frame
+  already exists by the time anything asks for it. Measured on the rig at 30 fps, images sit
+  **42–45 ms** behind the arm (stable to ~4 ms) and the two cameras are within **~3 ms** of each
+  other. That first number is a real image-vs-state offset — it halves at 60 fps — not a clock
+  error, so it is reported and never subtracted.
+
+  Camera columns used to be stamped when the background loop finished post-processing the frame.
+  That carried each camera's pipeline delay (a D405 hands over 4.8 ms after acquisition, a D435i
+  29.1 ms), which put a fabricated 24 ms between two cameras seeing the same instant and made
+  the images look 25 ms fresher than they were.
 - `sim_extraction_wallclock` — MuJoCo extracts every modality from one physics instant, so
   there is no acquisition skew to measure. These timestamps record extraction cost (state read,
   then one render per camera). Useful for catching a straggling render; **not** comparable to

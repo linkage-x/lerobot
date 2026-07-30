@@ -28,16 +28,22 @@ The two backends do not mean the same thing by "capture timestamp", and the repo
 one produced it in ``clock_semantics`` rather than silently mixing them:
 
 ``hardware_mixed``
-    Every column is a host ``perf_counter`` reading, but not of the same event. Arm and gripper
-    are stamped immediately after their driver read returns, inside ``get_observation()``.
-    Camera columns are stamped by the camera's own background read loop **after** it has
-    converted the frame to numpy and post-processed it -- so a camera column is neither the
-    exposure midpoint nor the driver handover, and it carries the conversion cost. It is also
-    older than the arm read by construction, because the loop hands over the newest frame it
-    already holds rather than waiting for a fresh one. Cross-device skew is therefore real, but
-    on this rig it is dominated by a fixed per-camera pipeline offset rather than by jitter:
-    measured 5.7 ms (``ee``) and 17.3 ms (``side``) ahead of the arm, each stable to ~2 ms.
-    Such a constant bias is reported per device rather than corrected away.
+    Arm and gripper columns are host ``perf_counter`` readings taken immediately after their
+    driver read returns, inside ``get_observation()``. Camera columns are the **acquisition**
+    instant: RealSense reports it on the device clock, global time maps that onto the host wall
+    clock, and the camera moves it onto the ``perf_counter`` basis by subtracting the frame's
+    age at handover. So the two are comparable, and a camera column is *not* the exposure
+    midpoint -- it is what the sensor reports as acquisition.
+
+    Cameras are older than the arm read by construction: the arm is read on demand while a
+    frame already exists by the time anything asks for it. On the FR3 rig that gap measures
+    42-45 ms at 30 fps, stable to ~4 ms -- a real image-vs-state offset, not a clock error, and
+    one that halves if the cameras run at 60 fps. Between the two cameras the soft-sync brings
+    skew down to ~3 ms. Constant biases are reported per device rather than corrected away.
+
+    Before this was measured from acquisition, camera columns carried each camera's pipeline
+    delay instead (a D405 hands frames over 4.8 ms after acquisition, a D435i 29.1 ms), which
+    both put a fake 24 ms between the two cameras and understated how stale the images were.
 
 ``sim_extraction_wallclock``
     In MuJoCo every modality is extracted from the *same* physics instant, so there is no
@@ -294,13 +300,14 @@ def build_fr3_sync_report(
         )
     else:
         report["interpretation"] = (
-            "Hardware backend: every column is a host clock read, but not of the same event. "
-            "Arm and gripper are stamped when their driver read returns; camera columns are "
-            "stamped by the camera's background loop after it converted and post-processed the "
-            "frame, so they are neither exposure midpoint nor driver handover, and they are "
-            "older than the arm read by construction (the loop hands over the newest frame it "
-            "already holds). A constant camera-vs-arm bias is a pipeline offset and is "
-            "reported, not corrected."
+            "Hardware backend: arm and gripper columns are host reads taken when their driver "
+            "read returns; camera columns are the acquisition instant reported by the sensor "
+            "(device clock via global time, moved onto the host monotonic basis), so they are "
+            "neither exposure midpoint nor driver handover. Cameras are older than the arm read "
+            "by construction -- the arm is read on demand, a frame already exists when asked "
+            "for -- which measures 42-45 ms at 30 fps on this rig and halves at 60 fps. A "
+            "constant camera-vs-arm bias is a real image-vs-state offset and is reported, not "
+            "corrected."
         )
     return report
 
