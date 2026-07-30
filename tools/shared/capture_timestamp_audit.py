@@ -75,9 +75,16 @@ def resolve_grid_lag_reference_index(
     honestly sit 25 ms ahead of the arm, which moved the median to -12 ms and reported 13.5 ms of
     grid lag for a loop whose cadence was exact to 0.03%.
 
-    So a rig with a device that is read on demand -- an arm, whose timestamp *is* the loop tick --
-    should name it here. A rig without one (a handheld capture, where every device free-runs) has
-    no better reference than the median, and passing no prefixes keeps exactly that.
+    So a rig with a device that carries no pipeline delay of its own -- an arm, read for the frame
+    rather than delivered to it -- should name it here. A rig without one (a handheld capture,
+    where every device free-runs) has no better reference than the median, and passing no prefixes
+    keeps exactly that.
+
+    The reference need not be the loop tick exactly, and on the FR3 it is not: that column is the
+    instant its 200 Hz state reader sampled, so it trails the tick by up to one poll period. That
+    puts a few ms of quantization noise on this metric, which is the right trade -- the column has
+    to mean *when the value was sampled* for every other number here to mean anything, and 5 ms of
+    noise against a 50 ms budget is cheaper than a reference carrying a 25 ms pipeline offset.
     """
     for prefix in prefixes:
         for index, name in enumerate(device_names):

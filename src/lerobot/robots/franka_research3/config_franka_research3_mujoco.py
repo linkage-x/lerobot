@@ -80,6 +80,10 @@ class FrankaResearch3MujocoConfig(RobotConfig):
     # Same guard as the hardware robot, kept numerically identical so a sim episode is held to
     # the envelope the hardware one is: a render pass that straggles this far behind its siblings
     # makes the frame unusable for training, so it fails the episode loudly.
+    #
+    # This side is what sets the number. Under software EGL the renderer was measured straggling
+    # 19 ms, which aborted a sim episode against the 15 ms this used to be. Hardware, where
+    # camera anchoring holds skew to 7.8 ms p95, would have been fine at 15.
     camera_max_skew_ms: float = 20.0
     # Re-randomize the workspace object at each episode reset so sim episodes are not identical.
     randomize_workspace_object: bool = True

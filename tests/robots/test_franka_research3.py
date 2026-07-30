@@ -251,6 +251,11 @@ def test_pandapy_arm_driver_connect_seeds_controller_with_current_joints(monkeyp
     assert np.allclose(controller.set_control_calls[0], DummyPanda.instances[-1].state.q)
     assert DummyPanda.instances[-1].started_controllers == [controller]
 
+    # This driver polls at the 200 Hz default, so its reader thread outlives the test unless it
+    # is stopped -- and a stray thread inside `backends` corrupts any later test that patches a
+    # module-level global there.
+    driver.disconnect()
+
 
 @pytest.mark.parametrize(
     ("mode_name", "expected_message"),
@@ -2280,3 +2285,216 @@ def test_connect_cleans_up_partial_backends(monkeypatch):
     assert robot._gripper is None
     assert DummyArmDriver.instances[-1].connected is False
     assert DummyGripperDriver.instances[-1].connected is False
+
+
+def test_arm_timestamp_marks_when_the_state_was_read_not_when_we_picked_it_up(monkeypatch):
+    """Two observations served from one cached sample must carry that sample's instant.
+
+    The driver serves a cache refreshed by its own state reader at state_poll_frequency_hz.
+    Stamping `perf_counter()` at pickup instead credits the reading with freshness it does not
+    have -- up to one poll period, varying frame to frame -- and that error is unrecoverable
+    afterwards because it lands inside the arm-vs-camera offset and looks like camera latency.
+    """
+
+    class DummyJointPositionController:
+        def set_control(self, joint_positions):
+            del joint_positions
+
+    class DummyPanda:
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.state = types.SimpleNamespace(
+                q=np.array([0.1, 0.2, 0.3, -1.0, 0.5, 1.2, -0.7], dtype=np.float64),
+                robot_mode=types.SimpleNamespace(name="kIdle"),
+            )
+
+        def start_controller(self, controller):
+            del controller
+
+        def stop_controller(self):
+            return None
+
+        def get_state(self):
+            return self.state
+
+    monkeypatch.setitem(
+        sys.modules,
+        "panda_py",
+        types.SimpleNamespace(
+            Panda=DummyPanda,
+            controllers=types.SimpleNamespace(JointPosition=DummyJointPositionController),
+        ),
+    )
+
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+
+    _, first = driver.get_joint_positions_with_timestamp()
+    time.sleep(0.01)
+    _, second = driver.get_joint_positions_with_timestamp()
+
+    # Same cached sample -> same instant. A pickup-time stamp would differ by ~10 ms here.
+    assert first == second
+    # And it is the moment the state arrived, so it precedes any later read.
+    assert first <= time.perf_counter()
+
+    driver.disconnect()
+
+
+def test_arm_capture_timestamp_comes_from_the_driver_when_it_reports_one(robot):
+    sampled_at_s = time.perf_counter() - 0.004
+
+    class SamplingArmDriver(DummyArmDriver):
+        def get_joint_positions_with_timestamp(self):
+            return self.joint_positions, sampled_at_s
+
+    robot._arm = SamplingArmDriver()
+    robot.connect()
+    robot._arm = SamplingArmDriver()
+    robot.reset_capture_timestamp_origin()
+
+    observation = robot.get_observation(include_cameras=False)
+
+    expected = sampled_at_s - robot._capture_timestamp_origin_s
+    assert observation["fr3.arm.capture_timestamp_s"] == pytest.approx(expected, abs=1e-9)
+
+
+def test_arm_capture_timestamp_falls_back_for_a_backend_without_sampling_instants(robot):
+    """Older backends keep working; the read instant is the honest upper bound."""
+    robot.connect()
+    assert not hasattr(robot._arm, "get_joint_positions_with_timestamp")
+    robot.reset_capture_timestamp_origin()
+
+    before = time.perf_counter() - robot._capture_timestamp_origin_s
+    observation = robot.get_observation(include_cameras=False)
+    after = time.perf_counter() - robot._capture_timestamp_origin_s
+
+    assert before <= observation["fr3.arm.capture_timestamp_s"] <= after
+
+
+def test_franka_hand_gripper_timestamp_marks_when_the_hand_was_read(monkeypatch):
+    """The same failure as the arm, and twenty times larger: this driver polls at 10 Hz."""
+
+    class FakeFrankaHandState:
+        def __init__(self, width=0.04, max_width=0.08):
+            self.width = width
+            self.max_width = max_width
+
+    class FakeFrankaHand:
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.state = FakeFrankaHandState()
+
+        def homing(self):
+            return True
+
+        def read_once(self):
+            return self.state
+
+        def stop(self):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "panda_py",
+        types.SimpleNamespace(libfranka=types.SimpleNamespace(Gripper=FakeFrankaHand)),
+    )
+
+    driver = FrankaHandGripperHardwareDriver(
+        robot_ip="192.168.1.206",
+        state_poll_frequency_hz=0.0,
+    )
+    driver.connect()
+
+    position, first = driver.get_position_with_timestamp()
+    time.sleep(0.01)
+    _, second = driver.get_position_with_timestamp()
+
+    assert position == pytest.approx(0.5)
+    # One cached read behind both calls -> one instant. Stamping at pickup would report the
+    # second reading as 10 ms fresher than the first while nothing new was read.
+    assert first == second
+    assert first <= time.perf_counter()
+
+    driver.disconnect()
+
+
+def test_das_gripper_timestamp_comes_from_the_encoder_callback(monkeypatch):
+    """The databus pushes updates on its own thread, so arrival is the only knowable instant."""
+
+    class FakeDataBus:
+        instances: list["FakeDataBus"] = []
+
+        def __init__(self, tty_port, baudrate, encoder_freq, encoder_callback, tactile_freq=None, tactile_callback=None):
+            del tty_port, baudrate, encoder_freq, tactile_freq, tactile_callback
+            self.encoder_callback = encoder_callback
+            type(self).instances.append(self)
+            self.encoder_callback(struct.pack(">f", 0.0206))
+
+        def set_target_distance(self, distance_m):
+            del distance_m
+
+        def stop(self):
+            return None
+
+    fake_module = types.ModuleType("gen_controller_sdk_python")
+    fake_module.DataBus = FakeDataBus
+    monkeypatch.setitem(sys.modules, "gen_controller_sdk_python", fake_module)
+
+    driver = fr3_backends.DasGripperHardwareDriver(
+        serial_port="/dev/ttyUSB0",
+        baudrate=921600,
+        update_frequency_hz=50.0,
+        min_distance_m=0.0,
+        max_distance_m=0.103,
+        initial_position=0.2,
+    )
+    driver.connect()
+    connect_returned_at_s = time.perf_counter()
+
+    time.sleep(0.01)
+    position, first = driver.get_position_with_timestamp()
+
+    assert position == pytest.approx(0.2, abs=1e-3)
+    # The update landed during connect(), so its instant is behind us -- not the read we just did.
+    assert first <= connect_returned_at_s
+
+    FakeDataBus.instances[-1].encoder_callback(struct.pack(">f", 0.0412))
+    moved_position, second = driver.get_position_with_timestamp()
+
+    assert moved_position == pytest.approx(0.4, abs=1e-3)
+    assert second > first
+
+    driver.disconnect()
+
+
+def test_gripper_capture_timestamp_comes_from_the_driver_when_it_reports_one(robot):
+    sampled_at_s = time.perf_counter() - 0.05
+
+    class SamplingGripperDriver(DummyGripperDriver):
+        def get_position_with_timestamp(self):
+            return self.position, sampled_at_s
+
+    robot.connect()
+    sampling_gripper = SamplingGripperDriver()
+    robot._gripper = sampling_gripper
+    robot.reset_capture_timestamp_origin()
+
+    observation = robot.get_observation(include_cameras=False)
+
+    expected = sampled_at_s - robot._capture_timestamp_origin_s
+    assert observation["pika_gripper.capture_timestamp_s"] == pytest.approx(expected, abs=1e-9)
+    assert observation["gripper.pos"] == pytest.approx(sampling_gripper.position)
+
+
+def test_gripper_capture_timestamp_falls_back_for_a_backend_without_sampling_instants(robot):
+    """`pika` and `corenetic` read on demand, so the read instant is a true upper bound."""
+    robot.connect()
+    assert not hasattr(robot._gripper, "get_position_with_timestamp")
+    robot.reset_capture_timestamp_origin()
+
+    before = time.perf_counter() - robot._capture_timestamp_origin_s
+    observation = robot.get_observation(include_cameras=False)
+    after = time.perf_counter() - robot._capture_timestamp_origin_s
+
+    assert before <= observation["pika_gripper.capture_timestamp_s"] <= after

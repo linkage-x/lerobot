@@ -173,6 +173,10 @@ class PandaPyArmDriver:
         self._state_reader_stop = threading.Event()
         self._state_reader_thread: threading.Thread | None = None
         self._cached_joint_positions: np.ndarray | None = None
+        # When the cache was filled from the arm. Kept beside the values so a consumer can
+        # timestamp them by when they were read *from the arm* rather than by when it happened
+        # to pick them up -- those differ by up to one poll period.
+        self._cached_joint_positions_at_s: float | None = None
 
     def connect(self) -> None:
         self._robot = self._panda_cls(self.robot_ip)
@@ -248,10 +252,35 @@ class PandaPyArmDriver:
             raise RuntimeError("Arm backend is not connected.")
         if state is None:
             state = self._robot.get_state()
+        # Taken right after the state is in hand. This does not remove libfranka's own transport
+        # delay -- the arm sampled these joints earlier still -- but it does pin the reading to
+        # the moment it arrived, which is the part this process can actually observe.
+        sampled_at_s = time.perf_counter()
         joint_positions = np.asarray(state.q, dtype=np.float64)
         with self._state_lock:
             self._cached_joint_positions = joint_positions.copy()
+            self._cached_joint_positions_at_s = sampled_at_s
         return joint_positions
+
+    def get_joint_positions_with_timestamp(self) -> tuple[np.ndarray, float]:
+        """Cached joint positions together with when they were read from the arm.
+
+        The state reader refreshes at ``state_poll_frequency_hz``, so a consumer that stamps its
+        own read instant instead credits a reading with freshness it does not have -- up to one
+        poll period (5 ms at the 200 Hz default), varying frame to frame. That error is invisible
+        afterwards: it lands inside the arm-vs-camera offset and looks like camera latency.
+        """
+        if self._robot is None:
+            raise RuntimeError("Arm backend is not connected.")
+        with self._state_lock:
+            cached = None if self._cached_joint_positions is None else self._cached_joint_positions.copy()
+            sampled_at_s = self._cached_joint_positions_at_s
+        if cached is not None and sampled_at_s is not None:
+            return cached, float(sampled_at_s)
+        joint_positions = self._refresh_joint_positions_cache()
+        with self._state_lock:
+            sampled_at_s = self._cached_joint_positions_at_s
+        return joint_positions, float(sampled_at_s if sampled_at_s is not None else time.perf_counter())
 
     def _start_state_reader(self) -> None:
         if self.state_poll_frequency_hz <= 0:
@@ -285,6 +314,7 @@ class PandaPyArmDriver:
             self._robot = None
         with self._state_lock:
             self._cached_joint_positions = None
+            self._cached_joint_positions_at_s = None
 
     def get_joint_positions(self) -> np.ndarray:
         if self._robot is None:
@@ -624,6 +654,10 @@ class FrankaHandGripperHardwareDriver:
         self._last_command_time_s: float | None = None
         self._pending_command_width_m: float | None = None
         self._cached_width_m: float | None = None
+        # When the cached width was read off the hand. This driver polls at 10 Hz, so a consumer
+        # that stamps its own pickup instead can credit the reading with up to 100 ms of
+        # freshness it does not have -- twenty times the arm's poll period.
+        self._cached_width_at_s: float | None = None
         self._io_lock = threading.Lock()
         self._command_lock = threading.Lock()
         self._command_event = threading.Event()
@@ -664,6 +698,7 @@ class FrankaHandGripperHardwareDriver:
         self._state_reader_stop.clear()
         with self._state_lock:
             self._cached_width_m = None
+            self._cached_width_at_s = None
         self._gripper = None
         self._last_command_width_m = None
         self._last_command_time_s = None
@@ -734,12 +769,16 @@ class FrankaHandGripperHardwareDriver:
             raise RuntimeError("Gripper backend is not connected.")
         with self._io_lock:
             state = self._gripper.read_once()
+        # Taken with the state in hand, so the cache carries when the hand was read rather than
+        # when someone later picks the value up.
+        sampled_at_s = time.perf_counter()
         width_m = float(getattr(state, "width", 0.0))
         max_width_m = float(getattr(state, "max_width", self._max_width_m))
         with self._state_lock:
             if max_width_m > 0:
                 self._max_width_m = max_width_m
             self._cached_width_m = width_m
+            self._cached_width_at_s = sampled_at_s
         return state
 
     def get_position(self) -> float:
@@ -756,6 +795,18 @@ class FrankaHandGripperHardwareDriver:
         if width_m is None or max_width_m <= 0:
             return 0.0
         return float(np.clip(width_m / max_width_m, 0.0, 1.0))
+
+    def get_position_with_timestamp(self) -> tuple[float, float]:
+        """Cached position together with when the hand was read for it.
+
+        The 10 Hz state reader means a pickup-time stamp is optimistic by up to 100 ms, varying
+        frame to frame. That error is unrecoverable once recorded: it lands inside the
+        gripper-vs-arm offset the sync audit reports and reads as a pipeline delay.
+        """
+        position = self.get_position()
+        with self._state_lock:
+            sampled_at_s = self._cached_width_at_s
+        return position, float(sampled_at_s if sampled_at_s is not None else time.perf_counter())
 
     def _execute_width_command(self, pending_width_m: float) -> None:
         if self._gripper is None:
@@ -1041,6 +1092,10 @@ class DasGripperHardwareDriver:
         self._gripper_state_updated = False
         self._tactile_state_updated = False
         self._position_m: float | None = None
+        # When the encoder update that produced ``_position_m`` arrived. The databus pushes these
+        # at ``update_frequency_hz`` on its own thread, so the callback is the only place that
+        # knows how fresh the value is; anything later is guessing.
+        self._position_at_s: float | None = None
         self._target_distance_m: float | None = None
         self._last_command_distance_m: float | None = None
         self._last_command_time_s: float | None = None
@@ -1093,6 +1148,7 @@ class DasGripperHardwareDriver:
         self._gripper_state_updated = False
         self._tactile_state_updated = False
         self._position_m = None
+        self._position_at_s = None
         self._target_distance_m = None
         self._last_command_distance_m = None
         self._last_command_time_s = None
@@ -1107,8 +1163,10 @@ class DasGripperHardwareDriver:
             logging.getLogger(__name__).warning("Failed to parse DAS encoder update: %s", exc)
             return
 
+        arrived_at_s = time.perf_counter()
         with self._lock:
             self._position_m = float(np.clip(distance_m, self.min_distance_m, self.max_distance_m))
+            self._position_at_s = arrived_at_s
             if self._target_distance_m is not None and self.grasp_threshold_m > 0:
                 _ = self._position_m > (self._target_distance_m + self.grasp_threshold_m)
         self._gripper_state_updated = True
@@ -1155,6 +1213,27 @@ class DasGripperHardwareDriver:
         if span <= 0:
             return 0.0
         return float(np.clip((distance_m - self.min_distance_m) / span, 0.0, 1.0))
+
+    def get_position_with_timestamp(self) -> tuple[float, float]:
+        """Position together with when its encoder update arrived on the databus.
+
+        Reads both under one lock so the value and its instant cannot come from different
+        updates. When no encoder update has landed yet, ``get_position`` substitutes the
+        *commanded* distance -- that is not a measurement of anything, so the read instant is
+        all this can honestly claim for it.
+        """
+        if self._databus is None:
+            raise RuntimeError("Gripper backend is not connected.")
+        with self._lock:
+            distance_m = self._position_m
+            arrived_at_s = self._position_at_s
+        if distance_m is None or arrived_at_s is None:
+            return self.get_position(), time.perf_counter()
+        span = self.max_distance_m - self.min_distance_m
+        if span <= 0:
+            return 0.0, float(arrived_at_s)
+        position = float(np.clip((distance_m - self.min_distance_m) / span, 0.0, 1.0))
+        return position, float(arrived_at_s)
 
     def get_tactile_observation(self) -> dict[str, np.ndarray]:
         if not self.tactile_enabled:

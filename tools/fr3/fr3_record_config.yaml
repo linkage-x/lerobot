@@ -8,8 +8,8 @@ robot:
   max_target_delta_pos: [0.001, 0.001, 0.001]
   max_target_delta_rot: [0.01, 0.01, 0.01]
   camera_max_age_ms: 100
-  # See config_franka_research3.py: each camera contributes its own newest frame, which widened
-  # cross-camera skew to a measured 16.2 ms maximum.
+  # See config_franka_research3.py: 20 rather than 15 is set by the sim twin's EGL renderer
+  # (measured straggling 19 ms), and kept identical here so one envelope covers both rigs.
   camera_max_skew_ms: 20
   cameras:
     # Sensor rate, deliberately above dataset.fps: an image is only as fresh as the sensor's

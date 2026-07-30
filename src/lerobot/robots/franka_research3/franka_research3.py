@@ -448,6 +448,45 @@ class FrankaResearch3(Robot):
             raise RuntimeError("Arm backend is not connected.")
         return np.asarray(self._arm.get_joint_positions(), dtype=np.float64)
 
+    def _read_joint_positions_with_timestamp(self) -> tuple[np.ndarray, float]:
+        """Joint positions and when they were read from the arm, not when we picked them up.
+
+        The two differ because the driver serves a cache refreshed by its own state reader. A
+        timestamp taken here would describe this process's scheduling rather than the arm's, and
+        the error is not recoverable later: it sits inside the arm-vs-camera offset and is
+        indistinguishable from camera latency.
+        """
+        if self._arm is None:
+            raise RuntimeError("Arm backend is not connected.")
+        read_with_timestamp = getattr(self._arm, "get_joint_positions_with_timestamp", None)
+        if callable(read_with_timestamp):
+            joint_positions, sampled_at_s = read_with_timestamp()
+            return np.asarray(joint_positions, dtype=np.float64), float(sampled_at_s)
+        # A backend that cannot say when it sampled: the read instant is the honest upper bound.
+        return np.asarray(self._arm.get_joint_positions(), dtype=np.float64), time.perf_counter()
+
+    def _read_gripper_position_with_timestamp(self) -> tuple[float, float]:
+        """Gripper position and when it was sampled, for the backends that can say.
+
+        Same failure as the arm, and worse where it applies: the Franka Hand driver polls at
+        10 Hz, so a pickup-time stamp can be optimistic by 100 ms. `das` knows its instant too --
+        the databus hands it over in a callback.
+
+        `pika` and `corenetic` take the branch below, where the read instant is a true upper
+        bound rather than a guess. `pika` reads straight through to the SDK's last parsed frame
+        and the SDK records no arrival time. `corenetic` samples do carry a timestamp, but it is
+        the BOX MCU's clock -- putting it in this column would mean splicing two time bases
+        together with no measured offset between them, which buys a plausible number and loses
+        the ability to tell the offset from a real lag.
+        """
+        if self._gripper is None:
+            raise RuntimeError("Gripper backend is not connected.")
+        read_with_timestamp = getattr(self._gripper, "get_position_with_timestamp", None)
+        if callable(read_with_timestamp):
+            gripper_pos, sampled_at_s = read_with_timestamp()
+            return float(gripper_pos), float(sampled_at_s)
+        return float(self._gripper.get_position()), time.perf_counter()
+
     def _get_release_hold_joint_target(self, current_joint_positions_rad: np.ndarray) -> np.ndarray:
         if self._prev_enabled and self._otg is not None:
             with self._otg_command_lock:
@@ -509,13 +548,11 @@ class FrankaResearch3(Robot):
     @check_if_not_connected
     def get_observation(self, *, include_cameras: bool = True) -> RobotObservation:
         self._raise_if_otg_failed()
-        joint_positions_rad = self._read_joint_positions()
-        arm_capture_timestamp_s = time.perf_counter()
+        joint_positions_rad, arm_capture_timestamp_s = self._read_joint_positions_with_timestamp()
         ee_pose = self._compute_ee_pose(joint_positions_rad)
         self._cache_observation_state_snapshot(joint_positions_rad, ee_pose)
         ee_rotvec = Rotation.from_matrix(ee_pose[:3, :3]).as_rotvec()
-        gripper_pos = float(self._gripper.get_position())
-        gripper_capture_timestamp_s = time.perf_counter()
+        gripper_pos, gripper_capture_timestamp_s = self._read_gripper_position_with_timestamp()
 
         observation: RobotObservation = {
             "ee.x": float(ee_pose[0, 3]),

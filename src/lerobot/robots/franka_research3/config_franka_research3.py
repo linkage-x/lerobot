@@ -78,11 +78,11 @@ class FrankaResearch3Config(RobotConfig):
     stiffness: list[float] | None = None
     filter_coeff: float | None = None
     camera_max_age_ms: float = 100.0
-    # Frames whose cameras disagree by more than this are refused outright. 20 ms rather than 15
-    # because each camera now contributes its own newest frame instead of being pulled back to a
-    # shared instant: that removed ~16 ms of staleness but widened cross-camera skew, which
-    # measured a 16.2 ms maximum over a 300-frame episode at 60 Hz. A 15 ms guard would abort
-    # roughly 1% of frames -- and this guard aborts the whole episode, not the frame.
+    # Frames whose cameras disagree by more than this are refused outright -- and it aborts the
+    # whole episode, not the frame. 20 ms rather than 15 is set by the *sim* twin, not by this
+    # rig: see FrankaResearch3MujocoConfig. Anchoring every camera on the oldest of their latest
+    # frames holds cross-camera skew to a measured 7.8 ms p95 at 60 Hz, so hardware has slack
+    # here; the number is kept identical to the sim guard so one envelope covers both.
     camera_max_skew_ms: float = 20.0
     use_otg: bool = True
     otg_control_frequency: float = 800.0

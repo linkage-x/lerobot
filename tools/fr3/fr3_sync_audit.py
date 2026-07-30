@@ -28,12 +28,24 @@ The two backends do not mean the same thing by "capture timestamp", and the repo
 one produced it in ``clock_semantics`` rather than silently mixing them:
 
 ``hardware_mixed``
-    Arm and gripper columns are host ``perf_counter`` readings taken immediately after their
-    driver read returns, inside ``get_observation()``. Camera columns are the **acquisition**
-    instant: RealSense reports it on the device clock, global time maps that onto the host wall
-    clock, and the camera moves it onto the ``perf_counter`` basis by subtracting the frame's
-    age at handover. So the two are comparable, and a camera column is *not* the exposure
-    midpoint -- it is what the sensor reports as acquisition.
+    Every column is on the host ``perf_counter`` basis, and every one of them means *when the
+    value was sampled* -- not when ``get_observation()`` picked it up.
+
+    Arm and gripper columns come from the driver where the driver can say. The arm's state
+    reader polls at 200 Hz and serves a cache, so its column is the instant that cached state
+    arrived from the arm; stamping the pickup instead would have credited the reading with up to
+    one poll period of freshness it did not have. Same for a ``franka_hand`` gripper (10 Hz poll,
+    so up to 100 ms) and a ``das`` one (stamped in the databus callback). ``pika`` and
+    ``corenetic`` read on demand and expose no sampling instant, so those columns fall back to
+    the read instant -- an upper bound, not a guess. The gripper backend is named in the column
+    itself (``<backend>_gripper.capture_timestamp_s``), which is what tells you which of the two
+    you are reading.
+
+    Camera columns are the **acquisition** instant: RealSense reports it on the device clock,
+    global time maps that onto the host wall clock, and the camera moves it onto the
+    ``perf_counter`` basis by subtracting the frame's age at handover. So all columns are
+    comparable, and a camera column is *not* the exposure midpoint -- it is what the sensor
+    reports as acquisition.
 
     Cameras are older than the arm read by construction: the arm is read on demand while a
     frame already exists by the time anything asks for it. On the FR3 rig that gap measures

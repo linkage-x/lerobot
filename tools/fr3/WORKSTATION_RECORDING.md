@@ -140,11 +140,16 @@ What the numbers mean:
 
 - `skew_*_ms` — spread *within* one frame across devices. Budget: 20 ms (`--sync-tolerance-ms`).
 - `grid_lag_p95_ms` — drift of the **arm read** away from the dataset's nominal
-  `frame_index / fps` grid, as p95 of `|lag|`. Budget: 50 ms. The arm is read on demand inside
-  `get_observation()`, so its timestamp is the control loop's tick — which is what this metric
-  is asking about. It used to be measured against the median across devices, which charged the
-  cameras' honest 25 ms latency to the loop: 13.5 ms of reported grid lag for a cadence that was
-  exact to 0.03%. Camera latency is not lost, it is reported as `bias_vs_arm_ms` instead.
+  `frame_index / fps` grid, as p95 of `|lag|`. Budget: 50 ms. The arm is the reference because it
+  is the one modality read *for* the frame rather than delivered to it, so it carries no pipeline
+  delay. It used to be measured against the median across devices, which charged the cameras'
+  honest 25 ms latency to the loop: 13.5 ms of reported grid lag for a cadence that was exact to
+  0.03%. Camera latency is not lost, it is reported as `bias_vs_arm_ms` instead.
+
+  It is not the loop tick exactly: the arm column is the instant the 200 Hz state reader sampled,
+  so it trails the tick by up to one 5 ms poll period and this metric carries that as noise. That
+  is the right trade — the column has to mean when the value was *sampled* for every other number
+  here to mean anything.
 - `interval_ms=A/Bnominal` — the cadence the control loop actually delivered vs. the cadence the
   dataset claims. **`A > B` means the recorded frame spacing is a fiction**: the dataset labels
   frames as evenly spaced at `1/fps` while they were captured further apart. Lower
@@ -159,11 +164,23 @@ What the numbers mean:
 `clock_semantics` says which clock produced the timestamps, because the two backends do not
 mean the same thing by them:
 
-- `hardware_mixed` — arm and gripper columns are host `perf_counter` reads taken when their
-  driver read returns. Camera columns are the **acquisition** instant: the sensor reports it on
-  the device clock, global time maps that onto the host wall clock, and the camera subtracts the
-  frame's age at handover to put it on the same monotonic basis. Not the exposure midpoint —
-  it is what the sensor calls acquisition.
+- `hardware_mixed` — every column is host `perf_counter`, and every one means **when the value was
+  sampled**, not when `get_observation()` picked it up.
+
+  The arm column is the instant its 200 Hz state reader took the state off the arm — the driver
+  serves a cache, so stamping the pickup would have claimed up to a poll period of freshness that
+  did not exist. The gripper column depends on the backend, which is why the backend is in the
+  column name (`<backend>_gripper.capture_timestamp_s`): `franka_hand` (10 Hz poll, so up to
+  100 ms at stake) and `das` (stamped in its databus callback) report their sampling instant;
+  `pika` — the shipped backend — and `corenetic` read on demand and expose none, so those columns
+  are the read instant, an upper bound rather than a guess. A `corenetic` sample does carry its
+  own timestamp, but on the BOX MCU's clock; using it here would splice two time bases with no
+  measured offset between them.
+
+  Camera columns are the **acquisition** instant: the sensor reports it on the device clock,
+  global time maps that onto the host wall clock, and the camera subtracts the frame's age at
+  handover to put it on the same monotonic basis. Not the exposure midpoint — it is what the
+  sensor calls acquisition.
 
   Cameras are older than the arm read by construction: the arm is read on demand, while a frame
   already exists by the time anything asks for it. Measured on the rig at 30 fps, images sit
