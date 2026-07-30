@@ -139,8 +139,12 @@ Standalone: `python tools/fr3/fr3_sync_audit.py --dataset <root> [--fail-on-viol
 What the numbers mean:
 
 - `skew_*_ms` — spread *within* one frame across devices. Budget: 20 ms (`--sync-tolerance-ms`).
-- `grid_lag_p95_ms` — drift of the real capture times away from the dataset's nominal
-  `frame_index / fps` grid. Budget: 50 ms.
+- `grid_lag_p95_ms` — drift of the **arm read** away from the dataset's nominal
+  `frame_index / fps` grid, as p95 of `|lag|`. Budget: 50 ms. The arm is read on demand inside
+  `get_observation()`, so its timestamp is the control loop's tick — which is what this metric
+  is asking about. It used to be measured against the median across devices, which charged the
+  cameras' honest 25 ms latency to the loop: 13.5 ms of reported grid lag for a cadence that was
+  exact to 0.03%. Camera latency is not lost, it is reported as `bias_vs_arm_ms` instead.
 - `interval_ms=A/Bnominal` — the cadence the control loop actually delivered vs. the cadence the
   dataset claims. **`A > B` means the recorded frame spacing is a fiction**: the dataset labels
   frames as evenly spaced at `1/fps` while they were captured further apart. Lower

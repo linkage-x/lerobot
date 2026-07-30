@@ -527,3 +527,137 @@ def test_measured_interval_is_the_average_cadence_not_the_median_gap():
     assert median_gap_ms > elapsed_mean_ms + 1.0
     assert summary["measured_frame_interval_ms"] == pytest.approx(elapsed_mean_ms, abs=1e-6)
     assert summary["measured_frame_interval_ms"] < summary["nominal_frame_interval_ms"] * 1.05
+
+
+def test_live_and_finalized_paths_agree_about_one_episode(tmp_path):
+    """The two audit paths measured the same episode and reported different numbers.
+
+    A v3 dataset holds its parquet open until finalize(), so a just-saved episode must be
+    audited from the in-memory buffer while the persisted report is built from the files. Those
+    are two code paths by necessity -- but they are not allowed to be two *measurements*. Before
+    they shared an implementation, one reported the p95 of |grid lag| and the other the p95 of
+    the signed value, describing a single real episode as both 13.49 and -3.75.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    device_names = [
+        "fr3.arm.capture_timestamp_s",
+        "pika_gripper.capture_timestamp_s",
+        "camera.ee.capture_timestamp_s",
+        "camera.side.capture_timestamp_s",
+    ]
+    frames = 60
+    rng = np.random.default_rng(7)
+    grid = np.arange(frames, dtype=np.float64) / 10.0
+    arm = grid + rng.normal(0, 0.002, frames)
+    # Cameras genuinely ahead of the arm, the condition that split the two readings apart.
+    captures = np.stack(
+        [arm, arm + 0.00004, arm - 0.025 + rng.normal(0, 0.002, frames), arm - 0.024], axis=1
+    )
+
+    dataset_root = tmp_path / "ds"
+    (dataset_root / "meta").mkdir(parents=True)
+    (dataset_root / "data" / "chunk-000").mkdir(parents=True)
+    (dataset_root / "meta" / "info.json").write_text(
+        json.dumps(
+            {
+                "fps": 10,
+                "robot_type": "franka_research3",
+                "features": {
+                    "observation.device_capture_timestamp": {
+                        "dtype": "float64",
+                        "shape": [len(device_names)],
+                        "names": device_names,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": [0] * frames,
+                "frame_index": list(range(frames)),
+                "timestamp": grid.tolist(),
+                "observation.device_capture_timestamp": [row.tolist() for row in captures],
+            }
+        ),
+        dataset_root / "data" / "chunk-000" / "file-000.parquet",
+    )
+
+    live = fr3_sync_audit.summarize_episode_capture_timestamps(
+        capture_timestamps=captures,
+        frame_timestamps=grid,
+        device_names=device_names,
+        clock_semantics="hardware_mixed",
+    )
+    report = fr3_sync_audit.build_fr3_sync_report(dataset_root=dataset_root)
+
+    finalized_lag_p95_ms = float(report["summary"]["abs_global_lag_s"]["p95"]) * 1e3
+    assert live["grid_lag_p95_ms"] == pytest.approx(finalized_lag_p95_ms, abs=1e-9)
+    finalized_skew_p95_ms = float(report["summary"]["max_skew_s"]["p95"]) * 1e3
+    assert live["p95_skew_ms"] == pytest.approx(finalized_skew_p95_ms, abs=1e-9)
+    # And the shared line each path prints quotes the same figure.
+    assert f"grid_lag_p95_ms={finalized_lag_p95_ms:.2f}" in fr3_sync_audit.format_sync_summary_line(report)
+    assert f"grid_lag_p95_ms={live['grid_lag_p95_ms']:.2f}" in fr3_sync_audit.format_episode_sync_line(
+        live, episode=0
+    )
+
+
+def test_grid_lag_is_anchored_to_the_arm_not_the_device_median(tmp_path):
+    """Honest camera latency must not be charged to the control loop's cadence."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    device_names = [
+        "fr3.arm.capture_timestamp_s",
+        "pika_gripper.capture_timestamp_s",
+        "camera.ee.capture_timestamp_s",
+        "camera.side.capture_timestamp_s",
+    ]
+    frames = 40
+    grid = np.arange(frames, dtype=np.float64) / 10.0
+    # Arm exactly on the grid; both cameras a real 25 ms ahead.
+    captures = np.stack([grid, grid + 0.00004, grid - 0.025, grid - 0.0248], axis=1)
+
+    dataset_root = tmp_path / "ds"
+    (dataset_root / "meta").mkdir(parents=True)
+    (dataset_root / "data" / "chunk-000").mkdir(parents=True)
+    (dataset_root / "meta" / "info.json").write_text(
+        json.dumps(
+            {
+                "fps": 10,
+                "robot_type": "franka_research3",
+                "features": {
+                    "observation.device_capture_timestamp": {
+                        "dtype": "float64",
+                        "shape": [len(device_names)],
+                        "names": device_names,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": [0] * frames,
+                "frame_index": list(range(frames)),
+                "timestamp": grid.tolist(),
+                "observation.device_capture_timestamp": [row.tolist() for row in captures],
+            }
+        ),
+        dataset_root / "data" / "chunk-000" / "file-000.parquet",
+    )
+
+    report = fr3_sync_audit.build_fr3_sync_report(dataset_root=dataset_root)
+
+    # The loop held the grid exactly, so grid lag is ~0 despite the cameras' offset...
+    assert abs(float(report["summary"]["abs_global_lag_s"]["p95"])) < 1e-6
+    assert report["summary"]["global_lag_over_tolerance_frames"] == 0
+    # ...while the camera offset is still reported, as a per-device bias.
+    bias = report["cross_modality_bias_ms"]
+    assert bias["camera.ee.capture_timestamp_s"] == pytest.approx(-25.0, abs=0.1)

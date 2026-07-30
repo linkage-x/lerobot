@@ -70,12 +70,23 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from tools.handheld.handheld_soft_sync import build_report as build_soft_sync_report  # noqa: E402
+from tools.shared.capture_timestamp_audit import (  # noqa: E402
+    DEFAULT_GLOBAL_LAG_TOLERANCE_MS,
+    DEFAULT_TOLERANCE_MS,
+    build_report as build_capture_timestamp_report,
+    compute_frame_metrics,
+    measured_frame_interval_s,
+    resolve_grid_lag_reference_index,
+)
 
-DEFAULT_TOLERANCE_MS = 20.0
-DEFAULT_GLOBAL_LAG_TOLERANCE_MS = 50.0
 REPORT_RELATIVE_PATH = Path("meta") / "fr3_sync_report.json"
 CLOCK_SEMANTICS = ("hardware_mixed", "sim_extraction_wallclock")
+# The FR3 arm is read on demand inside get_observation(), so its timestamp *is* the control
+# loop's tick -- which is what "did this frame land on the dataset's grid" asks about. Anchoring
+# the grid to it keeps honest camera latency out of the cadence measurement: with the median
+# across devices, cameras sitting 25 ms ahead pulled it to -12 ms and reported 13.5 ms of grid
+# lag for a loop whose cadence was exact to 0.03%.
+GRID_LAG_REFERENCE_PREFIXES = ("fr3.arm.",)
 
 
 def _classify_devices(names: list[str]) -> dict[str, list[str]]:
@@ -155,26 +166,24 @@ def summarize_episode_capture_timestamps(
     """
     capture_timestamps = np.asarray(capture_timestamps, dtype=np.float64)
     frame_timestamps = np.asarray(frame_timestamps, dtype=np.float64)
-    if capture_timestamps.ndim != 2:
-        raise ValueError(f"capture_timestamps must be 2D, got shape {capture_timestamps.shape}.")
-    if capture_timestamps.shape[0] != frame_timestamps.shape[0]:
-        raise ValueError(
-            "capture_timestamps and frame_timestamps must have the same frame count "
-            f"({capture_timestamps.shape[0]} vs {frame_timestamps.shape[0]})."
-        )
-    if capture_timestamps.shape[1] != len(device_names):
+    if capture_timestamps.ndim == 2 and capture_timestamps.shape[1] != len(device_names):
         raise ValueError(
             f"{len(device_names)} device names for width {capture_timestamps.shape[1]}."
         )
 
+    # Same measurement the finalized report runs, so the live verdict and the persisted one
+    # cannot disagree about a single episode.
+    metrics = compute_frame_metrics(
+        capture_timestamps,
+        frame_timestamps,
+        grid_lag_reference_index=resolve_grid_lag_reference_index(
+            device_names, GRID_LAG_REFERENCE_PREFIXES
+        ),
+    )
     frames = int(capture_timestamps.shape[0])
-    finite_mask = np.all(np.isfinite(capture_timestamps), axis=1)
-    max_skew_s = np.full(frames, np.nan, dtype=np.float64)
-    grid_lag_s = np.full(frames, np.nan, dtype=np.float64)
-    if finite_mask.any():
-        finite_capture = capture_timestamps[finite_mask]
-        max_skew_s[finite_mask] = np.max(finite_capture, axis=1) - np.min(finite_capture, axis=1)
-        grid_lag_s[finite_mask] = np.median(finite_capture, axis=1) - frame_timestamps[finite_mask]
+    finite_mask = metrics.finite_mask
+    max_skew_s = metrics.max_skew_s
+    grid_lag_s = metrics.grid_lag_s
 
     skew_limit_s = tolerance_ms / 1000.0
     lag_limit_s = global_lag_tolerance_ms / 1000.0
@@ -195,18 +204,7 @@ def summarize_episode_capture_timestamps(
     frame_centres_s = np.median(capture_timestamps, axis=1)
     frame_centres_s = frame_centres_s[np.isfinite(frame_centres_s)]
     measured_intervals_s = np.diff(frame_centres_s) if frame_centres_s.size > 1 else np.array([])
-    # Averaged across the episode rather than taken as a median of per-frame gaps. The question
-    # this answers -- did the loop hold the nominal cadence -- is about elapsed time, and
-    # per-frame gaps are not symmetric: a frame that lands late is followed by one that lands
-    # early, so their median sits above the true average and reports drift the episode does not
-    # have. Measured on the hardware rig: median gap 35.4 ms against a mean of 33.34 ms, for a
-    # 30 fps episode whose total duration was correct to 0.03%. The median reading would have
-    # condemned a cadence that was in fact exact.
-    measured_interval_s = (
-        float(frame_centres_s[-1] - frame_centres_s[0]) / (frame_centres_s.size - 1)
-        if frame_centres_s.size > 1
-        else 0.0
-    )
+    measured_interval_s = measured_frame_interval_s(capture_timestamps)
 
     arm_index = next((i for i, name in enumerate(device_names) if name.startswith("fr3.arm.")), None)
     bias_ms: dict[str, float] = {}
@@ -255,10 +253,16 @@ def build_fr3_sync_report(
     tolerance_ms: float = DEFAULT_TOLERANCE_MS,
     global_lag_tolerance_ms: float = DEFAULT_GLOBAL_LAG_TOLERANCE_MS,
 ) -> dict[str, Any]:
-    report = build_soft_sync_report(
+    report = build_capture_timestamp_report(
         dataset_root=dataset_root,
         tolerance_ms=tolerance_ms,
         global_lag_tolerance_ms=global_lag_tolerance_ms,
+        grid_lag_reference_prefixes=GRID_LAG_REFERENCE_PREFIXES,
+        # The signed distribution cannot answer "how far off was it": a lag that swings either
+        # way averages towards zero. The live per-episode line reports |grid lag|, so the
+        # persisted report has to carry it too or the two describe one episode differently --
+        # which is exactly what happened before the split (13.49 live against -3.75 on file).
+        report_absolute_grid_lag=True,
     )
     names = list(report["device_capture_timestamp_names"])
     groups = _classify_devices(names)
@@ -335,7 +339,9 @@ def format_sync_summary_line(report: dict[str, Any]) -> str:
     summary = report["summary"]
     max_skew_ms = float(summary["max_skew_s"]["max"] or 0.0) * 1e3
     p95_skew_ms = float(summary["max_skew_s"]["p95"] or 0.0) * 1e3
-    lag_p95_ms = float(summary["global_lag_s"]["p95"] or 0.0) * 1e3
+    # |grid lag|, matching the live per-episode line. The signed p95 reads low whenever the lag
+    # swings both ways, so the two lines used to disagree about the same episode.
+    lag_p95_ms = float(summary["abs_global_lag_s"]["p95"] or 0.0) * 1e3
     return (
         f"status={report['status']} clock={report['clock_semantics']} "
         f"frames={report['total_frames']} devices={len(report['device_capture_timestamp_names'])} "
