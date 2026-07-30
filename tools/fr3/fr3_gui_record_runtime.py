@@ -299,7 +299,7 @@ def build_sim_robot_config(
         "workspace_max": tuple(getattr(robot_cfg, "workspace_max", (0.9, 0.6, 0.8))),
         "max_target_delta_pos": getattr(robot_cfg, "max_target_delta_pos", None),
         "max_target_delta_rot": getattr(robot_cfg, "max_target_delta_rot", None),
-        "camera_max_skew_ms": float(getattr(robot_cfg, "camera_max_skew_ms", 15.0)),
+        "camera_max_skew_ms": float(getattr(robot_cfg, "camera_max_skew_ms", 20.0)),
         "teleop_control_frequency": float(cfg.control_fps or cfg.dataset.fps),
     }
     joint_names = list(getattr(robot_cfg, "joint_names", []) or [])

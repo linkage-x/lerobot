@@ -8,7 +8,9 @@ robot:
   max_target_delta_pos: [0.001, 0.001, 0.001]
   max_target_delta_rot: [0.01, 0.01, 0.01]
   camera_max_age_ms: 100
-  camera_max_skew_ms: 15
+  # See config_franka_research3.py: each camera contributes its own newest frame, which widened
+  # cross-camera skew to a measured 16.2 ms maximum.
+  camera_max_skew_ms: 20
   cameras:
     # Sensor rate, deliberately above dataset.fps: an image is only as fresh as the sensor's
     # frame period allows, so 60 Hz halves how stale a recorded frame is (measured 42-45 ms

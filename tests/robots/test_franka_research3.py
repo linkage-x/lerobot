@@ -1346,10 +1346,19 @@ def test_get_observation_skips_cameras_when_disabled(robot):
     assert camera.read_latest_calls == 1
 
 
-def test_get_observation_soft_syncs_cameras_from_frame_history(robot):
+def test_get_observation_takes_each_cameras_newest_frame(robot):
+    """No camera is pulled back to match another; a stale frame is never preferred.
+
+    The previous behaviour anchored on the oldest camera's latest frame and asked every camera
+    for the frame closest to it, so `ee` here would have been served its 0.070 frame to match
+    `wrist`. That left both cameras equally stale and set the whole observation's lag by the
+    slowest one -- measured at 25 ms behind the arm read on hardware, against 8.5 ms this way.
+    """
+
     class TimestampedCamera:
         def __init__(self, history):
             self.history = history
+            self.read_closest_calls = 0
 
         def read_latest_with_timestamp(self, max_age_ms):
             del max_age_ms
@@ -1357,32 +1366,36 @@ def test_get_observation_soft_syncs_cameras_from_frame_history(robot):
 
         def read_closest(self, timestamp_s, max_age_ms):
             del max_age_ms
+            self.read_closest_calls += 1
             return min(self.history, key=lambda sample: abs(sample[1] - timestamp_s))
 
     robot.connect()
     robot.reset_capture_timestamp_origin()
     origin = robot._capture_timestamp_origin_s
     robot.cameras = {
+        # An older frame is available and must be ignored in favour of the newest one.
         "ee": TimestampedCamera(
             [
-                (np.full((2, 2, 3), 66, dtype=np.uint8), origin + 0.066),
-                (np.full((2, 2, 3), 100, dtype=np.uint8), origin + 0.100),
+                (np.full((2, 2, 3), 70, dtype=np.uint8), origin + 0.070),
+                (np.full((2, 2, 3), 86, dtype=np.uint8), origin + 0.086),
             ]
         ),
-        "wrist": TimestampedCamera(
-            [(np.full((2, 2, 3), 72, dtype=np.uint8), origin + 0.072)]
-        ),
+        "wrist": TimestampedCamera([(np.full((2, 2, 3), 72, dtype=np.uint8), origin + 0.072)]),
     }
 
     observation = robot.get_observation()
 
-    assert int(observation["ee"][0, 0, 0]) == 66
+    assert int(observation["ee"][0, 0, 0]) == 86
     assert int(observation["wrist"][0, 0, 0]) == 72
-    assert observation["camera.ee.capture_timestamp_s"] == pytest.approx(0.066)
+    assert observation["camera.ee.capture_timestamp_s"] == pytest.approx(0.086)
     assert observation["camera.wrist.capture_timestamp_s"] == pytest.approx(0.072)
+    # The history walk is not merely unused -- it must not be paid for either.
+    assert all(camera.read_closest_calls == 0 for camera in robot.cameras.values())
 
 
 def test_get_observation_rejects_camera_skew_above_threshold(robot):
+    """The guard aborts the episode, so it has to fire on skew the strategy can still produce."""
+
     class TimestampedCamera:
         def __init__(self, timestamp_s):
             self.timestamp_s = timestamp_s
@@ -1391,19 +1404,37 @@ def test_get_observation_rejects_camera_skew_above_threshold(robot):
             del max_age_ms
             return np.zeros((2, 2, 3), dtype=np.uint8), self.timestamp_s
 
-        def read_closest(self, timestamp_s, max_age_ms):
-            del timestamp_s, max_age_ms
+    robot.connect()
+    origin = robot._capture_timestamp_origin_s
+    robot.cameras = {
+        "ee": TimestampedCamera(origin + 0.100),
+        "wrist": TimestampedCamera(origin + 0.125),
+    }
+
+    with pytest.raises(RuntimeError, match="camera skew 25.0 ms"):
+        robot.get_observation()
+
+
+def test_camera_skew_guard_admits_the_worst_skew_measured_on_hardware(robot):
+    """16.2 ms was the maximum over a 300-frame episode; a 15 ms guard would have aborted it."""
+
+    class TimestampedCamera:
+        def __init__(self, timestamp_s):
+            self.timestamp_s = timestamp_s
+
+        def read_latest_with_timestamp(self, max_age_ms):
+            del max_age_ms
             return np.zeros((2, 2, 3), dtype=np.uint8), self.timestamp_s
 
     robot.connect()
     origin = robot._capture_timestamp_origin_s
     robot.cameras = {
         "ee": TimestampedCamera(origin + 0.100),
-        "wrist": TimestampedCamera(origin + 0.120),
+        "wrist": TimestampedCamera(origin + 0.1162),
     }
 
-    with pytest.raises(RuntimeError, match="camera soft-sync skew 20.0 ms"):
-        robot.get_observation()
+    observation = robot.get_observation()
+    assert observation["camera.ee.capture_timestamp_s"] == pytest.approx(0.100)
 
 
 def test_get_observation_uses_kinematics_target_frame_even_if_arm_reports_pose(monkeypatch):

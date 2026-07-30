@@ -77,9 +77,10 @@ class FrankaResearch3MujocoConfig(RobotConfig):
     ik_solver: str = "mujoco"
     ik_tolerance: float = 1e-6
     ik_max_iterations: int = 200
-    # Same soft-sync guard as the hardware robot: a render pass that straggles this far behind
-    # its siblings makes the frame unusable for training, so it fails the episode loudly.
-    camera_max_skew_ms: float = 15.0
+    # Same guard as the hardware robot, kept numerically identical so a sim episode is held to
+    # the envelope the hardware one is: a render pass that straggles this far behind its siblings
+    # makes the frame unusable for training, so it fails the episode loudly.
+    camera_max_skew_ms: float = 20.0
     # Re-randomize the workspace object at each episode reset so sim episodes are not identical.
     randomize_workspace_object: bool = True
     workspace_object_random_radius_m: float = 0.10

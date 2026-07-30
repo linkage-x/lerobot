@@ -180,8 +180,23 @@ mean the same thing by them:
   then one render per camera). Useful for catching a straggling render; **not** comparable to
   hardware sensor timestamps.
 
-The hardware robot additionally fails a frame outright when its cameras disagree by more than
-`camera_max_skew_ms` (15 ms); the MuJoCo robot applies the same guard to its render pass.
+### Which frame each camera contributes
+
+Every camera contributes its own **newest** frame. It used to anchor on the oldest camera's
+latest frame and ask the others for the frame closest to that instant, which bought cross-camera
+simultaneity by pulling the newer camera back — leaving both equally stale and setting the whole
+observation's lag by the slowest camera. Measured over a 300-frame episode at 60 Hz, that cost
+25 ms of image-vs-state offset against 8.5 ms this way, and 8.5 ms is half a frame period, i.e.
+the floor for a sensor nothing triggers.
+
+The trade is real: cross-camera skew p95 goes 7.8 → 12.7 ms. At the measured EE speeds that is
+0.29 mm more parallax disagreement in exchange for 0.98 mm less image-vs-state offset and
+0.30 mm less jitter — and jitter is the part a policy cannot compensate for.
+
+The hardware robot fails a frame outright when its cameras disagree by more than
+`camera_max_skew_ms` (20 ms); the MuJoCo robot applies the same guard to its render pass. 20 ms
+rather than 15 because taking each camera's newest frame widened skew to a measured 16.2 ms
+maximum — and this guard aborts the episode, not the frame.
 
 ## Replay
 
