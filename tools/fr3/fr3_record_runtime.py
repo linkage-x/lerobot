@@ -83,11 +83,20 @@ def _force_binary_spacemouse_for_franka_hand(cfg: RecordConfig) -> None:
     cfg.teleop.tool_mode = SpaceMouseToolMode.BINARY
 
 
-def make_fr3_ee2ee_processors(cfg: RecordConfig) -> tuple[
+def make_fr3_action_processors(cfg: RecordConfig) -> tuple[
     RobotProcessorPipeline[tuple[dict, dict], dict],
     RobotProcessorPipeline[tuple[dict, dict], dict],
     RobotProcessorPipeline[dict, dict],
 ]:
+    """Build the three FR3 pipelines. Recording always stores the **absolute** EE contract.
+
+    A delta action's magnitude is tied to the interval it spans, and this pipeline runs at
+    ``control_fps`` while frames are captured at ``dataset.fps`` -- a step here cannot tell which
+    of its ~6.7 invocations per frame is the recorded one, so a delta computed at capture time
+    spans one control tick against a per-frame grid (measured: 0.5 mm stored where the command
+    advanced 1.0-1.5 mm). Delta contracts are therefore derived offline by differencing
+    consecutive dataset frames; see :mod:`tools.fr3.fr3_delta_action_transform`.
+    """
     teleop_action_processor = RobotProcessorPipeline[tuple[dict, dict], dict](
         steps=[
             DeltaActionToAbsoluteEEAction(
@@ -111,6 +120,44 @@ def make_fr3_ee2ee_processors(cfg: RecordConfig) -> tuple[
         to_output=transition_to_observation,
     )
     return teleop_action_processor, robot_action_processor, robot_observation_processor
+
+
+def build_fr3_ee2ee_dataset_features(
+    *,
+    robot,
+    teleop,
+    teleop_action_processor: RobotProcessorPipeline[tuple[dict, dict], dict],
+    robot_observation_processor: RobotProcessorPipeline[dict, dict],
+    use_videos: bool,
+) -> dict[str, dict]:
+    """Dataset feature contract shared by every FR3 ee2ee recorder.
+
+    Both the terminal recorder and the GUI-driven one (hardware or MuJoCo) must produce
+    byte-identical schemas, otherwise a sim-trained policy cannot be replayed against a
+    hardware dataset. Keeping the construction here -- including the
+    ``observation.device_capture_timestamp`` column that makes per-modality skew auditable
+    offline -- is what enforces that.
+    """
+    dataset_features = combine_feature_dicts(
+        aggregate_pipeline_dataset_features(
+            pipeline=teleop_action_processor,
+            initial_features=create_initial_features(action=teleop.action_features),
+            use_videos=use_videos,
+        ),
+        aggregate_pipeline_dataset_features(
+            pipeline=robot_observation_processor,
+            initial_features=create_initial_features(observation=robot.observation_features),
+            use_videos=use_videos,
+        ),
+    )
+    capture_timestamp_names = tuple(getattr(robot, "capture_timestamp_feature_names", ()))
+    if capture_timestamp_names:
+        dataset_features["observation.device_capture_timestamp"] = {
+            "dtype": "float64",
+            "shape": (len(capture_timestamp_names),),
+            "names": list(capture_timestamp_names),
+        }
+    return dataset_features
 
 
 def _quaternion_angle_error_rad(target_xyzw: np.ndarray, current_xyzw: np.ndarray) -> float:
@@ -289,27 +336,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     _force_binary_spacemouse_for_franka_hand(cfg)
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop)
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_fr3_ee2ee_processors(cfg)
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_fr3_action_processors(cfg)
 
-    dataset_features = combine_feature_dicts(
-        aggregate_pipeline_dataset_features(
-            pipeline=teleop_action_processor,
-            initial_features=create_initial_features(action=teleop.action_features),
-            use_videos=cfg.dataset.video,
-        ),
-        aggregate_pipeline_dataset_features(
-            pipeline=robot_observation_processor,
-            initial_features=create_initial_features(observation=robot.observation_features),
-            use_videos=cfg.dataset.video,
-        ),
+    dataset_features = build_fr3_ee2ee_dataset_features(
+        robot=robot,
+        teleop=teleop,
+        teleop_action_processor=teleop_action_processor,
+        robot_observation_processor=robot_observation_processor,
+        use_videos=cfg.dataset.video,
     )
-    capture_timestamp_names = tuple(getattr(robot, "capture_timestamp_feature_names", ()))
-    if capture_timestamp_names:
-        dataset_features["observation.device_capture_timestamp"] = {
-            "dtype": "float64",
-            "shape": (len(capture_timestamp_names),),
-            "names": list(capture_timestamp_names),
-        }
 
     if cfg.resume:
         dataset = LeRobotDataset(

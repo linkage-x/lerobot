@@ -17,7 +17,7 @@ from lerobot.teleoperators import make_teleoperator_from_config
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.utils import init_logging
 
-from tools.fr3.fr3_record_runtime import make_fr3_ee2ee_processors
+from tools.fr3.fr3_record_runtime import make_fr3_action_processors
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MAX_SESSION_SECONDS = 365 * 24 * 60 * 60
@@ -44,7 +44,7 @@ def teleoperate(cfg: RecordConfig) -> None:
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop)
     teleop_action_processor, robot_action_processor, robot_observation_processor = (
-        make_fr3_ee2ee_processors(cfg)
+        make_fr3_action_processors(cfg)
     )
     events = {
         "exit_early": False,

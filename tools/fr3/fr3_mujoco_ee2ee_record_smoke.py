@@ -42,7 +42,13 @@ from lerobot.scripts.lerobot_record import DatasetRecordConfig, RecordConfig
 from lerobot.teleoperators.spacemouse.configuration_spacemouse import SpaceMouseTeleopConfig
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.rotation import Rotation
-from tools.fr3.fr3_record_runtime import make_fr3_ee2ee_processors
+from lerobot.robots.franka_research3.action_modes import (
+    delta_reference_for_action_mode,
+    is_delta_action_mode,
+)
+from lerobot.robots.franka_research3.processor_franka_research3 import delta_ee_action_keys
+
+from tools.fr3.fr3_record_runtime import make_fr3_action_processors
 
 _D435I_IMAGE_SHAPE = (480, 640, 3)
 _SIM_CAMERA_NAMES = FR3MujocoEnvConfig().camera_names
@@ -167,7 +173,7 @@ def main() -> int:
         play_sounds=False,
         display_data=False,
     )
-    teleop_action_processor, _, robot_observation_processor = make_fr3_ee2ee_processors(record_cfg)
+    teleop_action_processor, _, robot_observation_processor = make_fr3_action_processors(record_cfg)
 
     teleop_features = {
         "enabled": bool,
@@ -278,7 +284,15 @@ def main() -> int:
             "joint_6.pos",
             "joint_7.pos",
         ]
-        expected_action_names = ["ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw", "gripper.pos"]
+        # Action names follow cfg.robot.action_mode: a delta dataset must not advertise absolute
+        # EE keys, and vice versa. Asserting one hard-coded list would make this smoke test fail
+        # for the delta contract instead of checking it.
+        if is_delta_action_mode(record_cfg.robot.action_mode):
+            expected_action_names = list(
+                delta_ee_action_keys(delta_reference_for_action_mode(record_cfg.robot.action_mode))
+            )
+        else:
+            expected_action_names = ["ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw", "gripper.pos"]
         if obs_names != expected_observation_names:
             raise RuntimeError(f"Unexpected observation.state names: {obs_names}")
         if act_names != expected_action_names:
