@@ -23,6 +23,22 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+for _import_root in (str(_REPO_ROOT / "src"), str(_REPO_ROOT)):
+    if _import_root not in sys.path:
+        sys.path.insert(0, _import_root)
+
+from lerobot.robots.franka_research3.action_modes import (  # noqa: E402
+    ACTION_MODE_ABSOLUTE_EE,
+    ACTION_MODES,
+    is_delta_action_mode,
+)
+
+from tools.fr3.fr3_delta_action_transform import (  # noqa: E402
+    derive_delta_action,
+    summarize_delta_scale,
+)
+
 
 DEFAULT_DATASET_ROOT = Path("dataset_test/single_cube2_20260429_165325")
 DEFAULT_CAMERAS = "observation.images.cam_1,observation.images.cam_3"
@@ -320,6 +336,7 @@ def prepare_dataset_view(
     image_resize_shape: list[int] | None,
     copy_videos: bool,
     overwrite: bool,
+    action_mode: str = ACTION_MODE_ABSOLUTE_EE,
 ) -> None:
     src_roots = discover_dataset_roots(src_root)
     if overwrite and dst_root.exists():
@@ -454,6 +471,8 @@ def prepare_dataset_view(
                 copy_or_symlink_file(src_video, dst_video, copy=copy_videos)
 
     processed_rows = 0
+    delta_action_names: list[str] = []
+    delta_reports: list[dict] = []
     for source_idx, (root, data_files) in enumerate(zip(src_roots, source_data_files, strict=True)):
         features = source_infos[source_idx]["features"]
         file_map = source_file_maps[source_idx]
@@ -498,6 +517,24 @@ def prepare_dataset_view(
                 action = loaded_action_npy[source_processed_rows : source_processed_rows + len(df)]
             else:
                 action = as_matrix(df[action_key], action_key, feature_dim(features[action_key]))
+            if is_delta_action_mode(action_mode):
+                # Differenced here, on the base action and before any appended columns, so the
+                # delta spans exactly one dataset frame. Episode boundaries are respected inside
+                # derive_delta_action; the call self-checks by rebuilding the absolute stream.
+                action, delta_action_names, delta_report = derive_delta_action(
+                    absolute_action=action,
+                    action_names=list(features[action_key]["names"]),
+                    observation_state=as_matrix(
+                        df["observation.state"],
+                        "observation.state",
+                        feature_dim(features["observation.state"]),
+                    ),
+                    observation_names=list(features["observation.state"]["names"]),
+                    episode_index=np.asarray(df["episode_index"]),
+                    action_mode=action_mode,
+                )
+                action = action.astype(np.float32)
+                delta_reports.append(delta_report)
             action_append = select_action_append_matrix(
                 df,
                 features,
@@ -591,6 +628,10 @@ def prepare_dataset_view(
         new_features[cam] = resize_camera_feature(first_features[cam], image_resize_shape)
     action_names = first_features.get(action_key, {}).get("names")
     base_action_dim = all_action.shape[1] - len(append_feature_names)
+    if is_delta_action_mode(action_mode):
+        # The delta names carry the reference, which is what makes the view self-describing:
+        # an offline tool can tell from the column names alone how to integrate it back.
+        action_names = delta_action_names
     if action_names is None or len(action_names) != base_action_dim:
         action_names = [f"action.{i}" for i in range(base_action_dim)]
     action_names = [*action_names, *append_feature_names]
@@ -640,8 +681,54 @@ def prepare_dataset_view(
         "action_dim": int(all_action.shape[1]),
         "total_episodes": int(total_episodes),
         "total_rows": int(total_rows),
+        # Recorded so the action contract of this view, and the evidence that the conversion was
+        # invertible, are auditable from the dataset rather than only from the command line.
+        "action_mode": action_mode,
+        "delta_transform": _summarize_delta_reports(
+            delta_reports,
+            delta_action=all_action,
+            delta_names=action_names,
+            append_names=append_feature_names,
+            fps=int(first_info.get("fps") or 0),
+        )
+        if is_delta_action_mode(action_mode)
+        else None,
     }
     write_json(dst_root / "meta/il_view_manifest.json", manifest)
+    if is_delta_action_mode(action_mode):
+        scale = manifest["delta_transform"]["per_frame_scale"]
+        print(
+            f"[prepare] action_mode={action_mode} "
+            f"per-frame translation p95={scale['p95_translation_per_frame_mm']:.3f} mm "
+            f"(implied {scale['implied_p95_speed_mm_s']:.1f} mm/s at {first_info.get('fps')} fps), "
+            f"reconstruction max error {manifest['delta_transform']['reconstruction_max_position_error_mm']:.5f} mm"
+        )
+
+
+def _summarize_delta_reports(
+    reports: list[dict],
+    *,
+    delta_action: np.ndarray,
+    delta_names: list[str],
+    append_names: list[str],
+    fps: int,
+) -> dict:
+    base_columns = delta_action.shape[1] - len(append_names)
+    return {
+        "frames": int(sum(int(report["frames"]) for report in reports)),
+        "episodes": int(sum(int(report["episodes"]) for report in reports)),
+        "reconstruction_max_position_error_mm": max(
+            (float(report["reconstruction_max_position_error_mm"]) for report in reports), default=0.0
+        ),
+        "reconstruction_max_rotation_error_deg": max(
+            (float(report["reconstruction_max_rotation_error_deg"]) for report in reports), default=0.0
+        ),
+        "per_frame_scale": summarize_delta_scale(
+            delta_action=delta_action[:, :base_columns].astype(np.float64),
+            delta_names=delta_names[:base_columns],
+            fps=fps,
+        ),
+    }
 
 
 def make_train_config(args: argparse.Namespace, view_root: Path, repo_id: str, config_path: Path) -> None:
@@ -921,6 +1008,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--job-name", default=None)
     parser.add_argument("--overwrite-view", action="store_true")
+    parser.add_argument(
+        "--action-mode",
+        choices=ACTION_MODES,
+        default=ACTION_MODE_ABSOLUTE_EE,
+        help=(
+            "Action contract for the generated training view. Recording always stores absolute EE; "
+            "the delta modes are derived here as consecutive-dataset-frame differences."
+        ),
+    )
     parser.add_argument("--copy-videos", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--smoke", action="store_true")
@@ -1006,6 +1102,7 @@ def main() -> None:
             image_resize_shape=image_resize_shape,
             copy_videos=args.copy_videos,
             overwrite=args.overwrite_view,
+            action_mode=args.action_mode,
         )
         manifest = load_json(view_root / "meta/il_view_manifest.json")
         make_train_config(args, view_root, args.repo_id, config_path)
