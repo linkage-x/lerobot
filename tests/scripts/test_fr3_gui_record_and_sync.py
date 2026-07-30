@@ -251,8 +251,10 @@ def test_file_report_labels_hardware_clock_semantics(tmp_path):
     )
     report, _ = fr3_sync_audit.write_fr3_sync_report(dataset_root)
     assert report["clock_semantics"] == "hardware_mixed"
-    # Camera columns must never be described as exposure midpoints.
-    assert "not exposure midpoint" in report["interpretation"]
+    # Camera columns must never be described as exposure midpoints -- nor as the driver
+    # handover, which is how they were documented until the stamp was traced to the camera's
+    # own post-processing step.
+    assert "neither exposure midpoint nor driver handover" in report["interpretation"]
     assert report["device_groups"]["camera"] == ["camera.ee.capture_timestamp_s"]
     assert report["device_groups"]["gripper"] == ["pika_gripper.capture_timestamp_s"]
 
@@ -495,3 +497,33 @@ def test_workstation_recorder_runs_offline_so_a_hub_fallback_cannot_hang_it():
     assert marker in source
     workstation_branch = source.split("if is_workstation:")[-1].split("recorder_log_path =")[0]
     assert marker in workstation_branch
+
+
+def test_measured_interval_is_the_average_cadence_not_the_median_gap():
+    """Jitter is asymmetric: a late frame is followed by an early one.
+
+    Taking the median of per-frame gaps therefore reads above the true average and condemns a
+    cadence the episode actually held. Measured on the hardware rig: median gap 35.4 ms against
+    a mean of 33.34 ms, for a 30 fps episode whose total duration was correct to 0.03%.
+    """
+    frames = 300
+    nominal_s = 1.0 / 30.0
+    # Gaps alternate long/short around the nominal cadence, so total elapsed time is exact
+    # while the median gap sits clearly above nominal.
+    gaps = np.where(np.arange(frames - 1) % 3 == 2, nominal_s * 0.86, nominal_s * 1.07)
+    centres = np.concatenate([[0.0], np.cumsum(gaps)])
+    capture = np.repeat(centres[:, None], len(DEVICE_NAMES), axis=1)
+
+    summary = fr3_sync_audit.summarize_episode_capture_timestamps(
+        capture_timestamps=capture,
+        frame_timestamps=np.arange(frames, dtype=np.float64) * nominal_s,
+        device_names=DEVICE_NAMES,
+        clock_semantics="hardware_mixed",
+    )
+
+    elapsed_mean_ms = (centres[-1] - centres[0]) / (frames - 1) * 1e3
+    median_gap_ms = float(np.median(gaps)) * 1e3
+    # The fixture is only meaningful if the two statistics actually disagree.
+    assert median_gap_ms > elapsed_mean_ms + 1.0
+    assert summary["measured_frame_interval_ms"] == pytest.approx(elapsed_mean_ms, abs=1e-6)
+    assert summary["measured_frame_interval_ms"] < summary["nominal_frame_interval_ms"] * 1.05

@@ -140,15 +140,25 @@ What the numbers mean:
   dataset claims. **`A > B` means the recorded frame spacing is a fiction**: the dataset labels
   frames as evenly spaced at `1/fps` while they were captured further apart. Lower
   `dataset.fps`, or cut per-frame work, and re-record. Do not train on that cadence as-is.
+  `A` is the episode's elapsed time divided by its frame count, *not* a median of per-frame
+  gaps — jitter is asymmetric (a late frame is followed by an early one), so the median gap
+  reads high and condemns a cadence that was in fact exact. On the hardware rig the median gap
+  was 35.4 ms where the true average was 33.34 ms against a 33.33 ms nominal.
 - `bias_vs_arm_ms[...]` — each modality's median offset from the arm read. A *constant* bias is
   a fixed pipeline offset and is reported, never silently subtracted.
 
 `clock_semantics` says which clock produced the timestamps, because the two backends do not
 mean the same thing by them:
 
-- `hardware_mixed` — camera columns are RealSense **frame timestamps** (driver handover, *not*
-  exposure midpoint; a constant exposure/readout offset may remain). Arm and gripper columns
-  are host `perf_counter` reads. Cross-device skew is physically meaningful here.
+- `hardware_mixed` — every column is a host `perf_counter` read, but not of the same event.
+  Arm and gripper are stamped when their driver read returns, inside `get_observation()`.
+  Camera columns are stamped by the camera's background read loop *after* it has converted and
+  post-processed the frame — so they are neither exposure midpoint nor driver handover, and
+  they carry the conversion cost. They are also older than the arm read by construction: the
+  loop hands over the most recent frame it already has. Measured on the rig, cameras sit
+  5.7 ms (`ee`) and 17.3 ms (`side`) ahead of the arm, each stable to ~2 ms, with `side`
+  drifting against `ee` at ~0.35 ms/s (two free-running 30 fps sensors beating). Cross-device
+  skew is therefore real but dominated by a fixed per-camera pipeline offset, not by jitter.
 - `sim_extraction_wallclock` — MuJoCo extracts every modality from one physics instant, so
   there is no acquisition skew to measure. These timestamps record extraction cost (state read,
   then one render per camera). Useful for catching a straggling render; **not** comparable to
