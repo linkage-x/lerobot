@@ -182,21 +182,29 @@ mean the same thing by them:
 
 ### Which frame each camera contributes
 
-Every camera contributes its own **newest** frame. It used to anchor on the oldest camera's
-latest frame and ask the others for the frame closest to that instant, which bought cross-camera
-simultaneity by pulling the newer camera back — leaving both equally stale and setting the whole
-observation's lag by the slowest camera. Measured over a 300-frame episode at 60 Hz, that cost
-25 ms of image-vs-state offset against 8.5 ms this way, and 8.5 ms is half a frame period, i.e.
-the floor for a sensor nothing triggers.
+Every camera is anchored on the **oldest** of the cameras' latest frames and asked for its frame
+closest to that instant. This is what bounds cross-camera skew, and the bound is what makes the
+guard below satisfiable.
 
-The trade is real: cross-camera skew p95 goes 7.8 → 12.7 ms. At the measured EE speeds that is
-0.29 mm more parallax disagreement in exchange for 0.98 mm less image-vs-state offset and
-0.30 mm less jitter — and jitter is the part a policy cannot compensate for.
+The cost is staleness: both cameras end up as old as the slowest one, measured 25 ms behind the
+arm read at 60 Hz. Serving each camera its own newest frame instead measures 8.5 ms — half a
+frame period, the floor for a sensor nothing triggers — and **was tried on hardware, where it
+aborted an episode after 21 frames** with 25.1 ms of skew. Nothing bounds the gap between two
+cameras' newest frames: their background threads deliver independently, and one falling a whole
+period behind opens a gap past any guard worth keeping.
+
+Worth recording why the offline analysis missed that, because the same trap is easy to walk into
+again: the comparison reconstructed each camera's newest frame as `selected + k × period` from
+already-recorded episodes. That arithmetic is exact, but every `selected` in it came from the
+anchored strategy, so the reconstruction inherited the very regularity anchoring imposes and
+predicted a 16.2 ms worst case. Thread scheduling and dropped frames are invisible in data that
+anchoring already cleaned up — a strategy cannot be evaluated on data produced by its
+alternative.
 
 The hardware robot fails a frame outright when its cameras disagree by more than
 `camera_max_skew_ms` (20 ms); the MuJoCo robot applies the same guard to its render pass. 20 ms
-rather than 15 because taking each camera's newest frame widened skew to a measured 16.2 ms
-maximum — and this guard aborts the episode, not the frame.
+rather than 15 because the sim renderer under software EGL was measured at 19 ms and this guard
+aborts the episode, not the frame.
 
 ## Replay
 
