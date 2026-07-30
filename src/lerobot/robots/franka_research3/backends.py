@@ -26,7 +26,7 @@ import struct
 import sys
 import threading
 import time
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -176,10 +176,54 @@ class PandaPyArmDriver:
 
     def connect(self) -> None:
         self._robot = self._panda_cls(self.robot_ip)
-        self._start_controller()
+        # One state read serves both the mode gate and the controller's initial setpoint. The
+        # state reader starts polling immediately afterwards, so a second round-trip here would
+        # only add latency to the connect path.
+        state = self._robot.get_state()
+        self._assert_arm_accepts_control(state)
+        self._start_controller(state)
         self._start_state_reader()
 
-    def _start_controller(self) -> None:
+    # Modes libfranka's control loop cannot start from, and what the operator has to do about
+    # each. Keyed by `RobotMode` name so this needs no libfranka import: the enum lives in a
+    # different module of the binding than the one the driver already depends on.
+    _UNCONTROLLABLE_ARM_MODES = {
+        "kUserStopped": (
+            "the arm is in user-stop. Release the user-stop button, confirm the arm is unlocked "
+            "in Desk, then reconnect."
+        ),
+        "kReflex": (
+            "the arm is in a reflex/error state. Clear the error in Desk (or call "
+            "Panda.recover()) before reconnecting."
+        ),
+        "kGuiding": (
+            "the arm is in guiding mode. Release the enabling device on the pilot grip before "
+            "reconnecting."
+        ),
+    }
+
+    def _assert_arm_accepts_control(self, state: Any) -> None:
+        """Refuse a mode the control loop can never start in, before start_controller() blocks.
+
+        ``start_controller()`` is a C++ call that waits for libfranka's control loop to come up,
+        and takes no timeout. With the user-stop pressed that loop can never start, so the wait
+        never returns: the process emits nothing and cannot be told to quit through its own stdin
+        either, which is what left the GUI stuck on "Starting FR3 real recorder" with nothing to
+        act on. The mode is readable beforehand, so read it and say which condition is blocking.
+
+        A backend that does not report ``robot_mode`` is left alone rather than assumed healthy
+        or assumed broken -- there is nothing to check against.
+        """
+        mode = getattr(state, "robot_mode", None)
+        if mode is None:
+            return
+        mode_name = getattr(mode, "name", str(mode))
+        remedy = self._UNCONTROLLABLE_ARM_MODES.get(mode_name)
+        if remedy is not None:
+            raise RuntimeError(f"FR3 at {self.robot_ip} cannot start a controller: {remedy}")
+        logger.info("FR3 arm at %s accepts control (robot_mode=%s)", self.robot_ip, mode_name)
+
+    def _start_controller(self, state: Any | None = None) -> None:
         if self._robot is None:
             raise RuntimeError("Arm backend is not connected.")
         self._controller = self._controllers.JointPosition()
@@ -189,7 +233,7 @@ class PandaPyArmDriver:
             self._controller.set_stiffness(self.stiffness)
         if self.filter_coeff is not None:
             self._controller.set_filter(self.filter_coeff)
-        current_joint_positions = self._refresh_joint_positions_cache()
+        current_joint_positions = self._refresh_joint_positions_cache(state)
         self._controller.set_control(current_joint_positions)
         self._robot.start_controller(self._controller)
 
@@ -198,10 +242,13 @@ class PandaPyArmDriver:
             self._robot.stop_controller()
             self._controller = None
 
-    def _refresh_joint_positions_cache(self) -> np.ndarray:
+    def _refresh_joint_positions_cache(self, state: Any | None = None) -> np.ndarray:
+        """Seed the cache from ``state`` when the caller already has one, else read a fresh one."""
         if self._robot is None:
             raise RuntimeError("Arm backend is not connected.")
-        joint_positions = np.asarray(self._robot.get_state().q, dtype=np.float64)
+        if state is None:
+            state = self._robot.get_state()
+        joint_positions = np.asarray(state.q, dtype=np.float64)
         with self._state_lock:
             self._cached_joint_positions = joint_positions.copy()
         return joint_positions

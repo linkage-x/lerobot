@@ -492,8 +492,17 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     clock_semantics = "sim_extraction_wallclock" if backend == "sim" else "hardware_mixed"
 
     try:
+        # Progress lines around each connect, because these are the calls that can block for a
+        # long time on hardware: the arm waits on libfranka, and each RealSense opens a USB
+        # pipeline. Every other emit happens after the whole connect sequence, so without these
+        # a stall here reaches the operator as the gateway's own spawn message and nothing else
+        # -- indistinguishable from a recorder that died before its first line.
+        emit(f"Connecting {robot.name} ({backend})")
         robot.connect()
+        emit(f"Connected {robot.name}")
+        emit(f"Connecting teleoperator {cfg.teleop.type}")
         teleop.connect()
+        emit(f"Connected teleoperator {cfg.teleop.type}")
         sync_gripper = getattr(teleop, "sync_gripper_baseline", None)
         if callable(sync_gripper):
             observation = robot.get_observation(include_cameras=False)

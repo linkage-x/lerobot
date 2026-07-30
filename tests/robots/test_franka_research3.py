@@ -252,6 +252,106 @@ def test_pandapy_arm_driver_connect_seeds_controller_with_current_joints(monkeyp
     assert DummyPanda.instances[-1].started_controllers == [controller]
 
 
+@pytest.mark.parametrize(
+    ("mode_name", "expected_message"),
+    [
+        ("kUserStopped", "user-stop"),
+        ("kReflex", "reflex"),
+        ("kGuiding", "guiding"),
+    ],
+)
+def test_pandapy_arm_driver_connect_refuses_modes_that_cannot_start_a_controller(
+    monkeypatch, mode_name, expected_message
+):
+    """`start_controller()` takes no timeout and waits on a loop these modes never start.
+
+    Blocking there is silent and uninterruptible -- the recorder emits nothing and stops reading
+    its own stdin -- so the mode has to be refused before the call, with the remedy named.
+    """
+
+    class DummyJointPositionController:
+        def set_control(self, joint_positions):
+            del joint_positions
+
+    class DummyPanda:
+        instances: list["DummyPanda"] = []
+
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.state = types.SimpleNamespace(
+                q=np.zeros(7, dtype=np.float64),
+                robot_mode=types.SimpleNamespace(name=mode_name),
+            )
+            self.started_controllers = []
+            type(self).instances.append(self)
+
+        def start_controller(self, controller):
+            self.started_controllers.append(controller)
+
+        def stop_controller(self):
+            return None
+
+        def get_state(self):
+            return self.state
+
+    monkeypatch.setitem(
+        sys.modules,
+        "panda_py",
+        types.SimpleNamespace(
+            Panda=DummyPanda,
+            controllers=types.SimpleNamespace(JointPosition=DummyJointPositionController),
+        ),
+    )
+
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    with pytest.raises(RuntimeError, match=expected_message):
+        driver.connect()
+    assert DummyPanda.instances[-1].started_controllers == []
+
+
+def test_pandapy_arm_driver_connect_accepts_a_controllable_mode(monkeypatch):
+    """A reported mode that *can* take control must not be turned into a refusal."""
+
+    class DummyJointPositionController:
+        def set_control(self, joint_positions):
+            del joint_positions
+
+    class DummyPanda:
+        instances: list["DummyPanda"] = []
+
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.state = types.SimpleNamespace(
+                q=np.zeros(7, dtype=np.float64),
+                robot_mode=types.SimpleNamespace(name="kIdle"),
+            )
+            self.started_controllers = []
+            type(self).instances.append(self)
+
+        def start_controller(self, controller):
+            self.started_controllers.append(controller)
+
+        def stop_controller(self):
+            return None
+
+        def get_state(self):
+            return self.state
+
+    monkeypatch.setitem(
+        sys.modules,
+        "panda_py",
+        types.SimpleNamespace(
+            Panda=DummyPanda,
+            controllers=types.SimpleNamespace(JointPosition=DummyJointPositionController),
+        ),
+    )
+
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+
+    assert DummyPanda.instances[-1].started_controllers == [driver._controller]
+
+
 def test_pandapy_arm_driver_get_joint_positions_uses_cached_state(monkeypatch):
     class DummyJointPositionController:
         def set_control(self, joint_positions):
