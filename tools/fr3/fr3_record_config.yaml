@@ -10,18 +10,21 @@ robot:
   camera_max_age_ms: 100
   camera_max_skew_ms: 15
   cameras:
+    # Sensor rate, deliberately above dataset.fps: an image is only as fresh as the sensor's
+    # frame period allows, so 60 Hz halves how stale a recorded frame is (measured 42-45 ms
+    # behind the arm read at 30 Hz). The dataset is still written at dataset.fps.
     ee:
       type: intelrealsense
       serial_number_or_name: "315122271876"
       width: 640
       height: 480
-      fps: 30
+      fps: 60
     side:
       type: intelrealsense
       serial_number_or_name: "243122071795"
       width: 640
       height: 480
-      fps: 30
+      fps: 60
 
 teleop:
   type: spacemouse
@@ -36,9 +39,12 @@ teleop:
   scale_wy: 0.0
 
 dataset:
-  repo_id: hph/fr3_pick_place_ee2ee_v1
+  # Separate root from the 30 Hz-camera recording: the camera rate does not appear in the
+  # schema, so appending here would mix two capture conditions in one dataset with nothing
+  # to flag it.
+  repo_id: hph/fr3_pick_place_ee2ee_v1_cam60
   single_task: Pick and place
-  root: /lerobot/outputs/datasets/fr3_pick_place_ee2ee_v1
+  root: /lerobot/outputs/datasets/fr3_pick_place_ee2ee_v1_cam60
   fps: 30
   num_episodes: 20
   episode_time_s: 10

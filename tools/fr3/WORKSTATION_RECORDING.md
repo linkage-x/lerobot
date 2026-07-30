@@ -22,6 +22,11 @@ The SpaceMouse is the only device that is physically opened in both backends. In
 the arm/gripper/camera rows stay `idle` ("simulated in MuJoCo") rather than pretending to be
 connected.
 
+**Open the gripper after `move_to_start` and before StartEpisode.** The homing move leaves it
+wherever the previous episode ended, so starting a take without opening it records a first frame
+whose gripper state does not match the task's starting condition — and on a grasp task the
+policy learns that opening is something that happens before the data begins.
+
 Episode control maps onto the gateway's existing recorder protocol:
 
 | UI | stdin | recorder behaviour |
