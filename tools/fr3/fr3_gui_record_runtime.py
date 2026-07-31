@@ -39,9 +39,11 @@ and a sim episode can be replayed against hardware tooling without conversion.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import logging
 from pathlib import Path
 import queue
+import re
 import sys
 import threading
 from typing import Any
@@ -331,6 +333,34 @@ def _dataset_root_for_backend(cfg: RecordConfig, backend: str) -> str:
     return str(path) if path.name.endswith("_sim") else str(path.parent / f"{path.name}_sim")
 
 
+# What the gateway strips off a directory name to attribute a session to its dataset. Matching
+# it here is what keeps a session countable: `_dataset_name_prefixes` recognises exactly this.
+_SESSION_STAMP_RE = re.compile(r"_\d{8}_\d{6}(?:_\d{2})?$")
+
+
+def _session_dataset_root(cfg: RecordConfig, backend: str) -> str:
+    """This session's own root: the configured name plus the instant the session started.
+
+    The config names a *series* of recordings, not one dataset. Writing every session into one
+    fixed root meant a run's identity was the moment you happened to look at the directory --
+    change a camera rate, a gripper, the lighting, and the episodes landed in the same pile with
+    nothing to separate them. Stamping the root makes each session a dataset, which is what the
+    docker recorder (`fr3_record.py`) and the Thor recorder have always done, and what the
+    gateway's episode counter already expects when it strips this suffix back off.
+
+    Two cases keep the configured root verbatim: ``cfg.resume``, which asks for one specific
+    dataset by definition, and a root that is already stamped, so pointing the recorder at an
+    existing session extends it instead of nesting a second stamp inside the first.
+    """
+    root = _dataset_root_for_backend(cfg, backend)
+    if not root or cfg.resume:
+        return root
+    path = Path(root)
+    if _SESSION_STAMP_RE.search(path.name):
+        return str(path)
+    return str(path.parent / f"{path.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+
+
 def _assert_resumable_or_absent(dataset_root: str) -> bool:
     """Is there a dataset at ``dataset_root`` that can actually be resumed?
 
@@ -462,14 +492,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         use_videos=cfg.dataset.video,
     )
 
-    dataset_root = _dataset_root_for_backend(cfg, backend)
+    dataset_root = _session_dataset_root(cfg, backend)
     repo_id = f"{cfg.dataset.repo_id}_sim" if backend == "sim" else cfg.dataset.repo_id
     camera_count = max(len(getattr(robot, "cameras", {}) or getattr(robot_cfg, "camera_names", ())), 1)
 
-    # Every GUI Connect opens a new recorder process against a dataset root that is fixed by
-    # the config (or by the bound task). The second session must extend that dataset, not die
-    # on LeRobotDataset.create()'s exist_ok=False mkdir -- which is what an operator pressing
-    # Connect twice would otherwise get, as a raw FileExistsError traceback.
+    # A stamped root is normally new, so this normally creates. It still has to handle an
+    # existing one: `cfg.resume` and an already-stamped root both name a specific dataset, and
+    # then a second session must extend it rather than die on LeRobotDataset.create()'s
+    # exist_ok=False mkdir -- a raw FileExistsError traceback in the operator's face.
     existing_dataset = _assert_resumable_or_absent(dataset_root)
     if existing_dataset:
         dataset = LeRobotDataset(

@@ -9,6 +9,7 @@ can act on.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -488,6 +489,57 @@ def test_resume_gate_refuses_an_info_only_dataset_instead_of_falling_back_to_the
     root = _write_dataset_meta(tmp_path / "ds", with_tasks=False)
     with pytest.raises(RuntimeError, match="no task metadata"):
         _assert_resumable_or_absent(str(root))
+
+
+def _session_config(root: str, *, resume: bool = False):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(dataset=SimpleNamespace(root=root), resume=resume)
+
+
+def test_each_session_gets_its_own_stamped_dataset_root():
+    """The config names a series of recordings; a session is one dataset inside it."""
+    from tools.fr3.fr3_gui_record_runtime import _resolve_workspace_path, _session_dataset_root
+
+    root = _session_dataset_root(_session_config("/lerobot/outputs/datasets/fr3_spacemouse"), "real")
+
+    name = Path(root).name
+    assert re.fullmatch(r"fr3_spacemouse_\d{8}_\d{6}", name)
+    # The container-style config path still lands in this checkout, stamp and all.
+    assert Path(root).parent == Path(_resolve_workspace_path("/lerobot/outputs/datasets"))
+
+    # And the stamp is what makes two sessions two datasets rather than one pile.
+    assert _session_dataset_root(_session_config("/lerobot/outputs/datasets/fr3_spacemouse"), "real")
+
+
+def test_the_stamp_survives_the_sim_suffix_where_the_counter_can_still_strip_it():
+    """`<name>_sim_<stamp>`, not `<name>_<stamp>_sim` -- the gateway strips a *trailing* stamp."""
+    from tools.fr3.fr3_gui_record_runtime import _session_dataset_root
+
+    root = _session_dataset_root(_session_config("/lerobot/outputs/datasets/fr3_spacemouse"), "sim")
+
+    name = Path(root).name
+    assert re.fullmatch(r"fr3_spacemouse_sim_\d{8}_\d{6}", name)
+    assert gateway._dataset_name_prefixes(name) >= {"fr3_spacemouse_sim"}
+
+
+def test_resume_keeps_the_configured_root_because_it_names_one_dataset():
+    from tools.fr3.fr3_gui_record_runtime import _resolve_workspace_path, _session_dataset_root
+
+    config = _session_config("/lerobot/outputs/datasets/fr3_spacemouse", resume=True)
+
+    assert _session_dataset_root(config, "real") == _resolve_workspace_path(
+        "/lerobot/outputs/datasets/fr3_spacemouse"
+    )
+
+
+def test_an_already_stamped_root_is_extended_rather_than_stamped_twice():
+    """Pointing the recorder at one session must not nest a second stamp inside the first."""
+    from tools.fr3.fr3_gui_record_runtime import _resolve_workspace_path, _session_dataset_root
+
+    stamped = "/lerobot/outputs/datasets/fr3_spacemouse_20260731_101500"
+
+    assert _session_dataset_root(_session_config(stamped), "real") == _resolve_workspace_path(stamped)
 
 
 def test_workstation_recorder_runs_offline_so_a_hub_fallback_cannot_hang_it():

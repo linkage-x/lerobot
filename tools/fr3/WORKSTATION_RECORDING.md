@@ -36,8 +36,24 @@ Episode control maps onto the gateway's existing recorder protocol:
 | Discard | `n` | ends the episode early and drops it |
 | Exit | `exit` | finalizes the dataset and shuts down |
 
-Pressing **Connect** again on an existing dataset root resumes it (episodes accumulate) after a
-schema-compatibility check, instead of failing on the root already existing.
+### One session, one dataset
+
+`dataset.root` names a *series*; the recorder appends `_<YYYYmmdd_HHMMSS>` to it, so every
+**Connect** opens its own root — `fr3_spacemouse_20260731_143012`. Sessions stay separable, which
+matters because the things that change between them (camera rate, gripper, lighting, a
+firmware) appear nowhere in the schema. The gateway's episode counter strips that suffix back
+off, so all of a series' sessions still attribute to one dataset name, and this is what the
+docker recorder (`fr3_record.py`) and the Thor recorder have always done.
+
+The consequence: **pressing Connect twice gives you two datasets, not one longer one.** A session
+interrupted halfway does not continue into the next Connect. Two ways to extend one specific
+dataset instead, both of which skip the stamp:
+
+- set `resume: true` in the config, which names one dataset by definition, or
+- point `dataset.root` at an already-stamped root, which is extended rather than stamped again.
+
+Either way the recorder refuses to append episodes whose schema disagrees with the existing ones,
+rather than producing a dataset that only fails at training time.
 
 ## Action contract
 

@@ -41,17 +41,18 @@ teleop:
   scale_wy: 0.0
 
 dataset:
-  # Named for the rig and the capture condition, nothing else. The task belongs to the episode
+  # Names the rig and how it is driven, nothing else. The task belongs to the episode
   # (`single_task` below, and the Task Library overlays both name and task per task), and the
   # action contract is not a property of a recording at all: capture always stores absolute EE
   # and delta views are derived later, so an `ee2ee` in the name labelled these files as
   # something they never were.
   #
-  # The camera rate does stay in the name: it does not appear anywhere in the schema, so a
-  # shared root would mix two capture conditions in one dataset with nothing to flag it.
-  repo_id: hph/fr3_cam60
+  # This is the name of a *series*, not of one dataset. The recorder appends `_<YYYYmmdd_HHMMSS>`
+  # so each session lands in its own root -- change a camera rate, a gripper or the lighting and
+  # the takes stay separable, which nothing in the schema would otherwise let you do.
+  repo_id: hph/fr3_spacemouse
   single_task: Pick and place
-  root: /lerobot/outputs/datasets/fr3_cam60
+  root: /lerobot/outputs/datasets/fr3_spacemouse
   fps: 30
   num_episodes: 20
   episode_time_s: 10
