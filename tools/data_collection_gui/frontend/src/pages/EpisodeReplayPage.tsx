@@ -9,7 +9,6 @@ export function ReplayPanel({
   status,
   busy,
   onPreflight,
-  onReplay,
   mujocoMode,
   cubeSelection = true,
   onAbort
@@ -17,12 +16,11 @@ export function ReplayPanel({
   status: ReplayStatus;
   busy: boolean;
   onPreflight: () => void;
-  onReplay: (realRobot: boolean) => void;
   mujocoMode: MujocoCubeMode;
   cubeSelection?: boolean;
   onAbort: () => void;
 }) {
-  const isActive = status.state === "dry_run" || status.state === "sim_replay" || status.state === "replaying";
+  const isActive = status.state === "sim_replay" || status.state === "replaying";
   const canReplayData = status.dataStatus === "loaded" && (status.recordedFrames ?? status.totalFrames) > 0;
   const validation = status.mujocoValidation;
   const validationMatchesMode = mujocoValidationMatchesSelection(validation?.cubeMode, mujocoMode, cubeSelection);
@@ -44,11 +42,20 @@ export function ReplayPanel({
     validation?.maxPositionErrorMm != null && validation?.maxRotationErrorDeg != null
       ? `Max ${validation.maxPositionErrorMm.toFixed(2)}mm / ${validation.maxRotationErrorDeg.toFixed(2)}deg; limits ${validation.maxPositionThresholdMm.toFixed(2)}mm / ${validation.maxRotationThresholdDeg.toFixed(2)}deg`
       : "No completed MuJoCo metrics yet";
+  // One line each: what the verdict is, what to do next, what it measured. These used to run
+  // together in a single paragraph where the label and the gateway's own message said the same
+  // thing twice and the numbers trailed off the end.
   const validationGuidance = mujocoPassed
-    ? `MuJoCo ${cubeSelection ? `${mujocoMode} ` : ""}replay is current for this episode.`
+    ? "Nothing to do; this episode's validation is current."
     : validation?.status === "passed" && !validationMatchesMode
       ? `The saved result is for ${validation.cubeMode ?? "left"}; run ${mujocoMode} before Real Robot.`
-      : "Strongly recommended before Preflight/Dry Run; required before Real Robot.";
+      : validation?.status === "failed"
+        ? "Inspect the trajectory below, then re-run MuJoCo."
+        : validation?.status === "running"
+          ? "Waiting for the run to finish."
+          : status.realReplaySupported === false
+            ? "Run MuJoCo to score this episode."
+            : "Run MuJoCo before real-robot replay.";
   return (
     <section className="panel replay-panel">
       <div className="panel-heading">
@@ -60,12 +67,13 @@ export function ReplayPanel({
       </div>
       <div className="control-row">
         <button disabled={busy || isActive || !canReplayData} onClick={onPreflight}>Preflight</button>
-        <button disabled={busy || isActive || status.safety !== "ready"} onClick={() => onReplay(false)}>Dry Run</button>
         <button disabled={busy || !isActive} onClick={onAbort}>Abort</button>
       </div>
       <p className="panel-note">Safety {status.safety} · {status.message}</p>
       <p className={`validation-note validation-${validationLabel}`}>
-        MuJoCo replay {validationLabel}: {validationGuidance} {validation?.message ?? "Run MuJoCo replay before real-robot replay."} · {validationMetric}
+        <strong>MuJoCo replay {validationLabel}</strong> · {validationGuidance}
+        <br />
+        {validationMetric}
       </p>
       {status.lastOutput ? <p className="process-output">{status.lastOutput}</p> : null}
       {status.diagnostics?.length ? (
@@ -118,8 +126,13 @@ export function RealRobotReplayPanel({
     (validation.cubeMode ?? status.mujocoCubeMode) === mode;
   const validationDecisionAvailable = validationPassed || validationFailedButReviewable;
   const ipValid = validIpv4(robotIp);
-  const active = status.state === "replaying" || status.state === "sim_replay" || status.state === "dry_run";
-  const disabled = busy || active || status.datasetKind === "exported" || !validationDecisionAvailable || !ipValid;
+  const active = status.state === "replaying" || status.state === "sim_replay";
+  // The gateway says whether this profile can drive an arm from a recording at all. The
+  // workstation cannot -- the real path replays AprilTag cube sidecars nothing here writes -- and
+  // an enabled-looking button that dies inside the gateway is worse than one that says why.
+  const supported = status.realReplaySupported !== false;
+  const disabled =
+    busy || active || !supported || status.datasetKind === "exported" || !validationDecisionAvailable || !ipValid;
 
   useEffect(() => {
     if (!monitorRequested && status.state !== "replaying") return;
@@ -165,15 +178,22 @@ export function RealRobotReplayPanel({
             {status.state === "replaying" ? "Real-robot replay running…" : "Run real-robot replay"}
           </button>
           <p className="panel-note">
-            {status.datasetKind === "exported"
-              ? "Real robot replay is disabled for exported datasets."
-              : !validationDecisionAvailable
-                ? "Run MuJoCo validation to completion for this dataset and episode first."
-                : !ipValid
-                  ? "Enter a valid robot IPv4 address."
-                  : validationFailedButReviewable
-                    ? "MuJoCo failed. You may click Run and make the final Yes/No decision in the warning window."
-                    : "The gateway preflights this FR3, moves pika_task_tcp to frame 0, then streams the trajectory."}
+            {!supported
+              ? "Not wired for this rig: the real path replays the AprilTag cube sidecars " +
+                "(derived/april_cube_tracking_in_robot_base/state_action.<cube>.csv), which a " +
+                "workstation recording never produces. MuJoCo replay is the validation path here."
+              : status.datasetKind === "exported"
+                ? "Real robot replay is disabled for exported datasets."
+                : !validationDecisionAvailable
+                  ? "Run MuJoCo validation to completion for this dataset and episode first. A run " +
+                    "that finishes and fails can still be overridden below, with its errors in front " +
+                    "of you; a validation that never ran leaves nothing to judge, so there is no " +
+                    "override for it."
+                  : !ipValid
+                    ? "Enter a valid robot IPv4 address."
+                    : validationFailedButReviewable
+                      ? "MuJoCo failed. You may click Run and make the final Yes/No decision in the warning window."
+                      : "The gateway preflights this FR3, moves pika_task_tcp to frame 0, then streams the trajectory."}
           </p>
         </div>
         <div className="realsense-monitor">
@@ -794,7 +814,6 @@ export function EpisodeReplayPage({
   snapshot,
   busy,
   onPreflight,
-  onReplay,
   onMujocoReplay,
   onApproveMujoco,
   onRealReplay,
@@ -809,7 +828,6 @@ export function EpisodeReplayPage({
   snapshot: GuiSnapshot;
   busy: boolean;
   onPreflight: () => void;
-  onReplay: (realRobot: boolean) => void;
   onMujocoReplay: (mode: MujocoCubeMode) => void;
   onApproveMujoco: (mode: MujocoCubeMode) => void;
   onRealReplay: (mode: RealCubeMode, robotIp: string, endEffectorMode: RealEndEffectorMode, overrideMujocoFailure: boolean) => void;
@@ -830,7 +848,7 @@ export function EpisodeReplayPage({
     snapshot.processing.find((item) => item.path === activePath) ?? null;
   return (
     <div className="page-stack">
-      <PageHeader title="Episode Replay" subtitle="consume processed trajectories: timeline review, safety preflight, dry-run, and real-robot replay" />
+      <PageHeader title="Episode Replay" subtitle="consume processed trajectories: timeline review, safety preflight, MuJoCo validation, and real-robot replay" />
       <ReplayReadinessCard
         status={snapshot.replay}
         processing={matchingProcessing}
@@ -849,7 +867,6 @@ export function EpisodeReplayPage({
           status={snapshot.replay}
           busy={busy}
           onPreflight={onPreflight}
-          onReplay={onReplay}
           mujocoMode={mujocoMode}
           cubeSelection={cubeSelection}
           onAbort={onAbort}

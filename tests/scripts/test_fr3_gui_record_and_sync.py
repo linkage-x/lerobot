@@ -289,6 +289,61 @@ def test_thor_profile_keeps_the_handheld_recorder(tmp_path):
     assert script == tmp_path / gateway.DEFAULT_RECORDER_SCRIPT
 
 
+def _finished_mujoco_validation(tmp_path: Path, monkeypatch, *, max_pos_mm: float) -> gateway.GatewayState:
+    # The trajectory contract reads the dataset off disk; this test is about what the verdict
+    # does to `safety`, so hold the contract at "passed" and let the metrics decide.
+    monkeypatch.setattr(
+        gateway,
+        "_trajectory_contract_for_episode",
+        lambda state, dataset_root: {"status": "passed", "checks": [], "failures": []},
+    )
+    state = _workstation_state(tmp_path)
+    state.replay.safety = "locked"
+    state.replay.mujocoValidation = {
+        "datasetRoot": str(tmp_path / "ds"),
+        "episode": 0,
+        "fps": 30,
+        "hasStructuredResult": True,
+        "completedFrames": 10,
+        "totalFrames": 10,
+        "maxPositionErrorMm": max_pos_mm,
+        "maxRotationErrorDeg": 1.0,
+        "maxPositionThresholdMm": 20.0,
+        "maxRotationThresholdDeg": 15.0,
+    }
+    gateway._finish_mujoco_validation(state, 0)
+    return state
+
+
+def test_a_failed_mujoco_score_is_not_reported_as_a_hardware_fault(tmp_path, monkeypatch):
+    """A trajectory scoring 25 mm is a verdict about the data, not about the rig.
+
+    Writing safety="fault" here mislabelled it and withheld the robot-free controls that are
+    exactly what an operator reaches for after a failed score.
+    """
+    state = _finished_mujoco_validation(tmp_path, monkeypatch, max_pos_mm=25.0)
+
+    assert state.replay.mujocoValidation["status"] == "failed"
+    assert state.replay.safety == "locked"
+
+
+def test_a_passing_mujoco_score_does_not_authorize_the_hardware_path(tmp_path, monkeypatch):
+    """Only the real preflight can say the arm is ready; a sim score cannot grant that."""
+    state = _finished_mujoco_validation(tmp_path, monkeypatch, max_pos_mm=1.0)
+
+    assert state.replay.mujocoValidation["status"] == "passed"
+    assert state.replay.safety == "locked"
+
+
+def test_real_replay_is_refused_up_front_on_a_profile_that_cannot_do_it(tmp_path):
+    """Fail with the reason, not 60 lines later with a missing-file message."""
+    state = _workstation_state(tmp_path)
+    state.replay.realReplaySupported = False
+
+    with pytest.raises(RuntimeError, match="not wired for the workstation profile"):
+        gateway._start_real_replay(state, cube_mode="left", robot_ip="192.168.1.206")
+
+
 def test_sync_lines_become_a_verdict_the_operator_can_act_on(tmp_path):
     state = _workstation_state(tmp_path)
     gateway._apply_recorder_output(

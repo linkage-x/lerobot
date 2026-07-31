@@ -328,7 +328,7 @@ export function ReplayInspector({
 
   const fps = timeline?.fps ?? fallbackFps;
   const mujocoRunning = replayStatus.state === "sim_replay";
-  const replayActive = mujocoRunning || replayStatus.state === "dry_run" || replayStatus.state === "replaying";
+  const replayActive = mujocoRunning || replayStatus.state === "replaying";
   const canRunMujoco =
     replayStatus.dataStatus === "loaded" &&
     (replayStatus.recordedFrames ?? replayStatus.totalFrames) > 0;

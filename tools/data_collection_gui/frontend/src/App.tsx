@@ -192,18 +192,6 @@ function App() {
   const activeReplayPath = snapshot.replay.datasetRoot ?? snapshot.replay.dataset;
   const replayMatch =
     snapshot.processing.find((item) => item.path === activeReplayPath) ?? snapshot.processing[0];
-  const startReplay = (realRobot: boolean) => {
-    if (realRobot) {
-      const ok = window.confirm(
-        `Start real-robot replay for episode ${snapshot.replay.episode}? MuJoCo validation is current for this dataset.`
-      );
-      if (!ok) {
-        return;
-      }
-    }
-    run(() => api.startReplay(realRobot));
-  };
-
   const exportTaskWithQcGuard = (taskId: string) => {
     const task = (snapshot.tasks ?? []).find((item) => item.id === taskId);
     if (!task) {
@@ -273,7 +261,6 @@ function App() {
         snapshot={snapshot}
         busy={busy}
         onPreflight={() => run(() => api.preflightReplay())}
-        onReplay={startReplay}
         onMujocoReplay={(mode) => run(() => api.startMujocoReplay(mode))}
         onApproveMujoco={(mode) => run(() => api.approveMujocoReplay(mode))}
         onRealReplay={(mode, robotIp, endEffectorMode, overrideMujocoFailure) =>

@@ -156,6 +156,10 @@ class ReplayStatus:
     realRobotIp: str = ""
     realEndEffectorMode: str = "corenetic_gripper_ee"
     mujocoOverrideAccepted: bool = False
+    # Whether this profile can actually drive a real arm from a recorded episode. The real path
+    # replays the cube sidecars an AprilTag rig produces; a workstation dataset has none, so the
+    # request dies inside the gateway. Say so up front instead of offering a live-looking button.
+    realReplaySupported: bool = True
     realReplayLog: list[str] = field(default_factory=list)
     # Bumped whenever the on-disk dataset content changes under a stable
     # (datasetRoot, episode) selection — e.g. deleting an episode keeps the
@@ -7289,10 +7293,15 @@ def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> Non
         if contract.get("status") != "passed":
             reasons.extend(str(reason) for reason in contract.get("failures", []))
 
+    # The verdict belongs to `mujocoValidation`, not to `safety`. `safety` describes whether the
+    # hardware path is authorized, and only the real preflight can say that -- a recorded
+    # trajectory scoring 25 mm instead of 20 mm is a data verdict, not a faulted rig. Writing
+    # "fault" here mislabelled it and, worse, withheld the robot-free controls that are exactly
+    # what an operator reaches for next; writing "ready" on a pass claimed an authorization no
+    # hardware check had granted. It stays "locked" from the start of the run either way.
     if reasons:
         validation["status"] = "failed"
         validation["message"] = "MuJoCo validation failed: " + "; ".join(reasons)
-        state.replay.safety = "fault"
         state.replay.state = "aborted"
     else:
         validation["status"] = "passed"
@@ -7300,7 +7309,6 @@ def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> Non
             f"MuJoCo validation passed: max {float(max_pos):.2f}mm / {float(max_rot):.2f}deg "
             f"within {max_pos_threshold:.2f}mm / {max_rot_threshold:.2f}deg"
         )
-        state.replay.safety = "ready"
         state.replay.state = "complete"
     state.replay.mujocoValidation = validation
     _refresh_mujoco_validation_current(state)
@@ -7963,7 +7971,7 @@ def _require_replay_dataset(state: GatewayState) -> Path:
 def _mujoco_recommendation_suffix(state: GatewayState, dataset_root: Path) -> str:
     if _mujoco_validation_is_for_active_episode(state, dataset_root):
         return "current MuJoCo validation is available"
-    return "MuJoCo replay is strongly recommended before Preflight/Dry Run and still required before Real Robot"
+    return "MuJoCo replay is strongly recommended before Preflight and still required before Real Robot"
 
 
 def _preflight_replay(state: GatewayState) -> None:
@@ -8121,6 +8129,18 @@ def _start_real_replay(
         state.replay.message = "Replay process is already running"
         return
 
+    if not state.replay.realReplaySupported:
+        # Fail here rather than 60 lines down inside _read_sidecar_cube_poses, whose
+        # "No valid generated EE trajectory" reads like a missing file the operator could go
+        # produce. On this profile there is no producer: the real path replays the cube sidecars
+        # an AprilTag rig writes, and nothing in the FR3 workstation pipeline writes them.
+        raise RuntimeError(
+            "Real-robot replay is not wired for the workstation profile: it drives the AprilTag "
+            "cube sidecars (derived/april_cube_tracking_in_robot_base/state_action.<cube>.csv), "
+            "which a workstation recording never produces. MuJoCo replay is the validation path "
+            "here."
+        )
+
     cube_mode = str(cube_mode).strip().lower()
     if cube_mode not in ("left", "right"):
         raise ValueError(f"Real replay cube mode must be left or right, got {cube_mode!r}")
@@ -8211,18 +8231,6 @@ def _start_real_replay(
         f"episode={state.replay.episode} cube={cube_mode} robot_ip={selected_ip} target={end_effector_mode}",
     )
     _start_replay_output_reader(state, process)
-
-
-def _start_dry_run_replay(state: GatewayState) -> None:
-    dataset_root = _require_replay_dataset(state)
-    state.replay.state = "dry_run"
-    state.replay.safety = "ready"
-    state.replay.frameIndex = 0
-    state.replay.message = (
-        f"Dry-run started for episode {state.replay.episode} from {dataset_root.name}; "
-        f"{_mujoco_recommendation_suffix(state, dataset_root)}"
-    )
-    state.log("info", state.replay.message)
 
 
 def _abort_replay(state: GatewayState) -> None:
@@ -8720,10 +8728,6 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _delete_replay_episode(self.server.state, query.get("episode", [""])[0])
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
-                if path == "/api/replay/start":
-                    _start_dry_run_replay(self.server.state)
-                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
-                    return
                 if path == "/api/replay/start-mujoco":
                     _start_mujoco_replay(
                         self.server.state,
@@ -8918,6 +8922,7 @@ def make_state(
         devices=_device_statuses(config, resolved_root),
     )
     state.replay.mujocoValidation = _new_mujoco_validation(state)
+    state.replay.realReplaySupported = profile != "workstation"
     if profile == "workstation":
         urdf_path, sim_xml_path = _fr3_pika_asset_paths(resolved_root)
         state.teleop.urdfPath = str(urdf_path)

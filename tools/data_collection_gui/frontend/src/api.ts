@@ -376,24 +376,6 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async startReplay(realRobot: boolean): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot(realRobot ? "/api/replay/start-real" : "/api/replay/start");
-    if (remote) {
-      return remote;
-    }
-    await wait(220);
-    this.snapshot.replay = {
-      ...this.snapshot.replay,
-      state: "aborted",
-      safety: "fault",
-      frameIndex: 0,
-      trackingErrorMm: 0,
-      message: `Gateway unavailable; ${realRobot ? "real-robot replay" : "dry-run replay"} cannot be mocked for safety`
-    };
-    this.log("error", `${realRobot ? "Real robot replay" : "Dry-run replay"} blocked because gateway is unavailable`);
-    return this.getSnapshot();
-  }
-
   async startMujocoReplay(cubeMode: MujocoCubeMode): Promise<GuiSnapshot> {
     const remote = await this.postRemoteSnapshot(`/api/replay/start-mujoco?cube=${encodeURIComponent(cubeMode)}`);
     if (remote) {
@@ -900,7 +882,7 @@ export class DataCollectionGuiApi {
       };
     }
 
-    if (this.snapshot.replay.state === "dry_run" || this.snapshot.replay.state === "sim_replay" || this.snapshot.replay.state === "replaying") {
+    if (this.snapshot.replay.state === "sim_replay" || this.snapshot.replay.state === "replaying") {
       const nextFrame = Math.min(this.snapshot.replay.frameIndex + 2, this.snapshot.replay.totalFrames);
       this.snapshot.replay = {
         ...this.snapshot.replay,

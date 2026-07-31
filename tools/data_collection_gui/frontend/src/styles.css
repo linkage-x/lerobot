@@ -345,7 +345,6 @@ button.danger {
 .status-recording,
 .status-replaying,
 .status-active,
-.status-dry_run,
 .status-sim_replay,
 .status-armed {
   background: #0f766e;

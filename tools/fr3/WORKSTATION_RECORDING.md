@@ -256,11 +256,21 @@ route never writes. The verdict here is settled automatically: the runtime repor
 `mujoco_replay_result=` line and the gateway resolves pass/fail when the process exits.
 
 **Real-robot replay is not wired for this profile.** The panel is shared with Thor, whose
-`_start_real_replay` requires the same cube sidecars and drives
-`third_party/opencv_kalibr/.../replay_cube_pose_in_robot_base.py`; against a workstation dataset
-it stops at `No valid generated EE trajectory for: <cube>` before anything reaches the arm. The
-MuJoCo pass therefore gates nothing today — treat the sim score as a data-quality verdict, not as
-an authorization to move hardware.
+`_start_real_replay` replays the same cube sidecars through
+`third_party/opencv_kalibr/.../replay_cube_pose_in_robot_base.py`; a workstation recording never
+produces them. The control is disabled here and the gateway refuses the request up front with
+that reason, rather than dying further in on a missing-file message that reads like something you
+could go generate.
+
+So the MuJoCo pass gates nothing today: treat the sim score as a verdict on the data, not as an
+authorization to move hardware. If the real path is ever wired for this rig, keep the gate — it
+is the only check that runs the recorded EE stream through IK before an arm executes it at speed,
+and it is complementary to the hardware preflight, which vets the arm but never looks at the
+trajectory.
+
+The MuJoCo verdict does not touch `safety`, which describes only whether the hardware path is
+authorized — that is the real preflight's answer to give. A failed score therefore leaves the
+robot-free controls alone instead of presenting the rig as faulted.
 
 Standalone:
 
