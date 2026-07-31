@@ -113,14 +113,18 @@ if $sync_only; then
 fi
 
 echo "==> Restarting ${profile} gateway on ${remote}..."
+# flock -n reports a lock conflict with -E's exit code, so a failure inside the
+# remote script stays distinguishable from "someone else is deploying".
+restart_rc=0
 ssh -o ConnectTimeout=5 "$remote" \
-  "flock -n -o /tmp/lerobot_gateway_deploy.lock bash -s -- '$remote_dir' '$profile' '$config_path'" \
-  <<'REMOTE'
+  "flock -n -o -E 75 /tmp/lerobot_gateway_deploy.lock bash -s -- '$remote_dir' '$profile' '$config_path'" \
+  <<'REMOTE' || restart_rc=$?
 set -euo pipefail
 
 repo_dir="$1"
 profile="$2"
 config_path="$3"
+gateway_log_dir="$repo_dir/outputs/logs/data_collection_gui"
 
 matching_pids() {
   local pattern="$1"
@@ -147,25 +151,76 @@ for name in os.listdir("/proc"):
 PY
 }
 
-stop_matching() {
-  local pattern="$1"
+# The gateway gets a scan of its own instead of a cmdline substring match: the
+# interpreter differs per profile (.venv-fr3/bin/python, .venv/bin/python which
+# is a symlink to python3, or plain python3) and flags may precede -m, while a
+# substring test would also match greps, editors and pkill on the module name.
+gateway_pids() {
+  python3 - <<'PY'
+import os
+
+MODULE = "tools.data_collection_gui.gateway"
+for name in os.listdir("/proc"):
+    if not name.isdigit():
+        continue
+    if int(name) == os.getpid():
+        continue
+    try:
+        args = [
+            item.decode("utf-8", "ignore")
+            for item in open(f"/proc/{name}/cmdline", "rb").read().split(b"\0")
+            if item
+        ]
+    except OSError:
+        continue
+    if not args or not os.path.basename(args[0]).startswith("python"):
+        continue
+    if any(flag == "-m" and mod == MODULE for flag, mod in zip(args, args[1:])):
+        print(name)
+PY
+}
+
+# Kill whatever a pid-listing command reports: `stop_pids gateway_pids` for the
+# gateway, `stop_pids matching_pids <pattern>` for the recorder/teleop scripts.
+stop_pids() {
   local pids
-  pids="$(matching_pids "$pattern" || true)"
+  pids="$("$@" || true)"
   if [[ -n "$pids" ]]; then
     echo "$pids" | xargs -r kill 2>/dev/null || true
     sleep 1
   fi
-  pids="$(matching_pids "$pattern" || true)"
+  pids="$("$@" || true)"
   if [[ -n "$pids" ]]; then
     echo "$pids" | xargs -r kill -9 2>/dev/null || true
   fi
 }
 
-stop_matching "tools.data_collection_gui.gateway"
+# gateway.py redirects stdout/stderr into its own gateway_<ts>_<pid>.log inside
+# main(), so run/logs/gateway.log only ever captures pre-main crashes. Pick the
+# newest log this restart created, keyed off the timestamp in the file name:
+# mtime is useless here because a gateway that survived the kill above keeps
+# appending to its own log and would always look like the freshest file.
+gateway_log_since() {
+  local since="$1" newest="" path name stamp
+  for path in "$gateway_log_dir"/gateway_*.log; do
+    [[ -e "$path" ]] || continue
+    name="${path##*/}"
+    name="${name#gateway_}"
+    stamp="${name%_*}"
+    [[ "$stamp" < "$since" ]] || newest="$path"
+  done
+  printf '%s' "$newest"
+}
+
+stop_pids gateway_pids
+# The gateway spawns the recorder (thor_record.py) as a child; killing the
+# gateway can orphan it, and it holds box_client.py + the box/camera (Argus)
+# sessions in memory. Stop it too so the next Connect respawns a fresh recorder
+# with the just-synced code instead of a stale orphan clashing over the hardware.
 if [[ "$profile" == "thor" ]]; then
-  stop_matching "tools/thor/gmsl2/thor_record.py"
+  stop_pids matching_pids "tools/thor/gmsl2/thor_record.py"
 else
-  stop_matching "tools/fr3/fr3_mujoco_teleop.py"
+  stop_pids matching_pids "tools/fr3/fr3_mujoco_teleop.py"
 fi
 
 cd "$repo_dir"
@@ -207,6 +262,7 @@ if [[ "$profile" == "workstation" ]]; then
 fi
 
 mkdir -p run/logs
+spawn_ts="$(date +%Y%m%d_%H%M%S)"
 setsid env \
   PYTHONPATH=src:. \
   PYTHONUNBUFFERED=1 \
@@ -224,15 +280,38 @@ setsid env \
 disown
 
 sleep 3
-new_pids="$(matching_pids "tools.data_collection_gui.gateway" || true)"
+new_pids="$(gateway_pids || true)"
+started_log="$(gateway_log_since "$spawn_ts" || true)"
 if [[ -z "$new_pids" ]]; then
   echo "ERROR: ${profile} gateway failed to start" >&2
-  tail -30 run/logs/gateway.log
+  # Failures before _setup_gateway_log() (bad interpreter, import errors) are
+  # all run/logs/gateway.log ever sees; everything later is in the gateway log.
+  if [[ -s run/logs/gateway.log ]]; then
+    echo "--- run/logs/gateway.log"
+    tail -20 run/logs/gateway.log
+  fi
+  if [[ -n "$started_log" ]]; then
+    echo "--- ${started_log}"
+    tail -30 "$started_log"
+  else
+    echo "(no new ${gateway_log_dir}/gateway_*.log was created)"
+  fi
   exit 1
 fi
 echo "${profile} gateway started (pid $(echo "$new_pids" | head -1))"
-tail -5 run/logs/gateway.log
+if [[ -n "$started_log" ]]; then
+  echo "--- ${started_log}"
+  tail -5 "$started_log"
+fi
 REMOTE
+
+if [[ $restart_rc -eq 75 ]]; then
+  echo "ERROR: another deploy is already restarting the ${profile} gateway on ${remote}" >&2
+  exit 75
+elif [[ $restart_rc -ne 0 ]]; then
+  echo "ERROR: ${profile} gateway restart failed (exit ${restart_rc})" >&2
+  exit "$restart_rc"
+fi
 
 if $no_frontend; then
   echo "==> ${target} gateway ready at ${gateway_target} (--no-frontend)."

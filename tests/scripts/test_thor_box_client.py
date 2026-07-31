@@ -856,6 +856,35 @@ def test_discover_boxes_maps_capabilities_to_expected_devices(fake_box_module):
     assert pub["capability_names"] == ["box_gripper", "box_imu"]
 
 
+def test_discovery_forwards_so_path_when_sdk_lives_in_the_wheel(fake_box_module):
+    # Deployed on Thor, box_sdk is imported straight out of the vendored .whl, so
+    # its own library resolver looks inside the zip (<...>.whl/box_sdk/lib) and
+    # raises NotADirectoryError. Every broadcast must therefore hand the SDK the
+    # extracted so_path -- including the one inside BoxClient.start(), which used
+    # to call box_sdk.discover() bare and lose the device_id (and with it set_mode
+    # and every calibration command) on the standalone single-box path.
+    seen: list[str | None] = []
+
+    def _discover(**kw):
+        seen.append(kw.get("so_path"))
+        if not kw.get("so_path"):
+            raise NotADirectoryError(20, "Not a directory", "sdk.whl/box_sdk/lib")
+        return [_FakeDiscovered(device_id=7, ip="192.168.2.60")]
+
+    fake_box_module.discover = _discover
+    cfg = box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01)
+    client = box_client.BoxClient(cfg, so_path="/lib/libbox_controller.so")
+    assert client.start() is True
+    try:
+        assert seen == ["/lib/libbox_controller.so"]
+        assert client._device_id == 7
+        # device_id learned -> address registered and startup_mode actually applied
+        assert client._raw_box.registered == [(7, "192.168.2.60", 15000)]
+        assert client._raw_box.mode == {7: 0}
+    finally:
+        client.stop()
+
+
 def test_box_pool_duplicate_serials_namespace_by_device_id(fake_box_module):
     # Un-personalized firmware ships every unit with the same box_serial; the
     # pool must still give each a UNIQUE namespace (by device_id) instead of
