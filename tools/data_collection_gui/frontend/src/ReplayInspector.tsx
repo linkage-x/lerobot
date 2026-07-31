@@ -506,6 +506,13 @@ export function ReplayInspector({
   const forceVector = ensureForceVector(frame?.forceVector);
   const touchMax = useMemo(() => touchScaleMax(timeline), [timeline]);
   const touchSummary = useMemo(() => touchPanelSummary(frame), [frame]);
+  // Decided from the episode, not from the current frame: a rig without Paxini pads (the FR3
+  // workstation runs a Pika gripper) otherwise gets a panel named after a sensor it does not
+  // have, showing two fabricated empty pads for the whole recording.
+  const hasTouchData = useMemo(
+    () => (timeline?.frames ?? []).some((entry) => Object.values(entry.touch ?? {}).some(Boolean)),
+    [timeline]
+  );
   const cubePoseNames = useMemo(() => {
     if (!timeline) {
       return [] as string[];
@@ -682,22 +689,24 @@ export function ReplayInspector({
           </div>
         ))}
       </div>
-      <section className="panel touch-panel">
-        <div className="panel-heading">
-          <h2>Paxini touch</h2>
-          <span>{touchSummary}</span>
-        </div>
-        <div className="touch-heatmaps">
-          {touchEntries(frame).map(([key, sample]) => (
-            <TouchHeatmap key={key} title={key} sample={sample} scale={touchMax} />
-          ))}
-        </div>
-        <div className="touch-legend" aria-hidden="true">
-          <span>0</span>
-          <div />
-          <span>{touchMax.normalMax.toFixed(1)}</span>
-        </div>
-      </section>
+      {hasTouchData ? (
+        <section className="panel touch-panel">
+          <div className="panel-heading">
+            <h2>Paxini touch</h2>
+            <span>{touchSummary}</span>
+          </div>
+          <div className="touch-heatmaps">
+            {touchEntries(frame).map(([key, sample]) => (
+              <TouchHeatmap key={key} title={key} sample={sample} scale={touchMax} />
+            ))}
+          </div>
+          <div className="touch-legend" aria-hidden="true">
+            <span>0</span>
+            <div />
+            <span>{touchMax.normalMax.toFixed(1)}</span>
+          </div>
+        </section>
+      ) : null}
       <section className="panel pose-panel">
         <div className="panel-heading">
           <h2>End-effector pose</h2>

@@ -325,6 +325,35 @@ class FrankaResearch3Mujoco(Robot):
             raise RuntimeError(f"{self} is not connected.")
         return self._env
 
+    def render_preview_frame(self, camera_name: str | None = None) -> np.ndarray | None:
+        """One rendered frame for a person to look at. Returns None if the renderer was busy.
+
+        Deliberately not ``get_observation(include_cameras=True)``: that fails the whole frame
+        when the cameras disagree by more than ``camera_max_skew_ms``, which is correct for a
+        training sample and wrong here -- a render hiccup would abort the very replay the preview
+        exists to illustrate. A preview owes nothing to the timestamp contract.
+
+        Without a name, prefers a camera looking *at* the arm over one mounted on it: a wrist view
+        cannot show you whether the trajectory went where you meant it to.
+        """
+        env = self._require_env()
+        frames = env.render_with_timestamps()
+        if not frames:
+            return None
+        selected = camera_name if camera_name in frames else self._preview_camera_name(frames)
+        if selected is None:
+            return None
+        return frames[selected][0]
+
+    def _preview_camera_name(self, frames: dict[str, Any]) -> str | None:
+        mapping = self.config.camera_name_mapping or {}
+        for name in frames:
+            model_camera = str(mapping.get(name, name)).lower()
+            if "wrist" in model_camera or "ee" in model_camera:
+                continue
+            return name
+        return next(iter(frames), None)
+
     def _workspace_object_body_id(self) -> int:
         env = self._require_env()
         try:

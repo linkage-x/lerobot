@@ -279,6 +279,7 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
     position_errors_mm: list[float] = []
     rotation_errors_deg: list[float] = []
     completed_frames = 0
+    video = _PreviewVideoWriter(args.render_video, fps) if args.render_video else None
 
     emit(f"fr3_mujoco_replay dataset={dataset_root.name} episode={args.episode} frames={total_frames} fps={fps}")
     robot.connect()
@@ -355,6 +356,8 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
             position_errors_mm.append(float(np.linalg.norm(actual_position - target_position) * 1e3))
             rotation_errors_deg.append(_rotation_error_deg(target_quaternion, actual_quaternion))
             completed_frames += 1
+            if video is not None:
+                video.append(robot.render_preview_frame())
 
             if frame_index % _PROGRESS_EVERY == 0 or frame_index == total_frames - 1:
                 emit(f"Replayed {completed_frames}/{total_frames} frames")
@@ -363,8 +366,16 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
                 if remaining_s > 0:
                     time.sleep(remaining_s)
     finally:
+        if video is not None:
+            video.close()
         if robot.is_connected:
             robot.disconnect()
+
+    if video is not None:
+        if video.error is not None:
+            emit(f"WARN: preview video not written ({video.error}); the replay metrics are unaffected")
+        elif video.frames_written:
+            emit(f"fr3_mujoco_replay_video={video.destination}")
 
     avg_position_mm = float(np.mean(position_errors_mm)) if position_errors_mm else 0.0
     max_position_mm = float(np.max(position_errors_mm)) if position_errors_mm else 0.0
@@ -393,12 +404,72 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
             "max_rotation_error_deg": float(args.max_rotation_error_deg),
         },
         "robot_type": robot.name,
+        "video_frames": int(video.frames_written) if video is not None else 0,
+        "native_video_path": (
+            str(video.destination) if video is not None and video.frames_written and not video.error else ""
+        ),
     }
     return result
 
 
 def fr3_mujoco_replay_report_path(dataset_root: Path, episode: int) -> Path:
     return dataset_root / "derived" / "fr3_mujoco_replay" / f"episode_{int(episode):06d}.json"
+
+
+def fr3_mujoco_replay_video_path(dataset_root: Path, episode: int) -> Path:
+    return dataset_root / "derived" / "fr3_mujoco_replay" / f"episode_{int(episode):06d}.mp4"
+
+
+class _PreviewVideoWriter:
+    """Collects rendered frames and writes them as one mp4 beside the report.
+
+    Every failure here is swallowed and reported once. The video is something to look at; the
+    verdict is the numbers. Letting a missing encoder or a busy renderer take down the replay
+    would trade the thing that matters for the thing that illustrates it.
+    """
+
+    def __init__(self, destination: Path, fps: int) -> None:
+        self.destination = destination
+        self.fps = max(int(fps), 1)
+        self.frames_written = 0
+        self.error: str | None = None
+        self._writer: Any = None
+
+    def _ensure_writer(self, frame: np.ndarray) -> Any:
+        if self._writer is None:
+            import imageio.v2 as imageio
+
+            self.destination.parent.mkdir(parents=True, exist_ok=True)
+            # yuv420p needs even dimensions, and a renderer height of 481 is not a reason to
+            # produce a file no browser will decode.
+            self._writer = imageio.get_writer(
+                str(self.destination),
+                fps=self.fps,
+                codec="libx264",
+                macro_block_size=2,
+                ffmpeg_params=["-pix_fmt", "yuv420p"],
+            )
+        return self._writer
+
+    def append(self, frame: np.ndarray | None) -> None:
+        if frame is None or self.error is not None:
+            return
+        try:
+            self._ensure_writer(frame).append_data(np.ascontiguousarray(frame))
+            self.frames_written += 1
+        except Exception as exc:  # noqa: BLE001 - a preview must never fail the replay
+            self.error = str(exc)
+            self._writer = None
+
+    def close(self) -> None:
+        if self._writer is None:
+            return
+        try:
+            self._writer.close()
+        except Exception as exc:  # noqa: BLE001
+            self.error = self.error or str(exc)
+        finally:
+            self._writer = None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -425,6 +496,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # warning fires for genuinely unreachable start poses rather than for normal servo droop.
     parser.add_argument("--settle-tolerance-mm", type=float, default=5.0)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--render-video",
+        dest="render_video",
+        type=Path,
+        default=None,
+        help="Write an mp4 of the simulated arm following the trajectory (preview only).",
+    )
     return parser.parse_args(argv)
 
 

@@ -7593,6 +7593,17 @@ def _active_replay_dataset_root(state: GatewayState) -> Path:
     return candidates[0].resolve()
 
 
+FR3_MUJOCO_REPLAY_DIR = "fr3_mujoco_replay"
+
+
+def _fr3_mujoco_replay_report_path(dataset_root: Path, episode: int) -> Path:
+    return dataset_root / "derived" / FR3_MUJOCO_REPLAY_DIR / f"episode_{int(episode):06d}.json"
+
+
+def _fr3_mujoco_replay_video_path(dataset_root: Path, episode: int) -> Path:
+    return dataset_root / "derived" / FR3_MUJOCO_REPLAY_DIR / f"episode_{int(episode):06d}.mp4"
+
+
 def _mujoco_preview_report_path(dataset_root: Path, episode: int, cube_mode: str) -> Path:
     return (
         dataset_root
@@ -7600,6 +7611,33 @@ def _mujoco_preview_report_path(dataset_root: Path, episode: int, cube_mode: str
         / DEFAULT_TRAJ_SIDECAR_NAME
         / f"mujoco_preview.{cube_mode}.episode_{int(episode):06d}.json"
     )
+
+
+def _fr3_mujoco_preview_payload(dataset_root: Path, episode: int) -> dict[str, Any] | None:
+    """The FR3 replay report, shaped as the inspector's preview payload.
+
+    The two routes disagree about what a replay report is: Thor's is per-cube and carries the
+    per-robot frame lists the inspector never reads, while the FR3 runtime writes one report per
+    episode. Adapting here keeps that difference out of the frontend, which only needs to know
+    whether there is a video to show.
+    """
+    report = _load_json_file(_fr3_mujoco_replay_report_path(dataset_root, episode))
+    if not report:
+        return None
+    video_path = _fr3_mujoco_replay_video_path(dataset_root, episode)
+    return {
+        "schema_version": int(report.get("schema_version") or 1),
+        "dataset_root": str(dataset_root),
+        "episode_index": int(report.get("episode", episode)),
+        "fps": int(report.get("fps") or 0),
+        "native_video_path": str(video_path) if video_path.is_file() else "",
+        "status": str(report.get("status") or ""),
+        "max_position_error_mm": report.get("max_position_error_mm"),
+        "max_rotation_error_deg": report.get("max_rotation_error_deg"),
+        # No cubes on this rig, and no second arm to place beside the first.
+        "robots": {},
+        "robot_spacing_m": 0.0,
+    }
 
 
 def _mujoco_preview_video_path(dataset_root: Path, episode: int, cube_mode: str) -> Path:
@@ -7642,6 +7680,10 @@ def _fr3_mujoco_replay_command(state: GatewayState, dataset_root: Path) -> list[
         str(DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM),
         "--max-rotation-error-deg",
         str(DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG),
+        # Without this the run produces numbers and nothing to look at: the inspector's video
+        # panel stays on its placeholder, which reads as "the replay did not happen".
+        "--render-video",
+        str(_fr3_mujoco_replay_video_path(dataset_root, state.replay.episode)),
     ]
 
 
@@ -8509,15 +8551,17 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "invalid episode"})
                 return
             with self.server.state.lock:
+                workstation = self.server.state.profile == "workstation"
                 dataset_root = (
                     _resolve_known_dataset(self.server.state, requested)
                     or self.server.state.selected_replay_root
                 )
-                video_path = (
-                    _mujoco_preview_video_path(dataset_root, episode, cube_mode)
-                    if dataset_root is not None
-                    else None
-                )
+                if dataset_root is None:
+                    video_path = None
+                elif workstation:
+                    video_path = _fr3_mujoco_replay_video_path(dataset_root, episode)
+                else:
+                    video_path = _mujoco_preview_video_path(dataset_root, episode, cube_mode)
             if video_path is None or not video_path.is_file():
                 _json_response(
                     self,
@@ -8572,18 +8616,23 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 if dataset_root is None:
                     _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not found"})
                     return
-                report_path = _mujoco_preview_report_path(dataset_root, episode, cube_mode)
+                workstation = self.server.state.profile == "workstation"
                 try:
-                    report = _load_json_file(report_path)
+                    report = (
+                        _fr3_mujoco_preview_payload(dataset_root, episode)
+                        if workstation
+                        else _load_json_file(_mujoco_preview_report_path(dataset_root, episode, cube_mode))
+                    )
                 except OSError as exc:
                     _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                     return
                 if not report:
-                    _json_response(
-                        self,
-                        HTTPStatus.NOT_FOUND,
-                        {"error": f"Run MuJoCo {cube_mode} replay for this dataset and episode first."},
+                    detail = (
+                        "Run MuJoCo replay for this dataset and episode first."
+                        if workstation
+                        else f"Run MuJoCo {cube_mode} replay for this dataset and episode first."
                     )
+                    _json_response(self, HTTPStatus.NOT_FOUND, {"error": detail})
                     return
                 _json_response(self, HTTPStatus.OK, report)
                 return
