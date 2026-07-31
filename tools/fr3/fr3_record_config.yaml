@@ -41,12 +41,17 @@ teleop:
   scale_wy: 0.0
 
 dataset:
-  # Separate root from the 30 Hz-camera recording: the camera rate does not appear in the
-  # schema, so appending here would mix two capture conditions in one dataset with nothing
-  # to flag it.
-  repo_id: hph/fr3_pick_place_ee2ee_v1_cam60
+  # Named for the rig and the capture condition, nothing else. The task belongs to the episode
+  # (`single_task` below, and the Task Library overlays both name and task per task), and the
+  # action contract is not a property of a recording at all: capture always stores absolute EE
+  # and delta views are derived later, so an `ee2ee` in the name labelled these files as
+  # something they never were.
+  #
+  # The camera rate does stay in the name: it does not appear anywhere in the schema, so a
+  # shared root would mix two capture conditions in one dataset with nothing to flag it.
+  repo_id: hph/fr3_cam60
   single_task: Pick and place
-  root: /lerobot/outputs/datasets/fr3_pick_place_ee2ee_v1_cam60
+  root: /lerobot/outputs/datasets/fr3_cam60
   fps: 30
   num_episodes: 20
   episode_time_s: 10
