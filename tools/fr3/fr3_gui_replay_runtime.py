@@ -14,16 +14,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Replay a recorded FR3 ee2ee episode in MuJoCo and score how well it tracked.
+"""Replay a recorded FR3 ee2ee episode and score how well the arm tracked it.
 
-This is the safety gate in front of real-robot replay: the recorded ``action`` stream is fed
-back through the *same* :class:`FrankaResearch3Mujoco` robot the sim recorder uses, and each
-commanded pose is compared against what the simulated arm actually reached. If the arm cannot
-follow the trajectory in simulation -- unreachable pose, joint limit, IK failure -- it will not
-follow it on hardware either, and the operator finds out without moving a real arm.
+``--backend sim`` (the default) is the safety gate in front of real-robot replay: the recorded
+``action`` stream is fed back through the *same* :class:`FrankaResearch3Mujoco` robot the sim
+recorder uses, and each commanded pose is compared against what the simulated arm actually
+reached. If the arm cannot follow the trajectory in simulation -- unreachable pose, joint limit,
+IK failure -- it will not follow it on hardware either, and the operator finds out without moving
+a real arm.
 
-It reports on the gateway's existing ``mujoco_replay_result=`` protocol line, so the Episode
-Replay page's validation gate works unchanged for workstation datasets.
+``--backend real`` runs the identical trajectory, approach phase and scoring against the hardware
+``FrankaResearch3`` from the same config. One runtime rather than two is the point: a real replay
+that reconstructed its trajectory differently from the run that cleared it would validate one
+thing and execute another. The differences are only the ones that must differ -- there is nothing
+to render, and the arm is asked to refuse rather than lunge when it cannot reach the start pose.
+
+Both report on the gateway's ``mujoco_replay_result=`` protocol line, so the Episode Replay
+page's validation gate works unchanged for workstation datasets.
 """
 
 from __future__ import annotations
@@ -266,14 +273,24 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
 
     with open(args.config_path) as config_file:
         record_cfg = draccus.load(RecordConfig, config_file)
-    sim_cfg = build_sim_robot_config(record_cfg)
     fps = int(args.fps or episode_data["fps"] or 30)
-    # Each replayed frame must be given the same amount of simulated time the recorder had
-    # between frames. Leaving this at the recorder's control frequency would advance physics
-    # by a fraction of a frame period per command and report tracking error that is really
-    # just an under-integrated servo window.
-    sim_cfg.teleop_control_frequency = float(max(fps, 1))
-    robot = make_robot_from_config(sim_cfg)
+    real_backend = args.backend == "real"
+    if real_backend:
+        robot_cfg = record_cfg.robot
+        if args.robot_ip:
+            robot_cfg.robot_ip = args.robot_ip
+        # Cameras are the recorder's business. Opening them here would take the RealSense units
+        # away from the live monitor the operator is watching the arm through, and this loop
+        # never reads an image.
+        robot_cfg.cameras = {}
+    else:
+        robot_cfg = build_sim_robot_config(record_cfg)
+        # Each replayed frame must be given the same amount of simulated time the recorder had
+        # between frames. Leaving this at the recorder's control frequency would advance physics
+        # by a fraction of a frame period per command and report tracking error that is really
+        # just an under-integrated servo window.
+        robot_cfg.teleop_control_frequency = float(max(fps, 1))
+    robot = make_robot_from_config(robot_cfg)
 
     frame_period_s = 1.0 / max(fps, 1)
     position_errors_mm: list[float] = []
@@ -281,12 +298,17 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
     completed_frames = 0
     video = _PreviewVideoWriter(args.render_video, fps) if args.render_video else None
 
-    emit(f"fr3_mujoco_replay dataset={dataset_root.name} episode={args.episode} frames={total_frames} fps={fps}")
+    emit(
+        f"fr3_mujoco_replay dataset={dataset_root.name} episode={args.episode} "
+        f"frames={total_frames} fps={fps} backend={args.backend}"
+    )
+    if real_backend:
+        emit(f"Real-robot replay on {getattr(robot_cfg, 'robot_ip', '?')}: the arm will move.")
     robot.connect()
     try:
-        # Unscored approach phase: the simulated arm starts at its home pose, which is not
-        # where the recording began. Without this, frame 0 is scored against a homing jump and
-        # every episode "fails" for a reason that has nothing to do with the trajectory.
+        # Unscored approach phase: the arm starts wherever it is, which is not where the
+        # recording began. Without this, frame 0 is scored against a homing jump and every
+        # episode "fails" for a reason that has nothing to do with the trajectory.
         settle_target = {
             "ee.x": float(action_positions[0][0]),
             "ee.y": float(action_positions[0][1]),
@@ -324,11 +346,19 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
         if settle_error_mm > args.settle_tolerance_mm:
             # Reported, not silently folded into the trajectory score: an arm that cannot even
             # reach the start pose says something different from one that drifts mid-episode.
-            emit(
-                f"WARN: could not reach the recorded start pose within {args.settle_steps} steps "
-                f"({settle_error_mm:.2f} mm > {args.settle_tolerance_mm:.2f} mm); "
-                "the trajectory may be outside the simulated workspace"
+            message = (
+                f"could not reach the recorded start pose within {args.settle_steps} steps "
+                f"({settle_error_mm:.2f} mm > {args.settle_tolerance_mm:.2f} mm)"
             )
+            if real_backend:
+                # On hardware this is where it stops. Frame 0 of a trajectory whose start the arm
+                # never reached is a step of unknown size taken at full command rate, and the
+                # thing that absorbs it is the hardware.
+                raise RuntimeError(
+                    f"Refusing to replay on the real robot: {message}. The arm is parked where the "
+                    "approach left it; nothing from the recorded trajectory was sent."
+                )
+            emit(f"WARN: {message}; the trajectory may be outside the simulated workspace")
 
         for frame_index in range(total_frames):
             target_position = action_positions[frame_index]
@@ -403,6 +433,7 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
             "max_position_error_mm": float(args.max_position_error_mm),
             "max_rotation_error_deg": float(args.max_rotation_error_deg),
         },
+        "backend": str(args.backend),
         "robot_type": robot.name,
         "video_frames": int(video.frames_written) if video is not None else 0,
         "native_video_path": (
@@ -418,6 +449,16 @@ def fr3_mujoco_replay_report_path(dataset_root: Path, episode: int) -> Path:
 
 def fr3_mujoco_replay_video_path(dataset_root: Path, episode: int) -> Path:
     return dataset_root / "derived" / "fr3_mujoco_replay" / f"episode_{int(episode):06d}.mp4"
+
+
+def fr3_real_replay_report_path(dataset_root: Path, episode: int) -> Path:
+    """Separate from the sim report on purpose.
+
+    The sim report is the verdict that authorized this run. Writing the hardware result over it
+    would destroy the record of what was checked beforehand, and a second real replay would then
+    be gated by the first one's outcome.
+    """
+    return dataset_root / "derived" / "fr3_real_replay" / f"episode_{int(episode):06d}.json"
 
 
 class _PreviewVideoWriter:
@@ -503,15 +544,53 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Write an mp4 of the simulated arm following the trajectory (preview only).",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--backend",
+        choices=("sim", "real"),
+        default="sim",
+        help="sim replays in MuJoCo and scores the trajectory; real moves the hardware arm.",
+    )
+    parser.add_argument(
+        "--robot-ip",
+        dest="robot_ip",
+        default="",
+        help="Override the config's robot_ip. Only meaningful with --backend real.",
+    )
+    args = parser.parse_args(argv)
+    if args.backend == "real":
+        if args.render_video is not None:
+            parser.error("--render-video is a MuJoCo preview; there is nothing to render on hardware.")
+        # A real arm has one clock and it is the wall clock. Streaming a 30 Hz trajectory as fast
+        # as the loop can issue it would ask the hardware for motion the recording never made.
+        args.realtime = True
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     result = replay_episode(args)
-    destination = args.output or fr3_mujoco_replay_report_path(args.dataset.resolve(), args.episode)
+    default_report = (
+        fr3_real_replay_report_path(args.dataset.resolve(), args.episode)
+        if args.backend == "real"
+        else fr3_mujoco_replay_report_path(args.dataset.resolve(), args.episode)
+    )
+    destination = args.output or default_report
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+
+    if args.backend == "real":
+        emit(
+            "fr3_real_replay_result="
+            f"status={result['status']} "
+            f"completed_frames={result['completed_frames']} "
+            f"total_frames={result['total_frames']} "
+            f"avg_pos_mm={result['avg_position_error_mm']:.4f} "
+            f"max_pos_mm={result['max_position_error_mm']:.4f} "
+            f"avg_rot_deg={result['avg_rotation_error_deg']:.4f} "
+            f"max_rot_deg={result['max_rotation_error_deg']:.4f}"
+        )
+        emit(f"fr3_real_replay_report={destination}")
+        return 0 if result["status"] == "passed" else 1
 
     # Exact shape the gateway's validation parser expects; keep it byte-compatible.
     emit(

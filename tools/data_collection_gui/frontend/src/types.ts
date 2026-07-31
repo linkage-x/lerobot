@@ -173,9 +173,6 @@ export type ReplayStatus = {
   realRobotIp?: string;
   realEndEffectorMode?: RealEndEffectorMode;
   mujocoOverrideAccepted?: boolean;
-  // False where the profile cannot drive a real arm from a recording at all (the workstation:
-  // the real path replays AprilTag cube sidecars nothing in its pipeline writes).
-  realReplaySupported?: boolean;
   realReplayLog?: string[];
   // Bumped when the dataset content changes under an unchanged (root, episode)
   // selection (e.g. after deleting an episode); the inspector refetches on it.

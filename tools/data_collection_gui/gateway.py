@@ -156,10 +156,6 @@ class ReplayStatus:
     realRobotIp: str = ""
     realEndEffectorMode: str = "corenetic_gripper_ee"
     mujocoOverrideAccepted: bool = False
-    # Whether this profile can actually drive a real arm from a recorded episode. The real path
-    # replays the cube sidecars an AprilTag rig produces; a workstation dataset has none, so the
-    # request dies inside the gateway. Say so up front instead of offering a live-looking button.
-    realReplaySupported: bool = True
     realReplayLog: list[str] = field(default_factory=list)
     # Bumped whenever the on-disk dataset content changes under a stable
     # (datasetRoot, episode) selection — e.g. deleting an episode keeps the
@@ -7812,6 +7808,35 @@ def _validated_robot_ip(raw: str, label: str) -> str:
     return value
 
 
+def _fr3_real_replay_command(state: GatewayState, dataset_root: Path, robot_ip: str) -> list[str]:
+    """Drive the hardware FR3 through the episode's own recorded EE actions.
+
+    The same runtime as the MuJoCo gate, with ``--backend real``. Sharing it is the point: a real
+    replay that rebuilt its trajectory by different code from the run that cleared it would have
+    validated one thing and executed another.
+    """
+    return [
+        str(_venv_python(state.repo_root, prefer_fr3=True)),
+        str(state.repo_root / "tools" / "fr3" / "fr3_gui_replay_runtime.py"),
+        "--backend",
+        "real",
+        "--dataset",
+        str(dataset_root),
+        "--episode",
+        str(state.replay.episode),
+        "--config-path",
+        str(state.config_path),
+        "--fps",
+        str(state.replay.fps or 30),
+        "--robot-ip",
+        str(robot_ip),
+        "--max-position-error-mm",
+        str(DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM),
+        "--max-rotation-error-deg",
+        str(DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG),
+    ]
+
+
 def _real_replay_command(
     state: GatewayState,
     dataset_root: Path,
@@ -7819,6 +7844,8 @@ def _real_replay_command(
     robot_ip: str,
     end_effector_mode: str = "corenetic_gripper_ee",
 ) -> list[str]:
+    if state.profile == "workstation":
+        return _fr3_real_replay_command(state, dataset_root, robot_ip)
     # run/deploy.sh hosts the gateway on Thor itself. Calling the developer-side
     # run_replay_cube_pose_on_thor.sh wrapper here would make Thor SSH back into
     # itself and depend on an unrelated self-SSH key. Invoke the same underlying
@@ -8171,44 +8198,40 @@ def _start_real_replay(
         state.replay.message = "Replay process is already running"
         return
 
-    if not state.replay.realReplaySupported:
-        # Fail here rather than 60 lines down inside _read_sidecar_cube_poses, whose
-        # "No valid generated EE trajectory" reads like a missing file the operator could go
-        # produce. On this profile there is no producer: the real path replays the cube sidecars
-        # an AprilTag rig writes, and nothing in the FR3 workstation pipeline writes them.
-        raise RuntimeError(
-            "Real-robot replay is not wired for the workstation profile: it drives the AprilTag "
-            "cube sidecars (derived/april_cube_tracking_in_robot_base/state_action.<cube>.csv), "
-            "which a workstation recording never produces. MuJoCo replay is the validation path "
-            "here."
-        )
-
     cube_mode = str(cube_mode).strip().lower()
     if cube_mode not in ("left", "right"):
         raise ValueError(f"Real replay cube mode must be left or right, got {cube_mode!r}")
     end_effector_mode = str(end_effector_mode).strip().lower()
     if end_effector_mode not in ("pika_gripper_ee", "corenetic_gripper_ee", "fr3_ee"):
         raise ValueError("Real replay end effector must be pika_gripper_ee, corenetic_gripper_ee, or fr3_ee")
+    workstation = state.profile == "workstation"
     state.replay.realReplayLog = []
     _append_real_replay_log(
         state,
         "request",
-        f"cube={cube_mode} episode={state.replay.episode} robot={robot_ip or _real_robot_ip(state)} target={end_effector_mode}",
+        f"{'source=recorded EE actions' if workstation else f'cube={cube_mode}'} "
+        f"episode={state.replay.episode} robot={robot_ip or _real_robot_ip(state)} target={end_effector_mode}",
     )
     dataset_root = _require_mujoco_validation(
         state,
         cube_mode=cube_mode,
         allow_failed_override=bool(override_mujoco_failure),
     )
-    validation_mode = str((state.replay.mujocoValidation or {}).get("cubeMode") or state.replay.mujocoCubeMode)
-    if validation_mode != cube_mode:
-        raise RuntimeError(
-            f"Run and pass MuJoCo {cube_mode} for this dataset/episode before real replay; "
-            f"current validation is for {validation_mode}."
+    if not workstation:
+        # Both checks below are about the cube sidecars. The workstation replays the episode's own
+        # action column, which the validation it just cleared was scored against -- there is no
+        # second artefact that could be missing or belong to a different cube.
+        validation_mode = str(
+            (state.replay.mujocoValidation or {}).get("cubeMode") or state.replay.mujocoCubeMode
         )
-    episode_poses = _read_sidecar_cube_poses(dataset_root, state.replay.episode)
-    if not episode_poses.get(cube_mode):
-        raise RuntimeError(f"No valid generated EE trajectory for: {cube_mode}")
+        if validation_mode != cube_mode:
+            raise RuntimeError(
+                f"Run and pass MuJoCo {cube_mode} for this dataset/episode before real replay; "
+                f"current validation is for {validation_mode}."
+            )
+        episode_poses = _read_sidecar_cube_poses(dataset_root, state.replay.episode)
+        if not episode_poses.get(cube_mode):
+            raise RuntimeError(f"No valid generated EE trajectory for: {cube_mode}")
 
     selected_ip = _validated_robot_ip(robot_ip or _real_robot_ip(state), "Robot IP")
     _append_real_replay_log(state, "validation", "trajectory and MuJoCo decision accepted")
@@ -8971,7 +8994,6 @@ def make_state(
         devices=_device_statuses(config, resolved_root),
     )
     state.replay.mujocoValidation = _new_mujoco_validation(state)
-    state.replay.realReplaySupported = profile != "workstation"
     if profile == "workstation":
         urdf_path, sim_xml_path = _fr3_pika_asset_paths(resolved_root)
         state.teleop.urdfPath = str(urdf_path)

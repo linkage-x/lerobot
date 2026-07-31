@@ -255,18 +255,33 @@ saved-report **Pass MuJoCo check** — that button re-reads a `mujoco_preview.<c
 route never writes. The verdict here is settled automatically: the runtime reports on the
 `mujoco_replay_result=` line and the gateway resolves pass/fail when the process exits.
 
-**Real-robot replay is not wired for this profile.** The panel is shared with Thor, whose
-`_start_real_replay` replays the same cube sidecars through
-`third_party/opencv_kalibr/.../replay_cube_pose_in_robot_base.py`; a workstation recording never
-produces them. The control is disabled here and the gateway refuses the request up front with
-that reason, rather than dying further in on a missing-file message that reads like something you
-could go generate.
+### Real-robot replay
 
-So the MuJoCo pass gates nothing today: treat the sim score as a verdict on the data, not as an
-authorization to move hardware. If the real path is ever wired for this rig, keep the gate — it
-is the only check that runs the recorded EE stream through IK before an arm executes it at speed,
-and it is complementary to the hardware preflight, which vets the arm but never looks at the
-trajectory.
+`--backend real` on the *same* runtime: the hardware `FrankaResearch3` from the same config,
+driven by the same reconstructed trajectory, scored the same way. Sharing the runtime is the
+point — a real replay that rebuilt its trajectory by different code from the run that cleared it
+would have validated one thing and executed another. Thor keeps its cube-sidecar path
+(`third_party/opencv_kalibr/.../replay_cube_pose_in_robot_base.py`); nothing is shared between
+them but the panel.
+
+What differs on hardware, and only what must:
+
+- Nothing is rendered, and the cameras are not opened — the RealSense units belong to the live
+  monitor the operator is watching the arm through, and this loop never reads an image.
+- The replay is paced at the dataset frame rate, always. Streaming a 30 Hz trajectory as fast as
+  the loop can issue it would ask the arm for motion the recording never made.
+- **The approach phase refuses instead of warning.** In sim, failing to reach the recorded start
+  pose is logged and the episode is scored anyway. On hardware it aborts before a single
+  trajectory frame is sent: frame 0 of a trajectory whose start the arm never reached is a step
+  of unknown size at full command rate, and the thing that absorbs it is the hardware.
+- The result lands in `derived/fr3_real_replay/episode_N.json`, never over the sim report that
+  authorized the run.
+
+The MuJoCo pass is still required in front of it, and that is deliberate: it is the only check
+that puts the recorded EE stream through IK before an arm executes it, and it is complementary to
+the hardware preflight, which vets the arm but never looks at the trajectory. A validation that
+ran and *failed* can be overridden in the confirmation window, with its errors in front of you; a
+validation that never ran cannot, because there is nothing to judge.
 
 The MuJoCo verdict does not touch `safety`, which describes only whether the hardware path is
 authorized — that is the real preflight's answer to give. A failed score therefore leaves the

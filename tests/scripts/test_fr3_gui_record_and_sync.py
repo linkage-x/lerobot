@@ -335,13 +335,36 @@ def test_a_passing_mujoco_score_does_not_authorize_the_hardware_path(tmp_path, m
     assert state.replay.safety == "locked"
 
 
-def test_real_replay_is_refused_up_front_on_a_profile_that_cannot_do_it(tmp_path):
-    """Fail with the reason, not 60 lines later with a missing-file message."""
+def test_workstation_real_replay_drives_the_shared_runtime_not_the_cube_script(tmp_path):
+    """One runtime for both. A real replay that rebuilt its trajectory by different code from the
+    run that cleared it would validate one thing and execute another."""
     state = _workstation_state(tmp_path)
-    state.replay.realReplaySupported = False
+    state.replay.episode = 3
+    state.replay.fps = 30
 
-    with pytest.raises(RuntimeError, match="not wired for the workstation profile"):
-        gateway._start_real_replay(state, cube_mode="left", robot_ip="192.168.1.206")
+    command = gateway._real_replay_command(
+        state, tmp_path / "ds", "left", "192.168.1.206", "pika_gripper_ee"
+    )
+
+    assert str(tmp_path / "tools/fr3/fr3_gui_replay_runtime.py") in command
+    assert "--backend" in command and command[command.index("--backend") + 1] == "real"
+    assert command[command.index("--robot-ip") + 1] == "192.168.1.206"
+    assert command[command.index("--episode") + 1] == "3"
+    # Nothing from the AprilTag route may leak in: no cube selection, no Thor config.
+    assert "--cube" not in command
+    assert not any("opencv_kalibr" in part for part in command)
+
+
+def test_thor_real_replay_still_drives_the_cube_script(tmp_path):
+    state = _workstation_state(tmp_path)
+    state.profile = "thor"
+
+    command = gateway._real_replay_command(
+        state, tmp_path / "ds", "left", "192.168.1.206", "corenetic_gripper_ee"
+    )
+
+    assert any("replay_cube_pose_in_robot_base.py" in part for part in command)
+    assert "--input.dataset_pose_name=left" in command
 
 
 def test_sync_lines_become_a_verdict_the_operator_can_act_on(tmp_path):

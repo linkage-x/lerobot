@@ -53,9 +53,7 @@ export function ReplayPanel({
         ? "Inspect the trajectory below, then re-run MuJoCo."
         : validation?.status === "running"
           ? "Waiting for the run to finish."
-          : status.realReplaySupported === false
-            ? "Run MuJoCo to score this episode."
-            : "Run MuJoCo before real-robot replay.";
+          : "Run MuJoCo before real-robot replay.";
   return (
     <section className="panel replay-panel">
       <div className="panel-heading">
@@ -127,12 +125,8 @@ export function RealRobotReplayPanel({
   const validationDecisionAvailable = validationPassed || validationFailedButReviewable;
   const ipValid = validIpv4(robotIp);
   const active = status.state === "replaying" || status.state === "sim_replay";
-  // The gateway says whether this profile can drive an arm from a recording at all. The
-  // workstation cannot -- the real path replays AprilTag cube sidecars nothing here writes -- and
-  // an enabled-looking button that dies inside the gateway is worse than one that says why.
-  const supported = status.realReplaySupported !== false;
   const disabled =
-    busy || active || !supported || status.datasetKind === "exported" || !validationDecisionAvailable || !ipValid;
+    busy || active || status.datasetKind === "exported" || !validationDecisionAvailable || !ipValid;
 
   useEffect(() => {
     if (!monitorRequested && status.state !== "replaying") return;
@@ -178,22 +172,18 @@ export function RealRobotReplayPanel({
             {status.state === "replaying" ? "Real-robot replay running…" : "Run real-robot replay"}
           </button>
           <p className="panel-note">
-            {!supported
-              ? "Not wired for this rig: the real path replays the AprilTag cube sidecars " +
-                "(derived/april_cube_tracking_in_robot_base/state_action.<cube>.csv), which a " +
-                "workstation recording never produces. MuJoCo replay is the validation path here."
-              : status.datasetKind === "exported"
-                ? "Real robot replay is disabled for exported datasets."
-                : !validationDecisionAvailable
-                  ? "Run MuJoCo validation to completion for this dataset and episode first. A run " +
-                    "that finishes and fails can still be overridden below, with its errors in front " +
-                    "of you; a validation that never ran leaves nothing to judge, so there is no " +
-                    "override for it."
-                  : !ipValid
-                    ? "Enter a valid robot IPv4 address."
-                    : validationFailedButReviewable
-                      ? "MuJoCo failed. You may click Run and make the final Yes/No decision in the warning window."
-                      : "The gateway preflights this FR3, moves pika_task_tcp to frame 0, then streams the trajectory."}
+            {status.datasetKind === "exported"
+              ? "Real robot replay is disabled for exported datasets."
+              : !validationDecisionAvailable
+                ? "Run MuJoCo validation to completion for this dataset and episode first. A run " +
+                  "that finishes and fails can still be overridden below, with its errors in front " +
+                  "of you; a validation that never ran leaves nothing to judge, so there is no " +
+                  "override for it."
+                : !ipValid
+                  ? "Enter a valid robot IPv4 address."
+                  : validationFailedButReviewable
+                    ? "MuJoCo failed. You may click Run and make the final Yes/No decision in the warning window."
+                    : "The gateway preflights this FR3, moves pika_task_tcp to frame 0, then streams the trajectory."}
           </p>
         </div>
         <div className="realsense-monitor">
