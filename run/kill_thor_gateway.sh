@@ -34,6 +34,8 @@ set -euo pipefail
 _gateway_pids() {
   python3 - <<'PY'
 import os
+
+MODULE = 'tools.data_collection_gui.gateway'
 for name in os.listdir('/proc'):
     if not name.isdigit():
         continue
@@ -42,7 +44,13 @@ for name in os.listdir('/proc'):
     except OSError:
         continue
     args = [x.decode('utf-8', 'ignore') for x in raw if x]
-    if len(args) >= 3 and args[0].endswith('python3') and args[1] == '-m' and args[2] == 'tools.data_collection_gui.gateway':
+    # Match on the interpreter + `-m <module>` pair rather than on argv[0]
+    # being exactly python3: other branches launch the gateway through
+    # .venv/bin/python (a symlink to python3) and may pass flags before -m.
+    # A plain substring test would instead match greps, editors and pkill.
+    if not args or not os.path.basename(args[0]).startswith('python'):
+        continue
+    if any(flag == '-m' and mod == MODULE for flag, mod in zip(args, args[1:])):
         print(name)
 PY
 }
