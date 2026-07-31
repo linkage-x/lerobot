@@ -246,7 +246,21 @@ aborts the episode, not the frame.
 The recorded absolute-EE action stream is fed back through the same
 `FrankaResearch3Mujoco` robot and scored against what the simulated arm reached. An unscored
 approach phase first drives to the recorded start pose, so frame 0 is not judged against a
-homing move. Passing thresholds are 20 mm / 15°, and a pass is what unlocks real-robot replay.
+homing move. Passing thresholds are 20 mm / 15°.
+
+There is no cube selection on this profile. The Thor route picks between AprilTag cubes and
+replays `state_action.<cube>.csv`; a workstation dataset has no cubes and no such sidecar, so the
+gateway drops the cube mode for it and the Episode Replay page hides the picker along with the
+saved-report **Pass MuJoCo check** — that button re-reads a `mujoco_preview.<cube>` file this
+route never writes. The verdict here is settled automatically: the runtime reports on the
+`mujoco_replay_result=` line and the gateway resolves pass/fail when the process exits.
+
+**Real-robot replay is not wired for this profile.** The panel is shared with Thor, whose
+`_start_real_replay` requires the same cube sidecars and drives
+`third_party/opencv_kalibr/.../replay_cube_pose_in_robot_base.py`; against a workstation dataset
+it stops at `No valid generated EE trajectory for: <cube>` before anything reaches the arm. The
+MuJoCo pass therefore gates nothing today — treat the sim score as a data-quality verdict, not as
+an authorization to move hardware.
 
 Standalone:
 

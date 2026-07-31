@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GuiSnapshot } from "../api";
 import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, MujocoCubeMode, RealCubeMode, RealEndEffectorMode, RealSensePreviewStatus } from "../types";
-import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
+import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation, mujocoValidationMatchesSelection } from "../shared/ui";
 import { ReplayInspector } from "../ReplayInspector";
 import { api } from "../apiClient";
 
@@ -11,6 +11,7 @@ export function ReplayPanel({
   onPreflight,
   onReplay,
   mujocoMode,
+  cubeSelection = true,
   onAbort
 }: {
   status: ReplayStatus;
@@ -18,12 +19,13 @@ export function ReplayPanel({
   onPreflight: () => void;
   onReplay: (realRobot: boolean) => void;
   mujocoMode: MujocoCubeMode;
+  cubeSelection?: boolean;
   onAbort: () => void;
 }) {
   const isActive = status.state === "dry_run" || status.state === "sim_replay" || status.state === "replaying";
   const canReplayData = status.dataStatus === "loaded" && (status.recordedFrames ?? status.totalFrames) > 0;
   const validation = status.mujocoValidation;
-  const validationMatchesMode = (validation?.cubeMode ?? "left") === mujocoMode;
+  const validationMatchesMode = mujocoValidationMatchesSelection(validation?.cubeMode, mujocoMode, cubeSelection);
   const mujocoPassed =
     validation?.status === "passed" &&
     validation.isCurrentForSelection === true &&
@@ -43,7 +45,7 @@ export function ReplayPanel({
       ? `Max ${validation.maxPositionErrorMm.toFixed(2)}mm / ${validation.maxRotationErrorDeg.toFixed(2)}deg; limits ${validation.maxPositionThresholdMm.toFixed(2)}mm / ${validation.maxRotationThresholdDeg.toFixed(2)}deg`
       : "No completed MuJoCo metrics yet";
   const validationGuidance = mujocoPassed
-    ? `MuJoCo ${mujocoMode} replay is current for this episode.`
+    ? `MuJoCo ${cubeSelection ? `${mujocoMode} ` : ""}replay is current for this episode.`
     : validation?.status === "passed" && !validationMatchesMode
       ? `The saved result is for ${validation.cubeMode ?? "left"}; run ${mujocoMode} before Real Robot.`
       : "Strongly recommended before Preflight/Dry Run; required before Real Robot.";
@@ -820,6 +822,9 @@ export function EpisodeReplayPage({
   onSaveAnnotation: (annotation: EpisodeAnnotation) => void;
 }) {
   const [mujocoMode, setMujocoMode] = useState<MujocoCubeMode>(snapshot.replay.mujocoCubeMode ?? "left");
+  // The workstation replays the arm's own recorded EE stream; there are no AprilTag cubes to
+  // pick between, and the gateway ignores the cube mode on that profile entirely.
+  const cubeSelection = (snapshot.deployment?.profile ?? "thor") !== "workstation";
   const activePath = snapshot.replay.datasetRoot ?? snapshot.replay.dataset;
   const matchingProcessing =
     snapshot.processing.find((item) => item.path === activePath) ?? null;
@@ -846,6 +851,7 @@ export function EpisodeReplayPage({
           onPreflight={onPreflight}
           onReplay={onReplay}
           mujocoMode={mujocoMode}
+          cubeSelection={cubeSelection}
           onAbort={onAbort}
         />
       </div>
@@ -863,6 +869,7 @@ export function EpisodeReplayPage({
         replayStatus={snapshot.replay}
         busy={busy}
         mujocoRefreshKey={`${snapshot.replay.mujocoValidation?.updatedAt ?? ""}:${snapshot.replay.state}`}
+        cubeSelection={cubeSelection}
       />
       <RealRobotReplayPanel status={snapshot.replay} busy={busy} onStart={onRealReplay} />
       <EpisodeAnnotationPanel

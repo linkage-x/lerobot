@@ -17,6 +17,19 @@ export const taskStatusDot: Record<TaskStatus, string> = {
   paused: "warning"
 };
 
+export function mujocoValidationMatchesSelection(
+  validationCubeMode: string | undefined,
+  selectedCubeMode: string,
+  cubeSelection: boolean
+): boolean {
+  // A rig without AprilTag cubes has no selection to disagree with: the gateway ignores the cube
+  // mode on that profile, so letting a mismatch through here would withdraw a validation the run
+  // actually produced -- Real Robot locks and a passed result reads as "recommended", because of
+  // a picker that changed nothing about what ran.
+  if (!cubeSelection) return true;
+  return (validationCubeMode ?? "left") === selectedCubeMode;
+}
+
 export function stateLabel(state: string) {
   return state.replace("_", " ");
 }
