@@ -79,12 +79,19 @@ fi
 
 # ---- 2. Restart gateway on Thor ----
 echo "==> Restarting gateway on Thor..."
-ssh -o ConnectTimeout=5 "$THOR" 'flock -n /tmp/lerobot_gateway_deploy.lock bash -s || { echo "ERROR: another deploy is already restarting the Thor gateway" >&2; exit 75; }' <<'REMOTE'
+# flock -n reports a lock conflict with -E's exit code, so a failure inside the
+# remote script stays distinguishable from "someone else is deploying".
+restart_rc=0
+ssh -o ConnectTimeout=5 "$THOR" 'flock -n -E 75 /tmp/lerobot_gateway_deploy.lock bash -s' <<'REMOTE' || restart_rc=$?
 set -e
+
+GATEWAY_LOG_DIR=~/lerobot/outputs/logs/data_collection_gui
 
 _gateway_pids() {
   python3 - <<'PY'
 import os
+
+MODULE = 'tools.data_collection_gui.gateway'
 for name in os.listdir('/proc'):
     if not name.isdigit():
         continue
@@ -93,9 +100,32 @@ for name in os.listdir('/proc'):
     except OSError:
         continue
     args = [x.decode('utf-8', 'ignore') for x in raw if x]
-    if len(args) >= 3 and args[0].endswith('python3') and args[1] == '-m' and args[2] == 'tools.data_collection_gui.gateway':
+    # Match on the interpreter + `-m <module>` pair rather than on argv[0]
+    # being exactly python3: other branches launch the gateway through
+    # .venv/bin/python (a symlink to python3) and may pass flags before -m.
+    # A plain substring test would instead match greps, editors and pkill.
+    if not args or not os.path.basename(args[0]).startswith('python'):
+        continue
+    if any(flag == '-m' and mod == MODULE for flag, mod in zip(args, args[1:])):
         print(name)
 PY
+}
+
+# gateway.py redirects stdout/stderr into its own gateway_<ts>_<pid>.log inside
+# main(), so run/logs/gateway.log only ever captures pre-main crashes. Pick the
+# newest log this restart created, keyed off the timestamp in the file name:
+# mtime is useless here because a gateway that survived the kill above keeps
+# appending to its own log and would always look like the freshest file.
+_gateway_log_since() {
+  local since="$1" newest="" path name stamp
+  for path in "$GATEWAY_LOG_DIR"/gateway_*.log; do
+    [[ -e "$path" ]] || continue
+    name="${path##*/}"
+    name="${name#gateway_}"
+    stamp="${name%_*}"
+    [[ "$stamp" < "$since" ]] || newest="$path"
+  done
+  printf '%s' "$newest"
 }
 
 old_pids="$(_gateway_pids || true)"
@@ -140,6 +170,7 @@ bash tools/thor/box_sdk/ensure_box_net.sh >/dev/null 2>&1 || true
 . tools/thor/box_sdk/setup_env.sh
 
 mkdir -p ~/lerobot/run/logs
+spawn_ts="$(date +%Y%m%d_%H%M%S)"
 setsid bash -c '''exec 3>&-; exec env PYTHONPATH=src:. PYTHONUNBUFFERED=1 \
   python3 -m tools.data_collection_gui.gateway \
   --config-path tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml \
@@ -151,15 +182,38 @@ disown
 
 sleep 3
 new_pids="$(_gateway_pids || true)"
+started_log="$(_gateway_log_since "$spawn_ts" || true)"
 if [[ -n "$new_pids" ]]; then
   echo "gateway started (pid $(echo "$new_pids" | head -1))"
-  tail -3 ~/lerobot/run/logs/gateway.log
+  if [[ -n "$started_log" ]]; then
+    echo "--- ${started_log}"
+    tail -3 "$started_log"
+  fi
 else
-  echo "ERROR: gateway failed to start"
-  tail -20 ~/lerobot/run/logs/gateway.log
+  echo "ERROR: gateway failed to start" >&2
+  # Failures before _setup_gateway_log() (bad interpreter, import errors) are
+  # all run/logs/gateway.log ever sees; everything later is in the gateway log.
+  if [[ -s ~/lerobot/run/logs/gateway.log ]]; then
+    echo "--- run/logs/gateway.log"
+    tail -20 ~/lerobot/run/logs/gateway.log
+  fi
+  if [[ -n "$started_log" ]]; then
+    echo "--- ${started_log}"
+    tail -30 "$started_log"
+  else
+    echo "(no new ${GATEWAY_LOG_DIR}/gateway_*.log was created)"
+  fi
   exit 1
 fi
 REMOTE
+
+if [[ $restart_rc -eq 75 ]]; then
+  echo "ERROR: another deploy is already restarting the Thor gateway" >&2
+  exit 75
+elif [[ $restart_rc -ne 0 ]]; then
+  echo "ERROR: Thor gateway restart failed (exit ${restart_rc})" >&2
+  exit "$restart_rc"
+fi
 
 if $no_frontend; then
   echo "==> Done (--no-frontend). Open http://192.168.111.122:5173/ from a browser."
