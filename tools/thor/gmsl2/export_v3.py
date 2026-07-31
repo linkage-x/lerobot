@@ -1099,6 +1099,25 @@ def export_task_to_v3(
 
     has_box = state_width > 0
 
+    # The recorded parquet width wins, but a width that disagrees with the
+    # current BOX_STATE_NAMES means the session predates a schema change (e.g.
+    # the 31-dim rpy+quat_wxyz layout vs today's 28-dim quat_xyzw one). The
+    # writer then has no trustworthy names for those columns and drops them, so
+    # say it out loud instead of emitting a nameless observation.state.
+    if has_box and len(box_state_names) != state_width:
+        _emit(
+            f"WARNING: session state width {state_width} != current schema "
+            f"{len(box_state_names)} ({', '.join(box_state_names[:3])}, ...); "
+            "exporting without observation.state/action feature names. "
+            "Re-record or re-run the recorder on the raw box_sensors.jsonl to "
+            "get the current schema."
+        )
+    if ts_width and len(box_ts_names) != ts_width:
+        _emit(
+            f"WARNING: session box.timestamps width {ts_width} != current schema "
+            f"{len(box_ts_names)}; exporting without box.timestamps feature names."
+        )
+
     _emit(f"Schema: {len(camera_keys)} camera(s) {width}x{height} @ {fps}fps, state_width={state_width}")
 
     writer = _V3Writer(

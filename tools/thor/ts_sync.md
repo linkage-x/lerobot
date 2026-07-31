@@ -5,6 +5,7 @@
 > 2026-06-15 按真机实测校订（各传感器频率、L3b 校准残差；MCU 时钟 = 1µs/tick，6 路全 engage）
 > 2026-06-16 schema 精简（observation.state 31 维 / box.timestamps 6 维）+ 去 meta 冗余（`sync_reference` 删 split_now_wall_s、camera_first_pts_s）
 > 2026-07-13 按最近 8 次同步相关改动校订：生产默认相机路径切到 `argus_online_sync`，SOF full-cluster 在 encoder 前对齐；新增 online frame bus / preview bus / replay 多视频同步说明。
+> 2026-07-29 实施 IMU 姿态去冗余（§9.1.1 / 原 §10 P2）：删 `rpy`、quat 改 xyzw，`observation.state` 31 → 28 维；四元数半球用 213 条真机 IMU 流实测后决定**不强制**。同日核对后关闭原 §10 P0（replay 修复的 Thor 部署）。
 
 ## 1. 系统总览
 
@@ -410,6 +411,7 @@ argus_metadata: 写完整视频 + sidecar -> 保存后按 SOF 对齐窗口 -> �
 | Episode Replay video sync | `tools/data_collection_gui/gateway.py` / `frontend/src/ReplayInspector.tsx` | `tests/scripts/test_data_collection_gui_gateway.py` + browser validation |
 | 500Hz poll + MCU 去重 | `box_sdk/box_client.py` `_poll_loop` | `tests/scripts/test_thor_box_client.py` |
 | 帧网格 + 最近邻对齐 | `gmsl2/thor_lerobot_v3.py` `_build_episode_rows` / `_nearest_sample_data` | `tests/scripts/test_thor_ts_sync_alignment.py` |
+| state schema（28 维；IMU 姿态只留 quat xyzw） | `gmsl2/thor_lerobot_v3.py` `BOX_STATE_NAMES` / `box_snapshot_to_state` / `_imu_quat_xyzw` | `tests/scripts/test_thor_ts_sync_alignment.py::test_imu_attitude_is_quaternion_only_in_xyzw_order`；`experiments/imu_quat_hemisphere_20260729/` |
 | MCU 时钟校准 + 回退 | `gmsl2/thor_lerobot_v3.py` `calibrate_mcu_clock` / `calibrate_sensor_samples` | `tests/scripts/test_thor_ts_sync_alignment.py` |
 | 相机曝光时刻对齐（skew 修复） | `gmsl2/thor_lerobot_v3.py` `camera_frame_times_rel` / `_build_episode_rows(frame_times_s=)`；`thor_record.py` 传参 | `tests/scripts/test_thor_ts_sync_alignment.py` §7–§8；`experiments/ts_sync_skew_20260716/` |
 | ffprobe/GStreamer PTS（离线数帧/QC） | `gmsl2/thor_lerobot_v3.py` `extract_pts`；`gmsl2/export_v3.py` | `tests/scripts/test_thor_lerobot_v3_pts.py` |
@@ -472,7 +474,7 @@ Episode Replay 不能把多个 `<video>` 元素当成天然同步：浏览器 vi
 
 `export_v3` **不重做** box↔相机的 state 同步（那一步已在录制 Stop 时完成，见 §6 开头「同步时机」）；它只把录制器已同步好的 box state 挂到权威相机网格上。相机网格：online-sync 数据使用 `logical_frame_index / fps`，legacy splitmux 数据使用 `pts_offset + N/fps`。box state 复用录制器已对齐的 session parquet，**按 `frame_index`（而非列表位置）** 配相机帧（box 网格比相机视频长的尾部丢弃、短的 carry-forward）；**无可用 session parquet 时直接跳过该 episode**（不再从 `box_sensors.jsonl` 在 export 内重做 L3b —— 该 raw 重对齐路径已于 2026-07-13 移除，见下方更新记录）。export 另外从 `box_sensors.jsonl` 重采样**触觉全阵列**（239 维 taxel）到帧网格，这是 export 才做的对齐（`_align_touch_rows`）。每集输出 `timestamp` 重基到 `i/fps` 以匹配重锚定的逐集视频。代码见 `export_v3._align_box_rows_by_frame_index`（state）/ `_align_touch_rows`（触觉阵列）。
 
-### 9.1 `observation.state` / `action`（float32，**31** 维）
+### 9.1 `observation.state` / `action`（float32，**28** 维）
 
 只放可训练的传感器读数，**不含任何时间戳、不含状态位**。通道分组（`BOX_STATE_NAMES`）：
 
@@ -480,13 +482,72 @@ Episode Replay 不能把多个 `<video>` 元素当成天然同步：浏览器 vi
 |----|------|------|
 | gripper | `box_gripper.distance_m` | 1 |
 | trigger | `box_trigger.travel_pct` | 1 |
-| IMU | `acc_{x,y,z}_g` / `gyr_{x,y,z}_deg_s` / `roll,pitch,yaw_deg` / `quat_{w,x,y,z}` | 13 |
+| IMU | `acc_{x,y,z}_g` / `gyr_{x,y,z}_deg_s` / `quat_{x,y,z,w}` | 10（姿态只留四元数，**xyzw 标量在后**，见 §9.1.1） |
 | 六维力 | `box_six_d_force.{fx,fy,fz,mx,my,mz}` | 6 |
 | 触觉 L/R | 各 `mean_f{x,y,z}_0p1N` / `max_abs_fz_0p1N` / `active_points`（239 点聚合） | 5+5 |
 
 > 演进：42 维（含重复 `gripper.pos`、7 个 `*.timestamp`、恒定死通道 `box_status.{valid,liwp_index}`）
-> → 33 维（去重 gripper + 时间戳移出, 见 §9.2）→ **31 维**（再删掉恒为常量的 `box_status.valid`(恒 1)
-> 和 `liwp_index`(HF 路径恒 0)）。原则：state 只留可训练的传感器读数, 不放单调计数/常量, 避免归一化被带歪与时间泄漏。
+> → 33 维（去重 gripper + 时间戳移出, 见 §9.2）→ 31 维（再删掉恒为常量的 `box_status.valid`(恒 1)
+> 和 `liwp_index`(HF 路径恒 0)）→ **28 维**（删 IMU 的 `roll/pitch/yaw_deg`，与 `quat` 冗余，见 §9.1.1）。
+> 原则：state 只留可训练的传感器读数, 不放单调计数/常量/同一量的第二种编码, 避免归一化被带歪与时间泄漏。
+
+#### 9.1.1 IMU 姿态去冗余（31 → 28 维，`rpy` 删除 + quat 改 xyzw）✅ 2026-07-29
+
+**结论（已实施）**：删掉 `box_imu.{roll,pitch,yaw}_deg` 三维，只保留四元数，并把顺序从原来的
+`w,x,y,z` 改为 **`x,y,z,w`**。`observation.state` / `action` 从 **31 → 28** 维。
+
+**为什么冗余**：`roll/pitch/yaw` 与 `quat` 编码同一个 3-DoF 姿态，且在 `box_client._decode_imu`
+里来自 SDK 同一个 `imu` 结构体的两个字段（`imu.roll/pitch/yaw` 与 `imu.quat`），**不是两路独立测量**。
+改动前 IMU 那 13 维里只有 9 维是独立信息（acc 3 + gyr 3 + 姿态 3）；改后留 10 维（多出的 1 维是四元数
+自带的模长约束，无害）。
+
+**为什么删 rpy 而不是删 quat**（冗余的那份恰好是更差的那份）：
+
+1. **`yaw_deg` 在 ±180° 处 wrap**。归一化统计（mean/std 或分位数）和回归损失落在一个会绕回的通道上
+   是**有害的**，不只是浪费维度：同一物理姿态的两个邻近时刻可能相差 360，梯度直接爆。
+2. **姿态在 state 里被隐式加权两次**，归一化后两组通道各自贡献一份姿态梯度。
+3. 四元数虽有双覆盖（`q` 与 `-q` 同一旋转），但那是**符号**问题，比角度 wrap 好处理；且实测这份 SDK
+   流根本不出现符号翻转（见下方半球约定）。
+
+**为什么 xyzw**：与 `scipy.spatial.transform.Rotation`、ROS `geometry_msgs/Quaternion`、MuJoCo 之外的
+多数下游一致（MuJoCo 用 wxyz，是少数派）。本仓库 FR3 侧已经在 `xyzquat` / `wxyz_to_xyzw()` 之间反复
+转换（见 `docs/fr3_act_infer_real_minimal.md`、`docs/fr3_quest3_teleop_todo.md`），统一到 xyzw 可以
+消掉一层「标量位在前还是在后」的心智负担。SDK 侧仍是 wxyz（`imu.quat` → `quat_wxyz`），**重排放在
+打包 state 时做，不改 SDK、不改 raw JSONL**。
+
+**数据不丢**：`box_sensors.jsonl` 存的是 `_decode_imu` 的完整 dict，`roll_deg/pitch_deg/yaw_deg`
+仍然原样归档，需要时可离线还原或重新导出。删的只是**训练用 state 布局**。
+
+**四元数半球约定：不强制半球，按 SDK 原样透传**（2026-07-29 真机实测后定案）。原计划是「若存在
+`q → -q` 翻转就强制 `w >= 0`」，实测结论把它推翻了：
+
+| 口径 | 实测（Thor `outputs/datasets` 全量，213 条 IMU 流 / 323,213 样本） |
+|------|------|
+| 相邻样本反极翻转 `dot(q[i], q[i+1]) < 0` | **0 次** —— SDK 输出本身就是连续的 |
+| 相邻样本最大 L2 步长（原样） | 0.342（真实快速转动，远离 2.0） |
+| `w` 变号（姿态自然穿过 `w=0`，即转过 180°）的流 | **31 条**（14.6%） |
+| 若强制 `w >= 0`，这 31 条的最大 L2 步长 | **2.001** —— 整体符号跳变被人为注入 |
+| 强制半球能改善的流 | **0 条** |
+
+即：**强制半球在这份数据上只有害处**——它把「`w` 过零」变成一个假的整体符号跳变，而它本要防的翻转
+根本不存在。因此打包 state 时只做 wxyz→xyzw 重排，**不改符号**。注意这条结论依赖 SDK 侧的连续性，
+若将来换固件/换 IMU 解算，应重跑 [`experiments/imu_quat_hemisphere_20260729/`](experiments/imu_quat_hemisphere_20260729/README.md)
+复核。另：同一批数据里 `yaw_deg` 的 ±180° wrap 实测确有发生（1 条流 2 次），佐证删 `rpy` 的判断。
+
+**改动点**（全部在录制/导出侧，SDK 不动）：
+
+| 文件 | 改动 |
+|------|------|
+| `gmsl2/thor_lerobot_v3.py` `BOX_STATE_NAMES` | 删 `box_imu.{roll,pitch,yaw}_deg` 三项；`quat_{w,x,y,z}` 改为 `quat_{x,y,z,w}` |
+| `gmsl2/thor_lerobot_v3.py` `box_snapshot_to_state` | 删三行 `_finite_float(imu.get("roll_deg"))` 等；新增 `_imu_quat_xyzw()`，把 SDK 的 `quat_wxyz` 重排为 xyzw（符号透传） |
+| `gmsl2/export_v3.py` | 只读 `lr3.BOX_STATE_NAMES`，随定义自动跟随；**新增**：session parquet 宽度与当前 schema 不一致时 `_emit` 警告（旧 31 维数据重导出会丢列名，不再静默） |
+| `tests/scripts/test_thor_ts_sync_alignment.py` | 新增 `test_imu_attitude_is_quaternion_only_in_xyzw_order`：rpy 不在 state、quat 顺序为 xyzw、打包确实按 `[1,2,3,0]` 重排且不改符号 |
+| `data_collection_gui/frontend/src/SeriesPlot.test.ts` | 新增当前 xyzw 布局分组用例；保留 legacy wxyz+rpy 用例（旧数据集 replay 仍要能画）。分组逻辑本身按名字驱动、`dim` 取自列表位置，无固定下标，源码无需改 |
+
+**迁移影响（破坏性）**：`observation.state` / `action` 宽度和列序都变，**已有数据集的 norm stats 与
+checkpoint 不兼容**。已录数据要么保持在旧 schema 下训练，要么重新录制/重跑录制器（raw JSONL 齐全，可重建）。
+注意 `export_v3` **不会**把旧的 31 维 session parquet 转成 28 维——它复用录制器已同步的 state，只会
+按上表警告并丢掉列名。
 
 ### 9.2 `box.timestamps` 元数据列（float64，**6** 维，非训练）
 
@@ -517,17 +578,22 @@ mcu_ts 冗余，已移除（liwp 是包级时间戳，对齐用 per-sensor 更�
 | 2026-07-07 | `argus_online_sync` 8 路 10×60s burn-in | 每路 3600 帧，sidecar 3600 行，max SOF delta 0.401ms，ffmpeg materialization=false |
 | 2026-07-13 | `sync_test_lht_20260707_090407` episode 0 spot check | 8 路 MP4 均 1330 帧 / 60fps；frame 1235 附近 SOF delta 12–13µs；MP4 第 1235 帧 PTS 均 20.583s |
 | 2026-07-13 | Episode Replay | 修复多 `<video>` 独立 clock/seek 容差导致的可见错位；原始视频与 sidecar 本身同步 |
+| 2026-07-29 | replay 修复的 Thor 部署核对 | gateway 源码含 `cameraVideoOffsetsS` 且进程在其后重启；Thor 不 serve 前端 bundle（前端在开发机跑 Vite）→ 原 §10 P0 关闭 |
 | 2026-07-16 | BOX↔相机固定 skew 量化（7 ep, `water_pouring_20260715_*`） | `N/fps` vs 硬件 SOF δ=−11~−53ms 逐 episode 变；真实帧率 60.000±0.002fps、`N/fps` 漂移可忽略；注入 gripper≤9mm/力≤4.2N。详见 `experiments/ts_sync_skew_20260716/` |
 | 2026-07-16 | 修复:BOX NN 改用 sensor_timestamp（L3b+） | `camera_frame_times_rel`+`_build_episode_rows(frame_times_s=)`；真机数据验证 timestamp 列不变、gripper 修正 max 8.96mm；回归测试 15 passed |
+| 2026-07-29 | IMU 四元数半球（213 条 IMU 流 / 323,213 样本） | 反极翻转 **0 次**（SDK 流本身连续）；31 条流自然穿过 `w=0`,强制半球反而注入 L2=2.0 符号跳变 → **决定不强制**。详见 `experiments/imu_quat_hemisphere_20260729/` |
 | 待验 | 部署侧 skew（frame bus + 实时 BOX） | 需先上推理部署,再量化在线路径残余 skew 并与训练侧对齐（§10 P1） |
 
 ## 10. TODO / 后续工作
+
+2026-07-29 已关闭（原 P0，replay 修复发布）：Thor 上核对确认无待办——`gateway.py` 已含 `cameraVideoOffsetsS`（源码 11:04 同步），gateway 进程 13:10 在其之后重启；Thor 只监听 8765，gateway 只 serve STL/JPEG/PNG，**不 serve 前端 bundle**，也无 Vite/node 进程，前端是在开发机本地跑 Vite（`VITE_GUI_API_BASE` 指向 Thor），源码已含四分之一帧 seek 容差，重启本地 dev server + 浏览器强刷即可。**遗留（非阻塞）**：Thor 上 `tools/data_collection_gui/frontend/dist/` 是 2026-05-27 的陈旧 bundle，当前无人 serve，但将来若配静态服务会踩回 50ms 容差那版——届时先重 build 或删除。
+
+2026-07-29 已完成（原 P2）：IMU 姿态去冗余——删 `box_imu.{roll,pitch,yaw}_deg`、quat 改 xyzw，`observation.state` / `action` 31 → 28 维；四元数半球经真机实测决定不强制。详见 §9.1.1 与 `experiments/imu_quat_hemisphere_20260729/`。**破坏性**：state 宽度与列序都变，旧数据集的 norm stats / checkpoint 不兼容。
 
 2026-07-13 已完成：Dataset Processing/QC 展示 `online_sync_manifest.json` 的 actual_frames、frame_count_by_camera、max SOF delta 和 failure reason；`export_v3` 改为要求 online-sync manifest，以 `actual_frames` 作为相机网格来源，并移除 legacy `pts_offset` / raw `box_sensors.jsonl` 重对齐路径。
 
 | 优先级 | TODO | 说明 |
 |--------|------|------|
-| P0 | 在 Thor GUI 实际服务目录重启/发布 replay 修复 | 源码更新后必须重启 gateway/Vite 或重新 build 前端；浏览器需强刷，避免旧 bundle 保留 50ms seek 容差。 |
 | P1 | 部署侧 skew 实测 + 训练/部署对齐 | 训练侧固定 skew 已于 2026-07-16 用 `sensor_timestamp` 量化并修复（δ=−11~−53ms,见 `experiments/ts_sync_skew_20260716/`）。**剩余**:闭环真正要求「训练对齐 == 部署对齐」,而部署走 online frame bus + 实时 BOX 的另一条路径,其残余 skew 尚未实测。**理由:目前还没有做推理部署**,故挂 TODO;届时把在线路径也锚到硬件 SOF 采集时刻基准并量化。原 tap-test 已非必需（skew 可纯数据量化）,仅在需要绝对地锚定 BOX↔相机延迟时再做。 |
 | P2 | frame bus 性能升级（仅在线推理需要） | 纯数据采集落盘无需处理。当前 tmpfs NV12 双缓冲用于实时推理/预览；若 8 路 60Hz 在线推理吞吐吃紧，再升级 CUDA/DMABUF zero-copy IPC 或共享内存 ring buffer。 |
 | P3 | BOX uint32 µs 时间戳 unwrap | 当前短 episode 不受影响；长会话/连续录制前在客户端 poll loop 检测回绕并累加 2^32。 |

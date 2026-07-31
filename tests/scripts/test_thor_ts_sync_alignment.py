@@ -278,6 +278,48 @@ def test_timestamps_excluded_from_state_and_emitted_as_metadata_column(tmp_path)
     assert gripper_mcu == expected_mcu
 
 
+def test_imu_attitude_is_quaternion_only_in_xyzw_order():
+    """ts_sync.md §9.1.1: rpy is dropped, the quaternion is packed scalar-last.
+
+    ``roll/pitch/yaw`` and ``quat`` come from the same SDK solve, so keeping
+    both puts 3 redundant dimensions -- one of which wraps at ±180° -- into a
+    normalized, regressed state vector.
+    """
+
+    imu_names = [n for n in lr3.BOX_STATE_NAMES if n.startswith("box_imu.")]
+    assert not any(n.endswith(("roll_deg", "pitch_deg", "yaw_deg")) for n in imu_names)
+    # acc 3 + gyr 3 + quat 4 == the 9 independent DoF plus the quaternion's
+    # redundant norm constraint; no Euler duplicate.
+    assert len(imu_names) == 10
+
+    quat_names = [n for n in imu_names if ".quat_" in n]
+    assert quat_names == [
+        "box_imu.quat_x",
+        "box_imu.quat_y",
+        "box_imu.quat_z",
+        "box_imu.quat_w",
+    ], "quaternion must be xyzw (scalar last), matching scipy/ROS"
+
+    # ...and the packer actually reorders the SDK's wxyz payload to match,
+    # sign passed through untouched (no forced w >= 0 hemisphere).
+    snapshot = {
+        "sensors": {
+            "box_imu": {
+                "timestamp": 1.0,
+                "quat_wxyz": [-0.1, 0.2, 0.3, 0.4],
+                "roll_deg": 111.0,
+                "pitch_deg": 222.0,
+                "yaw_deg": 333.0,
+            }
+        }
+    }
+    state = lr3.box_snapshot_to_state(snapshot)
+    assert len(state) == len(lr3.BOX_STATE_NAMES)
+    quat = [state[lr3.BOX_STATE_NAMES.index(n)] for n in quat_names]
+    assert quat == pytest.approx([0.2, 0.3, 0.4, -0.1])
+    # The dropped Euler angles must not leak into any other channel.
+    assert 111.0 not in state and 222.0 not in state and 333.0 not in state
+
 
 def test_multi_box_namespaced_snapshots_expand_state_and_timestamps(tmp_path):
     pq = pytest.importorskip("pyarrow.parquet")
