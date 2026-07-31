@@ -261,14 +261,26 @@ if [[ "$profile" == "workstation" ]]; then
   fi
 fi
 
+# Only export the X variables we actually resolved. Handing Thor an empty
+# DISPLAY is worse than handing it none: the recorder's EGL setup then tries
+# the X11 platform against "" and every Argus camera fails preflight with
+# "Could not get EGL display connection" / NvBufSurfaceMapEglImage failed,
+# while an unset DISPLAY takes the headless path and captures fine.
+gateway_env=(PYTHONPATH=src:. PYTHONUNBUFFERED=1)
+if [[ -n "$display" ]]; then
+  gateway_env+=(DISPLAY="$display")
+fi
+if [[ -n "$xauthority" ]]; then
+  gateway_env+=(XAUTHORITY="$xauthority")
+fi
+if [[ -n "$xdg_runtime_dir" ]]; then
+  gateway_env+=(XDG_RUNTIME_DIR="$xdg_runtime_dir")
+fi
+
 mkdir -p run/logs
 spawn_ts="$(date +%Y%m%d_%H%M%S)"
 setsid env \
-  PYTHONPATH=src:. \
-  PYTHONUNBUFFERED=1 \
-  DISPLAY="$display" \
-  XAUTHORITY="$xauthority" \
-  XDG_RUNTIME_DIR="$xdg_runtime_dir" \
+  "${gateway_env[@]}" \
   "$python_bin" -m tools.data_collection_gui.gateway \
     --profile "$profile" \
     --config-path "$config_path" \
