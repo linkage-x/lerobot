@@ -15,6 +15,12 @@
 # limitations under the License.
 
 from .configuration_quest3 import Quest3TeleopConfig
-from .teleop_quest3 import Quest3Teleop
 
 __all__ = ["Quest3Teleop", "Quest3TeleopConfig"]
+
+def __getattr__(name: str):
+    if name == "Quest3Teleop":
+        from .teleop_quest3 import Quest3Teleop
+
+        return Quest3Teleop
+    raise AttributeError(name)

@@ -142,6 +142,11 @@ fr3_teleop = [
     "cffi>=1.17.1,<3.0.0",
     "ruckig>=0.15,<0.16",
 ]
+fr3-workstation-teleop = [
+    "lerobot[fr3_mujoco_sim]",
+    "lerobot[spacemouse]",
+    "lerobot[intelrealsense]",
+]
 
 # Policies
 wallx = [
@@ -239,6 +244,9 @@ fr3-host = [
 [tool.uv.sources]
 panda-python = { git = "https://github.com/linkage-x/panda-py.git", rev = "47c304f9b8147ae7582dcfe8a97af554c363021d" }
 pika-sdk = { path = "third_party/pika_sdk" }
+
+[tool.uv.extra-build-dependencies]
+ruckig = ["scikit-build-core<0.10"]
 
 [project.scripts]
 lerobot-calibrate="lerobot.scripts.lerobot_calibrate:main"

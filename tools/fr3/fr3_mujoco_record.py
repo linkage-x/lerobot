@@ -42,18 +42,6 @@ from lerobot.envs.fr3_mujoco_teleop import (
     render_camera_grid,
     update_passive_viewer_markers,
 )
-from lerobot.processor import RobotProcessorPipeline
-from lerobot.processor.converters import (
-    observation_to_transition,
-    robot_action_observation_to_transition,
-    transition_to_observation,
-    transition_to_robot_action,
-)
-from lerobot.robots.franka_research3 import (
-    AbsoluteEEActionToRobotAction,
-    DeltaActionToAbsoluteEEAction,
-    KeepAbsoluteEEObservation,
-)
 from lerobot.scripts.lerobot_record import _confirm_keep_episode
 from lerobot.scripts.lerobot_record import RecordConfig
 from lerobot.teleoperators import make_teleoperator_from_config
@@ -399,27 +387,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         )
     )
 
-    teleop_action_processor = RobotProcessorPipeline[tuple[dict, dict], dict](
-        steps=[
-            DeltaActionToAbsoluteEEAction(
-                workspace_min=cfg.robot.workspace_min,
-                workspace_max=cfg.robot.workspace_max,
-                max_target_delta_pos=cfg.robot.max_target_delta_pos,
-                max_target_delta_rot=cfg.robot.max_target_delta_rot,
-            )
-        ],
-        to_transition=robot_action_observation_to_transition,
-        to_output=transition_to_robot_action,
-    )
-    robot_action_processor = RobotProcessorPipeline[tuple[dict, dict], dict](
-        steps=[AbsoluteEEActionToRobotAction()],
-        to_transition=robot_action_observation_to_transition,
-        to_output=transition_to_robot_action,
-    )
-    robot_observation_processor = RobotProcessorPipeline[dict, dict](
-        steps=[KeepAbsoluteEEObservation()],
-        to_transition=observation_to_transition,
-        to_output=transition_to_observation,
+    # Shared factory rather than an inline copy: every FR3 recorder must honour the same
+    # cfg.robot.action_mode, otherwise datasets from this script and from the GUI recorder would
+    # carry different action semantics behind identical feature names.
+    from tools.fr3.fr3_record_runtime import make_fr3_action_processors
+
+    teleop_action_processor, robot_action_processor, robot_observation_processor = (
+        make_fr3_action_processors(cfg)
     )
 
     teleop_features = _build_teleop_features()

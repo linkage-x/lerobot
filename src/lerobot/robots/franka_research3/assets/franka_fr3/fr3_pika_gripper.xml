@@ -1,0 +1,209 @@
+<mujoco model="fr3_pika_gripper">
+  <compiler angle="radian" meshdir="assets/"/>
+
+  <default>
+    <default class="fr3">
+      <joint armature="0.1" damping="1"/>
+      <position inheritrange="1"/>
+      <default class="visual">
+        <geom type="mesh" group="2" contype="0" conaffinity="0"/>
+      </default>
+      <default class="collision">
+        <geom type="mesh" group="3" mass="0" density="0" friction="0.9 0.15 0.01" solref="0.004 1.2" solimp="0.95 0.98 0.001"/>
+      </default>
+      <site size="0.001" rgba="0.5 0.5 0.5 0.3" group="3"/>
+    </default>
+  </default>
+
+  <asset>
+    <material name="black" rgba=".2 .2 .2 1"/>
+    <material name="white" rgba="1 1 1 1"/>
+    <material name="red" rgba="1 0.072272 0.039546 1"/>
+    <material name="gray" rgba="0.863156 0.863156 0.863157 1"/>
+    <material name="button_green" rgba="0.102241 0.571125 0.102242 1"/>
+    <material name="button_red" rgba="0.520996 0.008023 0.013702 1"/>
+    <material name="button_blue" rgba="0.024157 0.445201 0.737911 1"/>
+
+    <mesh name="link0_0" file="link0_0.obj"/>
+    <mesh name="link0_1" file="link0_1.obj"/>
+    <mesh name="link0_2" file="link0_2.obj"/>
+    <mesh name="link0_3" file="link0_3.obj"/>
+    <mesh name="link0_4" file="link0_4.obj"/>
+    <mesh name="link0_5" file="link0_5.obj"/>
+    <mesh name="link0_6" file="link0_6.obj"/>
+    <mesh name="link0" file="link0.stl"/>
+    <mesh name="link1" file="link1.obj"/>
+    <mesh name="link2" file="link2.obj"/>
+    <mesh name="link3_0" file="link3_0.obj"/>
+    <mesh name="link3_1" file="link3_1.obj"/>
+    <mesh name="link3" file="link3.stl"/>
+    <mesh name="link4_0" file="link4_0.obj"/>
+    <mesh name="link4_1" file="link4_1.obj"/>
+    <mesh name="link4" file="link4.stl"/>
+    <mesh name="link5_0" file="link5_0.obj"/>
+    <mesh name="link5_1" file="link5_1.obj"/>
+    <mesh name="link5_2" file="link5_2.obj"/>
+    <mesh name="link5" file="link5.stl"/>
+    <mesh name="link6_0" file="link6_0.obj"/>
+    <mesh name="link6_1" file="link6_1.obj"/>
+    <mesh name="link6_2" file="link6_2.obj"/>
+    <mesh name="link6_3" file="link6_3.obj"/>
+    <mesh name="link6_4" file="link6_4.obj"/>
+    <mesh name="link6_5" file="link6_5.obj"/>
+    <mesh name="link6_6" file="link6_6.obj"/>
+    <mesh name="link6_7" file="link6_7.obj"/>
+    <mesh name="link6" file="link6.stl"/>
+    <mesh name="link7_0" file="link7_0.obj"/>
+    <mesh name="link7_1" file="link7_1.obj"/>
+    <mesh name="link7_2" file="link7_2.obj"/>
+    <mesh name="link7_3" file="link7_3.obj"/>
+    <mesh name="link7" file="link7.stl"/>
+    <mesh name="fr32pika" file="fr32pika.STL" scale="0.001 0.001 0.001"/>
+    <mesh name="pika_gripper_base_link" file="pika_gripper_base_link.STL"/>
+    <mesh name="pika_gripper_left_link" file="pika_gripper_left_link.STL"/>
+    <mesh name="pika_gripper_right_link" file="pika_gripper_right_link.STL"/>
+  </asset>
+
+  <worldbody>
+    <body name="mount" pos="0 0 0.40">
+      <body name="base" childclass="fr3">
+        <body name="fr3_link0">
+          <geom name="fr3_link0_visual" type="mesh" mesh="link0_0" material="black" class="visual"/>
+          <geom type="mesh" mesh="link0_1" material="white" class="visual"/>
+          <geom type="mesh" mesh="link0_2" material="white" class="visual"/>
+          <geom type="mesh" mesh="link0_3" material="white" class="visual"/>
+          <geom type="mesh" mesh="link0_4" material="white" class="visual"/>
+          <geom type="mesh" mesh="link0_5" material="red" class="visual"/>
+          <geom type="mesh" mesh="link0_6" material="black" class="visual"/>
+          <geom name="fr3_link0_collision" type="mesh" mesh="link0" class="collision"/>
+          <body name="fr3_link1" pos="0 0 0.333">
+            <inertial pos="4.128e-07 -0.0181251 -0.0386036" quat="0.998098 -0.0605364 0.00380499 0.0110109" mass="2.92747" diaginertia="0.0239286 0.0227246 0.00610634"/>
+            <joint name="fr3_joint1" pos="0 0 0" axis="0 0 1" range="-2.7437 2.7437" actuatorfrcrange="-87 87" damping="0.003" frictionloss="0.2"/>
+            <geom name="fr3_link1_visual" type="mesh" material="white" class="visual" mesh="link1"/>
+            <geom name="fr3_link1_collision" type="mesh" mesh="link1" class="collision"/>
+            <body name="fr3_link2" quat="0.707107 -0.707107 0 0">
+              <inertial pos="0.00318289 -0.0743222 0.00881461" quat="0.502599 0.584437 -0.465998 0.434366" mass="2.93554" diaginertia="0.0629567 0.0411924 0.0246371"/>
+              <joint name="fr3_joint2" pos="0 0 0" axis="0 0 1" range="-1.7837 1.7837" actuatorfrcrange="-87 87" damping="0.003" frictionloss="0.2"/>
+              <geom name="fr3_link2_visual" type="mesh" material="white" class="visual" mesh="link2"/>
+              <geom name="fr3_link2_collision" type="mesh" mesh="link2" class="collision"/>
+              <body name="fr3_link3" pos="0 -0.316 0" quat="0.707107 0.707107 0 0">
+                <inertial pos="0.0407016 -0.00482006 -0.0289731" quat="0.921025 -0.244161 0.155272 0.260745" mass="2.2449" diaginertia="0.0267409 0.0189869 0.0171587"/>
+                <joint name="fr3_joint3" pos="0 0 0" axis="0 0 1" range="-2.9007 2.9007" actuatorfrcrange="-87 87" damping="0.003" frictionloss="0.2"/>
+                <geom type="mesh" material="white" class="visual" mesh="link3_0"/>
+                <geom type="mesh" material="black" class="visual" mesh="link3_1"/>
+                <geom name="fr3_link3_collision" type="mesh" mesh="link3" class="collision"/>
+                <body name="fr3_link4" pos="0.0825 0 0" quat="0.707107 0.707107 0 0">
+                  <inertial pos="-0.0459101 0.0630493 -0.00851879" quat="0.438018 0.803311 0.00937812 0.403414" mass="2.6156" diaginertia="0.05139 0.0372717 0.0160047"/>
+                  <joint name="fr3_joint4" pos="0 0 0" axis="0 0 1" range="-3.0421 -0.1518" actuatorfrcrange="-87 87" damping="0.003" frictionloss="0.2"/>
+                  <geom type="mesh" material="white" class="visual" mesh="link4_0"/>
+                  <geom type="mesh" material="black" class="visual" mesh="link4_1"/>
+                  <geom name="fr3_link4_collision" type="mesh" mesh="link4" class="collision"/>
+                  <body name="fr3_link5" pos="-0.0825 0.384 0" quat="0.707107 -0.707107 0 0">
+                    <inertial pos="-0.00160396 0.0292536 -0.0972966" quat="0.919031 0.125604 0.0751531 -0.366003" mass="2.32712" diaginertia="0.0579335 0.0449144 0.0130634"/>
+                    <joint name="fr3_joint5" pos="0 0 0" axis="0 0 1" range="-2.8065 2.8065" actuatorfrcrange="-12 12" damping="0.003" frictionloss="0.2"/>
+                    <geom type="mesh" material="white" class="visual" mesh="link5_0"/>
+                    <geom type="mesh" material="white" class="visual" mesh="link5_1"/>
+                    <geom type="mesh" material="black" class="visual" mesh="link5_2"/>
+                    <geom name="fr3_link5_collision" type="mesh" mesh="link5" class="collision"/>
+                    <body name="fr3_link6" quat="0.707107 0.707107 0 0">
+                      <inertial pos="0.0597131 -0.0410295 -0.0101693" quat="0.621301 0.552665 0.510011 0.220081" mass="1.81704" diaginertia="0.0175039 0.0161123 0.00193529"/>
+                      <joint name="fr3_joint6" pos="0 0 0" axis="0 0 1" range="0.5445 4.5169" actuatorfrcrange="-12 12" damping="0.003" frictionloss="0.2"/>
+                      <geom type="mesh" material="button_green" class="visual" mesh="link6_0"/>
+                      <geom type="mesh" material="white" class="visual" mesh="link6_1"/>
+                      <geom type="mesh" material="white" class="visual" mesh="link6_2"/>
+                      <geom type="mesh" material="gray" class="visual" mesh="link6_3"/>
+                      <geom type="mesh" material="button_red" class="visual" mesh="link6_4"/>
+                      <geom type="mesh" material="white" class="visual" mesh="link6_5"/>
+                      <geom type="mesh" material="black" class="visual" mesh="link6_6"/>
+                      <geom type="mesh" material="button_blue" class="visual" mesh="link6_7"/>
+                      <geom name="fr3_link6_collision" type="mesh" mesh="link6" class="collision"/>
+                      <body name="fr3_link7" pos="0.088 0 0" quat="0.707107 0.707107 0 0">
+                        <inertial pos="-0.00401826 0.00457211 0.0803951" quat="0.997617 0.0260292 -0.0371784 -0.0519723" mass="1.18326" diaginertia="0.0139646 0.0137417 0.000969345"/>
+                        <joint name="fr3_joint7" pos="0 0 0" axis="0 0 1" range="-3.0159 3.0159" actuatorfrcrange="-12 12" damping="0.003" frictionloss="0.2"/>
+                        <geom type="mesh" material="black" class="visual" mesh="link7_0"/>
+                        <geom type="mesh" material="white" class="visual" mesh="link7_1"/>
+                        <geom type="mesh" material="white" class="visual" mesh="link7_2"/>
+                        <geom type="mesh" material="black" class="visual" mesh="link7_3"/>
+                        <geom name="fr3_link7_collision" type="mesh" mesh="link7" class="collision"/>
+                        <body name="fr3_link8" pos="0 0 0.107">
+                          <body name="fr3_pika_adapter_link" pos="-0.033 -0.033 -0.012">
+                            <geom name="fr3_pika_adapter_visual" type="mesh" material="white" class="visual" mesh="fr32pika"/>
+                            <geom name="fr3_pika_adapter_collision" type="mesh" mesh="fr32pika" class="collision"/>
+                          </body>
+                          
+                          <body name="gripper_base" pos="0.002 0 0.008" quat="0.25563976 0.65927862 -0.25563976 0.65927864">
+                            <inertial pos="0.037477 -8.1437e-07 0.0084053" mass="0.456979" diaginertia="0.000520039 0.000344637 0.000265824"/>
+                            <geom name="pika_gripper_base_visual" type="mesh" material="black" class="visual" mesh="pika_gripper_base_link"/>
+                            <geom name="pika_gripper_base_collision" type="mesh" mesh="pika_gripper_base_link" class="collision" contype="0" conaffinity="0"/>
+                            <!-- D405 transformed from the ATI frame; lens shifted forward to clear the no-ATI mesh. -->
+                            <camera name="ee_cam" mode="fixed" pos="0.095 0.00118 0.04069"
+                                    xyaxes="0 -0.99893 0.04636 0 0.04636 0.99893" fovy="78"/>
+                            <!-- Both are rpy="3.1415926 -1.5707963 0" in the urdf (fr3_hand_tcp_joint,
+                                 pika_task_tcp_joint): a 180 deg turn about (x+z)/sqrt(2). The task TCP
+                                 used to carry a 45 deg z-rotation lifted from quest3_pika_gripper_scene.xml,
+                                 whose gripper_base is a different frame entirely. -->
+                            <body name="pika_gripper_ee" pos="0.185 0 0" quat="0 0.70710678 0 0.70710678"/>
+                            <!-- <body name="pika_task_tcp" pos="0 0 0.366842" quat="0 0.70710678 0 0.70710678"/> -->
+                            <body name="pika_task_tcp" pos="0.185 0 0" quat="0 0.70710678 0 0.70710678"/>
+                            <body name="gripper_left_link" pos="0.0815 0.08851 0.0064182">
+                              <inertial pos="0.033255 -0.014661 -0.0057614" mass="0.0811106" diaginertia="9.57314e-05 8.3052e-05 3.68146e-05"/>
+                              <joint name="gripper_left_joint" pos="0 0 0" axis="0 1 0" type="slide" range="-0.05 0" limited="true" actuatorfrcrange="-75 75" damping="0.20" armature="0.02"/>
+                              <geom type="mesh" material="black" class="visual" mesh="pika_gripper_left_link"/>
+                              <geom name="gripper_left_collision" type="mesh" mesh="pika_gripper_left_link" class="collision"
+                                    friction="2.0 0.4 0.03" condim="4" solref="0.001 0.6" solimp="0.995 0.9995 0.00005" priority="2"/>
+                            </body>
+                            <body name="gripper_right_link" pos="0.0815 -0.088529 0.0064182">
+                              <inertial pos="0.033255 0.014661 -0.0058113" mass="0.0811106" diaginertia="9.57314e-05 8.3052e-05 3.68146e-05"/>
+                              <joint name="gripper_right_joint" pos="0 0 0" axis="0 1 0" type="slide" range="0 0.05" limited="true" actuatorfrcrange="-75 75" damping="0.20" armature="0.02"/>
+                              <geom type="mesh" material="black" class="visual" mesh="pika_gripper_right_link"/>
+                              <geom name="gripper_right_collision" type="mesh" mesh="pika_gripper_right_link" class="collision"
+                                    friction="2.0 0.4 0.03" condim="4" solref="0.001 0.6" solimp="0.995 0.9995 0.00005" priority="2"/>
+                            </body>
+                          </body>
+                        </body>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <contact>
+    <exclude body1="gripper_base" body2="gripper_left_link"/>
+    <exclude body1="gripper_base" body2="gripper_right_link"/>
+    <exclude body1="fr3_link6" body2="gripper_left_link"/>
+    <exclude body1="fr3_link6" body2="gripper_right_link"/>
+    <exclude body1="gripper_left_link" body2="gripper_right_link"/>
+  </contact>
+
+  <tendon>
+    <fixed name="split">
+      <joint joint="gripper_left_joint" coef="1.087"/>
+      <joint joint="gripper_right_joint" coef="-1.087"/>
+    </fixed>
+  </tendon>
+
+  <equality>
+    <joint joint1="gripper_left_joint" joint2="gripper_right_joint" polycoef="0 -1 0 0 0"/>
+  </equality>
+
+  <actuator>
+    <position class="fr3" name="fr3_actuator1" joint="fr3_joint1" kp="5000" dampratio="1"/>
+    <position class="fr3" name="fr3_actuator2" joint="fr3_joint2" kp="5000" dampratio="1"/>
+    <position class="fr3" name="fr3_actuator3" joint="fr3_joint3" kp="5000" dampratio="1"/>
+    <position class="fr3" name="fr3_actuator4" joint="fr3_joint4" kp="5000" dampratio="1"/>
+    <position class="fr3" name="fr3_actuator5" joint="fr3_joint5" kp="5000" dampratio="1"/>
+    <position class="fr3" name="fr3_actuator6" joint="fr3_joint6" kp="5000" dampratio="1"/>
+    <position class="fr3" name="fr3_actuator7" joint="fr3_joint7" kp="5000" dampratio="1"/>
+    <position name="pika_gripper_actuator" tendon="split" ctrlrange="-0.11 0" kp="65" dampratio="1.0" forcerange="-75 75"/>
+  </actuator>
+
+  <keyframe>
+    <key name="home" qpos="0 -0.785 0 -2.355 0 1.57079 0.785 -0.04 0.04 0.48 0 0.44 1 0 0 0" ctrl="0 -0.785 0 -2.355 0 1.57079 0.785 0"/>
+  </keyframe>
+</mujoco>

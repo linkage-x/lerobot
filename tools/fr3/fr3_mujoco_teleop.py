@@ -125,7 +125,8 @@ def main(argv: list[str] | None = None) -> int:
         if viewer is not None:
             viewer.close()
         try:
-            teleop.disconnect()
+            if getattr(teleop, "is_connected", False):
+                teleop.disconnect()
         finally:
             env.close()
 

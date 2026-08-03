@@ -187,7 +187,9 @@ def test_get_action_uses_explicit_axis_map_instead_of_hidden_legacy_remap(monkey
     teleop.disconnect()
 
 
-def test_get_action_requires_stricter_enter_deadband_before_latching_motion(monkeypatch):
+def test_get_action_enables_motion_as_soon_as_an_axis_clears_its_threshold(monkeypatch):
+    # Motion enable comes straight from the per-axis deadband: there is no extra
+    # enter margin on top of `threshold_*`, so a reading just above it already moves.
     monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
     teleop = SpaceMouseTeleop(
         SpaceMouseTeleopConfig(
@@ -197,40 +199,6 @@ def test_get_action_requires_stricter_enter_deadband_before_latching_motion(monk
             threshold_wx=0.04,
             threshold_wy=0.04,
             threshold_wz=0.04,
-            motion_enable_enter_scale=1.5,
-            motion_enable_exit_scale=1.0,
-            bias_sample_count=0,
-            move_time=0.0,
-        )
-    )
-    teleop.connect()
-    teleop._driver.readings.append(
-        SpaceMouseReading(
-            translation=[0.028, 0.0, 0.0],
-            rotation=[0.0, 0.0, 0.0],
-            buttons=(False, False),
-        )
-    )
-
-    action = teleop.get_action()
-
-    assert action["enabled"] is False
-    assert action["target_x"] == pytest.approx(0.0)
-    assert action["target_y"] == pytest.approx(0.0)
-    teleop.disconnect()
-
-
-def test_get_action_default_exit_deadband_stops_motion_as_soon_as_input_reenters_center(monkeypatch):
-    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
-    teleop = SpaceMouseTeleop(
-        SpaceMouseTeleopConfig(
-            threshold_x=0.02,
-            threshold_y=0.02,
-            threshold_z=0.02,
-            threshold_wx=0.04,
-            threshold_wy=0.04,
-            threshold_wz=0.04,
-            motion_enable_enter_scale=1.5,
             bias_sample_count=0,
             move_time=0.0,
         )
@@ -239,27 +207,32 @@ def test_get_action_default_exit_deadband_stops_motion_as_soon_as_input_reenters
     teleop._driver.readings.extend(
         [
             SpaceMouseReading(
-                translation=[0.03, 0.0, 0.0],
+                translation=[0.028, 0.0, 0.0],
                 rotation=[0.0, 0.0, 0.0],
                 buttons=(False, False),
             ),
             SpaceMouseReading(
-                translation=[0.022, 0.0, 0.0],
+                translation=[0.019, 0.0, 0.0],
                 rotation=[0.0, 0.0, 0.0],
                 buttons=(False, False),
             ),
         ]
     )
 
-    entered = teleop.get_action()
-    released = teleop.get_action()
+    above_threshold = teleop.get_action()
+    below_threshold = teleop.get_action()
 
-    assert entered["enabled"] is True
-    assert released["enabled"] is False
+    assert above_threshold["enabled"] is True
+    # translation_axis_map maps raw x onto the command frame's -y.
+    assert above_threshold["target_y"] == pytest.approx(0.028 * teleop.translation_scale_vector[1])
+    assert below_threshold["enabled"] is False
+    assert below_threshold["target_y"] == pytest.approx(0.0)
     teleop.disconnect()
 
 
-def test_get_action_hysteresis_keeps_motion_enabled_until_it_drops_below_exit_threshold(monkeypatch):
+def test_get_action_keeps_motion_enabled_until_the_axis_drops_below_its_threshold(monkeypatch):
+    # Releasing the puck only stops motion once the axis re-enters the deadband;
+    # values that merely shrink but stay above `threshold_*` keep commanding.
     monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
     teleop = SpaceMouseTeleop(
         SpaceMouseTeleopConfig(
@@ -269,8 +242,6 @@ def test_get_action_hysteresis_keeps_motion_enabled_until_it_drops_below_exit_th
             threshold_wx=0.04,
             threshold_wy=0.04,
             threshold_wz=0.04,
-            motion_enable_enter_scale=1.5,
-            motion_enable_exit_scale=1.0,
             bias_sample_count=0,
             move_time=0.0,
         )
@@ -289,7 +260,7 @@ def test_get_action_hysteresis_keeps_motion_enabled_until_it_drops_below_exit_th
                 buttons=(False, False),
             ),
             SpaceMouseReading(
-                translation=[0.018, 0.0, 0.0],
+                translation=[0.012, 0.0, 0.0],
                 rotation=[0.0, 0.0, 0.0],
                 buttons=(False, False),
             ),
@@ -297,16 +268,18 @@ def test_get_action_hysteresis_keeps_motion_enabled_until_it_drops_below_exit_th
     )
 
     entered = teleop.get_action()
-    latched = teleop.get_action()
+    still_above = teleop.get_action()
     released = teleop.get_action()
 
     assert entered["enabled"] is True
-    assert latched["enabled"] is True
+    assert still_above["enabled"] is True
     assert released["enabled"] is False
     teleop.disconnect()
 
 
-def test_get_action_truncates_high_amplitude_release_decay(monkeypatch):
+def test_get_action_follows_high_amplitude_release_decay_down_to_the_deadband(monkeypatch):
+    # pyspacemouse emits a decaying tail after the puck is let go. Motion stays
+    # enabled through the tail and stops on the first sample inside the deadband.
     monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
     teleop = SpaceMouseTeleop(
         SpaceMouseTeleopConfig(
@@ -338,15 +311,22 @@ def test_get_action_truncates_high_amplitude_release_decay(monkeypatch):
                 rotation=[0.0, 0.0, 0.0],
                 buttons=(False, False),
             ),
+            SpaceMouseReading(
+                translation=[0.0, -0.015, 0.0],
+                rotation=[0.0, 0.0, 0.0],
+                buttons=(False, False),
+            ),
         ]
     )
 
     first = teleop.get_action()
     plateau = teleop.get_action()
+    decaying = teleop.get_action()
     released = teleop.get_action()
 
     assert first["enabled"] is True
     assert plateau["enabled"] is True
+    assert decaying["enabled"] is True
     assert released["enabled"] is False
     teleop.disconnect()
 
@@ -395,7 +375,9 @@ def test_get_action_keeps_gradual_same_direction_reduction_enabled(monkeypatch):
     teleop.disconnect()
 
 
-def test_get_action_truncates_release_decay_even_with_cross_axis_jitter(monkeypatch):
+def test_get_action_ignores_cross_axis_jitter_below_its_own_threshold(monkeypatch):
+    # A jittering x that never clears threshold_x contributes nothing on its own;
+    # enable state tracks the dominant y axis, and stops when y enters the deadband.
     monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
     teleop = SpaceMouseTeleop(
         SpaceMouseTeleopConfig(
@@ -410,30 +392,38 @@ def test_get_action_truncates_release_decay_even_with_cross_axis_jitter(monkeypa
         )
     )
     teleop.connect()
+    # translation_axis_map is [-raw_y, raw_x, raw_z], so thresholds apply in the
+    # command frame: raw_y drives target_x, and the raw_x jitter lands on target_y.
     teleop._driver.readings.extend(
         [
             SpaceMouseReading(
-                translation=[0.02, -0.30, 0.0],
+                translation=[0.010, -0.30, 0.0],
                 rotation=[0.0, 0.0, 0.0],
                 buttons=(False, False),
             ),
             SpaceMouseReading(
-                translation=[0.02, -0.29, 0.0],
+                translation=[0.010, -0.29, 0.0],
                 rotation=[0.0, 0.0, 0.0],
                 buttons=(False, False),
             ),
             SpaceMouseReading(
-                translation=[0.025, -0.08, 0.0],
+                translation=[0.015, -0.012, 0.0],
                 rotation=[0.0, 0.0, 0.0],
                 buttons=(False, False),
             ),
         ]
     )
 
-    teleop.get_action()
-    teleop.get_action()
+    first = teleop.get_action()
+    second = teleop.get_action()
     released = teleop.get_action()
 
+    assert first["enabled"] is True
+    assert second["enabled"] is True
+    # The sub-threshold jitter is deadbanded away instead of leaking into the command.
+    assert first["target_y"] == pytest.approx(0.0)
+    assert second["target_y"] == pytest.approx(0.0)
+    # Once the dominant axis also re-enters its deadband, nothing is left to enable.
     assert released["enabled"] is False
     teleop.disconnect()
 

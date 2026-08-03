@@ -6,6 +6,7 @@ import type {
   CalibrationStatus,
   ConfigSummary,
   DatasetExportStatus,
+  DeploymentProfile,
   DeviceStatus,
   BoxPreviewPayload,
   BoxCaliLog,
@@ -22,7 +23,8 @@ import type {
   RealEndEffectorMode,
   MujocoPreview,
   RealSensePreviewStatus,
-  TrajectoryPoint
+  TrajectoryPoint,
+  TeleopStatus
 } from "./types";
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -50,11 +52,13 @@ const defaultMujocoValidation = (datasetRoot: string, episode: number, fps: numb
 });
 
 export type GuiSnapshot = {
+  deployment: DeploymentProfile;
   gateway: GatewayStatus;
   configSummary: ConfigSummary;
   devices: DeviceStatus[];
   recording: RecordingStatus;
   replay: ReplayStatus;
+  teleop: TeleopStatus;
   annotation: EpisodeAnnotation;
   calibration: CalibrationStatus;
   datasetExport: DatasetExportStatus;
@@ -67,10 +71,20 @@ export type GuiSnapshot = {
   notice?: string;
 };
 
+/** A command the gateway rejected. Held until read so the 1s snapshot poll cannot bury it. */
+export type CommandFailure = { endpoint: string; command: string; message: string };
+
 export class DataCollectionGuiApi {
   private readonly apiBase = import.meta.env.VITE_GUI_API_BASE ?? "";
   private usingRemote = false;
+  private commandFailure: CommandFailure | null = null;
   private snapshot: GuiSnapshot = {
+    deployment: {
+      profile: "thor",
+      label: "Thor Acquisition",
+      capabilities: ["gmsl2", "box", "imu", "tactile", "force_torque", "recording"],
+      defaultRoute: "live-record"
+    },
     gateway: {
       configPath: handheldConfigSummary.configPath,
       pid: null,
@@ -131,6 +145,23 @@ export class DataCollectionGuiApi {
       lastOutput: "",
       mujocoCubeMode: "left",
       mujocoValidation: defaultMujocoValidation(handheldConfigSummary.root, 0, handheldConfigSummary.fps)
+    },
+    teleop: {
+      state: "idle",
+      backend: "mujoco",
+      inputDevice: "spacemouse",
+      robotModel: "fr3_pika_gripper",
+      urdfPath: "src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf",
+      simXmlPath: "src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_scene.xml",
+      targetFrameName: "pika_task_tcp",
+      pid: null,
+      message: "Start the local gateway to run FR3 Pika MuJoCo teleop",
+      command: [],
+      realRobotReady: false,
+      cameraViews: [
+        { id: "external", label: "External", source: "D435I", fps: 30, deviceId: "side" },
+        { id: "wrist", label: "Wrist", source: "D405", fps: 30, deviceId: "ee" }
+      ]
     },
     annotation: {
       datasetRoot: handheldConfigSummary.root,
@@ -197,8 +228,13 @@ export class DataCollectionGuiApi {
     return structuredClone(this.snapshot);
   }
 
-  async connectRecording(): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot("/api/handheld/record/connect");
+  async connectRecording(backend?: "real" | "sim"): Promise<GuiSnapshot> {
+    // The workstation profile picks between the hardware FR3 and its MuJoCo twin here; the
+    // Thor profile has a single rig and sends no backend at all.
+    const endpoint = backend
+      ? `/api/handheld/record/connect?backend=${encodeURIComponent(backend)}`
+      : "/api/handheld/record/connect";
+    const remote = await this.postRemoteSnapshot(endpoint);
     if (remote) {
       return remote;
     }
@@ -344,24 +380,6 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async startReplay(realRobot: boolean): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot(realRobot ? "/api/replay/start-real" : "/api/replay/start");
-    if (remote) {
-      return remote;
-    }
-    await wait(220);
-    this.snapshot.replay = {
-      ...this.snapshot.replay,
-      state: "aborted",
-      safety: "fault",
-      frameIndex: 0,
-      trackingErrorMm: 0,
-      message: `Gateway unavailable; ${realRobot ? "real-robot replay" : "dry-run replay"} cannot be mocked for safety`
-    };
-    this.log("error", `${realRobot ? "Real robot replay" : "Dry-run replay"} blocked because gateway is unavailable`);
-    return this.getSnapshot();
-  }
-
   async startMujocoReplay(cubeMode: MujocoCubeMode): Promise<GuiSnapshot> {
     const remote = await this.postRemoteSnapshot(`/api/replay/start-mujoco?cube=${encodeURIComponent(cubeMode)}`);
     if (remote) {
@@ -442,6 +460,55 @@ export class DataCollectionGuiApi {
       source: "manual"
     };
     this.log("info", `Annotation saved: episode ${annotation.episode}`);
+    return this.getSnapshot();
+  }
+
+  async startSimTeleop(): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot("/api/teleop/start-sim");
+    if (remote) {
+      return remote;
+    }
+    await wait(180);
+    this.snapshot.teleop = {
+      ...this.snapshot.teleop,
+      state: "error",
+      message: "Gateway unavailable; FR3 MuJoCo teleop must be started by the backend",
+      pid: null
+    };
+    this.log("error", "FR3 MuJoCo teleop blocked because gateway is unavailable");
+    return this.getSnapshot();
+  }
+
+  async startRealTeleop(): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot("/api/teleop/start-real");
+    if (remote) {
+      return remote;
+    }
+    await wait(180);
+    this.snapshot.teleop = {
+      ...this.snapshot.teleop,
+      state: "error",
+      backend: "real",
+      message: "Gateway unavailable; FR3 real teleop must be started by the backend",
+      pid: null
+    };
+    this.log("error", "FR3 real teleop could not reach the gateway");
+    return this.getSnapshot();
+  }
+
+  async stopTeleop(): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot("/api/teleop/stop");
+    if (remote) {
+      return remote;
+    }
+    await wait(120);
+    this.snapshot.teleop = {
+      ...this.snapshot.teleop,
+      state: "idle",
+      pid: null,
+      message: "FR3 Pika teleop stopped"
+    };
+    this.log("warn", "FR3 teleop stop requested");
     return this.getSnapshot();
   }
 
@@ -552,8 +619,12 @@ export class DataCollectionGuiApi {
     return `${this.apiBase}/api/replay/mujoco-video?${params.toString()}`;
   }
 
-  realSenseSnapshotUrl(cacheKey: number): string {
-    return `${this.apiBase}/api/replay/realsense.jpg?t=${cacheKey}`;
+  realSenseSnapshotUrl(cacheKey: number, cameraKey?: string): string {
+    const params = new URLSearchParams({ t: String(cacheKey) });
+    if (cameraKey) {
+      params.set("key", cameraKey);
+    }
+    return `${this.apiBase}/api/replay/realsense.jpg?${params.toString()}`;
   }
 
   async fetchRealSenseStatus(): Promise<RealSensePreviewStatus | null> {
@@ -568,8 +639,13 @@ export class DataCollectionGuiApi {
     }
   }
 
+  teleopCameraUrl(viewId: string): string {
+    const params = new URLSearchParams({ view: viewId, t: Date.now().toString() });
+    return `${this.apiBase}/api/teleop/camera.jpg?${params.toString()}`;
+  }
+
   cameraSnapshotUrl(deviceId: string): string {
-    const params = new URLSearchParams({ key: deviceId });
+    const params = new URLSearchParams({ key: deviceId, t: Date.now().toString() });
     return `${this.apiBase}/api/device-preview/camera.jpg?${params.toString()}`;
   }
 
@@ -764,8 +840,13 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async exportApprovedDataset(path: string): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot(`/api/datasets/export?path=${encodeURIComponent(path)}`);
+  async exportApprovedDataset(path: string, actionMode?: string): Promise<GuiSnapshot> {
+    // The workstation profile reuses this endpoint to build a training view, and picks the
+    // action contract with actionMode; Thor sends none and gets the raw->v3 consolidation.
+    const query = actionMode
+      ? `?path=${encodeURIComponent(path)}&action_mode=${encodeURIComponent(actionMode)}`
+      : `?path=${encodeURIComponent(path)}`;
+    const remote = await this.postRemoteSnapshot(`/api/datasets/export${query}`);
     if (remote) {
       return remote;
     }
@@ -809,7 +890,7 @@ export class DataCollectionGuiApi {
       };
     }
 
-    if (this.snapshot.replay.state === "dry_run" || this.snapshot.replay.state === "sim_replay" || this.snapshot.replay.state === "replaying") {
+    if (this.snapshot.replay.state === "sim_replay" || this.snapshot.replay.state === "replaying") {
       const nextFrame = Math.min(this.snapshot.replay.frameIndex + 2, this.snapshot.replay.totalFrames);
       this.snapshot.replay = {
         ...this.snapshot.replay,
@@ -915,8 +996,22 @@ export class DataCollectionGuiApi {
     return `HTTP ${response.status}`;
   }
 
+  /**
+   * Take the last rejected command, if any.
+   *
+   * The per-page fields written below live in the snapshot, which the 1s poll replaces with the
+   * gateway's own state -- so a rejection was visible for less than a poll interval and a failed
+   * command looked like a command that did nothing. This survives until someone reads it.
+   */
+  consumeCommandFailure(): CommandFailure | null {
+    const failure = this.commandFailure;
+    this.commandFailure = null;
+    return failure;
+  }
+
   private applyRemoteCommandError(endpoint: string, message: string) {
     const command = endpoint.split("?")[0].split("/").filter(Boolean).at(-1) ?? "command";
+    this.commandFailure = { endpoint, command, message };
     if (endpoint.includes("/handheld/record/")) {
       this.snapshot.recording = {
         ...this.snapshot.recording,

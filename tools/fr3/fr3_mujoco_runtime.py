@@ -52,6 +52,10 @@ def create_runtime_arg_parser(
         help="Teleoperator type for argparse-only FR3 MuJoCo tools. fr3_mujoco_record.py also accepts draccus --teleop.type.",
     )
     parser.add_argument("--device-id", type=int, default=0)
+    default_env_cfg = FR3MujocoEnvConfig()
+    parser.add_argument("--urdf-path", type=Path, default=Path(default_env_cfg.urdf_path))
+    parser.add_argument("--sim-xml-path", type=Path, default=Path(default_env_cfg.sim_xml_path))
+    parser.add_argument("--target-frame-name", default=default_env_cfg.target_frame_name)
     parser.add_argument("--no-viewer", action="store_true")
     parser.add_argument("--viewer-camera", choices=_VIEWER_CAMERA_CHOICES, default=None)
     parser.add_argument("--enable-cameras", action="store_true", default=True)
@@ -454,6 +458,9 @@ def build_runtime_env_config(
         if duration_s is not None:
             resolved_max_episode_steps = max(int(duration_s * resolved_control_frequency) + 100, 1_000)
     return FR3MujocoEnvConfig(
+        urdf_path=str(args.urdf_path),
+        sim_xml_path=str(args.sim_xml_path),
+        target_frame_name=str(args.target_frame_name),
         max_episode_steps=resolved_max_episode_steps,
         teleop_control_frequency=float(resolved_control_frequency),
         use_otg=bool(args.use_otg),

@@ -25,16 +25,46 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any, Iterable
+from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
+from urllib.request import urlopen
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
 DEFAULT_RECORDER_SCRIPT = Path("tools/handheld/handheld_record.py")
+# Gateway-driven FR3 SpaceMouse recorder. Handles both the hardware arm and its MuJoCo twin
+# behind one `--backend` switch, so both produce byte-identical dataset schemas.
+WORKSTATION_RECORDER_SCRIPT = Path("tools/fr3/fr3_gui_record_runtime.py")
+RECORD_BACKENDS = ("real", "sim")
+DEFAULT_RECORD_BACKEND = "real"
+# Action contracts the workstation Training View page can build. Recording always stores
+# absolute EE; the delta contracts are derived offline from consecutive dataset frames.
+TRAINING_VIEW_ACTION_MODES = ("absolute_ee", "delta_ee_from_prev_cmd", "delta_ee_from_current")
+DEFAULT_TRAINING_VIEW_ACTION_MODE = "delta_ee_from_prev_cmd"
 DEFAULT_DATASETS_ROOT = Path("outputs/datasets")
 DEFAULT_EXPORTS_ROOT = Path("outputs/exports")
+# Training views are grouped one level below the exports root. The grouping directory is not
+# itself a dataset, so every scan that walks the exports root has to descend into it explicitly.
+TRAINING_VIEWS_DIR_NAME = "training_views"
+DEPLOYMENT_PROFILES: dict[str, dict[str, Any]] = {
+    "thor": {
+        "label": "Thor Acquisition",
+        "defaultRoute": "live-record",
+        "capabilities": ["gmsl2", "box", "imu", "tactile", "force_torque", "recording"],
+    },
+    "workstation": {
+        "label": "FR3 Teleoperation Workstation",
+        "defaultRoute": "teleoperation",
+        "capabilities": ["fr3", "pika", "spacemouse", "realsense", "mujoco", "recording"],
+    },
+}
 DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM = 20.0
 DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG = 15.0
+DEFAULT_WORKSTATION_REPLAY_IK_ORIENTATION_WEIGHT = 0.012
+DEFAULT_WORKSTATION_REAL_SETTLE_STEPS = 300
+DEFAULT_WORKSTATION_REAL_SETTLE_TOLERANCE_MM = 6.0
 DEFAULT_REPLAY_MAX_EE_STEP_MM = 120.0
 DEFAULT_REPLAY_MAX_GRIPPER_STEP = 0.35
+DEFAULT_WORKSTATION_REPLAY_MAX_GRIPPER_STEP = 1.0
 DEFAULT_REAL_PREFLIGHT_TIMEOUT_S = 30.0
 DEFAULT_REAL_ROBOT_IP = "192.168.1.208"
 DEFAULT_CUBE_REPLAY_ROBOT_IP = "192.168.11.102"
@@ -94,6 +124,15 @@ class RecordingStatus:
     # only the most recent one (which is what lastOutput captures and is
     # what was losing 9+ lines per Connect cycle).
     recentOutput: list[str] = field(default_factory=list)
+    # Workstation profile only: which robot the recorder is driving ("real" or "sim").
+    backend: str = DEFAULT_RECORD_BACKEND
+    # Latest per-episode timestamp-synchronisation verdict parsed from the recorder's SYNC
+    # lines. Kept on the recording status (not a separate poll) so the operator sees an
+    # alignment problem on the episode that caused it, while the rig is still set up.
+    syncStatus: str = "unknown"
+    syncSummary: str = ""
+    syncReportPath: str = ""
+    syncWarnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -134,6 +173,28 @@ class ReplayStatus:
 
 
 @dataclass
+class TeleopStatus:
+    state: str = "idle"
+    backend: str = "mujoco"
+    inputDevice: str = "spacemouse"
+    robotModel: str = "fr3_pika_gripper"
+    urdfPath: str = ""
+    simXmlPath: str = ""
+    targetFrameName: str = "pika_task_tcp"
+    pid: int | None = None
+    message: str = "FR3 Pika MuJoCo teleop is ready"
+    lastOutput: str = ""
+    command: list[str] = field(default_factory=list)
+    realRobotReady: bool = False
+    cameraViews: list[dict[str, Any]] = field(
+        default_factory=lambda: [
+            {"id": "external", "label": "External", "source": "D435I", "fps": 30, "deviceId": "side"},
+            {"id": "wrist", "label": "Wrist", "source": "D405", "fps": 30, "deviceId": "ee"},
+        ]
+    )
+
+
+@dataclass
 class DatasetExportStatus:
     state: str = "idle"  # idle | exporting | complete | error
     target: str = "lerobot_v3"
@@ -167,11 +228,13 @@ class GatewayState:
     config: dict[str, Any]
     recording: RecordingStatus
     replay: ReplayStatus
+    profile: str = "thor"
     datasets_root: Path | None = None
     exports_root: Path | None = None
     devices: list[dict[str, Any]] = field(default_factory=list)
     calibration: CalibrationStatus = field(default_factory=CalibrationStatus)
     dataset_export: DatasetExportStatus = field(default_factory=DatasetExportStatus)
+    teleop: TeleopStatus = field(default_factory=TeleopStatus)
     export_process: subprocess.Popen[str] | None = None
     events: list[EventLogItem] = field(default_factory=list)
     selected_replay_root: Path | None = None
@@ -179,7 +242,10 @@ class GatewayState:
     process: subprocess.Popen[str] | None = None
     replay_process: subprocess.Popen[str] | None = None
     replay_process_kind: str = ""
+    teleop_process: subprocess.Popen[str] | None = None
+    teleop_started_at_s: float | None = None
     realsense_preview_process: subprocess.Popen[str] | None = None
+    realsense_preview_processes: dict[str, subprocess.Popen[str]] = field(default_factory=dict)
     processing_processes: dict[str, subprocess.Popen[str]] = field(default_factory=dict)
     processing_starting: set[str] = field(default_factory=set)
     process_started_at_s: float | None = None
@@ -519,6 +585,12 @@ def _replay_status_from_config(config: dict[str, Any]) -> ReplayStatus:
         totalFrames=_target_frames(config),
         fps=int(dataset.get("fps") or 30),
         realRobotIp=default_robot_ip,
+        realEndEffectorMode=(
+            "pika_gripper_ee"
+            if str(robot.get("gripper_backend") or "") == "pika"
+            or "pika" in str(robot.get("urdf_path") or "").lower()
+            else "corenetic_gripper_ee"
+        ),
     )
 
 
@@ -608,6 +680,57 @@ def _device_statuses(config: dict[str, Any], repo_root: Path | None = None) -> l
             device = raw_device if isinstance(raw_device, dict) else {}
             devices.append(_make_mapping_device(device_id, device, kind))
 
+    robot = config.get("robot") if isinstance(config.get("robot"), dict) else {}
+    robot_cameras = robot.get("cameras") if isinstance(robot.get("cameras"), dict) else {}
+    existing_ids = {str(device.get("id") or "") for device in devices}
+    for device_id, raw_device in robot_cameras.items():
+        if str(device_id) in existing_ids:
+            continue
+        device = raw_device if isinstance(raw_device, dict) else {}
+        devices.append(_make_mapping_device(str(device_id), device, "camera"))
+
+    if robot:
+        devices.append(
+            {
+                "id": "fr3",
+                "kind": "robot",
+                "label": "Franka Research 3",
+                "state": "idle",
+                "fps": int(config.get("control_fps") or 0),
+                "latencyMs": 0,
+                "detail": f"robot {robot.get('robot_ip', '?')}",
+                "config": robot,
+            }
+        )
+        gripper_port = robot.get("gripper_port")
+        if gripper_port:
+            devices.append(
+                {
+                    "id": "pika",
+                    "kind": "gripper",
+                    "label": "Pika gripper",
+                    "state": "idle",
+                    "fps": int(config.get("control_fps") or 0),
+                    "latencyMs": 0,
+                    "detail": str(gripper_port),
+                    "config": {"port": gripper_port, "backend": robot.get("gripper_backend", "pika")},
+                }
+            )
+    teleop = config.get("teleop") if isinstance(config.get("teleop"), dict) else {}
+    if teleop:
+        devices.append(
+            {
+                "id": str(teleop.get("type") or "teleoperator"),
+                "kind": "teleoperator",
+                "label": "SpaceMouse" if teleop.get("type") == "spacemouse" else str(teleop.get("type") or "Teleoperator"),
+                "state": "idle",
+                "fps": int(config.get("control_fps") or 0),
+                "latencyMs": 0,
+                "detail": f"USB input device {teleop.get('device_id', 0)}",
+                "config": teleop,
+            }
+        )
+
     box_cfg = config.get("box_collection")
     if isinstance(box_cfg, dict) and box_cfg.get("enabled", True):
         # Accept both the legacy flat single-box block and the new multi-box
@@ -621,6 +744,136 @@ def _device_statuses(config: dict[str, Any], repo_root: Path | None = None) -> l
         for box in box_entries:
             devices.extend(_box_collection_devices(box))
     return devices
+
+
+def _set_workstation_device_probe(
+    devices: list[dict[str, Any]],
+    device_id: str,
+    *,
+    detected: bool,
+    detail: str,
+    warning: bool = False,
+) -> None:
+    device = next((item for item in devices if item.get("id") == device_id), None)
+    if device is None:
+        return
+    device["state"] = "warning" if warning else ("running" if detected else "error")
+    device["detail"] = detail
+
+
+def _usb_physical_device_count(vendor_id: str, product_id: str) -> int:
+    count = 0
+    for vendor_path in Path("/sys/bus/usb/devices").glob("*/idVendor"):
+        try:
+            if vendor_path.read_text().strip().lower() != vendor_id.lower():
+                continue
+            if vendor_path.with_name("idProduct").read_text().strip().lower() == product_id.lower():
+                count += 1
+        except OSError:
+            continue
+    return count
+
+
+def _probe_workstation_devices(state: GatewayState) -> None:
+    robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
+    robot_ip = str(robot.get("robot_ip") or "")
+    if robot_ip:
+        try:
+            result = subprocess.run(
+                ["ping", "-c", "1", "-W", "1", robot_ip],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            reachable = result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            reachable = False
+        fci_ready = False
+        fci_detail = ""
+        if reachable:
+            try:
+                fci_probe = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "from panda_py import Panda; import sys; "
+                            "arm=Panda(sys.argv[1]); state=arm.get_state(); print(len(state.q))"
+                        ),
+                        robot_ip,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=4,
+                )
+                fci_ready = fci_probe.returncode == 0 and fci_probe.stdout.strip() == "7"
+                failure = fci_probe.stderr.strip().splitlines()[-1] if fci_probe.stderr.strip() else "state read failed"
+                fci_detail = "FCI state read ready" if fci_ready else f"FCI unavailable: {failure}"
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                fci_detail = f"FCI unavailable: {exc}"
+        _set_workstation_device_probe(
+            state.devices,
+            "fr3",
+            detected=fci_ready,
+            warning=reachable and not fci_ready,
+            detail=f"{robot_ip} reachable; {fci_detail}" if reachable else f"{robot_ip} unreachable",
+        )
+
+    gripper_port = str(robot.get("gripper_port") or "")
+    if gripper_port:
+        port = Path(gripper_port)
+        exists = port.exists()
+        accessible = exists and os.access(port, os.R_OK | os.W_OK)
+        _set_workstation_device_probe(
+            state.devices,
+            "pika",
+            detected=accessible,
+            warning=exists and not accessible,
+            detail=(
+                f"{gripper_port} read/write ready"
+                if accessible
+                else f"{gripper_port} exists but lacks read/write permission"
+                if exists
+                else f"{gripper_port} not found"
+            ),
+        )
+
+    spacemouse_count = _usb_physical_device_count("256f", "c635")
+    _set_workstation_device_probe(
+        state.devices,
+        "spacemouse",
+        detected=spacemouse_count > 0,
+        detail=(
+            f"3Dconnexion SpaceMouse Compact 256f:c635 ({spacemouse_count} physical device)"
+            if spacemouse_count
+            else "3Dconnexion SpaceMouse Compact 256f:c635 not found"
+        ),
+    )
+
+    detected_realsense: dict[str, str] = {}
+    try:
+        import pyrealsense2 as rs
+
+        for device in rs.context().query_devices():
+            serial = device.get_info(rs.camera_info.serial_number)
+            name = device.get_info(rs.camera_info.name)
+            detected_realsense[str(serial)] = str(name)
+    except Exception as exc:  # noqa: BLE001
+        state.log("warn", f"RealSense probe failed: {exc}")
+
+    cameras = robot.get("cameras") if isinstance(robot.get("cameras"), dict) else {}
+    for camera_name, camera in cameras.items():
+        if not isinstance(camera, dict) or str(camera.get("type", "")).lower() != "intelrealsense":
+            continue
+        serial = str(camera.get("serial_number_or_name") or "")
+        model = detected_realsense.get(serial)
+        resolution = f"{camera.get('width', '?')}x{camera.get('height', '?')}@{camera.get('fps', '?')}"
+        _set_workstation_device_probe(
+            state.devices,
+            str(camera_name),
+            detected=model is not None,
+            detail=f"{model} serial {serial} {resolution}" if model else f"RealSense serial {serial} not found",
+        )
 
 
 def _box_collection_devices(box: dict[str, Any]) -> list[dict[str, Any]]:
@@ -810,7 +1063,15 @@ def _scan_exports_root(state: GatewayState) -> list[Path]:
         return []
     if _is_dataset_root(root):
         return [root]
-    return [entry for entry in root.iterdir() if _is_dataset_root(entry)]
+    entries = [entry for entry in root.iterdir() if _is_dataset_root(entry)]
+    # Training views sit one level deeper (exports/training_views/<dataset>__<contract>). A
+    # single-level scan skipped the grouping directory -- which is not a dataset root -- and so
+    # hid every built view from replay selection, video serving and every other endpoint that
+    # gates on this candidate list.
+    views_root = _training_views_root(state)
+    if views_root.is_dir():
+        entries.extend(entry for entry in views_root.iterdir() if _is_dataset_root(entry))
+    return entries
 
 
 def _dataset_root_candidates(state: GatewayState) -> list[Path]:
@@ -841,7 +1102,18 @@ def _dataset_root_candidates(state: GatewayState) -> list[Path]:
 
 def _dataset_kind(state: GatewayState, dataset_root: Path) -> str:
     try:
-        dataset_root.resolve().relative_to(_task_exports_root(state).resolve())
+        resolved = dataset_root.resolve()
+    except OSError:
+        return "recorded"
+    # A training view is a re-expression of a recording, not a recording: keeping it its own kind
+    # is what lets the UI nest it under its source instead of offering it as capture output.
+    try:
+        resolved.relative_to(_training_views_root(state).resolve())
+        return "training_view"
+    except (OSError, ValueError):
+        pass
+    try:
+        resolved.relative_to(_task_exports_root(state).resolve())
     except (OSError, ValueError):
         return "recorded"
     return "exported"
@@ -850,6 +1122,11 @@ def _dataset_kind(state: GatewayState, dataset_root: Path) -> str:
 _REPLAY_CANDIDATES_MEMO: tuple[float, tuple[Any, ...], list[Path]] | None = None
 _REPLAY_CANDIDATES_TTL_S = 3.0
 _PROCESSING_STALE_RUNNING_S = 120.0
+
+
+def _invalidate_replay_candidates_memo() -> None:
+    global _REPLAY_CANDIDATES_MEMO
+    _REPLAY_CANDIDATES_MEMO = None
 
 
 def _path_memo_key(path: Path | None) -> str:
@@ -2366,6 +2643,111 @@ def _copy_approved_v3_dataset_export(
     state.log("info", f"Exported approved LeRobot v3 dataset {dataset_root} -> {out_root}")
 
 
+def _training_view_command(
+    state: GatewayState, dataset_root: Path, action_mode: str
+) -> tuple[list[str], Path]:
+    """Build the prepare-only training-view command for an FR3 workstation dataset.
+
+    The workstation recorder already writes a LeRobot v3 dataset, so there is no raw->v3 export
+    to run (that is the Thor GMSL2 path). What a workstation operator needs instead is the
+    *training view*: the same episodes with the action column expressed in whichever contract the
+    policy will be trained on. Delta contracts are derived here, by differencing consecutive
+    dataset frames, because a delta computed during capture would span one control tick rather
+    than one frame.
+    """
+    if action_mode not in TRAINING_VIEW_ACTION_MODES:
+        raise ValueError(
+            f"action_mode must be one of {TRAINING_VIEW_ACTION_MODES}, got {action_mode!r}"
+        )
+    if not _has_lerobot_v3_data(dataset_root):
+        raise ValueError(f"{dataset_root.name} is not a LeRobot v3 dataset; nothing to build a view from.")
+    # Cameras and state keys come from the dataset, not from the script's defaults: those
+    # defaults name another rig's cameras (observation.images.cam_1/cam_3) and would fail on
+    # every FR3 recording, which uses the config's own camera keys (ee/side).
+    info = _load_dataset_info(dataset_root) or {}
+    features = info.get("features") if isinstance(info.get("features"), dict) else {}
+    camera_keys = [
+        key
+        for key, feature in features.items()
+        if key.startswith("observation.images.")
+        and isinstance(feature, dict)
+        and feature.get("dtype") in ("video", "image")
+    ]
+    if not camera_keys:
+        raise ValueError(f"{dataset_root.name} has no camera features to build a training view from.")
+
+    view_name = f"{dataset_root.name}__{action_mode}"
+    view_root = _training_views_root(state) / view_name
+    command = [
+        str(_venv_python(state.repo_root, prefer_fr3=True)),
+        str(state.repo_root / "tools" / "fr3" / "fr3_train_il_policy.py"),
+        "--dataset-root", str(dataset_root),
+        "--view-root", str(view_root),
+        # The job name is what the generated train/inference configs use for their training
+        # output dir and checkpoint path. Left to the script's default it is a fixed legacy
+        # name, so every view built here would train into -- and overwrite -- the same
+        # directory regardless of source dataset or action contract.
+        "--job-name", view_name,
+        "--repo-id", f"local/{view_name}",
+        "--cameras", ",".join(sorted(camera_keys)),
+        "--state-keys", "observation.state",
+        "--action-mode", action_mode,
+        # The default append selector pulls a handheld-gripper column that FR3 datasets do not
+        # have; the FR3 action already carries its own gripper.
+        "--action-append-selectors", "",
+        "--action-append-names", "",
+        "--overwrite-view",
+        # Build the view only; training is a separate, deliberate step.
+        "--prepare-only",
+    ]
+    return command, view_root
+
+
+def _training_views_root(state: GatewayState) -> Path:
+    return _task_exports_root(state) / TRAINING_VIEWS_DIR_NAME
+
+
+def _start_training_view(state: GatewayState, raw_path: str, action_mode: str) -> None:
+    """Workstation counterpart of the Thor v3 export: build a policy-ready training view."""
+    if _export_is_running(state):
+        raise RuntimeError("A view build is already running; wait for it to finish.")
+    dataset_root = _resolve_known_dataset(state, raw_path)
+    if dataset_root is None:
+        raise ValueError("Dataset not found in the recorded dataset list.")
+    # Views are replay candidates now, so they are resolvable here. Re-expressing an already
+    # re-expressed action column would silently compose two contracts.
+    if _dataset_kind(state, dataset_root) == "training_view":
+        raise ValueError(f"{dataset_root.name} is already a training view; build from the recording instead.")
+    command, view_root = _training_view_command(state, dataset_root, action_mode)
+    state.export_process = subprocess.Popen(
+        command,
+        cwd=state.repo_root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=_recorder_env(state.repo_root),
+        start_new_session=True,
+    )
+    state.dataset_export = DatasetExportStatus(
+        state="exporting",
+        target=action_mode,
+        datasetRoot=str(dataset_root),
+        outputPath=str(view_root),
+        selectedEpisodes=int(_processing_item_from_dataset(dataset_root).get("totalEpisodes") or 0),
+        totalFrames=0,
+        message=f"Building {action_mode} training view from {dataset_root.name}…",
+        pid=state.export_process.pid,
+    )
+    state.log("info", f"Started {action_mode} training view build {dataset_root} -> {view_root}")
+    Thread(
+        target=_read_export_output,
+        args=(state, state.export_process),
+        daemon=True,
+        name=f"training-view-output-{state.export_process.pid}",
+    ).start()
+
+
 def _start_approved_dataset_export(state: GatewayState, raw_path: str) -> None:
     if _export_is_running(state):
         raise RuntimeError("An export is already running; wait for it to finish.")
@@ -2415,6 +2797,11 @@ def _apply_export_output(state: GatewayState, output: str) -> None:
     match = re.search(r"Export plan: (\d+) episodes", output)
     if match:
         state.dataset_export.selectedEpisodes = int(match.group(1))
+    # The training-view builder announces where the view landed. Trust that over the path this
+    # gateway predicted, so the UI links to what was actually written.
+    view_match = re.match(r"\[prepare\] dataset view: (.+)$", output)
+    if view_match:
+        state.dataset_export.outputPath = view_match.group(1).strip()
     if output.startswith("Episode ") and "written" in output:
         frames = re.search(r"\((\d+) frames\)", output)
         if frames:
@@ -2424,6 +2811,27 @@ def _apply_export_output(state: GatewayState, output: str) -> None:
     elif output.startswith("ERROR:"):
         state.dataset_export.state = "error"
     state.log("info", f"export: {output}")
+
+
+def _training_view_completion_message(state: GatewayState) -> str | None:
+    """Summarize a finished training-view build from the view itself.
+
+    Without this the status line keeps whatever the builder printed last, which in prepare-only
+    mode is the training output dir -- a directory that does not exist yet, named after a job
+    nobody on this page asked for. The manifest inside the view is the authoritative record of
+    what was built.
+    """
+    if state.dataset_export.target not in TRAINING_VIEW_ACTION_MODES:
+        return None
+    contract = state.dataset_export.target
+    manifest: dict[str, Any] = {}
+    if state.dataset_export.outputPath:
+        manifest = _load_json_file(Path(state.dataset_export.outputPath) / "meta" / "il_view_manifest.json")
+    episodes = int(manifest.get("total_episodes") or state.dataset_export.selectedEpisodes or 0)
+    frames = int(manifest.get("total_rows") or state.dataset_export.totalFrames or 0)
+    state.dataset_export.selectedEpisodes = episodes
+    state.dataset_export.totalFrames = frames
+    return f"View ready: {episodes} episode(s) · {frames} frames · {contract}"
 
 
 def _read_export_output(state: GatewayState, process: subprocess.Popen[str]) -> None:
@@ -2443,6 +2851,15 @@ def _read_export_output(state: GatewayState, process: subprocess.Popen[str]) -> 
             state.dataset_export.state = "error" if return_code else "complete"
             if return_code:
                 state.dataset_export.message = f"Export exited with code {return_code}"
+            else:
+                summary = _training_view_completion_message(state)
+                if summary is not None:
+                    state.dataset_export.message = summary
+                # A just-built view has to show up in the replay candidate list now, not up to
+                # one memo TTL (or one 10s stats-refresh cycle) later, or the operator reads
+                # "complete" while the dataset list still has no view to open.
+                _invalidate_replay_candidates_memo()
+                state.dataset_cache_ready = False
 
 
 def _annotation_store_path(dataset_root: Path) -> Path:
@@ -3396,9 +3813,38 @@ def _gmsl2_dataset_stats(dataset_root: Path) -> tuple[int, int]:
     return len(ep_dirs), total_frames
 
 
+def _training_view_item_fields(dataset_root: Path, dataset_kind: str) -> dict[str, Any]:
+    """Source dataset and action contract of a training view, for nesting it under its source.
+
+    The manifest the builder writes is authoritative; the ``<dataset>__<contract>`` directory
+    name is the fallback for views built before the manifest carried the action mode.
+    """
+    if dataset_kind != "training_view":
+        return {}
+    manifest = _load_json_file(dataset_root / "meta" / "il_view_manifest.json")
+    source = str(manifest.get("source_dataset_root") or "")
+    contract = str(manifest.get("action_mode") or "")
+    if "__" in dataset_root.name:
+        name_source, _, name_contract = dataset_root.name.partition("__")
+    else:
+        name_source, name_contract = dataset_root.name, ""
+    return {
+        "viewOf": source,
+        "viewOfName": Path(source).name if source else name_source,
+        "actionContract": contract or name_contract,
+    }
+
+
 def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for index, dataset_root in enumerate(_complete_replay_dataset_candidates(state)):
+    candidates = _complete_replay_dataset_candidates(state)
+    # "Latest" drives one-click actions on freshly captured data (Live Record -> Open in Replay),
+    # so a derived training view must never claim it even when it is the newest directory.
+    latest_recorded = next(
+        (root for root in candidates if _dataset_kind(state, root) != "training_view"),
+        None,
+    )
+    for dataset_root in candidates:
         info = _load_dataset_info(dataset_root)
         data_files = _dataset_data_files(dataset_root)
         modified_s = _dataset_modified_s(dataset_root)
@@ -3408,18 +3854,20 @@ def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
         else:
             total_episodes = int(info.get("total_episodes") or 0)
             total_frames = int(info.get("total_frames") or 0)
+        dataset_kind = _dataset_kind(state, dataset_root)
         items.append(
             {
                 "path": str(dataset_root),
                 "name": dataset_root.name,
-                "datasetKind": _dataset_kind(state, dataset_root),
+                "datasetKind": dataset_kind,
                 "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(modified_s)) if modified_s else "",
                 "updatedAtMs": int(modified_s * 1000),
                 "totalEpisodes": total_episodes,
                 "totalFrames": total_frames,
                 "dataStatus": _recorded_dataset_status(dataset_root),
                 "sourcePath": str(data_files[-1]) if data_files else "",
-                "isLatest": index == 0,
+                "isLatest": latest_recorded is not None and dataset_root == latest_recorded,
+                **_training_view_item_fields(dataset_root, dataset_kind),
             }
         )
     return items
@@ -5271,6 +5719,95 @@ def _camera_preview_cmd(
     ]
 
 
+def _realsense_device_preview_cmd(state: GatewayState, device: dict[str, Any]) -> list[str]:
+    config = device.get("config") if isinstance(device.get("config"), dict) else {}
+    return [
+        str(_venv_python3(state.repo_root, prefer_fr3=True)),
+        str(state.repo_root / "tools" / "fr3" / "fr3_realsense_preview.py"),
+        "--serial",
+        str(config.get("serial_number_or_name") or ""),
+        "--width",
+        str(int(config.get("width") or 640)),
+        "--height",
+        str(int(config.get("height") or 480)),
+        "--fps",
+        str(int(config.get("fps") or 30)),
+    ]
+
+
+def _ensure_realsense_device_preview(
+    state: GatewayState,
+    *,
+    device_id: str,
+    device: dict[str, Any],
+) -> bool:
+    script = state.repo_root / "tools" / "fr3" / "fr3_realsense_preview.py"
+    if not script.is_file():
+        return False
+    with state.camera_preview_lock:
+        proc = state.camera_preview_processes.get(device_id)
+        if proc is not None and proc.poll() is None:
+            return True
+    with state.camera_preview_spawn_lock:
+        with state.camera_preview_lock:
+            proc = state.camera_preview_processes.get(device_id)
+            if proc is not None and proc.poll() is None:
+                return True
+        proc = subprocess.Popen(
+            _realsense_device_preview_cmd(state, device),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=state.repo_root,
+            env=_tool_env(state.repo_root),
+        )
+        with state.camera_preview_lock:
+            state.camera_preview_processes[device_id] = proc
+    Thread(
+        target=_camera_preview_reader,
+        args=(state, device_id, proc),
+        daemon=True,
+        name=f"realsense-preview-{device_id}",
+    ).start()
+    return True
+
+
+def _serve_realsense_device_preview_snapshot(
+    handler: BaseHTTPRequestHandler,
+    *,
+    state: GatewayState,
+    device_id: str,
+    device: dict[str, Any],
+) -> None:
+    with state.camera_preview_lock:
+        state.camera_preview_last_access[device_id] = time.time()
+    if not _ensure_realsense_device_preview(state, device_id=device_id, device=device):
+        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "RealSense preview unavailable"})
+        return
+    deadline = time.monotonic() + _PREVIEW_FIRST_FRAME_TIMEOUT_S
+    frame: bytes | None = None
+    while time.monotonic() < deadline:
+        with state.camera_preview_lock:
+            cached = state.camera_preview_frames.get(device_id)
+            state.camera_preview_last_access[device_id] = time.time()
+        if cached is not None:
+            frame = cached[0]
+            break
+        time.sleep(0.1)
+    if frame is None:
+        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "no RealSense preview frame yet"})
+        return
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("Content-Type", "image/jpeg")
+    handler.send_header("Content-Length", str(len(frame)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    try:
+        handler.wfile.write(frame)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
 def _camera_preview_reader(state: GatewayState, device_id: str, proc: subprocess.Popen[bytes]) -> None:
     """Pump JPEG frames from one preview pipeline into the latest-frame cache.
 
@@ -5527,6 +6064,19 @@ def _serve_video(handler: BaseHTTPRequestHandler, video_path: Path) -> None:
 
 
 def _snapshot(state: GatewayState) -> dict[str, Any]:
+    teleop_process = state.teleop_process
+    if teleop_process is not None and teleop_process.poll() is not None:
+        state.log("info" if teleop_process.returncode == 0 else "warn", f"FR3 teleop exited with code {teleop_process.returncode}")
+        state.teleop_process = None
+        state.teleop_started_at_s = None
+        state.teleop.pid = None
+        state.teleop.realRobotReady = False
+        state.teleop.state = "idle" if teleop_process.returncode == 0 else "error"
+        if state.teleop.lastOutput:
+            state.teleop.message = f"FR3 teleop exited with code {teleop_process.returncode}: {state.teleop.lastOutput}"
+        else:
+            state.teleop.message = f"FR3 teleop exited with code {teleop_process.returncode}"
+
     process = state.process
     if process is not None and process.poll() is not None:
         state.log("warn", f"Handheld recorder exited with code {process.returncode}")
@@ -5648,6 +6198,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
     _refresh_mujoco_validation_current(state)
 
     return {
+        "deployment": {"profile": state.profile, **DEPLOYMENT_PROFILES[state.profile]},
         "gateway": {
             "configPath": str(state.config_path),
             "pid": state.recording.pid,
@@ -5662,6 +6213,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         ],
         "recording": asdict(state.recording),
         "replay": asdict(state.replay),
+        "teleop": asdict(state.teleop),
         "annotation": _active_annotation(state),
         "calibration": asdict(state.calibration),
         "recordedDatasets": recorded_datasets,
@@ -5700,16 +6252,18 @@ def _read_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     return payload
 
 
-def _venv_python(repo_root: Path) -> Path:
-    for name in (".venv", "venv"):
+def _venv_python(repo_root: Path, *, prefer_fr3: bool = False) -> Path:
+    names = (".venv-fr3", ".venv", "venv") if prefer_fr3 else (".venv", "venv")
+    for name in names:
         candidate = repo_root / name / "bin" / "python"
         if candidate.is_file():
             return candidate
     return Path(sys.executable)
 
 
-def _venv_python3(repo_root: Path) -> Path:
-    for name in (".venv", "venv"):
+def _venv_python3(repo_root: Path, *, prefer_fr3: bool = False) -> Path:
+    names = (".venv-fr3", ".venv", "venv") if prefer_fr3 else (".venv", "venv")
+    for name in names:
         for executable in ("python3", "python"):
             candidate = repo_root / name / "bin" / executable
             if candidate.is_file():
@@ -5736,6 +6290,210 @@ def _tool_env(repo_root: Path) -> dict[str, str]:
     env["PYTHONPATH"] = os.pathsep.join(python_paths)
     env["PYTHONUNBUFFERED"] = "1"
     return env
+
+
+def _fr3_pika_asset_paths(repo_root: Path) -> tuple[Path, Path]:
+    asset_root = repo_root / "src" / "lerobot" / "robots" / "franka_research3" / "assets" / "franka_fr3"
+    return asset_root / "fr3_pika_gripper.urdf", asset_root / "fr3_pika_gripper_scene.xml"
+
+
+def _fr3_sim_teleop_command(state: GatewayState) -> list[str]:
+    urdf_path, sim_xml_path = _fr3_pika_asset_paths(state.repo_root)
+    return [
+        str(_venv_python(state.repo_root, prefer_fr3=True)),
+        str(state.repo_root / "tools" / "fr3" / "fr3_mujoco_teleop.py"),
+        "--teleop-type",
+        "spacemouse",
+        "--urdf-path",
+        str(urdf_path),
+        "--sim-xml-path",
+        str(sim_xml_path),
+        "--target-frame-name",
+        "pika_task_tcp",
+        "--no-viewer",
+        "--enable-cameras",
+        "--camera-width",
+        "640",
+        "--camera-height",
+        "480",
+        "--camera-fps",
+        "30",
+        "--disable-otg",
+    ]
+
+
+def _fr3_real_teleop_command(state: GatewayState) -> list[str]:
+    return [
+        str(_venv_python(state.repo_root, prefer_fr3=True)),
+        "-m",
+        "tools.fr3.fr3_real_teleop_runtime",
+        f"--config_path={state.config_path}",
+    ]
+
+
+def _read_teleop_process_output(state: GatewayState, process: subprocess.Popen[str]) -> None:
+    if process.stdout is None:
+        return
+    for line in process.stdout:
+        output = line.strip()
+        if not output:
+            continue
+        with state.lock:
+            if state.teleop_process is not process:
+                return
+            if output.startswith("libEGL warning:"):
+                state.log("warn", f"fr3 teleop: {output}")
+                continue
+            state.teleop.lastOutput = output
+            if output == "fr3_real_teleop=READY":
+                state.teleop.state = "running"
+                state.teleop.realRobotReady = True
+                state.teleop.message = "FR3, Pika gripper, and SpaceMouse are connected"
+            elif output.startswith("Camera streams:"):
+                state.teleop.message = "External and wrist simulation views are live"
+            else:
+                state.teleop.message = output
+            state.log("info", f"fr3 teleop: {output}")
+
+
+def _start_teleop_output_reader(state: GatewayState, process: subprocess.Popen[str]) -> None:
+    Thread(
+        target=_read_teleop_process_output,
+        args=(state, process),
+        daemon=True,
+        name=f"fr3-teleop-output-{process.pid}",
+    ).start()
+
+
+def _start_fr3_sim_teleop(state: GatewayState) -> None:
+    process = state.teleop_process
+    if process is not None and process.poll() is None:
+        state.teleop.message = "FR3 MuJoCo teleop is already running"
+        return
+    urdf_path, sim_xml_path = _fr3_pika_asset_paths(state.repo_root)
+    if not urdf_path.is_file():
+        raise RuntimeError(f"Missing FR3 Pika URDF: {urdf_path}")
+    if not sim_xml_path.is_file():
+        raise RuntimeError(f"Missing FR3 Pika MuJoCo scene: {sim_xml_path}")
+    command = _fr3_sim_teleop_command(state)
+    env = _tool_env(state.repo_root)
+    env["MUJOCO_GL"] = "egl"
+    process = subprocess.Popen(
+        command,
+        cwd=state.repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    state.teleop_process = process
+    state.teleop_started_at_s = time.monotonic()
+    state.teleop = TeleopStatus(
+        state="running",
+        backend="mujoco",
+        inputDevice="spacemouse",
+        robotModel="fr3_pika_gripper",
+        urdfPath=str(urdf_path),
+        simXmlPath=str(sim_xml_path),
+        targetFrameName="pika_task_tcp",
+        pid=process.pid,
+        message="FR3 Pika MuJoCo teleop started; two camera streams are rendering in the web UI",
+        command=command,
+        realRobotReady=False,
+    )
+    state.log("info", f"Started FR3 Pika MuJoCo teleop pid={process.pid}")
+    _start_teleop_output_reader(state, process)
+
+
+def _start_fr3_real_teleop(state: GatewayState) -> None:
+    process = state.teleop_process
+    if process is not None and process.poll() is None:
+        state.teleop.message = "An FR3 teleop session is already active"
+        return
+    urdf_path, sim_xml_path = _fr3_pika_asset_paths(state.repo_root)
+    if not urdf_path.is_file():
+        raise RuntimeError(f"Missing FR3 Pika URDF: {urdf_path}")
+    if not state.config_path.is_file():
+        raise RuntimeError(f"Missing workstation FR3 config: {state.config_path}")
+
+    command = _fr3_real_teleop_command(state)
+    process = subprocess.Popen(
+        command,
+        cwd=state.repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=_tool_env(state.repo_root),
+        start_new_session=True,
+    )
+    state.teleop_process = process
+    state.teleop_started_at_s = time.monotonic()
+    state.teleop = TeleopStatus(
+        state="starting",
+        backend="real",
+        inputDevice="spacemouse",
+        robotModel="fr3_pika_gripper",
+        urdfPath=str(urdf_path),
+        simXmlPath=str(sim_xml_path),
+        targetFrameName="pika_task_tcp",
+        pid=process.pid,
+        message="Connecting to FR3 192.168.1.206, Pika gripper, and SpaceMouse",
+        command=command,
+        realRobotReady=False,
+    )
+    state.log("info", f"Started FR3 Pika real teleop without an FCI preflight gate pid={process.pid}")
+    _start_teleop_output_reader(state, process)
+
+
+def _stop_fr3_teleop(state: GatewayState) -> None:
+    process = state.teleop_process
+    if process is not None and process.poll() is None:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=1.0)
+        state.log("warn", f"Stopped FR3 teleop pid={process.pid}")
+    state.teleop_process = None
+    state.teleop_started_at_s = None
+    state.teleop.state = "idle"
+    state.teleop.pid = None
+    state.teleop.realRobotReady = False
+    state.teleop.message = "FR3 Pika teleop stopped"
+
+
+def _serve_teleop_camera_snapshot(
+    handler: BaseHTTPRequestHandler,
+    *,
+    state: GatewayState,
+    view_id: str,
+) -> None:
+    allowed_views = {str(view.get("id")) for view in state.teleop.cameraViews}
+    if view_id not in allowed_views:
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"unknown teleop camera view: {view_id}"})
+        return
+    process = state.teleop_process
+    if process is None or process.poll() is not None or state.teleop.state != "running":
+        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "MuJoCo teleop is not running"})
+        return
+    try:
+        with urlopen(f"http://127.0.0.1:18765/camera/{view_id}.jpg", timeout=1.0) as response:
+            payload = response.read()
+    except (OSError, URLError, TimeoutError) as exc:
+        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": f"camera frame unavailable: {exc}"})
+        return
+    try:
+        handler.send_response(HTTPStatus.OK)
+        handler.send_header("Content-Type", "image/jpeg")
+        handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        handler.send_header("Access-Control-Allow-Origin", "*")
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
 
 
 def _set_all_device_states(state: GatewayState, device_state: str) -> None:
@@ -5815,6 +6573,10 @@ def _recorder_script(state: GatewayState) -> tuple[Path, str]:
             script = state.repo_root / script
         flag = str(raw.get("config_flag") or "--config-path")
         return script, flag
+    if state.profile == "workstation":
+        # The FR3 workstation config is a lerobot RecordConfig, which draccus parses strictly;
+        # it cannot carry a `recorder:` block to point here, so the profile selects the script.
+        return state.repo_root / WORKSTATION_RECORDER_SCRIPT, "--config_path"
     return state.repo_root / DEFAULT_RECORDER_SCRIPT, "--config_path"
 
 
@@ -5988,15 +6750,24 @@ def _box_touch_cali_log_payload(state: GatewayState) -> dict[str, Any]:
         return {"running": state.box_touch_cali_running, "lines": list(state.box_touch_cali_log)}
 
 
-def _connect_recorder(state: GatewayState) -> None:
+def _connect_recorder(state: GatewayState, *, backend: str | None = None) -> None:
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
         return
 
+    is_workstation = state.profile == "workstation"
+    if backend is not None:
+        if backend not in RECORD_BACKENDS:
+            raise ValueError(f"Recording backend must be one of {RECORD_BACKENDS}, got {backend!r}")
+        if not is_workstation and backend != DEFAULT_RECORD_BACKEND:
+            raise ValueError("Only the workstation profile can choose a recording backend")
+        state.recording.backend = backend
+
     config_path = _resolve_recorder_config_path(state)
     recorder_script, config_flag = _recorder_script(state)
     command = [
-        str(_venv_python(state.repo_root)),
+        # The FR3 stack (panda_py, placo, mujoco) lives in .venv-fr3 on the workstation.
+        str(_venv_python(state.repo_root, prefer_fr3=is_workstation)),
         str(recorder_script),
         f"{config_flag}={config_path}",
     ]
@@ -6008,6 +6779,19 @@ def _connect_recorder(state: GatewayState) -> None:
     # the first PLAYING transition deadlocks the Python thread).
     if "thor_record" in str(recorder_script):
         command.append("--skip-argus-probe")
+    env = _recorder_env(state.repo_root)
+    if is_workstation:
+        command.append(f"--backend={state.recording.backend}")
+        # The FR3 recorder only ever writes a local dataset -- it neither pulls nor pushes to the
+        # Hub. Left online, any local metadata read that misses falls back to huggingface.co, and
+        # that connect has no timeout on a workstation with no route to it: the recorder hangs
+        # before its first output line and stops reading its own stdin, so the GUI cannot even
+        # cancel it. Offline turns that class of hang into an immediate error. Not set for Thor,
+        # whose handheld recorder honours dataset.push_to_hub.
+        env["HF_HUB_OFFLINE"] = "1"
+        if state.recording.backend == "sim":
+            # Headless MuJoCo rendering: the recorder runs detached from any X session.
+            env["MUJOCO_GL"] = "egl"
     recorder_log_path = _new_recorder_log_path(state)
     state.process = subprocess.Popen(
         command,
@@ -6016,7 +6800,7 @@ def _connect_recorder(state: GatewayState) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        env=_recorder_env(state.repo_root),
+        env=env,
         start_new_session=True,
     )
     state.process_started_at_s = time.monotonic()
@@ -6024,7 +6808,17 @@ def _connect_recorder(state: GatewayState) -> None:
     state.recording.pid = state.process.pid
     state.recording.frameIndex = 0
     state.recording.queueDepth = 0
-    state.recording.message = "Connecting handheld devices"
+    state.recording.message = (
+        f"Starting FR3 {state.recording.backend} recorder"
+        if is_workstation
+        else "Connecting handheld devices"
+    )
+    # A new session's alignment verdict starts blank; carrying the previous run's over would
+    # let a stale "pass" vouch for data it never saw.
+    state.recording.syncStatus = "unknown"
+    state.recording.syncSummary = ""
+    state.recording.syncReportPath = ""
+    state.recording.syncWarnings = []
     state.recorder_log_path = recorder_log_path
     _append_line(recorder_log_path, f"# command: {' '.join(command)}")
     _append_line(recorder_log_path, f"# cwd: {state.repo_root}")
@@ -6035,7 +6829,16 @@ def _connect_recorder(state: GatewayState) -> None:
     # Force the first viewer poll of the new session to send a demand heartbeat.
     state.recorder_preview_demand_sent_s = 0.0
     _set_all_device_states(state, "warning")
-    state.log("info", f"Started handheld recorder pid={state.process.pid} log={recorder_log_path}")
+    if is_workstation and state.recording.backend == "sim":
+        # Nothing physical is opened in a sim session. Leaving the hardware rows at "warning"
+        # (the Connect default) would imply the gateway is still waiting on an FR3 that was
+        # never asked to come up; the SpaceMouse row stays in the warning->running flow
+        # because that device really is opened.
+        for device in state.devices:
+            if device.get("kind") in ("robot", "gripper", "camera"):
+                device["state"] = "idle"
+                device["detail"] = "simulated in MuJoCo"
+    state.log("info", f"Started {state.profile} recorder pid={state.process.pid} log={recorder_log_path}")
     _start_output_reader(state, state.process)
 
 
@@ -6155,7 +6958,7 @@ def _dataset_scan_signature(state: GatewayState) -> tuple:
     the cache notices the dataset becoming replayable while still avoiding the
     full per-episode scan used by ``_recorded_dataset_items``.
     """
-    roots = [state.datasets_root, _task_exports_root(state)]
+    roots = [state.datasets_root, _task_exports_root(state), _training_views_root(state)]
     sig: list[tuple[Any, ...]] = []
     for root in roots:
         if root is None or not root.is_dir():
@@ -6442,7 +7245,12 @@ def _distance_mm(a: dict[str, Any], b: dict[str, Any]) -> float | None:
 def _trajectory_contract_for_episode(state: GatewayState, dataset_root: Path) -> dict[str, Any]:
     replay = _replay_config(state.config)
     max_ee_step_mm = _float_config(replay, "trajectory_max_ee_step_mm", DEFAULT_REPLAY_MAX_EE_STEP_MM)
-    max_gripper_step = _float_config(replay, "trajectory_max_gripper_step", DEFAULT_REPLAY_MAX_GRIPPER_STEP)
+    default_gripper_step = (
+        DEFAULT_WORKSTATION_REPLAY_MAX_GRIPPER_STEP
+        if state.profile == "workstation"
+        else DEFAULT_REPLAY_MAX_GRIPPER_STEP
+    )
+    max_gripper_step = _float_config(replay, "trajectory_max_gripper_step", default_gripper_step)
     min_z_value = replay.get("trajectory_min_z_m")
     max_z_value = replay.get("trajectory_max_z_m")
     min_z = float(min_z_value) if min_z_value is not None else None
@@ -6593,10 +7401,15 @@ def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> Non
         if contract.get("status") != "passed":
             reasons.extend(str(reason) for reason in contract.get("failures", []))
 
+    # The verdict belongs to `mujocoValidation`, not to `safety`. `safety` describes whether the
+    # hardware path is authorized, and only the real preflight can say that -- a recorded
+    # trajectory scoring 25 mm instead of 20 mm is a data verdict, not a faulted rig. Writing
+    # "fault" here mislabelled it and, worse, withheld the robot-free controls that are exactly
+    # what an operator reaches for next; writing "ready" on a pass claimed an authorization no
+    # hardware check had granted. It stays "locked" from the start of the run either way.
     if reasons:
         validation["status"] = "failed"
         validation["message"] = "MuJoCo validation failed: " + "; ".join(reasons)
-        state.replay.safety = "fault"
         state.replay.state = "aborted"
     else:
         validation["status"] = "passed"
@@ -6604,7 +7417,6 @@ def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> Non
             f"MuJoCo validation passed: max {float(max_pos):.2f}mm / {float(max_rot):.2f}deg "
             f"within {max_pos_threshold:.2f}mm / {max_rot_threshold:.2f}deg"
         )
-        state.replay.safety = "ready"
         state.replay.state = "complete"
     state.replay.mujocoValidation = validation
     _refresh_mujoco_validation_current(state)
@@ -6713,6 +7525,9 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
             if done:
                 state.box_cali_running = False
         return
+    if output.startswith("SYNC "):
+        _apply_sync_audit_output(state, output.removeprefix("SYNC ").strip())
+        return
     state.recording.lastOutput = output
     state.recording.message = output
     # Append to the ring buffer so the frontend can render every line the
@@ -6736,6 +7551,11 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         ("Tactiles:", "tactile"),
         ("Handheld grippers:", "handheld_gripper"),
         ("Box devices:", "box_collection"),
+        # Workstation FR3 rig: the recorder reports which of these actually came up, so a
+        # sim session never marks the physical arm or gripper as connected.
+        ("Robots:", "robot"),
+        ("Grippers:", "gripper"),
+        ("Teleoperators:", "teleoperator"),
     ):
         if output.startswith(prefix):
             _mark_connected_devices(state, kind, output.removeprefix(prefix).strip())
@@ -6779,6 +7599,49 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
         state.recording.frameIndex = 0
     elif "Input stream closed; stopping recording session." in output:
         state.recording.message = "Recorder input closed; finalizing dataset"
+
+
+_SYNC_WARNING_CAP = 12
+
+
+def _apply_sync_audit_output(state: GatewayState, payload: str) -> None:
+    """Fold one ``SYNC ...`` recorder line into the recording status.
+
+    The recorder emits three shapes: a ``status=... skew_p95_ms=...`` digest, a
+    ``report=<path>`` pointer once the on-disk report exists, and ``WARN:``/``bias_...``
+    detail lines. Warnings are kept as warnings on purpose -- an alignment violation must be
+    loudly visible without tearing down a live recording session.
+    """
+    if payload.startswith("report="):
+        state.recording.syncReportPath = payload.removeprefix("report=").strip()
+        state.log("info", f"sync report written: {state.recording.syncReportPath}")
+        return
+    if payload.startswith("WARN:"):
+        warning = payload.removeprefix("WARN:").strip()
+        state.recording.syncWarnings.append(warning)
+        del state.recording.syncWarnings[:-_SYNC_WARNING_CAP]
+        state.log("warn", f"timestamp sync: {warning}")
+        return
+    if payload.startswith("audit unavailable"):
+        state.recording.syncStatus = "unavailable"
+        state.recording.syncSummary = payload
+        state.log("warn", f"timestamp sync: {payload}")
+        return
+    if payload.startswith("bias_vs_arm_ms["):
+        state.log("info", f"timestamp sync: {payload}")
+        return
+
+    fields = dict(
+        item.split("=", 1) for item in payload.split() if "=" in item
+    )
+    status = str(fields.get("status") or "").strip()
+    if status in ("pass", "fail"):
+        # A new episode's verdict supersedes the previous one's warnings.
+        if status == "pass":
+            state.recording.syncWarnings = []
+        state.recording.syncStatus = status
+    state.recording.syncSummary = payload
+    state.log("info" if status == "pass" else "warn", f"timestamp sync: {payload}")
 
 
 def _apply_box_roster(state: GatewayState, roster: list[dict[str, Any]]) -> None:
@@ -6838,6 +7701,17 @@ def _active_replay_dataset_root(state: GatewayState) -> Path:
     return candidates[0].resolve()
 
 
+FR3_MUJOCO_REPLAY_DIR = "fr3_mujoco_replay"
+
+
+def _fr3_mujoco_replay_report_path(dataset_root: Path, episode: int) -> Path:
+    return dataset_root / "derived" / FR3_MUJOCO_REPLAY_DIR / f"episode_{int(episode):06d}.json"
+
+
+def _fr3_mujoco_replay_video_path(dataset_root: Path, episode: int) -> Path:
+    return dataset_root / "derived" / FR3_MUJOCO_REPLAY_DIR / f"episode_{int(episode):06d}.mp4"
+
+
 def _mujoco_preview_report_path(dataset_root: Path, episode: int, cube_mode: str) -> Path:
     return (
         dataset_root
@@ -6845,6 +7719,33 @@ def _mujoco_preview_report_path(dataset_root: Path, episode: int, cube_mode: str
         / DEFAULT_TRAJ_SIDECAR_NAME
         / f"mujoco_preview.{cube_mode}.episode_{int(episode):06d}.json"
     )
+
+
+def _fr3_mujoco_preview_payload(dataset_root: Path, episode: int) -> dict[str, Any] | None:
+    """The FR3 replay report, shaped as the inspector's preview payload.
+
+    The two routes disagree about what a replay report is: Thor's is per-cube and carries the
+    per-robot frame lists the inspector never reads, while the FR3 runtime writes one report per
+    episode. Adapting here keeps that difference out of the frontend, which only needs to know
+    whether there is a video to show.
+    """
+    report = _load_json_file(_fr3_mujoco_replay_report_path(dataset_root, episode))
+    if not report:
+        return None
+    video_path = _fr3_mujoco_replay_video_path(dataset_root, episode)
+    return {
+        "schema_version": int(report.get("schema_version") or 1),
+        "dataset_root": str(dataset_root),
+        "episode_index": int(report.get("episode", episode)),
+        "fps": int(report.get("fps") or 0),
+        "native_video_path": str(video_path) if video_path.is_file() else "",
+        "status": str(report.get("status") or ""),
+        "max_position_error_mm": report.get("max_position_error_mm"),
+        "max_rotation_error_deg": report.get("max_rotation_error_deg"),
+        # No cubes on this rig, and no second arm to place beside the first.
+        "robots": {},
+        "robot_spacing_m": 0.0,
+    }
 
 
 def _mujoco_preview_video_path(dataset_root: Path, episode: int, cube_mode: str) -> Path:
@@ -6865,7 +7766,40 @@ def _mujoco_replay_python(state: GatewayState) -> Path:
     return thor_python if thor_python.is_file() else _venv_python(state.repo_root)
 
 
+def _fr3_mujoco_replay_command(state: GatewayState, dataset_root: Path) -> list[str]:
+    """Workstation MuJoCo validation: replay the recorded FR3 EE command stream.
+
+    The Thor route tracks AprilTag cubes through a scene; a workstation dataset has no cubes
+    and instead carries the arm's own absolute EE actions, so validation means feeding those
+    back through the simulated arm and scoring the tracking error.
+    """
+    return [
+        str(_venv_python(state.repo_root, prefer_fr3=True)),
+        str(state.repo_root / "tools" / "fr3" / "fr3_gui_replay_runtime.py"),
+        "--dataset",
+        str(dataset_root),
+        "--episode",
+        str(state.replay.episode),
+        "--config-path",
+        str(state.config_path),
+        "--fps",
+        str(state.replay.fps or 30),
+        "--max-position-error-mm",
+        str(DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM),
+        "--max-rotation-error-deg",
+        str(DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG),
+        "--ik-orientation-weight",
+        str(DEFAULT_WORKSTATION_REPLAY_IK_ORIENTATION_WEIGHT),
+        # Without this the run produces numbers and nothing to look at: the inspector's video
+        # panel stays on its placeholder, which reads as "the replay did not happen".
+        "--render-video",
+        str(_fr3_mujoco_replay_video_path(dataset_root, state.replay.episode)),
+    ]
+
+
 def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: str | None = None) -> list[str]:
+    if state.profile == "workstation":
+        return _fr3_mujoco_replay_command(state, dataset_root)
     selected_cube_mode = str(cube_mode or state.replay.mujocoCubeMode or DEFAULT_MUJOCO_CUBE_MODE)
     if selected_cube_mode not in MUJOCO_CUBE_MODES:
         raise ValueError(f"MuJoCo cube mode must be one of {MUJOCO_CUBE_MODES}, got {selected_cube_mode!r}")
@@ -6988,6 +7922,41 @@ def _validated_robot_ip(raw: str, label: str) -> str:
     return value
 
 
+def _fr3_real_replay_command(state: GatewayState, dataset_root: Path, robot_ip: str) -> list[str]:
+    """Drive the hardware FR3 through the episode's own recorded EE actions.
+
+    The same runtime as the MuJoCo gate, with ``--backend real``. Sharing it is the point: a real
+    replay that rebuilt its trajectory by different code from the run that cleared it would have
+    validated one thing and executed another.
+    """
+    return [
+        str(_venv_python(state.repo_root, prefer_fr3=True)),
+        str(state.repo_root / "tools" / "fr3" / "fr3_gui_replay_runtime.py"),
+        "--backend",
+        "real",
+        "--dataset",
+        str(dataset_root),
+        "--episode",
+        str(state.replay.episode),
+        "--config-path",
+        str(state.config_path),
+        "--fps",
+        str(state.replay.fps or 30),
+        "--robot-ip",
+        str(robot_ip),
+        "--max-position-error-mm",
+        str(DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM),
+        "--max-rotation-error-deg",
+        str(DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG),
+        "--ik-orientation-weight",
+        str(DEFAULT_WORKSTATION_REPLAY_IK_ORIENTATION_WEIGHT),
+        "--settle-steps",
+        str(DEFAULT_WORKSTATION_REAL_SETTLE_STEPS),
+        "--settle-tolerance-mm",
+        str(DEFAULT_WORKSTATION_REAL_SETTLE_TOLERANCE_MM),
+    ]
+
+
 def _real_replay_command(
     state: GatewayState,
     dataset_root: Path,
@@ -6995,6 +7964,8 @@ def _real_replay_command(
     robot_ip: str,
     end_effector_mode: str = "corenetic_gripper_ee",
 ) -> list[str]:
+    if state.profile == "workstation":
+        return _fr3_real_replay_command(state, dataset_root, robot_ip)
     # run/deploy.sh hosts the gateway on Thor itself. Calling the developer-side
     # run_replay_cube_pose_on_thor.sh wrapper here would make Thor SSH back into
     # itself and depend on an unrelated self-SSH key. Invoke the same underlying
@@ -7005,7 +7976,7 @@ def _real_replay_command(
         / DEFAULT_TRAJ_SIDECAR_NAME
         / f"state_action.{cube_mode}.csv"
     )
-    return [
+    command = [
         str(_mujoco_replay_python(state)),
         str(
             state.repo_root
@@ -7032,6 +8003,19 @@ def _real_replay_command(
         "--replay.fail_on_unreached_initial_pose=true",
         f"--end_effector.mode={'fr3_ee' if end_effector_mode == 'fr3_ee' else 'robot_config'}",
     ]
+    if end_effector_mode == "pika_gripper_ee":
+        robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
+        urdf_path, _sim_xml_path = _fr3_pika_asset_paths(state.repo_root)
+        command.extend(
+            [
+                "--robot.gripper_backend=pika",
+                f"--robot.gripper_port={robot.get('gripper_port') or '/dev/ttyUSB0'}",
+                "--robot.allow_mock_gripper=false",
+                f"--robot.urdf_path={urdf_path}",
+                "--robot.target_frame_name=pika_task_tcp",
+            ]
+        )
+    return command
 
 
 def _real_robot_ip(state: GatewayState) -> str:
@@ -7042,11 +8026,24 @@ def _real_robot_ip(state: GatewayState) -> str:
 
 def _real_preflight_command(state: GatewayState, robot_ip: str | None = None) -> list[str]:
     replay = _replay_config(state.config)
+    config_path = (
+        state.config_path
+        if state.profile == "workstation"
+        else state.repo_root
+        / "third_party"
+        / "opencv_kalibr"
+        / "fr3_data_collection_replay"
+        / "replay_cube_pose_in_robot_base.thor.yaml"
+    )
     command = [
-        str(_mujoco_replay_python(state)),
+        str(
+            _venv_python(state.repo_root, prefer_fr3=True)
+            if state.profile == "workstation"
+            else _mujoco_replay_python(state)
+        ),
         str(state.repo_root / "tools" / "fr3" / "fr3_record_preflight.py"),
         f"--workspace={state.repo_root}",
-        f"--config-path={state.repo_root / 'third_party' / 'opencv_kalibr' / 'fr3_data_collection_replay' / 'replay_cube_pose_in_robot_base.thor.yaml'}",
+        f"--config-path={config_path}",
         f"--robot-ip={robot_ip or _real_robot_ip(state)}",
     ]
     if _bool_config(replay, "real_preflight_skip_host_imports", True):
@@ -7176,7 +8173,7 @@ def _require_replay_dataset(state: GatewayState) -> Path:
 def _mujoco_recommendation_suffix(state: GatewayState, dataset_root: Path) -> str:
     if _mujoco_validation_is_for_active_episode(state, dataset_root):
         return "current MuJoCo validation is available"
-    return "MuJoCo replay is strongly recommended before Preflight/Dry Run and still required before Real Robot"
+    return "MuJoCo replay is strongly recommended before Preflight and still required before Real Robot"
 
 
 def _preflight_replay(state: GatewayState) -> None:
@@ -7202,15 +8199,19 @@ def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CU
     cube_mode = str(cube_mode).strip().lower()
     if cube_mode not in MUJOCO_CUBE_MODES:
         raise ValueError(f"MuJoCo cube mode must be one of {MUJOCO_CUBE_MODES}, got {cube_mode!r}")
-    required_cubes = ("left", "right") if cube_mode == "both" else (cube_mode,)
-    episode_poses = _read_sidecar_cube_poses(dataset_root, state.replay.episode)
-    missing_cubes = [cube for cube in required_cubes if not episode_poses.get(cube)]
-    if missing_cubes:
-        raise RuntimeError(
-            f"Selected dataset episode {state.replay.episode} has no valid generated EE trajectory for: "
-            f"{', '.join(missing_cubes)}. "
-            "Run Generate EE Trajectory first."
-        )
+    if state.profile != "workstation":
+        # Thor validates against AprilTag cube trajectories generated from the camera stream.
+        # A workstation dataset carries the arm's own EE actions instead, so there is no
+        # sidecar to require -- gating on one would make FR3 replay permanently unreachable.
+        required_cubes = ("left", "right") if cube_mode == "both" else (cube_mode,)
+        episode_poses = _read_sidecar_cube_poses(dataset_root, state.replay.episode)
+        missing_cubes = [cube for cube in required_cubes if not episode_poses.get(cube)]
+        if missing_cubes:
+            raise RuntimeError(
+                f"Selected dataset episode {state.replay.episode} has no valid generated EE trajectory for: "
+                f"{', '.join(missing_cubes)}. "
+                "Run Generate EE Trajectory first."
+            )
 
     state.replay.mujocoCubeMode = cube_mode
     command = _mujoco_replay_command(state, dataset_root, cube_mode)
@@ -7242,8 +8243,11 @@ def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CU
     state.replay.frameIndex = 0
     state.replay.datasetRoot = str(dataset_root)
     state.replay.dataset = str(dataset_root)
+    # "cube mode" is a Thor concept; a workstation replay tracks the arm's own EE command
+    # stream, so naming a cube there would describe something that does not exist.
+    replay_subject = "EE command" if state.profile == "workstation" else cube_mode
     state.replay.message = (
-        f"MuJoCo {cube_mode} replay started for {dataset_root.name} episode {state.replay.episode}; "
+        f"MuJoCo {replay_subject} replay started for {dataset_root.name} episode {state.replay.episode}; "
         "waiting for validation metrics"
     )
     state.log(
@@ -7253,63 +8257,148 @@ def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CU
     _start_replay_output_reader(state, process)
 
 
-def _realsense_preview_paths(state: GatewayState) -> tuple[Path, Path]:
-    root = Path("/tmp") / f"lerobot_realsense_replay_{os.getpid()}"
-    return root.with_suffix(".jpg"), root.with_suffix(".json")
+def _realsense_preview_token(camera_key: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9-]+", "_", str(camera_key).strip())
+    return token.strip("_") or "default"
+
+
+def _realsense_preview_paths(state: GatewayState, camera_key: str = "default") -> tuple[Path, Path]:
+    token = _realsense_preview_token(camera_key)
+    root = Path("/tmp") / f"lerobot_realsense_replay_{os.getpid()}_{token}"
+    return Path(str(root) + ".jpg"), Path(str(root) + ".json")
 
 
 def _realsense_preview_python(state: GatewayState) -> Path:
     candidate = state.repo_root / "third_party" / "opencv_kalibr" / ".venv" / "bin" / "python3"
-    return candidate if candidate.is_file() else _venv_python3(state.repo_root)
-
-
-def _stop_realsense_preview(state: GatewayState) -> None:
-    process = state.realsense_preview_process
-    if process is not None and process.poll() is None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=2.0)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-    state.realsense_preview_process = None
-
-
-def _start_realsense_preview(state: GatewayState) -> None:
-    process = state.realsense_preview_process
-    if process is not None and process.poll() is None:
-        return
-    image_path, status_path = _realsense_preview_paths(state)
-    image_path.unlink(missing_ok=True)
-    status_path.unlink(missing_ok=True)
-    command = [
-        str(_realsense_preview_python(state)),
-        str(state.repo_root / "tools" / "data_collection_gui" / "realsense_live_preview.py"),
-        "--output", str(image_path),
-        "--status", str(status_path),
-    ]
-    state.realsense_preview_process = subprocess.Popen(
-        command,
-        cwd=state.repo_root,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
+    return (
+        candidate
+        if candidate.is_file()
+        else _venv_python3(state.repo_root, prefer_fr3=state.profile == "workstation")
     )
 
 
+def _replay_realsense_camera_matches(state: GatewayState, dataset_root: Path | None = None) -> list[dict[str, Any]]:
+    root = dataset_root or state.selected_replay_root or _resolve_known_dataset(state, state.replay.datasetRoot or state.replay.dataset)
+    if root is None:
+        return []
+    try:
+        camera_keys = _camera_keys(_load_dataset_info(root))
+    except Exception:
+        return []
+    robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
+    configured = robot.get("cameras") if isinstance(robot.get("cameras"), dict) else {}
+    matches: list[dict[str, Any]] = []
+    for camera_key in camera_keys:
+        stem = _camera_stem_from_key(camera_key)
+        config_key = camera_key if camera_key in configured else stem
+        camera_cfg = configured.get(config_key) if isinstance(configured.get(config_key), dict) else None
+        if not camera_cfg or str(camera_cfg.get("type", "")).lower() != "intelrealsense":
+            continue
+        serial = str(camera_cfg.get("serial_number_or_name") or "").strip()
+        if not serial:
+            continue
+        matches.append(
+            {
+                "cameraKey": camera_key,
+                "configKey": str(config_key),
+                "serial": serial,
+                "width": int(camera_cfg.get("width") or 640),
+                "height": int(camera_cfg.get("height") or 480),
+                "fps": min(int(camera_cfg.get("fps") or 15), 15),
+            }
+        )
+    return matches
+
+
+def _terminate_process_group(process: subprocess.Popen[str], timeout_s: float = 2.0) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=timeout_s)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+
+
+def _stop_realsense_preview(state: GatewayState) -> None:
+    processes = dict(state.realsense_preview_processes)
+    if state.realsense_preview_process is not None:
+        processes.setdefault("default", state.realsense_preview_process)
+    for process in processes.values():
+        _terminate_process_group(process)
+    state.realsense_preview_process = None
+    state.realsense_preview_processes = {}
+
+
+def _start_realsense_preview(state: GatewayState, dataset_root: Path | None = None) -> None:
+    matches = _replay_realsense_camera_matches(state, dataset_root)
+    running_keys = {key for key, process in state.realsense_preview_processes.items() if process.poll() is None}
+    desired_keys = {str(match["cameraKey"]) for match in matches}
+    if running_keys == desired_keys and running_keys:
+        return
+    _stop_realsense_preview(state)
+    for match in matches:
+        camera_key = str(match["cameraKey"])
+        image_path, status_path = _realsense_preview_paths(state, camera_key)
+        image_path.unlink(missing_ok=True)
+        status_path.unlink(missing_ok=True)
+        command = [
+            str(_realsense_preview_python(state)),
+            str(state.repo_root / "tools" / "data_collection_gui" / "realsense_live_preview.py"),
+            "--output", str(image_path),
+            "--status", str(status_path),
+            "--serial", str(match["serial"]),
+            "--width", str(match["width"]),
+            "--height", str(match["height"]),
+            "--fps", str(match["fps"]),
+        ]
+        state.realsense_preview_processes[camera_key] = subprocess.Popen(
+            command,
+            cwd=state.repo_root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+
 def _realsense_preview_status(state: GatewayState) -> dict[str, Any]:
-    _image_path, status_path = _realsense_preview_paths(state)
-    payload = _load_json_file(status_path)
-    process = state.realsense_preview_process
-    process_running = process is not None and process.poll() is None
-    if not payload:
+    matches = _replay_realsense_camera_matches(state)
+    by_key = {str(match["cameraKey"]): match for match in matches}
+    cameras: list[dict[str, Any]] = []
+    for camera_key, match in by_key.items():
+        _image_path, status_path = _realsense_preview_paths(state, camera_key)
+        payload = _load_json_file(status_path)
+        process = state.realsense_preview_processes.get(camera_key)
+        process_running = process is not None and process.poll() is None
+        if not payload:
+            payload = {
+                "available": None,
+                "running": process_running,
+                "error": "Waiting for RealSense detection" if process_running else "Preview starts with real-robot replay",
+            }
+        payload = dict(payload)
+        payload.update({"cameraKey": camera_key, "configKey": match["configKey"], "serial": match["serial"]})
+        payload["running"] = bool(payload.get("running")) and process_running
+        cameras.append(payload)
+    if not cameras:
         return {
             "available": None,
-            "running": process_running,
-            "error": "Waiting for RealSense detection" if process_running else "Preview starts with real-robot replay",
+            "running": False,
+            "cameras": [],
+            "error": "No dataset camera stream matches a configured RealSense camera.",
         }
-    payload["running"] = bool(payload.get("running")) and process_running
-    return payload
+    first = cameras[0]
+    return {
+        "available": any(camera.get("available") is True for camera in cameras),
+        "running": any(bool(camera.get("running")) for camera in cameras),
+        "serial": first.get("serial"),
+        "width": first.get("width"),
+        "height": first.get("height"),
+        "fps": first.get("fps"),
+        "error": "; ".join(str(camera.get("error")) for camera in cameras if camera.get("error")),
+        "cameras": cameras,
+    }
 
 
 def _start_real_replay(
@@ -7327,35 +8416,43 @@ def _start_real_replay(
     if cube_mode not in ("left", "right"):
         raise ValueError(f"Real replay cube mode must be left or right, got {cube_mode!r}")
     end_effector_mode = str(end_effector_mode).strip().lower()
-    if end_effector_mode not in ("corenetic_gripper_ee", "fr3_ee"):
-        raise ValueError("Real replay end effector must be corenetic_gripper_ee or fr3_ee")
+    if end_effector_mode not in ("pika_gripper_ee", "corenetic_gripper_ee", "fr3_ee"):
+        raise ValueError("Real replay end effector must be pika_gripper_ee, corenetic_gripper_ee, or fr3_ee")
+    workstation = state.profile == "workstation"
     state.replay.realReplayLog = []
     _append_real_replay_log(
         state,
         "request",
-        f"cube={cube_mode} episode={state.replay.episode} robot={robot_ip or _real_robot_ip(state)} target={end_effector_mode}",
+        f"{'source=recorded EE actions' if workstation else f'cube={cube_mode}'} "
+        f"episode={state.replay.episode} robot={robot_ip or _real_robot_ip(state)} target={end_effector_mode}",
     )
     dataset_root = _require_mujoco_validation(
         state,
         cube_mode=cube_mode,
         allow_failed_override=bool(override_mujoco_failure),
     )
-    validation_mode = str((state.replay.mujocoValidation or {}).get("cubeMode") or state.replay.mujocoCubeMode)
-    if validation_mode != cube_mode:
-        raise RuntimeError(
-            f"Run and pass MuJoCo {cube_mode} for this dataset/episode before real replay; "
-            f"current validation is for {validation_mode}."
+    if not workstation:
+        # Both checks below are about the cube sidecars. The workstation replays the episode's own
+        # action column, which the validation it just cleared was scored against -- there is no
+        # second artefact that could be missing or belong to a different cube.
+        validation_mode = str(
+            (state.replay.mujocoValidation or {}).get("cubeMode") or state.replay.mujocoCubeMode
         )
-    episode_poses = _read_sidecar_cube_poses(dataset_root, state.replay.episode)
-    if not episode_poses.get(cube_mode):
-        raise RuntimeError(f"No valid generated EE trajectory for: {cube_mode}")
+        if validation_mode != cube_mode:
+            raise RuntimeError(
+                f"Run and pass MuJoCo {cube_mode} for this dataset/episode before real replay; "
+                f"current validation is for {validation_mode}."
+            )
+        episode_poses = _read_sidecar_cube_poses(dataset_root, state.replay.episode)
+        if not episode_poses.get(cube_mode):
+            raise RuntimeError(f"No valid generated EE trajectory for: {cube_mode}")
 
     selected_ip = _validated_robot_ip(robot_ip or _real_robot_ip(state), "Robot IP")
     _append_real_replay_log(state, "validation", "trajectory and MuJoCo decision accepted")
 
     # Re-run hardware checks against the exact IP selected in this panel;
     # a prior preflight for a different arm must never authorize motion here.
-    _start_realsense_preview(state)
+    _start_realsense_preview(state, dataset_root)
     _append_real_replay_log(state, "camera", "RealSense monitor requested")
     try:
         _run_real_preflight(state, [selected_ip])
@@ -7413,18 +8510,6 @@ def _start_real_replay(
         f"episode={state.replay.episode} cube={cube_mode} robot_ip={selected_ip} target={end_effector_mode}",
     )
     _start_replay_output_reader(state, process)
-
-
-def _start_dry_run_replay(state: GatewayState) -> None:
-    dataset_root = _require_replay_dataset(state)
-    state.replay.state = "dry_run"
-    state.replay.safety = "ready"
-    state.replay.frameIndex = 0
-    state.replay.message = (
-        f"Dry-run started for episode {state.replay.episode} from {dataset_root.name}; "
-        f"{_mujoco_recommendation_suffix(state, dataset_root)}"
-    )
-    state.log("info", state.replay.message)
 
 
 def _abort_replay(state: GatewayState) -> None:
@@ -7534,6 +8619,13 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        if path == "/api/teleop/camera.jpg":
+            if self.server.state.profile != "workstation":
+                _json_response(self, HTTPStatus.NOT_FOUND, {"error": "teleoperation is unavailable"})
+                return
+            view_id = query.get("view", [""])[0]
+            _serve_teleop_camera_snapshot(self, state=self.server.state, view_id=view_id)
+            return
         if path.startswith("/api/assets/pika/"):
             name = path[len("/api/assets/pika/"):]
             allowed = {
@@ -7578,6 +8670,30 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing key"})
                 return
             use_recorder_preview = _should_use_recorder_camera_preview(self.server.state)
+            device = next(
+                (
+                    item
+                    for item in self.server.state.devices
+                    if item.get("id") == device_id and item.get("kind") == "camera"
+                ),
+                None,
+            )
+            config = (
+                device.get("config")
+                if isinstance(device, dict) and isinstance(device.get("config"), dict)
+                else {}
+            )
+            if (
+                self.server.state.profile == "workstation"
+                and str(config.get("type", "")).lower() == "intelrealsense"
+            ):
+                _serve_realsense_device_preview_snapshot(
+                    self,
+                    state=self.server.state,
+                    device_id=device_id,
+                    device=device,
+                )
+                return
             params = None if use_recorder_preview else _camera_preview_params(self.server.state, device_id)
             if use_recorder_preview:
                 _serve_recorder_camera_preview_snapshot(
@@ -7605,8 +8721,12 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             _json_response(self, HTTPStatus.OK, payload)
             return
         if path == "/api/replay/realsense.jpg":
+            camera_key = (query.get("key", [""])[0] or "").strip()
             with self.server.state.lock:
-                image_path, _status_path = _realsense_preview_paths(self.server.state)
+                if not camera_key:
+                    matches = _replay_realsense_camera_matches(self.server.state)
+                    camera_key = str(matches[0]["cameraKey"]) if matches else "default"
+                image_path, _status_path = _realsense_preview_paths(self.server.state, camera_key)
             if not image_path.is_file():
                 _json_response(self, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "No RealSense preview frame available"})
                 return
@@ -7672,15 +8792,17 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "invalid episode"})
                 return
             with self.server.state.lock:
+                workstation = self.server.state.profile == "workstation"
                 dataset_root = (
                     _resolve_known_dataset(self.server.state, requested)
                     or self.server.state.selected_replay_root
                 )
-                video_path = (
-                    _mujoco_preview_video_path(dataset_root, episode, cube_mode)
-                    if dataset_root is not None
-                    else None
-                )
+                if dataset_root is None:
+                    video_path = None
+                elif workstation:
+                    video_path = _fr3_mujoco_replay_video_path(dataset_root, episode)
+                else:
+                    video_path = _mujoco_preview_video_path(dataset_root, episode, cube_mode)
             if video_path is None or not video_path.is_file():
                 _json_response(
                     self,
@@ -7735,18 +8857,23 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 if dataset_root is None:
                     _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not found"})
                     return
-                report_path = _mujoco_preview_report_path(dataset_root, episode, cube_mode)
+                workstation = self.server.state.profile == "workstation"
                 try:
-                    report = _load_json_file(report_path)
+                    report = (
+                        _fr3_mujoco_preview_payload(dataset_root, episode)
+                        if workstation
+                        else _load_json_file(_mujoco_preview_report_path(dataset_root, episode, cube_mode))
+                    )
                 except OSError as exc:
                     _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                     return
                 if not report:
-                    _json_response(
-                        self,
-                        HTTPStatus.NOT_FOUND,
-                        {"error": f"Run MuJoCo {cube_mode} replay for this dataset and episode first."},
+                    detail = (
+                        "Run MuJoCo replay for this dataset and episode first."
+                        if workstation
+                        else f"Run MuJoCo {cube_mode} replay for this dataset and episode first."
                     )
+                    _json_response(self, HTTPStatus.NOT_FOUND, {"error": detail})
                     return
                 _json_response(self, HTTPStatus.OK, report)
                 return
@@ -7756,6 +8883,25 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         parsed_url = urlparse(self.path)
         path = parsed_url.path
         query = parse_qs(parsed_url.query)
+        # Recording is available in both profiles now: Thor drives the handheld/GMSL2 rig,
+        # the workstation drives the FR3 SpaceMouse recorder. Only the BOX-sensor calibration
+        # endpoints remain Thor-specific, since no BOX exists on the workstation.
+        thor_only_paths = {
+            "/api/device/calibrate-6dforce",
+            "/api/device/calibrate-6dforce-origin",
+            "/api/device/calibrate-touch",
+            # Task-scoped v3 consolidation only exists for the multi-session GMSL2 rig; a
+            # workstation dataset is already v3 and uses /api/datasets/export for its
+            # training view instead.
+            "/api/tasks/export",
+        }
+        if self.server.state.profile != "thor" and path in thor_only_paths:
+            _json_response(
+                self,
+                HTTPStatus.CONFLICT,
+                {"error": f"{path} is unavailable in the workstation profile"},
+            )
+            return
         if path == "/api/handheld/record/connect":
             # Free the cameras before the recorder opens them: live Device
             # Manager previews hold Argus sessions on the same sensor-ids, and
@@ -7765,15 +8911,21 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             # or _connect_recorder raising), not just the ones a hand-written
             # except remembered to cover.
             state = self.server.state
+            requested_backend = (query.get("backend", [""])[0] or "").strip().lower() or None
             try:
                 with _previews_suspended_for_connect(state):
                     # Done outside the state lock (terminate() blocks).
                     _stop_all_camera_previews(state)
+                    if state.profile == "workstation":
+                        # The RealSense teleop preview owns the same USB devices the hardware
+                        # recorder is about to open; leaving it up makes the recorder's
+                        # pipeline_start fail with "device busy".
+                        _stop_realsense_preview(state)
                     settle_s = _camera_preview_stagger_s(state)
                     if settle_s > 0:
                         time.sleep(settle_s)
                     with state.lock:
-                        _connect_recorder(state)
+                        _connect_recorder(state, backend=requested_backend)
                         response = _snapshot(state)
                 _json_response(self, HTTPStatus.OK, response)
             except Exception as exc:  # noqa: BLE001
@@ -7866,10 +9018,6 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _delete_replay_episode(self.server.state, query.get("episode", [""])[0])
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
-                if path == "/api/replay/start":
-                    _start_dry_run_replay(self.server.state)
-                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
-                    return
                 if path == "/api/replay/start-mujoco":
                     _start_mujoco_replay(
                         self.server.state,
@@ -7889,10 +9037,37 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         self.server.state,
                         query.get("cube", ["right"])[0],
                         query.get("robot_ip", [""])[0],
-                        query.get("end_effector", ["corenetic_gripper_ee"])[0],
+                        query.get("end_effector", ["pika_gripper_ee"])[0],
                         str(query.get("override_mujoco_failure", ["false"])[0]).strip().lower()
                         in ("1", "true", "yes", "on"),
                     )
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/teleop/start-sim":
+                    if self.server.state.profile != "workstation":
+                        _json_response(
+                            self, HTTPStatus.CONFLICT, {"error": "teleoperation is unavailable in the Thor profile"}
+                        )
+                        return
+                    _start_fr3_sim_teleop(self.server.state)
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/teleop/start-real":
+                    if self.server.state.profile != "workstation":
+                        _json_response(
+                            self, HTTPStatus.CONFLICT, {"error": "teleoperation is unavailable in the Thor profile"}
+                        )
+                        return
+                    _start_fr3_real_teleop(self.server.state)
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/teleop/stop":
+                    if self.server.state.profile != "workstation":
+                        _json_response(
+                            self, HTTPStatus.CONFLICT, {"error": "teleoperation is unavailable in the Thor profile"}
+                        )
+                        return
+                    _stop_fr3_teleop(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/calibration/run":
@@ -7970,7 +9145,17 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/datasets/export":
                     requested = (query.get("path", [""])[0] or "").strip()
-                    _start_approved_dataset_export(self.server.state, requested)
+                    if self.server.state.profile == "workstation":
+                        # The workstation recorder already writes v3, so there is no raw->v3
+                        # export here; the equivalent step is building the training view.
+                        _start_training_view(
+                            self.server.state,
+                            requested,
+                            (query.get("action_mode", [DEFAULT_TRAINING_VIEW_ACTION_MODE])[0] or "").strip()
+                            or DEFAULT_TRAINING_VIEW_ACTION_MODE,
+                        )
+                    else:
+                        _start_approved_dataset_export(self.server.state, requested)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
         except Exception as exc:  # noqa: BLE001
@@ -7998,7 +9183,10 @@ def make_state(
     exports_root: Path | None = None,
     log_dir: Path | None = None,
     gateway_log_path: Path | None = None,
+    profile: str = "thor",
 ) -> GatewayState:
+    if profile not in DEPLOYMENT_PROFILES:
+        raise ValueError(f"Unknown deployment profile: {profile}")
     resolved_root = repo_root.resolve()
     resolved_config = config_path if config_path.is_absolute() else resolved_root / config_path
     config = _load_yaml(resolved_config)
@@ -8014,6 +9202,7 @@ def make_state(
         repo_root=resolved_root,
         config_path=resolved_config,
         config=config,
+        profile=profile,
         recording=_recording_status_from_config(config),
         replay=_replay_status_from_config(config),
         datasets_root=resolved_datasets_root,
@@ -8023,7 +9212,12 @@ def make_state(
         devices=_device_statuses(config, resolved_root),
     )
     state.replay.mujocoValidation = _new_mujoco_validation(state)
-    state.log("info", f"Loaded handheld config {resolved_config}")
+    if profile == "workstation":
+        urdf_path, sim_xml_path = _fr3_pika_asset_paths(resolved_root)
+        state.teleop.urdfPath = str(urdf_path)
+        state.teleop.simXmlPath = str(sim_xml_path)
+        state.teleop.message = "FR3 Pika MuJoCo teleop is ready on the workstation"
+    state.log("info", f"Loaded {profile} config {resolved_config}")
     if resolved_datasets_root is not None:
         state.log("info", f"Scanning datasets under {resolved_datasets_root}")
     return state
@@ -8034,6 +9228,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    parser.add_argument("--profile", choices=tuple(DEPLOYMENT_PROFILES), default="thor")
     parser.add_argument("--config-path", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--datasets-root", type=Path, default=DEFAULT_DATASETS_ROOT)
     parser.add_argument("--exports-root", type=Path, default=DEFAULT_EXPORTS_ROOT)
@@ -8061,8 +9256,10 @@ def main() -> None:
     log_dir, gateway_log_path = _setup_gateway_log(repo_root, args.log_dir)
     state = make_state(
         repo_root, args.config_path, args.datasets_root, args.exports_root,
-        log_dir=log_dir, gateway_log_path=gateway_log_path,
+        log_dir=log_dir, gateway_log_path=gateway_log_path, profile=args.profile,
     )
+    if state.profile == "workstation":
+        _probe_workstation_devices(state)
     server = DataCollectionGuiServer((args.host, args.port), state)
     _start_background_workers(state)
     print(f"Data collection GUI gateway listening on http://{args.host}:{args.port}")
@@ -8076,6 +9273,9 @@ def main() -> None:
             for process in list(state.processing_processes.values()):
                 if process.poll() is None:
                     os.killpg(process.pid, signal.SIGTERM)
+            if state.teleop_process is not None and state.teleop_process.poll() is None:
+                os.killpg(state.teleop_process.pid, signal.SIGTERM)
+                state.teleop_process = None
             state.processing_processes.clear()
         server.server_close()
 

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GuiSnapshot } from "../api";
-import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, MujocoCubeMode, RealCubeMode, RealEndEffectorMode, RealSensePreviewStatus } from "../types";
-import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
+import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, MujocoCubeMode, RealCubeMode, RealEndEffectorMode, RealSensePreviewStatus, RealSensePreviewCameraStatus, ReplayTimeline } from "../types";
+import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation, mujocoValidationMatchesSelection } from "../shared/ui";
 import { ReplayInspector } from "../ReplayInspector";
 import { api } from "../apiClient";
 
@@ -9,21 +9,21 @@ export function ReplayPanel({
   status,
   busy,
   onPreflight,
-  onReplay,
   mujocoMode,
+  cubeSelection = true,
   onAbort
 }: {
   status: ReplayStatus;
   busy: boolean;
   onPreflight: () => void;
-  onReplay: (realRobot: boolean) => void;
   mujocoMode: MujocoCubeMode;
+  cubeSelection?: boolean;
   onAbort: () => void;
 }) {
-  const isActive = status.state === "dry_run" || status.state === "sim_replay" || status.state === "replaying";
+  const isActive = status.state === "sim_replay" || status.state === "replaying";
   const canReplayData = status.dataStatus === "loaded" && (status.recordedFrames ?? status.totalFrames) > 0;
   const validation = status.mujocoValidation;
-  const validationMatchesMode = (validation?.cubeMode ?? "left") === mujocoMode;
+  const validationMatchesMode = mujocoValidationMatchesSelection(validation?.cubeMode, mujocoMode, cubeSelection);
   const mujocoPassed =
     validation?.status === "passed" &&
     validation.isCurrentForSelection === true &&
@@ -42,11 +42,18 @@ export function ReplayPanel({
     validation?.maxPositionErrorMm != null && validation?.maxRotationErrorDeg != null
       ? `Max ${validation.maxPositionErrorMm.toFixed(2)}mm / ${validation.maxRotationErrorDeg.toFixed(2)}deg; limits ${validation.maxPositionThresholdMm.toFixed(2)}mm / ${validation.maxRotationThresholdDeg.toFixed(2)}deg`
       : "No completed MuJoCo metrics yet";
+  // One line each: what the verdict is, what to do next, what it measured. These used to run
+  // together in a single paragraph where the label and the gateway's own message said the same
+  // thing twice and the numbers trailed off the end.
   const validationGuidance = mujocoPassed
-    ? `MuJoCo ${mujocoMode} replay is current for this episode.`
+    ? "Nothing to do; this episode's validation is current."
     : validation?.status === "passed" && !validationMatchesMode
       ? `The saved result is for ${validation.cubeMode ?? "left"}; run ${mujocoMode} before Real Robot.`
-      : "Strongly recommended before Preflight/Dry Run; required before Real Robot.";
+      : validation?.status === "failed"
+        ? "Inspect the trajectory below, then re-run MuJoCo."
+        : validation?.status === "running"
+          ? "Waiting for the run to finish."
+          : "Run MuJoCo before real-robot replay.";
   return (
     <section className="panel replay-panel">
       <div className="panel-heading">
@@ -58,12 +65,13 @@ export function ReplayPanel({
       </div>
       <div className="control-row">
         <button disabled={busy || isActive || !canReplayData} onClick={onPreflight}>Preflight</button>
-        <button disabled={busy || isActive || status.safety !== "ready"} onClick={() => onReplay(false)}>Dry Run</button>
         <button disabled={busy || !isActive} onClick={onAbort}>Abort</button>
       </div>
       <p className="panel-note">Safety {status.safety} · {status.message}</p>
       <p className={`validation-note validation-${validationLabel}`}>
-        MuJoCo replay {validationLabel}: {validationGuidance} {validation?.message ?? "Run MuJoCo replay before real-robot replay."} · {validationMetric}
+        <strong>MuJoCo replay {validationLabel}</strong> · {validationGuidance}
+        <br />
+        {validationMetric}
       </p>
       {status.lastOutput ? <p className="process-output">{status.lastOutput}</p> : null}
       {status.diagnostics?.length ? (
@@ -91,16 +99,17 @@ export function RealRobotReplayPanel({
   busy: boolean;
   onStart: (mode: RealCubeMode, robotIp: string, endEffectorMode: RealEndEffectorMode, overrideMujocoFailure: boolean) => void;
 }) {
-  const [mode, setMode] = useState<RealCubeMode>(status.realCubeMode ?? "right");
-  const [robotIp, setRobotIp] = useState(status.realRobotIp ?? "");
-  const [endEffectorMode, setEndEffectorMode] = useState<RealEndEffectorMode>(
-    status.realEndEffectorMode ?? "corenetic_gripper_ee"
-  );
+  const validation = status.mujocoValidation;
+  const validationMode = validation?.cubeMode ?? status.mujocoCubeMode;
+  const mode: RealCubeMode = validationMode === "left" ? "left" : "right";
+  const endEffectorMode: RealEndEffectorMode = "pika_gripper_ee";
+  const [robotIp, setRobotIp] = useState(status.realRobotIp || "192.168.1.206");
   const [monitorRequested, setMonitorRequested] = useState(status.state === "replaying");
   const [overridePromptOpen, setOverridePromptOpen] = useState(false);
   const [cameraStatus, setCameraStatus] = useState<RealSensePreviewStatus | null>(null);
   const [frameKey, setFrameKey] = useState(0);
-  const validation = status.mujocoValidation;
+  const [timeline, setTimeline] = useState<ReplayTimeline | null>(null);
+  const recordedVideoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
   const validationPassed =
     validation?.status === "passed" &&
     validation.isCurrentForSelection === true &&
@@ -117,8 +126,16 @@ export function RealRobotReplayPanel({
     (validation.cubeMode ?? status.mujocoCubeMode) === mode;
   const validationDecisionAvailable = validationPassed || validationFailedButReviewable;
   const ipValid = validIpv4(robotIp);
-  const active = status.state === "replaying" || status.state === "sim_replay" || status.state === "dry_run";
-  const disabled = busy || active || status.datasetKind === "exported" || !validationDecisionAvailable || !ipValid;
+  const active = status.state === "replaying" || status.state === "sim_replay";
+  const disabled =
+    busy || active || status.datasetKind === "exported" || !validationDecisionAvailable || !ipValid;
+  const datasetPath = status.datasetRoot || status.dataset;
+  const timelineCameraKeys = timeline?.cameraKeys ?? [];
+  const cameraMatches = (cameraStatus?.cameras ?? []).filter((camera): camera is RealSensePreviewCameraStatus =>
+    Boolean(camera.cameraKey && timelineCameraKeys.includes(camera.cameraKey))
+  );
+  const recordedVideoUrl = (cameraKey: string) => datasetPath ? api.videoUrl(datasetPath, cameraKey, status.episode) : "";
+  const shortCameraName = (cameraKey: string) => cameraKey.split(".").pop() ?? cameraKey;
 
   useEffect(() => {
     if (!monitorRequested && status.state !== "replaying") return;
@@ -137,87 +154,138 @@ export function RealRobotReplayPanel({
     };
   }, [monitorRequested, status.state]);
 
+  useEffect(() => {
+    if (!datasetPath || status.datasetKind === "exported") {
+      setTimeline(null);
+      return;
+    }
+    let mounted = true;
+    api.fetchReplayTimeline(datasetPath, status.episode).then((next) => {
+      if (mounted) setTimeline(next);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, [datasetPath, status.datasetKind, status.episode, status.revision]);
+
+  useEffect(() => {
+    Object.values(recordedVideoRefs.current).forEach((video) => {
+      if (!video) return;
+      if (status.state !== "replaying") {
+        video.pause();
+        return;
+      }
+      video.currentTime = 0;
+      void video.play().catch(() => {
+        // Browser autoplay policy can still block muted video in some environments; controls remain visible.
+      });
+    });
+  }, [cameraMatches.map((camera) => camera.cameraKey).join("|"), status.state]);
+
   const startConfirmed = (overrideMujocoFailure: boolean) => {
     setOverridePromptOpen(false);
     setMonitorRequested(true);
-    setCameraStatus({ available: null, running: true, error: "Connecting to the first available RealSense…" });
+    setCameraStatus({ available: null, running: true, error: "Connecting to RealSense…" });
     onStart(mode, robotIp.trim(), endEffectorMode, overrideMujocoFailure);
-  };
-
-  const run = () => {
-    setOverridePromptOpen(true);
   };
 
   return (
     <section className="panel real-robot-panel">
       <div className="panel-heading">
         <h2>Real Robot Replay</h2>
-        <span>single-cube opencv_kalibr replay · automatic RealSense monitor</span>
+        <span>FR3 · Pika gripper · recorded end-effector trajectory</span>
       </div>
       <div className="real-robot-layout">
         <div className="real-robot-settings">
-          <div className="mujoco-mode-picker" role="group" aria-label="Real robot cube trajectory">
-            {(["left", "right"] as RealCubeMode[]).map((candidate) => (
-              <button
-                key={candidate}
-                className={mode === candidate ? "active" : ""}
-                disabled={busy || active}
-                onClick={() => setMode(candidate)}
-                type="button"
-              >
-                {`${candidate[0].toUpperCase()}${candidate.slice(1)} cube`}
-              </button>
-            ))}
-          </div>
-          <div className="mujoco-mode-picker" role="group" aria-label="Real robot end-effector frame">
-            <button
-              className={endEffectorMode === "corenetic_gripper_ee" ? "active" : ""}
-              disabled={busy || active}
-              onClick={() => setEndEffectorMode("corenetic_gripper_ee")}
-              type="button"
-            >
-              Corenetic gripper EE
-            </button>
-            <button
-              className={endEffectorMode === "fr3_ee" ? "active" : ""}
-              disabled={busy || active}
-              onClick={() => setEndEffectorMode("fr3_ee")}
-              type="button"
-            >
-              Bare FR3 · fr3_ee
-            </button>
+          <div className="teleop-config-grid">
+            <div><span>Robot</span><strong>Franka Research 3</strong></div>
+            <div><span>End effector</span><strong>Pika gripper · pika_task_tcp</strong></div>
           </div>
           <label className="real-robot-ip-field">
-            <span>Robot IP for {mode} trajectory</span>
-            <input value={robotIp} onChange={(event) => setRobotIp(event.target.value)} placeholder="192.168.x.x" />
+            <span>Robot IP</span>
+            <input value={robotIp} onChange={(event) => setRobotIp(event.target.value)} placeholder="192.168.1.206" />
           </label>
-          <button className="danger real-robot-run" disabled={disabled} onClick={run} type="button">
+          <button className="danger real-robot-run" disabled={disabled} onClick={() => setOverridePromptOpen(true)} type="button">
             {status.state === "replaying" ? "Real-robot replay running…" : "Run real-robot replay"}
           </button>
           <p className="panel-note">
             {status.datasetKind === "exported"
               ? "Real robot replay is disabled for exported datasets."
               : !validationDecisionAvailable
-                ? `Run MuJoCo ${mode} to completion for this dataset and episode first.`
+                ? "Run MuJoCo validation to completion for this dataset and episode first. A run " +
+                  "that finishes and fails can still be overridden below, with its errors in front " +
+                  "of you; a validation that never ran leaves nothing to judge, so there is no " +
+                  "override for it."
                 : !ipValid
                   ? "Enter a valid robot IPv4 address."
                   : validationFailedButReviewable
                     ? "MuJoCo failed. You may click Run and make the final Yes/No decision in the warning window."
-                    : `The gateway preflights this IP, moves ${endEffectorMode} to frame 0, then streams the trajectory.`}
+                    : "The gateway preflights this FR3, moves pika_task_tcp to frame 0, then streams the trajectory."}
           </p>
         </div>
-        <div className="realsense-monitor">
+        <div className="realsense-monitor replay-camera-compare">
           <div className="realsense-monitor-heading">
-            <strong>RealSense live monitor</strong>
-            <span>{cameraStatus?.serial ? `S/N ${cameraStatus.serial}` : "first available camera"}</span>
+            <strong>Replay camera monitor</strong>
+            <span>{status.state === "replaying" ? "live vs recorded" : "starts with real replay"}</span>
           </div>
-          {cameraStatus?.available && cameraStatus.running ? (
-            <img src={api.realSenseSnapshotUrl(frameKey)} alt="RealSense live view during real robot replay" />
+          {cameraMatches.length ? (
+            <div className="replay-camera-compare-grid">
+              {cameraMatches.map((camera) => (
+                <div className="replay-camera-pair" key={camera.cameraKey}>
+                  <div className="replay-camera-pair-heading">
+                    <strong>{camera.cameraKey}</strong>
+                    <span>config {camera.configKey ?? shortCameraName(camera.cameraKey)} · S/N {camera.serial ?? "?"}</span>
+                  </div>
+                  <div className="replay-camera-pair-grid">
+                    <div className="replay-camera-card">
+                      <div className="replay-camera-card-heading">
+                        <strong>Live RealSense</strong>
+                        <span>{camera.running ? "live" : "waiting"}</span>
+                      </div>
+                      <div className="replay-camera-media">
+                        {camera.available && camera.running ? (
+                          <img src={api.realSenseSnapshotUrl(frameKey, camera.cameraKey)} alt={`Live RealSense ${camera.cameraKey} during real robot replay`} />
+                        ) : (
+                          <div className="realsense-monitor-empty">
+                            {camera.error || "This matched RealSense connects automatically when real-robot replay starts."}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="replay-camera-card">
+                      <div className="replay-camera-card-heading">
+                        <strong>Recorded reference</strong>
+                        <span>episode {status.episode}</span>
+                      </div>
+                      <div className="replay-camera-media">
+                        <video
+                          ref={(element) => {
+                            recordedVideoRefs.current[camera.cameraKey] = element;
+                          }}
+                          src={recordedVideoUrl(camera.cameraKey)}
+                          muted
+                          playsInline
+                          controls
+                          preload="metadata"
+                          aria-label={`Recorded ${shortCameraName(camera.cameraKey)} camera for episode ${status.episode}`}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
           ) : (
-            <div className="realsense-monitor-empty">
-              {cameraStatus?.error || "The camera connects automatically when real-robot replay starts."}
+            <div className="realsense-monitor-empty replay-camera-no-match">
+              {cameraStatus?.error ||
+                (status.datasetKind === "exported"
+                  ? "Exported datasets do not expose source camera video here."
+                  : "No connected RealSense camera matches this episode's recorded camera observations.")}
             </div>
           )}
+          <p className="replay-camera-note">
+            During real replay, every dataset camera observation that matches a configured RealSense key is shown as a live/recorded pair. Matching uses the dataset camera key and the configured RealSense serial, not camera discovery order.
+          </p>
         </div>
       </div>
       <div className="real-replay-log-block">
@@ -238,7 +306,7 @@ export function RealRobotReplayPanel({
               {validationFailedButReviewable ? "MuJoCo validation failed" : "Confirm real-robot replay"}
             </h3>
             <p>
-              Dataset <strong>{status.datasetRoot ?? status.dataset}</strong>, episode <strong>{status.episode}</strong>, {mode} cube, target <strong>{endEffectorMode}</strong> on <strong>{robotIp.trim()}</strong>.
+              Dataset <strong>{status.datasetRoot ?? status.dataset}</strong>, episode <strong>{status.episode}</strong>, target <strong>pika_task_tcp</strong> on <strong>{robotIp.trim()}</strong>.
             </p>
             <p>{validationFailedButReviewable ? "The recorded trajectory did not meet the simulation limits:" : "MuJoCo passed within these limits:"}</p>
             <ul>
@@ -327,6 +395,11 @@ export function RecordedDatasetList({
                   <StatusDot state={dataset.dataStatus === "loaded" ? "running" : "warning"} />
                   <strong>{dataset.name}</strong>
                   {dataset.datasetKind === "exported" ? <em>exported</em> : null}
+                  {/* A view replays its own derived action contract -- which is the point of
+                      replaying one -- so name the contract rather than just the dataset. */}
+                  {dataset.datasetKind === "training_view" ? (
+                    <em>training view{dataset.actionContract ? ` · ${dataset.actionContract}` : ""}</em>
+                  ) : null}
                   {dataset.isLatest ? <em>latest</em> : null}
                 </div>
                 <p>{dataset.path}</p>
@@ -824,7 +897,6 @@ export function EpisodeReplayPage({
   snapshot,
   busy,
   onPreflight,
-  onReplay,
   onMujocoReplay,
   onApproveMujoco,
   onRealReplay,
@@ -839,7 +911,6 @@ export function EpisodeReplayPage({
   snapshot: GuiSnapshot;
   busy: boolean;
   onPreflight: () => void;
-  onReplay: (realRobot: boolean) => void;
   onMujocoReplay: (mode: MujocoCubeMode) => void;
   onApproveMujoco: (mode: MujocoCubeMode) => void;
   onRealReplay: (mode: RealCubeMode, robotIp: string, endEffectorMode: RealEndEffectorMode, overrideMujocoFailure: boolean) => void;
@@ -852,12 +923,15 @@ export function EpisodeReplayPage({
   onSaveAnnotation: (annotation: EpisodeAnnotation) => void;
 }) {
   const [mujocoMode, setMujocoMode] = useState<MujocoCubeMode>(snapshot.replay.mujocoCubeMode ?? "left");
+  // The workstation replays the arm's own recorded EE stream; there are no AprilTag cubes to
+  // pick between, and the gateway ignores the cube mode on that profile entirely.
+  const cubeSelection = (snapshot.deployment?.profile ?? "thor") !== "workstation";
   const activePath = snapshot.replay.datasetRoot ?? snapshot.replay.dataset;
   const matchingProcessing =
     snapshot.processing.find((item) => item.path === activePath) ?? null;
   return (
     <div className="page-stack">
-      <PageHeader title="Episode Replay" subtitle="consume processed trajectories: timeline review, safety preflight, dry-run, and real-robot replay" />
+      <PageHeader title="Episode Replay" subtitle="consume processed trajectories: timeline review, safety preflight, MuJoCo validation, and real-robot replay" />
       <ReplayReadinessCard
         status={snapshot.replay}
         processing={matchingProcessing}
@@ -876,8 +950,8 @@ export function EpisodeReplayPage({
           status={snapshot.replay}
           busy={busy}
           onPreflight={onPreflight}
-          onReplay={onReplay}
           mujocoMode={mujocoMode}
+          cubeSelection={cubeSelection}
           onAbort={onAbort}
         />
       </div>
@@ -895,6 +969,7 @@ export function EpisodeReplayPage({
         replayStatus={snapshot.replay}
         busy={busy}
         mujocoRefreshKey={`${snapshot.replay.mujocoValidation?.updatedAt ?? ""}:${snapshot.replay.state}`}
+        cubeSelection={cubeSelection}
       />
       <RealRobotReplayPanel status={snapshot.replay} busy={busy} onStart={onRealReplay} />
       <EpisodeAnnotationPanel

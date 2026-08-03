@@ -19,6 +19,7 @@ from __future__ import annotations
 from functools import cached_property
 import logging
 import threading
+import time
 
 import numpy as np
 
@@ -86,6 +87,7 @@ class FrankaResearch3(Robot):
         self._state_snapshot_lock = threading.Lock()
         self._last_observation_joint_positions_rad: np.ndarray | None = None
         self._last_observation_ee_pose: np.ndarray | None = None
+        self._capture_timestamp_origin_s = time.perf_counter()
 
     @property
     def _joint_names(self) -> list[str]:
@@ -228,6 +230,20 @@ class FrankaResearch3(Robot):
     def is_connected(self) -> bool:
         return self._is_connected
 
+    @property
+    def capture_timestamp_feature_names(self) -> tuple[str, ...]:
+        return (
+            "fr3.arm.capture_timestamp_s",
+            f"{self.config.gripper_backend}_gripper.capture_timestamp_s",
+            *(f"camera.{name}.capture_timestamp_s" for name in self.cameras),
+        )
+
+    def reset_capture_timestamp_origin(self) -> None:
+        self._capture_timestamp_origin_s = time.perf_counter()
+
+    def _relative_capture_timestamp(self, timestamp_s: float) -> float:
+        return float(timestamp_s - self._capture_timestamp_origin_s)
+
     def _make_gripper_driver(self):
         if self.config.gripper_backend == "mock":
             return self.mock_gripper_driver_cls(initial_position=1.0)
@@ -283,6 +299,8 @@ class FrankaResearch3(Robot):
             "target_frame_name": self.config.target_frame_name,
             "joint_names": self.config.joint_names,
         }
+        if self.kinematics_driver_cls is not PlacoKinematicsDriver:
+            return self.kinematics_driver_cls(**kwargs)
         if self.config.ik_solver == "hirol_lm":
             return HirolLMKinematicsDriver(
                 **kwargs,
@@ -373,6 +391,7 @@ class FrankaResearch3(Robot):
         self._kinematics = kinematics
         self._otg = otg
         self._is_connected = True
+        self.reset_capture_timestamp_origin()
         if self._otg is not None:
             self._start_otg_loop(np.asarray(arm.get_joint_positions(), dtype=np.float64))
         try:
@@ -428,6 +447,45 @@ class FrankaResearch3(Robot):
         if self._arm is None:
             raise RuntimeError("Arm backend is not connected.")
         return np.asarray(self._arm.get_joint_positions(), dtype=np.float64)
+
+    def _read_joint_positions_with_timestamp(self) -> tuple[np.ndarray, float]:
+        """Joint positions and when they were read from the arm, not when we picked them up.
+
+        The two differ because the driver serves a cache refreshed by its own state reader. A
+        timestamp taken here would describe this process's scheduling rather than the arm's, and
+        the error is not recoverable later: it sits inside the arm-vs-camera offset and is
+        indistinguishable from camera latency.
+        """
+        if self._arm is None:
+            raise RuntimeError("Arm backend is not connected.")
+        read_with_timestamp = getattr(self._arm, "get_joint_positions_with_timestamp", None)
+        if callable(read_with_timestamp):
+            joint_positions, sampled_at_s = read_with_timestamp()
+            return np.asarray(joint_positions, dtype=np.float64), float(sampled_at_s)
+        # A backend that cannot say when it sampled: the read instant is the honest upper bound.
+        return np.asarray(self._arm.get_joint_positions(), dtype=np.float64), time.perf_counter()
+
+    def _read_gripper_position_with_timestamp(self) -> tuple[float, float]:
+        """Gripper position and when it was sampled, for the backends that can say.
+
+        Same failure as the arm, and worse where it applies: the Franka Hand driver polls at
+        10 Hz, so a pickup-time stamp can be optimistic by 100 ms. `das` knows its instant too --
+        the databus hands it over in a callback.
+
+        `pika` and `corenetic` take the branch below, where the read instant is a true upper
+        bound rather than a guess. `pika` reads straight through to the SDK's last parsed frame
+        and the SDK records no arrival time. `corenetic` samples do carry a timestamp, but it is
+        the BOX MCU's clock -- putting it in this column would mean splicing two time bases
+        together with no measured offset between them, which buys a plausible number and loses
+        the ability to tell the offset from a real lag.
+        """
+        if self._gripper is None:
+            raise RuntimeError("Gripper backend is not connected.")
+        read_with_timestamp = getattr(self._gripper, "get_position_with_timestamp", None)
+        if callable(read_with_timestamp):
+            gripper_pos, sampled_at_s = read_with_timestamp()
+            return float(gripper_pos), float(sampled_at_s)
+        return float(self._gripper.get_position()), time.perf_counter()
 
     def _get_release_hold_joint_target(self, current_joint_positions_rad: np.ndarray) -> np.ndarray:
         if self._prev_enabled and self._otg is not None:
@@ -490,11 +548,11 @@ class FrankaResearch3(Robot):
     @check_if_not_connected
     def get_observation(self, *, include_cameras: bool = True) -> RobotObservation:
         self._raise_if_otg_failed()
-        joint_positions_rad = self._read_joint_positions()
+        joint_positions_rad, arm_capture_timestamp_s = self._read_joint_positions_with_timestamp()
         ee_pose = self._compute_ee_pose(joint_positions_rad)
         self._cache_observation_state_snapshot(joint_positions_rad, ee_pose)
         ee_rotvec = Rotation.from_matrix(ee_pose[:3, :3]).as_rotvec()
-        gripper_pos = float(self._gripper.get_position())
+        gripper_pos, gripper_capture_timestamp_s = self._read_gripper_position_with_timestamp()
 
         observation: RobotObservation = {
             "ee.x": float(ee_pose[0, 3]),
@@ -504,6 +562,10 @@ class FrankaResearch3(Robot):
             "ee.wy": float(ee_rotvec[1]),
             "ee.wz": float(ee_rotvec[2]),
             "gripper.pos": gripper_pos,
+            "fr3.arm.capture_timestamp_s": self._relative_capture_timestamp(arm_capture_timestamp_s),
+            f"{self.config.gripper_backend}_gripper.capture_timestamp_s": self._relative_capture_timestamp(
+                gripper_capture_timestamp_s
+            ),
             **self._make_prev_command_observation(current_ee_pose=ee_pose, current_gripper_pos=gripper_pos),
         }
         for index, joint_position in enumerate(joint_positions_rad, start=1):
@@ -512,8 +574,59 @@ class FrankaResearch3(Robot):
         if callable(get_tactile_observation):
             observation.update(get_tactile_observation())
         if include_cameras:
+            latest_samples: dict[str, tuple[np.ndarray, float]] = {}
             for camera_name, camera in self.cameras.items():
-                observation[camera_name] = camera.read_latest()
+                read_latest_with_timestamp = getattr(camera, "read_latest_with_timestamp", None)
+                if callable(read_latest_with_timestamp):
+                    latest_samples[camera_name] = read_latest_with_timestamp(
+                        max_age_ms=self.config.camera_max_age_ms
+                    )
+                else:
+                    try:
+                        frame = camera.read_latest(max_age_ms=self.config.camera_max_age_ms)
+                    except TypeError as exc:
+                        if "max_age_ms" not in str(exc):
+                            raise
+                        frame = camera.read_latest()
+                    latest_samples[camera_name] = (
+                        frame,
+                        float(getattr(camera, "latest_timestamp", time.perf_counter())),
+                    )
+
+            if latest_samples:
+                # Anchor every camera on the oldest of their latest frames and take each
+                # camera's frame closest to that instant.
+                #
+                # Taking each camera's own newest frame instead is tempting -- it measures 8.5 ms
+                # behind the arm read rather than 25 ms -- but it was tried and it breaks
+                # recording. Nothing then bounds how far apart the cameras' newest frames are:
+                # each camera's background thread delivers independently, and one falling a whole
+                # period behind puts the pair 25.1 ms apart, past any guard worth having. It
+                # aborted an episode after 21 frames on hardware. Anchoring is what bounds the
+                # spread, and that bound is why the guard below can stay tight.
+                reference_timestamp_s = min(timestamp for _frame, timestamp in latest_samples.values())
+                selected_timestamps: list[float] = []
+                for camera_name, camera in self.cameras.items():
+                    read_closest = getattr(camera, "read_closest", None)
+                    if callable(read_closest):
+                        frame, timestamp_s = read_closest(
+                            reference_timestamp_s,
+                            max_age_ms=self.config.camera_max_age_ms,
+                        )
+                    else:
+                        frame, timestamp_s = latest_samples[camera_name]
+                    observation[camera_name] = frame
+                    observation[f"camera.{camera_name}.capture_timestamp_s"] = (
+                        self._relative_capture_timestamp(timestamp_s)
+                    )
+                    selected_timestamps.append(timestamp_s)
+
+                camera_skew_ms = (max(selected_timestamps) - min(selected_timestamps)) * 1e3
+                if camera_skew_ms > self.config.camera_max_skew_ms:
+                    raise RuntimeError(
+                        f"FR3 camera skew {camera_skew_ms:.1f} ms exceeds "
+                        f"camera_max_skew_ms={self.config.camera_max_skew_ms:.1f}."
+                    )
         return observation
 
     @check_if_not_connected
@@ -603,7 +716,12 @@ class FrankaResearch3(Robot):
         if hold_current_joints:
             target_joints_rad = np.asarray(target_joints_rad, dtype=np.float64).copy()
         else:
-            target_joints_rad = self._kinematics.inverse_kinematics(joint_positions_rad, desired_pose)
+            ik_kwargs: dict[str, float] = {}
+            if self.config.ik_orientation_weight is not None:
+                ik_kwargs["orientation_weight"] = float(self.config.ik_orientation_weight)
+            target_joints_rad = self._kinematics.inverse_kinematics(
+                joint_positions_rad, desired_pose, **ik_kwargs
+            )
         if self._otg is not None:
             with self._otg_target_lock:
                 self._otg_target_joints = np.asarray(target_joints_rad, dtype=np.float64).copy()

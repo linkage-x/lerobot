@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GuiSnapshot } from "../api";
-import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
+import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingBackend, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
 
 export function DeviceList({ devices, config }: { devices: DeviceStatus[]; config: ConfigSummary }) {
@@ -144,6 +144,39 @@ export function recordingControlAvailability(status: RecordingStatus) {
   };
 }
 
+const syncStatusLabels: Record<string, string> = {
+  unknown: "not measured yet",
+  pass: "aligned",
+  fail: "out of budget",
+  unavailable: "audit unavailable"
+};
+
+/** Per-episode capture-timestamp verdict, surfaced while the rig is still set up. */
+export function SyncAuditPanel({ status }: { status: RecordingStatus }) {
+  const syncStatus = status.syncStatus ?? "unknown";
+  if (syncStatus === "unknown" && !status.syncSummary) return null;
+  const dotState = syncStatus === "pass" ? "running" : syncStatus === "fail" ? "error" : "warning";
+  const warnings = status.syncWarnings ?? [];
+  return (
+    <div className={`sync-audit sync-audit-${syncStatus}`}>
+      <div className="sync-audit-heading">
+        <StatusDot state={dotState} />
+        <strong>Timestamp sync</strong>
+        <span>{syncStatusLabels[syncStatus] ?? syncStatus}</span>
+      </div>
+      {status.syncSummary ? <code className="sync-audit-summary">{status.syncSummary}</code> : null}
+      {warnings.length > 0 ? (
+        <ul className="sync-audit-warnings">
+          {warnings.map((warning, index) => (
+            <li key={`${index}-${warning}`}>{warning}</li>
+          ))}
+        </ul>
+      ) : null}
+      {status.syncReportPath ? <small>report: {status.syncReportPath}</small> : null}
+    </div>
+  );
+}
+
 export function RecordingPanel({
   status,
   config,
@@ -151,7 +184,8 @@ export function RecordingPanel({
   onConnect,
   onStart,
   onStop,
-  logLines
+  logLines,
+  backendPicker
 }: {
   status: RecordingStatus;
   config: ConfigSummary;
@@ -160,12 +194,13 @@ export function RecordingPanel({
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
   logLines?: string[];
+  backendPicker?: React.ReactNode;
 }) {
   const progress = Math.round((status.frameIndex / Math.max(status.targetFrames, 1)) * 100);
   const { isConnected, canStartEpisode, canResolveEpisode, canExit } =
     recordingControlAvailability(status);
   const isGmsl = config.rigType === "gmsl2";
-  const panelTitle = isGmsl ? "GMSL2 Record" : "Handheld Record";
+  const panelTitle = backendPicker ? "FR3 Record" : isGmsl ? "GMSL2 Record" : "Handheld Record";
 
   return (
     <section className="panel">
@@ -176,6 +211,7 @@ export function RecordingPanel({
           {stateLabel(status.state)}
         </span>
       </div>
+      {backendPicker}
       {isGmsl && <HardwareSyncBadge config={config} />}
       <div className="config-grid">
         <Metric label="Config" value={config.configPath} />
@@ -203,6 +239,7 @@ export function RecordingPanel({
         <Metric label="PID" value={status.pid ?? "none"} />
       </div>
       <p className="panel-note">{status.message}</p>
+      <SyncAuditPanel status={status} />
       {logLines && logLines.length > 0
         ? <RecorderLogStream lines={logLines} />
         : status.lastOutput
@@ -227,7 +264,7 @@ export function LiveRecordPage({
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
-  onConnect: () => void;
+  onConnect: (backend?: RecordingBackend) => void;
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
   onOpenInReplay: () => void;
@@ -236,6 +273,12 @@ export function LiveRecordPage({
   onClearActiveTask: () => void;
 }) {
   const showSavedBanner = snapshot.recording.savedEpisodes > 0;
+  // Only the FR3 workstation has two robots behind one recorder; Thor's rig is singular and
+  // must keep sending Connect with no backend at all.
+  const supportsBackendChoice = snapshot.deployment?.profile === "workstation";
+  const [selectedBackend, setSelectedBackend] = useState<RecordingBackend>(
+    snapshot.recording.backend ?? "real"
+  );
   const activeTask = snapshot.activeTaskId
     ? snapshot.tasks.find((t) => t.id === snapshot.activeTaskId) ?? null
     : null;
@@ -266,7 +309,7 @@ export function LiveRecordPage({
       const key = event.key.toLowerCase();
       if (key === "c" && controls.canConnect) {
         event.preventDefault();
-        onConnect();
+        onConnect(supportsBackendChoice ? selectedBackend : undefined);
       } else if (key === "e" && controls.canStartEpisode) {
         event.preventDefault();
         onStart();
@@ -283,15 +326,46 @@ export function LiveRecordPage({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [busy, snapshot.recording, onConnect, onStart, onStop]);
+  }, [busy, snapshot.recording, onConnect, onStart, onStop, supportsBackendChoice, selectedBackend]);
+
+  // Once a session is live the backend is fixed by the running recorder process; showing the
+  // operator's stale pick instead of the actual one would misreport what is being recorded.
+  useEffect(() => {
+    if (recorderConnected && snapshot.recording.backend) {
+      setSelectedBackend(snapshot.recording.backend);
+    }
+  }, [recorderConnected, snapshot.recording.backend]);
+
+  const backendPicker = supportsBackendChoice ? (
+    <div className="mujoco-mode-picker" role="group" aria-label="Recording backend">
+      <button
+        className={selectedBackend === "real" ? "active" : ""}
+        disabled={busy || recorderConnected}
+        onClick={() => setSelectedBackend("real")}
+        type="button"
+      >
+        Real FR3
+      </button>
+      <button
+        className={selectedBackend === "sim" ? "active" : ""}
+        disabled={busy || recorderConnected}
+        onClick={() => setSelectedBackend("sim")}
+        type="button"
+      >
+        MuJoCo Sim
+      </button>
+    </div>
+  ) : undefined;
 
   return (
     <div className="page-stack">
       <PageHeader
         title="Live Record"
-        subtitle={snapshot.configSummary.rigType === "gmsl2"
-          ? `GMSL2 ${snapshot.devices.filter((d) => d.kind === "camera").length}-camera capture with${snapshot.configSummary.hardwareSync?.enabled ? "" : "out"} hardware sync`
-          : "capture raw multi-camera handheld data; post-processing lives on the Processing page"}
+        subtitle={supportsBackendChoice
+          ? `FR3 SpaceMouse capture on the ${selectedBackend === "sim" ? "MuJoCo twin" : "real arm"}; both write the same dataset schema`
+          : snapshot.configSummary.rigType === "gmsl2"
+            ? `GMSL2 ${snapshot.devices.filter((d) => d.kind === "camera").length}-camera capture with${snapshot.configSummary.hardwareSync?.enabled ? "" : "out"} hardware sync`
+            : "capture raw multi-camera handheld data; post-processing lives on the Processing page"}
       />
       {activeTask && (
         <section className="panel task-binding-banner">
@@ -306,7 +380,16 @@ export function LiveRecordPage({
         </section>
       )}
       <div className="split-layout">
-        <RecordingPanel status={snapshot.recording} config={snapshot.configSummary} busy={busy} onConnect={onConnect} onStart={onStart} onStop={onStop} logLines={logLines} />
+        <RecordingPanel
+          status={snapshot.recording}
+          config={snapshot.configSummary}
+          busy={busy}
+          onConnect={() => onConnect(supportsBackendChoice ? selectedBackend : undefined)}
+          onStart={onStart}
+          onStop={onStop}
+          logLines={logLines}
+          backendPicker={backendPicker}
+        />
         <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />
       </div>
       {showSavedBanner ? (

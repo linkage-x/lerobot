@@ -127,14 +127,21 @@ class DummyKinematicsDriver:
         self.forward_pose = np.eye(4, dtype=np.float64)
         self.forward_pose[:3, 3] = np.array([0.4, 0.1, 0.3], dtype=np.float64)
         self.inverse_calls: list[tuple[np.ndarray, np.ndarray]] = []
+        self.inverse_kwargs: list[dict[str, float]] = []
         self.inverse_solution = np.array([0.5, 0.4, 0.3, -0.2, 0.1, 0.0, -0.1], dtype=np.float64)
 
     def forward_kinematics(self, joint_positions_rad: np.ndarray) -> np.ndarray:
         del joint_positions_rad
         return self.forward_pose.copy()
 
-    def inverse_kinematics(self, current_joint_positions_rad: np.ndarray, desired_pose: np.ndarray) -> np.ndarray:
+    def inverse_kinematics(
+        self,
+        current_joint_positions_rad: np.ndarray,
+        desired_pose: np.ndarray,
+        **kwargs,
+    ) -> np.ndarray:
         self.inverse_calls.append((current_joint_positions_rad.copy(), desired_pose.copy()))
+        self.inverse_kwargs.append(dict(kwargs))
         return self.inverse_solution.copy()
 
 
@@ -251,6 +258,111 @@ def test_pandapy_arm_driver_connect_seeds_controller_with_current_joints(monkeyp
     assert np.allclose(controller.set_control_calls[0], DummyPanda.instances[-1].state.q)
     assert DummyPanda.instances[-1].started_controllers == [controller]
 
+    # This driver polls at the 200 Hz default, so its reader thread outlives the test unless it
+    # is stopped -- and a stray thread inside `backends` corrupts any later test that patches a
+    # module-level global there.
+    driver.disconnect()
+
+
+@pytest.mark.parametrize(
+    ("mode_name", "expected_message"),
+    [
+        ("kUserStopped", "user-stop"),
+        ("kReflex", "reflex"),
+        ("kGuiding", "guiding"),
+    ],
+)
+def test_pandapy_arm_driver_connect_refuses_modes_that_cannot_start_a_controller(
+    monkeypatch, mode_name, expected_message
+):
+    """`start_controller()` takes no timeout and waits on a loop these modes never start.
+
+    Blocking there is silent and uninterruptible -- the recorder emits nothing and stops reading
+    its own stdin -- so the mode has to be refused before the call, with the remedy named.
+    """
+
+    class DummyJointPositionController:
+        def set_control(self, joint_positions):
+            del joint_positions
+
+    class DummyPanda:
+        instances: list["DummyPanda"] = []
+
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.state = types.SimpleNamespace(
+                q=np.zeros(7, dtype=np.float64),
+                robot_mode=types.SimpleNamespace(name=mode_name),
+            )
+            self.started_controllers = []
+            type(self).instances.append(self)
+
+        def start_controller(self, controller):
+            self.started_controllers.append(controller)
+
+        def stop_controller(self):
+            return None
+
+        def get_state(self):
+            return self.state
+
+    monkeypatch.setitem(
+        sys.modules,
+        "panda_py",
+        types.SimpleNamespace(
+            Panda=DummyPanda,
+            controllers=types.SimpleNamespace(JointPosition=DummyJointPositionController),
+        ),
+    )
+
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    with pytest.raises(RuntimeError, match=expected_message):
+        driver.connect()
+    assert DummyPanda.instances[-1].started_controllers == []
+
+
+def test_pandapy_arm_driver_connect_accepts_a_controllable_mode(monkeypatch):
+    """A reported mode that *can* take control must not be turned into a refusal."""
+
+    class DummyJointPositionController:
+        def set_control(self, joint_positions):
+            del joint_positions
+
+    class DummyPanda:
+        instances: list["DummyPanda"] = []
+
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.state = types.SimpleNamespace(
+                q=np.zeros(7, dtype=np.float64),
+                robot_mode=types.SimpleNamespace(name="kIdle"),
+            )
+            self.started_controllers = []
+            type(self).instances.append(self)
+
+        def start_controller(self, controller):
+            self.started_controllers.append(controller)
+
+        def stop_controller(self):
+            return None
+
+        def get_state(self):
+            return self.state
+
+    monkeypatch.setitem(
+        sys.modules,
+        "panda_py",
+        types.SimpleNamespace(
+            Panda=DummyPanda,
+            controllers=types.SimpleNamespace(JointPosition=DummyJointPositionController),
+        ),
+    )
+
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+
+    assert DummyPanda.instances[-1].started_controllers == [driver._controller]
+
 
 def test_pandapy_arm_driver_get_joint_positions_uses_cached_state(monkeypatch):
     class DummyJointPositionController:
@@ -340,6 +452,128 @@ def test_pika_gripper_hardware_driver_deduplicates_and_rate_limits(monkeypatch):
     driver.set_position(0.4)
 
     assert FakeSDKGripper.instances[-1].set_gripper_distance_calls == [20.0, 40.0]
+
+
+def _make_fake_pika_sdk(latest_data: dict, voltage: float = 0.0):
+    """Fake Gripper whose connect()/enable() succeed like the real SDK's always do."""
+
+    class FakeSDKGripper:
+        instances: list["FakeSDKGripper"] = []
+
+        def __init__(self, port):
+            self.port = port
+            self.serial_comm = types.SimpleNamespace(latest_data=dict(latest_data))
+            self.motor_status = {"Voltage": voltage}
+            self.disconnected = False
+            type(self).instances.append(self)
+
+        def connect(self):
+            return True
+
+        def enable(self):
+            return True
+
+        def disable(self):
+            return True
+
+        def disconnect(self):
+            self.disconnected = True
+
+        def get_gripper_distance(self):
+            return 0.0
+
+        def set_gripper_distance(self, width_mm):
+            del width_mm
+
+    return FakeSDKGripper
+
+
+def test_pika_gripper_connect_rejects_a_port_with_no_gripper_telemetry(monkeypatch):
+    # Gripper.connect() only opens the serial port and enable() only writes bytes, so
+    # both succeed against any serial device. Without a parsed frame the readback stays
+    # at the SDK's initial 0.0 and commands are silently dropped, so connect must fail.
+    fake_cls = _make_fake_pika_sdk(latest_data={})
+    monkeypatch.setitem(sys.modules, "pika.gripper", types.SimpleNamespace(Gripper=fake_cls))
+
+    driver = PikaGripperHardwareDriver(
+        serial_port="/dev/ttyUSB80",
+        enable_settle_s=0.0,
+        telemetry_timeout_s=0.1,
+    )
+
+    with pytest.raises(ConnectionError, match="no Pika gripper telemetry"):
+        driver.connect()
+    assert fake_cls.instances[-1].disconnected is True
+
+
+def test_pika_gripper_connect_accepts_a_port_streaming_motor_frames(monkeypatch):
+    fake_cls = _make_fake_pika_sdk(latest_data={"motor": {"Position": 1.2}})
+    monkeypatch.setitem(sys.modules, "pika.gripper", types.SimpleNamespace(Gripper=fake_cls))
+
+    driver = PikaGripperHardwareDriver(
+        serial_port="/dev/ttyUSB80",
+        enable_settle_s=0.0,
+        telemetry_timeout_s=0.1,
+    )
+    driver.connect()
+
+    assert driver.has_telemetry() is True
+    driver.disconnect()
+
+
+def test_pika_gripper_connect_accepts_bus_voltage_as_proof_of_life(monkeypatch):
+    # Some frames carry motorstatus without motor; a non-zero bus voltage still proves
+    # the link is really talking to a powered gripper.
+    fake_cls = _make_fake_pika_sdk(latest_data={"motorstatus": {}}, voltage=24.0)
+    monkeypatch.setitem(sys.modules, "pika.gripper", types.SimpleNamespace(Gripper=fake_cls))
+
+    driver = PikaGripperHardwareDriver(
+        serial_port="/dev/ttyUSB80",
+        enable_settle_s=0.0,
+        telemetry_timeout_s=0.1,
+    )
+    driver.connect()
+
+    assert driver.has_telemetry() is True
+    driver.disconnect()
+
+
+def test_pika_gripper_skips_the_telemetry_gate_when_it_cannot_introspect(monkeypatch):
+    # A stand-in SDK object exposes neither serial_comm nor motor_status; the gate is a
+    # diagnostic and must fail open rather than reject a working gripper.
+    class BareSDKGripper:
+        def __init__(self, port):
+            self.port = port
+
+        def connect(self):
+            return True
+
+        def enable(self):
+            return True
+
+        def disable(self):
+            return True
+
+        def disconnect(self):
+            pass
+
+        def get_gripper_distance(self):
+            return 0.0
+
+        def set_gripper_distance(self, width_mm):
+            del width_mm
+
+    monkeypatch.setitem(sys.modules, "pika.gripper", types.SimpleNamespace(Gripper=BareSDKGripper))
+
+    driver = PikaGripperHardwareDriver(
+        serial_port="/dev/ttyUSB80",
+        enable_settle_s=0.0,
+        telemetry_timeout_s=0.1,
+    )
+    driver.connect()
+
+    assert driver.has_telemetry() is True
+    driver.disconnect()
 
 
 def test_pika_gripper_hardware_driver_skips_small_target_changes(monkeypatch):
@@ -1124,6 +1358,113 @@ def test_get_observation_skips_cameras_when_disabled(robot):
     assert camera.read_latest_calls == 1
 
 
+def test_get_observation_soft_syncs_cameras_from_frame_history(robot):
+    class TimestampedCamera:
+        def __init__(self, history):
+            self.history = history
+
+        def read_latest_with_timestamp(self, max_age_ms):
+            del max_age_ms
+            return self.history[-1]
+
+        def read_closest(self, timestamp_s, max_age_ms):
+            del max_age_ms
+            return min(self.history, key=lambda sample: abs(sample[1] - timestamp_s))
+
+    robot.connect()
+    robot.reset_capture_timestamp_origin()
+    origin = robot._capture_timestamp_origin_s
+    robot.cameras = {
+        "ee": TimestampedCamera(
+            [
+                (np.full((2, 2, 3), 66, dtype=np.uint8), origin + 0.066),
+                (np.full((2, 2, 3), 100, dtype=np.uint8), origin + 0.100),
+            ]
+        ),
+        "wrist": TimestampedCamera(
+            [(np.full((2, 2, 3), 72, dtype=np.uint8), origin + 0.072)]
+        ),
+    }
+
+    observation = robot.get_observation()
+
+    assert int(observation["ee"][0, 0, 0]) == 66
+    assert int(observation["wrist"][0, 0, 0]) == 72
+    assert observation["camera.ee.capture_timestamp_s"] == pytest.approx(0.066)
+    assert observation["camera.wrist.capture_timestamp_s"] == pytest.approx(0.072)
+
+
+def test_anchoring_bounds_the_spread_when_one_camera_delivers_late(robot):
+    """The property that makes the skew guard satisfiable at all.
+
+    Serving each camera its own newest frame was tried on hardware and aborted an episode after
+    21 frames with 25.1 ms of skew: nothing bounds how far apart two cameras' newest frames are
+    when their background threads deliver independently and one falls a period behind. Anchoring
+    on the oldest of those frames converts that unbounded gap into a bounded one -- here 18 ms of
+    divergence between the newest frames becomes 2 ms of recorded skew.
+    """
+
+    class TimestampedCamera:
+        def __init__(self, history):
+            self.history = history
+
+        def read_latest_with_timestamp(self, max_age_ms):
+            del max_age_ms
+            return self.history[-1]
+
+        def read_closest(self, timestamp_s, max_age_ms):
+            del max_age_ms
+            return min(self.history, key=lambda sample: abs(sample[1] - timestamp_s))
+
+    robot.connect()
+    robot.reset_capture_timestamp_origin()
+    origin = robot._capture_timestamp_origin_s
+    robot.cameras = {
+        # `ee` is a full period ahead; `wrist` has nothing newer than 0.098.
+        "ee": TimestampedCamera(
+            [
+                (np.full((2, 2, 3), 100, dtype=np.uint8), origin + 0.100),
+                (np.full((2, 2, 3), 116, dtype=np.uint8), origin + 0.116),
+            ]
+        ),
+        "wrist": TimestampedCamera([(np.full((2, 2, 3), 98, dtype=np.uint8), origin + 0.098)]),
+    }
+
+    observation = robot.get_observation()
+
+    # Taking the newest of each would have recorded 0.116 against 0.098 -- 18 ms apart, and past
+    # the guard. Anchoring picks ee's 0.100 instead.
+    assert observation["camera.ee.capture_timestamp_s"] == pytest.approx(0.100)
+    assert observation["camera.wrist.capture_timestamp_s"] == pytest.approx(0.098)
+    assert int(observation["ee"][0, 0, 0]) == 100
+
+
+def test_get_observation_rejects_camera_skew_above_threshold(robot):
+    """The guard aborts the whole episode, so it must fire before bad frames reach the dataset."""
+
+    class TimestampedCamera:
+        def __init__(self, timestamp_s):
+            self.timestamp_s = timestamp_s
+
+        def read_latest_with_timestamp(self, max_age_ms):
+            del max_age_ms
+            return np.zeros((2, 2, 3), dtype=np.uint8), self.timestamp_s
+
+        def read_closest(self, timestamp_s, max_age_ms):
+            del timestamp_s, max_age_ms
+            return np.zeros((2, 2, 3), dtype=np.uint8), self.timestamp_s
+
+    robot.connect()
+    origin = robot._capture_timestamp_origin_s
+    robot.cameras = {
+        "ee": TimestampedCamera(origin + 0.100),
+        "wrist": TimestampedCamera(origin + 0.125),
+    }
+
+    with pytest.raises(RuntimeError, match="camera skew 25.0 ms"):
+        robot.get_observation()
+
+
 def test_get_observation_uses_kinematics_target_frame_even_if_arm_reports_pose(monkeypatch):
     monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", ReportingArmDriver)
     monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
@@ -1313,11 +1654,51 @@ def test_send_action_accepts_absolute_ee_targets(robot):
 
     _, desired_pose = robot._kinematics.inverse_calls[-1]
     assert np.allclose(desired_pose[:3, 3], np.array([0.6, 0.3, 0.5]))
+    assert robot._kinematics.inverse_kwargs[-1] == {}
     assert returned["ee.x"] == pytest.approx(0.6)
     assert returned["ee.y"] == pytest.approx(0.3)
     assert returned["ee.z"] == pytest.approx(0.5)
     assert returned["gripper.pos"] == pytest.approx(1.0)
     assert robot._gripper.set_position_calls[-1] == pytest.approx(1.0)
+
+
+def test_send_action_passes_configured_ik_orientation_weight_for_absolute_ee(monkeypatch):
+    DummyArmDriver.instances = []
+    DummyGripperDriver.instances = []
+    DummyOTGDriver.instances = []
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            gripper_backend="mock",
+            urdf_path="/tmp/fr3.urdf",
+            ik_orientation_weight=0.012,
+            use_otg=False,
+        )
+    )
+
+    try:
+        robot.connect()
+        robot.send_action(
+            {
+                "ee.x": 0.7,
+                "ee.y": 0.5,
+                "ee.z": 0.8,
+                "ee.wx": 0.0,
+                "ee.wy": 0.0,
+                "ee.wz": 0.0,
+                "gripper.pos": 1.0,
+            }
+        )
+
+        assert robot._kinematics.inverse_kwargs[-1]["orientation_weight"] == pytest.approx(0.012)
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
 
 
 def test_send_action_disabled_stops_at_current_pose_after_release(robot):
@@ -1951,3 +2332,216 @@ def test_connect_cleans_up_partial_backends(monkeypatch):
     assert robot._gripper is None
     assert DummyArmDriver.instances[-1].connected is False
     assert DummyGripperDriver.instances[-1].connected is False
+
+
+def test_arm_timestamp_marks_when_the_state_was_read_not_when_we_picked_it_up(monkeypatch):
+    """Two observations served from one cached sample must carry that sample's instant.
+
+    The driver serves a cache refreshed by its own state reader at state_poll_frequency_hz.
+    Stamping `perf_counter()` at pickup instead credits the reading with freshness it does not
+    have -- up to one poll period, varying frame to frame -- and that error is unrecoverable
+    afterwards because it lands inside the arm-vs-camera offset and looks like camera latency.
+    """
+
+    class DummyJointPositionController:
+        def set_control(self, joint_positions):
+            del joint_positions
+
+    class DummyPanda:
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.state = types.SimpleNamespace(
+                q=np.array([0.1, 0.2, 0.3, -1.0, 0.5, 1.2, -0.7], dtype=np.float64),
+                robot_mode=types.SimpleNamespace(name="kIdle"),
+            )
+
+        def start_controller(self, controller):
+            del controller
+
+        def stop_controller(self):
+            return None
+
+        def get_state(self):
+            return self.state
+
+    monkeypatch.setitem(
+        sys.modules,
+        "panda_py",
+        types.SimpleNamespace(
+            Panda=DummyPanda,
+            controllers=types.SimpleNamespace(JointPosition=DummyJointPositionController),
+        ),
+    )
+
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+
+    _, first = driver.get_joint_positions_with_timestamp()
+    time.sleep(0.01)
+    _, second = driver.get_joint_positions_with_timestamp()
+
+    # Same cached sample -> same instant. A pickup-time stamp would differ by ~10 ms here.
+    assert first == second
+    # And it is the moment the state arrived, so it precedes any later read.
+    assert first <= time.perf_counter()
+
+    driver.disconnect()
+
+
+def test_arm_capture_timestamp_comes_from_the_driver_when_it_reports_one(robot):
+    sampled_at_s = time.perf_counter() - 0.004
+
+    class SamplingArmDriver(DummyArmDriver):
+        def get_joint_positions_with_timestamp(self):
+            return self.joint_positions, sampled_at_s
+
+    robot._arm = SamplingArmDriver()
+    robot.connect()
+    robot._arm = SamplingArmDriver()
+    robot.reset_capture_timestamp_origin()
+
+    observation = robot.get_observation(include_cameras=False)
+
+    expected = sampled_at_s - robot._capture_timestamp_origin_s
+    assert observation["fr3.arm.capture_timestamp_s"] == pytest.approx(expected, abs=1e-9)
+
+
+def test_arm_capture_timestamp_falls_back_for_a_backend_without_sampling_instants(robot):
+    """Older backends keep working; the read instant is the honest upper bound."""
+    robot.connect()
+    assert not hasattr(robot._arm, "get_joint_positions_with_timestamp")
+    robot.reset_capture_timestamp_origin()
+
+    before = time.perf_counter() - robot._capture_timestamp_origin_s
+    observation = robot.get_observation(include_cameras=False)
+    after = time.perf_counter() - robot._capture_timestamp_origin_s
+
+    assert before <= observation["fr3.arm.capture_timestamp_s"] <= after
+
+
+def test_franka_hand_gripper_timestamp_marks_when_the_hand_was_read(monkeypatch):
+    """The same failure as the arm, and twenty times larger: this driver polls at 10 Hz."""
+
+    class FakeFrankaHandState:
+        def __init__(self, width=0.04, max_width=0.08):
+            self.width = width
+            self.max_width = max_width
+
+    class FakeFrankaHand:
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            self.state = FakeFrankaHandState()
+
+        def homing(self):
+            return True
+
+        def read_once(self):
+            return self.state
+
+        def stop(self):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "panda_py",
+        types.SimpleNamespace(libfranka=types.SimpleNamespace(Gripper=FakeFrankaHand)),
+    )
+
+    driver = FrankaHandGripperHardwareDriver(
+        robot_ip="192.168.1.206",
+        state_poll_frequency_hz=0.0,
+    )
+    driver.connect()
+
+    position, first = driver.get_position_with_timestamp()
+    time.sleep(0.01)
+    _, second = driver.get_position_with_timestamp()
+
+    assert position == pytest.approx(0.5)
+    # One cached read behind both calls -> one instant. Stamping at pickup would report the
+    # second reading as 10 ms fresher than the first while nothing new was read.
+    assert first == second
+    assert first <= time.perf_counter()
+
+    driver.disconnect()
+
+
+def test_das_gripper_timestamp_comes_from_the_encoder_callback(monkeypatch):
+    """The databus pushes updates on its own thread, so arrival is the only knowable instant."""
+
+    class FakeDataBus:
+        instances: list["FakeDataBus"] = []
+
+        def __init__(self, tty_port, baudrate, encoder_freq, encoder_callback, tactile_freq=None, tactile_callback=None):
+            del tty_port, baudrate, encoder_freq, tactile_freq, tactile_callback
+            self.encoder_callback = encoder_callback
+            type(self).instances.append(self)
+            self.encoder_callback(struct.pack(">f", 0.0206))
+
+        def set_target_distance(self, distance_m):
+            del distance_m
+
+        def stop(self):
+            return None
+
+    fake_module = types.ModuleType("gen_controller_sdk_python")
+    fake_module.DataBus = FakeDataBus
+    monkeypatch.setitem(sys.modules, "gen_controller_sdk_python", fake_module)
+
+    driver = fr3_backends.DasGripperHardwareDriver(
+        serial_port="/dev/ttyUSB0",
+        baudrate=921600,
+        update_frequency_hz=50.0,
+        min_distance_m=0.0,
+        max_distance_m=0.103,
+        initial_position=0.2,
+    )
+    driver.connect()
+    connect_returned_at_s = time.perf_counter()
+
+    time.sleep(0.01)
+    position, first = driver.get_position_with_timestamp()
+
+    assert position == pytest.approx(0.2, abs=1e-3)
+    # The update landed during connect(), so its instant is behind us -- not the read we just did.
+    assert first <= connect_returned_at_s
+
+    FakeDataBus.instances[-1].encoder_callback(struct.pack(">f", 0.0412))
+    moved_position, second = driver.get_position_with_timestamp()
+
+    assert moved_position == pytest.approx(0.4, abs=1e-3)
+    assert second > first
+
+    driver.disconnect()
+
+
+def test_gripper_capture_timestamp_comes_from_the_driver_when_it_reports_one(robot):
+    sampled_at_s = time.perf_counter() - 0.05
+
+    class SamplingGripperDriver(DummyGripperDriver):
+        def get_position_with_timestamp(self):
+            return self.position, sampled_at_s
+
+    robot.connect()
+    sampling_gripper = SamplingGripperDriver()
+    robot._gripper = sampling_gripper
+    robot.reset_capture_timestamp_origin()
+
+    observation = robot.get_observation(include_cameras=False)
+
+    expected = sampled_at_s - robot._capture_timestamp_origin_s
+    assert observation["pika_gripper.capture_timestamp_s"] == pytest.approx(expected, abs=1e-9)
+    assert observation["gripper.pos"] == pytest.approx(sampling_gripper.position)
+
+
+def test_gripper_capture_timestamp_falls_back_for_a_backend_without_sampling_instants(robot):
+    """`pika` and `corenetic` read on demand, so the read instant is a true upper bound."""
+    robot.connect()
+    assert not hasattr(robot._gripper, "get_position_with_timestamp")
+    robot.reset_capture_timestamp_origin()
+
+    before = time.perf_counter() - robot._capture_timestamp_origin_s
+    observation = robot.get_observation(include_cameras=False)
+    after = time.perf_counter() - robot._capture_timestamp_origin_s
+
+    assert before <= observation["pika_gripper.capture_timestamp_s"] <= after
