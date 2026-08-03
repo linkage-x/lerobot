@@ -1229,6 +1229,117 @@ def test_exported_v3_dataset_is_replay_selectable_but_blocks_real_robot(tmp_path
         gateway._require_mujoco_validation(state)
 
 
+def test_replay_realsense_preview_paths_keep_full_camera_key(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "fr3.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+
+    image_path, status_path = gateway._realsense_preview_paths(state, "observation.images.ee")
+
+    assert image_path.name.endswith("_observation_images_ee.jpg")
+    assert status_path.name.endswith("_observation_images_ee.json")
+
+
+def test_replay_realsense_matches_dataset_camera_keys_to_configured_serials(tmp_path):
+    dataset_root = tmp_path / "outputs" / "datasets" / "fr3_spacemouse"
+    (dataset_root / "meta").mkdir(parents=True)
+    (dataset_root / "meta" / "info.json").write_text(
+        json.dumps(
+            {
+                "features": {
+                    "observation.images.ee": {"dtype": "video"},
+                    "observation.images.side": {"dtype": "video"},
+                    "observation.images.unconfigured": {"dtype": "video"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "fr3.yaml",
+        config={
+            "robot": {
+                "cameras": {
+                    "ee": {
+                        "type": "IntelRealSense",
+                        "serial_number_or_name": "RS_EE",
+                        "width": 640,
+                        "height": 480,
+                        "fps": 30,
+                    },
+                    "side": {
+                        "type": "IntelRealSense",
+                        "serial_number_or_name": "RS_SIDE",
+                        "width": 848,
+                        "height": 480,
+                        "fps": 6,
+                    },
+                    "other": {
+                        "type": "OpenCV",
+                        "serial_number_or_name": "NOT_RS",
+                    },
+                }
+            }
+        },
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(dataset=str(dataset_root), datasetRoot=str(dataset_root)),
+        selected_replay_root=dataset_root,
+        profile="workstation",
+    )
+
+    matches = gateway._replay_realsense_camera_matches(state, dataset_root)
+
+    assert [(match["cameraKey"], match["configKey"], match["serial"]) for match in matches] == [
+        ("observation.images.ee", "ee", "RS_EE"),
+        ("observation.images.side", "side", "RS_SIDE"),
+    ]
+    assert matches[0]["fps"] == 15
+    assert matches[1]["fps"] == 6
+
+
+def test_replay_realsense_status_reports_all_matched_dataset_cameras(tmp_path):
+    dataset_root = tmp_path / "outputs" / "datasets" / "fr3_spacemouse"
+    (dataset_root / "meta").mkdir(parents=True)
+    (dataset_root / "meta" / "info.json").write_text(
+        json.dumps({"features": {"observation.images.ee": {"dtype": "video"}}}),
+        encoding="utf-8",
+    )
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "fr3.yaml",
+        config={
+            "robot": {
+                "cameras": {
+                    "ee": {"type": "IntelRealSense", "serial_number_or_name": "RS_EE"},
+                }
+            }
+        },
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(dataset=str(dataset_root), datasetRoot=str(dataset_root)),
+        selected_replay_root=dataset_root,
+        profile="workstation",
+    )
+
+    status = gateway._realsense_preview_status(state)
+
+    assert status["running"] is False
+    assert status["cameras"] == [
+        {
+            "available": None,
+            "running": False,
+            "error": "Preview starts with real-robot replay",
+            "cameraKey": "observation.images.ee",
+            "configKey": "ee",
+            "serial": "RS_EE",
+        }
+    ]
+
+
 def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_replay(tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
@@ -1589,6 +1700,62 @@ def test_real_preflight_failure_is_preserved_in_panel_log(monkeypatch, tmp_path)
     assert "replay_cube_pose_in_robot_base.thor.yaml" in joined
     assert "[PASS] fr3_ping: reachable" in joined
     assert "[FAIL] fr3_arm: connection refused" in joined
+
+
+def _gripper_jump_contract_state(tmp_path: Path, *, profile: str) -> tuple[gateway.GatewayState, Path]:
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test", fps=30, episode=0),
+        datasets_root=dataset_root.parent,
+        profile=profile,
+    )
+    return state, dataset_root
+
+
+def test_workstation_trajectory_contract_allows_full_gripper_travel(monkeypatch, tmp_path):
+    state, dataset_root = _gripper_jump_contract_state(tmp_path, profile="workstation")
+    monkeypatch.setattr(
+        gateway,
+        "_read_dataset_timeline",
+        lambda *_args, **_kwargs: {
+            "frames": [
+                {"eePose": {"x": 0.3, "y": 0.0, "z": 0.2, "gripper": 0.0}},
+                {"eePose": {"x": 0.301, "y": 0.0, "z": 0.2, "gripper": 1.0}},
+            ]
+        },
+    )
+
+    contract = gateway._trajectory_contract_for_episode(state, dataset_root)
+
+    assert contract["status"] == "passed"
+    gripper_check = next(check for check in contract["checks"] if check["name"] == "gripper_range_step")
+    assert gripper_check["maxStep"] == 1.0
+    assert gripper_check["stepThreshold"] == 1.0
+
+
+def test_thor_trajectory_contract_keeps_conservative_gripper_step(monkeypatch, tmp_path):
+    state, dataset_root = _gripper_jump_contract_state(tmp_path, profile="thor")
+    monkeypatch.setattr(
+        gateway,
+        "_read_dataset_timeline",
+        lambda *_args, **_kwargs: {
+            "frames": [
+                {"eePose": {"x": 0.3, "y": 0.0, "z": 0.2, "gripper": 0.0}},
+                {"eePose": {"x": 0.301, "y": 0.0, "z": 0.2, "gripper": 1.0}},
+            ]
+        },
+    )
+
+    contract = gateway._trajectory_contract_for_episode(state, dataset_root)
+
+    assert contract["status"] == "failed"
+    assert "max gripper step 1.000 > 0.350" in contract["failures"]
 
 
 def test_mujoco_validation_fails_when_metrics_exceed_threshold(tmp_path):
@@ -2157,3 +2324,151 @@ def test_maybe_send_preview_demand_skips_non_gmsl2_recorder(tmp_path):
     state.process = _FakeRecorderProcess()
     gateway._maybe_send_preview_demand(state)
     assert state.process.stdin.writes == []
+
+
+def _training_view_state(tmp_path):
+    """Workstation state with one recording and one training view built from it."""
+    state, datasets_root = _task_state(tmp_path)
+    state.exports_root = tmp_path / "repo" / "outputs" / "exports"
+    state.profile = "workstation"
+    def add_cameras(root: Path) -> None:
+        info_path = root / "meta" / "info.json"
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        for camera_key in ("observation.images.ee", "observation.images.side"):
+            info["features"][camera_key] = {"dtype": "video"}
+            chunk = root / "videos" / camera_key / "chunk-000"
+            chunk.mkdir(parents=True)
+            (chunk / "file-000.mp4").write_bytes(b"0" * 2048)
+        info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    dataset_root = datasets_root / "fr3_spacemouse"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    add_cameras(dataset_root)
+    view_root = state.exports_root / gateway.TRAINING_VIEWS_DIR_NAME / "fr3_spacemouse__delta_ee_from_prev_cmd"
+    _write_minimal_episode_dataset(view_root, total_episodes=1)
+    add_cameras(view_root)
+    (view_root / "meta" / "il_view_manifest.json").write_text(
+        json.dumps(
+            {
+                "source_dataset_root": str(dataset_root),
+                "action_mode": "delta_ee_from_prev_cmd",
+                "total_episodes": 1,
+                "total_rows": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    gateway._invalidate_replay_candidates_memo()
+    return state, dataset_root, view_root
+
+
+def test_training_view_under_exports_is_a_replay_candidate(tmp_path):
+    # The grouping directory is not a dataset root, so a single-level scan of the exports root
+    # hid every built view -- and every endpoint gated on this list refused to serve it.
+    state, _dataset_root, view_root = _training_view_state(tmp_path)
+
+    candidates = gateway._complete_replay_dataset_candidates(state)
+
+    assert view_root in candidates
+    assert gateway._dataset_kind(state, view_root) == "training_view"
+    assert gateway._resolve_known_dataset(state, str(view_root)) == view_root
+
+
+def test_select_replay_dataset_accepts_a_training_view(tmp_path):
+    state, _dataset_root, view_root = _training_view_state(tmp_path)
+
+    gateway._select_replay_dataset(state, str(view_root))
+
+    assert state.selected_replay_root == view_root
+    assert state.replay.datasetRoot == str(view_root)
+    assert state.replay.datasetKind == "training_view"
+
+
+def test_recorded_dataset_items_link_a_view_to_its_source(tmp_path):
+    state, dataset_root, view_root = _training_view_state(tmp_path)
+
+    items = {item["path"]: item for item in gateway._recorded_dataset_items(state)}
+
+    view_item = items[str(view_root)]
+    assert view_item["datasetKind"] == "training_view"
+    assert view_item["viewOf"] == str(dataset_root)
+    assert view_item["viewOfName"] == dataset_root.name
+    assert view_item["actionContract"] == "delta_ee_from_prev_cmd"
+    # "Latest" drives one-click actions on fresh captures; a derived view must not claim it even
+    # though it is the newest directory on disk.
+    assert view_item["isLatest"] is False
+    assert items[str(dataset_root)]["isLatest"] is True
+
+
+def test_training_view_command_names_the_job_after_dataset_and_contract(tmp_path):
+    # Without an explicit job name the builder falls back to a fixed legacy name, so every view
+    # would generate configs training into -- and overwriting -- the same output directory.
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+
+    command, view_root = gateway._training_view_command(state, dataset_root, "delta_ee_from_prev_cmd")
+
+    assert view_root == state.exports_root / gateway.TRAINING_VIEWS_DIR_NAME / "fr3_spacemouse__delta_ee_from_prev_cmd"
+    assert command[command.index("--job-name") + 1] == "fr3_spacemouse__delta_ee_from_prev_cmd"
+    assert command[command.index("--view-root") + 1] == str(view_root)
+    assert "--prepare-only" in command
+
+
+def test_start_training_view_refuses_to_build_from_another_view(tmp_path):
+    state, _dataset_root, view_root = _training_view_state(tmp_path)
+
+    with pytest.raises(ValueError, match="already a training view"):
+        gateway._start_training_view(state, str(view_root), "absolute_ee")
+
+
+def test_training_view_build_reports_the_view_not_the_training_output_dir(tmp_path):
+    """Prepare-only prints a training output dir last; that must not become the status line.
+
+    The directory is not created by a prepare-only run, and its name comes from the builder's
+    own job naming -- reporting it told the operator about a job they never asked for.
+    """
+    state, dataset_root, view_root = _training_view_state(tmp_path)
+    state.dataset_export = gateway.DatasetExportStatus(
+        state="exporting",
+        target="delta_ee_from_prev_cmd",
+        datasetRoot=str(dataset_root),
+        outputPath="",
+    )
+
+    class FakeProcess:
+        stdout = [
+            f"[prepare] dataset view: {view_root}\n",
+            f"[prepare] train config: {view_root}/train_config.generated.json\n",
+            "[prepare] training output dir (created when this view is trained): outputs/train/x\n",
+        ]
+
+        def wait(self):
+            return 0
+
+    process = FakeProcess()
+    state.export_process = process
+
+    gateway._read_export_output(state, process)
+
+    assert state.dataset_export.state == "complete"
+    assert state.dataset_export.outputPath == str(view_root)
+    assert state.dataset_export.message == "View ready: 1 episode(s) · 2 frames · delta_ee_from_prev_cmd"
+
+
+def test_export_completion_leaves_non_view_exports_untouched(tmp_path):
+    state, _datasets_root = _task_state(tmp_path)
+    state.dataset_export = gateway.DatasetExportStatus(state="exporting", target="lerobot_v3")
+
+    class FakeProcess:
+        stdout = ["Episode 0 written (12 frames)\n"]
+
+        def wait(self):
+            return 0
+
+    process = FakeProcess()
+    state.export_process = process
+
+    gateway._read_export_output(state, process)
+
+    assert state.dataset_export.state == "complete"
+    assert state.dataset_export.message == "Episode 0 written (12 frames)"
+    assert state.dataset_export.totalFrames == 12

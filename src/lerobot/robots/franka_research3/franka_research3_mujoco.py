@@ -21,6 +21,10 @@ recording session run through the *same* ``record_loop`` and the *same* ee2ee pr
 pipeline, so the two datasets differ only in where the pixels and joint angles came from --
 never in feature names, ordering, shapes, or timestamp bookkeeping. A policy trained on sim
 data can therefore be replayed against hardware data without a translation layer.
+
+That includes the frame: ``ee.*`` here is in the robot base frame, as it is on the hardware
+arm. The scene bolts the arm to a pedestal, so the env converts out of MuJoCo world
+coordinates on the way through -- see ``FR3MujocoEnvConfig.base_frame_name``.
 """
 
 from __future__ import annotations
@@ -288,7 +292,12 @@ class FrankaResearch3Mujoco(Robot):
             desired_pose[:3, :3] = Rotation.from_rotvec(
                 [float(action["ee.wx"]), float(action["ee.wy"]), float(action["ee.wz"])]
             ).as_matrix()
-            env.step_absolute_pose(desired_pose, gripper=gripper, control_period_s=control_period_s)
+            env.step_absolute_pose(
+                desired_pose,
+                gripper=gripper,
+                control_period_s=control_period_s,
+                ik_orientation_weight=self.config.ik_orientation_weight,
+            )
             self._last_command_pose = desired_pose.copy()
             self._last_command_gripper = gripper
             return dict(action)

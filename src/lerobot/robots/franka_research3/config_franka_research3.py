@@ -48,6 +48,9 @@ class FrankaResearch3Config(RobotConfig):
     ik_solver: str = "hirol_lm"
     ik_tolerance: float = 1e-6
     ik_max_iterations: int = 200
+    # Optional absolute-pose IK orientation weight. None preserves the hardware/teleop default;
+    # replay can set this explicitly to match the MuJoCo validation objective.
+    ik_orientation_weight: float | None = None
     gripper_max_width_mm: float = 90.0
     gripper_command_rate_limit_hz: float | None = 15.0
     gripper_command_deadband_mm: float = 0.5
@@ -111,6 +114,8 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("ik_tolerance must be positive.")
         if self.ik_max_iterations <= 0:
             raise ValueError("ik_max_iterations must be positive.")
+        if self.ik_orientation_weight is not None and self.ik_orientation_weight < 0:
+            raise ValueError("ik_orientation_weight must be non-negative when provided.")
         if any(mn >= mx for mn, mx in zip(self.workspace_min, self.workspace_max, strict=True)):
             raise ValueError("workspace_min must be strictly smaller than workspace_max.")
         if self.gripper_max_width_mm <= 0:

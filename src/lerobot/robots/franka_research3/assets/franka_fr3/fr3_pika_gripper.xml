@@ -130,15 +130,21 @@
                             <geom name="fr3_pika_adapter_visual" type="mesh" material="white" class="visual" mesh="fr32pika"/>
                             <geom name="fr3_pika_adapter_collision" type="mesh" mesh="fr32pika" class="collision"/>
                           </body>
-                          <body name="gripper_base" pos="0.002 0 0.008" euler="-0.739815 -1.5707963 3.1415926">
+                          
+                          <body name="gripper_base" pos="0.002 0 0.008" quat="0.25563976 0.65927862 -0.25563976 0.65927864">
                             <inertial pos="0.037477 -8.1437e-07 0.0084053" mass="0.456979" diaginertia="0.000520039 0.000344637 0.000265824"/>
                             <geom name="pika_gripper_base_visual" type="mesh" material="black" class="visual" mesh="pika_gripper_base_link"/>
                             <geom name="pika_gripper_base_collision" type="mesh" mesh="pika_gripper_base_link" class="collision" contype="0" conaffinity="0"/>
                             <!-- D405 transformed from the ATI frame; lens shifted forward to clear the no-ATI mesh. -->
                             <camera name="ee_cam" mode="fixed" pos="0.095 0.00118 0.04069"
                                     xyaxes="0 -0.99893 0.04636 0 0.04636 0.99893" fovy="78"/>
-                            <body name="pika_gripper_ee" pos="0.185 0 0" euler="3.1415926 -1.5707963 0"/>
-                            <body name="pika_task_tcp" pos="0 0 0.366842" quat="0.92387953 0 0 -0.38268343"/>
+                            <!-- Both are rpy="3.1415926 -1.5707963 0" in the urdf (fr3_hand_tcp_joint,
+                                 pika_task_tcp_joint): a 180 deg turn about (x+z)/sqrt(2). The task TCP
+                                 used to carry a 45 deg z-rotation lifted from quest3_pika_gripper_scene.xml,
+                                 whose gripper_base is a different frame entirely. -->
+                            <body name="pika_gripper_ee" pos="0.185 0 0" quat="0 0.70710678 0 0.70710678"/>
+                            <!-- <body name="pika_task_tcp" pos="0 0 0.366842" quat="0 0.70710678 0 0.70710678"/> -->
+                            <body name="pika_task_tcp" pos="0.185 0 0" quat="0 0.70710678 0 0.70710678"/>
                             <body name="gripper_left_link" pos="0.0815 0.08851 0.0064182">
                               <inertial pos="0.033255 -0.014661 -0.0057614" mass="0.0811106" diaginertia="9.57314e-05 8.3052e-05 3.68146e-05"/>
                               <joint name="gripper_left_joint" pos="0 0 0" axis="0 1 0" type="slide" range="-0.05 0" limited="true" actuatorfrcrange="-75 75" damping="0.20" armature="0.02"/>

@@ -157,7 +157,7 @@ export type ReplayStatus = {
   safety: "locked" | "ready" | "active" | "fault";
   message: string;
   datasetRoot?: string;
-  datasetKind?: "recorded" | "exported";
+  datasetKind?: DatasetKind;
   sourcePath?: string;
   dataStatus?: "loaded" | "missing" | "unfinalized" | "unreadable" | "empty";
   trajectoryKind?: "pose" | "gripper_width" | "none";
@@ -210,6 +210,19 @@ export type MujocoCubeMode = "left" | "right" | "both";
 export type RealCubeMode = Exclude<MujocoCubeMode, "both">;
 export type RealEndEffectorMode = "pika_gripper_ee" | "corenetic_gripper_ee" | "fr3_ee";
 
+export type RealSensePreviewCameraStatus = {
+  cameraKey: string;
+  configKey?: string;
+  available: boolean | null;
+  running: boolean;
+  serial?: string;
+  width?: number;
+  height?: number;
+  fps?: number;
+  error?: string;
+  updated_at?: number;
+};
+
 export type RealSensePreviewStatus = {
   available: boolean | null;
   running: boolean;
@@ -219,6 +232,7 @@ export type RealSensePreviewStatus = {
   fps?: number;
   error?: string;
   updated_at?: number;
+  cameras?: RealSensePreviewCameraStatus[];
 };
 
 export type MujocoPreviewFrame = {
@@ -299,10 +313,12 @@ export type CollectionTask = {
   updatedAt: string;
 };
 
+export type DatasetKind = "recorded" | "exported" | "training_view";
+
 export type RecordedDataset = {
   path: string;
   name: string;
-  datasetKind?: "recorded" | "exported";
+  datasetKind?: DatasetKind;
   updatedAt: string;
   updatedAtMs: number;
   totalEpisodes: number;
@@ -310,6 +326,10 @@ export type RecordedDataset = {
   dataStatus: "loaded" | "missing" | "unfinalized" | "unreadable" | "empty";
   sourcePath: string;
   isLatest: boolean;
+  /** Training views only: the recording this view re-expresses, and in which action contract. */
+  viewOf?: string;
+  viewOfName?: string;
+  actionContract?: string;
 };
 
 export type TrajectoryPoint = {
@@ -331,7 +351,8 @@ export type EventLogItem = {
 
 export type DatasetExportStatus = {
   state: "idle" | "exporting" | "complete" | "error";
-  target: "lerobot_v3";
+  /** "lerobot_v3" for a Thor consolidation; the action contract for a workstation training view. */
+  target: string;
   datasetRoot: string;
   outputPath: string;
   selectedEpisodes: number;
@@ -453,7 +474,7 @@ export type CubeVideoOverlay = {
 
 export type ReplayTimeline = {
   datasetRoot: string;
-  datasetKind?: "recorded" | "exported";
+  datasetKind?: DatasetKind;
   name: string;
   episode: number;
   totalFrames: number;

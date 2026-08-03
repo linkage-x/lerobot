@@ -57,14 +57,16 @@ class FrankaResearch3MujocoConfig(RobotConfig):
     workspace_max: tuple[float, float, float] = (0.9, 0.6, 0.8)
     max_target_delta_pos: tuple[float, float, float] | None = None
     max_target_delta_rot: tuple[float, float, float] | None = None
+    # Keep in step with FR3MujocoEnvConfig.initial_joint_positions, which documents how the pose
+    # was chosen: fingers 0.20 m above the table over the workspace object, pointing down.
     initial_joint_positions: tuple[float, ...] = (
-        -0.09534768,
-        0.39794592,
-        -0.23614631,
-        -2.39008542,
-        1.72320219,
-        0.61671872,
-        2.14073504,
+        0.23486228,
+        -0.16457626,
+        -0.22702942,
+        -2.35687380,
+        -0.04549339,
+        2.19595640,
+        0.77724930,
     )
     initial_gripper: float = 1.0
     use_otg: bool = False
@@ -77,6 +79,10 @@ class FrankaResearch3MujocoConfig(RobotConfig):
     ik_solver: str = "mujoco"
     ik_tolerance: float = 1e-6
     ik_max_iterations: int = 200
+    # Optional override for absolute-pose replay only. None preserves the MuJoCo IK default; the
+    # workstation validation path sets this explicitly when it needs to prioritize TCP position
+    # over exact wrist orientation without changing teleop behavior.
+    ik_orientation_weight: float | None = None
     # Same guard as the hardware robot, kept numerically identical so a sim episode is held to
     # the envelope the hardware one is: a render pass that straggles this far behind its siblings
     # makes the frame unusable for training, so it fails the episode loudly.
@@ -108,3 +114,5 @@ class FrankaResearch3MujocoConfig(RobotConfig):
             raise ValueError("camera_width and camera_height must be positive.")
         if self.camera_max_skew_ms < 0:
             raise ValueError("camera_max_skew_ms must be non-negative.")
+        if self.ik_orientation_weight is not None and self.ik_orientation_weight < 0:
+            raise ValueError("ik_orientation_weight must be non-negative when provided.")

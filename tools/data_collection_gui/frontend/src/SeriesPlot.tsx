@@ -35,13 +35,17 @@ function joinFeatureName(prefix: string, leaf: string): string {
 function parseVectorComponent(name: string): { key: string; name: string; component: string } | null {
   const { prefix, leaf } = splitFeatureName(name);
 
-  const compactForce = leaf.match(/^([fm])([xyz])$/i);
-  if (compactForce) {
-    return {
-      key: joinFeatureName(prefix, compactForce[1]),
-      name: joinFeatureName(prefix, compactForce[1]),
-      component: compactForce[2].toLowerCase()
-    };
+  // A component glued straight onto its stem, with the dot as the only separator: `fx`, `mz`,
+  // the FR3 `ee.qx`, a delta action's `.dx`/`.drx`, or a bare `ee.x` with no stem at all. The
+  // stem is capped at three characters because a longer one is likelier an English word that
+  // happens to end in x/y/z/w (`max`, `flow`) than a vector component.
+  const compactComponent = leaf.match(/^([a-z]{0,3})([wxyz])$/i);
+  if (compactComponent) {
+    const stem = compactComponent[1];
+    const key = stem ? joinFeatureName(prefix, stem) : prefix;
+    if (key) {
+      return { key, name: key, component: compactComponent[2].toLowerCase() };
+    }
   }
 
   const touchSummary = leaf.match(/^(.*?_f)([xyz])(_.*)$/i);

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GuiSnapshot } from "../api";
-import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, MujocoCubeMode, RealCubeMode, RealEndEffectorMode, RealSensePreviewStatus } from "../types";
+import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, MujocoCubeMode, RealCubeMode, RealEndEffectorMode, RealSensePreviewStatus, RealSensePreviewCameraStatus, ReplayTimeline } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation, mujocoValidationMatchesSelection } from "../shared/ui";
 import { ReplayInspector } from "../ReplayInspector";
 import { api } from "../apiClient";
@@ -108,6 +108,8 @@ export function RealRobotReplayPanel({
   const [overridePromptOpen, setOverridePromptOpen] = useState(false);
   const [cameraStatus, setCameraStatus] = useState<RealSensePreviewStatus | null>(null);
   const [frameKey, setFrameKey] = useState(0);
+  const [timeline, setTimeline] = useState<ReplayTimeline | null>(null);
+  const recordedVideoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
   const validationPassed =
     validation?.status === "passed" &&
     validation.isCurrentForSelection === true &&
@@ -127,6 +129,13 @@ export function RealRobotReplayPanel({
   const active = status.state === "replaying" || status.state === "sim_replay";
   const disabled =
     busy || active || status.datasetKind === "exported" || !validationDecisionAvailable || !ipValid;
+  const datasetPath = status.datasetRoot || status.dataset;
+  const timelineCameraKeys = timeline?.cameraKeys ?? [];
+  const cameraMatches = (cameraStatus?.cameras ?? []).filter((camera): camera is RealSensePreviewCameraStatus =>
+    Boolean(camera.cameraKey && timelineCameraKeys.includes(camera.cameraKey))
+  );
+  const recordedVideoUrl = (cameraKey: string) => datasetPath ? api.videoUrl(datasetPath, cameraKey, status.episode) : "";
+  const shortCameraName = (cameraKey: string) => cameraKey.split(".").pop() ?? cameraKey;
 
   useEffect(() => {
     if (!monitorRequested && status.state !== "replaying") return;
@@ -144,6 +153,34 @@ export function RealRobotReplayPanel({
       window.clearInterval(frameTimer);
     };
   }, [monitorRequested, status.state]);
+
+  useEffect(() => {
+    if (!datasetPath || status.datasetKind === "exported") {
+      setTimeline(null);
+      return;
+    }
+    let mounted = true;
+    api.fetchReplayTimeline(datasetPath, status.episode).then((next) => {
+      if (mounted) setTimeline(next);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, [datasetPath, status.datasetKind, status.episode, status.revision]);
+
+  useEffect(() => {
+    Object.values(recordedVideoRefs.current).forEach((video) => {
+      if (!video) return;
+      if (status.state !== "replaying") {
+        video.pause();
+        return;
+      }
+      video.currentTime = 0;
+      void video.play().catch(() => {
+        // Browser autoplay policy can still block muted video in some environments; controls remain visible.
+      });
+    });
+  }, [cameraMatches.map((camera) => camera.cameraKey).join("|"), status.state]);
 
   const startConfirmed = (overrideMujocoFailure: boolean) => {
     setOverridePromptOpen(false);
@@ -186,18 +223,69 @@ export function RealRobotReplayPanel({
                     : "The gateway preflights this FR3, moves pika_task_tcp to frame 0, then streams the trajectory."}
           </p>
         </div>
-        <div className="realsense-monitor">
+        <div className="realsense-monitor replay-camera-compare">
           <div className="realsense-monitor-heading">
-            <strong>RealSense live monitor</strong>
-            <span>{cameraStatus?.serial ? "S/N " + cameraStatus.serial : "first available camera"}</span>
+            <strong>Replay camera monitor</strong>
+            <span>{status.state === "replaying" ? "live vs recorded" : "starts with real replay"}</span>
           </div>
-          {cameraStatus?.available && cameraStatus.running ? (
-            <img src={api.realSenseSnapshotUrl(frameKey)} alt="RealSense live view during real robot replay" />
+          {cameraMatches.length ? (
+            <div className="replay-camera-compare-grid">
+              {cameraMatches.map((camera) => (
+                <div className="replay-camera-pair" key={camera.cameraKey}>
+                  <div className="replay-camera-pair-heading">
+                    <strong>{camera.cameraKey}</strong>
+                    <span>config {camera.configKey ?? shortCameraName(camera.cameraKey)} · S/N {camera.serial ?? "?"}</span>
+                  </div>
+                  <div className="replay-camera-pair-grid">
+                    <div className="replay-camera-card">
+                      <div className="replay-camera-card-heading">
+                        <strong>Live RealSense</strong>
+                        <span>{camera.running ? "live" : "waiting"}</span>
+                      </div>
+                      <div className="replay-camera-media">
+                        {camera.available && camera.running ? (
+                          <img src={api.realSenseSnapshotUrl(frameKey, camera.cameraKey)} alt={`Live RealSense ${camera.cameraKey} during real robot replay`} />
+                        ) : (
+                          <div className="realsense-monitor-empty">
+                            {camera.error || "This matched RealSense connects automatically when real-robot replay starts."}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="replay-camera-card">
+                      <div className="replay-camera-card-heading">
+                        <strong>Recorded reference</strong>
+                        <span>episode {status.episode}</span>
+                      </div>
+                      <div className="replay-camera-media">
+                        <video
+                          ref={(element) => {
+                            recordedVideoRefs.current[camera.cameraKey] = element;
+                          }}
+                          src={recordedVideoUrl(camera.cameraKey)}
+                          muted
+                          playsInline
+                          controls
+                          preload="metadata"
+                          aria-label={`Recorded ${shortCameraName(camera.cameraKey)} camera for episode ${status.episode}`}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
           ) : (
-            <div className="realsense-monitor-empty">
-              {cameraStatus?.error || "The camera connects automatically when real-robot replay starts."}
+            <div className="realsense-monitor-empty replay-camera-no-match">
+              {cameraStatus?.error ||
+                (status.datasetKind === "exported"
+                  ? "Exported datasets do not expose source camera video here."
+                  : "No connected RealSense camera matches this episode's recorded camera observations.")}
             </div>
           )}
+          <p className="replay-camera-note">
+            During real replay, every dataset camera observation that matches a configured RealSense key is shown as a live/recorded pair. Matching uses the dataset camera key and the configured RealSense serial, not camera discovery order.
+          </p>
         </div>
       </div>
       <div className="real-replay-log-block">
@@ -307,6 +395,11 @@ export function RecordedDatasetList({
                   <StatusDot state={dataset.dataStatus === "loaded" ? "running" : "warning"} />
                   <strong>{dataset.name}</strong>
                   {dataset.datasetKind === "exported" ? <em>exported</em> : null}
+                  {/* A view replays its own derived action contract -- which is the point of
+                      replaying one -- so name the contract rather than just the dataset. */}
+                  {dataset.datasetKind === "training_view" ? (
+                    <em>training view{dataset.actionContract ? ` · ${dataset.actionContract}` : ""}</em>
+                  ) : null}
                   {dataset.isLatest ? <em>latest</em> : null}
                 </div>
                 <p>{dataset.path}</p>

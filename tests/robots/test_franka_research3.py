@@ -127,14 +127,21 @@ class DummyKinematicsDriver:
         self.forward_pose = np.eye(4, dtype=np.float64)
         self.forward_pose[:3, 3] = np.array([0.4, 0.1, 0.3], dtype=np.float64)
         self.inverse_calls: list[tuple[np.ndarray, np.ndarray]] = []
+        self.inverse_kwargs: list[dict[str, float]] = []
         self.inverse_solution = np.array([0.5, 0.4, 0.3, -0.2, 0.1, 0.0, -0.1], dtype=np.float64)
 
     def forward_kinematics(self, joint_positions_rad: np.ndarray) -> np.ndarray:
         del joint_positions_rad
         return self.forward_pose.copy()
 
-    def inverse_kinematics(self, current_joint_positions_rad: np.ndarray, desired_pose: np.ndarray) -> np.ndarray:
+    def inverse_kinematics(
+        self,
+        current_joint_positions_rad: np.ndarray,
+        desired_pose: np.ndarray,
+        **kwargs,
+    ) -> np.ndarray:
         self.inverse_calls.append((current_joint_positions_rad.copy(), desired_pose.copy()))
+        self.inverse_kwargs.append(dict(kwargs))
         return self.inverse_solution.copy()
 
 
@@ -1647,11 +1654,51 @@ def test_send_action_accepts_absolute_ee_targets(robot):
 
     _, desired_pose = robot._kinematics.inverse_calls[-1]
     assert np.allclose(desired_pose[:3, 3], np.array([0.6, 0.3, 0.5]))
+    assert robot._kinematics.inverse_kwargs[-1] == {}
     assert returned["ee.x"] == pytest.approx(0.6)
     assert returned["ee.y"] == pytest.approx(0.3)
     assert returned["ee.z"] == pytest.approx(0.5)
     assert returned["gripper.pos"] == pytest.approx(1.0)
     assert robot._gripper.set_position_calls[-1] == pytest.approx(1.0)
+
+
+def test_send_action_passes_configured_ik_orientation_weight_for_absolute_ee(monkeypatch):
+    DummyArmDriver.instances = []
+    DummyGripperDriver.instances = []
+    DummyOTGDriver.instances = []
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            gripper_backend="mock",
+            urdf_path="/tmp/fr3.urdf",
+            ik_orientation_weight=0.012,
+            use_otg=False,
+        )
+    )
+
+    try:
+        robot.connect()
+        robot.send_action(
+            {
+                "ee.x": 0.7,
+                "ee.y": 0.5,
+                "ee.z": 0.8,
+                "ee.wx": 0.0,
+                "ee.wy": 0.0,
+                "ee.wz": 0.0,
+                "gripper.pos": 1.0,
+            }
+        )
+
+        assert robot._kinematics.inverse_kwargs[-1]["orientation_weight"] == pytest.approx(0.012)
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
 
 
 def test_send_action_disabled_stops_at_current_pose_after_release(robot):

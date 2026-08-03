@@ -79,6 +79,74 @@ describe("groupSeriesNames", () => {
     expect(groups[2].items.map((item) => item.dim)).toEqual([5, 6, 7]);
   });
 
+  it("groups the FR3 workstation absolute_ee state into position and quaternion rows", () => {
+    // Feature names come from the FR3 processor (`ee.x` .. `prev_cmd.gripper.pos`): the
+    // component is glued to a dot-separated stem, so nothing here has a `_x` suffix to split on.
+    const groups = groupSeriesNames([
+      "ee.x",
+      "ee.y",
+      "ee.z",
+      "prev_cmd.ee.x",
+      "prev_cmd.ee.y",
+      "prev_cmd.ee.z",
+      "ee.qx",
+      "ee.qy",
+      "ee.qz",
+      "ee.qw",
+      "prev_cmd.ee.qx",
+      "prev_cmd.ee.qy",
+      "prev_cmd.ee.qz",
+      "prev_cmd.ee.qw",
+      "gripper.pos",
+      "prev_cmd.gripper.pos"
+    ]);
+
+    expect(groups.map((group) => group.key)).toEqual([
+      "ee",
+      "prev_cmd.ee",
+      "ee.q",
+      "prev_cmd.ee.q",
+      "gripper.pos",
+      "prev_cmd.gripper.pos"
+    ]);
+    expect(groups[0].items.map((item) => item.component)).toEqual(["x", "y", "z"]);
+    expect(groups[0].items.map((item) => item.dim)).toEqual([0, 1, 2]);
+    expect(groups[1].items.map((item) => item.dim)).toEqual([3, 4, 5]);
+    // Plotted w-first, same as every other quaternion, with dims pointing back at xyzw storage.
+    expect(groups[2].items.map((item) => item.component)).toEqual(["w", "x", "y", "z"]);
+    expect(groups[2].items.map((item) => item.dim)).toEqual([9, 6, 7, 8]);
+    expect(groups[3].items.map((item) => item.dim)).toEqual([13, 10, 11, 12]);
+  });
+
+  it("groups the FR3 delta action translation and rotvec triplets", () => {
+    const groups = groupSeriesNames([
+      "delta_ee_from_prev_cmd.dx",
+      "delta_ee_from_prev_cmd.dy",
+      "delta_ee_from_prev_cmd.dz",
+      "delta_ee_from_prev_cmd.drx",
+      "delta_ee_from_prev_cmd.dry",
+      "delta_ee_from_prev_cmd.drz",
+      "gripper.pos"
+    ]);
+
+    expect(groups.map((group) => group.key)).toEqual([
+      "delta_ee_from_prev_cmd.d",
+      "delta_ee_from_prev_cmd.dr",
+      "gripper.pos"
+    ]);
+    expect(groups[0].items.map((item) => item.component)).toEqual(["x", "y", "z"]);
+    expect(groups[1].items.map((item) => item.dim)).toEqual([3, 4, 5]);
+  });
+
+  it("keeps a lone word-final x/y/z/w dimension standalone", () => {
+    // `max` parses as stem `ma` + component `x`, but a group needs two distinct components,
+    // so an unrelated neighbour must not get swallowed into it.
+    const groups = groupSeriesNames(["stats.max", "stats.mean", "ee.x", "ee.y"]);
+
+    expect(groups.map((group) => group.key)).toEqual(["stats.max", "stats.mean", "ee"]);
+    expect(groups[2].items.map((item) => item.dim)).toEqual([2, 3]);
+  });
+
   it("groups cube pose position and quaternion display names", () => {
     const groups = groupSeriesNames([
       "cube_a.position_x",

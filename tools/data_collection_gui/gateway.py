@@ -42,6 +42,9 @@ TRAINING_VIEW_ACTION_MODES = ("absolute_ee", "delta_ee_from_prev_cmd", "delta_ee
 DEFAULT_TRAINING_VIEW_ACTION_MODE = "delta_ee_from_prev_cmd"
 DEFAULT_DATASETS_ROOT = Path("outputs/datasets")
 DEFAULT_EXPORTS_ROOT = Path("outputs/exports")
+# Training views are grouped one level below the exports root. The grouping directory is not
+# itself a dataset, so every scan that walks the exports root has to descend into it explicitly.
+TRAINING_VIEWS_DIR_NAME = "training_views"
 DEPLOYMENT_PROFILES: dict[str, dict[str, Any]] = {
     "thor": {
         "label": "Thor Acquisition",
@@ -56,8 +59,12 @@ DEPLOYMENT_PROFILES: dict[str, dict[str, Any]] = {
 }
 DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM = 20.0
 DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG = 15.0
+DEFAULT_WORKSTATION_REPLAY_IK_ORIENTATION_WEIGHT = 0.012
+DEFAULT_WORKSTATION_REAL_SETTLE_STEPS = 300
+DEFAULT_WORKSTATION_REAL_SETTLE_TOLERANCE_MM = 6.0
 DEFAULT_REPLAY_MAX_EE_STEP_MM = 120.0
 DEFAULT_REPLAY_MAX_GRIPPER_STEP = 0.35
+DEFAULT_WORKSTATION_REPLAY_MAX_GRIPPER_STEP = 1.0
 DEFAULT_REAL_PREFLIGHT_TIMEOUT_S = 30.0
 DEFAULT_REAL_ROBOT_IP = "192.168.1.208"
 DEFAULT_CUBE_REPLAY_ROBOT_IP = "192.168.11.102"
@@ -238,6 +245,7 @@ class GatewayState:
     teleop_process: subprocess.Popen[str] | None = None
     teleop_started_at_s: float | None = None
     realsense_preview_process: subprocess.Popen[str] | None = None
+    realsense_preview_processes: dict[str, subprocess.Popen[str]] = field(default_factory=dict)
     processing_processes: dict[str, subprocess.Popen[str]] = field(default_factory=dict)
     processing_starting: set[str] = field(default_factory=set)
     process_started_at_s: float | None = None
@@ -1055,7 +1063,15 @@ def _scan_exports_root(state: GatewayState) -> list[Path]:
         return []
     if _is_dataset_root(root):
         return [root]
-    return [entry for entry in root.iterdir() if _is_dataset_root(entry)]
+    entries = [entry for entry in root.iterdir() if _is_dataset_root(entry)]
+    # Training views sit one level deeper (exports/training_views/<dataset>__<contract>). A
+    # single-level scan skipped the grouping directory -- which is not a dataset root -- and so
+    # hid every built view from replay selection, video serving and every other endpoint that
+    # gates on this candidate list.
+    views_root = _training_views_root(state)
+    if views_root.is_dir():
+        entries.extend(entry for entry in views_root.iterdir() if _is_dataset_root(entry))
+    return entries
 
 
 def _dataset_root_candidates(state: GatewayState) -> list[Path]:
@@ -1086,7 +1102,18 @@ def _dataset_root_candidates(state: GatewayState) -> list[Path]:
 
 def _dataset_kind(state: GatewayState, dataset_root: Path) -> str:
     try:
-        dataset_root.resolve().relative_to(_task_exports_root(state).resolve())
+        resolved = dataset_root.resolve()
+    except OSError:
+        return "recorded"
+    # A training view is a re-expression of a recording, not a recording: keeping it its own kind
+    # is what lets the UI nest it under its source instead of offering it as capture output.
+    try:
+        resolved.relative_to(_training_views_root(state).resolve())
+        return "training_view"
+    except (OSError, ValueError):
+        pass
+    try:
+        resolved.relative_to(_task_exports_root(state).resolve())
     except (OSError, ValueError):
         return "recorded"
     return "exported"
@@ -1095,6 +1122,11 @@ def _dataset_kind(state: GatewayState, dataset_root: Path) -> str:
 _REPLAY_CANDIDATES_MEMO: tuple[float, tuple[Any, ...], list[Path]] | None = None
 _REPLAY_CANDIDATES_TTL_S = 3.0
 _PROCESSING_STALE_RUNNING_S = 120.0
+
+
+def _invalidate_replay_candidates_memo() -> None:
+    global _REPLAY_CANDIDATES_MEMO
+    _REPLAY_CANDIDATES_MEMO = None
 
 
 def _path_memo_key(path: Path | None) -> str:
@@ -2644,13 +2676,19 @@ def _training_view_command(
     if not camera_keys:
         raise ValueError(f"{dataset_root.name} has no camera features to build a training view from.")
 
-    view_root = _training_views_root(state) / f"{dataset_root.name}__{action_mode}"
+    view_name = f"{dataset_root.name}__{action_mode}"
+    view_root = _training_views_root(state) / view_name
     command = [
         str(_venv_python(state.repo_root, prefer_fr3=True)),
         str(state.repo_root / "tools" / "fr3" / "fr3_train_il_policy.py"),
         "--dataset-root", str(dataset_root),
         "--view-root", str(view_root),
-        "--repo-id", f"local/{dataset_root.name}__{action_mode}",
+        # The job name is what the generated train/inference configs use for their training
+        # output dir and checkpoint path. Left to the script's default it is a fixed legacy
+        # name, so every view built here would train into -- and overwrite -- the same
+        # directory regardless of source dataset or action contract.
+        "--job-name", view_name,
+        "--repo-id", f"local/{view_name}",
         "--cameras", ",".join(sorted(camera_keys)),
         "--state-keys", "observation.state",
         "--action-mode", action_mode,
@@ -2666,8 +2704,7 @@ def _training_view_command(
 
 
 def _training_views_root(state: GatewayState) -> Path:
-    root = state.exports_root or (state.repo_root / DEFAULT_EXPORTS_ROOT)
-    return root / "training_views"
+    return _task_exports_root(state) / TRAINING_VIEWS_DIR_NAME
 
 
 def _start_training_view(state: GatewayState, raw_path: str, action_mode: str) -> None:
@@ -2677,6 +2714,10 @@ def _start_training_view(state: GatewayState, raw_path: str, action_mode: str) -
     dataset_root = _resolve_known_dataset(state, raw_path)
     if dataset_root is None:
         raise ValueError("Dataset not found in the recorded dataset list.")
+    # Views are replay candidates now, so they are resolvable here. Re-expressing an already
+    # re-expressed action column would silently compose two contracts.
+    if _dataset_kind(state, dataset_root) == "training_view":
+        raise ValueError(f"{dataset_root.name} is already a training view; build from the recording instead.")
     command, view_root = _training_view_command(state, dataset_root, action_mode)
     state.export_process = subprocess.Popen(
         command,
@@ -2756,6 +2797,11 @@ def _apply_export_output(state: GatewayState, output: str) -> None:
     match = re.search(r"Export plan: (\d+) episodes", output)
     if match:
         state.dataset_export.selectedEpisodes = int(match.group(1))
+    # The training-view builder announces where the view landed. Trust that over the path this
+    # gateway predicted, so the UI links to what was actually written.
+    view_match = re.match(r"\[prepare\] dataset view: (.+)$", output)
+    if view_match:
+        state.dataset_export.outputPath = view_match.group(1).strip()
     if output.startswith("Episode ") and "written" in output:
         frames = re.search(r"\((\d+) frames\)", output)
         if frames:
@@ -2765,6 +2811,27 @@ def _apply_export_output(state: GatewayState, output: str) -> None:
     elif output.startswith("ERROR:"):
         state.dataset_export.state = "error"
     state.log("info", f"export: {output}")
+
+
+def _training_view_completion_message(state: GatewayState) -> str | None:
+    """Summarize a finished training-view build from the view itself.
+
+    Without this the status line keeps whatever the builder printed last, which in prepare-only
+    mode is the training output dir -- a directory that does not exist yet, named after a job
+    nobody on this page asked for. The manifest inside the view is the authoritative record of
+    what was built.
+    """
+    if state.dataset_export.target not in TRAINING_VIEW_ACTION_MODES:
+        return None
+    contract = state.dataset_export.target
+    manifest: dict[str, Any] = {}
+    if state.dataset_export.outputPath:
+        manifest = _load_json_file(Path(state.dataset_export.outputPath) / "meta" / "il_view_manifest.json")
+    episodes = int(manifest.get("total_episodes") or state.dataset_export.selectedEpisodes or 0)
+    frames = int(manifest.get("total_rows") or state.dataset_export.totalFrames or 0)
+    state.dataset_export.selectedEpisodes = episodes
+    state.dataset_export.totalFrames = frames
+    return f"View ready: {episodes} episode(s) · {frames} frames · {contract}"
 
 
 def _read_export_output(state: GatewayState, process: subprocess.Popen[str]) -> None:
@@ -2784,6 +2851,15 @@ def _read_export_output(state: GatewayState, process: subprocess.Popen[str]) -> 
             state.dataset_export.state = "error" if return_code else "complete"
             if return_code:
                 state.dataset_export.message = f"Export exited with code {return_code}"
+            else:
+                summary = _training_view_completion_message(state)
+                if summary is not None:
+                    state.dataset_export.message = summary
+                # A just-built view has to show up in the replay candidate list now, not up to
+                # one memo TTL (or one 10s stats-refresh cycle) later, or the operator reads
+                # "complete" while the dataset list still has no view to open.
+                _invalidate_replay_candidates_memo()
+                state.dataset_cache_ready = False
 
 
 def _annotation_store_path(dataset_root: Path) -> Path:
@@ -3737,9 +3813,38 @@ def _gmsl2_dataset_stats(dataset_root: Path) -> tuple[int, int]:
     return len(ep_dirs), total_frames
 
 
+def _training_view_item_fields(dataset_root: Path, dataset_kind: str) -> dict[str, Any]:
+    """Source dataset and action contract of a training view, for nesting it under its source.
+
+    The manifest the builder writes is authoritative; the ``<dataset>__<contract>`` directory
+    name is the fallback for views built before the manifest carried the action mode.
+    """
+    if dataset_kind != "training_view":
+        return {}
+    manifest = _load_json_file(dataset_root / "meta" / "il_view_manifest.json")
+    source = str(manifest.get("source_dataset_root") or "")
+    contract = str(manifest.get("action_mode") or "")
+    if "__" in dataset_root.name:
+        name_source, _, name_contract = dataset_root.name.partition("__")
+    else:
+        name_source, name_contract = dataset_root.name, ""
+    return {
+        "viewOf": source,
+        "viewOfName": Path(source).name if source else name_source,
+        "actionContract": contract or name_contract,
+    }
+
+
 def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for index, dataset_root in enumerate(_complete_replay_dataset_candidates(state)):
+    candidates = _complete_replay_dataset_candidates(state)
+    # "Latest" drives one-click actions on freshly captured data (Live Record -> Open in Replay),
+    # so a derived training view must never claim it even when it is the newest directory.
+    latest_recorded = next(
+        (root for root in candidates if _dataset_kind(state, root) != "training_view"),
+        None,
+    )
+    for dataset_root in candidates:
         info = _load_dataset_info(dataset_root)
         data_files = _dataset_data_files(dataset_root)
         modified_s = _dataset_modified_s(dataset_root)
@@ -3749,18 +3854,20 @@ def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
         else:
             total_episodes = int(info.get("total_episodes") or 0)
             total_frames = int(info.get("total_frames") or 0)
+        dataset_kind = _dataset_kind(state, dataset_root)
         items.append(
             {
                 "path": str(dataset_root),
                 "name": dataset_root.name,
-                "datasetKind": _dataset_kind(state, dataset_root),
+                "datasetKind": dataset_kind,
                 "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(modified_s)) if modified_s else "",
                 "updatedAtMs": int(modified_s * 1000),
                 "totalEpisodes": total_episodes,
                 "totalFrames": total_frames,
                 "dataStatus": _recorded_dataset_status(dataset_root),
                 "sourcePath": str(data_files[-1]) if data_files else "",
-                "isLatest": index == 0,
+                "isLatest": latest_recorded is not None and dataset_root == latest_recorded,
+                **_training_view_item_fields(dataset_root, dataset_kind),
             }
         )
     return items
@@ -6851,7 +6958,7 @@ def _dataset_scan_signature(state: GatewayState) -> tuple:
     the cache notices the dataset becoming replayable while still avoiding the
     full per-episode scan used by ``_recorded_dataset_items``.
     """
-    roots = [state.datasets_root, _task_exports_root(state)]
+    roots = [state.datasets_root, _task_exports_root(state), _training_views_root(state)]
     sig: list[tuple[Any, ...]] = []
     for root in roots:
         if root is None or not root.is_dir():
@@ -7138,7 +7245,12 @@ def _distance_mm(a: dict[str, Any], b: dict[str, Any]) -> float | None:
 def _trajectory_contract_for_episode(state: GatewayState, dataset_root: Path) -> dict[str, Any]:
     replay = _replay_config(state.config)
     max_ee_step_mm = _float_config(replay, "trajectory_max_ee_step_mm", DEFAULT_REPLAY_MAX_EE_STEP_MM)
-    max_gripper_step = _float_config(replay, "trajectory_max_gripper_step", DEFAULT_REPLAY_MAX_GRIPPER_STEP)
+    default_gripper_step = (
+        DEFAULT_WORKSTATION_REPLAY_MAX_GRIPPER_STEP
+        if state.profile == "workstation"
+        else DEFAULT_REPLAY_MAX_GRIPPER_STEP
+    )
+    max_gripper_step = _float_config(replay, "trajectory_max_gripper_step", default_gripper_step)
     min_z_value = replay.get("trajectory_min_z_m")
     max_z_value = replay.get("trajectory_max_z_m")
     min_z = float(min_z_value) if min_z_value is not None else None
@@ -7676,6 +7788,8 @@ def _fr3_mujoco_replay_command(state: GatewayState, dataset_root: Path) -> list[
         str(DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM),
         "--max-rotation-error-deg",
         str(DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG),
+        "--ik-orientation-weight",
+        str(DEFAULT_WORKSTATION_REPLAY_IK_ORIENTATION_WEIGHT),
         # Without this the run produces numbers and nothing to look at: the inspector's video
         # panel stays on its placeholder, which reads as "the replay did not happen".
         "--render-video",
@@ -7834,6 +7948,12 @@ def _fr3_real_replay_command(state: GatewayState, dataset_root: Path, robot_ip: 
         str(DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM),
         "--max-rotation-error-deg",
         str(DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG),
+        "--ik-orientation-weight",
+        str(DEFAULT_WORKSTATION_REPLAY_IK_ORIENTATION_WEIGHT),
+        "--settle-steps",
+        str(DEFAULT_WORKSTATION_REAL_SETTLE_STEPS),
+        "--settle-tolerance-mm",
+        str(DEFAULT_WORKSTATION_REAL_SETTLE_TOLERANCE_MM),
     ]
 
 
@@ -7906,11 +8026,24 @@ def _real_robot_ip(state: GatewayState) -> str:
 
 def _real_preflight_command(state: GatewayState, robot_ip: str | None = None) -> list[str]:
     replay = _replay_config(state.config)
+    config_path = (
+        state.config_path
+        if state.profile == "workstation"
+        else state.repo_root
+        / "third_party"
+        / "opencv_kalibr"
+        / "fr3_data_collection_replay"
+        / "replay_cube_pose_in_robot_base.thor.yaml"
+    )
     command = [
-        str(_mujoco_replay_python(state)),
+        str(
+            _venv_python(state.repo_root, prefer_fr3=True)
+            if state.profile == "workstation"
+            else _mujoco_replay_python(state)
+        ),
         str(state.repo_root / "tools" / "fr3" / "fr3_record_preflight.py"),
         f"--workspace={state.repo_root}",
-        f"--config-path={state.repo_root / 'third_party' / 'opencv_kalibr' / 'fr3_data_collection_replay' / 'replay_cube_pose_in_robot_base.thor.yaml'}",
+        f"--config-path={config_path}",
         f"--robot-ip={robot_ip or _real_robot_ip(state)}",
     ]
     if _bool_config(replay, "real_preflight_skip_host_imports", True):
@@ -8124,9 +8257,15 @@ def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CU
     _start_replay_output_reader(state, process)
 
 
-def _realsense_preview_paths(state: GatewayState) -> tuple[Path, Path]:
-    root = Path("/tmp") / f"lerobot_realsense_replay_{os.getpid()}"
-    return root.with_suffix(".jpg"), root.with_suffix(".json")
+def _realsense_preview_token(camera_key: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9-]+", "_", str(camera_key).strip())
+    return token.strip("_") or "default"
+
+
+def _realsense_preview_paths(state: GatewayState, camera_key: str = "default") -> tuple[Path, Path]:
+    token = _realsense_preview_token(camera_key)
+    root = Path("/tmp") / f"lerobot_realsense_replay_{os.getpid()}_{token}"
+    return Path(str(root) + ".jpg"), Path(str(root) + ".json")
 
 
 def _realsense_preview_python(state: GatewayState) -> Path:
@@ -8138,53 +8277,128 @@ def _realsense_preview_python(state: GatewayState) -> Path:
     )
 
 
-def _stop_realsense_preview(state: GatewayState) -> None:
-    process = state.realsense_preview_process
-    if process is not None and process.poll() is None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=2.0)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-    state.realsense_preview_process = None
+def _replay_realsense_camera_matches(state: GatewayState, dataset_root: Path | None = None) -> list[dict[str, Any]]:
+    root = dataset_root or state.selected_replay_root or _resolve_known_dataset(state, state.replay.datasetRoot or state.replay.dataset)
+    if root is None:
+        return []
+    try:
+        camera_keys = _camera_keys(_load_dataset_info(root))
+    except Exception:
+        return []
+    robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
+    configured = robot.get("cameras") if isinstance(robot.get("cameras"), dict) else {}
+    matches: list[dict[str, Any]] = []
+    for camera_key in camera_keys:
+        stem = _camera_stem_from_key(camera_key)
+        config_key = camera_key if camera_key in configured else stem
+        camera_cfg = configured.get(config_key) if isinstance(configured.get(config_key), dict) else None
+        if not camera_cfg or str(camera_cfg.get("type", "")).lower() != "intelrealsense":
+            continue
+        serial = str(camera_cfg.get("serial_number_or_name") or "").strip()
+        if not serial:
+            continue
+        matches.append(
+            {
+                "cameraKey": camera_key,
+                "configKey": str(config_key),
+                "serial": serial,
+                "width": int(camera_cfg.get("width") or 640),
+                "height": int(camera_cfg.get("height") or 480),
+                "fps": min(int(camera_cfg.get("fps") or 15), 15),
+            }
+        )
+    return matches
 
 
-def _start_realsense_preview(state: GatewayState) -> None:
-    process = state.realsense_preview_process
-    if process is not None and process.poll() is None:
+def _terminate_process_group(process: subprocess.Popen[str], timeout_s: float = 2.0) -> None:
+    if process.poll() is not None:
         return
-    image_path, status_path = _realsense_preview_paths(state)
-    image_path.unlink(missing_ok=True)
-    status_path.unlink(missing_ok=True)
-    command = [
-        str(_realsense_preview_python(state)),
-        str(state.repo_root / "tools" / "data_collection_gui" / "realsense_live_preview.py"),
-        "--output", str(image_path),
-        "--status", str(status_path),
-    ]
-    state.realsense_preview_process = subprocess.Popen(
-        command,
-        cwd=state.repo_root,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=timeout_s)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+
+
+def _stop_realsense_preview(state: GatewayState) -> None:
+    processes = dict(state.realsense_preview_processes)
+    if state.realsense_preview_process is not None:
+        processes.setdefault("default", state.realsense_preview_process)
+    for process in processes.values():
+        _terminate_process_group(process)
+    state.realsense_preview_process = None
+    state.realsense_preview_processes = {}
+
+
+def _start_realsense_preview(state: GatewayState, dataset_root: Path | None = None) -> None:
+    matches = _replay_realsense_camera_matches(state, dataset_root)
+    running_keys = {key for key, process in state.realsense_preview_processes.items() if process.poll() is None}
+    desired_keys = {str(match["cameraKey"]) for match in matches}
+    if running_keys == desired_keys and running_keys:
+        return
+    _stop_realsense_preview(state)
+    for match in matches:
+        camera_key = str(match["cameraKey"])
+        image_path, status_path = _realsense_preview_paths(state, camera_key)
+        image_path.unlink(missing_ok=True)
+        status_path.unlink(missing_ok=True)
+        command = [
+            str(_realsense_preview_python(state)),
+            str(state.repo_root / "tools" / "data_collection_gui" / "realsense_live_preview.py"),
+            "--output", str(image_path),
+            "--status", str(status_path),
+            "--serial", str(match["serial"]),
+            "--width", str(match["width"]),
+            "--height", str(match["height"]),
+            "--fps", str(match["fps"]),
+        ]
+        state.realsense_preview_processes[camera_key] = subprocess.Popen(
+            command,
+            cwd=state.repo_root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
 
 def _realsense_preview_status(state: GatewayState) -> dict[str, Any]:
-    _image_path, status_path = _realsense_preview_paths(state)
-    payload = _load_json_file(status_path)
-    process = state.realsense_preview_process
-    process_running = process is not None and process.poll() is None
-    if not payload:
+    matches = _replay_realsense_camera_matches(state)
+    by_key = {str(match["cameraKey"]): match for match in matches}
+    cameras: list[dict[str, Any]] = []
+    for camera_key, match in by_key.items():
+        _image_path, status_path = _realsense_preview_paths(state, camera_key)
+        payload = _load_json_file(status_path)
+        process = state.realsense_preview_processes.get(camera_key)
+        process_running = process is not None and process.poll() is None
+        if not payload:
+            payload = {
+                "available": None,
+                "running": process_running,
+                "error": "Waiting for RealSense detection" if process_running else "Preview starts with real-robot replay",
+            }
+        payload = dict(payload)
+        payload.update({"cameraKey": camera_key, "configKey": match["configKey"], "serial": match["serial"]})
+        payload["running"] = bool(payload.get("running")) and process_running
+        cameras.append(payload)
+    if not cameras:
         return {
             "available": None,
-            "running": process_running,
-            "error": "Waiting for RealSense detection" if process_running else "Preview starts with real-robot replay",
+            "running": False,
+            "cameras": [],
+            "error": "No dataset camera stream matches a configured RealSense camera.",
         }
-    payload["running"] = bool(payload.get("running")) and process_running
-    return payload
+    first = cameras[0]
+    return {
+        "available": any(camera.get("available") is True for camera in cameras),
+        "running": any(bool(camera.get("running")) for camera in cameras),
+        "serial": first.get("serial"),
+        "width": first.get("width"),
+        "height": first.get("height"),
+        "fps": first.get("fps"),
+        "error": "; ".join(str(camera.get("error")) for camera in cameras if camera.get("error")),
+        "cameras": cameras,
+    }
 
 
 def _start_real_replay(
@@ -8238,7 +8452,7 @@ def _start_real_replay(
 
     # Re-run hardware checks against the exact IP selected in this panel;
     # a prior preflight for a different arm must never authorize motion here.
-    _start_realsense_preview(state)
+    _start_realsense_preview(state, dataset_root)
     _append_real_replay_log(state, "camera", "RealSense monitor requested")
     try:
         _run_real_preflight(state, [selected_ip])
@@ -8507,8 +8721,12 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             _json_response(self, HTTPStatus.OK, payload)
             return
         if path == "/api/replay/realsense.jpg":
+            camera_key = (query.get("key", [""])[0] or "").strip()
             with self.server.state.lock:
-                image_path, _status_path = _realsense_preview_paths(self.server.state)
+                if not camera_key:
+                    matches = _replay_realsense_camera_matches(self.server.state)
+                    camera_key = str(matches[0]["cameraKey"]) if matches else "default"
+                image_path, _status_path = _realsense_preview_paths(self.server.state, camera_key)
             if not image_path.is_file():
                 _json_response(self, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "No RealSense preview frame available"})
                 return

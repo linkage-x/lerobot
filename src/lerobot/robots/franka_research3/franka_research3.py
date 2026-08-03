@@ -716,7 +716,12 @@ class FrankaResearch3(Robot):
         if hold_current_joints:
             target_joints_rad = np.asarray(target_joints_rad, dtype=np.float64).copy()
         else:
-            target_joints_rad = self._kinematics.inverse_kinematics(joint_positions_rad, desired_pose)
+            ik_kwargs: dict[str, float] = {}
+            if self.config.ik_orientation_weight is not None:
+                ik_kwargs["orientation_weight"] = float(self.config.ik_orientation_weight)
+            target_joints_rad = self._kinematics.inverse_kinematics(
+                joint_positions_rad, desired_pose, **ik_kwargs
+            )
         if self._otg is not None:
             with self._otg_target_lock:
                 self._otg_target_joints = np.asarray(target_joints_rad, dtype=np.float64).copy()

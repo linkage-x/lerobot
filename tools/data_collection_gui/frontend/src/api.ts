@@ -71,9 +71,13 @@ export type GuiSnapshot = {
   notice?: string;
 };
 
+/** A command the gateway rejected. Held until read so the 1s snapshot poll cannot bury it. */
+export type CommandFailure = { endpoint: string; command: string; message: string };
+
 export class DataCollectionGuiApi {
   private readonly apiBase = import.meta.env.VITE_GUI_API_BASE ?? "";
   private usingRemote = false;
+  private commandFailure: CommandFailure | null = null;
   private snapshot: GuiSnapshot = {
     deployment: {
       profile: "thor",
@@ -615,8 +619,12 @@ export class DataCollectionGuiApi {
     return `${this.apiBase}/api/replay/mujoco-video?${params.toString()}`;
   }
 
-  realSenseSnapshotUrl(cacheKey: number): string {
-    return `${this.apiBase}/api/replay/realsense.jpg?t=${cacheKey}`;
+  realSenseSnapshotUrl(cacheKey: number, cameraKey?: string): string {
+    const params = new URLSearchParams({ t: String(cacheKey) });
+    if (cameraKey) {
+      params.set("key", cameraKey);
+    }
+    return `${this.apiBase}/api/replay/realsense.jpg?${params.toString()}`;
   }
 
   async fetchRealSenseStatus(): Promise<RealSensePreviewStatus | null> {
@@ -988,8 +996,22 @@ export class DataCollectionGuiApi {
     return `HTTP ${response.status}`;
   }
 
+  /**
+   * Take the last rejected command, if any.
+   *
+   * The per-page fields written below live in the snapshot, which the 1s poll replaces with the
+   * gateway's own state -- so a rejection was visible for less than a poll interval and a failed
+   * command looked like a command that did nothing. This survives until someone reads it.
+   */
+  consumeCommandFailure(): CommandFailure | null {
+    const failure = this.commandFailure;
+    this.commandFailure = null;
+    return failure;
+  }
+
   private applyRemoteCommandError(endpoint: string, message: string) {
     const command = endpoint.split("?")[0].split("/").filter(Boolean).at(-1) ?? "command";
+    this.commandFailure = { endpoint, command, message };
     if (endpoint.includes("/handheld/record/")) {
       this.snapshot.recording = {
         ...this.snapshot.recording,

@@ -93,6 +93,8 @@ function App() {
   const [snapshot, setSnapshot] = useState<GuiSnapshot | null>(null);
   const [busy, setBusy] = useState(false);
   const [activePage, setActivePage] = useState<PageId>(() => pageFromHash());
+  // Kept outside the snapshot on purpose: the snapshot is replaced wholesale by the poll below.
+  const [commandError, setCommandError] = useState<string | null>(null);
   const loadingRef = useRef(false);
 
   useEffect(() => {
@@ -142,10 +144,18 @@ function App() {
     };
   }, []);
 
-  async function run(command: () => Promise<GuiSnapshot>) {
+  /** Run a gateway command; false means the gateway rejected it and `commandError` now says why. */
+  async function run(command: () => Promise<GuiSnapshot>): Promise<boolean> {
     setBusy(true);
+    api.consumeCommandFailure();
     try {
       setSnapshot(await command());
+      const failure = api.consumeCommandFailure();
+      setCommandError(failure ? `${failure.command}: ${failure.message}` : null);
+      return failure === null;
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : String(error));
+      return false;
     } finally {
       setBusy(false);
     }
@@ -173,13 +183,17 @@ function App() {
   const recorderWriting = ["recording", "saving", "discarding"].includes(snapshot.recording.state);
 
   async function selectAndOpenReplay(path: string) {
-    await run(() => api.selectRecordedDataset(path));
-    navigate("episode-replay");
+    // Navigating after a rejected selection is what made a failed "Open in Replay" look like a
+    // no-op: the page changed but kept showing whatever dataset was selected before.
+    if (await run(() => api.selectRecordedDataset(path))) {
+      navigate("episode-replay");
+    }
   }
 
   async function queueTrajGenAndOpenProcessing(path: string) {
-    await run(() => api.queueTrajGen(path));
-    navigate("dataset-processing");
+    if (await run(() => api.queueTrajGen(path))) {
+      navigate("dataset-processing");
+    }
   }
 
   const latestRecordedPath =
@@ -363,6 +377,14 @@ function App() {
           <span><StatusDot state={snapshot.replay.safety === "fault" ? "error" : snapshot.replay.safety === "active" ? "running" : "idle"} /> Replay safety {snapshot.replay.safety}</span>
         </div>
       </header>
+      {commandError ? (
+        <div className="command-error" role="alert">
+          <span>{commandError}</span>
+          <button type="button" onClick={() => setCommandError(null)} aria-label="Dismiss error">
+            ×
+          </button>
+        </div>
+      ) : null}
       <div className="factory-layout">
         <SidebarNav activePage={activePage} onNavigate={navigate} snapshot={snapshot} />
         <section className="page-content">{pageNode}</section>

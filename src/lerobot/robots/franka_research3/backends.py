@@ -1417,11 +1417,18 @@ class HirolLMKinematicsDriver:
         self._pin.updateFramePlacements(self._model, self._data)
         return np.asarray(self._data.oMf[self._frame_id].homogeneous, dtype=np.float64)
 
-    def inverse_kinematics(self, current_joint_positions_rad: np.ndarray, desired_pose: np.ndarray) -> np.ndarray:
+    def inverse_kinematics(
+        self,
+        current_joint_positions_rad: np.ndarray,
+        desired_pose: np.ndarray,
+        *,
+        orientation_weight: float | None = None,
+    ) -> np.ndarray:
         q = np.asarray(current_joint_positions_rad, dtype=np.float64).reshape(self._model.nq)
         q = np.clip(q, self._lower_limits, self._upper_limits)
         target_pose = np.asarray(desired_pose, dtype=np.float64).reshape(4, 4)
         target_placement = self._pin.SE3(target_pose[:3, :3], target_pose[:3, 3])
+        resolved_orientation_weight = 1.0 if orientation_weight is None else float(orientation_weight)
 
         lambda_k = 0.1
         lambda_min = 1e-6
@@ -1434,14 +1441,18 @@ class HirolLMKinematicsDriver:
             self._pin.updateFramePlacements(self._model, self._data)
             current_placement = self._data.oMf[self._frame_id]
             err_se3 = self._pin.log(current_placement.inverse() * target_placement).vector
-            error_norm = float(np.linalg.norm(err_se3))
+            weighted_err = err_se3.copy()
+            weighted_err[3:] *= resolved_orientation_weight
+            error_norm = float(np.linalg.norm(weighted_err))
             if error_norm < self.tolerance:
                 break
 
             self._pin.computeJointJacobians(self._model, self._data, q)
             jacobian = self._pin.getFrameJacobian(self._model, self._data, self._frame_id, self._pin.LOCAL)
-            jtj = jacobian.T @ jacobian
-            jt_err = jacobian.T @ err_se3
+            weighted_jacobian = jacobian.copy()
+            weighted_jacobian[3:, :] *= resolved_orientation_weight
+            jtj = weighted_jacobian.T @ weighted_jacobian
+            jt_err = weighted_jacobian.T @ weighted_err
             try:
                 delta_q = np.linalg.solve(jtj + lambda_k * np.eye(self._model.nv), jt_err)
             except np.linalg.LinAlgError:
@@ -1452,7 +1463,9 @@ class HirolLMKinematicsDriver:
             self._pin.forwardKinematics(self._model, self._data, q_candidate)
             self._pin.updateFramePlacements(self._model, self._data)
             candidate_error = self._pin.log(self._data.oMf[self._frame_id].inverse() * target_placement).vector
-            if float(np.linalg.norm(candidate_error)) < error_norm:
+            weighted_candidate_error = candidate_error.copy()
+            weighted_candidate_error[3:] *= resolved_orientation_weight
+            if float(np.linalg.norm(weighted_candidate_error)) < error_norm:
                 q = q_candidate
                 lambda_k = max(lambda_min, lambda_k / lambda_factor)
             else:
@@ -1501,11 +1514,18 @@ class HirolGaussianNewtonKinematicsDriver:
         self._pin.updateFramePlacements(self._model, self._data)
         return np.asarray(self._data.oMf[self._frame_id].homogeneous, dtype=np.float64)
 
-    def inverse_kinematics(self, current_joint_positions_rad: np.ndarray, desired_pose: np.ndarray) -> np.ndarray:
+    def inverse_kinematics(
+        self,
+        current_joint_positions_rad: np.ndarray,
+        desired_pose: np.ndarray,
+        *,
+        orientation_weight: float | None = None,
+    ) -> np.ndarray:
         q = np.asarray(current_joint_positions_rad, dtype=np.float64).reshape(self._model.nq)
         q = np.clip(q, self._lower_limits, self._upper_limits)
         target_pose = np.asarray(desired_pose, dtype=np.float64).reshape(4, 4)
         target_placement = self._pin.SE3(target_pose[:3, :3], target_pose[:3, 3])
+        resolved_orientation_weight = 1.0 if orientation_weight is None else float(orientation_weight)
         error_norm = float("inf")
 
         for _ in range(int(self.max_iterations)):
@@ -1513,18 +1533,22 @@ class HirolGaussianNewtonKinematicsDriver:
             self._pin.updateFramePlacements(self._model, self._data)
             current_placement = self._data.oMf[self._frame_id]
             err_se3 = self._pin.log(current_placement.inverse() * target_placement).vector
-            error_norm = float(np.linalg.norm(err_se3))
+            weighted_err = err_se3.copy()
+            weighted_err[3:] *= resolved_orientation_weight
+            error_norm = float(np.linalg.norm(weighted_err))
             if error_norm < self.tolerance:
                 break
 
             self._pin.computeJointJacobians(self._model, self._data, q)
             jacobian = self._pin.getFrameJacobian(self._model, self._data, self._frame_id, self._pin.LOCAL)
-            jjt = jacobian @ jacobian.T
+            weighted_jacobian = jacobian.copy()
+            weighted_jacobian[3:, :] *= resolved_orientation_weight
+            jjt = weighted_jacobian @ weighted_jacobian.T
             try:
-                step_twist = np.linalg.solve(jjt, err_se3)
+                step_twist = np.linalg.solve(jjt, weighted_err)
             except np.linalg.LinAlgError:
-                step_twist = np.linalg.solve(jjt + self.damping * np.eye(6), err_se3)
-            delta_q = jacobian.T @ step_twist
+                step_twist = np.linalg.solve(jjt + self.damping * np.eye(6), weighted_err)
+            delta_q = weighted_jacobian.T @ step_twist
             q = np.clip(q + delta_q, self._lower_limits, self._upper_limits)
 
         if error_norm >= self.tolerance:

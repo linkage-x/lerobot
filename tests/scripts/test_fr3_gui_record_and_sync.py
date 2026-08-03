@@ -95,6 +95,67 @@ def test_sim_backend_rejects_mixed_camera_resolutions(tmp_path):
         build_sim_robot_config(cfg)
 
 
+def test_real_replay_config_maps_container_urdf_to_host_checkout(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tools.fr3 import fr3_gui_replay_runtime
+
+    def fake_resolve(value: str) -> str:
+        if value.startswith("/lerobot/"):
+            return str(tmp_path / value.removeprefix("/lerobot/"))
+        return value
+
+    robot_cfg = SimpleNamespace(
+        urdf_path="/lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf",
+        robot_ip="192.168.1.1",
+        cameras={"ee": object()},
+    )
+    args = SimpleNamespace(backend="real", robot_ip="192.168.1.206", ik_orientation_weight=0.012)
+    monkeypatch.setattr(fr3_gui_replay_runtime, "_resolve_workspace_path", fake_resolve)
+
+    resolved = fr3_gui_replay_runtime._replay_robot_config(SimpleNamespace(robot=robot_cfg), args, fps=30)
+
+    assert resolved is robot_cfg
+    assert resolved.urdf_path == str(
+        tmp_path / "src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf"
+    )
+    assert resolved.robot_ip == "192.168.1.206"
+    assert resolved.ik_orientation_weight == pytest.approx(0.012)
+    assert resolved.cameras == {}
+
+
+def test_real_replay_start_settle_paces_hardware_between_attempts(monkeypatch):
+    from tools.fr3 import fr3_gui_replay_runtime
+
+    class StationaryRobot:
+        def __init__(self):
+            self.commands = []
+
+        def send_action(self, action):
+            self.commands.append(dict(action))
+
+        def get_observation(self, *, include_cameras: bool = True):
+            assert include_cameras is False
+            return {"ee.x": 0.0, "ee.y": 0.0, "ee.z": 0.0}
+
+    sleeps = []
+    monkeypatch.setattr(fr3_gui_replay_runtime.time, "perf_counter", lambda: 10.0)
+    monkeypatch.setattr(fr3_gui_replay_runtime.time, "sleep", sleeps.append)
+
+    residual_mm = fr3_gui_replay_runtime._settle_to_start_pose(
+        StationaryRobot(),
+        target_position=np.array([0.001, 0.0, 0.0], dtype=np.float64),
+        target_quaternion=np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+        target_gripper=1.0,
+        settle_steps=3,
+        settle_tolerance_mm=0.1,
+        settle_period_s=1.0 / 30.0,
+    )
+
+    assert residual_mm == pytest.approx(1.0)
+    assert sleeps == pytest.approx([1.0 / 30.0, 1.0 / 30.0])
+
+
 def test_sim_and_hardware_robots_declare_the_same_observation_schema(tmp_path):
     """A sim dataset must be interchangeable with a hardware one, feature for feature."""
     from lerobot.robots.franka_research3 import FrankaResearch3, FrankaResearch3Mujoco
@@ -335,6 +396,19 @@ def test_a_passing_mujoco_score_does_not_authorize_the_hardware_path(tmp_path, m
     assert state.replay.safety == "locked"
 
 
+def test_workstation_mujoco_validation_uses_position_prioritized_ik(tmp_path):
+    state = _workstation_state(tmp_path)
+    state.replay.episode = 3
+    state.replay.fps = 30
+
+    command = gateway._mujoco_replay_command(state, tmp_path / "ds")
+
+    assert str(tmp_path / "tools/fr3/fr3_gui_replay_runtime.py") in command
+    assert "--ik-orientation-weight" in command
+    assert command[command.index("--ik-orientation-weight") + 1] == "0.012"
+    assert "--backend" not in command
+
+
 def test_workstation_real_replay_drives_the_shared_runtime_not_the_cube_script(tmp_path):
     """One runtime for both. A real replay that rebuilt its trajectory by different code from the
     run that cleared it would validate one thing and execute another."""
@@ -350,9 +424,36 @@ def test_workstation_real_replay_drives_the_shared_runtime_not_the_cube_script(t
     assert "--backend" in command and command[command.index("--backend") + 1] == "real"
     assert command[command.index("--robot-ip") + 1] == "192.168.1.206"
     assert command[command.index("--episode") + 1] == "3"
+    assert "--ik-orientation-weight" in command
+    assert command[command.index("--ik-orientation-weight") + 1] == "0.012"
+    assert "--settle-steps" in command
+    assert command[command.index("--settle-steps") + 1] == "300"
+    assert "--settle-tolerance-mm" in command
+    assert command[command.index("--settle-tolerance-mm") + 1] == "6.0"
     # Nothing from the AprilTag route may leak in: no cube selection, no Thor config.
     assert "--cube" not in command
     assert not any("opencv_kalibr" in part for part in command)
+
+
+def test_workstation_real_preflight_uses_fr3_config_not_the_cube_script(tmp_path):
+    state = _workstation_state(tmp_path)
+    fr3_python = tmp_path / ".venv-fr3" / "bin" / "python"
+    fr3_python.parent.mkdir(parents=True)
+    fr3_python.touch()
+
+    command = gateway._real_preflight_command(state, "192.168.1.206")
+
+    assert command[0] == str(fr3_python)
+    assert str(tmp_path / "tools/fr3/fr3_record_preflight.py") in command
+    assert f"--config-path={state.config_path}" in command
+    assert "--robot-ip=192.168.1.206" in command
+    assert "--skip-host-imports" in command
+    assert "--skip-hikrobot" in command
+    assert "--skip-gripper" in command
+    # Workstation replays recorded EE actions. The AprilTag/Thor cube route must not leak into
+    # its hardware authorization path.
+    assert not any("opencv_kalibr" in part for part in command)
+    assert not any("replay_cube_pose_in_robot_base.thor.yaml" in part for part in command)
 
 
 def test_thor_real_replay_still_drives_the_cube_script(tmp_path):
@@ -518,6 +619,31 @@ def test_replay_still_reads_an_absolute_ee_dataset_unchanged():
     assert source == "absolute_ee action column"
     assert np.allclose(positions[0], [0.5, 0.1, 0.35])
     assert np.allclose(quaternions[0], [0.0, 0.0, 0.0, 1.0])
+
+
+def test_replay_preview_survives_a_renderer_that_cannot_open_a_gl_context(tmp_path):
+    """A dead offscreen renderer must cost the video, not the validation.
+
+    MuJoCo validation gates real-robot replay. On a box where the EGL context cannot be created
+    the first render raised inside the replay loop, so the run ended with no metrics at all and
+    the operator saw "MuJoCo replay failed" for a reason that has nothing to do with the
+    trajectory.
+    """
+    from tools.fr3.fr3_gui_replay_runtime import _PreviewVideoWriter, _preview_frame
+
+    class DeadRenderer:
+        def render_preview_frame(self):
+            raise RuntimeError("could not initialize EGL")
+
+    video = _PreviewVideoWriter(tmp_path / "episode_000000.mp4", fps=30)
+    robot = DeadRenderer()
+
+    assert _preview_frame(robot, video) is None
+    assert "could not initialize EGL" in str(video.error)
+    # And it stops asking: one dead renderer, one report, not one per frame.
+    assert _preview_frame(robot, video) is None
+    video.append(None)
+    assert video.frames_written == 0
 
 
 def test_replay_rejects_an_unknown_action_contract():

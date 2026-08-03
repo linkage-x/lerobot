@@ -1831,6 +1831,113 @@ button.danger {
   text-align: center;
 }
 
+.realsense-monitor.replay-camera-compare {
+  min-height: 0;
+}
+
+.replay-camera-compare .realsense-monitor-heading {
+  position: static;
+}
+
+.replay-camera-compare-grid {
+  display: grid;
+  gap: 12px;
+  padding: 10px;
+}
+
+.replay-camera-pair {
+  background: #071014;
+  border: 1px solid #1f2c33;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.replay-camera-pair-heading {
+  align-items: center;
+  color: #e8f0f3;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding: 8px 10px;
+}
+
+.replay-camera-pair-heading span {
+  color: #91a6af;
+  font-size: 11px;
+}
+
+.replay-camera-pair-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 0 10px 10px;
+}
+
+.replay-camera-card {
+  background: #0c1216;
+  border: 1px solid #26343c;
+  border-radius: 7px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.replay-camera-card-heading {
+  align-items: center;
+  color: #e5edf1;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding: 8px 10px;
+}
+
+.replay-camera-card-heading span {
+  color: #95a8b1;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.replay-camera-media {
+  align-items: center;
+  background: #050709;
+  display: flex;
+  height: 260px;
+  justify-content: center;
+}
+
+.replay-camera-media img,
+.replay-camera-media video {
+  display: block;
+  height: 260px;
+  object-fit: contain;
+  width: 100%;
+}
+
+.replay-camera-media .realsense-monitor-empty {
+  height: 260px;
+  padding: 18px;
+}
+
+.replay-camera-no-match {
+  height: 260px;
+}
+
+.replay-camera-note {
+  border-top: 1px solid #1f2c33;
+  color: #9fb2bb;
+  font-size: 12px;
+  line-height: 1.4;
+  margin: 0;
+  padding: 0 12px 12px;
+}
+
+@media (max-width: 1100px) {
+  .replay-camera-pair-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 900px) {
   .real-robot-layout {
     grid-template-columns: 1fr;
@@ -3543,4 +3650,75 @@ button.danger {
   display: block;
   margin-top: 6px;
   overflow-wrap: anywhere;
+}
+
+/* Gateway command rejections. Rendered outside the snapshot-driven page body so the 1s poll
+   cannot overwrite them; dismissed by the operator, not by the next tick. */
+.command-error {
+  align-items: center;
+  background: #fdecea;
+  border-bottom: 1px solid #f0b8ae;
+  color: #8d2d12;
+  display: flex;
+  font-size: 13px;
+  font-weight: 650;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 10px 20px;
+}
+
+.command-error button {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font-size: 18px;
+  line-height: 1;
+  min-height: 0;
+  padding: 0 4px;
+}
+
+/* Training views built from a recording, listed under that recording. */
+.view-list {
+  border-top: 1px dashed #d2d9de;
+  display: grid;
+  gap: 6px;
+  grid-column: 1 / -1;
+  margin-top: 2px;
+  padding-top: 8px;
+}
+
+.view-row {
+  align-items: center;
+  background: #f5f8fa;
+  border: 1px solid #e1e6ea;
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 8px 9px;
+}
+
+.view-row.pending {
+  background: #eef8f7;
+  border-color: #9ecbc6;
+}
+
+.view-row strong {
+  font-size: 13px;
+}
+
+.view-row p {
+  color: #60707c;
+  font-size: 12px;
+  margin: 3px 0 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.view-row .view-path {
+  color: #87939d;
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }

@@ -1079,7 +1079,11 @@ def main() -> None:
         args.action_npy = DEFAULT_DERIVED_ACTION
 
     tag = f"{args.policy}_{'_'.join(key.split('.')[-1] for key in cameras)}"
-    args.job_name = args.job_name or f"single_cube2_{tag}"
+    # The job name names the training output dir and the checkpoint path the generated inference
+    # config points at, so it has to identify *this* run. A fixed default (it used to be the
+    # single_cube2 task this script was written for) makes every dataset train into one directory
+    # and quietly overwrite the previous checkpoints.
+    args.job_name = args.job_name or f"{Path(args.dataset_root).name}_{tag}"
     view_root = args.view_root or Path("outputs/datasets") / args.job_name
     args.output_dir = args.output_dir or Path("outputs/train") / args.job_name
     config_path = view_root / "train_config.generated.json"
@@ -1122,7 +1126,12 @@ def main() -> None:
         print(f"[prepare] dataset view: {view_root}")
         print(f"[prepare] train config: {config_path}")
         print(f"[prepare] inference config: {inference_config_path}")
-    print(f"[prepare] output dir: {args.output_dir}")
+    if args.prepare_only:
+        # Nothing is written here in prepare-only mode; say so, or the last line of the run reads
+        # as if a training directory had just been produced.
+        print(f"[prepare] training output dir (created when this view is trained): {args.output_dir}")
+    else:
+        print(f"[prepare] output dir: {args.output_dir}")
     if args.smoke:
         run_smoke(args, view_root, args.repo_id)
     if args.prepare_only:

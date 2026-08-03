@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useState } from "react";
 import type { GuiSnapshot } from "../api";
-import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
-import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation, taskStatusLabel, taskStatusDot } from "../shared/ui";
+import type { RecordedDataset } from "../types";
+import { StatusDot, Metric, PageHeader, stateLabel, taskStatusDot } from "../shared/ui";
 
 type ActionMode = "absolute_ee" | "delta_ee_from_prev_cmd" | "delta_ee_from_current";
 
@@ -23,6 +23,10 @@ const actionModeCopy: Record<ActionMode, { label: string; blurb: string }> = {
   }
 };
 
+function contractLabel(contract: string): string {
+  return actionModeCopy[contract as ActionMode]?.label ?? contract;
+}
+
 /** Workstation counterpart of Dataset Export: build the policy-ready view of a v3 recording. */
 function TrainingViewPage({
   snapshot,
@@ -38,7 +42,18 @@ function TrainingViewPage({
   const exportStatus = snapshot.datasetExport;
   const building = exportStatus.state === "exporting";
   const [actionMode, setActionMode] = useState<ActionMode>("delta_ee_from_prev_cmd");
-  const datasets = snapshot.recordedDatasets ?? [];
+  const allDatasets = snapshot.recordedDatasets ?? [];
+  // Views are replay candidates, so they arrive in the same list as the recordings. They belong
+  // under the recording they were derived from, not next to it as another build source.
+  const datasets = allDatasets.filter((dataset) => dataset.datasetKind !== "training_view");
+  const viewsFor = (dataset: RecordedDataset) =>
+    allDatasets.filter(
+      (candidate) =>
+        candidate.datasetKind === "training_view" &&
+        (candidate.viewOf
+          ? candidate.viewOf === dataset.path
+          : candidate.viewOfName === dataset.name || candidate.name.startsWith(`${dataset.name}__`))
+    );
 
   return (
     <div className="page-stack">
@@ -82,48 +97,82 @@ function TrainingViewPage({
           <div className="empty-dataset-list">No recorded datasets yet. Record an episode first.</div>
         ) : (
           <div className="processing-list">
-            {datasets.map((dataset) => (
-              <div className="processing-row" key={dataset.path}>
-                <div className="processing-row-main static">
-                  <div>
-                    <div className="row-title">
-                      <strong>{dataset.name}</strong>
+            {datasets.map((dataset) => {
+              const views = viewsFor(dataset);
+              const buildingThis = building && exportStatus.datasetRoot === dataset.path;
+              return (
+                <div className="processing-row" key={dataset.path}>
+                  <div className="processing-row-main static">
+                    <div>
+                      <div className="row-title">
+                        <strong>{dataset.name}</strong>
+                      </div>
+                      <p>
+                        {dataset.totalEpisodes} episode(s) · {dataset.totalFrames} frames · {dataset.path}
+                      </p>
                     </div>
-                    <p>
-                      {dataset.totalEpisodes} episode(s) · {dataset.totalFrames} frames · {dataset.path}
-                    </p>
+                    <div className="processing-stats">
+                      <button
+                        disabled={busy || building}
+                        onClick={() => onBuildView(dataset.path, actionMode)}
+                      >
+                        {buildingThis ? "Building…" : "Build View"}
+                      </button>
+                    </div>
                   </div>
-                  <div className="processing-stats">
-                    <button
-                      disabled={busy || building}
-                      onClick={() => onBuildView(dataset.path, actionMode)}
-                    >
-                      {building && exportStatus.datasetRoot === dataset.path ? "Building…" : "Build View"}
-                    </button>
-                  </div>
+                  {views.length > 0 || buildingThis ? (
+                    <div className="view-list">
+                      {views.map((view) => (
+                        <div className="view-row" key={view.path}>
+                          <div>
+                            <strong>{contractLabel(view.actionContract ?? "")}</strong>
+                            <p>
+                              {view.totalEpisodes} episode(s) · {view.totalFrames} frames · built {view.updatedAt}
+                            </p>
+                            <p className="view-path">{view.path}</p>
+                          </div>
+                          <button disabled={busy || building} onClick={() => onOpenReplay(view.path)}>
+                            Open in Replay
+                          </button>
+                        </div>
+                      ))}
+                      {buildingThis ? (
+                        <div className="view-row pending">
+                          <div>
+                            <strong>{contractLabel(exportStatus.target)}</strong>
+                            <p>{exportStatus.message || "Building…"}</p>
+                          </div>
+                          <StatusDot state="running" />
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
-        {exportStatus.state !== "idle" && (
+      </section>
+
+      {exportStatus.state !== "idle" && (
+        <section className="panel">
+          <div className="panel-heading">
+            <h2>Build Status</h2>
+            <span className="state-pill">
+              <StatusDot state={exportStatus.state} />
+              {stateLabel(exportStatus.state)}
+            </span>
+          </div>
           <div className="summary-grid">
-            <Metric label="State" value={stateLabel(exportStatus.state)} />
-            <Metric label="Contract" value={exportStatus.target} />
             <Metric label="Source" value={exportStatus.datasetRoot || "—"} />
+            <Metric label="Contract" value={contractLabel(exportStatus.target)} />
             <Metric label="View" value={exportStatus.outputPath || "—"} />
             <Metric label="Episodes" value={exportStatus.selectedEpisodes} />
-            <Metric label="Message" value={exportStatus.message} />
+            <Metric label="Frames" value={exportStatus.totalFrames} />
+            <Metric label="Latest log" value={exportStatus.message || "—"} />
           </div>
-        )}
-        {exportStatus.outputPath ? (
-          <div className="control-row">
-            <button disabled={busy || building} onClick={() => onOpenReplay(exportStatus.outputPath)}>
-              Open in Replay
-            </button>
-          </div>
-        ) : null}
-      </section>
+        </section>
+      )}
     </div>
   );
 }

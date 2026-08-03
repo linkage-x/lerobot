@@ -56,6 +56,11 @@ class FR3MujocoEnvConfig:
     urdf_path: str = field(default_factory=_default_fr3_urdf_path)
     sim_xml_path: str = field(default_factory=_default_fr3_sim_xml_path)
     target_frame_name: str = "pika_task_tcp"
+    # Every EE pose this env reads or accepts is expressed in this body's frame, which is the
+    # frame the hardware FR3 reports poses in. The scene mounts the arm on a pedestal, so the
+    # MuJoCo world origin sits 0.4 m below the robot base; a dataset recorded in world
+    # coordinates would be offset from a hardware one by exactly that, for the same task.
+    base_frame_name: str = "fr3_link0"
     target_marker_name: str = "target"
     target_site_name: str = "target_site"
     tcp_marker_name: str = "TCP"
@@ -90,14 +95,20 @@ class FR3MujocoEnvConfig:
     camera_height: int = 256
     camera_width: int = 256
     enable_cameras: bool = False
+    # Fingers hovering 0.20 m above the table directly over the workspace object, approach axis
+    # straight down, closing along y -- the same wrist convention the hardware rig records in.
+    # Solved for `pika_gripper_ee` (the frame at the finger tips) rather than the task TCP, which
+    # sits 0.37 m off the hand. The previous values put the gripper somewhere plausible only while
+    # the MJCF still carried it in the wrong orientation; with the mount fixed they aimed it up
+    # and away from the table.
     initial_joint_positions: tuple[float, ...] = (
-        -0.09534768,
-        0.39794592,
-        -0.23614631,
-        -2.39008542,
-        1.72320219,
-        0.61671872,
-        2.14073504,
+        0.23486228,
+        -0.16457626,
+        -0.22702942,
+        -2.35687380,
+        -0.04549339,
+        2.19595640,
+        0.77724930,
     )
     initial_gripper: float = 1.0
     gripper_sim_steps: int = 640
@@ -297,6 +308,15 @@ class FR3MujocoEnv(gym.Env):
         self._tcp_body_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_BODY, self.cfg.target_frame_name)
         if self._tcp_body_id < 0:
             raise ValueError(f"TCP body '{self.cfg.target_frame_name}' not found in MuJoCo model.")
+        self._base_body_id = self._mujoco.mj_name2id(
+            self.model, self._mujoco.mjtObj.mjOBJ_BODY, self.cfg.base_frame_name
+        )
+        if self._base_body_id < 0:
+            raise ValueError(f"Robot base body '{self.cfg.base_frame_name}' not found in MuJoCo model.")
+        self._base_pose_world = self._static_world_pose(self._base_body_id)
+        self._base_pose_world_inv = np.eye(4, dtype=np.float64)
+        self._base_pose_world_inv[:3, :3] = self._base_pose_world[:3, :3].T
+        self._base_pose_world_inv[:3, 3] = -self._base_pose_world[:3, :3].T @ self._base_pose_world[:3, 3]
         self._gripper_base_body_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_BODY, "gripper_base")
         self._gripper_left_body_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_BODY, "gripper_left_link")
         self._gripper_right_body_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_BODY, "gripper_right_link")
@@ -554,19 +574,19 @@ class FR3MujocoEnv(gym.Env):
         command = float(np.clip(gripper_command, 0.0, 1.0))
         targets: dict[str, float] = {}
         for key, (lower, upper) in self._gripper_joint_limits.items():
-            closed = 0.0
-            if lower <= 0.0 <= upper:
-                closed = 0.0
-            else:
-                closed = lower if abs(lower) < abs(upper) else upper
-            open_target = lower if abs(lower) > abs(upper) else upper
+            # Match the hardware gripper convention: 0.0 is minimum aperture/closed and 1.0 is
+            # maximum aperture/open. In this MJCF the slide joints are physically open at q=0 and
+            # closed at the far end of their ranges, so the internal joint target is the inverse
+            # of the old command mapping.
+            open_target = 0.0 if lower <= 0.0 <= upper else (lower if abs(lower) < abs(upper) else upper)
+            closed = lower if abs(lower) > abs(upper) else upper
             targets[key] = float(closed + command * (open_target - closed))
         return targets
 
     def _gripper_ctrl_from_command(self, gripper_command: float) -> float:
         command = float(np.clip(gripper_command, 0.0, 1.0))
         lower, upper = self._gripper_ctrl_range
-        return float(upper + command * (lower - upper))
+        return float(lower + command * (upper - lower))
 
     def _set_gripper_command(self, gripper_command: float, *, simulate: bool = False) -> None:
         with self._physics_lock:
@@ -622,8 +642,8 @@ class FR3MujocoEnv(gym.Env):
         openings: list[float] = []
         for key, qpos_index in self._gripper_joint_indices.items():
             lower, upper = self._gripper_joint_limits[key]
-            closed = 0.0 if lower <= 0.0 <= upper else (lower if abs(lower) < abs(upper) else upper)
-            open_target = lower if abs(lower) > abs(upper) else upper
+            open_target = 0.0 if lower <= 0.0 <= upper else (lower if abs(lower) < abs(upper) else upper)
+            closed = lower if abs(lower) > abs(upper) else upper
             span = open_target - closed
             if abs(span) < 1e-12:
                 continue
@@ -665,12 +685,48 @@ class FR3MujocoEnv(gym.Env):
         with self._physics_lock:
             return np.asarray(self.data.qpos[self._qpos_indices], dtype=np.float64).copy()
 
+    def _static_world_pose(self, body_id: int) -> np.ndarray:
+        """World pose of a body that no joint can move, composed from the model tree.
+
+        Read off the model rather than ``data`` so it is available before the first
+        ``mj_forward``, and refuse the case it would silently get wrong: a joint anywhere between
+        the world and this body means the pose is a function of state, and every caller here
+        treats it as a constant.
+        """
+        pose = np.eye(4, dtype=np.float64)
+        body = int(body_id)
+        while body > 0:
+            if int(self.model.body_jntnum[body]) != 0:
+                name = self._mujoco.mj_id2name(self.model, self._mujoco.mjtObj.mjOBJ_BODY, body)
+                raise ValueError(
+                    f"Body '{name}' carries a joint, so the pose of "
+                    f"'{self.cfg.base_frame_name}' is not fixed in the world; this env assumes a "
+                    "bolted-down arm."
+                )
+            local = np.eye(4, dtype=np.float64)
+            rotation = np.zeros(9, dtype=np.float64)
+            self._mujoco.mju_quat2Mat(rotation, np.asarray(self.model.body_quat[body], dtype=np.float64))
+            local[:3, :3] = rotation.reshape(3, 3)
+            local[:3, 3] = np.asarray(self.model.body_pos[body], dtype=np.float64)
+            pose = local @ pose
+            body = int(self.model.body_parentid[body])
+        return pose
+
+    def _pose_to_base(self, world_pose: np.ndarray) -> np.ndarray:
+        """MuJoCo world frame -> robot base frame (the frame the hardware arm reports)."""
+        return self._base_pose_world_inv @ np.asarray(world_pose, dtype=np.float64)
+
+    def _pose_to_world(self, base_pose: np.ndarray) -> np.ndarray:
+        """Robot base frame -> MuJoCo world frame, for the kinematics helper and the scene."""
+        return self._base_pose_world @ np.asarray(base_pose, dtype=np.float64)
+
     def _current_tcp_pose(self) -> np.ndarray:
+        """Measured TCP pose in the robot base frame."""
         with self._physics_lock:
             pose = np.eye(4, dtype=np.float64)
             pose[:3, 3] = np.asarray(self.data.xpos[self._tcp_body_id], dtype=np.float64)
             pose[:3, :3] = np.asarray(self.data.xmat[self._tcp_body_id], dtype=np.float64).reshape(3, 3)
-            return pose
+            return self._pose_to_base(pose)
 
     def _update_visualization_state(self) -> None:
         self._tcp_pose = self._current_tcp_pose()
@@ -860,7 +916,9 @@ class FR3MujocoEnv(gym.Env):
         else:
             if self._hold_joint_target is None:
                 self._hold_joint_target = self._get_joint_positions().copy()
-            desired_pose = np.asarray(self._kinematics.forward_kinematics(self._hold_joint_target), dtype=np.float64)
+            desired_pose = self._pose_to_base(
+                np.asarray(self._kinematics.forward_kinematics(self._hold_joint_target), dtype=np.float64)
+            )
             hold_current_joints = True
 
         return desired_pose, hold_current_joints
@@ -894,7 +952,9 @@ class FR3MujocoEnv(gym.Env):
                     otg_steps, sender_steps = 0, 0
             else:
                 target_joints = np.asarray(
-                    self._kinematics.inverse_kinematics(current_joints, desired_pose, lock_orientation=True),
+                    self._kinematics.inverse_kinematics(
+                        current_joints, self._pose_to_world(desired_pose), lock_orientation=True
+                    ),
                     dtype=np.float64,
                 )
                 target_joints = np.clip(target_joints, self._joint_lower, self._joint_upper)
@@ -945,9 +1005,13 @@ class FR3MujocoEnv(gym.Env):
         gripper: float | None = None,
         control_period_s: float | None = None,
     ):
+        """Drive the TCP to ``target_pose``, given in the robot base frame."""
         target_pose = np.asarray(target_pose, dtype=np.float64).reshape(4, 4)
         current_joints = self._get_joint_positions()
-        target_joints = np.asarray(self._kinematics.inverse_kinematics(current_joints, target_pose), dtype=np.float64)
+        target_joints = np.asarray(
+            self._kinematics.inverse_kinematics(current_joints, self._pose_to_world(target_pose)),
+            dtype=np.float64,
+        )
         target_joints = np.clip(target_joints[: len(self.cfg.joint_names)], self._joint_lower, self._joint_upper)
 
         if self._otg is not None:
@@ -982,6 +1046,7 @@ class FR3MujocoEnv(gym.Env):
         *,
         gripper: float | None = None,
         control_period_s: float | None = None,
+        ik_orientation_weight: float | None = None,
     ):
         """Servo to an absolute TCP pose the way the real FR3 driver does.
 
@@ -990,12 +1055,20 @@ class FR3MujocoEnv(gym.Env):
         variant always advances a physics window (servo or OTG) so a simulated recording
         session behaves like the hardware one, and it is the path the MuJoCo-backed
         ``Robot`` adapter uses for ``send_action``.
+
+        ``target_pose`` is in the robot base frame, the same frame the hardware FR3 takes
+        commands in -- a recorded hardware trajectory replays here without conversion.
         """
         target_pose = np.asarray(target_pose, dtype=np.float64).reshape(4, 4)
         with self._physics_lock:
             current_joints = self._get_joint_positions()
             target_joints = np.asarray(
-                self._kinematics.inverse_kinematics(current_joints, target_pose), dtype=np.float64
+                self._kinematics.inverse_kinematics(
+                    current_joints,
+                    self._pose_to_world(target_pose),
+                    orientation_weight=ik_orientation_weight,
+                ),
+                dtype=np.float64,
             )
             target_joints = np.clip(target_joints[: len(self.cfg.joint_names)], self._joint_lower, self._joint_upper)
 

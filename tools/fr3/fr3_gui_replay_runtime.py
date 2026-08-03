@@ -60,7 +60,7 @@ from lerobot.robots.franka_research3.processor_franka_research3 import (  # noqa
 )
 from lerobot.utils.rotation import Rotation  # noqa: E402
 
-from tools.fr3.fr3_gui_record_runtime import build_sim_robot_config  # noqa: E402
+from tools.fr3.fr3_gui_record_runtime import build_sim_robot_config, _resolve_workspace_path  # noqa: E402
 
 ACTION_FEATURE = "action"
 OBSERVATION_FEATURE = "observation.state"
@@ -71,6 +71,84 @@ _PROGRESS_EVERY = 25
 
 def emit(line: str) -> None:
     print(line, flush=True)
+
+
+def _replay_robot_config(record_cfg: Any, args: argparse.Namespace, fps: int) -> Any:
+    real_backend = args.backend == "real"
+    if real_backend:
+        robot_cfg = record_cfg.robot
+        if args.robot_ip:
+            robot_cfg.robot_ip = args.robot_ip
+        robot_cfg.urdf_path = _resolve_workspace_path(str(getattr(robot_cfg, "urdf_path", "") or ""))
+        if args.ik_orientation_weight is not None:
+            robot_cfg.ik_orientation_weight = float(args.ik_orientation_weight)
+        # Cameras are the recorder's business. Opening them here would take the RealSense units
+        # away from the live monitor the operator is watching the arm through, and this loop
+        # never reads an image.
+        robot_cfg.cameras = {}
+        return robot_cfg
+
+    robot_cfg = build_sim_robot_config(record_cfg)
+    # Each replayed frame must be given the same amount of simulated time the recorder had
+    # between frames. Leaving this at the recorder's control frequency would advance physics
+    # by a fraction of a frame period per command and report tracking error that is really
+    # just an under-integrated servo window.
+    robot_cfg.teleop_control_frequency = float(max(fps, 1))
+    if args.ik_orientation_weight is not None:
+        robot_cfg.ik_orientation_weight = float(args.ik_orientation_weight)
+    return robot_cfg
+
+
+def _settle_to_start_pose(
+    robot: Any,
+    *,
+    target_position: np.ndarray,
+    target_quaternion: np.ndarray,
+    target_gripper: float,
+    settle_steps: int,
+    settle_tolerance_mm: float,
+    settle_period_s: float,
+) -> float:
+    settle_target = {
+        "ee.x": float(target_position[0]),
+        "ee.y": float(target_position[1]),
+        "ee.z": float(target_position[2]),
+        **dict(
+            zip(
+                ("ee.wx", "ee.wy", "ee.wz"),
+                (float(v) for v in Rotation.from_quat(target_quaternion).as_rotvec()),
+                strict=True,
+            )
+        ),
+        "gripper.pos": float(target_gripper),
+    }
+    settle_error_mm = float("inf")
+    total_steps = max(int(settle_steps), 0)
+    for step_index in range(total_steps):
+        loop_start_s = time.perf_counter()
+        robot.send_action(settle_target)
+        settle_observation = robot.get_observation(include_cameras=False)
+        settle_error_mm = float(
+            np.linalg.norm(
+                np.array(
+                    [
+                        settle_observation["ee.x"],
+                        settle_observation["ee.y"],
+                        settle_observation["ee.z"],
+                    ],
+                    dtype=np.float64,
+                )
+                - target_position
+            )
+            * 1e3
+        )
+        if settle_error_mm <= settle_tolerance_mm:
+            break
+        if settle_period_s > 0.0 and step_index + 1 < total_steps:
+            remaining_s = float(settle_period_s) - (time.perf_counter() - loop_start_s)
+            if remaining_s > 0.0:
+                time.sleep(remaining_s)
+    return settle_error_mm
 
 
 def _load_info(dataset_root: Path) -> dict[str, Any]:
@@ -275,21 +353,7 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
         record_cfg = draccus.load(RecordConfig, config_file)
     fps = int(args.fps or episode_data["fps"] or 30)
     real_backend = args.backend == "real"
-    if real_backend:
-        robot_cfg = record_cfg.robot
-        if args.robot_ip:
-            robot_cfg.robot_ip = args.robot_ip
-        # Cameras are the recorder's business. Opening them here would take the RealSense units
-        # away from the live monitor the operator is watching the arm through, and this loop
-        # never reads an image.
-        robot_cfg.cameras = {}
-    else:
-        robot_cfg = build_sim_robot_config(record_cfg)
-        # Each replayed frame must be given the same amount of simulated time the recorder had
-        # between frames. Leaving this at the recorder's control frequency would advance physics
-        # by a fraction of a frame period per command and report tracking error that is really
-        # just an under-integrated servo window.
-        robot_cfg.teleop_control_frequency = float(max(fps, 1))
+    robot_cfg = _replay_robot_config(record_cfg, args, fps)
     robot = make_robot_from_config(robot_cfg)
 
     frame_period_s = 1.0 / max(fps, 1)
@@ -309,39 +373,15 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
         # Unscored approach phase: the arm starts wherever it is, which is not where the
         # recording began. Without this, frame 0 is scored against a homing jump and every
         # episode "fails" for a reason that has nothing to do with the trajectory.
-        settle_target = {
-            "ee.x": float(action_positions[0][0]),
-            "ee.y": float(action_positions[0][1]),
-            "ee.z": float(action_positions[0][2]),
-            **dict(
-                zip(
-                    ("ee.wx", "ee.wy", "ee.wz"),
-                    (float(v) for v in Rotation.from_quat(action_quaternions[0]).as_rotvec()),
-                    strict=True,
-                )
-            ),
-            "gripper.pos": float(action_gripper[0]) if action_gripper is not None else 1.0,
-        }
-        settle_error_mm = float("inf")
-        for _ in range(args.settle_steps):
-            robot.send_action(settle_target)
-            settle_observation = robot.get_observation(include_cameras=False)
-            settle_error_mm = float(
-                np.linalg.norm(
-                    np.array(
-                        [
-                            settle_observation["ee.x"],
-                            settle_observation["ee.y"],
-                            settle_observation["ee.z"],
-                        ],
-                        dtype=np.float64,
-                    )
-                    - action_positions[0]
-                )
-                * 1e3
-            )
-            if settle_error_mm <= args.settle_tolerance_mm:
-                break
+        settle_error_mm = _settle_to_start_pose(
+            robot,
+            target_position=action_positions[0],
+            target_quaternion=action_quaternions[0],
+            target_gripper=float(action_gripper[0]) if action_gripper is not None else 1.0,
+            settle_steps=args.settle_steps,
+            settle_tolerance_mm=args.settle_tolerance_mm,
+            settle_period_s=frame_period_s if args.realtime else 0.0,
+        )
         emit(f"Approach to episode start pose: residual {settle_error_mm:.2f} mm")
         if settle_error_mm > args.settle_tolerance_mm:
             # Reported, not silently folded into the trajectory score: an arm that cannot even
@@ -387,7 +427,7 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
             rotation_errors_deg.append(_rotation_error_deg(target_quaternion, actual_quaternion))
             completed_frames += 1
             if video is not None:
-                video.append(robot.render_preview_frame())
+                video.append(_preview_frame(robot, video))
 
             if frame_index % _PROGRESS_EVERY == 0 or frame_index == total_frames - 1:
                 emit(f"Replayed {completed_frames}/{total_frames} frames")
@@ -513,6 +553,23 @@ class _PreviewVideoWriter:
             self._writer = None
 
 
+def _preview_frame(robot: Any, video: _PreviewVideoWriter) -> np.ndarray | None:
+    """Render one preview frame, or record why not and stop asking.
+
+    The encoder's failures were already swallowed, but the renderer's were not: on a machine
+    where the offscreen GL context cannot be created (headless box, EGL falling back to a dri2
+    screen it cannot open), the very first frame raised and took the whole validation with it --
+    losing the verdict over its illustration. The metrics do not need pixels.
+    """
+    if video.error is not None:
+        return None
+    try:
+        return robot.render_preview_frame()
+    except Exception as exc:  # noqa: BLE001 - a preview must never fail the replay
+        video.error = f"renderer unavailable: {exc}"
+        return None
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Replay an FR3 ee2ee episode in MuJoCo.")
     parser.add_argument("--dataset", type=Path, required=True)
@@ -536,6 +593,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # under 0.5x gravity compensation) and well below the 20 mm trajectory budget, so the
     # warning fires for genuinely unreachable start poses rather than for normal servo droop.
     parser.add_argument("--settle-tolerance-mm", type=float, default=5.0)
+    parser.add_argument(
+        "--ik-orientation-weight",
+        type=float,
+        default=None,
+        help=(
+            "Absolute-pose IK orientation weight for replay. "
+            "Omit to keep the robot backend default."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument(
         "--render-video",
