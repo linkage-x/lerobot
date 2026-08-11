@@ -19,11 +19,12 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Lock, Thread
+from threading import BoundedSemaphore, Lock, Thread
 from typing import Any, Iterable
 from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
@@ -214,11 +215,70 @@ class DatasetExportStatus:
 @dataclass
 class CalibrationStatus:
     state: str = "idle"
-    pattern: str = "ChArUco 5x7 (mock)"
+    pattern: str = "ChArUco 12x9 · 30 mm (charuco_400)"
     lastRunAt: str = ""
     message: str = "Run calibration to refresh extrinsics"
     cameras: list[dict[str, Any]] = field(default_factory=list)
     outputPath: str = ""
+    # Which calibration runs production is currently pointed at. The self-check
+    # records these with its baseline: a baseline that outlives the calibration
+    # it was taken against compares against a rig that no longer exists.
+    intrinsicsRun: str = ""
+    extrinsicsRun: str = ""
+
+
+@dataclass
+class CalibrationStep:
+    """One capture in the guided calibration.
+
+    Intrinsics need one sweep per camera because the binding constraint is how
+    much of *that* camera's frame the board reaches; extrinsics need a single
+    sweep that several cameras see at once, because the constraint is
+    co-visibility. They cannot share a capture.
+    """
+
+    kind: str  # "intrinsics" | "extrinsics"
+    camera: str  # "" for the extrinsics step
+    status: str = "pending"  # pending | recording | captured | skipped
+    episodeIndex: int = -1
+    note: str = ""
+
+
+@dataclass
+class CalibrationSession:
+    active: bool = False
+    stage: str = "idle"  # idle | capture | ready | solving | done | failed
+    datasetName: str = ""
+    datasetRoot: str = ""
+    steps: list[CalibrationStep] = field(default_factory=list)
+    currentIndex: int = 0
+    message: str = ""
+
+
+@dataclass
+class MarkerTcpSample:
+    id: str
+    side: str
+    condition: str
+    source: str = "recording"  # recording | static_transform
+    status: str = "pending"  # pending | recording | saved | discarded | registered
+    datasetRoot: str = ""
+    episodeIndex: int = -1
+    staticTransformPath: str = ""
+    note: str = ""
+    createdAt: str = ""
+
+
+@dataclass
+class MarkerTcpSession:
+    active: bool = False
+    sessionName: str = ""
+    sessionRoot: str = ""
+    stage: str = "idle"  # idle | capture | reporting | done | failed
+    samples: list[MarkerTcpSample] = field(default_factory=list)
+    pendingSampleId: str = ""
+    message: str = ""
+    reportPath: str = ""
 
 
 @dataclass
@@ -233,6 +293,8 @@ class GatewayState:
     exports_root: Path | None = None
     devices: list[dict[str, Any]] = field(default_factory=list)
     calibration: CalibrationStatus = field(default_factory=CalibrationStatus)
+    calibration_session: CalibrationSession = field(default_factory=CalibrationSession)
+    marker_tcp_session: MarkerTcpSession = field(default_factory=MarkerTcpSession)
     dataset_export: DatasetExportStatus = field(default_factory=DatasetExportStatus)
     teleop: TeleopStatus = field(default_factory=TeleopStatus)
     export_process: subprocess.Popen[str] | None = None
@@ -2183,50 +2245,873 @@ def _set_datasets_root(state: GatewayState, raw_path: str) -> bool:
     return created
 
 
-def _mock_calibrate_cameras(state: GatewayState) -> None:
-    cameras = [device for device in state.devices if device.get("kind") == "camera"]
-    if not cameras:
-        state.calibration.state = "failed"
-        state.calibration.message = "No cameras configured in handheld config"
-        state.calibration.cameras = []
-        state.calibration.lastRunAt = _now_iso()
-        state.log("warn", "Mock calibration aborted: no cameras configured")
-        return
+# --- Camera self-check -------------------------------------------------------
+#
+# Answers "has a fixed camera been bumped since it was calibrated?" by comparing
+# one frame per camera against a baseline captured at calibration time. The
+# analysis lives in metrology.cli.rig_shift_check; this side only grabs frames
+# and shells out, because the gateway deliberately carries no cv2.
+#
+# Frames come one at a time through the existing preview pipeline. Argus opens
+# are already serialized by the preview spawn lock, and asking for eleven at once
+# is the exact pattern that wedges it.
 
-    seed = int(time.time()) % 997
-    results: list[dict[str, Any]] = []
-    for index, device in enumerate(cameras):
-        # Deterministic-ish pseudo errors so the table feels alive without RNG imports.
-        reprojection = round(0.6 + ((seed + index * 17) % 23) / 25.0, 3)  # mm
-        baseline = round(80.0 + index * 95.0 + ((seed + index * 13) % 41), 1)  # mm
-        if reprojection < 1.2:
-            status = "pass"
-        elif reprojection < 1.8:
-            status = "warn"
-        else:
-            status = "fail"
-        results.append(
-            {
-                "id": str(device.get("id")),
-                "reprojectionMm": reprojection,
-                "baselineMm": baseline,
-                "status": status,
-            }
+_RIG_CHECK_SUBDIR = Path("outputs") / "metrology" / "rig_check"
+_RIG_CHECK_FRAME_TIMEOUT_S = 12.0
+
+
+def _rig_check_root(state: GatewayState) -> Path:
+    return state.repo_root / _RIG_CHECK_SUBDIR
+
+
+def _cv2_python(repo_root: Path) -> Path | None:
+    """First interpreter that can actually import cv2.
+
+    Checked rather than assumed: the gateway runs on the system python, which
+    has no cv2, and a missing import surfaces here as a clear message instead of
+    a traceback from a subprocess.
+    """
+    candidates = [
+        _venv_python3(repo_root, prefer_fr3=True),
+        Path("/home/nvidia/Code/infer/.venv-fr3/bin/python3"),
+        Path(sys.executable),
+    ]
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen or not candidate.is_file():
+            continue
+        seen.add(key)
+        try:
+            probe = subprocess.run(
+                [key, "-c", "import cv2"], capture_output=True, timeout=30, check=False
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
+            return candidate
+    return None
+
+
+def _cameras_busy_reason(state: GatewayState) -> str:
+    """Why the preview pipelines cannot open the cameras right now, if they can't.
+
+    The recorder holds Argus exclusively from Connect onwards -- including the
+    'armed' state, which is connected but not yet writing. Without this the
+    self-check would spend a full timeout per camera and then report an empty
+    result, which reads like a broken check rather than a busy rig.
+    """
+    if state.camera_preview_suspended:
+        return "相机已被录制器占用（Connect 之后 Argus 是独占的）。请先在采集页 Disconnect，再运行自检。"
+    if str(state.recording.state) in {"armed", "recording", "saving", "discarding", "review"}:
+        return (
+            f"录制会话处于 {state.recording.state} 状态，相机被占用。"
+            "请先 Disconnect 释放相机，再运行自检。"
+        )
+    return ""
+
+
+def _capture_camera_frames(state: GatewayState, out_dir: Path) -> tuple[list[str], list[dict[str, str]]]:
+    """One JPEG per configured camera, captured sequentially."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for stale in out_dir.glob("*.jpg"):
+        stale.unlink()
+
+    captured: list[str] = []
+    failed: list[dict[str, str]] = []
+    cameras = [device for device in state.devices if device.get("kind") == "camera"]
+    for device in cameras:
+        device_id = str(device.get("id"))
+        params = _camera_preview_params(state, device_id)
+        if params is None:
+            failed.append({"camera": device_id, "reason": "no preview parameters"})
+            continue
+        sensor_id, sensor_mode, width, height, fps = params
+        with state.camera_preview_lock:
+            state.camera_preview_last_access[device_id] = time.time()
+        if not _ensure_camera_preview(
+            state,
+            device_id=device_id,
+            sensor_id=sensor_id,
+            sensor_mode=sensor_mode,
+            source_width=width,
+            source_height=height,
+            source_fps=fps,
+        ):
+            failed.append({"camera": device_id, "reason": "preview pipeline unavailable"})
+            continue
+
+        deadline = time.monotonic() + _RIG_CHECK_FRAME_TIMEOUT_S
+        frame: bytes | None = None
+        while time.monotonic() < deadline:
+            with state.camera_preview_lock:
+                cached = state.camera_preview_frames.get(device_id)
+                state.camera_preview_last_access[device_id] = time.time()
+            if cached is not None:
+                frame = cached[0]
+                break
+            time.sleep(0.1)
+        if frame is None:
+            failed.append({"camera": device_id, "reason": "no frame within timeout"})
+            continue
+        (out_dir / f"{device_id}.jpg").write_bytes(frame)
+        captured.append(device_id)
+    return captured, failed
+
+
+def _rig_check_baseline_meta(state: GatewayState) -> dict[str, Any]:
+    path = _rig_check_root(state) / "baseline" / "baseline.json"
+    if not path.is_file():
+        return {"exists": False}
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"exists": False}
+    meta["exists"] = True
+    return meta
+
+
+def _capture_rig_check_baseline(state: GatewayState) -> dict[str, Any]:
+    """Record what the cameras see right now as the reference."""
+    busy = _cameras_busy_reason(state)
+    if busy:
+        return {"ok": False, "error": busy}
+    baseline_dir = _rig_check_root(state) / "baseline"
+    captured, failed = _capture_camera_frames(state, baseline_dir)
+    if not captured:
+        state.log("warn", "Rig-check baseline: no camera frames captured")
+        return {"ok": False, "error": "no camera frames captured", "failed": failed}
+
+    meta = {
+        "captured_at": _now_iso(),
+        "cameras": captured,
+        "failed": failed,
+        # Which calibration this baseline belongs to. A baseline outliving the
+        # calibration it was taken against is meaningless, so the pairing is
+        # recorded rather than assumed.
+        "intrinsics_run": state.calibration.intrinsicsRun,
+        "extrinsics_run": state.calibration.extrinsicsRun,
+    }
+    (baseline_dir / "baseline.json").write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    state.log("info", f"Rig-check baseline captured for {len(captured)} camera(s)")
+    return {"ok": True, "baseline": meta}
+
+
+def _run_rig_check(state: GatewayState) -> dict[str, Any]:
+    busy = _cameras_busy_reason(state)
+    if busy:
+        return {"ok": False, "error": busy}
+    root = _rig_check_root(state)
+    baseline_dir = root / "baseline"
+    if not any(baseline_dir.glob("*.jpg")):
+        return {
+            "ok": False,
+            "error": "no baseline captured yet",
+            "hint": "标定完成后先采集一次基线，自检才有比较对象。",
+        }
+
+    python = _cv2_python(state.repo_root)
+    if python is None:
+        return {"ok": False, "error": "no interpreter with cv2 available for the self-check"}
+
+    current_dir = root / "current"
+    captured, failed = _capture_camera_frames(state, current_dir)
+    if not captured:
+        return {"ok": False, "error": "no camera frames captured", "failed": failed}
+
+    result_path = root / "last_result.json"
+    intrinsics_run = state.calibration.intrinsicsRun
+    command = [
+        str(python),
+        "-m",
+        "metrology.cli.rig_shift_check",
+        "--baseline",
+        str(baseline_dir),
+        "--current",
+        str(current_dir),
+        "--out",
+        str(result_path),
+    ]
+    if intrinsics_run:
+        intrinsics_dir = state.repo_root / "outputs" / "calibration" / intrinsics_run
+        if intrinsics_dir.is_dir():
+            command += ["--intrinsics-dir", str(intrinsics_dir)]
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(state.repo_root / "third_party" / "opencv_kalibr")
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(state.repo_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        state.log("warn", f"Rig-check failed to run: {exc}")
+        return {"ok": False, "error": str(exc)}
+
+    if proc.returncode != 0 or not result_path.is_file():
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        state.log("warn", f"Rig-check exited {proc.returncode}")
+        return {"ok": False, "error": detail[-1] if detail else f"exit {proc.returncode}"}
+
+    report = json.loads(result_path.read_text(encoding="utf-8"))
+    report["failed_captures"] = failed
+    report["baseline"] = _rig_check_baseline_meta(state)
+    level = "warn" if report.get("overall") in {"moved", "suspect", "inconclusive"} else "info"
+    state.log(level, f"Rig self-check: {report.get('overall')} — {report.get('guidance', '')}")
+    return {"ok": True, "report": report}
+
+
+def _last_rig_check(state: GatewayState) -> dict[str, Any]:
+    path = _rig_check_root(state) / "last_result.json"
+    report: dict[str, Any] | None = None
+    if path.is_file():
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            report = None
+    return {"ok": True, "report": report, "baseline": _rig_check_baseline_meta(state)}
+
+
+# --- Extrinsics calibration --------------------------------------------------
+#
+# Runs the same three steps the 0804 calibration ran by hand, on an already
+# recorded ChArUco sweep: detect corners, bundle-adjust the camera poses with no
+# robot in the loop, then export the run layout production reads.
+#
+# Intrinsics are reused, not re-fitted. Moving a camera changes where it is, not
+# what its lens does, and re-fitting intrinsics needs a different capture anyway
+# (per-camera sweeps that reach the frame edge, not one shared sweep).
+
+_CALIB_INTRINSICS_REPORT = Path("outputs") / "metrology" / "calib_final" / "intrinsics_report.json"
+# The tracking config is the authority on which calibration production consumes.
+# Reading it means the GUI reports what is actually in use rather than a second,
+# independently drifting record of it.
+_TRACKING_CONFIG = (
+    Path("third_party") / "opencv_kalibr" / "hikon_cube_tracking_offline"
+    / "config_thor" / "april_cube_tracking_in_robot_base_thor.yaml"
+)
+
+
+def _load_active_calibration_runs(state: GatewayState) -> None:
+    import yaml  # local, matching how the rest of this module pulls it in
+
+    path = state.repo_root / _TRACKING_CONFIG
+    if not path.is_file():
+        return
+    try:
+        with open(path, encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        state.log("warn", f"Could not read tracking config for calibration runs: {exc}")
+        return
+    calib = config.get("calibration") or {}
+    tracker = config.get("cube_tracker") or {}
+    state.calibration.intrinsicsRun = str(calib.get("intrinsics_run_name", "") or "").strip()
+    state.calibration.extrinsicsRun = str(calib.get("fixed_camera_run_name", "") or "").strip()
+    model = str(tracker.get("camera_model", "") or "").strip()
+    if state.calibration.intrinsicsRun:
+        state.calibration.message = (
+            f"生产使用 {state.calibration.intrinsicsRun}"
+            + (f" · {model}" if model else "")
+        )
+        state.log(
+            "info",
+            f"Active calibration: {state.calibration.intrinsicsRun} / {state.calibration.extrinsicsRun}",
         )
 
-    overall_fail = any(item["status"] == "fail" for item in results)
-    state.calibration.state = "failed" if overall_fail else "complete"
-    state.calibration.lastRunAt = _now_iso()
-    state.calibration.cameras = results
-    state.calibration.outputPath = str(state.repo_root / "outputs" / "calibration" / f"mock_{int(time.time())}.json")
-    if overall_fail:
-        state.calibration.message = "Mock calibration finished with at least one fail; review cameras"
-    else:
-        state.calibration.message = f"Mock calibration completed for {len(results)} cameras"
-    state.log(
-        "warn" if overall_fail else "info",
-        f"Mock calibration {state.calibration.state}: {state.calibration.message}",
+
+def _calibration_session_payload(state: GatewayState) -> dict[str, Any]:
+    session = state.calibration_session
+    return {
+        "active": session.active,
+        "stage": session.stage,
+        "datasetName": session.datasetName,
+        "datasetRoot": session.datasetRoot,
+        "currentIndex": session.currentIndex,
+        "message": session.message,
+        "recorderState": state.recording.state,
+        "steps": [
+            {
+                "kind": step.kind,
+                "camera": step.camera,
+                "status": step.status,
+                "episodeIndex": step.episodeIndex,
+                "note": step.note,
+            }
+            for step in session.steps
+        ],
+    }
+
+
+def _start_calibration_session(state: GatewayState, cameras_arg: str = "") -> dict[str, Any]:
+    if state.calibration_session.active:
+        return {"ok": False, "error": "标定会话已在进行中"}
+    if state.calibration.state == "running":
+        return {"ok": False, "error": "上一次标定解算尚未结束"}
+
+    wanted = [c.strip() for c in cameras_arg.split(",") if c.strip()]
+    cameras = [str(d.get("id")) for d in state.devices if d.get("kind") == "camera"]
+    if wanted:
+        cameras = [c for c in cameras if c in set(wanted)]
+    if not cameras:
+        return {"ok": False, "error": "配置里没有相机"}
+
+    name = f"calib_{time.strftime('%Y%m%d_%H%M%S')}"
+    datasets_dir = _task_datasets_dir(state) or (state.datasets_root or state.repo_root / "outputs" / "datasets")
+    # One episode per camera, then one shared episode for the rig. The order is
+    # the order the operator will walk the room in.
+    steps = [CalibrationStep(kind="intrinsics", camera=camera) for camera in cameras]
+    steps.append(CalibrationStep(kind="extrinsics", camera=""))
+
+    state.calibration_session = CalibrationSession(
+        active=True,
+        stage="capture",
+        datasetName=name,
+        datasetRoot=str(Path(datasets_dir) / name),
+        steps=steps,
+        currentIndex=0,
+        message="按提示逐台录制；被遮挡或不需要的相机可以跳过。",
     )
+    state.log("info", f"Calibration session {name} started with {len(cameras)} camera(s)")
+    return {"ok": True, "session": _calibration_session_payload(state)}
+
+
+def _calibration_session_advance(state: GatewayState) -> None:
+    """Move to the first step still needing a capture, or declare the set ready."""
+    session = state.calibration_session
+    for index, step in enumerate(session.steps):
+        if step.status in {"pending", "recording"}:
+            session.currentIndex = index
+            return
+    session.currentIndex = len(session.steps)
+    captured = [s for s in session.steps if s.status == "captured"]
+    extrinsics_done = any(s.kind == "extrinsics" and s.status == "captured" for s in session.steps)
+    if not extrinsics_done:
+        session.stage = "capture"
+        session.message = "外参采集被跳过了——没有它无法解算相机之间的位姿。请补录。"
+        return
+    session.stage = "ready"
+    session.message = f"采集完成（{len(captured)} 段），可以开始解算。"
+
+
+def _calibration_step_record(state: GatewayState, action: str) -> dict[str, Any]:
+    session = state.calibration_session
+    if not session.active or session.stage != "capture":
+        return {"ok": False, "error": "没有进行中的采集步骤"}
+    if session.currentIndex >= len(session.steps):
+        return {"ok": False, "error": "所有步骤已完成"}
+    step = session.steps[session.currentIndex]
+
+    try:
+        if action == "start":
+            # Checked here so the operator gets the next action rather than the
+            # recorder's own English precondition message.
+            if state.recording.state in {"idle", "error"}:
+                return {
+                    "ok": False,
+                    "error": "相机还没连接。请先到「采集」页点 Connect，等相机全部就绪后再回来录制。",
+                }
+            _start_episode(state)
+            step.status = "recording"
+            session.message = (
+                f"正在录制 {step.camera or '外参'}——按提示挥板，完成后点「保存本段」。"
+            )
+        elif action in {"save", "discard"}:
+            _stop_recorder(state, action)
+            if action == "save":
+                step.status = "captured"
+                step.episodeIndex = int(state.recording.savedEpisodes)
+                _calibration_session_advance(state)
+            else:
+                step.status = "pending"
+                session.message = "本段已丢弃，可以重录。"
+        else:
+            return {"ok": False, "error": f"未知动作 {action}"}
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "session": _calibration_session_payload(state)}
+
+
+def _calibration_step_skip(state: GatewayState) -> dict[str, Any]:
+    session = state.calibration_session
+    if not session.active or session.currentIndex >= len(session.steps):
+        return {"ok": False, "error": "没有可跳过的步骤"}
+    step = session.steps[session.currentIndex]
+    if step.status == "recording":
+        return {"ok": False, "error": "正在录制中，请先保存或丢弃"}
+    step.status = "skipped"
+    # A skipped camera keeps whatever intrinsics it already has; a skipped
+    # extrinsics capture leaves nothing to solve, which advance() calls out.
+    step.note = "已跳过：沿用现有内参" if step.kind == "intrinsics" else "已跳过"
+    _calibration_session_advance(state)
+    return {"ok": True, "session": _calibration_session_payload(state)}
+
+
+def _cancel_calibration_session(state: GatewayState) -> dict[str, Any]:
+    if state.recording.state in {"recording", "saving", "discarding"}:
+        return {"ok": False, "error": "正在录制中，请先保存或丢弃当前段"}
+    state.calibration_session = CalibrationSession()
+    state.log("info", "Calibration session cancelled")
+    return {"ok": True, "session": _calibration_session_payload(state)}
+
+
+def _marker_tcp_root(state: GatewayState) -> Path:
+    return state.repo_root / "outputs" / "metrology" / "marker_tcp_repeatability"
+
+
+def _marker_tcp_session_path(state: GatewayState) -> Path | None:
+    session = state.marker_tcp_session
+    if not session.sessionRoot:
+        return None
+    return Path(session.sessionRoot) / "session.json"
+
+
+def _write_marker_tcp_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _save_marker_tcp_session(state: GatewayState) -> None:
+    path = _marker_tcp_session_path(state)
+    if path is None:
+        return
+    _write_marker_tcp_json(path, asdict(state.marker_tcp_session))
+
+
+def _marker_tcp_session_payload(state: GatewayState) -> dict[str, Any]:
+    session = state.marker_tcp_session
+    return asdict(session)
+
+
+def _valid_marker_tcp_side(side: str) -> str:
+    normalized = str(side or "").strip().lower()
+    if normalized not in {"left", "right"}:
+        raise ValueError("side must be left or right")
+    return normalized
+
+
+def _start_marker_tcp_session(state: GatewayState) -> dict[str, Any]:
+    if state.marker_tcp_session.active:
+        return {"ok": False, "error": "marker→TCP 采集会话已在进行中"}
+    name = f"marker_tcp_{time.strftime('%Y%m%d_%H%M%S')}"
+    root = _marker_tcp_root(state) / name
+    root.mkdir(parents=True, exist_ok=True)
+    state.marker_tcp_session = MarkerTcpSession(
+        active=True,
+        sessionName=name,
+        sessionRoot=str(root),
+        stage="capture",
+        message="采集 left/right UMI 的重复性样本；本页只记录条件与原始录制，不假设已解出 TCP 外参。",
+    )
+    _save_marker_tcp_session(state)
+    state.log("info", f"Marker→TCP repeatability session started: {root}")
+    return {"ok": True, "markerTcp": _marker_tcp_session_payload(state)}
+
+
+def _cancel_marker_tcp_session(state: GatewayState) -> dict[str, Any]:
+    if state.recording.state in {"recording", "saving", "discarding"} and state.marker_tcp_session.pendingSampleId:
+        return {"ok": False, "error": "正在录制 marker→TCP 样本，请先保存或丢弃当前段"}
+    state.marker_tcp_session = MarkerTcpSession()
+    state.log("info", "Marker→TCP repeatability session cancelled")
+    return {"ok": True, "markerTcp": _marker_tcp_session_payload(state)}
+
+
+def _marker_tcp_pending_sample(state: GatewayState) -> MarkerTcpSample | None:
+    pending_id = state.marker_tcp_session.pendingSampleId
+    if not pending_id:
+        return None
+    for sample in state.marker_tcp_session.samples:
+        if sample.id == pending_id:
+            return sample
+    return None
+
+
+def _marker_tcp_record_sample(state: GatewayState, action: str, *, side: str = "", condition: str = "") -> dict[str, Any]:
+    session = state.marker_tcp_session
+    if not session.active or session.stage not in {"capture", "failed"}:
+        return {"ok": False, "error": "没有进行中的 marker→TCP 采集会话"}
+    action = str(action or "start").strip().lower()
+    try:
+        if action == "start":
+            if session.pendingSampleId:
+                return {"ok": False, "error": "已有样本正在录制，请先保存或丢弃"}
+            side_norm = _valid_marker_tcp_side(side)
+            condition_text = str(condition or "").strip()
+            if not condition_text:
+                return {"ok": False, "error": "condition 不能为空，例如 same_mount_01 / remount_03 / light_push_x"}
+            if state.recording.state in {"idle", "error"}:
+                return {"ok": False, "error": "相机还没连接。请先到「采集」页 Connect，再回来采 marker→TCP 样本。"}
+            _start_episode(state)
+            sample = MarkerTcpSample(
+                id=f"sample_{len(session.samples) + 1:03d}",
+                side=side_norm,
+                condition=condition_text,
+                source="recording",
+                status="recording",
+                datasetRoot=state.recording.datasetRoot,
+                episodeIndex=int(state.recording.episodeIndex),
+                createdAt=datetime.now(timezone.utc).isoformat(),
+            )
+            session.samples.append(sample)
+            session.pendingSampleId = sample.id
+            session.message = f"正在录制 {side_norm} · {condition_text}；结束后保存或丢弃本段。"
+        elif action in {"save", "discard"}:
+            sample = _marker_tcp_pending_sample(state)
+            if sample is None:
+                return {"ok": False, "error": "没有正在录制的 marker→TCP 样本"}
+            episode_index = sample.episodeIndex if sample.episodeIndex >= 0 else int(state.recording.episodeIndex)
+            if state.recording.state == "armed":
+                # The recorder can auto-complete a fixed-duration episode and return to
+                # armed before the operator clicks save/discard. Finish this panel's
+                # sample bookkeeping without sending another command to an idle recorder.
+                state.recording.message = "Recorder is armed; marker→TCP sample finalized in calibration page"
+            else:
+                _stop_recorder(state, action)
+            sample.datasetRoot = state.recording.datasetRoot or sample.datasetRoot
+            sample.episodeIndex = episode_index
+            if action == "save":
+                sample.status = "saved"
+                sample.note = "raw recording saved; register static_transform.json after solving nominal transform"
+                session.message = "样本已保存。生成 static_transform.json 后在本页登记路径，再生成 repeatability 报告。"
+            else:
+                sample.status = "discarded"
+                sample.note = "discard requested; ignored by repeatability report"
+                session.message = "样本已丢弃，可以重录。"
+            session.pendingSampleId = ""
+        else:
+            return {"ok": False, "error": f"未知动作 {action}"}
+    except (RuntimeError, ValueError) as exc:
+        session.stage = "failed"
+        session.message = str(exc)
+        _save_marker_tcp_session(state)
+        return {"ok": False, "error": str(exc), "markerTcp": _marker_tcp_session_payload(state)}
+    session.stage = "capture"
+    _save_marker_tcp_session(state)
+    return {"ok": True, "markerTcp": _marker_tcp_session_payload(state)}
+
+
+def _register_marker_tcp_static_transform(
+    state: GatewayState,
+    *,
+    path_arg: str,
+    side: str,
+    condition: str,
+) -> dict[str, Any]:
+    session = state.marker_tcp_session
+    if not session.active:
+        return {"ok": False, "error": "没有进行中的 marker→TCP 采集会话"}
+    try:
+        side_norm = _valid_marker_tcp_side(side)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    path_text = str(path_arg or "").strip()
+    if not path_text:
+        return {"ok": False, "error": "path 不能为空"}
+    p = Path(path_text).expanduser()
+    if not p.is_absolute():
+        p = state.repo_root / p
+    if not p.is_file():
+        return {"ok": False, "error": f"static_transform.json not found: {p}"}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        transform_keys = ("T_ee_cube", "T_marker_tcp", "T_marker_to_tcp", "T_cube_ee")
+        if not any(key in data for key in transform_keys):
+            return {"ok": False, "error": "JSON 里没有 T_ee_cube / T_marker_tcp / T_marker_to_tcp / T_cube_ee"}
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"ok": False, "error": f"无法读取 static transform: {exc}"}
+    condition_text = str(condition or p.parent.name).strip() or p.parent.name
+    sample = MarkerTcpSample(
+        id=f"sample_{len(session.samples) + 1:03d}",
+        side=side_norm,
+        condition=condition_text,
+        source="static_transform",
+        status="registered",
+        staticTransformPath=str(p),
+        createdAt=datetime.now(timezone.utc).isoformat(),
+    )
+    session.samples.append(sample)
+    session.stage = "capture"
+    session.message = f"已登记 {side_norm} · {condition_text}: {p.name}"
+    _save_marker_tcp_session(state)
+    return {"ok": True, "markerTcp": _marker_tcp_session_payload(state)}
+
+
+def _run_marker_tcp_repeatability_report(state: GatewayState) -> dict[str, Any]:
+    session = state.marker_tcp_session
+    if not session.active:
+        return {"ok": False, "error": "没有进行中的 marker→TCP 采集会话"}
+    paths = [sample.staticTransformPath for sample in session.samples if sample.status == "registered" and sample.staticTransformPath]
+    if len(paths) < 2:
+        return {"ok": False, "error": "至少登记 2 个 static_transform.json 后才能生成 repeatability 报告"}
+    try:
+        metrology_root = state.repo_root / "third_party" / "opencv_kalibr"
+        if str(metrology_root) not in sys.path:
+            sys.path.insert(0, str(metrology_root))
+        from metrology.cli.marker_tcp_repeatability import load_transform_bundle, summarize_repeatability
+
+        bundles = [load_transform_bundle(Path(path)) for path in paths]
+        report = summarize_repeatability(bundles)
+        out_path = Path(session.sessionRoot) / "repeatability_report.json"
+        _write_marker_tcp_json(out_path, report)
+        session.reportPath = str(out_path)
+        session.stage = "done"
+        p95 = report.get("translation_error_mm", {}).get("p95")
+        session.message = f"repeatability report complete: translation p95={p95:.3f} mm" if isinstance(p95, (int, float)) else "repeatability report complete"
+        state.log("info", f"Marker→TCP repeatability report written: {out_path}")
+    except Exception as exc:  # noqa: BLE001
+        session.stage = "failed"
+        session.message = str(exc)
+        _save_marker_tcp_session(state)
+        return {"ok": False, "error": str(exc), "markerTcp": _marker_tcp_session_payload(state)}
+    _save_marker_tcp_session(state)
+    return {"ok": True, "markerTcp": _marker_tcp_session_payload(state)}
+
+
+def _newest_calibration_dataset(state: GatewayState) -> Path | None:
+    """Most recent recorded sweep that looks like a calibration capture."""
+    roots = [state.datasets_root] if state.datasets_root else []
+    roots.append(state.repo_root / "outputs" / "datasets")
+    for root in roots:
+        if not root or not root.is_dir():
+            continue
+        candidates = [
+            path
+            for path in root.iterdir()
+            if path.is_dir() and (path / "episodes").is_dir() and "calib" in path.name.lower()
+        ]
+        if candidates:
+            return max(candidates, key=lambda p: p.stat().st_mtime)
+    return None
+
+
+def _unmoved_cameras(state: GatewayState) -> list[str]:
+    """Cameras the last self-check found still in place.
+
+    These define the base frame during the re-export. A camera that was bumped
+    must not vote on where the frame is -- aligning onto its stale pose would
+    drag the whole rig toward it.
+    """
+    path = _rig_check_root(state) / "last_result.json"
+    if not path.is_file():
+        return []
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [name for name, entry in (report.get("cameras") or {}).items() if entry.get("verdict") == "ok"]
+
+
+def _fail_calibration(state: GatewayState, message: str) -> None:
+    """One place that marks a calibration failed, so the wizard cannot be left
+    sitting on "solving" by a path that forgot to update it."""
+    state.calibration.state = "failed"
+    state.calibration.message = message
+    state.log("warn", f"Calibration failed: {message}")
+    if state.calibration_session.active:
+        state.calibration_session.stage = "failed"
+        state.calibration_session.message = message
+
+
+def _calibration_step(
+    state: GatewayState, python: Path, args: list[str], *, label: str, timeout: int
+) -> subprocess.CompletedProcess[str] | None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(state.repo_root / "third_party" / "opencv_kalibr")
+    state.calibration.message = label
+    state.log("info", f"Calibration: {label}")
+    try:
+        return subprocess.run(
+            [str(python), *args],
+            cwd=str(state.repo_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _fail_calibration(state, f"{label} 失败：{exc}")
+        return None
+
+
+def _run_extrinsics_calibration(state: GatewayState, dataset: Path, run_name: str) -> None:
+    python = _cv2_python(state.repo_root)
+    if python is None:
+        _fail_calibration(state, "找不到带 cv2 的解释器，无法标定")
+        return
+
+    # Solve against the intrinsics production is actually using, not the
+    # metrology report: that report lives under outputs/, which is excluded from
+    # the deploy sync and so is simply absent on the rig. Using the active run
+    # also guarantees the bundle and the shipped intrinsics agree.
+    calib_root = state.repo_root / "outputs" / "calibration"
+    intrinsics_run = calib_root / (state.calibration.intrinsicsRun or "")
+    intrinsics_source: list[str]
+    if state.calibration.intrinsicsRun and intrinsics_run.is_dir():
+        intrinsics_source = ["--intrinsics-run", str(intrinsics_run)]
+    elif (state.repo_root / _CALIB_INTRINSICS_REPORT).is_file():
+        intrinsics_source = ["--intrinsics-report", str(state.repo_root / _CALIB_INTRINSICS_REPORT)]
+    else:
+        _fail_calibration(state, (
+            "找不到内参：既没有已激活的内参 run（calibration.intrinsics_run_name），"
+            f"也没有 {_CALIB_INTRINSICS_REPORT}"
+        ))
+        return
+
+    work = state.repo_root / "outputs" / "metrology" / run_name
+    detections = work / "det_extr"
+    base_run = calib_root / (state.calibration.extrinsicsRun or "")
+
+    steps: list[tuple[str, list[str], int]] = [
+        (
+            "检测 ChArUco 角点…",
+            [
+                "-m", "metrology.cli.detect_charuco",
+                "--episodes", str(dataset / "episodes"),
+                "--out", str(detections),
+                "--stride", "2",
+            ],
+            3600,
+        ),
+        (
+            "多相机联合 BA…",
+            [
+                "-m", "metrology.cli.calibrate_extrinsics",
+                "--detections", str(detections),
+                *intrinsics_source,
+                "--out", str(work),
+            ],
+            3600,
+        ),
+    ]
+    for label, args, timeout in steps:
+        proc = _calibration_step(state, python, args, label=label, timeout=timeout)
+        if proc is None:
+            return
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            _fail_calibration(state, f"{label} 失败：{detail[-1] if detail else proc.returncode}")
+            return
+
+    export_args = [
+        "-m", "metrology.cli.export_production_calibration",
+        "--extrinsics-report", str(work / "extrinsics_report.json"),
+        "--name", run_name,
+    ]
+    # Only emit intrinsics when there is no production run to keep. Re-solving
+    # extrinsics does not touch the lenses.
+    keep_intrinsics_run = bool(state.calibration.intrinsicsRun) and intrinsics_run.is_dir()
+    if not keep_intrinsics_run:
+        export_args += [
+            "--intrinsics-report", str(state.repo_root / _CALIB_INTRINSICS_REPORT),
+            "--model", "fisheye",
+        ]
+    if base_run.is_dir():
+        export_args += ["--base-extrinsics", str(base_run)]
+        unmoved = _unmoved_cameras(state)
+        if unmoved:
+            export_args += ["--align-cameras", *unmoved]
+            state.log("info", f"Base-frame alignment restricted to unmoved cameras: {', '.join(unmoved)}")
+    serial_map = state.repo_root / "tools" / "thor" / "gmsl2" / "camera_serial_map.yaml"
+    if serial_map.is_file():
+        export_args += ["--serial-map", str(serial_map)]
+
+    proc = _calibration_step(state, python, export_args, label="导出生产标定…", timeout=600)
+    if proc is None:
+        return
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        _fail_calibration(state, f"导出失败：{detail[-1] if detail else proc.returncode}")
+        return
+
+    report_path = work / "extrinsics_report.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _fail_calibration(state, f"读取 BA 结果失败：{exc}")
+        return
+
+    per_camera = report.get("per_camera_rmse") or {}
+    cameras = [
+        {
+            "id": name,
+            # Real reprojection residual in pixels, not a stand-in. The old mock
+            # reported millimetres it had invented.
+            "reprojectionPx": round(float(rmse), 4),
+            "status": "pass" if rmse < 0.5 else ("warn" if rmse < 1.0 else "fail"),
+        }
+        for name, rmse in sorted(per_camera.items())
+    ]
+    failed = [c for c in cameras if c["status"] == "fail"]
+    state.calibration.cameras = cameras
+    state.calibration.state = "failed" if failed else "complete"
+    state.calibration.lastRunAt = _now_iso()
+    state.calibration.outputPath = str(work)
+    if not keep_intrinsics_run:
+        state.calibration.intrinsicsRun = f"{run_name}_intrinsics"
+    state.calibration.extrinsicsRun = f"{run_name}_extrinsics"
+    state.calibration.message = (
+        f"BA 重投影 {float(report.get('rmse_px', float('nan'))):.4f} px，"
+        f"{report.get('num_frames', 0)} 帧 / {len(cameras)} 相机"
+        + ("；有相机残差过大" if failed else "")
+    )
+    state.log(
+        "warn" if failed else "info",
+        f"Extrinsics calibration {state.calibration.state}: {state.calibration.message}",
+    )
+    if state.calibration_session.active:
+        state.calibration_session.stage = "failed" if failed else "done"
+        state.calibration_session.message = state.calibration.message
+    # The baseline belongs to the calibration it was taken against, so a new
+    # calibration invalidates it rather than silently keeping the old frames.
+    baseline_meta = _rig_check_root(state) / "baseline" / "baseline.json"
+    if baseline_meta.is_file():
+        baseline_meta.unlink()
+        state.log("info", "Rig-check baseline cleared; capture a new one for the new calibration")
+
+
+def _start_extrinsics_calibration(state: GatewayState, dataset_arg: str = "") -> dict[str, Any]:
+    if state.calibration.state == "running":
+        return {"ok": False, "error": "标定已在进行中"}
+    session = state.calibration_session
+    if dataset_arg:
+        dataset = _resolve_dataset_root(state.repo_root, dataset_arg)
+    elif session.active and session.stage == "ready" and session.datasetRoot:
+        # Prefer what the guided session just recorded over whatever happens to
+        # be the newest calibration-looking directory on disk.
+        dataset = _resolve_dataset_root(state.repo_root, session.datasetRoot)
+    else:
+        dataset = _newest_calibration_dataset(state)
+    if dataset is None or not (dataset / "episodes").is_dir():
+        return {
+            "ok": False,
+            "error": "找不到可用的 ChArUco 采集",
+            "hint": "先用采集页录一段挥板数据（数据集名含 calib），再运行外参标定。",
+        }
+
+    run_name = f"calib_{time.strftime('%Y%m%d_%H%M%S')}"
+    state.calibration.state = "running"
+    state.calibration.message = f"处理 {dataset.name}…"
+    state.calibration.cameras = []
+    if state.calibration_session.active:
+        state.calibration_session.stage = "solving"
+        state.calibration_session.message = f"正在解算 {dataset.name}…" 
+    Thread(
+        target=_run_extrinsics_calibration,
+        args=(state, dataset, run_name),
+        daemon=True,
+        name=f"extrinsics-calibration-{run_name}",
+    ).start()
+    return {"ok": True, "dataset": str(dataset), "run": run_name}
 
 
 def _now_iso() -> str:
@@ -5413,6 +6298,9 @@ def _cached_mp4_is_usable(mp4_path: Path, mkv_path: Path, expected_duration_s: f
     return True
 
 
+_REPLAY_REMUX_SEMAPHORE = BoundedSemaphore(2)
+
+
 def _remux_mkv_to_mp4(mkv_path: Path, expected_duration_s: float | None = None) -> Path | None:
     mp4_path = mkv_path.with_suffix(".mp4")
     if mp4_path.is_file() and _cached_mp4_is_usable(mp4_path, mkv_path, expected_duration_s):
@@ -5430,20 +6318,26 @@ def _remux_mkv_to_mp4(mkv_path: Path, expected_duration_s: float | None = None) 
         except OSError:
             return None
 
+    if shutil.which("ffmpeg") is None:
+        return None
+
     cmd = [
-        "gst-launch-1.0", "-q",
-        "filesrc", f"location={mkv_path}",
-        "!", "matroskademux",
-        "!", "h265parse",
-        "!", "nvv4l2decoder",
-        "!", "nvv4l2h264enc", "bitrate=10000000",
-        "iframeinterval=60", "idrinterval=60", "insert-sps-pps=1", "insert-vui=1",
-        "!", "h264parse", "config-interval=-1",
-        "!", "mp4mux", "faststart=true",
-        "!", "filesink", f"location={tmp_path}",
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(mkv_path),
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(tmp_path),
     ]
+    timeout_s = 60.0
+    if expected_duration_s is not None and expected_duration_s > 0:
+        timeout_s = max(60.0, min(300.0, expected_duration_s * 12.0))
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=60, check=False)
+        with _REPLAY_REMUX_SEMAPHORE:
+            result = subprocess.run(cmd, capture_output=True, timeout=timeout_s, check=False)
     except (subprocess.TimeoutExpired, OSError):
         try:
             tmp_path.unlink()
@@ -5487,7 +6381,7 @@ def _resolve_video_path(
                     expected_duration_s = _first_finite(json.load(f).get("duration_s"), default=0.0)
             except (OSError, json.JSONDecodeError):
                 expected_duration_s = None
-        return _remux_mkv_to_mp4(mkv, expected_duration_s=expected_duration_s) or mkv
+        return _remux_mkv_to_mp4(mkv, expected_duration_s=expected_duration_s)
 
     info = _load_dataset_info(dataset_root)
     episode_video = _resolve_video_file_for_episode(dataset_root, info, camera_key, selected_episode)
@@ -6216,6 +7110,8 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "teleop": asdict(state.teleop),
         "annotation": _active_annotation(state),
         "calibration": asdict(state.calibration),
+        "calibrationSession": _calibration_session_payload(state),
+        "markerTcp": _marker_tcp_session_payload(state),
         "recordedDatasets": recorded_datasets,
         "processing": list(state.cached_processing_items),
         "trajectory": trajectory,
@@ -7085,6 +7981,14 @@ def _refresh_dataset_stats_cache(state: GatewayState) -> None:
     which is what made the UI freeze. So first take a cheap dir-mtime fingerprint
     and skip the whole walk when nothing changed; only rescan on a real change.
     """
+    with state.lock:
+        recorder_active = state.recording.pid is not None and bool(state.recording.datasetRoot)
+    if recorder_active:
+        # LeRobot/parquet files are not guaranteed readable until the recorder
+        # process exits and closes/finalizes them. Live recording status is
+        # updated from recorder stdout; defer historical dataset scans so the
+        # UI does not surface transient "missing footer" parquet warnings.
+        return
     signature = _dataset_scan_signature(state)
     with state.lock:
         selected_before = str(state.selected_replay_root.resolve()) if state.selected_replay_root is not None else ""
@@ -7401,16 +8305,14 @@ def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> Non
         if contract.get("status") != "passed":
             reasons.extend(str(reason) for reason in contract.get("failures", []))
 
-    # The verdict belongs to `mujocoValidation`, not to `safety`. `safety` describes whether the
-    # hardware path is authorized, and only the real preflight can say that -- a recorded
-    # trajectory scoring 25 mm instead of 20 mm is a data verdict, not a faulted rig. Writing
-    # "fault" here mislabelled it and, worse, withheld the robot-free controls that are exactly
-    # what an operator reaches for next; writing "ready" on a pass claimed an authorization no
-    # hardware check had granted. It stays "locked" from the start of the run either way.
+    # MuJoCo validation is the robot-replay gate. A failed validation means the selected
+    # trajectory is not authorized for real motion, so surface it as a safety fault until the
+    # operator reruns validation or explicitly uses the failed-validation override path.
     if reasons:
         validation["status"] = "failed"
         validation["message"] = "MuJoCo validation failed: " + "; ".join(reasons)
         state.replay.state = "aborted"
+        state.replay.safety = "fault"
     else:
         validation["status"] = "passed"
         validation["message"] = (
@@ -7418,6 +8320,7 @@ def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> Non
             f"within {max_pos_threshold:.2f}mm / {max_rot_threshold:.2f}deg"
         )
         state.replay.state = "complete"
+        state.replay.safety = "ready"
     state.replay.mujocoValidation = validation
     _refresh_mujoco_validation_current(state)
     if dataset_root is not None and _is_dataset_root(dataset_root):
@@ -7428,7 +8331,12 @@ def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> Non
     state.replay.message = validation["message"]
 
 
-_RECORDER_NOISE_PREFIXES = ("[TLV_LOG_UPLOAD]", "GST_ARGUS:", "NvMMLite")
+_RECORDER_NOISE_PREFIXES = (
+    "[TLV_LOG_UPLOAD]",
+    "[liwp][box] tlv ignored:",
+    "GST_ARGUS:",
+    "NvMMLite",
+)
 
 
 _RECORDER_FAILURE_KEYWORDS = (
@@ -8188,6 +9096,22 @@ def _preflight_replay(state: GatewayState) -> None:
     state.log("info", state.replay.message)
 
 
+def _start_dry_run_replay(state: GatewayState) -> None:
+    dataset_root = _require_replay_dataset(state)
+    state.selected_replay_root = dataset_root
+    state.replay.state = "dry_run"
+    state.replay.safety = "ready"
+    state.replay.pid = None
+    state.replay.frameIndex = 0
+    state.replay.datasetRoot = str(dataset_root)
+    state.replay.dataset = str(dataset_root)
+    state.replay.message = (
+        f"Dry-run replay ready for {dataset_root.name} episode {state.replay.episode}; "
+        f"{_mujoco_recommendation_suffix(state, dataset_root)}"
+    )
+    state.log("info", state.replay.message)
+
+
 def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CUBE_MODE) -> None:
     if state.replay_process is not None and state.replay_process.poll() is None:
         state.replay.message = "MuJoCo replay is already running"
@@ -8626,6 +9550,13 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             view_id = query.get("view", [""])[0]
             _serve_teleop_camera_snapshot(self, state=self.server.state, view_id=view_id)
             return
+        if path == "/api/calibration/rig-check":
+            _json_response(self, HTTPStatus.OK, _last_rig_check(self.server.state))
+            return
+        if path == "/api/calibration/marker-tcp":
+            with self.server.state.lock:
+                _json_response(self, HTTPStatus.OK, {"ok": True, "markerTcp": _marker_tcp_session_payload(self.server.state)})
+            return
         if path.startswith("/api/assets/pika/"):
             name = path[len("/api/assets/pika/"):]
             allowed = {
@@ -8770,11 +9701,12 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 return
             with self.server.state.lock:
                 dataset_root = _resolve_known_dataset(self.server.state, requested)
-                video_path = (
-                    _resolve_video_path(self.server.state, dataset_root, camera_key, episode)
-                    if dataset_root
-                    else None
-                )
+                resolved_episode = int(self.server.state.replay.episode if episode is None else episode)
+            video_path = (
+                _resolve_video_path(self.server.state, dataset_root, camera_key, resolved_episode)
+                if dataset_root
+                else None
+            )
             if video_path is None:
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"video not found: {camera_key}"})
                 return
@@ -9071,8 +10003,80 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/calibration/run":
-                    _mock_calibrate_cameras(self.server.state)
+                    dataset = (query.get("dataset", [""])[0] or "").strip()
+                    result = _start_extrinsics_calibration(self.server.state, dataset)
+                    if not result.get("ok"):
+                        _json_response(self, HTTPStatus.CONFLICT, result)
+                        return
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/calibration/session/start":
+                    result = _start_calibration_session(
+                        self.server.state, (query.get("cameras", [""])[0] or "").strip()
+                    )
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/marker-tcp/start":
+                    result = _start_marker_tcp_session(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/marker-tcp/cancel":
+                    result = _cancel_marker_tcp_session(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/marker-tcp/record":
+                    result = _marker_tcp_record_sample(
+                        self.server.state,
+                        (query.get("action", ["start"])[0] or "start").strip(),
+                        side=(query.get("side", [""])[0] or "").strip(),
+                        condition=(query.get("condition", [""])[0] or "").strip(),
+                    )
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/marker-tcp/register":
+                    result = _register_marker_tcp_static_transform(
+                        self.server.state,
+                        path_arg=(query.get("path", [""])[0] or "").strip(),
+                        side=(query.get("side", [""])[0] or "").strip(),
+                        condition=(query.get("condition", [""])[0] or "").strip(),
+                    )
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/marker-tcp/report":
+                    result = _run_marker_tcp_repeatability_report(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/session/record":
+                    action = (query.get("action", ["start"])[0] or "start").strip()
+                    result = _calibration_step_record(self.server.state, action)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/session/skip":
+                    result = _calibration_step_skip(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/session/cancel":
+                    result = _cancel_calibration_session(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/rig-check":
+                    result = _run_rig_check(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/rig-check/baseline":
+                    result = _capture_rig_check_baseline(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
                     return
                 if path == "/api/device/calibrate-6dforce":
                     box_id = (query.get("box_id", [""])[0] or "").strip()
@@ -9212,6 +10216,7 @@ def make_state(
         devices=_device_statuses(config, resolved_root),
     )
     state.replay.mujocoValidation = _new_mujoco_validation(state)
+    _load_active_calibration_runs(state)
     if profile == "workstation":
         urdf_path, sim_xml_path = _fr3_pika_asset_paths(resolved_root)
         state.teleop.urdfPath = str(urdf_path)

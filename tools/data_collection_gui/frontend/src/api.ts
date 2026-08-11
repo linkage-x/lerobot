@@ -2,8 +2,9 @@ import { handheldConfigSummary, initialDevices } from "./defaultHandheldConfig";
 import type {
   CollectionTask,
   EpisodeAnnotation,
-  CalibrationCamera,
   CalibrationStatus,
+  CalibrationSession,
+  MarkerTcpSession,
   ConfigSummary,
   DatasetExportStatus,
   DeploymentProfile,
@@ -18,6 +19,7 @@ import type {
   RecordingStatus,
   ReplayStatus,
   ReplayTimeline,
+  RigCheckResponse,
   MujocoCubeMode,
   RealCubeMode,
   RealEndEffectorMode,
@@ -61,6 +63,8 @@ export type GuiSnapshot = {
   teleop: TeleopStatus;
   annotation: EpisodeAnnotation;
   calibration: CalibrationStatus;
+  calibrationSession?: CalibrationSession;
+  markerTcp?: MarkerTcpSession;
   datasetExport: DatasetExportStatus;
   recordedDatasets: RecordedDataset[];
   processing: ProcessingItem[];
@@ -181,11 +185,21 @@ export class DataCollectionGuiApi {
     },
     calibration: {
       state: "idle",
-      pattern: "ChArUco 5x7 (mock)",
+      pattern: "ChArUco 12x9 · 30 mm (charuco_400)",
       lastRunAt: "",
       message: "Run calibration to refresh extrinsics",
       cameras: [],
       outputPath: ""
+    },
+    markerTcp: {
+      active: false,
+      sessionName: "",
+      sessionRoot: "",
+      stage: "idle",
+      samples: [],
+      pendingSampleId: "",
+      message: "Marker→TCP repeatability session not started",
+      reportPath: ""
     },
     datasetExport: {
       state: "idle",
@@ -517,30 +531,18 @@ export class DataCollectionGuiApi {
     if (remote) {
       return remote;
     }
-    await wait(450);
-    const cameras: CalibrationCamera[] = this.snapshot.devices
-      .filter((device) => device.kind === "camera")
-      .map((device, index) => {
-        const reprojection = Math.round((0.7 + ((index + 1) * 0.15) % 1.0) * 1000) / 1000;
-        const baseline = Math.round((90 + index * 110) * 10) / 10;
-        const status: CalibrationCamera["status"] = reprojection < 1.2 ? "pass" : reprojection < 1.8 ? "warn" : "fail";
-        return { id: device.id, reprojectionMm: reprojection, baselineMm: baseline, status };
-      });
-    const failed = cameras.some((entry) => entry.status === "fail");
+    // Offline, calibration cannot be faked: it reads recorded video and solves a
+    // bundle adjustment. The old fallback invented reprojection numbers, which
+    // is worse than saying nothing -- a green table implies the rig was verified.
+    await wait(120);
     this.snapshot.calibration = {
-      state: cameras.length === 0 ? "failed" : failed ? "failed" : "complete",
-      pattern: this.snapshot.calibration.pattern,
+      ...this.snapshot.calibration,
+      state: "failed",
       lastRunAt: new Date().toISOString(),
-      message:
-        cameras.length === 0
-          ? "No cameras configured in handheld config"
-          : failed
-            ? "Mock calibration finished with at least one fail"
-            : `Mock calibration completed for ${cameras.length} cameras`,
-      cameras,
-      outputPath: `outputs/calibration/mock_${Date.now()}.json`
+      message: "离线模式无法标定：需要网关读取录制数据并运行 BA",
+      cameras: []
     };
-    this.log(failed || cameras.length === 0 ? "warn" : "info", `Mock calibration: ${this.snapshot.calibration.message}`);
+    this.log("warn", "Calibration unavailable without a gateway");
     return this.getSnapshot();
   }
 
@@ -722,6 +724,112 @@ export class DataCollectionGuiApi {
       return (await response.json()) as BoxCaliLog;
     } catch {
       return null;
+    }
+  }
+
+  // The self-check reads and writes the same three things: the last result, a
+  // fresh run, and a re-captured baseline. Errors carry a message rather than
+  // being swallowed, because "cameras are busy" is the most common outcome and
+  // silently returning null would look like the check itself was broken.
+  // Guided calibration session. Each of these returns the gateway's own error
+  // string on refusal ("正在录制中，请先保存或丢弃"), which is the actionable part.
+  private async calibrationSessionPost(path: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      const payload = (await response.json()) as { ok?: boolean; error?: string };
+      return { ok: response.ok && payload.ok !== false, error: payload.error };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  }
+
+  async startCalibrationSession(cameras?: string[]): Promise<{ ok: boolean; error?: string }> {
+    const query = cameras?.length ? `?cameras=${encodeURIComponent(cameras.join(","))}` : "";
+    return this.calibrationSessionPost(`/api/calibration/session/start${query}`);
+  }
+
+  async calibrationStepRecord(action: "start" | "save" | "discard"): Promise<{ ok: boolean; error?: string }> {
+    return this.calibrationSessionPost(`/api/calibration/session/record?action=${action}`);
+  }
+
+  async calibrationStepSkip(): Promise<{ ok: boolean; error?: string }> {
+    return this.calibrationSessionPost("/api/calibration/session/skip");
+  }
+
+  async cancelCalibrationSession(): Promise<{ ok: boolean; error?: string }> {
+    return this.calibrationSessionPost("/api/calibration/session/cancel");
+  }
+
+  async startMarkerTcpSession(): Promise<{ ok: boolean; error?: string }> {
+    return this.calibrationSessionPost("/api/calibration/marker-tcp/start");
+  }
+
+  async cancelMarkerTcpSession(): Promise<{ ok: boolean; error?: string }> {
+    return this.calibrationSessionPost("/api/calibration/marker-tcp/cancel");
+  }
+
+  async markerTcpRecordSample(
+    action: "start" | "save" | "discard",
+    side: "left" | "right",
+    condition: string
+  ): Promise<{ ok: boolean; error?: string }> {
+    const params = new URLSearchParams({ action, side, condition });
+    return this.calibrationSessionPost(`/api/calibration/marker-tcp/record?${params.toString()}`);
+  }
+
+  async registerMarkerTcpStaticTransform(
+    path: string,
+    side: "left" | "right",
+    condition: string
+  ): Promise<{ ok: boolean; error?: string }> {
+    const params = new URLSearchParams({ path, side, condition });
+    return this.calibrationSessionPost(`/api/calibration/marker-tcp/register?${params.toString()}`);
+  }
+
+  async runMarkerTcpReport(): Promise<{ ok: boolean; error?: string }> {
+    return this.calibrationSessionPost("/api/calibration/marker-tcp/report");
+  }
+
+  async fetchRigCheck(): Promise<RigCheckResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/rig-check`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as RigCheckResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  async runRigCheck(): Promise<RigCheckResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/rig-check`, {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      const payload = (await response.json()) as RigCheckResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error), report: null };
+    }
+  }
+
+  async captureRigCheckBaseline(): Promise<RigCheckResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/rig-check/baseline`, {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      const payload = (await response.json()) as RigCheckResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error), report: null };
     }
   }
 
@@ -1082,6 +1190,7 @@ export class DataCollectionGuiApi {
       annotation: annotationWithDefaults,
       tasks: snapshot.tasks ?? this.snapshot.tasks ?? [],
       calibration: snapshot.calibration ?? this.snapshot.calibration,
+      markerTcp: snapshot.markerTcp ?? this.snapshot.markerTcp,
       datasetExport: snapshot.datasetExport ?? {
         ...this.snapshot.datasetExport,
         datasetRoot: snapshot.replay.datasetRoot || snapshot.recording.datasetRoot,

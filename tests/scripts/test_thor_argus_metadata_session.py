@@ -193,6 +193,7 @@ def test_camera_defaults_still_accept_argus_metadata_fallback() -> None:
 def test_argus_online_sync_preflight_timeout_defaults() -> None:
     cfg = gr.ArgusOnlineSync()
 
+    assert cfg.startup_full_clusters == 60
     assert cfg.frame_timeout_ms == 1000
     assert cfg.preflight_timeout_s == 30.0
     assert cfg.single_preflight_timeout_s == 10.0
@@ -242,6 +243,21 @@ def test_argus_online_sync_record_command_passes_frame_timeout(tmp_path: Path) -
     cmd = session._build_record_command(session._stream_cfgs, tmp_path / "episode", frames=60)
 
     assert cmd[cmd.index("--frame-timeout-ms") + 1] == "750"
+
+
+def test_argus_online_sync_record_command_passes_startup_full_clusters(tmp_path: Path) -> None:
+    session = aos.ArgusOnlineSyncCameraSession(
+        _streams(6, 7),
+        tmp_path / "warmup",
+        repo_root=tmp_path,
+        binary_path=tmp_path / "argus_online_sync_video_recorder",
+        auto_build=False,
+        startup_full_clusters=60,
+    )
+
+    cmd = session._build_record_command(session._stream_cfgs, tmp_path / "episode", frames=0)
+
+    assert cmd[cmd.index("--startup-full-clusters") + 1] == "60"
 
 
 def test_argus_online_sync_record_command_passes_frame_bus_options(tmp_path: Path) -> None:

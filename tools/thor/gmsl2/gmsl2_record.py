@@ -170,7 +170,7 @@ class ArgusOnlineSync:
     enabled: bool = True
     sync_source: str = "sof_tsc_ns"
     tolerance_ms: float = 1.0
-    startup_full_clusters: int = 30
+    startup_full_clusters: int = 60
     frame_timeout_ms: int = 1000
     preflight_timeout_s: float = 30.0
     single_preflight_timeout_s: float = 10.0

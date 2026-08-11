@@ -73,6 +73,54 @@ def test_dataset_scan_signature_tracks_v3_finalization_without_root_mtime_change
     assert gateway._dataset_scan_signature(state) != before
 
 
+def test_dataset_stats_refresh_defers_while_recorder_active(tmp_path, monkeypatch):
+    dataset_root = tmp_path / "outputs" / "datasets" / "active_session"
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 60}},
+        recording=gateway.RecordingStatus(
+            repoId="local/test",
+            datasetRoot=str(dataset_root),
+            pid=1234,
+        ),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root.parent,
+    )
+
+    def fail_scan(_state):
+        raise AssertionError("active recorder should defer dataset scans")
+
+    monkeypatch.setattr(gateway, "_dataset_scan_signature", fail_scan)
+
+    gateway._refresh_dataset_stats_cache(state)
+
+    assert state.dataset_cache_ready is False
+
+
+def test_dataset_stats_refresh_resumes_after_recorder_exit(tmp_path, monkeypatch):
+    dataset_root = tmp_path / "outputs" / "datasets" / "finished_session"
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test", datasetRoot=str(dataset_root), pid=None),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root.parent,
+    )
+
+    monkeypatch.setattr(gateway, "_dataset_scan_signature", lambda _state: (("finished",),))
+    monkeypatch.setattr(gateway, "_recorded_dataset_items", lambda _state: [{"path": str(dataset_root)}])
+    monkeypatch.setattr(gateway, "_read_recorded_trajectory", lambda _state: ([{"frame": 0}], {"dataStatus": "loaded"}))
+
+    gateway._refresh_dataset_stats_cache(state)
+
+    assert state.dataset_cache_ready is True
+    assert state.cached_recorded_datasets == [{"path": str(dataset_root)}]
+    assert state.cached_trajectory == [{"frame": 0}]
+    assert state.cached_trajectory_meta == {"dataStatus": "loaded"}
+
+
 def test_make_state_loads_handheld_config_contract():
     state = gateway.make_state(Path.cwd(), Path("tools/handheld/handheld_record_example.yaml"))
 
@@ -105,6 +153,84 @@ def test_default_config_is_thor_gmsl2_box():
     assert {"box_gripper", "box_imu", "box_trigger"}.issubset(set(devices_by_kind["box_collection"]))
     # Old Hikrobot / Pika devices are no longer in the default rig.
     assert "handheld_gripper" not in devices_by_kind
+
+
+def _marker_tcp_gateway_state(tmp_path: Path) -> gateway.GatewayState:
+    dataset_root = tmp_path / "outputs" / "datasets" / "marker_tcp_raw"
+    return gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 60}},
+        recording=gateway.RecordingStatus(
+            repoId="local/test",
+            datasetRoot=str(dataset_root),
+            state="armed",
+            episodeIndex=7,
+        ),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root.parent,
+    )
+
+
+def _write_static_transform(path: Path, *, x_m: float) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "T_ee_cube": [
+                    [1.0, 0.0, 0.0, x_m],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                "num_samples_used": 12,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_marker_tcp_sample_save_tolerates_recorder_returning_to_armed(tmp_path, monkeypatch):
+    state = _marker_tcp_gateway_state(tmp_path)
+    assert gateway._start_marker_tcp_session(state)["ok"] is True
+
+    def fake_start_episode(fake_state):
+        fake_state.recording.state = "recording"
+        fake_state.recording.frameIndex = 0
+
+    monkeypatch.setattr(gateway, "_start_episode", fake_start_episode)
+    result = gateway._marker_tcp_record_sample(state, "start", side="left", condition="same_mount_01")
+    assert result["ok"] is True
+    sample = state.marker_tcp_session.samples[0]
+    assert sample.status == "recording"
+    assert sample.episodeIndex == 7
+
+    state.recording.state = "armed"
+    result = gateway._marker_tcp_record_sample(state, "save", side="left", condition="same_mount_01")
+
+    assert result["ok"] is True
+    assert state.marker_tcp_session.pendingSampleId == ""
+    assert state.marker_tcp_session.samples[0].status == "saved"
+    assert state.marker_tcp_session.samples[0].episodeIndex == 7
+
+
+def test_marker_tcp_registers_static_transforms_and_writes_report(tmp_path, monkeypatch):
+    state = _marker_tcp_gateway_state(tmp_path)
+    monkeypatch.syspath_prepend(str(Path.cwd() / "third_party" / "opencv_kalibr"))
+    assert gateway._start_marker_tcp_session(state)["ok"] is True
+    a = _write_static_transform(tmp_path / "a" / "static_transform.json", x_m=0.0)
+    b = _write_static_transform(tmp_path / "b" / "static_transform.json", x_m=0.001)
+
+    assert gateway._register_marker_tcp_static_transform(state, path_arg=str(a), side="left", condition="same_mount_01")["ok"] is True
+    assert gateway._register_marker_tcp_static_transform(state, path_arg=str(b), side="left", condition="remount_01")["ok"] is True
+    result = gateway._run_marker_tcp_repeatability_report(state)
+
+    assert result["ok"] is True
+    report_path = Path(state.marker_tcp_session.reportPath)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["num_bundles"] == 2
+    assert report["translation_error_mm"]["max"] == pytest.approx(0.5)
 
 
 def test_workstation_profile_exposes_fr3_teleop_contract():
@@ -330,7 +456,7 @@ def test_resolve_gmsl2_video_path_accepts_lerobot_feature_key(tmp_path, monkeypa
     )
     monkeypatch.setattr(gateway, "_remux_mkv_to_mp4", lambda *_args, **_kwargs: None)
 
-    assert gateway._resolve_video_path(state, dataset_root, "observation.images.cam_00") == mkv
+    assert gateway._resolve_video_path(state, dataset_root, "observation.images.cam_00") is None
 
 
 def test_processing_item_and_qc_include_online_sync_manifest(tmp_path):
@@ -425,8 +551,8 @@ def test_remux_writes_tmp_then_replaces_mp4(tmp_path, monkeypatch):
         returncode = 0
 
     def fake_run(cmd, **_kwargs):
-        location_args = [part for part in cmd if isinstance(part, str) and part.startswith("location=")]
-        output = Path(location_args[-1].split("=", 1)[1])
+        assert cmd[:5] == ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+        output = Path(cmd[-1])
         assert output.name.startswith(".cam_00.")
         output.write_bytes(b"good-remux")
         return FakeResult()
@@ -671,6 +797,22 @@ def test_box_live_output_updates_preview_without_log_noise(tmp_path):
     assert payload["active"] is True
     assert payload["sensor"]["timestamp"] == 7
     assert payload["status"]["queue_size"] == 2
+    assert state.recording.lastOutput == ""
+    assert state.recording.recentOutput == []
+    assert state.events == []
+
+
+def test_recorder_tlv_ignored_output_is_noise(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=Path.cwd(),
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+
+    gateway._apply_recorder_output(state, "[liwp][box] tlv ignored: type=0x7")
+
     assert state.recording.lastOutput == ""
     assert state.recording.recentOutput == []
     assert state.events == []

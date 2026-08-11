@@ -224,7 +224,7 @@ setup_env.sh`。`LD_LIBRARY_PATH` 仍需调用方在 `dlopen` 前设好（gatewa
 **验证**：仅设 `LD_LIBRARY_PATH=tools/thor/box_sdk/lib:$LD_LIBRARY_PATH`，
 **不** source `setup_env.sh`，跑 2 路 + BOX 含 `--skip-hardware-sync`：
 - `Box devices: box_gripper, box_imu, box_trigger, box_six_d_force, box_touch_left, box_touch_right`
-- `Box rates: box_gripper=198, box_imu=198, ...`
+- `Box rates: box_six_d_force=480, box_imu=240, box_gripper=120, box_trigger=120, box_touch_left=60, box_touch_right=60`（v3.1 固件名义值；实测允许有抖动）
 - `Connected 2 pipelines in 2.6s`
 - `Episode 0 ready`
 - 持续 30s `RdSync: S=200, F=0, AvgRdT=3ms, ...` 心跳，无 abort marker

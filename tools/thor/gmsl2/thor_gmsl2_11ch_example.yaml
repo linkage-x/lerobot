@@ -78,7 +78,7 @@ sensors:
       enabled: true
       sync_source: sof_tsc_ns
       tolerance_ms: 1.0
-      startup_full_clusters: 30
+      startup_full_clusters: 60
       # Per-camera Argus acquire timeout while forming a full SOF cluster. At
       # 60 Hz a healthy camera should produce the next frame within ~16.7 ms;
       # 1000 ms is intentionally generous but fails much faster than the old
@@ -183,8 +183,8 @@ box_collection:
   sdk_setup_script: setup_env.sh
   urdf_relpath: share/monte_gripper.urdf
   startup_mode: 0          # 0 = collection (trigger-controlled), 1 = control
-  poll_interval_s: 0.002   # 500 Hz; MCU timestamp dedup reveals each sensor's native rate
-  record_poll_interval_s: 0.002  # same as poll; kept separate for configs that want lower idle CPU
+  poll_interval_s: 0.001   # 1 kHz idle/Connect poll; exposes 480 Hz six_d_force in rate reports
+  record_poll_interval_s: 0.0005  # 2 kHz recording wait; absorbs Python sleep jitter for 480 Hz six_d_force
   stale_threshold_s: 1.0   # consider a sensor offline after this gap
   expected_devices:
     - box_gripper

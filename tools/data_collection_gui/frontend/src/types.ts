@@ -120,6 +120,30 @@ export type RecordingStatus = {
   syncWarnings?: string[];
 };
 
+export type MarkerTcpSample = {
+  id: string;
+  side: "left" | "right" | string;
+  condition: string;
+  source: "recording" | "static_transform" | string;
+  status: "pending" | "recording" | "saved" | "discarded" | "registered" | string;
+  datasetRoot: string;
+  episodeIndex: number;
+  staticTransformPath: string;
+  note: string;
+  createdAt: string;
+};
+
+export type MarkerTcpSession = {
+  active: boolean;
+  sessionName: string;
+  sessionRoot: string;
+  stage: "idle" | "capture" | "reporting" | "done" | "failed" | string;
+  samples: MarkerTcpSample[];
+  pendingSampleId: string;
+  message: string;
+  reportPath: string;
+};
+
 export type RecordingBackend = "real" | "sim";
 
 export type TeleopCameraView = {
@@ -401,8 +425,10 @@ export type OnlineSyncSummary = {
 
 export type CalibrationCamera = {
   id: string;
-  reprojectionMm: number;
-  baselineMm: number;
+  // Bundle-adjustment reprojection residual, in pixels. Previously a fabricated
+  // millimetre figure from the mock; the real solve reports pixels, and there is
+  // no honest conversion without a range.
+  reprojectionPx: number;
   status: "pass" | "warn" | "fail";
 };
 
@@ -413,6 +439,10 @@ export type CalibrationStatus = {
   message: string;
   cameras: CalibrationCamera[];
   outputPath: string;
+  // Which calibration runs production is pointed at, read from the tracking
+  // config rather than tracked separately so the two cannot drift.
+  intrinsicsRun?: string;
+  extrinsicsRun?: string;
 };
 
 export type EePose = {
@@ -541,4 +571,82 @@ export type ProcessingItem = {
     }>;
     message: string;
   } | null;
+};
+
+// Camera self-check: did a fixed camera move since it was calibrated?
+//
+// Reported per camera as a view shift in pixels against a baseline frame stored
+// at calibration time. The criterion is change from that baseline, never how far
+// the cameras disagree with each other -- inter-camera disagreement is dominated
+// by target geometry (a marker size declared 5.8 cm instead of 5.6 accounted for
+// 23.5 mm of it), which no recalibration would fix.
+export type RigCheckVerdict = "ok" | "suspect" | "moved" | "unknown";
+
+// "partial" means every camera that could be checked was fine but some could
+// not be checked at all; it is deliberately not folded into "ok".
+export type RigCheckOverall = RigCheckVerdict | "partial" | "inconclusive";
+
+export type RigCheckCamera = {
+  status?: "measured" | "unknown";
+  verdict: RigCheckVerdict;
+  reason?: string;
+  shift_px_median?: number;
+  shift_px_p95?: number;
+  inliers?: number;
+  inlier_ratio?: number;
+  inlier_coverage?: number;
+  equivalent_rotation_deg?: number;
+  equivalent_error_mm_at_working_distance?: number;
+};
+
+export type RigCheckBaseline = {
+  exists: boolean;
+  captured_at?: string;
+  cameras?: string[];
+  intrinsics_run?: string;
+  extrinsics_run?: string;
+};
+
+export type RigCheckReport = {
+  generated_utc: string;
+  overall: RigCheckOverall;
+  guidance: string;
+  moved_cameras: string[];
+  unchecked_cameras?: string[];
+  thresholds_px: { warn: number; fail: number };
+  cameras: Record<string, RigCheckCamera>;
+  baseline?: RigCheckBaseline;
+};
+
+export type RigCheckResponse = {
+  ok: boolean;
+  error?: string;
+  hint?: string;
+  report: RigCheckReport | null;
+  baseline?: RigCheckBaseline;
+};
+
+// Guided calibration: per-camera intrinsics sweeps, then one shared extrinsics
+// sweep. They cannot be merged -- intrinsics are constrained by how much of one
+// camera's frame the board reaches, extrinsics by how often several cameras see
+// it at the same instant.
+export type CalibrationStepKind = "intrinsics" | "extrinsics";
+
+export type CalibrationSessionStep = {
+  kind: CalibrationStepKind;
+  camera: string;
+  status: "pending" | "recording" | "captured" | "skipped";
+  episodeIndex: number;
+  note: string;
+};
+
+export type CalibrationSession = {
+  active: boolean;
+  stage: "idle" | "capture" | "ready" | "solving" | "done" | "failed";
+  datasetName: string;
+  datasetRoot: string;
+  currentIndex: number;
+  message: string;
+  recorderState: string;
+  steps: CalibrationSessionStep[];
 };
