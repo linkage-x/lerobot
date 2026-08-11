@@ -98,11 +98,23 @@ def _emit(text: str) -> None:
     print(text, flush=True)
 
 
-# Healthy BOX sensors stream at ~199 Hz (touch ~50 Hz). A box that answers
+# BOX 采集板 v3.1 firmware + v3.4 SDK nominal stream rates. A box that answers
 # discovery but has stalled/aged out shows 0 Hz; a degraded one limps at ~8 Hz.
-# 30 Hz cleanly separates healthy (>=50) from both failure modes and is the floor
-# below which recorded box data is too sparse to be usable.
+# 30 Hz remains a conservative floor because the slowest nominal streams are the
+# two 60 Hz touch pads.
+BOX_SENSOR_NOMINAL_HZ = {
+    "box_touch_left": 60.0,
+    "box_touch_right": 60.0,
+    "box_gripper": 120.0,
+    "box_trigger": 120.0,
+    "box_imu": 240.0,
+    "box_six_d_force": 480.0,
+}
 _MIN_HEALTHY_STREAM_HZ = 30.0
+
+
+def _box_expected_rate_summary() -> str:
+    return "touch 60 Hz, six_d_force 480 Hz, imu 240 Hz, gripper/trigger 120 Hz"
 
 
 def _streaming_sensor_ids(observed_rates: dict[str, float]) -> list[str]:
@@ -1164,11 +1176,12 @@ def main(argv: list[str] | None = None) -> int:
         healthy, peak_hz = _box_stream_health(rates)
         if not healthy:
             # Discovery succeeded (box answered :15001) but the data stream on
-            # :15000 is stalled (0 Hz) or degraded (e.g. ~8 Hz vs ~199 Hz) and a
-            # host re-arm can't always revive it. Warn loudly so the operator
-            # power-cycles instead of recording empty/sparse box episodes.
+            # :15000 is stalled (0 Hz) or degraded (e.g. ~8 Hz vs nominal rates)
+            # and a host re-arm can't always revive it. Warn loudly so the
+            # operator power-cycles instead of recording empty/sparse box episodes.
             _emit(
-                f"WARNING: BOX stream unhealthy (peak {peak_hz:.0f} Hz, expected ~199); "
+                f"WARNING: BOX stream unhealthy (peak {peak_hz:.0f} Hz, "
+                f"expected {_box_expected_rate_summary()}); "
                 "recordings will have missing/sparse box data. Power-cycle the box and reconnect."
             )
     elif box_cfg.enabled:

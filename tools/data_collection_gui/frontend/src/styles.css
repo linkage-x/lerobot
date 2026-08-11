@@ -3121,6 +3121,45 @@ button.danger {
 .cali-box-panel > .cali-monitor-grid,
 .cali-box-panel > .cali-op-grid { margin: 0; }
 
+.marker-tcp-panel { border-left: 3px solid #2563eb; }
+.marker-tcp-controls {
+  align-items: flex-end;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 140px minmax(220px, 1fr);
+  margin-top: 12px;
+}
+.marker-tcp-controls label {
+  color: #60707c;
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  gap: 4px;
+}
+.marker-tcp-controls input,
+.marker-tcp-controls select {
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font: inherit;
+  min-height: 34px;
+  min-width: 0;
+  padding: 0 8px;
+}
+.marker-tcp-controls input:focus,
+.marker-tcp-controls select:focus {
+  border-color: #0f766e;
+  outline: 2px solid rgba(15, 118, 110, 0.16);
+}
+.marker-tcp-register { grid-template-columns: minmax(240px, 1fr) auto auto; }
+.marker-tcp-table { margin-top: 12px; }
+.marker-tcp-table .check-row { grid-template-columns: 220px minmax(0, 1fr) 110px; }
+@media (max-width: 760px) {
+  .marker-tcp-controls,
+  .marker-tcp-register,
+  .marker-tcp-table .check-row { grid-template-columns: 1fr; }
+  .marker-tcp-table .check-row em { text-align: left; }
+}
+
 .cali-op-card { position: relative; }
 .cali-meta {
   display: grid;

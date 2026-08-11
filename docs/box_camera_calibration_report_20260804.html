@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>BOX 8 路相机标定实验报告 · 2026-08-04</title>
+<style>
+  :root{
+    --bg:#f6f7f9;
+    --card:#ffffff;
+    --text:#1f2937;
+    --muted:#6b7280;
+    --line:#e5e7eb;
+    --accent:#2563eb;
+    --accent-soft:#eff6ff;
+    --ok:#15803d;
+    --ok-bg:#ecfdf5;
+    --warn:#b45309;
+    --warn-bg:#fffbeb;
+    --p0:#991b1b;
+    --p0-bg:#fef2f2;
+    --shadow:0 8px 24px rgba(15,23,42,.06);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    background:var(--bg);color:var(--text);line-height:1.65;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:36px 22px 72px}
+  .hero{background:linear-gradient(135deg,#111827,#1f2937);color:#fff;border-radius:22px;
+    padding:34px 36px;box-shadow:var(--shadow);margin-bottom:24px}
+  .hero h1{margin:0 0 10px;font-size:28px;letter-spacing:.2px}
+  .hero p{margin:6px 0;color:#d1d5db}
+  .hero a{color:#93c5fd}
+  .meta{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}
+  .pill{display:inline-flex;align-items:center;gap:7px;padding:6px 11px;border-radius:999px;
+    font-size:13px;font-weight:600;border:1px solid rgba(255,255,255,.18);color:#e5e7eb}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;
+    padding:22px;box-shadow:var(--shadow);margin-bottom:18px}
+  .card h2{margin:0 0 14px;font-size:22px}
+  .card h3{margin:22px 0 8px;font-size:17px}
+  .badge{display:inline-block;padding:4px 9px;border-radius:999px;font-size:12px;font-weight:700}
+  .done{color:var(--ok);background:var(--ok-bg)}
+  .todo{color:var(--accent);background:var(--accent-soft)}
+  .warn{color:var(--warn);background:var(--warn-bg)}
+  .p0{color:var(--p0);background:var(--p0-bg)}
+  .metric-table{width:100%;border-collapse:collapse;font-size:14px;margin:10px 0}
+  .metric-table th,.metric-table td{padding:9px 11px;border-bottom:1px solid var(--line);text-align:left}
+  .metric-table th{background:#f9fafb}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+    background:#f3f4f6;border-radius:6px;padding:2px 5px;font-size:.92em}
+  .callout{border-left:4px solid var(--accent);background:var(--accent-soft);
+    padding:14px 16px;border-radius:10px;margin:12px 0}
+  .callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  .callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  .callout.bad{border-color:var(--p0);background:var(--p0-bg)}
+  .small{font-size:13px;color:var(--muted)}
+  details{margin-top:12px;border:1px solid var(--line);border-radius:12px;background:#fafafa;overflow:hidden}
+  summary{cursor:pointer;padding:12px 14px;font-weight:700;list-style:none;user-select:none}
+  summary::-webkit-details-marker{display:none}
+  summary:before{content:"▸";display:inline-block;margin-right:8px;transition:.18s}
+  details[open] summary:before{transform:rotate(90deg)}
+  .detail-body{padding:0 14px 14px}
+  ol,ul{margin:8px 0 0 20px}
+  li{margin:5px 0}
+  .flow{white-space:pre-wrap;background:#0f172a;color:#e5e7eb;padding:16px;border-radius:12px;
+    overflow:auto;font-size:13px}
+  @media (max-width:820px){.hero{padding:26px 22px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<section class="hero">
+<h1>BOX 8 路相机标定实验报告</h1>
+<p>2026-08-04 · 从厂商内参切换到自标定 + 脱离机器人的多相机 BA</p>
+<p style="margin-top:14px">← 返回 <a href="box_umi_trajectory_gt_roadmap.html">BOX 高精度 UMI Trajectory GT Roadmap</a>（本报告对应 Phase 2）</p>
+<div class="meta">
+<span class="pill">3 次采集 · 18 episodes</span>
+<span class="pill">7 路参与标定 · cam_00 遮挡</span>
+<span class="pill">ChArUco 400 · 12×9 · 30 mm</span>
+<span class="pill">相机同步 0.008–0.009 ms</span>
+</div>
+</section>
+
+<section class="card">
+<h2>结论摘要</h2>
+<table class="metric-table">
+<tr><th>项</th><th>结果</th></tr>
+<tr><td><b>3D 一致性（独立 held-out）</b></td><td><b>p50 0.077 mm / p95 0.244 mm</b>，对照 0720 旧管线的 2.3–7.7 mm，好一个多数量级</td></tr>
+<tr><td><b>重建尺度偏差</b></td><td><b>+0.0074%</b>（1 m 处 0.07 mm）——印刷板标称 30 mm 可信，无需再修正尺度</td></tr>
+<tr><td><b>内参</b></td><td>自标定 held-out 比厂商值好 <b>2.7–4.8 倍</b>；厂商 <span class="mono">cam_08</span> 内参在 18.4% 画幅上无效</td></tr>
+<tr><td><b>相机模型</b></td><td><span class="badge done">判定：切 fisheye</span> 理由是正确性而非精度</td></tr>
+<tr><td><b>世界系</b></td><td>机器人已完全移出标定链路；当前 gauge 挂在 <span class="mono">cam_14</span>，待换桌面锚板</td></tr>
+<tr><td><b>Level 1 σ 场</b></td><td>工作区内 p50 <b>0.32 mm</b> / p95 <b>0.73 mm</b>，97.8% 在 1 mm 内；新旧标定逐点差中位数仅 <b>+0.63%</b></td></tr>
+<tr><td><b>遗留</b></td><td>3 台相机画幅覆盖未达 90%；<span class="mono">cam_00</span> 视野被遮挡</td></tr>
+</table>
+<div class="callout ok">
+<b>与理论预测的交叉验证：</b>Level 1 uncertainty map 在完全独立的路径上预测 σ<sub>max</sub> p95 = <b>0.26 mm</b>，本次实测 3D 一致性 p95 = <b>0.244 mm</b>。
+  两者吻合，说明 Level 1 的几何模型可信，且「相机布局不是瓶颈」的判断成立。
+</div>
+</section>
+
+<section class="card">
+<h2>1 · 实验设置</h2>
+
+<h3>1.1 数据</h3>
+<table class="metric-table">
+<tr><th>数据集</th><th>内容</th><th>用途</th></tr>
+<tr><td><span class="mono">calib_20260804_150355</span></td><td>10 episodes（0–6 逐相机内参，7–9 外参）</td><td>首轮全套</td></tr>
+<tr><td><span class="mono">thor_gmsl2_8ch_v1_20260804_160034</span></td><td>7 episodes（0–6 逐相机内参）</td><td>补画幅边缘</td></tr>
+<tr><td><span class="mono">thor_gmsl2_8ch_v1_20260804_163026</span></td><td>1 episode</td><td><span class="mono">cam_08</span> 专项补拍</td></tr>
+</table>
+<p class="small">episode ↔ 相机映射：0→cam_06, 1→cam_07, 2→cam_08, 3→cam_09, 4→cam_12, 5→cam_13, 6→cam_14。</p>
+
+<h3>1.2 标定板</h3>
+<table class="metric-table">
+<tr><th>板</th><th>规格</th><th>板面</th><th>1.2 m 处检出</th><th>判定</th></tr>
+<tr><td><span class="mono">charuco_400</span>（板 A）</td><td>12×9 格 × 30 mm，marker 22.5 mm，DICT_5X5_100，玻璃底板</td><td>360 × 270 mm</td><td><b>54/54</b></td><td><span class="badge done">唯一可用于挥板</span></td></tr>
+<tr><td><span class="mono">charuco_300</span>（板 B）</td><td>14×9 格 × 20 mm，marker 15 mm，铝框</td><td>280 × 180 mm</td><td><b>0/63</b></td><td><span class="badge p0">≤0.7 m 才可用</span></td></tr>
+</table>
+<div class="callout warn">
+<b>两块板的 marker ID 完全冲突</b>（A 是 0–53，B 是 0–62，重叠 0–53），不可同时入镜。
+  板 B 的 15 mm marker 在 1.2 m 处只成像 12.5 px，低于 OpenCV 默认 <span class="mono">minMarkerPerimeterRate</span> 的 14.4 px 下限，被检测器直接丢弃。
+</div>
+<p class="small"><b>注意板的行列约定</b>：印刷标签的「9×12」是行×列，OpenCV <span class="mono">CharucoBoard</span> 要传 <span class="mono">(squares_x, squares_y) = (12, 9)</span>，仓库里的板定义已经是转置后的形式。</p>
+
+<h3>1.3 相机</h3>
+<table class="metric-table">
+<tr><th>项</th><th>值</th></tr>
+<tr><td>分辨率 / 帧率</td><td>1920×1080 @ 60 fps，global shutter</td></tr>
+<tr><td>视场角（对图像角点反解光线方向）</td><td>对角 <b>129°–138°</b>，水平 <b>113°–121°</b></td></tr>
+<tr><td>同步质量</td><td>全 18 个 episode 的 SOF spread 最大 <b>0.008–0.009 ms</b>，各相机帧数完全一致，<span class="mono">ok=True</span></td></tr>
+<tr><td><span class="mono">cam_00</span></td><td><span class="badge p0">视野被完全遮挡</span>三个外参 episode 全部检出 0 帧，未参与标定</td></tr>
+</table>
+</section>
+
+<section class="card">
+<h2>2 · 方法</h2>
+<div class="flow">Thor (cv2 4.6, 旧 aruco API)          本地 (cv2 4.12)
+  mkv → detectMarkers
+      → interpolateCornersCharuco   ──npz──▶  内参自标定 (rational / fisheye)
+                                                 ├─ 分层时间块 held-out
+                                                 ├─ 全画幅径向单调性检查
+                                                 └─ 与厂商值对比
+                                              外参 corner 级 BA (无机器人)
+                                                 ├─ gauge 固定单相机
+                                                 ├─ scipy 稀疏 Jacobian + huber
+                                                 └─ held-out 帧三角化 → 3D 一致性</div>
+<p class="small">Thor 是 OpenCV 4.6，其 aruco 是 <span class="mono">Dictionary_get</span> / <span class="mono">CharucoBoard_create</span> 的旧 API（无 <span class="mono">ArucoDetector</span>）。
+因此<b>只在 Thor 上做检测</b>，把角点存成 npz 传回本地做标定数学——既避免传 2.3 GB 视频，也避免为旧 API 重写标定代码。</p>
+
+<h3>2.1 为什么 held-out 必须分层，而且不能随机抽帧</h3>
+<div class="callout warn">
+<b>随机抽帧会泄漏。</b>手持挥板时第 k 帧和第 k+1 帧几乎是同一个位姿，随机切分测的是插值而不是泛化。
+<br/><br/>
+<b>而在拼接后的序列上切整块也不行。</b>合并多次采集时，一整个 held-out 块可能落进同一次 sweep，训练集就只剩另一次 sweep 的空间分布。
+  实测后果：<span class="mono">cam_09</span> 的 held-out 报 <b>310 px</b>，而它同一份数据的 full fit 是健康的 0.150 px——那不是模型差，是训练子集里没有边缘数据、高阶系数无约束而发散。
+<br/><br/>
+<b>正确做法：在每一次采集内部各留出时间块，再拼接。</b>两侧都保有全部采集的空间分布。
+</div>
+
+<h3>2.2 判据：重投影之外还必须查单调性</h3>
+<div class="callout">
+径向映射如果在画幅内折返，那部分像素就<b>没有唯一光线对应</b>——模型在那里是坏的，而任何在现有数据上算的重投影统计都检测不到。
+本报告对每个拟合结果都检查「径向映射在整个画幅内是否严格单调」，并把「图像角点根本无法反解」单列为更严重的一类失败。
+</div>
+</section>
+
+<section class="card">
+<h2>3 · 结果：画幅覆盖</h2>
+<div class="callout bad">
+<b>首轮采集的边缘覆盖完全不合格：每台相机画幅外侧 30–50% 面积没有任何标定数据，外侧 20% 半径带的角点数全部为 0。</b>
+</div>
+<table class="metric-table">
+<tr><th>相机</th><th>1503 首轮</th><th>1600 补拍</th><th>合并后</th><th>rational 折返状况变化</th></tr>
+<tr><td>cam_08</td><td>62%</td><td>64%</td><td><b>96%</b> <span class="badge done">1630 专项</span></td><td>—</td></tr>
+<tr><td>cam_14</td><td>61%</td><td>95%</td><td>95%</td><td><span class="badge p0">37.2° 折返</span> → 单调</td></tr>
+<tr><td>cam_07</td><td>54%</td><td>92%</td><td>92%</td><td><span class="badge p0">35.9° 折返</span> → 单调</td></tr>
+<tr><td>cam_13</td><td>60%</td><td>90%</td><td>90%</td><td>单调 → 单调</td></tr>
+<tr><td>cam_09</td><td>61%</td><td>87%</td><td><span class="badge warn">86%</span></td><td><span class="badge p0">40.9° 折返</span> → <b>仍折返</b></td></tr>
+<tr><td>cam_12</td><td>70%</td><td>82%</td><td><span class="badge warn">82%</span></td><td>单调 → 单调</td></tr>
+<tr><td>cam_06</td><td>48%</td><td>79%</td><td><span class="badge warn">79%</span></td><td>单调 → 单调</td></tr>
+</table>
+<div class="callout ok">
+<b>补覆盖是迄今投入产出比最高的动作之一。</b>它同时：消除了三台相机的模型折返；把 <span class="mono">cam_07</span> 的 BA 残差从 0.85 px 降到 ≤0.265 px；
+  并<b>推翻了基于首轮数据得出的相机模型结论</b>（见第 5 节）。
+</div>
+</section>
+
+<section class="card">
+<h2>4 · 结果：内参</h2>
+<h3>4.1 自标定 vs 厂商值</h3>
+<table class="metric-table">
+<tr><th>相机</th><th>覆盖</th><th>rational held-out</th><th>fisheye held-out</th><th>厂商值同批数据</th><th>提升</th></tr>
+<tr><td>cam_08</td><td>96%</td><td>0.288</td><td><b>0.185</b></td><td>0.563</td><td>3.0×</td></tr>
+<tr><td>cam_14</td><td>95%</td><td>0.155</td><td>0.155</td><td>0.629</td><td>4.1×</td></tr>
+<tr><td>cam_07</td><td>92%</td><td>0.226</td><td><b>0.154</b></td><td>0.742</td><td>4.8×</td></tr>
+<tr><td>cam_13</td><td>90%</td><td>0.159</td><td>0.160</td><td>0.529</td><td>3.3×</td></tr>
+<tr><td>cam_09</td><td>86%</td><td>0.133</td><td>0.133</td><td>0.495</td><td>3.7×</td></tr>
+<tr><td>cam_12</td><td>82%</td><td>0.184</td><td>0.185</td><td>0.190</td><td>1.0×</td></tr>
+<tr><td>cam_06</td><td>79%</td><td>0.158</td><td>0.160</td><td>0.636</td><td>4.0×</td></tr>
+</table>
+<p class="small">单位 px。合并三次采集，每台 188–200 帧，分层时间块 held-out。<span class="mono">cam_12</span> 是唯一厂商值本就好的一路。</p>
+<div class="callout warn">
+<b>首轮那组更漂亮的数字（0.10–0.14 px）不是更好，是考卷更容易</b>——当时只覆盖了画幅中心。补上边缘之后分数变差，但那才是可信的分数。
+</div>
+
+<h3>4.2 厂商内参的问题</h3>
+<ul>
+<li><b><span class="mono">cam_08</span> 在 18.4% 的画幅上无效</b>：径向映射在 θ=51.7° 折返，而图像角点在 70.4°。折返前只覆盖到半径 845 px，图像半宽就有 960 px——超出部分的像素在模型下多解。</li>
+<li><b>拟合病态</b>：同型号镜头的 k1 从 0.06（cam_08）跨到 26.9（cam_06/14），差 400 倍，且 k1/k4 ≈ 0.985 分子分母近似抵消。系数没有物理意义。</li>
+<li><b>仓库里只有厂商给的 RMS 数字</b>，没有自测重投影、没有 held-out、没有边缘验证。</li>
+</ul>
+
+<h3>4.3 一个会误导后续所有工作的 OpenCV 坑</h3>
+<div class="callout bad">
+<b><span class="mono">cv2.undistortPoints</span> 的默认参数在这些镜头上不可用。</b>它用固定 <b>5 次</b> Gauss-Newton 反解畸变，在 113°–121° 视场上不收敛：
+  这七台相机的图像角点处往返误差高达 <b>35–55 px</b>。改用 <span class="mono">undistortPointsIter</span> 并给收敛判据（100 次 / 1e-12）后精确归零。
+<br/><br/>
+<b>模型本身可精确求逆，是 OpenCV 的默认反解不够。</b>生产 <span class="mono">cube_tracking</span> 路径不直接调它（只用正向 <span class="mono">projectPoints</span> + <span class="mono">solvePnP</span>），暂时安全；但 <span class="mono">solvePnP</span> 内部初值会用到反解，切换模型后需复核。
+</div>
+</section>
+
+<section class="card">
+<h2>5 · 结果：相机模型（结论翻转两次）</h2>
+<div class="callout bad">
+<b>这一节的过程本身比结论更值得留档：它是「标定数据覆盖不足会伪造出错误结论」的活样本。</b>
+<ol>
+<li><b>首轮（覆盖 48–71%）：两模型打平</b>（差 0.01–0.02 px）→ 曾据此写下「rational 够用，不用换」。</li>
+<li><b>二轮（64–95%）：fisheye 在覆盖最好的三台赢 1.9–4.8 倍</b> → 说明「打平」是覆盖不足造成的假象：中心区两个模型都拟合得动，<b>差异只在边缘暴露</b>。</li>
+<li><b>补齐 cam_08 后合并重标（79–96%）：fisheye 全面占优</b>，且判定理由从「精度」变成了「正确性」。</li>
+</ol>
+</div>
+<table class="metric-table">
+<tr><th>判据</th><th>rational</th><th>fisheye</th></tr>
+<tr><td>全画幅单调</td><td><span class="badge p0">cam_08 / cam_09 折返</span></td><td><span class="badge done">7 台全部通过</span></td></tr>
+<tr><td>图像角点可反解</td><td><span class="badge p0">cam_08 角点 (1919,1079) 反解出 <span class="mono">nan</span></span></td><td>全部正常</td></tr>
+<tr><td>train 残差 · cam_08（覆盖 96%）</td><td>1.419 px</td><td><b>0.179 px</b></td></tr>
+<tr><td>train 残差 · cam_14（95%）</td><td>0.323 px</td><td><b>0.144 px</b></td></tr>
+<tr><td>train 残差 · cam_07（92%）</td><td>0.246 px</td><td><b>0.170 px</b></td></tr>
+<tr><td>train 残差 · cam_06（79%）</td><td>0.142 px</td><td>0.144 px（打平）</td></tr>
+<tr><td><b>端到端 BA 重投影</b></td><td>0.2972 px</td><td><b>0.2437 px</b></td></tr>
+<tr><td><b>端到端 3D 一致性 p95</b></td><td>0.295 mm</td><td><b>0.244 mm</b></td></tr>
+</table>
+<div class="callout warn">
+<b>决定性理由不是那 0.05 mm，是正确性。</b>毫米上的差距只占 3 mm 指标的 1.7%，单看这个不值得动管线。但：
+<ul>
+<li><b>rational 在 cam_08 上连自己的图像角点都反解不出来</b>（返回 <span class="mono">nan</span>，而中心与边中点正常）——那块画幅没有对应的光线，这不是「精度差一点」。</li>
+<li><b>覆盖越好，rational 越吃力</b>：96% 时 train 1.419 vs 0.179；79% 时打平 0.142/0.144。这个单调关系说明不是偶然。</li>
+<li>cube 在桌面运动时 marker <b>会</b>跑到画幅边缘。到那时折返模型给的不是稍差的结果，是垃圾值。</li>
+</ul>
+</div>
+<div class="callout ok">
+<b>改造成本比先前估计的小得多。</b>给 BA 加 fisheye 支持实测只用了两个函数约 30 行（<span class="mono">project_points</span> / <span class="mono">solve_pnp</span> 各一个分支）。
+  生产路径调用点共 12 处：<span class="mono">cube_tracking.py</span>（4 projectPoints + 3 solvePnP）、<span class="mono">hikon_cube_tracking_in_robot_base.py</span>（1 + 3）、<span class="mono">april_cube_tracking_realsense_online.py</span>（1）。
+  关键在于 <b>corner 级 BA 只需要正向投影</b>，两模型都是闭式、代价为零；反解只在 PnP 初值处需要。
+<br/><br/>
+<b>落地方式：</b>先加 <span class="mono">camera_model: rational | fisheye</span> 配置开关，两条路都留着，同一批数据 A/B 一次再切默认值。
+</div>
+</section>
+
+<section class="card">
+<h2>6 · 结果：外参与 3D 一致性</h2>
+<h3>6.1 脱离机器人的 corner 级 BA</h3>
+<p>手持 ChArUco 板自由挥动，gauge 固定在 <span class="mono">cam_14</span>，7 个相机位姿与每帧板位姿一起对<b>原始角点重投影误差</b>求解（scipy 稀疏 Jacobian + huber）。机器人完全不参与。</p>
+<table class="metric-table">
+<tr><th>指标</th><th>rational 内参</th><th>fisheye 内参</th></tr>
+<tr><td>BA 重投影 RMSE</td><td>0.2972 px</td><td><b>0.2437 px</b></td></tr>
+<tr><td>最差相机</td><td>cam_07 0.443 px</td><td>cam_09 0.265 px</td></tr>
+<tr><td>参与帧 / 残差点</td><td colspan="2">250 帧 / 82181 点</td></tr>
+</table>
+
+<h3>6.2 独立 3D 一致性（BA 未用过的 427 帧）</h3>
+<p>用 BA 解出的相机位姿三角化棋盘角点，再与已知板几何做刚体拟合，残差即 3D 重建一致性。</p>
+<table class="metric-table">
+<tr><th>指标</th><th>rational</th><th>fisheye</th><th>0720 旧管线</th></tr>
+<tr><td>p50</td><td>0.089 mm</td><td><b>0.077 mm</b></td><td rowspan="2">per-camera sample 平移残差<br/><b>2.3–7.7 mm</b></td></tr>
+<tr><td>p95</td><td>0.295 mm</td><td><b>0.244 mm</b></td></tr>
+<tr><td>重建尺度偏差</td><td>−0.0064%</td><td>+0.0074%</td><td>未测</td></tr>
+</table>
+<div class="callout ok">
+尺度偏差 <b>+0.0074%</b>（1 m 处 0.07 mm）说明<b>印刷板标称的 30 mm 方格是准的</b>，尺度项不再是误差预算里的条目。
+</div>
+<p class="small">对照：旧管线用 FR3 举着单个 160 mm AprilTag 在 robot base 系里解，既继承 FK 误差、又够不到机器人到不了的桌面区域，且机器人一移动整套外参作废。</p>
+</section>
+
+<section class="card">
+<h2>7 · 用新标定重跑 Level 1 uncertainty map</h2>
+<p>Level 1 只依赖相机几何、内参和一个假设的 σ<sub>pixel</sub>（仍取 0.2 px，实测尚未做）。
+物理 rig 在 0720 与 0804 之间没有移动，因此<b>两套独立导出的标定应当给出一致的 σ 场</b>——差异大反倒说明某一套错了。
+这次重跑的价值不在「看到提升」，而在于：确认新标定没有隐含退化的几何、量化内参差异的影响面、以及再取一条独立证据判模型。</p>
+
+<h3>7.1 同一批物理点上的对比</h3>
+<p class="small">在 robot base 系取工作区网格（x[−0.2,1.4] y[−0.9,0.9] z[−0.3,0.9] m，58466 点），再变换到 cam_14 系评估新标定。<b>必须同点位比较</b>——见 7.2。</p>
+<table class="metric-table">
+<tr><th>标定</th><th>可测点</th><th>σ<sub>max</sub> p50</th><th>p95</th><th>max</th><th>gate &lt;1 mm</th></tr>
+<tr><td>0720 旧（厂商内参）</td><td>97.3%</td><td>0.321 mm</td><td>0.820 mm</td><td>6.497 mm</td><td>97.3%</td></tr>
+<tr><td>0804 新 · rational</td><td>97.3%</td><td>0.334 mm</td><td>0.908 mm</td><td>2.356 mm</td><td>96.3%</td></tr>
+<tr><td><b>0804 新 · fisheye</b></td><td><b>98.2%</b></td><td><b>0.319 mm</b></td><td><b>0.734 mm</b></td><td><b>1.944 mm</b></td><td><b>97.8%</b></td></tr>
+</table>
+<div class="callout ok">
+<b>三条结论：</b>
+<ol>
+<li><b>σ 场基本没变，逐点差中位数 +0.63%。</b>这是一个有价值的自洽性检验：同一个物理 rig 的两套完全独立标定，几何隐含的不确定度一致到 0.6%，说明两套都没有隐含的几何错误。</li>
+<li><b>fisheye 在每一项上都最好，差距全在尾部。</b>p95 0.734 vs 0.820（旧）vs 0.908（rational）；<b>max 1.944 vs 6.497 vs 2.356</b>。可测点也更多（98.2% vs 97.3%），因为不折返意味着更多画幅可用。
+      旧标定那个 max 6.497 mm 正是厂商 <span class="mono">cam_08</span> 折返在几何上的体现——中位数完全看不出来，极值看得清清楚楚。
+      这是继内参 held-out、端到端 3D 一致性之后<b>第三条独立指向 fisheye 的证据</b>。</li>
+<li><b>工作区内 σ<sub>max</sub> p50 0.32 mm / p95 0.73 mm，97.8% 在 1 mm 以内。</b>「几何不是瓶颈」的结论更扎实了。</li>
+</ol>
+</div>
+
+<h3>7.2 一个隐蔽的坐标系依赖（已修）</h3>
+<div class="callout bad">
+<b>第一版重跑的结果是错的，报出去之前查出来了。</b><span class="mono">coverage_extent()</span> 里原有一句
+<span class="mono">hi[2] = 相机最高处</span>，注释写的是「相机朝下看，没必要搜到最高相机之上」——这<b>隐含假设世界系 Z 轴朝上</b>。
+  旧标定的世界系是 robot base，假设成立；新标定的 gauge 钉在 <span class="mono">cam_14</span> 上，Z 变成该相机的光轴方向，这一刀正好把桌面所在区域整个切掉：
+  采样域塌缩成 0.95 m 薄片、可测点从 ~70% 掉到 <b>14.5%</b>、σ<sub>max</sub> p50 报出 1.36 mm，<b>看起来像精度大幅退化，实际只是采样域被切错</b>。
+<br/><br/>
+<b>修法：</b>三个轴对称加 padding，不对任何轴做特殊处理。定义域不该依赖外参碰巧写在哪个坐标系里。
+  并补了回归测试：整个 rig 绕 X 轴滚转 90°（Z 不再朝上）后可测体积不得塌缩——断言比值在 0.5–2.0 之间而非相等，因为轴对齐包围盒对旋转点集本来就不守恒，那部分差异无害。
+</div>
+<div class="callout warn">
+<b>这与「gauge 挂在相机上」是同一个问题的两面。</b>不只是原点物理上没意义、不可复现；它还会让「Z 轴朝上」这类隐藏在代码里的假设<b>静默失效</b>。
+  换成桌面锚板世界系之后，「Z 轴垂直桌面向上」会重新成为一个真实可依赖的约定，而不是一个碰巧成立的巧合。见 roadmap Phase 2.4。
+</div>
+<p class="small"><b>口径提醒：</b>本节的 p50 0.32 mm 是在<b>实际工作区</b>上统计的。
+若改在「≥2 相机可见」的整个体积上统计（含大量远端边角），同一套标定给出的是 p50 ≈ 1.4 mm——两个数都对，但对应的问题不同，引用时必须说清域。</p>
+</section>
+
+<section class="card">
+<h2>8 · 过程中发现的工具侧缺陷（均已修）</h2>
+<table class="metric-table">
+<tr><th>缺陷</th><th>后果</th><th>修法</th></tr>
+<tr><td>held-out 在拼接序列上切块</td><td>整个 held-out 块落进同一次采集，训练集缺边缘数据而发散（cam_09 报 310 px，其 full fit 是 0.150 px）</td><td>改为<b>按采集分层</b>，每次采集内部各留出时间块</td></tr>
+<tr><td><span class="mono">min_corners=20</span> 过高</td><td>板在画幅边缘时只露一部分、角点少，<b>被优先丢弃</b>——被丢帧平均半径 72–74% vs 保留帧 47–62%，cam_09 因此损失 8 个百分点覆盖</td><td>降到 <b>8</b></td></tr>
+<tr><td>FoV 判据用默认迭代的 <span class="mono">undistortPoints</span></td><td>角点反解误差 35–55 px，且对折返模型返回第二分支的假解</td><td>改 <span class="mono">undistortPointsIter</span>，并用<b>正向单调极限</b>兜底</td></tr>
+<tr><td>fisheye 角点方向计算饱和到 90°</td><td>每个 fisheye 拟合都被误报为「视场内折返」</td><td>改为在正向径向映射上数值反解</td></tr>
+<tr><td>「角点无法反解」与「视场内折返」共用一个标签</td><td>前者更严重却被后者的措辞盖过</td><td>拆成两个标签</td></tr>
+<tr><td><span class="mono">coverage_extent()</span> 假设世界系 Z 轴朝上</td><td>gauge 换成相机系后采样域塌缩成 0.95 m 薄片，可测点 70%→14.5%，σ 看起来像退化</td><td>三轴对称 padding；加滚转 90° 的回归测试</td></tr>
+<tr><td>rational 拟合无初值</td><td>cam_12 发散到 fx = 4498 px（真值约 1008）</td><td>用图像宽度播种 f，加 <span class="mono">CALIB_USE_INTRINSIC_GUESS</span></td></tr>
+</table>
+</section>
+
+<section class="card">
+<h2>9 · 待办</h2>
+<h3><span class="badge p0">阻塞中</span> 补完三台相机的画幅边缘覆盖</h3>
+<div class="callout warn">
+<b>暂不方便重新录制，列为 TODO。</b>下列三台未达 90%，其模型在边缘仍属外推：
+</div>
+<table class="metric-table">
+<tr><th>相机</th><th>当前覆盖</th><th>状态</th><th>优先级</th></tr>
+<tr><td><span class="mono">cam_09</span></td><td>86%</td><td><b>补过一轮仍折返</b>（rational 在 68.8° 折返，角点在 72.1°）</td><td><span class="badge p0">最高</span></td></tr>
+<tr><td><span class="mono">cam_12</span></td><td>82%</td><td>单调，但边缘仍是外推</td><td><span class="badge warn">中</span></td></tr>
+<tr><td><span class="mono">cam_06</span></td><td>79%</td><td>七台里最低</td><td><span class="badge warn">中</span></td></tr>
+</table>
+<details open="">
+<summary>补拍协议（照搬 cam_08 那次即可，它从 62% 补到了 96%）</summary>
+<div class="detail-body">
+<ul>
+<li><b>单独一个 episode 只伺候一台相机</b>——cam_08 那次 605 帧里 500 帧有效，是最好的一次。</li>
+<li>站到相机侧后方，把板<b>贴到画幅四角和四边</b>，四个角必须走到。</li>
+<li>每个边缘位置做 ±30–45° 倾斜。</li>
+<li>距离 0.5–0.8 m（板 A 在此距离 marker 成像 25–45 px，检测很稳）。</li>
+<li><b>录制时的判断标准</b>：看预览，板的一部分要贴着画面边框。</li>
+</ul>
+</div>
+</details>
+
+<h3><span class="badge todo">可并行</span> 其余待办</h3>
+<table class="metric-table">
+<tr><th>项</th><th>说明</th></tr>
+<tr><td><b>切换到 fisheye</b></td><td>先加 <span class="mono">camera_model</span> 配置开关，A/B 后再切默认值。12 个调用点</td></tr>
+<tr><td><b>修 <span class="mono">cam_00</span> 或删掉它</b></td><td>视野被完全遮挡，三个外参 episode 全部检出 0 帧。8 路里有 1 路是废的</td></tr>
+<tr><td><b>世界系换桌面锚板</b></td><td>当前 gauge 挂在 <span class="mono">cam_14</span> 上，原点物理上无意义、不可复现。见 roadmap Phase 2.4</td></tr>
+<tr><td><b>实测 σ<sub>pixel</sub></b></td><td>Level 1 uncertainty map 唯一未验证的输入。工具已就绪，需要一段静止录制</td></tr>
+<tr><td><b>板 ID 去冲突</b></td><td>两块现有板 ID 重叠 0–53，不可同时入镜。新板应从 ID 100 起编</td></tr>
+<tr><td><b>更大的板</b></td><td>板 A 在 1.2 m 处 marker 仅成像 18.8 px。按 30 px 反推需 marker ≥36 mm / 方格 ≥48 mm（12×9 板面约 576×432 mm）</td></tr>
+</table>
+</section>
+
+<section class="card">
+<h2>10 · 产物与复现</h2>
+<table class="metric-table">
+<tr><th>路径</th><th>内容</th></tr>
+<tr><td><span class="mono">outputs/metrology/calib_final/intrinsics_report.json</span></td><td>最终内参（rational + fisheye），含 held-out、单调性、来源文件与内容哈希</td></tr>
+<tr><td><span class="mono">outputs/metrology/calib_final/extrinsics_{fisheye,rational}/</span></td><td>最终外参 BA <span class="mono">T_ref_cam</span>（2026-08-05 补落盘，见下）</td></tr>
+<tr><td><span class="mono">outputs/metrology/calib_20260804/extrinsics_report.json</span></td><td><span class="badge warn">补拍前那一版</span> 0.3165 px / cam_07 0.85 px。<b>不是本报告 §6.1 引用的最终值</b></td></tr>
+<tr><td><span class="mono">outputs/metrology/calib_*/det_intr/</span></td><td>各次采集的角点检测 npz。<b>2026-08-05 补 <span class="mono">metrology.cli.detect_charuco</span></b> 作为可复现入口（此前只有临时脚本）</td></tr>
+<tr><td><span class="mono">outputs/metrology/coverage_compare.png</span></td><td>两轮覆盖对比图</td></tr>
+<tr><td><span class="mono">third_party/opencv_kalibr/metrology/</span></td><td><span class="mono">intrinsics.py</span> / <span class="mono">extrinsics.py</span> / <span class="mono">corner_noise.py</span> / <span class="mono">uncertainty.py</span> + CLI + 测试</td></tr>
+</table>
+<p class="small">所有报告都带每个读入文件的 sha256——与 tracking summary 只按 run 名字引用不同，改了标定目录而不改名字不会被漏掉。</p>
+
+<div class="callout warn">
+<b>2026-08-05 修正：最终外参此前没有落盘。</b>
+本报告 §6.1 引用的 BA 结果（rational 0.2972 px / fisheye 0.2437 px）当时是从临时脚本跑出来的，写进
+<span class="mono">calib_20260804/extrinsics_report.json</span> 的却是补拍<b>之前</b>那一次（0.3165 px、cam_07 0.85 px）。
+外参检测数据在补拍前后没有变过（两轮补拍都是逐相机<b>内参</b>采集），所以「最终 BA」＝同一批
+<span class="mono">det_extr</span> 换上最终内参重跑。已补
+<span class="mono">metrology.cli.calibrate_extrinsics</span> 作为可复现入口，重跑逐位复现了 §6.1 的两组数字
+（250 帧 / 82181 点；fisheye 0.2437 px，最差 cam_09 0.2649；rational 0.2972 px，最差 cam_07 0.4431）。
+<br/>
+<span class="mono">python3 -m metrology.cli.calibrate_extrinsics --detections outputs/metrology/calib_20260804/det_extr
+--intrinsics-report outputs/metrology/calib_final/intrinsics_report.json --model fisheye --reference cam_14
+--out outputs/metrology/calib_final/extrinsics_fisheye</span>
+<br/>
+教训与 §8 同类：<b>没有 CLI 的结果等于没有产物</b>——报告里的数字和目录里的文件可以在无人察觉的情况下分叉。
+<br/>
+检测那一步（mkv → 角点 npz）同样只存在于临时脚本里，已补为 <span class="mono">metrology.cli.detect_charuco</span>。
+它按能力选 aruco API（<span class="mono">interpolateCornersCharuco</span> 在 4.7 之后被移除，<span class="mono">CharucoDetector</span> 在此之前不存在，
+而 Thor 系统 python 是 4.6、评测用的 venv 是 4.12）。用新 API 重新检测再重跑 BA：<b>0.2434 px vs 0.2437</b>，相机位姿差 ≤0.06 mm / 0.0034°。
+至此从原始视频到生产标定<b>全链路可复现</b>。
+</div>
+
+<div class="callout warn">
+<b>2026-08-05 后续：这套标定接进生产后，端到端收益为零。</b>
+在一段已录制的 teaching bundle 上做三臂 A/B（同一批像素，只换标定）：相机间一致性 0720 厂商 23.5 mm、0804 rational 26.7 mm、0804 fisheye 26.6 mm。
+本报告的所有结论（自标好 3–6 倍、fisheye 全画幅单调、3D 一致性 p95 0.244 mm）都没有被推翻——
+<b>它们是对的，只是修的不是当前的瓶颈</b>。瓶颈是 <span class="mono">marker_size_cm</span>：5.8 改 5.6 让相机间一致性从 26.6 降到 4.1 mm。
+详见 <a href="box_umi_trajectory_gt_roadmap.html">roadmap</a> 的「2026-08-05 实测」一节。
+<br/>
+对本报告的方法论提醒：<b>§6.2 的 3D 一致性衡量的是「相机之间对棋盘角点是否自洽」，它对标定质量敏感，但对下游 marker 模型的错误完全免疫。</b>
+一个 p95 0.244 mm 的 rig 与一条 26 mm 的跟踪链路并不矛盾——两者量的不是同一件事。
+</div>
+</section>
+
+<p class="small" style="margin-top:24px">
+  2026-08-04 · 对应 <a href="box_umi_trajectory_gt_roadmap.html">roadmap</a> Phase 2（Metric Rig 标定）。
+</p>
+</div>
+</body>
+</html>

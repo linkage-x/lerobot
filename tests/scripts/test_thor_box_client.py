@@ -74,6 +74,7 @@ class _AllSensor:
     six_d_force_data_filter: _SixD = field(default_factory=_SixD)
     touch_sensor_data_first: _Touch = field(default_factory=_Touch)
     touch_sensor_data_sec: _Touch = field(default_factory=_Touch)
+    gripper_speed: float | None = None
 
 
 @dataclass
@@ -217,6 +218,7 @@ def test_decode_sensor_cache_filters_zero_timestamp_sensors():
         liwp_timestemp=1234,
         data=_AllSensor(
             gripper_data=_Gripper(timestamp=10, distance=0.04),
+            gripper_speed=0.0125,
             imu_data=_Imu(),  # timestamp=0 -> dropped
             trigger_data=_Trigger(timestamp=20, distance=42.0),
             six_d_force_data=_SixD(timestamp=30, data=(1, 2, 3, 4, 5, 6)),
@@ -240,6 +242,7 @@ def test_decode_sensor_cache_filters_zero_timestamp_sensors():
         "box_gripper", "box_trigger", "box_six_d_force", "box_touch_left",
     }
     assert out["sensors"]["box_gripper"]["distance_m"] == pytest.approx(0.04)
+    assert out["sensors"]["box_gripper"]["velocity_m_s"] == pytest.approx(0.0125)
     force = out["sensors"]["box_six_d_force"]
     assert force["timestamp"] == 31
     assert force["source"] == "filtered"
@@ -264,6 +267,26 @@ def test_decode_sensor_cache_falls_back_to_raw_six_d_when_filter_absent():
     assert out["sensors"]["box_six_d_force"]["timestamp"] == 30
     assert timestamps["box_six_d_force"] == 30
 
+
+
+def test_decode_changed_sensors_skips_unchanged_touch_payload(monkeypatch):
+    snap = _SensorCache(
+        data=_AllSensor(
+            six_d_force_data=_SixD(timestamp=30, data=(1, 2, 3, 4, 5, 6)),
+            six_d_force_data_filter=_SixD(timestamp=31, data=(10, 20, 30, 40, 50, 60)),
+            touch_sensor_data_first=_Touch(timestamp=40),
+            touch_sensor_data_sec=_Touch(timestamp=41),
+        ),
+    )
+
+    def fail_touch_decode(_touch):
+        raise AssertionError("unchanged touch payload should not be decoded")
+
+    monkeypatch.setattr(box_client, "_decode_touch", fail_touch_decode)
+    out = box_client._decode_changed_sensors(snap, {"box_six_d_force"})
+
+    assert set(out["sensors"]) == {"box_six_d_force"}
+    assert out["sensors"]["box_six_d_force"]["timestamp"] == 31
 
 
 def test_decode_sensor_cache_prefers_top_level_touch_array_over_legacy_fields():
@@ -666,6 +689,11 @@ def test_box_info_to_config_maps_identity_ip_and_sensor_mask():
     cfg2 = box_client.box_info_to_config(info2, template2, aliases={"SN-BBB": "box1"})
     assert cfg2.box_id == "box1"
     assert cfg2.expected_devices == ["box_gripper"]
+
+
+def test_box_config_record_poll_default_keeps_margin_for_480hz_force():
+    cfg = box_client.from_yaml_dict({"enabled": True})
+    assert cfg.record_poll_interval_s == 0.0005
 
 
 def test_sdk_discovery_with_injected_enumerate_maps_to_configs():

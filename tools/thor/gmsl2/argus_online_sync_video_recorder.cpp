@@ -71,7 +71,7 @@ struct Options {
     uint32_t iframe_interval = 60;
     uint32_t preset_level = 1;
     uint32_t control_rate = 1;
-    uint32_t startup_full_clusters = 30;
+    uint32_t startup_full_clusters = 60;
     uint32_t startup_timeout_ms = 15000;
     uint32_t frame_timeout_ms = 1000;
     uint64_t tolerance_ns = 1000000;
@@ -407,7 +407,7 @@ bool parse_args(int argc, char** argv, Options* options) {
                       << " --sids 6,7 --frames 600 --episode-dir DIR"
                       << " [--fps 60] [--codec h265] [--bitrate 40000000]"
                       << " [--iframe-interval 60] [--container mkv]"
-                      << " [--tolerance-ms 1.0] [--startup-full-clusters 30]"
+                      << " [--tolerance-ms 1.0] [--startup-full-clusters 60]"
                       << " [--frame-timeout-ms 1000]"
                       << " [--frame-bus-dir /dev/shm/lerobot_online_sync]"
                       << " [--frame-bus-every-n 1]"
@@ -755,14 +755,6 @@ public:
             std::cerr << "push_buffer missing Argus stream/buffer" << std::endl;
             return false;
         }
-        if (logical_index < 3) {
-            std::cerr << "encoder push begin logical=" << logical_index << std::endl;
-        }
-        if (logical_index < 3) {
-            std::cerr << "encoder using argus dmabuf logical=" << logical_index
-                      << " fd=" << dma_buffer->get_fd() << std::endl;
-        }
-
         int slot = find_free_output_slot();
         if (slot < 0 && !reclaim_output_slot(kDqRetries, &slot, false)) {
             return false;
@@ -786,22 +778,12 @@ public:
         v4l2_buf.timestamp.tv_sec = static_cast<time_t>(pts_us / 1000000ULL);
         v4l2_buf.timestamp.tv_usec = static_cast<suseconds_t>(pts_us % 1000000ULL);
 
-        if (logical_index < 3) {
-            std::cerr << "encoder queue logical=" << logical_index
-                      << " slot=" << slot
-                      << " fd=" << dma_buffer->get_fd() << std::endl;
-        }
-
         if (encoder_->output_plane.qBuffer(v4l2_buf, dma_buffer) < 0) {
             std::cerr << "Error while queueing encoder output buffer" << std::endl;
             return false;
         }
         output_argus_buffers_[slot] = argus_buffer;
         inflight_count_ += 1;
-        if (logical_index < 3) {
-            std::cerr << "encoder queued logical=" << logical_index
-                      << " slot=" << slot << std::endl;
-        }
         if (inflight_count_ >= kMaxInFlightBeforeReclaim) {
             int reclaimed_slot = -1;
             if (!reclaim_output_slot(kDqRetries, &reclaimed_slot, false)) {
@@ -1530,6 +1512,31 @@ bool publish_preview_frame_bus_cluster(
 using FrameQueue = std::deque<std::unique_ptr<FrameBundle>>;
 using FrameQueues = std::vector<FrameQueue>;
 
+
+void append_unmatched_drop_detail(
+    std::string* detail,
+    const CamCtx* cam,
+    uint64_t sof,
+    uint64_t local_min,
+    uint64_t local_max,
+    uint64_t tolerance_ns
+) {
+    if (!detail || detail->size() > 512) {
+        return;
+    }
+    if (!detail->empty()) {
+        *detail += "; ";
+    }
+    uint64_t delta_to_max = local_max >= sof ? local_max - sof : sof - local_max;
+    std::ostringstream oss;
+    oss << "drop " << (cam ? cam->name : "unknown")
+        << " sof=" << sof
+        << " range=[" << local_min << "," << local_max << "]"
+        << " delta_to_max_ns=" << delta_to_max
+        << " tolerance_ns=" << tolerance_ns;
+    *detail += oss.str();
+}
+
 bool acquire_cluster(
     const std::vector<std::unique_ptr<CamCtx>>& cameras,
     FrameQueues* queues,
@@ -1599,6 +1606,14 @@ bool acquire_cluster(
         bool dropped = false;
         for (size_t i = 0; i < queues->size(); ++i) {
             if (!(*queues)[i].empty() && (*queues)[i].front()->meta.sof_tsc_ns < threshold) {
+                append_unmatched_drop_detail(
+                    failure_detail,
+                    cameras[i].get(),
+                    (*queues)[i].front()->meta.sof_tsc_ns,
+                    local_min,
+                    local_max,
+                    options.tolerance_ns
+                );
                 release_bundle((*queues)[i].front().get());
                 (*queues)[i].pop_front();
                 if (dropped_unmatched) {
@@ -1608,6 +1623,14 @@ bool acquire_cluster(
             }
         }
         if (!dropped) {
+            append_unmatched_drop_detail(
+                failure_detail,
+                cameras[local_min_idx].get(),
+                (*queues)[local_min_idx].front()->meta.sof_tsc_ns,
+                local_min,
+                local_max,
+                options.tolerance_ns
+            );
             release_bundle((*queues)[local_min_idx].front().get());
             (*queues)[local_min_idx].pop_front();
             if (dropped_unmatched) {
@@ -1914,6 +1937,9 @@ RecordingResult record_episode(
             std::ostringstream oss;
             oss << "missing full SOF cluster inside recording window; unmatched_drops="
                 << unmatched_drops;
+            if (!cluster_failure.empty()) {
+                oss << ": " << cluster_failure;
+            }
             result.failure = oss.str();
             release_cluster(&cluster);
             break;

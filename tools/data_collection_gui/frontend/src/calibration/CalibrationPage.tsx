@@ -28,7 +28,9 @@ import { ForceSensorCard, TactileSensorCard } from "./SensorMonitors";
 import { ForceCalibrationCard, TactileCalibrationCard } from "./CalibrationCards";
 import { CalibrationLogPanel, toLogEntries } from "./CalibrationLogPanel";
 import { CalibrationHistory } from "./CalibrationHistory";
-import { MultiCameraCalibrationPanel } from "./MultiCameraCalibrationPanel";
+import { RigCheckPanel } from "./RigCheckPanel";
+import { CalibrationWizard } from "./CalibrationWizard";
+import { MarkerTcpPanel } from "./MarkerTcpPanel";
 
 const OPERATOR_KEY = "lerobot.calibration.operator";
 
@@ -166,11 +168,18 @@ export function CalibrationPage({
         </div>
       </section>
 
-      <MultiCameraCalibrationPanel
-        status={snapshot.calibration}
+      {/* Self-check sits above the calibration itself: the usual question is
+          "does anything need redoing?", and the answer is usually no. */}
+      <RigCheckPanel api={api} busy={busy} onRecalibrate={onRunMultiCameraCalibration} />
+
+      <CalibrationWizard
+        snapshot={snapshot}
+        api={api}
         busy={busy}
-        onRun={onRunMultiCameraCalibration}
+        onSolve={onRunMultiCameraCalibration}
       />
+
+      <MarkerTcpPanel snapshot={snapshot} api={api} busy={busy} />
 
       {/* --- per-BOX groups: readiness + monitors + calibration by device --- */}
       {boxGroups.map((group) => (

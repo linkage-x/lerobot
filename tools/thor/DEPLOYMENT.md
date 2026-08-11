@@ -745,7 +745,7 @@ BOX snapshot 时间 = t0_wall_s + t_relative_s
 
 ### 已实现：高频独立采样 + 逐传感器软同步（L3）
 
-录制时 `BoxClient` 以 500Hz (`record_poll_interval_s=0.002`) 轮询 SDK 的
+录制时 `BoxClient` 以 2kHz wait (`record_poll_interval_s=0.0005`) 轮询 SDK 的
 `get_sensor_cache()`，通过比较各传感器的 MCU 时间戳去重，每个传感器按 MCU
 原生推送频率独立记录。每个样本标注：
 

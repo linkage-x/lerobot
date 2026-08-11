@@ -331,9 +331,9 @@ def test_streaming_sensor_ids_filters_to_advancing_sensors():
     # sensor is genuinely pushing fresh data. The pre-record health check uses an
     # empty result to flag a box that answers discovery but isn't streaming.
     rates = {
-        "box_gripper": 199.0,
-        "box_imu": 198.0,
-        "box_touch_left": 50.0,
+        "box_gripper": 120.0,
+        "box_imu": 240.0,
+        "box_touch_left": 60.0,
         "box_six_d_force": 0.0,  # present but not advancing -> excluded
     }
     assert tr._streaming_sensor_ids(rates) == ["box_gripper", "box_imu", "box_touch_left"]
@@ -342,15 +342,20 @@ def test_streaming_sensor_ids_filters_to_advancing_sensors():
 
 
 def test_box_stream_health_flags_dead_and_degraded_boxes():
-    # Healthy: high-freq sensors near 199 Hz -> peak clears the floor.
+    # Healthy: v3.1 firmware nominal rates -> peak clears the floor.
     healthy, peak = tr._box_stream_health(
-        {"box_gripper": 199.0, "box_imu": 198.0, "box_touch_left": 50.0}
+        {
+            "box_gripper": 120.0,
+            "box_imu": 240.0,
+            "box_touch_left": 60.0,
+            "box_six_d_force": 480.0,
+        }
     )
     assert healthy is True
-    assert peak == 199.0
+    assert peak == 480.0
     # Fully stalled box (discovery OK, no data): all-zero -> unhealthy.
     assert tr._box_stream_health({"box_gripper": 0.0, "box_imu": 0.0}) == (False, 0.0)
-    # Degraded / ageing-out box (~8 Hz instead of ~199): peak below the floor ->
+    # Degraded / ageing-out box (~8 Hz instead of nominal rates): peak below the floor ->
     # flagged. This is the 073552 failure mode that a bare >0 check wrongly passes.
     healthy, peak = tr._box_stream_health(
         {"box_gripper": 8.5, "box_imu": 8.5, "box_touch_left": 2.5}
