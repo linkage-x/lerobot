@@ -237,7 +237,8 @@ export function ReplayInspector({
   onApproveMujoco,
   replayStatus,
   busy,
-  mujocoRefreshKey = ""
+  mujocoRefreshKey = "",
+  cubeSelection = true
 }: {
   api: DataCollectionGuiApi;
   datasetPath: string;
@@ -254,6 +255,10 @@ export function ReplayInspector({
   replayStatus: ReplayStatus;
   busy: boolean;
   mujocoRefreshKey?: string;
+  // Whether this rig tracks AprilTag cubes. The workstation does not: it replays the arm's own
+  // recorded EE command stream, the gateway ignores the cube mode for it, and the saved-report
+  // approval those controls drive reads a `mujoco_preview.<cube>` file it never writes.
+  cubeSelection?: boolean;
 }) {
   const [timeline, setTimeline] = useState<ReplayTimeline | null>(null);
   const [loading, setLoading] = useState(false);
@@ -323,7 +328,7 @@ export function ReplayInspector({
 
   const fps = timeline?.fps ?? fallbackFps;
   const mujocoRunning = replayStatus.state === "sim_replay";
-  const replayActive = mujocoRunning || replayStatus.state === "dry_run" || replayStatus.state === "replaying";
+  const replayActive = mujocoRunning || replayStatus.state === "replaying";
   const canRunMujoco =
     replayStatus.dataStatus === "loaded" &&
     (replayStatus.recordedFrames ?? replayStatus.totalFrames) > 0;
@@ -501,6 +506,13 @@ export function ReplayInspector({
   const forceVector = ensureForceVector(frame?.forceVector);
   const touchMax = useMemo(() => touchScaleMax(timeline), [timeline]);
   const touchSummary = useMemo(() => touchPanelSummary(frame), [frame]);
+  // Decided from the episode, not from the current frame: a rig without Paxini pads (the FR3
+  // workstation runs a Pika gripper) otherwise gets a panel named after a sensor it does not
+  // have, showing two fabricated empty pads for the whole recording.
+  const hasTouchData = useMemo(
+    () => (timeline?.frames ?? []).some((entry) => Object.values(entry.touch ?? {}).some(Boolean)),
+    [timeline]
+  );
   const cubePoseNames = useMemo(() => {
     if (!timeline) {
       return [] as string[];
@@ -677,22 +689,24 @@ export function ReplayInspector({
           </div>
         ))}
       </div>
-      <section className="panel touch-panel">
-        <div className="panel-heading">
-          <h2>Paxini touch</h2>
-          <span>{touchSummary}</span>
-        </div>
-        <div className="touch-heatmaps">
-          {touchEntries(frame).map(([key, sample]) => (
-            <TouchHeatmap key={key} title={key} sample={sample} scale={touchMax} />
-          ))}
-        </div>
-        <div className="touch-legend" aria-hidden="true">
-          <span>0</span>
-          <div />
-          <span>{touchMax.normalMax.toFixed(1)}</span>
-        </div>
-      </section>
+      {hasTouchData ? (
+        <section className="panel touch-panel">
+          <div className="panel-heading">
+            <h2>Paxini touch</h2>
+            <span>{touchSummary}</span>
+          </div>
+          <div className="touch-heatmaps">
+            {touchEntries(frame).map(([key, sample]) => (
+              <TouchHeatmap key={key} title={key} sample={sample} scale={touchMax} />
+            ))}
+          </div>
+          <div className="touch-legend" aria-hidden="true">
+            <span>0</span>
+            <div />
+            <span>{touchMax.normalMax.toFixed(1)}</span>
+          </div>
+        </section>
+      ) : null}
       <section className="panel pose-panel">
         <div className="panel-heading">
           <h2>End-effector pose</h2>
@@ -752,44 +766,55 @@ export function ReplayInspector({
           <span>selected dataset · episode {episode} · native MuJoCo render</span>
         </div>
         <div className="mujoco-local-controls">
-          <div className="mujoco-mode-picker" role="group" aria-label="MuJoCo cube trajectory">
-            {(["left", "right", "both"] as MujocoCubeMode[]).map((mode) => (
-              <button
-                key={mode}
-                className={mujocoMode === mode ? "active" : ""}
-                disabled={busy || replayActive}
-                onClick={() => onMujocoModeChange(mode)}
-                type="button"
-              >
-                {mode === "both" ? "Both cubes" : `${mode[0].toUpperCase()}${mode.slice(1)} cube`}
-              </button>
-            ))}
-          </div>
+          {cubeSelection ? (
+            <div className="mujoco-mode-picker" role="group" aria-label="MuJoCo cube trajectory">
+              {(["left", "right", "both"] as MujocoCubeMode[]).map((mode) => (
+                <button
+                  key={mode}
+                  className={mujocoMode === mode ? "active" : ""}
+                  disabled={busy || replayActive}
+                  onClick={() => onMujocoModeChange(mode)}
+                  type="button"
+                >
+                  {mode === "both" ? "Both cubes" : `${mode[0].toUpperCase()}${mode.slice(1)} cube`}
+                </button>
+              ))}
+            </div>
+          ) : null}
           <button
             className="mujoco-run-button"
             disabled={busy || replayActive || !canRunMujoco}
             onClick={() => onRunMujoco(mujocoMode)}
             type="button"
           >
-            {mujocoRunning ? "Rendering MuJoCo…" : `Run MuJoCo · ${mujocoMode}`}
+            {mujocoRunning ? "Rendering MuJoCo…" : cubeSelection ? `Run MuJoCo · ${mujocoMode}` : "Run MuJoCo"}
           </button>
-          <button
-            className="mujoco-pass-button"
-            disabled={busy || replayActive || !mujocoPreview}
-            onClick={() => onApproveMujoco(mujocoMode)}
-            type="button"
-          >
-            {replayStatus.mujocoValidation?.status === "passed" &&
-            replayStatus.mujocoValidation?.isCurrentForSelection &&
-            replayStatus.mujocoValidation?.cubeMode === mujocoMode
-              ? "MuJoCo passed"
-              : "Pass MuJoCo check"}
-          </button>
+          {/* Approving a *saved* report is a cube-rig affordance: it re-reads
+              `mujoco_preview.<cube>.episode_N.json` beside the cube CSVs it was scored against.
+              A workstation run has no such file -- it reports its verdict on the
+              `mujoco_replay_result=` line and the gateway settles pass/fail when the process
+              exits -- so the button could only ever error here. */}
+          {cubeSelection ? (
+            <button
+              className="mujoco-pass-button"
+              disabled={busy || replayActive || !mujocoPreview}
+              onClick={() => onApproveMujoco(mujocoMode)}
+              type="button"
+            >
+              {replayStatus.mujocoValidation?.status === "passed" &&
+              replayStatus.mujocoValidation?.isCurrentForSelection &&
+              replayStatus.mujocoValidation?.cubeMode === mujocoMode
+                ? "MuJoCo passed"
+                : "Pass MuJoCo check"}
+            </button>
+          ) : null}
         </div>
         <p className="panel-note">
-          {mujocoMode === "both"
-            ? "Two identical FR3 models are shown in parallel with 0.90 m between bases; both trajectories remain in their own robot-base coordinates."
-            : `One FR3 follows state_action.${mujocoMode}.csv from the selected dataset and episode.`}
+          {!cubeSelection
+            ? "The FR3 follows the absolute-EE action stream recorded in this episode; the verdict lands automatically when the run finishes."
+            : mujocoMode === "both"
+              ? "Two identical FR3 models are shown in parallel with 0.90 m between bases; both trajectories remain in their own robot-base coordinates."
+              : `One FR3 follows state_action.${mujocoMode}.csv from the selected dataset and episode.`}
         </p>
         <ReplayTransport
           playing={playing}
@@ -816,7 +841,9 @@ export function ReplayInspector({
           <div className="mujoco-empty">
             {nativeVideoFailed
               ? "The native MuJoCo FR3 video could not be loaded. Run MuJoCo again to regenerate it."
-              : "Choose a cube mode and run MuJoCo here to render the true FR3 model for this dataset and episode."}
+              : cubeSelection
+                ? "Choose a cube mode and run MuJoCo here to render the true FR3 model for this dataset and episode."
+                : "Run MuJoCo here to render the true FR3 model for this dataset and episode."}
           </div>
         )}
       </section>

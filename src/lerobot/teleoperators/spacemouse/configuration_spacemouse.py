@@ -69,8 +69,6 @@ class SpaceMouseTeleopConfig(TeleoperatorConfig):
     threshold_wx: float = 0.04
     threshold_wy: float = 0.04
     threshold_wz: float = 0.04
-    motion_enable_enter_scale: float = 1.5
-    motion_enable_exit_scale: float = 1.5
     bias_sample_count: int = 30
     bias_sample_sleep_s: float = 0.005
     enable_rotation: bool = True

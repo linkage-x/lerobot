@@ -93,6 +93,9 @@ WS   /api/handheld/events
 - 选择 dataset `repo_id/root`、episode、robot config、FPS。
 - 预检查：机器人连接、急停/使能、action feature 与 robot action processor contract、episode 长度、workspace/速度限制。
 - Replay 控制：arm/enable、dry-run、start、pause、resume、abort。
+  - **dry-run 仍未实现（2026-07-31）**：`/api/replay/start` 曾存在，但只改 `state.replay.state`
+    并打一条 message，不启动任何进程；两个 replay runtime 也都没有 dry-run 开关。按钮和端点已经
+    移除，宁可让这条需求显式未满足，也不要留一个按下去像在执行、实际什么都没做的控件。
 - 展示 replay 进度、发送帧率、最近 action、机器人 observation、tracking error。
 - 强制安全约束：网页只发高层命令，低层限速、限位、急停、断连保护必须在 Python runtime/robot backend 内实现。
 

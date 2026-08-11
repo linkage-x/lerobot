@@ -366,6 +366,22 @@ def test_build_host_env_adds_mvs_cmeel_and_gencon_paths(tmp_path: Path, monkeypa
     assert env["GEN_CON_SDK_HOME"] == str(gen_con_root.resolve())
 
 
+def _default_timestamped_dataset_root(timestamp: str) -> str:
+    """Dataset root the recorder derives from the shipped config, for the frozen clock.
+
+    Read from the config rather than hardcoded: these assertions exist to pin the *derivation*
+    (config root + timestamp suffix), and a literal name here silently turns into a failing test
+    the next time the config's dataset is renamed.
+    """
+    config = yaml.safe_load(
+        (Path(__file__).resolve().parents[2] / "tools/fr3/fr3_record_config.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    dataset_name = Path(str(config["dataset"]["root"])).name
+    return f"/workspace/outputs/datasets/{dataset_name}_{timestamp}"
+
+
 def test_main_dry_run_prints_command(capsys):
     original_getuid = fr3_record.os.getuid
     original_getgid = fr3_record.os.getgid
@@ -393,8 +409,9 @@ def test_main_dry_run_prints_command(capsys):
     assert "docker compose" in captured.out
     assert "lerobot-user" in captured.out
     assert "--config_path=/workspace/tools/fr3/fr3_record_config.yaml" in captured.out
-    assert "--dataset.root=/workspace/outputs/datasets/fr3_pick_place_ee2ee_v1_20260313_150102" in captured.out
-    assert "chown -R 1000:1001 /workspace/outputs/datasets/fr3_pick_place_ee2ee_v1_20260313_150102" in captured.out
+    expected_root = _default_timestamped_dataset_root("20260313_150102")
+    assert f"--dataset.root={expected_root}" in captured.out
+    assert f"chown -R 1000:1001 {expected_root}" in captured.out
 
 
 def test_main_returns_subprocess_exit_code(monkeypatch):
@@ -441,8 +458,9 @@ def test_main_runs_ownership_fix_after_success(monkeypatch):
 
     assert exit_code == 0
     assert len(calls) == 2
-    assert "--dataset.root=/workspace/outputs/datasets/fr3_pick_place_ee2ee_v1_20260313_150102" in " ".join(calls[0])
-    assert "chown -R 1000:1001 /workspace/outputs/datasets/fr3_pick_place_ee2ee_v1_20260313_150102" in " ".join(calls[1])
+    expected_root = _default_timestamped_dataset_root("20260313_150102")
+    assert f"--dataset.root={expected_root}" in " ".join(calls[0])
+    assert f"chown -R 1000:1001 {expected_root}" in " ".join(calls[1])
 
 
 def test_main_skips_ownership_fix_when_dataset_root_is_unknown_on_resume(monkeypatch):

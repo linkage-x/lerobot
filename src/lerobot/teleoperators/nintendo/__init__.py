@@ -15,6 +15,12 @@
 # limitations under the License.
 
 from .configuration_nintendo import NintendoController, NintendoGripperMode, NintendoTeleopConfig
-from .teleop_nintendo import NintendoTeleop
 
 __all__ = ["NintendoController", "NintendoGripperMode", "NintendoTeleop", "NintendoTeleopConfig"]
+
+def __getattr__(name: str):
+    if name == "NintendoTeleop":
+        from .teleop_nintendo import NintendoTeleop
+
+        return NintendoTeleop
+    raise AttributeError(name)

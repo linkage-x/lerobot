@@ -1,31 +1,32 @@
 robot:
   type: franka_research3
   robot_ip: 192.168.1.206
-  gripper_port: /dev/ttyUSB0
+  gripper_port: /dev/serial/by-path/pci-0000:00:14.0-usb-0:9.1.4:1.0-port0
   allow_mock_gripper: false
-  urdf_path: /lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_ati.urdf
-  target_frame_name: pika_gripper_ee
+  urdf_path: /lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf
+  target_frame_name: pika_task_tcp
   max_target_delta_pos: [0.001, 0.001, 0.001]
   max_target_delta_rot: [0.01, 0.01, 0.01]
+  camera_max_age_ms: 100
+  # See config_franka_research3.py: 20 rather than 15 is set by the sim twin's EGL renderer
+  # (measured straggling 19 ms), and kept identical here so one envelope covers both rigs.
+  camera_max_skew_ms: 20
   cameras:
+    # Sensor rate, deliberately above dataset.fps: an image is only as fresh as the sensor's
+    # frame period allows, so 60 Hz halves how stale a recorded frame is (measured 42-45 ms
+    # behind the arm read at 30 Hz). The dataset is still written at dataset.fps.
     ee:
       type: intelrealsense
       serial_number_or_name: "315122271876"
       width: 640
       height: 480
-      fps: 30
+      fps: 60
     side:
       type: intelrealsense
       serial_number_or_name: "243122071795"
       width: 640
       height: 480
-      fps: 30
-    front:
-      type: intelrealsense
-      serial_number_or_name: "244222075350"
-      width: 640
-      height: 480
-      fps: 30
+      fps: 60
 
 teleop:
   type: spacemouse
@@ -40,9 +41,18 @@ teleop:
   scale_wy: 0.0
 
 dataset:
-  repo_id: hph/fr3_pick_place_ee2ee_v1
+  # Names the rig and how it is driven, nothing else. The task belongs to the episode
+  # (`single_task` below, and the Task Library overlays both name and task per task), and the
+  # action contract is not a property of a recording at all: capture always stores absolute EE
+  # and delta views are derived later, so an `ee2ee` in the name labelled these files as
+  # something they never were.
+  #
+  # This is the name of a *series*, not of one dataset. The recorder appends `_<YYYYmmdd_HHMMSS>`
+  # so each session lands in its own root -- change a camera rate, a gripper or the lighting and
+  # the takes stay separable, which nothing in the schema would otherwise let you do.
+  repo_id: hph/fr3_spacemouse
   single_task: Pick and place
-  root: /lerobot/outputs/datasets/fr3_pick_place_ee2ee_v1
+  root: /lerobot/outputs/datasets/fr3_spacemouse
   fps: 30
   num_episodes: 20
   episode_time_s: 10

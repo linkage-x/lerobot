@@ -40,7 +40,9 @@ from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline, RobotObservation
 from lerobot.robots.franka_research3 import FrankaResearch3Config
+from lerobot.processor.core import TransitionKey
 from lerobot.robots.franka_research3.processor_franka_research3 import (
+    DeltaEEToAbsoluteEEAction,
     EE_POSITION_KEYS,
     EE_QUAT_KEYS,
     KeepAbsoluteEEObservation,
@@ -48,6 +50,7 @@ from lerobot.robots.franka_research3.processor_franka_research3 import (
     PREV_CMD_POSITION_KEYS,
     PREV_CMD_QUAT_KEYS,
     _continuous_quaternion,
+    delta_reference_from_action_names,
 )
 from lerobot.utils.control_utils import predict_action
 from lerobot.utils.rotation import Rotation
@@ -2083,18 +2086,73 @@ def convert_base_command_from_I_to_E(base_robot_command_i: dict[str, float]) -> 
     return dict(base_robot_command_i)
 
 
+def build_delta_action_reconstructor(action_names: list[str]) -> DeltaEEToAbsoluteEEAction | None:
+    """One stateful reconstructor for a delta-action checkpoint, or None for absolute EE.
+
+    Returns the *same* processor step the recorder used to turn its delta back into a robot
+    command, so deployment cannot drift from training. Built once at startup rather than per
+    step: the step keeps quaternion-sign continuity across frames.
+
+    The workspace clamp is deliberately not passed here. Reconstruction happens in the dataset
+    frame, while ``robot_cfg.workspace_min/max`` bound the robot base frame; clamping in the wrong
+    frame would silently distort the command. The existing base-frame guards
+    (``clamp_command_relative_to_current`` and the robot driver's own clip) still apply.
+    """
+    reference = delta_reference_from_action_names(action_names)
+    if reference is None:
+        return None
+    print(f'[INFO] action_contract=delta reference={reference}')
+    return DeltaEEToAbsoluteEEAction(reference=reference)
+
+
 def decode_action_to_robot_command(
     action_tensor: torch.Tensor,
     *,
     action_names: list[str],
     robot_cfg: FrankaResearch3Config,
     gripper_close_below: float | None = None,
+    delta_reconstructor: DeltaEEToAbsoluteEEAction | None = None,
+    dataset_observation_i: RobotObservation | None = None,
 ) -> dict[str, float]:
     action_np = np.asarray(action_tensor.squeeze(0).detach().cpu().numpy(), dtype=np.float64)
     if action_np.shape != (len(action_names),):
         raise ValueError(f'Expected policy action shape {(len(action_names),)}, got {action_np.shape}')
 
     action_map = {name: float(action_np[i]) for i, name in enumerate(action_names)}
+
+    if delta_reconstructor is not None:
+        # Delta contract: the policy emits an increment against a reference pose that lives in
+        # the dataset frame, so it must be rebuilt here, before the dataset -> base -> E
+        # conversions downstream.
+        if dataset_observation_i is None:
+            raise ValueError(
+                'A delta-action checkpoint needs the dataset-frame observation to rebuild an '
+                'absolute target; dataset_observation_i was not provided.'
+            )
+        rebuilt = delta_reconstructor(
+            {
+                TransitionKey.ACTION: dict(action_map),
+                TransitionKey.OBSERVATION: dict(dataset_observation_i),
+            }
+        )[TransitionKey.ACTION]
+        rebuilt_rotvec = Rotation.from_quat(
+            np.asarray([rebuilt['ee.qx'], rebuilt['ee.qy'], rebuilt['ee.qz'], rebuilt['ee.qw']], dtype=np.float64)
+        ).as_rotvec()
+        raw_delta_gripper = _action_value(action_map, 'gripper', 'gripper.pos')
+        if gripper_close_below is not None and raw_delta_gripper < float(gripper_close_below):
+            delta_gripper_normalized = 0.0
+        else:
+            delta_gripper_normalized = normalize_dataset_gripper(raw_delta_gripper, robot_cfg)
+        return {
+            'ee.x': float(rebuilt['ee.x']),
+            'ee.y': float(rebuilt['ee.y']),
+            'ee.z': float(rebuilt['ee.z']),
+            'ee.wx': float(rebuilt_rotvec[0]),
+            'ee.wy': float(rebuilt_rotvec[1]),
+            'ee.wz': float(rebuilt_rotvec[2]),
+            'gripper.pos': delta_gripper_normalized,
+        }
+
     quaternion_xyzw = np.asarray(
         [
             _action_value(action_map, 'qx', 'ee.qx'),
@@ -2272,16 +2330,54 @@ def build_chunk_ee_poses_for_visualization(
     action_names: list[str],
     robot_cfg: FrankaResearch3Config,
     T_B_Ws: np.ndarray,
+    delta_reference: str | None = None,
+    dataset_observation_i: RobotObservation | None = None,
 ) -> list[np.ndarray] | None:
+    """Absolute EE poses for a whole predicted action chunk, for the MuJoCo preview only.
+
+    A delta chunk cannot be decoded frame-independently: each future action's reference is the
+    pose the previous one commanded, so the chunk is *integrated* forward from the current
+    observation. For ``delta_ee_from_current`` that is an approximation -- the future measured
+    poses do not exist yet -- which is acceptable here because this feeds a preview overlay and
+    never a robot command.
+    """
     if not action_tensors:
         return None
+    if delta_reference is not None and dataset_observation_i is None:
+        return None
+    # A fresh reconstructor per call: the chunk is a hypothetical future, and its quaternion-sign
+    # history must not leak into the live control path's reconstructor.
+    chunk_reconstructor = (
+        DeltaEEToAbsoluteEEAction(reference=delta_reference) if delta_reference is not None else None
+    )
+    rolling_observation = dict(dataset_observation_i) if dataset_observation_i is not None else None
     chunk_ee_poses: list[np.ndarray] = []
     for action_tensor in action_tensors:
         dataset_robot_command_i = decode_action_to_robot_command(
             action_tensor,
             action_names=action_names,
             robot_cfg=robot_cfg,
+            delta_reconstructor=chunk_reconstructor,
+            dataset_observation_i=rolling_observation,
         )
+        if chunk_reconstructor is not None and rolling_observation is not None:
+            # Feed the rebuilt target forward as the next frame's reference.
+            rolling_quaternion = Rotation.from_rotvec(
+                [
+                    dataset_robot_command_i['ee.wx'],
+                    dataset_robot_command_i['ee.wy'],
+                    dataset_robot_command_i['ee.wz'],
+                ]
+            ).as_quat()
+            for keys, values in (
+                (PREV_CMD_POSITION_KEYS, ('ee.x', 'ee.y', 'ee.z')),
+                (EE_POSITION_KEYS, ('ee.x', 'ee.y', 'ee.z')),
+            ):
+                for key, source in zip(keys, values, strict=True):
+                    rolling_observation[key] = float(dataset_robot_command_i[source])
+            for keys in (PREV_CMD_QUAT_KEYS, EE_QUAT_KEYS):
+                for key, value in zip(keys, rolling_quaternion, strict=True):
+                    rolling_observation[key] = float(value)
         base_robot_command_i = convert_dataset_command_to_base_frame(dataset_robot_command_i, T_B_Ws)
         robot_command_e = convert_base_command_from_I_to_E(base_robot_command_i)
         chunk_ee_poses.append(_pose_from_rotvec_command(robot_command_e))
@@ -2846,6 +2942,12 @@ def run_inference(args: argparse.Namespace) -> int:
         else []
     )
     action_names = extract_feature_names(ds_meta.features['action'], _DEFAULT_ACTION_NAMES)
+    # Which action contract this checkpoint was trained on is read off the dataset's own action
+    # feature names, so a delta checkpoint can never be silently driven as an absolute one.
+    # Resolved here, before the arm is touched, and the reconstructor is stateful so it must be
+    # a single instance for the whole run.
+    delta_reference = delta_reference_from_action_names(action_names)
+    delta_reconstructor = build_delta_action_reconstructor(action_names)
     robot_init_state = parse_robot_init_state(args.robot_init_state)
     mujoco_model_path = resolve_mujoco_model_path(args.gripper_backend, args.mujoco_model)
     robot_urdf_path, target_frame_name = resolve_robot_tool_model(
@@ -3250,12 +3352,16 @@ def run_inference(args: argparse.Namespace) -> int:
                         action_names=action_names,
                         robot_cfg=robot_cfg,
                         T_B_Ws=T_B_Ws,
+                        delta_reference=delta_reference,
+                        dataset_observation_i=dataset_state_observation_i,
                     )
             dataset_robot_command_i = decode_action_to_robot_command(
                 action_tensor,
                 action_names=action_names,
                 robot_cfg=robot_cfg,
                 gripper_close_below=args.gripper_close_below,
+                delta_reconstructor=delta_reconstructor,
+                dataset_observation_i=dataset_state_observation_i,
             )
             base_robot_command_i = convert_dataset_command_to_base_frame(dataset_robot_command_i, T_B_Ws)
             robot_command = convert_base_command_from_I_to_E(base_robot_command_i)

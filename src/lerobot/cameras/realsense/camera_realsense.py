@@ -18,6 +18,7 @@ Provides the RealSenseCamera class for capturing frames from Intel RealSense cam
 
 import logging
 import time
+from collections import deque
 from threading import Event, Lock, Thread
 from typing import Any
 
@@ -136,7 +137,11 @@ class RealSenseCamera(Camera):
         self.latest_color_frame: NDArray[Any] | None = None
         self.latest_depth_frame: NDArray[Any] | None = None
         self.latest_timestamp: float | None = None
+        self.frame_history: deque[tuple[float, NDArray[Any]]] = deque(maxlen=8)
         self.new_frame_event: Event = Event()
+        # Latched once per session so a camera whose timestamps cannot be placed on the host
+        # clock says so once instead of on every frame.
+        self._device_clock_unusable_logged: bool = False
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
 
@@ -456,6 +461,62 @@ class RealSenseCamera(Camera):
 
         return processed_image
 
+    # A frame older than this cannot be a real acquisition delay; it means the two clocks were
+    # not comparable after all (a wall-clock step, or a timestamp domain that is not what it
+    # claimed). Fall back rather than write a fabricated instant.
+    _MAX_PLAUSIBLE_FRAME_AGE_S = 1.0
+
+    def _frame_capture_time_s(
+        self, color_frame: Any, *, handover_perf_s: float, handover_wall_s: float
+    ) -> float:
+        """The instant the frame was *acquired*, on the `perf_counter` basis.
+
+        Stamping `perf_counter()` at handover instead measures when this process got around to
+        the frame, which folds in the driver's pipeline delay -- and that delay differs per
+        model. Measured on the FR3 rig: a D405 hands frames over 4.8 ms after acquisition, a
+        D435i 29.1 ms, so two cameras recording the same instant were stamped 24 ms apart. That
+        offset is invisible in the data and would be learned as if it were real.
+
+        RealSense reports the acquisition instant on the device clock. With global time enabled
+        the driver maps that onto the host wall clock, which makes it comparable to `time.time()`
+        -- so the frame's age is `wall_now - frame_timestamp`, and subtracting it from the
+        `perf_counter` read taken at the same moment moves it onto the monotonic basis the
+        robot's other timestamps use. Both clocks are read at handover, so the subtraction spans
+        microseconds and cannot drift.
+
+        A device clock that is *not* on the host timeline (`HARDWARE_CLOCK`, i.e. global time
+        off or unsupported) has an arbitrary epoch. Differencing it against a host clock would
+        silently splice two unrelated time bases, so this returns the handover instant and says
+        so, once, instead.
+        """
+        domain = color_frame.get_frame_timestamp_domain()
+        if domain not in (rs.timestamp_domain.global_time, rs.timestamp_domain.system_time):
+            if not self._device_clock_unusable_logged:
+                self._device_clock_unusable_logged = True
+                logger.warning(
+                    "%s: frame timestamp domain is %s, which has no fixed relation to the host "
+                    "clock, so capture timestamps fall back to the handover instant and carry "
+                    "this camera's pipeline delay (a D435i measured 29 ms). Enable global time "
+                    "on the sensor to timestamp acquisition instead.",
+                    self,
+                    domain,
+                )
+            return handover_perf_s
+
+        frame_age_s = handover_wall_s - (color_frame.get_timestamp() / 1000.0)
+        if not (0.0 <= frame_age_s <= self._MAX_PLAUSIBLE_FRAME_AGE_S):
+            if not self._device_clock_unusable_logged:
+                self._device_clock_unusable_logged = True
+                logger.warning(
+                    "%s: frame timestamp implies an age of %.1f ms, which is not a plausible "
+                    "acquisition delay; the host wall clock likely stepped. Falling back to the "
+                    "handover instant for this frame.",
+                    self,
+                    frame_age_s * 1e3,
+                )
+            return handover_perf_s
+        return handover_perf_s - frame_age_s
+
     def _read_loop(self) -> None:
         """
         Internal loop run by the background thread for asynchronous reading.
@@ -475,6 +536,10 @@ class RealSenseCamera(Camera):
             try:
                 frame = self._read_from_hardware()
                 color_frame_raw = frame.get_color_frame()
+                # Read the clocks at handover, before any conversion work, so the frame's age
+                # can be subtracted from an instant that is still close to the handover.
+                handover_perf_s = time.perf_counter()
+                handover_wall_s = time.time()
                 color_frame = np.asanyarray(color_frame_raw.get_data())
                 processed_color_frame = self._postprocess_image(color_frame)
 
@@ -483,13 +548,18 @@ class RealSenseCamera(Camera):
                     depth_frame = np.asanyarray(depth_frame_raw.get_data())
                     processed_depth_frame = self._postprocess_image(depth_frame, depth_frame=True)
 
-                capture_time = time.perf_counter()
+                capture_time = self._frame_capture_time_s(
+                    color_frame_raw,
+                    handover_perf_s=handover_perf_s,
+                    handover_wall_s=handover_wall_s,
+                )
 
                 with self.frame_lock:
                     self.latest_color_frame = processed_color_frame
                     if self.use_depth:
                         self.latest_depth_frame = processed_depth_frame
                     self.latest_timestamp = capture_time
+                    self.frame_history.append((capture_time, processed_color_frame))
                 self.new_frame_event.set()
                 failure_count = 0
 
@@ -526,6 +596,7 @@ class RealSenseCamera(Camera):
             self.latest_color_frame = None
             self.latest_depth_frame = None
             self.latest_timestamp = None
+            self.frame_history.clear()
             self.new_frame_event.clear()
 
     # NOTE(Steven): Missing implementation for depth for now
@@ -571,6 +642,43 @@ class RealSenseCamera(Camera):
 
         return frame
 
+    @check_if_not_connected
+    def read_latest_with_timestamp(self, max_age_ms: int = 500) -> tuple[NDArray[Any], float]:
+        """Return the latest frame and its host monotonic capture timestamp."""
+        if self.thread is None or not self.thread.is_alive():
+            raise RuntimeError(f"{self} read thread is not running.")
+
+        with self.frame_lock:
+            frame = self.latest_color_frame
+            timestamp = self.latest_timestamp
+
+        if frame is None or timestamp is None:
+            raise RuntimeError(f"{self} has not captured any frames yet.")
+
+        age_ms = (time.perf_counter() - timestamp) * 1e3
+        if age_ms > max_age_ms:
+            raise TimeoutError(
+                f"{self} latest frame is too old: {age_ms:.1f} ms (max allowed: {max_age_ms} ms)."
+            )
+        return frame, timestamp
+
+    @check_if_not_connected
+    def read_closest(self, timestamp_s: float, max_age_ms: int = 500) -> tuple[NDArray[Any], float]:
+        """Return the buffered frame closest to a host monotonic timestamp."""
+        if self.thread is None or not self.thread.is_alive():
+            raise RuntimeError(f"{self} read thread is not running.")
+        with self.frame_lock:
+            history = tuple(self.frame_history)
+        if not history:
+            raise RuntimeError(f"{self} has not captured any frames yet.")
+        selected_timestamp, selected_frame = min(history, key=lambda sample: abs(sample[0] - timestamp_s))
+        age_ms = (time.perf_counter() - selected_timestamp) * 1e3
+        if age_ms > max_age_ms:
+            raise TimeoutError(
+                f"{self} closest frame is too old: {age_ms:.1f} ms (max allowed: {max_age_ms} ms)."
+            )
+        return selected_frame, selected_timestamp
+
     # NOTE(Steven): Missing implementation for depth for now
     @check_if_not_connected
     def read_latest(self, max_age_ms: int = 500) -> NDArray[Any]:
@@ -589,22 +697,7 @@ class RealSenseCamera(Camera):
             RuntimeError: If the camera is connected but has not captured any frames yet.
         """
 
-        if self.thread is None or not self.thread.is_alive():
-            raise RuntimeError(f"{self} read thread is not running.")
-
-        with self.frame_lock:
-            frame = self.latest_color_frame
-            timestamp = self.latest_timestamp
-
-        if frame is None or timestamp is None:
-            raise RuntimeError(f"{self} has not captured any frames yet.")
-
-        age_ms = (time.perf_counter() - timestamp) * 1e3
-        if age_ms > max_age_ms:
-            raise TimeoutError(
-                f"{self} latest frame is too old: {age_ms:.1f} ms (max allowed: {max_age_ms} ms)."
-            )
-
+        frame, _timestamp = self.read_latest_with_timestamp(max_age_ms=max_age_ms)
         return frame
 
     def disconnect(self) -> None:
@@ -634,6 +727,7 @@ class RealSenseCamera(Camera):
             self.latest_color_frame = None
             self.latest_depth_frame = None
             self.latest_timestamp = None
+            self.frame_history.clear()
             self.new_frame_event.clear()
 
         logger.info(f"{self} disconnected.")

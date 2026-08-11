@@ -297,8 +297,8 @@ def test_run_sim_teleop_loop_skips_step_camera_obs_when_camera_stream_enabled(mo
             return self.value
 
     def fake_start_camera_stream_outputs(**kwargs):
-        del kwargs
-        return FakeCameraServer(), FakeLatestFrame(), None
+        camera_names = kwargs["camera_names"]
+        return FakeCameraServer(), {name: FakeLatestFrame() for name in camera_names}
 
     monkeypatch.setattr(
         "lerobot.envs.fr3_mujoco_teleop._start_camera_stream_outputs",

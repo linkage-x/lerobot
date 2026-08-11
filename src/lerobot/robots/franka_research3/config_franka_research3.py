@@ -48,6 +48,9 @@ class FrankaResearch3Config(RobotConfig):
     ik_solver: str = "hirol_lm"
     ik_tolerance: float = 1e-6
     ik_max_iterations: int = 200
+    # Optional absolute-pose IK orientation weight. None preserves the hardware/teleop default;
+    # replay can set this explicitly to match the MuJoCo validation objective.
+    ik_orientation_weight: float | None = None
     gripper_max_width_mm: float = 90.0
     gripper_command_rate_limit_hz: float | None = 15.0
     gripper_command_deadband_mm: float = 0.5
@@ -77,6 +80,13 @@ class FrankaResearch3Config(RobotConfig):
     damping: list[float] | None = None
     stiffness: list[float] | None = None
     filter_coeff: float | None = None
+    camera_max_age_ms: float = 100.0
+    # Frames whose cameras disagree by more than this are refused outright -- and it aborts the
+    # whole episode, not the frame. 20 ms rather than 15 is set by the *sim* twin, not by this
+    # rig: see FrankaResearch3MujocoConfig. Anchoring every camera on the oldest of their latest
+    # frames holds cross-camera skew to a measured 7.8 ms p95 at 60 Hz, so hardware has slack
+    # here; the number is kept identical to the sim guard so one envelope covers both.
+    camera_max_skew_ms: float = 20.0
     use_otg: bool = True
     otg_control_frequency: float = 800.0
     otg_async_control_frequency: float = 1000.0
@@ -104,6 +114,8 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("ik_tolerance must be positive.")
         if self.ik_max_iterations <= 0:
             raise ValueError("ik_max_iterations must be positive.")
+        if self.ik_orientation_weight is not None and self.ik_orientation_weight < 0:
+            raise ValueError("ik_orientation_weight must be non-negative when provided.")
         if any(mn >= mx for mn, mx in zip(self.workspace_min, self.workspace_max, strict=True)):
             raise ValueError("workspace_min must be strictly smaller than workspace_max.")
         if self.gripper_max_width_mm <= 0:
@@ -120,6 +132,10 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("corenetic_stale_threshold_s must be positive.")
         if self.corenetic_connect_timeout_s <= 0:
             raise ValueError("corenetic_connect_timeout_s must be positive.")
+        if self.camera_max_age_ms <= 0:
+            raise ValueError("camera_max_age_ms must be positive.")
+        if self.camera_max_skew_ms < 0:
+            raise ValueError("camera_max_skew_ms must be non-negative.")
         if self.das_baudrate <= 0:
             raise ValueError("das_baudrate must be positive.")
         if self.das_update_frequency_hz <= 0:

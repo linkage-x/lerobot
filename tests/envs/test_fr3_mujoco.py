@@ -38,15 +38,7 @@ def test_reset_info_exposes_target_tcp_marker_state_and_named_cameras():
         _, info = env.reset()
         assert info["target_marker_name"] == "target"
         assert info["tcp_marker_name"] == "TCP"
-        assert info["camera_names"] == (
-            "third_person",
-            "north_east",
-            "side",
-            "west",
-            "south_west",
-            "south_east",
-            "wrist",
-        )
+        assert info["camera_names"] == ("external", "wrist")
         np.testing.assert_allclose(info["target_pose"], info["tcp_pose"])
         assert info["target_pose_7d"].shape == (7,)
         assert info["tcp_pose_7d"].shape == (7,)
@@ -54,7 +46,11 @@ def test_reset_info_exposes_target_tcp_marker_state_and_named_cameras():
         env.close()
 
 
-def test_current_tcp_pose_reads_directly_from_mujoco_tcp_body():
+def test_current_tcp_pose_reports_the_mujoco_tcp_body_in_the_robot_base_frame():
+    # The hardware FR3 reports EE poses relative to its own base. The scene bolts the simulated
+    # arm to a 0.4 m pedestal, so reporting raw world coordinates would put a sim dataset 0.4 m
+    # above a hardware dataset of the same task and neither the schema nor the replay gate would
+    # notice.
     env = FR3MujocoEnv()
     try:
         env.reset()
@@ -62,7 +58,111 @@ def test_current_tcp_pose_reads_directly_from_mujoco_tcp_body():
         body_pose = np.eye(4, dtype=np.float64)
         body_pose[:3, 3] = np.asarray(env.data.xpos[env._tcp_body_id], dtype=np.float64)
         body_pose[:3, :3] = np.asarray(env.data.xmat[env._tcp_body_id], dtype=np.float64).reshape(3, 3)
-        np.testing.assert_allclose(tcp_pose, body_pose, atol=1e-9)
+
+        base_id = env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_BODY, env.cfg.base_frame_name)
+        base_pose = np.eye(4, dtype=np.float64)
+        base_pose[:3, 3] = np.asarray(env.data.xpos[base_id], dtype=np.float64)
+        base_pose[:3, :3] = np.asarray(env.data.xmat[base_id], dtype=np.float64).reshape(3, 3)
+
+        expected = np.eye(4, dtype=np.float64)
+        expected[:3, :3] = base_pose[:3, :3].T @ body_pose[:3, :3]
+        expected[:3, 3] = base_pose[:3, :3].T @ (body_pose[:3, 3] - base_pose[:3, 3])
+        np.testing.assert_allclose(tcp_pose, expected, atol=1e-9)
+        # And the conversion is not a no-op on this scene.
+        np.testing.assert_allclose(body_pose[2, 3] - tcp_pose[2, 3], 0.40, atol=1e-9)
+    finally:
+        env.close()
+
+
+def test_home_pose_holds_the_gripper_over_the_table_pointing_down():
+    # A home pose is only meaningful together with the gripper's mounting orientation: the
+    # previous one was tuned while the MJCF carried the tool 165 deg off, so it aimed the fingers
+    # up and away from the table. Assert the physical intent instead of the joint numbers.
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+
+        def body_id(name):
+            return env._mujoco.mj_name2id(env.model, env._mujoco.mjtObj.mjOBJ_BODY, name)
+
+        approach_axis = np.asarray(env.data.xmat[body_id("gripper_base")]).reshape(3, 3)[:, 0]
+        np.testing.assert_allclose(approach_axis, np.array([0.0, 0.0, -1.0]), atol=1e-3)
+
+        # World coordinates: the table top is at z=0.40 and the workspace object at (0.48, 0).
+        finger_tip = np.asarray(env.data.xpos[body_id("pika_gripper_ee")], dtype=np.float64)
+        assert 0.55 < finger_tip[2] < 0.70, finger_tip
+        assert np.linalg.norm(finger_tip[:2] - np.array([0.48, 0.0])) < 0.02, finger_tip
+
+        arm_body_ids = {body_id(name) for name in ("gripper_base", "gripper_left_link", "gripper_right_link")}
+        for contact_index in range(int(env.data.ncon)):
+            contact = env.data.contact[contact_index]
+            touching = {int(env.model.geom_bodyid[int(contact.geom1)]), int(env.model.geom_bodyid[int(contact.geom2)])}
+            assert not (touching & arm_body_ids), "the arm should not be touching anything at home"
+    finally:
+        env.close()
+
+
+def test_gripper_command_matches_hardware_width_semantics():
+    # Hardware Pika commands are normalized aperture: 0.0 is closed/minimum width and 1.0 is
+    # open/maximum width. The MuJoCo slide joints are physically open at q=0 and closed at the
+    # far end of their ranges, so this test catches an accidental internal sign flip.
+    env = FR3MujocoEnv(FR3MujocoEnvConfig(continuous_physics=False, enable_cameras=False))
+    try:
+        env.reset()
+        env._set_gripper_command(0.0)
+        closed = env._get_gripper_joint_positions()
+        assert env.measured_gripper_position() == pytest.approx(0.0, abs=1e-9)
+
+        env._set_gripper_command(1.0)
+        opened = env._get_gripper_joint_positions()
+        assert env.measured_gripper_position() == pytest.approx(1.0, abs=1e-9)
+
+        assert abs(closed["left"]) > abs(opened["left"])
+        assert abs(closed["right"]) > abs(opened["right"])
+        assert abs(closed["left"] + closed["right"]) < 1e-9
+        assert abs(opened["left"] + opened["right"]) < 1e-9
+    finally:
+        env.close()
+
+
+def test_absolute_pose_can_override_mujoco_ik_orientation_weight():
+    env = FR3MujocoEnv(FR3MujocoEnvConfig(continuous_physics=False, enable_cameras=False))
+    try:
+        env.reset()
+        target_pose = env._current_tcp_pose().copy()
+        captured: list[float | None] = []
+        original_inverse_kinematics = env._kinematics.inverse_kinematics
+
+        def capture_inverse_kinematics(current_joints, desired_pose, **kwargs):
+            captured.append(kwargs.get("orientation_weight"))
+            return original_inverse_kinematics(current_joints, desired_pose, **kwargs)
+
+        env._kinematics.inverse_kinematics = capture_inverse_kinematics  # type: ignore[method-assign]
+        try:
+            env.step_absolute_pose(target_pose, control_period_s=1.0 / 30.0, ik_orientation_weight=0.01)
+        finally:
+            env._kinematics.inverse_kinematics = original_inverse_kinematics  # type: ignore[method-assign]
+
+        assert captured == [0.01]
+    finally:
+        env.close()
+
+
+def test_absolute_pose_commands_are_taken_in_the_robot_base_frame():
+    # Same frame in and out: a pose read off get_observation must be reachable by handing it
+    # straight back, which is exactly what replaying a recorded trajectory does.
+    env = FR3MujocoEnv()
+    try:
+        env.reset()
+        start_pose = env._current_tcp_pose().copy()
+        target_pose = start_pose.copy()
+        target_pose[2, 3] -= 0.05
+
+        for _ in range(50):
+            env.step_absolute_pose(target_pose, control_period_s=1.0 / 30.0)
+
+        reached = env._current_tcp_pose()
+        assert np.linalg.norm(reached[:3, 3] - target_pose[:3, 3]) < 5e-3
     finally:
         env.close()
 
@@ -367,7 +467,11 @@ def test_mujoco_ik_solution_moves_real_tcp_to_target_frame():
         target_pose = current_pose.copy()
         target_pose[:3, 3] += np.array([0.002, 0.002, 0.002], dtype=np.float64)
 
-        ik_joints = env._kinematics.inverse_kinematics(current_joints, target_pose, lock_orientation=True)
+        # _kinematics is the raw MuJoCo helper and speaks world coordinates; the env's own
+        # poses are in the robot base frame.
+        ik_joints = env._kinematics.inverse_kinematics(
+            current_joints, env._pose_to_world(target_pose), lock_orientation=True
+        )
         env._reset_joint_state(ik_joints)
         achieved_pose = env._current_tcp_pose()
 
@@ -410,10 +514,11 @@ def test_fk_ik_round_trip_stays_in_target_frame():
     try:
         env.reset()
         current_joints = env._get_joint_positions()
-        current_pose = env._current_tcp_pose()
-        ik_joints = env._kinematics.inverse_kinematics(current_joints, current_pose)
+        # Both ends of this round trip are the world-frame kinematics helper.
+        current_pose_world = env._pose_to_world(env._current_tcp_pose())
+        ik_joints = env._kinematics.inverse_kinematics(current_joints, current_pose_world)
         round_trip_pose = env._kinematics.forward_kinematics(ik_joints)
-        np.testing.assert_allclose(round_trip_pose, current_pose, atol=1e-5)
+        np.testing.assert_allclose(round_trip_pose, current_pose_world, atol=1e-5)
     finally:
         env.close()
 
@@ -455,7 +560,7 @@ def test_render_returns_named_camera_images_when_enabled():
     env = FR3MujocoEnv(cfg=cfg)
     try:
         observation, info = env.reset()
-        expected_camera_names = ["north_east", "side", "south_east", "south_west", "third_person", "west", "wrist"]
+        expected_camera_names = ["external", "wrist"]
         assert sorted(observation["camera_obs"].keys()) == expected_camera_names
         assert sorted(env.render().keys()) == expected_camera_names
         for image in observation["camera_obs"].values():
@@ -508,22 +613,22 @@ def test_gripper_command_updates_pika_slide_joints_symmetrically():
         env.reset()
         _, _, _, _, closed = env.step_teleop_action({"enabled": False, "gripper": 0.0})
         _, _, _, _, opened = env.step_teleop_action({"enabled": False, "gripper": 1.0})
-        assert abs(opened["gripper_joint_positions"]["left"]) > abs(closed["gripper_joint_positions"]["left"])
-        assert abs(opened["gripper_joint_positions"]["right"]) > abs(closed["gripper_joint_positions"]["right"])
-        assert abs(opened["gripper_joint_positions"]["left"] + opened["gripper_joint_positions"]["right"]) < 1e-4
+        assert abs(closed["gripper_joint_positions"]["left"]) > abs(opened["gripper_joint_positions"]["left"])
+        assert abs(closed["gripper_joint_positions"]["right"]) > abs(opened["gripper_joint_positions"]["right"])
+        assert abs(closed["gripper_joint_positions"]["left"] + closed["gripper_joint_positions"]["right"]) < 1e-4
         assert opened["gripper_command"] == 1.0
     finally:
         env.close()
 
 
-def test_gripper_fully_closes_without_object():
+def test_gripper_fully_opens_without_object():
     env = FR3MujocoEnv()
     try:
         env.reset()
-        env.step_teleop_action({"enabled": False, "gripper": 1.0})
-        _, _, _, _, closed = env.step_teleop_action({"enabled": False, "gripper": 0.0})
-        assert abs(closed["gripper_joint_positions"]["left"]) < 1e-3
-        assert abs(closed["gripper_joint_positions"]["right"]) < 1e-3
+        env.step_teleop_action({"enabled": False, "gripper": 0.0})
+        _, _, _, _, opened = env.step_teleop_action({"enabled": False, "gripper": 1.0})
+        assert abs(opened["gripper_joint_positions"]["left"]) < 1e-3
+        assert abs(opened["gripper_joint_positions"]["right"]) < 1e-3
     finally:
         env.close()
 
@@ -552,8 +657,9 @@ def test_gripper_stops_lowering_when_pads_reach_table_height():
     env = FR3MujocoEnv()
     try:
         env.reset()
-        current_pose = env._current_tcp_pose().copy()
-        lowered_pose = current_pose.copy()
+        # Table height is a property of the scene, so this test works in world coordinates:
+        # the table top is at z=0.40 and the arm base sits on it.
+        lowered_pose = env._pose_to_world(env._current_tcp_pose())
         lowered_pose[2, 3] = 0.46
         lowered_joint_positions = env._kinematics.inverse_kinematics(env._get_joint_positions(), lowered_pose)
         env._set_joint_state(lowered_joint_positions)
@@ -563,7 +669,7 @@ def test_gripper_stops_lowering_when_pads_reach_table_height():
         right_pad_z = float(env.data.geom_xpos[right_pad_geom_id][2])
         assert left_pad_z > 0.42
         assert right_pad_z > 0.42
-        assert env._current_tcp_pose()[2, 3] > 0.53
+        assert env._pose_to_world(env._current_tcp_pose())[2, 3] > 0.53
     finally:
         env.close()
 

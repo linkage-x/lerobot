@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -280,6 +281,290 @@ class DeltaActionToAbsoluteEEAction(RobotActionProcessorStep):
 
         for key in ("ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw", "gripper.pos"):
             action_features[key] = PolicyFeature(type=FeatureType.ACTION, shape=(1,))
+        return features
+
+
+# Which pose the delta is measured against. Both are exactly invertible, but they teach a
+# policy different things and require different deployment code, so the choice is explicit.
+DELTA_REFERENCE_PREV_CMD = "prev_cmd"
+DELTA_REFERENCE_CURRENT = "current"
+DELTA_REFERENCES = (DELTA_REFERENCE_PREV_CMD, DELTA_REFERENCE_CURRENT)
+# The reference is part of the *feature name*, not just a config value. Two datasets whose deltas
+# are measured against different poses need different absolute trajectories to be rebuilt from
+# them, so sharing one name would make a dataset un-self-describing and let an offline tool
+# integrate the wrong way while producing a plausible-looking result.
+_DELTA_EE_KEY_ROOTS = {
+    DELTA_REFERENCE_PREV_CMD: "delta_ee_from_prev_cmd",
+    DELTA_REFERENCE_CURRENT: "delta_ee_from_current",
+}
+# Gripper stays absolute in every mode: 0..1 is an opening, and a delta on it would accumulate
+# drift with no reference in the observation to correct against.
+DELTA_EE_GRIPPER_KEY = "gripper.pos"
+
+
+def delta_ee_key_root(reference: str) -> str:
+    if reference not in _DELTA_EE_KEY_ROOTS:
+        raise ValueError(f"delta reference must be one of {DELTA_REFERENCES}, got {reference!r}")
+    return _DELTA_EE_KEY_ROOTS[reference]
+
+
+def delta_ee_position_keys(reference: str) -> tuple[str, str, str]:
+    root = delta_ee_key_root(reference)
+    return (f"{root}.dx", f"{root}.dy", f"{root}.dz")
+
+
+def delta_ee_rotvec_keys(reference: str) -> tuple[str, str, str]:
+    root = delta_ee_key_root(reference)
+    return (f"{root}.drx", f"{root}.dry", f"{root}.drz")
+
+
+def delta_ee_action_keys(reference: str) -> tuple[str, ...]:
+    return (
+        *delta_ee_position_keys(reference),
+        *delta_ee_rotvec_keys(reference),
+        DELTA_EE_GRIPPER_KEY,
+    )
+
+
+def delta_reference_from_action_names(action_names: Iterable[str]) -> str | None:
+    """Recover which delta reference a recorded dataset used, from its action feature names."""
+    names = set(action_names)
+    for reference in DELTA_REFERENCES:
+        if set(delta_ee_position_keys(reference)) <= names:
+            return reference
+    return None
+# A delta this large is not a teleop increment; it means the reference pose was wrong (e.g. a
+# left/right multiplication mix-up, or a reference taken from the wrong frame). rotvec is
+# well-conditioned far below this, and near pi it would alias -- so refuse instead of aliasing.
+_MAX_SANE_DELTA_ROTATION_RAD = np.pi / 2.0
+
+
+def _reference_pose_from_observation(observation: RobotObservation, reference: str) -> np.ndarray:
+    """Pose the recorded delta is relative to, read from the raw robot observation.
+
+    Both references are present in every FR3 observation, so neither mode needs the recorder to
+    carry extra state -- and at deployment the policy's delta can be turned back into an
+    absolute target from the same observation it was conditioned on.
+    """
+    if reference == DELTA_REFERENCE_PREV_CMD:
+        position_keys, rotvec_keys, quat_keys = (
+            PREV_CMD_POSITION_KEYS,
+            PREV_CMD_ROTVEC_KEYS,
+            PREV_CMD_QUAT_KEYS,
+        )
+    elif reference == DELTA_REFERENCE_CURRENT:
+        position_keys, rotvec_keys, quat_keys = EE_POSITION_KEYS, EE_ROTVEC_KEYS, EE_QUAT_KEYS
+    else:
+        raise ValueError(f"delta reference must be one of {DELTA_REFERENCES}, got {reference!r}")
+
+    if not all(key in observation for key in position_keys):
+        raise ValueError(
+            f"Observation is missing {position_keys} needed for delta reference {reference!r}."
+        )
+    position_xyz = np.array([observation[key] for key in position_keys], dtype=np.float64)
+    if all(key in observation for key in rotvec_keys):
+        return _pose_from_position_and_rotvec(
+            position_xyz=position_xyz,
+            rotvec_xyz=np.array([observation[key] for key in rotvec_keys], dtype=np.float64),
+        )
+    if all(key in observation for key in quat_keys):
+        return _pose_from_position_and_quaternion(
+            position_xyz=position_xyz,
+            quaternion_xyzw=np.array([observation[key] for key in quat_keys], dtype=np.float64),
+        )
+    raise ValueError(
+        f"Observation carries neither {rotvec_keys} nor {quat_keys} for delta reference {reference!r}."
+    )
+
+
+@dataclass
+class AbsoluteEEToDeltaEEAction(RobotActionProcessorStep):
+    """Re-express an absolute EE target as a delta against the reference pose, for recording.
+
+    Runs after :class:`DeltaActionToAbsoluteEEAction`, so the delta describes the command that
+    was actually issued -- including the workspace clip -- rather than the raw teleop increment.
+
+    Conventions, which the reconstruction must mirror exactly:
+
+    * **translation is world-frame** (``delta = desired_pos - reference_pos``)
+    * **rotation is body/tool-frame and right-multiplied**
+      (``delta_R = reference_R^T @ desired_R``, so ``desired_R = reference_R @ delta_R``)
+
+    That mixed convention is not a preference; it is what
+    :class:`DeltaActionToAbsoluteEEAction` already does when it builds the target, so anything
+    else would make the recorded delta disagree with the clamp that produced it.
+
+    Rotation is stored as a **rotvec**, not a quaternion. Deltas are clamped to ~0.01 rad/frame,
+    where a quaternion's ``qw = cos(theta/2)`` spans only ~1.25e-5 -- about 8 bits of float32 --
+    and recovering the angle through ``acos`` near 1 amplifies regression error by ~80x. rotvec
+    is 1:1 in that range, carries no unit-norm constraint for a regressor to violate, and can be
+    linearly averaged for action chunking. The pi singularity that makes quaternions necessary
+    for *absolute* pose is two orders of magnitude away from a clamped delta.
+    """
+
+    reference: str = DELTA_REFERENCE_PREV_CMD
+
+    def __post_init__(self) -> None:
+        if self.reference not in DELTA_REFERENCES:
+            raise ValueError(f"reference must be one of {DELTA_REFERENCES}, got {self.reference!r}")
+
+    def action(self, action: RobotAction) -> RobotAction:
+        observation = self.transition.get(TransitionKey.OBSERVATION)
+        if observation is None:
+            raise ValueError("Observation is required to express an FR3 EE target as a delta.")
+        if not all(key in action for key in EE_POSITION_KEYS + EE_QUAT_KEYS):
+            raise ValueError(
+                "AbsoluteEEToDeltaEEAction expects an absolute EE action "
+                f"({EE_POSITION_KEYS + EE_QUAT_KEYS}); got keys {sorted(action)}."
+            )
+
+        desired_pose = _pose_from_position_and_quaternion(
+            position_xyz=np.array([action[key] for key in EE_POSITION_KEYS], dtype=np.float64),
+            quaternion_xyzw=np.array([action[key] for key in EE_QUAT_KEYS], dtype=np.float64),
+        )
+        reference_pose = _reference_pose_from_observation(observation, self.reference)
+
+        delta_position = desired_pose[:3, 3] - reference_pose[:3, 3]
+        delta_rotation = Rotation.from_matrix(reference_pose[:3, :3].T @ desired_pose[:3, :3])
+        delta_rotvec = delta_rotation.as_rotvec()
+        delta_angle_rad = float(np.linalg.norm(delta_rotvec))
+        if delta_angle_rad > _MAX_SANE_DELTA_ROTATION_RAD:
+            raise ValueError(
+                f"FR3 delta rotation {np.degrees(delta_angle_rad):.1f} deg exceeds "
+                f"{np.degrees(_MAX_SANE_DELTA_ROTATION_RAD):.1f} deg against the "
+                f"{self.reference!r} reference; the reference pose or the multiplication order "
+                "is wrong, and a rotvec this large would alias near pi."
+            )
+
+        gripper = float(np.clip(action.get("gripper.pos", action.get("gripper", 0.0)), 0.0, 1.0))
+        # Everything the downstream reconstruction and the robot's hold path need is passed
+        # through; only delta_ee_action_keys(reference) are declared as dataset features.
+        return {
+            **{key: bool(action["enabled"]) for key in ("enabled",) if "enabled" in action},
+            **{
+                key: float(action[key])
+                for key in ("target_x", "target_y", "target_z", "target_wx", "target_wy", "target_wz")
+                if key in action
+            },
+            **dict(
+                zip(delta_ee_position_keys(self.reference), (float(v) for v in delta_position), strict=True)
+            ),
+            **dict(
+                zip(delta_ee_rotvec_keys(self.reference), (float(v) for v in delta_rotvec), strict=True)
+            ),
+            "gripper": gripper,
+            "gripper.pos": gripper,
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        action_features = features[PipelineFeatureType.ACTION]
+        # Drop the absolute-EE keys the previous step declared: a delta dataset must not also
+        # advertise an absolute action, or a policy could be trained against the wrong one.
+        for key in (
+            "enabled",
+            "target_x",
+            "target_y",
+            "target_z",
+            "target_wx",
+            "target_wy",
+            "target_wz",
+            "gripper",
+            *EE_POSITION_KEYS,
+            *EE_QUAT_KEYS,
+            # Popped and re-added last so the ordering matches the absolute contract
+            # (pose components first, gripper last) instead of depending on insertion history.
+            DELTA_EE_GRIPPER_KEY,
+        ):
+            action_features.pop(key, None)
+        for key in delta_ee_action_keys(self.reference):
+            action_features[key] = PolicyFeature(type=FeatureType.ACTION, shape=(1,))
+        return features
+
+
+@dataclass
+class DeltaEEToAbsoluteEEAction(RobotActionProcessorStep):
+    """Rebuild the absolute EE target from a delta action.
+
+    This is the single implementation of the reconstruction, used in both directions: during
+    recording it turns the delta back into the command sent to the robot, and at deployment it
+    turns the policy's delta into that same command. Sharing it is what makes "training equals
+    deployment" structural rather than a convention two files have to agree on.
+
+    ``enabled`` is optional and defaults to True: a policy emits no such flag, and it does not
+    need one -- a held frame is recorded as a zero delta, which reconstructs to "stay put".
+    """
+
+    reference: str = DELTA_REFERENCE_PREV_CMD
+    workspace_min: tuple[float, float, float] | None = None
+    workspace_max: tuple[float, float, float] | None = None
+
+    _prev_output_quaternion_xyzw: np.ndarray | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.reference not in DELTA_REFERENCES:
+            raise ValueError(f"reference must be one of {DELTA_REFERENCES}, got {self.reference!r}")
+
+    def action(self, action: RobotAction) -> RobotAction:
+        position_keys = delta_ee_position_keys(self.reference)
+        rotvec_keys = delta_ee_rotvec_keys(self.reference)
+        if not all(key in action for key in position_keys + rotvec_keys):
+            # Already absolute (or a hold frame from an absolute pipeline): pass it through so
+            # one pipeline can serve both action modes without a caller-side branch.
+            return action
+        observation = self.transition.get(TransitionKey.OBSERVATION)
+        if observation is None:
+            raise ValueError("Observation is required to rebuild an absolute EE target from a delta.")
+
+        reference_pose = _reference_pose_from_observation(observation, self.reference)
+        delta_position = np.array([float(action[key]) for key in position_keys], dtype=np.float64)
+        delta_rotvec = np.array([float(action[key]) for key in rotvec_keys], dtype=np.float64)
+
+        desired_position = reference_pose[:3, 3] + delta_position
+        if self.workspace_min is not None and self.workspace_max is not None:
+            # Clamped on the way out as well as on the way in. During recording this is a no-op
+            # (the delta already encodes a clipped target); at deployment it is the guard that
+            # keeps a policy from commanding its way out of the safe envelope.
+            desired_position = np.clip(
+                desired_position,
+                np.asarray(self.workspace_min, dtype=np.float64),
+                np.asarray(self.workspace_max, dtype=np.float64),
+            )
+        # Right-multiplied, body frame -- the inverse of AbsoluteEEToDeltaEEAction.
+        desired_rotation = reference_pose[:3, :3] @ Rotation.from_rotvec(delta_rotvec).as_matrix()
+
+        desired_quaternion_xyzw = Rotation.from_matrix(desired_rotation).as_quat()
+        desired_quaternion_xyzw = _continuous_quaternion(
+            desired_quaternion_xyzw, self._prev_output_quaternion_xyzw
+        )
+        self._prev_output_quaternion_xyzw = desired_quaternion_xyzw.copy()
+
+        gripper = float(np.clip(action.get("gripper.pos", action.get("gripper", 0.0)), 0.0, 1.0))
+        rebuilt: RobotAction = {
+            **{key: action[key] for key in ("enabled",) if key in action},
+            **{
+                key: action[key]
+                for key in ("target_x", "target_y", "target_z", "target_wx", "target_wy", "target_wz")
+                if key in action
+            },
+            "ee.x": float(desired_position[0]),
+            "ee.y": float(desired_position[1]),
+            "ee.z": float(desired_position[2]),
+            **dict(zip(EE_QUAT_KEYS, (float(v) for v in desired_quaternion_xyzw), strict=True)),
+            "gripper": gripper,
+            "gripper.pos": gripper,
+        }
+        return rebuilt
+
+    def reset(self) -> None:
+        self._prev_output_quaternion_xyzw = None
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        # Reconstruction is a robot-command step, not a dataset-schema step: the recorded action
+        # stays the delta. Rewriting the features here would re-advertise the absolute action.
         return features
 
 

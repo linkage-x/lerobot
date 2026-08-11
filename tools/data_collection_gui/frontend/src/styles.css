@@ -345,7 +345,6 @@ button.danger {
 .status-recording,
 .status-replaying,
 .status-active,
-.status-dry_run,
 .status-sim_replay,
 .status-armed {
   background: #0f766e;
@@ -1832,6 +1831,113 @@ button.danger {
   text-align: center;
 }
 
+.realsense-monitor.replay-camera-compare {
+  min-height: 0;
+}
+
+.replay-camera-compare .realsense-monitor-heading {
+  position: static;
+}
+
+.replay-camera-compare-grid {
+  display: grid;
+  gap: 12px;
+  padding: 10px;
+}
+
+.replay-camera-pair {
+  background: #071014;
+  border: 1px solid #1f2c33;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.replay-camera-pair-heading {
+  align-items: center;
+  color: #e8f0f3;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding: 8px 10px;
+}
+
+.replay-camera-pair-heading span {
+  color: #91a6af;
+  font-size: 11px;
+}
+
+.replay-camera-pair-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 0 10px 10px;
+}
+
+.replay-camera-card {
+  background: #0c1216;
+  border: 1px solid #26343c;
+  border-radius: 7px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.replay-camera-card-heading {
+  align-items: center;
+  color: #e5edf1;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding: 8px 10px;
+}
+
+.replay-camera-card-heading span {
+  color: #95a8b1;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.replay-camera-media {
+  align-items: center;
+  background: #050709;
+  display: flex;
+  height: 260px;
+  justify-content: center;
+}
+
+.replay-camera-media img,
+.replay-camera-media video {
+  display: block;
+  height: 260px;
+  object-fit: contain;
+  width: 100%;
+}
+
+.replay-camera-media .realsense-monitor-empty {
+  height: 260px;
+  padding: 18px;
+}
+
+.replay-camera-no-match {
+  height: 260px;
+}
+
+.replay-camera-note {
+  border-top: 1px solid #1f2c33;
+  color: #9fb2bb;
+  font-size: 12px;
+  line-height: 1.4;
+  margin: 0;
+  padding: 0 12px 12px;
+}
+
+@media (max-width: 1100px) {
+  .replay-camera-pair-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 900px) {
   .real-robot-layout {
     grid-template-columns: 1fr;
@@ -3305,4 +3411,314 @@ button.danger {
   .cali-log-line .cali-log-box, .cali-log-line .cali-log-sensor { display: none; }
   .cali-history-head { grid-template-columns: 60px minmax(0, 1fr) 80px; }
   .cali-history-head span:nth-child(4), .cali-history-head span:nth-child(5) { display: none; }
+}
+
+.teleop-backend-picker {
+  width: min(100%, 420px);
+  margin-bottom: 12px;
+}
+
+.teleop-panel .summary-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.teleop-config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.teleop-config-grid div {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  min-width: 0;
+  background: #f8fafc;
+}
+
+.teleop-config-grid span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.teleop-config-grid strong {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.teleop-message {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.teleop-gate-note {
+  margin-top: 10px;
+  border-left: 3px solid #c78b23;
+  padding: 7px 10px;
+  background: #fff8e8;
+  color: #6f541f;
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .teleop-panel .summary-grid,
+  .teleop-config-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.teleop-camera-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.teleop-camera-tile {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+}
+
+.teleop-camera-media {
+  position: relative;
+  aspect-ratio: 4 / 3;
+  background: #101417;
+  overflow: hidden;
+}
+
+.teleop-camera-media img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.teleop-camera-offline {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+  color: #8d979e;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.teleop-camera-state {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 7px;
+  background: rgba(15, 19, 22, 0.82);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.teleop-camera-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 11px;
+}
+
+.teleop-camera-label strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.teleop-camera-label span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .teleop-camera-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.teleop-device-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.teleop-device {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fff;
+}
+
+.teleop-device div,
+.teleop-device strong,
+.teleop-device span,
+.teleop-device small {
+  min-width: 0;
+}
+
+.teleop-device div span {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.teleop-device small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 900px) {
+  .teleop-device-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Timestamp-synchronisation verdict shown under the record controls. Colour-coded so a
+   failing episode is obvious without reading the summary line. */
+.sync-audit {
+  border: 1px solid #dce4e8;
+  border-left-width: 4px;
+  border-radius: 7px;
+  background: #f4f7f8;
+  margin-top: 10px;
+  padding: 8px 10px;
+}
+
+.sync-audit-pass {
+  border-left-color: #2f855a;
+}
+
+.sync-audit-fail {
+  border-left-color: #b23c17;
+  background: #fdf3ef;
+}
+
+.sync-audit-unavailable,
+.sync-audit-unknown {
+  border-left-color: #b7791f;
+}
+
+.sync-audit-heading {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.sync-audit-heading span {
+  color: #60707c;
+  font-size: 12px;
+}
+
+.sync-audit-summary {
+  display: block;
+  font-size: 11.5px;
+  margin-top: 6px;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.sync-audit-warnings {
+  color: #8d2d12;
+  font-size: 12px;
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+.sync-audit small {
+  color: #60707c;
+  display: block;
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
+
+/* Gateway command rejections. Rendered outside the snapshot-driven page body so the 1s poll
+   cannot overwrite them; dismissed by the operator, not by the next tick. */
+.command-error {
+  align-items: center;
+  background: #fdecea;
+  border-bottom: 1px solid #f0b8ae;
+  color: #8d2d12;
+  display: flex;
+  font-size: 13px;
+  font-weight: 650;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 10px 20px;
+}
+
+.command-error button {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font-size: 18px;
+  line-height: 1;
+  min-height: 0;
+  padding: 0 4px;
+}
+
+/* Training views built from a recording, listed under that recording. */
+.view-list {
+  border-top: 1px dashed #d2d9de;
+  display: grid;
+  gap: 6px;
+  grid-column: 1 / -1;
+  margin-top: 2px;
+  padding-top: 8px;
+}
+
+.view-row {
+  align-items: center;
+  background: #f5f8fa;
+  border: 1px solid #e1e6ea;
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 8px 9px;
+}
+
+.view-row.pending {
+  background: #eef8f7;
+  border-color: #9ecbc6;
+}
+
+.view-row strong {
+  font-size: 13px;
+}
+
+.view-row p {
+  color: #60707c;
+  font-size: 12px;
+  margin: 3px 0 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.view-row .view-path {
+  color: #87939d;
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }

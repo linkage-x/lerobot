@@ -34,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     sample_idx = 0
 
     print("Connected to SpaceMouse.")
+    print(f"Device: {driver.describe()}")
     print("Columns:")
     print("  idx t_s tx ty tz roll pitch yaw trans_norm rot_norm buttons")
 

@@ -84,6 +84,9 @@ class FakeRobot:
         self.call_order = None
         self.move_to_start_calls = 0
         self.send_action_calls = []
+        # Mirrors the real FR3 observation contract, including prev_cmd.*: the delta action
+        # modes measure against the previously commanded pose, so a fake that omitted it would
+        # make the processors untestable for the default mode.
         self._observation = {
             "ee.x": 0.4,
             "ee.y": 0.0,
@@ -93,6 +96,14 @@ class FakeRobot:
             "ee.qz": 0.0,
             "ee.qw": 1.0,
             "gripper.pos": 0.5,
+            "prev_cmd.ee.x": 0.4,
+            "prev_cmd.ee.y": 0.0,
+            "prev_cmd.ee.z": 0.3,
+            "prev_cmd.ee.qx": 0.0,
+            "prev_cmd.ee.qy": 0.0,
+            "prev_cmd.ee.qz": 0.0,
+            "prev_cmd.ee.qw": 1.0,
+            "prev_cmd.gripper.pos": 0.5,
         }
 
     def connect(self):
@@ -219,7 +230,7 @@ def test_record_resets_teleop_action_processor_after_episode(monkeypatch):
     monkeypatch.setattr(fr3_record_runtime, "make_teleoperator_from_config", lambda cfg: teleop)
     monkeypatch.setattr(
         fr3_record_runtime,
-        "make_fr3_ee2ee_processors",
+        "make_fr3_action_processors",
         lambda cfg: (teleop_action_processor, robot_action_processor, robot_observation_processor),
     )
     monkeypatch.setattr(fr3_record_runtime, "aggregate_pipeline_dataset_features", lambda **kwargs: {})
@@ -287,7 +298,7 @@ def test_record_forces_binary_spacemouse_for_franka_hand(monkeypatch):
     )
     monkeypatch.setattr(
         fr3_record_runtime,
-        "make_fr3_ee2ee_processors",
+        "make_fr3_action_processors",
         lambda cfg: (teleop_action_processor, robot_action_processor, robot_observation_processor),
     )
     monkeypatch.setattr(fr3_record_runtime, "aggregate_pipeline_dataset_features", lambda **kwargs: {})
@@ -352,7 +363,7 @@ def test_record_waits_for_episode_start_settle_before_record_loop(monkeypatch):
     monkeypatch.setattr(fr3_record_runtime, "make_teleoperator_from_config", lambda cfg: teleop)
     monkeypatch.setattr(
         fr3_record_runtime,
-        "make_fr3_ee2ee_processors",
+        "make_fr3_action_processors",
         lambda cfg: (teleop_action_processor, robot_action_processor, robot_observation_processor),
     )
     monkeypatch.setattr(fr3_record_runtime, "aggregate_pipeline_dataset_features", lambda **kwargs: {})
@@ -450,7 +461,7 @@ def test_record_resets_before_first_episode_when_auto_move_enabled(monkeypatch):
     monkeypatch.setattr(fr3_record_runtime, "make_teleoperator_from_config", lambda cfg: teleop)
     monkeypatch.setattr(
         fr3_record_runtime,
-        "make_fr3_ee2ee_processors",
+        "make_fr3_action_processors",
         lambda cfg: (teleop_action_processor, robot_action_processor, robot_observation_processor),
     )
     monkeypatch.setattr(fr3_record_runtime, "aggregate_pipeline_dataset_features", lambda **kwargs: {})
@@ -518,7 +529,7 @@ def test_record_moves_to_start_opens_gripper_before_keep_confirmation(monkeypatc
     monkeypatch.setattr(fr3_record_runtime, "make_teleoperator_from_config", lambda cfg: teleop)
     monkeypatch.setattr(
         fr3_record_runtime,
-        "make_fr3_ee2ee_processors",
+        "make_fr3_action_processors",
         lambda cfg: (teleop_action_processor, robot_action_processor, robot_observation_processor),
     )
     monkeypatch.setattr(fr3_record_runtime, "aggregate_pipeline_dataset_features", lambda **kwargs: {})
@@ -596,7 +607,7 @@ def test_record_discards_episode_when_keep_confirmation_rejects(monkeypatch):
     monkeypatch.setattr(fr3_record_runtime, "make_teleoperator_from_config", lambda cfg: teleop)
     monkeypatch.setattr(
         fr3_record_runtime,
-        "make_fr3_ee2ee_processors",
+        "make_fr3_action_processors",
         lambda cfg: (teleop_action_processor, robot_action_processor, robot_observation_processor),
     )
     monkeypatch.setattr(fr3_record_runtime, "aggregate_pipeline_dataset_features", lambda **kwargs: {})
@@ -834,8 +845,8 @@ def test_wait_for_episode_start_settle_ignores_initial_spacemouse_translation(mo
     assert robot_observation_processor.reset_calls == 1
 
 
-def test_make_fr3_ee2ee_processors_use_delta_hold_for_idle_robot_frames():
-    cfg = RecordConfig(
+def _hold_frame_cfg() -> RecordConfig:
+    return RecordConfig(
         robot=FrankaResearch3Config(
             robot_ip="192.168.1.206",
             gripper_port="/dev/ttyUSB80",
@@ -862,30 +873,47 @@ def test_make_fr3_ee2ee_processors_use_delta_hold_for_idle_robot_frames():
         display_data=False,
     )
 
-    teleop_action_processor, robot_action_processor, _ = fr3_record_runtime.make_fr3_ee2ee_processors(cfg)
-    observation = {
-        "ee.x": 0.4,
-        "ee.y": 0.1,
-        "ee.z": 0.3,
-        "ee.wx": 0.0,
-        "ee.wy": 0.0,
-        "ee.wz": 0.0,
-        "gripper.pos": 0.5,
-    }
-    idle_action = {
-        "enabled": False,
-        "target_x": 0.0,
-        "target_y": 0.0,
-        "target_z": 0.0,
-        "target_wx": 0.0,
-        "target_wy": 0.0,
-        "target_wz": 0.0,
-        "gripper": 0.5,
-    }
 
-    processed_for_dataset = teleop_action_processor((idle_action.copy(), observation))
-    processed_for_robot = robot_action_processor((processed_for_dataset, observation))
+_HOLD_OBSERVATION = {
+    "ee.x": 0.4,
+    "ee.y": 0.1,
+    "ee.z": 0.3,
+    "ee.wx": 0.0,
+    "ee.wy": 0.0,
+    "ee.wz": 0.0,
+    "gripper.pos": 0.5,
+    # prev_cmd offset from the measured pose on purpose: the real robot's last command leads the
+    # measurement by the tracking residual, and the record pipeline must not confuse the two.
+    "prev_cmd.ee.x": 0.41,
+    "prev_cmd.ee.y": 0.1,
+    "prev_cmd.ee.z": 0.3,
+    "prev_cmd.ee.wx": 0.0,
+    "prev_cmd.ee.wy": 0.0,
+    "prev_cmd.ee.wz": 0.0,
+    "prev_cmd.gripper.pos": 0.5,
+}
+
+_IDLE_TELEOP_ACTION = {
+    "enabled": False,
+    "target_x": 0.0,
+    "target_y": 0.0,
+    "target_z": 0.0,
+    "target_wx": 0.0,
+    "target_wy": 0.0,
+    "target_wz": 0.0,
+    "gripper": 0.5,
+}
+
+
+def test_record_pipeline_stores_absolute_ee_and_holds_idle_robot_frames():
+    cfg = _hold_frame_cfg()
+    teleop_action_processor, robot_action_processor, _ = fr3_record_runtime.make_fr3_action_processors(cfg)
+
+    processed_for_dataset = teleop_action_processor((dict(_IDLE_TELEOP_ACTION), _HOLD_OBSERVATION))
+    processed_for_robot = robot_action_processor((processed_for_dataset, _HOLD_OBSERVATION))
 
     assert all(key in processed_for_dataset for key in ("ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw"))
-    assert np.isclose(processed_for_dataset["ee.z"], observation["ee.z"])
-    assert processed_for_robot == idle_action
+    assert np.isclose(processed_for_dataset["ee.z"], _HOLD_OBSERVATION["ee.z"])
+    assert processed_for_robot == _IDLE_TELEOP_ACTION
+
+
