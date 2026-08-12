@@ -8,6 +8,7 @@ export const processingStatusDot: Record<ProcessingStatus, string> = {
   queued: "connecting",
   running: "running",
   pose_ready: "armed",
+  qc_warn: "warning",
   qc_pass: "running",
   qc_failed: "error",
   error: "error"
@@ -35,7 +36,7 @@ export function ProcessingRow({
       <button disabled={busy} onClick={onGenerate}>Generate EE Trajectory</button>
     ) : item.status === "queued" || item.status === "running" ? (
       <button disabled={busy} onClick={onSelect}>View Log</button>
-    ) : item.status === "qc_pass" ? (
+    ) : item.status === "qc_pass" || item.status === "qc_warn" ? (
       <button disabled={busy} onClick={onOpenReplay}>Open Replay</button>
     ) : item.status === "error" && !item.trajectoryVersion ? (
       // trajectory generation failed: no trajectory to QC, offer to regenerate instead
@@ -109,6 +110,54 @@ export function OnlineSyncManifestBlock({ item }: { item: ProcessingItem }) {
   );
 }
 
+/** The sync verdict, shown as the three budgeted measurements plus the offsets they exclude. */
+export function TimestampSyncBlock({ item }: { item: ProcessingItem }) {
+  const sync = item.timestampSync;
+  if (!sync) {
+    return null;
+  }
+  const statusLabel = sync.status === "pass" ? "pass" : sync.status === "fail" ? "fail" : "missing";
+  const budget = (value: number | null | undefined) => (value == null ? "—" : `${value.toFixed(1)} ms`);
+  const measured = (value: number | null | undefined) => (value == null ? "—" : `${value.toFixed(2)} ms`);
+  return (
+    <div className="qc-block online-sync-block">
+      <div className="qc-block-heading">
+        <h3>Timestamp sync</h3>
+        <span className={`sync-status sync-status-${statusLabel}`}>{statusLabel}</span>
+      </div>
+      <div className="summary-grid compact-summary-grid">
+        <Metric
+          label="Camera-to-camera p95"
+          value={`${measured(sync.groupSkewP95Ms)} / ${budget(sync.budgetsMs?.within_group)}`}
+        />
+        <Metric
+          label="Bias-corrected p95"
+          value={
+            sync.residualSkewOverBudgetFrames == null
+              ? `${measured(sync.residualSkewP95Ms)} (not judged)`
+              : `${measured(sync.residualSkewP95Ms)} / ${budget(sync.budgetsMs?.residual)}`
+          }
+        />
+        <Metric
+          label="Frames over budget"
+          value={`${sync.groupSkewOverBudgetFrames + (sync.residualSkewOverBudgetFrames ?? 0)} / ${sync.totalFrames}`}
+        />
+        <Metric label="Grid-lag frames" value={sync.gridLagOverBudgetFrames} />
+      </div>
+      <p className="panel-note">
+        Each modality's offset from the arm read, which the verdict deliberately excludes — an
+        image is older than the state by construction, and that is measured, not corrected:{" "}
+        {Object.entries(sync.biasMs)
+          .filter(([, value]) => Math.abs(value) >= 0.01)
+          .map(([name, value]) => `${name.replace(/\.capture_timestamp_s$/, "")} ${value.toFixed(1)} ms`)
+          .join(" · ") || "none measurable"}
+        . Raw all-device spread p95 {sync.rawSkewP95Ms.toFixed(1)} ms.
+      </p>
+      {sync.failures.length ? <p className="panel-note">{sync.failures[0]}</p> : null}
+    </div>
+  );
+}
+
 export function DatasetProcessingPage({
   snapshot,
   busy,
@@ -130,6 +179,7 @@ export function DatasetProcessingPage({
   const runningCount = items.filter((item) => item.status === "running" || item.status === "queued").length;
   const failedCount = items.filter((item) => item.status === "qc_failed" || item.status === "error").length;
   const readyCount = items.filter((item) => item.status === "qc_pass").length;
+  const warnedCount = items.filter((item) => item.status === "qc_warn").length;
   const currentRoot = snapshot.gateway.datasetsRoot ?? "";
   const [rootInput, setRootInput] = useState<string>(currentRoot);
   useEffect(() => {
@@ -176,6 +226,7 @@ export function DatasetProcessingPage({
         <div className="summary-grid">
           <Metric label="In flight" value={runningCount} />
           <Metric label="QC passed" value={readyCount} />
+          <Metric label="QC warnings" value={warnedCount} />
           <Metric label="Failed" value={failedCount} />
           <Metric label="Total" value={items.length} />
         </div>
@@ -244,18 +295,20 @@ export function DatasetProcessingPage({
               <button
                 disabled={
                   busy ||
-                  !["pose_ready", "qc_pass", "qc_failed", "error"].includes(selected.status) ||
+                  !["pose_ready", "qc_warn", "qc_pass", "qc_failed", "error"].includes(selected.status) ||
                   // trajectory generation failed: nothing to QC until a trajectory exists
                   (selected.status === "error" && !selected.trajectoryVersion)
                 }
                 onClick={() => onRunQc(selected.path)}
               >
-                {selected.status === "qc_failed" || (selected.status === "error" && selected.trajectoryVersion)
+                {selected.status === "qc_failed" ||
+                selected.status === "qc_warn" ||
+                (selected.status === "error" && selected.trajectoryVersion)
                   ? "Re-run QC"
                   : "Run QC"}
               </button>
               <button
-                disabled={busy || !["pose_ready", "qc_pass"].includes(selected.status)}
+                disabled={busy || !["pose_ready", "qc_warn", "qc_pass"].includes(selected.status)}
                 onClick={() => onOpenReplay(selected.path)}
               >
                 Open Replay
@@ -341,6 +394,7 @@ export function DatasetProcessingPage({
                 </div>
               </div>
             ) : null}
+            <TimestampSyncBlock item={selected} />
             <OnlineSyncManifestBlock item={selected} />
             <div className="log-block">
               <h3>Log</h3>

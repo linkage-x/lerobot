@@ -3,7 +3,7 @@ import { type GuiSnapshot } from "./api";
 import { api } from "./apiClient";
 import "./styles.css";
 import type { CollectionTask, EpisodeAnnotation, ProcessingItem } from "./types";
-import { StatusDot, Metric, stateLabel, processingStatusLabel, taskNeedsQcExportConfirmation } from "./shared/ui";
+import { StatusDot, Metric, stateLabel, processingStatusLabel, qcWarnings, taskNeedsQcExportConfirmation } from "./shared/ui";
 import { CalibrationPage } from "./calibration/CalibrationPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { historyRepo, deviceBoxId } from "./calibration/adapters";
@@ -69,6 +69,11 @@ const navGroups: NavGroup[] = [
 const workstationPageIds = new Set<PageId>([
   "teleoperation",
   "live-record",
+  // The task overlay is rig-independent: the gateway patches dataset.repo_id/root/single_task
+  // onto whichever config the profile records with, so an FR3 session lands in the task's
+  // dataset exactly like a Thor one. Without this page a workstation operator can only name a
+  // task by editing fr3_record_config.yaml and restarting the gateway.
+  "task-library",
   "device-manager",
   "dataset-processing",
   "episode-replay",
@@ -235,6 +240,30 @@ function App() {
     run(() => api.exportTask(taskId));
   };
 
+  const exportApprovedWithWarningGuard = (path: string, actionMode?: string) => {
+    const item = snapshot.processing.find((candidate) => candidate.path === path);
+    // Only the QC-warned case asks. A pass exports straight through, and anything else is
+    // refused by the gateway with its own reason.
+    if (item?.status !== "qc_warn") {
+      run(() => api.exportApprovedDataset(path, actionMode));
+      return;
+    }
+    const warnings = qcWarnings(item);
+    const ok = window.confirm(
+      [
+        `QC passed with warnings for "${item.name}".`,
+        "",
+        ...(warnings.length ? warnings : [item.qcSummary]),
+        "",
+        "Export it anyway?"
+      ].join("\n")
+    );
+    if (!ok) {
+      return;
+    }
+    run(() => api.exportApprovedDataset(path, actionMode, true));
+  };
+
   const pageNode =
     activePage === "teleoperation" ? (
       <TeleoperationPage
@@ -295,7 +324,7 @@ function App() {
         snapshot={snapshot}
         busy={busy}
         onExportTask={exportTaskWithQcGuard}
-        onExportApprovedDataset={(path, actionMode) => run(() => api.exportApprovedDataset(path, actionMode))}
+        onExportApprovedDataset={(path, actionMode) => exportApprovedWithWarningGuard(path, actionMode)}
         onOpenProcessing={() => navigate("dataset-processing")}
         onOpenReplay={(path) => selectAndOpenReplay(path)}
       />

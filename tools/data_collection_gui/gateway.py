@@ -439,6 +439,11 @@ def _bool_config(config: dict[str, Any], key: str, default: bool) -> bool:
     return default
 
 
+def _query_flag(query: dict[str, list[str]], key: str) -> bool:
+    """Truthiness of a query-string flag, absent meaning false."""
+    return (query.get(key, [""])[0] or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _mujoco_validation_thresholds(config: dict[str, Any]) -> tuple[float, float]:
     replay = _replay_config(config)
     return (
@@ -2064,6 +2069,24 @@ def _online_sync_manifest_check(dataset_root: Path) -> tuple[dict[str, Any] | No
     }
 
 
+def _qc_warning_messages(qc_or_item: dict[str, Any]) -> list[str]:
+    """Every warning a QC run raised, in check order.
+
+    Reads either a stored QC result (``checks``) or a snapshot processing item (``qcChecks``),
+    because the export gate and the UI have to name the same warnings.
+    """
+    checks = qc_or_item.get("checks")
+    if not isinstance(checks, list):
+        checks = qc_or_item.get("qcChecks")
+    if not isinstance(checks, list):
+        return []
+    return [
+        f"{check.get('name')}: {check.get('message')}"
+        for check in checks
+        if isinstance(check, dict) and str(check.get("status") or "").lower() == "warn"
+    ]
+
+
 def _processing_item_from_dataset(
     dataset_root: Path,
     *,
@@ -2091,6 +2114,7 @@ def _processing_item_from_dataset(
         "onlineSync": _online_sync_manifest_summary(dataset_root),
         "qcChecks": [],
         "ikEvaluation": None,
+        "timestampSync": None,
     }
 
     meta = _load_processing_meta(dataset_root)
@@ -2121,9 +2145,20 @@ def _processing_item_from_dataset(
                 status = "qc_pass"
             elif qc_status in ("fail", "failed"):
                 status = "qc_failed"
+            elif qc_status == "warn":
+                # Its own state, not `pose_ready`. A QC that ran and warned is not a QC that has
+                # not run: the two used to be the same status, so a single warn removed the
+                # dataset from Dataset Export while the page still read "QC pending" -- an
+                # export blocked for a reason nobody was shown.
+                status = "qc_warn"
             else:
                 status = "pose_ready"
-            message = qc.get("reason") or qc.get("message") or "QC available"
+            message = (
+                qc.get("reason")
+                or qc.get("message")
+                or (_qc_warning_messages(qc)[0] if qc_status == "warn" else None)
+                or "QC available"
+            )
         elif version_info is not None:
             status = "pose_ready"
             message = "EE trajectory generated; QC pending"
@@ -2141,6 +2176,7 @@ def _processing_item_from_dataset(
             "logTail": list(current_job.get("log_tail") or []) if isinstance(current_job, dict) else [],
             "qcChecks": list(qc.get("checks") or []) if isinstance(qc, dict) else [],
             "ikEvaluation": qc.get("ik_evaluation") if isinstance(qc, dict) else None,
+            "timestampSync": qc.get("timestamp_sync") if isinstance(qc, dict) else None,
         }
 
     if not _dataset_data_files(dataset_root):
@@ -3581,6 +3617,9 @@ def _training_view_command(
         # have; the FR3 action already carries its own gripper.
         "--action-append-selectors", "",
         "--action-append-names", "",
+        # Explicit even though it is the script's default: this command is what the event log
+        # records, and "the reviewer's exclusions were applied" has to be visible there.
+        "--respect-annotations",
         "--overwrite-view",
         # Build the view only; training is a separate, deliberate step.
         "--prepare-only",
@@ -3604,6 +3643,13 @@ def _start_training_view(state: GatewayState, raw_path: str, action_mode: str) -
     if _dataset_kind(state, dataset_root) == "training_view":
         raise ValueError(f"{dataset_root.name} is already a training view; build from the recording instead.")
     command, view_root = _training_view_command(state, dataset_root, action_mode)
+    excluded = _annotation_excluded_episodes(dataset_root)
+    total_episodes = int(_processing_item_from_dataset(dataset_root).get("totalEpisodes") or 0)
+    if excluded and len(excluded) >= total_episodes > 0:
+        raise ValueError(
+            f"Every episode of {dataset_root.name} is marked as not for training; "
+            "there is nothing to build a view from."
+        )
     state.export_process = subprocess.Popen(
         command,
         cwd=state.repo_root,
@@ -3633,15 +3679,33 @@ def _start_training_view(state: GatewayState, raw_path: str, action_mode: str) -
     ).start()
 
 
-def _start_approved_dataset_export(state: GatewayState, raw_path: str) -> None:
+def _start_approved_dataset_export(
+    state: GatewayState, raw_path: str, *, acknowledge_warnings: bool = False
+) -> None:
     if _export_is_running(state):
         raise RuntimeError("An export is already running; wait for it to finish.")
     dataset_root = _resolve_known_dataset(state, raw_path)
     if dataset_root is None:
         raise ValueError("Dataset not found in the approved/candidate dataset list.")
     processing_item = _processing_item_from_dataset(dataset_root)
-    if processing_item.get("status") != "qc_pass":
-        raise ValueError("Dataset must pass QC before export.")
+    status = str(processing_item.get("status") or "")
+    warnings = _qc_warning_messages(processing_item)
+    if status == "qc_warn":
+        # A warning is a judgement call the operator is allowed to make, but only with the
+        # warnings in front of them -- the same rule the replay gate uses for a failed MuJoCo
+        # score. Silently blocking taught operators that Run QC breaks the export.
+        if not acknowledge_warnings:
+            raise ValueError(
+                "QC passed with warnings; confirm to export anyway. "
+                + (" | ".join(warnings) if warnings else "See the QC summary for details.")
+            )
+        state.log(
+            "warn",
+            f"Exporting {dataset_root.name} over {len(warnings)} QC warning(s): "
+            + (" | ".join(warnings) if warnings else "unspecified"),
+        )
+    elif status != "qc_pass":
+        raise ValueError(f"Dataset must pass QC before export (status: {status or 'unknown'}).")
     if not _has_gmsl2_episodes(dataset_root):
         if _has_lerobot_v3_data(dataset_root):
             _copy_approved_v3_dataset_export(state, dataset_root, processing_item)
@@ -3716,7 +3780,17 @@ def _training_view_completion_message(state: GatewayState) -> str | None:
     frames = int(manifest.get("total_rows") or state.dataset_export.totalFrames or 0)
     state.dataset_export.selectedEpisodes = episodes
     state.dataset_export.totalFrames = frames
-    return f"View ready: {episodes} episode(s) · {frames} frames · {contract}"
+    # Named in the completion line, not only in the manifest: a view with fewer episodes than the
+    # recording it came from has to say so where the operator is already looking.
+    dropped = sorted(
+        {
+            int(episode)
+            for excluded in (manifest.get("excluded_episodes") or {}).values()
+            for episode in excluded
+        }
+    )
+    excluded_note = f" · {len(dropped)} excluded by review {dropped}" if dropped else ""
+    return f"View ready: {episodes} episode(s) · {frames} frames · {contract}{excluded_note}"
 
 
 def _read_export_output(state: GatewayState, process: subprocess.Popen[str]) -> None:
@@ -3789,6 +3863,28 @@ def _dataset_task_prompt(dataset_root: Path, config: dict[str, Any]) -> str:
         except Exception:
             pass
     return str(_dataset_config(config).get("single_task") or "").strip()
+
+
+def _annotation_excluded_episodes(dataset_root: Path) -> list[int]:
+    """Episodes the operator marked as not for training, in view order.
+
+    The training-view builder reads the same store for itself, so this is what the *page* shows,
+    not what it enforces -- an exclusion the operator cannot see before pressing Build View is
+    how a training set quietly stops matching the recording it names.
+    """
+    store = _read_annotation_store(dataset_root)
+    annotations = store.get("annotations") if isinstance(store, dict) else None
+    if not isinstance(annotations, dict):
+        return []
+    excluded: set[int] = set()
+    for key, annotation in annotations.items():
+        if not isinstance(annotation, dict) or annotation.get("includeInTraining", True):
+            continue
+        try:
+            excluded.add(int(annotation.get("episode", key)))
+        except (TypeError, ValueError):
+            continue
+    return sorted(excluded)
 
 
 def _normalize_annotation(
@@ -3902,6 +3998,108 @@ def _save_annotation(state: GatewayState, payload: dict[str, Any]) -> None:
     store["updatedAt"] = annotation["updatedAt"]
     _write_annotation_store(dataset_root, store)
     state.log("info", f"Saved annotation for {dataset_root.name} episode {episode}")
+
+
+FR3_SYNC_REPORT_RELATIVE_PATH = Path("meta") / "fr3_sync_report.json"
+# The verdict rule changed in v3: it moved off the raw all-device spread (which is dominated by
+# the cameras' constant offset from the arm read and failed every hardware episode) onto the
+# within-group / residual / bias split. A v2 report's `status` therefore cannot be believed here.
+FR3_SYNC_REPORT_MIN_SCHEMA = 3
+
+
+def _fr3_sync_report_check(dataset_root: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Fold the timestamp-sync audit into QC, recomputing it when it is missing or stale.
+
+    QC used to be silent about alignment: a dataset whose cameras and arm disagreed still passed
+    every check here and reached Dataset Export, while the only verdict on it sat in a file the
+    export path never read. Recomputing rather than trusting a stale file matters for the same
+    reason -- an interrupted session never reaches ``finalize()``, so it has no report at all.
+
+    Returns ``(report, check)``. Both are ``None`` when there is nothing to judge (no
+    capture-timestamp column, or no numpy in this interpreter -- the Thor gateway runs a bare
+    system python and its datasets carry no such column anyway).
+    """
+    report_path = dataset_root / FR3_SYNC_REPORT_RELATIVE_PATH
+    report: dict[str, Any] | None = None
+    recomputed = False
+    if report_path.is_file():
+        try:
+            loaded = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = None
+        if isinstance(loaded, dict) and int(loaded.get("schema_version") or 0) >= FR3_SYNC_REPORT_MIN_SCHEMA:
+            report = loaded
+
+    if report is None:
+        try:
+            from tools.fr3.fr3_sync_audit import write_fr3_sync_report
+        except Exception:  # noqa: BLE001 - numpy is optional in the gateway's interpreter
+            return None, None
+        try:
+            report, _ = write_fr3_sync_report(
+                dataset_root,
+                # No sensor rate is available here -- a dataset records dataset.fps, not the
+                # camera's, and this gateway's config may not be the one that recorded it. The
+                # residual is measured and reported without a verdict rather than judged against
+                # a budget borrowed from another rig.
+                residual_tolerance_ms=None,
+            )
+        except Exception:  # noqa: BLE001 - a dataset without the column is not a QC failure
+            return None, None
+        recomputed = True
+
+    status = str(report.get("status") or "").lower()
+    failures = [str(item) for item in (report.get("failures") or [])]
+    source = "recomputed" if recomputed else "meta/fr3_sync_report.json"
+    if status == "pass":
+        message = f"capture timestamps within budget ({source})"
+    else:
+        message = failures[0] if failures else f"timestamp sync reported {status or 'no verdict'}"
+        if len(failures) > 1:
+            message = f"{message} (+{len(failures) - 1} more)"
+    return report, {
+        "name": "timestamp_sync",
+        "status": "pass" if status == "pass" else "fail",
+        "message": message,
+        "details": {
+            "clock_semantics": report.get("clock_semantics"),
+            "budgets_ms": (report.get("skew_evaluation") or {}).get("budgets_ms"),
+            "bias_ms": report.get("cross_modality_bias_ms"),
+            "failures": failures,
+        },
+    }
+
+
+def _timestamp_sync_summary(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The operator-facing digest of a sync report: budgets, what was measured, and the offsets.
+
+    The offsets are carried through deliberately. They are the reason the verdict is a three-way
+    split rather than one spread, so a panel that showed only pass/fail would hide the very
+    quantity that makes the verdict readable.
+    """
+    if not isinstance(report, dict):
+        return None
+    evaluation = report.get("skew_evaluation") if isinstance(report.get("skew_evaluation"), dict) else {}
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    within_group = evaluation.get("within_group") if isinstance(evaluation.get("within_group"), dict) else {}
+    residual = evaluation.get("residual") if isinstance(evaluation.get("residual"), dict) else {}
+    return {
+        "status": str(report.get("status") or "unknown"),
+        "clockSemantics": str(report.get("clock_semantics") or ""),
+        "totalFrames": int(report.get("total_frames") or 0),
+        "budgetsMs": evaluation.get("budgets_ms") or {},
+        "groupSkewP95Ms": max(
+            (float(entry.get("p95_ms") or 0.0) for entry in within_group.values()),
+            default=None,
+        ),
+        "groupSkewOverBudgetFrames": int(summary.get("within_group_skew_over_budget_frames") or 0),
+        "residualSkewP95Ms": float(residual.get("p95_ms")) if residual.get("p95_ms") is not None else None,
+        "residualSkewOverBudgetFrames": summary.get("residual_skew_over_budget_frames"),
+        "gridLagOverBudgetFrames": int(summary.get("global_lag_over_tolerance_frames") or 0),
+        "rawSkewP95Ms": float((evaluation.get("raw_all_device") or {}).get("p95_ms") or 0.0),
+        "biasMs": report.get("cross_modality_bias_ms") or {},
+        "failures": [str(item) for item in (report.get("failures") or [])],
+    }
 
 
 def _run_fr3_ik_qc(
@@ -4114,6 +4312,9 @@ def _run_qc(
     online_sync_summary, online_sync_check = _online_sync_manifest_check(dataset_root)
     if online_sync_check is not None:
         checks.append(online_sync_check)
+    sync_report, sync_check = _fr3_sync_report_check(dataset_root)
+    if sync_check is not None:
+        checks.append(sync_check)
     total_rows = 0
     invalid_rows = 0
     schema_failed_files = 0
@@ -4355,6 +4556,7 @@ def _run_qc(
         "summary": summary,
         "valid_frames_pct": round(valid_pct, 1),
         "checks": checks,
+        "timestamp_sync": _timestamp_sync_summary(sync_report),
         "online_sync": online_sync_summary,
         "ik_evaluation": ik_evaluation,
         "completed_at": _now_iso(),
@@ -4752,6 +4954,7 @@ def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
                 "dataStatus": _recorded_dataset_status(dataset_root),
                 "sourcePath": str(data_files[-1]) if data_files else "",
                 "isLatest": latest_recorded is not None and dataset_root == latest_recorded,
+                "excludedEpisodes": _annotation_excluded_episodes(dataset_root),
                 **_training_view_item_fields(dataset_root, dataset_kind),
             }
         )
@@ -10159,7 +10362,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                             or DEFAULT_TRAINING_VIEW_ACTION_MODE,
                         )
                     else:
-                        _start_approved_dataset_export(self.server.state, requested)
+                        _start_approved_dataset_export(
+                            self.server.state,
+                            requested,
+                            acknowledge_warnings=_query_flag(query, "acknowledge_warnings"),
+                        )
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
         except Exception as exc:  # noqa: BLE001

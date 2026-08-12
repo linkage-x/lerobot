@@ -77,10 +77,12 @@ from tools.fr3.fr3_record_runtime import (  # noqa: E402
     make_fr3_action_processors,
 )
 from tools.fr3.fr3_sync_audit import (  # noqa: E402
+    DEFAULT_BIAS_TOLERANCE_MS,
     DEFAULT_GLOBAL_LAG_TOLERANCE_MS,
     DEFAULT_TOLERANCE_MS,
     format_episode_sync_line,
     format_sync_summary_line,
+    residual_tolerance_for_camera_fps,
     summarize_episode_capture_timestamps,
     write_fr3_sync_report,
 )
@@ -206,9 +208,26 @@ def parse_runtime_args(argv: list[str] | None = None) -> tuple[argparse.Namespac
             "e.g. 'ee=ee_cam,side=external_cam'."
         ),
     )
-    arg_parser.add_argument("--sync-tolerance-ms", type=float, default=DEFAULT_TOLERANCE_MS)
+    arg_parser.add_argument(
+        "--sync-tolerance-ms",
+        type=float,
+        default=DEFAULT_TOLERANCE_MS,
+        help="Budget for skew within one modality group (the cameras against each other).",
+    )
     arg_parser.add_argument(
         "--sync-global-lag-tolerance-ms", type=float, default=DEFAULT_GLOBAL_LAG_TOLERANCE_MS
+    )
+    arg_parser.add_argument(
+        "--sync-residual-tolerance-ms",
+        type=float,
+        default=None,
+        help=(
+            "Budget for skew once each device's constant offset is removed. Derived from the "
+            "config's slowest camera rate when unset, because one sensor period is its floor."
+        ),
+    )
+    arg_parser.add_argument(
+        "--sync-bias-tolerance-ms", type=float, default=DEFAULT_BIAS_TOLERANCE_MS
     )
     arg_parser.add_argument(
         "--no-sync-audit",
@@ -387,6 +406,26 @@ def _assert_resumable_or_absent(dataset_root: str) -> bool:
     )
 
 
+def _slowest_camera_fps(cfg: RecordConfig) -> float | None:
+    """Frame rate of the slowest configured camera, which sets the residual-skew floor.
+
+    Read off the config rather than the dataset: ``dataset.fps`` is deliberately lower than the
+    sensor rate here (30 vs 60), and it is the *sensor* period a free-running camera's phase
+    wanders over.
+    """
+    cameras = getattr(getattr(cfg, "robot", None), "cameras", None) or {}
+    rates: list[float] = []
+    for camera in cameras.values():
+        fps = camera.get("fps") if isinstance(camera, dict) else getattr(camera, "fps", None)
+        try:
+            rate = float(fps)
+        except (TypeError, ValueError):
+            continue
+        if rate > 0:
+            rates.append(rate)
+    return min(rates) if rates else None
+
+
 def _audit_episode_buffer(
     dataset: LeRobotDataset,
     *,
@@ -394,6 +433,7 @@ def _audit_episode_buffer(
     clock_semantics: str,
     episode: int,
     runtime_args: argparse.Namespace,
+    residual_tolerance_ms: float | None,
 ) -> None:
     """Report per-modality alignment for the episode still sitting in the frame buffer."""
     if runtime_args.no_sync_audit or not device_names:
@@ -413,6 +453,8 @@ def _audit_episode_buffer(
             clock_semantics=clock_semantics,
             tolerance_ms=float(runtime_args.sync_tolerance_ms),
             global_lag_tolerance_ms=float(runtime_args.sync_global_lag_tolerance_ms),
+            residual_tolerance_ms=residual_tolerance_ms,
+            bias_tolerance_ms=float(runtime_args.sync_bias_tolerance_ms),
         )
     except Exception as exc:  # noqa: BLE001 - an audit failure must never lose the episode
         emit(f"SYNC audit unavailable: {exc}")
@@ -426,10 +468,15 @@ def _audit_episode_buffer(
         # whole recorder session failed and tear the process down mid-session.
         emit(
             f"SYNC WARN: episode {episode} alignment out of budget "
-            f"({summary['skew_over_tolerance_frames']} skew / "
+            f"({summary['within_group_skew_over_budget_frames']} group-skew / "
+            f"{summary['residual_skew_over_budget_frames'] or 0} residual / "
             f"{summary['global_lag_over_tolerance_frames']} grid-lag frames "
             f"of {summary['frames']})"
         )
+        # Each budgeted failure in its own words: the counts above say how many frames, not
+        # which measurement went out, and the operator has to fix the latter.
+        for failure in summary["failures"]:
+            emit(f"SYNC WARN: episode {episode}: {failure}")
         measured = float(summary["measured_frame_interval_ms"])
         nominal = float(summary["nominal_frame_interval_ms"])
         if summary["global_lag_over_tolerance_frames"] and nominal > 0 and measured > nominal * 1.05:
@@ -442,7 +489,12 @@ def _audit_episode_buffer(
             )
 
 
-def _write_dataset_sync_report(dataset_root: Path, runtime_args: argparse.Namespace) -> None:
+def _write_dataset_sync_report(
+    dataset_root: Path,
+    runtime_args: argparse.Namespace,
+    *,
+    residual_tolerance_ms: float | None,
+) -> None:
     """Persist the file-based audit once the parquet files are closed by ``finalize()``."""
     if runtime_args.no_sync_audit:
         return
@@ -451,6 +503,8 @@ def _write_dataset_sync_report(dataset_root: Path, runtime_args: argparse.Namesp
             dataset_root,
             tolerance_ms=float(runtime_args.sync_tolerance_ms),
             global_lag_tolerance_ms=float(runtime_args.sync_global_lag_tolerance_ms),
+            residual_tolerance_ms=residual_tolerance_ms,
+            bias_tolerance_ms=float(runtime_args.sync_bias_tolerance_ms),
         )
     except Exception as exc:  # noqa: BLE001 - a failed audit must not fail the session
         emit(f"SYNC audit unavailable: {exc}")
@@ -547,6 +601,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     # Declared, not guessed: the two backends put different meanings behind these timestamps
     # (hardware sensor/host reads vs. one shared physics instant), and the audit must say which.
     clock_semantics = "sim_extraction_wallclock" if backend == "sim" else "hardware_mixed"
+    # Derived once per session: the budget depends on the rig's sensor rate, and both the live
+    # per-episode verdict and the persisted report have to be judged against the same one.
+    residual_tolerance_ms = runtime_args.sync_residual_tolerance_ms
+    if residual_tolerance_ms is None:
+        residual_tolerance_ms = residual_tolerance_for_camera_fps(
+            _slowest_camera_fps(cfg),
+            within_group_tolerance_ms=float(runtime_args.sync_tolerance_ms),
+        )
 
     try:
         # Progress lines around each connect, because these are the calls that can block for a
@@ -645,6 +707,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         clock_semantics=clock_semantics,
                         episode=dataset.num_episodes,
                         runtime_args=runtime_args,
+                        residual_tolerance_ms=residual_tolerance_ms,
                     )
                     # parallel_encoding=False on purpose: the multi-camera path forks a
                     # ProcessPoolExecutor, and this process already holds the MuJoCo/EGL
@@ -672,7 +735,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         except Exception as exc:  # noqa: BLE001 - report, but still release the hardware below
             emit(f"ERROR: dataset finalize failed: {exc}")
         if finalized and dataset.num_episodes:
-            _write_dataset_sync_report(Path(dataset.root), runtime_args)
+            _write_dataset_sync_report(
+                Path(dataset.root), runtime_args, residual_tolerance_ms=residual_tolerance_ms
+            )
         if robot.is_connected:
             robot.disconnect()
         if teleop.is_connected:

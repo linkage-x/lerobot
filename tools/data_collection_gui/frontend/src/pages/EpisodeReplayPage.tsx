@@ -434,8 +434,19 @@ export function ReplayReadinessCard({
   const trajectoryReady =
     status.dataStatus === "loaded" &&
     (status.trajectoryKind === "pose" || status.trajectoryKind === "gripper_width") &&
-    (!processing || processing.status === "qc_pass" || processing.status === "pose_ready");
-  const qcLabel = !processing ? "—" : processing.status === "qc_pass" ? "Pass" : processing.status === "qc_failed" ? "Fail" : "Pending";
+    (!processing ||
+      processing.status === "qc_pass" ||
+      processing.status === "qc_warn" ||
+      processing.status === "pose_ready");
+  const qcLabel = !processing
+    ? "—"
+    : processing.status === "qc_pass"
+      ? "Pass"
+      : processing.status === "qc_warn"
+        ? "Warnings"
+        : processing.status === "qc_failed"
+          ? "Fail"
+          : "Pending";
   const validFrames = processing?.validFramesPct != null ? `${processing.validFramesPct}%` : "—";
 
   if (!trajectoryReady) {
@@ -673,7 +684,10 @@ export function EpisodeAnnotationPanel({
               type="checkbox"
               onChange={(event) => setDraft({ ...draft, includeInTraining: event.target.checked })}
             />
-            <span>Use for training</span>
+            <span>
+              Use for training
+              <small>unchecked: Build View leaves this episode out; the recording is untouched</small>
+            </span>
           </label>
           <label className="annotation-field">
             <span>Annotator</span>

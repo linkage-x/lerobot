@@ -205,17 +205,134 @@ def test_episode_summary_passes_for_tight_alignment():
     assert summary["measured_frame_interval_ms"] == pytest.approx(100.0, abs=1e-6)
 
 
-def test_episode_summary_flags_intra_frame_skew():
+HARDWARE_DEVICE_NAMES = [
+    "fr3.arm.capture_timestamp_s",
+    "pika_gripper.capture_timestamp_s",
+    "camera.ee.capture_timestamp_s",
+    "camera.side.capture_timestamp_s",
+]
+
+
+def _hardware_capture(
+    frames: int,
+    *,
+    interval_s: float = 0.1,
+    camera_offsets_s: tuple[float, float] = (-0.023, -0.023),
+    camera_drift_s: float = 0.0,
+) -> np.ndarray:
+    """Arm, gripper and two cameras, with the cameras behind the arm as they are on the rig."""
+    base = np.arange(frames, dtype=np.float64) * interval_s
+    drift = camera_drift_s * np.arange(frames, dtype=np.float64)
+    return np.stack(
+        [
+            base,
+            base + 0.002,
+            base + camera_offsets_s[0] + drift,
+            base + camera_offsets_s[1] + drift,
+        ],
+        axis=1,
+    )
+
+
+def test_episode_summary_does_not_fail_a_constant_cross_modality_offset():
+    """The regression this split exists for: 23 ms of camera lag is physics, not misalignment.
+
+    The old all-device spread called this out on 268 of 300 frames of a take whose cameras
+    agreed to 3.8 ms, i.e. it condemned every hardware episode ever recorded on this rig.
+    """
     frames = 20
     summary = fr3_sync_audit.summarize_episode_capture_timestamps(
-        capture_timestamps=_capture_timestamps(frames, skew_s=0.05, interval_s=0.1),
+        capture_timestamps=_hardware_capture(frames),
         frame_timestamps=np.arange(frames, dtype=np.float64) * 0.1,
-        device_names=DEVICE_NAMES,
+        device_names=HARDWARE_DEVICE_NAMES,
+        clock_semantics="hardware_mixed",
+        tolerance_ms=20.0,
+        residual_tolerance_ms=36.7,
+    )
+    assert summary["status"] == "pass"
+    # The offset is not hidden by passing: it is reported, in full, as what it is.
+    assert summary["cross_modality_bias_ms"]["camera.ee.capture_timestamp_s"] == pytest.approx(
+        -23.0, abs=1e-6
+    )
+    assert summary["max_skew_ms"] == pytest.approx(25.0, abs=1e-6)
+
+
+def test_episode_summary_flags_an_offset_past_the_bias_budget():
+    """Constant offsets are still budgeted -- a *changed* pipeline has to surface somewhere."""
+    frames = 20
+    summary = fr3_sync_audit.summarize_episode_capture_timestamps(
+        capture_timestamps=_hardware_capture(frames),
+        frame_timestamps=np.arange(frames, dtype=np.float64) * 0.1,
+        device_names=HARDWARE_DEVICE_NAMES,
+        clock_semantics="hardware_mixed",
+        tolerance_ms=20.0,
+        bias_tolerance_ms=20.0,
+    )
+    assert summary["status"] == "fail"
+    assert summary["skew_evaluation"]["bias_over_budget_devices"] == [
+        "camera.ee.capture_timestamp_s",
+        "camera.side.capture_timestamp_s",
+    ]
+
+
+def test_episode_summary_flags_cameras_that_disagree_with_each_other():
+    """Two cameras are meant to be simultaneous in absolute terms; 25 ms apart is a defect.
+
+    This is the shape of the handover-stamping bug: a D405 handed frames over 4.8 ms after
+    acquisition and a D435i 29.1 ms, putting a fabricated 24 ms between two views of one instant.
+    """
+    frames = 20
+    summary = fr3_sync_audit.summarize_episode_capture_timestamps(
+        capture_timestamps=_hardware_capture(frames, camera_offsets_s=(-0.005, -0.030)),
+        frame_timestamps=np.arange(frames, dtype=np.float64) * 0.1,
+        device_names=HARDWARE_DEVICE_NAMES,
         clock_semantics="hardware_mixed",
         tolerance_ms=20.0,
     )
     assert summary["status"] == "fail"
-    assert summary["skew_over_tolerance_frames"] == frames
+    assert summary["within_group_skew_over_budget_frames"] == frames
+    assert summary["skew_evaluation"]["within_group"]["camera"]["max_ms"] == pytest.approx(
+        25.0, abs=1e-6
+    )
+
+
+def test_episode_summary_flags_an_offset_that_drifts_inside_the_episode():
+    """A bias check cannot see drift; the bias-corrected residual is what catches it."""
+    frames = 40
+    capture = _hardware_capture(frames, camera_drift_s=0.002)
+    kwargs = {
+        "capture_timestamps": capture,
+        "frame_timestamps": np.arange(frames, dtype=np.float64) * 0.1,
+        "device_names": HARDWARE_DEVICE_NAMES,
+        "clock_semantics": "hardware_mixed",
+        "tolerance_ms": 20.0,
+    }
+
+    judged = fr3_sync_audit.summarize_episode_capture_timestamps(**kwargs, residual_tolerance_ms=36.7)
+    assert judged["status"] == "fail"
+    assert judged["residual_skew_over_budget_frames"] > 0
+    # The cameras drift together, so neither the within-group spread nor the median bias moves.
+    assert judged["within_group_skew_over_budget_frames"] == 0
+
+    # Without a rate to derive the floor from, the number is still measured and reported -- it
+    # just does not carry a verdict, rather than being judged against an invented threshold.
+    unjudged = fr3_sync_audit.summarize_episode_capture_timestamps(**kwargs)
+    assert unjudged["residual_skew_over_budget_frames"] is None
+    assert unjudged["residual_skew_p95_ms"] > 36.7
+
+
+def test_residual_budget_comes_from_the_configured_sensor_rate(tmp_path):
+    """The floor is one *sensor* period, and only the config knows it -- dataset.fps is lower."""
+    from tools.fr3.fr3_gui_record_runtime import _slowest_camera_fps
+
+    cfg = _record_config(tmp_path)  # cameras at 30 fps, dataset at 30 fps
+
+    assert _slowest_camera_fps(cfg) == pytest.approx(30.0)
+    assert fr3_sync_audit.residual_tolerance_for_camera_fps(30.0) == pytest.approx(53.33, abs=0.01)
+    # The shipped rig runs its cameras at 60 to halve how stale a recorded frame is.
+    assert fr3_sync_audit.residual_tolerance_for_camera_fps(60.0) == pytest.approx(36.67, abs=0.01)
+    # No rate, no verdict: reporting the number beats judging it against an invented threshold.
+    assert fr3_sync_audit.residual_tolerance_for_camera_fps(None) is None
 
 
 def test_episode_summary_flags_a_control_loop_that_cannot_hold_cadence():

@@ -121,3 +121,62 @@ def test_measured_interval_is_elapsed_time_not_the_median_gap():
 
     assert measured == pytest.approx((centres[-1] - centres[0]) / (len(centres) - 1), abs=1e-12)
     assert np.median(gaps) > measured + 0.001
+
+
+# ------------------------------------------------------------------- grouped skew ---
+
+GROUPS = {"arm": [0], "gripper": [1], "camera": [2, 3]}
+
+
+def test_a_constant_offset_lands_in_bias_and_leaves_no_residual():
+    """The split's whole purpose: a fixed pipeline delay is an offset, not a per-frame defect."""
+    capture, _ = _frames(40, camera_offset_s=0.025)
+
+    grouped = audit.compute_grouped_skew(capture, groups=GROUPS, reference_index=0, device_names=NAMES)
+
+    # Raw spread says ~25 ms every frame (the gripper sits 0.04 ms after the arm); the residual
+    # says the modalities are simultaneous once each one's own constant offset is accounted for.
+    assert np.allclose(np.max(capture, axis=1) - np.min(capture, axis=1), 0.02504, atol=1e-9)
+    assert np.allclose(grouped.residual_skew_s, 0.0, atol=1e-12)
+    assert grouped.device_bias_s[2] == pytest.approx(-0.025, abs=1e-12)
+    # The anchor is bias-free by construction, which is what makes the residual interpretable.
+    assert grouped.device_bias_s[0] == pytest.approx(0.0, abs=1e-12)
+    assert np.allclose(grouped.within_group_skew_s["camera"], 0.025 * 0.02, atol=1e-9)
+
+
+def test_residual_catches_an_offset_that_drifts_where_bias_cannot():
+    capture, _ = _frames(40, camera_offset_s=0.025)
+    capture[:, 2] += 0.001 * np.arange(40)  # one camera slides 1 ms per frame
+
+    grouped = audit.compute_grouped_skew(capture, groups=GROUPS, reference_index=0, device_names=NAMES)
+
+    # The median offset is still ~25 ms, so a bias check sees nothing; the residual sees it all.
+    assert grouped.device_bias_s[2] == pytest.approx(-0.025 + 0.001 * 19.5, abs=1e-3)
+    assert np.max(grouped.residual_skew_s) > 0.015
+
+
+def test_a_group_of_one_has_no_within_group_measurement():
+    """A lone device cannot disagree with itself; its alignment is a bias question."""
+    capture, _ = _frames(10, camera_offset_s=0.01)
+
+    grouped = audit.compute_grouped_skew(capture, groups=GROUPS, reference_index=0, device_names=NAMES)
+
+    assert set(grouped.within_group_skew_s) == {"camera"}
+
+
+def test_summary_reports_an_unjudged_residual_rather_than_inventing_a_budget():
+    capture, _ = _frames(20, camera_offset_s=0.025)
+    grouped = audit.compute_grouped_skew(capture, groups=GROUPS, reference_index=0, device_names=NAMES)
+
+    block = audit.summarize_grouped_skew(
+        grouped,
+        device_names=NAMES,
+        raw_max_skew_s=np.max(capture, axis=1) - np.min(capture, axis=1),
+        within_group_tolerance_ms=20.0,
+        residual_tolerance_ms=None,
+        bias_tolerance_ms=None,
+    )
+
+    assert block["residual"]["frames_over_budget"] is None
+    assert block["failures"] == []
+    assert block["raw_all_device"]["p50_ms"] == pytest.approx(25.04, abs=1e-6)

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { GuiSnapshot } from "../api";
 import type { RecordedDataset } from "../types";
-import { StatusDot, Metric, PageHeader, stateLabel, taskStatusDot } from "../shared/ui";
+import { StatusDot, Metric, PageHeader, qcWarnings, stateLabel, taskStatusDot } from "../shared/ui";
 
 type ActionMode = "absolute_ee" | "delta_ee_from_prev_cmd" | "delta_ee_from_current";
 
@@ -100,6 +100,8 @@ function TrainingViewPage({
             {datasets.map((dataset) => {
               const views = viewsFor(dataset);
               const buildingThis = building && exportStatus.datasetRoot === dataset.path;
+              const excluded = dataset.excludedEpisodes ?? [];
+              const kept = Math.max(0, dataset.totalEpisodes - excluded.length);
               return (
                 <div className="processing-row" key={dataset.path}>
                   <div className="processing-row-main static">
@@ -110,10 +112,20 @@ function TrainingViewPage({
                       <p>
                         {dataset.totalEpisodes} episode(s) · {dataset.totalFrames} frames · {dataset.path}
                       </p>
+                      {excluded.length > 0 ? (
+                        // Shown before the build, not after: this is the operator's own review
+                        // deciding what reaches training, and it changes what the button does.
+                        <p className="panel-note">
+                          {kept} of {dataset.totalEpisodes} will be built — episode
+                          {excluded.length > 1 ? "s" : ""} {excluded.join(", ")} marked not for
+                          training in Episode Replay.
+                        </p>
+                      ) : null}
                     </div>
                     <div className="processing-stats">
                       <button
-                        disabled={busy || building}
+                        disabled={busy || building || kept === 0}
+                        title={kept === 0 ? "Every episode is marked not for training" : undefined}
                         onClick={() => onBuildView(dataset.path, actionMode)}
                       >
                         {buildingThis ? "Building…" : "Build View"}
@@ -193,7 +205,11 @@ export function DatasetExportPage({
   onOpenReplay: (path: string) => void;
 }) {
   const exportStatus = snapshot.datasetExport;
-  const eligible = snapshot.processing.filter((item) => item.status === "qc_pass");
+  // A warned dataset is exportable, with the warnings acknowledged. Leaving it out of this list
+  // is what made a single warn look like "QC pending" and silently withdraw the dataset.
+  const eligible = snapshot.processing.filter(
+    (item) => item.status === "qc_pass" || item.status === "qc_warn"
+  );
   const hasEligible = eligible.length > 0;
   const exportableTasks = (snapshot.tasks ?? []).filter((t) => t.datasetRepoId);
   const exporting = exportStatus.state === "exporting";
@@ -273,30 +289,40 @@ export function DatasetExportPage({
         </div>
         {hasEligible ? (
           <div className="processing-list">
-            {eligible.map((item) => (
-              <div className="processing-row" key={item.path}>
-                <div className="processing-row-main static">
-                  <div>
-                    <div className="row-title">
-                      <StatusDot state="running" />
-                      <strong>{item.name}</strong>
-                      {item.trajectoryVersion ? <em>{item.trajectoryVersion}</em> : null}
+            {eligible.map((item) => {
+              const warnings = qcWarnings(item);
+              const warned = item.status === "qc_warn";
+              return (
+                <div className="processing-row" key={item.path}>
+                  <div className="processing-row-main static">
+                    <div>
+                      <div className="row-title">
+                        <StatusDot state={warned ? "warning" : "running"} />
+                        <strong>{item.name}</strong>
+                        {item.trajectoryVersion ? <em>{item.trajectoryVersion}</em> : null}
+                      </div>
+                      <p>{item.qcSummary}</p>
+                      {warned ? (
+                        <p className="panel-note">
+                          {warnings.length ? warnings.join(" · ") : item.message} — exporting asks for
+                          confirmation first.
+                        </p>
+                      ) : null}
                     </div>
-                    <p>{item.qcSummary}</p>
-                  </div>
-                  <div className="processing-stats">
-                    <span>{item.totalEpisodes} ep · {item.totalFrames} fr</span>
-                    <small>{item.updatedAt}</small>
-                    <button
-                      disabled={busy || exporting}
-                      onClick={() => onExportApprovedDataset(item.path)}
-                    >
-                      {exporting && exportStatus.datasetRoot === item.path ? "Exporting…" : "Export v3"}
-                    </button>
+                    <div className="processing-stats">
+                      <span>{item.totalEpisodes} ep · {item.totalFrames} fr</span>
+                      <small>{item.updatedAt}</small>
+                      <button
+                        disabled={busy || exporting}
+                        onClick={() => onExportApprovedDataset(item.path)}
+                      >
+                        {exporting && exportStatus.datasetRoot === item.path ? "Exporting…" : "Export v3"}
+                      </button>
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         ) : (
           <div className="empty-dataset-list">

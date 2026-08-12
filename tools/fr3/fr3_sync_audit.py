@@ -22,6 +22,30 @@ device's value entered the frame. This tool turns that column into a verdict: ar
 modalities inside one frame actually simultaneous, and does the frame as a whole sit on the
 dataset's nominal ``frame_index / fps`` grid?
 
+What the verdict rests on
+-------------------------
+Not on the spread across all four devices. That number is 27 ms on a *healthy* hardware episode
+here, because the cameras sit a constant 23 ms behind the arm read at 60 fps -- a frame already
+exists when the loop asks for it, while the arm is read on demand. Against the 20 ms budget it
+therefore failed 268 of 300 frames of a take with 3.8 ms of camera-to-camera skew and a cadence
+exact to 0.03%: a constant reported as a defect, on every episode, which is the same as no signal
+at all. ``status`` is instead the conjunction of four things, each with a budget it can actually
+meet (``skew_evaluation`` in the report carries all of them):
+
+- **within-group skew** -- the two cameras against each other, which is what
+  ``camera_max_skew_ms`` guards live. Measured p50 3.8 ms, max 8.3 ms (half a 60 fps period,
+  the floor anchoring imposes) against a 20 ms budget.
+- **bias-corrected residual skew** -- the spread once each device's own median offset is removed,
+  which catches an offset that *drifts* mid-session where a constant-bias check cannot. Measured
+  p95 12.8 ms, max 19.1 ms; its floor is one sensor period because nothing triggers the cameras.
+- **per-device bias** -- the offsets themselves, against a wide regression budget. Not a
+  correction: the offset is real, is reported, and is never subtracted from the data.
+- **grid lag** -- unchanged, and still anchored on the arm.
+
+The raw all-device spread stays in the report (``skew_evaluation.raw_all_device``, and the
+untouched ``summary.max_skew_s``) because it is the honest answer to "how far apart are these
+columns"; it is simply not a pass/fail question on a rig with real pipeline offsets.
+
 Clock semantics -- read this before interpreting the numbers
 ------------------------------------------------------------
 The two backends do not mean the same thing by "capture timestamp", and the report says which
@@ -71,6 +95,7 @@ replay run can be audited against the alignment that was actually achieved at ca
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 import json
 from pathlib import Path
 import sys
@@ -86,13 +111,23 @@ from tools.shared.capture_timestamp_audit import (  # noqa: E402
     DEFAULT_GLOBAL_LAG_TOLERANCE_MS,
     DEFAULT_TOLERANCE_MS,
     build_report as build_capture_timestamp_report,
+    capture_timestamp_names,
     compute_frame_metrics,
+    compute_grouped_skew,
+    load_dataset_info,
     measured_frame_interval_s,
     resolve_grid_lag_reference_index,
+    summarize_grouped_skew,
 )
 
 REPORT_RELATIVE_PATH = Path("meta") / "fr3_sync_report.json"
 CLOCK_SEMANTICS = ("hardware_mixed", "sim_extraction_wallclock")
+# How far a modality may sit from the arm read before the offset is treated as a regression
+# rather than as this rig's known pipeline delay. Measured here: cameras -23 ms at 60 fps,
+# -42 to -45 ms at 30 fps, gripper +2 ms. The budget is a tripwire for a *changed* pipeline (a
+# swapped camera, a stamping regression, a second clock spliced in), not a per-frame alignment
+# measure -- the offset itself is real and is never subtracted from the data.
+DEFAULT_BIAS_TOLERANCE_MS = 60.0
 # The FR3 arm is read on demand inside get_observation(), so its timestamp *is* the control
 # loop's tick -- which is what "did this frame land on the dataset's grid" asks about. Anchoring
 # the grid to it keeps honest camera latency out of the cadence measurement: with the median
@@ -116,6 +151,16 @@ def _classify_devices(names: list[str]) -> dict[str, list[str]]:
     return groups
 
 
+def _group_indices(names: Sequence[str]) -> dict[str, list[int]]:
+    """The same modality grouping as :func:`_classify_devices`, as column indices."""
+    position = {name: index for index, name in enumerate(names)}
+    return {
+        group: [position[member] for member in members]
+        for group, members in _classify_devices(list(names)).items()
+        if members
+    }
+
+
 def _infer_clock_semantics(dataset_root: Path, names: list[str]) -> str:
     """Decide which clock produced these timestamps, from the dataset itself.
 
@@ -136,27 +181,26 @@ def _infer_clock_semantics(dataset_root: Path, names: list[str]) -> str:
     return "hardware_mixed"
 
 
-def _cross_modality_bias_ms(report: dict[str, Any], groups: dict[str, list[str]]) -> dict[str, float]:
-    """Median lag of each modality relative to the arm read, in milliseconds.
+def residual_tolerance_for_camera_fps(
+    camera_fps: float | None,
+    *,
+    within_group_tolerance_ms: float = DEFAULT_TOLERANCE_MS,
+) -> float | None:
+    """Budget for bias-corrected skew on a rig whose cameras free-run, or ``None`` if unknown.
 
-    A constant bias here is a fixed pipeline offset (exposure/readout, driver handover), not a
-    per-episode alignment failure -- it is reported so it can be characterised, never
-    subtracted silently.
+    Nothing triggers these sensors, so a camera's acquisition instant sits at an arbitrary phase
+    inside its own frame period relative to the loop tick, and that phase lands entirely in the
+    residual. One full period is therefore the physical floor, and the within-group budget on top
+    is the same allowance the cameras already get against each other. At 60 fps that is 36.7 ms,
+    against a measured worst case of 19.1 ms on a healthy hardware episode.
+
+    A dataset does not record the sensor rate -- only the rig's config knows it, because
+    ``dataset.fps`` is deliberately lower -- so a caller without the config gets ``None`` and the
+    residual is reported without a verdict rather than judged against an invented threshold.
     """
-    per_device = report.get("per_device_lag_s", {})
-    arm_names = groups["arm"]
-    if not arm_names:
-        return {}
-    arm_reference = per_device.get(arm_names[0], {}).get("p50")
-    if arm_reference is None:
-        return {}
-    bias: dict[str, float] = {}
-    for name, stats in per_device.items():
-        median = stats.get("p50")
-        if median is None or not np.isfinite(median):
-            continue
-        bias[name] = float((median - arm_reference) * 1e3)
-    return bias
+    if not camera_fps or float(camera_fps) <= 0.0:
+        return None
+    return 1000.0 / float(camera_fps) + within_group_tolerance_ms
 
 
 def summarize_episode_capture_timestamps(
@@ -167,6 +211,8 @@ def summarize_episode_capture_timestamps(
     clock_semantics: str,
     tolerance_ms: float = DEFAULT_TOLERANCE_MS,
     global_lag_tolerance_ms: float = DEFAULT_GLOBAL_LAG_TOLERANCE_MS,
+    residual_tolerance_ms: float | None = None,
+    bias_tolerance_ms: float | None = DEFAULT_BIAS_TOLERANCE_MS,
 ) -> dict[str, Any]:
     """Audit one episode straight from the in-memory frame buffer.
 
@@ -185,12 +231,11 @@ def summarize_episode_capture_timestamps(
 
     # Same measurement the finalized report runs, so the live verdict and the persisted one
     # cannot disagree about a single episode.
+    reference_index = resolve_grid_lag_reference_index(device_names, GRID_LAG_REFERENCE_PREFIXES)
     metrics = compute_frame_metrics(
         capture_timestamps,
         frame_timestamps,
-        grid_lag_reference_index=resolve_grid_lag_reference_index(
-            device_names, GRID_LAG_REFERENCE_PREFIXES
-        ),
+        grid_lag_reference_index=reference_index,
     )
     frames = int(capture_timestamps.shape[0])
     finite_mask = metrics.finite_mask
@@ -218,13 +263,35 @@ def summarize_episode_capture_timestamps(
     measured_intervals_s = np.diff(frame_centres_s) if frame_centres_s.size > 1 else np.array([])
     measured_interval_s = measured_frame_interval_s(capture_timestamps)
 
-    arm_index = next((i for i, name in enumerate(device_names) if name.startswith("fr3.arm.")), None)
-    bias_ms: dict[str, float] = {}
-    if arm_index is not None and finite_mask.any():
-        device_lag = capture_timestamps - frame_timestamps[:, None]
-        arm_median = _stat(device_lag[:, arm_index], np.median)
-        for index, name in enumerate(device_names):
-            bias_ms[name] = (_stat(device_lag[:, index], np.median) - arm_median) * 1e3
+    # The same three-way split the persisted report is judged on. Judging the live episode on the
+    # raw all-device spread instead would fail every hardware take: that spread is dominated by
+    # the cameras' constant 23 ms offset from the arm read, which is physics, not misalignment.
+    grouped = compute_grouped_skew(
+        capture_timestamps,
+        groups=_group_indices(device_names),
+        reference_index=reference_index,
+        device_names=device_names,
+    )
+    skew_evaluation = summarize_grouped_skew(
+        grouped,
+        device_names=device_names,
+        raw_max_skew_s=max_skew_s,
+        within_group_tolerance_ms=tolerance_ms,
+        residual_tolerance_ms=residual_tolerance_ms,
+        bias_tolerance_ms=bias_tolerance_ms,
+    )
+    within_group_bad = sum(
+        int(entry["frames_over_budget"]) for entry in skew_evaluation["within_group"].values()
+    )
+
+    failures = list(skew_evaluation["failures"])
+    if nonfinite_frames:
+        failures.append(f"{nonfinite_frames} frame(s) have a non-finite capture timestamp")
+    if lag_bad:
+        failures.append(
+            f"{lag_bad}/{frames} frame(s) drift more than {global_lag_tolerance_ms:.1f} ms "
+            "from the nominal frame grid"
+        )
 
     return {
         "clock_semantics": clock_semantics,
@@ -232,30 +299,57 @@ def summarize_episode_capture_timestamps(
         "device_capture_timestamp_names": list(device_names),
         "nonfinite_capture_timestamp_frames": nonfinite_frames,
         "skew_over_tolerance_frames": skew_bad,
+        "within_group_skew_over_budget_frames": within_group_bad,
+        "residual_skew_over_budget_frames": skew_evaluation["residual"]["frames_over_budget"],
         "global_lag_over_tolerance_frames": lag_bad,
         "max_skew_ms": _stat(max_skew_s, np.max) * 1e3,
         "p95_skew_ms": _stat(max_skew_s, lambda v: np.percentile(v, 95)) * 1e3,
+        "within_group_skew_p95_ms": _stat(
+            grouped.worst_within_group_skew_s, lambda v: np.percentile(v, 95)
+        )
+        * 1e3,
+        "residual_skew_p95_ms": _stat(grouped.residual_skew_s, lambda v: np.percentile(v, 95)) * 1e3,
         "grid_lag_p95_ms": _stat(np.abs(grid_lag_s), lambda v: np.percentile(v, 95)) * 1e3,
         "nominal_frame_interval_ms": nominal_interval_s * 1e3,
         "measured_frame_interval_ms": measured_interval_s * 1e3,
         "measured_frame_interval_p95_ms": (
             float(np.percentile(measured_intervals_s, 95)) * 1e3 if measured_intervals_s.size else 0.0
         ),
-        "cross_modality_bias_ms": bias_ms,
-        "limits": {"max_skew_ms": tolerance_ms, "abs_global_lag_ms": global_lag_tolerance_ms},
-        "status": "pass" if not (nonfinite_frames or skew_bad or lag_bad) else "fail",
+        # Bias against the arm read, from the median of the per-frame differences rather than a
+        # difference of medians, so the live number and the report's are the same quantity.
+        "cross_modality_bias_ms": dict(skew_evaluation["bias_ms"]),
+        "skew_evaluation": skew_evaluation,
+        "limits": {
+            "within_group_skew_ms": tolerance_ms,
+            "residual_skew_ms": residual_tolerance_ms,
+            "bias_ms": bias_tolerance_ms,
+            "abs_global_lag_ms": global_lag_tolerance_ms,
+        },
+        "failures": failures,
+        "status": "pass" if not failures else "fail",
     }
 
 
 def format_episode_sync_line(summary: dict[str, Any], *, episode: int) -> str:
+    """One line per saved episode. The budgeted quantities lead; the raw spread trails as context.
+
+    ``skew_max_ms`` is deliberately last and named ``raw_``: it is the all-device spread, which on
+    this rig is 27 ms of constant camera offset on a perfectly aligned episode. Leading with it
+    trained the operator to ignore the line.
+    """
+    residual_bad = summary.get("residual_skew_over_budget_frames")
     return (
         f"episode={episode} status={summary['status']} clock={summary['clock_semantics']} "
-        f"frames={summary['frames']} skew_p95_ms={summary['p95_skew_ms']:.2f} "
-        f"skew_max_ms={summary['max_skew_ms']:.2f} grid_lag_p95_ms={summary['grid_lag_p95_ms']:.2f} "
+        f"frames={summary['frames']} "
+        f"group_skew_p95_ms={summary['within_group_skew_p95_ms']:.2f} "
+        f"residual_skew_p95_ms={summary['residual_skew_p95_ms']:.2f} "
+        f"grid_lag_p95_ms={summary['grid_lag_p95_ms']:.2f} "
         f"interval_ms={summary['measured_frame_interval_ms']:.1f}"
         f"/{summary['nominal_frame_interval_ms']:.1f}nominal "
-        f"bad_skew_frames={summary['skew_over_tolerance_frames']} "
-        f"bad_lag_frames={summary['global_lag_over_tolerance_frames']}"
+        f"bad_group_skew_frames={summary['within_group_skew_over_budget_frames']} "
+        f"bad_residual_frames={'n/a' if residual_bad is None else residual_bad} "
+        f"bad_lag_frames={summary['global_lag_over_tolerance_frames']} "
+        f"raw_skew_p95_ms={summary['p95_skew_ms']:.2f}"
     )
 
 
@@ -264,7 +358,19 @@ def build_fr3_sync_report(
     dataset_root: Path,
     tolerance_ms: float = DEFAULT_TOLERANCE_MS,
     global_lag_tolerance_ms: float = DEFAULT_GLOBAL_LAG_TOLERANCE_MS,
+    residual_tolerance_ms: float | None = None,
+    bias_tolerance_ms: float | None = DEFAULT_BIAS_TOLERANCE_MS,
 ) -> dict[str, Any]:
+    """Audit a finalized FR3 dataset and phrase the verdict.
+
+    ``tolerance_ms`` budgets the spread *within* a modality group (the two cameras), not the
+    spread across all devices: see :class:`~tools.shared.capture_timestamp_audit.GroupedSkewMetrics`
+    for why the latter cannot be a verdict on this rig. ``residual_tolerance_ms`` is best obtained
+    from :func:`residual_tolerance_for_camera_fps`; left at ``None`` the residual is measured and
+    reported but not judged.
+    """
+    names = capture_timestamp_names(load_dataset_info(dataset_root))
+    groups = _classify_devices(names)
     report = build_capture_timestamp_report(
         dataset_root=dataset_root,
         tolerance_ms=tolerance_ms,
@@ -275,37 +381,37 @@ def build_fr3_sync_report(
         # persisted report has to carry it too or the two describe one episode differently --
         # which is exactly what happened before the split (13.49 live against -3.75 on file).
         report_absolute_grid_lag=True,
+        device_groups=groups,
+        residual_tolerance_ms=residual_tolerance_ms,
+        bias_tolerance_ms=bias_tolerance_ms,
     )
-    names = list(report["device_capture_timestamp_names"])
-    groups = _classify_devices(names)
     clock_semantics = _infer_clock_semantics(dataset_root, names)
 
     summary = report["summary"]
     frames = int(report["total_frames"])
-    skew_bad = int(summary["skew_over_tolerance_frames"])
     lag_bad = int(summary["global_lag_over_tolerance_frames"])
     nonfinite = int(summary["nonfinite_capture_timestamp_frames"])
+    skew_evaluation = report.get("skew_evaluation") or {"failures": []}
 
     failures: list[str] = []
     if frames == 0:
         failures.append("dataset contains no frames")
     if nonfinite:
         failures.append(f"{nonfinite} frame(s) have a non-finite capture timestamp")
-    if skew_bad:
-        failures.append(
-            f"{skew_bad}/{frames} frame(s) exceed the {tolerance_ms:.1f} ms intra-frame skew budget"
-        )
+    failures.extend(str(failure) for failure in skew_evaluation.get("failures", []))
     if lag_bad:
         failures.append(
             f"{lag_bad}/{frames} frame(s) drift more than {global_lag_tolerance_ms:.1f} ms "
             "from the nominal frame grid"
         )
 
-    report["schema_version"] = 2
+    # v3: the verdict moved off the raw all-device spread onto the within-group / residual / bias
+    # split. A v2 reader looking at `status` would call every hardware episode failed.
+    report["schema_version"] = 3
     report["report_kind"] = "fr3_sync_audit"
     report["clock_semantics"] = clock_semantics
     report["device_groups"] = groups
-    report["cross_modality_bias_ms"] = _cross_modality_bias_ms(report, groups)
+    report["cross_modality_bias_ms"] = dict(skew_evaluation.get("bias_ms") or {})
     report["status"] = "pass" if not failures else "fail"
     report["failures"] = failures
     if clock_semantics == "sim_extraction_wallclock":
@@ -323,7 +429,9 @@ def build_fr3_sync_report(
             "by construction -- the arm is read on demand, a frame already exists when asked "
             "for -- which measures 42-45 ms at 30 fps on this rig and halves at 60 fps. A "
             "constant camera-vs-arm bias is a real image-vs-state offset and is reported, not "
-            "corrected."
+            "corrected, so the verdict rests on skew *within* a modality group, on skew after "
+            "each device's constant offset is removed, and on the offsets themselves against a "
+            "regression budget -- see skew_evaluation."
         )
     return report
 
@@ -333,12 +441,16 @@ def write_fr3_sync_report(
     *,
     tolerance_ms: float = DEFAULT_TOLERANCE_MS,
     global_lag_tolerance_ms: float = DEFAULT_GLOBAL_LAG_TOLERANCE_MS,
+    residual_tolerance_ms: float | None = None,
+    bias_tolerance_ms: float | None = DEFAULT_BIAS_TOLERANCE_MS,
     output_path: Path | None = None,
 ) -> tuple[dict[str, Any], Path]:
     report = build_fr3_sync_report(
         dataset_root=dataset_root,
         tolerance_ms=tolerance_ms,
         global_lag_tolerance_ms=global_lag_tolerance_ms,
+        residual_tolerance_ms=residual_tolerance_ms,
+        bias_tolerance_ms=bias_tolerance_ms,
     )
     destination = output_path if output_path is not None else dataset_root / REPORT_RELATIVE_PATH
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -349,18 +461,22 @@ def write_fr3_sync_report(
 def format_sync_summary_line(report: dict[str, Any]) -> str:
     """One-line digest for the recorder's stdout protocol / gateway event log."""
     summary = report["summary"]
-    max_skew_ms = float(summary["max_skew_s"]["max"] or 0.0) * 1e3
     p95_skew_ms = float(summary["max_skew_s"]["p95"] or 0.0) * 1e3
+    group_p95_ms = float((summary.get("within_group_skew_s") or {}).get("p95") or 0.0) * 1e3
+    residual_p95_ms = float((summary.get("residual_skew_s") or {}).get("p95") or 0.0) * 1e3
+    residual_bad = summary.get("residual_skew_over_budget_frames")
     # |grid lag|, matching the live per-episode line. The signed p95 reads low whenever the lag
     # swings both ways, so the two lines used to disagree about the same episode.
     lag_p95_ms = float(summary["abs_global_lag_s"]["p95"] or 0.0) * 1e3
     return (
         f"status={report['status']} clock={report['clock_semantics']} "
         f"frames={report['total_frames']} devices={len(report['device_capture_timestamp_names'])} "
-        f"skew_p95_ms={p95_skew_ms:.2f} skew_max_ms={max_skew_ms:.2f} "
+        f"group_skew_p95_ms={group_p95_ms:.2f} residual_skew_p95_ms={residual_p95_ms:.2f} "
         f"grid_lag_p95_ms={lag_p95_ms:.2f} "
-        f"bad_skew_frames={summary['skew_over_tolerance_frames']} "
-        f"bad_lag_frames={summary['global_lag_over_tolerance_frames']}"
+        f"bad_group_skew_frames={summary.get('within_group_skew_over_budget_frames', 0)} "
+        f"bad_residual_frames={'n/a' if residual_bad is None else residual_bad} "
+        f"bad_lag_frames={summary['global_lag_over_tolerance_frames']} "
+        f"raw_skew_p95_ms={p95_skew_ms:.2f}"
     )
 
 
@@ -375,8 +491,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=f"Report path. Defaults to <dataset>/{REPORT_RELATIVE_PATH.as_posix()}.",
     )
-    parser.add_argument("--tolerance-ms", type=float, default=DEFAULT_TOLERANCE_MS)
+    parser.add_argument(
+        "--tolerance-ms",
+        type=float,
+        default=DEFAULT_TOLERANCE_MS,
+        help="Budget for skew *within* a modality group (the cameras against each other).",
+    )
     parser.add_argument("--global-lag-tolerance-ms", type=float, default=DEFAULT_GLOBAL_LAG_TOLERANCE_MS)
+    parser.add_argument(
+        "--camera-fps",
+        type=float,
+        default=None,
+        help=(
+            "Sensor rate of the slowest camera, used to derive the bias-corrected skew budget "
+            "(one frame period is its physical floor). Datasets do not record it."
+        ),
+    )
+    parser.add_argument(
+        "--residual-tolerance-ms",
+        type=float,
+        default=None,
+        help=(
+            "Budget for skew after each device's constant offset is removed. Overrides "
+            "--camera-fps; without either, the residual is reported but not judged."
+        ),
+    )
+    parser.add_argument(
+        "--bias-tolerance-ms",
+        type=float,
+        default=DEFAULT_BIAS_TOLERANCE_MS,
+        help="How far a device may sit from the arm read before it counts as a regression.",
+    )
     parser.add_argument(
         "--fail-on-violation",
         action="store_true",
@@ -389,10 +534,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.tolerance_ms < 0 or args.global_lag_tolerance_ms < 0:
         raise ValueError("tolerances must be >= 0.")
+    residual_tolerance_ms = args.residual_tolerance_ms
+    if residual_tolerance_ms is None:
+        residual_tolerance_ms = residual_tolerance_for_camera_fps(
+            args.camera_fps, within_group_tolerance_ms=args.tolerance_ms
+        )
     report, destination = write_fr3_sync_report(
         args.dataset.resolve(),
         tolerance_ms=args.tolerance_ms,
         global_lag_tolerance_ms=args.global_lag_tolerance_ms,
+        residual_tolerance_ms=residual_tolerance_ms,
+        bias_tolerance_ms=args.bias_tolerance_ms,
         output_path=args.output,
     )
     print(f"fr3_sync_report={destination}")

@@ -948,12 +948,23 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async exportApprovedDataset(path: string, actionMode?: string): Promise<GuiSnapshot> {
+  async exportApprovedDataset(
+    path: string,
+    actionMode?: string,
+    acknowledgeWarnings = false
+  ): Promise<GuiSnapshot> {
     // The workstation profile reuses this endpoint to build a training view, and picks the
     // action contract with actionMode; Thor sends none and gets the raw->v3 consolidation.
-    const query = actionMode
-      ? `?path=${encodeURIComponent(path)}&action_mode=${encodeURIComponent(actionMode)}`
-      : `?path=${encodeURIComponent(path)}`;
+    const params = new URLSearchParams({ path });
+    if (actionMode) {
+      params.set("action_mode", actionMode);
+    }
+    if (acknowledgeWarnings) {
+      // The gateway refuses a QC-warned dataset without this, so the operator sees the warnings
+      // before they decide rather than finding an unexplained absence in this list.
+      params.set("acknowledge_warnings", "1");
+    }
+    const query = `?${params.toString()}`;
     const remote = await this.postRemoteSnapshot(`/api/datasets/export${query}`);
     if (remote) {
       return remote;

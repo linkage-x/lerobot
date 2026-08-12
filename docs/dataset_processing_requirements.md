@@ -37,6 +37,7 @@ type ProcessingStatus =
   | "queued"         // 任务排队中
   | "running"        // 后台任务进行中
   | "pose_ready"     // EE 轨迹生成完毕，等待 QC
+  | "qc_warn"        // QC 跑完、只有 warn 没有 fail：可导出，但导出前须显式确认
   | "qc_pass"        // QC 通过，可被 Dataset Export 消费
   | "qc_failed"      // QC 失败，需修复或重跑
   | "error";         // 任务执行失败
@@ -121,6 +122,13 @@ type ProcessingItem = {
 6. 触觉/Soft sync 字段（如存在）：值域合理、无掉帧丢失。
 
 每条检查产出 `{ name, severity, status: "pass"|"warn"|"fail", value, threshold, message }`。整条 dataset 的 status 取最严重等级。
+
+**warn 必须是自己的状态（`qc_warn`），不能并进 `pose_ready`。** 曾经是并进去的：只要有一条 warn，
+dataset 就从 Dataset Export 列表里消失，而 Processing 页显示的却是「等待 QC」——导出被挡住，理由却
+没人看得见，操作者学到的结论是「跑 QC 会弄坏导出」。现在 `qc_warn` 可导出，但 gateway 会拒绝没有
+`acknowledge_warnings=1` 的请求，前端据此弹确认框把每条 warn 原文列出来；确认后放行，并把「越过了哪
+几条 warn」写进事件日志。判据同 replay 的 MuJoCo 门：跑过并失败的校验可以在把错误摆到眼前的确认框里
+被越过，没跑过的不行。
 
 输出：
 

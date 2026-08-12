@@ -142,8 +142,16 @@ export const processingStatusLabel: Record<ProcessingStatus, string> = {
   queued: "Queued",
   running: "Running",
   pose_ready: "Pose ready",
+  qc_warn: "QC warnings",
   qc_pass: "QC pass",
   qc_failed: "QC failed",
   error: "Error"
 };
+
+/** The warnings a QC run raised, as the export confirmation has to list them. */
+export function qcWarnings(item: ProcessingItem): string[] {
+  return (item.qcChecks ?? [])
+    .filter((check) => check.status === "warn")
+    .map((check) => `${check.name}: ${check.message}`);
+}
 

@@ -321,6 +321,62 @@ def resize_camera_feature(feature: dict[str, Any], image_resize_shape: list[int]
     return resized
 
 
+ANNOTATION_STORE_RELATIVE_PATH = Path("meta") / "gui_annotations.json"
+
+
+def annotated_excluded_episodes(dataset_root: Path) -> set[int]:
+    """Episodes the operator marked *not* for training, from the GUI's annotation store.
+
+    Read here rather than passed in as a list, so the Episode Replay checkbox and a command-line
+    build reach the same answer. It used to be neither: the flag was written to
+    ``meta/gui_annotations.json`` and nothing downstream ever read it, which made "exclude from
+    training" a note to oneself -- the only way to actually drop an episode was to delete it.
+    """
+    store_path = dataset_root / ANNOTATION_STORE_RELATIVE_PATH
+    if not store_path.is_file():
+        return set()
+    try:
+        store = json.loads(store_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{store_path} is unreadable: {exc}") from exc
+    annotations = store.get("annotations") if isinstance(store, dict) else None
+    if not isinstance(annotations, dict):
+        return set()
+    excluded: set[int] = set()
+    for key, annotation in annotations.items():
+        if not isinstance(annotation, dict):
+            continue
+        if annotation.get("includeInTraining", True):
+            continue
+        try:
+            excluded.add(int(annotation.get("episode", key)))
+        except (TypeError, ValueError):
+            continue
+    return excluded
+
+
+def resolve_excluded_episodes(
+    src_roots: list[Path],
+    *,
+    explicit: set[int] | None,
+    respect_annotations: bool,
+) -> dict[Path, set[int]]:
+    """Per-source-root exclusion sets, from the annotation store and the explicit flag."""
+    if explicit and len(src_roots) > 1:
+        raise ValueError(
+            "--exclude-episodes names episode indices of one dataset, but this build has "
+            f"{len(src_roots)} source roots. Mark the episodes in the GUI instead, which records "
+            "the choice per dataset."
+        )
+    excluded: dict[Path, set[int]] = {}
+    for root in src_roots:
+        root_excluded = set(explicit or ())
+        if respect_annotations:
+            root_excluded |= annotated_excluded_episodes(root)
+        excluded[root] = root_excluded
+    return excluded
+
+
 def prepare_dataset_view(
     *,
     src_root: Path,
@@ -337,8 +393,13 @@ def prepare_dataset_view(
     copy_videos: bool,
     overwrite: bool,
     action_mode: str = ACTION_MODE_ABSOLUTE_EE,
+    exclude_episodes: set[int] | None = None,
+    respect_annotations: bool = True,
 ) -> None:
     src_roots = discover_dataset_roots(src_root)
+    excluded_by_root = resolve_excluded_episodes(
+        src_roots, explicit=exclude_episodes, respect_annotations=respect_annotations
+    )
     if overwrite and dst_root.exists():
         shutil.rmtree(dst_root)
     if dst_root.exists():
@@ -424,7 +485,11 @@ def prepare_dataset_view(
     source_episodes: list[pd.DataFrame] = []
     source_file_maps: list[dict[tuple[int, int], tuple[int, int]]] = []
     source_frame_offsets: list[int] = []
-    source_episode_offsets: list[int] = []
+    # Source episode index -> index in this view, per source root. Excluded episodes are absent,
+    # and the survivors are renumbered contiguously: LeRobot addresses episodes by position
+    # (`splits: 0:N`, one meta/episodes row each), so a gap would be a dataset that claims
+    # episodes it does not have.
+    source_episode_maps: list[dict[int, int]] = []
     total_rows = 0
     total_episodes = 0
 
@@ -436,10 +501,31 @@ def prepare_dataset_view(
         if not episodes_files:
             raise FileNotFoundError(f"No episode metadata files found under {root / 'meta/episodes'}")
         episodes = pd.concat([pq.read_table(path).to_pandas() for path in episodes_files], ignore_index=True)
+        # Physical row order, which is what the re-counted dataset_from/to_index below assume.
+        # It is normally episode order too, but that is a convention, not a guarantee.
+        episodes = episodes.sort_values("dataset_from_index").reset_index(drop=True)
+
+        excluded = excluded_by_root.get(root, set())
+        unknown = sorted(excluded - {int(index) for index in episodes["episode_index"]})
+        if unknown:
+            raise ValueError(f"{root} has no episode(s) {unknown} to exclude.")
+        if excluded:
+            # Keep source order: the rows are laid out that way in the parquet files, and the new
+            # dataset_from/to_index below count through them in exactly that order.
+            episodes = episodes[~episodes["episode_index"].isin(excluded)].reset_index(drop=True)
+            print(f"[prepare] excluding {len(excluded)} episode(s) from {root.name}: {sorted(excluded)}")
+        if episodes.empty:
+            raise ValueError(f"Every episode of {root} is excluded; there is nothing to build.")
+
         source_data_files.append(data_files)
         source_episodes.append(episodes)
         source_frame_offsets.append(total_rows)
-        source_episode_offsets.append(total_episodes)
+        source_episode_maps.append(
+            {
+                int(source_index): total_episodes + position
+                for position, source_index in enumerate(episodes["episode_index"])
+            }
+        )
         file_map: dict[tuple[int, int], tuple[int, int]] = {}
         for src_file in data_files:
             old_pair = chunk_file_from_path(src_file.relative_to(root))
@@ -477,9 +563,12 @@ def prepare_dataset_view(
         features = source_infos[source_idx]["features"]
         file_map = source_file_maps[source_idx]
         frame_offset = source_frame_offsets[source_idx]
-        episode_offset = source_episode_offsets[source_idx]
+        episode_map = source_episode_maps[source_idx]
         task_index_map = task_index_maps[source_idx]
-        source_processed_rows = 0
+        # Rows read from this source (which indexes --action-npy, written for the *source*) and
+        # rows actually written (which numbers the view). Exclusions make the two diverge.
+        source_read_rows = 0
+        source_written_rows = 0
 
         source_action_npy = action_npy
         if source_action_npy is not None and not source_action_npy.is_absolute():
@@ -496,12 +585,26 @@ def prepare_dataset_view(
             )
             dst_file.parent.mkdir(parents=True, exist_ok=True)
 
-            df = pq.read_table(src_file).to_pandas()
+            source_df = pq.read_table(src_file).to_pandas()
+            # Excluded rows are dropped before anything is derived from them: a delta computed
+            # across the seam of a removed episode would be an operator command that never
+            # happened, and the statistics would describe frames the view does not contain.
+            keep_mask = source_df["episode_index"].isin(episode_map).to_numpy()
+            df = source_df[keep_mask].reset_index(drop=True)
+            file_source_rows = len(source_df)
+            if df.empty:
+                # Every episode in this file was excluded. The video file it maps to stays
+                # symlinked and unreferenced, which costs nothing and keeps file numbering stable.
+                source_read_rows += file_source_rows
+                continue
+
             out = pd.DataFrame()
             out["timestamp"] = df["timestamp"]
             out["frame_index"] = df["frame_index"]
-            out["episode_index"] = df["episode_index"] + episode_offset
-            out["index"] = df["index"] + frame_offset
+            out["episode_index"] = df["episode_index"].map(episode_map).astype(source_df["episode_index"].dtype)
+            # Renumbered rather than offset: `index` is the row's position in the whole dataset,
+            # and dropping rows moves every later one.
+            out["index"] = np.arange(len(df), dtype=np.int64) + frame_offset + source_written_rows
             out["task_index"] = df["task_index"].map(task_index_map)
             if out["task_index"].isna().any():
                 missing = sorted(set(df.loc[out["task_index"].isna(), "task_index"].tolist()))
@@ -514,7 +617,10 @@ def prepare_dataset_view(
                 state_parts.append(state)
 
             if loaded_action_npy is not None:
-                action = loaded_action_npy[source_processed_rows : source_processed_rows + len(df)]
+                # Sliced by *source* position and then filtered with the same mask: the npy was
+                # written against the recording, so it still has a row per excluded frame.
+                action = loaded_action_npy[source_read_rows : source_read_rows + file_source_rows]
+                action = action[keep_mask]
             else:
                 action = as_matrix(df[action_key], action_key, feature_dim(features[action_key]))
             if is_delta_action_mode(action_mode):
@@ -554,11 +660,12 @@ def prepare_dataset_view(
                 scalar_parts[key].append(np.asarray(out[key]).reshape(-1, 1))
 
             pq.write_table(pa.Table.from_pandas(out, preserve_index=False), dst_file)
-            source_processed_rows += len(df)
+            source_read_rows += file_source_rows
+            source_written_rows += len(df)
             processed_rows += len(df)
 
-        if loaded_action_npy is not None and len(loaded_action_npy) != source_processed_rows:
-            raise ValueError(f"{source_action_npy} has {len(loaded_action_npy)} rows, dataset has {source_processed_rows}")
+        if loaded_action_npy is not None and len(loaded_action_npy) != source_read_rows:
+            raise ValueError(f"{source_action_npy} has {len(loaded_action_npy)} rows, dataset has {source_read_rows}")
 
     total_rows = processed_rows
 
@@ -587,11 +694,19 @@ def prepare_dataset_view(
     for source_idx, episodes in enumerate(source_episodes):
         file_map = source_file_maps[source_idx]
         frame_offset = source_frame_offsets[source_idx]
-        episode_offset = source_episode_offsets[source_idx]
+        episode_map = source_episode_maps[source_idx]
         out_episodes = episodes.copy()
-        out_episodes["episode_index"] = out_episodes["episode_index"] + episode_offset
-        out_episodes["dataset_from_index"] = out_episodes["dataset_from_index"] + frame_offset
-        out_episodes["dataset_to_index"] = out_episodes["dataset_to_index"] + frame_offset
+        out_episodes["episode_index"] = [
+            episode_map[int(index)] for index in out_episodes["episode_index"]
+        ]
+        # Recounted from the kept lengths rather than shifted by a constant: with an episode
+        # removed, every later episode starts earlier than it did in the source. The video
+        # timestamps are deliberately untouched -- the mp4 files are symlinked whole, so each
+        # surviving episode's from/to range still addresses its own frames.
+        lengths = out_episodes["length"].to_numpy()
+        starts = frame_offset + np.concatenate([[0], np.cumsum(lengths)[:-1]]).astype(lengths.dtype)
+        out_episodes["dataset_from_index"] = starts
+        out_episodes["dataset_to_index"] = starts + lengths
         for col_prefix in ["data", *[f"videos/{cam}" for cam in camera_keys]]:
             chunk_col = f"{col_prefix}/chunk_index"
             file_col = f"{col_prefix}/file_index"
@@ -681,6 +796,17 @@ def prepare_dataset_view(
         "action_dim": int(all_action.shape[1]),
         "total_episodes": int(total_episodes),
         "total_rows": int(total_rows),
+        # What was left out and where each surviving episode came from. Episodes are renumbered
+        # here, so without this a view's episode 4 could not be traced back to the recording --
+        # and a training set that silently differs from its source is not auditable.
+        "excluded_episodes": {
+            str(root): sorted(excluded_by_root.get(root, set())) for root in src_roots
+        },
+        "episode_source_index": [
+            {"episode_index": view_index, "source_dataset_root": str(root), "source_episode_index": source_index}
+            for root, episode_map in zip(src_roots, source_episode_maps, strict=True)
+            for source_index, view_index in sorted(episode_map.items(), key=lambda item: item[1])
+        ],
         # Recorded so the action contract of this view, and the evidence that the conversion was
         # invertible, are auditable from the dataset rather than only from the command line.
         "action_mode": action_mode,
@@ -1017,6 +1143,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "the delta modes are derived here as consecutive-dataset-frame differences."
         ),
     )
+    parser.add_argument(
+        "--exclude-episodes",
+        default="",
+        help=(
+            "Comma-separated source episode indices to leave out of the view, on top of whatever "
+            "the annotation store excludes. Single-source builds only."
+        ),
+    )
+    parser.add_argument(
+        "--respect-annotations",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Drop episodes marked includeInTraining=false in <root>/meta/gui_annotations.json. "
+            "On by default: the operator's review is the point of recording it."
+        ),
+    )
     parser.add_argument("--copy-videos", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--smoke", action="store_true")
@@ -1107,6 +1250,8 @@ def main() -> None:
             copy_videos=args.copy_videos,
             overwrite=args.overwrite_view,
             action_mode=args.action_mode,
+            exclude_episodes={int(value) for value in parse_csv(args.exclude_episodes)},
+            respect_annotations=args.respect_annotations,
         )
         manifest = load_json(view_root / "meta/il_view_manifest.json")
         make_train_config(args, view_root, args.repo_id, config_path)

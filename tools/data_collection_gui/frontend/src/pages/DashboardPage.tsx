@@ -58,6 +58,7 @@ export function DashboardPage({
     { label: "生成中", value: countOf("queued", "running") },
     { label: "Pose 就绪", value: countOf("pose_ready") },
     { label: "QC 通过", value: countOf("qc_pass") },
+    { label: "QC 警告", value: countOf("qc_warn") },
     { label: "QC 失败/错误", value: countOf("qc_failed", "error") },
   ];
   const latest = snapshot.recordedDatasets.find((d) => d.isLatest) ?? snapshot.recordedDatasets[0] ?? null;

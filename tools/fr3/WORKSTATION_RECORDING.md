@@ -27,6 +27,30 @@ wherever the previous episode ended, so starting a take without opening it recor
 whose gripper state does not match the task's starting condition — and on a grasp task the
 policy learns that opening is something that happens before the data begins.
 
+### Recording into a task
+
+**Task Library** page → **New Task** (name, description, target episodes, `Dataset Repo ID`) →
+**Go to Record**. The gateway then deep-copies `fr3_record_config.yaml` and patches only
+`dataset.repo_id` / `dataset.root` / `dataset.single_task` from the task, writing
+`outputs/.active_task_config.yaml` and spawning the recorder against that. The recorder itself
+knows nothing about tasks — it takes a config path — which is why the page works identically on
+both profiles and why the task's description becomes the episode's task prompt.
+
+The binding is fixed at Connect (the dataset root is resolved once, when the recorder starts), so
+the Live Record banner refuses to switch or unbind a task while a recorder is alive. Progress
+counting matches the task's `Dataset Repo ID` trailing name against dataset directory names with
+the session stamp stripped, so `local/pick_and_place` counts every
+`pick_and_place_<YYYYmmdd_HHMMSS>` session.
+
+Two limits worth knowing before planning a campaign around it:
+
+- A sim session writes `<name>_sim_<stamp>`, which is not that task's name once the stamp is
+  stripped, so **sim takes do not count toward a task's progress**.
+- Each Connect is its own dataset, and the workstation's Dataset Export page builds a training
+  view from *one* recording. Consolidating a task's sessions into a single view is the Thor
+  route's "Consolidate a Task" and has no workstation equivalent yet; `fr3_train_il_policy.py`
+  will merge a directory of dataset roots if you point `--dataset-root` at one.
+
 Episode control maps onto the gateway's existing recorder protocol:
 
 | UI | stdin | recorder behaviour |
@@ -97,6 +121,25 @@ tell from the column names alone how to integrate it back. Videos are symlinked 
 is off by default), so a view costs ~1% of the source's disk — measured: video is 99% of a
 dataset.
 
+#### What the view leaves out
+
+The build drops every episode marked **not for training** in Episode Replay's annotation panel
+(`includeInTraining` in `meta/gui_annotations.json`), and the Training View page shows the count
+and the episode numbers on the row before you press Build View. Surviving episodes are renumbered
+contiguously — LeRobot addresses episodes by position, so a gap would be a dataset claiming
+episodes it does not have — and `meta/il_view_manifest.json` records both `excluded_episodes` and
+an `episode_source_index` map so a view's episode 4 can still be traced back to the recording.
+
+The recording is never modified: videos are symlinked whole and each surviving episode keeps its
+own `from_timestamp`/`to_timestamp` range inside them. Deleting an episode in Episode Replay is
+still the destructive option; this one is a filter, and it is reversible by unchecking the box and
+rebuilding.
+
+That flag used to be inert. It was written to the annotation store and read by nothing, so an
+operator who reviewed a session and marked three bad takes still trained on them — the only
+exclusion that worked was deletion. `--exclude-episodes 3,7` does the same thing from the command
+line for a single-source build, and `--no-respect-annotations` builds the unfiltered view.
+
 `prev_cmd` is the default because the reference is the previous *command*: the arm's tracking lag
 stays out of the action, and a held frame is an exact zero. `delta_ee_from_current` references the
 *measured* pose, so every action carries the rig's tracking residual — on the MuJoCo rig that
@@ -150,11 +193,41 @@ moment it is saved. The verdict appears under the record controls and in the eve
 session end the same audit runs against the finalized files and is persisted to
 `meta/fr3_sync_report.json`.
 
-Standalone: `python tools/fr3/fr3_sync_audit.py --dataset <root> [--fail-on-violation]`.
+Standalone: `python tools/fr3/fr3_sync_audit.py --dataset <root> --camera-fps 60
+[--fail-on-violation]`. The verdict is also a QC check (`timestamp_sync` on the Dataset
+Processing page), so a dataset whose alignment failed cannot reach `qc_pass` and therefore cannot
+be exported. QC recomputes the report when it is missing (an interrupted session never reaches
+`finalize()`) or when it predates schema v3.
 
-What the numbers mean:
+### What `status` rests on
 
-- `skew_*_ms` — spread *within* one frame across devices. Budget: 20 ms (`--sync-tolerance-ms`).
+**Not the spread across all four devices.** That number is 27 ms on a *healthy* episode here,
+because the cameras sit a constant 23 ms behind the arm read at 60 fps — a frame already exists
+when the loop asks for it, while the arm is read on demand. Judged against the 20 ms budget it
+failed **268 of 300 frames** of a take whose two cameras agreed to 3.8 ms and whose cadence was
+exact to 0.03%. A constant reported as a defect on every episode is the same as no signal at all,
+so the verdict is now the conjunction of four budgeted quantities (all in `skew_evaluation`):
+
+| quantity | what it catches | budget | measured on a healthy hardware take |
+| --- | --- | --- | --- |
+| `within_group` skew (cameras vs each other) | one camera falling behind; the handover-stamping bug that put a fake 24 ms between two views of one instant | 20 ms (`--tolerance-ms`) | p50 3.8, max 8.3 ms |
+| `residual` skew (all devices, each one's median offset removed) | an offset that *drifts* inside a session, which a constant-bias check cannot see | one camera frame period + 20 ms → 36.7 ms at 60 fps (`--camera-fps` / `--residual-tolerance-ms`) | p95 12.8, max 19.1 ms |
+| `bias` (each device's median offset from the arm) | a *changed* pipeline: a swapped camera, a stamping regression, a second clock spliced in | 60 ms (`--bias-tolerance-ms`) | cameras −23.3 / −22.8 ms, gripper +2.3 ms |
+| `grid_lag` | the control loop missing the dataset's own cadence | 50 ms | p95 3.9 ms |
+
+The residual's floor is one sensor period: nothing triggers these cameras, so the phase between
+acquisition and the loop tick wanders over a full frame period and lands entirely in this number.
+That period is *not* in the dataset (`dataset.fps` is 30, the sensors run at 60), so the budget
+comes from the config at record time or from `--camera-fps`; without either, the residual is
+measured and reported with no verdict rather than judged against an invented threshold.
+
+The raw all-device spread is still in the report — `skew_evaluation.raw_all_device` and the
+untouched `summary.max_skew_s` — because it is the honest answer to "how far apart are these
+columns". It is simply not a pass/fail question on a rig with real pipeline offsets. Report schema
+is `3`; a v2 report's `status` was produced by the old rule and is not comparable.
+
+What the other numbers mean:
+
 - `grid_lag_p95_ms` — drift of the **arm read** away from the dataset's nominal
   `frame_index / fps` grid, as p95 of `|lag|`. Budget: 50 ms. The arm is the reference because it
   is the one modality read *for* the frame rather than delivered to it, so it carries no pipeline
@@ -174,8 +247,9 @@ What the numbers mean:
   gaps — jitter is asymmetric (a late frame is followed by an early one), so the median gap
   reads high and condemns a cadence that was in fact exact. On the hardware rig the median gap
   was 35.4 ms where the true average was 33.34 ms against a 33.33 ms nominal.
-- `bias_vs_arm_ms[...]` — each modality's median offset from the arm read. A *constant* bias is
-  a fixed pipeline offset and is reported, never silently subtracted.
+- `bias_vs_arm_ms[...]` — each modality's median offset from the arm read, as the median of the
+  per-frame differences. A *constant* bias is a fixed pipeline offset: it is budgeted against a
+  wide regression tripwire (above) and reported, never silently subtracted from the data.
 
 `clock_semantics` says which clock produced the timestamps, because the two backends do not
 mean the same thing by them:

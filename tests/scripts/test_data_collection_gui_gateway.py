@@ -1680,6 +1680,239 @@ def test_run_qc_includes_fr3_ik_result_in_overall_status(monkeypatch, tmp_path):
     assert ik_check["status"] == "fail"
 
 
+def _write_sync_report(dataset_root: Path, *, status: str, schema_version: int) -> None:
+    (dataset_root / "meta").mkdir(parents=True, exist_ok=True)
+    (dataset_root / "meta" / "fr3_sync_report.json").write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "report_kind": "fr3_sync_audit",
+                "status": status,
+                "clock_semantics": "hardware_mixed",
+                "total_frames": 300,
+                "failures": []
+                if status == "pass"
+                else ["12/300 frame(s) exceed the 20.0 ms within-camera skew budget"],
+                "cross_modality_bias_ms": {"camera.ee.capture_timestamp_s": -23.3},
+                "summary": {"within_group_skew_over_budget_frames": 0 if status == "pass" else 12},
+                "skew_evaluation": {
+                    "budgets_ms": {"within_group": 20.0, "residual": 36.7, "bias": 60.0},
+                    "within_group": {"camera": {"p95_ms": 7.8}},
+                    "residual": {"p95_ms": 12.8},
+                    "raw_all_device": {"p95_ms": 36.6},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_run_qc_fails_a_dataset_whose_timestamp_sync_failed(tmp_path):
+    """QC is the export gate, so the alignment verdict has to be inside it, not beside it."""
+    dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    _write_sync_report(dataset_root, status="fail", schema_version=3)
+
+    qc = gateway._run_qc(dataset_root)
+
+    assert qc["status"] == "fail"
+    check = next(check for check in qc["checks"] if check["name"] == "timestamp_sync")
+    assert check["status"] == "fail"
+    assert "within-camera skew budget" in check["message"]
+    assert qc["timestamp_sync"]["biasMs"]["camera.ee.capture_timestamp_s"] == pytest.approx(-23.3)
+    assert qc["timestamp_sync"]["rawSkewP95Ms"] == pytest.approx(36.6)
+
+
+def test_run_qc_passes_a_dataset_whose_timestamp_sync_passed(tmp_path):
+    dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    _write_sync_report(dataset_root, status="pass", schema_version=3)
+
+    qc = gateway._run_qc(dataset_root)
+
+    assert qc["status"] == "pass"
+    check = next(check for check in qc["checks"] if check["name"] == "timestamp_sync")
+    assert check["status"] == "pass"
+
+
+def test_run_qc_does_not_believe_a_pre_v3_sync_verdict(tmp_path):
+    """A v2 report judged the raw all-device spread, which failed every hardware episode.
+
+    Recomputing is the only honest option, and this dataset carries no capture-timestamp column,
+    so the recompute finds nothing to judge and QC stays silent rather than importing a verdict
+    that was produced by a rule this gateway no longer applies.
+    """
+    dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    _write_sync_report(dataset_root, status="fail", schema_version=2)
+
+    qc = gateway._run_qc(dataset_root)
+
+    assert [check for check in qc["checks"] if check["name"] == "timestamp_sync"] == []
+    assert qc["timestamp_sync"] is None
+    assert qc["status"] == "pass"
+
+
+def test_recorded_datasets_report_episodes_excluded_by_review(tmp_path):
+    """The page has to show the exclusion before Build View, not explain it afterwards."""
+    datasets_root = tmp_path / "outputs" / "datasets"
+    dataset_root = datasets_root / "fr3_spacemouse_20260811_170748"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=3)
+    (dataset_root / "meta" / "gui_annotations.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "annotations": {
+                    "0": {"episode": 0, "includeInTraining": True},
+                    "2": {"episode": 2, "includeInTraining": False},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=datasets_root,
+        profile="workstation",
+    )
+
+    item = next(item for item in gateway._recorded_dataset_items(state) if item["name"] == dataset_root.name)
+
+    assert item["excludedEpisodes"] == [2]
+
+
+def test_building_a_view_from_only_excluded_episodes_is_refused(tmp_path):
+    datasets_root = tmp_path / "outputs" / "datasets"
+    dataset_root = datasets_root / "fr3_spacemouse_20260811_170748"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=2)
+    info_path = dataset_root / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["features"]["observation.images.ee"] = {"dtype": "video", "shape": [64, 64, 3]}
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    video_dir = dataset_root / "videos" / "observation.images.ee" / "chunk-000"
+    video_dir.mkdir(parents=True)
+    (video_dir / "file-000.mp4").write_bytes(b"\0" * 16)
+    (dataset_root / "meta" / "gui_annotations.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "annotations": {
+                    str(episode): {"episode": episode, "includeInTraining": False}
+                    for episode in range(2)
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=datasets_root,
+        profile="workstation",
+    )
+
+    with pytest.raises(ValueError, match="nothing to build"):
+        gateway._start_training_view(state, str(dataset_root), "delta_ee_from_prev_cmd")
+
+
+def _qc_warned_state(tmp_path: Path) -> tuple[gateway.GatewayState, Path]:
+    """A dataset whose QC ran and warned -- the state that used to look like "QC pending"."""
+    datasets_root = tmp_path / "outputs" / "datasets"
+    dataset_root = datasets_root / "thor_gmsl2_v1_20260811_170748"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    gateway._write_processing_meta_qc(
+        dataset_root,
+        {
+            "status": "warn",
+            "summary": "6 pass · 1 warn · 0 fail · 2 frames",
+            "valid_frames_pct": 100.0,
+            "checks": [
+                {"name": "schema", "status": "pass", "message": "1 parquet file(s), 2 rows"},
+                {
+                    "name": "frame_count",
+                    "status": "warn",
+                    "message": "parquet has 2 rows but info.json declares 3",
+                },
+            ],
+            "completed_at": gateway._now_iso(),
+        },
+    )
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=datasets_root,
+    )
+    return state, dataset_root
+
+
+def test_a_qc_warning_is_its_own_status_not_qc_pending(tmp_path):
+    _, dataset_root = _qc_warned_state(tmp_path)
+
+    item = gateway._processing_item_from_dataset(dataset_root)
+
+    assert item["status"] == "qc_warn"
+    # The message names the warning instead of reading like QC never ran.
+    assert "info.json declares 3" in item["message"]
+
+
+def test_export_refuses_a_warned_dataset_until_the_warning_is_acknowledged(tmp_path):
+    state, dataset_root = _qc_warned_state(tmp_path)
+
+    with pytest.raises(ValueError, match="confirm to export anyway"):
+        gateway._start_approved_dataset_export(state, str(dataset_root))
+
+    # The refusal has to carry the warnings, or the confirmation is uninformed.
+    try:
+        gateway._start_approved_dataset_export(state, str(dataset_root))
+    except ValueError as exc:
+        assert "frame_count" in str(exc)
+
+
+def test_export_proceeds_on_a_warned_dataset_once_acknowledged(tmp_path, monkeypatch):
+    state, dataset_root = _qc_warned_state(tmp_path)
+    exported: dict[str, Path] = {}
+    monkeypatch.setattr(
+        gateway,
+        "_copy_approved_v3_dataset_export",
+        lambda _state, root, _item: exported.setdefault("root", root),
+    )
+
+    gateway._start_approved_dataset_export(state, str(dataset_root), acknowledge_warnings=True)
+
+    assert exported["root"] == dataset_root
+    # Overriding a warning is a decision, so it is logged with what was overridden.
+    assert any(
+        entry.level == "warn" and "frame_count" in entry.message for entry in state.events
+    )
+
+
+def test_export_still_refuses_a_dataset_whose_qc_never_ran(tmp_path):
+    datasets_root = tmp_path / "outputs" / "datasets"
+    dataset_root = datasets_root / "thor_gmsl2_v1_20260811_180000"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=datasets_root,
+    )
+
+    with pytest.raises(ValueError, match="must pass QC"):
+        gateway._start_approved_dataset_export(state, str(dataset_root), acknowledge_warnings=True)
+
+
 def test_run_qc_preserves_virtualenv_python_symlink(monkeypatch, tmp_path):
     dataset_root = tmp_path / "outputs" / "datasets" / "episode_set"
     _write_minimal_episode_dataset(dataset_root, total_episodes=1)

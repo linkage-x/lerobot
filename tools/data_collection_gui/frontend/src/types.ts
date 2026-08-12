@@ -350,6 +350,8 @@ export type RecordedDataset = {
   dataStatus: "loaded" | "missing" | "unfinalized" | "unreadable" | "empty";
   sourcePath: string;
   isLatest: boolean;
+  /** Episodes marked includeInTraining=false in Episode Replay; the view build drops these. */
+  excludedEpisodes?: number[];
   /** Training views only: the recording this view re-expresses, and in which action contract. */
   viewOf?: string;
   viewOfName?: string;
@@ -394,6 +396,9 @@ export type ProcessingStatus =
   | "queued"
   | "running"
   | "pose_ready"
+  // QC ran and raised warnings but no failures. Distinct from pose_ready ("QC has not run") so
+  // that a warning is visible instead of quietly removing the dataset from Dataset Export.
+  | "qc_warn"
   | "qc_pass"
   | "qc_failed"
   | "error";
@@ -523,6 +528,25 @@ export type ReplayTimeline = {
   error?: string;
 };
 
+/** Verdict of meta/fr3_sync_report.json, split the way the report judges it. */
+export type TimestampSyncSummary = {
+  status: string;
+  clockSemantics: string;
+  totalFrames: number;
+  budgetsMs: { within_group?: number | null; residual?: number | null; bias?: number | null };
+  groupSkewP95Ms: number | null;
+  groupSkewOverBudgetFrames: number;
+  residualSkewP95Ms: number | null;
+  // null when no sensor rate was available to derive the budget from: measured, not judged.
+  residualSkewOverBudgetFrames: number | null;
+  gridLagOverBudgetFrames: number;
+  // The all-device spread. Reported because it is real, excluded from the verdict because on
+  // this rig it is dominated by the cameras' constant offset from the arm read.
+  rawSkewP95Ms: number;
+  biasMs: Record<string, number>;
+  failures: string[];
+};
+
 export type ProcessingItem = {
   path: string;
   name: string;
@@ -536,6 +560,7 @@ export type ProcessingItem = {
   validFramesPct: number | null;
   logTail: string[];
   onlineSync?: OnlineSyncSummary | null;
+  timestampSync?: TimestampSyncSummary | null;
   qcChecks?: Array<{
     name: string;
     status: "pass" | "warn" | "fail";
