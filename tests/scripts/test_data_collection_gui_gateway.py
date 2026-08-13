@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -258,7 +259,7 @@ def test_workstation_profile_exposes_fr3_teleop_contract():
     assert devices_by_id["pika"]["config"]["port"].startswith("/dev/serial/by-")
     assert snapshot["teleop"]["urdfPath"].endswith("fr3_pika_gripper.urdf")
     assert snapshot["teleop"]["simXmlPath"].endswith("fr3_pika_gripper_scene.xml")
-    assert "ati" not in snapshot["teleop"]["urdfPath"].lower()
+    assert "ati" not in Path(snapshot["teleop"]["urdfPath"]).name.lower()
     assert [view["id"] for view in snapshot["teleop"]["cameraViews"]] == ["external", "wrist"]
     assert [view["deviceId"] for view in snapshot["teleop"]["cameraViews"]] == ["side", "ee"]
     assert snapshot["replay"]["realRobotIp"] == "192.168.1.206"
@@ -338,6 +339,69 @@ def test_start_workstation_real_teleop_does_not_call_hardware_preflight(monkeypa
     assert state.teleop.realRobotReady is False
     assert state.teleop.pid == 4242
     assert captured["command"] == gateway._fr3_real_teleop_command(state)
+
+
+def test_connect_recorder_accepts_episode_duration_override(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    dataset_root = tmp_path / "outputs" / "datasets" / "record_default"
+    config = {
+        "dataset": {
+            "repo_id": "local/test",
+            "root": str(dataset_root),
+            "fps": 30,
+            "episode_time_s": 10.0,
+            "num_episodes": 5,
+        },
+        "recorder": {"script": "tools/fr3/fr3_gui_record_runtime.py"},
+    }
+    config_path.write_text("dataset: {}\n", encoding="utf-8")
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=config_path,
+        config=config,
+        recording=gateway.RecordingStatus(repoId="local/test", datasetRoot=str(dataset_root)),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        profile="workstation",
+        datasets_root=dataset_root.parent,
+    )
+    fr3_python = tmp_path / ".venv-fr3" / "bin" / "python"
+    fr3_python.parent.mkdir(parents=True)
+    fr3_python.touch()
+    captured = {}
+
+    class FakeProcess:
+        pid = 4321
+        stdin = None
+        stdout = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(gateway, "_start_output_reader", lambda *_args: None)
+    monkeypatch.setattr(gateway, "_new_recorder_log_path", lambda _state: tmp_path / "recorder.log")
+
+    gateway._connect_recorder(state, backend="real", episode_time_s=15.0)
+
+    assert state.recording.targetFrames == 450
+    assert state.runtime_recording_config is not None
+    assert gateway._dataset_config(state.runtime_recording_config)["episode_time_s"] == 15.0
+    assert state.runtime_recording_config_path == tmp_path / "outputs" / ".active_task_config.yaml"
+    assert any(arg.endswith(f"={state.runtime_recording_config_path}") for arg in captured["command"])
+    assert state.config["dataset"]["episode_time_s"] == 10.0
+
+
+def test_episode_duration_override_validation():
+    assert gateway._parse_episode_time_override(12) == 12.0
+    assert gateway._parse_episode_time_override("") is None
+    for value in ("bad", 0, 601, float("inf")):
+        with pytest.raises(ValueError):
+            gateway._parse_episode_time_override(value)
 
 
 def test_gmsl2_device_preview_uses_recorder_owned_frames_only():
@@ -1817,9 +1881,111 @@ def test_building_a_view_from_only_excluded_episodes_is_refused(tmp_path):
         datasets_root=datasets_root,
         profile="workstation",
     )
+    # QC has to pass for the build to get as far as counting episodes; this test is about the
+    # exclusion check behind that gate, not about the gate.
+    _write_passing_qc(dataset_root)
 
     with pytest.raises(ValueError, match="nothing to build"):
         gateway._start_training_view(state, str(dataset_root), "delta_ee_from_prev_cmd")
+
+
+def _write_passing_qc(dataset_root: Path) -> None:
+    gateway._write_processing_meta_qc(
+        dataset_root,
+        {
+            "status": "pass",
+            "summary": "8 pass · 0 warn · 0 fail",
+            "valid_frames_pct": 100.0,
+            "checks": [{"name": "schema", "status": "pass", "message": "ok"}],
+            "completed_at": gateway._now_iso(),
+        },
+    )
+
+
+class _FakeExportProcess:
+    pid = 4321
+    stdout: list[str] = []
+
+    def poll(self):
+        return None
+
+
+def _stub_export_launch(monkeypatch) -> None:
+    """Let a build reach 'exporting' without spawning fr3_train_il_policy.py."""
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda command, **kwargs: _FakeExportProcess())
+    monkeypatch.setattr(gateway, "Thread", lambda *args, **kwargs: SimpleNamespace(start=lambda: None))
+
+
+def _write_warning_qc(dataset_root: Path, message: str) -> None:
+    gateway._write_processing_meta_qc(
+        dataset_root,
+        {
+            "status": "warn",
+            "summary": "7 pass · 1 warn · 0 fail",
+            "valid_frames_pct": 100.0,
+            "checks": [{"name": "frame_count", "status": "warn", "message": message}],
+            "completed_at": gateway._now_iso(),
+        },
+    )
+
+
+def test_training_view_refuses_a_dataset_that_has_not_passed_qc(tmp_path):
+    # The workstation view build *is* the export: it is the last step before a policy trains on
+    # these frames, and the timestamp-sync verdict only exists inside a QC run. Ungated, a
+    # dataset whose modalities disagreed reached training with its verdict unread.
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+
+    with pytest.raises(ValueError, match="must pass QC"):
+        gateway._start_training_view(state, str(dataset_root), "delta_ee_from_prev_cmd")
+
+
+def test_training_view_refuses_a_qc_failed_dataset(tmp_path):
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+    gateway._write_processing_meta_qc(
+        dataset_root,
+        {
+            "status": "fail",
+            "summary": "6 pass · 0 warn · 2 fail",
+            "valid_frames_pct": 41.0,
+            "checks": [{"name": "timestamp_sync", "status": "fail", "message": "skew 42 ms"}],
+            "completed_at": gateway._now_iso(),
+        },
+    )
+
+    with pytest.raises(ValueError, match="qc_failed"):
+        gateway._start_training_view(state, str(dataset_root), "delta_ee_from_prev_cmd")
+
+
+def test_training_view_of_a_warned_dataset_needs_the_warnings_acknowledged(tmp_path, monkeypatch):
+    # Same rule as the Thor export and the replay gate: a validation that ran and warned can be
+    # overridden with its warnings in front of you; one that never ran cannot.
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+    _write_warning_qc(dataset_root, "parquet has 2 rows but info.json declares 3")
+
+    with pytest.raises(ValueError, match="confirm to build the view anyway"):
+        gateway._start_training_view(state, str(dataset_root), "delta_ee_from_prev_cmd")
+
+    _stub_export_launch(monkeypatch)
+    gateway._start_training_view(
+        state, str(dataset_root), "delta_ee_from_prev_cmd", acknowledge_warnings=True
+    )
+
+    assert state.dataset_export.state == "exporting"
+    assert any(
+        "over 1 QC warning(s)" in item.message and "info.json declares 3" in item.message
+        for item in state.events
+    )
+
+
+def test_training_view_builds_from_a_qc_passed_dataset(tmp_path, monkeypatch):
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+    _write_passing_qc(dataset_root)
+    _stub_export_launch(monkeypatch)
+
+    gateway._start_training_view(state, str(dataset_root), "delta_ee_from_prev_cmd")
+
+    assert state.dataset_export.state == "exporting"
+    assert state.dataset_export.datasetRoot == str(dataset_root)
 
 
 def _qc_warned_state(tmp_path: Path) -> tuple[gateway.GatewayState, Path]:

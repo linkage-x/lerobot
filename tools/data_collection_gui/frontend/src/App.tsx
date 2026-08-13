@@ -249,13 +249,19 @@ function App() {
       return;
     }
     const warnings = qcWarnings(item);
+    // Name the action being overridden, not the endpoint it shares: on the workstation this
+    // button builds the training view a policy will be trained on, not a v3 export.
+    const overriding =
+      snapshot.deployment?.profile === "workstation"
+        ? "Build the training view anyway?"
+        : "Export it anyway?";
     const ok = window.confirm(
       [
         `QC passed with warnings for "${item.name}".`,
         "",
         ...(warnings.length ? warnings : [item.qcSummary]),
         "",
-        "Export it anyway?"
+        overriding
       ].join("\n")
     );
     if (!ok) {
@@ -282,7 +288,7 @@ function App() {
       <LiveRecordPage
         snapshot={snapshot}
         busy={busy}
-        onConnect={(backend) => run(() => api.connectRecording(backend))}
+        onConnect={(backend, episodeTimeS) => run(() => api.connectRecording(backend, episodeTimeS))}
         onStart={() => run(() => api.startRecording())}
         onStop={(action) => run(() => api.stopRecording(action))}
         onOpenInReplay={() => selectAndOpenReplay(latestRecordedPath)}
@@ -351,7 +357,7 @@ function App() {
       <DashboardPage
         snapshot={snapshot}
         busy={busy}
-        onConnect={() => run(() => api.connectRecording())}
+        onConnect={() => run(() => api.connectRecording(undefined, snapshot.configSummary.episodeTimeS))}
         onNavigate={navigate}
       />
     ) : (
@@ -390,7 +396,7 @@ function App() {
                   className="topbar-btn topbar-btn-primary"
                   disabled={busy}
                   title="连接录制器（按当前绑定 Task 启动，供录制 / 标定 / 设备预览共用）"
-                  onClick={() => run(() => api.connectRecording())}
+                  onClick={() => run(() => api.connectRecording(undefined, snapshot.configSummary.episodeTimeS))}
                 >
                   Connect
                 </button>

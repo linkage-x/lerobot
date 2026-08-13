@@ -426,6 +426,30 @@ def _slowest_camera_fps(cfg: RecordConfig) -> float | None:
     return min(rates) if rates else None
 
 
+def _reset_gripper_to_open(robot: Any, teleop: Any | None = None) -> None:
+    send_action = getattr(robot, "send_action", None)
+    if not callable(send_action):
+        robot_name = getattr(robot, "name", type(robot).__name__)
+        raise RuntimeError(f"Robot '{robot_name}' does not support send_action().")
+
+    send_action(
+        {
+            "enabled": False,
+            "target_x": 0.0,
+            "target_y": 0.0,
+            "target_z": 0.0,
+            "target_wx": 0.0,
+            "target_wy": 0.0,
+            "target_wz": 0.0,
+            "gripper": 1.0,
+        }
+    )
+    if teleop is not None:
+        set_gripper = getattr(teleop, "set_gripper", None)
+        if callable(set_gripper):
+            set_gripper(1.0)
+
+
 def _audit_episode_buffer(
     dataset: LeRobotDataset,
     *,
@@ -626,6 +650,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if callable(sync_gripper):
             observation = robot.get_observation(include_cameras=False)
             sync_gripper(float(observation["gripper.pos"]))
+        _reset_gripper_to_open(robot, teleop)
+        emit("Gripper opened")
 
         commands.start()
         emit(f"Backend: {backend}")
@@ -649,6 +675,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     move_to_start = getattr(robot, "move_to_start", None)
                     if callable(move_to_start):
                         move_to_start()
+                    _reset_gripper_to_open(robot, teleop)
+                    emit("Gripper opened")
 
                 emit(f"Episode {dataset.num_episodes} ready")
                 command = commands.wait_for_command()

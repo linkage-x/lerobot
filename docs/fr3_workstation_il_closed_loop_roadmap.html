@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FR3 Workstation 数据采集 / QC / 训练 / 推理闭环 Roadmap</title>
+<style>
+  :root{
+    --bg:#f7f8fa;
+    --panel:#ffffff;
+    --text:#1f2937;
+    --muted:#64748b;
+    --line:#e5e7eb;
+    --blue:#2563eb;
+    --blue-bg:#eff6ff;
+    --green:#15803d;
+    --green-bg:#ecfdf5;
+    --amber:#b45309;
+    --amber-bg:#fffbeb;
+    --red:#991b1b;
+    --red-bg:#fef2f2;
+    --shadow:0 10px 28px rgba(15,23,42,.06);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    line-height:1.62;
+  }
+  a{color:var(--blue)}
+  .wrap{max-width:1180px;margin:0 auto;padding:34px 22px 72px}
+  .hero{
+    background:#111827;
+    color:#f9fafb;
+    border-radius:18px;
+    padding:32px 34px;
+    box-shadow:var(--shadow);
+    margin-bottom:20px;
+  }
+  .hero h1{margin:0 0 10px;font-size:30px;line-height:1.22;letter-spacing:0}
+  .hero p{margin:8px 0;color:#d1d5db}
+  .meta{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}
+  .pill{
+    display:inline-flex;
+    align-items:center;
+    padding:5px 10px;
+    border-radius:999px;
+    border:1px solid rgba(255,255,255,.18);
+    color:#e5e7eb;
+    font-size:13px;
+    font-weight:650;
+  }
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+  .card{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:14px;
+    padding:20px;
+    box-shadow:var(--shadow);
+  }
+  .full{grid-column:1/-1}
+  h2{font-size:22px;margin:0 0 12px}
+  h3{font-size:18px;margin:18px 0 8px}
+  p{margin:8px 0}
+  ul,ol{margin:8px 0 0 22px;padding:0}
+  li{margin:5px 0}
+  code,.mono{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+    background:#f3f4f6;
+    border-radius:6px;
+    padding:2px 5px;
+    font-size:.92em;
+  }
+  .hero code,.hero .mono{background:rgba(255,255,255,.12);color:#fff}
+  .badge{
+    display:inline-block;
+    padding:3px 8px;
+    border-radius:999px;
+    font-size:12px;
+    font-weight:750;
+    white-space:nowrap;
+  }
+  .done{color:var(--green);background:var(--green-bg)}
+  .todo{color:var(--blue);background:var(--blue-bg)}
+  .warn{color:var(--amber);background:var(--amber-bg)}
+  .p0{color:var(--red);background:var(--red-bg)}
+  .section-head{
+    display:flex;
+    justify-content:space-between;
+    gap:12px;
+    align-items:flex-start;
+    margin-bottom:8px;
+  }
+  .small{font-size:13px;color:var(--muted)}
+  .callout{
+    margin:12px 0;
+    border-left:4px solid var(--blue);
+    background:var(--blue-bg);
+    border-radius:10px;
+    padding:12px 14px;
+  }
+  .callout.warn{border-color:var(--amber);background:var(--amber-bg)}
+  .callout.p0{border-color:var(--red);background:var(--red-bg)}
+  .callout.ok{border-color:var(--green);background:var(--green-bg)}
+  .table{width:100%;border-collapse:collapse;font-size:14px}
+  .table th,.table td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  .table th{background:#f9fafb;color:#111827}
+  .phase{
+    display:grid;
+    grid-template-columns:140px 1fr 180px;
+    gap:14px;
+    padding:14px 0;
+    border-top:1px solid var(--line);
+  }
+  .phase:first-of-type{border-top:none}
+  .phase .name{font-weight:800;color:#111827}
+  .gate{
+    border:1px dashed #9ca3af;
+    background:#fff;
+    border-radius:10px;
+    padding:10px 12px;
+    margin-top:10px;
+  }
+  .flow{
+    white-space:pre-wrap;
+    overflow:auto;
+    background:#0f172a;
+    color:#e5e7eb;
+    border-radius:12px;
+    padding:14px;
+    font-size:13px;
+  }
+  .kbd{
+    display:inline-block;
+    min-width:22px;
+    padding:1px 6px;
+    border:1px solid #cbd5e1;
+    border-bottom-width:2px;
+    border-radius:6px;
+    background:#fff;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+    font-size:12px;
+    text-align:center;
+  }
+  @media (max-width:860px){
+    .grid{grid-template-columns:1fr}
+    .full{grid-column:auto}
+    .phase{grid-template-columns:1fr}
+    .hero{padding:26px 22px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <h1>FR3 Workstation 数据采集 / QC / 训练 / 推理闭环 Roadmap</h1>
+    <p>目标：把工作站这条 FR3 + Pika + RealSense 链路收敛成可重复执行的闭环：采集、QC、Training View、ACT 训练、离线验证、真机 preview、真机 bounded rollout。</p>
+    <p>本文按当前代码现状写，不把另一台 DAS / Hikrobot rig 的经验参数迁移到这台机器上。</p>
+    <div class="meta">
+      <span class="pill">robot_ip: 192.168.1.206</span>
+      <span class="pill">target frame: pika_task_tcp</span>
+      <span class="pill">start pose: fr3_pika_gripper.xml home keyframe</span>
+      <span class="pill">record cameras: ee / side @ 60 Hz</span>
+      <span class="pill">Training View gated by QC</span>
+      <span class="pill">no DAS start</span>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="section-head">
+        <h2>当前已完成基线</h2>
+        <span class="badge done">可依赖</span>
+      </div>
+      <ul>
+        <li><code>tools/fr3/fr3_record_config.yaml</code> 固定真实工作站：FR3 <code>192.168.1.206</code>、Pika 串口、RealSense <code>ee</code>/<code>side</code>、<code>target_frame_name: pika_task_tcp</code>。</li>
+        <li>录制只存绝对 EE 动作；<code>delta_ee_from_prev_cmd</code> 等训练动作合同由 Training View 离线派生。</li>
+        <li><code>gateway.py::_start_training_view()</code> 已接入 QC gate：<code>qc_pass</code> 直通，<code>qc_warn</code> 必须确认并记录豁免警告，其他状态拒绝并指向 Dataset Processing。</li>
+        <li><code>/api/datasets/export</code> 已透传 <code>acknowledge_warnings</code>；前端 Training View 行显示 QC 状态、禁用原因和具体 warning。</li>
+        <li><code>tools/fr3/run_pick_place_infer_workstation.sh</code> 已覆盖 <code>env</code>、<code>home</code>、<code>smoke</code>、<code>preview</code>、<code>real</code>、<code>real_debug</code>、<code>real_once</code> 模式。</li>
+        <li><code>tools/fr3/fr3_il_infer_realsense_camera_config.yaml</code> 用同一组 RealSense serial 和同名 keys，避免 checkpoint 图像特征找错相机。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <div class="section-head">
+        <h2>仍未闭环的硬约束</h2>
+        <span class="badge p0">P0</span>
+      </div>
+      <ol>
+        <li><b>起始位姿不能使用 DAS start。</b>闭环应以 <code>src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.xml</code> 的 <code>home</code> keyframe 为唯一初始 pose 合同。</li>
+        <li><b>IK 工具坐标系必须从几何合同推出。</b>训练动作代表手指工作点，不是 gripper mount，因此 IK 目标应是 <code>pika_task_tcp</code>，并且 URDF、MJCF、record config、rollout args 必须同名同位姿。</li>
+        <li><b>gripper 单位 heuristic 只是绕行。</b><code>normalize_dataset_gripper()</code> 现在按数值范围猜单位，<code>--gripper-close-below 0.12</code> 只是把危险区压掉；根治要按 dataset feature / metadata 判定单位。</li>
+      </ol>
+    </div>
+
+    <div class="card full">
+      <div class="section-head">
+        <h2>P0 判据：Frame 和 Start Pose 先冻结</h2>
+        <span class="badge p0">先做</span>
+      </div>
+      <table class="table">
+        <tr>
+          <th>合同</th>
+          <th>当前代码事实</th>
+          <th>Roadmap 动作</th>
+          <th>Gate</th>
+        </tr>
+        <tr>
+          <td><b>起始位姿</b></td>
+          <td><code>fr3_move_to_start_runtime.py</code> 已改为调用 <code>Panda.move_to_joint_position()</code> 到 XML <code>home</code> keyframe，并读回 <code>state.q</code> 校验。</td>
+          <td>记录和 rollout 均使用 <code>fr3_pika_gripper.xml</code> 的 <code>home</code> keyframe，前 7 个 arm qpos：<code>0 -0.785 0 -2.355 0 1.57079 0.785</code>。<code>run_pick_place_infer_workstation.sh home/preview/real*</code> 走同一 helper。</td>
+          <td>执行后读 <code>state.q</code>，每关节误差在阈值内；event log / terminal 明确打印 keyframe 名和 q target。</td>
+        </tr>
+        <tr>
+          <td><b>IK 目标帧</b></td>
+          <td>录制 config 和 gateway sim teleop 使用 <code>pika_task_tcp</code>；runtime 如果不显式传参，Pika 默认落到 <code>pika_gripper_ee</code>。workstation rollout 脚本已显式传 <code>--target-frame-name pika_task_tcp</code>。</td>
+          <td>保留显式传参，并把 checkpoint/dataset manifest、rollout announce、MuJoCo viewer 都打印同一个 target frame。禁止靠 runtime 默认值表达工作站合同。</td>
+          <td>启动时输出：URDF path、target frame、dataset action contract、camera keys；任一缺失即 fail fast。</td>
+        </tr>
+        <tr>
+          <td><b>URDF / MJCF frame 一致性</b></td>
+          <td><code>tests/robots/test_fr3_model_frames.py</code> 已定义应一致的帧：<code>gripper_base</code>、<code>pika_gripper_ee</code>、<code>pika_task_tcp</code>。当前源码里 URDF 的 <code>pika_task_tcp</code> 是 <code>xyz=&quot;0 0 0.366842&quot;</code>，而 <code>fr3_pika_gripper.xml</code> 中同名 body 需要逐项核对，避免仿真/硬件各自自洽。</td>
+          <td>跑 frame contract test；若失败，按 URDF 的语义修 MJCF 或按实测 TCP 统一两边。不要只改 rollout 参数。</td>
+          <td><code>pytest tests/robots/test_fr3_model_frames.py</code> 通过；<code>pika_task_tcp</code> 平移误差 ≤ 1 mm，旋转误差 ≤ 0.1 deg。</td>
+        </tr>
+      </table>
+      <div class="callout p0">
+        第一性原理结论：policy 的动作目标必须对应数据集里被记录和被重建的物理点。抓取任务中这个点应是手指工作点 / task TCP；如果 IK 用的是 gripper mount 或另一个固定 frame，系统不会报错，只会把整条轨迹平移到错误工作空间。
+      </div>
+    </div>
+
+    <div class="card full">
+      <div class="section-head">
+        <h2>闭环路线</h2>
+        <span class="badge todo">执行顺序</span>
+      </div>
+
+      <div class="phase">
+        <div class="name">Phase 0</div>
+        <div>
+          <b>同步与环境基线</b>
+          <ul>
+            <li>把本地改动通过正常 deploy 同步到工作站，不依赖手工 scp 的单个 yaml。</li>
+            <li>在工作站确认 <code>.venv-fr3</code>、RealSense 权限、Pika 串口、FR3 FCI 网络。</li>
+            <li>运行 <code>bash tools/fr3/run_pick_place_infer_workstation.sh env</code>，保存输出作为本轮 rollout 配置快照。</li>
+          </ul>
+        </div>
+        <div class="gate"><b>Gate</b><br>env 输出的 robot IP、camera config、URDF、target frame、gripper threshold 全部匹配工作站合同。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">Phase 1</div>
+        <div>
+          <b>Frame / start pose 代码闭合</b>
+          <ul>
+            <li>硬件 start pose 已切到 XML <code>home</code> keyframe；继续禁止把 SDK <code>move_to_start()</code> 当工作站合同。</li>
+            <li>跑 URDF/MJCF frame 一致性测试，修复 <code>pika_task_tcp</code> 的任何模型差异。</li>
+            <li>在 rollout runtime 的 preflight 里把 <code>T_B_Ws</code> 起点对齐统计、target frame、dataset root 写入日志。</li>
+          </ul>
+        </div>
+        <div class="gate"><b>Gate</b><br><code>home</code> 后 q 误差达标；frame test 通过；preview 首帧对齐误差在 <code>20 mm / 8 deg</code> 安全阈值内。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">Phase 2</div>
+        <div>
+          <b>数据集 QC 与 Training View</b>
+          <ul>
+            <li>在 Dataset Processing 页对已有工作站 datasets 全量 rerun QC，尤其确认 <code>timestamp_sync</code> verdict。</li>
+            <li>只从 <code>qc_pass</code> 或确认后的 <code>qc_warn</code> 构建 Training View；<code>pose_ready</code> 但 QC 未跑过的 dataset 不准进入训练。</li>
+            <li>默认训练合同使用 <code>delta_ee_from_prev_cmd</code>；保留 <code>absolute_ee</code> 作为诊断基线。</li>
+          </ul>
+        </div>
+        <div class="gate"><b>Gate</b><br><code>meta/il_view_manifest.json</code> 有 action contract、自检结果、excluded episodes、source episode map。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">Phase 3</div>
+        <div>
+          <b>ACT 训练与离线验证</b>
+          <ul>
+            <li>用 Training View 训练 ACT，不在 GUI 内做跨 session 合并；跨 session 合并只走 CLI，并人工保证每个源 session 已过 QC。</li>
+            <li>训练后检查 checkpoint 的 <code>train_config.json</code> 能反查 dataset root、camera keys 和 action names。</li>
+            <li>离线跑 action reconstruction self-check / MuJoCo replay gate，先看 policy 输出能否重建成合理绝对 EE 流。</li>
+          </ul>
+        </div>
+        <div class="gate"><b>Gate</b><br>checkpoint 能加载；相机 keys 为 <code>ee</code>/<code>side</code>；delta 重建无 reference 缺失；离线轨迹无异常 step。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">Phase 4</div>
+        <div>
+          <b>真机 smoke 到 bounded rollout</b>
+          <ul>
+            <li><code>smoke</code>：不 homing、不运动，只验证 checkpoint、camera、一次 forward、action decode。</li>
+            <li><code>preview</code>：先移动到 XML keyframe start，20 step，无真实 rollout，打开相机窗口核对实时图像。</li>
+            <li><code>real_debug</code>：交互式 rollout，打开 MuJoCo target viewer；终端按 <span class="kbd">s</span>/<span class="kbd">x</span>/<span class="kbd">q</span> 控制。</li>
+            <li><code>real_once</code>：单次 bounded rollout，作为第一次闭环验收模式。</li>
+          </ul>
+        </div>
+        <div class="gate"><b>Gate</b><br>首帧安全阈值、每步安全阈值、gripper 归一化、相机 freshness 均在日志中可追溯。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">Phase 5</div>
+        <div>
+          <b>调参只在本 rig 上发生</b>
+          <ul>
+            <li><code>n_action_steps</code>、ACT temporal ensemble、command EMA、controller gains 继续默认留空，直到这台机器有可复现实测。</li>
+            <li>只基于失败类型调参：视觉滞后、首帧对齐、IK 不可达、gripper 时序、policy 抖动分别看不同日志。</li>
+            <li>每次修改生成一份 rollout config snapshot，避免把调参写成隐式 shell 历史。</li>
+          </ul>
+        </div>
+        <div class="gate"><b>Gate</b><br>同一 checkpoint 在相同 dataset start pose 下，bounded rollout 可重复，失败能归因到单一模块。</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-head">
+        <h2>端到端数据流</h2>
+        <span class="badge todo">合同视图</span>
+      </div>
+      <div class="flow">Record session
+  FR3/Pika/Realsense @ workstation
+  action = absolute EE + gripper.pos
+  target_frame_name = pika_task_tcp
+        |
+        v
+Dataset Processing / QC
+  timestamp_sync + schema + replay/readiness checks
+  qc_pass or acknowledged qc_warn only
+        |
+        v
+Training View
+  delta_ee_from_prev_cmd
+  respect annotations
+  il_view_manifest.json
+        |
+        v
+ACT training
+  checkpoint train_config.json records dataset/action/cameras
+        |
+        v
+Rollout
+  XML home keyframe start
+  URDF IK target = pika_task_tcp
+  ee/side cameras by serial
+  gripper_close_below > 0.1125</div>
+    </div>
+
+    <div class="card">
+      <div class="section-head">
+        <h2>Gripper 单位后续修复</h2>
+        <span class="badge warn">P1</span>
+      </div>
+      <p>当前 <code>normalize_dataset_gripper()</code> 对 Pika 数据按数值猜单位：小于 <code>gripper_max_width_mm / 1000 * 1.25</code> 的值会被当作米，<code>0.08</code> 会被解读成 80 mm，再归一化成接近全开。</p>
+      <p><code>--gripper-close-below 0.12</code> 是部署侧 guard：它必须高于 90 mm gripper 的歧义上界 <code>0.1125</code>，把 ACT 输出穿过的危险区压成关闭。</p>
+      <div class="callout warn">
+        根治方案：训练 view / checkpoint manifest 写明 <code>gripper.pos</code> 单位和 range；runtime 按 feature metadata 解析，不再按浮点值猜。由于该函数是共享推理代码，修改前要覆盖另一台 DAS / Hikrobot rig 的回归。
+      </div>
+    </div>
+
+    <div class="card full">
+      <div class="section-head">
+        <h2>近期任务清单</h2>
+        <span class="badge todo">Next</span>
+      </div>
+      <table class="table">
+        <tr>
+          <th>优先级</th>
+          <th>任务</th>
+          <th>代码落点</th>
+          <th>验收</th>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0</span></td>
+          <td>保持工作站 homing 使用 <code>fr3_pika_gripper.xml</code> 的 <code>home</code> keyframe。</td>
+          <td><code>tools/fr3/fr3_move_to_start_runtime.py</code> 或新增 keyframe helper；<code>tools/fr3/run_pick_place_infer_workstation.sh</code></td>
+          <td>真机读回 q 与 XML 前 7 维一致；日志不再声称 SDK start pose 是合同。</td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0</span></td>
+          <td>核对并修复 <code>pika_task_tcp</code> 的 URDF / MJCF 一致性。</td>
+          <td><code>src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf</code>、<code>fr3_pika_gripper.xml</code>、<code>tests/robots/test_fr3_model_frames.py</code></td>
+          <td>frame contract test 通过；rollout announce 中 target frame 不依赖默认值。</td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0</span></td>
+          <td>同步部署到工作站并重跑已有 dataset QC。</td>
+          <td><code>run/deploy.sh workstation</code>、Dataset Processing 页面</td>
+          <td>所有进入训练的 dataset 为 <code>qc_pass</code> 或确认后的 <code>qc_warn</code>，warning 写入 event log。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1</span></td>
+          <td>训练一个最小 ACT checkpoint 并跑 <code>smoke</code>/<code>preview</code>。</td>
+          <td><code>tools/fr3/fr3_train_il_policy.py</code>、<code>tools/fr3/run_pick_place_infer_workstation.sh</code></td>
+          <td>checkpoint 加载、相机打开、首帧对齐、action decode 全通过，无运动异常。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1</span></td>
+          <td>把 gripper 单位从 heuristic 迁到 metadata-driven。</td>
+          <td><code>tools/fr3/fr3_act_infer_real_runtime.py::normalize_dataset_gripper</code>、view/checkpoint manifest</td>
+          <td>工作站归一化数据和另一台毫米数据都有单测覆盖。</td>
+        </tr>
+      </table>
+    </div>
+
+    <div class="card full">
+      <div class="section-head">
+        <h2>运行命令顺序</h2>
+        <span class="badge todo">Operator Path</span>
+      </div>
+      <div class="flow"># 1. 部署后确认解析出的环境
+FR3_INFER_CHECKPOINT=outputs/train/&lt;job&gt;/checkpoints/last \
+  bash tools/fr3/run_pick_place_infer_workstation.sh env
+
+# 2. 只验证软件、checkpoint、相机、一次 forward，不移动手臂
+FR3_INFER_CHECKPOINT=outputs/train/&lt;job&gt;/checkpoints/last \
+  bash tools/fr3/run_pick_place_infer_workstation.sh smoke
+
+# 3. 移到 XML home keyframe start，预览相机和短步输出
+FR3_INFER_CHECKPOINT=outputs/train/&lt;job&gt;/checkpoints/last \
+  bash tools/fr3/run_pick_place_infer_workstation.sh preview
+
+# 4. 带 MuJoCo target viewer 的交互式真机调试
+FR3_INFER_CHECKPOINT=outputs/train/&lt;job&gt;/checkpoints/last \
+  bash tools/fr3/run_pick_place_infer_workstation.sh real_debug
+
+# 5. 第一次验收用 bounded rollout
+FR3_INFER_CHECKPOINT=outputs/train/&lt;job&gt;/checkpoints/last \
+  bash tools/fr3/run_pick_place_infer_workstation.sh real_once</div>
+      <p class="small">注意：上面的第 3 到 5 步以 Phase 1 的 keyframe start pose 修复为前提；在修复前，不应把当前 SDK <code>move_to_start()</code> 视为工作站闭环合同。</p>
+    </div>
+  </div>
+</div>
+</body>
+</html>

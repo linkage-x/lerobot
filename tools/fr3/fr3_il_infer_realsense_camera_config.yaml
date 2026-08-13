@@ -1,0 +1,29 @@
+# Inference cameras for the FR3 teleoperation workstation (192.168.100.155).
+#
+# The keys here are not labels: fr3_act_infer_real_runtime.py asks the checkpoint which images it
+# needs (`observation.images.<key>`) and looks each one up in this file by the bare key. A
+# workstation recording is made with tools/fr3/fr3_record_config.yaml, whose cameras are `ee` and
+# `side`, so those are the only two names a policy trained on it will ask for. Renaming one here
+# does not remap it -- it makes the camera un-findable and the rollout raises at startup.
+#
+# Serials are the same two RealSense units the recorder opens. They are matched by serial rather
+# than by bus position so swapping a USB port cannot silently exchange the wrist and side views,
+# which is a mistake a policy cannot detect and an operator cannot see in a preview window.
+robot:
+  cameras:
+    # 60 Hz for the same reason the recorder uses it, and it has to stay matched: an image is
+    # only as fresh as the sensor's frame period allows, and the policy was trained on frames
+    # that were ~23 ms behind the arm read at this rate. Serving it 30 Hz frames at deployment
+    # doubles that lag and shifts the observation away from the training distribution.
+    ee:
+      type: intelrealsense
+      serial_number_or_name: "315122271876"
+      width: 640
+      height: 480
+      fps: 60
+    side:
+      type: intelrealsense
+      serial_number_or_name: "243122071795"
+      width: 640
+      height: 480
+      fps: 60

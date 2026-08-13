@@ -242,11 +242,16 @@ export class DataCollectionGuiApi {
     return structuredClone(this.snapshot);
   }
 
-  async connectRecording(backend?: "real" | "sim"): Promise<GuiSnapshot> {
+  async connectRecording(backend?: "real" | "sim", episodeTimeS?: number): Promise<GuiSnapshot> {
     // The workstation profile picks between the hardware FR3 and its MuJoCo twin here; the
     // Thor profile has a single rig and sends no backend at all.
-    const endpoint = backend
-      ? `/api/handheld/record/connect?backend=${encodeURIComponent(backend)}`
+    const params = new URLSearchParams();
+    if (backend) params.set("backend", backend);
+    if (episodeTimeS != null && Number.isFinite(episodeTimeS)) {
+      params.set("episode_time_s", String(episodeTimeS));
+    }
+    const endpoint = params.toString()
+      ? `/api/handheld/record/connect?${params.toString()}`
       : "/api/handheld/record/connect";
     const remote = await this.postRemoteSnapshot(endpoint);
     if (remote) {

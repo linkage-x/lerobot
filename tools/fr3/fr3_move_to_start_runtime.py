@@ -15,7 +15,7 @@
 # limitations under the License.
 
 """
-Move the FR3 arm to its SDK-defined start pose from inside the Docker runtime.
+Move the FR3 arm to the workstation XML ``home`` keyframe.
 """
 
 from __future__ import annotations
@@ -26,11 +26,22 @@ import sys
 
 
 DEFAULT_ROBOT_IP = "192.168.1.206"
+# First seven qpos values from
+# src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.xml:<key name="home">.
+# This is the workstation recording start contract; it is deliberately not Panda.move_to_start().
+FR3_PIKA_HOME_JOINTS_RAD = (0.0, -0.785, 0.0, -2.355, 0.0, 1.57079, 0.785)
+DEFAULT_TOLERANCE_RAD = 0.01
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Move the FR3 arm to the SDK start pose.")
+    parser = argparse.ArgumentParser(description="Move the FR3 arm to the workstation XML home keyframe.")
     parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP, help="FR3 controller IP address.")
+    parser.add_argument(
+        "--tolerance-rad",
+        type=float,
+        default=DEFAULT_TOLERANCE_RAD,
+        help="Maximum allowed read-back joint error after the move.",
+    )
     return parser.parse_args(argv)
 
 
@@ -75,13 +86,23 @@ def main(argv: list[str] | None = None) -> int:
                 "or retry with "
                 f"`python tools/fr3/fr3_move_to_start.py --runtime host --robot-ip={args.robot_ip}`."
             ) from exc
-        robot.move_to_start()
+        target = list(FR3_PIKA_HOME_JOINTS_RAD)
+        print(f"fr3_move_to_start=TARGET source=fr3_pika_gripper.xml:keyframe/home q={target}")
+        robot.move_to_joint_position(target)
         state = robot.get_state()
         q = getattr(state, "q", None)
         if q is None:
             raise RuntimeError("FR3 move_to_start completed but state.q is unavailable.")
+        current = [float(value) for value in q]
+        max_error = max(abs(actual - desired) for actual, desired in zip(current, target, strict=True))
+        if max_error > float(args.tolerance_rad):
+            raise RuntimeError(
+                f"FR3 reached a different start pose: max_joint_error={max_error:.4f} rad "
+                f"> tolerance={args.tolerance_rad:.4f} rad."
+            )
         print("fr3_move_to_start=PASS")
-        print("Current joint angles (rad):", list(q))
+        print("Current joint angles (rad):", current)
+        print(f"Max joint error (rad): {max_error:.6f}")
         return 0
     except Exception as exc:
         print(f"fr3_move_to_start=FAIL details={exc}", file=sys.stderr)

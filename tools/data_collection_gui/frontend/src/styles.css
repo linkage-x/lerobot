@@ -635,6 +635,45 @@ button.danger {
   overflow-wrap: anywhere;
 }
 
+
+.episode-duration-control {
+  align-items: center;
+  border: 1px solid #e1e6ea;
+  border-radius: 6px;
+  display: grid;
+  gap: 6px;
+  grid-template-columns: minmax(0, 1fr) 96px auto;
+  margin: 10px 0;
+  padding: 8px;
+}
+
+.episode-duration-control span,
+.episode-duration-control small {
+  color: #60707c;
+  font-size: 12px;
+}
+
+.episode-duration-control input {
+  border: 1px solid #c8d2d8;
+  border-radius: 6px;
+  font: inherit;
+  min-width: 0;
+  padding: 7px 8px;
+}
+
+.episode-duration-control input:focus {
+  border-color: #0f766e;
+  outline: 2px solid rgba(15, 118, 110, 0.16);
+}
+
+.episode-duration-invalid {
+  border-color: #e7b64a;
+}
+
+.episode-duration-invalid input {
+  border-color: #b45309;
+}
+
 .progress,
 .timeline {
   background: #dce3e8;

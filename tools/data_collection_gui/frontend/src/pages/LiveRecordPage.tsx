@@ -185,7 +185,9 @@ export function RecordingPanel({
   onStart,
   onStop,
   logLines,
-  backendPicker
+  backendPicker,
+  episodeDurationControl,
+  episodeDurationValid = true
 }: {
   status: RecordingStatus;
   config: ConfigSummary;
@@ -195,6 +197,8 @@ export function RecordingPanel({
   onStop: (action: "save" | "discard" | "exit") => void;
   logLines?: string[];
   backendPicker?: React.ReactNode;
+  episodeDurationControl?: React.ReactNode;
+  episodeDurationValid?: boolean;
 }) {
   const progress = Math.round((status.frameIndex / Math.max(status.targetFrames, 1)) * 100);
   const { isConnected, canStartEpisode, canResolveEpisode, canExit } =
@@ -212,6 +216,7 @@ export function RecordingPanel({
         </span>
       </div>
       {backendPicker}
+      {episodeDurationControl}
       {isGmsl && <HardwareSyncBadge config={config} />}
       <div className="config-grid">
         <Metric label="Config" value={config.configPath} />
@@ -226,7 +231,7 @@ export function RecordingPanel({
         <div className="progress-bar" style={{ width: `${progress}%` }} />
       </div>
       <div className="control-row">
-        <button disabled={busy || isConnected} onClick={onConnect} title="Shortcut: C">Connect <kbd>C</kbd></button>
+        <button disabled={busy || isConnected || !episodeDurationValid} onClick={onConnect} title="Shortcut: C">Connect <kbd>C</kbd></button>
         <button disabled={busy || !canStartEpisode} onClick={onStart} title="Shortcut: E">StartEpisode <kbd>E</kbd></button>
         <button disabled={busy || !canResolveEpisode} onClick={() => onStop("save")} title="Shortcut: S">Save <kbd>S</kbd></button>
         <button disabled={busy || !canResolveEpisode} onClick={() => onStop("discard")} title="Shortcut: D">Discard <kbd>D</kbd></button>
@@ -264,7 +269,7 @@ export function LiveRecordPage({
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
-  onConnect: (backend?: RecordingBackend) => void;
+  onConnect: (backend?: RecordingBackend, episodeTimeS?: number) => void;
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
   onOpenInReplay: () => void;
@@ -279,6 +284,7 @@ export function LiveRecordPage({
   const [selectedBackend, setSelectedBackend] = useState<RecordingBackend>(
     snapshot.recording.backend ?? "real"
   );
+  const [episodeTimeInput, setEpisodeTimeInput] = useState(() => String(snapshot.configSummary.episodeTimeS));
   const activeTask = snapshot.activeTaskId
     ? snapshot.tasks.find((t) => t.id === snapshot.activeTaskId) ?? null
     : null;
@@ -290,6 +296,10 @@ export function LiveRecordPage({
   // directly. The pre-PR6 approach of accumulating `lastOutput` lost any
   // line that didn't land at the top of a snapshot poll window.
   const logLines = snapshot.recording.recentOutput ?? [];
+  const parsedEpisodeTimeS = Number(episodeTimeInput);
+  const canUseEpisodeTimeInput = Number.isFinite(parsedEpisodeTimeS) && parsedEpisodeTimeS >= 1 && parsedEpisodeTimeS <= 600;
+  const requestedEpisodeTimeS = canUseEpisodeTimeInput ? parsedEpisodeTimeS : snapshot.configSummary.episodeTimeS;
+  const requestedTargetFrames = Math.max(1, Math.round(snapshot.configSummary.fps * requestedEpisodeTimeS));
 
   // Keyboard shortcuts for the record controls. This component is mounted only
   // while activePage === "live-record", so the window listener is naturally
@@ -307,9 +317,9 @@ export function LiveRecordPage({
       if (busy) return;
       const controls = recordingControlAvailability(snapshot.recording);
       const key = event.key.toLowerCase();
-      if (key === "c" && controls.canConnect) {
+      if (key === "c" && controls.canConnect && canUseEpisodeTimeInput) {
         event.preventDefault();
-        onConnect(supportsBackendChoice ? selectedBackend : undefined);
+        onConnect(supportsBackendChoice ? selectedBackend : undefined, requestedEpisodeTimeS);
       } else if (key === "e" && controls.canStartEpisode) {
         event.preventDefault();
         onStart();
@@ -326,7 +336,7 @@ export function LiveRecordPage({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [busy, snapshot.recording, onConnect, onStart, onStop, supportsBackendChoice, selectedBackend]);
+  }, [busy, snapshot.recording, onConnect, onStart, onStop, supportsBackendChoice, selectedBackend, requestedEpisodeTimeS]);
 
   // Once a session is live the backend is fixed by the running recorder process; showing the
   // operator's stale pick instead of the actual one would misreport what is being recorded.
@@ -335,6 +345,28 @@ export function LiveRecordPage({
       setSelectedBackend(snapshot.recording.backend);
     }
   }, [recorderConnected, snapshot.recording.backend]);
+
+  useEffect(() => {
+    if (!recorderConnected) {
+      setEpisodeTimeInput(String(snapshot.configSummary.episodeTimeS));
+    }
+  }, [recorderConnected, snapshot.configSummary.episodeTimeS]);
+
+  const episodeDurationControl = (
+    <label className={`episode-duration-control ${canUseEpisodeTimeInput ? "" : "episode-duration-invalid"}`}>
+      <span>Episode seconds</span>
+      <input
+        type="number"
+        min={1}
+        max={600}
+        step={1}
+        disabled={busy || recorderConnected}
+        value={episodeTimeInput}
+        onChange={(event) => setEpisodeTimeInput(event.target.value)}
+      />
+      <small>{canUseEpisodeTimeInput ? `${requestedTargetFrames} frames` : "1-600s"}</small>
+    </label>
+  );
 
   const backendPicker = supportsBackendChoice ? (
     <div className="mujoco-mode-picker" role="group" aria-label="Recording backend">
@@ -384,11 +416,13 @@ export function LiveRecordPage({
           status={snapshot.recording}
           config={snapshot.configSummary}
           busy={busy}
-          onConnect={() => onConnect(supportsBackendChoice ? selectedBackend : undefined)}
+          onConnect={() => onConnect(supportsBackendChoice ? selectedBackend : undefined, requestedEpisodeTimeS)}
           onStart={onStart}
           onStop={onStop}
           logLines={logLines}
           backendPicker={backendPicker}
+          episodeDurationControl={episodeDurationControl}
+          episodeDurationValid={canUseEpisodeTimeInput}
         />
         <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />
       </div>

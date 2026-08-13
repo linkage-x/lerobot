@@ -97,6 +97,60 @@ class FrankaResearch3(Robot):
         if self._otg_error is not None:
             raise RuntimeError("FR3 OTG background loop failed.") from self._otg_error
 
+    def _configured_start_joint_positions(self) -> np.ndarray | None:
+        if self.config.start_joint_positions is None:
+            return None
+        target = np.asarray(self.config.start_joint_positions, dtype=np.float64)
+        expected_shape = (len(self.config.joint_names),)
+        if target.shape != expected_shape:
+            raise RuntimeError(f"Configured FR3 start pose shape must be {expected_shape}, got {target.shape}.")
+        return target
+
+    def _move_to_configured_start(self, target_joint_positions_rad: np.ndarray) -> np.ndarray:
+        if self._arm is None:
+            raise RuntimeError("Arm backend is not connected.")
+        set_joint_positions = getattr(self._arm, "set_joint_positions", None)
+        if not callable(set_joint_positions):
+            raise RuntimeError("FR3 arm backend does not support set_joint_positions().")
+
+        tolerance_rad = float(self.config.start_joint_tolerance_rad)
+        deadline_s = time.perf_counter() + float(self.config.start_move_timeout_s)
+        command_joint_positions_rad = self._read_joint_positions()
+
+        if self._otg is None:
+            set_joint_positions(target_joint_positions_rad)
+        else:
+            self._otg.reset(command_joint_positions_rad)
+            while time.perf_counter() < deadline_s:
+                self._raise_if_otg_failed()
+                command_joint_positions_rad = np.asarray(
+                    self._otg.step(command_joint_positions_rad, target_joint_positions_rad),
+                    dtype=np.float64,
+                )
+                set_joint_positions(command_joint_positions_rad)
+                if np.max(np.abs(command_joint_positions_rad - target_joint_positions_rad)) <= tolerance_rad:
+                    break
+                precise_sleep(self.config.otg_dt)
+            else:
+                raise RuntimeError(
+                    "Timed out generating FR3 start-pose trajectory before reaching the configured keyframe."
+                )
+
+        set_joint_positions(target_joint_positions_rad)
+        while time.perf_counter() < deadline_s:
+            observed_joint_positions_rad = self._read_joint_positions()
+            max_error_rad = float(np.max(np.abs(observed_joint_positions_rad - target_joint_positions_rad)))
+            if max_error_rad <= tolerance_rad:
+                logger.info("FR3 reached configured start pose with max_joint_error=%.4f rad", max_error_rad)
+                return observed_joint_positions_rad
+            precise_sleep(0.05)
+
+        raise RuntimeError(
+            "FR3 did not reach the configured start pose within "
+            f"{self.config.start_move_timeout_s:.1f}s; "
+            f"max_joint_error={max_error_rad:.4f} rad, tolerance={tolerance_rad:.4f} rad."
+        )
+
     def _start_otg_loop(self, initial_joint_positions: np.ndarray) -> None:
         self._otg_target_joints = np.asarray(initial_joint_positions, dtype=np.float64).copy()
         self._otg_command_joints = np.asarray(initial_joint_positions, dtype=np.float64).copy()
@@ -635,8 +689,10 @@ class FrankaResearch3(Robot):
         self._clear_observation_state_snapshot()
         if self._arm is None:
             raise RuntimeError("Arm backend is not connected.")
+
+        configured_start = self._configured_start_joint_positions()
         move_to_start = getattr(self._arm, "move_to_start", None)
-        if not callable(move_to_start):
+        if configured_start is None and not callable(move_to_start):
             raise RuntimeError("FR3 arm backend does not support move_to_start().")
 
         otg_enabled = self._otg is not None
@@ -646,8 +702,11 @@ class FrankaResearch3(Robot):
 
         moved_joint_positions_rad = fallback_joint_positions_rad
         try:
-            move_to_start()
-            moved_joint_positions_rad = self._read_joint_positions()
+            if configured_start is None:
+                move_to_start()
+                moved_joint_positions_rad = self._read_joint_positions()
+            else:
+                moved_joint_positions_rad = self._move_to_configured_start(configured_start)
         finally:
             self._reset_teleop_state()
             if otg_enabled:

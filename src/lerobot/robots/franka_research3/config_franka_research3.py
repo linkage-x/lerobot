@@ -30,6 +30,12 @@ class FrankaResearch3Config(RobotConfig):
     allow_mock_gripper: bool = True
     urdf_path: str = ""
     target_frame_name: str = "pika_gripper_ee"
+    # Optional explicit arm start pose for rigs where the data-collection workspace is anchored
+    # to a model keyframe rather than the vendor SDK's built-in start configuration. When unset,
+    # move_to_start() preserves the backend default for existing rigs.
+    start_joint_positions: tuple[float, ...] | None = None
+    start_joint_tolerance_rad: float = 0.01
+    start_move_timeout_s: float = 20.0
     joint_names: list[str] = field(
         default_factory=lambda: [
             "fr3_joint1",
@@ -104,6 +110,12 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("gripper_backend must be one of 'pika', 'das', 'franka_hand', 'corenetic', or 'mock'.")
         if len(self.workspace_min) != 3 or len(self.workspace_max) != 3:
             raise ValueError("workspace_min and workspace_max must be 3D tuples.")
+        if self.start_joint_positions is not None and len(self.start_joint_positions) != len(self.joint_names):
+            raise ValueError("start_joint_positions must match the number of FR3 joints when provided.")
+        if self.start_joint_tolerance_rad <= 0:
+            raise ValueError("start_joint_tolerance_rad must be positive.")
+        if self.start_move_timeout_s <= 0:
+            raise ValueError("start_move_timeout_s must be positive.")
         if self.max_target_delta_pos is not None and len(self.max_target_delta_pos) != 3:
             raise ValueError("max_target_delta_pos must be a 3D tuple when provided.")
         if self.max_target_delta_rot is not None and len(self.max_target_delta_rot) != 3:

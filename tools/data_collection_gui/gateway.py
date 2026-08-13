@@ -302,6 +302,8 @@ class GatewayState:
     selected_replay_root: Path | None = None
     active_task_id: str | None = None
     process: subprocess.Popen[str] | None = None
+    runtime_recording_config: dict[str, Any] | None = None
+    runtime_recording_config_path: Path | None = None
     replay_process: subprocess.Popen[str] | None = None
     replay_process_kind: str = ""
     teleop_process: subprocess.Popen[str] | None = None
@@ -3389,34 +3391,78 @@ def _write_overlay_config(state: GatewayState, overlay: dict[str, Any]) -> Path:
     return path
 
 
-def _resolve_recorder_config_path(state: GatewayState) -> Path:
+def _parse_episode_time_override(value: str | float | int | None) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        episode_time_s = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid episode duration: {value!r}") from exc
+    if not math.isfinite(episode_time_s) or episode_time_s < 1.0 or episode_time_s > 600.0:
+        raise ValueError("Episode duration must be between 1 and 600 seconds.")
+    return episode_time_s
+
+
+def _clear_runtime_recording_config(state: GatewayState) -> None:
+    state.runtime_recording_config = None
+    state.runtime_recording_config_path = None
+    dataset_config = _dataset_config(state.config)
+    state.recording.datasetRoot = str(dataset_config.get("root") or state.recording.datasetRoot)
+    state.recording.repoId = str(dataset_config.get("repo_id") or state.recording.repoId)
+    state.recording.targetFrames = _target_frames(state.config)
+
+
+def _resolve_recorder_config_path(state: GatewayState, *, episode_time_s: float | None = None) -> Path:
     """Config path to spawn the recorder with.
 
-    Returns the active task's overlay config when one is bound, else the
-    repo's literal config file (current behaviour). Sets
-    ``state.recording.datasetRoot`` to whichever dataset root will be used.
+    Returns an overlay config when a task binding or per-session UI duration is active, else the
+    repo's literal config file. Sets ``state.recording`` and runtime config fields to whichever
+    dataset config the recorder will actually use.
     """
 
     active_task = _find_task(state, state.active_task_id)
-    if active_task is None or not str(active_task.get("datasetRepoId") or "").strip():
+    has_task = active_task is not None and bool(str(active_task.get("datasetRepoId") or "").strip())
+    overlay: dict[str, Any] | None = None
+    if has_task:
+        datasets_dir = _task_datasets_dir(state)
+        if datasets_dir is None:
+            raise RuntimeError(
+                "Cannot record into a task without a datasets root; start the gateway "
+                "with --datasets-root or set dataset.root in the config."
+            )
+        overlay = _build_task_overlay_config(state.config, active_task, datasets_dir)
+    else:
         state.active_task_id = None
-        state.recording.datasetRoot = str(_dataset_config(state.config).get("root") or "")
-        return state.config_path
-    datasets_dir = _task_datasets_dir(state)
-    if datasets_dir is None:
-        raise RuntimeError(
-            "Cannot record into a task without a datasets root; start the gateway "
-            "with --datasets-root or set dataset.root in the config."
+        if episode_time_s is not None:
+            overlay = copy.deepcopy(state.config)
+
+    if episode_time_s is not None:
+        if overlay is None:
+            overlay = copy.deepcopy(state.config)
+        dataset = overlay.get("dataset")
+        if not isinstance(dataset, dict):
+            dataset = {}
+            overlay["dataset"] = dataset
+        dataset["episode_time_s"] = float(episode_time_s)
+
+    config = overlay if overlay is not None else state.config
+    config_path = _write_overlay_config(state, overlay) if overlay is not None else state.config_path
+    dataset_config = _dataset_config(config)
+    state.runtime_recording_config = config
+    state.runtime_recording_config_path = config_path
+    state.recording.datasetRoot = str(dataset_config.get("root") or "")
+    state.recording.repoId = str(dataset_config.get("repo_id") or state.recording.repoId)
+    state.recording.targetFrames = _target_frames(config)
+
+    if has_task:
+        state.log(
+            "info",
+            f"Recording into task '{active_task['name']}' dataset {active_task['datasetRepoId']} "
+            f"(config {config_path})",
         )
-    overlay = _build_task_overlay_config(state.config, active_task, datasets_dir)
-    overlay_path = _write_overlay_config(state, overlay)
-    state.recording.datasetRoot = str(_dataset_config(overlay).get("root") or "")
-    state.log(
-        "info",
-        f"Recording into task '{active_task['name']}' dataset {active_task['datasetRepoId']} "
-        f"(config {overlay_path})",
-    )
-    return overlay_path
+    if episode_time_s is not None:
+        state.log("info", f"Recording episode duration set to {episode_time_s:g}s for this session")
+    return config_path
 
 
 # ----------------------------------------------------- task v3 consolidation ---
@@ -3631,7 +3677,9 @@ def _training_views_root(state: GatewayState) -> Path:
     return _task_exports_root(state) / TRAINING_VIEWS_DIR_NAME
 
 
-def _start_training_view(state: GatewayState, raw_path: str, action_mode: str) -> None:
+def _start_training_view(
+    state: GatewayState, raw_path: str, action_mode: str, *, acknowledge_warnings: bool = False
+) -> None:
     """Workstation counterpart of the Thor v3 export: build a policy-ready training view."""
     if _export_is_running(state):
         raise RuntimeError("A view build is already running; wait for it to finish.")
@@ -3642,9 +3690,35 @@ def _start_training_view(state: GatewayState, raw_path: str, action_mode: str) -
     # re-expressed action column would silently compose two contracts.
     if _dataset_kind(state, dataset_root) == "training_view":
         raise ValueError(f"{dataset_root.name} is already a training view; build from the recording instead.")
+    processing_item = _processing_item_from_dataset(dataset_root)
+    # The same QC gate the Thor export enforces, and for a stronger reason: on this profile the
+    # view *is* the export -- it is the last step before a policy trains on these frames, and
+    # nothing downstream looks at QC again. The timestamp-sync verdict in particular only exists
+    # inside a QC run, so an ungated build let a dataset whose modalities disagreed reach
+    # training with its verdict sitting in a file no one had opened.
+    status = str(processing_item.get("status") or "")
+    warnings = _qc_warning_messages(processing_item)
+    if status == "qc_warn":
+        # A warning is the operator's call to make, but only with the warnings in front of them
+        # -- the same rule the replay gate uses for a failed MuJoCo score.
+        if not acknowledge_warnings:
+            raise ValueError(
+                "QC passed with warnings; confirm to build the view anyway. "
+                + (" | ".join(warnings) if warnings else "See the QC summary for details.")
+            )
+        state.log(
+            "warn",
+            f"Building a training view of {dataset_root.name} over {len(warnings)} QC warning(s): "
+            + (" | ".join(warnings) if warnings else "unspecified"),
+        )
+    elif status != "qc_pass":
+        raise ValueError(
+            f"{dataset_root.name} must pass QC before a training view is built "
+            f"(status: {status or 'unknown'}). Run QC on the Dataset Processing page."
+        )
     command, view_root = _training_view_command(state, dataset_root, action_mode)
     excluded = _annotation_excluded_episodes(dataset_root)
-    total_episodes = int(_processing_item_from_dataset(dataset_root).get("totalEpisodes") or 0)
+    total_episodes = int(processing_item.get("totalEpisodes") or 0)
     if excluded and len(excluded) >= total_episodes > 0:
         raise ValueError(
             f"Every episode of {dataset_root.name} is marked as not for training; "
@@ -3665,7 +3739,7 @@ def _start_training_view(state: GatewayState, raw_path: str, action_mode: str) -
         target=action_mode,
         datasetRoot=str(dataset_root),
         outputPath=str(view_root),
-        selectedEpisodes=int(_processing_item_from_dataset(dataset_root).get("totalEpisodes") or 0),
+        selectedEpisodes=total_episodes,
         totalFrames=0,
         message=f"Building {action_mode} training view from {dataset_root.name}…",
         pid=state.export_process.pid,
@@ -7181,6 +7255,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         state.process = None
         state.camera_preview_suspended = False
         state.process_started_at_s = None
+        _clear_runtime_recording_config(state)
         state.recording.state = "idle" if process.returncode == 0 else "error"
         state.recording.pid = None
         state.recording.frameIndex = 0 if process.returncode == 0 else state.recording.frameIndex
@@ -7195,7 +7270,6 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
             state.recording.message = f"Recorder exited with code {process.returncode}: {summary}"
         else:
             state.recording.message = f"Recorder exited with code {process.returncode}"
-        state.recording.datasetRoot = str(_dataset_config(state.config).get("root") or state.recording.datasetRoot)
         _set_all_device_states(
             state,
             "idle" if process.returncode == 0 or exited_from in ("idle", "discarding") else "error",
@@ -7303,7 +7377,10 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
             "processElapsedS": elapsed_s,
             "datasetsRoot": str(state.datasets_root) if state.datasets_root else "",
         },
-        "configSummary": _config_summary(state.config, state.config_path),
+        "configSummary": _config_summary(
+            state.runtime_recording_config or state.config,
+            state.runtime_recording_config_path or state.config_path,
+        ),
         "devices": [
             {**device, "state": "running" if recording_state == "recording" and device["state"] != "error" else device["state"]}
             for device in state.devices
@@ -7849,7 +7926,7 @@ def _box_touch_cali_log_payload(state: GatewayState) -> dict[str, Any]:
         return {"running": state.box_touch_cali_running, "lines": list(state.box_touch_cali_log)}
 
 
-def _connect_recorder(state: GatewayState, *, backend: str | None = None) -> None:
+def _connect_recorder(state: GatewayState, *, backend: str | None = None, episode_time_s: float | None = None) -> None:
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
         return
@@ -7862,7 +7939,7 @@ def _connect_recorder(state: GatewayState, *, backend: str | None = None) -> Non
             raise ValueError("Only the workstation profile can choose a recording backend")
         state.recording.backend = backend
 
-    config_path = _resolve_recorder_config_path(state)
+    config_path = _resolve_recorder_config_path(state, episode_time_s=episode_time_s)
     recorder_script, config_flag = _recorder_script(state)
     command = [
         # The FR3 stack (panda_py, placo, mujoco) lives in .venv-fr3 on the workstation.
@@ -9706,6 +9783,7 @@ def _stop_recorder(state: GatewayState, action: str) -> None:
             os.killpg(process.pid, signal.SIGTERM)
             state.process = None
             state.process_started_at_s = None
+            _clear_runtime_recording_config(state)
             state.recording.state = "idle"
             state.recording.pid = None
             state.recording.message = "Recorder process terminated during connect"
@@ -9729,6 +9807,7 @@ def _stop_recorder(state: GatewayState, action: str) -> None:
     os.killpg(process.pid, signal.SIGTERM)
     state.process = None
     state.process_started_at_s = None
+    _clear_runtime_recording_config(state)
     state.recording.state = "idle"
     state.recording.pid = None
     state.recording.message = "Recorder process terminated"
@@ -10047,7 +10126,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             # except remembered to cover.
             state = self.server.state
             requested_backend = (query.get("backend", [""])[0] or "").strip().lower() or None
+            raw_episode_time_s = (
+                query.get("episode_time_s", query.get("episodeTimeS", [""]))[0] or ""
+            ).strip()
             try:
+                episode_time_s = _parse_episode_time_override(raw_episode_time_s)
                 with _previews_suspended_for_connect(state):
                     # Done outside the state lock (terminate() blocks).
                     _stop_all_camera_previews(state)
@@ -10060,7 +10143,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     if settle_s > 0:
                         time.sleep(settle_s)
                     with state.lock:
-                        _connect_recorder(state, backend=requested_backend)
+                        _connect_recorder(state, backend=requested_backend, episode_time_s=episode_time_s)
                         response = _snapshot(state)
                 _json_response(self, HTTPStatus.OK, response)
             except Exception as exc:  # noqa: BLE001
@@ -10360,6 +10443,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                             requested,
                             (query.get("action_mode", [DEFAULT_TRAINING_VIEW_ACTION_MODE])[0] or "").strip()
                             or DEFAULT_TRAINING_VIEW_ACTION_MODE,
+                            acknowledge_warnings=_query_flag(query, "acknowledge_warnings"),
                         )
                     else:
                         _start_approved_dataset_export(

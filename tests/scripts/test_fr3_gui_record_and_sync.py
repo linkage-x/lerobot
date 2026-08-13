@@ -176,6 +176,46 @@ def test_sim_and_hardware_robots_declare_the_same_observation_schema(tmp_path):
     assert sim_names[2:] == hardware_names[2:]
 
 
+
+def test_gui_recorder_reset_gripper_to_open_updates_robot_and_teleop():
+    from tools.fr3.fr3_gui_record_runtime import _reset_gripper_to_open
+
+    class Robot:
+        name = "franka_research3"
+
+        def __init__(self):
+            self.commands = []
+
+        def send_action(self, action):
+            self.commands.append(dict(action))
+
+    class Teleop:
+        def __init__(self):
+            self.gripper = 0.0
+
+        def set_gripper(self, value):
+            self.gripper = value
+
+    robot = Robot()
+    teleop = Teleop()
+
+    _reset_gripper_to_open(robot, teleop)
+
+    assert robot.commands == [
+        {
+            "enabled": False,
+            "target_x": 0.0,
+            "target_y": 0.0,
+            "target_z": 0.0,
+            "target_wx": 0.0,
+            "target_wy": 0.0,
+            "target_wz": 0.0,
+            "gripper": 1.0,
+        }
+    ]
+    assert teleop.gripper == 1.0
+
+
 # ------------------------------------------------------------------------- the sync audit ---
 
 

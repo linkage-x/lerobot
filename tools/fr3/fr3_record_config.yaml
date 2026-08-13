@@ -5,6 +5,11 @@ robot:
   allow_mock_gripper: false
   urdf_path: /lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf
   target_frame_name: pika_task_tcp
+  # Must match the `home` keyframe in
+  # src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.xml.
+  # The workstation recording workspace is anchored to this pose; do not use the DAS/SDK start
+  # pose as a substitute.
+  start_joint_positions: [0, -0.785, 0, -2.355, 0, 1.57079, 0.785]
   max_target_delta_pos: [0.001, 0.001, 0.001]
   max_target_delta_rot: [0.01, 0.01, 0.01]
   camera_max_age_ms: 100

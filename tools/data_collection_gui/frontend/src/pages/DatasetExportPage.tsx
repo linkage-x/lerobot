@@ -1,7 +1,15 @@
 import { useState } from "react";
 import type { GuiSnapshot } from "../api";
 import type { RecordedDataset } from "../types";
-import { StatusDot, Metric, PageHeader, qcWarnings, stateLabel, taskStatusDot } from "../shared/ui";
+import {
+  StatusDot,
+  Metric,
+  PageHeader,
+  processingStatusLabel,
+  qcWarnings,
+  stateLabel,
+  taskStatusDot
+} from "../shared/ui";
 
 type ActionMode = "absolute_ee" | "delta_ee_from_prev_cmd" | "delta_ee_from_current";
 
@@ -32,11 +40,13 @@ function TrainingViewPage({
   snapshot,
   busy,
   onBuildView,
+  onOpenProcessing,
   onOpenReplay
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
   onBuildView: (path: string, actionMode?: string) => void;
+  onOpenProcessing: () => void;
   onOpenReplay: (path: string) => void;
 }) {
   const exportStatus = snapshot.datasetExport;
@@ -46,6 +56,12 @@ function TrainingViewPage({
   // Views are replay candidates, so they arrive in the same list as the recordings. They belong
   // under the recording they were derived from, not next to it as another build source.
   const datasets = allDatasets.filter((dataset) => dataset.datasetKind !== "training_view");
+  // The gateway refuses to build a view of a dataset that has not passed QC, so the row has to
+  // say where a dataset stands before the button is pressed. Shown rather than filtered: on this
+  // profile every recording is a build candidate, and hiding the ones that need QC is what made
+  // the Thor page look like it had silently lost datasets.
+  const qcItemFor = (dataset: RecordedDataset) =>
+    snapshot.processing.find((item) => item.path === dataset.path);
   const viewsFor = (dataset: RecordedDataset) =>
     allDatasets.filter(
       (candidate) =>
@@ -102,16 +118,54 @@ function TrainingViewPage({
               const buildingThis = building && exportStatus.datasetRoot === dataset.path;
               const excluded = dataset.excludedEpisodes ?? [];
               const kept = Math.max(0, dataset.totalEpisodes - excluded.length);
+              const qc = qcItemFor(dataset);
+              const qcStatus = qc?.status;
+              const warned = qcStatus === "qc_warn";
+              const qcReady = qcStatus === "qc_pass" || warned;
+              const warnings = qc ? qcWarnings(qc) : [];
+              const blockedReason = !qcReady
+                ? qcStatus === "qc_failed"
+                  ? "QC failed — fix or re-record before training on this"
+                  : "Run QC in Dataset Processing before building a view"
+                : kept === 0
+                  ? "Every episode is marked not for training"
+                  : undefined;
               return (
                 <div className="processing-row" key={dataset.path}>
                   <div className="processing-row-main static">
                     <div>
                       <div className="row-title">
+                        <StatusDot
+                          state={
+                            qcStatus === "qc_pass"
+                              ? "running"
+                              : warned
+                                ? "warning"
+                                : qcStatus === "qc_failed"
+                                  ? "error"
+                                  : "idle"
+                          }
+                        />
                         <strong>{dataset.name}</strong>
+                        <em>{qcStatus ? processingStatusLabel[qcStatus] : "QC not run"}</em>
                       </div>
                       <p>
                         {dataset.totalEpisodes} episode(s) · {dataset.totalFrames} frames · {dataset.path}
                       </p>
+                      {qcReady ? null : (
+                        // The gate is stated on the row rather than left to the error the build
+                        // would have returned: QC is a page away, and "why is this disabled" has
+                        // to be answerable without pressing the button first.
+                        <p className="panel-note">
+                          {blockedReason}. {qc?.qcSummary ?? "QC has not run on this recording."}
+                        </p>
+                      )}
+                      {warned ? (
+                        <p className="panel-note">
+                          {warnings.length ? warnings.join(" · ") : qc?.message} — building asks for
+                          confirmation first.
+                        </p>
+                      ) : null}
                       {excluded.length > 0 ? (
                         // Shown before the build, not after: this is the operator's own review
                         // deciding what reaches training, and it changes what the button does.
@@ -124,12 +178,19 @@ function TrainingViewPage({
                     </div>
                     <div className="processing-stats">
                       <button
-                        disabled={busy || building || kept === 0}
-                        title={kept === 0 ? "Every episode is marked not for training" : undefined}
+                        disabled={busy || building || !qcReady || kept === 0}
+                        title={blockedReason}
                         onClick={() => onBuildView(dataset.path, actionMode)}
                       >
                         {buildingThis ? "Building…" : "Build View"}
                       </button>
+                      {qcReady ? null : (
+                        // Navigates; it does not run QC. Naming it for what it does keeps the
+                        // page honest about where the gate is cleared.
+                        <button disabled={busy} onClick={onOpenProcessing}>
+                          Open Processing
+                        </button>
+                      )}
                     </div>
                   </div>
                   {views.length > 0 || buildingThis ? (
@@ -223,6 +284,7 @@ export function DatasetExportPage({
         snapshot={snapshot}
         busy={busy}
         onBuildView={onExportApprovedDataset}
+        onOpenProcessing={onOpenProcessing}
         onOpenReplay={onOpenReplay}
       />
     );

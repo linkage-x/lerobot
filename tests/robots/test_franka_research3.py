@@ -83,6 +83,12 @@ class NoMoveToStartArmDriver(DummyArmDriver):
     move_to_start = None
 
 
+class UpdatingJointArmDriver(DummyArmDriver):
+    def set_joint_positions(self, joint_positions: np.ndarray) -> None:
+        super().set_joint_positions(joint_positions)
+        self.joint_positions = np.asarray(joint_positions, dtype=np.float64).copy()
+
+
 class ReportingArmDriver(DummyArmDriver):
     def get_ee_pose(self) -> np.ndarray | None:
         pose = np.eye(4, dtype=np.float64)
@@ -1271,6 +1277,36 @@ def test_move_to_start_restarts_otg_and_clears_teleop_state(robot):
     assert robot._last_command_pose is None
     assert robot._hold_joint_target is None
     assert robot._prev_enabled is False
+
+
+def test_move_to_start_uses_configured_start_joint_positions(monkeypatch):
+    DummyOTGDriver.instances = []
+    target = (0.0, -0.785, 0.0, -2.355, 0.0, 1.57079, 0.785)
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", UpdatingJointArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+            start_joint_positions=target,
+            start_move_timeout_s=1.0,
+        )
+    )
+
+    try:
+        robot.connect()
+        robot.move_to_start()
+
+        assert robot._arm.move_to_start_calls == 0
+        assert np.allclose(robot._arm.set_joint_positions_calls[-1], np.asarray(target, dtype=np.float64))
+        assert np.allclose(DummyOTGDriver.instances[-1].step_calls[-1][1], np.asarray(target, dtype=np.float64))
+        assert np.allclose(DummyOTGDriver.instances[-1].reset_calls[-1], np.asarray(target, dtype=np.float64))
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
 
 
 def test_move_to_start_raises_when_backend_does_not_support_it(monkeypatch):

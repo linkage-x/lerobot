@@ -22,10 +22,12 @@ The SpaceMouse is the only device that is physically opened in both backends. In
 the arm/gripper/camera rows stay `idle` ("simulated in MuJoCo") rather than pretending to be
 connected.
 
-**Open the gripper after `move_to_start` and before StartEpisode.** The homing move leaves it
-wherever the previous episode ended, so starting a take without opening it records a first frame
-whose gripper state does not match the task's starting condition — and on a grasp task the
-policy learns that opening is something that happens before the data begins.
+The recorder opens the gripper after Connect and after every automatic `move_to_start`, before it
+prints `Episode <n> ready`. On this rig `move_to_start` means the explicit `home` keyframe from
+`fr3_pika_gripper.xml`, not the DAS/SDK default start. The operator should still visually confirm
+the gripper is open before pressing StartEpisode; starting a take from a closed gripper records a
+first frame whose gripper state does not match the task's starting condition, and on a grasp task
+the policy learns that opening is something that happens before the data begins.
 
 ### Recording into a task
 
@@ -110,6 +112,18 @@ python tools/fr3/fr3_train_il_policy.py \
   --action-mode delta_ee_from_prev_cmd --prepare-only
 ```
 
+**The dataset has to have passed QC first**, the same gate the Thor route puts in front of its v3
+export. On this profile the view *is* the export — it is the last step before a policy trains on
+these frames, and nothing downstream looks at QC again. The timestamp-sync verdict in particular
+only exists inside a QC run, so an ungated build was how a dataset whose modalities disagreed
+reached training with its verdict sitting in a file nothing had opened. A `qc_warn` dataset can be
+built with the warnings acknowledged in the confirmation window; a dataset whose QC never ran
+cannot, because there is nothing to judge. The row on the Training View page carries the QC status
+and a **Run QC** shortcut, so a disabled **Build View** says why without being pressed first.
+
+The CLI above is deliberately not gated — it is the escape hatch for a merge across sessions
+(`--dataset-root <parent dir>`), which the page cannot express. Run QC on each source first.
+
 | contract | action features | rotation | reconstruction |
 | --- | --- | --- | --- |
 | `absolute_ee` | `ee.x/y/z` + `ee.qx/qy/qz/qw` + `gripper.pos` | quaternion | — |
@@ -184,6 +198,49 @@ Every transform self-checks by rebuilding the absolute stream and comparing agai
 (tolerance 1e-5 m / 1e-2 deg); the result is recorded in `meta/il_view_manifest.json`. That check
 is what would have caught the capture-time rate bug — the MuJoCo replay gate could not, because it
 compares commanded vs *achieved*, not commanded vs *recorded-commanded*.
+
+#### Rollout on this rig
+
+```bash
+FR3_INFER_CHECKPOINT=outputs/train/<job>/checkpoints/last \
+  bash tools/fr3/run_pick_place_infer_workstation.sh smoke     # then preview, then real
+```
+
+There is no GUI entry point; rollout is a terminal step. `run_pick_place_infer_host.sh` is the
+*other* FR3 rig (Hikrobot cameras, DAS/Corenetic gripper, 192.168.11.102) and cannot be pointed
+here with environment variables, because three of its settings do not mean the same thing on this
+hardware:
+
+- **Tool frame.** The runtime defaults a Pika gripper to `pika_gripper_ee`; this rig records
+  against `pika_task_tcp` (`fr3_record_config.yaml`). Both are fixed frames on the same URDF, about
+  0.4 m apart. Left at the default, the rollout runs, tracks its targets, and is wrong by that
+  offset everywhere.
+- **Gripper units.** Here `gripper.pos` is a normalized 0..1 opening; on the Hikrobot rig the same
+  column is a Pika width in millimetres. That script's `--gripper-close-below 70` would clamp every
+  step of a normalized policy to fully closed.
+- **Cameras.** The checkpoint asks for `observation.images.ee` / `.side` by name, so the camera
+  config has to key its two RealSense units as `ee` and `side` —
+  `tools/fr3/fr3_il_infer_realsense_camera_config.yaml`, matched by serial, at the recorder's 60 Hz
+  so the images are as fresh at deployment as they were in training.
+
+`--gripper-close-below 0.12` is a correctness setting, not a preference. `normalize_dataset_gripper`
+guesses the unit of whatever the policy emits and reads anything ≤ `gripper_max_width_mm/1000 ×
+1.25` (0.1125 at 90 mm) as metres: a policy asking for 0.08 is rebuilt as 0.89, so the gripper opens
+where it was told to close. ACT regresses and its temporal ensemble averages, so a grasp passes
+through that band every time. Forcing the band to 0 before normalization is what makes the contract
+unambiguous; keep any replacement above 0.1125 and below the aperture the task grasps at.
+
+The script never uses `--move-to-das-start` — that homes to a joint configuration belonging to the
+DAS rig. `T_B_Ws` is solved from the first observation against the dataset's start pose, so the
+arm's start pose is what places the whole trajectory in the workspace: it has to be the pose the
+episodes were recorded from. The recording contract is the explicit `home` keyframe in
+`fr3_pika_gripper.xml`: `0 -0.785 0 -2.355 0 1.57079 0.785` for the arm joints.
+
+Tuning knobs the host script ships values for — `n_action_steps`, ACT temporal ensembling, command
+EMA, controller gains — are left unset here. Those numbers were measured on the other rig's arm,
+tool and task; the checkpoint's and driver's own defaults are the honest baseline to tune away
+from. The MuJoCo replay gate is still the thing to clear first, but note what it does *not* cover:
+it scores the recorded EE stream through IK, never the policy's output.
 
 ## Timestamp-synchronisation audit
 
