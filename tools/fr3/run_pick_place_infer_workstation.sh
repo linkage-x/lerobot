@@ -46,20 +46,14 @@ robot_urdf_path="${FR3_ROBOT_URDF_PATH-src/lerobot/robots/franka_research3/asset
 target_frame_name="${FR3_TARGET_FRAME_NAME-pika_task_tcp}"
 
 # Gripper units. On this rig `gripper.pos` is a normalized 0..1 opening in both the dataset and
-# the robot command; on the Hikrobot rig the same column is a Pika width in millimetres, which is
-# why that script's default here is 70 -- a value that would clamp *every* step of a normalized
-# policy to fully closed.
+# the robot command; on the Hikrobot rig unit-bearing feature names such as `*.width_mm` carry the
+# millimetre contract. fr3_act_infer_real_runtime.py now decodes gripper units from the dataset
+# feature name before falling back to the legacy value heuristic, so the old 0.08 -> 80 mm
+# ambiguity no longer needs a default threshold here.
 #
-# 0.12 is not a taste setting either. normalize_dataset_gripper() guesses the unit of whatever the
-# policy emits, and treats anything <= gripper_max_width_mm/1000 * 1.25 (0.1125 at 90 mm) as
-# metres: a policy asking for 0.08 (nearly closed) is read as 80 mm and rebuilt as 0.89 -- the
-# gripper opens where the policy asked it to close. ACT regresses and its temporal ensemble
-# averages, so that band is not hypothetical; a grasp passes through it every time. Forcing the
-# whole ambiguous band to 0 first is what makes the contract unambiguous.
-#
-# Raising this is fine as long as it stays above 0.1125 and below the aperture the task actually
-# grasps at. Lowering it below 0.1125 re-opens the misread.
-gripper_close_below="${FR3_GRIPPER_CLOSE_BELOW-0.12}"
+# Leave disabled unless you intentionally want a task-specific binary close guard. If enabled, it
+# clamps raw policy gripper values below the threshold to fully closed before unit conversion.
+gripper_close_below="${FR3_GRIPPER_CLOSE_BELOW-}"
 
 checkpoint="${FR3_INFER_CHECKPOINT-outputs/train/fr3_spacemouse__delta_ee_from_prev_cmd/checkpoints/last}"
 # Empty means "the dataset the checkpoint was trained on", read out of its own train_config.json.
@@ -124,7 +118,6 @@ common_args=(
   --gripper-max-width-mm "${gripper_max_width_mm}"
   --robot-urdf-path "${robot_urdf_path}"
   --target-frame-name "${target_frame_name}"
-  --gripper-close-below "${gripper_close_below}"
   --first-frame-max-pos-delta-mm "${first_frame_max_pos_delta_mm}"
   --first-frame-max-rot-delta-deg "${first_frame_max_rot_delta_deg}"
   --max-step-pos-delta-mm "${max_step_pos_delta_mm}"
@@ -133,6 +126,9 @@ common_args=(
   --no-move-to-das-start
 )
 
+if [[ -n "${gripper_close_below}" ]]; then
+  common_args+=(--gripper-close-below "${gripper_close_below}")
+fi
 if [[ -n "${dataset_root}" ]]; then
   common_args+=(--dataset-root "${dataset_root}")
 fi
@@ -172,7 +168,7 @@ announce() {
   echo "[INFO] dataset_root=${dataset_root:-<from checkpoint train_config.json>}"
   echo "[INFO] cameras=${camera_config} (keys must match the checkpoint's observation.images.*)"
   echo "[INFO] tool_frame=${target_frame_name} urdf=${robot_urdf_path}"
-  echo "[INFO] gripper=${gripper_backend}@${gripper_port} max_width=${gripper_max_width_mm}mm close_below=${gripper_close_below} (normalized 0..1)"
+  echo "[INFO] gripper=${gripper_backend}@${gripper_port} max_width=${gripper_max_width_mm}mm close_below=${gripper_close_below:-<disabled>} (normalized 0..1)"
   echo "[INFO] safety: first_frame<${first_frame_max_pos_delta_mm}mm/${first_frame_max_rot_delta_deg}deg, per_step<${max_step_pos_delta_mm}mm/${max_step_rot_delta_deg}deg"
 }
 

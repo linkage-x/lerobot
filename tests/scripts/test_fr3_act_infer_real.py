@@ -835,8 +835,6 @@ def test_extract_dataset_state_contract_indices_ignores_prev_cmd_suffix_fields(t
     assert indices['gripper.pos'] == 7
 
 
-
-
 def test_normalize_dataset_gripper_uses_feature_name_before_value_heuristic():
     robot_cfg = FrankaResearch3Config(
         robot_ip='192.168.1.206',

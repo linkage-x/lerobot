@@ -223,12 +223,13 @@ hardware:
   `tools/fr3/fr3_il_infer_realsense_camera_config.yaml`, matched by serial, at the recorder's 60 Hz
   so the images are as fresh at deployment as they were in training.
 
-`--gripper-close-below 0.12` is a correctness setting, not a preference. `normalize_dataset_gripper`
-guesses the unit of whatever the policy emits and reads anything ≤ `gripper_max_width_mm/1000 ×
-1.25` (0.1125 at 90 mm) as metres: a policy asking for 0.08 is rebuilt as 0.89, so the gripper opens
-where it was told to close. ACT regresses and its temporal ensemble averages, so a grasp passes
-through that band every time. Forcing the band to 0 before normalization is what makes the contract
-unambiguous; keep any replacement above 0.1125 and below the aperture the task grasps at.
+`fr3_act_infer_real_runtime.py` now resolves gripper units from the dataset feature name before
+falling back to the legacy value heuristic. For this workstation's `gripper.pos` contract, values
+like `0.08` stay normalized instead of being misread as `0.08 m`; for unit-bearing legacy features
+such as `*.width_mm` the runtime still converts through `gripper_max_width_mm`.
+
+`FR3_GRIPPER_CLOSE_BELOW` is disabled by default in the workstation rollout launcher. Use it only
+as a deliberate task-specific binary close guard, not as a unit workaround.
 
 The script never uses `--move-to-das-start` — that homes to a joint configuration belonging to the
 DAS rig. `T_B_Ws` is solved from the first observation against the dataset's start pose, so the

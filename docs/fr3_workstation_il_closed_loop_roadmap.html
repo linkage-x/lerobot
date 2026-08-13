@@ -192,7 +192,7 @@
       <ol>
         <li><b>起始位姿不能使用 DAS start。</b>闭环应以 <code>src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.xml</code> 的 <code>home</code> keyframe 为唯一初始 pose 合同。</li>
         <li><b>IK 工具坐标系必须从几何合同推出。</b>训练动作代表手指工作点，不是 gripper mount，因此 IK 目标应是 <code>pika_task_tcp</code>，并且 URDF、MJCF、record config、rollout args 必须同名同位姿。</li>
-        <li><b>gripper 单位 heuristic 只是绕行。</b><code>normalize_dataset_gripper()</code> 现在按数值范围猜单位，<code>--gripper-close-below 0.12</code> 只是把危险区压掉；根治要按 dataset feature / metadata 判定单位。</li>
+        <li><b>gripper 单位已经从数值猜测前移到 feature name。</b><code>gripper.pos</code> 按 normalized 处理，<code>*.width_mm</code>/<code>*.distance_m</code> 按显式单位处理；只有缺名字的旧 checkpoint 继续走 legacy heuristic。</li>
       </ol>
     </div>
 
@@ -348,18 +348,18 @@ Rollout
   XML home keyframe start
   URDF IK target = pika_task_tcp
   ee/side cameras by serial
-  gripper_close_below > 0.1125</div>
+  gripper unit: feature-name first</div>
     </div>
 
     <div class="card">
       <div class="section-head">
         <h2>Gripper 单位后续修复</h2>
-        <span class="badge warn">P1</span>
+        <span class="badge ok">完成</span>
       </div>
-      <p>当前 <code>normalize_dataset_gripper()</code> 对 Pika 数据按数值猜单位：小于 <code>gripper_max_width_mm / 1000 * 1.25</code> 的值会被当作米，<code>0.08</code> 会被解读成 80 mm，再归一化成接近全开。</p>
-      <p><code>--gripper-close-below 0.12</code> 是部署侧 guard：它必须高于 90 mm gripper 的歧义上界 <code>0.1125</code>，把 ACT 输出穿过的危险区压成关闭。</p>
-      <div class="callout warn">
-        根治方案：训练 view / checkpoint manifest 写明 <code>gripper.pos</code> 单位和 range；runtime 按 feature metadata 解析，不再按浮点值猜。由于该函数是共享推理代码，修改前要覆盖另一台 DAS / Hikrobot rig 的回归。
+      <p><code>normalize_dataset_gripper()</code> 已先按 dataset feature name 判定单位：<code>gripper.pos</code> 在 Pika workstation 上保持 normalized，<code>*.width_mm</code> 转毫米，<code>*.distance_m</code> 转米；只有没有 unit-bearing 名字的旧 checkpoint 继续使用数值 heuristic。</p>
+      <p><code>--gripper-close-below</code> 不再作为默认单位绕行启用。它保留为部署侧可选 guard，用于任务明确需要“低于某个开度直接闭合”的情况。</p>
+      <div class="callout ok">
+        当前部署路径已经不再依赖 <code>0.1125</code> 这个阈值规避单位歧义；后续仍可把单位/range 写入 training view 或 checkpoint metadata 做进一步显式化。
       </div>
     </div>
 
@@ -401,9 +401,9 @@ Rollout
         </tr>
         <tr>
           <td><span class="badge warn">P1</span></td>
-          <td>把 gripper 单位从 heuristic 迁到 metadata-driven。</td>
-          <td><code>tools/fr3/fr3_act_infer_real_runtime.py::normalize_dataset_gripper</code>、view/checkpoint manifest</td>
-          <td>工作站归一化数据和另一台毫米数据都有单测覆盖。</td>
+          <td>把 gripper 单位从 heuristic 迁到 feature-name-driven。</td>
+          <td><code>tools/fr3/fr3_act_infer_real_runtime.py::normalize_dataset_gripper</code></td>
+          <td>已覆盖 mm / normalized，并保留无名字旧 checkpoint 的 legacy fallback。</td>
         </tr>
       </table>
     </div>
