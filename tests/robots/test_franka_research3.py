@@ -1489,30 +1489,47 @@ def test_anchoring_bounds_the_spread_when_one_camera_delivers_late(robot):
     assert int(observation["ee"][0, 0, 0]) == 100
 
 
+class _TimestampedTestCamera:
+    def __init__(self, timestamp_s, value=0):
+        self.timestamp_s = timestamp_s
+        self.value = value
+
+    def read_latest_with_timestamp(self, max_age_ms):
+        del max_age_ms
+        return np.full((2, 2, 3), self.value, dtype=np.uint8), self.timestamp_s
+
+    def read_closest(self, timestamp_s, max_age_ms):
+        del timestamp_s, max_age_ms
+        return np.full((2, 2, 3), self.value, dtype=np.uint8), self.timestamp_s
+
+
 def test_get_observation_rejects_camera_skew_above_threshold(robot):
-    """The guard aborts the whole episode, so it must fire before bad frames reach the dataset."""
-
-    class TimestampedCamera:
-        def __init__(self, timestamp_s):
-            self.timestamp_s = timestamp_s
-
-        def read_latest_with_timestamp(self, max_age_ms):
-            del max_age_ms
-            return np.zeros((2, 2, 3), dtype=np.uint8), self.timestamp_s
-
-        def read_closest(self, timestamp_s, max_age_ms):
-            del timestamp_s, max_age_ms
-            return np.zeros((2, 2, 3), dtype=np.uint8), self.timestamp_s
-
     robot.connect()
     origin = robot._capture_timestamp_origin_s
     robot.cameras = {
-        "ee": TimestampedCamera(origin + 0.100),
-        "wrist": TimestampedCamera(origin + 0.125),
+        "ee": _TimestampedTestCamera(origin + 0.100),
+        "wrist": _TimestampedTestCamera(origin + 0.125),
     }
 
     with pytest.raises(RuntimeError, match="camera skew 25.0 ms"):
         robot.get_observation()
+
+
+def test_get_observation_can_record_camera_skew_for_offline_qc(robot):
+    robot.config.camera_skew_hard_fail = False
+    robot.connect()
+    origin = robot._capture_timestamp_origin_s
+    robot.cameras = {
+        "ee": _TimestampedTestCamera(origin + 0.100, value=11),
+        "wrist": _TimestampedTestCamera(origin + 0.133333, value=22),
+    }
+
+    observation = robot.get_observation()
+
+    assert int(observation["ee"][0, 0, 0]) == 11
+    assert int(observation["wrist"][0, 0, 0]) == 22
+    assert observation["camera.ee.capture_timestamp_s"] == pytest.approx(0.100)
+    assert observation["camera.wrist.capture_timestamp_s"] == pytest.approx(0.133333)
 
 
 def test_get_observation_uses_kinematics_target_frame_even_if_arm_reports_pose(monkeypatch):

@@ -16,6 +16,9 @@ robot:
   # See config_franka_research3.py: 20 rather than 15 is set by the sim twin's EGL renderer
   # (measured straggling 19 ms), and kept identical here so one envelope covers both rigs.
   camera_max_skew_ms: 20
+  # Do not kill the recorder on a single cross-camera jitter frame. Capture timestamps are
+  # recorded and the per-episode SYNC audit / QC gate decides whether the take is usable.
+  camera_skew_hard_fail: false
   cameras:
     # Sensor rate, deliberately above dataset.fps: an image is only as fresh as the sensor's
     # frame period allows, so 60 Hz halves how stale a recorded frame is (measured 42-45 ms

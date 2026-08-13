@@ -366,10 +366,13 @@ predicted a 16.2 ms worst case. Thread scheduling and dropped frames are invisib
 anchoring already cleaned up — a strategy cannot be evaluated on data produced by its
 alternative.
 
-The hardware robot fails a frame outright when its cameras disagree by more than
-`camera_max_skew_ms` (20 ms); the MuJoCo robot applies the same guard to its render pass. 20 ms
-rather than 15 because the sim renderer under software EGL was measured at 19 ms and this guard
-aborts the episode, not the frame.
+The hardware robot can fail a frame outright when its cameras disagree by more than
+`camera_max_skew_ms` (20 ms), and replay/inference keep that strict default. Workstation
+recording sets `camera_skew_hard_fail: false`: the capture timestamps are still recorded, the
+episode-level SYNC audit prints warnings, and the QC gate decides whether the take may reach
+training. This avoids losing the recorder process to one jittery camera frame while still
+preventing bad data from passing unnoticed. The MuJoCo robot keeps the hard guard on its render
+pass.
 
 ## Replay
 

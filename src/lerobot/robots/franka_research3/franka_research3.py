@@ -696,7 +696,10 @@ class FrankaResearch3(Robot):
                     selected_timestamps.append(timestamp_s)
 
                 camera_skew_ms = (max(selected_timestamps) - min(selected_timestamps)) * 1e3
-                if camera_skew_ms > self.config.camera_max_skew_ms:
+                if (
+                    camera_skew_ms > self.config.camera_max_skew_ms
+                    and getattr(self.config, "camera_skew_hard_fail", True)
+                ):
                     raise RuntimeError(
                         f"FR3 camera skew {camera_skew_ms:.1f} ms exceeds "
                         f"camera_max_skew_ms={self.config.camera_max_skew_ms:.1f}."
