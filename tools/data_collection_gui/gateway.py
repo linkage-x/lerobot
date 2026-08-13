@@ -3404,6 +3404,18 @@ def _parse_episode_time_override(value: str | float | int | None) -> float | Non
     return episode_time_s
 
 
+def _parse_recording_fps_override(value: str | float | int | None) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        fps = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid recording FPS: {value!r}") from exc
+    if not math.isfinite(fps) or fps < 1 or fps > 120 or abs(fps - round(fps)) > 1e-9:
+        raise ValueError("Recording FPS must be an integer between 1 and 120.")
+    return int(round(fps))
+
+
 def _clear_runtime_recording_config(state: GatewayState) -> None:
     state.runtime_recording_config = None
     state.runtime_recording_config_path = None
@@ -3413,7 +3425,9 @@ def _clear_runtime_recording_config(state: GatewayState) -> None:
     state.recording.targetFrames = _target_frames(state.config)
 
 
-def _resolve_recorder_config_path(state: GatewayState, *, episode_time_s: float | None = None) -> Path:
+def _resolve_recorder_config_path(
+    state: GatewayState, *, episode_time_s: float | None = None, recording_fps: int | None = None
+) -> Path:
     """Config path to spawn the recorder with.
 
     Returns an overlay config when a task binding or per-session UI duration is active, else the
@@ -3434,17 +3448,20 @@ def _resolve_recorder_config_path(state: GatewayState, *, episode_time_s: float 
         overlay = _build_task_overlay_config(state.config, active_task, datasets_dir)
     else:
         state.active_task_id = None
-        if episode_time_s is not None:
+        if episode_time_s is not None or recording_fps is not None:
             overlay = copy.deepcopy(state.config)
 
-    if episode_time_s is not None:
+    if episode_time_s is not None or recording_fps is not None:
         if overlay is None:
             overlay = copy.deepcopy(state.config)
         dataset = overlay.get("dataset")
         if not isinstance(dataset, dict):
             dataset = {}
             overlay["dataset"] = dataset
-        dataset["episode_time_s"] = float(episode_time_s)
+        if episode_time_s is not None:
+            dataset["episode_time_s"] = float(episode_time_s)
+        if recording_fps is not None:
+            dataset["fps"] = int(recording_fps)
 
     config = overlay if overlay is not None else state.config
     config_path = _write_overlay_config(state, overlay) if overlay is not None else state.config_path
@@ -3463,6 +3480,8 @@ def _resolve_recorder_config_path(state: GatewayState, *, episode_time_s: float 
         )
     if episode_time_s is not None:
         state.log("info", f"Recording episode duration set to {episode_time_s:g}s for this session")
+    if recording_fps is not None:
+        state.log("info", f"Recording FPS set to {recording_fps:g} for this session")
     return config_path
 
 
@@ -3612,7 +3631,11 @@ def _copy_approved_v3_dataset_export(
 
 
 def _training_view_command(
-    state: GatewayState, dataset_root: Path, action_mode: str
+    state: GatewayState,
+    dataset_root: Path,
+    action_mode: str,
+    *,
+    camera_crops: dict[str, list[int]] | None = None,
 ) -> tuple[list[str], Path]:
     """Build the prepare-only training-view command for an FR3 workstation dataset.
 
@@ -3671,6 +3694,8 @@ def _training_view_command(
         # Build the view only; training is a separate, deliberate step.
         "--prepare-only",
     ]
+    if camera_crops:
+        command.extend(["--camera-crops", json.dumps(camera_crops, separators=(",", ":"))])
     return command, view_root
 
 
@@ -3679,7 +3704,12 @@ def _training_views_root(state: GatewayState) -> Path:
 
 
 def _start_training_view(
-    state: GatewayState, raw_path: str, action_mode: str, *, acknowledge_warnings: bool = False
+    state: GatewayState,
+    raw_path: str,
+    action_mode: str,
+    *,
+    acknowledge_warnings: bool = False,
+    camera_crops: dict[str, list[int]] | None = None,
 ) -> None:
     """Workstation counterpart of the Thor v3 export: build a policy-ready training view."""
     if _export_is_running(state):
@@ -3717,7 +3747,7 @@ def _start_training_view(
             f"{dataset_root.name} must pass QC before a training view is built "
             f"(status: {status or 'unknown'}). Run QC on the Dataset Processing page."
         )
-    command, view_root = _training_view_command(state, dataset_root, action_mode)
+    command, view_root = _training_view_command(state, dataset_root, action_mode, camera_crops=camera_crops)
     excluded = _annotation_excluded_episodes(dataset_root)
     total_episodes = int(processing_item.get("totalEpisodes") or 0)
     if excluded and len(excluded) >= total_episodes > 0:
@@ -5030,6 +5060,7 @@ def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
                 "sourcePath": str(data_files[-1]) if data_files else "",
                 "isLatest": latest_recorded is not None and dataset_root == latest_recorded,
                 "excludedEpisodes": _annotation_excluded_episodes(dataset_root),
+                "cameraFeatures": _camera_feature_items(info),
                 **_training_view_item_fields(dataset_root, dataset_kind),
             }
         )
@@ -5347,9 +5378,43 @@ def _camera_keys(info: dict[str, Any]) -> list[str]:
         return []
     keys: list[str] = []
     for name, feature in features.items():
-        if isinstance(feature, dict) and feature.get("dtype") == "video":
+        if isinstance(feature, dict) and feature.get("dtype") in ("video", "image"):
             keys.append(str(name))
     return keys
+
+
+def _camera_feature_items(info: dict[str, Any]) -> list[dict[str, Any]]:
+    features = info.get("features") or {}
+    if not isinstance(features, dict):
+        return []
+    items: list[dict[str, Any]] = []
+    for key in _camera_keys(info):
+        feature = features.get(key) if isinstance(features.get(key), dict) else {}
+        shape = feature.get("shape") if isinstance(feature.get("shape"), list) else []
+        height = int(shape[0]) if len(shape) >= 1 and isinstance(shape[0], (int, float)) else 0
+        width = int(shape[1]) if len(shape) >= 2 and isinstance(shape[1], (int, float)) else 0
+        items.append({"key": key, "width": width, "height": height})
+    return items
+
+
+def _parse_training_view_camera_crops(raw: str) -> dict[str, list[int]]:
+    if not raw.strip():
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("camera_crops must be a JSON object keyed by camera feature") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("camera_crops must be a JSON object keyed by camera feature")
+    crops: dict[str, list[int]] = {}
+    for key, value in payload.items():
+        if not isinstance(value, list) or len(value) != 4:
+            raise ValueError(f"camera_crops[{key!r}] must be [x,y,w,h]")
+        try:
+            crops[str(key)] = [int(part) for part in value]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"camera_crops[{key!r}] must contain integers") from exc
+    return crops
 
 
 def _fixed_pose7_from_row(row: dict[str, Any], key: str) -> dict[str, float] | None:
@@ -7927,7 +7992,13 @@ def _box_touch_cali_log_payload(state: GatewayState) -> dict[str, Any]:
         return {"running": state.box_touch_cali_running, "lines": list(state.box_touch_cali_log)}
 
 
-def _connect_recorder(state: GatewayState, *, backend: str | None = None, episode_time_s: float | None = None) -> None:
+def _connect_recorder(
+    state: GatewayState,
+    *,
+    backend: str | None = None,
+    episode_time_s: float | None = None,
+    recording_fps: int | None = None,
+) -> None:
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
         return
@@ -7940,7 +8011,9 @@ def _connect_recorder(state: GatewayState, *, backend: str | None = None, episod
             raise ValueError("Only the workstation profile can choose a recording backend")
         state.recording.backend = backend
 
-    config_path = _resolve_recorder_config_path(state, episode_time_s=episode_time_s)
+    config_path = _resolve_recorder_config_path(
+        state, episode_time_s=episode_time_s, recording_fps=recording_fps
+    )
     recorder_script, config_flag = _recorder_script(state)
     command = [
         # The FR3 stack (panda_py, placo, mujoco) lives in .venv-fr3 on the workstation.
@@ -10151,8 +10224,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             raw_episode_time_s = (
                 query.get("episode_time_s", query.get("episodeTimeS", [""]))[0] or ""
             ).strip()
+            raw_fps = (query.get("fps", query.get("recording_fps", [""]))[0] or "").strip()
             try:
                 episode_time_s = _parse_episode_time_override(raw_episode_time_s)
+                recording_fps = _parse_recording_fps_override(raw_fps)
                 with _previews_suspended_for_connect(state):
                     # Done outside the state lock (terminate() blocks).
                     _stop_all_camera_previews(state)
@@ -10165,7 +10240,12 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     if settle_s > 0:
                         time.sleep(settle_s)
                     with state.lock:
-                        _connect_recorder(state, backend=requested_backend, episode_time_s=episode_time_s)
+                        _connect_recorder(
+                            state,
+                            backend=requested_backend,
+                            episode_time_s=episode_time_s,
+                            recording_fps=recording_fps,
+                        )
                         response = _snapshot(state)
                 _json_response(self, HTTPStatus.OK, response)
             except Exception as exc:  # noqa: BLE001
@@ -10473,6 +10553,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                             (query.get("action_mode", [DEFAULT_TRAINING_VIEW_ACTION_MODE])[0] or "").strip()
                             or DEFAULT_TRAINING_VIEW_ACTION_MODE,
                             acknowledge_warnings=_query_flag(query, "acknowledge_warnings"),
+                            camera_crops=_parse_training_view_camera_crops(
+                                (query.get("camera_crops", [""])[0] or "").strip()
+                            ),
                         )
                     else:
                         _start_approved_dataset_export(

@@ -182,6 +182,7 @@ def _build_view(src_root: Path, dst_root: Path, **kwargs):
     import pyarrow.parquet as pq
 
     camera = "observation.images.ee"
+    camera_crop_specs = kwargs.pop("camera_crop_specs", {})
     fr3_train_il_policy.prepare_dataset_view(
         src_root=src_root,
         dst_root=dst_root,
@@ -194,6 +195,7 @@ def _build_view(src_root: Path, dst_root: Path, **kwargs):
         action_append_names=[],
         action_append_shift=1,
         image_resize_shape=None,
+        camera_crop_specs=camera_crop_specs,
         copy_videos=False,
         overwrite=True,
         **kwargs,
@@ -203,6 +205,53 @@ def _build_view(src_root: Path, dst_root: Path, **kwargs):
     info = json.loads((dst_root / "meta" / "info.json").read_text(encoding="utf-8"))
     manifest = json.loads((dst_root / "meta" / "il_view_manifest.json").read_text(encoding="utf-8"))
     return frames, episodes, info, manifest
+
+
+def test_view_can_crop_camera_videos_without_mutating_recording(tmp_path, monkeypatch):
+    src_root = tmp_path / "recording"
+    dst_root = tmp_path / "view"
+    _write_v3_source_dataset(src_root)
+    calls: list[tuple[Path, Path, list[int]]] = []
+
+    def fake_crop_video(src: Path, dst: Path, crop: list[int]) -> None:
+        calls.append((src, dst, crop))
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"cropped")
+
+    monkeypatch.setattr(fr3_train_il_policy, "crop_video_file", fake_crop_video)
+
+    _frames, _episodes, info, manifest = _build_view(
+        src_root,
+        dst_root,
+        camera_crop_specs={"observation.images.ee": [2, 4, 20, 30]},
+    )
+
+    assert info["features"]["observation.images.ee"]["shape"] == [30, 20, 3]
+    assert manifest["camera_crop_specs"] == {"observation.images.ee": [2, 4, 20, 30]}
+    assert calls == [
+        (
+            src_root / "videos" / "observation.images.ee" / "chunk-000" / "file-000.mp4",
+            dst_root / "videos" / "observation.images.ee" / "chunk-000" / "file-000.mp4",
+            [2, 4, 20, 30],
+        )
+    ]
+    assert calls[0][0].read_bytes() == b"\0" * 16
+    assert calls[0][1].read_bytes() == b"cropped"
+
+
+def test_camera_crop_validation_rejects_invalid_bounds():
+    features = {"observation.images.ee": {"dtype": "video", "shape": [64, 64, 3]}}
+
+    with pytest.raises(ValueError, match="outside"):
+        fr3_train_il_policy.validate_camera_crop_specs(
+            {"observation.images.ee": [60, 0, 8, 8]}, features, ["observation.images.ee"]
+        )
+
+    with pytest.raises(ValueError, match="even"):
+        fr3_train_il_policy.validate_camera_crop_specs(
+            {"observation.images.ee": [1, 0, 8, 8]}, features, ["observation.images.ee"]
+        )
+
 
 
 def test_view_drops_episodes_marked_not_for_training(tmp_path):

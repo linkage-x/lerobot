@@ -339,6 +339,12 @@ export type CollectionTask = {
 
 export type DatasetKind = "recorded" | "exported" | "training_view";
 
+export type DatasetCameraFeature = {
+  key: string;
+  width: number;
+  height: number;
+};
+
 export type RecordedDataset = {
   path: string;
   name: string;
@@ -350,6 +356,7 @@ export type RecordedDataset = {
   dataStatus: "loaded" | "missing" | "unfinalized" | "unreadable" | "empty";
   sourcePath: string;
   isLatest: boolean;
+  cameraFeatures?: DatasetCameraFeature[];
   /** Episodes marked includeInTraining=false in Episode Replay; the view build drops these. */
   excludedEpisodes?: number[];
   /** Training views only: the recording this view re-expresses, and in which action contract. */

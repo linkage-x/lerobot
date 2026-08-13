@@ -29,6 +29,8 @@ import type {
   TeleopStatus
 } from "./types";
 
+export type CameraCropSpecs = Record<string, [number, number, number, number]>;
+
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
 const defaultMujocoValidation = (datasetRoot: string, episode: number, fps: number): ReplayStatus["mujocoValidation"] => ({
@@ -242,13 +244,16 @@ export class DataCollectionGuiApi {
     return structuredClone(this.snapshot);
   }
 
-  async connectRecording(backend?: "real" | "sim", episodeTimeS?: number): Promise<GuiSnapshot> {
+  async connectRecording(backend?: "real" | "sim", episodeTimeS?: number, fps?: number): Promise<GuiSnapshot> {
     // The workstation profile picks between the hardware FR3 and its MuJoCo twin here; the
     // Thor profile has a single rig and sends no backend at all.
     const params = new URLSearchParams();
     if (backend) params.set("backend", backend);
     if (episodeTimeS != null && Number.isFinite(episodeTimeS)) {
       params.set("episode_time_s", String(episodeTimeS));
+    }
+    if (fps != null && Number.isFinite(fps)) {
+      params.set("fps", String(fps));
     }
     const endpoint = params.toString()
       ? `/api/handheld/record/connect?${params.toString()}`
@@ -970,7 +975,8 @@ export class DataCollectionGuiApi {
   async exportApprovedDataset(
     path: string,
     actionMode?: string,
-    acknowledgeWarnings = false
+    acknowledgeWarnings = false,
+    cameraCrops?: CameraCropSpecs
   ): Promise<GuiSnapshot> {
     // The workstation profile reuses this endpoint to build a training view, and picks the
     // action contract with actionMode; Thor sends none and gets the raw->v3 consolidation.
@@ -982,6 +988,9 @@ export class DataCollectionGuiApi {
       // The gateway refuses a QC-warned dataset without this, so the operator sees the warnings
       // before they decide rather than finding an unexplained absence in this list.
       params.set("acknowledge_warnings", "1");
+    }
+    if (cameraCrops && Object.keys(cameraCrops).length > 0) {
+      params.set("camera_crops", JSON.stringify(cameraCrops));
     }
     const query = `?${params.toString()}`;
     const remote = await this.postRemoteSnapshot(`/api/datasets/export${query}`);

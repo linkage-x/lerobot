@@ -284,7 +284,7 @@ export function LiveRecordPage({
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
-  onConnect: (backend?: RecordingBackend, episodeTimeS?: number) => void;
+  onConnect: (backend?: RecordingBackend, episodeTimeS?: number, fps?: number) => void;
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
   onSetStartPose: () => void;
@@ -303,6 +303,7 @@ export function LiveRecordPage({
     snapshot.recording.backend ?? "real"
   );
   const [episodeTimeInput, setEpisodeTimeInput] = useState(() => String(snapshot.configSummary.episodeTimeS));
+  const [fpsInput, setFpsInput] = useState(() => String(snapshot.configSummary.fps));
   const activeTask = snapshot.activeTaskId
     ? snapshot.tasks.find((t) => t.id === snapshot.activeTaskId) ?? null
     : null;
@@ -315,9 +316,12 @@ export function LiveRecordPage({
   // line that didn't land at the top of a snapshot poll window.
   const logLines = snapshot.recording.recentOutput ?? [];
   const parsedEpisodeTimeS = Number(episodeTimeInput);
+  const parsedFps = Number(fpsInput);
   const canUseEpisodeTimeInput = Number.isFinite(parsedEpisodeTimeS) && parsedEpisodeTimeS >= 1 && parsedEpisodeTimeS <= 600;
+  const canUseFpsInput = Number.isInteger(parsedFps) && parsedFps >= 1 && parsedFps <= 120;
   const requestedEpisodeTimeS = canUseEpisodeTimeInput ? parsedEpisodeTimeS : snapshot.configSummary.episodeTimeS;
-  const requestedTargetFrames = Math.max(1, Math.round(snapshot.configSummary.fps * requestedEpisodeTimeS));
+  const requestedFps = canUseFpsInput ? parsedFps : snapshot.configSummary.fps;
+  const requestedTargetFrames = Math.max(1, Math.round(requestedFps * requestedEpisodeTimeS));
 
   // Keyboard shortcuts for the record controls. This component is mounted only
   // while activePage === "live-record", so the window listener is naturally
@@ -335,9 +339,9 @@ export function LiveRecordPage({
       if (busy) return;
       const controls = recordingControlAvailability(snapshot.recording);
       const key = event.key.toLowerCase();
-      if (key === "c" && controls.canConnect && canUseEpisodeTimeInput) {
+      if (key === "c" && controls.canConnect && canUseEpisodeTimeInput && canUseFpsInput) {
         event.preventDefault();
-        onConnect(supportsBackendChoice ? selectedBackend : undefined, requestedEpisodeTimeS);
+        onConnect(supportsBackendChoice ? selectedBackend : undefined, requestedEpisodeTimeS, requestedFps);
       } else if (key === "e" && controls.canStartEpisode) {
         event.preventDefault();
         onStart();
@@ -354,7 +358,7 @@ export function LiveRecordPage({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [busy, snapshot.recording, onConnect, onStart, onStop, supportsBackendChoice, selectedBackend, requestedEpisodeTimeS]);
+  }, [busy, snapshot.recording, onConnect, onStart, onStop, supportsBackendChoice, selectedBackend, requestedEpisodeTimeS, requestedFps, canUseEpisodeTimeInput, canUseFpsInput]);
 
   // Once a session is live the backend is fixed by the running recorder process; showing the
   // operator's stale pick instead of the actual one would misreport what is being recorded.
@@ -367,23 +371,39 @@ export function LiveRecordPage({
   useEffect(() => {
     if (!recorderConnected) {
       setEpisodeTimeInput(String(snapshot.configSummary.episodeTimeS));
+      setFpsInput(String(snapshot.configSummary.fps));
     }
-  }, [recorderConnected, snapshot.configSummary.episodeTimeS]);
+  }, [recorderConnected, snapshot.configSummary.episodeTimeS, snapshot.configSummary.fps]);
 
   const episodeDurationControl = (
-    <label className={`episode-duration-control ${canUseEpisodeTimeInput ? "" : "episode-duration-invalid"}`}>
-      <span>Episode seconds</span>
-      <input
-        type="number"
-        min={1}
-        max={600}
-        step={1}
-        disabled={busy || recorderConnected}
-        value={episodeTimeInput}
-        onChange={(event) => setEpisodeTimeInput(event.target.value)}
-      />
-      <small>{canUseEpisodeTimeInput ? `${requestedTargetFrames} frames` : "1-600s"}</small>
-    </label>
+    <div className="recording-session-controls">
+      <label className={`episode-duration-control ${canUseEpisodeTimeInput ? "" : "episode-duration-invalid"}`}>
+        <span>Episode seconds</span>
+        <input
+          type="number"
+          min={1}
+          max={600}
+          step={1}
+          disabled={busy || recorderConnected}
+          value={episodeTimeInput}
+          onChange={(event) => setEpisodeTimeInput(event.target.value)}
+        />
+        <small>{canUseEpisodeTimeInput ? `${requestedTargetFrames} frames` : "1-600s"}</small>
+      </label>
+      <label className={`episode-duration-control ${canUseFpsInput ? "" : "episode-duration-invalid"}`}>
+        <span>Recording FPS</span>
+        <input
+          type="number"
+          min={1}
+          max={120}
+          step={1}
+          disabled={busy || recorderConnected}
+          value={fpsInput}
+          onChange={(event) => setFpsInput(event.target.value)}
+        />
+        <small>{canUseFpsInput ? `${requestedFps} Hz` : "1-120"}</small>
+      </label>
+    </div>
   );
 
   const backendPicker = supportsBackendChoice ? (
@@ -417,6 +437,19 @@ export function LiveRecordPage({
             ? `GMSL2 ${snapshot.devices.filter((d) => d.kind === "camera").length}-camera capture with${snapshot.configSummary.hardwareSync?.enabled ? "" : "out"} hardware sync`
             : "capture raw multi-camera handheld data; post-processing lives on the Processing page"}
       />
+      {workstationProfile ? (
+        <section className="panel capture-readiness-banner" aria-label="FR3 capture readiness">
+          <div>
+            <strong>Before collecting: lock camera exposure and white balance</strong>
+            <span>Keep lighting, camera mounts, hole pose, and table background stable for this batch.</span>
+          </div>
+          <div className="capture-readiness-checks">
+            <span>Exposure locked</span>
+            <span>White balance locked</span>
+            <span>Hole visible in EE and side views</span>
+          </div>
+        </section>
+      ) : null}
       {activeTask && (
         <section className="panel task-binding-banner">
           <div className="panel-heading">
@@ -434,14 +467,14 @@ export function LiveRecordPage({
           status={snapshot.recording}
           config={snapshot.configSummary}
           busy={busy}
-          onConnect={() => onConnect(supportsBackendChoice ? selectedBackend : undefined, requestedEpisodeTimeS)}
+          onConnect={() => onConnect(supportsBackendChoice ? selectedBackend : undefined, requestedEpisodeTimeS, requestedFps)}
           onStart={onStart}
           onStop={onStop}
           onSetStartPose={onSetStartPose}
           logLines={logLines}
           backendPicker={backendPicker}
           episodeDurationControl={episodeDurationControl}
-          episodeDurationValid={canUseEpisodeTimeInput}
+          episodeDurationValid={canUseEpisodeTimeInput && canUseFpsInput}
           showStartPoseControl={workstationProfile}
         />
         <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />

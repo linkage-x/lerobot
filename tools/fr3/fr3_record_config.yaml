@@ -58,7 +58,7 @@ dataset:
   repo_id: hph/fr3_spacemouse
   single_task: Pick and place
   root: /lerobot/outputs/datasets/fr3_spacemouse
-  fps: 30
+  fps: 60
   num_episodes: 20
   episode_time_s: 10
   reset_time_s: 0

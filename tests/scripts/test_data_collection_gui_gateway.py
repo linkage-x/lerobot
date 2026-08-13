@@ -386,14 +386,17 @@ def test_connect_recorder_accepts_episode_duration_override(tmp_path, monkeypatc
     monkeypatch.setattr(gateway, "_start_output_reader", lambda *_args: None)
     monkeypatch.setattr(gateway, "_new_recorder_log_path", lambda _state: tmp_path / "recorder.log")
 
-    gateway._connect_recorder(state, backend="real", episode_time_s=15.0)
+    gateway._connect_recorder(state, backend="real", episode_time_s=15.0, recording_fps=60)
 
-    assert state.recording.targetFrames == 450
+    assert state.recording.targetFrames == 900
     assert state.runtime_recording_config is not None
-    assert gateway._dataset_config(state.runtime_recording_config)["episode_time_s"] == 15.0
+    runtime_dataset = gateway._dataset_config(state.runtime_recording_config)
+    assert runtime_dataset["episode_time_s"] == 15.0
+    assert runtime_dataset["fps"] == 60
     assert state.runtime_recording_config_path == tmp_path / "outputs" / ".active_task_config.yaml"
     assert any(arg.endswith(f"={state.runtime_recording_config_path}") for arg in captured["command"])
     assert state.config["dataset"]["episode_time_s"] == 10.0
+    assert state.config["dataset"]["fps"] == 30
 
 
 def test_episode_duration_override_validation():
@@ -402,6 +405,15 @@ def test_episode_duration_override_validation():
     for value in ("bad", 0, 601, float("inf")):
         with pytest.raises(ValueError):
             gateway._parse_episode_time_override(value)
+
+
+def test_recording_fps_override_validation():
+    assert gateway._parse_recording_fps_override(60) == 60
+    assert gateway._parse_recording_fps_override("60") == 60
+    assert gateway._parse_recording_fps_override("") is None
+    for value in ("bad", 0, 121, 30.5, float("inf")):
+        with pytest.raises(ValueError):
+            gateway._parse_recording_fps_override(value)
 
 
 def test_gmsl2_device_preview_uses_recorder_owned_frames_only():
@@ -2939,7 +2951,7 @@ def _training_view_state(tmp_path):
         info_path = root / "meta" / "info.json"
         info = json.loads(info_path.read_text(encoding="utf-8"))
         for camera_key in ("observation.images.ee", "observation.images.side"):
-            info["features"][camera_key] = {"dtype": "video"}
+            info["features"][camera_key] = {"dtype": "video", "shape": [480, 640, 3]}
             chunk = root / "videos" / camera_key / "chunk-000"
             chunk.mkdir(parents=True)
             (chunk / "file-000.mp4").write_bytes(b"0" * 2048)
@@ -3002,6 +3014,10 @@ def test_recorded_dataset_items_link_a_view_to_its_source(tmp_path):
     # though it is the newest directory on disk.
     assert view_item["isLatest"] is False
     assert items[str(dataset_root)]["isLatest"] is True
+    assert items[str(dataset_root)]["cameraFeatures"] == [
+        {"key": "observation.images.ee", "width": 640, "height": 480},
+        {"key": "observation.images.side", "width": 640, "height": 480},
+    ]
 
 
 def test_training_view_command_names_the_job_after_dataset_and_contract(tmp_path):
@@ -3009,12 +3025,18 @@ def test_training_view_command_names_the_job_after_dataset_and_contract(tmp_path
     # would generate configs training into -- and overwriting -- the same output directory.
     state, dataset_root, _view_root = _training_view_state(tmp_path)
 
-    command, view_root = gateway._training_view_command(state, dataset_root, "delta_ee_from_prev_cmd")
+    command, view_root = gateway._training_view_command(
+        state,
+        dataset_root,
+        "delta_ee_from_prev_cmd",
+        camera_crops={"observation.images.side": [224, 0, 416, 346]},
+    )
 
     assert view_root == state.exports_root / gateway.TRAINING_VIEWS_DIR_NAME / "fr3_spacemouse__delta_ee_from_prev_cmd"
     assert command[command.index("--job-name") + 1] == "fr3_spacemouse__delta_ee_from_prev_cmd"
     assert command[command.index("--view-root") + 1] == str(view_root)
     assert "--prepare-only" in command
+    assert command[command.index("--camera-crops") + 1] == '{"observation.images.side":[224,0,416,346]}'
 
 
 def test_start_training_view_refuses_to_build_from_another_view(tmp_path):

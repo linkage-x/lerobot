@@ -60,6 +60,44 @@ def normalize_camera_key(key: str) -> str:
     return key if key.startswith("observation.images.") else f"observation.images.{key}"
 
 
+def parse_camera_crop_specs(value: str | None) -> dict[str, list[int]]:
+    if value is None or value.strip().lower() in {"", "none", "null", "{}"}:
+        return {}
+    raw = value.strip()
+    parsed: dict[str, Any]
+    if raw.startswith("{"):
+        loaded = json.loads(raw)
+        if not isinstance(loaded, dict):
+            raise ValueError("--camera-crops JSON must be an object keyed by camera name.")
+        parsed = loaded
+    else:
+        parsed = {}
+        for item in raw.split(";"):
+            if not item.strip():
+                continue
+            key, sep, spec = item.partition(":")
+            if not sep:
+                raise ValueError(f"Invalid camera crop spec {item!r}; expected camera:x,y,w,h.")
+            parsed[key.strip()] = [part.strip() for part in spec.split(",")]
+
+    crops: dict[str, list[int]] = {}
+    for key, spec in parsed.items():
+        if isinstance(spec, dict):
+            values = [spec.get(name) for name in ("x", "y", "w", "h")]
+        elif isinstance(spec, (list, tuple)):
+            values = list(spec)
+        else:
+            raise ValueError(f"Invalid crop for {key!r}: expected [x,y,w,h] or object.")
+        if len(values) != 4:
+            raise ValueError(f"Invalid crop for {key!r}: expected four values x,y,w,h.")
+        try:
+            crop = [int(value) for value in values]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid crop for {key!r}: values must be integers.") from exc
+        crops[normalize_camera_key(str(key))] = crop
+    return crops
+
+
 def load_json(path: Path) -> dict[str, Any]:
     with path.open() as f:
         return json.load(f)
@@ -304,21 +342,79 @@ def select_state_matrix(df: pd.DataFrame, features: dict[str, Any], selectors: l
     return np.concatenate(parts, axis=1).astype(np.float32)
 
 
-def resize_camera_feature(feature: dict[str, Any], image_resize_shape: list[int] | None) -> dict[str, Any]:
+def resize_camera_feature(
+    feature: dict[str, Any],
+    image_resize_shape: list[int] | None,
+    crop: list[int] | None = None,
+) -> dict[str, Any]:
     resized = copy.deepcopy(feature)
-    if image_resize_shape is None:
-        return resized
-
-    height, width = int(image_resize_shape[0]), int(image_resize_shape[1])
     shape = resized.get("shape")
     if not isinstance(shape, list) or len(shape) != 3:
         raise ValueError(f"Expected camera feature shape [H, W, C], got {shape}")
+    if image_resize_shape is not None:
+        height, width = int(image_resize_shape[0]), int(image_resize_shape[1])
+    elif crop is not None:
+        height, width = int(crop[3]), int(crop[2])
+    else:
+        return resized
     resized["shape"] = [height, width, int(shape[2])]
     info = resized.setdefault("info", {})
     if isinstance(info, dict):
         info["video.height"] = height
         info["video.width"] = width
     return resized
+
+
+def validate_camera_crop_specs(
+    camera_crop_specs: dict[str, list[int]], features: dict[str, Any], camera_keys: list[str]
+) -> dict[str, list[int]]:
+    unknown = sorted(set(camera_crop_specs) - set(camera_keys))
+    if unknown:
+        raise ValueError(f"Crop specified for camera(s) not selected in --cameras: {unknown}")
+    validated: dict[str, list[int]] = {}
+    for camera_key, crop in camera_crop_specs.items():
+        shape = features[camera_key].get("shape")
+        if not isinstance(shape, list) or len(shape) != 3:
+            raise ValueError(f"Expected camera feature shape [H, W, C] for {camera_key}, got {shape}")
+        image_h, image_w = int(shape[0]), int(shape[1])
+        x, y, w, h = [int(value) for value in crop]
+        if x < 0 or y < 0 or w <= 0 or h <= 0:
+            raise ValueError(f"Crop for {camera_key} must be non-negative x/y and positive w/h, got {crop}")
+        if x + w > image_w or y + h > image_h:
+            raise ValueError(f"Crop for {camera_key} exceeds {image_w}x{image_h}: {crop}")
+        if any(value % 2 for value in (x, y, w, h)):
+            raise ValueError(f"Crop for {camera_key} must use even x,y,w,h for yuv420p video, got {crop}")
+        if x == 0 and y == 0 and w == image_w and h == image_h:
+            continue
+        validated[camera_key] = [x, y, w, h]
+    return validated
+
+
+def crop_video_file(src: Path, dst: Path, crop: list[int]) -> None:
+    x, y, w, h = [int(value) for value in crop]
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-vf",
+        f"crop={w}:{h}:{x}:{y}",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        str(dst),
+    ]
+    subprocess.run(command, check=True)
 
 
 ANNOTATION_STORE_RELATIVE_PATH = Path("meta") / "gui_annotations.json"
@@ -390,6 +486,7 @@ def prepare_dataset_view(
     action_append_names: list[str],
     action_append_shift: int,
     image_resize_shape: list[int] | None,
+    camera_crop_specs: dict[str, list[int]] | None,
     copy_videos: bool,
     overwrite: bool,
     action_mode: str = ACTION_MODE_ABSOLUTE_EE,
@@ -411,6 +508,7 @@ def prepare_dataset_view(
     first_stats = (
         load_json(src_roots[0] / "meta/stats.json") if (src_roots[0] / "meta/stats.json").exists() else {}
     )
+    camera_crop_specs = validate_camera_crop_specs(camera_crop_specs or {}, first_features, camera_keys)
     chunks_size = int(first_info.get("chunks_size", 1000))
 
     for root, info in zip(src_roots, source_infos, strict=True):
@@ -554,7 +652,11 @@ def prepare_dataset_view(
                     chunk_index=new_chunk,
                     file_index=new_file,
                 )
-                copy_or_symlink_file(src_video, dst_video, copy=copy_videos)
+                crop = camera_crop_specs.get(cam)
+                if crop is not None:
+                    crop_video_file(src_video, dst_video, crop)
+                else:
+                    copy_or_symlink_file(src_video, dst_video, copy=copy_videos)
 
     processed_rows = 0
     delta_action_names: list[str] = []
@@ -740,7 +842,7 @@ def prepare_dataset_view(
             "names": selected_state_names(first_features, state_keys),
         }
     for cam in camera_keys:
-        new_features[cam] = resize_camera_feature(first_features[cam], image_resize_shape)
+        new_features[cam] = resize_camera_feature(first_features[cam], image_resize_shape, camera_crop_specs.get(cam))
     action_names = first_features.get(action_key, {}).get("names")
     base_action_dim = all_action.shape[1] - len(append_feature_names)
     if is_delta_action_mode(action_mode):
@@ -792,6 +894,7 @@ def prepare_dataset_view(
         "action_append_names": append_feature_names,
         "action_append_shift": action_append_shift,
         "image_resize_shape": image_resize_shape,
+        "camera_crop_specs": camera_crop_specs,
         "state_dim": int(all_state.shape[1]) if state_keys else 0,
         "action_dim": int(all_action.shape[1]),
         "total_episodes": int(total_episodes),
@@ -1124,6 +1227,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cameras", default=DEFAULT_CAMERAS)
     parser.add_argument("--state-keys", default=DEFAULT_STATE_KEYS)
     parser.add_argument("--image-resize-shape", default=None)
+    parser.add_argument(
+        "--camera-crops",
+        default="",
+        help="JSON or semicolon specs keyed by camera, e.g. side:224,0,416,346",
+    )
     parser.add_argument("--action-key", default="action")
     parser.add_argument("--action-npy", type=Path, default=None)
     parser.add_argument("--use-derived-action", action="store_true")
@@ -1211,6 +1319,7 @@ def main() -> None:
     action_append_selectors = parse_csv(args.action_append_selectors)
     action_append_names = parse_csv(args.action_append_names)
     image_resize_shape = parse_hw(args.image_resize_shape)
+    camera_crop_specs = parse_camera_crop_specs(args.camera_crops)
     if not cameras:
         raise ValueError("At least one camera must be selected.")
     if args.policy != "act" and not state_keys:
@@ -1247,6 +1356,7 @@ def main() -> None:
             action_append_names=action_append_names,
             action_append_shift=args.action_append_shift,
             image_resize_shape=image_resize_shape,
+            camera_crop_specs=camera_crop_specs,
             copy_videos=args.copy_videos,
             overwrite=args.overwrite_view,
             action_mode=args.action_mode,

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { type GuiSnapshot } from "./api";
+import { type CameraCropSpecs, type GuiSnapshot } from "./api";
 import { api } from "./apiClient";
 import "./styles.css";
 import type { CollectionTask, EpisodeAnnotation, ProcessingItem } from "./types";
@@ -240,12 +240,12 @@ function App() {
     run(() => api.exportTask(taskId));
   };
 
-  const exportApprovedWithWarningGuard = (path: string, actionMode?: string) => {
+  const exportApprovedWithWarningGuard = (path: string, actionMode?: string, cameraCrops?: CameraCropSpecs) => {
     const item = snapshot.processing.find((candidate) => candidate.path === path);
     // Only the QC-warned case asks. A pass exports straight through, and anything else is
     // refused by the gateway with its own reason.
     if (item?.status !== "qc_warn") {
-      run(() => api.exportApprovedDataset(path, actionMode));
+      run(() => api.exportApprovedDataset(path, actionMode, false, cameraCrops));
       return;
     }
     const warnings = qcWarnings(item);
@@ -267,7 +267,7 @@ function App() {
     if (!ok) {
       return;
     }
-    run(() => api.exportApprovedDataset(path, actionMode, true));
+    run(() => api.exportApprovedDataset(path, actionMode, true, cameraCrops));
   };
 
   const pageNode =
@@ -288,7 +288,7 @@ function App() {
       <LiveRecordPage
         snapshot={snapshot}
         busy={busy}
-        onConnect={(backend, episodeTimeS) => run(() => api.connectRecording(backend, episodeTimeS))}
+        onConnect={(backend, episodeTimeS, fps) => run(() => api.connectRecording(backend, episodeTimeS, fps))}
         onStart={() => run(() => api.startRecording())}
         onStop={(action) => run(() => api.stopRecording(action))}
         onSetStartPose={() => run(() => api.setRecordingStartPose())}

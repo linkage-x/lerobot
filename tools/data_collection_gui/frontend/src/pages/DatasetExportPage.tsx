@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { GuiSnapshot } from "../api";
+import type { CameraCropSpecs, GuiSnapshot } from "../api";
 import type { RecordedDataset } from "../types";
 import {
   StatusDot,
@@ -35,6 +35,69 @@ function contractLabel(contract: string): string {
   return actionModeCopy[contract as ActionMode]?.label ?? contract;
 }
 
+type CameraCropInput = { x: string; y: string; w: string; h: string };
+
+function evenFloor(value: number): number {
+  return Math.max(0, Math.floor(value / 2) * 2);
+}
+
+function fullFrameCropInput(width: number, height: number): CameraCropInput {
+  return { x: "0", y: "0", w: String(evenFloor(width)), h: String(evenFloor(height)) };
+}
+
+function recommendedCropInput(key: string, width: number, height: number): CameraCropInput {
+  if (!key.endsWith(".side")) {
+    return fullFrameCropInput(width, height);
+  }
+  if (width >= 640 && height >= 480) {
+    return {
+      x: "224",
+      y: "0",
+      w: String(Math.min(416, evenFloor(width - 224))),
+      h: String(Math.min(346, evenFloor(height)))
+    };
+  }
+  const x = evenFloor(width * 0.35);
+  return { x: String(x), y: "0", w: String(evenFloor(width - x)), h: String(evenFloor(height * 0.72)) };
+}
+
+function cropInputForFeature(dataset: RecordedDataset, inputs: Record<string, CameraCropInput>, key: string): CameraCropInput {
+  const feature = (dataset.cameraFeatures ?? []).find((candidate) => candidate.key === key);
+  return inputs[key] ?? fullFrameCropInput(feature?.width ?? 0, feature?.height ?? 0);
+}
+
+function cropSpecsForDataset(
+  dataset: RecordedDataset,
+  enabled: boolean,
+  inputs: Record<string, CameraCropInput>
+): { crops?: CameraCropSpecs; error?: string; label?: string } {
+  if (!enabled) return {};
+  const features = (dataset.cameraFeatures ?? []).filter((feature) => feature.width > 0 && feature.height > 0);
+  if (features.length === 0) return { error: "Camera crop needs dataset camera metadata" };
+  const crops: CameraCropSpecs = {};
+  for (const feature of features) {
+    const input = cropInputForFeature(dataset, inputs, feature.key);
+    const x = Number(input.x);
+    const y = Number(input.y);
+    const w = Number(input.w);
+    const h = Number(input.h);
+    if (![x, y, w, h].every(Number.isInteger)) {
+      return { error: `${feature.key} crop must be integer pixels` };
+    }
+    if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > feature.width || y + h > feature.height) {
+      return { error: `${feature.key} crop is outside ${feature.width}x${feature.height}` };
+    }
+    if ([x, y, w, h].some((value) => value % 2 !== 0)) {
+      return { error: `${feature.key} crop must use even x/y/w/h for H.264` };
+    }
+    if (x !== 0 || y !== 0 || w !== evenFloor(feature.width) || h !== evenFloor(feature.height)) {
+      crops[feature.key] = [x, y, w, h];
+    }
+  }
+  const count = Object.keys(crops).length;
+  return count > 0 ? { crops, label: `${count} camera crop${count === 1 ? "" : "s"}` } : { label: "full frame" };
+}
+
 /** Workstation counterpart of Dataset Export: build the policy-ready view of a v3 recording. */
 function TrainingViewPage({
   snapshot,
@@ -45,17 +108,52 @@ function TrainingViewPage({
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
-  onBuildView: (path: string, actionMode?: string) => void;
+  onBuildView: (path: string, actionMode?: string, cameraCrops?: CameraCropSpecs) => void;
   onOpenProcessing: () => void;
   onOpenReplay: (path: string) => void;
 }) {
   const exportStatus = snapshot.datasetExport;
   const building = exportStatus.state === "exporting";
   const [actionMode, setActionMode] = useState<ActionMode>("delta_ee_from_prev_cmd");
+  const [cropEnabled, setCropEnabled] = useState(false);
+  const [cameraCropInputs, setCameraCropInputs] = useState<Record<string, CameraCropInput>>({});
   const allDatasets = snapshot.recordedDatasets ?? [];
   // Views are replay candidates, so they arrive in the same list as the recordings. They belong
   // under the recording they were derived from, not next to it as another build source.
   const datasets = allDatasets.filter((dataset) => dataset.datasetKind !== "training_view");
+  const cropCameraFeatures = Array.from(
+    new Map(
+      datasets
+        .flatMap((dataset) => dataset.cameraFeatures ?? [])
+        .filter((feature) => feature.width > 0 && feature.height > 0)
+        .map((feature) => [feature.key, feature] as const)
+    ).values()
+  );
+  const setCameraCropValue = (key: string, field: keyof CameraCropInput, value: string) => {
+    setCameraCropInputs((current) => {
+      const feature = cropCameraFeatures.find((candidate) => candidate.key === key);
+      const fallback = fullFrameCropInput(feature?.width ?? 0, feature?.height ?? 0);
+      return { ...current, [key]: { ...(current[key] ?? fallback), [field]: value } };
+    });
+  };
+  const useRecommendedCameraCrop = () => {
+    setCropEnabled(true);
+    setCameraCropInputs(
+      Object.fromEntries(
+        cropCameraFeatures.map((feature) => [
+          feature.key,
+          recommendedCropInput(feature.key, feature.width, feature.height)
+        ])
+      )
+    );
+  };
+  const resetCameraCrops = () => {
+    setCameraCropInputs(
+      Object.fromEntries(
+        cropCameraFeatures.map((feature) => [feature.key, fullFrameCropInput(feature.width, feature.height)])
+      )
+    );
+  };
   // The gateway refuses to build a view of a dataset that has not passed QC, so the row has to
   // say where a dataset stands before the button is pressed. Shown rather than filtered: on this
   // profile every recording is a build candidate, and hiding the ones that need QC is what made
@@ -86,7 +184,7 @@ function TrainingViewPage({
           Recording always stores absolute EE. The delta contracts are derived here by differencing
           consecutive dataset frames — a delta computed during capture would span one control tick
           (200 Hz) instead of one frame (30 Hz) and drive the arm ~6.7&times; too slow. Videos are
-          symlinked, so a view costs almost no disk.
+          symlinked unless crop is enabled, so a full-frame view costs almost no disk.
         </p>
         <div className="mujoco-mode-picker" role="group" aria-label="Action contract">
           {(Object.keys(actionModeCopy) as ActionMode[]).map((mode) => (
@@ -104,6 +202,60 @@ function TrainingViewPage({
         <p className="panel-note">{actionModeCopy[actionMode].blurb}</p>
       </section>
 
+      <section className="panel camera-crop-panel">
+        <div className="panel-heading">
+          <h2>Camera Crop</h2>
+          <span>{cropEnabled ? "enabled" : "full frame"}</span>
+        </div>
+        <p className="panel-note">
+          Crop is applied only to the generated training view. The raw recording stays unchanged.
+        </p>
+        <div className="control-row">
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={cropEnabled}
+              disabled={busy || building || cropCameraFeatures.length === 0}
+              onChange={(event) => setCropEnabled(event.target.checked)}
+            />
+            <span>Use crop for training view</span>
+          </label>
+          <button disabled={busy || building || cropCameraFeatures.length === 0} onClick={useRecommendedCameraCrop}>
+            Use Side ROI
+          </button>
+          <button disabled={busy || building || cropCameraFeatures.length === 0} onClick={resetCameraCrops}>
+            Full Frame
+          </button>
+        </div>
+        {cropEnabled && cropCameraFeatures.length > 0 ? (
+          <div className="camera-crop-grid">
+            {cropCameraFeatures.map((feature) => {
+              const input = cameraCropInputs[feature.key] ?? fullFrameCropInput(feature.width, feature.height);
+              return (
+                <div className="camera-crop-row" key={feature.key}>
+                  <div>
+                    <strong>{feature.key}</strong>
+                    <small>{feature.width}x{feature.height}</small>
+                  </div>
+                  {(["x", "y", "w", "h"] as const).map((field) => (
+                    <label key={field}>
+                      <span>{field}</span>
+                      <input
+                        type="number"
+                        min={field === "w" || field === "h" ? 2 : 0}
+                        step={2}
+                        value={input[field]}
+                        disabled={busy || building}
+                        onChange={(event) => setCameraCropValue(feature.key, field, event.target.value)}
+                      />
+                    </label>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+      </section>
       <section className="panel">
         <div className="panel-heading">
           <h2>Recorded Datasets</h2>
@@ -123,13 +275,14 @@ function TrainingViewPage({
               const warned = qcStatus === "qc_warn";
               const qcReady = qcStatus === "qc_pass" || warned;
               const warnings = qc ? qcWarnings(qc) : [];
+              const cropResult = cropSpecsForDataset(dataset, cropEnabled, cameraCropInputs);
               const blockedReason = !qcReady
                 ? qcStatus === "qc_failed"
                   ? "QC failed — fix or re-record before training on this"
                   : "Run QC in Dataset Processing before building a view"
                 : kept === 0
                   ? "Every episode is marked not for training"
-                  : undefined;
+                  : cropResult.error ?? undefined;
               return (
                 <div className="processing-row" key={dataset.path}>
                   <div className="processing-row-main static">
@@ -166,6 +319,9 @@ function TrainingViewPage({
                           confirmation first.
                         </p>
                       ) : null}
+                      {cropEnabled && cropResult.label ? (
+                        <p className="panel-note">Training view video input: {cropResult.label}.</p>
+                      ) : null}
                       {excluded.length > 0 ? (
                         // Shown before the build, not after: this is the operator's own review
                         // deciding what reaches training, and it changes what the button does.
@@ -178,9 +334,9 @@ function TrainingViewPage({
                     </div>
                     <div className="processing-stats">
                       <button
-                        disabled={busy || building || !qcReady || kept === 0}
+                        disabled={busy || building || !qcReady || kept === 0 || Boolean(cropResult.error)}
                         title={blockedReason}
-                        onClick={() => onBuildView(dataset.path, actionMode)}
+                        onClick={() => onBuildView(dataset.path, actionMode, cropResult.crops)}
                       >
                         {buildingThis ? "Building…" : "Build View"}
                       </button>
@@ -261,7 +417,7 @@ export function DatasetExportPage({
   snapshot: GuiSnapshot;
   busy: boolean;
   onExportTask: (id: string) => void;
-  onExportApprovedDataset: (path: string, actionMode?: string) => void;
+  onExportApprovedDataset: (path: string, actionMode?: string, cameraCrops?: CameraCropSpecs) => void;
   onOpenProcessing: () => void;
   onOpenReplay: (path: string) => void;
 }) {

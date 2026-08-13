@@ -636,6 +636,132 @@ button.danger {
 }
 
 
+
+.capture-readiness-banner {
+  align-items: center;
+  background: #fff8ed;
+  border-color: #e7b64a;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, auto);
+}
+
+.capture-readiness-banner strong,
+.capture-readiness-banner span {
+  display: block;
+}
+
+.capture-readiness-banner strong {
+  color: #7c2d12;
+  font-size: 15px;
+}
+
+.capture-readiness-banner span {
+  color: #43525e;
+  font-size: 13px;
+  margin-top: 3px;
+}
+
+.capture-readiness-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.capture-readiness-checks span {
+  background: #ffffff;
+  border: 1px solid #f1d6ad;
+  border-radius: 999px;
+  color: #7c2d12;
+  font-size: 12px;
+  margin: 0;
+  padding: 5px 8px;
+}
+
+.checkbox-row {
+  align-items: center;
+  color: #172026;
+  display: inline-flex;
+  font-size: 13px;
+  gap: 7px;
+}
+
+.checkbox-row input {
+  accent-color: #0f766e;
+}
+
+.camera-crop-grid {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.camera-crop-row {
+  align-items: center;
+  border: 1px solid #e1e6ea;
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(220px, 1fr) repeat(4, minmax(72px, 96px));
+  padding: 8px;
+}
+
+.camera-crop-row strong,
+.camera-crop-row small,
+.camera-crop-row label span {
+  display: block;
+}
+
+.camera-crop-row small,
+.camera-crop-row label span {
+  color: #60707c;
+  font-size: 12px;
+}
+
+.camera-crop-row input {
+  border: 1px solid #c8d2d8;
+  border-radius: 6px;
+  font: inherit;
+  min-width: 0;
+  padding: 7px 8px;
+  width: 100%;
+}
+
+.camera-crop-row input:focus {
+  border-color: #0f766e;
+  outline: 2px solid rgba(15, 118, 110, 0.16);
+}
+
+@media (max-width: 760px) {
+  .capture-readiness-banner {
+    grid-template-columns: 1fr;
+  }
+
+  .capture-readiness-checks {
+    justify-content: flex-start;
+  }
+
+  .camera-crop-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .camera-crop-row > div {
+    grid-column: 1 / -1;
+  }
+}
+
+.recording-session-controls {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  margin: 10px 0;
+}
+
+.recording-session-controls .episode-duration-control {
+  margin: 0;
+}
+
 .episode-duration-control {
   align-items: center;
   border: 1px solid #e1e6ea;
