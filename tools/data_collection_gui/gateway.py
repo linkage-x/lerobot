@@ -6771,11 +6771,21 @@ def _serve_static_file(handler: BaseHTTPRequestHandler, asset_path: Path, conten
 def _terminate_preview_proc(proc: subprocess.Popen[bytes] | None) -> None:
     if proc is None or proc.poll() is not None:
         return
-    proc.terminate()
     try:
-        proc.wait(timeout=1.0)
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=1.5)
+    except ProcessLookupError:
+        return
     except subprocess.TimeoutExpired:
-        proc.kill()
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 def _stop_all_camera_previews(state: GatewayState) -> None:
@@ -6996,6 +7006,7 @@ def _ensure_realsense_device_preview(
             stderr=subprocess.DEVNULL,
             cwd=state.repo_root,
             env=_tool_env(state.repo_root),
+            start_new_session=True,
         )
         with state.camera_preview_lock:
             state.camera_preview_processes[device_id] = proc
@@ -7015,6 +7026,9 @@ def _serve_realsense_device_preview_snapshot(
     device_id: str,
     device: dict[str, Any],
 ) -> None:
+    if state.camera_preview_suspended:
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": "camera preview suspended while recorder connects"})
+        return
     with state.camera_preview_lock:
         state.camera_preview_last_access[device_id] = time.time()
     if not _ensure_realsense_device_preview(state, device_id=device_id, device=device):
@@ -7142,6 +7156,7 @@ def _ensure_camera_preview(
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             cwd=str(Path.cwd()),
+            start_new_session=True,
         )
         state.camera_preview_last_spawn_s = time.monotonic()
         with state.camera_preview_lock:

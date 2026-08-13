@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -456,6 +457,45 @@ def test_previews_suspended_for_connect_resets_flag_on_any_exception():
     except RuntimeError:
         pass
     assert state.camera_preview_suspended is False
+
+
+def test_realsense_device_preview_respects_connect_suspension(monkeypatch):
+    state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH, profile="workstation")
+    state.camera_preview_suspended = True
+    called = False
+
+    def fail_if_preview_spawns(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("preview must not spawn while recorder is connecting")
+
+    class FakeHandler:
+        def __init__(self):
+            self.status = None
+            self.headers: list[tuple[str, str]] = []
+            self.wfile = io.BytesIO()
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, key, value):
+            self.headers.append((key, value))
+
+        def end_headers(self):
+            pass
+
+    monkeypatch.setattr(gateway, "_ensure_realsense_device_preview", fail_if_preview_spawns)
+    handler = FakeHandler()
+
+    gateway._serve_realsense_device_preview_snapshot(
+        handler,
+        state=state,
+        device_id="ee",
+        device={"config": {"serial_number_or_name": "315122271876"}},
+    )
+
+    assert handler.status == gateway.HTTPStatus.CONFLICT
+    assert called is False
 
 
 def test_gmsl2_timeline_ignores_replay_warmup_for_splitmux_episode(tmp_path):
