@@ -1441,20 +1441,51 @@ def build_tactile_fallback_observation(fallback_mode: str | None) -> dict[str, n
     }
 
 
-def normalize_dataset_gripper(aperture_value: float, cfg: FrankaResearch3Config) -> float:
+def _gripper_feature_unit(feature_name: str | None) -> str | None:
+    if not feature_name:
+        return None
+    name = str(feature_name).lower()
+    if name.endswith('.width_mm') or 'width_mm' in name:
+        return 'mm'
+    if name.endswith('.distance_m') or name.endswith('.width_m') or 'distance_m' in name or 'width_m' in name:
+        return 'm'
+    if name in {
+        'gripper.pos',
+        'observation.state.gripper.pos',
+        'prev_cmd.gripper.pos',
+        'observation.state.prev_cmd.gripper.pos',
+    }:
+        return 'normalized'
+    return None
+
+
+def normalize_dataset_gripper(
+    aperture_value: float,
+    cfg: FrankaResearch3Config,
+    *,
+    feature_name: str | None = None,
+) -> float:
     aperture_value = float(max(0.0, aperture_value))
+    unit = _gripper_feature_unit(feature_name)
+    if unit == 'normalized' and cfg.gripper_backend != 'das':
+        return float(np.clip(aperture_value, 0.0, 1.0))
+
     if cfg.gripper_backend == 'das':
         span_m = float(cfg.das_max_distance_m - cfg.das_min_distance_m)
         if span_m <= 0.0:
             return 0.0
         return float(np.clip((aperture_value - cfg.das_min_distance_m) / span_m, 0.0, 1.0))
+
     max_width_m = float(cfg.gripper_max_width_mm) / 1000.0
     max_width_mm = float(cfg.gripper_max_width_mm)
     if max_width_m <= 0.0 or max_width_mm <= 0.0:
         return 0.0
+    if unit == 'm':
+        return float(np.clip(aperture_value / max_width_m, 0.0, 1.0))
+    if unit == 'mm':
+        return float(np.clip(aperture_value / max_width_mm, 0.0, 1.0))
 
-    # Historical datasets used meters, live robot commands use normalized [0, 1],
-    # and Pika collection data often stores aperture directly in millimeters.
+    # Fallback for legacy checkpoints whose gripper dimension had no unit-bearing name.
     if aperture_value <= max_width_m * 1.25:
         return float(np.clip(aperture_value / max_width_m, 0.0, 1.0))
     if aperture_value <= 1.0:
@@ -1462,23 +1493,46 @@ def normalize_dataset_gripper(aperture_value: float, cfg: FrankaResearch3Config)
     return float(np.clip(aperture_value / max_width_mm, 0.0, 1.0))
 
 
-def denormalize_live_gripper_observation(gripper_pos: float, cfg: FrankaResearch3Config) -> float:
+def denormalize_live_gripper_observation(
+    gripper_pos: float,
+    cfg: FrankaResearch3Config,
+    *,
+    feature_name: str | None = None,
+) -> float:
     gripper_pos = float(np.clip(gripper_pos, 0.0, 1.0))
+    unit = _gripper_feature_unit(feature_name)
+    if unit == 'normalized' and cfg.gripper_backend != 'das':
+        return gripper_pos
+
     if cfg.gripper_backend == 'das':
         span_m = float(cfg.das_max_distance_m - cfg.das_min_distance_m)
         if span_m <= 0.0:
             return 0.0
         return float(cfg.das_min_distance_m + gripper_pos * span_m)
+
     max_width_m = float(cfg.gripper_max_width_mm) / 1000.0
+    max_width_mm = float(cfg.gripper_max_width_mm)
+    if unit == 'mm':
+        return float(gripper_pos * max_width_mm)
     if max_width_m <= 0.0:
         return 0.0
     return float(gripper_pos * max_width_m)
+
+
+def _dataset_feature_name_for_observation_key(state_names: list[str] | None, key: str) -> str | None:
+    if not state_names:
+        return None
+    for name in state_names:
+        if _state_name_to_observation_key(str(name)) == key:
+            return str(name)
+    return None
 
 
 def convert_gripper_observation_to_dataset_units(
     observation: RobotObservation,
     *,
     robot_cfg: FrankaResearch3Config,
+    state_names: list[str] | None = None,
 ) -> RobotObservation:
     converted_observation = dict(observation)
     for key in ('gripper.pos', PREV_CMD_GRIPPER_KEY):
@@ -1487,6 +1541,7 @@ def convert_gripper_observation_to_dataset_units(
         converted_observation[key] = denormalize_live_gripper_observation(
             float(converted_observation[key]),
             robot_cfg,
+            feature_name=_dataset_feature_name_for_observation_key(state_names, key) or key,
         )
     return converted_observation
 
@@ -1534,6 +1589,8 @@ def _state_name_to_observation_key(name: str) -> str:
         'handheld_gripper.pika_right.width_mm': 'gripper.pos',
         'corenetic_gripper.distance_m': 'gripper.pos',
         'box_gripper.distance_m': 'gripper.pos',
+        'observation.state.gripper.pos': 'gripper.pos',
+        'observation.state.prev_cmd.gripper.pos': PREV_CMD_GRIPPER_KEY,
         'observation.state_raw.handheld_gripper.pika_left.width_mm': 'gripper.pos',
         'observation.state_raw.handheld_gripper.pika_right.width_mm': 'gripper.pos',
         'observation.state_raw.corenetic_gripper.distance_m': 'gripper.pos',
@@ -1543,9 +1600,13 @@ def _state_name_to_observation_key(name: str) -> str:
 
 
 def _action_value(action_map: dict[str, float], *keys: str) -> float:
+    return _action_value_with_name(action_map, *keys)[0]
+
+
+def _action_value_with_name(action_map: dict[str, float], *keys: str) -> tuple[float, str]:
     for key in keys:
         if key in action_map:
-            return float(action_map[key])
+            return float(action_map[key]), key
     raise KeyError(f'Missing action keys {keys!r} in decoded policy action.')
 
 
@@ -1926,6 +1987,7 @@ def estimate_dataset_start_pose_contract(
     if gripper_values is not None:
         stats['gripper_mean'] = float(gripper_values.mean())
         stats['gripper_std'] = float(gripper_values.std())
+        stats['gripper_feature_name'] = 'gripper.pos'
     return representative_pose_xyzquat, stats
 
 
@@ -2138,11 +2200,15 @@ def decode_action_to_robot_command(
         rebuilt_rotvec = Rotation.from_quat(
             np.asarray([rebuilt['ee.qx'], rebuilt['ee.qy'], rebuilt['ee.qz'], rebuilt['ee.qw']], dtype=np.float64)
         ).as_rotvec()
-        raw_delta_gripper = _action_value(action_map, 'gripper', 'gripper.pos')
+        raw_delta_gripper, delta_gripper_feature = _action_value_with_name(action_map, 'gripper', 'gripper.pos')
         if gripper_close_below is not None and raw_delta_gripper < float(gripper_close_below):
             delta_gripper_normalized = 0.0
         else:
-            delta_gripper_normalized = normalize_dataset_gripper(raw_delta_gripper, robot_cfg)
+            delta_gripper_normalized = normalize_dataset_gripper(
+                raw_delta_gripper,
+                robot_cfg,
+                feature_name=delta_gripper_feature,
+            )
         return {
             'ee.x': float(rebuilt['ee.x']),
             'ee.y': float(rebuilt['ee.y']),
@@ -2163,17 +2229,26 @@ def decode_action_to_robot_command(
         dtype=np.float64,
     )
     rotvec_xyz = Rotation.from_quat(quaternion_xyzw).as_rotvec()
-    raw_gripper_value = _action_value(
+    raw_gripper_value, gripper_feature = _action_value_with_name(
         action_map,
         'gripper',
         'gripper.pos',
+        'observation.state.gripper.pos',
         'observation.state_raw.handheld_gripper.pika_left.width_mm',
         'observation.state_raw.handheld_gripper.pika_right.width_mm',
+        'corenetic_gripper.distance_m',
+        'observation.state_raw.corenetic_gripper.distance_m',
+        'box_gripper.distance_m',
+        'observation.state_raw.box_gripper.distance_m',
     )
     if gripper_close_below is not None and raw_gripper_value < float(gripper_close_below):
         gripper_normalized = 0.0
     else:
-        gripper_normalized = normalize_dataset_gripper(raw_gripper_value, robot_cfg)
+        gripper_normalized = normalize_dataset_gripper(
+            raw_gripper_value,
+            robot_cfg,
+            feature_name=gripper_feature,
+        )
 
     return {
         'ee.x': _action_value(action_map, 'x', 'ee.x'),
@@ -3018,11 +3093,13 @@ def run_inference(args: argparse.Namespace) -> int:
     from lerobot.robots.franka_research3 import FrankaResearch3
 
     robot = FrankaResearch3(robot_cfg)
+    dataset_gripper_feature_name = str(dataset_start_pose_stats.get('gripper_feature_name') or 'gripper.pos')
     dataset_start_gripper_mean_normalized: float | None = None
     if 'gripper_mean' in dataset_start_pose_stats:
         dataset_start_gripper_mean_normalized = normalize_dataset_gripper(
             float(dataset_start_pose_stats['gripper_mean']),
             robot_cfg,
+            feature_name=dataset_gripper_feature_name,
         )
     state_processor = KeepAbsoluteEEObservation()
     T_B_Ws: np.ndarray | None = None
@@ -3212,6 +3289,7 @@ def run_inference(args: argparse.Namespace) -> int:
             live_gripper_dataset_units = denormalize_live_gripper_observation(
                 float(robot_observation['gripper.pos']),
                 robot_cfg,
+                feature_name=dataset_gripper_feature_name,
             )
             if T_B_Ws is None:
                 current_start_pose_i = _pose_from_quaternion_observation(absolute_state_observation_i)
@@ -3280,6 +3358,7 @@ def run_inference(args: argparse.Namespace) -> int:
             dataset_state_observation_i = convert_gripper_observation_to_dataset_units(
                 dataset_state_observation_i,
                 robot_cfg=robot_cfg,
+                state_names=state_names,
             )
             policy_state_observation_i = apply_gripper_observation_offset(
                 dataset_state_observation_i,

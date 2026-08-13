@@ -835,6 +835,73 @@ def test_extract_dataset_state_contract_indices_ignores_prev_cmd_suffix_fields(t
     assert indices['gripper.pos'] == 7
 
 
+
+
+def test_normalize_dataset_gripper_uses_feature_name_before_value_heuristic():
+    robot_cfg = FrankaResearch3Config(
+        robot_ip='192.168.1.206',
+        gripper_port='/dev/ttyUSB0',
+        gripper_backend='pika',
+        urdf_path='/tmp/fr3_pika.urdf',
+        gripper_max_width_mm=90.0,
+    )
+
+    assert np.isclose(
+        fr3_act_infer_real_runtime.normalize_dataset_gripper(0.08, robot_cfg, feature_name='gripper.pos'),
+        0.08,
+    )
+    assert np.isclose(
+        fr3_act_infer_real_runtime.normalize_dataset_gripper(70.0, robot_cfg, feature_name='observation.state_raw.handheld_gripper.pika_left.width_mm'),
+        70.0 / 90.0,
+    )
+    # Legacy fallback stays unchanged when no unit-bearing feature name is available.
+    assert np.isclose(fr3_act_infer_real_runtime.normalize_dataset_gripper(0.08, robot_cfg), 0.08 / 0.09)
+
+
+def test_convert_gripper_observation_to_dataset_units_uses_state_feature_names():
+    robot_cfg = FrankaResearch3Config(
+        robot_ip='192.168.1.206',
+        gripper_port='/dev/ttyUSB0',
+        gripper_backend='pika',
+        urdf_path='/tmp/fr3_pika.urdf',
+        gripper_max_width_mm=90.0,
+    )
+
+    normalized = fr3_act_infer_real_runtime.convert_gripper_observation_to_dataset_units(
+        {'gripper.pos': 0.25, 'prev_cmd.gripper.pos': 0.5},
+        robot_cfg=robot_cfg,
+        state_names=['gripper.pos', 'prev_cmd.gripper.pos'],
+    )
+    width_mm = fr3_act_infer_real_runtime.convert_gripper_observation_to_dataset_units(
+        {'gripper.pos': 0.25},
+        robot_cfg=robot_cfg,
+        state_names=['observation.state_raw.handheld_gripper.pika_left.width_mm'],
+    )
+
+    assert normalized['gripper.pos'] == 0.25
+    assert normalized['prev_cmd.gripper.pos'] == 0.5
+    assert np.isclose(width_mm['gripper.pos'], 22.5)
+
+
+def test_decode_action_to_robot_command_treats_named_gripper_pos_as_normalized_for_pika():
+    robot_cfg = FrankaResearch3Config(
+        robot_ip='192.168.1.206',
+        gripper_port='/dev/ttyUSB0',
+        gripper_backend='pika',
+        urdf_path='/tmp/fr3_pika.urdf',
+        gripper_max_width_mm=90.0,
+    )
+    action_tensor = torch.tensor([[0.4, 0.1, 0.2, 0.0, 0.0, 0.0, 1.0, 0.08]], dtype=torch.float32)
+
+    command = fr3_act_infer_real_runtime.decode_action_to_robot_command(
+        action_tensor,
+        action_names=['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw', 'gripper.pos'],
+        robot_cfg=robot_cfg,
+    )
+
+    assert np.isclose(command['gripper.pos'], 0.08)
+
+
 def test_denormalize_live_gripper_observation_matches_das_aperture():
     robot_cfg = FrankaResearch3Config(
         robot_ip='192.168.1.208',
