@@ -88,7 +88,7 @@ export type ConfigSummary = {
     savePath: string;
   };
   recorderScript?: string;
-  rigType?: "gmsl2" | "handheld";
+  rigType?: "gmsl2" | "handheld" | "fr3";
   hardwareSync?: HardwareSyncStatus;
   cameraDefaults?: CameraDefaults;
 };

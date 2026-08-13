@@ -21,7 +21,8 @@ export function ProcessingRow({
   onSelect,
   onGenerate,
   onRunQc,
-  onOpenReplay
+  onOpenReplay,
+  supportsTrajectoryGeneration = true
 }: {
   item: ProcessingItem;
   active: boolean;
@@ -30,15 +31,16 @@ export function ProcessingRow({
   onGenerate: () => void;
   onRunQc: () => void;
   onOpenReplay: () => void;
+  supportsTrajectoryGeneration?: boolean;
 }) {
   const primary =
-    item.status === "pose_missing" ? (
+    item.status === "pose_missing" && supportsTrajectoryGeneration ? (
       <button disabled={busy} onClick={onGenerate}>Generate EE Trajectory</button>
     ) : item.status === "queued" || item.status === "running" ? (
       <button disabled={busy} onClick={onSelect}>View Log</button>
     ) : item.status === "qc_pass" || item.status === "qc_warn" ? (
       <button disabled={busy} onClick={onOpenReplay}>Open Replay</button>
-    ) : item.status === "error" && !item.trajectoryVersion ? (
+    ) : item.status === "error" && !item.trajectoryVersion && supportsTrajectoryGeneration ? (
       // trajectory generation failed: no trajectory to QC, offer to regenerate instead
       <button disabled={busy} onClick={onGenerate}>Regenerate Trajectory</button>
     ) : item.status === "qc_failed" || item.status === "error" ? (
@@ -180,6 +182,7 @@ export function DatasetProcessingPage({
   const failedCount = items.filter((item) => item.status === "qc_failed" || item.status === "error").length;
   const readyCount = items.filter((item) => item.status === "qc_pass").length;
   const warnedCount = items.filter((item) => item.status === "qc_warn").length;
+  const supportsTrajectoryGeneration = snapshot.deployment?.profile !== "workstation";
   const currentRoot = snapshot.gateway.datasetsRoot ?? "";
   const [rootInput, setRootInput] = useState<string>(currentRoot);
   useEffect(() => {
@@ -189,7 +192,12 @@ export function DatasetProcessingPage({
 
   return (
     <div className="page-stack">
-      <PageHeader title="Dataset Processing" subtitle="EE trajectory generation, QC, and post-processing job queue for recorded datasets" />
+      <PageHeader
+        title="Dataset Processing"
+        subtitle={supportsTrajectoryGeneration
+          ? "EE trajectory generation, QC, and post-processing job queue for recorded datasets"
+          : "QC and replay checks for FR3 datasets with recorded EE trajectories"}
+      />
       <section className="panel">
         <div className="panel-heading">
           <h2>Datasets Root</h2>
@@ -265,6 +273,7 @@ export function DatasetProcessingPage({
                   onGenerate={() => onGenerate(item.path)}
                   onRunQc={() => onRunQc(item.path)}
                   onOpenReplay={() => onOpenReplay(item.path)}
+                  supportsTrajectoryGeneration={supportsTrajectoryGeneration}
                 />
               ))}
             </div>
@@ -282,22 +291,24 @@ export function DatasetProcessingPage({
             <div className="summary-grid">
               <Metric label="Episodes" value={selected.totalEpisodes} />
               <Metric label="Frames" value={selected.totalFrames} />
-              <Metric label="Trajectory" value={selected.trajectoryVersion ?? "—"} />
+              <Metric label={supportsTrajectoryGeneration ? "Trajectory" : "Recorded trajectory"} value={selected.trajectoryVersion ?? "—"} />
               <Metric label="Valid frames" value={selected.validFramesPct != null ? `${selected.validFramesPct}%` : "—"} />
             </div>
             <div className="control-row">
-              <button
-                disabled={busy || selected.status === "running" || selected.status === "queued"}
-                onClick={() => onGenerate(selected.path)}
-              >
-                {selected.trajectoryVersion ? "Regenerate Trajectory" : "Generate EE Trajectory"}
-              </button>
+              {supportsTrajectoryGeneration ? (
+                <button
+                  disabled={busy || selected.status === "running" || selected.status === "queued"}
+                  onClick={() => onGenerate(selected.path)}
+                >
+                  {selected.trajectoryVersion ? "Regenerate Trajectory" : "Generate EE Trajectory"}
+                </button>
+              ) : null}
               <button
                 disabled={
                   busy ||
                   !["pose_ready", "qc_warn", "qc_pass", "qc_failed", "error"].includes(selected.status) ||
                   // trajectory generation failed: nothing to QC until a trajectory exists
-                  (selected.status === "error" && !selected.trajectoryVersion)
+                  (supportsTrajectoryGeneration && selected.status === "error" && !selected.trajectoryVersion)
                 }
                 onClick={() => onRunQc(selected.path)}
               >

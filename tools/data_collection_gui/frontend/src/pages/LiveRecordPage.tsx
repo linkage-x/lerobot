@@ -140,6 +140,7 @@ export function recordingControlAvailability(status: RecordingStatus) {
     canConnect: !isConnected,
     canStartEpisode: status.state === "armed",
     canResolveEpisode: status.state === "recording" || status.state === "review",
+    canSetStartPose: status.state === "armed" || status.state === "recording" || status.state === "review",
     canExit: isConnected,
   };
 }
@@ -184,10 +185,12 @@ export function RecordingPanel({
   onConnect,
   onStart,
   onStop,
+  onSetStartPose,
   logLines,
   backendPicker,
   episodeDurationControl,
-  episodeDurationValid = true
+  episodeDurationValid = true,
+  showStartPoseControl = false
 }: {
   status: RecordingStatus;
   config: ConfigSummary;
@@ -195,13 +198,15 @@ export function RecordingPanel({
   onConnect: () => void;
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
+  onSetStartPose?: () => void;
   logLines?: string[];
   backendPicker?: React.ReactNode;
   episodeDurationControl?: React.ReactNode;
   episodeDurationValid?: boolean;
+  showStartPoseControl?: boolean;
 }) {
   const progress = Math.round((status.frameIndex / Math.max(status.targetFrames, 1)) * 100);
-  const { isConnected, canStartEpisode, canResolveEpisode, canExit } =
+  const { isConnected, canStartEpisode, canResolveEpisode, canSetStartPose, canExit } =
     recordingControlAvailability(status);
   const isGmsl = config.rigType === "gmsl2";
   const panelTitle = backendPicker ? "FR3 Record" : isGmsl ? "GMSL2 Record" : "Handheld Record";
@@ -235,6 +240,15 @@ export function RecordingPanel({
         <button disabled={busy || !canStartEpisode} onClick={onStart} title="Shortcut: E">StartEpisode <kbd>E</kbd></button>
         <button disabled={busy || !canResolveEpisode} onClick={() => onStop("save")} title="Shortcut: S">Save <kbd>S</kbd></button>
         <button disabled={busy || !canResolveEpisode} onClick={() => onStop("discard")} title="Shortcut: D">Discard <kbd>D</kbd></button>
+        {showStartPoseControl ? (
+          <button
+            disabled={busy || !canSetStartPose || !onSetStartPose}
+            onClick={onSetStartPose}
+            title="Use current FR3 joints as the next return pose"
+          >
+            Set Home
+          </button>
+        ) : null}
         <button disabled={busy || !canExit} onClick={() => onStop("exit")} title="Shortcut: Esc">Exit <kbd>Esc</kbd></button>
       </div>
       <div className="summary-grid">
@@ -262,6 +276,7 @@ export function LiveRecordPage({
   onConnect,
   onStart,
   onStop,
+  onSetStartPose,
   onOpenInReplay,
   onQueueTrajGen,
   onGoToProcessing,
@@ -272,6 +287,7 @@ export function LiveRecordPage({
   onConnect: (backend?: RecordingBackend, episodeTimeS?: number) => void;
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
+  onSetStartPose: () => void;
   onOpenInReplay: () => void;
   onQueueTrajGen: () => void;
   onGoToProcessing: () => void;
@@ -280,7 +296,9 @@ export function LiveRecordPage({
   const showSavedBanner = snapshot.recording.savedEpisodes > 0;
   // Only the FR3 workstation has two robots behind one recorder; Thor's rig is singular and
   // must keep sending Connect with no backend at all.
-  const supportsBackendChoice = snapshot.deployment?.profile === "workstation";
+  const workstationProfile = snapshot.deployment?.profile === "workstation";
+  const supportsBackendChoice = workstationProfile;
+  const supportsTrajectoryGeneration = !workstationProfile;
   const [selectedBackend, setSelectedBackend] = useState<RecordingBackend>(
     snapshot.recording.backend ?? "real"
   );
@@ -419,10 +437,12 @@ export function LiveRecordPage({
           onConnect={() => onConnect(supportsBackendChoice ? selectedBackend : undefined, requestedEpisodeTimeS)}
           onStart={onStart}
           onStop={onStop}
+          onSetStartPose={onSetStartPose}
           logLines={logLines}
           backendPicker={backendPicker}
           episodeDurationControl={episodeDurationControl}
           episodeDurationValid={canUseEpisodeTimeInput}
+          showStartPoseControl={workstationProfile}
         />
         <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />
       </div>
@@ -435,7 +455,9 @@ export function LiveRecordPage({
           <p className="panel-note">{snapshot.recording.datasetRoot}</p>
           <div className="control-row">
             <button disabled={busy} onClick={onOpenInReplay}>Open in Replay</button>
-            <button disabled={busy} onClick={onQueueTrajGen}>Queue Traj Gen</button>
+            {supportsTrajectoryGeneration ? (
+              <button disabled={busy} onClick={onQueueTrajGen}>Queue Traj Gen</button>
+            ) : null}
             <button disabled={busy} onClick={onGoToProcessing}>Go to Processing</button>
           </div>
         </section>

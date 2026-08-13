@@ -291,6 +291,7 @@ function App() {
         onConnect={(backend, episodeTimeS) => run(() => api.connectRecording(backend, episodeTimeS))}
         onStart={() => run(() => api.startRecording())}
         onStop={(action) => run(() => api.stopRecording(action))}
+        onSetStartPose={() => run(() => api.setRecordingStartPose())}
         onOpenInReplay={() => selectAndOpenReplay(latestRecordedPath)}
         onQueueTrajGen={() => queueTrajGenAndOpenProcessing(firstMissingPath)}
         onGoToProcessing={() => navigate("dataset-processing")}
@@ -319,7 +320,9 @@ function App() {
         onSelectDataset={(path) => run(() => api.selectRecordedDataset(path))}
         onSelectEpisode={(episode) => run(() => api.selectReplayEpisode(episode))}
         onDeleteEpisode={(episode) => run(() => api.deleteReplayEpisode(episode))}
-        onGenerateForActive={() => replayMatch && queueTrajGenAndOpenProcessing(replayMatch.path)}
+        onGenerateForActive={() => {
+          if (!workstationProfile && replayMatch) queueTrajGenAndOpenProcessing(replayMatch.path);
+        }}
         onOpenProcessing={() => navigate("dataset-processing")}
         onSaveAnnotation={(annotation) => run(() => api.saveEpisodeAnnotation(annotation))}
       />

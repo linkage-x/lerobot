@@ -208,6 +208,20 @@ def test_connect_disconnect(robot):
     assert not robot.is_connected
 
 
+def test_capture_current_start_joint_positions_uses_cached_observation(robot):
+    robot.connect()
+    arm = DummyArmDriver.instances[-1]
+    cached_joints = arm.joint_positions.copy()
+
+    robot.get_observation(include_cameras=False)
+    arm.joint_positions = np.ones(7, dtype=np.float64)
+
+    captured = robot.capture_current_start_joint_positions(require_cached=True)
+
+    assert np.allclose(captured, cached_joints)
+    assert robot.config.start_joint_positions == tuple(float(value) for value in cached_joints)
+
+
 def test_pandapy_arm_driver_connect_seeds_controller_with_current_joints(monkeypatch):
     class DummyJointPositionController:
         def __init__(self):

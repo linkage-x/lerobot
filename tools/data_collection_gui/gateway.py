@@ -594,6 +594,7 @@ def _config_summary(config: dict[str, Any], config_path: Path) -> dict[str, Any]
     is_gmsl = "gmsl" in recorder_script or "defaults" in cameras
 
     vcodec = str(dataset.get("vcodec") or cam_defaults.get("codec") or "")
+    is_fr3 = "fr3_gui_record_runtime" in recorder_script or "tools/fr3/" in recorder_script or "tools\\fr3\\" in recorder_script
     return {
         "configPath": str(config_path),
         "repoId": str(dataset.get("repo_id") or ""),
@@ -611,7 +612,7 @@ def _config_summary(config: dict[str, Any], config_path: Path) -> dict[str, Any]
             "savePath": str(config.get("rerun_save_path") or ""),
         },
         "recorderScript": recorder_script,
-        "rigType": "gmsl2" if is_gmsl else "handheld",
+        "rigType": "fr3" if is_fr3 else "gmsl2" if is_gmsl else "handheld",
         "hardwareSync": {
             "enabled": bool(hw_sync.get("enabled", False)),
             "fps": int(hw_sync.get("fps") or 0),
@@ -8759,6 +8760,13 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
             state.recording.state = "review"
             state.recording.queueDepth = 0
 
+    if output.startswith("Episode review:"):
+        state.recording.state = "review"
+        state.recording.queueDepth = 0
+
+    if output.startswith("Start pose captured:"):
+        state.recording.message = output
+
     saved_match = re.search(r"Total saved episodes:\s*(\d+)", output)
     if saved_match:
         saved_episodes = int(saved_match.group(1))
@@ -9743,6 +9751,20 @@ def _abort_replay(state: GatewayState) -> None:
     state.replay.message = "Replay aborted; command stream stopped"
 
 
+def _capture_recorder_start_pose(state: GatewayState) -> None:
+    if state.profile != "workstation":
+        raise RuntimeError("Dynamic start pose capture is only available for the FR3 workstation recorder.")
+    if state.recording.state not in ("armed", "recording", "review"):
+        raise RuntimeError(f"Cannot capture start pose while recorder is {state.recording.state}.")
+    process = _ensure_recorder_running(state)
+    try:
+        _write_recorder_stdin(process, "set_start_pose\n")
+    except BrokenPipeError as exc:
+        raise RuntimeError("Recorder input is closed.") from exc
+    state.recording.message = "Start pose capture requested"
+    state.log("info", "Requested FR3 start pose capture")
+
+
 def _stop_recorder(state: GatewayState, action: str) -> None:
     # Recorder is going away (or already gone): re-allow Device Manager previews.
     state.camera_preview_suspended = False
@@ -10186,6 +10208,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             state = self.server.state
             requested = (query.get("path", [""])[0] or "").strip()
             try:
+                if state.profile == "workstation":
+                    _json_response(self, HTTPStatus.NOT_IMPLEMENTED, {"error": "FR3 workstation datasets already contain recorded EE trajectories; run QC directly."})
+                    return
                 with state.lock:
                     dataset_root = _resolve_known_dataset(state, requested)
                 if dataset_root is None:
@@ -10214,6 +10239,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/handheld/record/stop-discard":
                     _stop_recorder(self.server.state, "discard")
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/handheld/record/set-start-pose":
+                    _capture_recorder_start_pose(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/handheld/record/exit":

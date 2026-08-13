@@ -106,6 +106,26 @@ class FrankaResearch3(Robot):
             raise RuntimeError(f"Configured FR3 start pose shape must be {expected_shape}, got {target.shape}.")
         return target
 
+    def capture_current_start_joint_positions(self, *, require_cached: bool = False) -> tuple[float, ...]:
+        """Use the latest observed joint state as the configured return-to-start pose."""
+        with self._state_snapshot_lock:
+            cached_joint_positions_rad = self._last_observation_joint_positions_rad
+            joint_positions_rad = (
+                None
+                if cached_joint_positions_rad is None
+                else np.asarray(cached_joint_positions_rad, dtype=np.float64).copy()
+            )
+        if joint_positions_rad is None:
+            if require_cached:
+                raise RuntimeError("No cached FR3 joint observation is available yet.")
+            joint_positions_rad = self._read_joint_positions()
+        expected_shape = (len(self.config.joint_names),)
+        if joint_positions_rad.shape != expected_shape:
+            raise RuntimeError(f"FR3 joint pose shape must be {expected_shape}, got {joint_positions_rad.shape}.")
+        captured = tuple(float(value) for value in joint_positions_rad)
+        self.config.start_joint_positions = captured
+        return captured
+
     def _move_to_configured_start(self, target_joint_positions_rad: np.ndarray) -> np.ndarray:
         if self._arm is None:
             raise RuntimeError("Arm backend is not connected.")

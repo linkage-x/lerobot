@@ -901,6 +901,36 @@ def test_recorder_output_updates_status_and_event_log(tmp_path):
     assert state.events[0].message.startswith("recorder: Episode saved")
 
 
+def test_recorder_output_enters_review_on_explicit_prompt(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=Path.cwd(),
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 30, "episode_time_s": 10}},
+        recording=gateway.RecordingStatus(repoId="local/test", state="recording", targetFrames=300, frameIndex=247),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+
+    gateway._apply_recorder_output(state, "Episode review: save or discard")
+
+    assert state.recording.state == "review"
+    assert state.recording.queueDepth == 0
+
+
+def test_recorder_output_surfaces_captured_start_pose(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=Path.cwd(),
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "fps": 30, "episode_time_s": 10}},
+        recording=gateway.RecordingStatus(repoId="local/test", state="recording"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+
+    gateway._apply_recorder_output(state, "Start pose captured: joint_1=0.1000rad")
+
+    assert state.recording.message == "Start pose captured: joint_1=0.1000rad"
+    assert state.events[0].message.endswith("Start pose captured: joint_1=0.1000rad")
+
+
 def test_recorder_output_marks_connected_and_failed_devices(tmp_path):
     state = gateway.GatewayState(
         repo_root=Path.cwd(),
@@ -2823,6 +2853,39 @@ def _preview_demand_state(tmp_path):
         replay=gateway.ReplayStatus(dataset="local/test"),
         datasets_root=tmp_path,
     )
+
+
+def test_capture_recorder_start_pose_writes_workstation_command(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(tmp_path), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test", state="recording", pid=4321),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path,
+        profile="workstation",
+    )
+    state.process = _FakeRecorderProcess()
+
+    gateway._capture_recorder_start_pose(state)
+
+    assert state.process.stdin.writes == ["set_start_pose\n"]
+    assert state.recording.message == "Start pose capture requested"
+
+
+def test_capture_recorder_start_pose_rejects_thor_profile(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(tmp_path), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test", state="recording", pid=4321),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path,
+    )
+    state.process = _FakeRecorderProcess()
+
+    with pytest.raises(RuntimeError, match="FR3 workstation"):
+        gateway._capture_recorder_start_pose(state)
 
 
 def test_maybe_send_preview_demand_writes_heartbeat(tmp_path):

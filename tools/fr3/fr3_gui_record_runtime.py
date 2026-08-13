@@ -26,6 +26,7 @@ contract -- and only swaps the operator interface for the gateway's line protoco
     ""      start the armed episode  Dataset root: <path>
     save    keep the current episode  Cameras: <ids>
     n       drop the current episode  Episode <n> ready
+    set_start_pose capture current joints for future move_to_start()
     q       stop the session          Recorded <n> frames
     exit    shut down                 Episode saved / Episode discarded
                                       Total saved episodes: <n>
@@ -102,6 +103,89 @@ def emit(line: str) -> None:
     print(line, flush=True)
 
 
+_SAVE_COMMANDS = {"save", "y", "yes"}
+_DISCARD_COMMANDS = {"n", "no", "discard"}
+_EXIT_COMMANDS = {"q", "quit", "exit", "stop"}
+_START_COMMANDS = {"", "start"}
+_START_POSE_COMMANDS = {"set_start_pose", "capture_start_pose", "home_here"}
+
+
+def _format_joint_pose(joint_positions_rad: tuple[float, ...]) -> str:
+    return ", ".join(f"joint_{index}={value:.4f}rad" for index, value in enumerate(joint_positions_rad, start=1))
+
+
+def _capture_start_pose(robot: Any, events: dict[str, bool], *, require_cached: bool) -> bool:
+    capture = getattr(robot, "capture_current_start_joint_positions", None)
+    if not callable(capture):
+        events["capture_start_pose"] = False
+        emit("WARN: start pose capture unavailable for this robot backend")
+        return False
+    try:
+        joint_positions = capture(require_cached=require_cached)
+    except RuntimeError as exc:
+        if require_cached and "No cached FR3 joint observation" in str(exc):
+            return False
+        events["capture_start_pose"] = False
+        emit(f"WARN: start pose capture failed: {exc}")
+        return False
+    events["capture_start_pose"] = False
+    emit(f"Start pose captured: {_format_joint_pose(tuple(joint_positions))}")
+    return True
+
+
+class _StartPoseCaptureWatcher:
+    def __init__(self, robot: Any, events: dict[str, bool]) -> None:
+        self._robot = robot
+        self._events = events
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_StartPoseCaptureWatcher":
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="fr3-gui-record-start-pose", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(0.02):
+            if self._events.get("capture_start_pose"):
+                _capture_start_pose(self._robot, self._events, require_cached=True)
+
+
+def _episode_decision_from_command(command: str | None) -> str | None:
+    if command in _SAVE_COMMANDS:
+        return "save"
+    if command in _DISCARD_COMMANDS:
+        return "discard"
+    if command in _EXIT_COMMANDS:
+        return "exit"
+    return None
+
+
+def _wait_for_episode_decision(commands: "_CommandChannel", robot: Any, events: dict[str, bool]) -> str:
+    command = commands.drain_latest()
+    announced_review = False
+    while True:
+        decision = _episode_decision_from_command(command)
+        if decision is not None:
+            return decision
+        if command in _START_POSE_COMMANDS:
+            if events.get("capture_start_pose"):
+                _capture_start_pose(robot, events, require_cached=False)
+        elif command not in (None, *_START_COMMANDS):
+            emit(f"WARN: ignoring unknown review command: {command}")
+
+        if not announced_review:
+            emit("Episode review: save or discard")
+            announced_review = True
+        command = commands.wait_for_command()
+
+
 class _CommandChannel:
     """Non-blocking view of the gateway's stdin command stream.
 
@@ -124,13 +208,15 @@ class _CommandChannel:
         for raw_line in sys.stdin:
             command = raw_line.strip().lower()
             # A bare newline is the gateway's "start episode" keypress; everything else is a word.
-            if command in ("save", "y"):
+            if command in _SAVE_COMMANDS:
                 self._events["exit_early"] = True
-            elif command in ("n", "discard"):
+            elif command in _DISCARD_COMMANDS:
                 self._events["exit_early"] = True
-            elif command in ("q", "quit", "exit", "stop"):
+            elif command in _EXIT_COMMANDS:
                 self._events["exit_early"] = True
                 self._events["stop_recording"] = True
+            elif command in _START_POSE_COMMANDS:
+                self._events["capture_start_pose"] = True
             self._queue.put(command)
         # stdin closed: the gateway process is gone, so wind the session down cleanly.
         self._events["exit_early"] = True
@@ -617,7 +703,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             encoder_threads=cfg.dataset.encoder_threads,
         )
 
-    events = {"exit_early": False, "rerecord_episode": False, "stop_recording": False}
+    events = {"exit_early": False, "rerecord_episode": False, "stop_recording": False, "capture_start_pose": False}
     commands = _CommandChannel(events)
     control_fps = int(cfg.control_fps or cfg.dataset.fps)
     saved_episodes = 0
@@ -669,7 +755,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             emit("Robots: fr3")
             emit("Grippers: pika")
 
-        with VideoEncodingManager(dataset):
+        with VideoEncodingManager(dataset), _StartPoseCaptureWatcher(robot, events):
             while not events["stop_recording"] and saved_episodes < cfg.dataset.num_episodes:
                 if cfg.auto_move_to_start_after_episode:
                     move_to_start = getattr(robot, "move_to_start", None)
@@ -682,9 +768,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 command = commands.wait_for_command()
                 if command is None:
                     continue
-                if command in ("q", "quit", "exit", "stop"):
+                if command in _EXIT_COMMANDS:
                     break
-                if command not in ("", "start"):
+                if command in _START_POSE_COMMANDS:
+                    _capture_start_pose(robot, events, require_cached=False)
+                    continue
+                if command not in _START_COMMANDS:
                     # Save/discard with no episode in flight: nothing to act on, re-arm.
                     continue
 
@@ -713,10 +802,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         display_compressed_images=False,
                     )
 
-                # Whatever ended the episode (timer, save, discard, quit) is the last command
-                # seen; the timer case leaves nothing queued and defaults to keeping the take.
-                decision = commands.drain_latest()
-                keep_episode = decision not in ("n", "discard", "q", "quit", "exit", "stop")
+                # A button press during recording still resolves immediately; the timer path
+                # now pauses in review so the operator explicitly saves or discards the take.
+                decision = _wait_for_episode_decision(commands, robot, events)
+                keep_episode = decision == "save"
+                exit_after_episode = decision == "exit"
 
                 # An episode stopped before any frame landed has nothing to save; save_episode()
                 # would raise and take the whole session down with it.
@@ -754,6 +844,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 teleop_action_processor.reset()
                 robot_action_processor.reset()
                 robot_observation_processor.reset()
+                if exit_after_episode:
+                    break
     finally:
         emit("Recording stopped")
         finalized = False

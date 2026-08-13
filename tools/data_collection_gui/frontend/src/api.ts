@@ -289,6 +289,20 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
+  async setRecordingStartPose(): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot("/api/handheld/record/set-start-pose");
+    if (remote) {
+      return remote;
+    }
+    await wait(120);
+    this.snapshot.recording = {
+      ...this.snapshot.recording,
+      message: "Start pose capture requested"
+    };
+    this.log("info", "FR3 start pose capture requested");
+    return this.getSnapshot();
+  }
+
   async stopRecording(action: "save" | "discard" | "exit"): Promise<GuiSnapshot> {
     const endpoint =
       action === "save"

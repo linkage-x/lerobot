@@ -423,13 +423,15 @@ export function ReplayReadinessCard({
   processing,
   busy,
   onGenerate,
-  onOpenProcessing
+  onOpenProcessing,
+  supportsTrajectoryGeneration = true
 }: {
   status: ReplayStatus;
   processing: ProcessingItem | null;
   busy: boolean;
   onGenerate: () => void;
   onOpenProcessing: () => void;
+  supportsTrajectoryGeneration?: boolean;
 }) {
   const trajectoryReady =
     status.dataStatus === "loaded" &&
@@ -454,11 +456,17 @@ export function ReplayReadinessCard({
       <section className="panel readiness-card readiness-missing">
         <div className="panel-heading">
           <h2>Trajectory: Missing</h2>
-          <span>EE trajectory not generated</span>
+          <span>{supportsTrajectoryGeneration ? "EE trajectory not generated" : "recorded EE trajectory unavailable"}</span>
         </div>
-        <p className="panel-note">Generate EE trajectory before replaying this dataset. Replay is disabled until the trajectory is ready.</p>
+        <p className="panel-note">
+          {supportsTrajectoryGeneration
+            ? "Generate EE trajectory before replaying this dataset. Replay is disabled until the trajectory is ready."
+            : "Run QC on the recorded FR3 trajectory before replaying this dataset."}
+        </p>
         <div className="control-row">
-          <button disabled={busy || !processing} onClick={onGenerate}>Generate EE Trajectory</button>
+          {supportsTrajectoryGeneration ? (
+            <button disabled={busy || !processing} onClick={onGenerate}>Generate EE Trajectory</button>
+          ) : null}
           <button disabled={busy} onClick={onOpenProcessing}>Open Processing</button>
         </div>
       </section>
@@ -939,7 +947,8 @@ export function EpisodeReplayPage({
   const [mujocoMode, setMujocoMode] = useState<MujocoCubeMode>(snapshot.replay.mujocoCubeMode ?? "left");
   // The workstation replays the arm's own recorded EE stream; there are no AprilTag cubes to
   // pick between, and the gateway ignores the cube mode on that profile entirely.
-  const cubeSelection = (snapshot.deployment?.profile ?? "thor") !== "workstation";
+  const workstationProfile = (snapshot.deployment?.profile ?? "thor") === "workstation";
+  const cubeSelection = !workstationProfile;
   const activePath = snapshot.replay.datasetRoot ?? snapshot.replay.dataset;
   const matchingProcessing =
     snapshot.processing.find((item) => item.path === activePath) ?? null;
@@ -952,6 +961,7 @@ export function EpisodeReplayPage({
         busy={busy}
         onGenerate={onGenerateForActive}
         onOpenProcessing={onOpenProcessing}
+        supportsTrajectoryGeneration={!workstationProfile}
       />
       <div className="replay-workspace">
         <RecordedDatasetList

@@ -21,7 +21,60 @@ import numpy as np
 from lerobot.robots.franka_research3 import FrankaResearch3Config
 from lerobot.scripts.lerobot_record import DatasetRecordConfig, RecordConfig
 from lerobot.teleoperators.spacemouse.configuration_spacemouse import SpaceMouseTeleopConfig, SpaceMouseToolMode
-from tools.fr3 import fr3_record_runtime
+from tools.fr3 import fr3_gui_record_runtime, fr3_record_runtime
+
+
+def test_gui_episode_decision_waits_for_explicit_save_after_timer(monkeypatch):
+    emitted: list[str] = []
+    monkeypatch.setattr(fr3_gui_record_runtime, "emit", emitted.append)
+
+    class FakeCommands:
+        def __init__(self):
+            self.wait_calls = 0
+
+        def drain_latest(self):
+            return None
+
+        def wait_for_command(self):
+            self.wait_calls += 1
+            return "save"
+
+    commands = FakeCommands()
+
+    decision = fr3_gui_record_runtime._wait_for_episode_decision(
+        commands,
+        robot=object(),
+        events={"capture_start_pose": False},
+    )
+
+    assert decision == "save"
+    assert emitted == ["Episode review: save or discard"]
+    assert commands.wait_calls == 1
+
+
+def test_gui_start_pose_command_captures_current_joints(monkeypatch):
+    emitted: list[str] = []
+    monkeypatch.setattr(fr3_gui_record_runtime, "emit", emitted.append)
+
+    class FakeRobotWithStartPose:
+        def __init__(self):
+            self.calls = []
+
+        def capture_current_start_joint_positions(self, *, require_cached: bool):
+            self.calls.append(require_cached)
+            return (0.1, 0.2, 0.3, -1.0, 0.5, 1.2, -0.7)
+
+    robot = FakeRobotWithStartPose()
+    events = {"capture_start_pose": True}
+
+    assert fr3_gui_record_runtime._capture_start_pose(robot, events, require_cached=True) is True
+    assert robot.calls == [True]
+    assert events["capture_start_pose"] is False
+    assert emitted == [
+        "Start pose captured: "
+        "joint_1=0.1000rad, joint_2=0.2000rad, joint_3=0.3000rad, "
+        "joint_4=-1.0000rad, joint_5=0.5000rad, joint_6=1.2000rad, joint_7=-0.7000rad"
+    ]
 
 
 class FakeProcessor:
