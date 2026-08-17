@@ -31,6 +31,34 @@ _TOUCH_SUMMARY_NAMES = (
     "active_points",
 )
 
+# Touch pad geometry. box_client owns the table (it is what tags each frame);
+# re-exported here so export_v3 and the gateway resolve a taxel count without
+# each keeping its own copy. The literal fallback keeps this module importable
+# if box_sdk/ is not deployed alongside it.
+try:
+    from tools.thor.box_sdk.box_client import (  # noqa: F401
+        TOUCH_MODELS,
+        touch_model_for_point_count,
+        touch_point_count,
+    )
+except Exception:  # noqa: BLE001
+    TOUCH_MODELS = {
+        "paxini_l5325": {"points": 239, "rows": None, "cols": None},
+        "m2020": {"points": 9, "rows": 3, "cols": 3},
+    }
+
+    def touch_point_count(model: str | None) -> int:
+        spec = TOUCH_MODELS.get(str(model or ""))
+        return int(spec["points"]) if spec else 239
+
+    def touch_model_for_point_count(points: int) -> str | None:
+        for name, spec in TOUCH_MODELS.items():
+            if int(spec["points"]) == int(points):
+                return name
+        return None
+
+_SIX_D_FORCE_AXIS_NAMES = ("fx", "fy", "fz", "mx", "my", "mz")
+
 
 BOX_STATE_NAMES: tuple[str, ...] = (
     "box_gripper.distance_m",
@@ -49,12 +77,8 @@ BOX_STATE_NAMES: tuple[str, ...] = (
     "box_imu.quat_y",
     "box_imu.quat_z",
     "box_imu.quat_w",
-    "box_six_d_force.fx",
-    "box_six_d_force.fy",
-    "box_six_d_force.fz",
-    "box_six_d_force.mx",
-    "box_six_d_force.my",
-    "box_six_d_force.mz",
+    *tuple(f"box_six_d_force.{axis}" for axis in _SIX_D_FORCE_AXIS_NAMES),
+    *tuple(f"box_six_d_force_no_gravity.{axis}" for axis in _SIX_D_FORCE_AXIS_NAMES),
     *tuple(f"box_touch_left.{name}" for name in _TOUCH_SUMMARY_NAMES),
     *tuple(f"box_touch_right.{name}" for name in _TOUCH_SUMMARY_NAMES),
 )
@@ -224,10 +248,34 @@ def _imu_quat_xyzw(imu: dict[str, Any]) -> list[float]:
     return [x, y, z, w]
 
 
+def _touch_points(sensor: dict[str, Any]) -> int:
+    """How many taxels this touch frame actually carries.
+
+    The BOX SDK hands every pad over in one fixed 239-slot array regardless of
+    the pad fitted, so ``box_client`` cuts the frame to the pad's real point
+    count and tags it with ``points``. Prefer that tag; fall back to the array
+    lengths for frames archived before the tag existed. Hard-coding 239 here
+    would divide an M2020 pad's 9 real taxels by 239 and shrink every
+    ``mean_f*`` channel ~26x below the force the gripper actually felt.
+    """
+
+    tagged = sensor.get("points")
+    if isinstance(tagged, int) and tagged > 0:
+        return tagged
+    return max(
+        (len(sensor[key]) for key in ("fz_0p1N", "fx_0p1N", "fy_0p1N")
+         if isinstance(sensor.get(key), list)),
+        default=0,
+    )
+
+
 def _touch_summary(sensor: dict[str, Any]) -> list[float]:
-    fx = _list_values(sensor, "fx_0p1N", 239)
-    fy = _list_values(sensor, "fy_0p1N", 239)
-    fz = _list_values(sensor, "fz_0p1N", 239)
+    points = _touch_points(sensor)
+    if points <= 0:
+        return [0.0] * len(_TOUCH_SUMMARY_NAMES)
+    fx = _list_values(sensor, "fx_0p1N", points)
+    fy = _list_values(sensor, "fy_0p1N", points)
+    fz = _list_values(sensor, "fz_0p1N", points)
     if not fx and not fy and not fz:
         return [0.0] * len(_TOUCH_SUMMARY_NAMES)
     count = max(len(fx), len(fy), len(fz), 1)
@@ -268,6 +316,7 @@ def box_snapshot_to_state(snapshot: dict[str, Any]) -> list[float]:
         *_list_values(imu, "gyr_deg_s", 3),
         *_imu_quat_xyzw(imu),
         *_list_values(six_d, "fxyz_mxyz", 6),
+        *_list_values(six_d, "fxyz_mxyz_no_gravity", 6),
         *_touch_summary(touch_left),
         *_touch_summary(touch_right),
     ]

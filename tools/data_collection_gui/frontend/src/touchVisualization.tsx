@@ -4,6 +4,12 @@ export type TouchSampleLike = {
   fz?: number[];
   fx?: number[];
   fy?: number[];
+  // Pad geometry as reported by box_client (`paxini_l5325`, `m2020`, ...).
+  // The BOX SDK carries every pad in one fixed 239-slot array, so the array
+  // length alone cannot tell a 9-taxel M2020 frame from a Paxini frame whose
+  // trailing taxels are merely untouched -- prefer this when it is present.
+  model?: string;
+  points?: number;
 };
 
 export type TouchScale = {
@@ -17,6 +23,16 @@ export type TouchLayout = {
   unitCount: number;
   label: string;
 };
+
+// Touch pad models, mirroring box_client.TOUCH_MODELS.
+export const TOUCH_MODEL_PAXINI = "paxini_l5325";
+export const TOUCH_MODEL_M2020 = "m2020";
+
+// M2020: a 3x3 patch, cable entering on the left, numbered row-major 1..9 in
+// the vendor datasheet. Indices 0..8 of fx/fy/fz map straight onto that.
+export const M2020_TOUCH_ROWS = 3;
+export const M2020_TOUCH_COLUMNS = 3;
+export const M2020_TOUCH_UNIT_COUNT = M2020_TOUCH_ROWS * M2020_TOUCH_COLUMNS;
 
 export type TouchCoordinatePoint = { index: number; xMm: number; yMm: number; zMm: number };
 export type TouchShearArrow = { angleDeg: number; lengthPx: number; opacity: number };
@@ -299,13 +315,40 @@ function rectangularLayout(rows: number, columns: number, label: string): TouchL
   };
 }
 
+/**
+ * Which pad a sample came from. An explicit `model` tag wins; otherwise the
+ * taxel count is used, which is unambiguous for the pads we ship.
+ */
+export function touchModelForSample(sample: TouchSampleLike | null | undefined): string | null {
+  const tagged = sample?.model;
+  if (tagged === TOUCH_MODEL_M2020 || tagged === TOUCH_MODEL_PAXINI) {
+    return tagged;
+  }
+  const count = sample?.points ?? sample?.fz?.length ?? 0;
+  if (count === M2020_TOUCH_UNIT_COUNT) {
+    return TOUCH_MODEL_M2020;
+  }
+  if (count === PAXINI_TOUCH_UNIT_COUNT) {
+    return TOUCH_MODEL_PAXINI;
+  }
+  return null;
+}
+
 export function touchLayoutForCount(unitCount: number): TouchLayout {
   if (unitCount === PAXINI_TOUCH_UNIT_COUNT) {
     return {
       columns: 0,
       rowLengths: [],
       unitCount: PAXINI_TOUCH_UNIT_COUNT,
-      label: `${PAXINI_TOUCH_UNIT_COUNT} taxels · XYZ map`,
+      label: `Paxini L5325 · ${PAXINI_TOUCH_UNIT_COUNT} taxels · XYZ map`,
+    };
+  }
+  if (unitCount === M2020_TOUCH_UNIT_COUNT) {
+    return {
+      columns: M2020_TOUCH_COLUMNS,
+      rowLengths: Array.from({ length: M2020_TOUCH_ROWS }, () => M2020_TOUCH_COLUMNS),
+      unitCount: M2020_TOUCH_UNIT_COUNT,
+      label: `M2020 · ${M2020_TOUCH_ROWS}×${M2020_TOUCH_COLUMNS} · ${M2020_TOUCH_UNIT_COUNT} taxels`,
     };
   }
   if (unitCount === 500) {
@@ -434,6 +477,22 @@ function touchCoordinatePointsForCount(unitCount: number): readonly TouchCoordin
   return unitCount === PAXINI_TOUCH_UNIT_COUNT ? PAXINI_TOUCH_POINTS : null;
 }
 
+/** Layout for a sample, honouring its `model` tag before its array length. */
+export function touchLayoutForSample(sample: TouchSampleLike | null | undefined): TouchLayout | null {
+  const count = sample?.fz?.length ?? 0;
+  if (count === 0) {
+    return null;
+  }
+  const model = touchModelForSample(sample);
+  if (model === TOUCH_MODEL_M2020) {
+    return touchLayoutForCount(M2020_TOUCH_UNIT_COUNT);
+  }
+  if (model === TOUCH_MODEL_PAXINI) {
+    return touchLayoutForCount(PAXINI_TOUCH_UNIT_COUNT);
+  }
+  return touchLayoutForCount(count);
+}
+
 function coordinatePct(value: number, min: number, span: number): number {
   const raw = (value - min) / span;
   const normalized = Math.max(0, Math.min(1, raw));
@@ -460,6 +519,51 @@ export function TouchHeatmapGrid({
   const fx = sample?.fx ?? [];
   const fy = sample?.fy ?? [];
   const effectiveScale = scale ?? touchScaleFromSamples([sample]);
+  const model = touchModelForSample(sample);
+
+  // M2020: only 9 taxels, so each cell has room for its datasheet number and
+  // the patch is drawn with the cable stub on the left the way the vendor
+  // diagram orients it. Without that anchor a hot cell cannot be mapped back
+  // to a physical contact point.
+  if (model === TOUCH_MODEL_M2020) {
+    return (
+      <div className={`${className} touch-m2020`} aria-label={ariaLabel}>
+        <span className="touch-m2020-cable" aria-hidden="true" />
+        <div className="touch-m2020-pad">
+          {Array.from({ length: M2020_TOUCH_UNIT_COUNT }, (_, index) => {
+            const value = fz[index] ?? 0;
+            const shearX = fx[index];
+            const shearY = fy[index];
+            const shear = Math.hypot(shearX ?? 0, shearY ?? 0);
+            const color = touchCellColor(value, shearX, shearY, effectiveScale);
+            const arrow = touchShearArrow(shearX, shearY, effectiveScale);
+            const cellStyle: TouchCoordinateCellStyle = {
+              "--touch-arrow-angle": `${arrow.angleDeg}deg`,
+              "--touch-arrow-color": color,
+              "--touch-arrow-length": `${arrow.lengthPx}px`,
+              "--touch-arrow-opacity": arrow.opacity,
+              backgroundColor: color,
+            };
+            const forceText = shear > 0
+              ? `fx=${(shearX ?? 0).toFixed(1)} fy=${(shearY ?? 0).toFixed(1)} fz=${value.toFixed(1)} (0.1N)`
+              : `fz=${value.toFixed(1)} (0.1N)`;
+            return (
+              <span
+                className="touch-cell touch-m2020-cell"
+                key={index}
+                title={`#${index + 1} · ${forceText}`}
+                style={cellStyle}
+              >
+                <span className="touch-m2020-index" aria-hidden="true">{index + 1}</span>
+                <span className="touch-shear-arrow" aria-hidden="true" />
+              </span>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
   const coordinatePoints = touchCoordinatePointsForCount(fz.length);
   if (coordinatePoints) {
     return (

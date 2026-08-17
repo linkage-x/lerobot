@@ -105,7 +105,7 @@ marker 不必安装成物理 cube；必要条件是所有可见 marker corner �
 <li>做一个低矮刚性 carrier，固定到夹爪 palm、手腕连接座或固定外壳。</li>
 <li>左侧 / 右侧 / 上侧各布置 1 个或多个 tag，让不同桌面相机在不同姿态下总能看到足够角点。</li>
 <li>tag 尽量大、平整、不可弯，贴在刚性基材上，不要只贴在软壳或薄纸边缘。</li>
-<li>左右手使用独立 layout 文件和独立标定 ID，避免镜像假设。</li>
+<li>每台设备使用独立 layout 文件和独立标定 ID（按 BOX id 索引，不按左右手），避免镜像假设。</li>
 <li>保留 CAD 初值，但最终以多视角观测 refinement 和 repeatability benchmark 冻结。</li>
 </ul>
 </section>
@@ -128,7 +128,7 @@ marker 不必安装成物理 cube；必要条件是所有可见 marker corner �
 <tr><td>机械包络</td><td>降低高度，减少碰撞和遮挡；更适合夹爪真实操作空间</td><td>需要重新设计 carrier，装配重复性必须量化</td></tr>
 <tr><td>可观测性</td><td>左/右/上分布扩大角点空间基线，姿态约束可能强于单面或小 cube</td><td>侧面 tag 可能被夹爪本体或物体遮挡，掠射角会抬高 corner noise</td></tr>
 <tr><td>精度传播</td><td>降低 <span class="mono">marker_rig→TCP</span> lever arm 后，姿态误差传播到 TCP 位置的误差下降</td><td>如果 carrier 柔顺或相对 TCP 漂移，算法无法靠更多相机修掉</td></tr>
-<tr><td>软件模型</td><td>统一成通用 marker layout，cube 只是特例；后续可支持 head cube、不同夹爪和版本化硬件</td><td>需要替换硬编码 cube corner 生成、6 面假设、单 marker PnP 融合路径</td></tr>
+<tr><td>软件模型</td><td>统一成通用 marker layout，cube 只是特例；后续可支持其余 cube、不同夹爪和版本化硬件</td><td>需要替换硬编码 cube corner 生成、6 面假设、单 marker PnP 融合路径</td></tr>
 <tr><td>维护</td><td>局部坏一个 tag 仍可降级工作，QC 可按 corner/camera 可见性打分</td><td>layout、ID、尺寸、装配版本管理更重要，配置分裂风险上升</td></tr>
 </table>
 </section>
@@ -152,9 +152,128 @@ marker 不必安装成物理 cube；必要条件是所有可见 marker corner �
 </section>
 
 <section class="card full">
+<div class="section-title"><h2>0812 实测证据：下一版 rig 的设计准则</h2><span class="badge done">实测 · 2026-08-12</span></div>
+<p>
+下面每一条准则都来自同一份可复现的观测：<span class="mono">tcp_marker_rig_calib_20260812_102610</span>（marker id 0–4 的 cube，装在
+<span class="mono">box1672693301</span> 上；7 路相机出检测 × 1808 帧；0804 fisheye 自标定；marker 黑框 56 mm 卡尺实测，
+cube 71.92 / 71.67 / 71.09 mm）。这不是经验值，是从生产同款链路的图像里量出来的。
+复现命令见本页末「复现」。
+</p>
+
+<h3>一、观测条件长什么样</h3>
+<table class="metric-table">
+<tr><th>量</th><th>实测</th><th>说明</th></tr>
+<tr><td>cube–相机距离</td><td>p05 0.45 / p50 <b>0.67</b> / p95 0.94 m</td><td>工作距离比设计直觉近得多</td></tr>
+<tr><td>marker 视在边长</td><td>p05 59 / p50 <b>84</b> / p95 124 px</td><td>56 mm marker，f ≈ 1000 px；远未触及分辨率下限</td></tr>
+<tr><td>最佳面入射角</td><td>p50 32.6° / p90 45.5° / max 54.7°</td><td>立方体几何保证总有一面接近正对</td></tr>
+<tr><td>每相机每帧检出 marker 数</td><td>平均 <b>2.17</b> 个</td><td>生产 <span class="mono">best_rmse_single_marker</span> 只保留 1 个，一半观测被丢弃</td></tr>
+<tr><td>同时可见相机数</td><td>p50 6（共 7 路），&lt;3 路的帧占 0.00%</td><td>相机冗余充足，不是瓶颈</td></tr>
+</table>
+
+<h3>二、精度对「marker 尺寸 / 入射角」不敏感</h3>
+<p class="small">逐相机解 vs 该帧多相机共识；已剔除 &gt;20 mm 粗差（占 2.5%，见准则四）。</p>
+<table class="metric-table">
+<tr><th>分组</th><th>样本</th><th>位置分歧 p50 / p95</th><th>姿态分歧 p50 / p95</th></tr>
+<tr><td>视在边长 50–60 px（0.93–1.12 m）</td><td>451</td><td>4.25 / 8.07 mm</td><td>0.92 / 1.30°</td></tr>
+<tr><td>视在边长 60–90 px（0.62–0.93 m）</td><td>5941</td><td>5.33 / 10.50 mm</td><td>0.73 / 1.57°</td></tr>
+<tr><td>入射角 0–20°</td><td>2270</td><td>4.39 / 7.69 mm</td><td>0.85 / 2.54°</td></tr>
+<tr><td>入射角 20–35°</td><td>4105</td><td>4.90 / 9.81 mm</td><td>0.66 / 1.32°</td></tr>
+<tr><td>入射角 35–50°</td><td>4475</td><td>4.32 / 10.22 mm</td><td>0.51 / 1.15°</td></tr>
+</table>
+<div class="callout">
+<b>准则一：不要用 marker 尺寸买精度。</b>
+在 0.45–0.95 m 的真实工作距离内，位置分歧稳定在 4–5 mm、姿态稳定在 0.5–0.9°，与视在尺寸、入射角都不相关
+（更大的视在尺寸甚至略差，说明限制项在别处——与 0805 A/B「换整套相机标定收益为零」是同一结论的另一个切面）。
+因此 marker 尺寸只需守住检测下限，剩下的预算应该花在<b>压低高度</b>和<b>增加面数</b>上。
+本数据的最小观测样本是 ~50 px，低于此没有证据；工作距离若扩到 2 m，56 mm marker 只剩 28 px，那时才需要重新评估尺寸。
+</div>
+
+<h3>三、lever arm 是第一设计变量</h3>
+<p>
+pivot 标定实测 cube 中心到<b>夹持接触中心</b>的杠杆臂 <b>241.5 mm</b>（操作者已把治具球心对准两指腹中心，
+所以这个端点就是夹爪真实接触点；到 <span class="mono">TCP_closed</span> 约再短 5–21 mm，取决于 contact 口径，见 roadmap 0812 条目）。
+姿态误差经这条杠杆放大后直接变成 TCP 位置误差：
+</p>
+<table class="metric-table">
+<tr><th>lever arm</th><th>姿态 p50 0.64° 折算</th><th>姿态 p95 1.50° 折算</th></tr>
+<tr><td>241 mm（当前高位 cube）</td><td><b>2.69 mm</b></td><td><b>6.32 mm</b></td></tr>
+<tr><td>150 mm</td><td>1.68 mm</td><td>3.93 mm</td></tr>
+<tr><td>60 mm（palm / 手腕连接座）</td><td>0.67 mm</td><td>1.57 mm</td></tr>
+</table>
+<div class="callout">
+<b>准则二：把 rig 压到夹爪本体上，lever arm 每减 100 mm，姿态项按比例缩小。</b>
+当前 241 mm 让 rig 自身 0.64° 的姿态分歧在 TCP 上变成 2.7 mm（p95 6.3 mm），已经吃掉 3 mm 预算的大半。
+这也是「不要把 marker 立高」的定量理由：高位不只是遮挡问题，它把姿态误差乘以了一个大系数。
+</div>
+
+<h3>四、当前丢的是可用性，不是精度——而且两种失效都由「装得高」造成</h3>
+<table class="metric-table">
+<tr><th>相机</th><th>丢帧率</th><th>归因（对漏检帧逐帧回算几何）</th></tr>
+<tr><td><span class="mono">cam_09</span></td><td><b>47.4%</b></td><td>96% 是<b>没有任何一个 marker 完整落在画面内</b>——高位 cube 越出视野上缘</td></tr>
+<tr><td><span class="mono">cam_06</span></td><td><b>24.2%</b></td><td>100% 属<b>遮挡</b>：距离 0.82 m、入射角 p50 16°，几何完全正常</td></tr>
+<tr><td><span class="mono">cam_08</span></td><td>0.8%</td><td>遮挡</td></tr>
+<tr><td>cam_07 / 12 / 13 / 14</td><td>0%</td><td>全程检出</td></tr>
+</table>
+<p class="small">
+排除运动模糊：漏检帧与检出帧的 cube 速度分布一致（p50 135 vs 152 mm/s），且漏检成段出现（最长连续 3.7 s / 220 帧），
+不是散点式的模糊丢失。
+</p>
+<div class="callout warn">
+<b>准则三：layout 的设计目标是「在每个相机方向上都留有完整可见的 marker」，而不是「多贴几个 marker」。</b>
+高位 cube 同时触发两种失效：越出视野（cam_09 丢 47%）和被手臂遮挡（cam_06 丢 24%）。
+低矮分布式 carrier 把 marker 移到夹爪本体的左 / 右 / 上三面，可同时缓解这两项——但必须在 CAD 阶段就用现有相机外参
+直接验算覆盖，而不是装完再看。
+</div>
+
+<h3>五、粗差来自单 marker PnP 翻转，集中在中等入射角</h3>
+<table class="metric-table">
+<tr><th>最佳面入射角</th><th>样本</th><th>&gt;20 mm 粗差率</th><th>&gt;100 mm</th></tr>
+<tr><td>0–20°</td><td>2276</td><td>0.26%</td><td>0.00%</td></tr>
+<tr><td>20–35°</td><td>4125</td><td>0.48%</td><td>0.00%</td></tr>
+<tr><td>35–50°</td><td>4736</td><td><b>5.51%</b></td><td><b>4.88%</b></td></tr>
+<tr><td>50–65°</td><td>210</td><td>0.00%</td><td>0.00%</td></tr>
+</table>
+<div class="callout warn">
+<b>准则四：任何单个平面 marker 都不允许独自决定 pose。</b>
+当所有面都斜到 35° 以上时，单 marker PnP 的位姿二义性开始翻转，产生 &gt;100 mm 的整帧错误（4.88%）。
+当前 layout 平均只有 1.49 个面入射 &lt; 60°，而生产 solver 又只留一个 marker——两个设计缺陷叠在同一个失效上。
+<br/>layout 硬约束：<b>每个工作方向上至少 2 个非共面 marker 同时完整可见</b>；solver 侧对应 Phase 4 的 corner 级联合 BA。
+</div>
+
+<h3>六、可以直接进 CAD 的数值约束</h3>
+<ul>
+<li><b>marker 尺寸</b>：按最远工作距离 <span class="mono">d_max</span> 反算，保证视在边长 ≥ 50 px：<span class="mono">size ≥ 50 · d_max / f</span>；
+f ≈ 1000 px 时，1.2 m → ≥ 60 mm，0.95 m（当前 p95）→ ≥ 48 mm。现用 56 mm 在当前工作域内合格，无需增大。</li>
+<li><b>lever arm</b>：marker rig 几何中心到 <span class="mono">TCP_closed</span> 目标 ≤ 100 mm，硬上限 150 mm。</li>
+<li><b>法线分布</b>：marker 法线覆盖上半球 + 左右，相邻间隔 60–90°；判据是「对每个相机位姿，至少 2 个 marker 入射 &lt; 60° 且四角完整在画面内」。</li>
+<li><b>安装面</b>：只贴夹爪固定刚体（palm / 手腕连接座 / 固定外壳），不贴随开合运动的手指。</li>
+<li><b>高度</b>：不得高于夹爪本体轮廓——cam_09 的 47% 丢帧就是越界代价。</li>
+<li><b>非共面</b>：至少 3 个 marker 法线线性无关，使单帧单相机也能约束全部 6 DoF。</li>
+</ul>
+
+<h3>七、新原型的验收：复测同样五项</h3>
+<table class="metric-table">
+<tr><th>指标</th><th>当前高位 cube（基线）</th><th>新 rig 目标</th></tr>
+<tr><td>逐相机位置分歧 p50 / p95</td><td>4.57 / 9.67 mm</td><td>不劣于基线</td></tr>
+<tr><td>逐相机姿态分歧 p50 / p95</td><td>0.64° / 1.50°</td><td>不劣于基线</td></tr>
+<tr><td>姿态经 lever arm 折算到 TCP</td><td>2.69 / 6.32 mm</td><td>&lt; 1.5 mm p95</td></tr>
+<tr><td>最差相机丢帧率</td><td>47.4%</td><td>&lt; 10%</td></tr>
+<tr><td>&gt;20 mm 粗差率（全样本）</td><td>2.5%</td><td>&lt; 0.5%</td></tr>
+</table>
+<div class="callout ok">
+<b>复现：</b>
+本节全部数字来自
+<span class="mono">metrology/cli/pivot_marker_tcp_calibration.py</span> 的 per-camera 分解与同一份 tracking run
+（<span class="mono">outputs/tracking_analysis/tcp_marker_rig_calib_20260812_102610_thor_april_tracking_in_robot_base</span>）；
+丢帧归因用该 run 的 per-camera 记录 + 0804 内参把漏检帧的 cube 位姿回投到各相机画面判定。
+标定结果与 lever arm 见 <span class="mono">outputs/metrology/pivot_marker_tcp_20260812.json</span>。
+</div>
+</section>
+
+<section class="card full">
 <div class="section-title"><h2>代码影响</h2></div>
 <ul>
-<li>新增通用 <span class="mono">marker_layout.json</span>：marker ID、marker size、每个 marker 的 <span class="mono">T_marker_rig_marker_k</span>、corner 顺序、layout hash、左右手实例 ID。</li>
+<li>新增通用 <span class="mono">marker_layout.json</span>：marker ID、marker size、每个 marker 的 <span class="mono">T_marker_rig_marker_k</span>、corner 顺序、layout hash、按 BOX id 索引的实例 ID。</li>
 <li>把 <span class="mono">cube_tracking.py</span> 中“理想 cube 面角点解析生成”改成“读取 layout 后生成统一 <span class="mono">P_j^M</span>”。</li>
 <li>保留旧 cube 配置作为 layout 的一个兼容实例，避免一次性打断现有评估。</li>
 <li>Phase 4 solver 应使用所有相机所有可见 corner 的鲁棒重投影 BA；单相机 PnP 只作为初始化和诊断。</li>

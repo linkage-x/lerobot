@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>BOX UMI 分布式夹爪 Marker Rig 供应商设计需求</title>
+<style>
+  :root{
+    --bg:#f5f6f8;
+    --card:#ffffff;
+    --text:#1f2937;
+    --muted:#667085;
+    --line:#d9dee7;
+    --head:#111827;
+    --accent:#1d4ed8;
+    --accent-soft:#eff6ff;
+    --ok:#166534;
+    --ok-bg:#ecfdf5;
+    --warn:#92400e;
+    --warn-bg:#fffbeb;
+    --danger:#991b1b;
+    --danger-bg:#fef2f2;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    line-height:1.65;
+  }
+  .wrap{max-width:1100px;margin:0 auto;padding:34px 22px 72px}
+  .hero{
+    background:var(--head);
+    color:#fff;
+    border-radius:10px;
+    padding:30px 34px;
+    margin-bottom:18px;
+  }
+  .hero h1{margin:0 0 8px;font-size:29px;font-weight:750;letter-spacing:0}
+  .hero p{margin:6px 0;color:#d1d5db}
+  .meta{
+    display:grid;
+    grid-template-columns:repeat(4,minmax(0,1fr));
+    gap:1px;
+    background:var(--line);
+    border:1px solid var(--line);
+    border-radius:8px;
+    overflow:hidden;
+    margin-bottom:18px;
+  }
+  .meta div{background:#fff;padding:12px 14px}
+  .meta b{display:block;font-size:12px;color:var(--muted);font-weight:650}
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+  .card{
+    background:var(--card);
+    border:1px solid var(--line);
+    border-radius:8px;
+    padding:22px;
+  }
+  .full{grid-column:1/-1}
+  h2{margin:0 0 14px;font-size:21px;color:#111827}
+  h3{margin:18px 0 8px;font-size:16px;color:#111827}
+  p{margin:8px 0}
+  ul,ol{padding-left:22px;margin:8px 0}
+  li{margin:6px 0}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:10px 12px;border:1px solid var(--line);text-align:left;vertical-align:top}
+  th{background:#f9fafb;color:#111827}
+  .callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:13px 15px;border-radius:8px;margin:12px 0}
+  .warn{border-color:var(--warn);background:var(--warn-bg)}
+  .danger{border-color:var(--danger);background:var(--danger-bg)}
+  .ok{border-color:var(--ok);background:var(--ok-bg)}
+  .tag{display:inline-block;border-radius:999px;padding:3px 9px;font-size:12px;font-weight:700}
+  .must{color:var(--danger);background:var(--danger-bg)}
+  .target{color:var(--accent);background:var(--accent-soft)}
+  .deliver{color:var(--ok);background:var(--ok-bg)}
+  .small{font-size:13px;color:var(--muted)}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;background:#f3f4f6;border-radius:6px;padding:2px 5px;font-size:.92em}
+  @media (max-width:820px){
+    .grid,.meta{grid-template-columns:1fr}
+    .full{grid-column:auto}
+    .hero{padding:24px 20px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section class="hero">
+    <h1>BOX UMI 分布式夹爪 Marker Rig 供应商设计需求</h1>
+    <p>用途：用于夹爪端 AprilTag / marker 的刚性安装、视觉定位与后续 TCP 标定。</p>
+    <p class="small">本文为供应商沟通版，供结构设计、报价、打样、装配和质检使用。</p>
+  </section>
+
+  <section class="meta">
+    <div><b>文档版本</b>V1.0</div>
+    <div><b>日期</b>2026-08-13</div>
+    <div><b>阶段</b>原型设计 / DFM 评估</div>
+    <div><b>对象</b>BOX UMI 夹爪 marker carrier</div>
+  </section>
+
+  <div class="grid">
+    <section class="card full">
+      <h2>1. 项目目标</h2>
+      <div class="callout ok">
+        设计并制造一套低矮、刚性、可重复装配的夹爪端 marker carrier。该 carrier 需要把多个 marker 固定在同一个刚体上，并在夹爪工作过程中保持相对位置稳定。
+      </div>
+      <p>现有高位 marker cube 在工作空间中存在高度偏大、遮挡风险高、与夹爪 TCP 距离较远的问题。本项目希望改为左侧 / 右侧 / 上侧分布式 marker 布局，以降低机械包络、提升可见性并减小姿态误差向 TCP 位置误差的放大。</p>
+    </section>
+
+    <section class="card">
+      <h2>2. 设计范围</h2>
+      <ul>
+        <li>设计夹爪端 marker carrier 的整体结构。</li>
+        <li>设计 marker 安装面、定位基准、锁紧方式和防装反特征，例如非对称孔位、定位销、缺角或键槽。</li>
+        <li>输出 URDF 文件，描述 carrier、marker 安装面、夹爪接口和相关坐标系。</li>
+        <li>完成首批样件加工与装配验证。</li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>3. 不在范围内</h2>
+      <ul>
+        <li>视觉算法、相机标定、机器人 TCP 标定软件开发。</li>
+        <li>夹爪本体运动机构改造，除非双方另行确认。</li>
+        <li>量产工装设计，首版仅要求支持原型打样和小批验证。</li>
+      </ul>
+    </section>
+
+    <section class="card full">
+      <h2>4. 总体方案要求</h2>
+      <table>
+        <tr><th>项目</th><th>要求</th><th>说明</th></tr>
+        <tr>
+          <td><span class="tag must">必须</span> 同一刚体</td>
+          <td>所有 marker 必须安装在同一个非运动刚体上。</td>
+          <td>marker 可以分布在不同面，但各 marker 之间的 3D 相对位置必须稳定。</td>
+        </tr>
+        <tr>
+          <td><span class="tag must">必须</span> 固定安装</td>
+          <td>不得安装在随夹爪开合运动的手指、软壳、薄片或受力变形件上。</td>
+          <td>优先固定在 palm、手腕连接座或夹爪固定外壳。</td>
+        </tr>
+        <tr>
+          <td><span class="tag target">目标</span> 低包络</td>
+          <td>carrier 不应高于夹爪本体主要外轮廓；如局部必须高出，需要提前标注高度和原因。</td>
+          <td>目标是降低碰撞、出画和遮挡概率。</td>
+        </tr>
+        <tr>
+          <td><span class="tag target">目标</span> 短杠杆臂</td>
+          <td>marker rig 几何中心到夹爪 TCP 的距离目标 ≤ 100 mm，硬上限 150 mm。</td>
+          <td>距离越短，姿态误差传导到 TCP 位置误差越小。</td>
+        </tr>
+        <tr>
+          <td><span class="tag must">必须</span> 可重复装配</td>
+          <td>需要机械定位基准，不能只依赖人工目测贴合。</td>
+          <td>建议使用销孔、台阶、止口、沉头定位面等方式控制重复性。</td>
+        </tr>
+      </table>
+    </section>
+
+    <section class="card full">
+      <h2>5. Marker 布局要求</h2>
+      <table>
+        <tr><th>项目</th><th>要求</th><th>供应商需确认</th></tr>
+        <tr>
+          <td>布置面</td>
+          <td>至少包含左侧、右侧、上侧三个方向的安装面；marker 法线应非共面。</td>
+          <td>提供每个安装面的法线方向、尺寸和相对基准位置。</td>
+        </tr>
+        <tr>
+          <td>角度分布</td>
+          <td>相邻 marker 安装面法线建议间隔 60-90°。</td>
+          <td>若受夹爪结构限制无法满足，请提供替代角度与原因。</td>
+        </tr>
+        <tr>
+          <td>可见性</td>
+          <td>目标是在典型操作姿态下，每个主要相机方向至少能看到 2 个完整 marker。</td>
+          <td>我方可提供相机大致方位；供应商需在结构模型中检查明显遮挡和出界风险。</td>
+        </tr>
+        <tr>
+          <td>marker 尺寸</td>
+          <td>当前建议兼容 56 mm 黑框 marker；如使用其他尺寸，需先确认。</td>
+          <td>加工/贴附后需记录 marker 实测尺寸。</td>
+        </tr>
+        <tr>
+          <td>安装平面</td>
+          <td>marker 下方必须是平整刚性基材，避免纸张翘边、胶层不均、薄壁变形。</td>
+          <td>请给出推荐材料、表面处理和贴附工艺。</td>
+        </tr>
+        <tr>
+          <td>ID 管理</td>
+          <td>每个 marker 的 ID、朝向和所在安装面必须唯一记录。</td>
+          <td>交付 marker layout 表格和装配照片。</td>
+        </tr>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>6. 结构与材料建议</h2>
+      <ul>
+        <li>优先考虑 CNC 铝合金、刚性复合板或其他稳定材料。</li>
+        <li>marker 安装面应具备足够厚度和支撑，避免长期使用后弯曲。</li>
+        <li>表面建议哑光、低反光；marker 周边避免高亮金属反光边。</li>
+        <li>所有边角需倒角，避免划伤线缆、夹爪和被操作物。</li>
+        <li>不得遮挡夹爪运动、线缆、传感器或原有安装孔。</li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>7. 装配要求</h2>
+      <ul>
+        <li>carrier 应能在不拆解夹爪核心机构的情况下安装和拆卸。</li>
+        <li>装配方向需有防装反设计，避免左右、前后或上下装反。</li>
+        <li>紧固件需防松，且不得与夹爪运动件干涉。</li>
+        <li>marker 贴附或固定后不得翘边、起泡、明显偏斜或污染。</li>
+        <li>如 marker 需要更换，应提供可重复定位方案或更换后的复检流程。</li>
+      </ul>
+    </section>
+
+    <section class="card full">
+      <h2>8. 关键验收指标</h2>
+      <table>
+        <tr><th>类别</th><th>验收项</th><th>目标 / 判据</th></tr>
+        <tr>
+          <td>机械包络</td>
+          <td>安装后不影响夹爪开合、抓取路径、线缆和周边机构。</td>
+          <td>全行程手动检查无干涉；关键姿态拍照记录。</td>
+        </tr>
+        <tr>
+          <td>高度</td>
+          <td>整体高度尽量贴近夹爪本体，不形成明显高位立柱。</td>
+          <td>供应商需在 URDF 备注或随附说明中标注最高点相对夹爪基准的高度。</td>
+        </tr>
+        <tr>
+          <td>刚性</td>
+          <td>正常装配和轻载接触后，marker 面无可见松动或变形。</td>
+          <td>拆装、轻触、复位后进行外观和紧固检查。</td>
+        </tr>
+        <tr>
+          <td>重复装配</td>
+          <td>同一 carrier 拆装 5 次后，定位应保持稳定。</td>
+          <td>我方会通过视觉和 TCP 标定复测；供应商需保证机械定位设计可重复。</td>
+        </tr>
+        <tr>
+          <td>marker 完整性</td>
+          <td>marker 表面平整、清洁、边缘完整，ID 和方向可追溯。</td>
+          <td>每件交付前提供清晰照片和 layout 表。</td>
+        </tr>
+      </table>
+    </section>
+
+    <section class="card full">
+      <h2>9. 交付物清单</h2>
+      <table>
+        <tr><th>交付物</th><th>格式 / 内容</th><th>用途</th></tr>
+        <tr>
+          <td>URDF</td>
+          <td>包含 carrier、marker 安装面、夹爪接口、坐标系命名和各 link / joint 的相对位姿。</td>
+          <td>仿真、视觉标定和系统集成。</td>
+        </tr>
+        <tr>
+          <td>mesh 文件</td>
+          <td>如 URDF 需要外部几何文件，请同步提供 STL / DAE / OBJ 等引用文件。</td>
+          <td>保证 URDF 可直接加载和预览。</td>
+        </tr>
+        <tr>
+          <td>Marker layout 表</td>
+          <td>每个 marker 的 ID、尺寸、安装面、朝向、相对基准位置。</td>
+          <td>视觉标定和质量追溯。</td>
+        </tr>
+        <tr>
+          <td>装配说明</td>
+          <td>安装步骤、扭矩建议、防装反说明、marker 更换流程。</td>
+          <td>现场装配和返修。</td>
+        </tr>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>10. 打样流程建议</h2>
+      <ol>
+        <li>供应商提交初版结构方案、材料方案和预计加工方式。</li>
+        <li>双方评审包络、可见性、安装方式和维护方式。</li>
+        <li>供应商提交 URDF、marker layout 和报价。</li>
+        <li>加工 2-3 套首批样件。</li>
+        <li>我方完成装机、视觉跟踪和拆装重复性测试。</li>
+        <li>根据测试结果冻结设计或进入下一轮修改。</li>
+      </ol>
+    </section>
+
+    <section class="card">
+      <h2>11. 需供应商反馈</h2>
+      <ul>
+        <li>推荐材料、加工方式、表面处理和预计重量。</li>
+        <li>关键安装面能达到的平面度、位置度和重复装配能力。</li>
+        <li>marker 固定方式建议，以及长期使用是否会翘边或脱落。</li>
+        <li>是否存在夹爪干涉、装配困难或维护困难。</li>
+        <li>首批样件周期、单件成本、小批量成本和最小起订量。</li>
+      </ul>
+    </section>
+
+    <section class="card full">
+      <h2>12. 设计禁区</h2>
+      <div class="callout danger">
+        以下方案原则上不接受：marker 安装在运动手指上；carrier 参与夹持受力；仅靠胶带或薄纸作为最终定位基准；高位立柱式结构；marker 面明显弯曲或可手动晃动；无法追溯 marker ID、方向和尺寸。
+      </div>
+    </section>
+  </div>
+</div>
+</body>
+</html>

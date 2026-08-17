@@ -24,7 +24,7 @@ import { computeValidity } from "./status";
 import type { CalibrationKind, CalibrationRecord, ReadinessItem } from "./types";
 import { ReadinessChecklist } from "./ReadinessChecklist";
 import { useTactileActivation, useWarmup } from "./useReadiness";
-import { ForceSensorCard, TactileSensorCard } from "./SensorMonitors";
+import { ForceSensorCard, ForceStaticValidationCard, TactileSensorCard } from "./SensorMonitors";
 import { ForceCalibrationCard, TactileCalibrationCard } from "./CalibrationCards";
 import { CalibrationLogPanel, toLogEntries } from "./CalibrationLogPanel";
 import { CalibrationHistory } from "./CalibrationHistory";
@@ -348,6 +348,9 @@ function BoxCalibrationGroup({
       <div className="cali-monitor-grid">
         {group.force.map((d) => (
           <ForceSensorCard key={d.id} api={api} device={d} />
+        ))}
+        {group.force.map((d) => (
+          <ForceStaticValidationCard key={`${d.id}-static`} api={api} device={d} />
         ))}
         {group.touch.map((d) => (
           <TactileSensorCard key={d.id} api={api} device={d} />

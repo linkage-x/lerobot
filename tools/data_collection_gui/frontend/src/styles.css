@@ -1468,6 +1468,82 @@ button.danger {
 }
 
 
+/* Tile-filling tactile view plus a caption naming the pad geometry, so an
+   operator can tell an M2020 patch from a Paxini pad at a glance. */
+.box-touch-view {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  height: 100%;
+  min-height: 0;
+  width: 100%;
+}
+
+.box-touch-view .box-touch-fill {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.box-touch-legend {
+  color: #64748b;
+  flex: 0 0 auto;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  text-align: center;
+}
+
+/* M2020 tactile patch: 3x3 taxels with the cable stub drawn on the left, so
+   the on-screen orientation matches the vendor diagram and a hot cell can be
+   read back as a datasheet point number. */
+.touch-m2020 {
+  align-items: center;
+  background: #111827;
+  border: 1px solid #263241;
+  border-radius: 5px;
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+  padding: 6px;
+}
+
+.touch-m2020-cable {
+  background: linear-gradient(90deg, rgba(37, 99, 235, 0.25), rgba(37, 99, 235, 0.85));
+  border-radius: 2px;
+  flex: 0 0 auto;
+  height: 4px;
+  width: clamp(10px, 14%, 26px);
+}
+
+.touch-m2020-pad {
+  aspect-ratio: 1;
+  display: grid;
+  flex: 0 1 auto;
+  gap: 3px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-rows: repeat(3, minmax(0, 1fr));
+  max-height: 100%;
+  min-width: 0;
+}
+
+.touch-m2020-cell {
+  align-items: center;
+  aspect-ratio: 1;
+  border-radius: 3px;
+  display: flex;
+  justify-content: center;
+  overflow: visible;
+  position: relative;
+}
+
+.touch-m2020-index {
+  color: rgba(255, 255, 255, 0.72);
+  font-size: clamp(8px, 26%, 15px);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  pointer-events: none;
+  text-shadow: 0 1px 2px rgba(15, 23, 42, 0.85);
+}
+
 .touch-coordinate-grid {
   display: block;
   max-height: 100%;
@@ -2701,6 +2777,16 @@ button.danger {
   padding: 6px;
 }
 
+
+.box-touch-fill.touch-m2020 {
+  height: 100%;
+  padding: 4px;
+  width: 100%;
+}
+
+.box-touch-fill.touch-m2020 .touch-m2020-pad {
+  height: 100%;
+}
 
 .box-touch-fill.touch-coordinate-grid {
   display: block;
