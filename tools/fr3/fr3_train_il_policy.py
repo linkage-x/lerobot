@@ -1100,7 +1100,11 @@ def make_inference_config(
                 "gripper_port": "/dev/ttyUSB0",
             },
             "startup": {
-                "move_to_das_start": True,
+                # The DAS rig's joint configuration, not this one's. T_B_Ws is solved from the
+                # first observation against the dataset start pose, so homing somewhere the
+                # episodes were not recorded from offsets every target. Home with
+                # robot_init_state, or the launcher's own homing step.
+                "move_to_das_start": False,
                 "align_gripper_to_dataset_start": True,
                 "dataset_start_gripper_tolerance": 0.05,
             },

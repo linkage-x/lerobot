@@ -3672,6 +3672,104 @@ button.danger {
   font-size: 12px;
 }
 
+.teleop-gains-note {
+  color: #60707c;
+  font-size: 12px;
+  margin: 0 0 12px;
+}
+
+.teleop-gains-note code {
+  background: #eef2f5;
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+
+.teleop-gains-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.teleop-gain-row {
+  align-items: center;
+  border: 1px solid #e1e6ea;
+  border-radius: 6px;
+  display: grid;
+  /* label | input | hint, with the hint free to wrap under a narrow column. */
+  grid-template-columns: 84px 108px minmax(0, 1fr);
+  gap: 6px 8px;
+  margin: 0;
+  padding: 8px;
+}
+
+/* The two globals head their group, so they get the weight and the rest read as exceptions. */
+.teleop-gain-global {
+  background: #f6f9fa;
+  border-color: #c8d2d8;
+}
+
+.teleop-gain-label {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* Marks a gain that no longer matches the recorder config. */
+.teleop-gain-label em {
+  color: #0f766e;
+  font-size: 16px;
+  font-style: normal;
+  line-height: 0;
+  vertical-align: middle;
+}
+
+.teleop-gain-row input {
+  border: 1px solid #c8d2d8;
+  border-radius: 6px;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+  padding: 7px 8px;
+}
+
+.teleop-gain-row input:focus {
+  border-color: #0f766e;
+  outline: 2px solid rgba(15, 118, 110, 0.16);
+}
+
+.teleop-gain-row small {
+  color: #60707c;
+  font-size: 11px;
+}
+
+.teleop-gain-invalid {
+  border-color: #e7b64a;
+}
+
+.teleop-gain-invalid input {
+  border-color: #b45309;
+}
+
+.teleop-gain-invalid small {
+  color: #b45309;
+}
+
+.teleop-gain-pending {
+  color: #0f766e;
+  font-size: 11px;
+  font-weight: 600;
+  grid-column: 2 / -1;
+  text-transform: uppercase;
+}
+
+.teleop-gains-sim-note {
+  background: #f2f6f8;
+  border-left: 3px solid #7d8f9b;
+  color: #4a5a66;
+  font-size: 12px;
+  margin-top: 10px;
+  padding: 7px 10px;
+}
+
 @media (max-width: 900px) {
   .teleop-panel .summary-grid,
   .teleop-config-grid {

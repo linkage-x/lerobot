@@ -182,6 +182,12 @@ export function RealRobotReplayPanel({
     });
   }, [cameraMatches.map((camera) => camera.cameraKey).join("|"), status.state]);
 
+  // Never a literal: the gateway builds the replay command from `robot.target_frame_name`, and the
+  // two FR3 tool frames are 411 mm apart on the same URDF. A label that disagrees with the config
+  // is worse than no label, because replaying a dataset from the other frame still "works" -- so a
+  // gateway too old to report the frame says so rather than being guessed at.
+  const targetFrame = status.targetFrameName || "an unreported tool frame";
+
   const startConfirmed = (overrideMujocoFailure: boolean) => {
     setOverridePromptOpen(false);
     setMonitorRequested(true);
@@ -199,7 +205,7 @@ export function RealRobotReplayPanel({
         <div className="real-robot-settings">
           <div className="teleop-config-grid">
             <div><span>Robot</span><strong>Franka Research 3</strong></div>
-            <div><span>End effector</span><strong>Pika gripper · pika_task_tcp</strong></div>
+            <div><span>End effector</span><strong>Pika gripper · {targetFrame}</strong></div>
           </div>
           <label className="real-robot-ip-field">
             <span>Robot IP</span>
@@ -220,7 +226,7 @@ export function RealRobotReplayPanel({
                   ? "Enter a valid robot IPv4 address."
                   : validationFailedButReviewable
                     ? "MuJoCo failed. You may click Run and make the final Yes/No decision in the warning window."
-                    : "The gateway preflights this FR3, moves pika_task_tcp to frame 0, then streams the trajectory."}
+                    : `The gateway preflights this FR3, moves ${targetFrame} to frame 0, then streams the trajectory.`}
           </p>
         </div>
         <div className="realsense-monitor replay-camera-compare">
@@ -306,7 +312,7 @@ export function RealRobotReplayPanel({
               {validationFailedButReviewable ? "MuJoCo validation failed" : "Confirm real-robot replay"}
             </h3>
             <p>
-              Dataset <strong>{status.datasetRoot ?? status.dataset}</strong>, episode <strong>{status.episode}</strong>, target <strong>pika_task_tcp</strong> on <strong>{robotIp.trim()}</strong>.
+              Dataset <strong>{status.datasetRoot ?? status.dataset}</strong>, episode <strong>{status.episode}</strong>, target <strong>{targetFrame}</strong> on <strong>{robotIp.trim()}</strong>.
             </p>
             <p>{validationFailedButReviewable ? "The recorded trajectory did not meet the simulation limits:" : "MuJoCo passed within these limits:"}</p>
             <ul>

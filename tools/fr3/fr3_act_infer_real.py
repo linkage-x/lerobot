@@ -182,12 +182,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Show all policy input camera frames in one OpenCV window inside the runtime.',
     )
     parser.add_argument(
+        '--move-to-das-start',
+        dest='move_to_das_start',
+        action='store_true',
+        help=(
+            'Move the arm to the DAS rig start joint configuration before inference. Off by '
+            'default; see the runtime flag of the same name for why homing to another rig pose '
+            'offsets the whole trajectory.'
+        ),
+    )
+    parser.add_argument(
         '--no-move-to-das-start',
         dest='move_to_das_start',
         action='store_false',
-        help='Skip moving the arm to the DAS start joint configuration before inference.',
+        help='Now the default; accepted so existing launchers and configs keep working.',
     )
-    parser.add_argument('--move-to-das-start', dest='move_to_das_start', action='store_true')
     parser.add_argument(
         '--no-align-gripper-to-dataset-start',
         dest='align_gripper_to_dataset_start',
@@ -407,7 +416,7 @@ def apply_inference_config_defaults(args: argparse.Namespace) -> argparse.Namesp
         bool(camera_preview_default) if args.camera_preview_window is None else args.camera_preview_window
     )
     args.move_to_das_start = (
-        _bool_or_default(_nested(raw, 'runtime', 'startup', 'move_to_das_start'), True)
+        _bool_or_default(_nested(raw, 'runtime', 'startup', 'move_to_das_start'), False)
         if args.move_to_das_start is None
         else args.move_to_das_start
     )
@@ -508,7 +517,7 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         *([f'--tactile-fallback={shlex.quote(args.tactile_fallback)}'] if args.tactile_fallback is not None else []),
         *([f'--debug-step0-dump-dir={shlex.quote(debug_step0_dump_dir)}'] if debug_step0_dump_dir is not None else []),
         *(['--camera-preview-window'] if args.camera_preview_window else []),
-        *([] if args.move_to_das_start else ['--no-move-to-das-start']),
+        *(['--move-to-das-start'] if args.move_to_das_start else []),
         *([] if args.align_gripper_to_dataset_start else ['--no-align-gripper-to-dataset-start']),
         *([f'--dataset-start-gripper-tolerance={args.dataset_start_gripper_tolerance}'] if args.dataset_start_gripper_tolerance is not None else []),
         *([f'--gripper-close-below={args.gripper_close_below}'] if args.gripper_close_below is not None else []),

@@ -22,7 +22,9 @@ def test_build_docker_command_defaults_to_infer_service_and_profile(tmp_path: Pa
     command = fr3_act_infer_real.build_docker_command(args)
     command_text = ' '.join(command)
 
-    assert command[:8] == [
+    # `-T` (no pseudo-TTY) only for non-interactive runs: interactive rollouts read keystrokes
+    # from the terminal, so allocating a TTY is exactly what they need and `-T` would break them.
+    assert command[:9] == [
         'docker',
         'compose',
         '--profile',
@@ -30,6 +32,7 @@ def test_build_docker_command_defaults_to_infer_service_and_profile(tmp_path: Pa
         '-f',
         str((tmp_path / 'docker' / 'docker-compose.yml').resolve()),
         'run',
+        '-T',
         '--rm',
     ]
     assert 'lerobot-infer-fr3-act' in command
@@ -154,22 +157,56 @@ def test_build_docker_command_maps_legacy_box_backend_to_corenetic(tmp_path: Pat
     assert '--corenetic-bind-ip=192.168.2.45' in command_text
 
 
+def _base_args(tmp_path: Path, *extra: str) -> list[str]:
+    return [
+        '--workspace',
+        str(tmp_path),
+        '--checkpoint=/lerobot/outputs/train/2026-03-19/10-48-39_act/checkpoints/060000',
+        '--camera-config=/lerobot/tools/fr3/fr3_act_infer_camera_config.yaml',
+        *extra,
+    ]
+
+
 def test_build_docker_command_can_disable_default_startup_actions(tmp_path: Path):
     args = fr3_act_infer_real.parse_args(
-        [
-            '--workspace',
-            str(tmp_path),
-            '--checkpoint=/lerobot/outputs/train/2026-03-19/10-48-39_act/checkpoints/060000',
-            '--camera-config=/lerobot/tools/fr3/fr3_act_infer_camera_config.yaml',
-            '--no-move-to-das-start',
-            '--no-align-gripper-to-dataset-start',
-        ]
+        _base_args(tmp_path, '--no-align-gripper-to-dataset-start')
     )
 
     command_text = ' '.join(fr3_act_infer_real.build_docker_command(args))
 
-    assert '--no-move-to-das-start' in command_text
     assert '--no-align-gripper-to-dataset-start' in command_text
+
+
+def test_move_to_das_start_is_off_by_default(tmp_path: Path):
+    """Those joint angles belong to the DAS rig, so homing to them offsets every target."""
+    args = fr3_act_infer_real.parse_args(_base_args(tmp_path))
+
+    assert args.move_to_das_start is False
+
+    command_text = ' '.join(fr3_act_infer_real.build_docker_command(args))
+
+    assert '--move-to-das-start' not in command_text
+
+
+def test_move_to_das_start_opt_in_reaches_the_runtime(tmp_path: Path):
+    """The wrapper used to emit only the negative flag. Once the runtime default flipped, that
+    turned an explicit opt-in into silence, and silence now means off."""
+    args = fr3_act_infer_real.parse_args(_base_args(tmp_path, '--move-to-das-start'))
+
+    assert args.move_to_das_start is True
+
+    command_text = ' '.join(fr3_act_infer_real.build_docker_command(args))
+
+    assert '--move-to-das-start' in command_text
+    assert '--no-move-to-das-start' not in command_text
+
+
+def test_no_move_to_das_start_is_still_accepted(tmp_path: Path):
+    """Existing launchers pass it explicitly; it must stay a no-op rather than an error."""
+    args = fr3_act_infer_real.parse_args(_base_args(tmp_path, '--no-move-to-das-start'))
+
+    assert args.move_to_das_start is False
+    assert '--move-to-das-start' not in ' '.join(fr3_act_infer_real.build_docker_command(args))
 
 
 def test_build_docker_command_passes_robot_init_state(tmp_path: Path):
@@ -448,8 +485,11 @@ def test_build_policy_observation_maps_state_images_and_tactile_passthrough():
     )
 
     assert np.allclose(observation['observation.state'], [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0, 0.4])
-    assert observation['observation.images.left'].shape == (4, 5, 3)
-    assert observation['observation.images.right'].shape == (4, 5, 3)
+    # Resized to the checkpoint's declared feature shape (3, 480, 640), not passed through at the
+    # camera's own size, and kept HWC -- the 4x5 inputs above are deliberately the wrong size so a
+    # regression to pass-through shows up here rather than as a silent shape error inside the policy.
+    assert observation['observation.images.left'].shape == (480, 640, 3)
+    assert observation['observation.images.right'].shape == (480, 640, 3)
     assert np.allclose(observation['observation.tactile.left_clean'], 7.0)
     assert np.allclose(observation['observation.tactile.valid_mask'], 1.0)
 
@@ -650,7 +690,16 @@ def test_build_policy_observation_uses_tactile_fallback_for_missing_keys():
     assert np.allclose(observation['observation.tactile.valid_mask'], tactile_fallback['observation.tactile.valid_mask'])
 
 
-def test_convert_absolute_observation_from_E_to_I_matches_fixed_das_extrinsic():
+def test_convert_absolute_observation_from_E_to_I_is_a_pose_preserving_passthrough():
+    """E and I are the same frame on this rig, and the conversion must stay a no-op.
+
+    This used to apply a fixed DAS extrinsic ``_T_EI``. That extrinsic was removed and both
+    conversions became pass-throughs, leaving the functions as named seams for a rig that does
+    distinguish the two frames. The test now pins the pose is carried through *unchanged* rather
+    than that some particular transform is applied: if an extrinsic is ever reintroduced, this
+    fails and forces the matching change in ``convert_base_command_from_I_to_E``, which is its
+    inverse and is what closes the loop back to the robot.
+    """
     absolute_observation_e = {
         'ee.x': 0.1811,
         'ee.y': -0.5423,
@@ -664,15 +713,15 @@ def test_convert_absolute_observation_from_E_to_I_matches_fixed_das_extrinsic():
     }
 
     absolute_observation_i = fr3_act_infer_real_runtime.convert_absolute_observation_from_E_to_I(absolute_observation_e)
-    expected_pose_i = (
-        fr3_act_infer_real_runtime._pose_from_quaternion_observation(absolute_observation_e)
-        @ fr3_act_infer_real_runtime._T_EI
-    )
-    actual_pose_i = fr3_act_infer_real_runtime._pose_from_quaternion_observation(absolute_observation_i)
 
-    assert np.allclose(actual_pose_i, expected_pose_i)
+    expected_pose = fr3_act_infer_real_runtime._pose_from_quaternion_observation(absolute_observation_e)
+    actual_pose = fr3_act_infer_real_runtime._pose_from_quaternion_observation(absolute_observation_i)
+
+    assert np.allclose(actual_pose, expected_pose)
     assert absolute_observation_i['gripper.pos'] == absolute_observation_e['gripper.pos']
     assert absolute_observation_i['left'].shape == (2, 2, 3)
+    # A copy, not the caller's dict: the runtime keeps using the E observation after converting.
+    assert absolute_observation_i is not absolute_observation_e
 
 
 

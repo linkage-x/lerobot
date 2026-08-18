@@ -41,12 +41,20 @@ python3 tools/fr3/fr3_act_infer_real.py
 3. 将 gripper 对齐到 dataset start mean。
 4. 启动 ACT inference loop。
 
-如果设置了 `--robot-init-state`，runtime 会跳过默认 DAS 起始关节角动作，改用你指定的初始状态。
+启动时**不会**移动到 DAS 起始关节角：那组关节角属于 DAS 台架。`T_B_Ws` 是用第一帧观测
+对齐 dataset start pose 解出来的，所以起始位姿决定整条轨迹落在工作空间的哪里；home 到别的
+台架的位姿会让每一个 target 都带上一个固定偏移。请用 `--robot-init-state`（或 launcher 自
+己的 homing 步骤）home 到录制这批 episode 时用的位姿。
 
-如需关闭默认启动动作：
+如需恢复旧行为（仅在 DAS 台架上有意义）：
 
 ```bash
-python3 tools/fr3/fr3_act_infer_real.py --no-move-to-das-start
+python3 tools/fr3/fr3_act_infer_real.py --move-to-das-start
+```
+
+如需关闭其它默认启动动作：
+
+```bash
 python3 tools/fr3/fr3_act_infer_real.py --no-align-gripper-to-dataset-start
 ```
 
@@ -74,7 +82,7 @@ runtime:
     gripper_port: /dev/ttyUSB0
     gripper_backend: das  # das or pika
   startup:
-    move_to_das_start: true
+    move_to_das_start: false  # default; true only on the DAS rig
     align_gripper_to_dataset_start: true
     dataset_start_gripper_tolerance: 0.05
     robot_init_state:

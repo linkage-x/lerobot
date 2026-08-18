@@ -434,7 +434,27 @@
     <child link="pika_gripper_ee"/>
   </joint>
 
-  <!-- Task-space TCP: midpoint between the two finger working points. -->
+  <!-- NOT the midpoint between the finger working points, despite the name and what this comment
+       claimed until it was measured. Against the finger meshes in this file's own gripper_base_link
+       frame that midpoint is (0.1883, 0, 0.0006), i.e. `pika_gripper_ee` above, 3.4 mm away. This
+       frame sits 411.8 mm from it, in free space beside the gripper.
+
+       0.366842 is the fingertip reach measured in quest3_pika_gripper_scene.xml, whose gripper_base
+       is a free-flying wrist frame with the pika mesh mounted +0.1765 m along its own +z; there the
+       tool axis is +z and 0.366842 sits 0.35 mm from the far finger's furthest vertex there
+       (measured 0.366492). Here gripper_base_link IS the pika mesh
+       frame and the tool axis is +x, so the same literal points across the gripper instead of along
+       it. The 45 deg z-rotation that came over with it was already removed as frame-dependent (see
+       fr3_pika_gripper.xml); the translation is from the same source and equally frame-dependent.
+
+       Left in place because every dataset recorded before 2026-08 is anchored to it. It is a rigid
+       frame, so record/replay/rollout stay self-consistent as long as they all name it; deleting
+       or moving it reinterprets those episodes silently. New collections do NOT use it:
+       fr3_record_config.yaml now records against pika_gripper_ee, because the 411.85 mm lever
+       turns wrist rotation into apparent translation (1 deg of fr3_joint7 moves the real tool
+       0.03 mm and this frame 6.43 mm) and, worse, makes a rotation command pivot here rather than
+       at the fingers: a 45 deg wrist command swept the fingertips through a 314 mm arc.
+       See tools/fr3/WORKSTATION_RECORDING.md and tests/robots/test_fr3_tool_frame_geometry.py. -->
   <link name="pika_task_tcp"/>
   <joint name="pika_task_tcp_joint" type="fixed">
     <origin rpy="3.1415926 -1.5707963 0" xyz="0 0 0.366842"/>

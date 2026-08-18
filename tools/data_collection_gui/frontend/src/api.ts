@@ -26,7 +26,9 @@ import type {
   MujocoPreview,
   RealSensePreviewStatus,
   TrajectoryPoint,
-  TeleopStatus
+  TeleopStatus,
+  TeleopGains,
+  TeleopGainValues
 } from "./types";
 
 export type CameraCropSpecs = Record<string, [number, number, number, number]>;
@@ -55,6 +57,45 @@ const defaultMujocoValidation = (datasetRoot: string, episode: number, fps: numb
   cubeMode: "left"
 });
 
+/**
+ * Mirrors `teleop:` in tools/fr3/fr3_record_config.yaml, and the sim teleop script's own flag
+ * defaults. Only the offline mock adapter reads these; against a live gateway both arrive in the
+ * snapshot, which is the copy that is actually authoritative.
+ */
+const FR3_RECORD_CONFIG_TELEOP_GAINS: TeleopGainValues = {
+  translation_scale: 0.000615,
+  rotation_scale: 0.000648,
+  scale_x: null,
+  scale_y: null,
+  scale_z: null,
+  // Every axis follows its global since the rig switched to pika_gripper_ee. The sim script below
+  // still zeroes all three rotation axes -- that divergence is the point of showing both columns.
+  scale_wx: null,
+  scale_wy: null,
+  scale_wz: null
+};
+
+/** Mirrors gateway.FR3_TELEOP_AXIS_CALIBRATION, which mirrors the teleoperator. Mock adapter only. */
+const FR3_TELEOP_AXIS_CALIBRATION: TeleopGains["axisCalibration"] = {
+  scale_x: 1,
+  scale_y: 0.9414634146341463,
+  scale_z: 0.5902439024390244,
+  scale_wx: 1,
+  scale_wy: 0.9490740740740741,
+  scale_wz: 0.9259259259259259
+};
+
+const FR3_SIM_TELEOP_GAINS: TeleopGainValues = {
+  translation_scale: 0.001845,
+  rotation_scale: 0.001944,
+  scale_x: null,
+  scale_y: null,
+  scale_z: null,
+  scale_wx: 0,
+  scale_wy: 0,
+  scale_wz: 0
+};
+
 export type GuiSnapshot = {
   deployment: DeploymentProfile;
   gateway: GatewayStatus;
@@ -63,6 +104,7 @@ export type GuiSnapshot = {
   recording: RecordingStatus;
   replay: ReplayStatus;
   teleop: TeleopStatus;
+  teleopGains: TeleopGains;
   annotation: EpisodeAnnotation;
   calibration: CalibrationStatus;
   calibrationSession?: CalibrationSession;
@@ -150,7 +192,8 @@ export class DataCollectionGuiApi {
       pid: null,
       lastOutput: "",
       mujocoCubeMode: "left",
-      mujocoValidation: defaultMujocoValidation(handheldConfigSummary.root, 0, handheldConfigSummary.fps)
+      mujocoValidation: defaultMujocoValidation(handheldConfigSummary.root, 0, handheldConfigSummary.fps),
+      targetFrameName: "pika_gripper_ee"
     },
     teleop: {
       state: "idle",
@@ -159,7 +202,7 @@ export class DataCollectionGuiApi {
       robotModel: "fr3_pika_gripper",
       urdfPath: "src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf",
       simXmlPath: "src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper_scene.xml",
-      targetFrameName: "pika_task_tcp",
+      targetFrameName: "pika_gripper_ee",
       pid: null,
       message: "Start the local gateway to run FR3 Pika MuJoCo teleop",
       command: [],
@@ -168,6 +211,14 @@ export class DataCollectionGuiApi {
         { id: "external", label: "External", source: "D435I", fps: 30, deviceId: "side" },
         { id: "wrist", label: "Wrist", source: "D405", fps: 30, deviceId: "ee" }
       ]
+    },
+    teleopGains: {
+      values: { ...FR3_RECORD_CONFIG_TELEOP_GAINS },
+      configDefaults: { ...FR3_RECORD_CONFIG_TELEOP_GAINS },
+      simDefaults: { ...FR3_SIM_TELEOP_GAINS },
+      axisCalibration: { ...FR3_TELEOP_AXIS_CALIBRATION },
+      overridden: [],
+      absMax: 0.01
     },
     annotation: {
       datasetRoot: handheldConfigSummary.root,
@@ -547,6 +598,25 @@ export class DataCollectionGuiApi {
       message: "FR3 Pika teleop stopped"
     };
     this.log("warn", "FR3 teleop stop requested");
+    return this.getSnapshot();
+  }
+
+  /**
+   * Replace the whole gain override set. An empty object resets every gain to the recorder config,
+   * which is what Reset sends. Takes effect on the next teleop or recording spawn: the teleoperator
+   * reads its gains once, at construction, so a running session keeps the ones it started with.
+   */
+  async setTeleopGains(gains: TeleopGainValues): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteJsonSnapshot("/api/teleop/gains", gains);
+    if (remote) {
+      return remote;
+    }
+    this.snapshot.teleopGains = {
+      ...this.snapshot.teleopGains,
+      values: { ...this.snapshot.teleopGains.configDefaults, ...gains },
+      overridden: Object.keys(gains) as TeleopGains["overridden"]
+    };
+    this.log("warn", "Gateway unavailable; SpaceMouse gains changed in the mock adapter only");
     return this.getSnapshot();
   }
 
@@ -1229,6 +1299,7 @@ export class DataCollectionGuiApi {
       annotation: annotationWithDefaults,
       tasks: snapshot.tasks ?? this.snapshot.tasks ?? [],
       calibration: snapshot.calibration ?? this.snapshot.calibration,
+      teleopGains: snapshot.teleopGains ?? this.snapshot.teleopGains,
       markerTcp: snapshot.markerTcp ?? this.snapshot.markerTcp,
       datasetExport: snapshot.datasetExport ?? {
         ...this.snapshot.datasetExport,

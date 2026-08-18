@@ -30,7 +30,9 @@ extra_args=("$@")
 # --- What this rig is --------------------------------------------------------
 # Defaults mirror tools/fr3/fr3_record_config.yaml, because a rollout has to meet the hardware
 # the data came off. Anything that disagrees with the record config is a silent distribution
-# shift, not a preference.
+# shift, not a preference. `target_frame_name` below follows the checkpoint's dataset, which is the
+# same thing as today's record config until someone trains on pre-switch episodes -- see the note
+# there.
 robot_ip="${FR3_ROBOT_IP-192.168.1.206}"
 gripper_backend="${FR3_GRIPPER_BACKEND-pika}"
 gripper_port="${FR3_GRIPPER_PORT-/dev/serial/by-path/pci-0000:00:14.0-usb-0:9.1.4:1.0-port0}"
@@ -38,12 +40,19 @@ gripper_max_width_mm="${FR3_GRIPPER_MAX_WIDTH_MM-90}"
 camera_config="${FR3_INFER_CAMERA_CONFIG-tools/fr3/fr3_il_infer_realsense_camera_config.yaml}"
 
 # The IK tool frame, and the reason this script exists rather than a few env vars on the host one.
-# fr3_act_infer_real_runtime.py defaults a Pika gripper to `pika_gripper_ee`, but the workstation
-# records against `pika_task_tcp` (fr3_record_config.yaml) -- two fixed frames on the same URDF
-# roughly 0.4 m apart. Left at the default, every recorded pose would be interpreted against the
-# wrong frame: the rollout would run, track its targets, and be wrong by that offset everywhere.
+# The two Pika frames are fixed on the same URDF and 411.85 mm apart, so naming the wrong one does
+# not fail: the rollout runs, tracks its targets, and is wrong by that offset everywhere.
+#
+# The frame must match the dataset the *checkpoint* was trained on, which is normally the same as
+# the record config -- and is, here. This default tracked `pika_task_tcp` while the recorder did;
+# when the recorder switched, nothing had been trained yet (no outputs/train on either machine), so
+# there was no pre-switch checkpoint for the old value to protect and it moved with it.
+#
+# Export FR3_TARGET_FRAME_NAME=pika_task_tcp if you ever roll out a checkpoint trained on
+# pre-switch episodes -- the datasets recorded before the switch are still anchored there. Check the
+# checkpoint's dataset before the run, not after it.
 robot_urdf_path="${FR3_ROBOT_URDF_PATH-src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf}"
-target_frame_name="${FR3_TARGET_FRAME_NAME-pika_task_tcp}"
+target_frame_name="${FR3_TARGET_FRAME_NAME-pika_gripper_ee}"
 
 # Gripper units. On this rig `gripper.pos` is a normalized 0..1 opening in both the dataset and
 # the robot command; on the Hikrobot rig unit-bearing feature names such as `*.width_mm` carry the

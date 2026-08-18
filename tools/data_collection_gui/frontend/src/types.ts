@@ -170,6 +170,40 @@ export type TeleopStatus = {
   cameraViews?: TeleopCameraView[];
 };
 
+/** The SpaceMouse gain the teleoperator applies to one axis of the 6D command. */
+export type TeleopGainField =
+  | "translation_scale"
+  | "rotation_scale"
+  | "scale_x"
+  | "scale_y"
+  | "scale_z"
+  | "scale_wx"
+  | "scale_wy"
+  | "scale_wz";
+
+/**
+ * `null` means "not set" and is not the same as `0`: an unset per-axis gain falls back to the
+ * matching global gain, while a `0` disables that axis outright.
+ */
+export type TeleopGainValues = Partial<Record<TeleopGainField, number | null>>;
+
+export type TeleopGains = {
+  /** What the next session will use: config defaults with any operator override applied. */
+  values: TeleopGainValues;
+  /** What the recorder YAML asks for; the Reset button returns here. */
+  configDefaults: TeleopGainValues;
+  /** The sim teleop script's own flag defaults, which the YAML does not feed. */
+  simDefaults: TeleopGainValues;
+  /**
+   * Per-axis factors the teleoperator applies to a *global* gain (SpaceMouseTeleopConfig's
+   * TRANSLATION_/ROTATION_AXIS_CALIBRATION). An unset z therefore runs at 59% of
+   * `translation_scale`, and an explicitly set axis skips the factor entirely.
+   */
+  axisCalibration: Partial<Record<TeleopGainField, number>>;
+  overridden: TeleopGainField[];
+  absMax: number;
+};
+
 export type ReplayStatus = {
   state: "idle" | "preflight" | "armed" | "sim_replay" | "replaying" | "paused" | "aborted" | "complete";
   dataset: string;
@@ -198,6 +232,10 @@ export type ReplayStatus = {
   realEndEffectorMode?: RealEndEffectorMode;
   mujocoOverrideAccepted?: boolean;
   realReplayLog?: string[];
+  // The tool frame the gateway will build the replay command against, from
+  // `robot.target_frame_name`. Shown rather than assumed: replaying a dataset recorded in
+  // the other tool frame is a silent 411 mm offset, not an error.
+  targetFrameName?: string;
   // Bumped when the dataset content changes under an unchanged (root, episode)
   // selection (e.g. after deleting an episode); the inspector refetches on it.
   revision?: number;

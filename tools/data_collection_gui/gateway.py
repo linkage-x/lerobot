@@ -181,7 +181,10 @@ class TeleopStatus:
     robotModel: str = "fr3_pika_gripper"
     urdfPath: str = ""
     simXmlPath: str = ""
-    targetFrameName: str = "pika_task_tcp"
+    # Filled from the config on every snapshot, so this is only what an unconstructed status
+    # would claim. Deliberately empty rather than a frame name: a stale default here is what
+    # made the idle Teleoperation page name the wrong tool frame.
+    targetFrameName: str = ""
     pid: int | None = None
     message: str = "FR3 Pika MuJoCo teleop is ready"
     lastOutput: str = ""
@@ -304,6 +307,10 @@ class GatewayState:
     process: subprocess.Popen[str] | None = None
     runtime_recording_config: dict[str, Any] | None = None
     runtime_recording_config_path: Path | None = None
+    # SpaceMouse 6D gain overrides set from the Teleoperation page, empty until an operator changes
+    # one. Kept out of the YAML on purpose: these are tuned live against the arm, and a session's
+    # worth of experimenting should not rewrite the file that defines the recording contract.
+    runtime_teleop_gains: dict[str, float | None] = field(default_factory=dict)
     replay_process: subprocess.Popen[str] | None = None
     replay_process_kind: str = ""
     teleop_process: subprocess.Popen[str] | None = None
@@ -418,6 +425,137 @@ def _dataset_config(config: dict[str, Any]) -> dict[str, Any]:
 def _replay_config(config: dict[str, Any]) -> dict[str, Any]:
     replay = config.get("replay") or {}
     return replay if isinstance(replay, dict) else {}
+
+
+def _teleop_config(config: dict[str, Any]) -> dict[str, Any]:
+    teleop = config.get("teleop") or {}
+    return teleop if isinstance(teleop, dict) else {}
+
+
+# The SpaceMouse's 6D gain surface, in the order the UI shows it. `translation_scale` and
+# `rotation_scale` are the global gains; the six per-axis entries override them one axis at a time
+# and are `None` when unset, which is how SpaceMouseTeleopConfig asks for "use the global". A 0.0 is
+# therefore *not* the same as unset -- it disables that axis, which is how this rig ran roll and
+# pitch until it switched to recording against pika_gripper_ee.
+FR3_TELEOP_GLOBAL_GAINS = ("translation_scale", "rotation_scale")
+FR3_TELEOP_AXIS_GAINS = ("scale_x", "scale_y", "scale_z", "scale_wx", "scale_wy", "scale_wz")
+FR3_TELEOP_GAIN_FIELDS = FR3_TELEOP_GLOBAL_GAINS + FR3_TELEOP_AXIS_GAINS
+
+# Per device tick, so the ceiling is a rate: the recorder runs the SpaceMouse at 200 Hz, making
+# 0.01 worth 2 m/s or 2 rad/s at full stick deflection. That is already past anything this rig has
+# ever been driven at (the largest value in the repo is the sim's 0.001845), so it is a guard
+# against a typo'd extra digit rather than a tuning limit. The real safety net downstream is
+# `robot.max_target_delta_pos` / `max_target_delta_rot`, which clamp per control step regardless of
+# what gain produced the command.
+FR3_TELEOP_GAIN_ABS_MAX = 0.01
+
+# `tools/fr3/fr3_mujoco_teleop.py` does not read the recorder's YAML -- it takes gains as CLI flags
+# with their own defaults, which differ from the hardware config on every axis that matters:
+# 3x the translation gain, and all three rotation axes zeroed. Mirrored here so the UI can show the
+# operator what the sim will actually do, and pinned to the parser by
+# tests/scripts/test_data_collection_gui_gateway.py so the two cannot drift apart silently.
+FR3_SIM_TELEOP_GAIN_DEFAULTS: dict[str, float | None] = {
+    "translation_scale": 0.001845,
+    "rotation_scale": 0.001944,
+    "scale_x": None,
+    "scale_y": None,
+    "scale_z": None,
+    "scale_wx": 0.0,
+    "scale_wy": 0.0,
+    "scale_wz": 0.0,
+}
+
+# The global gain is not what an unset axis gets. `SpaceMouseTeleopConfig` multiplies it by a
+# per-axis calibration first (teleop_spacemouse.py, TRANSLATION_/ROTATION_AXIS_CALIBRATION), so an
+# unset z moves at 59% of `translation_scale` -- and an explicitly set axis *replaces* the
+# calibrated value rather than scaling it, meaning typing the global's own number into z is not a
+# no-op. The panel needs both halves of that to state what an axis will really do, so the vectors
+# are mirrored here and pinned to the teleoperator's source by
+# tests/scripts/test_data_collection_gui_gateway.py.
+FR3_TELEOP_AXIS_CALIBRATION: dict[str, float] = {
+    "scale_x": 1.0,
+    "scale_y": 0.9414634146341463,
+    "scale_z": 0.5902439024390244,
+    "scale_wx": 1.0,
+    "scale_wy": 0.9490740740740741,
+    "scale_wz": 0.9259259259259259,
+}
+
+
+def _teleop_gain_defaults(config: dict[str, Any]) -> dict[str, float | None]:
+    """The gains the recorder config asks for, with the teleoperator's own fallbacks."""
+
+    teleop = _teleop_config(config)
+    defaults: dict[str, float | None] = {}
+    for field_name in FR3_TELEOP_GAIN_FIELDS:
+        raw = teleop.get(field_name)
+        if raw is None or raw == "":
+            defaults[field_name] = None
+            continue
+        try:
+            defaults[field_name] = float(raw)
+        except (TypeError, ValueError):
+            defaults[field_name] = None
+    return defaults
+
+
+def _parse_teleop_gain_overrides(payload: Any) -> dict[str, float | None]:
+    """Validate a UI gain payload into the subset that should override the config.
+
+    A key that is absent, `null` or `""` means "leave this one alone"; the caller drops it rather
+    than writing a `None`, because `None` is itself a meaningful config value (it means "fall back
+    to the global gain") and the UI has no way to distinguish the two intents.
+    """
+
+    if not isinstance(payload, dict):
+        raise ValueError("Teleop gains must be a JSON object.")
+    unknown = sorted(set(payload) - set(FR3_TELEOP_GAIN_FIELDS))
+    if unknown:
+        raise ValueError(f"Unknown teleop gain(s): {', '.join(unknown)}")
+
+    overrides: dict[str, float | None] = {}
+    for field_name in FR3_TELEOP_GAIN_FIELDS:
+        if field_name not in payload:
+            continue
+        raw = payload[field_name]
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} must be a number, got {raw!r}") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"{field_name} must be finite, got {raw!r}")
+        if abs(value) > FR3_TELEOP_GAIN_ABS_MAX:
+            raise ValueError(
+                f"{field_name} must be within +/-{FR3_TELEOP_GAIN_ABS_MAX} "
+                f"(200 Hz x {FR3_TELEOP_GAIN_ABS_MAX} is already 2 m/s at full deflection)"
+            )
+        if field_name in FR3_TELEOP_GLOBAL_GAINS and value <= 0.0:
+            raise ValueError(
+                f"{field_name} is the global gain and must be positive; zero an individual axis "
+                "with scale_x .. scale_wz instead"
+            )
+        overrides[field_name] = value
+    return overrides
+
+
+def _effective_teleop_gains(state: GatewayState) -> dict[str, float | None]:
+    gains = _teleop_gain_defaults(state.config)
+    gains.update(state.runtime_teleop_gains or {})
+    return gains
+
+
+def _teleop_gains_payload(state: GatewayState) -> dict[str, Any]:
+    overrides = state.runtime_teleop_gains or {}
+    return {
+        "values": _effective_teleop_gains(state),
+        "configDefaults": _teleop_gain_defaults(state.config),
+        "simDefaults": dict(FR3_SIM_TELEOP_GAIN_DEFAULTS),
+        "axisCalibration": dict(FR3_TELEOP_AXIS_CALIBRATION),
+        "overridden": sorted(overrides),
+        "absMax": FR3_TELEOP_GAIN_ABS_MAX,
+    }
 
 
 def _float_config(config: dict[str, Any], key: str, default: float) -> float:
@@ -3301,6 +3439,10 @@ def _delete_task(state: GatewayState, task_id: str) -> None:
 
 
 _ACTIVE_TASK_OVERLAY_NAME = ".active_task_config.yaml"
+# Teleop gets its own overlay file rather than sharing the recorder's: the two are resolved
+# independently and a teleop-only overlay landing on the recorder's path would hand the recorder a
+# config it never asked for.
+_TELEOP_OVERLAY_NAME = ".teleop_gains_config.yaml"
 
 
 def _find_task(state: GatewayState, task_id: str | None) -> dict[str, Any] | None:
@@ -3382,10 +3524,25 @@ def _build_task_overlay_config(
     return overlay
 
 
-def _write_overlay_config(state: GatewayState, overlay: dict[str, Any]) -> Path:
+def _apply_teleop_gain_overrides(config: dict[str, Any], overrides: dict[str, float | None]) -> None:
+    """Write UI gain overrides into a config mapping in place."""
+
+    if not overrides:
+        return
+    teleop = config.get("teleop")
+    if not isinstance(teleop, dict):
+        teleop = {}
+        config["teleop"] = teleop
+    for field_name, value in overrides.items():
+        teleop[field_name] = value
+
+
+def _write_overlay_config(
+    state: GatewayState, overlay: dict[str, Any], *, name: str = _ACTIVE_TASK_OVERLAY_NAME
+) -> Path:
     import yaml
 
-    path = state.repo_root / "outputs" / _ACTIVE_TASK_OVERLAY_NAME
+    path = state.repo_root / "outputs" / name
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as overlay_file:
         yaml.safe_dump(overlay, overlay_file, sort_keys=False, allow_unicode=True)
@@ -3437,6 +3594,10 @@ def _resolve_recorder_config_path(
 
     active_task = _find_task(state, state.active_task_id)
     has_task = active_task is not None and bool(str(active_task.get("datasetRepoId") or "").strip())
+    # Gains tuned on the Teleoperation page have to reach the recorder too: the operator drives the
+    # same SpaceMouse through the same teleoperator while recording, so a session tuned at one gain
+    # and recorded at another would put demonstrations in the dataset that no live teleop produced.
+    gain_overrides = dict(state.runtime_teleop_gains or {})
     overlay: dict[str, Any] | None = None
     if has_task:
         datasets_dir = _task_datasets_dir(state)
@@ -3448,7 +3609,7 @@ def _resolve_recorder_config_path(
         overlay = _build_task_overlay_config(state.config, active_task, datasets_dir)
     else:
         state.active_task_id = None
-        if episode_time_s is not None or recording_fps is not None:
+        if episode_time_s is not None or recording_fps is not None or gain_overrides:
             overlay = copy.deepcopy(state.config)
 
     if episode_time_s is not None or recording_fps is not None:
@@ -3462,6 +3623,11 @@ def _resolve_recorder_config_path(
             dataset["episode_time_s"] = float(episode_time_s)
         if recording_fps is not None:
             dataset["fps"] = int(recording_fps)
+
+    if gain_overrides:
+        if overlay is None:
+            overlay = copy.deepcopy(state.config)
+        _apply_teleop_gain_overrides(overlay, gain_overrides)
 
     config = overlay if overlay is not None else state.config
     config_path = _write_overlay_config(state, overlay) if overlay is not None else state.config_path
@@ -3482,6 +3648,12 @@ def _resolve_recorder_config_path(
         state.log("info", f"Recording episode duration set to {episode_time_s:g}s for this session")
     if recording_fps is not None:
         state.log("info", f"Recording FPS set to {recording_fps:g} for this session")
+    if gain_overrides:
+        state.log(
+            "info",
+            "Recording with SpaceMouse gain overrides "
+            + ", ".join(f"{name}={value:g}" for name, value in sorted(gain_overrides.items())),
+        )
     return config_path
 
 
@@ -7467,8 +7639,14 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
             for device in state.devices
         ],
         "recording": asdict(state.recording),
-        "replay": asdict(state.replay),
-        "teleop": asdict(state.teleop),
+        # The tool frame is a property of the config, not of a session, so both pages report it
+        # whether or not anything is running. It used to be spelled out as a literal in the replay
+        # page and to sit at a stale dataclass default on an idle teleop status -- exactly the
+        # label an operator would trust while replaying a dataset recorded 411 mm away in the
+        # other frame.
+        "replay": {**asdict(state.replay), "targetFrameName": _fr3_target_frame_name(state)},
+        "teleop": {**asdict(state.teleop), "targetFrameName": _fr3_target_frame_name(state)},
+        "teleopGains": _teleop_gains_payload(state),
         "annotation": _active_annotation(state),
         "calibration": asdict(state.calibration),
         "calibrationSession": _calibration_session_payload(state),
@@ -7554,6 +7732,47 @@ def _fr3_pika_asset_paths(repo_root: Path) -> tuple[Path, Path]:
     return asset_root / "fr3_pika_gripper.urdf", asset_root / "fr3_pika_gripper_scene.xml"
 
 
+# Mirrors FrankaResearch3Config.target_frame_name, and is only reached by a config that does not
+# set the key -- the workstation's does. Pinned to the dataclass by
+# tests/scripts/test_data_collection_gui_gateway.py so the two cannot answer differently.
+FR3_DEFAULT_TARGET_FRAME_NAME = "pika_gripper_ee"
+
+
+def _fr3_target_frame_name(state: GatewayState) -> str:
+    """The tool frame, from the robot config rather than a literal.
+
+    Recording, MuJoCo replay and real replay have to name the *same* frame: `pika_task_tcp` and
+    `pika_gripper_ee` are 411 mm apart on the same URDF and share an orientation, so a mismatch is
+    a silent 411 mm offset rather than a failure. Several of these commands used to spell the frame
+    out, which made them the only places that would not follow `robot.target_frame_name` if the rig
+    ever switched -- exactly the direction a switch would be attempted from.
+
+    The fallback is `FrankaResearch3Config.target_frame_name`'s own default rather than a literal
+    picked here. A config that omits the key gets that frame from the robot class no matter what
+    this function says, so any other answer would hand the sim teleop and the replay a different
+    frame from the one the recorder is using -- the same silent offset, arrived at from the inside.
+    """
+    robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
+    return str(robot.get("target_frame_name") or "").strip() or FR3_DEFAULT_TARGET_FRAME_NAME
+
+
+def _teleop_gain_cli_args(state: GatewayState) -> list[str]:
+    """Gain flags for the sim teleop script, and only for gains the operator actually set.
+
+    `fr3_mujoco_teleop.py` carries its own defaults (see FR3_SIM_TELEOP_GAIN_DEFAULTS), so passing
+    nothing leaves the sim exactly as it was. Passing a per-axis flag as an explicit `None` is not
+    possible over argparse, so an override that clears an axis back to "follow the global gain" is
+    expressed by simply not sending that flag -- which is what dropping `None` values here does.
+    """
+
+    args: list[str] = []
+    for field_name, value in sorted((state.runtime_teleop_gains or {}).items()):
+        if value is None:
+            continue
+        args.extend([f"--{field_name.replace('_', '-')}", repr(float(value))])
+    return args
+
+
 def _fr3_sim_teleop_command(state: GatewayState) -> list[str]:
     urdf_path, sim_xml_path = _fr3_pika_asset_paths(state.repo_root)
     return [
@@ -7566,7 +7785,7 @@ def _fr3_sim_teleop_command(state: GatewayState) -> list[str]:
         "--sim-xml-path",
         str(sim_xml_path),
         "--target-frame-name",
-        "pika_task_tcp",
+        _fr3_target_frame_name(state),
         "--no-viewer",
         "--enable-cameras",
         "--camera-width",
@@ -7576,7 +7795,25 @@ def _fr3_sim_teleop_command(state: GatewayState) -> list[str]:
         "--camera-fps",
         "30",
         "--disable-otg",
+        *_teleop_gain_cli_args(state),
     ]
+
+
+def _resolve_teleop_config_path(state: GatewayState) -> Path:
+    """Config path to spawn the real teleop with: the repo's file, or an overlay carrying gains."""
+
+    overrides = dict(state.runtime_teleop_gains or {})
+    if not overrides:
+        return state.config_path
+    overlay = copy.deepcopy(state.config)
+    _apply_teleop_gain_overrides(overlay, overrides)
+    path = _write_overlay_config(state, overlay, name=_TELEOP_OVERLAY_NAME)
+    state.log(
+        "info",
+        "Real teleop launching with SpaceMouse gain overrides "
+        + ", ".join(f"{name}={value:g}" for name, value in sorted(overrides.items())),
+    )
+    return path
 
 
 def _fr3_real_teleop_command(state: GatewayState) -> list[str]:
@@ -7584,7 +7821,7 @@ def _fr3_real_teleop_command(state: GatewayState) -> list[str]:
         str(_venv_python(state.repo_root, prefer_fr3=True)),
         "-m",
         "tools.fr3.fr3_real_teleop_runtime",
-        f"--config_path={state.config_path}",
+        f"--config_path={_resolve_teleop_config_path(state)}",
     ]
 
 
@@ -7653,7 +7890,7 @@ def _start_fr3_sim_teleop(state: GatewayState) -> None:
         robotModel="fr3_pika_gripper",
         urdfPath=str(urdf_path),
         simXmlPath=str(sim_xml_path),
-        targetFrameName="pika_task_tcp",
+        targetFrameName=_fr3_target_frame_name(state),
         pid=process.pid,
         message="FR3 Pika MuJoCo teleop started; two camera streams are rendering in the web UI",
         command=command,
@@ -7693,7 +7930,7 @@ def _start_fr3_real_teleop(state: GatewayState) -> None:
         robotModel="fr3_pika_gripper",
         urdfPath=str(urdf_path),
         simXmlPath=str(sim_xml_path),
-        targetFrameName="pika_task_tcp",
+        targetFrameName=_fr3_target_frame_name(state),
         pid=process.pid,
         message="Connecting to FR3 192.168.1.206, Pika gripper, and SpaceMouse",
         command=command,
@@ -9296,7 +9533,7 @@ def _real_replay_command(
                 f"--robot.gripper_port={robot.get('gripper_port') or '/dev/ttyUSB0'}",
                 "--robot.allow_mock_gripper=false",
                 f"--robot.urdf_path={urdf_path}",
-                "--robot.target_frame_name=pika_task_tcp",
+                f"--robot.target_frame_name={_fr3_target_frame_name(state)}",
             ]
         )
     return command
@@ -10411,6 +10648,33 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         return
                     _stop_fr3_teleop(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/teleop/gains":
+                    if self.server.state.profile != "workstation":
+                        _json_response(
+                            self, HTTPStatus.CONFLICT, {"error": "teleoperation is unavailable in the Thor profile"}
+                        )
+                        return
+                    try:
+                        overrides = _parse_teleop_gain_overrides(_read_json_body(self))
+                    except ValueError as exc:
+                        _json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    state = self.server.state
+                    # A new gain only reaches the arm on the next spawn: the teleoperator reads its
+                    # config once at construction. Say so rather than letting the operator turn a
+                    # knob and wait for a running session to respond to it.
+                    state.runtime_teleop_gains = overrides
+                    if overrides:
+                        state.log(
+                            "info",
+                            "SpaceMouse gain override set: "
+                            + ", ".join(f"{name}={value:g}" for name, value in sorted(overrides.items()))
+                            + "; applies to the next teleop or recording session",
+                        )
+                    else:
+                        state.log("info", "SpaceMouse gains reset to the recorder config")
+                    _json_response(self, HTTPStatus.OK, _snapshot(state))
                     return
                 if path == "/api/calibration/run":
                     dataset = (query.get("dataset", [""])[0] or "").strip()

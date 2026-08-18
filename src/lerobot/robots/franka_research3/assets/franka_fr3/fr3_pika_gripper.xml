@@ -139,9 +139,20 @@
                             <camera name="ee_cam" mode="fixed" pos="0.095 0.00118 0.04069"
                                     xyaxes="0 -0.99893 0.04636 0 0.04636 0.99893" fovy="78"/>
                             <!-- Both are rpy="3.1415926 -1.5707963 0" in the urdf (fr3_hand_tcp_joint,
-                                 pika_task_tcp_joint): a 180 deg turn about (x+z)/sqrt(2). The task TCP
-                                 used to carry a 45 deg z-rotation lifted from quest3_pika_gripper_scene.xml,
-                                 whose gripper_base is a different frame entirely. -->
+                                 pika_task_tcp_joint): a 180 deg turn about (x+z)/sqrt(2). Identical
+                                 orientation, so the two frames differ by a pure translation; both put
+                                 z_tool along the approach axis (gripper_base +x), which is the contract
+                                 the IK and the recorded quaternions assume.
+
+                                 The task TCP used to carry a 45 deg z-rotation lifted from
+                                 quest3_pika_gripper_scene.xml, whose gripper_base is a different frame
+                                 entirely. Its *translation* came from there too and was not corrected:
+                                 0.366842 is the fingertip reach along quest3's gripper_base +z (0.35 mm
+                                 from that scene's far fingertip), but here the tool axis is +x, so it points across the
+                                 gripper. The real finger-working-point midpoint in this frame is
+                                 (0.1883, 0, 0.0006), i.e. pika_gripper_ee, 3.4 mm off; pika_task_tcp
+                                 is 411.8 mm off. Kept because the workstation's datasets are anchored
+                                 to it; see the long note in fr3_pika_gripper.urdf. -->
                             <body name="pika_gripper_ee" pos="0.185 0 0" quat="0 0.70710678 0 0.70710678"/>
                             <body name="pika_task_tcp" pos="0 0 0.366842" quat="0 0.70710678 0 0.70710678"/>
                             <body name="gripper_left_link" pos="0.0815 0.08851 0.0064182">

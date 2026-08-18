@@ -278,6 +278,7 @@ function App() {
         onStartSimTeleop={() => run(() => api.startSimTeleop())}
         onStartRealTeleop={() => run(() => api.startRealTeleop())}
         onStopTeleop={() => run(() => api.stopTeleop())}
+        onSetTeleopGains={(gains) => run(() => api.setTeleopGains(gains))}
         cameraUrl={(view, backend) =>
           backend === "real"
             ? api.cameraSnapshotUrl(view.deviceId ?? (view.id === "wrist" ? "ee" : "side"))

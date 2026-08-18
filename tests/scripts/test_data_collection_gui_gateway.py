@@ -1706,7 +1706,8 @@ def test_mujoco_validation_is_recommended_for_preflight_but_required_for_real_re
     )
     assert "--robot.gripper_backend=pika" in pika_command
     assert "--robot.allow_mock_gripper=false" in pika_command
-    assert "--robot.target_frame_name=pika_task_tcp" in pika_command
+    # No target_frame_name in this config, so this is the fallback: the robot class's own default.
+    assert f"--robot.target_frame_name={gateway.FR3_DEFAULT_TARGET_FRAME_NAME}" in pika_command
     assert any(part.endswith("fr3_pika_gripper.urdf") for part in pika_command)
 
     bare_command = gateway._real_replay_command(
@@ -3138,3 +3139,342 @@ def test_export_completion_leaves_non_view_exports_untouched(tmp_path):
     assert state.dataset_export.state == "complete"
     assert state.dataset_export.message == "Episode 0 written (12 frames)"
     assert state.dataset_export.totalFrames == 12
+
+
+def _frame_name_state(tmp_path: Path, target_frame_name: str | None) -> gateway.GatewayState:
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    robot: dict[str, object] = {"gripper_port": "/dev/ttyUSB9"}
+    if target_frame_name is not None:
+        robot["target_frame_name"] = target_frame_name
+    return gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={
+            "dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30},
+            "replay": {"robot_ip": "192.168.1.99"},
+            "robot": robot,
+        },
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test", fps=30),
+        datasets_root=dataset_root.parent,
+    )
+
+
+def test_fr3_target_frame_name_defaults_to_whatever_the_robot_class_would_use(tmp_path):
+    """A config with no key still gets a frame -- from FrankaResearch3Config, not from here.
+
+    The recorder builds its robot from the same config, so the dataclass default is what the arm
+    will actually be driven in. If this function answered anything else, a config that omits the key
+    would record in one frame while the sim teleop and the replay were told another, which is a
+    silent 411 mm offset and not an error. Read out of the source text because importing the robot
+    class needs the whole lerobot stack.
+    """
+    import re
+
+    source = Path("src/lerobot/robots/franka_research3/config_franka_research3.py").read_text(encoding="utf-8")
+    match = re.search(r'^\s*target_frame_name:\s*str\s*=\s*"([^"]+)"', source, re.MULTILINE)
+    assert match is not None, "FrankaResearch3Config no longer declares a target_frame_name default"
+    assert gateway.FR3_DEFAULT_TARGET_FRAME_NAME == match.group(1), (
+        f"FrankaResearch3Config defaults to {match.group(1)} but the gateway falls back to "
+        f"{gateway.FR3_DEFAULT_TARGET_FRAME_NAME}"
+    )
+
+    for absent in (None, "  "):
+        assert gateway._fr3_target_frame_name(_frame_name_state(tmp_path, absent)) == match.group(1)
+
+
+def test_fr3_target_frame_name_follows_the_robot_config(tmp_path):
+    """The two frames are 411 mm apart, so a process that ignores the config is a silent offset."""
+    state = _frame_name_state(tmp_path, "pika_gripper_ee")
+
+    assert gateway._fr3_target_frame_name(state) == "pika_gripper_ee"
+
+
+def test_sim_teleop_and_real_replay_take_the_frame_from_the_config(tmp_path):
+    """Both used to spell `pika_task_tcp` out, which made them the two places a frame switch would
+    silently miss. Recording, MuJoCo replay and real replay have to name the same frame."""
+    state = _frame_name_state(tmp_path, "pika_gripper_ee")
+
+    sim_command = gateway._fr3_sim_teleop_command(state)
+    assert "--target-frame-name" in sim_command
+    assert sim_command[sim_command.index("--target-frame-name") + 1] == "pika_gripper_ee"
+    assert "pika_task_tcp" not in sim_command
+
+    replay_command = gateway._real_replay_command(
+        state,
+        tmp_path / "repo" / "outputs" / "datasets" / "episode_set",
+        "left",
+        "192.168.1.206",
+        "pika_gripper_ee",
+    )
+    assert "--robot.target_frame_name=pika_gripper_ee" in replay_command
+    assert "--robot.target_frame_name=pika_task_tcp" not in replay_command
+
+
+def test_the_replay_snapshot_reports_the_frame_the_command_will_use(tmp_path):
+    """The replay page used to print the frame as a literal.
+
+    Replaying a dataset recorded in the other tool frame does not fail -- it puts the fingertips
+    where the other frame's origin used to be, 411 mm away, and runs to completion. The label an
+    operator reads before pressing the button therefore has to come from the same place the command
+    does, not from a string that was true when it was written.
+    """
+    for configured, expected in (("pika_gripper_ee", "pika_gripper_ee"), ("pika_task_tcp", "pika_task_tcp")):
+        state = _frame_name_state(tmp_path, configured)
+        snapshot = gateway._snapshot(state)
+
+        assert snapshot["replay"]["targetFrameName"] == expected
+        assert snapshot["teleop"]["targetFrameName"] == expected
+
+
+# --------------------------------------------------------- spacemouse 6d gains ---
+#
+# The gains are the operator's only handle on how the SpaceMouse maps to the tool, and they are
+# tuned live against the arm. Two properties make them worth pinning: an untouched rig has to keep
+# behaving exactly as the YAML says (so a gains UI cannot quietly re-tune a rig nobody asked it to),
+# and an override has to reach *both* teleop and recording, because the same teleoperator drives
+# both and a demonstration recorded at a gain the operator never felt is a silently wrong episode.
+
+
+def _gain_state(tmp_path: Path, teleop: dict[str, object] | None = None) -> gateway.GatewayState:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    dataset_root = repo_root / "outputs" / "datasets" / "episode_set"
+    config: dict[str, object] = {
+        "dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30},
+        "robot": {"target_frame_name": "pika_task_tcp"},
+    }
+    if teleop is not None:
+        config["teleop"] = teleop
+    return gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config=config,
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test", fps=30),
+        datasets_root=dataset_root.parent,
+        profile="workstation",
+    )
+
+
+def _workstation_teleop_gains() -> dict[str, object]:
+    """The gains tools/fr3/fr3_record_config.yaml actually ships."""
+    return {
+        "translation_scale": 0.000615,
+        "rotation_scale": 0.000648,
+        "scale_wx": 0.0,
+        "scale_wy": 0.0,
+    }
+
+
+def test_teleop_gain_defaults_read_the_config_and_distinguish_unset_from_zero(tmp_path):
+    """`scale_wx: 0.0` disables roll; an absent `scale_wz` follows rotation_scale. Not the same."""
+    gains = gateway._teleop_gain_defaults(_gain_state(tmp_path, _workstation_teleop_gains()).config)
+
+    assert gains["translation_scale"] == pytest.approx(0.000615)
+    assert gains["rotation_scale"] == pytest.approx(0.000648)
+    assert gains["scale_wx"] == 0.0
+    assert gains["scale_wy"] == 0.0
+    assert gains["scale_wz"] is None
+    assert gains["scale_x"] is None
+
+
+def test_teleop_gain_defaults_survive_a_config_with_no_teleop_block(tmp_path):
+    assert set(gateway._teleop_gain_defaults(_gain_state(tmp_path).config)) == set(
+        gateway.FR3_TELEOP_GAIN_FIELDS
+    )
+    assert all(value is None for value in gateway._teleop_gain_defaults(_gain_state(tmp_path).config).values())
+
+
+def test_an_untouched_rig_launches_exactly_as_before(tmp_path):
+    """The whole feature has to be inert until someone changes a gain."""
+    state = _gain_state(tmp_path, _workstation_teleop_gains())
+
+    sim_command = gateway._fr3_sim_teleop_command(state)
+    assert not [argument for argument in sim_command if argument.startswith("--translation-scale")]
+    assert not [argument for argument in sim_command if argument.startswith("--scale-")]
+
+    real_command = gateway._fr3_real_teleop_command(state)
+    assert f"--config_path={state.config_path}" in real_command
+    assert gateway._resolve_teleop_config_path(state) == state.config_path
+    assert not (state.repo_root / "outputs" / gateway._TELEOP_OVERLAY_NAME).exists()
+
+
+def test_a_gain_override_reaches_the_sim_teleop_as_flags(tmp_path):
+    state = _gain_state(tmp_path, _workstation_teleop_gains())
+    state.runtime_teleop_gains = {"rotation_scale": 0.002, "scale_wx": 0.002, "scale_wy": 0.002}
+
+    command = gateway._fr3_sim_teleop_command(state)
+
+    assert command[command.index("--rotation-scale") + 1] == "0.002"
+    assert command[command.index("--scale-wx") + 1] == "0.002"
+    assert command[command.index("--scale-wy") + 1] == "0.002"
+    # Untouched gains stay untouched: the script's own defaults still apply to them.
+    assert "--translation-scale" not in command
+    assert "--scale-wz" not in command
+
+
+def test_a_gain_override_reaches_the_real_teleop_as_an_overlay_config(tmp_path):
+    import yaml
+
+    state = _gain_state(tmp_path, _workstation_teleop_gains())
+    state.runtime_teleop_gains = {"scale_wx": 0.002, "scale_wy": 0.002}
+
+    command = gateway._fr3_real_teleop_command(state)
+    overlay_path = state.repo_root / "outputs" / gateway._TELEOP_OVERLAY_NAME
+
+    assert f"--config_path={overlay_path}" in command
+    assert f"--config_path={state.config_path}" not in command
+    overlay = yaml.safe_load(overlay_path.read_text(encoding="utf-8"))
+    assert overlay["teleop"]["scale_wx"] == pytest.approx(0.002)
+    assert overlay["teleop"]["scale_wy"] == pytest.approx(0.002)
+    # Everything the operator did not touch has to survive the overlay unchanged.
+    assert overlay["teleop"]["translation_scale"] == pytest.approx(0.000615)
+    assert overlay["robot"]["target_frame_name"] == "pika_task_tcp"
+    # ... and the recorder's own overlay must not be the file that got written.
+    assert not (state.repo_root / "outputs" / gateway._ACTIVE_TASK_OVERLAY_NAME).exists()
+
+
+def test_a_gain_override_reaches_the_recorder(tmp_path):
+    """Recording runs the same teleoperator, so it must not silently use the YAML's gains."""
+    import yaml
+
+    state = _gain_state(tmp_path, _workstation_teleop_gains())
+    state.runtime_teleop_gains = {"scale_wx": 0.002}
+
+    config_path = gateway._resolve_recorder_config_path(state)
+
+    assert config_path != state.config_path
+    overlay = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert overlay["teleop"]["scale_wx"] == pytest.approx(0.002)
+    assert overlay["dataset"]["fps"] == 30
+
+
+def test_gain_overrides_compose_with_the_recording_fps_override(tmp_path):
+    import yaml
+
+    state = _gain_state(tmp_path, _workstation_teleop_gains())
+    state.runtime_teleop_gains = {"scale_wy": 0.002}
+
+    config_path = gateway._resolve_recorder_config_path(state, recording_fps=60)
+    overlay = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    assert overlay["dataset"]["fps"] == 60
+    assert overlay["teleop"]["scale_wy"] == pytest.approx(0.002)
+
+
+def test_parse_teleop_gain_overrides_accepts_the_shape_the_ui_sends():
+    parsed = gateway._parse_teleop_gain_overrides(
+        {"rotation_scale": "0.002", "scale_wx": -0.002, "scale_wy": 0, "scale_wz": None, "scale_x": ""}
+    )
+
+    assert parsed == {"rotation_scale": 0.002, "scale_wx": -0.002, "scale_wy": 0.0}
+    # None and "" mean "the UI is not expressing an opinion", not "set this to None": None is a
+    # meaningful config value (follow the global gain) and would be indistinguishable.
+    assert "scale_wz" not in parsed
+    assert "scale_x" not in parsed
+
+
+def test_parse_teleop_gain_overrides_rejects_what_would_hurt():
+    with pytest.raises(ValueError, match="Unknown teleop gain"):
+        gateway._parse_teleop_gain_overrides({"scale_ww": 0.001})
+    with pytest.raises(ValueError, match="must be a number"):
+        gateway._parse_teleop_gain_overrides({"scale_wx": "fast"})
+    with pytest.raises(ValueError, match="must be finite"):
+        gateway._parse_teleop_gain_overrides({"scale_wx": float("inf")})
+    with pytest.raises(ValueError, match="within"):
+        gateway._parse_teleop_gain_overrides({"translation_scale": 1.0})
+    # A zero global gain would silently kill all three of its axes rather than one.
+    with pytest.raises(ValueError, match="must be positive"):
+        gateway._parse_teleop_gain_overrides({"rotation_scale": 0})
+    with pytest.raises(ValueError, match="must be positive"):
+        gateway._parse_teleop_gain_overrides({"translation_scale": -0.000615})
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        gateway._parse_teleop_gain_overrides([("scale_wx", 0.001)])
+
+
+def test_an_empty_payload_is_the_reset(tmp_path):
+    assert gateway._parse_teleop_gain_overrides({}) == {}
+    state = _gain_state(tmp_path, _workstation_teleop_gains())
+    state.runtime_teleop_gains = gateway._parse_teleop_gain_overrides({})
+
+    assert gateway._effective_teleop_gains(state)["scale_wx"] == 0.0
+    assert gateway._fr3_real_teleop_command(state) == gateway._fr3_real_teleop_command(_gain_state(tmp_path, _workstation_teleop_gains()))
+
+
+def test_the_gains_payload_tells_the_ui_what_is_overridden(tmp_path):
+    state = _gain_state(tmp_path, _workstation_teleop_gains())
+    state.runtime_teleop_gains = {"scale_wx": 0.002}
+
+    payload = gateway._teleop_gains_payload(state)
+
+    assert payload["values"]["scale_wx"] == pytest.approx(0.002)
+    assert payload["configDefaults"]["scale_wx"] == 0.0
+    assert payload["overridden"] == ["scale_wx"]
+    assert payload["absMax"] == gateway.FR3_TELEOP_GAIN_ABS_MAX
+    assert payload["simDefaults"] == dict(gateway.FR3_SIM_TELEOP_GAIN_DEFAULTS)
+
+
+def test_the_mirrored_sim_gain_defaults_match_the_sim_script():
+    """`FR3_SIM_TELEOP_GAIN_DEFAULTS` exists so the UI can warn that MuJoCo teleop does not read the
+    recorder YAML. A copy that drifts would make that warning a lie, so read the parser's own
+    defaults out of the source text -- importing the module needs the whole lerobot stack.
+    """
+    import re
+
+    source = Path("tools/fr3/fr3_mujoco_runtime.py").read_text(encoding="utf-8")
+    for field_name, expected in gateway.FR3_SIM_TELEOP_GAIN_DEFAULTS.items():
+        flag = f"--{field_name.replace('_', '-')}"
+        match = re.search(
+            rf'parser\.add_argument\(\s*"{re.escape(flag)}",.*?default=([^,\)\s]+)',
+            source,
+            re.DOTALL,
+        )
+        assert match is not None, f"{flag} is no longer declared in fr3_mujoco_runtime.py"
+        raw = match.group(1)
+        actual = None if raw == "None" else float(raw)
+        assert actual == expected, (
+            f"{flag} defaults to {actual} in fr3_mujoco_runtime.py but the gateway shows {expected}; "
+            "the Teleoperation page would be describing a sim that no longer exists"
+        )
+
+
+def test_the_mirrored_axis_calibration_matches_the_teleoperator():
+    """An unset axis does not run at the global gain.
+
+    `SpaceMouseTeleopConfig` scales it by a per-axis calibration first, so the panel's "what this
+    axis will actually do" readout is wrong by 41% on z unless it knows the vector. Read out of the
+    teleoperator's source for the same reason as the sim defaults above: importing it needs the
+    whole lerobot stack, and a silently drifted copy turns a control the operator tunes against
+    into a number that means nothing.
+    """
+    import re
+
+    source = Path("src/lerobot/teleoperators/spacemouse/teleop_spacemouse.py").read_text(encoding="utf-8")
+    axes = {
+        "TRANSLATION_AXIS_CALIBRATION": ("scale_x", "scale_y", "scale_z"),
+        "ROTATION_AXIS_CALIBRATION": ("scale_wx", "scale_wy", "scale_wz"),
+    }
+    for constant, fields in axes.items():
+        match = re.search(rf"{constant}\s*=\s*np\.array\(\s*\[([^\]]+)\]", source, re.DOTALL)
+        assert match is not None, f"{constant} is no longer declared in teleop_spacemouse.py"
+        values = [float(part) for part in match.group(1).split(",") if part.strip()]
+        assert len(values) == 3, f"{constant} is no longer a 3-vector"
+        for field_name, expected in zip(fields, values, strict=True):
+            assert gateway.FR3_TELEOP_AXIS_CALIBRATION[field_name] == pytest.approx(expected, rel=1e-12), (
+                f"{constant} gives {field_name} a factor of {expected} but the gateway mirrors "
+                f"{gateway.FR3_TELEOP_AXIS_CALIBRATION[field_name]}; the SpaceMouse gains panel "
+                "would be quoting a speed the arm never moves at"
+            )
+
+
+def test_the_gains_payload_carries_the_axis_calibration(tmp_path):
+    """The frontend must not keep its own copy of a constant that lives in the teleoperator."""
+    state = _gain_state(tmp_path)
+
+    payload = gateway._teleop_gains_payload(state)
+
+    assert set(payload["axisCalibration"]) == set(gateway.FR3_TELEOP_AXIS_GAINS)
+    assert payload["axisCalibration"]["scale_x"] == 1.0
+    assert payload["axisCalibration"]["scale_z"] < 0.6

@@ -32,7 +32,12 @@ class FrankaResearch3MujocoConfig(RobotConfig):
 
     urdf_path: str = ""
     sim_xml_path: str = ""
-    target_frame_name: str = "pika_task_tcp"
+    # Same default as FrankaResearch3Config: this class calls itself that config's simulation
+    # twin, and twins whose tool frames sit 411.85 mm apart would put the sim and hardware
+    # datasets in different frames while every other field matched. Unreachable in practice --
+    # fr3_gui_record_runtime.py is the only construction site and it always passes the frame
+    # through from the robot config.
+    target_frame_name: str = "pika_gripper_ee"
     joint_names: list[str] = field(
         default_factory=lambda: [
             "fr3_joint1",

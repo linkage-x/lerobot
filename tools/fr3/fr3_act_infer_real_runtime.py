@@ -470,10 +470,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Show the policy input camera frames in one OpenCV window with camera-name labels.',
     )
     parser.add_argument(
+        '--move-to-das-start',
+        dest='move_to_das_start',
+        action='store_true',
+        help=(
+            'Move the arm to the DAS replay start joint configuration before inference. Off by '
+            'default: those joint angles belong to the DAS rig, and the start pose is not cosmetic '
+            '-- T_B_Ws is solved from the first observation against the dataset start pose, so it '
+            'places the whole trajectory in the workspace. Homing to a pose belonging to a '
+            'different rig silently offsets every target. Home with the pose the episodes were '
+            'recorded from instead: --robot-init-state, or the launcher own homing step.'
+        ),
+    )
+    parser.add_argument(
         '--no-move-to-das-start',
         dest='move_to_das_start',
         action='store_false',
-        help='Skip moving the arm to the DAS replay start joint configuration before inference.',
+        help='Now the default; accepted so existing launchers and configs keep working.',
     )
     parser.add_argument(
         '--no-align-gripper-to-dataset-start',
@@ -527,7 +540,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Maximum policy action-chunk target points to draw in the MuJoCo viewer.',
     )
     parser.set_defaults(
-        move_to_das_start=True,
+        move_to_das_start=False,
         align_gripper_to_dataset_start=True,
         corenetic_release_mode_on_disconnect=True,
     )
@@ -3086,7 +3099,7 @@ def run_inference(args: argparse.Namespace) -> int:
     )
 
     if robot_init_state is not None and args.move_to_das_start:
-        print('[INFO] robot_init_state is set; skipping default move_to_das_start startup motion.')
+        print('[INFO] robot_init_state is set; ignoring the explicit --move-to-das-start request.')
     else:
         move_to_das_start_if_requested(robot_ip=args.robot_ip, enabled=bool(args.move_to_das_start))
 

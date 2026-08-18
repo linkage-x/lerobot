@@ -211,10 +211,12 @@ There is no GUI entry point; rollout is a terminal step. `run_pick_place_infer_h
 here with environment variables, because three of its settings do not mean the same thing on this
 hardware:
 
-- **Tool frame.** The runtime defaults a Pika gripper to `pika_gripper_ee`; this rig records
-  against `pika_task_tcp` (`fr3_record_config.yaml`). Both are fixed frames on the same URDF, about
-  0.4 m apart. Left at the default, the rollout runs, tracks its targets, and is wrong by that
-  offset everywhere.
+- **Tool frame.** Two fixed frames on the same URDF, 411.85 mm apart with identical orientation.
+  Naming the wrong one does not fail: the rollout runs, tracks its targets, and is wrong by that
+  offset everywhere. The frame must follow the *checkpoint's dataset*, which is normally the same
+  thing as the record config — and is: both are `pika_gripper_ee` since the switch below. The two
+  only diverge if you train on episodes recorded before it, in which case export
+  `FR3_TARGET_FRAME_NAME=pika_task_tcp` for that rollout.
 - **Gripper units.** Here `gripper.pos` is a normalized 0..1 opening; on the Hikrobot rig the same
   column is a Pika width in millimetres. That script's `--gripper-close-below 70` would clamp every
   step of a normalized policy to fully closed.
@@ -231,17 +233,337 @@ such as `*.width_mm` the runtime still converts through `gripper_max_width_mm`.
 `FR3_GRIPPER_CLOSE_BELOW` is disabled by default in the workstation rollout launcher. Use it only
 as a deliberate task-specific binary close guard, not as a unit workaround.
 
-The script never uses `--move-to-das-start` — that homes to a joint configuration belonging to the
-DAS rig. `T_B_Ws` is solved from the first observation against the dataset's start pose, so the
-arm's start pose is what places the whole trajectory in the workspace: it has to be the pose the
-episodes were recorded from. The recording contract is the explicit `home` keyframe in
-`fr3_pika_gripper.xml`: `0 -0.785 0 -2.355 0 1.57079 0.785` for the arm joints.
+`--move-to-das-start` is now **off by default** in the runtime — it used to be on, and it homes to a
+joint configuration belonging to the DAS rig. `T_B_Ws` is solved from the first observation against
+the dataset's start pose, so the arm's start pose is what places the whole trajectory in the
+workspace: it has to be the pose the episodes were recorded from. The recording contract is the
+explicit `home` keyframe in `fr3_pika_gripper.xml`: `0 -0.785 0 -2.355 0 1.57079 0.785` for the arm
+joints, checked against the recorder's and the launcher's copies by
+`tests/robots/test_fr3_home_keyframe_contract.py`.
+
+The launchers still pass `--no-move-to-das-start` explicitly. That is now redundant, and kept so:
+the flag is what a reader greps for, and leaving it means the launcher does not silently change
+behaviour if the default is ever flipped back.
 
 Tuning knobs the host script ships values for — `n_action_steps`, ACT temporal ensembling, command
 EMA, controller gains — are left unset here. Those numbers were measured on the other rig's arm,
 tool and task; the checkpoint's and driver's own defaults are the honest baseline to tune away
 from. The MuJoCo replay gate is still the thing to clear first, but note what it does *not* cover:
 it scores the recorded EE stream through IK, never the policy's output.
+
+#### Which frame is the tool, really
+
+`pika_task_tcp` is documented in the URDF as "midpoint between the two finger working points". It
+is not. Measured against the finger meshes in the model's own `gripper_base` frame
+(`tests/robots/test_fr3_tool_frame_geometry.py`):
+
+| frame | position in `gripper_base` | distance to the finger working-point midpoint |
+| --- | --- | --- |
+| finger working-point midpoint | `(0.1883, 0, 0.0006)` | — |
+| `pika_gripper_ee` | `(0.185, 0, 0)` | **3.4 mm** |
+| `pika_task_tcp` | `(0, 0, 0.366842)` | **411.8 mm** |
+
+`pika_gripper_ee` is the tool point. `0.366842` is the fingertip reach measured in
+`quest3_pika_gripper_scene.xml` — a free-flying wrist frame whose `gripper_base` carries the pika
+mesh 0.1765 m up its own **+z**, so there the tool axis is +z and `0.366842` lands on the far
+finger's furthest vertex (measured `0.366492`, 0.35 mm out). Not micron-exact — that scene's two
+jaws are not mirror-symmetric about the frame, reaching `0.354676` and `0.366492` — but unambiguous
+about which frame it was taken in.
+In the arm-mounted model `gripper_base` *is* the pika mesh frame and the tool axis is **+x**, so the
+same literal points across the gripper instead of along it. The 45° z-rotation that travelled with
+it was already recognised as frame-dependent and removed; the translation is from the same source
+and was not.
+
+`pika_task_tcp` is what this rig recorded against until the switch below, and it is a *rigid*
+frame — so recording, MuJoCo replay and rollout stayed mutually consistent as long as all three
+named it, and the episodes collected under it are not garbage. Do not "fix" the URDF: that silently
+reinterprets every episode already collected, in either frame. What the 0.41 m lever cost, measured
+at the `home` keyframe:
+
+- **Rotation leaks into translation.** `fr3_joint7` is the tool roll axis: +1° moves the real tool
+  **0.03 mm** and moves `pika_task_tcp` **6.43 mm**. Teleop and encoder jitter about that axis
+  enters `observation.state` as translation the policy has to learn to ignore.
+- **The step clamps are looser than they read.** They bound the *target frame*, so the rotation
+  allowance buys extra tool motion through the lever: `--max-step-*` at 3 mm / 2° permits up to
+  **17.3 mm** at the tool, and `--first-frame-max-*` at 20 mm / 8° permits up to **77.4 mm**.
+- **`workspace_min`/`workspace_max` do not bound the tool**, only the offset frame. This is the
+  one the switch below actually fixes rather than merely shrinks: the box is now derived from the
+  tabletop and applies to the fingertips.
+
+#### The switch to `pika_gripper_ee` — applied
+
+**Applied, for a task that reorients the tool.** `fr3_record_config.yaml` now records against
+`pika_gripper_ee`, `workspace_min`/`workspace_max` are declared there and re-derived at the tool
+point, and `scale_wx`/`scale_wy` are no longer held at zero. The three are guarded together by
+`tests/robots/test_fr3_recording_workspace_contract.py`, which fails if any one of them moves
+without the others — including a revert, which the home-clearance check catches on its own.
+
+The measurement further down said the lever was *dormant* for pick-and-place — 0.62 mm p95 per step
+against a 3.9 mm real tool step, 1.02x path inflation — and on that evidence switching bought that
+task nothing. A task that reorients the tool is a categorically different case, worked out under "A
+task that reorients the tool" below: there the lever is not noise, it is where the command pivots.
+
+What the switch deliberately does **not** do: it does not touch a recorded episode. Datasets
+collected before it are anchored to `pika_task_tcp` and are neither replayable nor trainable against
+this config until they are converted (exact recipe at the end of this section).
+
+Everything that *launches* something did move with it, including the rollout launcher. That one is
+normally the exception — a rollout has to meet the frame its checkpoint was trained in, not the
+frame the recorder happens to use today — but nothing had been trained when the switch happened
+(no `outputs/train` on either machine), so there was no checkpoint for the old default to protect.
+The exception reappears the moment someone trains on pre-switch episodes; `FR3_TARGET_FRAME_NAME`
+is the escape hatch and the launcher's own comment says so.
+
+**Why you would switch.** `pika_gripper_ee` *is* the tool point, and the real-robot config class
+already defaults to it (`config_franka_research3.py`) — only this rig's YAML overrides it. In its
+favour:
+
+- Rotation stops leaking into translation. The processor rotates the target about *its own origin*,
+  so today a pure reorientation swings the fingertips through an arc of radius 0.41 m; teleop and
+  encoder jitter about the roll axis enter `observation.state` as translation the policy has to
+  learn to ignore (`fr3_joint7`: +1° = 0.03 mm at the tool, 6.43 mm at `pika_task_tcp`).
+- Every safety number starts bounding the thing it names — the clamps, the workspace box, and the
+  rollout's first-frame and per-step gates all stop being ~5–6x looser at the tool than they read.
+- The recorded state becomes physically interpretable: "where the fingers are", not "where a point
+  0.41 m past the fingers is".
+
+**What it costs.** For pick-and-place alone none of this would have been worth paying:
+
+- Part of it is a hardware-in-the-loop re-tune, not a config edit. The teleop gains were tuned with
+  the lever present and cannot be re-tuned from a text editor.
+- Operators have to relearn the feel: rotation used to drag the tool through an arc, and now it
+  does not.
+- Every dataset that is not migrated is unmixable with the new ones — a lasting split in the corpus
+  for as long as both exist. This is the real price, and it is why the switch had to happen *before*
+  the rotation task was recorded rather than after.
+- **Measured on pick-and-place, it buys almost nothing.** The cost scales with the lever *times the
+  rotation actually used*, and that task barely rotates the wrist. See below.
+
+**What changed together.** `target_frame_name` reaches further than the recorder, and everything
+that names it has to agree — a dataset recorded in one frame and replayed or rolled out in another
+is wrong by 411 mm everywhere, with no error message:
+
+| where | value | note |
+| --- | --- | --- |
+| `fr3_record_config.yaml` `target_frame_name` | **`pika_gripper_ee`** | changed. The recorder, real teleop, sim teleop and both replay paths all read this one key |
+| `fr3_record_config.yaml` `workspace_min`/`max` | **`[0.18, -0.45, 0]`–`[0.70, 0.45, 0.70]`** | added. It was falling through to `FrankaResearch3Config`'s `(0.2,-0.6,0.05)`–`(0.9,0.6,0.8)`, which was never derived for this rig and, at the tool point, describes a region 411 mm from where it reads |
+| `fr3_record_config.yaml` `scale_wx`/`scale_wy` | **removed** | changed. Roll and pitch follow `rotation_scale` like every other axis; they were pinned to `0.0` only because of the lever |
+| `run_pick_place_infer_workstation.sh:46` | **`pika_gripper_ee`** | changed. The rollout frame must match the *checkpoint's* dataset, so this default only moved because there was nothing to protect: no `outputs/train` exists on either machine, so no checkpoint predates the switch. Export `FR3_TARGET_FRAME_NAME=pika_task_tcp` if one is ever trained on pre-switch episodes |
+| gateway sim-teleop, real-replay, and both status panels | *from config* | follows automatically through `_fr3_target_frame_name()`. The replay page and the idle teleop status used to print `pika_task_tcp` as a literal / a stale dataclass default; both now report the configured frame, so the label an operator reads before pressing Run comes from where the command does |
+| `gateway._fr3_target_frame_name` fallback | **`pika_gripper_ee`** | changed. Only reached by a config that omits the key, which the workstation's does not — but the recorder would build its robot from `FrankaResearch3Config`, whose default is `pika_gripper_ee`, so a `pika_task_tcp` fallback here meant recording in one frame while telling the sim teleop and the replay another. Now pinned to the dataclass rather than to a literal |
+| `fr3_gui_record_runtime.py:400` | fallback `pika_task_tcp` | fallback only, and the record config now sets the key explicitly |
+| `config_franka_research3_mujoco.py:35`, `envs/fr3_mujoco.py:58` | `pika_task_tcp` | library defaults for a bare CLI run. Every GUI path passes the frame explicitly, so these never apply to this rig; left alone because they are shared with the quest3 and RL envs |
+
+**What was re-derived, and what is still yours to tune.** Every one of these is stated against the
+target frame, so the switch re-aims it onto the real tool without anyone editing a number.
+
+*The workspace box — re-derived.* It clips `desired_pose[:3, 3]`, the target frame origin, so at
+`pika_task_tcp` it fenced a point 411 mm behind the fingers and could not stop the fingers hitting
+anything. At `pika_gripper_ee` it can, so it is now derived from the thing it is protecting. The
+workstation table in `fr3_pika_gripper_scene.xml` sits at base-frame x `[0.18, 0.86]`,
+y `[-0.46, 0.46]`, with its top at exactly **z = 0**:
+
+| | old, at `pika_task_tcp` | new, at `pika_gripper_ee` | where it comes from |
+| --- | --- | --- | --- |
+| x | `0.2` … `0.9` | **`0.18` … `0.70`** | the table's near edge; far edge trimmed so most of the box is inside the FR3's 855 mm reach |
+| y | `-0.6` … `0.6` | **`-0.45` … `0.45`** | the table's own width, less 10 mm |
+| z | `0.05` … `0.8` | **`0.0` … `0.70`** | the tabletop. The fingertips can no longer be commanded into the surface |
+
+`home` puts the tool point at base-frame `(0.309, -0.001, 0.398)`, clearing every wall by at least
+129 mm, and the 11 600 recorded pick-and-place frames re-expressed at the tool point span
+x `[0.264, 0.464]`, y `[-0.355, 0.122]`, z `[0.028, 0.397]` — the whole existing task fits inside
+with margin, so the fence is not what will stop a new one either. Two of the box's eight corners
+(far, high) are outside the arm's reach; no axis-aligned box that covers this table avoids that, and
+an unreachable command fails loudly in IK rather than silently.
+
+*The per-step clamps — unchanged, and the reason is measurement, not luck.* The geometric worst case
+says a step used to allow 1 mm of translation plus 0.01 rad of rotation, which the lever turned into
+~5 mm at the fingers, and that the same clamps now allow 1 mm — a 5x tightening that ought to feel
+abruptly rate-limited. It does not, because neither clamp was ever reached: at full SpaceMouse
+deflection the shipped gains produce at most 0.615 mm and 0.000648 rad per tick, **1.6x and 15x
+below** the clamps. What actually changed is that the clamps became honest — 1 mm/step is now 1 mm of fingertip
+motion — and the arm got safer, not slower.
+
+*The teleop gains — yours, on hardware.* `translation_scale` / `rotation_scale` were tuned with the
+lever present, and `rotation_scale` in particular was tuned for an axis whose two siblings were
+switched off. Tune them from **Teleoperation → SpaceMouse 6D Gains** (next section) and write what
+you settle on back into the YAML. One interaction worth knowing before you turn the knob:
+`max_target_delta_pos` is 0.001, so a `translation_scale` above `0.001` starts being clipped on x
+rather than scaled — 0.002 buys 1.63x there, not 2x — while y and z, which the device calibration
+scales to 94% and 59%, keep going for a while longer and the motion skews.
+`max_target_delta_rot` is 0.01, which is also the panel's cap, so rotation has headroom over its
+whole range.
+
+*The rollout gates — untouched, and now due for a look.* `--max-step-*` / `--first-frame-max-*` are
+stated against the target frame, so they were ~6x looser at the tool than they read for as long as
+the rollout ran in `pika_task_tcp`. With the launcher's default moved they are honest — and
+therefore tighter in practice. Nothing has been trained yet, so nothing has been measured against
+them; re-check them against the first post-switch rollout rather than assuming the old numbers
+transfer.
+
+**What the recorded episodes actually say.** The bullets above are the geometry's worst case. The
+lever only injects error when the wrist turns, so the question is how much this task turns it.
+Measured on the recorded `observation.state` of both corpora on the workstation —
+`fr3_pick_place_ee2ee_v1_merged_20260611_20260612` (50 episodes / 20 999 frames) and
+`merged_fr3_pick_place_data_260316` (51 / 15 305) — by re-expressing every frame in
+`pika_gripper_ee` through `p_ee = p_tcp + R(q) @ d` and comparing the two streams:
+
+| | merged_20260611_20260612 | merged_260316 |
+| --- | --- | --- |
+| wrist rotation from episode start, median / max | **4.3° / 11.7°** | 5.9° / 11.2° |
+| episode path length, `pika_task_tcp` vs `pika_gripper_ee` | 0.810 m vs 0.795 m (**1.02x**) | 0.774 m vs 0.763 m (1.02x) |
+| per-step translation injected by the lever, p95 | **0.62 mm** | 1.09 mm |
+| … as a fraction of the real tool's median step | **0.08** | 0.13 |
+| steps where the tool is still (<0.2 mm) but `pika_task_tcp` is not | 27.1% of frames, p95 **0.11 mm** | 8.7%, p95 0.24 mm |
+
+The 0.41 m lever is real but dormant: 4° of wrist motion cannot swing it far. The rotation the
+teleop actually commands is ~0.086°/step (0.62 mm ÷ 411 mm), **6.6x below** the
+`max_target_delta_rot` of 0.01 rad — so the clamp being ~5x looser at the tool than it reads never
+binds either. All three metrics are invariant to which fixed frame the episodes are expressed in
+(a rigid re-framing rotates `Δ(R @ d)` without changing its norm), so they hold regardless of
+whether the recorded columns are base-frame or workspace-frame.
+
+The trigger to revisit was a *task* change, not a code change: a task with real reorientation —
+in-hand regrasp, pouring, inserting at an angle, anything swinging the wrist through tens of
+degrees — moves these numbers by the ratio of the rotation used, and at 40° the injected motion is
+an order of magnitude larger than what is measured here. That is what happened, and the next section
+is why the rotation case does not reduce to scaling this table up.
+
+Re-run this measurement on the first post-switch corpus before trusting it: every number here was
+taken on episodes whose wrist barely moved, which is exactly the regime the rotation task leaves.
+
+**A task that reorients the tool.** The measurement above says the lever is dormant, not that it is
+harmless — it is dormant because pick-and-place turns the wrist a median of 4.3°. The reason it
+matters so much more for a rotation task is not noise; it is where the command pivots.
+`franka_research3.py:782` composes the target as
+
+```python
+desired_pose[:3, :3] = self._reference_pose[:3, :3] @ delta_rot.as_matrix()
+desired_pose[:3, 3]  = self._reference_pose[:3, 3] + delta_pos
+```
+
+The rotation multiplies the rotation block alone, so a pure rotation command holds the *target
+frame origin* fixed and swings everything else around it. With the target frame 411 mm behind the
+fingers, "rotate the gripper" means "sweep the fingers along an arc of radius 0.41 m":
+
+| commanded rotation | fingertip arc, `pika_task_tcp` | fingertip arc, `pika_gripper_ee` |
+| --- | --- | --- |
+| 5° | 36 mm | 0.3 mm |
+| 15° | 107 mm | 0.9 mm |
+| 30° | 213 mm | 1.8 mm |
+| 45° | 314 mm | 2.6 mm |
+| 90° | 581 mm | 4.8 mm |
+
+(Chord `2 R sin(θ/2)`; the right column uses the 3.4 mm residual between `pika_gripper_ee` and the
+measured finger working-point midpoint.) A 90° reorientation alone sweeps 581 mm through a
+workspace box only 700 mm wide in x, so it clipped before it completed. To turn an object *in place*
+the operator has to push translation to cancel a two-to-three-hundred-millimetre arc at the same
+time, by hand, continuously — and the policy then has to learn that compensation as if it were part
+of the task. This is almost certainly why `scale_wx` and `scale_wy` *were* pinned to `0.0` in
+`fr3_record_config.yaml`, and why all three rotation axes are still zeroed in the sim teleop's own
+flag defaults: roll and pitch are not usable from that frame. Switching the frame is what makes them
+usable, and the pins are gone as of the switch above.
+
+The ordering for a rotation task is therefore: switch the frame, re-derive the box, unpin the
+rotation axes, confirm the teleop feel on hardware with roll and pitch live, and only then record.
+The first three are done and committed; the fourth is a hardware session and has not happened yet.
+Recording before it would produce exactly the corpus split the next paragraph warns about.
+
+**Existing datasets do not have to be thrown away.** The two frames share an orientation exactly,
+so their separation expressed in the *tool* frame — the frame the recorded rotvec columns describe
+— is a rigid constant, independent of arm configuration
+(`test_fr3_tool_frame_geometry.py::test_the_offset_is_the_same_constant_in_the_tool_frame_for_every_configuration`):
+
+```
+d = (-0.366842, 0, 0.185)   metres, in the tool frame
+p_ee = p_tcp + R(rotvec) @ d
+```
+
+That converts a `pika_task_tcp` episode into a `pika_gripper_ee` one exactly. Rotations, gripper and
+images are frame-independent and stay untouched. Three details decide whether a migration script is
+right or merely plausible:
+
+- **Three position triplets, each with its own rotation.** The recorded schema is
+  `observation.state = [ee.xyz, prev_cmd.ee.xyz, ee.q, prev_cmd.ee.q, gripper.pos,
+  prev_cmd.gripper.pos]` and `action = [ee.xyz, ee.q, gripper.pos]`. So `ee.xyz` converts with
+  `ee.q`, `prev_cmd.ee.xyz` with **`prev_cmd.ee.q`**, and the action's `ee.xyz` with the action's
+  own `ee.q`. Reusing `ee.q` for the commanded pose is the obvious slip and it is wrong by the
+  measured-to-commanded rotation difference — small, never zero, and silent. (The action columns are
+  absolute poses named `ee.*`; `target_*` is the teleop runtime's delta naming in
+  `delta_action_processor.py` and never reaches a parquet.)
+- **Recompute the statistics; do not transform them.** `meta/stats.json` and the per-episode
+  `stats/observation.state/*` and `stats/action/*` columns in `meta/episodes/*.parquet` carry
+  min/max/mean/std/count and q01…q99, and today they are `pika_task_tcp` numbers (state mean x =
+  0.7145 on `fr3_spacemouse_20260813_160401`). The conversion is nonlinear in `q`, so no closed form
+  maps the old quantiles to the new ones. `fr3_train_il_policy.py` rebuilds
+  `observation.state`/`action` stats from the data when it materialises a training view, so the
+  training path is covered either way — but anything reading the source dataset's stats directly is
+  not.
+- **Nothing in the dataset says which frame it is in.** `ee.x` is `ee.x` in both. A migrated and an
+  unmigrated copy are indistinguishable by schema, which is why the rename below is not cosmetic.
+
+What you must *not* do is mix the two frames in one training set — that trains on two different
+robots — so migrate the whole set or none of it, and rename the dataset series so the two can never
+be globbed together.
+
+**Two ways to check a migration instead of trusting it.** `fr3_sim_record_replay_runtime.py`
+already identifies the frame from the data: it solves the first recorded pose against both bodies
+and prints `pos diff to pika_gripper_ee` / `pos diff to pika_task_tcp` before picking the closer
+one. On a correctly migrated episode the `pika_gripper_ee` diff collapses and the `pika_task_tcp`
+one goes to ~411 mm; if both stay large, the conversion is wrong in a way arithmetic review would
+not have caught. Then run the MuJoCo replay gate on one migrated episode before any hardware
+replay — scoring the recorded stream through IK is exactly what it is for, and a 411 mm frame error
+is the loudest thing it can possibly report.
+
+Until they are migrated, the pre-switch datasets are **not safe to replay against this config**.
+Replay reads recorded poses and commands them; with the config naming `pika_gripper_ee` and the
+poses recorded at `pika_task_tcp`, the arm puts the fingertips where the old frame's origin was —
+411 mm off, running to completion without an error. Either convert the dataset, or replay it
+against an overlay config that names the old frame. The Episode Replay page prints the frame the
+gateway will actually use, next to the dataset it will use it on; read them together.
+
+### SpaceMouse gains from the Teleoperation page
+
+The six-axis gains that map the SpaceMouse onto the tool are editable in the GUI under
+**Teleoperation → SpaceMouse 6D Gains**, because they can only be tuned with a hand on the device
+and an arm in front of you. The panel edits the same eight fields the config declares:
+`translation_scale` and `rotation_scale` are the global gains, and `scale_x` … `scale_wz` override
+them one axis at a time.
+
+- **Blank is not zero.** An empty per-axis field means "follow the global gain"; a `0` disables that
+  axis. `fr3_record_config.yaml` now ships all six axes blank, so all six follow the two globals; it
+  used to pin `scale_wx: 0.0` and `scale_wy: 0.0`, which left yaw as the only live rotation axis.
+  The sim teleop still zeroes all three — the panel shows both columns for exactly this reason.
+- **Blank is not the global gain either.** A blank axis follows the global *times* the device's own
+  per-axis calibration (`TRANSLATION_AXIS_CALIBRATION` / `ROTATION_AXIS_CALIBRATION` in
+  `teleop_spacemouse.py`): `x1.00 / x0.94 / x0.59` on translation and `x1.00 / x0.95 / x0.93` on
+  rotation. A *filled* axis replaces the calibrated value instead of scaling it, so typing the
+  global's own number into z speeds that axis up 1.7x rather than changing nothing. The panel prints
+  each row's factor and resolves both cases in its m/s / rad/s readout; the factors are mirrored from
+  the teleoperator and pinned by
+  `test_the_mirrored_axis_calibration_matches_the_teleoperator`.
+- **Untouched means unchanged.** With no override the rig launches byte-for-byte as before: real
+  teleop and the recorder get the literal config file, and the sim teleop gets no gain flags at all.
+- **An override reaches teleop *and* recording.** The same teleoperator drives both, so a session
+  tuned at one gain and recorded at another would put demonstrations in the dataset that nobody
+  ever felt. Real teleop is spawned against an overlay config
+  (`outputs/.teleop_gains_config.yaml`), the recorder against its own overlay, and the sim teleop
+  gets matching CLI flags.
+- **It applies on the next start.** The teleoperator reads its gains once, when it connects; a
+  running session keeps the ones it started with.
+- **It never writes the YAML.** `fr3_record_config.yaml` defines the recording contract; a session
+  of live experimenting should not rewrite it. Once a gain is worth keeping, edit the file.
+- **Bounds.** Values are capped at ±0.01 per device tick. At the 200 Hz poll rate that is already
+  2 m/s or 2 rad/s at full deflection, so the cap catches a typo'd digit rather than constraining
+  tuning. The real per-step safety net is `robot.max_target_delta_pos` / `max_target_delta_rot`,
+  which clamp regardless of the gain that produced the command.
+
+Note that `tools/fr3/fr3_mujoco_teleop.py` does **not** read the recorder YAML — it carries its own
+flag defaults, and they differ from the hardware on every axis that matters: 3x the translation
+gain (`0.001845` vs `0.000615`) and all three rotation axes zeroed. Sim and hardware therefore do
+not feel alike until a gain is applied in the panel, which is sent to both. The gateway mirrors
+those sim defaults so the UI can say so, pinned to the parser by
+`tests/scripts/test_data_collection_gui_gateway.py::test_the_mirrored_sim_gain_defaults_match_the_sim_script`.
 
 ## Timestamp-synchronisation audit
 

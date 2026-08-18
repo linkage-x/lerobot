@@ -4,7 +4,17 @@ robot:
   gripper_port: /dev/serial/by-path/pci-0000:00:14.0-usb-0:9.1.4:1.0-port0
   allow_mock_gripper: false
   urdf_path: /lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf
-  target_frame_name: pika_task_tcp
+  # The finger working-point midpoint. `pika_task_tcp` sits 411.85 mm behind it (a literal carried
+  # over from the free-flying quest3 wrist model, see test_fr3_tool_frame_geometry.py), which makes
+  # it a lever: `send_action` composes rotation about the *target frame origin*
+  # (franka_research3.py: desired_pose[:3,:3] = reference @ delta_rot), so a 45 deg wrist command
+  # swept the fingertips through a 314 mm arc -- which is why the roll/pitch teleop axes below used
+  # to be pinned to 0. Recording against the tool point makes rotation a rotation.
+  #
+  # Datasets recorded before this line changed are anchored to pika_task_tcp and are NOT replayable
+  # against this config. Convert them (p_ee = p_tcp + R(quat) @ [-0.366842, 0, 0.185]) or replay
+  # them with an overlay that names the old frame. See tools/fr3/WORKSTATION_RECORDING.md.
+  target_frame_name: pika_gripper_ee
   # Must match the `home` keyframe in
   # src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.xml.
   # The workstation recording workspace is anchored to this pose; do not use the DAS/SDK start
@@ -12,6 +22,19 @@ robot:
   start_joint_positions: [0, -0.785, 0, -2.355, 0, 1.57079, 0.785]
   max_target_delta_pos: [0.001, 0.001, 0.001]
   max_target_delta_rot: [0.01, 0.01, 0.01]
+  # A fence on the commanded tool point, in the robot base frame -- not a description of the task.
+  # Derived from the workstation table in fr3_pika_gripper_scene.xml, which sits at base-frame
+  # x [0.18, 0.86], y [-0.46, 0.46] with its top at exactly z = 0:
+  #   z >= 0      the fingertips are never commanded into the tabletop
+  #   x, y        the table's own footprint, trimmed to 0.70/0.45 so the reachable part of the box
+  #               dominates (FR3 reach is 855 mm from the base; the far-high corners of any box
+  #               that covers this table are unreachable and fail loudly in IK instead)
+  # The 11.6k recorded pick-and-place frames re-expressed at the tool point span
+  # x [0.264, 0.464], y [-0.355, 0.122], z [0.028, 0.397], so the whole existing task fits inside
+  # with margin. Widen it here if a new task needs more; do not silently rely on the dataclass
+  # default, which was written for pika_task_tcp and is meaningless at the tool point.
+  workspace_min: [0.18, -0.45, 0.0]
+  workspace_max: [0.70, 0.45, 0.70]
   camera_max_age_ms: 100
   # See config_franka_research3.py: 20 rather than 15 is set by the sim twin's EGL renderer
   # (measured straggling 19 ms), and kept identical here so one envelope covers both rigs.
@@ -44,9 +67,14 @@ teleop:
   move_time: 0.02
   enable_rotation: true
   translation_scale: 0.000615
+  # All six axes follow the two globals. scale_wx/scale_wy used to be pinned to 0 because roll and
+  # pitch about pika_task_tcp threw the fingertips through a 0.41 m arc; at the tool point they are
+  # ordinary axes. 0.000648 rad/tick at control_fps 200 is 7.4 deg/s on roll at full deflection --
+  # a deliberately slow starting point. (Pitch and yaw land 5-8% under that: the teleoperator scales
+  # a global gain by ROTATION_AXIS_CALIBRATION, and TRANSLATION_AXIS_CALIBRATION takes z down to
+  # 59%. An explicitly set axis skips that factor.) Tune live from Teleoperation -> SpaceMouse 6D
+  # Gains and write the value you settle on back here.
   rotation_scale: 0.000648
-  scale_wx: 0.0
-  scale_wy: 0.0
 
 dataset:
   # Names the rig and how it is driven, nothing else. The task belongs to the episode
