@@ -3,7 +3,7 @@ import type { GuiSnapshot } from "../api";
 import type { BoxPreviewPayload, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
 import { api } from "../apiClient";
-import { TouchHeatmapGrid, numberArray, touchLayoutForCount, touchSampleActivePoints, touchSampleHasShear, touchSampleLocalMax, touchScaleFromSamples } from "../touchVisualization";
+import { TouchHeatmapGrid, numberArray, touchLayoutForSample, touchSampleActivePoints, touchSampleHasShear, touchSampleLocalMax, touchScaleFromSamples } from "../touchVisualization";
 
 export function numberValue(value: unknown): number | null {
   const numeric = Number(value);
@@ -15,12 +15,16 @@ export function DeviceTouchPreview({ sensor }: { sensor?: Record<string, unknown
     fz: numberArray(sensor?.fz_0p1N),
     fx: numberArray(sensor?.fx_0p1N),
     fy: numberArray(sensor?.fy_0p1N),
+    // box_client tags each frame with the pad it came from; the layout follows
+    // that rather than the array length, which the SDK fixes at 239 regardless.
+    model: typeof sensor?.model === "string" ? sensor.model : undefined,
+    points: typeof sensor?.points === "number" ? sensor.points : undefined,
   };
   const hasData = sample.fz.length > 0;
   const scale = touchScaleFromSamples([sample]);
   const localMax = hasData ? touchSampleLocalMax(sample) : 0;
   const activePoints = touchSampleActivePoints(sample);
-  const layout = hasData ? touchLayoutForCount(sample.fz.length) : null;
+  const layout = touchLayoutForSample(sample);
   const hasShear = touchSampleHasShear(sample);
 
   return (
@@ -159,19 +163,25 @@ export function BoxTouchTileView({ sensor }: { sensor?: Record<string, unknown> 
     fz: numberArray(sensor?.fz_0p1N),
     fx: numberArray(sensor?.fx_0p1N),
     fy: numberArray(sensor?.fy_0p1N),
+    model: typeof sensor?.model === "string" ? sensor.model : undefined,
+    points: typeof sensor?.points === "number" ? sensor.points : undefined,
   };
   if (sample.fz.length === 0) {
     return <div className="camera-tile-empty">no touch sample</div>;
   }
   const scale = touchScaleFromSamples([sample]);
+  const layout = touchLayoutForSample(sample);
   return (
-    <TouchHeatmapGrid
-      sample={sample}
-      scale={scale}
-      ariaLabel="live tactile preview"
-      className="box-touch-fill"
-      emptyText="no touch sample"
-    />
+    <div className="box-touch-view">
+      <TouchHeatmapGrid
+        sample={sample}
+        scale={scale}
+        ariaLabel="live tactile preview"
+        className="box-touch-fill"
+        emptyText="no touch sample"
+      />
+      {layout ? <div className="box-touch-legend">{layout.label}</div> : null}
+    </div>
   );
 }
 

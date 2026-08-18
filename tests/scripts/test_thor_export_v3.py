@@ -573,3 +573,69 @@ def test_align_box_by_frame_index_no_timestamps_when_ts_width_zero():
         box_rows, n_frames=2, state_width=1, ts_width=0
     )
     assert ts is None
+
+
+# ---------------------------------------------------------- touch geometry ---
+
+
+def _write_touch_jsonl(ep_dir: Path, *, points: int, tagged: bool) -> None:
+    ep_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for sid in ("box0/box_touch_left", "box0/box_touch_right"):
+        data = {"timestamp": 1, "fz_0p1N": [0] * points, "fx_0p1N": [0] * points, "fy_0p1N": [0] * points}
+        if tagged:
+            data["model"] = "m2020" if points == 9 else "paxini_l5325"
+            data["points"] = points
+        rows.append({"sid": sid, "t_rel_s": 0.0, "data": data})
+    with (ep_dir / "box_sensors.jsonl").open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def test_detect_touch_width_reads_the_pad_actually_recorded(tmp_path):
+    # The parquet touch columns are fixed-size lists, so the export has to know
+    # the taxel count before it opens the writer. The BOX SDK's 239-slot array
+    # is not that count -- an M2020 pad reports 9.
+    m2020_ep = tmp_path / "m2020" / "episodes" / "episode_000000"
+    _write_touch_jsonl(m2020_ep, points=9, tagged=True)
+    assert export_v3._detect_touch_width([m2020_ep]) == 9
+
+    # Frames archived before the tag existed fall back to the array length.
+    legacy_ep = tmp_path / "legacy" / "episodes" / "episode_000000"
+    _write_touch_jsonl(legacy_ep, points=239, tagged=False)
+    assert export_v3._detect_touch_width([legacy_ep]) == 239
+
+    untagged_m2020 = tmp_path / "untagged" / "episodes" / "episode_000000"
+    _write_touch_jsonl(untagged_m2020, points=9, tagged=False)
+    assert export_v3._detect_touch_width([untagged_m2020]) == 9
+
+    # No touch archive at all keeps the legacy default rather than failing.
+    empty_ep = tmp_path / "empty" / "episodes" / "episode_000000"
+    empty_ep.mkdir(parents=True)
+    assert export_v3._detect_touch_width([empty_ep]) == export_v3._TOUCH_SAMPLE_WIDTH_DEFAULT
+
+
+def test_detect_touch_width_reports_a_pad_swap_mid_collection(tmp_path, capsys):
+    m2020_ep = tmp_path / "a" / "episodes" / "episode_000000"
+    paxini_ep = tmp_path / "b" / "episodes" / "episode_000000"
+    _write_touch_jsonl(m2020_ep, points=9, tagged=True)
+    _write_touch_jsonl(paxini_ep, points=239, tagged=True)
+
+    # Widest wins so nothing is truncated away, and the mismatch is said out
+    # loud instead of silently zero-padding half the set.
+    assert export_v3._detect_touch_width([m2020_ep, paxini_ep]) == 239
+    out = capsys.readouterr().out
+    assert "disagree on touch taxel count" in out
+    assert "9 taxels" in out and "239 taxels" in out
+
+
+def test_align_touch_rows_keeps_the_detected_width(tmp_path):
+    ep_dir = tmp_path / "s" / "episodes" / "episode_000000"
+    _write_touch_jsonl(ep_dir, points=9, tagged=True)
+
+    rows, saw = export_v3._align_touch_rows(ep_dir, 3, 30, width=9)
+
+    assert saw is True
+    for column, _, _ in export_v3._TOUCH_ARRAY_COLUMNS:
+        assert len(rows[column]) == 3
+        assert all(len(row) == 9 for row in rows[column])

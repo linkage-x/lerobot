@@ -164,11 +164,12 @@ for sid, ts in sensor_timestamps.items():
 | 六维力 | 199 Hz | ~1998 |
 | Gripper | 199 Hz | ~1998 |
 | Trigger | 199 Hz | ~1998 |
-| Touch L | **50 Hz** | ~500 |
-| Touch R | 50 Hz | ~500 |
+| Touch L | **50 Hz**（Paxini）/ **60 Hz**（M2020） | ~500 / ~600 |
+| Touch R | 50 Hz（Paxini）/ 60 Hz（M2020） | ~500 / ~600 |
 
-> 频率为 2026-06-15 真机实测（左右触觉垫**均为 50Hz**——早期文档误记 Touch L 为 200Hz）。
-> 这影响最近邻对齐误差：touch 在 50Hz 下为 ±10ms（而非 200Hz 的 ±2.5ms）。
+> 频率为 2026-06-15 真机实测（Paxini 左右触觉垫**均为 50Hz**——早期文档误记 Touch L 为 200Hz）；
+> 2026-08-17 换 M2020 后实测左右均为 **60Hz**（link stats `device_hz`/`measured_hz` 与 `sensor_status.observed_hz` 一致），见 §9.3。
+> 这影响最近邻对齐误差：touch 在 50Hz 下为 ±10ms、60Hz 下为 ±8.3ms（而非 200Hz 的 ±2.5ms）。
 
 ### 数据持久化
 
@@ -472,7 +473,7 @@ Episode Replay 不能把多个 `<video>` 元素当成天然同步：浏览器 vi
 
 录制器（`thor_lerobot_v3.py`）写的是 **box/state 最小 v3** parquet（数值特征 + 时间戳元数据）；相机原始文件仍并排存在每个 episode 目录里：`cam_*.mkv`、`cam_*.argus_frame_metadata.csv`、`online_sync_manifest.json`。离线 `export_v3.py` 再把相机转码并合并出带 `observation.images.*` 的训练数据集。
 
-`export_v3` **不重做** box↔相机的 state 同步（那一步已在录制 Stop 时完成，见 §6 开头「同步时机」）；它只把录制器已同步好的 box state 挂到权威相机网格上。相机网格：online-sync 数据使用 `logical_frame_index / fps`，legacy splitmux 数据使用 `pts_offset + N/fps`。box state 复用录制器已对齐的 session parquet，**按 `frame_index`（而非列表位置）** 配相机帧（box 网格比相机视频长的尾部丢弃、短的 carry-forward）；**无可用 session parquet 时直接跳过该 episode**（不再从 `box_sensors.jsonl` 在 export 内重做 L3b —— 该 raw 重对齐路径已于 2026-07-13 移除，见下方更新记录）。export 另外从 `box_sensors.jsonl` 重采样**触觉全阵列**（239 维 taxel）到帧网格，这是 export 才做的对齐（`_align_touch_rows`）。每集输出 `timestamp` 重基到 `i/fps` 以匹配重锚定的逐集视频。代码见 `export_v3._align_box_rows_by_frame_index`（state）/ `_align_touch_rows`（触觉阵列）。
+`export_v3` **不重做** box↔相机的 state 同步（那一步已在录制 Stop 时完成，见 §6 开头「同步时机」）；它只把录制器已同步好的 box state 挂到权威相机网格上。相机网格：online-sync 数据使用 `logical_frame_index / fps`，legacy splitmux 数据使用 `pts_offset + N/fps`。box state 复用录制器已对齐的 session parquet，**按 `frame_index`（而非列表位置）** 配相机帧（box 网格比相机视频长的尾部丢弃、短的 carry-forward）；**无可用 session parquet 时直接跳过该 episode**（不再从 `box_sensors.jsonl` 在 export 内重做 L3b —— 该 raw 重对齐路径已于 2026-07-13 移除，见下方更新记录）。export 另外从 `box_sensors.jsonl` 重采样**触觉全阵列**（taxel 维数按贴片型号，见 §9.3）到帧网格，这是 export 才做的对齐（`_align_touch_rows`）。每集输出 `timestamp` 重基到 `i/fps` 以匹配重锚定的逐集视频。代码见 `export_v3._align_box_rows_by_frame_index`（state）/ `_align_touch_rows`（触觉阵列）。
 
 ### 9.1 `observation.state` / `action`（float32，**28** 维）
 
@@ -484,7 +485,7 @@ Episode Replay 不能把多个 `<video>` 元素当成天然同步：浏览器 vi
 | trigger | `box_trigger.travel_pct` | 1 |
 | IMU | `acc_{x,y,z}_g` / `gyr_{x,y,z}_deg_s` / `quat_{x,y,z,w}` | 10（姿态只留四元数，**xyzw 标量在后**，见 §9.1.1） |
 | 六维力 | `box_six_d_force.{fx,fy,fz,mx,my,mz}` | 6 |
-| 触觉 L/R | 各 `mean_f{x,y,z}_0p1N` / `max_abs_fz_0p1N` / `active_points`（239 点聚合） | 5+5 |
+| 触觉 L/R | 各 `mean_f{x,y,z}_0p1N` / `max_abs_fz_0p1N` / `active_points`（**按贴片实际触点数**聚合，见 §9.3） | 5+5 |
 
 > 演进：42 维（含重复 `gripper.pos`、7 个 `*.timestamp`、恒定死通道 `box_status.{valid,liwp_index}`）
 > → 33 维（去重 gripper + 时间戳移出, 见 §9.2）→ 31 维（再删掉恒为常量的 `box_status.valid`(恒 1)
@@ -567,14 +568,34 @@ mcu_ts 冗余，已移除（liwp 是包级时间戳，对齐用 per-sensor 更�
 - CSV：SDK `.so` 另会向 CWD 写 `box_sensor_data_*.csv`，`BoxClient.stop()` 会清理本会话的
   （见 `box_sdk/TROUBLESHOOTING.md` §7，待 SDK 加关闭开关）。
 
-### 9.3 真机验证状态
+### 9.3 触觉贴片型号与触点数（2026-08-17）
+
+BOX SDK 对**所有**触觉贴片都用同一个 239 槽定长数组 `TouchSensor.forces` 承载 —— 这是旧 Paxini L5325 的触点数，**不是**当前实际装的贴片的属性。装 M2020（3×3）时，`libbox_controller.so` 解析 `TLV_TYPE_GET_TOUCH_M2020_{LEFT,RIGHT}_DATA` 后调 `fill_touch_from_m2020()`，把 9 个真实触点写进槽 0–8，槽 9–238 恒零。**所以数组长度不能用来判断贴片型号**（没被按压的 Paxini 贴片同样全零）。
+
+判据是链路流 id（`LinkStats.tlv_type`）：
+
+| 链路流 | 贴片 | 触点数 | 布局 |
+|--------|------|--------|------|
+| `0x0002` / `0x0003` | Paxini L5325 | 239 | 厂商 XYZ 坐标表 |
+| `0x0008` / `0x0009` | M2020 | 9 | 3×3，线缆在左，行优先编号 1–9 |
+
+- `box_client.touch_model_from_link_stats()` 据此识别贴片，`_decode_touch()` 把每帧裁到真实触点数并打上 `model` / `points` 标签；识别前**不截断**（按完整 239 槽透传 + 告警），不做零尾启发式猜测。
+- 型号一经识别就**锁存**：贴片不可能录制中途换，中途改宽度会在同一 episode 里写出参差不齐的 fx/fy/fz。可用 `box_collection.touch_model` 在配置里钉死。
+- `_touch_summary()` 的 `mean_f{x,y,z}` 按**实际触点数**求平均。曾硬编码除以 239：M2020 下同样的物理接触，均值被稀释 239/9 ≈ 26.6 倍（实测 132514 数据集：`mean_fz` 0.435 → 11.556）。
+- `export_v3` 每次导出用 `_detect_touch_width()` 从 raw jsonl 定宽（parquet 是定长 list 列）；一次导出里各 episode 宽度不一致 = 采集中途换过贴片，会告警并取最宽。
+- 前端 `touchVisualization` 按 `model` 选布局（M2020 画 3×3 带触点编号，Paxini 走 239 点 XYZ 图），Calibration / Device Manager / Episode Replay 三个页面共用。
+
+> **fz 饱和**：fz 是 uint8（0.1N/LSB），上限 25.5N。M2020 实测正中触点（index 5，数组下标 4）在抓取时长期顶到 255 —— 该通道在接触重时是**截断**的，不要当线性力用。
+
+### 9.4 真机验证状态
 
 | 日期 | 项 | 结果 |
 |------|----|------|
 | 2026-06-15 | 6 路 BOX 传感器频率 | gripper/imu/trigger/六维力 199Hz，touch L/R 各 50Hz |
 | 2026-06-15 | MCU 校准（L3b） | slope=1µs/tick，6 路全 engage，残差 1–2ms |
 | 2026-06-15 | 夹爪/扳机运动 | episode 实测 distance 0.0007–0.098m、trigger 0→100% 正确进 `state[0/1]` |
-| 2026-06-15 | 触觉接触 | `active_points` 1–52、`max_abs_fz` 饱和 255、239 点原始帧完整 |
+| 2026-06-15 | 触觉接触（Paxini L5325） | `active_points` 1–52、`max_abs_fz` 饱和 255、239 点原始帧完整 |
+| 2026-08-17 | 触觉贴片换 M2020 | 链路流实测 tlv 8/9 @60Hz（无 2/3）→ SDK 已支持；数据仍是 239 槽因 `fill_touch_from_m2020` 只填槽 0–8（全集扫描 594–597 帧×4 pad，槽 9–238 恒零）。见 §9.3 |
 | 2026-07-07 | `argus_online_sync` 8 路 10×60s burn-in | 每路 3600 帧，sidecar 3600 行，max SOF delta 0.401ms，ffmpeg materialization=false |
 | 2026-07-13 | `sync_test_lht_20260707_090407` episode 0 spot check | 8 路 MP4 均 1330 帧 / 60fps；frame 1235 附近 SOF delta 12–13µs；MP4 第 1235 帧 PTS 均 20.583s |
 | 2026-07-13 | Episode Replay | 修复多 `<video>` 独立 clock/seek 容差导致的可见错位；原始视频与 sidecar 本身同步 |

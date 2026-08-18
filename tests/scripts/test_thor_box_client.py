@@ -9,6 +9,7 @@ touches `libbox_controller.so` directly -- it goes through the wheel's
 
 from __future__ import annotations
 
+import logging
 import sys
 import types
 from dataclasses import dataclass, field
@@ -66,14 +67,23 @@ class _Touch:
 
 
 @dataclass
+class _LinkStatsRecord:
+    """Stand-in for box_sdk's LinkStats; only the fields the host reads."""
+    tlv_type: int = 0
+    samples_total: int = 0
+    device_id: int = 0
+
+
+@dataclass
 class _AllSensor:
     gripper_data: _Gripper = field(default_factory=_Gripper)
     imu_data: _Imu = field(default_factory=_Imu)
     trigger_data: _Trigger = field(default_factory=_Trigger)
     six_d_force_data: _SixD = field(default_factory=_SixD)
+    filtered: _SixD = field(default_factory=_SixD)
+    filtered_gravity: _SixD = field(default_factory=_SixD)
+    filtered_no_gravity: _SixD = field(default_factory=_SixD)
     six_d_force_data_filter: _SixD = field(default_factory=_SixD)
-    touch_sensor_data_first: _Touch = field(default_factory=_Touch)
-    touch_sensor_data_sec: _Touch = field(default_factory=_Touch)
     gripper_speed: float | None = None
 
 
@@ -82,8 +92,13 @@ class _SensorCache:
     valid: int = 1
     liwp_index: int = 0
     liwp_timestemp: int = 0  # SDK typo preserved
+    device_id: int = 0  # the device that produced this frame (v4 attribution)
     data: _AllSensor = field(default_factory=_AllSensor)
-    touch_sensor_data: tuple = field(default_factory=tuple)
+    # Two-element touch array, exactly like the SDK struct (AllSensor carries no
+    # touch members). Default is a zero-timestamp pair -> both pads dropped.
+    touch_sensor_data: tuple = field(
+        default_factory=lambda: (_Touch(), _Touch())
+    )
 
 
 @dataclass
@@ -125,9 +140,16 @@ class _FakeBox:
         self.snaps: list[_SensorCache] = []
         self.snaps_by_id: dict[int, _SensorCache] = {}
         self.mode: dict[int | None, int] = {}
+        self.clamp_cmds: list[tuple] = []
+        self.trigger_zeroed: list = []
         self.started = False
         self.stopped = False
         self.registered: list[tuple] = []
+        self.btn_key_action_observer = None
+        self.error_observer = None
+        self.device_state_observer = None
+        self.stats_observer = None
+        self.link_stats_observer = None
 
     # --- protocol the v3 Box exposes to BoxClient ----------------------
     def start(self, bind_ip, bind_port, remote_ip, remote_port):
@@ -147,9 +169,11 @@ class _FakeBox:
         return 0
 
     def set_clamp_pos(self, pos_m, device_id=None):
+        self.clamp_cmds.append((float(pos_m), device_id))
         return 0
 
     def set_trigger_zero(self, device_id=None):
+        self.trigger_zeroed.append(device_id)
         return 0
 
     def register_device(self, device_id, ip, port=15000):
@@ -171,6 +195,21 @@ class _FakeBox:
         if self.snaps:
             return 0, self.snaps[0]
         return 4, _SensorCache(valid=0)
+
+    def set_btn_key_action_observer(self, callback):
+        self.btn_key_action_observer = callback
+
+    def set_error_observer(self, callback):
+        self.error_observer = callback
+
+    def set_device_state_observer(self, callback):
+        self.device_state_observer = callback
+
+    def set_stats_observer(self, callback):
+        self.stats_observer = callback
+
+    def set_link_stats_observer(self, callback):
+        self.link_stats_observer = callback
 
     def err_str(self, rc):
         return "no cached sensor data" if rc == 4 else f"rc={rc}"
@@ -223,7 +262,9 @@ def test_decode_sensor_cache_filters_zero_timestamp_sensors():
             trigger_data=_Trigger(timestamp=20, distance=42.0),
             six_d_force_data=_SixD(timestamp=30, data=(1, 2, 3, 4, 5, 6)),
             six_d_force_data_filter=_SixD(timestamp=31, data=(10, 20, 30, 40, 50, 60)),
-            touch_sensor_data_first=_Touch(
+        ),
+        touch_sensor_data=(
+            _Touch(
                 timestamp=40,
                 total_force=_TouchForce(fx=7, fy=-8, fz=9),
                 forces=tuple(
@@ -231,7 +272,7 @@ def test_decode_sensor_cache_filters_zero_timestamp_sensors():
                     for i in range(239)
                 ),
             ),
-            touch_sensor_data_sec=_Touch(timestamp=0),  # dropped
+            _Touch(timestamp=0),  # dropped
         ),
     )
     out = box_client.decode_sensor_cache(snap)
@@ -268,15 +309,37 @@ def test_decode_sensor_cache_falls_back_to_raw_six_d_when_filter_absent():
     assert timestamps["box_six_d_force"] == 30
 
 
+def test_decode_sensor_cache_exposes_v4_gravity_compensated_force():
+    snap = _SensorCache(
+        data=_AllSensor(
+            six_d_force_data=_SixD(timestamp=30, data=(1, 2, 3, 4, 5, 6)),
+            filtered=_SixD(timestamp=31, data=(10, 20, 30, 40, 50, 60)),
+            filtered_gravity=_SixD(timestamp=31, data=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6)),
+            filtered_no_gravity=_SixD(timestamp=31, data=(9, 18, 27, 36, 45, 54)),
+        ),
+    )
+
+    out = box_client.decode_sensor_cache(snap)
+    force = out["sensors"]["box_six_d_force"]
+
+    assert force["source"] == "filtered"
+    assert force["fxyz_mxyz"] == [10, 20, 30, 40, 50, 60]
+    assert force["fxyz_mxyz_raw"] == [1, 2, 3, 4, 5, 6]
+    assert force["fxyz_mxyz_filtered"] == [10, 20, 30, 40, 50, 60]
+    assert force["fxyz_mxyz_gravity"] == pytest.approx(
+        [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    )
+    assert force["fxyz_mxyz_no_gravity"] == [9, 18, 27, 36, 45, 54]
+    assert force["fxyz_mxyz_gravity_compensated"] == [9, 18, 27, 36, 45, 54]
+
 
 def test_decode_changed_sensors_skips_unchanged_touch_payload(monkeypatch):
     snap = _SensorCache(
         data=_AllSensor(
             six_d_force_data=_SixD(timestamp=30, data=(1, 2, 3, 4, 5, 6)),
             six_d_force_data_filter=_SixD(timestamp=31, data=(10, 20, 30, 40, 50, 60)),
-            touch_sensor_data_first=_Touch(timestamp=40),
-            touch_sensor_data_sec=_Touch(timestamp=41),
         ),
+        touch_sensor_data=(_Touch(timestamp=40), _Touch(timestamp=41)),
     )
 
     def fail_touch_decode(_touch):
@@ -289,12 +352,10 @@ def test_decode_changed_sensors_skips_unchanged_touch_payload(monkeypatch):
     assert out["sensors"]["box_six_d_force"]["timestamp"] == 31
 
 
-def test_decode_sensor_cache_prefers_top_level_touch_array_over_legacy_fields():
-    legacy_left = _Touch(
-        timestamp=999,
-        forces=tuple(_TouchForce(fx=9, fy=9, fz=9) for _ in range(239)),
-    )
-    legacy_right = _Touch(timestamp=998)
+def test_decode_sensor_cache_reads_touch_from_the_cache_level_array():
+    # touch_sensor_data[0]/[1] are left/right; the flattened
+    # data.touch_sensor_data_first/_sec members the v3 bundles also carried are
+    # gone from the struct and must not be consulted.
     array_left = _Touch(
         timestamp=101,
         forces=tuple(_TouchForce(fx=1, fy=2, fz=3) for _ in range(239)),
@@ -303,13 +364,7 @@ def test_decode_sensor_cache_prefers_top_level_touch_array_over_legacy_fields():
         timestamp=202,
         forces=tuple(_TouchForce(fx=-1, fy=-2, fz=4) for _ in range(239)),
     )
-    snap = _SensorCache(
-        data=_AllSensor(
-            touch_sensor_data_first=legacy_left,
-            touch_sensor_data_sec=legacy_right,
-        ),
-        touch_sensor_data=(array_left, array_right),
-    )
+    snap = _SensorCache(touch_sensor_data=(array_left, array_right))
 
     out = box_client.decode_sensor_cache(snap)
     timestamps = box_client._decode_sensor_timestamps(snap)
@@ -378,6 +433,49 @@ def test_box_client_start_stop_pulls_snapshot_and_marks_detected(fake_box_module
     assert client.is_active() is False
 
 
+def test_box_client_forwards_control_calls_to_the_addressed_device(fake_box_module):
+    # The FR3 Corenetic gripper driver drives set_mode()/set_clamp_pos() on the
+    # BoxClient itself, so they must exist here -- not only on the internal
+    # _DeviceHandle -- and must carry the resolved device_id (v4 SDK addresses
+    # every command by id).
+    created: list[_FakeBox] = []
+
+    def _factory(*a, **kw):
+        b = _FakeBox()
+        b.snaps.append(
+            _SensorCache(
+                valid=1,
+                data=_AllSensor(gripper_data=_Gripper(timestamp=1, distance=0.05)),
+            ),
+        )
+        created.append(b)
+        return b
+
+    fake_box_module.Box = _factory  # type: ignore[assignment]
+
+    cfg = box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01)
+    client = box_client.BoxClient(cfg)
+    assert client.start() is True
+    try:
+        assert client.set_mode(1) == 0
+        assert client.set_clamp_pos(0.042) == 0
+        assert client.set_trigger_zero() == 0
+    finally:
+        client.stop()
+
+    box = created[-1]
+    # device_id 1 is the synthetic id _FakeBox reports for the most-recent path.
+    assert box.mode == {1: 1}
+    assert box.clamp_cmds == [(0.042, 1)]
+    assert box.trigger_zeroed == [1]
+
+
+def test_box_client_control_calls_raise_before_start(fake_box_module):
+    client = box_client.BoxClient(box_client.BoxClientConfig(enabled=True))
+    with pytest.raises(RuntimeError, match="not started"):
+        client.set_clamp_pos(0.01)
+
+
 def _force_box_factory(
     force=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
     *,
@@ -409,6 +507,87 @@ def _force_box_factory(
         return b
 
     return _factory, calls
+
+
+def test_box_client_gets_v4_gravity_compensated_force(fake_box_module):
+    def _factory(*a, **kw):
+        b = _FakeBox()
+        b.snaps.append(
+            _SensorCache(
+                valid=1,
+                data=_AllSensor(
+                    six_d_force_data=_SixD(timestamp=30, data=(1, 2, 3, 4, 5, 6)),
+                    filtered=_SixD(timestamp=31, data=(10, 20, 30, 40, 50, 60)),
+                    filtered_no_gravity=_SixD(timestamp=31, data=(9, 18, 27, 36, 45, 54)),
+                ),
+            ),
+        )
+        return b
+
+    fake_box_module.Box = _factory  # type: ignore[assignment]
+    cfg = box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01)
+    client = box_client.BoxClient(cfg)
+    assert client.start() is True
+    import time as _t
+    _t.sleep(0.05)
+    try:
+        assert client.get_six_d_force() == [10, 20, 30, 40, 50, 60]
+        assert client.get_six_d_force(gravity_compensated=True) == [
+            9, 18, 27, 36, 45, 54,
+        ]
+        assert client.get_six_d_force_gravity_compensated() == [9, 18, 27, 36, 45, 54]
+    finally:
+        client.stop()
+
+
+def test_box_client_registers_v4_observers_and_reports_monitor(fake_box_module):
+    boxes: list[_FakeBox] = []
+
+    def _factory(*a, **kw):
+        b = _FakeBox()
+        boxes.append(b)
+        return b
+
+    fake_box_module.Box = _factory  # type: ignore[assignment]
+    cfg = box_client.BoxClientConfig(enabled=True, poll_interval_s=0.01)
+    client = box_client.BoxClient(cfg)
+    seen_buttons: list[dict[str, Any]] = []
+    client.set_button_callback(seen_buttons.append)
+    assert client.start() is True
+    try:
+        box = boxes[-1]
+        assert callable(box.btn_key_action_observer)
+        assert callable(box.stats_observer)
+        assert callable(box.link_stats_observer)
+
+        box.btn_key_action_observer(7, types.SimpleNamespace(timestamp=123, event=2))
+        box.device_state_observer(7, True)
+        box.stats_observer(
+            types.SimpleNamespace(
+                rx_packets=11, rx_bytes=22, decode_errors=1, tlv_errors=2,
+                events_enqueued=33, events_dropped=4, queue_depth=5,
+                online_devices=1, lost_packets=6, reordered_packets=7,
+            )
+        )
+        box.link_stats_observer([
+            types.SimpleNamespace(
+                device_id=7, tlv_type=0x0007, measured_hz=480.0, nominal_hz=480.0,
+                host_jitter_ewma_ms=0.1, host_jitter_max_ms=0.2, device_hz=479.5,
+                jitter_ewma_ms=0.3, jitter_max_ms=0.4, samples_total=100,
+                lost_total=1, lost_window=0, reordered_total=0, stalled=0, online=1,
+            )
+        ])
+
+        monitor = client.read()["status"]["monitor"]
+        assert seen_buttons and seen_buttons[0]["event"] == 2
+        assert monitor["latest_button_event"]["timestamp"] == 123
+        assert monitor["device_online"] == {"7": True}
+        assert monitor["latest_stats"]["rx_packets"] == 11
+        assert monitor["latest_stats"]["events_dropped"] == 4
+        assert monitor["latest_link_stats"][0]["device_hz"] == pytest.approx(479.5)
+        assert monitor["latest_link_stats"][0]["online"] is True
+    finally:
+        client.stop()
 
 
 def test_calibrate_six_d_force_gracefully_handles_missing_sdk_method(fake_box_module):
@@ -653,83 +832,21 @@ def test_fleet_config_rejects_missing_or_duplicate_box_ids():
         box_client.BoxFleetConfig(discovery="bogus")
 
 
-def test_sdk_discovery_falls_back_to_static_boxes():
+def test_make_discovery_is_the_static_fallback_for_both_config_values():
+    # Live enumeration is unconditional now (BoxPool.start -> discover_boxes), so
+    # this strategy only supplies the fallback list; discovery: sdk is accepted
+    # for deployed YAML but no longer selects a different code path.
     boxes = [box_client.BoxClientConfig(box_id="box0")]
-    # No enumerate_fn -> box_discover() unavailable -> fall back to static.
-    assert box_client.SdkBoxDiscovery(boxes).discover()[0].box_id == "box0"
-    fleet = box_client.BoxFleetConfig(discovery="sdk", boxes=boxes)
-    assert isinstance(box_client.make_discovery(fleet), box_client.SdkBoxDiscovery)
-
-
-def test_decode_sensor_mask_follows_known_sensor_bit_order():
-    assert box_client.decode_sensor_mask(0) == []
-    # bit 0 -> box_gripper, bit 1 -> box_imu (KNOWN_SENSOR_IDS order)
-    assert box_client.decode_sensor_mask(0b1) == ["box_gripper"]
-    assert box_client.decode_sensor_mask(0b11) == ["box_gripper", "box_imu"]
-    assert box_client.decode_sensor_mask((1 << len(box_client.KNOWN_SENSOR_IDS)) - 1) == list(
-        box_client.KNOWN_SENSOR_IDS
-    )
-
-
-def test_box_info_to_config_maps_identity_ip_and_sensor_mask():
-    template = box_client.BoxClientConfig(
-        bind_ip="192.168.2.45", remote_ip="0.0.0.0", poll_interval_s=0.002
-    )
-    info = box_client.BoxInfo(box_serial="SN-AAA", ip="192.168.2.61", sensor_mask=0b11)
-    cfg = box_client.box_info_to_config(info, template)
-    assert cfg.box_id == "SN-AAA"  # serial is the default namespace id
-    assert cfg.remote_ip == "192.168.2.61"
-    assert cfg.bind_ip == "192.168.2.45"  # shared default inherited from template
-    assert cfg.poll_interval_s == 0.002
-    assert cfg.expected_devices == ["box_gripper", "box_imu"]
-
-    # aliases pin a friendly id; empty sensor_mask inherits the template list.
-    template2 = box_client.BoxClientConfig(expected_devices=["box_gripper"])
-    info2 = box_client.BoxInfo(box_serial="SN-BBB", ip="192.168.2.62", sensor_mask=0)
-    cfg2 = box_client.box_info_to_config(info2, template2, aliases={"SN-BBB": "box1"})
-    assert cfg2.box_id == "box1"
-    assert cfg2.expected_devices == ["box_gripper"]
+    for mode in ("static", "sdk"):
+        fleet = box_client.BoxFleetConfig(discovery=mode, boxes=boxes)
+        disco = box_client.make_discovery(fleet)
+        assert isinstance(disco, box_client.StaticBoxDiscovery)
+        assert [c.box_id for c in disco.discover()] == ["box0"]
 
 
 def test_box_config_record_poll_default_keeps_margin_for_480hz_force():
     cfg = box_client.from_yaml_dict({"enabled": True})
     assert cfg.record_poll_interval_s == 0.0005
-
-
-def test_sdk_discovery_with_injected_enumerate_maps_to_configs():
-    template = box_client.BoxClientConfig(bind_ip="192.168.2.45")
-
-    def _fake_box_discover():
-        return [
-            box_client.BoxInfo(box_serial="SN-0", ip="192.168.2.60", sensor_mask=0b1),
-            box_client.BoxInfo(box_serial="SN-1", ip="192.168.2.61", sensor_mask=0b11),
-        ]
-
-    disco = box_client.SdkBoxDiscovery(
-        fallback=[], enumerate_fn=_fake_box_discover, template=template,
-        aliases={"SN-0": "box0", "SN-1": "box1"},
-    )
-    configs = disco.discover()
-    assert [c.box_id for c in configs] == ["box0", "box1"]
-    assert [c.remote_ip for c in configs] == ["192.168.2.60", "192.168.2.61"]
-    assert configs[0].expected_devices == ["box_gripper"]
-    assert configs[1].expected_devices == ["box_gripper", "box_imu"]
-    assert all(c.bind_ip == "192.168.2.45" for c in configs)  # template default
-
-
-def test_sdk_discovery_empty_or_failing_enumerate_falls_back():
-    fallback = [box_client.BoxClientConfig(box_id="static0")]
-
-    # enumerate returns nothing -> fall back.
-    empty = box_client.SdkBoxDiscovery(fallback, enumerate_fn=lambda: [])
-    assert [c.box_id for c in empty.discover()] == ["static0"]
-
-    # enumerate raises -> fall back (SDK present but the call failed).
-    def _boom():
-        raise RuntimeError("sdk discovery error")
-
-    failing = box_client.SdkBoxDiscovery(fallback, enumerate_fn=_boom)
-    assert [c.box_id for c in failing.discover()] == ["static0"]
 
 
 def _preloaded_box_factory(distance: float):
@@ -834,6 +951,118 @@ def test_box_pool_two_boxes_namespace_sensors(fake_box_module):
     for nsid, sample_list in samples.items():
         assert all(s.sensor_id == nsid for s in sample_list)
     pool.stop()
+
+
+class _TwoBoxSharedSocket(_FakeBox):
+    """Two BOXes streaming on one socket while broadcast discovery answers nothing.
+
+    ``get_sensor_cache(None)`` alternates between the two devices, exactly like the
+    SDK's most-recent-device path; an addressed read returns only that device's
+    frames. The gripper distance identifies the source box.
+    """
+
+    DISTANCE = {7: 0.01, 9: 0.09}
+
+    def __init__(self, *a, report_ids: bool = False, **kw):
+        super().__init__(*a, **kw)
+        self.report_ids = report_ids
+        self.addressed: list[int | None] = []
+        self._turn = 0
+        self._ts = 0
+
+    def _frame(self, device_id: int) -> _SensorCache:
+        self._ts += 1
+        return _SensorCache(
+            valid=1,
+            device_id=device_id,
+            data=_AllSensor(
+                gripper_data=_Gripper(timestamp=self._ts, distance=self.DISTANCE[device_id])
+            ),
+        )
+
+    def get_device_ids(self, *_):
+        return [7, 9] if self.report_ids else []
+
+    def get_known_device_ids(self, *_):
+        return [7, 9] if self.report_ids else []
+
+    def get_sensor_cache(self, device_id=None):
+        self.addressed.append(device_id)
+        if device_id is None:
+            self._turn += 1
+            return 0, self._frame(7 if self._turn % 2 else 9)
+        return 0, self._frame(int(device_id))
+
+
+def test_unaddressed_device_handle_pins_from_the_cache_device_id():
+    # Discovery failed, two boxes push to the same socket, and this SDK exposes no
+    # id list. Every SensorCache still names its source device, so the handle must
+    # pin to one box rather than let the most-recent-device path interleave both
+    # streams into one recorded view.
+    box = _TwoBoxSharedSocket()
+    handle = box_client._DeviceHandle(box, None)
+
+    rc, first = handle.get_sensor_cache()
+    assert rc == 0
+    pinned = first.device_id
+    assert pinned in (7, 9)
+    assert handle.device_id == pinned
+
+    for _ in range(6):
+        _rc, snap = handle.get_sensor_cache()
+        assert snap.device_id == pinned  # never the other box's frames
+
+    assert box.addressed[0] is None  # only the first read is ambiguous
+    assert set(box.addressed[1:]) == {pinned}
+    # Commands go to the same device the samples came from.
+    assert handle.set_mode(1) == 0
+    assert box.mode == {pinned: 1}
+
+
+def test_unaddressed_device_handle_pins_from_reporting_ids_and_warns(caplog):
+    box = _TwoBoxSharedSocket(report_ids=True)
+    handle = box_client._DeviceHandle(box, None)
+
+    with caplog.at_level(logging.WARNING, logger="box_client"):
+        rc, snap = handle.get_sensor_cache()
+
+    assert rc == 0
+    assert handle.device_id == 7  # lowest reporting id -- deterministic per session
+    assert snap.device_id == 7  # already an addressed read, never the merged path
+    assert box.addressed == [7]
+    warning = " ".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+    assert "device_id=7" in warning
+    assert "[9]" in warning  # the box this view is NOT recording is named
+
+
+def test_box_pool_fallback_view_records_a_single_device(fake_box_module):
+    # Broadcast discovery finds nothing (blocked/mid-cycle) but two boxes stream on
+    # :15000. The lone fallback view must record one device's samples, never a
+    # blend of both, and say which device that was.
+    fake_box_module.Box = _TwoBoxSharedSocket
+    fake_box_module.discover = lambda **kw: []
+    fleet = box_client.BoxFleetConfig(
+        boxes=[
+            box_client.BoxClientConfig(
+                box_id="", poll_interval_s=0.005, stale_threshold_s=5.0
+            )
+        ]
+    )
+    pool = box_client.BoxPool(fleet)
+    assert pool.start() is True
+    import time as _t
+
+    pool.start_recording(t0_wall_s=100.0)
+    _t.sleep(0.1)
+    samples = pool.stop_recording()
+    status = pool.read()["status"]
+    pool.stop()
+
+    pinned = status["device_id"]
+    assert pinned in (7, 9)
+    assert samples["box_gripper"]
+    distances = {s.data["distance_m"] for s in samples["box_gripper"]}
+    assert distances == {_TwoBoxSharedSocket.DISTANCE[pinned]}
 
 
 # --- v3 discovery helpers ---------------------------------------------------
@@ -1005,3 +1234,99 @@ def test_ensure_box_sdk_importable_prefers_vendored_wheel(tmp_path, monkeypatch)
         sys.path[:] = old_path
         sys.modules.pop("box_sdk", None)
         sys.modules.pop("box_sdk.old_submodule", None)
+
+
+# --------------------------------------------------------------- touch pads ---
+#
+# The BOX SDK carries every touch pad in one fixed 239-slot array regardless of
+# what is fitted: for the 3x3 M2020 pads the .so parses the M2020 TLVs and
+# fill_touch_from_m2020() writes 9 real taxels into slots 0..8, leaving 230 zeros.
+# The pad is identified from the link-stream ids, not from the array.
+
+
+def test_touch_model_identified_from_link_stream_ids():
+    m2020 = [
+        {"tlv_type": 0x0008, "samples_total": 16937},
+        {"tlv_type": 0x0009, "samples_total": 16937},
+        {"tlv_type": 0x0007, "samples_total": 136007},  # 6D force, ignored
+    ]
+    paxini = [
+        {"tlv_type": 0x0002, "samples_total": 900},
+        {"tlv_type": 0x0003, "samples_total": 900},
+    ]
+
+    assert box_client.touch_model_from_link_stats(m2020) == box_client.TOUCH_MODEL_M2020
+    assert box_client.touch_model_from_link_stats(paxini) == box_client.TOUCH_MODEL_PAXINI_L5325
+    # No touch stream at all, and streams that never carried a sample, are not
+    # evidence about the fitted pad.
+    assert box_client.touch_model_from_link_stats([{"tlv_type": 0x0006, "samples_total": 5}]) is None
+    assert box_client.touch_model_from_link_stats([{"tlv_type": 0x0008, "samples_total": 0}]) is None
+    assert box_client.touch_model_from_link_stats([]) is None
+    # A rig reporting both pad families is a hardware fault, not something to
+    # average over; the caller keeps the untruncated fallback.
+    assert box_client.touch_model_from_link_stats(m2020 + paxini) is None
+
+
+def test_decode_touch_cuts_the_frame_to_the_pad_actually_fitted():
+    frame = _Touch(
+        timestamp=40,
+        total_force=_TouchForce(fx=7, fy=-8, fz=9),
+        # Mimic fill_touch_from_m2020: 9 real taxels, 230 zero slots after them.
+        forces=tuple(
+            _TouchForce(fx=i + 1, fy=-(i + 1), fz=(i + 1) * 3) if i < 9 else _TouchForce()
+            for i in range(239)
+        ),
+    )
+    snap = _SensorCache(touch_sensor_data=(frame, _Touch(timestamp=0)))
+
+    m2020 = box_client.decode_sensor_cache(snap, box_client.TOUCH_MODEL_M2020)["sensors"]["box_touch_left"]
+    assert m2020["model"] == box_client.TOUCH_MODEL_M2020
+    assert m2020["points"] == 9
+    assert len(m2020["fz_0p1N"]) == 9 == len(m2020["fx_0p1N"]) == len(m2020["fy_0p1N"])
+    assert m2020["fz_0p1N"] == [3, 6, 9, 12, 15, 18, 21, 24, 27]
+    # total_force is its own MCU-side aggregate, not a sum over the slots.
+    assert m2020["total_force_0p1N"] == [7, -8, 9]
+
+    # An unresolved pad is passed through at the full slot count rather than
+    # truncated on a guess.
+    unknown = box_client.decode_sensor_cache(snap)["sensors"]["box_touch_left"]
+    assert unknown["model"] == "unknown"
+    assert unknown["points"] == 239
+    assert len(unknown["fz_0p1N"]) == 239
+
+
+def test_touch_point_count_round_trips_through_the_model_table():
+    assert box_client.touch_point_count(box_client.TOUCH_MODEL_M2020) == 9
+    assert box_client.touch_point_count(box_client.TOUCH_MODEL_PAXINI_L5325) == 239
+    # Unknown/unresolved keeps the widest frame the SDK can hand over.
+    assert box_client.touch_point_count(None) == box_client.TOUCH_SDK_SLOT_COUNT
+    assert box_client.touch_point_count("nope") == box_client.TOUCH_SDK_SLOT_COUNT
+    assert box_client.touch_model_for_point_count(9) == box_client.TOUCH_MODEL_M2020
+    assert box_client.touch_model_for_point_count(239) == box_client.TOUCH_MODEL_PAXINI_L5325
+    assert box_client.touch_model_for_point_count(64) is None
+
+
+def test_recorded_touch_frames_keep_one_width_for_the_whole_session():
+    # Latch-once: link stats arriving mid-session must not switch the frame
+    # width underneath an in-flight recording and write ragged arrays.
+    cfg = box_client.BoxClientConfig(enabled=True, box_id="box0")
+    client = box_client.BoxClient(cfg)
+    assert client._touch_model is None
+
+    client._handle_link_stats([_LinkStatsRecord(tlv_type=0x0008, samples_total=10)])
+    assert client._touch_model == box_client.TOUCH_MODEL_M2020
+
+    client._handle_link_stats([_LinkStatsRecord(tlv_type=0x0002, samples_total=10)])
+    assert client._touch_model == box_client.TOUCH_MODEL_M2020
+
+
+def test_pinned_touch_model_wins_over_autodetect():
+    cfg = box_client.BoxClientConfig(enabled=True, touch_model=box_client.TOUCH_MODEL_M2020)
+    client = box_client.BoxClient(cfg)
+    assert client._touch_model == box_client.TOUCH_MODEL_M2020
+
+    client._handle_link_stats([_LinkStatsRecord(tlv_type=0x0002, samples_total=10)])
+    assert client._touch_model == box_client.TOUCH_MODEL_M2020
+
+    with pytest.raises(ValueError, match="unknown touch_model"):
+        box_client.BoxClientConfig(enabled=True, touch_model="l5325")

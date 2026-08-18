@@ -464,6 +464,13 @@ export type TouchPadFrame = {
   fz: number[];
   maxFz?: number;
   activePoints?: number;
+  /**
+   * Pad geometry this frame came from ("m2020", "paxini_l5325", ...). The BOX
+   * SDK carries every pad in one fixed 239-slot array, so array length alone
+   * cannot identify the pad; the gateway resolves and sends it explicitly.
+   */
+  model?: string;
+  points?: number;
 };
 
 export type ForceVector = {

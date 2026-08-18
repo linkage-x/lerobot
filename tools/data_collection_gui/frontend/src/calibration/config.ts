@@ -54,6 +54,18 @@ export const DYNAMIC_FORCE_LIMITS: ForceAxisLimits = {
   momentMaxNm: 0.01,
 };
 
+// --- 6D force: gravity-compensated static residual ---------------------------
+// Diagnostic only: this checks whether fxyz_mxyz_no_gravity is plausibly close
+// to zero while the tool is static/free-air. It does not redefine the legacy
+// box_six_d_force.* observation channels, which still carry fxyz_mxyz.
+export const STATIC_COMPENSATED_FORCE_LIMITS: ForceAxisLimits = {
+  fxMaxN: 1.0,
+  fyMaxN: 1.0,
+  fz: { mode: "abs", maxN: 1.0 },
+  mx: { mode: "abs", maxN: 0.03 },
+  momentMaxNm: 0.03,
+};
+
 // --- Tactile (touch pad) ------------------------------------------------------
 // After touch re-zero the net force and per-taxel residual target is 0. Real
 // hardware never reaches exactly 0, so we accept within an explicit epsilon and

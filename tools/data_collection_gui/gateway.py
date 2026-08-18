@@ -661,8 +661,10 @@ _BOX_COLLECTION_DEVICE_LABELS: dict[str, str] = {
     "box_imu": "BOX IMU (acc/gyr/euler/quat)",
     "box_trigger": "BOX trigger travel",
     "box_six_d_force": "BOX 6D force",
-    "box_touch_left": "Paxini touch pad L",
-    "box_touch_right": "Paxini touch pad R",
+    # Pad vendor/geometry is not fixed (Paxini L5325 239-taxel, M2020 3x3, ...)
+    # and is reported per frame as `model`; keep the static label neutral.
+    "box_touch_left": "BOX touch pad L",
+    "box_touch_right": "BOX touch pad R",
 }
 
 
@@ -5721,16 +5723,50 @@ def _rows_vector_all_zero(rows: list[dict[str, Any]], column: str) -> bool:
     return saw_value
 
 
+# Touch pad geometry, mirrored from box_client so the replay/preview paths work
+# on hosts where the ARM-only box_sdk wheel is absent. box_client.TOUCH_MODELS is
+# the source of truth; this falls back to it when importable so the two cannot
+# drift apart silently.
+_TOUCH_MODEL_WIDTHS: dict[str, int] = {"paxini_l5325": 239, "m2020": 9}
+try:  # pragma: no cover - exercised on Thor, not in host unit tests
+    from tools.thor.box_sdk.box_client import TOUCH_MODELS as _BOX_TOUCH_MODELS
+
+    _TOUCH_MODEL_WIDTHS = {
+        name: int(spec["points"]) for name, spec in _BOX_TOUCH_MODELS.items()
+    }
+except Exception:  # noqa: BLE001 - keep the mirrored table
+    pass
+
+_TOUCH_KNOWN_WIDTHS = frozenset(_TOUCH_MODEL_WIDTHS.values())
+# Sentinel for "any pad geometry we know", distinct from an explicit width and
+# from None (= accept whatever came in).
+_TOUCH_ANY_KNOWN_WIDTH = -1
+
+
+def _touch_model_for_width(width: int) -> str | None:
+    for name, points in _TOUCH_MODEL_WIDTHS.items():
+        if points == int(width):
+            return name
+    return None
+
+
 def _touch_payload_from_axes(
     fz_values: Any,
     *,
     fx_values: Any = None,
     fy_values: Any = None,
     timestamp: int = 0,
-    expected_count: int | None = 239,
+    model: str | None = None,
+    expected_count: int | None = _TOUCH_ANY_KNOWN_WIDTH,
 ) -> dict[str, Any] | None:
     fz = _as_float_list(fz_values)
-    if expected_count is not None:
+    if expected_count is _TOUCH_ANY_KNOWN_WIDTH:
+        # Accept any pad geometry box_client knows about (239-taxel Paxini,
+        # 9-taxel M2020, ...) but still reject a frame that is short for every
+        # one of them -- that is a truncated payload, not a smaller pad.
+        if len(fz) not in _TOUCH_KNOWN_WIDTHS:
+            return None
+    elif expected_count is not None:
         fz = fz[:expected_count]
         if len(fz) != expected_count:
             return None
@@ -5757,6 +5793,11 @@ def _touch_payload_from_axes(
         "fz": fz,
         "maxFz": max(fz) if fz else 0.0,
         "activePoints": active_points,
+        # Pad geometry, so the frontend picks a layout instead of inferring one
+        # from array length. Frames archived before box_client tagged the model
+        # fall back to the width, which is unambiguous for the pads we ship.
+        "model": str(model) if model else (_touch_model_for_width(count) or "unknown"),
+        "points": count,
     }
     if fx:
         payload["fx"] = fx
@@ -5774,6 +5815,7 @@ def _touch_payload(data: Any) -> dict[str, Any] | None:
         fx_values=data.get("fx_0p1N"),
         fy_values=data.get("fy_0p1N"),
         timestamp=timestamp,
+        model=data.get("model") if isinstance(data.get("model"), str) else None,
     )
 
 
@@ -5787,11 +5829,22 @@ _TOUCH_EXPORT_COLUMNS = {
 
 
 def _touch_payload_from_fz(values: Any, *, timestamp: int = 0) -> dict[str, Any] | None:
-    fz = _as_float_list(values)[:239]
+    """Build an fz-only payload, padding up to the nearest known pad width.
+
+    Callers here hand over a bare fz column whose width is whatever the dataset
+    stored, so a short frame is padded to the smallest pad that fits rather
+    than to a fixed 239 (which would inflate a 9-taxel M2020 frame back into a
+    Paxini-shaped one and put the UI on the wrong layout).
+    """
+
+    fz = _as_float_list(values)
     if not fz:
         return None
-    if len(fz) < 239:
-        fz.extend([0.0] * (239 - len(fz)))
+    target = min((w for w in sorted(_TOUCH_KNOWN_WIDTHS) if w >= len(fz)), default=None)
+    if target is None:
+        fz = fz[: max(_TOUCH_KNOWN_WIDTHS)]
+    elif len(fz) < target:
+        fz.extend([0.0] * (target - len(fz)))
     return _touch_payload_from_axes(fz, timestamp=timestamp, expected_count=None)
 
 

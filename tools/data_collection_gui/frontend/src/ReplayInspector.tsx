@@ -3,7 +3,7 @@ import { Pose3DViewer } from "./Pose3DViewer";
 import { SeriesPlot } from "./SeriesPlot";
 import type { DataCollectionGuiApi } from "./api";
 import type { CubeVideoOverlay, EePose, ForceVector, MujocoCubeMode, MujocoPreview, ReplayStatus, ReplayTimeline, ReplayTimelineFrame, TouchPadFrame } from "./types";
-import { TouchHeatmapGrid, touchLayoutForCount, touchSampleActivePoints, touchSampleHasShear, touchSampleLocalMax, touchScaleFromSamples, type TouchScale } from "./touchVisualization";
+import { TouchHeatmapGrid, touchLayoutForSample, touchSampleActivePoints, touchSampleHasShear, touchSampleLocalMax, touchScaleFromSamples, type TouchScale } from "./touchVisualization";
 
 const cubeColors: Record<string, number> = {
   left: 0xc2410c,
@@ -66,7 +66,7 @@ function touchScaleMax(timeline: ReplayTimeline | null): TouchScale {
 function touchPanelSummary(frame: ReplayTimelineFrame | undefined): string {
   const samples = Object.values(frame?.touch ?? {}).filter((sample): sample is TouchPadFrame => Boolean(sample));
   const firstWithData = samples.find((sample) => sample.fz.length > 0);
-  const layout = firstWithData ? touchLayoutForCount(firstWithData.fz.length) : null;
+  const layout = touchLayoutForSample(firstWithData);
   const mode = samples.some(touchSampleHasShear) ? "fz + fx/fy shear" : "fz pseudo color";
   return layout ? `${mode} · ${layout.label}` : mode;
 }
@@ -93,7 +93,7 @@ function TouchHeatmap({
   const hasData = values.length > 0;
   const localMax = hasData ? touchSampleLocalMax(sample) : 0;
   const activePoints = sample?.activePoints ?? touchSampleActivePoints(sample);
-  const layout = hasData ? touchLayoutForCount(values.length) : null;
+  const layout = touchLayoutForSample(sample);
   const hasShear = touchSampleHasShear(sample);
 
   return (

@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  M2020_TOUCH_UNIT_COUNT,
   PAXINI_TOUCH_POINTS,
   PAXINI_TOUCH_UNIT_COUNT,
+  TOUCH_MODEL_M2020,
+  TOUCH_MODEL_PAXINI,
   touchCellColor,
   touchLayoutForCount,
+  touchLayoutForSample,
+  touchModelForSample,
   touchSampleActivePoints,
   touchSampleHasShear,
   touchScaleFromSamples,
@@ -25,6 +30,35 @@ describe("touchVisualization", () => {
     expect(Math.min(...ys)).toBeCloseTo(0.08614981, 6);
     expect(Math.max(...ys)).toBeCloseTo(51.86232744, 6);
     expect(layout.label).toContain("XYZ map");
+  });
+
+  it("lays the M2020 patch out as the datasheet 3x3", () => {
+    const layout = touchLayoutForCount(M2020_TOUCH_UNIT_COUNT);
+
+    expect(M2020_TOUCH_UNIT_COUNT).toBe(9);
+    expect(layout.columns).toBe(3);
+    expect(layout.rowLengths).toEqual([3, 3, 3]);
+    expect(layout.label).toContain("M2020");
+  });
+
+  it("trusts the model tag over array length when identifying a pad", () => {
+    // The BOX SDK hands every pad over in one fixed 239-slot array, so an
+    // untouched Paxini frame and a zero-padded M2020 frame look identical by
+    // length alone -- only the tag separates them.
+    const tagged = { fz: new Array(239).fill(0), model: TOUCH_MODEL_M2020, points: 9 };
+    expect(touchModelForSample(tagged)).toBe(TOUCH_MODEL_M2020);
+    expect(touchLayoutForSample(tagged)?.columns).toBe(3);
+
+    const untagged239 = { fz: new Array(239).fill(0) };
+    expect(touchModelForSample(untagged239)).toBe(TOUCH_MODEL_PAXINI);
+    expect(touchLayoutForSample(untagged239)?.unitCount).toBe(PAXINI_TOUCH_UNIT_COUNT);
+
+    const untagged9 = { fz: new Array(9).fill(0) };
+    expect(touchModelForSample(untagged9)).toBe(TOUCH_MODEL_M2020);
+    expect(touchLayoutForSample(untagged9)?.columns).toBe(3);
+
+    expect(touchLayoutForSample({ fz: [] })).toBeNull();
+    expect(touchModelForSample({ fz: new Array(64).fill(0) })).toBeNull();
   });
 
   it("uses the dense 50 x 10 layout for 500-cell DAS tactile images", () => {

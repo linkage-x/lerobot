@@ -321,6 +321,49 @@ def test_imu_attitude_is_quaternion_only_in_xyzw_order():
     assert 111.0 not in state and 222.0 not in state and 333.0 not in state
 
 
+def test_force_state_keeps_legacy_force_and_appends_no_gravity_channels():
+    snapshot = {
+        "sensors": {
+            "box_six_d_force": {
+                "timestamp": 1.0,
+                "fxyz_mxyz": [1, 2, 3, 4, 5, 6],
+                "fxyz_mxyz_no_gravity": [10, 20, 30, 40, 50, 60],
+            }
+        }
+    }
+
+    state = lr3.box_snapshot_to_state(snapshot)
+    assert len(state) == len(lr3.BOX_STATE_NAMES)
+
+    legacy_names = [
+        "box_six_d_force.fx",
+        "box_six_d_force.fy",
+        "box_six_d_force.fz",
+        "box_six_d_force.mx",
+        "box_six_d_force.my",
+        "box_six_d_force.mz",
+    ]
+    compensated_names = [
+        "box_six_d_force_no_gravity.fx",
+        "box_six_d_force_no_gravity.fy",
+        "box_six_d_force_no_gravity.fz",
+        "box_six_d_force_no_gravity.mx",
+        "box_six_d_force_no_gravity.my",
+        "box_six_d_force_no_gravity.mz",
+    ]
+    legacy = [state[lr3.BOX_STATE_NAMES.index(name)] for name in legacy_names]
+    compensated = [state[lr3.BOX_STATE_NAMES.index(name)] for name in compensated_names]
+    assert legacy == pytest.approx([1, 2, 3, 4, 5, 6])
+    assert compensated == pytest.approx([10, 20, 30, 40, 50, 60])
+    first_compensated = lr3.BOX_STATE_NAMES.index(compensated_names[0])
+    last_legacy = lr3.BOX_STATE_NAMES.index(legacy_names[-1])
+    assert first_compensated > last_legacy
+
+    old_snapshot = {"sensors": {"box_six_d_force": {"fxyz_mxyz": [1, 2, 3, 4, 5, 6]}}}
+    old_state = lr3.box_snapshot_to_state(old_snapshot)
+    assert [old_state[lr3.BOX_STATE_NAMES.index(name)] for name in compensated_names] == [0.0] * 6
+
+
 def test_multi_box_namespaced_snapshots_expand_state_and_timestamps(tmp_path):
     pq = pytest.importorskip("pyarrow.parquet")
 

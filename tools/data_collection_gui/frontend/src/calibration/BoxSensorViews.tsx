@@ -7,29 +7,39 @@ import { fmtNum } from "./config";
 import { evaluateForce } from "./parseCaliLog";
 import type { AxisEval, ForceVec } from "./types";
 import { FORCE_AXES, FORCE_AXIS_LABELS } from "./types";
-import { TouchHeatmapGrid, touchScaleFromSamples } from "../touchVisualization";
+import { TouchHeatmapGrid, touchLayoutForSample, touchScaleFromSamples } from "../touchVisualization";
 
 export function TouchHeatmap({
   fz0p1N,
   fx0p1N = [],
   fy0p1N = [],
+  model,
+  points,
 }: {
   fz0p1N: number[];
   fx0p1N?: number[];
   fy0p1N?: number[];
+  // Pad geometry reported alongside the frame; without it a 9-taxel M2020
+  // frame and an untouched Paxini pad are indistinguishable.
+  model?: string;
+  points?: number;
 }) {
-  const sample = { fz: fz0p1N, fx: fx0p1N, fy: fy0p1N };
+  const sample = { fz: fz0p1N, fx: fx0p1N, fy: fy0p1N, model, points };
   if (fz0p1N.length === 0) {
     return <div className="camera-tile-empty">无触觉采样</div>;
   }
+  const layout = touchLayoutForSample(sample);
   return (
-    <TouchHeatmapGrid
-      sample={sample}
-      scale={touchScaleFromSamples([sample])}
-      ariaLabel="触觉实时热力图"
-      className="box-touch-fill"
-      emptyText="无触觉采样"
-    />
+    <div className="box-touch-view">
+      <TouchHeatmapGrid
+        sample={sample}
+        scale={touchScaleFromSamples([sample])}
+        ariaLabel="触觉实时热力图"
+        className="box-touch-fill"
+        emptyText="无触觉采样"
+      />
+      {layout ? <div className="box-touch-legend">{layout.label}</div> : null}
+    </div>
   );
 }
 

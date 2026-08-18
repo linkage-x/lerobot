@@ -194,17 +194,17 @@ box_collection:
     - box_touch_left
     - box_touch_right
 
-# Multi-box form (forward-looking; needs vendor SDK support to actually run --
-# see tools/thor/box_sdk/MULTI_BOX_PROTOCOL.md). The flat block above is the
-# single-box special case. To drive several BOXes on one subnet, drop the flat
-# fields and list them under `boxes:`; each needs a unique `box_id` that
-# namespaces its sensor IDs (box0/box_gripper, box1/box_gripper, ...). Set
-# `discovery: sdk` to defer the box list to the vendor enumeration API once it
-# ships; until then it falls back to the static `boxes` list with a warning.
+# Multi-box form. The flat block above is the single-box special case. Since SDK
+# v4.0 the recorder always broadcast-enumerates the BOXes on the subnet and
+# builds one view per discovered device (sensor set included), so this list is
+# only the fallback for when the broadcast finds nothing -- and the place to pin
+# a `box_id`, which namespaces that box's sensor IDs (box0/box_gripper,
+# box1/box_gripper, ...). `discovery:` is vestigial: `static` and `sdk` behave
+# identically. See tools/thor/box_sdk/MULTI_BOX_PROTOCOL.md §0.
 #
 # box_collection:
 #   enabled: true
-#   discovery: static          # static | sdk
+#   discovery: static          # static | sdk -- same behaviour, kept for compat
 #   boxes:
 #     - box_id: box0
 #       bind_ip: "0.0.0.0"

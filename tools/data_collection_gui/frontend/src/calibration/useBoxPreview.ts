@@ -16,9 +16,12 @@ export function numberArray(value: unknown): number[] {
   return value.map((v) => (typeof v === "number" ? v : Number(v))).filter((v) => Number.isFinite(v));
 }
 
-/** Extract [Fx,Fy,Fz,Mx,My,Mz] from a preview sensor payload. */
-export function forceVecFromSensor(sensor: Record<string, unknown> | null | undefined): ForceVec | null {
-  const arr = numberArray(sensor?.["fxyz_mxyz"]);
+/** Extract [Fx,Fy,Fz,Mx,My,Mz] from a preview sensor payload field. */
+export function forceVecFromSensor(
+  sensor: Record<string, unknown> | null | undefined,
+  field = "fxyz_mxyz",
+): ForceVec | null {
+  const arr = numberArray(sensor?.[field]);
   if (arr.length < 6) return null;
   return { fx: arr[0], fy: arr[1], fz: arr[2], mx: arr[3], my: arr[4], mz: arr[5] };
 }
@@ -30,12 +33,17 @@ export type BoxPreviewView = {
   staleS: number | null;
   /** True when live and the sample is fresh enough to trust. */
   fresh: boolean;
-  /** Parsed 6D force vector (force sensors only). */
+  /** Parsed legacy 6D force vector, from fxyz_mxyz (force sensors only). */
   force: ForceVec | null;
+  /** Parsed gravity-compensated 6D force vector, when supplied by SDK v4.0+. */
+  forceNoGravity: ForceVec | null;
   /** Touch pad taxel arrays in 0.1 N units (touch sensors only). */
   touchFx0p1N: number[];
   touchFy0p1N: number[];
   touchFz0p1N: number[];
+  /** Pad geometry reported with the frame ("m2020", "paxini_l5325", ...). */
+  touchModel: string | undefined;
+  touchPoints: number | undefined;
   touchNetN: number | null;
   touchMaxResidual: number | null;
 };
@@ -46,9 +54,12 @@ const EMPTY_VIEW: BoxPreviewView = {
   staleS: null,
   fresh: false,
   force: null,
+  forceNoGravity: null,
   touchFx0p1N: [],
   touchFy0p1N: [],
   touchFz0p1N: [],
+  touchModel: undefined,
+  touchPoints: undefined,
   touchNetN: null,
   touchMaxResidual: null,
 };
@@ -67,9 +78,14 @@ function toView(payload: BoxPreviewPayload | null): BoxPreviewView {
     staleS,
     fresh,
     force: forceVecFromSensor(sensor),
+    forceNoGravity:
+      forceVecFromSensor(sensor, "fxyz_mxyz_no_gravity") ??
+      forceVecFromSensor(sensor, "fxyz_mxyz_gravity_compensated"),
     touchFx0p1N,
     touchFy0p1N,
     touchFz0p1N,
+    touchModel: typeof sensor?.["model"] === "string" ? (sensor["model"] as string) : undefined,
+    touchPoints: typeof sensor?.["points"] === "number" ? (sensor["points"] as number) : undefined,
     touchNetN: touchNetForceN(touchFz0p1N),
     touchMaxResidual: touchMaxResidual0p1N(touchFz0p1N),
   };

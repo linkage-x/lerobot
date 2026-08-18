@@ -2614,3 +2614,53 @@ def test_export_completion_leaves_non_view_exports_untouched(tmp_path):
     assert state.dataset_export.state == "complete"
     assert state.dataset_export.message == "Episode 0 written (12 frames)"
     assert state.dataset_export.totalFrames == 12
+
+
+def test_touch_payload_accepts_every_known_pad_width_and_tags_the_model():
+    # The BOX SDK hands all pads over in a fixed 239-slot array, so box_client
+    # cuts each frame to the pad fitted. The replay/preview path must accept
+    # those narrower frames instead of dropping them as malformed.
+    m2020 = gateway._touch_payload(
+        {"timestamp": 5, "model": "m2020", "points": 9,
+         "fz_0p1N": [0, 0, 0, 0, 90, 0, 0, 0, 0], "fx_0p1N": [0] * 9, "fy_0p1N": [0] * 9}
+    )
+    assert m2020 is not None
+    assert m2020["model"] == "m2020"
+    assert m2020["points"] == 9
+    assert len(m2020["fz"]) == 9
+    assert m2020["maxFz"] == 90
+    assert m2020["activePoints"] == 1
+
+    # Untagged frames (archived before box_client tagged the model) fall back
+    # to the width, which is unambiguous for the pads we ship.
+    legacy = gateway._touch_payload({"timestamp": 6, "fz_0p1N": [0.0] * 239})
+    assert legacy is not None
+    assert legacy["model"] == "paxini_l5325"
+    assert legacy["points"] == 239
+
+    untagged_m2020 = gateway._touch_payload({"timestamp": 7, "fz_0p1N": [0.0] * 9})
+    assert untagged_m2020 is not None
+    assert untagged_m2020["model"] == "m2020"
+
+    # A width matching no pad is a truncated payload, not a smaller pad.
+    assert gateway._touch_payload({"timestamp": 8, "fz_0p1N": [0.0] * 100}) is None
+    assert gateway._touch_payload({"timestamp": 9, "fz_0p1N": []}) is None
+
+
+def test_touch_payload_from_fz_pads_to_the_nearest_pad_width():
+    # A short fz column is padded up to the smallest pad that fits, never
+    # inflated back to 239 -- that would put an M2020 frame on the Paxini
+    # layout in the replay view.
+    short = gateway._touch_payload_from_fz([1.0, 2.0, 3.0])
+    assert short is not None
+    assert short["points"] == 9
+    assert short["model"] == "m2020"
+    assert short["fz"][:3] == [1.0, 2.0, 3.0]
+    assert short["fz"][3:] == [0.0] * 6
+
+    wide = gateway._touch_payload_from_fz([0.0] * 200)
+    assert wide is not None
+    assert wide["points"] == 239
+    assert wide["model"] == "paxini_l5325"
+
+    assert gateway._touch_payload_from_fz([]) is None
