@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>分布式 marker rig → TCP 标定与 A/B · 2026-08-18</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#ffffff; --text:#1f2937; --muted:#6b7280; --line:#e5e7eb;
+    --accent:#2563eb; --accent-soft:#eff6ff; --ok:#15803d; --ok-bg:#ecfdf5;
+    --warn:#b45309; --warn-bg:#fffbeb; --p0:#991b1b; --p0-bg:#fef2f2;
+    --shadow:0 8px 24px rgba(15,23,42,.06);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+       background:var(--bg);color:var(--text);line-height:1.65}
+  .wrap{max-width:1080px;margin:0 auto;padding:36px 22px 72px}
+  .hero{background:linear-gradient(135deg,#111827,#1f2937);color:#fff;border-radius:22px;padding:34px 36px;
+        box-shadow:var(--shadow);margin-bottom:24px}
+  .hero h1{margin:0 0 10px;font-size:30px;letter-spacing:.2px}
+  .hero p{margin:6px 0;color:#d1d5db}
+  .hero a{color:#93c5fd}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:var(--shadow);margin-bottom:18px}
+  h2,h3{margin-top:0}
+  .section-title{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
+  .section-title h2{margin:0;font-size:22px}
+  .badge{display:inline-block;padding:4px 9px;border-radius:999px;font-size:12px;font-weight:700}
+  .p0{color:var(--p0);background:var(--p0-bg)}
+  .warn{color:var(--warn);background:var(--warn-bg)}
+  .done{color:var(--ok);background:var(--ok-bg)}
+  .callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:14px 16px;border-radius:10px;margin:12px 0}
+  .callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  .callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  .metric-table{width:100%;border-collapse:collapse;font-size:14px}
+  .metric-table th,.metric-table td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  .metric-table th{background:#f9fafb}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;background:#f3f4f6;border-radius:6px;padding:2px 5px;font-size:.92em}
+  ul,ol{padding-left:22px}
+  li{margin:6px 0}
+  .small{font-size:13px;color:var(--muted)}
+  .win{color:var(--ok);font-weight:700}
+  .lose{color:var(--p0);font-weight:700}
+  @media (max-width:820px){.hero{padding:26px 22px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<section class="hero">
+<h1>分布式 marker rig → TCP 标定与对高位 cube 的 A/B</h1>
+<p>2026-08-18 · 两次独立采集 <span class="mono">…_20260818_100615</span> ep2/3/4（1844 帧）与 <span class="mono">…_20260818_115119</span> ep0/1/2（1837 帧）· 7 路桌面相机</p>
+<p class="small">
+主文档：<a href="box_umi_trajectory_gt_roadmap.html">BOX 高精度 UMI Trajectory GT Roadmap</a> · Phase 3 ·
+设计准则：<a href="box_umi_distributed_marker_rig_design.html">分布式夹爪 marker rig 设计说明</a> ·
+基线：<a href="box_umi_tcp_calibration_20260812.html">0812 高位 cube pivot 标定</a>
+</p>
+</section>
+
+<section class="card">
+<div class="section-title"><h2>0. 一句话结论</h2><span class="badge done">已完成 · 二次采集复核</span></div>
+<div class="callout ok">
+把 layout 表达在 <b>CAD 坐标系</b>（原点 = pivot 球窝球心）后，pivot 拟合的正确答案就是 <span class="mono">[0,0,0]</span>，
+于是 <b><span class="mono">|p_rig|</span> 直接读出整条链路的总误差</b>，不需要任何对齐、不需要解释。
+两次相隔 1 小时 45 分的独立采集，在<b>最好的 layout 方案</b>（CAD 作先验 σ=1 mm，layout 求解排除坏相机 cam_09）下给出
+<b><span class="mono">|p_rig|</span> = 1.03 mm 与 0.90 mm，彼此相差 0.48 mm</b>；
+完全不用姿态的球面交叉检验给出半径 1.98 / 0.89 mm（真值同样是 0）。
+把 CAD 当硬约束冻结则是 1.35 / 1.29 mm —— 因为那样会把打印件约 1 mm 的横向装配公差原样引进来。
+<br/>用数据自定义的 rig 系表达时，同一结果是
+<b><span class="mono">p_rig</span> = [−3.46, +101.91, +8.53] mm，杠杆臂 102.32 mm</b>，
+CAD 独立预测 [−4.13, +101.70, +6.87] mm / 102.01 mm。
+<br/>相对 0812 高位 cube：<b>杠杆臂 241.5 → 102.3 mm（−58%）</b>，
+<b>姿态误差折算到 TCP 的 p95 从 6.32 → 2.59 mm</b>，<b>最差相机丢帧率 47.4% → 14.3%</b>。
+</div>
+<div class="callout warn">
+<b>但方法在第二次采集上第一次翻车了，必须一起记住。</b>第二次采集<b>用它自己解出来的 layout</b>，杠杆臂给出 107.31 mm
+（差 5 mm）。根因不是 rig 变了，而是 <b>cam_09 在第二次采集里彻底失效</b>（单相机自解 pivot 杠杆臂 34 mm、自残差 p50 16.9 mm），
+污染了 layout 求解。把 cam_09 排出 layout 求解后，layout 与 CAD 的中心对齐残差从 7.35 mm 掉到 <b>0.26 mm</b>。
+<b>结论：这条链路的薄弱环节已经从「rig 几何」转移到「layout 求解对坏相机没有防护」。</b>
+</div>
+</section>
+
+<section class="card">
+<div class="section-title"><h2>1. 这次测的是什么</h2></div>
+<p>
+黑色 3D 打印五臂支架，底部球窝坐在桌面固定钢球上，操作者做姿态扫掠 —— 与 0812 同一类定点 pivot 实验，
+但被标定的对象换成了低矮分布式 rig，而且<b>这次夹爪不在场</b>：测的是 rig 坐标系与球心之间的固定关系。
+</p>
+<table class="metric-table">
+<tr><th>项</th><th>值</th><th>怎么确定的</th></tr>
+<tr><td>marker 家族</td><td><b>ArUco <span class="mono">DICT_6X6</span>，id 7 / 12 / 14 / 16 / 17</b></td>
+    <td>全场 AprilTag 36h11 零检出；6x6 字典五个 id 稳定出现。<b>现有生产链路（36h11 + cube 面解析角点）检测不到这个 rig</b>，因此新建了检测/layout/tracking 三段工具</td></tr>
+<tr><td>marker 实测边长</td><td>60.58 / 60.60 / 60.60 / 60.86 / 60.98 mm</td><td>多视角三角化 + corner BA 量出来的，<b>不是假设值</b>；绝对尺度来自 0804 相机外参</td></tr>
+<tr><td>CAD 贴标面</td><td>69.6 mm 方形 × 5，法线两两夹角 54.7°–125.3°</td><td>Onshape <span class="mono">pivot calib fixture / marker_rig_mount_test</span>，<span class="mono">evalFeatureScript</span> 遍历全部 96 个面</td></tr>
+<tr><td>pivot 球窝</td><td>球面 <b>R = 12.68 mm，球心正好落在 CAD 原点</b></td><td>同上：整个零件只有一个球面。这就是「ball centered」命名的含义</td></tr>
+<tr><td>采集</td><td>3 × 约 10.2 s，60 fps，共 1844 帧；每帧 fused pose 成功率 <b>100%</b></td><td>ep2/3/4；ep0/ep1 是同一 rig，本次未用，可作后续 holdout</td></tr>
+<tr><td>相机</td><td>cam_06/07/08/09/12/13/14；每帧可见相机数 p50 = 5</td><td>0804 fisheye 自标定内参 + robot-base 外参，与 0812 完全同一套</td></tr>
+</table>
+<div class="callout">
+<b>为什么必须先测 layout 再解 pivot。</b>cube 的角点可以由「理想立方体 + marker 尺寸」解析生成，分布式 rig 没有这条捷径。
+这里的做法是：多相机三角化每个角点 → 刚体旋转平均得到初值 → <b>以 CAD 平面为初值的像素级 BA</b> 联合优化
+「5 个 marker 的 6D 位姿 + 边长」与「每帧 rig 位姿」。marker 尺寸是<b>输出</b>不是输入，
+所以贴歪、印小了都会出现在报告里，而不是悄悄变成 pose 偏差。
+</div>
+</section>
+
+<section class="card">
+<div class="section-title"><h2>2. 主结果：实测 pivot 与 CAD 的正面对照</h2><span class="badge done">交付</span></div>
+<table class="metric-table">
+<tr><th>量</th><th>实测（7 相机）</th><th>实测（剔除 cam_09）</th><th>CAD 预测</th></tr>
+<tr><td><span class="mono">p_rig</span>（球心在 rig 系）</td><td><b>[−3.46, 101.91, 8.53] mm</b></td><td>[−3.79, 101.55, 9.28] mm</td><td>[−4.13, 101.70, 6.87] mm</td></tr>
+<tr><td>杠杆臂 <span class="mono">|p_rig|</span></td><td><b>102.32 mm</b></td><td>102.04 mm</td><td><b>102.01 mm</b></td></tr>
+<tr><td>与 CAD 的差</td><td><b>1.80 mm</b></td><td><b>1.60 mm</b></td><td>—</td></tr>
+<tr><td>marker 中心与 CAD 贴标面中心的对齐残差</td><td colspan="2">rms <b>0.93 mm</b>（逐 marker 0.50 / 0.67 / 0.80 / 0.87 / 1.48 mm）</td><td>Procrustes，5 个中心</td></tr>
+</table>
+<p class="small">
+CAD 预测的算法：把测出来的 5 个 marker 中心与 CAD 的 5 个贴标面中心做 Procrustes 对齐（含 5!=120 种编号分配的暴力枚举，最优 0.93 mm、次优 31.67 mm，差 34 倍，分配无歧义），再把 CAD 原点（球心）搬到 rig 系。
+<b>这条路径完全不用 pivot 数据</b>，所以它与 <span class="mono">p_rig</span> 的差是真正的端到端校验量，
+里面同时含相机标定、layout、贴纸位置、打印公差、球窝间隙（socket R=12.68 对 25 mm 球，单边 0.18 mm）。
+</p>
+
+<h3>2.1 不依赖任何对齐的标量检验：五个 marker 到 pivot 的距离</h3>
+<p>
+上面的 CAD 预测要做一次 Procrustes 对齐。下面这组数不需要：
+<b>「第 k 个 marker 中心到球心的距离」在任何坐标系里都一样</b>，
+左列纯光学测量（实测 layout + 实测 pivot），右列纯机械（CAD）。
+</p>
+<table class="metric-table">
+<tr><th>marker id</th><th>实测 |中心 − pivot|</th><th>CAD 贴标面中心到球心</th><th>差</th><th>该 marker 的可见性</th></tr>
+<tr><td>12</td><td>140.69 mm</td><td>140.74 mm</td><td><b>0.05 mm</b></td><td>好</td></tr>
+<tr><td>16</td><td>103.62 mm</td><td>103.78 mm</td><td><b>0.16 mm</b></td><td>好</td></tr>
+<tr><td>14</td><td>104.06 mm</td><td>103.78 mm</td><td><b>0.28 mm</b></td><td>好（4.8 台相机）</td></tr>
+<tr><td>7</td><td>153.30 mm</td><td>152.48 mm</td><td>0.82 mm</td><td>弱（1.9 台相机）</td></tr>
+<tr><td>17</td><td>153.88 mm</td><td>152.48 mm</td><td><b>1.40 mm</b></td><td>弱（1.9 台相机）</td></tr>
+</table>
+<div class="callout ok">
+三个可见性好的 marker 对上 CAD 到 <b>0.05–0.28 mm</b>；两个只有约 1.9 台相机能同时看见的（id 7 / 17）偏出 0.82 / 1.40 mm。
+<b>误差与可见性对齐得这么整齐，说明剩余偏差主要是 layout 观测不足，而不是打印或装配</b>——
+补一次让 id 7 / 17 更多被两台以上相机同时看见的采集，应该能把这两项也拉进 0.3 mm。
+</div>
+
+<h3>2.2 pivot 解算自身的质量</h3>
+<table class="metric-table">
+<tr><th>量</th><th>新 rig（2026-08-18）</th><th>0812 高位 cube</th><th>读法</th></tr>
+<tr><td>拟合残差 rmse / p50 / p95</td><td><b>1.37 / 0.84 / 3.02 mm</b></td><td>1.99 / 1.52 / 3.76 mm<br/><span class="small">同一估计器：1.62 / 1.09 / <b>3.19</b></span></td><td>1844 帧，0 帧被粗差门限剔除。<b>3.76 是生产链路的数，跟 3.02 不是同一把尺子</b>；同口径应比 3.19 → 3.02，见 6.1</td></tr>
+<tr><td>留一 episode 外推 p95</td><td>1.64 / 1.65 / <b>4.75</b> mm</td><td>3.72 – 3.74 mm</td><td>两条好、一条（ep4）差；见第 6 节</td></tr>
+<tr><td>逐 episode <span class="mono">p_rig</span> 最大两两</td><td><b>1.71 mm</b></td><td>3.09 mm</td><td>重扫复现性，未拆装</td></tr>
+<tr><td>逐相机独立解最大两两</td><td>10.14 mm（<b>只看多 marker 的四台：1.69 mm</b>）</td><td>12.60 mm</td><td>系统项；见第 4 节</td></tr>
+<tr><td>球面拟合（不用姿态）</td><td>半径 <b>102.02 ± 0.42 mm</b>，球心距 q_base 0.47 mm</td><td>238.55 ± 0.84 mm，距 3.67 mm</td><td>与杠杆臂差 0.30 mm，模型无关的交叉验证</td></tr>
+<tr><td>可观测性 cond</td><td><b>76.5</b>（最弱方向 [−0.02, −0.42, 0.91]）</td><td>152.7</td><td>这次扫掠的姿态多样性比 0812 好一倍</td></tr>
+<tr><td>残差 vs 速度</td><td>低速四分位 p50 1.04 → 高速四分位 0.66 mm</td><td>&lt;172 mm/s 时恒 1.4–1.5</td><td>本次<b>反向</b>：低速段残差更大，怀疑是起落座/手压阶段，不是动态项</td></tr>
+</table>
+</section>
+
+<section class="card">
+<div class="section-title"><h2>2.3 第二次独立采集（11:51）：重复性、CAD 约束 layout</h2><span class="badge done">新增</span></div>
+<p>
+同一 rig、同一 7 台相机，<span class="mono">thor_gmsl2_9ch_v1_20260818_115119</span>，3 × 10.1 s / 1803 帧，
+检出同一组 ArUco id 7/12/14/16/17（29893 个 marker）。两次采集测出的 marker 边长互相吻合到 <b>0.02–0.17 mm</b>，
+说明贴纸和打印没变。为了可比，两次都用同一组门限重跑（<span class="mono">--max-ray-rms-mm 12 --frame-step 5</span>）。
+</p>
+<table class="metric-table">
+<tr><th>layout 来源</th><th>数据</th><th><span class="mono">p_rig</span> (mm)</th><th>杠杆臂 / <span class="mono">|p_rig|</span></th><th>拟合 p50 / p95</th><th>holdout p95</th></tr>
+<tr><td rowspan="3">数据自定义 rig 系</td><td>0818a 10:06 自身 layout</td><td>[−3.51, 102.02, 8.41]</td><td>102.43 mm</td><td>0.85 / 2.81</td><td>1.6 – 4.8</td></tr>
+<tr><td class="lose">0818b 11:51 <b>自身</b> layout</td><td>[+3.77, 106.67, 11.03]</td><td class="lose"><b>107.31 mm</b></td><td>0.69 / 2.60</td><td>—</td></tr>
+<tr><td><b>0818b 11:51 + 0818a 的 layout</b></td><td><b>[−3.13, 101.90, 8.29]</b></td><td><b>102.28 mm</b></td><td>0.96 / <b>1.82</b></td><td><b>1.69 – 1.93</b></td></tr>
+<tr><td rowspan="4">CAD 系（原点 = 球心，<br/>正确答案是 0）</td><td>0818a 10:06</td><td>[−0.62, 0.15, 1.19]</td><td><b>1.35 mm</b></td><td>0.82 / 3.06</td><td>1.78 / 1.81 / 4.25</td></tr>
+<tr><td><b>0818b 11:51</b></td><td><b>[−0.79, 0.59, 0.83]</b></td><td><b>1.29 mm</b></td><td>0.84 / <b>1.92</b></td><td><b>1.83 / 1.87 / 2.09</b></td></tr>
+<tr><td>0818a，跟踪时剔 cam_09</td><td>[−0.60, −0.13, 1.57]</td><td>1.69 mm</td><td>0.92 / 3.85</td><td>—</td></tr>
+<tr><td>0818b，跟踪时剔 cam_09</td><td>[−0.48, 0.90, 0.98]</td><td>1.41 mm</td><td>0.76 / 1.80</td><td>—</td></tr>
+</table>
+<div class="callout ok">
+<b>重复性（同一装配、间隔 1h45m、独立采集与独立解算）：0.60 mm。</b>
+两次的 <span class="mono">q_base</span>（球心在 base 系）差 1.44 mm，说明球窝本身也没被碰动。
+这补上了原第 7 节列为「完全没做」的一项 —— 但只补上了「重扫复现」，<b>拆装复测仍然没做</b>。
+</div>
+
+<h4>三种 layout 方案的正面对照</h4>
+<table class="metric-table">
+<tr><th>layout 方案</th><th>0818a <span class="mono">|p_rig|</span></th><th>0818b <span class="mono">|p_rig|</span></th><th>两次差</th><th>0818b 残差 p50/p95</th></tr>
+<tr><td>纯数据自定义（各自解各自的）</td><td>无绝对判据<br/><span class="small">杠杆臂 102.43 mm</span></td><td class="lose">杠杆臂 <b>107.31 mm</b>（坏）</td><td>—</td><td>0.69 / 2.60</td></tr>
+<tr><td>冻结 CAD（板心+法线锁死）</td><td>1.35 mm</td><td>1.29 mm</td><td>0.60 mm</td><td>0.84 / 1.92</td></tr>
+<tr><td><b>CAD 先验 σ=1 mm / 1°，layout 求解排除 cam_09</b></td><td><b>1.03 mm</b></td><td><b>0.90 mm</b></td><td><b>0.48 mm</b></td><td><b>0.80 / 1.53</b></td></tr>
+</table>
+<div class="callout ok">
+<b>把 CAD 当先验而不是当约束，是三者里最好的。</b>冻结 CAD 会把打印件相对 CAD 的真实装配公差（约 1 mm 横向）原样引进来；
+放开则让弱观测的 marker 7/17 有厘米级自由度。先验两头都占：板心以 σ = 1 mm 被拉向 CAD，
+像素仍可以修正真的贴歪了的板。σ 取 1.0 与 0.5 mm 给出同一答案（0.90 / 0.91 mm），说明结果由数据决定，
+先验只提供规范（gauge）并给没人看清的 marker 兜底。
+</div>
+<div class="callout warn">
+<b>但先验必须配合排除坏相机。</b>不排除 cam_09 时，σ=1 mm 的先验反而把 <span class="mono">|p_rig|</span> 推到
+<b>1.80 mm</b>（逐相机最大两两 5.25 → <b>57.6 mm</b>）—— 先验一放松，坏相机就有力气把板子拽走。
+冻结 CAD 之所以显得稳，一半原因是它顺带把坏相机挡在外面。<b>正确顺序是：先做逐相机体检，再放开先验。</b>
+</div>
+
+<h4>CAD 约束 layout：把 CAD 已知的部分冻住</h4>
+<p>
+CAD 知道的是 5 个 <b>贴标面的中心与法线</b>（机加工级）；CAD 不知道的是贴纸的<b>面内转角</b>、面内偏心和<b>实际印出来的边长</b>。
+所以 <span class="mono">metrology.rig_layout.cad_constrained_layout</span> 只保留后者：板心与法线从 CAD 冻结，
+自由度从 5×7 = 35 降到「5 个面内转角 + 5 个边长」，而被砍掉的恰好是三角化最弱的那些方向
+—— marker 7 / 17 只被约 1.9 台相机看见这件事因此不再重要。
+</p>
+<table class="metric-table">
+<tr><th>marker</th><th>→ CAD 板</th><th>实测边长</th><th>法线与 CAD 板的夹角</th><th>贴纸面内偏心</th><th>约束后角点移动</th></tr>
+<tr><td>7</td><td>4</td><td>60.96 mm</td><td>0.94°</td><td>1.06 mm</td><td>1.18 mm</td></tr>
+<tr><td>12</td><td>2</td><td>60.62 mm</td><td>1.89°</td><td>0.61 mm</td><td>1.17 mm</td></tr>
+<tr><td>14</td><td>1</td><td>60.59 mm</td><td>0.72°</td><td>0.54 mm</td><td>1.57 mm</td></tr>
+<tr><td>16</td><td>0</td><td>60.59 mm</td><td>1.79°</td><td>0.47 mm</td><td>1.06 mm</td></tr>
+<tr><td>17</td><td>3</td><td>61.06 mm</td><td>0.88°</td><td>0.70 mm</td><td>1.31 mm</td></tr>
+</table>
+<h4>球窝可以随便挪：它不进交付量</h4>
+<p>
+模型是 <span class="mono">R_i · p_rig + t_i = q_base</span>。<b><span class="mono">p_rig</span> 是球心在 rig 系里的位置</b>，
+只由 rig 自身几何决定（球窝是打印件的一部分，就在 CAD 原点），<b>与球窝摆在桌上哪里无关</b>；
+<span class="mono">q_base</span> 才是随位置走的那个，而它一直只是副产品。
+唯一的要求是球窝在<b>一次采集内部</b>别动 —— 原实现对整个 run 共享一个 <span class="mono">q_base</span>，
+等于假设 episode 之间也没人碰过它。
+</p>
+<p>
+这个假设已经去掉：<span class="mono">fit_pivot_multi_anchor()</span> 共享 <span class="mono">p_rig</span>、
+每个 episode 各解一个锚点（每 episode 多 3 个参数，600 帧下可忽略），
+报告里以 <span class="mono">socket_stability</span> 输出，<b>同时兼作「球窝被碰了没有」的体检</b>。
+因为 <span class="mono">p_rig</span> 仍是共享的，它<b>吸收不了 rig 自身的真实变化</b>。
+</p>
+<table class="metric-table">
+<tr><th>采集</th><th>共享锚点</th><th>逐 episode 锚点</th><th><span class="mono">p_rig</span> 位移</th><th>各 episode 球心最大两两</th></tr>
+<tr><td>0818a</td><td>|p| 1.03 mm，残差 p95 3.09</td><td>|p| <b>0.93 mm</b>，残差 p95 <b>2.60</b></td><td>0.152 mm</td><td><b>1.14 mm</b>（ep2↔ep3 仅 0.28）</td></tr>
+<tr><td>0818b</td><td>|p| 0.90 mm，残差 p95 1.53</td><td>|p| 0.90 mm，残差 p95 1.51</td><td><b>0.016 mm</b></td><td>0.38 mm</td></tr>
+</table>
+<p class="small">
+已有结论一个字都不用改。0818a 略微变好、且 ep4 的球心比另两个 episode 偏 1.14 mm，
+与它 holdout 一直偏大是同一个方向 —— <b>ep4 大概率真的被轻碰过一下</b>，现在这一项由模型自己吸收了。
+</p>
+
+<h4>卡尺交叉检验：贴纸实测 60.86 mm</h4>
+<table class="metric-table">
+<tr><th>marker</th><th>0818a 视觉</th><th>0818b 视觉</th><th>均值</th><th>vs 卡尺 60.86 mm</th></tr>
+<tr><td>7</td><td>60.96</td><td>60.79</td><td>60.88</td><td><b>+0.02 mm</b></td></tr>
+<tr><td>12</td><td>60.62</td><td>60.64</td><td>60.63</td><td>−0.23 mm（−0.38%）</td></tr>
+<tr><td>14</td><td>60.59</td><td>60.50</td><td>60.55</td><td>−0.31 mm（−0.52%）</td></tr>
+<tr><td>16</td><td>60.59</td><td>60.54</td><td>60.56</td><td>−0.30 mm（−0.48%）</td></tr>
+<tr><td>17</td><td>61.06</td><td>61.17</td><td>61.12</td><td><b>+0.26 mm（+0.42%）</b></td></tr>
+<tr><td><b>全局</b></td><td>60.764</td><td>60.728</td><td><b>60.746</b></td><td><b>−0.187%</b>，在 102.3 mm 杠杆上仅 0.19 mm</td></tr>
+</table>
+<div class="callout ok">
+<b>卡尺一次判掉两个候选。（1）尺度不是原因</b> —— 全局只差 −0.19%，值 0.19 mm，解释不了 1.3 mm。
+<b>（2）marker 尺寸误差也不是</b> —— 把边长全部钉死在 60.86 mm 重跑，<span class="mono">|p_rig|</span> 从 1.35/1.29 变成
+1.33/1.32 mm，动都没动。<b>（3）那 1.3 mm 几乎纯切向</b>：分解到「沿杠杆 / 垂直杠杆」是
+0818a −0.11 / <b>1.35</b> mm、0818b −0.40 / <b>1.22</b> mm。尺度类误差必然是径向的，实测是切向 ——
+所以它是<b>板位横偏</b>，正对上实测 layout 与 CAD 的中心残差 1.10 mm。这就是改用 CAD 先验的直接依据。
+</div>
+<p class="small">
+副产物：所有贴纸物理上同尺寸，所以逐 marker 的视觉偏差就是<b>每个 marker 局部重建误差的绝对读数</b>，
+而且两次采集复现到 0.02–0.17 mm —— 是系统项不是噪声。±0.5% 落在 100–150 mm 的臂上正好是 0.5–0.75 mm，
+与总量对得上。以后每次采集都该把这张表当体检项。
+</p>
+<p class="small">
+实测与 CAD 本来就一致到 1° 以内、贴纸偏心 0.5–1.1 mm，所以「约束」只挪动了 1.1–1.6 mm 的角点，
+不是把结果硬拗到 CAD 上。CLI 里设了 <span class="mono">--max-tilt-deg 10</span> 的护栏：
+如果实测法线离 CAD 板超过 10°，说明实测朝向本身不可信，直接拒绝构建（剔 cam_09 后的那版 layout 中心虽然对到 0.26 mm，
+朝向却偏 42–73°，正是被这道护栏拦下的 —— 它的角点位置对、朝向不对，不能拿来供给面内转角）。
+</p>
+</section>
+
+<section class="card">
+<div class="section-title"><h2>2.4 σ<sub>pixel</sub> 实测：用 rig 当目标，不用标定板</h2><span class="badge done">2026-08-18</span></div>
+<p>
+Level 1 / Level 3 唯一未验证的输入是「每角点定位噪声 = 0.2 px」。测它需要一段静止采集，
+<b>目标该用 rig 而不是标定板</b> —— σ<sub>pixel</sub> 不是相机的属性，它属于
+「检测器 × 字典 × 印刷 × 工作距离 × 曝光」这一整个组合；用 <span class="mono">charuco_400</span>/<span class="mono">DICT_5X5_100</span>
+加另一条检测路径测出来的数，描述不了 rig 跟踪器实际吃进去的角点。
+（为此给 <span class="mono">measure_corner_noise.py</span> 加了 rig 目标通路；角点不必共面，
+位姿拟合走的是一般 3D 点的 <span class="mono">solvePnP</span>，环绕原点的 rig 反而比平板条件更好。）
+</p>
+<p>
+数据：<span class="mono">…_163416</span> 4 个静止姿态 + <span class="mono">…_163752</span> 2 个，共 <b>6 个姿态</b>、每个 400–620 帧。
+静止性已核实：原始角点像素散布 0.023–0.074 px，逐 episode 姿态变化仅 0.04–0.20°。
+</p>
+<table class="metric-table">
+<tr><th>入射角</th><th>生产默认 <span class="mono">CORNER_REFINE_NONE</span></th><th><span class="mono">CORNER_REFINE_SUBPIX</span></th><th>样本数</th></tr>
+<tr><td>0–30°</td><td>0.214 px</td><td><b>0.034 px</b></td><td>9</td></tr>
+<tr><td>30–45°</td><td>0.184</td><td><b>0.042</b></td><td>14</td></tr>
+<tr><td>45–60°</td><td>0.156</td><td><b>0.048</b></td><td>13</td></tr>
+<tr><td>60–70°</td><td>0.169</td><td>0.121</td><td>4</td></tr>
+<tr><td><b>70–80°</b></td><td>0.354</td><td class="lose"><b>0.633</b></td><td>7</td></tr>
+<tr><td><b>全体中位（相机×姿态，n=28）</b></td><td><b>0.167 px</b></td><td><b>0.078 px</b></td><td>—</td></tr>
+</table>
+<div class="callout ok">
+<b>（1）0.2 px 的假设是对的。</b>生产检测器在正常工作角度（&lt;70°）实测 0.156–0.214 px，
+所以 Level 1 与 Level 3 基于 0.2 px 的结论原样成立，且略偏保守。按实测中位折算，
+Level 3 的 σ<sub>TCP</sub>（姿态 p95）全区 p50 <b>0.19 mm</b> / p95 <b>0.41 mm</b> ——
+仍比实测系统项 0.9–1.0 mm 低一到两个数量级。
+<br/><b>（2）SUBPIX 是 4–5 倍的免费收益，但必须配入射角门限。</b>
+70° 以下 0.034–0.048 px；<b>70° 以上反而比不开更差</b>（0.633 vs 0.354 px）——
+细化窗口落在被压扁、糊掉的边缘上会自己跑掉。所以应实现为「入射角 ≤70° 才细化」，不是全局打开。
+生产 tracking（<span class="mono">cube_tracking.py</span>）目前用的正是 <span class="mono">CORNER_REFINE_NONE</span>。
+</div>
+<div class="callout ok">
+<b>cam_08 已补测（<span class="mono">…_172430</span> ep0）</b>：σ = <b>0.028 px</b>（生产默认）/ <b>0.039 px</b>（SUBPIX），
+是 7 台里最低的一档 —— <b>它的角点检测毫无问题，那 27 mm 是外参，不是噪声</b>（见 2.5 节）。
+至此 7 台相机全部测到。同一姿态的其余相机：cam_09 0.155/0.038、cam_12 0.125/0.066、cam_13 0.224/0.032、cam_14 0.177/0.021 px。
+</div>
+<div class="callout warn">
+<b>原来的两个缺口。</b>① <span class="mono">cam_08</span> 在最初 6 个姿态里都只看到 1 个 marker
+（8 个观测对 6 个位姿自由度，自由度修正因子到 2.0，等于在拟合噪声自己），所以 7 台只测到 6 台；
+补一个让 cam_08 看到 ≥2 个 marker 的姿态即可。
+② <b>静止测得的是下界</b>：生产中 rig 在动，运动模糊会抬高角点噪声。
+<br/><b>当时还差的那件事已经采到了</b>（<span class="mono">…_183700</span>，见 5.3 节）：
+「把桌面钢球挪到新位置、再做一次定点摆动」的判别实验已完成，结论是<b>装配项</b>。
+</div>
+<p class="small">
+一个实现层面的坑一并记下：<span class="mono">metrology/__init__.py</span> 原本是 eager import，
+导入任何子模块都会拖进 SciPy。Thor 上「新版 <span class="mono">cv2.aruco</span> 只在 venv、SciPy 只在系统 python」，
+于是没有任何一个解释器能跑这个既要检测又要拟合的工具。已改为惰性导入，并加了一条回归测试钉死
+「导入 <span class="mono">metrology.corner_noise</span> 不得拉进 scipy」。
+</p>
+</section>
+
+<section class="card">
+<div class="section-title"><h2>2.5 相机外参偏置：固定在 base 系，跨采集可复现</h2><span class="badge done">2026-08-18</span></div>
+<p>
+数据 <span class="mono">…_172430</span> ep1–3：rig 被<b>拿在手里挥动</b>（原点位移包络 547 / 940 / 794 mm、速度 p50 234–364 mm/s，
+对照定点摆动只有 6 mm / 13–16 mm/s）。所以它<b>不能用来解 pivot</b> —— 用 CAD 系 layout 时 rig 原点就是球心，
+坐在球上转的话这个点不可能移动。但正因为它扫过了 <b>x 0.48–0.94、y −0.30–0.42、z 0.22–0.76 m</b>，
+它能直接回答另一个问题：<b>相机外参误差是否随位置变化</b>。
+</p>
+<table class="metric-table">
+<tr><th>相机</th><th>中位偏差向量 (mm)</th><th>|偏差|</th><th>跨 x 分档最大变化</th><th>三次采集散布 (std)</th></tr>
+<tr><td><b>cam_09</b></td><td><b>[−26.0, +4.4, +5.5]</b></td><td><b>27.0 mm</b></td><td>7.1 mm</td><td>1.4</td></tr>
+<tr><td>cam_06</td><td>[−6.3, +5.4, −1.5]</td><td>8.4</td><td>1.5</td><td>1.8</td></tr>
+<tr><td>cam_08</td><td>[−4.1, −2.7, +0.9]</td><td>5.1</td><td>1.7</td><td>0.9</td></tr>
+<tr><td>cam_13</td><td>[−3.7, −0.5, +1.0]</td><td>3.9</td><td>2.0</td><td>0.5</td></tr>
+<tr><td>cam_14</td><td>[+1.8, −0.9, −2.7]</td><td>3.4</td><td>1.4</td><td>2.4</td></tr>
+<tr><td>cam_07</td><td>[−0.4, +1.1, −0.2]</td><td>1.1</td><td>2.1</td><td>1.0</td></tr>
+<tr><td>cam_12</td><td>[+0.7, +0.7, +0.4]</td><td>1.0</td><td>1.1</td><td>0.4</td></tr>
+</table>
+<div class="callout ok">
+<b>每台相机的偏差是一个固定在 base 系里的常量</b>：跨 0.5 m 的位置变化只动 1–2 mm，
+而且在<b>三次独立采集</b>（两次定点摆动相隔 1h45m、一次挥动在 5 小时后、位置不同、速度差 20 倍）之间复现到
+<b>中位 1.9–2.4 mm</b>。这不是噪声，是可标定的外参平移误差 —— 上表即修正表
+（相对加权融合共识，加权和 ≈ 0，应用时等于把 gauge 固定在共识上）。
+</div>
+<div class="callout">
+<b>对「剩余 0.9 mm 是装配项还是外参项」的意义。</b>既然这些偏置<b>固定在 base 系</b>，
+它们主要被 <span class="mono">q_base</span> 吸收，而不会系统性地偏移 <span class="mono">p_rig</span>
+（与「rig 系里恒定的误差被 p_rig 吸收、base 系里恒定的误差被 q_base 吸收」是同一条道理）。
+所以现有证据<b>偏向假设 (A)：打印/装配偏差</b> —— 这也与 2.3 节「那 1.3 mm 几乎纯切向」的发现同向。
+<br/>但这仍是<b>间接推断</b>：直接判据依然是「把桌面钢球挪到新位置（<span class="mono">q_base</span> 移 ≥0.3 m）再做一次真正的定点摆动」，该实验仍未采到。
+</div>
+<p class="small">
+<b>「定点摆动」的操作定义</b>（这次没做对的地方）：rig 的球窝<b>始终坐在桌面固定钢球上不离开</b>，
+手只改变 rig 的<b>朝向</b>。<b>要稳住的是球窝球心，不是 rig 的几何中心</b> ——
+5.2 节记录的第三次尝试正是稳错了点。判据首选 <span class="mono">|p_rig|</span> ≈ 1 mm（见 5.2 节的即时自检）；
+球心位移包络 &lt;20 mm 只是辅助粗筛（成功的两次实测 4.3–11.1 mm，本次是 547–940 mm，中间没有灰区）。
+姿态跨度这次是够的（35–45°）。
+<b>注意这不是「要手很稳」的要求</b>：把球心钉住的是球窝-钢球的接触本身，不是手；见下面 5.1 节的容差实验。
+<br/><b>「挪位置」挪的是哪个</b>：是<b>桌面上那颗钢球（连底座）</b>，即支点在 base 系的位置
+<span class="mono">q_base</span>。rig 底部的球窝是打印件的一部分，跟 rig 一起走，本来就动不了；
+<span class="mono">p_rig</span> 是被求解的交付量，按定义与钢球摆在桌上哪里无关 —— 判别实验要的正是
+「换个 <span class="mono">q_base</span> 后它复不复现」：复现（差 ≲0.3 mm）则那 0.9 mm 跟着 rig 走 = 假设 (A) 装配/打印；
+随位置跳变（~1 mm 且方向随位置变）则来自 base 系里的场 = 假设 (B) 相机外参。
+之前两次采集的 <span class="mono">q_base</span> 只差 1.44 mm，等于同一个位置，所以给不出结论；
+新位置建议横移 0.3 m，且仍落在 x 0.7–1.1 / y −0.3…+0.4 / z 0.45–0.65 m 内。
+</p>
+
+<h4>5.1 球心到底要多稳？答案不是幅度，是「与姿态相不相关」</h4>
+<p>
+「手保持球心不动」听上去像一个做不到的要求，所以把它做成了实验：对两次成功采集的实测位姿
+<b>注入合成的球心漂移</b> <span class="mono">d_i</span>（等价于整台 rig 平移 <span class="mono">d_i</span>），
+重解一遍，看交付量 <span class="mono">p_rig</span> 被带偏多少、以及现有的三道检查（残差 p95、holdout、
+逐 episode 锚点）能不能发现。
+</p>
+<table class="metric-table">
+<tr><th>漂移形态</th><th>传到 <span class="mono">p_rig</span> 的杠杆</th><th>残差 p95 的反应（注入 2 mm 时）</th><th>判定</th></tr>
+<tr><td>随机手抖（iid，σ 给定）</td><td><b>0.10–0.29×</b></td><td><b>+3.08 / +3.44 mm</b></td><td class="win">无害，且很吵</td></tr>
+<tr><td>每 episode 慢漂移（底座蠕动）</td><td>0.16–0.27×</td><td>−0.52 / +0.15 mm；5 mm 时逐 episode 锚点报出 4.8 mm</td><td class="warn">轻微，锚点能抓</td></tr>
+<tr><td><b>横向推力随倾角变化</b></td><td><b>1.22–1.24×</b></td><td><b>−0.02 / +0.08 mm</b></td><td class="lose">危险：三道检查全失效</td></tr>
+<tr><td><b>与朝向锁死</b>（最坏情形）</td><td><b>1.00×</b>（原样进入）</td><td><b>±0.00 mm</b></td><td class="lose">数学上不可见</td></tr>
+</table>
+<p>
+结论是<b>反直觉但很实用的</b>：幅度不是判据，<b>相关性才是</b>。随机手抖 1–2 mm 完全无害（只贡献 0.1–0.3×），
+而且会在残差里自曝；真正会毁掉结果的是「你往哪边倾、它就往哪边挪一点」的系统性位移 ——
+1 mm 就是 1.2 mm 直接进交付量，<b>而残差、holdout、逐 episode 锚点三道检查一道都发现不了</b>
+（因为姿态相关的位移正好落在模型 <span class="mono">R_i p + t_i = q_base</span> 的零空间里，
+「与朝向锁死」那一行就是这个零空间的解析形式）。
+<b>把球心钉住的因此不是手，而是球窝-钢球的接触</b>：只要接触不脱开，球心相对 rig 的自由度就被间隙锁死。
+</p>
+<p>
+实测的球心轨迹也印证了这一点 —— 两次成功采集里 <span class="mono">c_i = R_i·p + t_i</span> 的包络只有几毫米：
+</p>
+<table class="metric-table">
+<tr><th>采集</th><th>episode</th><th>包络</th><th>慢分量（1 s 中值窗）</th><th>快分量 RMS</th></tr>
+<tr><td>0818a</td><td>ep2 / ep3 / ep4</td><td>4.27 / 6.86 / 9.91 mm</td><td>2.31 / 3.48 / 6.41 mm</td><td>0.43 / 0.53 / 0.73 mm</td></tr>
+<tr><td>0818b</td><td>ep0 / ep1 / ep2</td><td>11.06 / 6.92 / 10.87 mm</td><td>5.93 / 3.56 / 5.28 mm</td><td>0.91 / 0.51 / 0.69 mm</td></tr>
+</table>
+<p>
+快分量不到 1 mm，就是跟踪噪声。慢分量那几毫米<b>无法从这批数据里区分「真的蠕动」和「随姿态缓变的位姿偏置」</b>
+—— 两者 signature 相同，正是上表第三、四行那一类。（顺带修正：前一版把判据写成包络 &lt;10 mm，
+但 0818b 的 ep0 实测 11.06 mm 而它是合格采集；该判据本来只是粗筛「有没有把 rig 拿离钢球」，
+放宽到 <b>&lt;20 mm</b>。）
+</p>
+<div class="callout">
+<b>由此得到的两条操作要求</b>（取代「手要稳」）：
+<b>① 始终压住、大倾角时别让球窝单边翘起</b> —— 单边脱开就是典型的姿态相关位移；
+<b>② 按压方向相对 rig 保持一致</b>（沿球窝轴线往下压，别换着手法扶）。
+第二条的理由是本次实验带出的一个新认识：球心落在窝里哪一点<b>由受力方向决定，而受力方向随 rig 一起转</b>，
+所以<b>球窝间隙本身就是一个姿态相关项</b> —— socket R = 12.68 对 25 mm 球，极端两接触点相距 0.36 mm，
+按 1.22× 杠杆最多 <b>0.44 mm 直接进 <span class="mono">p_rig</span>，且残差看不见</b>。
+这把「球窝间隙」从无害项升级为剩余 0.9 mm 的<b>主要嫌疑之一</b>（本文早前写它「只进残差不进
+<span class="mono">p_rig</span>」是错的，已在第 7 节更正）。判别很便宜：<b>两次采集故意用不同按压方向</b>，
+<span class="mono">p_rig</span> 若差 0.3–0.4 mm 即坐实。
+</div>
+
+<h4>5.2 第三次尝试（<span class="mono">…_180914</span>）：稳住的点选错了，但换来两个结果</h4>
+<p>
+这次是「marker rig 中心尽量保持不动（约 &lt;1 cm 晃动）」。数据本身很干净 ——
+1218/1218 帧全部解出融合位姿、7 台相机、残差 p95 3.64 mm、姿态跨度 p95 80.4°，都和两次合格采集同档。
+<b>操作也到位</b>：被盯住的那个点确实稳到了 7.00 / 11.12 mm 包络，正是「&lt;1 cm」。
+</p>
+<p>
+<b>但稳住的不是球窝球心。</b>CAD 系 layout 下拟合出的定点在 <span class="mono">[114.0, 1.7, −1.5] mm</span>
+（离球心 114 mm、离 marker 几何中心 45.7 mm），而球窝球心自己的轨迹包络是 <b>221.9 mm</b> ——
+球窝全程不在钢球上，转的是手扶住的位置。判别实验必须以球心为定点，因为只有那里的真值是
+<span class="mono">[0,0,0]</span>；手扶点没有真值，<span class="mono">|p_rig|</span> 就不再是误差度量。
+</p>
+<div class="callout ok">
+<b>由此得到一个比目测可靠得多的即时自检</b>：采集完直接看 <span class="mono">|p_rig|</span> ——
+CAD 系 layout 下，球窝真坐上去了它必然 <b>≈1 mm</b>（前两次 0.90 / 1.03 mm），没坐上去就是<b>几十到上百 mm</b>
+（本次 114.01 mm）。不用等完整分析，跟踪一跑完就能判。
+</div>
+<p>
+这次采集换来的两个结果：<b>① 直接量出了「手扶 vs 机械座」的差距</b> ——
+逐 episode 各自拟合定点，两个 episode 之间差 <b>29.90 mm</b>；对照坐在钢球上的两次是 <b>1.71 / 1.54 mm</b>，
+差 18 倍。注意这里的反差：<b>单个 episode 内点稳到 7–11 mm，但两个 episode 之间手重新扶的位置差了 3 cm，
+肉眼完全看不出来</b> —— 这正是 5.1 节结论的实证：稳住球心的是球窝-钢球的接触，不是手。
+<b>② 第 4 个外参偏置复现点</b>（本次定点在 <span class="mono">q ≈ [0.886, 0.044, 0.402]</span>）：
+cam_09 = <span class="mono">[−28.6, 2.2, 4.5]</span>（|d| 29.1 mm）对照 2.5 节的
+<span class="mono">[−26.0, 4.4, 5.5]</span>（27.0 mm），差 3.6 mm；其余六台复现到 1.5–6.1 mm。
+</p>
+
+<h4>5.3 判别实验完成（<span class="mono">…_183700</span>）：剩余偏移是<b>装配项</b>，不是相机外参</h4>
+<p>
+第四次尝试是真正的定点摆动 —— 每个 episode 球心包络 <b>3.8 / 5.2 / 5.2 mm</b>、速度 13–16 mm/s、
+姿态跨度 55–81°。<b>而且钢球在三个 episode 之间被挪了 311–454 mm</b>，等于判别实验一次做了三遍。
+所有指标都是历史最好：
+</p>
+<table class="metric-table">
+<tr><th>指标（CAD 系，<span class="mono">p_rig</span> 真值 = 0）</th><th>0818a</th><th>0818b</th><th><b>0818d（本次）</b></th></tr>
+<tr><td><span class="mono">p_rig</span> (mm)</td><td>[−0.49, 0.17, 1.01]</td><td>[−0.20, 0.55, 0.68]</td><td><b>[−0.19, 0.27, 0.42]</b></td></tr>
+<tr><td><b><span class="mono">|p_rig|</span></b></td><td>1.14 mm</td><td>0.90 mm</td><td class="win"><b>0.54 mm</b></td></tr>
+<tr><td>拟合残差 p95</td><td>2.47 mm</td><td>1.51 mm</td><td class="win"><b>1.41 mm</b></td></tr>
+<tr><td>holdout p95</td><td>1.83–2.09 mm</td><td>—</td><td class="win"><b>1.12 / 1.70 / 1.76 mm</b></td></tr>
+<tr><td>球窝位置跨度</td><td>1 mm</td><td>0 mm</td><td><b>454 mm</b></td></tr>
+</table>
+<p class="small">
+holdout 这一行的含义本次变了：是把 <span class="mono">p_rig</span> 搬到<b>它从没见过的球窝位置</b>去验
+（只迁移 <span class="mono">p_rig</span>、重解该 episode 的锚点），结果还比之前原地验的更好。
+</p>
+<h5>判别结果</h5>
+<table class="metric-table">
+<tr><th>对比</th><th><span class="mono">|Δp_rig|</span></th><th>方向夹角</th><th>球窝挪了吗</th></tr>
+<tr><td>0818a vs 0818b</td><td>0.58 mm</td><td>30.4°</td><td>否（同位置）</td></tr>
+<tr><td><b>0818b vs 0818d</b></td><td class="win"><b>0.38 mm</b></td><td class="win"><b>9.5°</b></td><td><b>是（0.3–0.45 m）</b></td></tr>
+<tr><td>0818a vs 0818d</td><td>0.67 mm</td><td>22.1°</td><td>是</td></tr>
+</table>
+<div class="callout ok">
+<b>挪了球窝的那一对，反而比原地重复的那一对更一致</b>（0.38 mm / 9.5° vs 0.58 mm / 30.4°）。
+球窝位置搬了 0.45 m 而 <span class="mono">p_rig</span> 没有系统性变化 → 这个偏移<b>固定在 rig 系</b>，
+即<b>假设 (A)：打印/装配偏差</b>；<b>假设 (B)（相机外参在 base 系形成的场）被排除为主因</b>。
+这与 2.5 节自洽：外参偏置确实存在（cam_09 有 27 mm），但它固定在 base 系，因此被
+<span class="mono">q_base</span> 吸收而不进 <span class="mono">p_rig</span>。
+</div>
+<p>
+<b>但有一个次级效应。</b>episode 之间 <span class="mono">p_rig</span> 的 rms 散布：同位置的两次采集都是
+<b>0.42 mm</b>，本次跨 0.45 m 则是 <b>0.84 mm</b>，差值约 0.73 mm。这是一个<b>位置相关但零均值</b>的分量 ——
+它不改变平均值，跨位置平均即可消掉，这正解释了本次 0.54 mm 为何最好：<b>它平均了三个位置</b>。
+（n = 3，且三个 episode 的姿态覆盖也不同（81° / 55° / 55°），所以这一条是提示性的，不如上面的主结论硬。）
+<b>实用推论：以后标定应在多个球窝位置各录一段再合并，比在同一位置反复录更准。</b>
+</p>
+<p class="small">
+工具侧一并修了：钢球挪动时共享锚点的头条数字是垃圾（本次 <span class="mono">p_cube</span> 208 mm、残差 p95 307 mm），
+且 leave-one-episode-out 三折全部「no usable samples」——因为训练集带过来的 <span class="mono">q_base</span>
+对留出 episode 毫无意义，每个样本都被粗差门挡掉。现在锚点跨度 &gt; 5 mm 即自动判定
+<span class="mono">socket_moved_between_episodes</span>，头条换成 multi-anchor 结果、并显式标注共享锚点那行无效；
+holdout 改为只迁移 <span class="mono">p_rig</span>、重解留出 episode 的锚点；per-camera 拟合同样接上 ——
+其离散度从假的 326.85 mm 回到真实的 <b>6.66 mm</b>。
+</p>
+</section>
+
+<section class="card">
+<div class="section-title"><h2>3. A/B：高位 cube vs 分布式 rig</h2><span class="badge warn">三项达标 / 三项显著改善但未达标</span></div>
+<p>
+三次合格采集全部用<b>同一套最好配置</b>重算（CAD 先验 layout σ=1 mm/1°、cam_09 排除在 layout 求解之外、
+7 台相机全部参与跟踪，杠杆臂口径统一为 102.01 mm），所以下面三列可以直接横比 ——
+它们之间的差异是<b>采集之间的差异</b>，不是配置差异。
+</p>
+<table class="metric-table">
+<tr><th>指标</th><th>0812 高位 cube</th><th>0818a</th><th>0818b</th><th><b>0818d</b></th><th>设计目标</th><th>判定</th></tr>
+<tr><td><b>杠杆臂 L</b></td><td>241.5 mm</td><td colspan="3" style="text-align:center"><b>102.0 mm</b>（−58%）</td><td>≤100–120 mm</td><td class="win">达标</td></tr>
+<tr><td><b>与 CAD 的端到端误差 <span class="mono">|p_rig|</span></b></td><td>无独立对照</td><td>1.14 mm</td><td>0.90 mm</td><td class="win"><b>0.54 mm</b></td><td>—</td><td class="win">已有独立对照</td></tr>
+<tr><td>pivot 拟合残差 p50 / p95</td><td>1.09 / 3.19 mm</td><td>0.77 / 2.47 mm</td><td>0.78 / 1.51 mm</td><td class="win"><b>0.61 / 1.41 mm</b></td><td>—</td><td class="win">改善 2.3×</td></tr>
+<tr><td>留一 episode holdout p95</td><td>3.72 – 3.74 mm</td><td>1.83 – 2.09 mm</td><td>—</td><td class="win"><b>1.12 – 1.76 mm</b></td><td>≤3 mm</td><td class="win">达标</td></tr>
+<tr><td>逐相机位置分歧 p50 / p95</td><td>4.57 / 9.67 mm</td><td>4.13 / 12.60 mm</td><td>4.05 / 11.35 mm</td><td><b>2.40 / 7.14 mm</b></td><td>不劣于基线</td><td class="warn">前两次持平，0818d 更好</td></tr>
+<tr><td>逐相机姿态分歧 p50 / p95</td><td>0.64° / 1.50°</td><td>0.68° / 1.43°</td><td>0.59° / 1.25°</td><td>0.57° / 1.25°</td><td>不劣于基线</td><td class="warn">持平 —— 收益不来自姿态变准</td></tr>
+<tr><td><b>姿态经杠杆臂折算到 TCP</b></td><td>2.69 / 6.32 mm</td><td>1.21 / 2.55 mm</td><td>1.06 / 2.23 mm</td><td><b>1.01 / 2.23 mm</b></td><td>&lt; 1.5 mm p95</td><td class="warn">改善 2.8×，未达标</td></tr>
+<tr><td>最差相机丢帧率</td><td>47.4%（cam_09）</td><td>14.3%（cam_06）</td><td class="win"><b>3.5%</b>（cam_06）</td><td>44.7%（cam_08）</td><td>&lt; 10%</td><td class="warn">随采集姿态波动，未稳定达标</td></tr>
+<tr><td>&gt;20 mm 粗差率（全量 / 剔 cam_09）</td><td>2.5%</td><td>15.5% / 1.16%</td><td>14.7% / <b>0.38%</b></td><td>16.3% / 0.80%</td><td>&lt; 0.5%</td><td class="lose">全量更差，根因是 cam_09 外参</td></tr>
+<tr><td>可观测性 cond</td><td>152.7</td><td colspan="3" style="text-align:center"><b>64.6</b></td><td>—</td><td class="win">扫掠姿态多样性好一倍</td></tr>
+<tr><td>marker 家族 / layout 来源</td><td>AprilTag 36h11，5 面 cube，<b>解析</b>角点</td><td colspan="3" style="text-align:center">ArUco <span class="mono">DICT_6X6</span> id 7/12/14/16/17，5 块分布板，<b>实测 + CAD 先验</b></td><td>—</td><td class="warn">生产链路检不到新 rig</td></tr>
+</table>
+<div class="callout ok">
+<b>四句话总结。（1）</b>杠杆臂减半的收益是真的，但它落在<b>精度</b>（姿态折算到 TCP p95 −65%）上，
+不落在拟合残差 —— 残差已经不由杠杆臂主导。逐相机姿态分歧几乎没变（0.64°→0.57–0.68°），
+<b>变的是这条角误差被乘以多长的杠杆</b>：241.5 → 102.0 mm。设计说明「准则二」在实测上成立。
+<b>（2）</b>第一次有了与机械 CAD 的独立对照：<span class="mono">|p_rig|</span> 三次 1.14 / 0.90 / <b>0.54 mm</b>。
+<b>（3）</b>薄弱环节已从「rig 几何」转移到「相机外参」和「layout 求解对坏相机没有防护」。
+<b>（4）</b>剩余 <span class="mono">|p_rig|</span> 已判定为<b>装配/打印项</b>（5.3 节）：球窝挪 0.3–0.45 m 后
+<span class="mono">p_rig</span> 只差 0.38 mm、方向差 9.5°，比原地重复还一致。
+跨三个球窝位置合并后降到 0.54 mm —— <b>标定应在多个球窝位置各录一段再合并</b>。
+</div>
+<div class="callout warn">
+<b>还差什么才能达 1.5 mm p95。</b>当前 p95 = 2.23 mm，对应姿态 p95 1.25°。要么继续压杠杆臂（≤60 mm 即可达标），
+要么把姿态分歧压到 0.85° 以内 —— 后者已经不是 rig 的问题，而是相机间外参一致性（第 5 节）。
+<br/><b>也不要把这张表当作可以冻结的交付值。</b>rig 未装到夹爪，<span class="mono">R_rig_tcp</span> 的轴约定未定；
+接触中心到 <span class="mono">TCP_closed</span> 的那段（0812 上是 −20.04 mm）没有对应实物；
+<b>拆装重测一组未做，现值仍是单次装配</b>。cam_09 / cam_08 需重标。
+</div>
+</section>
+
+<section class="card">
+<div class="section-title"><h2>4. 单 marker 与多 marker：准则四的实证</h2><span class="badge done">新证据</span></div>
+<p>把 7 台相机各自独立解一遍 pivot，再看它们各自每帧平均能看到几个 marker：</p>
+<table class="metric-table">
+<tr><th>相机</th><th>每帧 marker 数</th><th>自解 <span class="mono">p_rig</span> (mm)</th><th>与融合解的位置分歧 p50</th><th>丢帧率</th><th>自身重投影 p50</th></tr>
+<tr><td>cam_14</td><td><b>3.34</b></td><td>[−1.88, 102.52, 7.86]</td><td>5.86 mm</td><td>0.0%</td><td>1.00 px</td></tr>
+<tr><td>cam_13</td><td><b>3.30</b></td><td>[−2.57, 102.30, 7.84]</td><td>3.57 mm</td><td>0.0%</td><td>1.10 px</td></tr>
+<tr><td>cam_12</td><td><b>3.05</b></td><td>[−3.35, 102.41, 8.68]</td><td>1.41 mm</td><td>0.0%</td><td>0.61 px</td></tr>
+<tr><td>cam_07</td><td><b>2.27</b></td><td>[−3.54, 102.34, 7.57]</td><td>1.52 mm</td><td>0.4%</td><td>0.69 px</td></tr>
+<tr><td>cam_08</td><td>1.24</td><td>[−1.59, <b>104.95</b>, 5.63]</td><td>4.42 mm</td><td>12.2%</td><td>0.22 px</td></tr>
+<tr><td>cam_06</td><td>1.08</td><td>[−3.00, <b>106.41</b>, 0.89]</td><td>9.96 mm</td><td>14.3%</td><td>0.13 px</td></tr>
+<tr><td>cam_09</td><td>—</td><td>[−4.85, 100.37, 8.83]</td><td>27.11 mm（见第 5 节）</td><td>2.4%</td><td>1.03 px</td></tr>
+</table>
+<div class="callout">
+<b>四台能同时看到 ≥2 个 marker 的相机，彼此的 <span class="mono">p_rig</span> 最大只差 1.69 mm；</b>
+两台大多只看到 1 个 marker 的（cam_06 / cam_08）分别偏出 4.5 / 3.0 mm，而且<b>它们的自身重投影反而最小（0.13 / 0.22 px）</b>
+—— 单 marker PnP 总能把自己拟合得很漂亮，代价是位姿本身可以整体转歪。这正是设计说明「准则四：任何单个平面 marker 都不允许独自决定 pose」
+的直接证据，也说明 rig 的分歧主要不是「相机好坏」，而是「这台相机看见几个 marker」。
+</div>
+</section>
+
+<section class="card">
+<div class="section-title"><h2>5. 副产物：cam_09 有一个 27 mm 的固定外参偏置</h2><span class="badge p0">需处置</span></div>
+<table class="metric-table">
+<tr><th>相机</th><th>与融合解的中位偏差向量 (mm)</th><th>|偏差| p50</th><th>&gt;20 mm 比例</th><th>自身重投影 p50</th></tr>
+<tr><td><b>cam_09</b></td><td><b>[−24.6, +9.2, +7.3]</b></td><td><b>27.11 mm</b></td><td><b>100.0%</b></td><td>1.03 px</td></tr>
+<tr><td>cam_06</td><td>[−6.8, +7.1, −1.2]</td><td>10.08 mm</td><td>4.0%</td><td>0.13 px</td></tr>
+<tr><td>cam_14</td><td>[+3.8, −0.7, −4.0]</td><td>5.86 mm</td><td>0.0%</td><td>1.00 px</td></tr>
+<tr><td>cam_08</td><td>[−3.4, −2.4, +0.9]</td><td>4.47 mm</td><td>1.9%</td><td>0.22 px</td></tr>
+<tr><td>cam_13</td><td>[−2.7, −0.6, +1.7]</td><td>3.57 mm</td><td>0.0%</td><td>1.10 px</td></tr>
+<tr><td>cam_07</td><td>[−0.1, −0.1, −0.4]</td><td>1.54 mm</td><td>0.7%</td><td>0.69 px</td></tr>
+<tr><td>cam_12</td><td>[+0.8, +0.6, +0.5]</td><td>1.41 mm</td><td>0.0%</td><td>0.61 px</td></tr>
+</table>
+<div class="callout warn">
+<b>这是偏置不是噪声：</b>cam_09 的偏差<b>方向固定</b>、幅值稳定、100% 的样本都超过 20 mm 门限，
+而它自己的重投影只有 1.03 px —— 内参和角点没问题，<b>它在 base 系里的位置是错的</b>。
+0812 文档记录的最大两两差正是「cam_06 与 cam_09」，本次独立复现了同一对相机。
+<br/><b>影响与处置：</b>融合解对它不敏感（剔除 cam_09 重跑整条链路，<span class="mono">p_rig</span> 只移动 <b>0.89 mm</b>，
+杠杆臂 102.32 → 102.04 mm，反而更贴 CAD），因为 corner-BA 的 8 px 重投影门限会在多数帧把它挡掉。
+但生产 sidecar 目前是 pose 级加权平均，<b>没有这道门</b>；建议先单独重标 cam_09 外参，
+在此之前把它在生产融合里降权或排除，并把「逐相机中位偏差向量」做成每次采集的常规体检项。
+</div>
+<div class="callout warn">
+<b>1 小时 45 分之后的第二次采集里，cam_09 不再是「偏置」而是彻底失效。</b>
+它的单相机独立解变成 <span class="mono">p_rig = [−14.7, 13.1, 28.0] mm</span>（杠杆臂 34 mm，真值 102），自残差 p50 <b>16.9 mm</b>；
+<span class="mono">cam_08</span> 同时也坏了（自残差 p50 <b>28.4 mm</b>，杠杆臂 121 mm）。两台在第一次采集里还分别是 2.7 / 3.4 mm。
+<table class="metric-table">
+<tr><th>用途</th><th>含 cam_09</th><th>剔除 cam_09</th><th>结论</th></tr>
+<tr><td>layout 求解（0818b）</td><td>与 CAD 中心残差 <b>7.35 mm</b>，角点刚性 p50/p95 2.55 / 7.71 mm</td><td>与 CAD 中心残差 <b>0.26 mm</b>，刚性 1.01 / 1.46 mm</td><td class="lose"><b>致命</b>：直接把杠杆臂推到 107.3 mm</td></tr>
+<tr><td>逐帧跟踪（CAD 系）</td><td><span class="mono">|p_rig|</span> 1.29 mm</td><td><span class="mono">|p_rig|</span> 1.41 mm</td><td class="win">无所谓，corner-BA 的 8 px 门限挡住了</td></tr>
+</table>
+<b>所以处置是分层的</b>：跟踪端已经有防护，<b>layout 求解端没有</b> —— 它对全部相机等权做像素级 BA，一台错外参的相机会把整个 rig 的形状拽歪。
+在重标 cam_09 / cam_08 之前，layout 求解必须显式排除它们；更根本的修法是给 layout BA 加一层逐相机重投影门限（与跟踪端同一道）。
+</div>
+</section>
+
+<section class="card">
+<div class="section-title"><h2>6. 对照实验：改进有多少来自估计器</h2><span class="badge done">已排除混淆</span></div>
+<p>
+新 rig 用的是新写的 corner-BA + 实测 layout，老 cube 的公开数字来自生产的「单 marker PnP + pose 级平均 + 解析 cube 角点」。
+两者不同源，直接比会把「算法变好」记成「rig 变好」。所以把<b>同一套估计器</b>倒回去跑 0812 的原始数据
+（<span class="mono">tcp_marker_rig_calib_20260812_102610</span>，解析 cube layout）：
+</p>
+<table class="metric-table">
+<tr><th>量</th><th>0812 公开值（生产链路）</th><th>0812 原始数据 + 本次估计器</th><th>新 rig + 本次估计器</th></tr>
+<tr><td><span class="mono">p_cube</span> / <span class="mono">p_rig</span></td><td>[−5.35, −214.81, 110.17]</td><td>[−5.44, −214.08, 109.32]</td><td>[−3.46, 101.91, 8.53]</td></tr>
+<tr><td>杠杆臂</td><td>241.47 mm</td><td>240.44 mm</td><td><b>102.32 mm</b></td></tr>
+<tr><td>拟合残差 p95</td><td>3.76 mm</td><td>3.19 mm</td><td>3.02 mm</td></tr>
+<tr><td>逐相机位置分歧 p50 / p95</td><td>4.57 / 9.67 mm</td><td>4.12 / 13.85 mm</td><td>3.87 / 12.41 mm</td></tr>
+<tr><td>逐相机姿态分歧 p50 / p95</td><td>0.64° / 1.50°</td><td>0.54° / 1.59°</td><td>0.67° / 1.45°</td></tr>
+<tr><td>姿态折算到 TCP p50 / p95</td><td>2.69 / 6.32 mm</td><td>2.28 / 6.71 mm</td><td><b>1.20 / 2.59 mm</b></td></tr>
+</table>
+<div class="callout ok">
+<b>估计器换过去后，老 cube 的答案在 1.1 mm 内复现了公开值</b>（杠杆臂 241.47 → 240.44 mm），
+逐相机分歧、姿态分歧也都在同一档。<b>所以 TCP 误差减半这一项确实来自杠杆臂，不是来自换算法。</b>
+</div>
+
+<h3>6.1 更正：拟合残差几乎没降，而且本来就不该降</h3>
+<p>
+本文档早先把「拟合 p95 3.76 → 3.02 mm」当成改善写了出来 —— <b>那是跨口径比较</b>：3.76 出自生产链路，
+同一估计器跑 0812 原始数据得到的是 <b>3.19</b>。同口径的 A/B 因此是 <b>3.19 → 3.02，几乎没动</b>。原因有两层。
+</p>
+<p>
+<b>其一，残差不是 L·θ。</b>逐帧残差是 <span class="mono">r_i = δt_i + δθ_i × (R_i·p)</span>，只有第二项与杠杆臂成正比。
+把残差除以杠杆臂换算成等效角，反而涨了：
+</p>
+<table class="metric-table">
+<tr><th></th><th>杠杆臂</th><th>残差 p50 / p95</th><th>残差 ÷ 杠杆臂（等效角）</th></tr>
+<tr><td>0812 cube（同一估计器）</td><td>240.4 mm</td><td>1.09 / 3.19 mm</td><td>0.259° / 0.760°</td></tr>
+<tr><td>0818 新 rig</td><td>102.3 mm</td><td>0.84 / 3.02 mm</td><td><b>0.469° / 1.693°</b></td></tr>
+</table>
+<p>
+杠杆臂缩了 2.35×，等效角涨了 1.8×（p50）到 2.2×（p95），乘起来抵消。
+<b>也就是说残差已经不再由杠杆臂主导，而是由与杠杆臂无关的项主导。</b>
+</p>
+<p>
+<b>其二，那个「与杠杆臂无关的项」就是 layout 误差。</b>老 cube 的角点由「理想立方体 + 实测边长」解析生成，刚性上完美；
+新 rig 的 layout 是从数据里量出来的，角点刚性 p50 0.91 / p95 6.45 mm。layout 有误差时位姿就依赖于
+「这一帧看见哪几个 marker」，marker 集合一换位姿就跳 —— 而这恰恰是帧间一致性残差唯一看得见的那类误差
+（rig 系里恒定的误差会被 <span class="mono">p_rig</span> 整个吸收，这也是 0812 文档「系统项残差里看不见」的同一条道理）。
+按可见集合切分，信号非常干净：
+</p>
+<table class="metric-table">
+<tr><th>该帧可见的 marker</th><th>帧数</th><th>残差 p50</th><th>残差 p95</th></tr>
+<tr><td>5 个全见</td><td>541</td><td><b>0.67 mm</b></td><td><b>1.48 mm</b></td></tr>
+<tr><td>{7,12,14,16}（丢 17）</td><td>1005</td><td>0.89 mm</td><td>2.08 mm</td></tr>
+<tr><td>{12,14,16,17}（丢 <b>7</b>）</td><td>245</td><td>1.06 mm</td><td><b>4.89 mm</b></td></tr>
+</table>
+<p class="small">
+按相机数切分同样：3 相机 p50 3.52 / p95 5.08，5 相机 p50 0.72 / p95 1.41。全局 p95 的尾巴里 <b>87% 来自 ep4</b>，
+因为 ep4 低相机数、丢 marker 的帧最多 —— 不是座子被碰动（原第 7 节第 4 条的猜测）。
+</p>
+<div class="callout ok">
+<b>在相机数匹配的条件下比（5 相机）：0812 是 0.96 / 1.86 mm，新 rig 是 0.72 / 1.41 mm，改善约 25%。</b>
+杠杆臂的收益是真的，但它体现在<b>精度</b>（逐相机分歧投影到 TCP，6.32 → 2.59 mm p95），不体现在拟合残差；
+残差现在被 layout 质量卡住。这也正是转向 CAD 约束 layout（2.3 节）的直接动机：
+用 CAD 冻住板心与法线之后，0818b 的残差 p95 从 2.60 掉到 1.92 mm，holdout p95 从最差 4.75 掉到 2.09 mm。
+</div>
+<p class="small">
+对照实验的一个已知瑕疵：它用 <span class="mono">cv2.aruco</span> 检 36h11，而不是生产用的 pupil 检测器（本机 venv 未装），
+cam_13 / cam_14 上出现了会污染单相机 PnP 的误检（自身重投影中位 179 / 183 px），因此该行的
+「逐相机最大两两」不可用（504 mm）。融合解不受影响 —— corner-BA 的重投影门限把这些帧挡在外面，
+这也是上表 <span class="mono">p_cube</span> 仍能复现公开值的原因。
+</p>
+</section>
+
+<section class="card">
+<div class="section-title"><h2>7. 还不能交付什么</h2><span class="badge warn">未决</span></div>
+<ol>
+<li><b>rig → TCP 的旋转仍差最后一步语义。</b>CAD 已经给出 rig 系与 CAD 系之间完整的 6D 变换（中心对齐残差 0.93 mm），
+CAD 原点就是球心 = 未来接触中心；但<b>「CAD 的三根轴对应夹爪 TCP 的哪三根轴」还需要在 rig 真正装到夹爪之后确认</b>。
+0812 已经栽过一次：单点 pivot 永远给不出旋转，任何旋转都必须写明 <span class="mono">rotation_source</span>。</li>
+<li><b>接触中心 ≠ TCP_closed。</b>0812 的口径里，pivot 测的是两指腹中心，到 <span class="mono">TCP_closed</span> 还要沿手指轴修
+<b>−20.04 mm</b>（FK 指腹中心偏置，机构状态 d = 34.27 mm）。本次 rig 不在夹爪上，这一段还没有对应实物。</li>
+<li><b>重复性只做了一半。</b>「同一装配、间隔 1h45m 的重扫」已完成，两次差 0.60 mm（2.3 节）；
+但<b>拆装 5 次、不同 opening、轻载荷方向仍然一组都没做</b>。现在这个 102.3 mm 依然是<b>单次装配</b>的值。</li>
+<li class="done"><s><b>ep4 的 holdout p95 = 4.75 mm 需回看视频</b></s> —— <b>已定位，不是座子被碰动</b>：
+ep4 低相机数 / 丢 marker 的帧最多，全局残差尾巴的 87% 来自它（6.1 节）。换用 CAD 约束 layout 后，
+三条 holdout p95 收敛到 1.83 / 1.87 / 2.09 mm。</li>
+<li><b>layout 求解对坏相机没有防护</b>（新增，见第 5 节）：它对全部相机等权做像素级 BA，
+一台外参错的相机（cam_09）就能把杠杆臂推偏 5 mm。跟踪端有 8 px 逐相机门限，layout 端没有 —— 应补上同一道门。</li>
+<li><b>marker 7 / 17 的 layout 较弱</b>：它们平均只有 1.9 台相机同时看得见（其余三个是 3.4–4.8 台）。
+CAD 约束 layout（2.3 节）已经把这条从「误差源」降级为「无所谓」，因为它们的位置不再由射线交会决定；
+但如果要回到纯数据自定义 layout，这仍是首要短板。</li>
+<li class="done"><s><b>1.3 mm 系统偏移的成因</b></s> —— <b>已定位</b>：卡尺（贴纸实测 60.86 mm）判掉了尺度与 marker 尺寸两个候选，
+偏移几乎纯切向，是打印件板位相对 CAD 的横向装配公差。改用 CAD 先验后降到 <b>0.90 / 1.03 mm</b>（2.3 节）。</li>
+<li class="done"><s><b>剩下的 0.9–1.0 mm 是装配项还是相机外参项</b></s> —— <b>已判定为装配项</b>（5.3 节）：
+球窝位置搬 0.3–0.45 m 后 <span class="mono">p_rig</span> 只差 0.38 mm、方向差 9.5°，比原地重复还一致，
+所以偏移固定在 rig 系。跨三个球窝位置合并后 <span class="mono">|p_rig|</span> 降到 <b>0.54 mm</b>。
+<b>剩下的分解</b>：仍未拆开的是那个 <b>0.73 mm 位置相关零均值分量</b>（同位置 ep 间散布 0.42 mm，
+跨 0.45 m 涨到 0.84 mm；n=3 且姿态覆盖不同，属提示性），以及<b>球窝间隙</b> —— socket R=12.68 对 25 mm 球，
+球心落在窝里哪一点由受力方向决定、而受力方向随 rig 一起转，是姿态相关项，
+极端两点 0.36 mm × 1.22 倍杠杆 ≈ 最多 0.44 mm 进 <span class="mono">p_rig</span> 且残差看不见（5.1 节；
+此前本文写它「只进残差不进 <span class="mono">p_rig</span>」是错的）。判别仍然很便宜：
+<b>两次采集故意用不同的按压方向</b>，<span class="mono">p_rig</span> 若差 0.3–0.4 mm 即坐实。</li>
+<li><b>cam_09 / cam_08 必须重标。</b>它们在第二次采集里失效（第 5 节），当前所有最好结果都是<b>把 cam_09 排除在 layout 求解之外</b>得到的；
+这不是长久之计 —— layout BA 需要一道逐相机重投影门限。</li>
+<li><b>生产链路还检不到这个 rig。</b>生产配置是 36h11 + cube 面解析角点；接入前需要把
+<span class="mono">marker_layout.json</span> 与 ArUco 字典打通（roadmap 已列为 P0-1「marker layout 可标定化」）。</li>
+</ol>
+</section>
+
+<section class="card">
+<div class="section-title"><h2>8. 产物与复现</h2></div>
+<p>新增四个 CLI（<span class="mono">third_party/opencv_kalibr/metrology/</span>），彼此用缓存解耦，重跑不必重解视频：</p>
+<table class="metric-table">
+<tr><th>工具</th><th>作用</th></tr>
+<tr><td><span class="mono">cli/detect_rig_markers.py</span></td><td>7 路视频一次性检出所有 marker 角点，存 <span class="mono">.npz</span> 缓存（存畸变原图像素，不预先去畸变）</td></tr>
+<tr><td><span class="mono">rig_layout.py</span> + <span class="mono">cli/bootstrap_marker_layout.py</span></td><td>三角化 → 刚体旋转平均 → 以 CAD 为初值的 square-marker 像素级 BA，导出 <span class="mono">marker_layout.json</span> 与 CAD 对照报告</td></tr>
+<tr><td><span class="mono">cli/track_marker_rig_in_base.py</span></td><td>逐帧 corner-BA 融合位姿 + 逐相机独立 PnP，输出与生产 cube tracker <b>同一套 CSV schema</b>，所以 pivot 工具原样可用</td></tr>
+<tr><td><span class="mono">cli/marker_rig_dispersion_report.py</span></td><td>逐相机分歧 / 丢帧率 / 粗差率 / 中位偏差向量 —— 即设计说明第七节的验收表</td></tr>
+<tr><td><span class="mono">cli/build_cad_layout.py</span></td><td><b>新增</b>：把实测 layout 的板心与法线换成 CAD 值，只保留实测的面内转角与边长，并把结果表达在 CAD 系（原点 = 球心）。带 <span class="mono">--max-tilt-deg</span> 护栏</td></tr>
+<tr><td><span class="mono">fixtures/cad/marker_rig_20260818_cad.json</span></td><td>从 Onshape 提取的 CAD 真值（球心、5 个贴标面角点），带 did/wid/eid 出处</td></tr>
+</table>
+<p>Thor 上的完整复现命令：</p>
+<pre class="mono" style="background:#f3f4f6;padding:14px;border-radius:10px;overflow-x:auto;font-size:12.5px">cd ~/lerobot/third_party/opencv_kalibr &amp;&amp; P=.venv/bin/python3
+CFG=hikon_cube_tracking_offline/config_thor/april_cube_tracking_in_robot_base_thor.yaml
+O=~/lerobot/outputs/metrology/newrig_20260818
+O2=~/lerobot/outputs/metrology/newrig_20260818_115119
+
+$P -m metrology.cli.detect_rig_markers --dataset-root ~/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260818_100615 \
+   --episodes 2 3 4 --cameras cam_06 cam_07 cam_08 cam_09 cam_12 cam_13 cam_14 \
+   --dictionary DICT_6X6_50 --out $O/detections_ep234.npz
+
+$P -m metrology.cli.bootstrap_marker_layout --detections $O/detections_ep234.npz --config $CFG \
+   --layout-id newrig_20260818_measured --cad-json metrology/fixtures/cad/marker_rig_20260818_cad.json \
+   --out $O/marker_layout_measured.json --frame-step 4 --refine-frames 120
+
+$P -m metrology.cli.track_marker_rig_in_base --detections $O/detections_ep234.npz \
+   --layout-json $O/marker_layout_measured.json --config $CFG --rig-name newrig \
+   --out-dir ~/lerobot/outputs/tracking_analysis/newrig_20260818_ep234
+
+$P -m metrology.cli.pivot_marker_tcp_calibration ~/lerobot/outputs/tracking_analysis/newrig_20260818_ep234 \
+   --cube newrig --out $O/pivot_marker_rig_20260818.json
+
+$P -m metrology.cli.marker_rig_dispersion_report ~/lerobot/outputs/tracking_analysis/newrig_20260818_ep234 \
+   --rig-name newrig --lever-arm-mm 102.32
+
+# --- 第二次采集 + CAD 约束 layout（2.3 / 6.1 节）。检测须用 .venv 的 python（system py3.12 的 cv2 无 ArucoDetector），
+#     layout/tracking/pivot 须用 system python3（.venv 无 scipy）。
+$P -m metrology.cli.detect_rig_markers --dataset-root ~/lerobot/outputs/datasets/thor_gmsl2_9ch_v1_20260818_115119 \
+   --episodes 0 1 2 --cameras cam_06 cam_07 cam_08 cam_09 cam_12 cam_13 cam_14 \
+   --dictionary DICT_6X6_50 --out $O2/detections_ep012.npz
+
+python3 -m metrology.cli.build_cad_layout --measured-layout $O/layout_g12.json \
+   --cad-json metrology/fixtures/cad/marker_rig_20260818_cad.json --out $O/layout_cad.json
+
+python3 -m metrology.cli.track_marker_rig_in_base --detections $O2/detections_ep012.npz \
+   --layout-json $O/layout_cad.json --config $CFG --rig-name newrig \
+   --out-dir ~/lerobot/outputs/tracking_analysis/cadlayout_b
+python3 -m metrology.cli.pivot_marker_tcp_calibration ~/lerobot/outputs/tracking_analysis/cadlayout_b \
+   --cube newrig --fps 60 --out $O2/pivot_cadlayout.json    # |p_rig| 应接近 0</pre>
+<p class="small">
+单元测试：<span class="mono">metrology/tests/test_rig_layout.py</span>（7 项：三角化、square 往返、合成 rig 的 layout 复原、
+BA 收敛、canonical frame 在刚体移动下不变、CAD 编号分配、CAD 约束 layout 落在板面上）。
+全量 <span class="mono">metrology/tests</span> <b>109 项通过</b>。
+</p>
+</section>
+
+</div>
+</body>
+</html>

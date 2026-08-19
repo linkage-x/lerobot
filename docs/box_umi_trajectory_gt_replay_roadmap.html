@@ -4,7 +4,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta content="width=device-width, initial-scale=1" name="viewport"/>
-<title>BOX 高精度 UMI Trajectory GT Roadmap</title>
+<title>BOX 高精度 UMI Trajectory GT &amp; Dual-FR3 Replay Roadmap</title>
 <style>
   :root{
     --bg:#f6f7f9;
@@ -128,8 +128,8 @@
 <body>
 <div class="wrap">
 <section class="hero">
-<h1>BOX 高精度 UMI Trajectory GT Roadmap</h1>
-<p>目标：优先建立可独立验证的毫米级双手 TCP 轨迹 GT；4D perception 作为后续遮挡、markerless 与 object tracking 增强。</p>
+<h1>BOX 高精度 UMI Trajectory GT &amp; Dual-FR3 Replay Roadmap</h1>
+<p>目标：先建立可独立验证的毫米级双手 TCP 轨迹 GT，再证明该轨迹经双 FR3 注册、联合 retarget、碰撞约束与控制后仍能以毫米级 fidelity 物理重播；4D perception 作为后续遮挡、markerless 与 object tracking 增强。</p>
 <div class="meta">
 <span class="pill">8 路桌面固定 RGB GS 相机</span>
 <span class="pill">左右腕部各 1 路</span>
@@ -138,10 +138,10 @@
 <span class="pill">相机间硬同步：已验证</span>
 <span class="pill">两台 BOX 设备各 1 个 IMU</span>
 <span class="pill">IMU↔Camera：毫秒级软同步</span>
-<span class="pill">关键精度项默认展开</span></div>
+<span class="pill">双 FR3 replay：新增主线</span><span class="pill">独立 6DoF replay GT：规划中</span><span class="pill">关键精度项默认展开</span></div>
 <p style="margin-top:16px;color:#9ca3af;font-size:13px">
       <b>当前状态：</b>8 路相机标定已接入生产，held-out 3D p95 为 0.244 mm；0805 生产 A/B 已确认端到端瓶颈不在相机标定，而在 marker rig 几何与 marker→TCP。
-      当前主线是 Phase 3 的实物几何与 repeatability 收敛，再把已验证的 BA / covariance / smoother 接成生产候选，最后用独立 GT、双手一致性和 replay Gate 决定训练数据准入。
+      当前主线是先收敛 Phase 3 的实物几何与 repeatability，并把已验证的 BA / covariance / smoother 接成生产候选；世界系持久化改为 <b>stable-camera consensus</b>（通常 ≥4 台未移动相机）而非桌面锚板；随后双 FR3 replay 主线通过移动平台 ArUco 做 session base registration → 共享 first-frame / absolute 对齐 → 联合 retarget + 碰撞约束 → FR3 intrinsic benchmark → 独立 6DoF GT 的双臂物理 replay 验收。
       标定与 A/B 的完整过程见 <a href="box_camera_calibration_report_20260804.html" style="color:#93c5fd">BOX 8 路相机标定实验报告</a>；版本历史保留在页面末尾。
     </p>
 </section>
@@ -160,14 +160,18 @@
 <tr><td>夹爪开度 / 指尖距离</td><td>独立标尺验证；误差预算按 contact TCP 对 d 的敏感度反推</td></tr>
 <tr><td>轨迹 catastrophic jump</td><td>0</td></tr>
 <tr><td>Tracking coverage</td><td>&gt; 99%（“有没有可靠轨迹”）</td></tr>
-<tr><td>Training-valid yield</td><td>单独统计；通过 tracking + QC + bimanual + retarget/replay 后才计入</td></tr>
+<tr><td>Training-valid yield</td><td>单独统计；通过 tracking + QC + bimanual + dual-FR3 executability 后才计入</td></tr>
+<tr><td>FR3 relative replay fidelity</td><td>目标与录制 GT 同量级；以 shared first-frame alignment 后的 p95 / RPE 验收</td></tr>
+<tr><td>FR3 absolute physical replay</td><td>先建立实测误差预算；最终目标为 3 mm-class，不能由 FR3 FK 自证</td></tr>
+<tr><td>Replay-certified yield</td><td>与 training-valid yield 分开统计；额外要求独立 6DoF physical replay 通过</td></tr>
+<tr><td>World-frame provenance</td><td>100% episode / calibration 可追溯到 <span class="mono">world_frame_id</span>；全相机移动只触发 continuity break，不使历史轨迹失效</td></tr>
 </table>
 <div class="callout">
         <b>训练侧评价顺序：</b>contact-local / short-horizon RPE 与 bimanual relative RPE 优先于 global APE；
         重点报告 40 ms / 100 ms / 400 ms / 1 s 的 relative pose error，同时保留独立 absolute GT 用于认证 metric scale。
       </div>
 <div class="callout ok">
-        <b>外部证据已内化：</b><a href="https://arxiv.org/abs/2607.25895">HiFi-UMI</a> 仅用于加强这套验收口径：3 mm 目标仍按 p95 + independent GT 管理；双手同时报告 native common-view consistency 与 bimanual RPE；数据集把 tracking coverage 和 training-valid yield 分开；opening / fingertip distance、replayability 和 timing 的 motion-equivalent error 都必须进入训练侧 Gate。固定 8 路 metric rig 仍是主线，不照搬其 head-SLAM 或 &lt;40 μs 门槛。
+        <b>统一验收口径：</b>3 mm 目标按 p95 + independent GT 管理；双手同时报告 native common-view consistency 与 bimanual RPE；tracking coverage、training-valid yield 与 replay-certified yield 分开；opening / fingertip distance、timing motion-equivalent error、retarget distortion 与 physical replay fidelity 都进入对应 Gate。
       </div>
 </section>
 <section class="card">
@@ -176,6 +180,8 @@
 </div>
 <p><b>Tier A：8 路桌面固定相机</b><br/>作为 Trajectory GT 的主测量网络。</p>
 <p><b>Tier B：左右腕部 + 头部 3 路运动相机</b><br/>第一阶段不直接承担绝对 GT 主约束；后续用于 4D、close-up 与 markerless recovery。</p>
+<p><b>Tier C：双 FR3 Replay System</b><br/>两台 FR3 作为目标 embodiment；必须有 session 级双 base 注册、联合 collision-aware retarget、真实控制执行与外部 physical GT。FR3 FK 只用于内部诊断，不承担 3 mm 认证。</p>
+<p><b>Independent Replay GT</b><br/>优先采用可动态输出 6DoF 的激光跟踪/光学测量系统。若只有单点 XYZ，则仍缺 orientation GT；若已有可靠 6DoF tracker，FR3 末端视觉 marker rig 可降为可选工程 QC，而非认证必需件。</p>
 <div class="flow">8 fixed cams
    ↓
 marker corners
@@ -204,15 +210,19 @@ IMU factor graph / QC</div>
 </div>
 <table class="metric-table">
 <tr><th>误差项</th><th>预算</th><th>状态</th><th>贡献与判断</th></tr>
-<tr><td>8 相机内外参 / 三角测量</td><td>≤0.8 mm</td><td><span class="badge done">已够</span></td><td>Level 1 p95 0.73 mm；0804 independent 3D p95 0.244 mm。继续重标收益低</td></tr>
-<tr><td>marker 尺寸 / marker rig 几何</td><td>≤1.0 mm</td><td><span class="badge p0">未完成</span></td><td>当前最大误差源：5.8→5.6 使相机间一致性 26.6→4.1 mm；还要 marker layout 可标定化</td></tr>
+<tr><td>8 相机内外参 / 三角测量</td><td>≤0.8 mm</td><td><span class="badge warn">几何已够，外参有可修的偏置</span></td><td>Level 1 p95 0.73 mm；0804 independent 3D p95 0.244 mm。<b>但 2026-08-18 实测出逐相机固定外参偏置</b>：cam_09 <b>27.0 mm</b>、cam_06 8.4、cam_08 5.1、cam_13 3.9、cam_14 3.4、cam_07 1.1、cam_12 1.0 mm，<b>固定在 base 系</b>（跨 0.5 m 工作区只变 1–2 mm）且在三次独立采集间复现到中位 1.9–2.4 mm。这是可标定量，不是噪声；修正表见 <a href="box_umi_marker_rig_tcp_20260818.html">实验记录 2.5 节</a></td></tr>
+<tr><td>marker 尺寸 / marker rig 几何</td><td>≤1.0 mm</td><td><span class="badge warn">大幅推进</span></td><td>5.8→5.6 使相机间一致性 26.6→4.1 mm。<b>2026-08-18 marker layout 已可标定化</b>：实测 layout + CAD 先验，与机械 CAD 的端到端误差 <span class="mono">|p_rig|</span> = 1.03 / 0.90 mm（两次采集差 0.48 mm）。贴纸边长 60.86 mm（卡尺）与视觉全局差 −0.19%；<b>贴纸 0.75 mm 的厚度也被光学独立测出（极小值在 +0.75，抛物线顶点 0.82 mm）</b>。剩余：拆装重测、cam_09/cam_08 重标</td></tr>
 <tr><td>marker→rigid TCP 常量</td><td>≤1.0 mm</td><td><span class="badge warn">部分完成</span></td><td>pivot 已出常量；但 σ 有 5 mm 量级分量，拆装 / 载荷 / opening repeatability 未采</td></tr>
-<tr><td>杠杆臂姿态放大 <span class="mono">L·θ</span></td><td>≤1.0 mm</td><td><span class="badge p0">未解决</span></td><td>当前 L≈241 mm，0.5°≈2.1 mm；低矮 / 分布式 rig 目标 L≤100–120 mm</td></tr>
+<tr><td>杠杆臂姿态放大 <span class="mono">L·θ</span></td><td>≤1.0 mm</td><td><span class="badge warn">部分缓解</span></td><td>0812 高位 cube L≈241 mm，0.5°≈2.1 mm。<b>2026-08-18 分布式原型实测 L = 102.3 mm</b>（<a href="box_umi_marker_rig_tcp_20260818.html">实验记录</a>），逐相机姿态分歧未变（0.64°→0.67° p50），但折算到 TCP 的 p95 由 6.32 → <b>2.59 mm</b>。距 ≤1.0 mm 仍差一档：要么 L 再降到 ≤60 mm，要么把姿态分歧压到 0.85° 以内（那已是相机间外参问题，不是 rig 问题）</td></tr>
 <tr><td>corner 级 multi-view solver + covariance</td><td>≤0.8 mm</td><td><span class="badge warn">离线已验证，生产未接</span></td><td>0817 Thor 1808 帧 full run 已完成 corner BA + FIM → <span class="mono">Σ_TCP</span>；quality-gated <span class="mono">σ_TCP,max</span> p95 = <b>0.217 mm</b>，低于 0.8 mm 预算。剩余工作是替换生产 <span class="mono">fuse_frame_samples()</span>、写 sidecar covariance / quality flag，并用分布式 <span class="mono">marker_layout.json</span> 重算</td></tr>
 <tr><td>timing / 动态误差</td><td>≤0.5 mm</td><td><span class="badge warn">部分完成</span></td><td>相机硬同步已完成；Camera↔IMU Δt 未标，需按 <span class="mono">v·|Δt|</span> / <span class="mono">ω·|Δt|</span> 验证</td></tr>
 <tr><td>轨迹滤波 / smoothing</td><td>≤0.5 mm</td><td><span class="badge warn">离线候选，需 contact A/B</span></td><td>0817 已用 0812 BA CSV 跑三档 Phase 5 smoother；推荐离线候选 v4：shift p95=0.382 mm / p99=0.595 mm，0.1s smooth-vs-raw RPE p95=0.632 mm，velocity-change p95 降到 raw 的 0.649。0812 数据主要是 pivot / calibration motion，不能证明接触操作标签安全；132514 已完成 left/right 离线 corner BA + episode-aware smoother A/B：left/right BA success 1680/1773 of 1834，σ_TCP,max p95 0.711 / 1.005 mm；smoother position shift p95 1.297 / 2.405 mm，0.1s smooth-vs-raw RPE p95 1.799 / 3.880 mm。contact-window detector 已补齐：主 force/tactile 口径 union 1825/1834 帧、bimanual 1513 帧；touch-strict 口径 union 1476 帧、bimanual 1166 帧。结论：真实接触覆盖已补强，right 全局 tail 偏大但前 10 个 right shift 最大帧均不在 touch-strict 窗口，生产替换前应重点视频复核 early force-only 段与 tactile 窗口内的少数高 shift 帧</td></tr>
-<tr><td>独立 GT benchmark</td><td>验收项</td><td><span class="badge warn">未完成</span></td><td>不进预算；FR3 FK 不能认证 3 mm，需 mocap / 精密治具 / contact benchmark</td></tr>
+<tr><td>独立 GT benchmark</td><td>验收项</td><td><span class="badge warn">未完成</span></td><td>不进录制误差预算；FR3 FK 不能认证 3 mm。录制 GT 与 replay GT 都需独立参考；replay 优先规划动态 6DoF laser tracker / optical tracker，并与 8-camera world 做刚体注册</td></tr>
 </table>
+<div class="callout">
+<b>新增：Record → Replay 是第二套误差预算，不能把“录制 p95 ≤3 mm”直接等同于“真实 replay ≤3 mm”。</b><br/>
+<span class="mono">e_replay ≈ f(e_record, e_world↔base, e_retarget, e_robot_model, e_control, e_tool/TCP, e_timing, e_contact)</span>。其中 p95 不应机械地做 RSS 相加，但工程上必须逐项测量并分账。先把 FR3 自身 physical tracking、双 base 注册和 retarget distortion 测出来，再决定 absolute replay 是否能冻结为严格 ≤3 mm；在此之前使用“3 mm-class / 同量级”而不是伪精确承诺。
+</div>
 <div class="callout warn">
 <b>供应商需求前置门槛：</b>先自打印低矮 / 分布式 marker rig 做 A/B，再把实测提升写成供应商验收指标。
 A/B 必须证明 <span class="mono">L</span> 下降、逐相机解分歧下降、pivot holdout p95 下降、TCP covariance 下降，且遮挡率不升；否则供应商只能保证按图加工，不能保证 3 mm TCP GT 变好。
@@ -222,6 +232,7 @@ A/B 必须证明 <span class="mono">L</span> 下降、逐相机解分歧下降�
 <b>必须继续做：</b>自制 rig A/B、marker layout 可标定化、repeatability、corner 级 BA 生产接入、离线 SE(3) smoothing 生产接入、独立 GT benchmark。
 </div>
 </section>
+
 <section class="card full">
 <div class="section-title">
 <h2>Phase 0 — Benchmark 与坐标系规范</h2>
@@ -240,6 +251,8 @@ A/B 必须证明 <span class="mono">L</span> 下降、逐相机解分歧下降�
 <li>对 <span class="mono">T_LR(t)</span> 同样计算 40 / 100 / 400 ms / 1 s RPE，作为双手协同动作的 training-facing 指标。</li>
 <li>把 gripper opening / fingertip distance <span class="mono">d</span> 纳入 action-label metric spec；不能只验证 pose 7D 后就认为训练标签完整。</li>
 <li>准备统一评测脚本和版本化 metric spec。</li>
+<li><b>冻结 replay frame contract：</b>明确 <span class="mono">T_world_demo_tcp</span>、<span class="mono">T_world_base_L/R</span>、<span class="mono">T_base_tcp_cmd/actual</span>、FR3 flange/tool/TCP 的方向约定；禁止用同名 <span class="mono">EE</span> 混淆 flange 与 contact TCP。</li>
+<li><b>冻结两种 replay mode：</b><span class="mono">relative replay</span> 用一个左右手共享的 global SE(3) first-frame alignment；<span class="mono">absolute replay</span> 只允许使用 session 标定的 world↔base 变换，不允许每 episode 用自由平移/旋转把绝对误差吃掉。</li>
 </ul>
 <p class="small"><b>代码 TODO：</b></p>
 <ul>
@@ -311,7 +324,7 @@ A/B 必须证明 <span class="mono">L</span> 下降、逐相机解分歧下降�
 </div>
 </details>
 <div class="callout">
-<b>v13 · 与 HiFi-UMI 的口径对齐但不照抄 40 μs：</b>除报告时间偏移本身，还要把它换成 motion-equivalent error：
+<b>Timing 的验收口径：</b>除报告时间偏移本身，还要把它换成 motion-equivalent error：
 <span class="mono">e_p ≈ v·|Δt|</span>，<span class="mono">e_R ≈ ω·|Δt|</span>。在真实 BOX 速度/角速度分布上报告 p50/p95，判断 timing 是否真的吃掉 3 mm / 0.5° 预算。
 </div>
 <div class="gate"><b>Gate：</b>在 IMU factor graph 前，把 effective timing uncertainty 压到亚毫秒附近，并证明其 p95 motion-equivalent translation / rotation error 落在分配给 timing 的误差预算内。</div>
@@ -513,7 +526,9 @@ A/B 必须证明 <span class="mono">L</span> 下降、逐相机解分歧下降�
 <b>推荐不要一步到位：</b>先做最简单的 3D point geometry map 验证相机布局，再升级到 marker 6DoF pose covariance，最后把 marker→TCP lever arm 传播进去得到真正与训练标签相关的 TCP uncertainty map。
   </div>
 <div class="callout ok">
-<b>代码现状：Level 1 已完成</b>（2026-08-04）。位于 <span class="mono">metrology/uncertainty.py</span> + <span class="mono">metrology/cli/level1_uncertainty_map.py</span>。
+<b>代码现状：Level 1 / 2 / 3 均已完成</b>。Level 1（2026-08-04）位于 <span class="mono">metrology/uncertainty.py</span> + <span class="mono">metrology/cli/level1_uncertainty_map.py</span>；
+Level 2 / 3（2026-08-18）位于 <span class="mono">metrology/tcp_uncertainty.py</span> + <span class="mono">metrology/cli/level3_tcp_uncertainty_map.py</span>，
+可见性模型由 <span class="mono">metrology/cli/fit_marker_visibility.py</span> <b>从真实采集拟合</b>而非假设。
     如预判，<span class="mono">cv2.projectPoints()</span> 返回的 jacobian 只对 rvec/tvec/内参，不对 3D 点，因此走中心差分——这样真实的 rational 畸变模型也留在导数里，而不是退化成理想 pinhole。
 <br/><br/>
 <b>验证做了两层：</b>解析协方差对拍闭式双目公式 <span class="mono">σ_Z = Z²/(fB)·σ_d</span>（精确相等）；再在真实 rig 上对拍蒙特卡洛三角化——近场 3 点吻合 1–5%，远场（距相机 2.6–2.8 m、仅 4 路可见）吻合 2%。后者是端到端的，<span class="mono">T_base_cam</span> 方向反了或 Jacobian 退化成 pinhole 都会被它抓住。
@@ -529,18 +544,41 @@ A/B 必须证明 <span class="mono">L</span> 下降、逐相机解分歧下降�
 <td>判断 camera layout、baseline 和视角几何是否合理</td>
 </tr>
 <tr>
-<td><b>Level 2</b><br/>Marker Pose Map</td>
-<td>Level 1 + marker cube geometry + marker orientation/visibility</td>
+<td><b>Level 2</b><br/>Marker Pose Map<br/><span class="badge done">2026-08-18</span></td>
+<td>Level 1 + 实测 marker layout + <b>实拟合</b>的 visibility model</td>
 <td>6DoF covariance：XYZ + roll/pitch/yaw</td>
-<td>判断真实 UMI marker 在不同位置/姿态下是否可稳定 tracking</td>
+<td>判断真实 UMI marker 在不同位置/姿态下是否可稳定 tracking。<b>用的是生产估计器本身的 Jacobian</b>（<span class="mono">marker_rig_ba._pose_jacobian</span>），不是另写一套解析模型 —— 跟踪几何若错，图会以同样方式错，从而能被实测抓住</td>
 </tr>
 <tr>
-<td><b>Level 3</b><br/>TCP Uncertainty Map</td>
-<td>Level 2 + T_marker→TCP</td>
-<td>TCP σx / σy / σz / σmax</td>
-<td>直接预测最终训练标签的局部理论精度，并用于 QC</td>
+<td><b>Level 3</b><br/>TCP Uncertainty Map<br/><span class="badge done">2026-08-18</span></td>
+<td>Level 2 + <span class="mono">T_marker→TCP</span>（平移已实测，见上方对比表）</td>
+<td>TCP σmax / σ_rotation，按姿态取分位</td>
+<td>直接预测训练标签的局部理论精度，并用于 QC。layout 已表达在 CAD 系（原点 = TCP），所以杠杆臂传播是自动的</td>
 </tr>
 </table>
+<div class="callout ok" data-block="level3-result">
+<b>Level 3 结果（2026-08-18）：理论噪声不是瓶颈，和 Level 1 的结论一样，但这次是在 TCP 上、用真实 rig 说的。</b>
+操作区 1.0 × 1.0 × 0.6 m、步长 0.1 m（847 点）、每点 32 个均匀采样姿态、σ<sub>pixel</sub> = 0.2 px：
+<b>847/847 点全部可解</b>；σ<sub>TCP</sub> 按姿态取 p50 后，全区 p50 <b>0.09 mm</b> / p95 <b>0.23 mm</b>；
+按姿态取 p95 后（即"姿态转到最差方向"），全区 p50 <b>0.23 mm</b> / p95 <b>0.49 mm</b>。
+<br/>对照实测：同一 rig 的 <span class="mono">|p_rig|</span> 端到端误差 0.90–1.03 mm、逐相机位置分歧 p50 4.1 mm。
+<b>理论比实测低一到两个数量级</b> —— 正落在本节验收语「若理论上 &lt;1 mm、实测却 3–5 mm，则优先排查 calibration bias、marker geometry、机械漂移等系统误差」的那一支。
+<b>结论：不要加相机、不要指望降 σ<sub>pixel</sub>；剩余误差全部是系统项</b>（相机外参、layout、装配）。
+<br/><b>visibility model 是量出来的不是猜的</b>：入射角 0–40° 检出率 92–98%，65–70° 降到 77%，
+<b>75–80° 跌破 50%（拟合 cutoff 80°）</b>，85–90° 归零。0–40° 段的 92–98% 同时说明<b>rig 自遮挡很轻</b>，不必单独建模。
+</div>
+<div class="callout warn">
+<b>σ<sub>pixel</sub> 已不再是假设（2026-08-18 实测，见 2.4 节）。</b>生产检测器在 &lt;70° 实测 <b>0.156–0.214 px</b>，
+所以上面按 0.2 px 算的图直接成立（σ 与 σ<sub>pixel</sub> 严格线性，0.5 px 的敏感性运行已确认恰好 ×2.5）。
+按实测中位 0.167 px 折算：σ<sub>TCP</sub>（姿态 p95）全区 p50 <b>0.19 mm</b> / p95 <b>0.41 mm</b>；
+若把 rig 检测链路的 SUBPIX（&lt;60° 实测 0.04 px）也算上，则降到 0.05 / 0.10 mm 量级。
+<b>无论取哪一档，都比实测的系统项低一到两个数量级，结论不变</b>
+（该系统项 2026-08-18 已从 0.9–1.0 mm 降到 <b>0.54 mm</b>，并判定为装配/打印项，见
+<a href="box_umi_marker_rig_tcp_20260818.html">rig 记录 5.3 节</a>）。
+<br/><b>仍未建模的两项</b>：① 本图用单一 σ<sub>pixel</sub>，而实测显示 70–80° 掠射时 σ 抬高 2–4 倍
+（80° 的可见性截断只挡掉了一部分），所以掠射姿态下本图偏乐观；把角点按 σ(入射角) 加权是下一步。
+② TCP <b>姿态</b>不确定度已一并输出，但它在夹爪轴系里的语义仍待 rig 装到夹爪后确认。
+</div>
 <details open="">
 <summary>Level 1：Point Geometry Map 怎么算</summary>
 <div class="detail-body">
@@ -562,22 +600,41 @@ A/B 必须证明 <span class="mono">L</span> 下降、逐相机解分歧下降�
 </div>
 </details>
 <details open="" data-block="sigma-pixel">
-<summary>σ_pixel 不要长期写死为 0.2 px <span class="badge p0">Level 1 唯一未验证输入</span></summary>
+<summary>σ_pixel 不要长期写死为 0.2 px <span class="badge done">2026-08-18 已实测</span></summary>
 <div class="detail-body">
+<div class="callout ok">
+<b>已实测（2026-08-18）。</b>数据：<span class="mono">…_163416</span> 4 个静止姿态 + <span class="mono">…_163752</span> 2 个，共 <b>6 个姿态</b>，
+每个约 400–620 帧，用 rig 本身而不是标定板作目标（σ<sub>pixel</sub> 属于「检测器 × 字典 × 印刷 × 距离」这一组合，换标定板测的不是同一个量）。
+<table class="metric-table">
+<tr><th>入射角</th><th>生产默认<br/><span class="mono">CORNER_REFINE_NONE</span></th><th><span class="mono">CORNER_REFINE_SUBPIX</span></th><th>n</th></tr>
+<tr><td>0–30°</td><td>0.214 px</td><td><b>0.034 px</b></td><td>9</td></tr>
+<tr><td>30–45°</td><td>0.184</td><td><b>0.042</b></td><td>14</td></tr>
+<tr><td>45–60°</td><td>0.156</td><td><b>0.048</b></td><td>13</td></tr>
+<tr><td>60–70°</td><td>0.169</td><td>0.121</td><td>4</td></tr>
+<tr><td><b>70–80°</b></td><td>0.354</td><td class="lose"><b>0.633</b></td><td>7</td></tr>
+<tr><td><b>全体中位</b></td><td><b>0.167 px</b></td><td><b>0.078 px</b></td><td>28 组 (相机×姿态)</td></tr>
+</table>
+<b>（1）0.2 px 的假设是对的</b>：生产检测器在正常工作角度（&lt;70°）实测 <b>0.156–0.214 px</b>，
+本页所有基于 0.2 px 的结论原样成立，且略偏保守。<b>Level 1 至此从「假设下的结论」升级为「已验证的结论」。</b>
+<br/><b>（2）开 SUBPIX 是 4–5 倍的免费收益</b>，但<b>必须配入射角门限</b>：70° 以下 0.034–0.048 px，
+<b>70° 以上反而比不开更差</b>（0.633 vs 0.354 px）—— 细化窗口落在被压扁、糊掉的边缘上会自己跑掉。
+建议实现为「入射角 ≤70° 才细化」，而不是全局打开。
+</div>
 <div class="callout warn">
-<b>现状：</b>Level 1 的全部结论都建立在「每角点定位噪声 = 0.2 px」这一<b>假设</b>上。已做的敏感性检验表明结论在 0.5 px 处仍成立（max 0.86 mm），
-      但 0.5 px 本身也是拍的——<b>必须实测一次，才能把 Level 1 从「假设下的结论」升级为「已验证的结论」</b>。
-    </div>
+<b>这次采集的两个缺口。</b>① <span class="mono">cam_08</span> 在全部 6 个姿态里都只看到 1 个 marker（8 观测 vs 6 位姿自由度，
+修正因子 2.0，不可用），所以 7 台里只测到 6 台；补一个让 cam_08 看到 ≥2 个 marker 的姿态即可。
+② 静止测得的是<b>下界</b>：生产中 rig 在动，运动模糊会抬高角点噪声，仍需按「曝光 × 速度」估模糊惩罚或在典型速度下复测。
+</div>
 <p class="small"><b>采集协议（必须做对，否则测的是别的东西）：</b></p>
 <ul>
 <li>目标<b>刚性固定</b>在工作区内，用生产曝光/增益/帧率、生产照明，连续采 300–1000 帧。相机先热机 ≥15 min。</li>
 <li><b>关键：静止目标不等于静止。</b>楼板振动、空调风、有人走动都会让整块板一起动，直接算 corner 方差会把这部分算成探测器噪声。
       正确做法是<b>先对每帧拟合该 tag 的刚体位姿/单应，再统计去掉刚体运动之后的重投影残差</b>——那才是探测器噪声。两者之差本身就是有用信息（机械稳定性）。</li>
-<li>测<b>生产路径实际用的角点</b>：<span class="mono">pupil_apriltags</span> + <span class="mono">refine_edges=1</span>，且当前<b>没有</b> <span class="mono">cornerSubPix</span>。测 refine 之后的版本没有意义，因为 solver 吃不到。</li>
+<li>测<b>生产路径实际用的角点</b>。<span class="badge done">已核实</span>生产 tracking（<span class="mono">cube_tracking.py</span>）用的是 <span class="mono">cv2.aruco.ArucoDetector</span> <b>默认参数</b>，即 <span class="mono">CORNER_REFINE_NONE</span>；<span class="mono">pupil_apriltags</span> 只出现在标定脚本里。上表两列就是这条路径的 A/B。</li>
 <li>按 image radius / marker 投影尺寸 / 入射角<b>分桶</b>，并<b>逐相机</b>给值（<span class="mono">--sigma-pixel-camera cam_07=0.35</span>），而不是全 rig 一个数。</li>
 <li><b>静止测得的是下界。</b>生产中 cube 在动，运动模糊会抬高角点噪声；需另行按「曝光时间 × 运动速度」估模糊惩罚，或直接在典型运动速度下复测。</li>
 </ul>
-<p class="small"><b>产出：</b>把实测值回填进 Level 1 重跑；若与 0.2 px 差异在 2 倍以内，本页所有结论不变（σ 与 σ<sub>pixel</sub> 严格线性，已在测试中钉死）。</p>
+<p class="small"><b>产出：</b>实测 0.167 px 与假设的 0.2 px 相差 1.2 倍，远在 2 倍以内，故本页所有结论不变（σ 与 σ<sub>pixel</sub> 严格线性，已在测试中钉死）。工具：<span class="mono">metrology/cli/measure_corner_noise.py --rig-layout-json …</span>（新增 rig 目标通路与逐 marker σ 输出）。</p>
 </div>
 </details>
 <details>
@@ -631,42 +688,50 @@ A/B 必须证明 <span class="mono">L</span> 下降、逐相机解分歧下降�
 <div class="phase" data-block="world-frame">
 <div class="phase-head">
 <div>
-<h3>2.4 世界坐标系：脱离机器人，锚定桌面</h3>
-<p class="goal">当前世界系 = robot base，机器人一移动整套外参即作废。</p>
+<h3>2.4 Canonical World Persistence：由稳定相机共识维持唯一世界系</h3>
+<p class="goal">世界系不再绑定 robot base，也不要求桌面锚板作为主基准；正常 session 用未移动相机子集把当前 rig 注册回同一个 canonical world。若全部相机都移动，则显式产生新的 world island，而不是让历史轨迹失效或静默改写旧 world。</p>
 </div>
-<span class="badge p0">决策</span>
+<span class="badge p0">P0 数据完整性 · P1 Replay 基础</span>
 </div>
-<div class="callout warn">
-<b>问题：</b>世界系绑在 robot base 上有三重耦合——机器人挪动则外参全部失效；外参靠 FR3 举着板标出，继承 FK 误差；机器人够不到的桌面区域根本标不了。双手 UMI 是手持场景，机器人本不该出现在测量链路里。
-  </div>
-<details open="">
-<summary>建议方案与理由</summary>
+<div class="callout ok">
+<b>当前场景足以采用 stable-camera consensus：</b>8 台相机中大多数情况下至少有 4 台保持物理不动。数学上 1 台已足以定义一个 6DoF frame；≥4 台的价值在于冗余、故障诊断和对“哪台相机动了”的 robust consensus。<b>因此桌面锚板不再是唯一世界系的主机制。</b>
+</div>
+<div class="callout warn" data-block="world-continuity-break">
+<b>系统级原则：Trajectory Validity 与 World Continuity 必须解耦。</b>如果 8 台相机全部移动，旧 session 的 <span class="mono">T_W_TCP(t)</span>、RPE、<span class="mono">T_LR</span>、contact-local trajectory 仍然有效；丢失的只是旧 world 与新 world 之间的绝对 6DoF 关系 <span class="mono">T_Wnew←Wold</span>。此时必须新建 <span class="mono">world_frame_id</span>，将新旧数据视为两个 coordinate islands。只有跨 session absolute replay / object-world alignment 需要恢复这条变换；不得因为 continuity break 删除、重标或静默重解释历史数据。
+</div>
+<details>
+<summary>理论依据：gauge、canonical frame 与 stable-camera consensus</summary>
 <div class="detail-body">
-<p><b>先把两件常被混为一谈的事拆开：</b></p>
-<ul>
-<li><b>BA 的 gauge</b>（为使优化良置而固定的 7 个自由度）——纯内部、任意。固定某一台相机为单位阵，尺度由标定板实测尺寸给定，机器人完全不参与。</li>
-<li><b>落盘/上报的坐标系</b>——必须物理可解释、可复现、长期稳定。</li>
-</ul>
-<p><b>建议：世界系 = 桌面锚定基准板。</b></p>
-<ul>
-<li><b>原点</b>：刚性多 tag 板（ChArUco / AprilGrid），螺接在桌面一角、操作区之外，尽量多相机可见。</li>
-<li><b>姿态</b>：Z = 桌面法向，X = 桌面长边。workspace 范围直接就是 <span class="mono">x ∈ [0, 桌长]</span>，不需要再解释「0.45 是什么意思」。</li>
-<li><b>rig 存成 <span class="mono">T_world_cam_i</span></b>，一次冻结长期不动；<b>机器人降级为被定位对象</b>，<span class="mono">T_world_base</span> 需要对 FK 时单独测一次，机器人挪了只重测这一个变换，不是重标定。</li>
-</ul>
-<p><b>关键设计点：用 ≥2 块锚板，不是 1 块。</b>板与板之间的相对变换是<b>不变量</b>，每次开工重测即可区分故障类型：板间距离都稳定但相机位姿变了 ⇒ 某台相机动了；某块板相对其它板变了 ⇒ 那块板或桌子动了。这一条同时把 Phase 2 验收要求的「跨天 repeatability」「静态 target 长时漂移」和 Phase 8 的漂移监控一起解决。</p>
-<p class="small"><b>实操细节：</b></p>
-<ul>
-<li>相机是装在独立支架上（非与桌面刚性相连）时，锚板方案<b>更</b>该选——它让 rig↔桌面漂移变成可观测量，而不是悄悄污染数据。</li>
-<li>锚板别纯平放。相机高度分三档（<span class="mono">cam_06/08</span> z≈0.38、<span class="mono">cam_12</span> 0.55、<span class="mono">cam_07/09</span> 0.78、<span class="mono">cam_13/14</span> 0.92–0.99），平板对低位相机是掠射角、位姿可观测性差。做成 L 形两面或整体倾斜 20–30° 明显更稳。</li>
-<li>板必须是刚性基材（铝板 / dibond），并<b>用卡尺实测印刷方格尺寸</b>再填配置——尺度误差等比例进位置，0.35% 就是 1 m 上 3.5 mm。同批 cube 已有 5.6 / 5.8 两个 <span class="mono">marker_size_cm</span> 的前车之鉴。</li>
-<li>仓库已有 <span class="mono">localize_auxiliary_aruco_markers_in_base.py</span> 与 <span class="mono">detect_camera_pose_in_base_from_aux_markers()</span>，正是同一套机制的反向用法（把辅助 marker 定位进 base，再用它反推相机位姿）。改成锚板系主要是换基准方向，不是从零写。</li>
-</ul>
-<div class="callout">
-<b>时机：必须与「换标定目标」合并成一次动作。</b>换 ChArUco/AprilGrid 与甩掉机器人是<b>同一次采集、同一处代码改动</b>，分两次做等于标定两遍。
-      </div>
+<p><b>1）BA gauge 与长期 world frame 是两件不同的事。</b> BA 为消除 SE(3)+scale 的 gauge freedom，可以临时固定一台相机/一帧 board；这只是优化内部约束。对外落盘的 <span class="mono">W</span> 应是一个冻结的 canonical frame，并由历史高质量标定保存 <span class="mono">T_WC_i^ref</span>。它可以取桌面友好的方向，也可以沿用现有 world，只要定义冻结且可版本化。</p>
+<p><b>2）“至少 4 台不动”不是唯一性的数学要求，而是可靠性的工程要求。</b> 若某台相机确定没动，它单独就可把新 session 注册回旧 <span class="mono">W</span>；但单相机没有自证能力。对候选稳定集合 <span class="mono">S</span>，可比较历史与当前 pairwise 外参：</p>
+<p><span class="mono">ΔT_ij = inv(T_CiCj^ref) · T_CiCj^cur</span></p>
+<p>若多对相机同时满足 translation / rotation threshold，它们形成稳定 cluster。4 台相机提供 6 个 pairwise constraints，可用 robust voting / maximum-consensus / clique 的方式识别“未移动子集”，并排除被碰动的 camera。</p>
+<p><b>3）新 session 的临时 rig frame 不应成为新 world。</b> 假设当前重标得到临时 gauge <span class="mono">S</span>，对稳定相机集合求一个共享刚体对齐：</p>
+<p><span class="mono">T_WS* = argmin_T Σ_{i∈S} ρ( || Log( inv(T_WC_i^ref) · T · T_SC_i^cur ) ||²_{Σ_i^-1} )</span></p>
+<p>然后所有当前相机统一写成 <span class="mono">T_WC_j^cur = T_WS* · T_SC_j^cur</span>。被移动的相机只更新自己的 <span class="mono">T_WC_j</span>；只要稳定 cluster 存在，canonical <span class="mono">W</span> 本身不跳。</p>
+<p><b>4）stable-camera consensus 有一个不可观测模式：所有“稳定相机”共同做相同刚体运动。</b> 若它们装在同一个框架且框架整体移动，所有 pairwise <span class="mono">T_CiCj</span> 都不变，内部 consensus 无法发现。这不妨碍定义唯一 camera-rig world，但会破坏它相对桌面/地面的绝对稳定性。若这种 common-mode motion 有现实可能，可保留一个与相机架机械独立的固定 ArUco / datum / laser-tracker reference 作为<b>低频 global-drift watchdog</b>，不再承担主标定。</p>
+<p><b>5）移动平台 marker 与 world anchor 的角色必须分开。</b> 左右 FR3 平台上的 ArUco marker 随机器人一起移动，因此它们用于估计 <span class="mono">T_WP_L/R</span>，不能反过来定义 <span class="mono">W</span>。这使系统形成清晰的三层关系：canonical camera world → mobile platform → FR3 base。</p>
+<p><b>6）全相机移动时不是“旧数据失效”，而是 world graph 断边。</b> 对旧轨迹做任意共同左乘 <span class="mono">X∈SE(3)</span>，episode 内 relative motion 与双手相对位姿不变：<span class="mono">inv(XT(0))·XT(t)=inv(T(0))·T(t)</span>，且 <span class="mono">inv(XT_L)·XT_R=inv(T_L)·T_R</span>。因此 delta/RPE/bimanual/contact-local 等 training-facing 信息不依赖跨 session absolute world continuity。真正不可观的是 <span class="mono">T_Wnew←Wold</span>；没有跨移动仍固定的 reference 时，任何算法都不能凭 camera graph 自己恢复它。</p>
+<p><b>7）World 应被建模成可版本化的 pose graph，而不是一个永远只有一个名字的全局变量。</b> 每个 canonical world node 有唯一 <span class="mono">world_frame_id</span>；若 continuity 可由 stable-camera consensus 保持，则继续同一 ID；若全部相机移动且无外部 anchor，则创建新 ID。以后若通过固定环境 marker / laser tracker / 其他跨 session datum 恢复 <span class="mono">T_Wnew←Wold</span>，只需给两个 world node 增加一条带 covariance 的 registration edge，历史 trajectory 本身无需重建。</p>
+<p><b>8）因此“唯一世界系”与“永不漂移的物理绝对系”不是同一要求。</b> 日常 session 需要的是 canonical world 的连续性；全相机移动时允许 continuity 显式断开。固定 environmental anchor 的职责只是避免/修复这类断边，不能成为历史数据可用性的前置条件。</p>
 </div>
 </details>
-<div class="gate"><b>Gate：</b>外参标定全程不出现机器人；<span class="mono">T_world_cam_i</span> 以锚板为基准落盘并带内容哈希；板间不变量作为每次开工的自检项。</div>
+<details>
+<summary>工程实现：如何识别稳定相机并维持 world</summary>
+<div class="detail-body">
+<ul>
+<li>首次高质量标定冻结 <span class="mono">world_reference.json</span>：canonical frame 定义、每台 <span class="mono">T_WC_i^ref</span>、covariance/quality、标定版本与内容哈希。</li>
+<li>每个 session 用共同观测重新估计当前 camera graph；比较所有可用 pairwise <span class="mono">T_CiCj</span> 与 reference，robustly 找最大稳定 cluster。<b>默认期望 ≥4 台</b>；少于 3 台时不建议自动宣布 world persistence 通过。</li>
+<li>用稳定 cluster 联合求一个共享 <span class="mono">T_WS</span>，而不是任选一台相机硬当 world；输出 alignment residual、stable-camera count、每台 residual 与 world covariance。</li>
+<li>被判定移动的 camera 可以重新求 <span class="mono">T_WC</span> 后继续加入 tracking，不应通过重新定义 world 来“迁就”它。</li>
+<li>如果稳定相机分属不同机械支架，共同刚体移动的风险很低；若多数稳定相机共用同一大框架，建议在墙/地面/独立结构上保留少量固定 marker，只做 common-mode drift health check。</li>
+<li><b>新增 world continuity state machine：</b><span class="mono">CONTINUOUS</span>（stable cluster 可把当前 session 注册回原 W）、<span class="mono">RECONNECTED</span>（原先断开的两个 world 通过独立 anchor 后验接回）、<span class="mono">BROKEN</span>（无稳定 camera/独立 anchor，创建新 world island）。</li>
+<li>所有 episode / calibration / derived trajectory 必须写 <span class="mono">world_frame_id</span>、<span class="mono">calibration_id</span>、<span class="mono">world_continuity_state</span>、stable-camera IDs、registration residual/covariance；若存在跨 world edge，再写 <span class="mono">parent_world_frame_id</span> 与 <span class="mono">T_parent_current</span>。</li>
+<li><b>禁止 silent relabel：</b>不能在全相机移动后继续复用旧 <span class="mono">world_frame_id</span>，也不能为了让旧/new absolute pose 看起来连续而把未知 SE(3) 当成单位阵。relative / bimanual 数据可跨 island 训练；absolute-world 数据跨 island 使用前必须有显式 registration edge。</li>
+</ul>
+</div>
+</details>
+<div class="gate"><b>Gate：</b>外参/重注册全程不依赖 robot FK。若 stable-camera consensus 成立，则当前 session 注册回原 canonical <span class="mono">W</span>；若所有相机移动且无法恢复 <span class="mono">T_Wnew←Wold</span>，必须进入 <span class="mono">BROKEN</span> 状态并创建新 <span class="mono">world_frame_id</span>。<b>这不阻塞旧数据的 relative / bimanual / training-facing 使用，只阻塞跨 world 的 absolute replay。</b>桌面/环境 anchor 仅用于 common-mode drift watchdog 或后验 reconnect。</div>
 </div>
 <div class="phase" data-block="camera-model">
 <div class="phase-head">
@@ -793,7 +858,7 @@ marker 不必组成物理立方体；必要条件是所有可见 marker corner �
 <tr><td><b>第二台常量落库 + multi-cube seam</b></td><td><span class="badge done">工程完成，常量未认证冻结</span></td><td><span class="mono">estimate_ee_pose_from_cube</span> 已显式传 <span class="mono">cube_name</span> 并按 left/right fail-closed 分派；geometry guard 与 <span class="mono">cube_tracker.cubes</span> 已启用。132514 完整 production run 写出左右各 1803 行 sidecar，无 <span class="mono">head</span> 残留</td></tr>
 <tr><td><b>拆装 / 载荷重复性</b></td><td><span class="badge p0">未采</span>，决定能否冻结 GT</td><td>同一安装 5 次、拆装重装 5 次、不同 opening、轻压三向；统计 translation / rotation p50、p95、max</td></tr>
 <tr><td><b>180° 腕部滚转</b></td><td><span class="badge warn">只影响 replay 构型，不影响 TCP 位置</span></td><td>夹爪装上 FR3 后确认基座 +Y 指向哪根手指，或做一次横移 ≥10 mm 的多点 pivot</td></tr>
-<tr><td><b>自打印低矮 / 分布式 rig A/B</b></td><td><span class="badge p0">供应商前置</span></td><td>先本地验证提升：<span class="mono">L</span> 目标 ≤100–120 mm；比较 visible cameras/corners、逐相机解分歧、pivot holdout p95、TCP covariance、遮挡 / 碰撞风险。通过后再写供应商验收指标</td></tr>
+<tr><td><b>自打印低矮 / 分布式 rig A/B</b></td><td><span class="badge done">三次合格采集已完成</span></td><td><b>2026-08-18，三次定点 pivot 采集，同一套最好配置横比</b>（<a href="box_umi_marker_rig_tcp_20260818.html">完整对比表见实验报告 §3</a>）。<b>决策：分布式 rig 取代高位 cube。</b>杠杆臂 241.5 → <b>102.0 mm</b>（达标），姿态折算 TCP p95 6.32 → <b>2.23 mm</b>，holdout p95 3.72 → <b>1.12–1.76 mm</b>（达标）。把 layout 表达在 CAD 系后 pivot 的真值就是 0，实测 <span class="mono">|p_rig|</span> = 1.14 / 0.90 / <b>0.54 mm</b>；<b>剩余偏移已判定为装配/打印项</b>（球窝挪 0.3–0.45 m 后 <span class="mono">p_rig</span> 只差 0.38 mm、方向差 9.5°，比原地重复还一致），故<b>标定应在多个球窝位置各录一段再合并</b>。<b>仍缺</b>：拆装重装 5 次 / 载荷 / 遮挡 / 静止 jitter 四组，装到夹爪后的 TCP 轴约定，cam_09 / cam_08 重标，以及生产链路（36h11 + cube 面解析角点）<b>检不到新 rig</b>，需接 <span class="mono">marker_layout.json</span> 与 ArUco 字典。现值为<b>单次装配</b>，未可冻结</td></tr>
 <tr><td><b>marker layout 可标定化</b></td><td><span class="badge warn">评估器已实现，缺 Onshape 导出</span></td><td>从理想 cube 解析角点升级为 <span class="mono">marker_layout.json</span>：每个 marker 一个 6D 位姿、按 BOX id 索引、带内容哈希；用 <span class="mono">metrology.cli.evaluate_marker_layout_fim</span> 对候选 layout 排序</td></tr>
 <tr><td><b>corner BA / covariance 生产接入</b></td><td><span class="badge warn">离线已验证，生产未接</span></td><td><span class="mono">metrology.cli.run_marker_rig_ba</span> 已证明可输出每帧 BA pose、FIM condition、<span class="mono">sigma_tcp_max_mm</span>；下一步替换 <span class="mono">fuse_frame_samples()</span> 并把 covariance / quality flag 写入 sidecar</td></tr>
 <tr><td><b>开度流 80 mm 点</b></td><td><span class="badge warn">插值区缺样本</span></td><td>补 80 mm 附近垫块，并重测 40.1 mm 离群点</td></tr>
@@ -879,6 +944,27 @@ marker 不必组成物理立方体；必要条件是所有可见 marker corner �
 <div class="callout ok">
 <b>touch-strict 对照更适合人工看接触细节。</b> 关闭 force/torque 开窗后，仅用 tactile normal-sum 与 active taxel 判定，输出在 <span class="mono">derived/marker_rig_ba_phase4_phase5_20260817_132514/contact_windows_touch_strict/</span>：union = <b>3 windows / 1476 frames / 80.48%</b>，bimanual = <b>4 windows / 1166 frames / 63.58%</b>，left/right coverage = <b>76.28% / 67.78%</b>。touch-strict 内 smoother shift p95：union left/right = <b>1.414 / 1.208 mm</b>，bimanual left/right = <b>1.531 / 1.271 mm</b>，right hand windows = <b>1.367 mm</b>；right 全局最大 shift 的前 10 帧都落在 episode 0 early force-only、active taxel=0 的区间，而不是 touch-strict 窗口。结论从“right tail 需要复核”细化为：先视频复核 episode 0 early force-only 段是否是 BA 抖动/初始化过渡，再复核 touch-strict 内 frame 1734 等少数 5–7 mm 峰值是否抹平了真实接触运动。
   </div>
+<div class="callout warn" data-block="m2020-touch-channel-health">
+<b>2026-08-17 · M2020 贴片换装后，触觉通道本身有两个未解决问题（待查）。</b>
+贴片已从 Paxini L5325（239 点）换成 <b>M2020（9 点 3×3）</b>，主机侧已在源头按 link stream <span class="mono">tlv 0x0008/0x0009</span> 识别并截断到 9 点，新数据集 <span class="mono">thor_gmsl2_9ch_v1_20260817_162847</span> 三条 episode 已全部正确打标（<span class="mono">model=m2020, points=9</span>，7200 帧无例外，60.00 Hz）。但对该数据集做逐 taxel 体检后，暴露出两个传感器/使用层面的问题，都<b>不是</b>本次改动引入，也<b>尚未</b>定位根因：
+<table class="metric-table" style="margin-top:10px">
+<tr><th>问题</th><th>优先级</th><th>实测（162847，4 pad × 3 ep ≈ 7200 帧）</th><th>影响</th></tr>
+<tr>
+<td><b>中心触点 #5 长期饱和</b></td>
+<td><span class="badge todo">P1</span></td>
+<td>四个 pad 的 <span class="mono">idx4</span>（数据表 #5）分别在 <b>51% / 53% / 73% / 50%</b> 的帧里顶死 <span class="mono">fz=255</span>。<span class="mono">fz</span> 是 <span class="mono">uint8 × 0.1 N</span>，天花板 <b>25.5 N</b>；<span class="mono">max_abs_fz_0p1N</span> 通道均值已到 <b>126.8–188.2</b>。</td>
+<td>该通道在重压段是常数不是力。直接污染 <span class="mono">observation.state</span> 的 <span class="mono">mean_fz</span> / <span class="mono">max_abs_fz</span>，也使 tactile normal-sum 在饱和区失去单调性 → contact-window detector 的 tactile 分支不可信。</td>
+</tr>
+<tr>
+<td><b>四个角点近零响应</b></td>
+<td><span class="badge warn">P2</span></td>
+<td>角点 <span class="mono">idx 0/2/6/8</span>（#1/#3/#7/#9）全 session <span class="mono">live%</span> 仅 <b>0–2%</b>，<span class="mono">maxfz</span> 只有 <b>2–5</b>（0.2–0.5 N，噪声底）。有信号的只有十字形 5 点（#2 #4 #5 #6 #8）。</td>
+<td>有效触点数实际是 5 不是 9。<span class="mono">active_points</span> 上限被压到 5，按 9 点归一的统计会系统性偏低。</td>
+</tr>
+</table>
+<b>为什么现在不下结论：</b>“角点静、中心饱和”这个模式对行主序和列主序都成立（<span class="mono">idx 0/2/6/8</span> 在两种排布下都是角点），所以<b>不是</b> slot→格点映射假设的问题；但它既可能是抓取几何（圆柱物体压中间，载荷集中在十字），也可能是角点通道本身失效。两者的处置完全不同，必须先做<b>专项按压实验</b>——手指单独按四个角各 10 s——才能定性。<br/>
+<b>连带待办：</b>contact-window detector 的 tactile 阈值（normal-sum、active taxel 计数）是在 239 点 Paxini 数据上标定的，换到 9 点 M2020 后量纲和计数尺度都变了，<b>必须重标</b>，否则 132514 与 162847 之后的数据不可直接比较。
+  </div>
 <p class="small"><b>剩余接入项：</b></p>
 <ul>
 <li><span class="mono">thor_gmsl2_9ch_v1_20260817_132514</span> 已生成 left/right raw BA pose、covariance、RMSE、quality flag、episode-aware smoother 输出与 contact-window 报告；下一步不是补“有没有数据”，而是按 <span class="mono">contact_windows_touch_strict/contact_windows.csv</span> 和 <span class="mono">contact_frames_60hz.csv</span> 做视频/力觉联合复核，并把合格列接入生产 sidecar 候选。</li>
@@ -928,73 +1014,278 @@ marker 不必组成物理立方体；必要条件是所有可见 marker corner �
 </section>
 <section class="card full">
 <div class="section-title">
-<h2>Phase 7 — 独立 Ground Truth 验证</h2>
+<h2>Phase 7 — 独立 Ground Truth 与跨测量系统注册</h2>
 <span class="badge p0">必须</span>
 </div>
-<p class="goal">reprojection error 不是毫米级轨迹精度证明，必须有独立参考。</p>
+<p class="goal">把“录制 GT 准不准”和“FR3 真实 replay 准不准”分别交给独立测量链认证；FR3 FK、IK pass、reprojection error 都不能作为 3 mm 的最终真值。</p>
+<details open="">
+<summary>7.1 UMI Trajectory GT 认证</summary>
+<div class="detail-body">
+<ul>
+<li>Static：已知位置 / 重复摆位 / 多方向姿态；Dynamic：慢速 / 快速 / 6DoF / 遮挡 / 双手。</li>
+<li>Bimanual：左右各自 APE/RPE 之外，必须直接验 <span class="mono">T_LR(t)=inv(T_world_L)·T_world_R</span> 的 translation / rotation 与 40/100/400 ms/1 s RPE。</li>
+<li>Contact：插孔、对齐、抵平面、夹持等 contact-local window 单独报告。</li>
+<li>FR3 FK × 静态 <span class="mono">T_ee_cube</span> 仅保留 relative-motion diagnosis，不再写成独立 GT。</li>
+</ul>
+</div>
+</details>
+<details open="">
+<summary>7.2 FR3 Replay 的独立 6DoF GT</summary>
+<div class="detail-body">
+<div class="callout ok"><b>推荐基线：</b>使用可动态输出 6DoF target pose 的激光跟踪 / 光学跟踪系统作为 replay certification GT。若设备只测单个 SMR / reflector 的 XYZ，则它只能认证 position，orientation 仍需多点刚体、6DoF target 或另一套独立测量。</div>
+<ul>
+<li>在 FR3 wrist/flange 上安装刚性 tracker target，并标定 <span class="mono">T_target→TCP</span>；“不用视觉 marker rig”不等于“末端不装任何 target”。</li>
+<li>若 6DoF laser tracker 可用，FR3 视觉 AprilTag marker rig <b>不是认证必需</b>；可保留为日常工程 QC / base quick check。若没有独立 tracker，则临时视觉 marker rig + 8-camera 可做高价值 replay QC，但与录制链共享系统误差，不能完全替代 independent certification。</li>
+<li>双 FR3 必须确认测量系统能对左右末端给出同步或可严格时间对齐的 6DoF pose；否则 <span class="mono">T_LR</span> 会混入时间偏差。</li>
+</ul>
+</div>
+</details>
+<details open="">
+<summary>7.3 8-camera world ↔ Replay-GT world 注册</summary>
+<div class="detail-body">
+<ul>
+<li>估计并版本化 <span class="mono">T_W8cam←Wgt</span>，使用固定刚体 target / 多点已知几何做 registration，不用 FR3 自身运动学充当唯一桥梁。</li>
+<li>每次 tracker、相机 rig、工作台或机器人基座发生移动后，重新验证 registration；保存 residual、日期、设备序列与 calibration hash。</li>
+<li>同一 benchmark 同时保留 <span class="mono">command</span>、<span class="mono">FR3 FK</span>、<span class="mono">independent physical GT</span> 三条轨迹，用于拆分 controller internal error 与真实 physical error。</li>
+</ul>
+</div>
+</details>
+<div class="gate"><b>Gate：</b>Phase 7 先认证 UMI GT generator；Replay GT 基础设施至少要能给出可追溯的双末端 physical 6DoF reference，才能进入 Phase 11/12 的 3 mm-class replay 结论。</div>
+</section>
+
+<section class="card full">
+<div class="section-title">
+<h2>Phase 8 — Production QC 与 Dataset Gate</h2>
+<span class="badge warn">部分已实现</span>
+</div>
+<p class="goal">只回答“这条 demonstration 是否是高质量、可追溯的 GT”；把 FR3 联合 retarget / collision / physical replay 从一个 QC bullet 升级为后续独立 Phase。</p>
 <details open="">
 <summary>实现细节</summary>
 <div class="detail-body">
 <ul>
-<li>优先使用 Vicon / OptiTrack / 高精度 optical mocap。</li>
-<li>可辅以精密 jig、已知空间 target、机器人 FK 做 relative-motion validation。</li>
-<li>Static benchmark：已知位置、重复摆位、多方向姿态。</li>
-<li>Dynamic benchmark：慢速、快速、6DoF、遮挡、双手操作。</li>
-<li><b>Bimanual benchmark：</b>除左右手各自 APE/RPE 外，直接对 GT 的 <span class="mono">T_LR(t)=inv(T_world_L)·T_world_R</span> 做 translation / rotation error 与 40/100/400 ms/1 s RPE；common-view 无参考 consistency 作为伴随诊断，不替代独立 GT。</li>
-<li>Contact benchmark：插孔、对齐、抵住平面、peg insertion。</li>
+<li>每帧输出 visible camera/tag/corner count、reprojection residual、pose covariance、IMU residual、真实 timestamp。</li>
+<li>检测 velocity / acceleration / jerk / pose flip / long missing interval；阈值由 Phase 7 benchmark 反推。</li>
+<li>episode 级 continuity / bimanual consistency / impossible motion；双手同时可见时输出 common-view <span class="mono">T_LR^c</span> dispersion。</li>
+<li>保留一个轻量 <b>target-embodiment precheck</b>：数据格式、workspace 粗可达、gripper domain；真正的双 FR3 连续 IK / collision-aware retarget 在 Phase 10 完成。</li>
+<li>报表拆成 <b>tracking coverage</b>、<b>training-valid yield</b>、<b>replay-certified yield</b>，三者不可混用。</li>
 </ul>
-<div class="callout ok">
-<b>已有实现（比预期完整）：</b><span class="mono">evaluate/cube_tracking_teaching_error_eval.py</span>（2667 行）与 <span class="mono">cube_tracking_circle_error_eval.py</span> 已经跑通「FR3 举着 cube 运动 → 对比 FK EE 与 cube 推出的 EE」的闭环，产出 per-camera 距离-误差曲线、速度-误差散点、空间误差热力图、误差箱线分布、分位数统计和 markdown 报告。<span class="mono">sweep_video_fk_offset.py</span> 还能扫 video↔FK 时间偏移。这是当前唯一的量化验证手段。
-  </div>
-<p class="small"><b>但它不能用来认证 3 mm，原因写清楚：</b></p>
-<ul>
-<li>参考基准 = FR3 FK × 一个由静态样本朴素平均得到的 <span class="mono">T_ee_cube</span>，两者本身各含数毫米误差，量级和被测目标相当。</li>
-<li>它只验证「cube 螺接在机器人上」这一种构型，覆盖不到手持 UMI 的真实姿态与遮挡分布。</li>
-<li>覆盖范围受机器人可达空间限制，桌面边角测不到。</li>
-</ul>
-<p class="small"><b>代码 TODO：</b>接入真正独立的参考（mocap / 精密治具 / 已知空间 target）；补 static 重复摆位、bimanual 与 contact benchmark；
-把 benchmark 结果反过来固化成 Phase 8 的 QC 阈值。对双手同时可见片段，额外保存 common-view <span class="mono">T_LR^c</span> dispersion，形成“独立 GT 绝对认证 + 无参考在线诊断”两层判据。</p>
+<p class="small"><b>已有：</b><span class="mono">verification/verify_processed_pose_dataset.py</span> 已覆盖非有限行、冻结位姿、index 断裂、鲁棒跳变与 FFT 高频检查；<span class="mono">verify_fr3_cube_pose_ik.py</span> 已能做单机/episode 级可达性标签，是 Phase 10 的输入而不是最终 replay 证明。</p>
 </div>
 </details>
-<div class="gate"><b>Gate：</b>只有独立 benchmark 达到 ≤3 mm，才把系统冻结为 Trajectory GT generator。</div>
+<div class="gate"><b>Gate：</b><span class="mono">tracking_pass ∧ qc_pass ∧ bimanual_pass</span> 后，episode 才进入 dual-FR3 executability；不要因为“能数值化输出 pose”就当成可训练、可重播数据。</div>
 </section>
-<section class="card full">
+
+<section class="card full" data-block="dual-fr3-registration">
 <div class="section-title">
-<h2>Phase 8 — Production QC</h2>
-<span class="badge warn">部分已实现</span>
+<h2>Phase 9 — 双 FR3 Base Registration、Replay Frame 与初始状态</h2>
+<span class="badge p0">新增主线</span>
 </div>
+<p class="goal">两台 FR3 的 base 可以移动，但每次移动后都必须重新建立同一个 metric world 下的几何关系；同时把 first-frame alignment 从“临时技巧”冻结成有语义的 replay protocol。</p>
 <details>
-<summary>实现细节</summary>
+<summary>理论依据：刚体注册、共享 SE(3) 对齐与初始条件</summary>
+<div class="detail-body">
+<p><b>1）Base registration 本质是刚体坐标系注册。</b> 两台 FR3 的运动学都只在各自 base frame 中有意义；要比较双手、做 inter-arm collision 或 absolute replay，必须先把它们放到 Phase 2.4 维护的同一个 canonical metric world：</p>
+<p><span class="mono">T_W_TCP,L = T_WB_L · T_B_L_TCP,L</span>，<span class="mono">T_W_TCP,R = T_WB_R · T_B_R_TCP,R</span>。</p>
+<p>当前硬件上，<span class="mono">T_WB</span> 最自然地拆成 <span class="mono">T_WP · T_PB</span>：8-camera 测可移动平台的 ArUco rig 得到 <span class="mono">T_WP</span>，平台到 FR3 base 的刚体外参 <span class="mono">T_PB</span> 预先标定。因此只要平台被移动，旧的 <span class="mono">T_WP / T_WB</span> 就不再成立；这不是“软件参数漂了”，而是物理坐标系本身发生了变化。机械定位销只用于减小变化，session registration 负责重新测量剩余偏差。</p>
+<p><b>2）双手不能各自做独立 first-frame alignment。</b> 若左、右分别乘不同的 <span class="mono">A_L</span>、<span class="mono">A_R</span>，则：</p>
+<p><span class="mono">T'_LR = inv(A_L·T_L) · (A_R·T_R)</span></p>
+<p>一般不再等于原始 <span class="mono">T_LR = inv(T_L)·T_R</span>，会把双手间距和相对姿态人为改掉。对双手 demo，应求一个共享 <span class="mono">T_align ∈ SE(3)</span>，或做带左右 residual 权重的 constrained SE(3) alignment，使公共刚体变换只改变整段动作在世界中的落点，不改变双手内部几何关系。</p>
+<p><b>3）Relative replay 与 absolute replay 测的是不同东西。</b> shared first-frame alignment 会主动消掉一个常量 world-frame 偏置，因此更适合检验 trajectory shape / short-horizon motion；absolute replay 则固定 <span class="mono">T_WB</span>，用于检验真实桌面、物体与 TCP 的空间一致性。两者不能用同一个数字替代。</p>
+<p><b>4）Replay 是动力系统问题，初始条件不只是一帧 pose。</b> 同一 reference trajectory 在不同 <span class="mono">q(0), dq(0), gripper(0), object/contact state(0)</span> 下可能产生不同控制瞬态甚至不同接触结果。正式 replay 前的 minimum-jerk / quintic approach，本质上是在连续地把系统送入指定初始状态，并令起始速度/加速度接近可控范围，避免把初始化瞬态误算成轨迹 fidelity。</p>
+<p><b>5）Absolute replay 必须消费 world continuity，而 relative replay 不需要。</b> 若 demo 与当前 FR3 session 属于不同 <span class="mono">world_frame_id</span> 且两者之间没有显式 registration edge，则 absolute replay 必须拒绝或降级；但 shared first-frame relative replay 仍可进行，因为它只依赖 episode 内/双手内部几何。这个判据必须由 metadata 自动决定，不能靠操作者记忆。</p>
+</div>
+</details>
+<div class="callout warn"><b>机械建议：</b>不要求把两台 FR3 永久固定在地面；更符合当前场景的是<b>平台内刚性固定 + 平台移动后可靠锁止 + session registration</b>。平台 ArUco rig 与 FR3 base 必须共刚体；只要平台被移动，旧的 <span class="mono">T_WB_L</span>、<span class="mono">T_WB_R</span>、inter-arm collision scene 与 absolute replay transform 就全部失效。</div>
+<details open="">
+<summary>9.1 Session-level Dual-base Registration：移动平台 ArUco rig</summary>
+<div class="detail-body">
+<p><b>首选链路：</b>左右 FR3 所在移动平台各自定义刚性 platform frame <span class="mono">P_L / P_R</span>，平台上布置多个已标定 ArUco marker；8-camera 在 canonical world <span class="mono">W</span> 下直接估计平台 pose：</p>
+<p><span class="mono">T_WB_L = T_WP_L · T_P_LB_L</span>，<span class="mono">T_WB_R = T_WP_R · T_P_RB_R</span></p>
+<ul>
+<li><span class="mono">T_WP_L/R</span>：每次平台移动后由 8-camera 重测；<span class="mono">T_PB</span>：FR3 相对平台的固定安装外参，只有机器人从平台拆装/安装结构变化时才重标。</li>
+<li>平台 marker 应视为一个<b>分布式刚体 layout</b>：保存 <span class="mono">platform_marker_layout.json</span>，所有可见 marker corners 联合求一个 platform pose；避免“每个 tag 独立 PnP 后再平均 pose”。较大的 marker baseline 还能显著加强 base orientation 约束。</li>
+<li>marker 必须贴/装在与 FR3 base 共刚体的承力结构上，避免薄钣金、塑料罩或可变形盖板；否则测到的是 panel motion，不是 base motion。</li>
+<li>每 session 求 <span class="mono">T_WB_L</span>、<span class="mono">T_WB_R</span> 与 <span class="mono">T_BL_BR = inv(T_WB_L)·T_WB_R</span>；移动任何一台平台后 registration 自动失效并重算 collision scene。</li>
+<li>replay 前后可持续观测 <span class="mono">T_WP(t)</span>，把平台滑动/被碰撞作为 base-motion fault；输出 pose covariance / repeatability，并传播进 inter-arm collision safety margin 与 absolute replay error budget。</li>
+<li>FR3 FK 可用于求/检查 <span class="mono">T_PB</span>，但不能单独认证 absolute base pose；平台 ArUco 的作用是“把可移动机器人注册进 world”，不是定义 world 本身。</li>
+</ul>
+</div>
+</details>
+<details open="">
+<summary>9.2 两种 Replay Mode</summary>
+<div class="detail-body">
+<p><b>Relative / trajectory-fidelity mode：</b>允许 first-frame alignment，但<b>双手不能各自独立吸收一个 SE(3)</b>。应求一个左右手共享的 <span class="mono">T_align</span>（或带小 residual 的 bimanual constrained alignment），共同作用到左右 demo，从而尽量保持 <span class="mono">T_LR</span>。</p>
+<p><span class="mono">T_cmd,L/R(t) = T_align · T_demo,L/R(t)</span></p>
+<p><b>Absolute / task-fidelity mode：</b>只使用 session 标定的 world↔base 关系；禁止 per-episode 自由平移/旋转把 world registration error 吃掉。</p>
+</div>
+</details>
+<details open="">
+<summary>9.3 Initial State 不只是 EE first pose</summary>
 <div class="detail-body">
 <ul>
-<li>每帧输出 visible camera/tag/corner count、reprojection residual、pose covariance、IMU residual。</li>
-<li>检测 velocity / acceleration / jerk / pose flip / long missing interval。</li>
-<li>阈值由 Phase 7 benchmark 反推，不拍脑袋设定。</li>
-<li>episode 级别做 continuity / <b>bimanual consistency</b> / impossible motion 检查；双手同时可见时必须输出 common-view <span class="mono">T_LR^c</span> dispersion。</li>
-<li><b>Simulation retarget/replay 是 training Hard Gate，不再是可选项：</b>BOX SE(3)+gripper trajectory → target embodiment retarget/IK → joint pos/vel/acc limit → singularity / self-collision / environment collision / gripper-domain checks；未通过的 episode 不得进入默认训练集。</li>
-<li>物理 contact simulation 可后加；V0 先保证“运动学/基本动力学上可执行”，不要让复杂接触仿真阻塞第一版 Gate。</li>
-</ul>
-<p class="small"><b>已有：</b><span class="mono">verification/verify_processed_pose_dataset.py</span> 已覆盖非有限行、冻结位姿（重复 run ≥3）、episode 内 frame/global index 断裂、median/MAD 鲁棒阈值的平移与旋转跳变、滑窗 FFT 高频能量，并输出 CSV + 图；<span class="mono">verify_fr3_cube_pose_ik.py</span> 做 IK 可达性并把 episode 级标签写回 parquet 供训练筛选。这已经是一套能用的 episode 级 QC。</p>
-<p class="small"><b>缺口：</b></p>
-<ul>
-<li>per-frame quality 没进 sidecar：<span class="mono">state_action.&lt;cube&gt;.csv</span> 只有 7D pose，<span class="mono">num_camera_samples</span> / <span class="mono">num_inliers</span> / RMSE 只落在 analysis 目录，训练侧拿不到，也无法按可见相机数加权或过滤。</li>
-<li>无 pose covariance（依赖 Phase 4）、无 IMU residual（依赖 Phase 6）。</li>
-<li>阈值目前是经验值，尚未由 Phase 7 benchmark 反推。</li>
-<li><span class="badge todo">v13</span> 无双手一致性检查——多 cube 仍各自独立跟踪；需补 common-view native <span class="mono">T_LR^c</span>、融合后 <span class="mono">T_LR</span> 与 bimanual RPE。</li>
-<li><span class="badge todo">v13</span> 现有 <span class="mono">verify_fr3_cube_pose_ik.py</span> 只是 replay Gate 的雏形：需把 pass/fail、失败原因、retarget residual、joint-limit margin 等写入 episode metadata / sidecar。</li>
-<li><span class="badge todo">v13</span> 数据报表拆成 <b>tracking coverage</b> 与 <b>training-valid yield</b>；后者必须是 reconstruction → QC → bimanual → replay 串联后的结果，不能为追求 &gt;99% 而放宽过滤。</li>
+<li>初始状态至少记录：左右 TCP pose、<span class="mono">q / dq</span>、gripper opening、object pose、contact state；对于已夹持物体的 demo，只对 EE first frame 对齐是不够的。</li>
+<li>正式轨迹前增加 smooth approach（minimum-jerk / quintic），到 replay start pose 后速度接近 0，再开始计入 benchmark，避免启动瞬态污染 p95/RPE。</li>
+<li>记录 <span class="mono">initial_alignment_residual</span>，不要用 alignment 把异常静默吃掉。</li>
 </ul>
 </div>
 </details>
-<div class="gate"><b>Gate：</b>默认训练集只接收 <span class="mono">tracking_pass ∧ qc_pass ∧ bimanual_pass(双手任务) ∧ replay_pass</span> 的 episode；
-所有降级单相机帧、插值段和 replay failure 必须可追溯，不允许“轨迹有数值就当 GT”。</div>
+<div class="gate"><b>Gate：</b>session registration 通过；左右共享的 alignment / absolute frame contract 可复现；初始 pose、gripper、object/contact state 满足任务要求后，才允许进入 retarget。</div>
 </section>
+
+<section class="card full" data-block="bimanual-retarget">
+<div class="section-title">
+<h2>Phase 10 — Bimanual Collision-aware Retarget &amp; Executability</h2>
+<span class="badge p0">新增主线</span>
+</div>
+<p class="goal">不再做“左轨迹单独 IK + 右轨迹单独 IK”，而是寻找一条同时保持任务语义、双手关系、关节连续性与安全间距的联合双臂轨迹。</p>
+<details>
+<summary>理论依据：7DoF 冗余、双臂约束优化与碰撞安全裕量</summary>
+<div class="detail-body">
+<p><b>1）TCP trajectory 并不唯一决定 FR3 的 joint trajectory。</b> FR3 是 7DoF，而一般末端位姿任务只有 6DoF，因此存在至少 1 维局部冗余。速度层可写成：</p>
+<p><span class="mono">q̇ = J⁺ ẋ + (I − J⁺J) z</span></p>
+<p>第一项完成 TCP 运动，第二项位于 Jacobian null-space，可用于远离 joint limit、奇异位形和另一只机械臂。若逐帧独立 IK，只约束 <span class="mono">T_TCP(t)</span> 而不约束 null-space 连续性，就可能出现 elbow branch 跳变，因此必须把整段轨迹作为连续优化问题处理。</p>
+<p><b>2）双臂 retarget 是一个带任务层级的约束优化。</b> 两只手分别误差很小并不保证双手协作正确；真正的协同变量是：</p>
+<p><span class="mono">T_LR(t) = inv(T_L(t)) · T_R(t)</span>。</p>
+<p>对于夹持、拉伸、装配等任务，<span class="mono">T_LR</span> 与 contact geometry 往往比单手 world-space pose 更接近任务不变量。因此优化器应允许利用 joint/null-space 先避碰，必要时才小幅修改 TCP，并对 <span class="mono">T_LR</span> / contact residual 施加更高权重。</p>
+<p><b>3）“无碰撞”不是足够条件。</b> 几何模型中的 signed distance 只代表名义模型。真实系统还有 base registration、TCP calibration、link geometry、controller tracking 等不确定度，因此应要求：</p>
+<p><span class="mono">d_min &gt; d_safe</span>，其中 <span class="mono">d_safe</span> 应至少覆盖两臂相对位置不确定度与动态 tracking tail。</p>
+<p>更保守地，可把左右末端/连杆不确定度近似传播到相对距离方向；只有当 nominal clearance 明显大于该方向的高分位 uncertainty 时，simulation collision-free 才能转化成真机安全置信度。</p>
+<p><b>4）Geometry path 与 timing 要解耦。</b> 一条路径可写成 <span class="mono">T(s)</span>，执行速度由 <span class="mono">s(t)</span> 决定。同一几何路径在不同 timing 下会产生完全不同的 <span class="mono">q̇/q̈/jerk</span>、控制误差与碰撞制动裕量。因此 retime 不是“改了动作形状”，但会改变动作动力学；必须把 original / retimed / executed timing 分开保存。</p>
+<p><b>5）Retarget 后直接改 UMI action label 会产生监督偏差。</b> UMI 图像记录的是原始手真实位于 <span class="mono">T_demo</span> 时的视觉状态；若只把 action 改成明显不同的 <span class="mono">T_retarget</span>，输入 observation 与监督 action 不再来自同一个物理状态分布。小改动可作为可行性近似，但大改动更适合作为 reject/metadata，或通过 FR3 真机 replay 重新采 embodiment-native observation-action pair。</p>
+</div>
+</details>
+<div class="callout">
+<span class="mono">min E = E_L + E_R + λ_LR E(T_LR) + λ_smooth E_smooth + λ_margin E_margin + λ_collision E_collision</span><br/>
+<span class="small">对于双手接触任务，推荐优先级：<b>contact geometry &gt; bimanual relative pose T_LR &gt; single-hand absolute pose &gt; joint posture</b>。</span>
+</div>
+<details open="">
+<summary>联合约束</summary>
+<div class="detail-body">
+<ul>
+<li>连续 IK / trajectory optimization：避免 7DoF 每帧独立 IK 的 elbow / null-space branch 跳变。</li>
+<li>joint position / velocity / acceleration / jerk limit，manipulability / singularity margin。</li>
+<li>left/right self-collision、inter-arm link-link、gripper-gripper、arm-opposite-gripper、table/environment collision。</li>
+<li><b>collision-free 不够：</b>要求 <span class="mono">d_min(t) &gt; d_safe</span>；<span class="mono">d_safe</span> 由左右 tracking uncertainty、base-registration uncertainty、动态误差与模型 margin 倒推，而不是随手设一个常数。</li>
+<li>把原始 timing 拆成 geometry path <span class="mono">T(s)</span> 与 time parameterization <span class="mono">s(t)</span>；必要时 retime，但必须保存 original / retimed / executed timestamp。</li>
+</ul>
+</div>
+</details>
+<details open="">
+<summary>Retarget 允许改多少、训练标签怎么处理</summary>
+<div class="detail-body">
+<ul>
+<li>永远保存三套轨迹：<span class="mono">demo_raw</span>、<span class="mono">retarget_reference</span>、后续 <span class="mono">executed_robot</span>；禁止覆盖原 demo。</li>
+<li>输出 <span class="mono">retarget_translation/rotation_p50,p95,max</span>、<span class="mono">bimanual_relative_retarget</span>、contact-window residual、<span class="mono">min_interarm_clearance</span>、joint-limit/singularity margin。</li>
+<li>free-space 可以允许更大的微调；contact window 必须更严格。具体阈值由 Phase 12 physical replay / task success 反推，不先拍脑袋冻结“1 mm / 5 mm”。</li>
+<li><b>UMI observation + UMI action 的 BC/VLA：</b>默认仍用 <span class="mono">demo_raw</span> 作为 supervision，retarget 主要作为 feasibility / quality metadata。若大幅 retarget 后直接替换 action label，会制造 observation-action mismatch。</li>
+<li><b>FR3-native policy：</b>更优路径是 retarget → 双 FR3 真机 replay → 重新采 FR3 observation + actual action，形成 embodiment-native 数据，而不是把 UMI 图像硬配 retarget label。</li>
+</ul>
+</div>
+</details>
+<div class="gate"><b>Gate：</b>连续可执行、无碰撞、clearance 高于不确定度驱动的 safety margin；retarget distortion 与 <span class="mono">T_LR</span> distortion 均在任务允许范围内。只通过 IK 但需要大幅改轨迹的 episode 不应默认为 training-valid。</div>
+</section>
+
+<section class="card full" data-block="fr3-intrinsic-metrology">
+<div class="section-title">
+<h2>Phase 11 — FR3 Intrinsic Physical Replay Metrology</h2>
+<span class="badge p0">先测机器人本身</span>
+</div>
+<p class="goal">在掺入 UMI、retarget 和复杂 contact 之前，先量清楚 FR3 本身对已知 Cartesian reference 的真实物理 tracking 能力，得到 replay error budget 中的 robot/controller 项。</p>
+<details>
+<summary>理论依据：Repeatability ≠ Absolute Accuracy，为什么必须独立测 FR3 Physical Motion</summary>
+<div class="detail-body">
+<p><b>1）机器人“重复到同一点”与“到达真实空间中的正确点”是两个指标。</b> repeatability 衡量多次执行同一命令后的离散程度；absolute accuracy / displacement accuracy 还受到 link 参数、joint zero、base frame、tool/TCP、载荷变形和控制误差影响。因此即使 FR3 内部 FK 每次都几乎相同，也不能据此推出真实 TCP 的 30 mm 位移误差同样很小。</p>
+<p><b>2）内部闭环误差和外部物理误差要分账。</b></p>
+<p><span class="mono">e_internal = T_cmd⁻¹ · T_FK</span> 主要反映 controller + robot model 的内部一致性；</p>
+<p><span class="mono">e_physical = T_cmd⁻¹ · T_GT</span> 则把真实机械结构、tool/TCP、base、负载/柔顺性等都包含进来。若两者明显不同，差值本身就是 robot-model / mechanical / registration 系统误差的证据。</p>
+<p><b>3）为什么先做简单基准再做 UMI replay。</b> End-to-end replay 中同时混有 recording、registration、retarget、collision avoidance、controller 与 contact。先用已知的 10/30/50/100 mm、旋转和几何轨迹激励 FR3，相当于系统辨识里的“隔离变量”：先测出 robot/controller 自身的 bias、repeatability、速度依赖和 workspace dependence，后续 UMI replay 才能做误差归因。</p>
+<p><b>4）动态误差通常依赖速度/加速度，而不是一个固定常数。</b> 可把真实 tracking 误差粗略理解为：</p>
+<p><span class="mono">e_robot = e_static(q, payload) + e_dynamic(q, q̇, q̈, controller) + e_timing</span>。</p>
+<p>因此 benchmark 必须覆盖典型 workspace、姿态与 demo speed 分布；只做低速静态 30 mm 平移不能代表真实 manipulation replay。</p>
+<p><b>5）独立 GT 的意义是打破共同模型误差。</b> FR3 FK 与 controller 都依赖同一机器人模型，二者互相比可能共同“相信”同一个错误。外部 6DoF laser / optical tracker 使用不同测量原理，可作为更独立的 physical reference；若只有单点 XYZ，则只能认证位置，不能完整认证 orientation。</p>
+</div>
+</details>
+<details open="">
+<summary>最小 Benchmark Matrix</summary>
+<div class="detail-body">
+<ul>
+<li>平移：X/Y/Z 的 ±10 / ±30 / ±50 / ±100 mm；重复 30–50 次，先低速静态，再扫 demo typical / p95 speed。</li>
+<li>旋转：roll/pitch/yaw 代表性小角度；再做 line / circle / figure-8 / coupled SE(3)。</li>
+<li>先单臂分别测，再双臂同时运动；双臂时额外看 controller interaction、最小 clearance 与 <span class="mono">T_LR</span>。</li>
+<li>每次同时记录 <span class="mono">T_cmd</span>、FR3 <span class="mono">T_FK</span>、independent <span class="mono">T_physical_GT</span>。</li>
+</ul>
+</div>
+</details>
+<div class="callout ok">
+<b>必须分开两个误差：</b><br/>
+<span class="mono">e_internal = error(T_cmd, T_FK)</span>：控制器/模型内部一致性；<br/>
+<span class="mono">e_physical = error(T_cmd, T_physical_GT)</span>：真实 TCP 是否走到命令位置。<br/>
+只有后者能回答“命令左移 30 mm，实际物理 TCP 到底走了多少”。
+</div>
+<div class="gate"><b>Gate：</b>建立 position/orientation × speed × workspace 的 p50/p95 map，并给出 FR3 physical tracking 的预算；若基础 30 mm relative move 已明显超过 1–2 mm 级，应先解决 TCP、tool calibration、base registration 或 controller，而不是继续归因于 UMI GT。</div>
+</section>
+
+<section class="card full" data-block="physical-replay">
+<div class="section-title">
+<h2>Phase 12 — UMI → Dual-FR3 Physical Replay Benchmark</h2>
+<span class="badge p0">最终闭环</span>
+</div>
+<p class="goal">最终比较的是 UMI 实际录到的双手 TCP 与双 FR3 实际执行出来的双手 TCP，而不是 demo vs command、也不是 command vs FK。</p>
+<details>
+<summary>理论依据：End-to-End Replay Fidelity 为什么必须分层评价</summary>
+<div class="detail-body">
+<p><b>1）最终 replay 误差是串联系统误差，不等于某一阶段的 3 mm。</b> 概念上：</p>
+<p><span class="mono">demo physical motion → recording GT → frame registration → retarget/retime → robot command → physical execution → replay GT</span></p>
+<p>每一段都可能引入 bias、随机误差或时延。因此“录制 GT p95 ≤3 mm”只能认证 recording subsystem，不能推出真实 FR3 replay 也 ≤3 mm。最终必须直接比较 <span class="mono">T_demo</span> 与独立测得的 <span class="mono">T_actual</span>。</p>
+<p><b>2）Absolute error 与 relative error 对系统误差的敏感性不同。</b> 常量 world/base 偏置会显著影响 global APE，但在 first-frame-aligned relative motion 中大部分被消除；相反，trajectory deformation、控制 lag、局部速度误差会保留在 RPE 中。因此两者组合才能区分“整段放错位置”和“动作本身执行变形”。</p>
+<p><b>3）双手任务需要显式看 differential / relative error。</b> 若左右同时产生同方向 common-mode 2 mm 偏差，单臂 APE 都不好看，但 <span class="mono">T_LR</span> 可能几乎正确；若左右分别向相反方向偏 2 mm，则双手间距可错 4 mm。对协同 manipulation，后者通常更危险，所以必须单列 bimanual fidelity。</p>
+<p><b>4）Contact-local metric 的权重高于自由空间全局平均。</b> Manipulation 的任务约束在接触附近急剧增强：抓取边缘、插入、双手夹持等对毫米级几何更敏感。长时间自由空间运动会稀释少量但关键的 contact error，因此 benchmark 应按 contact window 单独统计，而不是只报全 episode mean/p95。</p>
+<p><b>5）Timing error 可转化为空间等效误差。</b> 若 reference 与 GT 有时间偏差 <span class="mono">Δt</span>，在局部速度 <span class="mono">v, ω</span> 下会产生约 <span class="mono">v|Δt|</span> 与 <span class="mono">ω|Δt|</span> 的假空间误差。双臂 <span class="mono">T_LR</span> 对左右不同步尤其敏感，所以 independent replay GT 必须同步或严格时间对齐。</p>
+<p><b>6）Training-valid 与 replay-certified 分级是可扩展性要求。</b> 真机 replay 是昂贵测量，不能现实地覆盖每条大规模数据。因此 training-valid 负责判断“数据质量足够且双 FR3 模型上可执行”，replay-certified 负责用抽样/任务族 benchmark 认证“该数据分布在真实机器人上也能保持 fidelity”。两者必须分开命名，避免把抽样认证错误外推到整个数据集。</p>
+</div>
+</details>
+<div class="flow">UMI physical motion
+      ↓ 8-camera GT
+T_demo,L(t), T_demo,R(t)
+      ↓ shared alignment / absolute registration
+      ↓ bimanual retarget + collision constraints
+T_ref,L(t), T_ref,R(t)
+      ↓ dual-FR3 control
+FR3 physical motion
+      ↓ independent 6DoF replay GT
+T_actual,L(t), T_actual,R(t)
+      ↓
+relative / absolute / bimanual / contact replay metrics</div>
+<details open="">
+<summary>必须报告的 6 组指标</summary>
+<div class="detail-body">
+<ol>
+<li><b>Initial alignment residual</b>：正式 replay 开始前左右位置 / 姿态 / gripper / object-state 偏差。</li>
+<li><b>Relative trajectory fidelity</b>：shared first-frame alignment 后的 shape error + 40/100/400 ms/1 s RPE。</li>
+<li><b>Absolute world-space replay error</b>：固定 session registration，不允许 episode alignment 吃掉误差。</li>
+<li><b>Bimanual fidelity</b>：<span class="mono">T_LR^demo</span> vs <span class="mono">T_LR^actual</span>，尤其双手夹持 / 协同接触窗口。</li>
+<li><b>Contact-local error</b>：contact 前 / 当下 / 后窗口的位置、姿态、切向位移；优先级高于全程自由空间平均误差。</li>
+<li><b>Timing / retime fidelity</b>：original timing、retimed reference、executed timing 与 motion-equivalent error。</li>
+</ol>
+</div>
+</details>
+<details open="">
+<summary>Dataset 进入训练的两级口径</summary>
+<div class="detail-body">
+<p><b>Training-valid：</b><span class="mono">tracking ∧ qc ∧ bimanual ∧ dual_fr3_executable</span>。这是可规模化的数据准入，不要求每条都真机 replay。</p>
+<p><b>Replay-certified：</b>在上述基础上，额外通过独立 physical replay benchmark。可按 episode、任务族或分层抽样做认证，不能把少量 benchmark 的 pass 静默扩展成“全数据都已物理认证”。</p>
+<p><b>FR3-native 数据：</b>如果真机 replay 时同步重新采 FR3 相机 / proprioception / gripper / force/tactile，则保存 <span class="mono">executed_robot</span> 作为新的 robot-native demonstration；这与“修改 UMI 原始 action label”是两类数据。</p>
+</div>
+</details>
+<div class="gate"><b>Gate：</b>分别冻结 <span class="mono">recording_accuracy</span>、<span class="mono">relative_replay</span>、<span class="mono">absolute_replay</span>、<span class="mono">bimanual_replay</span> 与 <span class="mono">contact_replay</span>；只有独立 physical GT 支持时才宣称“FR3 replay 达到 3 mm-class”。</div>
+</section>
+
 <section class="card full">
 <div class="section-title">
-<h2>Phase 9 — 运动相机重新接入</h2>
+<h2>Phase 13 — 运动相机重新接入</h2>
 <span class="badge todo">后续</span>
 </div>
-<p class="goal">利用高精度 TCP 轨迹反推腕部相机 pose，为 4D reconstruction 提供强 camera trajectory。</p>
+<p class="goal">利用已认证的 TCP 轨迹反推腕部相机 pose，为 4D reconstruction 提供强 camera trajectory。</p>
 <details>
 <summary>实现细节</summary>
 <div class="detail-body">
@@ -1008,10 +1299,10 @@ marker 不必组成物理立方体；必要条件是所有可见 marker corner �
 </section>
 <section class="card full">
 <div class="section-title">
-<h2>Phase 10 — Markerless / 4D Research</h2>
+<h2>Phase 14 — Markerless / 4D Research</h2>
 <span class="badge todo">研究阶段</span>
 </div>
-<p class="goal">研究 dense 3D / 4D perception 是否能在 marker 遮挡甚至 markerless 时逼近已建立的毫米级 GT。</p>
+<p class="goal">研究 dense 3D / 4D perception 是否能在 marker 遮挡甚至 markerless 时逼近已建立并完成 replay 认证的毫米级 GT。</p>
 <details>
 <summary>候选研究方向</summary>
 <div class="detail-body">
@@ -1019,7 +1310,7 @@ marker 不必组成物理立方体；必要条件是所有可见 marker corner �
 <li>Marker occlusion recovery：dense 2D/3D track + IMU + 前后视觉 pose。</li>
 <li>Manipulated object trajectory：恢复 object SE(3) / non-rigid motion。</li>
 <li>4DGS / dynamic GS / object-centric GS 作为 scene representation。</li>
-<li>让已知 TCP trajectory supervision 约束 4D reconstruction，而不是由 4DGS 反推出 GT。</li>
+<li>让已知 TCP trajectory / replay-certified trajectory supervision 约束 4D reconstruction，而不是由 4DGS 反推出 GT。</li>
 </ul>
 </div>
 </details>
@@ -1057,7 +1348,7 @@ marker 不必组成物理立方体；必要条件是所有可见 marker corner �
 <td>2 外参 / Rig</td><td><span class="badge done">已脱离机器人 · 已上生产</span></td>
 <td><span class="mono">metrology/extrinsics.py</span>：手持 ChArUco + gauge 固定单相机 + <b>corner 级重投影联合 BA</b>（scipy 稀疏 Jacobian + huber）。机器人完全不参与。
 <b>0805 补 <span class="mono">cli/calibrate_extrinsics.py</span></b>（此前只有函数、无可复现入口），并按 7 相机位姿刚体对齐到 0720 base 系导出生产 run</td>
-<td>base 系仍继承 0720：两套 rig 对齐残差 <b>7.9 mm RMS / 2.17°</b>（尺度差 +0.69%），这部分是 0720 的误差，只有锚板（2.4）能消。
+<td>base 系仍继承 0720：两套 rig 对齐残差 <b>7.9 mm RMS / 2.17°</b>（尺度差 +0.69%），这部分是 legacy world/base 对齐误差。<b>2.4 已改为 canonical world + stable-camera consensus</b>：需要把生产导出从 0720 base 继承切到冻结的 camera-rig world；桌面锚板不再是必需的主修复路径。
 补拍后最终 BA 为 fisheye 0.2437 px（最差 cam_09 0.265），rational 0.2972（最差 cam_07 0.443）</td>
 </tr>
 <tr>
@@ -1097,34 +1388,52 @@ marker 不必组成物理立方体；必要条件是所有可见 marker corner �
 <td>kalibr 内无任何 IMU 代码（现有 <span class="mono">accel</span> 命中全是机器人 OTG 参数）</td>
 </tr>
 <tr>
-<td>7 独立 GT 验证</td><td><span class="badge warn">只有可执行性/弱参考</span></td>
-<td>FR3 FK 参考的 circle / teaching 误差评测仍在；<span class="mono">verification/verify_fr3_cube_pose_ik.py</span> 可对 sidecar 做 IK 可达性验证并输出 episode labels / JSON / markdown，GUI 也能触发离线 IK QC。</td>
-<td>这些都不是独立 3 mm 认证：FK、IK 可达性和 replay pass 只能证明轨迹可执行或与机器人模型一致，不能证明视觉 GT 的绝对精度。仍缺 mocap / 精密治具 / 接触 benchmark，以及 bimanual 独立参考。</td>
+<td>7 独立 GT / Replay GT</td><td><span class="badge warn">弱参考已有 · 独立链未闭环</span></td>
+<td>FR3 FK 参考的 circle / teaching 误差评测仍在；<span class="mono">verify_fr3_cube_pose_ik.py</span> 可做可达性验证。</td>
+<td>需接真正独立 6DoF reference；replay 推荐 dynamic laser/optical tracker + <span class="mono">T_target→TCP</span> + <span class="mono">T_W8cam←Wgt</span>。若 tracker 只给 XYZ，则 orientation GT 仍缺。</td>
 </tr>
 <tr>
-<td>8 Production QC</td><td><span class="badge warn">replay gate 成形 · GT QC 未闭环</span></td>
-<td>已有跳变 / 缺帧 / 冻结 / FFT 高频检查、FR3 IK 验证、episode label 输出；GUI Episode Replay 已接 native MuJoCo replay，真实机器人 replay 要求同 dataset/episode/fps/threshold/cube mode 的当前 MuJoCo pass，并有 trajectory contract（EE pose 完整性、最大 EE step、gripper range/step、Z bounds）。</td>
-<td>per-frame covariance、BA success、camera-count、RMSE、sync manifest 状态仍未进入生产 sidecar 的默认质量字段；阈值仍未由 Phase 7 benchmark 反推。bimanual 目前更多是 left/right/both replay 选择与 sidecar 显示，尚无 native relative-pose consistency / bimanual RPE 硬 gate。</td>
+<td>8 Production QC</td><td><span class="badge warn">GT QC 成形 · executability 拆出</span></td>
+<td>已有跳变 / 缺帧 / 冻结 / FFT 高频检查、episode label、MuJoCo precheck；bimanual sidecar 已有 left/right 数据基础。</td>
+<td>per-frame covariance / BA success / camera-count / RMSE /真实 timestamp 仍未全部写入默认 sidecar；native <span class="mono">T_LR</span> / bimanual RPE gate 仍需接入。</td>
+</tr>
+<tr>
+<td>9 Dual-FR3 registration</td><td><span class="badge p0">新增</span></td>
+<td>现有 world/base、FR3 FK 与 replay GUI 可作为基础。</td>
+<td>缺 session 级 <span class="mono">T_WB_L/R</span>、base-moved invalidation、共享 first-frame alignment、absolute replay contract、initial-state gate。</td>
+</tr>
+<tr>
+<td>10 Bimanual retarget / collision</td><td><span class="badge p0">新增</span></td>
+<td><span class="mono">verify_fr3_cube_pose_ik.py</span> 是单臂/逐 episode 可达性的起点。</td>
+<td>缺联合连续 IK/trajectory optimization、inter-arm collision、uncertainty-aware clearance、retime、retarget distortion 与 <span class="mono">T_LR</span> preservation。</td>
+</tr>
+<tr>
+<td>11 FR3 physical metrology</td><td><span class="badge p0">新增</span></td>
+<td>已有 FR3 command/FK 记录能力。</td>
+<td>缺 10/30/50/100 mm、旋转、line/circle/SE(3)、速度 sweep 的 independent physical GT benchmark；必须拆 <span class="mono">cmd↔FK</span> 与 <span class="mono">cmd↔physical</span>。</td>
+</tr>
+<tr>
+<td>12 Physical replay</td><td><span class="badge p0">新增</span></td>
+<td>已有 demo GT、bimanual metrics 雏形、MuJoCo replay 入口。</td>
+<td>缺双 FR3 同步执行 + independent 6DoF measurement；需输出 initial / relative / absolute / bimanual / contact / timing replay metrics，并区分 training-valid 与 replay-certified。</td>
 </tr>
 <tr>
 <td>8.1 相机移动自检</td><td><span class="badge done">0805 新增</span></td>
-<td>GUI 标定中心「相机自检」：每台相机当前画面与标定时基线做 RANSAC 单应，报视角位移（px + 等效转角 + 1 m 处 mm）。
-后端 <span class="mono">metrology/cli/rig_shift_check.py</span></td>
-<td>判据是<b>相对基线的逐相机变化</b>，不是相机间绝对分歧——后者由 marker 几何主导（26.6 mm），拿它报警会永远误报且重标也修不好。
-实测：未动 0.09–0.23 px，人为 3 px 测得 3.02，12 px 测得 11.93（0.678°）。<b>尚未在真机端到端跑过</b></td>
+<td>GUI 标定中心「相机自检」：每台相机当前画面与标定时基线做 RANSAC 单应；后端 <span class="mono">metrology/cli/rig_shift_check.py</span>。</td>
+<td>继续作为 camera-rig health check；不要与 dual-FR3 base registration 混为一项。</td>
 </tr>
 <tr>
-<td>9 / 10 运动相机 · 4D</td><td><span class="badge todo">未开始</span></td>
+<td>13 / 14 运动相机 · 4D</td><td><span class="badge todo">未开始</span></td>
 <td>—</td>
-<td>腕部/头部相机不在 tracking 相机列表内；无 <span class="mono">T_TCP↔Cam</span> 标定</td>
+<td>腕部/头部相机不在 tracking 相机列表内；无 <span class="mono">T_TCP↔Cam</span> 标定；应排在 replay fidelity 主线之后。</td>
 </tr>
 </table>
 <div class="callout warn">
 <b>结论（v13.8：代码缺口已经从“没有模块”变成“离线模块未进生产”）。</b>
 0805 的判断仍有效：外参已经接近亚像素 BA / 0.244 mm 级，端到端没有因此改善；真正没有被多相机平均掉的是 marker/cube 几何与 marker→TCP 这类所有相机共享的系统项。
 现在的变化是：<span class="mono">marker_rig_ba</span>、TCP covariance 和 SE(3) smoother 已经作为离线链路补齐，不能再把 Phase 4/5 写成“无代码”。
-<b>当前主阻塞是两层：</b>第一，Phase 3 的实物几何、cube→TCP bundle、拆装/重夹 repeatability 还没有达到可冻结状态；第二，production writer 仍输出旧的 pose 平均 + EMA sidecar，没有把 BA pose、covariance、quality flag 和 timestamp 写进默认训练数据。
-因此下一步不是继续新增离线指标，而是把已跑通的 BA/smoother 接成可回放、可 A/B、可追溯的生产候选，同时用真实 contact manipulation demo 证明不会伤害动作标签。
+<b>当前主阻塞分成三层：</b>第一，Phase 3 的实物几何、marker→TCP 与拆装/重夹 repeatability 仍需冻结；第二，production writer 还没有把 BA pose、covariance、quality flag 与真实 timestamp 完整写进默认训练数据；第三，原来的“FR3 IK/replay gate”只证明可达，尚缺双 base registration、联合 collision-aware retarget 与 independent physical replay metrology。
+因此后半段不再用一个 <span class="mono">replay_pass</span> 混掉不同含义，而拆成 <span class="mono">dual_fr3_executable</span> 与 <span class="mono">physical_replay_certified</span> 两级。
   </div>
 <div class="callout">
 <b>方法论教训：不要用「误差预算里最大的那一项」代替「实测最大的那一项」。</b>
@@ -1140,52 +1449,36 @@ marker 不必组成物理立方体；必要条件是所有可见 marker corner �
 </section>
 <section class="card full" data-block="execution-plan">
 <div class="section-title">
-<h2>当前执行计划</h2>
-<span class="badge p0">按阻塞关系排序</span>
+<h2>当前执行主线</h2>
+<span class="badge p0">按阻塞关系 + 数据风险排序</span>
 </div>
 <div class="callout warn">
-<b>当前判断：</b>0804 相机标定已经达到 held-out 3D p95 0.244 mm 并接入生产；0805 生产 A/B 说明它不是端到端瓶颈。当前精度地板在 marker rig 几何、marker→TCP 常量和真实装配/载荷 repeatability。离线 BA、covariance 与 smoother 已有可运行候选，下一步是把它们接成可回放、可 A/B、可追溯的生产候选，而不是继续堆离线指标。
+<b>优先级原则：</b>P0-Now 只保留“当前会影响 GT 精度”或“现在不做会造成不可逆数据/坐标系风险”的事项；Dual-FR3 replay 相关能力列为 P1-Replay，必须在进入真机 absolute replay 前完成，但不应抢占当前 Phase 3 收敛资源；environmental anchor / IMU / 4D 等为 P2。<b>World Continuity Break 的 metadata/版本化属于 P0-Now，因为成本低但能避免历史数据被错误串系；stable-camera consensus 求解器本身属于 P1-Replay。</b>
 </div>
-<h3 style="margin-top:18px">优先级与退出条件</h3>
 <table class="metric-table">
-<tr><th>层级</th><th>工作</th><th>最短路径</th><th>退出条件</th></tr>
-<tr><td><span class="badge p0">P0-1</span></td><td><b>冻结 marker rig 几何</b></td><td>补 id 11–15 cube 实测；以 5.6 cm guard 统一 layout；自制低矮/分布式 rig 与现有高位 cube 做 A/B。</td><td>L 下降、逐相机分歧与 pivot holdout p95 下降、TCP covariance 不升且遮挡率可接受。</td></tr>
-<tr><td><span class="badge p0">P0-2</span></td><td><b>冻结 marker→TCP 与真实 opening</b></td><td>做拆装、载荷、开度点位 repeatability；复核柔顺性与少量 40.1 mm outlier。</td><td>常量 bundle 标为 validated，并给出可用于预算/QC 的 repeatability 分布。</td></tr>
-<tr><td><span class="badge done">P0-3</span></td><td><b>右手 6DoF 与 multi-cube seam</b></td><td>已完成：right 常量、geometry guard、显式 <span class="mono">cube_name</span> 分派与 production run。</td><td>132514 三条 episode 均输出 left/right sidecar（各 1803 行），无 key / 坐标系 / geometry 静默回退；TCP 绝对精度仍由 P0-2 / P0-4 认证。</td></tr>
-<tr><td><span class="badge p0">P0-4</span></td><td><b>独立 GT benchmark</b></td><td>选 mocap、精密治具或 contact benchmark；先覆盖 static、dynamic、bimanual、contact。</td><td>p95 TCP ≤3 mm，且 bimanual relative pose 达标；FR3 FK 仅保留诊断用途。</td></tr>
-<tr><td><span class="badge todo">P1</span></td><td><b>生产候选数据链</b></td><td>corner BA 替换 pose 级平均；sidecar 写 pose covariance、quality、真实 timestamp；真实 contact episode 做 smoother A/B。</td><td>可复放对比 raw / BA / smoother，训练侧可按 quality 和时间轴筛选。</td></tr>
-<tr><td><span class="badge todo">P1</span></td><td><b>训练/质量 Gate</b></td><td>接统一 metrics、common-view bimanual 指标与 replay metadata。</td><td>training-valid yield = tracking → QC → bimanual → replay 的可追溯串联结果。</td></tr>
-<tr><td><span class="badge warn">P2</span></td><td><b>IMU 与 markerless / 4D</b></td><td>先完成 Camera↔IMU time/extrinsic，再进入 factor graph；markerless/4D 只用已认证 TCP 轨迹做 supervision。</td><td>不与当前 Phase 3/生产化 P0 竞争资源。</td></tr>
+<tr><th>优先级</th><th>工作</th><th>当前动作</th><th>退出条件 / 产物</th></tr>
+<tr><td><span class="badge p0">P0-Now</span></td><td><b>冻结 UMI marker rig / marker→TCP</b></td><td>完成拆装、载荷、opening repeatability；把当前分布式 rig / layout / 外参修正收敛成 validated bundle。</td><td>repeatability 分布进入误差预算；bundle 可版本化冻结。</td></tr>
+<tr><td><span class="badge p0">P0-Now</span></td><td><b>生产数据链升级</b></td><td>production writer 写 BA pose、covariance、quality、sensor timestamp；真实 contact demo 做 raw / EMA / smoother A/B。</td><td>默认 sidecar 可追溯，contact-window 不因 smoothing 被系统性改坏。</td></tr>
+<tr><td><span class="badge p0">P0-Now</span></td><td><b>World provenance / continuity-break 防护</b></td><td>先落最小 metadata 与状态机：<span class="mono">world_frame_id</span>、<span class="mono">calibration_id</span>、<span class="mono">CONTINUOUS / RECONNECTED / BROKEN</span>；全相机移动时禁止复用旧 world ID，历史轨迹保持原 ID。</td><td>任何新旧数据都不会静默串错坐标系；即使今天 8 台相机全部搬动，旧数据仍可被正确解释，absolute 跨-world 使用会显式 fail/require registration。</td></tr>
+<tr><td><span class="badge todo">P1-Replay</span></td><td><b>独立 GT 基础设施</b></td><td>确定 UMI GT 与 FR3 replay GT 的独立参考；若使用 laser tracker，确认动态 6DoF / 双 target 可同步，并设计 <span class="mono">T_target→TCP</span> 与 8cam↔tracker registration。</td><td>能输出同一 metric world 下、带 timestamp 的双末端 independent 6DoF reference。</td></tr>
+<tr><td><span class="badge todo">P1-Replay</span></td><td><b>Stable-camera consensus + Dual-FR3 base protocol</b></td><td>实现 pairwise SE(3) stable cluster 与共享 <span class="mono">T_WS</span>；若 continuity 为 BROKEN，则新建 world island。随后用左右平台分布式 ArUco 求 <span class="mono">T_WP_L/R</span>，组合 <span class="mono">T_PB_L/R</span> 得 <span class="mono">T_WB_L/R</span>。</td><td>正常 session 可由期望 ≥4 台稳定相机维持 canonical W；全相机移动能安全 branch；<span class="mono">T_WB_L/R</span>、covariance、platform-slip 与 initial-state residual 可记录。</td></tr>
+<tr><td><span class="badge todo">P1-Replay</span></td><td><b>联合 retarget + collision</b></td><td>连续双臂 IK/optimization，加入 self/inter-arm/environment collision、clearance、joint dynamics、singularity、retime 与 <span class="mono">T_LR</span> 保真。</td><td><span class="mono">dual_fr3_executable</span> + failure reason + retarget residual + min clearance + margins 全部落 metadata。</td></tr>
+<tr><td><span class="badge todo">P1-Replay</span></td><td><b>FR3 intrinsic physical benchmark</b></td><td>先做 10/30/50/100 mm 与旋转/line/circle/SE(3) speed sweep；同时记 cmd / FK / independent GT。</td><td>得到 robot/controller 自身 physical p50/p95 map，明确 3 mm budget 中 FR3 占多少。</td></tr>
+<tr><td><span class="badge todo">P1-Replay</span></td><td><b>UMI → 双 FR3 physical replay</b></td><td>同 world 时做 absolute + relative；不同 world 且无 registration edge 时只允许 relative/shared-alignment benchmark。经 retarget 真机执行，用 independent 6DoF GT 测 actual TCP。</td><td>initial / relative / absolute(可用时) / bimanual / contact / timing 六组 replay 指标；能有证据地决定是否达到 3 mm-class。</td></tr>
+<tr><td><span class="badge todo">P1-Data</span></td><td><b>训练数据语义冻结</b></td><td>UMI BC/VLA 默认保留 raw demo label；retarget 作为 feasibility metadata。明确 relative/bimanual 特征可跨 world island 使用，absolute-world label 只能在同一 world 或已注册 worlds 间使用。</td><td>明确 <span class="mono">training_valid</span>、<span class="mono">absolute_world_valid</span> 与 <span class="mono">replay_certified</span>，不因 world continuity break 废弃历史数据。</td></tr>
+<tr><td><span class="badge todo">P1</span></td><td><b>M2020 触觉收尾</b></td><td>解决中心 fz 饱和、角点近零响应并按 9 点口径重标 contact-window detector。</td><td>正常抓取无大面积饱和；有效触点数与阈值固定。</td></tr>
+<tr><td><span class="badge warn">P2</span></td><td><b>Environmental anchor / global-drift watchdog</b></td><td>只有当稳定相机存在共同刚体移动风险、或确实需要跨全相机搬迁恢复 absolute world 时，再部署与相机架机械独立的固定 marker/datum / tracker reference。</td><td>能检测 common-mode camera-rig drift；必要时提供 <span class="mono">T_Wnew←Wold</span> reconnect edge。<b>不是历史数据有效性的前置条件。</b></td></tr>
+<tr><td><span class="badge warn">P2</span></td><td><b>IMU / 运动相机 / markerless / 4D</b></td><td>Camera↔IMU time/extrinsic → factor graph；replay 主线稳定后再接 motion camera / 4D。</td><td>不与 UMI GT + Dual-FR3 replay 主线竞争资源。</td></tr>
 </table>
-<h3 style="margin-top:22px">建议时间线</h3>
-<div class="timeline"><div class="week">批次 1</div><div>Phase 3 收敛：marker layout/rig A/B、marker→TCP repeatability；P0-3 right seam 的 production run 已完成。</div></div>
-<div class="timeline"><div class="week">批次 2</div><div>生产候选：BA + covariance + timestamp sidecar；用真实 contact episode 完成 smoother A/B。</div></div>
-<div class="timeline"><div class="week">批次 3</div><div>验收 Gate：独立 GT、bimanual common-view/RPE、retarget/replay metadata 与 training-valid yield。</div></div>
-<div class="timeline"><div class="week">批次 4</div><div>仅在视觉 GT 候选稳定后推进 Camera↔IMU、factor graph 与 4D research。</div></div>
-<details data-block="phase2-checklist" style="margin-top:20px">
-<summary><b>Phase 2 收尾清单</b>（不再占据主线）</summary>
-<div class="detail-body">
-<table class="metric-table">
-<tr><th>项</th><th>动作</th><th>完成判据</th></tr>
-<tr><td>边缘覆盖</td><td>在可安排录制时补 cam_09/12/06 全画幅边缘数据。</td><td>held-out edge distortion 与径向单调性复验通过。</td></tr>
-<tr><td>σ<sub>pixel</sub></td><td>采一段静止录制，替换 Level 1 的 0.2 px 假设。</td><td>uncertainty map 使用实测噪声并复出报告。</td></tr>
-<tr><td>world anchor</td><td>用锚板替代继承的 0720 base 系。</td><td>消除当前 7.9 mm RMS / 2.17° 对齐残差的历史依赖。</td></tr>
-<tr><td>cam_00 / GUI</td><td>处理遮挡导致的零检出；修复内参录制时长和 recorder armed 保存/丢弃流程。</td><td>标定 GUI 可复现，失效显式可见。</td></tr>
-</table>
-</div>
+<details style="margin-top:20px">
+<summary><b>非阻塞 Maintenance Backlog</b></summary>
+<div class="detail-body"><ul>
+<li>Phase 2：cam_09/12/06 边缘覆盖、cam_00/GUI 等不再占当前主线；σ<sub>pixel</sub> 已实测。</li>
+<li>Canonical world persistence 与 dual-FR3 base registration 分层维护：前者负责 <span class="mono">world_frame_id</span> / stable-camera consensus / continuity graph；后者用移动平台 ArUco 管理 <span class="mono">T_WP_L/R → T_WB_L/R</span>。</li>
+<li><b>全相机搬迁不是数据灾难恢复事件：</b>创建新 world island 即可；只有 absolute-world cross-session/replay 需要后验 reconnect。不要为了避免这种 rare event 把大桌面 anchor 升回 P0。</li>
+<li>FR3 末端视觉 marker rig：若 6DoF laser tracker 可稳定使用，降为可选工程 QC；若独立 tracker 不可用，再把可重复安装的低矮 marker fixture 作为 fallback。</li>
+</ul></div>
 </details>
-<h3 style="margin-top:22px">可直接开工</h3>
-<table class="metric-table">
-<tr><th>#</th><th>改动</th><th>落点</th></tr>
-<tr><td>1</td><td>冻结 id 0–4 / 11–15 的实测几何归属，并产出可标定 <span class="mono">marker_layout.json</span>。</td><td>Phase 3 / rig A-B</td></tr>
-<tr><td>2</td><td>低矮/分布式 rig 对比现有 cube，并记录 visibility、per-camera dispersion、pivot holdout、Σ_TCP。</td><td>Phase 3 / 误差预算</td></tr>
-<tr><td>3</td><td>采 marker→TCP 的拆装、载荷与 opening repeatability；复核 40.1 mm outlier。</td><td>Phase 3 / 常量冻结</td></tr>
-<tr><td>4</td><td>把 132514 的 1803-frame left/right production run 固化为 seam / geometry regression。</td><td>Thor 默认 sidecar</td></tr>
-<tr><td>5</td><td>让 production writer 写 BA pose、covariance、quality flag 与 sensor timestamp。</td><td>Phase 4 / Phase 8</td></tr>
-<tr><td>6</td><td>拿真实 contact manipulation demo 跑 raw / BA / smoother A/B，并视频复核 right tail。</td><td>Phase 5</td></tr>
-<tr><td>7</td><td>把统一 metrics、bimanual common-view/RPE 与 replay pass/fail 接入评测和 episode metadata。</td><td>Phase 0 / 7 / 8</td></tr>
-<tr><td>8</td><td>安排独立 GT 的 static、dynamic、bimanual、contact benchmark。</td><td>Phase 7 Gate</td></tr>
-</table>
 </section>
 <section class="card full">
 <div class="section-title">
@@ -1200,6 +1493,9 @@ marker 不必组成物理立方体；必要条件是所有可见 marker corner �
 <tr><td>Multi-view BA</td><td>↓</td><td>↓</td><td>↓</td><td>↑</td></tr>
 <tr><td>+ trajectory optimization</td><td>≈ / ↓</td><td><b>↓↓</b></td><td><b>↓↓</b></td><td>↑</td></tr>
 <tr><td>+ IMU</td><td>↓</td><td><b>↓↓</b></td><td><b>↓↓</b></td><td><b>↑↑</b></td></tr>
+<tr><td>+ dual-FR3 executability</td><td>—</td><td>retarget residual</td><td>—</td><td>collision / clearance</td></tr>
+<tr><td>+ FR3 physical GT</td><td><b>直接测</b></td><td><b>直接测</b></td><td><b>直接测</b></td><td>—</td></tr>
+<tr><td>+ dual-FR3 physical replay</td><td><b>E2E</b></td><td><b>E2E</b></td><td><b>E2E</b></td><td>contact / bimanual</td></tr>
 <tr><td>+ dense 3D / 4D</td><td>?</td><td>?</td><td>?</td><td><b>目标验证</b></td></tr>
 </table>
 <div class="callout warn">
@@ -1210,44 +1506,69 @@ marker 不必组成物理立方体；必要条件是所有可见 marker corner �
 <div class="section-title">
 <h2>最终系统关系</h2>
 </div>
-<div class="flow">8 fixed synchronized RGB
-          │
-          ▼
- marker observations
-          │
-          ▼
- multi-view SE(3) BA
-          │
-          ├───────────────┐
-          │               │
-          ▼               ▼
- marker→TCP         left/right IMU
-          │               │
-          └──── factor graph ────┐
-                                │
-                                ▼
-                     TCP Trajectory GT
-                                │
-                                ▼
-               bimanual / QC / retarget-replay
-                                │
-                         training-valid gate
-                                │
-                 ┌──────────────┴──────────────┐
-                 ▼                             ▼
-          policy post-training        ground truth / strong constraint
-                                               │
-                                               ▼
-                                dense 3D / 4D manipulation
-                                  ↑          ↑          ↑
-                              8 fixed     2 wrist    head cam</div>
+<div class="flow">RECORD / GT
+8 fixed synchronized RGB
+          ↓
+ marker corners → multi-view SE(3) BA → marker→TCP
+          ↓                         ↘ IMU / smoother (only if ablation wins)
+ T_demo,L(t), T_demo,R(t)
+          ↓
+ tracking / QC / bimanual gate
+          ↓
+
+DUAL-FR3 TRANSFER
+session T_WB_L / T_WB_R
+          ↓
+shared first-frame alignment  OR  absolute world registration
+          ↓
+bimanual continuous retarget + retime
+          ↓
+joint limits / singularity / self + inter-arm + environment collision
+          ↓
+        dual_fr3_executable
+          ↓
+
+PHYSICAL REPLAY / CERTIFICATION
+Dual FR3 control
+          ↓
+independent dynamic 6DoF GT
+(laser / optical tracker; visual EE marker rig = optional fallback/QC)
+          ↓
+T_actual,L(t), T_actual,R(t)
+          ↓
+initial + relative + absolute + T_LR + contact + timing metrics
+          ↓
+ ┌──────────────────────┴───────────────────────┐
+ ▼                                              ▼
+training-valid dataset                  replay-certified subset
+(raw UMI labels + metadata)             / FR3-native replay data
+          │                                              │
+          └────────────────── policy training ───────────┘
+                                  ↓
+                         markerless / dense 3D / 4D</div>
 <div class="callout">
-        核心决策：先把 8 路固定、硬同步、global-shutter 相机榨成一套“视觉 motion capture system”；达到 2–3 mm 后，
-        再通过 bimanual / QC / retarget-replay 把“有轨迹”升级成“可训练、可执行轨迹”，最后研究 4D 感知如何处理 marker 遮挡与物体轨迹。
-      </div>
+<b>核心决策：</b>把系统终点从“视觉 motion-capture 达到 2–3 mm”扩成“Record → Transform → Retarget → Control → Physical Replay → Independent Validation”。<br/>
+录制精度、FR3 自身 physical tracking、retarget distortion、双臂碰撞安全和最终 end-to-end replay 必须分账；任何一个漂亮的 FK/IK/reprojection 数字都不能替代 physical replay GT。
+</div>
 </section>
 </div>
 <p class="small" style="margin-top:24px">
+    版本：2026-08-19 v14.3 · <b>World Continuity Break / 优先级重排</b>：明确“历史轨迹有效性”与“跨 session absolute world continuity”解耦。正常情况下由 stable-camera consensus 维持同一 canonical <span class="mono">W</span>；若 8 台相机全部移动且无独立 anchor，则创建新的 <span class="mono">world_frame_id</span> / coordinate island，旧数据的 RPE、delta、<span class="mono">T_LR</span> 与 contact-local trajectory 继续有效，只禁止无 registration edge 的跨-world absolute replay。新增 <span class="mono">CONTINUOUS / RECONNECTED / BROKEN</span> 状态机与 world graph metadata。优先级改为：Phase 3/生产链 + world provenance 防串系为 P0-Now；stable-camera consensus、dual-FR3 registration/retarget/physical replay 为 P1-Replay；固定 environmental anchor 仅为 P2 watchdog/reconnect，不再作为历史数据有效性的前置条件。<br/>
+    版本：2026-08-19 v14.2 · <b>Canonical World / 移动平台注册重构</b>：确认 8-camera 中大多数情况下至少 4 台物理不动，因此 Phase 2.4 从“桌面锚板定义 world”改为“冻结 canonical camera-rig world + stable-camera consensus 持久化”；通过历史/当前 pairwise SE(3) 找稳定相机 cluster，并用共享 SE(3) 把新 session 注册回同一 <span class="mono">W</span>。固定环境 anchor 降级为只检测相机群 common-mode 整体移动的可选 watchdog。Phase 9 明确左右移动平台的分布式 ArUco rig 是 FR3 session base registration 主手段：<span class="mono">T_WB = T_WP · T_PB</span>，平台移动即失效重算，并把 pose covariance / platform slip 传播到 collision 与 absolute replay budget。<br/>
+    版本：2026-08-19 v14.1 · <b>新增 Phase 理论层</b>：Phase 9–12 补充默认折叠的理论依据，分别说明刚体/base registration 与共享 SE(3) 对齐、7DoF null-space 与双臂约束优化/uncertainty-aware clearance、repeatability 与 absolute physical accuracy 的区别、以及 E2E replay 的 absolute/relative/bimanual/contact/timing 分层评价；主页面执行信息不展开膨胀。<br/>
+    版本：2026-08-19 v14.0 · <b>Roadmap 终点扩展为 Dual-FR3 Physical Replay</b>：基于双手轨迹最终需由两台可移动 FR3 重播的约束，新增 Phase 9–12：session 级双 base registration / shared first-frame 与 absolute replay protocol、bimanual collision-aware retarget、FR3 intrinsic physical metrology、UMI→双 FR3 independent physical replay benchmark；原 motion-camera / 4D 后移为 Phase 13/14。明确 FR3 FK 只做内部诊断；若可用动态 6DoF laser/optical tracker，则 FR3 视觉 marker rig 不再是认证必需，只作为 fallback/QC。训练侧不默认用 retarget trajectory 覆盖 UMI raw label，而分成 training-valid 与 replay-certified，并建议通过真机 replay 重采 FR3-native observation/action。<br/>
+    版本：2026-08-19 v13.25 · <b>「高位 cube vs 分布式 rig：正面对比」卡片从 roadmap 移入 rig 实验报告 §3</b>：原卡片夹在「3 mm 误差预算」与 Phase 0 之间，粒度也不对 —— Phase 3 的 goal 本就写明「本页只保留决策、状态和接口缺口，误差分解见实验报告」，而一张 12 行实测表正是该送走的内容；且 Phase 3 早有一条带链接的跟踪行与之重复。<b>顺带修掉一个真问题</b>：两个文档各有一张 A/B 表、数字不同却都没标采集来源（rig 文档 §3 是 0818a，roadmap 卡是 0818b），读者对照会以为打架。现已<b>用同一套最好配置</b>（CAD 先验 σ=1 mm/1°、cam_09 排除在 layout 求解外、7 相机跟踪、L 口径统一 102.01 mm）把三次采集全部重算并合并成一张标清来源的表：位置分歧 p50/p95 = 4.13/12.60、4.05/11.35、<b>2.40/7.14</b> mm；姿态 0.68/1.43°、0.59/1.25°、0.57/1.25°；折算 TCP 1.21/2.55、1.06/2.23、<b>1.01/2.23</b> mm；&gt;20 mm 粗差（全量/剔 cam_09）15.5/1.16%、14.7/<b>0.38%</b>、16.3/0.80%；最差相机丢帧 14.3%(cam_06)、<b>3.5%</b>(cam_06)、44.7%(cam_08)。roadmap Phase 3 只留一条决策行 + 链接。<br/>
+    版本：2026-08-18 v13.24 · <b>判别实验完成：剩余偏移是<u>装配项</u>，不是相机外参；<span class="mono">|p_rig|</span> 降到 0.54 mm，全部指标史上最好</b>：数据 <span class="mono">…_183700</span>（3 ep / 1805 帧）。真正的定点摆动（球心包络 3.8/5.2/5.2 mm、13–16 mm/s、姿态跨度 55–81°），<b>且钢球在 episode 之间被挪了 311–454 mm</b> —— 判别实验一次做了三遍。<b>(1) 结果</b>：<span class="mono">|p_rig|</span> = <b>0.54 mm</b>（前值 0.90 / 1.14），残差 p95 <b>1.41 mm</b>（前值 1.51 / 2.47），holdout p95 <b>1.12 / 1.70 / 1.76 mm</b>（前值 1.83–2.09）—— 且本次 holdout 是把 <span class="mono">p_rig</span> 搬到<b>没见过的球窝位置</b>去验，比原地验还好。<b>(2) 判别</b>：跨采集 <span class="mono">|Δp_rig|</span> —— 0818b vs 0818d（球窝挪 0.3–0.45 m）<b>0.38 mm / 方向差 9.5°</b>，反而优于 0818a vs 0818b（同位置）的 0.58 mm / 30.4°。<b>偏移固定在 rig 系 → 假设 (A) 打印/装配；假设 (B) 相机外参场被排除为主因</b>（与 v13.21 自洽：外参偏置固定在 base 系，被 <span class="mono">q_base</span> 吸收）。<b>(3) 次级效应</b>：ep 间 rms 散布同位置 0.42 mm、跨 0.45 m 涨到 0.84 mm，差值 ≈0.73 mm 是<b>位置相关但零均值</b>的分量 —— 跨位置平均即可消掉，这解释了本次为何最好。<b>实用推论：标定应在多个球窝位置各录一段再合并。</b>（n=3、姿态覆盖不同，此条属提示性。）<b>(4) 工具修复</b>：钢球挪动时共享锚点头条是垃圾（<span class="mono">p_cube</span> 208 mm、残差 307 mm）且 holdout 三折全 "no usable samples"；现在锚点跨度 &gt;5 mm 自动判 <span class="mono">socket_moved_between_episodes</span>，头条换 multi-anchor，holdout 改为只迁移 <span class="mono">p_rig</span>、重解留出 ep 的锚点，per-camera 同样接上（离散度从假的 326.85 mm 回到真实的 6.66 mm）。<br/>
+    版本：2026-08-18 v13.23 · <b>第三次 pivot 尝试仍未采到，但换来「手扶 vs 机械座」的实测差距和一条即时自检</b>：数据 <span class="mono">…_180914</span>（2 ep / 1205 帧，「marker rig 中心尽量保持不动，&lt;1 cm 晃动」）。<b>跟踪很干净</b>：1218/1218 帧全部融合、7 相机、残差 p95 3.64 mm、姿态跨度 p95 80.4°。<b>但稳住的点不是球窝球心</b>：CAD 系拟合出的定点在 <span class="mono">[114.0, 1.7, −1.5] mm</span>（离球心 114 mm），球窝球心自身轨迹包络 221.9 mm —— 球窝全程不在钢球上。判别实验必须以球心为定点（只有那里真值 = <span class="mono">[0,0,0]</span>），故仍未采到。<b>(1) 即时自检</b>：CAD 系 layout 下 <span class="mono">|p_rig|</span> 本身就是「有没有坐上去」的判据 —— 坐上去必然 ≈1 mm（前两次 0.90/1.03），没坐上去是几十到上百 mm（本次 114.01）；比目测晃动可靠得多。<b>(2) 手扶 vs 机械座差 18 倍</b>：逐 episode 拟合定点，本次两 ep 之间差 <b>29.90 mm</b>，对照坐钢球的两次 1.71 / 1.54 mm。反差在于<b>单 ep 内点稳到 7–11 mm，但 ep 之间手重新扶的位置差 3 cm，肉眼看不出</b> —— 实证 v13.22 的结论：稳住球心的是接触不是手。<b>(3) 第 4 个外参偏置复现点</b>（q ≈ [0.886, 0.044, 0.402]）：cam_09 = [−28.6, 2.2, 4.5]（29.1 mm）对照表值 [−26.0, 4.4, 5.5]（27.0 mm）差 3.6 mm，其余六台复现到 1.5–6.1 mm。<br/>
+    版本：2026-08-18 v13.22 · <b>球心稳定性的容差被量化：判据是「相关性」不是「幅度」，球窝间隙由此升级为剩余 0.9 mm 的主要嫌疑</b>：对两次成功采集的实测位姿<b>注入合成球心漂移</b>再重解，量出各形态漂移传进交付量 <span class="mono">p_rig</span> 的杠杆。<b>随机手抖 0.10–0.29×</b>（且 σ=2 mm 时残差 p95 +3.1/+3.4 mm，很吵）；<b>每 episode 慢漂移 0.16–0.27×</b>（5 mm 时逐 episode 锚点报出 4.8 mm）；<b>但横向推力随倾角变化是 1.22–1.24×、与朝向锁死是 1.00×，两者残差变化 ≤0.08 mm —— 残差/holdout/逐 episode 锚点三道检查全部失效</b>（姿态相关位移正落在 <span class="mono">R p + t = q</span> 的零空间里）。<b>推论一</b>：操作要求从「手要稳」改为「① 始终压住别单边翘起 ② 按压方向相对 rig 保持一致」—— 把球心钉住的是球窝-钢球的接触而非手。<b>推论二（新）</b>：球心落在窝里哪一点由受力方向决定、而受力方向随 rig 一起转，所以<b>球窝间隙本身就是姿态相关项</b> —— socket R=12.68 对 25 mm 球，极端两接触点 0.36 mm × 1.22 倍 ≈ <b>最多 0.44 mm 直接进 <span class="mono">p_rig</span> 且残差看不见</b>；此前记为「只进残差不进 <span class="mono">p_rig</span>」<b>是错的</b>。判别很便宜：两次采集故意用不同按压方向，<span class="mono">p_rig</span> 差 0.3–0.4 mm 即坐实。<b>另</b>：实测球心包络 4.3–11.1 mm（快分量 &lt;1 mm = 跟踪噪声），故上一版「包络 &lt;10 mm」判据放宽为 <b>&lt;20 mm</b>（0818b ep0 实测 11.06 mm 却是合格采集）。<br/>
+    版本：2026-08-18 v13.21 · <b>cam_08 σ 补齐 + 逐相机外参偏置标定出来了</b>：数据 <span class="mono">…_172430</span>（ep0 静止补 cam_08，ep1–3 本意是把桌面钢球挪到新位置后的定点摆动）。<b>(1) cam_08</b> σ<sub>pixel</sub> = <b>0.028 px</b>（生产默认）/ 0.039 px（SUBPIX），7 台里最低 —— 它的角点检测没问题，那 27 mm 是外参。至此 7 台全部测到。<b>(2) ep1–3 不是定点摆动</b>：rig 被拿在手里挥，原点位移包络 547/940/794 mm、速度 p50 234–364 mm/s（对照成功采集 6 mm / 13–16 mm/s），用 CAD 系 layout 时原点即球心、坐在球上转不可能移动 —— 所以 pivot 判别实验仍未采到。「定点摆动」的判据是<b>原点位移包络 &lt;10 mm</b>；而「挪位置」指挪<b>桌面钢球</b>（支点 <span class="mono">q_base</span>，建议横移 0.3 m），rig 上的球窝是打印件的一部分动不了，<span class="mono">p_rig</span> 正是要检验换位置后复不复现的量。<b>(3) 但挥动数据扫过 x 0.48–0.94 / y −0.30–0.42 / z 0.22–0.76 m，直接回答了「外参误差是否随位置变化」</b>：每台相机的偏差向量是<b>固定在 base 系的常量</b>，跨 0.5 m 只变 1–2 mm，且在三次独立采集（相隔 1h45m 与 5h、位置不同、速度差 20 倍）之间复现到中位 1.9–2.4 mm。修正表：cam_09 [−26.0, 4.4, 5.5]、cam_06 [−6.3, 5.4, −1.5]、cam_08 [−4.1, −2.7, 0.9]、cam_13 [−3.7, −0.5, 1.0]、cam_14 [1.8, −0.9, −2.7]、cam_07 [−0.4, 1.1, −0.2]、cam_12 [0.7, 0.7, 0.4] mm（相对加权融合共识）。<b>(4) 推论</b>：既然偏置固定在 base 系，它主要被 <span class="mono">q_base</span> 吸收而不偏移 <span class="mono">p_rig</span>，故剩余 0.9 mm 的证据<b>偏向装配/打印项</b>，与「偏移几乎纯切向」同向 —— 但直接判据仍需一次真正的定点摆动。<br/>
+    版本：2026-08-18 v13.20 · <b>σ<sub>pixel</sub> 实测，Level 1/3 的最后一个假设消除</b>：数据 <span class="mono">…_163416</span>（4 静止姿态）+ <span class="mono">…_163752</span>（2 个），共 6 姿态、每个 400–620 帧，<b>用 rig 本身而非标定板</b>作目标（σ<sub>pixel</sub> 属于「检测器×字典×印刷×距离」的组合量）。<b>结果</b>：生产默认 <span class="mono">CORNER_REFINE_NONE</span> 在 &lt;70° 实测 <b>0.156–0.214 px</b>，全体中位 0.167 px —— <b>沿用两年的 0.2 px 假设是对的且略偏保守，Level 1 至此从「假设下的结论」升级为「已验证的结论」</b>。<b>SUBPIX 的 A/B 有一个反直觉结论</b>：&lt;70° 时 0.034–0.048 px（好 4–5 倍），但 <b>70–80° 时反而更差</b>（0.633 vs 0.354 px）—— 细化窗口落在压扁糊掉的边缘上会跑掉；因此应实现为「入射角 ≤70° 才细化」而不是全局打开。工具侧：<span class="mono">measure_corner_noise.py</span> 新增 rig 目标通路（<span class="mono">--rig-layout-json</span>，角点不必共面）与逐 marker σ 输出；<span class="mono">metrology/__init__.py</span> 改为惰性导入 —— 原来导入任何子模块都会拖进 SciPy，导致「检测器在 venv、SciPy 在系统 python」这条 Thor 环境裂缝下没有任何一个解释器能跑这个工具。<b>采集缺口</b>：cam_08 在 6 个姿态里都只看到 1 个 marker（8 观测 vs 6 自由度，不可用），7 台只测到 6 台。<b>另注</b>：这两个数据集<b>都是静止采集</b>（每 episode 姿态变化仅 0.04–0.20°，对照真实摆动 18–34°），所以「挪动桌面钢球后再做定点摆动」这一判别实验仍未采到。<br/>
+    版本：2026-08-18 v13.19 · <b>pivot 去掉「球窝整轮不动」假设</b>：新增 <span class="mono">fit_pivot_multi_anchor()</span> —— 共享 <span class="mono">p_cube</span>、每个 episode 各解一个 <span class="mono">q_base</span>，报告里以 <span class="mono">socket_stability</span> 输出并兼作体检。球窝位置本来就不进交付量（<span class="mono">p_cube</span> 是球心在 rig 系里的位置，只由 rig 几何决定），跨采集完全自由；原实现只在「一次 run 内共享一个锚点」这一处残留了假设。实测：0818b 位移 0.016 mm（三 episode 球心全在 0.38 mm 内），0818a 位移 0.152 mm 且 <b>|p_rig| 1.03 → 0.93 mm、残差 p95 3.09 → 2.60</b>，其 ep4 球心比 ep2/ep3 偏 1.14 mm（ep2↔ep3 仅 0.28）—— <b>ep4 被轻碰过的怀疑得到印证</b>，且现在由模型自行吸收。下次采集若把桌面钢球挪到新位置（<span class="mono">q_base</span> 变、<span class="mono">p_rig</span> 按定义不变），反而是一个免费的判别实验：剩余约 0.9 mm 若跟着 rig 走则是装配/打印项，若随位置变则是相机外参项。<br/>
+    版本：2026-08-18 v13.18 · <b>Uncertainty Map 升级到 Level 3</b>：新增 <span class="mono">metrology/tcp_uncertainty.py</span>（对任意假想 rig 位姿合成角点观测，跑<b>生产估计器自己的</b> pose Jacobian → 6×6 协方差 → 传播到 TCP）、<span class="mono">cli/level3_tcp_uncertainty_map.py</span>（工作区网格 × 均匀采样姿态，按姿态取分位）、<span class="mono">cli/fit_marker_visibility.py</span>（<b>从真实采集拟合</b>可见性，而不是假设一个 FoV 判据）。可见性实测：入射角 0–40° 检出 92–98%、65–70° 77%、75–80% 跌破 50%（cutoff 80°）、85–90° 归零；0–40° 段的高检出率同时证明 rig 自遮挡很轻。<b>Level 3 结果</b>（1.0×1.0×0.6 m、0.1 m 步长、847 点、每点 32 姿态、σ<sub>pixel</sub>=0.2 px）：847/847 全可解，σ<sub>TCP</sub>（姿态 p50）全区 p50 0.09 / p95 0.23 mm，σ<sub>TCP</sub>（姿态 p95）全区 p50 0.23 / p95 0.49 mm —— <b>比实测 |p_rig| 0.9–1.0 mm 与逐相机分歧 4.1 mm 低一到两个数量级</b>，与 Level 1 同结论：几何与像素噪声都不是瓶颈，剩余全是系统项。实现中修掉一个会静默毁掉整张图的 bug：入射角原先取 <span class="mono">abs(cos)</span>，导致<b>背朝相机的 marker 被判为正对 0°</b>（修正后正对检出率由 46% 变 97%）；marker 法线现按「背离 layout 原点」定向。<b>唯一仍假设的输入是 σ<sub>pixel</sub>=0.2 px</b>，消除它只需一段静止采集，估计器 <span class="mono">cli/measure_corner_noise.py</span> 早已就绪。<br/>
+    版本：2026-08-18 v13.17 · <b>最好配置定稿、cube 正面对比、贴纸厚度光学标定</b>：新增「高位 cube vs 分布式 rig 正面对比」卡片（Phase 0 之前），两侧同一估计器。当前最好配置 = CAD 先验（板心 σ=1 mm / 法线 σ=1°）+ layout 求解剔除 cam_09 + 跟踪用全部 7 台：<b><span class="mono">|p_rig|</span> = 1.03 / 0.90 mm</b>，重扫复现 0.48 mm，姿态折算 TCP p95 6.32 → <b>2.23 mm</b>，最差相机丢帧 47.4% → <b>3.5%（达标）</b>，&gt;20 mm 粗差剔 cam_09 后 <b>0.38%</b>，holdout p95 3.72 → 1.83–2.09 mm，cond 152.7 → 64.6。<b>贴纸厚度</b>：用户给出卡尺 0.75 mm；把它建模为 marker 面相对 CAD 板面的外移（<span class="mono">--sticker-thickness-mm</span>），并做 −0.75…+1.5 mm 扫描，<b>拟合板位相对 CAD 先验的 rms 在 +0.75 处取极小（0.955 → 0.610 → 0.472 → 0.402 → 0.434 → 0.546 mm），抛物线顶点 0.82 mm</b> —— 视觉独立复现了纸的厚度，差 0.07 mm。判据选择本身是教训：重投影 rmse 对此完全不敏感（BA 会把板位重拟合，4.7622 vs 4.7622 px），<span class="mono">|p_rig|</span> 也太钝（变化 0.04–0.11 mm，低于 0.48 mm 的重复性），只有「拟合板位相对 CAD 先验的残差」看得见。CAD 侧确认无沉台（板厚 6 mm，外面积 4844.2 mm² = 69.6²），贴纸确实凸出。<br/>
+    版本：2026-08-18 v13.16 · <b>分布式 rig 二次采集复核 + CAD 约束 layout</b>：新增第二次独立采集（<span class="mono">…_20260818_115119</span> ep0/1/2，1837 帧）。<b>(1) 重复性</b>：两次相隔 1h45m 的采集，pivot 相差 <b>0.60 mm</b>，杠杆臂 102.43 / 102.28 mm。<b>(2) CAD 约束 layout</b>（新增 <span class="mono">rig_layout.cad_constrained_layout</span> + <span class="mono">cli/build_cad_layout.py</span>）：板心与法线从 CAD 冻结，只保留实测的面内转角与边长，结果表达在 CAD 系（原点 = pivot 球心），于是 pivot 拟合的正确答案就是 0 —— 实测 <span class="mono">|p_rig|</span> = <b>1.35 / 1.29 mm</b>，球面交叉检验半径 1.65 / 1.22 mm。实测与 CAD 本就一致到法线 &lt;2°、贴纸偏心 &lt;1.1 mm，约束只挪动角点 1.1–1.6 mm。<b>(3) 新风险</b>：<b>layout 求解对坏相机没有防护</b> —— cam_09 在第二次采集里彻底失效（单相机自解杠杆臂 34 mm、自残差 p50 16.9 mm，cam_08 28.4 mm），等权像素级 BA 把杠杆臂拽到 <b>107.3 mm</b>；排除 cam_09 后 layout 与 CAD 的中心残差 7.35 → <b>0.26 mm</b>。跟踪端的 8 px 逐相机门限须补到 layout 端。<b>(4) 更正</b>：v13.15 写的「拟合 p95 3.76 → 3.02」是跨口径比较；同一估计器下是 3.19 → 3.02，几乎没动。残差 = δt + δθ×L，杠杆臂缩 2.35× 但等效角涨 1.8–2.2×（layout 误差使位姿依赖于「本帧看见哪几个 marker」：5 个全见 p95 1.48 mm，丢 id 7 则 4.89 mm）。相机数匹配后（5 相机）真实改善约 25%。<b>(5)</b> 原列为待查的「ep4 holdout p95 4.75 mm」已定位为同一机理，非座子被碰动；换 CAD 约束 layout 后三条 holdout 收敛到 1.83–2.09 mm。<b>(6) 1.3 mm 系统偏移已定位并压下去</b>：贴纸卡尺实测 60.86 mm，视觉全局只差 −0.187%（值 0.19 mm），把边长钉死重跑 <span class="mono">|p_rig|</span> 纹丝不动（1.33/1.32），且偏移几乎纯切向（径向 −0.11/−0.40 vs 切向 1.35/1.22 mm）—— 是打印件板位横偏，不是尺度。于是把 CAD 从「硬约束」改为「先验」（<span class="mono">refine_square_layout_bundle(cad_prior=…)</span>，板心 σ=1 mm、法线 σ=1°，先验同时提供 gauge 故所有帧位姿放开）：<b><span class="mono">|p_rig|</span> = 1.03 / 0.90 mm，两次差 0.48 mm</b>，残差 p95 1.92 → 1.53。σ 取 1.0 与 0.5 结果相同，说明由数据决定。<b>但先验必须配合排除坏相机</b>：不排除 cam_09 时先验版反而退到 1.80 mm（逐相机最大两两 57.6 mm）。<b>剩余</b>：0.9–1.0 mm 仍未拆开（球窝间隙 / 外参在姿态空间的不一致），需一次拆装重测来分离「装配」与「测量」。<br/>
+    版本：2026-08-18 v13.15 · <b>分布式 marker rig 第一轮 A/B 与 CAD 对照</b>：新 rig 是 5 枚 ArUco <span class="mono">DICT_6X6</span>（id 7/12/14/16/17，实测边长 60.6 mm）的低矮五臂支架，生产的 36h11 + cube 面解析角点检不到它，为此新增 <span class="mono">metrology</span> 四件套：<span class="mono">detect_rig_markers</span> / <span class="mono">bootstrap_marker_layout</span>（三角化 + CAD 初值的 square-marker BA，marker 尺寸是输出不是输入）/ <span class="mono">track_marker_rig_in_base</span>（输出与生产 cube tracker 同 schema，pivot 工具原样可用）/ <span class="mono">marker_rig_dispersion_report</span>。ep2/3/4 共 1844 帧全部解算成功：<b>p_rig = [−3.46, 101.91, 8.53] mm，杠杆臂 102.32 mm</b>，拟合 p95 3.02 mm，逐 episode 最大两两 1.71 mm。CAD（Onshape，球心即原点）独立预测同一点，两者差 <b>1.80 mm</b>、杠杆臂差 0.31 mm —— 首次有 marker→TCP 常量的机械侧独立校验。副产物：<b>cam_09 存在 27 mm 固定外参偏置</b>（中位偏差 [−24.6, 9.2, 7.3] mm，100% 样本超 20 mm 门限，自身重投影仅 1.03 px），生产 pose 级平均没有 corner-BA 的重投影门限，需先重标或降权。详见 <a href="box_umi_marker_rig_tcp_20260818.html">分布式 marker rig → TCP 标定与 A/B</a>。<br/>
+    版本：2026-08-17 v13.14 · <b>M2020 触觉贴片换装体检</b>：贴片由 Paxini L5325（239 点）换为 M2020（9 点 3×3），主机侧已按 link stream <span class="mono">tlv 0x0008/0x0009</span> 在源头截断并打标，<span class="mono">thor_gmsl2_9ch_v1_20260817_162847</span> 三条 episode 全部正确（7200 帧 <span class="mono">model=m2020, points=9</span>，60.00 Hz，<span class="mono">mean_fz</span> 已按 9 点归一）。逐 taxel 体检暴露两个待查问题并已登记优先级：<b>P1</b> 中心触点 #5 在 50–73% 帧顶死 <span class="mono">fz=255</span>（<span class="mono">uint8×0.1 N</span>，上限 25.5 N）；<b>P2</b> 四个角点 <span class="mono">live%</span> 仅 0–2%、<span class="mono">maxfz</span> 2–5，有效触点疑似只有十字形 5 个。两者均非本次改动引入，根因未定位；连带待办是 contact-window detector 的 tactile 阈值需从 239 点口径重标。<br/>
     版本：2026-08-17 v13.13 · <b>P0-3 工程收尾</b>：生产 bundle、Thor 配置、sidecar 与 metadata 统一为 <span class="mono">left/right</span>；显式 <span class="mono">cube_name</span> 分派拒绝未知 key；132514 完整重跑 3 条 episode，左右 <span class="mono">state_action</span> 各 1803 行且无 <span class="mono">head</span> 残留。该状态只关闭 multi-cube 工程阻塞，bundle 仍为 <span class="mono">validated=false</span>，repeatability / wrist roll / 独立 GT 仍未完成。<br/>
     版本：2026-08-17 v13.12 · <b>结构整理</b>：HiFi-UMI 外部证据已内化到总体目标与 Phase 0/1/7/8；0805 生产 A/B 移出独立主文档节，只在 Phase 2/3/执行计划保留决策结论和归档链接；代码快照后移；原「优先级 / 建议时间线 / Phase 2 清单 / 下一步」合并为「当前执行计划」。<br/>
 版本：2026-08-17 v13.11 · <b>132514 contact-window detector</b>：新增 <span class="mono">metrology/cli/detect_contact_windows.py</span>，按“高频 force/tactile 先检测、再投影到 60 Hz frame”的口径生成 <span class="mono">contact_windows/</span> 与 <span class="mono">contact_windows_touch_strict/</span>；主口径 union 1825/1834 帧、bimanual 1513 帧，touch-strict union 1476 帧、bimanual 1166 帧。right 全局最大 shift 前 10 帧均为 episode 0 early force-only / active taxel=0，touch-strict 内 right p95 为 1.367 mm，生产替换前重点复核 early force-only 与 tactile 峰值帧。<br/>
