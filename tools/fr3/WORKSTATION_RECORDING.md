@@ -776,6 +776,100 @@ mean the same thing by them:
   then one render per camera). Useful for catching a straggling render; **not** comparable to
   hardware sensor timestamps.
 
+### When the audit fails: which cause it was
+
+The audit's budgets say alignment broke; they cannot say why, because a dataset only holds the
+timestamps of the frames that were *selected*. A frame the sensor never produced, one the host
+dropped on the way in, and one that arrived late are indistinguishable there. Two tools split
+them apart, and each fault shape has a distinct signature — pinned by
+`tests/scripts/test_fr3_camera_delivery.py`, so a shape that reads one way in the test cannot
+read the other way on the rig.
+
+`python tools/fr3/fr3_camera_delivery_probe.py <dataset_root> --camera-fps 60` — offline, from
+the same column the audit reads. Reports two things the audit does not:
+
+- **Frame reuse**: a repeated capture timestamp means the loop wrote the *same image* into two
+  frames because no new one had arrived. Skew cannot see this (a reused frame is perfectly
+  aligned with itself) and it is the more damaging failure — the images stand still while state
+  and action keep moving.
+- **Real delivery rate**, as a histogram in units of the sensor period. `{1x: …}` with a small
+  tail is a host that hiccuped; `{2x: …}` throughout is a sensor that ran at half rate. Plus
+  whether the bad frames arrived in bursts or evenly, which separates a load fault from a
+  standing one.
+
+`python tools/fr3/fr3_camera_delivery_bench.py --duration 60 --poll-hz 60` — live, cameras only,
+no arm and no encoder. It reproduces this page's anchoring in a process doing nothing else, so
+the skew it prints is what the recorder *would* have recorded had it been free. It also reads
+the three things only available live:
+
+| reading | meaning |
+| --- | --- |
+| `frame_counter` gaps | the sensor produced frames this host never received — USB bandwidth, a link that negotiated 2.1, a driver stall. The only measurement that proves a drop; absent on a kernel without the RealSense metadata patches, and the tool says so instead of reporting zero |
+| acquisition spacing wider than nominal, counters contiguous | the *sensor* slowed down. For a colour stream that is nearly always exposure: no sensor emits a frame faster than it exposes one, so an exposure past the frame period caps the rate whatever profile was negotiated. `actual_exposure` is printed next to it — compare it against `1000 / fps` ms |
+| handover lag, with counters contiguous at nominal spacing | the frames arrived and this process was busy — the host-side failure, and the one recording load can cause |
+
+The preamble alone ends most investigations: a `usb_type` of 2.1, `global_time` off (capture
+timestamps then fall back to the handover instant and carry each camera's pipeline delay), or a
+negotiated profile below the requested rate.
+
+Then vary one thing at a time: `--poll-hz 30` against the same scene (delivery must not care how
+often it is polled), `--extra-work-ms 4/8/16` as a dose-response for host load, and a rerun under
+brighter light to test auto-exposure. Recording the same scene at two `dataset.fps` values and
+diffing the two `meta/fr3_sync_report.json` closes the loop on the full pipeline.
+
+### Exposure is a frame-rate control, and it lives on the device
+
+This is what the procedure above caught on 2026-08-19, and it is worth knowing by name because
+nothing in the recording path reports it. Both cameras had been left on **manual** exposure —
+36.5 ms on `ee`, 42.3 ms on `side` — by some earlier program, most likely RealSense Viewer.
+RealSense controls are device state, not process state: they outlive whatever set them, and the
+next `pipeline.start` inherits them.
+
+Neither exposure fits in a 16.7 ms frame period, so the sensors emitted at 15.0 and 23.6 fps.
+Every other indicator stayed green — profiles negotiated 640x480@60, USB 3.2, `global_time` on,
+frame counters contiguous with zero drops — because nothing had failed. The images simply went
+stale (max 95.8 ms behind the arm read, against a `camera_max_age_ms` of 100), 65-75% of the
+recorded frames were duplicates of their predecessor, and the SYNC audit failed on cross-camera
+skew, which is four steps downstream of the cause.
+
+Two things now stand between that and a dataset:
+
+- `exposure_us` and `gain` in the camera config. Set, they pin a rate that cannot drift with the
+  light; **unset, they hand the sensor back to auto exposure at connect** — which is the part
+  that matters, because "leave it alone" is what let stale device state through. `connect`
+  refuses outright if the exposure cannot fit the frame period.
+- `fr3_camera_delivery_bench.py` prints `actual_exposure` beside the delivered rate, so the next
+  occurrence is one command away rather than two days of recordings.
+
+Fixed exposure is not free: brightness no longer tracks the room, so `gain` has to be
+re-measured when the lighting changes. What it buys beyond the rate is constant motion blur and
+constant image statistics across a take, which auto exposure does not give.
+
+### A camera that opens but never delivers
+
+```
+TimeoutError: Timed out waiting for frame from camera RealSenseCamera(315122271876) after
+1000 ms. Read thread alive: True.
+```
+
+This is not a configuration problem and not a busy device — the pipeline started, the read
+thread is running, and no frame is coming. A D400 can reach that state after a session dies
+mid-stream, and nothing in software clears it: observed on the `ee` D405 with a bare colour
+stream, no controls touched, going 10 s without a frame while the `side` D435i on the same bus
+opened in 383 ms. Only re-enumeration fixes it.
+
+`connect` now does that itself: it resets the device with `hardware_reset`, waits for it to
+come back (~2 s), settles, and retries the connection **once**. Measured end to end at 6.8 s,
+against a failed session. Once, not in a loop — a camera still dead after a reset is telling you
+something, and retrying forever would bury it.
+
+Two cases deliberately skip the reset, because it cannot help and would cost 30 s of confusion:
+a device that is not enumerated at all (log says replug it) and a `ValueError` from the exposure
+guard, which is a number in this YAML rather than a sick camera.
+
+If it still fails after the automatic reset, replug the camera. `tools/fr3/fr3_realsense_preview.py`
+is the quickest way to confirm it is back before starting a session.
+
 ### Which frame each camera contributes
 
 Every camera is anchored on the **oldest** of the cameras' latest frames and asked for its frame

@@ -33,6 +33,7 @@ from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnected
 rs = pytest.importorskip("pyrealsense2")
 
 from lerobot.cameras.realsense import RealSenseCamera, RealSenseCameraConfig
+from lerobot.cameras.realsense.camera_realsense import _color_stream_sensor, _exposure_step_us
 
 TEST_ARTIFACTS_DIR = Path(__file__).parent.parent / "artifacts" / "cameras"
 BAG_FILE_PATH = TEST_ARTIFACTS_DIR / "test_rs.bag"
@@ -309,3 +310,243 @@ def test_capture_time_warns_once_per_camera(caplog):
             )
 
     assert caplog.text.count("no fixed relation to the host clock") == 1
+
+
+class _FakeRange:
+    def __init__(self, maximum: float):
+        self.min = 1.0
+        self.max = maximum
+        self.step = 1.0
+
+
+class _FakeSensor:
+    """A sensor that only knows how to hold option values, which is all the controls path uses."""
+
+    def __init__(self, *, exposure_range_max: float, unsupported: tuple = (), publishes_color=True):
+        self.exposure_range_max = exposure_range_max
+        self.unsupported = unsupported
+        self.publishes_color = publishes_color
+        self.values: dict = {}
+        self.writes: list = []
+
+    def supports(self, option):
+        return option not in self.unsupported
+
+    def get_option_range(self, _option):
+        return _FakeRange(self.exposure_range_max)
+
+    def get_option(self, option):
+        return self.values.get(option, 0.0)
+
+    def set_option(self, option, value):
+        self.values[option] = value
+        self.writes.append((option, value))
+
+    def get_stream_profiles(self):
+        return [types.SimpleNamespace(stream_type=lambda: rs.stream.color)] if self.publishes_color else []
+
+
+class _FakeDevice:
+    """`has_color_sensor=False` is a D405: colour comes out of the stereo module."""
+
+    def __init__(self, sensor, *, has_color_sensor=True):
+        self.sensor = sensor
+        self.has_color_sensor = has_color_sensor
+
+    def first_color_sensor(self):
+        if not self.has_color_sensor:
+            raise RuntimeError("Could not find requested sensor type!")
+        return self.sensor
+
+    def query_sensors(self):
+        return [_FakeSensor(exposure_range_max=1.0, publishes_color=False), self.sensor]
+
+
+def _camera_with_sensor(sensor, *, fps=60, has_color_sensor=True, **config_kwargs):
+    camera = RealSenseCamera(RealSenseCameraConfig(serial_number_or_name="042", **config_kwargs))
+    camera.fps = fps
+    device = _FakeDevice(sensor, has_color_sensor=has_color_sensor)
+    camera.rs_pipeline = object()
+    camera.rs_profile = types.SimpleNamespace(get_device=lambda: device)
+    return camera
+
+
+def test_the_colour_sensor_is_found_on_a_device_that_has_none():
+    """A D405 raises from first_color_sensor(); its exposure still has to be reachable."""
+    sensor = _FakeSensor(exposure_range_max=165000)
+
+    assert _color_stream_sensor(_FakeDevice(sensor, has_color_sensor=False)) is sensor
+
+
+@pytest.mark.parametrize(
+    ("range_max", "expected_step_us"),
+    [(165000, 1.0), (10000, 100.0)],
+    ids=["stereo-module-microseconds", "uvc-rgb-hundred-microseconds"],
+)
+def test_the_exposure_unit_is_read_off_the_option_range(range_max, expected_step_us):
+    """librealsense never reports the unit, and the two D400 modules disagree about it."""
+    assert _exposure_step_us(_FakeSensor(exposure_range_max=range_max)) == expected_step_us
+
+
+@pytest.mark.parametrize(
+    ("range_max", "expected_raw"),
+    [(165000, 15000.0), (10000, 150.0)],
+    ids=["stereo-module", "uvc-rgb"],
+)
+def test_a_fixed_exposure_is_written_in_the_sensors_own_units(range_max, expected_raw):
+    """15 ms means 15 ms on both modules, or one of the two cameras is silently wrong."""
+    sensor = _FakeSensor(exposure_range_max=range_max)
+    camera = _camera_with_sensor(sensor, exposure_us=15000, gain=70)
+
+    camera._apply_sensor_controls()
+
+    assert sensor.values[rs.option.enable_auto_exposure] == 0.0
+    assert sensor.values[rs.option.exposure] == expected_raw
+    assert sensor.values[rs.option.gain] == 70.0
+
+
+def test_an_unset_exposure_hands_the_sensor_back_to_auto_exposure():
+    """The regression this exists for: controls persist on the device between processes.
+
+    Two days of takes were recorded at 15.0 and 23.6 fps because a manual 36.5/42.3 ms exposure
+    left behind by another program was inherited at connect. Leaving the config blank has to
+    mean "auto", not "whatever is already there".
+    """
+    sensor = _FakeSensor(exposure_range_max=165000)
+    sensor.values[rs.option.enable_auto_exposure] = 0.0
+    sensor.values[rs.option.exposure] = 36481.0
+    camera = _camera_with_sensor(sensor)
+
+    camera._apply_sensor_controls()
+
+    assert sensor.values[rs.option.enable_auto_exposure] == 1.0
+
+
+def test_an_exposure_that_cannot_fit_the_frame_period_is_refused():
+    """The sensor would negotiate 60 fps and then deliver 27, with nothing reporting it."""
+    sensor = _FakeSensor(exposure_range_max=165000)
+    camera = _camera_with_sensor(sensor, fps=60, exposure_us=36481)
+
+    with pytest.raises(ValueError, match="27.4 fps"):
+        camera._apply_sensor_controls()
+
+    assert rs.option.exposure not in sensor.values
+
+
+def test_a_clamped_exposure_is_reported_rather_than_assumed(caplog):
+    sensor = _FakeSensor(exposure_range_max=165000)
+    camera = _camera_with_sensor(sensor, exposure_us=15000)
+    # The sensor accepts the write but holds a different value, as a clamped range does.
+    sensor.set_option = lambda option, value: sensor.values.__setitem__(option, 8000.0)
+
+    with caplog.at_level(logging.WARNING):
+        camera._apply_sensor_controls()
+
+    assert "the sensor holds 8000 us" in caplog.text
+
+
+def test_an_unsupported_control_is_logged_and_skipped(caplog):
+    """Models differ; a missing gain control must not abort a connect."""
+    sensor = _FakeSensor(exposure_range_max=165000, unsupported=(rs.option.gain,))
+    camera = _camera_with_sensor(sensor, exposure_us=15000, gain=70)
+
+    with caplog.at_level(logging.WARNING):
+        camera._apply_sensor_controls()
+
+    assert sensor.values[rs.option.exposure] == 15000.0
+    assert "gain is not supported" in caplog.text
+
+
+def test_gain_without_exposure_is_rejected_at_config_time():
+    """Auto exposure drives gain itself, so the pair would not do what it says."""
+    with pytest.raises(ValueError, match="`gain` requires `exposure_us`"):
+        RealSenseCameraConfig(serial_number_or_name="042", gain=70)
+
+
+class _RecordingCamera:
+    """A camera whose open either fails or succeeds on cue, to drive `connect`'s retry."""
+
+    def __init__(self, outcomes, device=None):
+        self.outcomes = list(outcomes)
+        self.attempts = 0
+        self.device = device
+        self.torn_down = 0
+
+    def open(self):
+        self.attempts += 1
+        outcome = self.outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+
+
+def _camera_with_open_outcomes(outcomes, *, device_present=True, reset_raises=False):
+    camera = RealSenseCamera(RealSenseCameraConfig(serial_number_or_name="042"))
+    recorder = _RecordingCamera(outcomes)
+
+    def hardware_reset():
+        if reset_raises:
+            raise RuntimeError("device busy")
+        recorder.reset_calls = getattr(recorder, "reset_calls", 0) + 1
+
+    device = types.SimpleNamespace(hardware_reset=hardware_reset)
+    camera._open_and_warm_up = recorder.open
+    camera._find_device = lambda: (device if device_present else None)
+    camera._tear_down_pipeline = lambda: setattr(recorder, "torn_down", recorder.torn_down + 1)
+    return camera, recorder
+
+
+def test_a_camera_that_delivers_no_frames_is_reset_and_retried(caplog, monkeypatch):
+    """Observed on a D405: pipeline starts, read thread runs, no frame ever arrives."""
+    monkeypatch.setattr("lerobot.cameras.realsense.camera_realsense._DEVICE_RESET_SETTLE_S", 0.0)
+    camera, recorder = _camera_with_open_outcomes([TimeoutError("no frame in 1000 ms"), None])
+
+    with caplog.at_level(logging.WARNING):
+        camera.connect()
+
+    assert recorder.attempts == 2
+    assert recorder.reset_calls == 1
+    assert "Resetting the device" in caplog.text
+
+
+def test_the_retry_happens_only_once():
+    """A camera that is still dead after a reset is dead; looping on it hides that."""
+    camera, recorder = _camera_with_open_outcomes(
+        [TimeoutError("first"), TimeoutError("second")],
+    )
+
+    with pytest.raises(TimeoutError, match="second"):
+        camera.connect()
+
+    assert recorder.attempts == 2
+
+
+def test_an_unplugged_camera_is_not_reset(caplog):
+    """`hardware_reset` needs a device; saying "replug it" beats a confusing second failure."""
+    camera, recorder = _camera_with_open_outcomes([TimeoutError("no frame")], device_present=False)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(TimeoutError):
+        camera.connect()
+
+    assert recorder.attempts == 1
+    assert "needs a physical replug" in caplog.text
+
+
+def test_a_device_that_refuses_the_reset_is_reported_not_retried(caplog):
+    camera, recorder = _camera_with_open_outcomes([TimeoutError("no frame")], reset_raises=True)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(TimeoutError):
+        camera.connect()
+
+    assert recorder.attempts == 1
+    assert "needs a physical replug" in caplog.text
+
+
+def test_a_misconfigured_exposure_is_not_treated_as_a_wedged_camera():
+    """Resetting the hardware cannot fix a number in the YAML, and would hide it for 30 s."""
+    camera, recorder = _camera_with_open_outcomes([ValueError("exposure_us=36481 does not fit")])
+
+    with pytest.raises(ValueError, match="does not fit"):
+        camera.connect()
+
+    assert recorder.attempts == 1
+    assert not hasattr(recorder, "reset_calls")

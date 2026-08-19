@@ -46,18 +46,47 @@ robot:
     # Sensor rate, deliberately above dataset.fps: an image is only as fresh as the sensor's
     # frame period allows, so 60 Hz halves how stale a recorded frame is (measured 42-45 ms
     # behind the arm read at 30 Hz). The dataset is still written at dataset.fps.
+    #
+    # exposure_us/gain are pinned because `fps` alone does not buy the rate. A sensor cannot
+    # emit a frame faster than it exposes one, so exposure is a frame-rate control whether or
+    # not it is treated as one, and these controls live on the *device*: on 2026-08-19 both
+    # cameras had been left on manual exposure (36.5 ms on ee, 42.3 ms on side, each longer
+    # than the 16.7 ms period), and every recording inherited it. The profiles still negotiated
+    # 640x480@60 and the frame counters showed no drops -- the sensors simply ran at 15.0 and
+    # 23.6 fps, which reached the dataset as 75%/65% duplicated images and a failed SYNC audit.
+    #
+    # 15 ms sits just under the 16.7 ms period, so 60 fps holds no matter how dark the room
+    # gets. The gains restore the brightness auto exposure had chosen for the workstation scene
+    # (mean intensity 93 on ee, 109 on side): measured at 15 ms, ee reads 73 at gain 49 and 105
+    # at gain 82, side reads 96 at gain 110 and 105 at gain 128. A fixed exposure also keeps
+    # motion blur and image statistics constant across a take, which auto exposure does not.
+    #
+    # Verified through the recorder's own config path: ee holds 60.0 fps at mean 113 (1.9% of
+    # pixels clipped, 2.5 LSB of temporal noise), side 59.7 fps at mean 121 (0.5% clipped,
+    # 3.0 LSB).
+    #
+    # side is at its gain ceiling (128), so it has no headroom left for a darker room: add
+    # light rather than lengthen the exposure here, since anything past 16.7 ms puts the rate
+    # back where it started (`connect` now refuses that instead of under-delivering quietly).
+    # Re-measure with tools/fr3/fr3_camera_delivery_bench.py when the lighting changes -- a
+    # pinned exposure buys a constant rate, and constant motion blur, by giving up the
+    # brightness tracking auto exposure did for free.
     ee:
       type: intelrealsense
       serial_number_or_name: "315122271876"
       width: 640
       height: 480
       fps: 60
+      exposure_us: 15000
+      gain: 70
     side:
       type: intelrealsense
       serial_number_or_name: "243122071795"
       width: 640
       height: 480
       fps: 60
+      exposure_us: 15000
+      gain: 128
 
 teleop:
   type: spacemouse

@@ -45,12 +45,24 @@ class RealSenseCameraConfig(CameraConfig):
         use_depth: Whether to enable depth stream. Defaults to False.
         rotation: Image rotation setting (0°, 90°, 180°, or 270°). Defaults to no rotation.
         warmup_s: Time reading frames before returning from connect (in seconds)
+        exposure_us: Fixed exposure in microseconds, or None to hand the sensor back to auto
+            exposure. A sensor cannot emit a frame faster than it exposes one, so this is also
+            a frame-rate control: pinning it below the frame period is what guarantees `fps`
+            regardless of how dark the scene gets, and setting it above the frame period makes
+            the requested `fps` unreachable (`connect` refuses rather than under-deliver).
+        gain: Sensor gain to pair with a fixed exposure. Only meaningful together with
+            `exposure_us`, because auto exposure drives gain itself. A shorter exposure needs a
+            higher gain for the same brightness, and pays for it in noise.
 
     Note:
         - Either name or serial_number must be specified.
         - Depth stream configuration (if enabled) will use the same FPS as the color stream.
         - The actual resolution and FPS may be adjusted by the camera to the nearest supported mode.
         - For `fps`, `width` and `height`, either all of them need to be set, or none of them.
+        - Exposure and gain live on the device, not in this process. Leaving `exposure_us` unset
+          does not mean "keep whatever is there"; it means auto exposure is switched back on at
+          connect, so a control left behind by RealSense Viewer cannot follow you into a
+          recording.
     """
 
     serial_number_or_name: str
@@ -58,6 +70,8 @@ class RealSenseCameraConfig(CameraConfig):
     use_depth: bool = False
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
+    exposure_us: int | None = None
+    gain: int | None = None
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
@@ -67,4 +81,13 @@ class RealSenseCameraConfig(CameraConfig):
         if any(v is not None for v in values) and any(v is None for v in values):
             raise ValueError(
                 "For `fps`, `width` and `height`, either all of them need to be set, or none of them."
+            )
+
+        if self.exposure_us is not None and self.exposure_us <= 0:
+            raise ValueError(f"`exposure_us` must be > 0 when provided, but {self.exposure_us} is provided.")
+
+        if self.gain is not None and self.exposure_us is None:
+            raise ValueError(
+                "`gain` requires `exposure_us`: auto exposure drives gain itself, so a gain set "
+                "alongside it would be overwritten by the sensor."
             )

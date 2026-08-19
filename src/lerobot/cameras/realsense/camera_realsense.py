@@ -41,6 +41,49 @@ from .configuration_realsense import RealSenseCameraConfig
 
 logger = logging.getLogger(__name__)
 
+# Above this the `rs.option.exposure` range cannot be counting in 100 us steps, because the
+# implied ceiling (1 s) is already past anything a D400 exposes. See `_exposure_step_us`.
+_UVC_EXPOSURE_RANGE_MAX = 10000
+
+# How long a reset device gets to come back on the bus, and how long after that before it is
+# opened. Measured on a D405: re-enumerated in ~2 s, and opening it immediately on reappearance
+# is what wedges it again. See `_recover_wedged_device`.
+_DEVICE_RESET_TIMEOUT_S = 30.0
+_DEVICE_RESET_SETTLE_S = 2.0
+
+
+def _color_stream_sensor(device: Any) -> Any:
+    """The sensor that owns the colour stream, including on models that have no colour sensor.
+
+    `device.first_color_sensor()` raises "Could not find requested sensor type!" on a D405,
+    whose colour images come out of the "Stereo Module" -- there is no separate "RGB Camera" to
+    find, only a sensor that happens to publish colour profiles. Searching the profiles instead
+    of asking for a sensor type keeps exposure control and the settings readback working across
+    the whole D400 range, rather than silently skipping the models that need them most.
+    """
+    try:
+        return device.first_color_sensor()
+    except RuntimeError:
+        pass
+
+    for sensor in device.query_sensors():
+        for profile in sensor.get_stream_profiles():
+            if profile.stream_type() == rs.stream.color:
+                return sensor
+    raise RuntimeError("no sensor on this device publishes a colour stream profile")
+
+
+def _exposure_step_us(sensor: Any) -> float:
+    """How many microseconds one step of `rs.option.exposure` is worth on this sensor.
+
+    librealsense reports the range but never the unit, and the two D400 modules disagree: the
+    UVC RGB module counts in 100 us steps (measured range 1..10000 on a D435i, so a 1 s
+    ceiling), the stereo module counts in microseconds (measured 1..165000 on a D405, so a
+    165 ms ceiling). The maximum separates them without a model table, and does so safely: a
+    sensor whose ceiling really were 10000 us could not expose past 10 ms, which no D400 is.
+    """
+    return 100.0 if sensor.get_option_range(rs.option.exposure).max <= _UVC_EXPOSURE_RANGE_MAX else 1.0
+
 
 class RealSenseCamera(Camera):
     """
@@ -170,13 +213,31 @@ class RealSenseCamera(Camera):
             warmup (bool): If True, waits at connect() time until at least one valid frame
                            has been captured by the background thread. Defaults to True.
 
+        A camera that opens but never delivers is reset once and retried, rather than taken as
+        a dead camera: see `_recover_wedged_device`.
+
         Raises:
             DeviceAlreadyConnectedError: If the camera is already connected.
             ValueError: If the configuration is invalid (e.g., missing serial/name, name not unique).
             ConnectionError: If the camera is found but fails to start the pipeline or no RealSense devices are detected at all.
             RuntimeError: If the pipeline starts but fails to apply requested settings.
         """
+        try:
+            self._open_and_warm_up()
+        except (ConnectionError, TimeoutError) as first_attempt:
+            if not self._recover_wedged_device(first_attempt):
+                raise
+            self._open_and_warm_up()
 
+        logger.info(f"{self} connected.")
+
+    def _open_and_warm_up(self) -> None:
+        """One attempt at a live stream: start the pipeline, apply controls, wait for frames.
+
+        Leaves nothing running behind it. A half-open pipeline holds the USB device against
+        every later attempt, including the retry that is supposed to rescue this one, so a
+        failure anywhere past `start` tears the pipeline back down on the way out.
+        """
         self.rs_pipeline = rs.pipeline()
         rs_config = rs.config()
         self._configure_rs_pipeline_config(rs_config)
@@ -190,21 +251,90 @@ class RealSenseCamera(Camera):
                 f"Failed to open {self}.Run `lerobot-find-cameras realsense` to find available cameras."
             ) from e
 
-        self._configure_capture_settings()
-        self._start_read_thread()
+        try:
+            self._configure_capture_settings()
+            # After `_configure_capture_settings`, which is what fills in `self.fps` when the
+            # config left it unset -- the exposure check inside is against the negotiated frame
+            # period.
+            self._apply_sensor_controls()
+            self._start_read_thread()
 
-        # NOTE(Steven/Caroline): Enforcing at least one second of warmup as RS cameras need a bit of time before the first read. If we don't wait, the first read from the warmup will raise.
-        self.warmup_s = max(self.warmup_s, 1)
+            # NOTE(Steven/Caroline): Enforcing at least one second of warmup as RS cameras need a bit of time before the first read. If we don't wait, the first read from the warmup will raise.
+            self.warmup_s = max(self.warmup_s, 1)
 
-        start_time = time.time()
-        while time.time() - start_time < self.warmup_s:
-            self.async_read(timeout_ms=self.warmup_s * 1000)
-            time.sleep(0.1)
-        with self.frame_lock:
-            if self.latest_color_frame is None or self.use_depth and self.latest_depth_frame is None:
-                raise ConnectionError(f"{self} failed to capture frames during warmup.")
+            start_time = time.time()
+            while time.time() - start_time < self.warmup_s:
+                self.async_read(timeout_ms=self.warmup_s * 1000)
+                time.sleep(0.1)
+            with self.frame_lock:
+                if self.latest_color_frame is None or self.use_depth and self.latest_depth_frame is None:
+                    raise ConnectionError(f"{self} failed to capture frames during warmup.")
+        except BaseException:
+            self._tear_down_pipeline()
+            raise
 
-        logger.info(f"{self} connected.")
+    def _tear_down_pipeline(self) -> None:
+        """Return to the disconnected state, best effort. Used on the failure paths."""
+        self._stop_read_thread()
+        if self.rs_pipeline is not None:
+            try:
+                self.rs_pipeline.stop()
+            except RuntimeError as error:
+                logger.debug(f"{self}: pipeline stop during teardown failed ({error}).")
+        self.rs_pipeline = None
+        self.rs_profile = None
+
+    def _recover_wedged_device(self, cause: BaseException) -> bool:
+        """Software-reset the camera and wait for it to come back on the bus.
+
+        A D400 can reach a state where the pipeline starts, the read thread runs and no frame
+        ever arrives -- observed on a D405 after a session was killed mid-stream, where a bare
+        colour stream with no controls touched went 10 s without a frame while its neighbour on
+        the same bus was fine. Nothing in software clears that; the device has to re-enumerate.
+
+        `hardware_reset` is the non-privileged way to do it (measured: back on the bus in ~2 s,
+        streaming again 437 ms after the next open), so a wedged camera costs a few seconds
+        instead of a failed session and a manual replug.
+
+        Returns:
+            True if the device reset and re-enumerated, so a retry is worth making.
+        """
+        logger.warning(f"{self} opened but delivered no frames ({cause}). Resetting the device.")
+        self._tear_down_pipeline()
+
+        device = self._find_device()
+        if device is None:
+            logger.error(f"{self} is not enumerated; it needs a physical replug.")
+            return False
+
+        try:
+            device.hardware_reset()
+        except RuntimeError as error:
+            logger.error(f"{self} could not be reset ({error}); it needs a physical replug.")
+            return False
+
+        deadline = time.time() + _DEVICE_RESET_TIMEOUT_S
+        while time.time() < deadline:
+            time.sleep(1.0)
+            if self._find_device() is not None:
+                # Enumerated is not the same as ready: the firmware comes back before the
+                # streaming interfaces do, and opening into that gap wedges it again.
+                time.sleep(_DEVICE_RESET_SETTLE_S)
+                logger.warning(f"{self} reset and re-enumerated; retrying the connection.")
+                return True
+
+        logger.error(f"{self} did not re-enumerate within {_DEVICE_RESET_TIMEOUT_S:.0f} s.")
+        return False
+
+    def _find_device(self) -> Any:
+        """This camera's device as the driver currently sees it, or None if it is not there."""
+        for device in rs.context().query_devices():
+            try:
+                if str(device.get_info(rs.camera_info.serial_number)) == self.serial_number:
+                    return device
+            except RuntimeError:
+                continue
+        return None
 
     @staticmethod
     def find_cameras() -> list[dict[str, Any]]:
@@ -324,6 +454,80 @@ class RealSenseCamera(Camera):
                 self.width, self.height = actual_width, actual_height
                 self.capture_width, self.capture_height = actual_width, actual_height
 
+    def _set_sensor_option(self, sensor: Any, option: Any, value: float, label: str) -> bool:
+        """Write one control, treating "this model does not have it" as information, not failure."""
+        if not sensor.supports(option):
+            logger.warning(f"{self}: {label} is not supported by this sensor; leaving it alone.")
+            return False
+        try:
+            sensor.set_option(option, value)
+        except RuntimeError as error:
+            logger.warning(f"{self}: could not set {label} to {value:g} ({error}).")
+            return False
+        return True
+
+    @check_if_not_connected
+    def _apply_sensor_controls(self) -> None:
+        """Put exposure and gain into a known state instead of inheriting the device's.
+
+        RealSense controls live on the device, not in the process: whatever the last program to
+        touch this camera left behind -- RealSense Viewer, a preview window, an earlier
+        recording -- is what the next `pipeline.start` inherits. That is how a workstation spent
+        two days recording 640x480@60 profiles that delivered 15.0 and 23.6 fps: both cameras
+        had been left on manual exposure at 36.5 ms and 42.3 ms, each longer than the 16.7 ms
+        frame period, so neither sensor could physically produce the rate that had been asked
+        for and negotiated. Nothing failed; the images just went stale and the recorded frames
+        became 65-75% duplicates.
+
+        Hence an unset `exposure_us` means "hand it back to auto exposure", not "leave it
+        alone" -- the inherited state is exactly what must not survive a connect.
+
+        Raises:
+            ValueError: If a fixed exposure cannot fit inside the negotiated frame period. That
+                combination has no valid outcome: the sensor would silently deliver a slower
+                stream than the one it just agreed to.
+        """
+        if self.rs_profile is None:
+            raise RuntimeError(f"{self}: rs_profile must be initialized before setting controls.")
+
+        try:
+            sensor = _color_stream_sensor(self.rs_profile.get_device())
+        except RuntimeError as error:
+            logger.warning(f"{self}: cannot reach the colour sensor to set exposure ({error}).")
+            return
+
+        if self.config.exposure_us is None:
+            self._set_sensor_option(sensor, rs.option.enable_auto_exposure, 1.0, "auto exposure")
+            return
+
+        frame_period_us = 1e6 / self.fps if self.fps else None
+        if frame_period_us is not None and self.config.exposure_us >= frame_period_us:
+            raise ValueError(
+                f"{self}: exposure_us={self.config.exposure_us} does not fit in the "
+                f"{frame_period_us:.0f} us frame period of a {self.fps} fps stream. The sensor "
+                f"would emit at most {1e6 / self.config.exposure_us:.1f} fps. Shorten the "
+                f"exposure (and raise `gain` to keep the brightness) or lower `fps`."
+            )
+
+        step_us = _exposure_step_us(sensor)
+        self._set_sensor_option(sensor, rs.option.enable_auto_exposure, 0.0, "auto exposure")
+        applied = self._set_sensor_option(
+            sensor, rs.option.exposure, self.config.exposure_us / step_us, "exposure"
+        )
+        if self.config.gain is not None:
+            self._set_sensor_option(sensor, rs.option.gain, float(self.config.gain), "gain")
+
+        if applied:
+            # Read back rather than trust the write: the range is clamped silently, and a
+            # clamped exposure is the one failure mode this whole method exists to prevent.
+            readback_us = float(sensor.get_option(rs.option.exposure)) * step_us
+            if abs(readback_us - self.config.exposure_us) > step_us:
+                logger.warning(
+                    f"{self}: asked for {self.config.exposure_us} us of exposure, the sensor "
+                    f"holds {readback_us:.0f} us."
+                )
+            logger.info(f"{self}: exposure fixed at {readback_us / 1000:.1f} ms, gain {self.config.gain}.")
+
     @check_if_not_connected
     def get_session_settings(self) -> dict[str, Any]:
         """Return the active colour-stream and sensor controls as JSON-safe values.
@@ -338,7 +542,9 @@ class RealSenseCamera(Camera):
             raise RuntimeError(f"{self}: rs_profile must be initialized before reading session settings.")
 
         device = self.rs_profile.get_device()
-        color_sensor = device.first_color_sensor()
+        # Not `device.first_color_sensor()`: that raises on a D405 and took the readback down
+        # with it, so the one camera whose controls were wrong reported nothing at all.
+        color_sensor = _color_stream_sensor(device)
 
         def device_info(name: str) -> str | None:
             info = getattr(rs.camera_info, name, None)
