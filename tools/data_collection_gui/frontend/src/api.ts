@@ -20,6 +20,7 @@ import type {
   ReplayStatus,
   ReplayTimeline,
   RigCheckResponse,
+  WorldFrameResponse,
   MujocoCubeMode,
   RealCubeMode,
   RealEndEffectorMode,
@@ -830,6 +831,61 @@ export class DataCollectionGuiApi {
       return { ...payload, ok: response.ok && payload.ok !== false };
     } catch (error) {
       return { ok: false, error: String(error), report: null };
+    }
+  }
+
+  async fetchWorldFrame(): Promise<WorldFrameResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/world-frame`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as WorldFrameResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  // `apply` commits: moved cameras are re-placed in the same world, or a new
+  // world island is minted. Without it this is a read-only verdict, which is
+  // why it is safe to run at any time.
+  async registerWorldFrame(
+    options: { apply?: boolean; stable?: string[]; useRigCheck?: boolean } = {}
+  ): Promise<WorldFrameResponse> {
+    const params = new URLSearchParams();
+    if (options.apply) params.set("apply", "1");
+    if (options.stable?.length) params.set("stable", options.stable.join(","));
+    // Opt out of the self-check's verdict and let the geometry decide alone.
+    if (options.useRigCheck === false) params.set("rigcheck", "0");
+    const query = params.toString();
+    return this.worldFramePost(`/api/calibration/world-frame/register${query ? `?${query}` : ""}`);
+  }
+
+  async freezeWorldFrame(replace = false): Promise<WorldFrameResponse> {
+    return this.worldFramePost(
+      `/api/calibration/world-frame/freeze${replace ? "?replace=1" : ""}`
+    );
+  }
+
+  private async worldFramePost(path: string): Promise<WorldFrameResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      const payload = (await response.json()) as WorldFrameResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return {
+        ok: false,
+        error: String(error),
+        reference: { exists: false },
+        registration: null,
+        stableSource: { origin: "geometry" },
+        graph: { worlds: 0, edges: 0, nodes: [] }
+      };
     }
   }
 

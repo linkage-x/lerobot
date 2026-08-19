@@ -2481,6 +2481,300 @@ def _last_rig_check(state: GatewayState) -> dict[str, Any]:
     return {"ok": True, "report": report, "baseline": _rig_check_baseline_meta(state)}
 
 
+# --- Canonical world frame (roadmap Phase 2.4) -------------------------------
+#
+# A bundle adjustment fixes its gauge on whichever camera it likes, so exporting
+# its poses straight out redefines the world on every re-solve: yesterday's
+# absolute trajectories keep their numbers and quietly lose their meaning. The
+# frozen world_reference.json is what makes `world_frame_id` mean something, and
+# stable-camera consensus is what carries it across a recalibration.
+#
+# Everything here shells out to metrology.cli.world_registration for the same
+# reason the rig self-check does: the gateway carries no numerical stack.
+
+# Tracked in git, deliberately not under outputs/. The frozen reference cannot
+# be regenerated -- re-freezing mints a new world_frame_id for the same physical
+# frame and orphans the ID stamped into every episode recorded so far -- and
+# outputs/ is 7 GB of regenerable artefacts that gets deleted to reclaim space.
+_WORLD_SUBDIR = Path("tools") / "thor" / "gmsl2" / "world"
+_WORLD_REFERENCE_FILE = "world_reference.json"
+_WORLD_GRAPH_FILE = "world_graph.json"
+_WORLD_REGISTRATION_FILE = "world_registration.json"
+# Which evidence chose the stable cameras. Written by the gateway rather than by
+# the CLI, because it is the gateway that knows the rig self-check exists.
+_WORLD_STABLE_SOURCE_FILE = "world_stable_source.json"
+
+
+def _world_root(state: GatewayState) -> Path:
+    return state.repo_root / _WORLD_SUBDIR
+
+
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _latest_bundle_report(state: GatewayState) -> Path | None:
+    """The newest self-calibration bundle -- the current session's camera graph.
+
+    Preferring the run this gateway just solved over a directory scan matters
+    when several calibrations sit side by side: registering the wrong one would
+    report a healthy world for a rig nobody is using.
+    """
+    if state.calibration.outputPath:
+        candidate = Path(state.calibration.outputPath) / "extrinsics_report.json"
+        if candidate.is_file():
+            return candidate
+    root = state.repo_root / "outputs" / "metrology"
+    if not root.is_dir():
+        return None
+    reports = sorted(root.glob("*/extrinsics_report.json"), key=lambda p: p.stat().st_mtime)
+    return reports[-1] if reports else None
+
+
+def _rig_check_stable_cameras(state: GatewayState, reference_created_utc: str) -> dict[str, Any]:
+    """Which cameras the image-based self-check says did not move, if usable.
+
+    The two checks are not equally sensitive and it is worth being explicit
+    about which is which. The self-check compares each camera's *view* against
+    a baseline and resolves about 2 px -- roughly 1.7 mm at 1 m. The geometric
+    consensus below compares camera-to-camera geometry between two independent
+    solves, which on this rig disagree by up to 6.4 mm with nothing touched, so
+    its floor is around a centimetre.
+
+    So the self-check is the better detector of "was this camera bumped", and
+    handing its verdict over as the declared stable set puts the sensitive
+    measurement in charge of the decision. The geometric per-camera residual
+    then becomes an independent check on that decision rather than a restatement
+    of it -- the same reason the exporter leaves orientation out of its fit.
+
+    Refused rather than used when it cannot carry that weight: too few cleared
+    cameras to define a frame, a verdict that already says it could not tell, or
+    a result older than the world it would be judging movement against.
+    """
+    meta: dict[str, Any] = {"origin": "geometry", "cameras": [], "moved": []}
+    report = _read_json_file(_rig_check_root(state) / "last_result.json")
+    if not report:
+        meta["reason"] = "没有相机自检结果"
+        return meta
+
+    cameras = report.get("cameras") or {}
+    ok = sorted(name for name, entry in cameras.items() if (entry or {}).get("verdict") == "ok")
+    moved = sorted(name for name, entry in cameras.items() if (entry or {}).get("verdict") == "moved")
+    generated = str(report.get("generated_utc", ""))
+    meta.update({"generatedUtc": generated, "rigCheckOverall": report.get("overall", "")})
+
+    if str(report.get("overall", "")) == "inconclusive":
+        meta["reason"] = "相机自检判定为「无法判定」，不能当作未移动的证据"
+        return meta
+    if len(ok) < 3:
+        meta["reason"] = f"相机自检只有 {len(ok)} 台判为未移动，不足以定义世界系"
+        return meta
+    # Lexicographic works on the "%Y-%m-%dT%H:%M:%SZ" both sides write. An
+    # unparseable or missing stamp means the ordering cannot be established,
+    # which is a reason not to trust it rather than a reason to assume it.
+    if not generated or not reference_created_utc or generated <= reference_created_utc:
+        meta["reason"] = "相机自检结果不晚于世界系冻结时间，描述的不是冻结之后的状态"
+        return meta
+
+    meta.update({"origin": "rig_check", "cameras": ok, "moved": moved})
+    return meta
+
+
+def _world_frame_payload(state: GatewayState) -> dict[str, Any]:
+    """Everything the calibration page needs to describe the world's state."""
+    root = _world_root(state)
+    reference = _read_json_file(root / _WORLD_REFERENCE_FILE)
+    registration = _read_json_file(root / _WORLD_REGISTRATION_FILE)
+    graph = _read_json_file(root / _WORLD_GRAPH_FILE) or {}
+
+    reference_summary: dict[str, Any] | None = None
+    if reference:
+        reference_summary = {
+            "exists": True,
+            "world_frame_id": reference.get("world_frame_id", ""),
+            "created_utc": reference.get("created_utc", ""),
+            "calibration_id": reference.get("calibration_id", ""),
+            "definition": reference.get("definition", ""),
+            "cameras": sorted((reference.get("cameras") or {}).keys()),
+            "revisions": reference.get("revisions") or [],
+        }
+    else:
+        reference_summary = {"exists": False}
+
+    bundle = _latest_bundle_report(state)
+    return {
+        "ok": True,
+        "reference": reference_summary,
+        "registration": registration,
+        "stableSource": _read_json_file(root / _WORLD_STABLE_SOURCE_FILE) or {"origin": "geometry"},
+        "graph": {
+            "worlds": len(graph.get("nodes") or []),
+            "edges": len(graph.get("edges") or []),
+            "nodes": graph.get("nodes") or [],
+        },
+        "currentBundle": str(bundle) if bundle else "",
+        "extrinsicsRun": state.calibration.extrinsicsRun,
+    }
+
+
+def _run_world_cli(state: GatewayState, args: list[str], *, timeout: int = 300) -> tuple[int, str]:
+    python = _cv2_python(state.repo_root)
+    if python is None:
+        return 1, "找不到可用的 Python 解释器（需要 numpy）"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(state.repo_root / "third_party" / "opencv_kalibr")
+    command = [
+        str(python),
+        "-m",
+        "metrology.cli.world_registration",
+        "--world-dir",
+        str(_world_root(state)),
+        *args,
+    ]
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(state.repo_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, str(exc)
+    output = (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode, output.strip()
+
+
+def _freeze_world_reference(state: GatewayState, *, replace: bool = False) -> dict[str, Any]:
+    """Declare the current calibration to be the canonical world.
+
+    Deliberately manual. Freezing is the act that gives ``world_frame_id`` its
+    meaning, and doing it as a side effect of calibrating would defeat the point
+    -- the frame is supposed to stop moving when the calibration is redone.
+    """
+    source = _latest_bundle_report(state)
+    if source is None:
+        run = state.repo_root / "outputs" / "calibration" / (state.calibration.extrinsicsRun or "")
+        if not run.is_dir():
+            return {
+                "ok": False,
+                "error": "找不到可冻结的标定：既没有自标定 BA 结果，也没有已激活的外参 run。",
+            }
+        source = run
+    args = [
+        "freeze",
+        "--extrinsics",
+        str(source),
+        "--calibration-id",
+        state.calibration.extrinsicsRun or str(source),
+        "--definition",
+        "canonical camera-rig world (roadmap 2.4), frozen from " + str(source),
+    ]
+    if replace:
+        args.append("--replace")
+    code, output = _run_world_cli(state, args)
+    if code != 0:
+        state.log("warn", f"World freeze failed: {output.splitlines()[-1] if output else code}")
+        # Spread first: the payload carries its own "ok", and letting it land
+        # last would turn every failure into a success.
+        return {**_world_frame_payload(state), "ok": False, "error": output or f"exit {code}"}
+    state.log("info", f"Canonical world frozen from {source}")
+    return {**_world_frame_payload(state), "ok": True, "output": output}
+
+
+def _register_world(
+    state: GatewayState,
+    *,
+    apply_result: bool = False,
+    assume_stable: list[str] | None = None,
+    bundle: Path | None = None,
+    use_rig_check: bool = True,
+) -> dict[str, Any]:
+    """Check (and optionally commit) whether this session is still in the same world.
+
+    Precedence for "which cameras did not move": an explicit operator choice
+    first, then the image-based self-check when it is usable (see
+    :func:`_rig_check_stable_cameras`), and only then the geometric consensus
+    working it out alone. Whichever was used is reported back in
+    ``stableSource`` -- picking the stable set is the decision the whole
+    registration turns on, so it must never be invisible.
+    """
+    root = _world_root(state)
+    if not (root / _WORLD_REFERENCE_FILE).is_file():
+        return {
+            **_world_frame_payload(state),
+            "ok": False,
+            "error": "尚未冻结基准世界系。先在本面板点「冻结为基准世界系」，之后每次标定才有比较对象。",
+        }
+    bundle = bundle or _latest_bundle_report(state)
+    if bundle is None:
+        return {
+            **_world_frame_payload(state),
+            "ok": False,
+            "error": "找不到自标定 BA 结果（extrinsics_report.json）。先跑一次外参标定。",
+        }
+
+    stable_source: dict[str, Any] = {"origin": "operator" if assume_stable else "geometry", "cameras": list(assume_stable or [])}
+    if not assume_stable and use_rig_check:
+        reference = _read_json_file(root / _WORLD_REFERENCE_FILE) or {}
+        stable_source = _rig_check_stable_cameras(state, str(reference.get("created_utc", "")))
+        if stable_source["origin"] == "rig_check":
+            assume_stable = list(stable_source["cameras"])
+
+    args = ["register", "--current", str(bundle), "--calibration-id", state.calibration.extrinsicsRun or ""]
+    if assume_stable:
+        args += ["--assume-stable", *assume_stable]
+    if apply_result:
+        args.append("--apply")
+    code, output = _run_world_cli(state, args)
+    # Exit code 2 is "continuity broken", which is a verdict rather than a
+    # failure: the registration ran and its answer is written out.
+    if code not in (0, 2):
+        state.log("warn", f"World registration failed: {output.splitlines()[-1] if output else code}")
+        return {**_world_frame_payload(state), "ok": False, "error": output or f"exit {code}"}
+
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / _WORLD_STABLE_SOURCE_FILE).write_text(
+            json.dumps(stable_source, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError as exc:  # not worth failing a good registration over
+        state.log("warn", f"Could not record the stable-camera source: {exc}")
+
+    payload = _world_frame_payload(state)
+    payload["stableSource"] = stable_source
+    registration = payload.get("registration") or {}
+    world_state = registration.get("world_continuity_state", "?")
+    state.log(
+        "info" if code == 0 else "warn",
+        f"World registration: {world_state} — {registration.get('guidance', '')}",
+    )
+    return {**payload, "ok": True, "output": output}
+
+
+def _world_registration_for_export(state: GatewayState, bundle: Path) -> dict[str, Any] | None:
+    """Read-only registration run before the production export.
+
+    Its only job is to decide whether the export may keep the canonical
+    ``world_frame_id`` or must mint a new island. It never commits: adopting a
+    moved camera into the reference is a decision an operator makes after
+    reading the verdict, not a side effect of a calibration finishing.
+    """
+    if not (_world_root(state) / _WORLD_REFERENCE_FILE).is_file():
+        return None
+    result = _register_world(state, apply_result=False, bundle=bundle)
+    if not result.get("ok"):
+        return None
+    return result.get("registration")
+
+
 # --- Extrinsics calibration --------------------------------------------------
 #
 # Runs the same three steps the 0804 calibration ran by hand, on an already
@@ -3017,7 +3311,26 @@ def _run_extrinsics_calibration(state: GatewayState, dataset: Path, run_name: st
             "--intrinsics-report", str(state.repo_root / _CALIB_INTRINSICS_REPORT),
             "--model", "fisheye",
         ]
-    if base_run.is_dir():
+    world_reference = _world_root(state) / _WORLD_REFERENCE_FILE
+    registration = _world_registration_for_export(state, work / "extrinsics_report.json")
+    if world_reference.is_file() and registration is not None:
+        # The canonical world, not an older run's frame. Inheriting from a base
+        # run re-inherits its error every time (7.9 mm RMS / 2.17 deg for the
+        # 0720 legacy frame); registering onto W does not.
+        export_args += ["--world-reference", str(world_reference)]
+        if str(registration.get("world_continuity_state")) not in {"CONTINUOUS", "RECONNECTED"}:
+            # A new island is the *safe* direction: the old world_frame_id keeps
+            # meaning what it meant, and this run says plainly that it is not in
+            # it. Reusing the old ID here is the one thing that would corrupt
+            # history, so the export is allowed to proceed only under a new one.
+            export_args += ["--allow-world-break"]
+            state.log(
+                "warn",
+                "World continuity "
+                f"{registration.get('world_continuity_state')}: exporting under a new world_frame_id. "
+                f"{registration.get('guidance', '')}",
+            )
+    elif base_run.is_dir():
         export_args += ["--base-extrinsics", str(base_run)]
         unmoved = _unmoved_cameras(state)
         if unmoved:
@@ -9606,6 +9919,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         if path == "/api/calibration/rig-check":
             _json_response(self, HTTPStatus.OK, _last_rig_check(self.server.state))
             return
+        if path == "/api/calibration/world-frame":
+            _json_response(self, HTTPStatus.OK, _world_frame_payload(self.server.state))
+            return
         if path == "/api/calibration/marker-tcp":
             with self.server.state.lock:
                 _json_response(self, HTTPStatus.OK, {"ok": True, "markerTcp": _marker_tcp_session_payload(self.server.state)})
@@ -10128,6 +10444,30 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/calibration/rig-check/baseline":
                     result = _capture_rig_check_baseline(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/world-frame/freeze":
+                    result = _freeze_world_reference(
+                        self.server.state,
+                        replace=(query.get("replace", [""])[0] or "").strip() in {"1", "true", "yes"},
+                    )
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/world-frame/register":
+                    stable = [
+                        name.strip()
+                        for name in (query.get("stable", [""])[0] or "").split(",")
+                        if name.strip()
+                    ]
+                    result = _register_world(
+                        self.server.state,
+                        apply_result=(query.get("apply", [""])[0] or "").strip() in {"1", "true", "yes"},
+                        assume_stable=stable or None,
+                        use_rig_check=(query.get("rigcheck", ["1"])[0] or "1").strip()
+                        not in {"0", "false", "no"},
+                    )
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
                     return

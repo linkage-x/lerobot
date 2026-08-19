@@ -29,6 +29,7 @@ import { ForceCalibrationCard, TactileCalibrationCard } from "./CalibrationCards
 import { CalibrationLogPanel, toLogEntries } from "./CalibrationLogPanel";
 import { CalibrationHistory } from "./CalibrationHistory";
 import { RigCheckPanel } from "./RigCheckPanel";
+import { WorldFramePanel } from "./WorldFramePanel";
 import { CalibrationWizard } from "./CalibrationWizard";
 import { MarkerTcpPanel } from "./MarkerTcpPanel";
 
@@ -171,6 +172,11 @@ export function CalibrationPage({
       {/* Self-check sits above the calibration itself: the usual question is
           "does anything need redoing?", and the answer is usually no. */}
       <RigCheckPanel api={api} busy={busy} onRecalibrate={onRunMultiCameraCalibration} />
+
+      {/* Whether a bump happened is the self-check above; whether the world
+          frame survived it is a different question, and the one that decides
+          if today's absolute poses can be compared with last week's. */}
+      <WorldFramePanel api={api} busy={busy} />
 
       <CalibrationWizard
         snapshot={snapshot}

@@ -2664,3 +2664,246 @@ def test_touch_payload_from_fz_pads_to_the_nearest_pad_width():
     assert wide["model"] == "paxini_l5325"
 
     assert gateway._touch_payload_from_fz([]) is None
+
+
+# --- canonical world frame (roadmap 2.4) -------------------------------------
+
+
+def _world_gateway_state(tmp_path: Path) -> gateway.GatewayState:
+    """A repo root the world CLI can actually be run against.
+
+    ``third_party/opencv_kalibr`` is linked in rather than faked: the gateway
+    puts it on PYTHONPATH itself, so a stub would test the stub.
+    """
+    (tmp_path / "third_party").mkdir(parents=True, exist_ok=True)
+    real = Path(__file__).resolve().parents[2] / "third_party" / "opencv_kalibr"
+    link = tmp_path / "third_party" / "opencv_kalibr"
+    if not link.exists():
+        link.symlink_to(real, target_is_directory=True)
+    return gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(tmp_path / "ds"), "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test", datasetRoot=str(tmp_path / "ds")),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+
+
+def _write_bundle_report(path: Path, *, shift_m: float = 0.0, moved: str | None = None) -> Path:
+    """A four-camera bundle in its own gauge, optionally with one camera bumped."""
+    offsets = {"cam_00": [0, 0, 0], "cam_01": [1, 0, 0], "cam_02": [0, 1, 0], "cam_03": [1, 1, 0.2]}
+    poses = {}
+    for name, offset in offsets.items():
+        matrix = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+        for axis in range(3):
+            matrix[axis][3] = float(offset[axis]) - shift_m
+        if name == moved:
+            matrix[0][3] += 0.05
+        poses[name] = matrix
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"reference": "cam_00", "T_ref_cam": poses, "rmse_px": 0.244}), encoding="utf-8"
+    )
+    return path
+
+
+def test_world_frame_payload_says_so_when_nothing_has_been_frozen(tmp_path):
+    state = _world_gateway_state(tmp_path)
+
+    payload = gateway._world_frame_payload(state)
+
+    assert payload["ok"] is True
+    assert payload["reference"] == {"exists": False}
+    assert payload["registration"] is None
+
+
+def test_latest_bundle_report_prefers_the_run_just_solved(tmp_path):
+    """A newest-file scan would register whichever calibration happens to be
+    newest on disk, which is not necessarily the one that was just produced."""
+    state = _world_gateway_state(tmp_path)
+    _write_bundle_report(tmp_path / "outputs" / "metrology" / "old_run" / "extrinsics_report.json")
+    wanted = _write_bundle_report(
+        tmp_path / "outputs" / "metrology" / "the_run" / "extrinsics_report.json"
+    )
+    state.calibration.outputPath = str(wanted.parent)
+
+    assert gateway._latest_bundle_report(state) == wanted
+
+
+def test_registering_without_a_frozen_world_explains_the_missing_step(tmp_path):
+    state = _world_gateway_state(tmp_path)
+    _write_bundle_report(tmp_path / "outputs" / "metrology" / "run" / "extrinsics_report.json")
+
+    result = gateway._register_world(state)
+
+    assert result["ok"] is False
+    assert "冻结" in result["error"]
+
+
+def test_freeze_then_register_keeps_the_same_world_across_a_gauge_change(tmp_path, monkeypatch):
+    """The end-to-end point of Phase 2.4, through the endpoints the GUI calls."""
+    state = _world_gateway_state(tmp_path)
+    monkeypatch.setattr(gateway, "_cv2_python", lambda repo_root: Path(sys.executable))
+    first = _write_bundle_report(tmp_path / "outputs" / "metrology" / "run_a" / "extrinsics_report.json")
+    state.calibration.outputPath = str(first.parent)
+
+    frozen = gateway._freeze_world_reference(state)
+    assert frozen["ok"] is True, frozen.get("error")
+    world_id = frozen["reference"]["world_frame_id"]
+
+    # Same rig, re-solved in a different gauge, with one camera bumped.
+    second = _write_bundle_report(
+        tmp_path / "outputs" / "metrology" / "run_b" / "extrinsics_report.json",
+        shift_m=3.0,
+        moved="cam_03",
+    )
+    state.calibration.outputPath = str(second.parent)
+    result = gateway._register_world(state, assume_stable=["cam_00", "cam_01", "cam_02"])
+
+    assert result["ok"] is True, result.get("error")
+    registration = result["registration"]
+    assert registration["world_continuity_state"] == "CONTINUOUS"
+    assert registration["world_frame_id"] == world_id
+    assert registration["consensus"]["moved_cameras"] == ["cam_03"]
+
+
+def test_freezing_twice_is_refused_because_it_would_be_a_different_world(tmp_path, monkeypatch):
+    state = _world_gateway_state(tmp_path)
+    monkeypatch.setattr(gateway, "_cv2_python", lambda repo_root: Path(sys.executable))
+    report = _write_bundle_report(tmp_path / "outputs" / "metrology" / "run" / "extrinsics_report.json")
+    state.calibration.outputPath = str(report.parent)
+
+    assert gateway._freeze_world_reference(state)["ok"] is True
+    again = gateway._freeze_world_reference(state)
+
+    assert again["ok"] is False
+    assert "already defines world" in again["error"]
+
+
+def _write_rig_check_result(
+    state: gateway.GatewayState,
+    *,
+    generated_utc: str,
+    ok: list[str],
+    moved: list[str] = (),
+    overall: str = "moved",
+) -> Path:
+    cameras = {name: {"verdict": "ok", "status": "measured"} for name in ok}
+    cameras.update({name: {"verdict": "moved", "status": "measured"} for name in moved})
+    path = gateway._rig_check_root(state) / "last_result.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"generated_utc": generated_utc, "overall": overall, "cameras": cameras}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _frozen_world(tmp_path, monkeypatch) -> gateway.GatewayState:
+    state = _world_gateway_state(tmp_path)
+    monkeypatch.setattr(gateway, "_cv2_python", lambda repo_root: Path(sys.executable))
+    report = _write_bundle_report(tmp_path / "outputs" / "metrology" / "run_a" / "extrinsics_report.json")
+    state.calibration.outputPath = str(report.parent)
+    assert gateway._freeze_world_reference(state)["ok"] is True
+    return state
+
+
+def test_the_rig_self_check_decides_which_cameras_are_stable(tmp_path, monkeypatch):
+    """The self-check resolves ~1.7 mm at 1 m; the geometric consensus ~1 cm.
+
+    Letting the coarser measurement overrule the finer one would throw away the
+    only evidence that can see a small bump at all.
+    """
+    state = _frozen_world(tmp_path, monkeypatch)
+    _write_rig_check_result(
+        state, generated_utc="2099-01-01T00:00:00Z", ok=["cam_00", "cam_01", "cam_02"], moved=["cam_03"]
+    )
+    _write_bundle_report(
+        tmp_path / "outputs" / "metrology" / "run_b" / "extrinsics_report.json", shift_m=3.0, moved="cam_03"
+    )
+    state.calibration.outputPath = str(tmp_path / "outputs" / "metrology" / "run_b")
+
+    result = gateway._register_world(state)
+
+    assert result["stableSource"]["origin"] == "rig_check"
+    assert result["registration"]["consensus"]["stable_cameras"] == ["cam_00", "cam_01", "cam_02"]
+    assert result["registration"]["consensus"]["moved_cameras"] == ["cam_03"]
+
+
+def test_a_self_check_older_than_the_frozen_world_is_not_evidence(tmp_path, monkeypatch):
+    """It describes movement since a baseline that predates the world itself."""
+    state = _frozen_world(tmp_path, monkeypatch)
+    _write_rig_check_result(
+        state, generated_utc="2000-01-01T00:00:00Z", ok=["cam_00", "cam_01", "cam_02", "cam_03"]
+    )
+    _write_bundle_report(tmp_path / "outputs" / "metrology" / "run_b" / "extrinsics_report.json", shift_m=3.0)
+    state.calibration.outputPath = str(tmp_path / "outputs" / "metrology" / "run_b")
+
+    result = gateway._register_world(state)
+
+    assert result["stableSource"]["origin"] == "geometry"
+    assert "冻结时间" in result["stableSource"]["reason"]
+
+
+def test_an_inconclusive_self_check_is_refused_rather_than_read_as_ok(tmp_path, monkeypatch):
+    state = _frozen_world(tmp_path, monkeypatch)
+    _write_rig_check_result(
+        state,
+        generated_utc="2099-01-01T00:00:00Z",
+        ok=["cam_00", "cam_01", "cam_02", "cam_03"],
+        overall="inconclusive",
+    )
+    _write_bundle_report(tmp_path / "outputs" / "metrology" / "run_b" / "extrinsics_report.json", shift_m=3.0)
+    state.calibration.outputPath = str(tmp_path / "outputs" / "metrology" / "run_b")
+
+    result = gateway._register_world(state)
+
+    assert result["stableSource"]["origin"] == "geometry"
+    assert "无法判定" in result["stableSource"]["reason"]
+
+
+def test_an_explicit_operator_choice_outranks_the_self_check(tmp_path, monkeypatch):
+    state = _frozen_world(tmp_path, monkeypatch)
+    _write_rig_check_result(
+        state, generated_utc="2099-01-01T00:00:00Z", ok=["cam_00", "cam_01", "cam_02"], moved=["cam_03"]
+    )
+    _write_bundle_report(tmp_path / "outputs" / "metrology" / "run_b" / "extrinsics_report.json", shift_m=3.0)
+    state.calibration.outputPath = str(tmp_path / "outputs" / "metrology" / "run_b")
+
+    result = gateway._register_world(state, assume_stable=["cam_01", "cam_02", "cam_03"])
+
+    assert result["stableSource"]["origin"] == "operator"
+    assert result["registration"]["consensus"]["stable_cameras"] == ["cam_01", "cam_02", "cam_03"]
+
+
+def test_the_frozen_world_is_somewhere_git_actually_tracks():
+    """The one calibration artefact that cannot be regenerated.
+
+    Re-running `freeze` mints a new `world_frame_id` for the same physical
+    frame, orphaning the ID stamped into every episode recorded so far — so
+    restoring `world_reference.json` from git is the only recovery there is.
+    Putting it back under `outputs/` would look tidy (it is, after all, produced
+    by a tool) and would silently make it disposable: that tree is 7 GB of
+    regenerable artefacts and is deleted to reclaim space.
+
+    Guards the .gitignore side too, which is the half a path constant cannot.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    if not (repo_root / ".git").exists():
+        pytest.skip("not a git checkout")
+
+    reference = gateway._WORLD_SUBDIR / gateway._WORLD_REFERENCE_FILE
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", str(reference)],
+        cwd=repo_root,
+        check=False,
+    )
+    assert ignored.returncode != 0, f"{reference} is gitignored; it cannot be regenerated"
+
+    # The volatile half must stay out: it is rewritten by every continuity check.
+    for volatile in (gateway._WORLD_REGISTRATION_FILE, gateway._WORLD_STABLE_SOURCE_FILE):
+        path = gateway._WORLD_SUBDIR / volatile
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", str(path)], cwd=repo_root, check=False
+        )
+        assert result.returncode == 0, f"{path} would be committed on every check"

@@ -720,7 +720,7 @@ Level 2 / 3（2026-08-18）位于 <span class="mono">metrology/tcp_uncertainty.p
 <summary>工程实现：如何识别稳定相机并维持 world</summary>
 <div class="detail-body">
 <ul>
-<li>首次高质量标定冻结 <span class="mono">world_reference.json</span>：canonical frame 定义、每台 <span class="mono">T_WC_i^ref</span>、covariance/quality、标定版本与内容哈希。</li>
+<li>首次高质量标定冻结 <span class="mono">world_reference.json</span>：canonical frame 定义、每台 <span class="mono">T_WC_i^ref</span>、covariance/quality、标定版本与内容哈希。<b>该文件必须纳入版本管理</b>（现落在 <span class="mono">tools/thor/gmsl2/world/</span>，不放 <span class="mono">outputs/</span>）：它<b>不可重建</b>——重跑 freeze 会给同一个物理坐标系产生第二个 <span class="mono">world_frame_id</span>，把已录数据里盖的 ID 全变成孤儿；而 <span class="mono">outputs/</span> 是 7 GB 可再生产物、会被清理。工作站与 rig 之间只能<b>拷贝</b>这个目录，不能各自 freeze。</li>
 <li>每个 session 用共同观测重新估计当前 camera graph；比较所有可用 pairwise <span class="mono">T_CiCj</span> 与 reference，robustly 找最大稳定 cluster。<b>默认期望 ≥4 台</b>；少于 3 台时不建议自动宣布 world persistence 通过。</li>
 <li>用稳定 cluster 联合求一个共享 <span class="mono">T_WS</span>，而不是任选一台相机硬当 world；输出 alignment residual、stable-camera count、每台 residual 与 world covariance。</li>
 <li>被判定移动的 camera 可以重新求 <span class="mono">T_WC</span> 后继续加入 tracking，不应通过重新定义 world 来“迁就”它。</li>
@@ -731,6 +731,42 @@ Level 2 / 3（2026-08-18）位于 <span class="mono">metrology/tcp_uncertainty.p
 </ul>
 </div>
 </details>
+<div class="callout ok" data-block="world-frame-impl">
+<b>2026-08-19 已实现（代码落盘，尚未在真机冻结基准）。</b>
+<ul>
+<li><b>核心</b> <span class="mono">metrology/world_frame.py</span>：gauge-free pairwise <span class="mono">ΔT_ij</span> → Bron–Kerbosch 最大一致 clique → 稳定相机集上的鲁棒 SE(3) Gauss-Newton（Huber，残差自标定协方差，<b>不拟合尺度</b>）→ <span class="mono">CONTINUOUS / RECONNECTED / BROKEN</span> 状态机 + 可版本化 world pose graph。纯 NumPy（Thor 上 cv2 在 venv、SciPy 在系统 python，两者都要就没有解释器能跑，已加回归测试钉死）。</li>
+<li><b>CLI</b> <span class="mono">metrology/cli/world_registration.py</span>：<span class="mono">freeze / register / reconnect / show</span>。<span class="mono">register</span> <b>默认只读</b>，<span class="mono">--apply</span> 才写基准；BROKEN 的退出码是 2（是判定不是失败）。</li>
+<li><b>生产导出</b> <span class="mono">export_production_calibration.py --world-reference</span>：把 BA 注册进冻结的 <span class="mono">W</span> 后再导出，<span class="mono">summary.json</span> 写 <span class="mono">world_frame_id / world_continuity_state / stable_cameras / alignment 残差与协方差</span>；<span class="mono">base_to_camera</span> 键名保留（生产读它），值已是 <span class="mono">T_world_camera</span>。<b>continuity 断开时必须显式 <span class="mono">--allow-world-break</span>，且只会写新 ID，绝不复用旧 ID。</b>gateway 在有基准时自动走这条路，替代 <span class="mono">--base-extrinsics</span> 的 0720 继承。</li>
+<li><b>GUI</b>：标定中心新增「世界坐标系」面板（相机自检之下），显示基准 ID/冻结时间、状态、逐相机稳定/移动/新增/未解出、对齐残差与 σ(W)、common-mode 盲区、world graph；操作为 冻结 / 检测 / 接受并更新（或新建 world island）。</li>
+</ul>
+<b>两处刻意不自动化</b>：① 提交（<span class="mono">--apply</span>）与冻结都需人工确认——它们改变的是「以后所有 session 的比较基准」；② 两个同样大的 clique 判为 <span class="mono">ambiguous</span> 并停下来，由操作者勾选未移动相机，绝不用「取大的那组」冒充测量。<b>提交时稳定相机的基准位姿保持冻结不更新</b>，否则 <span class="mono">W</span> 会随每次噪声随机游走——这正是 canonical frame 要防的。
+</div>
+<div class="callout warn" data-block="world-frame-threshold">
+<b>2026-08-19 阈值实测：一致性判据从 3 mm / 0.2° 改为 <u>10 mm / 0.75°</u>，并更正一处引用错误。</b>
+拿磁盘上两次<b>独立解算同一个 rig</b>（<span class="mono">calib_20260804</span> 补拍前 0.3165 px vs <span class="mono">calib_final</span> 0.2437 px，<b>期间无人碰过相机</b>）对拍：
+21 对 pairwise 差 <b>p50 2.22 / p95 5.32 / max 6.44 mm</b>、<b>0.238 / 0.419 / 0.489°</b>；
+强制 7 台全部参与刚体对齐后逐相机残差只有 <b>0.49–2.30 mm / 0.07–0.32°（RMS 1.05 mm）</b>——证实确实没动，
+pairwise 那个 6.44 mm 是两台相机误差叠加再被 <span class="mono">δθ×基线</span> 杠杆放大的结果。
+<b>原 3 mm 阈值会把 cam_06 / cam_08 / cam_14 三台误判为 moved。</b>（最差的 cam_06 2.30 mm 与它 79% 的最低画幅覆盖一致。）
+<br/><b>更正：</b>此前用「重标复现性 0.06 mm / 0.0034°」论证 3 mm 够宽是<b>口径错误</b>——那个数是<b>同一份检测数据重跑 BA</b>，
+不是重新采集重解算。重新采集的实测是 mm 级，差两个数量级。
+<br/><b>结构性后果（已据此改设计）：</b>几何共识的检出下限因此约 <b>1 cm</b>，比图像相机自检（≈2 px ≈ 1.7 mm @1 m）粗一个量级。
+两者分工明确：<b>相机自检负责「发现谁被碰」，世界系负责「决定怎么处理」</b>。
+因此 <span class="mono">_register_world</span> 现在<b>默认把相机自检判为 ok 的相机作为 declared stable set</b>
+（优先级：操作者显式指定 &gt; 相机自检 &gt; 几何共识自解），几何逐相机残差退为对该判定的<b>独立复核</b>而非同义反复。
+自检在三种情况下被拒用：可用相机 &lt;3 台、overall 为 <span class="mono">inconclusive</span>、或结果不晚于世界系冻结时间（描述的不是冻结之后的状态）。
+GUI 显示实际用了哪一路，并提供「改用几何共识判定」回退。
+</div>
+<div class="callout warn" data-block="world-frame-todo">
+<b>剩余缺口：</b>①<b>还没在真机冻结基准</b>——已确认可直接用 0804 数据：应冻 <span class="mono">outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_extrinsics</span>（生产 run）<b>而不是</b> BA report，
+实测两者相对几何<b>逐位相同</b>（21 对 pairwise 差 0.000000 mm，只差一个刚体变换），故对共识判定毫无影响，差别只在坐标轴；
+而生产 run 的轴 = <b>现有全部历史数据所在的系</b>，冻它等于让历史数据免费获得 <span class="mono">world_frame_id</span>，冻 BA report（gauge=cam_14）则会凭空制造一次与全部历史的断裂。
+0720 继承的 8.3 mm RMS / 2.2° 因此从「每次重标重新继承的误差」变成<b>一次性冻结的常量轴偏置</b>——这正是 2.4 要消掉的那部分；
+与 FR3 的绝对对齐是 Phase 9 的 <span class="mono">T_WB</span>，独立重标、不受影响。
+②<b>episode / derived trajectory 尚未写 <span class="mono">world_frame_id</span></b>——目前只有标定 run 和 registration 记录带；
+③ common-mode watchdog 的独立锚点观测接口已就位（<span class="mono">--anchor</span>），但还没有实际的固定基准可读；
+④ 新阈值只由「同一天两次采集」这一组数据定出，<b>仍缺跨天/跨周的无扰动基线</b>——那一组本身还偏悲观（早期那版覆盖不足，cam_07 残差 0.85 px），两次都是好解算时应更接近。
+</div>
 <div class="gate"><b>Gate：</b>外参/重注册全程不依赖 robot FK。若 stable-camera consensus 成立，则当前 session 注册回原 canonical <span class="mono">W</span>；若所有相机移动且无法恢复 <span class="mono">T_Wnew←Wold</span>，必须进入 <span class="mono">BROKEN</span> 状态并创建新 <span class="mono">world_frame_id</span>。<b>这不阻塞旧数据的 relative / bimanual / training-facing 使用，只阻塞跨 world 的 absolute replay。</b>桌面/环境 anchor 仅用于 common-mode drift watchdog 或后验 reconnect。</div>
 </div>
 <div class="phase" data-block="camera-model">

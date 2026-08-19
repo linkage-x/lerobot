@@ -2997,6 +2997,19 @@ button.danger {
 
 .cali-muted { color: #7b8791; }
 
+/* Camera picker for an ambiguous world consensus: the operator names the
+   cameras that did not move, because no algorithm can tell. */
+.world-camera-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+.world-camera-picker label {
+  align-items: center;
+  display: inline-flex;
+  gap: 4px;
+}
+
 /* ---- global status bar ---- */
 .cali-statusbar {
   align-items: center;

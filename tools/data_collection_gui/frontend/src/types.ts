@@ -633,6 +633,118 @@ export type RigCheckResponse = {
   baseline?: RigCheckBaseline;
 };
 
+// --- canonical world frame (roadmap 2.4) ------------------------------------
+//
+// The world is not re-derived from each calibration; it is frozen once, and
+// every later solve is registered back onto it by the cameras whose mutual
+// geometry did not change. `world_frame_id` is the contract: two recordings are
+// comparable in absolute terms only when they carry the same one.
+export type WorldContinuityState = "CONTINUOUS" | "RECONNECTED" | "BROKEN";
+
+export type WorldPairDelta = {
+  a: string;
+  b: string;
+  translation_mm: number;
+  rotation_deg: number;
+  consistent: boolean;
+};
+
+export type WorldConsensus = {
+  stable_cameras: string[];
+  moved_cameras: string[];
+  new_cameras: string[];
+  missing_cameras: string[];
+  // Two equal-size clusters mean "half the rig moved together" is
+  // indistinguishable from "half of it stayed" -- a human has to say which.
+  ambiguous: boolean;
+  alternative_clusters: string[][];
+  thresholds: { translation_mm: number; rotation_deg: number };
+  pairs: WorldPairDelta[];
+};
+
+export type WorldAlignment = {
+  cameras_used: string[];
+  translation_residual_mm: Record<string, number>;
+  rotation_residual_deg: Record<string, number>;
+  rms_translation_mm: number;
+  max_translation_mm: number;
+  rms_rotation_deg: number;
+  max_rotation_deg: number;
+  sigma_world_translation_mm: number;
+  sigma_world_rotation_deg: number;
+  method?: string;
+};
+
+// The one motion camera consensus cannot see: the whole rig carried as one
+// leaves every pairwise transform unchanged. Reported as an explicit blind spot
+// when no independent datum was observed, never as silence.
+export type WorldCommonMode = {
+  observable: boolean;
+  note?: string;
+  translation_mm?: number;
+  rotation_deg?: number;
+  drifted?: boolean;
+};
+
+export type WorldRegistration = {
+  generated_utc: string;
+  world_continuity_state: WorldContinuityState;
+  world_frame_id: string;
+  parent_world_frame_id?: string | null;
+  reference_world_frame_id: string;
+  calibration_id: string;
+  reason: string;
+  guidance: string;
+  auto_declarable: boolean;
+  committed: boolean;
+  min_stable_cameras: number;
+  consensus: WorldConsensus;
+  alignment: WorldAlignment | null;
+  common_mode: WorldCommonMode;
+  session?: { source: string; gauge: string; solver: string };
+};
+
+export type WorldReferenceSummary = {
+  exists: boolean;
+  world_frame_id?: string;
+  created_utc?: string;
+  calibration_id?: string;
+  definition?: string;
+  cameras?: string[];
+  revisions?: {
+    utc?: string;
+    reason?: string;
+    state?: string;
+    cameras_replaced?: string[];
+    stable_cameras?: string[];
+  }[];
+};
+
+// Which evidence chose the cameras that define the frame. The self-check
+// resolves ~1.7 mm at 1 m and the geometric consensus about a centimetre, so
+// when the finer measurement is available it is the one that should decide —
+// but which one was used must never be invisible.
+export type WorldStableSource = {
+  origin: "rig_check" | "operator" | "geometry";
+  cameras?: string[];
+  moved?: string[];
+  generatedUtc?: string;
+  rigCheckOverall?: string;
+  reason?: string;
+};
+
+export type WorldFrameResponse = {
+  ok: boolean;
+  error?: string;
+  output?: string;
+  reference: WorldReferenceSummary;
+  registration: WorldRegistration | null;
+  stableSource?: WorldStableSource;
+  graph: { worlds: number; edges: number; nodes: { world_frame_id: string; parent_world_frame_id?: string | null }[] };
+  currentBundle?: string;
+  extrinsicsRun?: string;
+};
+
 // Guided calibration: per-camera intrinsics sweeps, then one shared extrinsics
 // sweep. They cannot be merged -- intrinsics are constrained by how much of one
 // camera's frame the board reaches, extrinsics by how often several cameras see
