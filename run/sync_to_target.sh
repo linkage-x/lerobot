@@ -3,6 +3,13 @@
 #
 # Usage:
 #   bash run/sync_to_target.sh [thor|workstation] [rsync options...]
+#   bash run/sync_to_target.sh user@host [rsync options...]      # REMOTE_DIR required
+#
+# The named targets are the two standing deployments. An arbitrary user@host is for
+# training machines chosen at run time from the GUI, which are not known here -- they
+# share this script rather than their own rsync so that the exclude list below, which
+# is what keeps a sync from clobbering a target's venv or its recorded datasets, has
+# exactly one definition.
 set -euo pipefail
 
 target="${1:-thor}"
@@ -19,8 +26,20 @@ case "$target" in
     remote="hph@192.168.100.155"
     remote_dir="/home/hph/Code/lerobot"
     ;;
+  *@*)
+    remote="$target"
+    remote_dir="${REMOTE_DIR:-}"
+    if [[ -z "$remote_dir" ]]; then
+      echo "ERROR: REMOTE_DIR must be set when the target is a raw user@host ('$target')" >&2
+      exit 2
+    fi
+    if [[ "$remote_dir" != /* ]]; then
+      echo "ERROR: REMOTE_DIR must be an absolute path (got '$remote_dir')" >&2
+      exit 2
+    fi
+    ;;
   *)
-    echo "ERROR: unknown deployment target '$target' (expected thor or workstation)" >&2
+    echo "ERROR: unknown deployment target '$target' (expected thor, workstation, or user@host)" >&2
     exit 2
     ;;
 esac

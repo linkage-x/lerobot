@@ -13,6 +13,28 @@ import {
 
 type ActionMode = "absolute_ee" | "delta_ee_from_prev_cmd" | "delta_ee_from_current";
 
+// Rates a training view may be built at. Mirrors TRAINING_VIEW_FPS_CHOICES in gateway.py.
+// 0 means "keep whatever the recording is", which the exporter only allows when every source
+// in one build already agrees.
+const VIEW_FPS_CHOICES = [30, 15, 60, 0] as const;
+const DEFAULT_VIEW_FPS = 30;
+
+/** Why this recording cannot be built at `viewFps`, or "" when it can. */
+function viewFpsProblem(sourceFps: number | undefined, viewFps: number): string {
+  if (!sourceFps || viewFps === 0) return "";
+  if (sourceFps < viewFps) {
+    return `recorded at ${sourceFps} fps — a ${viewFps} fps view would have to invent frames`;
+  }
+  if (sourceFps % viewFps !== 0) {
+    // Only integer decimation exists. Nearest-frame resampling would make the gap between
+    // kept frames alternate between 1 and 2 source frames, and the action is a per-frame
+    // delta, so that swing lands directly in the values the policy learns.
+    const divisors = [1, 2, 3, 4].filter((n) => sourceFps % n === 0).map((n) => sourceFps / n);
+    return `${sourceFps} fps is not an integer multiple of ${viewFps} — pick ${divisors.join(", ")}`;
+  }
+  return "";
+}
+
 const actionModeCopy: Record<ActionMode, { label: string; blurb: string }> = {
   absolute_ee: {
     label: "Absolute EE",
@@ -108,13 +130,14 @@ function TrainingViewPage({
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
-  onBuildView: (path: string, actionMode?: string, cameraCrops?: CameraCropSpecs) => void;
+  onBuildView: (path: string, actionMode?: string, cameraCrops?: CameraCropSpecs, viewFps?: number) => void;
   onOpenProcessing: () => void;
   onOpenReplay: (path: string) => void;
 }) {
   const exportStatus = snapshot.datasetExport;
   const building = exportStatus.state === "exporting";
   const [actionMode, setActionMode] = useState<ActionMode>("delta_ee_from_prev_cmd");
+  const [viewFps, setViewFps] = useState<number>(DEFAULT_VIEW_FPS);
   const [cropEnabled, setCropEnabled] = useState(false);
   const [cameraCropInputs, setCameraCropInputs] = useState<Record<string, CameraCropInput>>({});
   const allDatasets = snapshot.recordedDatasets ?? [];
@@ -202,6 +225,33 @@ function TrainingViewPage({
         <p className="panel-note">{actionModeCopy[actionMode].blurb}</p>
       </section>
 
+      <section className="panel">
+        <div className="panel-heading">
+          <h2>Frame Rate</h2>
+          <span>{viewFps === 0 ? "keep source rate" : `${viewFps} fps`}</span>
+        </div>
+        <p className="panel-note">
+          The action is a <em>per-frame</em> delta, so the same real motion is twice as large per
+          frame at 30 fps as at 60. Views built at different rates therefore cannot be merged —
+          the difference lands in the action values themselves and nothing downstream can see it.
+          Building every view at one rate is what lets a 60 fps session join the 30 fps baseline.
+          Frames are dropped, never interpolated, and the videos are not re-encoded.
+        </p>
+        <div className="mujoco-mode-picker" role="group" aria-label="Training view frame rate">
+          {VIEW_FPS_CHOICES.map((choice) => (
+            <button
+              key={choice}
+              className={viewFps === choice ? "active" : ""}
+              disabled={busy || building}
+              onClick={() => setViewFps(choice)}
+              type="button"
+            >
+              {choice === 0 ? "Source rate" : `${choice} fps`}
+            </button>
+          ))}
+        </div>
+      </section>
+
       <section className="panel camera-crop-panel">
         <div className="panel-heading">
           <h2>Camera Crop</h2>
@@ -276,13 +326,14 @@ function TrainingViewPage({
               const qcReady = qcStatus === "qc_pass" || warned;
               const warnings = qc ? qcWarnings(qc) : [];
               const cropResult = cropSpecsForDataset(dataset, cropEnabled, cameraCropInputs);
+              const fpsProblem = viewFpsProblem(dataset.fps, viewFps);
               const blockedReason = !qcReady
                 ? qcStatus === "qc_failed"
                   ? "QC failed — fix or re-record before training on this"
                   : "Run QC in Dataset Processing before building a view"
                 : kept === 0
                   ? "Every episode is marked not for training"
-                  : cropResult.error ?? undefined;
+                  : (cropResult.error ?? fpsProblem) || undefined;
               return (
                 <div className="processing-row" key={dataset.path}>
                   <div className="processing-row-main static">
@@ -303,8 +354,19 @@ function TrainingViewPage({
                         <em>{qcStatus ? processingStatusLabel[qcStatus] : "QC not run"}</em>
                       </div>
                       <p>
-                        {dataset.totalEpisodes} episode(s) · {dataset.totalFrames} frames · {dataset.path}
+                        {dataset.totalEpisodes} episode(s) · {dataset.totalFrames} frames
+                        {dataset.fps ? ` · ${dataset.fps} fps` : ""} · {dataset.path}
                       </p>
+                      {qcReady && fpsProblem ? (
+                        <p className="panel-note">Cannot build at {viewFps} fps: {fpsProblem}.</p>
+                      ) : null}
+                      {qcReady && !fpsProblem && dataset.fps && viewFps > 0 && dataset.fps !== viewFps ? (
+                        <p className="panel-note">
+                          Keeping 1 frame of {dataset.fps / viewFps} — the view will hold about{" "}
+                          {Math.ceil(dataset.totalFrames / (dataset.fps / viewFps)).toLocaleString()} frames
+                          at {viewFps} fps.
+                        </p>
+                      ) : null}
                       {qcReady ? null : (
                         // The gate is stated on the row rather than left to the error the build
                         // would have returned: QC is a page away, and "why is this disabled" has
@@ -334,9 +396,16 @@ function TrainingViewPage({
                     </div>
                     <div className="processing-stats">
                       <button
-                        disabled={busy || building || !qcReady || kept === 0 || Boolean(cropResult.error)}
+                        disabled={
+                          busy ||
+                          building ||
+                          !qcReady ||
+                          kept === 0 ||
+                          Boolean(cropResult.error) ||
+                          Boolean(fpsProblem)
+                        }
                         title={blockedReason}
-                        onClick={() => onBuildView(dataset.path, actionMode, cropResult.crops)}
+                        onClick={() => onBuildView(dataset.path, actionMode, cropResult.crops, viewFps)}
                       >
                         {buildingThis ? "Building…" : "Build View"}
                       </button>
@@ -417,7 +486,12 @@ export function DatasetExportPage({
   snapshot: GuiSnapshot;
   busy: boolean;
   onExportTask: (id: string) => void;
-  onExportApprovedDataset: (path: string, actionMode?: string, cameraCrops?: CameraCropSpecs) => void;
+  onExportApprovedDataset: (
+    path: string,
+    actionMode?: string,
+    cameraCrops?: CameraCropSpecs,
+    viewFps?: number
+  ) => void;
   onOpenProcessing: () => void;
   onOpenReplay: (path: string) => void;
 }) {

@@ -28,7 +28,13 @@ import type {
   TrajectoryPoint,
   TeleopStatus,
   TeleopGains,
-  TeleopGainValues
+  TeleopGainValues,
+  TrainingHost,
+  TrainingMachine,
+  TrainingRun,
+  TrainingStartRequest,
+  TrainingView,
+  TrainingWandbStatus
 } from "./types";
 
 export type CameraCropSpecs = Record<string, [number, number, number, number]>;
@@ -116,6 +122,7 @@ export type GuiSnapshot = {
   events: EventLogItem[];
   tasks: CollectionTask[];
   activeTaskId?: string;
+  training?: TrainingRun;
   notice?: string;
 };
 
@@ -737,6 +744,114 @@ export class DataCollectionGuiApi {
     return `${this.apiBase}/api/replay/realsense.jpg?${params.toString()}`;
   }
 
+  // ------------------------------------------------------------- training ---
+  //
+  // These do not go through the snapshot poll. A machine probe shells out to ssh and a
+  // sync runs rsync; putting either on the 1s snapshot path would stall every other page
+  // behind a host that is merely slow to answer.
+
+  private async trainingGet<T>(path: string, params?: Record<string, string>): Promise<T | null> {
+    try {
+      const qs = params ? `?${new URLSearchParams(params).toString()}` : "";
+      const response = await fetch(`${this.apiBase}${path}${qs}`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) return null;
+      return (await response.json()) as T;
+    } catch {
+      return null;
+    }
+  }
+
+  private async trainingPost<T>(path: string, body: unknown): Promise<T & { ok: boolean; error?: string }> {
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+      return {
+        ...(payload as T),
+        ok: response.ok && payload.ok !== false,
+        error: typeof payload.error === "string" ? payload.error : undefined
+      };
+    } catch (error) {
+      return {
+        ...({} as T),
+        ok: false,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+
+  async fetchTrainingHosts(): Promise<TrainingHost[]> {
+    const payload = await this.trainingGet<{ hosts: TrainingHost[] }>("/api/training/hosts");
+    return payload?.hosts ?? [];
+  }
+
+  async fetchTrainingMachine(
+    hostId: string
+  ): Promise<{ machine: TrainingMachine; wandb: TrainingWandbStatus } | null> {
+    return this.trainingGet<{ machine: TrainingMachine; wandb: TrainingWandbStatus }>(
+      "/api/training/machine",
+      { host: hostId }
+    );
+  }
+
+  async fetchTrainingViews(): Promise<TrainingView[]> {
+    const payload = await this.trainingGet<{ views: TrainingView[] }>("/api/training/views");
+    return payload?.views ?? [];
+  }
+
+  async fetchTrainingStatus(): Promise<TrainingRun | null> {
+    const payload = await this.trainingGet<{ training: TrainingRun }>("/api/training/status");
+    return payload?.training ?? null;
+  }
+
+  async addTrainingHost(host: {
+    label: string;
+    sshTarget: string;
+    repoDir: string;
+    pythonPath: string;
+  }) {
+    return this.trainingPost<{ host?: TrainingHost }>("/api/training/hosts/add", host);
+  }
+
+  async removeTrainingHost(hostId: string) {
+    return this.trainingPost<Record<string, never>>("/api/training/hosts/remove", { hostId });
+  }
+
+  /** The key is written, never read back: the response only says whether one is stored. */
+  async setTrainingWandbKey(hostId: string, apiKey: string) {
+    return this.trainingPost<{ wandb?: TrainingWandbStatus }>("/api/training/wandb", {
+      hostId,
+      apiKey
+    });
+  }
+
+  async clearTrainingWandbKey(hostId: string) {
+    return this.trainingPost<{ wandb?: TrainingWandbStatus }>("/api/training/wandb", {
+      hostId,
+      clear: true
+    });
+  }
+
+  async syncTrainingHost(hostId: string) {
+    return this.trainingPost<{ sync?: { message?: string; changedCount?: number; detail?: string[] } }>(
+      "/api/training/sync",
+      { hostId }
+    );
+  }
+
+  async startTraining(request: TrainingStartRequest) {
+    return this.trainingPost<{ training?: TrainingRun }>("/api/training/start", request);
+  }
+
+  async stopTraining() {
+    return this.trainingPost<{ training?: TrainingRun }>("/api/training/stop", {});
+  }
+
   async fetchRealSenseStatus(): Promise<RealSensePreviewStatus | null> {
     try {
       const response = await fetch(`${this.apiBase}/api/replay/realsense-status`, {
@@ -1060,7 +1175,8 @@ export class DataCollectionGuiApi {
     path: string,
     actionMode?: string,
     acknowledgeWarnings = false,
-    cameraCrops?: CameraCropSpecs
+    cameraCrops?: CameraCropSpecs,
+    viewFps?: number
   ): Promise<GuiSnapshot> {
     // The workstation profile reuses this endpoint to build a training view, and picks the
     // action contract with actionMode; Thor sends none and gets the raw->v3 consolidation.
@@ -1075,6 +1191,11 @@ export class DataCollectionGuiApi {
     }
     if (cameraCrops && Object.keys(cameraCrops).length > 0) {
       params.set("camera_crops", JSON.stringify(cameraCrops));
+    }
+    if (viewFps !== undefined) {
+      // Sent even when it matches the source rate, so the built view records that a rate was
+      // chosen rather than inherited -- that is what a later merge needs to know.
+      params.set("view_fps", String(viewFps));
     }
     const query = `?${params.toString()}`;
     const remote = await this.postRemoteSnapshot(`/api/datasets/export${query}`);

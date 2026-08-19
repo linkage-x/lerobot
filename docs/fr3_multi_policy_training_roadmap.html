@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FR3 Workstation 多策略训推与数据闭环 Roadmap</title>
+<style>
+  :root{
+    --bg:#f7f8fa;
+    --panel:#ffffff;
+    --text:#1f2937;
+    --muted:#64748b;
+    --line:#e5e7eb;
+    --blue:#2563eb;
+    --blue-bg:#eff6ff;
+    --green:#15803d;
+    --green-bg:#ecfdf5;
+    --amber:#b45309;
+    --amber-bg:#fffbeb;
+    --red:#991b1b;
+    --red-bg:#fef2f2;
+    --shadow:0 10px 28px rgba(15,23,42,.06);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    line-height:1.62;
+  }
+  a{color:var(--blue)}
+  .wrap{max-width:1180px;margin:0 auto;padding:34px 22px 72px}
+  .hero{
+    background:#111827;
+    color:#f9fafb;
+    border-radius:18px;
+    padding:32px 34px;
+    box-shadow:var(--shadow);
+    margin-bottom:20px;
+  }
+  .hero h1{margin:0 0 10px;font-size:30px;line-height:1.22;letter-spacing:0}
+  .hero p{margin:8px 0;color:#d1d5db}
+  .hero a{color:#93c5fd}
+  .meta{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}
+  .pill{
+    display:inline-flex;
+    align-items:center;
+    padding:5px 10px;
+    border-radius:999px;
+    border:1px solid rgba(255,255,255,.18);
+    color:#e5e7eb;
+    font-size:13px;
+    font-weight:650;
+  }
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+  .card{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:14px;
+    padding:20px;
+    box-shadow:var(--shadow);
+  }
+  .full{grid-column:1/-1}
+  h2{font-size:22px;margin:0 0 12px}
+  h3{font-size:17px;margin:20px 0 8px}
+  p{margin:8px 0}
+  ul,ol{margin:8px 0 0 22px;padding:0}
+  li{margin:5px 0}
+  code,.mono{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+    background:#f3f4f6;
+    border-radius:6px;
+    padding:2px 5px;
+    font-size:.92em;
+  }
+  .hero code,.hero .mono{background:rgba(255,255,255,.12);color:#fff}
+  .badge{
+    display:inline-block;
+    padding:3px 8px;
+    border-radius:999px;
+    font-size:12px;
+    font-weight:750;
+    white-space:nowrap;
+  }
+  .done{color:var(--green);background:var(--green-bg)}
+  .todo{color:var(--blue);background:var(--blue-bg)}
+  .warn{color:var(--amber);background:var(--amber-bg)}
+  .p0{color:var(--red);background:var(--red-bg)}
+  .section-head{
+    display:flex;
+    justify-content:space-between;
+    gap:12px;
+    align-items:flex-start;
+    margin-bottom:8px;
+  }
+  .small{font-size:13px;color:var(--muted)}
+  .callout{
+    margin:12px 0;
+    border-left:4px solid var(--blue);
+    background:var(--blue-bg);
+    border-radius:10px;
+    padding:12px 14px;
+  }
+  .callout.warn{border-color:var(--amber);background:var(--amber-bg)}
+  .callout.p0{border-color:var(--red);background:var(--red-bg)}
+  .callout.ok{border-color:var(--green);background:var(--green-bg)}
+  .table{width:100%;border-collapse:collapse;font-size:14px}
+  .table th,.table td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  .table th{background:#f9fafb;color:#111827}
+  .table tr.sep td{background:#f3f4f6;font-weight:800;color:#111827}
+  .scroll{overflow-x:auto}
+  .phase{
+    display:grid;
+    grid-template-columns:150px 1fr 200px;
+    gap:14px;
+    padding:14px 0;
+    border-top:1px solid var(--line);
+  }
+  .phase:first-of-type{border-top:none}
+  .phase .name{font-weight:800;color:#111827}
+  .gate{
+    border:1px dashed #9ca3af;
+    background:#fff;
+    border-radius:10px;
+    padding:10px 12px;
+    margin-top:10px;
+    font-size:13px;
+  }
+  .flow{
+    white-space:pre-wrap;
+    overflow:auto;
+    background:#0f172a;
+    color:#e5e7eb;
+    border-radius:12px;
+    padding:14px;
+    font-size:13px;
+    line-height:1.5;
+  }
+  .kbd{
+    display:inline-block;
+    min-width:22px;
+    padding:1px 6px;
+    border:1px solid #cbd5e1;
+    border-bottom-width:2px;
+    border-radius:6px;
+    background:#fff;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+    font-size:12px;
+    text-align:center;
+  }
+  .ok-mark{color:var(--green);font-weight:800}
+  .no-mark{color:var(--red);font-weight:800}
+  @media (max-width:860px){
+    .grid{grid-template-columns:1fr}
+    .full{grid-column:auto}
+    .phase{grid-template-columns:1fr}
+    .hero{padding:26px 22px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <h1>FR3 Workstation 多策略训推与数据闭环 Roadmap</h1>
+    <p>目标：把 <code>src/lerobot/policies</code> 下的算法族，按「今天能训 / 补依赖能训 / 需要新数据契约」三档收敛到这台工作站上，并把真机 rollout 的失败回流成下一轮训练数据。</p>
+    <p>本文所有「现状」条目都在 2026-08-19 于工作站 <code>hph@192.168.100.155</code> 实测得到，不引用其他 rig 的经验值。前置文档：<a href="fr3_workstation_il_closed_loop_roadmap.html">fr3_workstation_il_closed_loop_roadmap.html</a>（ACT 单策略闭环，部分结论已过期，见下方「合同勘误」）、<a href="../tools/fr3/WORKSTATION_RECORDING.md">tools/fr3/WORKSTATION_RECORDING.md</a>（工具帧切换的实测依据）。</p>
+    <div class="meta">
+      <span class="pill">训练基线：eeframe_fr3_spacemouse_20260813_160401</span>
+      <span class="pill">20 ep / 10305 frames / 30 fps</span>
+      <span class="pill">tool frame: pika_gripper_ee</span>
+      <span class="pill">GPU: RTX 4090 24 GB</span>
+      <span class="pill">venv: .venv-fr3 (torch 2.10.0+cu128)</span>
+      <span class="pill">action: delta_ee_from_prev_cmd</span>
+      <span class="pill">闭环：离线飞轮先行</span>
+    </div>
+  </div>
+
+  <div class="grid">
+
+    <!-- ================= 合同勘误 ================= -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>合同勘误：工具帧已经切换完成</h2>
+        <span class="badge done">已冻结</span>
+      </div>
+      <p>前一版 roadmap 把 <code>pika_task_tcp</code> 写成 P0 合同。<b>该结论已过期</b>。工具帧切换在 <code>33681669</code>（2026-08-18）落地，全链路现已统一到 <code>pika_gripper_ee</code>：</p>
+      <div class="scroll">
+      <table class="table">
+        <tr><th>位置</th><th>当前值</th><th>核实方式</th></tr>
+        <tr><td><code>tools/fr3/fr3_record_config.yaml:17</code></td><td><code>pika_gripper_ee</code></td><td>读文件</td></tr>
+        <tr><td><code>tools/fr3/run_pick_place_infer_workstation.sh:55</code></td><td><code>pika_gripper_ee</code>（默认值）</td><td>读文件</td></tr>
+        <tr><td><code>gateway._fr3_target_frame_name</code> fallback</td><td><code>pika_gripper_ee</code></td><td>WORKSTATION_RECORDING.md:375</td></tr>
+        <tr><td><code>eeframe_fr3_spacemouse_20260813_160401</code></td><td><code>pika_gripper_ee</code>（已迁移）</td><td><code>meta/fr3_tool_frame.json</code></td></tr>
+        <tr><td><code>fr3_spacemouse_20260819_141951</code></td><td><code>pika_gripper_ee</code></td><td>FK keyframe 实测：<b>3.0 mm</b> vs task_tcp 409.4 mm</td></tr>
+        <tr><td><code>fr3_spacemouse_20260819_104902</code></td><td><code>pika_gripper_ee</code></td><td>FK keyframe 实测：<b>2.3 mm</b> vs task_tcp 411.0 mm</td></tr>
+      </table>
+      </div>
+      <div class="callout ok">
+        <b>结论：训练数据、录制配置、rollout 默认值三者已一致，无需任何迁移或显式传参。</b>
+        <code>pika_gripper_ee</code> 是几何上真正的工具点（URDF 实测 3.4 mm，<code>pika_task_tcp</code> 差 411.8 mm，见 WORKSTATION_RECORDING.md:285）。
+        只有在 rollout <em>2026-08-18 之前</em> 录制的、未迁移的数据集训练出的 checkpoint 时，才需要 <code>FR3_TARGET_FRAME_NAME=pika_task_tcp</code>。
+      </div>
+    </div>
+
+    <!-- ================= 事实基线 ================= -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>事实基线 A：数据资产盘点</h2>
+        <span class="badge done">2026-08-19 实测</span>
+      </div>
+      <div class="scroll">
+      <table class="table">
+        <tr><th>数据集</th><th>ep</th><th>frames</th><th>fps</th><th>action</th><th>tool frame</th><th>可训练性</th></tr>
+        <tr>
+          <td><code>eeframe_fr3_spacemouse_20260813_160401</code></td>
+          <td><b>20</b></td><td><b>10305</b></td><td>30</td><td>absolute EE [8]</td><td>pika_gripper_ee</td>
+          <td><span class="badge done">本轮基线</span> QC pass（8 pass / 0 warn / 0 fail），需先导 Training View</td>
+        </tr>
+        <tr>
+          <td><code>fr3_spacemouse_20260813_160401</code>（未迁移原始）</td>
+          <td>20</td><td>10305</td><td>30</td><td>absolute EE [8]</td><td>pika_task_tcp（无 marker）</td>
+          <td><span class="badge warn">勿用</span> 与 rollout 默认帧差 411 mm</td>
+        </tr>
+        <tr>
+          <td><code>fr3_spacemouse_20260819_104902</code></td>
+          <td>2</td><td>2242</td><td><b>60</b></td><td>absolute EE [8]</td><td>pika_gripper_ee</td>
+          <td><span class="badge warn">待降采样</span> 导出支持 <code>--view-fps 30</code> 后即可与基线合并</td>
+        </tr>
+        <tr>
+          <td><code>fr3_spacemouse_20260819_141951</code></td>
+          <td>1</td><td>875</td><td><b>60</b></td><td>absolute EE [8]</td><td>pika_gripper_ee</td>
+          <td><span class="badge warn">样本过少</span> 仅作 pipeline smoke</td>
+        </tr>
+        <tr class="sep"><td colspan="7">已导出的 Training View</td></tr>
+        <tr>
+          <td><code>…141951__delta_ee_from_prev_cmd</code>（最新导出）</td>
+          <td><b>1</b></td><td>875</td><td>60</td><td>delta_ee [7]</td><td>pika_gripper_ee</td>
+          <td><span class="badge p0">不可训</span> 单 episode，仅验证导出链路</td>
+        </tr>
+      </table>
+      </div>
+      <div class="callout p0">
+        <b>最新那份导出（<code>fr3_spacemouse_20260819_141951__delta_ee_from_prev_cmd</code>）本身质量很好，但只有 1 个 episode / 875 帧，不能用于训练。</b>
+        它的 delta 重建误差 <code>0.0 mm / 2.6e-11 deg</code>、GUI replay 验证 <code>passed</code>（avg 1.84 mm / max 5.81 mm，阈值 20 mm）——这些数字证明<em>导出与回放链路是对的</em>，而不是数据量够了。
+        本轮训练必须从 <code>eeframe_fr3_spacemouse_20260813_160401</code>（20 ep）重新导 Training View。
+      </div>
+      <h3>fps 契约：导出时统一降采样到 30 fps</h3>
+      <p>训练动作是 <code>delta_ee_from_prev_cmd</code>，即<b>每帧</b>位移。同一段真实速度下，30 fps 的每帧位移是 60 fps 的两倍。把 0813（30 fps）和 0819（60 fps）直接合并进一个 Training View，等于往动作分布里注入一个 2× 的双峰尺度因子，模型无从分辨。</p>
+      <p><b>解决方式不是拒绝合并，而是让导出支持指定帧率并对原始数据降采样，默认 30 fps。</b>录制端可以继续用 60 fps 采（时间分辨率更高、QC 的 timestamp_sync 更容易判），训练视图统一落到 30 fps，两批数据就此可合并。</p>
+      <div class="callout">
+        <b>为什么降采样几乎是免费的：</b>训练视图的 mp4 是<em>整段 symlink</em> 的，parquet 行通过 <code>from_timestamp</code>/<code>to_timestamp</code> 按时间戳定位视频帧（<code>fr3_train_il_policy.py:806</code>）。
+        所以「隔行抽取」不需要重编码视频——保留的行仍然指向 mp4 中正确的时刻，只是行间距变成了 1/30 s。只有在同时启用裁剪 / 缩放（已有 ffmpeg 路径，<code>:397</code>）时才会触发重编码。
+      </div>
+      <h3>降采样的实现约束</h3>
+      <ol>
+        <li><b>必须先抽帧、再求 delta。</b><code>derive_delta_action</code> 是对<em>相邻行</em>做差分。若先求 delta 再抽行，被丢弃的那些帧的位移会直接消失，轨迹会缩短一半；先抽行再求 delta，delta 才正确地跨越新的帧间隔。这是整个特性里唯一会静默出错的地方。</li>
+        <li><b>只接受整数抽取比。</b><code>source_fps % view_fps == 0</code>，60→30 抽 1/2、30→30 不动。60→25 这类非整数比需要插值重采样，应当直接报错而不是就近取帧。</li>
+        <li><b><code>timestamp</code> 保持原值，<code>frame_index</code>/<code>index</code> 重新编号。</b>保留行的原始时间戳本来就是 1/30 s 间距，改写反而会与 mp4 脱钩；而索引列必须连续，否则 <code>frame_continuity</code> 检查会失败。每 episode 的 <code>length</code> 同步更新。</li>
+        <li><b><code>stats.json</code> 重算而非换算。</b>与 <code>fr3_migrate_tool_frame.py</code> 同样的理由：分位数 q01..q99 没有闭式映射。</li>
+        <li><b><code>implied_p95_speed_mm_s</code> 必须用新 fps 计算。</b>否则这个字段会报出 2× 的速度。</li>
+      </ol>
+    </div>
+
+    <!-- ================= 环境基线 ================= -->
+    <div class="card">
+      <div class="section-head">
+        <h2>事实基线 B：<code>.venv-fr3</code> 依赖</h2>
+        <span class="badge warn">部分缺失</span>
+      </div>
+      <p class="small">实测方式：<code>PYTHONPATH=src:. .venv-fr3/bin/python -c "import &lt;mod&gt;"</code></p>
+      <div class="scroll">
+      <table class="table">
+        <tr><th>已装</th><th>缺失</th></tr>
+        <tr>
+          <td>
+            <span class="ok-mark">✓</span> torch 2.10.0+cu128<br>
+            <span class="ok-mark">✓</span> torchvision 0.25.0+cu128<br>
+            <span class="ok-mark">✓</span> accelerate 1.13.0<br>
+            <span class="ok-mark">✓</span> safetensors 0.7.0<br>
+            <span class="ok-mark">✓</span> datasets 4.7.0<br>
+            <span class="ok-mark">✓</span> draccus 0.8.0<br>
+            <span class="ok-mark">✓</span> wandb 0.24.2<br>
+            <span class="ok-mark">✓</span> pinocchio / placo / panda_py / pika
+          </td>
+          <td>
+            <span class="no-mark">✗</span> <code>transformers</code><br>
+            <span class="no-mark">✗</span> <code>peft</code><br>
+            <span class="no-mark">✗</span> <code>timm</code><br>
+            <span class="no-mark">✗</span> <code>num2words</code><br>
+            <span class="no-mark">✗</span> <code>torchdiffeq</code><br>
+            <span class="no-mark">✗</span> <code>dm-tree</code><br>
+            <span class="no-mark">✗</span> <code>decord</code><br>
+            <span class="no-mark">✗</span> <code>flash-attn</code><br>
+            <span class="no-mark">✗</span> <code>qwen-vl-utils</code><br>
+            <span class="no-mark">✗</span> <code>scipy</code>
+          </td>
+        </tr>
+      </table>
+      </div>
+      <p>根因在 <a href="../tools/fr3/setup_workstation_teleop_env.sh">setup_workstation_teleop_env.sh</a>：它只 sync <code>--extra fr3-workstation-teleop --extra fr3-host</code>，这两个 extra 都不含任何 <em>policy</em> extra（<code>pi</code> / <code>smolvla</code> / <code>groot</code> / <code>wallx</code> / <code>xvla</code> / <code>sarm</code> / <code>hilserl</code>）。</p>
+      <p class="small">GPU：RTX 4090 24 GB，driver 580.173.02，<code>torch.cuda.is_available() == True</code>。</p>
+    </div>
+
+    <!-- ================= 策略可用性 ================= -->
+    <div class="card">
+      <div class="section-head">
+        <h2>事实基线 C：策略导入实测</h2>
+        <span class="badge warn">3 个直接失败</span>
+      </div>
+      <p class="small">实测方式：<code>get_policy_class(name)</code> 逐个调用</p>
+      <div class="scroll">
+      <table class="table">
+        <tr><th>策略</th><th>类导入</th><th>备注</th></tr>
+        <tr><td><code>act</code></td><td><span class="ok-mark">OK</span></td><td>chunk_size 100</td></tr>
+        <tr><td><code>diffusion</code></td><td><span class="ok-mark">OK</span></td><td>—</td></tr>
+        <tr><td><code>vqbet</code></td><td><span class="ok-mark">OK</span></td><td>chunk_size 5</td></tr>
+        <tr><td><code>tdmpc</code></td><td><span class="ok-mark">OK</span></td><td>需环境模型，见 Tier C</td></tr>
+        <tr><td><code>sac</code> / <code>reward_classifier</code></td><td><span class="ok-mark">OK</span></td><td>在线 RL，需 env + reward</td></tr>
+        <tr><td><code>pi0</code> / <code>pi0_fast</code> / <code>pi05</code></td><td><span class="warn badge">类 OK</span></td><td><b>延迟导入 transformers</b>，构建时才失败</td></tr>
+        <tr><td><code>groot</code></td><td><span class="warn badge">类 OK</span></td><td>同上，另需 timm / dm-tree / flash-attn</td></tr>
+        <tr><td><code>sarm</code></td><td><span class="warn badge">类 OK</span></td><td>同上，reward model 非动作策略</td></tr>
+        <tr><td><code>smolvla</code></td><td><span class="no-mark">FAIL</span></td><td><code>No module named 'transformers'</code></td></tr>
+        <tr><td><code>xvla</code></td><td><span class="no-mark">FAIL</span></td><td>顶层 import transformers ×6</td></tr>
+        <tr><td><code>wall_x</code></td><td><span class="no-mark">FAIL</span></td><td><code>No module named 'peft'</code></td></tr>
+      </table>
+      </div>
+      <div class="callout warn">
+        <code>pi0</code> / <code>pi05</code> / <code>groot</code> / <code>sarm</code> 的<b>类导入成功是假象</b>——它们在 <code>modeling_*.py</code> 顶层没有 <code>import transformers</code>，而是在构建 backbone 时才导入。装依赖之前不要把「导入通过」当成「可训练」。
+      </div>
+    </div>
+
+    <!-- ================= 策略分层 ================= -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>策略分层：三档收敛</h2>
+        <span class="badge todo">核心视图</span>
+      </div>
+
+      <h3>Tier A — 今天就能训（零依赖变更）</h3>
+      <div class="scroll">
+      <table class="table">
+        <tr><th>策略</th><th>数据契约</th><th>与当前数据的匹配</th><th>建议</th></tr>
+        <tr>
+          <td><b><code>act</code></b></td>
+          <td>images + state → action chunk</td>
+          <td><span class="ok-mark">完全匹配</span> state[16] + 2 cam + action[7]</td>
+          <td><span class="badge p0">首选基线</span>导出的 <code>train_config.generated.json</code> 已经默认 act，chunk 30 / n_action_steps 30</td>
+        </tr>
+        <tr>
+          <td><b><code>diffusion</code></b></td>
+          <td>同上，需 <code>n_obs_steps</code> 历史帧</td>
+          <td><span class="ok-mark">匹配</span></td>
+          <td><span class="badge warn">P1 对照组</span><code>fr3_train_il_policy.py --policy diffusion</code> 已支持</td>
+        </tr>
+        <tr>
+          <td><code>vqbet</code></td>
+          <td>需先训 residual VQ tokenizer（<code>lerobot-train-tokenizer</code>）</td>
+          <td><span class="ok-mark">匹配</span>但 chunk_size 默认仅 5</td>
+          <td><span class="badge todo">P2</span>两阶段训练，先跑通 Tier A 前两个再说</td>
+        </tr>
+      </table>
+      </div>
+
+      <h3>Tier B — 补依赖后能训（VLA 族）</h3>
+      <div class="scroll">
+      <table class="table">
+        <tr><th>策略</th><th>缺的依赖</th><th>预训练权重</th><th>额外数据要求</th><th>优先级</th></tr>
+        <tr>
+          <td><b><code>smolvla</code></b></td>
+          <td><code>transformers</code>, <code>num2words</code></td>
+          <td><code>lerobot/smolvla_base</code><br>backbone <code>HuggingFaceTB/SmolVLM2-500M-Video-Instruct</code></td>
+          <td>需要 task 语言指令</td>
+          <td><span class="badge warn">P2 首选 VLA</span>参数量最小，24 GB 最稳</td>
+        </tr>
+        <tr>
+          <td><code>pi0</code> / <code>pi05</code></td>
+          <td><code>transformers</code>, <code>scipy</code></td>
+          <td><code>google/paligemma-3b-pt-224</code></td>
+          <td>需要 task 语言指令</td>
+          <td><span class="badge todo">P2</span>3B backbone，24 GB 下需 bf16 + 小 batch，显存待实测</td>
+        </tr>
+        <tr>
+          <td><code>pi0_fast</code></td>
+          <td>同上</td>
+          <td>同上 + FAST action tokenizer</td>
+          <td>同上</td>
+          <td><span class="badge todo">P3</span></td>
+        </tr>
+        <tr>
+          <td><code>xvla</code></td>
+          <td><code>transformers</code></td>
+          <td><code>facebook/bart-large</code> tokenizer</td>
+          <td>—</td>
+          <td><span class="badge todo">P3</span></td>
+        </tr>
+        <tr>
+          <td><code>groot</code></td>
+          <td><code>transformers</code>, <code>peft</code>, <code>timm</code>, <code>dm-tree</code>, <code>decord</code>, <code>flash-attn</code></td>
+          <td><code>nvidia/GR00T-N1.5-3B</code></td>
+          <td>需要 task 语言指令 + embodiment tag</td>
+          <td><span class="badge todo">P3</span><code>flash-attn</code> 需编译，装机成本最高</td>
+        </tr>
+        <tr>
+          <td><code>wall_x</code></td>
+          <td><code>transformers</code>, <code>peft</code>, <code>scipy</code>, <code>torchdiffeq</code>, <code>qwen-vl-utils</code></td>
+          <td>Qwen-VL 系</td>
+          <td>语言依赖最重（配置里 5 处 lang 引用）</td>
+          <td><span class="badge todo">P3</span></td>
+        </tr>
+      </table>
+      </div>
+      <div class="callout warn">
+        <b>Tier B 共同的数据缺口：语言标注。</b>当前两个候选数据集的 <code>meta/tasks.parquet</code> 都只有<b>一条</b> task：<code>"Pick and place"</code>。
+        单一指令下 VLA 的语言通道退化成常量，等于花 3B 参数训一个 ACT。要让 Tier B 有意义，得先有多任务 / 多指令的采集计划——这是数据侧的事，不是训练侧的事。
+      </div>
+
+      <h3>Tier C — 需要新数据契约或新环境</h3>
+      <div class="scroll">
+      <table class="table">
+        <tr><th>策略</th><th>缺的不是依赖，是什么</th><th>优先级</th></tr>
+        <tr>
+          <td><code>sac</code> / <code>hilserl</code></td>
+          <td>需要 reward 定义 + 可交互 env（<code>src/lerobot/rl/</code> 的 actor/learner 已实现，但未接 FR3）+ <code>grpcio</code> / <code>gym-hil</code>。属于在线学习，见 Phase 5。</td>
+          <td><span class="badge todo">P3</span></td>
+        </tr>
+        <tr>
+          <td><code>sarm</code> / <code>reward_classifier</code></td>
+          <td>reward model，需要带成功/失败标注的数据。当前 QC 只判「录制质量」，不判「任务成败」。</td>
+          <td><span class="badge todo">P3</span>数据闭环成熟后才有价值</td>
+        </tr>
+        <tr>
+          <td><code>tdmpc</code></td>
+          <td>model-based，为在线 / sim 交互设计。纯离线 demo 数据上不是它的主场。</td>
+          <td><span class="badge todo">P4</span>暂不投入</td>
+        </tr>
+      </table>
+      </div>
+    </div>
+
+    <!-- ================= 阻塞项 ================= -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>P0 阻塞项：训练跑起来之前必须修</h2>
+        <span class="badge p0">先做</span>
+      </div>
+      <div class="scroll">
+      <table class="table">
+        <tr><th>#</th><th>问题</th><th>代码落点</th><th>影响</th></tr>
+        <tr>
+          <td>1</td>
+          <td><b>训练入口只支持两种策略。</b><code>--policy</code> 的 choices 硬编码为 <code>["act","diffusion"]</code>，其余 12 种无法通过这个脚本训练。</td>
+          <td><code>tools/fr3/fr3_train_il_policy.py:1230</code></td>
+          <td>阻塞 Tier A 的 vqbet 与全部 Tier B</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td><b>训练数据只有 1 个 episode。</b>最新 Training View 不可训。</td>
+          <td>GUI Dataset Processing → Training View，源改为 <code>eeframe_fr3_spacemouse_20260813_160401</code></td>
+          <td>阻塞一切训练</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td><b>生成的推理配置指向错误的相机。</b>导出的 <code>inference_config.generated.yaml</code> 写死 <code>camera_config: tools/fr3/fr3_il_infer_hikrobot_camera_config.yaml</code>，而本机是 RealSense。</td>
+          <td><code>tools/fr3/fr3_train_il_policy.py:1093</code></td>
+          <td>按生成配置部署会找错相机；<code>run_pick_place_infer_workstation.sh:39</code> 的默认值是对的（realsense），所以走脚本不受影响——这正是隐患：两条路给出不同答案</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td><b>生成的推理配置写错机器人 IP。</b><code>robot_ip: 192.168.1.208</code>，本机 FR3 是 <code>192.168.1.206</code>。</td>
+          <td><code>tools/data_collection_gui/gateway.py:70</code> <code>DEFAULT_REAL_ROBOT_IP</code></td>
+          <td>同上：<code>fr3_record_config.yaml:3</code> 与 gateway 第 7986 行的提示串都是 .206，只有这个常量是 .208</td>
+        </tr>
+        <tr>
+          <td>5</td>
+          <td><b>导出不支持指定帧率。</b>Training View 原样继承源数据 fps，30 fps 与 60 fps 的数据既不能合并，也没有统一手段。</td>
+          <td><code>tools/fr3/fr3_train_il_policy.py</code>（新增 <code>--view-fps</code>，默认 30）→ <code>gateway._training_view_command()</code> → 前端 Training View 行</td>
+          <td>阻塞跨 session 数据合并；直接合并会静默污染动作尺度</td>
+        </tr>
+      </table>
+      </div>
+      <div class="callout p0">
+        第 3 与第 4 条是同一类缺陷：<b>同一份事实有两个来源，且它们不一致。</b>
+        rollout 脚本的默认值是对的，导出的「生成配置」是错的。任何按生成配置办事的人（或脚本）都会拿到错误的相机和 IP，而且不会报错——相机会打不开（能发现），IP 会连不上（能发现），
+        但如果 .208 上恰好有台机器，就变成了最坏情况。修复方向是让生成配置从 <code>fr3_record_config.yaml</code> 派生，而不是各自持有默认值。
+      </div>
+    </div>
+
+    <!-- ================= TODO 优先级总表 ================= -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>TODO 优先级总表</h2>
+        <span class="badge todo">执行清单</span>
+      </div>
+      <div class="scroll">
+      <table class="table">
+        <tr><th>优先级</th><th>任务</th><th>代码落点</th><th>验收标准</th></tr>
+
+        <tr class="sep"><td colspan="4">P0 — 让第一个 checkpoint 存在</td></tr>
+        <tr>
+          <td><span class="badge p0">P0-1</span> <span class="badge done">已完成</span></td>
+          <td>从 <code>eeframe_fr3_spacemouse_20260813_160401</code> 导出 <code>delta_ee_from_prev_cmd</code> Training View</td>
+          <td>GUI Dataset Processing / <code>gateway._start_training_view()</code></td>
+          <td><code>il_view_manifest.json</code> 显示 <code>total_episodes: 20</code>、<code>total_rows: 10305</code>、<code>reconstruction_max_position_error_mm</code> ≈ 0<br><span class="small">2026-08-19 实测：<code>total_episodes 20</code> / <code>total_rows 10305</code> / <code>fps 30</code>；位置重建误差 <b>0.0 mm</b>、旋转 2.6e-11 deg；p95 每帧位移 2.927 mm（87.8 mm/s）</span></td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0-2</span> <span class="badge done">已完成</span></td>
+          <td>训练入口泛化到全部 policy type</td>
+          <td><code>tools/fr3/fr3_train_il_policy.py:1230</code>；或改为薄封装直接调 <code>lerobot-train</code>（<code>src/lerobot/scripts/lerobot_train.py</code>，draccus 已支持任意 policy）</td>
+          <td><code>--policy smolvla</code> 能走到「缺依赖」而不是「argparse 拒绝」<br><span class="small">2026-08-19 实测：报 <code>ModuleNotFoundError: No module named 'transformers'</code>，即已抵达构建 backbone 这一步。只有 act / diffusion 带本机调好的默认值，其余策略走各自 dataclass 默认值，靠 <code>--policy-config</code>（JSON）覆盖；<code>--smoke</code> 现在对<em>任意</em>策略都跑一次真实 forward，而不再只对 act 跑。</span></td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0-3</span> <span class="badge done">已完成</span></td>
+          <td>生成配置改为从 <code>fr3_record_config.yaml</code> 派生相机与 robot_ip</td>
+          <td><code>fr3_train_il_policy.py:1093</code>、<code>gateway.py:70</code></td>
+          <td>生成的 yaml 中 <code>camera_config</code> 为 realsense、<code>robot_ip</code> 为 <code>192.168.1.206</code>；与 <code>run_pick_place_infer_workstation.sh</code> 的默认值逐字段一致<br><span class="small">2026-08-19 实测：三项逐字段一致（<code>fr3_il_infer_realsense_camera_config.yaml</code> / <code>192.168.1.206</code> / <code>pika_gripper_ee</code>）。相机文件是<em>按相机身份匹配</em>选出来的（type + serial 与录制配置比对），匹配不上就写 <code>null</code> 并告警——一个会在部署时大声失败的 null，比一个安静走错的默认值值钱。<code>gateway.DEFAULT_REAL_ROBOT_IP</code>（<code>.208</code>，DAS 那台的地址）已删除，profile 不声明机器人就直接报错。</span></td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0-4</span> <span class="badge done">已完成</span></td>
+          <td><b>导出支持指定帧率并对原始数据降采样，默认 30 fps</b><br>
+              <span class="small">抽帧在求 delta <em>之前</em>；仅接受整数抽取比；mp4 不重编码；stats 重算；index 重编号</span></td>
+          <td><code>fr3_train_il_policy.py</code> 加 <code>--view-fps</code>（default 30）<br>
+              <code>gateway._training_view_command()</code> 透传<br>
+              前端 Training View 行加帧率选择器</td>
+          <td>60 fps 源导出后 <code>info.json.fps == 30</code>、行数减半、<code>frame_continuity</code> 通过、GUI replay 验证仍 passed；<code>il_view_manifest.json</code> 记录 <code>source_fps</code> / <code>view_fps</code> / <code>stride</code>；非整数比报错<br><span class="small">2026-08-19 用 <code>fr3_spacemouse_20260819_104902</code>（60 fps / 2242 帧）实测：<code>fps 30</code>、<b>1121 行</b>（2242 → 减半）、每 episode <code>frame_index</code> 连续、全局 <code>index</code> 稠密、时间戳间距 0.033333–0.033335 s（保留原值，未改写）、mp4 仍是 symlink（未重编码）、<code>frame_stride 2</code> / <code>source_fps 60</code> 入 manifest。关键一项：降采样后 p95 每帧位移 2.790 mm ≈ 83.7 mm/s，与 30 fps 基线的 2.927 mm ≈ 87.8 mm/s 同量级——这正是「两批数据可以合并」的证据；若直接合并，60 fps 那批的每帧 delta 只有基线的一半。前端 Training View 页已加帧率选择器（30 / 15 / 60 / 源帧率），并在<em>点击之前</em>就对非整数比（如 60 → 25）禁用按钮并说明原因。</span></td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0-5</span> <span class="badge warn">训练已跑通 / rollout 待人工</span></td>
+          <td>ACT 基线训练并跑完 <code>smoke → preview → real_once</code></td>
+          <td><code>run_pick_place_infer_workstation.sh</code></td>
+          <td>首帧对齐 ≤ 20 mm / 8 deg；每步 ≤ 3 mm / 2 deg；gripper 归一化正确；全程可追溯<br><span class="small">训练侧已跑通：ACT smoke forward loss 77.18（l1 0.406 / kld 7.68），20000 步基线经 Training 页启动并训完。<b>真机四段式（smoke → preview → real_debug → real_once）会驱动实际机械臂，需要人在 rig 前执行，未代跑。</b></span></td>
+        </tr>
+
+        <tr class="sep"><td colspan="4">P1 — 让结果可信</td></tr>
+        <tr>
+          <td><span class="badge warn">P1-1</span></td>
+          <td>接入离线评测，训练完先离线判，再上真机</td>
+          <td><code>src/lerobot/scripts/lerobot_eval_offline.py</code>（已存在 <code>lerobot-eval-offline</code>）、<code>docs/lerobot_eval_offline.md</code></td>
+          <td>每个 checkpoint 产出离线动作误差报告，作为上真机的 gate</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1-2</span></td>
+          <td>Diffusion Policy 对照组，与 ACT 同数据同 seed</td>
+          <td><code>fr3_train_il_policy.py --policy diffusion</code></td>
+          <td>两条曲线可比；差异能归因到策略而非数据</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1-3</span></td>
+          <td>把 fps / tool frame / action contract 写进 checkpoint metadata，rollout 启动时校验</td>
+          <td><code>fr3_act_infer_real_runtime.py</code> preflight</td>
+          <td>frame 或 fps 不匹配时 fail fast，而不是跑偏 411 mm</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1-4</span></td>
+          <td>标注旧 roadmap 已过期的 <code>pika_task_tcp</code> 段落</td>
+          <td><code>docs/fr3_workstation_il_closed_loop_roadmap.html</code></td>
+          <td>不再有两份文档给出冲突的帧合同</td>
+        </tr>
+
+        <tr class="sep"><td colspan="4">P2 — 打开 VLA 这条线</td></tr>
+        <tr>
+          <td><span class="badge todo">P2-1</span></td>
+          <td>env 脚本增加 policy extras（可选开关，默认不装以免拖慢 teleop 装机）</td>
+          <td><code>tools/fr3/setup_workstation_teleop_env.sh</code>：<code>INSTALL_POLICY_DEPS=1</code> → <code>--extra pi --extra smolvla</code> …</td>
+          <td><code>import transformers, peft, timm</code> 全通过；teleop 装机路径不受影响</td>
+        </tr>
+        <tr>
+          <td><span class="badge todo">P2-2</span></td>
+          <td>多任务 / 多指令采集计划（VLA 前置）</td>
+          <td>录制侧 task 标注；<code>meta/tasks.parquet</code></td>
+          <td>task 数 &gt; 1 且与视觉场景真实对应，而非同一动作换个说法</td>
+        </tr>
+        <tr>
+          <td><span class="badge todo">P2-3</span></td>
+          <td>SmolVLA 微调（Tier B 首选，参数量最小）</td>
+          <td><code>lerobot/smolvla_base</code></td>
+          <td>24 GB 下 batch/显存实测记录成表；与 ACT 基线可比</td>
+        </tr>
+        <tr>
+          <td><span class="badge todo">P2-4</span></td>
+          <td>VQ-BeT 两阶段训练</td>
+          <td><code>lerobot-train-tokenizer</code> → <code>lerobot-train</code></td>
+          <td>tokenizer 与 policy 两阶段产物都可复现</td>
+        </tr>
+
+        <tr class="sep"><td colspan="4">P3 — 数据闭环与在线学习</td></tr>
+        <tr>
+          <td><span class="badge todo">P3-1</span></td>
+          <td>离线飞轮 SOP：失败 rollout → 定向补采 → QC → 重导 → 重训</td>
+          <td>复用现有 QC gate，无需新代码</td>
+          <td>一轮完整飞轮跑通并留下记录</td>
+        </tr>
+        <tr>
+          <td><span class="badge todo">P3-2</span></td>
+          <td>π0 / π0.5 微调</td>
+          <td><code>google/paligemma-3b-pt-224</code></td>
+          <td>3B 在 24 GB 上的可行配置被确定并记录</td>
+        </tr>
+        <tr>
+          <td><span class="badge todo">P3-3</span></td>
+          <td>DAgger：SpaceMouse 接管 + 接管段标注回流</td>
+          <td>复用 <code>src/lerobot/processor/hil_processor.py</code>、<code>src/lerobot/rl/gym_manipulator.py</code> 的 intervention 实现，接到 FR3 rollout 控制环</td>
+          <td>接管切换轨迹连续、接管段被标记、回流数据走同一 QC</td>
+        </tr>
+        <tr>
+          <td><span class="badge todo">P3-4</span></td>
+          <td>GR00T / X-VLA / Wall-X / HIL-SERL</td>
+          <td>依赖与权重成本最高，排在最后</td>
+          <td>—</td>
+        </tr>
+      </table>
+      </div>
+    </div>
+
+    <!-- ================= Training 页 ================= -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>GUI Training 页：训练机、增量同步、W&amp;B</h2>
+        <span class="badge done">2026-08-19 落地</span>
+      </div>
+
+      <p>
+        训练和录制的约束不一样：录制被绑死在机械臂那台机器上，训练不是——常见答案是「另一张桌子上的 4090」。
+        所以 Training 页把「在哪训」做成一个显式选择，而不是隐含地等于 gateway 所在的机器。
+      </p>
+
+      <table class="table">
+        <tr><th>能力</th><th>落点</th><th>合同</th></tr>
+        <tr>
+          <td>选训练机</td>
+          <td><code>tools/data_collection_gui/training.py</code><br><code>GET/POST /api/training/hosts*</code></td>
+          <td>默认当前 host；远端写成 <code>user@ip</code> + 绝对仓库路径。
+              这两个字符串会被拼进 ssh 命令，所以格式不合就<em>拒绝</em>而不是转义——
+              存储里已损坏的条目在读取时直接丢弃，不会变成一条 ssh 命令。</td>
+        </tr>
+        <tr>
+          <td>增量同步代码</td>
+          <td><code>run/sync_to_target.sh</code>（新增 <code>user@host</code> 目标 + <code>REMOTE_DIR</code>）</td>
+          <td>复用 deploy 的同一份 exclude 列表——这份列表正是「同步不会删掉目标机的 .venv-fr3 和 outputs/」的唯一定义，
+              不能有第二份。远端起训前<em>自动</em>先同步：否则「我刚修好导出器」和「我刚启动的训练」说的是两份代码，而且没人会告诉你。
+              <br><span class="small">2026-08-19 实测（本机 → 工作站的一个全新目录）：首次 2454 个文件、第二次 0 个、改动一个文件后 1 个；
+              <code>.venv*</code> / <code>outputs/</code> / <code>.git</code> / <code>node_modules</code> 均未落地。</span></td>
+        </tr>
+        <tr>
+          <td>显示机器信息</td>
+          <td><code>tools/fr3/probe_training_machine.py</code><br><code>GET /api/training/machine</code></td>
+          <td>只用标准库，且远端是把脚本<em>喂给 stdin</em> 执行的——它要回答的问题包括「那台机器上到底有没有这个仓库」，
+              所以不能假设仓库已经在那儿。报告 GPU（型号 / 显存 / 利用率 / 温度 / 驱动）、torch + CUDA、磁盘、
+              以及<em>每个策略缺哪些包</em>。没有 torch 时所有策略都判为不可训——act / diffusion 不需要额外依赖，
+              不这样折算的话，一台刚同步完代码、环境还没装的机器会被报成「可以训 act」。</td>
+        </tr>
+        <tr>
+          <td>W&amp;B API key</td>
+          <td><code>~/.config/lerobot-gui/wandb_&lt;host&gt;.key</code><br><code>GET/POST /api/training/wandb</code></td>
+          <td>按机器分别存，0600，<em>不回传给浏览器</em>（只回 <code>configured</code> 和后四位），
+              也<em>不进命令行</em>——本机走子进程环境变量，远端由一次单独的 ssh 经 stdin 写成对面的 0600 文件。
+              命令行参数在目标机上是全体用户可读的。</td>
+        </tr>
+      </table>
+
+      <div class="callout p0">
+        <b>两个只有真跑起来才会暴露的坑，已修：</b>
+        <ul>
+          <li>
+            <b>训练进程原本会被 deploy 杀掉。</b>gateway 用 <code>stdout=PIPE</code> 拉训练输出，于是 gateway 一死、读端一关，
+            训练进程写下一行就吃 SIGPIPE。而 <code>run/deploy.sh</code> 每次都会重启 gateway——20000 步的任务实测在第 6000 步被这样杀掉。
+            现在训练进程<em>直接写日志文件</em>，gateway 只是这个文件的读者；gateway 重启后从
+            <code>outputs/logs/training/current_run.json</code> 认领回这个 run，继续 tail 同一个文件。
+            实测：重启 gateway 前后 pid 不变（2223337），step 从 2661 走到 3133，GPU 94%。
+            <br><span class="small">认领回来的 run 没有 Popen 对象，所以「停止」按 pid 杀进程组，
+            「是否已有任务在跑」也必须看 pid——否则重启后可以再起一个，两个 ACT 挤同一张 24 GB 卡，谁都活不下来。</span>
+          </li>
+          <li>
+            <b>进度条读数原本是错的。</b>lerobot 的日志行用 <code>format_big_number</code> 打步数，第 1300 步印成 <code>step:1K</code>，
+            按字面读就是 1。页面会卡在个位数一千步再跳一次。现在<em>步数取自 tqdm 那一栏的精确计数</em>
+            （<code>1300/20000</code>），loss 仍取自日志行——它只在那儿出现。
+            纯进度条不进可见日志（一秒十三条，会把真正的日志行冲干净），但仍然参与进度解析。
+          </li>
+        </ul>
+      </div>
+
+      <p class="small">
+        训练不再从 <code>--dataset-root</code> 重建 view：新增 <code>--skip-prepare</code>，直接训一个已经建好并过了 QC 的 view，
+        相机 / state / action 契约一律取自该 view 的 manifest。这既是远端训练机可行的前提（那台机器只有 view，没有原始录制），
+        也避免了对一份 action 已经是 delta 的数据再求一次 delta。
+        生成的两份配置写在 <code>&lt;view&gt;/runs/&lt;job&gt;/</code> 下——同一个 view 会被不同策略、不同步数反复训练，
+        写到 view 根目录会让那里的 inference config 指向最后一个 job 的 checkpoint；
+        写到训练输出目录则更糟：<code>lerobot_train</code> 见到输出目录已存在且不是 resume 就拒绝启动。
+      </p>
+    </div>
+
+    <!-- ================= Phase ================= -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>执行顺序</h2>
+        <span class="badge todo">Phase</span>
+      </div>
+
+      <div class="phase">
+        <div class="name">Phase 0<br><span class="small">数据就位</span></div>
+        <div>
+          <ul>
+            <li>确认 <code>eeframe_fr3_spacemouse_20260813_160401</code> 的 QC 仍为 pass（<code>meta/processing.json</code> 已记录 8 pass / 0 warn / 0 fail）。</li>
+            <li>从它导出 <code>delta_ee_from_prev_cmd</code> Training View，得到 20 ep / 10305 帧。</li>
+            <li>核对 <code>il_view_manifest.json</code> 的 <code>delta_transform</code> 重建误差与 per-frame scale。</li>
+          </ul>
+        </div>
+        <div class="gate"><b>Gate</b><br>manifest 的 <code>total_episodes = 20</code>；重建位置误差 ≈ 0；<code>excluded_episodes</code> 明确。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">Phase 1<br><span class="small">修 P0 缺陷</span></div>
+        <div>
+          <ul>
+            <li>训练入口泛化（P0-2）。</li>
+            <li>生成配置的相机 / IP 改为派生（P0-3）。</li>
+            <li>导出加 <code>--view-fps</code> 降采样，默认 30（P0-4）。</li>
+          </ul>
+        </div>
+        <div class="gate"><b>Gate</b><br>生成配置与 rollout 脚本默认值逐字段一致；<code>--policy</code> 不再是白名单。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">Phase 2<br><span class="small">ACT 基线闭环</span></div>
+        <div>
+          <ul>
+            <li>训 ACT，离线评测先判（P1-1），再 <code>smoke</code> → <code>preview</code> → <code>real_debug</code> → <code>real_once</code>。</li>
+            <li>Diffusion 同数据同 seed 做对照（P1-2）。</li>
+            <li>rollout preflight 校验 frame / fps / action contract（P1-3）。</li>
+          </ul>
+        </div>
+        <div class="gate"><b>Gate</b><br>至少一个 checkpoint 通过 bounded rollout 并可重复；失败能归因到单一模块。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">Phase 3<br><span class="small">离线飞轮</span></div>
+        <div>
+          <ul>
+            <li>把 Phase 2 的失败 case 分类（视觉滞后 / 首帧对齐 / IK 不可达 / gripper 时序 / policy 抖动）。</li>
+            <li>按失败类型<b>定向</b>补采，而不是无差别多采——这是飞轮相对于「再多采一点」的唯一优势。</li>
+            <li>新 session 走同一 QC → 以 <code>--view-fps 30</code> 导出并合并进 Training View → 重训 → 复评。60 fps 采集的新数据在此自动对齐到基线。</li>
+          </ul>
+        </div>
+        <div class="gate"><b>Gate</b><br>一轮飞轮闭合，且新 checkpoint 在原失败 case 上有可测量的改善。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">Phase 4<br><span class="small">VLA 扩展</span></div>
+        <div>
+          <ul>
+            <li>装 policy extras（P2-1），先 SmolVLA（P2-3）。</li>
+            <li>多任务采集（P2-2）——没有这个，VLA 的语言通道是常量。</li>
+            <li>显存 / batch / 吞吐实测入表，只记本机数据。</li>
+          </ul>
+        </div>
+        <div class="gate"><b>Gate</b><br>SmolVLA 在同一 Training View 上完成训练并通过离线评测；与 ACT 基线可比。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">Phase 5<br><span class="small">DAgger / 在线</span></div>
+        <div>
+          <ul>
+            <li>把 <code>hil_processor.py</code> / <code>gym_manipulator.py</code> 的 intervention 接到 FR3 rollout 控制环。</li>
+            <li>接管段自动标记为高价值样本，回流走同一 QC。</li>
+            <li>再往后才谈 reward model（sarm）与在线 RL（sac / hilserl）。</li>
+          </ul>
+        </div>
+        <div class="gate"><b>Gate</b><br>接管切换不产生轨迹跳变；接管数据在 manifest 中可区分于常规演示。</div>
+      </div>
+
+      <div class="callout">
+        <b>为什么 DAgger 排在 Phase 5 而不是更早：</b>DAgger 的价值是「用专家纠正 policy <em>自己走到的</em> state 分布」，前提是已有能跑出有意义 rollout 的 checkpoint。
+        Phase 2 之前没有这样的 checkpoint，此时开 DAgger 只会退化成普通遥操作采集，却要付出改造控制环的代价。
+        反过来说，一旦 Phase 2 完成，DAgger 的边际收益会明显超过离线补采——20 episodes 的 BC 几乎必然存在 distribution shift。
+      </div>
+    </div>
+
+    <!-- ================= 数据流 ================= -->
+    <div class="card">
+      <div class="section-head">
+        <h2>端到端数据流</h2>
+        <span class="badge todo">合同视图</span>
+      </div>
+      <div class="flow">Record session
+  FR3 192.168.1.206 / Pika / RealSense ee+side
+  target_frame_name = pika_gripper_ee
+  action = absolute EE[8] + gripper.pos
+        |
+        v
+Dataset Processing / QC
+  timestamp_sync + schema + frame_continuity
+  + ee_continuity + quat_norm + replay
+  只有 qc_pass 或确认过的 qc_warn 才放行
+        |
+        v
+Training View  (delta_ee_from_prev_cmd)
+  action[7] = d(xyz) + d(rpy) + gripper.pos
+  state[16] = ee + prev_cmd(ee) + gripper
+  il_view_manifest.json 记录来源与重建误差
+  ★ --view-fps 降采样，默认 30 fps
+    (先抽帧，后求 delta)
+        |
+        v
+Train  (Tier A: act/diffusion/vqbet
+        Tier B: smolvla/pi0/pi05/…)
+  checkpoint 需回写 frame / fps / action contract
+        |
+        v
+Offline eval   lerobot-eval-offline
+        |
+        v
+Rollout
+  home keyframe start
+  IK target = pika_gripper_ee   ← 与数据同帧
+  gripper 单位按 feature name
+        |
+        v
+失败 case 分类 ──────┐
+                     └──> 定向补采（回到最上）</div>
+    </div>
+
+    <!-- ================= 命令 ================= -->
+    <div class="card">
+      <div class="section-head">
+        <h2>命令速查</h2>
+        <span class="badge todo">Operator Path</span>
+      </div>
+      <div class="flow"># 部署（本机执行，同步 + 重启 gateway + 起前端）
+bash run/deploy.sh workstation
+
+# 导出 Training View（降采样到 30 fps，P0-4 落地后）
+PYTHONPATH=src:. .venv-fr3/bin/python \
+  tools/fr3/fr3_train_il_policy.py \
+    --dataset-root outputs/datasets/eeframe_fr3_spacemouse_20260813_160401 \
+    --action-mode delta_ee_from_prev_cmd --view-fps 30 --prepare-only
+
+# 训练（工作站，.venv-fr3）
+VIEW=outputs/exports/training_views/&lt;view&gt;
+PYTHONPATH=src:. .venv-fr3/bin/python \
+  tools/fr3/fr3_train_il_policy.py --policy act ...
+
+# 泛化后可直接用通用入口（支持全部 policy）
+PYTHONPATH=src:. .venv-fr3/bin/lerobot-train \
+  --config_path $VIEW/train_config.generated.json
+
+# 离线评测（上真机之前的 gate）
+PYTHONPATH=src:. .venv-fr3/bin/lerobot-eval-offline ...
+
+# 真机四段式
+CKPT=outputs/train/&lt;job&gt;/checkpoints/last
+FR3_INFER_CHECKPOINT=$CKPT bash tools/fr3/run_pick_place_infer_workstation.sh smoke
+FR3_INFER_CHECKPOINT=$CKPT bash tools/fr3/run_pick_place_infer_workstation.sh preview
+FR3_INFER_CHECKPOINT=$CKPT bash tools/fr3/run_pick_place_infer_workstation.sh real_debug
+FR3_INFER_CHECKPOINT=$CKPT bash tools/fr3/run_pick_place_infer_workstation.sh real_once
+
+# 只有训练自 2026-08-18 之前未迁移数据的 checkpoint 才需要：
+# FR3_TARGET_FRAME_NAME=pika_task_tcp</div>
+      <p class="small">工具帧迁移（仅用于 pre-switch 数据，一次一个数据集，目标路径必须是新目录）：<br>
+      <code>.venv-fr3/bin/python tools/fr3/fr3_migrate_tool_frame.py --src &lt;old&gt; --dst &lt;new&gt; --dry-run</code></p>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>

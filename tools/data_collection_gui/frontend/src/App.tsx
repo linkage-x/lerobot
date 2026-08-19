@@ -14,6 +14,7 @@ import { EpisodeReplayPage } from "./pages/EpisodeReplayPage";
 import { DatasetProcessingPage } from "./pages/DatasetProcessingPage";
 import { QcReportPage } from "./pages/QcReportPage";
 import { DatasetExportPage } from "./pages/DatasetExportPage";
+import { TrainingPage } from "./pages/TrainingPage";
 import { TaskLibraryPage } from "./pages/TaskLibraryPage";
 import { DeviceManagerPage } from "./pages/DeviceManagerPage";
 import { TeleoperationPage } from "./pages/TeleoperationPage";
@@ -25,6 +26,7 @@ export type PageId =
   | "dataset-processing"
   | "episode-replay"
   | "dataset-export"
+  | "training"
   | "dashboard"
   | "qc-report"
   | "model-evaluation"
@@ -42,6 +44,7 @@ const mvpPages: PageMeta[] = [
   { id: "dataset-processing", label: "Dataset Processing", kind: "mvp" },
   { id: "episode-replay", label: "Episode Replay", kind: "mvp" },
   { id: "dataset-export", label: "Dataset Export", kind: "mvp" },
+  { id: "training", label: "Training", kind: "mvp" },
   { id: "task-library", label: "Task Library", kind: "mvp" },
   { id: "calibration", label: "Calibration", kind: "mvp" },
   { id: "device-manager", label: "Device Manager", kind: "mvp" }
@@ -63,7 +66,10 @@ const navGroups: NavGroup[] = [
   { label: "Capture", ids: ["live-record", "teleoperation", "task-library"] },
   { label: "Calibration", ids: ["calibration"] },
   { label: "Devices", ids: ["device-manager"] },
-  { label: "Data", ids: ["dataset-processing", "episode-replay", "dataset-export"] }
+  { label: "Data", ids: ["dataset-processing", "episode-replay", "dataset-export"] },
+  // Training is not a Data step: it consumes a view the Data group produced, and it is the
+  // only page whose work can run on a machine other than the one the gateway is on.
+  { label: "Model", ids: ["training"] }
 ];
 
 const workstationPageIds = new Set<PageId>([
@@ -77,7 +83,8 @@ const workstationPageIds = new Set<PageId>([
   "device-manager",
   "dataset-processing",
   "episode-replay",
-  "dataset-export"
+  "dataset-export",
+  "training"
 ]);
 
 function pageAllowedForProfile(page: PageId, profile: "thor" | "workstation"): boolean {
@@ -240,12 +247,17 @@ function App() {
     run(() => api.exportTask(taskId));
   };
 
-  const exportApprovedWithWarningGuard = (path: string, actionMode?: string, cameraCrops?: CameraCropSpecs) => {
+  const exportApprovedWithWarningGuard = (
+    path: string,
+    actionMode?: string,
+    cameraCrops?: CameraCropSpecs,
+    viewFps?: number
+  ) => {
     const item = snapshot.processing.find((candidate) => candidate.path === path);
     // Only the QC-warned case asks. A pass exports straight through, and anything else is
     // refused by the gateway with its own reason.
     if (item?.status !== "qc_warn") {
-      run(() => api.exportApprovedDataset(path, actionMode, false, cameraCrops));
+      run(() => api.exportApprovedDataset(path, actionMode, false, cameraCrops, viewFps));
       return;
     }
     const warnings = qcWarnings(item);
@@ -267,7 +279,7 @@ function App() {
     if (!ok) {
       return;
     }
-    run(() => api.exportApprovedDataset(path, actionMode, true, cameraCrops));
+    run(() => api.exportApprovedDataset(path, actionMode, true, cameraCrops, viewFps));
   };
 
   const pageNode =
@@ -330,6 +342,8 @@ function App() {
       />
     ) : activePage === "qc-report" ? (
       <QcReportPage snapshot={snapshot} />
+    ) : activePage === "training" ? (
+      <TrainingPage />
     ) : activePage === "dataset-export" ? (
       <DatasetExportPage
         snapshot={snapshot}

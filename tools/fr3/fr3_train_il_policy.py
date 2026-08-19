@@ -1,9 +1,17 @@
 #!/usr/bin/env python
-"""Prepare a selectable LeRobot dataset view and train ACT or Diffusion Policy.
+"""Prepare a selectable LeRobot dataset view and train any LeRobot policy on it.
 
 This script is intentionally conservative: it never mutates the source dataset.
 It writes a derived dataset view under outputs/datasets and launches the standard
 LeRobot training entrypoint on that view.
+
+``--policy`` accepts any type the LeRobot registry knows (``act``, ``diffusion``,
+``smolvla``, ``pi0``, ``pi05``, ``groot``, ``xvla``, ``wall_x``, ``vqbet``, ...).
+Only ``act`` and ``diffusion`` carry tuned defaults here, because they are the only
+two this rig has measured. Every other type is emitted with the common training keys
+only, so the policy's own dataclass defaults apply, and ``--policy-config`` is the
+single place to override them -- inventing hyperparameters for a policy nobody has
+run on this rig would be a guess wearing the costume of a default.
 """
 
 from __future__ import annotations
@@ -46,6 +54,184 @@ DEFAULT_STATE_KEYS = "observation.state"
 DEFAULT_DERIVED_ACTION = Path("derived/hikon_cube_tracking_in_robot_base/action.npy")
 DEFAULT_ACTION_APPEND_SELECTORS = "observation.state_raw:handheld_gripper.pika_left.width_mm"
 DEFAULT_ACTION_APPEND_NAMES = "gripper"
+
+# Types this script has tuned defaults for. Everything else is still accepted -- it is
+# validated against the LeRobot registry at run time, not against this list.
+TUNED_POLICY_TYPES = ("act", "diffusion")
+# Advertised in --help and by the GUI. Kept as a literal because resolving it needs
+# lerobot.policies.factory, and importing that to print a usage string would make
+# `--help` depend on every policy's optional dependencies.
+KNOWN_POLICY_TYPES = (
+    "act",
+    "diffusion",
+    "vqbet",
+    "tdmpc",
+    "pi0",
+    "pi0_fast",
+    "pi05",
+    "smolvla",
+    "groot",
+    "xvla",
+    "wall_x",
+    "sac",
+    "sarm",
+    "reward_classifier",
+)
+
+
+DEFAULT_RECORD_CONFIG = "tools/fr3/fr3_record_config.yaml"
+# Every inference camera config in the tree. The generated config names one of these; which one
+# is decided by matching cameras against the recording, never by a default.
+INFER_CAMERA_CONFIG_CANDIDATES = (
+    "tools/fr3/fr3_il_infer_realsense_camera_config.yaml",
+    "tools/fr3/fr3_il_infer_hikrobot_camera_config.yaml",
+    "tools/fr3/fr3_il_infer_gmsl2_corenetic_camera_config.yaml",
+    "tools/fr3/fr3_act_infer_camera_config.yaml",
+)
+
+
+def load_yaml(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle)
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def camera_identities(config: dict[str, Any]) -> dict[str, tuple[str, str]]:
+    """(type, device id) per camera key.
+
+    The device id is what makes this an identity rather than a label: two configs can both
+    call a camera `ee` and open different hardware, which is precisely the mistake a policy
+    cannot detect -- it gets images of the right shape from the wrong viewpoint.
+    """
+    cameras = ((config.get("robot") or {}).get("cameras")) or {}
+    identities: dict[str, tuple[str, str]] = {}
+    for key, camera in cameras.items():
+        if not isinstance(camera, dict):
+            continue
+        device = camera.get("serial_number_or_name", camera.get("index_or_path", ""))
+        identities[str(key)] = (str(camera.get("type", "")).lower(), str(device))
+    return identities
+
+
+def resolve_inference_camera_config(
+    record_config: dict[str, Any], camera_keys: list[str], repo_root: Path
+) -> str | None:
+    """Pick the inference camera config that opens the same cameras the view was recorded on.
+
+    Matched by camera identity against the record config rather than assumed, because the two
+    disagreeing is not a loud failure: the wrong file either names cameras the checkpoint never
+    asks for (raises at startup, fine) or names the right keys pointed at different hardware
+    (runs, and is wrong for the whole rollout).
+
+    Returns None when nothing matches, and the caller writes null. A null that fails loudly at
+    deployment is worth more than a plausible default that is silently wrong.
+    """
+    wanted_keys = [key.removeprefix("observation.images.") for key in camera_keys]
+    recorded = camera_identities(record_config)
+    wanted = {key: recorded[key] for key in wanted_keys if key in recorded}
+    if not wanted:
+        return None
+    for candidate in INFER_CAMERA_CONFIG_CANDIDATES:
+        path = repo_root / candidate
+        if not path.exists():
+            continue
+        available = camera_identities(load_yaml(path))
+        if all(available.get(key) == identity for key, identity in wanted.items()):
+            return candidate
+    return None
+
+
+def resolve_frame_strides(
+    src_roots: list[Path], source_infos: list[dict], view_fps: int
+) -> tuple[int, list[int]]:
+    """Decide how many source frames each view frame stands for, per source dataset.
+
+    ``view_fps <= 0`` means "keep the sources' own rate", which then requires every source
+    to already agree -- merging 30 fps and 60 fps recordings into one view without saying
+    so produces an action column whose per-frame delta is twice as large in half the rows,
+    and nothing downstream can tell the two halves apart.
+
+    Only integer decimation is allowed. 60 -> 25 would need interpolation, and picking the
+    nearest frame instead would jitter the sample interval between 1 and 2 source frames --
+    a 2x swing in every delta, distributed unevenly through the episode.
+    """
+    source_fps: list[int] = []
+    for root, info in zip(src_roots, source_infos, strict=True):
+        fps = int(info.get("fps") or 0)
+        if fps <= 0:
+            raise ValueError(f"{root} has no usable fps in meta/info.json (got {info.get('fps')!r}).")
+        source_fps.append(fps)
+
+    if view_fps <= 0:
+        distinct = sorted(set(source_fps))
+        if len(distinct) > 1:
+            raise ValueError(
+                f"Source datasets disagree on fps ({distinct}); pass --view-fps to resample them "
+                "to a common rate. Merging them as-is would put two different per-frame action "
+                "scales in one column."
+            )
+        return distinct[0], [1] * len(src_roots)
+
+    strides: list[int] = []
+    for root, fps in zip(src_roots, source_fps, strict=True):
+        if fps < view_fps:
+            raise ValueError(
+                f"{root} is {fps} fps, below the requested --view-fps {view_fps}. Upsampling would "
+                "invent frames; lower --view-fps instead."
+            )
+        if fps % view_fps != 0:
+            raise ValueError(
+                f"{root} is {fps} fps, which is not an integer multiple of --view-fps {view_fps}. "
+                "Only integer decimation is supported; pick a divisor of the source rate "
+                f"(for example {', '.join(str(fps // n) for n in range(1, 5) if fps % n == 0)})."
+            )
+        strides.append(fps // view_fps)
+    return view_fps, strides
+
+
+def parse_policy_config(value: str | None) -> dict[str, Any]:
+    """Parse --policy-config, which is JSON so it can carry non-string types.
+
+    Policy hyperparameters are ints, floats, bools, lists and nested dicts. A
+    ``key=value`` mini-language would have to guess which of those a token is, and
+    guessing wrong on ``optimizer_lr=1e-5`` (str vs float) fails deep inside the
+    optimizer instead of here.
+    """
+    if not value or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--policy-config must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"--policy-config must be a JSON object, got {type(parsed).__name__}")
+    return parsed
+
+
+def validate_policy_type(policy_type: str) -> None:
+    """Fail here, with the list, rather than inside the training subprocess.
+
+    Names in KNOWN_POLICY_TYPES are accepted without importing anything: they are the
+    factory's own branches, and resolving them for real would pull in torch and every
+    optional backbone dependency just to spell-check a string -- which `--prepare-only`
+    has no other reason to do. A missing dependency still surfaces, at the point the
+    policy is actually built, as the ModuleNotFoundError naming the package.
+
+    Anything else is looked up in the draccus registry, which is where a policy that
+    lives outside this repo registers itself.
+    """
+    if policy_type in KNOWN_POLICY_TYPES:
+        return
+    try:
+        from lerobot.configs.policies import PreTrainedConfig
+
+        PreTrainedConfig.get_choice_class(policy_type)
+    except Exception as exc:
+        known = ", ".join(KNOWN_POLICY_TYPES)
+        raise ValueError(
+            f"Unknown policy type {policy_type!r}. Known types: {known}. "
+            "Third-party types must be registered with draccus before this script sees them."
+        ) from exc
 
 
 def parse_csv(value: str | None) -> list[str]:
@@ -492,6 +678,7 @@ def prepare_dataset_view(
     action_mode: str = ACTION_MODE_ABSOLUTE_EE,
     exclude_episodes: set[int] | None = None,
     respect_annotations: bool = True,
+    view_fps: int = 0,
 ) -> None:
     src_roots = discover_dataset_roots(src_root)
     excluded_by_root = resolve_excluded_episodes(
@@ -510,6 +697,16 @@ def prepare_dataset_view(
     )
     camera_crop_specs = validate_camera_crop_specs(camera_crop_specs or {}, first_features, camera_keys)
     chunks_size = int(first_info.get("chunks_size", 1000))
+    resolved_fps, source_strides = resolve_frame_strides(src_roots, source_infos, view_fps)
+    if any(stride > 1 for stride in source_strides):
+        print(
+            "[prepare] resampling to "
+            f"{resolved_fps} fps: "
+            + ", ".join(
+                f"{root.name} {int(info['fps'])}->{resolved_fps} (keep 1 of {stride})"
+                for root, info, stride in zip(src_roots, source_infos, source_strides, strict=True)
+            )
+        )
 
     for root, info in zip(src_roots, source_infos, strict=True):
         features = info["features"]
@@ -591,7 +788,7 @@ def prepare_dataset_view(
     total_rows = 0
     total_episodes = 0
 
-    for root in src_roots:
+    for source_root_index, root in enumerate(src_roots):
         data_files = sorted((root / "data").glob("*/*.parquet"))
         if not data_files:
             raise FileNotFoundError(f"No parquet files found under {root / 'data'}")
@@ -614,6 +811,15 @@ def prepare_dataset_view(
             print(f"[prepare] excluding {len(excluded)} episode(s) from {root.name}: {sorted(excluded)}")
         if episodes.empty:
             raise ValueError(f"Every episode of {root} is excluded; there is nothing to build.")
+
+        stride = source_strides[source_root_index]
+        if stride > 1:
+            # Ceiling, because frame 0 of every episode is always kept: an episode of 5 frames
+            # at stride 2 keeps frames 0, 2 and 4. This has to happen before the row offsets
+            # below are accumulated -- they count through these lengths.
+            episodes = episodes.copy()
+            lengths = episodes["length"].to_numpy()
+            episodes["length"] = ((lengths + stride - 1) // stride).astype(episodes["length"].dtype)
 
         source_data_files.append(data_files)
         source_episodes.append(episodes)
@@ -663,6 +869,7 @@ def prepare_dataset_view(
     delta_reports: list[dict] = []
     for source_idx, (root, data_files) in enumerate(zip(src_roots, source_data_files, strict=True)):
         features = source_infos[source_idx]["features"]
+        stride = source_strides[source_idx]
         file_map = source_file_maps[source_idx]
         frame_offset = source_frame_offsets[source_idx]
         episode_map = source_episode_maps[source_idx]
@@ -692,6 +899,15 @@ def prepare_dataset_view(
             # across the seam of a removed episode would be an operator command that never
             # happened, and the statistics would describe frames the view does not contain.
             keep_mask = source_df["episode_index"].isin(episode_map).to_numpy()
+            if stride > 1:
+                # Decimation joins the same mask, and for the same reason: the delta must be
+                # derived *after* the rows are thinned, so that it spans one view frame rather
+                # than one source frame. Differencing first and dropping rows second would
+                # discard the motion that happened in the dropped frames outright.
+                #
+                # frame_index is 0-based within its episode, so this keeps frame 0 of every
+                # episode -- the pose the whole rollout aligns on.
+                keep_mask = keep_mask & ((source_df["frame_index"].to_numpy() % stride) == 0)
             df = source_df[keep_mask].reset_index(drop=True)
             file_source_rows = len(source_df)
             if df.empty:
@@ -701,8 +917,13 @@ def prepare_dataset_view(
                 continue
 
             out = pd.DataFrame()
+            # timestamp is carried over untouched. The kept rows already sit at 1/view_fps
+            # spacing (source frame n*stride is at n*stride/source_fps == n/view_fps), and it is
+            # what addresses the mp4, which is not re-encoded. Recomputing it from the new index
+            # would give the same numbers with float drift against the actual video frame times.
             out["timestamp"] = df["timestamp"]
-            out["frame_index"] = df["frame_index"]
+            # Exact because only multiples of stride survive the mask above.
+            out["frame_index"] = (df["frame_index"] // stride) if stride > 1 else df["frame_index"]
             out["episode_index"] = df["episode_index"].map(episode_map).astype(source_df["episode_index"].dtype)
             # Renumbered rather than offset: `index` is the row's position in the whole dataset,
             # and dropping rows moves every later one.
@@ -860,6 +1081,7 @@ def prepare_dataset_view(
 
     new_info = copy.deepcopy(first_info)
     new_info["robot_type"] = f"{first_info.get('robot_type', 'robot')}_il_view"
+    new_info["fps"] = int(resolved_fps)
     new_info["features"] = new_features
     new_info["total_frames"] = int(total_rows)
     new_info["total_episodes"] = int(total_episodes)
@@ -897,6 +1119,17 @@ def prepare_dataset_view(
         "camera_crop_specs": camera_crop_specs,
         "state_dim": int(all_state.shape[1]) if state_keys else 0,
         "action_dim": int(all_action.shape[1]),
+        # The view's rate and what it was resampled from. Without this the fps in info.json is
+        # indistinguishable from a recording that was captured at that rate, and a later merge
+        # cannot tell whether these frames have already been thinned.
+        "fps": int(resolved_fps),
+        "source_fps": {
+            str(root): int(info.get("fps") or 0)
+            for root, info in zip(src_roots, source_infos, strict=True)
+        },
+        "frame_stride": {
+            str(root): int(stride) for root, stride in zip(src_roots, source_strides, strict=True)
+        },
         "total_episodes": int(total_episodes),
         "total_rows": int(total_rows),
         # What was left out and where each surviving episode came from. Episodes are renumbered
@@ -918,7 +1151,9 @@ def prepare_dataset_view(
             delta_action=all_action,
             delta_names=action_names,
             append_names=append_feature_names,
-            fps=int(first_info.get("fps") or 0),
+            # The view's rate, not the recording's: this is what turns a per-frame delta into
+            # mm/s, and using the source rate on a decimated view reports a 2x speed.
+            fps=int(resolved_fps),
         )
         if is_delta_action_mode(action_mode)
         else None,
@@ -929,7 +1164,7 @@ def prepare_dataset_view(
         print(
             f"[prepare] action_mode={action_mode} "
             f"per-frame translation p95={scale['p95_translation_per_frame_mm']:.3f} mm "
-            f"(implied {scale['implied_p95_speed_mm_s']:.1f} mm/s at {first_info.get('fps')} fps), "
+            f"(implied {scale['implied_p95_speed_mm_s']:.1f} mm/s at {resolved_fps} fps), "
             f"reconstruction max error {manifest['delta_transform']['reconstruction_max_position_error_mm']:.5f} mm"
         )
 
@@ -960,9 +1195,15 @@ def _summarize_delta_reports(
     }
 
 
-def make_train_config(args: argparse.Namespace, view_root: Path, repo_id: str, config_path: Path) -> None:
-    image_resize_shape = parse_hw(args.image_resize_shape)
-    peak_lr = args.act_lr if args.policy == "act" else args.dp_lr
+def build_policy_section(args: argparse.Namespace, image_resize_shape: list[int] | None) -> dict[str, Any]:
+    """The `policy` block of the generated train config.
+
+    `act` and `diffusion` get the defaults this rig tuned. Any other type gets the
+    common keys only: its own dataclass defaults are the closest thing to a measured
+    value that exists for it here, and overriding them with numbers borrowed from ACT
+    would be worse than not overriding them at all. `--policy-config` is applied last
+    so an operator who *has* measured something can say so.
+    """
     policy: dict[str, Any] = {
         "type": args.policy,
         "device": None if args.device == "auto" else args.device,
@@ -980,7 +1221,7 @@ def make_train_config(args: argparse.Namespace, view_root: Path, repo_id: str, c
                 "optimizer_lr_backbone": args.act_lr_backbone,
             }
         )
-    else:
+    elif args.policy == "diffusion":
         policy.update(
             {
                 "n_obs_steps": args.dp_n_obs_steps,
@@ -992,6 +1233,71 @@ def make_train_config(args: argparse.Namespace, view_root: Path, repo_id: str, c
                 "optimizer_lr": args.dp_lr,
             }
         )
+    policy.update(parse_policy_config(args.policy_config))
+    return policy
+
+
+def resolve_peak_lr(args: argparse.Namespace, policy: dict[str, Any]) -> float:
+    """Peak LR for the warmup/decay scheduler.
+
+    Read back off the resolved policy block so `--policy-config` wins, and so an
+    untuned policy that never set `optimizer_lr` fails here with an instruction
+    rather than scheduling a decay from a learning rate borrowed from ACT.
+    """
+    lr = policy.get("optimizer_lr")
+    if lr is not None:
+        return float(lr)
+    raise ValueError(
+        f"--lr-scheduler=cosine_decay_with_warmup needs a peak learning rate, and policy "
+        f"{args.policy!r} has no tuned default here. Pass it explicitly, for example "
+        f"--policy-config '{{\"optimizer_lr\": 1e-5}}'."
+    )
+
+
+def adopt_existing_view(args: argparse.Namespace, view_root: Path) -> dict[str, Any]:
+    """Load the manifest of a view built earlier and make `args` describe *that* view.
+
+    Training and export are separate steps here: the Dataset Export page builds a view with
+    ``--prepare-only`` and QC gates it, and the Training page trains that view, possibly on
+    another machine that never had the source recording. Without this the train step would
+    have to name a ``--dataset-root``, and the only path it can be sure exists is the view
+    itself -- which would re-derive a delta action column from frames whose action column is
+    already a delta, silently squaring the contract.
+
+    The shape keys are taken from the manifest rather than from the CLI because they are
+    facts about frames that already exist. A ``--cameras`` that disagreed with the view
+    would not fail here; it would fail thousands of steps into training, or not at all.
+    """
+    manifest_path = view_root / "meta" / "il_view_manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(
+            f"--skip-prepare needs a training view at {view_root}, but {manifest_path} is not there. "
+            "Build the view first (Dataset Export page, or --prepare-only)."
+        )
+    manifest = load_json(manifest_path)
+    args.cameras = ",".join(manifest["cameras"])
+    args.state_keys = ",".join(manifest["state_keys"])
+    args.action_append_selectors = ",".join(manifest["action_append_selectors"])
+    args.action_append_names = ",".join(manifest["action_append_names"])
+    args.action_mode = manifest["action_mode"]
+    # Only when the caller did not ask for one: a resize is a training-time transform, so
+    # overriding it is legitimate, but inheriting it is what keeps the generated config
+    # consistent with a view whose videos were already re-encoded at that size.
+    if args.image_resize_shape is None and manifest.get("image_resize_shape"):
+        args.image_resize_shape = ",".join(str(value) for value in manifest["image_resize_shape"])
+    if manifest.get("repo_id"):
+        args.repo_id = manifest["repo_id"]
+    print(
+        f"[prepare] view manifest: {manifest['total_episodes']} episodes / "
+        f"{manifest['total_rows']} rows @ {manifest.get('fps', '?')} fps, "
+        f"action_mode={manifest['action_mode']}"
+    )
+    return manifest
+
+
+def make_train_config(args: argparse.Namespace, view_root: Path, repo_id: str, config_path: Path) -> None:
+    image_resize_shape = parse_hw(args.image_resize_shape)
+    policy = build_policy_section(args, image_resize_shape)
 
     dataset_cfg: dict[str, Any] = {
         "repo_id": repo_id,
@@ -1036,6 +1342,7 @@ def make_train_config(args: argparse.Namespace, view_root: Path, repo_id: str, c
         "wandb_log_images_n_samples": args.wandb_log_images_n_samples,
     }
     if args.lr_scheduler == "cosine_decay_with_warmup":
+        peak_lr = resolve_peak_lr(args, policy)
         config["scheduler"] = {
             "type": "cosine_decay_with_warmup",
             "num_warmup_steps": args.lr_warmup_steps,
@@ -1067,6 +1374,28 @@ def make_inference_config(
 ) -> None:
     camera_suffixes = [key.removeprefix("observation.images.") for key in camera_keys]
     checkpoint_path = args.output_dir / "checkpoints" / "last"
+
+    # Hardware comes from the config the data was recorded with, not from literals here. Both of
+    # the literals this replaced were wrong for the workstation (a hikrobot camera file on a
+    # RealSense rig, and 192.168.1.208 for a robot at .206), and neither was reachable from the
+    # record config, so nothing could have caught the drift. The launcher script derives the same
+    # values independently; the point of deriving both from one file is that they cannot disagree.
+    record_config_path = Path(args.record_config)
+    if not record_config_path.is_absolute():
+        record_config_path = _REPO_ROOT / record_config_path
+    record_config: dict[str, Any] = {}
+    if record_config_path.exists():
+        record_config = load_yaml(record_config_path)
+    else:
+        print(f"[prepare] WARNING: record config not found: {record_config_path}")
+    record_robot = record_config.get("robot") or {}
+    camera_config = resolve_inference_camera_config(record_config, camera_keys, _REPO_ROOT)
+    if camera_config is None:
+        print(
+            "[prepare] WARNING: no inference camera config matches the recording's cameras "
+            f"({', '.join(camera_suffixes)}); writing camera_config: null. Set it by hand, or "
+            "pass --record-config for the rig this view came from."
+        )
     config = {
         "version": 1,
         "training": {
@@ -1090,15 +1419,24 @@ def make_inference_config(
         "runtime": {
             "checkpoint": str(checkpoint_path),
             "dataset_root": str(view_root),
-            "camera_config": "tools/fr3/fr3_il_infer_hikrobot_camera_config.yaml",
+            "camera_config": camera_config,
+            # The rate the view was built at, so a rollout can be paced to the data it learned
+            # from rather than to whatever the recorder happened to run at.
             "policy_fps": None,
             "max_steps": None,
             "preview": True,
             "hardware": {
-                "robot_ip": "192.168.1.208",
+                "robot_ip": record_robot.get("robot_ip"),
                 "gripper_backend": "pika",
-                "gripper_port": "/dev/ttyUSB0",
+                "gripper_port": record_robot.get("gripper_port"),
+                # Not read by the runtime yet -- recorded so a rollout can check the frame it is
+                # about to solve IK in against the frame this view's poses are expressed in. The
+                # two Pika frames are 410.85 mm apart and naming the wrong one does not fail.
+                "target_frame_name": record_robot.get("target_frame_name"),
             },
+            "recorded_with": str(record_config_path.relative_to(_REPO_ROOT))
+            if record_config_path.is_relative_to(_REPO_ROOT)
+            else str(record_config_path),
             "startup": {
                 # The DAS rig's joint configuration, not this one's. T_B_Ws is solved from the
                 # first observation against the dataset start pose, so homing somewhere the
@@ -1136,24 +1474,19 @@ def run_smoke(args: argparse.Namespace, view_root: Path, repo_id: str) -> None:
     from lerobot.datasets.factory import resolve_delta_timestamps
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
     from lerobot.datasets.transforms import ImageTransformConfig, ImageTransforms, ImageTransformsConfig
-    from lerobot.policies.factory import make_policy
-    from lerobot.policies.act.configuration_act import ACTConfig
-    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+    from lerobot.policies.factory import make_policy, make_policy_config
 
     meta = LeRobotDatasetMetadata(repo_id, root=view_root)
-    if args.policy == "act":
-        cfg = ACTConfig(
-            push_to_hub=False,
-            chunk_size=args.act_chunk_size,
-            n_action_steps=args.act_n_action_steps,
-        )
-    else:
-        cfg = DiffusionConfig(
-            push_to_hub=False,
-            n_obs_steps=args.dp_n_obs_steps,
-            horizon=args.dp_horizon,
-            n_action_steps=args.dp_n_action_steps,
-        )
+    # Built from the same block the train config gets, minus the keys that describe the
+    # training run rather than the policy. A smoke test that constructed the policy a
+    # different way from training would be testing the smoke test.
+    policy_section = build_policy_section(args, parse_hw(args.image_resize_shape))
+    cfg_kwargs = {
+        key: value
+        for key, value in policy_section.items()
+        if key not in ("type", "device", "use_amp") and value is not None
+    }
+    cfg = make_policy_config(args.policy, **cfg_kwargs)
     delta_timestamps = resolve_delta_timestamps(cfg, meta)
     image_transforms = None
     image_resize_shape = parse_hw(args.image_resize_shape)
@@ -1204,30 +1537,54 @@ def run_smoke(args: argparse.Namespace, view_root: Path, repo_id: str) -> None:
                 checked_indices.add(abs_idx)
         print(f"[smoke] temporal action tail queries checked={len(checked_indices)}")
 
-    if args.policy == "act":
-        smoke_device = args.device
-        if smoke_device == "auto":
-            smoke_device = "cuda" if torch.cuda.is_available() else "cpu"
-        cfg.device = smoke_device
-        policy = make_policy(cfg=cfg, ds_meta=meta)
-        policy.train()
-        batch = default_collate([item])
-        if "action_is_pad" not in batch:
-            batch["action_is_pad"] = torch.zeros(batch["action"].shape[:2], dtype=torch.bool)
-        batch = {
-            key: value.to(smoke_device) if hasattr(value, "to") else value
-            for key, value in batch.items()
-        }
-        with torch.no_grad():
-            loss, loss_dict = policy.forward(batch)
-        print(f"[smoke] act forward loss={float(loss.detach().cpu()):.6f} details={loss_dict}")
+    # Run the forward pass for whichever policy was asked for. Previously this was gated
+    # on `act`, so `--smoke` on any other type silently checked the dataset and nothing
+    # else -- an all-clear that had never touched the model.
+    smoke_device = args.device
+    if smoke_device == "auto":
+        smoke_device = "cuda" if torch.cuda.is_available() else "cpu"
+    cfg.device = smoke_device
+    policy = make_policy(cfg=cfg, ds_meta=meta)
+    policy.train()
+    batch = default_collate([item])
+    if "action_is_pad" not in batch:
+        batch["action_is_pad"] = torch.zeros(batch["action"].shape[:2], dtype=torch.bool)
+    batch = {
+        key: value.to(smoke_device) if hasattr(value, "to") else value
+        for key, value in batch.items()
+    }
+    with torch.no_grad():
+        loss, loss_dict = policy.forward(batch)
+    print(f"[smoke] {args.policy} forward loss={float(loss.detach().cpu()):.6f} details={loss_dict}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--repo-id", default="single_cube2_il_view")
-    parser.add_argument("--policy", choices=["act", "diffusion"], default="act")
+    parser.add_argument(
+        "--policy",
+        default="act",
+        metavar="TYPE",
+        help=(
+            "Policy type to train. Any type in the LeRobot registry is accepted; known ones are "
+            + ", ".join(KNOWN_POLICY_TYPES)
+            + ". Only "
+            + " and ".join(TUNED_POLICY_TYPES)
+            + " carry tuned defaults here -- for the rest, the policy's own dataclass defaults "
+            "apply and --policy-config is where you override them."
+        ),
+    )
+    parser.add_argument(
+        "--policy-config",
+        default="",
+        metavar="JSON",
+        help=(
+            "JSON object of policy hyperparameters merged into the generated train config, "
+            'for example \'{"chunk_size": 50, "optimizer_lr": 2.5e-5}\'. Applied after the '
+            "built-in defaults, so it wins."
+        ),
+    )
     parser.add_argument("--cameras", default=DEFAULT_CAMERAS)
     parser.add_argument("--state-keys", default=DEFAULT_STATE_KEYS)
     parser.add_argument("--image-resize-shape", default=None)
@@ -1272,8 +1629,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "On by default: the operator's review is the point of recording it."
         ),
     )
+    parser.add_argument(
+        "--view-fps",
+        type=int,
+        default=30,
+        metavar="FPS",
+        help=(
+            "Frame rate of the generated view. Sources faster than this are decimated to it "
+            "(60 fps -> keep 1 frame of 2), which is what lets recordings captured at different "
+            "rates share one view: the action column is a per-frame delta, so mixing rates puts "
+            "two scales in one column. Only integer ratios are accepted. Pass 0 to keep the "
+            "sources' own rate, which then requires them to already agree. Videos are not "
+            "re-encoded -- rows address the mp4 by timestamp."
+        ),
+    )
+    parser.add_argument(
+        "--record-config",
+        default=DEFAULT_RECORD_CONFIG,
+        metavar="PATH",
+        help=(
+            "Recorder config the source dataset was captured with. The generated inference "
+            "config takes its robot IP, gripper port, tool frame and camera file from here, so "
+            "that deployment meets the hardware the data came off instead of a literal."
+        ),
+    )
     parser.add_argument("--copy-videos", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument(
+        "--skip-prepare",
+        action="store_true",
+        help=(
+            "Train a training view that already exists at --view-root instead of building one. "
+            "The view's own manifest supplies the cameras, state keys and action contract, so "
+            "--dataset-root is not consulted and need not be present on this machine. This is "
+            "how the Training page runs: the view was built and QC gated as a separate step."
+        ),
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
@@ -1326,8 +1717,14 @@ def main() -> None:
     camera_crop_specs = parse_camera_crop_specs(args.camera_crops)
     if not cameras:
         raise ValueError("At least one camera must be selected.")
+    validate_policy_type(args.policy)
+    if args.skip_prepare and args.prepare_only:
+        raise ValueError("--skip-prepare and --prepare-only ask for opposite halves of this script.")
     if args.policy != "act" and not state_keys:
-        raise ValueError("Image-only low-dimensional observation is currently supported for ACT only.")
+        raise ValueError(
+            f"Image-only observation (no --state-keys) is only wired up for ACT here; "
+            f"{args.policy!r} needs a state feature. Pass --state-keys observation.state."
+        )
     if args.resume and args.lr_scheduler != "none":
         print("[resume] ignoring --lr-scheduler for resume; scheduler comes from the checkpoint config.")
 
@@ -1342,10 +1739,43 @@ def main() -> None:
     args.job_name = args.job_name or f"{Path(args.dataset_root).name}_{tag}"
     view_root = args.view_root or Path("outputs/datasets") / args.job_name
     args.output_dir = args.output_dir or Path("outputs/train") / args.job_name
-    config_path = view_root / "train_config.generated.json"
-    inference_config_path = view_root / "inference_config.generated.yaml"
+    # A run that builds its own view puts the generated configs at the view root, where the
+    # export step has always left them. A run that trains a view someone else built puts them
+    # under `runs/<job>/` instead, because the view is shared: several jobs train the same
+    # frames with different policies and step counts, and writing to the root would leave the
+    # last job's settings sitting in the view with an inference config naming a checkpoint
+    # nobody asked about.
+    #
+    # Not `args.output_dir`, tempting as that is: lerobot_train refuses to start when its
+    # output directory already exists and it is not resuming, so creating it here to hold the
+    # config would make every fresh run fail on its own scaffolding.
+    config_dir = (view_root / "runs" / args.job_name) if args.skip_prepare else view_root
+    config_path = config_dir / "train_config.generated.json"
+    inference_config_path = config_dir / "inference_config.generated.yaml"
 
-    if args.resume and view_root.exists() and not args.overwrite_view:
+    if args.skip_prepare:
+        manifest = adopt_existing_view(args, view_root)
+        # Regenerated rather than reused: the run's policy, step count, batch size and W&B
+        # settings live in this file, and the one left behind by --prepare-only describes
+        # whatever was asked for at export time. The *data* keys all come from the manifest,
+        # so regenerating cannot make the config disagree with the frames it points at.
+        make_train_config(args, view_root, args.repo_id, config_path)
+        make_inference_config(
+            args,
+            view_root=view_root,
+            repo_id=args.repo_id,
+            camera_keys=manifest["cameras"],
+            state_keys=manifest["state_keys"],
+            action_append_selectors=manifest["action_append_selectors"],
+            action_append_names=manifest["action_append_names"],
+            image_resize_shape=manifest["image_resize_shape"],
+            train_config_path=config_path,
+            inference_config_path=inference_config_path,
+        )
+        print(f"[prepare] training existing view: {view_root}")
+        print(f"[prepare] train config: {config_path}")
+        print(f"[prepare] inference config: {inference_config_path}")
+    elif args.resume and view_root.exists() and not args.overwrite_view:
         print(f"[prepare] resume: keeping existing dataset view: {view_root}")
     else:
         prepare_dataset_view(
@@ -1366,6 +1796,7 @@ def main() -> None:
             action_mode=args.action_mode,
             exclude_episodes={int(value) for value in parse_csv(args.exclude_episodes)},
             respect_annotations=args.respect_annotations,
+            view_fps=args.view_fps,
         )
         manifest = load_json(view_root / "meta/il_view_manifest.json")
         make_train_config(args, view_root, args.repo_id, config_path)

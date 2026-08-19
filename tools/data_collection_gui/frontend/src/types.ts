@@ -391,6 +391,8 @@ export type RecordedDataset = {
   updatedAtMs: number;
   totalEpisodes: number;
   totalFrames: number;
+  /** Capture rate. 0 when the dataset has no readable info.json. */
+  fps?: number;
   dataStatus: "loaded" | "missing" | "unfinalized" | "unreadable" | "empty";
   sourcePath: string;
   isLatest: boolean;
@@ -739,4 +741,112 @@ export type CalibrationSession = {
   message: string;
   recorderState: string;
   steps: CalibrationSessionStep[];
+};
+
+
+// ------------------------------------------------------------------ training ---
+
+export type TrainingHost = {
+  id: string;
+  label: string;
+  kind: "local" | "remote";
+  sshTarget: string;
+  repoDir: string;
+  pythonPath: string;
+};
+
+export type TrainingGpu = {
+  index: number | null;
+  name: string;
+  memoryTotalMb: number | null;
+  memoryUsedMb: number | null;
+  utilizationPct: number | null;
+  temperatureC: number | null;
+  driverVersion: string;
+};
+
+export type TrainingMachine = {
+  ok: boolean;
+  error?: string;
+  detail?: string[];
+  hostname?: string;
+  platform?: string;
+  cpuCount?: number | null;
+  repoRoot?: string;
+  repoRootExists?: boolean;
+  python?: { version: string; executable: string };
+  gpus?: TrainingGpu[];
+  gpuError?: string;
+  torch?: {
+    installed: boolean;
+    version?: string;
+    cudaAvailable?: boolean;
+    cudaVersion?: string | null;
+    deviceCount?: number;
+    bf16Supported?: boolean;
+    error?: string;
+  };
+  disk?: { path?: string; totalGb?: number; freeGb?: number; error?: string };
+  modules?: Record<string, boolean>;
+  policies?: Record<string, { trainable: boolean; missing: string[] }>;
+};
+
+export type TrainingWandbStatus = {
+  configured: boolean;
+  keySuffix: string;
+  hostId: string;
+};
+
+export type TrainingView = {
+  name: string;
+  root: string;
+  repoId: string;
+  episodes: number;
+  frames: number;
+  fps: number;
+  actionMode: string;
+  cameras: string[];
+  sourceFps: Record<string, number>;
+  frameStride: Record<string, number>;
+  modifiedAt: string;
+};
+
+export type TrainingRun = {
+  state: "idle" | "syncing" | "starting" | "running" | "complete" | "error" | "stopped";
+  hostId: string;
+  hostLabel: string;
+  viewName: string;
+  viewRoot: string;
+  policy: string;
+  jobName: string;
+  outputDir: string;
+  step: number;
+  totalSteps: number;
+  loss: number | null;
+  message: string;
+  pid: number | null;
+  startedAt: string;
+  finishedAt: string;
+  logPath: string;
+  wandbUrl: string;
+  wandbEnabled: boolean;
+  lastLines: string[];
+};
+
+export type TrainingStartRequest = {
+  hostId: string;
+  viewName: string;
+  policy: string;
+  jobName: string;
+  steps: number;
+  batchSize: number;
+  numWorkers: number;
+  saveFreq: number;
+  logFreq: number;
+  device: string;
+  useAmp: boolean;
+  policyConfig: string;
+  wandbEnabled: boolean;
+  wandbProject: string;
+  wandbEntity: string;
 };

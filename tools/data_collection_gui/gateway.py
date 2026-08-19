@@ -20,6 +20,7 @@ import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import dataclasses
 from dataclasses import asdict, dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +30,8 @@ from typing import Any, Iterable
 from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
+
+from tools.data_collection_gui import training as training_backend
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
 DEFAULT_RECORDER_SCRIPT = Path("tools/handheld/handheld_record.py")
@@ -41,6 +44,17 @@ DEFAULT_RECORD_BACKEND = "real"
 # absolute EE; the delta contracts are derived offline from consecutive dataset frames.
 TRAINING_VIEW_ACTION_MODES = ("absolute_ee", "delta_ee_from_prev_cmd", "delta_ee_from_current")
 DEFAULT_TRAINING_VIEW_ACTION_MODE = "delta_ee_from_prev_cmd"
+# Rates a training view may be built at. 30 is the default and the rate the FR3 baseline was
+# recorded at, so views built from newer 60 fps sessions land on the same per-frame action scale
+# and can be merged with it. 0 means "whatever the source is", which then requires every source
+# in one build to already agree -- offered because a rig that only ever records at one rate has
+# no reason to resample, not because mixing rates is ever safe.
+TRAINING_VIEW_FPS_CHOICES = (30, 15, 60, 0)
+DEFAULT_TRAINING_VIEW_FPS = 30
+# How often a running job's progress is checkpointed to disk. Long enough that a job logging
+# thirteen lines a second is not writing a file thirteen times a second; short enough that a
+# gateway restarted mid-run reports a step count from the same minute.
+TRAINING_STATUS_PERSIST_INTERVAL_S = 10.0
 DEFAULT_DATASETS_ROOT = Path("outputs/datasets")
 DEFAULT_EXPORTS_ROOT = Path("outputs/exports")
 # Training views are grouped one level below the exports root. The grouping directory is not
@@ -67,7 +81,6 @@ DEFAULT_REPLAY_MAX_EE_STEP_MM = 120.0
 DEFAULT_REPLAY_MAX_GRIPPER_STEP = 0.35
 DEFAULT_WORKSTATION_REPLAY_MAX_GRIPPER_STEP = 1.0
 DEFAULT_REAL_PREFLIGHT_TIMEOUT_S = 30.0
-DEFAULT_REAL_ROBOT_IP = "192.168.1.208"
 DEFAULT_CUBE_REPLAY_ROBOT_IP = "192.168.11.102"
 # EE trajectory generation now tracks gmsl2 (Thor) datasets with AprilTag cubes
 # instead of the legacy Hikon-camera route. The gateway runs on Thor, so it
@@ -300,6 +313,13 @@ class GatewayState:
     marker_tcp_session: MarkerTcpSession = field(default_factory=MarkerTcpSession)
     dataset_export: DatasetExportStatus = field(default_factory=DatasetExportStatus)
     teleop: TeleopStatus = field(default_factory=TeleopStatus)
+    training: training_backend.TrainingRunStatus = field(
+        default_factory=training_backend.TrainingRunStatus
+    )
+    # Bytes, not str: the run writes to its log file, and this object exists only to be
+    # polled for liveness and asked for an exit code.
+    training_process: subprocess.Popen[bytes] | None = None
+    training_persisted_s: float = 0.0
     export_process: subprocess.Popen[str] | None = None
     events: list[EventLogItem] = field(default_factory=list)
     selected_replay_root: Path | None = None
@@ -3843,6 +3863,7 @@ def _training_view_command(
     action_mode: str,
     *,
     camera_crops: dict[str, list[int]] | None = None,
+    view_fps: int = DEFAULT_TRAINING_VIEW_FPS,
 ) -> tuple[list[str], Path]:
     """Build the prepare-only training-view command for an FR3 workstation dataset.
 
@@ -3897,6 +3918,12 @@ def _training_view_command(
         # Explicit even though it is the script's default: this command is what the event log
         # records, and "the reviewer's exclusions were applied" has to be visible there.
         "--respect-annotations",
+        # The rate the view is resampled to. Explicit rather than left to the script's default
+        # because it is the one export setting that silently changes what the action column
+        # *means*: the action is a per-frame delta, so a view built at 30 fps from 60 fps frames
+        # has twice the per-frame displacement of the recording it came from. Two views built at
+        # different rates cannot be merged, and nothing downstream would notice.
+        "--view-fps", str(int(view_fps)),
         "--overwrite-view",
         # Build the view only; training is a separate, deliberate step.
         "--prepare-only",
@@ -3917,6 +3944,7 @@ def _start_training_view(
     *,
     acknowledge_warnings: bool = False,
     camera_crops: dict[str, list[int]] | None = None,
+    view_fps: int = DEFAULT_TRAINING_VIEW_FPS,
 ) -> None:
     """Workstation counterpart of the Thor v3 export: build a policy-ready training view."""
     if _export_is_running(state):
@@ -3954,7 +3982,9 @@ def _start_training_view(
             f"{dataset_root.name} must pass QC before a training view is built "
             f"(status: {status or 'unknown'}). Run QC on the Dataset Processing page."
         )
-    command, view_root = _training_view_command(state, dataset_root, action_mode, camera_crops=camera_crops)
+    command, view_root = _training_view_command(
+        state, dataset_root, action_mode, camera_crops=camera_crops, view_fps=view_fps
+    )
     excluded = _annotation_excluded_episodes(dataset_root)
     total_episodes = int(processing_item.get("totalEpisodes") or 0)
     if excluded and len(excluded) >= total_episodes > 0:
@@ -4131,6 +4161,454 @@ def _read_export_output(state: GatewayState, process: subprocess.Popen[str]) -> 
                 # "complete" while the dataset list still has no view to open.
                 _invalidate_replay_candidates_memo()
                 state.dataset_cache_ready = False
+
+
+# ------------------------------------------------------------------ training runs ---
+
+
+def _training_view_entries(state: GatewayState) -> list[dict[str, Any]]:
+    """Training views this gateway has built, newest first, with what a run needs to pick one.
+
+    Reads each view's own manifest rather than inferring from the directory name: the fps
+    and action contract are what decide whether two views are interchangeable, and the
+    name only carries the action mode.
+    """
+    root = _training_views_root(state)
+    entries: list[dict[str, Any]] = []
+    if not root.is_dir():
+        return entries
+    for view_root in sorted(root.iterdir(), key=lambda item: item.name):
+        if not view_root.is_dir():
+            continue
+        info = _load_dataset_info(view_root) or {}
+        manifest = _load_json_file(view_root / "meta" / "il_view_manifest.json") or {}
+        if not info:
+            continue
+        cameras = [key for key in (info.get("features") or {}) if key.startswith("observation.images.")]
+        entries.append(
+            {
+                "name": view_root.name,
+                "root": str(view_root),
+                "repoId": str(manifest.get("repo_id") or f"local/{view_root.name}"),
+                "episodes": int(info.get("total_episodes") or 0),
+                "frames": int(info.get("total_frames") or 0),
+                "fps": int(info.get("fps") or 0),
+                "actionMode": str(manifest.get("action_mode") or ""),
+                "cameras": sorted(cameras),
+                "sourceFps": manifest.get("source_fps") or {},
+                "frameStride": manifest.get("frame_stride") or {},
+                "modifiedAt": datetime.fromtimestamp(view_root.stat().st_mtime, timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+            }
+        )
+    entries.sort(key=lambda item: item["modifiedAt"], reverse=True)
+    return entries
+
+
+def _training_is_running(state: GatewayState) -> bool:
+    """Whether a run is on the GPU, whether or not this gateway started it.
+
+    Asking only about `training_process` would answer "no" for a run re-adopted after a
+    restart -- it has a pid and no Popen object -- and the caller uses this to decide whether
+    starting another one is allowed. Two ACT runs on one 24 GB card is not a state either of
+    them survives.
+    """
+    process = state.training_process
+    if process is not None:
+        return process.poll() is None
+    pid = state.training.pid
+    return (
+        state.training.state in ("syncing", "starting", "running")
+        and bool(pid)
+        and _process_is_alive(int(pid))
+    )
+
+
+def _apply_training_output(state: GatewayState, line: str) -> None:
+    status = state.training
+    # Progress is read off every line, including the tqdm bars, because those carry the exact
+    # step counter. Only the bars that say nothing else are then dropped from the visible tail:
+    # they arrive about thirteen times a second, and keeping them would push every real log
+    # line out of the window before an operator could read it.
+    found = training_backend.parse_progress_line(line)
+    if "step" in found:
+        status.step = found["step"]
+        # Only out of "starting". A stopped run keeps writing for as long as it takes to die,
+        # and letting those lines put it back into "running" would lose the operator's stop and
+        # then report the resulting non-zero exit as a failure rather than as what they asked for.
+        if status.state in ("starting", "syncing"):
+            status.state = "running"
+    if "totalSteps" in found:
+        status.totalSteps = found["totalSteps"]
+    if "loss" in found:
+        status.loss = found["loss"]
+    if "wandbUrl" in found and not status.wandbUrl:
+        status.wandbUrl = found["wandbUrl"]
+    # Checkpointed periodically rather than per line: output arrives about thirteen times a
+    # second, and the point of the file is that a gateway restarted mid-run knows roughly where
+    # the run had got to -- not that it knows to the step.
+    now = time.monotonic()
+    if now - state.training_persisted_s >= TRAINING_STATUS_PERSIST_INTERVAL_S:
+        state.training_persisted_s = now
+        _persist_training_status(state)
+    if training_backend.is_progress_bar_noise(line):
+        return
+    message = training_backend.strip_progress_prefix(line)
+    status.lastLines = [*status.lastLines[-39:], message]
+    status.message = message[:300]
+
+
+# What lerobot_train prints once it has run every step it was asked for. Matched on the
+# trainer's own words rather than on a checkpoint existing, because checkpoints are also
+# written at every --save-freq: a run killed at step 15000 leaves one too.
+_TRAINING_SUCCESS_MARKER = "End of training"
+
+
+def _training_log_reports_success(log_path: Path) -> bool:
+    """Whether the trainer said it finished, read from the tail of its log."""
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 16384))
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    return _TRAINING_SUCCESS_MARKER in tail
+
+
+def _follow_training_run(
+    state: GatewayState,
+    log_path: Path,
+    pid: int,
+    process: subprocess.Popen[str] | None = None,
+    *,
+    from_start: bool,
+) -> None:
+    """Follow a run by reading the log file it writes, and record how it ended.
+
+    The run writes to that file itself; the gateway holds no pipe to it. That is the whole
+    point. A pipe makes the gateway's lifetime the run's lifetime -- kill the gateway and the
+    read end closes, so the next line the trainer writes takes SIGPIPE and the job dies. Which
+    is precisely what a deploy did, six thousand steps into a twenty-thousand step run.
+
+    Reading the file instead lets the gateway be restarted, or crash, while the run continues,
+    and makes re-attaching after a restart the same code path as following a run this process
+    started -- the only difference being whether there is a `process` to ask for an exit code.
+    """
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+            if not from_start:
+                # A re-attached run's backlog is already summarized in the persisted status;
+                # replaying thousands of lines would only rewrite it with the same numbers.
+                handle.seek(0, os.SEEK_END)
+            while True:
+                line = handle.readline()
+                if line:
+                    # tqdm redraws with carriage returns, so one "line" off the file can hold
+                    # many bar updates. Split them out, or the regexes match the first and the
+                    # displayed step lags by however many updates shared the line.
+                    for part in line.replace("\r", "\n").splitlines():
+                        output = part.rstrip()
+                        if not output:
+                            continue
+                        with state.lock:
+                            if state.training.pid != pid:
+                                return
+                            _apply_training_output(state, output)
+                    continue
+                alive = process.poll() is None if process is not None else _process_is_alive(pid)
+                if not alive:
+                    # One more pass: the run may have written its last lines between the read
+                    # above and the exit observed here.
+                    remaining = handle.read()
+                    for part in remaining.replace("\r", "\n").splitlines():
+                        output = part.rstrip()
+                        if not output:
+                            continue
+                        with state.lock:
+                            if state.training.pid != pid:
+                                return
+                            _apply_training_output(state, output)
+                    break
+                time.sleep(1.0)
+    except OSError as exc:
+        with state.lock:
+            if state.training.pid == pid:
+                state.training.message = f"Could not follow training log: {exc}"
+
+    return_code = process.wait() if process is not None else None
+    with state.lock:
+        if state.training.pid != pid:
+            return
+        state.training.finishedAt = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if state.training.state == "stopped":
+            pass
+        elif return_code is None:
+            # No exit code: this gateway inherited the run rather than starting it. Ask the
+            # trainer instead -- lerobot_train prints a line of its own when it finishes all
+            # its steps. That is evidence, not a guess; without it a run that completed
+            # perfectly gets reported as a failure purely because the gateway was restarted
+            # somewhere in the middle of it.
+            if _training_log_reports_success(log_path):
+                state.training.state = "complete"
+                state.training.message = (
+                    f"Training finished; checkpoints under {state.training.outputDir}"
+                )
+            else:
+                state.training.state = "error"
+                state.training.message = (
+                    "Training process ended while this gateway was not attached to it, and its "
+                    f"log does not report finishing; check {state.training.logPath}."
+                )
+        elif return_code == 0:
+            state.training.state = "complete"
+            state.training.message = f"Training finished; checkpoints under {state.training.outputDir}"
+        else:
+            state.training.state = "error"
+            state.training.message = f"Training exited with code {return_code}"
+        _persist_training_status(state)
+        state.log(
+            "info" if state.training.state == "complete" else "error",
+            f"Training run {state.training.jobName} finished"
+            + (
+                f" with code {return_code}"
+                if return_code is not None
+                else f" (no exit code; log says {state.training.state})"
+            ),
+        )
+
+
+def _training_run_state_path(state: GatewayState) -> Path:
+    return state.repo_root / "outputs" / "logs" / "training" / "current_run.json"
+
+
+def _persist_training_status(state: GatewayState) -> None:
+    """Record the run on disk so it outlives this gateway process.
+
+    Training runs for hours; the gateway is restarted by every deploy and does not survive a
+    crash. Both already leave the run itself alive -- it is started in its own session -- so
+    without this the GPU stays busy with a job the page can no longer show, report or stop.
+    """
+    path = _training_run_state_path(state)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Written via a temp file: a gateway killed mid-write would otherwise leave a
+        # truncated file, and the next one would start by failing to parse it.
+        temp_path = path.with_suffix(".json.tmp")
+        temp_path.write_text(json.dumps(asdict(state.training), indent=2), encoding="utf-8")
+        temp_path.replace(path)
+    except OSError as exc:
+        state.log("warn", f"Could not persist training run status: {exc}")
+
+
+def _process_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Alive, owned by someone else. Treated as alive so the page reports it rather than
+        # claiming the GPU is free.
+        return True
+    return True
+
+
+def _restore_training_run(state: GatewayState) -> None:
+    """Re-adopt a run left behind by a previous gateway, if it is still going."""
+    path = _training_run_state_path(state)
+    if not path.is_file():
+        return
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        state.log("warn", f"Ignoring unreadable training run status: {exc}")
+        return
+    if not isinstance(stored, dict):
+        return
+    fields = {field.name for field in dataclasses.fields(training_backend.TrainingRunStatus)}
+    status = training_backend.TrainingRunStatus(
+        **{key: value for key, value in stored.items() if key in fields}
+    )
+    if status.state not in ("syncing", "starting", "running") or not status.pid:
+        # A run that had already finished is kept for display, not followed.
+        state.training = status
+        return
+    if not _process_is_alive(int(status.pid)):
+        status.state = "error"
+        status.message = (
+            f"Training run {status.jobName} was interrupted (pid {status.pid} is gone). "
+            f"Its log is at {status.logPath}."
+        )
+        status.finishedAt = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        state.training = status
+        _persist_training_status(state)
+        state.log("warn", status.message)
+        return
+
+    state.training = status
+    state.log("info", f"Re-attached to training run {status.jobName} (pid {status.pid})")
+    log_path = Path(status.logPath)
+    if not log_path.is_file():
+        state.training.message = (
+            f"{status.jobName} is still running (pid {status.pid}), but its log file is gone; "
+            "progress cannot be followed from here."
+        )
+        return
+    Thread(
+        target=_follow_training_run,
+        args=(state, log_path, int(status.pid)),
+        kwargs={"from_start": False},
+        daemon=True,
+        name=f"training-tail-{status.pid}",
+    ).start()
+
+
+def _start_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    if _training_is_running(state):
+        raise ValueError("A training run is already in progress; stop it before starting another.")
+
+    host = training_backend.resolve_host(state.repo_root, str(payload.get("hostId") or ""))
+    view_name = str(payload.get("viewName") or "").strip()
+    views = {entry["name"]: entry for entry in _training_view_entries(state)}
+    if view_name not in views:
+        raise ValueError(f"Unknown training view {view_name!r}. Build it on the Dataset Export page first.")
+    view = views[view_name]
+    if view["episodes"] < 1:
+        raise ValueError(f"{view_name} has no episodes to train on.")
+
+    policy = str(payload.get("policy") or "act").strip() or "act"
+    job_name = str(payload.get("jobName") or "").strip() or f"{view_name}__{policy}"
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", job_name):
+        raise ValueError("Job name may only contain letters, digits, '.', '_' and '-'.")
+
+    # A remote host trains from its own checkout, so the code it runs is whatever was last
+    # synced there. Doing it here rather than leaving it to the operator is the difference
+    # between "training the fix" and "training whatever was there".
+    sync_result: dict[str, Any] = {"skipped": True}
+    if host.kind == "remote":
+        state.training.state = "syncing"
+        state.training.message = f"Syncing code to {host.sshTarget}…"
+        sync_result = training_backend.sync_repo_to_host(state.repo_root, host)
+        if not sync_result.get("ok"):
+            state.training.state = "error"
+            state.training.message = str(sync_result.get("message") or "sync failed")
+            raise ValueError(state.training.message)
+
+    wandb_enabled = bool(payload.get("wandbEnabled"))
+    wandb_key = training_backend.read_wandb_key(host.id) if wandb_enabled else ""
+    if wandb_enabled and not wandb_key:
+        raise ValueError(
+            f"W&B logging is on but no API key is stored for {host.label}. Add one on the Training page."
+        )
+    if wandb_enabled:
+        training_backend.push_wandb_key(host, wandb_key)
+
+    # The view path is the *host's*: a remote machine's repo lives elsewhere, and the local
+    # absolute path would silently miss.
+    view_root = view["root"]
+    if host.kind == "remote":
+        try:
+            relative = Path(view_root).relative_to(state.repo_root)
+        except ValueError:
+            raise ValueError(
+                f"{view_name} lives outside the repo ({view_root}); a remote host cannot resolve it."
+            ) from None
+        view_root = f"{host.repoDir}/{relative.as_posix()}"
+
+    argv = training_backend.build_train_argv(
+        host=host,
+        view_root=view_root,
+        repo_id=view["repoId"],
+        job_name=job_name,
+        policy=policy,
+        steps=int(payload.get("steps") or 20000),
+        batch_size=int(payload.get("batchSize") or 8),
+        num_workers=int(payload.get("numWorkers") or 4),
+        save_freq=int(payload.get("saveFreq") or 5000),
+        log_freq=int(payload.get("logFreq") or 100),
+        device=str(payload.get("device") or "auto"),
+        use_amp=bool(payload.get("useAmp")),
+        policy_config=str(payload.get("policyConfig") or ""),
+        wandb_enabled=wandb_enabled,
+        wandb_project=str(payload.get("wandbProject") or "lerobot"),
+        wandb_entity=str(payload.get("wandbEntity") or ""),
+    )
+    command, env = training_backend.build_launch_command(
+        state.repo_root, host, argv, wandb_key=wandb_key
+    )
+
+    log_dir = state.repo_root / "outputs" / "logs" / "training"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"train_{job_name}_{stamp}.log"
+
+    # The run's output goes straight to the log file, not through a pipe this gateway holds.
+    # With a pipe, the gateway's death closes the read end and the trainer takes SIGPIPE on its
+    # next line -- so restarting the gateway (which every deploy does) killed the job. Writing
+    # to the file makes the log the record and the gateway merely a reader of it, which is also
+    # what lets a restarted gateway pick the run back up.
+    with log_path.open("ab") as log_file:
+        process = subprocess.Popen(
+            command,
+            cwd=state.repo_root,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+    state.training_process = process
+    state.training = training_backend.TrainingRunStatus(
+        state="starting",
+        hostId=host.id,
+        hostLabel=host.label,
+        viewName=view_name,
+        viewRoot=view_root,
+        policy=policy,
+        jobName=job_name,
+        outputDir=f"outputs/train/{job_name}",
+        totalSteps=int(payload.get("steps") or 20000),
+        message=f"Training {policy} on {view_name} at {host.label}",
+        pid=process.pid,
+        startedAt=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        logPath=str(log_path),
+        wandbEnabled=wandb_enabled,
+    )
+    state.log("info", f"Started training {policy} on {view_name} at {host.label} (pid {process.pid})")
+    _persist_training_status(state)
+    Thread(
+        target=_follow_training_run,
+        args=(state, log_path, process.pid, process),
+        kwargs={"from_start": True},
+        daemon=True,
+        name=f"training-output-{process.pid}",
+    ).start()
+    return {"ok": True, "training": asdict(state.training), "sync": sync_result}
+
+
+def _stop_training_run(state: GatewayState) -> dict[str, Any]:
+    process = state.training_process
+    # A run re-adopted after a gateway restart has no Popen object -- the pipe died with the
+    # gateway that opened it -- but it is still on the GPU, so "stop" has to reach it by pid.
+    # Without this the only way to end such a run would be to ssh in and kill it by hand.
+    pid = process.pid if process is not None else state.training.pid
+    running = process.poll() is None if process is not None else bool(pid and _process_is_alive(int(pid)))
+    if not pid or not running:
+        return {"ok": True, "training": asdict(state.training), "message": "No training run is active."}
+    state.training.state = "stopped"
+    state.training.message = "Stopping training run…"
+    try:
+        # The whole session: a remote run is an ssh client with the trainer on the far end,
+        # and killing only the client would leave the GPU busy with an orphan.
+        os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        if process is not None:
+            process.terminate()
+    state.log("warn", f"Stopped training run {state.training.jobName}")
+    _persist_training_status(state)
+    return {"ok": True, "training": asdict(state.training)}
 
 
 def _annotation_store_path(dataset_root: Path) -> Path:
@@ -5263,6 +5741,11 @@ def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
                 "updatedAtMs": int(modified_s * 1000),
                 "totalEpisodes": total_episodes,
                 "totalFrames": total_frames,
+                # The rate these frames were captured at. Surfaced because the training view is
+                # built by decimating it, and only integer ratios are possible -- the page needs
+                # this to say that 60 -> 25 is impossible before the operator clicks, rather than
+                # after the exporter has been started and refused.
+                "fps": int(info.get("fps") or 0),
                 "dataStatus": _recorded_dataset_status(dataset_root),
                 "sourcePath": str(data_files[-1]) if data_files else "",
                 "isLatest": latest_recorded is not None and dataset_root == latest_recorded,
@@ -5602,6 +6085,25 @@ def _camera_feature_items(info: dict[str, Any]) -> list[dict[str, Any]]:
         width = int(shape[1]) if len(shape) >= 2 and isinstance(shape[1], (int, float)) else 0
         items.append({"key": key, "width": width, "height": height})
     return items
+
+
+def _parse_training_view_fps(raw: str) -> int:
+    """Validate the requested view rate before it becomes a command-line argument.
+
+    Refused here rather than left to the exporter so the operator gets the answer in the
+    click that asked for it, instead of in a build log minutes later.
+    """
+    if not raw.strip():
+        return DEFAULT_TRAINING_VIEW_FPS
+    try:
+        fps = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"view_fps must be an integer, got {raw!r}") from exc
+    if fps not in TRAINING_VIEW_FPS_CHOICES:
+        raise ValueError(
+            f"view_fps must be one of {TRAINING_VIEW_FPS_CHOICES} (0 = keep the source rate), got {fps}"
+        )
+    return fps
 
 
 def _parse_training_view_camera_crops(raw: str) -> dict[str, list[int]]:
@@ -7709,6 +8211,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "tasks": _tasks_with_progress(state),
         "activeTaskId": state.active_task_id or "",
         "datasetExport": asdict(state.dataset_export),
+        "training": asdict(state.training),
     }
 
 
@@ -9591,9 +10094,23 @@ def _real_replay_command(
 
 
 def _real_robot_ip(state: GatewayState) -> str:
+    """The robot this profile drives, from its own config -- with no fallback.
+
+    There used to be one: 192.168.1.208, which is the *DAS* rig's arm (see
+    tools/fr3/fr3_das_replay_real.py and the rest of the fr3_*_das_* tooling). Reaching it
+    meant the loaded profile had not declared a robot, and the gateway would then send real
+    motion commands to a different rig's address -- succeeding if something answered there.
+    A profile that drives a robot names it; one that does not should say so here.
+    """
     replay = _replay_config(state.config)
     robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
-    return str(replay.get("robot_ip") or robot.get("robot_ip") or DEFAULT_REAL_ROBOT_IP)
+    robot_ip = replay.get("robot_ip") or robot.get("robot_ip")
+    if not robot_ip:
+        raise ValueError(
+            "No robot IP in this profile's config: set robot.robot_ip (or replay.robot_ip) in "
+            f"{state.config_path}."
+        )
+    return str(robot_ip)
 
 
 def _real_preflight_command(state: GatewayState, robot_ip: str | None = None) -> list[str]:
@@ -10250,6 +10767,57 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             view_id = query.get("view", [""])[0]
             _serve_teleop_camera_snapshot(self, state=self.server.state, view_id=view_id)
             return
+        if path == "/api/training/hosts":
+            state = self.server.state
+            _json_response(
+                self,
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "hosts": [asdict(host) for host in training_backend.all_hosts(state.repo_root)],
+                },
+            )
+            return
+        if path == "/api/training/machine":
+            state = self.server.state
+            host_id = query.get("host", [training_backend.LOCAL_HOST_ID])[0]
+            try:
+                host = training_backend.resolve_host(state.repo_root, host_id)
+            except training_backend.TrainingError as exc:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                return
+            # Probing shells out and can block for seconds on an unreachable host, so it runs
+            # without the state lock: holding it would stall every other page's polling.
+            report = training_backend.probe_machine(state.repo_root, host)
+            _json_response(
+                self,
+                HTTPStatus.OK,
+                {
+                    "ok": bool(report.get("ok")),
+                    "host": asdict(host),
+                    "machine": report,
+                    "wandb": training_backend.wandb_status(host.id),
+                },
+            )
+            return
+        if path == "/api/training/views":
+            with self.server.state.lock:
+                _json_response(
+                    self, HTTPStatus.OK, {"ok": True, "views": _training_view_entries(self.server.state)}
+                )
+            return
+        if path == "/api/training/status":
+            with self.server.state.lock:
+                _json_response(
+                    self, HTTPStatus.OK, {"ok": True, "training": asdict(self.server.state.training)}
+                )
+            return
+        if path == "/api/training/wandb":
+            host_id = query.get("host", [training_backend.LOCAL_HOST_ID])[0]
+            _json_response(
+                self, HTTPStatus.OK, {"ok": True, "wandb": training_backend.wandb_status(host_id)}
+            )
+            return
         if path == "/api/calibration/rig-check":
             _json_response(self, HTTPStatus.OK, _last_rig_check(self.server.state))
             return
@@ -10533,6 +11101,58 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 HTTPStatus.CONFLICT,
                 {"error": f"{path} is unavailable in the workstation profile"},
             )
+            return
+        if path.startswith("/api/training/"):
+            state = self.server.state
+            body = _read_json_body(self)
+            try:
+                if path == "/api/training/hosts/add":
+                    host = training_backend.add_remote_host(
+                        label=str(body.get("label") or ""),
+                        ssh_target=str(body.get("sshTarget") or ""),
+                        repo_dir=str(body.get("repoDir") or ""),
+                        python_path=str(body.get("pythonPath") or ""),
+                    )
+                    _json_response(self, HTTPStatus.OK, {"ok": True, "host": asdict(host)})
+                    return
+                if path == "/api/training/hosts/remove":
+                    training_backend.remove_remote_host(str(body.get("hostId") or ""))
+                    _json_response(self, HTTPStatus.OK, {"ok": True})
+                    return
+                if path == "/api/training/wandb":
+                    host_id = str(body.get("hostId") or training_backend.LOCAL_HOST_ID)
+                    if body.get("clear"):
+                        training_backend.clear_wandb_key(host_id)
+                    else:
+                        training_backend.set_wandb_key(host_id, str(body.get("apiKey") or ""))
+                    _json_response(
+                        self,
+                        HTTPStatus.OK,
+                        {"ok": True, "wandb": training_backend.wandb_status(host_id)},
+                    )
+                    return
+                if path == "/api/training/sync":
+                    host = training_backend.resolve_host(state.repo_root, str(body.get("hostId") or ""))
+                    result = training_backend.sync_repo_to_host(state.repo_root, host)
+                    _json_response(self, HTTPStatus.OK, {"ok": bool(result.get("ok")), "sync": result})
+                    return
+                if path == "/api/training/start":
+                    # Started outside the lock for the same reason the probe is: a remote start
+                    # runs an rsync first, and that can take a minute.
+                    result = _start_training_run(state, body)
+                    _json_response(self, HTTPStatus.OK, result)
+                    return
+                if path == "/api/training/stop":
+                    with state.lock:
+                        _json_response(self, HTTPStatus.OK, _stop_training_run(state))
+                    return
+            except training_backend.TrainingError as exc:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                return
+            except ValueError as exc:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                return
+            _json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": f"unknown route {path}"})
             return
         if path == "/api/handheld/record/connect":
             # Free the cameras before the recorder opens them: live Device
@@ -10910,6 +11530,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                             camera_crops=_parse_training_view_camera_crops(
                                 (query.get("camera_crops", [""])[0] or "").strip()
                             ),
+                            view_fps=_parse_training_view_fps(
+                                (query.get("view_fps", [""])[0] or "").strip()
+                            ),
                         )
                     else:
                         _start_approved_dataset_export(
@@ -10974,6 +11597,7 @@ def make_state(
     )
     state.replay.mujocoValidation = _new_mujoco_validation(state)
     _load_active_calibration_runs(state)
+    _restore_training_run(state)
     if profile == "workstation":
         urdf_path, sim_xml_path = _fr3_pika_asset_paths(resolved_root)
         state.teleop.urdfPath = str(urdf_path)

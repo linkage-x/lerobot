@@ -3643,3 +3643,283 @@ def test_selecting_a_dataset_moves_the_status_onto_its_own_rate(tmp_path):
 
     assert state.replay.fps == 30
 
+
+
+# --------------------------------------------------------- training view frame rate ---
+
+
+def test_training_view_command_carries_the_requested_frame_rate(tmp_path):
+    """The rate is on the command line, not left to the exporter's default.
+
+    It decides what the action column *means* -- a per-frame delta built at 30 fps from a
+    60 fps recording is twice the displacement of the same motion at 60 -- and the command is
+    what the event log records, so the rate has to be visible there.
+    """
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+
+    command, _ = gateway._training_view_command(
+        state, dataset_root, "delta_ee_from_prev_cmd", view_fps=30
+    )
+    assert command[command.index("--view-fps") + 1] == "30"
+
+    command, _ = gateway._training_view_command(
+        state, dataset_root, "delta_ee_from_prev_cmd", view_fps=0
+    )
+    assert command[command.index("--view-fps") + 1] == "0"
+
+
+def test_training_view_command_defaults_to_the_baseline_rate(tmp_path):
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+
+    command, _ = gateway._training_view_command(state, dataset_root, "delta_ee_from_prev_cmd")
+
+    assert command[command.index("--view-fps") + 1] == str(gateway.DEFAULT_TRAINING_VIEW_FPS)
+    assert gateway.DEFAULT_TRAINING_VIEW_FPS == 30
+
+
+def test_view_fps_query_is_validated_before_it_becomes_an_argument():
+    assert gateway._parse_training_view_fps("") == gateway.DEFAULT_TRAINING_VIEW_FPS
+    assert gateway._parse_training_view_fps("60") == 60
+    # 0 is "keep the source rate", which the exporter allows only when the sources agree.
+    assert gateway._parse_training_view_fps("0") == 0
+    with pytest.raises(ValueError, match="must be an integer"):
+        gateway._parse_training_view_fps("thirty")
+    # Refused here rather than minutes later in a build log.
+    with pytest.raises(ValueError, match="must be one of"):
+        gateway._parse_training_view_fps("25")
+
+
+def test_recorded_dataset_items_report_capture_rate(tmp_path):
+    """The page needs the source rate to say that 60 -> 25 is impossible before the click."""
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+
+    items = {item["path"]: item for item in gateway._recorded_dataset_items(state)}
+
+    assert items[str(dataset_root)]["fps"] == 30
+
+
+# ----------------------------------------------------- training runs across restarts ---
+
+
+def _training_run_state(tmp_path, **status_fields):
+    state, _dataset_root, _view_root = _training_view_state(tmp_path)
+    state.training = gateway.training_backend.TrainingRunStatus(**status_fields)
+    return state
+
+
+def _as_restarted_gateway(state):
+    """The same repo seen by a fresh gateway process: on-disk state kept, memory cleared."""
+    state.training = gateway.training_backend.TrainingRunStatus()
+    state.training_process = None
+    return state
+
+
+def test_a_running_job_is_re_adopted_by_the_next_gateway(tmp_path, monkeypatch):
+    """Training outlives the gateway; every deploy restarts it.
+
+    The run is started in its own session, so it survives -- which without this would leave
+    the GPU busy with a job the page shows as idle and has no way to stop.
+    """
+    state = _training_run_state(
+        tmp_path,
+        state="running",
+        jobName="baseline__act",
+        pid=4242,
+        step=1300,
+        totalSteps=20000,
+        logPath=str(tmp_path / "train.log"),
+    )
+    (tmp_path / "train.log").write_text("", encoding="utf-8")
+    gateway._persist_training_status(state)
+
+    monkeypatch.setattr(gateway, "_process_is_alive", lambda pid: pid == 4242)
+    restored = _as_restarted_gateway(state)
+    gateway._restore_training_run(restored)
+
+    assert restored.training.state == "running"
+    assert restored.training.jobName == "baseline__act"
+    assert restored.training.step == 1300
+    assert restored.training.pid == 4242
+
+
+def test_a_job_that_died_with_the_gateway_is_reported_as_interrupted(tmp_path, monkeypatch):
+    """Not "complete": nothing observed how it ended, so nothing may claim it succeeded."""
+    state = _training_run_state(
+        tmp_path, state="running", jobName="baseline__act", pid=4242, logPath=str(tmp_path / "train.log")
+    )
+    gateway._persist_training_status(state)
+
+    monkeypatch.setattr(gateway, "_process_is_alive", lambda pid: False)
+    restored = _as_restarted_gateway(state)
+    gateway._restore_training_run(restored)
+
+    assert restored.training.state == "error"
+    assert "interrupted" in restored.training.message
+    assert restored.training.finishedAt != ""
+
+
+def test_a_finished_job_is_shown_but_not_followed(tmp_path, monkeypatch):
+    state = _training_run_state(
+        tmp_path, state="complete", jobName="baseline__act", pid=4242, step=20000, totalSteps=20000
+    )
+    gateway._persist_training_status(state)
+
+    # Would raise if the restore tried to follow it; a completed run must not consult the pid,
+    # because that pid has long since been reused by something else.
+    monkeypatch.setattr(
+        gateway, "_process_is_alive", lambda pid: pytest.fail("a finished run must not be probed")
+    )
+    restored = _as_restarted_gateway(state)
+    gateway._restore_training_run(restored)
+
+    assert restored.training.state == "complete"
+    assert restored.training.step == 20000
+
+
+def test_an_unreadable_status_file_does_not_stop_the_gateway_from_starting(tmp_path):
+    state = _training_run_state(tmp_path)
+    path = gateway._training_run_state_path(state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{ truncated", encoding="utf-8")
+
+    gateway._restore_training_run(state)
+
+    assert state.training.state == "idle"
+
+
+def test_a_re_adopted_run_can_still_be_stopped(tmp_path, monkeypatch):
+    """It has no Popen object -- the pipe died with the previous gateway -- only a pid."""
+    state = _training_run_state(tmp_path, state="running", jobName="baseline__act", pid=4242)
+    state.training_process = None
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(gateway, "_process_is_alive", lambda pid: True)
+    monkeypatch.setattr(gateway.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(gateway.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+
+    result = gateway._stop_training_run(state)
+
+    assert result["ok"] is True
+    assert killed == [(4242, gateway.signal.SIGTERM)]
+    assert state.training.state == "stopped"
+
+
+def test_stopping_when_nothing_runs_says_so_instead_of_killing_a_reused_pid(tmp_path, monkeypatch):
+    state = _training_run_state(tmp_path, state="complete", jobName="baseline__act", pid=4242)
+    state.training_process = None
+    monkeypatch.setattr(gateway, "_process_is_alive", lambda pid: False)
+    monkeypatch.setattr(
+        gateway.os, "killpg", lambda pgid, sig: pytest.fail("must not signal a pid that is gone")
+    )
+
+    result = gateway._stop_training_run(state)
+
+    assert result["message"] == "No training run is active."
+
+
+def test_the_visible_log_keeps_real_lines_and_drops_bare_progress_bars(tmp_path):
+    state = _training_run_state(tmp_path, state="running", jobName="baseline__act", totalSteps=20000)
+
+    gateway._apply_training_output(state, "Training:   6%|x | 1299/20000 [01:33<27:58, 11.14step/s]")
+    gateway._apply_training_output(
+        state,
+        "Training:   7%|x | 1307/20000 [01:33<23:52, 13.05step/s]"
+        "INFO 2026-08-19 16:03:36 ot_train.py:518 step:1K loss:1.656 grdn:59.609",
+    )
+
+    # Both bars advanced the step; only the one carrying a message is shown.
+    assert state.training.step == 1307
+    assert state.training.loss == pytest.approx(1.656)
+    assert state.training.lastLines == [
+        "INFO 2026-08-19 16:03:36 ot_train.py:518 step:1K loss:1.656 grdn:59.609"
+    ]
+
+
+def test_the_run_is_followed_through_its_log_file_not_a_pipe(tmp_path, monkeypatch):
+    """A pipe would make the gateway's lifetime the run's lifetime.
+
+    The gateway holds the read end; killing it (which every deploy does) closes that end, and
+    the trainer takes SIGPIPE on its next line. That is how a twenty-thousand step run died at
+    step six thousand. The run must write to the log file itself.
+    """
+    state, _dataset_root, view_root = _training_view_state(tmp_path)
+    (view_root / "meta" / "info.json").write_text(
+        json.dumps(
+            {
+                "fps": 30,
+                "total_episodes": 2,
+                "total_frames": 4,
+                "features": {"observation.images.ee": {"dtype": "video", "shape": [480, 640, 3]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 5150
+
+        def poll(self):
+            return 0
+
+        def wait(self):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        captured.update(kwargs)
+        captured["command"] = command
+        return FakeProcess()
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", fake_popen)
+    gateway._start_training_run(
+        state, {"hostId": "local", "viewName": view_root.name, "policy": "act", "steps": 10}
+    )
+
+    assert captured["stdout"] is not gateway.subprocess.PIPE
+    # A real file object, so the child owns the write end and nothing here can break it.
+    assert hasattr(captured["stdout"], "fileno")
+    assert captured["stderr"] == gateway.subprocess.STDOUT
+    # Its own session, so a signal sent to the gateway's group does not reach it either.
+    assert captured["start_new_session"] is True
+
+
+def test_a_second_run_is_refused_while_a_re_adopted_one_is_still_going(tmp_path, monkeypatch):
+    """The guard has to see runs this gateway did not start.
+
+    After a restart the live run has a pid and no Popen object. Answering "nothing is
+    running" would put a second ACT job on the same 24 GB card, and neither would survive.
+    """
+    state, _dataset_root, view_root = _training_view_state(tmp_path)
+    state.training = gateway.training_backend.TrainingRunStatus(
+        state="running", jobName="baseline__act", pid=4242
+    )
+    state.training_process = None
+    monkeypatch.setattr(gateway, "_process_is_alive", lambda pid: True)
+
+    assert gateway._training_is_running(state) is True
+    with pytest.raises(ValueError, match="already in progress"):
+        gateway._start_training_run(state, {"hostId": "local", "viewName": view_root.name})
+
+    # Once it is gone, the next run is allowed.
+    monkeypatch.setattr(gateway, "_process_is_alive", lambda pid: False)
+    assert gateway._training_is_running(state) is False
+
+
+def test_output_arriving_after_a_stop_does_not_undo_the_stop(tmp_path):
+    """A stopped run keeps logging until it dies.
+
+    Letting those lines put it back into "running" loses the operator's stop, and the
+    non-zero exit that follows a SIGTERM then gets reported as a failure instead of as the
+    thing they asked for.
+    """
+    state, _dataset_root, _view_root = _training_view_state(tmp_path)
+    state.training = gateway.training_backend.TrainingRunStatus(state="starting", jobName="j")
+
+    gateway._apply_training_output(state, "Training: 1%| | 100/20000 [00:07<20:00, 13.5step/s]")
+    assert state.training.state == "running"
+
+    state.training.state = "stopped"
+    gateway._apply_training_output(state, "Training: 1%| | 120/20000 [00:09<20:00, 13.5step/s]")
+
+    assert state.training.state == "stopped"
+    # Progress still tracked; only the state is pinned.
+    assert state.training.step == 120
