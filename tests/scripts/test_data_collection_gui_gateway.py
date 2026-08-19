@@ -2926,6 +2926,57 @@ def test_capture_recorder_start_pose_writes_workstation_command(tmp_path):
     assert state.recording.message == "Start pose capture requested"
 
 
+def test_reset_recorder_start_pose_writes_workstation_command(tmp_path):
+    """Reset Home is the undo for Set Home, so it goes down the same stdin channel."""
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(tmp_path), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test", state="recording", pid=4321),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path,
+        profile="workstation",
+    )
+    state.process = _FakeRecorderProcess()
+
+    gateway._reset_recorder_start_pose(state)
+
+    assert state.process.stdin.writes == ["reset_start_pose\n"]
+    assert state.recording.message == "Start pose reset requested"
+
+
+def test_reset_recorder_start_pose_rejects_thor_profile(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(tmp_path), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test", state="recording", pid=4321),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path,
+    )
+    state.process = _FakeRecorderProcess()
+
+    with pytest.raises(RuntimeError, match="FR3 workstation"):
+        gateway._reset_recorder_start_pose(state)
+
+
+def test_reset_recorder_start_pose_needs_a_live_recorder(tmp_path):
+    """Nothing to undo before Connect: the capture only exists inside a running recorder."""
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(tmp_path), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test", state="idle"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path,
+        profile="workstation",
+    )
+    state.process = _FakeRecorderProcess()
+
+    with pytest.raises(RuntimeError, match="idle"):
+        gateway._reset_recorder_start_pose(state)
+
+
 def test_capture_recorder_start_pose_rejects_thor_profile(tmp_path):
     state = gateway.GatewayState(
         repo_root=tmp_path,
@@ -3478,3 +3529,81 @@ def test_the_gains_payload_carries_the_axis_calibration(tmp_path):
     assert set(payload["axisCalibration"]) == set(gateway.FR3_TELEOP_AXIS_GAINS)
     assert payload["axisCalibration"]["scale_x"] == 1.0
     assert payload["axisCalibration"]["scale_z"] < 0.6
+
+
+# ----------------------------------------------------------------- replay frame rate ---
+#
+# `ReplayStatus.fps` is seeded from the recorder config's `dataset.fps`, which says what the *next*
+# recording will do. The moment the recording rate is changed, every dataset recorded before it
+# replays at the wrong rate -- and neither symptom looks like a frame-rate bug. The preview video is
+# encoded at the wrong rate so the arm runs against the timeline at fps_used/fps_recorded speed, and
+# `fr3_gui_replay_runtime` derives the sim's `teleop_control_frequency` from it, so each command is
+# integrated for a fraction of a frame period and the tracking score fails on a servo window rather
+# than on the trajectory. Measured on eeframe_fr3_spacemouse_20260813_160401 episode 0, a 30 fps
+# recording replayed at 60 scored 43.26 mm / 8.23 deg against 4.88 mm / 0.64 deg at its own rate.
+
+
+def _fps_state(tmp_path, *, config_fps: int, dataset_fps: int | None):
+    dataset_root = tmp_path / "repo" / "outputs" / "datasets" / "episode_set"
+    (dataset_root / "meta").mkdir(parents=True, exist_ok=True)
+    if dataset_fps is not None:
+        (dataset_root / "meta" / "info.json").write_text(
+            json.dumps({"fps": dataset_fps, "total_episodes": 1, "total_frames": 10}), encoding="utf-8"
+        )
+    state = gateway.GatewayState(
+        profile="workstation",
+        repo_root=tmp_path / "repo",
+        config_path=tmp_path / "repo" / "config.yaml",
+        config={"dataset": {"fps": config_fps, "repo_id": "local/test"}, "robot": {}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test", fps=config_fps, episode=0),
+        datasets_root=dataset_root.parent,
+    )
+    return state, dataset_root
+
+
+def test_replay_runs_at_the_rate_the_dataset_was_recorded_at(tmp_path):
+    state, dataset_root = _fps_state(tmp_path, config_fps=60, dataset_fps=30)
+
+    assert gateway._replay_fps(state, dataset_root) == 30
+
+    command = gateway._fr3_mujoco_replay_command(state, dataset_root)
+    assert command[command.index("--fps") + 1] == "30", (
+        "the MuJoCo gate would encode the preview at 60 and give the sim half the settling time per "
+        "command, then report the difference as tracking error"
+    )
+
+
+def test_real_replay_takes_the_frame_rate_from_the_dataset_too(tmp_path):
+    """The hardware path shares the runtime, so it shares the failure."""
+    state, dataset_root = _fps_state(tmp_path, config_fps=60, dataset_fps=30)
+
+    command = gateway._fr3_real_replay_command(state, dataset_root, "192.168.1.206")
+
+    assert command[command.index("--fps") + 1] == "30"
+
+
+def test_a_dataset_that_declares_no_rate_keeps_the_status_value(tmp_path):
+    """Thor datasets and half-written roots have no meta/info.json; they must not become 30 silently."""
+    state, dataset_root = _fps_state(tmp_path, config_fps=60, dataset_fps=None)
+
+    assert gateway._dataset_declared_fps(dataset_root) is None
+    assert gateway._replay_fps(state, dataset_root) == 60
+
+
+def test_an_unusable_declared_rate_is_ignored_rather_than_trusted(tmp_path):
+    state, dataset_root = _fps_state(tmp_path, config_fps=60, dataset_fps=0)
+
+    assert gateway._dataset_declared_fps(dataset_root) is None
+    assert gateway._replay_fps(state, dataset_root) == 60
+
+
+def test_selecting_a_dataset_moves_the_status_onto_its_own_rate(tmp_path):
+    """The timeline reads ReplayStatus.fps, so the scrubber is wrong until this is corrected."""
+    state, dataset_root = _fps_state(tmp_path, config_fps=60, dataset_fps=30)
+    (dataset_root / "data" / "chunk-000").mkdir(parents=True, exist_ok=True)
+
+    state.replay.fps = gateway._dataset_declared_fps(dataset_root) or state.replay.fps
+
+    assert state.replay.fps == 30
+

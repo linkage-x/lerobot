@@ -61,6 +61,11 @@ from lerobot.robots.franka_research3.processor_franka_research3 import (  # noqa
 from lerobot.utils.rotation import Rotation  # noqa: E402
 
 from tools.fr3.fr3_gui_record_runtime import build_sim_robot_config, _resolve_workspace_path  # noqa: E402
+from tools.fr3.fr3_tool_frame_check import (  # noqa: E402
+    ToolFrameError,
+    require_frame,
+    workspace_clip_report,
+)
 
 ACTION_FEATURE = "action"
 OBSERVATION_FEATURE = "observation.state"
@@ -71,6 +76,59 @@ _PROGRESS_EVERY = 25
 
 def emit(line: str) -> None:
     print(line, flush=True)
+
+
+def _preflight_contract(robot_cfg: Any, action_positions: Any) -> list[str]:
+    """Refuse to replay a dataset the config cannot mean, before the arm is even connected.
+
+    Replay reads recorded poses and commands them. Two properties of the config decide what those
+    numbers mean, and neither is recorded in the dataset:
+
+    * ``target_frame_name`` -- the two FR3 tool frames are 410.85 mm apart and share an orientation,
+      so replaying one dataset under the other frame does not fail. It drives the fingertips to
+      where the other frame's origin used to be, for the whole episode.
+    * ``workspace_min``/``workspace_max`` -- ``_make_pose_from_absolute_action`` clips absolute
+      replay commands too, so a box that no longer contains the recorded trajectory does not stop
+      the replay. It flattens it against a wall and then the tracking score is computed against the
+      flattened version, which is a number about a trajectory nobody recorded.
+
+    Both used to be silent. This is the check the prose in WORKSTATION_RECORDING.md was standing in
+    for; a comment is not a mechanism.
+    """
+    positions = np.asarray(action_positions, dtype=np.float64)
+    configured_frame = str(getattr(robot_cfg, "target_frame_name", "") or "")
+
+    if configured_frame:
+        try:
+            errors = require_frame("this episode", positions[0], configured_frame)
+        except ToolFrameError as exc:
+            emit(f"ERROR: {exc}")
+            emit(
+                "Convert the dataset with tools/fr3/fr3_migrate_tool_frame.py, or replay it against "
+                "a config whose robot.target_frame_name matches the frame it was recorded in."
+            )
+            return [str(exc)]
+        emit(f"Tool frame: {configured_frame} (episode start {errors[configured_frame] * 1e3:.1f} mm from home)")
+
+    workspace_min = getattr(robot_cfg, "workspace_min", None)
+    workspace_max = getattr(robot_cfg, "workspace_max", None)
+    if workspace_min is not None and workspace_max is not None:
+        outside, worst_m, details = workspace_clip_report(positions, workspace_min, workspace_max)
+        if outside:
+            reason = (
+                f"robot.workspace_min/max would clip {outside} of {len(positions)} commanded poses "
+                f"({100.0 * outside / max(len(positions), 1):.1f}%), displacing them by up to "
+                f"{worst_m * 1e3:.1f} mm: {'; '.join(details)}"
+            )
+            emit(f"ERROR: {reason}.")
+            emit(
+                "The clip applies to absolute replay commands, so this would not fail -- it would "
+                "reshape the trajectory and then score the reshaped one. Widen the box for this "
+                "replay, or replay a dataset the box was derived for."
+            )
+            return [reason]
+
+    return []
 
 
 def _replay_robot_config(record_cfg: Any, args: argparse.Namespace, fps: int) -> Any:
@@ -354,6 +412,33 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
     fps = int(args.fps or episode_data["fps"] or 30)
     real_backend = args.backend == "real"
     robot_cfg = _replay_robot_config(record_cfg, args, fps)
+    contract_failures = _preflight_contract(robot_cfg, action_positions)
+    if contract_failures:
+        # A verdict about the *contract*, not about the trajectory: no arm was connected and no pose
+        # was tracked, so every error field stays at zero and `reasons` carries what went wrong. The
+        # gateway's parser sees a well-formed failure instead of a missing result line.
+        return {
+            "schema_version": 1,
+            "dataset": str(dataset_root),
+            "episode": int(args.episode),
+            "fps": fps,
+            "status": "failed",
+            "reasons": contract_failures,
+            "completed_frames": 0,
+            "total_frames": total_frames,
+            "avg_position_error_mm": 0.0,
+            "max_position_error_mm": 0.0,
+            "avg_rotation_error_deg": 0.0,
+            "max_rotation_error_deg": 0.0,
+            "limits": {
+                "max_position_error_mm": float(args.max_position_error_mm),
+                "max_rotation_error_deg": float(args.max_rotation_error_deg),
+            },
+            "backend": str(args.backend),
+            "robot_type": "",
+            "video_frames": 0,
+            "native_video_path": "",
+        }
     robot = make_robot_from_config(robot_cfg)
 
     frame_period_s = 1.0 / max(fps, 1)

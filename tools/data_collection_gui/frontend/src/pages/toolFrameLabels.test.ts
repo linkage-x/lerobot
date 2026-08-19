@@ -4,7 +4,7 @@ import episodeReplayPageSource from "./EpisodeReplayPage.tsx?raw";
 import teleoperationPageSource from "./TeleoperationPage.tsx?raw";
 
 /**
- * The two FR3 tool frames are 411.85 mm apart on the same URDF and share an orientation, so
+ * The two FR3 tool frames are 410.85 mm apart on the same URDF and share an orientation, so
  * replaying a dataset recorded in the other one does not fail -- the arm puts the fingertips where
  * the other frame's origin was and runs to completion. The label an operator reads before pressing
  * Run is therefore load-bearing, and it has to come from the snapshot (`targetFrameName`, which the

@@ -4,9 +4,9 @@ robot:
   gripper_port: /dev/serial/by-path/pci-0000:00:14.0-usb-0:9.1.4:1.0-port0
   allow_mock_gripper: false
   urdf_path: /lerobot/src/lerobot/robots/franka_research3/assets/franka_fr3/fr3_pika_gripper.urdf
-  # The finger working-point midpoint. `pika_task_tcp` sits 411.85 mm behind it (a literal carried
-  # over from the free-flying quest3 wrist model, see test_fr3_tool_frame_geometry.py), which makes
-  # it a lever: `send_action` composes rotation about the *target frame origin*
+  # The finger working-point midpoint. `pika_task_tcp` sits 410.85 mm behind this frame (a literal
+  # carried over from the free-flying quest3 wrist model, see test_fr3_tool_frame_geometry.py),
+  # which makes it a lever: `send_action` composes rotation about the *target frame origin*
   # (franka_research3.py: desired_pose[:3,:3] = reference @ delta_rot), so a 45 deg wrist command
   # swept the fingertips through a 314 mm arc -- which is why the roll/pitch teleop axes below used
   # to be pinned to 0. Recording against the tool point makes rotation a rotation.

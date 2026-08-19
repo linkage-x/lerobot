@@ -4,7 +4,7 @@
 
 ``send_action`` clips the *target frame origin* to ``workspace_min/max`` (franka_research3.py), so
 the box describes wherever the configured frame happens to be -- not a region of the room. The two
-FR3 tool frames are 411.85 mm apart, so naming the other one silently moves the fence by that much
+FR3 tool frames are 410.85 mm apart, so naming the other one silently moves the fence by that much
 while every number in it stays the same. The rig switched to ``pika_gripper_ee`` (the finger
 working-point midpoint) so that a rotation command pivots at the fingertips instead of swinging
 them through a 0.41 m arc; the box was re-derived from the workstation table in the same change.

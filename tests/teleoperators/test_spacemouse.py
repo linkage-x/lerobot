@@ -95,7 +95,8 @@ def test_get_action_maps_axes_and_scales(teleop):
     assert action["target_x"] == pytest.approx(0.3 * teleop.translation_scale_vector[0])
     assert action["target_y"] == pytest.approx(0.2 * teleop.translation_scale_vector[1])
     assert action["target_z"] == pytest.approx(0.4 * teleop.translation_scale_vector[2])
-    assert action["target_wx"] == pytest.approx(0.5 * teleop.rotation_scale_vector[0])
+    # rotation_axis_map negates roll: +raw_wx is a negative rotation about the tool x axis.
+    assert action["target_wx"] == pytest.approx(-0.5 * teleop.rotation_scale_vector[0])
     assert action["target_wy"] == pytest.approx(-0.6 * teleop.rotation_scale_vector[1])
     assert action["target_wz"] == pytest.approx(0.7 * teleop.rotation_scale_vector[2])
 
@@ -155,7 +156,8 @@ def test_get_action_zeroes_subthreshold_axes_even_when_other_axis_is_active(monk
     assert action["target_x"] == pytest.approx(0.0)
     assert action["target_y"] == pytest.approx(0.03 * teleop.translation_scale_vector[1])
     assert action["target_z"] == pytest.approx(0.0)
-    assert action["target_wx"] == pytest.approx(0.05 * teleop.rotation_scale_vector[0])
+    # rotation_axis_map negates roll: +raw_wx is a negative rotation about the tool x axis.
+    assert action["target_wx"] == pytest.approx(-0.05 * teleop.rotation_scale_vector[0])
     assert action["target_wy"] == pytest.approx(0.0)
     assert action["target_wz"] == pytest.approx(0.0)
     teleop.disconnect()
@@ -757,3 +759,62 @@ def test_pyspacemouse_driver_raises_when_device_index_out_of_range(monkeypatch):
 
     with pytest.raises(ConnectionError, match="out of range"):
         driver.connect()
+
+
+# ------------------------------------------------------------------- rotation axis convention ---
+#
+# Roll and pitch were pinned off (`scale_wx: 0.0` / `scale_wy: 0.0` in fr3_record_config.yaml) for
+# as long as the rig recorded against pika_task_tcp, because rotating about a frame 411 mm behind
+# the fingers swung them through an arc. Nothing exercised those two axes in that whole period, so
+# an inverted roll sat in the default map unnoticed until the switch to pika_gripper_ee turned them
+# back on and an operator felt the tool roll the wrong way. These pin the convention so it cannot
+# drift back silently -- there is no way to notice it from reading the code.
+
+
+def test_roll_is_inverted_relative_to_the_raw_device_axis(monkeypatch):
+    """+raw_wx must command a *negative* rotation about the tool x axis."""
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    teleop = SpaceMouseTeleop(SpaceMouseTeleopConfig(bias_sample_count=0, move_time=0.0))
+    teleop.connect()
+    teleop._driver.readings.append(
+        SpaceMouseReading(translation=[0.0, 0.0, 0.0], rotation=[0.5, 0.0, 0.0], buttons=(False, False))
+    )
+
+    action = teleop.get_action()
+
+    assert action["target_wx"] == pytest.approx(-0.5 * teleop.rotation_scale_vector[0])
+    assert action["target_wy"] == pytest.approx(0.0)
+    assert action["target_wz"] == pytest.approx(0.0)
+    teleop.disconnect()
+
+
+def test_pitch_and_yaw_are_not_inverted(monkeypatch):
+    """Only roll is flipped. Yaw was live throughout and pitch was measured with it."""
+    monkeypatch.setattr(SpaceMouseTeleop, "driver_cls", DummySpaceMouseDriver)
+    teleop = SpaceMouseTeleop(SpaceMouseTeleopConfig(bias_sample_count=0, move_time=0.0))
+    teleop.connect()
+    teleop._driver.readings.append(
+        SpaceMouseReading(translation=[0.0, 0.0, 0.0], rotation=[0.0, 0.5, 0.4], buttons=(False, False))
+    )
+
+    action = teleop.get_action()
+
+    assert action["target_wy"] == pytest.approx(0.5 * teleop.rotation_scale_vector[1])
+    assert action["target_wz"] == pytest.approx(0.4 * teleop.rotation_scale_vector[2])
+    assert action["target_wx"] == pytest.approx(0.0)
+    teleop.disconnect()
+
+
+def test_the_rotation_map_does_not_borrow_the_translation_map(monkeypatch):
+    """The two maps reach different frames, so they must not be kept in step with each other.
+
+    `target_{x,y,z}` is added to the reference position in the *base* frame; `target_{wx,wy,wz}` is
+    right-multiplied onto the reference orientation, i.e. applied about the *tool* axes. A future
+    reader tidying these two into one matrix would silently re-aim every rotation command.
+    """
+    config = SpaceMouseTeleopConfig()
+
+    assert config.rotation_axis_map != config.translation_axis_map
+    # A pure sign flip on roll: no axis swapping, which would be a different (and wrong) fix.
+    assert config.rotation_axis_map == ((-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+

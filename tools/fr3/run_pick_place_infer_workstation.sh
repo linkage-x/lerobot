@@ -40,7 +40,7 @@ gripper_max_width_mm="${FR3_GRIPPER_MAX_WIDTH_MM-90}"
 camera_config="${FR3_INFER_CAMERA_CONFIG-tools/fr3/fr3_il_infer_realsense_camera_config.yaml}"
 
 # The IK tool frame, and the reason this script exists rather than a few env vars on the host one.
-# The two Pika frames are fixed on the same URDF and 411.85 mm apart, so naming the wrong one does
+# The two Pika frames are fixed on the same URDF and 410.85 mm apart, so naming the wrong one does
 # not fail: the rollout runs, tracks its targets, and is wrong by that offset everywhere.
 #
 # The frame must match the dataset the *checkpoint* was trained on, which is normally the same as

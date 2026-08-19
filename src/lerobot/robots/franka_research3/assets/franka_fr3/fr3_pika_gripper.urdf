@@ -450,7 +450,7 @@
        Left in place because every dataset recorded before 2026-08 is anchored to it. It is a rigid
        frame, so record/replay/rollout stay self-consistent as long as they all name it; deleting
        or moving it reinterprets those episodes silently. New collections do NOT use it:
-       fr3_record_config.yaml now records against pika_gripper_ee, because the 411.85 mm lever
+       fr3_record_config.yaml now records against pika_gripper_ee, because the 410.85 mm lever
        turns wrist rotation into apparent translation (1 deg of fr3_joint7 moves the real tool
        0.03 mm and this frame 6.43 mm) and, worse, makes a rotation command pivot here rather than
        at the fingers: a 45 deg wrist command swept the fingertips through a 314 mm arc.

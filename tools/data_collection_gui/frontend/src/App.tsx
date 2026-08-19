@@ -293,6 +293,7 @@ function App() {
         onStart={() => run(() => api.startRecording())}
         onStop={(action) => run(() => api.stopRecording(action))}
         onSetStartPose={() => run(() => api.setRecordingStartPose())}
+        onResetStartPose={() => run(() => api.resetRecordingStartPose())}
         onOpenInReplay={() => selectAndOpenReplay(latestRecordedPath)}
         onQueueTrajGen={() => queueTrajGenAndOpenProcessing(firstMissingPath)}
         onGoToProcessing={() => navigate("dataset-processing")}

@@ -33,7 +33,7 @@ The script computes the model's forward kinematics for *both* candidate frames a
 data actually sits on -- the same decision ``fr3_sim_record_replay_runtime.py`` makes at replay time,
 anchored on the keyframe instead of on IK. The input must come out as ``pika_task_tcp`` (a dataset
 that already reads as ``pika_gripper_ee`` is refused rather than migrated twice, which would be a
-silent 823 mm error) and the output must come out as ``pika_gripper_ee``, by a margin no arithmetic
+silent 822 mm error) and the output must come out as ``pika_gripper_ee``, by a margin no arithmetic
 slip could fake.
 
 Usage, one dataset at a time -- the rename is the safety mechanism, so it is never derived::
@@ -58,25 +58,18 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SCENE_XML = (
-    REPO_ROOT / "src" / "lerobot" / "robots" / "franka_research3" / "assets" / "franka_fr3" / "fr3_pika_gripper_scene.xml"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# The frame identification lives in fr3_tool_frame_check so the replay preflight and this tool
+# cannot end up with two answers to the same geometric question.
+from fr3_tool_frame_check import (  # noqa: E402  (path set up above)
+    NEW_FRAME,
+    OLD_FRAME,
+    TOOL_FRAME_OFFSET_M,
+    ToolFrameError,
+    home_frame_positions,
+    require_frame,
 )
-
-OLD_FRAME = "pika_task_tcp"
-NEW_FRAME = "pika_gripper_ee"
-BASE_BODY = "fr3_link0"
-
-# pika_task_tcp -> pika_gripper_ee, in the tool frame, for every arm configuration. Pinned by
-# tests/robots/test_fr3_tool_frame_geometry.py; changing it silently reinterprets every episode.
-TOOL_FRAME_OFFSET_M = np.array([-0.366842, 0.0, 0.185], dtype=np.float64)
-
-# How far frame 0 of an episode may sit from the home keyframe before the identification is not
-# trustworthy. Measured across the 25 recorded episodes the worst was 6.3 mm; the frames themselves
-# are 411.85 mm apart, so anything in this range still separates them by more than 8x.
-MAX_HOME_ERROR_M = 0.05
-# ... and the loser has to be clearly a loser, not a coin flip.
-MIN_FRAME_SEPARATION_M = 0.2
 
 # Feature name prefixes that carry a pose. Each yields one (position, quaternion) pair per feature
 # that declares all seven names.
@@ -88,74 +81,19 @@ class MigrationError(RuntimeError):
     """Anything that would produce a dataset nobody can tell is wrong by looking at it."""
 
 
-# --------------------------------------------------------------------------- model geometry ---
-
-
-def home_frame_positions() -> dict[str, np.ndarray]:
-    """Where each candidate tool frame sits, in the robot base frame, at the `home` keyframe."""
+def check_frame(label: str, first_positions: np.ndarray, home: dict[str, np.ndarray], expected: str) -> None:
+    """require_frame, with the two failures this tool can produce spelled out for the operator."""
     try:
-        import mujoco
-    except ImportError as exc:  # pragma: no cover - environment, not logic
-        raise MigrationError(
-            "mujoco is required for the tool-frame check; run this with .venv-fr3/bin/python"
-        ) from exc
-
-    model = mujoco.MjModel.from_xml_path(str(SCENE_XML))
-    data = mujoco.MjData(model)
-    mujoco.mj_resetDataKeyframe(model, data, 0)
-    mujoco.mj_forward(model, data)
-
-    def origin(name: str) -> np.ndarray:
-        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
-        if body_id < 0:
-            raise MigrationError(f"body '{name}' is missing from {SCENE_XML.name}")
-        return np.asarray(data.xpos[body_id], dtype=np.float64)
-
-    base = origin(BASE_BODY)
-    return {name: origin(name) - base for name in (OLD_FRAME, NEW_FRAME)}
-
-
-def identify_frame(first_positions: np.ndarray, home: dict[str, np.ndarray]) -> tuple[str, dict[str, float]]:
-    """Which tool frame this data is expressed in, decided by the pose every episode starts from.
-
-    The recorder homes to the `home` keyframe before each episode, so frame 0 is that pose seen
-    through whatever frame the config named. Comparing it against the model's forward kinematics for
-    both candidates is an answer that comes from the URDF rather than from this file.
-    """
-    errors = {
-        name: float(np.median(np.linalg.norm(first_positions - position, axis=1)))
-        for name, position in home.items()
-    }
-    return min(errors, key=errors.__getitem__), errors
-
-
-def require_frame(label: str, first_positions: np.ndarray, home: dict[str, np.ndarray], expected: str) -> None:
-    identified, errors = identify_frame(first_positions, home)
+        errors = require_frame(label, first_positions, expected, home)
+    except ToolFrameError as exc:
+        hint = (
+            " It looks like it has already been migrated; running again would move it another 410.85 mm."
+            if expected == OLD_FRAME
+            else " The conversion did not land where it should have."
+        )
+        raise MigrationError(f"{exc}{hint}") from exc
     report = ", ".join(f"{name} {errors[name] * 1e3:.1f} mm" for name in sorted(errors))
-    runner_up = min((value for name, value in errors.items() if name != identified), default=float("inf"))
-
-    if identified != expected:
-        raise MigrationError(
-            f"{label} reads as '{identified}', not '{expected}' (episode-start distance: {report}). "
-            + (
-                "It looks like it has already been migrated; running again would move it another "
-                "411.85 mm."
-                if expected == OLD_FRAME
-                else "The conversion did not land where it should have."
-            )
-        )
-    if errors[identified] > MAX_HOME_ERROR_M:
-        raise MigrationError(
-            f"{label} is closest to '{identified}' but sits {errors[identified] * 1e3:.1f} mm from it "
-            f"(limit {MAX_HOME_ERROR_M * 1e3:.0f} mm; distances: {report}). Either the episodes do not "
-            "start from the home keyframe, or the data is in neither frame"
-        )
-    if runner_up - errors[identified] < MIN_FRAME_SEPARATION_M:
-        raise MigrationError(
-            f"{label} does not separate the two frames: {report}. The check cannot tell them apart, "
-            "so it cannot vouch for the migration either"
-        )
-    print(f"  [frame] {label}: {identified}  ({report})")
+    print(f"  [frame] {label}: {expected}  ({report})")
 
 
 # --------------------------------------------------------------------------- pose conversion ---
@@ -213,7 +151,7 @@ def convert_block(block: np.ndarray, pairs: list[tuple[list[int], list[int]]]) -
 def assert_rigid_shift(before: np.ndarray, after: np.ndarray, pairs, feature: str) -> None:
     """|p_new - p_old| is |d| for every row, and nothing outside the position columns moved.
 
-    A rotation matrix preserves length, so any row that shifted by something other than 411.85 mm
+    A rotation matrix preserves length, so any row that shifted by something other than 410.85 mm
     means the quaternion it was built from was not a rotation.
     """
     expected = float(np.linalg.norm(TOOL_FRAME_OFFSET_M))
@@ -334,23 +272,24 @@ def migrate(src: Path, dst: Path, video_mode: str, dry_run: bool) -> None:
         raise MigrationError(f"{src} has no data parquet files")
 
     # Identify the source frame before writing anything, so a refusal costs nothing.
+    state_positions = pose_column_pairs(read_feature_names(info, "observation.state"), "observation.state")[0][0]
     firsts = []
     for path in src_files:
         table = pq.read_table(path, columns=["observation.state", "episode_index"])
         block = np.stack(table["observation.state"].to_numpy(zero_copy_only=False)).astype(np.float64)
         episodes = table["episode_index"].to_numpy()
-        position_indices = pose_column_pairs(read_feature_names(info, "observation.state"), "observation.state")[0][0]
         for episode in np.unique(episodes):
-            firsts.append(block[episodes == episode][0, position_indices])
-    require_frame(f"{src.name} (source)", np.asarray(firsts), home, OLD_FRAME)
+            firsts.append(block[episodes == episode][0, state_positions])
+    check_frame(f"{src.name} (source)", np.asarray(firsts), home, OLD_FRAME)
 
     if dry_run:
         print(f"  [dry-run] would write {len(src_files)} data file(s) to {dst}")
         return
 
+    dst.parent.mkdir(parents=True, exist_ok=True)
     copy_tree(src, dst, video_mode)
 
-    migrated: dict[str, np.ndarray] = {}
+    migrated: dict[str, list[np.ndarray]] = {}
     episode_order: list[np.ndarray] = []
     for path in sorted((dst / "data").rglob("*.parquet")):
         table = pq.read_table(path)
@@ -390,10 +329,9 @@ def migrate(src: Path, dst: Path, video_mode: str, dry_run: bool) -> None:
     (dst / "meta" / "fr3_tool_frame.json").write_text(json.dumps(marker, indent=4) + "\n", encoding="utf-8")
 
     # The exit check: ask the model which frame the written data is in, not this file's arithmetic.
-    state_positions = pose_column_pairs(read_feature_names(info, "observation.state"), "observation.state")[0][0]
     state = stacked["observation.state"]
     firsts = [state[episodes == episode][0, state_positions] for episode in np.unique(episodes)]
-    require_frame(f"{dst.name} (result)", np.asarray(firsts), home, NEW_FRAME)
+    check_frame(f"{dst.name} (result)", np.asarray(firsts), home, NEW_FRAME)
 
 
 def main() -> int:

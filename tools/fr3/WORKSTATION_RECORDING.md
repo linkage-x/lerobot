@@ -29,6 +29,28 @@ the gripper is open before pressing StartEpisode; starting a take from a closed 
 first frame whose gripper state does not match the task's starting condition, and on a grasp task
 the policy learns that opening is something that happens before the data begins.
 
+### Moving the return pose: Set Home / Reset Home
+
+**Live Record** page, next to the episode controls, on the workstation profile only:
+
+- **Set Home** captures the arm's current joints as the pose `move_to_start` returns to between
+  episodes. Use it when a task needs to begin somewhere other than the `home` keyframe.
+- **Reset Home** puts it back to the pose the recorder was launched with — the config's
+  `robot.start_joint_positions`, which
+  `tests/robots/test_fr3_home_keyframe_contract.py` holds equal to the `home` keyframe.
+
+Both only touch the *running recorder's* config object; neither writes
+`fr3_record_config.yaml`, so a fresh Connect always starts from the file again. That is what makes
+Reset Home an exact undo rather than a second guess at what "home" means: it restores whatever that
+process read at startup, so a rig that legitimately declares a different start pose resets to its
+own. A config that declares no start pose resets back to *none*, meaning the arm backend's own
+start pose applies again — the recorder says so in the log rather than substituting a joint vector.
+
+Neither control does anything on the MuJoCo backend, which has no capture: the recorder emits a
+`WARN` and the session continues. And note that changing the return pose mid-collection splits the
+corpus the same way any other recording-contract change does — episodes recorded before and after
+begin from different places, and `T_B_Ws` is solved against the dataset's start pose at rollout.
+
 ### Recording into a task
 
 **Task Library** page → **New Task** (name, description, target episodes, `Dataset Repo ID`) →
@@ -211,7 +233,7 @@ There is no GUI entry point; rollout is a terminal step. `run_pick_place_infer_h
 here with environment variables, because three of its settings do not mean the same thing on this
 hardware:
 
-- **Tool frame.** Two fixed frames on the same URDF, 411.85 mm apart with identical orientation.
+- **Tool frame.** Two fixed frames on the same URDF, 410.85 mm apart with identical orientation.
   Naming the wrong one does not fail: the rollout runs, tracks its targets, and is wrong by that
   offset everywhere. The frame must follow the *checkpoint's dataset*, which is normally the same
   thing as the record config — and is: both are `pika_gripper_ee` since the switch below. The two
@@ -506,6 +528,28 @@ What you must *not* do is mix the two frames in one training set — that trains
 robots — so migrate the whole set or none of it, and rename the dataset series so the two can never
 be globbed together.
 
+`tools/fr3/fr3_migrate_tool_frame.py` does all of this. It matches the pose columns by feature
+*name* rather than by offset, recomputes both stats locations with the same estimator
+`fr3_train_il_policy.vector_stats` uses, and writes `meta/fr3_tool_frame.json` as the frame marker
+the schema lacks. Run it with `.venv-fr3` (it needs `mujoco` for the exit check), one dataset at a
+time — the rename is the safety mechanism, so it is never derived:
+
+```
+.venv-fr3/bin/python tools/fr3/fr3_migrate_tool_frame.py \
+    --src outputs/datasets/fr3_spacemouse_20260813_160401 \
+    --dst outputs/datasets/fr3_spacemouse_eeframe_20260813_160401
+```
+
+It refuses a source that already reads as `pika_gripper_ee`, so running it twice is an error rather
+than an 822 mm dataset. Videos are hardlinked (`--videos copy|symlink` to change); `--dry-run`
+identifies the source frame and stops.
+
+Measured on `fr3_spacemouse_20260813_160401` (10 305 frames, 20 episodes): the three converted
+triplets land within 1.5e-5 mm of the closed form, quaternion/gripper/index columns come out
+bit-identical, and the global and per-episode stats agree with the migrated values. Had `prev_cmd`
+been converted with `ee.q` instead of its own quaternion the result would have been **11.4 mm** out —
+the bullet above is not hypothetical.
+
 **Two ways to check a migration instead of trusting it.** `fr3_sim_record_replay_runtime.py`
 already identifies the frame from the data: it solves the first recorded pose against both bodies
 and prints `pos diff to pika_gripper_ee` / `pos diff to pika_task_tcp` before picking the closer
@@ -515,12 +559,63 @@ not have caught. Then run the MuJoCo replay gate on one migrated episode before 
 replay — scoring the recorded stream through IK is exactly what it is for, and a 411 mm frame error
 is the loudest thing it can possibly report.
 
-Until they are migrated, the pre-switch datasets are **not safe to replay against this config**.
-Replay reads recorded poses and commands them; with the config naming `pika_gripper_ee` and the
-poses recorded at `pika_task_tcp`, the arm puts the fingertips where the old frame's origin was —
-411 mm off, running to completion without an error. Either convert the dataset, or replay it
-against an overlay config that names the old frame. The Episode Replay page prints the frame the
-gateway will actually use, next to the dataset it will use it on; read them together.
+Until they are migrated, the pre-switch datasets are **not safe to replay against this config**, in
+two ways that compound. Both were silent, and both now fail in the replay preflight
+(`fr3_gui_replay_runtime._preflight_contract`) before the arm is connected:
+
+- **Frame.** Replay reads recorded poses and commands them. With the config naming
+  `pika_gripper_ee` and the poses recorded at `pika_task_tcp`, the arm puts the fingertips where the
+  old frame's origin was — 410.85 mm off, running to completion without an error.
+- **Workspace.** `_make_pose_from_absolute_action` clips absolute replay commands too, so the box
+  applies to a replayed trajectory exactly as it does to a teleop command. The new box was derived
+  around the *migrated* footprint (x `[0.264, 0.464]`); the same episodes unmigrated sit at
+  x `[0.633, 0.832]`, so **65.2% of `fr3_spacemouse_20260813_160401`'s frames land outside it**,
+  displaced by up to 132 mm (mean 22.2 mm) — every one of them flattened against `x = 0.70`. Under
+  the old box, 0% were outside. This is the worse of the two: a frame error is a rigid offset the
+  arm still tracks, whereas clipping reshapes the trajectory and then the score is computed against
+  the reshaped version.
+
+Either convert the dataset, or replay it against an overlay config that names the old frame *and*
+restores the old box — `target_frame_name: pika_task_tcp` with
+`workspace_min: [0.2, -0.6, 0.05]` / `workspace_max: [0.9, 0.6, 0.8]`. Measured on episode 0 of that
+dataset: unmigrated under the old contract scores 590/590 frames at 2.81 mm avg / 7.27 mm max, and
+migrated under the new one scores 590/590 at **1.94 mm avg / 4.88 mm max** — better, because the
+error is now measured at the tool instead of at the end of a 0.41 m lever.
+
+The Episode Replay page also prints the frame the gateway will actually use, next to the dataset it
+will use it on; read them together.
+
+**Replay runs at the dataset's frame rate, not the recorder's.** `ReplayStatus.fps` is seeded from
+the recorder config's `dataset.fps`, which describes what the *next* recording will do. The two
+diverged the moment the recording rate became adjustable (`Add FR3 recording FPS and crop controls`
+set it to 60 while every dataset on disk was recorded at 30), and replaying at the wrong rate fails
+in two ways that look like anything but a frame-rate bug:
+
+- the preview video is encoded at that rate, so the arm runs against the timeline at
+  `fps_used / fps_recorded` speed — at 60-against-30 the robot finishes in 9.8 s while the scrubber
+  takes 19.7 s;
+- `fr3_gui_replay_runtime` derives the sim's `teleop_control_frequency` from it, so each command is
+  integrated for a fraction of the frame period the recorder actually had. The comment in
+  `_replay_robot_config` predicted exactly this: *"tracking error that is really just an
+  under-integrated servo window"*.
+
+Measured on `eeframe_fr3_spacemouse_20260813_160401` episode 0, changing nothing but `--fps`:
+
+| `--fps` | verdict | avg | max pos | max rot | video |
+| --- | --- | --- | --- | --- | --- |
+| 30 (the recorded rate) | **passed** | 1.94 mm | 4.88 mm | 0.64° | 30/1, 19.67 s |
+| 60 (the config's rate) | failed | 2.43 mm | **43.26 mm** | **8.23°** | 60/1, 9.83 s |
+
+`gateway._replay_fps()` now takes the rate from the dataset's own `meta/info.json` for both the
+MuJoCo gate and the real replay, and selecting a dataset moves `ReplayStatus.fps` onto it so the
+timeline agrees. A dataset that declares no rate keeps the status value rather than silently
+becoming 30.
+
+One sharp edge the switch exposed: `fr3_gui_replay_runtime.py` run **by hand without
+`--ik-orientation-weight`** takes the robot backend default, which core-dumps (SIGFPE, ~frame 250)
+against `pika_gripper_ee` where it was stable against `pika_task_tcp`. The gateway always passes
+`0.012` (`DEFAULT_WORKSTATION_REPLAY_IK_ORIENTATION_WEIGHT`), so the GUI path is unaffected — but
+pass it explicitly if you drive the runtime from a terminal.
 
 ### SpaceMouse gains from the Teleoperation page
 
@@ -557,6 +652,20 @@ them one axis at a time.
   2 m/s or 2 rad/s at full deflection, so the cap catches a typo'd digit rather than constraining
   tuning. The real per-step safety net is `robot.max_target_delta_pos` / `max_target_delta_rot`,
   which clamp regardless of the gain that produced the command.
+
+**Roll is inverted at the device, on purpose.** `SpaceMouseTeleopConfig.rotation_axis_map` defaults
+to `[-raw_wx, raw_wy, raw_wz]`: the device's roll axis opposes the tool's x axis on this rig. It sat
+at identity — and wrong — for as long as the rig recorded against `pika_task_tcp`, because
+`scale_wx`/`scale_wy` were pinned to `0.0` there and nothing ever exercised roll or pitch. Turning
+them back on for the tool-frame switch is what surfaced it. No recorded episode is affected: roll was
+switched off in every one of them, so no roll command was ever stored.
+
+Two things follow. The rotation map is *not* the translation map and must not be tidied into it —
+`target_{x,y,z}` is added in the robot base frame while `target_{wx,wy,wz}` is right-multiplied onto
+the reference orientation, so they align device axes to different frames. And **pitch is the axis
+that still has no evidence behind it**: it was pinned off alongside roll, and yaw was the only
+rotation axis live during all previous recording. Check `wy` on hardware before trusting it; the
+convention is pinned by `tests/teleoperators/test_spacemouse.py`.
 
 Note that `tools/fr3/fr3_mujoco_teleop.py` does **not** read the recorder YAML — it carries its own
 flag defaults, and they differ from the hardware on every axis that matters: 3x the translation

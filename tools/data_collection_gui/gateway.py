@@ -1408,6 +1408,16 @@ def _select_replay_dataset(state: GatewayState, raw_path: str) -> None:
     state.replay.datasetRoot = str(matched)
     state.replay.datasetKind = _dataset_kind(state, matched)
     state.replay.dataset = str(matched)
+    # Not the recorder's current dataset.fps: that describes the next recording, and a dataset
+    # recorded before the rate was changed replays at the wrong speed and scores an under-integrated
+    # servo window if it is used. See _replay_fps.
+    declared_fps = _dataset_declared_fps(matched)
+    if declared_fps is not None and declared_fps != state.replay.fps:
+        state.log(
+            "info",
+            f"Replay fps {state.replay.fps} -> {declared_fps} (from {matched.name}/meta/info.json)",
+        )
+        state.replay.fps = declared_fps
     state.replay.message = f"Selected {_dataset_kind(state, matched)} dataset: {matched.name}"
     _invalidate_mujoco_validation(state, "Dataset changed; run MuJoCo replay again before real-robot replay.")
     persisted_validation = _load_persisted_mujoco_validation(state, matched, state.replay.episode)
@@ -1743,6 +1753,31 @@ def _load_dataset_info(dataset_root: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return info if isinstance(info, dict) else {}
+
+
+def _dataset_declared_fps(dataset_root: Path) -> int | None:
+    """The rate the dataset was actually recorded at, from its own metadata, or None if it cannot say."""
+    fps = _load_dataset_info(dataset_root).get("fps")
+    try:
+        value = int(fps)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _replay_fps(state: GatewayState, dataset_root: Path) -> int:
+    """The frame rate a replay of *this dataset* must run at.
+
+    `ReplayStatus.fps` is seeded from the recorder config's `dataset.fps`, which describes what the
+    *next* recording will do -- it is not a property of the episode being replayed, and the two
+    diverge the moment the recording rate is changed. Replaying at the wrong rate does not fail
+    visibly; it does two quiet things instead. The preview video is encoded at that rate, so it runs
+    against the timeline at fps_used/fps_recorded speed. And `fr3_gui_replay_runtime` sets the sim's
+    `teleop_control_frequency` from it, so every command is given a fraction of the simulated time
+    the recorder had between frames and the tracking score measures an under-integrated servo window
+    rather than the trajectory. The dataset is the authority on its own frame rate.
+    """
+    return _dataset_declared_fps(dataset_root) or int(state.replay.fps or 30)
 
 
 def _feature_names(info: dict[str, Any], column: str) -> list[str]:
@@ -9304,7 +9339,7 @@ def _fr3_mujoco_replay_command(state: GatewayState, dataset_root: Path) -> list[
         "--config-path",
         str(state.config_path),
         "--fps",
-        str(state.replay.fps or 30),
+        str(_replay_fps(state, dataset_root)),
         "--max-position-error-mm",
         str(DEFAULT_MUJOCO_MAX_POSITION_ERROR_MM),
         "--max-rotation-error-deg",
@@ -9462,7 +9497,7 @@ def _fr3_real_replay_command(state: GatewayState, dataset_root: Path, robot_ip: 
         "--config-path",
         str(state.config_path),
         "--fps",
-        str(state.replay.fps or 30),
+        str(_replay_fps(state, dataset_root)),
         "--robot-ip",
         str(robot_ip),
         "--max-position-error-mm",
@@ -10090,6 +10125,26 @@ def _capture_recorder_start_pose(state: GatewayState) -> None:
     state.log("info", "Requested FR3 start pose capture")
 
 
+def _reset_recorder_start_pose(state: GatewayState) -> None:
+    """Undo a Set Home, back to the start pose the recorder was launched with.
+
+    The capture only ever lived in the running recorder's config object -- neither it nor this
+    writes the YAML -- so the reset is symmetric: it restores what that process read at startup, and
+    a fresh recorder starts from the file regardless.
+    """
+    if state.profile != "workstation":
+        raise RuntimeError("Dynamic start pose capture is only available for the FR3 workstation recorder.")
+    if state.recording.state not in ("armed", "recording", "review"):
+        raise RuntimeError(f"Cannot reset start pose while recorder is {state.recording.state}.")
+    process = _ensure_recorder_running(state)
+    try:
+        _write_recorder_stdin(process, "reset_start_pose\n")
+    except BrokenPipeError as exc:
+        raise RuntimeError("Recorder input is closed.") from exc
+    state.recording.message = "Start pose reset requested"
+    state.log("info", "Requested FR3 start pose reset to the configured default")
+
+
 def _stop_recorder(state: GatewayState, action: str) -> None:
     # Recorder is going away (or already gone): re-allow Device Manager previews.
     state.camera_preview_suspended = False
@@ -10571,6 +10626,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/handheld/record/stop-discard":
                     _stop_recorder(self.server.state, "discard")
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/handheld/record/reset-start-pose":
+                    _reset_recorder_start_pose(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
                 if path == "/api/handheld/record/set-start-pose":

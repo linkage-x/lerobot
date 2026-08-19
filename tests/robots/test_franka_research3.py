@@ -222,6 +222,44 @@ def test_capture_current_start_joint_positions_uses_cached_observation(robot):
     assert robot.config.start_joint_positions == tuple(float(value) for value in cached_joints)
 
 
+def test_restore_configured_start_joint_positions_undoes_a_real_capture(robot):
+    """Set Home only ever edits the running process's config object, so Reset Home undoes exactly that.
+
+    This fixture declares no start pose, which is the case worth exercising: `None` means "keep the
+    arm backend's own start pose", so restoring a joint vector here would leave the rig at a
+    different pose from the one it was configured for -- a reset that resets to the wrong thing.
+    """
+    robot.connect()
+    robot.get_observation(include_cameras=False)
+    robot.capture_current_start_joint_positions(require_cached=True)
+    assert robot.config.start_joint_positions is not None
+
+    assert robot.restore_configured_start_joint_positions() is None
+    assert robot.config.start_joint_positions is None
+
+
+def test_restore_configured_start_joint_positions_returns_what_the_config_declared(robot):
+    """A rig that does declare a start pose resets to *its* pose, not to a literal in the driver.
+
+    ``robot`` is requested only for the driver classes its fixture patches.
+    """
+    del robot
+    configured = (0.0, -0.785, 0.0, -2.355, 0.0, 1.57079, 0.785)
+    device = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+            start_joint_positions=configured,
+        )
+    )
+    # Stand in for a Set Home capture, which is the only thing that writes this field at runtime.
+    device.config.start_joint_positions = (1.0,) * 7
+
+    assert device.restore_configured_start_joint_positions() == configured
+    assert device.config.start_joint_positions == configured
+
+
 def test_pandapy_arm_driver_connect_seeds_controller_with_current_joints(monkeypatch):
     class DummyJointPositionController:
         def __init__(self):

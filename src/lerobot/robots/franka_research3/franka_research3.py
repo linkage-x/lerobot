@@ -88,6 +88,14 @@ class FrankaResearch3(Robot):
         self._last_observation_joint_positions_rad: np.ndarray | None = None
         self._last_observation_ee_pose: np.ndarray | None = None
         self._capture_timestamp_origin_s = time.perf_counter()
+        # What the config asked for before any Set Home capture overwrote it, so the capture can be
+        # undone. `None` is a meaningful value here -- it means "keep the arm backend's own start
+        # pose" -- so it is preserved rather than normalised into a joint vector.
+        self._default_start_joint_positions: tuple[float, ...] | None = (
+            None
+            if config.start_joint_positions is None
+            else tuple(float(value) for value in config.start_joint_positions)
+        )
 
     @property
     def _joint_names(self) -> list[str]:
@@ -125,6 +133,17 @@ class FrankaResearch3(Robot):
         captured = tuple(float(value) for value in joint_positions_rad)
         self.config.start_joint_positions = captured
         return captured
+
+    def restore_configured_start_joint_positions(self) -> tuple[float, ...] | None:
+        """Undo a captured start pose, back to what the config declared when the robot was built.
+
+        Deliberately the *config's* value rather than the `home` keyframe literal: those two are
+        held equal by tests/robots/test_fr3_home_keyframe_contract.py, and reading the config means
+        a rig that legitimately declares a different start pose resets to its own default instead of
+        to this file's idea of one.
+        """
+        self.config.start_joint_positions = self._default_start_joint_positions
+        return self._default_start_joint_positions
 
     def _move_to_configured_start(self, target_joint_positions_rad: np.ndarray) -> np.ndarray:
         if self._arm is None:

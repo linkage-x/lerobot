@@ -359,6 +359,20 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
+  async resetRecordingStartPose(): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteSnapshot("/api/handheld/record/reset-start-pose");
+    if (remote) {
+      return remote;
+    }
+    await wait(120);
+    this.snapshot.recording = {
+      ...this.snapshot.recording,
+      message: "Start pose reset requested"
+    };
+    this.log("info", "FR3 start pose reset to the configured default requested");
+    return this.getSnapshot();
+  }
+
   async stopRecording(action: "save" | "discard" | "exit"): Promise<GuiSnapshot> {
     const endpoint =
       action === "save"

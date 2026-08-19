@@ -77,6 +77,65 @@ def test_gui_start_pose_command_captures_current_joints(monkeypatch):
     ]
 
 
+def test_gui_reset_start_pose_command_restores_the_configured_pose(monkeypatch):
+    emitted: list[str] = []
+    monkeypatch.setattr(fr3_gui_record_runtime, "emit", emitted.append)
+
+    class FakeRobotWithResettableStartPose:
+        def __init__(self):
+            self.calls = 0
+
+        def restore_configured_start_joint_positions(self):
+            self.calls += 1
+            return (0.0, -0.785, 0.0, -2.355, 0.0, 1.57079, 0.785)
+
+    robot = FakeRobotWithResettableStartPose()
+    events = {"reset_start_pose": True}
+
+    assert fr3_gui_record_runtime._reset_start_pose(robot, events) is True
+    assert robot.calls == 1
+    assert events["reset_start_pose"] is False
+    assert emitted == [
+        "Start pose reset to the configured default: "
+        "joint_1=0.0000rad, joint_2=-0.7850rad, joint_3=0.0000rad, "
+        "joint_4=-2.3550rad, joint_5=0.0000rad, joint_6=1.5708rad, joint_7=0.7850rad"
+    ]
+
+
+def test_gui_reset_start_pose_says_so_when_the_config_declares_none(monkeypatch):
+    """`None` is not a failure -- it means the arm backend's own start pose applies again."""
+    emitted: list[str] = []
+    monkeypatch.setattr(fr3_gui_record_runtime, "emit", emitted.append)
+
+    class FakeRobotWithoutConfiguredStartPose:
+        def restore_configured_start_joint_positions(self):
+            return None
+
+    events = {"reset_start_pose": True}
+
+    assert fr3_gui_record_runtime._reset_start_pose(FakeRobotWithoutConfiguredStartPose(), events) is True
+    assert events["reset_start_pose"] is False
+    assert emitted == [
+        "Start pose reset: the config declares none, so the arm backend's own start pose applies"
+    ]
+
+
+def test_gui_reset_start_pose_warns_when_the_backend_cannot_do_it(monkeypatch):
+    """The MuJoCo backend has neither capture nor restore; the sim session must not die over it."""
+    emitted: list[str] = []
+    monkeypatch.setattr(fr3_gui_record_runtime, "emit", emitted.append)
+    events = {"reset_start_pose": True}
+
+    assert fr3_gui_record_runtime._reset_start_pose(object(), events) is False
+    assert events["reset_start_pose"] is False
+    assert emitted == ["WARN: start pose reset unavailable for this robot backend"]
+
+
+def test_the_reset_and_capture_command_words_do_not_overlap():
+    """`home_here` and `home_default` differ by one word; overlapping sets would make one shadow the other."""
+    assert not (fr3_gui_record_runtime._START_POSE_COMMANDS & fr3_gui_record_runtime._RESET_START_POSE_COMMANDS)
+
+
 class FakeProcessor:
     def __init__(self):
         self.reset_calls = 0

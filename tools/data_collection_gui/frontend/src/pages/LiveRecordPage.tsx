@@ -186,6 +186,7 @@ export function RecordingPanel({
   onStart,
   onStop,
   onSetStartPose,
+  onResetStartPose,
   logLines,
   backendPicker,
   episodeDurationControl,
@@ -199,6 +200,7 @@ export function RecordingPanel({
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
   onSetStartPose?: () => void;
+  onResetStartPose?: () => void;
   logLines?: string[];
   backendPicker?: React.ReactNode;
   episodeDurationControl?: React.ReactNode;
@@ -249,6 +251,16 @@ export function RecordingPanel({
             Set Home
           </button>
         ) : null}
+        {showStartPoseControl ? (
+          <button
+            className="ghost"
+            disabled={busy || !canSetStartPose || !onResetStartPose}
+            onClick={onResetStartPose}
+            title="Return pose back to the one this recorder was launched with"
+          >
+            Reset Home
+          </button>
+        ) : null}
         <button disabled={busy || !canExit} onClick={() => onStop("exit")} title="Shortcut: Esc">Exit <kbd>Esc</kbd></button>
       </div>
       <div className="summary-grid">
@@ -277,6 +289,7 @@ export function LiveRecordPage({
   onStart,
   onStop,
   onSetStartPose,
+  onResetStartPose,
   onOpenInReplay,
   onQueueTrajGen,
   onGoToProcessing,
@@ -288,6 +301,7 @@ export function LiveRecordPage({
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
   onSetStartPose: () => void;
+  onResetStartPose: () => void;
   onOpenInReplay: () => void;
   onQueueTrajGen: () => void;
   onGoToProcessing: () => void;
@@ -471,6 +485,7 @@ export function LiveRecordPage({
           onStart={onStart}
           onStop={onStop}
           onSetStartPose={onSetStartPose}
+          onResetStartPose={onResetStartPose}
           logLines={logLines}
           backendPicker={backendPicker}
           episodeDurationControl={episodeDurationControl}
