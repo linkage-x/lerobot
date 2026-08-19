@@ -325,6 +325,69 @@ class RealSenseCamera(Camera):
                 self.capture_width, self.capture_height = actual_width, actual_height
 
     @check_if_not_connected
+    def get_session_settings(self) -> dict[str, Any]:
+        """Return the active colour-stream and sensor controls as JSON-safe values.
+
+        RealSense Viewer can persist controls directly on the device. The recorder
+        therefore reads the sensor after its pipeline has started rather than
+        treating the YAML stream request as the effective exposure or white
+        balance setting. Options differ between camera models and firmware, so an
+        unsupported option is listed separately instead of being invented as zero.
+        """
+        if self.rs_profile is None:
+            raise RuntimeError(f"{self}: rs_profile must be initialized before reading session settings.")
+
+        device = self.rs_profile.get_device()
+        color_sensor = device.first_color_sensor()
+
+        def device_info(name: str) -> str | None:
+            info = getattr(rs.camera_info, name, None)
+            if info is None:
+                return None
+            try:
+                return str(device.get_info(info)) if device.supports(info) else None
+            except RuntimeError:
+                return None
+
+        controls: dict[str, float] = {}
+        unsupported_controls: list[str] = []
+        option_names = (
+            "enable_auto_exposure", "auto_exposure_priority", "exposure", "gain",
+            "enable_auto_white_balance", "white_balance", "backlight_compensation",
+            "brightness", "contrast", "saturation", "sharpness", "gamma", "power_line_frequency",
+        )
+        for name in option_names:
+            option = getattr(rs.option, name, None)
+            if option is None:
+                unsupported_controls.append(name)
+                continue
+            try:
+                if not color_sensor.supports(option):
+                    unsupported_controls.append(name)
+                    continue
+                controls[name] = float(color_sensor.get_option(option))
+            except RuntimeError:
+                # A model may advertise a control which the active profile cannot
+                # read. Preserve that fact without aborting an otherwise valid take.
+                unsupported_controls.append(name)
+
+        stream = self.rs_profile.get_stream(rs.stream.color).as_video_stream_profile()
+        return {
+            "device": {
+                "name": device_info("name"),
+                "serial_number": device_info("serial_number") or self.serial_number,
+                "firmware_version": device_info("firmware_version"),
+                "usb_type_descriptor": device_info("usb_type_descriptor"),
+            },
+            "stream": {
+                "width": int(stream.width()), "height": int(stream.height()),
+                "fps": int(stream.fps()), "format": str(stream.format()),
+            },
+            "controls": controls,
+            "unsupported_controls": unsupported_controls,
+        }
+
+    @check_if_not_connected
     def read_depth(self, timeout_ms: int = 200) -> NDArray[Any]:
         """
         Reads a single frame (depth) synchronously from the camera.

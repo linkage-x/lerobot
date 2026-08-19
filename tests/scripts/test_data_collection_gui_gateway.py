@@ -608,6 +608,42 @@ def test_processing_item_and_qc_include_online_sync_manifest(tmp_path):
     assert qc["online_sync"]["episodes"][0]["frameCountByCamera"] == {"cam_00": 2, "cam_01": 2}
 
 
+def test_replay_timeline_includes_camera_controls_sidecar(tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "recorded"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    (dataset_root / "meta" / "camera_controls.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "captured_at": "2026-08-19T12:00:00+08:00",
+                "backend": "real",
+                "cameras": {
+                    "ee": {
+                        "status": "observed",
+                        "requested": {"width": 640, "height": 480, "fps": 60},
+                        "effective": {"controls": {"exposure": 8000.0, "gain": 16.0}},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root.parent,
+    )
+
+    timeline = gateway._read_dataset_timeline(state, dataset_root, episode=0)
+
+    assert timeline["cameraControls"]["backend"] == "real"
+    assert timeline["cameraControls"]["cameras"]["ee"]["effective"]["controls"]["exposure"] == 8000.0
+
+
 def test_lerobot_v3_gmsl2_timeline_ignores_replay_warmup(tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"

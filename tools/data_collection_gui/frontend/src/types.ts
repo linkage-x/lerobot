@@ -535,6 +535,25 @@ export type ReplayTimelineFrame = {
   videoOverlays?: Record<string, CubeVideoOverlay[]>;
 };
 
+export type CameraControlsMetadata = {
+  schema_version: number;
+  captured_at: string;
+  backend?: string;
+  source?: string;
+  cameras: Record<string, {
+    type?: string;
+    status?: string;
+    message?: string;
+    requested?: Record<string, unknown>;
+    effective?: {
+      device?: Record<string, unknown>;
+      stream?: Record<string, unknown>;
+      controls?: Record<string, unknown>;
+      unsupported_controls?: string[];
+    };
+  }>;
+};
+
 export type CubeVideoOverlay = {
   cubeName: string;
   color: string;
@@ -570,6 +589,7 @@ export type ReplayTimeline = {
   sourcePath: string;
   videoWarmupS?: number;
   cameraVideoOffsetsS?: Record<string, number>;
+  cameraControls?: CameraControlsMetadata | null;
   error?: string;
 };
 

@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Pose3DViewer } from "./Pose3DViewer";
 import { SeriesPlot } from "./SeriesPlot";
 import type { DataCollectionGuiApi } from "./api";
-import type { CubeVideoOverlay, EePose, ForceVector, MujocoCubeMode, MujocoPreview, ReplayStatus, ReplayTimeline, ReplayTimelineFrame, TouchPadFrame } from "./types";
+import type { CameraControlsMetadata, CubeVideoOverlay, EePose, ForceVector, MujocoCubeMode, MujocoPreview, ReplayStatus, ReplayTimeline, ReplayTimelineFrame, TouchPadFrame } from "./types";
 import { TouchHeatmapGrid, touchLayoutForCount, touchSampleActivePoints, touchSampleHasShear, touchSampleLocalMax, touchScaleFromSamples, type TouchScale } from "./touchVisualization";
 
 const cubeColors: Record<string, number> = {
@@ -25,6 +25,53 @@ const cubeEdges: Array<[number, number]> = [
 
 function shortCameraName(key: string): string {
   return key.replace(/^observation\.images\./, "");
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value != null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function displayCameraValue(value: unknown, unit = ""): string {
+  if (value == null || value === "") return "—";
+  if (typeof value === "number") return `${Number.isInteger(value) ? value : value.toFixed(3)}${unit}`;
+  return `${String(value)}${unit}`;
+}
+
+function displayEnabled(value: unknown): string {
+  if (typeof value === "boolean") return value ? "enabled" : "disabled";
+  if (typeof value === "number") return value !== 0 ? "enabled" : "disabled";
+  return displayCameraValue(value);
+}
+
+function cameraControlRows(entry: CameraControlsMetadata["cameras"][string]): Array<[string, string]> {
+  const requested = asRecord(entry.requested);
+  const effective = asRecord(entry.effective);
+  const device = asRecord(effective.device);
+  const stream = asRecord(effective.stream);
+  const controls = asRecord(effective.controls);
+  const requestedStream = [requested.width, requested.height, requested.fps].every((value) => value != null)
+    ? `${requested.width}×${requested.height} @ ${requested.fps} fps`
+    : "—";
+  const effectiveStream = [stream.width, stream.height, stream.fps].every((value) => value != null)
+    ? `${stream.width}×${stream.height} @ ${stream.fps} fps${stream.format ? ` · ${String(stream.format)}` : ""}`
+    : "—";
+  const rows: Array<[string, string]> = [
+    ["Requested stream", requestedStream],
+    ["Effective stream", effectiveStream],
+    ["Model", displayCameraValue(device.name)],
+    ["Serial", displayCameraValue(device.serial_number ?? requested.serial_number_or_name)],
+    ["Firmware", displayCameraValue(device.firmware_version)],
+    ["USB", displayCameraValue(device.usb_type_descriptor)],
+    ["Auto exposure", displayEnabled(controls.enable_auto_exposure)],
+    ["AE priority", displayEnabled(controls.auto_exposure_priority)],
+    ["Exposure", displayCameraValue(controls.exposure, " µs")],
+    ["Gain", displayCameraValue(controls.gain)],
+    ["Auto white balance", displayEnabled(controls.enable_auto_white_balance)],
+    ["White balance", displayCameraValue(controls.white_balance, " K")],
+  ];
+  return rows.filter(([, value]) => value !== "—");
 }
 
 function ReplayTransport({
@@ -689,6 +736,28 @@ export function ReplayInspector({
           </div>
         ))}
       </div>
+      {timeline.cameraControls && Object.keys(timeline.cameraControls.cameras).length ? (
+        <section className="panel camera-controls-panel">
+          <div className="panel-heading">
+            <h2>Camera capture settings</h2>
+            <span>{timeline.cameraControls.captured_at} · {timeline.cameraControls.backend ?? "recording"}</span>
+          </div>
+          <p className="panel-note">{timeline.cameraControls.source ?? "Settings captured when this recording session connected."}</p>
+          <div className="camera-controls-grid">
+            {Object.entries(timeline.cameraControls.cameras).map(([name, entry]) => (
+              <article className="camera-controls-card" key={name}>
+                <h3>{shortCameraName(name)} <small>{entry.type ?? "camera"} · {entry.status ?? "recorded"}</small></h3>
+                {entry.message ? <p className="panel-note">{entry.message}</p> : null}
+                <dl>
+                  {cameraControlRows(entry).map(([label, value]) => (
+                    <div key={label}><dt>{label}</dt><dd>{value}</dd></div>
+                  ))}
+                </dl>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
       {hasTouchData ? (
         <section className="panel touch-panel">
           <div className="panel-heading">

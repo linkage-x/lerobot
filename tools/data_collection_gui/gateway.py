@@ -6152,6 +6152,19 @@ def _extract_gripper(names: list[str], values: list[float]) -> float | None:
     return None
 
 
+def _load_camera_controls(dataset_root: Path) -> dict[str, Any] | None:
+    """Load an optional recorder camera-controls sidecar for the replay UI."""
+    path = dataset_root / "meta" / "camera_controls.json"
+    try:
+        with path.open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("cameras"), dict):
+        return None
+    return payload
+
+
 def _empty_timeline(
     dataset_root: Path,
     *,
@@ -6189,6 +6202,7 @@ def _empty_timeline(
         "sourcePath": "",
         "videoWarmupS": 0.0,
         "cameraVideoOffsetsS": {},
+        "cameraControls": _load_camera_controls(dataset_root),
     }
     if error:
         payload["error"] = error
@@ -6642,6 +6656,7 @@ def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict
         "sourcePath": str(ep_dir),
         "videoWarmupS": video_warmup_s,
         "cameraVideoOffsetsS": _gmsl2_camera_video_offsets_s(ep_meta, camera_keys),
+        "cameraControls": _load_camera_controls(dataset_root),
     }
 
 
@@ -6802,6 +6817,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         "sourcePath": str(data_file),
         "videoWarmupS": video_warmup_s,
         "cameraVideoOffsetsS": _gmsl2_camera_video_offsets_s(ep_meta, camera_keys),
+        "cameraControls": _load_camera_controls(dataset_root),
     }
 
 

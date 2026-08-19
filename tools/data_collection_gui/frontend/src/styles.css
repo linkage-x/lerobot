@@ -1565,6 +1565,64 @@ button.danger {
   text-transform: uppercase;
 }
 
+.camera-controls-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.camera-controls-panel .panel-note {
+  margin: 0;
+}
+
+.camera-controls-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+}
+
+.camera-controls-card {
+  background: #f8fafb;
+  border: 1px solid #dce4e8;
+  border-radius: 7px;
+  padding: 10px;
+}
+
+.camera-controls-card h3 {
+  color: #1f2933;
+  font-size: 14px;
+  margin: 0 0 8px;
+}
+
+.camera-controls-card h3 small {
+  color: #60707c;
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.camera-controls-card dl {
+  display: grid;
+  gap: 4px 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+}
+
+.camera-controls-card dl div {
+  min-width: 0;
+}
+
+.camera-controls-card dt {
+  color: #60707c;
+  font-size: 11px;
+}
+
+.camera-controls-card dd {
+  color: #172026;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  margin: 1px 0 0;
+  overflow-wrap: anywhere;
+}
+
 .inspector-grid {
   align-items: stretch;
   display: grid;

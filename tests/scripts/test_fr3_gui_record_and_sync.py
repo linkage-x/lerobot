@@ -17,7 +17,51 @@ import pytest
 
 from tools.data_collection_gui import gateway
 from tools.fr3 import fr3_sync_audit
-from tools.fr3.fr3_gui_record_runtime import build_sim_robot_config
+from tools.fr3.fr3_gui_record_runtime import build_sim_robot_config, write_camera_controls_metadata
+
+
+def test_camera_controls_sidecar_records_requested_and_effective_settings(tmp_path):
+    class FakeConfig:
+        type = "intelrealsense"
+        serial_number_or_name = "123456789"
+        width = 640
+        height = 480
+        fps = 60
+        color_mode = "rgb"
+        use_depth = False
+        rotation = 0
+
+    class FakeCamera:
+        config = FakeConfig()
+
+        @staticmethod
+        def get_session_settings():
+            return {
+                "device": {"serial_number": "123456789", "firmware_version": "5.15.1"},
+                "stream": {"width": 640, "height": 480, "fps": 60, "format": "rgb8"},
+                "controls": {"enable_auto_exposure": 0.0, "exposure": 8000.0, "gain": 16.0},
+                "unsupported_controls": ["enable_auto_white_balance"],
+            }
+
+    class FakeRobot:
+        cameras = {"ee": FakeCamera()}
+
+    destination = write_camera_controls_metadata(tmp_path, FakeRobot(), backend="real")
+
+    payload = json.loads(destination.read_text(encoding="utf-8"))
+    assert destination == tmp_path / "meta" / "camera_controls.json"
+    assert payload["backend"] == "real"
+    assert payload["cameras"]["ee"]["requested"] == {
+        "serial_number_or_name": "123456789",
+        "width": 640,
+        "height": 480,
+        "fps": 60,
+        "color_mode": "rgb",
+        "use_depth": False,
+        "rotation": 0,
+    }
+    assert payload["cameras"]["ee"]["effective"]["controls"]["exposure"] == 8000.0
+
 
 
 # ------------------------------------------------------------------ sim/real schema parity ---

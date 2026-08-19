@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import json
 import logging
 from pathlib import Path
 import queue
@@ -92,11 +93,83 @@ from tools.fr3.fr3_sync_audit import (  # noqa: E402
 _RUNTIME_ARGS: argparse.Namespace | None = None
 _PROGRESS_INTERVAL_S = 0.25
 _CAPTURE_TIMESTAMP_FEATURE = "observation.device_capture_timestamp"
+_CAMERA_CONTROLS_RELATIVE_PATH = Path("meta") / "camera_controls.json"
 # Wrist-ish camera names map onto the MuJoCo end-effector camera; everything else looks at the
 # scene from outside. Overridable with --sim-camera-map when a rig uses different names.
 _WRIST_CAMERA_HINTS = ("ee", "wrist", "hand", "eih", "gripper")
 _SIM_WRIST_CAMERA = "ee_cam"
 _SIM_EXTERNAL_CAMERA = "external_cam"
+
+
+def _json_scalar(value: Any) -> Any:
+    """Convert the small set of config values used in a sidecar to JSON scalars."""
+    enum_value = getattr(value, "value", value)
+    return enum_value if enum_value is None or isinstance(enum_value, (str, int, float, bool)) else str(enum_value)
+
+
+def _requested_camera_settings(camera: Any) -> dict[str, Any]:
+    """Capture what this recorder requested, separately from Viewer/device state."""
+    config = getattr(camera, "config", None)
+    if config is None:
+        return {}
+    requested: dict[str, Any] = {}
+    for field_name in (
+        "serial_number_or_name",
+        "width",
+        "height",
+        "fps",
+        "color_mode",
+        "use_depth",
+        "rotation",
+    ):
+        value = getattr(config, field_name, None)
+        if value is not None:
+            requested[field_name] = _json_scalar(value)
+    return requested
+
+
+def write_camera_controls_metadata(dataset_root: Path, robot: Any, *, backend: str) -> Path:
+    """Persist camera settings observed immediately after a recording session connects.
+
+    On the workstation the controls are Viewer-managed. The sidecar consequently
+    records both the recorder's stream request and the post-connect device
+    readback, which is the setting that produced the video. Missing controls are
+    normal for some RealSense models and never make collection fail.
+    """
+    cameras_payload: dict[str, Any] = {}
+    cameras = getattr(robot, "cameras", {}) or {}
+    for camera_name, camera in cameras.items():
+        config = getattr(camera, "config", None)
+        entry: dict[str, Any] = {
+            "type": str(getattr(config, "type", type(camera).__name__)),
+            "requested": _requested_camera_settings(camera),
+        }
+        read_settings = getattr(camera, "get_session_settings", None)
+        if not callable(read_settings):
+            entry["status"] = "not_available"
+            entry["message"] = "Camera backend does not expose physical sensor controls."
+        else:
+            try:
+                entry["effective"] = read_settings()
+                entry["status"] = "observed"
+            except Exception as exc:  # noqa: BLE001 - metadata must never abort recording
+                entry["status"] = "unavailable"
+                entry["message"] = str(exc)
+        cameras_payload[str(camera_name)] = entry
+
+    payload = {
+        "schema_version": 1,
+        "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "backend": backend,
+        "source": "post-connect device readback; controls may have been set in Intel RealSense Viewer",
+        "cameras": cameras_payload,
+    }
+    destination = dataset_root / _CAMERA_CONTROLS_RELATIVE_PATH
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(destination)
+    return destination
 
 
 def emit(line: str) -> None:
@@ -764,6 +837,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         emit(f"Connecting {robot.name} ({backend})")
         robot.connect()
         emit(f"Connected {robot.name}")
+        controls_path = write_camera_controls_metadata(Path(dataset.root), robot, backend=backend)
+        emit(f"Camera controls: {controls_path}")
         emit(f"Connecting teleoperator {cfg.teleop.type}")
         teleop.connect()
         emit(f"Connected teleoperator {cfg.teleop.type}")
