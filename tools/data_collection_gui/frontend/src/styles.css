@@ -693,33 +693,189 @@ button.danger {
 
 .camera-crop-grid {
   display: grid;
-  gap: 8px;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   margin-top: 10px;
 }
 
-.camera-crop-row {
-  align-items: center;
-  border: 1px solid #e1e6ea;
-  border-radius: 6px;
-  display: grid;
-  gap: 8px;
-  grid-template-columns: minmax(220px, 1fr) repeat(4, minmax(72px, 96px));
-  padding: 8px;
+.crop-source-row {
+  align-items: flex-end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 10px;
 }
 
-.camera-crop-row strong,
-.camera-crop-row small,
-.camera-crop-row label span {
+.crop-source-row label {
+  color: #60707c;
+  display: grid;
+  font-size: 12px;
+  gap: 4px;
+}
+
+.crop-source-row select {
+  border: 1px solid #c8d2d8;
+  border-radius: 6px;
+  color: #172026;
+  font: inherit;
+  padding: 6px 8px;
+}
+
+.crop-frame-scrub {
+  flex: 1 1 240px;
+  min-width: 200px;
+}
+
+.crop-frame-scrub input {
+  accent-color: #0f766e;
+  width: 100%;
+}
+
+.camera-crop-card {
+  border: 1px solid #e1e6ea;
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.camera-crop-card header {
+  align-items: flex-start;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.camera-crop-card strong,
+.camera-crop-card small {
   display: block;
 }
 
-.camera-crop-row small,
-.camera-crop-row label span {
+.camera-crop-card small {
   color: #60707c;
   font-size: 12px;
 }
 
-.camera-crop-row input {
+.crop-card-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 6px;
+}
+
+.crop-card-actions button {
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+.crop-picker {
+  display: grid;
+  gap: 6px;
+}
+
+.crop-surface {
+  background: #0d1417;
+  border-radius: 6px;
+  overflow: hidden;
+  position: relative;
+  /* A crop drag on a touchscreen must not also scroll the page under it. */
+  touch-action: none;
+  user-select: none;
+  width: 100%;
+}
+
+.crop-surface.disabled {
+  opacity: 0.65;
+}
+
+.crop-frame {
+  display: block;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+  width: 100%;
+}
+
+.crop-shade {
+  background: rgba(9, 17, 20, 0.55);
+  pointer-events: none;
+  position: absolute;
+}
+
+/* The box and its grips are painted, not clicked: every press is hit-tested against the crop
+   geometry itself, so the pointer never has to find a 9px target in the DOM. */
+.crop-box {
+  border: 1.5px solid #2dd4bf;
+  box-shadow: 0 0 0 1px rgba(9, 17, 20, 0.55);
+  pointer-events: none;
+  position: absolute;
+}
+
+.crop-box-label {
+  background: rgba(15, 118, 110, 0.92);
+  border-radius: 3px;
+  color: #f2fbf9;
+  font-size: 11px;
+  left: 3px;
+  padding: 1px 5px;
+  position: absolute;
+  top: 3px;
+  white-space: nowrap;
+}
+
+.crop-handle {
+  background: #2dd4bf;
+  border: 1px solid #0b1416;
+  border-radius: 2px;
+  height: 9px;
+  position: absolute;
+  width: 9px;
+}
+
+.crop-handle.nw { left: -5px; top: -5px; }
+.crop-handle.n { left: calc(50% - 5px); top: -5px; }
+.crop-handle.ne { right: -5px; top: -5px; }
+.crop-handle.e { right: -5px; top: calc(50% - 5px); }
+.crop-handle.se { right: -5px; bottom: -5px; }
+.crop-handle.s { left: calc(50% - 5px); bottom: -5px; }
+.crop-handle.sw { left: -5px; bottom: -5px; }
+.crop-handle.w { left: -5px; top: calc(50% - 5px); }
+
+.crop-frame-note {
+  align-items: center;
+  color: #cfe0e4;
+  display: flex;
+  font-size: 12px;
+  inset: 0;
+  justify-content: center;
+  padding: 12px;
+  pointer-events: none;
+  position: absolute;
+  text-align: center;
+}
+
+.crop-frame-note.error {
+  color: #fca5a5;
+}
+
+.crop-hint {
+  color: #60707c;
+  font-size: 12px;
+  margin: 0;
+}
+
+.crop-fields {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.crop-fields label span {
+  color: #60707c;
+  display: block;
+  font-size: 12px;
+}
+
+.crop-fields input {
   border: 1px solid #c8d2d8;
   border-radius: 6px;
   font: inherit;
@@ -728,7 +884,7 @@ button.danger {
   width: 100%;
 }
 
-.camera-crop-row input:focus {
+.crop-fields input:focus {
   border-color: #0f766e;
   outline: 2px solid rgba(15, 118, 110, 0.16);
 }
@@ -742,12 +898,12 @@ button.danger {
     justify-content: flex-start;
   }
 
-  .camera-crop-row {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .camera-crop-grid {
+    grid-template-columns: 1fr;
   }
 
-  .camera-crop-row > div {
-    grid-column: 1 / -1;
+  .crop-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -4081,6 +4237,128 @@ button.danger {
   font-size: 11.5px;
   overflow-wrap: anywhere;
   white-space: normal;
+}
+
+/* ------------------------------------------ Training view: source selection ---
+ *
+ * The build unit is a task's sessions, not one recording, so the list is grouped by task and
+ * ticked rather than acted on per row. A flat list of timestamped directories does not show
+ * which of them belong together, and the merge can only happen at build time -- a view
+ * renumbers its episodes and normalises over the whole set, so two views built separately
+ * cannot be combined afterwards.
+ */
+
+.source-group-list {
+  display: grid;
+  gap: 12px;
+}
+
+.source-group {
+  border: 1px solid #e1e6ea;
+  border-radius: 8px;
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+}
+
+.source-group > header {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr) auto;
+}
+
+.source-group > header strong {
+  font-size: 13.5px;
+}
+
+.source-group > header span {
+  color: #60707c;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-row {
+  background: #ffffff;
+  border: 1px solid #e1e6ea;
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  padding: 8px 9px;
+}
+
+.source-row.selected {
+  background: #eef8f7;
+  border-color: #9ecbc6;
+}
+
+.source-row-main {
+  align-items: start;
+  cursor: pointer;
+  display: grid;
+  gap: 9px;
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.source-row-main input[type="checkbox"] {
+  margin-top: 3px;
+}
+
+.source-row-main:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.source-row p {
+  color: #60707c;
+  font-size: 12px;
+  margin: 4px 0 0;
+}
+
+.source-row em {
+  background: #2563eb;
+  border-radius: 999px;
+  color: #ffffff;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 650;
+  padding: 2px 7px;
+}
+
+/* The one panel that says what pressing Build will actually produce. Kept adjacent to the
+ * button: the contract, rate and crop live in panels of their own, and a button far from them
+ * is what let a build run at settings nobody had looked at. */
+.build-panel {
+  border-color: #9ecbc6;
+}
+
+.build-panel .summary-grid {
+  margin-top: 4px;
+}
+
+.build-panel .control-row label {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.build-panel .control-row select {
+  min-width: 340px;
+}
+
+.build-panel button.primary {
+  background: #0f766e;
+  border-color: #0f766e;
+  color: #ffffff;
+  font-weight: 650;
+}
+
+.build-panel button.primary:disabled {
+  background: #cbd5d8;
+  border-color: #cbd5d8;
+  color: #6b7a82;
 }
 
 /* --------------------------------------------------- Model pages: shared shell ---

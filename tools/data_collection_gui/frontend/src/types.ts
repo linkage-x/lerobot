@@ -383,6 +383,18 @@ export type DatasetCameraFeature = {
   height: number;
 };
 
+/** What the Camera Crop picker needs to address one still frame of a recording. */
+export type DatasetFramePreview = {
+  path: string;
+  name: string;
+  /** Capture rate, used to turn a frame index into a seek timestamp. 0 when unknown. */
+  fps: number;
+  cameras: DatasetCameraFeature[];
+  /** Per-episode frame counts. v3 packs several episodes into one video, so the count is
+   * the episode's own length, not the file's. */
+  episodes: { episode: number; frames: number }[];
+};
+
 export type RecordedDataset = {
   path: string;
   name: string;
@@ -427,6 +439,8 @@ export type DatasetExportStatus = {
   /** "lerobot_v3" for a Thor consolidation; the action contract for a workstation training view. */
   target: string;
   datasetRoot: string;
+  /** Every recording in the running build; `datasetRoot` is the first of them. */
+  datasetRoots?: string[];
   outputPath: string;
   selectedEpisodes: number;
   totalFrames: number;
@@ -808,6 +822,15 @@ export type TrainingView = {
   cameras: string[];
   sourceFps: Record<string, number>;
   frameStride: Record<string, number>;
+  /** What the build used, from meta/il_view_manifest.json: the only record of these settings,
+   *  since the crop is baked into the view's video and the page that drew it keeps nothing. */
+  cameraCrops: Record<string, number[]>;
+  sourceRoots: string[];
+  excludedEpisodes: Record<string, number[]>;
+  /** Views are rebuilt in place when a task gains a session, so the root path alone no longer
+   *  identifies the frames. These say which build is currently on disk. */
+  buildId: string;
+  sourceDigest: string;
   modifiedAt: string;
 };
 

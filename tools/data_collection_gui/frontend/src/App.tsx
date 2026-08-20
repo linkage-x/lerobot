@@ -255,19 +255,22 @@ function App() {
   };
 
   const exportApprovedWithWarningGuard = (
-    path: string,
+    paths: string[],
     actionMode?: string,
     cameraCrops?: CameraCropSpecs,
     viewFps?: number
   ) => {
-    const item = snapshot.processing.find((candidate) => candidate.path === path);
+    // Every warned source, not just the first: a merge is gated on all of them, and confirming
+    // one recording's warnings would silently carry the rest into the same training set.
+    const warned = paths
+      .map((path) => snapshot.processing.find((candidate) => candidate.path === path))
+      .filter((item) => item?.status === "qc_warn");
     // Only the QC-warned case asks. A pass exports straight through, and anything else is
     // refused by the gateway with its own reason.
-    if (item?.status !== "qc_warn") {
-      run(() => api.exportApprovedDataset(path, actionMode, false, cameraCrops, viewFps));
+    if (warned.length === 0) {
+      run(() => api.exportApprovedDataset(paths, actionMode, false, cameraCrops, viewFps));
       return;
     }
-    const warnings = qcWarnings(item);
     // Name the action being overridden, not the endpoint it shares: on the workstation this
     // button builds the training view a policy will be trained on, not a v3 export.
     const overriding =
@@ -276,17 +279,21 @@ function App() {
         : "Export it anyway?";
     const ok = window.confirm(
       [
-        `QC passed with warnings for "${item.name}".`,
-        "",
-        ...(warnings.length ? warnings : [item.qcSummary]),
-        "",
+        ...warned.flatMap((item) => {
+          const warnings = qcWarnings(item!);
+          return [
+            `QC passed with warnings for "${item!.name}".`,
+            ...(warnings.length ? warnings : [item!.qcSummary]),
+            ""
+          ];
+        }),
         overriding
       ].join("\n")
     );
     if (!ok) {
       return;
     }
-    run(() => api.exportApprovedDataset(path, actionMode, true, cameraCrops, viewFps));
+    run(() => api.exportApprovedDataset(paths, actionMode, true, cameraCrops, viewFps));
   };
 
   const pageNode =
@@ -358,7 +365,12 @@ function App() {
         snapshot={snapshot}
         busy={busy}
         onExportTask={exportTaskWithQcGuard}
-        onExportApprovedDataset={(path, actionMode) => exportApprovedWithWarningGuard(path, actionMode)}
+        // Every argument forwarded: the Training View page decides the action contract, the
+        // camera crop and the view rate, and dropping the last two here made both controls
+        // inert -- the build ran at the gateway's defaults and looked like it had worked.
+        onExportApprovedDataset={(paths, actionMode, cameraCrops, viewFps) =>
+          exportApprovedWithWarningGuard(paths, actionMode, cameraCrops, viewFps)
+        }
         onOpenProcessing={() => navigate("dataset-processing")}
         onOpenReplay={(path) => selectAndOpenReplay(path)}
       />

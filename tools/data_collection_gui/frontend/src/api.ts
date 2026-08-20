@@ -7,6 +7,7 @@ import type {
   MarkerTcpSession,
   ConfigSummary,
   DatasetExportStatus,
+  DatasetFramePreview,
   DeploymentProfile,
   DeviceStatus,
   BoxPreviewPayload,
@@ -733,6 +734,36 @@ export class DataCollectionGuiApi {
     return `${this.apiBase}/api/replay/video?${params.toString()}`;
   }
 
+  /**
+   * One decoded still out of a recorded episode.
+   *
+   * Not `videoUrl`: a v3 dataset packs a whole chunk of episodes into one mp4 (tens of MB),
+   * and the crop picker needs a single frame of it. The gateway seeks and decodes; this
+   * fetches ~30 KB.
+   */
+  datasetFrameUrl(datasetPath: string, cameraKey: string, episode: number, frame: number): string {
+    const params = new URLSearchParams({
+      path: datasetPath,
+      key: cameraKey,
+      episode: String(episode),
+      frame: String(frame)
+    });
+    return `${this.apiBase}/api/replay/frame.jpg?${params.toString()}`;
+  }
+
+  async fetchDatasetFramePreview(datasetPath: string): Promise<DatasetFramePreview | null> {
+    try {
+      const response = await fetch(
+        `${this.apiBase}/api/replay/frame-info?path=${encodeURIComponent(datasetPath)}`,
+        { headers: { Accept: "application/json" } }
+      );
+      if (!response.ok) return null;
+      return (await response.json()) as DatasetFramePreview;
+    } catch {
+      return null;
+    }
+  }
+
   mujocoVideoUrl(datasetPath: string, episode: number, cubeMode: MujocoCubeMode): string {
     const params = new URLSearchParams({
       path: datasetPath,
@@ -1245,7 +1276,7 @@ export class DataCollectionGuiApi {
   }
 
   async exportApprovedDataset(
-    path: string,
+    paths: string[],
     actionMode?: string,
     acknowledgeWarnings = false,
     cameraCrops?: CameraCropSpecs,
@@ -1253,7 +1284,16 @@ export class DataCollectionGuiApi {
   ): Promise<GuiSnapshot> {
     // The workstation profile reuses this endpoint to build a training view, and picks the
     // action contract with actionMode; Thor sends none and gets the raw->v3 consolidation.
-    const params = new URLSearchParams({ path });
+    // `paths` is repeated once per source rather than joined: dataset paths are absolute, and
+    // any separator would have to be a character that cannot appear in one.
+    const params = new URLSearchParams();
+    for (const path of paths) {
+      params.append("paths", path);
+    }
+    // Kept for the Thor consolidation and for any gateway that predates the multi-source build.
+    if (paths.length > 0) {
+      params.set("path", paths[0]);
+    }
     if (actionMode) {
       params.set("action_mode", actionMode);
     }
@@ -1276,15 +1316,17 @@ export class DataCollectionGuiApi {
       return remote;
     }
     await wait(120);
+    const primary = paths[0] ?? "";
     this.snapshot.datasetExport = {
       ...this.snapshot.datasetExport,
       state: "exporting",
       target: "lerobot_v3",
-      datasetRoot: path,
-      outputPath: `${path}/exports/lerobot_v3`,
-      message: `Exporting approved dataset ${path}… (mock)`
+      datasetRoot: primary,
+      datasetRoots: [...paths],
+      outputPath: `${primary}/exports/lerobot_v3`,
+      message: `Exporting ${paths.length} approved dataset(s)… (mock)`
     };
-    this.log("info", `Started approved dataset v3 export: ${path}`);
+    this.log("info", `Started approved dataset v3 export: ${paths.join(", ")}`);
     return this.getSnapshot();
   }
 

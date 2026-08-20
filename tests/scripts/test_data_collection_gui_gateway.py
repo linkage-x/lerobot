@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -2004,7 +2005,7 @@ def test_building_a_view_from_only_excluded_episodes_is_refused(tmp_path):
     # exclusion check behind that gate, not about the gate.
     _write_passing_qc(dataset_root)
 
-    with pytest.raises(ValueError, match="nothing to build"):
+    with pytest.raises(ValueError, match="No episode is left to build"):
         gateway._start_training_view(state, str(dataset_root), "delta_ee_from_prev_cmd")
 
 
@@ -3960,3 +3961,460 @@ def test_the_success_marker_is_found_even_in_a_very_long_log(tmp_path):
     )
 
     assert gateway._training_log_reports_success(log_path) is True
+
+
+def _write_packed_video_dataset(dataset_root: Path, cameras: list[str], lengths: list[int], fps: int = 60) -> None:
+    """A v3 dataset the way the FR3 recorder writes one: every episode of a chunk concatenated
+    into a single mp4 per camera, with the boundaries in meta/episodes."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    (dataset_root / "meta").mkdir(parents=True)
+    info = {
+        "fps": fps,
+        "total_episodes": len(lengths),
+        "total_frames": sum(lengths),
+        "features": {
+            camera: {"dtype": "video", "shape": [480, 640, 3]} for camera in cameras
+        },
+    }
+    (dataset_root / "meta" / "info.json").write_text(json.dumps(info), encoding="utf-8")
+
+    rows: dict[str, list] = {"episode_index": [], "length": [], "data/chunk_index": [], "data/file_index": []}
+    for camera in cameras:
+        rows[f"videos/{camera}/chunk_index"] = []
+        rows[f"videos/{camera}/file_index"] = []
+        rows[f"videos/{camera}/from_timestamp"] = []
+        rows[f"videos/{camera}/to_timestamp"] = []
+    start = 0.0
+    for episode, length in enumerate(lengths):
+        rows["episode_index"].append(episode)
+        rows["length"].append(length)
+        rows["data/chunk_index"].append(0)
+        rows["data/file_index"].append(0)
+        for camera in cameras:
+            rows[f"videos/{camera}/chunk_index"].append(0)
+            rows[f"videos/{camera}/file_index"].append(0)
+            rows[f"videos/{camera}/from_timestamp"].append(start)
+            rows[f"videos/{camera}/to_timestamp"].append(start + length / fps)
+        start += length / fps
+
+    meta_dir = dataset_root / "meta" / "episodes" / "chunk-000"
+    meta_dir.mkdir(parents=True)
+    pq.write_table(pa.table(rows), meta_dir / "file-000.parquet")
+
+    for camera in cameras:
+        video_dir = dataset_root / "videos" / camera / "chunk-000"
+        video_dir.mkdir(parents=True)
+        (video_dir / "file-000.mp4").write_bytes(b"0" * 4096)
+
+
+def _frame_preview_state(tmp_path: Path, profile: str) -> "gateway.GatewayState":
+    return gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(tmp_path), "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path,
+        profile=profile,
+    )
+
+
+def test_frame_preview_seeks_to_the_episodes_own_start_in_a_packed_video(tmp_path):
+    # Every episode of the chunk lives in one mp4. Reading only the file would preview episode 0
+    # for all of them, and the operator would crop against the wrong scene.
+    dataset_root = tmp_path / "packed"
+    _write_packed_video_dataset(dataset_root, ["observation.images.side"], [120, 60, 90])
+    state = _frame_preview_state(tmp_path, "workstation")
+
+    source = gateway._frame_preview_source(state, dataset_root, "observation.images.side", episode=2)
+
+    assert source is not None
+    video_path, start_s, frames = source
+    assert video_path == dataset_root / "videos" / "observation.images.side" / "chunk-000" / "file-000.mp4"
+    assert start_s == pytest.approx((120 + 60) / 60)
+    assert frames == 90
+
+
+def test_frame_preview_timestamp_offsets_the_frame_from_that_start():
+    _index, timestamp = gateway._frame_preview_timestamp(start_s=3.0, frame_index=30, frames=90, fps=60)
+
+    assert timestamp == pytest.approx(3.5)
+
+
+def test_frame_preview_timestamp_clamps_a_frame_past_the_end_of_the_episode():
+    # The slider's range comes from a frame-info response that can lag the recording by a poll.
+    index, timestamp = gateway._frame_preview_timestamp(start_s=1.0, frame_index=999, frames=90, fps=60)
+
+    assert index == 89
+    assert timestamp == pytest.approx(1.0 + 89 / 60)
+
+
+def test_frame_preview_info_reports_each_episodes_own_length(tmp_path):
+    dataset_root = tmp_path / "packed"
+    _write_packed_video_dataset(dataset_root, ["observation.images.ee", "observation.images.side"], [120, 60, 90])
+
+    info = gateway._frame_preview_info(dataset_root)
+
+    assert info["fps"] == 60
+    assert [item["frames"] for item in info["episodes"]] == [120, 60, 90]
+    assert [camera["key"] for camera in info["cameras"]] == [
+        "observation.images.ee",
+        "observation.images.side",
+    ]
+    assert all(camera["width"] == 640 and camera["height"] == 480 for camera in info["cameras"])
+
+
+def test_frame_preview_decodes_a_timestamp_once(tmp_path, monkeypatch):
+    # The picker re-requests the frame it is already showing whenever the operator steps back to
+    # it, and every miss is another ffmpeg process on a rig that is also recording.
+    video_path = tmp_path / "file-000.mp4"
+    video_path.write_bytes(b"0" * 1024)
+    calls: list[float] = []
+
+    def fake_extract(path, timestamp_s):
+        calls.append(timestamp_s)
+        return b"jpeg-bytes"
+
+    monkeypatch.setattr(gateway, "_extract_video_frame_jpeg", fake_extract)
+    monkeypatch.setattr(gateway, "_FRAME_PREVIEW_CACHE", {})
+
+    assert gateway._frame_preview_jpeg(video_path, 1.5) == b"jpeg-bytes"
+    assert gateway._frame_preview_jpeg(video_path, 1.5) == b"jpeg-bytes"
+    assert gateway._frame_preview_jpeg(video_path, 2.5) == b"jpeg-bytes"
+
+    assert calls == [1.5, 2.5]
+
+
+def test_frame_preview_reads_a_gmsl2_episode_without_remuxing_it(tmp_path, monkeypatch):
+    # _resolve_video_path would transcode the whole episode to mp4 first: minutes of ffmpeg for
+    # one still, on the page that is only asking what the camera saw.
+    dataset_root = tmp_path / "gmsl2"
+    ep_dir = dataset_root / "episodes" / "episode_000001"
+    ep_dir.mkdir(parents=True)
+    (ep_dir / "cam_00.mkv").write_bytes(b"0" * 2048)
+    (ep_dir / "meta.json").write_text(
+        json.dumps({"duration_s": 4.0, "video": {"fps": 60}}), encoding="utf-8"
+    )
+    (dataset_root / "episodes" / "episode_000000").mkdir()
+    monkeypatch.setattr(
+        gateway,
+        "_remux_mkv_to_mp4",
+        lambda *args, **kwargs: pytest.fail("a still frame must not trigger a remux"),
+    )
+    state = _frame_preview_state(tmp_path, "thor")
+
+    source = gateway._frame_preview_source(state, dataset_root, "cam_00", episode=1)
+
+    assert source == (ep_dir / "cam_00.mkv", 0.0, 240)
+
+
+# --------------------------------------------------------------------------------------
+# Multi-source training views
+#
+# Several recordings can only be combined at build time: a view renumbers its episodes and
+# computes meta/stats.json over the whole set, so two views built separately share neither an
+# episode index space nor a normalisation, and no operation appends a session to a finished
+# view. These cover what the merge has to get right before it starts writing.
+# --------------------------------------------------------------------------------------
+
+
+def _multi_source_state(tmp_path, *, second_fps: int | None = None):
+    """Workstation state with two QC-passed recordings of one task."""
+    state, first, _view_root = _training_view_state(tmp_path)
+    datasets_root = first.parent
+    first_named = datasets_root / "pick_and_place_20260819_171323"
+    first.rename(first_named)
+    second = datasets_root / "pick_and_place_20260819_171756"
+    _write_minimal_episode_dataset(second, total_episodes=2)
+    info_path = second / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    for camera_key in ("observation.images.ee", "observation.images.side"):
+        info["features"][camera_key] = {"dtype": "video", "shape": [480, 640, 3]}
+        chunk = second / "videos" / camera_key / "chunk-000"
+        chunk.mkdir(parents=True)
+        (chunk / "file-000.mp4").write_bytes(b"0" * 2048)
+    if second_fps is not None:
+        info["fps"] = second_fps
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    _write_passing_qc(first_named)
+    _write_passing_qc(second)
+    gateway._invalidate_replay_candidates_memo()
+    return state, first_named, second
+
+
+def test_training_view_name_collapses_sessions_of_one_task(tmp_path):
+    # Deterministic on purpose: rebuilding the same selection has to land on the same directory,
+    # which is what "this task gained a session, rebuild the view" means.
+    roots = [
+        tmp_path / "pick_and_place_20260819_171756",
+        tmp_path / "pick_and_place_20260819_171323",
+    ]
+
+    assert (
+        gateway._training_view_name(roots, "delta_ee_from_prev_cmd")
+        == "pick_and_place__delta_ee_from_prev_cmd"
+    )
+    assert (
+        gateway._training_view_name(list(reversed(roots)), "delta_ee_from_prev_cmd")
+        == "pick_and_place__delta_ee_from_prev_cmd"
+    )
+
+
+def test_training_view_name_stays_inside_the_job_name_character_set(tmp_path):
+    # The view name is also the training job name and the trailing half of the `local/<name>`
+    # repo id. `_start_training_run` rejects a job name outside [A-Za-z0-9._-] and
+    # huggingface_hub.validate_repo_id rejects the repo id on the same grounds, so a name that
+    # only works as a directory builds a view that cannot be trained.
+    selections = [
+        [tmp_path / "pick_and_place_20260819_171756", tmp_path / "fr3_spacemouse_20260813_160401"],
+        [tmp_path / "pick and place_20260819_171756"],
+        [tmp_path / "cube+stack_20260819_100000", tmp_path / "pick_and_place_20260819_171756"],
+    ]
+    for roots in selections:
+        name = gateway._training_view_name(roots, "delta_ee_from_prev_cmd")
+        assert re.fullmatch(r"[A-Za-z0-9._-]+", name), name
+        assert re.fullmatch(r"[A-Za-z0-9._-]+", f"{name}__act"), name
+
+
+def test_training_view_name_keeps_a_single_sources_own_timestamp(tmp_path):
+    # A one-session view must not claim the whole task: the name is what a checkpoint records,
+    # and "pick_and_place" would say it trained on every session of it.
+    assert (
+        gateway._training_view_name([tmp_path / "pick_and_place_20260819_171756"], "absolute_ee")
+        == "pick_and_place_20260819_171756__absolute_ee"
+    )
+
+
+def test_training_view_command_passes_every_selected_root(tmp_path):
+    state, first, second = _multi_source_state(tmp_path)
+
+    command, view_root = gateway._training_view_command(
+        state, [first, second], "delta_ee_from_prev_cmd"
+    )
+
+    start = command.index("--dataset-roots") + 1
+    assert command[start : start + 2] == [str(first), str(second)]
+    # Never the parent directory: the builder expands a directory into every dataset inside it,
+    # and this datasets root holds recordings that were not selected.
+    assert str(first.parent) not in command
+    assert view_root.name == "pick_and_place__delta_ee_from_prev_cmd"
+
+
+def test_training_view_camera_keys_are_the_shared_ones(tmp_path):
+    state, first, second = _multi_source_state(tmp_path)
+    info_path = second / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    del info["features"]["observation.images.ee"]
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    command, _view_root = gateway._training_view_command(
+        state, [first, second], "delta_ee_from_prev_cmd"
+    )
+
+    # The intersection, not the first dataset's set: a camera missing from one source would
+    # fail deep inside the builder, after it had already started writing the view.
+    assert command[command.index("--cameras") + 1] == "observation.images.side"
+
+
+def test_training_view_refuses_sources_with_no_camera_in_common(tmp_path):
+    state, first, second = _multi_source_state(tmp_path)
+    info_path = second / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    for key in ("observation.images.ee", "observation.images.side"):
+        del info["features"][key]
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="No camera feature is shared"):
+        gateway._training_view_command(state, [first, second], "delta_ee_from_prev_cmd")
+
+
+def test_source_rate_is_refused_when_the_selection_disagrees_on_fps(tmp_path):
+    # Merging 30 fps and 60 fps recordings as-is puts two different per-frame action scales in
+    # one column, and nothing downstream can tell the halves apart.
+    state, first, second = _multi_source_state(tmp_path, second_fps=60)
+
+    conflict = gateway._training_view_fps_conflict([first, second], 0)
+
+    assert conflict is not None
+    assert "disagree" in conflict
+    # 30 divides both, so the same pair is buildable once a rate is named.
+    assert gateway._training_view_fps_conflict([first, second], 30) is None
+
+
+def test_a_rate_that_does_not_divide_a_source_is_refused_before_the_build(tmp_path):
+    state, first, second = _multi_source_state(tmp_path, second_fps=60)
+
+    assert "does not divide" in (gateway._training_view_fps_conflict([first, second], 25) or "")
+    assert "below the requested" in (gateway._training_view_fps_conflict([first, second], 60) or "")
+
+
+def test_every_source_of_a_merge_is_qc_gated(tmp_path, monkeypatch):
+    """One unchecked recording in a merge is enough to poison the whole training set.
+
+    It would also be invisible afterwards: the view renumbers its episodes, so nothing in the
+    built dataset says which of them came from the recording nobody had reviewed.
+    """
+    state, first, second = _multi_source_state(tmp_path)
+    gateway._write_processing_meta_qc(
+        second,
+        {
+            "status": "fail",
+            "summary": "6 pass · 0 warn · 2 fail",
+            "checks": [{"name": "sync", "status": "fail", "message": "timestamps disagree"}],
+            "completed_at": gateway._now_iso(),
+        },
+    )
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda *a, **k: pytest.fail("build started"))
+
+    with pytest.raises(ValueError, match="pick_and_place_20260819_171756 must pass QC"):
+        gateway._start_training_view(
+            state, [str(first), str(second)], "delta_ee_from_prev_cmd"
+        )
+
+
+def test_a_merge_reports_every_source_and_the_episodes_that_survive_review(tmp_path, monkeypatch):
+    state, first, second = _multi_source_state(tmp_path)
+    gateway._save_annotation(
+        state,
+        {"datasetRoot": str(second), "episode": 0, "includeInTraining": False, "outcome": "fail"},
+    )
+
+    class FakeProcess:
+        pid = 4242
+        stdout = []
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda *a, **k: FakeProcess())
+    monkeypatch.setattr(gateway, "Thread", lambda *a, **k: type("T", (), {"start": lambda self: None})())
+
+    gateway._start_training_view(state, [str(first), str(second)], "delta_ee_from_prev_cmd")
+
+    export = state.dataset_export
+    assert export.datasetRoots == [str(first), str(second)]
+    # 1 episode from the first recording, 2 from the second minus the one review excluded.
+    assert export.selectedEpisodes == 2
+    assert export.outputPath.endswith("pick_and_place__delta_ee_from_prev_cmd")
+
+
+def test_a_built_views_crop_is_readable_from_its_manifest(tmp_path):
+    """The manifest is the only record of what a build used.
+
+    The crop is baked into the view's video and the page that drew it keeps nothing across a
+    reload, so without this the settings can only be retyped from memory.
+    """
+    state, _dataset_root, view_root = _training_view_state(tmp_path)
+    manifest_path = view_root / "meta" / "il_view_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["camera_crop_specs"] = {"observation.images.side": [252, 124, 388, 356]}
+    manifest["source_dataset_roots"] = [str(_dataset_root)]
+    manifest["build_id"] = "2026-08-20T07:30:00+00:00"
+    manifest["source_digest"] = "abc123"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    entry = next(
+        item for item in gateway._training_view_entries(state) if item["name"] == view_root.name
+    )
+
+    assert entry["cameraCrops"] == {"observation.images.side": [252, 124, 388, 356]}
+    assert entry["sourceRoots"] == [str(_dataset_root)]
+    assert entry["buildId"] == "2026-08-20T07:30:00+00:00"
+    assert entry["sourceDigest"] == "abc123"
+
+
+def _write_merged_view_dataset(view_root: Path, episodes_per_file: list[list[int]], fps: int = 30) -> None:
+    """A view built from several recordings: one data parquet per source, plus the
+    meta/episodes rows that say which file holds which episode.
+
+    The builder writes the sources in order, so later files are the newer ones on disk --
+    which is what made a newest-first scan answer for the wrong source.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    (view_root / "meta").mkdir(parents=True)
+    (view_root / "data" / "chunk-000").mkdir(parents=True)
+    flat = [episode for group in episodes_per_file for episode in group]
+    names = ["ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw", "gripper.pos"]
+    info = {
+        "fps": fps,
+        "total_episodes": len(flat),
+        "total_frames": len(flat) * 2,
+        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+        "features": {"observation.state": {"names": names}, "action": {"names": names}},
+    }
+    (view_root / "meta" / "info.json").write_text(json.dumps(info), encoding="utf-8")
+
+    meta_rows: dict[str, list] = {"episode_index": [], "length": [], "data/chunk_index": [], "data/file_index": []}
+    for file_index, group in enumerate(episodes_per_file):
+        rows: dict[str, list] = {
+            "episode_index": [], "frame_index": [], "timestamp": [], "observation.state": [], "action": [],
+        }
+        for episode in group:
+            for frame in range(2):
+                rows["episode_index"].append(episode)
+                rows["frame_index"].append(frame)
+                rows["timestamp"].append(frame / fps)
+                # x encodes the episode, so a wrong pick is visible in the trajectory itself.
+                pose = [0.1 * episode + 0.001 * frame, 0.0, 0.2, 0.0, 0.0, 0.0, 1.0, 0.5]
+                rows["observation.state"].append(pose)
+                rows["action"].append(pose)
+            meta_rows["episode_index"].append(episode)
+            meta_rows["length"].append(2)
+            meta_rows["data/chunk_index"].append(0)
+            meta_rows["data/file_index"].append(file_index)
+        data_file = view_root / "data" / "chunk-000" / f"file-{file_index:03d}.parquet"
+        pq.write_table(pa.table(rows), data_file)
+        # Later sources are newer, exactly as a real build leaves them.
+        stamp = 1_700_000_000 + file_index * 10
+        os.utime(data_file, (stamp, stamp))
+
+    meta_dir = view_root / "meta" / "episodes" / "chunk-000"
+    meta_dir.mkdir(parents=True)
+    pq.write_table(pa.table(meta_rows), meta_dir / "file-000.parquet")
+
+
+def _merged_view_state(tmp_path: Path, view_root: Path) -> "gateway.GatewayState":
+    return gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(view_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset=str(view_root), datasetRoot=str(view_root)),
+        datasets_root=tmp_path / "outputs" / "datasets",
+        profile="workstation",
+    )
+
+
+def test_selected_episode_is_read_from_the_file_that_holds_it(tmp_path):
+    # A merged view has one parquet per source. The trajectory scan used to take them
+    # newest-first and answer with whatever that file's first episode was, so selecting an
+    # episode from an earlier source silently loaded a different episode -- and a replay would
+    # then have driven the arm through the one that was loaded, not the one that was picked.
+    view_root = tmp_path / "outputs" / "exports" / "training_views" / "merged__delta_ee_from_prev_cmd"
+    _write_merged_view_dataset(view_root, [[0, 1, 2], [3, 4], [5, 6, 7]])
+    state = _merged_view_state(tmp_path, view_root)
+    state.selected_replay_root = view_root
+
+    for episode in range(8):
+        state.replay.episode = episode
+        points, meta = gateway._read_recorded_trajectory(state)
+        assert meta["episode"] == episode, f"asked for {episode}, got {meta['episode']}"
+        assert meta["dataStatus"] == "loaded"
+        assert len(points) == 2
+
+
+def test_single_file_dataset_still_falls_back_to_the_newest_file(tmp_path):
+    # The newest-first scan is what a recording still in flight relies on, so the fix must not
+    # turn "no episode picked yet" into "nothing to show".
+    view_root = tmp_path / "outputs" / "exports" / "training_views" / "one__absolute_ee"
+    _write_merged_view_dataset(view_root, [[0, 1, 2]])
+    state = _merged_view_state(tmp_path, view_root)
+
+    points, meta = gateway._read_recorded_trajectory(state)
+
+    assert meta["dataStatus"] == "loaded"
+    assert points

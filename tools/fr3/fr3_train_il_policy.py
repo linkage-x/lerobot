@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -469,7 +472,26 @@ def copy_or_symlink_file(src: Path, dst: Path, *, copy: bool) -> None:
         dst.symlink_to(src.resolve())
 
 
-def discover_dataset_roots(dataset_root: Path) -> list[Path]:
+def discover_dataset_roots(dataset_root: Path | Sequence[Path]) -> list[Path]:
+    """Resolve the build's source datasets.
+
+    A sequence is an *explicit* selection and is taken literally: every entry must be a dataset
+    root itself. Expanding a directory that appears inside an explicit list would pull in
+    datasets the operator did not pick, and the training set would then differ from what the
+    GUI said it was building -- the one failure mode a merge must not have.
+    """
+    if isinstance(dataset_root, (list, tuple)):
+        roots: list[Path] = []
+        for entry in dataset_root:
+            root = Path(entry).resolve()
+            if not (root / "meta/info.json").is_file():
+                raise FileNotFoundError(f"{root} is not a LeRobot dataset root (no meta/info.json).")
+            if root not in roots:
+                roots.append(root)
+        if not roots:
+            raise ValueError("No source datasets selected.")
+        return roots
+
     dataset_root = dataset_root.resolve()
     if (dataset_root / "meta/info.json").is_file():
         return [dataset_root]
@@ -661,7 +683,7 @@ def resolve_excluded_episodes(
 
 def prepare_dataset_view(
     *,
-    src_root: Path,
+    src_root: Path | Sequence[Path],
     dst_root: Path,
     repo_id: str,
     camera_keys: list[str],
@@ -1104,9 +1126,41 @@ def prepare_dataset_view(
     new_stats["action"] = vector_stats(all_action)
     write_json(dst_root / "meta/stats.json", new_stats)
 
+    # What this build was made of, as one comparable value. Views are rebuilt under the same
+    # name when a task gains a session, so `view.root` alone no longer identifies the frames a
+    # checkpoint trained on -- a checkpoint that records this digest can still tell whether the
+    # view on disk is the one it saw, and the build id says when it was replaced.
+    source_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "root": str(root),
+                        "excluded": sorted(excluded_by_root.get(root, set())),
+                        "stride": int(stride),
+                    }
+                    for root, stride in zip(src_roots, source_strides, strict=True)
+                ],
+                "cameras": camera_keys,
+                "state_keys": state_keys,
+                "action_mode": action_mode,
+                "action_key": None if action_npy else action_key,
+                "action_append_selectors": action_append_selectors,
+                "action_append_shift": action_append_shift,
+                "image_resize_shape": image_resize_shape,
+                "camera_crop_specs": camera_crop_specs,
+                "fps": int(resolved_fps),
+            },
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+
     manifest = {
         "source_dataset_root": str(src_roots[0]) if len(src_roots) == 1 else None,
         "source_dataset_roots": [str(root) for root in src_roots],
+        "build_id": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source_digest": source_digest,
         "repo_id": repo_id,
         "cameras": camera_keys,
         "state_keys": state_keys,
@@ -1569,6 +1623,20 @@ def run_smoke(args: argparse.Namespace, view_root: Path, repo_id: str) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
+    parser.add_argument(
+        "--dataset-roots",
+        type=Path,
+        nargs="*",
+        default=[],
+        metavar="ROOT",
+        help=(
+            "Explicit list of source datasets to merge into one view, overriding --dataset-root. "
+            "Each entry must be a dataset root. Merging happens here rather than after the fact "
+            "because a view renumbers its episodes and computes meta/stats.json over the whole "
+            "set: two views built separately cannot be combined later, and adding a session to "
+            "an existing view means rebuilding it from every source at once."
+        ),
+    )
     parser.add_argument("--repo-id", default="single_cube2_il_view")
     parser.add_argument(
         "--policy",
@@ -1744,7 +1812,17 @@ def main() -> None:
     # config points at, so it has to identify *this* run. A fixed default (it used to be the
     # single_cube2 task this script was written for) makes every dataset train into one directory
     # and quietly overwrite the previous checkpoints.
-    args.job_name = args.job_name or f"{Path(args.dataset_root).name}_{tag}"
+    # An explicit list wins over the single root: --dataset-root keeps its default, so it is
+    # always set and could never signal "not asked for".
+    source_roots: Path | list[Path] = list(args.dataset_roots) if args.dataset_roots else args.dataset_root
+    default_job_source = (
+        Path(args.dataset_roots[0]).name
+        if len(args.dataset_roots) == 1
+        else f"{Path(args.dataset_roots[0]).name}_plus{len(args.dataset_roots) - 1}"
+        if args.dataset_roots
+        else Path(args.dataset_root).name
+    )
+    args.job_name = args.job_name or f"{default_job_source}_{tag}"
     view_root = args.view_root or Path("outputs/datasets") / args.job_name
     args.output_dir = args.output_dir or Path("outputs/train") / args.job_name
     # A run that builds its own view puts the generated configs at the view root, where the
@@ -1787,7 +1865,7 @@ def main() -> None:
         print(f"[prepare] resume: keeping existing dataset view: {view_root}")
     else:
         prepare_dataset_view(
-            src_root=args.dataset_root,
+            src_root=source_roots,
             dst_root=view_root,
             repo_id=args.repo_id,
             camera_keys=cameras,

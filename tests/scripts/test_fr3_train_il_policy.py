@@ -525,3 +525,87 @@ def test_training_a_shared_view_keeps_each_jobs_configs_apart(tmp_path, monkeypa
     assert config["dataset"]["repo_id"] == "local/fr3__delta_ee_from_prev_cmd"
     assert config["policy"]["type"] == "act"
     assert config["job_name"] == "baseline__act"
+
+
+# --------------------------------------------------------------------------------------
+# Explicit multi-source selection
+# --------------------------------------------------------------------------------------
+
+
+def test_an_explicit_root_list_is_taken_literally(tmp_path):
+    """A ticked list must not be expanded into the directory that holds it.
+
+    ``discover_dataset_roots`` treats a *directory* as "everything inside", which is what the
+    GUI's selection has to be protected from: the datasets root holds every recording on the
+    machine, and pulling in the unticked ones would make the training set differ from what the
+    page said it was building.
+    """
+    first = tmp_path / "datasets" / "pick_and_place_20260819_171323"
+    second = tmp_path / "datasets" / "pick_and_place_20260819_171756"
+    unselected = tmp_path / "datasets" / "stack_cube_20260819_180000"
+    for root in (first, second, unselected):
+        _write_v3_source_dataset(root, episodes=1)
+
+    assert fr3_train_il_policy.discover_dataset_roots([first, second]) == [first, second]
+    # The same parent, passed as a directory, is the "everything inside" form.
+    assert unselected in fr3_train_il_policy.discover_dataset_roots(tmp_path / "datasets")
+
+
+def test_an_explicit_list_rejects_an_entry_that_is_not_a_dataset(tmp_path):
+    good = tmp_path / "good"
+    _write_v3_source_dataset(good, episodes=1)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="not a LeRobot dataset root"):
+        fr3_train_il_policy.discover_dataset_roots([good, empty])
+
+
+def test_an_explicit_list_drops_a_root_named_twice(tmp_path):
+    root = tmp_path / "recording"
+    _write_v3_source_dataset(root, episodes=1)
+
+    # Duplicated selection would otherwise double every episode, and the view has no way to
+    # say that two of its episodes are the same frames.
+    assert fr3_train_il_policy.discover_dataset_roots([root, root]) == [root.resolve()]
+
+
+def test_a_merge_records_each_source_and_a_digest_of_the_selection(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _write_v3_source_dataset(first, episodes=2)
+    _write_v3_source_dataset(second, episodes=1)
+
+    _frames, episodes, info, manifest = _build_view([first, second], tmp_path / "view")
+
+    assert manifest["source_dataset_roots"] == [str(first), str(second)]
+    # No single source: a merged view that named one of them would misdescribe itself.
+    assert manifest["source_dataset_root"] is None
+    assert info["total_episodes"] == 3
+    assert len(episodes) == 3
+    assert manifest["build_id"]
+    # Episodes are renumbered, so this is the only way back to where each one came from.
+    assert {entry["source_dataset_root"] for entry in manifest["episode_source_index"]} == {
+        str(first),
+        str(second),
+    }
+
+
+def test_the_source_digest_changes_when_the_selection_does(tmp_path):
+    """Views are rebuilt under the same name, so the path alone no longer identifies the frames.
+
+    A checkpoint that records the digest can still tell whether the view on disk is the one it
+    trained on -- without it, adding a session to a task silently redefines every checkpoint's
+    training set.
+    """
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _write_v3_source_dataset(first, episodes=2)
+    _write_v3_source_dataset(second, episodes=1)
+
+    _, _, _, one = _build_view([first], tmp_path / "one")
+    _, _, _, again = _build_view([first], tmp_path / "again")
+    _, _, _, both = _build_view([first, second], tmp_path / "both")
+
+    assert one["source_digest"] == again["source_digest"]
+    assert one["source_digest"] != both["source_digest"]

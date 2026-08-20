@@ -26,7 +26,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import BoundedSemaphore, Lock, Thread
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
@@ -218,6 +218,10 @@ class DatasetExportStatus:
     state: str = "idle"  # idle | exporting | complete | error
     target: str = "lerobot_v3"
     datasetRoot: str = ""
+    # Every recording that went into the running build. `datasetRoot` keeps the first one so the
+    # existing single-source readers still work, but a merge that reported only its first source
+    # would describe a training set that is mostly not what it names.
+    datasetRoots: list[str] = field(default_factory=list)
     outputPath: str = ""
     selectedEpisodes: int = 0
     totalFrames: int = 0
@@ -2077,6 +2081,26 @@ def _selected_episode_for_dataset(state: GatewayState, dataset_root: Path, episo
     return episode_options[0]
 
 
+def _active_replay_episode(state: GatewayState, dataset_root: Path) -> int | None:
+    """The episode the operator picked, but only if they picked it on *this* dataset.
+
+    `_selected_episode_for_dataset` answers a related question -- which of these candidate
+    episodes to show -- and falls back to the first one when the pick is not among them.
+    This answers "is there an explicit pick here at all", which is what decides whether a
+    scan is allowed to hold itself to that episode instead of snapping to a neighbour.
+    """
+    replay_dataset = _resolve_dataset_root(state.repo_root, state.replay.datasetRoot or state.replay.dataset)
+    for candidate in (state.selected_replay_root, replay_dataset):
+        if candidate is None:
+            continue
+        try:
+            if candidate.resolve() == dataset_root.resolve():
+                return int(state.replay.episode or 0)
+        except OSError:
+            continue
+    return None
+
+
 def _recorded_dataset_status(dataset_root: Path) -> str:
     data_files = _dataset_data_files(dataset_root)
     if not data_files:
@@ -3864,9 +3888,78 @@ def _copy_approved_v3_dataset_export(
     state.log("info", f"Exported approved LeRobot v3 dataset {dataset_root} -> {out_root}")
 
 
+def _dataset_task_base_name(name: str) -> str:
+    """The task a recording belongs to, from its directory name.
+
+    ``pick_and_place_20260819_171756`` -> ``pick_and_place``. Sessions of one task differ only
+    by their capture timestamp, so the base name is what several recordings of the same task
+    have in common -- and therefore what the view built from all of them should be called.
+    """
+    prefixes = _dataset_name_prefixes(name) - {name}
+    return next(iter(prefixes), name)
+
+
+def _training_view_name(dataset_roots: Sequence[Path], action_mode: str) -> str:
+    """The directory a build writes to, derived only from what went into it.
+
+    Deterministic on purpose: rebuilding the same selection lands on the same name and replaces
+    it, which is what "this task gained a session, rebuild the view" should do. A different
+    selection produces a different name instead of silently overwriting a view that described
+    other frames.
+
+    Restricted to ``[A-Za-z0-9._-]`` because the name is not only a directory. It becomes the
+    training job name, which `_start_training_run` refuses outside that set, and the trailing
+    half of the ``local/<name>`` repo id, which `huggingface_hub.validate_repo_id` refuses on
+    the same grounds. A name that only works as a directory is a view that builds and then
+    cannot be trained.
+    """
+    bases: list[str] = []
+    for root in dataset_roots:
+        base = _dataset_task_base_name(root.name)
+        if base not in bases:
+            bases.append(base)
+    if len(dataset_roots) == 1:
+        # One source keeps its own full name, timestamp included: there is nothing to merge, and
+        # collapsing it to the task name would make a single-session view claim the whole task.
+        stem = dataset_roots[0].name
+    else:
+        stem = "-".join(sorted(bases))
+    return _safe_training_view_name(f"{stem}__{action_mode}")
+
+
+_UNSAFE_VIEW_NAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_training_view_name(name: str) -> str:
+    """Fold anything a task name may carry into the character set a job name accepts."""
+    cleaned = _UNSAFE_VIEW_NAME_CHARS.sub("-", name).strip("-.")
+    return cleaned or "training_view"
+
+
+def _training_view_camera_keys(dataset_roots: Sequence[Path]) -> list[str]:
+    """Camera features every selected recording has.
+
+    The intersection rather than the first dataset's set: a camera missing from one source
+    would fail deep inside the builder, after it had already started writing the view.
+    """
+    shared: set[str] | None = None
+    for root in dataset_roots:
+        info = _load_dataset_info(root) or {}
+        features = info.get("features") if isinstance(info.get("features"), dict) else {}
+        keys = {
+            key
+            for key, feature in features.items()
+            if key.startswith("observation.images.")
+            and isinstance(feature, dict)
+            and feature.get("dtype") in ("video", "image")
+        }
+        shared = keys if shared is None else (shared & keys)
+    return sorted(shared or set())
+
+
 def _training_view_command(
     state: GatewayState,
-    dataset_root: Path,
+    dataset_roots: Path | Sequence[Path],
     action_mode: str,
     *,
     camera_crops: dict[str, list[int]] | None = None,
@@ -3885,29 +3978,37 @@ def _training_view_command(
         raise ValueError(
             f"action_mode must be one of {TRAINING_VIEW_ACTION_MODES}, got {action_mode!r}"
         )
-    if not _has_lerobot_v3_data(dataset_root):
-        raise ValueError(f"{dataset_root.name} is not a LeRobot v3 dataset; nothing to build a view from.")
+    # A lone Path is the single-source call this function grew out of. Normalised rather than
+    # rejected, and checked explicitly because `list()` of a Path raises while `list()` of a str
+    # would silently produce one entry per character.
+    dataset_roots = [dataset_roots] if isinstance(dataset_roots, (str, Path)) else list(dataset_roots)
+    dataset_roots = [Path(root) for root in dataset_roots]
+    if not dataset_roots:
+        raise ValueError("Select at least one recording to build a training view from.")
+    for dataset_root in dataset_roots:
+        if not _has_lerobot_v3_data(dataset_root):
+            raise ValueError(
+                f"{dataset_root.name} is not a LeRobot v3 dataset; nothing to build a view from."
+            )
     # Cameras and state keys come from the dataset, not from the script's defaults: those
     # defaults name another rig's cameras (observation.images.cam_1/cam_3) and would fail on
     # every FR3 recording, which uses the config's own camera keys (ee/side).
-    info = _load_dataset_info(dataset_root) or {}
-    features = info.get("features") if isinstance(info.get("features"), dict) else {}
-    camera_keys = [
-        key
-        for key, feature in features.items()
-        if key.startswith("observation.images.")
-        and isinstance(feature, dict)
-        and feature.get("dtype") in ("video", "image")
-    ]
+    camera_keys = _training_view_camera_keys(dataset_roots)
     if not camera_keys:
-        raise ValueError(f"{dataset_root.name} has no camera features to build a training view from.")
+        names = ", ".join(root.name for root in dataset_roots)
+        raise ValueError(
+            f"No camera feature is shared by every selected recording ({names}); "
+            "a view cannot be built from sources that disagree on their cameras."
+        )
 
-    view_name = f"{dataset_root.name}__{action_mode}"
+    view_name = _training_view_name(dataset_roots, action_mode)
     view_root = _training_views_root(state) / view_name
     command = [
         str(_venv_python(state.repo_root, prefer_fr3=True)),
         str(state.repo_root / "tools" / "fr3" / "fr3_train_il_policy.py"),
-        "--dataset-root", str(dataset_root),
+        # An explicit list, never a parent directory: the builder would expand a directory into
+        # every dataset inside it, and the view would then hold recordings nobody ticked.
+        "--dataset-roots", *[str(root) for root in dataset_roots],
         "--view-root", str(view_root),
         # The job name is what the generated train/inference configs use for their training
         # output dir and checkpoint path. Left to the script's default it is a fixed legacy
@@ -3915,7 +4016,7 @@ def _training_view_command(
         # directory regardless of source dataset or action contract.
         "--job-name", view_name,
         "--repo-id", f"local/{view_name}",
-        "--cameras", ",".join(sorted(camera_keys)),
+        "--cameras", ",".join(camera_keys),
         "--state-keys", "observation.state",
         "--action-mode", action_mode,
         # The default append selector pulls a handheld-gripper column that FR3 datasets do not
@@ -3944,61 +4045,137 @@ def _training_views_root(state: GatewayState) -> Path:
     return _task_exports_root(state) / TRAINING_VIEWS_DIR_NAME
 
 
+def _training_view_fps_conflict(dataset_roots: Sequence[Path], view_fps: int) -> str | None:
+    """Why this rate cannot express these recordings, or None if it can.
+
+    Run before the build rather than left to the builder, which raises the same conditions but
+    only after the operator has watched a merge start. Only integer decimation is possible: the
+    action column is a per-frame delta, so keeping the nearest frame at a non-divisor rate would
+    swing every delta between one and two source intervals.
+    """
+    rates: dict[int, list[str]] = {}
+    for root in dataset_roots:
+        fps = int((_load_dataset_info(root) or {}).get("fps") or 0)
+        if fps <= 0:
+            return f"{root.name} has no usable fps in meta/info.json."
+        rates.setdefault(fps, []).append(root.name)
+    if view_fps <= 0:
+        if len(rates) > 1:
+            listed = "; ".join(f"{fps} fps: {', '.join(names)}" for fps, names in sorted(rates.items()))
+            return (
+                f"The selected recordings disagree on their rate ({listed}). Pick a view rate "
+                "they can all be decimated to instead of keeping the source rate."
+            )
+        return None
+    for fps, names in sorted(rates.items()):
+        if fps < view_fps:
+            return (
+                f"{', '.join(names)} is {fps} fps, below the requested {view_fps} fps. "
+                "Upsampling would invent frames; pick a lower view rate."
+            )
+        if fps % view_fps != 0:
+            divisors = ", ".join(str(fps // n) for n in range(1, 5) if fps % n == 0)
+            return (
+                f"{', '.join(names)} is {fps} fps, which {view_fps} fps does not divide. "
+                f"Pick a divisor of the source rate (for example {divisors})."
+            )
+    return None
+
+
 def _start_training_view(
     state: GatewayState,
-    raw_path: str,
+    raw_paths: str | Sequence[str],
     action_mode: str,
     *,
     acknowledge_warnings: bool = False,
     camera_crops: dict[str, list[int]] | None = None,
     view_fps: int = DEFAULT_TRAINING_VIEW_FPS,
 ) -> None:
-    """Workstation counterpart of the Thor v3 export: build a policy-ready training view."""
+    """Workstation counterpart of the Thor v3 export: build a policy-ready training view.
+
+    Several recordings can go into one view because that is the only moment they can be
+    combined: the view renumbers its episodes and computes meta/stats.json over the whole set,
+    so two views built separately share neither an episode index space nor a normalisation, and
+    adding a session later means rebuilding from every source at once.
+    """
     if _export_is_running(state):
         raise RuntimeError("A view build is already running; wait for it to finish.")
-    dataset_root = _resolve_known_dataset(state, raw_path)
-    if dataset_root is None:
-        raise ValueError("Dataset not found in the recorded dataset list.")
-    # Views are replay candidates now, so they are resolvable here. Re-expressing an already
-    # re-expressed action column would silently compose two contracts.
-    if _dataset_kind(state, dataset_root) == "training_view":
-        raise ValueError(f"{dataset_root.name} is already a training view; build from the recording instead.")
-    processing_item = _processing_item_from_dataset(dataset_root)
-    # The same QC gate the Thor export enforces, and for a stronger reason: on this profile the
-    # view *is* the export -- it is the last step before a policy trains on these frames, and
-    # nothing downstream looks at QC again. The timestamp-sync verdict in particular only exists
-    # inside a QC run, so an ungated build let a dataset whose modalities disagreed reach
-    # training with its verdict sitting in a file no one had opened.
-    status = str(processing_item.get("status") or "")
-    warnings = _qc_warning_messages(processing_item)
-    if status == "qc_warn":
-        # A warning is the operator's call to make, but only with the warnings in front of them
-        # -- the same rule the replay gate uses for a failed MuJoCo score.
-        if not acknowledge_warnings:
+    # A single string still works, and is spelled out because iterating one as a sequence would
+    # hand each character to the resolver and report "dataset not found: /" .
+    if isinstance(raw_paths, (str, Path)):
+        raw_paths = [str(raw_paths)]
+    dataset_roots: list[Path] = []
+    for raw_path in raw_paths:
+        dataset_root = _resolve_known_dataset(state, raw_path)
+        if dataset_root is None:
+            raise ValueError(f"Dataset not found in the recorded dataset list: {raw_path}")
+        # Views are replay candidates now, so they are resolvable here. Re-expressing an already
+        # re-expressed action column would silently compose two contracts.
+        if _dataset_kind(state, dataset_root) == "training_view":
             raise ValueError(
-                "QC passed with warnings; confirm to build the view anyway. "
-                + (" | ".join(warnings) if warnings else "See the QC summary for details.")
+                f"{dataset_root.name} is already a training view; build from the recording instead."
             )
+        if dataset_root not in dataset_roots:
+            dataset_roots.append(dataset_root)
+    if not dataset_roots:
+        raise ValueError("Select at least one recording to build a training view from.")
+
+    selected_episodes = 0
+    pending_warnings: list[str] = []
+    for dataset_root in dataset_roots:
+        processing_item = _processing_item_from_dataset(dataset_root)
+        # The same QC gate the Thor export enforces, and for a stronger reason: on this profile
+        # the view *is* the export -- it is the last step before a policy trains on these frames,
+        # and nothing downstream looks at QC again. The timestamp-sync verdict in particular only
+        # exists inside a QC run, so an ungated build let a dataset whose modalities disagreed
+        # reach training with its verdict sitting in a file no one had opened. Every source is
+        # gated, not just the first: one unchecked recording in a merge is enough to poison the
+        # whole training set, and it would be invisible once the episodes were renumbered.
+        status = str(processing_item.get("status") or "")
+        warnings = _qc_warning_messages(processing_item)
+        if status == "qc_warn":
+            # A warning is the operator's call to make, but only with the warnings in front of
+            # them -- the same rule the replay gate uses for a failed MuJoCo score.
+            pending_warnings.extend(f"{dataset_root.name}: {message}" for message in warnings)
+            if not warnings:
+                pending_warnings.append(f"{dataset_root.name}: see the QC summary for details.")
+        elif status != "qc_pass":
+            raise ValueError(
+                f"{dataset_root.name} must pass QC before a training view is built "
+                f"(status: {status or 'unknown'}). Run QC on the Dataset Processing page."
+            )
+        excluded = _annotation_excluded_episodes(dataset_root)
+        total_episodes = int(processing_item.get("totalEpisodes") or 0)
+        selected_episodes += max(0, total_episodes - len(excluded))
+
+    if pending_warnings and not acknowledge_warnings:
+        raise ValueError(
+            "QC passed with warnings; confirm to build the view anyway. " + " | ".join(pending_warnings)
+        )
+    if pending_warnings:
         state.log(
             "warn",
-            f"Building a training view of {dataset_root.name} over {len(warnings)} QC warning(s): "
-            + (" | ".join(warnings) if warnings else "unspecified"),
+            f"Building a training view over {len(pending_warnings)} QC warning(s): "
+            + " | ".join(pending_warnings),
         )
-    elif status != "qc_pass":
+    if selected_episodes <= 0:
+        names = ", ".join(root.name for root in dataset_roots)
         raise ValueError(
-            f"{dataset_root.name} must pass QC before a training view is built "
-            f"(status: {status or 'unknown'}). Run QC on the Dataset Processing page."
+            f"No episode is left to build a view from ({names}): every one is either absent or "
+            "marked as not for training."
         )
+    conflict = _training_view_fps_conflict(dataset_roots, view_fps)
+    if conflict:
+        raise ValueError(conflict)
+
     command, view_root = _training_view_command(
-        state, dataset_root, action_mode, camera_crops=camera_crops, view_fps=view_fps
+        state, dataset_roots, action_mode, camera_crops=camera_crops, view_fps=view_fps
     )
-    excluded = _annotation_excluded_episodes(dataset_root)
-    total_episodes = int(processing_item.get("totalEpisodes") or 0)
-    if excluded and len(excluded) >= total_episodes > 0:
-        raise ValueError(
-            f"Every episode of {dataset_root.name} is marked as not for training; "
-            "there is nothing to build a view from."
-        )
+    source_label = (
+        dataset_roots[0].name
+        if len(dataset_roots) == 1
+        else f"{len(dataset_roots)} recordings ({', '.join(root.name for root in dataset_roots)})"
+    )
     state.export_process = subprocess.Popen(
         command,
         cwd=state.repo_root,
@@ -4012,14 +4189,19 @@ def _start_training_view(
     state.dataset_export = DatasetExportStatus(
         state="exporting",
         target=action_mode,
-        datasetRoot=str(dataset_root),
+        datasetRoot=str(dataset_roots[0]),
+        datasetRoots=[str(root) for root in dataset_roots],
         outputPath=str(view_root),
-        selectedEpisodes=total_episodes,
+        selectedEpisodes=selected_episodes,
         totalFrames=0,
-        message=f"Building {action_mode} training view from {dataset_root.name}…",
+        message=f"Building {action_mode} training view from {source_label}…",
         pid=state.export_process.pid,
     )
-    state.log("info", f"Started {action_mode} training view build {dataset_root} -> {view_root}")
+    state.log(
+        "info",
+        f"Started {action_mode} training view build {source_label} -> {view_root} "
+        f"({selected_episodes} episode(s) after exclusions)",
+    )
     Thread(
         target=_read_export_output,
         args=(state, state.export_process),
@@ -4204,6 +4386,17 @@ def _training_view_entries(state: GatewayState) -> list[dict[str, Any]]:
                 "cameras": sorted(cameras),
                 "sourceFps": manifest.get("source_fps") or {},
                 "frameStride": manifest.get("frame_stride") or {},
+                # What this view was built with, so the settings can be reused rather than
+                # retyped. The manifest is the only record of them: the crop is baked into the
+                # view's video and the page that drew it keeps nothing after a reload.
+                "cameraCrops": manifest.get("camera_crop_specs") or {},
+                "sourceRoots": [str(root) for root in (manifest.get("source_dataset_roots") or [])],
+                "excludedEpisodes": {
+                    str(root): list(episodes)
+                    for root, episodes in (manifest.get("excluded_episodes") or {}).items()
+                },
+                "buildId": str(manifest.get("build_id") or ""),
+                "sourceDigest": str(manifest.get("source_digest") or ""),
                 "modifiedAt": datetime.fromtimestamp(view_root.stat().st_mtime, timezone.utc).isoformat(
                     timespec="seconds"
                 ),
@@ -6058,32 +6251,31 @@ def _dataset_name_with_actual_camera_count(dataset_root: Path) -> str:
 _GMSL2_EP_FRAMES_MEMO: dict[str, tuple[float, int]] = {}
 
 
+def _gmsl2_episode_frame_count(ep_dir: Path) -> int:
+    meta_path = ep_dir / "meta.json"
+    try:
+        mtime = meta_path.stat().st_mtime
+    except OSError:
+        return 0  # no meta.json yet (episode mid-write)
+    key = str(meta_path)
+    cached = _GMSL2_EP_FRAMES_MEMO.get(key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    try:
+        with meta_path.open() as f:
+            ep_meta = json.load(f)
+        dur = float(ep_meta.get("duration_s") or 0)
+        fps = int(ep_meta.get("video", {}).get("fps") or 60)
+        frames = int(dur * fps)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        frames = 0
+    _GMSL2_EP_FRAMES_MEMO[key] = (mtime, frames)
+    return frames
+
+
 def _gmsl2_dataset_stats(dataset_root: Path) -> tuple[int, int]:
     ep_dirs = _gmsl2_episode_dirs(dataset_root)
-    total_frames = 0
-    for ep_dir in ep_dirs:
-        meta_path = ep_dir / "meta.json"
-        try:
-            mtime = meta_path.stat().st_mtime
-        except OSError:
-            continue  # no meta.json yet (episode mid-write)
-        key = str(meta_path)
-        cached = _GMSL2_EP_FRAMES_MEMO.get(key)
-        if cached is not None and cached[0] == mtime:
-            total_frames += cached[1]
-            continue
-        frames = 0
-        try:
-            with meta_path.open() as f:
-                ep_meta = json.load(f)
-            dur = float(ep_meta.get("duration_s") or 0)
-            fps = int(ep_meta.get("video", {}).get("fps") or 60)
-            frames = int(dur * fps)
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            frames = 0
-        _GMSL2_EP_FRAMES_MEMO[key] = (mtime, frames)
-        total_frames += frames
-    return len(ep_dirs), total_frames
+    return len(ep_dirs), sum(_gmsl2_episode_frame_count(ep_dir) for ep_dir in ep_dirs)
 
 
 def _training_view_item_fields(dataset_root: Path, dataset_kind: str) -> dict[str, Any]:
@@ -6291,7 +6483,27 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
                 }
 
         data_files = _dataset_data_files(dataset_root)
-        for data_file in sorted(data_files, key=lambda path: path.stat().st_mtime, reverse=True):
+        # Which file holds the episode that was asked for. A view merged from several
+        # recordings gets one parquet per source, and this loop is otherwise newest-first:
+        # the newest file answered every request with *its* own first episode, so on the
+        # merged view picking episode 14 came back as episode 18 -- and a replay would have
+        # driven the arm through episode 18. meta/episodes is v3's own record of where an
+        # episode lives, so ask it, and only fall back to mtime order when it cannot say.
+        requested_episode = _active_replay_episode(state, dataset_root)
+        preferred_file = (
+            _resolve_data_file_for_episode(dataset_root, info, requested_episode)
+            if requested_episode is not None
+            else None
+        )
+        ordered_files = sorted(data_files, key=lambda path: path.stat().st_mtime, reverse=True)
+        if preferred_file is None:
+            # No authoritative answer (a recording still in flight has no meta/episodes yet),
+            # so leave the old newest-first behaviour alone rather than guessing.
+            requested_episode = None
+        else:
+            ordered_files = [preferred_file, *(path for path in ordered_files if path != preferred_file)]
+
+        for data_file in ordered_files:
             try:
                 parquet = pq.ParquetFile(data_file)
                 column_names = parquet.schema_arrow.names
@@ -6348,7 +6560,15 @@ def _read_recorded_trajectory(state: GatewayState) -> tuple[list[dict[str, Any]]
                 episodes = [int(value) for value in table["episode_index"].to_pylist() if value is not None]
                 if episodes:
                     episode_options = sorted(set(episodes))
-                    episode = _selected_episode_for_dataset(state, dataset_root, episode_options)
+                    if requested_episode is not None and requested_episode not in episode_options:
+                        # Another source's parquet. Falling back to its first episode here is
+                        # exactly what made a merged view report the wrong episode as loaded.
+                        continue
+                    episode = (
+                        requested_episode
+                        if requested_episode is not None
+                        else _selected_episode_for_dataset(state, dataset_root, episode_options)
+                    )
                     table = table.filter(pc.equal(table["episode_index"], episode))
                     if table.num_rows == 0:
                         continue
@@ -7868,6 +8088,159 @@ def _resolve_video_path(
         for mp4 in sorted(camera_dir.glob("chunk-*/*.mp4")):
             return mp4
     return None
+
+
+# ---------------------------------------------------------------- frame preview ---
+#
+# One still frame out of a recording, for the crop picker. A v3 dataset concatenates every
+# episode of a chunk into a single mp4 -- 16 FR3 episodes is a 42 MB file -- so pointing the
+# browser at the video URL and letting it seek costs tens of megabytes per camera before the
+# operator can draw a box. Decoding the one frame here costs ~30 KB.
+
+_FRAME_PREVIEW_SEMAPHORE = BoundedSemaphore(2)
+_FRAME_PREVIEW_CACHE: dict[tuple[str, int, int, str], bytes] = {}
+_FRAME_PREVIEW_CACHE_LIMIT = 48
+_FRAME_PREVIEW_CACHE_LOCK = Lock()
+
+
+def _episode_video_window(dataset_root: Path, camera_key: str, episode: int) -> tuple[float, int]:
+    """Where `episode` starts inside its (possibly shared) video file, and how long it is.
+
+    v3 concatenates episodes into one file per chunk and records the boundary per camera in
+    meta/episodes. Without it every episode of a chunk previews as the same first frame.
+    """
+    row = _episode_metadata_row(dataset_root, episode)
+    if row is None:
+        return 0.0, 0
+    try:
+        start_s = max(0.0, float(row[f"videos/{camera_key}/from_timestamp"]))
+    except (KeyError, TypeError, ValueError):
+        start_s = 0.0
+    try:
+        frames = max(0, int(row["length"]))
+    except (KeyError, TypeError, ValueError):
+        frames = 0
+    return start_s, frames
+
+
+def _frame_preview_source(
+    state: GatewayState, dataset_root: Path, camera_key: str, episode: int
+) -> tuple[Path, float, int] | None:
+    """Video file to decode, the episode's offset inside it, and its frame count."""
+    if _has_gmsl2_episodes(dataset_root):
+        ep_dir = dataset_root / "episodes" / f"episode_{episode:06d}"
+        mkv = ep_dir / f"{_camera_stem_from_key(camera_key)}.mkv"
+        if not mkv.is_file():
+            return None
+        # Decoded straight from the mkv: _resolve_video_path would remux the whole episode to
+        # mp4 first, which is minutes of ffmpeg for a single still.
+        return mkv, 0.0, _gmsl2_episode_frame_count(ep_dir)
+    video_path = _resolve_video_path(state, dataset_root, camera_key, episode)
+    if video_path is None:
+        return None
+    start_s, frames = _episode_video_window(dataset_root, camera_key, episode)
+    return video_path, start_s, frames
+
+
+def _frame_preview_episode_lengths(dataset_root: Path) -> dict[int, int]:
+    """episode_index -> frame count, read from meta/episodes in one pass."""
+    try:
+        import pyarrow.parquet as pq
+    except Exception:
+        return {}
+    lengths: dict[int, int] = {}
+    for meta_file in sorted((dataset_root / "meta" / "episodes").glob("*/*.parquet")):
+        try:
+            table = pq.read_table(meta_file, columns=["episode_index", "length"])
+        except Exception:
+            continue
+        for row in table.to_pylist():
+            try:
+                lengths[int(row["episode_index"])] = int(row["length"])
+            except (KeyError, TypeError, ValueError):
+                continue
+    return lengths
+
+
+def _frame_preview_info(dataset_root: Path) -> dict[str, Any]:
+    """What the crop picker needs to address a frame: cameras, rate, and episode lengths."""
+    info = _load_dataset_info(dataset_root)
+    gmsl2 = _has_gmsl2_episodes(dataset_root)
+    lengths = {} if gmsl2 else _frame_preview_episode_lengths(dataset_root)
+    episodes: list[dict[str, int]] = []
+    for episode in _dataset_episode_indices(dataset_root, info):
+        frames = (
+            _gmsl2_episode_frame_count(dataset_root / "episodes" / f"episode_{episode:06d}")
+            if gmsl2
+            else int(lengths.get(episode, 0))
+        )
+        episodes.append({"episode": int(episode), "frames": frames})
+    return {
+        "path": str(dataset_root),
+        "name": dataset_root.name,
+        "fps": int(info.get("fps") or 0),
+        "cameras": _camera_feature_items(info),
+        "episodes": episodes,
+    }
+
+
+def _frame_preview_timestamp(start_s: float, frame_index: int, frames: int, fps: int) -> tuple[int, float]:
+    """Clamp a requested frame to the episode and turn it into a seek timestamp.
+
+    Clamped rather than refused: the slider's range comes from a `frame-info` response that can
+    be one poll older than the recording it describes, and a stale last frame should still show
+    the last frame.
+    """
+    clamped = max(0, frame_index if frames <= 0 else min(frame_index, frames - 1))
+    return clamped, start_s + (clamped / fps if fps > 0 else 0.0)
+
+
+def _extract_video_frame_jpeg(video_path: Path, timestamp_s: float) -> bytes | None:
+    if shutil.which("ffmpeg") is None:
+        return None
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        # -ss ahead of -i seeks by index to the keyframe before the target and decodes forward
+        # from there. After -i it decodes from the start of the file instead, which on a
+        # five-minute chunk is seconds of work for every step of the frame slider.
+        "-ss", f"{max(0.0, timestamp_s):.3f}",
+        "-i", str(video_path),
+        "-frames:v", "1",
+        "-f", "image2",
+        "-c:v", "mjpeg",
+        "-q:v", "3",
+        "-",
+    ]
+    try:
+        with _FRAME_PREVIEW_SEMAPHORE:
+            result = subprocess.run(cmd, capture_output=True, timeout=30, check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    return result.stdout
+
+
+def _frame_preview_jpeg(video_path: Path, timestamp_s: float) -> bytes | None:
+    """Cached `_extract_video_frame_jpeg`. Dragging the frame slider revisits the same handful
+    of timestamps, and every miss is another ffmpeg process."""
+    try:
+        stat = video_path.stat()
+    except OSError:
+        return None
+    key = (str(video_path), int(stat.st_mtime_ns), int(stat.st_size), f"{timestamp_s:.3f}")
+    with _FRAME_PREVIEW_CACHE_LOCK:
+        cached = _FRAME_PREVIEW_CACHE.get(key)
+    if cached is not None:
+        return cached
+    frame = _extract_video_frame_jpeg(video_path, timestamp_s)
+    if frame is None:
+        return None
+    with _FRAME_PREVIEW_CACHE_LOCK:
+        _FRAME_PREVIEW_CACHE[key] = frame
+        while len(_FRAME_PREVIEW_CACHE) > _FRAME_PREVIEW_CACHE_LIMIT:
+            _FRAME_PREVIEW_CACHE.pop(next(iter(_FRAME_PREVIEW_CACHE)))
+    return frame
 
 
 def _serve_static_file(handler: BaseHTTPRequestHandler, asset_path: Path, content_type: str) -> None:
@@ -11393,6 +11766,64 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 return
             _serve_static_file(self, plot_path, "image/png")
             return
+        if path == "/api/replay/frame-info":
+            requested = query.get("path", [""])[0]
+            with self.server.state.lock:
+                dataset_root = _resolve_known_dataset(self.server.state, requested)
+            if dataset_root is None:
+                _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
+                return
+            _json_response(self, HTTPStatus.OK, _frame_preview_info(dataset_root))
+            return
+        if path == "/api/replay/frame.jpg":
+            requested = query.get("path", [""])[0]
+            camera_key = (query.get("key", [""])[0] or "").strip()
+            if not camera_key:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing camera key"})
+                return
+            try:
+                episode = int(query.get("episode", ["0"])[0] or 0)
+                requested_frame = int(query.get("frame", ["0"])[0] or 0)
+            except ValueError:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "episode and frame must be integers"})
+                return
+            with self.server.state.lock:
+                dataset_root = _resolve_known_dataset(self.server.state, requested)
+            if dataset_root is None:
+                _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
+                return
+            # ffmpeg and the metadata reads stay outside state.lock: this endpoint is driven by a
+            # slider, and holding the lock for a decode would stall every snapshot poll behind it.
+            source = _frame_preview_source(self.server.state, dataset_root, camera_key, episode)
+            if source is None:
+                _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"video not found: {camera_key}"})
+                return
+            video_path, start_s, frames = source
+            fps = _dataset_declared_fps(dataset_root) or 0
+            frame_index, timestamp_s = _frame_preview_timestamp(start_s, requested_frame, frames, fps)
+            jpeg = _frame_preview_jpeg(video_path, timestamp_s)
+            if jpeg is None:
+                _json_response(
+                    self,
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": f"could not decode frame {frame_index} of {camera_key}"},
+                )
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(jpeg)))
+            # A decoded frame of a finished recording never changes, and the picker re-requests
+            # the frame it just showed every time the operator steps back to it.
+            self.send_header("Cache-Control", "private, max-age=300")
+            self.send_header("X-Frame-Index", str(frame_index))
+            self.send_header("X-Frame-Count", str(frames))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            try:
+                self.wfile.write(jpeg)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         if path == "/api/replay/video":
             requested = query.get("path", [""])[0]
             camera_key = query.get("key", [""])[0]
@@ -11462,9 +11893,17 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/replay/timeline":
                 requested = query.get("path", [""])[0]
-                dataset_root = _resolve_known_dataset(self.server.state, requested) or (
-                    self.server.state.selected_replay_root
-                )
+                dataset_root = _resolve_known_dataset(self.server.state, requested)
+                if dataset_root is None and requested:
+                    # Only an *absent* path falls back. A path that was sent and did not resolve
+                    # is a caller error, and answering it with whatever happens to be selected
+                    # returns another dataset's timeline under the name that was asked for.
+                    # A path is easy to mangle in transit -- a raw "+" in a query string decodes
+                    # to a space -- so this has to fail loudly rather than plausibly.
+                    _json_response(self, HTTPStatus.NOT_FOUND, {"error": f"unknown dataset: {requested}"})
+                    return
+                if dataset_root is None:
+                    dataset_root = self.server.state.selected_replay_root
                 if dataset_root is None:
                     candidates = _dataset_root_candidates(self.server.state)
                     dataset_root = candidates[0] if candidates else None
@@ -12029,9 +12468,15 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     if self.server.state.profile == "workstation":
                         # The workstation recorder already writes v3, so there is no raw->v3
                         # export here; the equivalent step is building the training view.
+                        # `paths` is repeated once per selected recording rather than joined:
+                        # dataset paths are absolute and a separator would have to be one that
+                        # cannot appear in a path.
+                        requested_paths = [
+                            value.strip() for value in query.get("paths", []) if value.strip()
+                        ] or ([requested] if requested else [])
                         _start_training_view(
                             self.server.state,
-                            requested,
+                            requested_paths,
                             (query.get("action_mode", [DEFAULT_TRAINING_VIEW_ACTION_MODE])[0] or "").strip()
                             or DEFAULT_TRAINING_VIEW_ACTION_MODE,
                             acknowledge_warnings=_query_flag(query, "acknowledge_warnings"),
