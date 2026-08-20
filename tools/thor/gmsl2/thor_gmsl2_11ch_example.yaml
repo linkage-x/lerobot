@@ -241,7 +241,11 @@ dataset:
   # parquet (the GUI consumer reads the MKV streams + meta.json directly).
   fps: 60
   num_episodes: 0              # 0 = unlimited; press the GUI's Save/Stop
-  episode_time_s: 10
+  # Length of one episode. The recorder ends and auto-saves it when this
+  # elapses; the GUI's Save button only ends it earlier. The calibration
+  # wizard overrides it per episode (`episode_time:<seconds>` on stdin)
+  # because a board sweep is paced by the operator, not by this number.
+  episode_time_s: 20
   # Legacy gstreamer_splitmux only: while Connected but not recording, the
   # persistent pipelines keep streaming into a throwaway warmup fragment under
   # <root>/_warmup. The default argus_metadata backend starts one recorder

@@ -314,7 +314,7 @@ function App() {
         snapshot={snapshot}
         api={api}
         busy={busy}
-        onRunMultiCameraCalibration={() => run(() => api.runCalibration())}
+        onRunMultiCameraCalibration={(options) => run(() => api.runCalibration(options))}
       />
     ) : activePage === "device-manager" ? (
       <DeviceManagerPage snapshot={snapshot} />

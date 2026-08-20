@@ -178,6 +178,33 @@ export function stableSourceSummary(source: WorldStableSource | undefined): stri
 }
 
 /** Only offer the fallback when the self-check is actually driving. */
+/** Why the registration on screen is history rather than this run's answer.
+ *
+ * ``_world_frame_payload`` always returns the last registration written to
+ * disk, and the gateway attaches it to *failures* too so the panel does not go
+ * blank while showing an error. Rendering it unlabelled is how "找不到自标定 BA
+ * 结果，先跑一次外参标定" ended up sitting directly above "7 台相机全部未移动，
+ * 世界系保持不变" -- two statements that cannot both describe the same run.
+ * Returns "" when the block may stand as the current verdict.
+ */
+export function staleRegistrationNote(
+  payload: WorldFrameResponse | null,
+  fresh: boolean,
+): string {
+  const registration = payload?.registration;
+  if (!registration || fresh) return "";
+  const when = registration.generated_utc || "未知时间";
+  const note = `以下是上次检测的结果（${when}），不是本次的结论。`;
+  const active = payload?.extrinsicsRun ?? "";
+  const registered = registration.calibration_id ?? "";
+  if (active && registered && active !== registered) {
+    // A registration is a statement about one bundle. Once the active run is a
+    // different one, the verdict is not merely old -- it is about other data.
+    return `${note}它注册的是标定 ${registered}，与当前生效的外参 ${active} 不是同一次。`;
+  }
+  return note;
+}
+
 export function canFallBackToGeometry(source: WorldStableSource | undefined): boolean {
   return source?.origin === "rig_check";
 }

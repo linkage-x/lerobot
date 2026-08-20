@@ -6,6 +6,7 @@ import argparse
 import bisect
 import copy
 import csv
+import hashlib
 import ipaddress
 import json
 import math
@@ -18,14 +19,14 @@ import shutil
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import BoundedSemaphore, Lock, Thread
-from typing import Any, Iterable
+from threading import BoundedSemaphore, Lock, Thread, Timer
+from typing import Any, Callable, Iterable, Sequence
 from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
@@ -213,6 +214,31 @@ class DatasetExportStatus:
 
 
 @dataclass
+class CalibrationProgress:
+    """How far the solve has got, in units the operator can check against.
+
+    The solve is three subprocesses, and the first one decodes every frame of
+    every recorded video: on an 11-camera capture that is tens of minutes with
+    nothing on screen but "正在解算…". It also used to fail *after* that wait
+    -- the bundle imports scipy, which the rig's interpreter did not have -- so
+    "is it alive" and "how much is left" were both unanswerable.
+    """
+
+    stepIndex: int = 0  # 1-based; 0 while nothing is running
+    stepCount: int = 0
+    label: str = ""
+    done: int = 0
+    total: int = 0  # 0 = this step reports no unit of its own
+    fraction: float = 0.0  # overall, 0..1
+    # Wall-clock share of each step in *this* run's plan; see _solve_weights.
+    weights: list[float] = field(default_factory=list)
+    detail: str = ""
+    startedAt: float = 0.0  # epoch seconds; 0 = not started
+    elapsedS: float = 0.0
+    etaS: float = 0.0  # 0 = no basis to extrapolate from yet
+
+
+@dataclass
 class CalibrationStatus:
     state: str = "idle"
     pattern: str = "ChArUco 12x9 · 30 mm (charuco_400)"
@@ -220,6 +246,15 @@ class CalibrationStatus:
     message: str = "Run calibration to refresh extrinsics"
     cameras: list[dict[str, Any]] = field(default_factory=list)
     outputPath: str = ""
+    progress: CalibrationProgress = field(default_factory=CalibrationProgress)
+    # The capture the next solve reads, when the operator has named one.
+    # Empty means "work it out" -- see _solve_dataset.
+    solveDatasetRoot: str = ""
+    # The capture intrinsics are re-fitted from, when the operator asks for it.
+    # A different recording from the extrinsics one: intrinsics need a per-camera
+    # sweep that reaches that camera's frame edges, extrinsics need one sweep
+    # several cameras watch at once. They cannot share a capture.
+    intrinsicsDatasetRoot: str = ""
     # Which calibration runs production is currently pointed at. The self-check
     # records these with its baseline: a baseline that outlives the calibration
     # it was taken against compares against a rig that no longer exists.
@@ -253,6 +288,11 @@ class CalibrationSession:
     steps: list[CalibrationStep] = field(default_factory=list)
     currentIndex: int = 0
     message: str = ""
+    # How long each sweep records, in seconds. Independent of the config's
+    # dataset.episode_time_s because a calibration segment is paced by a human
+    # walking a board around a rig, not by whatever an ordinary demonstration
+    # episode is worth. Sent to the recorder per episode.
+    episodeTimeS: float = 30.0
 
 
 @dataclass
@@ -568,11 +608,23 @@ def _refresh_mujoco_validation_current(state: GatewayState) -> None:
         validation["isCurrentForSelection"] = False
 
 
+# Recorder default when a config omits dataset.episode_time_s. 10 s was too
+# short for anything an operator performs in front of the rig (a calibration
+# board sweep, a demonstration), so segments kept being cut mid-motion.
+_DEFAULT_EPISODE_TIME_S = 20.0
+
+
+def _episode_time_s(config: dict[str, Any]) -> float:
+    return float(_dataset_config(config).get("episode_time_s") or _DEFAULT_EPISODE_TIME_S)
+
+
+def _target_frames_for_seconds(config: dict[str, Any], seconds: float) -> int:
+    fps = int(_dataset_config(config).get("fps") or 30)
+    return max(1, int(round(fps * seconds)))
+
+
 def _target_frames(config: dict[str, Any]) -> int:
-    dataset = _dataset_config(config)
-    fps = int(dataset.get("fps") or 30)
-    episode_time_s = float(dataset.get("episode_time_s") or 10.0)
-    return max(1, int(round(fps * episode_time_s)))
+    return _target_frames_for_seconds(config, _episode_time_s(config))
 
 
 def _config_summary(config: dict[str, Any], config_path: Path) -> dict[str, Any]:
@@ -592,7 +644,7 @@ def _config_summary(config: dict[str, Any], config_path: Path) -> dict[str, Any]
         "repoId": str(dataset.get("repo_id") or ""),
         "root": str(dataset.get("root") or ""),
         "fps": int(dataset.get("fps") or 30),
-        "episodeTimeS": float(dataset.get("episode_time_s") or 10.0),
+        "episodeTimeS": _episode_time_s(config),
         "targetFrames": _target_frames(config),
         "numEpisodes": int(dataset.get("num_episodes") or 0),
         "video": bool(dataset.get("video", True)),
@@ -1080,6 +1132,14 @@ def _path_modified_s(path: Path) -> float:
         return path.stat().st_mtime
     except OSError:
         return 0.0
+
+
+def _path_modified_ns(path: Path) -> int:
+    """Integer mtime, for comparing a file against a record of what it was."""
+    try:
+        return int(path.stat().st_mtime_ns)
+    except OSError:
+        return 0
 
 
 def _dataset_modified_s(dataset_root: Path) -> float:
@@ -2295,6 +2355,86 @@ def _cv2_python(repo_root: Path) -> Path | None:
     return None
 
 
+# What the solve actually imports. cv2 decodes the video and finds the corners;
+# scipy's sparse least-squares *is* the bundle adjustment. They are probed
+# together because an interpreter carrying only cv2 gets all the way through
+# detection -- tens of minutes -- before the bundle dies on "No module named
+# 'scipy'", which is exactly what the rig did on 2026-08-20. Submodules rather
+# than top-level names: a partial scipy install imports and then fails here.
+_SOLVE_REQUIRED_IMPORTS = ("cv2", "numpy", "scipy.optimize", "scipy.sparse")
+
+_IMPORT_PROBE = (
+    "import importlib, sys\n"
+    "missing = []\n"
+    "for name in sys.argv[1:]:\n"
+    "    try:\n"
+    "        importlib.import_module(name)\n"
+    "    except Exception:\n"
+    "        missing.append(name)\n"
+    "print(' '.join(missing))\n"
+)
+
+
+def _missing_modules(python: Path, modules: Sequence[str]) -> list[str]:
+    """Which of `modules` this interpreter cannot import.
+
+    An interpreter that cannot even run the probe is missing all of them: the
+    caller only has to decide whether to use it, and it cannot be used.
+    """
+    try:
+        probe = subprocess.run(
+            [str(python), "-c", _IMPORT_PROBE, *modules],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return list(modules)
+    if probe.returncode != 0:
+        return list(modules)
+    return probe.stdout.split()
+
+
+def _solve_python(repo_root: Path) -> tuple[Path | None, list[str]]:
+    """Interpreter for the metrology CLIs, and whatever it still cannot import.
+
+    Prefers one that can import everything the solve needs; falls back to the
+    closest so the refusal can name the interpreter and the module, which is
+    what makes it fixable, instead of a traceback from a step that has already
+    burned the whole detection pass.
+    """
+    candidates = [
+        _venv_python3(repo_root, prefer_fr3=True),
+        Path("/home/nvidia/Code/infer/.venv-fr3/bin/python3"),
+        Path(sys.executable),
+    ]
+    best: tuple[Path, list[str]] | None = None
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen or not candidate.is_file():
+            continue
+        seen.add(key)
+        missing = _missing_modules(candidate, _SOLVE_REQUIRED_IMPORTS)
+        if not missing:
+            return candidate, []
+        if best is None or len(missing) < len(best[1]):
+            best = (candidate, missing)
+    if best is None:
+        return None, list(_SOLVE_REQUIRED_IMPORTS)
+    return best
+
+
+def _missing_modules_message(python: Path, missing: Sequence[str]) -> str:
+    """Say which package is missing and how to install it, not just that it is."""
+    packages = sorted({name.split(".")[0] for name in missing})
+    return (
+        f"解算用的解释器缺少 {'、'.join(packages)}：{python}。"
+        f"在这台机器上执行 `{python} -m pip install {' '.join(packages)}` 后重试。"
+    )
+
+
 def _cameras_busy_reason(state: GatewayState) -> str:
     """Why the preview pipelines cannot open the cameras right now, if they can't.
 
@@ -2832,6 +2972,7 @@ def _calibration_session_payload(state: GatewayState) -> dict[str, Any]:
         "datasetRoot": session.datasetRoot,
         "currentIndex": session.currentIndex,
         "message": session.message,
+        "episodeTimeS": session.episodeTimeS,
         "recorderState": state.recording.state,
         "steps": [
             {
@@ -2846,11 +2987,61 @@ def _calibration_session_payload(state: GatewayState) -> dict[str, Any]:
     }
 
 
-def _start_calibration_session(state: GatewayState, cameras_arg: str = "") -> dict[str, Any]:
+# A sweep shorter than this cannot cover a frame's corners at a walking pace;
+# longer than this is a mis-typed number, and every camera's segment is decoded
+# frame by frame during the solve.
+_CALIBRATION_SEGMENT_MIN_S = 5.0
+_CALIBRATION_SEGMENT_MAX_S = 300.0
+_CALIBRATION_SEGMENT_DEFAULT_S = 30.0
+
+
+def _parse_calibration_segment_seconds(raw: str, fallback: float) -> float:
+    """Validate an operator-supplied segment length, in seconds."""
+    text = str(raw or "").strip()
+    if not text:
+        return fallback
+    try:
+        seconds = float(text)
+    except ValueError as exc:
+        raise ValueError(f"每段时长要填数字，收到 {raw!r}") from exc
+    if not _CALIBRATION_SEGMENT_MIN_S <= seconds <= _CALIBRATION_SEGMENT_MAX_S:
+        raise ValueError(
+            f"每段时长要在 {_CALIBRATION_SEGMENT_MIN_S:g}–{_CALIBRATION_SEGMENT_MAX_S:g} 秒之间"
+        )
+    return seconds
+
+
+def _set_calibration_segment_seconds(state: GatewayState, seconds_arg: str) -> dict[str, Any]:
+    """Change the length of the sweeps still to be recorded."""
+    session = state.calibration_session
+    if not session.active:
+        return {"ok": False, "error": "没有进行中的标定会话"}
+    step = session.steps[session.currentIndex] if session.currentIndex < len(session.steps) else None
+    if step is not None and step.status == "recording":
+        # The recorder was already told how long this one runs; changing the
+        # number now would describe the segment on screen wrongly.
+        return {"ok": False, "error": "本段正在录制，先保存或丢弃再改时长"}
+    try:
+        session.episodeTimeS = _parse_calibration_segment_seconds(seconds_arg, session.episodeTimeS)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    state.log("info", f"Calibration segment length set to {session.episodeTimeS:g}s")
+    return {"ok": True, "session": _calibration_session_payload(state)}
+
+
+def _start_calibration_session(
+    state: GatewayState, cameras_arg: str = "", seconds_arg: str = ""
+) -> dict[str, Any]:
     if state.calibration_session.active:
         return {"ok": False, "error": "标定会话已在进行中"}
     if state.calibration.state == "running":
         return {"ok": False, "error": "上一次标定解算尚未结束"}
+    try:
+        episode_time_s = _parse_calibration_segment_seconds(
+            seconds_arg, _CALIBRATION_SEGMENT_DEFAULT_S
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
 
     wanted = [c.strip() for c in cameras_arg.split(",") if c.strip()]
     cameras = [str(d.get("id")) for d in state.devices if d.get("kind") == "camera"]
@@ -2874,6 +3065,7 @@ def _start_calibration_session(state: GatewayState, cameras_arg: str = "") -> di
         steps=steps,
         currentIndex=0,
         message="按提示逐台录制；被遮挡或不需要的相机可以跳过。",
+        episodeTimeS=episode_time_s,
     )
     state.log("info", f"Calibration session {name} started with {len(cameras)} camera(s)")
     return {"ok": True, "session": _calibration_session_payload(state)}
@@ -2897,6 +3089,25 @@ def _calibration_session_advance(state: GatewayState) -> None:
     session.message = f"采集完成（{len(captured)} 段），可以开始解算。"
 
 
+# Recorder states in which the current episode is still open, i.e. there is
+# something for save/discard to end. See _calibration_step_record.
+_EPISODE_OPEN_STATES = frozenset({"recording", "review"})
+
+
+def _calibration_segment_written(state: GatewayState, step: CalibrationStep) -> bool:
+    """Whether the recorder already wrote this step's episode to disk.
+
+    ``savedEpisodes`` counts the episodes the recorder wrote this session and
+    ``step.episodeIndex`` was that count when this segment started, so a higher
+    count means this segment landed. ``saving`` covers the sliver between the
+    recorder's "Episode saved." line and the "Total saved episodes: N" line that
+    carries the new count.
+    """
+    if state.recording.state == "saving":
+        return True
+    return step.episodeIndex >= 0 and int(state.recording.savedEpisodes) > step.episodeIndex
+
+
 def _calibration_step_record(state: GatewayState, action: str) -> dict[str, Any]:
     session = state.calibration_session
     if not session.active or session.stage != "capture":
@@ -2914,20 +3125,73 @@ def _calibration_step_record(state: GatewayState, action: str) -> dict[str, Any]
                     "ok": False,
                     "error": "相机还没连接。请先到「采集」页点 Connect，等相机全部就绪后再回来录制。",
                 }
-            _start_episode(state)
+            _start_episode(state, session.episodeTimeS)
             step.status = "recording"
+            step.note = ""
+            # The index this segment will take, read before the recorder confirms:
+            # savedEpisodes is the count already written, i.e. the 0-based index of
+            # the one just started. It is also the reference point that tells us
+            # later whether the recorder wrote this segment on its own.
+            step.episodeIndex = int(state.recording.savedEpisodes)
             session.message = (
-                f"正在录制 {step.camera or '外参'}——按提示挥板，完成后点「保存本段」。"
+                f"正在录制 {step.camera or '外参'}——按提示挥板，"
+                f"{session.episodeTimeS:g} 秒后自动收尾，挥完也可以提前点「保存本段」。"
             )
         elif action in {"save", "discard"}:
-            _stop_recorder(state, action)
+            # A segment does not necessarily end when the operator says so. The
+            # recorder closes the episode itself once dataset.episode_time_s
+            # elapses (thor_record: "duration_reached" -> auto-save -> "Episode N
+            # ready"), and on the GMSL2 rig that is 10 s -- shorter than a board
+            # sweep feels, so the recorder is usually back at "armed" by the time
+            # the operator clicks. Driving it then hit the recorder's own
+            # precondition ("Cannot save while recorder is armed") and dropped the
+            # bookkeeping for a segment already sitting on disk. So only send
+            # save/discard while the episode is still open; otherwise register
+            # what the recorder already decided.
+            episode_open = state.recording.state in _EPISODE_OPEN_STATES
+            if episode_open:
+                _stop_recorder(state, action)
+                written = action == "save"
+            else:
+                written = _calibration_segment_written(state, step)
             if action == "save":
+                if not written:
+                    step.status = "pending"
+                    session.message = "本段没有落盘，请重录一段。"
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"这一段没有保存成功（录制器状态 {state.recording.state}）。"
+                            "请重录一段；如果反复失败，去「采集」页看录制器输出。"
+                        ),
+                        "session": _calibration_session_payload(state),
+                    }
                 step.status = "captured"
-                step.episodeIndex = int(state.recording.savedEpisodes)
+                if not episode_open:
+                    step.note = f"录满 {session.episodeTimeS:g}s 自动收尾并保存"
+                # Point the solve at what the recorder actually wrote. The session
+                # names a calib_<ts> dataset when it starts, but the recorder's
+                # dataset root was fixed when it was spawned at Connect, so that
+                # name is a label and not a path: _start_extrinsics_calibration
+                # would resolve it and find no episodes/ under it.
+                if state.recording.datasetRoot:
+                    session.datasetRoot = state.recording.datasetRoot
+                    session.datasetName = Path(state.recording.datasetRoot).name
                 _calibration_session_advance(state)
             else:
                 step.status = "pending"
-                session.message = "本段已丢弃，可以重录。"
+                if written:
+                    # Nothing here can un-write it, and the solver reads every
+                    # episode under the dataset, so say so rather than implying
+                    # the segment is gone.
+                    step.note = "上一段已被录制器自动保存，无法撤回；解算时仍会被读入"
+                    session.message = (
+                        "本段在你点「丢弃」之前已被录制器按固定时长自动保存，无法撤回；"
+                        "可以重录一段，解算会把两段都读进去。"
+                    )
+                else:
+                    step.note = ""
+                    session.message = "本段已丢弃，可以重录。"
         else:
             return {"ok": False, "error": f"未知动作 {action}"}
     except (RuntimeError, ValueError) as exc:
@@ -2953,6 +3217,12 @@ def _calibration_step_skip(state: GatewayState) -> dict[str, Any]:
 def _cancel_calibration_session(state: GatewayState) -> dict[str, Any]:
     if state.recording.state in {"recording", "saving", "discarding"}:
         return {"ok": False, "error": "正在录制中，请先保存或丢弃当前段"}
+    # Leaving the wizard must not orphan what it recorded. The episodes are on
+    # disk either way; without this the only pointer to them goes with the
+    # session, and the fallback scan will not find a capture whose name does not
+    # happen to contain "calib".
+    if state.calibration_session.datasetRoot:
+        state.calibration.solveDatasetRoot = state.calibration_session.datasetRoot
     state.calibration_session = CalibrationSession()
     state.log("info", "Calibration session cancelled")
     return {"ok": True, "session": _calibration_session_payload(state)}
@@ -3189,6 +3459,129 @@ def _newest_calibration_dataset(state: GatewayState) -> Path | None:
     return None
 
 
+def _solve_dataset(state: GatewayState, dataset_arg: str = "") -> tuple[Path | None, str]:
+    """Which capture the next solve reads, and on whose authority.
+
+    Order: what the caller named, then what the operator picked, then what the
+    guided session recorded, then the newest directory that looks like a sweep.
+    The session's capture counts *whatever stage the session is in* -- a solve
+    that failed leaves its episodes on disk, and still pointing at them is the
+    whole of being able to retry. Requiring stage "ready" here is what made a
+    failed solve unretryable: the fallback scan wants "calib" in the directory
+    name, and the recorder names captures after the rig, not after the wizard.
+    """
+    session = state.calibration_session
+    # A named capture is an instruction, not a preference: if it cannot be read
+    # the answer is "missing", never a quietly substituted other dataset. An
+    # operator who picked one capture and got another solved would have no way
+    # to tell from the result.
+    for raw in (dataset_arg, state.calibration.solveDatasetRoot):
+        if not raw:
+            continue
+        resolved = _resolve_dataset_root(state.repo_root, str(raw))
+        if resolved is None or not (resolved / "episodes").is_dir():
+            return None, "missing"
+        return resolved, "manual"
+    if session.active and session.datasetRoot:
+        resolved = _resolve_dataset_root(state.repo_root, session.datasetRoot)
+        if resolved is not None and (resolved / "episodes").is_dir():
+            return resolved, "session"
+    newest = _newest_calibration_dataset(state)
+    return (newest, "auto") if newest is not None else (None, "none")
+
+
+def _set_solve_dataset(state: GatewayState, path_arg: str, kind: str = "extrinsics") -> dict[str, Any]:
+    """Point one half of the solve at a capture, or clear the choice."""
+    if state.calibration.state == "running":
+        return {"ok": False, "error": "解算进行中，结束后再换数据集"}
+    field_name = "intrinsicsDatasetRoot" if kind == "intrinsics" else "solveDatasetRoot"
+    text = str(path_arg or "").strip()
+    if not text:
+        setattr(state.calibration, field_name, "")
+        return {"ok": True, "solve": _solve_payload(state)}
+    resolved = _resolve_dataset_root(state.repo_root, text)
+    if resolved is None or not (resolved / "episodes").is_dir():
+        return {"ok": False, "error": f"{text} 里没有 episodes/，不是一份可解算的采集"}
+    setattr(state.calibration, field_name, str(resolved))
+    state.log("info", f"Calibration {kind} dataset set to {resolved}")
+    return {"ok": True, "solve": _solve_payload(state)}
+
+
+def _solve_candidates(state: GatewayState) -> list[dict[str, Any]]:
+    """Captures that could be solved: anything recorded with an episodes/ tree.
+
+    Built from the dataset scan the snapshot already keeps, so listing them
+    costs one stat each rather than a second walk of the datasets root.
+    """
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in state.cached_recorded_datasets:
+        path = str(item.get("path") or "")
+        if not path or path in seen or not (Path(path) / "episodes").is_dir():
+            continue
+        seen.add(path)
+        candidates.append(
+            {
+                "path": path,
+                "name": str(item.get("name") or Path(path).name),
+                "episodes": int(item.get("totalEpisodes") or 0),
+                "updatedAt": str(item.get("updatedAt") or ""),
+            }
+        )
+    # A capture recorded moments ago may not be in the scan yet, and the one the
+    # solve is actually pointed at must always be selectable -- otherwise the
+    # dropdown would silently disagree with the label above it.
+    for extra in (
+        state.calibration.solveDatasetRoot,
+        state.calibration.intrinsicsDatasetRoot,
+        state.calibration_session.datasetRoot,
+    ):
+        resolved = _resolve_dataset_root(state.repo_root, extra) if extra else None
+        if resolved is None or str(resolved) in seen or not (resolved / "episodes").is_dir():
+            continue
+        seen.add(str(resolved))
+        candidates.append(
+            {
+                "path": str(resolved),
+                "name": resolved.name,
+                "episodes": len([p for p in (resolved / "episodes").glob("episode_*") if p.is_dir()]),
+                "updatedAt": "",
+            }
+        )
+    return sorted(candidates, key=lambda item: item["updatedAt"], reverse=True)
+
+
+def _solve_payload(state: GatewayState) -> dict[str, Any]:
+    """What the panel needs to say which capture will be solved, and offer others."""
+    dataset, source = _solve_dataset(state)
+    candidates = _solve_candidates(state)
+    episodes = next(
+        (item["episodes"] for item in candidates if dataset is not None and item["path"] == str(dataset)),
+        0,
+    )
+    intrinsics = _resolve_dataset_root(state.repo_root, state.calibration.intrinsicsDatasetRoot)
+    intrinsics_ok = intrinsics is not None and (intrinsics / "episodes").is_dir()
+    return {
+        "datasetRoot": str(dataset) if dataset else "",
+        "datasetName": dataset.name if dataset else "",
+        "episodes": episodes,
+        "source": source,
+        "candidates": candidates,
+        "intrinsicsDatasetRoot": str(intrinsics) if intrinsics_ok else "",
+        "intrinsicsDatasetName": intrinsics.name if intrinsics_ok else "",
+        "intrinsicsEpisodes": next(
+            (
+                item["episodes"]
+                for item in candidates
+                if intrinsics_ok and item["path"] == str(intrinsics)
+            ),
+            0,
+        ),
+        # What the solve falls back to when intrinsics are not re-fitted.
+        "intrinsicsRun": state.calibration.intrinsicsRun,
+    }
+
+
 def _unmoved_cameras(state: GatewayState) -> list[str]:
     """Cameras the last self-check found still in place.
 
@@ -3211,102 +3604,526 @@ def _fail_calibration(state: GatewayState, message: str) -> None:
     sitting on "solving" by a path that forgot to update it."""
     state.calibration.state = "failed"
     state.calibration.message = message
+    _finish_solve_progress(state)
     state.log("warn", f"Calibration failed: {message}")
     if state.calibration_session.active:
         state.calibration_session.stage = "failed"
         state.calibration_session.message = message
 
 
+# Wall-clock share of each solve step. These exist only to make one honest bar
+# out of three subprocesses: ChArUco detection decodes every frame of every
+# recorded video, while the bundle and the export work on corner sets that are
+# already orders of magnitude smaller. Measured roughly on the 0804 capture
+# (11 cameras x 12 episodes): ~35 min detect, ~7 min bundle, seconds to export.
+_SOLVE_STEP_WEIGHTS: tuple[float, ...] = (0.80, 0.16, 0.04)
+
+
+def _solve_fraction(
+    step_index: int, done: int, total: int, weights: Sequence[float] = _SOLVE_STEP_WEIGHTS
+) -> float:
+    """Overall progress, 0..1, from the running step and its own units.
+
+    A step that reports no units of its own (``total <= 0``) sits at its start
+    boundary rather than inventing movement. The bar is allowed to stand still;
+    it is not allowed to promise progress that has not happened -- an operator
+    who has learned the bar creeps on its own stops reading it.
+    """
+    if step_index <= 0 or not weights:
+        return 0.0
+    index = min(step_index, len(weights)) - 1
+    before = sum(weights[:index])
+    within = max(0.0, min(1.0, done / total)) if total > 0 else 0.0
+    return max(0.0, min(1.0, before + weights[index] * within))
+
+
+def _solve_eta_s(fraction: float, elapsed_s: float) -> float:
+    """Seconds left at the rate achieved so far; 0 when there is no basis yet.
+
+    Below a few percent the extrapolation is dominated by interpreter startup
+    and would swing by tens of minutes between polls, which reads as broken.
+    """
+    if fraction < 0.03 or fraction >= 1.0 or elapsed_s <= 0:
+        return 0.0
+    return max(0.0, elapsed_s * (1.0 - fraction) / fraction)
+
+
+def _solve_progress_line(line: str) -> tuple[bool, str]:
+    """Read one line of a metrology CLI as (finished a unit?, what to show).
+
+    Kept apart from the subprocess plumbing so the two shapes it has to
+    recognise -- ``detect_charuco``'s per-video table and the bundle's prose --
+    can be pinned by tests instead of by watching a 40-minute run.
+    """
+    text = line.strip()
+    if not text or set(text) <= {"-"}:
+        return False, ""
+    parts = text.split()
+    if parts[0] == "episode" and len(parts) > 1 and parts[1] == "camera":
+        return False, ""  # the table header, not a video
+    if len(parts) >= 3 and parts[1].startswith("cam_"):
+        # "<episode> <camera> <kept frames> <median corners>", one per video.
+        if parts[2] == "-":
+            return True, f"{parts[0]} · {parts[1]} · 视频打不开"
+        if parts[2].isdigit():
+            return True, f"{parts[0]} · {parts[1]} · {parts[2]} 帧可用"
+    return False, text[:120]
+
+
+# Detections are a pure function of (video, stride, board), and producing them
+# is the expensive half of a solve -- tens of minutes of frame-by-frame decode.
+# Keying them by *run* meant every retry redid all of it, which is exactly the
+# bill the 2026-08-20 failure presented: the bundle died on a missing scipy
+# after the detection pass had already finished and been thrown away.
+_DETECTION_STRIDE = 2
+_DETECTION_MANIFEST = "manifest.json"
+
+
+def _capture_videos(episodes: Path) -> list[tuple[str, Path]]:
+    """(npz stem, video) for every video the detection step will read.
+
+    Enumerated exactly the way ``detect_charuco`` does -- ``episode_*``
+    subdirectories, or the directory itself when the videos sit in it directly,
+    and its ``<episode>__<camera>`` npz naming -- so "is this capture already
+    detected" is answered against the same files it would write.
+    """
+    directories = sorted(p for p in episodes.glob("episode_*") if p.is_dir()) or [episodes]
+    videos: list[tuple[str, Path]] = []
+    for directory in directories:
+        for video in sorted(directory.glob("cam_*.mkv")) + sorted(directory.glob("cam_*.mp4")):
+            videos.append((f"{directory.name}__{video.stem}", video))
+    return videos
+
+
+def _charuco_video_count(episodes: Path) -> int:
+    """How many videos the detection step will open, so its bar has a scale."""
+    return len(_capture_videos(episodes))
+
+
+def _detections_dir(state: GatewayState, dataset: Path) -> Path:
+    """Where a capture's corners live. Named after the capture, not the run.
+
+    The path digest is not decoration: intrinsics and extrinsics are two
+    different captures solved in the same run, and two datasets roots can hold
+    directories of the same name. Keying on the name alone would let one
+    capture's corners be read as another's, which no later step could detect.
+    """
+    digest = hashlib.sha1(str(dataset.resolve()).encode("utf-8")).hexdigest()[:8]
+    return state.repo_root / "outputs" / "metrology" / "detections" / f"{dataset.name}__{digest}"
+
+
+def _detection_fingerprint(episodes: Path) -> dict[str, Any]:
+    return {
+        "stride": _DETECTION_STRIDE,
+        "videos": {stem: _path_modified_ns(video) for stem, video in _capture_videos(episodes)},
+    }
+
+
+def _reusable_detections(episodes: Path, detections: Path) -> int | None:
+    """How many npz can be reused as they are, or None if detection must re-run.
+
+    Reuse requires the same set of videos, each with the mtime it had when it
+    was detected, and every npz still present. Anything else re-runs the whole
+    step: ``detect_charuco`` has no incremental mode, and a half-stale directory
+    would be bundled without anyone noticing -- a deleted episode still voting.
+    """
+    manifest_path = detections / _DETECTION_MANIFEST
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    current = _detection_fingerprint(episodes)
+    if manifest.get("stride") != current["stride"] or manifest.get("videos") != current["videos"]:
+        return None
+    stems = current["videos"]
+    if not stems or any(not (detections / f"{stem}.npz").is_file() for stem in stems):
+        return None
+    return len(stems)
+
+
+def _clear_detections(detections: Path) -> None:
+    """Drop the previous corners before detecting again.
+
+    The bundle reads whatever npz the directory holds, so an episode that has
+    since been deleted would keep voting on the extrinsics if its file survived.
+    """
+    if not detections.is_dir():
+        return
+    for path in [*detections.glob("*.npz"), detections / _DETECTION_MANIFEST]:
+        with suppress(OSError):
+            path.unlink()
+
+
+def _write_detection_manifest(episodes: Path, detections: Path) -> None:
+    manifest = _detection_fingerprint(episodes)
+    manifest["generatedUtc"] = _now_iso()
+    with suppress(OSError):
+        detections.mkdir(parents=True, exist_ok=True)
+        (detections / _DETECTION_MANIFEST).write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+
+
+def _solve_weights(detect_videos: Sequence[int]) -> list[float]:
+    """Wall-clock share of each step, given how much video each detection reads.
+
+    Decoding dominates everything else by orders of magnitude -- an intrinsics
+    capture is one sweep per camera, so its detection alone can be seven times
+    the extrinsics one -- and a fixed split would put the bar at 40% while 90%
+    of the work was still ahead. The fits get the remainder in the order they
+    run: intrinsics fit, bundle, export.
+    """
+    videos = [max(0, int(count)) for count in detect_videos]
+    total = sum(videos)
+    share = [0.85 * (count / total) if total else 0.85 / max(len(videos), 1) for count in videos]
+    # In step order, which interleaves: the intrinsics fit runs between the two
+    # detections, so its weight cannot simply be appended after both shares.
+    if len(share) == 2:
+        return [share[0], 0.05, share[1], 0.08, 0.02]
+    return [share[0], 0.13, 0.02]
+
+
+def _progress_weights(state: GatewayState) -> Sequence[float]:
+    return state.calibration.progress.weights or _SOLVE_STEP_WEIGHTS
+
+
+def _begin_solve_step(
+    state: GatewayState, index: int, count: int, label: str, total: int = 0
+) -> None:
+    progress = state.calibration.progress
+    progress.stepIndex = index
+    progress.stepCount = count
+    progress.label = label
+    progress.done = 0
+    progress.total = max(0, total)
+    progress.detail = ""
+    progress.fraction = _solve_fraction(index, 0, progress.total, _progress_weights(state))
+
+
+def _advance_solve_step(state: GatewayState, *, detail: str = "", unit_done: bool = True) -> None:
+    progress = state.calibration.progress
+    if unit_done:
+        progress.done += 1
+        if progress.total:
+            progress.done = min(progress.done, progress.total)
+    if detail:
+        progress.detail = detail
+    progress.fraction = _solve_fraction(
+        progress.stepIndex, progress.done, progress.total, _progress_weights(state)
+    )
+
+
+def _complete_solve_step(state: GatewayState) -> None:
+    """Mark the running step's own units as all accounted for."""
+    progress = state.calibration.progress
+    progress.done = progress.total
+    progress.fraction = _solve_fraction(
+        progress.stepIndex, progress.done, progress.total, _progress_weights(state)
+    )
+
+
+def _finish_solve_progress(state: GatewayState, *, complete: bool = False) -> None:
+    """Freeze the clock on a solve that has stopped, either way it stopped."""
+    progress = state.calibration.progress
+    if progress.startedAt > 0:
+        progress.elapsedS = round(max(0.0, time.time() - progress.startedAt), 1)
+    progress.etaS = 0.0
+    if complete:
+        progress.fraction = 1.0
+        progress.done = progress.total
+
+
+def _calibration_payload(state: GatewayState) -> dict[str, Any]:
+    """Calibration status with the elapsed clock read at request time.
+
+    Elapsed cannot be computed in the browser: the rig's clock and the
+    operator's have been observed minutes apart. Nor can it be advanced only
+    when the solve prints a line -- the bundle adjustment prints nothing for
+    minutes at a stretch, which is precisely when the operator needs to see
+    that something is still alive.
+    """
+    payload = asdict(state.calibration)
+    payload["solve"] = _solve_payload(state)
+    progress = payload.get("progress")
+    running = state.calibration.state == "running"
+    if running and isinstance(progress, dict) and float(progress.get("startedAt") or 0.0) > 0:
+        elapsed = max(0.0, time.time() - float(progress["startedAt"]))
+        progress["elapsedS"] = round(elapsed, 1)
+        progress["etaS"] = round(_solve_eta_s(float(progress.get("fraction") or 0.0), elapsed), 1)
+    return payload
+
+
 def _calibration_step(
-    state: GatewayState, python: Path, args: list[str], *, label: str, timeout: int
+    state: GatewayState,
+    python: Path,
+    args: list[str],
+    *,
+    label: str,
+    timeout: int,
+    on_line: Callable[[str], None] | None = None,
 ) -> subprocess.CompletedProcess[str] | None:
+    """Run one metrology CLI, reporting its output while it is still running.
+
+    Streamed rather than ``subprocess.run``-ed because the detection step takes
+    tens of minutes and prints one line per video as it goes: read at the end
+    that is a log, read as it arrives it is the progress bar.
+    """
     env = os.environ.copy()
     env["PYTHONPATH"] = str(state.repo_root / "third_party" / "opencv_kalibr")
     state.calibration.message = label
     state.log("info", f"Calibration: {label}")
+    command = [str(python), *args]
     try:
-        return subprocess.run(
-            [str(python), *args],
+        process = subprocess.Popen(
+            command,
             cwd=str(state.repo_root),
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
-            check=False,
+            bufsize=1,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         _fail_calibration(state, f"{label} 失败：{exc}")
         return None
 
+    # stderr is drained by a thread rather than read at the end: the failure
+    # message is built from its last line, and a step that fills the pipe buffer
+    # while nobody reads it blocks instead of failing.
+    errors: list[str] = []
+    drain: Thread | None = None
+    if process.stderr is not None:
+        drain = Thread(
+            target=lambda stream=process.stderr: errors.append(stream.read()),
+            daemon=True,
+            name="calibration-stderr",
+        )
+        drain.start()
 
-def _run_extrinsics_calibration(state: GatewayState, dataset: Path, run_name: str) -> None:
-    python = _cv2_python(state.repo_root)
-    if python is None:
-        _fail_calibration(state, "找不到带 cv2 的解释器，无法标定")
+    # The deadline is enforced by killing the process, not by checking a clock
+    # between lines: a step that hangs produces no lines, which is the one case
+    # a per-line check cannot catch.
+    killed: list[bool] = []
+
+    def _expire() -> None:
+        killed.append(True)
+        process.kill()
+
+    watchdog = Timer(timeout, _expire)
+    watchdog.start()
+    lines: list[str] = []
+    try:
+        if process.stdout is not None:
+            for raw in process.stdout:
+                line = raw.rstrip("\n")
+                lines.append(line)
+                if on_line is not None:
+                    on_line(line)
+        process.wait()
+    finally:
+        watchdog.cancel()
+    if drain is not None:
+        drain.join(timeout=10)
+
+    if killed:
+        _fail_calibration(state, f"{label} 失败：{timeout}s 内没有结束，已终止")
+        return None
+    return subprocess.CompletedProcess(
+        command, process.returncode, "\n".join(lines), "".join(errors)
+    )
+
+
+# How much of a camera's frame radius the board actually reached. The 0804
+# calibration had to be recaptured from scratch because this came out at 48-71%:
+# the distortion fit is an extrapolation past whatever the sweep covered, and it
+# folded over inside the frame. The recapture that fixed it reached 96%. The
+# reprojection residual cannot see this at all -- a fit is happy to be
+# self-consistent over the middle of the frame.
+_INTRINSICS_COVERAGE_WARN = 0.85
+
+
+def _annotate_intrinsics_coverage(cameras: list[dict[str, Any]], report_path: Path) -> None:
+    """Attach each camera's edge coverage from a calibrate_intrinsics report.
+
+    Read rather than recomputed: the report already states it per camera, and a
+    second implementation of "how far out did the board get" could disagree with
+    the one the fit was judged by.
+    """
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
         return
+    entries = report.get("cameras") or {}
+    for camera in cameras:
+        entry = entries.get(camera["id"]) or {}
+        coverage = entry.get("observed_radius_fraction")
+        if coverage is None:
+            continue
+        camera["coverage"] = round(float(coverage), 3)
+        fisheye = (entry.get("models") or {}).get("fisheye") or {}
+        folds = fisheye.get("monotonic_across_frame") is False
+        if folds:
+            # The distortion model turns back on itself inside the frame: pixels
+            # out there map to the wrong ray, or to none at all.
+            camera["status"] = "fail"
+            camera["intrinsicsNote"] = "畸变模型在画幅内折返——这一台要重录内参"
+        elif float(coverage) < _INTRINSICS_COVERAGE_WARN:
+            if camera["status"] == "pass":
+                camera["status"] = "warn"
+            camera["intrinsicsNote"] = (
+                f"板子只走到画幅半径的 {float(coverage):.0%}，边角是外推的"
+            )
 
-    # Solve against the intrinsics production is actually using, not the
-    # metrology report: that report lives under outputs/, which is excluded from
-    # the deploy sync and so is simply absent on the rig. Using the active run
-    # also guarantees the bundle and the shipped intrinsics agree.
+
+def _run_extrinsics_calibration(
+    state: GatewayState,
+    dataset: Path,
+    run_name: str,
+    python: Path | None = None,
+    *,
+    force_redetect: bool = False,
+    intrinsics_dataset: Path | None = None,
+) -> None:
+    if python is None:
+        python, missing = _solve_python(state.repo_root)
+        if python is None:
+            _fail_calibration(state, "找不到带 cv2 的解释器，无法标定")
+            return
+        if missing:
+            _fail_calibration(state, _missing_modules_message(python, missing))
+            return
+
     calib_root = state.repo_root / "outputs" / "calibration"
     intrinsics_run = calib_root / (state.calibration.intrinsicsRun or "")
-    intrinsics_source: list[str]
-    if state.calibration.intrinsicsRun and intrinsics_run.is_dir():
-        intrinsics_source = ["--intrinsics-run", str(intrinsics_run)]
-    elif (state.repo_root / _CALIB_INTRINSICS_REPORT).is_file():
-        intrinsics_source = ["--intrinsics-report", str(state.repo_root / _CALIB_INTRINSICS_REPORT)]
-    else:
-        _fail_calibration(state, (
-            "找不到内参：既没有已激活的内参 run（calibration.intrinsics_run_name），"
-            f"也没有 {_CALIB_INTRINSICS_REPORT}"
-        ))
-        return
+    intrinsics_source: list[str] = []
+    if intrinsics_dataset is None:
+        # Solve against the intrinsics production is actually using, not the
+        # metrology report: that report lives under outputs/, which is excluded
+        # from the deploy sync and so is simply absent on the rig. Using the
+        # active run also guarantees the bundle and the shipped intrinsics agree.
+        if state.calibration.intrinsicsRun and intrinsics_run.is_dir():
+            intrinsics_source = ["--intrinsics-run", str(intrinsics_run)]
+        elif (state.repo_root / _CALIB_INTRINSICS_REPORT).is_file():
+            intrinsics_source = [
+                "--intrinsics-report", str(state.repo_root / _CALIB_INTRINSICS_REPORT)
+            ]
+        else:
+            _fail_calibration(state, (
+                "找不到内参：既没有已激活的内参 run（calibration.intrinsics_run_name），"
+                f"也没有 {_CALIB_INTRINSICS_REPORT}"
+            ))
+            return
 
     work = state.repo_root / "outputs" / "metrology" / run_name
-    detections = work / "det_extr"
     base_run = calib_root / (state.calibration.extrinsicsRun or "")
+    # Two captures, two detection passes. Weighted by video count because that
+    # is what the time goes into: an intrinsics capture is one sweep per camera.
+    plan = [intrinsics_dataset, dataset] if intrinsics_dataset is not None else [dataset]
+    state.calibration.progress.weights = _solve_weights(
+        [_charuco_video_count(capture / "episodes") for capture in plan]
+    )
+    step_count = 5 if intrinsics_dataset is not None else 3
 
-    steps: list[tuple[str, list[str], int]] = [
-        (
-            "检测 ChArUco 角点…",
-            [
-                "-m", "metrology.cli.detect_charuco",
-                "--episodes", str(dataset / "episodes"),
-                "--out", str(detections),
-                "--stride", "2",
-            ],
-            3600,
-        ),
-        (
-            "多相机联合 BA…",
-            [
-                "-m", "metrology.cli.calibrate_extrinsics",
-                "--detections", str(detections),
-                *intrinsics_source,
-                "--out", str(work),
-            ],
-            3600,
-        ),
-    ]
-    for label, args, timeout in steps:
-        proc = _calibration_step(state, python, args, label=label, timeout=timeout)
+    # Detection is the only step that can say how much work it has: one unit per
+    # video, counted the same way it enumerates them. The fits report no units,
+    # so they move the bar only at their boundaries.
+    def _on_line(line: str) -> None:
+        unit_done, detail = _solve_progress_line(line)
+        if unit_done or detail:
+            _advance_solve_step(state, detail=detail, unit_done=unit_done)
+
+    def _run(label: str, args: list[str], timeout: int) -> bool:
+        proc = _calibration_step(
+            state, python, args, label=label, timeout=timeout, on_line=_on_line
+        )
         if proc is None:
-            return
+            return False
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip().splitlines()
             _fail_calibration(state, f"{label} 失败：{detail[-1] if detail else proc.returncode}")
+            return False
+        return True
+
+    def _detect(label: str, capture: Path, step_index: int) -> Path | None:
+        """Corners for one capture, reusing whatever is already on disk."""
+        capture_episodes = capture / "episodes"
+        directory = _detections_dir(state, capture)
+        reusable = None if force_redetect else _reusable_detections(capture_episodes, directory)
+        if reusable is not None:
+            _begin_solve_step(
+                state, step_index, step_count, f"{label}（复用已有检测 {reusable} 个视频）", reusable
+            )
+            _complete_solve_step(state)
+            state.log("info", f"Reusing {reusable} ChArUco detections from {directory}")
+            return directory
+        _clear_detections(directory)
+        _begin_solve_step(state, step_index, step_count, label, _charuco_video_count(capture_episodes))
+        args = [
+            "-m", "metrology.cli.detect_charuco",
+            "--episodes", str(capture_episodes),
+            "--out", str(directory),
+            "--stride", str(_DETECTION_STRIDE),
+        ]
+        if not _run(label, args, 3600):
+            return None
+        # Written only after the step succeeded, so a killed or crashed run
+        # leaves a directory that is re-detected rather than half-reused.
+        _write_detection_manifest(capture_episodes, directory)
+        return directory
+
+    fitted_intrinsics: Path | None = None
+    if intrinsics_dataset is not None:
+        intrinsics_detections = _detect("检测内参采集…", intrinsics_dataset, 1)
+        if intrinsics_detections is None:
             return
+        _begin_solve_step(state, 2, step_count, "拟合内参…")
+        fitted_intrinsics = work / "intrinsics_report.json"
+        work.mkdir(parents=True, exist_ok=True)
+        fit_args = [
+            "-m", "metrology.cli.calibrate_intrinsics",
+            "--detections", str(intrinsics_detections),
+            "--out", str(fitted_intrinsics),
+        ]
+        if not _run("拟合内参…", fit_args, 3600):
+            return
+        # fisheye, not rational: the report holds both, and production declares
+        # fisheye (cube_tracker.camera_model). Shipping the other one would be a
+        # mismatch nothing downstream can detect.
+        intrinsics_source = ["--intrinsics-report", str(fitted_intrinsics), "--model", "fisheye"]
+
+    detect_index = 3 if intrinsics_dataset is not None else 1
+    detections = _detect("检测外参采集…" if intrinsics_dataset is not None else "检测 ChArUco 角点…",
+                         dataset, detect_index)
+    if detections is None:
+        return
+
+    _begin_solve_step(state, detect_index + 1, step_count, "多相机联合 BA…")
+    bundle_args = [
+        "-m", "metrology.cli.calibrate_extrinsics",
+        "--detections", str(detections),
+        *intrinsics_source,
+        "--out", str(work),
+    ]
+    if not _run("多相机联合 BA…", bundle_args, 3600):
+        return
 
     export_args = [
         "-m", "metrology.cli.export_production_calibration",
         "--extrinsics-report", str(work / "extrinsics_report.json"),
         "--name", run_name,
     ]
-    # Only emit intrinsics when there is no production run to keep. Re-solving
-    # extrinsics does not touch the lenses.
-    keep_intrinsics_run = bool(state.calibration.intrinsicsRun) and intrinsics_run.is_dir()
-    if not keep_intrinsics_run:
+    # Only emit intrinsics when they were just re-fitted, or when there is no
+    # production run to keep. Re-solving extrinsics alone does not touch lenses.
+    keep_intrinsics_run = (
+        fitted_intrinsics is None
+        and bool(state.calibration.intrinsicsRun)
+        and intrinsics_run.is_dir()
+    )
+    if fitted_intrinsics is not None:
+        export_args += ["--intrinsics-report", str(fitted_intrinsics), "--model", "fisheye"]
+    elif not keep_intrinsics_run:
         export_args += [
             "--intrinsics-report", str(state.repo_root / _CALIB_INTRINSICS_REPORT),
             "--model", "fisheye",
@@ -3340,12 +4157,8 @@ def _run_extrinsics_calibration(state: GatewayState, dataset: Path, run_name: st
     if serial_map.is_file():
         export_args += ["--serial-map", str(serial_map)]
 
-    proc = _calibration_step(state, python, export_args, label="导出生产标定…", timeout=600)
-    if proc is None:
-        return
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        _fail_calibration(state, f"导出失败：{detail[-1] if detail else proc.returncode}")
+    _begin_solve_step(state, step_count, step_count, "导出生产标定…")
+    if not _run("导出生产标定…", export_args, 600):
         return
 
     report_path = work / "extrinsics_report.json"
@@ -3366,9 +4179,12 @@ def _run_extrinsics_calibration(state: GatewayState, dataset: Path, run_name: st
         }
         for name, rmse in sorted(per_camera.items())
     ]
+    if fitted_intrinsics is not None:
+        _annotate_intrinsics_coverage(cameras, fitted_intrinsics)
     failed = [c for c in cameras if c["status"] == "fail"]
     state.calibration.cameras = cameras
     state.calibration.state = "failed" if failed else "complete"
+    _finish_solve_progress(state, complete=True)
     state.calibration.lastRunAt = _now_iso()
     state.calibration.outputPath = str(work)
     if not keep_intrinsics_run:
@@ -3394,35 +4210,92 @@ def _run_extrinsics_calibration(state: GatewayState, dataset: Path, run_name: st
         state.log("info", "Rig-check baseline cleared; capture a new one for the new calibration")
 
 
-def _start_extrinsics_calibration(state: GatewayState, dataset_arg: str = "") -> dict[str, Any]:
+def _refuse_solve(state: GatewayState, error: str, *, hint: str = "") -> dict[str, Any]:
+    """Refuse to start, and put the reason where the operator is looking.
+
+    A guided session shows its own message, so a refusal returned only to the
+    caller leaves the wizard reading "采集完成，可以解算" while nothing happens
+    -- the same "is it working?" this whole change is about.
+    """
+    if state.calibration_session.active:
+        state.calibration_session.message = error
+    state.log("warn", f"Calibration not started: {error}")
+    payload: dict[str, Any] = {"ok": False, "error": error}
+    if hint:
+        payload["hint"] = hint
+    return payload
+
+
+def _start_extrinsics_calibration(
+    state: GatewayState,
+    dataset_arg: str = "",
+    *,
+    force_redetect: bool = False,
+    refit_intrinsics: bool = False,
+) -> dict[str, Any]:
     if state.calibration.state == "running":
         return {"ok": False, "error": "标定已在进行中"}
-    session = state.calibration_session
-    if dataset_arg:
-        dataset = _resolve_dataset_root(state.repo_root, dataset_arg)
-    elif session.active and session.stage == "ready" and session.datasetRoot:
-        # Prefer what the guided session just recorded over whatever happens to
-        # be the newest calibration-looking directory on disk.
-        dataset = _resolve_dataset_root(state.repo_root, session.datasetRoot)
-    else:
-        dataset = _newest_calibration_dataset(state)
-    if dataset is None or not (dataset / "episodes").is_dir():
-        return {
-            "ok": False,
-            "error": "找不到可用的 ChArUco 采集",
-            "hint": "先用采集页录一段挥板数据（数据集名含 calib），再运行外参标定。",
-        }
+    dataset, source = _solve_dataset(state, dataset_arg)
+    if dataset is None:
+        if source == "missing":
+            return _refuse_solve(
+                state,
+                "指定的采集读不到（目录不存在，或里面没有 episodes/）",
+                hint="在「将解算」下拉里换一份采集。",
+            )
+        return _refuse_solve(
+            state,
+            "找不到可用的 ChArUco 采集",
+            hint="先用采集页录一段挥板数据，或在「将解算」下拉里选一份带 episodes/ 的采集。",
+        )
+
+    # Checked before anything starts, not when the bundle gets there: an
+    # interpreter without scipy still runs the detection pass to completion and
+    # only then reports a missing module, so the operator waits out the entire
+    # expensive half of a solve to be told it was never going to work.
+    python, missing = _solve_python(state.repo_root)
+    if python is None:
+        return _refuse_solve(state, "找不到可用的 Python 解释器，无法解算")
+    if missing:
+        return _refuse_solve(
+            state,
+            _missing_modules_message(python, missing),
+            hint="解算要先检测 ChArUco 角点再做 BA，缺模块的话会白等一遍检测，所以在这里就拦下来。",
+        )
+
+    # Re-fitting intrinsics is a different capture from the extrinsics sweep,
+    # and asking for it without one is a mistake worth catching before the run.
+    intrinsics_dataset: Path | None = None
+    if refit_intrinsics:
+        intrinsics_dataset = _resolve_dataset_root(
+            state.repo_root, state.calibration.intrinsicsDatasetRoot
+        )
+        if intrinsics_dataset is None or not (intrinsics_dataset / "episodes").is_dir():
+            return _refuse_solve(
+                state,
+                "勾了「同时重算内参」，但没有选可用的内参采集",
+                hint="内参要的是逐台相机各录一段、板子走到画面四角的采集，和外参那一段不是同一份。",
+            )
 
     run_name = f"calib_{time.strftime('%Y%m%d_%H%M%S')}"
     state.calibration.state = "running"
     state.calibration.message = f"处理 {dataset.name}…"
     state.calibration.cameras = []
+    # Started here rather than in the thread so the bar is on screen from the
+    # click, instead of appearing whenever the thread happens to get scheduled.
+    state.calibration.progress = CalibrationProgress(
+        stepIndex=1,
+        stepCount=5 if intrinsics_dataset is not None else 3,
+        label="准备解算…",
+        startedAt=time.time(),
+    )
     if state.calibration_session.active:
         state.calibration_session.stage = "solving"
-        state.calibration_session.message = f"正在解算 {dataset.name}…" 
+        state.calibration_session.message = f"正在解算 {dataset.name}…"
     Thread(
         target=_run_extrinsics_calibration,
-        args=(state, dataset, run_name),
+        args=(state, dataset, run_name, python),
+        kwargs={"force_redetect": force_redetect, "intrinsics_dataset": intrinsics_dataset},
         daemon=True,
         name=f"extrinsics-calibration-{run_name}",
     ).start()
@@ -7475,7 +8348,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "replay": asdict(state.replay),
         "teleop": asdict(state.teleop),
         "annotation": _active_annotation(state),
-        "calibration": asdict(state.calibration),
+        "calibration": _calibration_payload(state),
         "calibrationSession": _calibration_session_payload(state),
         "markerTcp": _marker_tcp_session_payload(state),
         "recordedDatasets": recorded_datasets,
@@ -8104,11 +8977,35 @@ def _connect_recorder(state: GatewayState, *, backend: str | None = None) -> Non
     _start_output_reader(state, state.process)
 
 
-def _start_episode(state: GatewayState) -> None:
+def _start_episode(state: GatewayState, episode_time_s: float | None = None) -> None:
+    """Queue one episode, optionally overriding how long the recorder runs it.
+
+    ``episode_time_s`` asks the recorder for a specific length for this episode
+    only (``episode_time:<seconds>``), instead of the config's
+    ``dataset.episode_time_s``. The calibration wizard needs this: a board sweep
+    has to last as long as the operator was told to wave, and respawning the
+    recorder to change a config value would re-open eleven Argus cameras.
+    Only the GMSL2 recorder implements the command -- the FR3 runtime queues
+    unrecognised stdin lines as commands, so sending it there would be noise in
+    its state machine.
+    """
     process = _ensure_recorder_running(state)
     if state.recording.state not in ("armed", "idle"):
         raise RuntimeError(f"Cannot start an episode while recorder is {state.recording.state}.")
 
+    if episode_time_s is not None and episode_time_s > 0:
+        if not _state_is_gmsl2(state):
+            raise RuntimeError(
+                "This recorder cannot change the episode length per episode; "
+                "it always uses dataset.episode_time_s."
+            )
+        _write_recorder_stdin(process, f"episode_time:{episode_time_s:g}\n")
+        # Keep the frame budget in step with the length actually asked for:
+        # targetFrames is what flips the recorder to "review", so leaving it at
+        # the config value would declare a 30 s segment finished at 20 s.
+        state.recording.targetFrames = _target_frames_for_seconds(state.config, episode_time_s)
+    else:
+        state.recording.targetFrames = _target_frames(state.config)
     _write_recorder_stdin(process, "\n")
     state.recording.state = "recording"
     state.recording.frameIndex = 0
@@ -10373,15 +11270,31 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/calibration/run":
                     dataset = (query.get("dataset", [""])[0] or "").strip()
-                    result = _start_extrinsics_calibration(self.server.state, dataset)
+                    truthy = {"1", "true", "yes"}
+                    force = (query.get("force_redetect", [""])[0] or "").strip() in truthy
+                    refit = (query.get("refit_intrinsics", [""])[0] or "").strip() in truthy
+                    result = _start_extrinsics_calibration(
+                        self.server.state, dataset, force_redetect=force, refit_intrinsics=refit
+                    )
                     if not result.get("ok"):
                         _json_response(self, HTTPStatus.CONFLICT, result)
                         return
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
+                if path == "/api/calibration/dataset":
+                    result = _set_solve_dataset(
+                        self.server.state,
+                        (query.get("path", [""])[0] or "").strip(),
+                        (query.get("kind", [""])[0] or "extrinsics").strip(),
+                    )
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
                 if path == "/api/calibration/session/start":
                     result = _start_calibration_session(
-                        self.server.state, (query.get("cameras", [""])[0] or "").strip()
+                        self.server.state,
+                        (query.get("cameras", [""])[0] or "").strip(),
+                        (query.get("seconds", [""])[0] or "").strip(),
                     )
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
@@ -10424,6 +11337,13 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 if path == "/api/calibration/session/record":
                     action = (query.get("action", ["start"])[0] or "start").strip()
                     result = _calibration_step_record(self.server.state, action)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/session/duration":
+                    result = _set_calibration_segment_seconds(
+                        self.server.state, (query.get("seconds", [""])[0] or "").strip()
+                    )
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
                     return

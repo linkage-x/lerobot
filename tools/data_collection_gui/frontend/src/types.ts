@@ -430,6 +430,45 @@ export type CalibrationCamera = {
   // no honest conversion without a range.
   reprojectionPx: number;
   status: "pass" | "warn" | "fail";
+  /** Fraction of the frame radius the board reached, when intrinsics were re-fitted. */
+  coverage?: number;
+  /** Why the intrinsics for this camera are suspect, if they are. */
+  intrinsicsNote?: string;
+};
+
+/** How far a running solve has got. Absent on gateways older than this field. */
+export type CalibrationProgress = {
+  /** 1-based; 0 when nothing is running. */
+  stepIndex: number;
+  stepCount: number;
+  label: string;
+  done: number;
+  /** 0 means this step reports no unit of its own, so the bar cannot advance. */
+  total: number;
+  /** Overall, 0..1, weighted across the steps. */
+  fraction: number;
+  detail: string;
+  startedAt: number;
+  /** Computed on the gateway: the rig's clock is not the browser's. */
+  elapsedS: number;
+  /** 0 = no basis to extrapolate from yet. */
+  etaS: number;
+};
+
+/** The capture the next solve will read, plus everything else it could read. */
+export type CalibrationSolve = {
+  datasetRoot: string;
+  datasetName: string;
+  episodes: number;
+  /** Who chose it: an explicit pick, the guided session, or the fallback scan. */
+  source: "manual" | "session" | "auto" | "missing" | "none" | string;
+  candidates: { path: string; name: string; episodes: number; updatedAt: string }[];
+  /** The capture intrinsics would be re-fitted from; empty when none is chosen. */
+  intrinsicsDatasetRoot?: string;
+  intrinsicsDatasetName?: string;
+  intrinsicsEpisodes?: number;
+  /** The production intrinsics run reused when they are not re-fitted. */
+  intrinsicsRun?: string;
 };
 
 export type CalibrationStatus = {
@@ -439,6 +478,8 @@ export type CalibrationStatus = {
   message: string;
   cameras: CalibrationCamera[];
   outputPath: string;
+  progress?: CalibrationProgress;
+  solve?: CalibrationSolve;
   // Which calibration runs production is pointed at, read from the tracking
   // config rather than tracked separately so the two cannot drift.
   intrinsicsRun?: string;
@@ -597,6 +638,9 @@ export type RigCheckCamera = {
   status?: "measured" | "unknown";
   verdict: RigCheckVerdict;
   reason?: string;
+  // Machine-readable "why it could not be judged", so the summary can name the
+  // real cause instead of guessing one from the overall verdict.
+  cause?: string;
   shift_px_median?: number;
   shift_px_p95?: number;
   inliers?: number;
@@ -620,6 +664,13 @@ export type RigCheckReport = {
   guidance: string;
   moved_cameras: string[];
   unchecked_cameras?: string[];
+  // Cameras present now that the baseline never saw: nothing to compare, so
+  // they carry no verdict -- but leaving them off the report entirely would let
+  // a rig whose camera set changed read as fully checked.
+  cameras_without_baseline?: string[];
+  // Attached by the gateway, not the analysis: cameras whose frame could not be
+  // grabbed at all. Without it "no current frame" has no explanation.
+  failed_captures?: { camera: string; reason: string }[];
   thresholds_px: { warn: number; fail: number };
   cameras: Record<string, RigCheckCamera>;
   baseline?: RigCheckBaseline;
@@ -766,6 +817,8 @@ export type CalibrationSession = {
   datasetRoot: string;
   currentIndex: number;
   message: string;
+  /** Seconds each sweep records before the recorder ends and saves it. */
+  episodeTimeS: number;
   recorderState: string;
   steps: CalibrationSessionStep[];
 };

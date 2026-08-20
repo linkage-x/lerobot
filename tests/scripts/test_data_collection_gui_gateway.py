@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -153,6 +154,227 @@ def test_default_config_is_thor_gmsl2_box():
     assert {"box_gripper", "box_imu", "box_trigger"}.issubset(set(devices_by_kind["box_collection"]))
     # Old Hikrobot / Pika devices are no longer in the default rig.
     assert "handheld_gripper" not in devices_by_kind
+
+
+def _calibration_gateway_state(tmp_path: Path) -> gateway.GatewayState:
+    dataset_root = tmp_path / "outputs" / "datasets" / "thor_gmsl2_Nch_v1"
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={
+            "dataset": {
+                "repo_id": "local/test",
+                "root": str(dataset_root),
+                "fps": 60,
+                "episode_time_s": 20,
+            },
+            "recorder": {"script": "tools/thor/gmsl2/thor_record.py"},
+        },
+        recording=gateway.RecordingStatus(
+            repoId="local/test",
+            datasetRoot=str(dataset_root),
+            state="armed",
+            savedEpisodes=2,
+        ),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root.parent,
+    )
+    state.devices = [
+        {"id": "cam_06", "kind": "camera"},
+        {"id": "cam_07", "kind": "camera"},
+    ]
+    return state
+
+
+def _open_calibration_segment(state: gateway.GatewayState, monkeypatch) -> None:
+    def fake_start_episode(fake_state: gateway.GatewayState, episode_time_s: float | None = None) -> None:
+        fake_state.recording.state = "recording"
+        fake_state.recording.frameIndex = 0
+
+    monkeypatch.setattr(gateway, "_start_episode", fake_start_episode)
+    assert gateway._start_calibration_session(state)["ok"] is True
+    assert gateway._calibration_step_record(state, "start")["ok"] is True
+
+
+def _refuse_stop_recorder(monkeypatch) -> None:
+    def fail(*_args, **_kwargs):
+        raise AssertionError("must not drive a recorder that already closed the episode")
+
+    monkeypatch.setattr(gateway, "_stop_recorder", fail)
+
+
+def _capture_recorder_stdin(monkeypatch) -> list[str]:
+    written: list[str] = []
+    monkeypatch.setattr(gateway, "_ensure_recorder_running", lambda _state: object())
+    monkeypatch.setattr(gateway, "_write_recorder_stdin", lambda _proc, text: written.append(text))
+    return written
+
+
+def test_start_episode_asks_the_gmsl2_recorder_for_a_specific_length(tmp_path, monkeypatch):
+    state = _calibration_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+
+    gateway._start_episode(state, 30)
+
+    # The length has to reach the recorder before the start newline, or the
+    # episode is already running under the config's length.
+    assert written == ["episode_time:30\n", "\n"]
+    # 30 s x 60 fps: targetFrames is what flips the recorder to "review", so it
+    # has to follow the length actually asked for.
+    assert state.recording.targetFrames == 1800
+    assert state.recording.state == "recording"
+
+
+def test_start_episode_without_an_override_restores_the_config_length(tmp_path, monkeypatch):
+    state = _calibration_gateway_state(tmp_path)
+    state.recording.targetFrames = 1800  # left over from a calibration sweep
+    written = _capture_recorder_stdin(monkeypatch)
+
+    gateway._start_episode(state)
+
+    assert written == ["\n"]
+    assert state.recording.targetFrames == 1200  # 20 s x 60 fps from the config
+
+
+def test_start_episode_refuses_a_length_the_recorder_cannot_honour(tmp_path, monkeypatch):
+    # The FR3 runtime queues unrecognised stdin lines as commands, so an
+    # episode_time line there would be noise in its state machine rather than a
+    # longer episode. Say so instead of silently recording the wrong length.
+    state = _calibration_gateway_state(tmp_path)
+    state.config.pop("recorder")
+    written = _capture_recorder_stdin(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="episode length"):
+        gateway._start_episode(state, 30)
+
+    assert written == []
+
+
+def test_calibration_session_defaults_to_30s_sweeps_and_accepts_an_override(tmp_path):
+    state = _calibration_gateway_state(tmp_path)
+
+    assert gateway._start_calibration_session(state)["ok"] is True
+    assert state.calibration_session.episodeTimeS == 30.0
+
+    assert gateway._cancel_calibration_session(state)["ok"] is True
+    assert gateway._start_calibration_session(state, "", "45")["ok"] is True
+    assert state.calibration_session.episodeTimeS == 45.0
+
+
+def test_calibration_segment_length_is_editable_between_sweeps(tmp_path):
+    state = _calibration_gateway_state(tmp_path)
+    assert gateway._start_calibration_session(state)["ok"] is True
+
+    assert gateway._set_calibration_segment_seconds(state, "60")["ok"] is True
+    assert state.calibration_session.episodeTimeS == 60.0
+    # Out of range and non-numeric both keep the value that was working.
+    assert gateway._set_calibration_segment_seconds(state, "1")["ok"] is False
+    assert gateway._set_calibration_segment_seconds(state, "600")["ok"] is False
+    assert gateway._set_calibration_segment_seconds(state, "abc")["ok"] is False
+    assert state.calibration_session.episodeTimeS == 60.0
+
+
+def test_calibration_segment_length_is_locked_while_a_sweep_records(tmp_path, monkeypatch):
+    # The recorder was already told how long this episode runs; accepting a new
+    # number would describe the segment on screen wrongly.
+    state = _calibration_gateway_state(tmp_path)
+    _open_calibration_segment(state, monkeypatch)
+
+    assert gateway._set_calibration_segment_seconds(state, "60")["ok"] is False
+    assert state.calibration_session.episodeTimeS == 30.0
+
+
+def test_calibration_start_asks_the_recorder_for_the_session_length(tmp_path, monkeypatch):
+    state = _calibration_gateway_state(tmp_path)
+    seen: list[float | None] = []
+
+    def fake_start_episode(fake_state: gateway.GatewayState, episode_time_s: float | None = None) -> None:
+        seen.append(episode_time_s)
+        fake_state.recording.state = "recording"
+
+    monkeypatch.setattr(gateway, "_start_episode", fake_start_episode)
+    assert gateway._start_calibration_session(state, "", "45")["ok"] is True
+
+    assert gateway._calibration_step_record(state, "start")["ok"] is True
+
+    assert seen == [45.0]
+
+
+def test_calibration_save_ends_a_live_segment_early(tmp_path, monkeypatch):
+    state = _calibration_gateway_state(tmp_path)
+    _open_calibration_segment(state, monkeypatch)
+    stopped: list[str] = []
+    monkeypatch.setattr(gateway, "_stop_recorder", lambda _s, action: stopped.append(action))
+
+    result = gateway._calibration_step_record(state, "save")
+
+    assert result["ok"] is True
+    # What the button promises: end the open episode now rather than waiting out
+    # the configured episode_time_s.
+    assert stopped == ["save"]
+    step = state.calibration_session.steps[0]
+    assert step.status == "captured"
+    assert step.episodeIndex == 2
+    assert state.calibration_session.currentIndex == 1
+    # The solve has to run over the dataset the recorder is writing into, not the
+    # calib_<ts> label the session made up before knowing it.
+    assert state.calibration_session.datasetRoot == state.recording.datasetRoot
+    assert state.calibration_session.datasetName == "thor_gmsl2_Nch_v1"
+
+
+def test_calibration_save_registers_a_segment_the_recorder_already_auto_saved(tmp_path, monkeypatch):
+    # dataset.episode_time_s is 10 s on the GMSL2 rig, so the recorder saves the
+    # episode and re-arms long before the operator is done waving the board.
+    # Clicking 保存本段 then used to come back "Cannot save while recorder is
+    # armed" and lose a segment that was already written.
+    state = _calibration_gateway_state(tmp_path)
+    _open_calibration_segment(state, monkeypatch)
+    _refuse_stop_recorder(monkeypatch)
+    state.recording.state = "armed"
+    state.recording.savedEpisodes = 3
+
+    result = gateway._calibration_step_record(state, "save")
+
+    assert result["ok"] is True
+    step = state.calibration_session.steps[0]
+    assert step.status == "captured"
+    assert step.episodeIndex == 2
+    assert "自动" in step.note
+    assert state.calibration_session.currentIndex == 1
+
+
+def test_calibration_save_refuses_when_the_segment_never_landed(tmp_path, monkeypatch):
+    # Recorder closed the episode without writing it (frame-sync gate failure,
+    # stream exit): savedEpisodes never moved, so there is nothing to mark
+    # captured and saying "captured" would feed the solve a segment that is not
+    # on disk.
+    state = _calibration_gateway_state(tmp_path)
+    _open_calibration_segment(state, monkeypatch)
+    _refuse_stop_recorder(monkeypatch)
+    state.recording.state = "armed"
+
+    result = gateway._calibration_step_record(state, "save")
+
+    assert result["ok"] is False
+    assert state.calibration_session.steps[0].status == "pending"
+    assert state.calibration_session.currentIndex == 0
+
+
+def test_calibration_discard_admits_an_auto_saved_segment_cannot_be_taken_back(tmp_path, monkeypatch):
+    state = _calibration_gateway_state(tmp_path)
+    _open_calibration_segment(state, monkeypatch)
+    _refuse_stop_recorder(monkeypatch)
+    state.recording.state = "armed"
+    state.recording.savedEpisodes = 3
+
+    result = gateway._calibration_step_record(state, "discard")
+
+    assert result["ok"] is True
+    step = state.calibration_session.steps[0]
+    # Re-recording is still the right next move, but the solver reads every
+    # episode under the dataset, so the operator has to know this one stays.
+    assert step.status == "pending"
+    assert "无法撤回" in state.calibration_session.message
 
 
 def _marker_tcp_gateway_state(tmp_path: Path) -> gateway.GatewayState:
@@ -2907,3 +3129,693 @@ def test_the_frozen_world_is_somewhere_git_actually_tracks():
             ["git", "check-ignore", "-q", str(path)], cwd=repo_root, check=False
         )
         assert result.returncode == 0, f"{path} would be committed on every check"
+
+
+# ---------------------------------------------------------------------------
+# Solve progress, and refusing a solve that cannot finish
+# ---------------------------------------------------------------------------
+
+
+def _solve_state(tmp_path: Path) -> gateway.GatewayState:
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(tmp_path / "ds"), "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test", datasetRoot=str(tmp_path / "ds")),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+    return state
+
+
+def _charuco_capture(tmp_path: Path, *, episodes: int, cameras: int) -> Path:
+    dataset = tmp_path / "outputs" / "datasets" / "calib_capture"
+    for episode in range(episodes):
+        directory = dataset / "episodes" / f"episode_{episode:03d}"
+        directory.mkdir(parents=True)
+        for camera in range(cameras):
+            (directory / f"cam_{camera:02d}.mkv").write_bytes(b"")
+    return dataset
+
+
+def test_the_bar_advances_only_where_a_step_can_say_how_far_it_is(tmp_path):
+    """Detection counts videos; the bundle counts nothing and must not pretend."""
+    weights = (0.8, 0.16, 0.04)
+
+    assert gateway._solve_fraction(1, 0, 100, weights) == pytest.approx(0.0)
+    assert gateway._solve_fraction(1, 50, 100, weights) == pytest.approx(0.4)
+    assert gateway._solve_fraction(1, 100, 100, weights) == pytest.approx(0.8)
+    # Step 2 reports no units, so it sits at its own start boundary rather than
+    # creeping on a timer -- a bar that moves on its own stops being evidence.
+    assert gateway._solve_fraction(2, 0, 0, weights) == pytest.approx(0.8)
+    assert gateway._solve_fraction(3, 0, 0, weights) == pytest.approx(0.96)
+    assert gateway._solve_fraction(0, 0, 0, weights) == 0.0
+    # A capture whose video count was under-estimated still cannot overrun.
+    assert gateway._solve_fraction(1, 300, 100, weights) == pytest.approx(0.8)
+
+
+def test_no_eta_is_offered_before_there_is_anything_to_extrapolate_from():
+    assert gateway._solve_eta_s(0.0, 30.0) == 0.0
+    assert gateway._solve_eta_s(0.01, 30.0) == 0.0  # dominated by process startup
+    assert gateway._solve_eta_s(0.25, 300.0) == pytest.approx(900.0)
+    assert gateway._solve_eta_s(1.0, 300.0) == 0.0
+
+
+def test_detection_output_is_read_as_one_unit_per_video():
+    """The columns detect_charuco prints, and the lines that are not videos."""
+    done, detail = gateway._solve_progress_line("episode_000 cam_06     512             41")
+    assert done is True
+    assert "episode_000" in detail and "cam_06" in detail and "512" in detail
+
+    # A camera whose video will not open still finished its unit; not counting
+    # it would leave the bar permanently short of 100%.
+    done, detail = gateway._solve_progress_line("episode_000 cam_00     -    -  <-- 视频打不开")
+    assert done is True
+    assert "打不开" in detail
+
+    assert gateway._solve_progress_line("episode          camera    frames  median corners") == (False, "")
+    assert gateway._solve_progress_line("-" * 52) == (False, "")
+    assert gateway._solve_progress_line("   ") == (False, "")
+
+    # The bundle's own prose is not a unit, but it is the only sign of life
+    # during the minutes it spends inside least_squares.
+    done, detail = gateway._solve_progress_line("sync frames: 812  cameras: ['cam_06']")
+    assert done is False
+    assert detail.startswith("sync frames")
+
+
+def test_the_detection_bar_is_scaled_by_the_videos_it_will_open(tmp_path):
+    dataset = _charuco_capture(tmp_path, episodes=3, cameras=4)
+    assert gateway._charuco_video_count(dataset / "episodes") == 12
+
+    # detect_charuco also accepts a directory holding the videos directly, and
+    # the count has to follow it there or the bar would read 0/0.
+    flat = tmp_path / "flat"
+    flat.mkdir()
+    (flat / "cam_06.mkv").write_bytes(b"")
+    (flat / "cam_07.mp4").write_bytes(b"")
+    assert gateway._charuco_video_count(flat) == 2
+
+
+def test_a_solve_step_reports_its_output_while_it_is_still_running(tmp_path):
+    """Read at the end this is a log; read as it arrives it is the bar."""
+    state = _solve_state(tmp_path)
+    seen: list[str] = []
+    script = "import sys\nfor i in range(3):\n    print('line', i)\n    sys.stdout.flush()\n"
+
+    proc = gateway._calibration_step(
+        state,
+        Path(sys.executable),
+        ["-c", script],
+        label="测试步骤…",
+        timeout=60,
+        on_line=seen.append,
+    )
+
+    assert proc is not None
+    assert proc.returncode == 0
+    assert seen == ["line 0", "line 1", "line 2"]
+    assert proc.stdout.splitlines() == seen
+
+
+def test_a_step_that_prints_nothing_and_never_exits_is_still_killed(tmp_path):
+    """The deadline cannot be checked between lines: a hung step prints none."""
+    state = _solve_state(tmp_path)
+
+    proc = gateway._calibration_step(
+        state,
+        Path(sys.executable),
+        ["-c", "import time; time.sleep(120)"],
+        label="卡住的步骤…",
+        timeout=1,
+    )
+
+    assert proc is None
+    assert state.calibration.state == "failed"
+    assert "1s" in state.calibration.message
+
+
+def test_stderr_is_still_captured_when_the_step_fails(tmp_path):
+    """The failure message is built from it, so streaming must not drop it."""
+    state = _solve_state(tmp_path)
+
+    proc = gateway._calibration_step(
+        state,
+        Path(sys.executable),
+        ["-c", "import sys; sys.stderr.write('ModuleNotFoundError: boom\\n'); sys.exit(2)"],
+        label="测试步骤…",
+        timeout=60,
+    )
+
+    assert proc is not None
+    assert proc.returncode == 2
+    assert "ModuleNotFoundError: boom" in proc.stderr
+
+
+def test_a_solve_is_refused_up_front_when_the_interpreter_cannot_import_scipy(tmp_path, monkeypatch):
+    """The 2026-08-20 failure: detection ran to completion -- tens of minutes --
+    and only then did the bundle die on `No module named 'scipy'`."""
+    state = _solve_state(tmp_path)
+    dataset = _charuco_capture(tmp_path, episodes=1, cameras=2)
+    monkeypatch.setattr(
+        gateway, "_solve_python", lambda _root: (Path("/opt/venv/bin/python3"), ["scipy.optimize"])
+    )
+    started: list[str] = []
+    monkeypatch.setattr(gateway, "_run_extrinsics_calibration", lambda *a, **k: started.append("ran"))
+
+    result = gateway._start_extrinsics_calibration(state, str(dataset))
+
+    assert result["ok"] is False
+    assert "scipy" in result["error"]
+    # Actionable, not merely accurate: the interpreter and the install command.
+    assert "/opt/venv/bin/python3" in result["error"]
+    assert "pip install scipy" in result["error"]
+    assert started == []
+    assert state.calibration.state != "running"
+
+
+def test_a_refused_solve_says_so_inside_the_guided_session(tmp_path, monkeypatch):
+    """The wizard shows its own message; a refusal returned only to the caller
+    leaves it reading "可以解算" while nothing at all is happening."""
+    state = _calibration_gateway_state(tmp_path)
+    monkeypatch.setattr(gateway, "_start_episode", lambda *a, **k: None)
+    assert gateway._start_calibration_session(state)["ok"] is True
+    monkeypatch.setattr(
+        gateway, "_solve_python", lambda _root: (Path("/opt/venv/bin/python3"), ["scipy.optimize"])
+    )
+
+    result = gateway._start_extrinsics_calibration(state, str(tmp_path / "nope"))
+
+    assert result["ok"] is False
+    assert state.calibration_session.message == result["error"]
+
+
+def test_the_module_probe_reports_only_what_is_actually_missing(tmp_path):
+    missing = gateway._missing_modules(
+        Path(sys.executable), ["json", "definitely_not_a_module", "os"]
+    )
+    assert missing == ["definitely_not_a_module"]
+
+    # An interpreter that cannot even run is missing everything: it is unusable
+    # either way, and the caller only decides whether to use it.
+    assert gateway._missing_modules(tmp_path / "no-such-python", ["json"]) == ["json"]
+
+
+def test_the_solve_puts_a_bar_on_screen_from_the_click(tmp_path, monkeypatch):
+    """Not from whenever the worker thread happens to get scheduled."""
+    state = _solve_state(tmp_path)
+    dataset = _charuco_capture(tmp_path, episodes=1, cameras=2)
+    monkeypatch.setattr(gateway, "_solve_python", lambda _root: (Path(sys.executable), []))
+    monkeypatch.setattr(gateway, "_run_extrinsics_calibration", lambda *a, **k: None)
+
+    assert gateway._start_extrinsics_calibration(state, str(dataset))["ok"] is True
+
+    progress = state.calibration.progress
+    assert progress.stepIndex == 1
+    assert progress.stepCount == 3
+    assert progress.startedAt > 0
+
+
+def test_elapsed_is_read_from_the_rig_clock_at_request_time(tmp_path, monkeypatch):
+    """The bundle prints nothing for minutes; if elapsed only advanced on output
+    the page would look frozen exactly when the operator needs to see it is not.
+    Computing it in the browser is not an option either -- the rig's clock and
+    the operator's have been observed minutes apart."""
+    state = _solve_state(tmp_path)
+    state.calibration.state = "running"
+    state.calibration.progress = gateway.CalibrationProgress(
+        stepIndex=1, stepCount=3, label="检测 ChArUco 角点…", fraction=0.25, startedAt=1000.0
+    )
+    monkeypatch.setattr(gateway.time, "time", lambda: 1300.0)
+
+    payload = gateway._calibration_payload(state)
+
+    assert payload["progress"]["elapsedS"] == pytest.approx(300.0)
+    assert payload["progress"]["etaS"] == pytest.approx(900.0)
+
+    # Once it stops, the clock stops with it rather than counting up forever.
+    gateway._finish_solve_progress(state, complete=True)
+    state.calibration.state = "complete"
+    frozen = gateway._calibration_payload(state)
+    assert frozen["progress"]["elapsedS"] == pytest.approx(300.0)
+    assert frozen["progress"]["etaS"] == 0.0
+    assert frozen["progress"]["fraction"] == 1.0
+
+
+def test_a_failed_solve_stops_its_clock_too(tmp_path, monkeypatch):
+    state = _solve_state(tmp_path)
+    state.calibration.progress = gateway.CalibrationProgress(
+        stepIndex=2, stepCount=3, fraction=0.8, startedAt=1000.0, etaS=120.0
+    )
+    monkeypatch.setattr(gateway.time, "time", lambda: 1100.0)
+
+    gateway._fail_calibration(state, "多相机联合 BA… 失败：boom")
+
+    assert state.calibration.state == "failed"
+    assert state.calibration.progress.elapsedS == pytest.approx(100.0)
+    assert state.calibration.progress.etaS == 0.0
+
+
+def test_the_bar_walks_all_three_steps_of_a_real_solve(tmp_path, monkeypatch):
+    """The wiring, not the arithmetic: each step must declare how many units it
+    has before it runs, and the export must not leave the bar short of done."""
+    state = _solve_state(tmp_path)
+    state.calibration.state = "running"
+    state.calibration.progress = gateway.CalibrationProgress(startedAt=1000.0)
+    dataset = _charuco_capture(tmp_path, episodes=2, cameras=3)
+    report_path = tmp_path / "outputs" / "metrology" / "run_x" / "extrinsics_report.json"
+    intrinsics = tmp_path / gateway._CALIB_INTRINSICS_REPORT
+    intrinsics.parent.mkdir(parents=True, exist_ok=True)
+    intrinsics.write_text("{}", encoding="utf-8")
+
+    steps: list[tuple[str, int]] = []
+    finished: list[tuple[str, int]] = []
+
+    def fake_step(_state, _python, args, *, label, timeout, on_line=None):
+        steps.append((label, _state.calibration.progress.total))
+        module = next((arg for arg in args if arg.startswith("metrology.cli.")), "")
+        if module.endswith("detect_charuco"):
+            assert on_line is not None
+            for episode in range(2):
+                for camera in range(3):
+                    on_line(f"episode_{episode:03d} cam_{camera:02d}   400   40")
+        finished.append((label, _state.calibration.progress.done))
+        if module.endswith("calibrate_extrinsics"):
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps({"rmse_px": 0.2, "num_frames": 400, "per_camera_rmse": {"cam_00": 0.2}}),
+                encoding="utf-8",
+            )
+        return subprocess.CompletedProcess(["python"], 0, "", "")
+
+    monkeypatch.setattr(gateway, "_calibration_step", fake_step)
+
+    gateway._run_extrinsics_calibration(state, dataset, "run_x", Path(sys.executable))
+
+    assert [label for label, _ in steps] == ["检测 ChArUco 角点…", "多相机联合 BA…", "导出生产标定…"]
+    # Only the detection step knows its own size; it is 2 episodes x 3 cameras.
+    assert [total for _, total in steps] == [6, 0, 0]
+    assert finished[0] == ("检测 ChArUco 角点…", 6)  # every video counted, none twice
+    assert state.calibration.state == "complete", state.calibration.message
+    assert state.calibration.progress.fraction == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Which capture gets solved, and reusing its detections on a retry
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_solve_can_be_retried_on_the_same_capture(tmp_path):
+    """The 2026-08-20 dead end: the wizard records into a dataset named after
+    the rig (thor_gmsl2_10ch_v1_...), the solve failed, and the fallback scan
+    only finds directories with "calib" in the name -- so an intact 11-episode
+    capture became unreachable the moment its first solve failed."""
+    state = _solve_state(tmp_path)
+    dataset = _charuco_capture(tmp_path, episodes=2, cameras=3)
+    renamed = dataset.parent / "thor_gmsl2_10ch_v1_20260820_152528"
+    dataset.rename(renamed)
+    state.calibration_session = gateway.CalibrationSession(
+        active=True, stage="failed", datasetName=renamed.name, datasetRoot=str(renamed)
+    )
+
+    resolved, source = gateway._solve_dataset(state)
+
+    assert resolved == renamed
+    assert source == "session"
+
+
+def test_leaving_the_wizard_does_not_orphan_what_it_recorded(tmp_path):
+    state = _solve_state(tmp_path)
+    dataset = _charuco_capture(tmp_path, episodes=1, cameras=2)
+    renamed = dataset.parent / "thor_gmsl2_10ch_v1_20260820_152528"
+    dataset.rename(renamed)
+    state.calibration_session = gateway.CalibrationSession(
+        active=True, stage="failed", datasetName=renamed.name, datasetRoot=str(renamed)
+    )
+
+    assert gateway._cancel_calibration_session(state)["ok"] is True
+
+    assert gateway._solve_dataset(state) == (renamed, "manual")
+
+
+def test_a_named_capture_is_never_silently_replaced_by_another(tmp_path):
+    """Solving a different capture than the one asked for produces a result
+    nobody can trace back to its input."""
+    state = _solve_state(tmp_path)
+    _charuco_capture(tmp_path, episodes=1, cameras=2)  # a perfectly good fallback
+    state.calibration.solveDatasetRoot = str(tmp_path / "gone")
+
+    resolved, source = gateway._solve_dataset(state)
+
+    assert resolved is None
+    assert source == "missing"
+
+    result = gateway._start_extrinsics_calibration(state)
+    assert result["ok"] is False
+    assert "读不到" in result["error"]
+
+
+def test_picking_a_capture_requires_it_to_actually_hold_episodes(tmp_path):
+    state = _solve_state(tmp_path)
+    dataset = _charuco_capture(tmp_path, episodes=1, cameras=2)
+    empty = tmp_path / "outputs" / "datasets" / "not_a_capture"
+    empty.mkdir(parents=True)
+
+    assert gateway._set_solve_dataset(state, str(empty))["ok"] is False
+    assert gateway._set_solve_dataset(state, str(dataset))["ok"] is True
+    assert state.calibration.solveDatasetRoot == str(dataset)
+    # Clearing restores the automatic choice rather than wedging on the old one.
+    assert gateway._set_solve_dataset(state, "")["ok"] is True
+    assert state.calibration.solveDatasetRoot == ""
+
+
+def test_the_capture_being_solved_is_always_in_the_dropdown(tmp_path):
+    """A capture recorded moments ago is not in the dataset scan yet; if the
+    list omitted it the dropdown would contradict the label above it."""
+    state = _solve_state(tmp_path)
+    dataset = _charuco_capture(tmp_path, episodes=2, cameras=3)
+    state.calibration.solveDatasetRoot = str(dataset)
+
+    payload = gateway._solve_payload(state)
+
+    assert payload["datasetRoot"] == str(dataset)
+    assert payload["source"] == "manual"
+    assert [item["path"] for item in payload["candidates"]] == [str(dataset)]
+    assert payload["candidates"][0]["episodes"] == 2
+
+
+def test_detections_are_reused_when_the_videos_have_not_changed(tmp_path):
+    """They are a pure function of (video, stride, board), and producing them is
+    the expensive half of a solve. Re-deriving them on every retry is what made
+    the missing-scipy failure cost half an hour a second time."""
+    dataset = _charuco_capture(tmp_path, episodes=2, cameras=3)
+    episodes = dataset / "episodes"
+    detections = tmp_path / "det"
+    detections.mkdir()
+
+    assert gateway._reusable_detections(episodes, detections) is None  # nothing yet
+
+    for stem, _video in gateway._capture_videos(episodes):
+        (detections / f"{stem}.npz").write_bytes(b"")
+    gateway._write_detection_manifest(episodes, detections)
+
+    assert gateway._reusable_detections(episodes, detections) == 6
+
+
+def test_a_capture_that_changed_is_detected_again_rather_than_half_reused(tmp_path):
+    dataset = _charuco_capture(tmp_path, episodes=2, cameras=3)
+    episodes = dataset / "episodes"
+    detections = tmp_path / "det"
+    detections.mkdir()
+    for stem, _video in gateway._capture_videos(episodes):
+        (detections / f"{stem}.npz").write_bytes(b"")
+    gateway._write_detection_manifest(episodes, detections)
+
+    # An episode deleted after the fact. Reusing here would let a recording the
+    # operator threw away keep voting on the extrinsics.
+    shutil.rmtree(episodes / "episode_001")
+    assert gateway._reusable_detections(episodes, detections) is None
+
+    # And a video re-recorded under the same name.
+    restored = _charuco_capture(tmp_path / "again", episodes=2, cameras=3) / "episodes"
+    gateway._write_detection_manifest(restored, detections)
+    os.utime(restored / "episode_000" / "cam_00.mkv", (1, 1))
+    assert gateway._reusable_detections(restored, detections) is None
+
+
+def test_stale_npz_are_cleared_before_a_re_detection(tmp_path):
+    detections = tmp_path / "det"
+    detections.mkdir()
+    (detections / "episode_000__cam_00.npz").write_bytes(b"")
+    (detections / gateway._DETECTION_MANIFEST).write_text("{}", encoding="utf-8")
+
+    gateway._clear_detections(detections)
+
+    assert list(detections.iterdir()) == []
+
+
+def test_a_retry_skips_detection_and_says_so(tmp_path, monkeypatch):
+    state = _solve_state(tmp_path)
+    state.calibration.state = "running"
+    state.calibration.progress = gateway.CalibrationProgress(startedAt=1000.0)
+    dataset = _charuco_capture(tmp_path, episodes=2, cameras=3)
+    episodes = dataset / "episodes"
+    detections = gateway._detections_dir(state, dataset)
+    detections.mkdir(parents=True)
+    for stem, _video in gateway._capture_videos(episodes):
+        (detections / f"{stem}.npz").write_bytes(b"")
+    gateway._write_detection_manifest(episodes, detections)
+    intrinsics = tmp_path / gateway._CALIB_INTRINSICS_REPORT
+    intrinsics.parent.mkdir(parents=True, exist_ok=True)
+    intrinsics.write_text("{}", encoding="utf-8")
+    report = tmp_path / "outputs" / "metrology" / "run_y" / "extrinsics_report.json"
+
+    labels: list[str] = []
+
+    def fake_step(_state, _python, args, *, label, timeout, on_line=None):
+        labels.append(label)
+        module = next((arg for arg in args if arg.startswith("metrology.cli.")), "")
+        if module.endswith("calibrate_extrinsics"):
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(json.dumps({"rmse_px": 0.2, "per_camera_rmse": {}}), encoding="utf-8")
+        return subprocess.CompletedProcess(["python"], 0, "", "")
+
+    monkeypatch.setattr(gateway, "_calibration_step", fake_step)
+
+    gateway._run_extrinsics_calibration(state, dataset, "run_y", Path(sys.executable))
+
+    assert labels == ["多相机联合 BA…", "导出生产标定…"]  # detection never ran
+    assert state.calibration.state == "complete"
+
+
+def test_forcing_a_re_detection_ignores_the_cache(tmp_path, monkeypatch):
+    """The escape hatch for the case the fingerprint cannot see: a video that
+    changed without its mtime changing, or a detector that was itself fixed."""
+    state = _solve_state(tmp_path)
+    state.calibration.state = "running"
+    state.calibration.progress = gateway.CalibrationProgress(startedAt=1000.0)
+    dataset = _charuco_capture(tmp_path, episodes=1, cameras=2)
+    episodes = dataset / "episodes"
+    detections = gateway._detections_dir(state, dataset)
+    detections.mkdir(parents=True)
+    for stem, _video in gateway._capture_videos(episodes):
+        (detections / f"{stem}.npz").write_bytes(b"")
+    gateway._write_detection_manifest(episodes, detections)
+    intrinsics = tmp_path / gateway._CALIB_INTRINSICS_REPORT
+    intrinsics.parent.mkdir(parents=True, exist_ok=True)
+    intrinsics.write_text("{}", encoding="utf-8")
+
+    labels: list[str] = []
+
+    def fake_step(_state, _python, args, *, label, timeout, on_line=None):
+        labels.append(label)
+        return subprocess.CompletedProcess(["python"], 1, "", "boom")
+
+    monkeypatch.setattr(gateway, "_calibration_step", fake_step)
+
+    gateway._run_extrinsics_calibration(
+        state, dataset, "run_z", Path(sys.executable), force_redetect=True
+    )
+
+    assert labels[0] == "检测 ChArUco 角点…"
+    # The manifest is written only on success, so a failed re-detection cannot
+    # leave a directory that the next attempt would trust.
+    assert not (detections / gateway._DETECTION_MANIFEST).is_file()
+
+
+def test_the_solve_can_refit_intrinsics_from_a_second_capture(tmp_path, monkeypatch):
+    """The wizard records one intrinsics sweep per camera, and until now the
+    solve read none of them: it ran detect -> calibrate_extrinsics -> export and
+    reused whatever intrinsics run production already pointed at."""
+    state = _solve_state(tmp_path)
+    state.calibration.state = "running"
+    state.calibration.progress = gateway.CalibrationProgress(startedAt=1000.0)
+    extrinsics = _charuco_capture(tmp_path, episodes=1, cameras=3)
+    intrinsics = _charuco_capture(tmp_path / "i", episodes=7, cameras=3)
+    report = tmp_path / "outputs" / "metrology" / "run_i" / "extrinsics_report.json"
+
+    steps: list[tuple[str, str]] = []
+
+    def fake_step(_state, _python, args, *, label, timeout, on_line=None):
+        module = next((arg for arg in args if arg.startswith("metrology.cli.")), "")
+        steps.append((label, module))
+        if module.endswith("calibrate_intrinsics"):
+            Path(args[args.index("--out") + 1]).write_text("{}", encoding="utf-8")
+        if module.endswith("calibrate_extrinsics"):
+            # It must be solved against the intrinsics just fitted, not the
+            # production run: shipping a bundle fitted to one set of intrinsics
+            # alongside another is a mismatch nothing downstream can detect.
+            assert "--intrinsics-report" in args
+            assert args[args.index("--intrinsics-report") + 1].endswith("intrinsics_report.json")
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(json.dumps({"rmse_px": 0.2, "per_camera_rmse": {}}), encoding="utf-8")
+        if module.endswith("export_production_calibration"):
+            # And the new intrinsics have to be exported, or the run would ship
+            # a bundle whose lenses live only under outputs/.
+            assert "--intrinsics-report" in args
+        return subprocess.CompletedProcess(["python"], 0, "", "")
+
+    monkeypatch.setattr(gateway, "_calibration_step", fake_step)
+
+    gateway._run_extrinsics_calibration(
+        state, extrinsics, "run_i", Path(sys.executable), intrinsics_dataset=intrinsics
+    )
+
+    assert [module.split(".")[-1] for _label, module in steps] == [
+        "detect_charuco",
+        "calibrate_intrinsics",
+        "detect_charuco",
+        "calibrate_extrinsics",
+        "export_production_calibration",
+    ]
+    assert state.calibration.state == "complete", state.calibration.message
+    assert state.calibration.intrinsicsRun == "run_i_intrinsics"
+    assert state.calibration.progress.stepCount == 5
+
+
+def test_asking_to_refit_intrinsics_without_a_capture_is_refused_up_front(tmp_path, monkeypatch):
+    state = _solve_state(tmp_path)
+    dataset = _charuco_capture(tmp_path, episodes=1, cameras=2)
+    state.calibration.solveDatasetRoot = str(dataset)
+    monkeypatch.setattr(gateway, "_solve_python", lambda _root: (Path(sys.executable), []))
+    monkeypatch.setattr(gateway, "_run_extrinsics_calibration", lambda *a, **k: None)
+
+    result = gateway._start_extrinsics_calibration(state, refit_intrinsics=True)
+
+    assert result["ok"] is False
+    assert "内参采集" in result["error"]
+    assert "四角" in result["hint"]
+    assert state.calibration.state != "running"
+
+
+def test_the_bar_is_weighted_by_the_video_each_step_has_to_decode(tmp_path):
+    """An intrinsics capture is one sweep per camera: seven times the video of
+    the extrinsics sweep. A fixed split would sit at 40% with 90% of the work
+    still ahead."""
+    intrinsics_heavy = gateway._solve_weights([70, 10])
+    assert sum(intrinsics_heavy) == pytest.approx(1.0)
+    assert intrinsics_heavy[0] == pytest.approx(0.85 * 70 / 80)
+    assert intrinsics_heavy[2] == pytest.approx(0.85 * 10 / 80)
+    # Detection still dominates when it is the only capture.
+    assert gateway._solve_weights([10]) == pytest.approx([0.85, 0.13, 0.02])
+
+
+def test_each_capture_keeps_its_own_detections(tmp_path):
+    """Intrinsics and extrinsics are different recordings; sharing a detection
+    directory would let one overwrite the other's corners."""
+    state = _solve_state(tmp_path)
+    a = _charuco_capture(tmp_path, episodes=1, cameras=2)
+    b = _charuco_capture(tmp_path / "b", episodes=7, cameras=2)
+
+    assert gateway._detections_dir(state, a) != gateway._detections_dir(state, b)
+
+
+def test_the_intrinsics_capture_is_selected_separately(tmp_path):
+    state = _solve_state(tmp_path)
+    extrinsics = _charuco_capture(tmp_path, episodes=1, cameras=2)
+    intrinsics = _charuco_capture(tmp_path / "i", episodes=7, cameras=2)
+
+    assert gateway._set_solve_dataset(state, str(extrinsics))["ok"] is True
+    assert gateway._set_solve_dataset(state, str(intrinsics), "intrinsics")["ok"] is True
+
+    payload = gateway._solve_payload(state)
+    assert payload["datasetRoot"] == str(extrinsics)
+    assert payload["intrinsicsDatasetRoot"] == str(intrinsics)
+    assert payload["intrinsicsEpisodes"] == 7
+    # Both must stay selectable in the one dropdown the panel offers.
+    assert {item["path"] for item in payload["candidates"]} == {str(extrinsics), str(intrinsics)}
+
+
+def test_the_weights_follow_the_order_the_steps_actually_run_in(tmp_path):
+    """The intrinsics fit sits *between* the two detections, so its weight
+    cannot be appended after both of them."""
+    weights = gateway._solve_weights([70, 10])
+
+    assert weights[0] == pytest.approx(0.85 * 70 / 80)  # detect the intrinsics capture
+    assert weights[1] == pytest.approx(0.05)  # fit intrinsics
+    assert weights[2] == pytest.approx(0.85 * 10 / 80)  # detect the extrinsics capture
+    assert sum(weights) == pytest.approx(1.0)
+    # A bar 74% of the way through step 1 of 5 is not 15% done overall.
+    assert gateway._solve_fraction(1, 70, 70, weights) == pytest.approx(0.74375)
+
+
+def test_a_blind_camera_does_not_take_the_whole_intrinsics_fit_down(tmp_path):
+    """detect_charuco deliberately writes a file for a camera that saw nothing.
+    On this rig cam_01/02/03 point away from the board and detect zero frames in
+    every episode; aborting every other camera's fit over that is the wrong
+    failure mode."""
+    pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "third_party" / "opencv_kalibr"))
+    from metrology.cli import calibrate_intrinsics
+
+    detections = tmp_path / "det"
+    detections.mkdir()
+    np.savez(
+        detections / "episode_000000__cam_01.npz",
+        image_size=np.asarray([1920, 1080], dtype=np.int64),
+        frames=np.asarray([], dtype=np.int32),
+        n_per_frame=np.asarray([], dtype=np.int32),
+        charuco_ids=np.zeros((0,), np.int32),
+        charuco_pts=np.zeros((0, 2), np.float32),
+        aruco_n_per_frame=np.asarray([], dtype=np.int32),
+        aruco_ids=np.zeros((0,), np.int32),
+        aruco_pts=np.zeros((0, 4, 2), np.float32),
+        total_frames=np.asarray([1826], dtype=np.int64),
+    )
+    report = detections / "intrinsics_report.json"
+
+    assert calibrate_intrinsics.main(["--detections", str(detections), "--out", str(report)]) == 0
+
+    entry = json.loads(report.read_text(encoding="utf-8"))["cameras"]["cam_01"]
+    assert entry["frames_detected"] == 0
+    # No K under any model, which is what load_intrinsics_map skips on.
+    assert entry["models"] == {}
+
+
+def test_a_refit_reports_edge_coverage_next_to_the_residual(tmp_path):
+    """Reprojection cannot see the failure that forced the 0804 recapture: a
+    distortion fit is perfectly happy to be self-consistent over the middle of
+    the frame it was given, and say nothing about the corners it never saw."""
+    report = tmp_path / "intrinsics_report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "cameras": {
+                    "cam_06": {
+                        "observed_radius_fraction": 0.96,
+                        "models": {"fisheye": {"monotonic_across_frame": True}},
+                    },
+                    "cam_08": {
+                        "observed_radius_fraction": 0.62,
+                        "models": {"fisheye": {"monotonic_across_frame": True}},
+                    },
+                    "cam_09": {
+                        "observed_radius_fraction": 0.91,
+                        "models": {"fisheye": {"monotonic_across_frame": False}},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cameras = [
+        {"id": "cam_06", "reprojectionPx": 0.2, "status": "pass"},
+        {"id": "cam_08", "reprojectionPx": 0.2, "status": "pass"},
+        {"id": "cam_09", "reprojectionPx": 0.2, "status": "pass"},
+    ]
+
+    gateway._annotate_intrinsics_coverage(cameras, report)
+
+    assert cameras[0]["status"] == "pass"  # 96% is what the good recapture reached
+    assert cameras[1]["status"] == "warn"  # 62% is what had to be redone
+    assert "62%" in cameras[1]["intrinsicsNote"]
+    # A model that folds inside its own frame is worse than thin coverage: those
+    # pixels map to the wrong ray, so a good residual there means nothing.
+    assert cameras[2]["status"] == "fail"
+    assert "折返" in cameras[2]["intrinsicsNote"]
+
+
+def test_coverage_annotation_survives_a_report_it_cannot_read(tmp_path):
+    cameras = [{"id": "cam_06", "reprojectionPx": 0.2, "status": "pass"}]
+    gateway._annotate_intrinsics_coverage(cameras, tmp_path / "missing.json")
+    assert cameras == [{"id": "cam_06", "reprojectionPx": 0.2, "status": "pass"}]

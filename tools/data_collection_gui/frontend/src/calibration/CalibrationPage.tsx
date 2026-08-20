@@ -59,7 +59,9 @@ export function CalibrationPage({
   snapshot: GuiSnapshot;
   api: DataCollectionGuiApi;
   busy: boolean;
-  onRunMultiCameraCalibration: () => void;
+  onRunMultiCameraCalibration: (
+    options?: { forceRedetect?: boolean; refitIntrinsics?: boolean }
+  ) => void;
 }) {
   const now = useNow();
   const [operator, setOperator] = useState<string>(
@@ -171,7 +173,9 @@ export function CalibrationPage({
 
       {/* Self-check sits above the calibration itself: the usual question is
           "does anything need redoing?", and the answer is usually no. */}
-      <RigCheckPanel api={api} busy={busy} onRecalibrate={onRunMultiCameraCalibration} />
+      {/* Wrapped: this button hands its click event to whatever it is given, and
+          the solve now takes an options object. */}
+      <RigCheckPanel api={api} busy={busy} onRecalibrate={() => onRunMultiCameraCalibration()} />
 
       {/* Whether a bump happened is the self-check above; whether the world
           frame survived it is a different question, and the one that decides

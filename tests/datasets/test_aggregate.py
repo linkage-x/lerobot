@@ -14,12 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import datasets
+import pytest
 import torch
 
-from lerobot.datasets.aggregate import aggregate_datasets
+from lerobot.datasets.aggregate import aggregate_datasets, validate_derived_provenance
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from tests.fixtures.constants import DUMMY_REPO_ID
 
@@ -614,3 +617,85 @@ def test_aggregate_already_merged_dataset(tmp_path, lerobot_dataset_factory):
 
     # This would raise FileNotFoundError before the fix
     assert_dataset_iteration_works(ds_abc)
+
+
+# --- derived-sidecar provenance gate -------------------------------------------------
+# `validate_derived_provenance` only reads `.repo_id` and `.info`, so these tests build
+# metadata stubs instead of whole datasets: the rules under test are about what
+# `meta/info.json` says, not about frames.
+
+PRODUCER = "april_cube_tracking_in_robot_base"
+
+V2_CHAIN = {
+    "sidecar_schema_version": 2,
+    "sidecar_pose_source": "corner_ba",
+    "sidecar_smoothing": "offline_batch",
+}
+
+LEFT_LAYOUT = {
+    "left": {"layout_id": "cube_left_v1", "source": "measured", "sha256": "a" * 64},
+}
+
+
+def make_meta(repo_id, derived=None):
+    info = {"fps": 30, "robot_type": "dummy", "features": {}}
+    if derived is not None:
+        info["derived"] = derived
+    return SimpleNamespace(repo_id=repo_id, info=info)
+
+
+def stamped(repo_id, chain=None, layouts=None):
+    block = dict(chain if chain is not None else V2_CHAIN)
+    block["marker_layouts_by_cube"] = dict(layouts if layouts is not None else LEFT_LAYOUT)
+    return make_meta(repo_id, {PRODUCER: block})
+
+
+def test_derived_provenance_all_unstamped_passes_with_warning(caplog):
+    """Pure v1 datasets still aggregate — pre-existing datasets are not re-run — but the
+    caller is told that nothing downstream can filter those poses."""
+    all_metadata = [make_meta("ds_a"), make_meta("ds_b")]
+
+    with caplog.at_level(logging.WARNING):
+        validate_derived_provenance(all_metadata)
+
+    assert "sidecar schema v1" in caplog.text
+
+
+def test_derived_provenance_same_chain_passes():
+    validate_derived_provenance([stamped("ds_a"), stamped("ds_b")])
+
+
+def test_derived_provenance_rejects_mixed_stamped_and_unstamped():
+    all_metadata = [stamped("ds_v2"), make_meta("ds_v1")]
+
+    with pytest.raises(ValueError, match="stamped on 1 of 2 datasets"):
+        validate_derived_provenance(all_metadata)
+
+
+def test_derived_provenance_rejects_differing_chain():
+    """Same column names, different estimator: this is exactly what a feature-shape
+    check cannot catch."""
+    other_chain = dict(V2_CHAIN, sidecar_pose_source="pose_fusion")
+    all_metadata = [stamped("ds_ba"), stamped("ds_fusion", chain=other_chain)]
+
+    with pytest.raises(ValueError, match="different measurement chains"):
+        validate_derived_provenance(all_metadata)
+
+
+def test_derived_provenance_rejects_differing_layout_on_shared_cube():
+    """Same chain, but the rig geometry the poses were solved against disagrees."""
+    other_layout = {
+        "left": {"layout_id": "cube_left_v2", "source": "measured", "sha256": "b" * 64},
+    }
+    all_metadata = [stamped("ds_a"), stamped("ds_b", layouts=other_layout)]
+
+    with pytest.raises(ValueError, match="against different marker layouts"):
+        validate_derived_provenance(all_metadata)
+
+
+def test_derived_provenance_ignores_cubes_not_in_common():
+    """A dataset that only ever saw the right cube says nothing about the left one."""
+    right_only = {
+        "right": {"layout_id": "cube_right_v1", "source": "measured", "sha256": "c" * 64},
+    }
+    validate_derived_provenance([stamped("ds_left"), stamped("ds_right", layouts=right_only)])

@@ -11,6 +11,7 @@ import {
   needsOperatorChoice,
   referenceSummary,
   stableSourceSummary,
+  staleRegistrationNote,
   worldCameraRows,
 } from "./worldFrame";
 
@@ -52,6 +53,35 @@ function registration(overrides: Partial<WorldRegistration> = {}): WorldRegistra
     ...overrides,
   };
 }
+
+describe("a stored registration is never presented as this run's answer", () => {
+  const payload = (overrides = {}) =>
+    ({
+      ok: true,
+      reference: { exists: true },
+      registration: registration(),
+      graph: { worlds: 1, edges: 0, nodes: [] },
+      ...overrides,
+    }) as Parameters<typeof staleRegistrationNote>[0];
+
+  it("stays silent for the run the operator just triggered", () => {
+    expect(staleRegistrationNote(payload(), true)).toBe("");
+  });
+
+  it("labels the registration left over from a run that could not start", () => {
+    // "找不到自标定 BA 结果，先跑一次外参标定" sat directly above "7 台相机全部
+    // 未移动，世界系保持不变" -- both on screen, only one of them about now.
+    const note = staleRegistrationNote(payload(), false);
+    expect(note).toContain("上次检测");
+    expect(note).toContain("2026-08-19T02:00:00Z");
+  });
+
+  it("says so when the stored verdict is about a different calibration", () => {
+    const note = staleRegistrationNote(payload({ extrinsicsRun: "calib_20260820" }), false);
+    expect(note).toContain("calib_20260819");
+    expect(note).toContain("calib_20260820");
+  });
+});
 
 describe("canonical world frame presentation", () => {
   it("separates the cameras that define the frame from the one that moved", () => {

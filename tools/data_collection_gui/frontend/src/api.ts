@@ -527,8 +527,16 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async runCalibration(): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot("/api/calibration/run");
+  async runCalibration(
+    options: { forceRedetect?: boolean; refitIntrinsics?: boolean } = {}
+  ): Promise<GuiSnapshot> {
+    // Detections are reused across attempts unless this says otherwise; see the
+    // gateway's _reusable_detections for what counts as still valid.
+    const params = new URLSearchParams();
+    if (options.forceRedetect) params.set("force_redetect", "1");
+    if (options.refitIntrinsics) params.set("refit_intrinsics", "1");
+    const query = params.toString() ? `?${params}` : "";
+    const remote = await this.postRemoteSnapshot(`/api/calibration/run${query}`);
     if (remote) {
       return remote;
     }
@@ -747,9 +755,30 @@ export class DataCollectionGuiApi {
     }
   }
 
-  async startCalibrationSession(cameras?: string[]): Promise<{ ok: boolean; error?: string }> {
-    const query = cameras?.length ? `?cameras=${encodeURIComponent(cameras.join(","))}` : "";
+  async startCalibrationSession(
+    cameras?: string[],
+    segmentSeconds?: number,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const params = new URLSearchParams();
+    if (cameras?.length) params.set("cameras", cameras.join(","));
+    if (segmentSeconds && segmentSeconds > 0) params.set("seconds", String(segmentSeconds));
+    const query = params.toString() ? `?${params}` : "";
     return this.calibrationSessionPost(`/api/calibration/session/start${query}`);
+  }
+
+  /** Change how long the sweeps still to be recorded run for. */
+  async setCalibrationSegmentSeconds(seconds: number): Promise<{ ok: boolean; error?: string }> {
+    return this.calibrationSessionPost(`/api/calibration/session/duration?seconds=${seconds}`);
+  }
+
+  /** Point one half of the solve at a capture; an empty path restores the default. */
+  async setCalibrationDataset(
+    path: string,
+    kind: "extrinsics" | "intrinsics" = "extrinsics"
+  ): Promise<{ ok: boolean; error?: string }> {
+    return this.calibrationSessionPost(
+      `/api/calibration/dataset?path=${encodeURIComponent(path)}&kind=${kind}`
+    );
   }
 
   async calibrationStepRecord(action: "start" | "save" | "discard"): Promise<{ ok: boolean; error?: string }> {
@@ -1194,6 +1223,16 @@ export class DataCollectionGuiApi {
         ...this.snapshot.datasetExport,
         state: "error",
         message: `Export ${command} failed: ${message}`
+      };
+    } else if (endpoint.startsWith("/api/calibration/run")) {
+      // The solve refuses up front now (no ChArUco capture, or an interpreter
+      // missing scipy), and that refusal is the whole answer to "why is nothing
+      // happening". Left in the event log only, it is invisible on the page the
+      // operator is looking at.
+      this.snapshot.calibration = {
+        ...this.snapshot.calibration,
+        state: "failed",
+        message
       };
     } else if (endpoint.includes("/processing/datasets-root")) {
       window.alert(`Datasets Root save failed: ${message}`);

@@ -29,6 +29,7 @@ import {
   needsOperatorChoice,
   referenceSummary,
   stableSourceSummary,
+  staleRegistrationNote,
   worldCameraRows,
   worldReasonLabel,
   worldRoleDot,
@@ -44,11 +45,18 @@ export function WorldFramePanel({ api, busy }: { api: DataCollectionGuiApi; busy
   const [error, setError] = useState("");
   const [confirming, setConfirming] = useState(false);
   const [declared, setDeclared] = useState<string[]>([]);
+  // Whether the registration on screen was produced by the run the operator
+  // just triggered. Anything else -- a page load, a run that could not start --
+  // is last time's answer and has to say so.
+  const [fresh, setFresh] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     api.fetchWorldFrame().then((result) => {
-      if (!cancelled && result) setPayload(result);
+      if (!cancelled && result) {
+        setPayload(result);
+        setFresh(false);
+      }
     });
     return () => {
       cancelled = true;
@@ -63,11 +71,14 @@ export function WorldFramePanel({ api, busy }: { api: DataCollectionGuiApi; busy
     if (!result.ok) {
       setError(result.error || "操作失败");
       // The payload still carries the current state even on failure, so the
-      // panel does not go blank while showing an error about it.
+      // panel does not go blank while showing an error about it -- but the
+      // registration inside it is then the previous run's, not this one's.
       if (result.reference) setPayload({ ...result, ok: true });
+      setFresh(false);
       return;
     }
     setPayload(result);
+    setFresh(true);
     setDeclared([]);
   };
 
@@ -77,6 +88,7 @@ export function WorldFramePanel({ api, busy }: { api: DataCollectionGuiApi; busy
   const rows = worldCameraRows(registration);
   const ambiguous = needsOperatorChoice(registration);
   const disabled = busy || running;
+  const stale = staleRegistrationNote(payload, fresh);
 
   return (
     <section className="panel calibration-panel">
@@ -84,8 +96,9 @@ export function WorldFramePanel({ api, busy }: { api: DataCollectionGuiApi; busy
         <h2>世界坐标系</h2>
         {registration ? (
           <span className="state-pill">
-            <StatusDot state={worldStateDot[registration.world_continuity_state]} />
+            <StatusDot state={stale ? "idle" : worldStateDot[registration.world_continuity_state]} />
             {worldStateLabel[registration.world_continuity_state]}
+            {stale ? " · 上次" : ""}
           </span>
         ) : null}
       </div>
@@ -132,11 +145,13 @@ export function WorldFramePanel({ api, busy }: { api: DataCollectionGuiApi; busy
       {/* Only once there is a verdict to attribute: before any registration has
           run there is no stable set, and describing one would be describing
           nothing. */}
-      {stableSource && registration ? (
+      {stableSource && registration && !stale ? (
         <p className="panel-note">{stableSourceSummary(stableSource)}</p>
       ) : null}
 
       {error ? <p className="panel-note error">{error}</p> : null}
+
+      {stale ? <p className="panel-note cali-stale">{stale}</p> : null}
 
       {registration ? (
         <>

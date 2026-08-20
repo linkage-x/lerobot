@@ -21,6 +21,7 @@ already understands so the existing GUI plumbing keeps working:
   * ``Box devices: box_gripper, box_imu, ...``     → marks each box sensor id
   * ``Episode <N> ready``                          → arms the GUI
   * ``Recorded <K> frames ...``                    → frame progress
+  * ``Episode length <S>s``                        → length this episode runs
   * ``Episode saved. Total saved episodes: N/<budget>``
   * ``Episode discarded`` / ``Recording stopped``
 
@@ -30,6 +31,7 @@ stdin commands accepted (the gateway writes lines to our stdin):
   * ``y`` or ``yes``       → save the current / just-finished episode
   * ``n`` or ``no``        → discard
   * ``q`` or ``quit``      → exit the program cleanly
+  * ``episode_time:<seconds>`` → length of the NEXT episode only (0 = config)
 
 The recorder always runs in *streaming* mode; frame pixels never enter Python.
 Progress shown to the operator is estimated from elapsed time * configured fps.
@@ -333,6 +335,7 @@ def _read_stdin_loop(
     on_calibrate: Callable[[str], None] | None = None,
     on_calibrate_origin: Callable[[str], None] | None = None,
     on_calibrate_touch: Callable[[str], None] | None = None,
+    on_episode_time: Callable[[float], None] | None = None,
 ) -> None:
     while not stop.is_set():
         line = sys.stdin.readline()
@@ -380,6 +383,22 @@ def _read_stdin_loop(
             # analogous to cali_6dforce above: a side-effect, not an FSM command.
             if on_calibrate_touch is not None:
                 on_calibrate_touch(box_id)
+        elif cmd_key == "episode_time":
+            # `episode_time:<seconds>` sets how long the NEXT episode runs,
+            # overriding dataset.episode_time_s for that one episode. The GUI's
+            # calibration wizard needs a board sweep to last as long as the
+            # operator was told to wave (30 s by default), while ordinary
+            # captures keep the config's length. Sending it as a command rather
+            # than respawning the recorder matters: a respawn re-opens eleven
+            # Argus cameras. Like preview_demand it is a side-effect, not an FSM
+            # command, so it must not enter the start/save/quit queue.
+            try:
+                seconds = float(box_id)
+            except ValueError:
+                logger.warning("ignoring episode_time with unparseable seconds: %r", line)
+                continue
+            if on_episode_time is not None:
+                on_episode_time(seconds)
         else:
             logger.warning("ignoring unrecognized stdin command: %r", line)
 
@@ -405,6 +424,18 @@ def _preview_demand_decision(
     if last_demand_mono <= 0.0:
         return False
     return (now_mono - last_demand_mono) <= ttl_s
+
+
+def _next_episode_length_s(pending_s: float, config_s: float) -> float:
+    """Seconds the next episode should run.
+
+    A per-episode override from the gateway (``episode_time:<seconds>``) wins
+    over ``dataset.episode_time_s``; 0 means "until the operator stops it". The
+    override is consumed by the episode that starts next, so it can never leak
+    into the one after it -- the calibration wizard asks for a 30 s board sweep
+    without changing what an ordinary capture is worth.
+    """
+    return pending_s if pending_s > 0 else config_s
 
 
 def _wait_for_command(
@@ -1442,12 +1473,27 @@ def main(argv: list[str] | None = None) -> int:
             daemon=True, name="thor-record-touch-cali",
         ).start()
 
+    # Length of the next episode when the gateway asked for a specific one
+    # (`episode_time:<seconds>`); 0 means "use dataset.episode_time_s". Consumed
+    # when the episode starts, so an override never leaks into the episode after
+    # it. Written from the stdin thread, read from the command loop -- a single
+    # float assignment, which CPython publishes atomically.
+    pending_episode_time_s = 0.0
+
+    def _note_episode_time(seconds: float) -> None:
+        nonlocal pending_episode_time_s
+        if seconds < 0:
+            logger.warning("ignoring negative episode_time: %s", seconds)
+            return
+        pending_episode_time_s = float(seconds)
+        logger.info("next episode length set to %.3gs by the gateway", seconds)
+
     stdin_thread = threading.Thread(
         target=_read_stdin_loop,
         args=(
             cmd_queue, stop_event, _note_preview_demand,
             _trigger_six_d_force_cali, _trigger_six_d_force_cali_origin,
-            _trigger_touch_cali,
+            _trigger_touch_cali, _note_episode_time,
         ),
         daemon=True, name="thor-record-stdin",
     )
@@ -1604,7 +1650,14 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 box.start_recording(t_start)
             box_snapshots: list[dict[str, Any]] = []
-            target_s = cfg.episode_time_s if cfg.episode_time_s > 0 else float("inf")
+            episode_time_s = _next_episode_length_s(pending_episode_time_s, cfg.episode_time_s)
+            pending_episode_time_s = 0.0
+            target_s = episode_time_s if episode_time_s > 0 else float("inf")
+            _emit(
+                f"Episode length {episode_time_s:g}s"
+                if episode_time_s > 0
+                else "Episode length unlimited"
+            )
             last_progress_at = 0.0
             box_sample_at = 0.0
             stop_episode = False
