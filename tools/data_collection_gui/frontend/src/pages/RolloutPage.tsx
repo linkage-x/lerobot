@@ -1,0 +1,465 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { api } from "../apiClient";
+import { CheckpointBrowser, successRate } from "../shared/CheckpointBrowser";
+import { Metric, PageHeader, StatusDot } from "../shared/ui";
+import type { Checkpoint, RolloutMode, RolloutOutcomeEntry, RolloutRun } from "../types";
+
+/**
+ * Running a trained checkpoint on the real FR3.
+ *
+ * Its own page rather than a panel on Training because it is the only screen in this GUI whose
+ * buttons move a robot, and because what it needs on screen at the moment it matters -- the
+ * frames the policy is being fed, the safety-clamp count, one Stop -- has nothing in common
+ * with what a training run needs.
+ *
+ * Three deliberate frictions, all of them about a failure that would otherwise be silent:
+ *   1. A checkpoint whose contract disagrees with the rig cannot be started without an override.
+ *   2. Any mode that moves the arm needs motion confirmed in the same interaction.
+ *   3. A finished rollout asks how it went, once, while the operator still remembers.
+ */
+
+const LIVE_STATES = new Set(["starting", "waiting", "rolling"]);
+
+function stateTone(state: RolloutRun["state"]): string {
+  if (state === "rolling") return "running";
+  if (state === "waiting" || state === "starting") return "armed";
+  if (state === "error") return "error";
+  if (state === "complete") return "complete";
+  return "idle";
+}
+
+export function RolloutPage() {
+  const [run, setRun] = useState<RolloutRun | null>(null);
+  const [modes, setModes] = useState<RolloutMode[]>([]);
+  const [trainingBusy, setTrainingBusy] = useState(false);
+  const [selected, setSelected] = useState<Checkpoint | null>(null);
+  const [modeId, setModeId] = useState("smoke");
+  const [confirmMotion, setConfirmMotion] = useState(false);
+  const [overrideContract, setOverrideContract] = useState(false);
+  const [moveToStart, setMoveToStart] = useState(true);
+  const [maxSteps, setMaxSteps] = useState("300");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [outcomeNote, setOutcomeNote] = useState("");
+  const [history, setHistory] = useState<RolloutOutcomeEntry[]>([]);
+  const [frameNonce, setFrameNonce] = useState(0);
+  const logRef = useRef<HTMLPreElement | null>(null);
+
+  const mode = useMemo(() => modes.find((item) => item.id === modeId), [modes, modeId]);
+  const isLive = run !== null && LIVE_STATES.has(run.state);
+  const blocking = useMemo(
+    () => (selected?.issues ?? []).filter((issue) => issue.level === "block"),
+    [selected]
+  );
+
+  const refreshHistory = useCallback(async () => {
+    setHistory(await api.fetchRolloutOutcomes());
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      const payload = await api.fetchRolloutStatus();
+      if (cancelled || !payload) return;
+      setRun(payload.rollout);
+      setModes(payload.modes);
+      setTrainingBusy(payload.trainingBusy);
+    };
+    void tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    void refreshHistory();
+  }, [refreshHistory]);
+
+  // The camera poll only runs while something is producing frames. Polling a finished rollout
+  // would just 503 in a loop, and the gateway refuses stale frames anyway.
+  useEffect(() => {
+    if (!isLive) return undefined;
+    const timer = window.setInterval(() => setFrameNonce((value) => value + 1), 200);
+    return () => window.clearInterval(timer);
+  }, [isLive]);
+
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [run?.lastLines?.length]);
+
+  // Motion confirmation is per-start, not sticky: it is a statement about this run, and
+  // carrying it over to the next one would defeat the point of asking.
+  useEffect(() => {
+    setConfirmMotion(false);
+  }, [modeId, selected?.id]);
+
+  useEffect(() => {
+    setOverrideContract(false);
+  }, [selected?.id]);
+
+  const wrap = async (label: string, action: () => Promise<{ ok: boolean; error?: string }>) => {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    const result = await action();
+    setBusy(false);
+    if (!result.ok) setError(result.error || `${label} failed.`);
+    return result;
+  };
+
+  const onStart = async () => {
+    if (!selected || !mode) return;
+    const result = await wrap("Start rollout", () =>
+      api.startRollout({
+        mode: mode.id,
+        checkpointId: selected.id,
+        confirmMotion,
+        overrideContract,
+        moveToStart,
+        maxSteps: mode.id === "real_once" ? Number(maxSteps) || 300 : 0
+      })
+    );
+    if (result.ok) {
+      setRun((result as { rollout?: RolloutRun }).rollout ?? null);
+      setNotice(`${mode.label} started.`);
+    }
+  };
+
+  const onControl = async (command: "start" | "stop" | "quit") => {
+    const result = await wrap(`Rollout ${command}`, () => api.controlRollout(command));
+    if (result.ok) setRun((result as { rollout?: RolloutRun }).rollout ?? null);
+  };
+
+  const onStop = async () => {
+    const result = await wrap("Stop rollout", () => api.stopRollout());
+    if (result.ok) setNotice("Stop sent.");
+  };
+
+  const onRecordOutcome = async (outcome: "success" | "failure" | "aborted") => {
+    const result = await wrap("Record outcome", () =>
+      api.recordRolloutOutcome({ outcome, note: outcomeNote })
+    );
+    if (result.ok) {
+      setOutcomeNote("");
+      setNotice(`Recorded ${outcome}.`);
+      await refreshHistory();
+    }
+  };
+
+  const startDisabled =
+    busy ||
+    isLive ||
+    trainingBusy ||
+    !selected ||
+    !mode ||
+    (mode.movesArm && !confirmMotion) ||
+    (blocking.length > 0 && !overrideContract);
+
+  return (
+    <div className="page">
+      <PageHeader
+        title="Real-robot rollout"
+        subtitle="Run a trained checkpoint on the FR3, and record how it went."
+      />
+
+      {error && <div className="banner banner-error">{error}</div>}
+      {notice && !error && <div className="banner banner-ok">{notice}</div>}
+      {trainingBusy && (
+        <div className="banner banner-warn">
+          A training run is using the GPU. Stop it on the Training page before rolling out — a
+          policy starved of inference time still sends commands, just later than the arm expects
+          them.
+        </div>
+      )}
+
+      {/* --------------------------------------------------------- live run --- */}
+      {run && run.state !== "idle" && (
+        <section className="card rollout-live">
+          <div className="card-head">
+            <h3>
+              <StatusDot state={stateTone(run.state)} /> {run.mode || "rollout"} ·{" "}
+              {run.checkpointId || "—"}
+            </h3>
+            {isLive && (
+              <div className="row-actions">
+                {run.interactive && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => void onControl("start")}
+                      disabled={busy || run.state === "rolling"}
+                    >
+                      Start rollout
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void onControl("stop")}
+                      disabled={busy || run.state !== "rolling"}
+                    >
+                      Stop rollout
+                    </button>
+                  </>
+                )}
+                <button type="button" className="danger" onClick={() => void onStop()} disabled={busy}>
+                  End session
+                </button>
+              </div>
+            )}
+          </div>
+
+          <p className="hint">{run.message}</p>
+
+          <div className="metric-row">
+            <Metric label="State" value={run.state} />
+            <Metric label="Step" value={run.maxSteps ? `${run.step} / ${run.maxSteps}` : run.step} />
+            <Metric label="Rollout" value={run.rolloutIndex || "—"} />
+            <Metric label="Command" value={run.commandStatus || "—"} />
+            <Metric label="Step-limited" value={run.clampedSteps} />
+            <Metric label="Leashed" value={run.leashedSteps} />
+            <Metric label="Tool frame" value={run.targetFrameName || "—"} />
+          </div>
+
+          {run.clampedSteps > 0 && (
+            <p className="hint">
+              {run.clampedSteps} step(s) asked for more motion in a single tick than the step
+              limit allows, measured against the policy's own previous command. A few is normal;
+              a steady stream means the policy is asking for motion the demonstrations never
+              contained.
+            </p>
+          )}
+
+          {run.leashedSteps > 0 && (
+            <p className="hint">
+              {run.leashedSteps} step(s) hit the leash: the command ran further ahead of the
+              measured pose than tracking lag explains. Unlike step-limiting, this points at the
+              arm rather than the policy — something is blocking it, or it has stopped following.
+            </p>
+          )}
+
+          {run.cameraKeys.length > 0 && (
+            <div className="rollout-cameras">
+              {run.cameraKeys.map((cameraKey) => (
+                <figure key={cameraKey}>
+                  <img
+                    src={api.rolloutCameraUrl(cameraKey, frameNonce)}
+                    alt={`policy input ${cameraKey}`}
+                    onError={(event) => {
+                      (event.target as HTMLImageElement).style.visibility = "hidden";
+                    }}
+                    onLoad={(event) => {
+                      (event.target as HTMLImageElement).style.visibility = "visible";
+                    }}
+                  />
+                  <figcaption>{cameraKey}</figcaption>
+                </figure>
+              ))}
+              <p className="hint wide">
+                These are the frames the policy is being fed — after cropping and resizing, not
+                the raw camera. If one is black or stale, the policy is seeing that too.
+              </p>
+            </div>
+          )}
+
+          {run.pendingOutcomeFor > 0 && (
+            <div className="subcard outcome-prompt">
+              <h4>How did rollout {run.pendingOutcomeFor} go?</h4>
+              <p className="hint">
+                Recorded against {run.checkpointId}. This is the only thing that lets two
+                checkpoints be compared honestly later.
+              </p>
+              <label className="field">
+                <span>Note (optional)</span>
+                <input
+                  value={outcomeNote}
+                  onChange={(event) => setOutcomeNote(event.target.value)}
+                  placeholder="grasped but released early"
+                />
+              </label>
+              <div className="row-actions">
+                <button type="button" onClick={() => void onRecordOutcome("success")} disabled={busy}>
+                  Success
+                </button>
+                <button type="button" onClick={() => void onRecordOutcome("failure")} disabled={busy}>
+                  Failure
+                </button>
+                <button type="button" onClick={() => void onRecordOutcome("aborted")} disabled={busy}>
+                  Aborted (not the policy&apos;s fault)
+                </button>
+              </div>
+            </div>
+          )}
+
+          {run.lastLines.length > 0 && (
+            <pre className="log-block" ref={logRef}>
+              {run.lastLines.join("\n")}
+            </pre>
+          )}
+          {run.logPath && <p className="hint">Full log: <code>{run.logPath}</code></p>}
+        </section>
+      )}
+
+      {/* ------------------------------------------------------ checkpoint --- */}
+      <section className="card">
+        <div className="card-head">
+          <h3>Checkpoint</h3>
+        </div>
+        <CheckpointBrowser
+          mode="picker"
+          selectedId={selected?.id ?? ""}
+          onSelect={setSelected}
+          disabled={isLive}
+        />
+      </section>
+
+      {/* ------------------------------------------------------------ mode --- */}
+      <section className="card">
+        <div className="card-head">
+          <h3>Mode</h3>
+        </div>
+
+        <div className="mujoco-mode-picker">
+          {modes.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              className={item.id === modeId ? "active" : ""}
+              onClick={() => setModeId(item.id)}
+              disabled={isLive}
+            >
+              {item.label}
+              {item.movesArm ? " ⚠" : ""}
+            </button>
+          ))}
+        </div>
+        {mode && <p className="hint">{mode.description}</p>}
+
+        {mode?.id === "real_once" && (
+          <label className="field">
+            <span>Step limit</span>
+            <input
+              value={maxSteps}
+              onChange={(event) => setMaxSteps(event.target.value)}
+              inputMode="numeric"
+              disabled={isLive}
+            />
+          </label>
+        )}
+
+        {mode?.movesArm && (
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={moveToStart}
+              onChange={(event) => setMoveToStart(event.target.checked)}
+              disabled={isLive}
+            />
+            <span>
+              Home the arm first (the dataset frame is anchored to the pose episodes started from
+              — skipping this places the whole trajectory somewhere else)
+            </span>
+          </label>
+        )}
+
+        {selected && blocking.length > 0 && (
+          <div className="banner banner-error">
+            <strong>This checkpoint does not match the rig.</strong>
+            <ul>
+              {blocking.map((issue) => (
+                <li key={issue.field}>{issue.message}</li>
+              ))}
+            </ul>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={overrideContract}
+                onChange={(event) => setOverrideContract(event.target.checked)}
+                disabled={isLive}
+              />
+              <span>I have read these and want to run it anyway</span>
+            </label>
+          </div>
+        )}
+
+        {mode?.movesArm && (
+          <label className="checkbox confirm-motion">
+            <input
+              type="checkbox"
+              checked={confirmMotion}
+              onChange={(event) => setConfirmMotion(event.target.checked)}
+              disabled={isLive}
+            />
+            <span>
+              The cell is clear and I am at the rig. <strong>{mode.label} moves the arm.</strong>
+            </span>
+          </label>
+        )}
+
+        {selected && (
+          <p className="hint">
+            Will run <code>{selected.id}</code> ({selected.policyType}) with tool frame{" "}
+            <code>{selected.contract.targetFrameName || "rig default"}</code> against dataset{" "}
+            <code>{selected.datasetRepoId || "—"}</code>. Track record so far:{" "}
+            {successRate(selected)}.
+          </p>
+        )}
+
+        <button type="button" onClick={() => void onStart()} disabled={startDisabled}>
+          {isLive ? "Rollout in progress" : `Start ${mode?.label ?? "rollout"}`}
+        </button>
+      </section>
+
+      {/* --------------------------------------------------------- history --- */}
+      <section className="card">
+        <div className="card-head">
+          <h3>Rollout history</h3>
+          <button type="button" onClick={() => void refreshHistory()}>
+            Refresh
+          </button>
+        </div>
+        {history.length === 0 ? (
+          <p className="hint">No rollouts recorded yet.</p>
+        ) : (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Checkpoint</th>
+                <th>Mode</th>
+                <th>Outcome</th>
+                <th>Steps</th>
+                <th>Note</th>
+              </tr>
+            </thead>
+            <tbody>
+              {history.slice(0, 40).map((entry, index) => (
+                <tr key={`${entry.recordedAt}-${index}`}>
+                  <td>{entry.recordedAt.replace("T", " ").replace("+00:00", "Z")}</td>
+                  <td>{entry.checkpointId}</td>
+                  <td>{entry.mode || "—"}</td>
+                  <td>
+                    <span
+                      className={`pill pill-${
+                        entry.outcome === "success"
+                          ? "ok"
+                          : entry.outcome === "failure"
+                            ? "error"
+                            : "warn"
+                      }`}
+                    >
+                      {entry.outcome}
+                    </span>
+                  </td>
+                  <td>{entry.steps || "—"}</td>
+                  <td>{entry.note || "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+    </div>
+  );
+}

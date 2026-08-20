@@ -16,8 +16,10 @@ common_args=(
   --robot-init-state ee_xyzquat=0.584972 -0.198668 0.280659 0.959580 0.006716 0.281263 -0.007254
   --first-frame-max-pos-delta-mm 20
   --first-frame-max-rot-delta-deg 8
-  --max-step-pos-delta-mm 3
+  --max-step-pos-delta-mm 5
   --max-step-rot-delta-deg 2
+  --max-leash-pos-delta-mm 20
+  --max-leash-rot-delta-deg 8
   --camera-preview-window
 )
 

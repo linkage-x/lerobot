@@ -850,3 +850,170 @@ export type TrainingStartRequest = {
   wandbProject: string;
   wandbEntity: string;
 };
+
+// ------------------------------------------------------- checkpoints & rollout ---
+
+/** One disagreement between a checkpoint and the rig it would drive. */
+export type ContractIssue = {
+  level: "ok" | "warn" | "block";
+  field: string;
+  message: string;
+};
+
+/** The dataset facts recovered from the view a checkpoint names. */
+export type CheckpointView = {
+  root?: string;
+  exists?: boolean;
+  fps?: number;
+  episodes?: number;
+  frames?: number;
+  cameras?: string[];
+  actionMode?: string;
+  stateKeys?: string[];
+  /** True when the view was found by name in this repo rather than at the path the
+   *  checkpoint records — what a fetch from a training machine with a different layout
+   *  produces. */
+  relocated?: boolean;
+};
+
+/** The rollout settings recorded in the checkpoint's generated inference config. */
+export type CheckpointContract = {
+  robotIp?: string;
+  targetFrameName?: string;
+  gripperBackend?: string;
+  gripperPort?: string;
+  cameraConfig?: string;
+  cameraKeys?: string[];
+  policy?: string;
+  safety?: {
+    firstFrameMaxPosDeltaMm?: number | null;
+    firstFrameMaxRotDeltaDeg?: number | null;
+    maxStepPosDeltaMm?: number | null;
+    maxLeashPosDeltaMm?: number | null;
+    maxLeashRotDeltaDeg?: number | null;
+    maxStepRotDeltaDeg?: number | null;
+  };
+};
+
+export type CheckpointOutcomes = {
+  success: number;
+  failure: number;
+  aborted: number;
+  total: number;
+};
+
+export type Checkpoint = {
+  id: string;
+  jobName: string;
+  stepLabel: string;
+  step: number;
+  isLast: boolean;
+  /** Set when this entry is a symlink; names the numbered step whose bytes it shares. */
+  aliasOf: string;
+  path: string;
+  pretrainedPath: string;
+  policyType: string;
+  chunkSize?: number | null;
+  nActionSteps?: number | null;
+  cameras: string[];
+  totalSteps: number;
+  datasetRepoId: string;
+  /** Where the view actually is on this machine. */
+  datasetRoot: string;
+  /** The absolute path baked into the checkpoint by the machine that trained it. */
+  recordedDatasetRoot: string;
+  sizeBytes: number;
+  modifiedAt: number;
+  view: CheckpointView;
+  contract: CheckpointContract;
+  inferenceConfigPath: string;
+  issues: ContractIssue[];
+  verdict: "ok" | "warn" | "block";
+  outcomes: CheckpointOutcomes | null;
+  hostId: string;
+  hostLabel: string;
+  wandbProject?: string;
+  wandbRunId?: string;
+};
+
+/** What the rig is configured as today, for comparison against a checkpoint. */
+export type RigContract = {
+  robotIp: string;
+  targetFrameName: string;
+  cameraKeys: string[];
+  cameraConfigPath: string;
+};
+
+export type CheckpointListing = {
+  ok: boolean;
+  error?: string;
+  detail?: string[];
+  host: TrainingHost;
+  rig: RigContract;
+  checkpoints: Checkpoint[];
+};
+
+export type RolloutMode = {
+  id: string;
+  label: string;
+  description: string;
+  movesArm: boolean;
+  interactive: boolean;
+};
+
+export type RolloutRun = {
+  state: "idle" | "starting" | "waiting" | "rolling" | "complete" | "error" | "stopped";
+  mode: string;
+  checkpointId: string;
+  checkpointPath: string;
+  policy: string;
+  datasetRoot: string;
+  targetFrameName: string;
+  robotIp: string;
+  cameraKeys: string[];
+  interactive: boolean;
+  movesArm: boolean;
+  step: number;
+  maxSteps: number;
+  commandStatus: string;
+  clampedSteps: number;
+  leashedSteps: number;
+  rolloutIndex: number;
+  lastRolloutStatus: string;
+  pid: number | null;
+  message: string;
+  startedAt: string;
+  finishedAt: string;
+  logPath: string;
+  previewDir: string;
+  lastLines: string[];
+  /** Non-zero when a finished rollout is waiting for the operator to grade it. */
+  pendingOutcomeFor: number;
+};
+
+export type RolloutStatusPayload = {
+  ok: boolean;
+  rollout: RolloutRun;
+  modes: RolloutMode[];
+  rig: RigContract;
+  trainingBusy: boolean;
+};
+
+export type RolloutOutcomeEntry = {
+  recordedAt: string;
+  checkpointId: string;
+  outcome: "success" | "failure" | "aborted";
+  mode: string;
+  steps: number;
+  note: string;
+  logPath: string;
+};
+
+export type RolloutStartRequest = {
+  mode: string;
+  checkpointId: string;
+  confirmMotion?: boolean;
+  overrideContract?: boolean;
+  maxSteps?: number;
+  moveToStart?: boolean;
+};

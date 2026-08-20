@@ -528,7 +528,7 @@
           <td><span class="badge p0">P0-5</span> <span class="badge warn">训练已跑通 / rollout 待人工</span></td>
           <td>ACT 基线训练并跑完 <code>smoke → preview → real_once</code></td>
           <td><code>run_pick_place_infer_workstation.sh</code></td>
-          <td>首帧对齐 ≤ 20 mm / 8 deg；每步 ≤ 3 mm / 2 deg；gripper 归一化正确；全程可追溯<br><span class="small">训练侧已跑通：ACT smoke forward loss 77.18（l1 0.406 / kld 7.68），20000 步基线经 Training 页启动并训完。<b>真机四段式（smoke → preview → real_debug → real_once）会驱动实际机械臂，需要人在 rig 前执行，未代跑。</b></span></td>
+          <td>首帧对齐 ≤ 20 mm / 8 deg；每步 ≤ 3 mm / 2 deg；gripper 归一化正确；全程可追溯<br><span class="small">训练侧已跑通（2026-08-19，经 Training 页 <code>POST /api/training/start</code> 启动）：ACT / batch 8 / AMP / chunk 30，<b>20000 步跑满，用时 24 分 53 秒（13.7 step/s）</b>，loss 67.1 → <b>0.110</b>（step 1 → 20000，15.5 epoch）；checkpoint 落在 <code>outputs/train/eeframe_20260813_act_baseline/checkpoints/</code>（5000/10000/15000/20000/last，共 2.4 GB）；smoke forward loss 77.18（l1 0.406 / kld 7.68）。这一版的生成推理配置写在 <code>&lt;view&gt;/runs/eeframe_20260813_act_baseline/</code>，checkpoint / 相机 / robot_ip / tool frame 四项均已核对。<br><b>真机四段式（smoke → preview → real_debug → real_once）会驱动实际机械臂，需要人在 rig 前执行，未代跑。</b></span></td>
         </tr>
 
         <tr class="sep"><td colspan="4">P1 — 让结果可信</td></tr>
@@ -689,6 +689,351 @@
       </p>
     </div>
 
+    <!-- ================= Checkpoint / Rollout 页 ================= -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>GUI 产物管理与 Rollout 页：ckpt 登记、契约校验、真机执行</h2>
+        <span class="badge done">2026-08-20 落地</span>
+      </div>
+
+      <p>
+        训练产物列表如果只列路径，基本没用。这条产线上真正危险的失败不是崩溃：
+        用 <code>pika_task_tcp</code> 训出来的 checkpoint 拿 <code>pika_gripper_ee</code> 去 rollout <em>不会报错</em>——
+        两个 frame 在同一份 URDF 上、相距 410.85 mm、朝向相同，机械臂会正常跑完、正常跟踪目标，只是处处偏 410.85 mm。
+        所以这个登记表的职责是：<b>在机械臂动之前，把契约不一致变成可见的</b>。
+      </p>
+
+      <table class="table">
+        <tr><th>能力</th><th>落点</th><th>合同</th></tr>
+        <tr>
+          <td>ckpt 登记 / 检索</td>
+          <td><code>tools/fr3/scan_checkpoints.py</code><br><code>GET /api/checkpoints?host=</code></td>
+          <td>只用标准库、远端同样喂 stdin 执行（和 probe 一致）。每个 checkpoint 的事实全部从训练器自己写下的文件里读回来：
+              <code>config.json</code> 给策略类型和相机 key，<code>train_config.json</code> 给数据集，
+              view 的 manifest 给 action 契约和 fps，<code>inference_config.generated.yaml</code> 给工具坐标系、机器人 IP 和安全包络。
+              <code>last</code> 是软链，单独标出它指向哪个步数——否则一次运行的占盘会把最新那个 checkpoint 数两遍。</td>
+        </tr>
+        <tr>
+          <td>契约校验</td>
+          <td><code>tools/data_collection_gui/checkpoints.py</code> · <code>check_contract()</code></td>
+          <td>按「错得有多安静」排序：工具坐标系不符 → <b>block</b>（会跑，且处处偏）；
+              action mode 不是 <code>delta_ee_from_prev_cmd</code> → <b>block</b>（runtime 无论如何都按 delta 积分）；
+              相机 key 不符 → <b>block</b>；view 不在本机 → <b>block</b>（runtime 要从数据集读 episode 起始位姿来定位整条轨迹）；
+              机器人 IP 不符 / 没有 generated config → <b>warn</b>。
+              block 可以被显式勾选覆盖，但覆盖<em>不改用本机的 frame</em>——仍然用 checkpoint 自己的，那才是它的 delta 的含义。</td>
+        </tr>
+        <tr>
+          <td>远端产物取回</td>
+          <td><code>POST /api/checkpoints/fetch</code></td>
+          <td>rollout 必须发生在机械臂和相机所在的机器上，训练不必。所以远端 checkpoint 只列不跑，
+              取回时只传<em>权重</em>（约 200 MB）和 view 的 <code>meta/</code> + <code>data/</code>——
+              optimizer state 是模型的三倍大且只对续训有用；<code>videos/</code> runtime 根本不打开，
+              而且在导出 view 里那是指回源数据集的软链，落到别的机器上也解析不了。
+              <br><span class="small">2026-08-20 实测（工作站 → 本机）：206 MB / 18 个文件 / 2.3 s；
+              远端的 <code>last</code> 落地为 <code>020000</code>（见下），videos 未传输。</span></td>
+        </tr>
+        <tr>
+          <td>真机 rollout</td>
+          <td><code>tools/data_collection_gui/rollout.py</code><br><code>POST /api/rollout/{start,control,stop}</code></td>
+          <td>命令层刻意很薄：<code>run_pick_place_infer_workstation.sh</code> 已经是这台设备的唯一描述，
+              在这里重建一份参数表就等于让「从终端跑」和「从页面跑」有两份可能漂移的定义，而漂移后的 rollout 是安静地错。
+              所以这里只设置该脚本已文档化的环境变量，外加浏览器路径需要的两个 flag。</td>
+        </tr>
+        <tr>
+          <td>rollout 结果登记</td>
+          <td><code>outputs/rollouts/rollout_log.jsonl</code><br><code>POST /api/rollout/outcome</code></td>
+          <td>每次 rollout 结束追问一次 success / failure / aborted 加一句备注。
+              <code>aborted</code> 不计入成功率分母——因为有人走进工作区而停下，说明不了策略的任何事。
+              日志<em>不放在 checkpoint 目录旁边</em>：checkpoint 会因为清盘被删掉，而它的战绩恰恰是那之后还需要的东西。</td>
+        </tr>
+      </table>
+
+      <div class="callout p0">
+        <b>三个只有真跑起来才会暴露的坑，已修：</b>
+        <ul>
+          <li>
+            <b>浏览器原本无法驱动交互式 rollout。</b><code>real</code> / <code>real_debug</code> 的 s/x/q 依赖
+            <code>sshkeyboard</code>（工作站未安装）或一个 <em>TTY</em> stdin，而 gateway 给的是管道，两者都收不到键。
+            现在 <code>InteractiveRolloutKeyboard</code> 在 stdin 是管道时走<em>一行一条命令</em>的通道——
+            和 recorder 已有的 <code>_write_recorder_stdin</code> 是同一种形状。
+            <br><span class="small">这条通道必须先于 sshkeyboard 判断：sshkeyboard 抢的是终端，
+            在管道进程上它会装一个永远收不到键的后端，而真正能用的通道被晾在一边。
+            <code>/dev/null</code>（<code>subprocess.DEVNULL</code>）不算通道——它立刻返回 EOF，会被当成「对端关闭」而直接退出。
+            管道<em>关闭即退出</em>是刻意的：操纵这次 rollout 的人已经不在了，让机械臂在无人控制下继续动才是要避免的那个结局。</span>
+          </li>
+          <li>
+            <b>相机预览原本只在设备那台机器的屏幕上。</b><code>--camera-preview-window</code> 走 cv2 窗口，需要本机 X display
+            （当前 gateway 没有）。新增 <code>--preview-jpeg-dir</code>：把<em>喂给策略的那一帧</em>（裁剪、缩放之后，不是原始相机）
+            写成 <code>/dev/shm</code> 下的 JPEG，gateway 转发给浏览器——和 recorder / Device Manager 用的是同一套机制。
+            编码在后台线程上做，<code>publish</code> 只做一次拷贝：实测控制回路每步付出 <b>5 µs</b>。
+            真机控制回路上花几毫秒做 JPEG 编码是会变成抖动的。
+          </li>
+          <li>
+            <b>gateway 自己的环境变量原本能盖掉 checkpoint 的契约。</b>启动命令曾经是
+            <code>os.environ.copy()</code> 之后再 <code>update(_tool_env(...))</code>，于是启动 gateway 的那个 shell 里
+            残留的一个 <code>FR3_TARGET_FRAME_NAME</code> 会静悄悄改掉之后每一次 rollout 的工具坐标系。
+            现在 rollout 设置<em>叠加在</em>继承环境之上，且永不被它覆盖；<code>FR3_INFER_MAX_STEPS</code> 在未指定时被显式清除——
+            继承来的步数上限看起来和「策略自己停下来了」一模一样。
+          </li>
+        </ul>
+      </div>
+
+      <p class="small">
+        取回远端 <code>last</code> 时落地为它指向的编号（<code>020000</code>）。远端那是软链、步数可从链读出；
+        拷贝过来就是一个普通目录，名字里没有步数，而记录步数的 <code>training_state/</code> 属于刻意不传输的部分——
+        落成编号既保住了步数，也让之后再取一次更新的 <code>last</code> 是<em>新增</em>一个 checkpoint 而不是覆盖另一个。
+        另外，checkpoint 里记的数据集是<em>训练那台机器上的绝对路径</em>：换一台仓库位置不同的设备就直接不存在了，
+        哪怕 view 刚刚随它一起取回、就躺在本仓库的 views 目录下同名位置。
+        所以 scan 会在原路径缺失时<em>按名字</em>回落到本仓库的 views 目录，并把这次改道标记出来（<code>relocated</code>）——
+        只按名字、只在本仓库内，绝不搜索：用错数据集会从别人的 episode 解出起始位姿，把整条轨迹放到那个位置去，而且照样会跑。
+      </p>
+    </div>
+
+    <!-- ================= 无头渲染 / deploy 守卫 ================= -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>工作站无头渲染：deploy 守卫查错了东西</h2>
+        <span class="badge done">2026-08-20 定位并修复</span>
+      </div>
+
+      <p>
+        <code>bash run/deploy.sh workstation</code> 曾以
+        <code>ERROR: no active workstation X display found for MuJoCo viewer</code> 直接失败。
+        这个报错指向的不是原因：<b>gateway 从不需要 X</b>——它三处启动 MuJoCo 都设
+        <code>MUJOCO_GL=egl</code>，sim teleop 还带 <code>--no-viewer</code>，画面是离屏渲染后推给 web UI 的。
+      </p>
+
+      <p>
+        真正的原因在 GPU 设备节点上：<code>/dev/dri/renderD128</code> 是
+        <code>root:render rw-rw----</code>，而本机 <code>render</code> / <code>video</code> 两个组<em>都是空的</em>——
+        GPU 访问权全靠 logind 给「当前占用控制台的那个用户」发的 ACL。
+        于是只要没人在机器前图形登录，通过 ssh 部署的账号就<em>完全没有</em> GPU 权限，
+        EGL 失败看起来像驱动问题，实际是组成员身份。
+        <br><span class="small">实测：<code>open(&quot;/dev/dri/renderD128&quot;)</code> → <code>PermissionError</code>；
+        <code>getfacl</code> 只列出 <code>user:gdm:rw-</code>；控制台当时属于另一个账号 <code>tele</code>（且 <code>Active=no</code>）。</span>
+      </p>
+
+      <table class="table">
+        <tr><th>动作</th><th>落点</th><th>结果</th></tr>
+        <tr>
+          <td>给部署账号 GPU 权限</td>
+          <td><code>sudo gpasswd -a hph render</code> / <code>video</code></td>
+          <td>此后<em>完全无需图形登录</em>：无 <code>DISPLAY</code> 下离屏渲染实测 640×480 <b>0.99 ms/帧（约 1000 fps）</b>。
+              组成员身份在<em>新会话</em>生效，所以改完要重连一次。</td>
+        </tr>
+        <tr>
+          <td>守卫改为查真实能力</td>
+          <td><code>tools/fr3/probe_render_backend.py</code><br><code>run/deploy.sh</code></td>
+          <td>探测的是 gateway 真正要用的那条路径（mujoco 自己的 <code>create_initialized_egl_device_display</code>），
+              并把缺失原因连同<em>修复命令</em>一起打出来。不再硬失败：
+              渲染没了也只影响 sim teleop 画面和 MuJoCo replay 视频，
+              录制 / 导出 / 训练 / checkpoint / rollout 全都照常——为一项降级而拒绝整个部署，代价更大。</td>
+        </tr>
+        <tr>
+          <td>把 X 的判断放回它该在的地方</td>
+          <td><code>_start_rollout()</code></td>
+          <td>真正需要 X 的只有 rollout 的 <code>real_debug</code>（在设备自己屏幕上开 MuJoCo 窗口）。
+              没有 <code>DISPLAY</code> 时<em>在启动前拒绝</em>该模式：否则操作员会归位机械臂、跑起 rollout，
+              然后一直等一个永远不会出现的窗口——而那个窗口正是这个模式与 <code>real</code> 的<em>全部</em>区别。</td>
+        </tr>
+      </table>
+
+      <p class="small">
+        <code>PYOPENGL_PLATFORM</code> 和 <code>MUJOCO_GL</code> 要一起设：前者是 PyOpenGL 在 <em>import 时</em>绑定的平台，
+        只设后者的话，一旦环境里恰好有 <code>DISPLAY</code>，PyOpenGL 会去选 GLX——那回答的是另一个问题，不是 gateway 会问的那个。
+      </p>
+    </div>
+
+    <!-- ================= Homing gate ================= -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>归位门限：把验收阈值设成了控制器自己的收敛阈值</h2>
+        <span class="badge done">2026-08-20 定位并修复</span>
+      </div>
+
+      <p>
+        GUI 上点 <code>preview</code>，在 RealSense 已经打开之后整个 rollout 挂掉：
+        <code>FR3 reached a different start pose: max_joint_error=0.0102 rad &gt; tolerance=0.0100 rad</code>。
+        差 <b>0.0002 rad</b>。这不是「臂没归好位」，这是<em>门限本身设错了位置</em>。
+      </p>
+
+      <p>
+        panda_py 的 <code>move_to_joint_position()</code> 默认
+        <code>success_threshold=0.01</code>、<code>dq_threshold=0.001</code>——
+        也就是说它「到位」的判据就是 0.01 rad，或者速度掉到 0.001 rad/s 就停。
+        <b>把验收阈值设成和运动生成器自己的终止阈值一样大，等于对同一个姿态掷硬币</b>：
+        0.0098 过，0.0102 挂，臂根本没动过。
+      </p>
+
+      <p>
+        为什么偏偏是 joint 7：它的阻抗刚度是 <code>50</code>，而 joint 1–4 是 <code>600</code>。
+        同样一点静摩擦力矩，把它顶得比别的关节远十二倍。
+        <br><span class="small">真机实测（只读，未移动）：
+        <code>err = +0.00186 +0.00599 -0.00106 -0.00651 -0.00419 +0.00476 <b>-0.01019</b></code>，
+        <code>tau_J[6]=+0.05 N·m</code>（几乎不受力，所以不是重力下垂），3 秒内 <code>drift=0.000000</code>——
+        是稳态残差，不是还没停稳。</span>
+      </p>
+
+      <p>
+        而这 0.0102 rad 落在<em>最无害的那一根</em>上。在 MuJoCo 里按 home keyframe 逐关节扰动实测
+        <code>pika_gripper_ee</code> 的位移：
+      </p>
+
+      <table class="table">
+        <tr><th>扰动</th><th>EE 位移最大的关节</th><th>joint 7（工具滚转轴）</th><th>下游 first-frame 门限</th></tr>
+        <tr>
+          <td><code>0.0102 rad</code>（本次失败值）</td>
+          <td>joint 4 → <b>5.31 mm</b></td>
+          <td><b>0.02 mm</b> / 0.584°</td>
+          <td rowspan="2">20 mm / 8°<br><span class="small">数据集自身起点散布：rot p95 0.63° / max 0.86°</span></td>
+        </tr>
+        <tr>
+          <td><code>0.03 rad</code>（新门限）</td>
+          <td>joint 4 → <b>15.63 mm</b></td>
+          <td>0.06 mm / 1.719°</td>
+        </tr>
+      </table>
+
+      <p>
+        <b>0.584° 的腕部滚转 = 0.02 mm 的 EE 位移</b>，比训练集自己的起点散布还小。
+        旧门限拒绝的是它本该保护的那批 episode 里就存在的姿态。
+      </p>
+
+      <p>
+        另一条不对称：录制端 <code>_move_to_configured_start()</code> 用同样的 0.01 rad，却<em>一直保持指令输出</em>
+        并轮询最多 20 s 等它收敛；rollout 归位则是发完就撒手、只读一次。
+        同一台臂、同一个目标，录制过得去、rollout 过不去——差别不在硬件。
+      </p>
+
+      <table class="table">
+        <tr><th>动作</th><th>落点</th><th>理由</th></tr>
+        <tr>
+          <td>门限 0.01 → <code>0.03 rad</code></td>
+          <td><code>DEFAULT_TOLERANCE_RAD</code></td>
+          <td>用下游真正管事的那个门限反推：0.03 rad 时最差关节 15.63 mm &lt; 20 mm，
+              所以这道门放过的姿态<em>不可能</em>绕过 EE 门限。同时是控制器自身收敛阈值的 3 倍，
+              又比真正的归位失败（错 keyframe、没归位、DAS 关节构型）小一到两个数量级。</td>
+        </tr>
+        <tr>
+          <td>超限重发一次轨迹</td>
+          <td><code>--attempts</code>（默认 2）</td>
+          <td>重新进控制环通常能把卡住的静摩擦顶开。<em>不做</em>「等待沉降」轮询：
+              <code>get_state()</code> 返回的是控制环最后一拍的快照，环随运动一起停，
+              再读只是重复读同一个冻结值——实测 30 次采样逐位相同。</td>
+        </tr>
+        <tr>
+          <td>逐关节打印，点名最差的那根</td>
+          <td><code>JOINT_ERRORS</code> / <code>ARRIVED</code> / <code>NOTE</code></td>
+          <td>只有一个 <code>max_joint_error</code> 时，无害的腕部残差和「臂停在工作空间另一半」长得一模一样，
+              而这两者要求相反的处理。本次排查的成本几乎全在这里。</td>
+        </tr>
+        <tr>
+          <td>现场可调</td>
+          <td><code>FR3_MOVE_TO_START_TOLERANCE_RAD</code></td>
+          <td>收紧门限不必改代码；解析失败或非正数一律回落到默认值，绝不把门关掉。</td>
+        </tr>
+      </table>
+
+      <p class="small">
+        起始位姿本身仍然重要——<code>T_B_Ws</code> 是拿第一帧观测对着数据集起点解出来的，
+        整条轨迹的落位由它决定。变的只是<em>由谁来判定「够近了」</em>：
+        关节空间那道门只负责回答「臂在不在 home keyframe 上」，
+        「离得够不够近」交给 runtime 的 <code>dataset_start_alignment</code> + first-frame 门限——
+        它量的是策略真正吃进去的那个帧里的 EE 位姿，而且是拿真实录制分布标定的。
+      </p>
+    </div>
+
+    <!-- ================= Step envelope ================= -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>安全包络：拿「每步位移」的预算去卡「伺服跟随滞后」</h2>
+        <span class="badge done">2026-08-20 定位并修复</span>
+      </div>
+
+      <p>
+        归位修好之后，<code>real_once</code> 跑完了 300 步，但 GUI 报
+        <code>299 步被 clamp</code>——<em>每一步都被 clamp</em>。
+        而同一条日志里的臂其实跟得很好：实际每步位移 1.25 mm，和示教的 1.43 mm 基本一致。
+      </p>
+
+      <p>
+        <code>clamp_command_relative_to_current()</code> 量的是<b>指令减实测位姿</b>，
+        但策略是 <code>delta_ee_from_prev_cmd</code>：它的 delta 是加在 <code>prev_cmd</code> 上的，不是加在实测位姿上。
+        两个参考系之间差的那一截，就是伺服跟随滞后——指令在前、阻抗控制器在后，
+        这段间距<em>正是驱动臂运动的那个力的来源</em>，臂只要在动就一定有。于是这道门实际在判
+        <code>滞后 + 策略位移 ≤ 3 mm</code>，而滞后本身中位数就有 4.18 mm，策略一毫米还没出就已经超了。
+      </p>
+
+      <table class="table">
+        <tr><th>量</th><th>示教数据实测</th><th>旧门限 3 mm 的判定</th></tr>
+        <tr>
+          <td>策略每步 delta（对 <code>prev_cmd</code>）</td>
+          <td>p50 1.59 mm，p95 2.93 mm，p99 3.57 mm</td>
+          <td>合适——99% 的帧本来就在 3 mm 以内</td>
+        </tr>
+        <tr>
+          <td><code>prev_cmd</code> 与实测位姿之差（滞后）</td>
+          <td>p50 5.71 mm，p95 10.65 mm，max 15.92 mm</td>
+          <td><b>示教数据自己有 61.1% 的帧会被 clamp</b></td>
+        </tr>
+      </table>
+
+      <p>
+        也就是说：这道门会拒掉它本来要复现的那批数据——和归位门限是同一类错误。
+        更直白的一个对照：这次 rollout 的滞后中位数 4.18 mm，比人类示教时的 5.71 mm <em>还小</em>，
+        臂跟得比示教时更紧，却被判了 299/299。
+      </p>
+
+      <p>
+        另外 <code>np.clip</code> 是<b>逐轴</b>裁的，会把指令方向掰歪：
+        策略要 (0.2, 2.5, -4.9) mm 的下探，裁完变成 (0.2, 2.5, -3.0) mm——
+        下探被压住、横向漂移原样放行。这一跑里被丢掉的位移有 <b>77% 是 z 分量</b>，
+        累计丢掉 564 mm 指令，而臂实际只走了 374 mm。
+      </p>
+
+      <table class="table">
+        <tr><th>动作</th><th>落点</th><th>理由</th></tr>
+        <tr>
+          <td>拆成两道门，各自量各自的参考系</td>
+          <td><code>limit_command_for_safety()</code></td>
+          <td><b>step</b> 对 <code>prev_cmd</code> 量策略意图，<b>leash</b> 对实测位姿量滞后。
+              前者管「策略要得太猛」，后者管「臂根本没跟上」——两种故障要求相反的处理，
+              合成一个数就等于两个都看不见。</td>
+        </tr>
+        <tr>
+          <td>step 3 mm → <code>5 mm</code>（向量模长）</td>
+          <td><code>_DEFAULT_MAX_STEP_POS_DELTA_MM</code></td>
+          <td>拿录制的 action 分布标定：5 mm 放过 99.90% 的示教帧。
+              旧的逐轴 3 mm 对角线上本来就允许到 5.196 mm，所以包络大小几乎没变，只是变成了各向同性。</td>
+        </tr>
+        <tr>
+          <td>新增 leash <code>20 mm / 8°</code></td>
+          <td><code>--max-leash-pos-delta-mm</code></td>
+          <td>按录制滞后标定（p95 10.65 mm、max 15.92 mm），放过 100% 的示教帧，
+              与 first-frame 门限同值。它只在臂真的卡住、被挡住、或不再跟随时才响。</td>
+        </tr>
+        <tr>
+          <td>逐轴 <code>np.clip</code> → 按模长缩放</td>
+          <td><code>_shorten_to_limit()</code></td>
+          <td>只缩短、不转向。逐轴裁会朝着「哪个轴在扛主要运动就掰哪个轴」的方向系统性偏，
+              正好和想要的相反。</td>
+        </tr>
+        <tr>
+          <td>两个计数器分开报</td>
+          <td>GUI <code>Step-limited</code> / <code>Leashed</code></td>
+          <td>日志同时加打 <code>step_mm</code> / <code>step_deg</code>，
+              把策略意图和滞后分开显示——只看合并后的那个数，正是这次误判的根子。</td>
+        </tr>
+      </table>
+
+      <p class="small">
+        用这一跑自己的日志回放验证：<code>delta_ee_from_prev_cmd</code> 下
+        <code>prev_cmd</code> 就是上一步实际发出的指令，所以策略 delta 可以从日志精确重建——
+        p50 2.64 mm、p95 3.05 mm、max 3.15 mm，<b>299 步里 0 步</b>超过 5 mm，leash 也 0 步。
+        旧规则把这 299 步全判成了越界。
+      </p>
+    </div>
+
     <!-- ================= Phase ================= -->
     <div class="card full">
       <div class="section-head">
@@ -697,7 +1042,7 @@
       </div>
 
       <div class="phase">
-        <div class="name">Phase 0<br><span class="small">数据就位</span></div>
+        <div class="name">Phase 0<br><span class="small">数据就位</span><br><span class="badge done">已完成</span></div>
         <div>
           <ul>
             <li>确认 <code>eeframe_fr3_spacemouse_20260813_160401</code> 的 QC 仍为 pass（<code>meta/processing.json</code> 已记录 8 pass / 0 warn / 0 fail）。</li>
@@ -709,7 +1054,7 @@
       </div>
 
       <div class="phase">
-        <div class="name">Phase 1<br><span class="small">修 P0 缺陷</span></div>
+        <div class="name">Phase 1<br><span class="small">修 P0 缺陷</span><br><span class="badge done">已完成</span></div>
         <div>
           <ul>
             <li>训练入口泛化（P0-2）。</li>
@@ -721,7 +1066,7 @@
       </div>
 
       <div class="phase">
-        <div class="name">Phase 2<br><span class="small">ACT 基线闭环</span></div>
+        <div class="name">Phase 2<br><span class="small">ACT 基线闭环</span><br><span class="badge warn">训练已成 / 真机待跑</span></div>
         <div>
           <ul>
             <li>训 ACT，离线评测先判（P1-1），再 <code>smoke</code> → <code>preview</code> → <code>real_debug</code> → <code>real_once</code>。</li>

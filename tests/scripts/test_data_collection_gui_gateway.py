@@ -3923,3 +3923,40 @@ def test_output_arriving_after_a_stop_does_not_undo_the_stop(tmp_path):
     assert state.training.state == "stopped"
     # Progress still tracked; only the state is pinned.
     assert state.training.step == 120
+
+
+def test_an_inherited_run_is_judged_by_what_its_log_says(tmp_path):
+    """No exit code is available for a run this gateway did not start, so ask the trainer.
+
+    lerobot_train prints a line of its own once it has run every step. Without reading it, a
+    run that completed perfectly is reported as a failure purely because the gateway happened
+    to be restarted somewhere in the middle of it -- which is the normal case, since a deploy
+    restarts the gateway and training takes half an hour.
+    """
+    finished = tmp_path / "finished.log"
+    finished.write_text(
+        "INFO ot_train.py:547 Checkpoint policy after step 20000\n"
+        "INFO ot_train.py:621 End of training\n",
+        encoding="utf-8",
+    )
+    assert gateway._training_log_reports_success(finished) is True
+
+    # A checkpoint alone is not evidence: --save-freq writes one every few thousand steps, so
+    # a run killed at step 15000 leaves one behind too.
+    killed = tmp_path / "killed.log"
+    killed.write_text("INFO ot_train.py:547 Checkpoint policy after step 15000\n", encoding="utf-8")
+    assert gateway._training_log_reports_success(killed) is False
+
+    assert gateway._training_log_reports_success(tmp_path / "never-written.log") is False
+
+
+def test_the_success_marker_is_found_even_in_a_very_long_log(tmp_path):
+    """Training logs are megabytes of progress bars; only the tail is read."""
+    log_path = tmp_path / "long.log"
+    log_path.write_text(
+        "Training: 50%| | 10000/20000 [10:00<10:00, 16.6step/s]\n" * 20000
+        + "INFO ot_train.py:621 End of training\n",
+        encoding="utf-8",
+    )
+
+    assert gateway._training_log_reports_success(log_path) is True

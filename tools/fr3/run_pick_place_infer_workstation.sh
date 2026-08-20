@@ -73,8 +73,15 @@ dataset_root="${FR3_INFER_DATASET_ROOT-}"
 # Safety envelope. Same numbers fr3_train_il_policy.py writes into the generated inference config.
 first_frame_max_pos_delta_mm="${FR3_FIRST_FRAME_MAX_POS_DELTA_MM-20}"
 first_frame_max_rot_delta_deg="${FR3_FIRST_FRAME_MAX_ROT_DELTA_DEG-8}"
-max_step_pos_delta_mm="${FR3_MAX_STEP_POS_DELTA_MM-3}"
+# 5 mm of policy step, measured against prev_cmd, admits 99.90% of the recorded demo frames.
+# This used to be 3 mm and was compared against the *measured* pose instead, which folded servo
+# tracking lag into the same budget and clamped every step of a healthy rollout.
+max_step_pos_delta_mm="${FR3_MAX_STEP_POS_DELTA_MM-5}"
 max_step_rot_delta_deg="${FR3_MAX_STEP_ROT_DELTA_DEG-2}"
+# The command-vs-measured leash. Sized from the recorded lag (p95 10.65 mm, max 15.92 mm), so it
+# only fires when the arm has genuinely stopped following.
+max_leash_pos_delta_mm="${FR3_MAX_LEASH_POS_DELTA_MM-20}"
+max_leash_rot_delta_deg="${FR3_MAX_LEASH_ROT_DELTA_DEG-8}"
 
 # Deliberately unset by default. The host script ships values tuned against the other rig's arm,
 # tool and task (n_action_steps=50, ensemble 0.01, EMA 0.35, its own controller gains); importing
@@ -131,6 +138,8 @@ common_args=(
   --first-frame-max-rot-delta-deg "${first_frame_max_rot_delta_deg}"
   --max-step-pos-delta-mm "${max_step_pos_delta_mm}"
   --max-step-rot-delta-deg "${max_step_rot_delta_deg}"
+  --max-leash-pos-delta-mm "${max_leash_pos_delta_mm}"
+  --max-leash-rot-delta-deg "${max_leash_rot_delta_deg}"
   # This rig homes with `home`, not with the DAS rig's joint configuration.
   --no-move-to-das-start
 )
@@ -178,7 +187,7 @@ announce() {
   echo "[INFO] cameras=${camera_config} (keys must match the checkpoint's observation.images.*)"
   echo "[INFO] tool_frame=${target_frame_name} urdf=${robot_urdf_path}"
   echo "[INFO] gripper=${gripper_backend}@${gripper_port} max_width=${gripper_max_width_mm}mm close_below=${gripper_close_below:-<disabled>} (normalized 0..1)"
-  echo "[INFO] safety: first_frame<${first_frame_max_pos_delta_mm}mm/${first_frame_max_rot_delta_deg}deg, per_step<${max_step_pos_delta_mm}mm/${max_step_rot_delta_deg}deg"
+  echo "[INFO] safety: first_frame<${first_frame_max_pos_delta_mm}mm/${first_frame_max_rot_delta_deg}deg, per_step<${max_step_pos_delta_mm}mm/${max_step_rot_delta_deg}deg (vs prev_cmd), leash<${max_leash_pos_delta_mm}mm/${max_leash_rot_delta_deg}deg (vs measured)"
 }
 
 case "$mode" in

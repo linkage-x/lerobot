@@ -29,6 +29,12 @@ import type {
   TeleopStatus,
   TeleopGains,
   TeleopGainValues,
+  Checkpoint,
+  CheckpointListing,
+  RolloutOutcomeEntry,
+  RolloutRun,
+  RolloutStartRequest,
+  RolloutStatusPayload,
   TrainingHost,
   TrainingMachine,
   TrainingRun,
@@ -850,6 +856,73 @@ export class DataCollectionGuiApi {
 
   async stopTraining() {
     return this.trainingPost<{ training?: TrainingRun }>("/api/training/stop", {});
+  }
+
+  // --------------------------------------------------- checkpoints & rollout ---
+  //
+  // Same reasoning as the training calls above: a checkpoint scan on a remote host runs
+  // over ssh, and a fetch is an rsync of a few hundred megabytes. Neither belongs on the
+  // snapshot poll.
+
+  async fetchCheckpoints(hostId: string): Promise<CheckpointListing | null> {
+    return this.trainingGet<CheckpointListing>("/api/checkpoints", { host: hostId });
+  }
+
+  async fetchCheckpoint(hostId: string, checkpointId: string): Promise<Checkpoint | null> {
+    const listing = await this.fetchCheckpoints(hostId);
+    return listing?.checkpoints.find((item) => item.id === checkpointId) ?? null;
+  }
+
+  async fetchCheckpointToLocal(hostId: string, checkpointId: string) {
+    return this.trainingPost<{ localPath?: string; transferredCount?: number; message?: string }>(
+      "/api/checkpoints/fetch",
+      { hostId, checkpointId }
+    );
+  }
+
+  async deleteCheckpoint(checkpointId: string) {
+    return this.trainingPost<{ freedBytes?: number; message?: string }>("/api/checkpoints/delete", {
+      checkpointId
+    });
+  }
+
+  async fetchRolloutStatus(): Promise<RolloutStatusPayload | null> {
+    return this.trainingGet<RolloutStatusPayload>("/api/rollout/status");
+  }
+
+  async fetchRolloutOutcomes(): Promise<RolloutOutcomeEntry[]> {
+    const payload = await this.trainingGet<{ entries: RolloutOutcomeEntry[] }>(
+      "/api/rollout/outcomes"
+    );
+    return payload?.entries ?? [];
+  }
+
+  async startRollout(request: RolloutStartRequest) {
+    return this.trainingPost<{ rollout?: RolloutRun }>("/api/rollout/start", request);
+  }
+
+  /** One control word to the running rollout's stdin: the runtime reads it as a keypress. */
+  async controlRollout(command: "start" | "stop" | "quit") {
+    return this.trainingPost<{ rollout?: RolloutRun }>("/api/rollout/control", { command });
+  }
+
+  async stopRollout() {
+    return this.trainingPost<{ rollout?: RolloutRun }>("/api/rollout/stop", {});
+  }
+
+  async recordRolloutOutcome(record: {
+    checkpointId?: string;
+    outcome: "success" | "failure" | "aborted";
+    mode?: string;
+    steps?: number;
+    note?: string;
+  }) {
+    return this.trainingPost<{ entry?: RolloutOutcomeEntry }>("/api/rollout/outcome", record);
+  }
+
+  /** Cache-busted so the browser re-requests each poll rather than serving the first frame. */
+  rolloutCameraUrl(cameraKey: string, nonce: number): string {
+    return `${this.apiBase}/api/rollout/camera.jpg?camera=${encodeURIComponent(cameraKey)}&t=${nonce}`;
   }
 
   async fetchRealSenseStatus(): Promise<RealSensePreviewStatus | null> {

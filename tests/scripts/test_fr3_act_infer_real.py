@@ -990,36 +990,188 @@ def test_should_reject_first_command_detects_large_first_step():
     assert np.allclose(rotation_delta, [0.0, 0.0, np.deg2rad(12.0)])
 
 
-def test_clamp_command_relative_to_current_limits_absolute_pose_step():
-    safe_command, position_delta, rotation_delta, clamped = fr3_act_infer_real_runtime.clamp_command_relative_to_current(
-        {
-            'ee.x': 0.11,
-            'ee.y': -0.02,
-            'ee.z': 0.21,
-            'ee.wx': 0.0,
-            'ee.wy': 0.0,
-            'ee.wz': float(np.deg2rad(6.0)),
-            'gripper.pos': 0.8,
-        },
-        {
-            'ee.x': 0.1,
-            'ee.y': 0.0,
-            'ee.z': 0.2,
-            'ee.wx': 0.0,
-            'ee.wy': 0.0,
-            'ee.wz': 0.0,
-            'gripper.pos': 0.4,
-        },
-        max_pos_delta_m=0.005,
-        max_rot_delta_rad=float(np.deg2rad(3.0)),
+# Measured on the rig and in the training set that this policy was trained on
+# (eeframe_fr3_spacemouse_20260813_160401__delta_ee_from_prev_cmd, 20 episodes / 10305 frames):
+#
+#   policy per-step delta   p50 1.59 mm   p95 2.93 mm   p99 3.57 mm
+#   prev_cmd vs measured    p50 5.71 mm   p95 10.65 mm  max 15.92 mm
+#
+# The second row is servo tracking lag, not policy motion. Judging it by the first row's budget is
+# what reported 299 of 299 steps as clamped on a rollout whose arm was in fact tracking *better*
+# than the human demonstrations did (median lag 4.18 mm against the demos' 5.71 mm).
+_DEMO_STEP_P95_M = 0.00293
+_DEMO_LAG_P95_M = 0.01065
+_SHIPPED_STEP_LIMIT_M = fr3_act_infer_real_runtime._DEFAULT_MAX_STEP_POS_DELTA_MM / 1000.0
+_SHIPPED_LEASH_LIMIT_M = fr3_act_infer_real_runtime._DEFAULT_MAX_LEASH_POS_DELTA_MM / 1000.0
+
+
+def _observation(*, ee_xyz, prev_cmd_xyz=None, ee_wz=0.0, prev_cmd_wz=0.0):
+    """An FR3 observation carrying both the measured pose and the driver's last sent command."""
+    observation = {
+        'ee.x': ee_xyz[0],
+        'ee.y': ee_xyz[1],
+        'ee.z': ee_xyz[2],
+        'ee.wx': 0.0,
+        'ee.wy': 0.0,
+        'ee.wz': ee_wz,
+        'gripper.pos': 0.4,
+    }
+    if prev_cmd_xyz is not None:
+        observation.update(
+            {
+                'prev_cmd.ee.x': prev_cmd_xyz[0],
+                'prev_cmd.ee.y': prev_cmd_xyz[1],
+                'prev_cmd.ee.z': prev_cmd_xyz[2],
+                'prev_cmd.ee.wx': 0.0,
+                'prev_cmd.ee.wy': 0.0,
+                'prev_cmd.ee.wz': prev_cmd_wz,
+            }
+        )
+    return observation
+
+
+def _command(xyz, *, wz=0.0, gripper=0.8):
+    return {
+        'ee.x': xyz[0],
+        'ee.y': xyz[1],
+        'ee.z': xyz[2],
+        'ee.wx': 0.0,
+        'ee.wy': 0.0,
+        'ee.wz': wz,
+        'gripper.pos': gripper,
+    }
+
+
+def _guard(command, observation, **overrides):
+    kwargs = {
+        'max_step_pos_delta_m': _SHIPPED_STEP_LIMIT_M,
+        'max_step_rot_delta_rad': float(np.deg2rad(fr3_act_infer_real_runtime._DEFAULT_MAX_STEP_ROT_DELTA_DEG)),
+        'max_leash_pos_delta_m': _SHIPPED_LEASH_LIMIT_M,
+        'max_leash_rot_delta_rad': float(np.deg2rad(fr3_act_infer_real_runtime._DEFAULT_MAX_LEASH_ROT_DELTA_DEG)),
+    }
+    kwargs.update(overrides)
+    return fr3_act_infer_real_runtime.limit_command_for_safety(command, observation, **kwargs)
+
+
+def test_tracking_lag_alone_does_not_limit_a_healthy_command():
+    """The 299/299 case: the arm trails its command, the policy asks for an ordinary step."""
+    observation = _observation(ee_xyz=(0.1, 0.0, 0.2), prev_cmd_xyz=(0.1, 0.0, 0.2 + 0.00418))
+    # A p50-sized policy step on top of a median rig lag.
+    command = _command((0.1, 0.0, 0.2 + 0.00418 + 0.0016))
+
+    safe_command, guard = _guard(command, observation)
+
+    assert guard['status'] == 'pass'
+    assert guard['step_limited'] is False
+    assert guard['leash_limited'] is False
+    # The command reaches the policy's target untouched.
+    assert np.isclose(safe_command['ee.z'], command['ee.z'])
+    # ...even though the gap from the measured pose is well past the step limit.
+    assert np.linalg.norm(guard['position_delta']) > _SHIPPED_STEP_LIMIT_M
+
+
+def test_the_demonstrated_lag_and_step_both_fit_inside_the_shipped_limits():
+    """The gate must admit the data it exists to reproduce.
+
+    p95 lag plus a p95 policy step is an ordinary frame of the training set. If the shipped limits
+    reject that, they reject the demonstrations, which is exactly the bug this pair replaced.
+    """
+    observation = _observation(ee_xyz=(0.1, 0.0, 0.2), prev_cmd_xyz=(0.1, 0.0, 0.2 + _DEMO_LAG_P95_M))
+    command = _command((0.1, 0.0, 0.2 + _DEMO_LAG_P95_M + _DEMO_STEP_P95_M))
+
+    _, guard = _guard(command, observation)
+
+    assert guard['status'] == 'pass'
+
+
+def test_the_step_guard_measures_the_policy_delta_against_prev_cmd():
+    observation = _observation(ee_xyz=(0.1, 0.0, 0.2), prev_cmd_xyz=(0.1, 0.0, 0.21))
+    command = _command((0.1, 0.0, 0.212))
+
+    _, guard = _guard(command, observation)
+
+    # 2 mm from prev_cmd, not 12 mm from the measured pose.
+    assert np.allclose(guard['step_position_delta'], [0.0, 0.0, 0.002])
+    assert np.allclose(guard['position_delta'], [0.0, 0.0, 0.012])
+    assert guard['has_prev_cmd_reference'] is True
+
+
+def test_an_over_long_step_is_shortened_without_being_turned():
+    """Per-axis clipping bent a descent sideways; scaling must not."""
+    prev_cmd = np.array([0.1, 0.0, 0.2])
+    ask = np.array([0.001, 0.0025, -0.02])  # dominated by z, like a reach downward
+    observation = _observation(ee_xyz=tuple(prev_cmd), prev_cmd_xyz=tuple(prev_cmd))
+    command = _command(tuple(prev_cmd + ask))
+
+    safe_command, guard = _guard(command, observation)
+
+    assert guard['status'] == 'step_limited'
+    sent = np.array([safe_command['ee.x'], safe_command['ee.y'], safe_command['ee.z']]) - prev_cmd
+    assert np.isclose(np.linalg.norm(sent), _SHIPPED_STEP_LIMIT_M)
+    # Same heading, shorter: the cosine between ask and sent is 1.
+    assert np.isclose(sent @ ask / (np.linalg.norm(sent) * np.linalg.norm(ask)), 1.0)
+    # Per-axis np.clip would have left x and y untouched and only cut z.
+    assert not np.isclose(sent[1], ask[1])
+
+
+def test_a_command_running_away_from_a_stuck_arm_hits_the_leash():
+    """The failure the command-vs-measured direction actually exists to catch."""
+    # The arm has not moved; the command has been marching away from it.
+    observation = _observation(ee_xyz=(0.1, 0.0, 0.2), prev_cmd_xyz=(0.1, 0.0, 0.24))
+    command = _command((0.1, 0.0, 0.242))
+
+    safe_command, guard = _guard(command, observation)
+
+    assert guard['status'] == 'leash_limited'
+    assert guard['leash_limited'] is True
+    assert np.isclose(safe_command['ee.z'] - 0.2, _SHIPPED_LEASH_LIMIT_M)
+
+
+def test_the_leash_is_reported_over_a_step_limit_when_both_fire():
+    observation = _observation(ee_xyz=(0.1, 0.0, 0.2), prev_cmd_xyz=(0.1, 0.0, 0.24))
+    command = _command((0.1, 0.0, 0.26))
+
+    _, guard = _guard(command, observation)
+
+    assert guard['step_limited'] is True
+    assert guard['leash_limited'] is True
+    # The louder of the two wins the status: it is the one that says stop.
+    assert guard['status'] == 'leash_limited'
+
+
+def test_a_missing_prev_cmd_falls_back_to_the_measured_pose():
+    """A robot that reports no prev_cmd must still be guarded, not silently ungated."""
+    observation = _observation(ee_xyz=(0.1, 0.0, 0.2))
+    command = _command((0.1, 0.0, 0.22))
+
+    safe_command, guard = _guard(command, observation)
+
+    assert guard['has_prev_cmd_reference'] is False
+    assert guard['status'] == 'step_limited'
+    assert np.isclose(safe_command['ee.z'] - 0.2, _SHIPPED_STEP_LIMIT_M)
+
+
+def test_rotation_is_scaled_as_a_vector_rather_than_clipped_per_axis():
+    observation = _observation(ee_xyz=(0.1, 0.0, 0.2), prev_cmd_xyz=(0.1, 0.0, 0.2))
+    command = _command((0.1, 0.0, 0.2), wz=float(np.deg2rad(9.0)))
+
+    safe_command, guard = _guard(command, observation)
+
+    assert guard['status'] == 'step_limited'
+    assert np.isclose(
+        safe_command['ee.wz'],
+        np.deg2rad(fr3_act_infer_real_runtime._DEFAULT_MAX_STEP_ROT_DELTA_DEG),
     )
 
-    assert clamped is True
-    assert np.allclose(position_delta, [0.01, -0.02, 0.01])
-    assert np.allclose(rotation_delta, [0.0, 0.0, np.deg2rad(6.0)])
-    assert np.allclose([safe_command['ee.x'], safe_command['ee.y'], safe_command['ee.z']], [0.105, -0.005, 0.205])
-    assert np.isclose(safe_command['ee.wz'], np.deg2rad(3.0))
-    assert safe_command['gripper.pos'] == 0.8
+
+def test_the_step_limit_stays_below_the_leash():
+    """They bound different quantities, and the ordering is what keeps them distinguishable.
+
+    A leash at or under the step limit would fire first on every ordinary step and collapse the
+    pair back into the single mixed-reference check this replaced.
+    """
+    assert _SHIPPED_LEASH_LIMIT_M > 2 * _SHIPPED_STEP_LIMIT_M
+    assert _SHIPPED_LEASH_LIMIT_M >= _DEMO_LAG_P95_M
 
 
 def test_decode_action_to_robot_command_converts_quat_and_gripper():

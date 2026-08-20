@@ -32,8 +32,15 @@ controller_damping="${FR3_CONTROLLER_DAMPING-50,50,50,50,20,15,10}"
 controller_filter_coeff="${FR3_CONTROLLER_FILTER_COEFF-}"
 first_frame_max_pos_delta_mm="${FR3_FIRST_FRAME_MAX_POS_DELTA_MM-20}"
 first_frame_max_rot_delta_deg="${FR3_FIRST_FRAME_MAX_ROT_DELTA_DEG-8}"
-max_step_pos_delta_mm="${FR3_MAX_STEP_POS_DELTA_MM-3}"
+# 5 mm of policy step, measured against prev_cmd, admits 99.90% of the recorded demo frames.
+# This used to be 3 mm and was compared against the *measured* pose instead, which folded servo
+# tracking lag into the same budget and clamped every step of a healthy rollout.
+max_step_pos_delta_mm="${FR3_MAX_STEP_POS_DELTA_MM-5}"
 max_step_rot_delta_deg="${FR3_MAX_STEP_ROT_DELTA_DEG-2}"
+# The command-vs-measured leash. Sized from the recorded lag (p95 10.65 mm, max 15.92 mm), so it
+# only fires when the arm has genuinely stopped following.
+max_leash_pos_delta_mm="${FR3_MAX_LEASH_POS_DELTA_MM-20}"
+max_leash_rot_delta_deg="${FR3_MAX_LEASH_ROT_DELTA_DEG-8}"
 checkpoint="${FR3_INFER_CHECKPOINT-outputs/train/pick_place_act_cam2_cam3_pika_right_imgonly/checkpoints/060000}"
 dataset_root="${FR3_INFER_DATASET_ROOT-}"
 camera_config="${FR3_INFER_CAMERA_CONFIG-tools/fr3/fr3_il_infer_hikrobot_camera_config.yaml}"
@@ -105,6 +112,8 @@ common_args=(
   --first-frame-max-rot-delta-deg "${first_frame_max_rot_delta_deg}"
   --max-step-pos-delta-mm "${max_step_pos_delta_mm}"
   --max-step-rot-delta-deg "${max_step_rot_delta_deg}"
+  --max-leash-pos-delta-mm "${max_leash_pos_delta_mm}"
+  --max-leash-rot-delta-deg "${max_leash_rot_delta_deg}"
 )
 
 if [[ "${gripper_backend}" == "corenetic" ]]; then
@@ -210,7 +219,7 @@ case "$mode" in
     echo "[INFO] act_temporal_action_offset=${act_temporal_action_offset:-0}; 0 sends immediate action, larger values send farther into the ensembled chunk."
     echo "[INFO] command_ema_alpha=${command_ema_alpha:-disabled}; use with action queue to smooth commands without ACT target sticking."
     echo "[INFO] controller_gains=stiffness:${controller_stiffness:-default} damping:${controller_damping:-default} filter:${controller_filter_coeff:-default}."
-    echo "[INFO] safety: first_frame<${first_frame_max_pos_delta_mm}mm/${first_frame_max_rot_delta_deg}deg, per_step<${max_step_pos_delta_mm}mm/${max_step_rot_delta_deg}deg."
+    echo "[INFO] safety: first_frame<${first_frame_max_pos_delta_mm}mm/${first_frame_max_rot_delta_deg}deg, per_step<${max_step_pos_delta_mm}mm/${max_step_rot_delta_deg}deg (vs prev_cmd), leash<${max_leash_pos_delta_mm}mm/${max_leash_rot_delta_deg}deg (vs measured)."
     echo "[INFO] camera_preview_window=enabled; click/focus the terminal before pressing rollout keys."
     exec "${FR3_HOST_PYTHON}" "${common_args[@]}" "${init_state_args[@]}" \
       --interactive-rollouts \
@@ -234,7 +243,7 @@ case "$mode" in
     echo "[INFO] act_temporal_action_offset=${act_temporal_action_offset:-0}; 0 sends immediate action, larger values send farther into the ensembled chunk."
     echo "[INFO] command_ema_alpha=${command_ema_alpha:-disabled}; use with action queue to smooth commands without ACT target sticking."
     echo "[INFO] controller_gains=stiffness:${controller_stiffness:-default} damping:${controller_damping:-default} filter:${controller_filter_coeff:-default}."
-    echo "[INFO] safety: first_frame<${first_frame_max_pos_delta_mm}mm/${first_frame_max_rot_delta_deg}deg, per_step<${max_step_pos_delta_mm}mm/${max_step_rot_delta_deg}deg."
+    echo "[INFO] safety: first_frame<${first_frame_max_pos_delta_mm}mm/${first_frame_max_rot_delta_deg}deg, per_step<${max_step_pos_delta_mm}mm/${max_step_rot_delta_deg}deg (vs prev_cmd), leash<${max_leash_pos_delta_mm}mm/${max_leash_rot_delta_deg}deg (vs measured)."
     exec "${FR3_HOST_PYTHON}" "${common_args[@]}" "${init_state_args[@]}" \
       --interactive-rollouts \
       --rollout-start-key s \

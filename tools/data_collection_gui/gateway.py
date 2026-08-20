@@ -31,6 +31,8 @@ from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
+from tools.data_collection_gui import checkpoints as checkpoint_backend
+from tools.data_collection_gui import rollout as rollout_backend
 from tools.data_collection_gui import training as training_backend
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
@@ -320,6 +322,11 @@ class GatewayState:
     # polled for liveness and asked for an exit code.
     training_process: subprocess.Popen[bytes] | None = None
     training_persisted_s: float = 0.0
+    rollout: rollout_backend.RolloutStatus = field(default_factory=rollout_backend.RolloutStatus)
+    # Unlike training, this one keeps its stdin: it is the operator's start/stop channel, and
+    # holding it is what lets the gateway steer a rollout. It also means a dead gateway ends
+    # the rollout, which for a moving arm is the outcome to want.
+    rollout_process: subprocess.Popen[bytes] | None = None
     export_process: subprocess.Popen[str] | None = None
     events: list[EventLogItem] = field(default_factory=list)
     selected_replay_root: Path | None = None
@@ -4609,6 +4616,395 @@ def _stop_training_run(state: GatewayState) -> dict[str, Any]:
     state.log("warn", f"Stopped training run {state.training.jobName}")
     _persist_training_status(state)
     return {"ok": True, "training": asdict(state.training)}
+
+
+# ------------------------------------------------------- checkpoints & rollout ---
+
+
+def _rig_contract(state: GatewayState) -> checkpoint_backend.RigContract:
+    """What this rig is right now, as the thing a checkpoint has to agree with.
+
+    Read from the gateway's own config and the inference camera file rather than from the
+    rollout launcher, so the comparison is against the hardware as configured and not against
+    a second copy of the same numbers.
+    """
+    try:
+        robot_ip = _real_robot_ip(state)
+    except ValueError:
+        robot_ip = ""
+    import yaml  # local, matching how the rest of this module pulls it in
+
+    camera_config_rel = "tools/fr3/fr3_il_infer_realsense_camera_config.yaml"
+    camera_keys: list[str] = []
+    camera_path = state.repo_root / camera_config_rel
+    if camera_path.is_file():
+        try:
+            loaded = yaml.safe_load(camera_path.read_text(encoding="utf-8")) or {}
+            cameras = ((loaded.get("robot") or {}).get("cameras") or {})
+            camera_keys = sorted(str(key) for key in cameras)
+        except (OSError, yaml.YAMLError):
+            camera_keys = []
+    return checkpoint_backend.RigContract(
+        robotIp=robot_ip,
+        targetFrameName=_fr3_target_frame_name(state),
+        cameraKeys=camera_keys,
+        cameraConfigPath=camera_config_rel,
+    )
+
+
+def _checkpoint_entries(state: GatewayState, host_id: str) -> dict[str, Any]:
+    """Every checkpoint on one host, each already judged against this rig.
+
+    The judgement travels with the listing rather than being computed when a rollout starts,
+    because the point of showing it is to stop an operator from picking a checkpoint that
+    cannot be rolled out -- which is information they need while choosing, not after.
+    """
+    host = training_backend.resolve_host(state.repo_root, host_id)
+    report = checkpoint_backend.scan_host(state.repo_root, host)
+    rig = _rig_contract(state)
+    outcomes = checkpoint_backend.outcome_summary(
+        checkpoint_backend.load_rollout_outcomes(state.repo_root)
+    )
+    entries: list[dict[str, Any]] = []
+    for raw in report.get("checkpoints") or []:
+        entry = dict(raw)
+        entry["hostId"] = host.id
+        entry["hostLabel"] = host.label
+        entry["contract"] = checkpoint_backend.parse_inference_contract(
+            str(entry.pop("inferenceConfigText", "") or "")
+        )
+        issues = checkpoint_backend.check_contract(entry, rig=rig, local=host.kind == "local")
+        entry["issues"] = [asdict(issue) for issue in issues]
+        entry["verdict"] = checkpoint_backend.verdict_for(issues)
+        entry["outcomes"] = outcomes.get(str(entry.get("id") or ""), None)
+        entries.append(entry)
+    return {
+        "ok": bool(report.get("ok")),
+        "error": report.get("error", ""),
+        "detail": report.get("detail", []),
+        "host": asdict(host),
+        "rig": asdict(rig),
+        "checkpoints": entries,
+    }
+
+
+def _rollout_is_running(state: GatewayState) -> bool:
+    process = state.rollout_process
+    return process is not None and process.poll() is None
+
+
+def _apply_rollout_output(state: GatewayState, line: str) -> None:
+    status = state.rollout
+    parsed = rollout_backend.parse_rollout_line(line)
+    for key, value in parsed.items():
+        if key == "state":
+            # A stop the operator already asked for is not undone by a line the runtime wrote
+            # before it noticed. Same reasoning as the training follower.
+            if status.state in ("stopped", "error"):
+                continue
+            status.state = str(value)
+        else:
+            setattr(status, key, value)
+    if parsed.get("commandStatus") == "step_limited":
+        status.clampedSteps += 1
+    elif parsed.get("commandStatus") == "leash_limited":
+        status.leashedSteps += 1
+    if not rollout_backend.is_noise(line):
+        status.lastLines = (status.lastLines + [line])[-80:]
+
+
+def _follow_rollout_run(state: GatewayState, log_path: Path, process: subprocess.Popen[bytes]) -> None:
+    """Read the rollout's log file and record how the session ended.
+
+    Same file-tailing shape as the training follower and for the same reason -- the gateway
+    must not hold the process's stdout pipe. Rollout differs only in holding *stdin*, which is
+    the control channel and is supposed to die with the gateway.
+    """
+    pid = process.pid
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+            while True:
+                line = handle.readline()
+                if line:
+                    for part in line.replace("\r", "\n").splitlines():
+                        output = part.rstrip()
+                        if not output:
+                            continue
+                        with state.lock:
+                            if state.rollout.pid != pid:
+                                return
+                            _apply_rollout_output(state, output)
+                    continue
+                if process.poll() is not None:
+                    remaining = handle.read()
+                    for part in remaining.replace("\r", "\n").splitlines():
+                        output = part.rstrip()
+                        if not output:
+                            continue
+                        with state.lock:
+                            if state.rollout.pid != pid:
+                                return
+                            _apply_rollout_output(state, output)
+                    break
+                time.sleep(0.4)
+    except OSError as exc:
+        with state.lock:
+            if state.rollout.pid == pid:
+                state.rollout.message = f"Could not follow rollout log: {exc}"
+
+    return_code = process.wait()
+    with state.lock:
+        if state.rollout.pid != pid:
+            return
+        state.rollout.finishedAt = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if state.rollout.state == "stopped":
+            pass
+        elif return_code == 0:
+            state.rollout.state = "complete"
+            state.rollout.message = f"Rollout session finished ({state.rollout.mode})."
+        else:
+            state.rollout.state = "error"
+            state.rollout.message = (
+                f"Rollout exited with code {return_code}; see {state.rollout.logPath}."
+            )
+        state.log(
+            "info" if state.rollout.state == "complete" else "error",
+            f"Rollout {state.rollout.mode} on {state.rollout.checkpointId} "
+            f"finished with code {return_code}",
+        )
+
+
+def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    if state.profile != "workstation":
+        raise ValueError("Rollouts run on the workstation profile, which is where the FR3 is.")
+    if _rollout_is_running(state):
+        raise ValueError("A rollout is already running; stop it before starting another.")
+    if _training_is_running(state) and str(payload.get("mode") or "") != "env":
+        # Both want the GPU, and the rollout is the one with a deadline: a policy starved of
+        # inference time still sends commands, just later than the arm expects them.
+        raise ValueError(
+            "A training run is using the GPU. Stop it before rolling out, or the policy will "
+            "miss its control deadlines."
+        )
+
+    mode_id = str(payload.get("mode") or "").strip()
+    mode = rollout_backend.MODES_BY_ID.get(mode_id)
+    if mode is None:
+        raise ValueError(f"Unknown rollout mode {mode_id!r}.")
+    if mode.movesArm and not bool(payload.get("confirmMotion")):
+        raise ValueError(
+            f"{mode.label} moves the arm. Confirm motion before starting it."
+        )
+    if mode.id == "real_debug" and not os.environ.get("DISPLAY"):
+        # Refused rather than started: the viewer is the entire difference between this mode
+        # and `real`, and without a display the operator would home the arm and run rollouts
+        # waiting for a window that is never going to open.
+        raise ValueError(
+            "real_debug opens a MuJoCo viewer on the rig's own screen, and this gateway has no "
+            "X display. Log in graphically on the workstation and redeploy, or use "
+            "'Interactive rollouts' — it is the same rollout without the viewer."
+        )
+
+    checkpoint_id = str(payload.get("checkpointId") or "")
+    checkpoint_backend.validate_checkpoint_id(checkpoint_id)
+    listing = _checkpoint_entries(state, training_backend.LOCAL_HOST_ID)
+    selected = next(
+        (item for item in listing["checkpoints"] if item.get("id") == checkpoint_id), None
+    )
+    if selected is None:
+        raise ValueError(
+            f"No checkpoint {checkpoint_id} on this machine. Fetch it from its training host first."
+        )
+    blocking = [issue for issue in selected["issues"] if issue["level"] == "block"]
+    if blocking and not bool(payload.get("overrideContract")):
+        raise ValueError(
+            "This checkpoint does not match the rig: "
+            + " ".join(issue["message"] for issue in blocking)
+        )
+
+    contract = selected.get("contract") or {}
+    rig = listing["rig"]
+    # The checkpoint's own recorded frame wins over the rig default. It is the frame its dataset
+    # was anchored to, and that is what the action deltas mean.
+    target_frame = str(contract.get("targetFrameName") or rig.get("targetFrameName") or "")
+    camera_config = str(contract.get("cameraConfig") or rig.get("cameraConfigPath") or "")
+
+    command, env = rollout_backend.build_rollout_command(
+        state.repo_root,
+        mode=mode.id,
+        checkpoint_path=str(selected.get("path") or ""),
+        dataset_root=str((selected.get("view") or {}).get("root") or ""),
+        target_frame_name=target_frame,
+        robot_ip=str(rig.get("robotIp") or ""),
+        camera_config=camera_config,
+        max_steps=int(payload.get("maxSteps") or 0),
+        move_to_start=bool(payload.get("moveToStart", True)),
+        base_env=_tool_env(state.repo_root),
+    )
+
+    log_dir = state.repo_root / "outputs" / "logs" / "rollout"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"rollout_{checkpoint_id.replace('/', '_')}_{mode.id}_{stamp}.log"
+
+    try:
+        rollout_backend.PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        state.log("warn", f"Could not create rollout preview directory: {exc}")
+
+    # stdout to the file, stdin held as a pipe. The asymmetry is the design: the gateway must
+    # not own the run's output (that is what killed training runs on every deploy), but it must
+    # own its input, because that is the only way to stop a moving arm from a browser.
+    with log_path.open("ab") as log_file:
+        process = subprocess.Popen(
+            command,
+            cwd=state.repo_root,
+            stdin=subprocess.PIPE,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+    state.rollout_process = process
+    state.rollout = rollout_backend.RolloutStatus(
+        state="starting",
+        mode=mode.id,
+        checkpointId=checkpoint_id,
+        checkpointPath=str(selected.get("path") or ""),
+        policy=str(selected.get("policyType") or ""),
+        datasetRoot=str((selected.get("view") or {}).get("root") or ""),
+        targetFrameName=target_frame,
+        robotIp=str(rig.get("robotIp") or ""),
+        cameraKeys=list(selected.get("cameras") or []),
+        interactive=mode.interactive,
+        movesArm=mode.movesArm,
+        maxSteps=int(payload.get("maxSteps") or 0),
+        pid=process.pid,
+        message=f"Starting {mode.label} on {checkpoint_id}…",
+        startedAt=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        logPath=str(log_path),
+        previewDir=str(rollout_backend.PREVIEW_DIR),
+    )
+    state.log(
+        "warn" if mode.movesArm else "info",
+        f"Started rollout {mode.id} on {checkpoint_id} "
+        f"(tool_frame={target_frame}, pid={process.pid})",
+    )
+    Thread(
+        target=_follow_rollout_run,
+        args=(state, log_path, process),
+        daemon=True,
+        name=f"rollout-output-{process.pid}",
+    ).start()
+    return {"ok": True, "rollout": asdict(state.rollout)}
+
+
+def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
+    """Write one control word to the rollout's stdin.
+
+    The runtime reads this pipe one line at a time (InteractiveRolloutKeyboard's pipe backend),
+    so a word here is exactly a keypress there.
+    """
+    allowed = {"start", "stop", "quit"}
+    if command not in allowed:
+        raise ValueError(f"Rollout control must be one of {', '.join(sorted(allowed))}.")
+    process = state.rollout_process
+    if process is None or process.poll() is not None or process.stdin is None:
+        raise ValueError("No rollout is running.")
+    if not state.rollout.interactive:
+        raise ValueError(
+            f"{state.rollout.mode} is not an interactive mode; it runs to completion on its own."
+        )
+    try:
+        process.stdin.write(f"{command}\n".encode())
+        process.stdin.flush()
+    except (BrokenPipeError, OSError) as exc:
+        raise ValueError(f"Rollout is no longer accepting control commands: {exc}") from exc
+    if command == "start":
+        state.rollout.message = "Start sent."
+    elif command == "stop":
+        state.rollout.message = "Stop sent; ending the current rollout."
+    else:
+        state.rollout.state = "stopped"
+        state.rollout.message = "Quit sent; ending the rollout session."
+    state.log("info", f"Rollout control: {command}")
+    return {"ok": True, "rollout": asdict(state.rollout)}
+
+
+def _stop_rollout(state: GatewayState) -> dict[str, Any]:
+    process = state.rollout_process
+    if process is None or process.poll() is not None:
+        return {"ok": True, "rollout": asdict(state.rollout), "message": "No rollout is running."}
+    state.rollout.state = "stopped"
+    state.rollout.message = "Stopping rollout…"
+    # Ask first: the runtime's quit path disconnects the robot through its own `finally`, which
+    # releases the arm in a controlled way. SIGTERM to the group is the fallback for a process
+    # that is no longer reading its stdin.
+    try:
+        if process.stdin is not None:
+            process.stdin.write(b"quit\n")
+            process.stdin.flush()
+    except (BrokenPipeError, OSError):
+        pass
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        process.terminate()
+    state.log("warn", f"Stopped rollout {state.rollout.mode} on {state.rollout.checkpointId}")
+    return {"ok": True, "rollout": asdict(state.rollout)}
+
+
+def _record_rollout_outcome(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    entry = checkpoint_backend.append_rollout_outcome(
+        state.repo_root,
+        {
+            "checkpointId": str(payload.get("checkpointId") or state.rollout.checkpointId),
+            "outcome": str(payload.get("outcome") or ""),
+            "mode": str(payload.get("mode") or state.rollout.mode),
+            "steps": int(payload.get("steps") or state.rollout.step),
+            "note": str(payload.get("note") or ""),
+            "logPath": str(payload.get("logPath") or state.rollout.logPath),
+        },
+    )
+    # Clearing the prompt is what makes it fire once per rollout rather than on every poll.
+    state.rollout.pendingOutcomeFor = 0
+    state.log("info", f"Recorded rollout outcome {entry['outcome']} for {entry['checkpointId']}")
+    return {"ok": True, "entry": entry}
+
+
+def _rollout_preview_frame(camera_key: str) -> bytes | None:
+    path = rollout_backend.PREVIEW_DIR / f"{camera_key}.jpg"
+    try:
+        stat_result = path.stat()
+        if time.time() - stat_result.st_mtime > rollout_backend.PREVIEW_STALE_S:
+            return None
+        frame = path.read_bytes()
+    except OSError:
+        return None
+    return frame or None
+
+
+def _serve_rollout_camera_snapshot(
+    handler: BaseHTTPRequestHandler, *, state: GatewayState, camera_key: str
+) -> None:
+    if camera_key not in set(state.rollout.cameraKeys):
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"unknown rollout camera: {camera_key}"})
+        return
+    frame = _rollout_preview_frame(camera_key)
+    if frame is None:
+        _json_response(
+            handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "no rollout preview frame yet"}
+        )
+        return
+    try:
+        handler.send_response(HTTPStatus.OK)
+        handler.send_header("Content-Type", "image/jpeg")
+        handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        handler.send_header("Content-Length", str(len(frame)))
+        handler.end_headers()
+        handler.wfile.write(frame)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
 
 
 def _annotation_store_path(dataset_root: Path) -> Path:
@@ -10818,6 +11214,48 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 self, HTTPStatus.OK, {"ok": True, "wandb": training_backend.wandb_status(host_id)}
             )
             return
+        if path == "/api/rollout/camera.jpg":
+            camera_key = query.get("camera", [""])[0]
+            _serve_rollout_camera_snapshot(self, state=self.server.state, camera_key=camera_key)
+            return
+        if path == "/api/checkpoints":
+            state = self.server.state
+            host_id = query.get("host", [training_backend.LOCAL_HOST_ID])[0]
+            # Outside the lock like the machine probe: a remote scan shells out over ssh and can
+            # block for seconds on an unreachable host.
+            try:
+                _json_response(self, HTTPStatus.OK, _checkpoint_entries(state, host_id))
+            except training_backend.TrainingError as exc:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            return
+        if path == "/api/rollout/status":
+            state = self.server.state
+            with state.lock:
+                _json_response(
+                    self,
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "rollout": asdict(state.rollout),
+                        "modes": [asdict(mode) for mode in rollout_backend.ROLLOUT_MODES],
+                        "rig": asdict(_rig_contract(state)),
+                        "trainingBusy": _training_is_running(state),
+                    },
+                )
+            return
+        if path == "/api/rollout/outcomes":
+            state = self.server.state
+            entries = checkpoint_backend.load_rollout_outcomes(state.repo_root)
+            _json_response(
+                self,
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "entries": list(reversed(entries)),
+                    "summary": checkpoint_backend.outcome_summary(entries),
+                },
+            )
+            return
         if path == "/api/calibration/rig-check":
             _json_response(self, HTTPStatus.OK, _last_rig_check(self.server.state))
             return
@@ -11150,6 +11588,76 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
                 return
             except ValueError as exc:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                return
+            _json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": f"unknown route {path}"})
+            return
+        if path.startswith("/api/checkpoints/"):
+            state = self.server.state
+            body = _read_json_body(self)
+            try:
+                if path == "/api/checkpoints/fetch":
+                    # Outside the lock: this is an rsync of a few hundred megabytes, and holding
+                    # the lock for it would freeze every other page's polling for its duration.
+                    host = training_backend.resolve_host(state.repo_root, str(body.get("hostId") or ""))
+                    listing = _checkpoint_entries(state, host.id)
+                    checkpoint_id = str(body.get("checkpointId") or "")
+                    selected = next(
+                        (item for item in listing["checkpoints"] if item.get("id") == checkpoint_id),
+                        None,
+                    )
+                    if selected is None:
+                        raise checkpoint_backend.CheckpointError(
+                            f"No checkpoint {checkpoint_id} on {host.label}."
+                        )
+                    result = checkpoint_backend.fetch_checkpoint(state.repo_root, host, selected)
+                    with state.lock:
+                        state.log("info", result["message"])
+                    _json_response(self, HTTPStatus.OK, result)
+                    return
+                if path == "/api/checkpoints/delete":
+                    result = checkpoint_backend.delete_checkpoint(
+                        state.repo_root, str(body.get("checkpointId") or "")
+                    )
+                    with state.lock:
+                        state.log("warn", result["message"])
+                    _json_response(self, HTTPStatus.OK, result)
+                    return
+            except (checkpoint_backend.CheckpointError, training_backend.TrainingError) as exc:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                return
+            _json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": f"unknown route {path}"})
+            return
+        if path.startswith("/api/rollout/"):
+            state = self.server.state
+            body = _read_json_body(self)
+            try:
+                if path == "/api/rollout/start":
+                    with state.lock:
+                        _json_response(self, HTTPStatus.OK, _start_rollout(state, body))
+                    return
+                if path == "/api/rollout/control":
+                    with state.lock:
+                        _json_response(
+                            self,
+                            HTTPStatus.OK,
+                            _send_rollout_control(state, str(body.get("command") or "")),
+                        )
+                    return
+                if path == "/api/rollout/stop":
+                    with state.lock:
+                        _json_response(self, HTTPStatus.OK, _stop_rollout(state))
+                    return
+                if path == "/api/rollout/outcome":
+                    with state.lock:
+                        _json_response(self, HTTPStatus.OK, _record_rollout_outcome(state, body))
+                    return
+            except (
+                rollout_backend.RolloutError,
+                checkpoint_backend.CheckpointError,
+                training_backend.TrainingError,
+                ValueError,
+            ) as exc:
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
                 return
             _json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": f"unknown route {path}"})

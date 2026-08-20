@@ -148,6 +148,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--first-frame-max-rot-delta-deg', type=float, default=None)
     parser.add_argument('--max-step-pos-delta-mm', type=float, default=None)
     parser.add_argument('--max-step-rot-delta-deg', type=float, default=None)
+    parser.add_argument('--max-leash-pos-delta-mm', type=float, default=None)
+    parser.add_argument('--max-leash-rot-delta-deg', type=float, default=None)
     parser.add_argument(
         '--use-otg',
         dest='use_otg',
@@ -559,6 +561,8 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         ),
         *([f'--max-step-pos-delta-mm={args.max_step_pos_delta_mm}'] if args.max_step_pos_delta_mm is not None else []),
         *([f'--max-step-rot-delta-deg={args.max_step_rot_delta_deg}'] if args.max_step_rot_delta_deg is not None else []),
+        *([f'--max-leash-pos-delta-mm={args.max_leash_pos_delta_mm}'] if args.max_leash_pos_delta_mm is not None else []),
+        *([f'--max-leash-rot-delta-deg={args.max_leash_rot_delta_deg}'] if args.max_leash_rot_delta_deg is not None else []),
         *(['--use-otg'] if args.use_otg is True else ['--no-use-otg'] if args.use_otg is False else []),
         *([f'--otg-control-frequency={args.otg_control_frequency}'] if args.otg_control_frequency is not None else []),
         *(

@@ -8,6 +8,7 @@ import type {
   TrainingWandbStatus
 } from "../types";
 import { Metric, PageHeader, StatusDot } from "../shared/ui";
+import { CheckpointBrowser } from "../shared/CheckpointBrowser";
 
 // Mirrors KNOWN_POLICY_TYPES in tools/fr3/fr3_train_il_policy.py. Split by what this repo
 // has actually tuned for the FR3 rig, because "selectable" and "has defaults worth using"
@@ -138,6 +139,16 @@ export function TrainingPage() {
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [run?.lastLines?.length]);
+
+  // Re-scan the artifact list when a run stops running. Checkpoints appear on disk while
+  // training is still going (every save_freq steps), but the moment the operator cares about
+  // is the one where the run is done and there is something to roll out.
+  const [artifactToken, setArtifactToken] = useState(0);
+  const wasRunning = useRef(false);
+  useEffect(() => {
+    if (wasRunning.current && !isRunning) setArtifactToken((value) => value + 1);
+    wasRunning.current = isRunning;
+  }, [isRunning]);
 
   useEffect(() => {
     if (selectedView && !jobNameEdited) setJobName(`${selectedView.name}__${policy}`);
@@ -590,6 +601,20 @@ export function TrainingPage() {
           </pre>
         </section>
       )}
+
+      {/* ----------------------------------------------------------- artifacts --- */}
+      <section className="card">
+        <div className="card-head">
+          <h3>Checkpoints</h3>
+        </div>
+        <p className="hint">
+          What training produced, on this machine and on every training host. A checkpoint
+          trained elsewhere has to be fetched here before it can be rolled out — the robot and
+          its cameras are on this machine. Roll one out on the{" "}
+          <a href="#/rollout">Rollout</a> page.
+        </p>
+        <CheckpointBrowser mode="manage" refreshToken={artifactToken} />
+      </section>
     </div>
   );
 }

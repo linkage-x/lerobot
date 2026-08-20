@@ -4082,3 +4082,356 @@ button.danger {
   overflow-wrap: anywhere;
   white-space: normal;
 }
+
+/* --------------------------------------------------- Model pages: shared shell ---
+ *
+ * The Training and Rollout pages share one vocabulary of layout classes (.page, .card,
+ * .field, .banner-*, .table). Defined once here rather than per page so the two cannot
+ * drift apart -- an operator moves between them mid-task and a checkpoint that looks one
+ * way on Training and another on Rollout is a reason to doubt both.
+ */
+
+.page {
+  display: grid;
+  gap: 14px;
+}
+
+.card {
+  background: #ffffff;
+  border: 1px solid #d2d9de;
+  border-radius: 8px;
+  padding: 14px;
+}
+
+.card-head {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.card-head h3 {
+  align-items: center;
+  display: flex;
+  font-size: 15px;
+  gap: 8px;
+  margin: 0;
+}
+
+.card-head h4,
+.subcard h4 {
+  font-size: 14px;
+  margin: 0 0 6px;
+}
+
+.subcard {
+  background: #f7f9fa;
+  border: 1px solid #e1e6ea;
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  margin: 10px 0;
+  padding: 12px;
+}
+
+.row-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.metric-row {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  margin: 10px 0;
+}
+
+.hint {
+  color: #60707c;
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 6px 0;
+}
+
+.hint code,
+.checkpoint-detail code {
+  background: #eef2f4;
+  border-radius: 4px;
+  font-size: 12px;
+  padding: 1px 5px;
+  overflow-wrap: anywhere;
+}
+
+.field {
+  display: grid;
+  gap: 4px;
+  margin: 8px 0;
+}
+
+.field > span {
+  color: #60707c;
+  font-size: 12px;
+}
+
+.field input,
+.field select,
+.field textarea {
+  border: 1px solid #aeb9c2;
+  border-radius: 6px;
+  font: inherit;
+  min-height: 36px;
+  padding: 0 8px;
+}
+
+.field.inline {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+  margin: 0;
+}
+
+.field.inline > span {
+  white-space: nowrap;
+}
+
+.field.grow {
+  flex: 1 1 220px;
+}
+
+.field.grow input {
+  width: 100%;
+}
+
+.checkbox,
+.field-inline {
+  align-items: flex-start;
+  color: #172026;
+  display: flex;
+  font-size: 13px;
+  gap: 8px;
+  line-height: 1.45;
+  margin: 8px 0;
+}
+
+.checkbox input,
+.field-inline input {
+  accent-color: #0f766e;
+  margin-top: 2px;
+}
+
+.banner {
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 10px 12px;
+}
+
+.banner ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+.banner-ok {
+  background: #e9f6f3;
+  border: 1px solid #9ccdc4;
+  color: #114f48;
+}
+
+.banner-warn {
+  background: #fdf5e3;
+  border: 1px solid #e0c383;
+  color: #6f4e12;
+}
+
+.banner-error {
+  background: #fbeee8;
+  border: 1px solid #e0a487;
+  color: #8d2d12;
+}
+
+.table {
+  border-collapse: collapse;
+  font-size: 13px;
+  width: 100%;
+}
+
+.table th,
+.table td {
+  border-bottom: 1px solid #e1e6ea;
+  padding: 7px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.table th {
+  color: #60707c;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.cell-sub {
+  color: #60707c;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.pill {
+  border-radius: 999px;
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 650;
+  padding: 2px 9px;
+  white-space: nowrap;
+}
+
+.pill-ok {
+  background: #e9f6f3;
+  color: #114f48;
+}
+
+.pill-warn {
+  background: #fdf5e3;
+  color: #6f4e12;
+}
+
+.pill-error {
+  background: #fbeee8;
+  color: #8d2d12;
+}
+
+/* ------------------------------------------------------------ checkpoint list --- */
+
+.checkpoint-toolbar {
+  margin-bottom: 10px;
+}
+
+.checkpoint-table tbody tr.selected-row {
+  background: #eef8f7;
+}
+
+.checkpoint-table tbody tr:not(.detail-row):hover {
+  background: #f5f7f8;
+}
+
+.checkpoint-table td:first-child {
+  white-space: nowrap;
+}
+
+.detail-row > td {
+  background: #f7f9fa;
+}
+
+.checkpoint-detail {
+  display: grid;
+  gap: 10px;
+}
+
+.issue-list {
+  display: grid;
+  gap: 6px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.issue {
+  border-left: 3px solid transparent;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 6px 10px;
+}
+
+.issue-error {
+  background: #fbeee8;
+  border-left-color: #c2410c;
+  color: #8d2d12;
+}
+
+.issue-warn {
+  background: #fdf5e3;
+  border-left-color: #b7791f;
+  color: #6f4e12;
+}
+
+.issue-ok {
+  background: #e9f6f3;
+  border-left-color: #0f766e;
+  color: #114f48;
+}
+
+.detail-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  margin: 0;
+}
+
+.detail-grid > div.wide {
+  grid-column: 1 / -1;
+}
+
+.detail-grid dt {
+  color: #60707c;
+  font-size: 12px;
+}
+
+.detail-grid dd {
+  font-size: 13px;
+  margin: 2px 0 0;
+  overflow-wrap: anywhere;
+}
+
+/* ----------------------------------------------------------------- rollout --- */
+
+/* The live panel gets a teal rule down its left edge: on a page where every other section is
+ * configuration, this is the one that is currently connected to a robot. */
+.rollout-live {
+  border-left: 3px solid #0f766e;
+}
+
+.rollout-cameras {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  margin: 10px 0;
+}
+
+.rollout-cameras figure {
+  margin: 0;
+}
+
+.rollout-cameras img {
+  background: #172026;
+  border: 1px solid #d2d9de;
+  border-radius: 6px;
+  display: block;
+  width: 100%;
+}
+
+.rollout-cameras figcaption {
+  color: #60707c;
+  font-size: 12px;
+  padding-top: 4px;
+}
+
+.rollout-cameras .wide {
+  grid-column: 1 / -1;
+}
+
+.outcome-prompt {
+  border-color: #9ccdc4;
+}
+
+/* Motion confirmation is the last thing between a click and a moving arm, so it is the one
+ * control on the page that is allowed to shout. */
+.confirm-motion {
+  background: #fdf5e3;
+  border: 1px solid #e0c383;
+  border-radius: 6px;
+  color: #6f4e12;
+  padding: 10px 12px;
+}

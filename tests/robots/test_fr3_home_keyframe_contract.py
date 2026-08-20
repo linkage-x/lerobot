@@ -29,8 +29,9 @@ SCENE_XML = ASSETS / "fr3_pika_gripper_scene.xml"
 RECORD_CONFIG = Path("tools/fr3/fr3_record_config.yaml")
 
 ARM_JOINT_NAMES = tuple(f"fr3_joint{index}" for index in range(1, 8))
-# Same tolerance the runtime accepts as "arrived" (fr3_move_to_start_runtime.DEFAULT_TOLERANCE_RAD
-# is 0.01); a drift smaller than that could not be detected on the hardware anyway.
+# Not the runtime's arrival tolerance: that one absorbs controller residual on real hardware, and
+# is two orders of magnitude looser than anything a *file* should be allowed to drift by. Two
+# hand-copied numbers either agree or they do not.
 MAX_JOINT_DRIFT_RAD = 1e-9
 
 

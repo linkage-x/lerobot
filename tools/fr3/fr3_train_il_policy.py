@@ -1449,8 +1449,16 @@ def make_inference_config(
             "safety": {
                 "first_frame_max_pos_delta_mm": 20.0,
                 "first_frame_max_rot_delta_deg": 8.0,
-                "max_step_pos_delta_mm": 3.0,
+                # Bounds the policy's own per-step delta, measured against prev_cmd. Sized from the
+                # recorded action distribution: 5 mm admits 99.90% of demonstrated frames.
+                "max_step_pos_delta_mm": 5.0,
                 "max_step_rot_delta_deg": 2.0,
+                # Bounds how far the command may lead the measured pose. That gap is servo tracking
+                # lag, which reaches p95 10.65 mm in the demonstrations, so it needs its own much
+                # looser limit -- holding it to the per-step budget clamps every step of a healthy
+                # rollout.
+                "max_leash_pos_delta_mm": 20.0,
+                "max_leash_rot_delta_deg": 8.0,
             },
             "debug_step0_dump_dir": str(Path("outputs/debug") / f"{args.job_name}_step0"),
         },

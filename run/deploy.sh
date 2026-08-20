@@ -255,9 +255,26 @@ if [[ "$profile" == "workstation" ]]; then
   if [[ -z "$xauthority" && -r "$xdg_runtime_dir/gdm/Xauthority" ]]; then
     xauthority="$xdg_runtime_dir/gdm/Xauthority"
   fi
+  # A missing display used to abort the deploy "for MuJoCo viewer". It is the wrong thing to
+  # gate on: this gateway renders every MuJoCo view *offscreen* -- it exports MUJOCO_GL=egl and
+  # starts the sim teleop with --no-viewer, streaming frames into the web UI -- and that path
+  # needs the GPU's DRM render node, not an X server. The two came apart in practice: with
+  # nobody logged in graphically, the deploy account lost the logind ACL on /dev/dri/renderD*
+  # and offscreen rendering broke, while the error blamed a display nothing was going to use.
+  #
+  # So probe the capability itself, report the cause, and start anyway. A gateway that cannot
+  # render still records, exports, trains, manages checkpoints and runs rollouts; refusing to
+  # deploy at all costs more than the one capability that is actually degraded.
+  if ! render_probe="$(PYTHONPATH=src:. "$python_bin" tools/fr3/probe_render_backend.py 2>&1)"; then
+    echo "WARN: offscreen rendering unavailable: ${render_probe#reason=}" >&2
+    echo "WARN: MuJoCo sim-teleop camera streams and MuJoCo replay video will not render." >&2
+    echo "WARN: recording, dataset export, training, checkpoints and rollout are unaffected." >&2
+  fi
   if [[ -z "$display" ]]; then
-    echo "ERROR: no active workstation X display found for MuJoCo viewer" >&2
-    exit 1
+    # Separate capability, separate warning: these are windows that open on the rig's own
+    # screen, so they matter only to someone standing at it.
+    echo "WARN: no X display for ${USER:-$(id -un)}; on-rig windows are unavailable" >&2
+    echo "WARN: this affects the rollout 'real_debug' MuJoCo viewer only." >&2
   fi
 fi
 

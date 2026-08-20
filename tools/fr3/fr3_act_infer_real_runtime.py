@@ -17,7 +17,9 @@ import argparse
 from copy import deepcopy
 import json
 from pathlib import Path
+import os
 import select
+import stat as stat_module
 import sys
 import termios
 import threading
@@ -49,6 +51,7 @@ from lerobot.robots.franka_research3.processor_franka_research3 import (
     PREV_CMD_GRIPPER_KEY,
     PREV_CMD_POSITION_KEYS,
     PREV_CMD_QUAT_KEYS,
+    PREV_CMD_ROTVEC_KEYS,
     _continuous_quaternion,
     delta_reference_from_action_names,
 )
@@ -76,8 +79,29 @@ _DEFAULT_OPENCV_BACKEND = Cv2Backends.V4L2
 _OBS_IMAGES_PREFIX = 'observation.images.'
 _DEFAULT_FIRST_FRAME_MAX_POS_DELTA_MM = 30.0
 _DEFAULT_FIRST_FRAME_MAX_ROT_DELTA_DEG = 10.0
+# How far the *policy* may ask the EE to move in one step, measured against the pose its action is
+# defined relative to (``prev_cmd``). This is the number the training data bounds: in
+# eeframe_fr3_spacemouse_20260813_160401 the recorded per-step delta has p50 1.59 mm and p95
+# 2.93 mm, and a 5.0 mm magnitude admits 99.90% of demo frames -- so this clips genuine outliers
+# and leaves the demonstrated motion alone.
 _DEFAULT_MAX_STEP_POS_DELTA_MM = 5.0
 _DEFAULT_MAX_STEP_ROT_DELTA_DEG = 3.0
+
+# How far the command may run ahead of where the arm actually is. This is a different quantity
+# from the one above and it is not policy aggression: it is servo tracking lag. The command leads,
+# the impedance controller follows, and the gap between them is what produces the force that moves
+# the arm -- so a healthy moving arm always has one. In the very demonstrations this policy was
+# trained on that gap runs to p50 5.71 mm and p95 10.65 mm (max 15.92 mm), which is why the leash
+# is sized at 20 mm: it admits 100% of the recorded frames. It exists to catch a command running
+# away from an arm that is stuck, blocked, or not tracking at all, which is a failure the step
+# limit above cannot see.
+#
+# Judging the lag by the *step* limit is what pinned a healthy rollout at 299/299 clamped: the lag
+# alone (median 4.18 mm on that run) already exceeded the 3 mm the launcher was passing, before
+# the policy contributed a single millimetre. The demos themselves would have been clamped on
+# 61.1% of their frames by that same test.
+_DEFAULT_MAX_LEASH_POS_DELTA_MM = 20.0
+_DEFAULT_MAX_LEASH_ROT_DELTA_DEG = 8.0
 _DEFAULT_DATASET_START_GRIPPER_TOLERANCE = 0.05
 _DEFAULT_USE_OTG = bool(FrankaResearch3Config.__dataclass_fields__['use_otg'].default)
 _DEFAULT_OTG_CONTROL_FREQUENCY = float(
@@ -450,7 +474,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         '--max-step-rot-delta-deg',
         type=float,
         default=_DEFAULT_MAX_STEP_ROT_DELTA_DEG,
-        help='Clamp each step relative rotvec component to this limit.',
+        help=(
+            'Limit the magnitude of each step rotation delta, measured against prev_cmd -- the '
+            'pose the policy action is defined relative to.'
+        ),
+    )
+    parser.add_argument(
+        '--max-leash-pos-delta-mm',
+        type=float,
+        default=_DEFAULT_MAX_LEASH_POS_DELTA_MM,
+        help=(
+            'Limit how far the command may run ahead of the measured EE pose. This bounds servo '
+            'tracking lag, not policy motion, so it must stay well above the lag a healthy moving '
+            'arm produces; size it from the recorded prev_cmd-vs-measured gap, not from per-step '
+            'motion.'
+        ),
+    )
+    parser.add_argument(
+        '--max-leash-rot-delta-deg',
+        type=float,
+        default=_DEFAULT_MAX_LEASH_ROT_DELTA_DEG,
+        help='Rotational counterpart of --max-leash-pos-delta-mm.',
     )
     parser.add_argument(
         '--tactile-fallback',
@@ -468,6 +512,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         '--camera-preview-window',
         action='store_true',
         help='Show the policy input camera frames in one OpenCV window with camera-name labels.',
+    )
+    parser.add_argument(
+        '--no-camera-preview-window',
+        dest='camera_preview_window',
+        action='store_false',
+        help=(
+            'Turn the OpenCV preview window back off. The run_pick_place_* launchers enable it '
+            'for most modes; a caller with no X display (the GUI gateway) needs a way to say so '
+            'without reimplementing the launcher.'
+        ),
     )
     parser.add_argument(
         '--move-to-das-start',
@@ -514,7 +568,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         '--interactive-rollouts',
         action='store_true',
-        help='Wait for keyboard input between rollouts. Requires sshkeyboard inside the runtime.',
+        help='Wait for a start/stop/quit signal between rollouts, from a keyboard on a TTY or one command per line on a stdin pipe.',
+    )
+    parser.add_argument(
+        '--preview-jpeg-dir',
+        type=Path,
+        default=None,
+        help=(
+            'Publish the frames the policy is being fed as <camera>.jpg in this directory, for '
+            'a viewer that is not at the machine. Independent of --camera-preview-window, which '
+            'needs a local X display.'
+        ),
+    )
+    parser.add_argument(
+        '--preview-jpeg-fps',
+        type=float,
+        default=5.0,
+        help='Upper bound on preview JPEG writes per second (default 5).',
     )
     parser.add_argument('--rollout-start-key', default='s', help='Interactive key to start a rollout.')
     parser.add_argument('--rollout-stop-key', default='x', help='Interactive key to stop the current rollout.')
@@ -1106,6 +1176,57 @@ class InteractiveRolloutKeyboard:
         except TypeError:
             listen_keyboard(on_press=self._on_press)
 
+    # Words accepted alongside the bare keys on the pipe channel, so a caller that is not a
+    # keyboard can say what it means. The keys stay valid because the GUI and the terminal
+    # then speak the same alphabet, which is one less thing to keep in step.
+    _PIPE_COMMAND_WORDS = {'start': 'start', 'stop': 'stop', 'quit': 'quit'}
+
+    def _listen_pipe_loop(self) -> None:
+        """One command per line, for a caller that is a program rather than a terminal.
+
+        The GUI reaches this path: it holds the runtime's stdin as a pipe, which no keyboard
+        backend can read -- sshkeyboard and the cbreak fallback both want a terminal. This is
+        the same control shape the recorder already exposes to the gateway (see
+        _write_recorder_stdin), so the two long-running rig processes are driven the same way.
+
+        Reading returns '' only at EOF, which is the writer closing the pipe. That is a quit:
+        whoever was steering this rollout is gone, and continuing to move the arm with no
+        controller is the one outcome worth avoiding.
+        """
+        for raw_line in sys.stdin:
+            if self.quit_requested.is_set():
+                return
+            command = raw_line.strip().lower()
+            if not command:
+                continue
+            resolved = self._PIPE_COMMAND_WORDS.get(command)
+            if resolved == 'start':
+                self._on_press(self.start_key)
+            elif resolved == 'stop':
+                self._on_press(self.stop_key)
+            elif resolved == 'quit':
+                self._on_press(self.quit_key)
+            elif len(command) == 1:
+                self._on_press(command)
+            else:
+                print(f'[WARN] interactive_pipe_command_ignored={command!r}')
+        print('[INFO] interactive_pipe=closed_by_peer')
+        self._on_press(self.quit_key)
+
+    @staticmethod
+    def _stdin_is_pipe() -> bool:
+        """Whether stdin can actually deliver commands without being a terminal.
+
+        A pipe or a socket has a writer on the other end; /dev/null (which is what
+        subprocess.DEVNULL gives) is a character device that returns EOF immediately, and
+        treating that as a control channel would quit the rollout the moment it started.
+        """
+        try:
+            mode = os.fstat(sys.stdin.fileno()).st_mode
+        except (OSError, ValueError):
+            return False
+        return stat_module.S_ISFIFO(mode) or stat_module.S_ISSOCK(mode)
+
     def _listen_stdin_loop(self) -> None:
         if not sys.stdin.isatty():
             raise RuntimeError('Interactive rollout fallback requires a TTY stdin.')
@@ -1130,13 +1251,28 @@ class InteractiveRolloutKeyboard:
             termios.tcsetattr(fd, termios.TCSADRAIN, original_termios)
 
     def start(self) -> None:
+        # Checked before sshkeyboard, not after: sshkeyboard grabs the *terminal*, so on a
+        # process whose stdin is a pipe it would install a backend that can never receive a
+        # key while the channel that can sits unused.
+        if not sys.stdin.isatty() and self._stdin_is_pipe():
+            self._thread = threading.Thread(target=self._listen_pipe_loop, daemon=True)
+            self._thread.start()
+            backend = 'pipe'
+            print(
+                '[INFO] interactive_rollouts=enabled '
+                f'keyboard_backend={backend} '
+                f"start_key='{self.start_key}' stop_key='{self.stop_key}' quit_key='{self.quit_key}'"
+            )
+            return
+
         try:
             from sshkeyboard import listen_keyboard, stop_listening
         except ImportError:
             if not sys.stdin.isatty():
                 raise RuntimeError(
-                    'Interactive rollout mode requires `sshkeyboard` or a TTY stdin fallback. '
-                    'Install sshkeyboard in the runtime or run Docker with an interactive TTY.'
+                    'Interactive rollout mode requires `sshkeyboard`, a TTY stdin, or a pipe '
+                    'on stdin. Install sshkeyboard in the runtime, run with an interactive '
+                    'TTY, or drive it from a parent process that holds stdin open.'
                 )
             self._thread = threading.Thread(target=self._listen_stdin_loop, daemon=True)
             self._thread.start()
@@ -1785,6 +1921,120 @@ def show_policy_camera_preview_window(
     return True
 
 
+class PolicyCameraPreviewSink:
+    """Publish the frames the policy is seeing as JPEG files a viewer can poll.
+
+    Exists because the rollout's own preview is an OpenCV window, which needs an X display on
+    the machine the robot is wired to and shows the run only to someone standing at it. The
+    frames a remote operator most needs to see are precisely the ones the policy is being fed,
+    so they are published from the same observation the network receives -- after cropping and
+    resizing, not before.
+
+    Encoding happens on a background thread. The caller is a real-robot control loop at the
+    dataset's frame rate, and a JPEG encode of two 640x480 frames is a few milliseconds it
+    should not spend: `publish` only copies, and a slow or stalled reader can never add
+    latency to the arm.
+    """
+
+    def __init__(self, output_dir: Path, *, camera_keys: list[str], fps: float = 5.0):
+        self.output_dir = Path(output_dir)
+        self.camera_keys = list(camera_keys)
+        self._min_interval_s = 1.0 / fps if fps > 0 else 0.0
+        self._pending: dict[str, np.ndarray] | None = None
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._closed = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._failed = False
+
+    def start(self) -> None:
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f'[WARN] policy_camera_preview_sink=disabled reason=mkdir_failed: {exc}')
+            self._failed = True
+            return
+        self._thread = threading.Thread(target=self._encode_loop, daemon=True, name='policy-preview-sink')
+        self._thread.start()
+        print(
+            f'[INFO] policy_camera_preview_sink=enabled dir={self.output_dir} '
+            f"cameras={','.join(self.camera_keys)}"
+        )
+
+    def publish(self, policy_observation: dict[str, np.ndarray]) -> None:
+        if self._failed or self._closed.is_set():
+            return
+        frames: dict[str, np.ndarray] = {}
+        for camera_key in self.camera_keys:
+            image = policy_observation.get(f'{_OBS_IMAGES_PREFIX}{camera_key}')
+            if image is None:
+                continue
+            image = np.asarray(image)
+            if image.ndim != 3 or image.shape[-1] != 3:
+                continue
+            # Copied, not referenced: the caller reuses its observation buffers, and the
+            # encoder thread would otherwise race with the next capture.
+            frames[camera_key] = np.array(image, dtype=np.uint8, copy=True)
+        if not frames:
+            return
+        with self._lock:
+            self._pending = frames
+        self._wake.set()
+
+    def _encode_loop(self) -> None:
+        import cv2
+
+        last_write_s = 0.0
+        while not self._closed.is_set():
+            if not self._wake.wait(timeout=0.5):
+                continue
+            self._wake.clear()
+            with self._lock:
+                frames = self._pending
+                self._pending = None
+            if not frames:
+                continue
+            now_s = time.monotonic()
+            if self._min_interval_s and now_s - last_write_s < self._min_interval_s:
+                continue
+            last_write_s = now_s
+            for camera_key, image_rgb in frames.items():
+                try:
+                    ok, buffer = cv2.imencode('.jpg', image_rgb[..., ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    if not ok:
+                        continue
+                    self._write_atomic(self.output_dir / f'{camera_key}.jpg', buffer.tobytes())
+                except Exception as exc:  # noqa: BLE001 - a preview must never end a rollout
+                    print(f'[WARN] policy_camera_preview_write_failed camera={camera_key}: {exc}')
+                    self._failed = True
+                    return
+
+    @staticmethod
+    def _write_atomic(path: Path, payload: bytes) -> None:
+        # A reader polling this file must never see a half-written JPEG, and it polls far more
+        # often than this writes.
+        tmp_path = path.with_name(f'.{path.name}.tmp')
+        with open(tmp_path, 'wb') as handle:
+            handle.write(payload)
+        os.replace(tmp_path, path)
+
+    def close(self) -> None:
+        self._closed.set()
+        self._wake.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+        for camera_key in self.camera_keys:
+            # Remove the frames rather than leaving the last one behind: a stale JPEG sitting
+            # in /dev/shm after the run ends is indistinguishable from a live one to anything
+            # that only looks at the file, and the viewer would show a finished rollout as
+            # still going.
+            try:
+                (self.output_dir / f'{camera_key}.jpg').unlink()
+            except OSError:
+                pass
+
+
 def close_camera_preview_window(window_name: str = 'FR3 policy camera inputs') -> None:
     try:
         import cv2
@@ -2171,7 +2421,7 @@ def build_delta_action_reconstructor(action_names: list[str]) -> DeltaEEToAbsolu
     The workspace clamp is deliberately not passed here. Reconstruction happens in the dataset
     frame, while ``robot_cfg.workspace_min/max`` bound the robot base frame; clamping in the wrong
     frame would silently distort the command. The existing base-frame guards
-    (``clamp_command_relative_to_current`` and the robot driver's own clip) still apply.
+    (``limit_command_for_safety`` and the robot driver's own clip) still apply.
     """
     reference = delta_reference_from_action_names(action_names)
     if reference is None:
@@ -2762,24 +3012,99 @@ def should_reject_first_command(
     return reject, position_delta, rotation_delta
 
 
-def clamp_command_relative_to_current(
+def _extract_previous_command_pose(
+    robot_observation: RobotObservation,
+) -> tuple[np.ndarray, Rotation] | None:
+    """The pose the policy's delta is defined against, or None if the robot does not report it.
+
+    This is the driver's own last sent command -- the same field the recorder wrote into
+    ``observation.state.prev_cmd.*`` and the same one ``DeltaEEToAbsoluteEEAction`` rebuilds the
+    absolute target from. Reading it here is what lets the step guard judge the policy by the
+    quantity the policy actually produced, rather than by that quantity plus the servo lag.
+    """
+    keys = PREV_CMD_POSITION_KEYS + PREV_CMD_ROTVEC_KEYS
+    if not all(key in robot_observation for key in keys):
+        return None
+    position = np.asarray([robot_observation[key] for key in PREV_CMD_POSITION_KEYS], dtype=np.float64)
+    rotation = Rotation.from_rotvec([robot_observation[key] for key in PREV_CMD_ROTVEC_KEYS])
+    return position, rotation
+
+
+def _shorten_to_limit(delta: np.ndarray, limit: float) -> tuple[np.ndarray, bool]:
+    """Shorten an over-long delta without turning it.
+
+    Per-axis ``np.clip`` silently changes the commanded *direction*: a mostly-downward reach of
+    (0.2, 2.5, -4.9) mm clips to (0.2, 2.5, -3.0) mm, which points somewhere the policy never
+    asked to go. Worse, it bends hardest along whichever axis is carrying the motion, so a descent
+    gets throttled while the lateral drift rides through untouched -- on the 299/299 run, 77% of
+    all discarded displacement was the z component. Scaling the whole vector keeps the heading and
+    only reduces the distance.
+    """
+    magnitude = float(np.linalg.norm(delta))
+    if magnitude <= limit or magnitude == 0.0:
+        return delta, False
+    return delta * (limit / magnitude), True
+
+
+def limit_command_for_safety(
     robot_command: dict[str, float],
     robot_observation: RobotObservation,
     *,
-    max_pos_delta_m: float,
-    max_rot_delta_rad: float,
-) -> tuple[dict[str, float], np.ndarray, np.ndarray, bool]:
+    max_step_pos_delta_m: float,
+    max_step_rot_delta_rad: float,
+    max_leash_pos_delta_m: float,
+    max_leash_rot_delta_rad: float,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    """Bound the command twice, against the two references that mean different things.
+
+    **Step** -- how much motion the policy asked for, measured from ``prev_cmd``, the pose its
+    delta is defined against. This is the guard on policy aggression, and the training data sizes
+    it directly.
+
+    **Leash** -- how far the resulting command sits from where the arm actually is. That gap is
+    tracking lag, not intent; it is large and healthy whenever the arm is moving, and it only
+    means trouble when the arm has stopped tracking altogether.
+
+    Collapsing the two -- judging intent by the gap -- is what made a well-behaved rollout report
+    every one of its 299 steps as clamped while the arm was in fact following the policy closely.
+    """
     current_position, current_rotation = _extract_observation_pose(robot_observation)
-    position_delta, rotation_delta = compute_pose_delta_from_current(robot_command, robot_observation)
-    clamped_position_delta = np.clip(position_delta, -float(max_pos_delta_m), float(max_pos_delta_m))
-    clamped_rotation_delta = np.clip(rotation_delta, -float(max_rot_delta_rad), float(max_rot_delta_rad))
-    clamped = bool(
-        not np.allclose(clamped_position_delta, position_delta)
-        or not np.allclose(clamped_rotation_delta, rotation_delta)
+    target_position, target_rotation = _extract_command_pose(robot_command)
+
+    # Reported unchanged for the log, so ``pos_delta_mm`` keeps meaning what it always meant.
+    raw_gap_position_delta = target_position - current_position
+    raw_gap_rotation_delta = (current_rotation.inv() * target_rotation).as_rotvec()
+
+    reference = _extract_previous_command_pose(robot_observation)
+    if reference is None:
+        # No prev_cmd in the observation: fall back to the measured pose. The step guard then
+        # degrades to the old behaviour rather than silently vanishing.
+        reference_position, reference_rotation = current_position, current_rotation
+    else:
+        reference_position, reference_rotation = reference
+
+    step_position_delta = target_position - reference_position
+    step_rotation_delta = (reference_rotation.inv() * target_rotation).as_rotvec()
+    limited_step_position, step_position_limited = _shorten_to_limit(
+        step_position_delta, float(max_step_pos_delta_m)
+    )
+    limited_step_rotation, step_rotation_limited = _shorten_to_limit(
+        step_rotation_delta, float(max_step_rot_delta_rad)
+    )
+    target_position = reference_position + limited_step_position
+    target_rotation = reference_rotation * Rotation.from_rotvec(limited_step_rotation)
+
+    gap_position_delta = target_position - current_position
+    gap_rotation_delta = (current_rotation.inv() * target_rotation).as_rotvec()
+    limited_gap_position, leash_position_limited = _shorten_to_limit(
+        gap_position_delta, float(max_leash_pos_delta_m)
+    )
+    limited_gap_rotation, leash_rotation_limited = _shorten_to_limit(
+        gap_rotation_delta, float(max_leash_rot_delta_rad)
     )
 
-    safe_position = current_position + clamped_position_delta
-    safe_rotation = current_rotation * Rotation.from_rotvec(clamped_rotation_delta)
+    safe_position = current_position + limited_gap_position
+    safe_rotation = current_rotation * Rotation.from_rotvec(limited_gap_rotation)
     safe_rotvec = safe_rotation.as_rotvec()
     safe_command = dict(robot_command)
     safe_command.update(
@@ -2792,7 +3117,22 @@ def clamp_command_relative_to_current(
             'ee.wz': float(safe_rotvec[2]),
         }
     )
-    return safe_command, position_delta, rotation_delta, clamped
+
+    step_limited = bool(step_position_limited or step_rotation_limited)
+    leash_limited = bool(leash_position_limited or leash_rotation_limited)
+    guard: dict[str, Any] = {
+        'position_delta': raw_gap_position_delta,
+        'rotation_delta': raw_gap_rotation_delta,
+        'step_position_delta': step_position_delta,
+        'step_rotation_delta': step_rotation_delta,
+        'step_limited': step_limited,
+        'leash_limited': leash_limited,
+        'has_prev_cmd_reference': reference is not None,
+        # The leash firing is the one worth reacting to: it means the command is running away
+        # from an arm that is not following it.
+        'status': 'leash_limited' if leash_limited else ('step_limited' if step_limited else 'pass'),
+    }
+    return safe_command, guard
 
 
 def _format_vector(values: np.ndarray, *, scale: float = 1.0) -> str:
@@ -3023,6 +3363,8 @@ def run_inference(args: argparse.Namespace) -> int:
     first_frame_max_rot_delta_rad = np.deg2rad(float(args.first_frame_max_rot_delta_deg))
     max_step_pos_delta_m = float(args.max_step_pos_delta_mm) / 1000.0
     max_step_rot_delta_rad = np.deg2rad(float(args.max_step_rot_delta_deg))
+    max_leash_pos_delta_m = float(args.max_leash_pos_delta_mm) / 1000.0
+    max_leash_rot_delta_rad = np.deg2rad(float(args.max_leash_rot_delta_deg))
     dataset_start_gripper_tolerance = float(args.dataset_start_gripper_tolerance)
     state_names = (
         extract_feature_names(ds_meta.features['observation.state'], _DEFAULT_STATE_NAMES)
@@ -3160,7 +3502,8 @@ def run_inference(args: argparse.Namespace) -> int:
     print(
         '[INFO] safety='
         f'first_frame<{args.first_frame_max_pos_delta_mm:.1f}mm/{args.first_frame_max_rot_delta_deg:.1f}deg, '
-        f'per_step<{args.max_step_pos_delta_mm:.1f}mm/{args.max_step_rot_delta_deg:.1f}deg, '
+        f'per_step<{args.max_step_pos_delta_mm:.1f}mm/{args.max_step_rot_delta_deg:.1f}deg (vs prev_cmd), '
+        f'leash<{args.max_leash_pos_delta_mm:.1f}mm/{args.max_leash_rot_delta_deg:.1f}deg (vs measured), '
         f'preview={args.preview}'
     )
     print(
@@ -3228,6 +3571,14 @@ def run_inference(args: argparse.Namespace) -> int:
         f"{'enabled' if args.mujoco_viewer else 'disabled'} model={mujoco_model_path}"
     )
     print(f"[INFO] camera_preview_window={'enabled' if args.camera_preview_window else 'disabled'}")
+    preview_sink: PolicyCameraPreviewSink | None = None
+    if args.preview_jpeg_dir is not None:
+        preview_sink = PolicyCameraPreviewSink(
+            args.preview_jpeg_dir,
+            camera_keys=list(required_image_keys),
+            fps=float(args.preview_jpeg_fps),
+        )
+        preview_sink.start()
 
     if args.preview and args.align_gripper_to_dataset_start:
         print('[INFO] preview_gripper_alignment=requested; using virtual observation correction without moving hardware.')
@@ -3396,6 +3747,8 @@ def run_inference(args: argparse.Namespace) -> int:
                     policy_observation,
                     camera_keys=required_image_keys,
                 )
+            if preview_sink is not None:
+                preview_sink.publish(policy_observation)
             if step_idx == 0 and args.debug_step0_dump_dir is not None:
                 if start_alignment_stats is None:
                     raise RuntimeError('start_alignment_stats must be initialized before step0 capture dump.')
@@ -3483,12 +3836,16 @@ def run_inference(args: argparse.Namespace) -> int:
                 previous_smoothed_command,
                 alpha=args.command_ema_alpha,
             )
-            safe_command, position_delta, rotation_delta, clamped = clamp_command_relative_to_current(
+            safe_command, command_guard = limit_command_for_safety(
                 robot_command,
                 robot_observation,
-                max_pos_delta_m=max_step_pos_delta_m,
-                max_rot_delta_rad=max_step_rot_delta_rad,
+                max_step_pos_delta_m=max_step_pos_delta_m,
+                max_step_rot_delta_rad=max_step_rot_delta_rad,
+                max_leash_pos_delta_m=max_leash_pos_delta_m,
+                max_leash_rot_delta_rad=max_leash_rot_delta_rad,
             )
+            position_delta = command_guard['position_delta']
+            rotation_delta = command_guard['rotation_delta']
             command_status = 'pass'
             command_to_send = safe_command
             if step_idx == 0:
@@ -3506,8 +3863,8 @@ def run_inference(args: argparse.Namespace) -> int:
                         f'pos_delta_mm=({_format_vector(first_position_delta, scale=1000.0)}) '
                         f'rot_delta_deg=({_format_vector(np.rad2deg(first_rotation_delta))})'
                     )
-            if command_status == 'pass' and clamped:
-                command_status = 'clamped'
+            if command_status == 'pass' and command_guard['status'] != 'pass':
+                command_status = command_guard['status']
 
             gripper_command_before_latch = float(command_to_send['gripper.pos'])
             command_to_send, gripper_latch_debug = apply_gripper_change_delay(
@@ -3546,7 +3903,7 @@ def run_inference(args: argparse.Namespace) -> int:
                     command_status=command_status,
                     position_delta=position_delta,
                     rotation_delta=rotation_delta,
-                    clamped=clamped,
+                    clamped=bool(command_guard['status'] != 'pass'),
                 )
 
             if interactive_keyboard is not None and interactive_keyboard.should_stop_rollout():
@@ -3592,6 +3949,11 @@ def run_inference(args: argparse.Namespace) -> int:
                         else (
                             f" pos_delta_mm=({_format_vector(position_delta, scale=1000.0)}) "
                             f"rot_delta_deg=({_format_vector(np.rad2deg(rotation_delta))})"
+                            # What the policy actually asked for, separate from the lag baked into
+                            # pos_delta_mm above. Reading only the combined number is what made a
+                            # closely-tracking rollout look like a runaway one.
+                            + f" step_mm={np.linalg.norm(command_guard['step_position_delta']) * 1000.0:.2f} "
+                            + f"step_deg={np.rad2deg(np.linalg.norm(command_guard['step_rotation_delta'])):.2f}"
                         )
                     )
                 )
@@ -3641,6 +4003,8 @@ def run_inference(args: argparse.Namespace) -> int:
             mujoco_visualizer.close()
         if args.camera_preview_window:
             close_camera_preview_window()
+        if preview_sink is not None:
+            preview_sink.close()
         robot.disconnect()
 
     return 0
