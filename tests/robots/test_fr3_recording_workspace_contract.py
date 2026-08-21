@@ -164,15 +164,32 @@ def test_most_of_the_fence_is_actually_reachable(robot_config):
     )
 
 
-def test_no_rotation_axis_is_pinned_off(record_config):
-    """The reason the frame was switched. Re-pinning them undoes it without touching the frame."""
+def test_yaw_is_the_rotation_axis_that_stays_live(record_config):
+    """Roll and pitch are pinned off on purpose; yaw is what keeps rotation teleop alive.
+
+    This test used to assert the opposite -- that no rotation axis was pinned -- because roll and
+    pitch had been disabled while the rig recorded about `pika_task_tcp`, where rotating swung the
+    fingertips through a 0.41 m arc, and switching to pika_gripper_ee is what made them usable
+    again. They are off again now by choice rather than by that constraint: the tasks being
+    recorded want the wrist to hold the orientation it starts an episode in, and two axes the
+    operator has to hold still are two axes of drift in the demonstrations.
+
+    So the guard moves rather than goes. Pinning all three would leave the SpaceMouse unable to
+    turn the tool at all, which is a different rig, not a tuning choice -- and a roll or pitch
+    entry that is neither absent nor exactly 0 is a half-edit, not a decision.
+    """
     teleop = record_config.get("teleop") or {}
-    for axis in ("scale_wx", "scale_wy", "scale_wz"):
-        assert teleop.get(axis) != 0, (
-            f"teleop.{axis} is pinned to 0. Roll and pitch were disabled because rotation about "
-            "pika_task_tcp swung the fingertips through a 0.41 m arc; recording against "
-            f"{EXPECTED_TARGET_FRAME} is what makes them usable. Turning them back off means the "
-            "frame switch bought nothing -- say why here if that is intended"
+    assert teleop.get("scale_wz") != 0, (
+        "teleop.scale_wz is pinned to 0, which leaves no rotation axis under the operator's "
+        f"control. Recording against {EXPECTED_TARGET_FRAME} is what makes tool rotation usable; "
+        "disabling all of it means the frame switch bought nothing -- say why here if intended"
+    )
+    for axis in ("scale_wx", "scale_wy"):
+        value = teleop.get(axis)
+        assert value is None or float(value) == 0.0, (
+            f"teleop.{axis} is set to {value!r}. Roll and pitch are meant to be locked off "
+            "(0.0) or handed back wholesale (absent, so they follow rotation_scale); a value in "
+            "between is a half-edit that nothing downstream reads as a decision"
         )
 
 

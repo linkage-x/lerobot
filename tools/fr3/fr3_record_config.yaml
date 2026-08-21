@@ -96,14 +96,18 @@ teleop:
   move_time: 0.02
   enable_rotation: true
   translation_scale: 0.000615
-  # All six axes follow the two globals. scale_wx/scale_wy used to be pinned to 0 because roll and
-  # pitch about pika_task_tcp threw the fingertips through a 0.41 m arc; at the tool point they are
-  # ordinary axes. 0.000648 rad/tick at control_fps 200 is 7.4 deg/s on roll at full deflection --
-  # a deliberately slow starting point. (Pitch and yaw land 5-8% under that: the teleoperator scales
-  # a global gain by ROTATION_AXIS_CALIBRATION, and TRANSLATION_AXIS_CALIBRATION takes z down to
-  # 59%. An explicitly set axis skips that factor.) Tune live from Teleoperation -> SpaceMouse 6D
-  # Gains and write the value you settle on back here.
+  # 0.000648 rad/tick at control_fps 200 is 7.4 deg/s on yaw at full deflection -- a deliberately
+  # slow starting point. (Yaw lands 7% under that: the teleoperator scales a global gain by
+  # ROTATION_AXIS_CALIBRATION, and TRANSLATION_AXIS_CALIBRATION takes z down to 59%. An explicitly
+  # set axis skips that factor.) Tune live from Teleoperation -> SpaceMouse 6D Gains and write the
+  # value you settle on back here.
   rotation_scale: 0.000648
+  # Roll and pitch are locked off, so the wrist keeps the orientation it starts an episode in and
+  # the SpaceMouse drives x/y/z plus yaw. 0.0 is not the same as leaving these blank: blank means
+  # "follow rotation_scale", 0.0 disables the axis outright. Blank them here to hand roll and pitch
+  # back.
+  scale_wx: 0.0
+  scale_wy: 0.0
 
 dataset:
   # Names the rig and how it is driven, nothing else. The task belongs to the episode
@@ -120,7 +124,7 @@ dataset:
   root: /lerobot/outputs/datasets/fr3_spacemouse
   fps: 60
   num_episodes: 20
-  episode_time_s: 10
+  episode_time_s: 20
   reset_time_s: 0
   video: true
   streaming_encoding: true
