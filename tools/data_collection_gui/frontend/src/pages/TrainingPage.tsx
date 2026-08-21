@@ -10,10 +10,11 @@ import type {
 import { Metric, PageHeader, StatusDot } from "../shared/ui";
 import { CheckpointBrowser } from "../shared/CheckpointBrowser";
 
-// Mirrors KNOWN_POLICY_TYPES in tools/fr3/fr3_train_il_policy.py. Split by what this repo
-// has actually tuned for the FR3 rig, because "selectable" and "has defaults worth using"
-// are different claims and the page should not blur them.
-const TUNED_POLICIES = ["act", "diffusion"] as const;
+// Mirrors KNOWN_POLICY_TYPES in tools/fr3/fr3_train_il_policy.py. Split by what has actually
+// been trained and rolled out on the FR3 rig, because "selectable" and "someone has seen this
+// work here" are different claims and the page should not blur them. Every type in both groups
+// starts from its own upstream defaults -- the split says nothing about hyperparameters.
+const VERIFIED_POLICIES = ["act", "diffusion"] as const;
 const OTHER_POLICIES = [
   "vqbet",
   "tdmpc",
@@ -74,7 +75,13 @@ export function TrainingPage() {
   const [numWorkers, setNumWorkers] = useState("4");
   const [saveFreq, setSaveFreq] = useState("5000");
   const [logFreq, setLogFreq] = useState("100");
-  const [useAmp, setUseAmp] = useState(true);
+  // Off, like upstream's `PreTrainedConfig.use_amp`. It used to default on here, which put a
+  // claim in every checkpoint's train_config.json that the run did not honour: lerobot_train.py
+  // never reads use_amp -- it wraps the step in `accelerator.autocast()` and builds its
+  // Accelerator without `mixed_precision=`, so the run is fp32 unless accelerate is configured
+  // separately. Two checkpoints would have looked like they differed in numeric precision when
+  // they did not. See the note under the box.
+  const [useAmp, setUseAmp] = useState(false);
   const [policyConfig, setPolicyConfig] = useState("");
 
   const [wandbEnabled, setWandbEnabled] = useState(false);
@@ -477,14 +484,14 @@ export function TrainingPage() {
           <label className="field">
             <span>Policy</span>
             <select value={policy} onChange={(event) => setPolicy(event.target.value)} disabled={isRunning}>
-              <optgroup label="Tuned for this rig">
-                {TUNED_POLICIES.map((name) => (
+              <optgroup label="Trained and rolled out on this rig">
+                {VERIFIED_POLICIES.map((name) => (
                   <option key={name} value={name}>
                     {name}
                   </option>
                 ))}
               </optgroup>
-              <optgroup label="Policy defaults apply — set --policy-config yourself">
+              <optgroup label="Never run here — check the config yourself">
                 {OTHER_POLICIES.map((name) => (
                   <option key={name} value={name}>
                     {name}
@@ -506,6 +513,12 @@ export function TrainingPage() {
             />
           </label>
         </div>
+        <p className="hint">
+          Starting appends a UTC timestamp to this name, so each run owns{" "}
+          <code>outputs/train/{jobName || "<job>"}__&lt;started-at&gt;</code> and retraining the
+          same view neither collides with the previous run nor overwrites its checkpoints. The
+          run&apos;s log file carries the same stamp.
+        </p>
 
         {policySupport && !policySupport.trainable && (
           <div className="banner banner-warn">
@@ -546,6 +559,10 @@ export function TrainingPage() {
             disabled={isRunning}
           />
         </label>
+        <p className="hint">
+          Left empty, {policy} trains on its own upstream LeRobot defaults (ACT: chunk_size 100,
+          n_action_steps 100, lr 1e-5). Anything typed here wins over them.
+        </p>
 
         <label className="field-inline">
           <input
@@ -556,6 +573,12 @@ export function TrainingPage() {
           />
           <span>Mixed precision (AMP)</span>
         </label>
+        <p className="hint">
+          Recorded into the checkpoint&apos;s config, but not acted on:{" "}
+          <code>lerobot_train.py</code> leaves precision to Accelerate and never passes it{" "}
+          <code>mixed_precision</code>, so training runs fp32 either way. Ticking this changes what
+          the run says about itself, not what it does.
+        </p>
 
         <div className="row-actions">
           <button type="button" onClick={() => void onStart()} disabled={startDisabled}>
