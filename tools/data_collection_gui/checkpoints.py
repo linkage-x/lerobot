@@ -407,8 +407,8 @@ def _rsync(paths: list[str], *, timeout_s: float) -> list[str]:
     return [line for line in result.stdout.splitlines() if line[:1] in ("<", ">", "c", "*")]
 
 
-def delete_checkpoint(repo_root: Path, checkpoint_id: str) -> dict[str, Any]:
-    """Remove one local checkpoint directory, freeing its weights and optimizer state.
+def remove_checkpoint_dir(repo_root: Path, checkpoint_id: str) -> int:
+    """Delete one local checkpoint directory; return the bytes it freed.
 
     Refuses `last`: it is a symlink the trainer maintains, and deleting it leaves a run whose
     newest checkpoint has no stable name while freeing nothing.
@@ -432,11 +432,67 @@ def delete_checkpoint(repo_root: Path, checkpoint_id: str) -> dict[str, Any]:
         raise CheckpointError(f"No checkpoint directory at {target}.")
     freed = sum(f.stat().st_size for f in resolved.rglob("*") if f.is_file())
     shutil.rmtree(resolved)
+    return freed
+
+
+def delete_checkpoint(repo_root: Path, checkpoint_id: str) -> dict[str, Any]:
+    """Remove one local checkpoint directory, freeing its weights and optimizer state."""
+    freed = remove_checkpoint_dir(repo_root, checkpoint_id)
     return {
         "ok": True,
         "checkpointId": checkpoint_id,
         "freedBytes": freed,
         "message": f"Deleted {checkpoint_id} and freed {freed / 1e6:.0f} MB.",
+    }
+
+
+def delete_checkpoints(repo_root: Path, checkpoint_ids: list[str]) -> dict[str, Any]:
+    """Remove several checkpoints, reporting each one's fate rather than stopping at the first.
+
+    Deliberately not all-or-nothing. The directories are independent, deleting one cannot make
+    deleting the next wrong, and there is nothing to roll back to once bytes are gone -- so a
+    batch that hits one bad id should still free the other nine and say which one it skipped.
+    Aborting instead would leave the operator to work out by hand which half went.
+
+    `ok` is False only when nothing at all was deleted, so a partly-successful batch reports the
+    space it freed *and* the ids it could not touch, instead of one hiding the other.
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw in checkpoint_ids:
+        candidate = str(raw).strip()
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            ordered.append(candidate)
+    if not ordered:
+        raise CheckpointError("No checkpoints were selected for deletion.")
+
+    deleted: list[str] = []
+    failed: list[dict[str, str]] = []
+    freed = 0
+    for checkpoint_id in ordered:
+        try:
+            freed += remove_checkpoint_dir(repo_root, checkpoint_id)
+        except (CheckpointError, OSError) as exc:
+            failed.append({"checkpointId": checkpoint_id, "error": str(exc)})
+            continue
+        deleted.append(checkpoint_id)
+
+    if deleted and failed:
+        message = (
+            f"Deleted {len(deleted)} checkpoint(s) and freed {freed / 1e6:.0f} MB; "
+            f"{len(failed)} could not be deleted."
+        )
+    elif deleted:
+        message = f"Deleted {len(deleted)} checkpoint(s) and freed {freed / 1e6:.0f} MB."
+    else:
+        message = f"Deleted nothing: all {len(failed)} selected checkpoint(s) failed."
+    return {
+        "ok": bool(deleted),
+        "deleted": deleted,
+        "failed": failed,
+        "freedBytes": freed,
+        "message": message,
     }
 
 

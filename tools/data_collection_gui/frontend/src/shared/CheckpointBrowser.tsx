@@ -82,6 +82,7 @@ export function CheckpointBrowser({
   const [query, setQuery] = useState("");
   const [hideBlocked, setHideBlocked] = useState(false);
   const [expanded, setExpanded] = useState<string>("");
+  const [selection, setSelection] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -120,6 +121,58 @@ export function CheckpointBrowser({
   );
 
   const isRemote = listing?.host?.kind === "remote";
+  // Delete reaches the gateway's own repo, so it is offered only for the machine the gateway
+  // runs on. A remote host's checkpoints are managed by fetching them here first.
+  const canBulkDelete = mode === "manage" && !isRemote;
+  // `last` is a symlink onto a numbered step: the backend refuses it, and letting it be ticked
+  // would put a row in the batch that can only ever come back as a failure.
+  const deletable = useMemo(() => checkpoints.filter((item) => !item.aliasOf), [checkpoints]);
+  const selectedBytes = useMemo(
+    () =>
+      deletable
+        .filter((item) => selection.includes(item.id))
+        .reduce((sum, item) => sum + item.sizeBytes, 0),
+    [deletable, selection]
+  );
+  const deletableBytes = useMemo(
+    () => deletable.reduce((sum, item) => sum + item.sizeBytes, 0),
+    [deletable]
+  );
+
+  // A tick is a claim about a row that is on screen. Switching machine, typing in the search
+  // box, or refreshing after a delete can retire any of them, and an id left behind would keep
+  // "Delete 4 selected" pointing at something the operator can no longer see.
+  useEffect(() => {
+    const visible = new Set(deletable.map((item) => item.id));
+    setSelection((current) => {
+      const next = current.filter((id) => visible.has(id));
+      return next.length === current.length ? current : next;
+    });
+  }, [deletable]);
+
+  const toggleOne = (id: string) =>
+    setSelection((current) =>
+      current.includes(id) ? current.filter((item) => item !== id) : [...current, id]
+    );
+
+  const allSelected = deletable.length > 0 && selection.length === deletable.length;
+
+  /** Every checkpoint of a job except its newest -- the batch this page is actually for.
+   *
+   * Keyed on the highest step per job rather than on mtime: a checkpoint fetched from a
+   * training host carries the mtime of the copy, which would nominate the wrong survivor.
+   */
+  const selectSuperseded = () => {
+    const newestStep = new Map<string, number>();
+    for (const item of deletable) {
+      newestStep.set(item.jobName, Math.max(newestStep.get(item.jobName) ?? -1, item.step));
+    }
+    setSelection(
+      deletable
+        .filter((item) => item.step < (newestStep.get(item.jobName) ?? item.step))
+        .map((item) => item.id)
+    );
+  };
 
   const onFetch = async (checkpoint: Checkpoint) => {
     setBusy(true);
@@ -149,6 +202,39 @@ export function CheckpointBrowser({
     }
     setNotice(result.message || "Checkpoint deleted.");
     if (selectedId === checkpoint.id) onSelect?.(null);
+    await refresh(hostId);
+  };
+
+  const onDeleteSelected = async () => {
+    const targets = deletable.filter((item) => selection.includes(item.id));
+    if (targets.length === 0) return;
+    const bytes = targets.reduce((sum, item) => sum + item.sizeBytes, 0);
+    if (
+      !window.confirm(
+        `Delete ${targets.length} checkpoint(s)? This frees ${formatBytes(bytes)} and cannot be undone.`
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setNotice("");
+    const result = await api.deleteCheckpoints(targets.map((item) => item.id));
+    setBusy(false);
+    const failed = result.failed ?? [];
+    // A batch reports per checkpoint, so both halves are shown: the space actually reclaimed,
+    // and the ids that survived. Collapsing it to one banner would hide whichever came second.
+    if (failed.length > 0) {
+      setError(failed.map((item) => `${item.checkpointId}: ${item.error}`).join(" · "));
+    } else if (!result.ok) {
+      setError(result.error || "Bulk delete failed.");
+    }
+    const deleted = result.deleted ?? [];
+    if (deleted.length > 0) {
+      setNotice(result.message || `Deleted ${deleted.length} checkpoint(s).`);
+      if (selectedId && deleted.includes(selectedId)) onSelect?.(null);
+    }
+    setSelection([]);
     await refresh(hostId);
   };
 
@@ -191,7 +277,51 @@ export function CheckpointBrowser({
       </div>
 
       {error && <div className="banner banner-error">{error}</div>}
-      {notice && !error && <div className="banner banner-ok">{notice}</div>}
+      {notice && <div className="banner banner-ok">{notice}</div>}
+
+      {canBulkDelete && deletable.length > 0 && (
+        <div className="row-actions checkpoint-bulk">
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={allSelected}
+              ref={(node) => {
+                if (node) node.indeterminate = selection.length > 0 && !allSelected;
+              }}
+              disabled={disabled || busy}
+              onChange={() => setSelection(allSelected ? [] : deletable.map((item) => item.id))}
+            />
+            <span>Select all {deletable.length} shown</span>
+          </label>
+          <button type="button" onClick={selectSuperseded} disabled={disabled || busy}>
+            Select superseded
+          </button>
+          <button
+            type="button"
+            onClick={() => setSelection([])}
+            disabled={disabled || busy || selection.length === 0}
+          >
+            Clear
+          </button>
+          <button
+            type="button"
+            className="danger"
+            disabled={disabled || busy || selection.length === 0}
+            onClick={() => void onDeleteSelected()}
+          >
+            {busy && selection.length > 0
+              ? "Deleting…"
+              : selection.length === 0
+                ? "Delete selected"
+                : `Delete ${selection.length} · ${formatBytes(selectedBytes)}`}
+          </button>
+          <span className="bulk-summary">
+            {selection.length === 0
+              ? `${deletable.length} deletable · ${formatBytes(deletableBytes)}`
+              : `${selection.length} of ${deletable.length} ticked`}
+          </span>
+        </div>
+      )}
 
       {listing?.rig && (
         <p className="hint">
@@ -214,7 +344,7 @@ export function CheckpointBrowser({
         <table className="table checkpoint-table">
           <thead>
             <tr>
-              {mode === "picker" && <th aria-label="select" />}
+              {(mode === "picker" || canBulkDelete) && <th aria-label="select" />}
               <th>Checkpoint</th>
               <th>Policy</th>
               <th>Dataset</th>
@@ -245,6 +375,20 @@ export function CheckpointBrowser({
                         disabled={disabled}
                         onChange={() => onSelect?.(checkpoint)}
                       />
+                    </td>
+                  )}
+                  {canBulkDelete && (
+                    <td>
+                      {!checkpoint.aliasOf && (
+                        <input
+                          type="checkbox"
+                          aria-label={`select ${checkpoint.id}`}
+                          checked={selection.includes(checkpoint.id)}
+                          disabled={disabled || busy}
+                          onClick={(event) => event.stopPropagation()}
+                          onChange={() => toggleOne(checkpoint.id)}
+                        />
+                      )}
                     </td>
                   )}
                   <td>
@@ -312,7 +456,7 @@ export function CheckpointBrowser({
                 </tr>,
                 isExpanded ? (
                   <tr key={`${checkpoint.id}-detail`} className="detail-row">
-                    <td colSpan={mode === "picker" ? 8 : 7}>
+                    <td colSpan={mode === "picker" || canBulkDelete ? 8 : 7}>
                       <CheckpointDetail checkpoint={checkpoint} />
                     </td>
                   </tr>
@@ -329,7 +473,7 @@ export function CheckpointBrowser({
           {formatBytes(totalBytes)} on {listing?.host.label}.{" "}
           {isRemote
             ? "Fetch one here before rolling it out — the robot and its cameras are on this machine."
-            : "Intermediate checkpoints can be deleted once a later one is proven better."}
+            : "Intermediate checkpoints can be deleted once a later one is proven better — “Select superseded” ticks every step of each job except its newest."}
         </p>
       )}
     </div>

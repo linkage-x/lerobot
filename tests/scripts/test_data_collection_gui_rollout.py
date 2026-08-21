@@ -378,6 +378,74 @@ def test_deleting_a_checkpoint_that_is_not_there_is_an_operator_error(tmp_path: 
         checkpoint_backend.delete_checkpoint(tmp_path, "job_a/020000")
 
 
+def test_a_batch_delete_frees_every_checkpoint_it_names(tmp_path: Path):
+    view = _make_view(tmp_path, "v1")
+    for step in ("005000", "010000", "015000"):
+        _make_checkpoint(tmp_path, "job_a", step, view)
+
+    result = checkpoint_backend.delete_checkpoints(
+        tmp_path, ["job_a/005000", "job_a/010000", "job_a/015000"]
+    )
+
+    assert result["ok"] is True
+    assert result["deleted"] == ["job_a/005000", "job_a/010000", "job_a/015000"]
+    assert result["failed"] == []
+    assert result["freedBytes"] > 3000
+    assert list((tmp_path / "outputs" / "train" / "job_a" / "checkpoints").iterdir()) == []
+
+
+def test_a_batch_delete_keeps_going_past_the_one_it_cannot_delete(tmp_path: Path):
+    """The bytes of a good checkpoint should not be held hostage by a bad id next to it.
+
+    Nothing about deleting one directory makes deleting the next one wrong, and there is no
+    undo once they are gone -- so the batch reports per id instead of aborting and leaving the
+    operator to work out by hand which half went.
+    """
+    view = _make_view(tmp_path, "v1")
+    _make_checkpoint(tmp_path, "job_a", "005000", view)
+    _make_checkpoint(tmp_path, "job_a", "015000", view)
+    (tmp_path / "outputs" / "train" / "job_a" / "checkpoints" / "last").symlink_to("015000")
+
+    result = checkpoint_backend.delete_checkpoints(
+        tmp_path, ["job_a/005000", "job_a/last", "job_a/999999", "../escape/x"]
+    )
+
+    assert result["ok"] is True
+    assert result["deleted"] == ["job_a/005000"]
+    assert [item["checkpointId"] for item in result["failed"]] == [
+        "job_a/last",
+        "job_a/999999",
+        "../escape/x",
+    ]
+    assert not (tmp_path / "outputs" / "train" / "job_a" / "checkpoints" / "005000").exists()
+    assert (tmp_path / "outputs" / "train" / "job_a" / "checkpoints" / "015000").is_dir()
+
+
+def test_a_batch_that_deletes_nothing_is_not_reported_as_success(tmp_path: Path):
+    result = checkpoint_backend.delete_checkpoints(tmp_path, ["job_a/005000"])
+
+    assert result["ok"] is False
+    assert result["deleted"] == []
+    assert result["freedBytes"] == 0
+
+
+def test_a_batch_delete_ignores_a_repeated_id_rather_than_failing_on_the_second(tmp_path: Path):
+    view = _make_view(tmp_path, "v1")
+    _make_checkpoint(tmp_path, "job_a", "005000", view)
+
+    result = checkpoint_backend.delete_checkpoints(
+        tmp_path, ["job_a/005000", "job_a/005000", " "]
+    )
+
+    assert result["deleted"] == ["job_a/005000"]
+    assert result["failed"] == []
+
+
+def test_an_empty_batch_is_refused_rather_than_reported_as_a_no_op(tmp_path: Path):
+    with pytest.raises(checkpoint_backend.CheckpointError, match="No checkpoints were selected"):
+        checkpoint_backend.delete_checkpoints(tmp_path, [])
+
+
 def test_fetch_refuses_a_local_host(tmp_path: Path):
     host = training_backend.local_host(tmp_path)
 

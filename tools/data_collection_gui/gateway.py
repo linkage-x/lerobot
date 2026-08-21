@@ -466,8 +466,9 @@ def _teleop_config(config: dict[str, Any]) -> dict[str, Any]:
 # The SpaceMouse's 6D gain surface, in the order the UI shows it. `translation_scale` and
 # `rotation_scale` are the global gains; the six per-axis entries override them one axis at a time
 # and are `None` when unset, which is how SpaceMouseTeleopConfig asks for "use the global". A 0.0 is
-# therefore *not* the same as unset -- it disables that axis, which is how this rig ran roll and
-# pitch until it switched to recording against pika_gripper_ee.
+# therefore *not* the same as unset -- it disables that axis, which is how this rig runs roll and
+# pitch: fr3_record_config.yaml pins scale_wx/scale_wy to 0 so the wrist holds the orientation an
+# episode starts in, leaving x/y/z and yaw under the SpaceMouse.
 FR3_TELEOP_GLOBAL_GAINS = ("translation_scale", "rotation_scale")
 FR3_TELEOP_AXIS_GAINS = ("scale_x", "scale_y", "scale_z", "scale_wx", "scale_wy", "scale_wz")
 FR3_TELEOP_GAIN_FIELDS = FR3_TELEOP_GLOBAL_GAINS + FR3_TELEOP_AXIS_GAINS
@@ -4665,6 +4666,27 @@ def _restore_training_run(state: GatewayState) -> None:
     ).start()
 
 
+def _unique_job_name(repo_root: Path, base: str) -> str:
+    """`base`, or the first `base-N` no run directory has taken yet.
+
+    The timestamp in `base` already separates any two runs a person starts, because a person
+    cannot click twice inside one second. This closes the rest of the gap: a run that dies during
+    startup and is restarted by a script within the same second would land on the directory the
+    dead one left behind, and the operator would be back to reading a FileExistsError from
+    lerobot_train -- the exact failure the stamp exists to remove.
+
+    Exact for the host this gateway runs on, which is where `local` training writes. A remote
+    host's outputs/train is not visible from here, so there the timestamp is the whole guarantee.
+    """
+    train_root = repo_root / "outputs" / "train"
+    candidate = base
+    suffix = 2
+    while (train_root / candidate).exists():
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    return candidate
+
+
 def _start_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
     if _training_is_running(state):
         raise ValueError("A training run is already in progress; stop it before starting another.")
@@ -4679,9 +4701,23 @@ def _start_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[st
         raise ValueError(f"{view_name} has no episodes to train on.")
 
     policy = str(payload.get("policy") or "act").strip() or "act"
-    job_name = str(payload.get("jobName") or "").strip() or f"{view_name}__{policy}"
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", job_name):
+    run_name = str(payload.get("jobName") or "").strip() or f"{view_name}__{policy}"
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", run_name):
         raise ValueError("Job name may only contain letters, digits, '.', '_' and '-'.")
+    # Every start gets its own directory, by construction rather than by the operator
+    # remembering to rename. lerobot_train refuses to run when its output_dir already exists and
+    # it is not resuming (src/lerobot/configs/train.py), and upstream stays clear of that by
+    # timestamping the path it picks. This helper overrides output_dir with
+    # outputs/train/<job_name>, and the name above is a function of (view, policy) -- two
+    # coordinates that are *meant* to hold still while you retrain the same data with more steps
+    # or a different chunk size. So the second run of any view collided by construction, and the
+    # only advice the error could give was "rename it yourself".
+    #
+    # Same stamp as the log file below on purpose: the run directory and the log that recorded it
+    # are the two halves an operator pairs up afterwards, and a second `datetime.now()` would
+    # drift them apart across a midnight or a slow sync.
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    job_name = _unique_job_name(state.repo_root, f"{run_name}__{stamp}")
 
     # A remote host trains from its own checkout, so the code it runs is whatever was last
     # synced there. Doing it here rather than leaving it to the operator is the difference
@@ -4741,8 +4777,7 @@ def _start_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[st
 
     log_dir = state.repo_root / "outputs" / "logs" / "training"
     log_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    log_path = log_dir / f"train_{job_name}_{stamp}.log"
+    log_path = log_dir / f"train_{job_name}.log"
 
     # The run's output goes straight to the log file, not through a pipe this gateway holds.
     # With a pipe, the gateway's death closes the read end and the trainer takes SIGPIPE on its
@@ -4884,6 +4919,37 @@ def _checkpoint_entries(state: GatewayState, host_id: str) -> dict[str, Any]:
 def _rollout_is_running(state: GatewayState) -> bool:
     process = state.rollout_process
     return process is not None and process.poll() is None
+
+
+def _guard_checkpoint_deletion(state: GatewayState, checkpoint_ids: list[str]) -> None:
+    """Refuse to delete weights that something on this machine is still holding.
+
+    Two live holders, and neither fails loudly when the directory disappears underneath it. A
+    rollout has already loaded the policy, so it keeps driving the arm from weights that are no
+    longer on disk and only the next restart reveals what happened. A training run owns the job
+    directory it is still saving steps into, and deleting one of them leaves a run whose
+    checkpoint series has a hole in it.
+
+    Checked here rather than in the backend because liveness is gateway state, not disk state.
+    One click could always do this to a single checkpoint; select-all makes it one click for
+    every checkpoint at once, which is what turns a sharp edge into a guard worth having.
+    """
+    ids = {item for item in checkpoint_ids if item}
+    if not ids:
+        return
+    if _rollout_is_running(state) and state.rollout.checkpointId in ids:
+        raise checkpoint_backend.CheckpointError(
+            f"{state.rollout.checkpointId} is loaded by the rollout running right now. "
+            "Stop it on the Rollout page before deleting it."
+        )
+    if _training_is_running(state):
+        job_name = state.training.jobName
+        live = sorted(item for item in ids if item.split("/", 1)[0] == job_name)
+        if live:
+            raise checkpoint_backend.CheckpointError(
+                f"{job_name} is training right now and still writing checkpoints; "
+                f"{', '.join(live)} belong(s) to it. Stop the run first."
+            )
 
 
 def _apply_rollout_output(state: GatewayState, line: str) -> None:
@@ -12055,9 +12121,25 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.OK, result)
                     return
                 if path == "/api/checkpoints/delete":
-                    result = checkpoint_backend.delete_checkpoint(
-                        state.repo_root, str(body.get("checkpointId") or "")
+                    checkpoint_id = str(body.get("checkpointId") or "")
+                    with state.lock:
+                        _guard_checkpoint_deletion(state, [checkpoint_id])
+                    result = checkpoint_backend.delete_checkpoint(state.repo_root, checkpoint_id)
+                    with state.lock:
+                        state.log("warn", result["message"])
+                    _json_response(self, HTTPStatus.OK, result)
+                    return
+                if path == "/api/checkpoints/delete-many":
+                    raw_ids = body.get("checkpointIds")
+                    checkpoint_ids = (
+                        [str(item) for item in raw_ids] if isinstance(raw_ids, list) else []
                     )
+                    # Guarded before the first rmtree, not per id: a batch that includes the
+                    # running job should be refused whole, rather than half-deleted and then
+                    # stopped at the one that mattered.
+                    with state.lock:
+                        _guard_checkpoint_deletion(state, checkpoint_ids)
+                    result = checkpoint_backend.delete_checkpoints(state.repo_root, checkpoint_ids)
                     with state.lock:
                         state.log("warn", result["message"])
                     _json_response(self, HTTPStatus.OK, result)

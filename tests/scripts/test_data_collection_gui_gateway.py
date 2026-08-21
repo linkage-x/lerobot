@@ -4418,3 +4418,156 @@ def test_single_file_dataset_still_falls_back_to_the_newest_file(tmp_path):
 
     assert meta["dataStatus"] == "loaded"
     assert points
+
+
+# ------------------------------------------------------- training run identity ---
+
+
+class _FakeTrainProcess:
+    pid = 9911
+
+    def poll(self):
+        return None
+
+
+def _training_start_state(tmp_path: Path, monkeypatch) -> gateway.GatewayState:
+    """A gateway that can start a training run without a GPU, a view on disk, or a subprocess."""
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(repoId="local/test", datasetRoot=str(tmp_path)),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path / "outputs" / "datasets",
+    )
+    view_root = tmp_path / "outputs" / "exports" / "training_views" / "pick__delta_ee_from_prev_cmd"
+    view_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        gateway,
+        "_training_view_entries",
+        lambda _state: [
+            {
+                "name": "pick__delta_ee_from_prev_cmd",
+                "root": str(view_root),
+                "repoId": "local/pick",
+                "episodes": 12,
+                "frames": 4000,
+                "fps": 30,
+                "actionMode": "delta_ee_from_prev_cmd",
+                "cameras": ["observation.images.cam_1"],
+            }
+        ],
+    )
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda *args, **kwargs: _FakeTrainProcess())
+    monkeypatch.setattr(gateway, "Thread", lambda *args, **kwargs: SimpleNamespace(start=lambda: None))
+    return state
+
+
+def test_a_run_is_named_for_when_it_started_not_just_for_what_it_trains(tmp_path, monkeypatch):
+    # lerobot_train refuses to start when output_dir already exists and it is not resuming, and
+    # this helper pins output_dir to outputs/train/<job_name>. The GUI's default job name was a
+    # function of (view, policy) -- exactly the two things that stay the same when you retrain
+    # the same data for more steps -- so the second run failed by construction and the only
+    # remedy on offer was "rename it yourself".
+    state = _training_start_state(tmp_path, monkeypatch)
+    monkeypatch.setattr(gateway, "_training_is_running", lambda _state: False)
+
+    run = gateway._start_training_run(
+        state, {"viewName": "pick__delta_ee_from_prev_cmd", "policy": "act"}
+    )["training"]
+
+    assert re.fullmatch(r"pick__delta_ee_from_prev_cmd__act__\d{8}_\d{6}", run["jobName"])
+    assert run["outputDir"] == f"outputs/train/{run['jobName']}"
+    # The log file is keyed off the same stamp, so a run directory and the log that recorded it
+    # can still be paired up afterwards.
+    assert Path(run["logPath"]).name == f"train_{run['jobName']}.log"
+
+
+def test_a_restart_within_the_same_second_does_not_reuse_the_dead_runs_directory(
+    tmp_path, monkeypatch
+):
+    # The stamp separates any two runs a person starts. This is the rest of it: a run that dies
+    # on startup and is restarted by a script inside the same second would otherwise be handed
+    # the directory the dead one already created, which is the FileExistsError all over again.
+    state = _training_start_state(tmp_path, monkeypatch)
+    monkeypatch.setattr(gateway, "_training_is_running", lambda _state: False)
+    payload = {"viewName": "pick__delta_ee_from_prev_cmd", "policy": "act"}
+
+    first = gateway._start_training_run(state, payload)["training"]
+    # Stand in for the trainer, which creates its output directory as soon as it starts.
+    (tmp_path / first["outputDir"]).mkdir(parents=True)
+    second = gateway._start_training_run(state, payload)["training"]
+
+    assert second["outputDir"] != first["outputDir"]
+    # The invariant lerobot_train actually checks: the directory it is told to write must not
+    # already be there.
+    assert not (tmp_path / second["outputDir"]).exists()
+
+
+def test_a_typed_job_name_is_stamped_too_rather_than_colliding_on_the_second_start(
+    tmp_path, monkeypatch
+):
+    state = _training_start_state(tmp_path, monkeypatch)
+    monkeypatch.setattr(gateway, "_training_is_running", lambda _state: False)
+
+    run = gateway._start_training_run(
+        state, {"viewName": "pick__delta_ee_from_prev_cmd", "policy": "act", "jobName": "chunk100"}
+    )["training"]
+
+    assert run["jobName"].startswith("chunk100__")
+    assert re.fullmatch(r"chunk100__\d{8}_\d{6}", run["jobName"])
+
+
+def test_a_job_name_with_characters_a_path_cannot_carry_is_still_refused(tmp_path, monkeypatch):
+    state = _training_start_state(tmp_path, monkeypatch)
+    monkeypatch.setattr(gateway, "_training_is_running", lambda _state: False)
+
+    with pytest.raises(ValueError, match="letters, digits"):
+        gateway._start_training_run(
+            state,
+            {"viewName": "pick__delta_ee_from_prev_cmd", "policy": "act", "jobName": "../escape"},
+        )
+
+
+# ------------------------------------------------------ checkpoint delete guard ---
+
+
+def _delete_guard_state(tmp_path: Path) -> gateway.GatewayState:
+    return gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(repoId="local/test", datasetRoot=str(tmp_path)),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path / "outputs" / "datasets",
+    )
+
+
+def test_the_checkpoint_a_running_rollout_loaded_cannot_be_deleted(tmp_path):
+    # The rollout has the weights in memory, so deleting them does not stop it: it keeps driving
+    # the arm from a directory that is no longer there, and nothing says so until the next start.
+    state = _delete_guard_state(tmp_path)
+    state.rollout_process = _FakeTrainProcess()
+    state.rollout.checkpointId = "job_a/050000"
+
+    with pytest.raises(gateway.checkpoint_backend.CheckpointError, match="rollout running"):
+        gateway._guard_checkpoint_deletion(state, ["job_b/010000", "job_a/050000"])
+
+
+def test_the_job_that_is_training_right_now_keeps_its_checkpoints(tmp_path):
+    state = _delete_guard_state(tmp_path)
+    state.training_process = _FakeTrainProcess()
+    state.training.jobName = "job_a__20260821_094500"
+
+    with pytest.raises(gateway.checkpoint_backend.CheckpointError, match="training right now"):
+        gateway._guard_checkpoint_deletion(
+            state, ["job_a__20260821_094500/010000", "job_b/010000"]
+        )
+
+
+def test_the_guard_does_not_stand_in_the_way_of_a_finished_run(tmp_path):
+    state = _delete_guard_state(tmp_path)
+    state.training_process = _FakeTrainProcess()
+    state.training.jobName = "job_a__20260821_094500"
+
+    gateway._guard_checkpoint_deletion(state, ["job_b/010000", "job_c/020000"])

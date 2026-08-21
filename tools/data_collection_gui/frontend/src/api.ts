@@ -917,6 +917,17 @@ export class DataCollectionGuiApi {
     });
   }
 
+  // Separate route rather than a list on /delete: the batch answers per checkpoint, so its
+  // reply carries `failed` alongside `freedBytes` and the caller has to render both.
+  async deleteCheckpoints(checkpointIds: string[]) {
+    return this.trainingPost<{
+      deleted?: string[];
+      failed?: { checkpointId: string; error: string }[];
+      freedBytes?: number;
+      message?: string;
+    }>("/api/checkpoints/delete-many", { checkpointIds });
+  }
+
   async fetchRolloutStatus(): Promise<RolloutStatusPayload | null> {
     return this.trainingGet<RolloutStatusPayload>("/api/rollout/status");
   }
