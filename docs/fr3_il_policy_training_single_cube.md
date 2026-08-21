@@ -144,8 +144,8 @@ ACT arguments:
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `--act-chunk-size` | `30` | Number of future actions supervised and predicted per ACT query. |
-| `--act-n-action-steps` | `30` | Number of predicted chunk actions consumed before the next policy query. Must be <= `--act-chunk-size`. |
+| `--act-chunk-size` | `100` | Number of future actions supervised and predicted per ACT query. Upstream `ACTConfig` default. |
+| `--act-n-action-steps` | `100` | Number of predicted chunk actions consumed before the next policy query. Must be <= `--act-chunk-size`. Upstream `ACTConfig` default. |
 | `--act-lr` | `1e-5` | ACT optimizer learning rate. |
 | `--act-lr-backbone` | `1e-5` | Vision backbone learning rate saved into the ACT config. |
 | `--act-pretrained-backbone-weights` | `ResNet18_Weights.IMAGENET1K_V1` | Torchvision ResNet18 initialization for ACT image encoder. |
@@ -157,7 +157,7 @@ Diffusion Policy arguments:
 | `--dp-n-obs-steps` | `2` | Number of observation timesteps loaded for each policy sample. |
 | `--dp-horizon` | `16` | Action sequence horizon used by the diffusion model. Must be compatible with the model downsampling factor. |
 | `--dp-n-action-steps` | `8` | Number of generated actions used per inference query. |
-| `--dp-resize-shape` | `224,224` | DP-internal image resize as `H,W`. Prefer `--image-resize-shape` for real-robot work because it is shared by training metadata, dataloader, and inference. If `--image-resize-shape` is set, this DP-internal resize is disabled to avoid double resizing. |
+| `--dp-resize-shape` | *(empty)* | DP-internal image resize as `H,W`. Empty is upstream's `DiffusionConfig` default: no DP-internal resize. Prefer `--image-resize-shape` for real-robot work because it is shared by training metadata, dataloader, and inference. If `--image-resize-shape` is set, this DP-internal resize is disabled to avoid double resizing. |
 | `--dp-lr` | `1e-4` | Diffusion Policy optimizer learning rate. |
 
 Training arguments:

@@ -7,11 +7,13 @@ LeRobot training entrypoint on that view.
 
 ``--policy`` accepts any type the LeRobot registry knows (``act``, ``diffusion``,
 ``smolvla``, ``pi0``, ``pi05``, ``groot``, ``xvla``, ``wall_x``, ``vqbet``, ...).
-Only ``act`` and ``diffusion`` carry tuned defaults here, because they are the only
-two this rig has measured. Every other type is emitted with the common training keys
-only, so the policy's own dataclass defaults apply, and ``--policy-config`` is the
-single place to override them -- inventing hyperparameters for a policy nobody has
-run on this rig would be a guess wearing the costume of a default.
+Only ``act`` and ``diffusion`` get dedicated hyperparameter flags, and those flags
+default to the upstream policy dataclass values (ACT ``chunk_size`` 100, diffusion
+``horizon`` 16, ...), so a run nobody overrode trains what LeRobot itself would train.
+Every other type is emitted with the common training keys only, so its own dataclass
+defaults apply. ``--policy-config`` overrides either, and is the single place a
+rig-specific number belongs: a value that suited one recording, left standing as the
+default for every later one, is a guess wearing the costume of a default.
 """
 
 from __future__ import annotations
@@ -58,9 +60,11 @@ DEFAULT_DERIVED_ACTION = Path("derived/hikon_cube_tracking_in_robot_base/action.
 DEFAULT_ACTION_APPEND_SELECTORS = "observation.state_raw:handheld_gripper.pika_left.width_mm"
 DEFAULT_ACTION_APPEND_NAMES = "gripper"
 
-# Types this script has tuned defaults for. Everything else is still accepted -- it is
-# validated against the LeRobot registry at run time, not against this list.
-TUNED_POLICY_TYPES = ("act", "diffusion")
+# Types with dedicated hyperparameter flags below. Those flags default to the upstream
+# dataclass values, so being on this list changes how a type can be overridden, not what
+# it trains untouched. Everything else is still accepted -- it is validated against the
+# LeRobot registry at run time, not against this list.
+FLAGGED_POLICY_TYPES = ("act", "diffusion")
 # Advertised in --help and by the GUI. Kept as a literal because resolving it needs
 # lerobot.policies.factory, and importing that to print a usage string would make
 # `--help` depend on every policy's optional dependencies.
@@ -1252,11 +1256,13 @@ def _summarize_delta_reports(
 def build_policy_section(args: argparse.Namespace, image_resize_shape: list[int] | None) -> dict[str, Any]:
     """The `policy` block of the generated train config.
 
-    `act` and `diffusion` get the defaults this rig tuned. Any other type gets the
-    common keys only: its own dataclass defaults are the closest thing to a measured
-    value that exists for it here, and overriding them with numbers borrowed from ACT
-    would be worse than not overriding them at all. `--policy-config` is applied last
-    so an operator who *has* measured something can say so.
+    `act` and `diffusion` are spelled out explicitly, from flags that default to the
+    upstream dataclass values -- writing them into the generated config records what the
+    run used without changing it. Any other type gets the common keys only: its own
+    dataclass defaults are the closest thing to a measured value that exists for it here,
+    and overriding them with numbers borrowed from ACT would be worse than not overriding
+    them at all. `--policy-config` is applied last so an operator who *has* measured
+    something can say so.
     """
     policy: dict[str, Any] = {
         "type": args.policy,
@@ -1646,9 +1652,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Policy type to train. Any type in the LeRobot registry is accepted; known ones are "
             + ", ".join(KNOWN_POLICY_TYPES)
             + ". Only "
-            + " and ".join(TUNED_POLICY_TYPES)
-            + " carry tuned defaults here -- for the rest, the policy's own dataclass defaults "
-            "apply and --policy-config is where you override them."
+            + " and ".join(FLAGGED_POLICY_TYPES)
+            + " have dedicated hyperparameter flags, and those default to the upstream policy "
+            "dataclass values; for the rest, the policy's own dataclass defaults apply. "
+            "--policy-config overrides either."
         ),
     )
     parser.add_argument(
@@ -1767,9 +1774,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr-decay-steps", type=int, default=None)
     parser.add_argument("--lr-decay-final-lr", type=float, default=None)
 
+    # Every default below is the upstream one, copied from ACTConfig and DiffusionConfig in
+    # src/lerobot/policies/{act,diffusion}/configuration_*.py. The flags exist so a measured
+    # value can be named on the command line, not so this script can hold an opinion the
+    # policy's authors do not: a helper default that quietly differs from the library's turns
+    # every "I ran ACT" into "I ran something near ACT", and the difference only surfaces
+    # after the checkpoint disappoints. Change one here only to follow upstream changing it.
     parser.add_argument("--vision-backbone", default="resnet18")
-    parser.add_argument("--act-chunk-size", type=int, default=30)
-    parser.add_argument("--act-n-action-steps", type=int, default=30)
+    parser.add_argument("--act-chunk-size", type=int, default=100)
+    parser.add_argument("--act-n-action-steps", type=int, default=100)
     parser.add_argument("--act-lr", type=float, default=1e-5)
     parser.add_argument("--act-lr-backbone", type=float, default=1e-5)
     parser.add_argument("--act-pretrained-backbone-weights", default="ResNet18_Weights.IMAGENET1K_V1")
@@ -1777,7 +1790,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dp-n-obs-steps", type=int, default=2)
     parser.add_argument("--dp-horizon", type=int, default=16)
     parser.add_argument("--dp-n-action-steps", type=int, default=8)
-    parser.add_argument("--dp-resize-shape", default="224,224")
+    parser.add_argument(
+        "--dp-resize-shape",
+        default="",
+        metavar="H,W",
+        help=(
+            "DP-internal image resize as H,W. Empty is upstream's default: no DP-internal "
+            "resize. Prefer --image-resize-shape for real-robot work, because that one is "
+            "shared by training metadata, dataloader and inference; setting it disables this "
+            "resize so images are not resized twice."
+        ),
+    )
     parser.add_argument("--dp-lr", type=float, default=1e-4)
     return parser
 
