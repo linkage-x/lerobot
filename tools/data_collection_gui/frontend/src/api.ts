@@ -13,6 +13,7 @@ import type {
   BoxCaliLog,
   EventLogItem,
   GatewayStatus,
+  IntrinsicsCoverageResponse,
   ProcessingItem,
   ProcessingStatus,
   RecordedDataset,
@@ -860,6 +861,20 @@ export class DataCollectionGuiApi {
       return { ...payload, ok: response.ok && payload.ok !== false };
     } catch (error) {
       return { ok: false, error: String(error), report: null };
+    }
+  }
+
+  async fetchIntrinsicsCoverage(): Promise<IntrinsicsCoverageResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/intrinsics-coverage`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as IntrinsicsCoverageResponse;
+    } catch {
+      return null;
     }
   }
 

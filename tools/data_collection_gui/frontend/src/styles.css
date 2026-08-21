@@ -491,6 +491,20 @@ button.danger {
   overflow-wrap: anywhere;
 }
 
+/* Column captions for tables whose numbers need a unit to be readable. */
+.check-row-head {
+  background: #f6f8fa;
+  min-height: 34px;
+}
+
+.check-row-head strong,
+.check-row-head span,
+.check-row-head em {
+  color: #60707c;
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .check-row em {
   color: #60707c;
   font-style: normal;

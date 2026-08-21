@@ -3819,3 +3819,77 @@ def test_coverage_annotation_survives_a_report_it_cannot_read(tmp_path):
     cameras = [{"id": "cam_06", "reprojectionPx": 0.2, "status": "pass"}]
     gateway._annotate_intrinsics_coverage(cameras, tmp_path / "missing.json")
     assert cameras == [{"id": "cam_06", "reprojectionPx": 0.2, "status": "pass"}]
+
+
+def _intrinsics_gateway_state(tmp_path: Path, run: str) -> gateway.GatewayState:
+    state = _marker_tcp_gateway_state(tmp_path)
+    state.calibration.intrinsicsRun = run
+    return state
+
+
+def _write_producer_intrinsics(
+    root: Path, camera: str, *, coverage: float | None, fold_deg: float, corner_deg: float
+) -> None:
+    directory = root / "converted" / f"{camera}_SERIAL"
+    directory.mkdir(parents=True, exist_ok=True)
+    payload: dict = {
+        "camera_name": camera,
+        "camera_serial": "SERIAL",
+        "image_width": 1920,
+        "image_height": 1080,
+        "camera_matrix": [[1000.0, 0.0, 960.0], [0.0, 1000.0, 540.0], [0.0, 0.0, 1.0]],
+        "dist_coeffs": [[-0.07, -0.005, 0.001, 0.0]],
+        "model": "opencv_fisheye",
+    }
+    if coverage is not None:
+        payload["self_calibration"] = {
+            "observed_radius_fraction": coverage,
+            "radial_fold_deg": fold_deg,
+            "corner_bearing_deg": corner_deg,
+            "frames_used": 200,
+            "heldout_time_block_rmse_px": 0.16,
+        }
+    (directory / "intrinsics_producer.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_intrinsics_coverage_reports_each_camera_against_the_target(tmp_path):
+    run = "thor_gmsl2_selfcal_0804_fisheye_intrinsics"
+    root = tmp_path / "outputs" / "calibration" / run
+    # cam_06 as it really is in the 0804 production set: short of the recapture
+    # floor and folding only 2.1 deg outside its own corner.
+    _write_producer_intrinsics(root, "cam_06", coverage=0.7876, fold_deg=80.23, corner_deg=78.13)
+    _write_producer_intrinsics(root, "cam_08", coverage=0.9558, fold_deg=float("inf"), corner_deg=76.86)
+
+    payload = gateway._intrinsics_coverage_payload(_intrinsics_gateway_state(tmp_path, run))
+
+    assert payload["ok"] is True
+    assert payload["run"] == run
+    assert payload["coverageTarget"] == 0.90
+    by_camera = {entry["camera"]: entry for entry in payload["cameras"]}
+    assert by_camera["cam_06"]["coverage"] == pytest.approx(0.7876)
+    assert by_camera["cam_06"]["foldMarginDeg"] == pytest.approx(2.10, abs=0.01)
+    assert by_camera["cam_06"]["foldsInsideFrame"] is False
+    # An infinite fold limit means the model never folds. Reporting it as a
+    # number would make "never folds" indistinguishable from a huge margin, and
+    # JSON cannot carry inf anyway.
+    assert by_camera["cam_08"]["foldMarginDeg"] is None
+
+
+def test_intrinsics_coverage_leaves_an_unmeasured_camera_unmeasured(tmp_path):
+    """A vendor file has no self-calibration record, and must not read as passing."""
+    run = "vendor_intrinsics"
+    root = tmp_path / "outputs" / "calibration" / run
+    _write_producer_intrinsics(root, "cam_01", coverage=None, fold_deg=0.0, corner_deg=0.0)
+
+    payload = gateway._intrinsics_coverage_payload(_intrinsics_gateway_state(tmp_path, run))
+
+    entry = payload["cameras"][0]
+    assert entry["camera"] == "cam_01"
+    assert "coverage" not in entry
+
+
+def test_intrinsics_coverage_reports_a_missing_run_instead_of_an_empty_table(tmp_path):
+    payload = gateway._intrinsics_coverage_payload(_intrinsics_gateway_state(tmp_path, "no_such_run"))
+
+    assert payload["cameras"] == []
+    assert "找不到内参目录" in payload["error"]

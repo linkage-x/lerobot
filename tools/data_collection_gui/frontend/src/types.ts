@@ -822,3 +822,36 @@ export type CalibrationSession = {
   recorderState: string;
   steps: CalibrationSessionStep[];
 };
+
+// --- production intrinsics coverage -----------------------------------------
+//
+// How much of each camera's frame radius the calibration board actually reached.
+// It is reported separately from any reprojection score because the two cannot
+// substitute for each other: held-out RMSE is measured where the board went, so
+// a lens whose outer ring was never sampled scores exactly as well as one that
+// was covered everywhere -- the distortion model just extrapolates out there
+// with no data to contradict it.
+export type IntrinsicsCoverageCamera = {
+  camera: string;
+  serial?: string;
+  model?: string;
+  // Absent when the intrinsics did not come from a metrology self-calibration
+  // (a vendor file carries no such record). Absent is not "fine".
+  coverage?: number | null;
+  // Degrees between the model's radial fold and its own frame corner. null
+  // means it never folds; <= 0 means part of the image has no unique ray.
+  foldMarginDeg?: number | null;
+  foldsInsideFrame?: boolean;
+  framesUsed?: number;
+  heldoutRmsePx?: number | null;
+};
+
+export type IntrinsicsCoverageResponse = {
+  ok: boolean;
+  error?: string;
+  run: string;
+  source?: string;
+  coverageTarget: number;
+  foldMarginWarnDeg: number;
+  cameras: IntrinsicsCoverageCamera[];
+};

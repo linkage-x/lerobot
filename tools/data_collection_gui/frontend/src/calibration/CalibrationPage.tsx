@@ -29,6 +29,7 @@ import { ForceCalibrationCard, TactileCalibrationCard } from "./CalibrationCards
 import { CalibrationLogPanel, toLogEntries } from "./CalibrationLogPanel";
 import { CalibrationHistory } from "./CalibrationHistory";
 import { RigCheckPanel } from "./RigCheckPanel";
+import { IntrinsicsCoveragePanel } from "./IntrinsicsCoveragePanel";
 import { WorldFramePanel } from "./WorldFramePanel";
 import { CalibrationWizard } from "./CalibrationWizard";
 import { MarkerTcpPanel } from "./MarkerTcpPanel";
@@ -176,6 +177,13 @@ export function CalibrationPage({
       {/* Wrapped: this button hands its click event to whatever it is given, and
           the solve now takes an options object. */}
       <RigCheckPanel api={api} busy={busy} onRecalibrate={() => onRunMultiCameraCalibration()} />
+
+      {/* The self-check above only sees pose, and says so -- a bump invalidates
+          the extrinsics and leaves the lens alone. This is the other half: the
+          intrinsics do not go stale from bumps, they go stale from having been
+          fitted on a sweep that never reached the frame edge, which no
+          reprojection number on this page can reveal. */}
+      <IntrinsicsCoveragePanel api={api} onRecapture={() => onRunMultiCameraCalibration()} />
 
       {/* Whether a bump happened is the self-check above; whether the world
           frame survived it is a different question, and the one that decides

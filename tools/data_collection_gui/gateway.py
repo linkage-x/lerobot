@@ -1686,6 +1686,13 @@ def _first_finite(values: Any, default: float = 0.0) -> float:
     return default
 
 
+def _as_float(value: Any) -> float | None:
+    """A finite float, or None. NaN and inf are absences, not measurements."""
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return None
+
+
 def _as_float_list(values: Any) -> list[float]:
     if values is None:
         return []
@@ -2723,6 +2730,92 @@ def _rig_check_stable_cameras(state: GatewayState, reference_created_utc: str) -
 
     meta.update({"origin": "rig_check", "cameras": ok, "moved": moved})
     return meta
+
+
+# How much of the frame radius the board has to reach before the distortion
+# model is constrained rather than extrapolated. Not a number picked for this
+# panel: metrology.cli.calibrate_intrinsics prints its own "边缘无数据，畸变模型
+# 在其余部分是外推" warning below exactly this, and the two must not disagree
+# about what "covered" means.
+#
+# There is deliberately no second, lower threshold that would declare a camera
+# due for a re-shoot. One used to live here at 0.80 and it was wrong: coverage
+# costs nothing where the camera does not work, and the least-covered camera on
+# this rig (cam_06, 79%) never sees the cube past 52% of its frame radius.
+# Whether an extrapolated band matters is a question about the workspace, which
+# this endpoint cannot see, so it reports the measurement and stops.
+_COVERAGE_TARGET = 0.90
+# A model that folds back on itself inside its own frame has pixels with no
+# unique ray. A margin this small means the fold sits just outside the corner,
+# so it is not biting yet but nothing was measured out there either.
+_FOLD_MARGIN_WARN_DEG = 5.0
+
+
+def _intrinsics_coverage_payload(state: GatewayState) -> dict[str, Any]:
+    """Per-camera edge coverage of the intrinsics production is actually using.
+
+    Read from the shipped producer JSONs rather than from any fresh fit: the
+    question this answers is "is what production consumes good enough", and a
+    re-fit that has not been adopted cannot answer it.
+
+    Coverage is the one property of an intrinsics set that a reprojection score
+    cannot express. Held-out RMSE is computed where the board went, so a lens
+    whose outer ring was never sampled scores just as well as one that was
+    fully covered -- the model is simply extrapolating over the rest of the
+    frame with nothing to contradict it.
+    """
+    run = (state.calibration.intrinsicsRun or "").strip()
+    payload: dict[str, Any] = {
+        "ok": True,
+        "run": run,
+        "coverageTarget": _COVERAGE_TARGET,
+        "foldMarginWarnDeg": _FOLD_MARGIN_WARN_DEG,
+        "cameras": [],
+    }
+    if not run:
+        payload["error"] = "生产配置未指定内参 run（calibration.intrinsics_run_name）"
+        return payload
+
+    root = state.repo_root / "outputs" / "calibration" / run / "converted"
+    payload["source"] = str(root)
+    if not root.is_dir():
+        payload["error"] = f"找不到内参目录：{root}"
+        return payload
+
+    cameras: list[dict[str, Any]] = []
+    for directory in sorted(p for p in root.glob("*") if p.is_dir()):
+        data = _read_json_file(directory / "intrinsics_producer.json")
+        if not data:
+            continue
+        name = str(data.get("camera_name") or directory.name.split("_")[0])
+        entry: dict[str, Any] = {
+            "camera": name,
+            "serial": str(data.get("camera_serial") or ""),
+            "model": str(data.get("model") or ""),
+        }
+        # Absent for intrinsics that did not come from a metrology self-cal
+        # (vendor files carry no self_calibration block). Reporting nothing is
+        # the honest answer there; a missing measurement is not a passing one.
+        self_cal = data.get("self_calibration")
+        if isinstance(self_cal, dict):
+            fold = self_cal.get("radial_fold_deg")
+            bearing = self_cal.get("corner_bearing_deg")
+            margin = None
+            if isinstance(fold, (int, float)) and isinstance(bearing, (int, float)):
+                # inf means the model never folds, which is not a large margin
+                # but the absence of a fold; the frontend renders it as such.
+                margin = None if math.isinf(float(fold)) else float(fold) - float(bearing)
+            entry.update({
+                "coverage": _as_float(self_cal.get("observed_radius_fraction")),
+                "foldMarginDeg": margin,
+                "foldsInsideFrame": bool(margin is not None and margin <= 0.0),
+                "framesUsed": int(self_cal.get("frames_used") or 0),
+                "heldoutRmsePx": _as_float(self_cal.get("heldout_time_block_rmse_px")),
+            })
+        cameras.append(entry)
+
+    payload["cameras"] = cameras
+    return payload
 
 
 def _world_frame_payload(state: GatewayState) -> dict[str, Any]:
@@ -10818,6 +10911,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/calibration/world-frame":
             _json_response(self, HTTPStatus.OK, _world_frame_payload(self.server.state))
+            return
+        if path == "/api/calibration/intrinsics-coverage":
+            _json_response(self, HTTPStatus.OK, _intrinsics_coverage_payload(self.server.state))
             return
         if path == "/api/calibration/marker-tcp":
             with self.server.state.lock:
