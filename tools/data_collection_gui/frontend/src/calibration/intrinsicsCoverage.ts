@@ -14,6 +14,10 @@
 // this rig it mostly does not. Measured on 2026-08-21 against the cube in
 // thor_gmsl2_9ch_v1_20260817_162847: cam_06 covers 79% of its frame radius and
 // the cube never passes 52% of it, so its unmeasured band is never entered.
+// The same day, a rigid marker rig flown through a manipulation trajectory
+// (thor_gmsl2_10ch_v1_20260821_135926, 58447 detections) put 0.00% of its
+// corners outside any camera's covered radius -- the farthest, cam_12, reached
+// 0.72 of a radius it has measured to 0.82.
 // The one camera that does work past its covered band, cam_09, turned out to
 // carry a ~27 mm error that is flat in image radius (27.3 mm at 41 deg vs
 // 25.6 mm at 67 deg) and flat in visible marker count -- neither of which an
