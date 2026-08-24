@@ -27,12 +27,29 @@ robot:
   # x [0.18, 0.86], y [-0.46, 0.46] with its top at exactly z = 0:
   #   z >= 0      the fingertips are never commanded into the tabletop
   #   x, y        the table's own footprint, trimmed to 0.70/0.45 so the reachable part of the box
-  #               dominates (FR3 reach is 855 mm from the base; the far-high corners of any box
-  #               that covers this table are unreachable and fail loudly in IK instead)
+  #               dominates (FR3 reach is 855 mm from the base; the far corners of any box that
+  #               covers this table are outside it)
+  #
+  # This box is NOT the reachable envelope, and where they disagree the arm stops without saying
+  # so. Unreachable targets do not raise: HirolLMKinematicsDriver clips its step to the URDF joint
+  # limits (backends.py) and returns the joints it already had, so the arm is commanded to hold
+  # position and FR3 -- never having seen an illegal command -- stays green. Measured on this rig,
+  # walking the tool point in -x from the home pose with the home orientation held:
+  #   z >= 0.25   reaches x = 0.18, the fence is the limit
+  #   z = 0.20    stops at x = 0.2183   } fr3_joint4 pinned at its -3.0421 rad lower limit. The
+  #   z = 0.12    stops at x = 0.2818   } Pika tool is 411 mm long, so holding the fingertips both
+  #   z = 0.06    stops at x = 0.2988   } low and near the base folds the elbow past its stop.
+  # Home is x = 0.3086, so at grasp height there is ~10 mm of -x travel, not the 129 mm this box
+  # advertises. Pitching the wrist ~20 deg (fingers down-and-back) releases j4 and restores the
+  # full range -- teleop.scale_wy below is currently 0.0, which is what takes that escape away.
+  # See test_the_home_pose_can_travel_at_grasp_height in test_fr3_recording_workspace_contract.py.
+  #
   # The 11.6k recorded pick-and-place frames re-expressed at the tool point span
   # x [0.264, 0.464], y [-0.355, 0.122], z [0.028, 0.397], so the whole existing task fits inside
   # with margin. Widen it here if a new task needs more; do not silently rely on the dataclass
-  # default, which was written for pika_task_tcp and is meaningless at the tool point.
+  # default, which was written for pika_task_tcp and is meaningless at the tool point. Widening
+  # x_min buys nothing on its own -- at grasp height the kinematics bind ~120 mm before this box
+  # does, and dropping below 0.18 puts the fence off the near edge of the table.
   workspace_min: [0.18, -0.45, 0.0]
   workspace_max: [0.70, 0.45, 0.70]
   camera_max_age_ms: 100

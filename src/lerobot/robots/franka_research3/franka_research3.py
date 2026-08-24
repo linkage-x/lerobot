@@ -47,6 +47,22 @@ from .processor_franka_research3 import PREV_CMD_GRIPPER_KEY, PREV_CMD_POSITION_
 
 logger = logging.getLogger(__name__)
 
+# How far the tool point may sit from where it was commanded before the arm counts as stalled.
+#
+# Running out of reach is not an error anywhere in this stack. HirolLMKinematicsDriver clips its
+# Newton step to the URDF joint limits and returns the joints it already had, so an unreachable
+# target becomes "hold position": no exception, no log line, and the FR3 -- which never receives an
+# illegal command -- keeps its status light green. The operator sees an arm that has simply stopped
+# moving in one direction, with the SpaceMouse still deflected. That is what this detects.
+#
+# Deliberately not a config field. It is a diagnostic threshold, not a control parameter, and the
+# only reason to raise it is to stop hearing about a stall that is still happening. 5 mm is five
+# times max_target_delta_pos, so a single step that IK solves imperfectly stays quiet.
+_REACH_STALL_TOLERANCE_M = 0.005
+# A stall lasts as long as the operator keeps pushing, and every line the recorder prints becomes
+# the GUI's status message. Warn on the leading edge, then at this interval, then once on release.
+_REACH_STALL_REWARN_S = 2.0
+
 
 class FrankaResearch3(Robot):
     config_class = FrankaResearch3Config
@@ -84,6 +100,11 @@ class FrankaResearch3(Robot):
         self._otg_sender_thread: threading.Thread | None = None
         self._otg_running = False
         self._otg_error: Exception | None = None
+        # Distance between the last commanded tool point and the one the IK solution actually
+        # realises. 0.0 whenever the arm is following its command.
+        self._reach_stall_error_m: float = 0.0
+        self._reach_stall_since_s: float | None = None
+        self._reach_stall_last_warned_s: float = 0.0
         self._state_snapshot_lock = threading.Lock()
         self._last_observation_joint_positions_rad: np.ndarray | None = None
         self._last_observation_ee_pose: np.ndarray | None = None
@@ -509,6 +530,69 @@ class FrankaResearch3(Robot):
         self._last_command_gripper = None
         self._hold_joint_target = None
         self._prev_enabled = False
+        self._reach_stall_error_m = 0.0
+        self._reach_stall_since_s = None
+        self._reach_stall_last_warned_s = 0.0
+
+    @property
+    def reach_stall_error_m(self) -> float:
+        """How far the arm is behind its own command, in metres. 0.0 when it is keeping up.
+
+        Non-zero means the commanded tool point is outside what IK can realise from here -- the
+        arm is holding still while something keeps asking it to move. Read by the recorder so the
+        operator is told instead of guessing; see _note_reach_tracking.
+
+        Written by the control thread and read by the recorder's progress thread. A plain float
+        attribute is enough: the reader wants "is it stalled, and roughly how badly", and a
+        one-poll-stale answer to that is the same answer.
+        """
+
+        return self._reach_stall_error_m
+
+    def _note_reach_tracking(self, desired_pose: np.ndarray, target_joints_rad: np.ndarray) -> None:
+        """Compare where the arm was told to go with where these joints actually put it.
+
+        Purely solver-side: both poses come from the kinematics model, so this measures whether IK
+        could realise the command, not whether the arm has physically caught up yet. Servo lag,
+        OTG smoothing and a slow gripper are all invisible here, which is what makes a non-zero
+        reading mean one specific thing.
+        """
+
+        realised_pose = self._compute_ee_pose(target_joints_rad)
+        error_m = float(np.linalg.norm(realised_pose[:3, 3] - desired_pose[:3, 3]))
+        now_s = time.perf_counter()
+
+        if error_m <= _REACH_STALL_TOLERANCE_M:
+            # Published as exactly 0.0 rather than the sub-tolerance residual, so a reader can
+            # test the value itself instead of re-deriving the threshold this file chose.
+            self._reach_stall_error_m = 0.0
+            if self._reach_stall_since_s is not None:
+                logger.warning(
+                    "FR3 reach limit cleared after %.1fs", now_s - self._reach_stall_since_s
+                )
+            self._reach_stall_since_s = None
+            return
+
+        self._reach_stall_error_m = error_m
+        if self._reach_stall_since_s is None:
+            self._reach_stall_since_s = now_s
+        elif now_s - self._reach_stall_last_warned_s < _REACH_STALL_REWARN_S:
+            return
+        self._reach_stall_last_warned_s = now_s
+        commanded = desired_pose[:3, 3]
+        realised = realised_pose[:3, 3]
+        logger.warning(
+            "FR3 reach limit: commanded tool point (%.4f, %.4f, %.4f) is %.1f mm outside what IK "
+            "can reach from here; the arm is holding at (%.4f, %.4f, %.4f). Joint limits, not the "
+            "workspace fence -- lift the tool or change its orientation to get the axis back.",
+            commanded[0],
+            commanded[1],
+            commanded[2],
+            error_m * 1e3,
+            realised[0],
+            realised[1],
+            realised[2],
+        )
 
     def _cache_observation_state_snapshot(
         self,
@@ -823,6 +907,7 @@ class FrankaResearch3(Robot):
             target_joints_rad = self._kinematics.inverse_kinematics(
                 joint_positions_rad, desired_pose, **ik_kwargs
             )
+            self._note_reach_tracking(desired_pose, target_joints_rad)
         if self._otg is not None:
             with self._otg_target_lock:
                 self._otg_target_joints = np.asarray(target_joints_rad, dtype=np.float64).copy()

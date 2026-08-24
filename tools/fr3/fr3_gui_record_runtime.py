@@ -343,10 +343,20 @@ class _CommandChannel:
 
 
 class _ProgressReporter:
-    """Emit ``Recorded <n> frames`` while ``record_loop`` runs, so the UI's bar moves."""
+    """Emit ``Recorded <n> frames`` while ``record_loop`` runs, so the UI's bar moves.
 
-    def __init__(self, dataset: LeRobotDataset) -> None:
+    Also the only place that tells the operator the arm has run out of reach. Running out is
+    silent everywhere else in the stack -- IK clips to the joint limits and returns the joints it
+    already had, so the arm holds position, nothing raises, and the FR3's status light stays green
+    because it never saw an illegal command. From behind the SpaceMouse that is indistinguishable
+    from a dead axis, and the episode keeps recording either way.
+    """
+
+    def __init__(self, dataset: LeRobotDataset, robot: object | None = None) -> None:
         self._dataset = dataset
+        # getattr, not an isinstance check: the MuJoCo twin clips against the same envelope but is
+        # a different class, and a rig that cannot report this should stay quiet rather than crash.
+        self._robot = robot
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -368,13 +378,31 @@ class _ProgressReporter:
             return 0
         return int(buffer.get("size", 0))
 
+    def _reach_stall_error_m(self) -> float:
+        return float(getattr(self._robot, "reach_stall_error_m", 0.0) or 0.0)
+
     def _run(self) -> None:
         last_reported = -1
+        stalled = False
         while not self._stop.wait(_PROGRESS_INTERVAL_S):
             count = self._frame_count()
             if count != last_reported:
                 last_reported = count
                 emit(f"Recorded {count} frames")
+
+            # Edges only. A stall lasts as long as the operator keeps pushing, and every line the
+            # recorder writes becomes the GUI's status message.
+            stall_error_m = self._reach_stall_error_m()
+            if stall_error_m > 0.0 and not stalled:
+                stalled = True
+                emit(
+                    f"WARN: reach limit -- the arm is {stall_error_m * 1e3:.0f} mm behind its "
+                    "command and holding. Joint limits, not the workspace fence: lift the tool or "
+                    "change its orientation to get the axis back. Recording continues."
+                )
+            elif stall_error_m == 0.0 and stalled:
+                stalled = False
+                emit("Reach limit cleared")
 
 
 def parse_runtime_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
@@ -896,7 +924,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 if callable(reset_origin):
                     reset_origin()
 
-                with _ProgressReporter(dataset):
+                with _ProgressReporter(dataset, robot):
                     record_loop(
                         robot=robot,
                         events=events,

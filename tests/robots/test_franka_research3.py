@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from pathlib import Path
 import threading
 import numpy as np
@@ -151,6 +152,38 @@ class DummyKinematicsDriver:
         return self.inverse_solution.copy()
 
 
+class SaturatingKinematicsDriver:
+    """One-axis FK/IK with a reach limit, so a target can be asked for past what it can realise.
+
+    Stands in for HirolLMKinematicsDriver on the one property that matters here: it clips its
+    Newton step to the URDF joint limits and returns joints -- never an exception, never a flag --
+    so an unreachable target arrives at the arm as "hold position" and nothing downstream can tell
+    the difference. DummyKinematicsDriver cannot stand in for it, because its forward_kinematics
+    ignores the joints it is handed and so can never disagree with a command.
+    """
+
+    REACH_LIMIT_X_M = 0.45
+
+    def __init__(self, *args, **kwargs):
+        del args, kwargs
+
+    def forward_kinematics(self, joint_positions_rad: np.ndarray) -> np.ndarray:
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, 3] = np.array([float(joint_positions_rad[0]), 0.1, 0.3], dtype=np.float64)
+        return pose
+
+    def inverse_kinematics(
+        self,
+        current_joint_positions_rad: np.ndarray,
+        desired_pose: np.ndarray,
+        **kwargs,
+    ) -> np.ndarray:
+        del kwargs
+        solution = np.asarray(current_joint_positions_rad, dtype=np.float64).copy()
+        solution[0] = min(float(desired_pose[0, 3]), self.REACH_LIMIT_X_M)
+        return solution
+
+
 class DummyOTGDriver:
     instances: list["DummyOTGDriver"] = []
 
@@ -196,6 +229,132 @@ def robot(monkeypatch):
     yield device
     if device.is_connected:
         device.disconnect()
+
+
+@pytest.fixture
+def saturating_robot(monkeypatch):
+    """A robot whose arm runs out of reach at x = 0.45, well inside its workspace fence."""
+
+    DummyArmDriver.instances = []
+    DummyGripperDriver.instances = []
+    DummyOTGDriver.instances = []
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", DummyArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", SaturatingKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", DummyOTGDriver)
+    device = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+            # Deliberately wider in +x than the arm can reach, which is the real rig's situation:
+            # the fence is a box read off the table, the reachable set is neither.
+            workspace_min=(0.2, -0.3, 0.2),
+            workspace_max=(0.9, 0.3, 0.5),
+            max_target_delta_pos=(0.05, 0.05, 0.05),
+        )
+    )
+    yield device
+    if device.is_connected:
+        device.disconnect()
+
+
+def _push_x(robot, metres: float) -> None:
+    robot.send_action(
+        {
+            "enabled": True,
+            "target_x": metres,
+            "target_y": 0.0,
+            "target_z": 0.0,
+            "target_wx": 0.0,
+            "target_wy": 0.0,
+            "target_wz": 0.0,
+            "gripper": 0.0,
+        }
+    )
+
+
+def test_an_arm_that_is_following_its_command_reports_no_reach_stall(saturating_robot):
+    saturating_robot.connect()
+
+    for _ in range(3):
+        _push_x(saturating_robot, 0.01)
+
+    assert saturating_robot.reach_stall_error_m == 0.0
+
+
+def test_running_out_of_reach_is_reported_instead_of_passing_silently(saturating_robot, caplog):
+    """The failure this whole guard exists for: the arm stops, and nothing says so.
+
+    IK returns the joints it already had, `send_action` returns normally, the arm is commanded to
+    hold position, and the FR3 -- which never saw an illegal command -- keeps its light green. To
+    the operator that is indistinguishable from a dead SpaceMouse axis, and the episode goes on
+    recording either way.
+    """
+
+    saturating_robot.connect()
+    errors_m = []
+    with caplog.at_level(logging.WARNING, logger="lerobot.robots.franka_research3.franka_research3"):
+        for _ in range(8):
+            _push_x(saturating_robot, 0.05)
+            errors_m.append(saturating_robot.reach_stall_error_m)
+
+    # The reported gap is exactly how far the command has walked past what IK can realise.
+    assert saturating_robot.reach_stall_error_m == pytest.approx(
+        float(saturating_robot._last_command_pose[0, 3]) - SaturatingKinematicsDriver.REACH_LIMIT_X_M,
+        abs=1e-6,
+    )
+    # And it grows rather than settling: `send_action` advances _reference_pose to the commanded
+    # pose whether or not IK realised it, so holding the SpaceMouse against a reach limit walks the
+    # command away from the arm at the per-step rate, bounded only by the workspace fence.
+    stalled_m = [error_m for error_m in errors_m if error_m > 0.0]
+    assert len(stalled_m) >= 2, f"the arm never ran out of reach; errors were {errors_m}"
+    assert stalled_m[-1] > stalled_m[0], (
+        f"the gap stopped growing while the command kept advancing; errors were {errors_m}"
+    )
+    assert any("reach limit" in record.message.lower() for record in caplog.records), (
+        f"nothing warned that the arm had stopped following; logged: "
+        f"{[record.message for record in caplog.records]}"
+    )
+
+
+def test_the_reach_stall_clears_when_the_arm_can_follow_again(saturating_robot):
+    saturating_robot.connect()
+    for _ in range(8):
+        _push_x(saturating_robot, 0.05)
+    assert saturating_robot.reach_stall_error_m > 0.0
+
+    for _ in range(10):
+        _push_x(saturating_robot, -0.05)
+
+    assert saturating_robot.reach_stall_error_m == 0.0
+
+
+def test_a_released_spacemouse_does_not_report_a_reach_stall(saturating_robot):
+    """The hold branch commands the pose it computed from the held joints, so it always tracks."""
+
+    saturating_robot.connect()
+    for _ in range(8):
+        _push_x(saturating_robot, 0.05)
+    assert saturating_robot.reach_stall_error_m > 0.0
+
+    saturating_robot.send_action(
+        {
+            "enabled": False,
+            "target_x": 0.0,
+            "target_y": 0.0,
+            "target_z": 0.0,
+            "target_wx": 0.0,
+            "target_wy": 0.0,
+            "target_wz": 0.0,
+            "gripper": 0.0,
+        }
+    )
+
+    # Stale-but-alarming is worse than nothing: the operator would be told the arm is stuck while
+    # it is simply parked. move_to_start / _reset_teleop_state clears it for the same reason.
+    saturating_robot._reset_teleop_state()
+    assert saturating_robot.reach_stall_error_m == 0.0
 
 
 def test_connect_disconnect(robot):

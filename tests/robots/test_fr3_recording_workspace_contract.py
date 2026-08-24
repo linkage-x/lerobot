@@ -41,6 +41,11 @@ MIN_HOME_MARGIN_M = 0.05
 FR3_REACH_M = 0.855
 MIN_REACHABLE_CORNERS = 6
 
+# Where the fingertips are when they close on something. The recorded pick-and-place frames span
+# z [0.028, 0.397] at the tool point; grasps live at the bottom of that, and so does the problem:
+# the arm's near-base blind spot grows as the tool goes down.
+GRASP_HEIGHT_M = 0.06
+
 
 @pytest.fixture(scope="module")
 def record_config() -> dict:
@@ -152,15 +157,128 @@ def test_the_home_pose_sits_well_inside_the_fence(robot_config, scene):
     )
 
 
-def test_most_of_the_fence_is_actually_reachable(robot_config):
+def test_no_fence_corner_is_beyond_the_arm_entirely(robot_config):
+    """A distance check, and only that. It cannot tell you the fence is usable.
+
+    This used to be called `test_most_of_the_fence_is_actually_reachable` and was read as evidence
+    that the box described somewhere the arm could work. It is not: a sphere centred on the base is
+    an *upper bound* on reach, so failing it proves a corner is unreachable while passing it proves
+    nothing at all. In particular a sphere has no inner void and no notion of tool orientation, and
+    both of those are what actually bound this rig -- with the wrist vertical and a 411 mm tool,
+    the fingertips cannot be brought both low and close to the base, and the corner
+    (0.18, -0.45, 0.0) that this test waves through sits 485 mm from the base, well inside 855.
+
+    The claim this test was standing in for is in test_the_home_pose_can_travel_at_grasp_height,
+    which runs the solver the robot actually runs. Keep this one for what it does catch: a fence
+    widened to somewhere the arm could not reach at any orientation.
+    """
+
     lo, hi = _box(robot_config)
     corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
     reachable = int((np.linalg.norm(corners, axis=1) <= FR3_REACH_M).sum())
 
     assert reachable >= MIN_REACHABLE_CORNERS, (
         f"only {reachable}/8 corners of the workspace are within the FR3's {FR3_REACH_M * 1e3:.0f} mm "
-        "reach. A fence that mostly encloses unreachable space is not doing the job the clip is "
-        "there for; IK failures start standing in for it"
+        "reach -- they are outside the arm by distance alone, before orientation is even considered"
+    )
+
+
+@pytest.fixture(scope="module")
+def solver(robot_config):
+    """The IK driver the recording rig actually runs, built from the recording config.
+
+    Not an independent reachability oracle on purpose. What the operator experiences as a wall is
+    wherever *this* solver stops, so this is the thing worth pinning; a cleaner global solver
+    proving a pose is theoretically reachable would not move the wall by a millimetre.
+    """
+
+    pytest.importorskip(
+        "pinocchio",
+        reason="the FR3 IK driver needs pinocchio; it ships in .venv-fr3 on the workstation",
+    )
+    from lerobot.robots.franka_research3.backends import HirolLMKinematicsDriver
+    from lerobot.robots.franka_research3.config_franka_research3 import FrankaResearch3Config
+
+    defaults = FrankaResearch3Config(robot_ip="unused")
+    urdf_path = Path(str(robot_config["urdf_path"]).removeprefix("/lerobot/")).resolve()
+    assert urdf_path.is_file(), f"the recording config's urdf_path does not resolve to {urdf_path}"
+    return HirolLMKinematicsDriver(
+        urdf_path=str(urdf_path),
+        target_frame_name=str(robot_config["target_frame_name"]),
+        joint_names=defaults.joint_names,
+        tolerance=defaults.ik_tolerance,
+        max_iterations=defaults.ik_max_iterations,
+    )
+
+
+def _travel_from_home(solver, home_pose, home_joints, axis: int, sign: int, limit_m: float) -> float:
+    """How far the tool point follows a command along one axis before the solver stops tracking.
+
+    Walks in 5 mm steps, seeding each solve from the previous solution, because that is exactly
+    what teleop does -- `send_action` re-solves from the arm's current joints every control step.
+    A solver handed a far target in one jump can find a different arm configuration; an operator
+    pushing a SpaceMouse cannot.
+    """
+
+    joints = np.asarray(home_joints, dtype=np.float64).copy()
+    pose = np.asarray(home_pose, dtype=np.float64).copy()
+    travelled = 0.0
+    steps = int(round(limit_m / 0.005))
+    for step in range(1, steps + 1):
+        pose[axis, 3] = home_pose[axis, 3] + sign * step * 0.005
+        joints = solver.inverse_kinematics(joints, pose)
+        realised = solver.forward_kinematics(joints)
+        if abs(float(realised[axis, 3]) - float(pose[axis, 3])) > 0.003:
+            break
+        travelled = step * 0.005
+    return travelled
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known, unfixed: at grasp height the fingertips have ~10 mm of -x travel before fr3_joint4 "
+        "hits its -3.0421 rad limit, because a 411 mm tool held vertical cannot be both low and "
+        "near the base. Fixing it is a rig decision that has not been made -- move the work +x, "
+        "give teleop.scale_wy back so the wrist can pitch, or raise the work surface. Delete this "
+        "marker with whichever one lands."
+    ),
+)
+def test_the_home_pose_can_travel_at_grasp_height(robot_config, solver):
+    """Home must not sit against a wall -- and the fence is not the only wall.
+
+    test_the_home_pose_sits_well_inside_the_fence already checks the box, for the stated reason
+    that "the operator's first command in the tight direction is silently clipped". Exactly that
+    happened anyway, against the joint limits instead: IK clips its step to them and returns the
+    joints it already had, so the arm holds position, nothing raises, and the FR3 stays green
+    because it never saw an illegal command.
+    """
+
+    home_joints = np.asarray(robot_config["start_joint_positions"], dtype=np.float64)
+    home_pose = solver.forward_kinematics(home_joints)
+    at_grasp_height = home_pose.copy()
+    at_grasp_height[2, 3] = GRASP_HEIGHT_M
+    joints = home_joints.copy()
+    for _ in range(4):
+        joints = solver.inverse_kinematics(joints, at_grasp_height)
+    settled = solver.forward_kinematics(joints)
+    assert abs(float(settled[2, 3]) - GRASP_HEIGHT_M) <= 0.003, (
+        f"the tool point cannot even be brought to z={GRASP_HEIGHT_M} above the table at the home "
+        f"x/y (reached z={settled[2, 3]:.4f}); the home pose or the grasp height is wrong"
+    )
+
+    travel = {
+        name: _travel_from_home(solver, settled, joints, axis, sign, MIN_HOME_MARGIN_M)
+        for name, axis, sign in (("-x", 0, -1), ("+x", 0, 1), ("-y", 1, -1), ("+y", 1, 1))
+    }
+    tight = {name: metres for name, metres in travel.items() if metres < MIN_HOME_MARGIN_M}
+
+    assert not tight, (
+        f"at z={GRASP_HEIGHT_M} the tool point travels "
+        + ", ".join(f"{name} {metres * 1e3:.0f} mm" for name, metres in sorted(travel.items()))
+        + f" before the solver stops following, against a {MIN_HOME_MARGIN_M * 1e3:.0f} mm floor. "
+        "The operator gets a direction that silently stops responding. This is joint limits, not "
+        "the fence -- widening workspace_min will not move it"
     )
 
 
