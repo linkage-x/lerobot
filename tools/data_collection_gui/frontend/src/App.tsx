@@ -258,7 +258,8 @@ function App() {
     paths: string[],
     actionMode?: string,
     cameraCrops?: CameraCropSpecs,
-    viewFps?: number
+    viewFps?: number,
+    taskPrompt?: string
   ) => {
     // Every warned source, not just the first: a merge is gated on all of them, and confirming
     // one recording's warnings would silently carry the rest into the same training set.
@@ -268,7 +269,9 @@ function App() {
     // Only the QC-warned case asks. A pass exports straight through, and anything else is
     // refused by the gateway with its own reason.
     if (warned.length === 0) {
-      run(() => api.exportApprovedDataset(paths, actionMode, false, cameraCrops, viewFps));
+      run(() =>
+        api.exportApprovedDataset(paths, actionMode, false, cameraCrops, viewFps, taskPrompt)
+      );
       return;
     }
     // Name the action being overridden, not the endpoint it shares: on the workstation this
@@ -293,7 +296,9 @@ function App() {
     if (!ok) {
       return;
     }
-    run(() => api.exportApprovedDataset(paths, actionMode, true, cameraCrops, viewFps));
+    run(() =>
+      api.exportApprovedDataset(paths, actionMode, true, cameraCrops, viewFps, taskPrompt)
+    );
   };
 
   const pageNode =
@@ -368,10 +373,11 @@ function App() {
         busy={busy}
         onExportTask={exportTaskWithQcGuard}
         // Every argument forwarded: the Training View page decides the action contract, the
-        // camera crop and the view rate, and dropping the last two here made both controls
-        // inert -- the build ran at the gateway's defaults and looked like it had worked.
-        onExportApprovedDataset={(paths, actionMode, cameraCrops, viewFps) =>
-          exportApprovedWithWarningGuard(paths, actionMode, cameraCrops, viewFps)
+        // camera crop, the view rate and the task prompt, and dropping any of them here makes
+        // that control inert -- the build runs at the gateway's defaults and looks like it
+        // worked.
+        onExportApprovedDataset={(paths, actionMode, cameraCrops, viewFps, taskPrompt) =>
+          exportApprovedWithWarningGuard(paths, actionMode, cameraCrops, viewFps, taskPrompt)
         }
         onOpenProcessing={() => navigate("dataset-processing")}
         onOpenReplay={(path) => selectAndOpenReplay(path)}

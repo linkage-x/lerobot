@@ -8,6 +8,7 @@ import type {
   ConfigSummary,
   DatasetExportStatus,
   DatasetFramePreview,
+  DependencyInstall,
   DeploymentProfile,
   DeviceStatus,
   BoxPreviewPayload,
@@ -844,6 +845,20 @@ export class DataCollectionGuiApi {
     );
   }
 
+  /** The extras to install come from the probe, not from the page: the page shows what the
+   *  machine reported and asks for exactly that back. */
+  async installTrainingDeps(hostId: string, extras: string[]) {
+    return this.trainingPost<{ install?: DependencyInstall }>("/api/training/deps/install", {
+      hostId,
+      extras
+    });
+  }
+
+  async fetchDependencyInstall(): Promise<DependencyInstall | null> {
+    const payload = await this.trainingGet<{ install: DependencyInstall }>("/api/training/deps");
+    return payload?.install ?? null;
+  }
+
   async fetchTrainingViews(): Promise<TrainingView[]> {
     const payload = await this.trainingGet<{ views: TrainingView[] }>("/api/training/views");
     return payload?.views ?? [];
@@ -1299,7 +1314,8 @@ export class DataCollectionGuiApi {
     actionMode?: string,
     acknowledgeWarnings = false,
     cameraCrops?: CameraCropSpecs,
-    viewFps?: number
+    viewFps?: number,
+    taskPrompt?: string
   ): Promise<GuiSnapshot> {
     // The workstation profile reuses this endpoint to build a training view, and picks the
     // action contract with actionMode; Thor sends none and gets the raw->v3 consolidation.
@@ -1328,6 +1344,12 @@ export class DataCollectionGuiApi {
       // Sent even when it matches the source rate, so the built view records that a rate was
       // chosen rather than inherited -- that is what a later merge needs to know.
       params.set("view_fps", String(viewFps));
+    }
+    if (taskPrompt && taskPrompt.trim()) {
+      // Sent only when the operator typed one. Absent means "keep the prompt the recorder
+      // wrote", which is the only honest default: this string is tokenized into every training
+      // sample of a language-conditioned policy, so inventing one here would be inventing data.
+      params.set("task_prompt", taskPrompt.trim());
     }
     const query = `?${params.toString()}`;
     const remote = await this.postRemoteSnapshot(`/api/datasets/export${query}`);

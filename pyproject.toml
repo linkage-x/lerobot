@@ -147,6 +147,19 @@ fr3-workstation-teleop = [
     "lerobot[spacemouse]",
     "lerobot[intelrealsense]",
 ]
+# What the Training page needs on top of the base install to train the VLA policies it offers,
+# split out from the teleop extra because the machine that records and the machine that trains
+# are not always the same one. torch, accelerate and wandb are base dependencies; what is missing
+# without this extra is the language half of a VLA (transformers + the PaliGemma tokenizer path)
+# and the adapter library LoRA runs through.
+#
+# `peft` is not optional for pi0.5+LoRA and it is not implied by `pi`: lerobot[pi] is the dense
+# finetune only, and `lerobot_train.py` reaches for `peft` at the point it wraps the policy --
+# thousands of frames after the run looked like it had started.
+fr3-train = [
+    "lerobot[pi]",
+    "lerobot[peft]",
+]
 
 # Policies
 wallx = [

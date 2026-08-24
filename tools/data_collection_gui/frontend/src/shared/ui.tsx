@@ -1,5 +1,6 @@
 // Shared UI primitives + cross-page helpers, extracted from App.tsx so the
 // page modules can share them without a circular dependency on App.
+import { useEffect, useRef } from "react";
 import type { GuiSnapshot } from "../api";
 import type { CollectionTask, ProcessingItem, ProcessingStatus, TaskStatus } from "../types";
 
@@ -76,6 +77,60 @@ export function Metric({ label, value }: { label: string; value: string | number
   );
 }
 
+
+/** Lightweight modal (this project carries no UI library).
+ *
+ * Lives here rather than beside the calibration dialog it was written for: it is the only
+ * modal in the app, and a second copy would drift from this one on the day someone fixed the
+ * Escape handling in whichever file they had open.
+ */
+export function Modal({
+  title,
+  onClose,
+  children,
+  footer,
+  className
+}: {
+  title: string;
+  onClose: () => void;
+  children: React.ReactNode;
+  footer?: React.ReactNode;
+  /** Extra class on the dialog box, for the pages that need it wider than a checklist. */
+  className?: string;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    ref.current?.focus();
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div className="cali-modal-backdrop" onMouseDown={onClose}>
+      <div
+        className={`cali-modal${className ? ` ${className}` : ""}`}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        tabIndex={-1}
+        ref={ref}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="cali-modal-head">
+          <h3>{title}</h3>
+          <button className="cali-icon-btn" aria-label="关闭" onClick={onClose}>
+            ✕
+          </button>
+        </div>
+        <div className="cali-modal-body">{children}</div>
+        {footer && <div className="cali-modal-foot">{footer}</div>}
+      </div>
+    </div>
+  );
+}
 
 export function PageHeader({ title, subtitle }: { title: string; subtitle: string }) {
   return (

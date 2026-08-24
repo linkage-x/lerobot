@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -103,6 +104,7 @@ def _write_v3_source_dataset(
     frames: int = 4,
     camera: str = "observation.images.ee",
     fps: int = 30,
+    task_prompt: str = "Pick and place",
 ) -> None:
     """A minimal LeRobot v3 recording: one parquet, one mp4 per camera, episode metadata."""
     import pyarrow as pa
@@ -131,7 +133,7 @@ def _write_v3_source_dataset(
     }
     (root / "meta" / "info.json").write_text(json.dumps(info), encoding="utf-8")
 
-    tasks = pd.DataFrame({"task_index": [0]}, index=pd.Index(["Pick and place"], name="task"))
+    tasks = pd.DataFrame({"task_index": [0]}, index=pd.Index([task_prompt], name="task"))
     tasks.to_parquet(root / "meta" / "tasks.parquet")
 
     rows = {key: [] for key in ["timestamp", "frame_index", "episode_index", "index", "task_index"]}
@@ -151,7 +153,7 @@ def _write_v3_source_dataset(
 
     episode_rows = {
         "episode_index": list(range(episodes)),
-        "tasks": [["Pick and place"]] * episodes,
+        "tasks": [[task_prompt]] * episodes,
         "length": [frames] * episodes,
         "data/chunk_index": [0] * episodes,
         "data/file_index": [0] * episodes,
@@ -525,6 +527,317 @@ def test_training_a_shared_view_keeps_each_jobs_configs_apart(tmp_path, monkeypa
     assert config["dataset"]["repo_id"] == "local/fr3__delta_ee_from_prev_cmd"
     assert config["policy"]["type"] == "act"
     assert config["job_name"] == "baseline__act"
+
+
+# --------------------------------------------------------------------------------------
+# Task prompt (the language a VLA is conditioned on)
+# --------------------------------------------------------------------------------------
+
+
+def _view_tasks(dst_root: Path) -> list[str]:
+    """The view's prompts in task_index order -- the table a sample's `task` is resolved from."""
+    return fr3_train_il_policy.view_task_prompts(dst_root)
+
+
+def _task_indices(dst_root: Path, data_file: str) -> set[int]:
+    """The task indices in one of a merged view's data files."""
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(dst_root / "data" / "chunk-000" / f"{data_file}.parquet")
+    return set(table.column("task_index").to_pylist())
+
+
+def test_a_view_keeps_the_recorded_prompt_when_none_is_given(tmp_path):
+    src_root = tmp_path / "recording"
+    _write_v3_source_dataset(src_root, task_prompt="Pick and place")
+
+    _frames, episodes, _info, manifest = _build_view(src_root, tmp_path / "view")
+
+    assert _view_tasks(tmp_path / "view") == ["Pick and place"]
+    assert list(episodes["tasks"].iloc[0]) == ["Pick and place"]
+    assert manifest["task_prompt_override"] is None
+    assert manifest["task_prompts"] == ["Pick and place"]
+
+
+def test_a_view_can_be_given_a_better_prompt_than_the_recording_carried(tmp_path):
+    """The prompt is tokenized into every pi0/pi0.5 sample, so it is data, not a run setting."""
+    src_root = tmp_path / "recording"
+    _write_v3_source_dataset(src_root, task_prompt="Pick and place")
+
+    frames, episodes, info, manifest = _build_view(
+        src_root,
+        tmp_path / "view",
+        task_prompt="pick up the red cube and place it in the box",
+    )
+
+    assert _view_tasks(tmp_path / "view") == ["pick up the red cube and place it in the box"]
+    # Every frame still points at the one task row, and the human-readable copy agrees with it.
+    assert set(frames["task_index"]) == {0}
+    assert list(episodes["tasks"].iloc[0]) == ["pick up the red cube and place it in the box"]
+    assert info["total_tasks"] == 1
+    assert manifest["task_prompt_override"] == "pick up the red cube and place it in the box"
+    assert manifest["source_task_prompts"] == ["Pick and place"]
+
+    # The recording is untouched: it is the only primary record of what was captured.
+    source_tasks = pd.read_parquet(src_root / "meta" / "tasks.parquet")
+    assert list(source_tasks.index) == ["Pick and place"]
+
+
+def test_a_prompt_is_normalized_the_way_the_tokenizer_will_see_it(tmp_path):
+    src_root = tmp_path / "recording"
+    _write_v3_source_dataset(src_root)
+
+    _build_view(src_root, tmp_path / "view", task_prompt="  put  the cube\n in the box ")
+
+    # Not cosmetic: pi0.5 builds `Task: {task}, State: ...` and tokenizes it, so a stray double
+    # space is a different token sequence conditioning every frame in the dataset.
+    assert _view_tasks(tmp_path / "view") == ["put the cube in the box"]
+
+
+def test_a_merge_can_rewrite_each_recordings_prompt_separately(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _write_v3_source_dataset(first, episodes=2, task_prompt="Pick and place")
+    _write_v3_source_dataset(second, episodes=2, task_prompt="grab thing")
+
+    _frames, episodes, info, manifest = _build_view(
+        [first, second],
+        tmp_path / "view",
+        task_prompt_map={
+            "Pick and place": "pick up the red cube and place it in the box",
+            "grab thing": "pick up the blue cube and place it in the box",
+        },
+    )
+
+    assert _view_tasks(tmp_path / "view") == [
+        "pick up the red cube and place it in the box",
+        "pick up the blue cube and place it in the box",
+    ]
+    assert info["total_tasks"] == 2
+    # Each source keeps its own file in a merge, and each source's frames follow its own rewrite
+    # through the renumbered index space.
+    assert _task_indices(tmp_path / "view", "file-000") == {0}
+    assert _task_indices(tmp_path / "view", "file-001") == {1}
+    assert list(episodes["tasks"].iloc[0]) == ["pick up the red cube and place it in the box"]
+    assert list(episodes["tasks"].iloc[-1]) == ["pick up the blue cube and place it in the box"]
+    assert manifest["source_task_prompts"] == ["Pick and place", "grab thing"]
+
+
+def test_two_recordings_can_be_collapsed_onto_one_instruction(tmp_path):
+    """Two prompts rewritten to one string *are* one task: the index space is rebuilt here."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _write_v3_source_dataset(first, episodes=2, task_prompt="Pick and place")
+    _write_v3_source_dataset(second, episodes=2, task_prompt="pick+place v2")
+
+    _frames, _episodes, info, _manifest = _build_view(
+        [first, second], tmp_path / "view", task_prompt="pick up the cube and place it in the box"
+    )
+
+    assert _view_tasks(tmp_path / "view") == ["pick up the cube and place it in the box"]
+    assert info["total_tasks"] == 1
+    assert _task_indices(tmp_path / "view", "file-000") == {0}
+    assert _task_indices(tmp_path / "view", "file-001") == {0}
+
+
+def test_a_prompt_map_refuses_a_prompt_no_recording_has(tmp_path):
+    """Silently ignoring it would train the old wording while the command line said otherwise."""
+    src_root = tmp_path / "recording"
+    _write_v3_source_dataset(src_root, task_prompt="Pick and place")
+    dst_root = tmp_path / "view"
+
+    with pytest.raises(ValueError, match="no source dataset records"):
+        _build_view(src_root, dst_root, task_prompt_map={"Pick and Place": "pick up the red cube"})
+
+    # And nothing was written. A rejected build that left the directory behind would make the
+    # retry -- the one with the typo fixed -- fail on "already exists" instead of running.
+    assert not dst_root.exists()
+
+
+def test_the_two_prompt_flags_cannot_both_rewrite_the_same_column(tmp_path):
+    src_root = tmp_path / "recording"
+    _write_v3_source_dataset(src_root)
+
+    with pytest.raises(ValueError, match="both rewrite"):
+        _build_view(
+            src_root,
+            tmp_path / "view",
+            task_prompt="one thing",
+            task_prompt_map={"Pick and place": "another thing"},
+        )
+
+
+def test_the_digest_changes_when_only_the_prompt_does(tmp_path):
+    """Two views over the same frames with different instructions are not the same training set."""
+    src_root = tmp_path / "recording"
+    _write_v3_source_dataset(src_root)
+
+    _f, _e, _i, recorded = _build_view(src_root, tmp_path / "as-recorded")
+    _f, _e, _i, rewritten = _build_view(src_root, tmp_path / "rewritten", task_prompt="do the thing")
+
+    assert recorded["source_digest"] != rewritten["source_digest"]
+
+
+def test_a_prompt_rewrite_is_refused_when_no_view_is_being_built(tmp_path):
+    """--skip-prepare trains frames whose task column is already on disk."""
+    view_root = _view_with_manifest(tmp_path)
+    args = _args(skip_prepare=True, task_prompt="do the thing")
+
+    with pytest.raises(ValueError, match="Rebuild the view"):
+        fr3_train_il_policy.validate_prompt_args(args)
+
+    resumed = _args(resume=True, task_prompt="do the thing")
+    with pytest.raises(ValueError, match="two different instructions"):
+        fr3_train_il_policy.validate_prompt_args(resumed)
+
+    # And is a no-op to validate when nothing was asked for.
+    fr3_train_il_policy.validate_prompt_args(_args(skip_prepare=True))
+    assert view_root.exists()
+
+
+def test_the_generated_inference_config_carries_the_prompt_to_the_rollout(tmp_path, monkeypatch):
+    """pi0.5 takes the task from the caller at inference, not from the checkpoint."""
+    import yaml
+
+    src_root = tmp_path / "recording"
+    _write_v3_source_dataset(src_root)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "fr3_train_il_policy.py",
+            "--dataset-roots", str(src_root),
+            "--view-root", str(tmp_path / "view"),
+            "--job-name", "cube__pi05",
+            "--cameras", "observation.images.ee",
+            "--state-keys", "observation.state",
+            "--action-append-selectors", "",
+            "--action-append-names", "",
+            "--policy", "pi05",
+            "--task-prompt", "pick up the red cube and place it in the box",
+            "--prepare-only",
+        ],
+    )
+    fr3_train_il_policy.main()
+
+    config = yaml.safe_load(
+        (tmp_path / "view" / "inference_config.generated.yaml").read_text(encoding="utf-8")
+    )
+    assert config["runtime"]["task_prompt"] == "pick up the red cube and place it in the box"
+    assert config["training"]["task_prompts"] == ["pick up the red cube and place it in the box"]
+
+
+# --------------------------------------------------------------------------------------
+# Finetuning from a base checkpoint, with and without LoRA
+# --------------------------------------------------------------------------------------
+
+
+def test_a_base_checkpoint_supplies_weights_and_nothing_else(tmp_path):
+    policy = fr3_train_il_policy.build_policy_section(
+        _args(policy="pi05", pretrained_path="lerobot/pi05_base"), None
+    )
+
+    assert policy["pretrained_path"] == "lerobot/pi05_base"
+    # `use_peft` means "the path points at an adapter". Setting it for a LoRA run would send
+    # make_policy looking for an adapter config inside a base model.
+    assert "use_peft" not in policy
+
+
+def test_a_dense_run_emits_no_peft_block():
+    assert fr3_train_il_policy.build_peft_section(_args(policy="pi05")) is None
+
+
+def test_lora_emits_the_block_lerobot_train_reads():
+    peft = fr3_train_il_policy.build_peft_section(
+        _args(policy="pi05", lora=True, pretrained_path="lerobot/pi05_base", lora_r=32)
+    )
+
+    assert peft == {"method_type": "LORA", "r": 32}
+    # Every key here has to be a field of lerobot.configs.default.PeftConfig -- draccus parses
+    # this block into that dataclass, and an unknown key is a parse error, not an ignored one.
+    from lerobot.configs.default import PeftConfig
+
+    assert set(peft) <= {field.name for field in dataclasses.fields(PeftConfig)}
+
+
+def test_lora_leaves_the_targets_alone_unless_asked():
+    """pi0.5's own default target set is the tuned one; a null would overwrite it."""
+    default = fr3_train_il_policy.build_peft_section(
+        _args(policy="pi05", lora=True, pretrained_path="lerobot/pi05_base")
+    )
+    assert "target_modules" not in default
+    assert "full_training_modules" not in default
+
+    # A single token stays one string: 'all-linear' is a PEFT keyword and a regex is not a list.
+    keyword = fr3_train_il_policy.build_peft_section(
+        _args(
+            policy="pi05",
+            lora=True,
+            pretrained_path="lerobot/pi05_base",
+            lora_target_modules="all-linear",
+        )
+    )
+    assert keyword["target_modules"] == "all-linear"
+
+    listed = fr3_train_il_policy.build_peft_section(
+        _args(
+            policy="pi05",
+            lora=True,
+            pretrained_path="lerobot/pi05_base",
+            lora_target_modules="q_proj,v_proj",
+            lora_full_training_modules="",
+        )
+    )
+    assert listed["target_modules"] == ["q_proj", "v_proj"]
+    # An explicit empty string means "none", which is not the same as not asking.
+    assert listed["full_training_modules"] == []
+
+
+def test_lora_without_a_base_model_is_refused_before_the_run_starts():
+    """The same refusal PEFT makes, but before a dataset scan and a policy build."""
+    with pytest.raises(ValueError, match="nothing here to adapt"):
+        fr3_train_il_policy.validate_finetune_args(_args(policy="pi05", lora=True))
+
+    fr3_train_il_policy.validate_finetune_args(
+        _args(policy="pi05", lora=True, pretrained_path="lerobot/pi05_base")
+    )
+
+
+def test_a_pi05_lora_run_writes_a_config_lerobot_train_can_parse(tmp_path, monkeypatch):
+    view_root = _view_with_manifest(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "fr3_train_il_policy.py",
+            "--skip-prepare",
+            "--view-root", str(view_root),
+            "--job-name", "cube__pi05_lora",
+            "--output-dir", str(tmp_path / "train" / "cube__pi05_lora"),
+            "--policy", "pi05",
+            "--pretrained-path", "lerobot/pi05_base",
+            "--lora",
+            "--lora-r", "32",
+            "--steps", "1",
+        ],
+    )
+    monkeypatch.setattr(fr3_train_il_policy.subprocess, "run", lambda *a, **k: None)
+    fr3_train_il_policy.main()
+
+    config = json.loads(
+        (view_root / "runs" / "cube__pi05_lora" / "train_config.generated.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert config["policy"]["type"] == "pi05"
+    assert config["policy"]["pretrained_path"] == "lerobot/pi05_base"
+    # Top level, not under `policy`: TrainPipelineConfig.peft is what lerobot_train checks
+    # before calling `policy.wrap_with_peft`.
+    assert config["peft"] == {"method_type": "LORA", "r": 32}
+
+    from lerobot.configs.train import TrainPipelineConfig
+
+    assert "peft" in {field.name for field in dataclasses.fields(TrainPipelineConfig)}
 
 
 # --------------------------------------------------------------------------------------

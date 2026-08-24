@@ -25,9 +25,12 @@ import sys
 TRAIN_OUTPUTS_SUBDIR = os.path.join("outputs", "train")
 VIEWS_SUBDIR = os.path.join("outputs", "exports", "training_views")
 
-# The weights and the config that names the policy. A directory missing either of these is
-# a half-written checkpoint (killed mid-save), not one worth offering for a rollout.
-REQUIRED_CHECKPOINT_FILES = ("model.safetensors", "config.json")
+# The config names the policy. The weights are either a full-policy save or a PEFT/LoRA
+# adapter-only save; the latter is what pi0.5+LoRA writes. A directory missing both forms is a
+# half-written checkpoint (killed mid-save), not one worth offering for a rollout.
+REQUIRED_CONFIG_FILES = ("config.json",)
+FULL_WEIGHT_FILES = ("model.safetensors",)
+ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors", "adapter_config.json")
 
 
 def read_json(path: str) -> dict:
@@ -37,6 +40,18 @@ def read_json(path: str) -> dict:
     except (OSError, ValueError):
         return {}
     return loaded if isinstance(loaded, dict) else {}
+
+
+def has_checkpoint_payload(pretrained: str) -> bool:
+    if not all(os.path.isfile(os.path.join(pretrained, name)) for name in REQUIRED_CONFIG_FILES):
+        return False
+    has_full_weights = all(
+        os.path.isfile(os.path.join(pretrained, name)) for name in FULL_WEIGHT_FILES
+    )
+    has_adapter_weights = all(
+        os.path.isfile(os.path.join(pretrained, name)) for name in ADAPTER_WEIGHT_FILES
+    )
+    return has_full_weights or has_adapter_weights
 
 
 def dir_size_bytes(root: str) -> int:
@@ -145,7 +160,7 @@ def find_inference_config(view_root: str, job_name: str) -> tuple[str, str]:
 
 def describe_checkpoint(repo_root: str, job_name: str, step_dir: str) -> dict | None:
     pretrained = os.path.join(step_dir, "pretrained_model")
-    if not all(os.path.isfile(os.path.join(pretrained, name)) for name in REQUIRED_CHECKPOINT_FILES):
+    if not has_checkpoint_payload(pretrained):
         return None
 
     policy_config = read_json(os.path.join(pretrained, "config.json"))

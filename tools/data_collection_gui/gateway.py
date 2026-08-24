@@ -13,6 +13,7 @@ import os
 import queue
 import re
 import select
+import shlex
 import signal
 import shutil
 import subprocess
@@ -326,6 +327,10 @@ class GatewayState:
     # polled for liveness and asked for an exit code.
     training_process: subprocess.Popen[bytes] | None = None
     training_persisted_s: float = 0.0
+    deps_install: training_backend.DependencyInstallStatus = field(
+        default_factory=training_backend.DependencyInstallStatus
+    )
+    deps_install_process: subprocess.Popen[bytes] | None = None
     rollout: rollout_backend.RolloutStatus = field(default_factory=rollout_backend.RolloutStatus)
     # Unlike training, this one keeps its stdin: it is the operator's start/stop channel, and
     # holding it is what lets the gateway steer a rollout. It also means a dead gateway ends
@@ -4005,6 +4010,7 @@ def _training_view_command(
     *,
     camera_crops: dict[str, list[int]] | None = None,
     view_fps: int = DEFAULT_TRAINING_VIEW_FPS,
+    task_prompt: str = "",
 ) -> tuple[list[str], Path]:
     """Build the prepare-only training-view command for an FR3 workstation dataset.
 
@@ -4079,7 +4085,40 @@ def _training_view_command(
     ]
     if camera_crops:
         command.extend(["--camera-crops", json.dumps(camera_crops, separators=(",", ":"))])
+    if task_prompt:
+        # The language instruction the policy is conditioned on, rewritten into the view's task
+        # column. Sent only when the operator typed one: absent means "keep what the recorder
+        # wrote", which is the right default for a rig whose recording prompt was chosen with
+        # care and the only honest one for a rig whose prompt nobody has looked at.
+        command.extend(["--task-prompt", task_prompt])
     return command, view_root
+
+
+# Long enough for a real instruction, short enough that a paste accident is caught here rather
+# than truncated by pi0.5's 200-token prompt budget with no one told.
+_MAX_TASK_PROMPT_CHARS = 300
+
+
+def _parse_training_view_task_prompt(value: str) -> str:
+    """The instruction to write into the view's task column, or "" to keep the recorded one.
+
+    Whitespace is collapsed because pi0/pi0.5 tokenize the prompt into every sample -- a
+    trailing newline is not cosmetic there, it is a different token sequence. Control characters
+    are refused rather than stripped: they mean the field was pasted from somewhere unexpected,
+    and quietly training on a cleaned-up version of a string the operator never typed is worse
+    than telling them.
+    """
+    prompt = " ".join((value or "").split())
+    if not prompt:
+        return ""
+    if len(prompt) > _MAX_TASK_PROMPT_CHARS:
+        raise ValueError(
+            f"Task prompt is {len(prompt)} characters; keep it under {_MAX_TASK_PROMPT_CHARS}. "
+            "It is tokenized into every training sample, not stored as a note."
+        )
+    if any(ord(char) < 32 for char in prompt):
+        raise ValueError("Task prompt must not contain control characters.")
+    return prompt
 
 
 def _training_views_root(state: GatewayState) -> Path:
@@ -4131,6 +4170,7 @@ def _start_training_view(
     acknowledge_warnings: bool = False,
     camera_crops: dict[str, list[int]] | None = None,
     view_fps: int = DEFAULT_TRAINING_VIEW_FPS,
+    task_prompt: str = "",
 ) -> None:
     """Workstation counterpart of the Thor v3 export: build a policy-ready training view.
 
@@ -4210,7 +4250,12 @@ def _start_training_view(
         raise ValueError(conflict)
 
     command, view_root = _training_view_command(
-        state, dataset_roots, action_mode, camera_crops=camera_crops, view_fps=view_fps
+        state,
+        dataset_roots,
+        action_mode,
+        camera_crops=camera_crops,
+        view_fps=view_fps,
+        task_prompt=_parse_training_view_task_prompt(task_prompt),
     )
     source_label = (
         dataset_roots[0].name
@@ -4799,6 +4844,10 @@ def _start_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[st
         repo_id=view["repoId"],
         job_name=job_name,
         policy=policy,
+        pretrained_path=str(payload.get("pretrainedPath") or "").strip(),
+        lora_enabled=bool(payload.get("loraEnabled")),
+        lora_r=int(payload.get("loraR") or 16),
+        lora_target_modules=str(payload.get("loraTargetModules") or ""),
         steps=int(payload.get("steps") or 20000),
         batch_size=int(payload.get("batchSize") or 8),
         num_workers=int(payload.get("numWorkers") or 4),
@@ -4884,6 +4933,185 @@ def _stop_training_run(state: GatewayState) -> dict[str, Any]:
     state.log("warn", f"Stopped training run {state.training.jobName}")
     _persist_training_status(state)
     return {"ok": True, "training": asdict(state.training)}
+
+
+# ----------------------------------------------------- dependency install ---
+#
+# The Training page can already say "pi05 cannot run here: missing transformers>=5.3". This is
+# the other half of that sentence. Without it the page names a problem and leaves the operator
+# to find out, elsewhere, which extra fixes it and which of the two machines to type it on --
+# and the remote case makes that worse, because the answer is a command on a box they may not
+# have a shell open to.
+
+# What the install writes while it runs. Bigger than the training window (40) because this log
+# is read as a whole in a modal rather than glanced at as a status line, and a resolver failure
+# is explained across a dozen lines several hundred lines into the output.
+_DEPS_LOG_LINES = 400
+
+
+def _dependency_install_is_running(state: GatewayState) -> bool:
+    process = state.deps_install_process
+    if process is not None:
+        return process.poll() is None
+    pid = state.deps_install.pid
+    return state.deps_install.state == "running" and bool(pid) and _process_is_alive(int(pid))
+
+
+def _start_dependency_install(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Install pyproject extras on a training host and stream the log back to the page."""
+    with state.lock:
+        if _dependency_install_is_running(state):
+            raise ValueError(
+                "An install is already running on "
+                f"{state.deps_install.hostLabel or 'a machine'}; wait for it to finish."
+            )
+        # Refused rather than queued: uv is about to replace packages inside the environment
+        # the run's interpreter is executing out of, and a training process does not survive
+        # having torch swapped underneath it.
+        if _training_is_running(state):
+            raise ValueError(
+                "A training run is using this environment; stop it before installing packages."
+            )
+
+    host = training_backend.resolve_host(state.repo_root, str(payload.get("hostId") or ""))
+    # The page asks for what the policy is short of; the machine's own baseline is added here
+    # rather than there, because "this gateway is running as the recording workstation" is not
+    # something the browser knows and is exactly what decides whether the recorder shares this
+    # environment. An empty result is a legitimate plan: `uv sync` with no extra installs the
+    # base dependencies, and torch is one of them.
+    extras = training_backend.validate_extras(payload.get("extras"))
+    for extra in training_backend.baseline_extras(host, state.profile):
+        if extra not in extras:
+            extras.append(extra)
+    command, env = training_backend.build_install_command(state.repo_root, host, extras)
+
+    log_dir = state.repo_root / "outputs" / "logs" / "training"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    safe_host = re.sub(r"[^A-Za-z0-9._-]", "_", host.id)
+    log_path = log_dir / f"deps_{safe_host}_{stamp}.log"
+
+    # To a file rather than a pipe, for the reason training runs are: a gateway restart would
+    # otherwise close the read end and kill a half-finished sync, which is the one moment an
+    # environment is genuinely broken rather than merely incomplete.
+    try:
+        with log_path.open("ab") as log_file:
+            process = subprocess.Popen(
+                command,
+                cwd=state.repo_root,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        # ssh missing, bash missing, no room for the log. Reported as the operator's problem
+        # rather than as a traceback in the gateway's own log, which is not where they are
+        # looking.
+        raise training_backend.TrainingError(f"Could not start the install: {exc}") from exc
+
+    with state.lock:
+        state.deps_install_process = process
+        state.deps_install = training_backend.DependencyInstallStatus(
+            state="running",
+            hostId=host.id,
+            hostLabel=host.label,
+            extras=extras,
+            command=" ".join(shlex.quote(item) for item in command),
+            message=(
+                f"Installing {', '.join(extras)} on {host.label}…"
+                if extras
+                else f"Syncing base dependencies on {host.label}…"
+            ),
+            pid=process.pid,
+            startedAt=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            logPath=str(log_path),
+        )
+        status = asdict(state.deps_install)
+    state.log(
+        "info",
+        f"Installing {', '.join(extras) or 'base dependencies'} on {host.label} "
+        f"(pid {process.pid})",
+    )
+    Thread(
+        target=_follow_dependency_install,
+        args=(state, log_path, process.pid, process),
+        daemon=True,
+        name=f"deps-install-{process.pid}",
+    ).start()
+    return {"ok": True, "install": status}
+
+
+def _apply_dependency_install_output(state: GatewayState, line: str) -> None:
+    status = state.deps_install
+    status.lastLines = [*status.lastLines[-(_DEPS_LOG_LINES - 1):], line]
+    status.message = line[:300]
+
+
+def _follow_dependency_install(
+    state: GatewayState,
+    log_path: Path,
+    pid: int,
+    process: subprocess.Popen[bytes],
+) -> None:
+    """Tail the install log into the status the page polls, then record how it ended."""
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+            while True:
+                line = handle.readline()
+                if line:
+                    for part in line.replace("\r", "\n").splitlines():
+                        output = part.rstrip()
+                        if not output:
+                            continue
+                        with state.lock:
+                            if state.deps_install.pid != pid:
+                                return
+                            _apply_dependency_install_output(state, output)
+                    continue
+                if process.poll() is not None:
+                    # One more read: uv's last lines can land between the readline above and
+                    # the exit seen here, and those are the ones that say what went wrong.
+                    for part in handle.read().replace("\r", "\n").splitlines():
+                        output = part.rstrip()
+                        if not output:
+                            continue
+                        with state.lock:
+                            if state.deps_install.pid != pid:
+                                return
+                            _apply_dependency_install_output(state, output)
+                    break
+                time.sleep(0.5)
+    except OSError as exc:
+        with state.lock:
+            if state.deps_install.pid == pid:
+                state.deps_install.message = f"Could not follow the install log: {exc}"
+
+    return_code = process.wait()
+    with state.lock:
+        if state.deps_install.pid != pid:
+            return
+        status = state.deps_install
+        status.finishedAt = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if return_code == 0:
+            status.state = "complete"
+            installed = ", ".join(status.extras) or "the base dependencies"
+            status.message = (
+                f"Installed {installed} on {status.hostLabel}. "
+                "Re-probe to see what the machine reports now."
+            )
+        else:
+            status.state = "error"
+            status.message = (
+                f"Install exited with code {return_code}; the log above says why "
+                f"({status.logPath})."
+            )
+        state.deps_install_process = None
+        state.log(
+            "info" if return_code == 0 else "error",
+            f"Dependency install on {status.hostLabel} finished with code {return_code}",
+        )
 
 
 # ------------------------------------------------------- checkpoints & rollout ---
@@ -6444,6 +6672,11 @@ def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
                 "sourcePath": str(data_files[-1]) if data_files else "",
                 "isLatest": latest_recorded is not None and dataset_root == latest_recorded,
                 "excludedEpisodes": _annotation_excluded_episodes(dataset_root),
+                # The language instruction these frames carry. Surfaced because the view build
+                # can rewrite it, and an operator replacing a prompt should be able to see the
+                # one they are replacing -- read from the dataset's own tasks.parquet, not from
+                # the recorder config, which may have been edited since the take.
+                "taskPrompt": _dataset_task_prompt(dataset_root, state.config),
                 "cameraFeatures": _camera_feature_items(info),
                 **_training_view_item_fields(dataset_root, dataset_kind),
             }
@@ -11697,6 +11930,16 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 self, HTTPStatus.OK, {"ok": True, "wandb": training_backend.wandb_status(host_id)}
             )
             return
+        if path == "/api/training/deps":
+            # Polled by the page while its install modal is open, at a rate that suits a log
+            # window rather than the 1s snapshot -- which is why this is not on the snapshot.
+            with self.server.state.lock:
+                _json_response(
+                    self,
+                    HTTPStatus.OK,
+                    {"ok": True, "install": asdict(self.server.state.deps_install)},
+                )
+            return
         if path == "/api/rollout/camera.jpg":
             camera_key = query.get("camera", [""])[0]
             _serve_rollout_camera_snapshot(self, state=self.server.state, camera_key=camera_key)
@@ -12122,6 +12365,12 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     host = training_backend.resolve_host(state.repo_root, str(body.get("hostId") or ""))
                     result = training_backend.sync_repo_to_host(state.repo_root, host)
                     _json_response(self, HTTPStatus.OK, {"ok": bool(result.get("ok")), "sync": result})
+                    return
+                if path == "/api/training/deps/install":
+                    # Outside the lock: building the command for a remote host touches the
+                    # network, and the install itself runs for minutes in its own process.
+                    result = _start_dependency_install(state, body)
+                    _json_response(self, HTTPStatus.OK, result)
                     return
                 if path == "/api/training/start":
                     # Started outside the lock for the same reason the probe is: a remote start
@@ -12617,6 +12866,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                             view_fps=_parse_training_view_fps(
                                 (query.get("view_fps", [""])[0] or "").strip()
                             ),
+                            task_prompt=(query.get("task_prompt", [""])[0] or ""),
                         )
                     else:
                         _start_approved_dataset_export(

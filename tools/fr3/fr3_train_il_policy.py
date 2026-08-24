@@ -25,7 +25,7 @@ import json
 import shutil
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -194,6 +194,53 @@ def resolve_frame_strides(
             )
         strides.append(fps // view_fps)
     return view_fps, strides
+
+
+def rewrite_episode_tasks(value: Iterable[Any], rewrite: Callable[[str], str]) -> list[str]:
+    """Apply a prompt rewrite to one episode's `tasks` list, keeping order and dropping dupes.
+
+    Order is preserved rather than sorted because this column is read by people, and dedup
+    happens because a rewrite can map two of an episode's prompts onto one.
+    """
+    rewritten: list[str] = []
+    for task in list(value):
+        replacement = rewrite(str(task))
+        if replacement not in rewritten:
+            rewritten.append(replacement)
+    return rewritten
+
+
+def parse_task_prompt_map(value: str | None) -> dict[str, str]:
+    """Parse --task-prompt-map, a JSON object of {recorded prompt: prompt to train on}.
+
+    JSON rather than `old=new` pairs because a task string is a sentence: it contains spaces,
+    commas and (given what people actually type into a recorder) `=`. Any separator this could
+    have used is a character a prompt is allowed to hold.
+    """
+    if not value or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--task-prompt-map must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"--task-prompt-map must be a JSON object, got {type(parsed).__name__}")
+    mapping: dict[str, str] = {}
+    for key, replacement in parsed.items():
+        if not isinstance(replacement, str) or not replacement.strip():
+            raise ValueError(f"--task-prompt-map value for {key!r} must be a non-empty string.")
+        mapping[str(key)] = replacement.strip()
+    return mapping
+
+
+def normalize_task_prompt(value: str | None) -> str:
+    """The prompt as the policy will see it, or "" for "leave the recording's prompt alone".
+
+    Collapsed to single spaces because pi0/pi0.5 tokenize the task into a fixed-width prompt
+    (`Task: {task}, State: ...`), so a trailing newline or a double space is not cosmetic -- it
+    is a different token sequence conditioning every frame in the dataset.
+    """
+    return " ".join((value or "").split())
 
 
 def parse_policy_config(value: str | None) -> dict[str, Any]:
@@ -705,6 +752,8 @@ def prepare_dataset_view(
     exclude_episodes: set[int] | None = None,
     respect_annotations: bool = True,
     view_fps: int = 0,
+    task_prompt: str | None = None,
+    task_prompt_map: dict[str, str] | None = None,
 ) -> None:
     src_roots = discover_dataset_roots(src_root)
     excluded_by_root = resolve_excluded_episodes(
@@ -774,20 +823,67 @@ def prepare_dataset_view(
     else:
         append_feature_names = default_append_names
 
-    dst_root.mkdir(parents=True)
-    (dst_root / "meta").mkdir(parents=True, exist_ok=True)
+    # The prompt is training data, not a run setting: for pi0/pi0.5 the task string is tokenized
+    # into every sample's context, so which words are in it changes what the model is conditioned
+    # on exactly as much as which pixels are. That is why it is rewritten *here*, into the view,
+    # rather than at train time -- the view is the thing a checkpoint's manifest identifies, and a
+    # prompt that lived on the training command line would leave two runs over the same
+    # `source_digest` having learned different language with nothing on disk saying so.
+    #
+    # The recording is never touched. A prompt chosen badly during capture is not a reason to
+    # rewrite the only primary record of what was captured.
+    task_prompt = normalize_task_prompt(task_prompt)
+    task_prompt_map = {
+        normalize_task_prompt(key): normalize_task_prompt(value)
+        for key, value in (task_prompt_map or {}).items()
+    }
+    if task_prompt and task_prompt_map:
+        raise ValueError(
+            "--task-prompt and --task-prompt-map both rewrite the same column. Pass one: "
+            "--task-prompt to give every episode the same instruction, --task-prompt-map to "
+            "rewrite each recorded prompt separately."
+        )
+
+    def rewrite_task(name: str) -> str:
+        if task_prompt:
+            return task_prompt
+        return task_prompt_map.get(normalize_task_prompt(name), str(name))
 
     global_task_to_index: dict[str, int] = {}
     task_index_maps: list[dict[int, int]] = []
+    source_task_names: list[str] = []
     for root in src_roots:
         tasks = pd.read_parquet(root / "meta/tasks.parquet")
         source_map: dict[int, int] = {}
         for task, row in tasks.iterrows():
-            task_name = str(task)
+            source_name = str(task)
+            if source_name not in source_task_names:
+                source_task_names.append(source_name)
+            # Two source prompts can rewrite to one string, and then they *are* one task: the
+            # view's task_index space is rebuilt here, so the frames of both end up pointing at
+            # the same row and the policy sees one instruction. That is the point of the map.
+            task_name = rewrite_task(source_name)
             if task_name not in global_task_to_index:
                 global_task_to_index[task_name] = len(global_task_to_index)
             source_map[int(row["task_index"])] = global_task_to_index[task_name]
         task_index_maps.append(source_map)
+    # Named a prompt no recording has: almost always a typo or a stale copy of the recorder
+    # config, and silently ignoring it would train the old wording while the command line says
+    # otherwise. Compared after normalization so a trailing space is not what makes it "absent".
+    unmatched = sorted(
+        key
+        for key in task_prompt_map
+        if key not in {normalize_task_prompt(name) for name in source_task_names}
+    )
+    if unmatched:
+        raise ValueError(
+            f"--task-prompt-map names prompt(s) no source dataset records: {unmatched}. "
+            f"Recorded prompts are: {sorted(source_task_names)}"
+        )
+
+    dst_root.mkdir(parents=True)
+    (dst_root / "meta").mkdir(parents=True, exist_ok=True)
+
     tasks_df = pd.DataFrame(
         {"task_index": [idx for _, idx in sorted(global_task_to_index.items(), key=lambda item: item[1])]},
         index=pd.Index(
@@ -1048,6 +1144,13 @@ def prepare_dataset_view(
         out_episodes["episode_index"] = [
             episode_map[int(index)] for index in out_episodes["episode_index"]
         ]
+        # Kept in step with tasks.parquet by hand. Nothing in the training path reads this column
+        # -- LeRobotDataset resolves a frame's prompt through `task_index` into tasks.parquet --
+        # but it is what a person opens to ask what an episode was, and a view whose two records
+        # of the same fact disagree is worse than one that never had the second.
+        out_episodes["tasks"] = [
+            rewrite_episode_tasks(value, rewrite_task) for value in out_episodes["tasks"]
+        ]
         # Recounted from the kept lengths rather than shifted by a constant: with an episode
         # removed, every later episode starts earlier than it did in the source. The video
         # timestamps are deliberately untouched -- the mp4 files are symlinked whole, so each
@@ -1147,6 +1250,12 @@ def prepare_dataset_view(
                 ],
                 "cameras": camera_keys,
                 "state_keys": state_keys,
+                # In the digest because the prompt is part of what the frames teach: two views
+                # over the same episodes with different instructions must not compare equal, or a
+                # checkpoint could claim to have trained on a view it never saw.
+                "task_prompts": [
+                    task for task, _ in sorted(global_task_to_index.items(), key=lambda item: item[1])
+                ],
                 "action_mode": action_mode,
                 "action_key": None if action_npy else action_key,
                 "action_append_selectors": action_append_selectors,
@@ -1175,6 +1284,16 @@ def prepare_dataset_view(
         "action_append_shift": action_append_shift,
         "image_resize_shape": image_resize_shape,
         "camera_crop_specs": camera_crop_specs,
+        # The language the policy is conditioned on, in task_index order, and where it came
+        # from. A rollout has to send the same string it trained on -- pi0.5 takes the prompt
+        # from the caller at inference, not from the checkpoint -- so this is the value the
+        # generated inference config carries forward.
+        "task_prompts": [
+            task for task, _ in sorted(global_task_to_index.items(), key=lambda item: item[1])
+        ],
+        "source_task_prompts": source_task_names,
+        "task_prompt_override": task_prompt or None,
+        "task_prompt_map": task_prompt_map,
         "state_dim": int(all_state.shape[1]) if state_keys else 0,
         "action_dim": int(all_action.shape[1]),
         # The view's rate and what it was resampled from. Without this the fps in info.json is
@@ -1270,6 +1389,16 @@ def build_policy_section(args: argparse.Namespace, image_resize_shape: list[int]
         "use_amp": args.use_amp,
         "push_to_hub": False,
     }
+    if args.pretrained_path:
+        # Weights only. `make_policy` passes this config into `from_pretrained`, so the
+        # checkpoint supplies parameters and everything here supplies shape and hyperparameters
+        # -- which is what lets a pi0.5 base trained on someone else's robot finetune onto this
+        # rig's action dimension without the two configs having to agree.
+        #
+        # Deliberately not `use_peft`: that flag means "the path points at an adapter", and
+        # setting it for a LoRA *run* would send make_policy looking for an adapter config in a
+        # base model. lerobot_train wraps the policy itself once it sees the `peft` block.
+        policy["pretrained_path"] = str(args.pretrained_path)
     if args.policy == "act":
         policy.update(
             {
@@ -1295,6 +1424,74 @@ def build_policy_section(args: argparse.Namespace, image_resize_shape: list[int]
         )
     policy.update(parse_policy_config(args.policy_config))
     return policy
+
+
+def build_peft_section(args: argparse.Namespace) -> dict[str, Any] | None:
+    """The top-level `peft` block of the generated train config, or None for a dense run.
+
+    Mirrors `lerobot.configs.default.PeftConfig` exactly, which is a shorter list than the LoRA
+    knobs people expect: rank, targets, method, init and which modules stay fully trainable.
+    There is no `lora_alpha` or `lora_dropout` here because that dataclass has no field for
+    them -- draccus parses this block into it, and an extra key is a hard parse error rather
+    than an ignored one. Adapting those two means widening PeftConfig upstream.
+
+    Keys the operator did not set are omitted rather than sent as null so the policy's own
+    defaults apply: `PreTrainedPolicy._build_peft_config` skips None values, but only after
+    `PeftConfig`'s defaults have already overwritten what the policy asked for -- and for pi0.5
+    the policy's default target set is the tuned one.
+    """
+    if not args.lora:
+        return None
+    peft: dict[str, Any] = {"method_type": args.peft_method, "r": int(args.lora_r)}
+    if args.lora_target_modules is not None:
+        spec = args.lora_target_modules.strip()
+        # A single token is passed through as-is: 'all-linear' is a PEFT keyword and a regex is
+        # one string. Splitting either on commas would turn it into a list of one and change
+        # what PEFT matches.
+        peft["target_modules"] = parse_csv(spec) if "," in spec else spec
+    if args.lora_full_training_modules is not None:
+        peft["full_training_modules"] = parse_csv(args.lora_full_training_modules)
+    if args.lora_init_type is not None:
+        peft["init_type"] = args.lora_init_type
+    return peft
+
+
+def validate_prompt_args(args: argparse.Namespace) -> None:
+    """A prompt rewrite belongs to a view being built; refuse it when no view is being built.
+
+    `--skip-prepare` trains frames someone else already wrote, and their task column is already
+    on disk. Accepting the flag there would silently train the old wording while the command
+    line -- and the operator's memory of what they asked for -- said otherwise.
+    """
+    if not (args.task_prompt or args.task_prompt_map):
+        return
+    if args.skip_prepare:
+        raise ValueError(
+            "--task-prompt rewrites the view's task column while the view is built, and "
+            "--skip-prepare trains a view that already exists. Rebuild the view with the new "
+            "prompt (Dataset Export page, or --prepare-only), then train it."
+        )
+    if args.resume:
+        raise ValueError(
+            "--task-prompt cannot be applied to a resumed run: the checkpoint was trained on "
+            "the prompt already in its view, and changing the language mid-run trains one model "
+            "on two different instructions. Start a fresh run over a rebuilt view."
+        )
+
+
+def validate_finetune_args(args: argparse.Namespace) -> None:
+    """Refuse LoRA without a base model, here rather than 300 seconds into a training run.
+
+    `PreTrainedPolicy._validate_peft_config` raises the same refusal, but only after the
+    dataset has been scanned, the dataloader built and the policy constructed -- and on a
+    remote training host that failure arrives as a line in a log file nobody is watching yet.
+    """
+    if args.lora and not args.pretrained_path:
+        raise ValueError(
+            "--lora adapts a pretrained model and there is nothing here to adapt. Pass "
+            "--pretrained-path (for example --pretrained-path lerobot/pi05_base), or drop "
+            "--lora to train from scratch."
+        )
 
 
 def resolve_peak_lr(args: argparse.Namespace, policy: dict[str, Any]) -> float:
@@ -1401,6 +1598,9 @@ def make_train_config(args: argparse.Namespace, view_root: Path, repo_id: str, c
         "wandb_log_images_n_steps": args.wandb_log_images_n_steps,
         "wandb_log_images_n_samples": args.wandb_log_images_n_samples,
     }
+    peft = build_peft_section(args)
+    if peft is not None:
+        config["peft"] = peft
     if args.lr_scheduler == "cosine_decay_with_warmup":
         peak_lr = resolve_peak_lr(args, policy)
         config["scheduler"] = {
@@ -1419,6 +1619,21 @@ def make_train_config(args: argparse.Namespace, view_root: Path, repo_id: str, c
     write_json(config_path, config)
 
 
+def view_task_prompts(view_root: Path) -> list[str]:
+    """The prompts a built view actually holds, in task_index order.
+
+    Read from the view's own tasks.parquet rather than from its manifest: this is the table
+    `LeRobotDataset.__getitem__` indexes to attach `task` to a sample, so it is the only record
+    that cannot disagree with what a policy will be trained on. It also works for views built
+    before the manifest carried prompts at all.
+    """
+    tasks_path = view_root / "meta" / "tasks.parquet"
+    if not tasks_path.is_file():
+        return []
+    tasks = pd.read_parquet(tasks_path)
+    return [str(task) for task, _ in sorted(tasks.iterrows(), key=lambda item: int(item[1]["task_index"]))]
+
+
 def make_inference_config(
     args: argparse.Namespace,
     *,
@@ -1433,6 +1648,7 @@ def make_inference_config(
     inference_config_path: Path,
 ) -> None:
     camera_suffixes = [key.removeprefix("observation.images.") for key in camera_keys]
+    task_prompts = view_task_prompts(view_root)
     checkpoint_path = args.output_dir / "checkpoints" / "last"
 
     # Hardware comes from the config the data was recorded with, not from literals here. Both of
@@ -1475,6 +1691,9 @@ def make_inference_config(
             "action_append_selectors": action_append_selectors,
             "action_append_names": action_append_names,
             "action_append_shift": args.action_append_shift,
+            "pretrained_path": str(args.pretrained_path) if args.pretrained_path else None,
+            "peft": build_peft_section(args),
+            "task_prompts": task_prompts,
         },
         "runtime": {
             "checkpoint": str(checkpoint_path),
@@ -1485,6 +1704,26 @@ def make_inference_config(
             "policy_fps": None,
             "max_steps": None,
             "preview": True,
+            # The instruction a language-conditioned policy must be given at rollout. pi0/pi0.5
+            # read the task from the caller, not from the checkpoint, so a rollout that sends a
+            # different string than the view was built with is running a prompt the model was
+            # never trained on -- and nothing raises, it just behaves worse.
+            #
+            # A view with several prompts leaves this null on purpose: which one a given rollout
+            # wants is the operator's choice, and picking the first would look like an answer.
+            # The FR3 rollout runtime feeds this to language-conditioned policies. A single-task
+            # view can be auto-resolved; multi-task views must provide an explicit rollout prompt.
+            "task_prompt": task_prompts[0] if len(task_prompts) == 1 else None,
+            "task_prompts": task_prompts,
+            "rtc": {
+                # auto keeps ACT on its checkpoint queue and enables RTC for pi0/pi0.5/SmolVLA.
+                "mode": "auto",
+                "execution_horizon": 10,
+                "max_guidance_weight": 10.0,
+                "prefix_attention_schedule": "EXP",
+                "replan_queue_size": 30,
+                "inference_delay_steps": None,
+            },
             "hardware": {
                 "robot_ip": record_robot.get("robot_ip"),
                 "gripper_backend": "pika",
@@ -1668,6 +1907,67 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "built-in defaults, so it wins."
         ),
     )
+    parser.add_argument(
+        "--pretrained-path",
+        default=None,
+        metavar="REPO_OR_DIR",
+        help=(
+            "Base weights to finetune from: a Hugging Face repo id (lerobot/pi05_base) or a "
+            "local directory saved by `save_pretrained`. Written to policy.pretrained_path, so "
+            "the weights come from there while every hyperparameter still comes from this "
+            "script's generated config. Required by --lora, which has nothing to adapt without "
+            "a pretrained model."
+        ),
+    )
+    parser.add_argument(
+        "--lora",
+        action="store_true",
+        help=(
+            "Train a PEFT adapter instead of the whole network: the base weights are frozen and "
+            "only the adapter (plus --lora-full-training-modules) gets gradients. Emits the "
+            "top-level `peft` block lerobot_train reads. Needs --pretrained-path and the `peft` "
+            "package (pip install -e '.[fr3-train]')."
+        ),
+    )
+    parser.add_argument(
+        "--peft-method",
+        default="LORA",
+        metavar="METHOD",
+        help="PEFT method name, resolved against peft.PeftType (LORA, MISS, ...). Default LORA.",
+    )
+    parser.add_argument(
+        "--lora-r",
+        type=int,
+        default=16,
+        help="Adapter rank. Upstream PeftConfig default is 16; higher is closer to full finetuning.",
+    )
+    parser.add_argument(
+        "--lora-target-modules",
+        default=None,
+        metavar="SPEC",
+        help=(
+            "Which modules to adapt: a comma-separated list of name suffixes, the literal "
+            "'all-linear', or a regex. Left unset, the policy's own default is used -- pi0.5 "
+            "targets the action expert's q/v projections plus the state/action projections "
+            "(see PI05Policy._get_default_peft_targets), which is the tuned answer for it."
+        ),
+    )
+    parser.add_argument(
+        "--lora-full-training-modules",
+        default=None,
+        metavar="LIST",
+        help=(
+            "Comma-separated modules to fully finetune and save alongside the adapter (PEFT's "
+            "modules_to_save). Pass an empty string to force none. Left unset, the policy's "
+            "default applies."
+        ),
+    )
+    parser.add_argument(
+        "--lora-init-type",
+        default=None,
+        metavar="INIT",
+        help="Adapter initialization, passed through to the PEFT method's own init option.",
+    )
     parser.add_argument("--cameras", default=DEFAULT_CAMERAS)
     parser.add_argument("--state-keys", default=DEFAULT_STATE_KEYS)
     parser.add_argument("--image-resize-shape", default=None)
@@ -1675,6 +1975,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--camera-crops",
         default="",
         help="JSON or semicolon specs keyed by camera, e.g. side:224,0,416,346",
+    )
+    parser.add_argument(
+        "--task-prompt",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "Rewrite every episode's language instruction to this string in the view being "
+            "built. The recording is not touched. This is the prompt pi0/pi0.5/smolvla are "
+            "conditioned on -- it is tokenized into every training sample -- so it is worth more "
+            "than the label the recorder happened to be configured with. Rebuild the view to "
+            "change it; a checkpoint's manifest records the prompt it trained on."
+        ),
+    )
+    parser.add_argument(
+        "--task-prompt-map",
+        default=None,
+        metavar="JSON",
+        help=(
+            'JSON object rewriting recorded prompts one by one, e.g. \'{"Pick and place": '
+            '"pick up the red cube and place it in the box"}\'. Use instead of --task-prompt '
+            "when merging recordings that carry different prompts. Naming a prompt no source "
+            "records is an error, not a no-op."
+        ),
     )
     parser.add_argument("--action-key", default="action")
     parser.add_argument("--action-npy", type=Path, default=None)
@@ -1817,6 +2140,8 @@ def main() -> None:
     if not cameras:
         raise ValueError("At least one camera must be selected.")
     validate_policy_type(args.policy)
+    validate_finetune_args(args)
+    validate_prompt_args(args)
     if args.skip_prepare and args.prepare_only:
         raise ValueError("--skip-prepare and --prepare-only ask for opposite halves of this script.")
     if args.policy != "act" and not state_keys:
@@ -1906,6 +2231,8 @@ def main() -> None:
             exclude_episodes={int(value) for value in parse_csv(args.exclude_episodes)},
             respect_annotations=args.respect_annotations,
             view_fps=args.view_fps,
+            task_prompt=args.task_prompt,
+            task_prompt_map=parse_task_prompt_map(args.task_prompt_map),
         )
         manifest = load_json(view_root / "meta/il_view_manifest.json")
         make_train_config(args, view_root, args.repo_id, config_path)

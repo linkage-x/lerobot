@@ -411,6 +411,8 @@ export type RecordedDataset = {
   cameraFeatures?: DatasetCameraFeature[];
   /** Episodes marked includeInTraining=false in Episode Replay; the view build drops these. */
   excludedEpisodes?: number[];
+  /** The language instruction in this dataset's tasks.parquet -- what a VLA would train on. */
+  taskPrompt?: string;
   /** Training views only: the recording this view re-expresses, and in which action contract. */
   viewOf?: string;
   viewOfName?: string;
@@ -802,7 +804,40 @@ export type TrainingMachine = {
   };
   disk?: { path?: string; totalGb?: number; freeGb?: number; error?: string };
   modules?: Record<string, boolean>;
-  policies?: Record<string, { trainable: boolean; missing: string[] }>;
+  moduleVersions?: Record<string, string>;
+  /** `extras`: the pyproject extras that install what `missing` names, so the page can offer
+   *  the install rather than only reporting the gap. Empty means "no extra needed" -- torch is
+   *  a base dependency, so a bare `uv sync` is what fixes act on a machine without it. */
+  policies?: Record<string, { trainable: boolean; missing: string[]; extras?: string[] }>;
+  /** Training options that are not policies -- LoRA needs peft whatever policy is picked. */
+  features?: Record<string, { available: boolean; missing: string[]; extras?: string[] }>;
+  /** Whether the install can be run from here at all, answered about *that* machine. */
+  installer?: {
+    canInstall: boolean;
+    reason: string;
+    uvPath?: string;
+    uvVersion?: string;
+    venvPath?: string;
+    venvExists?: boolean;
+    /** The same button builds and extends; only the size and the wording differ. */
+    willCreateEnvironment?: boolean;
+    scriptPresent?: boolean;
+  };
+};
+
+/** A `uv sync` started from the Training page, as the log modal reads it. */
+export type DependencyInstall = {
+  state: "idle" | "running" | "complete" | "error";
+  hostId: string;
+  hostLabel: string;
+  extras: string[];
+  command: string;
+  message: string;
+  pid: number | null;
+  startedAt: string;
+  finishedAt: string;
+  logPath: string;
+  lastLines: string[];
 };
 
 export type TrainingWandbStatus = {
@@ -869,6 +904,13 @@ export type TrainingStartRequest = {
   device: string;
   useAmp: boolean;
   policyConfig: string;
+  /** HF repo id or local checkpoint dir to finetune from. Empty trains from scratch. */
+  pretrainedPath: string;
+  /** Freeze the base weights and train a PEFT adapter instead. Needs pretrainedPath. */
+  loraEnabled: boolean;
+  loraR: number;
+  /** Empty leaves the policy's own default target set alone, which for pi0.5 is the tuned one. */
+  loraTargetModules: string;
   wandbEnabled: boolean;
   wandbProject: string;
   wandbEntity: string;
@@ -1032,6 +1074,25 @@ export type RolloutOutcomeEntry = {
   logPath: string;
 };
 
+export type RolloutRtcMode = "auto" | "enabled" | "disabled";
+
+export type RolloutRtcSchedule = "EXP" | "LINEAR" | "ONES" | "ZEROS";
+
+export type RolloutRuntimeOptions = {
+  /** Empty lets the runtime recover the single task prompt recorded in the dataset view. */
+  taskPrompt?: string;
+  /** auto enables RTC for flow policies such as pi0.5 and keeps it off for ACT. */
+  rtcMode?: RolloutRtcMode;
+  rtcExecutionHorizon?: number;
+  rtcMaxGuidanceWeight?: number;
+  rtcPrefixAttentionSchedule?: RolloutRtcSchedule;
+  rtcReplanQueueSize?: number;
+  /** null or undefined leaves the runtime to estimate the delay from measured inference time. */
+  rtcInferenceDelaySteps?: number | null;
+  /** null or undefined disables extra command EMA smoothing. */
+  commandEmaAlpha?: number | null;
+};
+
 export type RolloutStartRequest = {
   mode: string;
   checkpointId: string;
@@ -1039,4 +1100,5 @@ export type RolloutStartRequest = {
   overrideContract?: boolean;
   maxSteps?: number;
   moveToStart?: boolean;
+  runtimeOptions?: RolloutRuntimeOptions;
 };

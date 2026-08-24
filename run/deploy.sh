@@ -284,6 +284,13 @@ fi
 # "Could not get EGL display connection" / NvBufSurfaceMapEglImage failed,
 # while an unset DISPLAY takes the headless path and captures fine.
 gateway_env=(PYTHONPATH=src:. PYTHONUNBUFFERED=1)
+# tele-MS-7E07 has an administrator-maintained Hub-compatible cache on the shared model
+# volume. Prefer it to a second per-user download and fail deterministically if a required
+# model is absent; an operator can deliberately disable offline mode when a network fetch is
+# genuinely wanted.
+if [[ "$profile" == "workstation" && -d /home/tele/Models/models--google--paligemma-3b-pt-224 ]]; then
+  gateway_env+=(HF_HUB_CACHE=/home/tele/Models HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1)
+fi
 if [[ -n "$display" ]]; then
   gateway_env+=(DISPLAY="$display")
 fi

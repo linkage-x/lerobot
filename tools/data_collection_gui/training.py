@@ -32,6 +32,7 @@ from typing import Any
 LOCAL_HOST_ID = "local"
 PROBE_SCRIPT = Path("tools/fr3/probe_training_machine.py")
 TRAIN_SCRIPT = Path("tools/fr3/fr3_train_il_policy.py")
+INSTALL_SCRIPT = Path("tools/fr3/install_training_deps.sh")
 # Where a host's W&B key lives. Outside the repo tree on purpose: `outputs/` is excluded
 # from the sync, but a secret one `git add -A` away from a commit is a bad shape even so.
 SECRETS_DIR = Path.home() / ".config" / "lerobot-gui"
@@ -40,6 +41,27 @@ SSH_OPTS = ("-o", "ConnectTimeout=8", "-o", "BatchMode=yes", "-o", "StrictHostKe
 # this string is used to build commands, so it is the one input that must not be able to
 # carry shell metacharacters.
 SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$")
+# A Hugging Face repo id (`lerobot/pi05_base`) or an absolute local checkpoint directory.
+# Same reasoning as SSH_TARGET_RE: this string is placed on a command line that may be wrapped
+# in `ssh`, so characters a shell would act on are refused here rather than quoted and hoped
+# for. `~` is out too -- it would expand against the *remote* home, which is not the directory
+# the operator is looking at. The explicit absolute-path branch matters for model caches such as
+# `/home/tele/Models/pi05_base`; the former pattern accidentally required the first character to
+# be alphanumeric and therefore rejected every absolute path.
+PRETRAINED_PATH_RE = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9._/\-]{0,255}|/[A-Za-z0-9][A-Za-z0-9._/\-]{0,255})$")
+# A PEFT target spec is name suffixes, 'all-linear', or a regex -- and pi0.5's own default is a
+# regex full of backslashes and pipes. So this is not a shell filter: `shlex.quote` already makes
+# every argv item safe, including this one. It only rejects the characters that are never part of
+# a module name or a sane regex and always mean the field was pasted from somewhere unexpected.
+_TARGET_MODULES_MAX_CHARS = 512
+# A pyproject extra name, as the page asks for it when the operator clicks Install. Same
+# reasoning again -- this reaches a command line, over ssh for a remote host -- and the set of
+# real extras is small and tame, so the pattern can be strict. It matches the one the install
+# script re-checks on the far side: neither trusts the other, because the script is also run by
+# hand and the gateway also talks to machines running a different checkout.
+EXTRA_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+_MAX_EXTRAS = 8
+TELE_MODEL_CACHE = Path("/home/tele/Models")
 
 
 class TrainingError(RuntimeError):
@@ -79,6 +101,31 @@ class TrainingRunStatus:
     lastLines: list[str] = field(default_factory=list)
 
 
+@dataclass
+class DependencyInstallStatus:
+    """The install the Training page is showing in its log window, if any.
+
+    Deliberately not persisted the way a training run is. A run lasts hours and the gateway is
+    restarted under it; an install lasts minutes, and if the gateway goes down mid-sync the
+    honest answer on the other side is "unknown, re-probe" rather than a resurrected status
+    whose process this gateway can no longer see. Concurrency is not left to this object
+    either: uv takes an exclusive lock on the environment, so a second sync waits rather than
+    interleaving with the first.
+    """
+
+    state: str = "idle"  # idle | running | complete | error
+    hostId: str = ""
+    hostLabel: str = ""
+    extras: list[str] = field(default_factory=list)
+    command: str = ""
+    message: str = ""
+    pid: int | None = None
+    startedAt: str = ""
+    finishedAt: str = ""
+    logPath: str = ""
+    lastLines: list[str] = field(default_factory=list)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -100,6 +147,66 @@ def validate_remote_dir(repo_dir: str) -> str:
     if any(ch in repo_dir for ch in "'\"\\$`\n"):
         raise TrainingError("Remote repo directory must not contain shell metacharacters.")
     return repo_dir.rstrip("/")
+
+
+def validate_pretrained_path(value: str) -> str:
+    value = (value or "").strip()
+    if not PRETRAINED_PATH_RE.match(value):
+        raise TrainingError(
+            f"Base checkpoint must be a Hugging Face repo id or a path (got {value!r}). "
+            "Names are used to build shell commands, so anything else is refused."
+        )
+    return value
+
+
+def validate_extras(values: Any) -> list[str]:
+    """The extras to install, de-duplicated in the order asked for.
+
+    Order is kept rather than sorted so the command in the log reads the way the operator's
+    click did, and duplicates are dropped because the page can legitimately ask for the same
+    extra twice -- pi0.5 and LoRA are both fixed by `fr3-train`.
+
+    An empty list is a valid answer, not an error. torch, accelerate and wandb are base
+    dependencies of this project, so the fix for "act cannot train here: missing torch" is a
+    `uv sync` with no extra at all -- and refusing that was a button the page could not offer
+    on the one machine that most needed it.
+    """
+    if isinstance(values, str):
+        values = [values]
+    if values is None:
+        values = []
+    if not isinstance(values, (list, tuple)):
+        raise TrainingError("Extras must be a list of pyproject extra names.")
+    extras: list[str] = []
+    for item in values:
+        name = str(item or "").strip()
+        if not name:
+            continue
+        if not EXTRA_NAME_RE.match(name):
+            raise TrainingError(
+                f"{name!r} is not a pyproject extra name. Names are used to build shell "
+                "commands, so anything else is refused."
+            )
+        if name not in extras:
+            extras.append(name)
+    if len(extras) > _MAX_EXTRAS:
+        raise TrainingError(f"At most {_MAX_EXTRAS} extras can be installed at once.")
+    return extras
+
+
+def validate_lora_targets(value: str) -> str:
+    value = (value or "").strip()
+    if any(ord(char) < 32 for char in value):
+        raise TrainingError(
+            "LoRA target modules must not contain control characters. Use a comma-separated "
+            "list of module name suffixes, 'all-linear', or a regex."
+        )
+    if len(value) > _TARGET_MODULES_MAX_CHARS:
+        raise TrainingError(
+            f"LoRA target modules is {len(value)} characters; keep it under "
+            f"{_TARGET_MODULES_MAX_CHARS}."
+        )
+    return value
 
 
 # --------------------------------------------------------------------- hosts ---
@@ -379,6 +486,10 @@ def build_train_argv(
     wandb_enabled: bool,
     wandb_project: str,
     wandb_entity: str,
+    pretrained_path: str = "",
+    lora_enabled: bool = False,
+    lora_r: int = 16,
+    lora_target_modules: str = "",
 ) -> list[str]:
     """The training argv, identical in shape for local and remote.
 
@@ -390,6 +501,11 @@ def build_train_argv(
     The cameras, state keys and action contract are deliberately not passed. They are
     properties of frames that already exist, the view's manifest carries them, and a second
     copy on this command line could only ever be a way for the two to disagree.
+
+    The task prompt is not passed either, and for the same reason: it is written into the view's
+    task column when the view is built, so by the time a run starts it is already a property of
+    the frames. A `--task-prompt` here would be a second, disagreeing copy -- and the training
+    script refuses the flag alongside `--skip-prepare` for exactly that reason.
     """
     python_path = host.pythonPath if host.kind == "remote" else "{python}"
     argv = [
@@ -407,6 +523,20 @@ def build_train_argv(
         "--log-freq", str(int(log_freq)),
         "--device", device,
     ]
+    if pretrained_path:
+        argv += ["--pretrained-path", validate_pretrained_path(pretrained_path)]
+    if lora_enabled:
+        # Refused here rather than by the training script alone: on a remote host that failure
+        # is a line in a log file the page is not showing yet, and the operator has already
+        # waited out an rsync to see it.
+        if not pretrained_path:
+            raise TrainingError(
+                "LoRA finetunes an existing model and no base checkpoint was given. Set "
+                "'Base checkpoint' (for example lerobot/pi05_base), or turn LoRA off."
+            )
+        argv += ["--lora", "--lora-r", str(int(lora_r))]
+        if lora_target_modules.strip():
+            argv += ["--lora-target-modules", validate_lora_targets(lora_target_modules)]
     if use_amp:
         argv.append("--use-amp")
     if policy_config.strip():
@@ -430,8 +560,33 @@ def build_launch_command(
     back by the shell that starts training, because a key spelled out in an ssh command
     line is visible in the target's process list to every user on that machine.
     """
+    # Do not use W&B's defaults below ~/.cache or ~/.local/share. Those may have been
+    # provisioned by a different user (as on tele), while the training process is deliberately
+    # unprivileged. Keeping every W&B byproduct below outputs also makes a run self-contained.
+    wandb_dirs = {
+        "WANDB_DIR": "runs",
+        "WANDB_CACHE_DIR": "cache",
+        "WANDB_CONFIG_DIR": "config",
+        "WANDB_DATA_DIR": "data",
+        # The W&B CLI/core may consult the XDG default before its Python settings. Point it at
+        # the same writable tree so that fallback cannot recreate the ~/.cache failure.
+        "XDG_CACHE_HOME": "xdg-cache",
+    }
+
     if host.kind == "local":
+        wandb_root = repo_root / "outputs" / "wandb"
+        for relative_dir in wandb_dirs.values():
+            (wandb_root / relative_dir).mkdir(parents=True, exist_ok=True)
         env = {**os.environ, "PYTHONPATH": "src:.", "PYTHONUNBUFFERED": "1"}
+        env.update({name: str(wandb_root / relative_dir) for name, relative_dir in wandb_dirs.items()})
+        if TELE_MODEL_CACHE.is_dir():
+            env.update(
+                {
+                    "HF_HUB_CACHE": str(TELE_MODEL_CACHE),
+                    "HF_HUB_OFFLINE": "1",
+                    "TRANSFORMERS_OFFLINE": "1",
+                }
+            )
         if wandb_key:
             env["WANDB_API_KEY"] = wandb_key
         local_argv = [_local_python(repo_root) if item == "{python}" else item for item in argv]
@@ -445,11 +600,76 @@ def build_launch_command(
         if wandb_key
         else ""
     )
+    remote_wandb_root = "outputs/wandb"
+    remote_wandb_dirs = " ".join(
+        shlex.quote(f"{remote_wandb_root}/{relative_dir}") for relative_dir in wandb_dirs.values()
+    )
+    remote_wandb_env = " ".join(
+        f"{name}={shlex.quote(f'{remote_wandb_root}/{relative_dir}') }"
+        for name, relative_dir in wandb_dirs.items()
+    )
+    remote_hf_cache = (
+        f"if [ -d {shlex.quote(str(TELE_MODEL_CACHE))} ]; then "
+        f"export HF_HUB_CACHE={shlex.quote(str(TELE_MODEL_CACHE))} "
+        "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1; fi; "
+    )
     remote = (
         f"cd {shlex.quote(host.repoDir)} && "
         f"{key_prefix}"
+        f"mkdir -p {remote_wandb_dirs} && "
+        f"export {remote_wandb_env} && "
+        f"{remote_hf_cache}"
         f"export PYTHONPATH=src:. PYTHONUNBUFFERED=1 && "
         f"exec {remote_argv}"
+    )
+    return ["ssh", *SSH_OPTS, host.sshTarget, remote], None
+
+
+# ------------------------------------------------------- dependency install ---
+
+
+# The extras a machine needs whatever the Training page was asked for. The recording
+# workstation shares one environment between the recorder and the trainer -- gateway.py hands
+# the recorder `.venv-fr3/bin/python` as soon as that path exists -- so every sync there has to
+# carry the recorder's own extras. Two things follow: an environment this button *builds* comes
+# out a superset rather than a training-only venv the recorder would then be pointed at, and an
+# environment it *extends* is resolved with the recorder's constraints in view instead of
+# treating those packages as extraneous.
+WORKSTATION_BASELINE_EXTRAS = ("fr3-workstation-teleop", "fr3-host")
+
+
+def baseline_extras(host: TrainingHost, profile: str) -> tuple[str, ...]:
+    """What `host` needs beyond the training extras, given what this gateway is running as.
+
+    Empty for a remote training box: nothing records there, so the environment is free to be
+    the training one and only that.
+    """
+    if host.kind == "local" and profile == "workstation":
+        return WORKSTATION_BASELINE_EXTRAS
+    return ()
+
+
+def build_install_command(
+    repo_root: Path, host: TrainingHost, extras: list[str]
+) -> tuple[list[str], dict[str, str] | None]:
+    """`install_training_deps.sh [extras...]`, local or over ssh.
+
+    The remote path runs the script *from the host's own checkout* rather than piping it over
+    stdin the way the probe does. The probe has to work on a machine with no repo -- answering
+    "is there one there" is half its job -- but `uv sync` reads pyproject.toml, so requiring the
+    sync first turns a confusing failure into an obvious one.
+    """
+    extras = validate_extras(extras)
+    if host.kind == "local":
+        script = repo_root / INSTALL_SCRIPT
+        if not script.is_file():
+            raise TrainingError(f"Install script missing: {script}")
+        return ["bash", str(script), *extras], {**os.environ, "PYTHONUNBUFFERED": "1"}
+
+    remote_extras = "".join(f" {shlex.quote(extra)}" for extra in extras)
+    remote = (
+        f"cd {shlex.quote(host.repoDir)} && "
+        f"exec bash {shlex.quote(str(INSTALL_SCRIPT))}{remote_extras}"
     )
     return ["ssh", *SSH_OPTS, host.sshTarget, remote], None
 

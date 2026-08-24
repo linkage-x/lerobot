@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../apiClient";
 import type {
+  DependencyInstall,
   TrainingHost,
   TrainingMachine,
   TrainingRun,
   TrainingView,
   TrainingWandbStatus
 } from "../types";
-import { Metric, PageHeader, StatusDot } from "../shared/ui";
+import { Metric, Modal, PageHeader, StatusDot } from "../shared/ui";
 import { CheckpointBrowser } from "../shared/CheckpointBrowser";
 
 // Mirrors KNOWN_POLICY_TYPES in tools/fr3/fr3_train_il_policy.py. Split by what has actually
@@ -28,6 +29,89 @@ const OTHER_POLICIES = [
   "sac",
   "sarm"
 ] as const;
+
+// The base checkpoint each VLA finetunes from, so picking the policy fills the field with a
+// model that exists rather than leaving the operator to remember a repo id. Only a default: the
+// field stays editable, and a checkpoint trained here is a legitimate value for it too.
+const DEFAULT_BASE_CHECKPOINT: Record<string, string> = {
+  pi0: "lerobot/pi0_base",
+  pi05: "lerobot/pi05_base",
+  pi0_fast: "lerobot/pi0fast_base",
+  smolvla: "lerobot/smolvla_base"
+};
+
+// The workstation's shared model volume contains a verified local pi0.5 checkpoint. Keep this
+// host-specific: other training machines must retain the portable Hugging Face repo default.
+const TELE_PI05_BASE_CHECKPOINT = "/home/tele/Models/pi05_base";
+
+function defaultBaseCheckpoint(policy: string, machine: TrainingMachine | null): string {
+  if (policy === "pi05" && machine?.hostname === "tele-MS-7E07") {
+    return TELE_PI05_BASE_CHECKPOINT;
+  }
+  return DEFAULT_BASE_CHECKPOINT[policy] ?? "";
+}
+
+// Policies that are pretrained models to adapt rather than architectures to fit from scratch.
+// Training one of these from random weights on a few hundred FR3 episodes is not a smaller
+// version of finetuning it -- it is a different, much worse thing, and the page should say so.
+const FINETUNE_POLICIES = new Set(Object.keys(DEFAULT_BASE_CHECKPOINT));
+
+// These presets are deliberately specific to the workstation's 30 fps delta-action
+// training views. They are not replacements for the policy dataclass defaults used by
+// the CLI: an absolute-pose task, a differently sampled dataset, or an established
+// rollout latency budget needs its own measured configuration.
+const ACT_DELTA_STARTING_POLICY_CONFIG = JSON.stringify({
+  chunk_size: 30,
+  n_action_steps: 1,
+  temporal_ensemble_coeff: 0.01,
+  optimizer_lr: 2.5e-5,
+  optimizer_lr_backbone: 1e-5
+});
+
+const PI05_LORA_24GB_STARTING_POLICY_CONFIG = JSON.stringify({
+  dtype: "bfloat16",
+  gradient_checkpointing: true,
+  compile_model: true,
+  optimizer_lr: 1e-4,
+  scheduler_warmup_steps: 1000,
+  scheduler_decay_steps: 20000,
+  scheduler_decay_lr: 1e-5
+});
+
+type TrainingPreset = {
+  batchSize: string;
+  description: string;
+  name: string;
+  policyConfig: string;
+  saveFreq: string;
+  steps: string;
+};
+
+function startingPreset(policy: string, actionMode: string | undefined): TrainingPreset | null {
+  if (policy === "act" && actionMode === "delta_ee_from_prev_cmd") {
+    return {
+      name: "FR3 delta ACT",
+      description:
+        "30-frame prediction horizon (1.0 s), re-plan every frame, temporal ensemble 0.01; avoids the upstream 100-frame / 3.33 s open-loop execution.",
+      policyConfig: ACT_DELTA_STARTING_POLICY_CONFIG,
+      steps: "20000",
+      batchSize: "8",
+      saveFreq: "2000"
+    };
+  }
+  if (policy === "pi05") {
+    return {
+      name: "pi0.5 + LoRA on 24 GiB",
+      description:
+        "BF16, gradient checkpointing, and compilation keep the first adapter run inside a 24 GiB GPU budget; batch size 2 is intentionally conservative.",
+      policyConfig: PI05_LORA_24GB_STARTING_POLICY_CONFIG,
+      steps: "20000",
+      batchSize: "2",
+      saveFreq: "2000"
+    };
+  }
+  return null;
+}
 
 const RUNNING_STATES = new Set(["syncing", "starting", "running"]);
 
@@ -83,11 +167,27 @@ export function TrainingPage() {
   // they did not. See the note under the box.
   const [useAmp, setUseAmp] = useState(false);
   const [policyConfig, setPolicyConfig] = useState("");
+  const [policyConfigEdited, setPolicyConfigEdited] = useState(false);
+
+  const [pretrainedPath, setPretrainedPath] = useState("");
+  // Whether the operator has typed their own base checkpoint. Until they do, it tracks the
+  // policy -- leaving pi0.5's base sitting in the field after switching to ACT would send
+  // lerobot_train looking for pi0.5 weights to load into a ResNet.
+  const [pretrainedPathEdited, setPretrainedPathEdited] = useState(false);
+  const [loraEnabled, setLoraEnabled] = useState(false);
+  const [loraR, setLoraR] = useState("16");
+  const [loraTargetModules, setLoraTargetModules] = useState("");
 
   const [wandbEnabled, setWandbEnabled] = useState(false);
   const [wandbProject, setWandbProject] = useState("lerobot");
   const [wandbEntity, setWandbEntity] = useState("");
   const [wandbKeyInput, setWandbKeyInput] = useState("");
+
+  // The dependency install and its log window. `install` is the gateway's status object, so
+  // the modal shows a sync started before this page was opened (or reloaded) rather than an
+  // empty box next to a machine that is visibly busy.
+  const [install, setInstall] = useState<DependencyInstall | null>(null);
+  const [installOpen, setInstallOpen] = useState(false);
 
   const [showAddHost, setShowAddHost] = useState(false);
   const [newHostLabel, setNewHostLabel] = useState("");
@@ -99,8 +199,43 @@ export function TrainingPage() {
 
   const selectedHost = useMemo(() => hosts.find((h) => h.id === hostId), [hosts, hostId]);
   const selectedView = useMemo(() => views.find((v) => v.name === viewName), [views, viewName]);
+  const selectedPreset = useMemo(
+    () => startingPreset(policy, selectedView?.actionMode),
+    [policy, selectedView?.actionMode]
+  );
   const isRunning = run !== null && RUNNING_STATES.has(run.state);
   const policySupport = machine?.policies?.[policy];
+  const loraSupport = machine?.features?.lora;
+  const isFinetunePolicy = FINETUNE_POLICIES.has(policy);
+  const installer = machine?.installer;
+  // The machine has no uv environment at all. Every policy is blocked by that one fact, so the
+  // page says it once, on the machine card, rather than once per policy the operator clicks.
+  const needsEnvironment = machine?.ok === true && installer?.willCreateEnvironment === true;
+  // Named on the machine card so the environment is a property of the machine on the page the
+  // way it is on the box, rather than something the operator discovers one policy at a time.
+  const blockedPolicies = useMemo(
+    () =>
+      Object.entries(machine?.policies ?? {})
+        .filter(([, support]) => support.trainable === false)
+        .map(([name]) => name),
+    [machine]
+  );
+  const installRunning = install?.state === "running";
+  // Everything the selected policy and the ticked options need, asked for in one sync. Two
+  // clicks would mean two resolutions of the same environment, and the second one would be
+  // deciding what to do about the packages the first had just installed.
+  const missingExtras = useMemo(() => {
+    const wanted: string[] = [];
+    for (const extra of policySupport?.trainable === false ? policySupport.extras ?? [] : []) {
+      if (!wanted.includes(extra)) wanted.push(extra);
+    }
+    if (loraEnabled && loraSupport?.available === false) {
+      for (const extra of loraSupport.extras ?? []) {
+        if (!wanted.includes(extra)) wanted.push(extra);
+      }
+    }
+    return wanted;
+  }, [policySupport, loraSupport, loraEnabled]);
 
   const refreshHosts = useCallback(async () => {
     const list = await api.fetchTrainingHosts();
@@ -121,6 +256,10 @@ export function TrainingPage() {
   useEffect(() => {
     void refreshHosts();
     void api.fetchTrainingViews().then(setViews);
+    // Once, on mount: an install started from another browser tab -- or before this page was
+    // reloaded -- is still running on the machine, and the poll below only starts once
+    // something says one is.
+    void api.fetchDependencyInstall().then(setInstall);
   }, [refreshHosts]);
 
   useEffect(() => {
@@ -161,6 +300,49 @@ export function TrainingPage() {
     if (selectedView && !jobNameEdited) setJobName(`${selectedView.name}__${policy}`);
   }, [selectedView, policy, jobNameEdited]);
 
+  useEffect(() => {
+    if (!pretrainedPathEdited) setPretrainedPath(defaultBaseCheckpoint(policy, machine));
+  }, [policy, machine, pretrainedPathEdited]);
+
+  // Seed a safe first run after the QC-gated view has arrived. Once the operator edits the
+  // JSON it remains theirs; the button below is the explicit way to return to this preset.
+  useEffect(() => {
+    if (!policyConfigEdited && selectedPreset) setPolicyConfig(selectedPreset.policyConfig);
+  }, [policyConfigEdited, selectedPreset]);
+
+  // LoRA has nothing to adapt without a base model, and the start button would otherwise be
+  // enabled for a run the gateway is about to refuse.
+  useEffect(() => {
+    if (!pretrainedPath.trim()) setLoraEnabled(false);
+  }, [pretrainedPath]);
+
+  // Polled only while there is something to watch: an install lasts minutes, and the rest of
+  // the time this would be a request per second asking a machine that is not installing
+  // anything whether it has finished not installing it.
+  useEffect(() => {
+    if (!installOpen && !installRunning) return;
+    let cancelled = false;
+    const tick = async () => {
+      const status = await api.fetchDependencyInstall();
+      if (!cancelled) setInstall(status);
+    };
+    void tick();
+    const timer = window.setInterval(tick, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [installOpen, installRunning]);
+
+  // Re-probe once, when the install stops running. The whole point of the button is the
+  // machine's answer changing, and an operator should not have to know to press Refresh to
+  // see it.
+  const wasInstalling = useRef(false);
+  useEffect(() => {
+    if (wasInstalling.current && !installRunning) void refreshMachine(hostId);
+    wasInstalling.current = installRunning;
+  }, [installRunning, hostId, refreshMachine]);
+
   const wrap = async (label: string, action: () => Promise<{ ok: boolean; error?: string }>) => {
     setBusy(true);
     setError("");
@@ -188,6 +370,14 @@ export function TrainingPage() {
       await refreshHosts();
       setNotice("Training host added.");
     }
+  };
+
+  const onInstallDeps = async (extras: string[]) => {
+    setInstallOpen(true);
+    const result = await wrap("Install dependencies", () =>
+      api.installTrainingDeps(hostId, extras)
+    );
+    if (result.ok) setInstall((result as { install?: DependencyInstall }).install ?? null);
   };
 
   const onSync = async () => {
@@ -231,6 +421,10 @@ export function TrainingPage() {
         device: "auto",
         useAmp,
         policyConfig,
+        pretrainedPath: pretrainedPath.trim(),
+        loraEnabled,
+        loraR: Number(loraR) || 16,
+        loraTargetModules,
         wandbEnabled,
         wandbProject,
         wandbEntity
@@ -240,6 +434,25 @@ export function TrainingPage() {
       setRun((result as { training?: TrainingRun }).training ?? null);
       setNotice("Training started.");
     }
+  };
+
+  const applyStartingPreset = (preset: TrainingPreset) => {
+    setSteps(preset.steps);
+    setBatchSize(preset.batchSize);
+    setSaveFreq(preset.saveFreq);
+    setPolicyConfig(preset.policyConfig);
+    setPolicyConfigEdited(false);
+    setNotice(`${preset.name} starting preset applied.`);
+  };
+
+  const onPolicyChange = (nextPolicy: string) => {
+    setPolicy(nextPolicy);
+    // A config copied from ACT into pi0.5 (or vice versa) is worse than no config. Selecting
+    // a policy therefore seeds its applicable preset rather than retaining stale JSON.
+    setPolicyConfigEdited(false);
+    const preset = startingPreset(nextPolicy, selectedView?.actionMode);
+    if (preset) applyStartingPreset(preset);
+    else setPolicyConfig("");
   };
 
   const onStop = async () => {
@@ -375,6 +588,38 @@ export function TrainingPage() {
               <p className="hint">No GPU reported{machine.gpuError ? ` — ${machine.gpuError}` : "."}</p>
             )}
 
+            {needsEnvironment ? (
+              <div className="banner banner-warn">
+                <div>
+                  {selectedHost?.label} has no <code>{installer?.venvPath ?? ".venv-fr3"}</code>{" "}
+                  yet, so nothing can train there. Dependencies here are managed with uv; this
+                  builds the environment and installs{" "}
+                  {missingExtras.length > 0
+                    ? `${missingExtras.join(" + ")} along with everything else that machine needs.`
+                    : "everything that machine needs."}
+                </div>
+                <DependencyInstallControls
+                  extras={missingExtras}
+                  installer={installer}
+                  hostLabel={selectedHost?.label ?? ""}
+                  busy={busy}
+                  installRunning={installRunning}
+                  trainingRunning={isRunning}
+                  onInstall={() => void onInstallDeps(missingExtras)}
+                  onShowLog={() => setInstallOpen(true)}
+                  hasLog={Boolean(install && install.state !== "idle")}
+                />
+              </div>
+            ) : (
+              blockedPolicies.length > 0 && (
+                <p className="hint">
+                  Cannot train here yet: <strong>{blockedPolicies.join(", ")}</strong>. Pick one
+                  below to see what it needs and install it.
+                  {installer && !installer.canInstall ? ` ${installer.reason}` : ""}
+                </p>
+              )
+            )}
+
             {selectedHost?.kind === "remote" && (
               <div className="row-actions">
                 <button type="button" onClick={() => void onSync()} disabled={busy || isRunning}>
@@ -483,7 +728,7 @@ export function TrainingPage() {
         <div className="field-row">
           <label className="field">
             <span>Policy</span>
-            <select value={policy} onChange={(event) => setPolicy(event.target.value)} disabled={isRunning}>
+            <select value={policy} onChange={(event) => onPolicyChange(event.target.value)} disabled={isRunning}>
               <optgroup label="Trained and rolled out on this rig">
                 {VERIFIED_POLICIES.map((name) => (
                   <option key={name} value={name}>
@@ -520,10 +765,47 @@ export function TrainingPage() {
           run&apos;s log file carries the same stamp.
         </p>
 
+        {selectedPreset && (
+          <div className="banner banner-warn">
+            <div>
+              <strong>{selectedPreset.name} starting preset.</strong> {selectedPreset.description}
+            </div>
+            <div className="row-actions">
+              <button type="button" onClick={() => applyStartingPreset(selectedPreset)} disabled={isRunning}>
+                Apply starting preset
+              </button>
+            </div>
+          </div>
+        )}
+
         {policySupport && !policySupport.trainable && (
           <div className="banner banner-warn">
-            {policy} cannot run on {selectedHost?.label}: missing {policySupport.missing.join(", ")}.
-            Install the matching extra there before starting.
+            <div>
+              {policy} cannot run on {selectedHost?.label}: missing{" "}
+              {policySupport.missing.join(", ")}.
+              {missingExtras.length > 0
+                ? ` Installing ${missingExtras.join(" + ")} on that machine fixes it.`
+                : " Those are base dependencies of this project, so syncing the environment" +
+                  " is the whole fix."}
+            </div>
+            {needsEnvironment ? (
+              <div className="hint">
+                Build the environment first — the button on the machine card above does it, and
+                the plan already includes what {policy} needs.
+              </div>
+            ) : (
+              <DependencyInstallControls
+                extras={missingExtras}
+                installer={installer}
+                hostLabel={selectedHost?.label ?? ""}
+                busy={busy}
+                installRunning={installRunning}
+                trainingRunning={isRunning}
+                onInstall={() => void onInstallDeps(missingExtras)}
+                onShowLog={() => setInstallOpen(true)}
+                hasLog={Boolean(install && install.state !== "idle")}
+              />
+            )}
           </div>
         )}
 
@@ -550,18 +832,112 @@ export function TrainingPage() {
           </label>
         </div>
 
+        <div className="field-row">
+          <label className="field">
+            <span>Base checkpoint (optional)</span>
+            <input
+              value={pretrainedPath}
+              onChange={(event) => {
+                setPretrainedPathEdited(true);
+                setPretrainedPath(event.target.value);
+              }}
+              placeholder="lerobot/pi05_base, or a local checkpoint directory"
+              disabled={isRunning}
+            />
+          </label>
+          <label className="field-inline">
+            <input
+              type="checkbox"
+              checked={loraEnabled}
+              onChange={(event) => setLoraEnabled(event.target.checked)}
+              disabled={isRunning || !pretrainedPath.trim() || loraSupport?.available === false}
+            />
+            <span>LoRA (freeze the base, train an adapter)</span>
+          </label>
+        </div>
+        {loraEnabled && (
+          <div className="field-row">
+            <label className="field">
+              <span>LoRA rank</span>
+              <input value={loraR} onChange={(e) => setLoraR(e.target.value)} disabled={isRunning} />
+            </label>
+            <label className="field">
+              <span>Target modules (optional)</span>
+              <input
+                value={loraTargetModules}
+                onChange={(e) => setLoraTargetModules(e.target.value)}
+                placeholder="(policy default)"
+                disabled={isRunning}
+              />
+            </label>
+          </div>
+        )}
+        <p className="hint">
+          A base checkpoint supplies <em>weights only</em> — every hyperparameter still comes from
+          this page. Left empty, {policy} trains from random initialization.{" "}
+          {isFinetunePolicy && !pretrainedPath.trim() && (
+            <strong>
+              {policy} is a pretrained model meant to be adapted; from scratch on one rig&apos;s
+              episodes it will not learn the task.
+            </strong>
+          )}{" "}
+          {loraEnabled ? (
+            <>
+              LoRA trains an adapter on frozen base weights — far less GPU memory, and the
+              checkpoint holds the adapter rather than the whole model. Leave{" "}
+              <em>Target modules</em> empty to use the policy&apos;s own default: pi0.5 targets its
+              action expert&apos;s q/v projections plus the state and action projections, which is
+              the tuned answer for it. Rank and targets are the only adapter knobs LeRobot&apos;s{" "}
+              <code>PeftConfig</code> exposes — there is no alpha or dropout field to set.
+            </>
+          ) : null}
+        </p>
+        {loraSupport?.available === false && (
+          <div className="banner banner-warn">
+            <div>
+              LoRA is unavailable on {selectedHost?.label}: missing{" "}
+              {loraSupport.missing.join(", ")}.
+            </div>
+            {!needsEnvironment && (
+              <DependencyInstallControls
+                extras={loraSupport.extras ?? []}
+                installer={installer}
+                hostLabel={selectedHost?.label ?? ""}
+                busy={busy}
+                installRunning={installRunning}
+                trainingRunning={isRunning}
+                onInstall={() => void onInstallDeps(loraSupport.extras ?? [])}
+                onShowLog={() => setInstallOpen(true)}
+                hasLog={Boolean(install && install.state !== "idle")}
+              />
+            )}
+          </div>
+        )}
+        {isFinetunePolicy && (
+          <p className="hint">
+            First run only: pi0/pi0.5 tokenize their prompt with{" "}
+            <code>google/paligemma-3b-pt-224</code>, a <strong>gated</strong> Hugging Face repo.
+            Accept its terms on the model page and <code>hf auth login</code> on the training
+            machine, or the run stops in the pre-processor with a 401.
+          </p>
+        )}
+
         <label className="field">
           <span>Policy config (JSON, optional)</span>
           <input
             value={policyConfig}
-            onChange={(event) => setPolicyConfig(event.target.value)}
+            onChange={(event) => {
+              setPolicyConfigEdited(true);
+              setPolicyConfig(event.target.value);
+            }}
             placeholder='{"chunk_size": 50, "optimizer_lr": 2.5e-5}'
             disabled={isRunning}
           />
         </label>
         <p className="hint">
-          Left empty, {policy} trains on its own upstream LeRobot defaults (ACT: chunk_size 100,
-          n_action_steps 100, lr 1e-5). Anything typed here wins over them.
+          {selectedPreset
+            ? `The ${selectedPreset.name} JSON above is the selected starting point. Anything typed here wins over it.`
+            : `Left empty, ${policy} trains on its own upstream LeRobot defaults (ACT: chunk_size 100, n_action_steps 100, lr 1e-5). Anything typed here wins over them.`}
         </p>
 
         <label className="field-inline">
@@ -638,6 +1014,125 @@ export function TrainingPage() {
         </p>
         <CheckpointBrowser mode="manage" refreshToken={artifactToken} />
       </section>
+
+      {installOpen && (
+        <Modal
+          title="Training dependencies"
+          className="cali-modal-wide"
+          onClose={() => setInstallOpen(false)}
+          footer={
+            <>
+              <span className="hint">
+                {installRunning
+                  ? "Closing this leaves the install running; reopen it from the banner."
+                  : install?.logPath || ""}
+              </span>
+              <button type="button" onClick={() => setInstallOpen(false)}>
+                {installRunning ? "Hide" : "Close"}
+              </button>
+            </>
+          }
+        >
+          <InstallLogView install={install} />
+        </Modal>
+      )}
     </div>
+  );
+}
+
+/** The Install button, plus the reasons it is not one. */
+function DependencyInstallControls({
+  extras,
+  installer,
+  hostLabel,
+  busy,
+  installRunning,
+  trainingRunning,
+  onInstall,
+  onShowLog,
+  hasLog
+}: {
+  extras: string[];
+  installer: TrainingMachine["installer"];
+  hostLabel: string;
+  busy: boolean;
+  installRunning: boolean;
+  trainingRunning: boolean;
+  onInstall: () => void;
+  onShowLog: () => void;
+  hasLog: boolean;
+}) {
+  // Every one of these is a state the operator can be in, and each has a different answer.
+  // Collapsing them into a disabled button with no explanation is how a page ends up being
+  // described as broken.
+  const blocked = trainingRunning
+    ? "A training run is using this environment; stop it first."
+    : installRunning
+      ? "An install is already running."
+      : installer && !installer.canInstall
+        ? installer.reason
+        : "";
+
+  // No extra to name is not nothing to do: torch and accelerate are base dependencies, so a
+  // bare `uv sync` is the fix, and it is also what a machine with no environment at all needs.
+  const building = installer?.willCreateEnvironment === true;
+  const label = building
+    ? "Build environment with uv"
+    : extras.length > 0
+      ? `Install ${extras.join(" + ")}`
+      : "Sync base dependencies";
+
+  return (
+    <div className="row-actions">
+      <button type="button" onClick={onInstall} disabled={busy || Boolean(blocked)}>
+        {installRunning ? "Installing…" : label}
+      </button>
+      {hasLog && (
+        <button type="button" onClick={onShowLog}>
+          View install log
+        </button>
+      )}
+      <span className="hint">
+        {blocked ||
+          (building
+            ? `${hostLabel} has no ${installer?.venvPath ?? ".venv-fr3"} yet. This builds it with ` +
+              "uv, including everything else that machine needs — several GB, once."
+            : `Runs uv sync on ${hostLabel} and streams the log here. It adds packages; it ` +
+              "never removes one, so the recorder's own dependencies survive it.")}
+      </span>
+    </div>
+  );
+}
+
+/** The install's own output, tailed. */
+function InstallLogView({ install }: { install: DependencyInstall | null }) {
+  const ref = useRef<HTMLPreElement | null>(null);
+  useEffect(() => {
+    if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
+  }, [install?.lastLines?.length]);
+
+  if (!install || install.state === "idle") {
+    return <p className="hint">Nothing has been installed from this page yet.</p>;
+  }
+  return (
+    <>
+      <div className="metric-row">
+        <Metric label="Machine" value={install.hostLabel || install.hostId} />
+        <Metric label="Extras" value={install.extras.join(", ")} />
+        <Metric label="State" value={install.state} />
+      </div>
+      <p className="hint">{install.message}</p>
+      <p className="hint">
+        <code>{install.command}</code>
+      </p>
+      <pre className="log-block" ref={ref}>
+        {install.lastLines.join("\n") || "Waiting for output…"}
+      </pre>
+      {install.state === "complete" && (
+        <p className="hint">
+          The machine has been re-probed; the banner above now reflects what it reports.
+        </p>
+      )}
+    </>
   );
 }

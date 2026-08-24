@@ -134,4 +134,11 @@ describe("rollout page safety gating", () => {
     expect(rolloutPageSource).toContain("(mode.movesArm && !confirmMotion)");
     expect(rolloutPageSource).toContain("(blocking.length > 0 && !overrideContract)");
   });
+
+  it("keeps pi0.5+LoRA runtime defaults on the Rollout page", () => {
+    expect(rolloutPageSource).toContain("pi0.5+LoRA first rollout defaults");
+    expect(rolloutPageSource).toContain("runtimeOptions: rolloutRuntimeOptions");
+    expect(rolloutPageSource).toContain("RTC auto stays disabled for ACT-style policies");
+    expect(rolloutPageSource).toContain("Show advanced rollout knobs");
+  });
 });

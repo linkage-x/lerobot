@@ -211,6 +211,9 @@ def test_the_wandb_key_never_appears_in_the_launch_command(tmp_path):
     assert key not in " ".join(local_command)
     assert env is not None and env["WANDB_API_KEY"] == key
     assert env["PYTHONPATH"] == "src:."
+    assert env["WANDB_DIR"] == str(tmp_path / "outputs" / "wandb" / "runs")
+    assert env["WANDB_CACHE_DIR"] == str(tmp_path / "outputs" / "wandb" / "cache")
+    assert env["XDG_CACHE_HOME"] == str(tmp_path / "outputs" / "wandb" / "xdg-cache")
     # The placeholder is replaced, or the command would try to run a literal "{python}".
     assert "{python}" not in local_command
 
@@ -232,8 +235,28 @@ def test_a_remote_launch_runs_in_the_hosts_own_repo_directory(tmp_path):
     remote_script = command[-1]
     assert remote_script.startswith("cd /home/user/lerobot &&")
     assert "PYTHONPATH=src:." in remote_script
+    assert "mkdir -p outputs/wandb/runs outputs/wandb/cache outputs/wandb/config outputs/wandb/data outputs/wandb/xdg-cache" in remote_script
+    assert "WANDB_CACHE_DIR=outputs/wandb/cache" in remote_script
+    assert "HF_HUB_CACHE=/home/tele/Models" in remote_script
+    assert "HF_HUB_OFFLINE=1" in remote_script
+    assert "TRANSFORMERS_OFFLINE=1" in remote_script
     # Nothing to read the key from, so nothing tries to.
     assert ".wandb_key" not in remote_script
+
+
+def test_a_local_launch_uses_the_tele_model_cache_when_present(tmp_path, monkeypatch):
+    model_cache = tmp_path / "Models"
+    model_cache.mkdir()
+    monkeypatch.setattr(training, "TELE_MODEL_CACHE", model_cache)
+
+    _, env = training.build_launch_command(
+        tmp_path, training.local_host(tmp_path), ["{python}", "train.py"], wandb_key=""
+    )
+
+    assert env is not None
+    assert env["HF_HUB_CACHE"] == str(model_cache)
+    assert env["HF_HUB_OFFLINE"] == "1"
+    assert env["TRANSFORMERS_OFFLINE"] == "1"
 
 
 # ----------------------------------------------------------------------- wandb ---
@@ -375,9 +398,112 @@ def test_no_torch_means_nothing_is_trainable():
     from tools.fr3 import probe_training_machine
 
     without = probe_training_machine.query_policies(torch_installed=False)["policies"]
-    assert without["act"] == {"trainable": False, "missing": ["torch"]}
+    assert without["act"] == {"trainable": False, "missing": ["torch"], "extras": []}
     assert without["smolvla"]["trainable"] is False
     assert without["smolvla"]["missing"][0] == "torch"
+
+
+def _finetune_argv(**overrides) -> list[str]:
+    common = {
+        "host": _remote_host(),
+        "view_root": "/repo/view",
+        "repo_id": "local/v",
+        "job_name": "v__pi05",
+        "policy": "pi05",
+        "steps": 10,
+        "batch_size": 2,
+        "num_workers": 4,
+        "save_freq": 5,
+        "log_freq": 1,
+        "device": "cuda",
+        "use_amp": False,
+        "policy_config": "",
+        "wandb_enabled": False,
+        "wandb_project": "",
+        "wandb_entity": "",
+    }
+    common.update(overrides)
+    return training.build_train_argv(**common)
+
+
+def test_a_dense_run_asks_for_neither_a_base_model_nor_an_adapter():
+    argv = _finetune_argv()
+
+    assert "--pretrained-path" not in argv
+    assert "--lora" not in argv
+
+
+def test_finetuning_from_a_base_checkpoint_names_it_on_the_command_line():
+    argv = _finetune_argv(pretrained_path="lerobot/pi05_base")
+
+    assert argv[argv.index("--pretrained-path") + 1] == "lerobot/pi05_base"
+    # Weights only. Without --lora the run is a dense finetune of that checkpoint.
+    assert "--lora" not in argv
+
+
+def test_finetuning_accepts_an_absolute_local_base_checkpoint_path():
+    """The tele model cache is a local directory, not a Hugging Face repo id."""
+    base = "/home/tele/Models/pi05_base"
+    argv = _finetune_argv(pretrained_path=base, lora_enabled=True)
+
+    assert argv[argv.index("--pretrained-path") + 1] == base
+    assert "--lora" in argv
+
+
+@pytest.mark.parametrize("value", ("/", "/home/tele/Models/pi05 base", "/home/tele/$(id)", "~/Models/pi05_base"))
+def test_pretrained_path_rejects_unsafe_or_ambiguous_local_paths(value: str):
+    with pytest.raises(training.TrainingError):
+        training.validate_pretrained_path(value)
+
+
+def test_lora_carries_its_rank_and_leaves_the_targets_to_the_policy():
+    argv = _finetune_argv(pretrained_path="lerobot/pi05_base", lora_enabled=True, lora_r=32)
+
+    assert "--lora" in argv
+    assert argv[argv.index("--lora-r") + 1] == "32"
+    # pi0.5's own default target set is the tuned one; sending nothing is how it survives.
+    assert "--lora-target-modules" not in argv
+
+    targeted = _finetune_argv(
+        pretrained_path="lerobot/pi05_base",
+        lora_enabled=True,
+        lora_target_modules="all-linear",
+    )
+    assert targeted[targeted.index("--lora-target-modules") + 1] == "all-linear"
+
+
+def test_lora_without_a_base_model_is_refused_before_the_rsync():
+    """On a remote host the training script's own refusal is a line in a log nobody is reading."""
+    with pytest.raises(training.TrainingError, match="no base checkpoint"):
+        _finetune_argv(lora_enabled=True)
+
+
+def test_a_base_checkpoint_of_the_wrong_shape_is_refused():
+    """Caught here as a typo, with a message, rather than as a 404 from the Hub mid-run."""
+    with pytest.raises(training.TrainingError, match="Hugging Face repo id"):
+        _finetune_argv(pretrained_path="lerobot/pi05_base; rm -rf /")
+    with pytest.raises(training.TrainingError, match="Hugging Face repo id"):
+        _finetune_argv(pretrained_path="$(whoami)")
+
+
+def test_a_target_regex_survives_validation():
+    """pi0.5's own default target spec is a regex; a shell-metacharacter filter would reject it.
+
+    What makes these safe is `shlex.quote` in build_launch_command, not this function -- which
+    only rejects what is never part of a module name and always means a bad paste.
+    """
+    spec = r"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj)"
+    argv = _finetune_argv(
+        pretrained_path="lerobot/pi05_base", lora_enabled=True, lora_target_modules=spec
+    )
+    assert argv[argv.index("--lora-target-modules") + 1] == spec
+
+    with pytest.raises(training.TrainingError, match="control characters"):
+        _finetune_argv(
+            pretrained_path="lerobot/pi05_base",
+            lora_enabled=True,
+            lora_target_modules="q_proj\nv_proj",
+        )
 
 
 def test_policy_requirements_are_reported_under_their_install_names():
@@ -390,7 +516,61 @@ def test_policy_requirements_are_reported_under_their_install_names():
     groot = policies["groot"]["missing"]
     assert "tree" not in groot
     if groot:
-        assert set(groot) <= {"transformers", "peft", "timm", "dm-tree", "safetensors"}
+        # Names carry their floor where one is declared, because that is what an operator has to
+        # type: `pip install transformers` on a box that already has 4.49 is a no-op.
+        assert set(groot) <= {"transformers>=5.3", "peft>=0.18", "timm", "dm-tree", "safetensors"}
+
+
+def test_a_module_that_is_present_but_too_old_counts_as_missing(monkeypatch):
+    """pi0.5 imports `transformers.masking_utils` at module import; 4.x does not have it.
+
+    Presence is the wrong question here, and answering it made the page say "pi05: trainable"
+    on a machine where the run dies at step 0 inside a subprocess.
+    """
+    import importlib.util
+
+    from tools.fr3 import probe_training_machine
+
+    # Every module is installed as far as the probe can see, so the floor is the only thing
+    # left that can make an answer False.
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+
+    monkeypatch.setattr(probe_training_machine, "module_version", lambda name: "4.49.0")
+    assert not probe_training_machine.module_present("transformers")
+    # Modules without a declared floor are unaffected -- any scipy is a scipy.
+    assert probe_training_machine.module_present("scipy")
+
+    monkeypatch.setattr(probe_training_machine, "module_version", lambda name: "5.3.1")
+    assert probe_training_machine.module_present("transformers")
+
+    # An unreadable version is not evidence of an old one: an editable install still trains.
+    monkeypatch.setattr(probe_training_machine, "module_version", lambda name: "")
+    assert probe_training_machine.module_present("transformers")
+
+
+def test_a_version_floor_is_compared_numerically_not_lexically():
+    """`4.49.0` must not beat `5.3` the way a string comparison would have it."""
+    from tools.fr3 import probe_training_machine
+
+    assert probe_training_machine._version_tuple("4.49.0") < (5, 3)
+    assert probe_training_machine._version_tuple("5.3.0.dev0") == (5, 3, 0)
+    assert probe_training_machine._version_tuple("5.10.1") > (5, 3)
+    # Nothing numeric to read: reported as unknown, which the caller treats as satisfying.
+    assert probe_training_machine._version_tuple("main") == ()
+    assert probe_training_machine.module_requirement("transformers") == "transformers>=5.3"
+    assert probe_training_machine.module_requirement("tree") == "dm-tree"
+
+
+def test_lora_availability_is_reported_apart_from_the_policy_list(monkeypatch):
+    """A machine can train pi0.5 densely and not with an adapter; one flag cannot say both."""
+    from tools.fr3 import probe_training_machine
+
+    monkeypatch.setattr(probe_training_machine, "module_present", lambda name: name != "peft")
+
+    features = probe_training_machine.query_features()
+
+    assert features["lora"]["available"] is False
+    assert features["lora"]["missing"] == ["peft>=0.18"]
 
 
 def test_an_ordinary_log_line_that_ends_in_a_bracket_is_not_mistaken_for_a_bar():
@@ -398,3 +578,262 @@ def test_an_ordinary_log_line_that_ends_in_a_bracket_is_not_mistaken_for_a_bar()
     assert not training.is_progress_bar_noise("INFO checkpoint written to outputs/train/x [act]")
     assert not training.is_progress_bar_noise("INFO resolved delta_timestamps: [0.0, 0.033]")
     assert training.is_progress_bar_noise("Training: 30%|###| 6055/20000 [07:18<17:13, 13.49step/s]")
+
+
+# ------------------------------------------------------- dependency install ---
+
+
+def test_every_extra_the_probe_offers_is_one_pyproject_actually_has():
+    """The probe names the fix; uv is the one that has to recognise it.
+
+    These two lists are edited months apart -- a policy is added to the probe, an extra is
+    renamed in pyproject -- and the failure that drift produces is an install button that runs
+    a sync, waits, and comes back with "unknown extra" on a machine the operator had to walk to.
+    """
+    import tomllib
+
+    from tools.fr3 import probe_training_machine
+
+    with open("pyproject.toml", "rb") as handle:
+        declared = set(tomllib.load(handle)["project"]["optional-dependencies"])
+
+    offered = {
+        extra
+        for extras in (
+            *probe_training_machine.POLICY_EXTRAS.values(),
+            *probe_training_machine.FEATURE_EXTRAS.values(),
+        )
+        for extra in extras
+    }
+    assert offered
+    assert offered <= declared, f"not in pyproject: {sorted(offered - declared)}"
+    # And every one of them survives the validation the gateway puts them through, which is
+    # the other end of the same journey.
+    assert training.validate_extras(sorted(offered)) == sorted(offered)
+
+
+def test_every_policy_the_probe_judges_also_says_how_to_fix_it():
+    """A policy present in one map and absent from the other reports a gap with no remedy."""
+    from tools.fr3 import probe_training_machine
+
+    assert set(probe_training_machine.POLICY_EXTRAS) == set(
+        probe_training_machine.POLICY_REQUIREMENTS
+    )
+    assert set(probe_training_machine.FEATURE_EXTRAS) == set(
+        probe_training_machine.FEATURE_REQUIREMENTS
+    )
+    # A policy that needs no extra module needs no extra: act is fixed by having an environment
+    # at all, and offering "install ()" would be a button that does nothing.
+    for policy, requirements in probe_training_machine.POLICY_REQUIREMENTS.items():
+        if not requirements:
+            assert probe_training_machine.POLICY_EXTRAS[policy] == ()
+
+
+def test_the_extras_are_reported_next_to_what_is_missing():
+    from tools.fr3 import probe_training_machine
+
+    policies = probe_training_machine.query_policies(torch_installed=True)["policies"]
+
+    assert policies["pi05"]["extras"] == ["fr3-train"]
+    assert policies["act"]["extras"] == []
+    assert probe_training_machine.query_features()["lora"]["extras"] == ["peft"]
+
+
+def test_an_extra_name_that_could_reach_a_shell_is_refused():
+    """This string ends up in an ssh command line, so it is filtered rather than quoted."""
+    for bad in ("fr3-train; rm -rf /", "$(id)", "../../etc", "fr3 train", "-x", "`id`", "a|b"):
+        with pytest.raises(training.TrainingError):
+            training.validate_extras([bad])
+    # Blank entries are dropped rather than refused: an empty plan is the base-dependency sync,
+    # and a page that sends one empty string means the same thing as one that sends none.
+    assert training.validate_extras(["", "  "]) == []
+
+
+def test_the_same_extra_asked_for_twice_is_installed_once():
+    """pi0.5 and LoRA are both fixed by fr3-train, and the page can ask for both at once."""
+    assert training.validate_extras(["fr3-train", "peft", "fr3-train"]) == ["fr3-train", "peft"]
+    # Order is the operator's, not alphabetical: it is what the logged command will read like.
+    assert training.validate_extras(["smolvla", "fr3-train"]) == ["smolvla", "fr3-train"]
+
+
+def test_asking_for_no_extra_at_all_is_a_plan_not_an_error():
+    """"act cannot train here: missing torch" has no extra to name and a real fix.
+
+    torch, accelerate and wandb are base dependencies of this project, so `uv sync` with no
+    extra is the whole remedy. Refusing an empty list turned the button off on the one machine
+    that most needed it -- the freshly synced box with the code and no environment.
+    """
+    assert training.validate_extras([]) == []
+    assert training.validate_extras(None) == []
+
+
+def test_the_recording_workstation_never_syncs_without_the_recorders_own_extras(tmp_path):
+    """The workstation shares one environment between the recorder and the trainer.
+
+    gateway.py hands the recorder `.venv-fr3/bin/python` as soon as that path exists, so an
+    environment built for training alone would stop recording on the next Connect -- and even
+    when it already exists, resolving without those extras invites a shared dependency being
+    moved under the recorder's feet.
+    """
+    local = training.local_host(tmp_path)
+    remote = training.TrainingHost(
+        id="user@box:/srv/lerobot",
+        label="box",
+        kind="remote",
+        sshTarget="user@box",
+        repoDir="/srv/lerobot",
+    )
+
+    assert training.baseline_extras(local, "workstation") == (
+        "fr3-workstation-teleop",
+        "fr3-host",
+    )
+    # Nothing records on a remote training box, so its environment is free to be the training
+    # one and only that.
+    assert training.baseline_extras(remote, "workstation") == ()
+    assert training.baseline_extras(local, "thor") == ()
+
+
+def test_a_sync_with_no_extras_is_a_command_the_script_accepts(tmp_path):
+    """The base-dependency case has to survive the whole chain, not just validation."""
+    script = tmp_path / training.INSTALL_SCRIPT
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+    command, _ = training.build_install_command(tmp_path, training.local_host(tmp_path), [])
+    assert command == ["bash", str(script)]
+
+    host = training.TrainingHost(
+        id="user@box:/srv/lerobot",
+        label="box",
+        kind="remote",
+        sshTarget="user@box",
+        repoDir="/srv/lerobot",
+    )
+    remote, _ = training.build_install_command(tmp_path, host, [])
+    # No stray trailing space: the far side is a shell, and `bash script ''` is a different
+    # command from `bash script`.
+    assert remote[-1] == "cd /srv/lerobot && exec bash tools/fr3/install_training_deps.sh"
+
+
+def test_the_local_install_runs_the_script_out_of_this_checkout(tmp_path):
+    script = tmp_path / training.INSTALL_SCRIPT
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+    command, env = training.build_install_command(
+        tmp_path, training.local_host(tmp_path), ["fr3-train"]
+    )
+
+    assert command == ["bash", str(script), "fr3-train"]
+    assert env is not None and env["PYTHONUNBUFFERED"] == "1"
+
+
+def test_an_install_with_no_script_to_run_says_so_rather_than_failing_in_bash(tmp_path):
+    with pytest.raises(training.TrainingError, match="Install script missing"):
+        training.build_install_command(tmp_path, training.local_host(tmp_path), ["fr3-train"])
+
+
+def test_a_remote_install_runs_in_the_hosts_own_checkout(tmp_path):
+    """Not piped over stdin like the probe: an install needs the repo it is installing from.
+
+    The probe has to work on a machine with no checkout -- that is half of what it reports --
+    but `uv sync` reads pyproject.toml, so requiring the sync first turns a puzzling failure
+    into an obvious one.
+    """
+    host = training.TrainingHost(
+        id="user@box:/srv/lerobot",
+        label="box",
+        kind="remote",
+        sshTarget="user@box",
+        repoDir="/srv/lerobot",
+    )
+
+    command, env = training.build_install_command(tmp_path, host, ["fr3-train", "peft"])
+
+    assert command[0] == "ssh"
+    assert command[-2] == "user@box"
+    assert command[-1] == (
+        "cd /srv/lerobot && exec bash tools/fr3/install_training_deps.sh fr3-train peft"
+    )
+    # No environment override: a remote command carries nothing of this machine's environment.
+    assert env is None
+
+
+def test_a_machine_with_no_environment_is_offered_one_rather_than_an_explanation(tmp_path):
+    """No .venv-fr3 is the first sync, not a blocker -- but the page has to say which it is.
+
+    Building takes several GB and a while; extending takes a minute. Same button, and an
+    operator who cannot tell which one they pressed will assume it has hung.
+    """
+    from tools.fr3 import probe_training_machine
+
+    (tmp_path / "tools" / "fr3").mkdir(parents=True)
+    (tmp_path / probe_training_machine.INSTALL_SCRIPT).write_text("#!/bin/bash\n", encoding="utf-8")
+
+    report = probe_training_machine.query_installer(str(tmp_path))
+
+    assert report["canInstall"] is True
+    assert report["venvExists"] is False
+    assert report["willCreateEnvironment"] is True
+
+    # A machine the repo has never been synced to is a different answer, and the fix is a
+    # different button: Sync code now, not Install.
+    bare = probe_training_machine.query_installer(str(tmp_path / "nowhere"))
+    assert bare["canInstall"] is False
+    assert bare["scriptPresent"] is False
+    assert "sync the repo" in bare["reason"]
+
+
+def test_an_old_uv_is_reported_as_the_blocker_it_is(tmp_path, monkeypatch):
+    """`--inexact` is the flag this depends on, and a 0.4 would fail without saying that."""
+    from tools.fr3 import probe_training_machine
+
+    (tmp_path / "tools" / "fr3").mkdir(parents=True)
+    (tmp_path / probe_training_machine.INSTALL_SCRIPT).write_text("#!/bin/bash\n", encoding="utf-8")
+    venv_bin = tmp_path / probe_training_machine.VENV_PATH / "bin"
+    venv_bin.mkdir(parents=True)
+    python = venv_bin / "python"
+    python.write_text("#!/bin/sh\n", encoding="utf-8")
+    python.chmod(0o755)
+
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text("#!/bin/sh\necho 'uv 0.4.1'\n", encoding="utf-8")
+    fake_uv.chmod(0o755)
+    monkeypatch.setattr(probe_training_machine.shutil, "which", lambda name: str(fake_uv))
+
+    report = probe_training_machine.query_installer(str(tmp_path))
+
+    assert report["canInstall"] is False
+    assert report["uvVersion"] == "0.4.1"
+    assert "uv self update" in report["reason"]
+
+    # Everything in place: the page is allowed to offer the button.
+    fake_uv.write_text("#!/bin/sh\necho 'uv 0.10.2'\n", encoding="utf-8")
+    ready = probe_training_machine.query_installer(str(tmp_path))
+    assert ready == {
+        "canInstall": True,
+        "reason": "",
+        "uvPath": str(fake_uv),
+        "uvVersion": "0.10.2",
+        "venvPath": ".venv-fr3",
+        "venvExists": True,
+        "willCreateEnvironment": False,
+        "scriptPresent": True,
+    }
+
+
+def test_no_uv_is_the_one_thing_this_cannot_work_around(tmp_path, monkeypatch):
+    """The environment is a uv project environment; a pip install into one is invisible to it."""
+    from tools.fr3 import probe_training_machine
+
+    (tmp_path / "tools" / "fr3").mkdir(parents=True)
+    (tmp_path / probe_training_machine.INSTALL_SCRIPT).write_text("#!/bin/bash\n", encoding="utf-8")
+    monkeypatch.setattr(probe_training_machine.shutil, "which", lambda name: None)
+    monkeypatch.setattr(probe_training_machine.os.path, "expanduser", lambda path: "/nonexistent")
+
+    report = probe_training_machine.query_installer(str(tmp_path))
+
+    assert report["canInstall"] is False
+    assert "uv" in report["reason"]
+    assert "docs.astral.sh/uv" in report["reason"]

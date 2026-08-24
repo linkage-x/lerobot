@@ -9,6 +9,10 @@ venv_path="${VENV_PATH:-.venv-fr3}"
 install_system_deps="${INSTALL_SYSTEM_DEPS:-1}"
 configure_device_access="${CONFIGURE_DEVICE_ACCESS:-1}"
 install_real_robot_deps="${INSTALL_REAL_ROBOT_DEPS:-1}"
+# The VLA training extra (transformers + peft). On by default because the Training page offers
+# pi0/pi0.5/smolvla against "this machine" and a missing package there surfaces as a
+# ModuleNotFoundError inside a training subprocess, not as an unavailable option.
+install_training_deps="${INSTALL_TRAINING_DEPS:-1}"
 
 if [[ -n "${UV_BIN:-}" ]]; then
   uv_bin="$UV_BIN"
@@ -77,6 +81,9 @@ sync_extras=(--extra fr3-workstation-teleop)
 if [[ "$install_real_robot_deps" == "1" ]]; then
   sync_extras+=(--extra fr3-host)
 fi
+if [[ "$install_training_deps" == "1" ]]; then
+  sync_extras+=(--extra fr3-train)
+fi
 UV_PROJECT_ENVIRONMENT="$venv_path" "$uv_bin" sync \
   --python "$python_version" \
   "${sync_extras[@]}" \
@@ -111,6 +118,33 @@ print(f"mujoco={mujoco.__version__} nq={model.nq} nu={model.nu}")
 print(f"realsense_devices={realsense_serials}")
 print(f"spacemouse_devices={len(spacemouse_devices)}")
 PY
+
+if [[ "$install_training_deps" == "1" ]]; then
+  echo "==> Running VLA training dependency smoke checks"
+  # Imported for real, not just found on the path. The pi0.5 modeling module resolves its
+  # PaliGemma/Gemma symbols at import time behind an `if TYPE_CHECKING or _transformers_available`
+  # guard, so a transformers that is installed but too old fails here rather than at step 0 of a
+  # training run -- which is the failure this check exists to move forward.
+  PYTHONPATH=src:. "$venv_path/bin/python" - <<'PY'
+import peft
+import transformers
+
+from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors  # noqa: F401
+
+print(f"transformers={transformers.__version__}")
+print(f"peft={peft.__version__}")
+print(f"pi05={PI05Policy.name}")
+PY
+  cat <<'NOTE'
+==> pi0.5 also needs two downloads the first time it trains, neither of which this script can do
+    for you:
+      * google/paligemma-3b-pt-224 -- the tokenizer, a GATED Hugging Face repo. Accept its terms
+        on the model page, then `hf auth login` (older CLIs: `huggingface-cli login`) in this venv.
+      * lerobot/pi05_base -- the base checkpoint LoRA finetunes on top of. Not gated.
+    Without the first, training stops in the pre-processor with a 401 from the Hub.
+NOTE
+fi
 
 if [[ "$install_real_robot_deps" == "1" ]]; then
   PYTHONPATH=src:. "$venv_path/bin/python" - <<'PY'

@@ -89,7 +89,8 @@ function TrainingViewPage({
     paths: string[],
     actionMode?: string,
     cameraCrops?: CameraCropSpecs,
-    viewFps?: number
+    viewFps?: number,
+    taskPrompt?: string
   ) => void;
   onOpenProcessing: () => void;
   onOpenReplay: (path: string) => void;
@@ -98,6 +99,12 @@ function TrainingViewPage({
   const building = exportStatus.state === "exporting";
   const [actionMode, setActionMode] = useState<ActionMode>("delta_ee_from_prev_cmd");
   const [viewFps, setViewFps] = useState<number>(DEFAULT_VIEW_FPS);
+  // The language instruction written into the view's task column. Empty means "keep the prompt
+  // the recorder wrote", which is the only defensible default -- this string is tokenized into
+  // every sample of a pi0/pi0.5/smolvla run, so a placeholder here would be invented training
+  // data. Not persisted across a reload for the same reason the crop is not: it is a property of
+  // the build about to be started, and the built view's manifest is where it is recorded.
+  const [taskPrompt, setTaskPrompt] = useState("");
   const [cropEnabled, setCropEnabled] = useState(false);
   const [cameraCrops, setCameraCrops] = useState<Record<string, CropRect>>({});
   // Which recording the crop is drawn on. The box applies to every build this page starts, so
@@ -135,6 +142,9 @@ function TrainingViewPage({
   // it on a recording the build does not include answers a question nobody asked.
   const previewCandidates = selected.filter((dataset) =>
     (dataset.cameraFeatures ?? []).some((feature) => feature.width > 0 && feature.height > 0)
+  );
+  const recordedPrompts = Array.from(
+    new Set(selected.map((dataset) => dataset.taskPrompt ?? "").filter(Boolean))
   );
   const summary = summarizeSelection(selected, viewFps);
   const fpsProblem = selectionFpsProblem(selected, viewFps);
@@ -697,7 +707,42 @@ function TrainingViewPage({
           <Metric label="Contract" value={actionModeCopy[actionMode].label} />
           <Metric label="Rate" value={viewFps === 0 ? "source" : `${viewFps} fps`} />
           <Metric label="Crop" value={cropEnabled ? (cropResult.label ?? "—") : "full frame"} />
+          <Metric
+            label="Prompt"
+            value={taskPrompt.trim() ? "rewritten" : recordedPrompts.length ? "as recorded" : "—"}
+          />
         </div>
+        <label className="field">
+          <span>Task prompt (optional)</span>
+          <input
+            value={taskPrompt}
+            onChange={(event) => setTaskPrompt(event.target.value)}
+            placeholder={
+              recordedPrompts.length === 1
+                ? `as recorded: ${recordedPrompts[0]}`
+                : "as recorded"
+            }
+            disabled={building}
+          />
+        </label>
+        <p className="panel-note">
+          The language instruction a VLA is conditioned on. pi0/pi0.5 and smolvla tokenize it into{" "}
+          <em>every</em> training sample, so it is data, not a label — a terse{" "}
+          {recordedPrompts.length === 1 ? <code>{recordedPrompts[0]}</code> : "recorder default"}{" "}
+          gives the model far less to align its pretrained language understanding to than a
+          concrete sentence naming the object, the action and the destination. Left empty, the
+          prompt the recorder wrote is kept. ACT and diffusion ignore it entirely. Written into
+          this view only — the recording is never modified — so changing it later means building
+          the view again.
+          {recordedPrompts.length > 1 && (
+            <>
+              {" "}
+              The selected recordings carry {recordedPrompts.length} different prompts (
+              {recordedPrompts.map((prompt) => `"${prompt}"`).join(", ")}); typing one here
+              collapses them into a single task.
+            </>
+          )}
+        </p>
         {existingView ? (
           // The build writes to a fixed name, so a rebuild replaces whatever is there. Said
           // before the button, because a checkpoint trained on the old contents keeps pointing
@@ -714,7 +759,15 @@ function TrainingViewPage({
             className="primary"
             disabled={busy || building || Boolean(buildBlockedReason)}
             title={buildBlockedReason || undefined}
-            onClick={() => onBuildView(selected.map((dataset) => dataset.path), actionMode, cropResult.crops, viewFps)}
+            onClick={() =>
+              onBuildView(
+                selected.map((dataset) => dataset.path),
+                actionMode,
+                cropResult.crops,
+                viewFps,
+                taskPrompt
+              )
+            }
           >
             {building ? "Building…" : `Build View from ${selected.length} recording(s)`}
           </button>
@@ -765,7 +818,8 @@ export function DatasetExportPage({
     paths: string[],
     actionMode?: string,
     cameraCrops?: CameraCropSpecs,
-    viewFps?: number
+    viewFps?: number,
+    taskPrompt?: string
   ) => void;
   onOpenProcessing: () => void;
   onOpenReplay: (path: string) => void;

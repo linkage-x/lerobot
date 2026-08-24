@@ -1,56 +1,15 @@
-// Lightweight modal (no UI library in this project) plus the pre-calibration
-// confirmation dialog: an operator checklist gate and a live stability probe.
-// The "开始校准" button stays disabled until every item is checked and the rig
-// is not measurably unstable (spec §7).
+// The pre-calibration confirmation dialog: an operator checklist gate and a live
+// stability probe. The "开始校准" button stays disabled until every item is checked
+// and the rig is not measurably unstable (spec §7).
+//
+// The modal shell it sits in moved to shared/ui once a second page needed one; it is
+// re-exported here so the calibration imports did not all have to move with it.
 
-import { useEffect, useRef } from "react";
+import { Modal } from "../shared/ui";
 import type { StabilityResult } from "./useCalibrationWorkflow";
 import { STABILITY } from "./config";
 
-export function Modal({
-  title,
-  onClose,
-  children,
-  footer,
-}: {
-  title: string;
-  onClose: () => void;
-  children: React.ReactNode;
-  footer?: React.ReactNode;
-}) {
-  const ref = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    ref.current?.focus();
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  return (
-    <div className="cali-modal-backdrop" onMouseDown={onClose}>
-      <div
-        className="cali-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
-        tabIndex={-1}
-        ref={ref}
-        onMouseDown={(e) => e.stopPropagation()}
-      >
-        <div className="cali-modal-head">
-          <h3>{title}</h3>
-          <button className="cali-icon-btn" aria-label="关闭" onClick={onClose}>
-            ✕
-          </button>
-        </div>
-        <div className="cali-modal-body">{children}</div>
-        {footer && <div className="cali-modal-foot">{footer}</div>}
-      </div>
-    </div>
-  );
-}
+export { Modal };
 
 export const CONFIRM_CHECKLIST: { id: string; label: string }[] = [
   { id: "fixture", label: "BOX 已放入标准标定工装" },
