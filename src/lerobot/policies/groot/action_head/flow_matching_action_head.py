@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field
+from dataclasses import field
 from typing import TYPE_CHECKING
 
 import torch
@@ -36,6 +36,7 @@ from lerobot.policies.groot.action_head.action_encoder import (
     swish,
 )
 
+from ..utils import config_dataclass
 from .cross_attention_dit import DiT, SelfAttentionTransformer
 
 
@@ -110,7 +111,7 @@ class MultiEmbodimentActionEncoder(nn.Module):
         return x
 
 
-@dataclass
+@config_dataclass
 class FlowmatchingActionHeadConfig(PretrainedConfig):
     """NOTE: N1.5 uses XEmbFlowmatchingPolicyHeadConfig as action head"""
 

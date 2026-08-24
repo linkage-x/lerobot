@@ -71,6 +71,14 @@ def get_safe_wandb_artifact_name(name: str):
     return name.replace(":", "_").replace("/", "_")
 
 
+def _flatten_loggable_metric(key: str, value) -> list[tuple[str, int | float | str]]:
+    if isinstance(value, (int | float | str)):
+        return [(key, value)]
+    if isinstance(value, (list, tuple)) and value and all(isinstance(item, (int | float)) for item in value):
+        return [(f"{key}/{index}", item) for index, item in enumerate(value)]
+    return []
+
+
 class WandBLogger:
     """A helper class to log object using wandb."""
 
@@ -177,7 +185,8 @@ class WandBLogger:
                 self._wandb.define_metric(new_custom_key, hidden=True)
 
         for k, v in d.items():
-            if not isinstance(v, (int | float | str)):
+            metrics = _flatten_loggable_metric(k, v)
+            if not metrics:
                 logging.warning(
                     f'WandB logging of key "{k}" was ignored as its type "{type(v)}" is not handled by this wrapper.'
                 )
@@ -187,13 +196,14 @@ class WandBLogger:
             if self._wandb_custom_step_key is not None and k in self._wandb_custom_step_key:
                 continue
 
-            if custom_step_key is not None:
-                value_custom_step = d[custom_step_key]
-                data = {f"{mode}/{k}": v, f"{mode}/{custom_step_key}": value_custom_step}
-                self._wandb.log(data)
-                continue
+            for metric_key, metric_value in metrics:
+                if custom_step_key is not None:
+                    value_custom_step = d[custom_step_key]
+                    data = {f"{mode}/{metric_key}": metric_value, f"{mode}/{custom_step_key}": value_custom_step}
+                    self._wandb.log(data)
+                    continue
 
-            self._wandb.log(data={f"{mode}/{k}": v}, step=step)
+                self._wandb.log(data={f"{mode}/{metric_key}": metric_value}, step=step)
 
     def log_video(self, video_path: str, step: int, mode: str = "train"):
         if mode not in {"train", "eval"}:

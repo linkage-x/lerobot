@@ -57,6 +57,17 @@ from lerobot.utils.constants import (
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
+PALIGEMMA_TOKENIZER_NAME = "google/paligemma-3b-pt-224"
+
+
+def _with_paligemma_tokenizer_override(overrides: dict[str, Any] | None) -> dict[str, Any]:
+    """Keep restored pi0/pi0.5 processors from reusing machine-local tokenizer paths."""
+    updated = dict(overrides or {})
+    tokenizer_overrides = dict(updated.get("tokenizer_processor") or {})
+    tokenizer_overrides.setdefault("tokenizer_name", PALIGEMMA_TOKENIZER_NAME)
+    updated["tokenizer_processor"] = tokenizer_overrides
+    return updated
+
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     """
@@ -263,6 +274,11 @@ def make_pre_post_processors(
             }
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
+
+        if isinstance(policy_cfg, (PI0Config, PI05Config)):
+            kwargs["preprocessor_overrides"] = _with_paligemma_tokenizer_override(
+                kwargs.get("preprocessor_overrides")
+            )
 
         return (
             PolicyProcessorPipeline.from_pretrained(

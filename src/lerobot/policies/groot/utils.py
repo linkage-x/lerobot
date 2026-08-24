@@ -1,7 +1,29 @@
+import dataclasses
 from pathlib import Path
 from shutil import copytree
 
 from huggingface_hub import hf_hub_download
+
+
+def config_dataclass(cls):
+    """`@dataclass`, unless the transformers in use already applied it.
+
+    transformers>=5 makes `PretrainedConfig` a dataclass and runs `@dataclass` over every
+    subclass from `__init_subclass__`. Applying it a second time re-reads the class body, where
+    the `field(init=False)` sentinels have already been consumed -- so the fields come back as
+    ordinary init arguments without defaults, land after the ten defaulted ones the base now
+    contributes, and the class raises `TypeError: non-default argument 'backbone_cfg' follows
+    default argument` at import time.
+
+    That is not a Gr00t-only failure: `lerobot/policies/__init__.py` imports Gr00t eagerly, so
+    the exception takes down `lerobot.policies` -- and with it `lerobot.policies.factory`, which
+    `lerobot_train` imports before it can train anything at all, pi0.5 included.
+
+    Under transformers 4 `PretrainedConfig` is a plain class, nothing has been applied, and the
+    decorator is still required. Hence the check rather than a removal: `is_dataclass` is False
+    exactly in the case where the decorator is still doing work.
+    """
+    return cls if dataclasses.is_dataclass(cls) else dataclasses.dataclass(cls)
 
 
 def ensure_eagle_cache_ready(vendor_dir: Path, cache_dir: Path, assets_repo: str) -> None:

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING
 
 import torch
@@ -37,6 +38,12 @@ if TYPE_CHECKING or _transformers_available:
         PaliGemmaForConditionalGeneration,
         PaliGemmaModel,
     )
+    _CREATE_CAUSAL_MASK_PARAMETERS = inspect.signature(create_causal_mask).parameters
+    _CREATE_CAUSAL_MASK_PARAMETER_NAMES = set(_CREATE_CAUSAL_MASK_PARAMETERS)
+    _CREATE_CAUSAL_MASK_ACCEPTS_VAR_KEYWORD = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in _CREATE_CAUSAL_MASK_PARAMETERS.values()
+    )
 else:
     GemmaAttention = None
     GemmaConfig = None
@@ -49,6 +56,40 @@ else:
     GradientCheckpointingLayer = None
     BaseModelOutputWithPast = None
     create_causal_mask = None
+    _CREATE_CAUSAL_MASK_PARAMETER_NAMES = set()
+    _CREATE_CAUSAL_MASK_ACCEPTS_VAR_KEYWORD = False
+
+
+def _create_causal_mask_compat(
+    *,
+    config,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    cache_position: torch.LongTensor | None,
+    past_key_values,
+    position_ids: torch.Tensor | None,
+):
+    """Call Transformers' causal-mask helper across small signature changes.
+
+    Transformers 5.15 no longer accepts ``cache_position`` here, while older versions did.
+    PiGemma still needs to compute and pass ``cache_position`` to the decoder layers; only the
+    mask helper call is version-dependent.
+    """
+    kwargs = {
+        "config": config,
+        "inputs_embeds": inputs_embeds,
+        "attention_mask": attention_mask,
+        "cache_position": cache_position,
+        "past_key_values": past_key_values,
+        "position_ids": position_ids,
+    }
+    if not _CREATE_CAUSAL_MASK_ACCEPTS_VAR_KEYWORD:
+        kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in _CREATE_CAUSAL_MASK_PARAMETER_NAMES
+        }
+    return create_causal_mask(**kwargs)
 
 
 def _gated_residual(
@@ -258,7 +299,7 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
+        causal_mask = _create_causal_mask_compat(
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,

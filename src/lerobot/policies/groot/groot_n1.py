@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field
+from dataclasses import field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -45,7 +45,7 @@ from lerobot.policies.groot.action_head.flow_matching_action_head import (
     FlowmatchingActionHead,
     FlowmatchingActionHeadConfig,
 )
-from lerobot.policies.groot.utils import ensure_eagle_cache_ready
+from lerobot.policies.groot.utils import config_dataclass, ensure_eagle_cache_ready
 from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME
 
 DEFAULT_VENDOR_EAGLE_PATH = str((Path(__file__).resolve().parent / "eagle2_hg_model").resolve())
@@ -173,7 +173,7 @@ N_COLOR_CHANNELS = 3
 
 
 # config
-@dataclass
+@config_dataclass
 class GR00TN15Config(PretrainedConfig):
     model_type = "gr00t_n1_5"
     backbone_cfg: dict = field(init=False, metadata={"help": "Backbone configuration."})

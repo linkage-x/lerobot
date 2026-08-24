@@ -1047,7 +1047,10 @@ class PI05Policy(PreTrainedPolicy):
                 print("All keys loaded successfully!")
 
         except Exception as e:
-            print(f"Warning: Could not load state dict: {e}")
+            raise RuntimeError(
+                f"Could not load every required pi0.5 checkpoint weight from {pretrained_name_or_path}. "
+                "Refusing to continue with a partially initialized policy."
+            ) from e
 
         return model
 
@@ -1096,10 +1099,14 @@ class PI05Policy(PreTrainedPolicy):
                 logging.warning(f"Skipping state_proj key in pi05 mode: {key}")
                 continue
 
-            # Handle vision tower embedding layer potential differences
-            if "patch_embedding" in key:
-                # Some checkpoints might have this, but current model expects different structure
-                logging.warning(f"Vision embedding key might need handling: {key}")
+            # Transformers 5 flattened PaliGemma's vision module from
+            # ``vision_tower.vision_model.*`` to ``vision_tower.*``. Older pi0.5
+            # checkpoints therefore otherwise miss every vision weight. Map the stable
+            # prefix before handing the state dict to PyTorch instead of continuing with
+            # a randomly initialized image encoder.
+            vision_prefix = "paligemma_with_expert.paligemma.model.vision_tower.vision_model."
+            if vision_prefix in new_key:
+                new_key = new_key.replace(vision_prefix, vision_prefix.removesuffix("vision_model."))
 
             if (
                 key == "model.paligemma_with_expert.paligemma.lm_head.weight"
