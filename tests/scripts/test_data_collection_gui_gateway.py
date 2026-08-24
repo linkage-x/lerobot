@@ -418,6 +418,23 @@ def test_recording_fps_override_validation():
             gateway._parse_recording_fps_override(value)
 
 
+def test_num_episodes_override_validation():
+    """0 is rejected rather than treated as 'unlimited'.
+
+    The recorder loops `while saved_episodes < cfg.dataset.num_episodes`, so 0 connects the
+    cameras and then records nothing -- a Connect that looks like it worked and produces an empty
+    dataset. Whatever "unlimited" should mean here, it is not this number.
+    """
+
+    assert gateway._parse_num_episodes_override(20) == 20
+    assert gateway._parse_num_episodes_override("20") == 20
+    assert gateway._parse_num_episodes_override("") is None
+    assert gateway._parse_num_episodes_override(None) is None
+    for value in ("bad", 0, -1, 1001, 20.5, float("inf")):
+        with pytest.raises(ValueError):
+            gateway._parse_num_episodes_override(value)
+
+
 def test_gmsl2_device_preview_uses_recorder_owned_frames_only():
     gmsl2_state = gateway.make_state(Path.cwd(), gateway.DEFAULT_CONFIG_PATH)
 
@@ -3450,6 +3467,49 @@ def test_gain_overrides_compose_with_the_recording_fps_override(tmp_path):
 
     assert overlay["dataset"]["fps"] == 60
     assert overlay["teleop"]["scale_wy"] == pytest.approx(0.002)
+
+
+def test_the_episode_count_reaches_the_recorder_without_editing_the_repo_config(tmp_path):
+    """How many episodes a sitting is worth is a per-session decision, not a config edit.
+
+    Before this the only way to record other than `dataset.num_episodes` was to edit the YAML in
+    the repo, which makes the count a property of the checkout rather than of the session -- and
+    leaves the next operator recording someone else's number.
+    """
+
+    import yaml
+
+    state = _gain_state(tmp_path, _workstation_teleop_gains())
+
+    config_path = gateway._resolve_recorder_config_path(state, num_episodes=5)
+    overlay = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    assert config_path != state.config_path
+    assert overlay["dataset"]["num_episodes"] == 5
+    # The repo's own config is untouched, so the next Connect starts from the checked-in value.
+    assert state.config["dataset"].get("num_episodes") != 5
+
+
+def test_the_episode_count_composes_with_a_task_binding(tmp_path):
+    """A task's `targetEpisodes` is a target across sittings; this is the stop for one sitting.
+
+    _build_task_overlay_config patches repo_id/root/single_task and leaves the count alone, so the
+    two never contend. This pins that: binding a task must not swallow the operator's count, and
+    setting a count must not detach the recorder from the task's dataset.
+    """
+
+    state, _datasets_root = _task_state(tmp_path)
+    gateway._create_task(
+        state,
+        {"name": "Insert", "targetEpisodes": 100, "datasetRepoId": "local/insert"},
+    )
+    gateway._set_active_task(state, gateway._read_tasks(state)[0]["id"])
+
+    config_path = gateway._resolve_recorder_config_path(state, num_episodes=7)
+    overlay = gateway._load_yaml(config_path)
+
+    assert overlay["dataset"]["num_episodes"] == 7
+    assert overlay["dataset"]["repo_id"] == "local/insert"
 
 
 def test_parse_teleop_gain_overrides_accepts_the_shape_the_ui_sends():

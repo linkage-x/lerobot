@@ -315,7 +315,9 @@ function App() {
       <LiveRecordPage
         snapshot={snapshot}
         busy={busy}
-        onConnect={(backend, episodeTimeS, fps) => run(() => api.connectRecording(backend, episodeTimeS, fps))}
+        onConnect={(backend, episodeTimeS, fps, numEpisodes) =>
+          run(() => api.connectRecording(backend, episodeTimeS, fps, numEpisodes))
+        }
         onStart={() => run(() => api.startRecording())}
         onStop={(action) => run(() => api.stopRecording(action))}
         onSetStartPose={() => run(() => api.setRecordingStartPose())}

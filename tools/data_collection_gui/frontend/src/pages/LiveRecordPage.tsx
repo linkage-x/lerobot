@@ -297,7 +297,12 @@ export function LiveRecordPage({
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
-  onConnect: (backend?: RecordingBackend, episodeTimeS?: number, fps?: number) => void;
+  onConnect: (
+    backend?: RecordingBackend,
+    episodeTimeS?: number,
+    fps?: number,
+    numEpisodes?: number
+  ) => void;
   onStart: () => void;
   onStop: (action: "save" | "discard" | "exit") => void;
   onSetStartPose: () => void;
@@ -318,6 +323,14 @@ export function LiveRecordPage({
   );
   const [episodeTimeInput, setEpisodeTimeInput] = useState(() => String(snapshot.configSummary.episodeTimeS));
   const [fpsInput, setFpsInput] = useState(() => String(snapshot.configSummary.fps));
+  // `numEpisodes` is `number | "unlimited"`: the handheld rigs run until the operator stops, the
+  // FR3 recorder stops itself after `dataset.num_episodes`. Only a number is editable, so the
+  // control below hides itself rather than offering an edit the recorder would ignore.
+  const configuredNumEpisodes = snapshot.configSummary.numEpisodes;
+  const supportsNumEpisodes = typeof configuredNumEpisodes === "number";
+  const [numEpisodesInput, setNumEpisodesInput] = useState(() =>
+    supportsNumEpisodes ? String(configuredNumEpisodes) : ""
+  );
   const activeTask = snapshot.activeTaskId
     ? snapshot.tasks.find((t) => t.id === snapshot.activeTaskId) ?? null
     : null;
@@ -331,10 +344,18 @@ export function LiveRecordPage({
   const logLines = snapshot.recording.recentOutput ?? [];
   const parsedEpisodeTimeS = Number(episodeTimeInput);
   const parsedFps = Number(fpsInput);
+  const parsedNumEpisodes = Number(numEpisodesInput);
   const canUseEpisodeTimeInput = Number.isFinite(parsedEpisodeTimeS) && parsedEpisodeTimeS >= 1 && parsedEpisodeTimeS <= 600;
   const canUseFpsInput = Number.isInteger(parsedFps) && parsedFps >= 1 && parsedFps <= 120;
+  // Bounds mirror _parse_num_episodes_override in gateway.py; keep them in step or the field
+  // accepts a value Connect then rejects.
+  const canUseNumEpisodesInput =
+    !supportsNumEpisodes ||
+    (Number.isInteger(parsedNumEpisodes) && parsedNumEpisodes >= 1 && parsedNumEpisodes <= 1000);
   const requestedEpisodeTimeS = canUseEpisodeTimeInput ? parsedEpisodeTimeS : snapshot.configSummary.episodeTimeS;
   const requestedFps = canUseFpsInput ? parsedFps : snapshot.configSummary.fps;
+  const requestedNumEpisodes =
+    supportsNumEpisodes && Number.isInteger(parsedNumEpisodes) ? parsedNumEpisodes : undefined;
   const requestedTargetFrames = Math.max(1, Math.round(requestedFps * requestedEpisodeTimeS));
 
   // Keyboard shortcuts for the record controls. This component is mounted only
@@ -353,9 +374,20 @@ export function LiveRecordPage({
       if (busy) return;
       const controls = recordingControlAvailability(snapshot.recording);
       const key = event.key.toLowerCase();
-      if (key === "c" && controls.canConnect && canUseEpisodeTimeInput && canUseFpsInput) {
+      if (
+        key === "c" &&
+        controls.canConnect &&
+        canUseEpisodeTimeInput &&
+        canUseFpsInput &&
+        canUseNumEpisodesInput
+      ) {
         event.preventDefault();
-        onConnect(supportsBackendChoice ? selectedBackend : undefined, requestedEpisodeTimeS, requestedFps);
+        onConnect(
+          supportsBackendChoice ? selectedBackend : undefined,
+          requestedEpisodeTimeS,
+          requestedFps,
+          requestedNumEpisodes
+        );
       } else if (key === "e" && controls.canStartEpisode) {
         event.preventDefault();
         onStart();
@@ -372,7 +404,7 @@ export function LiveRecordPage({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [busy, snapshot.recording, onConnect, onStart, onStop, supportsBackendChoice, selectedBackend, requestedEpisodeTimeS, requestedFps, canUseEpisodeTimeInput, canUseFpsInput]);
+  }, [busy, snapshot.recording, onConnect, onStart, onStop, supportsBackendChoice, selectedBackend, requestedEpisodeTimeS, requestedFps, requestedNumEpisodes, canUseEpisodeTimeInput, canUseFpsInput, canUseNumEpisodesInput]);
 
   // Once a session is live the backend is fixed by the running recorder process; showing the
   // operator's stale pick instead of the actual one would misreport what is being recorded.
@@ -386,8 +418,9 @@ export function LiveRecordPage({
     if (!recorderConnected) {
       setEpisodeTimeInput(String(snapshot.configSummary.episodeTimeS));
       setFpsInput(String(snapshot.configSummary.fps));
+      setNumEpisodesInput(typeof configuredNumEpisodes === "number" ? String(configuredNumEpisodes) : "");
     }
-  }, [recorderConnected, snapshot.configSummary.episodeTimeS, snapshot.configSummary.fps]);
+  }, [recorderConnected, snapshot.configSummary.episodeTimeS, snapshot.configSummary.fps, configuredNumEpisodes]);
 
   const episodeDurationControl = (
     <div className="recording-session-controls">
@@ -417,6 +450,25 @@ export function LiveRecordPage({
         />
         <small>{canUseFpsInput ? `${requestedFps} Hz` : "1-120"}</small>
       </label>
+      {supportsNumEpisodes ? (
+        <label className={`episode-duration-control ${canUseNumEpisodesInput ? "" : "episode-duration-invalid"}`}>
+          <span>Episodes</span>
+          <input
+            type="number"
+            min={1}
+            max={1000}
+            step={1}
+            disabled={busy || recorderConnected}
+            value={numEpisodesInput}
+            onChange={(event) => setNumEpisodesInput(event.target.value)}
+          />
+          <small>
+            {canUseNumEpisodesInput
+              ? `stops after ${requestedNumEpisodes ?? configuredNumEpisodes}`
+              : "1-1000"}
+          </small>
+        </label>
+      ) : null}
     </div>
   );
 
@@ -481,7 +533,14 @@ export function LiveRecordPage({
           status={snapshot.recording}
           config={snapshot.configSummary}
           busy={busy}
-          onConnect={() => onConnect(supportsBackendChoice ? selectedBackend : undefined, requestedEpisodeTimeS, requestedFps)}
+          onConnect={() =>
+            onConnect(
+              supportsBackendChoice ? selectedBackend : undefined,
+              requestedEpisodeTimeS,
+              requestedFps,
+              requestedNumEpisodes
+            )
+          }
           onStart={onStart}
           onStop={onStop}
           onSetStartPose={onSetStartPose}
@@ -489,7 +548,7 @@ export function LiveRecordPage({
           logLines={logLines}
           backendPicker={backendPicker}
           episodeDurationControl={episodeDurationControl}
-          episodeDurationValid={canUseEpisodeTimeInput && canUseFpsInput}
+          episodeDurationValid={canUseEpisodeTimeInput && canUseFpsInput && canUseNumEpisodesInput}
           showStartPoseControl={workstationProfile}
         />
         <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />

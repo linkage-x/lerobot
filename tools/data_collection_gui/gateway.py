@@ -3660,6 +3660,31 @@ def _parse_recording_fps_override(value: str | float | int | None) -> int | None
     return int(round(fps))
 
 
+def _parse_num_episodes_override(value: str | float | int | None) -> int | None:
+    """How many episodes this Connect will record before the recorder stops on its own.
+
+    The recorder loops `while saved_episodes < cfg.dataset.num_episodes`, so 0 records nothing --
+    the floor is 1, not 0. The ceiling is a typo guard rather than a rig limit: an operator who
+    means 20 and types 200 finds out four hours later, and the recorder holds the cameras for the
+    whole run.
+    """
+
+    if value is None or value == "":
+        return None
+    try:
+        num_episodes = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid episode count: {value!r}") from exc
+    if (
+        not math.isfinite(num_episodes)
+        or num_episodes < 1
+        or num_episodes > 1000
+        or abs(num_episodes - round(num_episodes)) > 1e-9
+    ):
+        raise ValueError("Episode count must be an integer between 1 and 1000.")
+    return int(round(num_episodes))
+
+
 def _clear_runtime_recording_config(state: GatewayState) -> None:
     state.runtime_recording_config = None
     state.runtime_recording_config_path = None
@@ -3670,7 +3695,11 @@ def _clear_runtime_recording_config(state: GatewayState) -> None:
 
 
 def _resolve_recorder_config_path(
-    state: GatewayState, *, episode_time_s: float | None = None, recording_fps: int | None = None
+    state: GatewayState,
+    *,
+    episode_time_s: float | None = None,
+    recording_fps: int | None = None,
+    num_episodes: int | None = None,
 ) -> Path:
     """Config path to spawn the recorder with.
 
@@ -3696,10 +3725,15 @@ def _resolve_recorder_config_path(
         overlay = _build_task_overlay_config(state.config, active_task, datasets_dir)
     else:
         state.active_task_id = None
-        if episode_time_s is not None or recording_fps is not None or gain_overrides:
+        if (
+            episode_time_s is not None
+            or recording_fps is not None
+            or num_episodes is not None
+            or gain_overrides
+        ):
             overlay = copy.deepcopy(state.config)
 
-    if episode_time_s is not None or recording_fps is not None:
+    if episode_time_s is not None or recording_fps is not None or num_episodes is not None:
         if overlay is None:
             overlay = copy.deepcopy(state.config)
         dataset = overlay.get("dataset")
@@ -3710,6 +3744,12 @@ def _resolve_recorder_config_path(
             dataset["episode_time_s"] = float(episode_time_s)
         if recording_fps is not None:
             dataset["fps"] = int(recording_fps)
+        if num_episodes is not None:
+            # Composes with a task binding rather than competing with it: _build_task_overlay_config
+            # sets repo_id/root/single_task and deliberately leaves the count alone, so a task's
+            # `targetEpisodes` stays a progress target across sittings while this is how many the
+            # recorder stops after in *this* one.
+            dataset["num_episodes"] = int(num_episodes)
 
     if gain_overrides:
         if overlay is None:
@@ -9639,6 +9679,7 @@ def _connect_recorder(
     backend: str | None = None,
     episode_time_s: float | None = None,
     recording_fps: int | None = None,
+    num_episodes: int | None = None,
 ) -> None:
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
@@ -9653,7 +9694,10 @@ def _connect_recorder(
         state.recording.backend = backend
 
     config_path = _resolve_recorder_config_path(
-        state, episode_time_s=episode_time_s, recording_fps=recording_fps
+        state,
+        episode_time_s=episode_time_s,
+        recording_fps=recording_fps,
+        num_episodes=num_episodes,
     )
     recorder_script, config_flag = _recorder_script(state)
     command = [
@@ -12197,9 +12241,13 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 query.get("episode_time_s", query.get("episodeTimeS", [""]))[0] or ""
             ).strip()
             raw_fps = (query.get("fps", query.get("recording_fps", [""]))[0] or "").strip()
+            raw_num_episodes = (
+                query.get("num_episodes", query.get("numEpisodes", [""]))[0] or ""
+            ).strip()
             try:
                 episode_time_s = _parse_episode_time_override(raw_episode_time_s)
                 recording_fps = _parse_recording_fps_override(raw_fps)
+                num_episodes = _parse_num_episodes_override(raw_num_episodes)
                 with _previews_suspended_for_connect(state):
                     # Done outside the state lock (terminate() blocks).
                     _stop_all_camera_previews(state)
@@ -12217,6 +12265,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                             backend=requested_backend,
                             episode_time_s=episode_time_s,
                             recording_fps=recording_fps,
+                            num_episodes=num_episodes,
                         )
                         response = _snapshot(state)
                 _json_response(self, HTTPStatus.OK, response)
