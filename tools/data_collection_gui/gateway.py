@@ -5355,6 +5355,9 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
     # was anchored to, and that is what the action deltas mean.
     target_frame = str(contract.get("targetFrameName") or rig.get("targetFrameName") or "")
     camera_config = str(contract.get("cameraConfig") or rig.get("cameraConfigPath") or "")
+    runtime_options = rollout_backend.sanitize_rollout_runtime_options(
+        payload.get("runtimeOptions")
+    )
 
     command, env = rollout_backend.build_rollout_command(
         state.repo_root,
@@ -5366,6 +5369,7 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
         camera_config=camera_config,
         max_steps=int(payload.get("maxSteps") or 0),
         move_to_start=bool(payload.get("moveToStart", True)),
+        runtime_options=runtime_options,
         base_env=_tool_env(state.repo_root),
     )
 

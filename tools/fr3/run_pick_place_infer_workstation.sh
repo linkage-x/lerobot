@@ -69,6 +69,7 @@ checkpoint="${FR3_INFER_CHECKPOINT-outputs/train/fr3_spacemouse__delta_ee_from_p
 # For a view built by the Training View page that is the view root, which is what the action
 # contract and the start-pose reference have to come from.
 dataset_root="${FR3_INFER_DATASET_ROOT-}"
+task_prompt="${FR3_TASK_PROMPT-}"
 
 # Safety envelope. Same numbers fr3_train_il_policy.py writes into the generated inference config.
 first_frame_max_pos_delta_mm="${FR3_FIRST_FRAME_MAX_POS_DELTA_MM-20}"
@@ -89,6 +90,12 @@ max_leash_rot_delta_deg="${FR3_MAX_LEASH_ROT_DELTA_DEG-8}"
 # checkpoint's and the driver's own defaults, which is the honest baseline to tune away from.
 policy_n_action_steps="${FR3_POLICY_N_ACTION_STEPS-}"
 act_temporal_ensemble_coeff="${FR3_ACT_TEMPORAL_ENSEMBLE_COEFF-}"
+rtc_mode="${FR3_RTC_MODE-auto}"
+rtc_execution_horizon="${FR3_RTC_EXECUTION_HORIZON-10}"
+rtc_max_guidance_weight="${FR3_RTC_MAX_GUIDANCE_WEIGHT-10}"
+rtc_prefix_attention_schedule="${FR3_RTC_PREFIX_ATTENTION_SCHEDULE-EXP}"
+rtc_replan_queue_size="${FR3_RTC_REPLAN_QUEUE_SIZE-30}"
+rtc_inference_delay_steps="${FR3_RTC_INFERENCE_DELAY_STEPS-}"
 command_ema_alpha="${FR3_COMMAND_EMA_ALPHA-}"
 controller_stiffness="${FR3_CONTROLLER_STIFFNESS-}"
 controller_damping="${FR3_CONTROLLER_DAMPING-}"
@@ -150,6 +157,9 @@ fi
 if [[ -n "${dataset_root}" ]]; then
   common_args+=(--dataset-root "${dataset_root}")
 fi
+if [[ -n "${task_prompt}" ]]; then
+  common_args+=(--task-prompt "${task_prompt}")
+fi
 if [[ -n "${robot_init_state}" ]]; then
   common_args+=(--robot-init-state "${robot_init_state}")
 fi
@@ -158,6 +168,27 @@ if [[ -n "${policy_n_action_steps}" ]]; then
 fi
 if [[ -n "${act_temporal_ensemble_coeff}" ]]; then
   common_args+=(--act-temporal-ensemble-coeff "${act_temporal_ensemble_coeff}")
+fi
+case "${rtc_mode}" in
+  auto|AUTO) common_args+=(--rtc-auto) ;;
+  enabled|enable|on|true|1|ENABLED|ENABLE|ON|TRUE) common_args+=(--rtc) ;;
+  disabled|disable|off|false|0|DISABLED|DISABLE|OFF|FALSE) common_args+=(--no-rtc) ;;
+  *) echo "ERROR: FR3_RTC_MODE must be auto, enabled, or disabled; got '${rtc_mode}'" >&2; exit 2 ;;
+esac
+if [[ -n "${rtc_execution_horizon}" ]]; then
+  common_args+=(--rtc-execution-horizon "${rtc_execution_horizon}")
+fi
+if [[ -n "${rtc_max_guidance_weight}" ]]; then
+  common_args+=(--rtc-max-guidance-weight "${rtc_max_guidance_weight}")
+fi
+if [[ -n "${rtc_prefix_attention_schedule}" ]]; then
+  common_args+=(--rtc-prefix-attention-schedule "${rtc_prefix_attention_schedule}")
+fi
+if [[ -n "${rtc_replan_queue_size}" ]]; then
+  common_args+=(--rtc-replan-queue-size "${rtc_replan_queue_size}")
+fi
+if [[ -n "${rtc_inference_delay_steps}" ]]; then
+  common_args+=(--rtc-inference-delay-steps "${rtc_inference_delay_steps}")
 fi
 if [[ -n "${command_ema_alpha}" ]]; then
   common_args+=(--command-ema-alpha "${command_ema_alpha}")
@@ -184,18 +215,27 @@ announce() {
   echo "[INFO] host_python=${FR3_HOST_PYTHON}"
   echo "[INFO] checkpoint=${checkpoint}"
   echo "[INFO] dataset_root=${dataset_root:-<from checkpoint train_config.json>}"
+  echo "[INFO] task_prompt=${task_prompt:-<auto from single dataset task>}"
   echo "[INFO] cameras=${camera_config} (keys must match the checkpoint's observation.images.*)"
   echo "[INFO] tool_frame=${target_frame_name} urdf=${robot_urdf_path}"
   echo "[INFO] gripper=${gripper_backend}@${gripper_port} max_width=${gripper_max_width_mm}mm close_below=${gripper_close_below:-<disabled>} (normalized 0..1)"
   echo "[INFO] safety: first_frame<${first_frame_max_pos_delta_mm}mm/${first_frame_max_rot_delta_deg}deg, per_step<${max_step_pos_delta_mm}mm/${max_step_rot_delta_deg}deg (vs prev_cmd), leash<${max_leash_pos_delta_mm}mm/${max_leash_rot_delta_deg}deg (vs measured)"
+  echo "[INFO] rtc: mode=${rtc_mode} horizon=${rtc_execution_horizon:-<runtime default>} guidance=${rtc_max_guidance_weight:-<runtime default>} schedule=${rtc_prefix_attention_schedule:-<runtime default>} replan_q=${rtc_replan_queue_size:-<runtime default>} delay=${rtc_inference_delay_steps:-auto}"
 }
 
 case "$mode" in
   env)
     announce
     echo "FR3_MOVE_TO_START=${move_to_start}"
+    echo "FR3_TASK_PROMPT=${task_prompt:-<auto>}"
     echo "FR3_POLICY_N_ACTION_STEPS=${policy_n_action_steps:-<checkpoint default>}"
     echo "FR3_ACT_TEMPORAL_ENSEMBLE_COEFF=${act_temporal_ensemble_coeff:-<disabled>}"
+    echo "FR3_RTC_MODE=${rtc_mode}"
+    echo "FR3_RTC_EXECUTION_HORIZON=${rtc_execution_horizon:-<runtime default>}"
+    echo "FR3_RTC_MAX_GUIDANCE_WEIGHT=${rtc_max_guidance_weight:-<runtime default>}"
+    echo "FR3_RTC_PREFIX_ATTENTION_SCHEDULE=${rtc_prefix_attention_schedule:-<runtime default>}"
+    echo "FR3_RTC_REPLAN_QUEUE_SIZE=${rtc_replan_queue_size:-<runtime default>}"
+    echo "FR3_RTC_INFERENCE_DELAY_STEPS=${rtc_inference_delay_steps:-<auto>}"
     echo "FR3_COMMAND_EMA_ALPHA=${command_ema_alpha:-<disabled>}"
     echo "FR3_CONTROLLER_STIFFNESS=${controller_stiffness:-<driver default>}"
     echo "FR3_CONTROLLER_DAMPING=${controller_damping:-<driver default>}"

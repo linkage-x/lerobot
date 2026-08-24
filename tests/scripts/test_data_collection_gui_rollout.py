@@ -521,6 +521,57 @@ def test_a_step_limit_only_appears_when_asked_for(tmp_path: Path):
     assert with_limit["FR3_INFER_MAX_STEPS"] == "300"
 
 
+def test_browser_rollout_runtime_options_are_passed_to_the_launcher(tmp_path: Path):
+    runtime_options = rollout_backend.sanitize_rollout_runtime_options(
+        {
+            "taskPrompt": "Pick up the peg and insert it fully into the hole.",
+            "rtcMode": "auto",
+            "rtcExecutionHorizon": 10,
+            "rtcMaxGuidanceWeight": 10,
+            "rtcPrefixAttentionSchedule": "EXP",
+            "rtcReplanQueueSize": 30,
+            "rtcInferenceDelaySteps": 1,
+            "commandEmaAlpha": 0.2,
+        }
+    )
+
+    _, env = _command(tmp_path, runtime_options=runtime_options)
+
+    assert env["FR3_TASK_PROMPT"] == "Pick up the peg and insert it fully into the hole."
+    assert env["FR3_RTC_MODE"] == "auto"
+    assert env["FR3_RTC_EXECUTION_HORIZON"] == "10"
+    assert env["FR3_RTC_MAX_GUIDANCE_WEIGHT"] == "10"
+    assert env["FR3_RTC_PREFIX_ATTENTION_SCHEDULE"] == "EXP"
+    assert env["FR3_RTC_REPLAN_QUEUE_SIZE"] == "30"
+    assert env["FR3_RTC_INFERENCE_DELAY_STEPS"] == "1"
+    assert env["FR3_COMMAND_EMA_ALPHA"] == "0.2"
+
+
+def test_browser_rollout_runtime_options_clear_stale_shell_values(tmp_path: Path):
+    _, env = _command(
+        tmp_path,
+        base_env={
+            "FR3_TASK_PROMPT": "stale prompt",
+            "FR3_RTC_MODE": "enabled",
+            "FR3_RTC_EXECUTION_HORIZON": "3",
+            "FR3_COMMAND_EMA_ALPHA": "0.9",
+            "FR3_ACT_TEMPORAL_ENSEMBLE_COEFF": "0.01",
+        },
+    )
+
+    for key in rollout_backend.ROLLOUT_RUNTIME_ENV_KEYS:
+        assert key not in env
+
+
+def test_rollout_runtime_options_reject_invalid_values():
+    with pytest.raises(rollout_backend.RolloutError, match="rtcMode"):
+        rollout_backend.sanitize_rollout_runtime_options({"rtcMode": "always"})
+    with pytest.raises(rollout_backend.RolloutError, match="rtcExecutionHorizon"):
+        rollout_backend.sanitize_rollout_runtime_options({"rtcExecutionHorizon": 0})
+    with pytest.raises(rollout_backend.RolloutError, match="commandEmaAlpha"):
+        rollout_backend.sanitize_rollout_runtime_options({"commandEmaAlpha": 1.5})
+
+
 def test_an_unknown_mode_is_refused(tmp_path: Path):
     with pytest.raises(rollout_backend.RolloutError, match="Unknown rollout mode"):
         _command(tmp_path, mode="real_yolo")

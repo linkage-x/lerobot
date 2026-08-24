@@ -2,7 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../apiClient";
 import { CheckpointBrowser, successRate } from "../shared/CheckpointBrowser";
 import { Metric, PageHeader, StatusDot } from "../shared/ui";
-import type { Checkpoint, RolloutMode, RolloutOutcomeEntry, RolloutRun } from "../types";
+import type {
+  Checkpoint,
+  RolloutMode,
+  RolloutOutcomeEntry,
+  RolloutRtcMode,
+  RolloutRtcSchedule,
+  RolloutRun,
+  RolloutRuntimeOptions
+} from "../types";
 
 /**
  * Running a trained checkpoint on the real FR3.
@@ -19,6 +27,30 @@ import type { Checkpoint, RolloutMode, RolloutOutcomeEntry, RolloutRun } from ".
  */
 
 const LIVE_STATES = new Set(["starting", "waiting", "rolling"]);
+const RTC_SCHEDULES: RolloutRtcSchedule[] = ["EXP", "LINEAR", "ONES", "ZEROS"];
+const DEFAULT_TASK_PROMPT_PLACEHOLDER = "Pick up the peg and insert it fully into the hole.";
+
+function isRtcPolicy(policyType: string): boolean {
+  const normalized = policyType.trim().toLowerCase().replace(/[\s._-]+/g, "");
+  return (
+    normalized === "pi0" ||
+    normalized.startsWith("pi05") ||
+    normalized.startsWith("pi0fast") ||
+    normalized.startsWith("smolvla")
+  );
+}
+
+function positiveNumberOr(value: string, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function optionalNumberOrNull(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 
 function stateTone(state: RolloutRun["state"]): string {
   if (state === "rolling") return "running";
@@ -38,6 +70,16 @@ export function RolloutPage() {
   const [overrideContract, setOverrideContract] = useState(false);
   const [moveToStart, setMoveToStart] = useState(true);
   const [maxSteps, setMaxSteps] = useState("300");
+  const [taskPrompt, setTaskPrompt] = useState("");
+  const [rtcMode, setRtcMode] = useState<RolloutRtcMode>("auto");
+  const [rtcExecutionHorizon, setRtcExecutionHorizon] = useState("10");
+  const [rtcMaxGuidanceWeight, setRtcMaxGuidanceWeight] = useState("10");
+  const [rtcPrefixAttentionSchedule, setRtcPrefixAttentionSchedule] =
+    useState<RolloutRtcSchedule>("EXP");
+  const [rtcReplanQueueSize, setRtcReplanQueueSize] = useState("30");
+  const [rtcInferenceDelaySteps, setRtcInferenceDelaySteps] = useState("");
+  const [commandEmaAlpha, setCommandEmaAlpha] = useState("");
+  const [showRolloutAdvanced, setShowRolloutAdvanced] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -51,6 +93,32 @@ export function RolloutPage() {
   const blocking = useMemo(
     () => (selected?.issues ?? []).filter((issue) => issue.level === "block"),
     [selected]
+  );
+  const isRtcCheckpoint = useMemo(
+    () => isRtcPolicy(selected?.policyType ?? ""),
+    [selected?.policyType]
+  );
+  const rolloutRuntimeOptions = useMemo<RolloutRuntimeOptions>(
+    () => ({
+      taskPrompt: taskPrompt.trim() || undefined,
+      rtcMode,
+      rtcExecutionHorizon: positiveNumberOr(rtcExecutionHorizon, 10),
+      rtcMaxGuidanceWeight: positiveNumberOr(rtcMaxGuidanceWeight, 10),
+      rtcPrefixAttentionSchedule,
+      rtcReplanQueueSize: positiveNumberOr(rtcReplanQueueSize, 30),
+      rtcInferenceDelaySteps: optionalNumberOrNull(rtcInferenceDelaySteps),
+      commandEmaAlpha: optionalNumberOrNull(commandEmaAlpha)
+    }),
+    [
+      taskPrompt,
+      rtcMode,
+      rtcExecutionHorizon,
+      rtcMaxGuidanceWeight,
+      rtcPrefixAttentionSchedule,
+      rtcReplanQueueSize,
+      rtcInferenceDelaySteps,
+      commandEmaAlpha
+    ]
   );
 
   const refreshHistory = useCallback(async () => {
@@ -100,6 +168,18 @@ export function RolloutPage() {
     setOverrideContract(false);
   }, [selected?.id]);
 
+  useEffect(() => {
+    setTaskPrompt("");
+    setRtcMode("auto");
+    setRtcExecutionHorizon("10");
+    setRtcMaxGuidanceWeight("10");
+    setRtcPrefixAttentionSchedule("EXP");
+    setRtcReplanQueueSize("30");
+    setRtcInferenceDelaySteps("");
+    setCommandEmaAlpha("");
+    setShowRolloutAdvanced(false);
+  }, [selected?.id]);
+
   const wrap = async (label: string, action: () => Promise<{ ok: boolean; error?: string }>) => {
     setBusy(true);
     setError("");
@@ -119,7 +199,8 @@ export function RolloutPage() {
         confirmMotion,
         overrideContract,
         moveToStart,
-        maxSteps: mode.id === "real_once" ? Number(maxSteps) || 300 : 0
+        maxSteps: mode.id === "real_once" ? Number(maxSteps) || 300 : 0,
+        runtimeOptions: rolloutRuntimeOptions
       })
     );
     if (result.ok) {
@@ -347,6 +428,126 @@ export function RolloutPage() {
             />
           </label>
         )}
+
+        <div className="subcard rollout-runtime-options">
+          <h4>pi0.5+LoRA first rollout defaults</h4>
+          <p className="hint">
+            Recommended first rollout: keep RTC mode on <code>auto</code>, execution horizon{" "}
+            <code>10</code>, max guidance <code>10</code>, prefix attention <code>EXP</code>,
+            replan queue <code>30</code>, inference delay <code>auto</code>, and command EMA{" "}
+            <code>off</code>.
+          </p>
+          <p className="hint">
+            {selected
+              ? isRtcCheckpoint
+                ? "This checkpoint is a flow/VLA policy; RTC auto will be enabled for smoother chunked execution."
+                : `This checkpoint is ${selected.policyType}; RTC auto stays disabled for ACT-style policies.`
+              : "Pick a checkpoint; these defaults are safe to leave unchanged."}
+          </p>
+          <label className="field">
+            <span>Task prompt override</span>
+            <input
+              value={taskPrompt}
+              onChange={(event) => setTaskPrompt(event.target.value)}
+              placeholder={`auto from dataset task; e.g. ${DEFAULT_TASK_PROMPT_PLACEHOLDER}`}
+              disabled={isLive}
+            />
+          </label>
+          <div className="row-actions">
+            <label className="field inline">
+              <span>RTC mode</span>
+              <select
+                value={rtcMode}
+                onChange={(event) => setRtcMode(event.target.value as RolloutRtcMode)}
+                disabled={isLive}
+              >
+                <option value="auto">auto (recommended)</option>
+                <option value="enabled">force enabled</option>
+                <option value="disabled">disabled</option>
+              </select>
+            </label>
+            <label className="field inline">
+              <span>Horizon</span>
+              <input
+                value={rtcExecutionHorizon}
+                onChange={(event) => setRtcExecutionHorizon(event.target.value)}
+                inputMode="numeric"
+                disabled={isLive}
+              />
+            </label>
+            <label className="field inline">
+              <span>Guidance</span>
+              <input
+                value={rtcMaxGuidanceWeight}
+                onChange={(event) => setRtcMaxGuidanceWeight(event.target.value)}
+                inputMode="decimal"
+                disabled={isLive}
+              />
+            </label>
+          </div>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={showRolloutAdvanced}
+              onChange={(event) => setShowRolloutAdvanced(event.target.checked)}
+              disabled={isLive}
+            />
+            <span>Show advanced rollout knobs</span>
+          </label>
+          {showRolloutAdvanced && (
+            <>
+              <div className="row-actions">
+                <label className="field inline">
+                  <span>Attention schedule</span>
+                  <select
+                    value={rtcPrefixAttentionSchedule}
+                    onChange={(event) =>
+                      setRtcPrefixAttentionSchedule(event.target.value as RolloutRtcSchedule)
+                    }
+                    disabled={isLive}
+                  >
+                    {RTC_SCHEDULES.map((schedule) => (
+                      <option key={schedule} value={schedule}>{schedule}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="field inline">
+                  <span>Replan queue</span>
+                  <input
+                    value={rtcReplanQueueSize}
+                    onChange={(event) => setRtcReplanQueueSize(event.target.value)}
+                    inputMode="numeric"
+                    disabled={isLive}
+                  />
+                </label>
+                <label className="field inline">
+                  <span>Delay steps</span>
+                  <input
+                    value={rtcInferenceDelaySteps}
+                    onChange={(event) => setRtcInferenceDelaySteps(event.target.value)}
+                    inputMode="numeric"
+                    placeholder="auto"
+                    disabled={isLive}
+                  />
+                </label>
+                <label className="field inline">
+                  <span>Command EMA</span>
+                  <input
+                    value={commandEmaAlpha}
+                    onChange={(event) => setCommandEmaAlpha(event.target.value)}
+                    inputMode="decimal"
+                    placeholder="off"
+                    disabled={isLive}
+                  />
+                </label>
+              </div>
+              <p className="hint">
+                EMA is intentionally off for the first pi0.5+LoRA rollout: RTC replanning already
+                smooths the queue, while extra EMA can blur the final insertion correction.
+              </p>
+            </>
+          )}
+        </div>
 
         {mode?.movesArm && (
           <label className="checkbox">

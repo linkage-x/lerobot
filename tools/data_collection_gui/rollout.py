@@ -14,6 +14,7 @@ the runtime prints for humans; the markers matched here are the ones it emits un
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -30,6 +31,23 @@ PREVIEW_FPS = 5.0
 # A frame older than this is not a live view. Rollouts run at the dataset's rate, well above the
 # preview rate, so the only way to exceed this is a run that has stopped producing frames.
 PREVIEW_STALE_S = 3.0
+
+# Runtime knobs the browser owns. They are cleared from any inherited environment before the
+# page applies its explicit choices, because stale shell values are otherwise indistinguishable
+# from operator intent once the launcher starts.
+ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
+    "FR3_TASK_PROMPT",
+    "FR3_ACT_TEMPORAL_ENSEMBLE_COEFF",
+    "FR3_RTC_MODE",
+    "FR3_RTC_EXECUTION_HORIZON",
+    "FR3_RTC_MAX_GUIDANCE_WEIGHT",
+    "FR3_RTC_PREFIX_ATTENTION_SCHEDULE",
+    "FR3_RTC_REPLAN_QUEUE_SIZE",
+    "FR3_RTC_INFERENCE_DELAY_STEPS",
+    "FR3_COMMAND_EMA_ALPHA",
+)
+RTC_MODES = {"auto", "enabled", "disabled"}
+RTC_PREFIX_ATTENTION_SCHEDULES = {"EXP", "LINEAR", "ONES", "ZEROS"}
 
 
 @dataclass(frozen=True)
@@ -104,6 +122,124 @@ class RolloutError(RuntimeError):
     """Something the operator can fix, reported as a 4xx rather than a traceback."""
 
 
+def _optional_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _parse_int_field(value: Any, field: str, *, minimum: int) -> int:
+    if isinstance(value, bool):
+        raise RolloutError(f"{field} must be an integer, not a boolean.")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float) and value.is_integer():
+        parsed = int(value)
+    else:
+        text = str(value).strip()
+        if not re.fullmatch(r"[+-]?\d+", text):
+            raise RolloutError(f"{field} must be an integer.")
+        parsed = int(text)
+    if parsed < minimum:
+        raise RolloutError(f"{field} must be >= {minimum}.")
+    return parsed
+
+
+def _parse_float_field(value: Any, field: str, *, minimum: float | None = None) -> float:
+    if isinstance(value, bool):
+        raise RolloutError(f"{field} must be a number, not a boolean.")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RolloutError(f"{field} must be a number.") from exc
+    if not math.isfinite(parsed):
+        raise RolloutError(f"{field} must be finite.")
+    if minimum is not None and parsed < minimum:
+        raise RolloutError(f"{field} must be >= {minimum:g}.")
+    return parsed
+
+
+def _set_optional_int_env(
+    options: dict[str, str],
+    raw: dict[str, Any],
+    field: str,
+    env_name: str,
+    *,
+    minimum: int,
+) -> None:
+    if field not in raw or raw[field] in (None, ""):
+        return
+    options[env_name] = str(_parse_int_field(raw[field], field, minimum=minimum))
+
+
+def _set_optional_float_env(
+    options: dict[str, str],
+    raw: dict[str, Any],
+    field: str,
+    env_name: str,
+    *,
+    minimum: float | None = None,
+) -> float | None:
+    if field not in raw or raw[field] in (None, ""):
+        return None
+    parsed = _parse_float_field(raw[field], field, minimum=minimum)
+    options[env_name] = f"{parsed:g}"
+    return parsed
+
+
+def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
+    """Validate the Rollout page's optional runtime knobs and return launcher env values."""
+    if raw in (None, ""):
+        return {}
+    if not isinstance(raw, dict):
+        raise RolloutError("runtimeOptions must be an object.")
+
+    options: dict[str, str] = {}
+    task_prompt = _optional_text(raw.get("taskPrompt"))
+    if task_prompt:
+        options["FR3_TASK_PROMPT"] = task_prompt
+
+    rtc_mode = _optional_text(raw.get("rtcMode"))
+    if rtc_mode:
+        rtc_mode = rtc_mode.lower()
+        if rtc_mode not in RTC_MODES:
+            raise RolloutError(
+                f"rtcMode must be one of {', '.join(sorted(RTC_MODES))}; got {raw.get('rtcMode')!r}."
+            )
+        options["FR3_RTC_MODE"] = rtc_mode
+
+    _set_optional_int_env(
+        options, raw, "rtcExecutionHorizon", "FR3_RTC_EXECUTION_HORIZON", minimum=1
+    )
+    _set_optional_float_env(
+        options, raw, "rtcMaxGuidanceWeight", "FR3_RTC_MAX_GUIDANCE_WEIGHT", minimum=0.0
+    )
+
+    schedule = _optional_text(raw.get("rtcPrefixAttentionSchedule"))
+    if schedule:
+        schedule = schedule.upper()
+        if schedule not in RTC_PREFIX_ATTENTION_SCHEDULES:
+            raise RolloutError(
+                "rtcPrefixAttentionSchedule must be one of "
+                f"{', '.join(sorted(RTC_PREFIX_ATTENTION_SCHEDULES))}; got "
+                f"{raw.get('rtcPrefixAttentionSchedule')!r}."
+            )
+        options["FR3_RTC_PREFIX_ATTENTION_SCHEDULE"] = schedule
+
+    _set_optional_int_env(
+        options, raw, "rtcReplanQueueSize", "FR3_RTC_REPLAN_QUEUE_SIZE", minimum=1
+    )
+    _set_optional_int_env(
+        options, raw, "rtcInferenceDelaySteps", "FR3_RTC_INFERENCE_DELAY_STEPS", minimum=0
+    )
+    ema = _set_optional_float_env(
+        options, raw, "commandEmaAlpha", "FR3_COMMAND_EMA_ALPHA", minimum=0.0
+    )
+    if ema is not None and ema > 1.0:
+        raise RolloutError("commandEmaAlpha must be <= 1.")
+    return options
+
+
 @dataclass
 class RolloutStatus:
     state: str = "idle"  # idle | starting | waiting | rolling | complete | error | stopped
@@ -151,6 +287,7 @@ def build_rollout_command(
     camera_config: str = "",
     max_steps: int = 0,
     move_to_start: bool = True,
+    runtime_options: dict[str, str] | None = None,
     preview_dir: Path = PREVIEW_DIR,
     preview_fps: float = PREVIEW_FPS,
     base_env: dict[str, str] | None = None,
@@ -177,6 +314,13 @@ def build_rollout_command(
         raise RolloutError("A rollout needs a checkpoint.")
 
     env = dict(base_env) if base_env is not None else os.environ.copy()
+    for key in ROLLOUT_RUNTIME_ENV_KEYS:
+        env.pop(key, None)
+    for key, value in (runtime_options or {}).items():
+        if key not in ROLLOUT_RUNTIME_ENV_KEYS:
+            raise RolloutError(f"Unsupported rollout runtime environment key {key!r}.")
+        env[key] = value
+
     env["FR3_INFER_CHECKPOINT"] = checkpoint_path
     env["FR3_MOVE_TO_START"] = "1" if move_to_start else "0"
     env["PYTHONUNBUFFERED"] = "1"

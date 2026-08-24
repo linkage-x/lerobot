@@ -35,6 +35,8 @@ ROBOT_INIT_STATE_SHORTHAND_PREFIXES = (
     'xyzrotvec:',
 )
 GRIPPER_BACKEND_CHOICES = ('pika', 'das', 'franka_hand', 'corenetic')
+RTC_MODE_CHOICES = ('auto', 'enabled', 'disabled')
+RTC_PREFIX_ATTENTION_SCHEDULE_CHOICES = ('ZEROS', 'ONES', 'LINEAR', 'EXP')
 
 
 def _normalize_gripper_backend(value: str) -> str:
@@ -85,6 +87,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Camera config YAML relative to repo root. Defaults to the OpenCV-based FR3 inference camera config.',
     )
     parser.add_argument('--dataset-root', default=None, help='Optional dataset root override.')
+    parser.add_argument('--task-prompt', default=None, help='Task prompt for language-conditioned policies.')
     parser.add_argument('--policy-fps', type=float, default=None, help='Optional low-rate policy update FPS override.')
     parser.add_argument('--max-steps', type=int, default=None, help='Optional inference loop step limit.')
     parser.add_argument(
@@ -150,6 +153,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--max-step-rot-delta-deg', type=float, default=None)
     parser.add_argument('--max-leash-pos-delta-mm', type=float, default=None)
     parser.add_argument('--max-leash-rot-delta-deg', type=float, default=None)
+    parser.add_argument('--rtc-mode', choices=RTC_MODE_CHOICES, default=None)
+    parser.add_argument('--rtc', dest='rtc_mode', action='store_const', const='enabled')
+    parser.add_argument('--no-rtc', dest='rtc_mode', action='store_const', const='disabled')
+    parser.add_argument('--rtc-auto', dest='rtc_mode', action='store_const', const='auto')
+    parser.add_argument('--rtc-execution-horizon', type=int, default=None)
+    parser.add_argument('--rtc-max-guidance-weight', type=float, default=None)
+    parser.add_argument('--rtc-prefix-attention-schedule', choices=RTC_PREFIX_ATTENTION_SCHEDULE_CHOICES, default=None)
+    parser.add_argument('--rtc-replan-queue-size', type=int, default=None)
+    parser.add_argument('--rtc-inference-delay-steps', type=int, default=None)
     parser.add_argument(
         '--use-otg',
         dest='use_otg',
@@ -289,6 +301,7 @@ def apply_inference_config_defaults(args: argparse.Namespace) -> argparse.Namesp
         DEFAULT_CAMERA_CONFIG,
     )
     args.dataset_root = args.dataset_root or _nested(raw, 'runtime', 'dataset_root') or _nested(raw, 'training', 'dataset_root')
+    args.task_prompt = args.task_prompt or _nested(raw, 'runtime', 'task_prompt')
     args.policy_fps = args.policy_fps if args.policy_fps is not None else _nested(raw, 'runtime', 'policy_fps')
     args.max_steps = args.max_steps if args.max_steps is not None else _nested(raw, 'runtime', 'max_steps')
     args.preview = bool(_nested(raw, 'runtime', 'preview')) if args.preview is None else args.preview
@@ -389,6 +402,35 @@ def apply_inference_config_defaults(args: argparse.Namespace) -> argparse.Namesp
         if args.max_step_rot_delta_deg is not None
         else _nested(raw, 'runtime', 'safety', 'max_step_rot_delta_deg')
     )
+    rtc_enabled_default = _nested(raw, 'runtime', 'rtc', 'enabled')
+    if args.rtc_mode is None and rtc_enabled_default is not None:
+        args.rtc_mode = 'enabled' if bool(rtc_enabled_default) else 'disabled'
+    if args.rtc_mode is None:
+        args.rtc_mode = _nested(raw, 'runtime', 'rtc', 'mode')
+    args.rtc_execution_horizon = (
+        args.rtc_execution_horizon
+        if args.rtc_execution_horizon is not None
+        else _nested(raw, 'runtime', 'rtc', 'execution_horizon')
+    )
+    args.rtc_max_guidance_weight = (
+        args.rtc_max_guidance_weight
+        if args.rtc_max_guidance_weight is not None
+        else _nested(raw, 'runtime', 'rtc', 'max_guidance_weight')
+    )
+    args.rtc_prefix_attention_schedule = (
+        args.rtc_prefix_attention_schedule
+        or _nested(raw, 'runtime', 'rtc', 'prefix_attention_schedule')
+    )
+    args.rtc_replan_queue_size = (
+        args.rtc_replan_queue_size
+        if args.rtc_replan_queue_size is not None
+        else _nested(raw, 'runtime', 'rtc', 'replan_queue_size')
+    )
+    args.rtc_inference_delay_steps = (
+        args.rtc_inference_delay_steps
+        if args.rtc_inference_delay_steps is not None
+        else _nested(raw, 'runtime', 'rtc', 'inference_delay_steps')
+    )
     otg_default = _nested(raw, 'runtime', 'control', 'use_otg')
     if otg_default is None:
         otg_default = _nested(raw, 'runtime', 'otg', 'enabled')
@@ -452,6 +494,17 @@ def apply_inference_config_defaults(args: argparse.Namespace) -> argparse.Namesp
         if args.mujoco_max_chunk_points is not None
         else _nested(raw, 'runtime', 'mujoco', 'max_chunk_points')
     )
+    if args.rtc_mode is not None:
+        args.rtc_mode = str(args.rtc_mode).strip().lower()
+        if args.rtc_mode not in RTC_MODE_CHOICES:
+            raise ValueError(f"runtime.rtc.mode must be one of {RTC_MODE_CHOICES}, got {args.rtc_mode!r}")
+    if args.rtc_prefix_attention_schedule is not None:
+        args.rtc_prefix_attention_schedule = str(args.rtc_prefix_attention_schedule).strip().upper()
+        if args.rtc_prefix_attention_schedule not in RTC_PREFIX_ATTENTION_SCHEDULE_CHOICES:
+            raise ValueError(
+                'runtime.rtc.prefix_attention_schedule must be one of '
+                f'{RTC_PREFIX_ATTENTION_SCHEDULE_CHOICES}, got {args.rtc_prefix_attention_schedule!r}'
+            )
     return args
 
 
@@ -513,6 +566,7 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         f'--camera-config={shlex.quote(camera_config)}',
         f'--gripper-backend={shlex.quote(args.gripper_backend)}',
         *([f"--dataset-root={shlex.quote(_normalize_workspace_path(args.dataset_root))}"] if args.dataset_root is not None else []),
+        *([f'--task-prompt={shlex.quote(args.task_prompt)}'] if args.task_prompt is not None else []),
         *([f'--policy-fps={args.policy_fps}'] if args.policy_fps is not None else []),
         *([f'--max-steps={args.max_steps}'] if args.max_steps is not None else []),
         *(['--preview'] if args.preview else []),
@@ -563,6 +617,24 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         *([f'--max-step-rot-delta-deg={args.max_step_rot_delta_deg}'] if args.max_step_rot_delta_deg is not None else []),
         *([f'--max-leash-pos-delta-mm={args.max_leash_pos_delta_mm}'] if args.max_leash_pos_delta_mm is not None else []),
         *([f'--max-leash-rot-delta-deg={args.max_leash_rot_delta_deg}'] if args.max_leash_rot_delta_deg is not None else []),
+        *(
+            ['--rtc']
+            if args.rtc_mode == 'enabled'
+            else ['--no-rtc']
+            if args.rtc_mode == 'disabled'
+            else ['--rtc-auto']
+            if args.rtc_mode == 'auto'
+            else []
+        ),
+        *([f'--rtc-execution-horizon={args.rtc_execution_horizon}'] if args.rtc_execution_horizon is not None else []),
+        *([f'--rtc-max-guidance-weight={args.rtc_max_guidance_weight}'] if args.rtc_max_guidance_weight is not None else []),
+        *(
+            [f'--rtc-prefix-attention-schedule={shlex.quote(args.rtc_prefix_attention_schedule)}']
+            if args.rtc_prefix_attention_schedule is not None
+            else []
+        ),
+        *([f'--rtc-replan-queue-size={args.rtc_replan_queue_size}'] if args.rtc_replan_queue_size is not None else []),
+        *([f'--rtc-inference-delay-steps={args.rtc_inference_delay_steps}'] if args.rtc_inference_delay_steps is not None else []),
         *(['--use-otg'] if args.use_otg is True else ['--no-use-otg'] if args.use_otg is False else []),
         *([f'--otg-control-frequency={args.otg_control_frequency}'] if args.otg_control_frequency is not None else []),
         *(

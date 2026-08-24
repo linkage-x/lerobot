@@ -14,8 +14,10 @@ Execution model:
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from copy import deepcopy
 import json
+import math
 from pathlib import Path
 import os
 import select
@@ -37,12 +39,15 @@ from lerobot.cameras.hikrobot.configuration_hikrobot import HikrobotCameraConfig
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.configs.types import FeatureType
+from lerobot.configs.types import FeatureType, RTCAttentionSchedule
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline, RobotObservation
 from lerobot.robots.franka_research3 import FrankaResearch3Config
 from lerobot.processor.core import TransitionKey
+from lerobot.policies.rtc.action_queue import ActionQueue
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.policies.rtc.latency_tracker import LatencyTracker
 from lerobot.robots.franka_research3.processor_franka_research3 import (
     DeltaEEToAbsoluteEEAction,
     EE_POSITION_KEYS,
@@ -55,7 +60,7 @@ from lerobot.robots.franka_research3.processor_franka_research3 import (
     _continuous_quaternion,
     delta_reference_from_action_names,
 )
-from lerobot.utils.control_utils import predict_action
+from lerobot.utils.control_utils import predict_action, prepare_observation_for_inference
 from lerobot.utils.rotation import Rotation
 from lerobot.utils.robot_utils import precise_sleep
 
@@ -125,6 +130,12 @@ _DAS_START_JOINTS_RAD = np.array(
     dtype=np.float64,
 )
 _TACTILE_FALLBACK_CHOICES = ('baseline_idle',)
+_RTC_MODE_CHOICES = ('auto', 'enabled', 'disabled')
+_RTC_POLICY_TYPES = {'pi0', 'pi05', 'pi0_fast', 'smolvla'}
+_DEFAULT_RTC_EXECUTION_HORIZON = 10
+_DEFAULT_RTC_MAX_GUIDANCE_WEIGHT = 10.0
+_DEFAULT_RTC_PREFIX_ATTENTION_SCHEDULE = RTCAttentionSchedule.EXP
+_DEFAULT_RTC_REPLAN_QUEUE_SIZE = 30
 _JOINT_NAMES = [
     'fr3_joint1',
     'fr3_joint2',
@@ -213,6 +224,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Camera config YAML. Defaults to the OpenCV-based FR3 inference camera config.',
     )
     parser.add_argument('--dataset-root', default=None, help='Optional dataset root override.')
+    parser.add_argument(
+        '--task-prompt',
+        default=None,
+        help=(
+            'Task prompt to send to language-conditioned policies. If omitted, the runtime uses the '
+            'single task stored in the checkpoint dataset/view; multi-task views require this flag.'
+        ),
+    )
     parser.add_argument('--policy-fps', type=float, default=None, help='Optional low-rate policy update FPS override.')
     parser.add_argument(
         '--policy-n-action-steps',
@@ -277,12 +296,57 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Normalized gripper command at or below this value is considered closed for temporal offset advance.',
     )
     parser.add_argument(
+        '--rtc-mode',
+        choices=_RTC_MODE_CHOICES,
+        default='auto',
+        help=(
+            'Real-Time Chunking mode for flow-matching chunk policies. '
+            'auto enables RTC only for pi0/pi0.5/pi0_fast/SmolVLA; disabled preserves the checkpoint default queue.'
+        ),
+    )
+    parser.add_argument('--rtc', dest='rtc_mode', action='store_const', const='enabled', help='Enable RTC.')
+    parser.add_argument('--no-rtc', dest='rtc_mode', action='store_const', const='disabled', help='Disable RTC.')
+    parser.add_argument('--rtc-auto', dest='rtc_mode', action='store_const', const='auto', help='Auto-enable RTC for supported policies.')
+    parser.add_argument(
+        '--rtc-execution-horizon',
+        type=int,
+        default=_DEFAULT_RTC_EXECUTION_HORIZON,
+        help='RTC overlap horizon, in policy steps. Typical pi0/pi0.5 values are 8-12.',
+    )
+    parser.add_argument(
+        '--rtc-max-guidance-weight',
+        type=float,
+        default=_DEFAULT_RTC_MAX_GUIDANCE_WEIGHT,
+        help='RTC guidance strength. 10.0 is the recommended starting point for 10-step pi0/pi0.5 inference.',
+    )
+    parser.add_argument(
+        '--rtc-prefix-attention-schedule',
+        choices=[schedule.value for schedule in RTCAttentionSchedule],
+        default=_DEFAULT_RTC_PREFIX_ATTENTION_SCHEDULE.value,
+        help='RTC prefix weighting schedule. EXP is the conservative default for real-robot rollout.',
+    )
+    parser.add_argument(
+        '--rtc-replan-queue-size',
+        type=int,
+        default=_DEFAULT_RTC_REPLAN_QUEUE_SIZE,
+        help=(
+            'Request a new action chunk when this many postprocessed actions remain. '
+            'For chunk_size=50, 30 replans after about 20 executed steps and leaves overlap for RTC.'
+        ),
+    )
+    parser.add_argument(
+        '--rtc-inference-delay-steps',
+        type=int,
+        default=None,
+        help='Optional fixed inference delay in policy steps. Omit to estimate from measured chunk latency.',
+    )
+    parser.add_argument(
         '--command-ema-alpha',
         type=float,
         default=None,
         help=(
             'Optional EMA smoothing for decoded EE commands before safety clamp. '
-            'Use with ACT action queue to reduce jitter without temporal-ensemble target sticking. '
+            'Use lightly with chunk/RTC policies; heavy values can delay grasp and insertion corrections. '
             '1.0 disables smoothing; smaller values are smoother.'
         ),
     )
@@ -2573,6 +2637,19 @@ def extract_new_action_chunk_for_visualization(
     return action_tensors
 
 
+
+def extract_action_queue_for_visualization(
+    action_queue: ActionQueue,
+    current_action_tensor: torch.Tensor,
+) -> list[torch.Tensor]:
+    action_tensors = [current_action_tensor.detach().cpu()]
+    with action_queue.lock:
+        if action_queue.queue is None:
+            return action_tensors
+        for queued_action in action_queue.queue[action_queue.last_index :]:
+            action_tensors.append(queued_action.detach().cpu())
+    return action_tensors
+
 def select_temporal_ensemble_offset_action(
     action_tensor: torch.Tensor,
     *,
@@ -3275,6 +3352,154 @@ def dump_step0_action_debug(
     )
 
 
+
+def _policy_config_type(policy_cfg: Any) -> str:
+    policy_type = getattr(policy_cfg, "type", "")
+    if callable(policy_type):
+        try:
+            policy_type = policy_type()
+        except TypeError:
+            policy_type = ""
+    return str(policy_type or "").strip().lower()
+
+
+def should_enable_rtc_for_policy(policy_cfg: Any, rtc_mode: str) -> bool:
+    mode = str(rtc_mode or "disabled").strip().lower()
+    if mode not in _RTC_MODE_CHOICES:
+        raise ValueError(f"--rtc-mode must be one of {_RTC_MODE_CHOICES}, got {rtc_mode!r}.")
+    supports_rtc = hasattr(policy_cfg, "rtc_config") and _policy_config_type(policy_cfg) in _RTC_POLICY_TYPES
+    if mode == "disabled":
+        return False
+    if mode == "enabled" and not supports_rtc:
+        raise ValueError(
+            f"--rtc-mode=enabled was requested, but policy type {_policy_config_type(policy_cfg)!r} "
+            "does not support RTC in this runtime. Use --rtc-mode=auto to keep unsupported policies on their "
+            "checkpoint queue."
+        )
+    return supports_rtc
+
+
+def configure_rtc_for_policy_config(
+    policy_cfg: Any,
+    *,
+    rtc_mode: str,
+    execution_horizon: int,
+    max_guidance_weight: float,
+    prefix_attention_schedule: str,
+) -> bool:
+    enabled = should_enable_rtc_for_policy(policy_cfg, rtc_mode)
+    policy_type = _policy_config_type(policy_cfg)
+    if not enabled:
+        print(f"[INFO] rtc=disabled mode={rtc_mode} policy_type={policy_type or '<unknown>'}")
+        return False
+
+    execution_horizon = int(execution_horizon)
+    if execution_horizon <= 0:
+        raise ValueError("--rtc-execution-horizon must be > 0 when RTC is enabled.")
+    max_guidance_weight = float(max_guidance_weight)
+    if max_guidance_weight <= 0.0:
+        raise ValueError("--rtc-max-guidance-weight must be > 0 when RTC is enabled.")
+    schedule = RTCAttentionSchedule(str(prefix_attention_schedule).upper())
+    policy_cfg.rtc_config = RTCConfig(
+        enabled=True,
+        execution_horizon=execution_horizon,
+        max_guidance_weight=max_guidance_weight,
+        prefix_attention_schedule=schedule,
+    )
+    print(
+        "[INFO] rtc=enabled "
+        f"mode={rtc_mode} policy_type={policy_type} "
+        f"execution_horizon={execution_horizon} "
+        f"max_guidance_weight={max_guidance_weight:.6g} "
+        f"prefix_attention_schedule={schedule.value}"
+    )
+    return True
+
+
+def _clamp_rtc_delay_steps(delay_steps: int, chunk_len: int) -> int:
+    delay_steps = max(int(delay_steps), 0)
+    chunk_len = int(chunk_len)
+    if chunk_len <= 0:
+        return 0
+    if delay_steps >= chunk_len:
+        clamped = max(chunk_len - 1, 0)
+        print(
+            "[WARN] rtc_delay_exceeds_chunk "
+            f"delay_steps={delay_steps} chunk_len={chunk_len}; using delay_steps={clamped} so one action remains."
+        )
+        return clamped
+    return delay_steps
+
+
+def resolve_rtc_replan_queue_size(policy: Any, requested_replan_queue_size: int) -> int:
+    chunk_size = int(getattr(getattr(policy, "config", None), "chunk_size", 1))
+    if chunk_size <= 1:
+        return 0
+    requested = max(int(requested_replan_queue_size), 0)
+    return min(requested, chunk_size - 1)
+
+
+
+def resolve_rollout_task_prompt(ds_meta: LeRobotDatasetMetadata, explicit_task_prompt: str | None) -> str | None:
+    if explicit_task_prompt is not None and str(explicit_task_prompt).strip():
+        return str(explicit_task_prompt).strip()
+
+    tasks = getattr(ds_meta, "tasks", None)
+    if tasks is None:
+        return None
+    task_prompts = [str(task).strip() for task in list(tasks.index) if str(task).strip()]
+    unique_prompts = list(dict.fromkeys(task_prompts))
+    if len(unique_prompts) == 1:
+        return unique_prompts[0]
+    if len(unique_prompts) > 1:
+        raise ValueError(
+            "This checkpoint dataset/view contains multiple task prompts; pass --task-prompt explicitly "
+            f"to avoid running pi0/pi0.5 with the wrong language condition. Prompts: {unique_prompts}"
+        )
+    return None
+
+def predict_action_chunk_for_rollout(
+    observation: dict[str, np.ndarray],
+    *,
+    policy: Any,
+    device: torch.device,
+    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    use_amp: bool,
+    inference_delay: int,
+    prev_chunk_left_over: torch.Tensor | None,
+    execution_horizon: int,
+    task: str | None = None,
+    robot_type: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Predict one action chunk for a queue-driven rollout.
+
+    The returned first tensor is still in policy/raw action space, because RTC uses it as the
+    previous-chunk prefix on the next inference. The second tensor is already postprocessed into
+    the dataset action contract and can be decoded one step at a time against the live robot state.
+    """
+    observation = dict(observation)
+    with (
+        torch.no_grad(),
+        torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
+    ):
+        prepared_observation = prepare_observation_for_inference(
+            observation,
+            device,
+            task=task,
+            robot_type=robot_type,
+        )
+        preprocessed_observation = preprocessor(prepared_observation)
+        actions = policy.predict_action_chunk(
+            preprocessed_observation,
+            inference_delay=int(inference_delay),
+            prev_chunk_left_over=prev_chunk_left_over,
+            execution_horizon=int(execution_horizon),
+        )
+        original_actions = actions.squeeze(0).detach().clone()
+        processed_actions = postprocessor(actions).squeeze(0).detach().cpu().clone()
+    return original_actions, processed_actions
+
 def load_policy_stack(
     pretrained_dir: Path,
     *,
@@ -3282,10 +3507,25 @@ def load_policy_stack(
     device: torch.device,
     n_action_steps_override: int | None = None,
     act_temporal_ensemble_coeff: float | None = None,
+    rtc_mode: str = 'disabled',
+    rtc_execution_horizon: int = _DEFAULT_RTC_EXECUTION_HORIZON,
+    rtc_max_guidance_weight: float = _DEFAULT_RTC_MAX_GUIDANCE_WEIGHT,
+    rtc_prefix_attention_schedule: str = _DEFAULT_RTC_PREFIX_ATTENTION_SCHEDULE.value,
 ) -> tuple[Any, PolicyProcessorPipeline[dict[str, Any], dict[str, Any]], PolicyProcessorPipeline[PolicyAction, PolicyAction]]:
     policy_cfg = load_train_config(pretrained_dir).policy
     if policy_cfg is None:
         raise ValueError(f"No policy config found in {pretrained_dir / 'train_config.json'}")
+
+    rtc_enabled = configure_rtc_for_policy_config(
+        policy_cfg,
+        rtc_mode=rtc_mode,
+        execution_horizon=rtc_execution_horizon,
+        max_guidance_weight=rtc_max_guidance_weight,
+        prefix_attention_schedule=rtc_prefix_attention_schedule,
+    )
+
+    if rtc_enabled and act_temporal_ensemble_coeff is not None:
+        raise ValueError('--act-temporal-ensemble-coeff and RTC are mutually exclusive rollout smoothers.')
 
     if n_action_steps_override is not None:
         n_action_steps = int(n_action_steps_override)
@@ -3336,6 +3576,7 @@ def run_inference(args: argparse.Namespace) -> int:
     dataset_root = resolve_dataset_root(pretrained_dir, train_cfg, args.dataset_root)
     alignment_dataset_root, alignment_state_key = resolve_alignment_dataset_root_and_state_key(dataset_root)
     ds_meta = load_dataset_metadata(dataset_root, train_cfg.dataset.repo_id)
+    task_prompt = resolve_rollout_task_prompt(ds_meta, args.task_prompt)
     dataset_start_pose_contract_xyzquat, dataset_start_pose_stats = estimate_dataset_start_pose_contract(
         alignment_dataset_root,
         state_key=alignment_state_key,
@@ -3349,6 +3590,10 @@ def run_inference(args: argparse.Namespace) -> int:
         device=device,
         n_action_steps_override=args.policy_n_action_steps,
         act_temporal_ensemble_coeff=args.act_temporal_ensemble_coeff,
+        rtc_mode=args.rtc_mode,
+        rtc_execution_horizon=args.rtc_execution_horizon,
+        rtc_max_guidance_weight=args.rtc_max_guidance_weight,
+        rtc_prefix_attention_schedule=args.rtc_prefix_attention_schedule,
     )
     required_image_keys = extract_required_image_keys(policy.config.input_features)
     required_tactile_keys = extract_required_tactile_keys(policy.config.input_features)
@@ -3359,6 +3604,19 @@ def run_inference(args: argparse.Namespace) -> int:
     policy_fps = float(args.policy_fps or ds_meta.fps)
     if policy_fps <= 0.0:
         raise ValueError('policy-fps must be positive.')
+    rtc_config = getattr(policy.config, 'rtc_config', None)
+    rtc_enabled = bool(rtc_config is not None and getattr(rtc_config, 'enabled', False))
+    rtc_time_per_step = 1.0 / policy_fps
+    rtc_replan_queue_size = (
+        resolve_rtc_replan_queue_size(policy, args.rtc_replan_queue_size) if rtc_enabled else 0
+    )
+    rtc_state: dict[str, Any] = {
+        'queue': ActionQueue(rtc_config) if rtc_enabled else None,
+        'latency_tracker': LatencyTracker(),
+        'last_debug': {'status': 'disabled'},
+    }
+    if rtc_enabled and args.act_temporal_stuck_max_offset is not None:
+        raise ValueError('--act-temporal-stuck-max-offset is ACT-temporal-only; disable it when RTC is enabled.')
     first_frame_max_pos_delta_m = float(args.first_frame_max_pos_delta_mm) / 1000.0
     first_frame_max_rot_delta_rad = np.deg2rad(float(args.first_frame_max_rot_delta_deg))
     max_step_pos_delta_m = float(args.max_step_pos_delta_mm) / 1000.0
@@ -3473,6 +3731,7 @@ def run_inference(args: argparse.Namespace) -> int:
     print(f'[INFO] alignment_state_key={alignment_state_key}')
     print(f'[INFO] policy_device={device}')
     print(f'[INFO] policy_fps={policy_fps:.3f}')
+    print('[INFO] task_prompt=' + (json.dumps(task_prompt, ensure_ascii=False) if task_prompt else '<empty>'))
     print('[INFO] policy_image_keys=' + ', '.join(required_image_keys) if required_image_keys else '[INFO] policy_image_keys=<none>')
     print('[INFO] policy_tactile_keys=' + ', '.join(required_tactile_keys) if required_tactile_keys else '[INFO] policy_tactile_keys=<none>')
     print('[INFO] tactile_fallback=' + args.tactile_fallback if args.tactile_fallback is not None else '[INFO] tactile_fallback=<none>')
@@ -3548,6 +3807,17 @@ def run_inference(args: argparse.Namespace) -> int:
         )
     )
     print(
+        '[INFO] rtc_queue='
+        + (
+            'disabled'
+            if not rtc_enabled
+            else (
+                f'replan_when_remaining<={rtc_replan_queue_size} ' 
+                f'fixed_delay_steps={args.rtc_inference_delay_steps if args.rtc_inference_delay_steps is not None else "auto"}'
+            )
+        )
+    )
+    print(
         '[INFO] command_ema_alpha='
         + ('disabled' if args.command_ema_alpha is None else f'{float(args.command_ema_alpha):.3f}')
     )
@@ -3615,6 +3885,10 @@ def run_inference(args: argparse.Namespace) -> int:
         state_processor.reset()
         preprocessor.reset()
         postprocessor.reset()
+        if rtc_enabled:
+            rtc_state['queue'] = ActionQueue(rtc_config)
+            rtc_state['latency_tracker'] = LatencyTracker()
+            rtc_state['last_debug'] = {'status': 'reset'}
 
     def run_policy_rollout(interactive_keyboard: InteractiveRolloutKeyboard | None = None) -> str:
         reset_policy_runtime_state()
@@ -3768,28 +4042,95 @@ def run_inference(args: argparse.Namespace) -> int:
                     dataset_state_observation_i=dataset_state_observation_i,
                 )
                 print(f'[INFO] step0_capture_dump={dump_dir}')
-            action_tensor = predict_action(
-                policy_observation,
-                policy=policy,
-                device=device,
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                use_amp=bool(policy.config.use_amp),
-                robot_type=robot.name,
-            )
-            temporal_offset_used = int(temporal_offset_state.get('current_offset', int(args.act_temporal_action_offset)))
-            action_tensor = select_temporal_ensemble_offset_action(
-                action_tensor,
-                policy=policy,
-                postprocessor=postprocessor,
-                offset=temporal_offset_used,
-            )
+            if rtc_enabled:
+                action_queue = rtc_state['queue']
+                if not isinstance(action_queue, ActionQueue):
+                    raise RuntimeError('RTC is enabled but the rollout action queue was not initialized.')
+                if action_queue.qsize() <= rtc_replan_queue_size:
+                    latency_tracker = rtc_state['latency_tracker']
+                    if not isinstance(latency_tracker, LatencyTracker):
+                        raise RuntimeError('RTC is enabled but the latency tracker was not initialized.')
+                    prev_chunk_left_over = action_queue.get_left_over()
+                    tracked_latency = latency_tracker.max() or 0.0
+                    guidance_delay_steps = (
+                        int(args.rtc_inference_delay_steps)
+                        if args.rtc_inference_delay_steps is not None
+                        else int(math.ceil(float(tracked_latency) / rtc_time_per_step))
+                    )
+                    guidance_delay_steps = max(guidance_delay_steps, 0)
+                    chunk_start_t = time.perf_counter()
+                    original_actions, processed_actions = predict_action_chunk_for_rollout(
+                        policy_observation,
+                        policy=policy,
+                        device=device,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        use_amp=bool(policy.config.use_amp),
+                        inference_delay=guidance_delay_steps,
+                        prev_chunk_left_over=prev_chunk_left_over,
+                        execution_horizon=int(args.rtc_execution_horizon),
+                        task=task_prompt,
+                        robot_type=robot.name,
+                    )
+                    chunk_latency_s = time.perf_counter() - chunk_start_t
+                    measured_delay_steps = (
+                        int(args.rtc_inference_delay_steps)
+                        if args.rtc_inference_delay_steps is not None
+                        else int(math.ceil(chunk_latency_s / rtc_time_per_step))
+                    )
+                    delay_steps = _clamp_rtc_delay_steps(measured_delay_steps, int(processed_actions.shape[0]))
+                    latency_tracker.add(chunk_latency_s)
+                    action_queue.merge(
+                        original_actions,
+                        processed_actions,
+                        real_delay=delay_steps,
+                        action_index_before_inference=None,
+                    )
+                    rtc_state['last_debug'] = {
+                        'status': 'replan',
+                        'latency_s': chunk_latency_s,
+                        'guidance_delay_steps': guidance_delay_steps,
+                        'merge_delay_steps': delay_steps,
+                        'queue_size': action_queue.qsize(),
+                        'prev_leftover': 0 if prev_chunk_left_over is None else int(prev_chunk_left_over.shape[0]),
+                    }
+                else:
+                    rtc_state['last_debug'] = {
+                        'status': 'reuse',
+                        'queue_size': action_queue.qsize(),
+                    }
+                action_tensor = action_queue.get()
+                if action_tensor is None:
+                    raise RuntimeError('RTC action queue is empty after chunk prediction.')
+                temporal_offset_used = 0
+            else:
+                action_tensor = predict_action(
+                    policy_observation,
+                    policy=policy,
+                    device=device,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    use_amp=bool(policy.config.use_amp),
+                    task=task_prompt,
+                    robot_type=robot.name,
+                )
+                temporal_offset_used = int(temporal_offset_state.get('current_offset', int(args.act_temporal_action_offset)))
+                action_tensor = select_temporal_ensemble_offset_action(
+                    action_tensor,
+                    policy=policy,
+                    postprocessor=postprocessor,
+                    offset=temporal_offset_used,
+                )
             model_gripper_raw = extract_action_gripper_raw(action_tensor, action_names)
             if mujoco_visualizer is not None:
-                maybe_chunk_actions = extract_new_action_chunk_for_visualization(
-                    policy,
-                    action_tensor,
-                    postprocessor,
+                maybe_chunk_actions = (
+                    extract_action_queue_for_visualization(action_queue, action_tensor)
+                    if rtc_enabled and isinstance(rtc_state.get('queue'), ActionQueue)
+                    else extract_new_action_chunk_for_visualization(
+                        policy,
+                        action_tensor,
+                        postprocessor,
+                    )
                 )
                 if maybe_chunk_actions is not None:
                     latest_chunk_ee_poses = build_chunk_ee_poses_for_visualization(
@@ -3933,6 +4274,17 @@ def run_inference(args: argparse.Namespace) -> int:
                         else (
                             f" temporal_offset={temporal_offset_used}->{int(temporal_offset_debug['current_offset'])} "
                             f"temporal_offset_status={temporal_offset_debug['status']}"
+                        )
+                    )
+                    + (
+                        ''
+                        if not rtc_enabled
+                        else (
+                            f" rtc={rtc_state['last_debug'].get('status', 'unknown')}"
+                            f" rtc_q={int(rtc_state['last_debug'].get('queue_size', -1))}"
+                            f" rtc_lat_ms={float(rtc_state['last_debug'].get('latency_s', 0.0)) * 1000.0:.1f}"
+                            f" rtc_delay={int(rtc_state['last_debug'].get('guidance_delay_steps', 0))}"
+                            f"->{int(rtc_state['last_debug'].get('merge_delay_steps', 0))}"
                         )
                     )
                     + (

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 import subprocess
 
 import numpy as np
+import pytest
 import torch
 
 from lerobot.cameras.configs import ColorMode, Cv2Backends
@@ -51,6 +53,71 @@ def test_main_dry_run_prints_command(capsys):
     assert 'lerobot-infer-fr3-act' in captured.out
     assert '--camera-key-map' not in captured.out
 
+
+
+def test_build_docker_command_passes_task_prompt_and_rtc_flags(tmp_path: Path):
+    args = fr3_act_infer_real.parse_args(
+        [
+            '--workspace',
+            str(tmp_path),
+            '--checkpoint=/lerobot/outputs/train/2026-03-19/10-48-39_act/checkpoints/060000',
+            '--camera-config=/lerobot/tools/fr3/fr3_act_infer_camera_config.yaml',
+            '--task-prompt',
+            'Pick up the peg and insert it fully into the hole.',
+            '--rtc',
+            '--rtc-execution-horizon',
+            '10',
+            '--rtc-max-guidance-weight',
+            '10',
+            '--rtc-prefix-attention-schedule',
+            'EXP',
+            '--rtc-replan-queue-size',
+            '30',
+            '--rtc-inference-delay-steps',
+            '4',
+        ]
+    )
+
+    command_text = ' '.join(fr3_act_infer_real.build_docker_command(args))
+
+    assert '--task-prompt=' in command_text
+    assert 'Pick up the peg and insert it fully into the hole.' in command_text
+    assert '--rtc' in command_text
+    assert '--rtc-execution-horizon=10' in command_text
+    assert '--rtc-max-guidance-weight=10.0' in command_text
+    assert '--rtc-prefix-attention-schedule=EXP' in command_text
+    assert '--rtc-replan-queue-size=30' in command_text
+    assert '--rtc-inference-delay-steps=4' in command_text
+
+
+def test_rollout_task_prompt_auto_uses_single_dataset_task():
+    ds_meta = SimpleNamespace(tasks=SimpleNamespace(index=['Pick up the peg and insert it fully into the hole.']))
+
+    assert (
+        fr3_act_infer_real_runtime.resolve_rollout_task_prompt(ds_meta, None)
+        == 'Pick up the peg and insert it fully into the hole.'
+    )
+
+
+def test_rollout_task_prompt_requires_explicit_value_for_multitask_view():
+    ds_meta = SimpleNamespace(tasks=SimpleNamespace(index=['wrong task', 'Pick up the peg and insert it fully into the hole.']))
+
+    with pytest.raises(ValueError, match='multiple task prompts'):
+        fr3_act_infer_real_runtime.resolve_rollout_task_prompt(ds_meta, None)
+
+
+def test_rtc_auto_only_enables_supported_policy_types():
+    pi05_cfg = SimpleNamespace(type='pi05', rtc_config=None)
+    act_cfg = SimpleNamespace(type='act')
+
+    assert fr3_act_infer_real_runtime.should_enable_rtc_for_policy(pi05_cfg, 'auto') is True
+    assert fr3_act_infer_real_runtime.should_enable_rtc_for_policy(act_cfg, 'auto') is False
+    with pytest.raises(ValueError, match='does not support RTC'):
+        fr3_act_infer_real_runtime.should_enable_rtc_for_policy(act_cfg, 'enabled')
+
+
+def test_rtc_delay_clamp_keeps_one_action_when_latency_exceeds_chunk():
+    assert fr3_act_infer_real_runtime._clamp_rtc_delay_steps(80, 50) == 49
 
 def test_build_docker_command_passes_preview_and_safety_flags(tmp_path: Path):
     args = fr3_act_infer_real.parse_args(
