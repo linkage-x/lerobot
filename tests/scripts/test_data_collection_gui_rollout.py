@@ -191,6 +191,39 @@ def test_scan_skips_a_checkpoint_that_was_killed_mid_save(tmp_path: Path):
     assert "job_a/025000" not in ids
 
 
+def test_scan_reports_lora_adapter_checkpoints(tmp_path: Path):
+    view = _make_view(tmp_path, "v1")
+    step_dir = _make_checkpoint(tmp_path, "job_pi05", "020000", view)
+    pretrained = step_dir / "pretrained_model"
+    (pretrained / "model.safetensors").unlink()
+    (pretrained / "adapter_model.safetensors").write_bytes(b"adapter" * 1024)
+    _write_json(
+        pretrained / "adapter_config.json",
+        {"base_model_name_or_path": "/home/tele/Models/pi05_base"},
+    )
+    config = json.loads((pretrained / "config.json").read_text(encoding="utf-8"))
+    config["type"] = "pi05"
+    _write_json(pretrained / "config.json", config)
+
+    entry = _entry(tmp_path, "job_pi05/020000")
+
+    assert entry["policyType"] == "pi05"
+    assert entry["pretrainedPath"].endswith("checkpoints/020000/pretrained_model")
+    assert entry["sizeBytes"] >= len(b"adapter" * 1024)
+
+
+def test_scan_skips_a_half_written_lora_adapter_checkpoint(tmp_path: Path):
+    view = _make_view(tmp_path, "v1")
+    step_dir = _make_checkpoint(tmp_path, "job_pi05", "020000", view)
+    pretrained = step_dir / "pretrained_model"
+    (pretrained / "model.safetensors").unlink()
+    (pretrained / "adapter_model.safetensors").write_bytes(b"adapter")
+
+    ids = [item["id"] for item in _scan(tmp_path)["checkpoints"]]
+
+    assert "job_pi05/020000" not in ids
+
+
 def test_scan_names_the_step_that_last_points_at(tmp_path: Path):
     """`last` is a symlink, so its bytes are already counted under the numbered step."""
     view = _make_view(tmp_path, "v1")
