@@ -44,6 +44,86 @@ from lerobot.datasets.utils import (
 from lerobot.datasets.video_utils import concatenate_video_files, get_video_duration_in_s
 
 
+# Keys under `info["derived"][<producer>]` that identify which measurement chain
+# produced the poses a derived sidecar wrote into `observation.state` / `action`.
+# Two datasets that disagree on any of them carry the same column names filled by
+# different estimators, which is exactly what a feature-shape check cannot catch.
+DERIVED_CHAIN_KEYS = ("sidecar_schema_version", "sidecar_pose_source", "sidecar_smoothing")
+
+
+def validate_derived_provenance(all_metadata: list[LeRobotDatasetMetadata]) -> None:
+    """Refuses to aggregate datasets whose derived sidecars come from different chains.
+
+    A derived producer (currently the AprilTag cube tracker) overwrites
+    ``observation.state`` and ``action`` in place. Its schema version, pose
+    estimator and post-hoc smoother are stamped into ``meta/info.json`` under
+    ``derived/<producer>``. Reading one such dataset on its own is fine whatever
+    it says; concatenating two that disagree silently mixes measurement chains
+    under identical column names, so the check belongs here rather than in every
+    reader.
+
+    A dataset with no ``derived`` block predates the stamp (schema v1). All-v1 is
+    allowed and warned about; mixing stamped and unstamped is not.
+
+    Args:
+        all_metadata: List of LeRobotDatasetMetadata objects about to be aggregated.
+
+    Raises:
+        ValueError: If the datasets disagree on a derived producer's measurement chain.
+    """
+
+    producers: dict[str, dict[str, list]] = {}
+    for meta in all_metadata:
+        derived = meta.info.get("derived") or {}
+        if not isinstance(derived, dict):
+            continue
+        for producer, block in derived.items():
+            if not isinstance(block, dict):
+                continue
+            chain = tuple(block.get(key) for key in DERIVED_CHAIN_KEYS)
+            layouts = block.get("marker_layouts_by_cube") or {}
+            producers.setdefault(producer, {}).setdefault(chain, []).append((meta.repo_id, layouts))
+
+    for producer, chains in producers.items():
+        stamped = sum(len(entries) for entries in chains.values())
+        if stamped != len(all_metadata):
+            raise ValueError(
+                f"Derived producer '{producer}' is stamped on {stamped} of {len(all_metadata)} datasets. "
+                "Aggregating stamped and unstamped datasets mixes sidecar schema v1 (pose averaging + "
+                "causal EMA) with v2 under the same column names. Re-run the producer on the unstamped "
+                "datasets, or aggregate them separately."
+            )
+        if len(chains) > 1:
+            detail = "; ".join(
+                f"{dict(zip(DERIVED_CHAIN_KEYS, chain, strict=True))} <- {[repo for repo, _ in entries]}"
+                for chain, entries in chains.items()
+            )
+            raise ValueError(
+                f"Derived producer '{producer}' disagrees across the datasets being aggregated: {detail}. "
+                "These poses come from different measurement chains and must not share one training set."
+            )
+        # Same chain, but the rig geometry the poses were solved against still has
+        # to match for the cubes the datasets have in common.
+        entries = next(iter(chains.values()))
+        reference_repo, reference_layouts = entries[0]
+        for repo_id, layouts in entries[1:]:
+            for cube in set(reference_layouts) & set(layouts):
+                lhs = {k: reference_layouts[cube].get(k) for k in ("layout_id", "source", "sha256")}
+                rhs = {k: layouts[cube].get(k) for k in ("layout_id", "source", "sha256")}
+                if lhs != rhs:
+                    raise ValueError(
+                        f"Derived producer '{producer}' solved cube '{cube}' against different marker "
+                        f"layouts: {reference_repo} has {lhs}, {repo_id} has {rhs}."
+                    )
+
+    if not producers:
+        logging.warning(
+            "No dataset carries a derived-sidecar stamp in meta/info.json; treating them all as sidecar "
+            "schema v1. v1 poses have no per-frame covariance or quality flags, so nothing downstream can "
+            "filter them."
+        )
+
+
 def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
     """Validates that all dataset metadata have consistent properties.
 
@@ -76,6 +156,8 @@ def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
             raise ValueError(
                 f"Same features is expected, but got features={meta.features} instead of {features}."
             )
+
+    validate_derived_provenance(all_metadata)
 
     return fps, robot_type, features
 

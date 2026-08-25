@@ -253,13 +253,33 @@ f ≈ 1000 px 时，1.2 m → ≥ 60 mm，0.95 m（当前 p95）→ ≥ 48 mm。
 
 <h3>七、新原型的验收：复测同样五项</h3>
 <table class="metric-table">
-<tr><th>指标</th><th>当前高位 cube（基线）</th><th>新 rig 目标</th></tr>
-<tr><td>逐相机位置分歧 p50 / p95</td><td>4.57 / 9.67 mm</td><td>不劣于基线</td></tr>
-<tr><td>逐相机姿态分歧 p50 / p95</td><td>0.64° / 1.50°</td><td>不劣于基线</td></tr>
-<tr><td>姿态经 lever arm 折算到 TCP</td><td>2.69 / 6.32 mm</td><td>&lt; 1.5 mm p95</td></tr>
-<tr><td>最差相机丢帧率</td><td>47.4%</td><td>&lt; 10%</td></tr>
-<tr><td>&gt;20 mm 粗差率（全样本）</td><td>2.5%</td><td>&lt; 0.5%</td></tr>
+<tr><th>指标</th><th>当前高位 cube（基线）</th><th>新 rig 目标</th><th>新 rig 实测 · 2026-08-18</th></tr>
+<tr><td>逐相机位置分歧 p50 / p95</td><td>4.57 / 9.67 mm</td><td>不劣于基线</td><td>3.87 / 12.41 mm（持平）</td></tr>
+<tr><td>逐相机姿态分歧 p50 / p95</td><td>0.64° / 1.50°</td><td>不劣于基线</td><td>0.67° / 1.45°（持平）</td></tr>
+<tr><td>姿态经 lever arm 折算到 TCP</td><td>2.69 / 6.32 mm</td><td>&lt; 1.5 mm p95</td><td><b>1.20 / 2.59 mm</b>（改善 2.4×，未达标）</td></tr>
+<tr><td>最差相机丢帧率</td><td>47.4%</td><td>&lt; 10%</td><td><b>14.3%</b>（改善 3.3×，未达标）</td></tr>
+<tr><td>&gt;20 mm 粗差率（全样本）</td><td>2.5%</td><td>&lt; 0.5%</td><td>15.4% 全量 / <b>1.01%</b> 剔除 cam_09</td></tr>
+<tr><td>lever arm（准则二的主变量）</td><td>241.5 mm</td><td>≤100–120 mm</td><td><b>102.3 mm</b>（达标）</td></tr>
+<tr><td>重扫复现（同一装配，间隔 1h45m）</td><td>逐 episode 最大两两 3.09 mm</td><td>—</td><td><b>0.60 mm</b>（两次独立采集 + 独立解算）</td></tr>
+<tr><td>与 CAD 的端到端误差 <span class="mono">|p_rig|</span><br/><span class="small">layout 表达在 CAD 系，真值 = 0</span></td><td>无对照</td><td>—</td><td><b>1.03 / 0.90 mm</b>（两次采集，CAD 作先验）<br/><span class="small">CAD 作硬约束则 1.35 / 1.29 mm</span></td></tr>
 </table>
+<div class="callout ok">
+<b>2026-08-18 原型实测已完成，完整实验记录见
+<a href="box_umi_marker_rig_tcp_20260818.html">分布式 marker rig → TCP 标定与 A/B</a>。</b>
+三条结论：<b>(1)</b> 收益来自几何不是算法 —— 逐相机姿态分歧几乎没变（0.64°→0.67°），变的是它被乘以多长的杠杆（241.5→102.3 mm）；
+把同一套估计器倒回去跑 0812 原始数据，老 cube 的杠杆臂复现到 240.44 mm（公开值 241.47），对照成立。
+<b>(2)</b> 准则四得到实证：能同时看到 ≥2 个 marker 的四台相机，自解 <span class="mono">p_rig</span> 最大只差 1.69 mm；
+只看到 1 个 marker 的两台偏出 3–4.5 mm，而且它们的自身重投影反而最小（0.13 / 0.22 px）。
+<b>(3)</b> 首次拿到与 CAD 的正面对照：把 layout 表达在 CAD 系（原点 = pivot 球心）后，pivot 拟合的正确答案就是 0，
+两次独立采集实测 <span class="mono">|p_rig|</span> = <b>1.03 / 0.90 mm</b>，彼此差 0.48 mm。
+<b>准则补充</b>：CAD 应当作<b>先验</b>（板心 σ≈1 mm）而不是硬约束 —— 冻结 CAD 会把打印件约 1 mm 的横向装配公差原样引进来，
+放开则让弱观测 marker 有厘米级自由度；先验两头都占，但前提是先把坏相机排除。
+<b>(4)</b> 新增一条必须写进设计的教训：<b>layout 求解对坏相机没有防护</b> ——
+cam_09 在第二次采集里失效（单相机自解杠杆臂 34 mm），等权像素级 BA 把杠杆臂拽到 107.3 mm；
+把它排出 layout 求解后，layout 与 CAD 的中心残差从 7.35 mm 掉到 0.26 mm。跟踪端有 8 px 逐相机门限，layout 端应补同一道。
+<br/>本轮只做了「慢速 6DoF 摆动」+「重扫复现」两组；静止 jitter、遮挡、<b>拆装重装 5 次</b>、载荷四组仍未做，
+所以 102.3 mm 目前是<b>单次装配</b>的值，不能按冻结常量用。
+</div>
 <div class="callout ok">
 <b>复现：</b>
 本节全部数字来自

@@ -309,7 +309,7 @@ def load_config(path: Path) -> RecorderConfig:
         dataset_root=_resolve(ds.get("root", "outputs/datasets/gmsl2")),
         fps=int(ds.get("fps", defaults.fps)),
         num_episodes=int(ds.get("num_episodes", 0)),
-        episode_time_s=float(ds.get("episode_time_s", 10)),
+        episode_time_s=float(ds.get("episode_time_s", 20)),
         detect_all=bool(cams.get("detect_all", True)),
         sensor_ids=list(cams.get("sensor_ids", []) or []),
         name_prefix=str(cams.get("name_prefix", "cam")),

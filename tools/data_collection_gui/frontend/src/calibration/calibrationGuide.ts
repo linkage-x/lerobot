@@ -36,7 +36,6 @@ export const INTRINSICS_GUIDE: GuideStep[] = [
     title: "边录边看预览：任何时刻都应有一部分板贴着画面边框",
     detail: "这是现场唯一可用的合格判据。如果整段录制里板始终在画面中间，这一台就要重录。",
   },
-  { title: "录 30–60 秒后点「保存本段」", detail: "参考：cam_08 那次 605 帧里 500 帧有效，是迄今最好的一次。" },
 ];
 
 export const EXTRINSICS_GUIDE: GuideStep[] = [
@@ -50,11 +49,39 @@ export const EXTRINSICS_GUIDE: GuideStep[] = [
   },
   { title: "板面尽量朝向相机群，不要长时间只对着某一台" },
   { title: "动作要慢——运动模糊会让角点定位变差", detail: "相机之间是硬同步的（SOF 偏差 0.008–0.009 ms），所以慢挥不会引入跨相机的时间误差，只影响清晰度。" },
-  { title: "录 60 秒左右后点「保存本段」" },
 ];
 
-export function guideFor(kind: CalibrationStepKind): GuideStep[] {
-  return kind === "intrinsics" ? INTRINSICS_GUIDE : EXTRINSICS_GUIDE;
+/** How a segment ends, in the recorder's terms rather than in wall-clock wishes.
+ *
+ * This step used to read "录 30–60 秒后点「保存本段」", which the recorder never
+ * agreed to: it ends and saves the episode itself when its configured length
+ * elapses, which was 10 s on the GMSL2 rig. An operator following the old wording
+ * waved for another 30 s into a recorder that had already re-armed, then hit
+ * "Cannot save while recorder is armed". The wizard now sets the length itself
+ * (30 s by default), so `episodeTimeS` is what the operator asked for and this
+ * step is the one place that says it. `episodeTimeS <= 0` means the recorder runs
+ * until told to stop, which is what the untimed wording describes.
+ */
+export function segmentEndGuide(episodeTimeS: number, targetFrames: number): GuideStep {
+  if (episodeTimeS > 0) {
+    const frames = targetFrames > 0 ? `（≈${targetFrames} 帧）` : "";
+    return {
+      title: `本段会在 ${episodeTimeS} 秒后自动结束并保存${frames}——此后再挥板不会录进这一段`,
+      detail:
+        "挥完了可以随时点「保存本段」提前收尾；自动收尾之后点它也一样，只是登记已经录好的这一段。" +
+        "参考：cam_08 那次 605 帧里 500 帧有效，是迄今最好的一次——一段的长度够用，覆盖不到位才是问题。",
+    };
+  }
+  return { title: "挥完后点「保存本段」" };
+}
+
+export function guideFor(
+  kind: CalibrationStepKind,
+  episodeTimeS = 0,
+  targetFrames = 0,
+): GuideStep[] {
+  const base = kind === "intrinsics" ? INTRINSICS_GUIDE : EXTRINSICS_GUIDE;
+  return [...base, segmentEndGuide(episodeTimeS, targetFrames)];
 }
 
 export function stepTitle(kind: CalibrationStepKind, camera: string): string {

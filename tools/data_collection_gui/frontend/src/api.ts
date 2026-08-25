@@ -13,6 +13,7 @@ import type {
   BoxCaliLog,
   EventLogItem,
   GatewayStatus,
+  IntrinsicsCoverageResponse,
   ProcessingItem,
   ProcessingStatus,
   RecordedDataset,
@@ -20,6 +21,7 @@ import type {
   ReplayStatus,
   ReplayTimeline,
   RigCheckResponse,
+  WorldFrameResponse,
   MujocoCubeMode,
   RealCubeMode,
   RealEndEffectorMode,
@@ -526,8 +528,16 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async runCalibration(): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot("/api/calibration/run");
+  async runCalibration(
+    options: { forceRedetect?: boolean; refitIntrinsics?: boolean } = {}
+  ): Promise<GuiSnapshot> {
+    // Detections are reused across attempts unless this says otherwise; see the
+    // gateway's _reusable_detections for what counts as still valid.
+    const params = new URLSearchParams();
+    if (options.forceRedetect) params.set("force_redetect", "1");
+    if (options.refitIntrinsics) params.set("refit_intrinsics", "1");
+    const query = params.toString() ? `?${params}` : "";
+    const remote = await this.postRemoteSnapshot(`/api/calibration/run${query}`);
     if (remote) {
       return remote;
     }
@@ -560,8 +570,12 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async queueTrajGen(path: string): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot(`/api/processing/traj-gen?path=${encodeURIComponent(path)}`);
+  async queueTrajGen(path: string, markerTcpCalibrationPath = ""): Promise<GuiSnapshot> {
+    const params = new URLSearchParams({ path });
+    if (markerTcpCalibrationPath.trim()) {
+      params.set("marker_to_tcp_calibration_path", markerTcpCalibrationPath.trim());
+    }
+    const remote = await this.postRemoteSnapshot(`/api/processing/traj-gen?${params.toString()}`);
     if (remote) {
       return remote;
     }
@@ -746,9 +760,30 @@ export class DataCollectionGuiApi {
     }
   }
 
-  async startCalibrationSession(cameras?: string[]): Promise<{ ok: boolean; error?: string }> {
-    const query = cameras?.length ? `?cameras=${encodeURIComponent(cameras.join(","))}` : "";
+  async startCalibrationSession(
+    cameras?: string[],
+    segmentSeconds?: number,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const params = new URLSearchParams();
+    if (cameras?.length) params.set("cameras", cameras.join(","));
+    if (segmentSeconds && segmentSeconds > 0) params.set("seconds", String(segmentSeconds));
+    const query = params.toString() ? `?${params}` : "";
     return this.calibrationSessionPost(`/api/calibration/session/start${query}`);
+  }
+
+  /** Change how long the sweeps still to be recorded run for. */
+  async setCalibrationSegmentSeconds(seconds: number): Promise<{ ok: boolean; error?: string }> {
+    return this.calibrationSessionPost(`/api/calibration/session/duration?seconds=${seconds}`);
+  }
+
+  /** Point one half of the solve at a capture; an empty path restores the default. */
+  async setCalibrationDataset(
+    path: string,
+    kind: "extrinsics" | "intrinsics" = "extrinsics"
+  ): Promise<{ ok: boolean; error?: string }> {
+    return this.calibrationSessionPost(
+      `/api/calibration/dataset?path=${encodeURIComponent(path)}&kind=${kind}`
+    );
   }
 
   async calibrationStepRecord(action: "start" | "save" | "discard"): Promise<{ ok: boolean; error?: string }> {
@@ -773,20 +808,33 @@ export class DataCollectionGuiApi {
 
   async markerTcpRecordSample(
     action: "start" | "save" | "discard",
-    side: "left" | "right",
+    boxId: string,
     condition: string
   ): Promise<{ ok: boolean; error?: string }> {
-    const params = new URLSearchParams({ action, side, condition });
+    const params = new URLSearchParams({ action, box_id: boxId, condition });
     return this.calibrationSessionPost(`/api/calibration/marker-tcp/record?${params.toString()}`);
   }
 
   async registerMarkerTcpStaticTransform(
     path: string,
-    side: "left" | "right",
+    boxId: string,
     condition: string
   ): Promise<{ ok: boolean; error?: string }> {
-    const params = new URLSearchParams({ path, side, condition });
+    const params = new URLSearchParams({ path, box_id: boxId, condition });
     return this.calibrationSessionPost(`/api/calibration/marker-tcp/register?${params.toString()}`);
+  }
+
+  async solveMarkerTcpTransform(
+    boxId: string,
+    cadPath: string,
+    socketBeyondTcpMm: string
+  ): Promise<{ ok: boolean; error?: string }> {
+    const params = new URLSearchParams({
+      box_id: boxId,
+      cad_path: cadPath,
+      socket_beyond_tcp_mm: socketBeyondTcpMm
+    });
+    return this.calibrationSessionPost(`/api/calibration/marker-tcp/solve?${params.toString()}`);
   }
 
   async runMarkerTcpReport(): Promise<{ ok: boolean; error?: string }> {
@@ -830,6 +878,75 @@ export class DataCollectionGuiApi {
       return { ...payload, ok: response.ok && payload.ok !== false };
     } catch (error) {
       return { ok: false, error: String(error), report: null };
+    }
+  }
+
+  async fetchIntrinsicsCoverage(): Promise<IntrinsicsCoverageResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/intrinsics-coverage`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as IntrinsicsCoverageResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchWorldFrame(): Promise<WorldFrameResponse | null> {
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/world-frame`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as WorldFrameResponse;
+    } catch {
+      return null;
+    }
+  }
+
+  // `apply` commits: moved cameras are re-placed in the same world, or a new
+  // world island is minted. Without it this is a read-only verdict, which is
+  // why it is safe to run at any time.
+  async registerWorldFrame(
+    options: { apply?: boolean; stable?: string[]; useRigCheck?: boolean } = {}
+  ): Promise<WorldFrameResponse> {
+    const params = new URLSearchParams();
+    if (options.apply) params.set("apply", "1");
+    if (options.stable?.length) params.set("stable", options.stable.join(","));
+    // Opt out of the self-check's verdict and let the geometry decide alone.
+    if (options.useRigCheck === false) params.set("rigcheck", "0");
+    const query = params.toString();
+    return this.worldFramePost(`/api/calibration/world-frame/register${query ? `?${query}` : ""}`);
+  }
+
+  async freezeWorldFrame(replace = false): Promise<WorldFrameResponse> {
+    return this.worldFramePost(
+      `/api/calibration/world-frame/freeze${replace ? "?replace=1" : ""}`
+    );
+  }
+
+  private async worldFramePost(path: string): Promise<WorldFrameResponse> {
+    try {
+      const response = await fetch(`${this.apiBase}${path}`, {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      const payload = (await response.json()) as WorldFrameResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return {
+        ok: false,
+        error: String(error),
+        reference: { exists: false },
+        registration: null,
+        stableSource: { origin: "geometry" },
+        graph: { worlds: 0, edges: 0, nodes: [] }
+      };
     }
   }
 
@@ -1138,6 +1255,16 @@ export class DataCollectionGuiApi {
         ...this.snapshot.datasetExport,
         state: "error",
         message: `Export ${command} failed: ${message}`
+      };
+    } else if (endpoint.startsWith("/api/calibration/run")) {
+      // The solve refuses up front now (no ChArUco capture, or an interpreter
+      // missing scipy), and that refusal is the whole answer to "why is nothing
+      // happening". Left in the event log only, it is invisible on the page the
+      // operator is looking at.
+      this.snapshot.calibration = {
+        ...this.snapshot.calibration,
+        state: "failed",
+        message
       };
     } else if (endpoint.includes("/processing/datasets-root")) {
       window.alert(`Datasets Root save failed: ${message}`);

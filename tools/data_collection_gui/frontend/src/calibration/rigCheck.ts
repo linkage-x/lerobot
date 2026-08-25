@@ -8,18 +8,25 @@
 // worse.
 import type { RigCheckCamera, RigCheckOverall, RigCheckReport, RigCheckVerdict } from "../types";
 
-export const verdictLabel: Record<RigCheckVerdict, string> = {
+// A camera with no baseline was never in the comparison, which is a third
+// thing: not a verdict, not a failed measurement. It gets its own row label so
+// the table cannot imply it was checked.
+export type RigCheckRowVerdict = RigCheckVerdict | "no_baseline";
+
+export const verdictLabel: Record<RigCheckRowVerdict, string> = {
   ok: "未移动",
   suspect: "接近阈值",
   moved: "疑似移动",
   unknown: "无法判定",
+  no_baseline: "无基线",
 };
 
-export const verdictDot: Record<RigCheckVerdict, string> = {
+export const verdictDot: Record<RigCheckRowVerdict, string> = {
   ok: "running",
   suspect: "warning",
   moved: "error",
   unknown: "idle",
+  no_baseline: "idle",
 };
 
 export const overallLabel: Record<RigCheckOverall, string> = {
@@ -73,7 +80,7 @@ export function formatImpact(camera: RigCheckCamera): string {
 
 export type RigCheckRow = {
   camera: string;
-  verdict: RigCheckVerdict;
+  verdict: RigCheckRowVerdict;
   shift: string;
   impact: string;
   note: string;
@@ -81,7 +88,12 @@ export type RigCheckRow = {
 
 export function rigCheckRows(report: RigCheckReport | null): RigCheckRow[] {
   if (!report) return [];
-  return Object.keys(report.cameras)
+  // Why a frame is missing is the gateway's knowledge, not the analysis's:
+  // "no current frame" alone leaves an operator with nothing to act on.
+  const failed = new Map((report.failed_captures ?? []).map((entry) => [entry.camera, entry.reason]));
+  const joined = (...parts: (string | undefined)[]) => parts.filter(Boolean).join(" · ");
+
+  const compared: RigCheckRow[] = Object.keys(report.cameras)
     .sort()
     .map((camera) => {
       const entry = report.cameras[camera];
@@ -90,9 +102,32 @@ export function rigCheckRows(report: RigCheckReport | null): RigCheckRow[] {
         verdict: entry.verdict,
         shift: formatShift(entry),
         impact: formatImpact(entry),
-        note: entry.reason ?? "",
+        note: joined(entry.reason, failed.get(camera)),
       };
     });
+  const unbaselined: RigCheckRow[] = [...(report.cameras_without_baseline ?? [])]
+    .sort()
+    .map((camera) => ({
+      camera,
+      verdict: "no_baseline" as const,
+      shift: "—",
+      impact: "",
+      note: joined("基线之后才出现的相机，没有比较对象", failed.get(camera)),
+    }));
+  // A camera that has no baseline *and* produced no frame is in neither list;
+  // dropping it would hide exactly the camera that is misbehaving most.
+  const seen = new Set([...compared, ...unbaselined].map((row) => row.camera));
+  const missing: RigCheckRow[] = [...failed.keys()]
+    .filter((camera) => !seen.has(camera))
+    .sort()
+    .map((camera) => ({
+      camera,
+      verdict: "unknown" as const,
+      shift: "—",
+      impact: "",
+      note: failed.get(camera) ?? "未取到画面",
+    }));
+  return [...compared, ...unbaselined, ...missing];
 }
 
 /** How stale the baseline is, in words, or why there isn't one. */

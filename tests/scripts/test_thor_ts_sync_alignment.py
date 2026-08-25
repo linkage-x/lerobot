@@ -171,6 +171,39 @@ def test_mcu_calibration_removes_poll_jitter():
     assert res_std < 0.01            # well under the 0.05 s fallback threshold
 
 
+def test_mcu_calibration_survives_real_clock_magnitudes():
+    """The fit must stay exact at 4e9 ticks against a 1.8e9 s wall clock.
+
+    Every other test in this file runs on toy magnitudes -- ``T0_WALL_S`` is
+    1000.0 and ``mcu_ts`` starts at zero -- which is precisely why none of them
+    could see the numerical problem that shipped for months: the textbook
+    ``n*Sxy - Sx*Sy`` normal equation subtracts two ~2.9e25 quantities to get
+    ~1e14 on *real* magnitudes, and loses eleven digits doing it.
+
+    Measured against exact rational arithmetic on 72 real sensor-episodes
+    (2026-08-25), that cost 0.11 ms RMS / 0.5 ms peak of timestamp error, as a
+    rotation about the episode centroid: zero mean, worst at both ends, sign
+    random per episode. This pins the centred form, which lands at 0.3 us --
+    the float64 representation limit of a 1.8e9-second wall clock.
+    """
+    # A real 2026-08 capture: 20 s of a 250 Hz sensor, uint32 microsecond
+    # counter near 2.8e9, host wall clock near 1.787e9. Noiseless on purpose --
+    # any residual here is arithmetic, not measurement.
+    slope_true = 1e-6
+    intercept_true = 1787291990.6574438
+    mcu = [2_822_581_935 + 4000 * k for k in range(5000)]
+    host = [slope_true * t + intercept_true for t in mcu]
+
+    slope, intercept, res_std = lr3.calibrate_mcu_clock(mcu, host)
+
+    worst_us = max(abs(slope * t + intercept - y) * 1e6 for t, y in zip(mcu, host, strict=True))
+    assert worst_us < 1.0, f"{worst_us:.3f} us of pure arithmetic error"
+    assert abs(slope / slope_true - 1.0) * 1e6 < 1.0, "slope must be within 1 ppm"
+    # An exactly linear input must not manufacture a residual for the 50 ms
+    # fallback threshold to judge; the uncentred form reported ~45 us here.
+    assert res_std < 1e-6
+
+
 # --------------------------------------------------------------------------
 # 4. calibration safety fallbacks keep the original poll-based times
 # --------------------------------------------------------------------------
