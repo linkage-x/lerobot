@@ -1,0 +1,5 @@
+# Volatile status, rewritten on every continuity check and fully re-derivable
+# from world_reference.json plus a bundle report. Tracking it would put a diff
+# in every commit for the sake of a file nobody needs to recover.
+world_registration.json
+world_stable_source.json

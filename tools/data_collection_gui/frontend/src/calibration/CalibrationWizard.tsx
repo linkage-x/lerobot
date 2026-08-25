@@ -6,7 +6,7 @@
 // correctness one: the 0804 capture had to be redone from scratch because the
 // board never reached the edges of the frame, and nothing on screen said it had
 // to. Every step here carries its acceptance criterion.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { DataCollectionGuiApi, GuiSnapshot } from "../api";
 import type { CalibrationSession, CalibrationSessionStep } from "../types";
 import { Metric, StatusDot, stateLabel } from "../shared/ui";
@@ -18,6 +18,17 @@ import {
   skipConsequence,
   stepTitle,
 } from "./calibrationGuide";
+import { SolvePanel, type SolveOptions } from "./SolvePanel";
+import { captureTally } from "./solvePanel";
+import { SolveProgress } from "./SolveProgress";
+import { StepCameraPreview } from "./StepCameraPreview";
+import { previewCameras, previewStatus } from "./stepPreview";
+
+// Mirrors the gateway's validation (_parse_calibration_segment_seconds); the
+// input just stops the obvious mistakes before a round-trip.
+const SEGMENT_SECONDS_DEFAULT = 30;
+const SEGMENT_SECONDS_MIN = 5;
+const SEGMENT_SECONDS_MAX = 300;
 
 function StepList({ steps, currentIndex }: { steps: CalibrationSessionStep[]; currentIndex: number }) {
   return (
@@ -48,7 +59,7 @@ export function CalibrationWizard({
   snapshot: GuiSnapshot;
   api: DataCollectionGuiApi;
   busy: boolean;
-  onSolve: () => void;
+  onSolve: (options?: SolveOptions) => void;
 }) {
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
@@ -61,11 +72,77 @@ export function CalibrationWizard({
     const result = await fn();
     setPending(false);
     if (!result.ok) setError(result.error || "操作失败");
+    return result;
   };
 
   const disabled = busy || pending;
   const step = session?.steps[session.currentIndex];
   const recording = step?.status === "recording";
+
+  // How long each sweep records. Kept as a draft string so typing "45" does not
+  // fire a request per keystroke; the session is the source of truth once it
+  // exists and the effect adopts whatever it reports back.
+  const sessionSeconds = session?.active ? session.episodeTimeS : undefined;
+  const [secondsDraft, setSecondsDraft] = useState(String(SEGMENT_SECONDS_DEFAULT));
+  useEffect(() => {
+    if (sessionSeconds != null) setSecondsDraft(String(sessionSeconds));
+  }, [sessionSeconds]);
+
+  const commitSeconds = async () => {
+    const value = Number(secondsDraft);
+    if (!Number.isFinite(value) || value <= 0) {
+      setSecondsDraft(String(sessionSeconds ?? SEGMENT_SECONDS_DEFAULT));
+      return;
+    }
+    // Before the session exists there is nothing to update: the value is passed
+    // to the start call instead.
+    if (sessionSeconds == null || value === sessionSeconds) return;
+    const result = await call(() => api.setCalibrationSegmentSeconds(value));
+    // A rejected length (out of range, or a sweep already recording) must not
+    // stay on screen as if it had been accepted.
+    if (!result.ok) setSecondsDraft(String(sessionSeconds));
+  };
+
+  const secondsField = (
+    <label className="cali-seconds">
+      <span>每段时长</span>
+      <input
+        type="number"
+        min={SEGMENT_SECONDS_MIN}
+        max={SEGMENT_SECONDS_MAX}
+        step={5}
+        value={secondsDraft}
+        disabled={disabled || recording}
+        onChange={(event) => setSecondsDraft(event.target.value)}
+        onBlur={() => void commitSeconds()}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") void commitSeconds();
+        }}
+      />
+      <span>秒</span>
+    </label>
+  );
+  // What this step is pointed at, and whether the recorder is publishing frames
+  // for it right now. Both answers live in stepPreview.ts so the wording can be
+  // pinned by a test.
+  const cameras = previewCameras(
+    step,
+    snapshot.devices.filter((device) => device.kind === "camera").map((device) => device.id),
+  );
+  const preview = previewStatus(step, session?.recorderState ?? "idle");
+
+  // Solving is an operation on a capture, not the tail of the capture wizard:
+  // it is offered whenever a capture exists and nothing is running, including
+  // after a failure and outside a session entirely.
+  const solvePanel = (
+    <SolvePanel
+      status={status}
+      session={session}
+      disabled={disabled}
+      onSolve={onSolve}
+      onPickDataset={(path, kind) => call(() => api.setCalibrationDataset(path, kind))}
+    />
+  );
 
   return (
     <section className="panel calibration-panel">
@@ -87,6 +164,10 @@ export function CalibrationWizard({
         </span>
       </div>
 
+      {/* Above the branch: a solve can be launched with or without a guided
+          session, and in both cases it is the thing the operator is waiting on. */}
+      <SolveProgress status={status} />
+
       {!session?.active ? (
         <>
           <p className="panel-note">{status.message}</p>
@@ -103,26 +184,40 @@ export function CalibrationWizard({
             </p>
           </div>
           <div className="control-row">
-            <button className="cali-btn-primary" disabled={disabled} onClick={() => call(() => api.startCalibrationSession())}>
+            {secondsField}
+            <button
+              className="cali-btn-primary"
+              disabled={disabled}
+              onClick={() =>
+                call(() => api.startCalibrationSession(undefined, Number(secondsDraft) || undefined))
+              }
+            >
               开始引导标定
             </button>
           </div>
+          {solvePanel}
         </>
       ) : (
         <>
           <div className="summary-grid">
             <Metric label="数据集" value={session.datasetName} />
             <Metric label="进度" value={`${session.currentIndex} / ${session.steps.length}`} />
+            <Metric label="已录制" value={captureTally(session.steps)} />
+            <Metric label="每段时长" value={`${session.episodeTimeS}s`} />
             <Metric label="录制器" value={session.recorderState} />
           </div>
 
-          <p className="panel-note">{session.message}</p>
+          <p className={`panel-note${session.stage === "failed" ? " error" : ""}`}>{session.message}</p>
 
           {step ? (
             <div className="callout">
               <b>{stepTitle(step.kind, step.camera)}</b>
               <ol>
-                {guideFor(step.kind).map((item) => (
+                {guideFor(
+                  step.kind,
+                  session.episodeTimeS,
+                  Math.round(snapshot.configSummary.fps * session.episodeTimeS),
+                ).map((item) => (
                   <li key={item.title}>
                     {item.title}
                     {item.detail ? <div className="small">{item.detail}</div> : null}
@@ -135,9 +230,12 @@ export function CalibrationWizard({
 
           <StepList steps={session.steps} currentIndex={session.currentIndex} />
 
+          <StepCameraPreview api={api} cameras={cameras} live={preview.live} note={preview.note} />
+
           {error ? <p className="panel-note error">{error}</p> : null}
 
           <div className="control-row">
+            {step ? secondsField : null}
             {step && !recording ? (
               <button
                 className="cali-btn-primary"
@@ -166,15 +264,12 @@ export function CalibrationWizard({
                 跳过这一台
               </button>
             ) : null}
-            {session.stage === "ready" ? (
-              <button className="cali-btn-primary" disabled={disabled} onClick={onSolve}>
-                开始解算
-              </button>
-            ) : null}
             <button disabled={disabled || recording} onClick={() => call(() => api.cancelCalibrationSession())}>
               退出引导
             </button>
           </div>
+
+          {solvePanel}
         </>
       )}
 
@@ -188,7 +283,13 @@ export function CalibrationWizard({
             {status.cameras.map((camera) => (
               <div className="check-row" key={camera.id}>
                 <strong>{camera.id}</strong>
-                <span>重投影 {camera.reprojectionPx.toFixed(4)} px</span>
+                <span>
+                  重投影 {camera.reprojectionPx.toFixed(4)} px
+                  {/* Coverage is the failure reprojection cannot see: a fit is
+                      happy to be self-consistent over the middle of the frame. */}
+                  {camera.coverage != null ? ` · 边缘覆盖 ${Math.round(camera.coverage * 100)}%` : ""}
+                  {camera.intrinsicsNote ? <div className="small">{camera.intrinsicsNote}</div> : null}
+                </span>
                 <em>{camera.status}</em>
               </div>
             ))}

@@ -63,6 +63,39 @@ describe("rig self-check presentation", () => {
     expect(rows[1].shift).toBe("—");
   });
 
+  it("lists a camera that has no baseline instead of leaving it out", () => {
+    // The 0805 baseline predates cam_01/cam_03; iterating the baseline alone
+    // dropped them from the table, so a rig that grew two cameras looked fully
+    // checked.
+    const rows = rigCheckRows(
+      report({
+        overall: "partial",
+        cameras: { cam_06: { status: "measured", verdict: "ok", shift_px_median: 0.04 } },
+        cameras_without_baseline: ["cam_03", "cam_01"],
+      }),
+    );
+    expect(rows.map((r) => r.camera)).toEqual(["cam_06", "cam_01", "cam_03"]);
+    expect(rows[1].verdict).toBe("no_baseline");
+    expect(rows[1].shift).toBe("—");
+  });
+
+  it("explains a missing frame instead of just noting its absence", () => {
+    const rows = rigCheckRows(
+      report({
+        overall: "partial",
+        cameras: { cam_00: { status: "unknown", verdict: "unknown", reason: "no current frame" } },
+        failed_captures: [
+          { camera: "cam_00", reason: "no frame within timeout" },
+          { camera: "cam_05", reason: "preview pipeline unavailable" },
+        ],
+      }),
+    );
+    expect(rows[0].note).toContain("no frame within timeout");
+    // cam_05 has neither a baseline nor a frame; it is in no other list, and
+    // dropping it would hide the camera that is misbehaving most.
+    expect(rows.map((r) => r.camera)).toContain("cam_05");
+  });
+
   it("says plainly when there is no baseline to compare against", () => {
     expect(baselineSummary(null)).toContain("尚未采集基线");
     expect(

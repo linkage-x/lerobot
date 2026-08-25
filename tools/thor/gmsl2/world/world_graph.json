@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "world_frame_id": "world_20260819_031843",
+      "created_utc": "2026-08-19T03:18:43Z",
+      "calibration_id": "thor_gmsl2_selfcal_0804_fisheye_extrinsics",
+      "parent_world_frame_id": null,
+      "reason": "frozen_reference"
+    }
+  ],
+  "edges": []
+}

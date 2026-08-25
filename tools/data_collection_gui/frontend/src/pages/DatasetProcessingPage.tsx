@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { GuiSnapshot } from "../api";
 import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
@@ -119,7 +119,7 @@ export function DatasetProcessingPage({
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
-  onGenerate: (path: string) => void;
+  onGenerate: (path: string, markerTcpCalibrationPath?: string) => void;
   onRunQc: (path: string) => void;
   onOpenReplay: (path: string) => void;
   onSetDatasetsRoot: (path: string) => void;
@@ -132,10 +132,19 @@ export function DatasetProcessingPage({
   const readyCount = items.filter((item) => item.status === "qc_pass").length;
   const currentRoot = snapshot.gateway.datasetsRoot ?? "";
   const [rootInput, setRootInput] = useState<string>(currentRoot);
+  const latestMarkerTcpPath = snapshot.markerTcp?.solvePath ?? "";
+  // Deliberately NOT pre-filled with the latest solve. A solve directory's bundle is
+  // merged from whatever bundle it started from, so it is only fresh for the ONE cube
+  // that was just solved -- every other cube in it is whatever the previous bundle held.
+  // Pre-filling made "just press Generate" silently pick that over the production bundle
+  // named in the tracker YAML, which is the one that gets curated for all cubes.
+  // "Latest Solve" is still one click away when that is genuinely what you want.
+  const [markerTcpPathInput, setMarkerTcpPathInput] = useState<string>("");
   useEffect(() => {
     setRootInput(currentRoot);
   }, [currentRoot]);
   const rootDirty = rootInput.trim() !== currentRoot;
+  const markerTcpPath = markerTcpPathInput.trim();
 
   return (
     <div className="page-stack">
@@ -167,6 +176,42 @@ export function DatasetProcessingPage({
           </button>
         </div>
         <p className="panel-note">Absolute or relative to the gateway repo root. Default: outputs/datasets.</p>
+      </section>
+      <section className="panel">
+        <div className="panel-heading">
+          <h2>EE Trajectory Options</h2>
+          <span>marker→TCP</span>
+        </div>
+        <div className="datasets-root-row trajectory-option-row">
+          <input
+            className="datasets-root-input"
+            value={markerTcpPathInput}
+            onChange={(event) => setMarkerTcpPathInput(event.target.value)}
+            placeholder="可选：outputs/.../marker_to_tcp_calibration.json"
+            spellCheck={false}
+          />
+          <button
+            disabled={busy || !latestMarkerTcpPath}
+            onClick={() => setMarkerTcpPathInput(latestMarkerTcpPath)}
+          >
+            Latest Solve
+          </button>
+          <button
+            disabled={busy || !markerTcpPathInput.trim()}
+            onClick={() => setMarkerTcpPathInput("")}
+          >
+            Clear
+          </button>
+        </div>
+        <p className="panel-note">
+          {markerTcpPath
+            ? `Generate 将使用 ${markerTcpPath}（覆盖 tracker YAML 的默认 bundle）`
+            : "留空 = 使用 tracker YAML 里的 production marker→TCP bundle，正常情况保持留空。"}
+        </p>
+        <p className="panel-note">
+          解算目录里的 bundle 是从上一版合并出来的：只有刚解的那个 cube 是新的，其余 cube
+          仍是旧值。要给多个夹爪生成轨迹时，用留空的 production bundle，不要指向解算目录。
+        </p>
       </section>
       <section className="panel">
         <div className="panel-heading">
@@ -211,7 +256,7 @@ export function DatasetProcessingPage({
                   active={item.path === selected?.path}
                   busy={busy}
                   onSelect={() => setSelectedPath(item.path)}
-                  onGenerate={() => onGenerate(item.path)}
+                  onGenerate={() => onGenerate(item.path, markerTcpPath)}
                   onRunQc={() => onRunQc(item.path)}
                   onOpenReplay={() => onOpenReplay(item.path)}
                 />
@@ -233,11 +278,12 @@ export function DatasetProcessingPage({
               <Metric label="Frames" value={selected.totalFrames} />
               <Metric label="Trajectory" value={selected.trajectoryVersion ?? "—"} />
               <Metric label="Valid frames" value={selected.validFramesPct != null ? `${selected.validFramesPct}%` : "—"} />
+              <Metric label="Marker→TCP" value={selected.markerTcpCalibrationPath || "default"} />
             </div>
             <div className="control-row">
               <button
                 disabled={busy || selected.status === "running" || selected.status === "queued"}
-                onClick={() => onGenerate(selected.path)}
+                onClick={() => onGenerate(selected.path, markerTcpPath)}
               >
                 {selected.trajectoryVersion ? "Regenerate Trajectory" : "Generate EE Trajectory"}
               </button>

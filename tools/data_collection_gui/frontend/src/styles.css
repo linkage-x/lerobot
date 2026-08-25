@@ -491,6 +491,20 @@ button.danger {
   overflow-wrap: anywhere;
 }
 
+/* Column captions for tables whose numbers need a unit to be readable. */
+.check-row-head {
+  background: #f6f8fa;
+  min-height: 34px;
+}
+
+.check-row-head strong,
+.check-row-head span,
+.check-row-head em {
+  color: #60707c;
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .check-row em {
   color: #60707c;
   font-style: normal;
@@ -680,6 +694,78 @@ button.danger {
 
 .control-row button:disabled kbd {
   opacity: 0.4;
+}
+
+/* Segment-length field that sits inline with the calibration record buttons. */
+.cali-seconds {
+  align-items: center;
+  color: #60707c;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 650;
+  gap: 6px;
+}
+
+.cali-seconds input {
+  background: #ffffff;
+  border: 1px solid #aeb9c2;
+  border-radius: 6px;
+  color: #172026;
+  font: inherit;
+  min-height: 32px;
+  padding: 4px 8px;
+  width: 72px;
+}
+
+.cali-seconds input:disabled {
+  background: #eef1f4;
+  color: #8a969f;
+}
+
+/* "将解算 <capture>" — the capture picker that sits with the solve button. */
+.cali-field {
+  align-items: center;
+  color: #60707c;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 650;
+  gap: 6px;
+}
+
+.cali-field select {
+  background: #ffffff;
+  border: 1px solid #aeb9c2;
+  border-radius: 6px;
+  color: #172026;
+  font: inherit;
+  max-width: 380px;
+  min-height: 32px;
+  padding: 4px 8px;
+}
+
+.cali-field select:disabled {
+  background: #eef1f4;
+  color: #8a969f;
+}
+
+.cali-solve-target {
+  border-top: 1px solid #e3e8ec;
+  margin-top: 12px;
+  padding-top: 8px;
+}
+
+.cali-solve-target .control-row {
+  margin: 0;
+}
+
+.cali-solve-nested {
+  margin-left: 24px;
+}
+
+.cali-solve-target .cali-check {
+  color: #64748b;
+  font-size: 12px;
+  margin-top: 6px;
 }
 
 .device-group {
@@ -2997,6 +3083,56 @@ button.danger {
 
 .cali-muted { color: #7b8791; }
 
+/* Live view beside the calibration record buttons. One big tile for a
+   per-camera intrinsics sweep, a grid for the shared extrinsics sweep. */
+.cali-preview {
+  margin: 10px 0 4px;
+}
+
+.cali-preview-single {
+  max-width: 420px;
+}
+
+.cali-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 8px;
+}
+
+.cali-preview-badge {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.78);
+  color: #f4d9b0;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+/* A verdict left over from an earlier run. Loud enough that it is not read as
+   the current answer, quiet enough that it is not read as an error. */
+.panel-note.cali-stale {
+  color: #8a5a12;
+  background: #fbf0dc;
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
+/* Camera picker for an ambiguous world consensus: the operator names the
+   cameras that did not move, because no algorithm can tell. */
+.world-camera-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+.world-camera-picker label {
+  align-items: center;
+  display: inline-flex;
+  gap: 4px;
+}
+
 /* ---- global status bar ---- */
 .cali-statusbar {
   align-items: center;
@@ -3208,6 +3344,18 @@ button.danger {
 .cali-box-panel > .cali-op-grid { margin: 0; }
 
 .marker-tcp-panel { border-left: 3px solid #2563eb; }
+.marker-tcp-guide {
+  margin-top: 12px;
+}
+.marker-tcp-guide ol {
+  margin: 8px 0 0;
+  padding-left: 20px;
+}
+.marker-tcp-guide li {
+  color: #43525e;
+  line-height: 1.5;
+  margin: 4px 0;
+}
 .marker-tcp-controls {
   align-items: flex-end;
   display: grid;
@@ -3236,11 +3384,42 @@ button.danger {
   border-color: #0f766e;
   outline: 2px solid rgba(15, 118, 110, 0.16);
 }
+.marker-tcp-solve { grid-template-columns: minmax(260px, 1fr) 150px; }
+.marker-tcp-solve-notes { margin-top: 8px; }
+.marker-tcp-solve-notes .panel-note { margin: 4px 0; }
+.marker-tcp-label-row {
+  align-items: baseline;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+.marker-tcp-help-btn {
+  background: none;
+  border: none;
+  color: #2563eb;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+  text-decoration: underline;
+}
+.marker-tcp-help-btn:hover { color: #1d4ed8; }
+.marker-tcp-example {
+  background: #0f172a;
+  border-radius: 6px;
+  color: #e2e8f0;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 10px 0 0;
+  max-height: 340px;
+  overflow: auto;
+  padding: 12px 14px;
+}
 .marker-tcp-register { grid-template-columns: minmax(240px, 1fr) auto auto; }
 .marker-tcp-table { margin-top: 12px; }
 .marker-tcp-table .check-row { grid-template-columns: 220px minmax(0, 1fr) 110px; }
 @media (max-width: 760px) {
   .marker-tcp-controls,
+  .marker-tcp-solve,
   .marker-tcp-register,
   .marker-tcp-table .check-row { grid-template-columns: 1fr; }
   .marker-tcp-table .check-row em { text-align: left; }
@@ -3322,6 +3501,29 @@ button.danger {
   width: 14px;
 }
 @keyframes cali-spin { to { transform: rotate(360deg); } }
+
+.cali-solve { margin: 8px 0 12px; }
+.cali-solve .progress { margin: 6px 0; }
+.cali-solve-percent { color: #0f766e; font-variant-numeric: tabular-nums; margin-left: auto; }
+.cali-solve-detail { color: #64748b; overflow-wrap: anywhere; }
+/* The bundle adjustment and the export report no units, so the bar stops at
+   their boundary. The shimmer is the only thing saying "still working" then --
+   it must not be applied to a bar that is genuinely advancing, or the two
+   states become indistinguishable. */
+.progress-bar-waiting {
+  animation: cali-shimmer 1.4s linear infinite;
+  background-image: linear-gradient(
+    110deg,
+    rgba(255, 255, 255, 0) 35%,
+    rgba(255, 255, 255, 0.5) 50%,
+    rgba(255, 255, 255, 0) 65%
+  );
+  background-size: 250% 100%;
+}
+@keyframes cali-shimmer {
+  from { background-position: 250% 0; }
+  to { background-position: -250% 0; }
+}
 
 .cali-reboot {
   background: #eef4ff;
