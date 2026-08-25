@@ -21,6 +21,7 @@
 
 import logging
 from pathlib import Path
+from threading import Event
 import types
 from unittest.mock import patch
 
@@ -147,6 +148,37 @@ def test_async_read():
         assert camera.thread is not None
         assert camera.thread.is_alive()
         assert isinstance(img, np.ndarray)
+
+
+def test_read_loop_uses_captured_stop_event(monkeypatch):
+    config = RealSenseCameraConfig(serial_number_or_name="042", warmup_s=0)
+    camera = RealSenseCamera(config)
+    stop_event = Event()
+    frame = np.zeros((1, 1, 3), dtype=np.uint8)
+
+    class FakeColorFrame:
+        def get_data(self):
+            return frame
+
+    class FakeFrameSet:
+        def get_color_frame(self):
+            return FakeColorFrame()
+
+    camera.stop_event = stop_event
+
+    def fake_read_from_hardware():
+        stop_event.set()
+        camera.stop_event = None
+        return FakeFrameSet()
+
+    monkeypatch.setattr(camera, '_read_from_hardware', fake_read_from_hardware)
+    monkeypatch.setattr(camera, '_postprocess_image', lambda image, depth_frame=False: image)
+    monkeypatch.setattr(camera, '_frame_capture_time_s', lambda *args, **kwargs: 123.0)
+
+    camera._read_loop()
+
+    assert camera.latest_color_frame is not None
+    assert camera.latest_timestamp == 123.0
 
 
 def test_async_read_timeout():
