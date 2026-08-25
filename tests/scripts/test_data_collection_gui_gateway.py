@@ -7,7 +7,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import threading
+import time
+
+import numpy as np
 import pytest
+import yaml
 
 from tools.data_collection_gui import gateway
 
@@ -435,6 +440,29 @@ def test_marker_tcp_sample_save_tolerates_recorder_returning_to_armed(tmp_path, 
     assert state.marker_tcp_session.pendingSampleId == ""
     assert state.marker_tcp_session.samples[0].status == "saved"
     assert state.marker_tcp_session.samples[0].episodeIndex == 7
+
+
+def test_marker_tcp_sample_records_box_id_target(tmp_path, monkeypatch):
+    state = _marker_tcp_gateway_state(tmp_path)
+    assert gateway._start_marker_tcp_session(state)["ok"] is True
+
+    def fake_start_episode(fake_state):
+        fake_state.recording.state = "recording"
+        fake_state.recording.frameIndex = 0
+
+    monkeypatch.setattr(gateway, "_start_episode", fake_start_episode)
+    result = gateway._marker_tcp_record_sample(
+        state,
+        "start",
+        box_id="box1819152274",
+        condition="same_mount_01",
+    )
+
+    assert result["ok"] is True
+    sample = state.marker_tcp_session.samples[0]
+    assert sample.boxId == "box1819152274"
+    assert sample.side == "box1819152274"
+    assert result["markerTcp"]["samples"][0]["boxId"] == "box1819152274"
 
 
 def test_marker_tcp_registers_static_transforms_and_writes_report(tmp_path, monkeypatch):
@@ -3893,3 +3921,355 @@ def test_intrinsics_coverage_reports_a_missing_run_instead_of_an_empty_table(tmp
 
     assert payload["cameras"] == []
     assert "找不到内参目录" in payload["error"]
+
+
+# --- marker->TCP solve + EE trajectory bundle override -----------------------
+
+MARKER_TCP_TRACKING_CONFIG = """
+calibration:
+  root_dir: outputs/calibration
+  intrinsics_run_name: intr_run
+  fixed_camera_run_name: extr_run
+cube_tracker:
+  aruco_dictionary: DICT_APRILTAG_36h11
+  marker_size_cm: 5.6
+  cubes:
+    - name: left
+      handedness: right_hand
+      marker_ids: [null, 2, 0, 3, 4, 1]
+      cube_size_cm_xyz: [7.192, 7.167, 7.109]
+ee_from_cube:
+  mode: calibrated_marker_to_tcp
+  marker_to_tcp_calibration_path: config/marker_to_tcp_calibration.json
+"""
+
+# R_cube_tcp for the 0812 left cube: a proper rotation, so the solve inherits it
+# rather than refusing for lack of rotation evidence.
+INHERITED_ROTATION = [[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]
+
+
+def _marker_tcp_bundle(rotation, translation_m=(0.0, 0.1019, 0.0085)):
+    transform = [list(row) + [value] for row, value in zip(rotation, translation_m, strict=True)]
+    transform.append([0.0, 0.0, 0.0, 1.0])
+    return {
+        "schema": "marker_rig_to_tcp_calibration/v1",
+        "calibration_id": "pivot_20260812",
+        "cubes": {
+            "left": {"device_id": "box1672693301", "T_cube_tcp": transform},
+            "right": {"device_id": "box1819152274", "T_cube_tcp": transform},
+        },
+    }
+
+
+def _marker_tcp_solve_repo(tmp_path: Path) -> tuple[gateway.GatewayState, Path, Path]:
+    """A repo laid out with everything the solve reads before it shells out."""
+    repo_root = tmp_path / "repo"
+    config_path = repo_root / gateway.DEFAULT_EE_TRAJECTORY_CONFIG
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(MARKER_TCP_TRACKING_CONFIG, encoding="utf-8")
+    runner_path = repo_root / gateway.DEFAULT_EE_TRAJECTORY_RUNNER
+    runner_path.parent.mkdir(parents=True, exist_ok=True)
+    runner_path.write_text("#!/usr/bin/env bash\necho tracking\n", encoding="utf-8")
+
+    bundle_path = config_path.parent / "marker_to_tcp_calibration.json"
+    bundle_path.write_text(json.dumps(_marker_tcp_bundle(INHERITED_ROTATION)), encoding="utf-8")
+    # ee_from_cube.marker_to_tcp_calibration_path is relative to the repo root.
+    config_path.write_text(
+        MARKER_TCP_TRACKING_CONFIG.replace(
+            "config/marker_to_tcp_calibration.json",
+            str(bundle_path.relative_to(repo_root)),
+        ),
+        encoding="utf-8",
+    )
+
+    summary_path = repo_root / "outputs" / "calibration" / "extr_run" / "summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(
+        json.dumps({"joint_solution": {"cameras": {"cam_06": {}, "cam_07": {}, "cam_13": {}}}}),
+        encoding="utf-8",
+    )
+
+    dataset_root = repo_root / "outputs" / "datasets" / "marker_tcp_raw"
+    for episode in (3, 5):
+        episode_dir = dataset_root / "episodes" / f"episode_{episode:06d}"
+        episode_dir.mkdir(parents=True, exist_ok=True)
+        # cam_99 is recorded but never calibrated: it must not reach the detector.
+        for camera in ("cam_06", "cam_07", "cam_13", "cam_99"):
+            (episode_dir / f"{camera}.mkv").write_bytes(b"")
+
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 60}},
+        recording=gateway.RecordingStatus(repoId="local/test", datasetRoot=str(dataset_root)),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root.parent,
+    )
+    session_root = repo_root / "outputs" / "calibration" / "marker_tcp" / "session"
+    session_root.mkdir(parents=True, exist_ok=True)
+    state.marker_tcp_session = gateway.MarkerTcpSession(
+        active=True,
+        sessionName="session",
+        sessionRoot=str(session_root),
+        stage="capture",
+        samples=[
+            gateway.MarkerTcpSample(
+                id=f"sample_{n:03d}",
+                side="box1672693301",
+                boxId="box1672693301",
+                condition=f"same_mount_{n:02d}",
+                status="saved",
+                datasetRoot=str(dataset_root),
+                episodeIndex=episode,
+            )
+            for n, episode in enumerate((3, 5), start=1)
+        ],
+    )
+    return state, dataset_root, bundle_path
+
+
+def _stub_marker_tcp_chain(monkeypatch, calls: list[list[str]]):
+    """Run the solve without cv2/scipy: record commands, fake their outputs."""
+    monkeypatch.setattr(gateway, "_marker_tcp_python", lambda _state: Path("/usr/bin/python3"))
+
+    def fake_run(state, command, *, label, log_path, timeout_s=7200):
+        calls.append(list(command))
+        if "metrology.cli.build_rig_layout_from_cube" in command:
+            out = Path(command[command.index("--out") + 1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(
+                json.dumps(
+                    {
+                        "schema": "marker_layout_resolved/v1",
+                        "layout_id": "left_resolved",
+                        "units": "m",
+                        "rig_frame_is_cube_frame": True,
+                        "T_rig_cube": np.eye(4).tolist(),
+                        "markers": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+        elif "metrology.cli.detect_rig_markers" in command:
+            Path(command[command.index("--out") + 1]).write_bytes(b"")
+        elif "metrology.cli.track_marker_rig_in_base" in command:
+            Path(command[command.index("--out-dir") + 1]).mkdir(parents=True, exist_ok=True)
+        elif "metrology.cli.pivot_marker_tcp_calibration" in command:
+            Path(command[command.index("--out") + 1]).write_text(
+                json.dumps(
+                    {
+                        "fit": {"residual_mm": {"p95": 3.02}},
+                        "socket_moved_between_episodes": False,
+                        "primary_fit": "shared_anchor",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            emitted = Path(command[command.index("--emit-marker-to-tcp") + 1])
+            emitted.write_text(json.dumps(_marker_tcp_bundle(INHERITED_ROTATION)), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(gateway, "_run_marker_tcp_command", fake_run)
+
+
+def test_marker_tcp_solve_runs_the_metrology_chain_and_writes_a_production_bundle(
+    tmp_path, monkeypatch
+):
+    state, dataset_root, _ = _marker_tcp_solve_repo(tmp_path)
+    calls: list[list[str]] = []
+    _stub_marker_tcp_chain(monkeypatch, calls)
+
+    result = gateway._run_marker_tcp_solve(
+        state, box_id="box1672693301", socket_beyond_tcp_mm="0", background=False
+    )
+
+    assert result["ok"] is True, result.get("error")
+    steps = [
+        next(part for part in command if part.startswith("metrology.cli.")) for command in calls
+    ]
+    assert steps == [
+        "metrology.cli.build_rig_layout_from_cube",
+        "metrology.cli.detect_rig_markers",
+        "metrology.cli.track_marker_rig_in_base",
+        "metrology.cli.pivot_marker_tcp_calibration",
+    ]
+
+    detect = calls[1]
+    # Both saved episodes are solved together, renumbered into the subset dataset.
+    assert detect[detect.index("--episodes") + 1 : detect.index("--cameras")] == ["0", "1"]
+    # Recorded-but-uncalibrated cameras never reach the detector.
+    cameras = detect[detect.index("--cameras") + 1 : detect.index("--dictionary")]
+    assert cameras == ["cam_06", "cam_07", "cam_13"]
+    assert detect[detect.index("--dictionary") + 1] == "DICT_APRILTAG_36h11"
+
+    pivot = calls[3]
+    assert pivot[pivot.index("--cube") + 1] == "left"
+    assert pivot[pivot.index("--device-id") + 1] == "box1672693301"
+    assert pivot[pivot.index("--socket-beyond-tcp-mm") + 1] == "0"
+    # A single pivot point cannot observe rotation, so it is inherited verbatim
+    # and its provenance is recorded rather than being silently re-fitted.
+    assert pivot[pivot.index("--rotation-cube-tcp") + 1] == "0,0,1;-1,0,0;0,-1,0"
+    assert "inherited from existing production bundle" in pivot[pivot.index("--rotation-source") + 1]
+
+    session = state.marker_tcp_session
+    # Solving one BOX must not close the session: the operator still has to be
+    # able to record another sample or solve the second BOX.
+    assert session.stage == "capture"
+    assert Path(session.solvePath).is_file()
+    summary = json.loads(Path(session.solveSummaryPath).read_text(encoding="utf-8"))
+    assert summary["boxId"] == "box1672693301"
+    assert summary["cubeName"] == "left"
+    assert summary["rigFrameIsCubeFrame"] is True
+    assert summary["cameras"] == ["cam_06", "cam_07", "cam_13"]
+    assert summary["pivotP95Mm"] == 3.02
+    assert [entry["sourceEpisodeIndex"] for entry in summary["episodes"]] == [3, 5]
+    # The layout ships next to the bundle so a non-identity rig frame can travel
+    # with it into the production tracker.
+    assert (Path(session.solvePath).parent / gateway.DEFAULT_MARKER_LAYOUT_NAME).is_file()
+
+
+def test_marker_tcp_solve_refuses_a_box_the_production_bundle_does_not_cover(tmp_path, monkeypatch):
+    state, _, _ = _marker_tcp_solve_repo(tmp_path)
+    _stub_marker_tcp_chain(monkeypatch, [])
+
+    result = gateway._run_marker_tcp_solve(state, box_id="box_unknown", background=False)
+
+    assert result["ok"] is False
+    assert "box_unknown" in result["error"]
+
+
+def test_queue_traj_gen_writes_a_marker_tcp_override_config_and_records_it(tmp_path, monkeypatch):
+    state, dataset_root, bundle_path = _marker_tcp_solve_repo(tmp_path)
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    launched: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 4321
+        stdout = []
+
+        def poll(self):
+            return None
+
+    def fake_popen(command, **kwargs):
+        launched["command"] = command
+        return FakeProcess()
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(gateway, "_start_traj_gen_output_reader", lambda *_args: None)
+
+    gateway._queue_traj_gen(state, dataset_root, marker_to_tcp_calibration_path=bundle_path)
+
+    command = launched["command"]
+    override_path = Path(command[command.index("--config") + 1])
+    # The base config is left alone; the override lives under the dataset's meta/.
+    assert override_path != state.repo_root / gateway.DEFAULT_EE_TRAJECTORY_CONFIG
+    assert override_path.parent == dataset_root / "meta"
+    override = yaml.safe_load(override_path.read_text(encoding="utf-8"))
+    assert override["ee_from_cube"]["mode"] == "calibrated_marker_to_tcp"
+    assert override["ee_from_cube"]["marker_to_tcp_calibration_path"] == str(bundle_path)
+    # An identity rig frame needs no layout override: production keeps generating
+    # cube corners from the same numbers.
+    assert "marker_layout_path" not in override["cube_tracker"]
+
+    item = gateway._processing_item_from_dataset(dataset_root)
+    assert item["markerTcpCalibrationPath"] == str(bundle_path)
+    assert str(bundle_path) in item["message"]
+
+
+def test_queue_traj_gen_carries_a_cad_rig_frame_layout_into_the_tracker(tmp_path, monkeypatch):
+    """A bundle solved in a CAD rig frame is not sufficient on its own.
+
+    The tracker would otherwise report a cube-frame pose while the bundle's
+    T_rig_tcp is expressed in the rig frame -- a silent frame error of exactly
+    the CAD rotation, with no symptom until the EE labels are wrong.
+    """
+    state, dataset_root, _ = _marker_tcp_solve_repo(tmp_path)
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+
+    solve_dir = Path(state.marker_tcp_session.sessionRoot) / "solve_cad"
+    solve_dir.mkdir(parents=True, exist_ok=True)
+    bundle_path = solve_dir / "marker_to_tcp_calibration.json"
+    bundle_path.write_text(json.dumps(_marker_tcp_bundle(INHERITED_ROTATION)), encoding="utf-8")
+    layout_path = solve_dir / gateway.DEFAULT_MARKER_LAYOUT_NAME
+    layout_path.write_text(
+        json.dumps({"rig_frame_is_cube_frame": False, "markers": []}), encoding="utf-8"
+    )
+
+    class FakeProcess:
+        pid = 4322
+        stdout = []
+
+        def poll(self):
+            return None
+
+    launched: dict[str, object] = {}
+
+    def fake_popen(command, **kwargs):
+        launched["command"] = command
+        return FakeProcess()
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(gateway, "_start_traj_gen_output_reader", lambda *_args: None)
+
+    gateway._queue_traj_gen(state, dataset_root, marker_to_tcp_calibration_path=bundle_path)
+
+    command = launched["command"]
+    override = yaml.safe_load(
+        Path(command[command.index("--config") + 1]).read_text(encoding="utf-8")
+    )
+    assert override["cube_tracker"]["marker_layout_path"] == str(layout_path)
+
+
+def test_marker_tcp_solve_returns_immediately_and_reports_progress_through_the_session(
+    tmp_path, monkeypatch
+):
+    """The POST must not hold the connection open for the whole solve.
+
+    Detection alone decodes every frame of every camera; a synchronous response
+    would sit past any browser or proxy timeout and read as a failure even when
+    the solve succeeded. The panel already polls the snapshot, so the request
+    only has to validate and hand off.
+    """
+    state, _, _ = _marker_tcp_solve_repo(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_run(_state, command, *, label, log_path, timeout_s=7200):
+        started.set()
+        assert release.wait(timeout=10)
+        raise RuntimeError("stopped on purpose")
+
+    monkeypatch.setattr(gateway, "_marker_tcp_python", lambda _state: Path("/usr/bin/python3"))
+    monkeypatch.setattr(gateway, "_run_marker_tcp_command", blocking_run)
+
+    result = gateway._run_marker_tcp_solve(state, box_id="box1672693301")
+
+    assert result["ok"] is True
+    assert started.wait(timeout=10)
+    assert state.marker_tcp_session.stage == "solving"
+    # A second request while one is running is refused rather than racing it.
+    second = gateway._run_marker_tcp_solve(state, box_id="box1672693301")
+    assert second["ok"] is False
+    assert "已有解算在进行中" in second["error"]
+
+    release.set()
+    for _ in range(100):
+        if state.marker_tcp_session.stage == "failed":
+            break
+        time.sleep(0.05)
+    assert state.marker_tcp_session.stage == "failed"
+    assert "stopped on purpose" in state.marker_tcp_session.message
+
+
+def test_marker_tcp_solve_rejects_a_bad_socket_offset_before_spawning_anything(tmp_path, monkeypatch):
+    state, _, _ = _marker_tcp_solve_repo(tmp_path)
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("no subprocess should be reached for an invalid request")
+
+    monkeypatch.setattr(gateway, "_run_marker_tcp_command", explode)
+
+    result = gateway._run_marker_tcp_solve(state, box_id="box1672693301", socket_beyond_tcp_mm="很多")
+
+    assert result["ok"] is False
+    assert "必须是数字" in result["error"]

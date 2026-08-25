@@ -265,7 +265,9 @@ function App() {
       <DatasetProcessingPage
         snapshot={snapshot}
         busy={busy}
-        onGenerate={(path) => run(() => api.queueTrajGen(path))}
+        onGenerate={(path, markerTcpCalibrationPath) =>
+          run(() => api.queueTrajGen(path, markerTcpCalibrationPath ?? ""))
+        }
         onRunQc={(path) => run(() => api.runQc(path))}
         onOpenReplay={(path) => selectAndOpenReplay(path)}
         onSetDatasetsRoot={(path) => run(() => api.setDatasetsRoot(path))}

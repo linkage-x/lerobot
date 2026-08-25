@@ -78,6 +78,9 @@ DEFAULT_EE_TRAJECTORY_RUNNER = Path("third_party/opencv_kalibr/run_april_cube_tr
 DEFAULT_EE_TRAJECTORY_CONFIG = Path(
     "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/april_cube_tracking_in_robot_base_thor.yaml"
 )
+# Resolved marker layout the solve writes next to its production bundle, so a
+# non-identity rig frame travels with the bundle instead of being lost.
+DEFAULT_MARKER_LAYOUT_NAME = "marker_layout_resolved.json"
 # Algorithm id + on-disk sidecar/analysis names produced by the april thor config
 # (save_to_dataset.sidecar_dir and output.run_name_suffix). Kept in sync here so
 # the gateway reads back exactly what the tracker writes.
@@ -300,6 +303,7 @@ class MarkerTcpSample:
     id: str
     side: str
     condition: str
+    boxId: str = ""
     source: str = "recording"  # recording | static_transform
     status: str = "pending"  # pending | recording | saved | discarded | registered
     datasetRoot: str = ""
@@ -314,11 +318,15 @@ class MarkerTcpSession:
     active: bool = False
     sessionName: str = ""
     sessionRoot: str = ""
-    stage: str = "idle"  # idle | capture | reporting | done | failed
+    stage: str = "idle"  # idle | capture | solving | reporting | done | failed
     samples: list[MarkerTcpSample] = field(default_factory=list)
     pendingSampleId: str = ""
     message: str = ""
     reportPath: str = ""
+    solvePath: str = ""
+    solveSummaryPath: str = ""
+    pivotReportPath: str = ""
+    trackingRunPath: str = ""
 
 
 @dataclass
@@ -2157,6 +2165,7 @@ def _processing_item_from_dataset(
         "totalFrames": total_frames,
         "validFramesPct": None,
         "logTail": [],
+        "markerTcpCalibrationPath": "",
         "onlineSync": _online_sync_manifest_summary(dataset_root),
         "qcChecks": [],
         "ikEvaluation": None,
@@ -2169,6 +2178,11 @@ def _processing_item_from_dataset(
         current_job = meta.get("current_job") if isinstance(meta.get("current_job"), dict) else {}
         version_info = versions.get(active_version) if isinstance(active_version, str) else None
         qc = version_info.get("qc") if isinstance(version_info, dict) else None
+        marker_tcp_path = ""
+        if isinstance(current_job, dict):
+            marker_tcp_path = str(current_job.get("marker_to_tcp_calibration_path", "") or "")
+        if not marker_tcp_path and isinstance(version_info, dict):
+            marker_tcp_path = str(version_info.get("marker_to_tcp_calibration_path", "") or "")
         if isinstance(current_job, dict) and current_job.get("status") in ("queued", "running"):
             status = str(current_job["status"])
             message = current_job.get("message") or f"{current_job.get('kind') or 'job'} {status}"
@@ -2208,6 +2222,7 @@ def _processing_item_from_dataset(
             "message": message,
             "validFramesPct": float(qc["valid_frames_pct"]) if isinstance(qc, dict) and qc.get("valid_frames_pct") is not None else None,
             "logTail": list(current_job.get("log_tail") or []) if isinstance(current_job, dict) else [],
+            "markerTcpCalibrationPath": marker_tcp_path,
             "qcChecks": list(qc.get("checks") or []) if isinstance(qc, dict) else [],
             "ikEvaluation": qc.get("ik_evaluation") if isinstance(qc, dict) else None,
         }
@@ -3358,6 +3373,541 @@ def _valid_marker_tcp_side(side: str) -> str:
     return normalized
 
 
+def _marker_tcp_target_label(*, box_id: str = "", side: str = "") -> tuple[str, str]:
+    box_id_norm = str(box_id or "").strip()
+    if box_id_norm:
+        return box_id_norm, box_id_norm
+    # Backward compatibility for older saved sessions/tests/API callers. New UI
+    # sends box_id and uses boxId for display; side is kept only as legacy label.
+    side_norm = str(side or "").strip().lower()
+    if side_norm in {"left", "right"}:
+        return "", side_norm
+    raise ValueError("box_id 不能为空，请选择 BOX ID")
+
+
+def _marker_tcp_slug(raw: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(raw or "").strip())
+    text = text.strip("._-")
+    return text or "marker_tcp"
+
+
+def _resolve_user_path(state: GatewayState, raw_path: str | Path) -> Path:
+    path = Path(str(raw_path)).expanduser()
+    if not path.is_absolute():
+        path = state.repo_root / path
+    return path
+
+
+def _load_yaml_mapping(path: Path) -> dict[str, Any]:
+    import yaml
+
+    with path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"YAML root must be a mapping: {path}")
+    return data
+
+
+def _write_yaml_mapping(path: Path, payload: dict[str, Any]) -> None:
+    import yaml
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+
+def _default_marker_tcp_bundle_path(state: GatewayState) -> Path | None:
+    config_path = state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG
+    if not config_path.is_file():
+        return None
+    try:
+        cfg = _load_yaml_mapping(config_path)
+    except Exception as exc:  # noqa: BLE001
+        state.log("warn", f"Could not read marker→TCP bundle path from {config_path}: {exc}")
+        return None
+    ee_cfg = cfg.get("ee_from_cube") if isinstance(cfg.get("ee_from_cube"), dict) else {}
+    raw = str(ee_cfg.get("marker_to_tcp_calibration_path", "") or "").strip()
+    return _resolve_user_path(state, raw) if raw else None
+
+
+def _load_marker_tcp_calibration_bundle(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    schema = str(data.get("schema", ""))
+    if not schema.startswith("marker_rig_to_tcp_calibration/"):
+        raise ValueError(f"{path}: unexpected marker→TCP schema {schema!r}")
+    cubes = data.get("cubes")
+    if not isinstance(cubes, dict) or not cubes:
+        raise ValueError(f"{path}: marker→TCP bundle has no cubes")
+    return data
+
+
+def _resolve_marker_tcp_calibration_file(state: GatewayState, raw_path: str) -> Path | None:
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+    path = _resolve_user_path(state, text)
+    if not path.is_file():
+        raise FileNotFoundError(f"marker→TCP calibration bundle not found: {path}")
+    _load_marker_tcp_calibration_bundle(path)
+    return path
+
+
+def _marker_tcp_cube_for_box_id(state: GatewayState, box_id: str) -> tuple[str, dict[str, Any], Path | None]:
+    target = str(box_id or "").strip()
+    default_path = _default_marker_tcp_bundle_path(state)
+    if default_path is not None and default_path.is_file():
+        bundle = _load_marker_tcp_calibration_bundle(default_path)
+        cubes = bundle.get("cubes", {}) if isinstance(bundle.get("cubes"), dict) else {}
+        if target in cubes and isinstance(cubes[target], dict):
+            return target, cubes[target], default_path
+        for name, entry in cubes.items():
+            if isinstance(entry, dict) and str(entry.get("device_id", "")).strip() == target:
+                return str(name), entry, default_path
+    legacy = target.lower()
+    if legacy in {"left", "right"}:
+        return legacy, {}, default_path
+    raise ValueError(
+        f"默认 production marker→TCP bundle 中找不到 BOX ID {target!r}。"
+        "请先登记该 BOX，或提供包含对应 T_cube_tcp/T_marker_tcp 的 CAD/真值 JSON。"
+    )
+
+
+def _coerce_mat4(value: Any, *, label: str) -> list[list[float]]:
+    if not isinstance(value, list) or len(value) != 4:
+        raise ValueError(f"{label} must be a 4x4 matrix")
+    matrix: list[list[float]] = []
+    for row in value:
+        if not isinstance(row, list) or len(row) != 4:
+            raise ValueError(f"{label} must be a 4x4 matrix")
+        values = [float(v) for v in row]
+        if not all(math.isfinite(v) for v in values):
+            raise ValueError(f"{label} contains non-finite values")
+        matrix.append(values)
+    return matrix
+
+
+def _rotation_from_transform(value: Any, *, label: str) -> list[list[float]]:
+    matrix = _coerce_mat4(value, label=label)
+    rotation = [row[:3] for row in matrix[:3]]
+    det = _det3(rotation)
+    if abs(det - 1.0) > 1e-3:
+        raise ValueError(f"{label} rotation is not proper (det={det:.6f})")
+    return rotation
+
+
+def _det3(matrix: list[list[float]]) -> float:
+    a, b, c = matrix
+    return (
+        a[0] * (b[1] * c[2] - b[2] * c[1])
+        - a[1] * (b[0] * c[2] - b[2] * c[0])
+        + a[2] * (b[0] * c[1] - b[1] * c[0])
+    )
+
+
+def _rotation_arg(rotation: list[list[float]]) -> str:
+    return ";".join(",".join(f"{float(value):.12g}" for value in row) for row in rotation)
+
+
+def _rotation_from_marker_tcp_truth(
+    state: GatewayState,
+    *,
+    truth_path: Path | None,
+    cube_name: str,
+    box_id: str,
+) -> tuple[list[list[float]] | None, str]:
+    if truth_path is None:
+        return None, ""
+    try:
+        data = json.loads(truth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"无法读取 CAD/真值 JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"CAD/真值 JSON root must be a mapping: {truth_path}")
+
+    cubes = data.get("cubes") if isinstance(data.get("cubes"), dict) else {}
+    candidate_names = []
+    if cube_name in cubes:
+        candidate_names.append(cube_name)
+    if box_id in cubes and box_id not in candidate_names:
+        candidate_names.append(box_id)
+    for name, entry in cubes.items():
+        if isinstance(entry, dict) and str(entry.get("device_id", "")).strip() == box_id and str(name) not in candidate_names:
+            candidate_names.append(str(name))
+    for name in candidate_names:
+        entry = cubes.get(name)
+        if isinstance(entry, dict) and "T_cube_tcp" in entry:
+            rotation = _rotation_from_transform(entry["T_cube_tcp"], label=f"{truth_path}:cubes.{name}.T_cube_tcp")
+            return rotation, f"operator supplied CAD/truth rotation from {truth_path}: cubes.{name}.T_cube_tcp"
+
+    for key in ("T_cube_tcp", "T_marker_tcp", "T_marker_to_tcp", "T_rig_tcp"):
+        if key in data:
+            rotation = _rotation_from_transform(data[key], label=f"{truth_path}:{key}")
+            return rotation, f"operator supplied CAD/truth rotation from {truth_path}: {key}"
+
+    schema = str(data.get("schema", ""))
+    if schema.startswith("marker_rig_cad/") or schema.startswith("marker_layout/"):
+        state.log(
+            "warn",
+            f"{truth_path} contains marker geometry but no TCP rotation transform; "
+            "using the existing production bundle rotation if available.",
+        )
+        return None, f"CAD/layout geometry recorded from {truth_path}; no TCP rotation key present"
+    return None, f"CAD/truth JSON recorded from {truth_path}; no supported TCP transform key present"
+
+
+def _select_marker_tcp_rotation(
+    state: GatewayState,
+    *,
+    truth_path: Path | None,
+    cube_name: str,
+    box_id: str,
+    existing_entry: dict[str, Any],
+    existing_bundle_path: Path | None,
+) -> tuple[list[list[float]], str, str]:
+    truth_rotation, truth_note = _rotation_from_marker_tcp_truth(
+        state, truth_path=truth_path, cube_name=cube_name, box_id=box_id
+    )
+    if truth_rotation is not None:
+        return truth_rotation, truth_note, truth_note
+    if existing_entry and "T_cube_tcp" in existing_entry:
+        rotation = _rotation_from_transform(existing_entry["T_cube_tcp"], label=f"{existing_bundle_path}:cubes.{cube_name}.T_cube_tcp")
+        source = (
+            f"rotation inherited from existing production bundle {existing_bundle_path}; "
+            "the fixed-point pivot solve updates translation only because a single pivot point cannot observe rotation"
+        )
+        return rotation, source, truth_note
+    raise ValueError(
+        "无法确定 marker rig→TCP 的旋转。单点 pivot 只能估计 TCP 原点；"
+        "请提供包含 T_cube_tcp/T_marker_tcp/T_marker_to_tcp 的 CAD/真值 JSON，"
+        "或先让默认 production bundle 包含该 BOX 的旋转。"
+    )
+
+
+# Every module the metrology solve chain imports at top level: cv2 for the
+# detector, scipy for the bundle adjustment, yaml/numpy everywhere.
+_MARKER_TCP_REQUIRED_MODULES = ("cv2", "numpy", "scipy", "yaml")
+
+
+def _marker_tcp_python_candidates(repo_root: Path) -> list[Path]:
+    home = Path.home()
+    return [
+        repo_root / "third_party" / "opencv_kalibr" / ".venv" / "bin" / "python3",
+        repo_root / ".venv-fr3" / "bin" / "python",
+        home / "Code" / "infer" / ".venv-fr3" / "bin" / "python",
+        home / "Codes" / "infer" / ".venv-fr3" / "bin" / "python",
+        repo_root / ".venv" / "bin" / "python3",
+        Path(sys.executable),
+        Path("/usr/bin/python3"),
+    ]
+
+
+def _marker_tcp_python(state: GatewayState) -> Path:
+    """Pick an interpreter that can actually run the metrology solve chain.
+
+    Probing beats guessing here: on Thor the repo's own ``.venv`` has cv2 but no
+    scipy, so the obvious choice decodes 7 cameras x ~1800 frames of 1080p and
+    only then dies importing ``scipy.optimize`` inside the bundle adjustment.
+    A one-second import check up front turns that into an error message.
+    """
+    tried: list[str] = []
+    seen: set[str] = set()
+    for candidate in _marker_tcp_python_candidates(state.repo_root):
+        if not candidate.is_file() or str(candidate) in seen:
+            continue
+        seen.add(str(candidate))
+        probe = subprocess.run(
+            [str(candidate), "-c", f"import {', '.join(_MARKER_TCP_REQUIRED_MODULES)}"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return candidate
+        missing = (probe.stderr or "").strip().splitlines()
+        tried.append(f"{candidate}: {missing[-1] if missing else 'import failed'}")
+    raise RuntimeError(
+        "找不到能运行 metrology 解算链的 python（需要 "
+        + ", ".join(_MARKER_TCP_REQUIRED_MODULES)
+        + "）。已尝试：\n"
+        + "\n".join(f"  - {line}" for line in tried)
+    )
+
+
+def _marker_tcp_tool_env(state: GatewayState) -> dict[str, str]:
+    env = _tool_env(state.repo_root)
+    metrology_root = state.repo_root / "third_party" / "opencv_kalibr"
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join([str(metrology_root), existing]) if existing else str(metrology_root)
+    return env
+
+
+def _run_marker_tcp_command(
+    state: GatewayState,
+    command: list[str],
+    *,
+    label: str,
+    log_path: Path,
+    timeout_s: int = 7200,
+) -> subprocess.CompletedProcess[str]:
+    session = state.marker_tcp_session
+    session.stage = "solving"
+    session.message = label
+    _save_marker_tcp_session(state)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"\n$ {' '.join(command)}\n")
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(state.repo_root),
+            env=_marker_tcp_tool_env(state),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = exc.output if isinstance(exc.output, str) else ""
+        with log_path.open("a", encoding="utf-8") as handle:
+            if output:
+                handle.write(output)
+            handle.write(f"\n[TIMEOUT] {label} exceeded {timeout_s}s\n")
+        raise RuntimeError(f"{label} 超时：{timeout_s}s 内没有结束") from exc
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(proc.stdout or "")
+        handle.write(f"\n[exit_code] {proc.returncode}\n")
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stdout or "").splitlines()[-12:])
+        raise RuntimeError(f"{label} 失败(exit={proc.returncode})" + (f": {tail}" if tail else ""))
+    return proc
+
+
+def _marker_tcp_saved_samples(session: MarkerTcpSession, box_id: str) -> list[MarkerTcpSample]:
+    target = str(box_id or "").strip()
+    samples = []
+    for sample in session.samples:
+        if sample.status != "saved" or sample.episodeIndex < 0 or not sample.datasetRoot:
+            continue
+        if target and target not in {str(sample.boxId or "").strip(), str(sample.side or "").strip()}:
+            continue
+        samples.append(sample)
+    return sorted(samples, key=lambda item: (item.datasetRoot, item.episodeIndex, item.id))
+
+
+def _marker_tcp_subset_dataset(
+    state: GatewayState,
+    *,
+    solve_dir: Path,
+    samples: list[MarkerTcpSample],
+) -> tuple[Path, list[dict[str, Any]]]:
+    roots = {sample.datasetRoot for sample in samples if sample.datasetRoot}
+    if len(roots) != 1:
+        raise ValueError("本次解算要求样本来自同一个 datasetRoot；请对每个录制会话分别解算")
+    dataset_root = _resolve_user_path(state, next(iter(roots)))
+    if not dataset_root.is_dir():
+        raise FileNotFoundError(f"datasetRoot not found: {dataset_root}")
+
+    subset_root = solve_dir / "input_dataset"
+    episodes_root = subset_root / "episodes"
+    episodes_root.mkdir(parents=True, exist_ok=True)
+    mapping: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for sample in samples:
+        episode = int(sample.episodeIndex)
+        if episode in seen:
+            continue
+        seen.add(episode)
+        source = dataset_root / "episodes" / f"episode_{episode:06d}"
+        if not source.is_dir():
+            raise FileNotFoundError(f"episode dir not found for sample {sample.id}: {source}")
+        if not any(source.glob("cam_*.mkv")):
+            raise FileNotFoundError(f"episode has no cam_*.mkv videos: {source}")
+        dest = episodes_root / f"episode_{len(mapping):06d}"
+        try:
+            os.symlink(source.resolve(), dest, target_is_directory=True)
+            link_mode = "symlink"
+        except OSError:
+            shutil.copytree(source, dest, symlinks=True)
+            link_mode = "copytree"
+        mapping.append(
+            {
+                "sampleId": sample.id,
+                "condition": sample.condition,
+                "sourceDatasetRoot": str(dataset_root),
+                "sourceEpisodeIndex": episode,
+                "subsetEpisodeIndex": len(mapping),
+                "sourceEpisodeDir": str(source),
+                "subsetEpisodeDir": str(dest),
+                "mode": link_mode,
+            }
+        )
+    if not mapping:
+        raise ValueError("没有可用于解算的 saved 样本")
+    _write_marker_tcp_json(subset_root / "marker_tcp_episode_map.json", {"episodes": mapping})
+    return subset_root, mapping
+
+
+def _marker_tcp_tracking_cameras(state: GatewayState, subset_root: Path, episodes: list[int]) -> list[str]:
+    """Cameras to detect on: those recorded in every episode AND calibrated.
+
+    Detection is the expensive half of the solve (1080p decode per camera per
+    frame), and a camera with no extrinsics contributes nothing to the pose --
+    ``track_marker_rig_in_base`` skips it outright. Intersecting up front keeps
+    the cost proportional to what the solve can actually use.
+    """
+    per_episode: list[set[str]] = []
+    for episode in episodes:
+        episode_dir = subset_root / "episodes" / f"episode_{episode:06d}"
+        per_episode.append({path.stem for path in episode_dir.glob("cam_*.mkv")})
+    recorded = set.intersection(*per_episode) if per_episode else set()
+    if not recorded:
+        raise FileNotFoundError(f"选中的 episode 里没有所有段共有的 cam_*.mkv：{subset_root}")
+
+    cfg = _load_yaml_mapping(state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG)
+    calib = cfg.get("calibration") if isinstance(cfg.get("calibration"), dict) else {}
+    summary_path = (
+        _resolve_user_path(state, str(calib.get("root_dir", "outputs/calibration")))
+        / str(calib.get("fixed_camera_run_name", "")).strip()
+        / "summary.json"
+    )
+    if not summary_path.is_file():
+        raise FileNotFoundError(f"外参 summary.json not found: {summary_path}")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    joint = summary.get("joint_solution") if isinstance(summary.get("joint_solution"), dict) else {}
+    calibrated = joint.get("cameras") if isinstance(joint.get("cameras"), dict) else {}
+    usable = sorted(recorded & set(calibrated))
+    if not usable:
+        raise ValueError(
+            f"录制到的相机 {sorted(recorded)} 和已标定的相机 {sorted(calibrated)} 没有交集，无法解算"
+        )
+    return usable
+
+
+def _marker_tcp_aruco_dictionary(state: GatewayState) -> str:
+    """The dictionary the rig's markers are drawn from, per the production config.
+
+    Detecting with the wrong dictionary does not fail loudly -- every id decodes
+    to something else and the solve happily fits nothing -- so this reads the one
+    place production already declares it instead of carrying a default.
+    """
+    cfg = _load_yaml_mapping(state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG)
+    tracker = cfg.get("cube_tracker") if isinstance(cfg.get("cube_tracker"), dict) else {}
+    dictionary = str(tracker.get("aruco_dictionary", "") or "").strip()
+    if not dictionary:
+        raise ValueError(
+            f"cube_tracker.aruco_dictionary 未设置：{state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG}"
+        )
+    return dictionary
+
+
+def _marker_tcp_layout_command(
+    state: GatewayState,
+    *,
+    python_bin: Path,
+    cube_name: str,
+    out_path: Path,
+    cad_path: Path | None,
+) -> list[str]:
+    command = [
+        str(python_bin),
+        "-m",
+        "metrology.cli.build_rig_layout_from_cube",
+        "--tracking-config",
+        str(state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG),
+        "--cube",
+        cube_name,
+        "--layout-id",
+        f"{cube_name}_{out_path.parent.name}",
+        "--out",
+        str(out_path),
+    ]
+    if cad_path is not None:
+        command += ["--cad-json", str(cad_path)]
+    return command
+
+
+def _cad_declares_rig_placement(cad_path: Path | None, cube_name: str) -> bool:
+    """Whether a CAD file actually places the cube in a rig frame.
+
+    The panel's one "CAD / 真值 JSON" field feeds two different consumers -- the
+    rotation picker and the layout resolver -- and only some CAD files carry a
+    ``T_rig_cube``. Handing a rotation-only file to the resolver would make it
+    exit rather than fall through to the identity default, so check first.
+    """
+    if cad_path is None:
+        return False
+    try:
+        data = json.loads(cad_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    keys = {"T_rig_cube", "T_rig_from_cube", "T_cube_rig", "T_cube_from_rig"}
+    if keys & set(data):
+        return True
+    cubes = data.get("cubes")
+    entry = cubes.get(cube_name) if isinstance(cubes, dict) else None
+    return isinstance(entry, dict) and bool(keys & set(entry))
+
+
+def _compose_rig_rotation(
+    rotation_cube_tcp: list[list[float]],
+    layout_path: Path,
+) -> tuple[list[list[float]], bool]:
+    """Carry an inherited ``R_cube_tcp`` into the frame the layout is expressed in.
+
+    With the default identity placement the rig frame *is* the cube frame and
+    this is a no-op. When CAD moves the cube into a separate rig frame, the
+    tracker reports poses of the rig, so the rotation the bundle needs is
+    ``R_rig_tcp = R_rig_cube @ R_cube_tcp`` -- writing the un-composed one would
+    be a silent frame error of exactly the CAD rotation.
+    """
+    layout = json.loads(layout_path.read_text(encoding="utf-8"))
+    if bool(layout.get("rig_frame_is_cube_frame", True)):
+        return rotation_cube_tcp, False
+    T_rig_cube = _coerce_mat4(layout.get("T_rig_cube"), label=f"{layout_path}:T_rig_cube")
+    R_rig_cube = [row[:3] for row in T_rig_cube[:3]]
+    composed = [
+        [sum(R_rig_cube[i][k] * rotation_cube_tcp[k][j] for k in range(3)) for j in range(3)]
+        for i in range(3)
+    ]
+    return composed, True
+
+
+def _write_ee_trajectory_override_config(
+    state: GatewayState,
+    dataset_root: Path,
+    marker_to_tcp_calibration_path: Path,
+) -> Path:
+    base_config_path = state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG
+    if not base_config_path.is_file():
+        raise FileNotFoundError(f"EE trajectory config not found: {base_config_path}")
+    cfg = _load_yaml_mapping(base_config_path)
+    ee_cfg = cfg.setdefault("ee_from_cube", {})
+    if not isinstance(ee_cfg, dict):
+        raise ValueError("ee_from_cube must be a mapping in EE trajectory config")
+    ee_cfg["mode"] = "calibrated_marker_to_tcp"
+    ee_cfg["marker_to_tcp_calibration_path"] = str(marker_to_tcp_calibration_path)
+    # A bundle solved in a CAD rig frame is only half the story: the production
+    # tracker still generates analytic cube corners unless it is handed the same
+    # layout, and pairing a rig-frame T_rig_tcp with a cube-frame pose is a
+    # silent frame error. The solve drops the layout next to the bundle exactly
+    # so this can pick it up; an identity placement needs no override.
+    layout_path = marker_to_tcp_calibration_path.parent / DEFAULT_MARKER_LAYOUT_NAME
+    if layout_path.is_file():
+        layout = json.loads(layout_path.read_text(encoding="utf-8"))
+        if not bool(layout.get("rig_frame_is_cube_frame", True)):
+            tracker_cfg = cfg.setdefault("cube_tracker", {})
+            if not isinstance(tracker_cfg, dict):
+                raise ValueError("cube_tracker must be a mapping in EE trajectory config")
+            tracker_cfg["marker_layout_path"] = str(layout_path)
+    digest = hashlib.sha1(str(marker_to_tcp_calibration_path).encode("utf-8")).hexdigest()[:10]
+    path = dataset_root / "meta" / f"ee_trajectory_config_marker_tcp_{digest}.yaml"
+    _write_yaml_mapping(path, cfg)
+    return path
+
+
 def _start_marker_tcp_session(state: GatewayState) -> dict[str, Any]:
     if state.marker_tcp_session.active:
         return {"ok": False, "error": "marker→TCP 采集会话已在进行中"}
@@ -3369,7 +3919,7 @@ def _start_marker_tcp_session(state: GatewayState) -> dict[str, Any]:
         sessionName=name,
         sessionRoot=str(root),
         stage="capture",
-        message="采集 left/right UMI 的重复性样本；本页只记录条件与原始录制，不假设已解出 TCP 外参。",
+        message="按 BOX ID 采集 UMI marker→TCP 样本；保存录制段后可直接解算 marker rig→TCP 并写生产 bundle。",
     )
     _save_marker_tcp_session(state)
     state.log("info", f"Marker→TCP repeatability session started: {root}")
@@ -3394,7 +3944,14 @@ def _marker_tcp_pending_sample(state: GatewayState) -> MarkerTcpSample | None:
     return None
 
 
-def _marker_tcp_record_sample(state: GatewayState, action: str, *, side: str = "", condition: str = "") -> dict[str, Any]:
+def _marker_tcp_record_sample(
+    state: GatewayState,
+    action: str,
+    *,
+    side: str = "",
+    box_id: str = "",
+    condition: str = "",
+) -> dict[str, Any]:
     session = state.marker_tcp_session
     if not session.active or session.stage not in {"capture", "failed"}:
         return {"ok": False, "error": "没有进行中的 marker→TCP 采集会话"}
@@ -3403,7 +3960,7 @@ def _marker_tcp_record_sample(state: GatewayState, action: str, *, side: str = "
         if action == "start":
             if session.pendingSampleId:
                 return {"ok": False, "error": "已有样本正在录制，请先保存或丢弃"}
-            side_norm = _valid_marker_tcp_side(side)
+            box_id_norm, target_label = _marker_tcp_target_label(box_id=box_id, side=side)
             condition_text = str(condition or "").strip()
             if not condition_text:
                 return {"ok": False, "error": "condition 不能为空，例如 same_mount_01 / remount_03 / light_push_x"}
@@ -3412,8 +3969,9 @@ def _marker_tcp_record_sample(state: GatewayState, action: str, *, side: str = "
             _start_episode(state)
             sample = MarkerTcpSample(
                 id=f"sample_{len(session.samples) + 1:03d}",
-                side=side_norm,
+                side=target_label,
                 condition=condition_text,
+                boxId=box_id_norm,
                 source="recording",
                 status="recording",
                 datasetRoot=state.recording.datasetRoot,
@@ -3422,7 +3980,7 @@ def _marker_tcp_record_sample(state: GatewayState, action: str, *, side: str = "
             )
             session.samples.append(sample)
             session.pendingSampleId = sample.id
-            session.message = f"正在录制 {side_norm} · {condition_text}；结束后保存或丢弃本段。"
+            session.message = f"正在录制 {target_label} · {condition_text}；结束后保存或丢弃本段。"
         elif action in {"save", "discard"}:
             sample = _marker_tcp_pending_sample(state)
             if sample is None:
@@ -3439,8 +3997,8 @@ def _marker_tcp_record_sample(state: GatewayState, action: str, *, side: str = "
             sample.episodeIndex = episode_index
             if action == "save":
                 sample.status = "saved"
-                sample.note = "raw recording saved; register static_transform.json after solving nominal transform"
-                session.message = "样本已保存。生成 static_transform.json 后在本页登记路径，再生成 repeatability 报告。"
+                sample.note = "raw recording saved; use solve to estimate marker rig->TCP, or register an external static_transform.json"
+                session.message = "样本已保存。可继续录制同一 BOX 的其它 pivot 段，或直接点击解算写入生产 bundle。"
             else:
                 sample.status = "discarded"
                 sample.note = "discard requested; ignored by repeatability report"
@@ -3463,13 +4021,14 @@ def _register_marker_tcp_static_transform(
     *,
     path_arg: str,
     side: str,
-    condition: str,
+    box_id: str = "",
+    condition: str = "",
 ) -> dict[str, Any]:
     session = state.marker_tcp_session
     if not session.active:
         return {"ok": False, "error": "没有进行中的 marker→TCP 采集会话"}
     try:
-        side_norm = _valid_marker_tcp_side(side)
+        box_id_norm, target_label = _marker_tcp_target_label(box_id=box_id, side=side)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     path_text = str(path_arg or "").strip()
@@ -3490,8 +4049,9 @@ def _register_marker_tcp_static_transform(
     condition_text = str(condition or p.parent.name).strip() or p.parent.name
     sample = MarkerTcpSample(
         id=f"sample_{len(session.samples) + 1:03d}",
-        side=side_norm,
+        side=target_label,
         condition=condition_text,
+        boxId=box_id_norm,
         source="static_transform",
         status="registered",
         staticTransformPath=str(p),
@@ -3499,7 +4059,285 @@ def _register_marker_tcp_static_transform(
     )
     session.samples.append(sample)
     session.stage = "capture"
-    session.message = f"已登记 {side_norm} · {condition_text}: {p.name}"
+    session.message = f"已登记 {target_label} · {condition_text}: {p.name}"
+    _save_marker_tcp_session(state)
+    return {"ok": True, "markerTcp": _marker_tcp_session_payload(state)}
+
+
+def _run_marker_tcp_solve(
+    state: GatewayState,
+    *,
+    box_id: str = "",
+    cad_path: str = "",
+    socket_beyond_tcp_mm: str = "0",
+    background: bool = True,
+) -> dict[str, Any]:
+    """Validate the request, then run the solve chain off the request thread.
+
+    Everything that can be checked cheaply -- the BOX, its cube in the bundle,
+    the saved samples, the socket offset, the rotation provenance -- is checked
+    here so a bad request still gets a real error response. The four subprocess
+    steps that follow take minutes (detection alone decodes every frame of every
+    camera), which no browser or proxy will hold a POST open for, so they run in
+    a worker and the panel follows ``stage``/``message`` through the snapshot it
+    already polls. ``background=False`` runs them inline, for tests.
+    """
+    session = state.marker_tcp_session
+    if not session.active:
+        return {"ok": False, "error": "没有进行中的 marker→TCP 采集会话"}
+    if session.pendingSampleId:
+        return {"ok": False, "error": "还有样本正在录制，请先保存或丢弃当前段"}
+    if session.stage == "solving":
+        return {"ok": False, "error": "已有解算在进行中，请等它结束"}
+    try:
+        box_id_norm, target_label = _marker_tcp_target_label(box_id=box_id)
+        cube_name, existing_entry, existing_bundle_path = _marker_tcp_cube_for_box_id(state, box_id_norm)
+        samples = _marker_tcp_saved_samples(session, box_id_norm)
+        if not samples:
+            return {"ok": False, "error": f"{target_label} 没有 saved 样本，先录制并保存至少 1 段 pivot 数据"}
+        try:
+            socket_mm = float(str(socket_beyond_tcp_mm or "0").strip())
+        except ValueError as exc:
+            raise ValueError("球心到 TCP 偏置必须是数字，单位 mm；球心与 TCP 重合时填 0") from exc
+        if not math.isfinite(socket_mm):
+            raise ValueError("球心到 TCP 偏置必须是有限数字")
+
+        truth_path = None
+        if str(cad_path or "").strip():
+            truth_path = _resolve_user_path(state, cad_path)
+            if not truth_path.is_file():
+                raise FileNotFoundError(f"CAD/真值 JSON not found: {truth_path}")
+        rotation, rotation_source, truth_note = _select_marker_tcp_rotation(
+            state,
+            truth_path=truth_path,
+            cube_name=cube_name,
+            box_id=box_id_norm,
+            existing_entry=existing_entry,
+            existing_bundle_path=existing_bundle_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        session.stage = "failed"
+        session.message = str(exc)
+        _save_marker_tcp_session(state)
+        return {"ok": False, "error": str(exc), "markerTcp": _marker_tcp_session_payload(state)}
+
+    plan = {
+        "box_id_norm": box_id_norm,
+        "target_label": target_label,
+        "cube_name": cube_name,
+        "existing_bundle_path": existing_bundle_path,
+        "samples": samples,
+        "socket_mm": socket_mm,
+        "truth_path": truth_path,
+        "rotation": rotation,
+        "rotation_source": rotation_source,
+        "truth_note": truth_note,
+    }
+    if not background:
+        return _marker_tcp_solve_worker(state, plan)
+
+    session.stage = "solving"
+    session.message = f"{target_label}：解算已开始，正在准备数据集子集…"
+    _save_marker_tcp_session(state)
+    Thread(
+        target=_marker_tcp_solve_worker,
+        args=(state, plan),
+        daemon=True,
+        name=f"marker-tcp-solve-{_marker_tcp_slug(box_id_norm)}",
+    ).start()
+    return {"ok": True, "markerTcp": _marker_tcp_session_payload(state)}
+
+
+def _marker_tcp_solve_worker(state: GatewayState, plan: dict[str, Any]) -> dict[str, Any]:
+    session = state.marker_tcp_session
+    box_id_norm = plan["box_id_norm"]
+    target_label = plan["target_label"]
+    cube_name = plan["cube_name"]
+    existing_bundle_path = plan["existing_bundle_path"]
+    samples = plan["samples"]
+    socket_mm = plan["socket_mm"]
+    truth_path = plan["truth_path"]
+    rotation = plan["rotation"]
+    rotation_source = plan["rotation_source"]
+    truth_note = plan["truth_note"]
+    try:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        solve_dir = Path(session.sessionRoot) / f"solve_{_marker_tcp_slug(box_id_norm)}_{timestamp}"
+        solve_dir.mkdir(parents=True, exist_ok=True)
+        log_path = solve_dir / "solve.log"
+        python_bin = _marker_tcp_python(state)
+        tracking_config_path = state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG
+        subset_root, episode_map = _marker_tcp_subset_dataset(state, solve_dir=solve_dir, samples=samples)
+        episodes = [int(entry["subsetEpisodeIndex"]) for entry in episode_map]
+        cameras = _marker_tcp_tracking_cameras(state, subset_root, episodes)
+
+        # 1. Resolve the layout. The cube geometry did not change when the rig
+        #    moved, so the corner table comes from the production cube template
+        #    rather than being re-estimated; only its placement can come from CAD.
+        layout_path = solve_dir / DEFAULT_MARKER_LAYOUT_NAME
+        _run_marker_tcp_command(
+            state,
+            _marker_tcp_layout_command(
+                state,
+                python_bin=python_bin,
+                cube_name=cube_name,
+                out_path=layout_path,
+                cad_path=truth_path if _cad_declares_rig_placement(truth_path, cube_name) else None,
+            ),
+            label=f"解算 {target_label}: resolve marker layout",
+            log_path=log_path,
+        )
+        if not layout_path.is_file():
+            raise FileNotFoundError(f"resolved marker layout was not written: {layout_path}")
+        rotation, rig_frame_composed = _compose_rig_rotation(rotation, layout_path)
+        if rig_frame_composed:
+            rotation_source = (
+                f"{rotation_source}; composed into the CAD rig frame as R_rig_tcp = R_rig_cube @ R_cube_tcp "
+                f"using T_rig_cube from {layout_path}"
+            )
+
+        # 2. Detect once, cache the corners, then track. Splitting these is what
+        #    lets a re-solve skip the expensive half.
+        detections_path = solve_dir / "detections.npz"
+        _run_marker_tcp_command(
+            state,
+            [
+                str(python_bin),
+                "-m",
+                "metrology.cli.detect_rig_markers",
+                "--dataset-root",
+                str(subset_root),
+                "--episodes",
+                *[str(episode) for episode in episodes],
+                "--cameras",
+                *cameras,
+                "--dictionary",
+                _marker_tcp_aruco_dictionary(state),
+                "--out",
+                str(detections_path),
+            ],
+            label=f"解算 {target_label}: detect markers ({len(cameras)} cameras x {len(episodes)} episodes)",
+            log_path=log_path,
+        )
+        if not detections_path.is_file():
+            raise FileNotFoundError(f"marker detections were not written: {detections_path}")
+
+        # 3. Corner-level BA over every camera at once. Writes the same two CSVs
+        #    the production cube tracker writes, so the pivot tool below runs on
+        #    a distributed rig and on this relocated cube unchanged.
+        tracking_run_dir = solve_dir / "tracking_run"
+        _run_marker_tcp_command(
+            state,
+            [
+                str(python_bin),
+                "-m",
+                "metrology.cli.track_marker_rig_in_base",
+                "--detections",
+                str(detections_path),
+                "--layout-json",
+                str(layout_path),
+                "--config",
+                str(tracking_config_path),
+                "--rig-name",
+                cube_name,
+                "--out-dir",
+                str(tracking_run_dir),
+            ],
+            label=f"解算 {target_label}: track marker rig in robot base",
+            log_path=log_path,
+        )
+        if not tracking_run_dir.is_dir():
+            raise FileNotFoundError(f"tracking run was not written: {tracking_run_dir}")
+
+        bundle_path = solve_dir / "marker_to_tcp_calibration.json"
+        if existing_bundle_path is not None and existing_bundle_path.is_file():
+            shutil.copy2(existing_bundle_path, bundle_path)
+        pivot_report_path = solve_dir / "pivot_report.json"
+        calibration_id = f"pivot_{timestamp}_{box_id_norm}"
+        pivot_command = [
+            str(python_bin),
+            "-m",
+            "metrology.cli.pivot_marker_tcp_calibration",
+            str(tracking_run_dir),
+            "--cube",
+            cube_name,
+            "--fps",
+            str(float(state.config.get("dataset", {}).get("fps") or 60.0)),
+            "--out",
+            str(pivot_report_path),
+            "--emit-marker-to-tcp",
+            str(bundle_path),
+            "--calibration-id",
+            calibration_id,
+            "--device-id",
+            box_id_norm,
+            "--socket-beyond-tcp-mm",
+            f"{socket_mm:.9g}",
+            "--rotation-cube-tcp",
+            _rotation_arg(rotation),
+            "--rotation-source",
+            rotation_source,
+        ]
+        _run_marker_tcp_command(
+            state,
+            pivot_command,
+            label=f"解算 {target_label}: pivot fit + write production bundle",
+            log_path=log_path,
+        )
+        if not bundle_path.is_file():
+            raise FileNotFoundError(f"marker→TCP bundle was not written: {bundle_path}")
+        pivot_report = json.loads(pivot_report_path.read_text(encoding="utf-8")) if pivot_report_path.is_file() else {}
+        summary_path = solve_dir / "solve_summary.json"
+        solve_summary = {
+            "schema": "marker_tcp_gui_solve/v1",
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "boxId": box_id_norm,
+            "cubeName": cube_name,
+            "targetLabel": target_label,
+            "datasetRoot": episode_map[0]["sourceDatasetRoot"],
+            "episodes": episode_map,
+            "subsetDatasetRoot": str(subset_root),
+            "trackingConfigPath": str(tracking_config_path),
+            "trackingRunPath": str(tracking_run_dir),
+            "markerLayoutPath": str(layout_path),
+            "rigFrameIsCubeFrame": not rig_frame_composed,
+            "detectionsPath": str(detections_path),
+            "cameras": cameras,
+            "solverPython": str(python_bin),
+            "pivotReportPath": str(pivot_report_path),
+            "productionBundlePath": str(bundle_path),
+            "cadTruthPath": "" if truth_path is None else str(truth_path),
+            "cadTruthNote": truth_note,
+            "socketBeyondTcpMm": socket_mm,
+            "rotationSource": rotation_source,
+            "socketMovedBetweenEpisodes": bool(pivot_report.get("socket_moved_between_episodes", False)),
+            "primaryFit": pivot_report.get("primary_fit", ""),
+            "pivotP95Mm": (pivot_report.get("fit") or {}).get("residual_mm", {}).get("p95") if isinstance(pivot_report, dict) else None,
+            "logPath": str(log_path),
+        }
+        _write_marker_tcp_json(summary_path, solve_summary)
+
+        session.solvePath = str(bundle_path)
+        session.solveSummaryPath = str(summary_path)
+        session.pivotReportPath = str(pivot_report_path)
+        session.trackingRunPath = str(tracking_run_dir)
+        # Back to "capture", not "done": solving one BOX does not close the
+        # session, and "done" would lock out recording the next sample or the
+        # second BOX. The result lives in solvePath and the message.
+        session.stage = "capture"
+        p95 = solve_summary.get("pivotP95Mm")
+        warning = "；注意 socket 在 episode 间移动" if solve_summary["socketMovedBetweenEpisodes"] else ""
+        session.message = (
+            f"marker→TCP 解算完成：{target_label} -> {bundle_path}"
+            + (f"，pivot p95={float(p95):.2f} mm" if isinstance(p95, (int, float)) else "")
+            + warning
+        )
+        state.log("info", f"Marker→TCP solve written: {bundle_path}")
+    except Exception as exc:  # noqa: BLE001
+        session.stage = "failed"
+        session.message = str(exc)
+        _save_marker_tcp_session(state)
+        return {"ok": False, "error": str(exc), "markerTcp": _marker_tcp_session_payload(state)}
     _save_marker_tcp_session(state)
     return {"ok": True, "markerTcp": _marker_tcp_session_payload(state)}
 
@@ -5699,13 +6537,20 @@ def _next_processing_version(versions: dict[str, Any]) -> str:
     return f"v{index}"
 
 
-def _ee_trajectory_command(state: GatewayState, dataset_root: Path) -> list[str]:
+def _ee_trajectory_command(
+    state: GatewayState,
+    dataset_root: Path,
+    *,
+    marker_to_tcp_calibration_path: Path | None = None,
+) -> list[str]:
     runner_path = state.repo_root / DEFAULT_EE_TRAJECTORY_RUNNER
     config_path = state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG
     if not runner_path.is_file():
         raise FileNotFoundError(f"EE trajectory runner not found: {runner_path}")
     if not config_path.is_file():
         raise FileNotFoundError(f"EE trajectory config not found: {config_path}")
+    if marker_to_tcp_calibration_path is not None:
+        config_path = _write_ee_trajectory_override_config(state, dataset_root, marker_to_tcp_calibration_path)
     return [
         "bash",
         str(runner_path),
@@ -5726,6 +6571,7 @@ def _update_traj_gen_meta(
     log_tail: list[str] | None = None,
     version: str | None = None,
     exit_code: int | None = None,
+    marker_to_tcp_calibration_path: str | Path | None = None,
 ) -> None:
     existing = _load_processing_meta(dataset_root) or {}
     current_job = existing.get("current_job") if isinstance(existing.get("current_job"), dict) else {}
@@ -5743,6 +6589,15 @@ def _update_traj_gen_meta(
         job["command"] = command
     elif isinstance(current_job, dict) and isinstance(current_job.get("command"), list):
         job["command"] = current_job["command"]
+    marker_path_text = (
+        str(marker_to_tcp_calibration_path)
+        if marker_to_tcp_calibration_path is not None
+        else str(current_job.get("marker_to_tcp_calibration_path", "") or "")
+        if isinstance(current_job, dict)
+        else ""
+    )
+    if marker_path_text:
+        job["marker_to_tcp_calibration_path"] = marker_path_text
     if exit_code is not None:
         job["exit_code"] = exit_code
     if status == "running" and not job.get("started_at"):
@@ -5759,6 +6614,7 @@ def _update_traj_gen_meta(
             "dataset_root": str(dataset_root),
             "sidecar_dir": str(dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME),
             "command": job.get("command") or command or [],
+            "marker_to_tcp_calibration_path": marker_path_text,
             "qc": versions.get(version, {}).get("qc") if isinstance(versions.get(version), dict) else None,
         }
         updated["active_version"] = version
@@ -5841,7 +6697,12 @@ def _read_traj_gen_output(
             state.log("warn", f"{message}: {dataset_root}")
 
 
-def _queue_traj_gen(state: GatewayState, dataset_root: Path) -> None:
+def _queue_traj_gen(
+    state: GatewayState,
+    dataset_root: Path,
+    *,
+    marker_to_tcp_calibration_path: Path | None = None,
+) -> None:
     key = str(dataset_root)
     with state.lock:
         running = state.processing_processes.get(key)
@@ -5857,14 +6718,23 @@ def _queue_traj_gen(state: GatewayState, dataset_root: Path) -> None:
     job_id = f"traj-gen-{int(time.time())}"
     command: list[str] = []
     try:
-        command = _ee_trajectory_command(state, dataset_root)
+        command = _ee_trajectory_command(
+            state,
+            dataset_root,
+            marker_to_tcp_calibration_path=marker_to_tcp_calibration_path,
+        )
+        marker_path_text = "" if marker_to_tcp_calibration_path is None else str(marker_to_tcp_calibration_path)
         _update_traj_gen_meta(
             dataset_root,
             job_id=job_id,
             status="running",
             command=command,
-            message=f"Running AprilTag cube tracking for {dataset_root.name}",
+            message=(
+                f"Running AprilTag cube tracking for {dataset_root.name}"
+                + (f" with marker→TCP bundle {marker_path_text}" if marker_path_text else "")
+            ),
             log_tail=[f"[traj-gen] {' '.join(command)}"],
+            marker_to_tcp_calibration_path=marker_path_text or None,
         )
         _refresh_cached_processing_item(state, dataset_root)
         process = subprocess.Popen(
@@ -5886,6 +6756,7 @@ def _queue_traj_gen(state: GatewayState, dataset_root: Path) -> None:
             command=command,
             message=f"Failed to start EE trajectory generation: {exc}",
             log_tail=[f"[traj-gen] failed to start: {exc}"],
+            marker_to_tcp_calibration_path=marker_to_tcp_calibration_path,
         )
         _refresh_cached_processing_item(state, dataset_root)
         raise
@@ -11261,13 +12132,18 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         if path == "/api/processing/traj-gen":
             state = self.server.state
             requested = (query.get("path", [""])[0] or "").strip()
+            marker_tcp_raw = (
+                query.get("marker_to_tcp_calibration_path", query.get("markerTcpCalibrationPath", [""]))[0]
+                or ""
+            ).strip()
             try:
                 with state.lock:
                     dataset_root = _resolve_known_dataset(state, requested)
                 if dataset_root is None:
                     _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
                     return
-                _queue_traj_gen(state, dataset_root)
+                marker_tcp_path = _resolve_marker_tcp_calibration_file(state, marker_tcp_raw)
+                _queue_traj_gen(state, dataset_root, marker_to_tcp_calibration_path=marker_tcp_path)
                 with state.lock:
                     response = _snapshot(state)
                 _json_response(self, HTTPStatus.OK, response)
@@ -11410,6 +12286,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         self.server.state,
                         (query.get("action", ["start"])[0] or "start").strip(),
                         side=(query.get("side", [""])[0] or "").strip(),
+                        box_id=(query.get("box_id", query.get("boxId", [""]))[0] or "").strip(),
                         condition=(query.get("condition", [""])[0] or "").strip(),
                     )
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
@@ -11420,7 +12297,21 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         self.server.state,
                         path_arg=(query.get("path", [""])[0] or "").strip(),
                         side=(query.get("side", [""])[0] or "").strip(),
+                        box_id=(query.get("box_id", query.get("boxId", [""]))[0] or "").strip(),
                         condition=(query.get("condition", [""])[0] or "").strip(),
+                    )
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/marker-tcp/solve":
+                    result = _run_marker_tcp_solve(
+                        self.server.state,
+                        box_id=(query.get("box_id", query.get("boxId", [""]))[0] or "").strip(),
+                        cad_path=(query.get("cad_path", query.get("cadPath", [""]))[0] or "").strip(),
+                        socket_beyond_tcp_mm=(
+                            query.get("socket_beyond_tcp_mm", query.get("socketBeyondTcpMm", ["0"]))[0]
+                            or "0"
+                        ).strip(),
                     )
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)

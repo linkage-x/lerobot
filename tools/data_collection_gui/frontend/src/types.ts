@@ -123,6 +123,7 @@ export type RecordingStatus = {
 export type MarkerTcpSample = {
   id: string;
   side: "left" | "right" | string;
+  boxId?: string;
   condition: string;
   source: "recording" | "static_transform" | string;
   status: "pending" | "recording" | "saved" | "discarded" | "registered" | string;
@@ -142,6 +143,10 @@ export type MarkerTcpSession = {
   pendingSampleId: string;
   message: string;
   reportPath: string;
+  solvePath?: string;
+  solveSummaryPath?: string;
+  pivotReportPath?: string;
+  trackingRunPath?: string;
 };
 
 export type RecordingBackend = "real" | "sim";
@@ -583,6 +588,7 @@ export type ProcessingItem = {
   totalFrames: number;
   validFramesPct: number | null;
   logTail: string[];
+  markerTcpCalibrationPath?: string;
   onlineSync?: OnlineSyncSummary | null;
   qcChecks?: Array<{
     name: string;

@@ -119,7 +119,7 @@ export function DatasetProcessingPage({
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
-  onGenerate: (path: string) => void;
+  onGenerate: (path: string, markerTcpCalibrationPath?: string) => void;
   onRunQc: (path: string) => void;
   onOpenReplay: (path: string) => void;
   onSetDatasetsRoot: (path: string) => void;
@@ -132,10 +132,19 @@ export function DatasetProcessingPage({
   const readyCount = items.filter((item) => item.status === "qc_pass").length;
   const currentRoot = snapshot.gateway.datasetsRoot ?? "";
   const [rootInput, setRootInput] = useState<string>(currentRoot);
+  const latestMarkerTcpPath = snapshot.markerTcp?.solvePath ?? "";
+  const [markerTcpPathInput, setMarkerTcpPathInput] = useState<string>(latestMarkerTcpPath);
+  const lastAutoMarkerTcpPath = useRef<string>("");
   useEffect(() => {
     setRootInput(currentRoot);
   }, [currentRoot]);
+  useEffect(() => {
+    if (!latestMarkerTcpPath || markerTcpPathInput !== lastAutoMarkerTcpPath.current) return;
+    lastAutoMarkerTcpPath.current = latestMarkerTcpPath;
+    setMarkerTcpPathInput(latestMarkerTcpPath);
+  }, [latestMarkerTcpPath, markerTcpPathInput]);
   const rootDirty = rootInput.trim() !== currentRoot;
+  const markerTcpPath = markerTcpPathInput.trim();
 
   return (
     <div className="page-stack">
@@ -167,6 +176,37 @@ export function DatasetProcessingPage({
           </button>
         </div>
         <p className="panel-note">Absolute or relative to the gateway repo root. Default: outputs/datasets.</p>
+      </section>
+      <section className="panel">
+        <div className="panel-heading">
+          <h2>EE Trajectory Options</h2>
+          <span>marker→TCP</span>
+        </div>
+        <div className="datasets-root-row trajectory-option-row">
+          <input
+            className="datasets-root-input"
+            value={markerTcpPathInput}
+            onChange={(event) => setMarkerTcpPathInput(event.target.value)}
+            placeholder="可选：outputs/.../marker_to_tcp_calibration.json"
+            spellCheck={false}
+          />
+          <button
+            disabled={busy || !latestMarkerTcpPath}
+            onClick={() => {
+              lastAutoMarkerTcpPath.current = latestMarkerTcpPath;
+              setMarkerTcpPathInput(latestMarkerTcpPath);
+            }}
+          >
+            Latest Solve
+          </button>
+          <button
+            disabled={busy || !markerTcpPathInput.trim()}
+            onClick={() => setMarkerTcpPathInput("")}
+          >
+            Clear
+          </button>
+        </div>
+        <p className="panel-note">{markerTcpPath ? `Generate 将使用 ${markerTcpPath}` : "留空时使用 tracker YAML 中的默认 production marker→TCP bundle。"}</p>
       </section>
       <section className="panel">
         <div className="panel-heading">
@@ -211,7 +251,7 @@ export function DatasetProcessingPage({
                   active={item.path === selected?.path}
                   busy={busy}
                   onSelect={() => setSelectedPath(item.path)}
-                  onGenerate={() => onGenerate(item.path)}
+                  onGenerate={() => onGenerate(item.path, markerTcpPath)}
                   onRunQc={() => onRunQc(item.path)}
                   onOpenReplay={() => onOpenReplay(item.path)}
                 />
@@ -233,11 +273,12 @@ export function DatasetProcessingPage({
               <Metric label="Frames" value={selected.totalFrames} />
               <Metric label="Trajectory" value={selected.trajectoryVersion ?? "—"} />
               <Metric label="Valid frames" value={selected.validFramesPct != null ? `${selected.validFramesPct}%` : "—"} />
+              <Metric label="Marker→TCP" value={selected.markerTcpCalibrationPath || "default"} />
             </div>
             <div className="control-row">
               <button
                 disabled={busy || selected.status === "running" || selected.status === "queued"}
-                onClick={() => onGenerate(selected.path)}
+                onClick={() => onGenerate(selected.path, markerTcpPath)}
               >
                 {selected.trajectoryVersion ? "Regenerate Trajectory" : "Generate EE Trajectory"}
               </button>

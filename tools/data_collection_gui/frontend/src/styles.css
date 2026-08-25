@@ -3344,6 +3344,18 @@ button.danger {
 .cali-box-panel > .cali-op-grid { margin: 0; }
 
 .marker-tcp-panel { border-left: 3px solid #2563eb; }
+.marker-tcp-guide {
+  margin-top: 12px;
+}
+.marker-tcp-guide ol {
+  margin: 8px 0 0;
+  padding-left: 20px;
+}
+.marker-tcp-guide li {
+  color: #43525e;
+  line-height: 1.5;
+  margin: 4px 0;
+}
 .marker-tcp-controls {
   align-items: flex-end;
   display: grid;
@@ -3372,11 +3384,42 @@ button.danger {
   border-color: #0f766e;
   outline: 2px solid rgba(15, 118, 110, 0.16);
 }
+.marker-tcp-solve { grid-template-columns: minmax(260px, 1fr) 150px; }
+.marker-tcp-solve-notes { margin-top: 8px; }
+.marker-tcp-solve-notes .panel-note { margin: 4px 0; }
+.marker-tcp-label-row {
+  align-items: baseline;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+.marker-tcp-help-btn {
+  background: none;
+  border: none;
+  color: #2563eb;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+  text-decoration: underline;
+}
+.marker-tcp-help-btn:hover { color: #1d4ed8; }
+.marker-tcp-example {
+  background: #0f172a;
+  border-radius: 6px;
+  color: #e2e8f0;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 10px 0 0;
+  max-height: 340px;
+  overflow: auto;
+  padding: 12px 14px;
+}
 .marker-tcp-register { grid-template-columns: minmax(240px, 1fr) auto auto; }
 .marker-tcp-table { margin-top: 12px; }
 .marker-tcp-table .check-row { grid-template-columns: 220px minmax(0, 1fr) 110px; }
 @media (max-width: 760px) {
   .marker-tcp-controls,
+  .marker-tcp-solve,
   .marker-tcp-register,
   .marker-tcp-table .check-row { grid-template-columns: 1fr; }
   .marker-tcp-table .check-row em { text-align: left; }

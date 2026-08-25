@@ -570,8 +570,12 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async queueTrajGen(path: string): Promise<GuiSnapshot> {
-    const remote = await this.postRemoteSnapshot(`/api/processing/traj-gen?path=${encodeURIComponent(path)}`);
+  async queueTrajGen(path: string, markerTcpCalibrationPath = ""): Promise<GuiSnapshot> {
+    const params = new URLSearchParams({ path });
+    if (markerTcpCalibrationPath.trim()) {
+      params.set("marker_to_tcp_calibration_path", markerTcpCalibrationPath.trim());
+    }
+    const remote = await this.postRemoteSnapshot(`/api/processing/traj-gen?${params.toString()}`);
     if (remote) {
       return remote;
     }
@@ -804,20 +808,33 @@ export class DataCollectionGuiApi {
 
   async markerTcpRecordSample(
     action: "start" | "save" | "discard",
-    side: "left" | "right",
+    boxId: string,
     condition: string
   ): Promise<{ ok: boolean; error?: string }> {
-    const params = new URLSearchParams({ action, side, condition });
+    const params = new URLSearchParams({ action, box_id: boxId, condition });
     return this.calibrationSessionPost(`/api/calibration/marker-tcp/record?${params.toString()}`);
   }
 
   async registerMarkerTcpStaticTransform(
     path: string,
-    side: "left" | "right",
+    boxId: string,
     condition: string
   ): Promise<{ ok: boolean; error?: string }> {
-    const params = new URLSearchParams({ path, side, condition });
+    const params = new URLSearchParams({ path, box_id: boxId, condition });
     return this.calibrationSessionPost(`/api/calibration/marker-tcp/register?${params.toString()}`);
+  }
+
+  async solveMarkerTcpTransform(
+    boxId: string,
+    cadPath: string,
+    socketBeyondTcpMm: string
+  ): Promise<{ ok: boolean; error?: string }> {
+    const params = new URLSearchParams({
+      box_id: boxId,
+      cad_path: cadPath,
+      socket_beyond_tcp_mm: socketBeyondTcpMm
+    });
+    return this.calibrationSessionPost(`/api/calibration/marker-tcp/solve?${params.toString()}`);
   }
 
   async runMarkerTcpReport(): Promise<{ ok: boolean; error?: string }> {

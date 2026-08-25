@@ -236,3 +236,30 @@ export function deviceBoxId(device: DeviceStatus): string {
 export function boxDisplayName(boxId: string): string {
   return boxId || "BOX";
 }
+
+/**
+ * The physical identity of the box carried on a device row.
+ *
+ * `deviceBoxId` is a *namespace*, and on a single-box rig it is deliberately
+ * empty (box_client.py keeps `box_id=""` for a lone discovered device so sensor
+ * IDs stay bare and datasets stay compatible). That empty string is the right
+ * value to send to the recorder — there it means "the one box" — but it cannot
+ * name a box in an artifact that outlives the session, such as the marker→TCP
+ * bundle whose cubes are keyed `box1672693301`.
+ *
+ * So fall back through what discovery actually reports: the serial when the
+ * firmware was personalized, otherwise `box<device_id>`, which is the form the
+ * production bundle already uses. Do NOT substitute this for `deviceBoxId` in
+ * recorder commands: an empty box_id there selects the single box, while a
+ * concrete one selects by namespace and would match nothing.
+ */
+export function deviceBoxIdentity(device: DeviceStatus): string {
+  const cfg = device.config ?? {};
+  const namespaced = deviceBoxId(device);
+  if (namespaced) return namespaced;
+  const sn = String((cfg.sn as string | undefined) ?? "").trim();
+  if (sn) return sn;
+  const deviceId = cfg.device_id;
+  if (deviceId != null && String(deviceId).trim()) return `box${String(deviceId).trim()}`;
+  return "";
+}
