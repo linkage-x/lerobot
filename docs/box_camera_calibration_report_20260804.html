@@ -76,7 +76,7 @@
 <section class="hero">
 <h1>BOX 8 路相机标定实验报告</h1>
 <p>2026-08-04 · 从厂商内参切换到自标定 + 脱离机器人的多相机 BA</p>
-<p style="margin-top:14px">← 返回 <a href="box_umi_trajectory_gt_roadmap.html">BOX 高精度 UMI Trajectory GT Roadmap</a>（本报告对应 Phase 2）</p>
+<p style="margin-top:14px">← 返回 <a href="box_umi_trajectory_gt_replay_roadmap.html">BOX 高精度 UMI Trajectory GT Roadmap</a>（本报告对应 Phase 2）</p>
 <div class="meta">
 <span class="pill">3 次采集 · 18 episodes</span>
 <span class="pill">7 路参与标定 · cam_00 遮挡</span>
@@ -420,7 +420,7 @@
 在一段已录制的 teaching bundle 上做三臂 A/B（同一批像素，只换标定）：相机间一致性 0720 厂商 23.5 mm、0804 rational 26.7 mm、0804 fisheye 26.6 mm。
 本报告的所有结论（自标好 3–6 倍、fisheye 全画幅单调、3D 一致性 p95 0.244 mm）都没有被推翻——
 <b>它们是对的，只是修的不是当前的瓶颈</b>。瓶颈是 <span class="mono">marker_size_cm</span>：5.8 改 5.6 让相机间一致性从 26.6 降到 4.1 mm。
-详见 <a href="box_umi_trajectory_gt_roadmap.html">roadmap</a> 的「2026-08-05 实测」一节。
+详见 <a href="box_umi_trajectory_gt_replay_roadmap.html">roadmap</a> 的「2026-08-05 实测」一节。
 <br/>
 对本报告的方法论提醒：<b>§6.2 的 3D 一致性衡量的是「相机之间对棋盘角点是否自洽」，它对标定质量敏感，但对下游 marker 模型的错误完全免疫。</b>
 一个 p95 0.244 mm 的 rig 与一条 26 mm 的跟踪链路并不矛盾——两者量的不是同一件事。
@@ -428,7 +428,7 @@
 </section>
 
 <p class="small" style="margin-top:24px">
-  2026-08-04 · 对应 <a href="box_umi_trajectory_gt_roadmap.html">roadmap</a> Phase 2（Metric Rig 标定）。
+  2026-08-04 · 对应 <a href="box_umi_trajectory_gt_replay_roadmap.html">roadmap</a> Phase 2（Metric Rig 标定）。
 </p>
 </div>
 </body>

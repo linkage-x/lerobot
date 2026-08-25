@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>BOX Metrology 代码现状快照 · opencv_kalibr @ 34561ab</title>
+<style>
+  :root{
+    --bg:#f6f7f9;
+    --card:#ffffff;
+    --text:#1f2937;
+    --muted:#6b7280;
+    --line:#e5e7eb;
+    --accent:#2563eb;
+    --accent-soft:#eff6ff;
+    --ok:#15803d;
+    --ok-bg:#ecfdf5;
+    --warn:#b45309;
+    --warn-bg:#fffbeb;
+    --p0:#991b1b;
+    --p0-bg:#fef2f2;
+    --shadow:0 8px 24px rgba(15,23,42,.06);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    font-family:Inter, "PingFang SC","Microsoft YaHei",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    line-height:1.65;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:36px 22px 72px}
+  .hero{
+    background:linear-gradient(135deg,#111827,#1f2937);
+    color:#fff;
+    border-radius:22px;
+    padding:34px 36px;
+    box-shadow:var(--shadow);
+    margin-bottom:24px;
+  }
+  .hero h1{margin:0 0 10px;font-size:30px;letter-spacing:.2px}
+  .hero p{margin:6px 0;color:#d1d5db}
+  .hero .meta{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}
+  .pill{
+    display:inline-flex;align-items:center;gap:7px;
+    padding:6px 11px;border-radius:999px;font-size:13px;font-weight:600;
+    border:1px solid rgba(255,255,255,.18);color:#e5e7eb
+  }
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+  .card{
+    background:var(--card);border:1px solid var(--line);border-radius:18px;
+    padding:22px;box-shadow:var(--shadow)
+  }
+  .card h2,.card h3{margin-top:0}
+  .section-title{
+    display:flex;align-items:center;justify-content:space-between;gap:12px;
+    margin-bottom:14px
+  }
+  .section-title h2{margin:0;font-size:22px}
+  .badge{
+    display:inline-block;padding:4px 9px;border-radius:999px;font-size:12px;font-weight:700
+  }
+  .done{color:var(--ok);background:var(--ok-bg)}
+  .todo{color:var(--accent);background:var(--accent-soft)}
+  .warn{color:var(--warn);background:var(--warn-bg)}
+  .p0{color:var(--p0);background:var(--p0-bg)}
+  .blocked{color:#6b7280;background:#f3f4f6;border:1px solid #d1d5db}
+  .now{color:#166534;background:#dcfce7}
+  tr.is-blocked td{background:#fafafa;color:#6b7280}
+  .table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .phase{margin-top:18px}
+  .phase-head{
+    display:flex;align-items:flex-start;justify-content:space-between;gap:16px;
+    margin-bottom:10px
+  }
+  .phase h3{font-size:19px;margin:0}
+  .phase .goal{color:var(--muted);margin:4px 0 0}
+  .timeline{
+    display:grid;grid-template-columns:120px 1fr;gap:14px;
+    padding:10px 0;border-top:1px solid var(--line)
+  }
+  .timeline:first-child{border-top:none}
+  .week{font-weight:700;color:#111827}
+  details{
+    margin-top:12px;border:1px solid var(--line);border-radius:12px;
+    background:#fafafa;overflow:hidden
+  }
+  summary{
+    cursor:pointer;padding:12px 14px;font-weight:700;list-style:none;
+    user-select:none
+  }
+  summary::-webkit-details-marker{display:none}
+  summary:before{content:"▸";display:inline-block;margin-right:8px;transition:.18s}
+  details[open] summary:before{transform:rotate(90deg)}
+  .detail-body{padding:0 14px 14px}
+  .detail-body ul{margin:8px 0 0 20px}
+  .detail-body li{margin:4px 0}
+  .metric-table{width:100%;border-collapse:collapse;font-size:14px}
+  .metric-table th,.metric-table td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  .metric-table th{background:#f9fafb}
+  code,.mono{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+    background:#f3f4f6;border-radius:6px;padding:2px 5px;font-size:.92em
+  }
+  .flow{
+    white-space:pre-wrap;background:#0f172a;color:#e5e7eb;
+    padding:16px;border-radius:12px;overflow:auto;font-size:13px
+  }
+  .callout{
+    border-left:4px solid var(--accent);background:var(--accent-soft);
+    padding:14px 16px;border-radius:10px;margin:12px 0
+  }
+  .callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  .callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  .gate{
+    margin-top:12px;padding:13px 15px;border:1px dashed #9ca3af;border-radius:10px;
+    background:#fff
+  }
+  .small{font-size:13px;color:var(--muted)}
+  .priority-list{margin:0;padding-left:20px}
+  .priority-list li{margin:7px 0}
+  .full{grid-column:1/-1}
+  @media (max-width:820px){
+    .grid{grid-template-columns:1fr}
+    .timeline{grid-template-columns:1fr}
+    .hero{padding:26px 22px}
+    .full{grid-column:auto}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+<section class="hero">
+<h1>BOX Metrology 代码现状快照 · opencv_kalibr @ 34561ab</h1>
+<p>roadmap 各 Phase ↔ third_party/opencv_kalibr 实际代码的逐项对照：现状、已有实现、关键缺口，以及 metrology package 的工程约定。</p>
+<div class="meta"><span class="pill">roadmap ↔ 代码对照</span><span class="pill">Phase 0 → 14 逐项</span><span class="pill">@ 34561ab</span><span class="pill">会随代码推进过期</span></div>
+<p style="margin-top:16px;color:#9ca3af;font-size:13px">本页由 <a href="box_umi_trajectory_gt_replay_roadmap.html" style="color:#93c5fd">BOX 高精度 UMI Trajectory GT &amp; Dual-FR3 Replay Roadmap</a> 拆出，内容为<b>原文整段搬运，未作改写</b>；主 roadmap 只保留结论、数字与口径红线。 <b>本页会随代码推进过期</b>，以仓库实际状态为准。</p>
+</section>
+<div class="grid">
+<section class="card full" data-block="code-status">
+<div class="section-title">
+<h2>代码现状快照 · <span class="mono">third_party/opencv_kalibr @ 34561ab</span></h2>
+<span class="badge warn">roadmap ↔ 代码对照</span>
+</div>
+<p class="goal">当前生产链路（Thor GMSL2）：<span class="mono">marker 检测 → 全相机角点联合 corner BA（FIM → σ）→ calibrated_marker_to_tcp bundle → 离线 SE(3) batch smoother → sidecar v2</span>。<b>2026-08-19（<span class="mono">abacec0</span>）之后本节曾整体过期</b>：此前写的「每相机 PnP → pose 级平均 → 因果 EMA」已不再是生产路径，<b>2026-08-21 按 <span class="mono">34561ab</span> 重新核对配置后逐行更正</b>。逐相机 PnP 仍在跑，但只作为 <span class="mono">ba_vs_fusion</span> 对照列，不产出标签；<span class="mono">analysis_lowpass</span> 的 <span class="mono">enable</span> 仍是 <span class="mono">true</span>，但只写分析 CSV（v15.0 记的「默认改 false」与配置不符，以此处为准）。下表把 roadmap 每个 Phase 对到实际代码。</p>
+<table class="metric-table">
+<tr><th>Phase</th><th>现状</th><th>已有实现</th><th>关键缺口</th></tr>
+<tr>
+<td>0 Benchmark / TCP frame</td><td><span class="badge warn">metric 模块已建 · 部分接入</span></td>
+<td><span class="mono">metrology/metrics.py</span> 统一 APE/RPE（40/100/400 ms/1 s）和无参考判据；pivot 与 smoother 诊断已经复用 <span class="mono">summarize_errors</span> / timestamp-from-fps 工具。tracking 输出已明确区分 <span class="mono">cube_base</span>、<span class="mono">ee_est_raw_base</span>、<span class="mono">ee_est_base</span>，sidecar 按 cube 写 <span class="mono">state_action.&lt;cube&gt;.csv</span>。</td>
+<td>circle / teaching eval 旧脚本仍未全部改成同一个 metrics 入口；gripper 开度只在 GUI/replay 侧读已有 state，尚未成为 GT pose sidecar 的一等质量字段；统一 TCP spec 仍未冻结。（<b>「sidecar 只有 frame index、无真实时间戳」已于 2026-08-19 关闭</b>：v2 每帧带 <span class="mono">timestamp_s</span>，从 LeRobot parquet 的 <span class="mono">timestamp</span> 列读入，缺列直接失败。）</td>
+</tr>
+<tr>
+<td>1.1 相机硬同步</td><td><span class="badge done">采集/GUI 有 gate</span></td>
+<td><span class="mono">argus_online_sync</span> 在 encoder 前按 SOF TSC 做 full-cluster gate + manifest 保存门；GUI gateway 已解析 <span class="mono">online_sync_manifest.json</span>，把缺失/失败/帧数不一致暴露为 dataset check。</td>
+<td>tracking / BA CLI 入口仍不把 sync manifest 当硬前置条件，也不消费 <span class="mono">argus_frame_metadata</span> 的 sensor timestamp；离线 pose CSV 仍按 frame index 对齐。</td>
+</tr>
+<tr>
+<td>1.2 Camera↔IMU 时间标定</td><td><span class="badge warn">首次实测 · 未上线</span></td>
+<td>BOX 侧有 MCU→host 线性回归 + 最近邻挂帧（<span class="mono">ts_sync.md</span>）。<b>2026-08-25 新增</b> <span class="mono">metrology/time_offset.py</span> + <span class="mono">cli/estimate_camera_imu_time_offset.py</span>（25 单测）：<span class="mono">ω_vision↔ω_gyro</span> 互相关 + <span class="mono">Δt</span>/<span class="mono">R_rig_imu</span>/gyro bias 联合解，<span class="mono">Δt</span> = <b>+4.4 / +4.7 ms</b>（<span class="mono">box1672693301</span>，两个 session），<span class="mono">R_rig_imu</span> ≈ 90° yaw 且跨 session 复现到 ~1°</td>
+<td><b>Δt 没有被任何代码消费</b>——录制器仍不减它，已录数据都带着这个偏移；还欠一段专门的标定采集；touch 的最近邻查表（4.8 ms）仍是端到端的主导项</td>
+</tr>
+<tr>
+<td>2 内参</td><td><span class="badge done">已自标定 · 已上生产</span></td>
+<td><span class="mono">metrology/intrinsics.py</span> + <span class="mono">cli/calibrate_intrinsics.py</span>：ChArUco 自标，时间块 held-out、rational↔fisheye 对比、全画幅径向单调性检查。
+<b>0805：<span class="mono">cli/export_production_calibration.py</span> 导出为生产 run</b>，配置已切 <span class="mono">thor_gmsl2_selfcal_0804_fisheye_intrinsics</span></td>
+<td>画幅边缘无数据（见 2.6），外推区仍不可信；<span class="mono">cam_00</span> 视野被遮挡，检出 0 帧</td>
+</tr>
+<tr>
+<td>2 外参 / Rig</td><td><span class="badge done">已脱离机器人 · 已上生产</span></td>
+<td><span class="mono">metrology/extrinsics.py</span>：手持 ChArUco + gauge 固定单相机 + <b>corner 级重投影联合 BA</b>（scipy 稀疏 Jacobian + huber）。机器人完全不参与。
+<b>0805 补 <span class="mono">cli/calibrate_extrinsics.py</span></b>（此前只有函数、无可复现入口），并按 7 相机位姿刚体对齐到 0720 base 系导出生产 run</td>
+<td>base 系仍继承 0720：两套 rig 对齐残差 <b>7.9 mm RMS / 2.17°</b>（尺度差 +0.69%），这部分是 legacy world/base 对齐误差。<b>2.4 已改为 canonical world + stable-camera consensus，且 2026-08-19 已冻结 </b><span class="mono">world_20260819_031843</span>：生产导出已由 0720 base 继承切到冻结的 camera-rig world，该残差从每次重标继承的误差变为一次性的常量轴偏置（重导出与现行生产一致到 4.4e-16 m）。桌面锚板不再是必需的主修复路径。
+补拍后最终 BA 为 fisheye 0.2437 px（最差 cam_09 0.265），rational 0.2972（最差 cam_07 0.443）</td>
+</tr>
+<tr>
+<td>2.7 标定可复现性</td><td><span class="badge done">0805 补齐</span></td>
+<td><span class="mono">cli/detect_charuco.py</span>：mkv → 角点 npz，按能力选 <span class="mono">CharucoDetector</span>（≥4.7）或 <span class="mono">interpolateCornersCharuco</span>（≤4.6）</td>
+<td>此前检测与外参 BA 都靠临时脚本，报告引用的 0.2437 px <b>从未落盘</b>（目录里是补拍前的 0.3165）。
+现重跑复现：BA 0.2434 px、相机位姿差 ≤0.06 mm / 0.0034°</td>
+</tr>
+<tr>
+<td>2.2 / 2.3 Uncertainty map</td><td><span class="badge done">Level 1/2/3 离线完成</span></td>
+<td><span class="mono">metrology/</span> 包：<span class="mono">uncertainty.py</span>（信息矩阵 + <span class="mono">projectPoints</span> 数值差分 Jacobian，含 rational 畸变）、<span class="mono">cli/level1_uncertainty_map.py</span>、<span class="mono">calibration_io.py</span>（读标定并记 sha256）。新增 <span class="mono">marker_rig_ba.py</span> 与 <span class="mono">cli/run_marker_rig_ba.py</span>：用所有可见 marker corner 做跨相机 BA，输出 <span class="mono">sigma_tcp_max_mm</span>、FIM condition、per-camera-vs-BA consistency。</td>
+<td>Level 2/3 目前只在离线报告里使用，production sidecar 还没有 covariance / quality flag；TCP covariance 仍依赖当前 legacy cube layout 与已落库但未 fully validated 的 marker→TCP bundle。</td>
+</tr>
+<tr>
+<td>3 Marker cube 几何</td><td><span class="badge warn">已加 guard · 仍未 refinement</span></td>
+<td>生产配置固定 <span class="mono">marker_size_cm: 5.6</span>，并用 <span class="mono">check_thor_umi_cube_geometry()</span> 防止回退到 5.8；支持每 cube 的 <span class="mono">cube_size_cm_xyz</span>，代码常量 <span class="mono">THOR_UMI_MEASURED_CUBE_SIZE_CM_XYZ</span> 与测试覆盖 left/right 尺寸表。<span class="mono">cube_tracking.py</span> 已支持非等边 cube half-size。</td>
+<td>marker layout 仍是假设 tag 居中贴在解析 cube 面上，没有从实物 corner/Onshape 导出的 marker-rig geometry refinement；分布式低矮 rig 仍只停在设计/评估入口。</td>
+</tr>
+<tr>
+<td>3 marker→TCP</td><td><span class="badge warn">生产已改用标定 bundle · 未认证冻结</span></td>
+<td><span class="mono">april_cube_tracking_in_robot_base.py</span> 已拒绝旧 <span class="mono">corenetic_tcp_urdf</span> 链，并要求 <span class="mono">calibrated_marker_to_tcp</span>。<span class="mono">marker_to_tcp_calibration_20260812.json</span> 已落 left/right 的 <span class="mono">T_cube_tcp</span>、translation sigma、rotation sigma 与 open_items；生产 bundle、Thor 配置、sidecar 与 metadata 均以 <span class="mono">right</span> 命名。<span class="mono">estimate_ee_pose_from_cube</span> 已接收 <span class="mono">cube_name</span>，未知 key 直接失败。<span class="mono">pivot_marker_tcp_calibration.py</span>、<span class="mono">marker_tcp_repeatability.py</span>、<span class="mono">build_box_umi_urdf.py</span> 已存在。</td>
+<td>bundle <span class="mono">validated=false</span>；left holdout p95 约 3.74 mm、right 约 3.04 mm，且 180° wrist roll、拆装/重夹重复性仍未解决。multi-cube 已在 Thor 132514 的 3 条 episode production run 验证：左右 sidecar 各 1803 行；该结果证明工程分派与输出链路，不认证 TCP 绝对精度。</td>
+</tr>
+<tr>
+<td>4 Multi-view rigid solver</td><td><span class="badge done">corner BA 已进生产</span></td>
+<td><b>2026-08-19（<span class="mono">abacec0</span>）起生产走 corner BA</b>：<span class="mono">corner_ba.enable: true</span>、<span class="mono">min_cameras: 2</span>、<span class="mono">fallback_to_pose_fusion: false</span>，所有相机的角点进同一个最小二乘，信息矩阵即协方差并经杠杆臂传到 TCP；BA 解不出的帧置 unsolved + σ=inf，<b>不回落</b>成 pose 平均。逐相机 PnP（<span class="mono">best_rmse_single_marker</span>）仍在跑，但只写 <span class="mono">ba_vs_fusion_position_m</span> 对照列。</td>
+<td>剩余：detector 仍是 stock corner（<b>无 subpixel refine</b>——2026-08-18 实测 &lt;70° 开 SUBPIX 是 4–5 倍的免费收益，但必须配入射角门限）；<span class="mono">min_cameras_per_fusion_frame: 1</span> 只对已废弃的 pose-fusion 路径有效，配置里应清掉以免误读。</td>
+</tr>
+<tr>
+<td>5 轨迹优化</td><td><span class="badge done">offline smoother 已进生产</span></td>
+<td><span class="mono">offline_smoothing.enable: true</span>：写进数据集的 active sidecar 是 SE(3) batch smoother 的结果（<span class="mono">smoothing=offline_batch</span>），逐帧按 BA 报的 σ 加权、按 episode 分段。<span class="mono">analysis_lowpass</span> 的 <span class="mono">enable</span> <b>仍是 true 但只写分析 CSV</b>，不再进训练标签——<b>v15.0 记的「默认改 false」与配置不符</b>，回退开关是 <span class="mono">offline_smoothing.enable: false</span>。</td>
+<td>门的方向已反转：smoother 已是默认写入路径，contact A/B 从「上线闸门」变成「事后复核」，结论决定是否<b>回退</b>（判据 (B)/(C) 见误差预算表 smoothing 行）。<s><b>缺口是执行</b>：两条判据从未在真实 contact 数据上跑过，人工复核未做。</s><br/><b>2026-08-25 已执行完</b>，新增 <span class="mono">metrology/contact_lag.py</span>（互相关群延迟估计 + 差分/onset 工具）、<span class="mono">cli/contact_onset_lag.py</span>（判据 (C)，自带注入延迟的功率检验，默认相关速度而非位置）、<span class="mono">cli/render_contact_review_clips.py</span>（按 (A) 条款选帧，出视频 + raw/EMA/smoother 三轨 + |Δ| + 参与相机数/σ + 力/触觉的对照图）、<span class="mono">tests/test_contact_lag.py</span>（16 passed）。结论<b>不回滚</b>；<b>缺口换成了三条</b>：(B) 判据的形式与数值都要重定（剔掉相机切换帧后 p95 仍 1.347/1.180 mm，而 0.5 mm 是按 solver ≤0.8 mm 切的分配、solver 实际 ≈2 mm）；132514 触觉在多数「接触」帧被 255 顶死，收敛 (B) 需另录一段固定装夹数据；融合位姿在<b>相机集合变化</b>时被允许跳台阶（集合未变 p95 7.66 mm vs 变化 15.49 mm，<b>不是某一台相机的缺陷</b>）。<b>注意 per-frame σ 早已接通</b>：<span class="mono">build_offline_smoothed_rows()</span> 逐帧读 <span class="mono">sigma_pos_*_m</span> → <span class="mono">measurement_sigma_m</span>（有 wiring 测试），本页与 roadmap 里「传入 measurement_sigma_m」那条待办是过期的；σ 兜不住是因为它编码几何条件数而非相机子集间的系统性分歧。</td>
+</tr>
+<tr>
+<td>6 IMU / factor graph</td><td><span class="badge p0">缺</span></td>
+<td>—</td>
+<td>kalibr 内无任何 IMU 代码（现有 <span class="mono">accel</span> 命中全是机器人 OTG 参数）</td>
+</tr>
+<tr>
+<td>7 独立 GT / Replay GT</td><td><span class="badge warn">弱参考已有 · 独立链未闭环</span></td>
+<td>FR3 FK 参考的 circle / teaching 误差评测仍在；<span class="mono">verify_fr3_cube_pose_ik.py</span> 可做可达性验证。</td>
+<td>需接真正独立 6DoF reference；replay 推荐 dynamic laser/optical tracker + <span class="mono">T_target→TCP</span> + <span class="mono">T_Wcam←Wgt</span>。若 tracker 只给 XYZ，则 orientation GT 仍缺。</td>
+</tr>
+<tr>
+<td>8 Production QC</td><td><span class="badge warn">GT QC 成形 · executability 拆出</span></td>
+<td>已有跳变 / 缺帧 / 冻结 / FFT 高频检查、episode label、MuJoCo precheck；bimanual sidecar 已有 left/right 数据基础。</td>
+<td><b>per-frame covariance / BA success / camera-count / RMSE / 真实 timestamp 已随 sidecar v2 全部写入（2026-08-19）</b>；剩余是 native <span class="mono">T_LR</span> / bimanual RPE gate 未接入，以及<b>逐帧实际检出的 marker id 仍未落列</b>——生产 sidecar 写的是配置里的 <span class="mono">spec.marker_ids</span>，不是本帧真检到的那几个，因此下游无法复算 marker 基线（见误差预算表 marker→TCP 行）。</td>
+</tr>
+<tr>
+<td>9 Dual-FR3 registration</td><td><span class="badge p0">新增</span></td>
+<td>现有 world/base、FR3 FK 与 replay GUI 可作为基础。</td>
+<td>缺 session 级 <span class="mono">T_WB_L/R</span>、base-moved invalidation、共享 first-frame alignment、absolute replay contract、initial-state gate。</td>
+</tr>
+<tr>
+<td>10 Bimanual retarget / collision</td><td><span class="badge p0">新增</span></td>
+<td><span class="mono">verify_fr3_cube_pose_ik.py</span> 是单臂/逐 episode 可达性的起点。</td>
+<td>缺联合连续 IK/trajectory optimization、inter-arm collision、uncertainty-aware clearance、retime、retarget distortion 与 <span class="mono">T_LR</span> preservation。</td>
+</tr>
+<tr>
+<td>11 FR3 physical metrology</td><td><span class="badge p0">新增</span></td>
+<td>已有 FR3 command/FK 记录能力。</td>
+<td>缺 10/30/50/100 mm、旋转、line/circle/SE(3)、速度 sweep 的 independent physical GT benchmark；必须拆 <span class="mono">cmd↔FK</span> 与 <span class="mono">cmd↔physical</span>。</td>
+</tr>
+<tr>
+<td>12 Physical replay</td><td><span class="badge p0">新增</span></td>
+<td>已有 demo GT、bimanual metrics 雏形、MuJoCo replay 入口。</td>
+<td>缺双 FR3 同步执行 + independent 6DoF measurement；需输出 initial / relative / absolute / bimanual / contact / timing replay metrics，并区分 training-valid 与 replay-certified。</td>
+</tr>
+<tr>
+<td>8.1 相机移动自检</td><td><span class="badge done">0805 新增</span></td>
+<td>GUI 标定中心「相机自检」：每台相机当前画面与标定时基线做 RANSAC 单应；后端 <span class="mono">metrology/cli/rig_shift_check.py</span>。</td>
+<td>继续作为 camera-rig health check；不要与 dual-FR3 base registration 混为一项。</td>
+</tr>
+<tr>
+<td>13 / 14 运动相机 · 4D</td><td><span class="badge todo">未开始</span></td>
+<td>—</td>
+<td>腕部/头部相机不在 tracking 相机列表内；无 <span class="mono">T_TCP↔Cam</span> 标定；应排在 replay fidelity 主线之后。</td>
+</tr>
+</table>
+<div class="callout warn">
+<b>结论（2026-08-21 重写：缺口已从“离线模块未进生产”变成“生产已换血，剩下的是标定与认证”）。</b>
+0805 的判断仍有效：外参已经接近亚像素 BA 级，端到端没有因此改善；真正没有被多相机平均掉的是 marker/rig 几何与 marker→TCP 这类所有相机共享的系统项。
+<b>本节此前的结论行（v13.8）整体过期了</b>：<span class="mono">marker_rig_ba</span>、TCP covariance 和 SE(3) smoother 已于 2026-08-19（<span class="mono">abacec0</span>）进入生产，sidecar v2 也已带齐 σ / BA success / 相机数 / 残差 / 真实 timestamp。
+<b>当前主阻塞分成三层：</b>第一，Phase 3 的实物几何、marker→TCP 与拆装/重夹 repeatability 仍需冻结（<b>被供应商阻塞</b>）；第二，尺子本身还有一台已知错到 2° 的相机（cam_09，已从数据解出修正但<b>未进生产</b>），且外参的重采复现性至今没有第二个独立样本；第三，原来的“FR3 IK/replay gate”只证明可达，尚缺双 base registration、联合 collision-aware retarget 与 independent physical replay metrology。
+因此后半段不再用一个 <span class="mono">replay_pass</span> 混掉不同含义，而拆成 <span class="mono">dual_fr3_executable</span> 与 <span class="mono">physical_replay_certified</span> 两级。
+  </div>
+<div class="callout">
+<b>方法论教训：不要用「误差预算里最大的那一项」代替「实测最大的那一项」。</b>
+外参 9–22 mm 是算出来的上界，marker 尺寸错误没有出现在任何误差预算里——因为没人怀疑过一个写在配置里的常数。
+实测能发现它，是因为用了<b>无参考判据</b>（相机间一致性）：它对「所有相机共有的系统偏移」敏感，而对 FK 误差、marker→TCP 常量免疫。
+对 FK 的绝对误差在 marker=5.4 时反而更小（10.7 mm vs 5.6 的 14.3 mm），只看它会选错值。
+  </div>
+<div class="callout ok">
+<b>新增工程约定：</b>新代码放进 <span class="mono">third_party/opencv_kalibr/metrology/</span>——一个真正可导入的 package（带 <span class="mono">pyproject.toml</span>），而<b>不是新开 submodule</b>，也不再往 <span class="mono">scripts/</span> 堆脚本。
+    理由：opencv_kalibr 的 remote 是自家 <span class="mono">linkage-x/opencv_kalibr</span>（非上游 fork，不存在「改不动」），新 submodule 只会产生第三份标定加载与 cube 几何定义，加剧已有的配置分裂；
+    但该仓库无 packaging、靠 <span class="mono">sys.path.insert</span>，且 <span class="mono">scripts/</span> 与 <span class="mono">hikon_cube_tracking_offline/</span> 下的 <span class="mono">cube_tracking.py</span> / <span class="mono">hikon_cube_tracking_in_robot_base.py</span> 已 md5 分叉——<b>这正是「新代码必须有工程形态」的直接证据</b>。
+  </div>
+</section>
+
+</div>
+</div>
+</body>
+</html>
