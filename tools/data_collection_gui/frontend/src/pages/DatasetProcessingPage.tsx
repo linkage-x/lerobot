@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { GuiSnapshot } from "../api";
 import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
@@ -133,16 +133,16 @@ export function DatasetProcessingPage({
   const currentRoot = snapshot.gateway.datasetsRoot ?? "";
   const [rootInput, setRootInput] = useState<string>(currentRoot);
   const latestMarkerTcpPath = snapshot.markerTcp?.solvePath ?? "";
-  const [markerTcpPathInput, setMarkerTcpPathInput] = useState<string>(latestMarkerTcpPath);
-  const lastAutoMarkerTcpPath = useRef<string>("");
+  // Deliberately NOT pre-filled with the latest solve. A solve directory's bundle is
+  // merged from whatever bundle it started from, so it is only fresh for the ONE cube
+  // that was just solved -- every other cube in it is whatever the previous bundle held.
+  // Pre-filling made "just press Generate" silently pick that over the production bundle
+  // named in the tracker YAML, which is the one that gets curated for all cubes.
+  // "Latest Solve" is still one click away when that is genuinely what you want.
+  const [markerTcpPathInput, setMarkerTcpPathInput] = useState<string>("");
   useEffect(() => {
     setRootInput(currentRoot);
   }, [currentRoot]);
-  useEffect(() => {
-    if (!latestMarkerTcpPath || markerTcpPathInput !== lastAutoMarkerTcpPath.current) return;
-    lastAutoMarkerTcpPath.current = latestMarkerTcpPath;
-    setMarkerTcpPathInput(latestMarkerTcpPath);
-  }, [latestMarkerTcpPath, markerTcpPathInput]);
   const rootDirty = rootInput.trim() !== currentRoot;
   const markerTcpPath = markerTcpPathInput.trim();
 
@@ -192,10 +192,7 @@ export function DatasetProcessingPage({
           />
           <button
             disabled={busy || !latestMarkerTcpPath}
-            onClick={() => {
-              lastAutoMarkerTcpPath.current = latestMarkerTcpPath;
-              setMarkerTcpPathInput(latestMarkerTcpPath);
-            }}
+            onClick={() => setMarkerTcpPathInput(latestMarkerTcpPath)}
           >
             Latest Solve
           </button>
@@ -206,7 +203,15 @@ export function DatasetProcessingPage({
             Clear
           </button>
         </div>
-        <p className="panel-note">{markerTcpPath ? `Generate 将使用 ${markerTcpPath}` : "留空时使用 tracker YAML 中的默认 production marker→TCP bundle。"}</p>
+        <p className="panel-note">
+          {markerTcpPath
+            ? `Generate 将使用 ${markerTcpPath}（覆盖 tracker YAML 的默认 bundle）`
+            : "留空 = 使用 tracker YAML 里的 production marker→TCP bundle，正常情况保持留空。"}
+        </p>
+        <p className="panel-note">
+          解算目录里的 bundle 是从上一版合并出来的：只有刚解的那个 cube 是新的，其余 cube
+          仍是旧值。要给多个夹爪生成轨迹时，用留空的 production bundle，不要指向解算目录。
+        </p>
       </section>
       <section className="panel">
         <div className="panel-heading">
