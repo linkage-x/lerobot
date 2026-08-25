@@ -72,11 +72,11 @@ export function RolloutPage() {
   const [maxSteps, setMaxSteps] = useState("300");
   const [taskPrompt, setTaskPrompt] = useState("");
   const [rtcMode, setRtcMode] = useState<RolloutRtcMode>("auto");
-  const [rtcExecutionHorizon, setRtcExecutionHorizon] = useState("10");
+  const [rtcExecutionHorizon, setRtcExecutionHorizon] = useState("16");
   const [rtcMaxGuidanceWeight, setRtcMaxGuidanceWeight] = useState("10");
   const [rtcPrefixAttentionSchedule, setRtcPrefixAttentionSchedule] =
     useState<RolloutRtcSchedule>("EXP");
-  const [rtcReplanQueueSize, setRtcReplanQueueSize] = useState("30");
+  const [rtcReplanQueueSize, setRtcReplanQueueSize] = useState("25");
   const [rtcInferenceDelaySteps, setRtcInferenceDelaySteps] = useState("");
   const [commandEmaAlpha, setCommandEmaAlpha] = useState("");
   const [showRolloutAdvanced, setShowRolloutAdvanced] = useState(false);
@@ -102,10 +102,10 @@ export function RolloutPage() {
     () => ({
       taskPrompt: taskPrompt.trim() || undefined,
       rtcMode,
-      rtcExecutionHorizon: positiveNumberOr(rtcExecutionHorizon, 10),
+      rtcExecutionHorizon: positiveNumberOr(rtcExecutionHorizon, 16),
       rtcMaxGuidanceWeight: positiveNumberOr(rtcMaxGuidanceWeight, 10),
       rtcPrefixAttentionSchedule,
-      rtcReplanQueueSize: positiveNumberOr(rtcReplanQueueSize, 30),
+      rtcReplanQueueSize: positiveNumberOr(rtcReplanQueueSize, 25),
       rtcInferenceDelaySteps: optionalNumberOrNull(rtcInferenceDelaySteps),
       commandEmaAlpha: optionalNumberOrNull(commandEmaAlpha)
     }),
@@ -433,8 +433,8 @@ export function RolloutPage() {
           <h4>pi0.5+LoRA first rollout defaults</h4>
           <p className="hint">
             Recommended first rollout: keep RTC mode on <code>auto</code>, execution horizon{" "}
-            <code>10</code>, max guidance <code>10</code>, prefix attention <code>EXP</code>,
-            replan queue <code>30</code>, inference delay <code>auto</code>, and command EMA{" "}
+            <code>16</code>, max guidance <code>10</code>, prefix attention <code>EXP</code>,
+            replan queue <code>25</code>, inference delay <code>auto</code>, and command EMA{" "}
             <code>off</code>.
           </p>
           <p className="hint">
