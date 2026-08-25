@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
@@ -3599,6 +3600,154 @@ def predict_action_chunk_for_rollout(
         processed_actions = postprocessor(actions).squeeze(0).detach().cpu().clone()
     return original_actions, processed_actions
 
+
+def _clone_policy_observation_for_async(observation: dict[str, np.ndarray]) -> dict[str, Any]:
+    """Own the observation buffers before handing them to a background planner thread."""
+    cloned: dict[str, Any] = {}
+    for key, value in observation.items():
+        if isinstance(value, np.ndarray):
+            cloned[key] = np.array(value, copy=True)
+        elif torch.is_tensor(value):
+            cloned[key] = value.detach().clone()
+        else:
+            cloned[key] = deepcopy(value)
+    return cloned
+
+
+@dataclass(frozen=True)
+class AsyncActionChunkPlanResult:
+    original_actions: torch.Tensor
+    processed_actions: torch.Tensor
+    latency_s: float
+    action_index_before_inference: int
+    guidance_delay_steps: int
+    observation_step: int
+
+
+class AsyncActionChunkPlanner:
+    """Run slow chunk inference off the 30 Hz robot command loop.
+
+    RTC assumes the robot keeps executing the previous chunk while the next chunk is being
+    predicted. If inference runs synchronously inside the command loop, no actions are actually
+    sent during that time; the arm catches the current target and visually pauses. This helper keeps
+    the physical control loop causal: one thread plans, the main loop continues sending setpoints.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._result: AsyncActionChunkPlanResult | None = None
+        self._error: BaseException | None = None
+
+    def running(self) -> bool:
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    def start(
+        self,
+        observation: dict[str, np.ndarray],
+        *,
+        predict_kwargs: dict[str, Any],
+        action_index_before_inference: int,
+        guidance_delay_steps: int,
+        observation_step: int,
+    ) -> bool:
+        observation_snapshot = _clone_policy_observation_for_async(observation)
+
+        def _target() -> None:
+            started_at_s = time.perf_counter()
+            result: AsyncActionChunkPlanResult | None = None
+            error: BaseException | None = None
+            try:
+                original_actions, processed_actions = predict_action_chunk_for_rollout(
+                    observation_snapshot,
+                    **predict_kwargs,
+                )
+                result = AsyncActionChunkPlanResult(
+                    original_actions=original_actions,
+                    processed_actions=processed_actions,
+                    latency_s=time.perf_counter() - started_at_s,
+                    action_index_before_inference=int(action_index_before_inference),
+                    guidance_delay_steps=int(guidance_delay_steps),
+                    observation_step=int(observation_step),
+                )
+            except BaseException as exc:  # pragma: no cover - propagated on the main thread
+                error = exc
+            with self._lock:
+                self._result = result
+                self._error = error
+
+        with self._lock:
+            if self._thread is not None:
+                if self._thread.is_alive():
+                    return False
+                # A completed result has to be merged before another request can replace it.
+                return False
+            self._result = None
+            self._error = None
+            self._thread = threading.Thread(target=_target, daemon=True, name='RTCActionChunkPlanner')
+            self._thread.start()
+            return True
+
+    def pop_completed(self) -> AsyncActionChunkPlanResult | None:
+        with self._lock:
+            thread = self._thread
+            if thread is None or thread.is_alive():
+                return None
+            result = self._result
+            error = self._error
+            self._thread = None
+            self._result = None
+            self._error = None
+        thread.join(timeout=0.0)
+        if error is not None:
+            raise RuntimeError('Asynchronous RTC chunk prediction failed.') from error
+        if result is None:
+            raise RuntimeError('Asynchronous RTC chunk prediction finished without producing actions.')
+        return result
+
+    def join(self, timeout_s: float | None = None) -> bool:
+        with self._lock:
+            thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout=timeout_s)
+        return not thread.is_alive()
+
+
+def merge_completed_rtc_plan(
+    action_queue: ActionQueue,
+    result: AsyncActionChunkPlanResult,
+    latency_tracker: LatencyTracker,
+) -> dict[str, Any]:
+    """Merge an async RTC plan using actions actually consumed during inference.
+
+    Wall-clock latency is only an estimate of how many setpoints should have been consumed. The
+    robot cares about the setpoints that were really sent, so queue merge uses the queue's
+    consumption index. This is the causal quantity that keeps the new chunk aligned with the old
+    one.
+    """
+    consumed_steps = max(int(action_queue.get_action_index()) - int(result.action_index_before_inference), 0)
+    merge_delay_steps = _clamp_rtc_delay_steps(consumed_steps, int(result.processed_actions.shape[0]))
+    action_queue.merge(
+        result.original_actions,
+        result.processed_actions,
+        real_delay=merge_delay_steps,
+        action_index_before_inference=(
+            int(result.action_index_before_inference) if merge_delay_steps == consumed_steps else None
+        ),
+    )
+    latency_tracker.add(float(result.latency_s))
+    return {
+        'status': 'replan_async_merge',
+        'latency_s': float(result.latency_s),
+        'guidance_delay_steps': int(result.guidance_delay_steps),
+        'merge_delay_steps': int(merge_delay_steps),
+        'actual_consumed_steps': int(consumed_steps),
+        'queue_size': action_queue.qsize(),
+        'observation_step': int(result.observation_step),
+    }
+
 def load_policy_stack(
     pretrained_dir: Path,
     *,
@@ -4016,10 +4165,17 @@ def run_inference(args: argparse.Namespace) -> int:
             'current_offset': max(int(args.act_temporal_action_offset), 0),
             'stuck_count': 0,
         }
+        rtc_planner = AsyncActionChunkPlanner() if rtc_enabled else None
+
+        def finish_rollout(status: str) -> str:
+            if rtc_planner is not None and not rtc_planner.join(timeout_s=5.0):
+                print('[WARN] rtc_async_planner_still_running_after_rollout_stop timeout_s=5.0')
+            return status
+
         step_idx = 0
         while args.max_steps is None or step_idx < args.max_steps:
             if interactive_keyboard is not None and interactive_keyboard.should_stop_rollout():
-                return 'quit' if interactive_keyboard.quit_requested.is_set() else 'stopped'
+                return finish_rollout('quit' if interactive_keyboard.quit_requested.is_set() else 'stopped')
             loop_start_t = time.perf_counter()
             robot_observation = robot.get_observation()
             previous_tracking_position_delta: np.ndarray | None = None
@@ -4157,57 +4313,130 @@ def run_inference(args: argparse.Namespace) -> int:
                 action_queue = rtc_state['queue']
                 if not isinstance(action_queue, ActionQueue):
                     raise RuntimeError('RTC is enabled but the rollout action queue was not initialized.')
-                if action_queue.qsize() <= rtc_replan_queue_size:
-                    latency_tracker = rtc_state['latency_tracker']
-                    if not isinstance(latency_tracker, LatencyTracker):
-                        raise RuntimeError('RTC is enabled but the latency tracker was not initialized.')
-                    prev_chunk_left_over = action_queue.get_left_over()
-                    tracked_latency = latency_tracker.max() or 0.0
-                    guidance_delay_steps = (
-                        int(args.rtc_inference_delay_steps)
-                        if args.rtc_inference_delay_steps is not None
-                        else int(math.ceil(float(tracked_latency) / rtc_time_per_step))
+                latency_tracker = rtc_state['latency_tracker']
+                if not isinstance(latency_tracker, LatencyTracker):
+                    raise RuntimeError('RTC is enabled but the latency tracker was not initialized.')
+                if rtc_planner is None:
+                    raise RuntimeError('RTC is enabled but the async planner was not initialized.')
+
+                completed_plan = rtc_planner.pop_completed()
+                if completed_plan is not None:
+                    rtc_state['last_debug'] = merge_completed_rtc_plan(
+                        action_queue,
+                        completed_plan,
+                        latency_tracker,
                     )
-                    guidance_delay_steps = max(guidance_delay_steps, 0)
-                    chunk_start_t = time.perf_counter()
-                    original_actions, processed_actions = predict_action_chunk_for_rollout(
-                        policy_observation,
-                        policy=policy,
-                        device=device,
-                        preprocessor=preprocessor,
-                        postprocessor=postprocessor,
-                        use_amp=bool(policy.config.use_amp),
-                        inference_delay=guidance_delay_steps,
-                        prev_chunk_left_over=prev_chunk_left_over,
-                        execution_horizon=int(args.rtc_execution_horizon),
-                        task=task_prompt,
-                        robot_type=robot.name,
-                    )
-                    chunk_latency_s = time.perf_counter() - chunk_start_t
-                    measured_delay_steps = (
-                        int(args.rtc_inference_delay_steps)
-                        if args.rtc_inference_delay_steps is not None
-                        else int(math.ceil(chunk_latency_s / rtc_time_per_step))
-                    )
-                    delay_steps = _clamp_rtc_delay_steps(measured_delay_steps, int(processed_actions.shape[0]))
-                    latency_tracker.add(chunk_latency_s)
-                    action_queue.merge(
-                        original_actions,
-                        processed_actions,
-                        real_delay=delay_steps,
-                        action_index_before_inference=None,
-                    )
-                    rtc_state['last_debug'] = {
-                        'status': 'replan',
-                        'latency_s': chunk_latency_s,
-                        'guidance_delay_steps': guidance_delay_steps,
-                        'merge_delay_steps': delay_steps,
-                        'queue_size': action_queue.qsize(),
-                        'prev_leftover': 0 if prev_chunk_left_over is None else int(prev_chunk_left_over.shape[0]),
-                    }
+
+                if action_queue.empty():
+                    if rtc_planner.running():
+                        # This is an overload path, not the intended steady state. Wait for the
+                        # in-flight plan rather than crashing, but make the stall explicit in logs.
+                        print('[WARN] rtc_queue_starved_waiting_for_async_plan')
+                        if not rtc_planner.join(timeout_s=5.0):
+                            raise RuntimeError(
+                                'RTC action queue starved and async chunk prediction did not finish within 5s.'
+                            )
+                        completed_plan = rtc_planner.pop_completed()
+                        if completed_plan is None:
+                            raise RuntimeError('RTC async chunk prediction completed without a mergeable result.')
+                        rtc_state['last_debug'] = merge_completed_rtc_plan(
+                            action_queue,
+                            completed_plan,
+                            latency_tracker,
+                        )
+
+                    if action_queue.empty():
+                        prev_chunk_left_over = action_queue.get_left_over()
+                        if prev_chunk_left_over is not None:
+                            prev_chunk_left_over = prev_chunk_left_over.detach().clone()
+                        tracked_latency = latency_tracker.max() or 0.0
+                        guidance_delay_steps = (
+                            int(args.rtc_inference_delay_steps)
+                            if args.rtc_inference_delay_steps is not None
+                            else int(math.ceil(float(tracked_latency) / rtc_time_per_step))
+                        )
+                        guidance_delay_steps = max(guidance_delay_steps, 0)
+                        chunk_start_t = time.perf_counter()
+                        original_actions, processed_actions = predict_action_chunk_for_rollout(
+                            policy_observation,
+                            policy=policy,
+                            device=device,
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                            use_amp=bool(policy.config.use_amp),
+                            inference_delay=guidance_delay_steps,
+                            prev_chunk_left_over=prev_chunk_left_over,
+                            execution_horizon=int(args.rtc_execution_horizon),
+                            task=task_prompt,
+                            robot_type=robot.name,
+                        )
+                        chunk_latency_s = time.perf_counter() - chunk_start_t
+                        latency_tracker.add(chunk_latency_s)
+                        # No queued actions are consumed while the main thread blocks here. Skipping
+                        # by wall-clock latency would jump into the middle of the new chunk and create
+                        # exactly the discontinuity RTC is supposed to avoid.
+                        action_queue.merge(
+                            original_actions,
+                            processed_actions,
+                            real_delay=0,
+                            action_index_before_inference=action_queue.get_action_index(),
+                        )
+                        rtc_state['last_debug'] = {
+                            'status': 'replan_sync_bootstrap' if prev_chunk_left_over is None else 'replan_sync_starved',
+                            'latency_s': chunk_latency_s,
+                            'guidance_delay_steps': guidance_delay_steps,
+                            'merge_delay_steps': 0,
+                            'actual_consumed_steps': 0,
+                            'queue_size': action_queue.qsize(),
+                            'prev_leftover': 0 if prev_chunk_left_over is None else int(prev_chunk_left_over.shape[0]),
+                        }
+
+                elif action_queue.qsize() <= rtc_replan_queue_size:
+                    if rtc_planner.running():
+                        rtc_state['last_debug'] = {
+                            'status': 'replan_async_pending',
+                            'queue_size': action_queue.qsize(),
+                        }
+                    else:
+                        prev_chunk_left_over = action_queue.get_left_over()
+                        if prev_chunk_left_over is not None:
+                            prev_chunk_left_over = prev_chunk_left_over.detach().clone()
+                        tracked_latency = latency_tracker.max() or 0.0
+                        guidance_delay_steps = (
+                            int(args.rtc_inference_delay_steps)
+                            if args.rtc_inference_delay_steps is not None
+                            else int(math.ceil(float(tracked_latency) / rtc_time_per_step))
+                        )
+                        guidance_delay_steps = max(guidance_delay_steps, 0)
+                        started = rtc_planner.start(
+                            policy_observation,
+                            predict_kwargs={
+                                'policy': policy,
+                                'device': device,
+                                'preprocessor': preprocessor,
+                                'postprocessor': postprocessor,
+                                'use_amp': bool(policy.config.use_amp),
+                                'inference_delay': guidance_delay_steps,
+                                'prev_chunk_left_over': prev_chunk_left_over,
+                                'execution_horizon': int(args.rtc_execution_horizon),
+                                'task': task_prompt,
+                                'robot_type': robot.name,
+                            },
+                            action_index_before_inference=action_queue.get_action_index(),
+                            guidance_delay_steps=guidance_delay_steps,
+                            observation_step=step_idx,
+                        )
+                        rtc_state['last_debug'] = {
+                            'status': 'replan_async_start' if started else 'replan_async_pending',
+                            'latency_s': 0.0,
+                            'guidance_delay_steps': guidance_delay_steps,
+                            'merge_delay_steps': 0,
+                            'queue_size': action_queue.qsize(),
+                            'prev_leftover': 0 if prev_chunk_left_over is None else int(prev_chunk_left_over.shape[0]),
+                        }
                 else:
                     rtc_state['last_debug'] = {
-                        'status': 'reuse',
+                        'status': 'replan_async_pending' if rtc_planner.running() else 'reuse',
                         'queue_size': action_queue.qsize(),
                     }
                 action_tensor = action_queue.get()
@@ -4359,11 +4588,14 @@ def run_inference(args: argparse.Namespace) -> int:
                 )
 
             if interactive_keyboard is not None and interactive_keyboard.should_stop_rollout():
-                return 'quit' if interactive_keyboard.quit_requested.is_set() else 'stopped'
+                return finish_rollout('quit' if interactive_keyboard.quit_requested.is_set() else 'stopped')
 
             if not args.preview:
                 robot.send_action(command_to_send)
                 previous_sent_command = dict(command_to_send)
+
+            elapsed_s = time.perf_counter() - loop_start_t
+            sleep_s = max(1.0 / policy_fps - elapsed_s, 0.0)
 
             if args.preview or command_status != 'pass' or step_idx % max(args.log_interval, 1) == 0:
                 log_message = (
@@ -4425,12 +4657,12 @@ def run_inference(args: argparse.Namespace) -> int:
                         f" prev_cmd_err_mm={np.linalg.norm(previous_tracking_position_delta) * 1000.0:.2f} "
                         f"prev_cmd_err_rot_deg={np.linalg.norm(np.rad2deg(previous_tracking_rotation_delta)):.2f}"
                     )
+                log_message += f" loop_ms={elapsed_s * 1000.0:.1f} sleep_ms={sleep_s * 1000.0:.1f}"
                 print(log_message)
 
-            elapsed_s = time.perf_counter() - loop_start_t
-            precise_sleep(max(1.0 / policy_fps - elapsed_s, 0.0))
+            precise_sleep(sleep_s)
             step_idx += 1
-        return 'completed'
+        return finish_rollout('completed')
 
     interactive_keyboard: InteractiveRolloutKeyboard | None = None
     try:

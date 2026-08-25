@@ -120,6 +120,67 @@ def test_rtc_auto_only_enables_supported_policy_types():
 def test_rtc_delay_clamp_keeps_one_action_when_latency_exceeds_chunk():
     assert fr3_act_infer_real_runtime._clamp_rtc_delay_steps(80, 50) == 49
 
+
+def test_async_rtc_planner_copies_observation_before_background_inference(monkeypatch):
+    def fake_predict_action_chunk(observation, **_kwargs):
+        value = float(observation['observation.state'][0])
+        action = torch.tensor([[value]], dtype=torch.float32)
+        return action, action + 10.0
+
+    monkeypatch.setattr(
+        fr3_act_infer_real_runtime,
+        'predict_action_chunk_for_rollout',
+        fake_predict_action_chunk,
+    )
+    planner = fr3_act_infer_real_runtime.AsyncActionChunkPlanner()
+    observation = {'observation.state': np.array([1.0], dtype=np.float32)}
+
+    assert planner.start(
+        observation,
+        predict_kwargs={},
+        action_index_before_inference=3,
+        guidance_delay_steps=2,
+        observation_step=7,
+    )
+    observation['observation.state'][0] = 99.0
+    assert planner.join(timeout_s=1.0)
+    result = planner.pop_completed()
+
+    assert result is not None
+    assert result.action_index_before_inference == 3
+    assert result.guidance_delay_steps == 2
+    assert result.observation_step == 7
+    assert torch.equal(result.original_actions, torch.tensor([[1.0]]))
+    assert torch.equal(result.processed_actions, torch.tensor([[11.0]]))
+
+
+def test_async_rtc_merge_uses_actual_consumed_actions_instead_of_wall_clock_delay():
+    action_queue = fr3_act_infer_real_runtime.ActionQueue(
+        fr3_act_infer_real_runtime.RTCConfig(enabled=True)
+    )
+    initial = torch.arange(50, dtype=torch.float32).unsqueeze(1)
+    action_queue.merge(initial, initial + 1000.0, real_delay=0, action_index_before_inference=0)
+    for _ in range(12):
+        assert action_queue.get() is not None
+
+    result = fr3_act_infer_real_runtime.AsyncActionChunkPlanResult(
+        original_actions=initial + 2000.0,
+        processed_actions=initial + 3000.0,
+        latency_s=0.40,
+        action_index_before_inference=0,
+        guidance_delay_steps=99,
+        observation_step=5,
+    )
+    tracker = fr3_act_infer_real_runtime.LatencyTracker()
+
+    debug = fr3_act_infer_real_runtime.merge_completed_rtc_plan(action_queue, result, tracker)
+
+    assert debug['actual_consumed_steps'] == 12
+    assert debug['merge_delay_steps'] == 12
+    assert debug['queue_size'] == 38
+    assert np.isclose(tracker.max(), 0.40)
+    assert torch.equal(action_queue.get(), torch.tensor([3012.0]))
+
 def test_policy_compile_override_disables_training_compile_for_rollout(capsys):
     cfg = SimpleNamespace(type='pi05', compile_model=True, compile_mode='max-autotune')
 
