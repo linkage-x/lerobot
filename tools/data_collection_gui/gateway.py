@@ -5285,7 +5285,7 @@ def _follow_rollout_run(state: GatewayState, log_path: Path, process: subprocess
             return
         state.rollout.finishedAt = datetime.now(timezone.utc).isoformat(timespec="seconds")
         if state.rollout.state == "stopped":
-            pass
+            state.rollout.message = "Rollout stopped."
         elif return_code == 0:
             state.rollout.state = "complete"
             state.rollout.message = f"Rollout session finished ({state.rollout.mode})."

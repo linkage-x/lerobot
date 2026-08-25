@@ -2215,11 +2215,7 @@ def convert_local_command_to_base_frame(
     return base_robot_command
 
 
-def _load_episode_start_state_rows(
-    dataset_root: Path,
-    *,
-    state_key: str = 'observation.state',
-) -> list[tuple[int, np.ndarray]]:
+def _load_episode_data_locations(dataset_root: Path) -> list[tuple[int, int, int]]:
     import pyarrow.parquet as pq
 
     dataset_root = _resolve_repo_path(dataset_root)
@@ -2238,8 +2234,19 @@ def _load_episode_start_state_rows(
             episode_rows.append((int(episode_index), int(chunk_index), int(file_index)))
 
     episode_rows.sort(key=lambda item: item[0])
+    return episode_rows
+
+
+def _load_episode_start_state_rows(
+    dataset_root: Path,
+    *,
+    state_key: str = 'observation.state',
+) -> list[tuple[int, np.ndarray]]:
+    import pyarrow.parquet as pq
+
+    dataset_root = _resolve_repo_path(dataset_root)
     start_state_rows: list[tuple[int, np.ndarray]] = []
-    for episode_index, chunk_index, file_index in episode_rows:
+    for episode_index, chunk_index, file_index in _load_episode_data_locations(dataset_root):
         data_file = _resolve_dataset_data_file(dataset_root, chunk_index=chunk_index, file_index=file_index)
         table = pq.read_table(str(data_file), columns=['episode_index', state_key]).to_pydict()
         for row_episode_index, state in zip(table['episode_index'], table[state_key], strict=True):
@@ -2253,6 +2260,61 @@ def _load_episode_start_state_rows(
     if not start_state_rows:
         raise ValueError(f'No episode starts resolved from {dataset_root}')
     return start_state_rows
+
+
+def _load_episode_start_gripper_targets(
+    dataset_root: Path,
+    *,
+    state_key: str = 'observation.state',
+) -> tuple[dict[int, float], str, str] | None:
+    """Return the per-episode gripper target that should define rollout start.
+
+    The first observation can lag the command at episode start: on this FR3/Pika
+    dataset, some first-frame sensor readings are still closed while the first
+    action and prev_cmd already say "open". For rollout alignment, the command
+    contract is what matters: physically put the gripper where the policy was
+    commanded to start, not where a stale first sensor sample happened to be.
+    """
+    import pyarrow.parquet as pq
+
+    dataset_root = _resolve_repo_path(dataset_root)
+    info = _load_dataset_info(dataset_root)
+    state_names = _load_observation_state_feature_names(dataset_root, state_key=state_key)
+    action_names_raw = info.get('features', {}).get('action', {}).get('names')
+    action_names = [str(name) for name in action_names_raw] if isinstance(action_names_raw, list) else []
+
+    column = state_key
+    value_index: int
+    source: str
+    feature_name = 'gripper.pos'
+    if 'gripper.pos' in action_names:
+        column = 'action'
+        value_index = action_names.index('gripper.pos')
+        source = 'action.gripper.pos'
+    elif 'prev_cmd.gripper.pos' in state_names:
+        value_index = state_names.index('prev_cmd.gripper.pos')
+        source = f'{state_key}.prev_cmd.gripper.pos'
+    elif 'gripper.pos' in state_names:
+        value_index = state_names.index('gripper.pos')
+        source = f'{state_key}.gripper.pos'
+    else:
+        return None
+
+    targets: dict[int, float] = {}
+    for episode_index, chunk_index, file_index in _load_episode_data_locations(dataset_root):
+        data_file = _resolve_dataset_data_file(dataset_root, chunk_index=chunk_index, file_index=file_index)
+        table = pq.read_table(str(data_file), columns=['episode_index', column]).to_pydict()
+        for row_episode_index, values in zip(table['episode_index'], table[column], strict=True):
+            if int(row_episode_index) != episode_index:
+                continue
+            targets[int(episode_index)] = float(np.asarray(values, dtype=np.float64)[value_index])
+            break
+        else:
+            raise ValueError(f'Episode {episode_index} metadata found, but no rows matched in {data_file}')
+
+    if not targets:
+        return None
+    return targets, source, feature_name
 
 
 def _load_episode_start_states(
@@ -2276,15 +2338,17 @@ def estimate_dataset_start_pose_contract(
     *,
     state_key: str = 'observation.state',
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    start_states = _load_episode_start_states(dataset_root, state_key=state_key)
+    start_state_rows = _load_episode_start_state_rows(dataset_root, state_key=state_key)
+    start_states = np.asarray([state for _, state in start_state_rows], dtype=np.float64)
     state_indices = _extract_dataset_state_contract_indices(dataset_root, state_key=state_key)
     positions = np.asarray([[state[state_indices[key]] for key in EE_POSITION_KEYS] for state in start_states], dtype=np.float64)
     quaternions = np.asarray([[state[state_indices[key]] for key in EE_QUAT_KEYS] for state in start_states], dtype=np.float64)
-    gripper_values = (
+    observation_gripper_values = (
         np.asarray([state[state_indices['gripper.pos']] for state in start_states], dtype=np.float64)
         if 'gripper.pos' in state_indices
         else None
     )
+    gripper_targets = _load_episode_start_gripper_targets(dataset_root, state_key=state_key)
 
     aligned_quaternions = quaternions.copy()
     reference_quaternion = aligned_quaternions[0]
@@ -2311,10 +2375,24 @@ def estimate_dataset_start_pose_contract(
         'rotation_spread_p95_deg': float(np.percentile(rotation_spread_deg, 95)),
         'rotation_spread_max_deg': float(rotation_spread_deg.max()),
     }
-    if gripper_values is not None:
-        stats['gripper_mean'] = float(gripper_values.mean())
-        stats['gripper_std'] = float(gripper_values.std())
+    if gripper_targets is not None:
+        gripper_targets_by_episode, gripper_source, gripper_feature_name = gripper_targets
+        ordered_targets = np.asarray(
+            [gripper_targets_by_episode[int(episode_index)] for episode_index, _ in start_state_rows],
+            dtype=np.float64,
+        )
+        stats['gripper_mean'] = float(ordered_targets.mean())
+        stats['gripper_std'] = float(ordered_targets.std())
+        stats['gripper_feature_name'] = gripper_feature_name
+        stats['gripper_source'] = gripper_source
+        if observation_gripper_values is not None:
+            stats['observation_gripper_mean'] = float(observation_gripper_values.mean())
+            stats['observation_gripper_std'] = float(observation_gripper_values.std())
+    elif observation_gripper_values is not None:
+        stats['gripper_mean'] = float(observation_gripper_values.mean())
+        stats['gripper_std'] = float(observation_gripper_values.std())
         stats['gripper_feature_name'] = 'gripper.pos'
+        stats['gripper_source'] = f'{state_key}.gripper.pos'
     return representative_pose_xyzquat, stats
 
 
@@ -2328,6 +2406,8 @@ def summarize_live_start_alignment_to_dataset_starts(
 ) -> dict[str, Any]:
     start_state_rows = _load_episode_start_state_rows(dataset_root, state_key=state_key)
     state_indices = _extract_dataset_state_contract_indices(dataset_root, state_key=state_key)
+    gripper_targets = _load_episode_start_gripper_targets(dataset_root, state_key=state_key)
+    start_gripper_targets_by_episode = gripper_targets[0] if gripper_targets is not None else None
     live_position = np.asarray(live_start_pose_i[:3, 3], dtype=np.float64)
     live_rotation = Rotation.from_matrix(live_start_pose_i[:3, :3])
 
@@ -2346,6 +2426,8 @@ def summarize_live_start_alignment_to_dataset_starts(
             state,
             state_indices=state_indices,
         )
+        if start_gripper_targets_by_episode is not None:
+            dataset_gripper = start_gripper_targets_by_episode.get(int(episode_index), dataset_gripper)
         dataset_start_pose_i = _pose_from_position_and_quaternion(position_xyz, quaternion_xyzw)
         predicted_start_pose_i = T_B_Ws @ dataset_start_pose_i
         position_error_mm = float(np.linalg.norm(predicted_start_pose_i[:3, 3] - live_position) * 1000.0)
@@ -3416,6 +3498,23 @@ def configure_rtc_for_policy_config(
     return True
 
 
+def disable_policy_compile_for_online_rollout(policy_cfg: Any) -> None:
+    """Keep training-time torch.compile settings out of the real-time rollout path.
+
+    Training checkpoints can legitimately carry ``compile_model=True``. Reusing that
+    flag during online robot control is a different contract: the first forward pass
+    may spend tens of seconds in TorchInductor compile/autotune and RTC will then
+    treat the whole chunk as stale. Rollout should be latency-predictable by default.
+    """
+    if bool(getattr(policy_cfg, 'compile_model', False)):
+        compile_mode = getattr(policy_cfg, 'compile_mode', '<unset>')
+        policy_cfg.compile_model = False
+        print(
+            '[INFO] policy_compile_model_override='
+            f'from=True to=False compile_mode={compile_mode} reason=online_rollout_latency'
+        )
+
+
 def _clamp_rtc_delay_steps(delay_steps: int, chunk_len: int) -> int:
     delay_steps = max(int(delay_steps), 0)
     chunk_len = int(chunk_len)
@@ -3515,6 +3614,8 @@ def load_policy_stack(
     policy_cfg = load_train_config(pretrained_dir).policy
     if policy_cfg is None:
         raise ValueError(f"No policy config found in {pretrained_dir / 'train_config.json'}")
+
+    disable_policy_compile_for_online_rollout(policy_cfg)
 
     rtc_enabled = configure_rtc_for_policy_config(
         policy_cfg,
@@ -3754,7 +3855,13 @@ def run_inference(args: argparse.Namespace) -> int:
         dataset_start_spread_line += (
             f" gripper_mean/std={dataset_start_pose_stats['gripper_mean']:.3f}/"
             f"{dataset_start_pose_stats['gripper_std']:.3f}"
+            f" source={dataset_start_pose_stats.get('gripper_source', '<unknown>')}"
         )
+        if 'observation_gripper_mean' in dataset_start_pose_stats and 'observation_gripper_std' in dataset_start_pose_stats:
+            dataset_start_spread_line += (
+                f" observation_gripper_mean/std={dataset_start_pose_stats['observation_gripper_mean']:.3f}/"
+                f"{dataset_start_pose_stats['observation_gripper_std']:.3f}"
+            )
     print(dataset_start_spread_line)
     print(f'[INFO] state_frame=absolute_pose({robot_cfg.target_frame_name}) in dataset_world(W_s)')
     print('[INFO] tool_frame_transform=identity; no DAS gripper_base_link<->EE fixed transform is applied')
@@ -3952,11 +4059,13 @@ def run_inference(args: argparse.Namespace) -> int:
                 )
                 if 'live_gripper' in start_alignment_stats:
                     dataset_gripper_mean = float(dataset_start_pose_stats.get('gripper_mean', float('nan')))
+                    dataset_gripper_source = str(dataset_start_pose_stats.get('gripper_source', '<unknown>'))
                     gripper_delta_to_mean = abs(float(start_alignment_stats['live_gripper']) - dataset_gripper_mean)
                     dataset_alignment_line += (
                         f" live_gripper={start_alignment_stats['live_gripper']:.3f}"
-                        f" dataset_gripper_mean={dataset_gripper_mean:.3f}"
-                        f" delta_to_mean={gripper_delta_to_mean:.3f}"
+                        f" dataset_gripper_target={dataset_gripper_mean:.3f}"
+                        f" source={dataset_gripper_source}"
+                        f" delta_to_target={gripper_delta_to_mean:.3f}"
                         f" nearest_gripper_abs={start_alignment_stats['best_gripper_abs_delta']:.3f}"
                         f" median_gripper_abs={start_alignment_stats['median_gripper_abs_delta']:.3f}"
                         f" p95_gripper_abs={start_alignment_stats['p95_gripper_abs_delta']:.3f}"
@@ -3971,7 +4080,8 @@ def run_inference(args: argparse.Namespace) -> int:
                     print(
                         '[WARN] live gripper start is far from dataset start contract; '
                         f"live={start_alignment_stats['live_gripper']:.3f} "
-                        f"dataset_mean={float(dataset_start_pose_stats['gripper_mean']):.3f} "
+                        f"dataset_target={float(dataset_start_pose_stats['gripper_mean']):.3f} "
+                        f"source={dataset_start_pose_stats.get('gripper_source', '<unknown>')} "
                         f"abs_delta={abs(float(start_alignment_stats['live_gripper']) - float(dataset_start_pose_stats['gripper_mean'])):.3f} "
                         f"tol={dataset_start_gripper_tolerance:.3f}. "
                         'Use a dataset-like start gripper or --align-gripper-to-dataset-start.'
@@ -3982,7 +4092,8 @@ def run_inference(args: argparse.Namespace) -> int:
                     print(
                         '[INFO] preview_gripper_alignment=virtual '
                         f"live_start={float(start_alignment_stats['live_gripper']):.3f} "
-                        f"target_mean={float(dataset_start_pose_stats['gripper_mean']):.3f} "
+                        f"target={float(dataset_start_pose_stats['gripper_mean']):.3f} "
+                        f"source={dataset_start_pose_stats.get('gripper_source', '<unknown>')} "
                         f"offset={preview_gripper_offset:+.3f} "
                         f"corrected_start={preview_target_gripper:.3f}"
                     )

@@ -830,6 +830,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            rtc_time_tensor = time_tensor[:, None, None]
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
                 return self.denoise_step(
@@ -848,7 +849,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     x_t=x_t,
                     prev_chunk_left_over=prev_chunk_left_over,
                     inference_delay=inference_delay,
-                    time=time,
+                    time=rtc_time_tensor,
                     original_denoise_step_partial=denoise_step_partial_call,
                     execution_horizon=execution_horizon,
                 )

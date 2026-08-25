@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import json
 import subprocess
 
 import numpy as np
@@ -118,6 +119,26 @@ def test_rtc_auto_only_enables_supported_policy_types():
 
 def test_rtc_delay_clamp_keeps_one_action_when_latency_exceeds_chunk():
     assert fr3_act_infer_real_runtime._clamp_rtc_delay_steps(80, 50) == 49
+
+def test_policy_compile_override_disables_training_compile_for_rollout(capsys):
+    cfg = SimpleNamespace(type='pi05', compile_model=True, compile_mode='max-autotune')
+
+    fr3_act_infer_real_runtime.disable_policy_compile_for_online_rollout(cfg)
+
+    captured = capsys.readouterr()
+    assert cfg.compile_model is False
+    assert 'policy_compile_model_override=from=True to=False' in captured.out
+    assert 'max-autotune' in captured.out
+
+
+def test_policy_compile_override_leaves_uncompiled_policy_unchanged(capsys):
+    cfg = SimpleNamespace(type='pi05', compile_model=False, compile_mode='max-autotune')
+
+    fr3_act_infer_real_runtime.disable_policy_compile_for_online_rollout(cfg)
+
+    captured = capsys.readouterr()
+    assert cfg.compile_model is False
+    assert captured.out == ''
 
 def test_build_docker_command_passes_preview_and_safety_flags(tmp_path: Path):
     args = fr3_act_infer_real.parse_args(
@@ -1263,6 +1284,111 @@ def test_decode_action_to_robot_command_converts_quat_and_gripper():
     assert np.isclose(command['ee.wy'], 0.0)
     assert np.isclose(command['ee.wz'], 0.0)
     assert np.isclose(command['gripper.pos'], 1.0)
+
+
+def test_dataset_start_gripper_contract_prefers_first_action_target(tmp_path: Path):
+    pytest.importorskip('pyarrow')
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    dataset_root = tmp_path / 'view'
+    (dataset_root / 'meta' / 'episodes' / 'chunk-000').mkdir(parents=True)
+    (dataset_root / 'data' / 'chunk-000').mkdir(parents=True)
+    state_names = [
+        'ee.x',
+        'ee.y',
+        'ee.z',
+        'prev_cmd.ee.x',
+        'prev_cmd.ee.y',
+        'prev_cmd.ee.z',
+        'ee.qx',
+        'ee.qy',
+        'ee.qz',
+        'ee.qw',
+        'prev_cmd.ee.qx',
+        'prev_cmd.ee.qy',
+        'prev_cmd.ee.qz',
+        'prev_cmd.ee.qw',
+        'gripper.pos',
+        'prev_cmd.gripper.pos',
+    ]
+    action_names = [
+        'delta_ee_from_prev_cmd.dx',
+        'delta_ee_from_prev_cmd.dy',
+        'delta_ee_from_prev_cmd.dz',
+        'delta_ee_from_prev_cmd.drx',
+        'delta_ee_from_prev_cmd.dry',
+        'delta_ee_from_prev_cmd.drz',
+        'gripper.pos',
+    ]
+    (dataset_root / 'meta' / 'info.json').write_text(
+        json.dumps(
+            {
+                'data_path': 'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet',
+                'features': {
+                    'observation.state': {'names': state_names},
+                    'action': {'names': action_names},
+                },
+            }
+        ),
+        encoding='utf-8',
+    )
+    pq.write_table(
+        pa.table(
+            {
+                'episode_index': [0, 1],
+                'data/chunk_index': [0, 0],
+                'data/file_index': [0, 0],
+            }
+        ),
+        dataset_root / 'meta' / 'episodes' / 'chunk-000' / 'file-000.parquet',
+    )
+
+    def state(gripper: float) -> list[float]:
+        return [
+            0.3,
+            0.0,
+            0.4,
+            0.3,
+            0.0,
+            0.4,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            gripper,
+            1.0,
+        ]
+
+    open_action = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    pq.write_table(
+        pa.table(
+            {
+                'episode_index': [0, 0, 1, 1],
+                'observation.state': [state(0.0), state(0.5), state(1.0), state(1.0)],
+                'action': [open_action, open_action, open_action, open_action],
+            }
+        ),
+        dataset_root / 'data' / 'chunk-000' / 'file-000.parquet',
+    )
+
+    _, stats = fr3_act_infer_real_runtime.estimate_dataset_start_pose_contract(dataset_root)
+    summary = fr3_act_infer_real_runtime.summarize_live_start_alignment_to_dataset_starts(
+        dataset_root,
+        np.eye(4),
+        np.eye(4),
+        live_gripper=0.25,
+    )
+
+    assert stats['gripper_source'] == 'action.gripper.pos'
+    assert np.isclose(stats['gripper_mean'], 1.0)
+    assert np.isclose(stats['gripper_std'], 0.0)
+    assert np.isclose(stats['observation_gripper_mean'], 0.5)
+    assert np.isclose(summary['median_gripper_abs_delta'], 0.75)
 
 
 def test_preview_and_real_alignment_share_step0_policy_observation_state():
