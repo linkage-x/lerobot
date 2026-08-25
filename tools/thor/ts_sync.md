@@ -6,6 +6,7 @@
 > 2026-06-16 schema 精简（observation.state 31 维 / box.timestamps 6 维）+ 去 meta 冗余（`sync_reference` 删 split_now_wall_s、camera_first_pts_s）
 > 2026-07-13 按最近 8 次同步相关改动校订：生产默认相机路径切到 `argus_online_sync`，SOF full-cluster 在 encoder 前对齐；新增 online frame bus / preview bus / replay 多视频同步说明。
 > 2026-07-29 实施 IMU 姿态去冗余（§9.1.1 / 原 §10 P2）：删 `rpy`、quat 改 xyzw，`observation.state` 31 → 28 维；四元数半球用 213 条真机 IMU 流实测后决定**不强制**。同日核对后关闭原 §10 P0（replay 修复的 Thor 部署）。
+> 2026-08-25 新增 §5.5（BOX↔相机残余偏移首次实测 +4.4 ms，gyro↔vision 互相关；同时更正当前固件的传感器实际速率为 520/244/120/60 Hz）；§5.2 的 MCU→host 回归改为去均值形式（原写法在真实量级上有 0.107 ms RMS 的数值误差）
 
 ## 1. 系统总览
 
@@ -257,6 +258,18 @@ frame_time[N] = pts_offset + N / fps        （t0 相对域）
 host_time = slope × mcu_ts + intercept
 ```
 
+> **2026-08-25：这个拟合改成了去均值形式。** 原先用教科书的 `n·Sxy − Sx·Sy` 正规方程，
+> 在真实量级上（`mcu_ts` ~4e9 µs 对墙钟 ~1.8e9 s）分子要拿两个 ~2.9e25 相减去得到 ~1e14，
+> 十一位有效数字没了。用**精确有理数拟合**对 72 个真实 sensor-episode 逐条比对，旧写法的代价是
+> **RMS 0.107 ms / p95 0.291 ms / 峰值 0.568 ms**（slope 差 ±1~94 ppm）。
+> 形状比幅值重要：`intercept` 无论如何都强制拟合线过质心，所以误差是**绕 episode 中点的转动**
+> ——整段均值 <0.3 µs、两端最大、符号逐 episode 随机。**因此它进不了任何偏置量**（§5.5 的 Δt
+> 改前改后只动 ≤0.04 ms），只进逐帧 timing，且最差处落在 episode 头尾。
+> 去均值后同样 72 条 fit 降到 **0.3 µs**——那是 float64 装 1.8e9 秒墙钟的**表示极限**，不是算法残留。
+> 收益很小（折进逐传感器 timing σ 最多让 six_d_force 0.63 → 0.69 ms，≤0.02 mm）；改它的理由是
+> 这项误差**逐 episode 零均值、结构性不可见**。回归测试须用真实量级——本仓库原有 18 条 ts_sync
+> 测试全跑在 `T0=1000.0` 的玩具量级上，这正是它藏了几个月的原因。
+
 - `slope` ≈ MCU 时钟周期（ticks → seconds），反映 MCU 晶振频率
 - `intercept` = MCU 时钟域到主机时钟域的偏移量
 
@@ -324,6 +337,37 @@ touch 残差约为 200Hz 传感器的 2×：样本少 4×（501 vs 1998，拟合
 > （online-sync 数据则由 SOF full-cluster gate 约束相机间同帧）。另外延迟的**平均值**被 `intercept` 吸收、不进残差，但它在
 > BOX↔相机之间留下一个固定 skew（BOX 内部各传感器对齐时相消）。**所以对 touch，主导误差是 ±10ms
 > 的最近邻量化，而非 ±2ms 的校准残差。**
+
+### 5.5 BOX↔相机残余偏移：实测 +4.4 ms（2026-08-25）
+
+§5.4 那张表把「BOX↔相机端到端」写成 ±1~3ms 残差 + ±2.5ms 量化，但**没有给出偏移的
+均值**——因为回归的 `intercept` 把设备→主机的平均传输延迟整个吸收掉了，它在 BOX 内部
+各传感器之间相消，只在 BOX↔相机之间留下一个固定 skew（§5.4 末尾的口径提醒已经点出这
+件事，但当时是定性的）。
+
+现在它是定量的。做法是拿**旋转**当共同观测量：marker rig 与 IMU 刚性连接，两者的体坐标
+系角速度是同一个矢量在两个系里的表示，于是可以在不知道任何平移标定的前提下解出时间偏移。
+工具是 `third_party/opencv_kalibr/metrology/cli/estimate_camera_imu_time_offset.py`。
+
+**符号约定**：`Δt > 0` 表示 **BOX 时间戳偏晚**，即 `ω_gyro(t_cam + Δt) ≈ R_rig_imu · ω_rig(t_cam)`；
+修正是 `t_box -= Δt`，等价于「在 `t_cam + Δt` 处查 BOX 样本」。
+
+| session | BOX | 采纳 episode | Δt | 逐 episode σ |
+|---|---|---|---|---|
+| `..._9ch_v1_20260817_162847` | `box1672693301` | 3 / 3 | **+4.39 ms** | 0.20 ms |
+| `..._9ch_v1_20260817_162847` | `box1819152274` | 3 / 3 | **−1.18 ms** | 2.3 ms |
+| `..._10ch_v1_20260821_173941` | `box1672693301` | 13 / 13 | **+4.71 ms** | 1.16 ms |
+
+同一个 BOX 在相隔四天的两个 session 上给出 +4.4 / +4.7 ms——**这是可复现的常量**，
+不是 §5.4 里那个逐 episode 乱跳的 `N/fps` skew。**左右两个 BOX 的 Δt 不同**（+4.4 vs −1.2 ms），
+所以不能共用一个常数：它主要由各自的 UDP 传输延迟决定。
+
+**这个数目前没有被任何代码消费**——录制器不减它，已录数据都带着它。
+
+> **不要把它读成「标完就到亚毫秒了」。** 标定去掉的是**偏置**，去不掉的是逐帧
+> **最近邻量化**，而后者按传感器不同、且更大：`间隔/√12` = six_d_force 0.6 ms、
+> imu 1.2 ms、gripper/trigger 2.4 ms、**touch 4.8 ms**。也就是说端到端的主导项是
+> **查表方式**而不是时钟，touch 要做到亚毫秒只能把最近邻换成插值。
 
 ## 6. 完整对齐流程（per episode）
 
@@ -603,6 +647,10 @@ BOX SDK 对**所有**触觉贴片都用同一个 239 槽定长数组 `TouchSenso
 | 2026-07-16 | BOX↔相机固定 skew 量化（7 ep, `water_pouring_20260715_*`） | `N/fps` vs 硬件 SOF δ=−11~−53ms 逐 episode 变；真实帧率 60.000±0.002fps、`N/fps` 漂移可忽略；注入 gripper≤9mm/力≤4.2N。详见 `experiments/ts_sync_skew_20260716/` |
 | 2026-07-16 | 修复:BOX NN 改用 sensor_timestamp（L3b+） | `camera_frame_times_rel`+`_build_episode_rows(frame_times_s=)`；真机数据验证 timestamp 列不变、gripper 修正 max 8.96mm；回归测试 15 passed |
 | 2026-07-29 | IMU 四元数半球（213 条 IMU 流 / 323,213 样本） | 反极翻转 **0 次**（SDK 流本身连续）；31 条流自然穿过 `w=0`,强制半球反而注入 L2=2.0 符号跳变 → **决定不强制**。详见 `experiments/imu_quat_hemisphere_20260729/` |
+| 2026-08-25 | BOX↔相机残余偏移（gyro↔vision 互相关） | `box1672693301` = **+4.39 / +4.71 ms**（0817/0821 两个 session，逐 episode σ 0.20/1.16 ms），`box1819152274` = **−1.18 ms**；同时解出 `R_rig_imu` ≈ 90° yaw（两 BOX 各 89.5°/88.2°，跨 session 复现 ~1°）。见 §5.5 |
+| 2026-08-25 | 传感器实际速率（当前固件） | six_d_force **520 Hz** · imu **244 Hz** · gripper/trigger **120 Hz** · touch **60 Hz**——与 2026-06-15 记的 199/50 Hz 已不同，最近邻量化项须按实测速率算 |
+| 2026-08-25 | `sensor_timestamp_ns` 内核打戳抖动 | 逐相机 p50 0.04–0.07 / p95 0.15–0.22 ms（尾部 2.6 ms），0817/0821/0824 三批、每台相机一致；而硬件 `sof_tsc_ns` 跨相机只差 **8 µs**。`camera_frame_times_rel` 用的是前者，450 mm/s 下 p95 折 0.09 mm，属记录项 |
+| 2026-08-25 | MCU→host 回归的数值条件性（精确有理数对照，72 sensor-episode） | 旧的原始平方和写法：RMS **0.107** / p95 **0.291** / 峰值 **0.568 ms**，形态为绕 episode 中点的转动（整段均值 <0.3 µs）；改去均值后降到 **0.3 µs**。Δt 不受影响（4.39 → 4.35 ms）。见 §5.2 |
 | 待验 | 部署侧 skew（frame bus + 实时 BOX） | 需先上推理部署,再量化在线路径残余 skew 并与训练侧对齐（§10 P1） |
 
 ## 10. TODO / 后续工作
@@ -615,6 +663,6 @@ BOX SDK 对**所有**触觉贴片都用同一个 239 槽定长数组 `TouchSenso
 
 | 优先级 | TODO | 说明 |
 |--------|------|------|
-| P1 | 部署侧 skew 实测 + 训练/部署对齐 | 训练侧固定 skew 已于 2026-07-16 用 `sensor_timestamp` 量化并修复（δ=−11~−53ms,见 `experiments/ts_sync_skew_20260716/`）。**剩余**:闭环真正要求「训练对齐 == 部署对齐」,而部署走 online frame bus + 实时 BOX 的另一条路径,其残余 skew 尚未实测。**理由:目前还没有做推理部署**,故挂 TODO;届时把在线路径也锚到硬件 SOF 采集时刻基准并量化。原 tap-test 已非必需（skew 可纯数据量化）,仅在需要绝对地锚定 BOX↔相机延迟时再做。 |
+| P1 | 部署侧 skew 实测 + 训练/部署对齐 | 训练侧固定 skew 已于 2026-07-16 用 `sensor_timestamp` 量化并修复（δ=−11~−53ms,见 `experiments/ts_sync_skew_20260716/`）。**剩余**:闭环真正要求「训练对齐 == 部署对齐」,而部署走 online frame bus + 实时 BOX 的另一条路径,其残余 skew 尚未实测。**理由:目前还没有做推理部署**,故挂 TODO;届时把在线路径也锚到硬件 SOF 采集时刻基准并量化。原 tap-test 已非必需（skew 可纯数据量化）,仅在需要绝对地锚定 BOX↔相机延迟时再做——**该绝对锚定已于 2026-08-25 用 gyro↔vision 互相关完成（§5.5），无需 tap-test**；同一工具可直接用于量化在线路径。 |
 | P2 | frame bus 性能升级（仅在线推理需要） | 纯数据采集落盘无需处理。当前 tmpfs NV12 双缓冲用于实时推理/预览；若 8 路 60Hz 在线推理吞吐吃紧，再升级 CUDA/DMABUF zero-copy IPC 或共享内存 ring buffer。 |
 | P3 | BOX uint32 µs 时间戳 unwrap | 当前短 episode 不受影响；长会话/连续录制前在客户端 poll loop 检测回绕并累加 2^32。 |
