@@ -589,6 +589,23 @@ def selected_state_names(features: dict[str, Any], state_keys: list[str]) -> lis
     return names
 
 
+def action_drop_column_indices(base_action_names: list[str], drop_dims: list[str]) -> list[int]:
+    """Columns of the *base* action (before appended selectors) that ``drop_dims`` names.
+
+    Refuses a name that is not an action dim rather than silently dropping nothing: a typo here
+    would otherwise produce a view that still carries the axis it was built to remove, and the
+    only symptom would be a policy that keeps predicting it.
+    """
+    missing = [name for name in drop_dims if name not in base_action_names]
+    if missing:
+        raise ValueError(
+            f"--action-drop-dims names are not action dims: {missing}; have {base_action_names}"
+        )
+    if len(drop_dims) >= len(base_action_names):
+        raise ValueError("--action-drop-dims would drop every action dim.")
+    return sorted(base_action_names.index(name) for name in drop_dims)
+
+
 def select_state_matrix(df: pd.DataFrame, features: dict[str, Any], selectors: list[str]) -> np.ndarray:
     parts: list[np.ndarray] = []
     for selector in selectors:
@@ -748,6 +765,7 @@ def prepare_dataset_view(
     camera_crop_specs: dict[str, list[int]] | None,
     copy_videos: bool,
     overwrite: bool,
+    action_drop_dims: list[str] | None = None,
     action_mode: str = ACTION_MODE_ABSOLUTE_EE,
     exclude_episodes: set[int] | None = None,
     respect_annotations: bool = True,
@@ -1086,6 +1104,27 @@ def prepare_dataset_view(
                 )
                 action = action.astype(np.float32)
                 delta_reports.append(delta_report)
+            if action_drop_dims:
+                # Dropped after the delta is derived, never before: the reference pose is rebuilt
+                # from all six components, so differencing a already-truncated action would put
+                # the rotation error into the axes that are kept. Deployment restores the dropped
+                # axes as exact zeros -- see fr3_act_infer_real_runtime.decode_action_to_robot_command.
+                base_action_names = (
+                    delta_action_names
+                    if is_delta_action_mode(action_mode)
+                    else list(features[action_key].get("names") or [])
+                )
+                if len(base_action_names) != action.shape[1]:
+                    raise ValueError(
+                        f"--action-drop-dims needs named action dims; {action_key} has "
+                        f"{action.shape[1]} columns and {len(base_action_names)} names."
+                    )
+                keep_columns = [
+                    index
+                    for index in range(action.shape[1])
+                    if index not in set(action_drop_column_indices(base_action_names, action_drop_dims))
+                ]
+                action = action[:, keep_columns]
             action_append = select_action_append_matrix(
                 df,
                 features,
@@ -1199,6 +1238,9 @@ def prepare_dataset_view(
         # The delta names carry the reference, which is what makes the view self-describing:
         # an offline tool can tell from the column names alone how to integrate it back.
         action_names = delta_action_names
+    if action_drop_dims and action_names is not None:
+        dropped = set(action_drop_dims)
+        action_names = [name for name in action_names if name not in dropped]
     if action_names is None or len(action_names) != base_action_dim:
         action_names = [f"action.{i}" for i in range(base_action_dim)]
     action_names = [*action_names, *append_feature_names]
@@ -1258,6 +1300,7 @@ def prepare_dataset_view(
                 ],
                 "action_mode": action_mode,
                 "action_key": None if action_npy else action_key,
+                "action_drop_dims": action_drop_dims or [],
                 "action_append_selectors": action_append_selectors,
                 "action_append_shift": action_append_shift,
                 "image_resize_shape": image_resize_shape,
@@ -1279,6 +1322,7 @@ def prepare_dataset_view(
         "state_keys": state_keys,
         "action_key": None if action_npy else action_key,
         "action_npy": str(action_npy) if action_npy else None,
+        "action_drop_dims": action_drop_dims or [],
         "action_append_selectors": action_append_selectors,
         "action_append_names": append_feature_names,
         "action_append_shift": action_append_shift,
@@ -1534,6 +1578,7 @@ def adopt_existing_view(args: argparse.Namespace, view_root: Path) -> dict[str, 
     manifest = load_json(manifest_path)
     args.cameras = ",".join(manifest["cameras"])
     args.state_keys = ",".join(manifest["state_keys"])
+    args.action_drop_dims = ",".join(manifest.get("action_drop_dims") or [])
     args.action_append_selectors = ",".join(manifest["action_append_selectors"])
     args.action_append_names = ",".join(manifest["action_append_names"])
     args.action_mode = manifest["action_mode"]
@@ -1688,6 +1733,7 @@ def make_inference_config(
             "action_key": "action",
             "action_source_key": None if args.action_npy else args.action_key,
             "action_npy": str(args.action_npy) if args.action_npy else None,
+            "action_drop_dims": parse_csv(args.action_drop_dims),
             "action_append_selectors": action_append_selectors,
             "action_append_names": action_append_names,
             "action_append_shift": args.action_append_shift,
@@ -2002,6 +2048,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--action-key", default="action")
     parser.add_argument("--action-npy", type=Path, default=None)
     parser.add_argument("--use-derived-action", action="store_true")
+    parser.add_argument(
+        "--action-drop-dims",
+        default="",
+        help=(
+            "Comma-separated action dim names to leave out of the view, e.g. "
+            "delta_ee_from_prev_cmd.drx,delta_ee_from_prev_cmd.dry. For axes the teleop rig locks: "
+            "their recorded signal is numerical noise, and normalising a noise-only range hands it "
+            "a real share of the loss. Deployment restores a dropped delta axis as an exact zero."
+        ),
+    )
     parser.add_argument("--action-append-selectors", default=DEFAULT_ACTION_APPEND_SELECTORS)
     parser.add_argument("--action-append-names", default=DEFAULT_ACTION_APPEND_NAMES)
     parser.add_argument("--action-append-shift", type=int, default=1)
@@ -2133,6 +2189,7 @@ def main() -> None:
     steps_supplied = cli_arg_was_supplied("--steps")
     cameras = [normalize_camera_key(key) for key in parse_csv(args.cameras)]
     state_keys = parse_csv(args.state_keys)
+    action_drop_dims = parse_csv(args.action_drop_dims)
     action_append_selectors = parse_csv(args.action_append_selectors)
     action_append_names = parse_csv(args.action_append_names)
     image_resize_shape = parse_hw(args.image_resize_shape)
@@ -2220,6 +2277,7 @@ def main() -> None:
             state_keys=state_keys,
             action_key=args.action_key,
             action_npy=args.action_npy,
+            action_drop_dims=action_drop_dims,
             action_append_selectors=action_append_selectors,
             action_append_names=action_append_names,
             action_append_shift=args.action_append_shift,

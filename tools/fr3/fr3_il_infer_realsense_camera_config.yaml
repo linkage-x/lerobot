@@ -15,15 +15,30 @@ robot:
     # only as fresh as the sensor's frame period allows, and the policy was trained on frames
     # that were ~23 ms behind the arm read at this rate. Serving it 30 Hz frames at deployment
     # doubles that lag and shifts the observation away from the training distribution.
+    #
+    # exposure_us/gain are copied from fr3_record_config.yaml and have to stay copied. Leaving
+    # them unset is not "keep whatever the device has": RealSenseCameraConfig switches auto
+    # exposure back on at connect (see configuration_realsense.py), so every rollout used to hand
+    # the policy a differently exposed scene than every recording -- brighter or darker with the
+    # room, with auto-chosen gain and auto-chosen motion blur, against a dataset whose whole point
+    # was that those are constant.
+    #
+    # It also takes the 60 Hz above back. Auto exposure lengthens the exposure in a dark room, a
+    # sensor cannot emit a frame faster than it exposes one, and past the 16.7 ms frame period the
+    # rate quietly drops -- which is exactly the staleness this file pins fps to avoid.
     ee:
       type: intelrealsense
       serial_number_or_name: "315122271876"
       width: 640
       height: 480
       fps: 60
+      exposure_us: 15000
+      gain: 70
     side:
       type: intelrealsense
       serial_number_or_name: "243122071795"
       width: 640
       height: 480
       fps: 60
+      exposure_us: 15000
+      gain: 128

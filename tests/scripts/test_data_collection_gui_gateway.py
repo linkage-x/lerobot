@@ -3166,6 +3166,74 @@ def test_recorded_dataset_items_link_a_view_to_its_source(tmp_path):
     ]
 
 
+def _add_prev_cmd_state_dims(dataset_root: Path) -> None:
+    """Give a fixture dataset the 16-dim observation the FR3 workstation actually records."""
+    info_path = dataset_root / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["features"]["observation.state"]["names"] = [
+        "ee.x", "ee.y", "ee.z",
+        "prev_cmd.ee.x", "prev_cmd.ee.y", "prev_cmd.ee.z",
+        "ee.qx", "ee.qy", "ee.qz", "ee.qw",
+        "prev_cmd.ee.qx", "prev_cmd.ee.qy", "prev_cmd.ee.qz", "prev_cmd.ee.qw",
+        "gripper.pos", "prev_cmd.gripper.pos",
+    ]
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+
+def test_training_view_command_drops_prev_cmd_from_the_observation(tmp_path):
+    # prev_cmd.* is the reference frame the delta action is measured against, and
+    # prev_cmd.gripper.pos equals the gripper label on 98.8% of frames -- leaving them in the
+    # observation lets a policy answer without ever reading the cameras.
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+    _add_prev_cmd_state_dims(dataset_root)
+
+    command, _ = gateway._training_view_command(state, dataset_root, "delta_ee_from_prev_cmd")
+
+    selectors = command[command.index("--state-keys") + 1].split(",")
+    assert selectors == [
+        "observation.state:ee.x",
+        "observation.state:ee.y",
+        "observation.state:ee.z",
+        "observation.state:ee.qx",
+        "observation.state:ee.qy",
+        "observation.state:ee.qz",
+        "observation.state:ee.qw",
+        "observation.state:gripper.pos",
+    ]
+    assert not any("prev_cmd" in selector for selector in selectors)
+
+
+def test_training_view_command_keeps_the_whole_state_when_there_is_no_prev_cmd(tmp_path):
+    # A rig whose observation was never built with prev_cmd.* must not be rewritten into a
+    # per-dim selector list: the fallback keeps this a no-op there.
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+
+    command, _ = gateway._training_view_command(state, dataset_root, "delta_ee_from_prev_cmd")
+
+    assert command[command.index("--state-keys") + 1] == "observation.state"
+
+
+def test_training_view_command_drops_the_locked_rotation_axes_from_a_delta_action(tmp_path):
+    # scale_wx/scale_wy are 0 in the teleop config, so drx/dry carry 3.6e-5 rad of numerical
+    # noise -- below the policy's own sampling noise, and it accumulates in a delta contract.
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+
+    command, _ = gateway._training_view_command(state, dataset_root, "delta_ee_from_prev_cmd")
+
+    assert command[command.index("--action-drop-dims") + 1] == (
+        "delta_ee_from_prev_cmd.drx,delta_ee_from_prev_cmd.dry"
+    )
+
+
+def test_training_view_command_drops_no_action_dim_from_an_absolute_view(tmp_path):
+    # An absolute view's rotation is a quaternion; no single component is the locked axis.
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+
+    command, _ = gateway._training_view_command(state, dataset_root, "absolute_ee")
+
+    assert command[command.index("--action-drop-dims") + 1] == ""
+
+
 def test_training_view_command_names_the_job_after_dataset_and_contract(tmp_path):
     # Without an explicit job name the builder falls back to a fixed legacy name, so every view
     # would generate configs training into -- and overwriting -- the same output directory.
@@ -4567,6 +4635,210 @@ def _training_start_state(tmp_path: Path, monkeypatch) -> gateway.GatewayState:
     monkeypatch.setattr(gateway.subprocess, "Popen", lambda *args, **kwargs: _FakeTrainProcess())
     monkeypatch.setattr(gateway, "Thread", lambda *args, **kwargs: SimpleNamespace(start=lambda: None))
     return state
+
+
+def test_a_started_run_records_its_settings_for_the_next_one(tmp_path, monkeypatch):
+    # Tuning a policy means running the same view many times with one knob moved. Without this
+    # the only record of what a finished run used is its train_config.json, buried under an
+    # output directory named after a timestamp.
+    state = _training_start_state(tmp_path, monkeypatch)
+    monkeypatch.setattr(gateway, "_training_is_running", lambda _state: False)
+
+    gateway._start_training_run(
+        state,
+        {
+            "viewName": "pick__delta_ee_from_prev_cmd",
+            "policy": "pi05",
+            "steps": 40000,
+            "batchSize": 2,
+            "saveFreq": 2000,
+            "pretrainedPath": "/home/tele/Models/pi05_base",
+            "loraEnabled": True,
+            "loraR": 32,
+            "policyConfig": '{"optimizer_lr": 5e-05}',
+        },
+    )
+
+    entries = gateway._training_history_entries(state)
+    assert len(entries) == 1
+    assert entries[0]["viewName"] == "pick__delta_ee_from_prev_cmd"
+    assert entries[0]["policy"] == "pi05"
+    params = entries[0]["params"]
+    assert params["steps"] == 40000
+    assert params["batchSize"] == 2
+    assert params["loraEnabled"] is True
+    assert params["loraR"] == 32
+    assert params["policyConfig"] == '{"optimizer_lr": 5e-05}'
+    # Defaults the operator never typed are recorded as the values the run actually used, so
+    # replaying an entry reproduces that run rather than today's defaults.
+    assert params["numWorkers"] == 4
+    assert params["logFreq"] == 100
+
+
+def _write_finished_run(repo_root: Path, job_name: str, **config) -> Path:
+    """A run directory as lerobot_train leaves it: weights, and a train_config.json beside them."""
+    run_dir = repo_root / "outputs" / "train" / job_name
+    checkpoint = run_dir / "checkpoints" / "020000" / "pretrained_model"
+    checkpoint.mkdir(parents=True)
+    payload = {
+        "job_name": job_name,
+        "steps": 20000,
+        "batch_size": 16,
+        "num_workers": 4,
+        "save_freq": 1000,
+        "log_freq": 100,
+        "dataset": {"root": "/repo/outputs/exports/training_views/pick__delta_ee_from_prev_cmd"},
+        "policy": {"type": "pi05", "pretrained_path": "/models/pi05_base", "optimizer_lr": 5e-05},
+        "peft": {"method_type": "LORA", "r": 32, "target_modules": None},
+        "wandb": {"enable": True, "project": "lerobot", "entity": None},
+    }
+    payload.update(config)
+    (checkpoint / "train_config.json").write_text(json.dumps(payload), encoding="utf-8")
+    return run_dir
+
+
+def test_history_finds_runs_that_finished_before_it_was_recording(tmp_path, monkeypatch):
+    # The whole point of copying settings is the runs already on disk. Gating the list on a file
+    # only future starts write would have shown an empty control to everyone who had history.
+    state = _training_start_state(tmp_path, monkeypatch)
+    _write_finished_run(state.repo_root, "pick__pi05__20260825_075239")
+
+    entries = gateway._training_history_entries(state)
+
+    assert [entry["jobName"] for entry in entries] == ["pick__pi05__20260825_075239"]
+    entry = entries[0]
+    assert entry["policy"] == "pi05"
+    assert entry["viewName"] == "pick__delta_ee_from_prev_cmd"
+    # The timestamp the job name carries, not the moment the page happened to look.
+    assert entry["startedAt"].startswith("2026-08-25T07:52:39")
+    params = entry["params"]
+    assert params["batchSize"] == 16
+    assert params["loraEnabled"] is True
+    assert params["loraR"] == 32
+    assert params["pretrainedPath"] == "/models/pi05_base"
+    assert json.loads(params["policyConfig"]) == {"optimizer_lr": 5e-05}
+
+
+def test_a_recovered_run_carries_only_policy_keys_the_form_owns(tmp_path, monkeypatch):
+    # train_config.json also holds the frames' own properties -- features, normalisation stats.
+    # Copying those into the JSON box would pin the next run to the previous view's shape.
+    state = _training_start_state(tmp_path, monkeypatch)
+    _write_finished_run(
+        state.repo_root,
+        "pick__pi05__20260825_075239",
+        policy={
+            "type": "pi05",
+            "optimizer_lr": 5e-05,
+            "normalization_mapping": {"ACTION": "MIN_MAX"},
+            "input_features": {"observation.state": {"shape": [16]}},
+            "output_features": {"action": {"shape": [7]}},
+        },
+    )
+
+    params = gateway._training_history_entries(state)[0]["params"]
+
+    assert json.loads(params["policyConfig"]) == {
+        "optimizer_lr": 5e-05,
+        "normalization_mapping": {"ACTION": "MIN_MAX"},
+    }
+
+
+def test_a_dense_run_is_not_reported_as_lora(tmp_path, monkeypatch):
+    state = _training_start_state(tmp_path, monkeypatch)
+    _write_finished_run(state.repo_root, "pick__act__20260821_095253", peft=None, policy={"type": "act"})
+
+    params = gateway._training_history_entries(state)[0]["params"]
+
+    assert params["loraEnabled"] is False
+
+
+def test_a_run_that_never_wrote_a_checkpoint_is_skipped(tmp_path, monkeypatch):
+    # A run that died during startup leaves the directory but nothing to reproduce.
+    state = _training_start_state(tmp_path, monkeypatch)
+    (state.repo_root / "outputs" / "train" / "died__act__20260821_095253").mkdir(parents=True)
+
+    assert gateway._training_history_entries(state) == []
+
+
+def test_a_recorded_run_wins_over_the_same_run_on_disk(tmp_path, monkeypatch):
+    # Both sources describe one run. The recorded one holds what the operator asked for; the
+    # reconstruction can only see what lerobot_train resolved it to.
+    state = _training_start_state(tmp_path, monkeypatch)
+    monkeypatch.setattr(gateway, "_training_is_running", lambda _state: False)
+    started = gateway._start_training_run(
+        state, {"viewName": "pick__delta_ee_from_prev_cmd", "policy": "act", "steps": 1234}
+    )["training"]
+    _write_finished_run(state.repo_root, started["jobName"], steps=9999)
+
+    entries = gateway._training_history_entries(state)
+
+    assert [entry["jobName"] for entry in entries] == [started["jobName"]]
+    assert entries[0]["params"]["steps"] == 1234
+
+
+def test_history_is_newest_first_across_runs(tmp_path, monkeypatch):
+    state = _training_start_state(tmp_path, monkeypatch)
+    monkeypatch.setattr(gateway, "_training_is_running", lambda _state: False)
+
+    gateway._start_training_run(
+        state, {"viewName": "pick__delta_ee_from_prev_cmd", "policy": "act", "steps": 1000}
+    )
+    gateway._start_training_run(
+        state, {"viewName": "pick__delta_ee_from_prev_cmd", "policy": "pi05", "steps": 2000}
+    )
+
+    entries = gateway._training_history_entries(state)
+    assert [entry["params"]["steps"] for entry in entries] == [2000, 1000]
+
+
+def test_history_does_not_grow_without_bound(tmp_path, monkeypatch):
+    # The file is read whole on every poll of the Training page.
+    state = _training_start_state(tmp_path, monkeypatch)
+    monkeypatch.setattr(gateway, "_training_is_running", lambda _state: False)
+    monkeypatch.setattr(gateway, "_TRAINING_HISTORY_LIMIT", 3)
+
+    for step_count in range(1, 6):
+        run = gateway._start_training_run(
+            state,
+            {"viewName": "pick__delta_ee_from_prev_cmd", "policy": "act", "steps": step_count},
+        )["training"]
+        # Stand in for the trainer creating its output directory, which is what makes the next
+        # start inside the same second pick a distinct job name rather than colliding.
+        (state.repo_root / run["outputDir"]).mkdir(parents=True)
+
+    entries = gateway._training_history_entries(state)
+    assert [entry["params"]["steps"] for entry in entries] == [5, 4, 3]
+
+
+def test_history_ignores_an_entry_that_carries_no_settings(tmp_path, monkeypatch):
+    # Hand-edited or half-written files must not take the Training page down with them.
+    state = _training_start_state(tmp_path, monkeypatch)
+    path = gateway._training_history_path(state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"runs": [{"jobName": "no-params"}, "not-a-dict", {"params": {"steps": 7}}]}),
+        encoding="utf-8",
+    )
+
+    entries = gateway._training_history_entries(state)
+
+    assert [entry["params"]["steps"] for entry in entries] == [7]
+
+
+def test_history_offers_back_only_settings_the_form_knows(tmp_path, monkeypatch):
+    # A stray key from a future (or hand-edited) record must not be handed to the page, which
+    # would spread it into the next start payload unchecked.
+    state = _training_start_state(tmp_path, monkeypatch)
+    path = gateway._training_history_path(state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"runs": [{"jobName": "j", "params": {"steps": 5, "somethingElse": "x"}}]}),
+        encoding="utf-8",
+    )
+
+    params = gateway._training_history_entries(state)[0]["params"]
+
+    assert params == {"steps": 5}
 
 
 def test_a_run_is_named_for_when_it_started_not_just_for_what_it_trains(tmp_path, monkeypatch):

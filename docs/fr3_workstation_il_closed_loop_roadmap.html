@@ -365,6 +365,190 @@ Rollout
 
     <div class="card full">
       <div class="section-head">
+        <h2>ROI / Camera Crop 的训练-推理合同</h2>
+        <span class="badge p0">2026-08-25 定位失败根因</span>
+      </div>
+      <p>Training View 的 camera crop 一直是<b>只作用于训练侧</b>的变换。它把裁剪后的像素烘进 view 的视频，view 的 feature shape 就是裁剪框的尺寸，于是 checkpoint 声明要一张只存在于那个矩形里的图；而 rollout 读的是整幅传感器帧，旧代码直接 <code>cv2.resize</code> 到 feature shape，从不裁剪。</p>
+      <table class="table">
+        <tr><th>侧</th><th>网络实际看到的</th></tr>
+        <tr>
+          <td>训练</td>
+          <td><code>ee</code> = 源帧 <code>[58,194,542,286]</code>、<code>side</code> = 源帧 <code>[108,58,444,382]</code> 这两个矩形内的像素。</td>
+        </tr>
+        <tr>
+          <td>推理（修复前）</td>
+          <td>整幅 <code>640x480</code> 被压进 <code>542x286</code> / <code>444x382</code>。日志原文：<code>policy_image_preprocess camera=ee raw_shape_hwc=(480, 640, 3) policy_feature_chw=(3, 286, 542) method=cv2.resize_no_crop</code></td>
+        </tr>
+      </table>
+      <p>两侧的映射差是一个<b>缩放 + 平移的仿射错位</b>，不是噪声。以 <code>ee</code> 为例，训练是 <code>v = Y - 194</code>，推理是 <code>v = 0.596&nbsp;Y</code>，在 ROI 顶部错位达 116 px / 286 行（约 40% 图高）。peg-in-hole 的精定位主要靠这颗 wrist 相机，这一项足以单独解释“轨迹形态对、就是伸不到位”。</p>
+      <div class="callout p0">
+        <b>为什么它一直没被发现：</b>两条路径产出的图像 <i>形状完全相同</i>，都是 policy 声明的 feature shape。没有任何一层会报错——shape 检查通过、rollout 正常跑完、clamp/leash 不触发。唯一的线索是那行 <code>method=cv2.resize_no_crop</code>，以及 manifest 里非空的 <code>camera_crop_specs</code>。
+      </div>
+      <h3 style="margin:14px 0 6px">ROI 形状本身不会拉伸图像</h3>
+      <p>pi0.5 侧用的是 <code>resize_with_pad_torch</code>（<code>src/lerobot/policies/pi05/modeling_pi05.py</code>），<code>ratio = max(w/W, h/H)</code> 等比缩放后补黑边，所以矩形 ROI 是 letterbox，不是 squeeze，几何不失真。ROI 的真实收益和代价是<b>有效像素</b>：<code>640x480</code> 等比进 224 只占 <code>224x168</code>，256 个 SigLIP patch 里 64 个（25%）是纯黑；换成接近 1:1 的 ROI 既减少黑边，又把目标线性放大。所以 ROI 值得用——前提是两侧用同一个框。</p>
+      <h3 style="margin:14px 0 6px">修复与验证顺序</h3>
+      <ol>
+        <li><b>确诊。</b><code>cat &lt;view_root&gt;/meta/il_view_manifest.json | grep -A5 camera_crop_specs</code> 与 rollout 日志的 <code>grep policy_image_preprocess</code> 对照；manifest 有框而日志 <code>raw_shape_hwc</code> 是整幅传感器帧即确诊。</li>
+        <li><b>推理侧补裁剪</b>（已做）。<code>fr3_act_infer_real_runtime.py::load_camera_crop_specs()</code> 从 view manifest 读框，<code>apply_camera_crop()</code> 在 resize 之前取同一个矩形。相机分辨率与录制不一致、或框超出实时帧，都直接 raise——裁剪框是以源像素表达的，换个尺寸它框的就是场景的另一块，绝不允许静默缩放。</li>
+        <li><b>实证闭环。</b>rollout 带 <code>--debug-step0-dump-dir</code> 采一帧，跑 <code>tools/fr3/fr3_compare_live_capture_to_dataset.py</code>，把 live policy observation 和 dataset frame 并排看。<b>每次换 view / 换相机布置后都应作为 preflight 跑一次。</b>
+          <br><b>注意它的 MAE 不能当 crop 的门限。</b>step0 的状态匹配是自证的：<code>T_B_Ws</code> 正是从这一帧观测解出来的，所以转换后的 live state 必然贴着 dataset 起始位姿合同，<code>[START_MATCH]</code>/<code>[FRAME_MATCH]</code> 的 0.1~0.2 mm 是恒等式而非证据；被选中的 dataset 帧只是某条 episode 的近起始帧，物体摆放与现场无关，图像 MAE 因此被场景布置和曝光支配（实测 mae_255≈46~49）。真正的 crop 门限是 rollout 日志那行 <code>crop_xywh</code> 必须等于 manifest、且 <code>cropped_shape_hwc</code> 必须等于 <code>policy_feature_chw</code>（已由 <code>tests/scripts/test_fr3_act_infer_real.py</code> 锁住）；这个工具的价值是把两张图摆在一起看几何对不对——wrist 相机的两根手指是刚性固连的，它们在画面里的位置就是裁剪几何的直读。把它接进 preflight 时修掉了它自己的两处阻塞：帧扫描把 parquet 名写死成六位 <code>file-000000</code>（Training View 建的 view 是 <code>file-000</code>，现改走 <code>infer_runtime._resolve_dataset_data_file</code>），以及 E/I 帧假设段只会重建 <code>ee.*</code>/<code>gripper.pos</code>、遇到 <code>delta_ee_from_prev_cmd</code> 的 <code>prev_cmd.*</code> 直接 KeyError 崩掉（现改为打 WARN 跳过，图像比对照常出）。</li>
+        <li><b>再训。</b>清干净以上后再动训练超参，且优先改 batch 与 LoRA target（见任务清单），而不是继续加 LoRA rank。</li>
+      </ol>
+      <div class="callout p0">
+        <b>同一族的第二处不对称：曝光/增益。</b><code>fr3_record_config.yaml</code> 把两颗相机钉死在 <code>exposure_us: 15000</code>（ee <code>gain: 70</code>、side <code>gain: 128</code>），而 <code>fr3_il_infer_realsense_camera_config.yaml</code> 两个都没设。这不是“沿用设备上的值”——<code>configuration_realsense.py</code> 写得很清楚：<i>Leaving <code>exposure_us</code> unset does not mean &quot;keep whatever is there&quot;; it means auto exposure is switched back on at connect</i>。所以**每次 rollout 都把相机切回自动曝光**，而整个数据集的立论前提是曝光、增益、运动模糊恒定。附带还把 60 Hz 让了出去：自动曝光在暗处会把曝光拉过 16.7 ms 帧周期，帧率静默下降，正是这份 config 钉 fps 想避免的那种观测滞后。已把两组值抄回推理 config。step0 抓拍里 live 与 dataset 的色彩/对比差异肉眼可见。
+      </div>
+      <div class="callout warn">
+        <b>训练超参的两个结构性上限（与 ROI 独立，需一并处理）：</b>
+        <ul style="margin:6px 0 0">
+          <li>pi0.5 的默认 LoRA target（<code>modeling_pi05.py::_get_default_peft_targets</code>）只覆盖 action expert 的 <code>self_attn.q/v_proj</code> 加 state/action 投影，<code>modules_to_save</code> 为空——<b>SigLIP 视觉塔和 Gemma 主干完全冻结</b>。视觉 grounding 不适配本场景时，把 rank 从 16 提到 32 是在瓶颈之外加容量。</li>
+          <li><code>batch_size=2</code> 对 flow matching：每样本随机采一个时间步和一份噪声，单步梯度被采样方差主导，收敛向均值动作（幅度不足、停在分布中心）。仓库没有 gradient accumulation，batch 只能直接调大。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card full">
+      <div class="section-head">
+        <h2>Action 归一化：99.93% 的 loss 花在被锁死的两个轴上</h2>
+        <span class="badge p0">2026-08-25 训练侧根因</span>
+      </div>
+      <p><code>fr3_record_config.yaml</code> 的 teleop 段设了 <code>scale_wx: 0.0</code> / <code>scale_wy: 0.0</code>，roll 和 pitch 被关掉，SpaceMouse 只驱动 x/y/z 加 yaw。于是 <code>delta_ee_from_prev_cmd</code> 的 <code>drx</code>/<code>dry</code> 结构性地恒为零，只剩数值抖动。但 view 的 action 统计是这样的：</p>
+      <table class="table">
+        <tr><th></th><th>drx</th><th>dry</th><th>dx / dy / dz</th></tr>
+        <tr><td>q99 − q01</td><td>1.1e-05</td><td>3.1e-05</td><td>~4.6e-03</td></tr>
+        <tr><td>min..max</td><td>±1.6e-02</td><td>±1.7e-02</td><td>~1.3e-02</td></tr>
+        <tr><td>极值 / 分位带</td><td><b>1500×</b></td><td><b>550×</b></td><td>~3×</td></tr>
+      </table>
+      <p><code>NormalizationMode.QUANTILES</code> 做的是 <code>2*(x - q01)/(q99 - q01) - 1</code>，<b>不 clamp</b>（<code>normalize_processor.py</code>），所以超出分位带的值被线性外推到无界。拿 24945 帧实际动作代进去：</p>
+      <div class="flow">QUANTILES  share:  dx=0.0032%  dy=0.0048%  dz=0.0117%  drx=38.63%  dry=61.30%  drz=0.017%  grip=0.032%
+QUANTILES  |max|:  dx=3.5      dy=3.5      dz=3.4      drx=3007.2  dry=1084.3  drz=19.7    grip=1.0
+
+MIN_MAX    share:  dx=5.71%    dy=10.14%   dz=8.52%    drx=15.80%  dry=0.94%   drz=7.00%   grip=51.90%
+MIN_MAX    |max|:  所有维恒为 1.0（按构造有界）</div>
+      <div class="callout p0">
+        决定定位的三个平移维一共拿到 <b>0.02%</b> 的 loss，两个不携带任务信息的轴拿走 <b>99.93%</b>。这也同时解释了训练日志里 <code>grdn</code> 从第 2k 步起就稳定在 ~100、而 <code>grad_clip_norm</code> 是 <code>1.0</code>——每一步都被裁到单位范数，方向由 drx/dry 的噪声主导。<b>这一项的权重高于 LoRA target 和 batch size。</b>
+      </div>
+      <h3 style="margin:14px 0 6px">真机验证：两条 rollout 各自对应一个被饿死的维度</h3>
+      <p>2026-08-25，crop 与曝光都修好之后，用 checkpoint 038000 / 040000 各跑一条 <code>real_once</code>。这两条日志把上表从一个统计论证变成了观测事实。</p>
+      <div class="flow">038000 (480 步, log_interval=30, 全程 status=pass)
+step=0    safe_ee=(0.3106, -0.0018, 0.3955)  model_gripper_raw=0.89
+step=150  safe_ee=(0.4208, -0.1904, 0.1710)  model_gripper_raw=0.96
+step=300  safe_ee=(0.4216, -0.3039, 0.0492)  model_gripper_raw=0.66
+step=480  safe_ee=(0.4093, -0.2969, 0.0494)  model_gripper_raw=1.00
+
+040000 (270 步)
+step=0    safe_ee=(0.3107, -0.0038, 0.3972)  model_gripper_raw=0.92
+step=120  safe_ee=(0.4076, -0.1244, 0.2470)  model_gripper_raw=1.01
+step=270  safe_ee=(0.3916, -0.2185, 0.0489)  model_gripper_raw=1.14</div>
+      <ul>
+        <li><b>接近段是好的，安全包络不是原因。</b>两条都从 home（z=0.396）平滑下降到桌面（z≈0.049），480 步全部 <code>status=pass</code>，没有一次 clamp，leash 一次都没触发。</li>
+        <li><b>夹爪从头到尾没有闭合过。</b><code>model_gripper_raw</code> 全程在 0.58–1.17 之间抖动，最低 0.58，从未接近 0（闭合）。<code>gripper_close_below</code> 与 <code>gripper_change_delay</code> 都是 disabled，没有任何 guard 在阻止闭合——policy 输出的是围绕“张开”的噪声，它<b>没有在做闭合这个决策</b>。</li>
+        <li><b>输出越界。</b>1.06 / 1.14 / 1.17 都超出了夹爪的归一化范围 [0, 1]，是同一个未 clamp 的归一化在输出侧的镜像。</li>
+      </ul>
+      <div class="callout p0">
+        两个观测到的症状，各自精确对应一个在 loss 里被饿死的维度：平移拿 <b>0.02%</b> → 只学会“大致往下往前”，没学会精确定位；夹爪拿 <b>0.03%</b> → 压根没学。这条链条到此闭合，不需要再往下查。
+        <br><br>
+        <b>一个被证伪的预期，记在这里免得重犯：</b>修好 crop 之后曾预期“接近/伸手会明显改善”，实际没有。原因是 crop 修的是<i>感知</i>，而 policy 在平移和夹爪这两个维度上从未获得过学习信号——感知修好了也没有东西去用它。观测侧的合同和训练侧的目标函数是两件独立的事，修好其中一件不会替另一件背书。
+      </div>
+      <p><b>选 MIN_MAX 而不是 MEAN_STD。</b>MEAN_STD 把每维的 mean-square 拉平到 1.0（平移合计 42.9%），但 drx 仍留有 88σ 的尖峰，梯度尖刺不会消失；MIN_MAX 按构造把所有维界定在 [-1, 1]，而且死轴的取值被压成一个近似常数（drx 恒在 +0.54 附近），模型几步就拟合掉、此后不再贡献梯度。MIN_MAX 下夹爪占到 51.9% 看着偏高，但它恰好是当前坏得最彻底的那一维，而且是一个真实的双峰信号（mean 0.553 / std 0.489），这个分配是想要的而不是要修的。<b>无需重建 training view</b>——min/max 已经在 <code>meta/stats.json</code> 里，归一化模式是 policy 侧的选择。STATE 侧不要动：那边每一维的极值/分位带比值都在 1.0–1.9，没有这个病。</p>
+      <p class="small">在训期早停判据，别等四小时：<b>(1)</b> 2k 步时 <code>grdn</code> 应从 ~100 掉到 O(1–10)，还停在 ~100 就是这个判断错了，立刻停；<b>(2)</b> MIN_MAX 下动作有界，loss 绝对值应落在 O(1) 量级，不再是 52–600。</p>
+    </div>
+
+    <div class="card full">
+      <div class="section-head">
+        <h2>归一化不是根因：契约让 policy 不看图就能答对</h2>
+        <span class="badge p0">2026-08-26 契约根因</span>
+      </div>
+      <p>换到 MIN_MAX 之后重训，<b>定位没有变准，而且多出了数据集里从未出现过的两个轴的旋转</b>。三条测量把根因从归一化推到了<b>动作契约与观测契约</b>本身。全部在 checkpoint 自己的训练数据上测得。</p>
+
+      <h3 style="margin:14px 0 6px">RC1 — 夹爪的标签就是它自己的输入</h3>
+      <div class="flow">action.gripper.pos  vs  observation.state.prev_cmd.gripper.pos   (全部 24945 帧)
+  逐帧完全相同 (&lt;1e-6)     = 98.765%
+  R² of copying prev_cmd  = 0.999871
+  有变化的帧               = 1253 / 24945 = 5.02%
+  每条 episode 的斜坡事件   = 2 次（闭 / 开），各约 12 帧
+  遥操增量直方图            -0.10: 1.49%   -0.05: 1.04%   0.00: 94.97%   +0.05: 1.00%   +0.10: 1.50%
+  半开帧 (0.05&lt;g&lt;0.95)     = 1210 (4.85%)
+  100 次斜坡事件的落点       → 0.00: 50 次   → 1.00: 49 次   → 0.90: 1 次</div>
+      <p>夹爪这一维 99.99% 由一个<b>输入特征</b>决定。真正携带决策信息的只有斜坡起点：2 次 × 50 episodes = <b>100 帧</b>，占全数据集 0.4%。模型学到的正是这个 copy（<code>corr(pred, prev_cmd)=0.965</code>），部署时成为<b>不动点</b>：起始 <code>prev_cmd=1.0</code> → 预测 1.0 → 写回 <code>prev_cmd</code> → 永远张开。rollout 里 <code>model_gripper_raw</code> 在 0.92–1.04 之间钉死 500 步，与此完全吻合。MIN_MAX 给了夹爪 51.9% 的 loss 权重，但其中 99.6% 花在“把输入抄给输出”的帧上——<b>不是权重不够，是标签里没有信息。</b></p>
+      <div class="callout warn">
+        <b>一处自我修正：</b>先前记为“斜坡是恒定 0.10/帧的事后 rate limiter”。细直方图显示是 ±0.05 与 ±0.10 <b>两档遥操增量</b>（按键力度），不是 limiter，是操作者的真实输入。因此<b>不要</b>把夹爪目标压成二值：100 次事件里虽有 99 次落在两端，但 4.85% 的半开帧是真实中间状态，且确有 1 次停在 0.90。连续目标保留，copy 通路由 RC3 的 state 改动切断即可。
+      </div>
+
+      <h3 style="margin:14px 0 6px">RC2 — 两个旋转轴的信号低于模型自己的采样噪声</h3>
+      <p>固定 flow-matching 噪声种子后的消融（原始弧度单位）：</p>
+      <table class="table">
+        <tr><th>维</th><th>数据集信号 std</th><th>模型采样噪声</th><th>噪声 / 信号</th><th>训练帧上的 R²</th></tr>
+        <tr><td><code>drx</code></td><td>3.59e-05</td><td>2.75e-04</td><td><b>7.7×</b></td><td><b>−57.9</b></td></tr>
+        <tr><td><code>dry</code></td><td>1.42e-04</td><td>5.79e-04</td><td><b>4.1×</b></td><td><b>−3.3</b></td></tr>
+        <tr><td><code>drz</code></td><td>3.95e-04</td><td>6.05e-04</td><td>1.5×</td><td>−0.07</td></tr>
+      </table>
+      <p>三个旋转轴上，模型<b>仅采样随机性就大于真实信号</b>。<code>drx</code> 的 MIN_MAX 反归一化尺度是 <code>span/2 = 1.04e-2</code> rad，信号 std 只有 3.59e-5——<b>290 倍失配</b>。QUANTILES 时代这个尺度是 1.1e-5（小约 1000 倍），所以同样的噪声当时看不见。契约是 delta，噪声<b>逐帧累加</b>：rollout 里 rot 漂移涨到 8.00° 撞上 leash，<b>441/503 记录步是 <code>leash_limited</code></b>，x 从 0.309 漂到 0.605，跑出工作空间 30 cm。这正是“数据集中没出现过的两个轴的旋转”。<b>是上一轮把 QUANTILES 换成 MIN_MAX 换出来的</b>——按 range 分配权重，而 drx/dry 的 range 全是离群噪声。</p>
+
+      <h3 style="margin:14px 0 6px">RC3 — 契约可作弊度：不看图的线性模型能答对多少</h3>
+      <p>留出 10 条 episode，用<b>完全不看图</b>的线性模型拟合各契约。R² 越高 = 越好作弊 = 越不逼模型用视觉。</p>
+      <table class="table">
+        <tr><th>契约</th><th>chunk-50<br>16 维 state</th><th>chunk-50<br><b>8 维</b>（去 prev_cmd）</th><th>首帧<br>16 维</th><th>首帧<br><b>8 维</b></th></tr>
+        <tr><td><code>delta_ee_from_prev_cmd</code>（当前）</td><td>0.4184</td><td><b>0.2837</b></td><td>0.6772</td><td><b>0.1630</b></td></tr>
+        <tr><td><code>delta_ee_from_current</code></td><td>0.7049</td><td>0.4243</td><td>0.9954</td><td>0.2179</td></tr>
+        <tr><td><code>absolute_ee</code></td><td>0.9482</td><td>0.8648</td><td>0.9999</td><td>0.9754</td></tr>
+        <tr><td><code>rel_to_episode_start</code></td><td>0.9486</td><td>0.8636</td><td>0.9996</td><td>0.9749</td></tr>
+        <tr><td><code>rel_to_chunk_start</code></td><td>0.8069</td><td>0.3158</td><td>0.9954</td><td>0.2179</td></tr>
+      </table>
+      <p>另一侧的对照：pi0.5 策略在<b>自己的训练帧</b>上被 16 维线性回归全面超过——<code>dx</code> 0.234 vs <b>0.847</b>，<code>dy</code> 0.244 vs <b>0.948</b>，<code>dz</code> 0.319 vs <b>0.952</b>。这不是过拟合，是<b>根本没拟合</b>：归一化空间里夹爪占动作总方差 92.5%，平移三轴合计只有 7.1%，而那 92.5% 是“抄一下就拿满”的假方差。loss 0.025 几乎全部来自“抄会了夹爪”，视觉通路从未被优化压力推动过（<code>target_modules: None</code>，VLM 冻结，LoRA 只在 action expert 上）。</p>
+      <div class="callout p0">
+        <b>结论：契约本身不用换，问题全在 state 里的 <code>prev_cmd</code>。</b>同一个 <code>delta_ee_from_prev_cmd</code>，首帧可作弊度 0.6772 → <b>0.1630</b>，只因为去掉了 prev_cmd——这是本轮最高杠杆的单点改动，且是纯 flag。
+      </div>
+      <div class="callout warn">
+        <b>两处被证伪的建议，记下来免得重提：</b>
+        <br>• <b><code>--action-mode absolute_ee</code> 是错的</b>（上一轮提过）。它是表里<b>最</b>好作弊的契约（8 维首帧 0.9754），不看图就能拿 97.5%。“绝对姿态不累积漂移”成立，但代价是把视觉压力彻底拿掉，而病症恰恰是模型不看图。
+        <br>• <b><code>ee2relative_start_frame_ee</code> ≡ <code>absolute_ee</code></b>。两者 R² 差 0.0004（0.9486 vs 0.9482），因为本 rig 每条 episode 的起始位姿标准差只有 <code>xyz_std_mm=(0.26, 0.36, 0.18)</code>、rot p95 = 0.17°——起点是固定 home 位，减去它只是加了个常数偏移，信息结构一点没变。相对起始帧只在<b>起点本身有变化</b>时才有意义。（另：<code>rel_to_*</code> 在代码里不存在，<code>ACTION_MODES</code> 只有三个。）
+      </div>
+
+      <h3 style="margin:14px 0 6px">落地：view 重建命令已改</h3>
+      <p>两条都由 <code>tools/data_collection_gui/gateway.py::_training_view_command</code> 自动带上，Dataset Export 页面重建即生效：</p>
+      <div class="flow">--state-keys       observation.state:ee.x,...:ee.y,...:ee.z,
+                   ...:ee.qx,...:ee.qy,...:ee.qz,...:ee.qw,...:gripper.pos      # 16 维 → 8 维
+--action-drop-dims delta_ee_from_prev_cmd.drx,delta_ee_from_prev_cmd.dry        # 7 维 → 5 维</div>
+      <ul>
+        <li><b>state 侧</b>由 <code>_training_view_state_keys()</code> 从数据集 feature name 逐维推导，凡 <code>prev_cmd.</code> 开头一律剔除；没有 <code>prev_cmd.*</code> 的 rig 回落到整包 <code>observation.state</code>，是 no-op。</li>
+        <li><b>action 侧</b>由新增的 <code>--action-drop-dims</code> 实现（<code>fr3_train_il_policy.py</code>），在 delta 求导<b>之后</b>裁列——先裁会把旋转误差挤进保留轴。<code>absolute_ee</code> 不裁：绝对姿态是四元数，没有哪一个分量对应被锁的轴。</li>
+        <li><b>部署侧两处都已对齐。</b>（1）state：<code>_extract_dataset_state_contract_indices</code> 只要求 <code>ee.*</code> + <code>gripper.pos</code>，8 维 view 零改动可跑；delta 还原读的是<b>原始机器人 observation</b> 里的 <code>prev_cmd.*</code>，与 policy state 是两条路。（2）action：<code>decode_action_to_robot_command</code> 现在把缺失的 delta 旋转轴补回<b>精确的 0</b>——否则 <code>DeltaEEToAbsoluteEEAction</code> 会因为缺 key 而走“已经是绝对值”的直通分支，把毫米级增量当成基座标目标发给机械臂。</li>
+      </ul>
+      <p class="small">回归覆盖：<code>test_data_collection_gui_gateway.py</code>（选择器推导 / 无 prev_cmd 回落 / delta 与 absolute 的裁剪差异）、<code>test_fr3_train_il_policy.py</code>（列裁剪、错名拒绝、view 的 names 与 stats 同步收缩）、<code>test_fr3_act_infer_real.py</code>（5 维动作仍重建出绝对目标，且姿态不被扰动）。</p>
+
+      <h3 style="margin:14px 0 6px">重建后实测：预测 → 实测</h3>
+      <p>2026-08-26 16:54 重建完成（<code>build_id 2026-08-26T08:54:12Z</code>，digest <code>5322498f</code>，旧 <code>64bcf3fe</code>）。同样的留出 10 条 episode、同样的不看图线性探针，这次直接跑在 view 自己的列上——也就是 policy 真正会看到的东西。</p>
+      <table class="table">
+        <tr><th>指标</th><th>改前（16 维 state / 7 维 action）</th><th>预测</th><th><b>实测</b></th><th></th></tr>
+        <tr>
+          <td>可作弊度 chunk-50</td><td>0.4184</td><td>0.2837</td><td><b>0.2907</b></td>
+          <td>符合</td>
+        </tr>
+        <tr>
+          <td>可作弊度 首帧</td><td>0.6772</td><td>0.1630</td><td><b>0.1830</b></td>
+          <td>符合</td>
+        </tr>
+        <tr>
+          <td><code>gripper.pos</code> 首帧 R²</td><td>0.9999（抄 <code>prev_cmd</code>）</td><td>—</td><td><b>0.3064</b></td>
+          <td>copy 通路已切断</td>
+        </tr>
+      </table>
+      <p>逐维看首帧：<code>dx −0.0360</code>（不看图完全预测不了，正是要的）、<code>dy +0.3279</code>、<code>dz +0.2545</code>、<code>drz +0.0623</code>、<code>gripper.pos +0.3064</code>。</p>
+      <p><b>delta 确实在裁列之前求导</b>——manifest 的自检 <code>reconstruction_max_position_error_mm = 0.0</code>、<code>max_rotation_error_deg = 2.58e-11</code>，且 per-frame 尺度（median 1.567 mm / p95 3.577 mm / max 15.797 mm）与旧 build 逐位相同。帧数 24945、50 episodes、crop、stride(60→30) 全部未变，只有两个契约变了。</p>
+      <p>MIN_MAX loss 权重随之重新分配：</p>
+      <table class="table">
+        <tr><th></th><th>dx</th><th>dy</th><th>dz</th><th>drx</th><th>dry</th><th>drz</th><th>grip</th><th>平移合计</th></tr>
+        <tr><td>改前</td><td>5.71%</td><td>10.14%</td><td>8.52%</td><td>15.80%</td><td>0.94%</td><td>7.00%</td><td>51.90%</td><td>24.37%</td></tr>
+        <tr><td><b>实测</b></td><td><b>6.85%</b></td><td><b>12.17%</b></td><td><b>10.23%</b></td><td>—</td><td>—</td><td><b>8.41%</b></td><td><b>62.33%</b></td><td><b>29.26%</b></td></tr>
+      </table>
+      <div class="callout warn">
+        <b>夹爪现在占 62.33%，比改前的 51.90% 更高——这不是回退。</b>改前那 51.9% 里 99.6% 花在“抄输入”的废帧上；现在这 62.33% 对应的是一个首帧 R² 只有 0.31 的真任务，每一帧都在教决策边界。但它标出了下一个观察点：<b>如果这轮仍不理想，先看夹爪与平移的相对权重，不要再回头动归一化模式。</b>
+      </div>
+      <p class="small"><b>另注：</b>本次重建把 <code>task_prompt</code> 改成了 “Pick up the peg and insert it fully into the hole”（旧为 “pick the peg and insert into the hole”）。prompt 进 digest，因此这个 view 与旧 checkpoint 在指令上也不再可比。</p>
+    </div>
+
+    <div class="card full">
+      <div class="section-head">
         <h2>近期任务清单</h2>
         <span class="badge todo">Next</span>
       </div>
@@ -394,6 +578,48 @@ Rollout
           <td>所有进入训练的 dataset 为 <code>qc_pass</code> 或确认后的 <code>qc_warn</code>，warning 写入 event log。</td>
         </tr>
         <tr>
+          <td><span class="badge p0">P0</span></td>
+          <td>推理侧复现 Training View 的 camera crop，并把 step0 对比做成换 view 后的 preflight。</td>
+          <td><code>tools/fr3/fr3_act_infer_real_runtime.py::load_camera_crop_specs / apply_camera_crop</code>、<code>tools/fr3/fr3_compare_live_capture_to_dataset.py</code></td>
+          <td>rollout 日志出现 <code>crop_xywh=... method=cv2.crop_then_resize</code>，框与 manifest 一致且 <code>cropped_shape_hwc</code> 等于 <code>policy_feature_chw</code>；step0 抓拍与 dataset 帧并排看，wrist 相机的两根手指位置重合。（<b>不要</b>用图像 MAE 当门限，理由见上一张卡。）</td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0</span></td>
+          <td>推理 camera config 与 record config 的曝光/增益保持逐字一致，别再让 rollout 落回自动曝光。</td>
+          <td><code>tools/fr3/fr3_il_infer_realsense_camera_config.yaml</code>、<code>tools/fr3/fr3_record_config.yaml</code></td>
+          <td>两份 config 的 <code>exposure_us</code>/<code>gain</code>/<code>fps</code> 相同；rollout 抓拍的图像统计与 dataset 帧同量级，不随房间明暗漂移。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1</span></td>
+          <td>让 step0 对比的 E/I 帧假设段支持 <code>prev_cmd.*</code> 状态合同（目前对这类 checkpoint 跳过）。</td>
+          <td><code>tools/fr3/fr3_compare_live_capture_to_dataset_runtime.py::_build_quaternion_observation_from_rotvec_scalars / _evaluate_live_frame_hypothesis</code></td>
+          <td><code>[HYPOTHESIS]</code> 两行对 <code>delta_ee_from_prev_cmd</code> checkpoint 正常输出，不再走 WARN 跳过分支。</td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0</span></td>
+          <td>ACTION 归一化改 <code>MIN_MAX</code>（STATE 保持 <code>QUANTILES</code>）。</td>
+          <td>Training 页面 policy config 的 <code>normalization_mapping</code></td>
+          <td>训练日志 <code>grdn</code> 从 ~100 降到 O(1–10)；<code>grad_clip_norm: 1.0</code> 不再每步都触发。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1</span></td>
+          <td>把 <code>drx</code>/<code>dry</code> 从 action 空间里去掉，让动作维度与 teleop 实际自由度一致。</td>
+          <td><code>tools/fr3/fr3_train_il_policy.py</code> 的 action 构造；<code>fr3_record_config.yaml</code> 的 <code>scale_wx/scale_wy</code></td>
+          <td>action 维度为 5（dx/dy/dz/drz/grip）；归一化方式的选择不再需要为死轴买单。</td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0</span></td>
+          <td>LoRA target 扩到 VLM 主干，不要只加 rank。</td>
+          <td><code>tools/fr3/fr3_train_il_policy.py --lora-target-modules</code>、<code>src/lerobot/policies/pi05/modeling_pi05.py::_get_default_peft_targets</code></td>
+          <td>训练日志的 trainable 参数覆盖 <code>language_model</code>（视觉塔可选）；显存不足时优先退 rank 保覆盖。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1</span></td>
+          <td>把 <code>batch_size</code> 从 2 调到 8/16；不够就先关 <code>compile_model</code> 换显存。</td>
+          <td>Training 页面 policy config、<code>src/lerobot/configs/train.py</code></td>
+          <td>同 steps 下 loss 曲线方差明显下降；rollout 动作幅度不再系统性欠调。</td>
+        </tr>
+        <tr>
           <td><span class="badge warn">P1</span></td>
           <td>训练一个最小 ACT checkpoint 并跑 <code>smoke</code>/<code>preview</code>。</td>
           <td><code>tools/fr3/fr3_train_il_policy.py</code>、<code>tools/fr3/run_pick_place_infer_workstation.sh</code></td>
@@ -421,6 +647,18 @@ FR3_INFER_CHECKPOINT=outputs/train/&lt;job&gt;/checkpoints/last \
 FR3_INFER_CHECKPOINT=outputs/train/&lt;job&gt;/checkpoints/last \
   bash tools/fr3/run_pick_place_infer_workstation.sh smoke
 
+# 2b. 换 view / 动过相机后必跑：采一帧 step0，比对 live 与 dataset
+#     先 home，并把任务场景摆成录制时的样子，否则图像差异全是场景布置。
+FR3_INFER_CHECKPOINT=outputs/train/&lt;job&gt;/checkpoints/last \
+  bash tools/fr3/run_pick_place_infer_workstation.sh home
+FR3_INFER_CHECKPOINT=outputs/train/&lt;job&gt;/checkpoints/last \
+  bash tools/fr3/run_pick_place_infer_workstation.sh smoke \
+  --debug-step0-dump-dir outputs/fr3_live_step0/latest
+.venv-fr3/bin/python tools/fr3/fr3_compare_live_capture_to_dataset_runtime.py \
+  --capture-dir outputs/fr3_live_step0/latest
+# 日志里确认 crop 与 view manifest 一致：
+grep -E 'camera_crop|policy_image_preprocess' &lt;rollout log&gt;
+
 # 3. 移到 XML home keyframe start，预览相机和短步输出
 FR3_INFER_CHECKPOINT=outputs/train/&lt;job&gt;/checkpoints/last \
   bash tools/fr3/run_pick_place_infer_workstation.sh preview
@@ -432,7 +670,7 @@ FR3_INFER_CHECKPOINT=outputs/train/&lt;job&gt;/checkpoints/last \
 # 5. 第一次验收用 bounded rollout
 FR3_INFER_CHECKPOINT=outputs/train/&lt;job&gt;/checkpoints/last \
   bash tools/fr3/run_pick_place_infer_workstation.sh real_once</div>
-      <p class="small">注意：上面的第 3 到 5 步以 Phase 1 的 keyframe start pose 修复为前提；在修复前，不应把当前 SDK <code>move_to_start()</code> 视为工作站闭环合同。</p>
+      <p class="small">注意：上面的第 3 到 5 步以 Phase 1 的 keyframe start pose 修复为前提；在修复前，不应把当前 SDK <code>move_to_start()</code> 视为工作站闭环合同。第 2b 步不是可选项——crop 不匹配不会报错，只会让 rollout 稳定地伸向错误的位置。</p>
     </div>
   </div>
 </div>

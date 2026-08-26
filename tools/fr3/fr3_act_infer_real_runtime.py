@@ -59,6 +59,7 @@ from lerobot.robots.franka_research3.processor_franka_research3 import (
     PREV_CMD_QUAT_KEYS,
     PREV_CMD_ROTVEC_KEYS,
     _continuous_quaternion,
+    delta_ee_rotvec_keys,
     delta_reference_from_action_names,
 )
 from lerobot.utils.control_utils import predict_action, prepare_observation_for_inference
@@ -810,6 +811,81 @@ def resolve_alignment_dataset_root_and_state_key(dataset_root: Path) -> tuple[Pa
     source_root = _resolve_existing_dataset_root(source_dataset_root)
     source_info = _load_dataset_info(source_root)
     return source_root, _infer_source_state_key(manifest, source_info)
+
+
+def _load_crop_source_frame_shapes(
+    manifest: dict[str, Any], manifest_path: Path, feature_keys: list[str]
+) -> dict[str, tuple[int, int]]:
+    """The (H, W) each crop was drawn on, read off the recording the view was built from."""
+    roots = manifest.get('source_dataset_roots') or []
+    if not roots and manifest.get('source_dataset_root'):
+        roots = [manifest['source_dataset_root']]
+    for root_value in roots:
+        try:
+            info = _load_dataset_info(_resolve_existing_dataset_root(root_value))
+        except (FileNotFoundError, ValueError, OSError):
+            continue
+        features = info.get('features') or {}
+        shapes: dict[str, tuple[int, int]] = {}
+        for feature_key in feature_keys:
+            shape = (features.get(feature_key) or {}).get('shape')
+            if isinstance(shape, (list, tuple)) and len(shape) == 3:
+                shapes[feature_key] = (int(shape[0]), int(shape[1]))
+        if len(shapes) == len(feature_keys):
+            return shapes
+    # Not fatal: the bounds check in `apply_camera_crop` still rejects a crop that cannot fit the
+    # live frame. It only stops catching a camera opened *larger* than the recording, where the
+    # rectangle still fits and quietly frames a different part of the scene.
+    print(
+        '[WARN] camera_crop_source_frame=unknown '
+        f'reason=source_dataset_unreadable manifest={manifest_path}'
+    )
+    return {}
+
+
+def load_camera_crop_specs(dataset_root: Path) -> tuple[dict[str, list[int]], dict[str, tuple[int, int]]]:
+    """The crop a training view baked into its videos, keyed by image feature.
+
+    A view built with a camera crop stores the cropped pixels in its video and nowhere else --
+    its own feature shape *is* the crop's -- so a checkpoint trained on it asks for an image
+    that only exists inside that rectangle. The rollout reads whole sensor frames, so unless the
+    crop is replayed here it is a training-only transform: the policy gets the entire scene
+    squeezed into the rectangle's shape where it was trained on a window of it. Nothing raises,
+    because both images carry the shape the policy asked for; the scene is simply scaled and
+    shifted away from what the checkpoint saw, and the rollout reaches for the wrong place.
+
+    Returns the crops plus the (H, W) of the recording each was drawn on, so a camera opened at
+    another resolution is refused rather than cropped against the wrong pixel grid.
+    """
+    dataset_root = _resolve_repo_path(dataset_root)
+    manifest_path = dataset_root / 'meta' / 'il_view_manifest.json'
+    if not manifest_path.is_file():
+        return {}, {}
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    raw_specs = manifest.get('camera_crop_specs') or {}
+    if not isinstance(raw_specs, dict):
+        raise ValueError(f'{manifest_path} has a non-object camera_crop_specs: {raw_specs!r}')
+    crops: dict[str, list[int]] = {}
+    for feature_key, value in raw_specs.items():
+        if not isinstance(value, (list, tuple)) or len(value) != 4:
+            raise ValueError(
+                f'{manifest_path} camera_crop_specs[{feature_key!r}] must be [x, y, w, h], got {value!r}'
+            )
+        try:
+            x, y, w, h = (int(part) for part in value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f'{manifest_path} camera_crop_specs[{feature_key!r}] must contain integers, got {value!r}'
+            ) from exc
+        if x < 0 or y < 0 or w <= 0 or h <= 0:
+            raise ValueError(
+                f'{manifest_path} camera_crop_specs[{feature_key!r}] must have non-negative x/y and '
+                f'positive w/h, got {value!r}'
+            )
+        crops[str(feature_key)] = [x, y, w, h]
+    if not crops:
+        return {}, {}
+    return crops, _load_crop_source_frame_shapes(manifest, manifest_path, sorted(crops))
 
 
 def move_to_das_start_if_requested(*, robot_ip: str, enabled: bool) -> None:
@@ -1842,6 +1918,34 @@ def extract_action_gripper_raw(action_tensor: torch.Tensor, action_names: list[s
     )
 
 
+def apply_camera_crop(
+    image: np.ndarray,
+    crop: list[int],
+    *,
+    feature_key: str,
+    source_hw: tuple[int, int] | None,
+) -> np.ndarray:
+    """Take the same rectangle out of a live frame that the training view took out of its video.
+
+    Both mismatches raise rather than warn. A crop is expressed in the recording's own pixels, so
+    against any other frame size it is not an approximation of the training view -- it is a
+    different part of the scene, and the rollout that follows looks healthy the whole way down.
+    """
+    x, y, w, h = (int(part) for part in crop)
+    frame_h, frame_w = int(image.shape[0]), int(image.shape[1])
+    if source_hw is not None and (frame_h, frame_w) != source_hw:
+        raise ValueError(
+            f'{feature_key}: live frame is {frame_w}x{frame_h} but the training view crop {crop} was '
+            f'drawn on {source_hw[1]}x{source_hw[0]}. Open the camera at the recording resolution -- a '
+            'crop is in source pixels and frames a different part of the scene at any other size.'
+        )
+    if x + w > frame_w or y + h > frame_h:
+        raise ValueError(
+            f'{feature_key}: training view crop {crop} does not fit a {frame_w}x{frame_h} live frame.'
+        )
+    return np.ascontiguousarray(image[y : y + h, x : x + w])
+
+
 def resize_image_to_policy_shape(image: np.ndarray, image_feature: Any) -> np.ndarray:
     shape = tuple(getattr(image_feature, 'shape', ()))
     if len(shape) != 3:
@@ -1864,6 +1968,8 @@ def build_policy_observation(
     input_features: dict[str, Any],
     tactile_fallback_observation: dict[str, np.ndarray] | None = None,
     camera_configs: dict[str, OpenCVCameraConfig | RealSenseCameraConfig | HikrobotCameraConfig] | None = None,
+    camera_crop_specs: dict[str, list[int]] | None = None,
+    camera_crop_source_hw: dict[str, tuple[int, int]] | None = None,
 ) -> dict[str, np.ndarray]:
     observation: dict[str, np.ndarray] = {}
     if 'observation.state' in input_features:
@@ -1885,13 +1991,27 @@ def build_policy_observation(
             if color_mode == ColorMode.BGR:
                 image = np.ascontiguousarray(image[..., ::-1])
         feature_key = f'{_OBS_IMAGES_PREFIX}{camera_key}'
+        raw_shape = tuple(image.shape)
+        crop = (camera_crop_specs or {}).get(feature_key)
+        if crop is not None:
+            image = apply_camera_crop(
+                image,
+                crop,
+                feature_key=feature_key,
+                source_hw=(camera_crop_source_hw or {}).get(feature_key),
+            )
         logged_shapes = getattr(build_policy_observation, '_logged_image_shapes', set())
         if camera_key not in logged_shapes:
             feature_shape = tuple(getattr(input_features[feature_key], 'shape', ()))
             print(
                 '[INFO] policy_image_preprocess '
-                f'camera={camera_key} raw_shape_hwc={tuple(image.shape)} policy_feature_chw={feature_shape} '
-                'method=cv2.resize_no_crop'
+                f'camera={camera_key} raw_shape_hwc={raw_shape} policy_feature_chw={feature_shape} '
+                + (
+                    f"crop_xywh={','.join(str(part) for part in crop)} cropped_shape_hwc={tuple(image.shape)} "
+                    'method=cv2.crop_then_resize'
+                    if crop is not None
+                    else 'crop=none method=cv2.resize_no_crop'
+                )
             )
             logged_shapes.add(camera_key)
             setattr(build_policy_observation, '_logged_image_shapes', logged_shapes)
@@ -2593,6 +2713,13 @@ def decode_action_to_robot_command(
     action_map = {name: float(action_np[i]) for i, name in enumerate(action_names)}
 
     if delta_reconstructor is not None:
+        # A view built with --action-drop-dims omits the axes the teleop rig locks, so the policy
+        # emits no drx/dry. Restore them as the exact zeros the dropped columns held, *before*
+        # reconstruction: DeltaEEToAbsoluteEEAction treats an action missing any delta key as one
+        # that is already absolute and passes it straight through, which would feed a
+        # millimetre-scale increment to the arm as if it were a base-frame target.
+        for rotvec_key in delta_ee_rotvec_keys(delta_reconstructor.reference):
+            action_map.setdefault(rotvec_key, 0.0)
         # Delta contract: the policy emits an increment against a reference pose that lives in
         # the dataset frame, so it must be rebuilt here, before the dataset -> base -> E
         # conversions downstream.
@@ -3832,6 +3959,7 @@ def run_inference(args: argparse.Namespace) -> int:
         state_key=alignment_state_key,
     )
     camera_configs = load_camera_configs(args.camera_config)
+    camera_crop_specs, camera_crop_source_hw = load_camera_crop_specs(dataset_root)
     device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
 
     policy, preprocessor, postprocessor = load_policy_stack(
@@ -3979,6 +4107,16 @@ def run_inference(args: argparse.Namespace) -> int:
     if alignment_dataset_root != dataset_root:
         print(f'[INFO] alignment_dataset_root={alignment_dataset_root}')
     print(f'[INFO] alignment_state_key={alignment_state_key}')
+    if camera_crop_specs:
+        for feature_key in sorted(camera_crop_specs):
+            source_hw = camera_crop_source_hw.get(feature_key)
+            print(
+                f'[INFO] camera_crop {feature_key}='
+                + ','.join(str(part) for part in camera_crop_specs[feature_key])
+                + (f' source_frame={source_hw[1]}x{source_hw[0]}' if source_hw else ' source_frame=unknown')
+            )
+    else:
+        print('[INFO] camera_crop=<none> (training view was built full frame)')
     print(f'[INFO] policy_device={device}')
     print(f'[INFO] policy_fps={policy_fps:.3f}')
     print('[INFO] task_prompt=' + (json.dumps(task_prompt, ensure_ascii=False) if task_prompt else '<empty>'))
@@ -4282,6 +4420,8 @@ def run_inference(args: argparse.Namespace) -> int:
                 input_features=policy.config.input_features,
                 tactile_fallback_observation=tactile_fallback_observation,
                 camera_configs=camera_configs,
+                camera_crop_specs=camera_crop_specs,
+                camera_crop_source_hw=camera_crop_source_hw,
             )
             if camera_preview_enabled:
                 camera_preview_enabled = show_policy_camera_preview_window(

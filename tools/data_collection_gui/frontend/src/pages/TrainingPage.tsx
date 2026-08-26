@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../apiClient";
 import type {
   DependencyInstall,
+  TrainingHistoryEntry,
   TrainingHost,
   TrainingMachine,
   TrainingRun,
@@ -122,6 +123,20 @@ function gpuLine(gpu: TrainingMachine["gpus"] extends (infer G)[] | undefined ? 
   return `${(free / 1024).toFixed(1)} / ${(total / 1024).toFixed(1)} GiB free`;
 }
 
+/** One past run, as one line in the copy-settings dropdown.
+ *
+ *  Leads with the date and the knobs that actually distinguish two runs of the same view --
+ *  steps, batch, LoRA rank -- because the job names differ only by their trailing timestamp. */
+function describeHistoryEntry(entry: TrainingHistoryEntry): string {
+  const p = entry.params;
+  const day = entry.startedAt ? entry.startedAt.slice(0, 10) : "unknown date";
+  const parts = [day, entry.policy || "?", `${(entry.steps || 0).toLocaleString()} steps`];
+  if (p.batchSize !== undefined) parts.push(`bs ${p.batchSize}`);
+  if (p.loraEnabled) parts.push(`LoRA r${p.loraR ?? "?"}`);
+  if (entry.viewName) parts.push(entry.viewName);
+  return parts.join(" · ");
+}
+
 function describeView(view: TrainingView): string {
   const strides = Object.values(view.frameStride ?? {});
   const resampled = strides.some((stride) => stride > 1);
@@ -186,6 +201,10 @@ export function TrainingPage() {
   // The dependency install and its log window. `install` is the gateway's status object, so
   // the modal shows a sync started before this page was opened (or reloaded) rather than an
   // empty box next to a machine that is visibly busy.
+  // Past runs, newest first, and which one the "copy settings" control is pointing at.
+  const [history, setHistory] = useState<TrainingHistoryEntry[]>([]);
+  const [historyJob, setHistoryJob] = useState("");
+
   const [install, setInstall] = useState<DependencyInstall | null>(null);
   const [installOpen, setInstallOpen] = useState(false);
 
@@ -256,6 +275,7 @@ export function TrainingPage() {
   useEffect(() => {
     void refreshHosts();
     void api.fetchTrainingViews().then(setViews);
+    void api.fetchTrainingHistory().then(setHistory);
     // Once, on mount: an install started from another browser tab -- or before this page was
     // reloaded -- is still running on the machine, and the poll below only starts once
     // something says one is.
@@ -443,6 +463,46 @@ export function TrainingPage() {
     setPolicyConfig(preset.policyConfig);
     setPolicyConfigEdited(false);
     setNotice(`${preset.name} starting preset applied.`);
+  };
+
+  /** Refill the form from a past run.
+   *
+   *  The view is deliberately not copied: the reason to reach for an earlier run's settings is
+   *  almost always to put them on frames that did not exist then. The job name is not copied
+   *  either -- it is derived per start, and reusing one would train into a directory that is
+   *  already another run's record.
+   *
+   *  A key the recorded run did not carry leaves that field alone rather than resetting it to a
+   *  default the old run never actually used.
+   */
+  const applyHistory = (entry: TrainingHistoryEntry) => {
+    const p = entry.params;
+    if (p.policy !== undefined) setPolicy(p.policy);
+    if (p.steps !== undefined) setSteps(String(p.steps));
+    if (p.batchSize !== undefined) setBatchSize(String(p.batchSize));
+    if (p.numWorkers !== undefined) setNumWorkers(String(p.numWorkers));
+    if (p.saveFreq !== undefined) setSaveFreq(String(p.saveFreq));
+    if (p.logFreq !== undefined) setLogFreq(String(p.logFreq));
+    if (p.useAmp !== undefined) setUseAmp(p.useAmp);
+    if (p.policyConfig !== undefined) {
+      setPolicyConfig(p.policyConfig);
+      // Marked as hand-edited so selecting a policy afterwards does not quietly overwrite the
+      // config this run is being reproduced from with that policy's starting preset.
+      setPolicyConfigEdited(p.policyConfig.trim() !== "");
+    }
+    if (p.pretrainedPath !== undefined) {
+      setPretrainedPath(p.pretrainedPath);
+      setPretrainedPathEdited(p.pretrainedPath.trim() !== "");
+    }
+    if (p.loraEnabled !== undefined) setLoraEnabled(p.loraEnabled);
+    if (p.loraR !== undefined) setLoraR(String(p.loraR));
+    if (p.loraTargetModules !== undefined) setLoraTargetModules(p.loraTargetModules);
+    if (p.wandbEnabled !== undefined) setWandbEnabled(p.wandbEnabled);
+    if (p.wandbProject !== undefined) setWandbProject(p.wandbProject);
+    if (p.wandbEntity !== undefined) setWandbEntity(p.wandbEntity);
+    setNotice(
+      `Settings copied from ${entry.jobName}. The training view and job name were left alone.`
+    );
   };
 
   const onPolicyChange = (nextPolicy: string) => {
@@ -724,6 +784,31 @@ export function TrainingPage() {
             )}
           </p>
         )}
+
+        <label className="field">
+          <span>Copy settings from a past run</span>
+          <select
+            value={historyJob}
+            onChange={(event) => {
+              const jobName = event.target.value;
+              setHistoryJob(jobName);
+              const entry = history.find((item) => item.jobName === jobName);
+              if (entry) applyHistory(entry);
+            }}
+            disabled={isRunning || history.length === 0}
+          >
+            <option value="">
+              {history.length === 0
+                ? "No past runs found under outputs/train"
+                : "Start from the current settings…"}
+            </option>
+            {history.map((entry) => (
+              <option key={entry.jobName} value={entry.jobName}>
+                {describeHistoryEntry(entry)}
+              </option>
+            ))}
+          </select>
+        </label>
 
         <div className="field-row">
           <label className="field">

@@ -125,6 +125,30 @@ select_python() {
 }
 
 FR3_HOST_PYTHON="$(select_python)"
+
+# pi0.5 asks the Hub for the PaliGemma tokenizer (`google/paligemma-3b-pt-224`) at every startup.
+# The policy weights come off a local checkpoint, but that one tokenizer does not, so a rollout on
+# a rig with no route to huggingface.co stalls in retry backoff and then fails to build its
+# processor -- with the arm powered and the cameras open.
+#
+# The default cache under ~/.cache/huggingface/hub is root-owned on this workstation (a container
+# created it), so this points at one the operator can write. `unset` is not "use whatever is
+# cached": without HF_HUB_OFFLINE the hub still round-trips to the network first and only falls
+# back to the cache after five backoffs, which is a minute of dead time before an arm starts
+# moving. Offline makes a missing asset a fast, legible failure instead.
+#
+# To refresh it, copy the snapshot from a machine that does have network:
+#   rsync -aL ~/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/ \
+#     <rig>:${FR3_HF_HOME:-$HOME/hf_cache}/hub/models--google--paligemma-3b-pt-224/
+# Set FR3_HF_HUB_OFFLINE=0 to let a networked rig fetch what it is missing.
+hf_home="${FR3_HF_HOME-$HOME/hf_cache}"
+if [[ -d "${hf_home}" ]]; then
+  export HF_HOME="${hf_home}"
+  export HF_HUB_OFFLINE="${FR3_HF_HUB_OFFLINE-1}"
+else
+  echo "WARN: no HF cache at ${hf_home}; pi0.5 will fetch its tokenizer from huggingface.co" >&2
+fi
+
 venv_root="$(cd "$(dirname "${FR3_HOST_PYTHON}")/.." && pwd)"
 # placo/pinocchio ship their shared objects under the cmeel prefix; the IK import fails without it.
 cmeel_prefix="$(find "${venv_root}/lib" -path '*/site-packages/cmeel.prefix' -type d | head -n 1 || true)"
@@ -239,6 +263,8 @@ case "$mode" in
     echo "FR3_COMMAND_EMA_ALPHA=${command_ema_alpha:-<disabled>}"
     echo "FR3_CONTROLLER_STIFFNESS=${controller_stiffness:-<driver default>}"
     echo "FR3_CONTROLLER_DAMPING=${controller_damping:-<driver default>}"
+    echo "HF_HOME=${HF_HOME:-<unset, tokenizer will be fetched from huggingface.co>}"
+    echo "HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-<unset>}"
     echo "PYTHONPATH=${PYTHONPATH}"
     echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
     ;;

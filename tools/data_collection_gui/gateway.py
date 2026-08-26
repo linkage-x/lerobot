@@ -4003,6 +4003,63 @@ def _training_view_camera_keys(dataset_roots: Sequence[Path]) -> list[str]:
     return sorted(shared or set())
 
 
+def _training_view_state_keys(dataset_roots: Sequence[Path]) -> list[str]:
+    """Per-dim ``observation.state`` selectors for the view, with ``prev_cmd.*`` left out.
+
+    ``prev_cmd.ee.*`` is the pose commanded on the previous frame, and a delta view's action is
+    measured against exactly that pose -- so keeping it in the observation hands the policy the
+    answer's own reference frame, and ``prev_cmd.gripper.pos`` hands it the gripper label outright
+    (measured on this rig's 24945 frames: the label equals it on 98.8% of them, R^2 0.9999). A
+    vision-free linear probe on held-out episodes recovers the first action at R^2 0.68 with these
+    dims present and 0.16 without them -- dropping them is what leaves the cameras as the only way
+    to answer.
+
+    Reconstruction at deployment is unaffected: it reads ``prev_cmd.*`` from the raw robot
+    observation, not from the policy's state vector.
+
+    Falls back to the whole vector for a dataset that names no dims or carries no ``prev_cmd.*``,
+    so this stays a no-op on a rig whose observation was never built this way.
+    """
+    shared: set[str] | None = None
+    ordered: list[str] = []
+    for root in dataset_roots:
+        info = _load_dataset_info(root) or {}
+        features = info.get("features") if isinstance(info.get("features"), dict) else {}
+        feature = features.get("observation.state") if isinstance(features, dict) else None
+        names = feature.get("names") if isinstance(feature, dict) else None
+        if not isinstance(names, list) or not names:
+            return ["observation.state"]
+        names = [str(name) for name in names]
+        if shared is None:
+            ordered = names
+        shared = set(names) if shared is None else (shared & set(names))
+    kept = [
+        name
+        for name in ordered
+        if name in (shared or set()) and not name.startswith("prev_cmd.")
+    ]
+    if not kept or len(kept) == len(ordered):
+        return ["observation.state"]
+    return [f"observation.state:{name}" for name in kept]
+
+
+def _training_view_action_drop_dims(action_mode: str) -> list[str]:
+    """Action dims the view leaves out, for a contract with axes the rig never moves.
+
+    The SpaceMouse teleop locks roll and pitch, so ``drx``/``dry`` carry a recorded std of
+    3.6e-5 rad (~0.002 deg) -- below the policy's own flow-matching sampling noise, measured at
+    7.7x the signal on drx. MIN_MAX then rescales that noise-only range into a real share of the
+    loss, and because the contract is a delta it accumulates frame by frame: one rollout sat
+    against its 8 deg leash for 441 of 503 steps. Deployment restores both axes as exact zeros.
+
+    Only the delta contracts: an absolute view's rotation is a quaternion, where no single
+    component corresponds to a locked axis.
+    """
+    if action_mode not in ("delta_ee_from_prev_cmd", "delta_ee_from_current"):
+        return []
+    return [f"{action_mode}.drx", f"{action_mode}.dry"]
+
+
 def _training_view_command(
     state: GatewayState,
     dataset_roots: Path | Sequence[Path],
@@ -4048,6 +4105,9 @@ def _training_view_command(
             "a view cannot be built from sources that disagree on their cameras."
         )
 
+    state_key_selectors = _training_view_state_keys(dataset_roots)
+    action_drop_dims = _training_view_action_drop_dims(action_mode)
+
     view_name = _training_view_name(dataset_roots, action_mode)
     view_root = _training_views_root(state) / view_name
     command = [
@@ -4064,8 +4124,10 @@ def _training_view_command(
         "--job-name", view_name,
         "--repo-id", f"local/{view_name}",
         "--cameras", ",".join(camera_keys),
-        "--state-keys", "observation.state",
+        "--state-keys", ",".join(state_key_selectors),
         "--action-mode", action_mode,
+        # Locked rotation axes, left out of the action. Empty for contracts that have none.
+        "--action-drop-dims", ",".join(action_drop_dims),
         # The default append selector pulls a handheld-gripper column that FR3 datasets do not
         # have; the FR3 action already carries its own gripper.
         "--action-append-selectors", "",
@@ -4670,6 +4732,221 @@ def _training_run_state_path(state: GatewayState) -> Path:
     return state.repo_root / "outputs" / "logs" / "training" / "current_run.json"
 
 
+def _training_history_path(state: GatewayState) -> Path:
+    return state.repo_root / "outputs" / "logs" / "training" / "run_history.json"
+
+
+# Enough to cover a few weeks of tuning without the page having to paginate. The file is read
+# whole on every poll, so this is also what keeps that read cheap.
+_TRAINING_HISTORY_LIMIT = 50
+
+# The knobs a past run can hand to the next one. Deliberately not viewName or jobName: the
+# reason to copy a run's settings is almost always to put them on *different* frames (a rebuilt
+# view), and a job name is derived per start so that two runs cannot collide.
+_TRAINING_HISTORY_PARAM_KEYS = (
+    "policy",
+    "steps",
+    "batchSize",
+    "numWorkers",
+    "saveFreq",
+    "logFreq",
+    "device",
+    "useAmp",
+    "policyConfig",
+    "pretrainedPath",
+    "loraEnabled",
+    "loraR",
+    "loraTargetModules",
+    "wandbEnabled",
+    "wandbProject",
+    "wandbEntity",
+)
+
+# Policy-config keys worth carrying from a finished run's train_config.json back into the form's
+# JSON box. Everything else in that dict is either a property of the frames (input/output
+# features, normalisation stats) or an upstream default nobody set here, and copying those would
+# turn a small override into a large one that disagrees with the next view.
+_TRAINING_POLICY_CONFIG_KEYS = (
+    "dtype",
+    "gradient_checkpointing",
+    "compile_model",
+    "normalization_mapping",
+    "chunk_size",
+    "n_action_steps",
+    "num_inference_steps",
+    "temporal_ensemble_coeff",
+    "optimizer_lr",
+    "optimizer_lr_backbone",
+    "scheduler_warmup_steps",
+    "scheduler_decay_steps",
+    "scheduler_decay_lr",
+)
+
+
+def _training_run_config_path(run_dir: Path) -> Path | None:
+    """The train_config.json of a run's newest checkpoint, if it got far enough to write one.
+
+    The newest rather than the first: they agree on the settings, and picking the last one means
+    a run whose early checkpoints were deleted to save disk is still readable.
+    """
+    checkpoints = run_dir / "checkpoints"
+    if not checkpoints.is_dir():
+        return None
+    for checkpoint in sorted(checkpoints.iterdir(), reverse=True):
+        config_path = checkpoint / "pretrained_model" / "train_config.json"
+        if config_path.is_file():
+            return config_path
+    return None
+
+
+def _training_history_from_train_config(run_dir: Path) -> dict[str, Any] | None:
+    """Recover one past run's settings from what lerobot_train wrote next to its weights.
+
+    Without this the history is empty until the first run started *after* the feature shipped --
+    which is exactly backwards, since the reason to want it is the runs already on disk. The
+    recorded history stays authoritative where both exist; this only fills the gap behind it.
+    """
+    config_path = _training_run_config_path(run_dir)
+    if config_path is None:
+        return None
+    config = _load_json_file(config_path)
+    if not isinstance(config, dict):
+        return None
+    policy = config.get("policy") if isinstance(config.get("policy"), dict) else {}
+    peft = config.get("peft") if isinstance(config.get("peft"), dict) else {}
+    wandb = config.get("wandb") if isinstance(config.get("wandb"), dict) else {}
+    dataset = config.get("dataset") if isinstance(config.get("dataset"), dict) else {}
+
+    policy_config = {
+        key: policy[key] for key in _TRAINING_POLICY_CONFIG_KEYS if key in policy
+    }
+    params: dict[str, Any] = {
+        "policy": str(policy.get("type") or ""),
+        "steps": int(config.get("steps") or 0),
+        "batchSize": int(config.get("batch_size") or 0),
+        "numWorkers": int(config.get("num_workers") or 0),
+        "saveFreq": int(config.get("save_freq") or 0),
+        "logFreq": int(config.get("log_freq") or 0),
+        "policyConfig": json.dumps(policy_config) if policy_config else "",
+        "pretrainedPath": str(policy.get("pretrained_path") or ""),
+        # `r` is only meaningful when a method was actually selected; a config with no peft block
+        # is a dense run, not a LoRA run with a default rank.
+        "loraEnabled": bool(peft.get("method_type")),
+        "loraR": int(peft.get("r") or 16),
+        "loraTargetModules": str(peft.get("target_modules") or ""),
+        "wandbEnabled": bool(wandb.get("enable")),
+        "wandbProject": str(wandb.get("project") or "lerobot"),
+        "wandbEntity": str(wandb.get("entity") or ""),
+    }
+    view_root = str(dataset.get("root") or "")
+    # The trailing __YYYYmmdd_HHMMSS a start stamps on. Runs from before that convention keep
+    # their directory mtime, which is still the right ordering key.
+    stamp = re.search(r"__(\d{8})_(\d{6})$", run_dir.name)
+    if stamp:
+        started_at = (
+            f"{stamp.group(1)[:4]}-{stamp.group(1)[4:6]}-{stamp.group(1)[6:]}"
+            f"T{stamp.group(2)[:2]}:{stamp.group(2)[2:4]}:{stamp.group(2)[4:]}+00:00"
+        )
+    else:
+        started_at = datetime.fromtimestamp(
+            run_dir.stat().st_mtime, timezone.utc
+        ).isoformat(timespec="seconds")
+    return {
+        "jobName": str(config.get("job_name") or run_dir.name),
+        "startedAt": started_at,
+        "viewName": Path(view_root).name if view_root else "",
+        "hostId": "",
+        "hostLabel": "",
+        "params": params,
+    }
+
+
+def _discovered_training_runs(state: GatewayState) -> list[dict[str, Any]]:
+    """Past runs found under outputs/train, newest first."""
+    train_root = state.repo_root / "outputs" / "train"
+    if not train_root.is_dir():
+        return []
+    entries: list[dict[str, Any]] = []
+    for run_dir in train_root.iterdir():
+        if not run_dir.is_dir():
+            continue
+        try:
+            entry = _training_history_from_train_config(run_dir)
+        except (OSError, ValueError, TypeError) as exc:
+            state.log("warn", f"Skipping unreadable training run {run_dir.name}: {exc}")
+            continue
+        if entry is not None:
+            entries.append(entry)
+    entries.sort(key=lambda item: item["startedAt"], reverse=True)
+    return entries
+
+
+def _load_training_history(state: GatewayState) -> list[dict[str, Any]]:
+    stored = _load_json_file(_training_history_path(state))
+    if not isinstance(stored, dict):
+        return []
+    runs = stored.get("runs")
+    return [entry for entry in runs if isinstance(entry, dict)] if isinstance(runs, list) else []
+
+
+def _record_training_history(state: GatewayState, entry: dict[str, Any]) -> None:
+    """Append one start to the run history, newest first.
+
+    Kept apart from ``current_run.json``, which holds exactly one run and is overwritten by the
+    next start: the point here is the settings of runs that are already over, which is precisely
+    what that file throws away. Written best-effort -- failing to record history must never take
+    down a training run that has already been launched.
+    """
+    path = _training_history_path(state)
+    try:
+        runs = [entry, *_load_training_history(state)][:_TRAINING_HISTORY_LIMIT]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(".json.tmp")
+        temp_path.write_text(json.dumps({"runs": runs}, indent=2), encoding="utf-8")
+        temp_path.replace(path)
+    except OSError as exc:
+        state.log("warn", f"Could not record training history: {exc}")
+
+
+def _training_history_entries(state: GatewayState) -> list[dict[str, Any]]:
+    """Past runs with the settings needed to reproduce them, newest first.
+
+    Each entry's ``params`` is a complete, self-contained set: a run recorded before a knob
+    existed simply lacks that key, and the page leaves its current value alone rather than
+    inventing one.
+
+    Two sources, in priority order: the runs this gateway recorded at start, then the ones
+    recovered from ``train_config.json`` under ``outputs/train``. The recorded entry wins on a
+    job-name collision -- it holds what the operator actually asked for, while the reconstruction
+    can only see what lerobot_train resolved it to.
+    """
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for stored in [*_load_training_history(state), *_discovered_training_runs(state)]:
+        params = stored.get("params")
+        if not isinstance(params, dict):
+            continue
+        job_name = str(stored.get("jobName") or "")
+        if job_name in seen:
+            continue
+        seen.add(job_name)
+        entries.append(
+            {
+                "jobName": job_name,
+                "startedAt": str(stored.get("startedAt") or ""),
+                "viewName": str(stored.get("viewName") or ""),
+                "hostLabel": str(stored.get("hostLabel") or ""),
+                "policy": str(params.get("policy") or ""),
+                "steps": int(params.get("steps") or 0),
+                "params": {
+                    key: params[key] for key in _TRAINING_HISTORY_PARAM_KEYS if key in params
+                },
+            }
+        )
+    entries.sort(key=lambda item: item["startedAt"], reverse=True)
+    return entries[:_TRAINING_HISTORY_LIMIT]
+
+
 def _persist_training_status(state: GatewayState) -> None:
     """Record the run on disk so it outlives this gateway process.
 
@@ -4838,27 +5115,49 @@ def _start_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[st
             ) from None
         view_root = f"{host.repoDir}/{relative.as_posix()}"
 
+    # Resolved once, in the page's own vocabulary, then spent twice: on the argv that starts this
+    # run and on the history entry that can refill the form for the next one. One dict rather
+    # than two readings of `payload` is what keeps "what ran" and "what is offered back" from
+    # drifting apart as knobs are added.
+    argv_settings: dict[str, Any] = {
+        "policy": policy,
+        "pretrainedPath": str(payload.get("pretrainedPath") or "").strip(),
+        "loraEnabled": bool(payload.get("loraEnabled")),
+        "loraR": int(payload.get("loraR") or 16),
+        "loraTargetModules": str(payload.get("loraTargetModules") or ""),
+        "steps": int(payload.get("steps") or 20000),
+        "batchSize": int(payload.get("batchSize") or 8),
+        "numWorkers": int(payload.get("numWorkers") or 4),
+        "saveFreq": int(payload.get("saveFreq") or 5000),
+        "logFreq": int(payload.get("logFreq") or 100),
+        "device": str(payload.get("device") or "auto"),
+        "useAmp": bool(payload.get("useAmp")),
+        "policyConfig": str(payload.get("policyConfig") or ""),
+        "wandbEnabled": wandb_enabled,
+        "wandbProject": str(payload.get("wandbProject") or "lerobot"),
+        "wandbEntity": str(payload.get("wandbEntity") or ""),
+    }
     argv = training_backend.build_train_argv(
         host=host,
         view_root=view_root,
         repo_id=view["repoId"],
         job_name=job_name,
-        policy=policy,
-        pretrained_path=str(payload.get("pretrainedPath") or "").strip(),
-        lora_enabled=bool(payload.get("loraEnabled")),
-        lora_r=int(payload.get("loraR") or 16),
-        lora_target_modules=str(payload.get("loraTargetModules") or ""),
-        steps=int(payload.get("steps") or 20000),
-        batch_size=int(payload.get("batchSize") or 8),
-        num_workers=int(payload.get("numWorkers") or 4),
-        save_freq=int(payload.get("saveFreq") or 5000),
-        log_freq=int(payload.get("logFreq") or 100),
-        device=str(payload.get("device") or "auto"),
-        use_amp=bool(payload.get("useAmp")),
-        policy_config=str(payload.get("policyConfig") or ""),
-        wandb_enabled=wandb_enabled,
-        wandb_project=str(payload.get("wandbProject") or "lerobot"),
-        wandb_entity=str(payload.get("wandbEntity") or ""),
+        policy=argv_settings["policy"],
+        pretrained_path=argv_settings["pretrainedPath"],
+        lora_enabled=argv_settings["loraEnabled"],
+        lora_r=argv_settings["loraR"],
+        lora_target_modules=argv_settings["loraTargetModules"],
+        steps=argv_settings["steps"],
+        batch_size=argv_settings["batchSize"],
+        num_workers=argv_settings["numWorkers"],
+        save_freq=argv_settings["saveFreq"],
+        log_freq=argv_settings["logFreq"],
+        device=argv_settings["device"],
+        use_amp=argv_settings["useAmp"],
+        policy_config=argv_settings["policyConfig"],
+        wandb_enabled=argv_settings["wandbEnabled"],
+        wandb_project=argv_settings["wandbProject"],
+        wandb_entity=argv_settings["wandbEntity"],
     )
     command, env = training_backend.build_launch_command(
         state.repo_root, host, argv, wandb_key=wandb_key
@@ -4902,6 +5201,23 @@ def _start_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[st
     )
     state.log("info", f"Started training {policy} on {view_name} at {host.label} (pid {process.pid})")
     _persist_training_status(state)
+    # Recorded from the *resolved* values rather than the raw payload, so a run started before a
+    # knob had a default still replays with the value it actually trained under.
+    _record_training_history(
+        state,
+        {
+            "jobName": job_name,
+            "startedAt": state.training.startedAt,
+            "viewName": view_name,
+            "hostId": host.id,
+            "hostLabel": host.label,
+            "params": {
+                key: value
+                for key, value in argv_settings.items()
+                if key in _TRAINING_HISTORY_PARAM_KEYS
+            },
+        },
+    )
     Thread(
         target=_follow_training_run,
         args=(state, log_path, process.pid, process),
@@ -11920,6 +12236,14 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             with self.server.state.lock:
                 _json_response(
                     self, HTTPStatus.OK, {"ok": True, "views": _training_view_entries(self.server.state)}
+                )
+            return
+        if path == "/api/training/history":
+            with self.server.state.lock:
+                _json_response(
+                    self,
+                    HTTPStatus.OK,
+                    {"ok": True, "runs": _training_history_entries(self.server.state)},
                 )
             return
         if path == "/api/training/status":

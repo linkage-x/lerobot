@@ -916,6 +916,42 @@ export type TrainingStartRequest = {
   wandbEntity: string;
 };
 
+/** The knobs one past run can hand to the next. Every field is optional: a run recorded
+ *  before a knob existed simply lacks it, and the form then keeps its current value. */
+export type TrainingHistoryParams = Partial<
+  Pick<
+    TrainingStartRequest,
+    | "policy"
+    | "steps"
+    | "batchSize"
+    | "numWorkers"
+    | "saveFreq"
+    | "logFreq"
+    | "device"
+    | "useAmp"
+    | "policyConfig"
+    | "pretrainedPath"
+    | "loraEnabled"
+    | "loraR"
+    | "loraTargetModules"
+    | "wandbEnabled"
+    | "wandbProject"
+    | "wandbEntity"
+  >
+>;
+
+/** One previously started run, newest first, as offered by /api/training/history. */
+export type TrainingHistoryEntry = {
+  jobName: string;
+  startedAt: string;
+  /** The view it trained on. Shown, never copied: the point is usually to retrain new frames. */
+  viewName: string;
+  hostLabel: string;
+  policy: string;
+  steps: number;
+  params: TrainingHistoryParams;
+};
+
 // ------------------------------------------------------- checkpoints & rollout ---
 
 /** One disagreement between a checkpoint and the rig it would drive. */

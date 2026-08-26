@@ -94,6 +94,64 @@ def test_select_state_matrix_concatenates_full_features_and_selected_dims():
     assert np.allclose(state[:, 7], [61.0, 71.0])
 
 
+# ------------------------------------------------------------- dropping locked action dims ---
+
+
+def test_action_drop_column_indices_finds_the_named_dims():
+    names = ["delta.dx", "delta.dy", "delta.dz", "delta.drx", "delta.dry", "delta.drz", "gripper.pos"]
+
+    assert fr3_train_il_policy.action_drop_column_indices(names, ["delta.drx", "delta.dry"]) == [3, 4]
+    # Order of the request must not matter; the columns come out in column order.
+    assert fr3_train_il_policy.action_drop_column_indices(names, ["delta.dry", "delta.drx"]) == [3, 4]
+
+
+def test_action_drop_column_indices_refuses_a_name_that_is_not_an_action_dim():
+    # A typo would otherwise drop nothing, and the only symptom would be a policy that keeps
+    # predicting the axis the view was rebuilt to remove.
+    names = ["delta.dx", "gripper.pos"]
+
+    with pytest.raises(ValueError, match="not action dims"):
+        fr3_train_il_policy.action_drop_column_indices(names, ["delta.drx"])
+
+
+def test_action_drop_column_indices_refuses_to_drop_everything():
+    names = ["delta.dx", "gripper.pos"]
+
+    with pytest.raises(ValueError, match="every action dim"):
+        fr3_train_il_policy.action_drop_column_indices(names, ["delta.dx", "gripper.pos"])
+
+
+def test_view_leaves_out_the_dropped_action_dim(tmp_path):
+    """The dropped dim must vanish from the column, the names, and the stats together.
+
+    A view whose `names` still advertised the dim would be read back at deployment as an action
+    the policy does not emit, and every dim after it would be off by one.
+    """
+    src_root = tmp_path / "recording"
+    _write_v3_source_dataset(src_root)
+
+    frames, _episodes, info, manifest = _build_view(
+        src_root, tmp_path / "view", action_drop_dims=["ee.x"]
+    )
+
+    assert info["features"]["action"]["names"] == ["gripper.pos"]
+    assert info["features"]["action"]["shape"] == [1]
+    assert all(len(row) == 1 for row in frames["action"])
+    assert manifest["action_drop_dims"] == ["ee.x"]
+    # The observation is untouched: only the action contract changed.
+    assert info["features"]["observation.state"]["names"] == ["ee.x", "gripper.pos"]
+
+
+def test_view_keeps_every_action_dim_when_nothing_is_dropped(tmp_path):
+    src_root = tmp_path / "recording"
+    _write_v3_source_dataset(src_root)
+
+    _frames, _episodes, info, manifest = _build_view(src_root, tmp_path / "view")
+
+    assert info["features"]["action"]["names"] == ["ee.x", "gripper.pos"]
+    assert manifest["action_drop_dims"] == []
+
+
 # --------------------------------------------------------- episode exclusion in the view ---
 
 

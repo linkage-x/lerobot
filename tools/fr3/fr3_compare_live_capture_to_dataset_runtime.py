@@ -87,7 +87,13 @@ def _load_all_frame_state_rows(
             episode_idx = int(episode_idx)
             if episode_idx not in episode_set:
                 continue
-            data_file = dataset_root / 'data' / f'chunk-{int(chunk_idx):03d}' / f'file-{int(file_idx):06d}.parquet'
+            # Resolved through the runtime rather than formatted here: a v3 view names its
+            # parquet `file-000`, older exports `file-000000`, and the info.json `data_path`
+            # template is what settles it. Spelling the six-digit form out here made this scan
+            # fail on every view built by the Training View page.
+            data_file = infer_runtime._resolve_dataset_data_file(
+                dataset_root, chunk_index=int(chunk_idx), file_index=int(file_idx)
+            )
             if data_file not in seen_data_files:
                 seen_data_files.add(data_file)
                 data_files.append(data_file)
@@ -354,23 +360,36 @@ def main(argv: list[str] | None = None) -> int:
     state_names = [str(name) for name in metadata.get('state_names', infer_runtime._DEFAULT_STATE_NAMES)]
     action_names = [str(name) for name in metadata.get('action_names', infer_runtime._DEFAULT_ACTION_NAMES)]
     capture_task = metadata.get('task') if isinstance(metadata.get('task'), str) else None
+    # The E-vs-I hypothesis rebuilds the state under each frame convention, and it only knows how
+    # to rebuild `ee.*` and `gripper.pos`. A `delta_ee_from_prev_cmd` checkpoint also asks for
+    # `prev_cmd.*`, which this path predates. Skipped rather than fatal: the image comparison
+    # below is what a crop / camera-placement preflight is here for, and it does not depend on the
+    # hypothesis at all.
     for hypothesis_name in ('E', 'I'):
-        hypothesis_state_observation_i, delta_summary = _evaluate_live_frame_hypothesis(
-            hypothesis_name=hypothesis_name,
-            raw_quaternion_observation=raw_quaternion_observation,
-            capture_policy_observation=capture_policy_observation,
-            dataset_start_pose_contract=dataset_start_pose_contract,
-            state_names=state_names,
-            action_names=action_names,
-            input_features=policy.config.input_features,
-            policy=policy,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            device=device,
-            use_amp=bool(policy.config.use_amp),
-            task=capture_task,
-            robot_type=ds_meta.robot_type,
-        )
+        try:
+            hypothesis_state_observation_i, delta_summary = _evaluate_live_frame_hypothesis(
+                hypothesis_name=hypothesis_name,
+                raw_quaternion_observation=raw_quaternion_observation,
+                capture_policy_observation=capture_policy_observation,
+                dataset_start_pose_contract=dataset_start_pose_contract,
+                state_names=state_names,
+                action_names=action_names,
+                input_features=policy.config.input_features,
+                policy=policy,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                device=device,
+                use_amp=bool(policy.config.use_amp),
+                task=capture_task,
+                robot_type=ds_meta.robot_type,
+            )
+        except KeyError as exc:
+            print(
+                f'[WARN] hypothesis={hypothesis_name} skipped=unsupported_state_contract '
+                f'missing_key={exc.args[0]!r} '
+                'reason=_evaluate_live_frame_hypothesis rebuilds only ee.*/gripper.pos'
+            )
+            continue
         print(
             '[HYPOTHESIS] '
             f'live_ee_frame={hypothesis_name} '

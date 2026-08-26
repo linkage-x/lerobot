@@ -41,6 +41,7 @@ import type {
   TrainingMachine,
   TrainingRun,
   TrainingStartRequest,
+  TrainingHistoryEntry,
   TrainingView,
   TrainingWandbStatus
 } from "./types";
@@ -862,6 +863,14 @@ export class DataCollectionGuiApi {
   async fetchTrainingViews(): Promise<TrainingView[]> {
     const payload = await this.trainingGet<{ views: TrainingView[] }>("/api/training/views");
     return payload?.views ?? [];
+  }
+
+  /** Past runs with the settings to reproduce them, newest first. */
+  async fetchTrainingHistory(): Promise<TrainingHistoryEntry[]> {
+    const payload = await this.trainingGet<{ runs: TrainingHistoryEntry[] }>(
+      "/api/training/history"
+    );
+    return payload?.runs ?? [];
   }
 
   async fetchTrainingStatus(): Promise<TrainingRun | null> {

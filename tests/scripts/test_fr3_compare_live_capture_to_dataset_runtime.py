@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import sys
 import types
+
+import pytest
 
 import numpy as np
 
@@ -19,14 +22,21 @@ class _FakeTable:
         return self._payload
 
 
-def test_load_all_frame_state_rows_reads_each_data_file_once(monkeypatch, tmp_path: Path):
+# Both names are live on this rig: the Training View page writes `file-000`, older exports
+# `file-000000`. This test used to hard-code the six-digit form, which is what let the scan ship
+# unable to read any view the page had built.
+@pytest.mark.parametrize("data_file_name", ["file-000.parquet", "file-000000.parquet"])
+def test_load_all_frame_state_rows_reads_each_data_file_once(
+    monkeypatch, tmp_path: Path, data_file_name: str
+):
     dataset_root = tmp_path / "dataset"
     meta_file = dataset_root / "meta" / "episodes" / "chunk-000" / "episodes.parquet"
-    data_file = dataset_root / "data" / "chunk-000" / "file-000000.parquet"
+    data_file = dataset_root / "data" / "chunk-000" / data_file_name
     meta_file.parent.mkdir(parents=True, exist_ok=True)
     data_file.parent.mkdir(parents=True, exist_ok=True)
     meta_file.touch()
     data_file.touch()
+    (dataset_root / "meta" / "info.json").write_text(json.dumps({}), encoding="utf-8")
 
     read_calls: list[tuple[str, tuple[str, ...] | None]] = []
 

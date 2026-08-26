@@ -766,6 +766,153 @@ def test_build_policy_observation_normalizes_bgr_hikrobot_frames_to_rgb():
     assert observation['observation.images.wrist'][0, 0].tolist() == [0, 0, 255]
 
 
+def _crop_state_observation(image: np.ndarray) -> dict:
+    return {
+        'ee.x': 0.1,
+        'ee.y': 0.2,
+        'ee.z': 0.3,
+        'ee.qx': 0.0,
+        'ee.qy': 0.0,
+        'ee.qz': 0.0,
+        'ee.qw': 1.0,
+        'gripper.pos': 0.4,
+        'side': image,
+    }
+
+
+def _write_cropped_view(tmp_path: Path, *, crop: list[int], source_shape: list[int]) -> Path:
+    """A training view whose manifest records a crop, next to the recording it was built from."""
+    source_root = tmp_path / 'source'
+    (source_root / 'meta').mkdir(parents=True)
+    (source_root / 'meta' / 'info.json').write_text(
+        json.dumps({'features': {'observation.images.side': {'shape': source_shape}}}),
+        encoding='utf-8',
+    )
+    view_root = tmp_path / 'view'
+    (view_root / 'meta').mkdir(parents=True)
+    (view_root / 'meta' / 'il_view_manifest.json').write_text(
+        json.dumps(
+            {
+                'source_dataset_roots': [str(source_root)],
+                'camera_crop_specs': {'observation.images.side': crop},
+                'image_resize_shape': None,
+            }
+        ),
+        encoding='utf-8',
+    )
+    return view_root
+
+
+def test_build_policy_observation_takes_the_training_view_crop_before_resizing():
+    """The crop is baked into the view's video, so the rollout has to take the same rectangle.
+
+    Without it the policy is handed the whole scene squeezed into the crop's shape -- the right
+    shape, the wrong framing, and nothing raises. The frame below is a gradient so an off-by-one
+    origin fails here instead of surviving as a few millimetres of reach error on the robot.
+    """
+    input_features = {
+        'observation.images.side': PolicyFeature(type=FeatureType.VISUAL, shape=(3, 2, 3)),
+    }
+    frame = np.arange(8 * 8 * 3, dtype=np.uint8).reshape(8, 8, 3)
+
+    observation = fr3_act_infer_real_runtime.build_policy_observation(
+        _crop_state_observation(frame),
+        state_names=[],
+        input_features=input_features,
+        camera_crop_specs={'observation.images.side': [1, 2, 3, 2]},
+        camera_crop_source_hw={'observation.images.side': (8, 8)},
+    )
+
+    # x=1, y=2, w=3, h=2 -- and the feature shape already matches, so the resize is a no-op and
+    # these are the source pixels themselves, not an interpolation of them.
+    assert observation['observation.images.side'].shape == (2, 3, 3)
+    assert np.array_equal(observation['observation.images.side'], frame[2:4, 1:4])
+
+
+def test_build_policy_observation_without_a_crop_still_resizes_the_full_frame():
+    input_features = {
+        'observation.images.side': PolicyFeature(type=FeatureType.VISUAL, shape=(3, 2, 3)),
+    }
+    frame = np.arange(8 * 8 * 3, dtype=np.uint8).reshape(8, 8, 3)
+
+    observation = fr3_act_infer_real_runtime.build_policy_observation(
+        _crop_state_observation(frame),
+        state_names=[],
+        input_features=input_features,
+    )
+
+    assert observation['observation.images.side'].shape == (2, 3, 3)
+    assert not np.array_equal(observation['observation.images.side'], frame[2:4, 1:4])
+
+
+def test_build_policy_observation_rejects_a_crop_drawn_on_another_frame_size():
+    """A crop is in the recording's pixels. Against a differently sized frame it is not a rougher
+    version of the training view, it is a different part of the scene -- so this refuses rather
+    than rescaling into a rollout that looks healthy and reaches for the wrong place."""
+    input_features = {
+        'observation.images.side': PolicyFeature(type=FeatureType.VISUAL, shape=(3, 2, 3)),
+    }
+    frame = np.zeros((16, 16, 3), dtype=np.uint8)
+
+    with pytest.raises(ValueError, match='drawn on 8x8'):
+        fr3_act_infer_real_runtime.build_policy_observation(
+            _crop_state_observation(frame),
+            state_names=[],
+            input_features=input_features,
+            camera_crop_specs={'observation.images.side': [1, 2, 3, 2]},
+            camera_crop_source_hw={'observation.images.side': (8, 8)},
+        )
+
+
+def test_build_policy_observation_rejects_a_crop_that_leaves_the_live_frame():
+    input_features = {
+        'observation.images.side': PolicyFeature(type=FeatureType.VISUAL, shape=(3, 2, 3)),
+    }
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+
+    with pytest.raises(ValueError, match='does not fit'):
+        fr3_act_infer_real_runtime.build_policy_observation(
+            _crop_state_observation(frame),
+            state_names=[],
+            input_features=input_features,
+            camera_crop_specs={'observation.images.side': [6, 2, 4, 2]},
+            camera_crop_source_hw=None,
+        )
+
+
+def test_load_camera_crop_specs_reads_the_crop_and_the_frame_it_was_drawn_on(tmp_path: Path):
+    view_root = _write_cropped_view(tmp_path, crop=[108, 58, 444, 382], source_shape=[480, 640, 3])
+
+    crops, source_hw = fr3_act_infer_real_runtime.load_camera_crop_specs(view_root)
+
+    assert crops == {'observation.images.side': [108, 58, 444, 382]}
+    assert source_hw == {'observation.images.side': (480, 640)}
+
+
+def test_load_camera_crop_specs_is_empty_for_a_full_frame_view(tmp_path: Path):
+    view_root = tmp_path / 'view'
+    (view_root / 'meta').mkdir(parents=True)
+    (view_root / 'meta' / 'il_view_manifest.json').write_text(
+        json.dumps({'source_dataset_roots': [], 'camera_crop_specs': {}}), encoding='utf-8'
+    )
+
+    assert fr3_act_infer_real_runtime.load_camera_crop_specs(view_root) == ({}, {})
+
+
+def test_load_camera_crop_specs_is_empty_for_a_dataset_that_is_not_a_view(tmp_path: Path):
+    dataset_root = tmp_path / 'recording'
+    (dataset_root / 'meta').mkdir(parents=True)
+
+    assert fr3_act_infer_real_runtime.load_camera_crop_specs(dataset_root) == ({}, {})
+
+
+def test_load_camera_crop_specs_rejects_a_malformed_rectangle(tmp_path: Path):
+    view_root = _write_cropped_view(tmp_path, crop=[108, 58, 444], source_shape=[480, 640, 3])
+
+    with pytest.raises(ValueError, match=r'\[x, y, w, h\]'):
+        fr3_act_infer_real_runtime.load_camera_crop_specs(view_root)
+
+
 def test_build_policy_observation_rejects_missing_required_tactile():
     input_features = {
         'observation.state': PolicyFeature(type=FeatureType.STATE, shape=(8,)),
@@ -1321,6 +1468,57 @@ def test_the_step_limit_stays_below_the_leash():
     """
     assert _SHIPPED_LEASH_LIMIT_M > 2 * _SHIPPED_STEP_LIMIT_M
     assert _SHIPPED_LEASH_LIMIT_M >= _DEMO_LAG_P95_M
+
+
+def test_decode_restores_a_dropped_delta_axis_as_zero():
+    """A 5-dim view (drx/dry dropped) must still rebuild an absolute target.
+
+    DeltaEEToAbsoluteEEAction passes through any action missing a delta key, treating it as one
+    that is already absolute -- so without the restore a millimetre-scale increment would reach
+    the arm as a base-frame target. The restored zeros must also leave the orientation exactly as
+    the reference pose had it.
+    """
+    robot_cfg = FrankaResearch3Config(
+        robot_ip='192.168.1.208',
+        gripper_port='/dev/ttyUSB0',
+        gripper_backend='pika',
+        urdf_path='/tmp/fr3.urdf',
+    )
+    action_names = [
+        'delta_ee_from_prev_cmd.dx',
+        'delta_ee_from_prev_cmd.dy',
+        'delta_ee_from_prev_cmd.dz',
+        'delta_ee_from_prev_cmd.drz',
+        'gripper.pos',
+    ]
+    action_tensor = torch.tensor([[0.01, -0.02, 0.03, 0.0, 1.0]], dtype=torch.float32)
+    reconstructor = fr3_act_infer_real_runtime.build_delta_action_reconstructor(action_names)
+    assert reconstructor is not None, 'a dx/dy/dz view is still a delta contract'
+
+    command = fr3_act_infer_real_runtime.decode_action_to_robot_command(
+        action_tensor,
+        action_names=action_names,
+        robot_cfg=robot_cfg,
+        delta_reconstructor=reconstructor,
+        dataset_observation_i={
+            'prev_cmd.ee.x': 0.30,
+            'prev_cmd.ee.y': 0.00,
+            'prev_cmd.ee.z': 0.40,
+            'prev_cmd.ee.qx': 0.0,
+            'prev_cmd.ee.qy': 0.0,
+            'prev_cmd.ee.qz': 0.0,
+            'prev_cmd.ee.qw': 1.0,
+        },
+    )
+
+    # Rebuilt against prev_cmd, not passed through: 0.30 + 0.01 rather than a bare 0.01.
+    assert np.isclose(command['ee.x'], 0.31)
+    assert np.isclose(command['ee.y'], -0.02)
+    assert np.isclose(command['ee.z'], 0.43)
+    # drz was 0 and drx/dry were restored as 0, so the reference orientation is unchanged.
+    assert np.isclose(command['ee.wx'], 0.0, atol=1e-9)
+    assert np.isclose(command['ee.wy'], 0.0, atol=1e-9)
+    assert np.isclose(command['ee.wz'], 0.0, atol=1e-9)
 
 
 def test_decode_action_to_robot_command_converts_quat_and_gripper():
