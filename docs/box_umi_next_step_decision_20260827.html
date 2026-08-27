@@ -134,6 +134,7 @@
 <section class="hero">
 <h1>下一步做什么：从第一性原理推</h1>
 <p>2026-08-27。把「误差预算还剩哪些待办」这个问题交给两条公理和一条决策规则去回答，而不是交给清单顺序。结论：五项待办里<b>两项立刻做、一项已被测量否决、两项降级</b>。</p>
+<p style="color:#fca5a5"><b>先防一个误读：</b>本页出现的 17.46 mm 是「<b>p95 的灵敏度</b>」，不是实测轨迹误差。rig 口径下标签的典型误差是 <b>2–3 mm 量级</b>、p95 <b>4–7 mm</b>——见第一之二节。</p>
 <div class="meta"><span class="pill">决策依据全部为当日实测</span><span class="pill">每项可回溯到 roadmap</span><span class="pill">含两个被数据推翻的直觉</span></div>
 <p style="margin-top:16px;color:#9ca3af;font-size:13px">状态与待办在 <a href="box_umi_trajectory_gt_replay_roadmap.html" style="color:#93c5fd">BOX 高精度 UMI Trajectory GT &amp; Dual-FR3 Replay Roadmap</a>（执行主线 P0-Now ⑪ / ⑫ / ⑬ 与「3 mm 轨迹精度误差预算」表）。本页只放<b>推理</b>：为什么是这个顺序，以及每一步的判据。</p>
 </section>
@@ -150,16 +151,40 @@
 </div>
 
 <div class="callout warn">
-<b>公理 2 · 这个下界已经超预算 5.8 倍。</b>
-<p><span class="mono">all_sources</span> p95 = <b>17.46 mm</b>（0820 外参 + 实测内参 σ），预算 <b>3 mm</b>。</p>
+<b>公理 2 · 真正要交付的那条路径，至今没有数；而它已知含一个从未测量的 9.1 mm 项。</b>
+<p>误差预算表的三个口径：<b>A</b>（rig 口径逐相机弥散，实测）p50 3.42–3.84 / p95 7.43 mm；<b>A′</b>（按各行合成的估计）p50 2.24 / p95 ≈4.0 mm；而 <b>B</b>——<b>真正会进训练集的生产 cube 路径</b>——「<b>给不出可信数</b>」。B 比 A 多出来的，正是 A 结构性移除掉的 <span class="mono">marker→TCP</span>，其中<b>旋转那一半从未测量</b>（声明值 2.0° × 259.5 mm = <b>9.1 mm</b>）。</p>
 </div>
 
 <h3 style="margin:18px 0 6px">推论：一条可执行的决策规则</h3>
-<p>若一项工作只能把 17.46 改动百分之几，它<b>翻转不了任何决策</b>——「超 5.8 倍」这个结论对任一输入的 ±20% 都不敏感。所以：</p>
+<p>在「最重要的那条路径根本没有数、且已知含一个 9.1 mm 的未测量项」的前提下，把某个<b>已有</b> σ 从 2.0e-03 改成 7.5e-04 不可能翻转任何决策。所以：</p>
 <div class="callout ok">
 <b>只做两类事：(i) 揭露抽样研究看不见的系统误差；(ii) 防止整条测量链被静默作废。<br/>细化已有 σ 不属于任何一类。</b>
 </div>
-<p>这条规则当日有直接验证：把一个<b>高估 3 倍</b>的占位值（<span class="mono">focal_rel</span> 2.0e-03 → 实测 7.5e-04）换成实测值，总量 <b>18.00 → 17.46 mm，只动 3.0%</b>。更极端地，<b>把整个 intrinsics 行归零</b>，总量也只到 <b>15.96 mm，仍超 5.3 倍</b>。</p>
+<p>这条规则当日有直接验证：把一个<b>高估 3 倍</b>的占位值（<span class="mono">focal_rel</span> 2.0e-03 → 实测 7.5e-04）换成实测值，MC 总量 <b>18.00 → 17.46 mm，只动 3.0%</b>；<b>把整个 intrinsics 行归零</b>也只到 <b>15.96 mm</b>。<b>量级完全由未知量决定，不由已知量的精修决定。</b></p>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>一之二、先把「现在到底多准」说清楚</h2><span class="badge warn">口径易被误读</span></div>
+<p>上面三个口径彼此差 3–4 倍。<b>这个不一致本身是个发现</b>，而且不说清楚的话，很容易把最悲观的一条读成结论。</p>
+<div class="table-scroll">
+<table class="metric-table">
+<tr><th style="width:16%">口径</th><th style="width:10%">p50</th><th style="width:10%">p95</th><th>它是什么，以及往哪边偏</th></tr>
+<tr><td><b>A′</b> 按各行合成</td><td><b>2.24 mm</b></td><td><b>≈4.0 mm</b></td><td><b>目前最接近「标签实际有多准」的估计。</b>但它是<b>估计不是测量</b>，且相机行那 2.0 mm 是系统偏置、被 RSS 温和处理了。</td></tr>
+<tr><td><b>A</b> 逐相机弥散</td><td>3.42–3.84 mm</td><td>7.43 mm</td><td><b>实测，但是上界，而且是<u>宽松</u>的上界。</b>它量的是「换一台相机信，答案会变多少」，<b>系统性高估标签的敏感度</b>——同批实测：把一台<b>自身错 1416 mm</b> 的相机从 BA 拿掉，<b>标签只动 0.34 mm</b>；少一个 marker 使弥散 p50 涨 ~1 mm，而<b>标签只动 0.19–0.78 mm</b>。所以真值明显低于 3.42。</td></tr>
+<tr><td><b>MC</b> 灵敏度</td><td>7.12 mm</td><td>17.46 mm</td><td><b>最悲观，且有已知的偏大原因。</b>它问的是「<b>若</b>标定偏了 σ，标签会挪多远」，而 <span class="mono">σ_ext = 0.2°</span> 是<b>两次相隔 16 天的标定之间</b>的变化量；这批数据录于 08-17，用的是 08-20 的标定，<b>只隔 3 天</b>。拿 16 天口径的 σ 评 3 天的数据必然偏大。<span class="small">（这只是与差距方向一致的推断——3 天口径的 σ 没有测过。）</span></td></tr>
+</table>
+</div>
+<div class="callout ok">
+<b>所以对「现在轨迹标签多准」的诚实回答是：rig 口径下典型 <u>2–3 mm 量级</u>、p95 <u>4–7 mm</u>，而不是 17 mm。</b>
+<p class="small">MC 的 17.46 是「p95 的<b>灵敏度</b>」，不是实测误差；它的 p50 是 7.12，且尾部由弱几何帧主导（2 相机帧 p95 28.2 mm，4 相机及以上 13–16 mm）。</p>
+</div>
+<div class="callout warn">
+<b>但这不构成「已经够好了」，有两条压着：</b>
+<ul style="margin:6px 0 0 18px">
+<li><b>以上全是 rig 口径</b>，marker→TCP 被结构性移除。生产 cube 路径要再叠上那个从未测量的安装旋转（<b>9.1 mm</b>），预算表 B 行明写「给不出可信数」。</li>
+<li><b>以上全是精度不是准确度</b>（公理 1）。共模误差对三条路线一律不可见。</li>
+</ul>
+</div>
 </section>
 
 <section class="card full">
@@ -256,7 +281,7 @@
 </tr>
 <tr>
 <td>「占位值是隐患，先把它们全换成实测的」</td>
-<td><b>代价极小，不值得优先。</b>换掉一个高估 3 倍的占位值，总量只动 3.0%；整个 intrinsics 行归零也只从 17.46 到 15.96 mm。<b>而且其中一个占位值本来就猜对了</b>（<span class="mono">principal_px</span> 1.0 vs 实测 0.20–1.10）。</td>
+<td><b>代价极小，不值得优先。</b>换掉一个高估 3 倍的占位值，MC 总量只动 3.0%；整个 intrinsics 行归零也只从 17.46 到 15.96 mm。<b>而且其中一个占位值本来就猜对了</b>（<span class="mono">principal_px</span> 1.0 vs 实测 0.20–1.10）。</td>
 </tr>
 </table>
 <p class="small" style="margin-top:12px"><b>共同的教训：</b>「哪一项听起来最不严谨」与「哪一项最影响结论」是两个不同的排序，而本页的决策规则要求按后者排。</p>
