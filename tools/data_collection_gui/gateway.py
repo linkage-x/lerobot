@@ -3071,6 +3071,82 @@ def _load_active_calibration_runs(state: GatewayState) -> None:
         )
 
 
+# Cached by mtime rather than read once at boot: the pointer is edited by hand
+# and rewritten by every deploy, so a value captured at startup would report a
+# stale answer as the current one -- which is the exact failure this comparison
+# exists to catch.
+_PRODUCTION_RUNS_CACHE: dict[str, Any] = {}
+
+
+def _production_calibration_runs(state: GatewayState) -> dict[str, str]:
+    """What the tracker config says production will actually load, read now.
+
+    ``state.calibration.*Run`` is not this. It starts equal to the config at
+    boot, and a solve overwrites it in memory with the run it just produced --
+    which never reaches the config, because nothing writes those keys. Reading
+    the file separately is what makes the two comparable at all.
+    """
+    import yaml
+
+    path = state.repo_root / _TRACKING_CONFIG
+    out: dict[str, str] = {"configPath": str(_TRACKING_CONFIG), "intrinsicsRun": "", "extrinsicsRun": "", "error": ""}
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError as exc:
+        out["error"] = f"读不到生产配置：{exc}"
+        return out
+    cached = _PRODUCTION_RUNS_CACHE.get("value")
+    if cached is not None and _PRODUCTION_RUNS_CACHE.get("mtime") == mtime:
+        return dict(cached)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+        calib = config.get("calibration") or {}
+        out["intrinsicsRun"] = str(calib.get("intrinsics_run_name", "") or "").strip()
+        out["extrinsicsRun"] = str(calib.get("fixed_camera_run_name", "") or "").strip()
+    except (OSError, yaml.YAMLError) as exc:
+        out["error"] = f"生产配置解析失败：{exc}"
+        return out
+    _PRODUCTION_RUNS_CACHE["mtime"] = mtime
+    _PRODUCTION_RUNS_CACHE["value"] = dict(out)
+    return out
+
+
+def _calibration_pointer_mismatch(state: GatewayState, production: dict[str, str]) -> dict[str, Any]:
+    """Where the last solve's output and the production pointer disagree.
+
+    Empty when they agree. This is deliberately not silenced after the operator
+    has seen it once: on 2026-08-20 a solve produced a calibration that recorded
+    "cam_09 has moved" in its own summary, the panel showed it as live, and
+    production went on loading the previous run for seven days -- the reprojection
+    gate then discarding cam_09 from 1675 of 1680 frames. Nothing in the UI said
+    so, because the only place the new name was written was this process's memory.
+    """
+    if production.get("error"):
+        return {}
+    fields = (
+        ("intrinsics", "内参", state.calibration.intrinsicsRun, production.get("intrinsicsRun", "")),
+        ("extrinsics", "外参", state.calibration.extrinsicsRun, production.get("extrinsicsRun", "")),
+    )
+    differing = [
+        {"kind": kind, "label": label, "solved": solved, "production": live}
+        for kind, label, solved, live in fields
+        if solved and live and solved != live
+    ]
+    if not differing:
+        return {}
+    names = " / ".join(item["label"] for item in differing)
+    return {
+        "fields": differing,
+        "configPath": production.get("configPath", ""),
+        "message": (
+            f"最近解出的{names} run 与生产实际加载的不是同一个。"
+            f"解算<b>不会</b>自动改生产指针——要生效必须编辑 {production.get('configPath', '')}，"
+            "否则下一条轨迹仍然用旧标定。"
+        ),
+    }
+
+
 def _calibration_session_payload(state: GatewayState) -> dict[str, Any]:
     session = state.calibration_session
     return {
@@ -4777,6 +4853,9 @@ def _calibration_payload(state: GatewayState) -> dict[str, Any]:
     """
     payload = asdict(state.calibration)
     payload["solve"] = _solve_payload(state)
+    production = _production_calibration_runs(state)
+    payload["production"] = production
+    payload["pointerMismatch"] = _calibration_pointer_mismatch(state, production)
     progress = payload.get("progress")
     running = state.calibration.state == "running"
     if running and isinstance(progress, dict) and float(progress.get("startedAt") or 0.0) > 0:
@@ -5121,6 +5200,22 @@ def _run_extrinsics_calibration(
     if not keep_intrinsics_run:
         state.calibration.intrinsicsRun = f"{run_name}_intrinsics"
     state.calibration.extrinsicsRun = f"{run_name}_extrinsics"
+    # These two assignments are in-memory only. Nothing in this repo writes
+    # `intrinsics_run_name` / `fixed_camera_run_name` back to the tracker config,
+    # so a solve that finishes here has produced files production will not load
+    # until somebody edits that file -- and a gateway restart quietly reverts the
+    # panel to the config's answer, erasing even the appearance of a new run.
+    # Say so at the moment the operator is watching, rather than leaving the
+    # panel implying the new calibration is live.
+    _PRODUCTION_RUNS_CACHE.clear()
+    mismatch = _calibration_pointer_mismatch(state, _production_calibration_runs(state))
+    if mismatch:
+        state.log(
+            "warn",
+            "Solved calibration is NOT live: "
+            + ", ".join(f"{f['kind']} {f['solved']} vs production {f['production']}" for f in mismatch["fields"])
+            + f". Edit {mismatch['configPath']} to promote it.",
+        )
     state.calibration.message = (
         f"BA 重投影 {float(report.get('rmse_px', float('nan'))):.4f} px，"
         f"{report.get('num_frames', 0)} 帧 / {len(cameras)} 相机"

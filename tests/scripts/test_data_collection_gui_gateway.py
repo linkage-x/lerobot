@@ -4273,3 +4273,104 @@ def test_marker_tcp_solve_rejects_a_bad_socket_offset_before_spawning_anything(t
 
     assert result["ok"] is False
     assert "必须是数字" in result["error"]
+
+
+# --- calibration pointer: what was solved vs what production loads -----------
+
+
+def _pointer_state(tmp_path: Path, *, config: str | None, solved_intr: str, solved_extr: str):
+    state = _marker_tcp_gateway_state(tmp_path)
+    state.calibration.intrinsicsRun = solved_intr
+    state.calibration.extrinsicsRun = solved_extr
+    if config is not None:
+        path = tmp_path / gateway._TRACKING_CONFIG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(config, encoding="utf-8")
+    gateway._PRODUCTION_RUNS_CACHE.clear()
+    return state
+
+
+_POINTER_CONFIG = """
+calibration:
+  root_dir: outputs/calibration
+  intrinsics_run_name: intr_0804
+  fixed_camera_run_name: extr_0804
+"""
+
+
+def test_production_runs_are_read_from_the_config_not_from_memory(tmp_path):
+    """The two must come from different places or they cannot be compared.
+
+    `state.calibration.*Run` starts equal to the config and is then overwritten
+    by whatever a solve produced. Reading the file separately is the only way
+    the panel can tell "solved" from "live".
+    """
+    state = _pointer_state(tmp_path, config=_POINTER_CONFIG, solved_intr="intr_NEW", solved_extr="extr_NEW")
+
+    production = gateway._production_calibration_runs(state)
+
+    assert production["intrinsicsRun"] == "intr_0804"
+    assert production["extrinsicsRun"] == "extr_0804"
+    assert production["error"] == ""
+
+
+def test_pointer_mismatch_flags_the_run_that_drifted(tmp_path):
+    """The 2026-08-20 failure: new extrinsics solved, production never repointed."""
+    state = _pointer_state(tmp_path, config=_POINTER_CONFIG, solved_intr="intr_0804", solved_extr="calib_0820_extrinsics")
+
+    mismatch = gateway._calibration_pointer_mismatch(state, gateway._production_calibration_runs(state))
+
+    assert [f["kind"] for f in mismatch["fields"]] == ["extrinsics"]
+    assert mismatch["fields"][0]["solved"] == "calib_0820_extrinsics"
+    assert mismatch["fields"][0]["production"] == "extr_0804"
+    # The message has to say the solve did not promote anything, not merely
+    # that two strings differ -- "they differ" reads as a display glitch.
+    assert "不会" in mismatch["message"]
+    assert str(gateway._TRACKING_CONFIG) in mismatch["message"]
+    assert mismatch["configPath"] == str(gateway._TRACKING_CONFIG)
+
+
+def test_pointer_mismatch_is_empty_when_they_agree(tmp_path):
+    state = _pointer_state(tmp_path, config=_POINTER_CONFIG, solved_intr="intr_0804", solved_extr="extr_0804")
+
+    assert gateway._calibration_pointer_mismatch(state, gateway._production_calibration_runs(state)) == {}
+
+
+def test_pointer_mismatch_is_silent_when_the_config_cannot_be_read(tmp_path):
+    """An unreadable config is not evidence of a mismatch.
+
+    We do not know what production loads, and asserting a disagreement we
+    cannot see would put a false alarm on top of a broken deployment.
+    """
+    state = _pointer_state(tmp_path, config=None, solved_intr="intr_NEW", solved_extr="extr_NEW")
+
+    production = gateway._production_calibration_runs(state)
+    assert production["error"]
+    assert gateway._calibration_pointer_mismatch(state, production) == {}
+
+
+def test_production_runs_follow_an_edit_rather_than_caching_boot_state(tmp_path):
+    """The pointer is edited by hand and rewritten by deploys.
+
+    A value cached at startup would keep reporting the old run as live, which
+    is precisely the class of error this comparison is meant to surface.
+    """
+    state = _pointer_state(tmp_path, config=_POINTER_CONFIG, solved_intr="intr_0804", solved_extr="calib_0820_extrinsics")
+    assert gateway._calibration_pointer_mismatch(state, gateway._production_calibration_runs(state))
+
+    path = tmp_path / gateway._TRACKING_CONFIG
+    path.write_text(_POINTER_CONFIG.replace("extr_0804", "calib_0820_extrinsics"), encoding="utf-8")
+    os.utime(path, (time.time() + 1, time.time() + 1))
+
+    assert gateway._production_calibration_runs(state)["extrinsicsRun"] == "calib_0820_extrinsics"
+    assert gateway._calibration_pointer_mismatch(state, gateway._production_calibration_runs(state)) == {}
+
+
+def test_calibration_payload_carries_both_pointers(tmp_path):
+    state = _pointer_state(tmp_path, config=_POINTER_CONFIG, solved_intr="intr_0804", solved_extr="calib_0820_extrinsics")
+
+    payload = gateway._calibration_payload(state)
+
+    assert payload["extrinsicsRun"] == "calib_0820_extrinsics"
+    assert payload["production"]["extrinsicsRun"] == "extr_0804"
+    assert payload["pointerMismatch"]["fields"]

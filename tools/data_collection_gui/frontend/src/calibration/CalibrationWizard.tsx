@@ -23,6 +23,7 @@ import { captureTally } from "./solvePanel";
 import { SolveProgress } from "./SolveProgress";
 import { StepCameraPreview } from "./StepCameraPreview";
 import { previewCameras, previewStatus } from "./stepPreview";
+import { pointerPromotionHint, pointerRows } from "./status";
 
 // Mirrors the gateway's validation (_parse_calibration_segment_seconds); the
 // input just stops the obvious mistakes before a round-trip.
@@ -65,6 +66,7 @@ export function CalibrationWizard({
   const [pending, setPending] = useState(false);
   const session: CalibrationSession | undefined = snapshot.calibrationSession;
   const status = snapshot.calibration;
+  const promotionHint = pointerPromotionHint(status);
 
   const call = async (fn: () => Promise<{ ok: boolean; error?: string }>) => {
     setPending(true);
@@ -299,9 +301,30 @@ export function CalibrationWizard({
 
       <div className="summary-grid">
         <Metric label="上次解算" value={status.lastRunAt || "—"} />
-        <Metric label="生产内参" value={status.intrinsicsRun || "—"} />
-        <Metric label="生产外参" value={status.extrinsicsRun || "—"} />
       </div>
+
+      {/* Two columns, never one. A solve writes its run name into gateway
+          memory and never into the tracking config, so a single "生产外参: X"
+          line showed a calibration as live while production kept loading the
+          previous one — for seven days, with a moved camera in it. */}
+      <div className="cali-pointers">
+        <div className="cali-pointer-head">
+          <span />
+          <span>最近解出</span>
+          <span>生产实际加载</span>
+        </div>
+        {pointerRows(status).map((row) => (
+          <div key={row.label} className={row.differs ? "cali-pointer-row differs" : "cali-pointer-row"}>
+            <span>{row.label}</span>
+            <span className="mono">{row.solved || "—"}</span>
+            <span className="mono">
+              {row.production || "—"}
+              {row.differs ? <b> ← 不一致</b> : null}
+            </span>
+          </div>
+        ))}
+      </div>
+      {promotionHint ? <p className="panel-note cali-pointer-drift">{promotionHint}</p> : null}
     </section>
   );
 }

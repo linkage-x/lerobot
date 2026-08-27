@@ -485,10 +485,36 @@ export type CalibrationStatus = {
   outputPath: string;
   progress?: CalibrationProgress;
   solve?: CalibrationSolve;
-  // Which calibration runs production is pointed at, read from the tracking
-  // config rather than tracked separately so the two cannot drift.
+  /**
+   * The last run the gateway *knows about*: the tracking config's value at
+   * startup, overwritten in memory by whatever a solve produces.
+   *
+   * The comment that used to sit here said these were read from the tracking
+   * config "so the two cannot drift". They do drift, and that is the whole
+   * point of `production` below: nothing writes the run names back to the
+   * config, so a finished solve leaves these two naming a calibration that
+   * production will not load.
+   */
   intrinsicsRun?: string;
   extrinsicsRun?: string;
+  /** What the tracking config says right now — what production actually loads. */
+  production?: CalibrationProduction;
+  /** Present only when the last solve and the production pointer disagree. */
+  pointerMismatch?: CalibrationPointerMismatch;
+};
+
+export type CalibrationProduction = {
+  configPath: string;
+  intrinsicsRun: string;
+  extrinsicsRun: string;
+  /** Non-empty when the config could not be read or parsed. */
+  error: string;
+};
+
+export type CalibrationPointerMismatch = {
+  fields: { kind: "intrinsics" | "extrinsics"; label: string; solved: string; production: string }[];
+  configPath: string;
+  message: string;
 };
 
 export type EePose = {

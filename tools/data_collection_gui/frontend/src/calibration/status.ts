@@ -119,3 +119,58 @@ export function summarizeKinds(
   });
   return summary;
 }
+
+export type PointerRow = {
+  label: string;
+  /** The run the gateway last solved or loaded at startup. */
+  solved: string;
+  /** The run the tracking config points at — what production actually loads. */
+  production: string;
+  /** True when the two name different runs and both are known. */
+  differs: boolean;
+};
+
+/**
+ * The two calibration pointers side by side, so a solve that has not been
+ * promoted cannot look like one that has.
+ *
+ * A single "生产内参: X" line cannot express the state that actually occurs:
+ * a solve writes its run name into gateway memory and never into the tracking
+ * config, so the panel showed a calibration as live while production kept
+ * loading the previous one. Rendering both values is what makes the gap
+ * visible; `differs` is what makes it loud.
+ */
+export function pointerRows(status: {
+  intrinsicsRun?: string;
+  extrinsicsRun?: string;
+  production?: { intrinsicsRun: string; extrinsicsRun: string; error: string };
+}): PointerRow[] {
+  const production = status.production;
+  const build = (label: string, solved: string, live: string): PointerRow => ({
+    label,
+    solved,
+    production: live,
+    // An unreadable config is not a mismatch: we do not know what production
+    // loads, and claiming a disagreement we cannot see would be a false alarm
+    // on top of an already-broken deployment.
+    differs: Boolean(production && !production.error && solved && live && solved !== live),
+  });
+  return [
+    build("内参", status.intrinsicsRun ?? "", production?.intrinsicsRun ?? ""),
+    build("外参", status.extrinsicsRun ?? "", production?.extrinsicsRun ?? ""),
+  ];
+}
+
+/** One line telling the operator what to do about a mismatch, or "" when fine. */
+export function pointerPromotionHint(status: {
+  production?: { configPath: string; error: string };
+  pointerMismatch?: { fields: unknown[]; configPath: string };
+}): string {
+  if (status.production?.error) return status.production.error;
+  const mismatch = status.pointerMismatch;
+  if (!mismatch || mismatch.fields.length === 0) return "";
+  return (
+    `解算不会自动改生产指针：要让它生效，编辑 ${mismatch.configPath} 的 ` +
+    `calibration.intrinsics_run_name / fixed_camera_run_name。在那之前，产出的轨迹仍用旧标定。`
+  );
+}
