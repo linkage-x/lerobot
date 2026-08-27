@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>误差预算下一步的第一性原理决策 · 2026-08-27</title>
+<style>
+  :root{
+    --bg:#f6f7f9;
+    --card:#ffffff;
+    --text:#1f2937;
+    --muted:#6b7280;
+    --line:#e5e7eb;
+    --accent:#2563eb;
+    --accent-soft:#eff6ff;
+    --ok:#15803d;
+    --ok-bg:#ecfdf5;
+    --warn:#b45309;
+    --warn-bg:#fffbeb;
+    --p0:#991b1b;
+    --p0-bg:#fef2f2;
+    --shadow:0 8px 24px rgba(15,23,42,.06);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    font-family:Inter, "PingFang SC","Microsoft YaHei",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    line-height:1.65;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:36px 22px 72px}
+  .hero{
+    background:linear-gradient(135deg,#111827,#1f2937);
+    color:#fff;
+    border-radius:22px;
+    padding:34px 36px;
+    box-shadow:var(--shadow);
+    margin-bottom:24px;
+  }
+  .hero h1{margin:0 0 10px;font-size:30px;letter-spacing:.2px}
+  .hero p{margin:6px 0;color:#d1d5db}
+  .hero .meta{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}
+  .pill{
+    display:inline-flex;align-items:center;gap:7px;
+    padding:6px 11px;border-radius:999px;font-size:13px;font-weight:600;
+    border:1px solid rgba(255,255,255,.18);color:#e5e7eb
+  }
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+  .card{
+    background:var(--card);border:1px solid var(--line);border-radius:18px;
+    padding:22px;box-shadow:var(--shadow)
+  }
+  .card h2,.card h3{margin-top:0}
+  .section-title{
+    display:flex;align-items:center;justify-content:space-between;gap:12px;
+    margin-bottom:14px
+  }
+  .section-title h2{margin:0;font-size:22px}
+  .badge{
+    display:inline-block;padding:4px 9px;border-radius:999px;font-size:12px;font-weight:700
+  }
+  .done{color:var(--ok);background:var(--ok-bg)}
+  .todo{color:var(--accent);background:var(--accent-soft)}
+  .warn{color:var(--warn);background:var(--warn-bg)}
+  .p0{color:var(--p0);background:var(--p0-bg)}
+  .blocked{color:#6b7280;background:#f3f4f6;border:1px solid #d1d5db}
+  .now{color:#166534;background:#dcfce7}
+  tr.is-blocked td{background:#fafafa;color:#6b7280}
+  .table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .phase{margin-top:18px}
+  .phase-head{
+    display:flex;align-items:flex-start;justify-content:space-between;gap:16px;
+    margin-bottom:10px
+  }
+  .phase h3{font-size:19px;margin:0}
+  .phase .goal{color:var(--muted);margin:4px 0 0}
+  .timeline{
+    display:grid;grid-template-columns:120px 1fr;gap:14px;
+    padding:10px 0;border-top:1px solid var(--line)
+  }
+  .timeline:first-child{border-top:none}
+  .week{font-weight:700;color:#111827}
+  details{
+    margin-top:12px;border:1px solid var(--line);border-radius:12px;
+    background:#fafafa;overflow:hidden
+  }
+  summary{
+    cursor:pointer;padding:12px 14px;font-weight:700;list-style:none;
+    user-select:none
+  }
+  summary::-webkit-details-marker{display:none}
+  summary:before{content:"▸";display:inline-block;margin-right:8px;transition:.18s}
+  details[open] summary:before{transform:rotate(90deg)}
+  .detail-body{padding:0 14px 14px}
+  .detail-body ul{margin:8px 0 0 20px}
+  .detail-body li{margin:4px 0}
+  .metric-table{width:100%;border-collapse:collapse;font-size:14px}
+  .metric-table th,.metric-table td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  .metric-table th{background:#f9fafb}
+  code,.mono{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+    background:#f3f4f6;border-radius:6px;padding:2px 5px;font-size:.92em
+  }
+  .flow{
+    white-space:pre-wrap;background:#0f172a;color:#e5e7eb;
+    padding:16px;border-radius:12px;overflow:auto;font-size:13px
+  }
+  .callout{
+    border-left:4px solid var(--accent);background:var(--accent-soft);
+    padding:14px 16px;border-radius:10px;margin:12px 0
+  }
+  .callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  .callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  .gate{
+    margin-top:12px;padding:13px 15px;border:1px dashed #9ca3af;border-radius:10px;
+    background:#fff
+  }
+  .small{font-size:13px;color:var(--muted)}
+  .priority-list{margin:0;padding-left:20px}
+  .priority-list li{margin:7px 0}
+  .full{grid-column:1/-1}
+  @media (max-width:820px){
+    .grid{grid-template-columns:1fr}
+    .timeline{grid-template-columns:1fr}
+    .hero{padding:26px 22px}
+    .full{grid-column:auto}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+<section class="hero">
+<h1>下一步做什么：从第一性原理推</h1>
+<p>2026-08-27。把「误差预算还剩哪些待办」这个问题交给两条公理和一条决策规则去回答，而不是交给清单顺序。结论：五项待办里<b>两项立刻做、一项已被测量否决、两项降级</b>。</p>
+<div class="meta"><span class="pill">决策依据全部为当日实测</span><span class="pill">每项可回溯到 roadmap</span><span class="pill">含两个被数据推翻的直觉</span></div>
+<p style="margin-top:16px;color:#9ca3af;font-size:13px">状态与待办在 <a href="box_umi_trajectory_gt_replay_roadmap.html" style="color:#93c5fd">BOX 高精度 UMI Trajectory GT &amp; Dual-FR3 Replay Roadmap</a>（执行主线 P0-Now ⑪ / ⑫ / ⑬ 与「3 mm 轨迹精度误差预算」表）。本页只放<b>推理</b>：为什么是这个顺序，以及每一步的判据。</p>
+</section>
+
+<div class="grid">
+
+<section class="card full">
+<div class="section-title"><h2>一、两条公理</h2><span class="badge done">当日实测</span></div>
+
+<div class="callout">
+<b>公理 1 · 准确度 ≥ 精度，而我们至今只测到精度。</b>
+<p>误差传播 MC、外参 bootstrap、内参 bootstrap，三者都是<b>围绕当前标定扰动</b>。凡是所有相机共享的误差——全场尺度、world 系整体偏置、共同的模型偏差——在任何一次抽样里都不动，因此对三者<b>结构性不可见</b>。所以它们产出的每一个数字都是<b>下界</b>，真值只会更大。</p>
+<p class="small">这不是谨慎措辞。当日实例：<span class="mono">cam_09</span> 被物理挪动，而标定自评 <span class="mono">bundle_rmse</span> 反而更好（0.244 px vs 0.273 px）——它是错的那一份。模型自评、以及围绕模型的抽样，都看不见模型之外的事。</p>
+</div>
+
+<div class="callout warn">
+<b>公理 2 · 这个下界已经超预算 5.8 倍。</b>
+<p><span class="mono">all_sources</span> p95 = <b>17.46 mm</b>（0820 外参 + 实测内参 σ），预算 <b>3 mm</b>。</p>
+</div>
+
+<h3 style="margin:18px 0 6px">推论：一条可执行的决策规则</h3>
+<p>若一项工作只能把 17.46 改动百分之几，它<b>翻转不了任何决策</b>——「超 5.8 倍」这个结论对任一输入的 ±20% 都不敏感。所以：</p>
+<div class="callout ok">
+<b>只做两类事：(i) 揭露抽样研究看不见的系统误差；(ii) 防止整条测量链被静默作废。<br/>细化已有 σ 不属于任何一类。</b>
+</div>
+<p>这条规则当日有直接验证：把一个<b>高估 3 倍</b>的占位值（<span class="mono">focal_rel</span> 2.0e-03 → 实测 7.5e-04）换成实测值，总量 <b>18.00 → 17.46 mm，只动 3.0%</b>。更极端地，<b>把整个 intrinsics 行归零</b>，总量也只到 <b>15.96 mm，仍超 5.3 倍</b>。</p>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>二、决策表</h2><span class="badge now">五项</span></div>
+<div class="table-scroll">
+<table class="metric-table">
+<tr><th style="width:18%">待办</th><th style="width:10%">决定</th><th>第一性理由</th><th style="width:21%">roadmap 溯源</th></tr>
+
+<tr>
+<td><b>D1 · A/B 择优 CLI</b><br/><span class="small">参考 episode 缓存 + 两份外参 → 三项指标对比</span></td>
+<td><span class="badge now">立刻做</span><br/><span class="small">第 1 优先</span></td>
+<td>属于类别 (ii)，而且是<b>唯一</b>能用独立数据检出「生产在用错标定」的机制。代价按小时计；不做的代价<b>已实测为 7 天</b>生产数据跑在一台失效相机上。判别力当日已验证：同一批缓存检测，0804 与 0820 的融合重投影残差是 <b>2.552 vs 1.319 px</b>，毫不含糊；而标定自评分数把顺序<b>排反</b>。<br/><b>不要先做提升按钮（⑬③）。</b>没有可信判别器的提升闸门比没有闸门更糟——它把「点过了」变成「验过了」。</td>
+<td>P0-Now <b>⑬</b> 第②层<br/><span class="small">①层（两个指针并排 + 不一致告警）当日已完成并部署</span></td>
+</tr>
+
+<tr>
+<td><b>D2 · 拆解那 1.32 px 残差</b><br/><span class="small">(a) 实测角点噪声定随机地板；(b) 反解 cube layout 看能吸收多少</span></td>
+<td><span class="badge now">立刻做</span><br/><span class="small">第 2 优先</span></td>
+<td>属于类别 (i)，且是<b>全系统最大的未解释量</b>。模型的每个部件都声称自己在 0.16–0.27 px，而 cube 数据上的融合残差是 <b>1.32 px</b>——<b>6.6 倍于噪声地板，没有任何部件认领</b>（账目见下一节）。<br/>它<b>不是相机</b>：换 0820 外参只消掉一半，而 <span class="mono">cam_08</span> 的逐相机分歧 9.87 → 9.39 mm <b>纹丝不动</b>。<br/>它<b>不是随机噪声</b>：噪声会同时抬高 held-out 与板拟合，那两项都干净。<br/>模型里剩下的部件只有 <b>cube 几何</b>。而系统性偏差<b>不随相机数或帧数平均下去</b>，正是公理 1 里「下界与真值之间」那段距离的组成部分。<br/><b>先 (a) 后 (b)</b>：若角点噪声实测就是 ~0.2 px，则 1.32 全是系统性 → 查几何；若实测接近 1 px，则是检测器更吵 → 完全不同的修法。(a) 是更便宜的判别器。</td>
+<td>误差预算表「<b>corner 级 multi-view solver</b>」行（自认 σ 低估约一个量级）+「<b>marker 尺寸 / marker rig 几何</b>」行<br/>+ P0-Now <b>⑪</b> 退出条件里 <span class="mono">corner_px</span> 一项</td>
+</tr>
+
+<tr>
+<td><b>D3 · 给 MC 加 <span class="mono">D</span>（畸变）扰动入口</b></td>
+<td><span class="badge done">否决</span><br/><span class="small">由测量而非判断</span></td>
+<td><b>已用实验回答，不再是待办。</b>在 bootstrap 里加了一个对照：用副本的 <span class="mono">K</span> 配<b>参考的 D</b>（即 MC 现在的做法），对比副本的 <span class="mono">K</span> 与 <span class="mono">D</span> 一起用。差别 <b>−3% 到 +9%</b>，且 <b>7 台里 4 台为负</b>。<br/><b>负号是关键</b>：K 与 D 联合拟合、彼此补偿，所以只扰动 K 反而<b>略偏保守</b>。把 D 作为<b>独立</b>输入加进去会<b>更错</b>——那是往一个现实中会互相抵消的方向注入方差。</td>
+<td>P0-Now <b>⑪</b> 退出条件「六项 σ 全部有出处」<br/><span class="small">此项由「缺」改为「已判定不需要」</span></td>
+</tr>
+
+<tr>
+<td><b>D4 · 修 fx/fy 独立抽样</b></td>
+<td><span class="badge warn">做，但不单独排期</span></td>
+<td>实测 <span class="mono">corr(fx, fy) = 0.88–1.00</span>（七台无一例外），而 MC 是 <span class="mono">rng.normal(0.0, σ, 2)</span> 抽两次。这是在探索一个<b>长宽比失真</b>的方向，而估计量根本不往那走。<br/>按决策规则它<b>改不动量级</b>（intrinsics 行整个归零也只值 1.5 mm）。但它<b>扭曲行与行之间的归因</b>，而归因正是人用来决定「该修哪个」的东西——探索了虚假方向的模型会高估 intrinsics 行的重要性。<br/><b>结论：下次编辑该文件时顺手改掉，不为它单开一项。</b><br/><span class="small">同批还有一个：<span class="mono">_label_seed</span> 只取前 4 字节，<span class="mono">timing_skew</span> 与 <span class="mono">timing_bias</span> <b>撞种子</b>——逐源对比时这两行不是独立样本。</span></td>
+<td>P0-Now <b>⑪</b><br/><span class="small">MC 的模型缺陷，不是 σ 取值问题</span></td>
+</tr>
+
+<tr>
+<td><b>D5 · hand-eye 解算 CLI</b></td>
+<td><span class="badge blocked">降级</span><br/><span class="small">可做，排最后</span></td>
+<td>它瞄准的是<b>第二大单项</b>（rig→TCP 旋转，声明值 2.0° → <b>9.1 mm</b>），价值真实。但<b>采集</b>已随新夹爪–rig 方案顺延，而 CLI 本身<b>不产生知识</b>、只提前占用日程。<br/>按 roadmap 既有判据「新夹爪明天到货，这项工作会不会白做？」——CLI <b>不会</b>（它只吃位姿对），所以<b>允许做</b>；但排在 D1/D2 之前，等于拿能揭露系统误差的时间去换排期。</td>
+<td>P0-Now <b>⑫</b>「可先行」产物<br/><span class="small">①转接件待定、②机时顺延、③拆装重复性已确认同场做</span></td>
+</tr>
+</table>
+</div>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>三、D2 的账目：那 1.32 px 缺了谁的解释</h2><span class="badge p0">全系统最大未解释量</span></div>
+<table class="metric-table">
+<tr><th>量</th><th style="width:14%">数值</th><th>它说明什么</th></tr>
+<tr><td>BA 假设的角点 σ</td><td><b>0.200 px</b></td><td>求解器<b>声称</b>的观测噪声</td></tr>
+<tr><td>内参自标定 held-out</td><td><b>0.160 px</b></td><td>镜头模型在<b>没见过的</b>板视图上的表现——干净</td></tr>
+<tr><td>0820 标定自评板拟合</td><td><b>0.273 px</b></td><td>外参解在<b>自己那批板数据</b>上的表现——干净</td></tr>
+<tr><td><b>cube 数据上的融合重投影残差</b></td><td><b>1.319 px</b></td><td><b>6.6 倍于噪声地板。没有任何部件认领这一段。</b></td></tr>
+</table>
+<div class="callout warn" style="margin-top:14px">
+<b>换算量级：</b>f ≈ 993 px、相机到 cube 中位距离 0.97 m，则 1.32 px ≈ <b>1.29 mm</b> 横向错位（每台）。而它是<b>系统性</b>的，不随相机数或帧数平均下去。对着 3 mm 的总预算，这不是小数点后的事。
+</div>
+<p><b>排除法已走完两步：</b></p>
+<ul>
+<li><b>不是相机外参。</b>换 0820 标定重解，残差 2.552 → 1.319 px，<b>只消掉一半</b>；<span class="mono">cam_08</span> 的逐相机分歧 9.87 → 9.39 mm，<b>基本没动</b>。</li>
+<li><b>不是随机噪声。</b>噪声会同时抬高 held-out 与板拟合，那两项都在 0.16–0.27 px。</li>
+</ul>
+<p><b>模型里剩下的部件只有 cube 几何</b>——假设的 71.92 × 71.67 × 71.09 mm、marker 56 mm，以及贴纸的实际位置。这与 roadmap 既有的那条判断吻合：<span class="small">「cube 晃动是运动相关的时变量，不能被任何 <span class="mono">static_transform</span> 吸收，而且所有既有检查对它免疫——多相机一致性看不见（共模），重投影残差也看不见（单相机 cube pose 中位只用 1–2 个 marker，近乎退化）」。</span></p>
+<div class="callout">
+<b>执行顺序（先便宜的判别器）：</b>
+<ol style="margin:6px 0 0 18px">
+<li><b>实测角点噪声</b>（<span class="mono">metrology/corner_noise.py</span> / <span class="mono">cli/measure_corner_noise.py</span> 已存在），定出随机地板。</li>
+<li><b>反解 cube layout</b>（<span class="mono">cli/bootstrap_marker_layout.py</span> / <span class="mono">build_rig_layout_from_cube.py</span> / <span class="mono">marker_set_bias.py</span> 已存在），看能吸收 1.32 px 里的多少。</li>
+</ol>
+<span class="small"><b>两步都不需要新采集</b>——检测缓存 <span class="mono">outputs/metrology/error_propagation_132514/detections.npz</span> 在。</span>
+</div>
+<div class="callout warn">
+<b>一条必须先说清的口径红线：</b>不要因为残差是 1.32 px 就把 <span class="mono">corner_px</span> 从 0.2 抬到 1.32。<b>偏差不随相机数/帧数平均下去，而 σ 会</b>——直接抬 σ 只会让 FIM 继续错误地预测「加相机有用」。正确产出是<b>拆成随机项 + 系统项</b>，这也是步骤 (a) 必须先做的理由。
+</div>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>四、不在清单上，但结论要求说的一件事</h2><span class="badge p0">证书问题</span></div>
+<p>由公理 1：<b>本页排的每一项都不能把「下界」变成「准确度」。</b>D1 保护测量链不被作废，D2 找出并修掉最大的系统误差——两者都让下界更贴近真值，但<b>都不能证明它就是真值</b>，因为共模误差对它们同样不可见。</p>
+<div class="callout warn">
+<b>能把 3 mm 变成可验收的，只有独立 GT（roadmap Phase 7 / P1-采购）。</b>这不是「以后也做一下」，而是<b>逻辑上唯一的出口</b>。任何「我们内部又量了一遍所以现在准了」的说法，都在重复公理 1 已经排除的错误。
+</div>
+<p class="small">所以本页的正确读法是：<b>D1/D2 在缩小「下界与真值」之间那段距离，Phase 7 才是把这段距离量出来。</b>两者不可互替，顺序上也不冲突——D1/D2 不需要采购周期，Phase 7 需要，因此它应当<b>并行推进</b>而不是排在后面。</p>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>五、被数据推翻的两个直觉</h2><span class="badge warn">方法论</span></div>
+<table class="metric-table">
+<tr><th style="width:30%">听起来对的说法</th><th>实测</th></tr>
+<tr>
+<td>「MC 不扰动 <span class="mono">D</span>，所以低估了内参不确定性」</td>
+<td><b>相反。</b>只扰动 K 反而略偏保守：K 与 D 联合拟合、彼此补偿，K-only 与 K+D 的差别是 −3% ~ +9%，<b>7 台里 4 台为负</b>。把 D 当独立输入加进去，是往一个现实中会抵消的方向注入方差。</td>
+</tr>
+<tr>
+<td>「占位值是隐患，先把它们全换成实测的」</td>
+<td><b>代价极小，不值得优先。</b>换掉一个高估 3 倍的占位值，总量只动 3.0%；整个 intrinsics 行归零也只从 17.46 到 15.96 mm。<b>而且其中一个占位值本来就猜对了</b>（<span class="mono">principal_px</span> 1.0 vs 实测 0.20–1.10）。</td>
+</tr>
+</table>
+<p class="small" style="margin-top:12px"><b>共同的教训：</b>「哪一项听起来最不严谨」与「哪一项最影响结论」是两个不同的排序，而本页的决策规则要求按后者排。</p>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>六、溯源索引</h2><span class="badge done">数据与代码</span></div>
+<div class="table-scroll">
+<table class="metric-table">
+<tr><th style="width:25%">本页结论</th><th style="width:38%">产物（Thor <span class="mono">/home/nvidia/lerobot/</span>）</th><th>代码</th></tr>
+<tr><td>公理 2 的 17.46 mm；退占位值只动 3%</td><td><span class="mono">outputs/metrology/error_propagation_132514/mc_left_measured_sigma/</span><br/><span class="small">对照 <span class="mono">mc_left_0820/</span>（占位 σ）、<span class="mono">mc_left_bycam/</span>（0804 外参）</span></td><td><span class="mono">metrology/cli/error_propagation_mc.py</span></td></tr>
+<tr><td>D3 的 K-only 对照；内参 σ 实测</td><td><span class="mono">outputs/metrology/intrinsics_bootstrap_0820/</span><br/><span class="small">同 seed 连跑两次逐位一致</span></td><td><span class="mono">metrology/cli/intrinsics_bootstrap.py</span></td></tr>
+<tr><td>D4 的 <span class="mono">corr(fx, fy)</span>；σ<sub>ext</sub> 是漂移不是噪声</td><td><span class="mono">outputs/metrology/calibration_bootstrap_0820/</span><br/><span class="small">＋ <span class="mono">_block1/</span>、<span class="mono">_block40/</span> 区块敏感性</span></td><td><span class="mono">metrology/cli/calibration_bootstrap.py</span></td></tr>
+<tr><td>D1 的判别力（2.552 vs 1.319 px）；D2 的排除法</td><td><span class="mono">outputs/metrology/error_propagation_132514/recheck/</span><br/><span class="small">cam09fix / c0820 两份重解</span></td><td><span class="mono">metrology/cli/run_marker_rig_ba.py --detections</span></td></tr>
+</table>
+</div>
+<p class="small" style="margin-top:12px"><b>本页与 roadmap 的分工：</b>状态、待办与口径红线在 roadmap；本页只放<b>为什么是这个顺序</b>。任何一项状态变化以 roadmap 为准，<b>本页不跟随更新</b>——它是一次<b>决策的记录</b>，不是看板。</p>
+</section>
+
+</div>
+</div>
+</body>
+</html>
