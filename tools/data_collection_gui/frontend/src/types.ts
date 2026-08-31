@@ -708,6 +708,105 @@ export type RigCheckReport = {
   baseline?: RigCheckBaseline;
 };
 
+// --- hand-eye (AX = XB), the rotation half of marker rig -> TCP -------------
+// Mirrors metrology/cli/hand_eye_calibration.py. `verdict.status` is the field
+// to branch on, not `ok`: "not_observable", "mis_associated" and
+// "no_uncertainty_estimate" are all successful *runs* that refuse to produce a
+// constant, and each needs a different thing from the operator.
+export type HandEyeVerdictStatus =
+  | "ok"
+  | "not_observable"
+  | "mis_associated"
+  | "insufficient_motions"
+  | "solved_but_out_of_budget"
+  | "no_uncertainty_estimate";
+
+export type HandEyeReport = {
+  input?: { path?: string; sha256?: string; num_poses?: number; pose_names?: string[] };
+  motions?: {
+    num_poses?: number;
+    num_motions?: number;
+    num_candidate_pairs?: number;
+    pairing?: string;
+    dropped?: Record<string, number>;
+    worst_angle_disagreement_deg?: number;
+    motion_angle_deg?: { p05?: number; p50?: number; p95?: number };
+  };
+  observability?: {
+    ok?: boolean;
+    rotation_axis_rank_ratio?: number;
+    translation_rank_ratio?: number;
+    reasons?: string[];
+  };
+  solution?: {
+    T_flange_rig?: number[][];
+    rotation_vector_deg?: number[];
+    translation_mm?: number[];
+    num_motions_used?: number;
+    num_motions_rejected?: number;
+    residual_rotation_deg?: { p50: number; p95: number; max: number };
+    residual_translation_mm?: { p50: number; p95: number; max: number };
+  };
+  holdout?: {
+    num_folds?: number;
+    note?: string;
+    solution_shift_rotation_deg?: { p50: number; p95: number; max: number };
+  };
+  bootstrap?: { num_resamples?: number; sigma_deg?: number | null; note?: string };
+  rotation_sigma_deg?: number | null;
+  lever_equivalent_mm?: number;
+  lever_mm?: number;
+  against_budget?: {
+    target_deg: number;
+    acceptable_deg: number;
+    meets_target: boolean;
+    meets_acceptable: boolean;
+    replaces_declared_deg: number;
+    replaces_declared_mm: number;
+  };
+  T_box_rig?: { status?: string; why?: string; note?: string; matrix?: number[][] };
+  production?: {
+    wired_in?: boolean;
+    note?: string;
+    marker_rig_to_tcp_patch?: { rotation_source: string; rotation_sigma_deg: number } | null;
+  };
+  verdict?: { status?: HandEyeVerdictStatus; why?: string; note?: string };
+  validated?: boolean;
+};
+
+export type HandEyeSolveResponse = {
+  ok: boolean;
+  returncode?: number;
+  error?: string;
+  verdict?: { status?: HandEyeVerdictStatus; why?: string; note?: string };
+  report: HandEyeReport | null;
+  reportPath?: string;
+  stdout?: string;
+  stderr?: string;
+};
+
+export type HandEyePlanRow = {
+  num_poses: number;
+  num_trials: number;
+  rotation_error_p50_deg?: number;
+  rotation_error_p95_deg?: number;
+  lever_equivalent_p95_mm?: number;
+  meets_target?: boolean;
+  meets_acceptable?: boolean;
+};
+
+export type HandEyePlanResponse = {
+  ok: boolean;
+  error?: string;
+  plan: {
+    assumptions?: Record<string, number>;
+    lever_mm?: number;
+    rows?: HandEyePlanRow[];
+  } | null;
+  planPath?: string;
+  stdout?: string;
+};
+
 export type RigCheckResponse = {
   ok: boolean;
   error?: string;

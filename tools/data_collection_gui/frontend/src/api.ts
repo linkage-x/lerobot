@@ -20,6 +20,8 @@ import type {
   RecordingStatus,
   ReplayStatus,
   ReplayTimeline,
+  HandEyePlanResponse,
+  HandEyeSolveResponse,
   RigCheckResponse,
   WorldFrameResponse,
   MujocoCubeMode,
@@ -865,6 +867,57 @@ export class DataCollectionGuiApi {
       return { ...payload, ok: response.ok && payload.ok !== false };
     } catch (error) {
       return { ok: false, error: String(error), report: null };
+    }
+  }
+
+  // Hand-eye (AX=XB). Both of these return the tool's own report verbatim,
+  // including a non-zero returncode, because a refusal ("not observable",
+  // "mis-associated") is the answer the panel has to show -- flattening it into
+  // ok/failed would be how a refused solve turns back into a confident number.
+  async runHandEyeSolve(params: {
+    pairsPath: string;
+    tFlangeBoxPath?: string;
+    leverMm?: string;
+    pairing?: "all" | "consecutive";
+  }): Promise<HandEyeSolveResponse> {
+    const query = new URLSearchParams({ pairs_path: params.pairsPath });
+    if (params.tFlangeBoxPath?.trim()) query.set("t_flange_box_path", params.tFlangeBoxPath.trim());
+    if (params.leverMm?.trim()) query.set("lever_mm", params.leverMm.trim());
+    if (params.pairing) query.set("pairing", params.pairing);
+    try {
+      const response = await fetch(
+        `${this.apiBase}/api/calibration/hand-eye/solve?${query.toString()}`,
+        { method: "POST", headers: { Accept: "application/json" } }
+      );
+      const payload = (await response.json()) as HandEyeSolveResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error), report: null, returncode: -1 };
+    }
+  }
+
+  async runHandEyePlan(params: {
+    poses?: string;
+    poseNoiseDeg?: string;
+    poseNoiseMm?: string;
+    trials?: string;
+    leverMm?: string;
+  }): Promise<HandEyePlanResponse> {
+    const query = new URLSearchParams();
+    if (params.poses?.trim()) query.set("poses", params.poses.trim());
+    if (params.poseNoiseDeg?.trim()) query.set("pose_noise_deg", params.poseNoiseDeg.trim());
+    if (params.poseNoiseMm?.trim()) query.set("pose_noise_mm", params.poseNoiseMm.trim());
+    if (params.trials?.trim()) query.set("trials", params.trials.trim());
+    if (params.leverMm?.trim()) query.set("lever_mm", params.leverMm.trim());
+    try {
+      const response = await fetch(
+        `${this.apiBase}/api/calibration/hand-eye/plan?${query.toString()}`,
+        { method: "POST", headers: { Accept: "application/json" } }
+      );
+      const payload = (await response.json()) as HandEyePlanResponse;
+      return { ...payload, ok: response.ok && payload.ok !== false };
+    } catch (error) {
+      return { ok: false, error: String(error), plan: null };
     }
   }
 

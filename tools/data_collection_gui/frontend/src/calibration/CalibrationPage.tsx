@@ -33,6 +33,7 @@ import { IntrinsicsCoveragePanel } from "./IntrinsicsCoveragePanel";
 import { WorldFramePanel } from "./WorldFramePanel";
 import { CalibrationWizard } from "./CalibrationWizard";
 import { MarkerTcpPanel } from "./MarkerTcpPanel";
+import { HandEyePanel } from "./HandEyePanel";
 
 const OPERATOR_KEY = "lerobot.calibration.operator";
 
@@ -198,6 +199,12 @@ export function CalibrationPage({
       />
 
       <MarkerTcpPanel snapshot={snapshot} api={api} busy={busy} />
+
+      {/* The pivot above measures translation and is structurally blind to
+          rotation -- a spherical joint leaves it in the null space. This is the
+          other half of the same constant, and the larger of the two errors: the
+          rotation in production is a declared 2.0 deg that was never measured. */}
+      <HandEyePanel api={api} busy={busy} />
 
       {/* --- per-BOX groups: readiness + monitors + calibration by device --- */}
       {boxGroups.map((group) => (

@@ -4449,6 +4449,218 @@ def _run_marker_tcp_repeatability_report(state: GatewayState) -> dict[str, Any]:
     return {"ok": True, "markerTcp": _marker_tcp_session_payload(state)}
 
 
+# --------------------------------------------------------------------------- #
+# hand-eye (AX = XB): the rotation half of marker rig -> TCP                    #
+# --------------------------------------------------------------------------- #
+#
+# The pivot fixture above measures translation and is structurally blind to
+# rotation -- a ball-and-socket joint is a 3-DoF spherical pair, so the mounting
+# rotation lives in the null space of what it observes and no number of frames
+# recovers it. The production bundle therefore still carries a *declared*
+# rotation_sigma_deg = 2.0, which on the current lever arm is 9.1 mm: the single
+# largest line in a 3 mm budget, and the only one that was never measured.
+#
+# Hand-eye is the fixture that does observe it. Mount the BOX on the FR3 flange,
+# drive it to a set of poses, and read each pose twice -- once from FK, once from
+# the camera rig. This gateway side only shells out; everything real is in
+# metrology.hand_eye, which takes pose pairs and nothing else and is therefore
+# not blocked by the gripper redesign that blocks the acquisition.
+_HAND_EYE_REQUIRED_MODULES = ("numpy",)
+
+
+def _hand_eye_python(state: GatewayState) -> Path:
+    """An interpreter that can run the hand-eye solve.
+
+    Deliberately a much weaker requirement than ``_marker_tcp_python``: the
+    solver is numpy-only, with the SO(3) log/exp written out rather than
+    imported from scipy, precisely so that the machine holding the data can
+    always run it. On Thor neither venv has scipy.
+    """
+    tried: list[str] = []
+    seen: set[str] = set()
+    for candidate in _marker_tcp_python_candidates(state.repo_root):
+        if not candidate.is_file() or str(candidate) in seen:
+            continue
+        seen.add(str(candidate))
+        probe = subprocess.run(
+            [str(candidate), "-c", f"import {', '.join(_HAND_EYE_REQUIRED_MODULES)}"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return candidate
+        missing = (probe.stderr or "").strip().splitlines()
+        tried.append(f"{candidate}: {missing[-1] if missing else 'import failed'}")
+    raise RuntimeError(
+        "找不到能运行 hand-eye 解算的 python（只需要 numpy）。已尝试：\n"
+        + "\n".join(f"  - {line}" for line in tried)
+    )
+
+
+def _hand_eye_output_root(state: GatewayState) -> Path:
+    root = state.repo_root / "outputs" / "metrology" / "hand_eye"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _run_hand_eye_command(state: GatewayState, args: list[str], *, timeout_s: int = 900) -> dict[str, Any]:
+    """Run the CLI and hand back its report plus its exit code.
+
+    The exit code is carried through rather than collapsed into ok/not-ok. Its
+    whole point is to distinguish "not observable" (3) from "mis-associated" (5)
+    from "solved but out of budget" (4) from "solved with no uncertainty at
+    all" (6), and a panel that only knew ok/failed would be the thing that
+    turns a refusal back into a confident number.
+    """
+    python = _hand_eye_python(state)
+    command = [str(python), "-m", "metrology.cli.hand_eye_calibration", *args]
+    proc = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        cwd=str(state.repo_root),
+        env=_marker_tcp_tool_env(state),
+        check=False,
+    )
+    return {
+        "returncode": proc.returncode,
+        "stdout": (proc.stdout or "")[-20000:],
+        "stderr": (proc.stderr or "")[-8000:],
+        "command": command,
+    }
+
+
+def _run_hand_eye_solve(
+    state: GatewayState,
+    *,
+    pairs_path: str = "",
+    t_flange_box_path: str = "",
+    lever_mm: str = "",
+    pairing: str = "all",
+) -> dict[str, Any]:
+    raw = str(pairs_path or "").strip()
+    if not raw:
+        return {"ok": False, "error": "需要一个 pose-pair JSON 路径"}
+    try:
+        pairs = _resolve_user_path(state, raw)
+        if not pairs.is_file():
+            raise FileNotFoundError(f"pose-pair JSON 不存在: {pairs}")
+        cad = None
+        if str(t_flange_box_path or "").strip():
+            cad = _resolve_user_path(state, t_flange_box_path)
+            if not cad.is_file():
+                raise FileNotFoundError(f"T_flange_box JSON 不存在: {cad}")
+        lever = float(str(lever_mm).strip()) if str(lever_mm or "").strip() else None
+        if lever is not None and (not math.isfinite(lever) or lever <= 0):
+            raise ValueError("杠杆臂必须是正数，单位 mm")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = _hand_eye_output_root(state) / f"hand_eye_{stamp}.json"
+    args = [str(pairs), "--out", str(out_path), "--pairing", pairing]
+    if cad is not None:
+        args += ["--t-flange-box", str(cad)]
+    if lever is not None:
+        args += ["--lever-mm", str(lever)]
+
+    try:
+        run = _run_hand_eye_command(state, args)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+    report: dict[str, Any] | None = None
+    if out_path.is_file():
+        try:
+            report = json.loads(out_path.read_text())
+        except Exception:  # noqa: BLE001
+            report = None
+
+    verdict = (report or {}).get("verdict") or {}
+    why = verdict.get("why") if isinstance(verdict, dict) else None
+    if run["returncode"] == 0:
+        error = ""
+    elif isinstance(why, str) and why.strip():
+        error = why.strip()
+    else:
+        tail = (run["stderr"] or "").strip().splitlines()
+        error = tail[-1] if tail else "hand-eye 解算失败"
+
+    # returncode 0 is the only "solved and accepted" outcome; every other code is
+    # a specific, named refusal, and it is carried through rather than collapsed
+    # so the panel can say which one happened.
+    return {
+        "ok": run["returncode"] == 0,
+        "returncode": run["returncode"],
+        "verdict": verdict,
+        "report": report,
+        "reportPath": str(out_path) if out_path.is_file() else "",
+        "stdout": run["stdout"],
+        "stderr": run["stderr"],
+        "error": error,
+    }
+
+
+def _run_hand_eye_plan(
+    state: GatewayState,
+    *,
+    poses: str = "",
+    pose_noise_deg: str = "",
+    pose_noise_mm: str = "",
+    trials: str = "",
+    lever_mm: str = "",
+) -> dict[str, Any]:
+    """Size the capture that does not exist yet.
+
+    This is the half of the item that is useful *today*: the acquisition is
+    blocked on the gripper-rig design, so what can be produced now is its
+    specification -- how many poses, at what per-pose orientation noise, to get
+    the rotation inside the budget.
+    """
+    try:
+        pose_list = str(poses or "6,8,12,16,24,32").strip()
+        for part in pose_list.split(","):
+            if part.strip() and int(part) <= 0:
+                raise ValueError("位姿数必须是正整数")
+        noise = float(str(pose_noise_deg).strip()) if str(pose_noise_deg or "").strip() else 0.10
+        noise_mm = float(str(pose_noise_mm).strip()) if str(pose_noise_mm or "").strip() else 0.5
+        trial_count = int(str(trials).strip()) if str(trials or "").strip() else 40
+        trial_count = max(5, min(trial_count, 200))
+        lever = float(str(lever_mm).strip()) if str(lever_mm or "").strip() else 102.3
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"参数不合法: {exc}"}
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = _hand_eye_output_root(state) / f"hand_eye_plan_{stamp}.json"
+    args = [
+        "--plan",
+        "--plan-poses", pose_list,
+        "--plan-pose-noise-deg", str(noise),
+        "--plan-pose-noise-mm", str(noise_mm),
+        "--plan-trials", str(trial_count),
+        "--lever-mm", str(lever),
+        "--out", str(out_path),
+    ]
+    try:
+        run = _run_hand_eye_command(state, args, timeout_s=600)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+    if run["returncode"] != 0:
+        tail = (run["stderr"] or "").strip().splitlines()
+        return {"ok": False, "error": tail[-1] if tail else "capture plan 失败", "stdout": run["stdout"]}
+
+    payload = json.loads(out_path.read_text()) if out_path.is_file() else {}
+    return {
+        "ok": True,
+        "plan": payload,
+        "planPath": str(out_path) if out_path.is_file() else "",
+        "stdout": run["stdout"],
+    }
+
+
 def _newest_calibration_dataset(state: GatewayState) -> Path | None:
     """Most recent recorded sweep that looks like a calibration capture."""
     roots = [state.datasets_root] if state.datasets_root else []
@@ -12407,6 +12619,37 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                             query.get("socket_beyond_tcp_mm", query.get("socketBeyondTcpMm", ["0"]))[0]
                             or "0"
                         ).strip(),
+                    )
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/hand-eye/solve":
+                    result = _run_hand_eye_solve(
+                        self.server.state,
+                        pairs_path=(query.get("pairs_path", query.get("pairsPath", [""]))[0] or "").strip(),
+                        t_flange_box_path=(
+                            query.get("t_flange_box_path", query.get("tFlangeBoxPath", [""]))[0] or ""
+                        ).strip(),
+                        lever_mm=(query.get("lever_mm", query.get("leverMm", [""]))[0] or "").strip(),
+                        pairing=(query.get("pairing", ["all"])[0] or "all").strip(),
+                    )
+                    # A refusal is a real answer here, not a server error: the
+                    # report is written either way and the panel renders the
+                    # verdict, so this stays 200 and carries returncode.
+                    _json_response(self, HTTPStatus.OK, result)
+                    return
+                if path == "/api/calibration/hand-eye/plan":
+                    result = _run_hand_eye_plan(
+                        self.server.state,
+                        poses=(query.get("poses", [""])[0] or "").strip(),
+                        pose_noise_deg=(
+                            query.get("pose_noise_deg", query.get("poseNoiseDeg", [""]))[0] or ""
+                        ).strip(),
+                        pose_noise_mm=(
+                            query.get("pose_noise_mm", query.get("poseNoiseMm", [""]))[0] or ""
+                        ).strip(),
+                        trials=(query.get("trials", [""])[0] or "").strip(),
+                        lever_mm=(query.get("lever_mm", query.get("leverMm", [""]))[0] or "").strip(),
                     )
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
