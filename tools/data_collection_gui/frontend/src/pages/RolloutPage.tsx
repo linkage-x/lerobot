@@ -146,6 +146,48 @@ export function RolloutPage() {
     void refreshHistory();
   }, [refreshHistory]);
 
+  // Seed the form from the last rollout, once, on mount. Tuning a policy means rolling out the
+  // same settings against checkpoint after checkpoint, and retyping eight RTC knobs each time is
+  // how they end up subtly different between two runs that were meant to be comparable.
+  //
+  // The gates (`confirmMotion`, `overrideContract`) are absent from the payload by construction
+  // and are not seeded here either: they are re-answered for every start.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const params = await api.fetchRolloutLastParams();
+      if (cancelled || !params || Object.keys(params).length === 0) return;
+      if (params.mode) setModeId(params.mode);
+      if (params.maxSteps !== undefined) setMaxSteps(String(params.maxSteps));
+      if (params.moveToStart !== undefined) setMoveToStart(params.moveToStart);
+      const options = params.runtimeOptions;
+      if (options) {
+        if (options.taskPrompt !== undefined) setTaskPrompt(options.taskPrompt);
+        if (options.rtcMode !== undefined) setRtcMode(options.rtcMode);
+        if (options.rtcExecutionHorizon !== undefined)
+          setRtcExecutionHorizon(String(options.rtcExecutionHorizon));
+        if (options.rtcMaxGuidanceWeight !== undefined)
+          setRtcMaxGuidanceWeight(String(options.rtcMaxGuidanceWeight));
+        if (options.rtcPrefixAttentionSchedule !== undefined)
+          setRtcPrefixAttentionSchedule(options.rtcPrefixAttentionSchedule);
+        if (options.rtcReplanQueueSize !== undefined)
+          setRtcReplanQueueSize(String(options.rtcReplanQueueSize));
+        // null is a real recorded value here -- "let the runtime estimate it" -- and must land
+        // as an empty field rather than the string "null".
+        setRtcInferenceDelaySteps(
+          options.rtcInferenceDelaySteps == null ? "" : String(options.rtcInferenceDelaySteps)
+        );
+        setCommandEmaAlpha(
+          options.commandEmaAlpha == null ? "" : String(options.commandEmaAlpha)
+        );
+      }
+      setNotice("Settings carried over from the last rollout. Motion confirmation is not.");
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // The camera poll only runs while something is producing frames. Polling a finished rollout
   // would just 503 in a loop, and the gateway refuses stale frames anyway.
   useEffect(() => {

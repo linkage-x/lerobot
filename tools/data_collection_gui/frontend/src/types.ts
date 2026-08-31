@@ -1132,6 +1132,17 @@ export type RolloutRuntimeOptions = {
   commandEmaAlpha?: number | null;
 };
 
+/** The previous rollout's settings, as offered by /api/rollout/last-params.
+ *
+ *  Deliberately excludes `checkpointId` and both safety gates (`confirmMotion`,
+ *  `overrideContract`): a remembered "yes" to arm motion is a gate that answers itself. */
+export type RolloutLastParams = {
+  mode?: string;
+  maxSteps?: number;
+  moveToStart?: boolean;
+  runtimeOptions?: RolloutRuntimeOptions;
+};
+
 export type RolloutStartRequest = {
   mode: string;
   checkpointId: string;

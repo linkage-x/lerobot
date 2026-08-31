@@ -5625,6 +5625,50 @@ def _follow_rollout_run(state: GatewayState, log_path: Path, process: subprocess
         )
 
 
+def _rollout_last_params_path(state: GatewayState) -> Path:
+    return state.repo_root / "outputs" / "logs" / "rollout" / "last_params.json"
+
+
+# The knobs the page may carry from one rollout to the next. `checkpointId` is not among them:
+# the reason to roll out again is almost always a different checkpoint, and a stale one would be
+# pre-selected under settings that look deliberate.
+#
+# `confirmMotion` and `overrideContract` are excluded for a stronger reason. They are the two
+# gates that stand between a click and an arm that moves, and between a click and a checkpoint
+# the rig has already reported as mismatched. A remembered "yes" is a gate that answers itself,
+# so both are re-asked on every start no matter what the last rollout did.
+_ROLLOUT_LAST_PARAM_KEYS = ("mode", "maxSteps", "moveToStart", "runtimeOptions")
+
+
+def _record_rollout_params(state: GatewayState, params: dict[str, Any]) -> None:
+    """Remember this rollout's settings so the next one starts from them. Best-effort."""
+    path = _rollout_last_params_path(state)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(".json.tmp")
+        temp_path.write_text(json.dumps(params, indent=2), encoding="utf-8")
+        temp_path.replace(path)
+    except OSError as exc:
+        state.log("warn", f"Could not record rollout parameters: {exc}")
+
+
+def _rollout_last_params(state: GatewayState) -> dict[str, Any]:
+    """The previous rollout's settings, or {} when there is no usable record.
+
+    Filtered on the way out as well as on the way in, so a file written by an older build (or by
+    hand) cannot introduce a key the start payload does not expect -- least of all one of the two
+    safety gates.
+    """
+    stored = _load_json_file(_rollout_last_params_path(state))
+    if not isinstance(stored, dict):
+        return {}
+    params = {key: stored[key] for key in _ROLLOUT_LAST_PARAM_KEYS if key in stored}
+    options = params.get("runtimeOptions")
+    if options is not None and not isinstance(options, dict):
+        params.pop("runtimeOptions")
+    return params
+
+
 def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
     if state.profile != "workstation":
         raise ValueError("Rollouts run on the workstation profile, which is where the FR3 is.")
@@ -5681,6 +5725,20 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
     camera_config = str(contract.get("cameraConfig") or rig.get("cameraConfigPath") or "")
     runtime_options = rollout_backend.sanitize_rollout_runtime_options(
         payload.get("runtimeOptions")
+    )
+
+    # Recorded before launch, and from the values that were actually validated: a rollout that
+    # dies on startup still tells the next one what was tried. The two safety gates are not here.
+    _record_rollout_params(
+        state,
+        {
+            "mode": mode.id,
+            "maxSteps": int(payload.get("maxSteps") or 0),
+            "moveToStart": bool(payload.get("moveToStart", True)),
+            "runtimeOptions": payload.get("runtimeOptions")
+            if isinstance(payload.get("runtimeOptions"), dict)
+            else {},
+        },
     )
 
     command, env = rollout_backend.build_rollout_command(
@@ -12303,6 +12361,14 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                         "rig": asdict(_rig_contract(state)),
                         "trainingBusy": _training_is_running(state),
                     },
+                )
+            return
+        if path == "/api/rollout/last-params":
+            with self.server.state.lock:
+                _json_response(
+                    self,
+                    HTTPStatus.OK,
+                    {"ok": True, "params": _rollout_last_params(self.server.state)},
                 )
             return
         if path == "/api/rollout/outcomes":

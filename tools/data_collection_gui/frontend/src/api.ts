@@ -41,6 +41,7 @@ import type {
   TrainingMachine,
   TrainingRun,
   TrainingStartRequest,
+  RolloutLastParams,
   TrainingHistoryEntry,
   TrainingView,
   TrainingWandbStatus
@@ -969,6 +970,15 @@ export class DataCollectionGuiApi {
       "/api/rollout/outcomes"
     );
     return payload?.entries ?? [];
+  }
+
+  /** The previous rollout's settings, so a new one starts where the last left off.
+   *  Never carries the safety gates; those are re-asked every time. */
+  async fetchRolloutLastParams(): Promise<RolloutLastParams> {
+    const payload = await this.trainingGet<{ params: RolloutLastParams }>(
+      "/api/rollout/last-params"
+    );
+    return payload?.params ?? {};
   }
 
   async startRollout(request: RolloutStartRequest) {

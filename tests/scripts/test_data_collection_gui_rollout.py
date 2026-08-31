@@ -899,6 +899,89 @@ def test_a_non_motion_mode_needs_no_confirmation(tmp_path: Path):
     gateway._stop_rollout(state)
 
 
+def test_a_rollout_remembers_its_settings_for_the_next_one(tmp_path: Path):
+    # Tuning means rolling out the same knobs against checkpoint after checkpoint. Retyping eight
+    # RTC values each time is how two runs meant to be comparable end up subtly different.
+    state = _rollout_state(tmp_path)
+
+    gateway._start_rollout(
+        state,
+        {
+            "mode": "smoke",
+            "checkpointId": "job_a/020000",
+            "maxSteps": 500,
+            "moveToStart": False,
+            "runtimeOptions": {
+                "rtcMode": "auto",
+                "rtcExecutionHorizon": 16,
+                "rtcReplanQueueSize": 25,
+                "rtcInferenceDelaySteps": None,
+            },
+        },
+    )
+    gateway._stop_rollout(state)
+
+    params = gateway._rollout_last_params(state)
+    assert params["mode"] == "smoke"
+    assert params["maxSteps"] == 500
+    assert params["moveToStart"] is False
+    assert params["runtimeOptions"]["rtcExecutionHorizon"] == 16
+    # None is a real recorded value -- "let the runtime estimate the delay" -- not a missing key.
+    assert params["runtimeOptions"]["rtcInferenceDelaySteps"] is None
+
+
+def test_the_safety_gates_are_never_carried_to_the_next_rollout(tmp_path: Path):
+    # confirmMotion is what stands between a click and an arm that moves; overrideContract is
+    # what stands between a click and a checkpoint the rig reported as mismatched. A remembered
+    # "yes" is a gate that answers itself.
+    state = _rollout_state(tmp_path)
+
+    gateway._start_rollout(
+        state,
+        {
+            "mode": "real",
+            "checkpointId": "job_a/020000",
+            "confirmMotion": True,
+            "overrideContract": True,
+        },
+    )
+    gateway._stop_rollout(state)
+
+    params = gateway._rollout_last_params(state)
+    assert "confirmMotion" not in params
+    assert "overrideContract" not in params
+    # Nor the checkpoint: the next rollout is almost always a different one.
+    assert "checkpointId" not in params
+
+
+def test_a_hand_written_params_file_cannot_smuggle_a_gate_back_in(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    path = gateway._rollout_last_params_path(state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "mode": "smoke",
+                "confirmMotion": True,
+                "overrideContract": True,
+                "checkpointId": "job_a/020000",
+                "runtimeOptions": "not-an-object",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    params = gateway._rollout_last_params(state)
+
+    assert params == {"mode": "smoke"}
+
+
+def test_no_previous_rollout_means_no_carried_settings(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+
+    assert gateway._rollout_last_params(state) == {}
+
+
 def test_a_blocked_contract_is_refused_unless_overridden(tmp_path: Path):
     state = _rollout_state(tmp_path)
     view = _make_view(state.repo_root, "v2")
