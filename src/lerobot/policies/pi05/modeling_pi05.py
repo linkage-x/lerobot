@@ -19,6 +19,7 @@ import copy
 import logging
 import math
 from collections import deque
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
@@ -903,6 +904,33 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return self.action_out_proj(suffix_out)
 
 
+def apply_action_loss_weights(losses: Tensor, weights: Sequence[float]) -> Tensor:
+    """Scale a (B, T, D) loss tensor by a per-dimension weight vector.
+
+    Normalisation alone decides two things that are better kept apart: the *scale* a dimension
+    occupies in the space the model optimises (too small and it sits under the sampling noise),
+    and the *share of the gradient* it receives. MEAN_STD equalises the first but thereby forces
+    the second to be equal too. Weighting splits them: normalise for scale, weight for budget.
+
+    The weights are renormalised to mean 1, so changing them redistributes the gradient between
+    dimensions without changing its overall size -- otherwise every weight change would silently
+    be a learning-rate change as well.
+    """
+    action_dim = losses.shape[-1]
+    if len(weights) != action_dim:
+        raise ValueError(
+            f"action_loss_weights has {len(weights)} entries but the action has {action_dim} "
+            "dimensions."
+        )
+    w = torch.as_tensor(list(weights), dtype=losses.dtype, device=losses.device)
+    if bool(torch.any(w < 0)):
+        raise ValueError(f"action_loss_weights must be non-negative, got {list(weights)}.")
+    total = w.sum()
+    if float(total) <= 0.0:
+        raise ValueError("action_loss_weights must not sum to zero.")
+    return losses * (w * (w.numel() / total))
+
+
 class PI05Policy(PreTrainedPolicy):
     """PI05 Policy for LeRobot."""
 
@@ -1278,6 +1306,15 @@ class PI05Policy(PreTrainedPolicy):
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
         }
+
+        # Applied after the truncation above so the weights line up with the real action dims
+        # rather than the padded ones. `loss_per_dim` is recorded *before* this, so the log keeps
+        # showing the raw per-dimension error and stays comparable across differently weighted runs.
+        if self.config.action_loss_weights is not None:
+            losses = apply_action_loss_weights(losses, self.config.action_loss_weights)
+            loss_dict["loss_per_dim_weighted"] = (
+                losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist()
+            )
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims

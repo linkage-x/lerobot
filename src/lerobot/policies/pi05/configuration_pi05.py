@@ -81,6 +81,17 @@ class PI05Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
+    # Relative weight of each action dimension in the loss. None keeps every dimension equal,
+    # which is what upstream does.
+    #
+    # Normalisation alone decides two things that are better kept apart: the *scale* a dimension
+    # occupies in the space the model optimises (too small and it sits under the sampling noise),
+    # and the *share of the gradient* it receives. MEAN_STD equalises the first but thereby forces
+    # the second to be equal too. This lets a rig split them: normalise for scale, weight for
+    # budget. Length must match the real action dimension, and the weights are renormalised to
+    # mean 1 so changing them does not also change the effective learning rate.
+    action_loss_weights: list[float] | None = None
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
