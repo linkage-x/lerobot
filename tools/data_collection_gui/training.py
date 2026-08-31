@@ -489,6 +489,7 @@ def build_train_argv(
     pretrained_path: str = "",
     lora_enabled: bool = False,
     lora_r: int = 16,
+    lora_alpha: int = 0,
     lora_target_modules: str = "",
 ) -> list[str]:
     """The training argv, identical in shape for local and remote.
@@ -535,6 +536,11 @@ def build_train_argv(
                 "'Base checkpoint' (for example lerobot/pi05_base), or turn LoRA off."
             )
         argv += ["--lora", "--lora-r", str(int(lora_r))]
+        # An adapter's strength is alpha / r, so the rank alone does not say how hard it
+        # pulls. Sent only when the operator names one; left out, the training script tracks
+        # the rank and the scaling stays 1.0.
+        if lora_alpha:
+            argv += ["--lora-alpha", str(int(lora_alpha))]
         if lora_target_modules.strip():
             argv += ["--lora-target-modules", validate_lora_targets(lora_target_modules)]
     if use_amp:

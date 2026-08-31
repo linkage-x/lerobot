@@ -1474,10 +1474,10 @@ def build_peft_section(args: argparse.Namespace) -> dict[str, Any] | None:
     """The top-level `peft` block of the generated train config, or None for a dense run.
 
     Mirrors `lerobot.configs.default.PeftConfig` exactly, which is a shorter list than the LoRA
-    knobs people expect: rank, targets, method, init and which modules stay fully trainable.
-    There is no `lora_alpha` or `lora_dropout` here because that dataclass has no field for
-    them -- draccus parses this block into it, and an extra key is a hard parse error rather
-    than an ignored one. Adapting those two means widening PeftConfig upstream.
+    knobs people expect: rank, scaling, targets, method, init and which modules stay fully
+    trainable. There is still no `lora_dropout` here because that dataclass has no field for it
+    -- draccus parses this block into it, and an extra key is a hard parse error rather than an
+    ignored one. Adapting it means widening PeftConfig upstream, as `alpha` already was.
 
     Keys the operator did not set are omitted rather than sent as null so the policy's own
     defaults apply: `PreTrainedPolicy._build_peft_config` skips None values, but only after
@@ -1486,7 +1486,15 @@ def build_peft_section(args: argparse.Namespace) -> dict[str, Any] | None:
     """
     if not args.lora:
         return None
-    peft: dict[str, Any] = {"method_type": args.peft_method, "r": int(args.lora_r)}
+    rank = int(args.lora_r)
+    # An adapter's strength is alpha / r, and PEFT's own alpha default is a fixed 8 -- so
+    # leaving it alone makes a higher rank *weaken* every update (r=32 -> 0.25) rather than
+    # strengthen it, the opposite of what --lora-r advertises. Default alpha to the rank so
+    # that scaling stays 1.0 whatever rank is chosen and --lora-r means what it says.
+    alpha = rank if args.lora_alpha is None else int(args.lora_alpha)
+    peft: dict[str, Any] = {"method_type": args.peft_method, "r": rank, "alpha": alpha}
+    note = "" if args.lora_alpha is not None else "  (alpha defaulted to rank)"
+    print(f"[train] LoRA rank={rank} alpha={alpha} -> scaling {alpha / rank:.3f}{note}")
     if args.lora_target_modules is not None:
         spec = args.lora_target_modules.strip()
         # A single token is passed through as-is: 'all-linear' is a PEFT keyword and a regex is
@@ -1985,7 +1993,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--lora-r",
         type=int,
         default=16,
-        help="Adapter rank. Upstream PeftConfig default is 16; higher is closer to full finetuning.",
+        help="Adapter rank; higher is closer to full finetuning. See --lora-alpha for scaling.",
+    )
+    parser.add_argument(
+        "--lora-alpha",
+        type=int,
+        default=None,
+        help=(
+            "Adapter scaling numerator; an adapter's strength is alpha/r. Defaults to the rank, "
+            "giving a scaling of 1.0 at any rank. PEFT's own default is a fixed 8, which "
+            "attenuates high ranks (r=32 -> 0.25); pass 8 to reproduce that."
+        ),
     )
     parser.add_argument(
         "--lora-target-modules",

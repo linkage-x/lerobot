@@ -810,12 +810,42 @@ def test_lora_emits_the_block_lerobot_train_reads():
         _args(policy="pi05", lora=True, pretrained_path="lerobot/pi05_base", lora_r=32)
     )
 
-    assert peft == {"method_type": "LORA", "r": 32}
+    assert peft == {"method_type": "LORA", "r": 32, "alpha": 32}
     # Every key here has to be a field of lerobot.configs.default.PeftConfig -- draccus parses
     # this block into that dataclass, and an unknown key is a parse error, not an ignored one.
     from lerobot.configs.default import PeftConfig
 
     assert set(peft) <= {field.name for field in dataclasses.fields(PeftConfig)}
+
+
+def test_alpha_tracks_the_rank_so_a_higher_rank_is_a_stronger_adapter():
+    """An adapter's strength is alpha/r, and PEFT's own alpha default is a fixed 8.
+
+    Left to that default, raising --lora-r *weakens* every update (r=32 -> 0.25) instead of
+    strengthening it, which is the opposite of what the flag advertises and silently
+    attenuated every capacity experiment on this rig.
+    """
+    for rank in (8, 16, 32, 64):
+        peft = fr3_train_il_policy.build_peft_section(
+            _args(policy="pi05", lora=True, pretrained_path="lerobot/pi05_base", lora_r=rank)
+        )
+        assert peft["alpha"] / peft["r"] == 1.0
+
+
+def test_an_explicit_alpha_wins_over_the_rank():
+    """Passing 8 has to reproduce PEFT's old fixed default exactly, for comparability with
+    checkpoints trained before alpha was reachable."""
+    peft = fr3_train_il_policy.build_peft_section(
+        _args(
+            policy="pi05",
+            lora=True,
+            pretrained_path="lerobot/pi05_base",
+            lora_r=32,
+            lora_alpha=8,
+        )
+    )
+
+    assert (peft["r"], peft["alpha"]) == (32, 8)
 
 
 def test_lora_leaves_the_targets_alone_unless_asked():
@@ -891,7 +921,7 @@ def test_a_pi05_lora_run_writes_a_config_lerobot_train_can_parse(tmp_path, monke
     assert config["policy"]["pretrained_path"] == "lerobot/pi05_base"
     # Top level, not under `policy`: TrainPipelineConfig.peft is what lerobot_train checks
     # before calling `policy.wrap_with_peft`.
-    assert config["peft"] == {"method_type": "LORA", "r": 32}
+    assert config["peft"] == {"method_type": "LORA", "r": 32, "alpha": 32}
 
     from lerobot.configs.train import TrainPipelineConfig
 

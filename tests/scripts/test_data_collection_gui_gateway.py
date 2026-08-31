@@ -4719,6 +4719,32 @@ def test_history_finds_runs_that_finished_before_it_was_recording(tmp_path, monk
     assert json.loads(params["policyConfig"]) == {"optimizer_lr": 5e-05}
 
 
+def test_a_run_from_before_alpha_existed_replays_at_the_strength_it_actually_ran(tmp_path, monkeypatch):
+    # Its peft block names a rank and no alpha, so it got PEFT's fixed 8 and a scaling of
+    # 8/32 = 0.25. Copying the rank alone and letting alpha track it would hand the next run a
+    # scaling of 1.0 -- a four-times-stronger adapter under the same label.
+    state = _training_start_state(tmp_path, monkeypatch)
+    _write_finished_run(state.repo_root, "pick__pi05__20260825_075239")
+
+    params = gateway._training_history_entries(state)[0]["params"]
+
+    assert params["loraR"] == 32
+    assert params["loraAlpha"] == 8
+
+
+def test_a_run_that_named_its_alpha_keeps_it(tmp_path, monkeypatch):
+    state = _training_start_state(tmp_path, monkeypatch)
+    _write_finished_run(
+        state.repo_root,
+        "pick__pi05__20260828_101500",
+        peft={"method_type": "LORA", "r": 64, "alpha": 64, "target_modules": None},
+    )
+
+    params = gateway._training_history_entries(state)[0]["params"]
+
+    assert (params["loraR"], params["loraAlpha"]) == (64, 64)
+
+
 def test_a_recovered_run_carries_only_policy_keys_the_form_owns(tmp_path, monkeypatch):
     # train_config.json also holds the frames' own properties -- features, normalisation stats.
     # Copying those into the JSON box would pin the next run to the previous view's shape.

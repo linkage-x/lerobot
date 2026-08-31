@@ -909,6 +909,8 @@ export type TrainingStartRequest = {
   /** Freeze the base weights and train a PEFT adapter instead. Needs pretrainedPath. */
   loraEnabled: boolean;
   loraR: number;
+  /** Scaling numerator; the adapter's strength is alpha / r. 0 tracks the rank (scaling 1.0). */
+  loraAlpha: number;
   /** Empty leaves the policy's own default target set alone, which for pi0.5 is the tuned one. */
   loraTargetModules: string;
   wandbEnabled: boolean;
@@ -933,6 +935,7 @@ export type TrainingHistoryParams = Partial<
     | "pretrainedPath"
     | "loraEnabled"
     | "loraR"
+    | "loraAlpha"
     | "loraTargetModules"
     | "wandbEnabled"
     | "wandbProject"

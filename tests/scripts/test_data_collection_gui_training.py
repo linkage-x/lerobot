@@ -472,6 +472,18 @@ def test_lora_carries_its_rank_and_leaves_the_targets_to_the_policy():
     assert targeted[targeted.index("--lora-target-modules") + 1] == "all-linear"
 
 
+def test_lora_alpha_is_sent_only_when_the_operator_names_one():
+    # Strength is alpha / r, so a rank with no alpha is only half a specification. Sending
+    # nothing lets the training script track the rank; sending 0 would pin the scaling to 0.
+    default = _finetune_argv(pretrained_path="lerobot/pi05_base", lora_enabled=True, lora_r=64)
+    assert "--lora-alpha" not in default
+
+    pinned = _finetune_argv(
+        pretrained_path="lerobot/pi05_base", lora_enabled=True, lora_r=64, lora_alpha=8
+    )
+    assert pinned[pinned.index("--lora-alpha") + 1] == "8"
+
+
 def test_lora_without_a_base_model_is_refused_before_the_rsync():
     """On a remote host the training script's own refusal is a line in a log nobody is reading."""
     with pytest.raises(training.TrainingError, match="no base checkpoint"):

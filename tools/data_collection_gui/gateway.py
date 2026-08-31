@@ -4756,6 +4756,7 @@ _TRAINING_HISTORY_PARAM_KEYS = (
     "pretrainedPath",
     "loraEnabled",
     "loraR",
+    "loraAlpha",
     "loraTargetModules",
     "wandbEnabled",
     "wandbProject",
@@ -4833,6 +4834,11 @@ def _training_history_from_train_config(run_dir: Path) -> dict[str, Any] | None:
         # is a dense run, not a LoRA run with a default rank.
         "loraEnabled": bool(peft.get("method_type")),
         "loraR": int(peft.get("r") or 16),
+        # Not a form default like the rank above: a config with no `alpha` was run before this
+        # knob existed and got PEFT's own fixed 8, so 8 is what that run actually used. Copying
+        # it forward is the only way such a run reproduces -- an adapter's strength is alpha / r,
+        # and inheriting the rank instead would quietly make the copy four times stronger.
+        "loraAlpha": int(peft.get("alpha") or 8),
         "loraTargetModules": str(peft.get("target_modules") or ""),
         "wandbEnabled": bool(wandb.get("enable")),
         "wandbProject": str(wandb.get("project") or "lerobot"),
@@ -5124,6 +5130,7 @@ def _start_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[st
         "pretrainedPath": str(payload.get("pretrainedPath") or "").strip(),
         "loraEnabled": bool(payload.get("loraEnabled")),
         "loraR": int(payload.get("loraR") or 16),
+        "loraAlpha": int(payload.get("loraAlpha") or 0),
         "loraTargetModules": str(payload.get("loraTargetModules") or ""),
         "steps": int(payload.get("steps") or 20000),
         "batchSize": int(payload.get("batchSize") or 8),
@@ -5146,6 +5153,7 @@ def _start_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[st
         pretrained_path=argv_settings["pretrainedPath"],
         lora_enabled=argv_settings["loraEnabled"],
         lora_r=argv_settings["loraR"],
+        lora_alpha=argv_settings["loraAlpha"],
         lora_target_modules=argv_settings["loraTargetModules"],
         steps=argv_settings["steps"],
         batch_size=argv_settings["batchSize"],

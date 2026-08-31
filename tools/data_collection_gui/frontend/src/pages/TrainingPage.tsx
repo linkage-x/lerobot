@@ -132,7 +132,13 @@ function describeHistoryEntry(entry: TrainingHistoryEntry): string {
   const day = entry.startedAt ? entry.startedAt.slice(0, 10) : "unknown date";
   const parts = [day, entry.policy || "?", `${(entry.steps || 0).toLocaleString()} steps`];
   if (p.batchSize !== undefined) parts.push(`bs ${p.batchSize}`);
-  if (p.loraEnabled) parts.push(`LoRA r${p.loraR ?? "?"}`);
+  if (p.loraEnabled) {
+    // alpha is shown only when it disagrees with the rank, which is exactly when the
+    // adapter's strength (alpha / r) is not 1 -- the one thing two otherwise identical
+    // LoRA runs can differ by without the line saying so.
+    const scaled = p.loraAlpha && p.loraAlpha !== p.loraR ? ` \u03b1${p.loraAlpha}` : "";
+    parts.push(`LoRA r${p.loraR ?? "?"}${scaled}`);
+  }
   if (entry.viewName) parts.push(entry.viewName);
   return parts.join(" · ");
 }
@@ -191,6 +197,7 @@ export function TrainingPage() {
   const [pretrainedPathEdited, setPretrainedPathEdited] = useState(false);
   const [loraEnabled, setLoraEnabled] = useState(false);
   const [loraR, setLoraR] = useState("16");
+  const [loraAlpha, setLoraAlpha] = useState("");
   const [loraTargetModules, setLoraTargetModules] = useState("");
 
   const [wandbEnabled, setWandbEnabled] = useState(false);
@@ -444,6 +451,7 @@ export function TrainingPage() {
         pretrainedPath: pretrainedPath.trim(),
         loraEnabled,
         loraR: Number(loraR) || 16,
+        loraAlpha: Number(loraAlpha) || 0,
         loraTargetModules,
         wandbEnabled,
         wandbProject,
@@ -496,6 +504,7 @@ export function TrainingPage() {
     }
     if (p.loraEnabled !== undefined) setLoraEnabled(p.loraEnabled);
     if (p.loraR !== undefined) setLoraR(String(p.loraR));
+    if (p.loraAlpha !== undefined) setLoraAlpha(p.loraAlpha ? String(p.loraAlpha) : "");
     if (p.loraTargetModules !== undefined) setLoraTargetModules(p.loraTargetModules);
     if (p.wandbEnabled !== undefined) setWandbEnabled(p.wandbEnabled);
     if (p.wandbProject !== undefined) setWandbProject(p.wandbProject);
@@ -945,6 +954,15 @@ export function TrainingPage() {
             <label className="field">
               <span>LoRA rank</span>
               <input value={loraR} onChange={(e) => setLoraR(e.target.value)} disabled={isRunning} />
+            </label>
+            <label className="field">
+              <span>LoRA alpha</span>
+              <input
+                value={loraAlpha}
+                onChange={(e) => setLoraAlpha(e.target.value)}
+                placeholder="(tracks rank)"
+                disabled={isRunning}
+              />
             </label>
             <label className="field">
               <span>Target modules (optional)</span>
