@@ -4392,6 +4392,11 @@ button.danger {
 .page {
   display: grid;
   gap: 14px;
+  /* minmax(0, 1fr) rather than the implicit auto track: an auto track is sized by its content's
+     min-content width, and a <pre> that does not wrap has no meaningful min-content width. One
+     long log line was therefore enough to stretch the whole page, which pushed the controls in
+     a card's right-aligned .card-head off-screen until the operator scrolled sideways. */
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .card {
@@ -4728,6 +4733,24 @@ button.danger {
  * configuration, this is the one that is currently connected to a robot. */
 .rollout-live {
   border-left: 3px solid #0f766e;
+}
+
+/* Every log block scrolls inside itself. A <pre> has no base rule here, so it took the browser
+   default -- no wrapping, no overflow -- and the .page track above now pins the card to the
+   container width, which would leave a long line spilling out of the card instead of scrolling.
+   Both halves are needed: the track stops the page widening, this stops the content escaping. */
+.log-block {
+  max-width: 100%;
+  overflow: auto;
+}
+
+/* The rollout log keeps its lines intact rather than wrapping: a step line is a row of
+   key=value pairs and wrapping it makes the run unreadable. Capped so the log cannot push
+   Start/Stop/End session -- which live in the same card -- below the fold. */
+.rollout-live .log-block {
+  margin: 12px 0 0;
+  max-height: 40vh;
+  white-space: pre;
 }
 
 .rollout-cameras {
