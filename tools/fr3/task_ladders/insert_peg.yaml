@@ -1,0 +1,71 @@
+# Grading ladder for the FR3 peg-insertion baseline.
+#
+# A rollout is graded by the furthest precondition it reached, not by a score. The stages are
+# not this task's invention: they are the points where the set of active contacts changes --
+# free motion, contact with the object, the object moving with the end effector, contact with
+# the target, the constraint satisfied, the gripper gone. That is why the same ladder describes
+# opening a drawer or pouring a cup, and why a new task needs a file like this one rather than
+# new code.
+#
+# `stage` ids and ordinals come from the shared vocabulary in
+# `tools/data_collection_gui/task_ladders.py`. A task declares which of them it has and what
+# they look like when they happen; it does not renumber them, so `stage: 3` means "the object
+# moved with the end effector" in every task and the ordinals stay comparable.
+
+task: insert_peg
+label: 插销入孔
+description: >-
+  从桌面抓起销，移动到孔位上方，插入到底。观测为双相机 + 末端位姿，无物体位姿传感。
+
+stages:
+  - id: approach
+    instance: 末端到达销附近，但夹爪闭合时没有碰到销（空抓）
+    # The trace can prove this one on its own: it knows where the end effector went.
+    machine_checkable: true
+  - id: contact
+    instance: 闭合时碰到了销，但没有形成可承载的约束 —— 典型表现是把销推倒
+  - id: secure
+    instance: 销随夹爪一起离开桌面
+  - id: transport
+    instance: 保持夹持到达孔位上方
+  - id: target_contact
+    instance: 销与孔建立接触，插入了一部分或插歪了
+  - id: constraint_met
+    instance: 销完全插入到底
+  - id: release_stable
+    instance: 松开夹爪并撤出后，销仍然留在孔里
+
+# Success is the last stage, not the one that looks finished. A peg that comes back out with
+# the gripper was never inserted, and on this rig that failure is invisible until the release:
+# `lift` and `held_steps` cannot tell a held object from a gripper closed on air, so the moment
+# the gripper lets go is the only cheap evidence there was ever anything in it.
+terminal: release_stable
+
+# Why the rollout stopped where it did. Deliberately separate from `stage`: the same stage can
+# fail for different reasons, and folding them together counts two different work items as one.
+blockers:
+  - id: object_pose_offset
+    label: 抓取位姿偏移
+    instance: 夹爪与销之间有系统性偏移，闭合时把销推开或推倒
+    # No sensor on this rig observes the object, so a systematic offset cannot be measured from
+    # the trace -- the closure points scatter with the peg's own position. Which way the peg
+    # fell is one bit the operator can see for free, and it is the only thing that separates a
+    # systematic offset (consistent direction) from noise (no direction).
+    ask: 销朝哪个方向倒？
+  - id: perception
+    label: 感知
+    instance: 没有找到销，或找错了位置
+  - id: policy_action
+    label: 策略动作
+    instance: 位姿对上了，但动作本身做不到 —— 插入相的 yaw 或末端精度不够
+  - id: hardware
+    label: 硬件
+    instance: 夹爪、相机或机械臂本身的问题，与策略无关
+  - id: operator_stop
+    label: 人为中止
+    instance: 与策略无关的中止（有人进入工作区、验收流程要求提前停）
+  - id: out_of_distribution
+    label: 起点分布外
+    instance: 销的位姿落在 demo 覆盖之外（半径 <56 mm、>170 mm，或 79° 缺口）
+  - id: unknown
+    label: 未判明

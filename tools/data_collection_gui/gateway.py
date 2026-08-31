@@ -34,6 +34,7 @@ from urllib.request import urlopen
 
 from tools.data_collection_gui import checkpoints as checkpoint_backend
 from tools.data_collection_gui import rollout as rollout_backend
+from tools.data_collection_gui import task_ladders
 from tools.data_collection_gui import training as training_backend
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
@@ -349,6 +350,7 @@ class GatewayState:
     runtime_teleop_gains: dict[str, float | None] = field(default_factory=dict)
     replay_process: subprocess.Popen[str] | None = None
     replay_process_kind: str = ""
+    mujoco_preview_memory: dict[str, Any] = field(default_factory=dict)
     teleop_process: subprocess.Popen[str] | None = None
     teleop_started_at_s: float | None = None
     realsense_preview_process: subprocess.Popen[str] | None = None
@@ -1808,9 +1810,8 @@ def _replay_fps(state: GatewayState, dataset_root: Path) -> int:
     `ReplayStatus.fps` is seeded from the recorder config's `dataset.fps`, which describes what the
     *next* recording will do -- it is not a property of the episode being replayed, and the two
     diverge the moment the recording rate is changed. Replaying at the wrong rate does not fail
-    visibly; it does two quiet things instead. The preview video is encoded at that rate, so it runs
-    against the timeline at fps_used/fps_recorded speed. And `fr3_gui_replay_runtime` sets the sim's
-    `teleop_control_frequency` from it, so every command is given a fraction of the simulated time
+    visibly; it indexes the qpos preview against the wrong frame grid and `fr3_gui_replay_runtime`
+    sets the sim's `teleop_control_frequency` from it, so every command is given a fraction of the simulated time
     the recorder had between frames and the tracking score measures an under-integrated servo window
     rather than the trajectory. The dataset is the authority on its own frame rate.
     """
@@ -4772,6 +4773,7 @@ _TRAINING_POLICY_CONFIG_KEYS = (
     "gradient_checkpointing",
     "compile_model",
     "normalization_mapping",
+    "action_loss_weights",
     "chunk_size",
     "n_action_steps",
     "num_inference_steps",
@@ -5879,25 +5881,35 @@ def _stop_rollout(state: GatewayState) -> dict[str, Any]:
 
 
 def _record_rollout_outcome(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
-    entry = checkpoint_backend.append_rollout_outcome(
-        state.repo_root,
-        {
-            "checkpointId": str(payload.get("checkpointId") or state.rollout.checkpointId),
-            "outcome": str(payload.get("outcome") or ""),
-            "mode": str(payload.get("mode") or state.rollout.mode),
-            "steps": int(payload.get("steps") or state.rollout.step),
-            "note": str(payload.get("note") or ""),
-            "logPath": str(payload.get("logPath") or state.rollout.logPath),
-            "rolloutIndex": int(payload.get("rolloutIndex") or state.rollout.pendingOutcomeFor),
-            # Taken from the status rather than from the request: the runtime measured it, and a
-            # page that could send its own would be able to record a grade against a point the
-            # arm never visited.
-            "geometry": dict(state.rollout.lastRolloutGeometry or {}),
-        },
-    )
+    record: dict[str, Any] = {
+        "checkpointId": str(payload.get("checkpointId") or state.rollout.checkpointId),
+        "outcome": str(payload.get("outcome") or ""),
+        "mode": str(payload.get("mode") or state.rollout.mode),
+        "steps": int(payload.get("steps") or state.rollout.step),
+        "note": str(payload.get("note") or ""),
+        "logPath": str(payload.get("logPath") or state.rollout.logPath),
+        "rolloutIndex": int(payload.get("rolloutIndex") or state.rollout.pendingOutcomeFor),
+        # Taken from the status rather than from the request: the runtime measured it, and a
+        # page that could send its own would be able to record a grade against a point the
+        # arm never visited.
+        "geometry": dict(state.rollout.lastRolloutGeometry or {}),
+    }
+    # Forwarded only when the page actually sent them, so an ungraded rollout reaches the log
+    # as one instead of as stage 0 -- which is a real grade meaning "never reached the object".
+    # The backend derives `outcome` from `stage` and refuses the two disagreeing, so nothing
+    # here needs to reconcile them.
+    for key in ("taskLadder", "stage", "stageId", "blocker", "inDistribution"):
+        if payload.get(key) is not None:
+            record[key] = payload[key]
+    try:
+        entry = checkpoint_backend.append_rollout_outcome(state.repo_root, record)
+    except checkpoint_backend.CheckpointError as error:
+        state.log("warn", f"Rejected rollout grade: {error}")
+        return {"ok": False, "error": str(error)}
     # Clearing the prompt is what makes it fire once per rollout rather than on every poll.
     state.rollout.pendingOutcomeFor = 0
-    state.log("info", f"Recorded rollout outcome {entry['outcome']} for {entry['checkpointId']}")
+    graded = f" stage={entry['stage']}" if "stage" in entry else ""
+    state.log("info", f"Recorded rollout outcome {entry['outcome']}{graded} for {entry['checkpointId']}")
     return {"ok": True, "entry": entry}
 
 
@@ -8423,6 +8435,61 @@ def _gmsl2_camera_video_offsets_s(ep_meta: dict[str, Any], camera_keys: list[str
             offsets[key] = offset
     return offsets
 
+
+def _v3_camera_video_offsets_s(
+    dataset_root: Path, camera_keys: list[str], episode: int
+) -> dict[str, float]:
+    """Same contract as `_gmsl2_camera_video_offsets_s`, for a v3 dataset's packed mp4s.
+
+    A v3 dataset concatenates every episode of a chunk into one file per camera and records
+    where each one starts in meta/episodes' ``videos/<cam>/from_timestamp``, while the parquet
+    ``timestamp`` column restarts at 0 for every episode. The offset is therefore *negative*:
+    the file's own zero sits ``from_timestamp`` seconds before this episode's first frame, and
+    the frontend's ``timeline_timestamp - offset`` lands on ``timestamp + from_timestamp``.
+
+    Without it every episode of a chunk replays as the first episode in its file. That is
+    invisible on a single recording whose chunk holds one episode and glaring on a merged
+    training view, where one file holds twenty: only the episodes that happen to start at 0 --
+    the first of each source -- play their own footage, and the rest silently show someone
+    else's, which is worse than showing nothing.
+    """
+    if not camera_keys:
+        return {}
+    try:
+        import pyarrow.parquet as pq
+    except Exception:
+        return {}
+
+    wanted = {f"videos/{key}/from_timestamp": key for key in camera_keys}
+    for meta_file in sorted((dataset_root / "meta" / "episodes").glob("*/*.parquet")):
+        try:
+            names = set(pq.read_schema(meta_file).names)
+        except Exception:
+            continue
+        # Only the columns needed: a recording's meta/episodes carries a per-episode stats block
+        # for every feature, and this runs on every episode switch in the replay UI.
+        columns = ["episode_index", *(name for name in wanted if name in names)]
+        if "episode_index" not in names or len(columns) == 1:
+            continue
+        try:
+            table = pq.read_table(meta_file, columns=columns)
+        except Exception:
+            continue
+        for row in table.to_pylist():
+            try:
+                if int(row["episode_index"]) != int(episode):
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+            offsets: dict[str, float] = {}
+            for column, key in wanted.items():
+                value = row.get(column)
+                if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    offsets[key] = -float(value)
+            return offsets
+    return {}
+
+
 def _read_gmsl2_timeline(dataset_root: Path, episode: int | None = None) -> dict[str, Any]:
     ep_dirs = _gmsl2_episode_dirs(dataset_root)
     if not ep_dirs:
@@ -8658,6 +8725,15 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
 
     video_template = str(info.get("video_path") or "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
 
+    # Where each camera's video file starts on this episode's timeline axis. Which layout answers
+    # that is decided the same way `_resolve_video_path` decides which file to serve: a GMSL2
+    # recording hands the browser a per-episode mkv whose zero is that camera's own first frame,
+    # while a v3 dataset hands it the whole chunk and has to be seeked into the episode.
+    if _has_gmsl2_episodes(dataset_root):
+        camera_video_offsets_s = _gmsl2_camera_video_offsets_s(ep_meta, camera_keys)
+    else:
+        camera_video_offsets_s = _v3_camera_video_offsets_s(dataset_root, camera_keys, int(episode or 0))
+
     return {
         "datasetRoot": str(dataset_root),
         "datasetKind": _dataset_kind(state, dataset_root),
@@ -8675,7 +8751,7 @@ def _read_dataset_timeline(state: GatewayState, dataset_root: Path, episode: int
         "frames": frames,
         "sourcePath": str(data_file),
         "videoWarmupS": video_warmup_s,
-        "cameraVideoOffsetsS": _gmsl2_camera_video_offsets_s(ep_meta, camera_keys),
+        "cameraVideoOffsetsS": camera_video_offsets_s,
         "cameraControls": _load_camera_controls(dataset_root),
     }
 
@@ -10744,12 +10820,17 @@ def _read_replay_process_output(state: GatewayState, process: subprocess.Popen[s
         with state.lock:
             if state.replay_process is not process:
                 return
-            state.replay.lastOutput = output
-            state.replay.message = output
             if state.replay_process_kind == "mujoco":
+                frame_output = output.startswith("mujoco_replay_frame=")
+                if not frame_output:
+                    state.replay.lastOutput = output
+                    state.replay.message = output
                 _apply_mujoco_replay_output(state, output)
-                state.log("info", f"mujoco replay: {output}")
+                if not frame_output:
+                    state.log("info", f"mujoco replay: {output}")
             else:
+                state.replay.lastOutput = output
+                state.replay.message = output
                 _append_real_replay_log(state, "replay", output)
                 state.log("info", f"real replay: {output}")
 
@@ -10763,6 +10844,33 @@ def _set_mujoco_validation_metric(validation: dict[str, Any], key: str, value: s
 
 def _apply_mujoco_replay_output(state: GatewayState, output: str) -> None:
     validation = state.replay.mujocoValidation or _new_mujoco_validation(state, status="running")
+    if output.startswith("mujoco_replay_frame="):
+        try:
+            frame = json.loads(output.split("=", 1)[1])
+        except json.JSONDecodeError:
+            return
+        if isinstance(frame, dict) and "frame_index" in frame:
+            memory = state.mujoco_preview_memory if isinstance(state.mujoco_preview_memory, dict) else {}
+            memory.setdefault("dataset_root", validation.get("datasetRoot") or state.replay.datasetRoot or state.replay.dataset)
+            memory.setdefault("episode", validation.get("episode", state.replay.episode))
+            memory.setdefault("frames", [])
+            frames = memory.get("frames")
+            if not isinstance(frames, list):
+                frames = []
+                memory["frames"] = frames
+            frames.append(frame)
+            memory["fps"] = validation.get("fps", state.replay.fps)
+            memory["target_frame_name"] = frame.get("target_frame_name") or memory.get("target_frame_name") or ""
+            state.mujoco_preview_memory = memory
+            completed = len(frames)
+            validation["completedFrames"] = completed
+            try:
+                state.replay.frameIndex = max(0, int(frame.get("frame_index", completed - 1)))
+            except (TypeError, ValueError):
+                state.replay.frameIndex = max(0, completed - 1)
+        validation["updatedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        state.replay.mujocoValidation = validation
+        return
     result_match = re.search(
         r"mujoco_replay_result(?:=|\s+)status=(?P<status>\w+)\s+"
         r"completed_frames=(?P<completed>\d+)\s+total_frames=(?P<total>\d+)\s+"
@@ -10790,6 +10898,14 @@ def _apply_mujoco_replay_output(state: GatewayState, output: str) -> None:
             metric_match = re.search(pattern, output)
             if metric_match:
                 _set_mujoco_validation_metric(validation, key, metric_match.group(1))
+    progress_match = re.search(r"Replayed\s+(?P<completed>\d+)\s*/\s*(?P<total>\d+)\s+frames", output)
+    if progress_match:
+        completed = int(progress_match.group("completed"))
+        total = int(progress_match.group("total"))
+        validation["completedFrames"] = completed
+        validation["totalFrames"] = total
+        state.replay.frameIndex = max(0, completed - 1)
+        state.replay.totalFrames = total
     validation["updatedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
     state.replay.mujocoValidation = validation
 
@@ -11297,6 +11413,10 @@ def _fr3_mujoco_replay_report_path(dataset_root: Path, episode: int) -> Path:
     return dataset_root / "derived" / FR3_MUJOCO_REPLAY_DIR / f"episode_{int(episode):06d}.json"
 
 
+def _fr3_mujoco_replay_stream_path(dataset_root: Path, episode: int) -> Path:
+    return dataset_root / "derived" / FR3_MUJOCO_REPLAY_DIR / f"episode_{int(episode):06d}.frames.jsonl"
+
+
 def _fr3_mujoco_replay_video_path(dataset_root: Path, episode: int) -> Path:
     return dataset_root / "derived" / FR3_MUJOCO_REPLAY_DIR / f"episode_{int(episode):06d}.mp4"
 
@@ -11310,27 +11430,73 @@ def _mujoco_preview_report_path(dataset_root: Path, episode: int, cube_mode: str
     )
 
 
-def _fr3_mujoco_preview_payload(dataset_root: Path, episode: int) -> dict[str, Any] | None:
+def _fr3_mujoco_memory_frames(state: GatewayState | None, dataset_root: Path, episode: int) -> list[dict[str, Any]]:
+    if state is None:
+        return []
+    memory = state.mujoco_preview_memory if isinstance(state.mujoco_preview_memory, dict) else {}
+    try:
+        memory_episode = int(memory.get("episode", -1))
+    except (TypeError, ValueError):
+        return []
+    if memory_episode != int(episode):
+        return []
+    memory_root = memory.get("dataset_root")
+    if memory_root and Path(str(memory_root)).resolve() != dataset_root.resolve():
+        return []
+    frames = memory.get("frames")
+    return list(frames) if isinstance(frames, list) else []
+
+
+def _load_fr3_mujoco_stream_frames(dataset_root: Path, episode: int) -> list[dict[str, Any]]:
+    stream_path = _fr3_mujoco_replay_stream_path(dataset_root, episode)
+    if not stream_path.is_file():
+        return []
+    frames: list[dict[str, Any]] = []
+    try:
+        for line in stream_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if isinstance(item, dict) and "frame_index" in item:
+                frames.append(item)
+    except (OSError, json.JSONDecodeError):
+        return frames
+    return frames
+
+
+def _fr3_mujoco_preview_payload(dataset_root: Path, episode: int, state: GatewayState | None = None) -> dict[str, Any] | None:
     """The FR3 replay report, shaped as the inspector's preview payload.
 
     The two routes disagree about what a replay report is: Thor's is per-cube and carries the
-    per-robot frame lists the inspector never reads, while the FR3 runtime writes one report per
-    episode. Adapting here keeps that difference out of the frontend, which only needs to know
-    whether there is a video to show.
+    per-robot frame lists, while the FR3 runtime writes one report per episode. Adapting here
+    keeps that difference out of the frontend; both become qpos frame payloads for Three.js.
     """
-    report = _load_json_file(_fr3_mujoco_replay_report_path(dataset_root, episode))
-    if not report:
+    report = _load_json_file(_fr3_mujoco_replay_report_path(dataset_root, episode)) or {}
+    report_frames = report.get("frames") if isinstance(report.get("frames"), list) else []
+    memory_frames = _fr3_mujoco_memory_frames(state, dataset_root, episode)
+    stream_frames = _load_fr3_mujoco_stream_frames(dataset_root, episode)
+    frames = report_frames if report_frames else (memory_frames if memory_frames else stream_frames)
+    if not report and not frames:
         return None
-    video_path = _fr3_mujoco_replay_video_path(dataset_root, episode)
+    memory = state.mujoco_preview_memory if state is not None and isinstance(state.mujoco_preview_memory, dict) else {}
     return {
         "schema_version": int(report.get("schema_version") or 1),
         "dataset_root": str(dataset_root),
         "episode_index": int(report.get("episode", episode)),
-        "fps": int(report.get("fps") or 0),
-        "native_video_path": str(video_path) if video_path.is_file() else "",
-        "status": str(report.get("status") or ""),
+        "fps": int(report.get("fps") or memory.get("fps") or _dataset_declared_fps(dataset_root) or 0),
+        "status": str(report.get("status") or ("running" if frames else "")),
         "max_position_error_mm": report.get("max_position_error_mm"),
         "max_rotation_error_deg": report.get("max_rotation_error_deg"),
+        "frames": frames,
+        "stream_frame_count": len(memory_frames) or len(stream_frames),
+        "streaming": bool((memory_frames or stream_frames) and not report_frames),
+        "frame_source": str(report.get("frame_source") or "mujoco qpos + body poses"),
+        "target_frame_name": str(report.get("target_frame_name") or memory.get("target_frame_name") or ""),
+        "action_source": str(report.get("action_source") or ""),
+        "model": {
+            "renderer": "three-webgl",
+            "kinematics_path": "/fr3_mujoco_replay/kinematics.json",
+        },
         # No cubes on this rig, and no second arm to place beside the first.
         "robots": {},
         "robot_spacing_m": 0.0,
@@ -11379,10 +11545,8 @@ def _fr3_mujoco_replay_command(state: GatewayState, dataset_root: Path) -> list[
         str(DEFAULT_MUJOCO_MAX_ROTATION_ERROR_DEG),
         "--ik-orientation-weight",
         str(DEFAULT_WORKSTATION_REPLAY_IK_ORIENTATION_WEIGHT),
-        # Without this the run produces numbers and nothing to look at: the inspector's video
-        # panel stays on its placeholder, which reads as "the replay did not happen".
-        "--render-video",
-        str(_fr3_mujoco_replay_video_path(dataset_root, state.replay.episode)),
+        "--output",
+        str(_fr3_mujoco_replay_report_path(dataset_root, state.replay.episode)),
     ]
 
 
@@ -11393,7 +11557,6 @@ def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: s
     if selected_cube_mode not in MUJOCO_CUBE_MODES:
         raise ValueError(f"MuJoCo cube mode must be one of {MUJOCO_CUBE_MODES}, got {selected_cube_mode!r}")
     report_path = _mujoco_preview_report_path(dataset_root, state.replay.episode, selected_cube_mode)
-    video_path = _mujoco_preview_video_path(dataset_root, state.replay.episode, selected_cube_mode)
     command = [
         str(_mujoco_replay_python(state)),
         str(
@@ -11419,8 +11582,6 @@ def _mujoco_replay_command(state: GatewayState, dataset_root: Path, cube_mode: s
         str(DEFAULT_MUJOCO_ROBOT_SPACING_M),
         "--report-json",
         str(report_path),
-        "--render-video",
-        str(video_path),
         "--no-viewer",
     ]
     return command
@@ -11438,12 +11599,9 @@ def _approve_mujoco_report(state: GatewayState, cube_mode: str) -> None:
         raise ValueError(f"MuJoCo cube mode must be one of {MUJOCO_CUBE_MODES}, got {selected_cube_mode!r}")
 
     report_path = _mujoco_preview_report_path(dataset_root, state.replay.episode, selected_cube_mode)
-    video_path = _mujoco_preview_video_path(dataset_root, state.replay.episode, selected_cube_mode)
     report = _load_json_file(report_path)
     if not report:
         raise RuntimeError(f"Run MuJoCo {selected_cube_mode} first; no report exists for this episode.")
-    if not video_path.is_file():
-        raise RuntimeError(f"MuJoCo report exists but its native video is missing: {video_path}")
     if Path(str(report.get("dataset_root") or "")).resolve() != dataset_root.resolve():
         raise RuntimeError("MuJoCo report belongs to a different dataset.")
     if int(report.get("episode_index", -1)) != int(state.replay.episode):
@@ -11456,7 +11614,7 @@ def _approve_mujoco_report(state: GatewayState, cube_mode: str) -> None:
     selected_cubes = ("left", "right") if selected_cube_mode == "both" else (selected_cube_mode,)
     sidecar_dir = dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME
     newest_input_mtime = max((sidecar_dir / f"state_action.{cube}.csv").stat().st_mtime for cube in selected_cubes)
-    if report_path.stat().st_mtime < newest_input_mtime or video_path.stat().st_mtime < newest_input_mtime:
+    if report_path.stat().st_mtime < newest_input_mtime:
         raise RuntimeError("MuJoCo output is older than the EE trajectory. Run MuJoCo again before passing it.")
 
     robots = report.get("robots") if isinstance(report.get("robots"), dict) else {}
@@ -11833,6 +11991,24 @@ def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CU
             )
 
     state.replay.mujocoCubeMode = cube_mode
+    state.mujoco_preview_memory = {
+        "dataset_root": str(dataset_root),
+        "episode": int(state.replay.episode),
+        "cube_mode": cube_mode,
+        "frames": [],
+        "fps": int(_replay_fps(state, dataset_root)),
+        "status": "running",
+        "target_frame_name": _fr3_target_frame_name(state) if state.profile == "workstation" else "",
+    }
+    if state.profile == "workstation":
+        for stale_path in (
+            _fr3_mujoco_replay_report_path(dataset_root, state.replay.episode),
+            _fr3_mujoco_replay_stream_path(dataset_root, state.replay.episode),
+        ):
+            try:
+                stale_path.unlink()
+            except FileNotFoundError:
+                pass
     command = _mujoco_replay_command(state, dataset_root, cube_mode)
     state.replay.mujocoValidation = _new_mujoco_validation(
         state,
@@ -12399,6 +12575,20 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             )
             _json_response(self, HTTPStatus.OK, {"ok": True, "landmarks": landmarks})
             return
+        if path == "/api/rollout/ladders":
+            state = self.server.state
+            # Served rather than compiled into the page so the menu an operator grades from is
+            # the same file the gateway validates against. Two copies of a stage list is how a
+            # page ends up offering a stage the backend then refuses.
+            _json_response(
+                self,
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "ladders": [ladder.describe() for ladder in task_ladders.list_ladders(state.repo_root)],
+                },
+            )
+            return
         if path == "/api/rollout/outcomes":
             state = self.server.state
             entries = checkpoint_backend.load_rollout_outcomes(state.repo_root)
@@ -12419,13 +12609,21 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             with self.server.state.lock:
                 _json_response(self, HTTPStatus.OK, {"ok": True, "markerTcp": _marker_tcp_session_payload(self.server.state)})
             return
-        if path.startswith("/api/assets/pika/"):
-            name = path[len("/api/assets/pika/"):]
+        if path.startswith("/api/assets/pika/") or path.startswith("/api/assets/fr3/"):
+            is_fr3_asset = path.startswith("/api/assets/fr3/")
+            prefix = "/api/assets/fr3/" if is_fr3_asset else "/api/assets/pika/"
+            name = path[len(prefix):]
             allowed = {
                 "pika_gripper_base_link.STL",
                 "pika_gripper_left_link.STL",
                 "pika_gripper_right_link.STL",
             }
+            if is_fr3_asset:
+                allowed = allowed | {
+                    "link0.stl", "link1.stl", "link2.stl", "link3.stl",
+                    "link4.stl", "link5.stl", "link6.stl", "link7.stl",
+                    "fr32pika.STL",
+                }
             if name not in allowed:
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": "asset not allowed"})
                 return
@@ -12720,7 +12918,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 workstation = self.server.state.profile == "workstation"
                 try:
                     report = (
-                        _fr3_mujoco_preview_payload(dataset_root, episode)
+                        _fr3_mujoco_preview_payload(dataset_root, episode, self.server.state)
                         if workstation
                         else _load_json_file(_mujoco_preview_report_path(dataset_root, episode, cube_mode))
                     )

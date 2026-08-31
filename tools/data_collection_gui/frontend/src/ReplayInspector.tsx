@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { MujocoReplayViewer } from "./MujocoReplayViewer";
 import { Pose3DViewer } from "./Pose3DViewer";
 import { SeriesPlot } from "./SeriesPlot";
 import type { DataCollectionGuiApi } from "./api";
 import type { CameraControlsMetadata, CubeVideoOverlay, EePose, ForceVector, MujocoCubeMode, MujocoPreview, ReplayStatus, ReplayTimeline, ReplayTimelineFrame, TouchPadFrame } from "./types";
 import { TouchHeatmapGrid, touchLayoutForCount, touchSampleActivePoints, touchSampleHasShear, touchSampleLocalMax, touchScaleFromSamples, type TouchScale } from "./touchVisualization";
+import { timelineTimeToVideoTime as toVideoTime, videoTimeToTimelineTime as toTimelineTime } from "./shared/videoOffsets";
 
 const cubeColors: Record<string, number> = {
   left: 0xc2410c,
@@ -313,8 +315,6 @@ export function ReplayInspector({
   const [currentFrame, setCurrentFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [mujocoPreview, setMujocoPreview] = useState<MujocoPreview | null>(null);
-  const [nativeVideoFailed, setNativeVideoFailed] = useState(false);
-  const mujocoVideoRef = useRef<HTMLVideoElement | null>(null);
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
   // Frame counts read from loaded video metadata, keyed per camera. A single
   // corrupt remux cache can report a tiny duration (e.g. 56 frames); using
@@ -360,44 +360,36 @@ export function ReplayInspector({
     };
   }, [api, datasetPath, episode, revision]);
 
+  const mujocoRunning = replayStatus.state === "sim_replay";
+
   useEffect(() => {
     let cancelled = false;
+    let timer: number | null = null;
     setMujocoPreview(null);
-    setNativeVideoFailed(false);
     if (!datasetPath) return;
-    api.fetchMujocoPreview(datasetPath, episode, mujocoMode).then((result) => {
-      if (!cancelled) setMujocoPreview(result);
-    });
+
+    const loadPreview = () => {
+      api.fetchMujocoPreview(datasetPath, episode, mujocoMode).then((result) => {
+        if (!cancelled) setMujocoPreview(result);
+      });
+    };
+
+    loadPreview();
+    if (mujocoRunning) {
+      timer = window.setInterval(loadPreview, 300);
+    }
     return () => {
       cancelled = true;
+      if (timer !== null) window.clearInterval(timer);
     };
-  }, [api, datasetPath, episode, mujocoMode, mujocoRefreshKey]);
+  }, [api, datasetPath, episode, mujocoMode, mujocoRefreshKey, mujocoRunning]);
 
   const fps = timeline?.fps ?? fallbackFps;
-  const mujocoRunning = replayStatus.state === "sim_replay";
   const replayActive = mujocoRunning || replayStatus.state === "replaying";
   const canRunMujoco =
     replayStatus.dataStatus === "loaded" &&
     (replayStatus.recordedFrames ?? replayStatus.totalFrames) > 0;
 
-  useEffect(() => {
-    const video = mujocoVideoRef.current;
-    if (!video) return;
-    const targetTime = currentFrame / Math.max(fps, 1);
-    if (Math.abs(video.currentTime - targetTime) > 2 / Math.max(fps, 1)) {
-      video.currentTime = Math.min(targetTime, Number.isFinite(video.duration) ? video.duration : targetTime);
-    }
-  }, [currentFrame, fps, mujocoPreview]);
-
-  useEffect(() => {
-    const video = mujocoVideoRef.current;
-    if (!video) return;
-    if (playing) {
-      video.play().catch(() => undefined);
-    } else {
-      video.pause();
-    }
-  }, [playing, mujocoPreview]);
   const backendTotalFrames = timeline?.totalFrames ?? 0;
   // Effective playable frame count: keep the backend timeline as the primary
   // source, but allow a consistent shorter video duration to trim it. Taking
@@ -414,16 +406,12 @@ export function ReplayInspector({
   const videoWarmupS = Math.max(0, timeline?.videoWarmupS ?? 0);
   const firstTimelineTime = timeline?.frames?.[0]?.timestamp ?? 0;
   const cameraVideoOffsetsS: Record<string, number> = timeline?.cameraVideoOffsetsS ?? {};
-  const cameraVideoOffsetS = useCallback((key: string): number => {
-    const offset = cameraVideoOffsetsS[key];
-    return Number.isFinite(offset) ? offset : 0;
-  }, [cameraVideoOffsetsS]);
   const timelineTimeToVideoTime = useCallback((key: string, timelineTimeS: number): number => {
-    return Math.max(0, timelineTimeS - cameraVideoOffsetS(key) + videoWarmupS);
-  }, [cameraVideoOffsetS, videoWarmupS]);
+    return toVideoTime(cameraVideoOffsetsS, key, timelineTimeS, videoWarmupS);
+  }, [cameraVideoOffsetsS, videoWarmupS]);
   const videoTimeToTimelineTime = useCallback((key: string, videoTimeS: number): number => {
-    return Math.max(0, videoTimeS + cameraVideoOffsetS(key) - videoWarmupS);
-  }, [cameraVideoOffsetS, videoWarmupS]);
+    return toTimelineTime(cameraVideoOffsetsS, key, videoTimeS, videoWarmupS);
+  }, [cameraVideoOffsetsS, videoWarmupS]);
   const syncVideoToTimelineTime = useCallback((
     key: string,
     video: HTMLVideoElement,
@@ -832,7 +820,7 @@ export function ReplayInspector({
       <section className="panel pose-panel mujoco-panel">
         <div className="panel-heading">
           <h2>MuJoCo EE trajectory replay</h2>
-          <span>selected dataset · episode {episode} · native MuJoCo render</span>
+          <span>selected dataset · episode {episode} · Three.js/WebGL live view</span>
         </div>
         <div className="mujoco-local-controls">
           {cubeSelection ? (
@@ -856,7 +844,7 @@ export function ReplayInspector({
             onClick={() => onRunMujoco(mujocoMode)}
             type="button"
           >
-            {mujocoRunning ? "Rendering MuJoCo…" : cubeSelection ? `Run MuJoCo · ${mujocoMode}` : "Run MuJoCo"}
+            {mujocoRunning ? "Running MuJoCo…" : cubeSelection ? `Run MuJoCo · ${mujocoMode}` : "Run MuJoCo"}
           </button>
           {/* Approving a *saved* report is a cube-rig affordance: it re-reads
               `mujoco_preview.<cube>.episode_N.json` beside the cube CSVs it was scored against.
@@ -880,10 +868,10 @@ export function ReplayInspector({
         </div>
         <p className="panel-note">
           {!cubeSelection
-            ? "The FR3 follows the absolute-EE action stream recorded in this episode; the verdict lands automatically when the run finishes."
+            ? "MuJoCo computes validation metrics and streams body poses through the gateway; this browser view renders them live with Three.js/WebGL."
             : mujocoMode === "both"
               ? "Two identical FR3 models are shown in parallel with 0.90 m between bases; both trajectories remain in their own robot-base coordinates."
-              : `One FR3 follows state_action.${mujocoMode}.csv from the selected dataset and episode.`}
+              : `One FR3 follows state_action.${mujocoMode}.csv from the selected dataset and episode, then the browser renders the qpos report.`}
         </p>
         <ReplayTransport
           playing={playing}
@@ -891,30 +879,7 @@ export function ReplayInspector({
           currentFrame={currentFrame}
           timestamp={frame?.timestamp}
         />
-        {mujocoPreview?.native_video_path && !nativeVideoFailed ? (
-          <div className="mujoco-native-video-wrap">
-            <video
-              ref={mujocoVideoRef}
-              className="mujoco-native-video"
-              src={api.mujocoVideoUrl(datasetPath, episode, mujocoMode)}
-              muted
-              playsInline
-              preload="metadata"
-              onError={() => setNativeVideoFailed(true)}
-            />
-            {mujocoMode === "both" ? (
-              <div className="mujoco-native-labels"><span>Left FR3</span><span>Right FR3</span></div>
-            ) : null}
-          </div>
-        ) : (
-          <div className="mujoco-empty">
-            {nativeVideoFailed
-              ? "The native MuJoCo FR3 video could not be loaded. Run MuJoCo again to regenerate it."
-              : cubeSelection
-                ? "Choose a cube mode and run MuJoCo here to render the true FR3 model for this dataset and episode."
-                : "Run MuJoCo here to render the true FR3 model for this dataset and episode."}
-          </div>
-        )}
+        <MujocoReplayViewer preview={mujocoPreview} currentFrame={currentFrame} />
       </section>
       <div className="series-grid">
         <SeriesPlot

@@ -6,12 +6,7 @@ import type {
   RolloutLandmarks,
   RolloutOutcomeEntry
 } from "../types";
-import {
-  buildLandingPoints,
-  formatMm,
-  type PlottedOutcome,
-  type PlottedPoint
-} from "./landingMapPoints";
+import { buildLandingPoints, formatMm, type PlottedPoint, pointFill, stageFill } from "./landingMapPoints";
 
 /** A top-down map of where rollouts actually put the gripper, over where the demonstrations did.
  *
@@ -33,13 +28,6 @@ const PAD_BOTTOM = 40;
 const PAD_TOP = 16;
 const PAD_RIGHT = 16;
 const GRID_STEP_M = 0.05;
-
-const OUTCOME_FILL: Record<PlottedOutcome, string> = {
-  success: "#2f9e5f",
-  failure: "#cf4b3a",
-  aborted: "#8a8a8a",
-  pending: "#d79b28"
-};
 
 export function RolloutLandingMap({
   landmarks,
@@ -127,6 +115,15 @@ export function RolloutLandingMap({
   const radius = landmarks.graspRadiusM;
   const graded = rolloutPoints.filter((point) => point.outcome !== "pending");
   const successes = graded.filter((point) => point.outcome === "success").length;
+  // The ramp replaces the success/failure key only once something on the map carries a stage;
+  // a log full of records graded the old way would otherwise get a legend for colours it has
+  // no points in.
+  const staged = graded.filter(
+    (point) => point.stage !== undefined && point.terminalStage !== undefined
+  );
+  const terminalStage = staged.length
+    ? Math.max(...staged.map((point) => point.terminalStage as number))
+    : 0;
 
   return (
     <div className="landing-map">
@@ -216,7 +213,7 @@ export function RolloutLandingMap({
         {rolloutPoints.map((point) => {
           const cx = frame.toScreenX(point.x);
           const cy = frame.toScreenY(point.y);
-          const fill = OUTCOME_FILL[point.outcome];
+          const fill = pointFill(point);
           return (
             <g key={point.key}>
               {/* A ring in the plot's own background colour, so a dot that lands on an earlier
@@ -255,8 +252,26 @@ export function RolloutLandingMap({
 
       <div className="landing-map-legend">
         <span><i className="dot demo" /> demo grasp ({demoPoints.length})</span>
-        <span><i className="dot success" /> success ({successes})</span>
-        <span><i className="dot failure" /> failure</span>
+        {staged.length ? (
+          <>
+            <span className="landing-map-ramp">
+              <i className="dot" style={{ background: stageFill(1, terminalStage) }} />
+              {Array.from({ length: terminalStage - 1 }, (_, index) => (
+                <i
+                  key={index + 2}
+                  className="dot"
+                  style={{ background: stageFill(index + 2, terminalStage) }}
+                />
+              ))}
+              {` stage 1 → ${terminalStage} (success)`}
+            </span>
+          </>
+        ) : (
+          <>
+            <span><i className="dot success" /> success ({successes})</span>
+            <span><i className="dot failure" /> failure</span>
+          </>
+        )}
         <span><i className="dot aborted" /> aborted</span>
         <span><i className="dot pending" /> not graded</span>
         <span><i className="dot hollow" /> gripper never closed</span>
@@ -267,6 +282,10 @@ export function RolloutLandingMap({
         from the hole
         {radius ? ` (${formatMm(radius.min)}–${formatMm(radius.max)})` : ""}; a failure outside
         them is a placement the policy was never trained on.
+        {staged.length
+          ? " Dot colour is how far along the task's precondition chain the rollout got, so a" +
+            " cluster of one colour is a cluster of one failure mode."
+          : ""}
       </p>
     </div>
   );

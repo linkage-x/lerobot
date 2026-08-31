@@ -17,8 +17,8 @@ does not SSH from Thor back into itself.
 2. Generate the EE trajectory in Dataset Processing. The selected cube must have
    a non-empty `state_action.<cube>.csv` for that episode.
 3. Thor's `/home/nvidia/Code/infer/.venv-fr3/bin/python3` must provide MuJoCo and
-   the hardware-equivalent IK dependencies. `ffmpeg` must be available for the
-   browser-playable native MP4.
+   the hardware-equivalent IK dependencies. The browser preview uses the JSON
+   body-pose preview stream plus Three.js/WebGL; it no longer requires `ffmpeg` or an MP4.
 4. Hardware replay additionally needs `panda_py`, the BOX SDK environment used
    by the Corenetic gripper, network access to the selected FR3 IP, and an
    operator ready to stop the robot.
@@ -30,15 +30,16 @@ does not SSH from Thor back into itself.
 
 Choose `Left cube`, `Right cube`, or `Both cubes`, then click `Run MuJoCo`.
 The gateway runs the selected episode headlessly with the hardware-equivalent IK
-solver, creates a native MuJoCo video, and embeds it in the same timeline as the
-recorded cameras and telemetry.
+solver, streams per-frame MuJoCo poses through gateway memory, writes structured
+metrics at completion, and the browser renders the live pose stream with Three.js/WebGL
+in the same timeline as the recorded cameras
+and telemetry.
 
 Outputs are written beside the generated cube trajectories:
 
 ```text
 derived/april_cube_tracking_in_robot_base/
   mujoco_preview.<left|right|both>.episode_XXXXXX.json
-  mujoco_preview.<left|right|both>.episode_XXXXXX.mp4
 ```
 
 The validation record contains the selected cube mode. A pass for `left` cannot
@@ -70,7 +71,7 @@ control, not as a replacement for the robot's physical emergency stop.
 With a real dataset available, validate in this order:
 
 1. Confirm the selected episode has finite left/right sidecar poses.
-2. Run one single-cube MuJoCo replay and inspect its embedded MP4 and metrics.
+2. Run one single-cube MuJoCo replay and inspect its Three.js pose preview and metrics.
 3. Run `both` MuJoCo replay and confirm the two trajectories remain in separate
    robot-base viewports.
 4. Confirm the hardware panel stays locked for a different cube or episode.

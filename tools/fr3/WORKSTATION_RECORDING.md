@@ -591,9 +591,8 @@ diverged the moment the recording rate became adjustable (`Add FR3 recording FPS
 set it to 60 while every dataset on disk was recorded at 30), and replaying at the wrong rate fails
 in two ways that look like anything but a frame-rate bug:
 
-- the preview video is encoded at that rate, so the arm runs against the timeline at
-  `fps_used / fps_recorded` speed — at 60-against-30 the robot finishes in 9.8 s while the scrubber
-  takes 19.7 s;
+- the qpos preview report is indexed at that rate, so the arm is compared against the same
+  frame grid the browser scrubs;
 - `fr3_gui_replay_runtime` derives the sim's `teleop_control_frequency` from it, so each command is
   integrated for a fraction of the frame period the recorder actually had. The comment in
   `_replay_robot_config` predicted exactly this: *"tracking error that is really just an
@@ -601,10 +600,10 @@ in two ways that look like anything but a frame-rate bug:
 
 Measured on `eeframe_fr3_spacemouse_20260813_160401` episode 0, changing nothing but `--fps`:
 
-| `--fps` | verdict | avg | max pos | max rot | video |
-| --- | --- | --- | --- | --- | --- |
-| 30 (the recorded rate) | **passed** | 1.94 mm | 4.88 mm | 0.64° | 30/1, 19.67 s |
-| 60 (the config's rate) | failed | 2.43 mm | **43.26 mm** | **8.23°** | 60/1, 9.83 s |
+| `--fps` | verdict | avg | max pos | max rot |
+| --- | --- | --- | --- | --- |
+| 30 (the recorded rate) | **passed** | 1.94 mm | 4.88 mm | 0.64 deg |
+| 60 (the config's rate) | failed | 2.43 mm | **43.26 mm** | **8.23 deg** |
 
 `gateway._replay_fps()` now takes the rate from the dataset's own `meta/info.json` for both the
 MuJoCo gate and the real replay, and selecting a dataset moves `ReplayStatus.fps` onto it so the
@@ -955,7 +954,9 @@ python tools/fr3/fr3_gui_replay_runtime.py \
   --config-path tools/fr3/fr3_record_config.yaml
 ```
 
-Reports land in `derived/fr3_mujoco_replay/episode_XXXXXX.json`.
+Reports land in `derived/fr3_mujoco_replay/episode_XXXXXX.json`. During replay the runtime
+streams per-frame MuJoCo body poses through gateway memory for the Episode Replay browser
+viewer; the GUI no longer asks the runtime to render an MP4 preview.
 
 ## Known constraints
 

@@ -45,7 +45,8 @@ import type {
   RolloutLandmarks,
   TrainingHistoryEntry,
   TrainingView,
-  TrainingWandbStatus
+  TrainingWandbStatus,
+  TaskLadder,
 } from "./types";
 
 export type CameraCropSpecs = Record<string, [number, number, number, number]>;
@@ -983,6 +984,12 @@ export class DataCollectionGuiApi {
     return payload?.landmarks ?? {};
   }
 
+  /** The grading ladders the repo ships, so the outcome prompt can offer this task's stages. */
+  async fetchTaskLadders(): Promise<TaskLadder[]> {
+    const payload = await this.trainingGet<{ ladders: TaskLadder[] }>("/api/rollout/ladders");
+    return payload?.ladders ?? [];
+  }
+
   /** The previous rollout's settings, so a new one starts where the last left off.
    *  Never carries the safety gates; those are re-asked every time. */
   async fetchRolloutLastParams(): Promise<RolloutLastParams> {
@@ -1009,10 +1016,15 @@ export class DataCollectionGuiApi {
    *  runtime measured, so a grade can never be filed against a place the arm did not go. */
   async recordRolloutOutcome(record: {
     checkpointId?: string;
-    outcome: "success" | "failure" | "aborted";
+    /** Omitted when a stage is sent: the gateway derives success from the stage, and an
+     *  outcome sent alongside one it disagrees with is refused rather than silently kept. */
+    outcome?: "success" | "failure" | "aborted";
     mode?: string;
     steps?: number;
     note?: string;
+    taskLadder?: string;
+    stageId?: string;
+    blocker?: string;
   }) {
     return this.trainingPost<{ entry?: RolloutOutcomeEntry }>("/api/rollout/outcome", record);
   }

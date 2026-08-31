@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FR3 抓取 Baseline Roadmap</title>
+<style>
+  :root{
+    --bg:#f6f7f9;--panel:#fff;--text:#1f2937;--muted:#64748b;--line:#e5e7eb;
+    --blue:#1d4ed8;--blue-bg:#eff6ff;--green:#15803d;--green-bg:#ecfdf5;
+    --amber:#a16207;--amber-bg:#fffbeb;--red:#991b1b;--red-bg:#fef2f2;
+    --shadow:0 8px 24px rgba(15,23,42,.06)
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,"PingFang SC",
+    "Microsoft YaHei",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.62}
+  a{color:var(--blue)}
+  .wrap{max-width:1120px;margin:0 auto;padding:32px 22px 72px}
+  .hero{background:#111827;color:#f9fafb;border-radius:18px;padding:30px 32px;
+    box-shadow:var(--shadow);margin-bottom:18px}
+  .hero h1{margin:0 0 10px;font-size:30px;line-height:1.25}
+  .hero p{margin:8px 0;color:#d1d5db}
+  .hero a{color:#bfdbfe}
+  .meta{display:flex;gap:8px;flex-wrap:wrap;margin-top:17px}
+  .pill{display:inline-flex;padding:5px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);
+    color:#e5e7eb;font-size:13px;font-weight:650}
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;
+    box-shadow:var(--shadow)}
+  .full{grid-column:1/-1}
+  h2{font-size:22px;margin:0 0 12px}
+  h3{font-size:17px;margin:18px 0 7px}
+  p{margin:8px 0}
+  ul,ol{margin:8px 0 0 22px;padding:0}
+  li{margin:5px 0}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+    background:#f3f4f6;border-radius:6px;padding:2px 5px;font-size:.92em}
+  .hero code,.hero .mono{background:rgba(255,255,255,.12);color:#fff}
+  .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;
+    font-weight:750;white-space:nowrap}
+  .done{color:var(--green);background:var(--green-bg)}
+  .todo{color:var(--blue);background:var(--blue-bg)}
+  .warn{color:var(--amber);background:var(--amber-bg)}
+  .p0{color:var(--red);background:var(--red-bg)}
+  .callout{margin:12px 0;border-left:4px solid var(--blue);background:var(--blue-bg);
+    border-radius:10px;padding:12px 14px}
+  .callout.ok{border-color:var(--green);background:var(--green-bg)}
+  .callout.warn{border-color:var(--amber);background:var(--amber-bg)}
+  .callout.p0{border-color:var(--red);background:var(--red-bg)}
+  .small{font-size:13px;color:var(--muted)}
+  .tablewrap{overflow-x:auto;max-width:100%}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{background:#f9fafb;color:#111827}
+  td.num{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+  .flow{white-space:pre-wrap;overflow:auto;background:#0f172a;color:#e5e7eb;border-radius:12px;
+    padding:14px;font-size:13px}
+  .phase{display:grid;grid-template-columns:145px 1fr 205px;gap:14px;padding:14px 0;
+    border-top:1px solid var(--line)}
+  .phase:first-of-type{border-top:none}
+  .phase .name{font-weight:800;color:#111827}
+  @media(max-width:820px){.grid{grid-template-columns:1fr}.full{grid-column:auto}
+    .phase{grid-template-columns:1fr}.hero{padding:25px 21px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <h1>FR3 抓取 Baseline Roadmap</h1>
+    <p>目标：让 <span class="mono">50 条 demo + pi0.5 + LoRA</span> 形成一个可重复、可测量、可回退的真机 baseline。</p>
+    <p><b>当前状态（2026-08-31）：030000 已在真机表现出“会找本次物体”的泛化，主问题从“没有条件化”转为末端几毫米与插入 yaw 的精度。S0.1 真机验收当天通过（第 8/9 轮成功、第 10 轮验证“从未闭合”分支），当天下午又跑了固定协议 20 轮，<b>0 成功</b>（合计 2/29 ≈ 7%）——两轮成功确实撑不起成功率。
+      这 20 轮真正的价值在于它们断在三个不同环节上，而 <code>success/failure</code> 读不出这件事，
+      因此评分机制本身成了当前门禁（第七节）。同一批数据还暴露出两件事：事件约化把夹爪指令的瞬时抖动当成了抓取（9 轮闭合 rollout 里 4 轮的 lift / held / 释放点是错的，已修复）；更要紧的是<b>轨迹本身分不清"抓到了"和"抓空了"</b> —— 第 4、5 轮把 peg 推倒、抓空，却照样握持 190 / 87 步并抬升 67 / 79 mm。成败判定仍然只能来自操作者。
+      08-31 晚：分级评分已落地（第七节），并从这 20 条轨迹里量出了 2→3 流失的一个可测候选原因——<b>策略闭合时的下降深度散布是 demo 的 2.6 倍</b>，深度还与抓取成败相关。随后的真机回放判别实验排除了「坐标系/标定漂了」这条替代解释——留档 demo 在真机原样重播仍能复现抓取，因此散布归到「策略 z 自身噪声」，门禁转向 S6 DAgger。</b></p>
+    <p class="small">完整实验过程、失效结论和方法论复盘已移到
+      <a href="./fr3_grasp_baseline_experiment_log.html">FR3 抓取 Baseline 实验档案</a>；本页只保留当前事实与执行顺序。</p>
+    <div class="meta">
+      <span class="pill">ckpt: L4_full48_holdout22_40 / 030000</span>
+      <span class="pill">训练：48 ep / 30000 steps / loss 0.123</span>
+      <span class="pill">当前门禁：S6 DAgger 接管</span>
+      <span class="pill">归因：策略 z 噪声（坐标系漂移已证伪）</span>
+      <span class="pill">S1 / S5 可并行</span>
+      <span class="pill">RL：S7，触发判据见第九节</span>
+      <span class="pill">S2 / S3 / S4 等落点图决策</span>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card full">
+      <h2>一、现在已经确定的事实</h2>
+      <div class="tablewrap">
+      <table>
+        <tr><th>层面</th><th>当前结论</th><th>证据</th><th>边界</th></tr>
+        <tr>
+          <td>真机成功率</td>
+          <td><span class="badge warn">已测</span> 固定协议 20 轮 <b>0 成功</b>；合计 <b>2 / 29 ≈ 7%</b></td>
+          <td class="num">08-31 两个会话：上午 2/9，下午 20/20 失败</td>
+          <td>失败断在三个不同环节，二元标签读不出来，见第七节</td>
+        </tr>
+        <tr>
+          <td>动作/观测契约</td>
+          <td><span class="badge done">通过</span> 标签不可被 state 平凡复制，视觉信息能抵达 action expert</td>
+          <td class="num">首帧可作弊度 0.68→0.18；KV cache LOO R² x=0.485 / y=0.201</td>
+          <td>冻结 VLM 不是当前瓶颈</td>
+        </tr>
+        <tr>
+          <td>容量与优化</td>
+          <td><span class="badge done">通过</span> 绑定约束是可训练预算；MEAN_STD + 逐维权重有效</td>
+          <td class="num">2.57M→27.86M；ep4 dx 0.106→0.893；alpha 修复与模块覆盖各贡献约一半</td>
+          <td>不要继续靠扩大 VLM/LoRA 解决末端精度</td>
+        </tr>
+        <tr>
+          <td>环带内泛化</td>
+          <td><span class="badge done">通过</span> 未训练位置上的三个平移维都显著为正</td>
+          <td class="num">H22/H40 chunk: dx +0.840/+0.863；dy +0.868/+0.862；dz +0.930/+0.903</td>
+          <td>只证明角度内插；半径 &lt;56 mm、&gt;170 mm 与 79° 缺口仍是 OOD</td>
+        </tr>
+        <tr>
+          <td>真机首轮</td>
+          <td><span class="badge done">定性成立</span> 夹爪会朝本次 peg 去</td>
+          <td>A：抓起+插入；B：接近但抓不起；C：抓起但插不准</td>
+          <td><b>只有操作者口述</b>；没有坐标、比例、外参门记录，不能据此选择 S2/S3/S4</td>
+        </tr>
+        <tr>
+          <td>失败类型</td>
+          <td><span class="badge warn">已换类</span> 从“没条件化”变成“条件化精度不足”</td>
+          <td>08-27 失败在接近相；08-31 失败主要落在闭合相或插入相</td>
+          <td>需要落点图把视觉分辨率、yaw 与数据盲区分开</td>
+        </tr>
+        <tr>
+          <td>坐标系/标定</td>
+          <td><span class="badge done">已证伪</span> 没有漂移，也就没有一个常数在等着被修</td>
+          <td>留档 demo 轨迹在真机原样重播，仍能复现抓取</td>
+          <td>只排除常数偏置；闭合深度的<b>散布</b>不受此影响</td>
+        </tr>
+      </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>二、当前 baseline 配方</h2>
+      <ul>
+        <li>数据：50 条 demo，训练排除 holdout <code>[22,40]</code>，实际 48 条 / 23971 帧。</li>
+        <li>策略：pi0.5 + LoRA，全 action expert linear，<code>r=64</code> / <code>alpha=64</code>。</li>
+        <li>可训练参数：<code>27,856,896</code>（0.67%）。</li>
+        <li>归一化：<code>MEAN_STD</code>。</li>
+        <li>逐维权重：<code>[1.0,1.0,1.0,0.2,2.0]</code>。</li>
+        <li>checkpoint：<code>L4_full48_holdout22_40/030000</code>，30000 步，最终 loss 0.123。</li>
+      </ul>
+      <div class="callout ok">
+        <b>030000 是第一个可工作的回退锚点。</b>在任何 crop、yaw 权重或数据改动前，先完成 S5 归档。
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>三、仍未收口的量</h2>
+      <ul>
+        <li><b>成功率和空间分布：</b>首轮没有机器可读落点，A/B/C 比例未知；至今没有任何一批固定协议的连续 rollout，所有“成功率”都还是逐轮印象。</li>
+        <li><b>评分漏登：</b>只有操作者回答了结果提示，rollout 才会入库。第 7 轮留下了 78 步的 <code>rollout_007.csv</code>，却在 <code>rollout_log.jsonl</code> 里没有任何一行（索引从 6 直接跳到 8）。<b>漏评一轮，分母就少一轮，而且不留痕迹。</b></li>
+        <li><b>相机外参：</b>首轮是否通过外参比对没有记录。</li>
+        <li><b><code>drz</code>：</b>R² 分母近零，H22/H40 差两个数量级；下一指标应是 chunk 累计 yaw 的绝对角度误差（度）。</li>
+        <li><b>观测夹爪：</b><code>observation.state.gripper.pos</code> 有 47% 帧掉成 0；事件检测必须读取指令。</li>
+        <li><b>S1 曲线：</b>005000–025000 尚未与 030000 连成 holdout 曲线，平台期未知。</li>
+      </ul>
+    </div>
+
+    <div class="card full">
+      <h2>四、S0.1 真机闭环验收（08-31 通过）与它暴露的三个缺陷</h2>
+      <div class="callout ok">
+        <b>2026-08-31 已在真机通过。</b>
+        同一交互会话内第 8、9 轮成功；两轮之间
+        <code>homing=start → done → arm_at_start=1 → rollout_start</code> 顺序完整，第二轮确实从归位后的
+        起点开始。第 10 轮在夹爪闭合前停止，落到 <code>closed=0</code> 分支：只产出 <code>approach_xyz</code>、
+        地图画空心点、<code>rollout_010.csv</code> 正常归档，没有伪造抓取点。四段数据（CSV / end marker /
+        评分 JSONL / 地图）指向同一 <code>logPath</code> 与 <code>rolloutIndex</code>。</div>
+      <div class="callout p0">
+        <b>同一次验收证伪了已归档的几何。</b>
+        事件约化把夹爪指令的瞬时越界当成了一次抓取：9 轮闭合 rollout 里有 4 轮（第 2、4、5、9）的
+        <b>lift、held steps 与释放点</b>是错的，见下节。抓取点受影响很小（位移 0.3–3.9 mm），
+        落点图只画抓取点，因此地图本身基本不受影响。
+        <b>两轮成功只说明该 checkpoint 具备成功能力，不构成成功率。</b>
+        重算已就绪：从留档 CSV 复算，只有第 2、4、5、9 轮发生实质变化，其余 5 轮逐字节不变——这既是修复生效的证据，也是它没有波及正确轮次的证据。回填尚未执行。
+      </div>
+      <div class="callout warn">
+        <b>做成功率批次之前先知道这条：漏评分的 rollout 不入库。</b>
+        结果提示按 <code>rolloutIndex</code> 弹出，记录也只在回答之后才写（<code>tools/data_collection_gui/rollout.py:500</code>）。第 7 轮就是这样丢的：轨迹 CSV 在，日志里没有。批次期间<b>每一轮都必须评分</b>，否则分母会静默变小，而且是往“看起来更好”的方向变——跑不下去而被放弃的那一轮，恰恰是最容易忘记评分的一轮。
+      </div>
+
+      <h3>已经实现</h3>
+      <div class="tablewrap">
+      <table>
+        <tr><th>链路</th><th>实现</th><th>关键约束</th></tr>
+        <tr>
+          <td>原始轨迹</td>
+          <td>每步保存 EE xyz、夹爪指令/原始值、状态到 <code>outputs/rollout_traces/rollout_NNN.csv</code></td>
+          <td>rollout 不可复现，先留原始轨迹，事后规则才能重算</td>
+        </tr>
+        <tr>
+          <td>事件约化</td>
+          <td>抓取点、释放点、最低接近点、apex、lift、descent、held steps</td>
+          <td>抓取取“先张开、后闭合”的下降沿；不能把初始闭合的 home pose 当抓取点</td>
+        </tr>
+        <tr>
+          <td>结果入库</td>
+          <td>runtime end marker → gateway → Success/Failure/Aborted JSONL</td>
+          <td>坐标来自 runtime，页面不能伪造；无坐标就保持缺失，不能补原点</td>
+        </tr>
+        <tr>
+          <td>落点图</td>
+          <td>rollout 点叠加 checkpoint 数据集的 50 个 demo 抓取点、孔位和覆盖环带</td>
+          <td>同一 checkpoint 单独显示；从未闭合画最低接近点为空心点</td>
+        </tr>
+        <tr>
+          <td>会话内归位</td>
+          <td><code>Move to start</code> 贯通 runtime / pipe / gateway / GUI</td>
+          <td>只允许 waiting 时触发；归位不自动开夹爪；第二轮不能从上一轮停止位姿直接开始</td>
+        </tr>
+      </table>
+      </div>
+
+      <h3>自动验收边界</h3>
+      <p>GUI rollout 后端 <b>116 项通过</b>；前端 <b>133 项通过</b>；生产构建与 Python 语法编译通过。
+      完整 <code>test_fr3_act_infer_real.py</code> 在本工作站收集阶段被依赖冲突挡住：
+      <code>huggingface-hub==1.12.0</code>，当前 <code>transformers</code> 要求 <code>&lt;1.0</code>。
+      这是环境阻塞，不是测试失败，但也不能据此宣称 runtime 已全量回归。
+      落点约化这一子集已经用<b>真实源码</b>在隔离运行器中跑通（从 runtime 模块原文 exec 出
+      <code>RolloutGeometryTrace</code>，从测试文件按 AST 取出原测试体，绕开 <code>lerobot.policies</code>
+      的导入链）：<b>10 项通过</b>，含本次修复新增的 2 项回归。其余 runtime 仍未回归。
+      该运行器已入库为 <code>tests/scripts/run_geometry_tests_isolated.py</code>：它在运行时从两份源文件里抽取，
+      不复制任何一行，因此不会与真测试脱节。环境能导入 runtime 的那天直接删掉它即可。</p>
+
+
+      <h3>验收发现的缺陷：把瞬时抖动当成了抓取</h3>
+      <p>夹爪指令是连续量，按 0.5 阈值切出闭合区间。旧规则取<b>第一个</b>下降沿，再取其后<b>第一个</b>上升沿。
+      第 9 轮的指令在 step 388 只掠过 0.4997 两步就弹回，真正闭合发生在 22 步之后 —— 于是那两步成了整段抓取，
+      一次 lift 73 mm、横移 108 mm 的成功被归档成 <code>lift=0、held_steps=2</code>、抓取点与释放点重合。
+      同一轮真正的握持本身还被 3 步的越界切成两段。</p>
+      <p>修法与既有的“抓取是下降沿、不是电平”同一条思路，再推一步：<b>抓取是一段握持，不是一次抖动</b>。
+      间隔小于 <code>_TRACE_GRIPPER_REOPEN_MIN_STEPS = 5</code> 步的闭合段并为一段，取其中最长的一段作为
+      这一轮的握持。阈值仍然只是参数，原始 CSV 还在手上，旧 rollout 可以按新规则重算。</p>
+      <div class="tablewrap">
+      <table>
+        <tr><th>轮次</th><th>人工评分</th><th>归档 held / lift(m)</th><th>重算 held / lift(m)</th><th>释放点 z(m)</th><th>结论</th></tr>
+          <tr><td>1</td><td>失败 · grasped but released early</td><td class="mono">274 / 0.0789</td><td class="mono">274 / 0.0789</td><td class="mono">0.0659</td><td>一致</td></tr>
+          <tr><td>2</td><td>失败 · grasped but released early</td><td class="mono">11 / 0.0003</td><td class="mono"><b>181 / 0.0754</b></td><td class="mono">0.0880</td><td><span class="badge warn">改写</span></td></tr>
+          <tr><td>3</td><td>失败 · no grasped</td><td class="mono">2 / 0.0000</td><td class="mono">2 / 0.0000</td><td class="mono">0.0632</td><td>一致，确实没抓住</td></tr>
+          <tr><td>4</td><td>失败 · push down</td><td class="mono">6 / 0.0000</td><td class="mono"><b>190 / 0.0671</b></td><td class="mono">0.0757</td><td><span class="badge warn">改写</span></td></tr>
+          <tr><td>5</td><td>失败 · push down</td><td class="mono">1 / 0.0000</td><td class="mono"><b>86 / 0.0790</b></td><td class="mono">0.1262</td><td><span class="badge warn">改写</span></td></tr>
+          <tr><td>6</td><td>成功</td><td class="mono">244 / 0.0854</td><td class="mono">244 / 0.0854</td><td class="mono">0.0711</td><td>一致</td></tr>
+          <tr><td>7</td><td>未评分</td><td class="mono">—</td><td class="mono">从未闭合</td><td class="mono">—</td><td>—</td></tr>
+          <tr><td>8</td><td>成功</td><td class="mono">240 / 0.0717</td><td class="mono">240 / 0.0717</td><td class="mono">0.0692</td><td>一致</td></tr>
+          <tr><td>9</td><td>成功</td><td class="mono">2 / 0.0000</td><td class="mono"><b>348 / 0.0747</b></td><td class="mono">0.0803</td><td><span class="badge warn">改写</span></td></tr>
+          <tr><td>10</td><td>中止（验收轮）</td><td class="mono">从未闭合</td><td class="mono">从未闭合</td><td class="mono">—</td><td>一致</td></tr>
+      </table>
+      </div>
+      <div class="callout warn">
+        <b>重算只改文档，还没有回填。</b>
+        远端 <code>rollout_log.jsonl</code> 里第 2、4、5、9 轮的 lift / held / 释放点仍是错的。
+        抓取点位移 0.3–3.9 mm，落点图（只画 <code>graspXyz ?? approachXyz</code>）实际不受影响。
+        回填要改的是实验记录本身，等确认后再执行；原始 <code>rollout_traces/*.csv</code> 未被触碰。
+      </div>
+
+      <h3>第二个缺陷：轨迹文件在会话之间互相覆盖</h3>
+      <div class="callout p0">
+        <b><code>rolloutIndex</code> 每个交互会话都从 1 重新开始，而轨迹只按索引命名。</b>
+        今天 15:11 启动的第二个会话，把上午会话的 <code>rollout_001.csv</code> 起逐个覆盖掉了——
+        包括上午仅有的两轮成功（第 8、9 轮）的原始轨迹。<code>rollout_log.jsonl</code> 里
+        <code>(logPath, rolloutIndex)</code> 仍然唯一，所以<b>记录没丢，丢的是可复算的原始数据</b>。
+        整个约化设计的前提是"轨迹留着，阈值以后还能改"，这个覆盖正好废掉那个前提。
+      </div>
+      <ul>
+        <li><b>已止损：</b>上午会话的 10 条轨迹从本机副本恢复到
+          <code>outputs/rollout_traces/session_20260831_033716/</code>。</li>
+        <li><b>已加护栏：</b><code>tools/fr3/fr3_rederive_rollout_geometry.py</code> 检测到日志含多个会话时
+          直接拒绝执行并列出会话，而不是默认取最新的——否则它会把一个会话的落点写到另一个会话的记录上。
+          验证过：不带 <code>--session</code> 退出码 2；带上之后精确复现第 2/4/5/9 轮的差异。</li>
+        <li><b>待修（S0.3）：</b>轨迹文件名应带会话标识（<code>logPath</code> 的时间戳即可），
+          与记录里的 <code>logPath</code> 对齐。在此之前，<b>每批 rollout 结束后先把轨迹目录归档再开下一个会话</b>。</li>
+      </ul>
+
+      <h3>更要紧的一条：握持不等于抓到</h3>
+      <p>第 4、5 轮的人工备注是 <b>push down —— peg 被推倒，没抓住</b>。而这两轮的轨迹是
+      190 步 / 87 步的连续闭合，末端分别抬升 67 mm 和 79 mm。也就是说：<b>夹爪合拢并抬起，手里可以是空的</b>。
+      在 xyz + 夹爪指令这个空间里，"抓起来搬走"和"抓空了搬走"完全同形。</p>
+      <p>observation 侧的夹爪宽度也救不了：取各轮握持段内的非零读数，成功轮中位数
+      0.0106 / 0.0109 / 0.0133，push down 轮 0.0076 / 0.0079，区间完全重叠，且 9%–48% 的帧是掉线 0。
+      <b>这条链路没有"手里有没有东西"的信号。</b></p>
+      <div class="callout p0">
+        <b>因此：<code>lift</code>、<code>held_steps</code>、释放点都不能单独用来判定成功。</b>
+        它们记录的是"夹爪在哪里合拢、在哪里张开"，不是"抓到了什么"。
+        成败标签仍然只能来自操作者的评分，落点图上的抓取点应读作<b>闭合点</b>。
+        想让几何自己能判成败，需要新的观测（腕部相机的抓后确认、力/宽度阈值、或放置后的物体位姿），
+        这是一项独立工作，不在 S0.1 范围内。
+      </div>
+
+      <h3>真机验收步骤</h3>
+      <ol>
+        <li>先运行相机外参比对，并把结果与本轮 rollout 一起留档。</li>
+        <li>同一交互会话启动第一轮：核对 CSV、end marker、评分 JSONL 和地图点一致。</li>
+        <li>停止后确认 <code>armAtStart=false</code>；按 <code>Move to start</code>，确认回到数据集起点且夹爪保持不变。</li>
+        <li>同一进程启动第二轮，重复检查，证明多轮起点契约成立。</li>
+        <li>至少覆盖一次“从未闭合”，确认最低接近点以空心点出现。</li>
+      </ol>
+      <div class="callout warn">
+        <b>通过判据：</b>两轮的四段数据一致、第二轮确实从归位后的起点开始、无闭合分支不产生假抓取点。
+        在此之前，不用 S0 地图选择 S2/S3/S4。
+      </div>
+    </div>
+
+    <div class="card full">
+      <h2>五、执行顺序</h2>
+
+      <div class="phase">
+        <div class="name">S0<br><span class="badge done">软件完成</span></div>
+        <div>逐步轨迹、事件约化、结果入库、demo 底图、落点图、一键评分、会话内归位均已实现。</div>
+        <div>后端 116 / 前端 133 项通过；真机闭环 08-31 通过。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">S0.1<br><span class="badge done">08-31 通过</span></div>
+        <div><b>同一会话两轮真机验收 + 一轮从未闭合验收已完成（第 8/9/10 轮）。</b>
+          测量链成立，但同一批数据暴露出事件约化的抖动缺陷，已修复；旧几何待重算回填。</div>
+        <div>复算脚本与隔离测试（10 项）已就绪，回填待执行。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">S0.2<br><span class="badge p0">当前门禁</span></div>
+        <div><b>固定协议连续 20 轮，拿到第一个真正的成功率。</b>
+          同一 checkpoint、同一起点、同一参数，中途不动任何设置；每轮如实评分并在备注里写清失败模式
+          （<code>push down</code> / 抓空 / 没对准 / 放置偏）。<b>漏评一轮就等于伪造分母。</b></div>
+        <div>只占机械臂时间，零代码。这是 S2/S3/S4 和 DAgger 共同的分母。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">S1<br><span class="badge todo">可并行</span></div>
+        <div><b>评测 005000–025000，确认 030000 是否平台期。</b>若 025000→030000 仍有斜率，直接续训是最低风险提升；若已平，转 S2/S3/S4。</div>
+        <div>GPU 约 3.3 小时；零代码、零训练、无人值守。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">S0.2<br><span class="badge done">08-31 完成</span></div>
+        <div><b>固定协议 20 轮：0 成功。</b>加上上午会话的 2/9，合计 <b>2/29 ≈ 7%</b>。
+          二元标签到此为止已经用尽——20 轮全是 <code>failure</code>，而它们其实断在三个完全不同的环节上。</div>
+        <div>这批数据的价值不在成功率，在于它证明了评分粒度不够。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">S0.4<br><span class="badge done">软件完成 · 待部署</span></div>
+        <div><b>阶段评分已落地：阶梯文件 → gateway 校验 → 页面下拉框 → 落点图色带，见第七节。</b>
+          评分面板现在问"走到了哪一步"和"卡在哪"，<code>outcome</code> 由阶段派生，不再能与它矛盾。</div>
+        <div>后端 349 项通过。<b>还没有同步到真机</b>——远端 gateway 未重启前，机上仍是旧的两个按钮。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">S0.3<br><span class="badge p0">修数据完整性</span></div>
+        <div><b>轨迹文件名带上会话标识，评分漏登要能看出来。</b>
+          目前换一个会话就会覆盖上一个会话的轨迹，且漏评分的一轮不留任何记录——
+          两者都直接损坏成功率批次的可信度。</div>
+        <div>小改动，但要赶在下一批 rollout 之前；否则这批数据也会被下一批覆盖。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">S6<br><span class="badge p0">当前门禁</span></div>
+        <div><b>DAgger：在 rollout 里加操作者接管，把失败态直接变成带标签的定向数据。</b>
+          两个前置条件都已满足：能跑出有意义 rollout 的 checkpoint（第 8/9 轮），以及 S0.2 的分母
+          （2/29 ≈ 7%）。闭合深度散布这条新证据（第七节）也把靶心指到了同一处，
+          而回放判别实验排除了坐标系漂移——这条散布没有更便宜的解释了。</div>
+        <div>代码不占机械臂。风险最高的一处改动——它改的是在动机械臂的控制环，见第八节。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">S5<br><span class="badge todo">可并行</span></div>
+        <div><b>归档 030000 与 holdout 评测脚本。</b>评测脚本目前仍在工作站 <code>/tmp</code>；任何模型/数据改动前先建立可回退锚点。</div>
+        <div>十几分钟。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">S2 / S3 / S4<br><span class="badge warn">等数据决策</span></div>
+        <div>只能由验收后的落点图选择；一次只动一个变量。</div>
+        <div>不要并行改 crop、yaw 权重和数据。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">S7<br><span class="badge warn">暂不启动</span></div>
+        <div><b>RL：用任务定义的回报去优化最后几毫米的精细操作，见第九节。</b>
+          触发判据不是日历，是一个可检验的量：<b>策略的散布已经收到 demo 的散布，而任务仍然失败。</b>
+          现在策略闭合深度 sd 9 mm vs demo 3.5 mm——还没到。</div>
+        <div>最便宜的一级（等级条件化 token）几乎免费，但需要 DAgger 先把正例补上。</div>
+      </div>
+    </div>
+
+    <div class="card full">
+      <h2>六、落点图如何决定下一条路</h2>
+      <div class="callout warn">
+        <b>下表的分档判据不能用 lift / held steps 去读。</b>
+        第 4、5 轮已经证明：peg 被推倒、没抓住，轨迹照样是 190 / 87 步握持加 67 / 79 mm 抬升。
+        <b>“握持很久且抬起来了”不构成 B/C 档的证据</b>，分档仍要靠操作者的评分与备注。
+        几何能提供的是闭合点在环带里的位置，以及成功轮之间的一致性，不是成败本身。
+      </div>
+      <div class="tablewrap">
+      <table>
+        <tr><th>观测</th><th>优先动作</th><th>原因</th><th>下一次判据</th></tr>
+        <tr>
+          <td>失败主要是 B 档，且落在 demo 环带内或集中于特定方位</td>
+          <td><span class="badge todo">S2</span> 腕部 crop 改接近 1:1</td>
+          <td>当前 letterbox 浪费有效视觉分辨率，直接命中最后几毫米</td>
+          <td>B 档比例下降；系统偏移/方位相关性收窄</td>
+        </tr>
+        <tr>
+          <td>主要是 C 档：能抓起，但插入相失败</td>
+          <td><span class="badge todo">S3</span> 分相位重算 yaw 预算与不可约方差</td>
+          <td>整段 <code>drz</code> 降权 0.2 可能压住了真正受约束的插入相</td>
+          <td>插入相绝对 yaw 误差（度）与 demo 容差可比；不再用近零分母 R²</td>
+        </tr>
+        <tr>
+          <td>失败集中在半径 &lt;56 mm、&gt;170 mm 或 79° 缺口</td>
+          <td><span class="badge todo">S4</span> 定向补数据</td>
+          <td>这是已知 OOD，不应算作环带内模型失败</td>
+          <td>只补对应盲区，不做无差别扩量</td>
+        </tr>
+        <tr>
+          <td>025000→030000 的 holdout 曲线仍明显上升</td>
+          <td>续训当前配方</td>
+          <td>训练预算未到平台；无需引入新假设</td>
+          <td>新 checkpoint 继续用同一 holdout 报告和同一真机落点协议</td>
+        </tr>
+      </table>
+      </div>
+    </div>
+
+
+
+    <div class="card full">
+      <h2>七、评分机制：阶段，不是分数</h2>
+
+      <h3>先问评分是给谁看的</h3>
+      <p>一个评分只有在<b>改变某个决策</b>时才有价值。这里有三个不同的决策，需要的东西并不一样：</p>
+      <ul>
+        <li><b>是否达标</b> —— 需要二元。</li>
+        <li><b>下一步修哪里</b> —— 需要知道在<b>哪一环</b>断的。</li>
+        <li><b>补什么数据 / 在哪接管</b> —— 需要知道当时的状态和原因。</li>
+      </ul>
+      <p>一个 1–5 的分数三样都服务不好。但一个<b>有序的阶段</b>同时服务前两样，因为"成功"不过是
+        "走到了最后一级"。</p>
+
+      <div class="callout ok">
+        <b>第一性原理：操作任务是一条前提链。</b>
+        每一环让系统获得一个<b>新的物理约束</b>，后面每一环都依赖它。
+        你观察到的五种情况本身就不是并列的类别，而是这条链上的断点，天然有序：
+        空抓（没建立接触）→ 推倒（接触了但约束没成立）→ 夹起没插进去（约束成立、目标没对上）
+        → 插一点歪了（目标约束部分满足）→ 完全插入。
+        <b>评分就是"走到的最远前提"。</b>
+      </div>
+
+      <h3>三条使用规则</h3>
+      <ul>
+        <li><b>不要求平均。</b>阶段是序数不是间距量：2→3 跨越的是"约束成立与否"，4→5 跨越的是"精度够不够"，
+          两者不可通约，"平均分 3.2"没有意义。</li>
+        <li><b>报告方式是漏斗</b>——达到 ≥ 每一级的比例。二元成功率只是 <em>k</em> = 末级的那一格。</li>
+        <li><b>相邻两级之间流失最多的那一格，就是下一个工作项。</b>
+          这正是第六节的分档表一直想做、但用 lift / held steps 做不到的事。</li>
+      </ul>
+
+      <h3>通用阶梯：换任务时不重新设计评分，只写这条链</h3>
+      <div class="tablewrap">
+      <table>
+        <tr><th>#</th><th>阶段</th><th>判据（与任务无关的表述）</th><th>本任务</th><th>换成「开抽屉」</th><th>换成「倒水」</th></tr>
+        <tr><td class="num">0</td><td>未接近</td><td>末端从未进入物体邻域</td><td>没到销附近</td><td>没够到把手</td><td>没够到杯子</td></tr>
+        <tr><td class="num">1</td><td>接近</td><td>进入邻域，未建立接触</td><td>离销一段距离空抓</td><td>停在把手外</td><td>停在杯外</td></tr>
+        <tr><td class="num">2</td><td>接触</td><td>建立接触，但未形成可承载的约束</td><td>闭合时把销推倒</td><td>碰到把手但滑脱</td><td>碰倒杯子</td></tr>
+        <tr><td class="num">3</td><td>获取</td><td>物体随末端一起运动</td><td>夹起来了</td><td>握住把手</td><td>抓稳杯子</td></tr>
+        <tr><td class="num">4</td><td>转移</td><td>保持约束到达目标邻域</td><td>带到孔上方</td><td>拉开一段</td><td>移到目标杯上方</td></tr>
+        <tr><td class="num">5</td><td>目标接触</td><td>与目标建立约束，部分满足</td><td>插进去一点 / 歪了</td><td>拉到一半</td><td>倒出一部分</td></tr>
+        <tr><td class="num">6</td><td>约束满足</td><td>目标约束完全满足</td><td>完全插入</td><td>完全拉开</td><td>倒完</td></tr>
+        <tr><td class="num">7</td><td>释放稳定</td><td>撤出后约束仍然满足</td><td>松爪后销留在孔里</td><td>松手后不回弹</td><td>放回杯子</td></tr>
+      </table>
+      </div>
+      <div class="callout ok">
+        <b>为什么这套换个任务还有效：阶段边界不是拍脑袋定的，是"接触集合发生变化的时刻"。</b>
+        自由运动 → 与物体接触 → 约束成立（物体随末端运动）→ 与目标接触 → 约束满足 → 释放。
+        这几个时刻可以直接从一条 demo 里读出来，因此<b>新任务 = 写一份阶梯定义，不改代码</b>。
+        没有某一级的任务（例如无抓取的擦拭）就声明它不存在——阶梯是该任务前提链的最长前缀。
+      </div>
+
+      <h3>三个正交轴，不要塞进一个数</h3>
+      <div class="tablewrap">
+      <table>
+        <tr><th>字段</th><th>是什么</th><th>为什么不能并进 stage</th></tr>
+        <tr><td><code>stage</code></td><td>走到哪一级（序数）</td><td>—</td></tr>
+        <tr><td><code>blocker</code></td><td>卡住的原因：位姿偏移 / 策略动作 / 硬件 / 人为早停 / 起点 OOD</td>
+          <td><b>同一级可以因不同原因失败</b>，混在一起会把两个不同的工作项算成一个</td></tr>
+        <tr><td><code>inDistribution</code></td><td>起点与物体位姿是否在 demo 覆盖内</td>
+          <td>分布外的失败不是模型的失败；本页已有 &lt;56 mm / &gt;170 mm / 79° 缺口这条判据</td></tr>
+      </table>
+      </div>
+
+      <h3>谁来打分：机器先填它能证明的，人只答它证明不了的</h3>
+      <p>这是第四节结论的直接后果——轨迹分不清"抓到"和"抓空"，所以边界必须显式画出来，
+        而不是藏在一个 success 按钮后面：</p>
+      <ul>
+        <li>阶段 ≤1（是否进入物体邻域）<b>轨迹能证明</b> → 自动预填。</li>
+        <li>阶段 ≥3（约束是否成立）<b>当前传感器证明不了</b> → 必须人答。</li>
+        <li>表单只问机器答不了的那部分，操作者多点一次，换来的是可机读的漏斗。</li>
+      </ul>
+      <div class="callout p0">
+        <b><code>outcome</code> 应当从 <code>stage</code> 派生，而不是与它并列</b>
+        （<code>success ⟺ stage == 末级</code>）。现在两者独立，可以互相矛盾：
+        本批 20 轮全部标成 <code>failure</code>，其中第 17 轮实际已经把销插进孔里一部分，
+        这条信息只活在自由文本里。
+      </div>
+
+      <h3>用备注反推本批 20 轮的漏斗</h3>
+      <div class="tablewrap">
+      <table>
+        <tr><th>阶段</th><th>达到 ≥ 该级</th><th>本级流失</th><th>对应备注</th></tr>
+        <tr><td>1 接近</td><td class="num">20 / 20</td><td class="num">—</td><td>全部</td></tr>
+        <tr><td>2 接触</td><td class="num">17 / 20</td><td class="num">−3</td><td>grasped empty ×2、approach not grasp ×1</td></tr>
+        <tr><td>3 获取</td><td class="num">9 / 20</td><td class="num"><b>−8</b></td><td>push down ×8</td></tr>
+        <tr><td>4 转移到位</td><td class="num">9 / 20</td><td class="num">0</td><td>—</td></tr>
+        <tr><td>5 目标接触</td><td class="num">1 / 20</td><td class="num"><b>−8</b></td><td>lift … not insert ×8</td></tr>
+        <tr><td>6 完全插入</td><td class="num">0 / 20</td><td class="num">−1</td><td>inserted but not fully ×1</td></tr>
+      </table>
+      </div>
+      <div class="callout warn">
+        <b>两个瓶颈一样大，各吃掉 8 轮：闭合时把销推倒，以及抓起来之后插不进去。</b>
+        二元成功率 0/20 完全看不出这一点，而这两条指向的是完全不同的工作项
+        （前者是抓取位姿，后者是插入相 yaw 与精度）。
+        <br><b>同时这张表也说明了为什么要现场评而不是事后反推：</b>
+        "grasped empty" 的两轮到底碰没碰到销，备注里读不出来，卡在 1 还是 2 无法判定。
+        现场一个单选就没有这个歧义。
+      </div>
+
+      <div class="callout p0">
+        <b>关于"夹爪 TCP 与销有偏移量"这个假设：现有数据无法验证。</b>
+        本批闭合点 x 极差 103 mm、y 极差 205 mm——peg 每轮不在同一位置，
+        所以"推倒组 vs 抓起组 Δy = −63.5 mm"几乎肯定是 peg 位置差异，不是 TCP 偏移。
+        要测偏移需要物体位姿，而那正是第四节的测量缺口。
+        <b>便宜的替代：把"销朝哪个方向倒"作为 <code>blocker=位姿偏移</code> 时的一位补充观测</b>——
+        系统性偏移会让方向一致，随机误差不会。这恰好是评分应该承担的角色：
+        <b>只记录轨迹证明不了、而人不花额外成本就能看见的东西。</b>
+      </div>
+
+      <h3>闭合高度：2→3 那 8 轮流失的一个可测候选原因</h3>
+      <p>把 48 条训练 demo 的抓取点和本批 20 条轨迹放进<b>同一个量</b>里比。轨迹留档的
+        <code>ee.z</code> 采自 <code>absolute_state_observation</code>，正是数据集
+        <code>observation.state</code> 的那一维，两边不需要任何换算：</p>
+      <div class="tablewrap">
+      <table>
+        <tr><th>群体</th><th>n</th><th>闭合时 ee.z 中位数</th><th>范围 / 标准差</th></tr>
+        <tr><td>48 条 demo 的抓取</td><td class="num">48</td><td class="num"><b>50.2 mm</b></td><td class="num">sd 3.5 mm</td></tr>
+        <tr><td>抓住了（stage ≥ 3）</td><td class="num">9</td><td class="num"><b>60.1 mm</b></td><td class="num">49.5 – 78.0 mm</td></tr>
+        <tr><td>闭合了但没抓住</td><td class="num">7</td><td class="num"><b>50.2 mm</b></td><td class="num">48.9 – 64.6 mm</td></tr>
+      </table>
+      </div>
+      <p>三条支撑事实，用来挡掉三种平凡解释：</p>
+      <ul>
+        <li><b>不是桌面不平。</b>用 <code>x, y</code> 拟合平面只能解释 demo 抓取高度 11% 的方差
+          （残差 sd 3.3 mm vs 总 sd 3.5 mm），所以 50.2 mm 是一个与桌面位置基本无关的常数。</li>
+        <li><b>不是"停在半路"，而是下降深度本身不同。</b>策略和 demo 一样都是降到底再闭合
+          （闭合点比该轮自身最低点高 0.0–1.2 mm，demo 中位 0.2 mm）。闭合高度 = 下降深度。</li>
+        <li><b>深度把结果分开了。</b>闭合高度 ≥ 58 mm 的 8 轮里 7 轮抓住；&lt; 58 mm 的 8 轮里只有 2 轮抓住
+          （Fisher p ≈ 0.04，<b>n = 16</b>）。</li>
+      </ul>
+      <p>策略这一维的散布 sd ≈ 9 mm，是 demo 的 <b>2.6 倍</b>。上一条 callout 说"现有数据无法验证 TCP 偏移"仍然成立
+        ——这里量到的是<b>深度的散布</b>，不是偏移的方向，两者不是一回事。</p>
+
+      <div class="callout ok">
+        <b>两种机制会产生一模一样的日志特征，光看日志分不开——判别实验已经把它们分开了。</b>
+        <ul>
+          <li><b>(a) 坐标系/标定漂了。<span class="badge done">已证伪</span></b>
+            数据集是 3 月录的，仓库里有 <code>tools/fr3/fr3_migrate_tool_frame.py</code>，工具坐标系被迁移过；
+            若 TCP 定义变过，同一个"50 mm"对应的物理高度就不同。
+            <b>但留档轨迹在今天的真机上原样重播，仍然复现得出抓取</b> —— 记录里的 z 在当前运行时下
+            依旧指向录制时那个物理高度。<b>没有一个运行时常数在等着被修。</b></li>
+          <li><b>(b) 策略的 z 自身就噪。<span class="badge warn">保留</span></b>那是数据分布问题，属于 DAgger。</li>
+        </ul>
+        判据是本页原先就写下的那一条：<code>fr3_das_replay_real.py --episode N</code> 把某条 demo 原样回放、
+        peg 摆回那一集记录的位置，看夹爪是否干净夹住。<b>夹住 → (a) 被排除</b>；和策略一样推倒 → (a) 成立。
+        实测是前者。
+        <br><span class="small">证据边界：与本页其他真机结论同级——来自操作者对回放的观察，
+        没有留下机器可读的抓后确认（那正是第四节的测量缺口）。</span>
+      </div>
+
+      <div class="callout ok">
+        <b>取 (b)：策略 z 自身噪声。<span class="badge done">已判别</span>判别实验做过了，(a) 出局。</b>
+        这一条原先写的是<b>判断而不是结论</b>，写在这里是为了它被证伪时能被找到；被证伪的是它的对手。
+        现在的位置与代价：
+        <ul>
+          <li>散布本身 (sd 9 mm vs demo 3.5 mm) 是一个常数偏移解释不了的量：一个 +10 mm 的补偿把整条分布抬上去，
+            <b>宽度不变</b>，低尾那几轮照样闭合过浅。(a) 出局之后，连均值那一半也没有别的候选了。</li>
+          <li>失败恰好发生在 policy 自己走出去的状态上，而这正是 DAgger 的靶心（第八节）。</li>
+          <li><b>原先记在这里的代价已经消失</b>——"若 (a) 其实成立，DAgger 会花几十次接管去学一个本该由一行常数
+            修掉的偏置"，这个风险随判别实验一起结清了。</li>
+        </ul>
+        <b>仍要留一句：排除 (a) 不等于直接证实 (b)。</b>它只是把二选一里的另一支拿掉；
+        (b) 依旧是推论，真正证实它的会是 DAgger 之后散布是否收窄。
+      </div>
+
+      <div class="callout warn">
+        <b>顺带一条：第 2、8、9、15 轮夹爪指令<b>从未闭合</b>，其中三轮的备注却是 push down。</b>
+        也就是说销是在<b>接近过程中被撞倒的</b>，不是闭合时被挤倒的。这两件事现在都折在 stage 2 里，
+        但它们指向不同的工作项（接近轨迹 vs 闭合位姿）。下一批评分时 <code>blocker</code> 要能把它们分开。
+      </div>
+
+      <div class="callout warn">
+        <b>下一批 rollout 请把 peg 固定在同一个位置。</b>
+        本批闭合点 x 极差 103 mm、y 极差 205 mm，闭合高度彼此不可比；固定位置之后，
+        散布才是策略的散布，而不是摆放的散布。10 轮即可。
+      </div>
+
+      <h3>落地形状（已实现）</h3>
+      <div class="flow">{"outcome": "failure",          // 派生：stage == terminal 才是 success
+ "taskLadder": "insert_peg",
+ "stage": 2, "stageId": "contact", "terminalStage": 7,
+ "blocker": "object_pose_offset",
+ "inDistribution": true,
+ "note": "闭合时推倒，销向 +y 倒"}</div>
+      <div class="tablewrap">
+      <table>
+        <tr><th>文件</th><th>作用</th></tr>
+        <tr><td><code>tools/fr3/task_ladders/insert_peg.yaml</code></td>
+          <td>本任务的阶梯：选用哪几级、每级在这个任务里长什么样、哪级算成功、有哪些 blocker。
+            <b>换任务加一个文件，不改代码。</b></td></tr>
+        <tr><td><code>tools/data_collection_gui/task_ladders.py</code></td>
+          <td>共享词表（7 级阶段 + 7 类 blocker）、阶梯加载与校验、<code>normalize_grade</code>、
+            <code>stage_funnel</code></td></tr>
+        <tr><td><code>checkpoints.append_rollout_outcome</code></td>
+          <td>写入前派生 <code>outcome</code> 并校验；未评级的记录一个字段都不加</td></tr>
+        <tr><td><code>gateway._record_rollout_outcome</code></td>
+          <td>透传评级字段；校验失败返回 <code>ok:false</code> 并记日志，而不是抛 500</td></tr>
+        <tr><td><code>fr3_backfill_rollout_stages.py</code></td>
+          <td>把 08-31 两批的自由文本备注按一张显式对照表迁移成阶段；对不上的备注直接中止</td></tr>
+      </table>
+      </div>
+      <p>被拒绝的写入（各有回归测试）：阶段与 <code>outcome</code> 矛盾；没有阶梯却给了 stage；
+        本任务没有的阶段；词表外的 blocker；阶梯用了共享词表以外的阶段名；
+        <code>terminal</code> 低于最后一级；task id 带路径分隔符。
+        <code>operator_stop</code> 与 <code>unknown</code> 任何阶梯都不得禁用——
+        任何任务都可能被人中止，也都可能出现说不清原因的一轮。</p>
+      <ul>
+        <li><b>旧记录没有 <code>stage</code> 即"未评级"</b>，成功率仍可从 <code>outcome</code> 算。
+          注意 stage 0 是一个真实评级（"从未接近物体"），所以缺省绝不能填 0。</li>
+        <li><b><code>terminalStage</code> 存进记录本身</b>，而不是读取时查表：
+          落点图要画"走了多远"就必须知道链条到哪结束，而且一条评级应当永远保持它做出时的含义，
+          即使阶梯后来加了一级。</li>
+        <li><b>落点图按阶段上色</b>：用连续色带而不是分类色板——<code>stage</code> 是序数，
+          "走了多远"必须能直接从颜色读出来。<code>aborted</code> 与未评级留在色带之外，
+          否则会被眼睛算进色带本来要统计的那一批里。色带按位置采样，
+          所以四级的任务和七级的任务都跑满整条带。</li>
+        <li>与 DAgger 共用同一套阶段定义：<b>接管发生在哪一级，就是那一级是瓶颈的直接证据</b>，
+          不需要另一套标签体系。</li>
+      </ul>
+      <div class="callout warn">
+        <b>迁移过来的 20 轮，<code>blocker</code> 一律是 <code>unknown</code>。</b>
+        备注说的是发生了什么，不是为什么。补一个操作者当时没给的归因，
+        等于往"用来区分工作项"的那个字段里塞进凭空造出来的证据。这个字段从下一批开始才有信息。
+      </div>
+    </div>
+
+    <div class="card full">
+      <h2>八、DAgger：把失败态变成定向数据</h2>
+      <p>
+        <a href="./fr3_multi_policy_training_roadmap.html">多策略路线图</a>把 DAgger 排在 Phase 5，理由是
+        它的价值来自「用专家纠正 policy <em>自己走到的</em> state 分布」，因此必须先有一个能跑出有意义
+        rollout 的 checkpoint，否则只会退化成普通遥操作采集。<b>那个前置条件现在成立了</b>：030000 的第
+        8、9 轮是完整成功的 rollout。
+      </p>
+
+      <h3>为什么它在本页值得排到 S2/S3/S4 前面</h3>
+      <ul>
+        <li><b>失败模式正好是它的靶心。</b>push down、抓空、提前松手都发生在物体前几厘米，是 policy
+          自己走出去的状态。离线再补 demo 覆盖不到这些点——demo 里根本不存在"已经把 peg 推歪之后"的画面。</li>
+        <li><b>它顺带解决了本页最难的一条。</b>第四节的结论是几何分不清"抓到"和"抓空"，成败只能靠人评。
+          而<b>接管这个动作本身就是人给的、无歧义的标签，并且自带当时的 state 和正确动作</b>。
+          同一次操作同时回答了"哪一步错了"和"应该怎么做"，这是评分表给不了的。</li>
+        <li><b>数据效率。</b>定向纠正 20 次接管，覆盖的是分布里真正稀缺的那一段；无差别再采 50 条 demo
+          仍然只是加厚已经会做的部分。</li>
+      </ul>
+
+      <h3>要动的位置</h3>
+      <div class="tablewrap">
+      <table>
+        <tr><th>改动点</th><th>位置</th><th>内容</th></tr>
+        <tr>
+          <td>接管键</td>
+          <td><code>InteractiveRolloutKeyboard</code>（runtime:1343）</td>
+          <td>与 start / stop / home / quit 同一监听线程里增加接管键，进入与退出都要在 end marker 上留痕</td>
+        </tr>
+        <tr>
+          <td>专家动作源</td>
+          <td><code>lerobot.teleoperators.spacemouse</code></td>
+          <td>录制器已在用同一套（<code>fr3_gui_record_runtime.py:69</code>）；推理侧目前<b>零引用</b>，需要引入</td>
+        </tr>
+        <tr>
+          <td>单一钳制路径</td>
+          <td>runtime:3594–3644</td>
+          <td>策略动作与遥操动作必须走同一套 step / leash 钳制，否则交接的那一步本身就是越界</td>
+        </tr>
+        <tr>
+          <td>段落标注</td>
+          <td><code>RolloutGeometryTrace</code>（runtime:2348）</td>
+          <td>接管起止 step 与抓取/释放事件同源归档，落在同一条 end marker 上，避免第二条会走样的通道</td>
+        </tr>
+        <tr>
+          <td>数据写出</td>
+          <td>录制器的 <code>LeRobotDataset</code>（record_runtime:799 / 820）</td>
+          <td>接管段按 episode 写出并带 <code>is_intervention</code>，训练侧只在专家动作上回归</td>
+        </tr>
+      </table>
+      </div>
+
+      <div class="callout warn">
+        <b>这是本链路上风险最高的一处代码改动：它直接改推理控制环，而这个环在动机械臂。</b>
+        <ul>
+          <li>两个动作源共用一套钳制与 leash，交接不限速就是一次阶跃。</li>
+          <li>接管期间夹爪也要能遥操，否则最该接管的抓取瞬间恰好接管不了。</li>
+          <li>DAgger 数据与 demo 的混合比例是一个<b>新变量</b>，必须记录；否则它和"一次只动一个变量"直接冲突。</li>
+          <li>先在 MuJoCo 后端把交接跑通，再上真机。</li>
+        </ul>
+      </div>
+      <div class="callout ok">
+        <b>优先级结论：S6 现在是当前门禁。</b>它原来的两个前置条件都已满足——
+        S0.2 的分母已经拿到（2/29 ≈ 7%），阶段评分也已落地，接管发生在哪一级可以直接记成那一级的证据。
+        第七节新量到的闭合深度散布进一步指向同一处：<b>失败发生在 policy 自己走出去的状态上</b>，
+        而这正是离线补 demo 覆盖不到的那一段。
+        <br>仍然成立的约束：<b>DAgger 数据与 demo 的混合比例是一个新变量，必须记录</b>；
+        并且先在 MuJoCo 后端把交接跑通再上真机。
+      </div>
+    </div>
+
+    <div class="card full">
+      <h2>九、RL：什么时候值得上，为什么现在不是</h2>
+
+      <div class="callout ok">
+        <b>判据先行：当策略的散布已经收到示教的散布，而任务仍然失败时，才轮到 RL。</b>
+        这不是一个日历上的时间点，是一个可以直接从数据里读出来的量。
+      </div>
+
+      <h3>为什么是这条判据</h3>
+      <p>模仿类方法（BC、DAgger）的上限是<b>示教者本人的精度</b>——标签就是人的动作，学得再好也只是把人的手复制过来。
+        这个上限是可以被量出来的：本任务 48 条 demo 的闭合深度 sd 是 <b>3.5 mm</b>，那就是 spacemouse 操作者
+        在最后几毫米上的抖动。<b>如果精细操作的目标严于这个数，模仿在原理上就到不了</b>，
+        因为标签自己没那么准。RL 用的是任务定义的回报而不是人的动作，因此<b>可以超过示教者</b>——
+        这是它唯一不可替代的性质，也是唯一值得为它付代价的理由。</p>
+      <div class="tablewrap">
+      <table>
+        <tr><th>量</th><th>现在</th><th>触发线</th><th>读法</th></tr>
+        <tr><td>闭合深度散布</td><td class="num">策略 sd <b>9 mm</b></td><td class="num">≈ demo sd <b>3.5 mm</b></td>
+          <td><b>策略比数据本身还差 2.6 倍</b>——它还没学会数据里已经有的东西</td></tr>
+        <tr><td>成功率</td><td class="num">2 / 29 ≈ 7%</td><td class="num">模仿收敛后仍不达标</td>
+          <td>此时失败才归因于"人也做不到那么准"，而不是"没学到"</td></tr>
+      </table>
+      </div>
+      <div class="callout p0">
+        <b>所以现在上 RL 是用最贵的方法去补最便宜的差距。</b>
+        当策略的散布还是示教的 2.6 倍时，缺的是模仿，不是超越示教。
+      </div>
+
+      <h3>三个硬前置条件，缺一不可</h3>
+      <ul>
+        <li><b>自动回报——这是最大的一个，而第四节已经证明现在没有。</b>
+          轨迹分不清"抓到"和"抓空"，成败只能来自操作者。人评 = 每个 episode 按一次按钮 =
+          上限几百个 episode，而 RL 要 10²–10⁴。<b>需要新观测</b>：腕部相机的抓后确认、
+          夹爪宽度 + 力阈值、或放置后的物体位姿。
+          <b>这项工作在第四节里本来就是独立列出的，它不只服务 RL。</b></li>
+        <li><b>自动复位。</b>现在 peg 靠人摆回去。没有自动复位，"多试几次"就等于"多摆几次"，
+          于是 RL 的样本成本被人力锁死。</li>
+        <li><b>安全的探索边界。</b>RL 会主动试探没试过的动作，真机上这要求钳制、力限与自动急停先成立。
+          好消息是第八节的"单一钳制路径"就是同一件事，两条路线共用。</li>
+      </ul>
+
+      <h3>四级阶梯，按代价排序</h3>
+      <div class="tablewrap">
+      <table>
+        <tr><th>级</th><th>做法</th><th>环境交互</th><th>回报从哪来</th><th>何时</th></tr>
+        <tr>
+          <td class="num">R1</td>
+          <td><b>等级条件化 token</b>：把第七节的 <code>stage</code> 序数当作 return，
+            作为一个条件 token 送进策略；训练时喂全部数据（含失败），推理时请求最高等级</td>
+          <td>零，只用已采数据</td>
+          <td><b>已经有了</b>——stage 本身就是标量回报</td>
+          <td>DAgger 数据到位后立刻可试</td>
+        </tr>
+        <tr>
+          <td class="num">R2</td>
+          <td>离线 RL / advantage-weighted regression，同一批数据</td>
+          <td>零</td><td>同上</td><td>R1 有效但不够时</td>
+        </tr>
+        <tr>
+          <td class="num">R3</td>
+          <td>仿真里在线 RL 微调，再迁移</td>
+          <td>MuJoCo</td><td>仿真里可自动算</td><td>愿意付 sim2real 差距时</td>
+        </tr>
+        <tr>
+          <td class="num">R4</td>
+          <td>真机在线 RL</td>
+          <td>真机 10²–10⁴ episode</td><td>必须自动，见上一节</td><td>前三级都不够时</td>
+        </tr>
+      </table>
+      </div>
+      <div class="callout ok">
+        <b>R1 几乎是免费的，而且它的前置条件恰好是第七节刚落地的东西。</b>
+        阶段评分把每一条 rollout 变成了一个<b>有序标量</b>——那正是 return 的定义。
+        所以在这条路线上，"上 RL"的第一级不是一个遥远的大工程，只是训练时多喂一个 token。
+        代价是一次重训，因此它排在"先不要改权重"这条约束之后。
+      </div>
+
+      <h3>为什么不能跳过 DAgger 直接做 R1</h3>
+      <p>条件化 token 要学会"高等级长什么样"，前提是<b>高等级和低等级出现在同一片 state 分布里</b>。
+        现在 29 轮里只有 2 轮成功，正例几乎不存在，token 学到的会是"等级 = 这一小撮特定初始位姿"，
+        而不是"等级 = 动作更准"。DAgger 的接管数据补的恰好是这一段：<b>同一个失败态上，
+        既有策略走错的动作，也有人纠正后的动作</b>。所以这个顺序不是偏好，是数据结构决定的。</p>
+
+      <div class="callout warn">
+        <b>一个反向的代价，要在动手前想清楚：一旦评分进入损失函数，它就不再只是诊断。</b>
+        R1/R2 会把 <code>stage</code> 从"给人看的漏斗"变成训练信号。
+        那时漏评、误评不再只是让分母失真，而是<b>直接改变学到的策略</b>。
+        因此要上 R1，第七节那条"每轮必评、<code>blocker</code> 如实填"就从建议变成硬要求，
+        而且需要先做一次评分一致性检查（同一批 rollout 两个人独立评，看分歧率）。
+      </div>
+
+      <div class="callout p0">
+        <b>优先级结论：S7，排在 S6 之后，现在不启动。</b>
+        但其中一项前置工作<b>应当提前开始</b>——<b>自动成败判定</b>（腕部相机抓后确认 / 夹爪宽度 + 力）。
+        它同时解决三件事：第四节的测量缺口、评分的人力成本、以及 RL 的回报来源。
+        它不改权重、不改控制环，是这张表上少见的"三条路线共用"的投入。
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>十、当前不要重开的方向</h2>
+      <ul>
+        <li>不给 language model / vision tower 加 LoRA：信息已完好到达 KV cache。</li>
+        <li>不靠提高 <code>num_inference_steps</code> 缩散布：它只改变 ODE 积分精度。</li>
+        <li>不做推理端多采样平均：在线成本过高，且 B/C 首要问题是条件均值精度。</li>
+        <li>不动 <code>rtc_execution_horizon</code>：全量训练后“首步最差”已经自愈。</li>
+        <li>不基于 <code>drz</code> R² 再调权重：先换成绝对角度误差。</li>
+        <li><b>不要给 <code>z</code> 加一个常数补偿来"修"闭合过浅。</b>
+          回放判别实验已经排除了坐标系漂移，没有一个偏置在等着被补；而常数本来也解释不了散布：
+          +10 mm 只是把分布整体抬高，sd 9 mm 不变，低尾照样闭合过浅。按 (b) 走 DAgger。</li>
+        <li><b>不要现在上 RL。</b>策略的散布还是示教的 2.6 倍，缺的是模仿不是超越示教；
+          且自动回报尚不存在，见第九节。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>十一、文档边界</h2>
+      <p>本页只回答三个问题：</p>
+      <ol>
+        <li>现在已经知道什么；</li>
+        <li>当前唯一门禁是什么；</li>
+        <li>下一项改动由什么证据触发。</li>
+      </ol>
+      <p>需要复查 L0–L4 数字、被撤销的 P0.1 结论、alpha 根因、方法论错误或完整证伪表时，查
+        <a href="./fr3_grasp_baseline_experiment_log.html">实验档案</a>。</p>
+    </div>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,1800 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FR3 抓取 Baseline 实验档案</title>
+<style>
+  :root{
+    --bg:#f7f8fa;
+    --panel:#ffffff;
+    --text:#1f2937;
+    --muted:#64748b;
+    --line:#e5e7eb;
+    --blue:#2563eb;
+    --blue-bg:#eff6ff;
+    --green:#15803d;
+    --green-bg:#ecfdf5;
+    --amber:#b45309;
+    --amber-bg:#fffbeb;
+    --red:#991b1b;
+    --red-bg:#fef2f2;
+    --shadow:0 10px 28px rgba(15,23,42,.06);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    line-height:1.62;
+  }
+  a{color:var(--blue)}
+  .wrap{max-width:1180px;margin:0 auto;padding:34px 22px 72px}
+  .hero{
+    background:#111827;
+    color:#f9fafb;
+    border-radius:18px;
+    padding:32px 34px;
+    box-shadow:var(--shadow);
+    margin-bottom:20px;
+  }
+  .hero h1{margin:0 0 10px;font-size:30px;line-height:1.22;letter-spacing:0}
+  .hero p{margin:8px 0;color:#d1d5db}
+  .meta{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}
+  .pill{
+    display:inline-flex;
+    align-items:center;
+    padding:5px 10px;
+    border-radius:999px;
+    border:1px solid rgba(255,255,255,.18);
+    color:#e5e7eb;
+    font-size:13px;
+    font-weight:650;
+  }
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+  .card{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:14px;
+    padding:20px;
+    box-shadow:var(--shadow);
+  }
+  .full{grid-column:1/-1}
+  h2{font-size:22px;margin:0 0 12px}
+  h3{font-size:18px;margin:18px 0 8px}
+  p{margin:8px 0}
+  ul,ol{margin:8px 0 0 22px;padding:0}
+  li{margin:5px 0}
+  code,.mono{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+    background:#f3f4f6;
+    border-radius:6px;
+    padding:2px 5px;
+    font-size:.92em;
+  }
+  .hero code,.hero .mono{background:rgba(255,255,255,.12);color:#fff}
+  .badge{
+    display:inline-block;
+    padding:3px 8px;
+    border-radius:999px;
+    font-size:12px;
+    font-weight:750;
+    white-space:nowrap;
+  }
+  .done{color:var(--green);background:var(--green-bg)}
+  .todo{color:var(--blue);background:var(--blue-bg)}
+  .warn{color:var(--amber);background:var(--amber-bg)}
+  .p0{color:var(--red);background:var(--red-bg)}
+  .section-head{
+    display:flex;
+    justify-content:space-between;
+    gap:12px;
+    align-items:flex-start;
+    margin-bottom:8px;
+  }
+  .small{font-size:13px;color:var(--muted)}
+  .callout{
+    margin:12px 0;
+    border-left:4px solid var(--blue);
+    background:var(--blue-bg);
+    border-radius:10px;
+    padding:12px 14px;
+  }
+  .callout.warn{border-color:var(--amber);background:var(--amber-bg)}
+  .callout.p0{border-color:var(--red);background:var(--red-bg)}
+  .callout.ok{border-color:var(--green);background:var(--green-bg)}
+  .table{width:100%;border-collapse:collapse;font-size:14px}
+  .table th,.table td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  .table th{background:#f9fafb;color:#111827}
+  .table td.num{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+  .phase{
+    display:grid;
+    grid-template-columns:150px 1fr 200px;
+    gap:14px;
+    padding:14px 0;
+    border-top:1px solid var(--line);
+  }
+  .phase:first-of-type{border-top:none}
+  .phase .name{font-weight:800;color:#111827}
+  .gate{
+    border:1px dashed #9ca3af;
+    background:#fff;
+    border-radius:10px;
+    padding:10px 12px;
+    margin-top:10px;
+  }
+  .flow{
+    white-space:pre;
+    overflow:auto;
+    max-width:100%;
+    background:#0f172a;
+    color:#e5e7eb;
+    border-radius:12px;
+    padding:14px;
+    font-size:13px;
+  }
+  .tablewrap{overflow-x:auto;max-width:100%}
+  .strike{text-decoration:line-through;color:var(--muted)}
+  @media (max-width:860px){
+    .grid{grid-template-columns:1fr}
+    .full{grid-column:auto}
+    .phase{grid-template-columns:1fr}
+    .hero{padding:26px 22px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <h1>FR3 抓取 Baseline 实验档案</h1>
+    <p><b>档案说明：</b>本页保存截至 2026-08-31 的完整实验链、被推翻的结论、方法论复盘与原始判据，
+    供追溯证据使用；它不是当前执行入口。当前状态与下一步只看
+    <a href="./fr3_grasp_baseline_roadmap.html">FR3 抓取 Baseline Roadmap</a>。</p>
+    <p><b>08-31 六次更新：S0 的软件链路已经落地——逐步轨迹、抓取/释放/最低接近点、demo 环带底图与一键评分已贯通；同时补上交互式多轮 rollout 的会话内归位。自动验收为后端 116 项、前端 123 项与生产构建通过，当前门禁是真机双轮端到端验收，尚不能把“代码完成”当成“新样本已采到”。见第一之三之九节 S0/S0.1。</b><b>08-31 四次更新：第 5 层真机 rollout 首轮跑完——030000 的泛化在真机上成立，夹爪懂得去找物体；失败模式整体换了一类，从「没条件化」变成「条件化的精度不够」。阶段性成功经验与后续提升路线见第一之三之八、一之三之九节。</b><b>08-31 三次更新：第 4 层已跑完——全量 48 条 + 逐维权重，留出集上三个平移维全线上涨、「首步最差」自愈；离线这条线走完了，下一步是真机 rollout，见第一之三之七节。</b><b>08-28 二次更新：L3／L4 已跑完——泛化不是瓶颈，绑定约束是容量；下一步是全量 50 条重训，权重见第一之三之六节。</b><b>08-28：P0.1 的「结构性缺陷」结论已收回；三个方法论错误已写入第一之四节。</b><b>08-27：P0 阶梯已跑，根因之一定位到归一化尺度 —— 见第一之二节。</b>迭代一周未打通。本文不再在同一条线上加参数，而是从第一性原理拆开「行为克隆要成立必须同时满足什么」，把每个前提变成一个<b>便宜、可判定</b>的实验，按依赖顺序排列。已完成的采集 / QC / Training View / 部署 infra 不重复描述，只列其中的<b>优化空间</b>。</p>
+    <div class="meta">
+      <span class="pill">当前 ckpt: L4_full48_holdout22_40 / 030000</span>
+      <span class="pill">真机首轮：A 抓起+插入 / B 只接近 / C 插不准</span>
+      <span class="pill">失败模式换类：不是没条件化，是精度不够</span>
+      <span class="pill">S0 软件链路完成：后端 116 + 前端 123 项通过</span>
+      <span class="pill">当前门禁：真机双轮闭环验收 + 积累带落点样本</span>
+      <span class="pill">会话内归位已补：自动测试通过，待真机回归</span>
+      <span class="pill">demo 插入实测 69.8±11.9 mm（+1.0 mm 是错指标）</span>
+      <span class="pill">view: 50 ep / 24945 帧 / 30 fps</span>
+      <span class="pill">state 8 维 · action 5 维</span>
+      <span class="pill">可训练参数 2.57M → 27.86M（0.06% → 0.67%）</span>
+      <span class="pill">当前 030000 loss 0.123（历史基线 0.030）</span>
+      <span class="pill">P0.2 通过：信息完好抵达 KV cache</span>
+      <span class="pill">L2 通过：绑定约束是可训练容量／强度</span>
+      <span class="pill">L3 通过：泛化不是瓶颈（train/holdout 区分消失）</span>
+      <span class="pill">L4：drz 占 32% 预算，85% 学不掉 → 权重 0.2</span>
+      <span class="pill">第 4 层通过：留出集 dx +0.40／+0.61，dy +0.70／+0.66</span>
+      <span class="pill">「首步最差」自愈 → RTC 隐患撤销</span>
+      <span class="pill">dx 只跟 x 行程走：4 次独立复现</span>
+      <span class="pill">未收口：drz 的 R² 已失效，需换角度误差</span>
+      <span class="pill">五条必要条件全部已验证</span>
+      <span class="pill">P0.1「管线有结构性缺陷」已收回</span>
+      <span class="pill">根因之一：归一化尺度（5/5 单调 ×2）</span>
+      <span class="pill">08-28：三个方法论错误已归档</span>
+    </div>
+  </div>
+
+  <div class="grid">
+
+    <!-- ============================================ 现状 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>一、08-27 历史基线：会的都是不用看图的，不会的都是必须看图的</h2>
+        <span class="badge warn">历史快照，已被第 5 层改写</span>
+      </div>
+      <div class="callout ok">
+        <b>当前结论（08-31）：本节只保留为对照，不再代表现状。</b>
+        第 4 层留出集与第 5 层真机首轮已经共同证明 x/y 会随本次 peg 改变；现在的问题是最后几毫米与插入 yaw 的精度，
+        不是“视觉没有起作用”。新现状见第一之三之七、第一之三之八。
+      </div>
+      <p>把 rollout 拆成四个环节，逐个用离线推理在<b>训练帧</b>上验证。结论非常整齐：</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>环节</th><th>状态</th><th>证据</th><th>是否需要视觉</th></tr>
+        <tr>
+          <td><b>夹爪时机</b></td><td><span class="badge done">已学会</span></td>
+          <td class="num">离线 56 个探针帧：预测闭合 21 帧 vs 真值 24 帧；<br>闭合后 +20 帧预测 0.00–0.06（真值 0.00）</td>
+          <td>局部判断，腕部相机即可</td>
+        </tr>
+        <tr>
+          <td><b>z / 下降</b></td><td><span class="badge done">已学会</span></td>
+          <td class="num">rollout 落到 z=0.0536，demo 闭合点 z=0.0500±0.0035</td>
+          <td><b>否</b>（50 条 demo 的 z 几乎是常数）</td>
+        </tr>
+        <tr>
+          <td><b>x 接近</b></td><td><span class="badge warn">极弱</span></td>
+          <td class="num">8 次采样平均后 corr(pred, 到 peg 方向) = <b>+0.406</b><br>n=17，p≈0.11，<b>不显著</b></td>
+          <td><b>是</b></td>
+        </tr>
+        <tr>
+          <td><b>y 接近</b></td><td><span class="badge p0">未学会</span></td>
+          <td class="num">平均后 corr = <b>+0.124</b>；与真实动作 corr = <b>+0.001</b><br>多条 episode 符号相反</td>
+          <td><b>是</b></td>
+        </tr>
+      </table>
+      </div>
+      <div class="callout p0">
+        <b>一句话：所有不看图就能学会的维度都学会了，唯一必须看图的两个维度没学会。</b>
+        loss 0.030 是在已解决的维度上挣来的。两次真机 rollout 的失败（撞 peg 触发 <code>cartesian_reflex</code>；定位歪）都是这一条的下游后果——夹爪不闭合是因为视觉正确判断出「peg 不在指尖之间」，而它之所以不在，是因为 x/y 没走对。
+      </div>
+      <h3>被误读过的两个信号，记下来避免重复排查</h3>
+      <ul>
+        <li><b>leash 计数从 88% 涨到 99% 不是恶化。</b><code>rx/ry</code> 已从撞 8° 上限降到 0.06°/0.36°（drx/dry 裁剪生效）。现在撞 leash 的是 <code>z</code>（占 64.9%，机械臂被 peg 挡住不动而指令继续下压）和 <code>rz</code>，两者都是<b>手臂停滞</b>的后果，不是独立漂移。</li>
+        <li><b><code>drz</code> 不是噪声，不要裁。</b>绝对 yaw 每条 episode 真实移动 mean 6.09° / p95 12.19°；累计 <code>Σ|drz|</code>=8.12° vs 净变化 −3.62°，比值 2.2，不是相消噪声的形态。</li>
+      </ul>
+    </div>
+
+    <!-- ============================================ P0 结果 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>一之二、P0.1 第一版门禁 —— 结论部分作废，根因部分成立</h2>
+        <span class="badge warn">2026-08-27，08-28 部分收回</span>
+      </div>
+      <div class="callout warn">
+        <b>先读这个：本节的门禁判定已于 08-28 收回，根因分析仍然成立。</b>
+        下表的四条 FAIL 是在 <b>episode 0</b> 上测的，而 ep0 的 <code>dx</code> 位移排在全部 50 条的第 28 百分位、
+        y/x 比 3.97（中位数 1.47）—— 我用一条 x 几乎不动的轨迹去考察 x。
+        换 <b>episode 4</b>（dx 位移 57.0 mm）复测，同一份 checkpoint 配方给出 chunk 累计
+        <code>dx</code> R² = <b>+0.501</b>。<b>「管线有结构性缺陷、不要再训 P1/P3」这条结论作废。</b>
+        <br><br>
+        <b>仍然成立的是下面的根因表</b>——归一化尺度与 R² 的两次 5/5 单调是<b>同一条 episode 内跨维度</b>的比较，
+        不受选哪条 episode 影响。详见第一之三节。
+      </div>
+      <p>用<b>一条</b> episode 训练 4000 步（45 epoch，loss 1.412 → 0.054），再在<b>同一条</b> episode 上评测。这是纯记忆任务，不需要泛化、不需要条件化视觉。</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>判据</th><th>MIN_MAX（原配置）</th><th>MEAN_STD（只改归一化）</th><th>门禁</th></tr>
+        <tr><td>R²(dx) &gt; 0.9</td><td class="num">−1.881</td><td class="num">−0.325</td><td><span class="badge p0">FAIL</span></td></tr>
+        <tr><td>R²(dy) &gt; 0.9</td><td class="num">−0.028</td><td class="num">+0.410</td><td><span class="badge p0">FAIL</span></td></tr>
+        <tr><td>夹爪闭合帧误差 &lt; 5</td><td class="num">3 帧 ✓</td><td class="num">247 帧</td><td><span class="badge p0">FAIL</span></td></tr>
+        <tr><td>同帧采样 std &lt; 3 mm</td><td class="num">13.6 / 27.0 mm</td><td class="num">6.5 / 16.8 mm</td><td><span class="badge p0">FAIL</span></td></tr>
+      </table>
+      </div>
+      <div class="callout warn">
+        <span class="strike"><b>只有一条轨迹要背、训了 45 遍，它仍然复现不出这条轨迹的 dx/dy。</b>这一刀同时排除了「数据量不足」和「没有条件化视觉」。问题是结构性的。</span>
+        <br><b>↑ 08-28 收回。</b>这段话的前提是「ep0 的 dx 是可达的」，而它不是。见第一之三节。
+      </div>
+
+      <h3>根因：归一化尺度决定了这一维学不学得会</h3>
+      <p>全 chunk（50 个位置池化）的 R²，与各维在<b>优化实际看到的那个空间</b>里的信号尺度并列：</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>维</th><th>MIN_MAX 后信号 std</th><th>R²（MIN_MAX）</th><th>R²（MEAN_STD）</th><th>改善</th></tr>
+        <tr><td><code>drz</code></td><td class="num"><b>0.047</b> 最饿</td><td class="num">−5.135</td><td class="num">−0.069</td><td class="num"><b>+5.07</b></td></tr>
+        <tr><td><code>dx</code></td><td class="num">0.112</td><td class="num">−1.808</td><td class="num">−0.266</td><td class="num">+1.54</td></tr>
+        <tr><td><code>dy</code></td><td class="num">0.133</td><td class="num">+0.128</td><td class="num">+0.480</td><td class="num">+0.35</td></tr>
+        <tr><td><code>dz</code></td><td class="num">0.208</td><td class="num">+0.335</td><td class="num">+0.323</td><td class="num">−0.01</td></tr>
+        <tr><td><code>gripper</code></td><td class="num"><b>0.978</b> 最撑</td><td class="num">+0.862</td><td class="num">+0.707</td><td class="num"><b>−0.16</b></td></tr>
+      </table>
+      </div>
+      <div class="callout p0">
+        <b>两次独立的 5/5 严格单调。</b>（1）失败程度按尺度排序：尺度越小 R² 越低，无一例外。（2）换成 MEAN_STD 后的改善幅度按「原来有多饿」排序：最饿的 <code>drz</code> 改善 +5.07，最撑的 <code>gripper</code> 反而退了 0.16。5 个元素完全单调的偶然概率约 0.008。
+        <br><br>
+        这解释了这一周所有的谜团：为什么 z 学会了而 x/y 没有（<code>dz</code> 尺度是 <code>dx</code> 的近 2 倍）、为什么夹爪一直好（大 8.7 倍）、为什么 1 条和 50 条 episode 一样差（与数据量无关）。
+      </div>
+      <p>chunk 累计位移也同向改善：<code>dx</code> 预测散布 20.8 → <b>13.5 mm</b>（真值 13.7），平均绝对误差 22.4 → <b>12.7 mm</b>；<code>dy</code> 误差 34.8 → <b>22.4 mm</b>。</p>
+
+      <div class="callout warn">
+        <b>为什么当初选 MIN_MAX 不是错的，但需要重新评估：</b>那个决定是为了压住 <code>drx</code>/<code>dry</code> 的 1500×/550× 离群比，在当时成立。<b>但那两维已经被裁掉了，前提随之失效，而我没有及时重估。</b>现在表里最大离群比只剩 <code>drz</code> 的 9.4×。
+      </div>
+
+      <h3>但 MEAN_STD 是必要不充分 —— 归一化在同时决定两件本该分开的事</h3>
+      <div class="callout p0">
+        <b>尺度</b>决定这一维是否掉在噪声底下；<b>预算</b>决定它拿到多少梯度。MIN_MAX 把 <code>dx</code> 压到 0.112（掉进噪声）却给夹爪 62% 的预算；MEAN_STD 拉平了尺度，却把预算也平均成 20%，于是<b>饿死了夹爪</b>（闭合预测从第 254 帧跑到第 7 帧）。
+        <br><br>
+        要的是<b>「尺度拉平 + 预算按需分配」</b>——即 MEAN_STD <u>加上</u>逐维 loss 权重。<b>这把 P1.2 从次要项提升为主线。</b>
+        <br><br>
+        并且即便尺度修好，<code>dx</code> 在自己背了 45 遍的 episode 上仍是 −0.325。<b>剩余差距才轮到 P1.1 的容量假设</b>，而那个假设现在终于站在干净的地基上。
+      </div>
+    </div>
+
+    <!-- ============================================ 一之三 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>一之三、同一份配方，两条 episode：管线能学会 dx，但明显欠拟合</h2>
+        <span class="badge p0">2026-08-28 修正</span>
+      </div>
+      <p>同一个训练配方（MEAN_STD + 逐维权重 <code>[1,1,1,1,2]</code>，4000 步，batch 8），换一条 dx 真正在动的 episode 重跑。</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>指标</th><th>ep0（dx 位移 13.7 mm）</th><th>ep4（dx 位移 57.0 mm）</th><th>读法</th></tr>
+        <tr><td>chunk 累计 <code>dx</code> R²</td><td class="num">−0.643</td><td class="num"><b>+0.501</b></td><td>信号一给够，dx 就学得动</td></tr>
+        <tr><td>chunk 累计 <code>dy</code> R²</td><td class="num">+0.635</td><td class="num">+0.458</td><td>两条都为正</td></tr>
+        <tr><td>逐步 <code>dx</code> R² @ h=0</td><td class="num">−0.399</td><td class="num">−0.423</td><td><b>两条都为负</b> —— 见下</td></tr>
+        <tr><td>逐步 <code>dx</code> 最好位置</td><td class="num">−0.057 @ h=16</td><td class="num">+0.530 @ h=23</td><td>chunk 中段远好于首步</td></tr>
+        <tr><td><code>dx</code> 预测散布 / 真值</td><td class="num">14.0 / 13.7 mm</td><td class="num">44.3 / 57.0 mm</td><td>幅度量级对，方向不够准</td></tr>
+        <tr><td>夹爪闭合帧误差</td><td class="num">2 帧 ✓</td><td class="num">174 帧 ✗</td><td><b>判据本身不稳</b> —— 见第一之四节 (3)</td></tr>
+      </table>
+      </div>
+
+      <div class="callout ok">
+        <b>收回的结论：</b><span class="strike">管线有结构性缺陷，不要再花训练轮次在 P1/P3 上。</span><br>
+        <b>换上的结论：管线不是坏的，是欠拟合。</b>dx 在信号充足时能到 +0.50，但离「背下一条自己训了 45 遍的轨迹」应有的水平（R² ≈ 1、采样散布 ≈ 0）还很远。
+        <b>这意味着 P1.1（容量）和 P3（数据）重新回到桌面上，不再被「先查 bug」挡住。</b>
+      </div>
+
+      <h3>一个没被解释、但很可能是关键的模式</h3>
+      <p>两条 episode 上，<code>dx</code> 的逐步 R² 都是<b>首步最差、chunk 中段最好</b>；而夹爪正好相反，是标准的单调衰减：</p>
+      <div class="flow">ep4  dx   h0:-0.42  h5:-0.16  h10:+0.24  h15:+0.46  h20:+0.49  h25:+0.47  h30:+0.43  h35:+0.33  h40:+0.23  h45:+0.25
+ep4  grip h0:+0.70  h5:+0.75  h10:+0.68  h15:+0.64  h20:+0.65  h25:+0.58  h30:+0.53  h35:+0.50  h40:+0.45  h45:+0.36</div>
+      <p>夹爪那条是「越远越难预测」，符合直觉。<code>dx</code> 那条不符合——如果模型只是能力不足，最近的一步应该<b>最</b>好预测。</p>
+      <div class="callout warn">
+        <b>提出过的解释（已于 08-28 用 L0 实测否掉）：</b>
+        <span class="strike">30 Hz 的逐步 <code>dx</code> 里大部分方差是遥操抖动，本身就不可预测；该测的是 chunk 累计位移而不是逐步 R²。</span>
+        <br><b>实测：<code>dx</code> 的逐步 R² 上限是 0.881，目标高度可预测。</b>见下一节。
+      </div>
+    </div>
+
+    <!-- ============================================ L0 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>一之三之二、L0 实测：目标是可预测的，而 <code>drz</code> 已经到顶了</h2>
+        <span class="badge done">2026-08-28 已完成 · 15 分钟 · 无 GPU</span>
+      </div>
+      <p>把每一维的方差拆成「时间上相关的成分」（图像原则上能决定）与「白噪声成分」（遥操抖动，任何模型都决定不了），
+      得到<b>逐步 R² 的理论上限</b>。四个互相独立的估计器同时报出，因为此前两版门禁都栽在单一估计上。
+      每个数是 50 条 episode 的中位数。</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>维</th><th>ACF 外推</th><th>平滑 w=5</th><th>平滑 w=9</th><th>&lt;2 Hz 占比</th><th>&lt;5 Hz 占比</th><th>chunk 累计上限</th></tr>
+        <tr><td><code>dx</code></td><td class="num"><b>0.881</b></td><td class="num">0.889</td><td class="num">0.837</td><td class="num">0.914</td><td class="num">0.938</td><td class="num">0.995</td></tr>
+        <tr><td><code>dy</code></td><td class="num">0.974</td><td class="num">0.971</td><td class="num">0.953</td><td class="num">0.977</td><td class="num">0.982</td><td class="num">0.999</td></tr>
+        <tr><td><code>dz</code></td><td class="num">0.979</td><td class="num">0.977</td><td class="num">0.960</td><td class="num">0.987</td><td class="num">0.992</td><td class="num">0.999</td></tr>
+        <tr><td><code>drz</code></td><td class="num"><b>0.151</b></td><td class="num">0.318</td><td class="num">0.237</td><td class="num">0.203</td><td class="num">0.391</td><td class="num">0.876</td></tr>
+        <tr><td><code>gripper</code></td><td class="num">0.997</td><td class="num">0.997</td><td class="num">0.992</td><td class="num">1.000</td><td class="num">1.000</td><td class="num">1.000</td></tr>
+      </table>
+      </div>
+      <div class="callout ok">
+        <b>假设被否掉了，这是好事。</b><code>dx</code> 的逐步上限 0.881（四个估计器一致，0.837–0.938），
+        目标<b>高度可预测</b>。实测 −0.423 距可达值差 <b>1.30</b>，与目标噪声无关。
+        <b>逐步 R² 是有效指标，不用换。</b>15 分钟、零 GPU 杀掉一个错误方向。
+      </div>
+
+      <h3>没预料到的发现：<code>drz</code> 已经到顶，却在拿 1/5 的 loss 预算</h3>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>维</th><th>逐步上限</th><th>实测 R² @ h=0</th><th>余量</th><th>含义</th></tr>
+        <tr><td><code>drz</code></td><td class="num">0.151</td><td class="num">0.138</td><td class="num"><b>0.013</b></td><td><b>已到顶，再优化不可能有收益</b></td></tr>
+        <tr><td><code>gripper</code></td><td class="num">0.997</td><td class="num">0.704</td><td class="num">0.293</td><td>有余量</td></tr>
+        <tr><td><code>dy</code></td><td class="num">0.974</td><td class="num">−0.178</td><td class="num">1.152</td><td>巨大缺口</td></tr>
+        <tr><td><code>dz</code></td><td class="num">0.979</td><td class="num">−0.320</td><td class="num">1.299</td><td>巨大缺口</td></tr>
+        <tr><td><code>dx</code></td><td class="num">0.881</td><td class="num">−0.423</td><td class="num"><b>1.304</b></td><td>巨大缺口</td></tr>
+      </table>
+      </div>
+      <div class="callout p0">
+        <b><code>drz</code> 的逐步增量有 85% 是白噪声，而模型已经把那 15% 可提取的部分全提取了。</b>
+        它却和 <code>dx</code> 拿同样的 loss 权重。
+        <br><br>
+        这与第一节「<code>drz</code> 不是噪声，不要裁」<b>不矛盾</b>：那条说的是<b>绝对 yaw</b> 每 episode 真移动 6.09°，
+        这条说的是<b>逐步增量</b>。真实 yaw 运动藏在那 15% 里，chunk 累计上限 0.876 也证实累计量可学。
+        <b>结论不是裁掉 <code>drz</code>，而是逐步 loss 权重要远低于 1</b>，把共享容量让给余量 1.3 的三个平移维。
+        <br><br>
+        <b>机制上还有一层代价：</b>在 flow matching 里，目标中不可约的噪声只能靠<b>更宽的条件分布</b>去拟合——
+        这正是观测到的 27.3 / 14.5 mm 采样散布的成因之一。<b>下一版权重应按「上限 − 实测」的余量分配，而不是按维度平均。</b>
+      </div>
+      <div class="callout warn">
+        <b>顺带作废：</b>「逐步 R² 上限远低于 1，所以只该看 chunk 累计位移」——这条推论建立在被否掉的假设上，同样收回。
+      </div>
+    </div>
+
+    <!-- ============================================ L1 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>一之三之三、L1 实测：缺口对半分成「采样散布」和「条件均值」两个独立问题</h2>
+        <span class="badge done">2026-08-28 已完成 · GPU ~25 分钟</span>
+      </div>
+
+      <div class="callout p0">
+        <b>先说一个必须交代的事：同一个 checkpoint、同一条 episode，<code>dx</code> @ h=0 昨天测出 −0.423，今天第一版测出 +0.476。</b>
+        原因不是任何一次算错——是<b>单次噪声抽样的 R² 本身就在 −0.42 到 +0.48 之间晃</b>。
+        两个数都是单点估计的运气，<b>都作废</b>。这是同一个方法论错误的第四次，只是这次的「单点」是噪声种子。
+        下表全部是 8 次独立抽样的统计量。
+      </div>
+
+      <p>在 ep4 过拟合 checkpoint 上，40 个探针帧 × 8 次独立噪声抽样。把 L0 的上限、单次抽样、条件均值并排放：</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>维</th><th>L0 上限</th><th>单次抽样</th><th>8 次均值</th><th>散布代价</th><th>均值缺口</th></tr>
+        <tr><td><code>dx</code></td><td class="num">0.881</td><td class="num">0.106</td><td class="num">0.414</td><td class="num">0.308</td><td class="num"><b>0.467</b></td></tr>
+        <tr><td><code>dy</code></td><td class="num">0.974</td><td class="num">0.106</td><td class="num">0.381</td><td class="num">0.275</td><td class="num"><b>0.593</b></td></tr>
+        <tr><td><code>dz</code></td><td class="num">0.979</td><td class="num">−0.196</td><td class="num">0.338</td><td class="num"><b>0.534</b></td><td class="num"><b>0.641</b></td></tr>
+        <tr><td><code>drz</code></td><td class="num">0.151</td><td class="num">−0.262</td><td class="num">0.256</td><td class="num">0.518</td><td class="num">−0.105 <span class="small">见下</span></td></tr>
+        <tr><td><code>gripper</code></td><td class="num">0.997</td><td class="num">0.659</td><td class="num"><b>0.876</b></td><td class="num">0.217</td><td class="num">0.121</td></tr>
+      </table>
+      </div>
+      <p class="small">散布代价 = 一次抽样相对条件均值丢掉多少 R²；均值缺口 = 条件均值距 L0 上限还差多少。</p>
+
+      <div class="callout p0">
+        <b>缺口大致对半分成两个独立问题，谁也不能单独解释：</b><br>
+        <b>(A) 采样散布</b>——一次抽样比条件均值差 0.31（<code>dx</code>）到 0.53（<code>dz</code>）。<br>
+        <b>(B) 条件均值本身</b>——把噪声全平均掉之后，<code>dx</code> 仍距上限 0.467、<code>dz</code> 距 0.641。
+        <br><br>
+        <b>(A) 不能靠推理端多采样解决</b>：8 次抽样约 3.2 s，在线放不下（第八节那条证伪仍然成立）。<b>必须在训练里解决。</b>
+      </div>
+
+      <h3>三个附带结论</h3>
+      <ul>
+        <li><b>夹爪基本已解决。</b>条件均值 0.876 / 上限 0.997，缺口 0.121，剩下的几乎全是散布。</li>
+        <li><b><code>drz</code> 的均值缺口为负（−0.105），这一格不能当结论用。</b>L0 的上限是 <b>50 条 episode 的中位数</b>，而这里只在 ep4 上评测，ep4 的 drz 相关成分可能高于中位数。
+        <code>dx</code>/<code>dy</code>/<code>dz</code> 的缺口 0.47–0.64 远大于 L0 报出的 episode 间 IQR（dx: [0.77, 0.92]），那三条不受这个问题影响。</li>
+        <li><b>「首步最差」是真的，不是抽样噪声。</b>条件均值下 <code>dx</code> 的 h 剖面：
+        <span class="mono">h0:+0.41 h10:+0.60 h20:+0.70 h30:+0.67 h40:+0.57 h45:+0.49</span>。
+        h=0 比 h=20 差 0.29。<b>而 RTC 执行的正是每个 chunk 的前 16 步——策略在它唯一被用到的位置上最差。</b></li>
+      </ul>
+
+      <h3>另一半：LoRA 关掉之后</h3>
+      <p>同一次实验里把 adapter 停用（投影头的 LoRA 也随之停用）：输出的采样散布塌到 <b>0.05 mm</b>，与真值相关 <b>R² ≈ 0.000</b>。</p>
+      <div class="callout ok">
+        <b>L1 的原假设也被否掉了：</b><span class="strike">宽条件分布是从预训练先验继承来的，LoRA 没动过它。</span>
+        <b>先验根本不宽——它是退化的。</b>那个宽度是训练<u>产生</u>的，LoRA 动了很多（<code>dx</code> 增益 +0.476）。
+        <b>所以问题不是「LoRA 没起作用」，而是「LoRA 起了作用但没收敛」——这正好指向 L2。</b>
+      </div>
+
+      <h3>顺带查出：<code>--lora-r</code> 是个反向的旋钮</h3>
+      <div class="callout p0">
+        <code>build_peft_section</code> 从不设 <code>lora_alpha</code>，它落到 PEFT 的固定默认值 <b>8</b>。
+        LoRA 的实际强度是 <code>alpha / r</code>：
+        <span class="mono">r=8 → 1.00</span>、<span class="mono">r=16 → 0.50</span>、<span class="mono">r=32（本轮所有实验）→ 0.25</span>。
+        <b>调高 rank 反而把每次更新衰减 4 倍</b>，与该 flag 的 help 文字（“higher is closer to full finetuning”）正好相反。
+        <br><br>
+        <b>已于 08-28 修好（upstream）：</b><code>PeftConfig</code> 增加 <code>alpha</code> 字段，
+        <code>pretrained.py</code> 的 <code>_preprocess_peft_cli_overrides</code> 把它改名成各方法自己的键（LoRA 的 <code>lora_alpha</code>），
+        与 <code>init_type</code> / <code>full_training_modules</code> 已有的改名走同一条路。
+        <code>--lora-alpha</code> <b>默认取 rank</b>，任何 rank 下缩放都是 1.0。
+        <span class="small">测试：<code>tests/policies/test_peft_alpha_mapping.py</code> + 两处被钉住的 peft 块断言。</span>
+        <br><br>
+        <b>反过来说，之前所有实验的 LoRA 强度都只有名义值的 1/4</b>，这是所有容量结论都要重新审视的理由。
+        <b>要复现 08-28 之前的 checkpoint，必须显式传 <code>--lora-alpha 8</code></b>——
+        「Copy settings from a past run」只记录了 <code>loraR</code>，跨这个日期复制参数<u>不等价</u>。
+      </div>
+    </div>
+
+    <!-- ============================================ L2 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>一之三之四、L2 通过：绑定约束是可训练容量／强度，不是管线</h2>
+        <span class="badge done">2026-08-28 决定性 · 训练 72 分钟</span>
+      </div>
+      <p>相对 ep4 基线只改两处：可训练模块从 <code>gemma_expert</code> 的 q/v 扩到<b>全部 linear</b>（q/k/v/o + gate/up/down，模块名从 base 权重读出而非猜测），
+      rank 32→64、alpha 8→64。<b>dataset / steps=4000 / batch=8 / seed=1000 / optimizer / scheduler / MEAN_STD / 权重 <code>[1,1,1,1,2]</code> 全部逐字节相同。</b>
+      可训练参数 2.57M → <b>27.86M</b>（0.06% → 0.67%）。</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>指标</th><th>基线（0.06%，缩放 0.25）</th><th>L2（0.67%，缩放 1.0）</th><th></th></tr>
+        <tr><td>训练 loss（step 4000）</td><td class="num">0.464</td><td class="num"><b>0.108</b></td><td>低 4.3×</td></tr>
+        <tr><td><code>dx</code> 单次抽样 R²</td><td class="num">0.106</td><td class="num"><b>0.893</b></td><td></td></tr>
+        <tr><td><code>dx</code> 散布代价</td><td class="num">0.308</td><td class="num"><b>0.061</b></td><td>−80%</td></tr>
+        <tr><td><code>dx</code> 均值缺口</td><td class="num">0.467</td><td class="num"><b>−0.073</b></td><td>见下方注意</td></tr>
+        <tr><td><code>dy</code> 单次抽样 R²</td><td class="num">0.106</td><td class="num"><b>0.797</b></td><td></td></tr>
+        <tr><td><code>dz</code> 单次抽样 R²</td><td class="num">−0.196</td><td class="num"><b>0.799</b></td><td></td></tr>
+        <tr><td>夹爪单次抽样 R²</td><td class="num">0.659</td><td class="num"><b>0.976</b></td><td></td></tr>
+      </table>
+      </div>
+      <div class="callout ok">
+        <b>两条判据同时满足 → 分叉 ①：绑定约束是可训练容量／更新强度，不是数据通路里的结构性问题。</b>
+        管线在预算给够时能把一条 episode 背到接近可达上限。<b>P1.1 成为主线；「先查 bug」这条路正式关闭。</b>
+      </div>
+
+      <h3>免费杀掉的一个假设：时间对齐</h3>
+      <p><code>dx</code> 的逐位置 R² 剖面从「首步最差」变成了平的：</p>
+      <div class="flow">基线  h0:+0.11  h10:+0.40  h20:+0.49  h30:+0.45  h40:+0.27  h45:+0.18
+L2    h0:+0.89  h10:+0.88  h20:+0.94  h30:+0.94  h40:+0.90  h45:+0.85</div>
+      <div class="callout ok">
+        <b>「首步最差」是欠拟合的产物，不是 view 构建里的时间偏移。</b>
+        同一份数据、同一套时间戳，只把预算加上去，这个模式就消失了。
+        <b>时间对齐从剩余嫌疑名单里划掉</b>——L2 之前它和 chunk 语义是仅剩的两个结构性嫌疑。
+        <span class="small">这一条同时解掉了「RTC 执行前 16 步而策略在那里最差」的担忧。</span>
+      </div>
+
+      <h3>两个不能当结论用的格子</h3>
+      <ul>
+        <li><b><code>drz</code> 的所有 R² 都不可信。</b>它的逐步信号 std 在 L1 里就打印成 <code>0.00 rad</code>，R² 的分母近乎为零，
+        所以单次抽样 −0.926 与 8 次均值 +0.724 都是数值噪声而非信息。<b>drz 需要换一个指标（累计量），不能用逐步 R² 评价。</b></li>
+        <li><b><code>dx</code> 均值缺口为负（0.954 &gt; L0 上限 0.881）。</b>L0 的上限是 50 条 episode 的<b>中位数</b>，
+        且 ACF 二次外推对相关成分是<b>偏低估</b>的（真实自协方差在 0 附近若是尖峰，二次外推会低估 var(s)）。
+        <b>它是量级参照，不是硬上界，不应再当门禁用。</b></li>
+      </ul>
+
+      <h3>归因：L2b 把两个因素分开了</h3>
+      <p>L2 同时动了模块覆盖（×10.8）与更新强度（×4）。<b>L2b</b> 把目标模块与 rank 完全保持基线
+      （q/v + 投影头，r=32，可训练参数 <b>2,574,336</b>，与基线逐个相同），<b>只把 alpha 从 8 抬到 32</b>。</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>配置</th><th>缩放</th><th>模块</th><th>可训练</th><th><code>dx</code> 单次抽样</th><th>散布代价</th><th>均值缺口</th><th>loss</th></tr>
+        <tr><td>基线</td><td class="num">0.25</td><td>q/v</td><td class="num">2.57M</td><td class="num">0.106</td><td class="num">0.308</td><td class="num">0.467</td><td class="num">0.464</td></tr>
+        <tr><td><b>L2b</b> alpha only</td><td class="num">1.00</td><td>q/v</td><td class="num"><b>2.57M</b></td><td class="num"><b>0.479</b></td><td class="num">0.187</td><td class="num">0.216</td><td class="num">0.291</td></tr>
+        <tr><td><b>L2</b> alpha + 扩模块</td><td class="num">1.00</td><td>全 linear</td><td class="num">27.9M</td><td class="num"><b>0.893</b></td><td class="num">0.061</td><td class="num">−0.073</td><td class="num">0.108</td></tr>
+      </table>
+      </div>
+      <div class="callout p0">
+        <b>大致对半：一个不增加任何参数的配置修复（alpha），买下了 L2 一半的改进。</b>
+        <code>dy</code> 0.106 → 0.368 → 0.797、<code>dz</code> −0.196 → 0.407 → 0.799、夹爪 0.659 → 0.908 → 0.976，
+        三个维度都是同样的对半分。另一半要付 <b>10.8 倍参数</b>。
+        <br><br>
+        <b>实践含义：</b>凡是历史上「加了容量却没用」的结论，都要考虑是不是被 alpha=8 吃掉了——这条同时改写了第八节里「单纯加大 LoRA rank」那条证伪。
+      </div>
+    </div>
+
+    <!-- ============================================ L3 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>一之三之五、L3 通过：泛化不是瓶颈，而 train/holdout 的区分本身消失了</h2>
+        <span class="badge done">2026-08-28 · 训练 115 分钟 + 评测 40 分钟</span>
+      </div>
+      <p>用 L2 的胜出配方（全 linear，r=64／alpha=64）在 <b>8 条 episode</b> <code>[2,4,15,37,41,43,46,49]</code> 上训练 8000 步，
+      在<b>从未训练过的</b> <code>[22,40]</code> 上评测。holdout 是按角度<b>内插</b>挑的（两侧都有近邻的 episode），
+      不是随机抽——随机抽会挑到环带角度边缘，那是外插测试穿着泛化测试的衣服。
+      每个探针帧 <b>8 次独立噪声抽样</b>，并在<b>同一个 checkpoint</b> 上同时评 train 侧 <code>{2,4}</code> 作对照：
+      holdout 单独低无法与「这个 checkpoint 就是差」区分开，<b>对比本身才是测量</b>。</p>
+
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>维</th><th>L0 上限</th><th>H22 单次抽样</th><th>H40 单次抽样</th><th>T2 单次抽样<br><span class="small">训练过</span></th><th>T4 单次抽样<br><span class="small">训练过</span></th></tr>
+        <tr><td><code>dx</code></td><td class="num">0.881</td><td class="num">+0.087 ± 0.20</td><td class="num"><b>+0.411 ± 0.11</b></td><td class="num">−0.472 ± 0.45</td><td class="num">+0.712 ± 0.08</td></tr>
+        <tr><td><code>dy</code></td><td class="num">0.974</td><td class="num"><b>+0.473 ± 0.05</b></td><td class="num"><b>+0.573 ± 0.10</b></td><td class="num">+0.566 ± 0.12</td><td class="num">+0.370 ± 0.22</td></tr>
+        <tr><td><code>dz</code></td><td class="num">0.979</td><td class="num">+0.666 ± 0.06</td><td class="num">+0.657 ± 0.07</td><td class="num">+0.717 ± 0.09</td><td class="num">+0.701 ± 0.13</td></tr>
+        <tr><td>夹爪</td><td class="num">0.997</td><td class="num">+0.963 ± 0.02</td><td class="num">+0.962 ± 0.01</td><td class="num">+0.964 ± 0.02</td><td class="num">+0.975 ± 0.02</td></tr>
+      </table>
+      </div>
+      <p class="small">逐步 R² @ h=0，± 是 8 次独立抽样之间的标准差。<code>drz</code> 单列在下面，它的逐步 R² 分母近零不可用。</p>
+
+      <div class="callout ok">
+        <b>门禁通过。</b><code>dy</code> 在两条 holdout 上都显著为正；<code>dx</code> 在 H40 上 +0.411 ± 0.11 显著为正，
+        H22 在 h=0 与 0 无法区分，但其 chunk 累计是 <b>+0.773 ± 0.08</b>——信号在，只是被 h=0 的采样散布淹了。
+        <b>五条必要条件里的第 5 条（样本足够约束映射）第一次拿到直接证据</b>：8 条 episode 足以在没见过的 peg 位置上
+        给出正确的 dy／dz／夹爪和大部分 dx。<b>可以开全量 50 条。</b>
+      </div>
+
+      <h3>意外发现：dx 只跟这条 episode 的 x 行程走，与「训练过没有」无关</h3>
+      <p>对照组 <b>T2 是训练过的</b>，它的 <code>dx</code> 反而是四条里最差的。把四条按 ee.x 行程排开：</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>episode</th><th>x 行程</th><th>身份</th><th><code>dx</code> @ h=0</th><th><code>dx</code> chunk 累计</th></tr>
+        <tr><td>T2</td><td class="num">73.8 mm<span class="small">（34 分位）</span></td><td>训练过</td><td class="num">−0.472</td><td class="num">+0.379</td></tr>
+        <tr><td>H22</td><td class="num">122.1 mm<span class="small">（70 分位）</span></td><td><b>没见过</b></td><td class="num">+0.087</td><td class="num">+0.773</td></tr>
+        <tr><td>H40</td><td class="num">142.4 mm<span class="small">（82 分位）</span></td><td><b>没见过</b></td><td class="num">+0.411</td><td class="num">+0.840</td></tr>
+        <tr><td>T4</td><td class="num">182.3 mm<span class="small">（96 分位）</span></td><td>训练过</td><td class="num">+0.712</td><td class="num">+0.919</td></tr>
+      </table>
+      </div>
+      <div class="callout p0">
+        <b>两个互相独立的指标同时 4/4 严格单调，且与「训练过没有」完全无关</b>（指定方向下随机排序概率 1/24 ≈ 0.04）。
+        <br><br>
+        这否掉了「背下来」这个假设——<b>背不出一个比训练集里两条还好的、没见过的 episode</b>。
+        它同时说明：<b>此前所有逐 episode 的 <code>dx</code> 数字，测的主要是那条 episode 的 x 信号量，不是模型的能力。</b>
+        这正是方法论错误 #2 的同一个形状，只是这次它藏在<u>对照组</u>里而不是实验组里——见第一之四节。
+      </div>
+
+      <h3>唯一真实的泛化缺口：<code>drz</code> 在背题</h3>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th></th><th>H22</th><th>H40</th><th>T2</th><th>T4</th></tr>
+        <tr><td><code>drz</code> chunk 累计 R²</td><td class="num"><b>−1.109</b></td><td class="num"><b>−9.547</b></td><td class="num">+0.667</td><td class="num">+0.880</td></tr>
+      </table>
+      </div>
+      <div class="callout warn">
+        <b>全表唯一一个 train/holdout 分得开的维度，差了一个数量级。</b>
+        模型把 8 条训练 episode 的 yaw 轨迹背了下来，套到没见过的 episode 上，套错了。
+        而它恰好是 L0 测出逐步上限只有 0.151（<b>85% 是白噪声</b>）的那一维——<b>背的是噪声，噪声不迁移。</b>
+        <span class="small">这里用的是路线图指定给 <code>drz</code> 的 chunk 累计量，不是分母近零的逐步 R²，所以结论成立。
+        与第一之三之六节的 loss 份额构成两条独立证据，指向同一个动作：<code>drz</code> 大幅降权。</span>
+      </div>
+
+      <h3>「首步最差」在没见过的数据上回来了</h3>
+      <div class="flow">H22  h0:+0.09  h5:+0.33  h10:+0.45  h15:+0.56  h20:+0.51  h25:+0.49  h30:+0.51  h35:+0.64  h40:+0.62  h45:+0.61
+H40  h0:+0.41  h5:+0.37  h10:+0.48  h15:+0.55  h20:+0.51  h25:+0.57  h30:+0.53  h35:+0.68  h40:+0.62  h45:+0.59
+T4   h0:+0.71  h5:+0.75  h10:+0.73  h15:+0.76  h20:+0.85  h25:+0.82  h30:+0.81  h35:+0.79  h40:+0.80  h45:+0.76</div>
+      <div class="callout warn">
+        L2 曾把这个剖面拉平（h0:+0.89／h20:+0.94），并据此把「时间对齐」从嫌疑名单划掉。
+        <b>那条结论仍然成立</b>——剖面能被拉平，就不是固定的帧偏移。
+        <b>但 L2 的拉平是记忆的产物：在没见过的 episode 上「首步最差」回来了。</b>
+        所以第一之三之四节里「这一条同时解掉了 RTC 执行前 16 步而策略在那里最差的担忧」<span class="strike">已解决</span>
+        ——<b>那个操作后果在真实条件下回来了，rollout 前要重新考虑。</b>
+        <br><b>08-31 更新：不用了。</b>第 4 层（全量 48 条）实测 h=0 抬到 +0.40／+0.61，剖面自己就平了——
+        这里写下的处置「先测，别先改」是对的。见第一之三之七节。
+      </div>
+
+      <h3>这一节不覆盖的范围</h3>
+      <p>holdout 是按角度<b>内插</b>挑的，所以这里证明的是<b>环带内的内插泛化</b>。
+      它不覆盖第六节列出的三个盲区：环内侧（半径 &lt; 56 mm）、环外侧（&gt; 170 mm）、约 79° 的角度缺口。
+      真机 rollout 若落到那三处，仍然是真正的分布外。</p>
+    </div>
+
+    <!-- ============================================ L4 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>一之三之六、L4 实测：<code>drz</code> 拿着 32% 的 loss 预算，其中 85% 学不掉</h2>
+        <span class="badge done">2026-08-28 · GPU 12 分钟</span>
+      </div>
+      <p>逐维权重此前建立在一个只被<b>推断</b>过的说法上：<code>drz</code> 占了与它可回收信号不成比例的预算。
+      L0 的上限是在<b>动作空间</b>测的，而 loss 活在 flow matching 的<b>速度空间</b>，两者不是同一个量。
+      <code>loss_per_dim</code> 是在加权<u>之前</u>记录的，所以它能直接把这件事测出来，不用再争。
+      在 L2 的 ep4 checkpoint 上取 40 个 batch × 8：</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>维</th><th>loss</th><th>份额</th><th>L0 上限</th><th>不可约比例</th></tr>
+        <tr><td><code>dx</code></td><td class="num">0.2345</td><td class="num">34.7%</td><td class="num">0.881</td><td class="num">0.119</td></tr>
+        <tr><td><code>drz</code></td><td class="num">0.2165</td><td class="num"><b>32.0%</b></td><td class="num"><b>0.151</b></td><td class="num"><b>0.849</b></td></tr>
+        <tr><td><code>dz</code></td><td class="num">0.1181</td><td class="num">17.5%</td><td class="num">0.979</td><td class="num">0.021</td></tr>
+        <tr><td><code>dy</code></td><td class="num">0.0859</td><td class="num">12.7%</td><td class="num">0.974</td><td class="num">0.026</td></tr>
+        <tr><td>夹爪</td><td class="num">0.0207</td><td class="num">3.1%</td><td class="num">0.997</td><td class="num">0.003</td></tr>
+      </table>
+      </div>
+      <div class="callout p0">
+        <b>推断变成了实测：<code>drz</code> 和 <code>dx</code> 拿着几乎一样的份额（32.0% vs 34.7%），
+        但 <code>dx</code> 有 88% 可回收、<code>drz</code> 只有 15%。</b>
+        加上第一之三之五节，<code>drz</code> 不只是在噪声上花预算，它还把那份噪声<b>背下来并当成错误迁移出去</b>。
+        两条独立证据指向同一个动作。
+      </div>
+
+      <h3>由此定出的第 4 层权重</h3>
+      <div class="flow">action_loss_weights = [1.0, 1.0, 1.0, 0.2, 2.0]   # dx, dy, dz, drz, gripper</div>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>加权后的预算</th><th><code>drz</code></th><th>三个平移维合计</th></tr>
+        <tr><td>当前 <code>[1,1,1,1,2]</code></td><td class="num">31.0%</td><td class="num">63.0%</td></tr>
+        <tr><td><b>建议</b></td><td class="num"><b>8.3%</b></td><td class="num"><b>83.8%</b></td></tr>
+      </table>
+      </div>
+      <ul>
+        <li><b><code>drz</code> → 0.2</b>：约等于它的上限 0.151 相对其余各维 ~0.95 的比值。释放出的约 21 个百分点全部流向余量最大的三个平移维。</li>
+        <li><b>平移三轴保持均等</b>：它们是短板，三个都有 &gt;88% 可回收，不需要再互相压。</li>
+        <li><b>夹爪保持 2.0</b>：它已经解决（holdout 上 0.962–0.963），且原始份额只有 3.1%，压它是无谓风险——
+        MEAN_STD 那次把夹爪饿死（闭合帧误差 3 → 247）的教训见第一之二节。</li>
+      </ul>
+      <p class="small"><code>apply_action_loss_weights</code> 会把权重重归一化到均值 1，所以这只重新分配梯度、不改变梯度总量
+      （即不是一次隐藏的学习率变更）。</p>
+      <div class="callout warn">
+        <b>这一节的边界：</b>份额是在 L2 的 <b>ep4 过拟合 checkpoint</b> 上测的，全量 50 条的百分比会变。
+        但<b>「不可约比例」是数据的属性、不是 checkpoint 的属性</b>，<code>drz</code> 的 0.849 不会变，所以降权这个动作是稳的。
+      </div>
+    </div>
+
+    <!-- ============================================ 第 4 层 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>一之三之七、第 4 层通过：三个平移维在留出集上全线上涨，「首步最差」自愈，<code>drz</code> 仍未解决</h2>
+        <span class="badge done">2026-08-31 · 训练 8 小时 23 分 + 评测 40 分钟</span>
+      </div>
+      <p><b>全量 48 条</b>（50 条去掉留出的 <code>[22,40]</code>，23971 帧）训练 30000 步 ≈ 10.0 epoch，
+      L2 配方（全 linear，r=64／alpha=64，<code>num_learnable_params = 27,856,896</code>，启动时已核对）
+      加上第一之三之六节定出的 <code>action_loss_weights = [1.0, 1.0, 1.0, 0.2, 2.0]</code>。
+      最终 loss <b>0.123</b>（0.190 → 0.175 → 0.158 → 0.137 → 0.134 → 0.123）。
+      评测沿用第一之三之五节那一套：同一批 holdout <code>[22,40]</code>、同一批 train 侧对照 <code>{2,4}</code>、
+      每个探针帧 8 次独立噪声抽样，<b>两轮数字可以逐格直接比</b>。
+      这一轮同时动了两个变量（8 条 → 48 条、<code>drz</code> 权重 1.0 → 0.2），所以下面每一处归因都标了它属于哪一个。</p>
+
+      <h3>留出集：三个平移维全线上涨</h3>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>维</th><th>L0 上限</th><th>H22 L3</th><th>H22 第 4 层</th><th>H40 L3</th><th>H40 第 4 层</th></tr>
+        <tr><td><code>dx</code></td><td class="num">0.881</td><td class="num">+0.087 ± 0.20</td><td class="num"><b>+0.399 ± 0.21</b></td><td class="num">+0.411 ± 0.11</td><td class="num"><b>+0.608 ± 0.08</b></td></tr>
+        <tr><td><code>dy</code></td><td class="num">0.974</td><td class="num">+0.473 ± 0.05</td><td class="num"><b>+0.702 ± 0.05</b></td><td class="num">+0.573 ± 0.10</td><td class="num"><b>+0.657 ± 0.05</b></td></tr>
+        <tr><td><code>dz</code></td><td class="num">0.979</td><td class="num">+0.666 ± 0.06</td><td class="num"><b>+0.755 ± 0.06</b></td><td class="num">+0.657 ± 0.07</td><td class="num"><b>+0.778 ± 0.04</b></td></tr>
+        <tr><td>夹爪</td><td class="num">0.997</td><td class="num">+0.963 ± 0.02</td><td class="num">+0.961 ± 0.02</td><td class="num">+0.962 ± 0.01</td><td class="num">+0.959 ± 0.02</td></tr>
+      </table>
+      </div>
+      <p class="small">逐步 R² @ h=0，± 是 8 次独立抽样之间的标准差。chunk 累计同向：
+      <code>dx</code> +0.773 → <b>+0.840</b>／+0.840 → <b>+0.863</b>；
+      <code>dy</code> +0.786 → +0.868／+0.844 → +0.862；
+      <code>dz</code> +0.889 → +0.930／+0.890 → +0.903。</p>
+
+      <div class="callout ok">
+        <b>六个平移格子全部上涨，没有一个退。</b>最大的一格是 <code>dx</code> @ H22：+0.087（与 0 无法区分）→ <b>+0.399</b>。
+        <b>夹爪没有被饿死</b>——权重留在 2.0 那个决定是对的：它的原始 loss 份额只有 3.1%，
+        MEAN_STD 那次把它饿死（闭合帧误差 3 → 247，见第一之二节）的代价还记着。
+      </div>
+
+      <h3>采样散布第一次实质性收窄</h3>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th><code>dx</code> 散布代价<span class="small">（条件均值 − 单次抽样）</span></th><th>L3</th><th>第 4 层</th></tr>
+        <tr><td>H22</td><td class="num">0.554</td><td class="num"><b>0.319</b></td></tr>
+        <tr><td>H40</td><td class="num">0.239</td><td class="num"><b>0.110</b></td></tr>
+      </table>
+      </div>
+      <p>第一之三之三节把缺口拆成「采样散布」和「条件均值」两个独立问题，此后每一层都只推动了后者。
+      <b>这是散布那一半第一次自己往下走</b>——而真机 rollout 每一步只抽一次噪声，拿到的正是含散布的那个数。
+      第 4 层的条件均值是 <code>dx</code> +0.718／+0.718、<code>dy</code> +0.851／+0.735、<code>dz</code> +0.838／+0.868。</p>
+
+      <h3>「首步最差」自愈了 —— RTC 那个隐患可以撤销</h3>
+      <div class="flow">H22  h0:+0.40  h5:+0.50  h10:+0.60  h15:+0.69  h20:+0.44  h25:+0.47  h30:+0.51  h35:+0.70  h40:+0.64  h45:+0.74
+H40  h0:+0.61  h5:+0.50  h10:+0.57  h15:+0.54  h20:+0.51  h25:+0.56  h30:+0.47  h35:+0.66  h40:+0.64  h45:+0.60
+                             ——  L3 同两条：h0:+0.09 → h35:+0.64 ／ h0:+0.41 → h35:+0.68</div>
+      <div class="callout ok">
+        <b>h=0 从 +0.09／+0.41 抬到 +0.40／+0.61，H40 的剖面已经基本平了</b>（h0 是它自己的中位数附近，不再是最低点）。
+        第一之三之五节据此把「RTC 只执行每个 chunk 的前 16 步」列为 rollout 前必须处理的一件事，
+        <span class="strike">rollout 前要重新考虑</span>——<b>不用动了。</b>
+        <br><br>
+        当时写下的预判是「全量 50 条的拟合程度不同，这个剖面可能自己就变了。先测，别先改」——<b>实测确认了这一条</b>。
+        它说明那个剖面从来不是 RTC 或时间对齐的性质，而是<b>欠拟合在 h 轴上的投影</b>：
+        靠后的步数据更平滑因而更容易拟合，欠拟合时先学会的就是它们。数据量一上来，差异就摊掉了。
+        <span class="small">H22 仍从 h0:+0.40 升到 h45:+0.74，首步依然是偏弱的一端，只是不再接近零。这属于余量问题，不属于操作后果。</span>
+      </div>
+
+      <h3>「<code>dx</code> 只跟 x 行程走」第二次独立复现</h3>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>episode</th><th>x 行程</th><th>身份</th><th><code>dx</code> @ h=0</th><th><code>dx</code> chunk 累计</th><th>L3 同两格</th></tr>
+        <tr><td>T2</td><td class="num">73.8 mm<span class="small">（34 分位）</span></td><td>训练过</td><td class="num">−0.164</td><td class="num">+0.670</td><td class="num small">−0.472 ／ +0.379</td></tr>
+        <tr><td>H22</td><td class="num">122.1 mm<span class="small">（70 分位）</span></td><td><b>没见过</b></td><td class="num">+0.399</td><td class="num">+0.840</td><td class="num small">+0.087 ／ +0.773</td></tr>
+        <tr><td>H40</td><td class="num">142.4 mm<span class="small">（82 分位）</span></td><td><b>没见过</b></td><td class="num">+0.608</td><td class="num">+0.863</td><td class="num small">+0.411 ／ +0.840</td></tr>
+        <tr><td>T4</td><td class="num">182.3 mm<span class="small">（96 分位）</span></td><td>训练过</td><td class="num">+0.784</td><td class="num">+0.949</td><td class="num small">+0.712 ／ +0.919</td></tr>
+      </table>
+      </div>
+      <div class="callout p0">
+        <b>两个指标再次各自 4/4 严格单调，而且 T2 这次是在全量 48 条里训练过的，仍然是四条里最差的。</b>
+        累计两轮独立训练 × 两个指标 = <b>四次复现</b>。
+        <br><br>
+        这把第一之三之五节那条从「意外发现」升格为<b>可依赖的读数规则</b>：
+        <u>任何逐 episode 的 <code>dx</code> 数字，先看这条 episode 的 x 行程分位，再谈模型。</u>
+        它也解释了为什么 T2 看起来没被 6 倍数据救回来——它的 x 信号本来就只有 73.8 mm，
+        分母小，R² 天生难看；它的 chunk 累计其实从 +0.379 涨到了 <b>+0.670</b>，是全表涨幅最大的一格。
+      </div>
+
+      <h3>唯一没有解决的：<code>drz</code></h3>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th><code>drz</code> chunk 累计 R²</th><th>H22<span class="small">（没见过）</span></th><th>H40<span class="small">（没见过）</span></th><th>T2<span class="small">（训练过）</span></th><th>T4<span class="small">（训练过）</span></th></tr>
+        <tr><td>L3 <code>[1,1,1,1,2]</code></td><td class="num">−1.109</td><td class="num">−9.547</td><td class="num">+0.667</td><td class="num">+0.880</td></tr>
+        <tr><td>第 4 层 <code>[1,1,1,0.2,2]</code></td><td class="num"><b>−0.379</b></td><td class="num"><b>−8.417</b></td><td class="num">+0.027</td><td class="num">+0.524</td></tr>
+      </table>
+      </div>
+      <p><b>降权起了一半作用。</b>train 侧的过拟合确实被压住了（T4 +0.880 → +0.524，T2 +0.667 → +0.027，
+      模型不再拿预算去死记 yaw 轨迹），H22 的负值收敛了约 3 倍，它的逐步条件均值 <b>+0.148</b> 恰好落在 L0 上限 0.151 上。
+      <b>但 H40 仍然是 −8.417 ± 2.15，与降权前基本没区别。</b></p>
+      <div class="callout warn">
+        <b>这里要停下来的是指标本身，不是模型。</b><code>drz</code> 的 R² 分母近零（逐步信号 std 打印为 0.00 rad），
+        chunk 累计只是把这个问题推后了一点，并没有解决它。证据是同一个 checkpoint 上
+        <b>H22 落在上限、H40 是 −8.4</b>——两条按同一规则挑出来的内插 holdout 差了两个数量级，
+        这更像是两条 episode 的 <code>drz</code> 方差不同，而不是模型在其中一条上的行为不同。
+        ± 2.00／± 1.82 的抽样标准差本身也在说同一件事。
+        <br><br>
+        <b>结论：R² 在这一维上已经问不出东西了。</b>要判 <code>drz</code> 到底行不行，
+        得换一个<b>绝对量</b>的指标——一个 chunk 内累计 yaw 的角度误差，单位是度，
+        和「抓取要求的 yaw 容差是多少度」直接可比。
+        <span class="small">在拿到那个数之前，不要基于 R² 再动 <code>drz</code> 的权重——那会是第四次「把含噪连续量压成二元判定」，见第一之四节。</span>
+      </div>
+
+      <h3>第 4 层的判据结算</h3>
+      <p>判据写的是「留出集指标 + 真机 rollout」。<b>留出集这一半通过了</b>：
+      三个平移维在没见过的 peg 位置上都显著为正且比 L3 明显提升，夹爪保持，散布收窄，首步劣势消失。
+      <b>剩下的一半是真机 rollout</b>——这也是自 08-21 以来第一次，所有离线前提都成立、可以拿去真机验的时刻。</p>
+      <div class="callout warn">
+        <b>rollout 之前先过相机外参门。</b>采集与现在隔了数天，相机若被碰过，定位必然失败，
+        而那会被读成策略的问题——用第七节 P4 里的 <code>fr3_compare_live_capture_to_dataset_runtime.py</code> 先比一遍。
+      </div>
+      <div class="callout warn">
+        <b>这一节不覆盖的范围（两条都从第一之三之五节继承）：</b>
+        holdout 仍是按角度<b>内插</b>挑的，所以证明的仍然是<b>环带内的内插泛化</b>，
+        第六节那三个盲区（半径 &lt; 56 mm、&gt; 170 mm、79° 角度缺口）仍是分布外。
+        另外 <code>[22,40]</code> 现在已经被用来读过两轮结果——单一配方下不构成选择偏差，
+        但<b>一旦开始用它比较多个配方，它就不再是干净的留出集了</b>，届时要换一对。
+      </div>
+    </div>
+
+
+    <!-- ============================================ 一之三之八 真机首轮 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>一之三之八、第 5 层：真机 rollout 首轮 —— 泛化成立，失败模式整体换了一类</h2>
+        <span class="badge done">2026-08-31 · 操作者口述</span>
+      </div>
+
+      <div class="callout ok">
+        <b>ckpt <code>L4_full48_holdout22_40 / 030000</code> 在真机上表现出可用的泛化：夹爪懂得去找物体。</b>
+        按 peg 的摆放区域分成三档：<b>A</b> 抓起 + 插入都成；<b>B</b> 能接近、抓不起来；<b>C</b> 能抓起、插不准。
+        <br><span class="small">本节的读数来自操作者口述，<b>不是仪器记录</b>——三档各自覆盖哪些区域、各占多少、样本数是多少，
+        都还没有落到数据里。这本身就是下一步的第一件事，见第一之三之九节的 <b>S0</b>。</span>
+      </div>
+
+      <h3>比三档结果更重要的一条：失败模式换了一类</h3>
+      <p>把这一轮和 08-27 那两次失败并排放，会发现变化的不是成功率高低，而是<b>失败发生在哪一相、以及它属于哪一类问题</b>。</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>对照项</th><th>08-27 两次 rollout</th><th>08-31 首轮（030000）</th></tr>
+        <tr>
+          <td><b>夹爪往哪去</b></td>
+          <td>一个<b>合法但与本次 peg 无关</b>的抓取点：距最近的真实 demo 抓取点只有 9.1 / 15.3 mm，且落在采样过的环带内</td>
+          <td><b>朝本次 peg 去。</b>三档里没有一档是"走到一个不相干的位置"</td>
+        </tr>
+        <tr>
+          <td><b>y 这一维</b></td>
+          <td class="num">corr(pred, 真实动作) = <b>+0.001</b></td>
+          <td class="num">留出集 chunk 累计 <code>dy</code> <b>+0.868 / +0.862</b>，真机上兑现</td>
+        </tr>
+        <tr>
+          <td><b>失败在哪一相</b></td>
+          <td>接近相：撞 peg 触发 <code>cartesian_reflex</code>；定位歪</td>
+          <td>闭合相（B 档）或插入相（C 档）。接近相基本不再是失败点</td>
+        </tr>
+        <tr>
+          <td><b>要诊断的问题</b></td>
+          <td>有没有<b>条件化</b>（π(a|o) 里的 o 有没有起作用）</td>
+          <td>条件化的<b>精度</b>够不够（末端几毫米 + yaw）</td>
+        </tr>
+      </table>
+      </div>
+      <div class="callout p0">
+        <b>第一节那句总结可以撤销了。</b>
+        原文是「所有不看图就能学会的维度都学会了，唯一必须看图的两个维度没学会」。
+        现在<b>必须看图的两个维度也学会了</b>——只是精度不足以在最后几毫米内收口。
+        <br><br>
+        这不是"同一个问题变好了"，是<b>换成了另一个问题</b>，而两者的修法几乎没有交集：
+        前者要的是让信息进得来（容量、归一化、梯度预算），后者要的是<b>分辨率、相位专属的精度、以及标签本身够不够准</b>。
+        第四节 P1 那一整套旋钮已经交付完毕，继续在上面加压不会再有第二次收益。
+      </div>
+
+      <h3>阶段性成功经验：哪几步真正买到了这个结果</h3>
+      <p>一周没打通，五层三天走完。差别不在哪个超参上，下面八条是回头看真正起作用的部分——<b>每条都写成可迁移的形式</b>，因为它们比任何一个具体数值都更值得带到下一个任务。</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>#</th><th>经验</th><th>本轮的证据</th></tr>
+        <tr>
+          <td class="num">1</td>
+          <td><b>先把契约修成不可作弊的，再谈能力。</b>在问"模型学不学得会"之前，先确认 a 不是 o 的平凡函数——否则后面每一个实验都在测一个恒等映射，而且都会通过</td>
+          <td class="num">首帧可作弊度 0.68 → 0.18；夹爪 copy 通路 R² 0.9999 → 0.31。<br><span class="small">修契约本身不解决定位，但不修的话 L0–L4 全部不可读</span></td>
+        </tr>
+        <tr>
+          <td class="num">2</td>
+          <td><b>阶梯法：每层只问一个可判定的问题。</b>失败要被夹在<u>两层之间</u>，而不是散在整个假设空间里</td>
+          <td>L0 目标可预测吗 → L1 训练动过条件分布吗 → L2 预算是绑定约束吗 → L3 是不是在背题 → L4 哪一维在花预算。<br><span class="small">此前一周在同一条线上加参数，没有产生任何可以关掉方向的结论</span></td>
+        </tr>
+        <tr>
+          <td class="num">3</td>
+          <td><b>先测上限，再读差距。</b>没有上限的 R² 是不可读的数</td>
+          <td class="num">L0 给出 <code>dx</code> 上限 0.881、<code>drz</code> 上限 0.151。<br><span class="small">第一版门禁把不可达的 0.9 当门槛，作废了一天的结论——见第一之四节</span></td>
+        </tr>
+        <tr>
+          <td class="num">4</td>
+          <td><b>确认旋钮是不是你以为的那个。</b>"加 rank 没用"的观察是对的，结论是错的：缩放是 alpha/r，动分母会把分子一起压掉</td>
+          <td class="num">L2b：目标模块与 rank 完全不动，只把 alpha 8 → 32，买下 L2 一半的改进（<code>dx</code> 0.106 → 0.479），<b>零新增参数</b></td>
+        </tr>
+        <tr>
+          <td class="num">5</td>
+          <td><b>把"哪一维在浪费梯度"从推断变实测。</b>逐维 loss 预算 + 逐维不可约方差，是决定权重的最小证据集</td>
+          <td class="num">L4：<code>drz</code> 占 <b>32.0%</b> 预算而 <b>84.9%</b> 方差不可约 → 权重 0.2。<br><span class="small">此前的权重建立在一个只被推断过的说法上</span></td>
+        </tr>
+        <tr>
+          <td class="num">6</td>
+          <td><b>把探针放在主实验前面。</b>一个比主实验便宜一个数量级的探针，只要它<u>能改变主实验的配方</u>，就值得先跑</td>
+          <td>L3 花 2.5 小时，买到一个放行（配方不背题）+ 一个权重决定从推断变实测。主实验是 8 小时 23 分</td>
+        </tr>
+        <tr>
+          <td class="num">7</td>
+          <td><b>"先测，别先改"。</b>一个看起来该修的隐患，先确认它在新配方下还在不在</td>
+          <td>「首步最差」当时被当成 RTC 隐患，实测在全量数据下<b>自愈</b>（h0 +0.40 / +0.61），省掉一次对 <code>rtc_execution_horizon</code> 的改动，还顺带定了它的性质：<b>欠拟合在 h 轴上的投影</b></td>
+        </tr>
+        <tr>
+          <td class="num">8</td>
+          <td><b>把误读和证伪写进文档，而不是只写结论。</b>这一周有多次差点重新提出已被排除的方向</td>
+          <td>第一节两个被误读的信号、第一之四节三个方法论错误、第八节整张证伪表。<br><span class="small">其中"换归一化模式"和"加大 LoRA rank"两条后来被<b>反转</b>——写下证据（而不只是结论）才使反转成为可能</span></td>
+        </tr>
+      </table>
+      </div>
+      <div class="callout ok">
+        <b>贯穿这八条的是同一件事：把每个"我以为"变成一个便宜、可判定、且<u>能改变下一步动作</u>的测量。</b>
+        第 3、4、5 条各自推翻了一个当时被普遍相信的说法，而三次推翻的成本加起来不到一次全量训练。
+      </div>
+
+      <h3>三档失败各自对应哪个已知缺口</h3>
+      <p>三档都<b>不是</b>新发现的问题——每一档的第一嫌疑都已经挂在这份文档里，只是此前没有优先级，因为定位还没打通。现在它们各自有了一个真机现象来指认。</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>档</th><th>现象</th><th>失败相</th><th>第一嫌疑（出处）</th><th>判据</th></tr>
+        <tr>
+          <td><span class="badge done">A</span></td>
+          <td>抓起 + 插入都成</td><td>—</td>
+          <td>—</td>
+          <td><b>要记录它落在环带的哪个分位</b>——这是唯一的正样本，"什么条件下能成"只能从这里读</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">B</span></td>
+          <td>能接近，抓不起来</td><td>闭合相</td>
+          <td><b>末端几毫米的分辨率。</b>腕部相机 <b>47%</b> 的输入面积是灰边（第五节）；
+              以及"peg 在工作区四角的两个 crop 里是否全程可见、像素尺寸够不够"——<b>这一项从未系统检查过</b></td>
+          <td>crop 改成接近 1:1 后，B 档比例是否下降；若 B 档集中在某个方位，先查那个方位的 crop</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">C</span></td>
+          <td>能抓起，插不准</td><td>插入相</td>
+          <td>(1) <code>drz</code> 降权 0.2 是按<b>整条 episode</b> 的不可约方差定的，插入相位的 yaw 很可能正是可约的那 15%<br>
+              <span class="small"><s>(2) demo 里插入只有 +1.0 mm 位移</s> —— 08-31 已核对，那是个错指标，见下方"更正"。demo 确实插入 69.8±11.9 mm。</span></td>
+          <td><b>(1) 现在无阻塞，可以直接做。</b>标签里确有插入动作，所以重算插入相的 yaw 预算测的是一个真实存在的目标</td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">OOD</span></td>
+          <td>任意档，但 peg 落在盲区</td><td>不限</td>
+          <td>半径 &lt; 56 mm、&gt; 170 mm、79° 角度缺口（第六节）</td>
+          <td><b>分布外，不算进第 4 层的账</b>，直接转 P3 补数据</td>
+        </tr>
+      </table>
+      </div>
+
+      <div class="callout warn">
+        <b>这一轮还读不出来的东西（都因为同一个原因：没有记录）。</b>
+        三档的<b>比例</b>、每档对应的<b>区域</b>、失败落点相对环带的<b>半径与角度</b>、以及有多少失败其实落在那三个盲区里——
+        全部未知。<b>而"按区域分档"恰恰是目前信息量最大的信号：</b>它把"策略行不行"这个不可分的问题，
+        拆成了"在哪些条件下行"这个可分的问题，但只有把落点记下来才能真正拆开。
+        <br><br>
+        <span class="small">第九节在第 5 层里写的"要带回来的读数：失败发生在哪一相、peg 落在环带的哪个分位"，
+        前半条这次拿到了（口述），后半条没有。下一轮必须把后半条补上，否则 S2/S3/S4 三条路谁先走是靠猜的。</span>
+      </div>
+    </div>
+
+    <!-- ============================================ 一之三之九 提升成功率 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>一之三之九、后续如何继续提升成功率（按收益/成本排序）</h2>
+        <span class="badge p0">当前主线</span>
+      </div>
+
+      <div class="callout p0">
+        <b>排序原则变了。</b>过去五层回答的是<b>"为什么完全不行"</b>，那个问题可以在离线、在没有机器人的情况下判定，
+        所以阶梯法成立。现在要回答的是<b>"在哪些条件下不行"</b>——这是一个<u>需要先有数据才能提问</u>的问题。
+        <br><b>所以当前第一项不是改模型，而是验收并使用刚落地的测量链。</b>
+        S0 软件已完成；在 S0.1 真机验收和第一批带落点样本之前做 S2/S3/S4，仍是在拿 8 小时训练去赌一个可以用半小时观察确定的方向。
+      </div>
+
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>档</th><th>动作</th><th>针对</th><th>成本</th><th>为什么排在这个位置</th></tr>
+        <tr>
+          <td><span class="badge done">S0</span></td>
+          <td><b>记录 rollout 落点与结果档位</b><br><span class="small">软件链路完成，见下</span></td>
+          <td>全部三档</td>
+          <td class="num">已自动化：每次 rollout 结束自动出点，评分一次点击</td>
+          <td><b>它决定后面每一条该不该做。</b>自动测试已过；尚缺真机端到端验收与实际点云</td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">S0.1</span></td>
+          <td><b>真机双轮闭环验收</b><br><span class="small">含会话内 Move to start</span></td>
+          <td>测量链可信度</td>
+          <td class="num">同一会话 2 次受控 rollout</td>
+          <td><b>当前门禁。</b>确认轨迹 CSV → end marker → 评分 JSONL → 地图，以及第二轮归位后再启动，全部在真机成立</td>
+        </tr>
+        <tr>
+          <td><span class="badge todo">S1（可并行）</span></td>
+          <td><b>确认 030000 是不是平台期</b></td>
+          <td>全部三档</td>
+          <td class="num">GPU ~3.3 小时，无人值守，<b>零改动</b></td>
+          <td>6 个 checkpoint 已经在盘上，评测脚本已经能跑。<b>不占机器人，可与 S0.1 并行</b>；若曲线还在涨，最便宜的提升就是继续训</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">S2</span></td>
+          <td><b>腕部 crop 改成接近 1:1</b></td>
+          <td>B 档（抓不起来）</td>
+          <td class="num">重建一次 view + 一次重训</td>
+          <td>有效分辨率翻倍，是全表里最直接对准"最后几毫米"的一项，且<b>不需要改代码</b></td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">S3</span></td>
+          <td><b>分相位重算 yaw 的预算与不可约方差</b></td>
+          <td>C 档（插不准）</td>
+          <td class="num">给 L4 那个脚本加一个相位掩码</td>
+          <td>降权 0.2 对抓取是对的，但它<b>可能对插入是反向的</b>——这个矛盾目前是纯推理，一次离线计算就能结算</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">S4</span></td>
+          <td><b>定向补数据</b></td>
+          <td>落在盲区的失败</td>
+          <td class="num">采集时间</td>
+          <td><b>只在 S0 的散点图显示失败集中在盲区时才做</b>，且只补那三处，不是无差别加量</td>
+        </tr>
+        <tr>
+          <td><span class="badge todo">S5（可并行）</span></td>
+          <td><b>把 030000 与评测脚本归档</b></td>
+          <td>回退基线</td>
+          <td class="num">十几分钟</td>
+          <td>这是<b>第一个可工作的 baseline</b>；应在任何 S2/S3/S4 改动前完成，可与 S0.1/S1 并行。评测脚本仍在工作站 <code>/tmp</code></td>
+        </tr>
+      </table>
+      </div>
+
+      <h3>S0 — 把"按区域分档"变成一张图</h3>
+      <div class="callout ok">
+        <b>08-31 软件链路已实现，不再依赖手记。</b>Rollout 页面新增「Where the gripper landed」一图，
+        每次 rollout 结束自动落一个点，操作者已有的 Success / Failure / Aborted 一按，点就变色。
+        底图是这套 checkpoint 自己的 50 条 demo 抓取点 + 实测孔位 + 覆盖环带，都是从数据集现算的。
+        <br><span class="small"><b>完成边界：</b>现有首轮口述结果无法事后补回坐标；当前仓库里也没有一批由这条新链路闭环归档的真机样本。
+        所以 S0 的“软件实现”完成，S0.1 的“测量链验收”尚未完成。</span>
+      </div>
+      <p>设计上只有四个决定，其余都是它们的推论：</p>
+      <ul>
+        <li><b>不在线判事件。</b>rollout 不可重放——peg 的这次摆放被这次运行本身破坏了，当时没记的东西永远没了。
+            所以运行时只<b>逐步存原始轨迹</b>（EE 位置 + 夹爪指令，一行一步，一次 rollout 约 70 KB），
+            结束时再用规则把它约化成落点。在线判事件等于把一个阈值烧进不可复现的数据里；
+            存轨迹则让那个阈值仍然是个<b>事后可以改</b>的参数。
+            <span class="mono small">outputs/rollout_traces/rollout_NNN.csv</span></li>
+        <li><b>事件读夹爪<u>指令</u>，不读观测宽度。</b>观测那一路 47% 的帧掉成 0（见上一节的更正），
+            按它判"有没有闭合"会在掉帧上触发。</li>
+        <li><b>抓取是下降沿，不是“第一个闭合电平”。</b>开发中在 030000 的 rollout 6 观察到 live 起始夹爪 0.016，
+            而数据集起始契约是 1.000；若按第一个低于阈值的点判抓取，会把约 340 mm 高的 home pose 记成抓取点。
+            现在必须先出现张开指令，再取第一次张开→闭合；全程闭合或从未闭合都诚实地退回“最低接近点”。</li>
+        <li><b>只问人类才能回答的那一件事。</b>机器人自己知道的全部自动算：闭合点、释放点、
+            提起高度、插入下降、有没有闭合过。人只需要说"这次算不算成功"——而且是在<b>刚看完</b>的那一刻问，
+            不是事后凭记忆补。</li>
+      </ul>
+      <p>每次 rollout 自动得到的量：</p>
+      <div class="flow">闭合点 xyz        ->  夹爪真正合上的位置（= 策略认为 peg 在哪）
+释放点 xyz        ->  松手的位置（= 策略认为孔在哪）
+提起高度 / 插入下降 ->  和 demo 的 70.7 mm / 69.8 mm 直接可比
+从未闭合           ->  画成空心点：「够到了但没夹」和「夹了又掉」是两种失败，坐标可能一样
+操作者评分         ->  Success / Failure / Aborted（原有按钮，现在带着落点一起入库）</div>
+      <p class="small">
+        没有闭合的那次 rollout 也有落点：取它<b>最低的那一点</b>——那就是策略认为物体所在的地方，
+        正是 B 档最需要的读数。把它丢掉等于把最常见的失败从图上抹掉。
+      </p>
+      <p>把它叠到第六节那张环带上（半径 56–170 mm、角度覆盖 281°、缺口 79°），一张图同时回答三件事：</p>
+      <ul>
+        <li><b>失败是不是集中在三个盲区里。</b>是 → 走 S4，且这不算第 4 层的账；否 → 是精度问题，走 S2/S3。</li>
+        <li><b>B 档和 C 档在空间上分不分得开。</b>若 B 档集中在某个方位，第一嫌疑立刻变成"peg 在那个方位被 crop 裁掉了或太小"，
+            那是第五节那条"从未系统检查过"的直接命中，比重训便宜两个数量级。</li>
+        <li><b>A 档的分布长什么样。</b>正样本的形状决定了"缩小随机化范围"该缩到哪里——第六节建议过缩小范围，
+            但当时没有依据说该保留哪一块。</li>
+      </ul>
+      <div class="callout warn">
+        <b>顺带把相机外参门补上。</b>第九节第 5 层写了"跑之前先过外参门"，
+        用 <code>fr3_compare_live_capture_to_dataset_runtime.py</code> 比一遍。
+        这一轮是否过了这道门没有记录——<b>如果没过，B/C 两档里可能有一部分是外参漂移而不是策略精度</b>，
+        那会把 S2 和 S3 的判读全部带偏。这是整张表里最便宜、也最容易被跳过的一步。
+      </div>
+
+      <h3>S0.1 — 多轮 rollout 的起点契约与真机验收</h3>
+      <div class="callout p0">
+        <b>新增发现：交互式会话原来只在启动器进入 runtime 之前归位一次。</b>
+        第一轮结束后，runtime 仍持有唯一的 libfranka 连接；如果不结束进程，第二轮会从上一轮停止位姿开始，
+        而页面此前仍显示“arm is at its start pose”。这会让数据集坐标系的起点契约失真，也会污染多轮 rollout 的可比性。
+      </div>
+      <p>当前代码已经补齐这条链：</p>
+      <ul>
+        <li>runtime/pipe/GUI 增加 <code>home</code> / <code>Move to start</code>，只允许在 <code>waiting</code> 状态触发；
+            homing 自己是“机械臂正在运动”的状态，不能伪装成 waiting。</li>
+        <li>每轮结束后 <code>armAtStart=false</code>；归位成功后才恢复为 true。Start 也只在 runtime 真正进入 waiting 后可按，
+            避免加载阶段过早按下、请求随后被清掉。</li>
+        <li><b>归位不自动开夹爪。</b>若仍夹着物体，页面要求操作者先处理；让程序擅自在未知位置松手比保留现状更危险。</li>
+      </ul>
+      <div class="callout warn">
+        <b>当前验收状态：</b>GUI rollout 后端 <b>116 项通过</b>，前端 <b>123 项通过</b>，生产构建与 Python 语法编译通过。
+        完整 <code>test_fr3_act_infer_real.py</code> 在本工作站收集阶段被环境冲突挡住：
+        <code>huggingface-hub==1.12.0</code>，而当前 <code>transformers</code> 要求 <code>&lt;1.0</code>；
+        这不是测试失败，但意味着不能据此宣称 runtime 已全量回归。
+        <br><br>
+        <b>真机门禁：</b>先运行相机外参比对并把结果留档；再在同一交互会话连续做两轮受控 rollout。
+        第一轮确认 CSV、end marker、评分 JSONL 和地图点一致；按 <code>Move to start</code>，
+        确认机械臂回到数据集起点且夹爪保持不变；第二轮再启动并重复检查。
+        至少再覆盖一次“从未闭合→最低点空心标记”。完成前，S2/S3/S4 仍不应按这张图做选择。
+      </div>
+
+      <h3>S1 — 曲线还在涨吗？6 个 checkpoint 已经在盘上</h3>
+      <p><code>L4_full48_holdout22_40</code> 每 5000 步存了一个，共 <code>005000 … 030000</code>；
+      留出集评测脚本接受 checkpoint 路径作为第一个参数。<b>不需要训练，只需要把已有的点连成一条曲线</b>：</p>
+      <div class="flow">cd /home/hph/Code/lerobot &amp;&amp; setsid nohup env \
+  HF_HOME=$HOME/hf_cache HF_HUB_OFFLINE=1 PYTHONPATH=src:. \
+  bash -c 'for s in 005000 010000 015000 020000 025000; do
+             .venv-fr3/bin/python -u /tmp/l3_holdout_eval.py \
+               outputs/train/L4_full48_holdout22_40/checkpoints/$s/pretrained_model
+           done' &gt; /tmp/l4_ckpt_sweep.log 2&gt;&amp;1 &amp;</div>
+      <div class="callout ok">
+        <b>读法：看 holdout 的 chunk 累计 <code>dx</code>／<code>dy</code>（030000 处是 +0.840／+0.863 与 +0.868／+0.862）在 025000 → 030000 之间还有没有斜率。</b>
+        <ul style="margin:8px 0 0">
+          <li><b>还在涨</b> → 30000 步（≈10.0 epoch）只是训练预算用完了，不是模型能力到顶。
+              <b>继续训是全表里最便宜的提升</b>：不改配方、不改数据、没有新假设，风险接近零。</li>
+          <li><b>已经平了</b> → 提升必须来自 S2/S3/S4，此时再花 8 小时重训才是有依据的。</li>
+        </ul>
+        <span class="small">这一项同时是 P4 第一条（离线评测工具化）的第二次付款：同一套指标，这次用来给 checkpoint 排序而不是给配方排序。</span>
+      </div>
+
+      <h3>S3 — 为什么"给 <code>drz</code> 降权"可能对插入是反向的</h3>
+      <div class="callout warn">
+        <b>0.2 这个权重建立在一个整条 episode 上算出来的量上。</b>
+        L4 测的是<code>drz</code> 占 32.0% 的 loss 预算、其中 84.9% 的方差不可约——但那是把<b>接近、对准、闭合、提起、插入</b>五个相位混在一起算的。
+        接近相里 yaw 几乎是自由的（怎么转都不影响结果），它会贡献大量不可约方差；
+        而<b>插入相里 yaw 是被孔约束死的</b>，那一段很可能正是可约的那 15%。
+        <br><br>
+        <b>如果是这样，降权就是在压制唯一真正需要学的那一段 yaw</b>——而 C 档"能抓起、插不准"正是这个预测该产生的现象。
+        <br><br>
+        <b>做法：</b>给 L4 那个逐维预算脚本加一个相位掩码（按夹爪状态切分即可：张开=接近，闭合后=运送+插入），
+        分相位重算预算占比与不可约方差。若插入相的 <code>drz</code> 不可约比例显著低于 84.9%，
+        下一版就不是"调 <code>drz</code> 的标量权重"，而是<b>给插入相位单独加权</b>。
+        <span class="small">这是一次离线计算，不需要训练，也不需要机器人。</span>
+      </div>
+      <div class="callout ok">
+        <b>更正（08-31 晚，已实测）：那个 +1.0 mm 是个错指标，不是一个可疑的数据。</b>
+        它是 <code>z@抓取</code> 减 <code>z@释放</code>——两个<b>都发生在桌面高度</b>的事件之差，
+        本来就不该等于插入深度。插入深度是<b>从提起的顶点下降到释放点</b>的那一段。按后者重算 50 条 demo：
+        <div class="flow">z@闭合   50.05 ± 3.51 mm      (min 41.3 / max 56.6)
+z@释放   51.01 ± 4.07 mm      (min 41.9 / max 58.4)
+z 顶点   120.79 ± 11.41 mm    (min 99.1 / max 162.1)
+插入下降 = 顶点 - 释放   <b>69.78 ± 11.85 mm</b>   (min <b>47.35</b> / max 107.88)
+提起高度 = 顶点 - 闭合   70.74 ± 10.23 mm
+夹持时长 223 ± 30 步 ≈ 7.4 s        n = 50 / 50 条 episode 全部下降 ≥ 47 mm</div>
+        所以 <b>demo 里插入是真的插进去了</b>，标签里有这个动作，S3 不再有前置条件。
+        原来那条"若 demo 只是送到孔上方就松手"的分支不成立，可以从计划里去掉。
+        <br><span class="small">教训与第八节那两条同类：一个指标写出来之后，要先问它测的是不是它名字说的那件事。
+        「抓取高度和释放高度差不多」是真的，「没有插入动作」是从它推出来的，而这一步推理是错的。</span>
+      </div>
+      <div class="callout warn">
+        <b>同一次核对里顺带查到的一件事，会影响所有以夹爪为准的分析：</b>
+        <code>observation.state.gripper.pos</code> 在这份数据里<b>有 47% 的帧掉成 0</b>，
+        而同一时刻 <code>action.gripper.pos</code> 是干净的 1.0。
+        真正的"夹住 peg"宽度是 0.31–0.32（占 24% 的帧）。
+        <br>所以：<b>任何"有没有抓到 / 什么时候闭合"的判据都不能读观测夹爪宽度</b>，要读指令那一路。
+        落点记录（S0）就是这么实现的。观测这一路的掉帧本身也是个待查项——策略的输入里有它。
+      </div>
+
+      <h3>不要再试的（第八节已证伪，三档结果不改变结论）</h3>
+      <ul>
+        <li><b>推理端多采样平均</b>压不掉 B/C 档。它压的是<u>散布</u>，而 B/C 是<u>均值精度</u>问题。
+            而且散布在第 4 层已经自己降了（<code>dx</code> 散布代价 0.554 → 0.319 / 0.239 → 0.110），
+            <b>这条路的动机比当初更弱，不是更强</b>。</li>
+        <li><b>调高 <code>num_inference_steps</code></b>：pi0.5 采样是确定性 ODE 积分，加步数不缩小跨噪声散布。</li>
+        <li><b>在线平滑（<code>commandEmaAlpha</code>）</b>：平滑压不掉一个指向错误的均值。</li>
+        <li><b>动 <code>rtc_execution_horizon</code></b>：「首步最差」已自愈，剖面在 H40 上基本是平的，当前没有依据去动它。
+            <span class="small">唯一可能让它回到桌面上的是 S0 的记录——若 C 档的失败集中在最后 0.5 s 的开环段内，那才是重新提出它的理由。</span></li>
+      </ul>
+
+      <div class="callout ok">
+        <b>一次只动一个旋钮。</b>现在第一次有了一个可工作的 baseline，也就第一次有了<b>可以回退的参照</b>。
+        此前多轮实验之所以难判读，是因为没有一个"已知能到什么程度"的锚点；030000 现在就是那个锚点，
+        所以它和它的评测脚本必须先归档（S5），再动任何东西。
+      </div>
+    </div>
+    <!-- ============================================ 一之四 方法论 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>一之四、这一周走弯路的方法论错误（保留在文档里）</h2>
+        <span class="badge warn">避免第四次</span>
+      </div>
+      <p>下面三个错误各让一到两天的结论作废过。共同点不是编码 bug，而是<b>都在把一个含噪的连续量压成二元 PASS/FAIL 判定，而每个判据都建立在单点估计上</b>。记在这里，因为它们比任何一条实验结论都更容易重犯。</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>#</th><th>错误</th><th>后果</th><th>规避方式</th></tr>
+        <tr>
+          <td>1</td>
+          <td><b>覆盖了还没读的 <code>sys.argv</code></b><br><span class="small">评测脚本里先 <code>sys.argv = ["x"]</code>（为了让下游 parser 不报错），之后才去读 <code>argv[1]</code> 取 checkpoint 路径。</span></td>
+          <td>MEAN_STD 的门禁<b>实际重测了旧的 MIN_MAX checkpoint</b>。是「两次数字逐位相同」这个巧合才暴露的。</td>
+          <td>任何要改写 <code>sys.argv</code> 的脚本，<b>第一行</b>就 <code>_ARGV = list(sys.argv)</code>，后续只读副本。</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td><b>用一条该维度几乎不动的 episode 去考察该维度</b><br><span class="small">选 ep0 做过拟合测试，而它的 dx 位移只有 13.7 mm（第 28 百分位）、y/x 比 3.97（中位数 1.47）。</span></td>
+          <td>得出<b>「管线有结构性缺陷」</b>并据此暂停 P1/P3。换 ep4 后 dx R² 从 −0.643 变 +0.501，结论作废。</td>
+          <td>做单条 episode 的实验前，先看这条 episode 在<b>被考察的那个维度</b>上的分位数；不要用默认的第 0 条。</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td><b>用单点估计去定判据</b><br><span class="small">(a) 噪声上限 <code>R²_max = 1−(noise/signal)²</code> 里的 noise 只在<b>一帧</b>上测；(b) 夹爪判据是「预测值首次跌破 0.5」。</span></td>
+          <td>(a) <code>dy</code> 算出 <b>174% of ceiling</b>——数学上不可能，说明上限本身是错的（那一帧噪声 26.2 mm，全程实际残差只有 22.5 mm）。<br>(b) 一次偶然抖动就触发，ep4 报「第 12 帧闭合」而真值 186。</td>
+          <td>噪声估计至少跨 20 帧取中位数；阈值穿越类判据改成<b>连续 N 帧</b>或用面积/相关性等积分量。<b>更根本的：不再做二元门禁，直接报分级事实。</b></td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td><b>用单次噪声抽样的 R² 下结论</b><br><span class="small">flow matching 的输出是初始噪声的函数；每个探针帧只抽一次，就把一个随机量当成了确定量。</span></td>
+          <td>同一 checkpoint、同一 episode 的 <code>dx</code> @ h=0 报出过 <b>−0.423</b> 和 <b>+0.476</b>，符号相反。两个数都进过结论。</td>
+          <td>每个探针帧至少 8 次独立抽样，分开报<b>单次抽样</b>与<b>条件均值</b>两个数——它们的差本身就是要测的量。</td>
+        </tr>
+      </table>
+      </div>
+      <div class="callout warn">
+        <b>第五个正在形成的错误，提前记下：</b>P0.1 的过拟合测试<b>是用部署时的参数预算跑的</b>（LoRA 2.57M / 4.15B = 0.06%，VLM 全冻结）。
+        在这个预算下失败，<b>无法区分「管线有 bug」和「可训练容量不够」</b>——而过拟合测试的全部意义就是排除前者。
+        <br><br>
+        <b>正确做法是先在<u>不受限</u>的配置下确认天花板</b>（放开 action expert），再把约束一个个加回去。这条直接决定了下一步的顺序。
+      </div>
+    </div>
+
+    <!-- ============================================ 第一性原理 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>二、第一性原理：BC 要成立必须<u>同时</u>满足五个条件</h2>
+        <span class="badge todo">分析框架</span>
+      </div>
+      <p>行为克隆学的是 <span class="mono">π(a|o)</span>。要在真机上产生正确动作，下面五条缺一不可。<b>截至 08-31，五条都已有直接证据</b>；当前边界不再是必要条件是否成立，而是环带内末端精度与环带外覆盖。</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>#</th><th>条件</th><th>当前状态</th><th>对应章节</th></tr>
+        <tr><td>1</td><td><b>标签里有信息</b>：o 必须能决定 a，且 a 不能是 o 的平凡函数</td>
+            <td><span class="badge done">已验证</span> 契约已修：首帧可作弊度 0.68→0.18；夹爪 copy 通路 R² 0.9999→0.31</td><td>—（已完成）</td></tr>
+        <tr><td>2</td><td><b>观测里有信息</b>：图像必须真的包含 peg 位置，且信息要能<b>抵达</b> action expert</td>
+            <td><span class="badge done">已验证</span> 信息完好送达 expert 真正 attend 的 KV cache<br>LOO R²: x=<b>0.485</b> / y=<b>0.201</b>（穿过冻结 LM 保留 114.6%/109.6%）</td><td>P0.2 <b>已完成</b></td></tr>
+        <tr><td>3</td><td><b>模型有容量</b>表示这个映射</td>
+            <td><span class="badge done">已验证</span> L2 放开 action expert（27.86M 可训练参数，r/alpha=64/64）后，ep4 单次抽样 R²：
+            <code>dx</code> 0.106→<b>0.893</b>、<code>dy</code> 0.106→0.797、<code>dz</code> −0.196→0.799。绑定约束是预算，不是管线 bug</td><td>第一之三之四、P1.1</td></tr>
+        <tr><td>4</td><td><b>优化能找到它</b>：梯度要流向失败的维度</td>
+            <td><span class="badge done">已验证并落地</span> MEAN_STD 拉平尺度；逐维权重已实现并用于第 4 层
+            <code>[1,1,1,0.2,2]</code>。留出集三个平移维全部上涨，夹爪保持约 0.96</td><td>第一之三之六、第一之三之七、P1.2</td></tr>
+        <tr><td>5</td><td><b>样本足够</b>约束这个映射</td>
+            <td><span class="badge done">环带内已验证</span> 8 条训练已能泛化到角度内插 holdout；48 条后 H22/H40 的 chunk 累计
+            <code>dx</code> +0.840/+0.863、<code>dy</code> +0.868/+0.862。<br>
+            <span class="small">边界：半径 &lt;56 mm、&gt;170 mm 与 79° 角度缺口仍是 OOD</span></td><td>第一之三之五、第一之三之七、P3</td></tr>
+      </table>
+      </div>
+      <div class="callout ok">
+        <b>框架结算：五条必要条件全部通过，诊断阶段结束。</b>
+        契约修复解决第 1 条，KV 探针解决第 2 条，L2 解决第 3 条，归一化与逐维权重解决第 4 条，L3/第 4 层解决第 5 条。
+        第 5 层真机首轮又把离线结论兑现成“夹爪会找本次物体”。当前主线因此转为<b>测量末端精度与失败区域</b>，不是继续给前五条加压。
+      </div>
+
+      <h3>两个关键前提的结算</h3>
+      <div class="callout ok">
+        <b>前提 A —— 这条管线能不能过拟合？<span class="badge done">已回答：能</span></b><br>
+        L2 在同一条 ep4 上只放开预算与更新强度，就把 <code>dx</code> 单次抽样 R² 从 0.106 推到 <b>0.893</b>，
+        <code>dy/dz</code> 到 0.797/0.799，夹爪到 0.976，loss 0.464→0.108。
+        <b>「管线 bug」与「容量不够」已经分开，答案是后者。</b>
+      </div>
+      <div class="callout ok">
+        <b>前提 B —— 视觉信息能不能穿过冻结的 LM 层？<span class="badge done">已回答：能</span></b><br>
+        实测 action expert 真正 attend 的 <code>past_key_values</code>：LOO R² x=<b>0.485</b> / y=<b>0.201</b>，相对 <code>embed_image</code> 基线保留 <b>114.6% / 109.6%</b>。冻结的语言模型不但没丢信息，还因为跨相机混合 token 而让位置<b>更</b>线性可分。
+        <br><br>
+        <b>结论：瓶颈在 action expert 下游的「读出」环节，不在冻结的 VLM。</b>这条结论直接砍掉了「给 LM / vision tower 加 LoRA」这个方向，把 P1.1 收敛到投影头与 expert 内部——见第四节。
+      </div>
+    </div>
+
+    <!-- ============================================ P0 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>三、P0 — 先证明管线能学会任何东西（阶梯法）</h2>
+        <span class="badge p0">最高优先级</span>
+      </div>
+      <p>目前的任务是「peg 在 23×28 cm 内随机 + 抓取 + 插孔」。这<b>不是</b>一个 basic baseline。正确做法是把难度降到必然可解，确认管线无误，再<b>逐级</b>加回难度，每级设一个门。任何一级失败，问题就被夹在该级和上一级之间。</p>
+
+      <div class="phase">
+        <div class="name">P0.1 单条 episode 过拟合<br><span class="badge p0">已完成：FAIL</span></div>
+        <div>
+          用<b>1 条</b> episode 训练，step 数取到 loss 明显收敛（建议 3k–5k，batch 8）。然后在<b>同一条</b> episode 上离线推理，逐帧比对预测动作与真值。
+          <div class="flow">通过判据（在训练用的那条 episode 上）
+  per-dim R²(dx) > 0.9    per-dim R²(dy) > 0.9
+  夹爪闭合帧位置误差 < 5 帧
+  同帧重复采样 std(dx,dy) < 3 mm      ← 条件分布应该很窄</div>
+          <p class="small">成本：约 20–40 分钟一轮，不占真机。</p>
+        </div>
+        <div>
+          <div class="gate"><b>Gate 结果：未通过</b><br>
+            四条判据全部 FAIL（见第一之二节）。按门禁规定，<b>在修好归一化 + loss 预算之前不启动 P3 补数据</b>。
+            <br><br>候选清单里「归一化」已被证实并部分修复；<b>时间对齐 / crop 通路 / chunk 语义仍未逐一排除</b>，若 P1.2 之后仍不通过需回到这里。
+          </div>
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="name">P0.2 KV cache 探针<br><span class="badge done">已完成 08-27</span></div>
+        <div>
+          验证<b>前提 B</b>：对同样 50 条 episode 的接近帧，提取 action expert <b>真正 attend 的那个 <code>past_key_values</code></b>（逐层 k/v 对 head 与序列维 mean-pool，9216 维），与 <code>embed_image</code> 基线做同一套留一法岭回归。
+          <div class="flow">特征层                          维度    LOO R² x   LOO R² y
+embed_image (SigLIP, LM 之前)   4096      0.424      0.183
+KV cache   (冻结 LM 之后)       9216      0.485      0.201
+                        保留率   ——      114.6%     109.6%
+
+policy 自己（8 次采样平均，同一目标）       ~0.165     ~0.015</div>
+          <p><b>前提 B 被证伪。</b>冻结的语言模型不但没有丢失 peg 位置，反而让它<b>更线性可分</b>（LM 会跨两个相机混合 token 并注入上下文）。</p>
+        </div>
+        <div>
+          <div class="gate"><b>Gate 结果</b><br>
+            信息完好抵达 KV cache → <b>瓶颈在 action expert 下游</b>。
+            <br><br><b>不要给 language model 或 vision tower 加 LoRA</b>——那两级已经把信息送到了，给它们加容量是花 8.5 小时买一个不是瓶颈的东西。
+          </div>
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="name">P0.3 难度阶梯<br><span class="badge todo">按序</span></div>
+        <div>
+          每一级独立采集、独立训练、独立 rollout，<b>只加一个难度维度</b>：
+          <div class="tablewrap">
+          <table class="table">
+            <tr><th>级</th><th>peg 位置</th><th>任务</th><th>demo 数</th><th>期望</th></tr>
+            <tr><td>L0</td><td><b>完全固定</b></td><td>只抓起</td><td>10–15</td><td>近乎必然成功；不成功即管线问题</td></tr>
+            <tr><td>L1</td><td>±3 cm</td><td>只抓起</td><td>25</td><td>视觉伺服的最小可用验证</td></tr>
+            <tr><td>L2</td><td>环带上取 8 个固定角度<br><span class="small">半径固定在 100 mm</span></td><td>只抓起</td><td>50</td><td>把 2 自由度降成 1 自由度；实测半径实际散了 3 倍，这里先钉住它</td></tr>
+            <tr><td>L3</td><td>8×8 cm</td><td>抓起 + 插孔</td><td>50–80</td><td>加回第二阶段</td></tr>
+            <tr><td>L4</td><td>23×28 cm</td><td>抓起 + 插孔</td><td>250+</td><td>当前目标，见 P3 测算</td></tr>
+          </table>
+          </div>
+          <p class="small">「只抓起」意味着 episode 在夹爪闭合并抬起 10 cm 后结束——去掉插孔阶段能把 episode 长度和任务复杂度都砍掉一半，是最省的降难度手段。</p>
+        </div>
+        <div>
+          <div class="gate"><b>Gate</b><br>
+            L0 真机成功率 &lt; 80% → 不要往上走，回到 P0.1。<br>
+            每一级达到 ≥80% 才允许进下一级。<br>
+            <b>当前实际处在 L4，却从未验证过 L0。</b>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================ P1 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>四、P1 — 容量与优化：让梯度流到失败的维度</h2>
+        <span class="badge done">主线已完成</span>
+      </div>
+      <div class="callout ok">
+        <b>本节以下保留的是当时的候选与决策过程；当前结算见 L2/L2b/第 4 层。</b>
+        alpha 修复贡献约一半，expert 全 linear 覆盖贡献另一半；最终配方为 r=64/alpha=64、27.86M 可训练参数，
+        再配合 MEAN_STD 与逐维权重。冻结 VLM 不需要动。
+      </div>
+
+      <h3>P1.1 容量该加在哪：由 P0.2 定案</h3>
+      <div class="callout p0">
+        <b>信息已经送到了，是读出这一步丢的。</b>线性读出头能从 KV cache 拿到 R² <b>0.485 / 0.201</b>，而拥有 2.57M 可训练参数、专门用来读这个 cache 的 policy 只拿到 <b>0.165 / 0.015</b>——白白丢掉 x 上 66%、y 上 <b>92%</b> 的可用信号。<b>在把这 3–13 倍差距拿回来之前，不要动 VLM。</b>
+      </div>
+      <p>现状：默认 regex 只覆盖 <code>gemma_expert</code> 的 q/v 加 5 个投影头，共 <b>2.57M / 4.15B = 0.06%</b>。按 P0.2 的结论，候选按优先级排序：</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>优先级</th><th>改动</th><th>理由</th></tr>
+        <tr>
+          <td><span class="badge p0">先试</span></td>
+          <td><b>投影头改全量训练</b><br><code>peft.full_training_modules</code>（当前为 <code>null</code>）<br>覆盖 <code>state_proj</code> / <code>action_in_proj</code> / <code>action_out_proj</code> / <code>action_time_mlp_*</code></td>
+          <td>动作空间是<b>全新的</b>（5 维、新归一化、新任务），而这些投影头目前只是在「为另一个动作空间预训练的权重」上加 rank-32 增量。读出这一步正是丢信号的地方。参数量增加很小</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">再试</span></td>
+          <td><b>在 <code>gemma_expert</code> 内部扩展 LoRA</b>：加 <code>o_proj</code> 与 MLP（<code>gate/up/down_proj</code>）</td>
+          <td>现在只有 q/v 可训，能调「往哪看」，不能调「看到之后怎么算」。仍然局限在 expert 内，比动 3B VLM 便宜得多</td>
+        </tr>
+        <tr>
+          <td><span class="badge done">不要做</span></td>
+          <td class="strike">paligemma language model q/v（36 模块）<br>paligemma vision tower q/v（54 模块）</td>
+          <td><b>P0.2 已排除</b>：信息穿过这两级的保留率是 114.6% / 109.6%，它们不是瓶颈</td>
+        </tr>
+      </table>
+      </div>
+      <p>模块名前缀（已实测，写 regex 时以 PEFT 去掉 <code>base_model.model.</code> 后的 key 为准）：</p>
+      <div class="flow">model.paligemma_with_expert.gemma_expert.model.layers.{i}.self_attn.{q,v,o}_proj
+model.paligemma_with_expert.gemma_expert.model.layers.{i}.mlp.{gate,up,down}_proj
+model.{state_proj,action_in_proj,action_out_proj,action_time_mlp_in,action_time_mlp_out}</div>
+      <div class="callout warn">
+        <b>零匹配不会静默通过——这条已于 08-28 实测更正。</b>
+        <span class="strike">一个匹配不到任何模块的 regex 不会报错，只会静默训练 0 个适配器，代价是 8.5 小时。</span>
+        实测 peft 0.20.0：字符串 regex（<code>re.fullmatch</code>）和列表两种写法，只要<b>一个模块都没匹配上</b>，
+        <code>get_peft_model</code> 就抛 <code>ValueError: Target modules ... not found in the base model</code>，
+        在建模型的那几秒内失败，不会跑掉 8.5 小时。
+        <br><b>剩下的那一种才要防</b>：<u>列表里部分条目拼错</u>——<code>["q_proj","typo_proj"]</code> 不报错，
+        只在匹配上的模块装 adapter。<code>lerobot_train.py:394-412</code> 启动时打印的
+        <code>num_learnable_params</code> 是现成的暴露手段，提交前扫一眼即可；
+        写成一条 regex（L2/L3 的做法）则连这一种也不存在。
+      </div>
+
+      <h3>P1.2 归一化 + 逐维 loss 权重 <span class="badge done">已实现并验证</span></h3>
+      <div class="callout ok">
+        <b>P0.1 证明这是主因，第 4 层完成闭环。</b>归一化同时决定尺度与预算；现在用 MEAN_STD 拉平尺度，
+        再用逐维权重独立分配预算。实际配方 <code>[1.0,1.0,1.0,0.2,2.0]</code> 已完成 30000 步训练并通过留出集判据。
+      </div>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>方案</th><th>尺度</th><th>预算</th><th>实测后果</th></tr>
+        <tr><td><code>MIN_MAX</code>（原配置）</td><td><span class="badge p0">失衡</span> dx 0.112 / drz 0.047</td><td><span class="badge p0">失衡</span> 夹爪 62.3%</td><td>平移掉进噪声：dx R² −1.808</td></tr>
+        <tr><td><code>MEAN_STD</code>（已测）</td><td><span class="badge done">拉平</span> 全部 = 1.0</td><td><span class="badge warn">被迫平均</span> 各 20%</td><td>平移改善，但夹爪饿死：闭合帧误差 3 → 247</td></tr>
+        <tr><td><b><code>MEAN_STD</code> + 逐维权重</b></td><td><span class="badge done">拉平</span></td><td><span class="badge done">按需</span></td><td><span class="badge done">已验证</span> H22/H40 三个平移维全线上涨，夹爪保持</td></tr>
+      </table>
+      </div>
+      <p><b>实现已落地：</b><code>Pi05Config.action_loss_weights</code> 从训练配置读入，在截断到真实动作维之后、总 loss 归约之前应用；
+      权重自动重归一化到均值 1，因此只重分配梯度、不暗改总学习率。<code>loss_per_dim</code> 保留加权前读数，
+      <code>loss_per_dim_weighted</code> 记录加权后读数。</p>
+      <p><b>实际权重：</b><code>[1.0,1.0,1.0,0.2,2.0]</code>。<code>drz</code> 降到 0.2 来压住 84.9% 不可约方差，
+      夹爪保持 2.0，避免 MEAN_STD 单独使用时再次饿死闭合时机。</p>
+      <div class="callout ok">
+        <b>验证结果：</b>第 4 层 H22/H40 的 <code>dx</code> h0 提升 +0.312/+0.197，<code>dy</code> +0.229/+0.084，
+        <code>dz</code> +0.089/+0.121；夹爪保持约 0.96。散布也第一次实质收窄。完整数字见第一之三之七。
+      </div>
+
+      <h3>P1.3 条件分布过宽是核心症状，值得单独盯</h3>
+      <p>同一帧、同一观测重复推理 10 次，chunk 累计位移的散布：</p>
+      <div class="flow">同帧采样 std     x = 13.9 / 17.1 / 10.7 mm      y = 17.6 / 17.8 / 9.4 mm
+跨 episode 真实变化  x = 11.3 mm                    y = 19.1 mm</div>
+      <p><b>模型自己的采样噪声 ≈ 它要产生的全部真实信号。</b>给定场景，demo 的接近方向基本是确定的；一个拟合良好的模型条件分布应该很窄。14 mm 的散布意味着模型认为很多个方向都同样合理——即它没有把场景解析出来。</p>
+      <p><b>当前更新：</b>第 4 层已经把散布代价从 H22/H40 的 0.554/0.239 降到 0.319/0.110，
+      证明这一症状会随拟合改善而收窄；但固定 checkpoint 的逐 checkpoint 报告仍未工具化，继续列在 P4/S5。</p>
+    </div>
+
+    <!-- ============================================ P2 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>五、P2 — 观测效率：现在有一半的视觉预算浪费在灰边上</h2>
+        <span class="badge warn">便宜，值得早做</span>
+      </div>
+      <p><code>resize_with_pad_torch</code> 保持长宽比后 letterbox 到 224×224。按当前 crop 计算实际利用率：</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>相机</th><th>crop (x,y,w,h)</th><th>长宽比</th><th>224×224 内的有效区域</th><th>padding 占比</th></tr>
+        <tr><td><code>observation.images.ee</code></td><td class="num">58,194,542,286</td><td class="num">1.90:1</td><td class="num">224 × 118</td><td class="num"><b>47%</b></td></tr>
+        <tr><td><code>observation.images.side</code></td><td class="num">108,58,444,382</td><td class="num">1.16:1</td><td class="num">224 × 193</td><td class="num">14%</td></tr>
+      </table>
+      </div>
+      <div class="callout warn">
+        <b>腕部相机有 47% 的输入面积是灰边。</b>这不会造成几何畸变（是 pad 不是 stretch，最早那轮的担心可以排除），但它确实把有效分辨率砍掉了近一半——而分辨率正是「精确定位一个小 peg」最吃的资源。
+        <br><br>
+        修法：把 crop 调成接近 1:1（例如以 peg 工作区为中心取正方形），或让 crop 的长宽比匹配网络输入。<b>这是一次 view 重建就能拿到的收益，不需要改代码。</b>
+      </div>
+      <h3>其他观测侧待验证项</h3>
+      <ul>
+        <li><b>peg 在两个 crop 里是否全程可见、可分辨。</b>工作区 23×28 cm，需要抽查工作区四角的帧，确认 peg 没有被裁掉、且像素尺寸足够。<b>这一项从未系统检查过。</b></li>
+        <li><b><code>n_obs_steps=1</code>，没有历史帧。</b>8 维 state 里没有速度项，单帧观测无法推断运动状态。对 delta 契约而言这是个真实的信息缺口，但目前<b>没有证据</b>说它是当前瓶颈——列为 L2 之后再考虑的备选。</li>
+        <li><b>相机外参漂移。</b>采集与 rollout 之间若相机被碰过，定位必然失败。<code>tools/fr3/fr3_compare_live_capture_to_dataset_runtime.py</code> 已经能做这个比对，建议把它变成 rollout 前的<b>强制前置门</b>（见 P4）。</li>
+      </ul>
+    </div>
+
+    <!-- ============================================ P3 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>六、P3 — 数据量与采样结构（08-27 实测修正）</h2>
+        <span class="badge warn">已降级为次要瓶颈</span>
+      </div>
+
+      <div class="callout warn">
+        <b>本节原先的测算偏悲观 2 倍，已按实测改写。</b>原文用「23×28 cm 矩形均匀分布」估出最近邻 35.7 mm、需要 7 倍插值。实际抓取点<b>沿一个环带分布</b>，真实最近邻只有 18 mm。结论方向不变，但「数据量」不再是主要嫌疑。
+      </div>
+
+      <h3>真实的采样结构：绕固定 hole 的一个厚环带</h3>
+      <p>hole 位置可以直接从数据里恢复——<b>夹爪张开的地方就是 hole</b>（抓 peg → 移动 → 插入 → 松开）。50 条 episode 的释放点：</p>
+      <div class="flow">hole (释放点)   x 360.0±4.3   y -133.1±2.4   z 51.0±4.1  mm
+                xy 散布  中位 3.5 mm   p90 8.4 mm   max 11.1 mm   -> hole 是固定的
+
+抓取点绕真实 hole 的半径   mean 103.7   std 26.2   min 56.0   max 170.3   跨度 114.3 mm
+角度覆盖                  281 度（缺口约 79 度）</div>
+      <div class="callout p0">
+        <b>半径不是固定的：从 56 mm 到 170 mm，3 倍变化。</b>若采集意图是「固定半径的圆」，实际执行散开了 3 倍——建议回去核对摆放流程。这决定了任务是 1 自由度（只有角度）还是 2 自由度（角度 + 半径），而实测是后者。
+      </div>
+
+      <h3>密度：实测最近邻 18 mm</h3>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>模型</th><th>最近邻间距</th><th>vs 抓取所需 ±5–10 mm</th></tr>
+        <tr><td><b>实测（50 个点之间的真实距离）</b></td><td class="num"><b>中位 18.0 / 均值 20.0 / p90 34.6 / max 43.8 mm</b></td><td><span class="badge warn">约 2.4× 插值</span></td></tr>
+        <tr><td class="strike">原文的面积模型</td><td class="num">35.7 mm</td><td>悲观 2.0×</td></tr>
+        <tr><td class="strike">纯细圆模型</td><td class="num">8.9 mm（沿环）</td><td>乐观 2×（忽略了 114 mm 的径向散布）</td></tr>
+      </table>
+      </div>
+
+      <h3>为什么「数据量」被降级</h3>
+      <div class="callout p0">
+        两次失败 rollout 的落点，距<b>最近的真实 demo 抓取点</b>只有 <b>9.1 mm</b> 和 <b>15.3 mm</b>——比 18 mm 的最近邻间距还近，且都落在采样过的环带内（半径 77.7 / 120.6）。
+        <br><br>
+        <b>也就是说：policy 输出的位置，单看坐标与一个合法的 demo 抓取点无法区分。</b>它不是插值失败、也不是跑到分布外，而是给出了一个完全合理、但与本次 peg 实际位置无关的抓取点。这与 P0.2 的结论（信息就在 KV cache 里，policy 只用上 8%–34%）是两条独立证据指向同一件事：<b>问题是没有条件化，不是没有数据。</b>
+      </div>
+
+      <h3>环形采样特有的三个盲区</h3>
+      <ul>
+        <li><b>环内部</b>（半径 &lt; 56 mm）从未采样</li>
+        <li><b>环外部</b>（半径 &gt; 170 mm）从未采样</li>
+        <li><b>约 79° 的角度缺口</b>从未采样</li>
+      </ul>
+      <p>rollout 时 peg 若落在这三个区域，才是真正的分布外。补数据应<b>优先补这三处</b>，而不是无差别加量。</p>
+
+      <h3>修订后的数据建议</h3>
+      <ul>
+        <li><b>先不要补数据。</b>在 P0.1 与 P1.1 之前补数据有全部作废的风险，且现有证据显示瓶颈不在数据量。</li>
+        <li><b>缩小随机化范围仍然值得做</b>，但理由改为<b>降低条件化难度</b>（让视觉只需分辨少数几个位置），而不是原文写的「提高采样密度」。</li>
+        <li>同一位置采 2–3 条，用来压窄 P1.3 那个过宽的条件分布——这条理由不变。</li>
+        <li>起始位姿保持当前的高度一致（<code>xyz_std_mm=(0.26,0.36,0.18)</code>），它让 z 这一维几乎免费学会。</li>
+        <li class="small"><b>已结案（08-31）：</b><s>抓取 z=50.0±3.5 mm，释放 z=51.0±4.1 mm，落差仅 +1.0 mm，「插入」在 z 上几乎没有位移。</s>
+            这两个高度确实差不多，但它们<b>都在桌面高度</b>，其差值从来不是插入深度。
+            按「顶点 → 释放」重算：插入下降 <b>69.78 ± 11.85 mm</b>，50 条 episode 全部 ≥ 47 mm。插入是真的。</li>
+      </ul>
+    </div>
+
+    <!-- ============================================ P4 infra ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>七、P4 — Infra 优化空间（迭代速度是当前最大瓶颈）</h2>
+        <span class="badge warn">与 P0/P1 并行</span>
+      </div>
+      <p>一轮完整迭代 = 8.5 小时训练 + 真机 rollout。一周只能试 5–7 个方案，这本身就是打不通的重要原因。下面按<b>收益/成本比</b>排序。</p>
+
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>优先级</th><th>项目</th><th>现状</th><th>建议</th></tr>
+        <tr>
+          <td><span class="badge p0">P0</span></td>
+          <td><b>离线评测工具化</b></td>
+          <td>本轮排查用的是临时脚本（夹爪时机、接近相关性、同帧噪声、冻结特征探针），跑完即弃</td>
+          <td>做成 <code>tools/fr3/fr3_eval_policy_offline.py</code>，对任一 checkpoint 输出固定指标集：<br>
+            <code>per-dim R²</code> / <code>同帧采样 std</code> / <code>corr(pred, 到 peg 方向)</code> / <code>夹爪闭合帧误差</code><br>
+            <b>这是全表收益最高的一项</b>——能把「15 个 checkpoint 排序」从数小时真机时间变成几分钟离线计算</td>
+        </tr>
+        <tr>
+          <td><span class="badge done">不需要</span></td>
+          <td><b>LoRA 匹配数断言</b><span class="badge p0">08-28 前提被推翻</span></td>
+          <td><span class="strike">regex 匹配 0 个模块时静默通过</span><br>
+            实测 peft 0.20.0 在零匹配时直接抛 <code>ValueError</code>（字符串 regex 与列表皆然），秒级失败；
+            <code>lerobot_train.py:394-412</code> 也早已在启动时打印 <code>num_learnable_params</code> / <code>num_total_params</code></td>
+          <td><b>不做。</b>两半都已经有了，这一项是按一个没验证过的前提排进来的。<br>
+            <span class="small">残余风险只剩「列表里部分条目拼错」——那种不报错，但既有的可训练参数量日志就能看出来；
+            用单条 regex 写 target（L2/L3 的做法）则不存在这种情况。</span></td>
+        </tr>
+        <tr>
+          <td><span class="badge done">已完成</span></td>
+          <td><b>逐维 loss 权重开关</b></td>
+          <td><code>Pi05Config.action_loss_weights</code> 已落地；加权前后逐维 loss 都可记录</td>
+          <td>第 4 层已用 <code>[1,1,1,0.2,2]</code> 完成 30000 步训练并通过留出集判据（见 P1.2）</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1</span></td>
+          <td><b>rollout 延迟可观测性</b></td>
+          <td><code>rtc_lat_ms</code> 在 669 个样本里只有 <b>1 个非零</b>（仅 bootstrap 记录），无法诊断稳态延迟</td>
+          <td>每次真实推理都记录延迟，或至少按 log_interval 采样记录</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1</span></td>
+          <td><b>相机外参前置门</b></td>
+          <td><code>fr3_compare_live_capture_to_dataset_runtime.py</code> 存在但需手动跑</td>
+          <td>接进 rollout 启动流程，比对超阈值直接拒绝启动</td>
+        </tr>
+        <tr>
+          <td><span class="badge todo">P2</span></td>
+          <td><b>crop 长宽比检查</b></td>
+          <td>建 view 时不检查 letterbox 浪费</td>
+          <td>Dataset Export 页面显示每个相机的 padding 占比，超过 30% 给出警告（见 P2）</td>
+        </tr>
+        <tr>
+          <td><span class="badge todo">P2</span></td>
+          <td><b>训练早停判据</b></td>
+          <td>只有 loss / grdn</td>
+          <td>周期性跑 P4 的离线指标，把 <code>同帧采样 std</code> 与 <code>corr(pred, 到 peg)</code> 画进 W&amp;B——这两个比 loss 更早暴露「没在学定位」</td>
+        </tr>
+      </table>
+      </div>
+      <div class="callout ok">
+        <b>已在本轮完成、可直接使用：</b>Training 页面「Copy settings from a past run」（含从 <code>outputs/train/*/train_config.json</code> 回填历史）；
+        Rollout 页面自动沿用上次参数（安全闸门 <code>confirmMotion</code>/<code>overrideContract</code> 永不沿用）；
+        rollout 日志自带滚动条不再撑宽页面；S0 的逐步轨迹、自动落点、demo 环带底图与一键评分；
+        以及多轮交互会话内的 <code>Move to start</code> 控制。<b>后两项已过自动测试，仍需真机端到端验收。</b>
+      </div>
+    </div>
+
+    <!-- ============================================ 证伪清单 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>八、已证伪 / 不要再试</h2>
+        <span class="badge done">节省时间</span>
+      </div>
+      <p>这一周里被实测排除的方向。每条都附了证据，避免以后重新提出。</p>
+      <div class="tablewrap">
+      <table class="table">
+        <tr><th>方向</th><th>为何不行</th></tr>
+        <tr><td class="strike">改 <code>--action-mode absolute_ee</code></td>
+            <td>它是<b>最</b>好作弊的契约：8 维 state 下不看图的线性模型首帧 R² 就有 <b>0.9754</b>。会把视觉压力彻底拿掉</td></tr>
+        <tr><td class="strike">改成 relative-to-start-frame</td>
+            <td>与 <code>absolute_ee</code> 数值上等价（R² 0.9486 vs 0.9482，差 0.0004）——本 rig 起始位姿 std 只有 0.26 mm，减去它只是加了个常数。且代码里不存在此模式</td></tr>
+        <tr><td class="strike">调高 <code>num_inference_steps</code></td>
+            <td>pi0.5 采样是<b>从初始噪声出发的确定性 ODE 积分</b>（<code>modeling_pi05.py:810-830</code>）。加步数只让单条轨迹积得更准，<b>不缩小跨噪声抽样的散布</b></td></tr>
+        <tr><td class="strike">在线平滑（<code>commandEmaAlpha</code>）救定位</td>
+            <td>8 次平均把噪声压掉之后，条件<b>均值本身</b>仍然是错的（y 与真实动作 corr = +0.001）。平滑压不掉一个指向错误的均值</td></tr>
+        <tr><td class="strike">推理端多采样平均</td>
+            <td>要把噪声压到信号 1/3 需 N≈13 次采样 → 单次推理 5.2 s，<code>execution_horizon</code> 得开到 150+。在线不可行</td></tr>
+        <tr><td class="strike">把夹爪目标改成二值</td>
+            <td>已被「state 去掉 <code>prev_cmd.gripper.pos</code>」吸收；且 4.85% 的半开帧是真实中间状态，二值化会丢掉遥操的真实能力</td></tr>
+        <tr><td><b>换归一化模式</b><span class="badge p0">已反转</span></td>
+            <td><b>此前写「MIN_MAX 是对的，不要再改」——该结论已被 P0.1 推翻。</b>它的依据（<code>drx</code>/<code>dry</code> 的 1500×/550× 离群比）随那两维被裁掉而失效。实测 MEAN_STD 在 <code>dx</code> 上带来 +1.54、<code>drz</code> 上 +5.07 的 R² 改善。<br>
+            <span class="small">仍然成立的部分：单换 MEAN_STD 会饿死夹爪，所以要配合逐维权重（P1.2）。</span></td></tr>
+        <tr><td class="strike">保留原「再改归一化模式」条目</td>
+            <td>重建后 view 上复测：<code>drz</code> 的极值/分位带比仍有 <b>9.4×</b>，QUANTILES 会让它无界外推到 |max|=19.7 并吃掉 25% loss。<b>MIN_MAX 是对的</b></td></tr>
+        <tr><td class="strike">裁掉 <code>drz</code></td>
+            <td>它携带真实信号（绝对 yaw 每 episode 移动 mean 6.09°/p95 12.19°）。rollout 里的 yaw 漂移是手臂停滞的后果，不是这一维的问题</td></tr>
+        <tr><td><b>单纯加大 LoRA rank</b><span class="badge p0">已修正</span></td>
+            <td><span class="strike">问题不在 rank 而在加在哪些模块。</span>
+            <b>真正的原因是 alpha 被固定在 8：抬 rank 会把缩放 alpha/r 一起压下去</b>，r=32 只有 0.25。
+            「加 rank 没用」的观察是对的，结论是错的。修好 alpha 后 L2 通过。<br>
+            <span class="small">仍然成立：只动 rank 而不动 alpha 依然没用，甚至有害。</span></td></tr>
+        <tr><td><b>给 LoRA 加「匹配数」启动期断言</b><span class="badge p0">08-28 前提被推翻</span></td>
+            <td><span class="strike">regex 匹配不到任何模块时 PEFT 静默通过，会白跑 8.5 小时，所以需要自己加断言。</span>
+            <b>PEFT 自己就会拦。</b>实测 peft 0.20.0：字符串 regex 和列表两种写法，只要一个模块都没匹配上，
+            <code>get_peft_model</code> 即抛 <code>ValueError: Target modules ... not found in the base model</code>，
+            在建模型的那几秒内失败。可训练参数量也早已由 <code>lerobot_train.py:394-412</code> 打进启动日志。
+            这一项是按一个从未验证过的前提排进 P4 的，已从待办里删除。<br>
+            <span class="small">仍然成立的部分：<u>列表</u>里部分条目拼错不会报错（<code>["q_proj","typo_proj"]</code> 只装匹配上的那个），
+            靠那行 <code>num_learnable_params</code> 对账即可；写成单条 regex 则连这一种也不存在。</span></td></tr>
+        <tr><td class="strike">查 view 构建里的时间对齐 / 帧偏移</td>
+            <td>「首步最差」的剖面（h0 −0.42 而 h20 +0.49）曾是它的主要证据。L2 用<b>同一份数据、同一套时间戳</b>把剖面拉平到 h0:+0.89 / h20:+0.94，
+            说明那是欠拟合的产物。<b>不是时间偏移</b></td></tr>
+        <tr><td class="strike">给 LM / vision tower 加 LoRA</td>
+            <td>P0.2 已证信息穿过冻结 LM 后<b>保留 114.6%/109.6%</b>，冻结层没有丢信息。加在这里改不动瓶颈</td></tr>
+        <tr><td><b>用二元 PASS/FAIL 门禁判定管线好坏</b><span class="badge p0">08-28 停用</span></td>
+            <td>连续两版门禁都给出误导性判定：第一版把不可达的 <code>R²&gt;0.9</code> 当门槛（ep0 的 dx 上限只有 0.72）；
+            第二版自校准了上限，却因单帧噪声估计给出 <code>dy = 174% of ceiling</code> 这种不可能的数。
+            <b>改为直接报分级事实（R² + 信号/噪声 + 占可达比例），不再压成一个布尔值。</b></td></tr>
+      </table>
+      </div>
+    </div>
+
+    <!-- ============================================ 执行顺序 ============================================ -->
+    <div class="card full">
+      <div class="section-head">
+        <h2>九、下一步计划（08-31 六次重排：S0 软件落地之后）</h2>
+        <span class="badge p0">当前主线</span>
+      </div>
+      <p>第 0–4 层的全部检验已跑完，结果是：<b>目标可预测（上限 0.881）、先验退化而非发散、绑定约束是可训练容量／强度、
+      泛化不是瓶颈，而全量 48 条 + 逐维权重把三个平移维在留出集上全部推上去了</b>。
+      管线本身没有结构性问题——「先查 bug」这条路关闭。<b>五条必要条件全部有直接证据。</b>
+      <b>离线这条线已经走到头了：所有能在没有机器人的情况下判定的前提都已判定，剩下的唯一未知量在真机上。</b>
+      <b>而真机首轮已经跑完：泛化成立，夹爪懂得去找物体，失败模式从「没条件化」换成了「精度不够」。</b>
+      <span class="small">唯一没收口的是 <code>drz</code>，而它卡在指标而不是模型上——见下面的专门一条。</span></p>
+
+      <div class="phase">
+        <div class="name">第 0–2 层<br><span class="badge done">已完成</span></div>
+        <div>
+          <b>L0</b> 目标可预测吗 → 能，<code>dx</code> 上限 0.881；副产品：<code>drz</code> 逐步已到顶（余量 0.013）<br>
+          <b>L1</b> 训练动过条件分布吗 → 动了很多；缺口拆成散布（0.31–0.53）与均值（0.47–0.64）两半<br>
+          <b>L2</b> 预算是绑定约束吗 → <b>是</b>。27.9M 参数下 <code>dx</code> 单次抽样 0.106 → 0.893，剖面拉平
+        </div>
+        <div><b>实际成本：</b>约 2.5 小时<br><b>顺带关闭：</b>时间对齐、VLM LoRA、逐步 R² 判据是否有效</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">第 2b 层<br><span class="badge done">已完成</span></div>
+        <div>
+          <b>L2b — 是 alpha 还是模块覆盖？→ 对半。</b>目标模块与 rank 完全保持基线（q/v + 投影头，r=32，2,574,336 个可训练参数），
+          只把 alpha 从 8 抬到 32，就买下了 L2 一半的改进（<code>dx</code> 0.106 → 0.479，零新增参数）；另一半要付 10.8 倍参数。
+          <div class="small">走的是分叉 ②：模块覆盖是真贡献者，后续按完整 L2 配方走。详见第一之三之四节。</div>
+        </div>
+        <div><b>实际成本：</b>~65 分钟<br><b>顺带改写：</b>第八节「单纯加大 LoRA rank」那条证伪</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">第 3 层<br><span class="badge done">已通过</span></div>
+        <div>
+          <b>泛化探针：背下来 ≠ 学会了 → 不是背的。</b>L2 配方在 8 条 episode 上训练 8000 步，
+          在角度内插的留出 <code>[22,40]</code> 上评测：<code>dy</code> +0.473／+0.573 显著为正，
+          <code>dx</code> 在 H40 上 +0.411（H22 的 chunk 累计 +0.773）。
+          <div class="small"><b>而 train/holdout 的区分本身消失了</b>——训练过的 T2 反而最差，
+          <code>dx</code> 只跟这条 episode 的 x 行程走（两个指标各自 4/4 单调）。详见第一之三之五节。</div>
+        </div>
+        <div>
+          <b>实际成本：</b>训练 115 分钟 + 评测 40 分钟<br>
+          <b>拿到的结论：</b>第 5 条必要条件（样本足够）第一次有直接证据<br>
+          <b>新暴露的问题：</b><code>drz</code> 是唯一分得开的维度，在 holdout 上 chunk 累计 −1.1／−9.5，它在背噪声
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="name">第 3b 层<br><span class="badge done">已完成</span></div>
+        <div>
+          <b>L4 — 哪一维真的在花 loss 预算？</b>逐维权重此前建立在一个只被推断过的说法上。
+          实测：<code>drz</code> 占 <b>32.0%</b> 的预算，而它 <b>84.9% 的方差不可约</b>；<code>dx</code> 占 34.7%，不可约只有 0.119。
+          <div class="small">推断变实测，第 4 层的权重不再是猜的。详见第一之三之六节。</div>
+        </div>
+        <div><b>实际成本：</b>GPU 12 分钟<br><b>定出：</b>下一层的权重向量</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">第 4 层<br><span class="badge done">留出集判据已通过</span></div>
+        <div>
+          <b>全量 48 条重训 + 逐维 loss 权重 <code>[1.0, 1.0, 1.0, 0.2, 2.0]</code>。</b>
+          30000 步 ≈ 10.0 epoch，最终 loss 0.123。<b>留出集上六个平移格子全部上涨，没有一个退</b>：
+          <code>dx</code> +0.087 → <b>+0.399</b>／+0.411 → <b>+0.608</b>，
+          <code>dy</code> +0.473 → +0.702／+0.573 → +0.657，
+          <code>dz</code> +0.666 → +0.755／+0.657 → +0.778，夹爪保持 0.96。
+          <div class="small">采样散布第一次自己往下走（<code>dx</code> 散布代价 0.554 → 0.319／0.239 → 0.110）。详见第一之三之七节。</div>
+        </div>
+        <div>
+          <b>实际成本：</b>训练 8 小时 23 分 + 评测 40 分钟<br>
+          <b>判据结算：</b>留出集这一半通过，真机 rollout 那一半转入第 5 层<br>
+          <b>没解决的：</b><code>drz</code> 在 H40 上仍是 −8.4，但问题出在指标
+        </div>
+      </div>
+
+      <div class="callout ok">
+        <b>「首步最差」自愈了，RTC 那个隐患撤销。</b>
+        <span class="strike">开 rollout 之前要先处理：holdout 上 h0:+0.09／+0.41 升到 h35:+0.64／+0.68，而 RTC 执行的正是每个 chunk 的前 16 步。</span>
+        <br>第 4 层实测：<b>h=0 抬到 +0.40／+0.61，H40 的剖面已经基本平了</b>。
+        当时写下的处置是「先测，别先改——全量数据的拟合程度不同，这个剖面可能自己就变了」，实测确认了这一条。
+        <b>不需要动 <code>rtc_execution_horizon</code>。</b>
+        <span class="small">顺带把这个现象的性质定了：它是<b>欠拟合在 h 轴上的投影</b>（靠后的步更平滑、更早被学会），
+        既不是 RTC 的性质也不是时间对齐的性质。详见第一之三之七节。</span>
+      </div>
+
+      <div class="phase">
+        <div class="name">第 5 层<br><span class="badge done">已跑，泛化成立</span></div>
+        <div>
+          <b>真机 rollout 首轮。</b>030000 在真机上的泛化成立——<b>夹爪懂得去找物体</b>，
+          按摆放区域分成三档：<b>A</b> 抓起+插入都成、<b>B</b> 能接近抓不起来、<b>C</b> 能抓起插不准。
+          <div class="callout ok" style="margin:8px 0">
+            <b>失败模式整体换了一类。</b>08-27 的失败是"走到一个与本次 peg 无关的合法抓取点"（<code>dy</code> 与真实动作 corr +0.001）；
+            现在接近相基本不再是失败点，失败落在<b>闭合相</b>与<b>插入相</b>。
+            要诊断的问题从<b>「有没有条件化」</b>变成<b>「条件化的精度够不够」</b>，两者的修法几乎没有交集。
+            详见第一之三之八节。
+          </div>
+          <div class="small">第一节那句「唯一必须看图的两个维度没学会」可以撤销了。第四节 P1 那一整套旋钮已交付完毕，
+          继续在上面加压不会有第二次收益。</div>
+        </div>
+        <div>
+          <b>实际成本：</b>真机时间<br>
+          <b>拿到的读数：</b>失败相（口述）<br>
+          <b>没拿到的：</b><span class="badge p0">缺</span> peg 落点的半径/角度、三档比例、有多少失败其实落在盲区里<br>
+          <span class="small">"按区域分档"是目前信息量最大的信号，但它现在只存在于口头印象里</span>
+        </div>
+      </div>
+
+      <div class="callout warn">
+        <b>首轮数据的边界没有改变，但补救工具已经就位。</b>
+        ① 首轮是否过了<b>相机外参门</b>没有记录——B/C 两档仍可能混有外参漂移；
+        ② 首轮 rollout 没有坐标，无法事后恢复半径/角度与三档比例。
+        S0 已补齐后续记录软件，并顺带修了会话内只归位一次的问题；<b>现在缺的是 S0.1 真机验收和新一批带落点样本</b>，
+        不是继续开发图。详见第一之三之九。
+      </div>
+
+      <div class="phase">
+        <div class="name">第 6 层<br><span class="badge p0">下一步</span></div>
+        <div>
+          <b>把成功率从"分区域可用"推到"整个环带可用"。</b>排序原则变了：前五层回答"为什么完全不行"，
+          可以离线判定；现在要回答<b>"在哪些条件下不行"</b>，而这个问题需要先有数据才提得出来。
+          <div class="gate" style="margin:8px 0">
+            <b>S0 软件链路</b>（已完成：轨迹 + 自动落点 + demo 底图 + 一键评分）→
+            <b>S0.1 真机双轮验收并开始积累带落点样本</b>（当前门禁）；
+            同时并行跑 <b>S1 checkpoint 曲线</b> 与 <b>S5 归档 030000/评测脚本</b> →
+            <b>S2 腕部 crop 改 1:1</b>（对 B 档）／<b>S3 分相位重算 yaw 预算</b>（对 C 档）／<b>S4 定向补盲区</b>（对 OOD）
+            —— 三选一必须由验收后的 S0 地图决定
+          </div>
+          <div class="callout ok" style="margin:8px 0">
+            <b>S3 的前置核对已做完（08-31）：demo 里插入是真的。</b>
+            插入下降按「顶点 → 释放」算是 <b>69.78 ± 11.85 mm</b>，50 条全部 ≥ 47 mm。
+            原来那个 +1.0 mm 是拿两个都在桌面高度的事件相减得到的，指标本身错了。
+            <b>S3 现在无阻塞。</b>
+          </div>
+        </div>
+        <div>
+          <b>成本：</b>S0 软件已完成；S0.1 同会话 2 次受控 rollout；S1 无人值守 3.3 小时；S5 十几分钟；S2/S3/S4 待定<br>
+          <b>当前判据：</b>两轮的 CSV/end marker/JSONL/地图一致，第二轮确实从归位后的起点开始；
+          后续才读 B 档比例（S2）／插入相 <code>drz</code> 不可约方差（S3）／失败是否集中在盲区（S4）<br>
+          <span class="small">完整论证见第一之三之九节</span>
+        </div>
+      </div>
+
+      <div class="phase">
+        <div class="name">之后</div>
+        <div>
+          <b>P4 离线评测工具化</b>（这一周手写了 5 个一次性探针脚本，固化后每轮省数小时真机时间；L1b 那套「单次抽样 / 条件均值 / 散布代价」的分解应该成为标准报告）→
+          <b>P2 crop 改成接近 1:1</b>（腕部相机有效分辨率翻倍，1 小时）→
+          <b>L0/L1 难度阶梯</b>（固定位置 → ±3 cm）→ <b>P3 补数据</b>
+        </div>
+        <div class="small">这几项的价值不依赖上面任何一层的结果，但都比第 3 层贵。</div>
+      </div>
+
+      <div class="callout ok">
+        <b>状态变化（08-31 晚）：真机把留出集的数字兑现了，主线从「诊断」转入「提精度」。</b>
+        留出集上 <code>dx</code>／<code>dy</code> 的 chunk 累计 +0.84／+0.87 不再只是一个离线数字——
+        真机上夹爪确实朝本次 peg 去。<b>五层阶梯到此结束</b>：它要回答的"为什么完全不行"已经答完，
+        剩下的问题（末端几毫米的分辨率、插入相的 yaw、标签里插入到底有没有发生）都<u>不能</u>用同一套方法排，
+        因为它们要求先知道"在哪些条件下不行"。<b>所以第 6 层当前第一项是验收测量链并采样，不是训练。</b>
+        <span class="small">详见第一之三之八、一之三之九节。</span>
+      </div>
+      <div class="callout ok">
+        <b>状态变化（早前）：离线这条线走完了。</b>
+        五条必要条件全部有直接证据（1／2／4 此前已验证，3 由 L2 验证，第 5 条由 L3 验证），
+        <b>而第 4 层把这些结论兑现成了留出集上的实际数字</b>——不再是「前提成立所以应该能行」，
+        而是「在没见过的 peg 位置上，三个平移维和夹爪的预测都对」。
+        主线上没有「未验证的前提」挡路，剩下的唯一未知量在真机上。
+      </div>
+      <div class="callout ok">
+        <b>第 3 层确实挡住了一次白跑，只是挡的方向和预期相反。</b>
+        它原本是用来防「配方只会背题、别花 8.5 小时」的；实测结果是配方<u>不</u>背题，
+        反而查出真正在背题的是 <code>drz</code> 这一个维度——而那正好是第 4 层要降权的那一维。
+        <span class="small">2.5 小时买到的信息：一个放行、一个此前只被推断的权重决定变成了实测。</span>
+      </div>
+      <div class="callout warn">
+        <b>唯一没收口的是 <code>drz</code>，而它卡在指标上，不在模型上。</b>
+        降权起了一半作用：train 侧不再死记 yaw（+0.880 → +0.524），H22 的负值收敛约 3 倍且其条件均值 +0.148 正落在 L0 上限 0.151 上；
+        <b>但 H40 仍是 −8.417</b>。同一个 checkpoint、同一规则挑出的两条内插 holdout 差两个数量级，
+        这更像两条 episode 的 <code>drz</code> 方差不同，而不是模型行为不同——它的 R² 分母近零，chunk 累计只把问题推后了一点。
+        <br><b>下一步不是再调权重，而是换一个绝对量的指标</b>：一个 chunk 内累计 yaw 的<b>角度误差（度）</b>，
+        和「抓取要求的 yaw 容差是多少度」直接可比。
+        <span class="small">在拿到那个数之前基于 R² 再动 <code>drz</code>，会是第四次「把含噪连续量压成二元判定」——见第一之四节。</span>
+      </div>
+      <div class="callout warn">
+        <b>还没有直接证据的是环带外。</b>L3 和第 4 层的 holdout 都是按角度<b>内插</b>挑的，
+        证明的是环带内的内插泛化。第六节那三个盲区（半径 &lt; 56 mm、&gt; 170 mm、79° 角度缺口）仍然是分布外，
+        真机 rollout 落到那里失败不能算进第 4 层的账。
+        <span class="small">另外 <code>[22,40]</code> 已经被用来读过两轮结果：单一配方下不构成选择偏差，
+        但一旦开始用它比较多个配方，就要换一对。</span>
+      </div>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>

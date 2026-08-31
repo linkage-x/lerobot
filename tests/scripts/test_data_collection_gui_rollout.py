@@ -23,6 +23,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from tools.data_collection_gui import checkpoints as checkpoint_backend  # noqa: E402
 from tools.data_collection_gui import rollout as rollout_backend  # noqa: E402
+from tools.data_collection_gui import task_ladders  # noqa: E402
 from tools.data_collection_gui import training as training_backend  # noqa: E402
 
 SCAN_SCRIPT = REPO_ROOT / "tools" / "fr3" / "scan_checkpoints.py"
@@ -1681,3 +1682,259 @@ def test_demo_landing_points_on_a_dataset_that_is_not_there(tmp_path: Path):
     """A missing or unreadable dataset leaves the map without a backdrop rather than 500ing the
     page: the rollout points are still worth showing."""
     assert checkpoint_backend.demo_landing_points(tmp_path / "absent") == {}
+
+
+# --------------------------------------------------------------- grading ladders ---
+#
+# The 20-rollout batch of 2026-08-31 came back 20/20 `failure` while breaking in three different
+# places, so the tests below are mostly about the log refusing to store a grade whose meaning a
+# later reader could not recover: a stage with no ladder, a stage this task does not have, or an
+# outcome that disagrees with its own stage.
+
+
+def _write_ladder(repo_root: Path, body: str, task: str = "demo_task") -> Path:
+    path = repo_root / task_ladders.LADDER_DIR / f"{task}.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+_DEMO_LADDER = """
+task: demo_task
+label: 测试任务
+stages:
+  - {id: approach, instance: 到了附近}
+  - {id: contact, instance: 碰到了}
+  - {id: secure, instance: 拿住了}
+terminal: secure
+blockers:
+  - {id: object_pose_offset}
+  - {id: unknown}
+"""
+
+
+def test_the_shipped_peg_ladder_loads(tmp_path: Path):
+    """The file the rig actually grades against, checked here so a typo in it fails a test run
+    rather than a rollout the operator has already performed."""
+    ladder = task_ladders.find_ladder(REPO_ROOT, "insert_peg")
+
+    assert ladder.terminal.id == "release_stable"
+    # Ordinals are the shared scale, so they must survive the trip through the file unchanged.
+    assert [stage.ordinal for stage in ladder.stages] == [1, 2, 3, 4, 5, 6, 7]
+    assert "object_pose_offset" in ladder.blockers
+
+
+def test_reaching_the_terminal_stage_is_what_makes_it_a_success(tmp_path: Path):
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    entry = checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {"checkpointId": "job_a/020000", "taskLadder": "demo_task", "stageId": "secure"},
+    )
+
+    assert entry["outcome"] == "success"
+    assert entry["stage"] == 3
+    assert entry["stageId"] == "secure"
+
+
+def test_falling_short_grades_as_failure_and_keeps_how_far_it_got(tmp_path: Path):
+    """The point of the ladder: `failure` stops being the whole story."""
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    entry = checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/020000",
+            "taskLadder": "demo_task",
+            "stage": 2,
+            "blocker": "object_pose_offset",
+            "inDistribution": True,
+        },
+    )
+
+    assert entry["outcome"] == "failure"
+    assert entry["stage"] == 2
+    assert entry["blocker"] == "object_pose_offset"
+    assert entry["inDistribution"] is True
+
+
+def test_an_outcome_that_contradicts_its_own_stage_is_refused(tmp_path: Path):
+    """A record carrying both is a record whose halves can disagree. That is the defect this
+    replaces: the batch filed a partially inserted peg under `failure` with the fact surviving
+    only in prose."""
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    with pytest.raises(checkpoint_backend.CheckpointError, match="contradicts stage"):
+        checkpoint_backend.append_rollout_outcome(
+            tmp_path,
+            {
+                "checkpointId": "job_a/020000",
+                "taskLadder": "demo_task",
+                "stage": 2,
+                "outcome": "success",
+            },
+        )
+
+
+def test_aborted_overrides_the_derived_outcome_and_still_records_the_stage(tmp_path: Path):
+    """Someone walking into the cell says nothing about the policy, so the round must stay out
+    of the rate -- but how far it had got before the stop is still worth keeping."""
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    entry = checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/020000",
+            "taskLadder": "demo_task",
+            "stage": 2,
+            "outcome": "aborted",
+            "blocker": "operator_stop",
+        },
+    )
+
+    assert entry["outcome"] == "aborted"
+    assert entry["stage"] == 2
+
+
+def test_a_stage_without_a_ladder_is_refused(tmp_path: Path):
+    """A bare ordinal is a number no later reader could turn back into a claim."""
+    with pytest.raises(checkpoint_backend.CheckpointError, match="without a task ladder"):
+        checkpoint_backend.append_rollout_outcome(
+            tmp_path, {"checkpointId": "job_a/020000", "outcome": "failure", "stage": 2}
+        )
+
+
+def test_a_stage_this_task_does_not_have_is_refused(tmp_path: Path):
+    """`demo_task` stops at `secure`; grading it as an insertion would be inventing a link."""
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    with pytest.raises(checkpoint_backend.CheckpointError, match="no stage 6"):
+        checkpoint_backend.append_rollout_outcome(
+            tmp_path, {"checkpointId": "job_a/020000", "taskLadder": "demo_task", "stage": 6}
+        )
+
+
+def test_a_blocker_outside_the_vocabulary_is_refused(tmp_path: Path):
+    """Free-text reasons are what the batch already had, and they cannot be tallied."""
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    with pytest.raises(checkpoint_backend.CheckpointError, match="not one of"):
+        checkpoint_backend.append_rollout_outcome(
+            tmp_path,
+            {"checkpointId": "job_a/020000", "taskLadder": "demo_task", "stage": 2, "blocker": "vibes"},
+        )
+
+
+def test_a_shortfall_with_no_reason_given_records_that_it_was_unknown(tmp_path: Path):
+    """Storing nothing would lose the fact that the question was asked at all."""
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    entry = checkpoint_backend.append_rollout_outcome(
+        tmp_path, {"checkpointId": "job_a/020000", "taskLadder": "demo_task", "stage": 1}
+    )
+
+    assert entry["blocker"] == "unknown"
+
+
+def test_a_ladder_using_a_stage_outside_the_shared_vocabulary_is_refused(tmp_path: Path):
+    """The ordinals are only comparable across tasks while every task draws from one list."""
+    _write_ladder(tmp_path, _DEMO_LADDER.replace("id: contact", "id: wiggle_it"))
+
+    with pytest.raises(checkpoint_backend.CheckpointError, match="unknown stage"):
+        checkpoint_backend.append_rollout_outcome(
+            tmp_path, {"checkpointId": "job_a/020000", "taskLadder": "demo_task", "stage": 1}
+        )
+
+
+def test_a_terminal_below_the_last_stage_is_refused(tmp_path: Path):
+    """A stage past success is a stage the grade could never reward, so it is a mistake in the
+    ladder rather than a preference."""
+    _write_ladder(tmp_path, _DEMO_LADDER.replace("terminal: secure", "terminal: contact"))
+
+    with pytest.raises(checkpoint_backend.CheckpointError, match="below its last stage"):
+        checkpoint_backend.append_rollout_outcome(
+            tmp_path, {"checkpointId": "job_a/020000", "taskLadder": "demo_task", "stage": 1}
+        )
+
+
+def test_a_task_id_cannot_walk_out_of_the_ladder_directory(tmp_path: Path):
+    with pytest.raises(checkpoint_backend.CheckpointError, match="bare name"):
+        checkpoint_backend.append_rollout_outcome(
+            tmp_path,
+            {"checkpointId": "job_a/020000", "taskLadder": "../../etc/passwd", "stage": 1},
+        )
+
+
+def test_an_ungraded_rollout_is_stored_without_inventing_a_stage(tmp_path: Path):
+    """Stage 0 is a real grade ("never reached the object"), so it must not stand in for
+    "nobody said". Every record written before the ladder existed is in this shape."""
+    entry = checkpoint_backend.append_rollout_outcome(
+        tmp_path, {"checkpointId": "job_a/020000", "outcome": "failure"}
+    )
+
+    assert "stage" not in entry
+    assert "taskLadder" not in entry
+
+
+def test_the_funnel_reports_where_rollouts_are_lost(tmp_path: Path):
+    """The reason the grade is ordinal: the largest drop between neighbours names the next thing
+    to work on. Modelled on the 08-31 batch, where two bottlenecks were the same size and the
+    binary rate showed neither."""
+    ladder = task_ladders.load_ladder(_write_ladder(tmp_path, _DEMO_LADDER))
+    entries = (
+        [{"taskLadder": "demo_task", "stage": 1, "outcome": "failure"}] * 3
+        + [{"taskLadder": "demo_task", "stage": 2, "outcome": "failure"}] * 8
+        + [{"taskLadder": "demo_task", "stage": 3, "outcome": "success"}] * 9
+        # Excluded: stopped for reasons that say nothing about the policy.
+        + [{"taskLadder": "demo_task", "stage": 1, "outcome": "aborted"}]
+        # Excluded: graded the old way, so it has no stage to place.
+        + [{"outcome": "failure"}]
+    )
+
+    funnel = task_ladders.stage_funnel(entries, ladder)
+
+    assert [(row["stage"], row["reached"], row["lost"]) for row in funnel] == [
+        (1, 20, 0),
+        (2, 17, 3),
+        (3, 9, 8),
+    ]
+    assert all(row["graded"] == 20 for row in funnel)
+
+
+def test_the_grading_menu_carries_this_task_s_own_words(tmp_path: Path):
+    """The operator grades by matching what they watched against a sentence, not by translating
+    the vocabulary's abstract criterion. `describe` is what the page renders, so the task's own
+    phrasing has to survive into it -- and so do the blocker labels, or the menu offers ids."""
+    ladder = task_ladders.find_ladder(REPO_ROOT, "insert_peg")
+
+    menu = ladder.describe()
+
+    contact = next(stage for stage in menu["stages"] if stage["ordinal"] == 2)
+    assert "推倒" in contact["instance"]
+    assert contact["criterion"] == "建立接触，但未形成可承载的约束"
+    assert menu["terminal"] == 7
+    offset = next(item for item in menu["blockers"] if item["id"] == "object_pose_offset")
+    assert offset["label"] == "抓取位姿偏移"
+
+
+def test_a_blocker_the_ladder_did_not_declare_still_gets_a_name(tmp_path: Path):
+    """`operator_stop` and `unknown` are merged into every ladder whether or not it lists them,
+    so the menu must not fall back to showing a bare id for one nobody wrote a label for."""
+    _write_ladder(tmp_path, _DEMO_LADDER.replace("  - {id: unknown}\n", ""))
+
+    menu = task_ladders.find_ladder(tmp_path, "demo_task").describe()
+
+    names = {item["id"]: item["label"] for item in menu["blockers"]}
+    assert names["operator_stop"] == "operator_stop"
+    assert set(names) >= {"object_pose_offset", "operator_stop", "unknown"}
+
+
+def test_one_unreadable_ladder_does_not_take_the_others_down(tmp_path: Path):
+    """The page fetches every ladder at once. If a half-edited file could raise, editing one
+    task's ladder would stop the operator grading the task they are actually running."""
+    _write_ladder(tmp_path, _DEMO_LADDER)
+    (tmp_path / task_ladders.LADDER_DIR / "broken.yaml").write_text(
+        "task: broken\nstages:\n  - {id: no_such_stage}\n", encoding="utf-8"
+    )
+
+    assert [ladder.task for ladder in task_ladders.list_ladders(tmp_path)] == ["demo_task"]

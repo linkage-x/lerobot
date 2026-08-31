@@ -66,6 +66,8 @@ from lerobot.utils.control_utils import predict_action, prepare_observation_for_
 from lerobot.utils.rotation import Rotation
 from lerobot.utils.robot_utils import precise_sleep
 
+from tools.fr3.dagger_takeover import ExpertTakeover, expert_spans
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CHECKPOINT = _REPO_ROOT / 'outputs/train/2026-03-19/10-48-39_act/checkpoints/060000'
 _DEFAULT_CAMERA_CONFIG = _REPO_ROOT / 'tools/fr3/fr3_act_infer_camera_config.yaml'
@@ -672,6 +674,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Interactive key to move the arm back to its start pose between rollouts.',
     )
     parser.add_argument('--rollout-quit-key', default='q', help='Interactive key to quit inference.')
+    parser.add_argument(
+        '--dagger-takeover',
+        action='store_true',
+        help=(
+            'Let the operator take the arm over mid-rollout with a SpaceMouse and hand it back, '
+            'so a correction is applied to the state the policy actually walked into. Off by '
+            'default: it opens a second action source onto a loop that is moving a real arm.'
+        ),
+    )
+    parser.add_argument(
+        '--rollout-takeover-key',
+        default='t',
+        help='Interactive key that toggles DAgger takeover on and off. Only bound with --dagger-takeover.',
+    )
+    parser.add_argument(
+        '--dagger-spacemouse-device-id',
+        type=int,
+        default=0,
+        help='SpaceMouse device index used for takeover (default 0).',
+    )
+    parser.add_argument(
+        '--dagger-translation-scale',
+        type=float,
+        default=None,
+        help='Override the SpaceMouse translation scale during takeover. Defaults to the recorder's value.',
+    )
+    parser.add_argument(
+        '--dagger-rotation-scale',
+        type=float,
+        default=None,
+        help='Override the SpaceMouse rotation scale during takeover. Defaults to the recorder's value.',
+    )
     parser.add_argument(
         '--mujoco-viewer',
         action='store_true',
@@ -1341,15 +1375,31 @@ class FR3InferenceMujocoVisualizer:
 
 
 class InteractiveRolloutKeyboard:
-    def __init__(self, *, start_key: str, stop_key: str, home_key: str, quit_key: str):
+    def __init__(
+        self,
+        *,
+        start_key: str,
+        stop_key: str,
+        home_key: str,
+        quit_key: str,
+        takeover_key: str | None = None,
+    ):
         self.start_key = self._normalize_key(start_key)
         self.stop_key = self._normalize_key(stop_key)
         self.home_key = self._normalize_key(home_key)
         self.quit_key = self._normalize_key(quit_key)
+        # None when DAgger takeover is off, so the key stays free for whatever else the
+        # operator has bound and a stray press cannot hand a live rollout to a device that
+        # was never connected.
+        self.takeover_key = self._normalize_key(takeover_key) if takeover_key else None
         self.start_requested = threading.Event()
         self.stop_requested = threading.Event()
         self.home_requested = threading.Event()
         self.quit_requested = threading.Event()
+        # A toggle, not a hold. sshkeyboard and the cbreak fallback both report presses, not
+        # releases, so a dead-man's switch cannot be built on this channel -- and one built on
+        # key repeat would drop control every time the operator's hand paused.
+        self.takeover_engaged = threading.Event()
         self._thread: threading.Thread | None = None
         self._stop_listening = None
 
@@ -1369,11 +1419,21 @@ class InteractiveRolloutKeyboard:
         elif key_name == self.home_key:
             print('[INFO] interactive_key=move_to_start')
             self.home_requested.set()
+        elif self.takeover_key is not None and key_name == self.takeover_key:
+            if self.takeover_engaged.is_set():
+                self.takeover_engaged.clear()
+                print('[INFO] interactive_key=takeover_release')
+            else:
+                self.takeover_engaged.set()
+                print('[INFO] interactive_key=takeover_engage')
         elif key_name == self.quit_key:
             print('[INFO] interactive_key=quit')
             self.quit_requested.set()
             self.stop_requested.set()
             self.start_requested.set()
+            # Quitting drops the takeover with it. Leaving it engaged would hand the next
+            # process state, and there is no next process to hand it to.
+            self.takeover_engaged.clear()
 
     def _listen_keyboard_loop(self, listen_keyboard: Any) -> None:
         try:
@@ -1384,7 +1444,13 @@ class InteractiveRolloutKeyboard:
     # Words accepted alongside the bare keys on the pipe channel, so a caller that is not a
     # keyboard can say what it means. The keys stay valid because the GUI and the terminal
     # then speak the same alphabet, which is one less thing to keep in step.
-    _PIPE_COMMAND_WORDS = {'start': 'start', 'stop': 'stop', 'home': 'home', 'quit': 'quit'}
+    _PIPE_COMMAND_WORDS = {
+        'start': 'start',
+        'stop': 'stop',
+        'home': 'home',
+        'quit': 'quit',
+        'takeover': 'takeover',
+    }
 
     def _listen_pipe_loop(self) -> None:
         """One command per line, for a caller that is a program rather than a terminal.
@@ -1413,6 +1479,11 @@ class InteractiveRolloutKeyboard:
                 self._on_press(self.home_key)
             elif resolved == 'quit':
                 self._on_press(self.quit_key)
+            elif resolved == 'takeover':
+                if self.takeover_key is None:
+                    print('[WARN] interactive_pipe_takeover_ignored reason=takeover_disabled')
+                else:
+                    self._on_press(self.takeover_key)
             elif len(command) == 1:
                 self._on_press(command)
             else:
@@ -1470,6 +1541,7 @@ class InteractiveRolloutKeyboard:
                 f'keyboard_backend={backend} '
                 f"start_key='{self.start_key}' stop_key='{self.stop_key}' "
                 f"home_key='{self.home_key}' quit_key='{self.quit_key}'"
+                + ('' if self.takeover_key is None else f" takeover_key='{self.takeover_key}'")
             )
             return
 
@@ -1500,6 +1572,7 @@ class InteractiveRolloutKeyboard:
             f'keyboard_backend={backend} '
             f"start_key='{self.start_key}' stop_key='{self.stop_key}' "
             f"home_key='{self.home_key}' quit_key='{self.quit_key}'"
+            + ('' if self.takeover_key is None else f" takeover_key='{self.takeover_key}'")
         )
 
     def wait_for_command(self, *, arm_at_start: bool) -> str:
@@ -1518,6 +1591,10 @@ class InteractiveRolloutKeyboard:
         self.start_requested.clear()
         self.stop_requested.clear()
         self.home_requested.clear()
+        # Every rollout begins under the policy. A takeover left engaged from the last one
+        # would hand the arm to a SpaceMouse nobody is holding, at the moment a fresh rollout
+        # starts moving.
+        self.takeover_engaged.clear()
         print(
             '[INFO] interactive_waiting_for_start '
             f'arm_at_start={1 if arm_at_start else 0} '
@@ -1538,6 +1615,9 @@ class InteractiveRolloutKeyboard:
                 self.home_requested.clear()
                 return 'home'
         return 'quit'
+
+    def takeover_is_engaged(self) -> bool:
+        return self.takeover_key is not None and self.takeover_engaged.is_set()
 
     def should_stop_rollout(self) -> bool:
         return self.stop_requested.is_set() or self.quit_requested.is_set()
@@ -2315,6 +2395,34 @@ class PolicyCameraPreviewSink:
 # `observation.state.gripper.pos` reads 0 on 47% of frames while the command held a clean 1.0,
 # so any "did it close?" test keyed on the observation fires on dropouts instead of on grasps.
 _TRACE_GRIPPER_CLOSED_BELOW = 0.5
+# An open stretch shorter than this does not end a hold. Observed on rollout 9 of
+# L4_full48_holdout22_40/030000: the command touched 0.4997 for two steps, went back up, and
+# only shut for real 22 steps later, so "the first hold" was a two-sample blip and the rollout
+# scored lift 0 with the grasp and release points on top of each other. The same run's real
+# hold was itself split by a three-step excursion back over the threshold.
+_TRACE_GRIPPER_REOPEN_MIN_STEPS = 5
+
+
+def _dominant_closed_span(closed: np.ndarray) -> tuple[int, int]:
+    """The inclusive `(first, last)` step of the hold that carries the rollout.
+
+    The gripper command is a continuous signal crossed against a threshold, so one hold can
+    come back as several runs and a transient can come back as a hold. Runs parted by less
+    than `_TRACE_GRIPPER_REOPEN_MIN_STEPS` open steps are one hold, and of the holds that
+    remain the longest is the one that did the carrying -- a grasp is a hold, not a blip.
+    """
+    flags = closed.astype(np.int8)
+    edges = np.diff(np.concatenate(([0], flags, [0])))
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1) - 1
+    spans: list[list[int]] = [[int(starts[0]), int(ends[0])]]
+    for start, end in zip(starts[1:], ends[1:]):
+        if int(start) - spans[-1][1] - 1 < _TRACE_GRIPPER_REOPEN_MIN_STEPS:
+            spans[-1][1] = int(end)
+        else:
+            spans.append([int(start), int(end)])
+    first, last = max(spans, key=lambda span: span[1] - span[0])
+    return first, last
 
 
 class RolloutGeometryTrace:
@@ -2338,7 +2446,7 @@ class RolloutGeometryTrace:
     def __init__(self, rollout_index: int, *, trace_dir: Path | None = None):
         self.rollout_index = int(rollout_index)
         self.trace_dir = Path(trace_dir) if trace_dir else None
-        self._rows: list[tuple[int, float, float, float, float, float, str]] = []
+        self._rows: list[tuple[int, float, float, float, float, float, str, str]] = []
 
     def sample(
         self,
@@ -2348,6 +2456,7 @@ class RolloutGeometryTrace:
         gripper_command: float,
         gripper_raw: float,
         command_status: str,
+        source: str = 'policy',
     ) -> None:
         try:
             position = np.asarray(position_xyz, dtype=np.float64).reshape(3)
@@ -2364,6 +2473,7 @@ class RolloutGeometryTrace:
                 float(gripper_command),
                 float(gripper_raw),
                 str(command_status),
+                str(source),
             )
         )
 
@@ -2373,6 +2483,7 @@ class RolloutGeometryTrace:
             return {'samples': 0, 'closed': False}
         positions = np.asarray([row[1:4] for row in self._rows], dtype=np.float64)
         gripper = np.asarray([row[4] for row in self._rows], dtype=np.float64)
+        sources = [row[7] for row in self._rows]
         # A grasp is a falling edge, not a level. A rollout can begin with the gripper already
         # commanded shut -- the start-pose check warns about exactly that when the live gripper
         # does not match the dataset's start contract -- and "first step under the threshold"
@@ -2381,17 +2492,27 @@ class RolloutGeometryTrace:
         # event a transition, which is what closing on something is.
         open_steps = np.flatnonzero(gripper >= _TRACE_GRIPPER_CLOSED_BELOW)
         first_open = int(open_steps[0]) if open_steps.size else len(self._rows)
-        closed_steps = np.flatnonzero(gripper[first_open:] < _TRACE_GRIPPER_CLOSED_BELOW) + first_open
-        result: dict[str, Any] = {'samples': len(self._rows), 'closed': bool(closed_steps.size)}
-        if not closed_steps.size:
+        closed = gripper < _TRACE_GRIPPER_CLOSED_BELOW
+        closed[:first_open] = False
+        result: dict[str, Any] = {'samples': len(self._rows), 'closed': bool(closed.any())}
+        # Reduced from the per-step column rather than tracked alongside it, so the marker can
+        # never claim a takeover the trace file does not show. `intervened` is separate from
+        # the span list because it is the one bit every consumer needs: a rollout the operator
+        # drove part of says nothing about the policy's success rate, and folding it into that
+        # rate is the same arithmetic mistake as forgetting to grade a round.
+        expert_spans_found = expert_spans(sources)
+        if expert_spans_found:
+            result['intervened'] = True
+            result['expert_steps'] = sum(last - first + 1 for first, last in expert_spans_found)
+            result['expert_spans'] = expert_spans_found
+        if not closed.any():
             # Never closed. The lowest point it reached is still the landing point worth
             # plotting: it is where the policy decided the object was.
             lowest = int(np.argmin(positions[:, 2]))
             result['approach_xyz'] = positions[lowest].tolist()
             return result
-        close_idx = int(closed_steps[0])
-        reopened = np.flatnonzero(gripper[close_idx:] >= _TRACE_GRIPPER_CLOSED_BELOW)
-        release_idx = int(close_idx + reopened[0]) if reopened.size else len(self._rows) - 1
+        close_idx, hold_end = _dominant_closed_span(closed)
+        release_idx = min(hold_end + 1, len(self._rows) - 1)
         apex_z = float(positions[close_idx : release_idx + 1, 2].max())
         result.update(
             {
@@ -2425,6 +2546,12 @@ class RolloutGeometryTrace:
         held = summary.get('held_steps')
         if held is not None:
             fields.append(f'held_steps={int(held)}')
+        if summary.get('intervened'):
+            fields.append('intervened=1')
+            fields.append(f"expert_steps={int(summary['expert_steps'])}")
+            fields.append(
+                'expert_spans=' + ';'.join(f'{first}-{last}' for first, last in summary['expert_spans'])
+            )
         return ' '.join(fields)
 
     def write(self) -> None:
@@ -2435,10 +2562,11 @@ class RolloutGeometryTrace:
             self.trace_dir.mkdir(parents=True, exist_ok=True)
             path = self.trace_dir / f'rollout_{self.rollout_index:03d}.csv'
             with open(path, 'w', encoding='utf-8') as handle:
-                handle.write('step,x,y,z,gripper_cmd,gripper_raw,status\n')
-                for step_idx, x, y, z, gripper_cmd, gripper_raw, status in self._rows:
+                handle.write('step,x,y,z,gripper_cmd,gripper_raw,status,source\n')
+                for step_idx, x, y, z, gripper_cmd, gripper_raw, status, source in self._rows:
                     handle.write(
-                        f'{step_idx},{x:.6f},{y:.6f},{z:.6f},{gripper_cmd:.4f},{gripper_raw:.4f},{status}\n'
+                        f'{step_idx},{x:.6f},{y:.6f},{z:.6f},{gripper_cmd:.4f},{gripper_raw:.4f},'
+                        f'{status},{source}\n'
                     )
         except OSError as exc:  # noqa: BLE001 - a trace must never end a rollout
             print(f'[WARN] rollout_trace_write_failed index={self.rollout_index}: {exc}')
@@ -3893,6 +4021,34 @@ def resolve_rtc_replan_queue_size(policy: Any, requested_replan_queue_size: int)
 
 
 
+def build_expert_takeover(args: argparse.Namespace) -> ExpertTakeover | None:
+    """Connect the SpaceMouse the operator will steer with, or explain why there is none.
+
+    Imported here rather than at module scope so a rig with no HID library, or no device
+    plugged in, still runs ordinary rollouts. Takeover is the addition; it must not become a
+    new way for inference to fail to start.
+    """
+    if not args.dagger_takeover:
+        return None
+    from lerobot.teleoperators.spacemouse.configuration_spacemouse import SpaceMouseTeleopConfig
+    from lerobot.teleoperators.spacemouse.teleop_spacemouse import SpaceMouseTeleop
+
+    overrides: dict[str, Any] = {'device_id': int(args.dagger_spacemouse_device_id)}
+    if args.dagger_translation_scale is not None:
+        overrides['translation_scale'] = float(args.dagger_translation_scale)
+    if args.dagger_rotation_scale is not None:
+        overrides['rotation_scale'] = float(args.dagger_rotation_scale)
+    teleop = SpaceMouseTeleop(SpaceMouseTeleopConfig(**overrides))
+    teleop.connect()
+    print(
+        '[INFO] dagger_takeover=ready '
+        f"device_id={overrides['device_id']} "
+        f"translation_scale={teleop.config.translation_scale:.6f} "
+        f"rotation_scale={teleop.config.rotation_scale:.6f}"
+    )
+    return ExpertTakeover(teleop)
+
+
 def resolve_rollout_task_prompt(ds_meta: LeRobotDatasetMetadata, explicit_task_prompt: str | None) -> str | None:
     if explicit_task_prompt is not None and str(explicit_task_prompt).strip():
         return str(explicit_task_prompt).strip()
@@ -4513,6 +4669,7 @@ def run_inference(args: argparse.Namespace) -> int:
     def run_policy_rollout(
         interactive_keyboard: InteractiveRolloutKeyboard | None = None,
         trace: RolloutGeometryTrace | None = None,
+        expert_takeover: ExpertTakeover | None = None,
     ) -> str:
         reset_policy_runtime_state()
         T_B_Ws: np.ndarray | None = None
@@ -4881,6 +5038,29 @@ def run_inference(args: argparse.Namespace) -> int:
                 ramp_step_m=float(args.place_assist_ramp_step_mm) / 1000.0,
                 closed_gripper_max=float(args.place_assist_closed_gripper_max),
             )
+            command_source = 'policy'
+            if expert_takeover is not None:
+                robot_command, takeover_debug = expert_takeover.command(
+                    engaged=interactive_keyboard is not None and interactive_keyboard.takeover_is_engaged(),
+                    policy_command=robot_command,
+                    previous_sent_command=previous_sent_command,
+                    robot_observation=robot_observation,
+                )
+                command_source = str(takeover_debug['source'])
+                if command_source == 'expert':
+                    # Both assists read "the policy has stopped making progress" off a command
+                    # that is no longer the policy's. While the operator drives, holding still
+                    # is an instruction, not a stall -- and an offset accumulated during a
+                    # correction would be re-applied to a policy that has since been handed an
+                    # arm somewhere else entirely.
+                    place_assist_state['stuck_count'] = 0
+                    place_assist_state['offset_xyz_m'] = np.zeros(3, dtype=np.float64)
+                    temporal_offset_state['stuck_count'] = 0
+
+            # One smoothing and clamping path for both action sources. The expert's target is
+            # a delta against `previous_sent_command`, which is the same pose the policy's
+            # delta is defined against, so the step guard below bounds the two identically --
+            # and the filter state carries across a handoff instead of restarting at it.
             robot_command = smooth_robot_command_ema(
                 robot_command,
                 previous_smoothed_command,
@@ -4973,6 +5153,7 @@ def run_inference(args: argparse.Namespace) -> int:
                     gripper_command=float(command_to_send['gripper.pos']),
                     gripper_raw=float(model_gripper_raw),
                     command_status=str(command_status),
+                    source=command_source,
                 )
 
             elapsed_s = time.perf_counter() - loop_start_t
@@ -5038,6 +5219,11 @@ def run_inference(args: argparse.Namespace) -> int:
                         f" prev_cmd_err_mm={np.linalg.norm(previous_tracking_position_delta) * 1000.0:.2f} "
                         f"prev_cmd_err_rot_deg={np.linalg.norm(np.rad2deg(previous_tracking_rotation_delta)):.2f}"
                     )
+                if command_source != 'policy':
+                    log_message += (
+                        f" source={command_source} takeover={takeover_debug.get('status', '')}"
+                        f" takeover_gripper={int(bool(takeover_debug.get('gripper_owned')))}"
+                    )
                 log_message += f" loop_ms={elapsed_s * 1000.0:.1f} sleep_ms={sleep_s * 1000.0:.1f}"
                 print(log_message)
 
@@ -5047,13 +5233,21 @@ def run_inference(args: argparse.Namespace) -> int:
 
     rollout_trace_dir = Path(args.rollout_trace_dir).expanduser() if args.rollout_trace_dir else None
     interactive_keyboard: InteractiveRolloutKeyboard | None = None
+    expert_takeover: ExpertTakeover | None = None
+    if args.dagger_takeover and not args.interactive_rollouts:
+        # The key that engages it only exists in interactive mode, so a takeover asked for
+        # anywhere else could never be triggered -- and a device connected but unreachable is
+        # worse than one that was never opened.
+        raise SystemExit('--dagger-takeover requires --interactive-rollouts.')
     try:
+        expert_takeover = build_expert_takeover(args)
         if args.interactive_rollouts:
             interactive_keyboard = InteractiveRolloutKeyboard(
                 start_key=args.rollout_start_key,
                 stop_key=args.rollout_stop_key,
                 home_key=args.rollout_home_key,
                 quit_key=args.rollout_quit_key,
+                takeover_key=args.rollout_takeover_key if expert_takeover is not None else None,
             )
             interactive_keyboard.start()
             rollout_index = 0
@@ -5075,7 +5269,9 @@ def run_inference(args: argparse.Namespace) -> int:
                 arm_at_start = False
                 print(f'[INFO] interactive_rollout_start index={rollout_index}')
                 trace = RolloutGeometryTrace(rollout_index, trace_dir=rollout_trace_dir)
-                rollout_status = run_policy_rollout(interactive_keyboard, trace=trace)
+                rollout_status = run_policy_rollout(
+                    interactive_keyboard, trace=trace, expert_takeover=expert_takeover
+                )
                 print(
                     f'[INFO] interactive_rollout_end index={rollout_index} status={rollout_status} '
                     + trace.summary_log_fields()
@@ -5092,6 +5288,8 @@ def run_inference(args: argparse.Namespace) -> int:
     finally:
         if interactive_keyboard is not None:
             interactive_keyboard.close()
+        if expert_takeover is not None:
+            expert_takeover.close()
         if mujoco_visualizer is not None:
             mujoco_visualizer.close()
         if args.camera_preview_window:

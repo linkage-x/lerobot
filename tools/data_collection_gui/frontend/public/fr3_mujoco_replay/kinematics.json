@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "name": "fr3_pika_gripper_simplified",
+  "root": "base",
+  "active_joints": [
+    "fr3_joint1",
+    "fr3_joint2",
+    "fr3_joint3",
+    "fr3_joint4",
+    "fr3_joint5",
+    "fr3_joint6",
+    "fr3_joint7"
+  ],
+  "links": [
+    {"name": "base"},
+    {"name": "fr3_link0", "mesh": {"url": "/api/assets/fr3/link0.stl"}},
+    {"name": "fr3_link1", "mesh": {"url": "/api/assets/fr3/link1.stl"}},
+    {"name": "fr3_link2", "mesh": {"url": "/api/assets/fr3/link2.stl"}},
+    {"name": "fr3_link3", "mesh": {"url": "/api/assets/fr3/link3.stl"}},
+    {"name": "fr3_link4", "mesh": {"url": "/api/assets/fr3/link4.stl"}},
+    {"name": "fr3_link5", "mesh": {"url": "/api/assets/fr3/link5.stl"}},
+    {"name": "fr3_link6", "mesh": {"url": "/api/assets/fr3/link6.stl"}},
+    {"name": "fr3_link7", "mesh": {"url": "/api/assets/fr3/link7.stl"}},
+    {"name": "fr3_link8"},
+    {"name": "fr3_pika_adapter_link", "mesh": {"url": "/api/assets/fr3/fr32pika.STL", "scale": [0.001, 0.001, 0.001]}},
+    {"name": "gripper_base_link", "mesh": {"url": "/api/assets/fr3/pika_gripper_base_link.STL"}},
+    {"name": "gripper_left_link", "mesh": {"url": "/api/assets/fr3/pika_gripper_left_link.STL"}},
+    {"name": "gripper_right_link", "mesh": {"url": "/api/assets/fr3/pika_gripper_right_link.STL"}}
+  ],
+  "joints": [
+    {"name": "fr3_base_joint", "type": "fixed", "parent": "base", "child": "fr3_link0", "origin": {"xyz": [0, 0, 0], "rpy": [0, 0, 0]}},
+    {"name": "fr3_joint1", "type": "revolute", "parent": "fr3_link0", "child": "fr3_link1", "origin": {"xyz": [0, 0, 0.333], "rpy": [0, 0, 0]}, "axis": [0, 0, 1]},
+    {"name": "fr3_joint2", "type": "revolute", "parent": "fr3_link1", "child": "fr3_link2", "origin": {"xyz": [0, 0, 0], "rpy": [-1.570796326794897, 0, 0]}, "axis": [0, 0, 1]},
+    {"name": "fr3_joint3", "type": "revolute", "parent": "fr3_link2", "child": "fr3_link3", "origin": {"xyz": [0, -0.316, 0], "rpy": [1.570796326794897, 0, 0]}, "axis": [0, 0, 1]},
+    {"name": "fr3_joint4", "type": "revolute", "parent": "fr3_link3", "child": "fr3_link4", "origin": {"xyz": [0.0825, 0, 0], "rpy": [1.570796326794897, 0, 0]}, "axis": [0, 0, 1]},
+    {"name": "fr3_joint5", "type": "revolute", "parent": "fr3_link4", "child": "fr3_link5", "origin": {"xyz": [-0.0825, 0.384, 0], "rpy": [-1.570796326794897, 0, 0]}, "axis": [0, 0, 1]},
+    {"name": "fr3_joint6", "type": "revolute", "parent": "fr3_link5", "child": "fr3_link6", "origin": {"xyz": [0, 0, 0], "rpy": [1.570796326794897, 0, 0]}, "axis": [0, 0, 1]},
+    {"name": "fr3_joint7", "type": "revolute", "parent": "fr3_link6", "child": "fr3_link7", "origin": {"xyz": [0.088, 0, 0], "rpy": [1.570796326794897, 0, 0]}, "axis": [0, 0, 1]},
+    {"name": "fr3_joint8", "type": "fixed", "parent": "fr3_link7", "child": "fr3_link8", "origin": {"xyz": [0, 0, 0.107], "rpy": [0, 0, 0]}},
+    {"name": "fr3_pika_adapter_joint", "type": "fixed", "parent": "fr3_link8", "child": "fr3_pika_adapter_link", "origin": {"xyz": [-0.033, -0.033, -0.012], "rpy": [0, 0, 0]}},
+    {"name": "fr3_gripper_joint", "type": "fixed", "parent": "fr3_link8", "child": "gripper_base_link", "origin": {"xyz": [0.002, 0, 0.008], "rpy": [-0.739815, -1.5707963, 3.1415926]}},
+    {"name": "gripper_left_joint", "type": "prismatic", "parent": "gripper_base_link", "child": "gripper_left_link", "origin": {"xyz": [0.0815, 0.08851, 0.0064182], "rpy": [0, 0, 0]}, "axis": [0, 1, 0]},
+    {"name": "gripper_right_joint", "type": "prismatic", "parent": "gripper_base_link", "child": "gripper_right_link", "origin": {"xyz": [0.0815, -0.088529, 0.0064182], "rpy": [0, 0, 0]}, "axis": [0, 1, 0]}
+  ],
+  "gripper": {
+    "value_semantics": "1_open_0_closed",
+    "jaw_stroke_m": 0.05,
+    "left_joint": "gripper_left_joint",
+    "right_joint": "gripper_right_joint"
+  }
+}

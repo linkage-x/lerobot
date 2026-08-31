@@ -11,6 +11,18 @@ import type {
 } from "../types";
 import { Metric, Modal, PageHeader, StatusDot } from "../shared/ui";
 import { CheckpointBrowser } from "../shared/CheckpointBrowser";
+import {
+  ACTION_LOSS_WEIGHT_DIMENSIONS,
+  FR3_BASELINE_ACTION_LOSS_WEIGHTS,
+  PI05_FULL_ACTION_EXPERT_LORA_TARGETS,
+  UNIFORM_ACTION_LOSS_WEIGHTS,
+  describeLoraTargetModules,
+  isFiveDimFr3DeltaActionMode,
+  parseActionLossWeightInputs,
+  separateActionLossWeights,
+  withActionLossWeights,
+  type ActionLossWeightInputs
+} from "./trainingPolicyConfig";
 
 // Mirrors KNOWN_POLICY_TYPES in tools/fr3/fr3_train_il_policy.py. Split by what has actually
 // been trained and rolled out on the FR3 rig, because "selectable" and "someone has seen this
@@ -80,6 +92,7 @@ const PI05_LORA_24GB_STARTING_POLICY_CONFIG = JSON.stringify({
 });
 
 type TrainingPreset = {
+  actionLossWeights?: ActionLossWeightInputs;
   batchSize: string;
   description: string;
   name: string;
@@ -104,8 +117,9 @@ function startingPreset(policy: string, actionMode: string | undefined): Trainin
     return {
       name: "pi0.5 + LoRA on 24 GiB",
       description:
-        "BF16, gradient checkpointing, and compilation keep the first adapter run inside a 24 GiB GPU budget; batch size 2 is intentionally conservative.",
+        "BF16, gradient checkpointing, and compilation keep the first adapter run inside a 24 GiB GPU budget; batch size 2 is intentionally conservative. FR3 5-D delta views also start from the measured per-dimension loss weights below.",
       policyConfig: PI05_LORA_24GB_STARTING_POLICY_CONFIG,
+      actionLossWeights: [...FR3_BASELINE_ACTION_LOSS_WEIGHTS],
       steps: "20000",
       batchSize: "2",
       saveFreq: "2000"
@@ -138,6 +152,12 @@ function describeHistoryEntry(entry: TrainingHistoryEntry): string {
     // LoRA runs can differ by without the line saying so.
     const scaled = p.loraAlpha && p.loraAlpha !== p.loraR ? ` \u03b1${p.loraAlpha}` : "";
     parts.push(`LoRA r${p.loraR ?? "?"}${scaled}`);
+  }
+  if (p.policyConfig) {
+    const separated = separateActionLossWeights(p.policyConfig);
+    if (separated.actionLossWeights) {
+      parts.push(`loss w ${separated.actionLossWeights.join("/")}`);
+    }
   }
   if (entry.viewName) parts.push(entry.viewName);
   return parts.join(" · ");
@@ -189,6 +209,9 @@ export function TrainingPage() {
   const [useAmp, setUseAmp] = useState(false);
   const [policyConfig, setPolicyConfig] = useState("");
   const [policyConfigEdited, setPolicyConfigEdited] = useState(false);
+  const [actionLossWeights, setActionLossWeights] = useState<ActionLossWeightInputs>([
+    ...FR3_BASELINE_ACTION_LOSS_WEIGHTS
+  ]);
 
   const [pretrainedPath, setPretrainedPath] = useState("");
   // Whether the operator has typed their own base checkpoint. Until they do, it tracks the
@@ -228,6 +251,18 @@ export function TrainingPage() {
   const selectedPreset = useMemo(
     () => startingPreset(policy, selectedView?.actionMode),
     [policy, selectedView?.actionMode]
+  );
+  const actionLossWeightsApply =
+    policy === "pi05" && isFiveDimFr3DeltaActionMode(selectedView?.actionMode);
+  const actionLossWeightsEditable =
+    policy === "pi05" && (!selectedView || isFiveDimFr3DeltaActionMode(selectedView.actionMode));
+  const parsedActionLossWeights = useMemo(
+    () => parseActionLossWeightInputs(actionLossWeights),
+    [actionLossWeights]
+  );
+  const loraTargetSummary = useMemo(
+    () => describeLoraTargetModules(policy, loraTargetModules),
+    [policy, loraTargetModules]
   );
   const isRunning = run !== null && RUNNING_STATES.has(run.state);
   const policySupport = machine?.policies?.[policy];
@@ -434,6 +469,22 @@ export function TrainingPage() {
   };
 
   const onStart = async () => {
+    if (actionLossWeightsApply && parsedActionLossWeights.error) {
+      setNotice("");
+      setError(parsedActionLossWeights.error);
+      return;
+    }
+    let resolvedPolicyConfig: string;
+    try {
+      resolvedPolicyConfig = withActionLossWeights(
+        policyConfig,
+        actionLossWeightsApply ? (parsedActionLossWeights.weights ?? []) : null
+      );
+    } catch (configError) {
+      setNotice("");
+      setError(configError instanceof Error ? configError.message : String(configError));
+      return;
+    }
     const result = await wrap("Start training", () =>
       api.startTraining({
         hostId,
@@ -447,7 +498,7 @@ export function TrainingPage() {
         logFreq: Number(logFreq) || 100,
         device: "auto",
         useAmp,
-        policyConfig,
+        policyConfig: resolvedPolicyConfig,
         pretrainedPath: pretrainedPath.trim(),
         loraEnabled,
         loraR: Number(loraR) || 16,
@@ -470,6 +521,9 @@ export function TrainingPage() {
     setSaveFreq(preset.saveFreq);
     setPolicyConfig(preset.policyConfig);
     setPolicyConfigEdited(false);
+    if (preset.actionLossWeights) {
+      setActionLossWeights([...preset.actionLossWeights]);
+    }
     setNotice(`${preset.name} starting preset applied.`);
   };
 
@@ -492,11 +546,22 @@ export function TrainingPage() {
     if (p.saveFreq !== undefined) setSaveFreq(String(p.saveFreq));
     if (p.logFreq !== undefined) setLogFreq(String(p.logFreq));
     if (p.useAmp !== undefined) setUseAmp(p.useAmp);
+    const historyPolicy = p.policy ?? entry.policy;
     if (p.policyConfig !== undefined) {
-      setPolicyConfig(p.policyConfig);
+      const separated = separateActionLossWeights(p.policyConfig);
+      setPolicyConfig(separated.policyConfig);
+      if (separated.actionLossWeights) {
+        setActionLossWeights(separated.actionLossWeights);
+      } else if (historyPolicy === "pi05") {
+        // No field in an older pi0.5 checkpoint means the run used upstream equal weighting.
+        setActionLossWeights([...UNIFORM_ACTION_LOSS_WEIGHTS]);
+      }
       // Marked as hand-edited so selecting a policy afterwards does not quietly overwrite the
       // config this run is being reproduced from with that policy's starting preset.
-      setPolicyConfigEdited(p.policyConfig.trim() !== "");
+      setPolicyConfigEdited(separated.policyConfig.trim() !== "");
+    } else if (historyPolicy === "pi05") {
+      // The oldest stored history entries predate policyConfig itself; they also used equal loss.
+      setActionLossWeights([...UNIFORM_ACTION_LOSS_WEIGHTS]);
     }
     if (p.pretrainedPath !== undefined) {
       setPretrainedPath(p.pretrainedPath);
@@ -530,7 +595,12 @@ export function TrainingPage() {
   };
 
   const startDisabled =
-    busy || isRunning || !viewName || !jobName || (selectedView?.episodes ?? 0) < 1;
+    busy ||
+    isRunning ||
+    !viewName ||
+    !jobName ||
+    (selectedView?.episodes ?? 0) < 1 ||
+    (actionLossWeightsApply && Boolean(parsedActionLossWeights.error));
 
   return (
     <div className="page">
@@ -950,30 +1020,56 @@ export function TrainingPage() {
           </label>
         </div>
         {loraEnabled && (
-          <div className="field-row">
-            <label className="field">
-              <span>LoRA rank</span>
-              <input value={loraR} onChange={(e) => setLoraR(e.target.value)} disabled={isRunning} />
-            </label>
-            <label className="field">
-              <span>LoRA alpha</span>
-              <input
-                value={loraAlpha}
-                onChange={(e) => setLoraAlpha(e.target.value)}
-                placeholder="(tracks rank)"
-                disabled={isRunning}
-              />
-            </label>
-            <label className="field">
-              <span>Target modules (optional)</span>
-              <input
-                value={loraTargetModules}
-                onChange={(e) => setLoraTargetModules(e.target.value)}
-                placeholder="(policy default)"
-                disabled={isRunning}
-              />
-            </label>
-          </div>
+          <>
+            <div className="field-row">
+              <label className="field">
+                <span>LoRA rank</span>
+                <input value={loraR} onChange={(e) => setLoraR(e.target.value)} disabled={isRunning} />
+              </label>
+              <label className="field">
+                <span>LoRA alpha</span>
+                <input
+                  value={loraAlpha}
+                  onChange={(e) => setLoraAlpha(e.target.value)}
+                  placeholder="(tracks rank)"
+                  disabled={isRunning}
+                />
+              </label>
+              <label className="field">
+                <span>Target modules (optional)</span>
+                <input
+                  value={loraTargetModules}
+                  onChange={(e) => setLoraTargetModules(e.target.value)}
+                  placeholder="(policy default)"
+                  disabled={isRunning}
+                />
+              </label>
+            </div>
+            <div className="subcard">
+              <div>
+                <strong>{loraTargetSummary.title}</strong>
+                <p className="hint">{loraTargetSummary.detail}</p>
+              </div>
+              {policy === "pi05" && (
+                <div className="row-actions">
+                  <button
+                    type="button"
+                    onClick={() => setLoraTargetModules(PI05_FULL_ACTION_EXPERT_LORA_TARGETS)}
+                    disabled={isRunning || loraTargetModules.trim() === PI05_FULL_ACTION_EXPERT_LORA_TARGETS}
+                  >
+                    Use FR3 full action-expert baseline
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLoraTargetModules("")}
+                    disabled={isRunning || !loraTargetModules.trim()}
+                  >
+                    Use compact policy default
+                  </button>
+                </div>
+              )}
+            </div>
+          </>
         )}
         <p className="hint">
           A base checkpoint supplies <em>weights only</em> — every hyperparameter still comes from
@@ -1041,7 +1137,66 @@ export function TrainingPage() {
           {selectedPreset
             ? `The ${selectedPreset.name} JSON above is the selected starting point. Anything typed here wins over it.`
             : `Left empty, ${policy} trains on its own upstream LeRobot defaults (ACT: chunk_size 100, n_action_steps 100, lr 1e-5). Anything typed here wins over them.`}
+          {policy === "pi05" && (
+            <>
+              {" "}The <code>action_loss_weights</code> key is the exception: the five labelled
+              controls below own it, so a stale copy in this JSON cannot silently override them.
+            </>
+          )}
         </p>
+
+        {policy === "pi05" && (
+          <div className="subcard">
+            <h4>FR3 action loss weights</h4>
+            <p className="hint">
+              Each value controls how much that action dimension&apos;s prediction error contributes
+              to training. It changes the share of loss and gradient the dimension receives; it
+              does <strong>not</strong> multiply, clamp, or otherwise scale commands sent to the
+              robot. The trainer normalizes the five values to mean 1, so they redistribute the
+              learning budget without changing the overall loss scale.
+            </p>
+            <div className="action-loss-weight-grid">
+              {ACTION_LOSS_WEIGHT_DIMENSIONS.map((dimension, index) => (
+                <label className="field" key={dimension.key}>
+                  <span>
+                    <code>{dimension.key}</code> · {dimension.label}
+                  </span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.1"
+                    inputMode="decimal"
+                    aria-label={`${dimension.key} action loss weight`}
+                    value={actionLossWeights[index]}
+                    onChange={(event) => {
+                      const next = [...actionLossWeights] as ActionLossWeightInputs;
+                      next[index] = event.target.value;
+                      setActionLossWeights(next);
+                    }}
+                    disabled={isRunning || !actionLossWeightsEditable}
+                  />
+                </label>
+              ))}
+            </div>
+            <p className="hint">
+              Relative meaning: <code>1.0</code> is the reference share, <code>0.2</code> gives a
+              dimension one fifth of that emphasis, and <code>2.0</code> gives it twice the
+              emphasis. The FR3 baseline therefore de-emphasizes <code>drz</code> rotation and
+              emphasizes gripper timing while keeping <code>dx / dy / dz</code> at the reference
+              share.
+            </p>
+            {selectedView && !isFiveDimFr3DeltaActionMode(selectedView.actionMode) && (
+              <div className="banner banner-warn">
+                These five labels describe the FR3 delta action contract. The selected view uses{" "}
+                <code>{selectedView.actionMode}</code>, so these weights are disabled and will not
+                be submitted; its action dimension is different.
+              </div>
+            )}
+            {actionLossWeightsEditable && parsedActionLossWeights.error && (
+              <div className="banner banner-error">{parsedActionLossWeights.error}</div>
+            )}
+          </div>
+        )}
 
         <label className="field-inline">
           <input

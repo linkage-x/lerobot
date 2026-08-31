@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pi0.5 + LoRA 训练成功经验</title>
+<style>
+  :root{
+    --bg:#f6f7f9;
+    --panel:#ffffff;
+    --text:#1f2937;
+    --muted:#64748b;
+    --line:#e5e7eb;
+    --ink:#111827;
+    --blue:#1d4ed8;
+    --blue-bg:#eff6ff;
+    --green:#15803d;
+    --green-bg:#ecfdf5;
+    --amber:#a16207;
+    --amber-bg:#fffbeb;
+    --red:#991b1b;
+    --red-bg:#fef2f2;
+    --shadow:0 8px 24px rgba(15,23,42,.06);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    line-height:1.64;
+  }
+  a{color:var(--blue)}
+  .wrap{max-width:1120px;margin:0 auto;padding:34px 22px 72px}
+  .hero{
+    background:var(--ink);
+    color:#f9fafb;
+    border-radius:18px;
+    padding:30px 32px;
+    box-shadow:var(--shadow);
+    margin-bottom:18px;
+  }
+  .hero h1{margin:0 0 10px;font-size:30px;line-height:1.24;letter-spacing:0}
+  .hero p{margin:8px 0;color:#d1d5db}
+  .hero a{color:#bfdbfe}
+  .meta{display:flex;gap:8px;flex-wrap:wrap;margin-top:17px}
+  .pill{
+    display:inline-flex;
+    padding:5px 10px;
+    border-radius:999px;
+    border:1px solid rgba(255,255,255,.18);
+    color:#e5e7eb;
+    font-size:13px;
+    font-weight:650;
+  }
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}
+  .card{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:14px;
+    padding:20px;
+    box-shadow:var(--shadow);
+  }
+  .full{grid-column:1/-1}
+  h2{font-size:22px;margin:0 0 12px;color:var(--ink)}
+  h3{font-size:17px;margin:18px 0 7px;color:var(--ink)}
+  p{margin:8px 0}
+  ul,ol{margin:8px 0 0 22px;padding:0}
+  li{margin:5px 0}
+  code,.mono{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+    background:#f3f4f6;
+    border-radius:6px;
+    padding:2px 5px;
+    font-size:.92em;
+  }
+  .hero code,.hero .mono{background:rgba(255,255,255,.12);color:#fff}
+  .small{font-size:13px;color:var(--muted)}
+  .badge{
+    display:inline-block;
+    padding:3px 8px;
+    border-radius:999px;
+    font-size:12px;
+    font-weight:750;
+    white-space:nowrap;
+  }
+  .done{color:var(--green);background:var(--green-bg)}
+  .warn{color:var(--amber);background:var(--amber-bg)}
+  .p0{color:var(--red);background:var(--red-bg)}
+  .callout{
+    margin:12px 0;
+    border-left:4px solid var(--blue);
+    background:var(--blue-bg);
+    border-radius:10px;
+    padding:12px 14px;
+  }
+  .callout.ok{border-color:var(--green);background:var(--green-bg)}
+  .callout.warn{border-color:var(--amber);background:var(--amber-bg)}
+  .callout.p0{border-color:var(--red);background:var(--red-bg)}
+  .tablewrap{overflow-x:auto;max-width:100%}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{background:#f9fafb;color:#111827}
+  td.num{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+  .experience{
+    display:grid;
+    grid-template-columns:185px 1fr;
+    gap:16px;
+    padding:18px 0;
+    border-top:1px solid var(--line);
+  }
+  .experience:first-of-type{border-top:none;padding-top:0}
+  .experience .label{font-weight:800;color:var(--ink)}
+  .flow{
+    white-space:pre-wrap;
+    overflow:auto;
+    background:#0f172a;
+    color:#e5e7eb;
+    border-radius:12px;
+    padding:14px;
+    font-size:13px;
+  }
+  @media(max-width:840px){
+    .grid{grid-template-columns:1fr}
+    .full{grid-column:auto}
+    .experience{grid-template-columns:1fr}
+    .hero{padding:25px 21px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <h1>pi0.5 + LoRA 训练成功经验</h1>
+    <p>范围：结合 <a href="./fr3_grasp_baseline_roadmap.html">FR3 抓取 Baseline Roadmap</a>、实验档案和当前 repo，只总结截至 <b>2026-08-31</b> 已有较确定收益的经验。</p>
+    <p>这不是“成功率已经解决”的复盘。当前只是流程跑通，训练、推理、真机 rollout 和评分链路都有了闭环；模型具备基础成功能力，但固定协议 20 轮为 <b>0 成功</b>，合计 <b>2 / 29 ≈ 7%</b>。因此这里保留的是能稳定改善可训练性、可诊断性和可回退性的经验，不把尚未验证的 crop、yaw 分相位加权、DAgger 写成成功经验。</p>
+    <div class="meta">
+      <span class="pill">policy: pi0.5 + LoRA</span>
+      <span class="pill">ckpt: L4_full48_holdout22_40 / 030000</span>
+      <span class="pill">data: 48 ep / 23971 frames</span>
+      <span class="pill">holdout: [22, 40]</span>
+      <span class="pill">train: 30000 steps / loss 0.123</span>
+      <span class="pill">robot: FR3 peg insertion</span>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card full">
+      <h2>一、可以复用的最小配方</h2>
+      <div class="tablewrap">
+      <table>
+        <tr><th>项</th><th>当前 baseline</th><th>为什么保留</th></tr>
+        <tr>
+          <td>训练视图</td>
+          <td>50 条 demo 中排除 holdout <code>[22,40]</code>，训练 48 条 / 23971 帧，30 fps</td>
+          <td>先保留独立留出集，避免只看训练集记忆；holdout 按角度内插，不覆盖环带外 OOD。</td>
+        </tr>
+        <tr>
+          <td>动作契约</td>
+          <td>5 维 delta：<code>dx, dy, dz, drz, gripper</code>；记录仍保留 absolute EE 源数据</td>
+          <td>delta 在 dataset frame 上离线生成，避免把 200 Hz 控制 tick 当成 30 Hz 训练步长。</td>
+        </tr>
+        <tr>
+          <td>归一化与预算</td>
+          <td><code>MEAN_STD</code> + <code>action_loss_weights=[1,1,1,0.2,2]</code></td>
+          <td>归一化负责尺度，权重负责梯度预算；二者拆开后，平移维提升且夹爪没有被饿死。</td>
+        </tr>
+        <tr>
+          <td>LoRA</td>
+          <td><code>r=64</code> / <code>alpha=64</code>，目标模块覆盖 action expert 全 linear</td>
+          <td>alpha 修复与模块覆盖各贡献了清晰可测的收益；不需要先动 VLM / vision tower。</td>
+        </tr>
+        <tr>
+          <td>推理与验收</td>
+          <td>同 checkpoint、同起点、逐轮轨迹 CSV、end marker、人工阶段评分和落点图</td>
+          <td>真机数据不可复现，必须把 rollout 轨迹和评分一轮一轮留住，否则无法判断下一步该改什么。</td>
+        </tr>
+      </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>二、当前结果该怎么读</h2>
+      <div class="callout ok">
+        <b>确定成立：</b>030000 不是随机输出。它在留出集上三个平移维全线上涨，真机上也表现出“会找本次物体”的能力，失败从“没有条件化”换成了“最后几毫米与插入精度不足”。
+      </div>
+      <div class="callout warn">
+        <b>不能外推：</b>2/29 的真机结果只能证明有基础成功能力，不能证明成功率可用。20 轮固定协议全失败，而且失败断在不同阶段，二元 success/failure 已经不够。
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>三、明确不要写成经验的东西</h2>
+      <ul>
+        <li>不要说“继续调大 rank 一定有效”。历史上 rank 的含义被 <code>alpha/r</code> 反向稀释过。</li>
+        <li>不要说“增加推理采样 / inference steps / EMA 会解决 B/C 档”。当前证据指向均值精度，不是单纯采样散布。</li>
+        <li>不要说“只看 lift 或 held steps 就能判成功”。夹爪闭合并抬起时，手里也可能是空的。</li>
+        <li>不要把 crop、分相位 yaw 权重、DAgger 当作已验证收益。它们是下一步候选，不是本轮成功经验。</li>
+      </ul>
+    </div>
+
+    <div class="card full">
+      <h2>四、确定有收益的经验</h2>
+
+      <div class="experience">
+        <div class="label">1. 先修动作/观测契约</div>
+        <div>
+          <p><b>经验：</b>训练前先确认标签不是观测的平凡复制，动作定义也不能和部署时的动作定义漂移。否则 loss 会下降，但学到的是一条不可部署的捷径。</p>
+          <p><b>本轮证据：</b>首帧可作弊度从 <code>0.68</code> 降到 <code>0.18</code>；夹爪 copy 通路 R² 从 <code>0.9999</code> 降到 <code>0.31</code>。这不直接提升抓取成功率，但让后续 L0-L4 的结论可读。</p>
+          <p><b>repo 形态：</b><code>fr3_delta_action_transform.py</code> 明确把 delta 定义为 dataset frame 间差分，absolute action 仍是源数据；部署侧再把 delta 还原为绝对 EE 命令。</p>
+        </div>
+      </div>
+
+      <div class="experience">
+        <div class="label">2. 离线生成 delta action</div>
+        <div>
+          <p><b>经验：</b>FR3 采集路径保留 absolute EE，训练 view 再离线派生 delta。不要在 recorder 的控制循环里存 delta。</p>
+          <p><b>确定收益：</b>控制循环约 200 Hz，而训练 view 是 30 Hz；在控制 tick 上生成 delta 会把一帧动作缩小到约 <code>1/6.7</code>，策略上线后会明显变慢。离线按 dataset frame 差分后，这个尺度错误被消掉，且以后可以不重录硬件数据就重建 view。</p>
+          <div class="flow">recording: absolute EE action 是源数据
+training view: consecutive dataset frames -> delta action
+runtime: delta action -> absolute EE command</div>
+        </div>
+      </div>
+
+      <div class="experience">
+        <div class="label">3. LoRA alpha 必须和 rank 一起钉住</div>
+        <div>
+          <p><b>经验：</b>LoRA 的有效缩放是 <code>alpha / r</code>。只调 rank 不设 alpha，会把“加容量”变成“降更新强度”。</p>
+          <p><b>本轮证据：</b>历史配置里 <code>r=32</code> 但 alpha 落到默认 <code>8</code>，实际缩放只有 <code>0.25</code>。L2b 只把 alpha 从 <code>8</code> 抬到 <code>32</code>，目标模块和参数量不变，<code>dx</code> 单次抽样 R² 从 <code>0.106</code> 到 <code>0.479</code>，买下 L2 约一半改进，且零新增参数。</p>
+          <p><b>repo 形态：</b><code>--lora-alpha</code> 默认取 rank；测试固定了生成的 peft block 和 <code>alpha/r == 1.0</code>。</p>
+        </div>
+      </div>
+
+      <div class="experience">
+        <div class="label">4. 容量加在 action expert，不先动 VLM</div>
+        <div>
+          <p><b>经验：</b>先证明视觉信息有没有穿过冻结 VLM，再决定 LoRA 加在哪。信息已经抵达 expert 时，优先扩 action expert 和投影头，而不是给 LM / vision tower 加 adapter。</p>
+          <p><b>本轮证据：</b>KV cache 留一岭回归可读出 peg 位置，LOO R² 为 <code>x=0.485</code>、<code>y=0.201</code>，相对 <code>embed_image</code> 基线保留 <code>114.6%</code> / <code>109.6%</code>。瓶颈在下游读出，不在冻结 VLM。</p>
+          <p><b>L2 收益：</b>目标模块从默认 q/v + 投影头扩到 action expert 全 linear，并用 <code>r=64/alpha=64</code>，可训练参数从 <code>2.57M</code> 到 <code>27.86M</code>。ep4 上 <code>dx</code> 单次抽样 R² <code>0.106 -> 0.893</code>，<code>dy</code> <code>0.106 -> 0.797</code>，<code>dz</code> <code>-0.196 -> 0.799</code>，夹爪 <code>0.659 -> 0.976</code>。</p>
+        </div>
+      </div>
+
+      <div class="experience">
+        <div class="label">5. 归一化和梯度预算分开处理</div>
+        <div>
+          <p><b>经验：</b><code>MEAN_STD</code> 解决动作维度尺度问题，但它会让每个维度默认拿同等 loss 预算；pi0.5 这种 flow matching 训练还需要单独的逐维权重。</p>
+          <p><b>本轮证据：</b><code>drz</code> 拿了 <code>32.0%</code> 的未加权 loss 预算，但逐步上限只有 <code>0.151</code>，约 <code>84.9%</code> 方差不可约。把权重设为 <code>[1,1,1,0.2,2]</code> 后，第 4 层 H22/H40 三个平移维全部上涨，夹爪仍保持约 <code>0.96</code>。</p>
+          <p><b>repo 形态：</b><code>PI05Config.action_loss_weights</code> 已落地；<code>apply_action_loss_weights</code> 会把权重重归一化到均值 1，只重分配梯度，不暗改总学习率。</p>
+        </div>
+      </div>
+
+      <div class="experience">
+        <div class="label">6. 先跑便宜探针，再跑 8 小时训练</div>
+        <div>
+          <p><b>经验：</b>不要直接用全量训练验证假设。先用单条 episode、8 条 episode、逐维 loss、KV cache 这类便宜探针，把“管线坏 / 容量不够 / 泛化不足 / 预算分配错”分开。</p>
+          <p><b>本轮证据：</b>L0 判断动作目标是否可预测；L1 把缺口拆成采样散布和条件均值；L2 证明是可训练预算；L3 证明角度内插 holdout 不只是背题；L4 用实测 loss 份额确定 <code>drz</code> 降权。几次探针成本加起来低于一次全量训练，却直接改变了最终配方。</p>
+        </div>
+      </div>
+
+      <div class="experience">
+        <div class="label">7. 留出集必须和训练侧对照一起读</div>
+        <div>
+          <p><b>经验：</b>holdout 低不一定说明泛化差，也可能是这个 checkpoint 本来就差，或该 episode 的目标维度信号量小。holdout 要和训练侧 episode 同时评，且要看被考察维度的行程分位。</p>
+          <p><b>本轮证据：</b>L3 中未训练 H22/H40 的表现可超过训练过的 T2；<code>dx</code> 数字与 episode 自身 x 行程强相关，这个模式在 L3 和第 4 层重复出现。第 4 层里 H22/H40 的 chunk 累计平移指标为 <code>dx +0.840/+0.863</code>、<code>dy +0.868/+0.862</code>、<code>dz +0.930/+0.903</code>。</p>
+          <p><b>边界：</b>这个 holdout 是角度内插，只证明环带内泛化；半径 <code>&lt;56 mm</code>、<code>&gt;170 mm</code> 和 <code>79°</code> 缺口仍是 OOD。</p>
+        </div>
+      </div>
+
+      <div class="experience">
+        <div class="label">8. 真机 rollout 先建测量链</div>
+        <div>
+          <p><b>经验：</b>训练一旦有基础成功能力，下一步不是继续堆参数，而是把真机失败变成可机读数据。否则 0/20 只能说明失败，不能说明该改抓取、插入、视野还是数据覆盖。</p>
+          <p><b>本轮证据：</b>S0/S0.1 已把逐步轨迹、事件约化、结果入库、落点图、会话内归位打通；后端 116 项、前端 133 项通过，真机双轮闭环验收通过。但 08-31 固定协议 20 轮全失败后，二元评分已经不够，必须进入阶段评分。</p>
+          <p><b>repo 形态：</b><code>tools/fr3/task_ladders/insert_peg.yaml</code> 定义阶段链，<code>rollout_log.jsonl</code> 记录操作者评分；轨迹事件读夹爪指令而不是观测宽度，因为观测夹爪有大量掉 0。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card full">
+      <h2>五、推荐以后直接沿用的检查清单</h2>
+      <div class="tablewrap">
+      <table>
+        <tr><th>阶段</th><th>检查</th><th>通过后才做什么</th></tr>
+        <tr>
+          <td>建 view 前</td>
+          <td>确认 action 不可由首帧 state 平凡复制；delta 在 dataset frame 离线派生；drop 的维度从 action names、stats、runtime 解码一起消失。</td>
+          <td>开始 pi0.5/LoRA 训练。</td>
+        </tr>
+        <tr>
+          <td>训练前</td>
+          <td>打印并保存 peft block：<code>r</code>、<code>alpha</code>、<code>target_modules</code>、可训练参数数；确认 <code>alpha/r=1</code>。</td>
+          <td>相信“加容量”的实验语义。</td>
+        </tr>
+        <tr>
+          <td>小实验</td>
+          <td>先用单条 episode 和 8 条 episode 探针验证容量、散布、holdout，不用真机。</td>
+          <td>启动全量长训练。</td>
+        </tr>
+        <tr>
+          <td>全量训练</td>
+          <td>固定 holdout 与 train 对照，报告单次抽样和条件均值；<code>drz</code> 不再用近零分母 R² 下结论。</td>
+          <td>决定是否进入真机 rollout。</td>
+        </tr>
+        <tr>
+          <td>真机前</td>
+          <td>跑相机外参门；归档 checkpoint、train config、inference config、评测脚本和 prompt。</td>
+          <td>开始固定协议 rollout。</td>
+        </tr>
+        <tr>
+          <td>真机后</td>
+          <td>每轮都必须评分；用阶段漏斗报告，而不是只报 success/failure；轨迹文件按会话归档。</td>
+          <td>决定后续是 crop、yaw、补数据还是接管采集。</td>
+        </tr>
+      </table>
+      </div>
+    </div>
+
+    <div class="card full">
+      <h2>六、最终结论</h2>
+      <p>pi0.5 + LoRA 这次最确定的成功，不是把 FR3 peg insertion 直接训到可用成功率，而是把系统从“不可诊断的失败”推进到“有可复用配方、有非零真机成功、有可回退 checkpoint、有分阶段测量链”。</p>
+      <p>真正值得复用的收益来自三类事：第一，把数据和动作契约修到可读；第二，把 LoRA 更新强度、模块覆盖、归一化和逐维预算钉成可解释的训练配方；第三，把 rollout 的失败记录成能驱动下一次决策的阶段数据。当前成功率还低，所以所有后续提升都应该以 030000 为锚点，一次只动一个变量。</p>
+    </div>
+  </div>
+</div>
+</body>
+</html>

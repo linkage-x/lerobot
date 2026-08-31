@@ -2016,36 +2016,53 @@ button.danger {
   width: 100%;
 }
 
-.mujoco-native-video-wrap {
-  background: #050708;
-  border: 1px solid #27343b;
+.mujoco-three-viewer {
+  background: #f8fafc;
+  border: 1px solid #d2d9de;
   border-radius: 8px;
-  min-height: 430px;
+  height: 430px;
   overflow: hidden;
   position: relative;
   width: 100%;
 }
 
-.mujoco-native-video {
-  background: #050708;
+.mujoco-three-viewer canvas {
   display: block;
-  height: 430px;
-  object-fit: contain;
+  height: 100%;
   width: 100%;
 }
 
-.mujoco-native-labels {
-  color: #e7eef2;
-  display: grid;
+.mujoco-three-hud {
+  align-items: center;
+  background: rgb(248 250 252 / 86%);
+  border: 1px solid #d7e0e7;
+  border-radius: 6px;
+  color: #36454f;
+  display: flex;
+  flex-wrap: wrap;
   font-size: 12px;
-  font-weight: 600;
-  grid-template-columns: 1fr 1fr;
-  left: 0;
+  gap: 8px;
+  justify-content: space-between;
+  left: 10px;
+  max-width: calc(100% - 20px);
+  padding: 6px 8px;
   pointer-events: none;
   position: absolute;
-  right: 0;
-  text-align: center;
+  right: 10px;
   top: 10px;
+  z-index: 2;
+}
+
+.mujoco-three-overlay {
+  align-items: center;
+  color: #60707c;
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 24px;
+  position: absolute;
+  text-align: center;
+  z-index: 1;
 }
 
 .real-robot-panel {
@@ -4489,6 +4506,22 @@ button.danger {
   padding: 0 8px;
 }
 
+.action-loss-weight-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+}
+
+.action-loss-weight-grid .field {
+  margin: 0;
+}
+
+.action-loss-weight-grid .field input {
+  box-sizing: border-box;
+  min-width: 0;
+  width: 100%;
+}
+
 .field.inline {
   align-items: center;
   display: flex;
@@ -4885,6 +4918,21 @@ button.danger {
   margin-right: 5px;
   vertical-align: baseline;
   width: 9px;
+}
+
+/* The ramp's swatches sit flush against each other so they read as one continuous scale rather
+   than as a row of independent categories -- which is the whole claim the stage grade makes. */
+.landing-map-ramp .dot {
+  margin-right: 0;
+}
+
+.landing-map-ramp .dot:first-of-type {
+  border-radius: 50% 0 0 50%;
+}
+
+.landing-map-ramp .dot:last-of-type {
+  border-radius: 0 50% 50% 0;
+  margin-right: 5px;
 }
 
 .landing-map-legend .dot.demo {

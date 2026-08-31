@@ -1189,15 +1189,13 @@ def test_mujoco_replay_command_uses_selected_cube_sidecar_and_episode(tmp_path):
     assert "--no-viewer" in command
     report_path = Path(command[command.index("--report-json") + 1])
     assert report_path.name == "mujoco_preview.left.episode_000002.json"
-    video_path = Path(command[command.index("--render-video") + 1])
-    assert video_path.name == "mujoco_preview.left.episode_000002.mp4"
+    assert "--render-video" not in command
 
     both_command = gateway._mujoco_replay_command(state, dataset_root, "both")
     assert both_command[both_command.index("--cube") + 1] == "both"
     both_report = Path(both_command[both_command.index("--report-json") + 1])
     assert both_report.name == "mujoco_preview.both.episode_000002.json"
-    both_video = Path(both_command[both_command.index("--render-video") + 1])
-    assert both_video.name == "mujoco_preview.both.episode_000002.mp4"
+    assert "--render-video" not in both_command
 
 
 def test_save_annotation_persists_episode_metadata(monkeypatch, tmp_path):
@@ -1797,7 +1795,6 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
         encoding="utf-8",
     )
     report_path = gateway._mujoco_preview_report_path(dataset_root, 0, "left")
-    video_path = gateway._mujoco_preview_video_path(dataset_root, 0, "left")
     report_path.write_text(
         json.dumps({
             "dataset_root": str(dataset_root),
@@ -1818,7 +1815,6 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
         }),
         encoding="utf-8",
     )
-    video_path.write_bytes(b"rendered")
     state = gateway.GatewayState(
         repo_root=repo_root,
         config_path=repo_root / "config.yaml",
@@ -1852,7 +1848,6 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
         "max_rotation_error_deg": 3.0,
     })
     report_path.write_text(json.dumps(passing_report), encoding="utf-8")
-    video_path.write_bytes(b"passing-render")
 
     gateway._approve_mujoco_report(state, "left")
 
@@ -3700,9 +3695,9 @@ def test_the_gains_payload_carries_the_axis_calibration(tmp_path):
 #
 # `ReplayStatus.fps` is seeded from the recorder config's `dataset.fps`, which says what the *next*
 # recording will do. The moment the recording rate is changed, every dataset recorded before it
-# replays at the wrong rate -- and neither symptom looks like a frame-rate bug. The preview video is
-# encoded at the wrong rate so the arm runs against the timeline at fps_used/fps_recorded speed, and
-# `fr3_gui_replay_runtime` derives the sim's `teleop_control_frequency` from it, so each command is
+# replays at the wrong rate -- and neither symptom looks like a frame-rate bug. The qpos preview is
+# indexed against the wrong frame grid, and `fr3_gui_replay_runtime` derives the sim's
+# `teleop_control_frequency` from it, so each command is
 # integrated for a fraction of a frame period and the tracking score fails on a servo window rather
 # than on the trajectory. Measured on eeframe_fr3_spacemouse_20260813_160401 episode 0, a 30 fps
 # recording replayed at 60 scored 43.26 mm / 8.23 deg against 4.88 mm / 0.64 deg at its own rate.
@@ -3737,6 +3732,45 @@ def test_replay_runs_at_the_rate_the_dataset_was_recorded_at(tmp_path):
         "the MuJoCo gate would encode the preview at 60 and give the sim half the settling time per "
         "command, then report the difference as tracking error"
     )
+    assert "--stream-jsonl" not in command
+
+
+def test_fr3_mujoco_preview_payload_streams_frames_from_gateway_memory(tmp_path):
+    dataset_root = tmp_path / "dataset"
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={"dataset": {"fps": 30, "repo_id": "local/test"}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset=str(dataset_root), datasetRoot=str(dataset_root), episode=2, fps=30),
+        profile="workstation",
+    )
+    state.replay.mujocoValidation = gateway._new_mujoco_validation(
+        state, status="running", dataset_root=dataset_root, episode=2
+    )
+    frame = {
+        "frame_index": 4,
+        "qpos": [0, 0, 0, -2.0, 0, 1.5, 0.7],
+        "target_position_m": [0.31, -0.05, 0.2],
+        "target_quaternion_xyzw": [0, 0, 0, 1],
+        "actual_position_m": [0.312, -0.05, 0.2],
+        "actual_quaternion_xyzw": [0, 0, 0, 1],
+        "body_poses": {
+            "fr3_link0": {"position_m": [0, 0, 0], "quaternion_xyzw": [0, 0, 0, 1]},
+            "pika_gripper_ee": {"position_m": [0.312, -0.05, 0.2], "quaternion_xyzw": [0, 0, 0, 1]},
+        },
+        "target_frame_name": "pika_gripper_ee",
+    }
+
+    gateway._apply_mujoco_replay_output(state, "mujoco_replay_frame=" + json.dumps(frame))
+    payload = gateway._fr3_mujoco_preview_payload(dataset_root, 2, state)
+
+    assert state.replay.frameIndex == 4
+    assert payload is not None
+    assert payload["streaming"] is True
+    assert payload["stream_frame_count"] == 1
+    assert payload["target_frame_name"] == "pika_gripper_ee"
+    assert payload["frames"][0]["body_poses"]["pika_gripper_ee"]["position_m"] == [0.312, -0.05, 0.2]
 
 
 def test_real_replay_takes_the_frame_rate_from_the_dataset_too(tmp_path):
@@ -4238,6 +4272,124 @@ def test_frame_preview_info_reports_each_episodes_own_length(tmp_path):
         "observation.images.side",
     ]
     assert all(camera["width"] == 640 and camera["height"] == 480 for camera in info["cameras"])
+
+
+def _write_packed_timeline_dataset(
+    dataset_root: Path, cameras: list[str], lengths: list[int], fps: int = 60
+) -> None:
+    """`_write_packed_video_dataset` plus the parquet rows `_read_dataset_timeline` reads."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    _write_packed_video_dataset(dataset_root, cameras, lengths, fps=fps)
+    info = json.loads((dataset_root / "meta" / "info.json").read_text(encoding="utf-8"))
+    names = ["ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw", "gripper.pos"]
+    info["features"]["observation.state"] = {"names": names}
+    info["features"]["action"] = {"names": names}
+    (dataset_root / "meta" / "info.json").write_text(json.dumps(info), encoding="utf-8")
+
+    rows: dict[str, list] = {
+        "episode_index": [], "frame_index": [], "timestamp": [], "observation.state": [], "action": []
+    }
+    for episode, length in enumerate(lengths):
+        for frame in range(length):
+            rows["episode_index"].append(episode)
+            rows["frame_index"].append(frame)
+            # Restarts at 0 for every episode. That is the whole reason the video needs an offset:
+            # the timeline axis is episode-relative while the mp4 holds the entire chunk.
+            rows["timestamp"].append(frame / fps)
+            pose = [0.3 + 0.001 * episode, 0.0, 0.2, 0.0, 0.0, 0.0, 1.0, 0.5]
+            rows["observation.state"].append(pose)
+            rows["action"].append(pose)
+    data_dir = dataset_root / "data" / "chunk-000"
+    data_dir.mkdir(parents=True)
+    pq.write_table(pa.table(rows), data_dir / "file-000.parquet")
+
+
+def test_v3_timeline_seeks_the_video_to_the_episodes_own_start_in_the_packed_file(tmp_path):
+    # The bug this guards: a merged training view puts twenty episodes in one mp4, the timeline
+    # timestamps restart at 0 for each, and with no offset every episode replayed as the first
+    # one in its file. Only the episodes that happen to start at 0 looked right, which reads as
+    # "the robot grasps somewhere else than the recording" when the recording is what is wrong.
+    dataset_root = tmp_path / "packed"
+    _write_packed_timeline_dataset(dataset_root, ["observation.images.ee", "observation.images.side"], [120, 60, 90])
+    state = _frame_preview_state(tmp_path, "workstation")
+
+    timeline = gateway._read_dataset_timeline(state, dataset_root, episode=2)
+
+    assert timeline["frames"][0]["timestamp"] == 0.0
+    # Negative: the file's own zero sits (120 + 60) / 60 s *before* this episode's first frame,
+    # so the frontend's `timeline_timestamp - offset` seeks forward into the episode.
+    assert timeline["cameraVideoOffsetsS"] == {
+        "observation.images.ee": pytest.approx(-3.0),
+        "observation.images.side": pytest.approx(-3.0),
+    }
+
+
+def test_v3_timeline_offset_is_zero_for_the_first_episode_in_its_file(tmp_path):
+    dataset_root = tmp_path / "packed"
+    _write_packed_timeline_dataset(dataset_root, ["observation.images.ee"], [120, 60, 90])
+    state = _frame_preview_state(tmp_path, "workstation")
+
+    timeline = gateway._read_dataset_timeline(state, dataset_root, episode=0)
+
+    assert timeline["cameraVideoOffsetsS"]["observation.images.ee"] == pytest.approx(0.0)
+
+
+def test_v3_camera_video_offsets_skips_a_camera_the_metadata_does_not_describe(tmp_path):
+    # A camera key with no from_timestamp column is left out rather than defaulted to 0: the
+    # frontend already treats a missing entry as "this file holds only this episode", and that
+    # is the honest answer for a camera whose boundaries were never recorded.
+    dataset_root = tmp_path / "packed"
+    _write_packed_video_dataset(dataset_root, ["observation.images.ee"], [120, 60])
+
+    offsets = gateway._v3_camera_video_offsets_s(
+        dataset_root, ["observation.images.ee", "observation.images.missing"], episode=1
+    )
+
+    assert offsets == {"observation.images.ee": pytest.approx(-2.0)}
+
+
+def test_v3_camera_video_offsets_is_empty_for_an_episode_with_no_metadata_row(tmp_path):
+    dataset_root = tmp_path / "packed"
+    _write_packed_video_dataset(dataset_root, ["observation.images.ee"], [120, 60])
+
+    assert gateway._v3_camera_video_offsets_s(dataset_root, ["observation.images.ee"], episode=9) == {}
+
+
+def test_gmsl2_dataset_with_v3_data_keeps_its_own_camera_offsets(tmp_path):
+    # A hybrid recording is served per-episode mkv by `_resolve_video_path`, so its offsets have
+    # to stay the camera-start ones. Reading from_timestamp here would seek a file that already
+    # begins at the episode.
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "hybrid"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=1)
+    t0 = 1_700_000_000.0
+    ep_dir = dataset_root / "episodes" / "episode_000000"
+    ep_dir.mkdir(parents=True)
+    (ep_dir / "cam_00.mkv").write_bytes(b"0" * 2048)
+    (ep_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "duration_s": 2 / 30.0,
+                "video": {"fps": 30},
+                "sync_reference": {"t0_wall_s": t0, "camera_first_wall_s": {"cam_00": t0 + 0.10}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={"dataset": {"repo_id": "local/test", "root": str(dataset_root), "fps": 30}},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=dataset_root.parent,
+    )
+
+    timeline = gateway._read_dataset_timeline(state, dataset_root, episode=0)
+
+    assert timeline["cameraVideoOffsetsS"] == {"cam_00": pytest.approx(0.10)}
 
 
 def test_frame_preview_decodes_a_timestamp_once(tmp_path, monkeypatch):
@@ -4756,6 +4908,7 @@ def test_a_recovered_run_carries_only_policy_keys_the_form_owns(tmp_path, monkey
             "type": "pi05",
             "optimizer_lr": 5e-05,
             "normalization_mapping": {"ACTION": "MIN_MAX"},
+            "action_loss_weights": [1.0, 1.0, 1.0, 0.2, 2.0],
             "input_features": {"observation.state": {"shape": [16]}},
             "output_features": {"action": {"shape": [7]}},
         },
@@ -4766,6 +4919,7 @@ def test_a_recovered_run_carries_only_policy_keys_the_form_owns(tmp_path, monkey
     assert json.loads(params["policyConfig"]) == {
         "optimizer_lr": 5e-05,
         "normalization_mapping": {"ACTION": "MIN_MAX"},
+        "action_loss_weights": [1.0, 1.0, 1.0, 0.2, 2.0],
     }
 
 

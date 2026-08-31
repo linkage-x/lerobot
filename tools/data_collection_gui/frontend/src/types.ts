@@ -297,12 +297,25 @@ export type RealSensePreviewStatus = {
   cameras?: RealSensePreviewCameraStatus[];
 };
 
+export type MujocoPreviewBodyPose = {
+  position_m: [number, number, number];
+  quaternion_xyzw: [number, number, number, number];
+};
+
 export type MujocoPreviewFrame = {
   frame_index: number;
-  joints_rad: number[];
+  qpos?: number[];
+  joints_rad?: number[];
+  gripper?: number;
   target_position_m: [number, number, number];
   target_quaternion_xyzw?: [number, number, number, number];
-  mujoco_position_m: [number, number, number];
+  mujoco_position_m?: [number, number, number];
+  actual_position_m?: [number, number, number];
+  actual_quaternion_xyzw?: [number, number, number, number];
+  body_poses?: Record<string, MujocoPreviewBodyPose>;
+  target_frame_name?: string;
+  position_error_mm?: number;
+  rotation_error_deg?: number;
 };
 
 export type MujocoPreviewRobot = {
@@ -326,6 +339,16 @@ export type MujocoPreview = {
   fps: number;
   robot_spacing_m: number;
   native_video_path?: string;
+  frames?: MujocoPreviewFrame[];
+  streaming?: boolean;
+  stream_frame_count?: number;
+  frame_source?: string;
+  target_frame_name?: string;
+  action_source?: string;
+  model?: {
+    renderer?: "three-webgl" | string;
+    kinematics_path?: string;
+  };
   robots: Partial<Record<"left" | "right", MujocoPreviewRobot>>;
 };
 
@@ -1152,6 +1175,31 @@ export type RolloutStatusPayload = {
   trainingBusy: boolean;
 };
 
+/** One task's grading ladder, as the gateway serves it from `tools/fr3/task_ladders/`.
+ *  The page never defines stages of its own: the menu and the validation have to be the
+ *  same list, or the operator can pick a stage the gateway then rejects. */
+export type TaskLadderStage = {
+  id: string;
+  ordinal: number;
+  /** The vocabulary's word for this link, shared across tasks. */
+  label: string;
+  /** What the link means in general. */
+  criterion: string;
+  /** What it looks like in *this* task -- the sentence the operator matches against. */
+  instance: string;
+};
+
+export type TaskLadderBlocker = { id: string; label: string; instance: string };
+
+export type TaskLadder = {
+  task: string;
+  label: string;
+  /** The stage that counts as success. Everything below it is a shortfall. */
+  terminal: number;
+  stages: TaskLadderStage[];
+  blockers: TaskLadderBlocker[];
+};
+
 export type RolloutOutcomeEntry = {
   recordedAt: string;
   checkpointId: string;
@@ -1163,6 +1211,16 @@ export type RolloutOutcomeEntry = {
   rolloutIndex?: number;
   /** Absent on rollouts recorded before the runtime reported landing points. */
   geometry?: RolloutGeometry;
+  /** The ladder this rollout was graded against. Absent on rollouts graded before ladders. */
+  taskLadder?: string;
+  /** How far along that task's precondition chain it got. Ordinal — never average these. */
+  stage?: number;
+  stageId?: string;
+  /** The stage that counts as success. Stored per record so an old grade still renders right. */
+  terminalStage?: number;
+  blocker?: string;
+  /** Whether the attempt was inside what the demonstrations cover. */
+  inDistribution?: boolean;
 };
 
 export type RolloutRtcMode = "auto" | "enabled" | "disabled";

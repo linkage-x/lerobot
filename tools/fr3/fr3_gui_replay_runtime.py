@@ -49,7 +49,7 @@ for _path in (str(_REPO_ROOT / "src"), str(_REPO_ROOT)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from lerobot.robots import make_robot_from_config  # noqa: E402
+from lerobot.robots.utils import make_robot_from_config  # noqa: E402
 from lerobot.robots.franka_research3.processor_franka_research3 import (  # noqa: E402
     DELTA_REFERENCE_CURRENT,
     PREV_CMD_POSITION_KEYS,
@@ -72,6 +72,67 @@ OBSERVATION_FEATURE = "observation.state"
 DEFAULT_MAX_POSITION_ERROR_MM = 20.0
 DEFAULT_MAX_ROTATION_ERROR_DEG = 15.0
 _PROGRESS_EVERY = 25
+
+PREVIEW_BODY_NAMES = (
+    "fr3_link0",
+    "fr3_link1",
+    "fr3_link2",
+    "fr3_link3",
+    "fr3_link4",
+    "fr3_link5",
+    "fr3_link6",
+    "fr3_link7",
+    "fr3_link8",
+    "fr3_pika_adapter_link",
+    "gripper_base",
+    "gripper_left_link",
+    "gripper_right_link",
+    "pika_gripper_ee",
+    "pika_task_tcp",
+)
+PREVIEW_BODY_ALIASES = {"gripper_base": "gripper_base_link"}
+
+
+def _sim_body_poses_in_base(robot: Any) -> dict[str, dict[str, list[float]]]:
+    """Return MuJoCo body poses in the same base frame as observation ee.*.
+
+    The browser viewer uses these poses when available instead of reimplementing the MJCF
+    kinematic tree. That keeps the visual meshes, actual TCP marker and scored EE pose in one
+    coordinate frame even when the MJCF has mount offsets or non-URDF body names.
+    """
+    env = getattr(robot, "_env", None)
+    if env is None or not hasattr(env, "_pose_to_base"):
+        return {}
+    mujoco = getattr(env, "_mujoco", None)
+    model = getattr(env, "model", None)
+    data = getattr(env, "data", None)
+    if mujoco is None or model is None or data is None:
+        return {}
+    poses: dict[str, dict[str, list[float]]] = {}
+    for body_name in PREVIEW_BODY_NAMES:
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        if body_id < 0:
+            continue
+        world_pose = np.eye(4, dtype=np.float64)
+        world_pose[:3, 3] = np.asarray(data.xpos[body_id], dtype=np.float64)
+        world_pose[:3, :3] = np.asarray(data.xmat[body_id], dtype=np.float64).reshape(3, 3)
+        base_pose = env._pose_to_base(world_pose)
+        entry = {
+            "position_m": [float(value) for value in base_pose[:3, 3]],
+            "quaternion_xyzw": [float(value) for value in Rotation.from_matrix(base_pose[:3, :3]).as_quat()],
+        }
+        poses[body_name] = entry
+        alias = PREVIEW_BODY_ALIASES.get(body_name)
+        if alias:
+            poses[alias] = entry
+    return poses
+
+
+def _write_stream_frame(handle: Any, frame: dict[str, Any]) -> None:
+    if handle is None:
+        return
+    handle.write(json.dumps(frame, sort_keys=True) + "\n")
+    handle.flush()
 
 
 def emit(line: str) -> None:
@@ -291,10 +352,24 @@ def _rotation_error_deg(target_xyzw: np.ndarray, actual_xyzw: np.ndarray) -> flo
 
 def _delta_stream(names: list[str], values: np.ndarray, reference: str) -> tuple[np.ndarray, np.ndarray]:
     """Extract (translation deltas Nx3, rotvec deltas Nx3) from a delta action block."""
-    position_columns = [_column(names, values, key) for key in delta_ee_position_keys(reference)]
-    rotvec_columns = [_column(names, values, key) for key in delta_ee_rotvec_keys(reference)]
-    if any(column is None for column in position_columns + rotvec_columns):
-        raise ValueError(f"Action column is missing some {reference!r} delta components.")
+    position_keys = delta_ee_position_keys(reference)
+    position_columns = [_column(names, values, key) for key in position_keys]
+    if any(column is None for column in position_columns):
+        missing = [key for key, column in zip(position_keys, position_columns, strict=True) if column is None]
+        raise ValueError(f"Action column is missing {reference!r} translation delta components: {missing}.")
+
+    rotvec_keys = delta_ee_rotvec_keys(reference)
+    rotvec_columns = [_column(names, values, key) for key in rotvec_keys]
+    missing_rotvec = [key for key, column in zip(rotvec_keys, rotvec_columns, strict=True) if column is None]
+    if missing_rotvec:
+        emit(
+            "WARN: action column omits locked/unused rotation delta components "
+            f"{missing_rotvec}; replay will fill them with 0.0 rad."
+        )
+        rotvec_columns = [
+            column if column is not None else np.zeros(values.shape[0], dtype=np.float64)
+            for column in rotvec_columns
+        ]
     return np.stack(position_columns, axis=1), np.stack(rotvec_columns, axis=1)
 
 
@@ -438,14 +513,22 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
             "robot_type": "",
             "video_frames": 0,
             "native_video_path": "",
+            "frames": [],
+            "frame_source": "mujoco qpos + body poses",
+            "target_frame_name": str(getattr(robot_cfg, "target_frame_name", "") or ""),
         }
     robot = make_robot_from_config(robot_cfg)
 
     frame_period_s = 1.0 / max(fps, 1)
     position_errors_mm: list[float] = []
     rotation_errors_deg: list[float] = []
+    preview_frames: list[dict[str, Any]] = []
     completed_frames = 0
     video = _PreviewVideoWriter(args.render_video, fps) if args.render_video else None
+    stream_handle = None
+    if args.stream_jsonl is not None and not real_backend:
+        args.stream_jsonl.parent.mkdir(parents=True, exist_ok=True)
+        stream_handle = args.stream_jsonl.open("w", encoding="utf-8")
 
     emit(
         f"fr3_mujoco_replay dataset={dataset_root.name} episode={args.episode} "
@@ -510,6 +593,29 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
             ).as_quat()
             position_errors_mm.append(float(np.linalg.norm(actual_position - target_position) * 1e3))
             rotation_errors_deg.append(_rotation_error_deg(target_quaternion, actual_quaternion))
+            joints_rad = [
+                float(observation[f"joint_{joint_index}.pos"])
+                for joint_index in range(1, 8)
+                if f"joint_{joint_index}.pos" in observation
+            ]
+            preview_frame = {
+                "frame_index": int(frame_index),
+                "qpos": joints_rad,
+                "joints_rad": joints_rad,
+                "gripper": float(command["gripper.pos"]),
+                "target_position_m": [float(value) for value in target_position],
+                "target_quaternion_xyzw": [float(value) for value in target_quaternion],
+                "actual_position_m": [float(value) for value in actual_position],
+                "actual_quaternion_xyzw": [float(value) for value in actual_quaternion],
+                "body_poses": _sim_body_poses_in_base(robot) if not real_backend else {},
+                "target_frame_name": str(getattr(robot_cfg, "target_frame_name", "") or ""),
+                "position_error_mm": float(position_errors_mm[-1]),
+                "rotation_error_deg": float(rotation_errors_deg[-1]),
+            }
+            preview_frames.append(preview_frame)
+            _write_stream_frame(stream_handle, preview_frame)
+            if not real_backend:
+                emit("mujoco_replay_frame=" + json.dumps(preview_frame, separators=(",", ":"), sort_keys=True))
             completed_frames += 1
             if video is not None:
                 video.append(_preview_frame(robot, video))
@@ -521,6 +627,8 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
                 if remaining_s > 0:
                     time.sleep(remaining_s)
     finally:
+        if stream_handle is not None:
+            stream_handle.close()
         if video is not None:
             video.close()
         if robot.is_connected:
@@ -564,6 +672,10 @@ def replay_episode(args: argparse.Namespace) -> dict[str, Any]:
         "native_video_path": (
             str(video.destination) if video is not None and video.frames_written and not video.error else ""
         ),
+        "frames": preview_frames,
+        "frame_source": "mujoco qpos + body poses",
+        "target_frame_name": str(getattr(robot_cfg, "target_frame_name", "") or ""),
+        "action_source": action_source,
     }
     return result
 
@@ -689,6 +801,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument(
+        "--stream-jsonl",
+        dest="stream_jsonl",
+        type=Path,
+        default=None,
+        help="Write one replay preview frame JSON object per line while MuJoCo runs.",
+    )
+    parser.add_argument(
         "--render-video",
         dest="render_video",
         type=Path,
@@ -719,13 +838,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    result = replay_episode(args)
     default_report = (
         fr3_real_replay_report_path(args.dataset.resolve(), args.episode)
         if args.backend == "real"
         else fr3_mujoco_replay_report_path(args.dataset.resolve(), args.episode)
     )
     destination = args.output or default_report
+    try:
+        result = replay_episode(args)
+    except Exception as exc:  # noqa: BLE001 - still emit the gateway protocol line
+        result = {
+            "schema_version": 1,
+            "dataset": str(args.dataset.resolve()),
+            "episode": int(args.episode),
+            "fps": int(args.fps or 0),
+            "status": "failed",
+            "reasons": [str(exc)],
+            "completed_frames": 0,
+            "total_frames": 0,
+            "avg_position_error_mm": 0.0,
+            "max_position_error_mm": 0.0,
+            "avg_rotation_error_deg": 0.0,
+            "max_rotation_error_deg": 0.0,
+            "limits": {
+                "max_position_error_mm": float(args.max_position_error_mm),
+                "max_rotation_error_deg": float(args.max_rotation_error_deg),
+            },
+            "backend": str(args.backend),
+            "robot_type": "",
+            "video_frames": 0,
+            "native_video_path": "",
+            "frames": [],
+            "frame_source": "mujoco qpos + body poses",
+            "target_frame_name": "",
+        }
+        emit(f"ERROR: {exc}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
 

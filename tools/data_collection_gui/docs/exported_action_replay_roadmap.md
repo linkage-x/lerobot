@@ -1,6 +1,6 @@
 # Exported Dataset Action Replay Roadmap
 
-Updated: 2026-07-14
+Updated: 2026-08-31
 
 This roadmap tracks the path from Thor exported datasets to GUI visualization,
 MuJoCo validation, and eventually guarded real-robot replay when `action` is
@@ -38,6 +38,7 @@ Real-robot replay should be unlocked only when all of these are true:
 | Export dataset visibility in GUI Replay | Done | Gateway scans `outputs/exports`, returns `datasetKind=exported`, and Replay lists exported datasets. |
 | Export page open-in-replay entry | Done | Dataset Export shows `Open Replay` when `datasetExport.outputPath` is available. |
 | MuJoCo validation infrastructure | Done | Gateway starts MuJoCo replay, requires structured `mujoco_replay_result`, stores metrics, persists validation, and checks current dataset/episode/fps/thresholds. |
+| MuJoCo replay visualization | Done for live body-pose playback | Replay runtimes now stream MuJoCo body poses through gateway memory while writing final JSON metrics. The GUI renders those frames live in the browser with Three.js/WebGL; the gateway no longer needs to render or validate an MP4 preview. |
 | Basic trajectory contract | Done | Gateway checks EE pose presence, max EE step, gripper range/step, and optional Z bounds in `_trajectory_contract_for_episode`. |
 | Real hardware preflight | Done | `Preflight` runs host-side hardware checks before `safety=ready`. |
 | FR3 real replay default path | Done | `fr3_das_replay_real_runtime.py` reads LeRobot main `action` and sends it through the validated `action[t] + OTG` path; joint-target CSV replay remains experimental. |
@@ -136,6 +137,30 @@ exported + derived action semantics + current MuJoCo pass + preflight pass:
 This requires changing both frontend gating and backend `_require_mujoco_validation`.
 The backend must remain authoritative.
 
+### 5. Renderer stack migration decision
+
+Current decision: do not migrate to `react-three-fiber` or MUI in the current
+MuJoCo replay fix. The existing GUI has no MUI dependency and already uses a
+small direct Three.js viewer, so the low-risk change is to render MuJoCo
+body-pose frames with the same stack.
+
+When to migrate:
+
+- migrate to `react-three-fiber` when the replay view needs multiple coordinated
+  canvases, declarative scene composition, or shared frame-loop ownership across
+  replay, teleop, and rollout pages;
+- migrate controls to MUI only when the broader GUI adopts MUI as its component
+  system, not as a one-panel dependency;
+- migrate physics to browser-side MuJoCo WASM only after model packaging is
+  static-file complete (`kinematics.json`, MJCF/WASM assets, simplified STL) and
+  the replay gate can prove that WASM metrics match the current Python MuJoCo
+  safety gate within the configured thresholds.
+
+Until then the browser renderer is Three.js/WebGL, driven by body-pose
+frames emitted over the MuJoCo validation runtime's stdout and cached in gateway
+memory. This removes offline MP4 rendering without changing which process
+computes the safety verdict.
+
 ## TODO Roadmap
 
 ### P0: Make action semantics explicit
@@ -177,6 +202,15 @@ The backend must remain authoritative.
   action-source configuration.
 - Add tests proving MuJoCo validation cannot unlock Real Robot for a different
   action column, episode, fps, or threshold set.
+
+### P2: Optional frontend renderer migration
+
+- Introduce `react-three-fiber` only after at least two GUI pages share the same
+  robot scene lifecycle, camera controls, and per-frame animation hooks.
+- Introduce MUI only as part of a GUI-wide component-system migration.
+- Prototype MuJoCo WASM as a non-authoritative browser replay first; promote it
+  to the safety gate only after parity tests against Python MuJoCo pass on fixed
+  datasets.
 
 ### P2: Improve audit artifacts
 

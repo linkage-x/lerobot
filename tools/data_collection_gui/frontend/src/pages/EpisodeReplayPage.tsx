@@ -4,6 +4,7 @@ import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, Con
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation, mujocoValidationMatchesSelection } from "../shared/ui";
 import { ReplayInspector } from "../ReplayInspector";
 import { api } from "../apiClient";
+import { episodeVideoStartS } from "../shared/videoOffsets";
 
 export function ReplayPanel({
   status,
@@ -168,19 +169,40 @@ export function RealRobotReplayPanel({
     };
   }, [datasetPath, status.datasetKind, status.episode, status.revision]);
 
+  // Not 0. A v3 dataset concatenates every episode of its chunk into one mp4, so the episode
+  // being replayed starts somewhere inside the served file -- for a merged training view, up to
+  // five minutes in. Playing from 0 shows the first episode of the source next to the live
+  // camera, which reads as "the robot is grasping in the wrong place" when it is the reference
+  // that is wrong.
+  const recordedVideoStartS = useCallback(
+    (cameraKey: string) =>
+      episodeVideoStartS(timeline?.cameraVideoOffsetsS, cameraKey, timeline?.videoWarmupS ?? 0),
+    [timeline],
+  );
+  const seekRecordedVideo = useCallback(
+    (cameraKey: string, video: HTMLVideoElement) => {
+      try {
+        video.currentTime = recordedVideoStartS(cameraKey);
+      } catch {
+        // Browsers throw when metadata is not loaded yet; onLoadedMetadata seeks again.
+      }
+    },
+    [recordedVideoStartS],
+  );
+
   useEffect(() => {
-    Object.values(recordedVideoRefs.current).forEach((video) => {
+    Object.entries(recordedVideoRefs.current).forEach(([cameraKey, video]) => {
       if (!video) return;
       if (status.state !== "replaying") {
         video.pause();
         return;
       }
-      video.currentTime = 0;
+      seekRecordedVideo(cameraKey, video);
       void video.play().catch(() => {
         // Browser autoplay policy can still block muted video in some environments; controls remain visible.
       });
     });
-  }, [cameraMatches.map((camera) => camera.cameraKey).join("|"), status.state]);
+  }, [cameraMatches.map((camera) => camera.cameraKey).join("|"), seekRecordedVideo, status.state]);
 
   // Never a literal: the gateway builds the replay command from `robot.target_frame_name`, and the
   // two FR3 tool frames are 411 mm apart on the same URDF. A label that disagrees with the config
@@ -269,6 +291,14 @@ export function RealRobotReplayPanel({
                             recordedVideoRefs.current[camera.cameraKey] = element;
                           }}
                           src={recordedVideoUrl(camera.cameraKey)}
+                          onLoadedMetadata={(event) => {
+                            // A seek before metadata is refused, and playback then starts at 0.
+                            // Only forward: once it has taken, currentTime is past the start.
+                            const target = event.currentTarget;
+                            if (target.currentTime + 0.001 < recordedVideoStartS(camera.cameraKey)) {
+                              seekRecordedVideo(camera.cameraKey, target);
+                            }
+                          }}
                           muted
                           playsInline
                           controls

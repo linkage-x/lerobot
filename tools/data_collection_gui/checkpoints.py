@@ -32,6 +32,11 @@ try:  # pragma: no cover - exercised implicitly by every gateway import
 except ImportError:  # pragma: no cover - direct-script fallback, as elsewhere in this package
     import training as training_backend
 
+try:  # pragma: no cover - same fallback as above
+    from tools.data_collection_gui import task_ladders
+except ImportError:  # pragma: no cover - direct-script fallback, as elsewhere in this package
+    import task_ladders
+
 SCAN_SCRIPT = Path("tools/fr3/scan_checkpoints.py")
 
 # `<job>/<step>`, both segments already constrained by what the trainer will accept as a job
@@ -511,7 +516,20 @@ def append_rollout_outcome(repo_root: Path, record: dict[str, Any]) -> dict[str,
     reason you would or would not retrain that way, and a record stored beside the weights
     would go with them.
     """
-    outcome = str(record.get("outcome") or "").strip()
+    # Graded first, because on a ladder the outcome is not an independent field: success is
+    # reaching the terminal stage. A record carrying both is a record whose two halves can
+    # disagree, which is how a partially inserted peg ended up filed as a plain `failure`.
+    try:
+        ladder = (
+            task_ladders.find_ladder(repo_root, str(record["taskLadder"]))
+            if record.get("taskLadder")
+            else None
+        )
+        graded = task_ladders.normalize_grade(record, ladder)
+    except task_ladders.LadderError as error:
+        raise CheckpointError(str(error)) from error
+
+    outcome = str(graded.get("outcome") or record.get("outcome") or "").strip()
     if outcome not in ROLLOUT_OUTCOMES:
         raise CheckpointError(f"Outcome must be one of {', '.join(ROLLOUT_OUTCOMES)} (got {outcome!r}).")
     checkpoint_id = str(record.get("checkpointId") or "")
@@ -528,6 +546,11 @@ def append_rollout_outcome(repo_root: Path, record: dict[str, Any]) -> dict[str,
         "logPath": str(record.get("logPath") or ""),
         "rolloutIndex": int(record.get("rolloutIndex") or 0),
     }
+    # Absent on an ungraded rollout rather than defaulted: stage 0 is a real grade ("never
+    # reached the object"), so writing it for "nobody said" would invent evidence.
+    for key in ("taskLadder", "stage", "stageId", "terminalStage", "blocker", "inDistribution"):
+        if key in graded:
+            entry[key] = graded[key]
     # Stored with the grade rather than in a file of its own: a landing point without an outcome
     # is a dot with no meaning, and an outcome without a landing point cannot be put on a map.
     # Written only when the runtime actually reported one, so an older log line -- or a rollout

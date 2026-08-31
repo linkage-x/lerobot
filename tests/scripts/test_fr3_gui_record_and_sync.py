@@ -607,6 +607,9 @@ def test_workstation_mujoco_validation_uses_position_prioritized_ik(tmp_path):
     assert str(tmp_path / "tools/fr3/fr3_gui_replay_runtime.py") in command
     assert "--ik-orientation-weight" in command
     assert command[command.index("--ik-orientation-weight") + 1] == "0.012"
+    assert "--render-video" not in command
+    assert "--stream-jsonl" not in command
+    assert "--output" in command
     assert "--backend" not in command
 
 
@@ -821,6 +824,42 @@ def test_replay_still_reads_an_absolute_ee_dataset_unchanged():
     assert np.allclose(positions[0], [0.5, 0.1, 0.35])
     assert np.allclose(quaternions[0], [0.0, 0.0, 0.0, 1.0])
 
+
+
+def test_replay_fills_missing_locked_rotation_delta_axes_with_zero():
+    from tools.fr3.fr3_gui_replay_runtime import reconstruct_absolute_pose_stream
+
+    action_names = [
+        "delta_ee_from_prev_cmd.dx",
+        "delta_ee_from_prev_cmd.dy",
+        "delta_ee_from_prev_cmd.dz",
+        "delta_ee_from_prev_cmd.drz",
+        "gripper.pos",
+    ]
+    actions = np.array([
+        [0.01, 0.0, 0.0, 0.001, 0.5],
+        [0.02, 0.0, 0.0, 0.002, 0.5],
+    ])
+    observation_names = [
+        "ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw",
+        "prev_cmd.ee.x", "prev_cmd.ee.y", "prev_cmd.ee.z",
+        "prev_cmd.ee.qx", "prev_cmd.ee.qy", "prev_cmd.ee.qz", "prev_cmd.ee.qw",
+        "gripper.pos",
+    ]
+    observations = np.array([
+        [0.3, 0.0, 0.2, 0.0, 0.0, 0.0, 1.0, 0.3, 0.0, 0.2, 0.0, 0.0, 0.0, 1.0, 0.5],
+        [0.31, 0.0, 0.2, 0.0, 0.0, 0.001, 0.9999995, 0.31, 0.0, 0.2, 0.0, 0.0, 0.001, 0.9999995, 0.5],
+    ])
+
+    positions, _quaternions, source = reconstruct_absolute_pose_stream(
+        action_names=action_names,
+        actions=actions,
+        observation_names=observation_names,
+        observations=observations,
+    )
+
+    assert "prev_cmd" in source
+    assert np.allclose(positions[:, 0], [0.31, 0.33])
 
 def test_replay_preview_survives_a_renderer_that_cannot_open_a_gl_context(tmp_path):
     """A dead offscreen renderer must cost the video, not the validation.

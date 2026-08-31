@@ -10,7 +10,8 @@ import type {
   RolloutRtcMode,
   RolloutRtcSchedule,
   RolloutRun,
-  RolloutRuntimeOptions
+  RolloutRuntimeOptions,
+  TaskLadder
 } from "../types";
 import { RolloutLandingMap } from "./RolloutLandingMap";
 
@@ -95,6 +96,10 @@ export function RolloutPage() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [outcomeNote, setOutcomeNote] = useState("");
+  const [ladders, setLadders] = useState<TaskLadder[]>([]);
+  const [outcomeTask, setOutcomeTask] = useState("");
+  const [outcomeStageId, setOutcomeStageId] = useState("");
+  const [outcomeBlocker, setOutcomeBlocker] = useState("");
   const [history, setHistory] = useState<RolloutOutcomeEntry[]>([]);
   const [landmarks, setLandmarks] = useState<RolloutLandmarks>({});
   const [frameNonce, setFrameNonce] = useState(0);
@@ -184,6 +189,19 @@ export function RolloutPage() {
       cancelled = true;
     };
   }, [run?.datasetRoot, landmarks.datasetRoot]);
+
+  // Once, on mount: the ladders are files in the repo, so they change when someone edits one
+  // and not while a rollout is running.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const payload = await api.fetchTaskLadders();
+      if (!cancelled && payload.length) setLadders(payload);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Seed the form from the last rollout, once, on mount. Tuning a policy means rolling out the
   // same settings against checkpoint after checkpoint, and retyping eight RTC knobs each time is
@@ -300,13 +318,40 @@ export function RolloutPage() {
     if (result.ok) setNotice("Stop sent.");
   };
 
-  const onRecordOutcome = async (outcome: "success" | "failure" | "aborted") => {
+  // One ladder ships today; the picker only appears once there are two, so the common case is
+  // not a one-item menu.
+  const ladder = useMemo(
+    () => ladders.find((item) => item.task === outcomeTask) ?? ladders[0] ?? null,
+    [ladders, outcomeTask]
+  );
+  const gradedStage = useMemo(
+    () => ladder?.stages.find((stage) => stage.id === outcomeStageId) ?? null,
+    [ladder, outcomeStageId]
+  );
+  // Shown to the operator before they commit, because this is the number the log will carry:
+  // the outcome is *derived* from the stage rather than chosen beside it.
+  const derivedOutcome =
+    gradedStage && ladder ? (gradedStage.ordinal >= ladder.terminal ? "success" : "failure") : "";
+
+  const onRecordOutcome = async (outcome?: "success" | "failure" | "aborted") => {
     const result = await wrap("Record outcome", () =>
-      api.recordRolloutOutcome({ outcome, note: outcomeNote })
+      api.recordRolloutOutcome({
+        note: outcomeNote,
+        ...(ladder && gradedStage ? { taskLadder: ladder.task, stageId: gradedStage.id } : {}),
+        // Only meaningful on a shortfall: the terminal stage did not stop anywhere.
+        ...(ladder && gradedStage && outcomeBlocker && gradedStage.ordinal < ladder.terminal
+          ? { blocker: outcomeBlocker }
+          : {}),
+        // Sent only when it is not derivable. `aborted` is the one outcome a stage cannot
+        // imply -- it says the round is not evidence about the policy at all.
+        ...(outcome ? { outcome } : {})
+      })
     );
     if (result.ok) {
       setOutcomeNote("");
-      setNotice(`Recorded ${outcome}.`);
+      setOutcomeStageId("");
+      setOutcomeBlocker("");
+      setNotice(`Recorded ${outcome ?? derivedOutcome}${gradedStage ? ` at stage ${gradedStage.ordinal}` : ""}.`);
       await refreshHistory();
     }
   };
@@ -466,13 +511,95 @@ export function RolloutPage() {
                   placeholder="grasped but released early"
                 />
               </label>
+              {ladder && (
+                <>
+                  {ladders.length > 1 && (
+                    <label className="field">
+                      <span>Task</span>
+                      <select
+                        value={ladder.task}
+                        onChange={(event) => {
+                          setOutcomeTask(event.target.value);
+                          setOutcomeStageId("");
+                          setOutcomeBlocker("");
+                        }}
+                      >
+                        {ladders.map((item) => (
+                          <option key={item.task} value={item.task}>
+                            {item.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                  <label className="field">
+                    <span>走到了哪一步</span>
+                    <select
+                      value={outcomeStageId}
+                      onChange={(event) => setOutcomeStageId(event.target.value)}
+                    >
+                      <option value="">— 选择阶段 —</option>
+                      {ladder.stages.map((stage) => (
+                        <option key={stage.id} value={stage.id}>
+                          {stage.ordinal} · {stage.label} — {stage.instance || stage.criterion}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {gradedStage && gradedStage.ordinal < ladder.terminal && (
+                    <label className="field">
+                      <span>卡在哪</span>
+                      <select
+                        value={outcomeBlocker}
+                        onChange={(event) => setOutcomeBlocker(event.target.value)}
+                      >
+                        <option value="">未判明</option>
+                        {ladder.blockers
+                          .filter((blocker) => blocker.id !== "unknown")
+                          .map((blocker) => (
+                            <option key={blocker.id} value={blocker.id}>
+                              {blocker.label}
+                              {blocker.instance ? ` — ${blocker.instance}` : ""}
+                            </option>
+                          ))}
+                      </select>
+                    </label>
+                  )}
+                  <p className="hint">
+                    成功 = 到达第 {ladder.terminal} 阶段（{ladder.stages[ladder.stages.length - 1].instance}）。
+                    outcome 由阶段推出，不单独选 —— 两者能各填各的，就能互相矛盾。
+                  </p>
+                </>
+              )}
               <div className="row-actions">
-                <button type="button" onClick={() => void onRecordOutcome("success")} disabled={busy}>
-                  Success
-                </button>
-                <button type="button" onClick={() => void onRecordOutcome("failure")} disabled={busy}>
-                  Failure
-                </button>
+                {ladder ? (
+                  <button
+                    type="button"
+                    onClick={() => void onRecordOutcome()}
+                    disabled={busy || !gradedStage}
+                  >
+                    {gradedStage
+                      ? `Record stage ${gradedStage.ordinal} (${derivedOutcome})`
+                      : "Record (pick a stage first)"}
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => void onRecordOutcome("success")}
+                      disabled={busy}
+                    >
+                      Success
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void onRecordOutcome("failure")}
+                      disabled={busy}
+                    >
+                      Failure
+                    </button>
+                  </>
+                )}
                 <button type="button" onClick={() => void onRecordOutcome("aborted")} disabled={busy}>
                   Aborted (not the policy&apos;s fault)
                 </button>

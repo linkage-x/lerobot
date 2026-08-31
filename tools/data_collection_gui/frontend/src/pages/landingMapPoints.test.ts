@@ -1,7 +1,7 @@
 import { describe as suite, expect, it } from "vitest";
 
 import type { RolloutOutcomeEntry } from "../types";
-import { buildLandingPoints } from "./landingMapPoints";
+import { buildLandingPoints, pointFill, stageFill } from "./landingMapPoints";
 
 function entry(
   recordedAt: string,
@@ -51,5 +51,58 @@ suite("landing map point order", () => {
     delete ungeometried.geometry;
 
     expect(buildLandingPoints([ungeometried], 0, undefined)).toEqual([]);
+  });
+});
+
+suite("stage colours", () => {
+  // The ramp exists because `stage` is ordinal. A palette would let two adjacent stages read
+  // as unrelated categories, which is the failure this replaces: the 08-31 batch broke in three
+  // different places and came back one colour.
+  it("runs the full ramp whatever the task's chain length", () => {
+    expect(stageFill(1, 7)).toBe(stageFill(1, 4));
+    expect(stageFill(7, 7)).toBe(stageFill(4, 4));
+    expect(stageFill(1, 7)).not.toBe(stageFill(7, 7));
+  });
+
+  it("keeps the ordering monotone, so 'further along' is never a darker step backwards", () => {
+    const ramp = [1, 2, 3, 4, 5, 6, 7].map((stage) => stageFill(stage, 7));
+
+    expect(new Set(ramp).size).toBe(7);
+  });
+
+  it("colours a rollout graded on a ladder by how far it got", () => {
+    const point = { outcome: "failure" as const, stage: 2, terminalStage: 7 };
+
+    expect(pointFill(point as never)).toBe(stageFill(2, 7));
+  });
+
+  it("leaves an aborted rollout out of the ramp whatever stage it reached", () => {
+    // Stopped for reasons that say nothing about the policy, so it must not be counted by eye
+    // among the rollouts the ramp is there to tally.
+    const point = { outcome: "aborted" as const, stage: 5, terminalStage: 7 };
+
+    expect(pointFill(point as never)).not.toBe(stageFill(5, 7));
+  });
+
+  it("falls back to the outcome colour for rollouts graded before ladders existed", () => {
+    const older = { outcome: "success" as const };
+    const graded = { outcome: "success" as const, stage: 7, terminalStage: 7 };
+
+    expect(pointFill(older as never)).toBe(pointFill(graded as never));
+  });
+
+  it("puts the stage ahead of the geometry in the tooltip", () => {
+    const graded: RolloutOutcomeEntry = {
+      ...entry("2026-08-31T07:18:47+00:00", "failure", [0.37, -0.05], 4),
+      stage: 2,
+      stageId: "contact",
+      terminalStage: 7,
+      blocker: "object_pose_offset"
+    };
+
+    const [point] = buildLandingPoints([graded], 0, undefined);
+
+    expect(point.title).toContain("stage 2/7 contact");
+    expect(point.title).toContain("object_pose_offset");
   });
 });

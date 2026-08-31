@@ -63,7 +63,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
 from lerobot.datasets.utils import DEFAULT_TASKS_PATH, LEGACY_TASKS_PATH  # noqa: E402
 from lerobot.datasets.video_utils import VideoEncodingManager  # noqa: E402
 import lerobot.robots.franka_research3  # noqa: E402,F401  # registers both FR3 robot choices
-from lerobot.robots import make_robot_from_config  # noqa: E402
+from lerobot.robots.utils import make_robot_from_config  # noqa: E402
 from lerobot.robots.franka_research3 import FrankaResearch3MujocoConfig  # noqa: E402
 from lerobot.scripts.lerobot_record import RecordConfig, record_loop  # noqa: E402
 import lerobot.teleoperators.spacemouse  # noqa: E402,F401

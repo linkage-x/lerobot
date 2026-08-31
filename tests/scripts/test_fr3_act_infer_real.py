@@ -1710,7 +1710,7 @@ def test_preview_and_real_alignment_share_step0_policy_observation_state():
 # ------------------------------------------------------------ rollout geometry ---
 
 
-def _trace_from(gripper_commands, positions, *, trace_dir=None):
+def _trace_from(gripper_commands, positions, *, trace_dir=None, sources=None):
     trace = fr3_act_infer_real_runtime.RolloutGeometryTrace(1, trace_dir=trace_dir)
     for step, (gripper, position) in enumerate(zip(gripper_commands, positions, strict=True)):
         trace.sample(
@@ -1719,6 +1719,7 @@ def _trace_from(gripper_commands, positions, *, trace_dir=None):
             gripper_command=float(gripper),
             gripper_raw=float(gripper),
             command_status="pass",
+            **({} if sources is None else {"source": sources[step]}),
         )
     return trace
 
@@ -1806,6 +1807,63 @@ def test_a_gripper_commanded_shut_for_the_whole_rollout_reports_no_grasp():
     assert summary["approach_xyz"] == [0.35, -0.02, 0.08]
 
 
+def test_a_two_sample_dip_before_the_real_grasp_is_not_the_grasp():
+    """Observed on rollout 9 of L4_full48_holdout22_40/030000, which the operator scored a
+    success: the command grazed 0.4997 for two steps, went back over the threshold, and only
+    shut on the object 22 steps later. "The first hold" made that blip the whole grasp, so a
+    rollout that lifted 73 mm and carried 108 mm was recorded as lift 0, held_steps 2, with the
+    release point on top of the grasp point -- a real success archived as a degenerate one."""
+    gripper = [1.0, 1.0, 0.49, 0.49, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    positions = [
+        (0.31, -0.00, 0.20),
+        (0.34, -0.01, 0.10),
+        (0.37, -0.02, 0.05),
+        (0.37, -0.02, 0.05),
+        (0.38, -0.02, 0.06),
+        (0.38, -0.02, 0.06),
+        (0.38, -0.03, 0.06),
+        (0.38, -0.03, 0.06),
+        (0.39, -0.03, 0.05),
+        (0.39, -0.03, 0.05),
+        (0.37, -0.08, 0.13),
+        (0.36, -0.13, 0.06),
+        (0.36, -0.13, 0.06),
+    ]
+
+    summary = _trace_from(gripper, positions).summary()
+
+    # Not [0.37, -0.02, 0.05], the blip, which is what "the first hold" gives.
+    assert summary["grasp_xyz"] == [0.39, -0.03, 0.05]
+    assert summary["release_xyz"] == [0.36, -0.13, 0.06]
+    assert summary["lift_m"] == pytest.approx(0.08)
+    assert summary["held_steps"] == 3
+
+
+def test_a_brief_excursion_over_the_threshold_does_not_end_the_carry():
+    """The same rollout's real hold was itself parted by three steps back over the threshold,
+    which would end the carry at the apex and report a lift with no descent. A hold is one hold
+    across a command transient shorter than a reopen."""
+    gripper = [1.0, 0.0, 0.0, 0.0, 0.55, 0.0, 0.0, 0.0, 1.0]
+    positions = [
+        (0.31, -0.00, 0.20),
+        (0.39, -0.03, 0.05),
+        (0.39, -0.03, 0.09),
+        (0.38, -0.06, 0.12),
+        (0.38, -0.08, 0.13),
+        (0.37, -0.10, 0.12),
+        (0.37, -0.11, 0.09),
+        (0.36, -0.13, 0.06),
+        (0.36, -0.13, 0.06),
+    ]
+
+    summary = _trace_from(gripper, positions).summary()
+
+    # Not [0.38, -0.08, 0.13], the apex, which is where the excursion would cut the carry.
+    assert summary["release_xyz"] == [0.36, -0.13, 0.06]
+    assert summary["descent_m"] == pytest.approx(0.07)
+    assert summary["held_steps"] == 7
+
+
 def test_rollout_trace_writes_a_replayable_csv(tmp_path: Path):
     """The reduction above is a rule applied to a buffer, and rules get revised. The rollout it
     was applied to cannot be repeated, so the buffer outlives the summary."""
@@ -1817,9 +1875,12 @@ def test_rollout_trace_writes_a_replayable_csv(tmp_path: Path):
     trace.write()
 
     rows = (tmp_path / "rollout_001.csv").read_text(encoding="utf-8").strip().splitlines()
-    assert rows[0] == "step,x,y,z,gripper_cmd,gripper_raw,status"
+    assert rows[0] == "step,x,y,z,gripper_cmd,gripper_raw,status,source"
     assert len(rows) == 4
     assert rows[2].startswith("1,0.310000,-0.220000,0.050000,0.0000")
+    # Every row says who was driving, including the ordinary case. A column that only appears
+    # on intervened rollouts would make "no takeover" and "an older file" the same reading.
+    assert rows[1].endswith(",pass,policy")
 
 
 def test_rollout_trace_summary_fields_are_readable_off_the_end_marker():
@@ -1839,3 +1900,44 @@ def test_an_empty_rollout_reports_no_landing_point():
     summary = fr3_act_infer_real_runtime.RolloutGeometryTrace(1).summary()
 
     assert summary == {"samples": 0, "closed": False}
+
+
+def test_a_rollout_nobody_touched_reports_no_intervention():
+    # The field is absent rather than false. A run with takeover available but never used has
+    # to reduce to exactly what a run without the feature reduces to, or every rollout recorded
+    # before today would read as a different kind of record.
+    summary = _trace_from([1.0, 0.0, 1.0], [(0.31, -0.22, z) for z in (0.20, 0.05, 0.06)]).summary()
+
+    assert "intervened" not in summary
+    assert "expert_steps" not in summary
+
+
+def test_the_operator_s_stretches_come_back_as_spans_not_a_count():
+    # A count cannot answer the question the takeover exists to raise -- *where* in the task the
+    # policy needed help. Two single-step corrections at the grasp and one long one at the
+    # insertion are the same count and completely different evidence.
+    gripper = [1.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    positions = [(0.31, -0.22, z) for z in (0.20, 0.12, 0.05, 0.05, 0.06, 0.14)]
+    sources = ["policy", "expert", "expert", "policy", "expert", "policy"]
+
+    summary = _trace_from(gripper, positions, sources=sources).summary()
+
+    assert summary["intervened"] is True
+    assert summary["expert_spans"] == [(1, 2), (4, 4)]
+    assert summary["expert_steps"] == 3
+
+
+def test_the_end_marker_says_the_rollout_was_intervened():
+    # On the marker because that is the line the page already reads. A rollout the operator drove
+    # part of says nothing about the policy's success rate, and the reader has to be able to see
+    # that without opening the trace file.
+    gripper = [1.0, 0.0, 0.0, 1.0]
+    positions = [(0.31, -0.22, z) for z in (0.20, 0.05, 0.09, 0.14)]
+
+    fields = _trace_from(
+        gripper, positions, sources=["policy", "expert", "expert", "policy"]
+    ).summary_log_fields()
+
+    assert "intervened=1" in fields
+    assert "expert_steps=2" in fields
+    assert "expert_spans=1-2" in fields
