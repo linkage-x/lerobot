@@ -242,7 +242,7 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
 
 @dataclass
 class RolloutStatus:
-    state: str = "idle"  # idle | starting | waiting | rolling | complete | error | stopped
+    state: str = "idle"  # idle | starting | waiting | homing | rolling | complete | error | stopped
     mode: str = ""
     checkpointId: str = ""
     checkpointPath: str = ""
@@ -264,6 +264,10 @@ class RolloutStatus:
     leashedSteps: int = 0
     rolloutIndex: int = 0
     lastRolloutStatus: str = ""
+    # Whether the arm is at the pose the demonstrations started from. False from the moment a
+    # rollout ends until the operator homes it again -- the launcher's homing step runs once,
+    # before the runtime exists, so nothing else puts this back to true on its own.
+    armAtStart: bool = False
     pid: int | None = None
     message: str = "Pick a checkpoint and a mode to start."
     startedAt: str = ""
@@ -274,6 +278,10 @@ class RolloutStatus:
     # Set once the operator has been asked to record how the last rollout went, so the page can
     # prompt exactly once per rollout rather than on every poll.
     pendingOutcomeFor: int = 0
+    # Where the last finished rollout put the gripper, in the dataset's own frame. Carried on
+    # the status rather than fetched separately because it arrives on the same log line that
+    # raises `pendingOutcomeFor`, and the page draws the point before the operator grades it.
+    lastRolloutGeometry: dict[str, Any] = field(default_factory=dict)
 
 
 def build_rollout_command(
@@ -361,6 +369,57 @@ _STATUS_RE = re.compile(r"\bstatus=([A-Za-z_]+)")
 _ROLLOUT_START_RE = re.compile(r"interactive_rollout_start index=(\d+)")
 _ROLLOUT_END_RE = re.compile(r"interactive_rollout_end index=(\d+) status=(\w+)")
 _KEYBOARD_BACKEND_RE = re.compile(r"keyboard_backend=(\w+)")
+_ARM_AT_START_RE = re.compile(r"\barm_at_start=([01])\b")
+_HOMING_RE = re.compile(r"interactive_homing=(\w+)")
+_GEOMETRY_POINT_RE = re.compile(
+    r"\b(grasp_xyz|release_xyz|approach_xyz)=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)"
+)
+_GEOMETRY_SCALAR_RE = re.compile(r"\b(apex_z|lift_m|descent_m)=(-?[\d.]+)")
+_GEOMETRY_COUNT_RE = re.compile(r"\b(samples|held_steps|closed)=(\d+)")
+# The runtime writes these as log fields; the page reads them as JSON. Renamed at this single
+# crossing so neither side has to carry the other's convention.
+_GEOMETRY_FIELD_NAMES = {
+    "grasp_xyz": "graspXyz",
+    "release_xyz": "releaseXyz",
+    "approach_xyz": "approachXyz",
+    "apex_z": "apexZ",
+    "lift_m": "liftM",
+    "descent_m": "descentM",
+    "samples": "samples",
+    "held_steps": "heldSteps",
+    "closed": "closed",
+}
+
+
+def parse_rollout_geometry(text: str) -> dict[str, Any]:
+    """The landing points the runtime appends to its rollout end marker.
+
+    Returned as a plain dict rather than a typed record because the runtime prints only the
+    fields that exist for that rollout: one that never closed its gripper has an approach point
+    and no grasp point, and inventing zeros for the missing half would put a rollout at the
+    origin of the plot rather than leaving it off.
+    """
+    geometry: dict[str, Any] = {}
+    for match in _GEOMETRY_POINT_RE.finditer(text):
+        try:
+            geometry[_GEOMETRY_FIELD_NAMES[match.group(1)]] = [
+                float(match.group(index)) for index in (2, 3, 4)
+            ]
+        except ValueError:
+            continue
+    for match in _GEOMETRY_SCALAR_RE.finditer(text):
+        try:
+            geometry[_GEOMETRY_FIELD_NAMES[match.group(1)]] = float(match.group(2))
+        except ValueError:
+            continue
+    for match in _GEOMETRY_COUNT_RE.finditer(text):
+        try:
+            value = int(match.group(2))
+        except ValueError:
+            continue
+        field_name = _GEOMETRY_FIELD_NAMES[match.group(1)]
+        geometry[field_name] = bool(value) if field_name == "closed" else value
+    return geometry
 
 
 def parse_rollout_line(line: str) -> dict[str, Any]:
@@ -386,7 +445,36 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
 
     if "interactive_waiting_for_start" in stripped:
         parsed["state"] = "waiting"
-        parsed["message"] = "Waiting for Start. The arm is at its start pose."
+        at_start = _ARM_AT_START_RE.search(stripped)
+        # A runtime that prints no arm_at_start field is telling us nothing, and the honest
+        # reading of nothing is "not known to be at the start pose". Being wrong that way costs
+        # one press of an idempotent button; being wrong the other way starts a rollout from a
+        # pose the dataset frame was never anchored to.
+        parsed["armAtStart"] = bool(at_start) and at_start.group(1) == "1"
+        parsed["message"] = (
+            "Waiting for Start. The arm is at its start pose."
+            if parsed["armAtStart"]
+            else "Waiting for Start. The arm is where the last rollout left it."
+        )
+        return parsed
+
+    homing_match = _HOMING_RE.search(stripped)
+    if homing_match:
+        phase = homing_match.group(1)
+        if phase == "start":
+            # Its own state, not "waiting". Waiting means the arm is parked and safe to reach
+            # into; during this it is moving, and the page has to stop saying otherwise.
+            parsed["state"] = "homing"
+            parsed["message"] = "Moving the arm back to its start pose."
+        elif phase == "done":
+            parsed["armAtStart"] = True
+            parsed["message"] = "The arm is back at its start pose."
+        else:
+            # Reported, not fatal: the runtime hands the session back rather than tearing down a
+            # loaded policy, so the page has to as well. `armAtStart` stays false, which is what
+            # keeps the warning on screen after this message is overwritten by the next line.
+            parsed["armAtStart"] = False
+            parsed["message"] = stripped[:400]
         return parsed
 
     start_match = _ROLLOUT_START_RE.search(stripped)
@@ -394,6 +482,13 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
         parsed["state"] = "rolling"
         parsed["rolloutIndex"] = int(start_match.group(1))
         parsed["step"] = 0
+        # From this instant the arm is no longer at the pose the episodes began from, and it
+        # will not be again until somebody homes it. Set here rather than on the end marker so
+        # a session that dies mid-rollout still leaves the page telling the truth.
+        parsed["armAtStart"] = False
+        # Cleared here so the plot never shows the previous rollout's landing point attached to
+        # the one now running.
+        parsed["lastRolloutGeometry"] = {}
         parsed["message"] = f"Rollout {start_match.group(1)} running."
         return parsed
 
@@ -405,6 +500,7 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
         # The page prompts for an outcome against this index. Recorded here rather than when
         # the rollout starts, because a rollout that never finished has nothing to grade.
         parsed["pendingOutcomeFor"] = int(end_match.group(1))
+        parsed["lastRolloutGeometry"] = parse_rollout_geometry(stripped)
         parsed["message"] = f"Rollout {end_match.group(1)} ended ({end_match.group(2)})."
         return parsed
 
@@ -415,8 +511,13 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
 
     backend_match = _KEYBOARD_BACKEND_RE.search(stripped)
     if backend_match:
-        parsed["message"] = f"Rollout control channel ready ({backend_match.group(1)})."
-        parsed["state"] = "waiting"
+        # Deliberately no state. The control channel being open is not the same as the runtime
+        # being ready to act on it: `start` is read by the listener thread the moment this line
+        # prints, but the loop clears every pending request when it reaches its wait, so a start
+        # sent in that window is swallowed without a trace. `interactive_waiting_for_start` is
+        # the marker that means the runtime is actually at the gate, and it is the only one that
+        # may enable Start.
+        parsed["message"] = f"Rollout control channel ready ({backend_match.group(1)}); waiting for the runtime to reach its start gate."
         return parsed
 
     if stripped.startswith("[ERROR]") or "Traceback (most recent call last)" in stripped:

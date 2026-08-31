@@ -42,6 +42,7 @@ import type {
   TrainingRun,
   TrainingStartRequest,
   RolloutLastParams,
+  RolloutLandmarks,
   TrainingHistoryEntry,
   TrainingView,
   TrainingWandbStatus
@@ -972,6 +973,16 @@ export class DataCollectionGuiApi {
     return payload?.entries ?? [];
   }
 
+  /** Where the demonstrations grasped and released, as the backdrop for rollout landing points.
+   *  Reduced from the checkpoint's own dataset, so the first call after a gateway restart pays
+   *  for one pass over its parquet and every later one is served from memory. */
+  async fetchRolloutLandmarks(): Promise<RolloutLandmarks> {
+    const payload = await this.trainingGet<{ landmarks: RolloutLandmarks }>(
+      "/api/rollout/landmarks"
+    );
+    return payload?.landmarks ?? {};
+  }
+
   /** The previous rollout's settings, so a new one starts where the last left off.
    *  Never carries the safety gates; those are re-asked every time. */
   async fetchRolloutLastParams(): Promise<RolloutLastParams> {
@@ -986,7 +997,7 @@ export class DataCollectionGuiApi {
   }
 
   /** One control word to the running rollout's stdin: the runtime reads it as a keypress. */
-  async controlRollout(command: "start" | "stop" | "quit") {
+  async controlRollout(command: "start" | "stop" | "home" | "quit") {
     return this.trainingPost<{ rollout?: RolloutRun }>("/api/rollout/control", { command });
   }
 
@@ -994,6 +1005,8 @@ export class DataCollectionGuiApi {
     return this.trainingPost<{ rollout?: RolloutRun }>("/api/rollout/stop", {});
   }
 
+  /** The landing point is deliberately not a parameter: the gateway attaches the one the
+   *  runtime measured, so a grade can never be filed against a place the arm did not go. */
   async recordRolloutOutcome(record: {
     checkpointId?: string;
     outcome: "success" | "failure" | "aborted";

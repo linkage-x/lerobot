@@ -667,12 +667,65 @@ def test_the_rollout_lifecycle_markers_drive_the_page_state():
     assert session_over["state"] == "complete"
 
 
-def test_the_pipe_control_backend_is_reported_when_it_comes_up():
+def test_the_waiting_banner_says_whether_the_arm_is_still_at_its_start_pose():
+    """The launcher homes once, before the runtime exists. Nothing else puts this back."""
+    fresh = rollout_backend.parse_rollout_line(
+        "[INFO] interactive_waiting_for_start arm_at_start=1 press 's' to start."
+    )
+    displaced = rollout_backend.parse_rollout_line(
+        "[INFO] interactive_waiting_for_start arm_at_start=0 press 's' to start."
+    )
+    started = rollout_backend.parse_rollout_line("[INFO] interactive_rollout_start index=1")
+
+    assert fresh["armAtStart"] is True
+    assert displaced["armAtStart"] is False
+    # Set on the *start* marker, so a session that dies mid-rollout still leaves the page
+    # saying the arm is somewhere the next rollout should not begin from.
+    assert started["armAtStart"] is False
+
+
+def test_a_runtime_that_says_nothing_about_the_start_pose_is_not_taken_as_a_yes():
+    """Unknown reads as "not at the start pose": being wrong costs one idempotent button press."""
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] interactive_waiting_for_start press 's' to start, 'q' to quit."
+    )
+
+    assert parsed["state"] == "waiting"
+    assert parsed["armAtStart"] is False
+
+
+def test_homing_is_its_own_state_because_the_arm_is_moving_during_it():
+    homing = rollout_backend.parse_rollout_line(
+        "[INFO] interactive_homing=start gripper_pos=0.512 (gripper is left as it is)"
+    )
+    done = rollout_backend.parse_rollout_line("[INFO] interactive_homing=done")
+    failed = rollout_backend.parse_rollout_line(
+        "[WARN] interactive_homing=failed details=FR3 did not reach the configured start pose"
+    )
+
+    # Not "waiting": waiting is the page's word for an arm that is parked and safe to reach into.
+    assert homing["state"] == "homing"
+    assert done["armAtStart"] is True
+    # A failed home leaves the flag down, which is what keeps the warning on the page after this
+    # message is overwritten by the waiting line that follows it.
+    assert failed["armAtStart"] is False
+    assert "did not reach" in failed["message"]
+    # And it is not a state change: the runtime hands the session back rather than tearing down
+    # a loaded policy, so the page must not report the run as finished either.
+    assert "state" not in failed
+
+
+def test_an_open_control_channel_is_not_yet_a_runtime_that_will_act_on_it():
+    """The channel opens before the loop reaches its wait, and the wait clears what is pending.
+
+    So a `start` sent on this line is read, cleared, and lost -- the click looks accepted and
+    nothing happens. Reported as a message, never as a state, so it cannot enable Start.
+    """
     parsed = rollout_backend.parse_rollout_line(
         "[INFO] interactive_rollouts=enabled keyboard_backend=pipe start_key='s' stop_key='x'"
     )
 
-    assert parsed["state"] == "waiting"
+    assert "state" not in parsed
     assert "pipe" in parsed["message"]
 
 
@@ -798,10 +851,15 @@ CAMERA_CONFIG_YAML = """robot:
 # line on stdin -- so the control path is exercised for real rather than mocked.
 FAKE_LAUNCHER = """#!/usr/bin/env bash
 echo "[INFO] interactive_rollouts=enabled keyboard_backend=pipe start_key='s'"
+echo "[INFO] interactive_waiting_for_start arm_at_start=1 press 's' to start."
 while IFS= read -r line; do
   case "$line" in
     start) echo "[INFO] interactive_rollout_start index=1"; echo "[INFO] step=1 status=pass" ;;
-    stop)  echo "[INFO] interactive_rollout_end index=1 status=stopped" ;;
+    stop)  echo "[INFO] interactive_rollout_end index=1 status=stopped"
+           echo "[INFO] interactive_waiting_for_start arm_at_start=0 press 's' to start." ;;
+    home)  echo "[INFO] interactive_homing=start gripper_pos=0.500 (gripper is left as it is)"
+           echo "[INFO] interactive_homing=done"
+           echo "[INFO] interactive_waiting_for_start arm_at_start=1 press 's' to start." ;;
     quit)  echo "[INFO] interactive_rollouts=stopped"; exit 0 ;;
   esac
 done
@@ -1078,8 +1136,52 @@ def test_control_is_refused_for_a_mode_that_runs_to_completion(tmp_path: Path):
     gateway._stop_rollout(state)
 
 
-@pytest.mark.parametrize("bad", ["", "s", "START", "rm -rf /", "quit\nstart"])
-def test_only_the_three_control_words_are_accepted(tmp_path: Path, bad: str):
+def test_move_to_start_reaches_the_arm_between_rollouts(tmp_path: Path):
+    """The whole point of the button: home the arm without dropping a loaded policy."""
+    state = _rollout_state(tmp_path)
+    gateway._start_rollout(
+        state, {"mode": "real", "checkpointId": "job_a/020000", "confirmMotion": True}
+    )
+    assert _wait_for(lambda: state.rollout.state == "waiting"), state.rollout.message
+
+    gateway._send_rollout_control(state, "start")
+    assert _wait_for(lambda: state.rollout.state == "rolling"), state.rollout.message
+    gateway._send_rollout_control(state, "stop")
+    # Both halves matter: the stop has landed (waiting), and the page now says the arm is not
+    # where the episodes began. armAtStart alone would pass while the rollout was still running.
+    assert _wait_for(
+        lambda: state.rollout.state == "waiting" and state.rollout.armAtStart is False
+    ), state.rollout.message
+
+    gateway._send_rollout_control(state, "home")
+    assert _wait_for(lambda: state.rollout.armAtStart is True), state.rollout.message
+    assert state.rollout.state == "waiting"
+    # Still the same process, still holding the policy -- which is why this exists at all.
+    assert state.rollout_process is not None and state.rollout_process.poll() is None
+    gateway._stop_rollout(state)
+
+
+def test_move_to_start_is_refused_while_a_rollout_is_running(tmp_path: Path):
+    """Rejected with a reason rather than queued: an arm that homes itself the moment a rollout
+    ends, seconds after the operator stopped watching, is what interactive mode exists to
+    prevent. The runtime drops it too; this one is here so the click does not look accepted."""
+    state = _rollout_state(tmp_path)
+    gateway._start_rollout(
+        state, {"mode": "real", "checkpointId": "job_a/020000", "confirmMotion": True}
+    )
+    assert _wait_for(lambda: state.rollout.state == "waiting"), state.rollout.message
+    gateway._send_rollout_control(state, "start")
+    assert _wait_for(lambda: state.rollout.state == "rolling"), state.rollout.message
+
+    with pytest.raises(ValueError, match="only runs between rollouts"):
+        gateway._send_rollout_control(state, "home")
+
+    assert state.rollout.state == "rolling"
+    gateway._stop_rollout(state)
+
+
+@pytest.mark.parametrize("bad", ["", "s", "h", "START", "rm -rf /", "quit\nstart"])
+def test_only_the_control_vocabulary_is_accepted(tmp_path: Path, bad: str):
     state = _rollout_state(tmp_path)
     gateway._start_rollout(
         state, {"mode": "real", "checkpointId": "job_a/020000", "confirmMotion": True}
@@ -1366,3 +1468,216 @@ def test_the_other_modes_do_not_need_a_display(tmp_path: Path, monkeypatch):
 
     assert state.rollout.mode == "real"
     gateway._stop_rollout(state)
+
+
+# ------------------------------------------------------------- landing points ---
+#
+# The map these feed exists because a success rate cannot distinguish six failures spread across
+# the workspace from six at the same spot, and those have opposite causes. Everything below is
+# about the geometry surviving the trip from the runtime's log line to the graded record without
+# acquiring a coordinate the arm never visited.
+
+
+def test_rollout_end_marker_carries_the_landing_points():
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] interactive_rollout_end index=3 status=stopped samples=430 closed=1 "
+        "grasp_xyz=0.3162,-0.2214,0.0461 release_xyz=0.3599,-0.1330,0.0510 "
+        "apex_z=0.1201 lift_m=0.0740 descent_m=0.0691 held_steps=223"
+    )
+
+    assert parsed["rolloutIndex"] == 3
+    assert parsed["pendingOutcomeFor"] == 3
+    geometry = parsed["lastRolloutGeometry"]
+    assert geometry["graspXyz"] == [0.3162, -0.2214, 0.0461]
+    assert geometry["releaseXyz"] == [0.3599, -0.1330, 0.0510]
+    assert geometry["closed"] is True
+    assert geometry["descentM"] == pytest.approx(0.0691)
+    assert geometry["heldSteps"] == 223
+
+
+def test_a_rollout_that_never_closed_reports_where_it_reached():
+    """The approach point is the whole result for a failure that never gripped.
+
+    Reported as `approachXyz` rather than as a grasp point at the same coordinates, because the
+    two mean different things: one is where the gripper closed, the other is where it stopped
+    without closing, and a map that drew them identically would hide the more common failure.
+    """
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] interactive_rollout_end index=4 status=stopped samples=380 closed=0 "
+        "approach_xyz=0.4410,-0.2600,0.0523"
+    )
+
+    geometry = parsed["lastRolloutGeometry"]
+    assert geometry["closed"] is False
+    assert geometry["approachXyz"] == [0.4410, -0.2600, 0.0523]
+    assert "graspXyz" not in geometry
+    assert "descentM" not in geometry
+
+
+def test_an_end_marker_without_geometry_still_parses():
+    """A runtime older than this feature, or one whose rollout produced no samples."""
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] interactive_rollout_end index=1 status=stopped"
+    )
+
+    assert parsed["pendingOutcomeFor"] == 1
+    assert parsed["lastRolloutGeometry"] == {}
+
+
+def test_starting_a_rollout_clears_the_previous_landing_point():
+    """Otherwise the running rollout inherits the last one's dot until it finishes."""
+    parsed = rollout_backend.parse_rollout_line("[INFO] interactive_rollout_start index=5")
+
+    assert parsed["lastRolloutGeometry"] == {}
+
+
+def test_recorded_outcomes_keep_the_landing_point(tmp_path: Path):
+    checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/030000",
+            "outcome": "failure",
+            "rolloutIndex": 7,
+            "geometry": {
+                "graspXyz": [0.31, -0.22, 0.046],
+                "closed": True,
+                "liftM": 0.074,
+                "descentM": 0.069,
+                "heldSteps": 223,
+            },
+        },
+    )
+
+    entry = checkpoint_backend.load_rollout_outcomes(tmp_path)[-1]
+    assert entry["rolloutIndex"] == 7
+    assert entry["geometry"]["graspXyz"] == [0.31, -0.22, 0.046]
+    assert entry["geometry"]["descentM"] == pytest.approx(0.069)
+
+
+def test_a_recorded_outcome_cannot_smuggle_in_extra_geometry(tmp_path: Path):
+    """The log grows only the fields the runtime measures."""
+    checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/030000",
+            "outcome": "success",
+            "geometry": {"graspXyz": [0.31, -0.22, 0.046], "operatorGuess": [1.0, 2.0, 3.0]},
+        },
+    )
+
+    entry = checkpoint_backend.load_rollout_outcomes(tmp_path)[-1]
+    assert "operatorGuess" not in entry["geometry"]
+
+
+def test_an_outcome_without_geometry_records_no_empty_point(tmp_path: Path):
+    """A missing landing point has to stay missing: an absent field keeps the rollout off the
+    map, while a zeroed one would put it at the base of the robot."""
+    checkpoint_backend.append_rollout_outcome(
+        tmp_path, {"checkpointId": "job_a/030000", "outcome": "aborted"}
+    )
+
+    assert "geometry" not in checkpoint_backend.load_rollout_outcomes(tmp_path)[-1]
+
+
+def _write_demo_dataset(root: Path, episodes: dict[int, tuple[list[float], list[float]]]) -> Path:
+    """A dataset shaped like the real one: absolute EE state, commanded gripper in the action."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    _write_json(
+        root / "meta" / "info.json",
+        {
+            "features": {
+                "observation.state": {
+                    "names": ["ee.x", "ee.y", "ee.z", "ee.qx", "ee.qy", "ee.qz", "ee.qw", "gripper.pos"]
+                },
+                "action": {"names": ["dx", "dy", "dz", "drz", "gripper.pos"]},
+            }
+        },
+    )
+    episode_index: list[int] = []
+    states: list[list[float]] = []
+    actions: list[list[float]] = []
+    for episode, (heights, gripper) in episodes.items():
+        for height, grip in zip(heights, gripper, strict=True):
+            episode_index.append(episode)
+            # x and y move with the phase so grasp and release land in different places, the
+            # way they do on the rig: pick out in the workspace, release into the fixed hole.
+            grasping = grip < 0.5
+            states.append(
+                [0.36 if grasping and height < 0.07 and heights.index(height) > 3 else 0.31,
+                 -0.13 if grasping and height < 0.07 and heights.index(height) > 3 else -0.22,
+                 height, 0.0, 0.0, 0.0, 1.0, grip]
+            )
+            actions.append([0.0, 0.0, 0.0, 0.0, grip])
+    table = pa.table(
+        {
+            "episode_index": pa.array(episode_index, pa.int64()),
+            "observation.state": pa.array(states, pa.list_(pa.float32())),
+            "action": pa.array(actions, pa.list_(pa.float32())),
+        }
+    )
+    path = root / "data" / "chunk-000" / "file-000.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, str(path))
+    return root
+
+
+def test_demo_landing_points_reduce_each_episode_to_its_grasp_and_release(tmp_path: Path):
+    """The backdrop of the map: one grasp point per demonstration, by the rule the runtime uses.
+
+    Computed from the dataset rather than kept as a fixture because it describes the checkpoint
+    under test -- a hard-coded region would keep describing whichever dataset it was written for.
+    """
+    heights = [0.20, 0.12, 0.05, 0.05, 0.12, 0.13, 0.06, 0.06, 0.14]
+    gripper = [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+    root = _write_demo_dataset(tmp_path / "view", {0: (heights, gripper), 1: (heights, gripper)})
+
+    landmarks = checkpoint_backend.demo_landing_points(root)
+
+    assert len(landmarks["points"]) == 2
+    point = landmarks["points"][0]
+    assert point["graspXyz"] == [0.31, -0.22, 0.05]
+    assert point["releaseXyz"][2] == pytest.approx(0.06)
+    assert point["liftM"] == pytest.approx(0.08)
+    # The number the roadmap once reported as ~1 mm by subtracting two table-height events. The
+    # insertion travel is the drop from the apex, and it is the whole reason this is measured
+    # rather than assumed.
+    assert point["descentM"] == pytest.approx(0.07)
+    assert landmarks["hole"] == pytest.approx(landmarks["points"][0]["releaseXyz"][:2])
+
+
+def test_a_demonstration_that_starts_with_the_gripper_shut_grasps_on_the_falling_edge(
+    tmp_path: Path,
+):
+    """The same edge rule the runtime uses, so the two sets of points on the map mean one thing.
+
+    No demonstration in the current dataset starts shut, but a rollout did, and a backdrop
+    derived by a rule that only coincidentally agrees with the runtime's is a backdrop that can
+    stop agreeing without anybody noticing.
+    """
+    heights = [0.40, 0.20, 0.12, 0.05, 0.05, 0.12, 0.13, 0.06, 0.06, 0.14]
+    gripper = [0.05, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+    root = _write_demo_dataset(tmp_path / "view", {0: (heights, gripper)})
+
+    point = checkpoint_backend.demo_landing_points(root)["points"][0]
+
+    # Not [.., 0.40], which is where "first step under the threshold" puts it: the start pose.
+    assert point["graspXyz"] == [0.31, -0.22, 0.05]
+
+
+def test_demo_landing_points_are_memoised_per_dataset(tmp_path: Path):
+    """The scan is a full pass over the dataset's parquet; the page asks for it on every mount."""
+    heights = [0.20, 0.05, 0.12, 0.06, 0.14]
+    root = _write_demo_dataset(tmp_path / "view", {0: (heights, [1.0, 0.0, 0.0, 0.0, 1.0])})
+
+    first = checkpoint_backend.demo_landing_points(root)
+    second = checkpoint_backend.demo_landing_points(root)
+
+    assert first is second
+
+
+def test_demo_landing_points_on_a_dataset_that_is_not_there(tmp_path: Path):
+    """A missing or unreadable dataset leaves the map without a backdrop rather than 500ing the
+    page: the rollout points are still worth showing."""
+    assert checkpoint_backend.demo_landing_points(tmp_path / "absent") == {}

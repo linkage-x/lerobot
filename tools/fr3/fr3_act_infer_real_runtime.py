@@ -652,8 +652,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=5.0,
         help='Upper bound on preview JPEG writes per second (default 5).',
     )
+    parser.add_argument(
+        '--rollout-trace-dir',
+        type=str,
+        default='outputs/rollout_traces',
+        help=(
+            'Directory for one CSV per interactive rollout holding its per-step end-effector '
+            'position and gripper command. On by default because a rollout cannot be repeated: '
+            'the object placement it was run against is destroyed by the run itself. Pass an '
+            'empty string to write nothing; the summary on the rollout end marker is printed '
+            'either way.'
+        ),
+    )
     parser.add_argument('--rollout-start-key', default='s', help='Interactive key to start a rollout.')
     parser.add_argument('--rollout-stop-key', default='x', help='Interactive key to stop the current rollout.')
+    parser.add_argument(
+        '--rollout-home-key',
+        default='h',
+        help='Interactive key to move the arm back to its start pose between rollouts.',
+    )
     parser.add_argument('--rollout-quit-key', default='q', help='Interactive key to quit inference.')
     parser.add_argument(
         '--mujoco-viewer',
@@ -1110,6 +1127,48 @@ def move_to_robot_init_state_if_requested(robot: Any, init_state: dict[str, Any]
     )
 
 
+def home_arm_to_start_pose(robot: Any) -> bool:
+    """Put the arm back at the pose the demonstrations started from, between rollouts.
+
+    Interactive mode homes the arm exactly once, in the launcher, before this process exists.
+    Every rollout after the first therefore begins wherever the previous one stopped -- and the
+    dataset frame is anchored to the start pose (T_B_Ws is solved from the first observation
+    against the dataset's start distribution), so a rollout launched from a displaced arm is
+    either refused by the first-frame gate or, worse, admitted at the edge of it.
+
+    It has to happen in this process rather than by running fr3_move_to_start_runtime.py again:
+    the FR3 accepts one libfranka client and this process is holding it. That script opens its
+    own `Panda()`, which is why the launcher runs it *before* exec'ing this runtime and never
+    alongside it. `FrankaResearch3.move_to_start()` goes to the same joint target -- the config's
+    start pose, held equal to the XML `home` keyframe by
+    tests/robots/test_fr3_home_keyframe_contract.py -- and, unlike a second libfranka session,
+    it stops and restarts the OTG loop around the move instead of fighting it.
+
+    The gripper is deliberately left where it is. Homing with a peg still in the fingers is
+    wrong for the next rollout, but opening them would drop whatever is held from wherever the
+    arm stopped, and only the operator standing at the rig can say which of those is worse. The
+    position is logged either way, so the choice is on the record.
+
+    Returns whether the arm actually arrived. A failure is reported and handed back rather than
+    raised: tearing down a loaded policy -- ten seconds of arm motion paid for with a minute of
+    reload and ten gigabytes of VRAM -- is a much larger action than the one that failed, and
+    the first-frame gate still stands between a mis-posed arm and a rollout.
+    """
+    try:
+        gripper_pos = float(robot.get_observation(include_cameras=False)['gripper.pos'])
+        gripper_text = f'{gripper_pos:.3f}'
+    except Exception:
+        gripper_text = 'unknown'
+    print(f'[INFO] interactive_homing=start gripper_pos={gripper_text} (gripper is left as it is)')
+    try:
+        robot.move_to_start()
+    except Exception as exc:
+        print(f'[WARN] interactive_homing=failed details={exc}')
+        return False
+    print('[INFO] interactive_homing=done')
+    return True
+
+
 def resolve_mujoco_model_path(gripper_backend: str, model_path: str | Path | None) -> Path:
     if model_path is not None:
         return _resolve_repo_path(model_path)
@@ -1282,12 +1341,14 @@ class FR3InferenceMujocoVisualizer:
 
 
 class InteractiveRolloutKeyboard:
-    def __init__(self, *, start_key: str, stop_key: str, quit_key: str):
+    def __init__(self, *, start_key: str, stop_key: str, home_key: str, quit_key: str):
         self.start_key = self._normalize_key(start_key)
         self.stop_key = self._normalize_key(stop_key)
+        self.home_key = self._normalize_key(home_key)
         self.quit_key = self._normalize_key(quit_key)
         self.start_requested = threading.Event()
         self.stop_requested = threading.Event()
+        self.home_requested = threading.Event()
         self.quit_requested = threading.Event()
         self._thread: threading.Thread | None = None
         self._stop_listening = None
@@ -1305,6 +1366,9 @@ class InteractiveRolloutKeyboard:
         elif key_name == self.stop_key:
             print('[INFO] interactive_key=stop_current_rollout')
             self.stop_requested.set()
+        elif key_name == self.home_key:
+            print('[INFO] interactive_key=move_to_start')
+            self.home_requested.set()
         elif key_name == self.quit_key:
             print('[INFO] interactive_key=quit')
             self.quit_requested.set()
@@ -1320,7 +1384,7 @@ class InteractiveRolloutKeyboard:
     # Words accepted alongside the bare keys on the pipe channel, so a caller that is not a
     # keyboard can say what it means. The keys stay valid because the GUI and the terminal
     # then speak the same alphabet, which is one less thing to keep in step.
-    _PIPE_COMMAND_WORDS = {'start': 'start', 'stop': 'stop', 'quit': 'quit'}
+    _PIPE_COMMAND_WORDS = {'start': 'start', 'stop': 'stop', 'home': 'home', 'quit': 'quit'}
 
     def _listen_pipe_loop(self) -> None:
         """One command per line, for a caller that is a program rather than a terminal.
@@ -1345,6 +1409,8 @@ class InteractiveRolloutKeyboard:
                 self._on_press(self.start_key)
             elif resolved == 'stop':
                 self._on_press(self.stop_key)
+            elif resolved == 'home':
+                self._on_press(self.home_key)
             elif resolved == 'quit':
                 self._on_press(self.quit_key)
             elif len(command) == 1:
@@ -1402,7 +1468,8 @@ class InteractiveRolloutKeyboard:
             print(
                 '[INFO] interactive_rollouts=enabled '
                 f'keyboard_backend={backend} '
-                f"start_key='{self.start_key}' stop_key='{self.stop_key}' quit_key='{self.quit_key}'"
+                f"start_key='{self.start_key}' stop_key='{self.stop_key}' "
+                f"home_key='{self.home_key}' quit_key='{self.quit_key}'"
             )
             return
 
@@ -1431,22 +1498,46 @@ class InteractiveRolloutKeyboard:
         print(
             '[INFO] interactive_rollouts=enabled '
             f'keyboard_backend={backend} '
-            f"start_key='{self.start_key}' stop_key='{self.stop_key}' quit_key='{self.quit_key}'"
+            f"start_key='{self.start_key}' stop_key='{self.stop_key}' "
+            f"home_key='{self.home_key}' quit_key='{self.quit_key}'"
         )
 
-    def wait_for_start_or_quit(self) -> bool:
+    def wait_for_command(self, *, arm_at_start: bool) -> str:
+        """Block until the operator asks for the next thing: 'start', 'home' or 'quit'.
+
+        Every request flag is cleared on entry, so a key pressed *during* a rollout is dropped
+        rather than acted on the instant that rollout ends. That matters most for home: an arm
+        that begins moving on its own seconds after the operator stopped watching is the exact
+        outcome an interactive mode exists to prevent.
+
+        `arm_at_start` is printed rather than assumed. The launcher homes the arm once, before
+        this process exists; from the second rollout onwards the arm is wherever the last one
+        left it, and a banner that keeps claiming otherwise is how an operator ends up starting
+        a rollout from a pose the dataset frame was never anchored to.
+        """
         self.start_requested.clear()
         self.stop_requested.clear()
+        self.home_requested.clear()
         print(
             '[INFO] interactive_waiting_for_start '
-            f"press '{self.start_key}' to start, '{self.quit_key}' to quit."
+            f'arm_at_start={1 if arm_at_start else 0} '
+            f"press '{self.start_key}' to start, '{self.home_key}' to move to start, "
+            f"'{self.quit_key}' to quit."
         )
         while not self.quit_requested.is_set():
             if self.start_requested.wait(timeout=0.1):
                 self.start_requested.clear()
                 self.stop_requested.clear()
-                return True
-        return False
+                # Quit sets start_requested too, to break exactly this wait. Without the
+                # re-check it reads as a start, and the session announces a rollout index it
+                # then immediately abandons.
+                if self.quit_requested.is_set():
+                    break
+                return 'start'
+            if self.home_requested.is_set():
+                self.home_requested.clear()
+                return 'home'
+        return 'quit'
 
     def should_stop_rollout(self) -> bool:
         return self.stop_requested.is_set() or self.quit_requested.is_set()
@@ -2218,6 +2309,141 @@ class PolicyCameraPreviewSink:
                 (self.output_dir / f'{camera_key}.jpg').unlink()
             except OSError:
                 pass
+
+
+# A rollout's gripper command is the event signal, not its observed width. In this dataset
+# `observation.state.gripper.pos` reads 0 on 47% of frames while the command held a clean 1.0,
+# so any "did it close?" test keyed on the observation fires on dropouts instead of on grasps.
+_TRACE_GRIPPER_CLOSED_BELOW = 0.5
+
+
+class RolloutGeometryTrace:
+    """Where one rollout put the gripper, sampled while it happens and reduced when it ends.
+
+    A rollout cannot be repeated. The peg is placed by hand, and that placement stops existing
+    the moment the arm touches it, so anything not written down during the run is gone. This
+    keeps every step's end-effector position and gripper command, and derives the two points
+    that carry the result -- where the gripper closed, and where it opened again -- only at the
+    end, from the buffer it kept.
+
+    Deriving them online would bake a threshold into data that can never be recaptured; deriving
+    them from a retained trace leaves the threshold a parameter that can be changed afterwards
+    with the same rollouts still in hand.
+
+    Positions are sampled in the dataset's own frame, because the point of recording them is to
+    compare them against where the demonstrations grasped, and a comparison across two frames is
+    not a comparison.
+    """
+
+    def __init__(self, rollout_index: int, *, trace_dir: Path | None = None):
+        self.rollout_index = int(rollout_index)
+        self.trace_dir = Path(trace_dir) if trace_dir else None
+        self._rows: list[tuple[int, float, float, float, float, float, str]] = []
+
+    def sample(
+        self,
+        *,
+        step_idx: int,
+        position_xyz: np.ndarray,
+        gripper_command: float,
+        gripper_raw: float,
+        command_status: str,
+    ) -> None:
+        try:
+            position = np.asarray(position_xyz, dtype=np.float64).reshape(3)
+        except (ValueError, TypeError):
+            return
+        if not np.all(np.isfinite(position)):
+            return
+        self._rows.append(
+            (
+                int(step_idx),
+                float(position[0]),
+                float(position[1]),
+                float(position[2]),
+                float(gripper_command),
+                float(gripper_raw),
+                str(command_status),
+            )
+        )
+
+    def summary(self) -> dict[str, Any]:
+        """The landing points of this rollout, or what it reached if it never closed."""
+        if not self._rows:
+            return {'samples': 0, 'closed': False}
+        positions = np.asarray([row[1:4] for row in self._rows], dtype=np.float64)
+        gripper = np.asarray([row[4] for row in self._rows], dtype=np.float64)
+        # A grasp is a falling edge, not a level. A rollout can begin with the gripper already
+        # commanded shut -- the start-pose check warns about exactly that when the live gripper
+        # does not match the dataset's start contract -- and "first step under the threshold"
+        # then returns step 0, putting the grasp at the home pose ~340 mm above the table
+        # instead of on the object. Requiring the command to have been open first makes the
+        # event a transition, which is what closing on something is.
+        open_steps = np.flatnonzero(gripper >= _TRACE_GRIPPER_CLOSED_BELOW)
+        first_open = int(open_steps[0]) if open_steps.size else len(self._rows)
+        closed_steps = np.flatnonzero(gripper[first_open:] < _TRACE_GRIPPER_CLOSED_BELOW) + first_open
+        result: dict[str, Any] = {'samples': len(self._rows), 'closed': bool(closed_steps.size)}
+        if not closed_steps.size:
+            # Never closed. The lowest point it reached is still the landing point worth
+            # plotting: it is where the policy decided the object was.
+            lowest = int(np.argmin(positions[:, 2]))
+            result['approach_xyz'] = positions[lowest].tolist()
+            return result
+        close_idx = int(closed_steps[0])
+        reopened = np.flatnonzero(gripper[close_idx:] >= _TRACE_GRIPPER_CLOSED_BELOW)
+        release_idx = int(close_idx + reopened[0]) if reopened.size else len(self._rows) - 1
+        apex_z = float(positions[close_idx : release_idx + 1, 2].max())
+        result.update(
+            {
+                'grasp_xyz': positions[close_idx].tolist(),
+                'release_xyz': positions[release_idx].tolist(),
+                'apex_z': apex_z,
+                'lift_m': apex_z - float(positions[close_idx, 2]),
+                'descent_m': apex_z - float(positions[release_idx, 2]),
+                'held_steps': release_idx - close_idx,
+            }
+        )
+        return result
+
+    def summary_log_fields(self) -> str:
+        """The summary as `key=value` fields appended to the rollout's end marker.
+
+        On the end marker rather than in a file of its own because the page already reads that
+        line, and a second channel for the same event is a second thing that can be out of step
+        with the first.
+        """
+        summary = self.summary()
+        fields = [f"samples={summary.get('samples', 0)}", f"closed={int(bool(summary.get('closed')))}"]
+        for key in ('grasp_xyz', 'release_xyz', 'approach_xyz'):
+            point = summary.get(key)
+            if point is not None:
+                fields.append(f"{key}=" + ','.join(f'{value:.4f}' for value in point))
+        for key in ('apex_z', 'lift_m', 'descent_m'):
+            value = summary.get(key)
+            if value is not None:
+                fields.append(f'{key}={float(value):.4f}')
+        held = summary.get('held_steps')
+        if held is not None:
+            fields.append(f'held_steps={int(held)}')
+        return ' '.join(fields)
+
+    def write(self) -> None:
+        """Persist the raw per-step trace, so the reduction above can be redone later."""
+        if self.trace_dir is None or not self._rows:
+            return
+        try:
+            self.trace_dir.mkdir(parents=True, exist_ok=True)
+            path = self.trace_dir / f'rollout_{self.rollout_index:03d}.csv'
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write('step,x,y,z,gripper_cmd,gripper_raw,status\n')
+                for step_idx, x, y, z, gripper_cmd, gripper_raw, status in self._rows:
+                    handle.write(
+                        f'{step_idx},{x:.6f},{y:.6f},{z:.6f},{gripper_cmd:.4f},{gripper_raw:.4f},{status}\n'
+                    )
+        except OSError as exc:  # noqa: BLE001 - a trace must never end a rollout
+            print(f'[WARN] rollout_trace_write_failed index={self.rollout_index}: {exc}')
+            return
+        print(f'[INFO] rollout_trace_written index={self.rollout_index} path={path} rows={len(self._rows)}')
 
 
 def close_camera_preview_window(window_name: str = 'FR3 policy camera inputs') -> None:
@@ -4284,7 +4510,10 @@ def run_inference(args: argparse.Namespace) -> int:
             rtc_state['latency_tracker'] = LatencyTracker()
             rtc_state['last_debug'] = {'status': 'reset'}
 
-    def run_policy_rollout(interactive_keyboard: InteractiveRolloutKeyboard | None = None) -> str:
+    def run_policy_rollout(
+        interactive_keyboard: InteractiveRolloutKeyboard | None = None,
+        trace: RolloutGeometryTrace | None = None,
+    ) -> str:
         reset_policy_runtime_state()
         T_B_Ws: np.ndarray | None = None
         start_alignment_stats: dict[str, Any] | None = None
@@ -4734,6 +4963,18 @@ def run_inference(args: argparse.Namespace) -> int:
                 robot.send_action(command_to_send)
                 previous_sent_command = dict(command_to_send)
 
+            if trace is not None:
+                trace.sample(
+                    step_idx=step_idx,
+                    position_xyz=np.asarray(
+                        [absolute_state_observation_i[key] for key in EE_POSITION_KEYS],
+                        dtype=np.float64,
+                    ),
+                    gripper_command=float(command_to_send['gripper.pos']),
+                    gripper_raw=float(model_gripper_raw),
+                    command_status=str(command_status),
+                )
+
             elapsed_s = time.perf_counter() - loop_start_t
             sleep_s = max(1.0 / policy_fps - elapsed_s, 0.0)
 
@@ -4804,25 +5045,42 @@ def run_inference(args: argparse.Namespace) -> int:
             step_idx += 1
         return finish_rollout('completed')
 
+    rollout_trace_dir = Path(args.rollout_trace_dir).expanduser() if args.rollout_trace_dir else None
     interactive_keyboard: InteractiveRolloutKeyboard | None = None
     try:
         if args.interactive_rollouts:
             interactive_keyboard = InteractiveRolloutKeyboard(
                 start_key=args.rollout_start_key,
                 stop_key=args.rollout_stop_key,
+                home_key=args.rollout_home_key,
                 quit_key=args.rollout_quit_key,
             )
             interactive_keyboard.start()
             rollout_index = 0
+            # Whether anything has displaced the arm since it was last put at the start pose.
+            # True at process start because nothing in *this* process has moved it yet -- the
+            # launcher's homing step ran before exec. It goes false the moment a rollout ends,
+            # which is the case the waiting banner used to get wrong for every rollout but the
+            # first, and it is what the operator is deciding on when they reach for home.
+            arm_at_start = True
             while not interactive_keyboard.quit_requested.is_set():
                 move_to_robot_init_state_if_requested(robot, robot_init_state)
-                should_start = interactive_keyboard.wait_for_start_or_quit()
-                if not should_start:
+                command = interactive_keyboard.wait_for_command(arm_at_start=arm_at_start)
+                if command == 'quit':
                     break
+                if command == 'home':
+                    arm_at_start = home_arm_to_start_pose(robot)
+                    continue
                 rollout_index += 1
+                arm_at_start = False
                 print(f'[INFO] interactive_rollout_start index={rollout_index}')
-                rollout_status = run_policy_rollout(interactive_keyboard)
-                print(f'[INFO] interactive_rollout_end index={rollout_index} status={rollout_status}')
+                trace = RolloutGeometryTrace(rollout_index, trace_dir=rollout_trace_dir)
+                rollout_status = run_policy_rollout(interactive_keyboard, trace=trace)
+                print(
+                    f'[INFO] interactive_rollout_end index={rollout_index} status={rollout_status} '
+                    + trace.summary_log_fields()
+                )
+                trace.write()
                 if rollout_status == 'quit':
                     break
             print('[INFO] interactive_rollouts=stopped')

@@ -292,26 +292,28 @@ case "$mode" in
     ;;
   real)
     announce
-    echo "[INFO] interactive_real_mode=enabled; keys: s=start rollout, x=stop, q=quit."
+    echo "[INFO] interactive_real_mode=enabled; keys: s=start rollout, x=stop, h=move to start, q=quit."
     echo "[INFO] focus the terminal (not the preview window) before pressing a key."
     if [[ "${move_to_start}" == "1" ]]; then home_the_arm; fi
     exec "${FR3_HOST_PYTHON}" "${common_args[@]}" \
       --interactive-rollouts \
       --rollout-start-key s \
       --rollout-stop-key x \
+      --rollout-home-key h \
       --rollout-quit-key q \
       --camera-preview-window \
       "${extra_args[@]}"
     ;;
   real_debug)
     announce
-    echo "[INFO] interactive_real_debug_mode=enabled; keys: s=start rollout, x=stop, q=quit."
+    echo "[INFO] interactive_real_debug_mode=enabled; keys: s=start rollout, x=stop, h=move to start, q=quit."
     echo "[INFO] MuJoCo colors: orange=current EE, green=raw policy target, yellow=safe sent EE, blue-to-pink=action chunk."
     if [[ "${move_to_start}" == "1" ]]; then home_the_arm; fi
     exec "${FR3_HOST_PYTHON}" "${common_args[@]}" \
       --interactive-rollouts \
       --rollout-start-key s \
       --rollout-stop-key x \
+      --rollout-home-key h \
       --rollout-quit-key q \
       --camera-preview-window \
       --mujoco-viewer \

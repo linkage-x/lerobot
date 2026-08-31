@@ -1705,3 +1705,137 @@ def test_preview_and_real_alignment_share_step0_policy_observation_state():
         preview_policy_observation['observation.state'],
         real_policy_observation['observation.state'],
     )
+
+
+# ------------------------------------------------------------ rollout geometry ---
+
+
+def _trace_from(gripper_commands, positions, *, trace_dir=None):
+    trace = fr3_act_infer_real_runtime.RolloutGeometryTrace(1, trace_dir=trace_dir)
+    for step, (gripper, position) in enumerate(zip(gripper_commands, positions, strict=True)):
+        trace.sample(
+            step_idx=step,
+            position_xyz=np.asarray(position, dtype=np.float64),
+            gripper_command=float(gripper),
+            gripper_raw=float(gripper),
+            command_status="pass",
+        )
+    return trace
+
+
+def test_rollout_trace_reduces_a_pick_and_place_to_its_two_landing_points():
+    # Approach at height, close, lift, traverse, descend, open. The two points that carry the
+    # result are where it closed and where it opened; everything between them is travel.
+    heights = [0.20, 0.12, 0.05, 0.05, 0.12, 0.13, 0.06, 0.06, 0.14]
+    gripper = [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+    positions = [(0.31, -0.22, z) for z in heights[:4]] + [(0.36, -0.13, z) for z in heights[4:]]
+
+    summary = _trace_from(gripper, positions).summary()
+
+    assert summary["closed"] is True
+    assert summary["grasp_xyz"] == [0.31, -0.22, 0.05]
+    assert summary["release_xyz"] == [0.36, -0.13, 0.06]
+    assert summary["apex_z"] == pytest.approx(0.13)
+    assert summary["lift_m"] == pytest.approx(0.08)
+    assert summary["descent_m"] == pytest.approx(0.07)
+    assert summary["held_steps"] == 5
+
+
+def test_rollout_trace_reports_the_lowest_point_when_the_gripper_never_closed():
+    """The commonest failure this rig has: the arm goes somewhere and never grips.
+
+    Its landing point is still the measurement -- it is where the policy decided the object was
+    -- so it is reported as an approach point rather than dropped for lacking a grasp.
+    """
+    positions = [(0.44, -0.26, 0.20), (0.44, -0.26, 0.09), (0.44, -0.26, 0.14)]
+
+    summary = _trace_from([1.0, 1.0, 1.0], positions).summary()
+
+    assert summary["closed"] is False
+    assert summary["approach_xyz"] == [0.44, -0.26, 0.09]
+    assert "grasp_xyz" not in summary
+
+
+def test_rollout_trace_keyed_on_the_commanded_gripper_not_the_observed_one():
+    """`observation.state.gripper.pos` reads 0 on nearly half the frames in this dataset while
+    the command holds a clean 1.0, so a detector reading the observation fires on dropouts. The
+    trace samples the command, and this is the case that would break if that ever changed."""
+    trace = fr3_act_infer_real_runtime.RolloutGeometryTrace(1)
+    for step, height in enumerate([0.20, 0.15, 0.10]):
+        trace.sample(
+            step_idx=step,
+            position_xyz=np.asarray([0.31, -0.22, height]),
+            gripper_command=1.0,
+            gripper_raw=0.0,
+            command_status="pass",
+        )
+
+    assert trace.summary()["closed"] is False
+
+
+def test_a_rollout_that_starts_with_the_gripper_shut_does_not_grasp_at_the_start_pose():
+    """Observed on rollout 6 of L4_full48_holdout22_40/030000: the runtime warned that the live
+    gripper start (0.016) was nowhere near the dataset's start contract (1.000), so the command
+    was already under the threshold at step 0 and "first step closed" returned the home pose --
+    a grasp reported 340 mm above the table, with lift 0. A grasp is a falling edge."""
+    heights = [0.40, 0.40, 0.20, 0.12, 0.05, 0.05, 0.12, 0.13, 0.06, 0.06, 0.14]
+    # Starts shut at the home pose, opens on the way down, then closes on the object.
+    gripper = [0.05, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+    positions = (
+        [(0.31, -0.00, z) for z in heights[:4]]
+        + [(0.39, -0.03, z) for z in heights[4:6]]
+        + [(0.36, -0.13, z) for z in heights[6:]]
+    )
+
+    summary = _trace_from(gripper, positions).summary()
+
+    # Not [0.31, -0.00, 0.40], the home pose, which is what "first step under the threshold" gives.
+    assert summary["grasp_xyz"] == [0.39, -0.03, 0.05]
+    assert summary["lift_m"] == pytest.approx(0.08)
+    assert summary["descent_m"] == pytest.approx(0.07)
+
+
+def test_a_gripper_commanded_shut_for_the_whole_rollout_reports_no_grasp():
+    """The edge rule's other end: without ever opening there is no transition to find, and the
+    honest answer is the approach point rather than step 0."""
+    positions = [(0.31, -0.00, 0.40), (0.35, -0.02, 0.08), (0.35, -0.02, 0.20)]
+
+    summary = _trace_from([0.05, 0.0, 0.0], positions).summary()
+
+    assert summary["closed"] is False
+    assert summary["approach_xyz"] == [0.35, -0.02, 0.08]
+
+
+def test_rollout_trace_writes_a_replayable_csv(tmp_path: Path):
+    """The reduction above is a rule applied to a buffer, and rules get revised. The rollout it
+    was applied to cannot be repeated, so the buffer outlives the summary."""
+    trace = _trace_from(
+        [1.0, 0.0, 1.0],
+        [(0.31, -0.22, 0.20), (0.31, -0.22, 0.05), (0.36, -0.13, 0.06)],
+        trace_dir=tmp_path,
+    )
+    trace.write()
+
+    rows = (tmp_path / "rollout_001.csv").read_text(encoding="utf-8").strip().splitlines()
+    assert rows[0] == "step,x,y,z,gripper_cmd,gripper_raw,status"
+    assert len(rows) == 4
+    assert rows[2].startswith("1,0.310000,-0.220000,0.050000,0.0000")
+
+
+def test_rollout_trace_summary_fields_are_readable_off_the_end_marker():
+    summary = _trace_from(
+        [1.0, 0.0, 1.0],
+        [(0.31, -0.22, 0.20), (0.31, -0.22, 0.05), (0.36, -0.13, 0.06)],
+    ).summary_log_fields()
+
+    assert "closed=1" in summary
+    assert "grasp_xyz=0.3100,-0.2200,0.0500" in summary
+    assert "release_xyz=0.3600,-0.1300,0.0600" in summary
+
+
+def test_an_empty_rollout_reports_no_landing_point():
+    """A rollout stopped before its first step has nothing to put on a map, and must not claim
+    the origin."""
+    summary = fr3_act_infer_real_runtime.RolloutGeometryTrace(1).summary()
+
+    assert summary == {"samples": 0, "closed": False}

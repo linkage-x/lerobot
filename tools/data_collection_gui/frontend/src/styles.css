@@ -4795,3 +4795,119 @@ button.danger {
   color: #6f4e12;
   padding: 10px 12px;
 }
+
+/* ---------------------------------------------------------- landing map --- */
+
+/* The map is square by construction -- one span for both axes, so a millimetre reads the same
+ * in x as in y -- and its box has to stay square too, or the SVG's viewBox would be letterboxed
+ * back into an aspect the plot was drawn to avoid. */
+.landing-map svg {
+  aspect-ratio: 1 / 1;
+  display: block;
+  max-width: 520px;
+  width: 100%;
+}
+
+.landing-map-frame {
+  fill: #ffffff;
+  stroke: #cfd8de;
+}
+
+.landing-map-grid {
+  stroke: #eef2f4;
+  stroke-width: 1;
+}
+
+.landing-map-tick {
+  fill: #8a97a1;
+  font-size: 10px;
+}
+
+.landing-map-axis {
+  fill: #5b6a75;
+  font-size: 11px;
+}
+
+.landing-map-demo {
+  fill: #b6c2cb;
+}
+
+/* The demonstrated grasp annulus. Dashed because it is a summary of where the demonstrations
+ * happened to fall, not a boundary anybody drew. */
+.landing-map-band {
+  fill: none;
+  stroke: #9fb3c0;
+  stroke-dasharray: 4 5;
+  stroke-width: 1;
+}
+
+.landing-map-hole line {
+  stroke: #172026;
+  stroke-width: 2;
+}
+
+/* Separates stacked landing points. Painted in the plot background rather than left out, so
+ * two rollouts that landed on the same spot stay countable. */
+.landing-map-halo {
+  fill: none;
+  stroke: #ffffff;
+  stroke-width: 2;
+}
+
+/* An ungraded point is the only thing on the map that is asking for something. */
+.landing-map-pending {
+  animation: landing-map-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes landing-map-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.landing-map-legend {
+  color: #5b6a75;
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 12px;
+  gap: 14px;
+  padding: 8px 0 2px;
+}
+
+.landing-map-legend .dot {
+  border-radius: 50%;
+  display: inline-block;
+  height: 9px;
+  margin-right: 5px;
+  vertical-align: baseline;
+  width: 9px;
+}
+
+.landing-map-legend .dot.demo {
+  background: #b6c2cb;
+}
+
+.landing-map-legend .dot.success {
+  background: #2f9e5f;
+}
+
+.landing-map-legend .dot.failure {
+  background: #cf4b3a;
+}
+
+.landing-map-legend .dot.aborted {
+  background: #8a8a8a;
+}
+
+.landing-map-legend .dot.pending {
+  background: #d79b28;
+}
+
+.landing-map-legend .dot.hollow {
+  background: transparent;
+  border: 2px solid #5b6a75;
+}

@@ -1,0 +1,273 @@
+import { useMemo } from "react";
+
+import type {
+  DemoLandingPoint,
+  RolloutGeometry,
+  RolloutLandmarks,
+  RolloutOutcomeEntry
+} from "../types";
+import {
+  buildLandingPoints,
+  formatMm,
+  type PlottedOutcome,
+  type PlottedPoint
+} from "./landingMapPoints";
+
+/** A top-down map of where rollouts actually put the gripper, over where the demonstrations did.
+ *
+ * The reason this is a map and not a success rate: a rate answers "how often", and the question
+ * a partially working policy raises is "where". Three rollouts that fail at three corners of the
+ * workspace and three that fail at the same spot have the same rate and completely different
+ * causes -- the first is coverage, the second is a systematic offset -- and no scalar can tell
+ * them apart. The demonstrations are drawn underneath for the same reason: a landing point is
+ * only interpretable relative to the region the policy was ever shown.
+ *
+ * Plotted in the robot's own base frame rather than in camera pixels. The base frame is the one
+ * the dataset, the runtime and this page already agree on, so nothing here depends on a camera
+ * calibration that could be stale.
+ */
+
+const SIZE = 460;
+const PAD_LEFT = 52;
+const PAD_BOTTOM = 40;
+const PAD_TOP = 16;
+const PAD_RIGHT = 16;
+const GRID_STEP_M = 0.05;
+
+const OUTCOME_FILL: Record<PlottedOutcome, string> = {
+  success: "#2f9e5f",
+  failure: "#cf4b3a",
+  aborted: "#8a8a8a",
+  pending: "#d79b28"
+};
+
+export function RolloutLandingMap({
+  landmarks,
+  entries,
+  pendingIndex,
+  pendingGeometry,
+  checkpointId
+}: {
+  landmarks: RolloutLandmarks;
+  entries: RolloutOutcomeEntry[];
+  pendingIndex: number;
+  pendingGeometry?: RolloutGeometry;
+  checkpointId: string;
+}) {
+  const demoPoints: DemoLandingPoint[] = landmarks.points ?? [];
+
+  const rolloutPoints = useMemo<PlottedPoint[]>(
+    () => buildLandingPoints(entries, pendingIndex, pendingGeometry),
+    [entries, pendingIndex, pendingGeometry]
+  );
+
+  const frame = useMemo(() => {
+    const xs: number[] = [];
+    const ys: number[] = [];
+    demoPoints.forEach((point) => {
+      xs.push(point.graspXyz[0]);
+      ys.push(point.graspXyz[1]);
+    });
+    rolloutPoints.forEach((point) => {
+      xs.push(point.x);
+      ys.push(point.y);
+    });
+    if (landmarks.hole) {
+      xs.push(landmarks.hole[0]);
+      ys.push(landmarks.hole[1]);
+    }
+    if (xs.length === 0) return null;
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    // One span for both axes. Two would make the plot fill its box more neatly and would also
+    // make a 20 mm error look like a 40 mm one along whichever axis happened to be tighter,
+    // which is the single thing this plot must never do.
+    const span = Math.max(maxX - minX, maxY - minY, 0.05) * 1.18;
+    const centreX = (minX + maxX) / 2;
+    const centreY = (minY + maxY) / 2;
+    const plotWidth = SIZE - PAD_LEFT - PAD_RIGHT;
+    const plotHeight = SIZE - PAD_TOP - PAD_BOTTOM;
+    const scale = Math.min(plotWidth, plotHeight) / span;
+    const originX = PAD_LEFT + plotWidth / 2;
+    const originY = PAD_TOP + plotHeight / 2;
+    return {
+      span,
+      centreX,
+      centreY,
+      // Base y grows to the robot's left, so it is drawn rightward and base x upward: the view
+      // an operator has standing in front of the cell, rather than one they have to mirror.
+      toScreenX: (x: number) => originX + (x - centreX) * scale,
+      toScreenY: (y: number) => originY - (y - centreY) * scale,
+      scale
+    };
+  }, [demoPoints, rolloutPoints, landmarks.hole]);
+
+  if (!frame) {
+    return (
+      <p className="hint">
+        No landing points yet. The map fills in as rollouts finish — each one adds the point where
+        its gripper closed.
+      </p>
+    );
+  }
+
+  const gridLines: { value: number; axis: "x" | "y" }[] = [];
+  const halfSpan = frame.span / 2;
+  for (const axis of ["x", "y"] as const) {
+    const centre = axis === "x" ? frame.centreX : frame.centreY;
+    const first = Math.ceil((centre - halfSpan) / GRID_STEP_M) * GRID_STEP_M;
+    for (let value = first; value <= centre + halfSpan; value += GRID_STEP_M) {
+      gridLines.push({ value, axis });
+    }
+  }
+
+  const hole = landmarks.hole;
+  const radius = landmarks.graspRadiusM;
+  const graded = rolloutPoints.filter((point) => point.outcome !== "pending");
+  const successes = graded.filter((point) => point.outcome === "success").length;
+
+  return (
+    <div className="landing-map">
+      <svg viewBox={`0 0 ${SIZE} ${SIZE}`} role="img" aria-label="Rollout landing points">
+        <rect
+          x={PAD_LEFT}
+          y={PAD_TOP}
+          width={SIZE - PAD_LEFT - PAD_RIGHT}
+          height={SIZE - PAD_TOP - PAD_BOTTOM}
+          className="landing-map-frame"
+        />
+        {gridLines.map(({ value, axis }) => {
+          const isX = axis === "x";
+          const screen = isX ? frame.toScreenX(value) : frame.toScreenY(value);
+          if (isX && (screen < PAD_LEFT || screen > SIZE - PAD_RIGHT)) return null;
+          if (!isX && (screen < PAD_TOP || screen > SIZE - PAD_BOTTOM)) return null;
+          return (
+            <g key={`${axis}-${value.toFixed(3)}`}>
+              <line
+                x1={isX ? screen : PAD_LEFT}
+                x2={isX ? screen : SIZE - PAD_RIGHT}
+                y1={isX ? PAD_TOP : screen}
+                y2={isX ? SIZE - PAD_BOTTOM : screen}
+                className="landing-map-grid"
+              />
+              <text
+                x={isX ? screen : PAD_LEFT - 6}
+                y={isX ? SIZE - PAD_BOTTOM + 14 : screen + 3}
+                className="landing-map-tick"
+                textAnchor={isX ? "middle" : "end"}
+              >
+                {(value * 1000).toFixed(0)}
+              </text>
+            </g>
+          );
+        })}
+
+        {hole && radius && (
+          <>
+            {/* The annulus the demonstrations actually cover. Anything outside it is a placement
+                the policy was never shown, and its failure is a coverage fact, not a policy one. */}
+            <circle
+              cx={frame.toScreenX(hole[0])}
+              cy={frame.toScreenY(hole[1])}
+              r={radius.min * frame.scale}
+              className="landing-map-band"
+            />
+            <circle
+              cx={frame.toScreenX(hole[0])}
+              cy={frame.toScreenY(hole[1])}
+              r={radius.max * frame.scale}
+              className="landing-map-band"
+            />
+          </>
+        )}
+
+        {demoPoints.map((point) => (
+          <circle
+            key={`demo-${point.episode}`}
+            cx={frame.toScreenX(point.graspXyz[0])}
+            cy={frame.toScreenY(point.graspXyz[1])}
+            r={3}
+            className="landing-map-demo"
+          >
+            <title>{`Demo episode ${point.episode} — insert descent ${formatMm(point.descentM)}`}</title>
+          </circle>
+        ))}
+
+        {hole && (
+          <g className="landing-map-hole">
+            <line
+              x1={frame.toScreenX(hole[0]) - 7}
+              x2={frame.toScreenX(hole[0]) + 7}
+              y1={frame.toScreenY(hole[1])}
+              y2={frame.toScreenY(hole[1])}
+            />
+            <line
+              x1={frame.toScreenX(hole[0])}
+              x2={frame.toScreenX(hole[0])}
+              y1={frame.toScreenY(hole[1]) - 7}
+              y2={frame.toScreenY(hole[1]) + 7}
+            />
+            <title>Hole, measured as the mean of every demonstration&apos;s release point</title>
+          </g>
+        )}
+
+        {rolloutPoints.map((point) => {
+          const cx = frame.toScreenX(point.x);
+          const cy = frame.toScreenY(point.y);
+          const fill = OUTCOME_FILL[point.outcome];
+          return (
+            <g key={point.key}>
+              {/* A ring in the plot's own background colour, so a dot that lands on an earlier
+                  one still reads as two dots instead of silently replacing it. */}
+              <circle cx={cx} cy={cy} r={point.closed ? 7 : 8} className="landing-map-halo" />
+              {/* Filled when the gripper closed, hollow when it only reached: the same dot in
+                  two states, because "did not grip" and "gripped and dropped it" are different
+                  failures at the same coordinates. */}
+              <circle
+                cx={cx}
+                cy={cy}
+                r={point.closed ? 5.5 : 6.5}
+                fill={point.closed ? fill : "none"}
+                stroke={fill}
+                strokeWidth={point.closed ? 1 : 2}
+                className={point.outcome === "pending" ? "landing-map-pending" : undefined}
+              />
+              <title>{point.title}</title>
+            </g>
+          );
+        })}
+
+        <text x={SIZE / 2} y={SIZE - 6} className="landing-map-axis" textAnchor="middle">
+          base x (mm)
+        </text>
+        <text
+          x={12}
+          y={SIZE / 2}
+          className="landing-map-axis"
+          textAnchor="middle"
+          transform={`rotate(-90 12 ${SIZE / 2})`}
+        >
+          base y (mm)
+        </text>
+      </svg>
+
+      <div className="landing-map-legend">
+        <span><i className="dot demo" /> demo grasp ({demoPoints.length})</span>
+        <span><i className="dot success" /> success ({successes})</span>
+        <span><i className="dot failure" /> failure</span>
+        <span><i className="dot aborted" /> aborted</span>
+        <span><i className="dot pending" /> not graded</span>
+        <span><i className="dot hollow" /> gripper never closed</span>
+      </div>
+      <p className="hint">
+        Landing points for <code>{checkpointId || "this checkpoint"}</code>, in the robot base
+        frame. The two dashed circles are the closest and furthest the demonstrations ever grasped
+        from the hole
+        {radius ? ` (${formatMm(radius.min)}–${formatMm(radius.max)})` : ""}; a failure outside
+        them is a placement the policy was never trained on.
+      </p>
+    </div>
+  );
+}

@@ -5,12 +5,14 @@ import { Metric, PageHeader, StatusDot } from "../shared/ui";
 import type {
   Checkpoint,
   RolloutMode,
+  RolloutLandmarks,
   RolloutOutcomeEntry,
   RolloutRtcMode,
   RolloutRtcSchedule,
   RolloutRun,
   RolloutRuntimeOptions
 } from "../types";
+import { RolloutLandingMap } from "./RolloutLandingMap";
 
 /**
  * Running a trained checkpoint on the real FR3.
@@ -24,9 +26,16 @@ import type {
  *   1. A checkpoint whose contract disagrees with the rig cannot be started without an override.
  *   2. Any mode that moves the arm needs motion confirmed in the same interaction.
  *   3. A finished rollout asks how it went, once, while the operator still remembers.
+ *
+ * Move to start is the fourth control, and the one that is not a friction. The launcher homes
+ * the arm once, before the runtime process exists, so every rollout after the first begins
+ * wherever the previous one stopped. Ending the session to fix that costs a minute of policy
+ * reload; this sends one word down the control channel the running process is already reading,
+ * and it is enabled only between rollouts, which is the only window in which nothing else is
+ * commanding the arm.
  */
 
-const LIVE_STATES = new Set(["starting", "waiting", "rolling"]);
+const LIVE_STATES = new Set(["starting", "waiting", "homing", "rolling"]);
 const RTC_SCHEDULES: RolloutRtcSchedule[] = ["EXP", "LINEAR", "ONES", "ZEROS"];
 const DEFAULT_TASK_PROMPT_PLACEHOLDER = "Pick up the peg and insert it fully into the hole.";
 
@@ -53,7 +62,9 @@ function optionalNumberOrNull(value: string): number | null {
 }
 
 function stateTone(state: RolloutRun["state"]): string {
-  if (state === "rolling") return "running";
+  // "running" is the arm-is-moving-right-now dot, which homing is as much as rolling is;
+  // "armed" is the it-could-move-at-any-moment one. The state text beside it says which.
+  if (state === "rolling" || state === "homing") return "running";
   if (state === "waiting" || state === "starting") return "armed";
   if (state === "error") return "error";
   if (state === "complete") return "complete";
@@ -85,6 +96,7 @@ export function RolloutPage() {
   const [notice, setNotice] = useState("");
   const [outcomeNote, setOutcomeNote] = useState("");
   const [history, setHistory] = useState<RolloutOutcomeEntry[]>([]);
+  const [landmarks, setLandmarks] = useState<RolloutLandmarks>({});
   const [frameNonce, setFrameNonce] = useState(0);
   const logRef = useRef<HTMLPreElement | null>(null);
 
@@ -121,6 +133,16 @@ export function RolloutPage() {
     ]
   );
 
+  // Only this checkpoint's rollouts. Two checkpoints' landing points on one map look like one
+  // policy with twice the scatter, which is the opposite of what the map is for.
+  const mappedEntries = useMemo(
+    () =>
+      history.filter(
+        (entry) => entry.geometry && (!run?.checkpointId || entry.checkpointId === run.checkpointId)
+      ),
+    [history, run?.checkpointId]
+  );
+
   const refreshHistory = useCallback(async () => {
     setHistory(await api.fetchRolloutOutcomes());
   }, []);
@@ -145,6 +167,23 @@ export function RolloutPage() {
   useEffect(() => {
     void refreshHistory();
   }, [refreshHistory]);
+
+  // Fetched once per dataset rather than on every poll: the first call reduces the dataset's
+  // parquet down to one point per episode, and the answer only changes when the checkpoint under
+  // test was trained on something else.
+  useEffect(() => {
+    const datasetRoot = run?.datasetRoot ?? "";
+    if (!datasetRoot) return;
+    if (landmarks.datasetRoot === datasetRoot) return;
+    let cancelled = false;
+    void (async () => {
+      const payload = await api.fetchRolloutLandmarks();
+      if (!cancelled && payload) setLandmarks(payload);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [run?.datasetRoot, landmarks.datasetRoot]);
 
   // Seed the form from the last rollout, once, on mount. Tuning a policy means rolling out the
   // same settings against checkpoint after checkpoint, and retyping eight RTC knobs each time is
@@ -251,7 +290,7 @@ export function RolloutPage() {
     }
   };
 
-  const onControl = async (command: "start" | "stop" | "quit") => {
+  const onControl = async (command: "start" | "stop" | "home" | "quit") => {
     const result = await wrap(`Rollout ${command}`, () => api.controlRollout(command));
     if (result.ok) setRun((result as { rollout?: RolloutRun }).rollout ?? null);
   };
@@ -310,10 +349,16 @@ export function RolloutPage() {
               <div className="row-actions">
                 {run.interactive && (
                   <>
+                    {/* Enabled only on `waiting`, which the runtime declares by printing
+                        `interactive_waiting_for_start`. Everything before that -- homing the
+                        arm, a minute of loading the policy, opening the cameras -- is
+                        `starting`, and a Start pressed there is read by the listener thread and
+                        then cleared by the loop when it reaches its wait. The click looked like
+                        it worked and nothing happened. */}
                     <button
                       type="button"
                       onClick={() => void onControl("start")}
-                      disabled={busy || run.state === "rolling"}
+                      disabled={busy || run.state !== "waiting"}
                     >
                       Start rollout
                     </button>
@@ -323,6 +368,17 @@ export function RolloutPage() {
                       disabled={busy || run.state !== "rolling"}
                     >
                       Stop rollout
+                    </button>
+                    {/* After Stop rather than beside Start, because that is the order it is
+                        used in. Enabled on `waiting` rather than on "Stop was pressed": a
+                        rollout that ran to its own end leaves the arm just as displaced as one
+                        that was interrupted, and both land here. */}
+                    <button
+                      type="button"
+                      onClick={() => void onControl("home")}
+                      disabled={busy || run.state !== "waiting"}
+                    >
+                      Move to start
                     </button>
                   </>
                 )}
@@ -334,6 +390,15 @@ export function RolloutPage() {
           </div>
 
           <p className="hint">{run.message}</p>
+
+          {run.interactive && run.state === "waiting" && !run.armAtStart && (
+            <p className="hint">
+              The arm is where the last rollout left it. The dataset frame is anchored to the
+              pose the episodes started from, so the next rollout would begin somewhere the
+              policy was never shown — press <b>Move to start</b> first. The gripper is left
+              exactly as it is: if it is still holding something, take it before homing.
+            </p>
+          )}
 
           <div className="metric-row">
             <Metric label="State" value={run.state} />
@@ -423,6 +488,20 @@ export function RolloutPage() {
           {run.logPath && <p className="hint">Full log: <code>{run.logPath}</code></p>}
         </section>
       )}
+
+      {/* ---------------------------------------------------- landing map --- */}
+      <section className="card">
+        <div className="card-head">
+          <h3>Where the gripper landed</h3>
+        </div>
+        <RolloutLandingMap
+          landmarks={landmarks}
+          entries={mappedEntries}
+          pendingIndex={run?.pendingOutcomeFor ?? 0}
+          pendingGeometry={run?.lastRolloutGeometry}
+          checkpointId={run?.checkpointId ?? selected?.id ?? ""}
+        />
+      </section>
 
       {/* ------------------------------------------------------ checkpoint --- */}
       <section className="card">

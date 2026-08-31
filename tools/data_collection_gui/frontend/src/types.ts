@@ -1066,7 +1066,15 @@ export type RolloutMode = {
 };
 
 export type RolloutRun = {
-  state: "idle" | "starting" | "waiting" | "rolling" | "complete" | "error" | "stopped";
+  state:
+    | "idle"
+    | "starting"
+    | "waiting"
+    | "homing"
+    | "rolling"
+    | "complete"
+    | "error"
+    | "stopped";
   mode: string;
   checkpointId: string;
   checkpointPath: string;
@@ -1084,6 +1092,9 @@ export type RolloutRun = {
   leashedSteps: number;
   rolloutIndex: number;
   lastRolloutStatus: string;
+  /** Whether the arm is at the pose the demonstrations started from. False from the moment a
+   *  rollout begins until somebody homes it: the launcher homes once, before the runtime. */
+  armAtStart: boolean;
   pid: number | null;
   message: string;
   startedAt: string;
@@ -1093,6 +1104,44 @@ export type RolloutRun = {
   lastLines: string[];
   /** Non-zero when a finished rollout is waiting for the operator to grade it. */
   pendingOutcomeFor: number;
+  /** Where the last finished rollout put the gripper. Empty until one has finished. */
+  lastRolloutGeometry?: RolloutGeometry;
+};
+
+/** The landing points of one rollout, measured by the runtime from its own per-step trace.
+ *
+ *  Every field is optional because a rollout that never closed its gripper has an approach
+ *  point and no grasp point, and one that closed and never reopened has no release point. A
+ *  missing field means the event did not happen, which is itself a result -- it is what
+ *  separates "reached for it and did not grip" from "gripped and dropped it".
+ */
+export type RolloutGeometry = {
+  graspXyz?: [number, number, number];
+  releaseXyz?: [number, number, number];
+  approachXyz?: [number, number, number];
+  apexZ?: number;
+  liftM?: number;
+  descentM?: number;
+  samples?: number;
+  heldSteps?: number;
+  closed?: boolean;
+};
+
+/** One demonstration's grasp and release, reduced by the same rule the runtime applies live. */
+export type DemoLandingPoint = {
+  episode: number;
+  graspXyz: [number, number, number];
+  releaseXyz: [number, number, number];
+  liftM: number;
+  descentM: number;
+};
+
+export type RolloutLandmarks = {
+  datasetRoot?: string;
+  /** Measured as the mean of every demonstration's release point, not configured. */
+  hole?: [number, number];
+  points?: DemoLandingPoint[];
+  graspRadiusM?: { min: number; max: number; mean: number };
 };
 
 export type RolloutStatusPayload = {
@@ -1111,6 +1160,9 @@ export type RolloutOutcomeEntry = {
   steps: number;
   note: string;
   logPath: string;
+  rolloutIndex?: number;
+  /** Absent on rollouts recorded before the runtime reported landing points. */
+  geometry?: RolloutGeometry;
 };
 
 export type RolloutRtcMode = "auto" | "enabled" | "disabled";

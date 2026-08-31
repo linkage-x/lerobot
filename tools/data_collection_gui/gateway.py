@@ -5818,7 +5818,7 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
     The runtime reads this pipe one line at a time (InteractiveRolloutKeyboard's pipe backend),
     so a word here is exactly a keypress there.
     """
-    allowed = {"start", "stop", "quit"}
+    allowed = {"start", "stop", "home", "quit"}
     if command not in allowed:
         raise ValueError(f"Rollout control must be one of {', '.join(sorted(allowed))}.")
     process = state.rollout_process
@@ -5827,6 +5827,15 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
     if not state.rollout.interactive:
         raise ValueError(
             f"{state.rollout.mode} is not an interactive mode; it runs to completion on its own."
+        )
+    # Checked here as well as in the runtime, which drops a home request pressed mid-rollout.
+    # Two gates because they answer different questions: the runtime's keeps the arm from moving
+    # unattended, and this one gives the operator a reason on screen instead of a click that
+    # looks accepted and does nothing.
+    if command == "home" and state.rollout.state != "waiting":
+        raise ValueError(
+            "Move to start only runs between rollouts, when the arm is parked. "
+            "Stop the current rollout first."
         )
     try:
         process.stdin.write(f"{command}\n".encode())
@@ -5837,6 +5846,8 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
         state.rollout.message = "Start sent."
     elif command == "stop":
         state.rollout.message = "Stop sent; ending the current rollout."
+    elif command == "home":
+        state.rollout.message = "Move to start sent; the arm is heading for its start pose."
     else:
         state.rollout.state = "stopped"
         state.rollout.message = "Quit sent; ending the rollout session."
@@ -5877,6 +5888,11 @@ def _record_rollout_outcome(state: GatewayState, payload: dict[str, Any]) -> dic
             "steps": int(payload.get("steps") or state.rollout.step),
             "note": str(payload.get("note") or ""),
             "logPath": str(payload.get("logPath") or state.rollout.logPath),
+            "rolloutIndex": int(payload.get("rolloutIndex") or state.rollout.pendingOutcomeFor),
+            # Taken from the status rather than from the request: the runtime measured it, and a
+            # page that could send its own would be able to record a grade against a point the
+            # arm never visited.
+            "geometry": dict(state.rollout.lastRolloutGeometry or {}),
         },
     )
     # Clearing the prompt is what makes it fire once per rollout rather than on every poll.
@@ -12370,6 +12386,18 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     HTTPStatus.OK,
                     {"ok": True, "params": _rollout_last_params(self.server.state)},
                 )
+            return
+        if path == "/api/rollout/landmarks":
+            state = self.server.state
+            # Read outside the lock: the first call scans the dataset's parquet, and holding the
+            # gateway lock for that would stall the 1 Hz status poll of a running rollout.
+            dataset_root = (query.get("dataset", [""])[0] or "").strip() or state.rollout.datasetRoot
+            landmarks = (
+                checkpoint_backend.demo_landing_points(state.repo_root / dataset_root)
+                if dataset_root
+                else {}
+            )
+            _json_response(self, HTTPStatus.OK, {"ok": True, "landmarks": landmarks})
             return
         if path == "/api/rollout/outcomes":
             state = self.server.state

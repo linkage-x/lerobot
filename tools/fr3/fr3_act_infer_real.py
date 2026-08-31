@@ -236,6 +236,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument('--rollout-start-key', default=None, help='Keyboard key to start a rollout in interactive mode.')
     parser.add_argument('--rollout-stop-key', default=None, help='Keyboard key to stop the current rollout in interactive mode.')
+    parser.add_argument('--rollout-home-key', default=None, help='Keyboard key to move the arm back to its start pose between rollouts.')
     parser.add_argument('--rollout-quit-key', default=None, help='Keyboard key to quit interactive inference.')
     parser.add_argument(
         '--mujoco-viewer',
@@ -483,6 +484,7 @@ def apply_inference_config_defaults(args: argparse.Namespace) -> argparse.Namesp
     args.interactive_rollouts = bool(interactive_default) if args.interactive_rollouts is None else args.interactive_rollouts
     args.rollout_start_key = args.rollout_start_key or _nested(raw, 'runtime', 'interactive', 'start_key') or 's'
     args.rollout_stop_key = args.rollout_stop_key or _nested(raw, 'runtime', 'interactive', 'stop_key') or 'x'
+    args.rollout_home_key = args.rollout_home_key or _nested(raw, 'runtime', 'interactive', 'home_key') or 'h'
     args.rollout_quit_key = args.rollout_quit_key or _nested(raw, 'runtime', 'interactive', 'quit_key') or 'q'
     mujoco_default = _nested(raw, 'runtime', 'mujoco', 'enabled')
     if mujoco_default is None:
@@ -581,6 +583,7 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         *(['--interactive-rollouts'] if args.interactive_rollouts else []),
         f'--rollout-start-key={shlex.quote(args.rollout_start_key)}',
         f'--rollout-stop-key={shlex.quote(args.rollout_stop_key)}',
+        f'--rollout-home-key={shlex.quote(args.rollout_home_key)}',
         f'--rollout-quit-key={shlex.quote(args.rollout_quit_key)}',
         *(['--mujoco-viewer'] if args.mujoco_viewer else []),
         *([f'--mujoco-model={shlex.quote(mujoco_model)}'] if mujoco_model is not None else []),

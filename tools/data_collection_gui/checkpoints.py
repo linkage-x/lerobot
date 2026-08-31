@@ -517,6 +517,7 @@ def append_rollout_outcome(repo_root: Path, record: dict[str, Any]) -> dict[str,
     checkpoint_id = str(record.get("checkpointId") or "")
     validate_checkpoint_id(checkpoint_id)
 
+    geometry = record.get("geometry")
     entry = {
         "recordedAt": _now(),
         "checkpointId": checkpoint_id,
@@ -525,12 +526,46 @@ def append_rollout_outcome(repo_root: Path, record: dict[str, Any]) -> dict[str,
         "steps": int(record.get("steps") or 0),
         "note": str(record.get("note") or "")[:2000],
         "logPath": str(record.get("logPath") or ""),
+        "rolloutIndex": int(record.get("rolloutIndex") or 0),
     }
+    # Stored with the grade rather than in a file of its own: a landing point without an outcome
+    # is a dot with no meaning, and an outcome without a landing point cannot be put on a map.
+    # Written only when the runtime actually reported one, so an older log line -- or a rollout
+    # that produced no samples -- leaves the field absent instead of claiming the origin.
+    if isinstance(geometry, dict) and geometry:
+        entry["geometry"] = _sanitize_rollout_geometry(geometry)
     path = rollout_log_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
     return entry
+
+
+_GEOMETRY_POINT_FIELDS = ("graspXyz", "releaseXyz", "approachXyz")
+_GEOMETRY_SCALAR_FIELDS = ("apexZ", "liftM", "descentM")
+
+
+def _sanitize_rollout_geometry(geometry: dict[str, Any]) -> dict[str, Any]:
+    """Keep the fields this log is allowed to grow, and nothing a caller invented."""
+    clean: dict[str, Any] = {}
+    for key in _GEOMETRY_POINT_FIELDS:
+        value = geometry.get(key)
+        if isinstance(value, (list, tuple)) and len(value) == 3:
+            try:
+                clean[key] = [round(float(component), 5) for component in value]
+            except (TypeError, ValueError):
+                continue
+    for key in _GEOMETRY_SCALAR_FIELDS:
+        value = geometry.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            clean[key] = round(float(value), 5)
+    for key in ("samples", "heldSteps"):
+        value = geometry.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            clean[key] = value
+    if "closed" in geometry:
+        clean["closed"] = bool(geometry.get("closed"))
+    return clean
 
 
 def load_rollout_outcomes(repo_root: Path, limit: int = 500) -> list[dict[str, Any]]:
@@ -555,6 +590,139 @@ def load_rollout_outcomes(repo_root: Path, limit: int = 500) -> list[dict[str, A
     except OSError:
         return []
     return entries[-limit:]
+
+
+# ------------------------------------------------------- demonstration landmarks ---
+
+# The same rule the runtime applies to a rollout, applied to the demonstrations, so the two sets
+# of points on the plot mean the same thing. Keyed on the commanded gripper for the same reason:
+# in this dataset the observed width reads 0 on nearly half the frames while the command holds a
+# clean 1.0.
+_DEMO_GRIPPER_CLOSED_BELOW = 0.5
+
+_demo_landmark_cache: dict[tuple[str, float], dict[str, Any]] = {}
+
+
+def _feature_index(info: dict[str, Any], feature: str, name: str) -> int | None:
+    names = (((info.get("features") or {}).get(feature) or {}).get("names")) or []
+    if isinstance(names, list) and name in names:
+        return names.index(name)
+    return None
+
+
+def demo_landing_points(dataset_root: Path) -> dict[str, Any]:
+    """Where the demonstrations grasped and released, as the backdrop for rollout landing points.
+
+    A rollout landing point on its own says nothing: the question every one of them is asked is
+    whether it fell inside the region the demonstrations covered, and that region has to be drawn
+    from the same dataset the checkpoint was trained on or the comparison is to a different task.
+
+    Reduced here rather than shipped as a fixture because the dataset is what the checkpoint was
+    trained on and it changes; a hard-coded ring would keep describing an older one. Memoised on
+    the dataset's own metadata timestamp, since the scan costs a full pass over its parquet.
+    """
+    root = Path(dataset_root)
+    info_path = root / "meta" / "info.json"
+    try:
+        cache_key = (str(root.resolve()), info_path.stat().st_mtime)
+    except OSError:
+        return {}
+    cached = _demo_landmark_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        import numpy as np
+        import pyarrow.parquet as pq
+    except ImportError:
+        return {}
+    try:
+        with info_path.open("r", encoding="utf-8") as handle:
+            info = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    state_indices = [_feature_index(info, "observation.state", name) for name in ("ee.x", "ee.y", "ee.z")]
+    action_names = (((info.get("features") or {}).get("action") or {}).get("names")) or []
+    gripper_index = action_names.index("gripper.pos") if "gripper.pos" in action_names else None
+    if any(index is None for index in state_indices) or gripper_index is None:
+        return {}
+
+    episodes: dict[int, list[tuple[Any, Any]]] = {}
+    try:
+        for parquet_path in sorted(root.glob("data/**/*.parquet")):
+            table = pq.read_table(
+                str(parquet_path), columns=["episode_index", "observation.state", "action"]
+            ).to_pydict()
+            episode_column = np.asarray(table["episode_index"])
+            states = np.asarray([np.asarray(row) for row in table["observation.state"]], dtype=np.float64)
+            actions = np.asarray([np.asarray(row) for row in table["action"]], dtype=np.float64)
+            for episode in sorted({int(value) for value in episode_column}):
+                mask = episode_column == episode
+                episodes.setdefault(episode, []).append((states[mask], actions[mask]))
+    except (OSError, KeyError, ValueError):
+        return {}
+    if not episodes:
+        return {}
+
+    points: list[dict[str, Any]] = []
+    releases: list[list[float]] = []
+    for episode in sorted(episodes):
+        state = np.concatenate([chunk[0] for chunk in episodes[episode]])
+        action = np.concatenate([chunk[1] for chunk in episodes[episode]])
+        position = state[:, state_indices]
+        gripper = action[:, gripper_index]
+        # Falling edge, matching the runtime: an episode that starts with the gripper already
+        # commanded shut would otherwise report its grasp at the start pose. The demonstrations
+        # start open, so this changes none of them -- it keeps the two point sets on this plot
+        # derived by one rule rather than by two that happen to agree today.
+        open_steps = np.flatnonzero(gripper >= _DEMO_GRIPPER_CLOSED_BELOW)
+        if not open_steps.size:
+            continue
+        first_open = int(open_steps[0])
+        closed_steps = np.flatnonzero(gripper[first_open:] < _DEMO_GRIPPER_CLOSED_BELOW) + first_open
+        if not closed_steps.size:
+            continue
+        close_idx = int(closed_steps[0])
+        reopened = np.flatnonzero(gripper[close_idx:] >= _DEMO_GRIPPER_CLOSED_BELOW)
+        release_idx = int(close_idx + reopened[0]) if reopened.size else len(gripper) - 1
+        apex_z = float(position[close_idx : release_idx + 1, 2].max())
+        points.append(
+            {
+                "episode": int(episode),
+                "graspXyz": [round(float(value), 5) for value in position[close_idx]],
+                "releaseXyz": [round(float(value), 5) for value in position[release_idx]],
+                "liftM": round(apex_z - float(position[close_idx, 2]), 5),
+                "descentM": round(apex_z - float(position[release_idx, 2]), 5),
+            }
+        )
+        releases.append([float(position[release_idx, 0]), float(position[release_idx, 1])])
+
+    if not points:
+        return {}
+    # The demonstrations all release into the same hole, so their mean release point *is* the
+    # hole -- measured rather than configured, which keeps it correct if the fixture is moved.
+    hole = [
+        round(float(np.mean([release[0] for release in releases])), 5),
+        round(float(np.mean([release[1] for release in releases])), 5),
+    ]
+    radii = [
+        float(np.hypot(point["graspXyz"][0] - hole[0], point["graspXyz"][1] - hole[1]))
+        for point in points
+    ]
+    landmarks = {
+        "datasetRoot": str(root),
+        "hole": hole,
+        "points": points,
+        "graspRadiusM": {
+            "min": round(min(radii), 5),
+            "max": round(max(radii), 5),
+            "mean": round(float(np.mean(radii)), 5),
+        },
+    }
+    _demo_landmark_cache.clear()
+    _demo_landmark_cache[cache_key] = landmarks
+    return landmarks
 
 
 def outcome_summary(entries: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
