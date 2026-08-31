@@ -1,0 +1,1078 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>夹爪 Marker Rig 设计需求 V2</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600;700&display=swap">
+
+<style>
+  :root{
+    --paper:#eceff0;
+    --surface:#ffffff;
+    --surface-2:#f6f8f8;
+    --ink:#101817;
+    --ink-2:#394a48;
+    --muted:#667876;
+    --rule:#d2dbd9;
+    --rule-soft:#e5eae9;
+    --accent:#0d675e;
+    --accent-2:#0a4f48;
+    --accent-soft:#e0eeeb;
+    --must:#9b2b1d;
+    --must-soft:#f9e8e5;
+    --warn:#87590a;
+    --warn-soft:#fbf1dd;
+    --ok:#1d6740;
+    --ok-soft:#e5f1ea;
+    --shadow:0 1px 2px rgba(16,24,23,.05), 0 8px 24px -18px rgba(16,24,23,.32);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --paper:#0d1413;
+      --surface:#151d1c;
+      --surface-2:#1a2322;
+      --ink:#e6ecea;
+      --ink-2:#b6c4c1;
+      --muted:#8a9c99;
+      --rule:#2a3533;
+      --rule-soft:#212b29;
+      --accent:#55b8aa;
+      --accent-2:#79ccc0;
+      --accent-soft:#123330;
+      --must:#e0887b;
+      --must-soft:#331a16;
+      --warn:#d5a44e;
+      --warn-soft:#2d2412;
+      --ok:#69c48c;
+      --ok-soft:#13291e;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 26px -20px rgba(0,0,0,.9);
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#0d1413;
+    --surface:#151d1c;
+    --surface-2:#1a2322;
+    --ink:#e6ecea;
+    --ink-2:#b6c4c1;
+    --muted:#8a9c99;
+    --rule:#2a3533;
+    --rule-soft:#212b29;
+    --accent:#55b8aa;
+    --accent-2:#79ccc0;
+    --accent-soft:#123330;
+    --must:#e0887b;
+    --must-soft:#331a16;
+    --warn:#d5a44e;
+    --warn-soft:#2d2412;
+    --ok:#69c48c;
+    --ok-soft:#13291e;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 26px -20px rgba(0,0,0,.9);
+  }
+
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    background:var(--paper);
+    color:var(--ink);
+    font-family:"Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,-apple-system,sans-serif;
+    font-size:15.5px;
+    line-height:1.78;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1040px;margin:0 auto;padding:0 20px 96px}
+  h1,h2,h3{font-family:"Noto Serif SC","Songti SC",Georgia,serif;text-wrap:balance;margin:0}
+  .num{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums;font-feature-settings:"tnum"}
+  code,.mono{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em;background:var(--surface-2);border:1px solid var(--rule-soft);border-radius:4px;padding:1px 5px}
+
+  /* ---------- hero ---------- */
+  .hero{padding:64px 0 34px;border-bottom:1px solid var(--rule)}
+  .eyebrow{
+    font-family:"IBM Plex Mono",monospace;font-size:11.5px;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--accent);margin-bottom:18px;font-weight:500;
+  }
+  .hero h1{font-size:clamp(30px,4.4vw,44px);font-weight:700;line-height:1.28;letter-spacing:-.01em;max-width:19ch}
+  .hero .lede{margin:18px 0 0;max-width:60ch;color:var(--ink-2);font-size:17px}
+  .docmeta{
+    display:flex;flex-wrap:wrap;gap:8px 26px;margin-top:26px;
+    font-family:"IBM Plex Mono",monospace;font-size:12.5px;color:var(--muted);
+  }
+  .docmeta b{color:var(--ink-2);font-weight:500}
+
+  /* ---------- key figures ---------- */
+  .figures{
+    display:grid;grid-template-columns:repeat(4,minmax(0,1fr));
+    gap:1px;background:var(--rule);border:1px solid var(--rule);
+    border-radius:6px;overflow:hidden;margin:30px 0 0;
+  }
+  .fig{background:var(--surface);padding:18px 18px 16px}
+  .fig .v{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;font-size:25px;font-weight:600;color:var(--ink);line-height:1.2}
+  .fig .v small{font-size:14px;font-weight:400;color:var(--muted);margin-left:2px}
+  .fig .k{font-size:12.5px;color:var(--muted);margin-top:6px;line-height:1.5}
+  .fig.hot .v{color:var(--must)}
+  .fig.good .v{color:var(--accent)}
+
+  /* ---------- sections ---------- */
+  section{padding-top:56px}
+  .shead{display:flex;align-items:baseline;gap:14px;margin-bottom:6px}
+  .snum{font-family:"IBM Plex Mono",monospace;font-size:12.5px;color:var(--accent);font-weight:600;letter-spacing:.06em;padding-top:6px}
+  .shead h2{font-size:25px;font-weight:700;letter-spacing:-.005em}
+  .sdek{color:var(--muted);max-width:66ch;margin:0 0 24px;font-size:14.5px}
+  p{margin:0 0 14px;max-width:70ch}
+  ul,ol{margin:0 0 14px;padding-left:20px;max-width:70ch}
+  li{margin:6px 0}
+  strong{font-weight:700}
+
+  /* ---------- mechanism cards ---------- */
+  .mechs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+  .mech{
+    background:var(--surface);border:1px solid var(--rule);border-radius:6px;
+    padding:22px 22px 18px;box-shadow:var(--shadow);
+  }
+  .mech h3{font-size:17px;font-weight:600;margin-bottom:4px}
+  .mech .law{
+    font-family:"IBM Plex Mono",monospace;font-size:13px;color:var(--accent);
+    background:var(--accent-soft);border-radius:4px;padding:6px 10px;display:inline-block;margin:6px 0 12px;
+  }
+  .mech p{font-size:14.5px;margin-bottom:10px;color:var(--ink-2)}
+  .mech p:last-child{margin-bottom:0}
+  .mech.full{grid-column:1/-1}
+
+  /* ---------- requirement blocks ---------- */
+  .req{
+    display:grid;grid-template-columns:96px 1fr;gap:0;
+    background:var(--surface);border:1px solid var(--rule);border-radius:6px;
+    margin-bottom:12px;overflow:hidden;box-shadow:var(--shadow);
+  }
+  .rail{
+    background:var(--surface-2);border-right:1px solid var(--rule-soft);
+    padding:20px 14px;display:flex;flex-direction:column;align-items:flex-start;gap:8px;
+  }
+  .rid{font-family:"IBM Plex Mono",monospace;font-size:16px;font-weight:600;color:var(--ink);letter-spacing:.02em}
+  .chip{
+    font-size:11.5px;font-weight:700;border-radius:3px;padding:2px 7px;
+    letter-spacing:.04em;white-space:nowrap;
+  }
+  .chip.must{color:var(--must);background:var(--must-soft)}
+  .chip.target{color:var(--accent);background:var(--accent-soft)}
+  .chip.confirm{color:var(--warn);background:var(--warn-soft)}
+  .chip.deliver{color:var(--ok);background:var(--ok-soft)}
+  .rbody{padding:20px 24px}
+  .rbody h3{font-size:17px;font-weight:600;margin-bottom:8px;line-height:1.5}
+  .rbody p{font-size:14.5px;color:var(--ink-2);margin-bottom:10px}
+  .rbody p:last-child{margin-bottom:0}
+  .rbody ul{font-size:14.5px;color:var(--ink-2)}
+  .basis{
+    border-left:2px solid var(--accent);padding:2px 0 2px 13px;margin-top:12px !important;
+    font-size:13.5px;color:var(--ink-2);max-width:72ch;
+  }
+  .basis b{
+    font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--accent);display:block;margin-bottom:2px;font-weight:600;
+  }
+
+  /* ---------- tables ---------- */
+  .tw{overflow-x:auto;border:1px solid var(--rule);border-radius:6px;background:var(--surface);box-shadow:var(--shadow)}
+  table{width:100%;border-collapse:collapse;font-size:14px;min-width:560px}
+  th,td{padding:11px 14px;text-align:left;vertical-align:top;border-bottom:1px solid var(--rule-soft)}
+  thead th{
+    background:var(--surface-2);font-weight:600;font-size:12.5px;color:var(--muted);
+    letter-spacing:.04em;border-bottom:1px solid var(--rule);white-space:nowrap;
+  }
+  tbody tr:last-child td{border-bottom:none}
+  td.n,th.n{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
+  td.goal{color:var(--accent);font-weight:600}
+  td.bad{color:var(--must)}
+
+  /* ---------- callouts ---------- */
+  .note{
+    border:1px solid var(--rule);border-left:3px solid var(--accent);
+    background:var(--surface);border-radius:0 6px 6px 0;padding:16px 20px;margin:0 0 18px;
+  }
+  .note.warn{border-left-color:var(--warn)}
+  .note.stop{border-left-color:var(--must)}
+  .note h4{
+    margin:0 0 6px;font-family:"Noto Serif SC",serif;font-size:15px;font-weight:600;
+  }
+  .note p{font-size:14.5px;color:var(--ink-2);margin-bottom:0}
+  .note p + p{margin-top:10px}
+
+  /* ---------- forbidden ---------- */
+  .nolist{list-style:none;padding:0;max-width:none;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  .nolist li{
+    margin:0;background:var(--must-soft);border:1px solid var(--rule);border-radius:5px;
+    padding:13px 16px;font-size:14px;color:var(--ink-2);display:flex;gap:10px;align-items:flex-start;
+  }
+  .nolist li::before{content:"×";font-family:"IBM Plex Mono",monospace;font-weight:600;color:var(--must);flex:none;line-height:1.7}
+
+  /* ---------- footer ---------- */
+  footer{margin-top:64px;padding-top:24px;border-top:1px solid var(--rule);font-size:13px;color:var(--muted)}
+  footer p{max-width:78ch}
+  a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
+  a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:2px}
+
+  @media (max-width:860px){
+    .figures{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .mechs{grid-template-columns:1fr}
+    .nolist{grid-template-columns:1fr}
+    .req{grid-template-columns:1fr}
+    .rail{
+      flex-direction:row;align-items:center;border-right:none;
+      border-bottom:1px solid var(--rule-soft);padding:12px 18px;
+    }
+    .rbody{padding:18px}
+    .hero{padding-top:44px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <div class="eyebrow">供应商设计需求 · V2.0 · 取代 2026-08-13 V1.0</div>
+    <h1>新版 UMI 夹爪与 Marker Rig 机械设计需求</h1>
+    <p class="lede">
+      我们用 7 路桌面相机测量夹爪的 6DoF 轨迹，作为机器人模仿学习的训练标签，目标是 <b class="num">TCP 位置误差 p95 ≤ 3 mm</b>。
+      这个精度目标已经不再由算法决定，而是由几处具体的机械几何决定。本文把每一条设计要求和它背后的实测数据一并给出，
+      目的是让结构设计能自己判断取舍，而不是照着尺寸表加工。
+    </p>
+    <div class="docmeta">
+      <span><b>版本</b> V2.0</span>
+      <span><b>日期</b> 2026-08-28</span>
+      <span><b>阶段</b> 结构方案评审 / 打样</span>
+      <span><b>对象</b> UMI 采集夹爪 + marker rig + FR3 转接</span>
+    </div>
+
+    <div class="figures">
+      <div class="fig"><div class="v">3<small> mm</small></div><div class="k">TCP 轨迹误差目标（p95）</div></div>
+      <div class="fig hot"><div class="v">9.1<small> mm</small></div><div class="k">当前最大单项误差：一个从未被测量过的安装旋转</div></div>
+      <div class="fig good"><div class="v">102<small> mm</small></div><div class="k">自制原型已验证的杠杆臂（原 241.5 mm）</div></div>
+      <div class="fig hot"><div class="v">47<small> %</small></div><div class="k">高位 cube 造成的最差相机丢帧率</div></div>
+    </div>
+  </header>
+
+  <!-- ============ 1 ============ -->
+  <section>
+    <div class="shead"><div class="snum">01</div><h2>这份文档要解决的问题</h2></div>
+    <p class="sdek">先说清楚我们在做什么，否则后面每一条约束都会显得过分。</p>
+
+    <p>
+      人手持 BOX（夹爪 + 传感器）做演示操作，桌面上 7 台固定相机通过夹爪上的 marker 反解出夹爪的位姿轨迹，
+      这条轨迹被当作训练数据的<strong>动作标签</strong>，随后要在双臂 FR3 机器人上复现。
+      标签错多少，机器人就学错多少，而且下游没有任何环节能把它纠正回来。
+    </p>
+    <p>
+      现在的状态：纯相机侧（把 marker 当作刚体目标）的误差 p95 约 <b class="num">4 mm</b>，
+      距 3 mm 目标不远；但<strong>真正进训练集的那条路径给不出可信数字</strong>，
+      因为从 marker 到夹爪 TCP 的那一段常量既没有被完整测量，装配本身的重复性也从未被测过。
+      这一段是机械件，不是算法，所以它是这次设计的核心。
+    </p>
+
+    <div class="note stop">
+      <h4>为什么必须重出一版，而不是在现有夹爪上改</h4>
+      <p>
+        2026-08-21 同时出现了三件事：一只夹爪的 marker cube <strong>明显晃动</strong>；另一只 cube <strong>安装位置被改变</strong>；
+        中间一个版本把 cube 前移以缩短杠杆臂，结果<strong>前向 marker 被相机本体挡住</strong>。
+        第三件事是最值得记取的：它用 1–3 mm 的 marker 观测损失，换来杠杆臂的一点线性缩短，净亏。
+      </p>
+      <p>
+        结论是：marker 的安装几何不能作为夹爪设计的附属品事后处理，它必须和夹爪本体一起设计、一起冻结。
+        这也是我们在新夹爪到货前<strong>暂停</strong>做拆装重复性测试的原因——在旧装配上测出来的分布不会迁移到新设计上。
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ 2 ============ -->
+  <section>
+    <div class="shead"><div class="snum">02</div><h2>四条会直接决定精度的物理机制</h2></div>
+    <p class="sdek">这一节不含要求，只解释原理。理解这四条以后，第 3–5 节的每一条约束都能自己推出来。</p>
+
+    <div class="mechs">
+
+      <div class="mech">
+        <h3>一 · 杠杆臂把角度误差放大成位置误差</h3>
+        <div class="law">TCP 位置误差 ≈ L × θ</div>
+        <p>
+          marker rig 几何中心到夹爪 TCP 的距离 <b>L</b> 就是杠杆臂。视觉解出的 rig 姿态有一个残余角度误差 θ，
+          它经过这条杠杆变成 TCP 的位置误差，而位置误差才是我们的指标。
+        </p>
+        <p>
+          实测：rig 自身的姿态分歧 p50 <span class="num">0.64°</span> / p95 <span class="num">1.50°</span>。
+          在旧高位 cube 的 <span class="num">241.5 mm</span> 上，这是 TCP 上的 <span class="num">2.69 / 6.32 mm</span>——
+          已经吃掉 3 mm 预算的大半。把 rig 压到 <span class="num">102.3 mm</span> 之后同样的姿态误差只剩 <span class="num">1.20 / 2.59 mm</span>。
+        </p>
+        <p><strong>关键点：姿态精度几乎没变（0.64° → 0.67°），变的只是它被乘以多长的杠杆。这是纯机械收益，算法买不到。</strong></p>
+      </div>
+
+      <div class="mech">
+        <h3>二 · 可见性决定有几台相机在解这一帧</h3>
+        <div class="law">看不到 = 这台相机这一帧不存在</div>
+        <p>
+          marker 必须<strong>四个角点完整落在画面内</strong>才算一次观测。高位 cube 同时触发两种失效：
+          越出视野上缘（cam_09 丢 <span class="num">47.4%</span> 的帧，其中 96% 属于此类），
+          以及被手臂/物体遮挡（cam_06 丢 <span class="num">24.2%</span>，全部属于遮挡）。
+        </p>
+        <p>
+          相机数减少不只是"稍差一点"：解算尾部误差几乎全部来自弱几何帧——只有 2 台相机参与的帧占样本 8%，
+          却占了误差最差 5% 的 <span class="num">38%</span>。
+        </p>
+        <p><strong>低矮分布式布局把最差相机丢帧率降到 14.3%，是同一个设计改动的第二项收益。</strong></p>
+      </div>
+
+      <div class="mech">
+        <h3>三 · 松动是系统性的盲区，不是"噪声大一点"</h3>
+        <div class="law">共模误差 = 所有自动检查同时失明</div>
+        <p>
+          如果 marker 相对夹爪会晃动，我们所有的质量检查都<strong>查不出来</strong>：
+          多相机一致性看不见（7 台相机看的是同一个晃动的 rig，晃动是共模量）；
+          重投影残差也看不见（残差只说明"这些角点自洽"，不说明"它在夹爪上的位置对"）。
+        </p>
+        <p>
+          后果是数据表面全绿而标签是错的。我们已经据此定了一条硬规则：<strong>装配恢复刚性之前采集的数据一律不进训练集</strong>。
+          也就是说，一处松动会作废整批采集，而不是让它精度降一点。
+        </p>
+        <p><strong>所以刚性不是"越硬越好"的目标项，它是一条通过/不通过的门槛。</strong></p>
+      </div>
+
+      <div class="mech">
+        <h3>四 · 常量只有在装配可重复时才有意义</h3>
+        <div class="law">标一次，用很多次 —— 前提是装回去还是那个位置</div>
+        <p>
+          marker 到 TCP 的关系是一个标定出来的常量，标定一次以后长期使用。
+          但只要拆装一次这个常量就变一次，整套标定就失效。
+        </p>
+        <p>
+          实测对照很极端：靠人手扶定位，两次之间差 <span class="num">29.90 mm</span>；
+          靠机械座定位，两次之间差 <span class="num">1.71 / 1.54 mm</span>——<strong>相差 18 倍</strong>。
+          而单次之内两者都稳到 7–11 mm，肉眼完全看不出区别。
+        </p>
+        <p><strong>所以定位必须由机械特征保证（销孔 / 止口 / 台阶），螺钉加目视对齐不构成定位。</strong></p>
+      </div>
+
+      <div class="mech full">
+        <h3>五 · 接口同构会让一整类误差自己相消 —— 这条决定了整体方案</h3>
+        <div class="law">采集器与执行器共用同一套基准 ⇒ 图纸误差在 record → replay 中抵消</div>
+        <p>
+          前四条讲的是怎么把误差做小。这一条不同：它讲的是<strong>怎么让一类误差根本不必被测量</strong>，
+          因此它的价值高于前四条里的任何一条。
+        </p>
+        <p>
+          我们有一段量始终测不到：<b>夹爪安装基准面到真实 TCP</b>（那条 155 mm 的链）。
+          设真值为 <code>G_real</code>、图纸值为 <code>G_model</code>。
+          在<b>标签侧</b>，我们用 <code>G_model</code> 生成标签，于是标签相对真实演示动作偏了一个量 E。
+          在<b>机器人侧</b>，控制器同样用 <code>G_model</code> 计算它的 TCP，于是它把自己朝<b>相反方向</b>偏了同样的 E。
+        </p>
+        <p>
+          <strong>两者精确抵消，机器人的真实 TCP 落回真实演示动作上——而且 <code>G_model</code> 根本不出现在结果里，
+          也就是说图纸准不准都无所谓。</strong>
+          成立的唯一条件是：两台设备的夹爪相对各自安装基准的真实关系<b>一样</b>，即 <code>G_real' = G_real</code>。
+        </p>
+        <p>
+          <strong>但必须区分哪一段会抵消：</strong>会抵消的是「安装面 → TCP」这一段，因为标签侧与机器人侧<b>都</b>在用它。
+          而「rig → 安装面」那一段<b>只出现在标签侧</b>——机器人根本没有 rig 参与，没有东西跟它抵消，
+          所以那一段必须真的被测出来。这正是 M6 存在的理由。
+        </p>
+        <p>
+          这条推论会改变要求的优先级：<strong>件间一致性比绝对精度更重要</strong>。
+          对贵司而言这通常是好消息——同图纸、同工装、同一次装夹能保证的一致性，
+          往往比同等水平的绝对精度便宜得多。绝对公差仍然要（见 M7），但它服务的是另一件事：
+          用激光跟踪仪做外部认证时误差不抵消，那时才需要绝对值。
+        </p>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============ 3 ============ -->
+  <section>
+    <div class="shead"><div class="snum">03</div><h2>新设计需要同时支持的四件事</h2></div>
+    <p class="sdek">这一版夹爪不只是"装 marker 的载体"，它还要能被标定、被验证、被独立测量。四件事必须在同一个结构上成立。</p>
+
+    <div class="tw">
+      <table>
+        <thead>
+          <tr><th style="width:16%">用途</th><th style="width:42%">它要求什么结构特征</th><th>为什么现在没有它就卡住</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>A · 日常采集</b></td>
+            <td>低矮、刚性、分布在左 / 右 / 上三个方向的 marker 安装面，固定在夹爪的非运动刚体上</td>
+            <td>决定杠杆臂 L 与可见性——机制一与机制二</td>
+          </tr>
+          <tr>
+            <td><b>B · 平移标定</b></td>
+            <td>一个<b>球窝</b>特征，其球心在 CAD 中相对 TCP 的位置已知</td>
+            <td>marker→TCP 的平移量靠"球窝坐在固定钢球上、绕球心扫姿态"标出来。没有球窝就没有平移标定</td>
+          </tr>
+          <tr>
+            <td><b>C · 旋转标定</b></td>
+            <td>执行器上一套<b>与采集器同构的可拆 marker rig</b>；rig 安装基准两边同图、同公差</td>
+            <td>旋转常量在人手持状态下<b>结构性不可测</b>，必须借机器人的正运动学做 hand-eye。
+                执行器本来就在法兰上，是最省的一条路。见 §4-M6</td>
+          </tr>
+          <tr>
+            <td><b>D · 独立验收</b></td>
+            <td>靠近 TCP 的 <b>SMR 磁性窝</b>；FR3 侧另预留 6D 靶安装面</td>
+            <td>3 mm 这个指标目前<b>无法被认证</b>——没有独立参考。激光跟踪仪采购在推进，接口必须现在进设计</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note warn" style="margin-top:18px">
+      <h4>B 与 C 是两个独立的量，不能互相替代</h4>
+      <p>
+        球窝是一个 3 自由度球副：rig 绕球心任意旋转都不改变观测方程，<strong>旋转整个落在观测的零空间里</strong>。
+        这不是数据量问题，再多帧、再好的相机都测不到。我们算过用多球窝治具补救的方案：
+        要达到 0.22° 的目标，球窝间距需要 <span class="num">517 mm</span>（乐观）到 <span class="num">1.5 m</span>（现实），
+        且三个球窝必须非共线、精度由最短边决定——一个三向都 ≥200 mm 的治具要夹在 45 mm 的指间还能绕球心大角度扫动，机械上不现实。
+      </p>
+      <p>因此：<strong>平移走球窝（B），旋转走 FR3 hand-eye（C）</strong>，两条路都要有对应的机械接口。</p>
+    </div>
+
+    <h3 style="font-size:19px;margin:34px 0 6px">三种构型分别带什么</h3>
+    <p class="sdek">
+      需要明确区分：marker rig 只在采集侧是必需的。下表说明每种构型的组成，避免把标定工装当成量产件、
+      或者把 rig 当成执行器的标配。
+    </p>
+    <div class="tw">
+      <table>
+        <thead>
+          <tr><th style="width:20%">构型</th><th style="width:34%">组成</th><th style="width:14%">marker rig</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>① 采集夹爪</b><br><span class="sdek" style="font-size:13px">人手持，量产件</span></td>
+            <td>BOX 本体 + 夹爪 + marker rig</td>
+            <td class="goal">必须</td>
+            <td>相机通过 rig 反解轨迹，这是 rig 存在的全部理由。M1–M8 主要针对这一构型</td>
+          </tr>
+          <tr>
+            <td><b>② 标定构型</b><br><span class="sdek" style="font-size:13px">临时，仅标定时</span></td>
+            <td>① <b>整机原样</b>（首选方案）→ FR3 法兰；或 ① 卸下夹爪换上转接板（退路方案）</td>
+            <td class="goal">必须</td>
+            <td>用的就是①那台设备，不另做。首选方案<b>什么都不拆</b>，构型与录制完全一致；
+                退路方案的转接板<b>占的正是夹爪自己的安装面</b>，与夹爪只能二选一——见 M6</td>
+          </tr>
+          <tr>
+            <td><b>③ 部署执行器</b><br><span class="sdek" style="font-size:13px">装在 FR3 上复现轨迹</span></td>
+            <td>FR3 法兰 + 夹爪 + <b>可拆的同构 marker rig</b></td>
+            <td class="goal">必须</td>
+            <td>出标签不需要它——TCP 由正运动学给出。但它是 <b>M6 的首选标定路径</b>：
+                执行器本来就在法兰上，装上同构 rig 就能原位做 hand-eye，不需要任何转接件。
+                顺带免费得到 world↔base 配准与 FK 的逐帧检查。做成<b>可拆</b>：标定/QC 时装上，作业时可卸下。
+                另需 tracker 靶接口（T3）</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note">
+      <h4>"同构"指的是接口与基准同构，不是整机同构</h4>
+      <p>
+        执行器<strong>不需要</strong>复制采集器的相机、IMU、触觉等电气部分——那些只服务于采集。
+        需要同构的只有四组机械特征：<strong>同一款夹爪、同一夹爪安装基准、同一 rig 安装基准、同一 FR3 法兰基准</strong>。
+        这四组一致，机制五的抵消就成立；BOM 差多少都不影响。
+      </p>
+      <p>
+        反过来说，这四组里任何一组在两种设备上"差不多但不一样"，抵消就失效，
+        而且失效的方式是<strong>安静的</strong>——数据看起来完全正常，只是机器人复现的动作系统性偏一点。
+        所以这四组基准必须在图纸上被显式声明为同一组，而不是各自标注后"看起来一样"。
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ 4 ============ -->
+  <section>
+    <div class="shead"><div class="snum">04</div><h2>硬性约束（必须满足）</h2></div>
+    <p class="sdek">以下每条都附了它的实测依据。若结构上确实无法满足，请提出替代方案与原因，不要静默放宽。</p>
+
+    <article class="req">
+      <div class="rail"><span class="rid">M1</span><span class="chip must">必须</span></div>
+      <div class="rbody">
+        <h3>所有 marker 属于同一个非运动刚体</h3>
+        <p>
+          marker 不必组成物理立方体，可以分布在不同的面上——我们的算法只要求所有可见角点属于同一刚体，
+          且在统一坐标系下有已标定的 3D 坐标。但这个刚体必须是<strong>不随夹爪开合运动的固定结构</strong>。
+        </p>
+        <p>
+          不得安装在随开合运动的手指、软壳、薄片或任何受力变形件上；marker 载体本身不得参与夹持、接触或受力路径。
+        </p>
+        <p>
+          <strong>并且：rig 的结构根部必须落在 BOX 本体一侧，也就是"卸下夹爪"这条分割线的上方。</strong>
+          原因见 M6——旋转标定要把夹爪卸下来，如果 rig 挂在夹爪上，夹爪一卸 rig 就跟着走了，整个标定方案不成立。
+          这一条与 M2 的短杠杆臂目标存在张力，处理办法见下方。
+        </p>
+        <p class="basis"><b>依据</b>
+          见机制三。一旦松动，多相机一致性与重投影残差<b>同时失明</b>，错误标签不会被任何自动检查拦下，
+          而对应的处置是整批数据作废。2026-08-21 已经发生过一次。
+        </p>
+      </div>
+    </article>
+
+    <div class="note warn">
+      <h4>M1 与 M2 会打架，请按下面的方式解</h4>
+      <p>
+        几何事实：<strong>TCP 位于夹爪基座安装面沿夹爪轴向 <span class="num">155 mm</span> 处</strong>
+        （我方 URDF 中 <code>link_lt_gripper_base → link_lt_gripper_tcp</code>）。
+        所以如果 rig 的几何中心停在 BOX 的夹爪安装面附近，杠杆臂 L 至少是 155 mm —— 已经顶到 M2 的硬上限。
+      </p>
+      <p>
+        解法：<strong>rig 的结构根部固定在 BOX 一侧，支臂向下延伸到夹爪本体两侧</strong>，
+        把 marker 的几何中心拉到接触点附近。这样卸夹爪时 rig 原封不动留在 BOX 上，而 L 仍能做到 ≤100 mm。
+        我方 2026-08-18 的自制原型正是这个形态：五条支臂，marker 中心到接触点 <span class="num">103–153 mm</span>，
+        合成杠杆臂 <span class="num">102.3 mm</span>。
+      </p>
+      <p>
+        支臂向下延伸必然增加与工件、桌面的碰撞风险，这是已知要付的代价。
+        <strong>请在结构方案里把这个取舍显式做出来</strong>：支臂包络、离指尖的最小距离、
+        以及最坏姿态下支臂会不会先于手指碰到工件。
+      </p>
+    </div>
+
+    <article class="req">
+      <div class="rail"><span class="rid">M2</span><span class="chip must">必须</span></div>
+      <div class="rbody">
+        <h3>杠杆臂 L ≤ 100 mm，硬上限 150 mm；marker 不得高于夹爪本体轮廓</h3>
+        <p>
+          L 定义为 marker rig 几何中心到夹爪 TCP（闭合状态）的距离。自制原型已经做到 <span class="num">102.3 mm</span> 并验证有效，
+          说明这个量级是可实现的，不是理论值。
+        </p>
+        <p class="basis"><b>依据</b>
+          旧高位 cube L = <span class="num">241.5 mm</span>，姿态误差折算到 TCP 为 p50 <span class="num">2.69</span> / p95 <span class="num">6.32 mm</span>；
+          压到 102.3 mm 后为 <span class="num">1.20 / 2.59 mm</span>。同时最差相机丢帧率 47.4% → 14.3%。
+          "立高"的代价是两项叠加，不只是碰撞风险。
+        </p>
+      </div>
+    </article>
+
+    <article class="req">
+      <div class="rail"><span class="rid">M3</span><span class="chip must">必须</span></div>
+      <div class="rbody">
+        <h3>任一工作姿态下，每个相机方向至少 2 个非共面 marker 完整可见</h3>
+        <p>
+          布置面至少覆盖左 / 右 / 上三个方向，相邻安装面法线夹角建议 60–90°；
+          至少 3 个 marker 的法线线性无关，使单相机单帧也能约束全部 6 个自由度。
+        </p>
+        <p>
+          判据不是"多贴几个 marker"，而是<strong>对每一个相机位姿，都有 ≥2 个 marker 入射角 &lt;60° 且四角完整在画面内</strong>。
+          这一条必须在 CAD 阶段用我方提供的相机外参直接验算，不能装完再看。
+        </p>
+        <p class="basis"><b>依据</b>
+          三组独立实测都指向同一条：① 单个平面 marker 在 35–50° 入射角下 PnP 位姿二义性开始翻转，产生 &gt;100 mm 的整帧错误，发生率 <span class="num">4.88%</span>；
+          ② 能同时看到 ≥2 个 marker 的四台相机，各自独立解出的杠杆臂最大只差 <span class="num">1.69 mm</span>，
+          只看到 1 个 marker 的两台偏出 <span class="num">3–4.5 mm</span>——而且它们自己的重投影残差反而最小（0.13 / 0.22 px），完全骗人；
+          ③ 只被约 1.9 台相机看见的两个 marker，在几何重建里偏出 <span class="num">0.82 / 1.40 mm</span>，
+          而可见性好的三个对上 CAD 到 <span class="num">0.05–0.28 mm</span>。
+        </p>
+      </div>
+    </article>
+
+    <article class="req">
+      <div class="rail"><span class="rid">M4</span><span class="chip must">必须</span></div>
+      <div class="rbody">
+        <h3>装配定位由机械特征保证，并支持反复拆装</h3>
+        <p>
+          需要销孔、止口、台阶或沉头定位面等真实定位基准，并带防装反特征（非对称孔位、定位销、缺角或键槽）。
+          螺钉 + 目视贴合不算定位。carrier 应能在不拆解夹爪核心机构的前提下装拆，紧固件需防松。
+        </p>
+        <p>
+          验收方式：同一 carrier <strong>拆装重装 5 次</strong>，我方每次重跑一遍完整标定，看这 5 次结果的分散度。
+        </p>
+        <p class="basis"><b>依据</b>
+          手扶定位 vs 机械座定位实测差 <span class="num">18×</span>（29.90 mm vs 1.71/1.54 mm），而单次之内两者都稳、肉眼无法区分。
+          另：我方标定的不确定度将<b>取这 5 次的实测分散度</b>，而不是取标定算法自己的拟合残差——
+          我们刚在"模型自评"上吃过一次亏（一份自评分数更好的相机标定恰恰是错的那份）。
+        </p>
+      </div>
+    </article>
+
+    <article class="req">
+      <div class="rail"><span class="rid">M5</span><span class="chip must">必须</span></div>
+      <div class="rbody">
+        <h3>保留一个可标定的球窝基准，且其球心在 CAD 中精确给出</h3>
+        <p>
+          marker→TCP 的平移量靠定点 pivot 标定得到：rig 上的球窝坐在桌面固定钢球上，操作者绕球心扫掠姿态。
+          现用配合是球窝 R <span class="num">12.68 mm</span> 对 25 mm 钢球。请给出球窝的球径、配合间隙、球面加工方式与材料。
+        </p>
+        <p>
+          <strong>建议把 CAD 原点定在球窝球心。</strong>这样标定的正确答案就是 [0,0,0]，
+          我们不需要任何对齐就能直接读出整条链路的总误差——这是上一版原型能做出可信验收的关键。
+        </p>
+        <p class="basis"><b>依据</b>
+          配合间隙不是无害项：球心落在窝里的哪一点由受力方向决定，而受力方向随 rig 姿态改变，
+          于是产生一个<b>姿态相关</b>的位移。这类位移正好落在标定方程的零空间里，
+          残差 / holdout / 逐段锚点三道检查<b>全部失效</b>。现有 0.18 mm 单边间隙估算最多贡献 <span class="num">0.44 mm</span> 且不可见，
+          是当前残余 0.9 mm 误差的主要嫌疑之一。间隙越小越好。
+        </p>
+      </div>
+    </article>
+
+    <article class="req">
+      <div class="rail"><span class="rid">M6</span><span class="chip confirm">必须 · 需确认</span></div>
+      <div class="rbody">
+        <h3>执行器带一套与采集器同构的 marker rig，hand-eye 在机器人上原位完成</h3>
+        <p>
+          这是本次需求中<strong>最重要也最需要贵司判断</strong>的一条。我们要测的是
+          <code>A = rig → 夹爪安装基准面</code> 这段安装角度，办法是让机器人正运动学提供 TCP 姿态、
+          多相机提供 rig 姿态，两者相比。
+        </p>
+        <p>
+          <strong>第一层 · 首选：在执行器上做一套与采集器同构的 marker rig。</strong>
+          执行器本来就装在 FR3 法兰上，所以这条路<strong>不需要任何转接件、不需要拆任何东西、也不需要动采集器</strong>，
+          标定在机器人上原位完成。这套 rig 建议做成可拆：标定与 QC 时装上，作业时可卸下。
+          <b>前提是它与采集器共用同一组 rig 安装基准</b>（见 M7）。
+        </p>
+        <div class="basis" style="margin:14px 0">
+          <b>但这一层有一个必须写明的限制</b>
+          机制五那个"自动抵消"<strong>只对「安装面 → TCP」成立，对本项这个 A 不成立</strong>——
+          A 只出现在标签侧，机器人那边没有 rig 参与，没有东西跟它抵消。
+          所以把执行器上测到的 A 用到采集器上，<strong>依赖 rig 安装基准的件间一致性</strong>：
+          在 102 mm 杠杆上，0.1° = <span class="num">0.18 mm</span>，0.2° = <span class="num">0.36 mm</span>，
+          0.5° = <span class="num">0.89 mm</span>。因此这条一致性要求是 <strong>≤0.1°</strong>，
+          且它<b>无法被 hand-eye 自身验证</b>（只测了执行器那一台）。
+        </div>
+        <p>
+          <strong>第二层 · 建议同时做：在采集器本体上也留一个 FR3 法兰安装基准</strong>
+          （尾部一个基准平面 + 定位止口 + 法兰孔位）。它平时不用，但可以让每台采集器<strong>自己测一次 A</strong>，
+          于是上面那条一致性从"假设"变成"测量"，两者一比就直接得到件间差异的实测值。
+          如果代价不大，强烈建议做——这是目前唯一能验证同构是否真的成立的手段。
+        </p>
+        <p>
+          <strong>第三层 · 退路（仅在前两层都做不到时）：</strong>
+          把夹爪从本体上卸下，用夹爪原本那个安装面当转接面，做一块机加转接板——
+          一侧复刻该安装面、另一侧是 FR3 法兰孔位。这块板<strong>占的正是夹爪自己的安装面</strong>，
+          与夹爪只能二选一，标定与录制之间必须换装，于是"夹爪重装重复性"变成一个新的、必须测量的误差项。
+          它必须机加、不能 3D 打印（本项要买的就是把 2.0° 压到 0.05°–0.1°，打印件守不住这个量级），1–2 件即可。
+          这个方案是从"改造现有硬件"的约束里来的——当时只能复用一个变换已知的面；<strong>对全新设计这个约束不存在。</strong>
+        </p>
+        <p><strong>需要贵司确认：执行器能否带一套与采集器同构的可拆 rig？rig 安装基准的件间一致性能做到多少？采集器本体上留一个法兰基准的代价有多大？</strong></p>
+        <p class="basis"><b>依据</b>
+          现役标定包里记录的安装旋转不确定度 <span class="num">2.0°</span> <b>是一个声明值，不是测量值</b>
+          （出处写着"从 24 个轴对齐候选里按物理合理性挑了一个"，另一只夹爪是从第一只继承的，两条都不含任何直接观测）。
+          按现役杠杆臂 <span class="num">259.5 mm</span> 折算即 <span class="num">9.1 mm</span>——3 mm 预算的三倍，
+          是目前误差账本上<b>最大的单项</b>。而 2.0° → 0.05° 是 20 倍以上的改善，且误差从此有出处。
+        </p>
+      </div>
+    </article>
+
+    <div class="note stop">
+      <h4>这个方案剩下的那一段：安装面 → TCP 仍然是 CAD，不是测量</h4>
+      <p>
+        必须如实写清楚链路的两半：
+        <code>rig →〔hand-eye 实测〕→ 夹爪安装基准面 →〔URDF / CAD，未测〕→ 真实 TCP</code>。
+        hand-eye 精确给出前半段，后半段仍然来自图纸——<strong>夹爪装着标也一样</strong>，
+        因为 hand-eye 观测的是法兰与 rig 的相对运动，夹爪在不在场都不会让"安装面到 TCP"变成被观测量。
+      </p>
+      <p>
+        所以这个方案的实际收益是<strong>把未测量的对象换小</strong>：
+        从"整个 rig→TCP 旋转（<span class="num">2.0°</span>，出处是从 24 个候选里挑的一个，无人对它负责）"，
+        换成"夹爪自身几何相对它自己的安装基准"——后者由贵司加工控制，可以给出公差。
+        在 <span class="num">155 mm</span> 杠杆上折算：0.1° = <span class="num">0.27 mm</span>，
+        0.2° = <span class="num">0.54 mm</span>，0.5° = <span class="num">1.35 mm</span>，
+        对照现值 2.0° 在 259.5 mm 上的 9.1 mm。
+      </p>
+      <p>
+        我方会用三件事把这一段收掉：① 向贵司要 TCP 相对安装基准面的公差（见 M7 与第 9 节）；
+        ② 用 pivot 做交叉检验——pivot 是<strong>用真夹爪、真指腹夹住球窝治具</strong>测出来的，
+        它给出的 rig→接触中心平移<strong>独立于 URDF</strong>，可以直接检验图纸对不对；
+        ③ 把"夹爪拆装重复性"补进采集协议（见第 6 节）——既然流程里要卸夹爪，这一项就不能不测。
+      </p>
+    </div>
+
+    <article class="req">
+      <div class="rail"><span class="rid">M7</span><span class="chip must">必须</span></div>
+      <div class="rbody">
+        <h3>rig、夹爪、法兰三组基准做在同一零件上，并给出公差与件间一致性</h3>
+        <p>
+          这是上面那段残差的<strong>结构性解法</strong>，比事后标定便宜得多：
+          让 marker rig 的定位特征、夹爪安装基准面与 FR3 法兰基准面成为<strong>同一个刚性零件上的三组特征，尽量一次装夹加工完成</strong>。
+          这样"rig 在哪"与"夹爪在哪"之间的关系是一条有公差的机加尺寸，
+          而不是若干个装配接口叠出来的未知量。
+        </p>
+        <p>请随件给出：</p>
+        <ul>
+          <li><strong>件间一致性：同批次不同单元之间，夹爪 TCP 相对安装基准面的差异</strong>——
+              按机制五，这是比绝对精度<strong>更重要</strong>的一个数，因为 record → replay 抵消的成立条件是
+              采集器与执行器"一样"，不是"准"；</li>
+          <li>夹爪 TCP（闭合状态）相对夹爪安装基准面的<strong>位置度与角度公差</strong>（绝对值，用于外部 GT 认证）；</li>
+          <li>该基准面的平面度与孔位度；</li>
+          <li>夹爪<strong>重复拆装</strong>的重复性（因为标定流程里要卸下再装回）；</li>
+          <li><strong>夹爪安装接口必须带定位销</strong>，不得只靠螺钉过孔定位——过孔间隙会让每次重装落在不同位置，
+              而这个位移经 155 mm 杠杆直接进 TCP；</li>
+          <li>rig 定位特征与该基准面之间的位置/角度公差，以及是否同一次装夹加工。</li>
+        </ul>
+        <p class="basis"><b>依据</b>
+          这四个数会<b>直接</b>成为误差预算里"安装面 → TCP"那一段的数值。
+          目前这一段在我方账本上是空的，只能按最坏情况留余量。
+          <b>给出一个 0.2° 的实测公差，比给出一句"符合图纸"有用得多</b>——
+          前者能让我们把这一项关掉，后者只能让我们继续按 1° 计。
+          而件间一致性那一条更关键：按机制五，只要采集器与执行器的这段几何一致，
+          图纸误差在 record → replay 里自动抵消；<b>一致性做得好，可以放宽绝对精度要求</b>。
+        </p>
+      </div>
+    </article>
+
+    <div class="note warn">
+      <h4>关于"夹层式常驻转接板"这个替代方案</h4>
+      <p>
+        转接板与夹爪抢的是同一个安装面，所以标定与录制之间必须换装。
+        一个自然的替代想法是把转接板做成<strong>常驻夹层</strong>：BOX 面 → 转接板（永久安装）→ 夹爪装在板的外侧，
+        法兰孔位另做在板上，录制时那个面空着不用。<strong>我方评估过，不作为默认方案，但贵司可以提出</strong>——
+        提出时请一并回答下面三笔代价。
+      </p>
+      <p>
+        它买到的：夹爪永不拆卸，本页"夹爪拆装重复性"一项消失；pivot 测到的真实接触点常量长期有效；
+        标定构型与录制构型完全一致。
+      </p>
+      <p>
+        它要付的：① <strong>杠杆臂增加一个板厚</strong>，与 M2 直接冲突，而 M2 是目前唯一被实测证明有效的精度杠杆；
+        ② 同轴的法兰面被夹爪占了，只能侧面出耳或另开孔圈，这个结构在录制时一直挂着——增加质量与包络，
+        并可能遮挡 marker（2026-08-21 的中间版本正是这样翻的车）；
+        ③ URDF 多一段，板厚成为新的 CAD 输入。
+      </p>
+      <p>
+        <strong>我方倾向：维持换装方案 + 定位销。</strong>一对定位销就能买到夹层方案想买的重装重复性，
+        而且不用付上面三笔。另外"夹爪拆装重复性"在换装方案下是<b>可测的</b>——做 5 次就有数进预算；
+        消掉一个本来就能测的误差，价值没有看上去那么大。
+      </p>
+      <p>
+        最后说明：<strong>两种方案对"安装面 → TCP 是 CAD"这段残差没有区别</strong>。
+        hand-eye 无论哪种接法都不观测 TCP，夹爪在不在场都一样；夹层方案消掉的只是"夹爪重装"那一半。
+      </p>
+    </div>
+
+    <article class="req">
+      <div class="rail"><span class="rid">M8</span><span class="chip must">必须</span></div>
+      <div class="rbody">
+        <h3>marker 安装面为平整刚性基材，贴附厚度需给出</h3>
+        <p>
+          marker 下方必须是平整刚性基材，避免纸张翘边、胶层不均、薄壁变形。
+          表面哑光低反光，marker 周边避免高亮金属反光边。请给出推荐材料、表面处理与贴附工艺，
+          并<strong>明确 CAD 中标注的是贴标面还是 marker 成像平面</strong>，以及两者之间的厚度。
+        </p>
+        <p class="basis"><b>依据</b>
+          这不是形式要求：我们的视觉重建<b>能测出一张贴纸的厚度</b>。
+          实测贴纸厚 <span class="num">0.75 mm</span>，扫描拟合给出 <span class="num">0.82 mm</span>，两者差 0.07 mm。
+          也就是说亚毫米级的贴附偏差会进入我们的几何模型；说清楚比做到更重要。
+        </p>
+      </div>
+    </article>
+
+    <article class="req">
+      <div class="rail"><span class="rid">M9</span><span class="chip must">必须</span></div>
+      <div class="rbody">
+        <h3>marker 的 ID、字典、尺寸、所在面、朝向唯一可追溯</h3>
+        <p>
+          每台设备使用<strong>独立的 layout 记录</strong>（按设备编号索引，不按左右手），避免任何镜像假设。
+          所有 marker 请使用<strong>同一尺寸的贴纸</strong>。交付 marker layout 表格与装配照片。
+        </p>
+        <p class="basis"><b>依据</b>
+          同尺寸贴纸是一把免费的绝对标尺：我们从图像里量出的每个 marker 边长偏差，
+          就是该 marker 局部重建误差的绝对读数（实测 ±0.5%，两次采集复现到 0.02–0.17 mm，属系统项）。
+          尺寸不一致就损失了这个交叉校验。
+        </p>
+      </div>
+    </article>
+
+    <article class="req">
+      <div class="rail"><span class="rid">M10</span><span class="chip must">必须</span></div>
+      <div class="rbody">
+        <h3>TCP 固定在夹爪本体坐标系里，不随开度移动</h3>
+        <p>
+          新版本请把 TCP 定义成<strong>夹爪本体上的一个固定点</strong>——参照 Franka Hand / Pika gripper 的做法：
+          TCP 相对安装基准面的位置由结构决定，<strong>开合手指不改变它</strong>。
+          开度 <code>d</code> 仍然作为一个独立的自由度上报，但它<strong>不得出现在 TCP 的位姿里</strong>。
+          若结构上必须让接触点随开合移动，请把两者<strong>分成两个量</strong>：
+          一个固定的 <code>tcp</code>（我们用它做标签与标定）、一个随 <code>d</code> 变化的 <code>contact_point</code>（我们只在分析里用）。
+        </p>
+        <p class="basis"><b>依据</b>
+          现役夹爪的 TCP 是随开度后退的，用的是贵司给的解析式
+          <code>z = R − √(R² − A·d − d²/4)</code>（<span class="num">R = 49.8361</span>、<span class="num">A = 4.0456</span> mm，<code>d</code> 为真实指尖距）。
+          这条曲线不是小量：闭合到 70 mm 开度，TCP 沿手指轴后退 <span class="num">18.6 mm</span>；到公式定义域上限 91.9 mm 时后退 <span class="num">49.8 mm</span>。
+          它造成三个我们无法在软件里消化的后果——
+          <b>① 它把「marker → TCP 常量」变成了不是常量。</b>整条测量链的前提是 marker rig 与 TCP 同属一个刚体（机制三、M1），
+          TCP 一旦随 <code>d</code> 移动，这段变换就标不出来，误差预算里最大的一项（<span class="num">9.1 mm</span> 的安装旋转）也就没有可收敛的对象。
+          <b>② 它把开度传感器塞进了标签的误差链。</b>灵敏度 <code>dz/dd</code> 随开度急剧上升：35 mm 处 0.24、70 mm 处 0.63、85 mm 处 <span class="num">1.27</span>、89 mm 处已超过 2.0 mm/mm。
+          而开度通道本身只准到约 ±1 mm（硅胶指腹每侧压缩约 0.5 mm，这是物理下限），且在 89.8 mm 处实测系统性多报 <span class="num">+3.3 mm</span>——
+          若不校正，仅这一项在高开度端就折算成 <span class="num">6 mm 以上</span>的标签误差，而我们的总目标是 <span class="num">3 mm</span>。
+          我方目前靠一张实测折点表把它修回来，<b>但「必须维护一张折点表才能得到正确标签」本身就是这个 TCP 定义的代价</b>——
+          它把一个机械常量换成了一条需要长期标定、且会随指腹磨损漂移的曲线。
+          <b>③ 它让机制五的误差相消失效。</b>若执行器侧用的是 TCP 固定的夹爪，而采集器侧的 TCP 随 <code>d</code> 移动，
+          两侧的差不是一个静态变换，而是一条随开度变化的曲线，<strong>无法用任何常量补偿</strong>；
+          训练数据里还会出现一种物理上不存在的耦合：「张开手」被记成「末端后退了 18 mm」。
+          <b>补充一条工程上的信号：</b>该公式在 <span class="num">91.9089 mm</span> 处根号归零、导数发散，而开度流的原始读数在真实开度约 89 mm 时就会越过这个上限——
+          一个在正常工作行程内就会出现奇点的 TCP 定义，本身说明它不适合当标签口径。
+        </p>
+      </div>
+    </article>
+  </section>
+
+  <!-- ============ 5 ============ -->
+  <section>
+    <div class="shead"><div class="snum">05</div><h2>目标指标（可讨论，但请给出实际能力）</h2></div>
+    <p class="sdek">这些是希望达到的数值。若结构上有冲突，请告诉我们能达到什么，我们据此调整误差预算。</p>
+
+    <article class="req">
+      <div class="rail"><span class="rid">T1</span><span class="chip target">目标</span></div>
+      <div class="rbody">
+        <h3>marker 尺寸维持 56–61 mm，不必增大</h3>
+        <p>
+          下限由检测决定：<code>尺寸 ≥ 50 × 最远工作距离 / f</code>，我们的 f ≈ 1000 px。
+          1.2 m 工作距离对应 ≥60 mm，0.95 m 对应 ≥48 mm。实际工作距离 p05/p50/p95 = 0.45 / 0.67 / 0.94 m。
+        </p>
+        <p class="basis"><b>依据</b>
+          实测：在 0.45–0.95 m 内，定位分歧稳定在 4–5 mm、姿态 0.5–0.9°，<b>与 marker 视在尺寸、入射角都不相关</b>
+          （视在尺寸更大的一组甚至略差）。
+          所以<b>不要用 marker 尺寸买精度</b>——尺寸只需守住检测下限，省下的空间全部用来压低高度、增加可见面数。
+        </p>
+      </div>
+    </article>
+
+    <article class="req">
+      <div class="rail"><span class="rid">T2</span><span class="chip target">目标</span></div>
+      <div class="rbody">
+        <h3>marker 法线分布按"入射角 &lt;60°"设计，而不是按外形对称</h3>
+        <p>实测的检出率随入射角衰减曲线（我方数据，可作为设计输入）：</p>
+        <div class="tw" style="margin:12px 0 0">
+          <table style="min-width:420px">
+            <thead><tr><th>入射角</th><th class="n">检出率</th><th>可用性</th></tr></thead>
+            <tbody>
+              <tr><td>0–40°</td><td class="n">92–98%</td><td>正常工作区</td></tr>
+              <tr><td>40–60°</td><td class="n">可用</td><td>设计判据的边界</td></tr>
+              <tr><td>75–80°</td><td class="n">&lt;50%</td><td>不可依赖</td></tr>
+              <tr><td>&gt;80°</td><td class="n">≈0</td><td>视为不可见</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </article>
+
+    <article class="req">
+      <div class="rail"><span class="rid">T3</span><span class="chip target">目标</span></div>
+      <div class="rbody">
+        <h3>SMR 磁性窝尽量靠近 TCP；FR3 侧预留 6D 靶安装面</h3>
+        <p>
+          我们正在采购激光跟踪仪作为独立参考。SMR 窝装在 TCP 附近即可认证"3 mm 位置"这一项本身。
+          6D 靶（约 9×9×20 cm / 1400 g）只可能装在 FR3 一侧——它占 FR3 额定负载的 47%，
+          手持采集侧挂上去会改变演示动力学，不可接受。请在 CAD 中给出 SMR 窝球心相对 TCP 的位置。
+        </p>
+        <p class="basis"><b>依据</b>
+          目前"3 mm"这个指标<b>无法被验收</b>，只能被证伪：所有内部检查都绕着同一套相机标定做，
+          共模误差（全场尺度、坐标系整体偏置）对每一个数字都不可见。独立参考是唯一出路，而它有较长的采购前置期。
+        </p>
+      </div>
+    </article>
+
+    <article class="req">
+      <div class="rail"><span class="rid">T4</span><span class="chip confirm">需确认</span></div>
+      <div class="rbody">
+        <h3>明确 TCP 定义、开度定义与开度→TCP 的解析式</h3>
+        <p>请在新版本中明确回答（<b>其中第三条已由 M10 定为硬性要求，此处只需确认</b>）：</p>
+        <ul>
+          <li>TCP 原点与 XYZ 方向的定义（相对哪个基准面）；</li>
+          <li>开度 <code>d</code> 是否为<strong>真实两指尖距离</strong>；若不是，转换关系是什么；</li>
+          <li><strong>确认 TCP 不随开度移动</strong>（M10）；若结构上做不到，请给出解析式、适用范围与定义域上限，我们会按上限反算它在误差预算里占多少；</li>
+          <li>贵司定义的 TCP 与指腹接触中心之间的关系——<b>这两者请分别命名、分别给值</b>，不要合成一个随开度变化的量。</li>
+        </ul>
+        <p class="basis"><b>依据</b>
+          现役链路已经在用贵司给的解析公式，并且已经发现：<b>贵司 TCP 与指腹中心恒差 <span class="num">15.49 mm</span></b>。
+          用错口径会让整条常量沿手指轴整体偏 15.5 mm。这条已经踩过一次，希望新版本在文档里直接写死。
+          另：现有开度数据在 80 mm 附近缺样本、40.1 mm 处有一个离群点，新版本若能给出标称曲线会有帮助。
+        </p>
+      </div>
+    </article>
+  </section>
+
+  <!-- ============ 6 ============ -->
+  <section>
+    <div class="shead"><div class="snum">06</div><h2>验收协议：我方会怎么测</h2></div>
+    <p class="sdek">提前公开判据，避免打样后对"合格"的理解不一致。全部为无参考或有绝对真值的判据，不依赖主观评价。</p>
+
+    <div class="tw">
+      <table>
+        <thead>
+          <tr><th style="width:20%">采集组</th><th style="width:26%">目的</th><th>主要判据</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>静止 300–1000 帧</td><td>机械微动、检测噪声</td><td>TCP 抖动、相机间一致性、重投影残差</td></tr>
+          <tr><td>慢速 6DoF 摆动</td><td>姿态与视角覆盖</td><td>可见相机数、可见角点数、姿态连续性、无整帧跳变</td></tr>
+          <tr><td>典型操作遮挡</td><td>真实任务中是否被物体/手挡住</td><td>有效轨迹覆盖率、低质量帧比例、最差姿态区间</td></tr>
+          <tr><td><b>拆装重装 5 次</b></td><td>装配重复性（M4）</td><td>平移 / 旋转的 p50、p95、max —— <b>不确定度取自这一组的分散度</b></td></tr>
+          <tr><td>轻载 / 三向接触</td><td>carrier 与夹爪的柔顺性</td><td>接触前后位姿残差、回零残差、方向相关偏置</td></tr>
+          <tr><td><b>夹爪拆装 5 次</b><br><span class="sdek" style="font-size:13px">仅 M6 退路方案需要</span></td><td>退路方案的标定流程要卸夹爪，这一项因此必须测</td><td>每次重装后重测 pivot，看 rig→接触中心平移的分散度。<b>走 M6 首选方案则本组不需要</b>——夹爪根本不拆</td></tr>
+          <tr><td><b>FR3 hand-eye</b></td><td>安装旋转（M6）</td><td>同一装配下 ≥50 个姿态、至少两个不平行的旋转轴；与拆装重装<b>同场完成</b></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note" style="margin-top:20px">
+      <h4>为什么拆装重复性必须和 hand-eye 同场做</h4>
+      <p>
+        如果拆装不可重复，那么在机器人上测到的常量本来就不能迁移到人手持采集的那一次装配上——分开做等于白做一件。
+        这一点已经写进采集协议，不是可选项。
+      </p>
+    </div>
+
+    <h3 style="font-size:19px;margin:34px 0 12px">验收数值表</h3>
+    <div class="tw">
+      <table>
+        <thead>
+          <tr>
+            <th>指标</th>
+            <th class="n">旧高位 cube（基线）</th>
+            <th class="n">自制原型 2026-08-18</th>
+            <th class="n">新夹爪目标</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>杠杆臂 L</td><td class="n">241.5 mm</td><td class="n">102.3 mm</td><td class="n goal">≤100 mm（上限 150）</td></tr>
+          <tr><td>最差相机丢帧率</td><td class="n bad">47.4%</td><td class="n">14.3%</td><td class="n goal">&lt;10%</td></tr>
+          <tr><td>姿态误差折算到 TCP · p95</td><td class="n bad">6.32 mm</td><td class="n">2.59 mm</td><td class="n goal">&lt;1.5 mm</td></tr>
+          <tr><td>与 CAD 的端到端偏差</td><td class="n">无对照</td><td class="n">0.54 – 1.03 mm</td><td class="n goal">≤1.0 mm</td></tr>
+          <tr><td>同一装配重扫复现</td><td class="n">3.09 mm</td><td class="n">0.60 mm</td><td class="n goal">≤0.6 mm</td></tr>
+          <tr><td>拆装重装 5 次 · 平移 p95</td><td class="n bad">未测</td><td class="n bad">未测</td><td class="n goal">≤1.0 mm</td></tr>
+          <tr><td>拆装重装 5 次 · 旋转 p95</td><td class="n bad">未测（声明 2.0°）</td><td class="n bad">未测</td><td class="n goal">≤0.2°（可接受下限 0.5°）</td></tr>
+          <tr><td>夹爪拆装 5 次 · 平移 p95<br><span class="sdek" style="font-size:12.5px">仅 M6 退路方案</span></td><td class="n bad">未测</td><td class="n bad">未测</td><td class="n goal">≤1.0 mm</td></tr>
+          <tr><td>采集器 ↔ 执行器 · <b>rig</b> 安装基准件间一致性</td><td class="n">—</td><td class="n">—</td><td class="n goal">≤0.1°（= 0.18 mm）</td></tr>
+          <tr><td>采集器 ↔ 执行器 · <b>夹爪</b>安装基准件间一致性</td><td class="n">—</td><td class="n">—</td><td class="n goal">≤0.1° / ≤0.3 mm</td></tr>
+          <tr><td>TCP 相对夹爪安装基准面的角度公差</td><td class="n bad">未知</td><td class="n bad">未知</td><td class="n goal">≤0.2°（即 ≤0.54 mm）</td></tr>
+          <tr><td>每方向 ≥2 marker 完整可见的帧占比</td><td class="n">—</td><td class="n">—</td><td class="n goal">≥95%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sdek" style="margin-top:12px">
+      "未测"是如实记录，不是遗漏：现有 rig 是单次自打印装配，在它上面测出的分布不会迁移到新设计，所以我们把这两项留到新夹爪到货后一次做完。
+    </p>
+  </section>
+
+  <!-- ============ 7 ============ -->
+  <section>
+    <div class="shead"><div class="snum">07</div><h2>交付物</h2></div>
+    <p class="sdek">CAD 不只是参考件——它会作为我们几何重建的先验参与计算，所以它必须描述真实设计意图。</p>
+
+    <article class="req">
+      <div class="rail"><span class="rid">D1</span><span class="chip deliver">交付</span></div>
+      <div class="rbody">
+        <h3>CAD（STEP）+ URDF + mesh</h3>
+        <p>
+          URDF 需包含 carrier、每个 marker 安装面、夹爪接口、TCP 与球窝的坐标系命名及相对位姿；
+          若引用外部几何请同步提供 STL / DAE / OBJ。
+        </p>
+        <p class="basis"><b>依据</b>
+          我们的 layout 求解把 CAD <b>当先验而不是硬约束</b>（面心 σ ≈ 1 mm、法线 σ ≈ 1°），
+          实测这是三种方案里最好的一种：完全冻结 CAD 会把约 1 mm 的装配公差原样引进来（|误差| 1.35 / 1.29 mm），
+          完全放开则让弱观测的 marker 有厘米级自由度，而先验方案两头都占（0.90 / 1.03 mm）。
+          <b>所以 CAD 有公差是可以接受的，CAD 与实物系统性不符则不可以。</b>
+        </p>
+      </div>
+    </article>
+
+    <article class="req">
+      <div class="rail"><span class="rid">D2</span><span class="chip deliver">交付</span></div>
+      <div class="rbody">
+        <h3>Marker layout 表 + 装配说明</h3>
+        <p>
+          layout 表：每个 marker 的 ID、字典、尺寸、所在安装面、朝向、相对基准的位置。
+          装配说明：安装步骤、扭矩建议、防装反说明、marker 更换后的复定位流程。
+        </p>
+      </div>
+    </article>
+
+    <article class="req">
+      <div class="rail"><span class="rid">D3</span><span class="chip deliver">交付</span></div>
+      <div class="rbody">
+        <h3>能力说明：安装面的平面度、位置度与可达到的拆装重复性</h3>
+        <p>
+          请给出关键安装面的实际加工能力（平面度、位置度、相对基准的位置公差），
+          以及定位方案能保证的重复装配能力。这三个数会直接进入我们的误差预算表，
+          比"符合图纸"这种表述有用得多。
+        </p>
+      </div>
+    </article>
+
+    <article class="req">
+      <div class="rail"><span class="rid">D4</span><span class="chip deliver">交付</span></div>
+      <div class="rbody">
+        <h3>2–3 套首批样件</h3>
+        <p>
+          我方完成装机、视觉跟踪、拆装重复性与 FR3 hand-eye 测试后，根据结果冻结设计或进入下一轮修改。
+          交付前请提供每件的清晰照片与 layout 表。
+        </p>
+      </div>
+    </article>
+  </section>
+
+  <!-- ============ 8 ============ -->
+  <section>
+    <div class="shead"><div class="snum">08</div><h2>设计禁区</h2></div>
+    <p class="sdek">以下方案原则上不接受。每一条都对应上文的某个机制，不是偏好问题。</p>
+    <ul class="nolist">
+      <li>marker 安装在随开合运动的手指上（机制三）</li>
+      <li>marker carrier 参与夹持或处于受力路径上（机制三）</li>
+      <li>仅靠胶带、薄纸或 3D 打印薄壁件作为最终定位基准（机制三 / 四）</li>
+      <li>高位立柱式结构，marker 高出夹爪本体轮廓（机制一 / 二）</li>
+      <li>marker 面可手动晃动，或长期使用后会弯曲（机制三）</li>
+      <li>只靠螺钉 + 目视对齐定位，无机械定位特征（机制四）</li>
+      <li>无法追溯 marker 的 ID、朝向与尺寸（M9）</li>
+      <li>为缩短杠杆臂而牺牲 marker 可见性（2026-08-21 中间版本的教训）</li>
+      <li>TCP 随开度沿手指轴移动，或 TCP 与接触中心合成为同一个随开度变化的量（M10）</li>
+    </ul>
+  </section>
+
+  <!-- ============ 9 ============ -->
+  <section>
+    <div class="shead"><div class="snum">09</div><h2>需要贵司回复的清单</h2></div>
+    <p class="sdek">按重要性排序。第 1 项是当前的硬阻塞——转接方案不定，机器人侧的标定就无法开始。</p>
+
+    <div class="tw">
+      <table>
+        <thead><tr><th class="n" style="width:6%">#</th><th style="width:44%">问题</th><th>为什么我们需要它</th></tr></thead>
+        <tbody>
+          <tr><td class="n">1</td><td><b>执行器能否带一套与采集器同构的可拆 marker rig？rig 安装基准的件间一致性能做到多少（目标 ≤0.1°）？</b></td><td>M6 的首选标定路径；这是误差账本上最大单项（9.1 mm）唯一的测量路径，而一致性决定它能否迁移到采集器</td></tr>
+          <tr><td class="n">2</td><td><b>采集器本体上留一个 FR3 法兰基准的代价有多大？</b>（平时不用，仅用于让每台采集器自测一次 A）</td><td>唯一能把上一条的件间一致性从「假设」变成「测量」的手段；代价不大就强烈建议做</td></tr>
+          <tr><td class="n">3</td><td><b>采集器与执行器能否共用同一组机械基准（同款夹爪 + 三组基准同图）？</b></td><td>按机制五，这决定了一整类图纸误差是「必须测量」还是「自动抵消」；一致性做得好可以放宽绝对精度</td></tr>
+          <tr><td class="n">4</td><td><b>TCP（闭合）相对夹爪安装基准面的位置度与角度公差；该面的平面度与孔位度；夹爪重复拆装的重复性</b></td><td>hand-eye 不覆盖"安装面 → TCP"这一段，它只能靠贵司的加工公差。155 mm 杠杆上 0.2° = 0.54 mm，1.0° = 2.7 mm</td></tr>
+          <tr><td class="n">5</td><td><b>新版本能否做到 TCP 不随开度移动（M10）？</b>并给出 TCP 定义、开度 <code>d</code> 的定义、TCP 与指腹中心的关系（两者分列）</td><td>口径用错会让整条常量沿手指轴偏 15.5 mm；而随开度移动的 TCP 更糟——它让 marker→TCP 不再是常量，并把开度传感器的 ±1 mm 按最高 &gt;2 mm/mm 放大进标签</td></tr>
+          <tr><td class="n">6</td><td>marker 安装面能达到的平面度、位置度与拆装重复性</td><td>直接进误差预算表</td></tr>
+          <tr><td class="n">7</td><td>球窝规格：球径、配合间隙、球面加工方式与材料</td><td>间隙产生的是不可见的姿态相关误差（M5）</td></tr>
+          <tr><td class="n">8</td><td>SMR 磁性窝能否安排？可行的安装位置在哪</td><td>独立验收的唯一接口，采购前置期长</td></tr>
+          <tr><td class="n">9</td><td>推荐材料、加工方式、表面处理与预计重量</td><td>重量影响手持演示的动力学</td></tr>
+          <tr><td class="n">10</td><td>marker 固定方式建议；长期使用是否会翘边或脱落</td><td>贴附厚度已被证明可测量（M8）</td></tr>
+          <tr><td class="n">11</td><td>是否存在夹爪干涉、装配困难或维护困难</td><td>提前发现比打样后发现便宜</td></tr>
+          <tr><td class="n">12</td><td>首批样件周期、单件成本、小批量成本与最小起订量</td><td>排期</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note" style="margin-top:22px">
+      <h4>建议的推进流程</h4>
+      <p>
+        ① 贵司先回复第 1–4 项 —— 这三项不依赖完整结构方案，却决定整体路线：第 1–2 项决定标定怎么做、以及那条一致性能不能被验证，第 3 项决定一整类误差是「必须测量」还是「自动抵消」，第 4 项是我方误差预算里唯一一段还空着的数。
+        ② 提交初版结构方案与材料方案，双方评审包络、可见性、安装与维护方式。
+        ③ <strong>若能先给出 marker 安装面的 CAD，我方可立即用现有相机外参对候选布局排序</strong>，
+        把可见性验算的结果反馈成具体的面位调整建议——这一步在打样之前做，成本最低。
+        ④ 提交 CAD / URDF / layout 表与报价。⑤ 加工 2–3 套样件。⑥ 我方按第 6 节完成六组测试。⑦ 冻结或迭代。
+      </p>
+    </div>
+  </section>
+
+  <footer>
+    <p>
+      本文所有数值均来自我方可复现的实测记录，主要为 2026-08-12 高位 cube 标定（1808 帧 / 7 路相机）、
+      2026-08-18 分布式原型的三次独立采集与 A/B 对照、以及 2026-08-21 至 08-27 的误差预算与灵敏度实验。
+      标注"未测"的项目为如实记录，将在新样件到货后补齐。
+    </p>
+    <p style="margin-top:10px">
+      文档版本 V2.0 · 2026-08-28 · 取代 2026-08-13 发出的 V1.0。相对 V1.0 的主要变化：
+      新增执行器同构 rig 与原位 hand-eye（M6）、三组基准同件与件间一致性（M7）、球窝基准（M5）、SMR 接口（T3）与 <b>TCP 不随开度移动（M10）</b>五项此前未提出的需求；补充机制五（接口同构使一类误差自动抵消）与三种构型的界定；
+      杠杆臂、可见性与 marker 尺寸的要求由估计值改为实测值；补充验收数值表与设计禁区的对应机制。
+    </p>
+  </footer>
+
+</div>
+
+</body>
+</html>

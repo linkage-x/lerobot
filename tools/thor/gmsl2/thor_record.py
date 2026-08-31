@@ -70,6 +70,7 @@ from tools.thor.gmsl2 import argus_online_sync_session as aos  # noqa: E402
 from tools.thor.gmsl2 import argus_video_materialize as avm  # noqa: E402
 from tools.thor.gmsl2 import persistent_session as ps  # noqa: E402
 from tools.thor.gmsl2 import thor_lerobot_v3 as lr3  # noqa: E402
+from tools.thor.gmsl2 import world_provenance as wp  # noqa: E402
 from tools.thor.box_sdk import box_client as bc  # noqa: E402
 
 logger = logging.getLogger("thor_record")
@@ -589,6 +590,7 @@ def _write_episode_meta(
     stop_reason: str,
     wallclock_start_utc: str,
     wallclock_end_utc: str,
+    world_frame: dict[str, Any],
 ) -> Path:
     """Write per-episode meta.json under the persistent-pipeline model.
 
@@ -630,6 +632,10 @@ def _write_episode_meta(
         "wallclock_end_utc": wallclock_end_utc,
         "duration_s": duration_s,
         "recording_stop_reason": stop_reason,
+        # Which world this episode's poses will be expressed in. Read from the
+        # frozen reference on disk at record time (see world_provenance.py); it
+        # is the one field here that cannot be reconstructed afterwards.
+        "world_frame": world_frame,
         "video": {
             "recorder_backend": cfg.cameras.recorder_backend,
             "fps": cfg.cameras.fps,
@@ -1131,6 +1137,14 @@ def main(argv: list[str] | None = None) -> int:
     dataset_root_base = cfg.dataset_root
 
     repo_root = args.repo_root.resolve()
+    # Resolve the world frame before anything else can fail: an operator who is
+    # about to spend an hour recording should learn that the frozen reference is
+    # missing now, not from the meta.json afterwards. It is read once per session
+    # because re-reading per episode would let a mid-session deploy split one
+    # dataset across two worlds without the dataset saying so.
+    world_frame = wp.read_world_provenance(repo_root)
+    _emit(wp.describe(world_frame))
+
     if args.skip_hardware_sync:
         cfg.hardware_sync.enabled = False
     gr.maybe_setup_sync(cfg, repo_root)
@@ -1439,6 +1453,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo_id=cfg.repo_id,
                 task=cfg.single_task,
                 fps=cfg.fps,
+                world_frame=world_frame,
             )
             if lr3_writer is None:
                 logger.warning("BOX LeRobot v3 writer disabled; pyarrow is unavailable")
@@ -1773,6 +1788,7 @@ def main(argv: list[str] | None = None) -> int:
                 meta_path = _write_episode_meta(
                     handle, cfg, locked, argus_failed, connect_errors,
                     box_cfg, box_snapshots, decision, wall_start, wall_end,
+                    world_frame,
                 )
                 # Hardware SOF frame times (t0-relative) that correct the
                 # BOX↔camera per-episode skew (ts_sync.md §5.4); None for

@@ -100,9 +100,11 @@ def test_thor_record_meta_records_connect_stream_errors(tmp_path: Path) -> None:
         stop_reason="save",
         wallclock_start_utc="2026-07-03T00:00:00+00:00",
         wallclock_end_utc="2026-07-03T00:00:01+00:00",
+        world_frame={"world_frame_id": "world_20260819_031843", "status": "ok"},
     )
 
     meta = json.loads(meta_path.read_text())
+    assert meta["world_frame"]["world_frame_id"] == "world_20260819_031843"
     assert meta["active_camera_sids"] == [6]
     assert meta["argus_failed_sids"] == []
     assert meta["connect_failed_sids"] == [3]
