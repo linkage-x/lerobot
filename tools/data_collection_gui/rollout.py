@@ -21,6 +21,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# The runtime writes these lines; this is its own reader for them. Imported rather than
+# re-matched here because a live frame is the one runtime line whose format is machine-chosen
+# on both ends -- a second regex for it would be a second definition of the wire format.
+from tools.fr3.live_frames import parse_live_frame  # noqa: F401  (re-exported for the gateway)
+
 LAUNCHER = Path("tools/fr3/run_pick_place_infer_workstation.sh")
 
 # Where the runtime publishes the frames it is feeding the policy. /dev/shm rather than the
@@ -103,6 +108,16 @@ ROLLOUT_MODES: tuple[RolloutMode, ...] = (
         "Homes the arm, then waits. Each Start runs one rollout; Stop ends the current one and "
         "returns to waiting. The arm moves.",
         movesArm=True,
+        interactive=True,
+    ),
+    RolloutMode(
+        "dagger_sim",
+        "DAgger rehearsal (MuJoCo, no arm)",
+        "Replays a recorded episode through the simulated arm and lets the operator take over "
+        "mid-episode with the SpaceMouse. Rehearses the handoff -- clamp, gripper hold, "
+        "handback -- with no hardware. The checkpoint is used only to find the dataset the "
+        "episode comes from; no weights are loaded. Watch it in the live 3D view.",
+        movesArm=False,
         interactive=True,
     ),
     RolloutMode(
@@ -242,7 +257,7 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
 
 @dataclass
 class RolloutStatus:
-    state: str = "idle"  # idle | starting | waiting | homing | rolling | complete | error | stopped
+    state: str = "idle"  # idle | starting | waiting | homing | resetting | rolling | complete | error | stopped
     mode: str = ""
     checkpointId: str = ""
     checkpointPath: str = ""
@@ -253,6 +268,12 @@ class RolloutStatus:
     cameraKeys: list[str] = field(default_factory=list)
     interactive: bool = False
     movesArm: bool = False
+    # Whether a SpaceMouse was opened, i.e. whether moving it will take the arm over. Read off
+    # the takeover key on the runtime's own control-channel line rather than inferred from the
+    # mode, because it is the runtime that decides: it refuses to bind that key when no device
+    # was opened. The page uses it to say the device is armed, not to offer a button -- takeover
+    # engages itself when the device moves.
+    takeoverAvailable: bool = False
     step: int = 0
     maxSteps: int = 0
     commandStatus: str = ""
@@ -358,6 +379,11 @@ def build_rollout_command(
             str(preview_dir),
             "--preview-jpeg-fps",
             str(preview_fps),
+            # Every step, because the page draws the arm from these and a gap in them is a jump
+            # in the drawing. They cost one short line per step in a log that already carries
+            # per-step telemetry, and the launcher's own modes decide whether to forward them.
+            "--live-frame-interval",
+            "1",
         ]
     return command, env
 
@@ -504,6 +530,28 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
         parsed["message"] = f"Rollout {end_match.group(1)} ended ({end_match.group(2)})."
         return parsed
 
+    if "scene_reset=start" in stripped:
+        parsed["state"] = "resetting"
+        parsed["armAtStart"] = False
+        parsed["message"] = "Scene reset is moving the peg."
+        return parsed
+
+    if "scene_reset_step=" in stripped:
+        parsed["state"] = "resetting"
+        parsed["message"] = stripped[:400]
+        return parsed
+
+    if "scene_reset=done" in stripped:
+        parsed["state"] = "waiting"
+        parsed["message"] = "Scene reset finished; waiting for the next command."
+        return parsed
+
+    if "scene_reset=failed" in stripped:
+        parsed["state"] = "waiting"
+        parsed["armAtStart"] = False
+        parsed["message"] = stripped[:400]
+        return parsed
+
     if "interactive_rollouts=stopped" in stripped:
         parsed["state"] = "complete"
         parsed["message"] = "Interactive rollout session ended."
@@ -511,6 +559,9 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
 
     backend_match = _KEYBOARD_BACKEND_RE.search(stripped)
     if backend_match:
+        # The runtime prints `takeover_key='t'` on this same line, and only when it has a device
+        # to hand the arm to.
+        parsed["takeoverAvailable"] = "takeover_key=" in stripped
         # Deliberately no state. The control channel being open is not the same as the runtime
         # being ready to act on it: `start` is read by the listener thread the moment this line
         # prints, but the loop clears every pending request when it reaches its wait, so a start

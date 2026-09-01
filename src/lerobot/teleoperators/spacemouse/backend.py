@@ -27,6 +27,12 @@ class SpaceMouseReading:
     translation: np.ndarray
     rotation: np.ndarray
     buttons: tuple[bool, bool]
+    # When the device produced this report, on whatever clock the backend keeps. `poll()` hands
+    # back the last state it saw whenever no new report arrived, so the six axes alone cannot
+    # say whether the operator is still pushing the puck or stopped touching it a minute ago --
+    # an unchanged timestamp says nothing has been heard since. None when a backend does not
+    # date its reports.
+    timestamp: float | None = None
 
 
 class SpaceMouseDriver(Protocol):
@@ -138,4 +144,13 @@ class PySpaceMouseDriver:
         translation = np.array([state.x, state.y, state.z], dtype=np.float64)
         rotation = np.array([state.roll, state.pitch, state.yaw], dtype=np.float64)
         buttons = (bool(state.buttons[0]), bool(state.buttons[1]))
-        return SpaceMouseReading(translation=translation, rotation=rotation, buttons=buttons)
+        # pyspacemouse writes `t` only while processing a HID report, and `read()` returns the
+        # previous tuple untouched when the queue is empty. That makes this field the one part
+        # of the reading that distinguishes a new report from a copy of the last one.
+        report_time = getattr(state, "t", None)
+        return SpaceMouseReading(
+            translation=translation,
+            rotation=rotation,
+            buttons=buttons,
+            timestamp=None if report_time is None else float(report_time),
+        )

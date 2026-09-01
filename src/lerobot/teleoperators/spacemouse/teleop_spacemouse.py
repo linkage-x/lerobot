@@ -64,6 +64,8 @@ class SpaceMouseTeleop(Teleoperator):
         self._button_press_times = np.full(2, float("-inf"), dtype=np.float64)
         self._translation_bias = np.zeros(3, dtype=np.float64)
         self._rotation_bias = np.zeros(3, dtype=np.float64)
+        # The timestamp of the report the last action was computed from. None until one arrives.
+        self._last_report_timestamp: float | None = None
         # State-change tracking for targeted debug logging
         self._prev_motion_detected = False
         self._prev_motion_enabled = False
@@ -91,6 +93,18 @@ class SpaceMouseTeleop(Teleoperator):
     @property
     def is_connected(self) -> bool:
         return self._is_connected
+
+    @property
+    def last_report_timestamp(self) -> float | None:
+        """When the device last said anything, as the driver dates it. None if it never has.
+
+        The driver returns its cached state rather than nothing when no report arrived, which is
+        the right default for teleoperation -- a puck held off centre is a rate command that
+        should keep applying between reports. A caller that has to know whether the operator is
+        still there cannot read that from the axes: this value stops advancing when the device
+        goes quiet, and is the only thing that does.
+        """
+        return self._last_report_timestamp
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
@@ -354,6 +368,12 @@ class SpaceMouseTeleop(Teleoperator):
     @check_if_not_connected
     def get_action(self) -> RobotAction:
         reading = self._driver.poll()
+        # Left alone when a poll brings nothing back, because "no report" is exactly what an
+        # unchanged timestamp already means -- overwriting it with None would erase the last
+        # thing the device did say.
+        report_timestamp = getattr(reading, "timestamp", None)
+        if report_timestamp is not None:
+            self._last_report_timestamp = float(report_timestamp)
         if reading is None:
             self._motion_active = False
             # Log if enabled output just went True->False (transition to stop)
@@ -432,6 +452,7 @@ class SpaceMouseTeleop(Teleoperator):
             self._driver = None
             self._is_connected = False
             self._motion_active = False
+            self._last_report_timestamp = None
             self._last_button_raw = None
             self._debounced_buttons.fill(0.0)
             self._button_change_time = 0.0

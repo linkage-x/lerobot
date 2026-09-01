@@ -11,9 +11,12 @@ import type {
   RolloutRtcSchedule,
   RolloutRun,
   RolloutRuntimeOptions,
+  SceneResetRequest,
   TaskLadder
 } from "../types";
 import { RolloutLandingMap } from "./RolloutLandingMap";
+import { RolloutLiveViewer } from "./RolloutLiveViewer";
+import { SceneResetPanel } from "./SceneResetPanel";
 
 /**
  * Running a trained checkpoint on the real FR3.
@@ -36,7 +39,7 @@ import { RolloutLandingMap } from "./RolloutLandingMap";
  * commanding the arm.
  */
 
-const LIVE_STATES = new Set(["starting", "waiting", "homing", "rolling"]);
+const LIVE_STATES = new Set(["starting", "waiting", "homing", "resetting", "rolling"]);
 const RTC_SCHEDULES: RolloutRtcSchedule[] = ["EXP", "LINEAR", "ONES", "ZEROS"];
 const DEFAULT_TASK_PROMPT_PLACEHOLDER = "Pick up the peg and insert it fully into the hole.";
 
@@ -65,7 +68,7 @@ function optionalNumberOrNull(value: string): number | null {
 function stateTone(state: RolloutRun["state"]): string {
   // "running" is the arm-is-moving-right-now dot, which homing is as much as rolling is;
   // "armed" is the it-could-move-at-any-moment one. The state text beside it says which.
-  if (state === "rolling" || state === "homing") return "running";
+  if (state === "rolling" || state === "homing" || state === "resetting") return "running";
   if (state === "waiting" || state === "starting") return "armed";
   if (state === "error") return "error";
   if (state === "complete") return "complete";
@@ -106,6 +109,7 @@ export function RolloutPage() {
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const mode = useMemo(() => modes.find((item) => item.id === modeId), [modes, modeId]);
+  const sceneResetBackgroundUrl = api.cameraSnapshotUrl("side");
   const isLive = run !== null && LIVE_STATES.has(run.state);
   const blocking = useMemo(
     () => (selected?.issues ?? []).filter((issue) => issue.level === "block"),
@@ -308,7 +312,7 @@ export function RolloutPage() {
     }
   };
 
-  const onControl = async (command: "start" | "stop" | "home" | "quit") => {
+  const onControl = async (command: "start" | "stop" | "home" | "quit" | "takeover") => {
     const result = await wrap(`Rollout ${command}`, () => api.controlRollout(command));
     if (result.ok) setRun((result as { rollout?: RolloutRun }).rollout ?? null);
   };
@@ -316,6 +320,15 @@ export function RolloutPage() {
   const onStop = async () => {
     const result = await wrap("Stop rollout", () => api.stopRollout());
     if (result.ok) setNotice("Stop sent.");
+  };
+
+  const onSceneReset = async (request: SceneResetRequest) => {
+    const result = await wrap("Scene reset", () => api.resetRolloutScene(request));
+    if (result.ok) {
+      setRun((result as { rollout?: RolloutRun }).rollout ?? null);
+      setNotice("Scene reset sent.");
+    }
+    return { ok: result.ok, error: result.error };
   };
 
   // One ladder ships today; the picker only appears once there are two, so the common case is
@@ -436,6 +449,19 @@ export function RolloutPage() {
 
           <p className="hint">{run.message}</p>
 
+          {/* There is no Take over button, and that is the design: moving the SpaceMouse takes
+              the arm, and the policy resumes about a second after the operator stops. A button
+              is a thing to find at the moment something is going wrong, and a latched one is a
+              thing to forget -- the next rollout would start under a device nobody is holding.
+              Who is driving right now is drawn in the live view's own pill, off the frames the
+              runtime publishes, rather than off this click. */}
+          {run.takeoverAvailable && run.state === "rolling" && (
+            <p className="hint">
+              SpaceMouse armed: move it to take the arm over. The policy resumes on its own once
+              you stop.
+            </p>
+          )}
+
           {run.interactive && run.state === "waiting" && !run.armAtStart && (
             <p className="hint">
               The arm is where the last rollout left it. The dataset frame is anchored to the
@@ -443,6 +469,17 @@ export function RolloutPage() {
               policy was never shown — press <b>Move to start</b> first. The gripper is left
               exactly as it is: if it is still holding something, take it before homing.
             </p>
+          )}
+
+          {/* Drawn from the joint angles the runtime publishes each step, so it follows the arm
+              rather than replaying it afterwards. Mounted only while something is producing
+              frames: the canvas holds WebGL context and STL meshes, and an idle page has no
+              reason to. */}
+          {isLive && (
+            // Mounted for the whole session, polling only while a rollout is actually
+            // publishing: the canvas holds its WebGL context and meshes between rollouts (so the
+            // arm does not vanish and reappear), and nothing is asked for while nothing moves.
+            <RolloutLiveViewer live={run.state === "rolling"} rolloutIndex={run.rolloutIndex} />
           )}
 
           <div className="metric-row">
@@ -629,6 +666,23 @@ export function RolloutPage() {
           checkpointId={run?.checkpointId ?? selected?.id ?? ""}
         />
       </section>
+
+      <SceneResetPanel
+        title="Scene reset"
+        landmarks={landmarks}
+        backgroundImageUrl={sceneResetBackgroundUrl}
+        backgroundLabel="side camera"
+        busy={busy}
+        disabled={!run?.interactive || run.state !== "waiting"}
+        disabledReason={
+          !run?.interactive
+            ? "Start Interactive rollouts first; that process owns the FR3 connection."
+            : run.state !== "waiting"
+              ? "Scene reset is only available between rollouts."
+              : ""
+        }
+        onReset={onSceneReset}
+      />
 
       {/* ------------------------------------------------------ checkpoint --- */}
       <section className="card">

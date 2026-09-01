@@ -6,7 +6,49 @@ of "the peg has already been knocked over", because a demonstrator never gets th
 correction has to be applied online, inside the same loop that is running the policy, and the
 segment it produced has to come back labelled.
 
-Two design decisions carry the rest of this file.
+Four design decisions carry the rest of this file.
+
+**The device decides when it is driving.** There is no engage button and no hold-to-take-over
+key. Moving the SpaceMouse takes the arm; letting go of it hands the arm back once the device
+has been quiet for ``release_after_s``. A button is a second thing to reach for at the moment
+something is going wrong, and it is a thing that can be left in the wrong position -- a rollout
+that ended with the takeover still latched hands the next one to a device nobody is holding.
+The device's own deadbands (``threshold_x`` and friends in ``SpaceMouseTeleopConfig``, applied
+after an idle-bias estimate taken at connect) already decide what counts as motion, so nothing
+here adds a second threshold: any non-zero delta that reaches this file is real.
+
+**One step is driven by the newest report the device has, and by nothing else.** Three
+different things have to be true at once for the arm to follow the hand that is on the puck now.
+
+*The scale is per report.* ``translation_scale`` 0.000615 m and ``rotation_scale`` 0.000648 rad
+are "per tick at 200 Hz" -- what the recorder's loop applies each time round (7.4 deg/s of yaw
+at full deflection, as ``fr3_record_config.yaml`` says). A rollout loop runs at 30 Hz, so one
+reading has to cover 6.67 of those ticks or the same hand moves the arm at a sixth of the speed
+it moved it while recording. That is ``motion_gain_for``.
+
+*The queue has to be emptied.* ``pyspacemouse`` opens the device non-blocking and takes one
+report per read, while the kernel queues every report the device sends -- about 126 a second
+with the puck displaced. A loop reading one per step at 30 Hz falls behind by ~96 reports a
+second, so within a second the operator is steering with a hand they had half a second ago, and
+when they let go the arm flies on through everything still queued. So every step drains the
+queue. Only the *newest* report survives that drain: this is a rate control, the newest
+deflection is the current one, and summing what the queue held would ask for as many times the
+operator's motion as the step had reports in it -- which is the bug that made the arm run at the
+clamp with no proportional control at all.
+
+*A copy is not a report.* Once the queue is empty ``poll`` returns the device's cached state
+rather than nothing, which is right for teleoperation -- a puck held off centre is a rate
+command and should keep applying between reports -- and wrong the moment the hand comes off. The
+device stops reporting; the cached state does not fall to zero unless the puck's own resting
+position sits inside the deadband; so the loop re-applies that one reading 30 times a second.
+The arm keeps flying at teleoperation speed with nobody touching anything, and the idle timer
+that is supposed to hand it back is reset by every one of those copies, so it never runs out.
+Measured in the first MuJoCo rehearsal: one takeover ran 1196 steps to the end of the rollout
+and handed back 271 mm from where it engaged. The driver dates each report, and a timestamp
+that has not moved means the device has said nothing since the last step -- which is what that
+step then asks the arm to do. The gripper axis is deliberately exempt: a button held down
+produces no new reports either, and it is the teleoperator's own state machine, not a stream of
+reports, that keeps the fingers closing while it is held.
 
 **One reference for both action sources.** The policy's action is a delta against ``prev_cmd``
 -- the pose the last command asked for, not the pose the arm reached. The expert's delta is
@@ -33,7 +75,8 @@ actually presses a button, and only then does the device take over that axis too
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+import time
+from typing import Any, Callable, Mapping, NamedTuple
 
 import numpy as np
 
@@ -43,11 +86,78 @@ EE_POSITION_KEYS = ('ee.x', 'ee.y', 'ee.z')
 EE_ROTVEC_KEYS = ('ee.wx', 'ee.wy', 'ee.wz')
 GRIPPER_KEY = 'gripper.pos'
 
+_DELTA_POSITION_KEYS = ('target_x', 'target_y', 'target_z')
+_DELTA_ROTVEC_KEYS = ('target_wx', 'target_wy', 'target_wz')
+
 # How far the device's gripper reading must move from what it read when the operator engaged
 # before the device owns that axis. Below this it is the same button state, not a press: the
 # incremental tool mode drifts by `incremental_step` per poll while a button is held, and the
 # EMA in the teleoperator means even a released button settles rather than snaps.
 _GRIPPER_TOUCH_EPS = 0.02
+
+# Smaller than any increment the device can produce, larger than float noise. Only used to ask
+# "did this reading move at all", which is what makes a button press count as taking over.
+_GRIPPER_MOVED_EPS = 1e-9
+
+# How long the operator has been driving before the arm goes back to the policy.
+DEFAULT_RELEASE_AFTER_S = 1.0
+# The puck is a rate control, not a stream of displacements, and the scales are calibrated to
+# say so: `translation_scale` is metres *per recorder tick*, and the recorder ticks at
+# `control_fps` (200) whether or not a fresh report arrived. Full deflection is therefore
+# 0.000615 * 200 = 0.123 m/s, and a loop at any rate reproduces it by scaling one reading by
+# `tick_hz * step_period_s`. Identity by default so a caller that has not thought about its own
+# rate gets the raw reading rather than a silent speed change.
+DEFAULT_MOTION_GAIN = 1.0
+
+# Reads allowed per control step while emptying the queue. The kernel's hidraw ring holds 64
+# reports and drops the oldest when it overflows, so nothing older than this can still be waiting;
+# one step is therefore always enough to catch up, and the cap only bounds a device that has
+# started talking faster than it can be read.
+MAX_READS_PER_STEP = 64
+
+
+def motion_gain_for(*, tick_hz: float, step_period_s: float) -> float:
+    """Scale one reading so this loop covers the same ground per second as the recorder.
+
+    One reading, however many reads it took to reach it. The extra reads empty the queue -- the
+    device sends ~126 reports a second and the driver hands over one per read -- but they are not
+    extra motion: past the end of the queue ``PySpaceMouseDriver.poll`` returns the device's last
+    state rather than nothing (measured on the rig: 0 empty returns in 620k reads over 2 s), so
+    summing what a step read multiplied the operator's hand by however many reads it had time
+    for -- 32, at the old cap.
+    """
+    return max(0.0, float(tick_hz)) * max(0.0, float(step_period_s))
+
+
+class DeviceInput(NamedTuple):
+    """What the device said during one control step."""
+
+    delta_position: np.ndarray
+    delta_rotvec: np.ndarray
+    gripper: float | None
+    gripper_before: float | None
+    gripper_moved: bool
+    moved: bool
+    # Whether this step's reading was a new report rather than the driver's cached copy of the
+    # last one. False means the device has been silent since the previous step.
+    fresh: bool = True
+
+    @property
+    def eventful(self) -> bool:
+        """Whether the operator touched the device at all. Motion or a button, either counts."""
+        return bool(self.moved or self.gripper_moved)
+
+
+def _finite_vector(action: Mapping[str, Any], keys: tuple[str, str, str]) -> np.ndarray:
+    """The three deltas under `keys`, or zeros if any of them is not a finite number.
+
+    Zeroing the whole vector rather than the offending axis: a device that reports NaN on one
+    axis is not reporting a two-axis motion, it is not reporting.
+    """
+    values = np.array([float(action.get(key, 0.0) or 0.0) for key in keys], dtype=np.float64)
+    if not np.all(np.isfinite(values)):
+        return np.zeros(3, dtype=np.float64)
+    return values
 
 
 def _pose_from_command(command: Mapping[str, float]) -> tuple[np.ndarray, Rotation]:
@@ -87,44 +197,148 @@ def expert_spans(sources: list[str], *, expert_label: str = 'expert') -> list[tu
 class ExpertTakeover:
     """Turns SpaceMouse motion into the same command shape the policy produces.
 
-    Holds one piece of state only -- whether the operator has touched the gripper since they
-    engaged. Everything else is derived from the command that was last sent, which the caller
-    already tracks for the step guard.
+    Also decides *when* the operator is driving: see the module docstring. The caller passes
+    ``latched``, which is the manual override (a key, for an operator who wants the arm held
+    still while they think). Everything else follows from what the device reports.
     """
 
-    def __init__(self, teleop: Any):
+    def __init__(
+        self,
+        teleop: Any,
+        *,
+        release_after_s: float = DEFAULT_RELEASE_AFTER_S,
+        motion_gain: float = DEFAULT_MOTION_GAIN,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self._teleop = teleop
+        # `monotonic`, not `time()`: this is a duration between two events seconds apart in one
+        # process, and a wall clock that steps backwards mid-rollout would hand the arm over.
+        self._clock = clock
+        self._release_after_s = max(0.0, float(release_after_s))
+        self._motion_gain = max(0.0, float(motion_gain))
         self._engaged = False
         self._gripper_hold: float = 0.0
         self._gripper_at_engage: float | None = None
         self._gripper_owned = False
+        self._last_gripper_seen: float | None = None
+        # The report the previous step's motion came from. A reading carrying this same
+        # timestamp is a copy, not the operator.
+        self._last_report_timestamp: float | None = None
+        # Never touched, rather than "touched at time zero": on the first step the arm belongs
+        # to the policy, and `inf` seconds of idle is the honest way to say so.
+        self._last_input_s = float('-inf')
         self._poll_failed = False
 
     @property
     def engaged(self) -> bool:
         return self._engaged
 
-    def _engage(self, *, previous_sent_command: Mapping[str, float] | None, robot_observation: Mapping[str, float]) -> None:
+    @property
+    def auto_enabled(self) -> bool:
+        return self._release_after_s > 0.0
+
+    def _read_device(self) -> DeviceInput:
+        """One reading, rescaled from the recorder's per-tick calibration to this loop's step.
+
+        One read rather than a drain, and the reason is in :func:`motion_gain_for`: the driver
+        repeats its last state when the queue is empty, so a second read inside one control step
+        returns a copy. The old drain summed those copies, which is why a puck off centre by any
+        amount asked for more than the step guard would pass -- the arm ran at the clamp and the
+        operator lost every bit of proportional control.
+
+        The same repetition is why the motion here is gated on the report timestamp rather than
+        on the axes: see the module docstring. A device that cannot date its reports keeps the
+        old behaviour, because a reading that might be new is the only thing such a device
+        offers and refusing to act on it would leave the operator pushing a dead puck.
+        """
+        action = self._teleop.get_action()
+        gripper_before = self._last_gripper_seen
+
+        timestamp = getattr(self._teleop, 'last_report_timestamp', None)
+        fresh = timestamp is None or timestamp != self._last_report_timestamp
+        self._last_report_timestamp = timestamp
+
+        reported_position = _finite_vector(action, _DELTA_POSITION_KEYS) if fresh else np.zeros(3)
+        reported_rotvec = _finite_vector(action, _DELTA_ROTVEC_KEYS) if fresh else np.zeros(3)
+        # Measured before the gain: whether the operator moved is a property of the reading, and
+        # a gain of zero must not read as a hand that let go.
+        moved = bool(np.any(reported_position != 0.0) or np.any(reported_rotvec != 0.0))
+
+        gripper = gripper_before
+        gripper_moved = False
+        reading = action.get('gripper')
+        if reading is not None and np.isfinite(float(reading)):
+            reading = float(np.clip(float(reading), 0.0, 1.0))
+            gripper_moved = (
+                self._last_gripper_seen is not None
+                and abs(reading - self._last_gripper_seen) > _GRIPPER_MOVED_EPS
+            )
+            self._last_gripper_seen = reading
+            gripper = reading
+
+        return DeviceInput(
+            delta_position=reported_position * self._motion_gain,
+            delta_rotvec=reported_rotvec * self._motion_gain,
+            gripper=gripper,
+            gripper_before=gripper_before,
+            gripper_moved=gripper_moved,
+            moved=moved,
+            fresh=fresh,
+        )
+
+    def _engage(
+        self,
+        *,
+        reason: str,
+        device_input: DeviceInput | None,
+        previous_sent_command: Mapping[str, float] | None,
+        robot_observation: Mapping[str, float],
+    ) -> None:
         self._engaged = True
         self._gripper_owned = False
-        self._gripper_at_engage = None
-        self._poll_failed = False
+        # What the device read *before* this step. An operator who took the arm by pressing a
+        # gripper button has already moved it by one increment by the time we get here; measuring
+        # ownership from the post-press value would need a second press to notice the first.
+        self._gripper_at_engage = None if device_input is None else device_input.gripper_before
         if previous_sent_command is not None and GRIPPER_KEY in previous_sent_command:
             self._gripper_hold = float(previous_sent_command[GRIPPER_KEY])
         else:
             self._gripper_hold = float(robot_observation.get(GRIPPER_KEY, 0.0))
-        print(f'[INFO] dagger_takeover=engaged gripper_hold={self._gripper_hold:.3f}')
+        print(f'[INFO] dagger_takeover=engaged reason={reason} gripper_hold={self._gripper_hold:.3f}')
 
-    def _release(self) -> None:
+    def _release(self, *, reason: str, idle_s: float) -> None:
         self._engaged = False
         self._gripper_owned = False
         self._gripper_at_engage = None
-        print('[INFO] dagger_takeover=released')
+        idle_text = '' if not np.isfinite(idle_s) else f' idle_s={idle_s:.2f}'
+        print(f'[INFO] dagger_takeover=released reason={reason}{idle_text}')
+
+    def _held_command(
+        self,
+        policy_command: dict[str, float],
+        reference_position: np.ndarray,
+        reference_rotation: Rotation,
+    ) -> dict[str, float]:
+        """The arm stays where the last command put it. Used when the device cannot be read."""
+        held = dict(policy_command)
+        rotvec = reference_rotation.as_rotvec()
+        held.update(
+            {
+                'ee.x': float(reference_position[0]),
+                'ee.y': float(reference_position[1]),
+                'ee.z': float(reference_position[2]),
+                'ee.wx': float(rotvec[0]),
+                'ee.wy': float(rotvec[1]),
+                'ee.wz': float(rotvec[2]),
+                GRIPPER_KEY: float(self._gripper_hold),
+            }
+        )
+        return held
 
     def command(
         self,
         *,
-        engaged: bool,
+        latched: bool = False,
         policy_command: dict[str, float],
         previous_sent_command: Mapping[str, float] | None,
         robot_observation: Mapping[str, float],
@@ -132,75 +346,76 @@ class ExpertTakeover:
         """The command for this step, plus what it was and why.
 
         Returns the policy's own command untouched whenever the operator is not driving, so a
-        run with takeover available but never used is byte-identical to one without it.
+        run with a SpaceMouse plugged in and never touched is byte-identical to one without it.
         """
-        if engaged and not self._engaged:
-            self._engage(previous_sent_command=previous_sent_command, robot_observation=robot_observation)
-        elif not engaged and self._engaged:
-            self._release()
+        now = self._clock()
+        device_input: DeviceInput | None = None
+        try:
+            device_input = self._read_device()
+        except Exception as exc:  # noqa: BLE001 - a device read must never end a rollout mid-motion
+            if not self._poll_failed:
+                self._poll_failed = True
+                print(f'[WARN] dagger_takeover_poll_failed: {exc}')
+        else:
+            self._poll_failed = False
+            if device_input.eventful:
+                self._last_input_s = now
+
+        idle_s = now - self._last_input_s
+        if device_input is None:
+            # A dead device does not hand the arm back on its own. If the operator was driving,
+            # they still are as far as they know, and the alternative -- the policy resuming
+            # under their hand -- is the one surprise this path exists to rule out. They hold
+            # position (below) until they stop the rollout.
+            auto_engaged = self._engaged
+        else:
+            auto_engaged = self.auto_enabled and idle_s < self._release_after_s
+        wanted = bool(latched) or auto_engaged
+
+        if wanted and not self._engaged:
+            self._engage(
+                reason='latched' if latched and not auto_engaged else 'motion',
+                device_input=device_input,
+                previous_sent_command=previous_sent_command,
+                robot_observation=robot_observation,
+            )
+        elif not wanted and self._engaged:
+            self._release(reason='idle' if self.auto_enabled else 'unlatched', idle_s=idle_s)
 
         if not self._engaged:
-            return policy_command, {'source': 'policy', 'engaged': False}
+            return policy_command, {'source': 'policy', 'engaged': False, 'idle_s': idle_s}
 
         # The arm holds where the last command put it. Used both as the delta reference and as
-        # the fallback when the device cannot be read: an operator who asked for control and
-        # got a policy command back instead is the one surprise worth ruling out.
+        # the fallback when the device cannot be read.
         if previous_sent_command is not None:
             reference_position, reference_rotation = _pose_from_command(previous_sent_command)
         else:
             reference_position, reference_rotation = _pose_from_observation(robot_observation)
 
-        try:
-            action = self._teleop.get_action()
-        except Exception as exc:  # noqa: BLE001 - a device read must never end a rollout mid-motion
-            if not self._poll_failed:
-                self._poll_failed = True
-                print(f'[WARN] dagger_takeover_poll_failed holding_position: {exc}')
-            held = dict(policy_command)
-            held.update(
-                {
-                    'ee.x': float(reference_position[0]),
-                    'ee.y': float(reference_position[1]),
-                    'ee.z': float(reference_position[2]),
-                }
-            )
-            rotvec = reference_rotation.as_rotvec()
-            held.update({'ee.wx': float(rotvec[0]), 'ee.wy': float(rotvec[1]), 'ee.wz': float(rotvec[2])})
-            held[GRIPPER_KEY] = float(self._gripper_hold)
+        if device_input is None:
+            held = self._held_command(policy_command, reference_position, reference_rotation)
             return held, {'source': 'expert', 'engaged': True, 'status': 'poll_failed'}
-        self._poll_failed = False
 
-        delta_position = np.array(
-            [float(action.get('target_x', 0.0)), float(action.get('target_y', 0.0)), float(action.get('target_z', 0.0))],
-            dtype=np.float64,
-        )
-        delta_rotvec = np.array(
-            [float(action.get('target_wx', 0.0)), float(action.get('target_wy', 0.0)), float(action.get('target_wz', 0.0))],
-            dtype=np.float64,
-        )
-        if not np.all(np.isfinite(delta_position)) or not np.all(np.isfinite(delta_rotvec)):
-            delta_position = np.zeros(3, dtype=np.float64)
-            delta_rotvec = np.zeros(3, dtype=np.float64)
-
-        target_position = reference_position + delta_position
+        target_position = reference_position + device_input.delta_position
         # Right-multiplied, matching the recorder's own delta convention
         # (processor_franka_research3: `desired_R = reference_R @ delta_R`). A left-multiplied
         # rotation here would mean the SpaceMouse turned the tool about the base axes during
         # takeover and about the tool axes during recording -- the same device, two behaviours.
-        target_rotation = reference_rotation * Rotation.from_rotvec(delta_rotvec)
+        target_rotation = reference_rotation * Rotation.from_rotvec(device_input.delta_rotvec)
         target_rotvec = target_rotation.as_rotvec()
 
-        gripper_reading = action.get('gripper')
-        if gripper_reading is None or not np.isfinite(float(gripper_reading)):
+        if device_input.gripper is None:
             gripper_command = float(self._gripper_hold)
         else:
-            gripper_reading = float(np.clip(float(gripper_reading), 0.0, 1.0))
             if self._gripper_at_engage is None:
-                self._gripper_at_engage = gripper_reading
-            if not self._gripper_owned and abs(gripper_reading - self._gripper_at_engage) >= _GRIPPER_TOUCH_EPS:
+                self._gripper_at_engage = device_input.gripper
+            if (
+                not self._gripper_owned
+                and abs(device_input.gripper - self._gripper_at_engage) >= _GRIPPER_TOUCH_EPS
+            ):
                 self._gripper_owned = True
-                print(f'[INFO] dagger_takeover=gripper_taken value={gripper_reading:.3f}')
-            gripper_command = gripper_reading if self._gripper_owned else float(self._gripper_hold)
+                print(f'[INFO] dagger_takeover=gripper_taken value={device_input.gripper:.3f}')
+            gripper_command = device_input.gripper if self._gripper_owned else float(self._gripper_hold)
 
         expert_command = dict(policy_command)
         expert_command.update(
@@ -214,14 +429,18 @@ class ExpertTakeover:
                 GRIPPER_KEY: float(gripper_command),
             }
         )
-        moved = bool(np.any(delta_position != 0.0) or np.any(delta_rotvec != 0.0))
         return expert_command, {
             'source': 'expert',
             'engaged': True,
-            'status': 'moving' if moved else 'holding',
-            'moved': moved,
+            # `stale` is not `holding`: holding is a puck at rest under a hand that is still
+            # there, stale is a device that has stopped speaking. On the rig they are the
+            # difference between "the operator is thinking" and "the operator has let go".
+            'status': ('moving' if device_input.moved else 'holding' if device_input.fresh else 'stale'),
+            'moved': device_input.moved,
             'gripper_owned': self._gripper_owned,
-            'step_mm': float(np.linalg.norm(delta_position) * 1000.0),
+            'step_mm': float(np.linalg.norm(device_input.delta_position) * 1000.0),
+            'idle_s': idle_s,
+            'latched': bool(latched),
         }
 
     def close(self) -> None:

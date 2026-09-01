@@ -627,8 +627,13 @@ def test_every_mode_that_moves_the_arm_is_marked_as_such():
     assert by_id["real"].movesArm is True
     assert by_id["real_once"].movesArm is True
     assert by_id["real_debug"].movesArm is True
+    # The rehearsal is interactive -- it is steered, and it is where the takeover is practised --
+    # but the arm it moves is simulated, so it must not ask for motion confirmation.
+    assert by_id["dagger_sim"].movesArm is False
+    assert by_id["dagger_sim"].interactive is True
     assert [mode.id for mode in rollout_backend.ROLLOUT_MODES if mode.interactive] == [
         "real",
+        "dagger_sim",
         "real_debug",
     ]
 

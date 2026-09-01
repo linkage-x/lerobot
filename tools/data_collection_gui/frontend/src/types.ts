@@ -352,6 +352,26 @@ export type MujocoPreview = {
   robots: Partial<Record<"left" | "right", MujocoPreviewRobot>>;
 };
 
+/** One step of a running rollout, as the runtime publishes it. Shares the replay viewer's frame
+ *  shape so the same Three.js component draws both; `source` is the addition, and it is the
+ *  point: it says whether the policy or the operator produced the command behind this pose. */
+export type RolloutLiveFrame = MujocoPreviewFrame & {
+  source?: string;
+  status?: string;
+  rollout_index?: number;
+};
+
+export type RolloutLiveFrames = {
+  /** Sequence of the newest frame the gateway holds. Never restarts, so "nothing new" and
+   *  "you fell behind" are different answers rather than the same one. */
+  seq: number;
+  frames: RolloutLiveFrame[];
+  rolloutIndex: number;
+  running: boolean;
+  /** The buffer rolled past what this client last saw; what follows is not a continuation. */
+  dropped: boolean;
+};
+
 export type AnnotationOutcome = "unreviewed" | "success" | "failure" | "partial";
 
 export type AnnotationQuality = "unreviewed" | "good" | "needs_review" | "bad";
@@ -1094,6 +1114,7 @@ export type RolloutRun = {
     | "starting"
     | "waiting"
     | "homing"
+    | "resetting"
     | "rolling"
     | "complete"
     | "error"
@@ -1108,6 +1129,10 @@ export type RolloutRun = {
   cameraKeys: string[];
   interactive: boolean;
   movesArm: boolean;
+  /** Whether a SpaceMouse was opened for this rollout, i.e. whether the operator can take the
+   *  arm over by moving it. Read off the takeover key the runtime binds, which it refuses to
+   *  bind without a device. Reported by the runtime rather than derived from the mode. */
+  takeoverAvailable?: boolean;
   step: number;
   maxSteps: number;
   commandStatus: string;
@@ -1251,6 +1276,31 @@ export type RolloutLastParams = {
   maxSteps?: number;
   moveToStart?: boolean;
   runtimeOptions?: RolloutRuntimeOptions;
+};
+
+
+export type SceneResetStroke = {
+  x: number;
+  y: number;
+  radiusM: number;
+};
+
+export type SceneResetRequest = {
+  pickXyz: [number, number, number];
+  targetZ: number;
+  liftM: number;
+  approachClearanceM?: number;
+  openGripper?: number;
+  closedGripper?: number;
+  returnToStart?: boolean;
+  mask: { strokes: SceneResetStroke[] };
+};
+
+export type SceneResetResult = {
+  ok: boolean;
+  error?: string;
+  sceneReset?: SceneResetRequest & { targetXyz?: [number, number, number] };
+  rollout?: RolloutRun;
 };
 
 export type RolloutStartRequest = {

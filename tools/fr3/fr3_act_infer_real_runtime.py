@@ -14,21 +14,28 @@ Execution model:
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
 import os
-import select
-import stat as stat_module
 import sys
-import termios
 import threading
 import time
-import tty
+from collections.abc import Callable
 from typing import Any
+
+# Both roots, before anything below is imported. `lerobot` lives under src/ and the launcher
+# exports it on PYTHONPATH, but `tools.*` -- the takeover, the command guard, the control channel
+# -- is imported by package path and nothing puts the repo root on sys.path: running a file as a
+# script puts *the file's own directory* there, not the working directory. Same bootstrap the
+# other FR3 runtimes carry, and for the same reason.
+_BOOTSTRAP_REPO_ROOT = Path(__file__).resolve().parents[2]
+for _bootstrap_path in (str(_BOOTSTRAP_REPO_ROOT / 'src'), str(_BOOTSTRAP_REPO_ROOT)):
+    if _bootstrap_path not in sys.path:
+        sys.path.insert(0, _bootstrap_path)
 
 import numpy as np
 import torch
@@ -66,7 +73,41 @@ from lerobot.utils.control_utils import predict_action, prepare_observation_for_
 from lerobot.utils.rotation import Rotation
 from lerobot.utils.robot_utils import precise_sleep
 
-from tools.fr3.dagger_takeover import ExpertTakeover, expert_spans
+from tools.fr3.command_guard import (
+    compute_pose_delta_from_current,
+    limit_command_for_safety,
+    smooth_robot_command_ema,
+)
+from tools.fr3.command_guard import PREV_CMD_POSITION_KEYS as _GUARD_PREV_CMD_POSITION_KEYS
+from tools.fr3.command_guard import PREV_CMD_ROTVEC_KEYS as _GUARD_PREV_CMD_ROTVEC_KEYS
+from tools.fr3.dagger_takeover import ExpertTakeover, expert_spans, motion_gain_for
+from tools.fr3.dagger_dataset import (
+    DEFAULT_MAX_BUFFERED_FRAMES,
+    DaggerEpisodeWriter,
+    DaggerFrameBuffer,
+    build_dagger_frame,
+    dagger_dataset_features,
+    image_source_keys,
+    sent_command_to_dataset_action,
+)
+from tools.fr3.interactive_control import InteractiveRolloutKeyboard
+from tools.fr3.scene_reset import (
+    SceneResetError,
+    execute_scene_reset,
+    scene_reset_request_from_payload,
+)
+from tools.fr3.live_frames import LiveFrameEmitter
+
+# The guard carries its own copy of the prev_cmd key names so that it can be imported
+# without the policy stack. Checked here, the one place both definitions are in scope: a
+# rename in the processor would otherwise leave the step guard quietly falling back to the
+# measured pose, which is the failure this pair of tuples exists to prevent.
+assert _GUARD_PREV_CMD_POSITION_KEYS == PREV_CMD_POSITION_KEYS, (
+    'command_guard.PREV_CMD_POSITION_KEYS has drifted from the FR3 processor'
+)
+assert _GUARD_PREV_CMD_ROTVEC_KEYS == PREV_CMD_ROTVEC_KEYS, (
+    'command_guard.PREV_CMD_ROTVEC_KEYS has drifted from the FR3 processor'
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CHECKPOINT = _REPO_ROOT / 'outputs/train/2026-03-19/10-48-39_act/checkpoints/060000'
@@ -655,6 +696,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Upper bound on preview JPEG writes per second (default 5).',
     )
     parser.add_argument(
+        '--live-frame-interval',
+        type=int,
+        default=0,
+        help=(
+            'Print one live_frame= line every N steps: joint angles, gripper and the commanded '
+            'versus measured end-effector position, for a browser to draw the arm while the '
+            'rollout is running. 0 (default) prints nothing. The GUI passes 1; a terminal '
+            'operator watching the arm itself has no use for it.'
+        ),
+    )
+    parser.add_argument(
         '--rollout-trace-dir',
         type=str,
         default='outputs/rollout_traces',
@@ -679,14 +731,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action='store_true',
         help=(
             'Let the operator take the arm over mid-rollout with a SpaceMouse and hand it back, '
-            'so a correction is applied to the state the policy actually walked into. Off by '
+            'so a correction is applied to the state the policy actually walked into. Moving the '
+            'device takes the arm; the policy resumes once it goes quiet. Off by '
             'default: it opens a second action source onto a loop that is moving a real arm.'
+        ),
+    )
+    parser.add_argument(
+        '--dagger-takeover-release-after-s',
+        type=float,
+        default=1.0,
+        help=(
+            'Hand the arm back to the policy once the SpaceMouse has been quiet this long '
+            '(default 1 s). 0 disables automatic takeover, leaving only the takeover key.'
         ),
     )
     parser.add_argument(
         '--rollout-takeover-key',
         default='t',
-        help='Interactive key that toggles DAgger takeover on and off. Only bound with --dagger-takeover.',
+        help=(
+            'Interactive key that latches DAgger takeover on, for an operator who wants the arm '
+            'held still without moving the device. Only bound with --dagger-takeover.'
+        ),
     )
     parser.add_argument(
         '--dagger-spacemouse-device-id',
@@ -698,13 +763,46 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         '--dagger-translation-scale',
         type=float,
         default=None,
-        help='Override the SpaceMouse translation scale during takeover. Defaults to the recorder's value.',
+        help="Override the SpaceMouse translation scale during takeover. Defaults to the recorder's value.",
     )
     parser.add_argument(
         '--dagger-rotation-scale',
         type=float,
         default=None,
-        help='Override the SpaceMouse rotation scale during takeover. Defaults to the recorder's value.',
+        help="Override the SpaceMouse rotation scale during takeover. Defaults to the recorder's value.",
+    )
+    parser.add_argument(
+        '--dagger-dataset-root',
+        type=Path,
+        default=None,
+        help=(
+            'Write the steps the operator drove to this LeRobot dataset, one episode per '
+            'correction, each frame flagged is_intervention. Created if absent, extended if not. '
+            'Without it a takeover steers the arm and leaves no training sample behind.'
+        ),
+    )
+    parser.add_argument(
+        '--dagger-dataset-repo-id',
+        type=str,
+        default=None,
+        help='repo_id for --dagger-dataset-root. Defaults to the directory name.',
+    )
+    parser.add_argument(
+        '--dagger-max-buffered-frames',
+        type=int,
+        default=DEFAULT_MAX_BUFFERED_FRAMES,
+        help=(
+            'Expert frames held in memory per rollout before the rest are dropped and counted '
+            f'(default {DEFAULT_MAX_BUFFERED_FRAMES}, about 15 s of correction at 30 Hz). They are '
+            'held rather than written as they happen because save_episode encodes video, and the '
+            'end of a correction is when the policy is about to resume driving a real arm.'
+        ),
+    )
+    parser.add_argument(
+        '--dagger-min-span-frames',
+        type=int,
+        default=2,
+        help='Corrections shorter than this many frames are a bumped device, not a demonstration (default 2).',
     )
     parser.add_argument(
         '--mujoco-viewer',
@@ -1374,263 +1472,6 @@ class FR3InferenceMujocoVisualizer:
                 pass
 
 
-class InteractiveRolloutKeyboard:
-    def __init__(
-        self,
-        *,
-        start_key: str,
-        stop_key: str,
-        home_key: str,
-        quit_key: str,
-        takeover_key: str | None = None,
-    ):
-        self.start_key = self._normalize_key(start_key)
-        self.stop_key = self._normalize_key(stop_key)
-        self.home_key = self._normalize_key(home_key)
-        self.quit_key = self._normalize_key(quit_key)
-        # None when DAgger takeover is off, so the key stays free for whatever else the
-        # operator has bound and a stray press cannot hand a live rollout to a device that
-        # was never connected.
-        self.takeover_key = self._normalize_key(takeover_key) if takeover_key else None
-        self.start_requested = threading.Event()
-        self.stop_requested = threading.Event()
-        self.home_requested = threading.Event()
-        self.quit_requested = threading.Event()
-        # A toggle, not a hold. sshkeyboard and the cbreak fallback both report presses, not
-        # releases, so a dead-man's switch cannot be built on this channel -- and one built on
-        # key repeat would drop control every time the operator's hand paused.
-        self.takeover_engaged = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._stop_listening = None
-
-    @staticmethod
-    def _normalize_key(key: str) -> str:
-        return str(key).strip().lower()
-
-    def _on_press(self, key: str) -> None:
-        key_name = self._normalize_key(key)
-        if key_name == self.start_key:
-            print('[INFO] interactive_key=start')
-            self.start_requested.set()
-            self.stop_requested.clear()
-        elif key_name == self.stop_key:
-            print('[INFO] interactive_key=stop_current_rollout')
-            self.stop_requested.set()
-        elif key_name == self.home_key:
-            print('[INFO] interactive_key=move_to_start')
-            self.home_requested.set()
-        elif self.takeover_key is not None and key_name == self.takeover_key:
-            if self.takeover_engaged.is_set():
-                self.takeover_engaged.clear()
-                print('[INFO] interactive_key=takeover_release')
-            else:
-                self.takeover_engaged.set()
-                print('[INFO] interactive_key=takeover_engage')
-        elif key_name == self.quit_key:
-            print('[INFO] interactive_key=quit')
-            self.quit_requested.set()
-            self.stop_requested.set()
-            self.start_requested.set()
-            # Quitting drops the takeover with it. Leaving it engaged would hand the next
-            # process state, and there is no next process to hand it to.
-            self.takeover_engaged.clear()
-
-    def _listen_keyboard_loop(self, listen_keyboard: Any) -> None:
-        try:
-            listen_keyboard(on_press=self._on_press, sequential=False)
-        except TypeError:
-            listen_keyboard(on_press=self._on_press)
-
-    # Words accepted alongside the bare keys on the pipe channel, so a caller that is not a
-    # keyboard can say what it means. The keys stay valid because the GUI and the terminal
-    # then speak the same alphabet, which is one less thing to keep in step.
-    _PIPE_COMMAND_WORDS = {
-        'start': 'start',
-        'stop': 'stop',
-        'home': 'home',
-        'quit': 'quit',
-        'takeover': 'takeover',
-    }
-
-    def _listen_pipe_loop(self) -> None:
-        """One command per line, for a caller that is a program rather than a terminal.
-
-        The GUI reaches this path: it holds the runtime's stdin as a pipe, which no keyboard
-        backend can read -- sshkeyboard and the cbreak fallback both want a terminal. This is
-        the same control shape the recorder already exposes to the gateway (see
-        _write_recorder_stdin), so the two long-running rig processes are driven the same way.
-
-        Reading returns '' only at EOF, which is the writer closing the pipe. That is a quit:
-        whoever was steering this rollout is gone, and continuing to move the arm with no
-        controller is the one outcome worth avoiding.
-        """
-        for raw_line in sys.stdin:
-            if self.quit_requested.is_set():
-                return
-            command = raw_line.strip().lower()
-            if not command:
-                continue
-            resolved = self._PIPE_COMMAND_WORDS.get(command)
-            if resolved == 'start':
-                self._on_press(self.start_key)
-            elif resolved == 'stop':
-                self._on_press(self.stop_key)
-            elif resolved == 'home':
-                self._on_press(self.home_key)
-            elif resolved == 'quit':
-                self._on_press(self.quit_key)
-            elif resolved == 'takeover':
-                if self.takeover_key is None:
-                    print('[WARN] interactive_pipe_takeover_ignored reason=takeover_disabled')
-                else:
-                    self._on_press(self.takeover_key)
-            elif len(command) == 1:
-                self._on_press(command)
-            else:
-                print(f'[WARN] interactive_pipe_command_ignored={command!r}')
-        print('[INFO] interactive_pipe=closed_by_peer')
-        self._on_press(self.quit_key)
-
-    @staticmethod
-    def _stdin_is_pipe() -> bool:
-        """Whether stdin can actually deliver commands without being a terminal.
-
-        A pipe or a socket has a writer on the other end; /dev/null (which is what
-        subprocess.DEVNULL gives) is a character device that returns EOF immediately, and
-        treating that as a control channel would quit the rollout the moment it started.
-        """
-        try:
-            mode = os.fstat(sys.stdin.fileno()).st_mode
-        except (OSError, ValueError):
-            return False
-        return stat_module.S_ISFIFO(mode) or stat_module.S_ISSOCK(mode)
-
-    def _listen_stdin_loop(self) -> None:
-        if not sys.stdin.isatty():
-            raise RuntimeError('Interactive rollout fallback requires a TTY stdin.')
-
-        fd = sys.stdin.fileno()
-        original_termios = termios.tcgetattr(fd)
-        try:
-            tty.setcbreak(fd)
-            while not self.quit_requested.is_set():
-                readable, _, _ = select.select([sys.stdin], [], [], 0.1)
-                if not readable:
-                    continue
-                char = sys.stdin.read(1)
-                if char == '\x03':
-                    self._on_press(self.quit_key)
-                    break
-                if char == '\x1b':
-                    self._on_press(self.quit_key)
-                    continue
-                self._on_press(char)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, original_termios)
-
-    def start(self) -> None:
-        # Checked before sshkeyboard, not after: sshkeyboard grabs the *terminal*, so on a
-        # process whose stdin is a pipe it would install a backend that can never receive a
-        # key while the channel that can sits unused.
-        if not sys.stdin.isatty() and self._stdin_is_pipe():
-            self._thread = threading.Thread(target=self._listen_pipe_loop, daemon=True)
-            self._thread.start()
-            backend = 'pipe'
-            print(
-                '[INFO] interactive_rollouts=enabled '
-                f'keyboard_backend={backend} '
-                f"start_key='{self.start_key}' stop_key='{self.stop_key}' "
-                f"home_key='{self.home_key}' quit_key='{self.quit_key}'"
-                + ('' if self.takeover_key is None else f" takeover_key='{self.takeover_key}'")
-            )
-            return
-
-        try:
-            from sshkeyboard import listen_keyboard, stop_listening
-        except ImportError:
-            if not sys.stdin.isatty():
-                raise RuntimeError(
-                    'Interactive rollout mode requires `sshkeyboard`, a TTY stdin, or a pipe '
-                    'on stdin. Install sshkeyboard in the runtime, run with an interactive '
-                    'TTY, or drive it from a parent process that holds stdin open.'
-                )
-            self._thread = threading.Thread(target=self._listen_stdin_loop, daemon=True)
-            self._thread.start()
-            backend = 'stdin'
-        else:
-            self._stop_listening = stop_listening
-            self._thread = threading.Thread(
-                target=self._listen_keyboard_loop,
-                args=(listen_keyboard,),
-                daemon=True,
-            )
-            self._thread.start()
-            backend = 'sshkeyboard'
-
-        print(
-            '[INFO] interactive_rollouts=enabled '
-            f'keyboard_backend={backend} '
-            f"start_key='{self.start_key}' stop_key='{self.stop_key}' "
-            f"home_key='{self.home_key}' quit_key='{self.quit_key}'"
-            + ('' if self.takeover_key is None else f" takeover_key='{self.takeover_key}'")
-        )
-
-    def wait_for_command(self, *, arm_at_start: bool) -> str:
-        """Block until the operator asks for the next thing: 'start', 'home' or 'quit'.
-
-        Every request flag is cleared on entry, so a key pressed *during* a rollout is dropped
-        rather than acted on the instant that rollout ends. That matters most for home: an arm
-        that begins moving on its own seconds after the operator stopped watching is the exact
-        outcome an interactive mode exists to prevent.
-
-        `arm_at_start` is printed rather than assumed. The launcher homes the arm once, before
-        this process exists; from the second rollout onwards the arm is wherever the last one
-        left it, and a banner that keeps claiming otherwise is how an operator ends up starting
-        a rollout from a pose the dataset frame was never anchored to.
-        """
-        self.start_requested.clear()
-        self.stop_requested.clear()
-        self.home_requested.clear()
-        # Every rollout begins under the policy. A takeover left engaged from the last one
-        # would hand the arm to a SpaceMouse nobody is holding, at the moment a fresh rollout
-        # starts moving.
-        self.takeover_engaged.clear()
-        print(
-            '[INFO] interactive_waiting_for_start '
-            f'arm_at_start={1 if arm_at_start else 0} '
-            f"press '{self.start_key}' to start, '{self.home_key}' to move to start, "
-            f"'{self.quit_key}' to quit."
-        )
-        while not self.quit_requested.is_set():
-            if self.start_requested.wait(timeout=0.1):
-                self.start_requested.clear()
-                self.stop_requested.clear()
-                # Quit sets start_requested too, to break exactly this wait. Without the
-                # re-check it reads as a start, and the session announces a rollout index it
-                # then immediately abandons.
-                if self.quit_requested.is_set():
-                    break
-                return 'start'
-            if self.home_requested.is_set():
-                self.home_requested.clear()
-                return 'home'
-        return 'quit'
-
-    def takeover_is_engaged(self) -> bool:
-        return self.takeover_key is not None and self.takeover_engaged.is_set()
-
-    def should_stop_rollout(self) -> bool:
-        return self.stop_requested.is_set() or self.quit_requested.is_set()
-
-    def close(self) -> None:
-        self.quit_requested.set()
-        if callable(self._stop_listening):
-            try:
-                self._stop_listening()
-            except Exception:
-                pass
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
 
 
 def _coerce_opencv_index_or_path(value: Any) -> int | Path:
@@ -3439,69 +3280,6 @@ def apply_gripper_observation_offset(
     return corrected_observation
 
 
-def _extract_observation_pose(robot_observation: RobotObservation) -> tuple[np.ndarray, Rotation]:
-    position = np.asarray(
-        [robot_observation['ee.x'], robot_observation['ee.y'], robot_observation['ee.z']],
-        dtype=np.float64,
-    )
-    rotation = Rotation.from_rotvec(
-        [robot_observation['ee.wx'], robot_observation['ee.wy'], robot_observation['ee.wz']]
-    )
-    return position, rotation
-
-
-def _extract_command_pose(robot_command: dict[str, float]) -> tuple[np.ndarray, Rotation]:
-    position = np.asarray([robot_command['ee.x'], robot_command['ee.y'], robot_command['ee.z']], dtype=np.float64)
-    rotation = Rotation.from_rotvec([robot_command['ee.wx'], robot_command['ee.wy'], robot_command['ee.wz']])
-    return position, rotation
-
-
-def compute_pose_delta_from_current(
-    robot_command: dict[str, float],
-    robot_observation: RobotObservation,
-) -> tuple[np.ndarray, np.ndarray]:
-    current_position, current_rotation = _extract_observation_pose(robot_observation)
-    target_position, target_rotation = _extract_command_pose(robot_command)
-    position_delta = target_position - current_position
-    rotation_delta = (current_rotation.inv() * target_rotation).as_rotvec()
-    return position_delta, rotation_delta
-
-
-def smooth_robot_command_ema(
-    robot_command: dict[str, float],
-    previous_command: dict[str, float] | None,
-    *,
-    alpha: float | None,
-) -> dict[str, float]:
-    if alpha is None:
-        return dict(robot_command)
-    alpha = float(alpha)
-    if not 0.0 < alpha <= 1.0:
-        raise ValueError('--command-ema-alpha must be in (0, 1] when provided.')
-    if previous_command is None or alpha >= 1.0:
-        return dict(robot_command)
-
-    previous_position, previous_rotation = _extract_command_pose(previous_command)
-    target_position, target_rotation = _extract_command_pose(robot_command)
-    smoothed_position = previous_position + alpha * (target_position - previous_position)
-    relative_rotation = previous_rotation.inv() * target_rotation
-    smoothed_rotation = previous_rotation * Rotation.from_rotvec(alpha * relative_rotation.as_rotvec())
-    smoothed_rotvec = smoothed_rotation.as_rotvec()
-
-    smoothed_command = dict(robot_command)
-    smoothed_command.update(
-        {
-            'ee.x': float(smoothed_position[0]),
-            'ee.y': float(smoothed_position[1]),
-            'ee.z': float(smoothed_position[2]),
-            'ee.wx': float(smoothed_rotvec[0]),
-            'ee.wy': float(smoothed_rotvec[1]),
-            'ee.wz': float(smoothed_rotvec[2]),
-        }
-    )
-    return smoothed_command
-
-
 def apply_place_assist_offset(
     robot_command: dict[str, float],
     robot_observation: RobotObservation,
@@ -3651,129 +3429,6 @@ def should_reject_first_command(
         or np.any(np.abs(rotation_delta) > float(max_rot_delta_rad))
     )
     return reject, position_delta, rotation_delta
-
-
-def _extract_previous_command_pose(
-    robot_observation: RobotObservation,
-) -> tuple[np.ndarray, Rotation] | None:
-    """The pose the policy's delta is defined against, or None if the robot does not report it.
-
-    This is the driver's own last sent command -- the same field the recorder wrote into
-    ``observation.state.prev_cmd.*`` and the same one ``DeltaEEToAbsoluteEEAction`` rebuilds the
-    absolute target from. Reading it here is what lets the step guard judge the policy by the
-    quantity the policy actually produced, rather than by that quantity plus the servo lag.
-    """
-    keys = PREV_CMD_POSITION_KEYS + PREV_CMD_ROTVEC_KEYS
-    if not all(key in robot_observation for key in keys):
-        return None
-    position = np.asarray([robot_observation[key] for key in PREV_CMD_POSITION_KEYS], dtype=np.float64)
-    rotation = Rotation.from_rotvec([robot_observation[key] for key in PREV_CMD_ROTVEC_KEYS])
-    return position, rotation
-
-
-def _shorten_to_limit(delta: np.ndarray, limit: float) -> tuple[np.ndarray, bool]:
-    """Shorten an over-long delta without turning it.
-
-    Per-axis ``np.clip`` silently changes the commanded *direction*: a mostly-downward reach of
-    (0.2, 2.5, -4.9) mm clips to (0.2, 2.5, -3.0) mm, which points somewhere the policy never
-    asked to go. Worse, it bends hardest along whichever axis is carrying the motion, so a descent
-    gets throttled while the lateral drift rides through untouched -- on the 299/299 run, 77% of
-    all discarded displacement was the z component. Scaling the whole vector keeps the heading and
-    only reduces the distance.
-    """
-    magnitude = float(np.linalg.norm(delta))
-    if magnitude <= limit or magnitude == 0.0:
-        return delta, False
-    return delta * (limit / magnitude), True
-
-
-def limit_command_for_safety(
-    robot_command: dict[str, float],
-    robot_observation: RobotObservation,
-    *,
-    max_step_pos_delta_m: float,
-    max_step_rot_delta_rad: float,
-    max_leash_pos_delta_m: float,
-    max_leash_rot_delta_rad: float,
-) -> tuple[dict[str, float], dict[str, Any]]:
-    """Bound the command twice, against the two references that mean different things.
-
-    **Step** -- how much motion the policy asked for, measured from ``prev_cmd``, the pose its
-    delta is defined against. This is the guard on policy aggression, and the training data sizes
-    it directly.
-
-    **Leash** -- how far the resulting command sits from where the arm actually is. That gap is
-    tracking lag, not intent; it is large and healthy whenever the arm is moving, and it only
-    means trouble when the arm has stopped tracking altogether.
-
-    Collapsing the two -- judging intent by the gap -- is what made a well-behaved rollout report
-    every one of its 299 steps as clamped while the arm was in fact following the policy closely.
-    """
-    current_position, current_rotation = _extract_observation_pose(robot_observation)
-    target_position, target_rotation = _extract_command_pose(robot_command)
-
-    # Reported unchanged for the log, so ``pos_delta_mm`` keeps meaning what it always meant.
-    raw_gap_position_delta = target_position - current_position
-    raw_gap_rotation_delta = (current_rotation.inv() * target_rotation).as_rotvec()
-
-    reference = _extract_previous_command_pose(robot_observation)
-    if reference is None:
-        # No prev_cmd in the observation: fall back to the measured pose. The step guard then
-        # degrades to the old behaviour rather than silently vanishing.
-        reference_position, reference_rotation = current_position, current_rotation
-    else:
-        reference_position, reference_rotation = reference
-
-    step_position_delta = target_position - reference_position
-    step_rotation_delta = (reference_rotation.inv() * target_rotation).as_rotvec()
-    limited_step_position, step_position_limited = _shorten_to_limit(
-        step_position_delta, float(max_step_pos_delta_m)
-    )
-    limited_step_rotation, step_rotation_limited = _shorten_to_limit(
-        step_rotation_delta, float(max_step_rot_delta_rad)
-    )
-    target_position = reference_position + limited_step_position
-    target_rotation = reference_rotation * Rotation.from_rotvec(limited_step_rotation)
-
-    gap_position_delta = target_position - current_position
-    gap_rotation_delta = (current_rotation.inv() * target_rotation).as_rotvec()
-    limited_gap_position, leash_position_limited = _shorten_to_limit(
-        gap_position_delta, float(max_leash_pos_delta_m)
-    )
-    limited_gap_rotation, leash_rotation_limited = _shorten_to_limit(
-        gap_rotation_delta, float(max_leash_rot_delta_rad)
-    )
-
-    safe_position = current_position + limited_gap_position
-    safe_rotation = current_rotation * Rotation.from_rotvec(limited_gap_rotation)
-    safe_rotvec = safe_rotation.as_rotvec()
-    safe_command = dict(robot_command)
-    safe_command.update(
-        {
-            'ee.x': float(safe_position[0]),
-            'ee.y': float(safe_position[1]),
-            'ee.z': float(safe_position[2]),
-            'ee.wx': float(safe_rotvec[0]),
-            'ee.wy': float(safe_rotvec[1]),
-            'ee.wz': float(safe_rotvec[2]),
-        }
-    )
-
-    step_limited = bool(step_position_limited or step_rotation_limited)
-    leash_limited = bool(leash_position_limited or leash_rotation_limited)
-    guard: dict[str, Any] = {
-        'position_delta': raw_gap_position_delta,
-        'rotation_delta': raw_gap_rotation_delta,
-        'step_position_delta': step_position_delta,
-        'step_rotation_delta': step_rotation_delta,
-        'step_limited': step_limited,
-        'leash_limited': leash_limited,
-        'has_prev_cmd_reference': reference is not None,
-        # The leash firing is the one worth reacting to: it means the command is running away
-        # from an arm that is not following it.
-        'status': 'leash_limited' if leash_limited else ('step_limited' if step_limited else 'pass'),
-    }
-    return safe_command, guard
 
 
 def _format_vector(values: np.ndarray, *, scale: float = 1.0) -> str:
@@ -4021,7 +3676,7 @@ def resolve_rtc_replan_queue_size(policy: Any, requested_replan_queue_size: int)
 
 
 
-def build_expert_takeover(args: argparse.Namespace) -> ExpertTakeover | None:
+def build_expert_takeover(args: argparse.Namespace, *, step_period_s: float) -> ExpertTakeover | None:
     """Connect the SpaceMouse the operator will steer with, or explain why there is none.
 
     Imported here rather than at module scope so a rig with no HID library, or no device
@@ -4040,13 +3695,109 @@ def build_expert_takeover(args: argparse.Namespace) -> ExpertTakeover | None:
         overrides['rotation_scale'] = float(args.dagger_rotation_scale)
     teleop = SpaceMouseTeleop(SpaceMouseTeleopConfig(**overrides))
     teleop.connect()
+    release_after_s = float(args.dagger_takeover_release_after_s)
+    # `frequency` is the rate the scales are calibrated against, not the device's report rate --
+    # see `motion_gain_for`. This loop runs slower, so one reading has to cover proportionally
+    # more ground to move the arm at the speed the recorder moved it.
+    motion_gain = motion_gain_for(tick_hz=float(teleop.config.frequency), step_period_s=step_period_s)
     print(
         '[INFO] dagger_takeover=ready '
         f"device_id={overrides['device_id']} "
         f"translation_scale={teleop.config.translation_scale:.6f} "
-        f"rotation_scale={teleop.config.rotation_scale:.6f}"
+        f"rotation_scale={teleop.config.rotation_scale:.6f} "
+        f'release_after_s={release_after_s:.2f} '
+        f'motion_gain={motion_gain:.2f} '
+        f'full_deflection_mm_per_step={teleop.config.translation_scale * motion_gain * 1000.0:.1f}'
     )
-    return ExpertTakeover(teleop)
+    return ExpertTakeover(teleop, release_after_s=release_after_s, motion_gain=motion_gain)
+
+
+def build_dagger_writer(
+    args: argparse.Namespace,
+    *,
+    ds_meta: LeRobotDatasetMetadata,
+    fps: float,
+) -> tuple[Any, DaggerEpisodeWriter] | None:
+    """Open (or extend) the dataset the corrections will be written to.
+
+    The schema is the imitated dataset's own plus ``is_intervention``: a DAgger episode is only
+    worth anything if it is shaped like the demonstrations it will be trained beside, and any
+    other way of deriving the schema is a way for the two to drift apart.
+
+    Extending rather than recreating is deliberate and is the recorder's own behaviour -- a
+    second session of corrections belongs in the same place as the first, and
+    ``LeRobotDataset.create`` on an existing root raises rather than appending.
+    """
+    if not args.dagger_takeover or args.dagger_dataset_root is None:
+        return None
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    root = Path(args.dagger_dataset_root).expanduser()
+    repo_id = str(args.dagger_dataset_repo_id or root.name)
+    features = dagger_dataset_features(dict(ds_meta.features))
+    if root.exists():
+        dataset = LeRobotDataset(repo_id, root=root)
+        # The frames written below are built against `features`, derived from the dataset being
+        # imitated. If the root points at a dataset built from something else, every column
+        # would be filled from the wrong place -- and a schema mismatch that only shows up as a
+        # badly trained policy is worth failing on here instead.
+        mismatched = sorted(set(features) ^ set(dataset.meta.features))
+        if mismatched:
+            raise SystemExit(
+                f'--dagger-dataset-root {root} holds a dataset whose schema differs from '
+                f'{ds_meta.repo_id}: {mismatched}. Point it at a fresh directory, or at the '
+                'DAgger dataset recorded against this same view.'
+            )
+        print(
+            f'[INFO] dagger_dataset=extending root={root} repo_id={repo_id} '
+            f'episodes={dataset.meta.total_episodes}'
+        )
+    else:
+        dataset = LeRobotDataset.create(
+            repo_id,
+            fps=int(round(fps)),
+            root=root,
+            features=features,
+            use_videos=True,
+        )
+        print(f'[INFO] dagger_dataset=created root={root} repo_id={repo_id} fps={int(round(fps))}')
+    return dataset, DaggerEpisodeWriter(dataset, min_span_frames=int(args.dagger_min_span_frames))
+
+
+def build_dagger_action_encoder(
+    action_names: list[str],
+    *,
+    robot_cfg: FrankaResearch3Config,
+    gripper_feature_name: str | None,
+) -> tuple[Any, Callable[[float], float]]:
+    """The two pieces the writer cannot import: the delta encoder and the gripper's units.
+
+    ``AbsoluteEEToDeltaEEAction`` is the step the *recorder* used to turn a command into the
+    delta it stored. Using it here rather than a second implementation is what makes a DAgger
+    sample and a demonstration sample the same arithmetic; anything else would be a second
+    definition of the action space, discoverable only as a policy that has learned an offset.
+    """
+    reference = delta_reference_from_action_names(action_names)
+    encode_delta: Callable[[dict[str, float], dict[str, float]], dict[str, float]] | None = None
+    if reference is not None:
+        from lerobot.robots.franka_research3.processor_franka_research3 import (
+            AbsoluteEEToDeltaEEAction,
+        )
+
+        encoder = AbsoluteEEToDeltaEEAction(reference=reference)
+
+        def encode_delta(absolute_action, dataset_observation_i):  # noqa: F811
+            return encoder(
+                {
+                    TransitionKey.ACTION: dict(absolute_action),
+                    TransitionKey.OBSERVATION: dict(dataset_observation_i),
+                }
+            )[TransitionKey.ACTION]
+
+    def denormalize_gripper(value: float) -> float:
+        return denormalize_live_gripper_observation(value, robot_cfg, feature_name=gripper_feature_name)
+
+    return encode_delta, denormalize_gripper
 
 
 def resolve_rollout_task_prompt(ds_meta: LeRobotDatasetMetadata, explicit_task_prompt: str | None) -> str | None:
@@ -4626,6 +4377,43 @@ def run_inference(args: argparse.Namespace) -> int:
         )
         preview_sink.start()
 
+    def publish_current_camera_preview_snapshot() -> None:
+        if preview_sink is None:
+            return
+        try:
+            robot_observation = robot.get_observation()
+        except Exception as exc:  # noqa: BLE001 - a background frame must not stop rollout control
+            print(f'[WARN] scene_reset_preview_snapshot=skipped reason={exc}')
+            return
+        preview_observation: dict[str, np.ndarray] = {}
+        for camera_key in required_image_keys:
+            if camera_key not in robot_observation:
+                continue
+            image = np.asarray(robot_observation[camera_key], dtype=np.uint8)
+            if image.ndim != 3 or image.shape[-1] != 3:
+                continue
+            if camera_key in camera_configs:
+                color_mode = getattr(camera_configs[camera_key], 'color_mode', None)
+                try:
+                    color_mode = ColorMode(color_mode)
+                except ValueError:
+                    color_mode = None
+                if color_mode == ColorMode.BGR:
+                    image = np.ascontiguousarray(image[..., ::-1])
+            feature_key = f'{_OBS_IMAGES_PREFIX}{camera_key}'
+            crop = camera_crop_specs.get(feature_key) if camera_crop_specs else None
+            if crop is not None:
+                image = apply_camera_crop(
+                    image,
+                    crop,
+                    feature_key=feature_key,
+                    source_hw=camera_crop_source_hw.get(feature_key) if camera_crop_source_hw else None,
+                )
+            preview_observation[feature_key] = image
+        if preview_observation:
+            preview_sink.publish(preview_observation)
+            print('[INFO] scene_reset_preview_snapshot=published', flush=True)
+
     if args.preview and args.align_gripper_to_dataset_start:
         print('[INFO] preview_gripper_alignment=requested; using virtual observation correction without moving hardware.')
     if args.interactive_rollouts and robot_init_state is None:
@@ -4670,11 +4458,16 @@ def run_inference(args: argparse.Namespace) -> int:
         interactive_keyboard: InteractiveRolloutKeyboard | None = None,
         trace: RolloutGeometryTrace | None = None,
         expert_takeover: ExpertTakeover | None = None,
+        dagger_buffer: DaggerFrameBuffer | None = None,
     ) -> str:
         reset_policy_runtime_state()
         T_B_Ws: np.ndarray | None = None
         start_alignment_stats: dict[str, Any] | None = None
         previous_dataset_quaternion_xyzw: np.ndarray | None = None
+        # Separate from the observation's continuity state above: this one tracks the sign of
+        # the *action* quaternion written to the DAgger dataset, which is a different sequence
+        # of rotations and would flip at different frames.
+        previous_dagger_quaternion_xyzw: np.ndarray | None = None
         preview_gripper_offset: float | None = None
         latest_chunk_ee_poses: list[np.ndarray] | None = None
         camera_preview_enabled = bool(args.camera_preview_window)
@@ -5041,7 +4834,9 @@ def run_inference(args: argparse.Namespace) -> int:
             command_source = 'policy'
             if expert_takeover is not None:
                 robot_command, takeover_debug = expert_takeover.command(
-                    engaged=interactive_keyboard is not None and interactive_keyboard.takeover_is_engaged(),
+                    # `latched` is the manual override, not the ordinary way in: moving the
+                    # SpaceMouse is what takes the arm, and letting go of it hands the arm back.
+                    latched=interactive_keyboard is not None and interactive_keyboard.takeover_is_engaged(),
                     policy_command=robot_command,
                     previous_sent_command=previous_sent_command,
                     robot_observation=robot_observation,
@@ -5156,6 +4951,55 @@ def run_inference(args: argparse.Namespace) -> int:
                     source=command_source,
                 )
 
+            if dagger_buffer is not None:
+                # Offered every step, kept only when the operator was driving: the buffer owns
+                # where a span starts, so this call site never has to know.
+                if command_source == 'expert':
+                    dagger_action, previous_dagger_quaternion_xyzw = sent_command_to_dataset_action(
+                        command_to_send,
+                        T_B_Ws=T_B_Ws,
+                        dataset_observation_i=dataset_state_observation_i,
+                        encode_delta=dagger_encode_delta,
+                        denormalize_gripper=dagger_denormalize_gripper,
+                        previous_quaternion_xyzw=previous_dagger_quaternion_xyzw,
+                    )
+                    dagger_buffer.append(
+                        build_dagger_frame(
+                            dataset_features=dagger_features,
+                            # The dataset-frame observation, not the base-frame one: a rollout
+                            # runs with the arm's start pose offset from the dataset's, and an
+                            # observation written in the live base frame would carry that offset
+                            # into every sample.
+                            observation_values={
+                                **dataset_state_observation_i,
+                                **{key: robot_observation[key] for key in dagger_image_keys},
+                            },
+                            action_values=dagger_action,
+                            task=dagger_task,
+                        ),
+                        is_expert=True,
+                    )
+                else:
+                    dagger_buffer.append({}, is_expert=False)
+
+            if live_frame_emitter.wants(step_idx):
+                # Measured joints with the *commanded* end-effector target beside them, which is
+                # the pair that makes a clamp visible: the arm lags a command it is following and
+                # stops tracking one it is not, and only the two together tell those apart.
+                live_frame_emitter.emit_step(
+                    step_idx,
+                    # Thunks, not values: reading joints out of an observation can raise on a
+                    # robot config that does not report them, and the emitter's guarantee is
+                    # that the picture never costs the run.
+                    joints_rad=lambda: _observation_joint_positions(robot_observation),
+                    gripper=lambda: float(robot_observation['gripper.pos']),
+                    source=command_source,
+                    status=str(command_status),
+                    rollout_index=None if trace is None else int(trace.rollout_index),
+                    target_position_m=lambda: [float(command_to_send[key]) for key in EE_POSITION_KEYS],
+                    actual_position_m=lambda: [float(robot_observation[key]) for key in EE_POSITION_KEYS],
+                )
+
             elapsed_s = time.perf_counter() - loop_start_t
             sleep_s = max(1.0 / policy_fps - elapsed_s, 0.0)
 
@@ -5223,6 +5067,9 @@ def run_inference(args: argparse.Namespace) -> int:
                     log_message += (
                         f" source={command_source} takeover={takeover_debug.get('status', '')}"
                         f" takeover_gripper={int(bool(takeover_debug.get('gripper_owned')))}"
+                        # How many SpaceMouse reports this step absorbed. Reading one per step
+                        # is what made takeover feel like treacle: see tools/fr3/dagger_takeover.
+                        f" step_mm={takeover_debug.get('step_mm', 0.0):.1f}"
                     )
                 log_message += f" loop_ms={elapsed_s * 1000.0:.1f} sleep_ms={sleep_s * 1000.0:.1f}"
                 print(log_message)
@@ -5232,15 +5079,50 @@ def run_inference(args: argparse.Namespace) -> int:
         return finish_rollout('completed')
 
     rollout_trace_dir = Path(args.rollout_trace_dir).expanduser() if args.rollout_trace_dir else None
+    dagger_open = build_dagger_writer(args, ds_meta=ds_meta, fps=policy_fps)
+    dagger_dataset_handle, dagger_writer = dagger_open if dagger_open is not None else (None, None)
+    dagger_features = dagger_dataset_features(dict(ds_meta.features)) if dagger_writer is not None else {}
+    dagger_image_keys = image_source_keys(dagger_features) if dagger_writer is not None else []
+    dagger_encode_delta, dagger_denormalize_gripper = (
+        build_dagger_action_encoder(
+            action_names,
+            robot_cfg=robot_cfg,
+            gripper_feature_name=dataset_gripper_feature_name,
+        )
+        if dagger_writer is not None
+        else (None, lambda value: value)
+    )
+    # The prompt the corrections are labelled with. A DAgger episode that carries a different
+    # task string from the demonstrations is an episode a language-conditioned policy will not
+    # associate with the thing it was correcting.
+    dagger_task = str(task_prompt or '')
+    if dagger_writer is not None and not dagger_task:
+        raise SystemExit(
+            '--dagger-dataset-root needs a task prompt to label the corrections with; pass '
+            '--task-prompt (the dataset has more than one task).'
+        )
+    live_frame_emitter = LiveFrameEmitter(interval=int(args.live_frame_interval))
+    if live_frame_emitter.enabled:
+        print(f'[INFO] live_frame_stream=enabled interval={live_frame_emitter.interval}')
     interactive_keyboard: InteractiveRolloutKeyboard | None = None
     expert_takeover: ExpertTakeover | None = None
     if args.dagger_takeover and not args.interactive_rollouts:
-        # The key that engages it only exists in interactive mode, so a takeover asked for
-        # anywhere else could never be triggered -- and a device connected but unreachable is
-        # worse than one that was never opened.
+        # Interactive mode is the one that has an operator sitting at the rig with a hand on the
+        # device. A bounded scripted run has nobody to take the arm from the policy, and a
+        # device connected but unattended is worse than one that was never opened.
         raise SystemExit('--dagger-takeover requires --interactive-rollouts.')
+    # Opened before the try so the finally can always close it: a stack created inside the try
+    # is undefined if the statement above it raises, and the NameError that follows in the
+    # finally would replace the error worth reading.
+    dagger_encoding = ExitStack()
     try:
-        expert_takeover = build_expert_takeover(args)
+        expert_takeover = build_expert_takeover(args, step_period_s=1.0 / policy_fps)
+        # The recorder wraps its whole session in this for the same reason: episodes saved
+        # inside it get their video finalized on the way out, and one saved outside it does not.
+        if dagger_dataset_handle is not None:
+            from lerobot.datasets.video_utils import VideoEncodingManager
+
+            dagger_encoding.enter_context(VideoEncodingManager(dagger_dataset_handle))
         if args.interactive_rollouts:
             interactive_keyboard = InteractiveRolloutKeyboard(
                 start_key=args.rollout_start_key,
@@ -5259,24 +5141,50 @@ def run_inference(args: argparse.Namespace) -> int:
             arm_at_start = True
             while not interactive_keyboard.quit_requested.is_set():
                 move_to_robot_init_state_if_requested(robot, robot_init_state)
+                publish_current_camera_preview_snapshot()
                 command = interactive_keyboard.wait_for_command(arm_at_start=arm_at_start)
                 if command == 'quit':
                     break
                 if command == 'home':
                     arm_at_start = home_arm_to_start_pose(robot)
                     continue
+                if command == 'scene_reset':
+                    payload = interactive_keyboard.pop_scene_reset_payload()
+                    try:
+                        request = scene_reset_request_from_payload(payload or {})
+                    except SceneResetError as exc:
+                        print(f'[WARN] scene_reset=failed details={exc}')
+                        arm_at_start = False
+                        continue
+                    result = execute_scene_reset(robot, request)
+                    arm_at_start = bool(result.get('ok')) and bool(request.returnToStart)
+                    continue
                 rollout_index += 1
                 arm_at_start = False
                 print(f'[INFO] interactive_rollout_start index={rollout_index}')
                 trace = RolloutGeometryTrace(rollout_index, trace_dir=rollout_trace_dir)
+                dagger_buffer = (
+                    DaggerFrameBuffer(max_frames=int(args.dagger_max_buffered_frames))
+                    if dagger_writer is not None
+                    else None
+                )
                 rollout_status = run_policy_rollout(
-                    interactive_keyboard, trace=trace, expert_takeover=expert_takeover
+                    interactive_keyboard,
+                    trace=trace,
+                    expert_takeover=expert_takeover,
+                    dagger_buffer=dagger_buffer,
                 )
                 print(
                     f'[INFO] interactive_rollout_end index={rollout_index} status={rollout_status} '
                     + trace.summary_log_fields()
                 )
                 trace.write()
+                if dagger_writer is not None and dagger_buffer is not None:
+                    # Here, not at the end of each span: save_episode encodes video, and the end
+                    # of a span is the moment the operator has let go and the policy is about to
+                    # drive the arm again. The loop has stopped by now, so a slow write costs
+                    # nothing but the operator's patience.
+                    dagger_writer.write(dagger_buffer, rollout_index=rollout_index)
                 if rollout_status == 'quit':
                     break
             print('[INFO] interactive_rollouts=stopped')
@@ -5286,6 +5194,7 @@ def run_inference(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print('[INFO] KeyboardInterrupt received, stopping inference loop.')
     finally:
+        dagger_encoding.close()
         if interactive_keyboard is not None:
             interactive_keyboard.close()
         if expert_takeover is not None:

@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { api } from "../apiClient";
 import type { GuiSnapshot } from "../api";
-import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingBackend, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
+import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingBackend, RecordingStatus, ReplayStatus, RolloutLandmarks, SceneResetRequest, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
+import { SceneResetPanel } from "./SceneResetPanel";
 
 export function DeviceList({ devices, config }: { devices: DeviceStatus[]; config: ConfigSummary }) {
   const grouped = useMemo(() => {
@@ -290,6 +292,7 @@ export function LiveRecordPage({
   onStop,
   onSetStartPose,
   onResetStartPose,
+  onSceneReset,
   onOpenInReplay,
   onQueueTrajGen,
   onGoToProcessing,
@@ -307,6 +310,7 @@ export function LiveRecordPage({
   onStop: (action: "save" | "discard" | "exit") => void;
   onSetStartPose: () => void;
   onResetStartPose: () => void;
+  onSceneReset: (request: SceneResetRequest) => Promise<boolean>;
   onOpenInReplay: () => void;
   onQueueTrajGen: () => void;
   onGoToProcessing: () => void;
@@ -318,6 +322,7 @@ export function LiveRecordPage({
   const workstationProfile = snapshot.deployment?.profile === "workstation";
   const supportsBackendChoice = workstationProfile;
   const supportsTrajectoryGeneration = !workstationProfile;
+  const [sceneResetLandmarks, setSceneResetLandmarks] = useState<RolloutLandmarks>({});
   const [selectedBackend, setSelectedBackend] = useState<RecordingBackend>(
     snapshot.recording.backend ?? "real"
   );
@@ -413,6 +418,18 @@ export function LiveRecordPage({
       setSelectedBackend(snapshot.recording.backend);
     }
   }, [recorderConnected, snapshot.recording.backend]);
+
+  useEffect(() => {
+    if (!workstationProfile) return;
+    let cancelled = false;
+    void (async () => {
+      const payload = await api.fetchRolloutLandmarks(snapshot.recording.datasetRoot);
+      if (!cancelled) setSceneResetLandmarks(payload);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [workstationProfile, snapshot.recording.datasetRoot]);
 
   useEffect(() => {
     if (!recorderConnected) {
@@ -553,6 +570,25 @@ export function LiveRecordPage({
         />
         <DeviceList devices={snapshot.devices} config={snapshot.configSummary} />
       </div>
+      {workstationProfile ? (
+        <SceneResetPanel
+          title="Record scene reset"
+          landmarks={sceneResetLandmarks}
+          backgroundImageUrl={recorderConnected ? api.cameraSnapshotUrl("side") : undefined}
+          backgroundLabel="side camera"
+          busy={busy}
+          disabled={!(["armed", "review"].includes(snapshot.recording.state))}
+          disabledReason={
+            ["armed", "review"].includes(snapshot.recording.state)
+              ? ""
+              : "Connect the FR3 recorder and wait between episodes before resetting the scene."
+          }
+          onReset={async (request) => {
+            const ok = await onSceneReset(request);
+            return { ok, error: ok ? undefined : "Scene reset command was rejected." };
+          }}
+        />
+      ) : null}
       {showSavedBanner ? (
         <section className="panel saved-cta">
           <div className="panel-heading">

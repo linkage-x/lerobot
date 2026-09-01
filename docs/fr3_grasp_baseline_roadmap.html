@@ -79,6 +79,7 @@
       <span class="pill">训练：48 ep / 30000 steps / loss 0.123</span>
       <span class="pill">当前门禁：S6 DAgger 接管</span>
       <span class="pill">归因：策略 z 噪声（坐标系漂移已证伪）</span>
+      <span class="pill">S6：接管链路与数据写出均已实现 · 均未上过机</span>
       <span class="pill">S1 / S5 可并行</span>
       <span class="pill">RL：S7，触发判据见第九节</span>
       <span class="pill">S2 / S3 / S4 等落点图决策</span>
@@ -360,12 +361,25 @@
       </div>
 
       <div class="phase">
+        <div class="name">S0.5<br><span class="badge todo">TODO</span></div>
+        <div><b>record / rollout 页面加场景 reset 按钮：自动把 peg 从固定取料位搬到一个随机目标区域。</b>
+          第一性原理上，这个需求要解决的不是"少按几次按钮"，而是把每个 episode 的初始条件从人工摆放变成
+          <b>可复现、可记录、可限位</b>的环境状态。UI 只负责触发和显示状态；后端必须拥有状态机和安全边界：
+          从固定取料位抓取 peg，抓住后先沿 z 抬起 <b>12 cm</b>，再移动到目标点上方并放置。
+          目标点在 xoy 平面内随机，z 固定；随机区域由前端散点图作为参考，并允许用画笔涂抹出可采样 mask。
+          每次 reset 都要记录固定取料位、采样目标、mask 版本、z 高度、执行结果和失败原因。</div>
+        <div>建议先做成等待态才可触发的独立控制命令，不和 policy rollout 混在同一个控制循环里。真机前必须有干跑：
+          mask 采样、边界钳制、12 cm 抬升顺序、抓空/掉落/急停分支全部可见。</div>
+      </div>
+
+      <div class="phase">
         <div class="name">S6<br><span class="badge p0">当前门禁</span></div>
         <div><b>DAgger：在 rollout 里加操作者接管，把失败态直接变成带标签的定向数据。</b>
           两个前置条件都已满足：能跑出有意义 rollout 的 checkpoint（第 8/9 轮），以及 S0.2 的分母
           （2/29 ≈ 7%）。闭合深度散布这条新证据（第七节）也把靶心指到了同一处，
           而回放判别实验排除了坐标系漂移——这条散布没有更便宜的解释了。</div>
-        <div>代码不占机械臂。风险最高的一处改动——它改的是在动机械臂的控制环，见第八节。</div>
+        <div>代码不占机械臂。风险最高的一处改动——它改的是在动机械臂的控制环，见第八节。
+          <br><b>接管链路已实现并可在 MuJoCo 里演练（含网页实时视图）；缺的是把接管段写成训练数据。</b></div>
       </div>
 
       <div class="phase">
@@ -678,33 +692,43 @@
       </ul>
 
       <h3>要动的位置</h3>
+      <div class="callout ok">
+        <b>五行都在树里了。</b>接管键、专家动作源、单一钳制路径、段落标注，
+        以及最后那行<b>数据写出</b>：<code>tools/fr3/dagger_dataset.py</code> 把操作者开过的那些步
+        按段写成 episode，每帧带 <code>is_intervention</code>，落进一个独立的 <code>_dagger</code> 数据集
+        （<code>FR3_DAGGER_DATASET_ROOT</code>）。<b>但和上面四行一样，它还没上过机</b>——
+        单元测试过了 21 项，真机上一次没跑过。
+      </div>
       <div class="tablewrap">
       <table>
         <tr><th>改动点</th><th>位置</th><th>内容</th></tr>
         <tr>
-          <td>接管键</td>
+          <td><span class="badge done">已实现</span> 接管键</td>
           <td><code>InteractiveRolloutKeyboard</code>（runtime:1343）</td>
           <td>与 start / stop / home / quit 同一监听线程里增加接管键，进入与退出都要在 end marker 上留痕</td>
         </tr>
         <tr>
-          <td>专家动作源</td>
+          <td><span class="badge done">已实现</span> 专家动作源</td>
           <td><code>lerobot.teleoperators.spacemouse</code></td>
           <td>录制器已在用同一套（<code>fr3_gui_record_runtime.py:69</code>）；推理侧目前<b>零引用</b>，需要引入</td>
         </tr>
         <tr>
-          <td>单一钳制路径</td>
+          <td><span class="badge done">已实现</span> 单一钳制路径</td>
           <td>runtime:3594–3644</td>
           <td>策略动作与遥操动作必须走同一套 step / leash 钳制，否则交接的那一步本身就是越界</td>
         </tr>
         <tr>
-          <td>段落标注</td>
+          <td><span class="badge done">已实现</span> 段落标注</td>
           <td><code>RolloutGeometryTrace</code>（runtime:2348）</td>
           <td>接管起止 step 与抓取/释放事件同源归档，落在同一条 end marker 上，避免第二条会走样的通道</td>
         </tr>
         <tr>
-          <td>数据写出</td>
-          <td>录制器的 <code>LeRobotDataset</code>（record_runtime:799 / 820）</td>
-          <td>接管段按 episode 写出并带 <code>is_intervention</code>，训练侧只在专家动作上回归</td>
+          <td><span class="badge done">已实现</span> 数据写出</td>
+          <td><code>tools/fr3/dagger_dataset.py</code> + runtime 的 <code>build_dagger_writer</code></td>
+          <td>接管段按 episode 写出并带 <code>is_intervention</code>，训练侧只在专家动作上回归。
+            <b>写的是实际发出去的那条命令</b>（过完 EMA 与钳制），不是操作者的原始请求——
+            专家的原始 delta 经常大于步长守卫允许的量，回归"请求"等于教策略去下一条
+            自己的运行时会拒绝的命令。</td>
         </tr>
       </table>
       </div>
@@ -718,6 +742,92 @@
           <li>先在 MuJoCo 后端把交接跑通，再上真机。</li>
         </ul>
       </div>
+      <h3>MuJoCo 交接演练与网页实时视图（已实现）</h3>
+      <p>"先在 MuJoCo 后端把交接跑通"现在有一个具体的东西可跑：
+        <code>tools/fr3/dagger_sim_dryrun.py</code>。它<b>不加载 checkpoint</b>——
+        被演练的是交接，不是策略，而一条<b>逐帧回放的 demo</b> 恰好具备交接需要的全部性质：
+        每帧都出命令、可重复、并且在操作者一动手就<b>不再知道机械臂在哪</b>，
+        而那正是交还必须挺过去的条件。让策略真的在 sim 里跑，需要仿真把两路相机渲染到可信，
+        那演练的是渲染，不是交接。</p>
+      <ul>
+        <li><b>接管期间 demo 流冻结。</b>它是开环的：继续推进就会用一条机械臂已经不在的轨迹算出目标，
+          交还时相差以米计。冻结之后，交还就是一条回到暂停点的命令，并且走同一套步长钳制——
+          机械臂按钳制速率<b>走</b>回去而不是扑过去。走回去的距离记为 <code>handback_gap_mm</code>，
+          这是演练要产出的那个数。</li>
+        <li><b>钳制与控制通道已抽出共享模块</b>（<code>tools/fr3/command_guard.py</code>、
+          <code>tools/fr3/interactive_control.py</code>）：演练跑的必须是真机要跑的那一份，
+          两份实现就是在演练一个没人会运行的守卫。抽出来的另一个好处是它们不再依赖策略栈，
+          <b>可以在这台工作站上直接测</b>（本机导不动 <code>lerobot.policies</code>，见第四节）。</li>
+        <li><b>每个控制步要把设备排队的报文全部读干净。</b>SpaceMouse 按 200 Hz 出报文，
+          而它的两个 scale（<code>translation_scale</code> 0.000615 m、<code>rotation_scale</code>
+          0.000648 rad）是<b>每报文</b>的量，不是每秒的量。rollout 环跑 30 Hz，一步只读一份报文，
+          就等于把操作者手上的动作打了三到六折；没读的那些堆在 hidraw 队列里直到溢出，
+          于是<b>真正读到的那一份已经是将近一秒前的手</b>。同一只手，慢六倍、还迟到、还一阵一阵地来——
+          接管手感像在推糨糊，原因全在这里。把一步之内排队的报文<b>累加成一个 delta</b>，
+          就还原了录制端本来的算术：同样的报文、同样的 scale、同样的每秒距离，
+          读它的那个环跑多快都一样。</li>
+        <li><b>模拟臂不报 <code>prev_cmd</code></b>，而步长守卫缺了它会退回按<b>实测位姿</b>量步长——
+          那把跟踪滞后折进了步长，同一条命令在演练里和真机上会被钳制成不同的样子。
+          演练把自己上一条已发命令写进那几个字段，值不是编的：那正是真机上这个字段的含义。</li>
+      </ul>
+      <div class="callout ok">
+        <b>网页端实时视图：不再是"先 run mujoco、再 play"。</b>
+        运行中的进程每步打印一行 <code>live_frame=</code>（七个关节角、夹爪、指令位姿、实测位姿，
+        以及<b>这一步是谁在开</b>），gateway 收进一个有界环形缓冲，页面每 150 ms 取增量、
+        按产生时的帧率播放。<b>关节角而不是画面</b>：浏览器已经有这条臂的 FK 模型
+        （回放视图用的 <code>kinematics.json</code>），七个浮点数比一张 JPEG 便宜得多，
+        而且发送端不渲染、不编码、不阻塞——一个会拖慢控制环的观察器，就是会改变被观察对象的观察器。
+        代价是画面比机械臂晚约一个轮询（0.2 秒左右）；换来的是运动是连续的，
+        而不是每秒五帧的跳格。
+        <br><b>页面上没有接管按钮，这是有意的。</b>动一下 SpaceMouse 就把机械臂拿走，
+        松手静止约 1 秒（<code>--dagger-takeover-release-after-s</code>）策略自己接回去。
+        按钮是出事那一刻还要去找的第二样东西，而且是会被忘在错误位置的东西——
+        上一次 rollout 结束时还锁着接管，下一次就把机械臂交给了一个没人握着的设备。
+        页面只在<b>运行时自己声明绑定了接管键</b>时提示"SpaceMouse 已就绪"：没有设备时运行时拒绝绑定。
+        终端的 <code>t</code>（以及同名的控制词）保留为<b>手动锁定</b>，给想让机械臂停住不动的操作者，
+        不是接管的常规入口。<b>谁在开</b>由实时视图自己的 pill 显示，读的是运行时发出的帧，
+        而不是页面上的某一次点击——页面和机械臂在这件事上不该有分歧。
+      </div>
+      <h3>接管段写成训练数据（已实现，未上机）</h3>
+      <p>三个决定值得记下来，因为每一个的反面都会安静地产出一份看不出问题的坏数据集。</p>
+      <ul>
+        <li><b>写的是发出去的命令，不是操作者的请求。</b>存进去的动作是过完 EMA 与步长/牵引钳制、
+          真正到达机械臂的那一条。这也是录制端自己的约定，但在这里更要紧：专家的原始 delta
+          经常大于步长守卫允许的量，回归"请求"就是在教策略说一门<b>它自己的运行时听不懂的话</b>。</li>
+        <li><b>只写操作者开过的那些步。</b>接管之前的几帧是策略正在出错的那几帧，
+          把它们一起回归就是在学那个正在被纠正的错误。段边界直接就是
+          <code>expert_spans</code> 的边界，所以轨迹文件和数据集不可能对"纠正了哪一段"有分歧。</li>
+        <li><b>一段一个 episode，而且在 rollout 结束后才写。</b><code>save_episode</code> 要编码视频，
+          耗时以秒计；而一段结束的那一瞬间，正是操作者刚松手、策略马上要重新驱动一条真机械臂的时刻——
+          整个 rollout 里最不该卡住控制环的一刻。所以接管帧先留在内存里（上限
+          <code>--dagger-max-buffered-frames</code>，默认 450 帧≈15 秒），机械臂停下来再写。
+          两段纠正<b>不会</b>被拼成一个 episode：拼接处的两帧相隔数秒、相距数厘米，
+          跨过它训练就是在学一个机械臂从未做过的转移。</li>
+      </ul>
+      <div class="callout ok">
+        <b>落在独立的 <code>_dagger</code> 数据集里</b>（<code>FR3_DAGGER_DATASET_ROOT</code>），
+        不动原训练集：多轮 DAgger 各自成集、随时可丢弃重来，而写进原集是不可逆的。
+        schema 取自<b>被模仿的那个数据集</b>再加一列 <code>is_intervention</code>——
+        DAgger 数据只有和示教数据同形才有用；指到一个 schema 不同的老目录会直接报错退出，
+        而不是照着错的列写下去。
+      </div>
+
+      <div class="callout warn">
+        <b>这版接管代码曾经连语法都过不了。</b>
+        <code>fr3_act_infer_real_runtime.py</code> 里有一个未转义的引号（<code>recorder's</code>）；
+        另外 <code>tools.*</code> 的导入在启动器的 PYTHONPATH 下会失败，
+        因为脚本方式启动时进入 <code>sys.path</code> 的是脚本自己的目录，不是仓库根。两处都已修，
+        <code>dagger_sim</code> 现在能在浏览器里跑起来，实时视图逐帧画出了这条臂。
+        <b>但"跑起来"还不等于"交接演练过"：</b>还没有一份 <code>dagger_sim_dryrun_report</code>
+        落盘，也就没有一个 <code>handback_gap_mm</code> 的实测数。真机之前的顺序不变——
+        先在 <code>dagger_sim</code> 里用手真的接管几次，看那个数。
+        <br>启动器这一侧已经补上：<code>dagger_sim</code> 每次都写
+        <code>outputs/dagger_sim/dryrun_&lt;时间戳&gt;.json</code>（<code>FR3_DAGGER_SIM_REPORT</code> 改路径），
+        报告里连同当次的钳制上限一起记——一个交还距离只有放在产生它的那组上限旁边才有意义，
+        而启动器传的那组和脚本自带的默认值并不相同。原来这个 <code>--output</code> 要手敲，
+        于是一次演练做完了，数却没落下来。
+      </div>
+
       <div class="callout ok">
         <b>优先级结论：S6 现在是当前门禁。</b>它原来的两个前置条件都已满足——
         S0.2 的分母已经拿到（2/29 ≈ 7%），阶段评分也已落地，接管发生在哪一级可以直接记成那一级的证据。
@@ -764,7 +874,9 @@
           夹爪宽度 + 力阈值、或放置后的物体位姿。
           <b>这项工作在第四节里本来就是独立列出的，它不只服务 RL。</b></li>
         <li><b>自动复位。</b>现在 peg 靠人摆回去。没有自动复位，"多试几次"就等于"多摆几次"，
-          于是 RL 的样本成本被人力锁死。</li>
+          于是 RL 的样本成本被人力锁死。S0.5 的 record / rollout 场景 reset 按钮就是这项前置工作的最小版本：
+          固定取料位抓 peg，抓后先抬高 12 cm，再放到 xoy 随机、z 固定的目标区域；区域可由散点图参考加画笔
+          mask 定义，但采样、限位、日志和失败分支必须在后端闭环。</li>
         <li><b>安全的探索边界。</b>RL 会主动试探没试过的动作，真机上这要求钳制、力限与自动急停先成立。
           好消息是第八节的"单一钳制路径"就是同一件事，两条路线共用。</li>
       </ul>

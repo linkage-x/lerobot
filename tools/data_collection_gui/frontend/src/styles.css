@@ -4786,6 +4786,22 @@ button.danger {
   white-space: pre;
 }
 
+/* The live 3D view. Its own block above the metrics because it answers a different question:
+   the numbers say what the last step did, the drawing says where the arm is now. */
+.rollout-live-viewer {
+  margin: 12px 0;
+}
+
+.rollout-live-viewer-head {
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.rollout-live-viewer-head .hint {
+  margin: 0;
+}
+
 .rollout-cameras {
   display: grid;
   gap: 10px;
@@ -4958,4 +4974,59 @@ button.danger {
 .landing-map-legend .dot.hollow {
   background: transparent;
   border: 2px solid #5b6a75;
+}
+
+.scene-reset-card { overflow: hidden; }
+.scene-reset-layout {
+  display: grid;
+  grid-template-columns: minmax(300px, 380px) 1fr;
+  gap: 18px;
+  align-items: start;
+}
+.scene-reset-canvas {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  background: #f8fafc;
+}
+.scene-reset-map svg {
+  position: relative;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  touch-action: none;
+  cursor: crosshair;
+}
+.scene-reset-bg-img {
+  position: absolute;
+  left: 7.7778%;
+  top: 7.7778%;
+  width: 84.4444%;
+  height: 84.4444%;
+  object-fit: cover;
+  filter: grayscale(0.82) saturate(0.28) contrast(0.78) brightness(1.08);
+  opacity: 0.42;
+  pointer-events: none;
+}
+.scene-reset-frame-with-bg {
+  fill: rgba(248, 250, 252, 0.34);
+}
+.scene-reset-mask-stroke {
+  fill: rgba(37, 99, 235, 0.18);
+  stroke: rgba(37, 99, 235, 0.72);
+  stroke-width: 1.5;
+}
+.scene-reset-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.scene-reset-form .field.inline {
+  min-width: 92px;
+  flex: 1 1 92px;
+}
+@media (max-width: 860px) {
+  .scene-reset-layout { grid-template-columns: 1fr; }
 }

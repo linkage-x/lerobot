@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import type { MujocoPreview, MujocoPreviewBodyPose, MujocoPreviewFrame } from "./types";
+import { matrixFromOrigin } from "./urdfOrigin";
 
 type Vec3 = [number, number, number];
 type Quat = [number, number, number, number];
@@ -137,14 +138,6 @@ function tracksFromPreview(preview: MujocoPreview | null): RobotTrack[] {
       frames: robot.frames,
       baseOffset: robot.base_offset_m ?? [0, 0, 0]
     }));
-}
-
-function matrixFromOrigin(xyz: Vec3, rpy: Vec3): THREE.Matrix4 {
-  const matrix = new THREE.Matrix4();
-  const rotation = new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(rpy[0], rpy[1], rpy[2], "XYZ"));
-  matrix.copy(rotation);
-  matrix.setPosition(xyz[0], xyz[1], xyz[2]);
-  return matrix;
 }
 
 function makeAxis(length: number): THREE.LineSegments {
@@ -359,6 +352,17 @@ export function MujocoReplayViewer({ preview, currentFrame }: { preview: MujocoP
   const [error, setError] = useState<string>("");
   const tracks = useMemo(() => tracksFromPreview(preview), [preview]);
   const kinematicsPath = preview?.model?.kinematics_path ?? DEFAULT_KINEMATICS_PATH;
+  // Which robots are on the canvas, not what they are doing. A live stream hands this component
+  // a new frame array several times a second; rebuilding on the array itself would reload every
+  // STL mesh at that rate, which is both a stall and a flicker. The meshes depend on the model
+  // and on where each robot's base sits -- nothing else in a frame can change them.
+  const robotSignature = useMemo(
+    () => tracks.map((track) => `${track.key}@${track.baseOffset.join(",")}`).join("|"),
+    [tracks]
+  );
+  // Read inside the build effect, which must not re-run when the frames change.
+  const tracksRef = useRef<RobotTrack[]>(tracks);
+  tracksRef.current = tracks;
 
   useEffect(() => {
     const container = containerRef.current;
@@ -441,14 +445,15 @@ export function MujocoReplayViewer({ preview, currentFrame }: { preview: MujocoP
     const state = sceneRef.current;
     if (!state) return;
     let cancelled = false;
-    setStatus(tracks.length ? "loading" : "idle");
+    const builtTracks = tracksRef.current;
+    setStatus(builtTracks.length ? "loading" : "idle");
     setError("");
     state.robots.forEach((robot) => {
       state.scene.remove(robot.root);
       disposeObject(robot.root);
     });
     state.robots.clear();
-    if (!tracks.length) return;
+    if (!builtTracks.length) return;
 
     loadModel(kinematicsPath)
       .then(async (model) => {
@@ -456,7 +461,7 @@ export function MujocoReplayViewer({ preview, currentFrame }: { preview: MujocoP
         if (cancelled || !sceneRef.current) return;
         sceneRef.current.model = model;
         sceneRef.current.geometries = geometries;
-        for (const track of tracks) {
+        for (const track of builtTracks) {
           const robot = buildRobot(model, geometries, track);
           sceneRef.current.scene.add(robot.root);
           sceneRef.current.robots.set(track.key, robot);
@@ -472,7 +477,7 @@ export function MujocoReplayViewer({ preview, currentFrame }: { preview: MujocoP
     return () => {
       cancelled = true;
     };
-  }, [kinematicsPath, tracks]);
+  }, [kinematicsPath, robotSignature]);
 
   useEffect(() => {
     const state = sceneRef.current;

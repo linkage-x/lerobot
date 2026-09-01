@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import dataclasses
@@ -36,6 +37,11 @@ from tools.data_collection_gui import checkpoints as checkpoint_backend
 from tools.data_collection_gui import rollout as rollout_backend
 from tools.data_collection_gui import task_ladders
 from tools.data_collection_gui import training as training_backend
+from tools.fr3.scene_reset import (
+    SceneResetError,
+    scene_reset_command,
+    sanitize_scene_reset_request,
+)
 
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
 DEFAULT_RECORDER_SCRIPT = Path("tools/handheld/handheld_record.py")
@@ -102,6 +108,11 @@ DEFAULT_TRAJ_SIDECAR_NAME = "april_cube_tracking_in_robot_base"
 DEFAULT_TRACKING_RUN_SUFFIX = "_thor_april_tracking_in_robot_base"
 DEFAULT_CUBE_TRAJECTORY_NAMES = ("left", "right", "head")
 DEFAULT_MUJOCO_CUBE_MODE = "left"
+
+# Twenty seconds at 30 Hz. Long enough that a page opened mid-rollout still has motion to
+# draw and a client that blinked can catch up; short enough that the gateway is not the
+# place a rollout is archived -- the trace CSV and the log file are.
+ROLLOUT_LIVE_FRAME_CAPACITY = 600
 MUJOCO_CUBE_MODES = ("left", "right", "both")
 DEFAULT_MUJOCO_ROBOT_SPACING_M = 0.9
 DEFAULT_CUBE_SIZE_M = 0.07
@@ -351,6 +362,15 @@ class GatewayState:
     replay_process: subprocess.Popen[str] | None = None
     replay_process_kind: str = ""
     mujoco_preview_memory: dict[str, Any] = field(default_factory=dict)
+    # The arm's recent state as the rollout publishes it, for the page to draw live. Bounded and
+    # in memory only: these are worth seconds, not minutes, and the log file already holds every
+    # one of them for anybody who wants the whole run. Each entry is (sequence, frame); the
+    # sequence never restarts, so a client that was away can tell "nothing new" from "you missed
+    # some" without the gateway keeping per-client state.
+    rollout_live_frames: deque[tuple[int, dict[str, Any]]] = field(
+        default_factory=lambda: deque(maxlen=ROLLOUT_LIVE_FRAME_CAPACITY)
+    )
+    rollout_live_frame_seq: int = 0
     teleop_process: subprocess.Popen[str] | None = None
     teleop_started_at_s: float | None = None
     realsense_preview_process: subprocess.Popen[str] | None = None
@@ -5548,6 +5568,18 @@ def _guard_checkpoint_deletion(state: GatewayState, checkpoint_ids: list[str]) -
 
 def _apply_rollout_output(state: GatewayState, line: str) -> None:
     status = state.rollout
+    frame = rollout_backend.parse_live_frame(line)
+    if frame is not None:
+        state.rollout_live_frame_seq += 1
+        state.rollout_live_frames.append((state.rollout_live_frame_seq, frame))
+        # The step counter comes off these too. The `[INFO] step=` lines it used to come from are
+        # printed once per --log-interval steps, so on a rollout logging every 25th step the page
+        # counted in 25s while the arm moved continuously.
+        try:
+            status.step = int(frame["frame_index"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        return
     parsed = rollout_backend.parse_rollout_line(line)
     for key, value in parsed.items():
         if key == "state":
@@ -5558,6 +5590,11 @@ def _apply_rollout_output(state: GatewayState, line: str) -> None:
             status.state = str(value)
         else:
             setattr(status, key, value)
+    if parsed.get("state") == "rolling":
+        # Dropped at the start of each rollout so the viewer never draws the tail of the previous
+        # one. The sequence keeps climbing, which is what tells a polling client that what it
+        # holds is stale rather than merely unchanged.
+        state.rollout_live_frames.clear()
     if parsed.get("commandStatus") == "step_limited":
         status.clampedSteps += 1
     elif parsed.get("commandStatus") == "leash_limited":
@@ -5814,13 +5851,83 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
     return {"ok": True, "rollout": asdict(state.rollout)}
 
 
+def _scene_reset_workspace_bounds(state: GatewayState) -> tuple[tuple[float, float, float] | None, tuple[float, float, float] | None]:
+    robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
+    workspace_min = robot.get("workspace_min")
+    workspace_max = robot.get("workspace_max")
+    if not isinstance(workspace_min, (list, tuple)) or not isinstance(workspace_max, (list, tuple)):
+        return None, None
+    if len(workspace_min) != 3 or len(workspace_max) != 3:
+        return None, None
+    return tuple(float(value) for value in workspace_min), tuple(float(value) for value in workspace_max)
+
+
+def _build_scene_reset_command(state: GatewayState, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    workspace_min, workspace_max = _scene_reset_workspace_bounds(state)
+    request = sanitize_scene_reset_request(
+        payload,
+        workspace_min=workspace_min,
+        workspace_max=workspace_max,
+    )
+    return scene_reset_command(request), request.payload()
+
+
+def _request_rollout_scene_reset(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    if state.profile != "workstation":
+        raise ValueError("Scene reset is only available for the FR3 workstation profile.")
+    if state.rollout.state != "waiting":
+        raise ValueError("Scene reset from Rollout is only allowed while the interactive session is waiting.")
+    process = state.rollout_process
+    if process is None or process.poll() is not None or process.stdin is None:
+        raise ValueError("Start an interactive rollout session before using scene reset from this page.")
+    if not state.rollout.interactive:
+        raise ValueError("Scene reset needs an interactive rollout session so the gateway owns stdin.")
+    command, request_payload = _build_scene_reset_command(state, payload)
+    try:
+        process.stdin.write((command + "\n").encode())
+        process.stdin.flush()
+    except (BrokenPipeError, OSError) as exc:
+        raise ValueError(f"Rollout is no longer accepting control commands: {exc}") from exc
+    state.rollout.state = "resetting"
+    state.rollout.armAtStart = False
+    target = request_payload["targetXyz"]
+    state.rollout.message = (
+        "Scene reset sent: target "
+        f"x={target[0]:+.3f}, y={target[1]:+.3f}, z={target[2]:+.3f}; lift is 8 cm before transfer."
+    )
+    state.log("warn", f"Rollout scene reset requested target={target}")
+    return {"ok": True, "rollout": asdict(state.rollout), "sceneReset": request_payload}
+
+
+def _request_recording_scene_reset(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    if state.profile != "workstation":
+        raise ValueError("Scene reset is only available for the FR3 workstation profile.")
+    if state.recording.state not in ("armed", "review"):
+        raise ValueError(
+            f"Scene reset from Record is only allowed between episodes, not while recorder is {state.recording.state}."
+        )
+    process = _ensure_recorder_running(state)
+    command, request_payload = _build_scene_reset_command(state, payload)
+    try:
+        _write_recorder_stdin(process, command + "\n")
+    except BrokenPipeError as exc:
+        raise RuntimeError("Recorder input is closed.") from exc
+    target = request_payload["targetXyz"]
+    state.recording.message = (
+        "Scene reset sent: target "
+        f"x={target[0]:+.3f}, y={target[1]:+.3f}, z={target[2]:+.3f}; lift is 8 cm before transfer."
+    )
+    state.log("warn", f"Recording scene reset requested target={target}")
+    return {"ok": True, "sceneReset": request_payload, "snapshot": _snapshot(state)}
+
+
 def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
     """Write one control word to the rollout's stdin.
 
     The runtime reads this pipe one line at a time (InteractiveRolloutKeyboard's pipe backend),
     so a word here is exactly a keypress there.
     """
-    allowed = {"start", "stop", "home", "quit"}
+    allowed = {"start", "stop", "home", "quit", "takeover"}
     if command not in allowed:
         raise ValueError(f"Rollout control must be one of {', '.join(sorted(allowed))}.")
     process = state.rollout_process
@@ -5850,6 +5957,11 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
         state.rollout.message = "Stop sent; ending the current rollout."
     elif command == "home":
         state.rollout.message = "Move to start sent; the arm is heading for its start pose."
+    elif command == "takeover":
+        # A toggle, not a state this page owns: the runtime decides which way it went and says
+        # so on its next line. Claiming a direction here would let the page and the arm disagree
+        # about who is driving, which is the one disagreement worth never having.
+        state.rollout.message = "Takeover toggled; the runtime reports which way on its next line."
     else:
         state.rollout.state = "stopped"
         state.rollout.message = "Quit sent; ending the rollout session."
@@ -12555,6 +12667,35 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     },
                 )
             return
+        if path == "/api/rollout/live-frames":
+            state = self.server.state
+            try:
+                after = int((query.get("after", ["0"])[0] or "0").strip())
+            except ValueError:
+                after = 0
+            with state.lock:
+                buffered = list(state.rollout_live_frames)
+                latest_seq = state.rollout_live_frame_seq
+                running = _rollout_is_running(state)
+                rollout_index = int(state.rollout.rolloutIndex or 0)
+            oldest_seq = buffered[0][0] if buffered else latest_seq
+            frames = [frame for seq, frame in buffered if seq > after]
+            _json_response(
+                self,
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "seq": latest_seq,
+                    "frames": frames,
+                    "rolloutIndex": rollout_index,
+                    "running": running,
+                    # True when the client was away long enough for the buffer to roll past it.
+                    # It has to know: the frames it is being handed are not the continuation of
+                    # the ones it has, and playing them as if they were shows a jump.
+                    "dropped": bool(buffered) and after > 0 and after < oldest_seq - 1,
+                },
+            )
+            return
         if path == "/api/rollout/last-params":
             with self.server.state.lock:
                 _json_response(
@@ -13086,6 +13227,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                             _send_rollout_control(state, str(body.get("command") or "")),
                         )
                     return
+                if path == "/api/rollout/scene-reset":
+                    with state.lock:
+                        _json_response(self, HTTPStatus.OK, _request_rollout_scene_reset(state, body))
+                    return
                 if path == "/api/rollout/stop":
                     with state.lock:
                         _json_response(self, HTTPStatus.OK, _stop_rollout(state))
@@ -13096,6 +13241,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
             except (
                 rollout_backend.RolloutError,
+                SceneResetError,
                 checkpoint_backend.CheckpointError,
                 training_backend.TrainingError,
                 ValueError,
@@ -13222,6 +13368,14 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 if path == "/api/handheld/record/reset-start-pose":
                     _reset_recorder_start_pose(self.server.state)
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/handheld/record/scene-reset":
+                    try:
+                        result = _request_recording_scene_reset(self.server.state, _read_json_body(self))
+                    except (SceneResetError, ValueError, RuntimeError) as exc:
+                        _json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    _json_response(self, HTTPStatus.OK, result.get("snapshot", _snapshot(self.server.state)))
                     return
                 if path == "/api/handheld/record/set-start-pose":
                     _capture_recorder_start_pose(self.server.state)

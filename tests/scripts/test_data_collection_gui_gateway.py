@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from tools.data_collection_gui import gateway
+from tools.fr3 import live_frames
 
 
 def _write_minimal_episode_dataset(dataset_root: Path, total_episodes: int = 3) -> None:
@@ -5099,6 +5100,127 @@ def _delete_guard_state(tmp_path: Path) -> gateway.GatewayState:
         replay=gateway.ReplayStatus(dataset="local/test"),
         datasets_root=tmp_path / "outputs" / "datasets",
     )
+
+
+# ------------------------------------------------------- rollout live frames ---
+
+
+def _rollout_state(tmp_path: Path) -> gateway.GatewayState:
+    return gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(repoId="local/test", datasetRoot=str(tmp_path)),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path / "outputs" / "datasets",
+    )
+
+
+def _frame_line(step: int, source: str = "policy") -> str:
+    return live_frames.format_live_frame(
+        live_frames.build_live_frame(
+            frame_index=step, joints_rad=[0.0] * 7, gripper=1.0, source=source
+        )
+    )
+
+
+def test_live_frames_are_buffered_and_kept_out_of_the_log_tail(tmp_path):
+    """Thirty a second would push every readable line off the page's rolling log within a couple
+    of seconds. They are drawn, not read."""
+    state = _rollout_state(tmp_path)
+
+    gateway._apply_rollout_output(state, "[INFO] interactive_rollout_start index=4")
+    for step in range(3):
+        gateway._apply_rollout_output(state, _frame_line(step))
+
+    assert [frame["frame_index"] for _, frame in state.rollout_live_frames] == [0, 1, 2]
+    assert not any("live_frame=" in line for line in state.rollout.lastLines)
+
+
+def test_the_step_counter_follows_the_frames_not_the_log_interval(tmp_path):
+    """`[INFO] step=` lines are printed once per --log-interval steps, so on a rollout logging
+    every 25th step the page counted in 25s while the arm moved continuously."""
+    state = _rollout_state(tmp_path)
+
+    gateway._apply_rollout_output(state, _frame_line(37))
+
+    assert state.rollout.step == 37
+
+
+def test_a_new_rollout_does_not_inherit_the_last_one_s_frames(tmp_path):
+    """Two rollouts drawn as one trajectory would show the arm teleporting from where the last
+    one stopped to where this one starts."""
+    state = _rollout_state(tmp_path)
+    gateway._apply_rollout_output(state, "[INFO] interactive_rollout_start index=1")
+    gateway._apply_rollout_output(state, _frame_line(0))
+    gateway._apply_rollout_output(state, _frame_line(1))
+
+    gateway._apply_rollout_output(state, "[INFO] interactive_rollout_start index=2")
+
+    assert list(state.rollout_live_frames) == []
+    # The sequence keeps climbing across the clear: a polling client that still holds sequence 2
+    # has to learn that what it has is stale, and a counter that restarted would tell it the
+    # opposite.
+    assert state.rollout_live_frame_seq == 2
+
+
+def test_the_buffer_is_bounded(tmp_path):
+    """It is a view of the last few seconds, not an archive. The trace CSV and the log file are
+    the archive."""
+    state = _rollout_state(tmp_path)
+
+    for step in range(gateway.ROLLOUT_LIVE_FRAME_CAPACITY + 25):
+        gateway._apply_rollout_output(state, _frame_line(step))
+
+    assert len(state.rollout_live_frames) == gateway.ROLLOUT_LIVE_FRAME_CAPACITY
+    assert state.rollout_live_frames[-1][1]["frame_index"] == gateway.ROLLOUT_LIVE_FRAME_CAPACITY + 24
+
+
+def test_a_malformed_frame_line_is_ignored_rather_than_logged_as_a_message(tmp_path):
+    """The follower can read a line the runtime had not finished writing."""
+    state = _rollout_state(tmp_path)
+
+    gateway._apply_rollout_output(state, 'live_frame={"frame_index":3,"joints')
+
+    assert list(state.rollout_live_frames) == []
+
+
+def test_takeover_is_a_control_word_the_gateway_will_forward(tmp_path):
+    """The page's button and the terminal's `t` reach the same runtime through the same pipe."""
+    state = _rollout_state(tmp_path)
+    process = _FakeControlProcess()
+    state.rollout_process = process
+    state.rollout.interactive = True
+    state.rollout.state = "rolling"
+
+    result = gateway._send_rollout_control(state, "takeover")
+
+    assert result["ok"] is True
+    assert process.written == [b"takeover\n"]
+
+
+def test_takeover_with_no_rollout_running_is_refused(tmp_path):
+    state = _rollout_state(tmp_path)
+
+    with pytest.raises(ValueError, match="No rollout is running"):
+        gateway._send_rollout_control(state, "takeover")
+
+
+class _FakeControlProcess:
+    pid = 4242
+
+    def __init__(self):
+        self.written: list[bytes] = []
+        self.stdin = self
+
+    def poll(self):
+        return None
+
+    def write(self, payload: bytes) -> None:
+        self.written.append(payload)
+
+    def flush(self) -> None:
+        pass
 
 
 def test_the_checkpoint_a_running_rollout_loaded_cannot_be_deleted(tmp_path):

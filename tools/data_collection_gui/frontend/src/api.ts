@@ -26,6 +26,7 @@ import type {
   RealCubeMode,
   RealEndEffectorMode,
   MujocoPreview,
+  RolloutLiveFrames,
   RealSensePreviewStatus,
   TrajectoryPoint,
   TeleopStatus,
@@ -43,6 +44,8 @@ import type {
   TrainingStartRequest,
   RolloutLastParams,
   RolloutLandmarks,
+  SceneResetRequest,
+  SceneResetResult,
   TrainingHistoryEntry,
   TrainingView,
   TrainingWandbStatus,
@@ -397,6 +400,20 @@ export class DataCollectionGuiApi {
       message: "Start pose reset requested"
     };
     this.log("info", "FR3 start pose reset to the configured default requested");
+    return this.getSnapshot();
+  }
+
+  async resetRecordingScene(request: SceneResetRequest): Promise<GuiSnapshot> {
+    const remote = await this.postRemoteJsonSnapshot("/api/handheld/record/scene-reset", request);
+    if (remote) {
+      return remote;
+    }
+    await wait(160);
+    this.snapshot.recording = {
+      ...this.snapshot.recording,
+      message: "Scene reset needs the live FR3 gateway; mock mode did not move the arm"
+    };
+    this.log("warn", "Scene reset blocked because gateway is unavailable");
     return this.getSnapshot();
   }
 
@@ -977,9 +994,10 @@ export class DataCollectionGuiApi {
   /** Where the demonstrations grasped and released, as the backdrop for rollout landing points.
    *  Reduced from the checkpoint's own dataset, so the first call after a gateway restart pays
    *  for one pass over its parquet and every later one is served from memory. */
-  async fetchRolloutLandmarks(): Promise<RolloutLandmarks> {
+  async fetchRolloutLandmarks(datasetRoot?: string): Promise<RolloutLandmarks> {
+    const query = datasetRoot ? `?dataset=${encodeURIComponent(datasetRoot)}` : "";
     const payload = await this.trainingGet<{ landmarks: RolloutLandmarks }>(
-      "/api/rollout/landmarks"
+      `/api/rollout/landmarks${query}`
     );
     return payload?.landmarks ?? {};
   }
@@ -1003,9 +1021,28 @@ export class DataCollectionGuiApi {
     return this.trainingPost<{ rollout?: RolloutRun }>("/api/rollout/start", request);
   }
 
-  /** One control word to the running rollout's stdin: the runtime reads it as a keypress. */
-  async controlRollout(command: "start" | "stop" | "home" | "quit") {
+  /** One control word to the running rollout's stdin: the runtime reads it as a keypress.
+   *  `takeover` latches the arm to the operator's device and is not sent by this page -- moving
+   *  the SpaceMouse takes the arm on its own. It stays in the alphabet because the terminal and
+   *  the page drive the same session with the same words, and a latch is still worth having for
+   *  an operator who wants the arm held still without touching the device. */
+  async controlRollout(command: "start" | "stop" | "home" | "quit" | "takeover") {
     return this.trainingPost<{ rollout?: RolloutRun }>("/api/rollout/control", { command });
+  }
+
+  async resetRolloutScene(request: SceneResetRequest): Promise<SceneResetResult> {
+    return this.trainingPost<SceneResetResult>("/api/rollout/scene-reset", request);
+  }
+
+  /** Arm state since `after`, for drawing the rollout while it runs.
+   *
+   *  Polled rather than pushed: this gateway speaks request/response everywhere else, and a
+   *  fifth of a second of latency is invisible on an arm that takes seconds to reach for
+   *  something. Frames arrive in batches and are played out at the rate they were produced. */
+  async fetchRolloutLiveFrames(after: number): Promise<RolloutLiveFrames | null> {
+    return this.trainingGet<RolloutLiveFrames>(
+      `/api/rollout/live-frames?after=${encodeURIComponent(String(Math.max(0, Math.trunc(after))))}`
+    );
   }
 
   async stopRollout() {

@@ -12,6 +12,17 @@
 #   bash tools/fr3/run_pick_place_infer_workstation.sh real                   # interactive rollouts (s/x/q)
 #   bash tools/fr3/run_pick_place_infer_workstation.sh real_debug             # + MuJoCo target viewer
 #   bash tools/fr3/run_pick_place_infer_workstation.sh real_once              # one bounded rollout
+#   bash tools/fr3/run_pick_place_infer_workstation.sh dagger_sim             # MuJoCo takeover rehearsal
+#   Each rehearsal drops outputs/dagger_sim/dryrun_<timestamp>.json (FR3_DAGGER_SIM_REPORT to
+#   place it elsewhere): expert spans and the handback gap in mm, the number to read before the
+#   takeover is allowed near the real arm.
+#
+# Take the arm over mid-rollout and keep the corrections as training data:
+#   FR3_DAGGER_TAKEOVER=1 FR3_DAGGER_DATASET_ROOT=<dir> \
+#     bash tools/fr3/run_pick_place_infer_workstation.sh real
+#   Move the SpaceMouse to take the arm; let go and the policy resumes. Each correction
+#   becomes one episode flagged is_intervention. Without the dataset root the takeover
+#   still steers the arm, but nothing is written.
 #
 # Point it at a checkpoint:
 #   FR3_INFER_CHECKPOINT=outputs/train/<job>/checkpoints/last \
@@ -190,6 +201,24 @@ fi
 if [[ -n "${policy_n_action_steps}" ]]; then
   common_args+=(--policy-n-action-steps "${policy_n_action_steps}")
 fi
+
+# DAgger takeover, for the interactive modes only: the runtime refuses --dagger-takeover
+# without --interactive-rollouts, because a device connected with nobody at the rig is worse
+# than one that was never opened. Kept out of common_args for exactly that reason.
+dagger_args=()
+if [[ "${FR3_DAGGER_TAKEOVER-0}" == "1" ]]; then
+  dagger_args+=(--dagger-takeover)
+  if [[ -n "${FR3_DAGGER_DATASET_ROOT-}" ]]; then
+    dagger_args+=(--dagger-dataset-root "${FR3_DAGGER_DATASET_ROOT}")
+  else
+    # Loud, because this is the difference between corrections that train something and
+    # corrections that only steer the arm for the length of one rollout.
+    echo "[WARN] FR3_DAGGER_TAKEOVER=1 without FR3_DAGGER_DATASET_ROOT: takeovers will steer the arm but write no training data." >&2
+  fi
+  if [[ -n "${FR3_DAGGER_RELEASE_AFTER_S-}" ]]; then
+    dagger_args+=(--dagger-takeover-release-after-s "${FR3_DAGGER_RELEASE_AFTER_S}")
+  fi
+fi
 if [[ -n "${act_temporal_ensemble_coeff}" ]]; then
   common_args+=(--act-temporal-ensemble-coeff "${act_temporal_ensemble_coeff}")
 fi
@@ -302,6 +331,7 @@ case "$mode" in
       --rollout-home-key h \
       --rollout-quit-key q \
       --camera-preview-window \
+      "${dagger_args[@]}" \
       "${extra_args[@]}"
     ;;
   real_debug)
@@ -318,7 +348,39 @@ case "$mode" in
       --camera-preview-window \
       --mujoco-viewer \
       --log-interval 1 \
+      "${dagger_args[@]}" \
       "${extra_args[@]}"
+    ;;
+  dagger_sim)
+    # The MuJoCo rehearsal of the takeover. No checkpoint, no cameras, no real arm: a recorded
+    # episode stands in for the policy so that what gets rehearsed is the handoff itself. The
+    # clamp limits are handed over from this file so the rehearsal bounds motion by exactly the
+    # numbers the real rollout will bound it by -- see tools/fr3/dagger_sim_dryrun.py.
+    dagger_dataset="${FR3_DAGGER_SIM_DATASET-${dataset_root}}"
+    if [[ -z "${dagger_dataset}" ]]; then
+      echo "[ERROR] dagger_sim needs a dataset of demonstrations: set FR3_DAGGER_SIM_DATASET (or FR3_INFER_DATASET_ROOT)." >&2
+      exit 2
+    fi
+    # Every rehearsal writes its report, because the handback gaps are the whole point of running
+    # one and a terminal that scrolls away is not a place to keep a measurement. Timestamped, so a
+    # second rehearsal cannot quietly overwrite the first -- comparing two of them is how anyone
+    # sees whether a clamp change helped.
+    dagger_report="${FR3_DAGGER_SIM_REPORT-outputs/dagger_sim/dryrun_$(date +%Y%m%d_%H%M%S).json}"
+    echo "[INFO] dagger_sim_mode=enabled dataset=${dagger_dataset} episode=${FR3_DAGGER_SIM_EPISODE-0}"
+    echo "[INFO] keys: s=start, t=take over / hand back, x=stop, q=quit. The arm is simulated."
+    echo "[INFO] dagger_sim_report=${dagger_report}"
+    # The inference flags the browser appends (camera preview, JPEG directory) mean nothing to a
+    # run with no cameras, so they are deliberately not forwarded.
+    exec "${FR3_HOST_PYTHON}" tools/fr3/dagger_sim_dryrun.py \
+      --dataset "${dagger_dataset}" \
+      --episode "${FR3_DAGGER_SIM_EPISODE-0}" \
+      --config-path "${FR3_RECORD_CONFIG-tools/fr3/fr3_record_config.yaml}" \
+      --output "${dagger_report}" \
+      --max-step-pos-delta-mm "${max_step_pos_delta_mm}" \
+      --max-step-rot-delta-deg "${max_step_rot_delta_deg}" \
+      --max-leash-pos-delta-mm "${max_leash_pos_delta_mm}" \
+      --max-leash-rot-delta-deg "${max_leash_rot_delta_deg}" \
+      --live-frame-interval 1
     ;;
   real_once)
     announce
@@ -329,7 +391,7 @@ case "$mode" in
       "${extra_args[@]}"
     ;;
   *)
-    echo "Usage: $0 [env|home|smoke|preview|real|real_debug|real_once]" >&2
+    echo "Usage: $0 [env|home|smoke|preview|real|real_debug|real_once|dagger_sim]" >&2
     exit 2
     ;;
 esac

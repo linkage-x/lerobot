@@ -68,6 +68,11 @@ from lerobot.robots.franka_research3 import FrankaResearch3MujocoConfig  # noqa:
 from lerobot.scripts.lerobot_record import RecordConfig, record_loop  # noqa: E402
 import lerobot.teleoperators.spacemouse  # noqa: E402,F401
 from lerobot.teleoperators import make_teleoperator_from_config  # noqa: E402
+from tools.fr3.scene_reset import (  # noqa: E402
+    SceneResetError,
+    execute_scene_reset,
+    scene_reset_request_from_payload,
+)
 from lerobot.utils.control_utils import (  # noqa: E402
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
@@ -183,6 +188,7 @@ _EXIT_COMMANDS = {"q", "quit", "exit", "stop"}
 _START_COMMANDS = {"", "start"}
 _START_POSE_COMMANDS = {"set_start_pose", "capture_start_pose", "home_here"}
 _RESET_START_POSE_COMMANDS = {"reset_start_pose", "restore_start_pose", "home_default"}
+_SCENE_RESET_PREFIX = "scene_reset "
 
 
 def _format_joint_pose(joint_positions_rad: tuple[float, ...]) -> str:
@@ -226,6 +232,23 @@ def _reset_start_pose(robot: Any, events: dict[str, bool]) -> bool:
         emit("Start pose reset: the config declares none, so the arm backend's own start pose applies")
     else:
         emit(f"Start pose reset to the configured default: {_format_joint_pose(tuple(joint_positions))}")
+    return True
+
+
+def _run_scene_reset_command(command: str | None, robot: Any) -> bool:
+    if not command or not command.startswith(_SCENE_RESET_PREFIX):
+        return False
+    try:
+        payload = json.loads(command.removeprefix(_SCENE_RESET_PREFIX).strip())
+        request = scene_reset_request_from_payload(payload)
+    except (json.JSONDecodeError, SceneResetError) as exc:
+        emit(f"WARN: scene reset command rejected: {exc}")
+        return True
+    result = execute_scene_reset(robot, request)
+    if result.get("ok"):
+        emit(f"Scene reset complete: target={request.targetXyz[0]:+.4f},{request.targetXyz[1]:+.4f},{request.targetXyz[2]:+.4f}")
+    else:
+        emit(f"WARN: scene reset failed: {result.get('error', 'unknown error')}")
     return True
 
 
@@ -277,6 +300,8 @@ def _wait_for_episode_decision(commands: "_CommandChannel", robot: Any, events: 
                 _capture_start_pose(robot, events, require_cached=False)
         elif command in _RESET_START_POSE_COMMANDS:
             _reset_start_pose(robot, events)
+        elif _run_scene_reset_command(command, robot):
+            pass
         elif command not in (None, *_START_COMMANDS):
             emit(f"WARN: ignoring unknown review command: {command}")
 
@@ -306,7 +331,9 @@ class _CommandChannel:
 
     def _read_loop(self) -> None:
         for raw_line in sys.stdin:
-            command = raw_line.strip().lower()
+            raw_command = raw_line.strip()
+            command = raw_command.lower()
+            queued_command = raw_command if command.startswith(_SCENE_RESET_PREFIX) else command
             # A bare newline is the gateway's "start episode" keypress; everything else is a word.
             if command in _SAVE_COMMANDS:
                 self._events["exit_early"] = True
@@ -319,7 +346,7 @@ class _CommandChannel:
                 self._events["capture_start_pose"] = True
             elif command in _RESET_START_POSE_COMMANDS:
                 self._events["reset_start_pose"] = True
-            self._queue.put(command)
+            self._queue.put(queued_command)
         # stdin closed: the gateway process is gone, so wind the session down cleanly.
         self._events["exit_early"] = True
         self._events["stop_recording"] = True
@@ -913,6 +940,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     continue
                 if command in _RESET_START_POSE_COMMANDS:
                     _reset_start_pose(robot, events)
+                    continue
+                if _run_scene_reset_command(command, robot):
                     continue
                 if command not in _START_COMMANDS:
                     # Save/discard with no episode in flight: nothing to act on, re-arm.
