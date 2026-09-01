@@ -40,6 +40,16 @@ class FakeRobot:
         self.move_to_start_calls += 1
 
 
+class FakePegBlockedRobot(FakeRobot):
+    def send_action(self, action):
+        self.actions.append(dict(action))
+        self.xyz = (action["ee.x"], action["ee.y"], action["ee.z"])
+        self.rotvec = (action["ee.wx"], action["ee.wy"], action["ee.wz"])
+        commanded_gripper = float(action["gripper.pos"])
+        self.gripper = 0.25 if commanded_gripper <= 0.0 else commanded_gripper
+        return dict(action)
+
+
 def request_payload(**overrides):
     payload = {
         "pickXyz": [0.40, 0.00, 0.035],
@@ -84,6 +94,24 @@ def test_scene_reset_executes_lift_before_horizontal_transfer():
     assert target_above in xyzs
     assert xyzs.index(lifted) < xyzs.index(target_above)
     assert robot.move_to_start_calls == 1
+
+
+def test_scene_reset_lifts_after_gripper_feedback_stops_on_peg():
+    request = sanitize_scene_reset_request(
+        request_payload(gripperTolerance=0.01, graspSettleS=0.0),
+        rng=random.Random(1),
+    )
+    robot = FakePegBlockedRobot()
+
+    result = execute_scene_reset(robot, request)
+
+    assert result["ok"] is True
+    xyzs = [(action["ee.x"], action["ee.y"], action["ee.z"]) for action in robot.actions]
+    lifted = (request.pickXyz[0], request.pickXyz[1], request.pickXyz[2] + 0.08)
+    target_above = (request.targetXyz[0], request.targetXyz[1], request.targetXyz[2] + 0.08)
+    assert lifted in xyzs
+    assert target_above in xyzs
+    assert xyzs.index(lifted) < xyzs.index(target_above)
 
 
 def test_scene_reset_trajectory_qc_rejects_workspace_escape():

@@ -68,7 +68,7 @@ export function SceneResetPanel({
   const [pickX, setPickX] = useState("0.40");
   const [pickY, setPickY] = useState("0.00");
   const [pickZ, setPickZ] = useState("0.035");
-  const [targetZ, setTargetZ] = useState("0.035");
+  const [targetZ, setTargetZ] = useState("0.55");
   const [liftM] = useState(FIXED_LIFT_M.toFixed(2));
   const [brushRadius, setBrushRadius] = useState("0.035");
   const [returnToStart, setReturnToStart] = useState(true);
@@ -109,7 +109,7 @@ export function SceneResetPanel({
     setMessage("");
     const request: SceneResetRequest = {
       pickXyz: [numberOr(pickX, 0.4), numberOr(pickY, 0), numberOr(pickZ, 0.035)],
-      targetZ: numberOr(targetZ, 0.035),
+      targetZ: numberOr(targetZ, 0.55),
       liftM: FIXED_LIFT_M,
       approachClearanceM: FIXED_LIFT_M,
       returnToStart,

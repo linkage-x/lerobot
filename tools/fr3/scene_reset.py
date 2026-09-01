@@ -58,6 +58,7 @@ class SceneResetRequest:
     timeoutS: float = 20.0
     toleranceM: float = 0.006
     gripperTolerance: float = 0.08
+    graspSettleS: float = 0.6
     controlPeriodS: float = 1.0 / 30.0
     maskStrokes: tuple[SceneResetStroke, ...] = field(default_factory=tuple)
     requestId: str = ""
@@ -156,8 +157,8 @@ def _validate_common_request_fields(request: SceneResetRequest) -> None:
     _require_fixed_lift(request.approachClearanceM, "approachClearanceM")
     if request.timeoutS <= 0.0 or request.toleranceM <= 0.0 or request.controlPeriodS <= 0.0:
         raise SceneResetError("timeoutS, toleranceM and controlPeriodS must be positive.")
-    if request.gripperTolerance < 0.0:
-        raise SceneResetError("gripperTolerance must be non-negative.")
+    if request.gripperTolerance < 0.0 or request.graspSettleS < 0.0:
+        raise SceneResetError("gripperTolerance and graspSettleS must be non-negative.")
     if request.openGripper < 0.0 or request.openGripper > 1.0 or request.closedGripper < 0.0 or request.closedGripper > 1.0:
         raise SceneResetError("openGripper and closedGripper must be normalized in [0, 1].")
     for name, xyz in (("pickXyz", request.pickXyz), ("targetXyz", request.targetXyz)):
@@ -286,6 +287,7 @@ def sanitize_scene_reset_request(
         timeoutS=_finite_float(raw.get("timeoutS", 20.0), "timeoutS"),
         toleranceM=_finite_float(raw.get("toleranceM", 0.006), "toleranceM"),
         gripperTolerance=_finite_float(raw.get("gripperTolerance", 0.08), "gripperTolerance"),
+        graspSettleS=_finite_float(raw.get("graspSettleS", 0.6), "graspSettleS"),
         controlPeriodS=_finite_float(raw.get("controlPeriodS", 1.0 / 30.0), "controlPeriodS"),
         maskStrokes=strokes,
         requestId=str(raw.get("requestId") or f"scene_reset_{time.time_ns()}"),
@@ -327,6 +329,7 @@ def scene_reset_request_from_payload(payload: Any) -> SceneResetRequest:
         timeoutS=_finite_float(payload.get("timeoutS", 20.0), "timeoutS"),
         toleranceM=_finite_float(payload.get("toleranceM", 0.006), "toleranceM"),
         gripperTolerance=_finite_float(payload.get("gripperTolerance", 0.08), "gripperTolerance"),
+        graspSettleS=_finite_float(payload.get("graspSettleS", 0.6), "graspSettleS"),
         controlPeriodS=_finite_float(payload.get("controlPeriodS", 1.0 / 30.0), "controlPeriodS"),
         maskStrokes=_parse_strokes({"strokes": payload.get("maskStrokes", [])}),
         requestId=str(payload.get("requestId") or ""),
@@ -369,6 +372,17 @@ def _distance(a: tuple[float, float, float], b: tuple[float, float, float]) -> f
     return math.sqrt(sum((ai - bi) ** 2 for ai, bi in zip(a, b, strict=True)))
 
 
+def _scene_reset_waits_for_gripper_position(name: str) -> bool:
+    # Once the peg is clamped, the measured opening is the peg thickness, not the closed command.
+    # Waiting for `closedGripper` would block the lift and carry steps forever on a successful grasp.
+    return name not in {
+        "close_gripper",
+        "lift_8cm_after_grasp",
+        "move_to_place_above",
+        "descend_8cm_to_place",
+    }
+
+
 def _run_step(
     robot: Any,
     request: SceneResetRequest,
@@ -384,15 +398,37 @@ def _run_step(
     )
     deadline = time.perf_counter() + request.timeoutS
     last_error = ""
+    position_reached_at: float | None = None
     while time.perf_counter() < deadline:
+        now = time.perf_counter()
         _send_absolute(robot, xyz, rotvec, gripper)
         current_xyz, _current_rotvec, current_gripper = _observation_xyz_rotvec_gripper(robot)
         pos_error = _distance(current_xyz, xyz)
         gripper_error = abs(current_gripper - gripper)
         last_error = f"pos_err_mm={pos_error * 1000.0:.1f} gripper_err={gripper_error:.3f}"
-        if pos_error <= request.toleranceM and gripper_error <= request.gripperTolerance:
+        pos_ok = pos_error <= request.toleranceM
+        gripper_ok = gripper_error <= request.gripperTolerance
+        if pos_ok and position_reached_at is None:
+            position_reached_at = now
+        elif not pos_ok:
+            position_reached_at = None
+        waits_for_gripper = _scene_reset_waits_for_gripper_position(name)
+        if waits_for_gripper:
+            gripper_wait_done = gripper_ok
+            gripper_wait = "position"
+        elif name == "close_gripper":
+            gripper_wait_done = gripper_ok or (
+                position_reached_at is not None
+                and now - position_reached_at >= request.graspSettleS
+            )
+            gripper_wait = "position" if gripper_ok else "grasp_settle"
+        else:
+            gripper_wait_done = True
+            gripper_wait = "carried_object"
+        if pos_ok and gripper_wait_done:
             print(
-                f"[INFO] scene_reset_step=done request_id={request.requestId} name={name} {last_error}",
+                f"[INFO] scene_reset_step=done request_id={request.requestId} name={name} "
+                f"{last_error} gripper_wait={gripper_wait}",
                 flush=True,
             )
             return

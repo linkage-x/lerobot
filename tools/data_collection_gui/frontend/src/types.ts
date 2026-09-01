@@ -1292,6 +1292,8 @@ export type SceneResetRequest = {
   approachClearanceM?: number;
   openGripper?: number;
   closedGripper?: number;
+  gripperTolerance?: number;
+  graspSettleS?: number;
   returnToStart?: boolean;
   mask: { strokes: SceneResetStroke[] };
 };
