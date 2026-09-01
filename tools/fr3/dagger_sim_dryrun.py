@@ -298,6 +298,7 @@ def run_dryrun(args: argparse.Namespace) -> dict[str, Any]:
                     f"step={step_index} demo_frame={demo_index}/{total_frames} "
                     f"source={command_source} status={guard['status']} "
                     f"takeover={takeover_debug.get('status', '')} "
+                    f"reads={int(takeover_debug.get('reads', 0))} "
                     f"step_mm={takeover_debug.get('step_mm', 0.0):.1f} "
                     f"gripper_cmd={command_to_send['gripper.pos']:.3f}"
                 )

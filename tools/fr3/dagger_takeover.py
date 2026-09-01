@@ -141,6 +141,9 @@ class DeviceInput(NamedTuple):
     # Whether this step's reading was a new report rather than the driver's cached copy of the
     # last one. False means the device has been silent since the previous step.
     fresh: bool = True
+    # How many reads it took to reach it. More than a couple means the queue had backed up, which
+    # is worth seeing in a log: it is the arm following a hand from several steps ago.
+    reads: int = 1
 
     @property
     def eventful(self) -> bool:
@@ -237,26 +240,49 @@ class ExpertTakeover:
     def auto_enabled(self) -> bool:
         return self._release_after_s > 0.0
 
+    def _newest_report(self) -> tuple[Mapping[str, Any], bool, int]:
+        """Empty the device's queue; keep the last report out of it and whether it was new.
+
+        The driver hands over one queued report per read and the device sends about 126 a second,
+        so a step that reads once falls behind by three or four reports every time round. Past the
+        end of the queue the same read starts returning the device's cached state, dated with the
+        timestamp it already had -- which is how the end of the queue is recognised, and how a
+        device that has gone quiet is told apart from one the operator is still pushing.
+
+        Only the newest report is returned. Everything the drain passed over is a deflection the
+        operator has already moved on from; the alternative -- adding them up -- is what made a
+        puck off centre by any amount ask for more motion than the step guard would pass.
+        """
+        action = self._teleop.get_action()
+        timestamp = getattr(self._teleop, 'last_report_timestamp', None)
+        if timestamp is None:
+            # An undated backend cannot say which of its reads were copies, so one read is all
+            # that can be trusted from it: draining it would be back to summing copies, and
+            # refusing to act on a reading that might be new would leave the operator pushing a
+            # dead puck.
+            return action, True, 1
+
+        fresh = timestamp != self._last_report_timestamp
+        reads = 1
+        while reads < MAX_READS_PER_STEP:
+            next_action = self._teleop.get_action()
+            next_timestamp = getattr(self._teleop, 'last_report_timestamp', None)
+            reads += 1
+            if next_timestamp is None or next_timestamp == timestamp:
+                break
+            action, timestamp, fresh = next_action, next_timestamp, True
+        self._last_report_timestamp = timestamp
+        return action, fresh, reads
+
     def _read_device(self) -> DeviceInput:
         """One reading, rescaled from the recorder's per-tick calibration to this loop's step.
 
-        One read rather than a drain, and the reason is in :func:`motion_gain_for`: the driver
-        repeats its last state when the queue is empty, so a second read inside one control step
-        returns a copy. The old drain summed those copies, which is why a puck off centre by any
-        amount asked for more than the step guard would pass -- the arm ran at the clamp and the
-        operator lost every bit of proportional control.
-
-        The same repetition is why the motion here is gated on the report timestamp rather than
-        on the axes: see the module docstring. A device that cannot date its reports keeps the
-        old behaviour, because a reading that might be new is the only thing such a device
-        offers and refusing to act on it would leave the operator pushing a dead puck.
+        The reading is the newest report the device had (see :meth:`_newest_report`), and it moves
+        the arm only if it is one the operator produced since the last step. A repeat means the
+        device has said nothing, and nothing is what it asks for.
         """
-        action = self._teleop.get_action()
+        action, fresh, reads = self._newest_report()
         gripper_before = self._last_gripper_seen
-
-        timestamp = getattr(self._teleop, 'last_report_timestamp', None)
-        fresh = timestamp is None or timestamp != self._last_report_timestamp
-        self._last_report_timestamp = timestamp
 
         reported_position = _finite_vector(action, _DELTA_POSITION_KEYS) if fresh else np.zeros(3)
         reported_rotvec = _finite_vector(action, _DELTA_ROTVEC_KEYS) if fresh else np.zeros(3)
@@ -284,6 +310,7 @@ class ExpertTakeover:
             gripper_moved=gripper_moved,
             moved=moved,
             fresh=fresh,
+            reads=reads,
         )
 
     def _engage(
@@ -439,6 +466,7 @@ class ExpertTakeover:
             'moved': device_input.moved,
             'gripper_owned': self._gripper_owned,
             'step_mm': float(np.linalg.norm(device_input.delta_position) * 1000.0),
+            'reads': int(device_input.reads),
             'idle_s': idle_s,
             'latched': bool(latched),
         }

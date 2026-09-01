@@ -403,78 +403,90 @@ def test_a_dead_device_does_not_hand_the_arm_back_by_itself():
     assert take(takeover, latched=False)[1]["source"] == "expert"
 
 
-# --- moving the arm at the speed the recorder moved it -----------------------------------------
+# --- moving the arm at the speed the recorder moved it, and at the time the hand moved it -------
 
 
-class RepeatingSpaceMouse:
-    """A puck held off centre: the same reading, and a new report behind every one of them.
+class QueuedSpaceMouse:
+    """The driver, as it behaves: one queued report per read, then copies of the last one.
 
-    ``PySpaceMouseDriver.poll`` returns the device's cached state when the hidraw queue is empty,
-    so "read again" and "read a new report" are indistinguishable from the values alone -- which
-    is why the reading is dated. A deflected puck keeps reporting at ~126 Hz, so a loop at 30 Hz
-    sees a fresh report every step, and the timestamp advances with them.
+    ``PySpaceMouseDriver.poll`` takes a single report out of the kernel's hidraw queue per call,
+    and once that queue is empty it returns the device's cached state instead -- carrying the
+    timestamp it already had, which is the only way to tell the copy from a report.
 
-    ``dated=False`` is a backend that does not timestamp its reports at all.
+    ``arrive()`` is the device putting reports into the queue: what the puck does between two
+    control steps, which is about four reports at 30 Hz while it is displaced, and none at all
+    once the operator's hand comes off.
     """
 
-    def __init__(self, reading, *, dated=True, tick_s=1.0 / 126.0):
-        self.reading = reading
-        self.polls = 0
-        self.tick_s = float(tick_s)
-        self.last_report_timestamp = 100.0 if dated else None
-
-    def get_action(self):
-        self.polls += 1
-        if self.last_report_timestamp is not None:
-            self.last_report_timestamp += self.tick_s
-        return dict(self.reading)
-
-    def disconnect(self):
-        pass
-
-
-class SilentSpaceMouse:
-    """The device once the hand comes off: the last report, handed back forever, undated.
-
-    The puck at rest sends nothing, so the hidraw queue stays empty and ``poll`` keeps returning
-    the state of the last report the operator did produce -- which is not zero unless the puck's
-    own resting position falls inside the deadband. Only the frozen timestamp tells the arm that
-    nobody is driving any more.
-
-    ``gripper_step`` is the other half of the device: a button held down produces no new reports
-    either, and the teleoperator's own state machine keeps moving the gripper while it is held.
-    """
-
-    def __init__(self, reading, *, timestamp=100.0, gripper_step=0.0):
-        self.reading = dict(reading)
-        self.last_report_timestamp = float(timestamp)
+    def __init__(self, *arrivals, gripper_step=0.0):
+        self._queue = [dict(reading) for reading in arrivals]
+        self._current = mouse_action()
+        self.last_report_timestamp = 100.0
         self.gripper_step = float(gripper_step)
         self.polls = 0
 
+    def arrive(self, *readings, times=1):
+        for _ in range(times):
+            self._queue.extend(dict(reading) for reading in readings)
+        return self
+
     def get_action(self):
         self.polls += 1
-        if self.gripper_step:
-            self.reading["gripper"] = max(0.0, self.reading["gripper"] - self.gripper_step)
+        if self._queue:
+            self._current = self._queue.pop(0)
+            self.last_report_timestamp += 1.0 / 126.0
+        elif self.gripper_step:
+            # The teleoperator's own state machine, which needs no report: a button held down
+            # keeps moving the gripper, and moves it on the copies too.
+            self._current["gripper"] = max(0.0, self._current["gripper"] - self.gripper_step)
+        return dict(self._current)
+
+    def disconnect(self):
+        pass
+
+
+class UndatedSpaceMouse:
+    """A backend that does not timestamp its reports: every read might be new, and none can be
+    told apart. The same reading forever is all it offers."""
+
+    def __init__(self, reading):
+        self.reading = dict(reading)
+        self.polls = 0
+
+    def get_action(self):
+        self.polls += 1
         return dict(self.reading)
 
     def disconnect(self):
         pass
 
 
-def test_the_device_is_read_once_per_control_step():
-    # Reading it twice measures nothing extra -- the second read is a copy -- and the old drain
-    # summed those copies, so a puck off centre by any amount asked for 32x what the hand did.
-    device = RepeatingSpaceMouse(mouse_action(enabled=True, target_x=0.001))
+def test_the_queue_is_emptied_every_step_and_the_newest_report_is_the_one_that_moves_the_arm():
+    # Both halves of the read, in one test. The device sends ~126 reports a second against a loop
+    # at 30, so a step that reads once is steering the arm with a hand from several steps ago --
+    # and after the operator lets go, with the tail of a queue nobody is adding to any more. But
+    # the drain must not add up what it passed over: this is a rate control, and four reports of
+    # 1 mm is a hand asking for 1 mm, not for 4.
+    device = QueuedSpaceMouse(
+        mouse_action(enabled=True, target_x=0.001),
+        mouse_action(enabled=True, target_x=0.001),
+        mouse_action(enabled=True, target_x=0.001),
+        mouse_action(enabled=True, target_x=0.004),
+    )
 
-    take(ExpertTakeover(device), latched=False)
+    command, debug = take(ExpertTakeover(device), latched=False)
 
-    assert device.polls == 1
+    assert command["ee.x"] == pytest.approx(LAST_SENT["ee.x"] + 0.004)
+    assert debug["step_mm"] == pytest.approx(4.0)
+    # Four reports plus the read that finds the queue empty.
+    assert device.polls == 5
+    assert debug["reads"] == 5
 
 
 def test_one_reading_covers_the_whole_control_step():
     # The scales are metres per recorder tick at 200 Hz. A 30 Hz loop that applied one reading
     # unscaled would move the arm at a sixth of the speed the same hand produced while recording.
-    device = RepeatingSpaceMouse(mouse_action(enabled=True, target_x=0.001))
+    device = QueuedSpaceMouse(mouse_action(enabled=True, target_x=0.001))
     gain = motion_gain_for(tick_hz=200.0, step_period_s=1.0 / 30.0)
     takeover = ExpertTakeover(device, motion_gain=gain)
 
@@ -488,8 +500,9 @@ def test_one_reading_covers_the_whole_control_step():
 def test_holding_the_puck_still_asks_for_the_recorder_speed_not_the_clamp():
     # Full deflection is 0.000615 m/tick * 200 = 0.123 m/s, which at 30 Hz is 4.1 mm per step --
     # under the 5 mm step guard. Every takeover step arriving clamped is the signature of the
-    # summing bug, so pin the number that says it is gone.
-    device = RepeatingSpaceMouse(mouse_action(enabled=True, target_x=0.000615))
+    # summing bug, so pin the number that says it is gone: four reports of full deflection in one
+    # step is still one step of full deflection.
+    device = QueuedSpaceMouse().arrive(mouse_action(enabled=True, target_x=0.000615), times=4)
     takeover = ExpertTakeover(device, motion_gain=motion_gain_for(tick_hz=200.0, step_period_s=1.0 / 30.0))
 
     _, debug = take(takeover, latched=False)
@@ -500,7 +513,7 @@ def test_holding_the_puck_still_asks_for_the_recorder_speed_not_the_clamp():
 def test_gain_of_one_leaves_a_reading_alone():
     # The default. A caller that has not told `ExpertTakeover` its loop rate gets the raw reading
     # rather than a speed silently chosen for it.
-    device = RepeatingSpaceMouse(mouse_action(enabled=True, target_x=0.001))
+    device = QueuedSpaceMouse(mouse_action(enabled=True, target_x=0.001))
 
     command, _ = take(ExpertTakeover(device), latched=False)
 
@@ -510,7 +523,7 @@ def test_gain_of_one_leaves_a_reading_alone():
 def test_a_zero_gain_still_reads_the_hand_as_engaged():
     # `moved` is a property of the reading, not of what reaches the arm: a gain that scales the
     # motion away must not read as an operator who let go and hand the arm back mid-correction.
-    device = RepeatingSpaceMouse(mouse_action(enabled=True, target_x=0.001))
+    device = QueuedSpaceMouse(mouse_action(enabled=True, target_x=0.001))
 
     _, debug = take(ExpertTakeover(device, motion_gain=0.0), latched=False)
 
@@ -530,7 +543,7 @@ def test_a_device_that_has_gone_quiet_stops_moving_the_arm():
     # The bug, in one test. The last report the operator produced is applied once -- it is theirs
     # -- and every read after it is that same report again, which is not a request to keep going.
     gain = motion_gain_for(tick_hz=200.0, step_period_s=1.0 / 30.0)
-    device = SilentSpaceMouse(mouse_action(enabled=True, target_x=0.002))
+    device = QueuedSpaceMouse(mouse_action(enabled=True, target_x=0.002))
     takeover = ExpertTakeover(device, motion_gain=gain)
 
     first, _ = take(takeover, latched=False)
@@ -548,7 +561,7 @@ def test_the_arm_goes_back_to_the_policy_after_the_device_goes_quiet():
     # And the other consequence of counting copies as input: they reset the idle timer, so the
     # takeover that could not be moved out of also could never be released.
     clock = FakeClock()
-    device = SilentSpaceMouse(mouse_action(enabled=True, target_x=0.002))
+    device = QueuedSpaceMouse(mouse_action(enabled=True, target_x=0.002))
     takeover = ExpertTakeover(device, release_after_s=1.0, clock=clock)
     assert take(takeover, latched=False)[1]["source"] == "expert"
 
@@ -564,11 +577,12 @@ def test_a_puck_held_off_centre_keeps_driving_however_long_it_is_held():
     # a rate command that goes on meaning what it says. Gating motion on freshness must not turn
     # a steady push into a stall.
     clock = FakeClock()
-    device = RepeatingSpaceMouse(mouse_action(enabled=True, target_x=0.002))
+    device = QueuedSpaceMouse()
     takeover = ExpertTakeover(device, release_after_s=1.0, clock=clock)
 
     for _ in range(5):
         clock.advance(0.9)
+        device.arrive(mouse_action(enabled=True, target_x=0.002), times=4)
         command, debug = take(takeover, latched=False)
         assert debug["source"] == "expert"
         assert debug["status"] == "moving"
@@ -580,7 +594,7 @@ def test_a_held_gripper_button_keeps_the_arm_while_the_puck_says_nothing():
     # gripper on report freshness would hand the arm back mid-close, with the fingers on the
     # object and the operator still pressing.
     clock = FakeClock()
-    device = SilentSpaceMouse(mouse_action(gripper=0.8), gripper_step=0.05)
+    device = QueuedSpaceMouse(gripper_step=0.05)
     takeover = ExpertTakeover(device, release_after_s=1.0, clock=clock)
     take(takeover, latched=False)  # the first reading is a baseline, not a change
 
@@ -594,13 +608,14 @@ def test_a_held_gripper_button_keeps_the_arm_while_the_puck_says_nothing():
 
 def test_a_backend_that_does_not_date_its_reports_is_taken_at_its_word():
     # Without a timestamp there is no way to tell a copy from a report, and refusing to act on a
-    # reading that might be new would leave the operator pushing a dead puck. Old behaviour, and
-    # the reason every scripted double in this file still means what it did.
-    device = RepeatingSpaceMouse(mouse_action(enabled=True, target_x=0.002), dated=False)
+    # reading that might be new would leave the operator pushing a dead puck. Old behaviour, on
+    # purpose -- including the single read, because draining an undated device would sum copies.
+    device = UndatedSpaceMouse(mouse_action(enabled=True, target_x=0.002))
     takeover = ExpertTakeover(device)
 
     command, debug = take(takeover, latched=False)
 
     assert debug["source"] == "expert"
     assert debug["status"] == "moving"
+    assert device.polls == 1
     assert command["ee.x"] == pytest.approx(LAST_SENT["ee.x"] + 0.002)
