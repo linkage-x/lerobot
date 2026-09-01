@@ -5067,7 +5067,12 @@ def _calibration_payload(state: GatewayState) -> dict[str, Any]:
     payload["solve"] = _solve_payload(state)
     production = _production_calibration_runs(state)
     payload["production"] = production
-    payload["pointerMismatch"] = _calibration_pointer_mismatch(state, production)
+    # Only when there is one. An empty dict on the wire reads as "a mismatch
+    # object exists" to any client that checks for the key, which is how the
+    # panel came to dereference `.fields` on the agreeing case and white-screen.
+    mismatch = _calibration_pointer_mismatch(state, production)
+    if mismatch:
+        payload["pointerMismatch"] = mismatch
     progress = payload.get("progress")
     running = state.calibration.state == "running"
     if running and isinstance(progress, dict) and float(progress.get("startedAt") or 0.0) > 0:

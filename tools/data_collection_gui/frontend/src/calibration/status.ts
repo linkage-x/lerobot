@@ -164,13 +164,22 @@ export function pointerRows(status: {
 /** One line telling the operator what to do about a mismatch, or "" when fine. */
 export function pointerPromotionHint(status: {
   production?: { configPath: string; error: string };
-  pointerMismatch?: { fields: unknown[]; configPath: string };
+  /**
+   * Every field is optional on purpose. "No mismatch" arrives from the gateway
+   * as an empty object, not as an absent key, and an empty object is truthy:
+   * reading `.fields.length` off it threw and took the whole panel down with a
+   * blank screen -- in the agreeing case, i.e. almost always. A gateway that is
+   * a deploy behind still sends that shape, so the guard stays regardless of
+   * what the current one emits.
+   */
+  pointerMismatch?: { fields?: unknown[]; configPath?: string };
 }): string {
   if (status.production?.error) return status.production.error;
   const mismatch = status.pointerMismatch;
-  if (!mismatch || mismatch.fields.length === 0) return "";
+  if (!mismatch?.fields?.length) return "";
+  const configPath = mismatch.configPath || status.production?.configPath || "追踪配置";
   return (
-    `解算不会自动改生产指针：要让它生效，编辑 ${mismatch.configPath} 的 ` +
+    `解算不会自动改生产指针：要让它生效，编辑 ${configPath} 的 ` +
     `calibration.intrinsics_run_name / fixed_camera_run_name。在那之前，产出的轨迹仍用旧标定。`
   );
 }

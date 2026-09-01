@@ -4374,3 +4374,17 @@ def test_calibration_payload_carries_both_pointers(tmp_path):
     assert payload["extrinsicsRun"] == "calib_0820_extrinsics"
     assert payload["production"]["extrinsicsRun"] == "extr_0804"
     assert payload["pointerMismatch"]["fields"]
+
+
+def test_calibration_payload_omits_pointer_mismatch_when_they_agree(tmp_path):
+    """Absent, not an empty object.
+
+    `{}` is truthy in the browser, so a client testing for the key found a
+    "mismatch" with no `fields` and crashed the calibration page on the healthy
+    path. The key documents itself as present only on disagreement; send that.
+    """
+    state = _pointer_state(tmp_path, config=_POINTER_CONFIG, solved_intr="intr_0804", solved_extr="extr_0804")
+
+    payload = gateway._calibration_payload(state)
+
+    assert "pointerMismatch" not in payload

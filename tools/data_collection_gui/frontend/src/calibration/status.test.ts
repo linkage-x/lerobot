@@ -160,6 +160,23 @@ describe("pointerPromotionHint", () => {
     expect(pointerPromotionHint({ pointerMismatch: { fields: [], configPath: "x.yaml" } })).toBe("");
   });
 
+  it("survives the empty object the gateway actually sends when they agree", () => {
+    // Not hypothetical: the gateway serialised "no mismatch" as `{}`, which is
+    // truthy, so `mismatch.fields.length` threw inside render and the whole
+    // calibration page went blank -- on the healthy path. A client one deploy
+    // behind the gateway still sees this shape.
+    expect(pointerPromotionHint({ pointerMismatch: {} })).toBe("");
+    expect(pointerPromotionHint({ pointerMismatch: {}, production: { configPath: "x.yaml", error: "" } })).toBe("");
+  });
+
+  it("falls back to the production config path when the mismatch omits one", () => {
+    const hint = pointerPromotionHint({
+      production: { configPath: "config_thor/april.yaml", error: "" },
+      pointerMismatch: { fields: [{}] },
+    });
+    expect(hint).toContain("config_thor/april.yaml");
+  });
+
   it("names the file to edit, because the solve will not edit it", () => {
     const hint = pointerPromotionHint({
       pointerMismatch: { fields: [{}], configPath: "config_thor/april.yaml" },
