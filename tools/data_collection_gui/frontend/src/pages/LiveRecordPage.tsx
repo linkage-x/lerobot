@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../apiClient";
 import type { GuiSnapshot } from "../api";
-import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingBackend, RecordingStatus, ReplayStatus, RolloutLandmarks, SceneResetRequest, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
+import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingBackend, RecordingStatus, ReplayStatus, RolloutLandmarks, SceneResetRequest, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, TrainingView } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
 import { SceneResetPanel } from "./SceneResetPanel";
 
@@ -323,6 +323,9 @@ export function LiveRecordPage({
   const supportsBackendChoice = workstationProfile;
   const supportsTrajectoryGeneration = !workstationProfile;
   const [sceneResetLandmarks, setSceneResetLandmarks] = useState<RolloutLandmarks>({});
+  const [sceneResetTrainingViews, setSceneResetTrainingViews] = useState<TrainingView[]>([]);
+  const [sceneResetReferenceSource, setSceneResetReferenceSource] = useState("");
+  const [sceneResetReferenceLandmarks, setSceneResetReferenceLandmarks] = useState<RolloutLandmarks>({});
   const [selectedBackend, setSelectedBackend] = useState<RecordingBackend>(
     snapshot.recording.backend ?? "real"
   );
@@ -432,6 +435,35 @@ export function LiveRecordPage({
   }, [workstationProfile, snapshot.recording.datasetRoot]);
 
   useEffect(() => {
+    if (!workstationProfile) return;
+    let cancelled = false;
+    void (async () => {
+      const views = await api.fetchTrainingViews();
+      if (!cancelled) setSceneResetTrainingViews(views);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [workstationProfile]);
+
+  useEffect(() => {
+    if (!workstationProfile) return;
+    if (sceneResetReferenceSource === "none") {
+      setSceneResetReferenceLandmarks({});
+      return;
+    }
+    if (!sceneResetReferenceSource) return;
+    let cancelled = false;
+    void (async () => {
+      const landmarks = await api.fetchRolloutLandmarks(sceneResetReferenceSource);
+      if (!cancelled) setSceneResetReferenceLandmarks(landmarks);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [workstationProfile, sceneResetReferenceSource]);
+
+  useEffect(() => {
     if (!recorderConnected) {
       setEpisodeTimeInput(String(snapshot.configSummary.episodeTimeS));
       setFpsInput(String(snapshot.configSummary.fps));
@@ -510,6 +542,43 @@ export function LiveRecordPage({
     </div>
   ) : undefined;
 
+  const sceneResetReferenceOptions = useMemo(() => {
+    return [
+      ...sceneResetTrainingViews.map((view) => ({
+        value: view.root,
+        label: view.name,
+        count: view.episodes
+      })),
+      { value: "none", label: "No training view", count: 0 }
+    ];
+  }, [sceneResetTrainingViews]);
+
+  useEffect(() => {
+    if (sceneResetReferenceSource === "none") return;
+    if (sceneResetReferenceOptions.some((option) => option.value === sceneResetReferenceSource)) return;
+    setSceneResetReferenceSource(sceneResetTrainingViews[0]?.root ?? "none");
+  }, [sceneResetReferenceOptions, sceneResetReferenceSource, sceneResetTrainingViews]);
+
+  const selectedSceneResetReference =
+    sceneResetReferenceOptions.find((option) => option.value === sceneResetReferenceSource) ?? sceneResetReferenceOptions[0];
+  const sceneResetPanelLandmarks =
+    sceneResetReferenceSource === "none" ? sceneResetLandmarks : sceneResetReferenceLandmarks;
+  const sceneResetReferenceControl = (
+    <label className="field inline scene-reset-reference-source">
+      <span>Training view</span>
+      <select
+        value={sceneResetReferenceSource || selectedSceneResetReference?.value || "none"}
+        onChange={(event) => setSceneResetReferenceSource(event.target.value)}
+      >
+        {sceneResetReferenceOptions.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.count ? `${option.label} (${option.count} ep)` : option.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+
   return (
     <div className="page-stack">
       <PageHeader
@@ -573,9 +642,10 @@ export function LiveRecordPage({
       {workstationProfile ? (
         <SceneResetPanel
           title="Record scene reset"
-          landmarks={sceneResetLandmarks}
+          landmarks={sceneResetPanelLandmarks}
           backgroundImageUrl={recorderConnected ? api.cameraSnapshotUrl("side") : undefined}
           backgroundLabel="side camera"
+          referenceSourceControl={sceneResetReferenceControl}
           busy={busy}
           disabled={!(["armed", "review"].includes(snapshot.recording.state))}
           disabledReason={

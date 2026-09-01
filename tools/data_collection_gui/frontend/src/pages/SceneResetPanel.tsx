@@ -51,6 +51,7 @@ export function SceneResetPanel({
   landmarks = {},
   backgroundImageUrl,
   backgroundLabel = "side camera",
+  referenceSourceControl,
   busy,
   disabled,
   disabledReason,
@@ -60,6 +61,7 @@ export function SceneResetPanel({
   landmarks?: RolloutLandmarks;
   backgroundImageUrl?: string;
   backgroundLabel?: string;
+  referenceSourceControl?: React.ReactNode;
   busy: boolean;
   disabled?: boolean;
   disabledReason?: string;
@@ -192,6 +194,9 @@ export function SceneResetPanel({
         </div>
 
         <div className="scene-reset-form">
+          {referenceSourceControl ? (
+            <div className="scene-reset-reference-control">{referenceSourceControl}</div>
+          ) : null}
           <div className="row-actions">
             <label className="field inline"><span>Pick x</span><input value={pickX} onChange={(event) => setPickX(event.target.value)} inputMode="decimal" /></label>
             <label className="field inline"><span>Pick y</span><input value={pickY} onChange={(event) => setPickY(event.target.value)} inputMode="decimal" /></label>

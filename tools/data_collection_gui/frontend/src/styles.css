@@ -5027,6 +5027,13 @@ button.danger {
   min-width: 92px;
   flex: 1 1 92px;
 }
+.scene-reset-reference-control {
+  display: flex;
+  justify-content: flex-start;
+}
+.scene-reset-reference-source {
+  max-width: 260px;
+}
 @media (max-width: 860px) {
   .scene-reset-layout { grid-template-columns: 1fr; }
 }
