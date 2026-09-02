@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import threading
@@ -4388,3 +4389,314 @@ def test_calibration_payload_omits_pointer_mismatch_when_they_agree(tmp_path):
     payload = gateway._calibration_payload(state)
 
     assert "pointerMismatch" not in payload
+
+
+def _production_intrinsics_run(tmp_path: Path, name: str, cameras: list[str]) -> None:
+    """A run directory shaped the way export_production_calibration writes one."""
+    directory = tmp_path / "outputs" / "calibration" / name
+    (directory / "converted").mkdir(parents=True, exist_ok=True)
+    (directory / "summary.json").write_text(
+        json.dumps({"cameras": [{"camera_name": camera} for camera in cameras]}),
+        encoding="utf-8",
+    )
+
+
+def test_a_refit_that_cannot_survive_its_own_export_is_refused_before_the_decode(
+    tmp_path, monkeypatch
+):
+    """The exporter builds a whole intrinsics run from one report and cannot
+    carry a camera forward, so a camera in the capture that sees no board takes
+    the run down at the *last* step -- after both captures have been decoded.
+    The check is worth an hour every time it fires, so it happens at the click."""
+    monkeypatch.setattr(gateway, "_solve_python", lambda _root: (Path(sys.executable), []))
+    state = _solve_state(tmp_path)
+    capture = _charuco_capture(tmp_path, episodes=2, cameras=3)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_00"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    gateway._set_solve_dataset(state, str(capture))
+    gateway._set_solve_dataset(state, str(capture), "intrinsics")
+
+    preflight = gateway._solve_payload(state)["intrinsicsPreflight"]
+    assert preflight["blocking"] is True
+    # Named, not counted: the operator has to know which cameras to deal with.
+    assert preflight["uncalibrated"] == ["cam_01", "cam_02"]
+
+    refused = gateway._start_extrinsics_calibration(state, refit_intrinsics=True)
+    assert refused["ok"] is False
+    assert "cam_01" in refused["error"] and "cam_02" in refused["error"]
+    assert "只解算，不导出" in refused["hint"]
+    assert state.calibration.state != "running"
+
+
+def test_experiment_mode_is_the_way_past_that_refusal(tmp_path, monkeypatch):
+    """Not an override: nothing gets exported, so the failure cannot occur."""
+    monkeypatch.setattr(gateway, "_solve_python", lambda _root: (Path(sys.executable), []))
+    monkeypatch.setattr(gateway, "Thread", lambda *a, **k: types.SimpleNamespace(start=lambda: None))
+    state = _solve_state(tmp_path)
+    capture = _charuco_capture(tmp_path, episodes=2, cameras=3)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_00"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    gateway._set_solve_dataset(state, str(capture))
+    gateway._set_solve_dataset(state, str(capture), "intrinsics")
+
+    started = gateway._start_extrinsics_calibration(
+        state, refit_intrinsics=True, export_production=False
+    )
+    assert started["ok"] is True
+    # Four steps, not five: the export is gone rather than skipped at the end.
+    assert state.calibration.progress.stepCount == 4
+
+
+def test_a_fresh_rig_is_not_blocked_by_its_own_first_calibration(tmp_path):
+    """Blocking is about extending a set that exists. With no production
+    intrinsics there is nothing to lose and nothing to carry forward."""
+    state = _solve_state(tmp_path)
+    capture = _charuco_capture(tmp_path, episodes=2, cameras=3)
+    gateway._set_solve_dataset(state, str(capture), "intrinsics")
+
+    assert gateway._solve_payload(state)["intrinsicsPreflight"]["blocking"] is False
+
+
+def test_skipping_the_export_drops_its_step_rather_than_leaving_a_gap(tmp_path):
+    """The bar must still reach 1.0 by finishing work, not by being set there."""
+    full = gateway._solve_weights([70, 10])
+    experiment = gateway._solve_weights([70, 10], export=False)
+
+    assert len(experiment) == len(full) - 1
+    assert sum(experiment) == pytest.approx(1.0)
+    # The detections still dominate; only the 0.02 export slice is redistributed.
+    assert experiment[0] > full[0]
+
+
+# --- Promoting a solved calibration into production ------------------------
+#
+# The gateway half of the promotion path: reading the tracking config, refusing
+# a write the operator has not been shown the risks of, and stopping trajectory
+# generation that would silently use a stale pointer. The comparison arithmetic
+# itself is covered in test_calibration_promotion.py.
+
+_TRACKING_CONFIG_TEXT = """calibration:
+  # Provenance note that a YAML round-trip would delete.
+  intrinsics_run_name: live_intrinsics
+  fixed_camera_run_name: live_extrinsics
+cube_tracker:
+  camera_model: opencv_fisheye
+"""
+
+
+def _promotion_state(tmp_path, *, live_world="world_a", candidate_world="world_a", candidate_state="CONTINUOUS"):
+    config_path = tmp_path / gateway._TRACKING_CONFIG
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(_TRACKING_CONFIG_TEXT, encoding="utf-8")
+
+    calibration_root = tmp_path / "outputs" / "calibration"
+
+    def write(name, world_id, world_state, x):
+        directory = calibration_root / name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "summary.json").write_text(
+            json.dumps(
+                {
+                    "bundle_rmse_px": 0.25,
+                    "joint_solution": {
+                        "cameras": {
+                            "cam_06": {
+                                "base_to_camera": {
+                                    "matrix_4x4": [
+                                        [1, 0, 0, 0.0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]
+                                    ]
+                                }
+                            },
+                            "cam_07": {
+                                "base_to_camera": {
+                                    "matrix_4x4": [
+                                        [1, 0, 0, x], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]
+                                    ]
+                                }
+                            },
+                        }
+                    },
+                    "world": {
+                        "world_frame_id": world_id,
+                        "world_continuity_state": world_state,
+                        "reason": "stable_cluster",
+                        "stable_cameras": ["cam_06", "cam_07"],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return directory
+
+    live = write("live_extrinsics", live_world, "CONTINUOUS", 1.0)
+    candidate = write("calib_20260902_103833_extrinsics", candidate_world, candidate_state, 1.001)
+    os.utime(live, (1_700_000_100, 1_700_000_100))
+    os.utime(candidate, (1_700_000_900, 1_700_000_900))
+
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+        datasets_root=tmp_path / "outputs" / "datasets",
+    )
+    gateway._PRODUCTION_RUNS_CACHE.clear()
+    gateway._load_active_calibration_runs(state)
+    return state, config_path
+
+
+def test_the_review_is_built_without_being_asked_for(tmp_path):
+    """A review behind a button is a review that gets skipped.
+
+    That is not a hunch: the step which was optional -- hand-editing the tracking
+    config -- is the exact step that went undone for seven days while production
+    loaded a calibration missing a moved camera.
+    """
+    state, _ = _promotion_state(tmp_path)
+    payload = gateway._calibration_payload(state)
+    review = payload["promotion"]
+    assert review["candidates"]["extrinsics"] == "calib_20260902_103833_extrinsics"
+    assert review["extrinsics"]["ok"] is True
+    assert review["extrinsics"]["cameras"][0]["camera"] in {"cam_06", "cam_07"}
+    assert review["extrinsicsBlockers"] == []
+
+
+def test_promotion_writes_the_pointer_and_keeps_the_comments(tmp_path):
+    state, config_path = _promotion_state(tmp_path)
+    result = gateway._promote_calibration(state, ["extrinsics"])
+    assert result["ok"] is True, result
+    text = config_path.read_text(encoding="utf-8")
+    assert "fixed_camera_run_name: calib_20260902_103833_extrinsics" in text
+    assert "Provenance note that a YAML round-trip would delete." in text
+    # Untouched, because only extrinsics was asked for.
+    assert "intrinsics_run_name: live_intrinsics" in text
+    # And the panel now agrees with the file, without waiting for a restart.
+    assert state.calibration.extrinsicsRun == "calib_20260902_103833_extrinsics"
+
+
+def test_promotion_leaves_an_audit_line_carrying_the_evidence(tmp_path):
+    state, _ = _promotion_state(tmp_path)
+    gateway._promote_calibration(state, ["extrinsics"], note="fresh calibration for today")
+    log = tmp_path / gateway._PROMOTION_LOG
+    record = json.loads(log.read_text(encoding="utf-8").strip())
+    assert record["note"] == "fresh calibration for today"
+    assert record["changes"][0]["to"] == "calib_20260902_103833_extrinsics"
+    assert "medianBaselineShiftMm" in record["evidence"]
+
+
+def test_a_world_change_stops_the_promotion_until_it_is_acknowledged(tmp_path):
+    """Silently moving the world frame makes old and new labels incomparable."""
+    state, config_path = _promotion_state(
+        tmp_path, candidate_world="world_b", candidate_state="RECONCILED"
+    )
+    refused = gateway._promote_calibration(state, ["extrinsics"])
+    assert refused["ok"] is False
+    kinds = {item["kind"] for item in refused["blockers"]}
+    assert "world_frame_changed" in kinds
+    assert "live_extrinsics" in config_path.read_text(encoding="utf-8")
+
+    allowed = gateway._promote_calibration(
+        state, ["extrinsics"], acknowledge=sorted(kinds)
+    )
+    assert allowed["ok"] is True, allowed
+    assert "calib_20260902_103833_extrinsics" in config_path.read_text(encoding="utf-8")
+
+
+def test_promoting_twice_is_refused_rather_than_logged_as_a_change(tmp_path):
+    state, _ = _promotion_state(tmp_path)
+    assert gateway._promote_calibration(state, ["extrinsics"])["ok"] is True
+    again = gateway._promote_calibration(state, ["extrinsics"])
+    assert again["ok"] is False
+    assert "已经是最新" in again["error"]
+
+
+def test_a_running_solve_blocks_promotion(tmp_path):
+    state, _ = _promotion_state(tmp_path)
+    state.calibration.state = "running"
+    result = gateway._promote_calibration(state, ["extrinsics"])
+    assert result["ok"] is False
+    assert "解算正在运行" in result["error"]
+
+
+def test_trajectory_generation_refuses_a_stale_calibration_pointer(tmp_path):
+    """The one check that fires with nobody watching.
+
+    Promotion is a button somebody has to press; this is what catches the case
+    where nobody did. Generating against the older calibration stays possible --
+    reproducing an earlier result needs it -- but only when asked for explicitly.
+    """
+    state, _ = _promotion_state(tmp_path)
+    gate = gateway._stale_calibration_gate(state)
+    assert "calib_20260902_103833_extrinsics" in gate["message"]
+    assert "live_extrinsics" in gate["message"]
+
+    dataset_root = tmp_path / "outputs" / "datasets" / "thor_gmsl2_10ch_v1_20260902_120000"
+    dataset_root.mkdir(parents=True)
+    with pytest.raises(gateway.StaleCalibrationError):
+        gateway._queue_traj_gen(state, dataset_root)
+    # Nothing was started, so nothing must be left marked as starting.
+    assert str(dataset_root) not in state.processing_starting
+
+
+def test_the_stale_gate_goes_quiet_once_the_run_is_promoted(tmp_path):
+    state, _ = _promotion_state(tmp_path)
+    assert gateway._stale_calibration_gate(state)
+    gateway._promote_calibration(state, ["extrinsics"])
+    assert gateway._stale_calibration_gate(state) == {}
+
+
+def test_the_job_record_says_which_calibration_produced_it(tmp_path):
+    """Months later this is the only thing that answers "before or after the repoint"."""
+    dataset_root = tmp_path / "outputs" / "datasets" / "thor_gmsl2_10ch_v1_20260902_120000"
+    dataset_root.mkdir(parents=True)
+    gateway._update_traj_gen_meta(
+        dataset_root,
+        job_id="traj-gen-1",
+        status="running",
+        command=["bash", "run.sh"],
+        message="running",
+        calibration={
+            "intrinsicsRun": "live_intrinsics",
+            "extrinsicsRun": "calib_20260902_103833_extrinsics",
+            "configPath": "config_thor/april.yaml",
+        },
+    )
+    # A later update that does not repeat the stamp must not drop it: the
+    # completion record is the one that lasts.
+    gateway._update_traj_gen_meta(
+        dataset_root, job_id="traj-gen-1", status="complete", message="done", exit_code=0
+    )
+    meta = gateway._load_processing_meta(dataset_root)
+    assert meta["current_job"]["calibration"]["extrinsicsRun"] == "calib_20260902_103833_extrinsics"
+
+
+def test_the_review_cache_notices_a_new_run_appearing(tmp_path):
+    """The review is cached because the panel polls, but a solve must show up.
+
+    A cache that outlived a new run would put the panel back in the state this
+    whole path exists to remove: production loading one calibration while the
+    screen implies another.
+    """
+    state, _ = _promotion_state(tmp_path)
+    assert gateway._calibration_payload(state)["promotion"]["candidates"]["extrinsics"] == (
+        "calib_20260902_103833_extrinsics"
+    )
+    # Same inputs -> served from cache, and still a faithful copy rather than the
+    # cached object itself (mutating the payload must not poison the next read).
+    payload = gateway._calibration_payload(state)
+    payload["promotion"]["candidates"]["extrinsics"] = "mutated"
+    assert gateway._calibration_payload(state)["promotion"]["candidates"]["extrinsics"] == (
+        "calib_20260902_103833_extrinsics"
+    )
+
+    newer = tmp_path / "outputs" / "calibration" / "calib_20260903_090000_extrinsics"
+    newer.mkdir(parents=True)
+    shutil.copy(
+        tmp_path / "outputs" / "calibration" / "calib_20260902_103833_extrinsics" / "summary.json",
+        newer / "summary.json",
+    )
+    os.utime(newer, (1_700_001_500, 1_700_001_500))
+    assert gateway._calibration_payload(state)["promotion"]["candidates"]["extrinsics"] == (
+        "calib_20260903_090000_extrinsics"
+    )

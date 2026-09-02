@@ -4089,3 +4089,49 @@ button.danger {
   padding: 6px 10px;
   margin-top: 6px;
 }
+
+/* The promotion review. Deliberately quieter than .cali-pointer-drift above:
+   that one reports a problem, this one is the workspace for resolving it, and a
+   panel that shouts while you read a table of numbers is a panel that gets
+   collapsed. */
+.cali-promotion {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #d8dde5;
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+.cali-promotion-head {
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+.cali-promotion-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin: 6px 0;
+}
+.cali-promotion-table th,
+.cali-promotion-table td {
+  text-align: left;
+  padding: 3px 8px 3px 0;
+  border-bottom: 1px solid #eceff3;
+  white-space: nowrap;
+}
+.cali-promotion-table th {
+  color: #6b7280;
+  font-weight: 500;
+  font-size: 11px;
+}
+/* Each blocker is its own checkbox, so declining a risk is one decision per
+   risk rather than one blanket acknowledgement carried across all of them. */
+.cali-promotion-blockers {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #fdf6e7;
+  color: #7a4f0d;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}

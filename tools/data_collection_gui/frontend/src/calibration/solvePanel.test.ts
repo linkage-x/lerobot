@@ -5,7 +5,13 @@ import type {
   CalibrationSolve,
   CalibrationStatus,
 } from "../types";
-import { captureTally, intrinsicsNote, solveButtonView, solveTargetView } from "./solvePanel";
+import {
+  captureTally,
+  intrinsicsNote,
+  preflightView,
+  solveButtonView,
+  solveTargetView,
+} from "./solvePanel";
 
 function status(
   state: CalibrationStatus["state"],
@@ -171,5 +177,37 @@ describe("intrinsics note", () => {
     const note = intrinsicsNote({ ...(CAPTURE as CalibrationSolve), candidates: [] }, true);
     expect(note).toContain("还没选内参采集");
     expect(note).toContain("四角");
+  });
+});
+
+describe("preflightView", () => {
+  const preflight = {
+    cameras: ["cam_01", "cam_02", "cam_06"],
+    production: ["cam_06", "cam_07"],
+    uncalibrated: ["cam_01", "cam_02"],
+    blocking: true,
+  };
+
+  it("stays quiet when intrinsics are not being re-fitted", () => {
+    expect(preflightView(preflight, false, false).blocking).toBe(false);
+  });
+
+  it("blocks a re-fit that would export, naming the cameras", () => {
+    const view = preflightView(preflight, true, false);
+    expect(view.blocking).toBe(true);
+    expect(view.message).toContain("cam_01");
+    expect(view.message).toContain("cam_02");
+    // The production count is the other half of the loss: those are dropped.
+    expect(view.message).toContain("2 台");
+    expect(view.hint).toContain("只解算，不导出");
+  });
+
+  it("lets experiment mode through, because nothing gets exported", () => {
+    expect(preflightView(preflight, true, true).blocking).toBe(false);
+  });
+
+  it("does not block a fresh rig, which has no production set to lose", () => {
+    const fresh = { cameras: ["cam_01"], production: [], uncalibrated: [], blocking: false };
+    expect(preflightView(fresh, true, false).blocking).toBe(false);
   });
 });

@@ -3,6 +3,8 @@ import {
   computeValidity,
   canTransition,
   pointerPromotionHint,
+  promotionView,
+  intrinsicsPromotionNote,
   pointerRows,
   summarizeKinds,
   worstValidity,
@@ -191,5 +193,115 @@ describe("pointerPromotionHint", () => {
       pointerMismatch: { fields: [{}], configPath: "x.yaml" },
     });
     expect(hint).toBe("生产配置解析失败");
+  });
+});
+
+describe("promotionView", () => {
+  const review = {
+    candidates: { extrinsics: "calib_20260902_103833_extrinsics" },
+    configPath: "config_thor/april.yaml",
+    extrinsics: {
+      ok: true,
+      live: "calib_20260820_173825_extrinsics",
+      candidate: "calib_20260902_103833_extrinsics",
+      pairCount: 21,
+      medianBaselineShiftMm: 0.233,
+      medianRotationDeg: 0.0911,
+      worstPair: { a: "cam_07", b: "cam_14", liveMm: 817.05, candidateMm: 817.88, shiftMm: 0.832, rotationDeg: 0.1238 },
+      cameras: [
+        { camera: "cam_07", medianBaselineShiftMm: 0.637, maxBaselineShiftMm: 0.832, medianRotationDeg: 0.128, maxRotationDeg: 0.1846 },
+        { camera: "cam_14", medianBaselineShiftMm: 0.151, maxBaselineShiftMm: 0.832, medianRotationDeg: 0.0719, maxRotationDeg: 0.1238 },
+      ],
+      candidateWorld: {
+        worldFrameId: "world_20260819_031843",
+        referenceWorldFrameId: "world_20260819_031843",
+        continuityState: "CONTINUOUS",
+        reason: "stable_cluster",
+        stableCameras: ["cam_06", "cam_07"],
+      },
+      liveRmsePx: 0.2728,
+      candidateRmsePx: 0.2263,
+    },
+    extrinsicsBlockers: [],
+  };
+
+  it("stays hidden when production already loads the newest run", () => {
+    expect(promotionView(undefined).visible).toBe(false);
+    expect(promotionView({ candidates: {}, configPath: "x.yaml" }).visible).toBe(false);
+  });
+
+  it("names the run that would take effect", () => {
+    const view = promotionView(review);
+    expect(view.visible).toBe(true);
+    expect(view.headline).toContain("calib_20260902_103833_extrinsics");
+    expect(view.kinds).toEqual(["extrinsics"]);
+  });
+
+  it("orders cameras as the gateway ranked them and keeps the median, not the max", () => {
+    const rows = promotionView(review).rows;
+    expect(rows.map((r) => r.camera)).toEqual(["cam_07", "cam_14"]);
+    // 0.637 is cam_07's median; its max (0.832) belongs to the worst-pair line.
+    expect(rows[0].baselineMm).toBe("0.64");
+  });
+
+  it("shows the reprojection numbers but refuses to let them read as a verdict", () => {
+    const view = promotionView(review);
+    expect(view.rmseNote).toContain("0.2728");
+    expect(view.rmseNote).toContain("0.2263");
+    // The candidate scores better here, which is exactly when the warning has
+    // to be present: in August the better-scoring run was the wrong one.
+    expect(view.rmseNote).toContain("不能用来择优");
+    expect(view.headline).not.toMatch(/更好|推荐|建议采用/);
+    expect(view.summary).not.toMatch(/更好|推荐/);
+  });
+
+  it("carries world continuity into the summary line", () => {
+    expect(promotionView(review).world).toContain("CONTINUOUS");
+    expect(promotionView(review).world).toContain("world_20260819_031843");
+  });
+
+  it("passes blockers through so the button can stay disabled", () => {
+    const blocked = {
+      ...review,
+      extrinsicsBlockers: [{ kind: "world_frame_changed", message: "世界系变了" }],
+    };
+    expect(promotionView(blocked).blockers).toHaveLength(1);
+    expect(promotionView(blocked).blockers[0].kind).toBe("world_frame_changed");
+  });
+
+  it("reports a run it could not read instead of rendering an empty table", () => {
+    const broken = {
+      candidates: { extrinsics: "calib_x_extrinsics" },
+      configPath: "x.yaml",
+      extrinsics: { ok: false, error: "读不到 summary.json", live: "a", candidate: "b" },
+    };
+    const view = promotionView(broken);
+    expect(view.visible).toBe(true);
+    expect(view.rows).toEqual([]);
+    expect(view.summary).toContain("读不到 summary.json");
+  });
+});
+
+describe("intrinsicsPromotionNote", () => {
+  it("is empty when no lens run is up for promotion", () => {
+    expect(intrinsicsPromotionNote(undefined)).toBe("");
+    expect(intrinsicsPromotionNote({ candidates: {}, configPath: "x" })).toBe("");
+  });
+
+  it("names the model, because that is what makes a lens run unloadable", () => {
+    const note = intrinsicsPromotionNote({
+      candidates: { intrinsics: "run_intrinsics" },
+      configPath: "x",
+      intrinsics: {
+        ok: true,
+        live: "old",
+        candidate: "run_intrinsics",
+        cameras: ["cam_06", "cam_07"],
+        model: "opencv_fisheye",
+        trackerModel: "opencv_fisheye",
+      },
+    });
+    expect(note).toContain("2 台");
+    expect(note).toContain("opencv_fisheye");
   });
 });

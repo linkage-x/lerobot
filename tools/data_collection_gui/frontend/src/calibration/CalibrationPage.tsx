@@ -62,7 +62,7 @@ export function CalibrationPage({
   api: DataCollectionGuiApi;
   busy: boolean;
   onRunMultiCameraCalibration: (
-    options?: { forceRedetect?: boolean; refitIntrinsics?: boolean }
+    options?: { forceRedetect?: boolean; refitIntrinsics?: boolean; experiment?: boolean }
   ) => void;
 }) {
   const now = useNow();

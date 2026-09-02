@@ -16,6 +16,7 @@ import type {
   CalibrationSessionStep,
   CalibrationSolve,
   CalibrationStatus,
+  IntrinsicsPreflight,
 } from "../types";
 
 export type SolveTargetView = {
@@ -115,3 +116,44 @@ export function captureTally(steps: CalibrationSessionStep[]): string {
   const skipped = steps.filter((step) => step.status === "skipped").length;
   return `${captured} 段${skipped ? ` · 跳过 ${skipped}` : ""}`;
 }
+
+
+/** Whether re-fitting and exporting from this capture is doomed, and why.
+ *
+ * `export_production_calibration` builds a whole intrinsics run from one report
+ * and has no way to carry a camera forward from the run in production, so every
+ * camera with video in the capture must come out of the fit with a usable model.
+ * On this rig cam_02/cam_03 point away from the board area and detect nothing in
+ * every episode, which makes "re-fit the whole rig and export" structurally
+ * impossible rather than unlucky -- and the failure lands at the *last* step,
+ * after both captures have been decoded. Saying it before the click is worth an
+ * hour every time it fires.
+ *
+ * It only blocks when production already ships intrinsics: a first calibration
+ * of a fresh rig has nothing to extend and nothing to lose.
+ */
+export type PreflightView = { blocking: boolean; message: string; hint: string };
+
+export function preflightView(
+  preflight: IntrinsicsPreflight | undefined,
+  refit: boolean,
+  experiment: boolean,
+): PreflightView {
+  if (!refit || experiment || !preflight?.blocking) {
+    return { blocking: false, message: "", hint: "" };
+  }
+  const names = preflight.uncalibrated.join("、");
+  return {
+    blocking: true,
+    message:
+      `${names} 没有在产内参，重算后必须各自拟合出可用模型才能导出——` +
+      `任何一台看不到板都会让整轮在最后一步作废，已解码的部分全部白跑。` +
+      `而且导出只写这份报告里的相机，当前在产的 ${preflight.production.length} 台不会被保留。`,
+    hint: "勾上「只解算，不导出」跑这一轮：BA 照常解出这些相机并给残差，只是不写进生产。",
+  };
+}
+
+/** What experiment mode is for, said where the checkbox is. */
+export const EXPERIMENT_NOTE =
+  "解算并给出残差，但不写生产标定、不动内外参指针、不清空 rig-check 基线。" +
+  "测一颗新镜头、试一份采集时用这个——生产标定不该是实验的副作用。";

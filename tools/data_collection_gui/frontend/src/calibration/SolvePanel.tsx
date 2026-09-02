@@ -1,8 +1,18 @@
 import { useEffect, useState } from "react";
 import type { CalibrationSession, CalibrationStatus } from "../types";
-import { intrinsicsNote, solveButtonView, solveTargetView } from "./solvePanel";
+import {
+  EXPERIMENT_NOTE,
+  intrinsicsNote,
+  preflightView,
+  solveButtonView,
+  solveTargetView,
+} from "./solvePanel";
 
-export type SolveOptions = { forceRedetect?: boolean; refitIntrinsics?: boolean };
+export type SolveOptions = {
+  forceRedetect?: boolean;
+  refitIntrinsics?: boolean;
+  experiment?: boolean;
+};
 
 /** The capture the solve will read, and the button that starts (or retries) it. */
 export function SolvePanel({
@@ -26,8 +36,13 @@ export function SolvePanel({
   // decode) and it replaces the intrinsics production is using, which is not
   // something to do as a side effect of re-solving extrinsics.
   const [refitIntrinsics, setRefitIntrinsics] = useState(false);
+  // Off by default so the ordinary path still ships. A solve that ends without
+  // writing anything is the safe mode, not the default one: an operator who
+  // recalibrates the rig and gets no new run would have no way to tell.
+  const [experiment, setExperiment] = useState(false);
   const target = solveTargetView(status.solve);
   const button = solveButtonView(status, session);
+  const preflight = preflightView(status.solve?.intrinsicsPreflight, refitIntrinsics, experiment);
   // The gateway is the source of truth for which capture is selected, but it
   // only says so on the next snapshot poll; without holding the choice locally
   // the dropdown visibly snaps back to the old capture in between.
@@ -61,10 +76,10 @@ export function SolvePanel({
         <span className="cali-dev-hint">外参</span>
         <button
           className="cali-btn-primary"
-          disabled={disabled || button.disabled}
-          onClick={() => onSolve({ forceRedetect, refitIntrinsics })}
+          disabled={disabled || button.disabled || preflight.blocking}
+          onClick={() => onSolve({ forceRedetect, refitIntrinsics, experiment })}
         >
-          {button.label}
+          {experiment ? `${button.label}（不导出）` : button.label}
         </button>
       </div>
       <p className="small cali-solve-detail">
@@ -101,6 +116,25 @@ export function SolvePanel({
         </div>
       ) : null}
       <p className="small cali-solve-detail">{intrinsicsNote(status.solve, refitIntrinsics)}</p>
+      {preflight.blocking ? (
+        <p className="small cali-solve-detail cali-warn">
+          {preflight.message}
+          <br />
+          {preflight.hint}
+        </p>
+      ) : null}
+
+      <label className="cali-check">
+        <input
+          type="checkbox"
+          checked={experiment}
+          disabled={disabled}
+          onChange={(event) => setExperiment(event.target.checked)}
+        />
+        <span>只解算，不导出（实验）</span>
+      </label>
+      <p className="small cali-solve-detail">{EXPERIMENT_NOTE}</p>
+
       <label className="cali-check">
         <input
           type="checkbox"

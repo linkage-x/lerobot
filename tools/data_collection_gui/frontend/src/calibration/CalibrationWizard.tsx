@@ -24,6 +24,7 @@ import { SolveProgress } from "./SolveProgress";
 import { StepCameraPreview } from "./StepCameraPreview";
 import { previewCameras, previewStatus } from "./stepPreview";
 import { pointerPromotionHint, pointerRows } from "./status";
+import { PromotionPanel } from "./PromotionPanel";
 
 // Mirrors the gateway's validation (_parse_calibration_segment_seconds); the
 // input just stops the obvious mistakes before a round-trip.
@@ -325,6 +326,11 @@ export function CalibrationWizard({
         ))}
       </div>
       {promotionHint ? <p className="panel-note cali-pointer-drift">{promotionHint}</p> : null}
+      <PromotionPanel
+        review={status.promotion}
+        disabled={disabled}
+        onPromote={(options) => api.promoteCalibration(options)}
+      />
     </section>
   );
 }

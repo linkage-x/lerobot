@@ -531,13 +531,16 @@ export class DataCollectionGuiApi {
   }
 
   async runCalibration(
-    options: { forceRedetect?: boolean; refitIntrinsics?: boolean } = {}
+    options: { forceRedetect?: boolean; refitIntrinsics?: boolean; experiment?: boolean } = {}
   ): Promise<GuiSnapshot> {
     // Detections are reused across attempts unless this says otherwise; see the
     // gateway's _reusable_detections for what counts as still valid.
     const params = new URLSearchParams();
     if (options.forceRedetect) params.set("force_redetect", "1");
     if (options.refitIntrinsics) params.set("refit_intrinsics", "1");
+    // Absent means export, so a caller that has never heard of experiment mode
+    // keeps the behaviour it had.
+    if (options.experiment) params.set("experiment", "1");
     const query = params.toString() ? `?${params}` : "";
     const remote = await this.postRemoteSnapshot(`/api/calibration/run${query}`);
     if (remote) {
@@ -790,6 +793,45 @@ export class DataCollectionGuiApi {
 
   async calibrationStepRecord(action: "start" | "save" | "discard"): Promise<{ ok: boolean; error?: string }> {
     return this.calibrationSessionPost(`/api/calibration/session/record?action=${action}`);
+  }
+
+  /**
+   * Write the reviewed runs into the tracking config -- the only thing that
+   * makes a solve take effect. Blockers come back in `blockers` and are cleared
+   * by naming their `kind` in `acknowledge`, so the risk is declined explicitly
+   * rather than by a checkbox that was already ticked before it was read.
+   */
+  async promoteCalibration(options: {
+    kinds: ("intrinsics" | "extrinsics")[];
+    acknowledge?: string[];
+    note?: string;
+  }): Promise<{ ok: boolean; error?: string; blockers?: { kind: string; message: string }[] }> {
+    const params = new URLSearchParams();
+    params.set("kind", options.kinds.join(","));
+    if (options.acknowledge?.length) params.set("acknowledge", options.acknowledge.join(","));
+    if (options.note) params.set("note", options.note);
+    try {
+      const response = await fetch(`${this.apiBase}/api/calibration/promote?${params}`, {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      const payload = (await response.json()) as {
+        ok?: boolean;
+        error?: string;
+        blockers?: { kind: string; message: string }[];
+        calibration?: unknown;
+      };
+      if (response.ok && payload.ok !== false) {
+        // The gateway answers a successful promotion with a whole snapshot, so
+        // adopting it here is what makes the panel show the new pointer without
+        // waiting for the next poll to come round.
+        this.snapshot = { ...this.snapshot, ...(payload as unknown as Partial<GuiSnapshot>) };
+        return { ok: true };
+      }
+      return { ok: false, error: payload.error, blockers: payload.blockers };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
   }
 
   async calibrationStepSkip(): Promise<{ ok: boolean; error?: string }> {

@@ -3,6 +3,7 @@
 
 import { VALIDITY, type CalibrationKind } from "./config";
 import type { CaliMachineState, DotState, ValidityState } from "./types";
+import type { CalibrationPromotionReview } from "../types";
 import { TERMINAL_STATES, BUSY_STATES } from "./types";
 
 export type Validity = {
@@ -181,5 +182,115 @@ export function pointerPromotionHint(status: {
   return (
     `解算不会自动改生产指针：要让它生效，编辑 ${configPath} 的 ` +
     `calibration.intrinsics_run_name / fixed_camera_run_name。在那之前，产出的轨迹仍用旧标定。`
+  );
+}
+
+/**
+ * The review that has to be on screen before a calibration can be promoted.
+ *
+ * Everything here is a description, never a recommendation. Ranking two
+ * calibrations by a single number is the specific mistake this guards against:
+ * the run that self-scored best in August (0804, 0.244 px) was the one missing
+ * a camera that had been physically moved, and the run that scored worse (0820,
+ * 0.273 px) was correct. So the reprojection numbers are rendered side by side
+ * and explicitly labelled as not a criterion, and there is no "better" verdict
+ * anywhere in this file.
+ */
+export type PromotionView = {
+  /** Empty when production already loads the newest run. */
+  visible: boolean;
+  headline: string;
+  /** Per-camera gauge-free movement, largest first. */
+  rows: { camera: string; baselineMm: string; rotationDeg: string }[];
+  summary: string;
+  world: string;
+  rmseNote: string;
+  blockers: { kind: string; message: string }[];
+  kinds: ("intrinsics" | "extrinsics")[];
+};
+
+export function promotionView(review: CalibrationPromotionReview | undefined): PromotionView {
+  const empty: PromotionView = {
+    visible: false,
+    headline: "",
+    rows: [],
+    summary: "",
+    world: "",
+    rmseNote: "",
+    blockers: [],
+    kinds: [],
+  };
+  if (!review?.candidates) return empty;
+  const kinds = (["intrinsics", "extrinsics"] as const).filter((k) => review.candidates[k]);
+  if (!kinds.length) return empty;
+
+  const parts = kinds.map((kind) =>
+    `${kind === "intrinsics" ? "内参" : "外参"} → ${review.candidates[kind]}`,
+  );
+  const extrinsics = review.extrinsics;
+  const rows =
+    extrinsics?.ok && extrinsics.cameras
+      ? extrinsics.cameras.map((row) => ({
+          camera: row.camera,
+          baselineMm: row.medianBaselineShiftMm.toFixed(2),
+          rotationDeg: row.medianRotationDeg.toFixed(3),
+        }))
+      : [];
+
+  let summary = "";
+  if (extrinsics?.ok) {
+    const worst = extrinsics.worstPair;
+    summary =
+      `${extrinsics.pairCount ?? 0} 对相机间距：中位变化 ${(extrinsics.medianBaselineShiftMm ?? 0).toFixed(2)} mm、` +
+      `相对朝向中位 ${(extrinsics.medianRotationDeg ?? 0).toFixed(3)}°` +
+      (worst ? `；最大的一对是 ${worst.a}–${worst.b}，${worst.shiftMm.toFixed(2)} mm` : "");
+    if (extrinsics.addedCameras?.length) summary += `。新增相机：${extrinsics.addedCameras.join("、")}`;
+    if (extrinsics.removedCameras?.length) summary += `。少了相机：${extrinsics.removedCameras.join("、")}`;
+  } else if (extrinsics?.error) {
+    summary = extrinsics.error;
+  }
+
+  const candidateWorld = extrinsics?.candidateWorld;
+  const world = candidateWorld
+    ? `世界系 ${candidateWorld.worldFrameId || "未声明"} · ${candidateWorld.continuityState || "未声明"}` +
+      (candidateWorld.reason ? `（${candidateWorld.reason}）` : "") +
+      (candidateWorld.stableCameras.length
+        ? ` · 稳定簇 ${candidateWorld.stableCameras.join("、")}`
+        : "")
+    : "";
+
+  const live = extrinsics?.liveRmsePx;
+  const candidate = extrinsics?.candidateRmsePx;
+  const rmseNote =
+    typeof live === "number" && typeof candidate === "number"
+      ? `BA 重投影 ${live.toFixed(4)} → ${candidate.toFixed(4)} px。` +
+        `这个数不能用来择优——2026-08 那次自评更好的恰恰是漏掉了被碰相机的那份。`
+      : "";
+
+  return {
+    visible: true,
+    headline: `有一份解算尚未生效：${parts.join("，")}`,
+    rows,
+    summary,
+    world,
+    rmseNote,
+    blockers: [
+      ...(review.extrinsicsBlockers ?? []),
+      ...(review.intrinsicsBlockers ?? []),
+    ],
+    kinds: [...kinds],
+  };
+}
+
+/** What the intrinsics half of the review says, or "" when there is none. */
+export function intrinsicsPromotionNote(review: CalibrationPromotionReview | undefined): string {
+  const intrinsics = review?.intrinsics;
+  if (!intrinsics) return "";
+  if (!intrinsics.ok) return intrinsics.error ?? "内参读不出来";
+  const model = intrinsics.model || "模型不统一";
+  const tracker = intrinsics.trackerModel;
+  return (
+    `内参 ${intrinsics.candidate}：${(intrinsics.cameras ?? []).length} 台 · ${model}` +
+    (tracker ? `，配置声明 ${tracker}` : "")
   );
 }

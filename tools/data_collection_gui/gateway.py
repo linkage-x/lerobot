@@ -31,6 +31,8 @@ from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
+from tools.data_collection_gui import calibration_promotion as promotion
+
 DEFAULT_CONFIG_PATH = Path("tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml")
 DEFAULT_RECORDER_SCRIPT = Path("tools/handheld/handheld_record.py")
 # Gateway-driven FR3 SpaceMouse recorder. Handles both the hardware arm and its MuJoCo twin
@@ -263,6 +265,10 @@ class CalibrationStatus:
     # it was taken against compares against a rig that no longer exists.
     intrinsicsRun: str = ""
     extrinsicsRun: str = ""
+    # Whether the last finished solve was written into production. A solve run
+    # in experiment mode leaves the production pointers alone, so "complete"
+    # alone no longer implies "this is what the rig is using".
+    lastRunExported: bool = True
 
 
 @dataclass
@@ -3147,6 +3153,288 @@ def _calibration_pointer_mismatch(state: GatewayState, production: dict[str, str
     }
 
 
+_PROMOTION_LOG = Path("outputs") / "calibration" / "promotions.jsonl"
+
+
+def _calibration_root(state: GatewayState) -> Path:
+    return state.repo_root / "outputs" / "calibration"
+
+
+def _tracker_camera_model(state: GatewayState) -> str:
+    """What projection model the tracking config expects its intrinsics to be."""
+    import yaml
+
+    path = state.repo_root / _TRACKING_CONFIG
+    try:
+        with open(path, encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError):
+        return ""
+    tracker = config.get("cube_tracker") or {}
+    return str(tracker.get("camera_model", "") or "").strip()
+
+
+def _promotion_candidates(state: GatewayState, production: dict[str, str]) -> dict[str, str]:
+    """Which run each pointer would be promoted to, if the operator says so.
+
+    Two sources, in order. The last solve in this process comes first because it
+    is what the operator just watched finish. Failing that, the newest run on
+    disk -- which is what survives a gateway restart, and a restart is precisely
+    what erased the evidence in August: the panel reloaded the config, agreed
+    with production, and the seven days of wrong calibration went unremarked.
+    """
+    candidates: dict[str, str] = {}
+    for kind, live in (
+        ("intrinsics", production.get("intrinsicsRun", "")),
+        ("extrinsics", production.get("extrinsicsRun", "")),
+    ):
+        solved = (
+            state.calibration.intrinsicsRun if kind == "intrinsics" else state.calibration.extrinsicsRun
+        ) or ""
+        if solved and solved != live:
+            candidates[kind] = solved
+            continue
+        newer = promotion.promotable_runs(
+            _calibration_root(state),
+            suffix="_intrinsics" if kind == "intrinsics" else "_extrinsics",
+            live_run=live,
+            require_model=_tracker_camera_model(state) if kind == "intrinsics" else "",
+        )
+        if newer:
+            candidates[kind] = newer[0]["run"]
+    return candidates
+
+
+# Keyed on what can change the answer: the config's pointers, the set of runs on
+# disk, and whichever run the last solve produced. Without it every snapshot poll
+# re-reads two run summaries and stats the whole calibration directory, and the
+# panel polls continuously while a session is open.
+_PROMOTION_REVIEW_CACHE: dict[str, Any] = {}
+
+
+def _promotion_review_key(state: GatewayState, production: dict[str, str]) -> tuple[Any, ...]:
+    root = _calibration_root(state)
+    try:
+        runs_mtime = root.stat().st_mtime_ns if root.is_dir() else 0
+    except OSError:
+        runs_mtime = 0
+    return (
+        # The repo root is part of the identity, not decoration: without it two
+        # states sharing pointer names would read each other's cached review.
+        str(state.repo_root),
+        production.get("intrinsicsRun", ""),
+        production.get("extrinsicsRun", ""),
+        state.calibration.intrinsicsRun,
+        state.calibration.extrinsicsRun,
+        runs_mtime,
+    )
+
+
+def _promotion_review(state: GatewayState, production: dict[str, str]) -> dict[str, Any]:
+    """The comparison the operator has to see before promoting anything.
+
+    Built on every snapshot rather than on demand, because a review the operator
+    has to go and ask for is a review that gets skipped -- and the whole reason
+    this exists is that the one step which was optional (editing a YAML file by
+    hand) is the step that did get skipped, for seven days.
+
+    Note what is absent: any ranking, score or recommendation. The reprojection
+    RMSE is carried through only so it can be shown labelled as not-a-criterion.
+    It ranked the two August runs backwards (0804 scored 0.244 px against 0820's
+    0.273 px, and 0804 was the one missing a moved camera), so a panel that
+    sorted by it would have argued for the wrong run.
+    """
+    if production.get("error"):
+        return {}
+    key = _promotion_review_key(state, production)
+    if _PROMOTION_REVIEW_CACHE.get("key") == key:
+        return copy.deepcopy(_PROMOTION_REVIEW_CACHE["value"])
+    candidates = _promotion_candidates(state, production)
+    if not candidates:
+        _PROMOTION_REVIEW_CACHE.update({"key": key, "value": {}})
+        return {}
+
+    root = _calibration_root(state)
+    review: dict[str, Any] = {"candidates": candidates, "configPath": production.get("configPath", "")}
+
+    if "extrinsics" in candidates:
+        live_run = production.get("extrinsicsRun", "")
+        comparison = promotion.compare_runs(
+            promotion.load_run(root / live_run, live_run) if live_run else promotion.RunPoses(),
+            promotion.load_run(root / candidates["extrinsics"], candidates["extrinsics"]),
+        )
+        review["extrinsics"] = comparison
+        review["extrinsicsBlockers"] = promotion.promotion_blockers(comparison)
+
+    if "intrinsics" in candidates:
+        live_run = production.get("intrinsicsRun", "")
+        comparison = promotion.compare_intrinsics_runs(
+            promotion.load_intrinsics_run(root / live_run, live_run)
+            if live_run
+            else promotion.IntrinsicsRun(),
+            promotion.load_intrinsics_run(root / candidates["intrinsics"], candidates["intrinsics"]),
+            tracker_model=_tracker_camera_model(state),
+        )
+        review["intrinsics"] = comparison
+        review["intrinsicsBlockers"] = promotion.intrinsics_blockers(comparison)
+
+    _PROMOTION_REVIEW_CACHE.update({"key": key, "value": copy.deepcopy(review)})
+    return review
+
+
+def _promote_calibration(
+    state: GatewayState,
+    kinds: Sequence[str],
+    *,
+    acknowledge: Sequence[str] = (),
+    note: str = "",
+) -> dict[str, Any]:
+    """Write the chosen runs into the tracking config, or say why not.
+
+    This is the only writer of those two keys in the repository. Before this
+    existed the sole way to make a solve take effect was a hand edit, which is
+    the kind of step that gets skipped precisely when it matters most -- after a
+    long solve, at the end of a session, by someone who has already seen the
+    panel say the new run is live.
+    """
+    if state.calibration.state == "running":
+        return {"ok": False, "error": "解算正在运行，等它结束再提升"}
+
+    wanted = [kind for kind in kinds if kind in promotion.POINTER_KEYS]
+    if not wanted:
+        return {"ok": False, "error": "没有指定要提升什么（intrinsics / extrinsics）"}
+
+    _PRODUCTION_RUNS_CACHE.clear()
+    _PROMOTION_REVIEW_CACHE.clear()
+    production = _production_calibration_runs(state)
+    if production.get("error"):
+        return {"ok": False, "error": production["error"]}
+
+    review = _promotion_review(state, production)
+    candidates = review.get("candidates") or {}
+    missing = [kind for kind in wanted if kind not in candidates]
+    if missing:
+        return {
+            "ok": False,
+            "error": "没有可提升的" + "、".join("内参" if k == "intrinsics" else "外参" for k in missing)
+            + " run——生产加载的已经是最新的了",
+        }
+
+    acknowledged = {str(k) for k in acknowledge}
+    outstanding: list[dict[str, str]] = []
+    for kind in wanted:
+        for blocker in review.get(f"{kind}Blockers") or []:
+            if blocker["kind"] not in acknowledged:
+                outstanding.append({**blocker, "target": kind})
+    if outstanding:
+        return {
+            "ok": False,
+            "error": "提升被拦下：" + " ".join(item["message"] for item in outstanding),
+            "blockers": outstanding,
+            "hint": "这些是需要人确认的风险，不是错误。确认无误后带上 acknowledge 再提升。",
+        }
+
+    path = state.repo_root / _TRACKING_CONFIG
+    try:
+        original = path.read_text(encoding="utf-8")
+        updated, changes = promotion.rewrite_pointers(
+            original, {kind: candidates[kind] for kind in wanted}
+        )
+    except (OSError, promotion.PointerWriteError) as exc:
+        return {"ok": False, "error": f"改写生产配置失败：{exc}"}
+    if updated == original:
+        return {"ok": False, "error": "生产配置没有变化——指针已经指向这些 run 了"}
+
+    try:
+        promotion.write_config_atomically(path, updated)
+    except OSError as exc:
+        return {"ok": False, "error": f"写生产配置失败：{exc}"}
+
+    record = promotion.promotion_record(
+        changes=changes,
+        comparison=review.get("extrinsics") or review.get("intrinsics") or {},
+        acknowledged=sorted(acknowledged),
+        note=note,
+    )
+    try:
+        promotion.append_promotion_log(state.repo_root / _PROMOTION_LOG, record)
+    except OSError as exc:
+        # The config write already succeeded and is what production reads, so a
+        # log that could not be appended is worth a warning, not a rollback.
+        state.log("warn", f"Promotion succeeded but the log could not be written: {exc}")
+
+    _PRODUCTION_RUNS_CACHE.clear()
+    _PROMOTION_REVIEW_CACHE.clear()
+    _load_active_calibration_runs(state)
+    summary = "，".join(f"{change['key']} → {change['to']}" for change in changes)
+    state.log("info", f"Calibration promoted: {summary}")
+    state.calibration.message = f"已提升为生产标定：{summary}"
+    return {"ok": True, "changes": changes, "record": record}
+
+
+class StaleCalibrationError(RuntimeError):
+    """Trajectory generation would silently use a calibration that is not the newest."""
+
+    def __init__(self, message: str, detail: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
+def _stale_calibration_gate(state: GatewayState) -> dict[str, Any]:
+    """Whether a newer promotable calibration exists than the one production loads.
+
+    This is the only one of the three checks that fires without anyone looking at
+    a panel, and it is the one that would actually have caught the August
+    incident: promotion is a button somebody has to press, and the whole lesson
+    of those seven days is that the manual step is the step that gets missed.
+    Here the trajectory itself refuses to be generated against a stale pointer.
+
+    Deliberately not phrased as an error. Generating against the older
+    calibration is sometimes exactly right -- reproducing an earlier result, for
+    one -- so this asks rather than forbids. What is never right is not being
+    told which calibration a trajectory was built on.
+    """
+    production = _production_calibration_runs(state)
+    if production.get("error"):
+        return {}
+    root = _calibration_root(state)
+    # Lens runs the tracker's declared model rules out are not "newer", they are
+    # unusable -- see promotable_runs on why this matters more than it sounds.
+    model = _tracker_camera_model(state)
+    stale = {
+        kind: promotion.promotable_runs(
+            root,
+            suffix=suffix,
+            live_run=production.get(key, ""),
+            require_model=model if kind == "intrinsics" else "",
+        )
+        for kind, suffix, key in (
+            ("intrinsics", "_intrinsics", "intrinsicsRun"),
+            ("extrinsics", "_extrinsics", "extrinsicsRun"),
+        )
+    }
+    messages = [
+        promotion.stale_pointer_refusal(
+            rows,
+            kind_label="内参" if kind == "intrinsics" else "外参",
+            live_run=production.get("intrinsicsRun" if kind == "intrinsics" else "extrinsicsRun", ""),
+        )
+        for kind, rows in stale.items()
+    ]
+    messages = [text for text in messages if text]
+    if not messages:
+        return {}
+    return {
+        "message": " ".join(messages),
+        "stale": {kind: rows for kind, rows in stale.items() if rows},
+        "live": {
+            "intrinsicsRun": production.get("intrinsicsRun", ""),
+            "extrinsicsRun": production.get("extrinsicsRun", ""),
+            "configPath": production.get("configPath", ""),
+        },
+    }
+
+
 def _calibration_session_payload(state: GatewayState) -> dict[str, Any]:
     session = state.calibration_session
     return {
@@ -4770,6 +5058,80 @@ def _solve_candidates(state: GatewayState) -> list[dict[str, Any]]:
     return sorted(candidates, key=lambda item: item["updatedAt"], reverse=True)
 
 
+def _production_intrinsics_cameras(state: GatewayState) -> list[str]:
+    """Cameras the intrinsics run in production actually ships a lens for.
+
+    Read from the run directory rather than the metrology report: ``outputs/``
+    is excluded from the deploy sync, so on the rig the run is the only one of
+    the two that exists.
+    """
+    run = (state.calibration.intrinsicsRun or "").strip()
+    if not run:
+        return []
+    directory = state.repo_root / "outputs" / "calibration" / run
+    summary = _read_json_file(directory / "summary.json")
+    if isinstance(summary, dict):
+        names = [
+            str(row.get("camera_name") or "")
+            for row in (summary.get("cameras") or [])
+            if isinstance(row, dict)
+        ]
+        if any(names):
+            return sorted(n for n in names if n)
+    # Older runs, or one written without a summary: the per-camera directories
+    # are named "<camera>_<serial>", and the camera name is the cam_NN prefix.
+    found = set()
+    for path in directory.glob("converted/*/intrinsics_producer.json"):
+        parts = path.parent.name.split("_")
+        if len(parts) >= 2:
+            found.add(f"{parts[0]}_{parts[1]}")
+    return sorted(found)
+
+
+def _capture_cameras(dataset: Path) -> list[str]:
+    """Camera names with video in a capture, i.e. the ones a fit would cover."""
+    return sorted({video.stem for _, video in _capture_videos(dataset / "episodes")})
+
+
+def _intrinsics_preflight(state: GatewayState, intrinsics: Path | None) -> dict[str, Any]:
+    """Whether re-fitting intrinsics from this capture can survive the export.
+
+    ``export_production_calibration`` writes a whole intrinsics run from one
+    report and has no way to carry a camera forward from the run already in
+    production, so every camera with video in the capture must come out of the
+    fit with a usable model -- one that saw no board takes the export down at
+    the last step, after the entire decode. On this rig cam_02/cam_03 point
+    away from the board area and detect nothing in every episode, which makes
+    "re-fit and export from a full-rig capture" structurally impossible rather
+    than unlucky.
+
+    Blocking applies only when production already ships intrinsics: a first
+    calibration of a fresh rig has nothing to extend and nothing to lose.
+    """
+    production = _production_intrinsics_cameras(state)
+    if intrinsics is None or not production:
+        return {"cameras": [], "production": production, "uncalibrated": [], "blocking": False}
+    cameras = _capture_cameras(intrinsics)
+    uncalibrated = [name for name in cameras if name not in set(production)]
+    return {
+        "cameras": cameras,
+        "production": production,
+        "uncalibrated": uncalibrated,
+        "blocking": bool(uncalibrated),
+    }
+
+
+def _preflight_message(preflight: dict[str, Any]) -> str:
+    """The refusal, naming the cameras and the two ways past it."""
+    names = "、".join(preflight.get("uncalibrated") or [])
+    kept = len(preflight.get("production") or [])
+    return (
+        f"重算内参并导出会在最后一步失败：这份采集里 {names} 没有在产内参，"
+        f"导出时它们必须各自拟合出可用的模型，任何一台看不到板都会让整轮作废（已解码的部分全部白跑）。"
+        f"当前在产内参只有 {kept} 台，导出也不会把它们保留下来。"
+    )
+
+
 def _solve_payload(state: GatewayState) -> dict[str, Any]:
     """What the panel needs to say which capture will be solved, and offer others."""
     dataset, source = _solve_dataset(state)
@@ -4798,6 +5160,10 @@ def _solve_payload(state: GatewayState) -> dict[str, Any]:
         ),
         # What the solve falls back to when intrinsics are not re-fitted.
         "intrinsicsRun": state.calibration.intrinsicsRun,
+        # Whether re-fitting from that capture could survive its own export.
+        "intrinsicsPreflight": _intrinsics_preflight(
+            state, intrinsics if intrinsics_ok else None
+        ),
     }
 
 
@@ -4985,7 +5351,7 @@ def _write_detection_manifest(episodes: Path, detections: Path) -> None:
         )
 
 
-def _solve_weights(detect_videos: Sequence[int]) -> list[float]:
+def _solve_weights(detect_videos: Sequence[int], *, export: bool = True) -> list[float]:
     """Wall-clock share of each step, given how much video each detection reads.
 
     Decoding dominates everything else by orders of magnitude -- an intrinsics
@@ -4993,15 +5359,26 @@ def _solve_weights(detect_videos: Sequence[int]) -> list[float]:
     the extrinsics one -- and a fixed split would put the bar at 40% while 90%
     of the work was still ahead. The fits get the remainder in the order they
     run: intrinsics fit, bundle, export.
+
+    ``export=False`` drops the export step. Its weight is redistributed rather
+    than left as a gap, so the bar still reaches 1.0 by finishing work instead
+    of by being set there at the end.
     """
     videos = [max(0, int(count)) for count in detect_videos]
     total = sum(videos)
     share = [0.85 * (count / total) if total else 0.85 / max(len(videos), 1) for count in videos]
     # In step order, which interleaves: the intrinsics fit runs between the two
     # detections, so its weight cannot simply be appended after both shares.
-    if len(share) == 2:
-        return [share[0], 0.05, share[1], 0.08, 0.02]
-    return [share[0], 0.13, 0.02]
+    weights = (
+        [share[0], 0.05, share[1], 0.08, 0.02]
+        if len(share) == 2
+        else [share[0], 0.13, 0.02]
+    )
+    if export:
+        return weights
+    weights = weights[:-1]
+    scale = 1.0 / sum(weights)
+    return [w * scale for w in weights]
 
 
 def _progress_weights(state: GatewayState) -> Sequence[float]:
@@ -5073,6 +5450,12 @@ def _calibration_payload(state: GatewayState) -> dict[str, Any]:
     mismatch = _calibration_pointer_mismatch(state, production)
     if mismatch:
         payload["pointerMismatch"] = mismatch
+    # The comparison is built unconditionally rather than behind a button: a
+    # review the operator has to request is a review that gets skipped, and the
+    # step that got skipped for seven days was exactly the optional one.
+    review = _promotion_review(state, production)
+    if review:
+        payload["promotion"] = review
     progress = payload.get("progress")
     running = state.calibration.state == "running"
     if running and isinstance(progress, dict) and float(progress.get("startedAt") or 0.0) > 0:
@@ -5212,6 +5595,7 @@ def _run_extrinsics_calibration(
     *,
     force_redetect: bool = False,
     intrinsics_dataset: Path | None = None,
+    export_production: bool = True,
 ) -> None:
     if python is None:
         python, missing = _solve_python(state.repo_root)
@@ -5249,9 +5633,10 @@ def _run_extrinsics_calibration(
     # is what the time goes into: an intrinsics capture is one sweep per camera.
     plan = [intrinsics_dataset, dataset] if intrinsics_dataset is not None else [dataset]
     state.calibration.progress.weights = _solve_weights(
-        [_charuco_video_count(capture / "episodes") for capture in plan]
+        [_charuco_video_count(capture / "episodes") for capture in plan],
+        export=export_production,
     )
-    step_count = 5 if intrinsics_dataset is not None else 3
+    step_count = (5 if intrinsics_dataset is not None else 3) - (0 if export_production else 1)
 
     # Detection is the only step that can say how much work it has: one unit per
     # video, counted the same way it enumerates them. The fits report no units,
@@ -5336,57 +5721,64 @@ def _run_extrinsics_calibration(
     if not _run("多相机联合 BA…", bundle_args, 3600):
         return
 
-    export_args = [
-        "-m", "metrology.cli.export_production_calibration",
-        "--extrinsics-report", str(work / "extrinsics_report.json"),
-        "--name", run_name,
-    ]
-    # Only emit intrinsics when they were just re-fitted, or when there is no
-    # production run to keep. Re-solving extrinsics alone does not touch lenses.
-    keep_intrinsics_run = (
-        fitted_intrinsics is None
-        and bool(state.calibration.intrinsicsRun)
-        and intrinsics_run.is_dir()
-    )
-    if fitted_intrinsics is not None:
-        export_args += ["--intrinsics-report", str(fitted_intrinsics), "--model", "fisheye"]
-    elif not keep_intrinsics_run:
-        export_args += [
-            "--intrinsics-report", str(state.repo_root / _CALIB_INTRINSICS_REPORT),
-            "--model", "fisheye",
+    # Experiment mode stops here: the numbers are the deliverable and the
+    # production pointers are left exactly as they were. Skipping the export
+    # is also the only way a re-fit from a full-rig capture can finish at all,
+    # since the exporter refuses a report that is missing any camera it sees.
+    if not export_production:
+        state.log("info", f"Experiment solve {run_name}: export skipped, production unchanged")
+    else:
+        export_args = [
+            "-m", "metrology.cli.export_production_calibration",
+            "--extrinsics-report", str(work / "extrinsics_report.json"),
+            "--name", run_name,
         ]
-    world_reference = _world_root(state) / _WORLD_REFERENCE_FILE
-    registration = _world_registration_for_export(state, work / "extrinsics_report.json")
-    if world_reference.is_file() and registration is not None:
-        # The canonical world, not an older run's frame. Inheriting from a base
-        # run re-inherits its error every time (7.9 mm RMS / 2.17 deg for the
-        # 0720 legacy frame); registering onto W does not.
-        export_args += ["--world-reference", str(world_reference)]
-        if str(registration.get("world_continuity_state")) not in {"CONTINUOUS", "RECONNECTED"}:
-            # A new island is the *safe* direction: the old world_frame_id keeps
-            # meaning what it meant, and this run says plainly that it is not in
-            # it. Reusing the old ID here is the one thing that would corrupt
-            # history, so the export is allowed to proceed only under a new one.
-            export_args += ["--allow-world-break"]
-            state.log(
-                "warn",
-                "World continuity "
-                f"{registration.get('world_continuity_state')}: exporting under a new world_frame_id. "
-                f"{registration.get('guidance', '')}",
-            )
-    elif base_run.is_dir():
-        export_args += ["--base-extrinsics", str(base_run)]
-        unmoved = _unmoved_cameras(state)
-        if unmoved:
-            export_args += ["--align-cameras", *unmoved]
-            state.log("info", f"Base-frame alignment restricted to unmoved cameras: {', '.join(unmoved)}")
-    serial_map = state.repo_root / "tools" / "thor" / "gmsl2" / "camera_serial_map.yaml"
-    if serial_map.is_file():
-        export_args += ["--serial-map", str(serial_map)]
+        # Only emit intrinsics when they were just re-fitted, or when there is no
+        # production run to keep. Re-solving extrinsics alone does not touch lenses.
+        keep_intrinsics_run = (
+            fitted_intrinsics is None
+            and bool(state.calibration.intrinsicsRun)
+            and intrinsics_run.is_dir()
+        )
+        if fitted_intrinsics is not None:
+            export_args += ["--intrinsics-report", str(fitted_intrinsics), "--model", "fisheye"]
+        elif not keep_intrinsics_run:
+            export_args += [
+                "--intrinsics-report", str(state.repo_root / _CALIB_INTRINSICS_REPORT),
+                "--model", "fisheye",
+            ]
+        world_reference = _world_root(state) / _WORLD_REFERENCE_FILE
+        registration = _world_registration_for_export(state, work / "extrinsics_report.json")
+        if world_reference.is_file() and registration is not None:
+            # The canonical world, not an older run's frame. Inheriting from a base
+            # run re-inherits its error every time (7.9 mm RMS / 2.17 deg for the
+            # 0720 legacy frame); registering onto W does not.
+            export_args += ["--world-reference", str(world_reference)]
+            if str(registration.get("world_continuity_state")) not in {"CONTINUOUS", "RECONNECTED"}:
+                # A new island is the *safe* direction: the old world_frame_id keeps
+                # meaning what it meant, and this run says plainly that it is not in
+                # it. Reusing the old ID here is the one thing that would corrupt
+                # history, so the export is allowed to proceed only under a new one.
+                export_args += ["--allow-world-break"]
+                state.log(
+                    "warn",
+                    "World continuity "
+                    f"{registration.get('world_continuity_state')}: exporting under a new world_frame_id. "
+                    f"{registration.get('guidance', '')}",
+                )
+        elif base_run.is_dir():
+            export_args += ["--base-extrinsics", str(base_run)]
+            unmoved = _unmoved_cameras(state)
+            if unmoved:
+                export_args += ["--align-cameras", *unmoved]
+                state.log("info", f"Base-frame alignment restricted to unmoved cameras: {', '.join(unmoved)}")
+        serial_map = state.repo_root / "tools" / "thor" / "gmsl2" / "camera_serial_map.yaml"
+        if serial_map.is_file():
+            export_args += ["--serial-map", str(serial_map)]
 
-    _begin_solve_step(state, step_count, step_count, "导出生产标定…")
-    if not _run("导出生产标定…", export_args, 600):
-        return
+        _begin_solve_step(state, step_count, step_count, "导出生产标定…")
+        if not _run("导出生产标定…", export_args, 600):
+            return
 
     report_path = work / "extrinsics_report.json"
     try:
@@ -5414,9 +5806,14 @@ def _run_extrinsics_calibration(
     _finish_solve_progress(state, complete=True)
     state.calibration.lastRunAt = _now_iso()
     state.calibration.outputPath = str(work)
-    if not keep_intrinsics_run:
+    state.calibration.lastRunExported = export_production
+    # No run directories were written in experiment mode, so the pointers must
+    # keep naming the calibration production is actually loading. Claiming this
+    # run instead would make an experiment look like a deployment.
+    if export_production and not keep_intrinsics_run:
         state.calibration.intrinsicsRun = f"{run_name}_intrinsics"
-    state.calibration.extrinsicsRun = f"{run_name}_extrinsics"
+    if export_production:
+        state.calibration.extrinsicsRun = f"{run_name}_extrinsics"
     # These two assignments are in-memory only. Nothing in this repo writes
     # `intrinsics_run_name` / `fixed_camera_run_name` back to the tracker config,
     # so a solve that finishes here has produced files production will not load
@@ -5425,7 +5822,11 @@ def _run_extrinsics_calibration(
     # Say so at the moment the operator is watching, rather than leaving the
     # panel implying the new calibration is live.
     _PRODUCTION_RUNS_CACHE.clear()
-    mismatch = _calibration_pointer_mismatch(state, _production_calibration_runs(state))
+    mismatch = (
+        _calibration_pointer_mismatch(state, _production_calibration_runs(state))
+        if export_production
+        else None
+    )
     if mismatch:
         state.log(
             "warn",
@@ -5437,18 +5838,22 @@ def _run_extrinsics_calibration(
         f"BA 重投影 {float(report.get('rmse_px', float('nan'))):.4f} px，"
         f"{report.get('num_frames', 0)} 帧 / {len(cameras)} 相机"
         + ("；有相机残差过大" if failed else "")
+        + ("" if export_production else "。实验模式：未导出，生产标定未改动。")
     )
     state.log(
         "warn" if failed else "info",
-        f"Extrinsics calibration {state.calibration.state}: {state.calibration.message}",
+        f"{'Extrinsics' if export_production else 'Experiment'} calibration "
+        f"{state.calibration.state}: {state.calibration.message}",
     )
     if state.calibration_session.active:
         state.calibration_session.stage = "failed" if failed else "done"
         state.calibration_session.message = state.calibration.message
     # The baseline belongs to the calibration it was taken against, so a new
     # calibration invalidates it rather than silently keeping the old frames.
+    # An experiment shipped nothing, so the baseline still describes the rig
+    # production is running and must survive.
     baseline_meta = _rig_check_root(state) / "baseline" / "baseline.json"
-    if baseline_meta.is_file():
+    if export_production and baseline_meta.is_file():
         baseline_meta.unlink()
         state.log("info", "Rig-check baseline cleared; capture a new one for the new calibration")
 
@@ -5475,6 +5880,7 @@ def _start_extrinsics_calibration(
     *,
     force_redetect: bool = False,
     refit_intrinsics: bool = False,
+    export_production: bool = True,
 ) -> dict[str, Any]:
     if state.calibration.state == "running":
         return {"ok": False, "error": "标定已在进行中"}
@@ -5519,6 +5925,17 @@ def _start_extrinsics_calibration(
                 "勾了「同时重算内参」，但没有选可用的内参采集",
                 hint="内参要的是逐台相机各录一段、板子走到画面四角的采集，和外参那一段不是同一份。",
             )
+        # Refused here rather than discovered at the export, which is the last
+        # step: by then the whole capture has been decoded twice and the hour
+        # is spent. See _intrinsics_preflight for why this is structural.
+        preflight = _intrinsics_preflight(state, intrinsics_dataset)
+        if export_production and preflight["blocking"]:
+            return _refuse_solve(
+                state,
+                _preflight_message(preflight),
+                hint="改用「只解算，不导出」跑这一轮：BA 会把这些相机一起解出来并给出残差，"
+                "只是不写进生产。要真正把它们并进生产内参，需要导出器支持从在产 run 承接未重拟的相机。",
+            )
 
     run_name = f"calib_{time.strftime('%Y%m%d_%H%M%S')}"
     state.calibration.state = "running"
@@ -5528,7 +5945,8 @@ def _start_extrinsics_calibration(
     # click, instead of appearing whenever the thread happens to get scheduled.
     state.calibration.progress = CalibrationProgress(
         stepIndex=1,
-        stepCount=5 if intrinsics_dataset is not None else 3,
+        stepCount=(5 if intrinsics_dataset is not None else 3)
+        - (0 if export_production else 1),
         label="准备解算…",
         startedAt=time.time(),
     )
@@ -5538,7 +5956,11 @@ def _start_extrinsics_calibration(
     Thread(
         target=_run_extrinsics_calibration,
         args=(state, dataset, run_name, python),
-        kwargs={"force_redetect": force_redetect, "intrinsics_dataset": intrinsics_dataset},
+        kwargs={
+            "force_redetect": force_redetect,
+            "intrinsics_dataset": intrinsics_dataset,
+            "export_production": export_production,
+        },
         daemon=True,
         name=f"extrinsics-calibration-{run_name}",
     ).start()
@@ -6884,6 +7306,7 @@ def _update_traj_gen_meta(
     version: str | None = None,
     exit_code: int | None = None,
     marker_to_tcp_calibration_path: str | Path | None = None,
+    calibration: dict[str, str] | None = None,
 ) -> None:
     existing = _load_processing_meta(dataset_root) or {}
     current_job = existing.get("current_job") if isinstance(existing.get("current_job"), dict) else {}
@@ -6910,6 +7333,16 @@ def _update_traj_gen_meta(
     )
     if marker_path_text:
         job["marker_to_tcp_calibration_path"] = marker_path_text
+    # Carried forward across status updates the same way the command is: the
+    # completion update does not re-read the config, and a stamp that vanished
+    # when the job finished would be missing from exactly the record that lasts.
+    stamp = calibration if calibration is not None else current_job.get("calibration")
+    if isinstance(stamp, dict) and stamp:
+        job["calibration"] = {
+            "intrinsicsRun": str(stamp.get("intrinsicsRun", "") or ""),
+            "extrinsicsRun": str(stamp.get("extrinsicsRun", "") or ""),
+            "configPath": str(stamp.get("configPath", "") or ""),
+        }
     if exit_code is not None:
         job["exit_code"] = exit_code
     if status == "running" and not job.get("started_at"):
@@ -7014,7 +7447,14 @@ def _queue_traj_gen(
     dataset_root: Path,
     *,
     marker_to_tcp_calibration_path: Path | None = None,
+    allow_stale_calibration: bool = False,
 ) -> None:
+    # Checked here rather than only in the HTTP handler so that every path into
+    # trajectory generation goes through it, including any future automatic one.
+    if not allow_stale_calibration:
+        gate = _stale_calibration_gate(state)
+        if gate:
+            raise StaleCalibrationError(gate["message"], gate)
     key = str(dataset_root)
     with state.lock:
         running = state.processing_processes.get(key)
@@ -7045,6 +7485,10 @@ def _queue_traj_gen(
                 f"Running AprilTag cube tracking for {dataset_root.name}"
                 + (f" with marker→TCP bundle {marker_path_text}" if marker_path_text else "")
             ),
+            # Which calibration this trajectory was built on, recorded next to
+            # the trajectory itself. Read months later this is the only thing
+            # that can answer "was this produced before or after the repoint".
+            calibration=_production_calibration_runs(state),
             log_tail=[f"[traj-gen] {' '.join(command)}"],
             marker_to_tcp_calibration_path=marker_path_text or None,
         )
@@ -12455,10 +12899,29 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
                     return
                 marker_tcp_path = _resolve_marker_tcp_calibration_file(state, marker_tcp_raw)
-                _queue_traj_gen(state, dataset_root, marker_to_tcp_calibration_path=marker_tcp_path)
+                allow_stale = (
+                    query.get("allow_stale_calibration", query.get("allowStaleCalibration", [""]))[0] or ""
+                ).strip() in {"1", "true", "yes"}
+                _queue_traj_gen(
+                    state,
+                    dataset_root,
+                    marker_to_tcp_calibration_path=marker_tcp_path,
+                    allow_stale_calibration=allow_stale,
+                )
                 with state.lock:
                     response = _snapshot(state)
                 _json_response(self, HTTPStatus.OK, response)
+            except StaleCalibrationError as exc:
+                _json_response(
+                    self,
+                    HTTPStatus.CONFLICT,
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "staleCalibration": exc.detail,
+                        "hint": "先在标定中心提升，或带 allow_stale_calibration=1 明确用旧标定生成。",
+                    },
+                )
             except NotImplementedError as exc:
                 _json_response(self, HTTPStatus.NOT_IMPLEMENTED, {"error": str(exc)})
             except Exception as exc:  # noqa: BLE001
@@ -12557,8 +13020,39 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     truthy = {"1", "true", "yes"}
                     force = (query.get("force_redetect", [""])[0] or "").strip() in truthy
                     refit = (query.get("refit_intrinsics", [""])[0] or "").strip() in truthy
+                    # Exporting is the default so an unaware caller still ships;
+                    # experiment mode has to be asked for.
+                    experiment = (query.get("experiment", [""])[0] or "").strip() in truthy
                     result = _start_extrinsics_calibration(
-                        self.server.state, dataset, force_redetect=force, refit_intrinsics=refit
+                        self.server.state,
+                        dataset,
+                        force_redetect=force,
+                        refit_intrinsics=refit,
+                        export_production=not experiment,
+                    )
+                    if not result.get("ok"):
+                        _json_response(self, HTTPStatus.CONFLICT, result)
+                        return
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/calibration/promote":
+                    kinds = [
+                        item
+                        for value in query.get("kind", [])
+                        for item in value.split(",")
+                        if item.strip()
+                    ]
+                    acknowledge = [
+                        item
+                        for value in query.get("acknowledge", [])
+                        for item in value.split(",")
+                        if item.strip()
+                    ]
+                    result = _promote_calibration(
+                        self.server.state,
+                        [k.strip() for k in kinds],
+                        acknowledge=[a.strip() for a in acknowledge],
+                        note=(query.get("note", [""])[0] or "").strip(),
                     )
                     if not result.get("ok"):
                         _json_response(self, HTTPStatus.CONFLICT, result)

@@ -474,6 +474,19 @@ export type CalibrationSolve = {
   intrinsicsEpisodes?: number;
   /** The production intrinsics run reused when they are not re-fitted. */
   intrinsicsRun?: string;
+  /** Whether re-fitting from that capture could survive its own export. */
+  intrinsicsPreflight?: IntrinsicsPreflight;
+};
+
+/** Which cameras a re-fit would have to produce a lens for, and which of them
+ * production has no lens for today. The exporter writes a whole intrinsics run
+ * from one report with no way to carry a camera forward, so any camera in the
+ * capture that fails its fit takes the export down at the last step. */
+export type IntrinsicsPreflight = {
+  cameras: string[];
+  production: string[];
+  uncalibrated: string[];
+  blocking: boolean;
 };
 
 export type CalibrationStatus = {
@@ -501,6 +514,71 @@ export type CalibrationStatus = {
   production?: CalibrationProduction;
   /** Present only when the last solve and the production pointer disagree. */
   pointerMismatch?: CalibrationPointerMismatch;
+  /**
+   * The mandatory review: what promoting the newest run would change. Absent
+   * when production already loads the newest run, which is the ordinary case.
+   */
+  promotion?: CalibrationPromotionReview;
+};
+
+/** Per-camera difference between two extrinsics runs, in gauge-free terms. */
+export type PromotionCameraRow = {
+  camera: string;
+  medianBaselineShiftMm: number;
+  maxBaselineShiftMm: number;
+  medianRotationDeg: number;
+  maxRotationDeg: number;
+};
+
+export type PromotionWorld = {
+  worldFrameId: string;
+  referenceWorldFrameId: string;
+  continuityState: string;
+  reason: string;
+  stableCameras: string[];
+};
+
+export type PromotionBlocker = { kind: string; message: string; target?: string };
+
+export type ExtrinsicsComparison = {
+  ok: boolean;
+  error?: string;
+  live: string;
+  candidate: string;
+  cameras?: PromotionCameraRow[];
+  addedCameras?: string[];
+  removedCameras?: string[];
+  pairCount?: number;
+  medianBaselineShiftMm?: number;
+  medianRotationDeg?: number;
+  worstPair?: { a: string; b: string; liveMm: number; candidateMm: number; shiftMm: number; rotationDeg: number };
+  liveWorld?: PromotionWorld;
+  candidateWorld?: PromotionWorld;
+  /** Shown, never ranked on: this number picked the wrong run in August. */
+  liveRmsePx?: number | null;
+  candidateRmsePx?: number | null;
+};
+
+export type IntrinsicsComparison = {
+  ok: boolean;
+  error?: string;
+  live: string;
+  candidate: string;
+  cameras?: string[];
+  model?: string;
+  mixedModels?: string[];
+  trackerModel?: string;
+  addedCameras?: string[];
+  removedCameras?: string[];
+};
+
+export type CalibrationPromotionReview = {
+  candidates: { intrinsics?: string; extrinsics?: string };
+  configPath: string;
+  extrinsics?: ExtrinsicsComparison;
+  extrinsicsBlockers?: PromotionBlocker[];
+  intrinsics?: IntrinsicsComparison;
+  intrinsicsBlockers?: PromotionBlocker[];
 };
 
 export type CalibrationProduction = {
