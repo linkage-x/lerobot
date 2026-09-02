@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 import json
 import importlib
@@ -1607,6 +1608,31 @@ class RuckigOTGDriver:
             self._input.synchronization = Synchronization.Phase
         else:
             self._input.synchronization = Synchronization.Time
+
+    @contextlib.contextmanager
+    def limits_scaled_by(self, scale: float):
+        """Run at `scale` of the configured velocity, acceleration and jerk ceilings, then restore.
+
+        All three scale by the same factor rather than the textbook v*s, a*s^2, j*s^3. The caller
+        asking for this wants a slower *and* gentler move; squaring an already small factor into
+        the acceleration makes the arm crawl the last centimetre of every move instead.
+
+        Not safe to enter while a background loop is stepping this driver -- the ceilings live in
+        the one InputParameter both would be using. The only caller, the FR3's homing move, stops
+        its OTG loop first for its own reasons.
+        """
+
+        if not 0.0 < scale <= 1.0:
+            raise ValueError(f"OTG limit scale must be in (0, 1], got {scale}.")
+        self._input.max_velocity = (self._max_velocity * scale).tolist()
+        self._input.max_acceleration = (self._max_acceleration * scale).tolist()
+        self._input.max_jerk = (self._max_jerk * scale).tolist()
+        try:
+            yield
+        finally:
+            self._input.max_velocity = self._max_velocity.tolist()
+            self._input.max_acceleration = self._max_acceleration.tolist()
+            self._input.max_jerk = self._max_jerk.tolist()
 
     def reset(self, current_joint_positions: np.ndarray) -> None:
         current = np.asarray(current_joint_positions, dtype=np.float64)

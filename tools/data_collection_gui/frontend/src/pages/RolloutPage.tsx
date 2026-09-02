@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../apiClient";
 import { CheckpointBrowser, successRate } from "../shared/CheckpointBrowser";
+import { assistedSuccessBlocked, terminalEventDriver } from "./rolloutAttribution";
+import { carriedOverNotice } from "./rolloutCarryover";
 import { Metric, PageHeader, StatusDot } from "../shared/ui";
 import type {
   Checkpoint,
@@ -46,6 +48,12 @@ const LIVE_STATES = new Set(["starting", "waiting", "homing", "resetting", "roll
 const RTC_SCHEDULES: RolloutRtcSchedule[] = ["EXP", "LINEAR", "ONES", "ZEROS"];
 const DEFAULT_TASK_PROMPT_PLACEHOLDER = "Pick up the peg and insert it fully into the hole.";
 
+/** How many rollouts the history table opens on.
+ *
+ * It used to render the newest 40, which on a page whose real work sits above it meant the
+ * card ran on for screens. The window keeps the scroll inside the card. */
+const HISTORY_VISIBLE = 10;
+
 function isRtcPolicy(policyType: string): boolean {
   const normalized = policyType.trim().toLowerCase().replace(/[\s._-]+/g, "");
   return (
@@ -78,11 +86,25 @@ function stateTone(state: RolloutRun["state"]): string {
   return "idle";
 }
 
+// Written into the note when an operator overrides the assisted-success block, so the claim it
+// rests on ("the policy finished it; I only took the arm afterwards") is in the log next to the
+// grade instead of only in their memory.
+const ASSISTED_SUCCESS_MARK = "[操作者确认：终点由策略完成，接管仅用于收尾]";
+
 export function RolloutPage() {
   const [run, setRun] = useState<RolloutRun | null>(null);
   const [modes, setModes] = useState<RolloutMode[]>([]);
   const [trainingBusy, setTrainingBusy] = useState(false);
   const [selected, setSelected] = useState<Checkpoint | null>(null);
+  // The checkpoint the last rollout ran, held as an id until the picker's listing arrives and
+  // can turn it into the object the contract gates are checked against.
+  const [restoreCheckpointId, setRestoreCheckpointId] = useState("");
+  // The one checkpoint whose per-checkpoint defaults must not fire when it lands. Selecting a
+  // checkpoint normally resets the prompt and the RTC knobs, because settings tuned for one
+  // policy are the wrong ones for another -- but the restored checkpoint arrives carrying the
+  // settings that were recorded against it, and resetting those would undo the carry-over one
+  // render after it landed. Consumed once, so picking it again later behaves like any pick.
+  const skipDefaultsForRef = useRef("");
   const [modeId, setModeId] = useState("smoke");
   const [confirmMotion, setConfirmMotion] = useState(false);
   const [overrideContract, setOverrideContract] = useState(false);
@@ -97,6 +119,18 @@ export function RolloutPage() {
   const [rtcReplanQueueSize, setRtcReplanQueueSize] = useState("25");
   const [rtcInferenceDelaySteps, setRtcInferenceDelaySteps] = useState("");
   const [commandEmaAlpha, setCommandEmaAlpha] = useState("");
+  // Off until a previous rollout says otherwise. Takeover opens a second action source onto a
+  // loop that is moving a real arm, so when it does come back on the carry-over notice says so
+  // out loud -- the switch itself lives in a subcard that is easy to start a rollout without
+  // ever scrolling to.
+  const [daggerTakeover, setDaggerTakeover] = useState(false);
+  const [daggerRecord, setDaggerRecord] = useState(true);
+  const [daggerDatasetRoot, setDaggerDatasetRoot] = useState("");
+  const [daggerReleaseAfterS, setDaggerReleaseAfterS] = useState("");
+  // Ticked only for the one case the trace cannot tell apart: a rollout the policy finished
+  // before the operator took the arm to tidy up afterwards. Recorded in the note when used, so
+  // the claim is in the log rather than only in the operator's memory.
+  const [assistedSuccessAck, setAssistedSuccessAck] = useState(false);
   const [showRolloutAdvanced, setShowRolloutAdvanced] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -107,6 +141,7 @@ export function RolloutPage() {
   const [outcomeStageId, setOutcomeStageId] = useState("");
   const [outcomeBlocker, setOutcomeBlocker] = useState("");
   const [history, setHistory] = useState<RolloutOutcomeEntry[]>([]);
+  const [showAllHistory, setShowAllHistory] = useState(false);
   const [landmarks, setLandmarks] = useState<RolloutLandmarks>({});
   const [frameNonce, setFrameNonce] = useState(0);
   const [backgroundNonce, setBackgroundNonce] = useState(0);
@@ -114,6 +149,9 @@ export function RolloutPage() {
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const mode = useMemo(() => modes.find((item) => item.id === modeId), [modes, modeId]);
+  // Read off the mode rather than assumed from `interactive`: the DAgger rehearsal is interactive
+  // and takes the arm over, but it is its own program and takes none of these settings.
+  const takeoverSupported = Boolean(mode?.takeover);
   const isLive = run !== null && LIVE_STATES.has(run.state);
   // Scene reset drives the arm through the rollout process's own stdin, so it is only offered
   // while that process is sitting between rollouts waiting for a command.
@@ -154,7 +192,14 @@ export function RolloutPage() {
       rtcPrefixAttentionSchedule,
       rtcReplanQueueSize: positiveNumberOr(rtcReplanQueueSize, 25),
       rtcInferenceDelaySteps: optionalNumberOrNull(rtcInferenceDelaySteps),
-      commandEmaAlpha: optionalNumberOrNull(commandEmaAlpha)
+      commandEmaAlpha: optionalNumberOrNull(commandEmaAlpha),
+      // Sent only for the modes the launcher forwards it to. On any other mode the gateway
+      // refuses the start rather than dropping the setting, so not sending it is what keeps a
+      // leftover switch from blocking a smoke test.
+      daggerTakeover: takeoverSupported ? daggerTakeover : false,
+      daggerRecord,
+      daggerDatasetRoot: daggerDatasetRoot.trim() || undefined,
+      daggerReleaseAfterS: optionalNumberOrNull(daggerReleaseAfterS)
     }),
     [
       taskPrompt,
@@ -164,7 +209,12 @@ export function RolloutPage() {
       rtcPrefixAttentionSchedule,
       rtcReplanQueueSize,
       rtcInferenceDelaySteps,
-      commandEmaAlpha
+      commandEmaAlpha,
+      takeoverSupported,
+      daggerTakeover,
+      daggerRecord,
+      daggerDatasetRoot,
+      daggerReleaseAfterS
     ]
   );
 
@@ -176,6 +226,13 @@ export function RolloutPage() {
         (entry) => entry.geometry && (!run?.checkpointId || entry.checkpointId === run.checkpointId)
       ),
     [history, run?.checkpointId]
+  );
+
+  // The log is served newest first, and the rows that answer "did that last run go in" are the
+  // ones at the top. The rest stays one click away rather than several screens down.
+  const visibleHistory = useMemo(
+    () => (showAllHistory ? history : history.slice(0, HISTORY_VISIBLE)),
+    [history, showAllHistory]
   );
 
   const refreshHistory = useCallback(async () => {
@@ -245,6 +302,12 @@ export function RolloutPage() {
       const params = await api.fetchRolloutLastParams();
       if (cancelled || !params || Object.keys(params).length === 0) return;
       if (params.mode) setModeId(params.mode);
+      // Handed to the picker rather than applied here: this page has the id, and only the
+      // listing has the checkpoint.
+      if (params.checkpointId) {
+        skipDefaultsForRef.current = params.checkpointId;
+        setRestoreCheckpointId(params.checkpointId);
+      }
       if (params.maxSteps !== undefined) setMaxSteps(String(params.maxSteps));
       if (params.moveToStart !== undefined) setMoveToStart(params.moveToStart);
       const options = params.runtimeOptions;
@@ -267,8 +330,20 @@ export function RolloutPage() {
         setCommandEmaAlpha(
           options.commandEmaAlpha == null ? "" : String(options.commandEmaAlpha)
         );
+        // The switch comes back with the destination and the handback. It is not one of the
+        // motion gates -- it opens the SpaceMouse, it does not start the arm -- and a session
+        // spent collecting corrections re-ticks it before every single rollout otherwise. What
+        // it does get is a sentence in the notice, since it is a second action source and the
+        // subcard holding it can sit unscrolled-to.
+        if (options.daggerTakeover !== undefined) setDaggerTakeover(options.daggerTakeover);
+        if (options.daggerRecord !== undefined) setDaggerRecord(options.daggerRecord);
+        if (options.daggerDatasetRoot !== undefined)
+          setDaggerDatasetRoot(options.daggerDatasetRoot);
+        setDaggerReleaseAfterS(
+          options.daggerReleaseAfterS == null ? "" : String(options.daggerReleaseAfterS)
+        );
       }
-      setNotice("Settings carried over from the last rollout. Motion confirmation is not.");
+      setNotice(carriedOverNotice(params));
     })();
     return () => {
       cancelled = true;
@@ -309,6 +384,10 @@ export function RolloutPage() {
   }, [selected?.id]);
 
   useEffect(() => {
+    if (selected?.id && selected.id === skipDefaultsForRef.current) {
+      skipDefaultsForRef.current = "";
+      return;
+    }
     setTaskPrompt("");
     setRtcMode("auto");
     setRtcExecutionHorizon("10");
@@ -382,11 +461,22 @@ export function RolloutPage() {
   // the outcome is *derived* from the stage rather than chosen beside it.
   const derivedOutcome =
     gradedStage && ladder ? (gradedStage.ordinal >= ladder.terminal ? "success" : "failure") : "";
+  // Success means the policy got the object to the end of the task. If the operator was driving
+  // when the object got there, it did not -- so that grade is blocked rather than warned about:
+  // this log is what two checkpoints are compared on, and a success it did not earn is the one
+  // entry that cannot be corrected by looking at more of them.
+  const terminalWasOperators = terminalEventDriver(run?.lastRolloutGeometry) === "expert";
+  const successBlocked = assistedSuccessBlocked(run?.lastRolloutGeometry, assistedSuccessAck);
 
   const onRecordOutcome = async (outcome?: "success" | "failure" | "aborted") => {
+    const recordedSuccess = (outcome ?? derivedOutcome) === "success";
+    const note =
+      recordedSuccess && terminalWasOperators && assistedSuccessAck
+        ? [ASSISTED_SUCCESS_MARK, outcomeNote].filter(Boolean).join(" ")
+        : outcomeNote;
     const result = await wrap("Record outcome", () =>
       api.recordRolloutOutcome({
-        note: outcomeNote,
+        note,
         ...(ladder && gradedStage ? { taskLadder: ladder.task, stageId: gradedStage.id } : {}),
         // Only meaningful on a shortfall: the terminal stage did not stop anywhere.
         ...(ladder && gradedStage && outcomeBlocker && gradedStage.ordinal < ladder.terminal
@@ -401,6 +491,7 @@ export function RolloutPage() {
       setOutcomeNote("");
       setOutcomeStageId("");
       setOutcomeBlocker("");
+      setAssistedSuccessAck(false);
       setNotice(`Recorded ${outcome ?? derivedOutcome}${gradedStage ? ` at stage ${gradedStage.ordinal}` : ""}.`);
       await refreshHistory();
     }
@@ -491,12 +582,64 @@ export function RolloutPage() {
               is a thing to find at the moment something is going wrong, and a latched one is a
               thing to forget -- the next rollout would start under a device nobody is holding.
               Who is driving right now is drawn in the live view's own pill, off the frames the
-              runtime publishes, rather than off this click. */}
-          {run.takeoverAvailable && run.state === "rolling" && (
-            <p className="hint">
-              SpaceMouse armed: move it to take the arm over. The policy resumes on its own once
-              you stop.
-            </p>
+              runtime publishes, rather than off this click.
+
+              Hold is the other half of that latch and does have a button, because a rollout this
+              gateway launched holds the runtime's stdin as a pipe: the `t` key a terminal
+              operator would press cannot reach it, so without this the browser has no brake. It
+              freezes the arm at the last command it sent -- the gripper included -- which is what
+              an operator wants when the policy is heading somewhere wrong and they need a moment
+              before steering. The runtime clears the latch when the rollout stops, so it cannot
+              be left on for the next one. */}
+          {run.takeoverAvailable && (
+            <div className="subcard">
+              <div className="row-actions">
+                <span className="pill">SpaceMouse armed</span>
+                {run.state === "rolling" && (
+                  <button
+                    type="button"
+                    onClick={() => void onControl("takeover")}
+                    disabled={busy}
+                  >
+                    Hold / release (freeze the arm)
+                  </button>
+                )}
+              </div>
+              <p className="hint">
+                Move the device to take the arm over.{" "}
+                {run.daggerReleaseAfterS === 0
+                  ? "Automatic handback is off: Hold is the only way in and out."
+                  : run.daggerReleaseAfterS
+                    ? `The policy resumes ${run.daggerReleaseAfterS} s after you stop.`
+                    : "The policy resumes on its own once you stop."}{" "}
+                Taking over does not move the gripper until you press a gripper button.
+              </p>
+              {run.daggerReportTimestamps && (
+                <p className="hint">
+                  Pre-flight: <code>report_timestamps={run.daggerReportTimestamps}</code> — the
+                  driver dates each report, so a device that has gone quiet is told apart from one
+                  still being pushed. Without it the arm would keep flying after your hand came
+                  off; a real rollout cannot start without it.
+                </p>
+              )}
+              {run.daggerDatasetPath ? (
+                <p className="hint">
+                  Corrections: <code>{run.daggerDatasetPath}</code>
+                  {run.daggerEpisodes ? ` — ${run.daggerEpisodes} episode(s) so far` : ""}
+                </p>
+              ) : (
+                <p className="hint warn">
+                  Steer only — corrections are not being written anywhere.
+                </p>
+              )}
+              {Boolean(run.daggerDroppedFrames) && (
+                <p className="hint warn">
+                  {run.daggerDroppedFrames} correction frame(s) dropped past the buffer cap: a
+                  takeover ran longer than the runtime holds in memory, so the end of it is
+                  missing from the dataset.
+                </p>
+              )}
+            </div>
           )}
 
           {run.interactive && run.state === "waiting" && !run.armAtStart && (
@@ -572,11 +715,27 @@ export function RolloutPage() {
 
           {run.pendingOutcomeFor > 0 && (
             <div className="subcard outcome-prompt">
-              <h4>How did rollout {run.pendingOutcomeFor} go?</h4>
+              <h4>
+                How did rollout {run.pendingOutcomeFor} go?
+                {run.lastRolloutIntervention?.intervened && (
+                  <span className="pill pill-warn outcome-assisted-pill">
+                    人工接管 {run.lastRolloutIntervention.expertSteps ?? 0} 步
+                  </span>
+                )}
+              </h4>
               <p className="hint">
                 Recorded against {run.checkpointId}. This is the only thing that lets two
                 checkpoints be compared honestly later.
               </p>
+              {run.lastRolloutIntervention?.intervened && (
+                <p className="hint warn">
+                  这一轮你接管过 {run.lastRolloutIntervention.expertSteps ?? 0} 步：
+                  <strong>要填，但不能按“孔插进去了”来评 —— 按你接管之前策略自己走到哪一步来评。</strong>
+                  阶段选它被接管前够到的那一阶段，"卡在哪"选你之所以要伸手的原因，note 里写清楚从第几步起是人在开。
+                  终点是你的手放上去之后到达的，记成成功就是把这一分记在了 checkpoint 头上 ——
+                  下一版是不是真的变好，比的就是这条记录。
+                </p>
+              )}
               <label className="field">
                 <span>Note (optional)</span>
                 <input
@@ -645,23 +804,45 @@ export function RolloutPage() {
                   </p>
                 </>
               )}
+              {terminalWasOperators && (!ladder || derivedOutcome === "success") && (
+                <div className="subcard">
+                  <p className="hint warn">
+                    终点那一下是<strong>你</strong>开的（release 落在你的接管区间里），所以这一轮不能记成
+                    success —— 记了就是把你的手算成了 checkpoint 的本事。选策略自己走到的那一阶段；
+                    如果你伸手跟策略无关（碰倒了、复位、救硬件），用 Aborted。
+                  </p>
+                  <label className="checkbox">
+                    <input
+                      type="checkbox"
+                      checked={assistedSuccessAck}
+                      onChange={(event) => setAssistedSuccessAck(event.target.checked)}
+                    />
+                    <span>
+                      任务在我接管前就已经完成，我只是接管去收尾（勾选后可以记 success，这句话会写进
+                      note）
+                    </span>
+                  </label>
+                </div>
+              )}
               <div className="row-actions">
                 {ladder ? (
                   <button
                     type="button"
                     onClick={() => void onRecordOutcome()}
-                    disabled={busy || !gradedStage}
+                    disabled={busy || !gradedStage || (derivedOutcome === "success" && successBlocked)}
                   >
-                    {gradedStage
-                      ? `Record stage ${gradedStage.ordinal} (${derivedOutcome})`
-                      : "Record (pick a stage first)"}
+                    {!gradedStage
+                      ? "Record (pick a stage first)"
+                      : derivedOutcome === "success" && successBlocked
+                        ? "Record (终点由人完成，不能记 success)"
+                        : `Record stage ${gradedStage.ordinal} (${derivedOutcome})`}
                   </button>
                 ) : (
                   <>
                     <button
                       type="button"
                       onClick={() => void onRecordOutcome("success")}
-                      disabled={busy}
+                      disabled={busy || successBlocked}
                     >
                       Success
                     </button>
@@ -755,6 +936,7 @@ export function RolloutPage() {
           mode="picker"
           selectedId={selected?.id ?? ""}
           onSelect={setSelected}
+          restoreId={restoreCheckpointId}
           disabled={isLive}
         />
       </section>
@@ -913,6 +1095,75 @@ export function RolloutPage() {
           )}
         </div>
 
+        {takeoverSupported && (
+          <div className="subcard rollout-runtime-options">
+            <h4>DAgger takeover</h4>
+            <p className="hint">
+              Moving the SpaceMouse takes the arm mid-rollout; the policy resumes on its own once
+              you stop. There is no engage button — the device is the switch. Each stretch you
+              drove becomes one episode flagged <code>is_intervention</code>, written after the
+              rollout ends rather than at the moment you let go.
+            </p>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={daggerTakeover}
+                onChange={(event) => setDaggerTakeover(event.target.checked)}
+                disabled={isLive}
+              />
+              <span>
+                Open a SpaceMouse for this session (a second action source onto a moving arm —
+                somebody has to be at the rig)
+              </span>
+            </label>
+            {daggerTakeover && (
+              <>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={daggerRecord}
+                    onChange={(event) => setDaggerRecord(event.target.checked)}
+                    disabled={isLive}
+                  />
+                  <span>
+                    Keep the corrections as training data (uncheck only to feel out the handoff —
+                    takeover still steers the arm, but nothing is written)
+                  </span>
+                </label>
+                {daggerRecord ? (
+                  <label className="field">
+                    <span>Corrections dataset</span>
+                    <input
+                      value={daggerDatasetRoot}
+                      onChange={(event) => setDaggerDatasetRoot(event.target.value)}
+                      placeholder="auto: outputs/datasets/dagger_<checkpoint>, extended across sessions"
+                      disabled={isLive}
+                    />
+                  </label>
+                ) : (
+                  <p className="hint warn">
+                    Steer only: this session&apos;s corrections are discarded when it ends.
+                  </p>
+                )}
+                <label className="field inline">
+                  <span>Hand back after (s)</span>
+                  <input
+                    value={daggerReleaseAfterS}
+                    onChange={(event) => setDaggerReleaseAfterS(event.target.value)}
+                    inputMode="decimal"
+                    placeholder="1"
+                    disabled={isLive}
+                  />
+                </label>
+                <p className="hint">
+                  Seconds of a still device before the policy takes the arm back. <code>0</code>{" "}
+                  turns automatic handback off, leaving <b>Hold</b> as the only way in and out.
+                </p>
+              </>
+            )}
+          </div>
+        )}
+
         {mode?.movesArm && (
           <label className="checkbox">
             <input
@@ -987,42 +1238,66 @@ export function RolloutPage() {
         {history.length === 0 ? (
           <p className="hint">No rollouts recorded yet.</p>
         ) : (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>When</th>
-                <th>Checkpoint</th>
-                <th>Mode</th>
-                <th>Outcome</th>
-                <th>Steps</th>
-                <th>Note</th>
-              </tr>
-            </thead>
-            <tbody>
-              {history.slice(0, 40).map((entry, index) => (
-                <tr key={`${entry.recordedAt}-${index}`}>
-                  <td>{entry.recordedAt.replace("T", " ").replace("+00:00", "Z")}</td>
-                  <td>{entry.checkpointId}</td>
-                  <td>{entry.mode || "—"}</td>
-                  <td>
-                    <span
-                      className={`pill pill-${
-                        entry.outcome === "success"
-                          ? "ok"
-                          : entry.outcome === "failure"
-                            ? "error"
-                            : "warn"
-                      }`}
-                    >
-                      {entry.outcome}
-                    </span>
-                  </td>
-                  <td>{entry.steps || "—"}</td>
-                  <td>{entry.note || "—"}</td>
+          <div className="table-scroll">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>When</th>
+                  <th>Checkpoint</th>
+                  <th>Mode</th>
+                  <th>Outcome</th>
+                  <th>Steps</th>
+                  <th>Assisted</th>
+                  <th>Note</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {visibleHistory.map((entry, index) => (
+                  <tr key={`${entry.recordedAt}-${index}`}>
+                    <td>{entry.recordedAt.replace("T", " ").replace("+00:00", "Z")}</td>
+                    <td>{entry.checkpointId}</td>
+                    <td>{entry.mode || "—"}</td>
+                    <td>
+                      <span
+                        className={`pill pill-${
+                          entry.outcome === "success"
+                            ? "ok"
+                            : entry.outcome === "failure"
+                              ? "error"
+                              : "warn"
+                        }`}
+                      >
+                        {entry.outcome}
+                      </span>
+                    </td>
+                    <td>{entry.steps || "—"}</td>
+                    <td>
+                      {entry.intervened ? (
+                        <span className="pill pill-warn" title="A human drove part of this rollout">
+                          人工 {entry.expertSteps ?? 0} 步
+                        </span>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
+                    <td>{entry.note || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {history.length > HISTORY_VISIBLE && (
+          <div className="row-actions">
+            <button type="button" onClick={() => setShowAllHistory((value) => !value)}>
+              {showAllHistory ? `Show latest ${HISTORY_VISIBLE}` : `Show all ${history.length}`}
+            </button>
+            <span className="hint">
+              {showAllHistory
+                ? `All ${history.length} recorded rollouts, newest first.`
+                : `Latest ${HISTORY_VISIBLE} of ${history.length}, newest first.`}
+            </span>
+          </div>
         )}
       </section>
     </div>

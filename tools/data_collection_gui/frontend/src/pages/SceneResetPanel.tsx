@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { api } from "../apiClient";
 import type {
   DemoLandingPoint,
   RolloutLandmarks,
@@ -8,6 +9,8 @@ import type {
   TableWindow
 } from "../types";
 import type { PlottedPoint } from "./landingMapPoints";
+import { PLACE_Z_M, TABLE_Z_M, dropWarning } from "./sceneResetHeights";
+import { strokesAfterLoad } from "./sceneResetMask";
 import { windowForPlot } from "./tableWindow";
 
 const SIZE = 360;
@@ -102,16 +105,22 @@ export function SceneResetPanel({
 }) {
   const [pickX, setPickX] = useState("0.40");
   const [pickY, setPickY] = useState("0.00");
-  const [pickZ, setPickZ] = useState("0.035");
+  const [pickZ, setPickZ] = useState(TABLE_Z_M.toFixed(3));
   // The pick pose follows the measured place point until an operator overrides it, and then
   // stops: a nudge that a newly loaded dataset silently undoes is worse than no default.
   const [pickFollowsDemos, setPickFollowsDemos] = useState(true);
-  const [targetZ, setTargetZ] = useState("0.55");
+  // Not the pick's measurement: the release height is chosen once and stays chosen. A dataset
+  // loading in the background must not move the height the gripper opens at.
+  const [targetZ, setTargetZ] = useState(PLACE_Z_M.toFixed(3));
   const [liftM] = useState(FIXED_LIFT_M.toFixed(2));
   const [brushRadius, setBrushRadius] = useState("0.035");
   const [returnToStart, setReturnToStart] = useState(true);
   const [confirmMotion, setConfirmMotion] = useState(false);
   const [strokes, setStrokes] = useState<SceneResetStroke[]>([]);
+  // Gates the save below until the stored mask has been asked for. Without it the panel's own
+  // empty initial state is written over the stored region a moment before that region arrives,
+  // which is the persistence deleting exactly what it exists to keep.
+  const [maskLoaded, setMaskLoaded] = useState(false);
   const [message, setMessage] = useState("");
   const [drawing, setDrawing] = useState(false);
   const [backgroundLoaded, setBackgroundLoaded] = useState(false);
@@ -141,6 +150,38 @@ export function SceneResetPanel({
   const plotSize = SIZE - PAD * 2;
   const backgroundUrl = tableViewUrl ? tableViewUrl(viewWindow, plotSize, plotSize) : "";
 
+  // The mask is measured, not typed: a region of the real table, drawn over a camera still of
+  // it. Redrawing it from memory after every page load is how two sessions end up resetting to
+  // two different regions -- and the difference does not show up as a mistake, it shows up as a
+  // rollout series whose place points quietly moved.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .fetchSceneResetMask()
+      .then((saved) => {
+        if (cancelled) return;
+        setStrokes((current) => strokesAfterLoad(current, saved));
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (!cancelled) setMaskLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!maskLoaded) return;
+    // Debounced because one brush stroke is a pointermove: drawing a region is a few hundred
+    // state updates, and a write per pointer sample would be a few hundred writes of the same
+    // region. Cleared masks are saved too -- "no region" is an answer.
+    const timer = window.setTimeout(() => {
+      void api.saveSceneResetMask(strokes);
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [strokes, maskLoaded]);
+
   const applyMeasuredPick = (xyz: [number, number, number]) => {
     setPickX(xyz[0].toFixed(3));
     setPickY(xyz[1].toFixed(3));
@@ -148,8 +189,10 @@ export function SceneResetPanel({
   };
 
   useEffect(() => {
-    if (!measuredPick || !pickFollowsDemos) return;
-    applyMeasuredPick(measuredPick);
+    if (!measuredPick) return;
+    if (pickFollowsDemos) applyMeasuredPick(measuredPick);
+    // Place z is deliberately absent from this effect: it is the one height a measurement does
+    // not get to write.
     // measuredPickKey, not measuredPick: the landmarks object is rebuilt on every poll, and
     // depending on its identity would overwrite an in-progress edit once a second.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -159,6 +202,8 @@ export function SceneResetPanel({
     setPickFollowsDemos(false);
     setter(value);
   };
+  const placeDropWarning = dropWarning(numberOr(pickZ, TABLE_Z_M), numberOr(targetZ, PLACE_Z_M));
+
   const gridValues = useMemo(() => {
     const values: number[] = [];
     for (let value = -0.5; value <= 0.75; value += 0.05) values.push(value);
@@ -187,8 +232,8 @@ export function SceneResetPanel({
   const runReset = async () => {
     setMessage("");
     const request: SceneResetRequest = {
-      pickXyz: [numberOr(pickX, 0.4), numberOr(pickY, 0), numberOr(pickZ, 0.035)],
-      targetZ: numberOr(targetZ, 0.55),
+      pickXyz: [numberOr(pickX, 0.4), numberOr(pickY, 0), numberOr(pickZ, TABLE_Z_M)],
+      targetZ: numberOr(targetZ, PLACE_Z_M),
       liftM: FIXED_LIFT_M,
       approachClearanceM: FIXED_LIFT_M,
       returnToStart,
@@ -341,6 +386,7 @@ export function SceneResetPanel({
             <label className="field inline"><span>Brush</span><input value={brushRadius} onChange={(event) => setBrushRadius(event.target.value)} inputMode="decimal" /></label>
           </div>
           <p className="hint">Brush radius {formatM(numberOr(brushRadius, 0.035))}; lift/descent is fixed at 80 mm for QC.</p>
+          {placeDropWarning ? <div className="banner banner-warn">{placeDropWarning}</div> : null}
           {measuredPick ? (
             <>
               <p className="hint">
@@ -351,9 +397,12 @@ export function SceneResetPanel({
                 {pickFollowsDemos
                   ? " Edit any Pick field to nudge it."
                   : " Edited by hand — it no longer tracks the demonstrations."}
+                {" Place z does not follow that measurement: it starts at "}
+                {PLACE_Z_M.toFixed(3)}
+                {" m and only changes if you edit it by hand."}
               </p>
-              {!pickFollowsDemos ? (
-                <div className="row-actions">
+              <div className="row-actions">
+                {!pickFollowsDemos ? (
                   <button
                     type="button"
                     className="ghost"
@@ -364,12 +413,21 @@ export function SceneResetPanel({
                   >
                     Use the measured pick
                   </button>
-                </div>
-              ) : null}
+                ) : null}
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => setTargetZ(PLACE_Z_M.toFixed(3))}
+                  disabled={targetZ === PLACE_Z_M.toFixed(3)}
+                >
+                  Back to default ({PLACE_Z_M.toFixed(3)} m)
+                </button>
+              </div>
             </>
           ) : (
             <p className="hint">
               No demonstration geometry for this dataset yet, so Pick is whatever you type here.
+              Place z is {PLACE_Z_M.toFixed(3)} m by default either way.
             </p>
           )}
           <label className="checkbox">

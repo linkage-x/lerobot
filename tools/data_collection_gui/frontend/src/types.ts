@@ -1106,6 +1106,10 @@ export type RolloutMode = {
   description: string;
   movesArm: boolean;
   interactive: boolean;
+  /** Whether the launcher forwards the DAgger flags to this mode. Narrower than `interactive`:
+   *  the runtime refuses takeover without interactive rollouts, so only `real` and `real_debug`
+   *  carry it. */
+  takeover?: boolean;
 };
 
 export type RolloutRun = {
@@ -1133,6 +1137,21 @@ export type RolloutRun = {
    *  arm over by moving it. Read off the takeover key the runtime binds, which it refuses to
    *  bind without a device. Reported by the runtime rather than derived from the mode. */
   takeoverAvailable?: boolean;
+  /** `yes` once the runtime's takeover pre-flight has printed. It is the only value a real
+   *  rollout can reach -- an undated SpaceMouse driver is refused before the arm is built -- so
+   *  this is the operator's confirmation that the check ran, not a warning light. */
+  daggerReportTimestamps?: string;
+  /** Seconds of a still device before the policy takes the arm back. 0 means only the hold latch
+   *  moves the arm between the two drivers. */
+  daggerReleaseAfterS?: number | null;
+  /** Where corrections are being written; empty when the operator chose to steer without
+   *  recording. */
+  daggerDatasetPath?: string;
+  /** Correction episodes written so far this session, summed across rollouts. */
+  daggerEpisodes?: number;
+  /** Frames dropped past the buffer cap. Non-zero means a correction was longer than the buffer
+   *  and the dataset is missing its end. */
+  daggerDroppedFrames?: number;
   step: number;
   maxSteps: number;
   commandStatus: string;
@@ -1157,6 +1176,21 @@ export type RolloutRun = {
   pendingOutcomeFor: number;
   /** Where the last finished rollout put the gripper. Empty until one has finished. */
   lastRolloutGeometry?: RolloutGeometry;
+  /** Whether a human drove part of the last finished rollout. Empty until one has finished,
+   *  and on a runtime too old to report it. */
+  lastRolloutIntervention?: RolloutIntervention;
+};
+
+/** Whose hand drove the rollout that is about to be graded.
+ *
+ *  `intervened` false is a measurement: the runtime reported a summary and it contained no
+ *  expert spans. The whole record being absent is the other case -- nobody counted -- and the
+ *  page must not turn that into "the policy did it alone".
+ */
+export type RolloutIntervention = {
+  intervened?: boolean;
+  /** Steps the operator drove, out of the rollout's total. Zero when `intervened` is false. */
+  expertSteps?: number;
 };
 
 /** The landing points of one rollout, measured by the runtime from its own per-step trace.
@@ -1176,7 +1210,17 @@ export type RolloutGeometry = {
   samples?: number;
   heldSteps?: number;
   closed?: boolean;
+  /** Who was driving at the instant of each point. Absent on rollouts recorded before the
+   *  runtime attributed them — which is not the same as "the policy". Rollout-level
+   *  `intervened` cannot answer this: it says a human was somewhere in the rollout, not
+   *  whether they were in *this* event. */
+  graspBy?: EventDriver;
+  releaseBy?: EventDriver;
+  approachBy?: EventDriver;
 };
+
+/** The two things that can drive the arm during a rollout. */
+export type EventDriver = "policy" | "expert";
 
 /** One demonstration's grasp and release, reduced by the same rule the runtime applies live. */
 export type DemoLandingPoint = {
@@ -1289,6 +1333,11 @@ export type RolloutOutcomeEntry = {
   rolloutIndex?: number;
   /** Absent on rollouts recorded before the runtime reported landing points. */
   geometry?: RolloutGeometry;
+  /** Whether a human drove part of this rollout, and for how many steps. Absent on records
+   *  written before the runtime reported it — which is not the same as false. An assisted
+   *  rollout's outcome describes the operator, not the checkpoint. */
+  intervened?: boolean;
+  expertSteps?: number;
   /** The ladder this rollout was graded against. Absent on rollouts graded before ladders. */
   taskLadder?: string;
   /** How far along that task's precondition chain it got. Ordinal — never average these. */
@@ -1318,14 +1367,29 @@ export type RolloutRuntimeOptions = {
   rtcInferenceDelaySteps?: number | null;
   /** null or undefined disables extra command EMA smoothing. */
   commandEmaAlpha?: number | null;
+  /** Open a SpaceMouse and let the operator take the arm mid-rollout. Only `real` and
+   *  `real_debug` accept it; anything else is refused with a reason rather than dropped. */
+  daggerTakeover?: boolean;
+  /** Whether those corrections become training data. False is the shakedown case -- feeling out
+   *  the handoff on the real arm without adding half-meant corrections to a dataset. */
+  daggerRecord?: boolean;
+  /** Blank derives one per checkpoint, so an afternoon's corrections accumulate in one dataset
+   *  instead of scattering across launches. */
+  daggerDatasetRoot?: string;
+  /** null or undefined leaves the runtime's 1 s handback. 0 turns automatic handback off. */
+  daggerReleaseAfterS?: number | null;
 };
 
 /** The previous rollout's settings, as offered by /api/rollout/last-params.
  *
- *  Deliberately excludes `checkpointId` and both safety gates (`confirmMotion`,
- *  `overrideContract`): a remembered "yes" to arm motion is a gate that answers itself. */
+ *  Deliberately excludes both safety gates (`confirmMotion`, `overrideContract`): a remembered
+ *  "yes" to arm motion is a gate that answers itself. The checkpoint is not a gate -- it is
+ *  re-selected, and then re-checked against the rig like any other pick. */
 export type RolloutLastParams = {
   mode?: string;
+  /** Pre-selects the picker once the listing containing it has loaded. Absent, or naming a
+   *  checkpoint that has since been deleted, leaves the page with nothing selected. */
+  checkpointId?: string;
   maxSteps?: number;
   moveToStart?: boolean;
   runtimeOptions?: RolloutRuntimeOptions;

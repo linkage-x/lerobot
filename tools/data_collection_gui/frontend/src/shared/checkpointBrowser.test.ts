@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   checkpointMatches,
+  checkpointToRestore,
   formatBytes,
   successRate,
   verdictClass
@@ -115,6 +116,53 @@ describe("byte formatting", () => {
   });
 });
 
+describe("restoring the last checkpoint", () => {
+  const wanted = makeCheckpoint({ id: "job_a/020000" });
+  const other = makeCheckpoint({ id: "job_b/010000" });
+
+  it("resolves the remembered id once the listing containing it arrives", () => {
+    expect(checkpointToRestore([other, wanted], "job_a/020000", "")).toBe(wanted);
+  });
+
+  it("waits rather than guessing while the listing does not hold it", () => {
+    // Empty is the state on mount, before the fetch returns. A wrong guess here would put the
+    // page's contract gates in front of a checkpoint nobody asked for.
+    expect(checkpointToRestore([], "job_a/020000", "")).toBeNull();
+    expect(checkpointToRestore([other], "job_a/020000", "")).toBeNull();
+  });
+
+  it("does not override a checkpoint the operator has already picked", () => {
+    // The list is what an operator picks from, so a pick means they looked at it. Last
+    // session's memory does not get to move the selection out from under that.
+    expect(checkpointToRestore([other, wanted], "job_a/020000", "job_b/010000")).toBeNull();
+  });
+
+  it("does nothing when there is nothing remembered", () => {
+    expect(checkpointToRestore([wanted], "", "")).toBeNull();
+  });
+});
+
+describe("rollout page carry-over", () => {
+  it("hands the remembered checkpoint to the picker instead of selecting it blind", () => {
+    // The page holds an id; only the listing holds the Checkpoint the contract check runs on.
+    expect(rolloutPageSource).toContain("restoreId={restoreCheckpointId}");
+    expect(rolloutPageSource).toContain("setRestoreCheckpointId(params.checkpointId)");
+  });
+
+  it("keeps the restored checkpoint from wiping the settings restored with it", () => {
+    // Selecting a checkpoint resets the prompt and the RTC knobs. Without the skip, the
+    // restore would fire that reset one render after the carry-over landed, and the operator
+    // would start a "carried over" rollout on defaults.
+    expect(rolloutPageSource).toContain("skipDefaultsForRef.current");
+    expect(rolloutPageSource).toContain("selected.id === skipDefaultsForRef.current");
+  });
+
+  it("restores the SpaceMouse switch and says so", () => {
+    expect(rolloutPageSource).toContain("setDaggerTakeover(options.daggerTakeover)");
+    expect(rolloutPageSource).toContain("setNotice(carriedOverNotice(params))");
+  });
+});
+
 describe("rollout page safety gating", () => {
   it("keeps motion confirmation out of the start payload's defaults", () => {
     // The gateway refuses a motion mode without confirmMotion, but the page must not send a
@@ -128,6 +176,16 @@ describe("rollout page safety gating", () => {
     // checkpoint would let an operator arm a rollout they never looked at.
     expect(rolloutPageSource).toContain("setConfirmMotion(false);");
     expect(rolloutPageSource).toContain("}, [modeId, selected?.id]);");
+  });
+
+  it("re-asks both gates for a checkpoint that was restored rather than picked", () => {
+    // The restore lands as an ordinary selection change, which is what makes this hold: the
+    // two gates key off `selected?.id` and cannot tell -- or need to tell -- a remembered
+    // checkpoint from one somebody just clicked.
+    expect(rolloutPageSource).toContain("setOverrideContract(false);");
+    expect(rolloutPageSource).toContain("}, [selected?.id]);");
+    // ...and the skip that protects the carried settings is scoped to the defaults alone.
+    expect(rolloutPageSource).not.toContain("skipDefaultsForRef.current = params.mode");
   });
 
   it("disables Start until every gate is satisfied", () => {

@@ -21,6 +21,8 @@ import json
 import math
 from pathlib import Path
 import os
+import shutil
+import signal
 import sys
 import threading
 import time
@@ -93,7 +95,10 @@ from tools.fr3.dagger_dataset import (
     DaggerEpisodeWriter,
     DaggerFrameBuffer,
     build_dagger_frame,
+    dagger_dataset_can_load_locally,
     dagger_dataset_features,
+    dagger_dataset_is_unfinalized,
+    dagger_dataset_root_is_recreatable,
     image_source_keys,
     sent_command_to_dataset_action,
 )
@@ -2435,11 +2440,20 @@ class RolloutGeometryTrace:
             result['intervened'] = True
             result['expert_steps'] = sum(last - first + 1 for first, last in expert_spans_found)
             result['expert_spans'] = expert_spans_found
+        # Who was driving at the instant of each landing event. `intervened` says a human was in
+        # the rollout somewhere; this says whether they were in *this* event, which is the
+        # question a landing point and a grade both actually ask. A grasp the policy made before
+        # the operator stepped in is still the policy's datum, and a peg the operator seated is
+        # not the policy's success.
+        def driver_at(index: int) -> str:
+            return 'expert' if sources[index] == 'expert' else 'policy'
+
         if not closed.any():
             # Never closed. The lowest point it reached is still the landing point worth
             # plotting: it is where the policy decided the object was.
             lowest = int(np.argmin(positions[:, 2]))
             result['approach_xyz'] = positions[lowest].tolist()
+            result['approach_by'] = driver_at(lowest)
             return result
         close_idx, hold_end = _dominant_closed_span(closed)
         release_idx = min(hold_end + 1, len(self._rows) - 1)
@@ -2452,6 +2466,8 @@ class RolloutGeometryTrace:
                 'lift_m': apex_z - float(positions[close_idx, 2]),
                 'descent_m': apex_z - float(positions[release_idx, 2]),
                 'held_steps': release_idx - close_idx,
+                'grasp_by': driver_at(close_idx),
+                'release_by': driver_at(release_idx),
             }
         )
         return result
@@ -2476,6 +2492,10 @@ class RolloutGeometryTrace:
         held = summary.get('held_steps')
         if held is not None:
             fields.append(f'held_steps={int(held)}')
+        for key in ('grasp_by', 'release_by', 'approach_by'):
+            driver = summary.get(key)
+            if driver is not None:
+                fields.append(f'{key}={driver}')
         if summary.get('intervened'):
             fields.append('intervened=1')
             fields.append(f"expert_steps={int(summary['expert_steps'])}")
@@ -3850,7 +3870,19 @@ def build_dagger_writer(
     root = Path(args.dagger_dataset_root).expanduser()
     repo_id = str(args.dagger_dataset_repo_id or root.name)
     features = dagger_dataset_features(dict(ds_meta.features))
-    if root.exists():
+
+    def create_dataset() -> Any:
+        dataset = LeRobotDataset.create(
+            repo_id,
+            fps=int(round(fps)),
+            root=root,
+            features=features,
+            use_videos=True,
+        )
+        print(f'[INFO] dagger_dataset=created root={root} repo_id={repo_id} fps={int(round(fps))}')
+        return dataset
+
+    if root.exists() and dagger_dataset_can_load_locally(root):
         dataset = LeRobotDataset(repo_id, root=root)
         # The frames written below are built against `features`, derived from the dataset being
         # imitated. If the root points at a dataset built from something else, every column
@@ -3868,14 +3900,23 @@ def build_dagger_writer(
             f'episodes={dataset.meta.total_episodes}'
         )
     else:
-        dataset = LeRobotDataset.create(
-            repo_id,
-            fps=int(round(fps)),
-            root=root,
-            features=features,
-            use_videos=True,
-        )
-        print(f'[INFO] dagger_dataset=created root={root} repo_id={repo_id} fps={int(round(fps))}')
+        if root.exists():
+            if not dagger_dataset_root_is_recreatable(root):
+                if dagger_dataset_is_unfinalized(root):
+                    raise SystemExit(
+                        f'--dagger-dataset-root {root} holds a DAgger session that was killed '
+                        'before it closed its dataset: the frames and videos are on disk, but the '
+                        'episode metadata was never flushed and the data parquet has no footer, '
+                        'so nothing can open it. Move it aside and start a fresh directory -- '
+                        'those corrections cannot be recovered.'
+                    )
+                raise SystemExit(
+                    f'--dagger-dataset-root {root} exists but is not a loadable LeRobot dataset '
+                    'and contains files other than an empty DAgger metadata shell. Move it aside, '
+                    'or point --dagger-dataset-root at a fresh directory.'
+                )
+            shutil.rmtree(root)
+        dataset = create_dataset()
     return dataset, DaggerEpisodeWriter(dataset, min_span_frames=int(args.dagger_min_span_frames))
 
 
@@ -4193,6 +4234,55 @@ def load_policy_stack(
     )
     policy.eval()
     return policy, preprocessor, postprocessor
+
+
+class TerminateAsKeyboardInterrupt:
+    """SIGTERM turned into the exception a rollout already unwinds on, once.
+
+    SIGTERM is how the gateway's stop button reaches this process when the `quit` it wrote to
+    stdin has gone unanswered, and Python's default action for it is to die on the spot: no
+    `finally`, so no `robot.disconnect()` and no `dataset.finalize()`. A DAgger run killed that
+    way leaves its corrections as a parquet with no footer -- 432 recorded frames were lost
+    exactly so on 2026-09-02. Raising here makes a signalled shutdown identical to a Ctrl-C one,
+    which is the path this file has always handled.
+
+    A repeat is ignored rather than escalating, because the second signal would land *inside*
+    that shutdown -- encoding video and closing parquet writers is the slow part of it -- and
+    interrupting the close is the failure the guard exists to prevent. SIGKILL stays the
+    operator's escalation, and the gateway sends it after its own grace period.
+    """
+
+    def __init__(self, emit: Callable[[str], None] = print):
+        self._emit = emit
+        self._previous: Any = None
+        self._installed = False
+        self.shutting_down = False
+
+    def install(self) -> None:
+        try:
+            self._previous = signal.signal(signal.SIGTERM, self)
+        except ValueError:
+            # Signal handlers can only be installed from the main thread. A harness that drives
+            # `run_inference` off it still gets the rollout; it just does not get this.
+            return
+        self._installed = True
+
+    def restore(self) -> None:
+        if not self._installed:
+            return
+        self._installed = False
+        try:
+            signal.signal(signal.SIGTERM, self._previous)
+        except (ValueError, TypeError):
+            pass
+
+    def __call__(self, signum: int, _frame: Any) -> None:
+        if self.shutting_down:
+            self._emit(f'[INFO] shutdown_signal={signum} ignored; the session is already closing.')
+            return
+        self.shutting_down = True
+        self._emit(f'[INFO] shutdown_signal={signum} received; closing the session.')
+        raise KeyboardInterrupt
 
 
 def run_inference(args: argparse.Namespace) -> int:
@@ -4610,31 +4700,9 @@ def run_inference(args: argparse.Namespace) -> int:
     if args.interactive_rollouts and robot_init_state is None:
         print('[WARN] interactive_rollouts enabled without robot_init_state; rollout reset will hold the current robot state.')
 
+    # Declared here so the finally below can always test it. The arm is not connected here: see
+    # the connect inside the try.
     mujoco_visualizer: FR3InferenceMujocoVisualizer | None = None
-    robot.connect()
-    if args.mujoco_viewer:
-        mujoco_visualizer = FR3InferenceMujocoVisualizer(
-            model_path=mujoco_model_path,
-            max_chunk_points=args.mujoco_max_chunk_points,
-        )
-        mujoco_visualizer.start()
-    if args.align_gripper_to_dataset_start and not args.preview:
-        if dataset_start_gripper_mean_normalized is None:
-            print(
-                '[WARN] align_gripper_to_dataset_start=fallback_open_gripper '
-                'reason=dataset_start_states_do_not_include_gripper_values target=1.000'
-            )
-            align_gripper_to_dataset_start(
-                robot,
-                target_gripper_pos=1.0,
-                tolerance=dataset_start_gripper_tolerance,
-            )
-        else:
-            align_gripper_to_dataset_start(
-                robot,
-                target_gripper_pos=float(dataset_start_gripper_mean_normalized),
-                tolerance=dataset_start_gripper_tolerance,
-            )
     def reset_policy_runtime_state() -> None:
         policy.reset()
         state_processor.reset()
@@ -5163,7 +5231,19 @@ def run_inference(args: argparse.Namespace) -> int:
                             # into every sample.
                             observation_values={
                                 **dataset_state_observation_i,
-                                **{key: robot_observation[key] for key in dagger_image_keys},
+                                # The images the *policy* was shown, not the robot's raw frames.
+                                # The dataset being imitated is a training view, and a view's
+                                # images are its own crop of the camera (here 542x286 of the ee
+                                # frame and 444x382 of the side one) in RGB. `build_policy_observation`
+                                # has already put the live frame through exactly that crop, so
+                                # taking its output writes a DAgger sample in the view's own
+                                # pixels; taking `robot_observation` writes a 480x640 BGR-or-RGB
+                                # frame that `validate_frame` rejects at flush time -- after the
+                                # correction has been driven and cannot be repeated.
+                                **{
+                                    camera_name: policy_observation[f'{_OBS_IMAGES_PREFIX}{camera_name}']
+                                    for camera_name in dagger_image_keys
+                                },
                             },
                             action_values=dagger_action,
                             task=dagger_task,
@@ -5194,7 +5274,12 @@ def run_inference(args: argparse.Namespace) -> int:
             elapsed_s = time.perf_counter() - loop_start_t
             sleep_s = max(1.0 / policy_fps - elapsed_s, 0.0)
 
-            if args.preview or command_status != 'pass' or step_idx % max(args.log_interval, 1) == 0:
+            if (
+                args.preview
+                or command_status != 'pass'
+                or command_source != 'policy'
+                or step_idx % max(args.log_interval, 1) == 0
+            ):
                 log_message = (
                     ('[PREVIEW] step=' if args.preview else '[INFO] step=')
                     + f"{step_idx} "
@@ -5282,6 +5367,24 @@ def run_inference(args: argparse.Namespace) -> int:
     dagger_dataset_handle, dagger_writer = dagger_open if dagger_open is not None else (None, None)
     dagger_features = dagger_dataset_features(dict(ds_meta.features)) if dagger_writer is not None else {}
     dagger_image_keys = image_source_keys(dagger_features) if dagger_writer is not None else []
+    # Checked here rather than at the first written frame, because a DAgger frame is only built
+    # while the operator is driving and the buffer is only flushed when the rollout ends: a
+    # schema problem found there costs the whole correction (measured: 476 expert steps of an
+    # insertion, lost at flush). The images come from the policy observation, so a camera the
+    # dataset carries and the policy does not read is one this loop cannot fill.
+    missing_dagger_images = [
+        camera_name
+        for camera_name in dagger_image_keys
+        if camera_name not in required_image_keys
+    ]
+    if missing_dagger_images:
+        raise SystemExit(
+            'DAgger corrections cannot be written for camera(s) '
+            f"{', '.join(missing_dagger_images)}: {ds_meta.repo_id} carries them but the policy "
+            'does not read them, so the rollout never builds an image in the view geometry. '
+            'Point --dagger-dataset-root at a dataset matching this policy, or record without '
+            '--dagger-takeover.'
+        )
     dagger_encode_delta, dagger_denormalize_gripper = (
         build_dagger_action_encoder(
             action_names,
@@ -5310,11 +5413,47 @@ def run_inference(args: argparse.Namespace) -> int:
         # device. A bounded scripted run has nobody to take the arm from the policy, and a
         # device connected but unattended is worse than one that was never opened.
         raise SystemExit('--dagger-takeover requires --interactive-rollouts.')
+    # Installed before the try that owns the shutdown, restored at the end of its finally, so
+    # every step of that shutdown runs under it. See the class for why it exists.
+    terminate_guard = TerminateAsKeyboardInterrupt()
+    terminate_guard.install()
     # Opened before the try so the finally can always close it: a stack created inside the try
     # is undefined if the statement above it raises, and the NameError that follows in the
     # finally would replace the error worth reading.
     dagger_encoding = ExitStack()
     try:
+        # The arm is connected here rather than several hundred lines earlier, because this try
+        # is what owns `robot.disconnect()`. Connected outside it, any exception in between --
+        # and everything above raises: an unloadable --dagger-dataset-root, a camera the policy
+        # does not read, a missing task prompt -- unwound the interpreter with the FCI control
+        # loop still live. panda_py's C++ control thread is then destroyed while joinable, which
+        # is `terminate called without an active exception`: the connection is severed instead
+        # of the controller being stopped, and the arm is dropped out of control mid-hold. A
+        # path typo should not be able to do that to a running arm.
+        robot.connect()
+        if args.mujoco_viewer:
+            mujoco_visualizer = FR3InferenceMujocoVisualizer(
+                model_path=mujoco_model_path,
+                max_chunk_points=args.mujoco_max_chunk_points,
+            )
+            mujoco_visualizer.start()
+        if args.align_gripper_to_dataset_start and not args.preview:
+            if dataset_start_gripper_mean_normalized is None:
+                print(
+                    '[WARN] align_gripper_to_dataset_start=fallback_open_gripper '
+                    'reason=dataset_start_states_do_not_include_gripper_values target=1.000'
+                )
+                align_gripper_to_dataset_start(
+                    robot,
+                    target_gripper_pos=1.0,
+                    tolerance=dataset_start_gripper_tolerance,
+                )
+            else:
+                align_gripper_to_dataset_start(
+                    robot,
+                    target_gripper_pos=float(dataset_start_gripper_mean_normalized),
+                    tolerance=dataset_start_gripper_tolerance,
+                )
         expert_takeover = build_expert_takeover(args, step_period_s=1.0 / policy_fps)
         # The recorder wraps its whole session in this for the same reason: episodes saved
         # inside it get their video finalized on the way out, and one saved outside it does not.
@@ -5356,7 +5495,9 @@ def run_inference(args: argparse.Namespace) -> int:
                         arm_at_start = False
                         continue
                     result = execute_scene_reset(robot, request)
-                    arm_at_start = bool(result.get('ok')) and bool(request.returnToStart)
+                    # Reported by the reset rather than inferred from ok+returnToStart: a failed
+                    # reset now homes too, and a successful one whose homing raised does not.
+                    arm_at_start = bool(result.get('returnedToStart'))
                     continue
                 if command == 'probe_pose':
                     payload = interactive_keyboard.pop_probe_pose_payload()
@@ -5416,7 +5557,14 @@ def run_inference(args: argparse.Namespace) -> int:
             close_camera_preview_window()
         if preview_sink is not None:
             preview_sink.close()
-        robot.disconnect()
+        # Guarded because connect() is now inside this try and can be what failed. disconnect()
+        # carries @check_if_not_connected, so calling it on an arm that never came up raises
+        # DeviceNotConnectedError from the finally and replaces the error worth reading.
+        if robot.is_connected:
+            robot.disconnect()
+        # Restored last, so every step above ran under the guard rather than under the default
+        # action, which would have killed a shutdown that was still in progress.
+        terminate_guard.restore()
 
     return 0
 

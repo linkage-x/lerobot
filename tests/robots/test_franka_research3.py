@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import logging
 from pathlib import Path
 import threading
@@ -28,6 +29,7 @@ from lerobot.robots.franka_research3 import FrankaResearch3, FrankaResearch3Conf
 from lerobot.robots.franka_research3 import backends as fr3_backends
 from lerobot.robots.franka_research3.backends import (
     FrankaHandGripperHardwareDriver,
+    RuckigOTGDriver,
     PandaPyArmDriver,
     PikaGripperHardwareDriver,
 )
@@ -43,6 +45,7 @@ from lerobot.processor.converters import (
     transition_to_observation,
     transition_to_robot_action,
 )
+from lerobot.utils.errors import DeviceNotConnectedError
 from lerobot.utils.rotation import Rotation
 import json
 
@@ -201,6 +204,46 @@ class DummyOTGDriver:
         target = np.asarray(target_joint_positions, dtype=np.float64)
         self.step_calls.append((current.copy(), target.copy()))
         return target.copy()
+
+
+class ScalingOTGDriver(DummyOTGDriver):
+    """A trajectory generator that can be told to run below its configured ceilings.
+
+    Records which steps were generated inside the scaled scope, not merely that the scope was
+    entered: a homing move that scales its limits and then steps outside them is exactly the bug
+    this double exists to catch. The background OTG loop steps this driver too, which is why the
+    window is recorded as a slice rather than the whole list being inspected.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scales: list[float] = []
+        self.scale_active: float | None = None
+        self.step_scales: list[float | None] = []
+        self.scaled_windows: list[tuple[int, int]] = []
+
+    @contextlib.contextmanager
+    def limits_scaled_by(self, scale: float):
+        self.scales.append(float(scale))
+        self.scale_active = float(scale)
+        entered_at = len(self.step_scales)
+        try:
+            yield
+        finally:
+            self.scaled_windows.append((entered_at, len(self.step_scales)))
+            self.scale_active = None
+
+    def step(self, current_joint_positions: np.ndarray, target_joint_positions: np.ndarray) -> np.ndarray:
+        self.step_scales.append(self.scale_active)
+        return super().step(current_joint_positions, target_joint_positions)
+
+
+class StuckOTGDriver(DummyOTGDriver):
+    """A trajectory generator that never arrives, so a homing move always spends its whole budget."""
+
+    def step(self, current_joint_positions: np.ndarray, target_joint_positions: np.ndarray) -> np.ndarray:
+        super().step(current_joint_positions, target_joint_positions)
+        return np.asarray(current_joint_positions, dtype=np.float64).copy()
 
 
 class FailingOTGDriver(DummyOTGDriver):
@@ -1605,6 +1648,43 @@ def test_get_observation_skips_cameras_when_disabled(robot):
     assert camera.read_latest_calls == 1
 
 
+def test_get_observation_adds_camera_context_to_stale_frame_timeout(robot):
+    class StaleCamera:
+        latest_timestamp = 123.0
+        thread = None
+        new_frame_event = None
+
+        def read_latest_with_timestamp(self, max_age_ms):
+            raise TimeoutError(f"stale at {max_age_ms}")
+
+    class FreshCamera:
+        latest_timestamp = 124.0
+        thread = None
+        new_frame_event = None
+
+        def read_latest_with_timestamp(self, max_age_ms):
+            del max_age_ms
+            return np.zeros((2, 2, 3), dtype=np.uint8), self.latest_timestamp
+
+    robot.connect()
+    robot.cameras = {"ee": StaleCamera(), "side": FreshCamera()}
+
+    with pytest.raises(TimeoutError) as exc_info:
+        robot.get_observation()
+
+    message = str(exc_info.value)
+    assert "stale at 100.0" in message
+    assert "FR3 camera_timeout_context failed_camera=ee" in message
+    assert "ee_z_m=0.3000" in message
+    assert "stage_ms=[arm_read=" in message
+    assert "gripper_read=" in message
+    assert "pre_camera=" in message
+    assert "ee:age_ms=" in message
+    assert "side:age_ms=" in message
+    assert "thread_alive=unknown" in message
+    assert "event_set=unknown" in message
+
+
 def test_get_observation_soft_syncs_cameras_from_frame_history(robot):
     class TimestampedCamera:
         def __init__(self, history):
@@ -2809,3 +2889,268 @@ def test_gripper_capture_timestamp_falls_back_for_a_backend_without_sampling_ins
     after = time.perf_counter() - robot._capture_timestamp_origin_s
 
     assert before <= observation["pika_gripper.capture_timestamp_s"] <= after
+
+
+def _homing_robot(monkeypatch, otg_driver_cls):
+    """A connected robot with a start keyframe, so homing goes through the OTG rather than libfranka."""
+
+    DummyOTGDriver.instances = []
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", UpdatingJointArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", otg_driver_cls)
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+            start_joint_positions=(0.0, -0.785, 0.0, -2.355, 0.0, 1.57079, 0.785),
+            start_move_timeout_s=1.0,
+        )
+    )
+    robot.connect()
+    return robot
+
+
+def test_move_to_start_generates_the_whole_move_at_the_requested_fraction_of_its_limits(monkeypatch):
+    robot = _homing_robot(monkeypatch, ScalingOTGDriver)
+
+    try:
+        robot.move_to_start(speed_scale=0.25)
+
+        otg = DummyOTGDriver.instances[-1]
+        assert otg.scales == [0.25]
+        # The whole move is generated inside the scope, not merely near it: the window is
+        # non-empty, so the trajectory was stepped while the ceilings were down.
+        (entered_at, left_at), = otg.scaled_windows
+        assert left_at > entered_at
+        assert set(otg.step_scales[entered_at:left_at]) == {0.25}
+        assert np.allclose(
+            otg.step_calls[left_at - 1][1], np.asarray(robot.config.start_joint_positions, dtype=np.float64)
+        )
+        # And the ceilings are given back, so the next teleop command is not quietly slowed too.
+        assert otg.scale_active is None
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
+
+
+def test_move_to_start_leaves_the_otg_limits_alone_by_default(monkeypatch):
+    robot = _homing_robot(monkeypatch, ScalingOTGDriver)
+
+    try:
+        robot.move_to_start()
+
+        otg = DummyOTGDriver.instances[-1]
+        assert otg.scales == []
+        assert otg.scaled_windows == []
+        assert otg.step_scales and set(otg.step_scales) == {None}
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
+
+
+def test_move_to_start_still_homes_an_otg_that_cannot_be_slowed(monkeypatch):
+    """The sim twin and older backends have no limit knob. Homing them must not become an error."""
+
+    robot = _homing_robot(monkeypatch, DummyOTGDriver)
+    target = np.asarray(robot.config.start_joint_positions, dtype=np.float64)
+
+    try:
+        robot.move_to_start(speed_scale=0.25)
+
+        assert np.allclose(robot._arm.set_joint_positions_calls[-1], target)
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
+
+
+def test_move_to_start_refuses_a_speed_scale_outside_the_range(monkeypatch):
+    robot = _homing_robot(monkeypatch, ScalingOTGDriver)
+
+    try:
+        with pytest.raises(ValueError, match=r"speed_scale must be in \(0, 1\]"):
+            robot.move_to_start(speed_scale=0.0)
+        with pytest.raises(ValueError, match=r"speed_scale must be in \(0, 1\]"):
+            robot.move_to_start(speed_scale=1.5)
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
+
+
+def test_move_to_start_stretches_its_timeout_by_the_same_factor_it_slows_the_arm(monkeypatch):
+    """A slower homing move must not report itself as an arm that failed to home.
+
+    `start_move_timeout_s` budgets a move at full speed. Cutting the speed without giving the
+    same fraction back to the budget would make `speed_scale` a way to manufacture timeouts on
+    an arm that is working perfectly. Measured against an OTG that never arrives, so what is
+    timed is the budget itself rather than how quickly the double happens to converge.
+    """
+
+    DummyOTGDriver.instances = []
+    monkeypatch.setattr(FrankaResearch3, "arm_driver_cls", UpdatingJointArmDriver)
+    monkeypatch.setattr(FrankaResearch3, "gripper_driver_cls", DummyGripperDriver)
+    monkeypatch.setattr(FrankaResearch3, "kinematics_driver_cls", DummyKinematicsDriver)
+    monkeypatch.setattr(FrankaResearch3, "otg_driver_cls", StuckOTGDriver)
+    robot = FrankaResearch3(
+        FrankaResearch3Config(
+            robot_ip="192.168.1.206",
+            gripper_port="/dev/ttyUSB80",
+            urdf_path="/tmp/fr3.urdf",
+            start_joint_positions=(0.0, -0.785, 0.0, -2.355, 0.0, 1.57079, 0.785),
+            start_move_timeout_s=0.05,
+        )
+    )
+    robot.connect()
+
+    try:
+        started_at = time.perf_counter()
+        with pytest.raises(RuntimeError, match="Timed out generating"):
+            robot.move_to_start()
+        full_speed_s = time.perf_counter() - started_at
+
+        started_at = time.perf_counter()
+        with pytest.raises(RuntimeError, match="Timed out generating"):
+            robot.move_to_start(speed_scale=0.25)
+        quarter_speed_s = time.perf_counter() - started_at
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
+
+    assert quarter_speed_s > full_speed_s * 2.5
+
+
+def test_iter_reach_errors_m_reports_how_far_ik_falls_short_of_each_point(saturating_robot):
+    """The arm's reach, asked for on the model before anything is commanded.
+
+    SaturatingKinematicsDriver runs out at x = 0.45 the way the real solver runs out at a joint
+    limit: it returns joints, never an error, so the shortfall is only visible by putting those
+    joints back through forward kinematics -- which is what this does.
+    """
+
+    saturating_robot.connect()
+    with saturating_robot._otg_target_lock:
+        target_before = saturating_robot._otg_target_joints.copy()
+
+    errors = list(
+        saturating_robot.iter_reach_errors_m(
+            [(0.40, 0.1, 0.3), (0.45, 0.1, 0.3), (0.60, 0.1, 0.3)],
+            (0.0, 0.0, 0.0),
+        )
+    )
+
+    assert errors[0] == pytest.approx(0.0, abs=1e-9)
+    assert errors[1] == pytest.approx(0.0, abs=1e-9)
+    assert errors[2] == pytest.approx(0.15, abs=1e-9)
+    # Asking must not be moving: the OTG is still holding the target it was left with.
+    with saturating_robot._otg_target_lock:
+        assert np.allclose(saturating_robot._otg_target_joints, target_before)
+
+
+def test_iter_reach_errors_m_solves_lazily_and_reseeds_from_each_solution(robot):
+    """Two properties that only hold together.
+
+    Lazy, so a caller that refuses at the first unreachable point does not pay the solver's full
+    iteration budget for the rest of the path. Re-seeded, because the solver is local: a point is
+    reachable or not from the configuration the arm arrives in, and seeding every point from the
+    arm's present joints would answer a question about a journey nothing takes.
+    """
+
+    robot.connect()
+    kinematics = robot._kinematics
+    kinematics.inverse_calls.clear()
+
+    errors = robot.iter_reach_errors_m([(0.3, 0.0, 0.2), (0.4, 0.0, 0.2), (0.5, 0.0, 0.2)], (0.0, 0.0, 0.0))
+    assert kinematics.inverse_calls == []
+
+    assert isinstance(next(errors), float)
+    assert len(kinematics.inverse_calls) == 1
+    assert np.allclose(kinematics.inverse_calls[0][0], robot._arm.joint_positions)
+    assert np.allclose(kinematics.inverse_calls[0][1][:3, 3], np.array([0.3, 0.0, 0.2]))
+    assert np.allclose(kinematics.inverse_calls[0][1][:3, :3], np.eye(3))
+
+    next(errors)
+    assert len(kinematics.inverse_calls) == 2
+    assert np.allclose(kinematics.inverse_calls[1][0], kinematics.inverse_solution)
+
+
+def test_iter_reach_errors_m_needs_a_connected_robot(robot):
+    with pytest.raises(DeviceNotConnectedError):
+        robot.iter_reach_errors_m([(0.3, 0.0, 0.2)], (0.0, 0.0, 0.0))
+
+
+@pytest.fixture
+def ruckig_otg(monkeypatch):
+    """RuckigOTGDriver against a stand-in ruckig, so the limit scaling itself is covered.
+
+    ruckig is a hardware/runtime dependency and is not installed for the test suite, but the
+    scaling is plain arithmetic on the input parameters and is exactly the part worth pinning:
+    it is what actually slows the arm down.
+    """
+
+    module = types.ModuleType("ruckig")
+
+    class InputParameter:
+        def __init__(self, dof):
+            self.dof = dof
+
+    class OutputParameter:
+        def __init__(self, dof):
+            self.dof = dof
+
+    class Ruckig:
+        def __init__(self, dof, dt):
+            self.dof = dof
+            self.dt = dt
+
+    class Result:
+        Working = "working"
+        Finished = "finished"
+
+    class Synchronization:
+        No = "none"
+        Phase = "phase"
+        Time = "time"
+
+    module.InputParameter = InputParameter
+    module.OutputParameter = OutputParameter
+    module.Ruckig = Ruckig
+    module.Result = Result
+    module.Synchronization = Synchronization
+    monkeypatch.setitem(sys.modules, "ruckig", module)
+
+    return RuckigOTGDriver(
+        dof=2,
+        dt=0.001,
+        max_velocity=[2.0, 4.0],
+        max_acceleration=[8.0, 8.0],
+        max_jerk=[4000.0, 4000.0],
+    )
+
+
+def test_ruckig_limits_scaled_by_scales_all_three_ceilings_and_puts_them_back(ruckig_otg):
+    with ruckig_otg.limits_scaled_by(0.25):
+        assert ruckig_otg._input.max_velocity == [0.5, 1.0]
+        assert ruckig_otg._input.max_acceleration == [2.0, 2.0]
+        assert ruckig_otg._input.max_jerk == [1000.0, 1000.0]
+
+    assert ruckig_otg._input.max_velocity == [2.0, 4.0]
+    assert ruckig_otg._input.max_acceleration == [8.0, 8.0]
+    assert ruckig_otg._input.max_jerk == [4000.0, 4000.0]
+
+
+def test_ruckig_limits_come_back_even_when_the_move_inside_fails(ruckig_otg):
+    """A homing move that raises must not leave the arm's ceilings quartered for teleop."""
+
+    with pytest.raises(RuntimeError, match="homing failed"):
+        with ruckig_otg.limits_scaled_by(0.25):
+            raise RuntimeError("homing failed")
+
+    assert ruckig_otg._input.max_velocity == [2.0, 4.0]
+
+
+def test_ruckig_refuses_a_scale_outside_the_range(ruckig_otg):
+    for scale in (0.0, -0.5, 1.5):
+        with pytest.raises(ValueError, match=r"scale must be in \(0, 1\]"):
+            with ruckig_otg.limits_scaled_by(scale):
+                pass

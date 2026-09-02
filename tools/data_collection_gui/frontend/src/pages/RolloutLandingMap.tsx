@@ -272,6 +272,22 @@ export function RolloutLandingMap({
                 strokeWidth={point.closed ? 1 : 2}
                 className={point.outcome === "pending" ? "landing-map-pending" : undefined}
               />
+              {/* A dashed ring, not a hollow dot and not a colour: both of those already mean
+                  something here (never gripped, and how far it got). This is a third, orthogonal
+                  fact -- the operator's hand put the gripper at this coordinate, so the point is
+                  real but it is not evidence about where the policy reaches. Marked rather than
+                  dropped: an intervention is usually a rescue, and dropping the rescued attempts
+                  would leave the map showing only the placements that went well. */}
+              {point.drivenBy === "expert" && (
+                <circle
+                  cx={cx}
+                  cy={cy}
+                  r={point.closed ? 9 : 10}
+                  fill="none"
+                  stroke={fill}
+                  className="landing-map-assisted"
+                />
+              )}
               <title>{point.title}</title>
             </g>
           );
@@ -316,6 +332,9 @@ export function RolloutLandingMap({
         <span><i className="dot aborted" /> aborted</span>
         <span><i className="dot pending" /> not graded</span>
         <span><i className="dot hollow" /> gripper never closed</span>
+        {rolloutPoints.some((point) => point.drivenBy === "expert") && (
+          <span><i className="dot assisted" /> 人工接管时的落点</span>
+        )}
       </div>
       <p className="hint">
         Landing points for <code>{checkpointId || "this checkpoint"}</code>, in the robot base

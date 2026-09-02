@@ -273,6 +273,27 @@ tool and task; the checkpoint's and driver's own defaults are the honest baselin
 from. The MuJoCo replay gate is still the thing to clear first, but note what it does *not* cover:
 it scores the recorded EE stream through IK, never the policy's output.
 
+#### DAgger corrections are written in the training view's pixels
+
+A takeover writes its corrected steps into a dataset whose schema is the *view* the policy was
+trained on, and a view's images are its own crop of the camera — 542x286 of `ee` and 444x382 of
+`side` for `fr3_spacemouse-insert__delta_ee_from_prev_cmd`, against 640x480 raw. So the frame
+handed to the writer is the one `build_policy_observation` produced (cropped, RGB, resized to the
+feature), not `robot_observation`'s raw image.
+
+Writing the raw image instead fails, and fails at the worst possible moment:
+
+```
+ValueError: The feature 'observation.images.side' of shape '(480, 640, 3)' does not have the
+expected shape '(382, 444, 3)' or '(444, 3, 382)'.
+```
+
+The buffer is only flushed when the rollout ends, so this raised *after* an operator had driven a
+476-step insertion, and took all of it with it. The launcher now refuses at startup if the
+dataset carries a camera the policy does not read (the rollout could not build an image in the
+view's geometry for it), rather than discovering the mismatch after the correction has been
+driven.
+
 #### Which frame is the tool, really
 
 `pika_task_tcp` is documented in the URDF as "midpoint between the two finger working points". It
@@ -868,6 +889,42 @@ guard, which is a number in this YAML rather than a sick camera.
 
 If it still fails after the automatic reset, replug the camera. `tools/fr3/fr3_realsense_preview.py`
 is the quickest way to confirm it is back before starting a session.
+
+### A camera that stops delivering because something is holding its frames
+
+```
+TimeoutError: RealSenseCamera(315122271876) latest frame is too old: 101.5 ms (max allowed:
+100.0 ms). FR3 camera_timeout_context failed_camera=ee ee_z_m=0.2971 cameras=[ee:age_ms=101.6,
+thread_alive=true,event_set=true; side:age_ms=93.8,thread_alive=true,event_set=true]
+```
+
+Read that line before looking for something slow: **both** cameras stale at once, both read
+threads alive, and the step that raised it had been finishing in 1.5 ms with 32 ms of sleep to
+spare. Nothing was late. The frames had stopped.
+
+What `get_data()` hands over is a pointer, not a picture. `np.asanyarray(frame.get_data())` wraps
+the librealsense frame's own buffer and keeps that frame alive for as long as the array lives, so
+an image that outlives the step it was read in is a frame the sensor cannot reuse. The pool is
+`RS2_OPTION_FRAMES_QUEUE_SIZE` frames — 16 by default — and when it is empty the camera does not
+drop the occasional frame, it stops.
+
+Found 2026-09-02 as: every interactive rollout died ~14 steps after the operator took the arm with
+the SpaceMouse, never otherwise. The DAgger takeover buffer keeps one image per corrected step
+*per camera*, so it empties both pools in lockstep — which is why both cameras go stale together
+and why the count was the same every time (13/14/14/14 expert steps across four runs). A probe
+holding one image per 30 Hz step reproduced it without the robot: delivery stopped at the twelfth
+held frame, the newest frame's age then grew one control period per step, 100 ms was crossed at
+the fourteenth, and releasing the images restored delivery within a frame period.
+
+Fixed at the source rather than in the consumer: `_postprocess_image` copies when neither the BGR
+conversion nor the rotation has already done so, so every image a camera hands out owns its
+pixels. It costs one memcpy per frame (0.9 MB at 640x480, ~55 MB/s at 60 fps) and it is what the
+BGR and rotated paths always did by construction — which is why recording, on BGR cameras, never
+saw this and rollout, on RGB ones, always did.
+
+The signature is worth keeping: **cameras stale together, threads alive, loop fast** means
+something is holding frames, not that something is slow. Any new consumer that keeps images — a
+preview ring, a replay buffer, a debug dump — is a candidate.
 
 ### Which frame each camera contributes
 

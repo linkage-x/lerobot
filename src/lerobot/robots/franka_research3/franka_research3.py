@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
+import contextlib
 from functools import cached_property
 import logging
 import threading
@@ -166,35 +168,60 @@ class FrankaResearch3(Robot):
         self.config.start_joint_positions = self._default_start_joint_positions
         return self._default_start_joint_positions
 
-    def _move_to_configured_start(self, target_joint_positions_rad: np.ndarray) -> np.ndarray:
+    @contextlib.contextmanager
+    def _otg_speed_scaled(self, speed_scale: float) -> Iterator[None]:
+        """Run the OTG at a fraction of its configured joint ceilings for the duration.
+
+        A no-op for an OTG backend that cannot be told -- the sim twin, the test doubles. A
+        trajectory generator that ignores the request is still correct, only not slower, and
+        refusing to home on a backend that lacks the knob would be the worse failure.
+        """
+
+        limits_scaled_by = None if self._otg is None else getattr(self._otg, "limits_scaled_by", None)
+        if speed_scale == 1.0 or not callable(limits_scaled_by):
+            yield
+            return
+        with limits_scaled_by(speed_scale):
+            yield
+
+    def _move_to_configured_start(
+        self, target_joint_positions_rad: np.ndarray, *, speed_scale: float = 1.0
+    ) -> np.ndarray:
         if self._arm is None:
             raise RuntimeError("Arm backend is not connected.")
         set_joint_positions = getattr(self._arm, "set_joint_positions", None)
         if not callable(set_joint_positions):
             raise RuntimeError("FR3 arm backend does not support set_joint_positions().")
 
+        speed_scale = float(speed_scale)
+        if not 0.0 < speed_scale <= 1.0:
+            raise ValueError(f"speed_scale must be in (0, 1], got {speed_scale}.")
+
         tolerance_rad = float(self.config.start_joint_tolerance_rad)
-        deadline_s = time.perf_counter() + float(self.config.start_move_timeout_s)
+        # Stretched by the same factor the speed is cut by. Slowing the arm down deliberately
+        # must not turn a homing move that works into a timeout that reports the arm as broken.
+        deadline_s = time.perf_counter() + float(self.config.start_move_timeout_s) / float(speed_scale)
         command_joint_positions_rad = self._read_joint_positions()
 
         if self._otg is None:
             set_joint_positions(target_joint_positions_rad)
         else:
-            self._otg.reset(command_joint_positions_rad)
-            while time.perf_counter() < deadline_s:
-                self._raise_if_otg_failed()
-                command_joint_positions_rad = np.asarray(
-                    self._otg.step(command_joint_positions_rad, target_joint_positions_rad),
-                    dtype=np.float64,
-                )
-                set_joint_positions(command_joint_positions_rad)
-                if np.max(np.abs(command_joint_positions_rad - target_joint_positions_rad)) <= tolerance_rad:
-                    break
-                precise_sleep(self.config.otg_dt)
-            else:
-                raise RuntimeError(
-                    "Timed out generating FR3 start-pose trajectory before reaching the configured keyframe."
-                )
+            with self._otg_speed_scaled(speed_scale):
+                self._otg.reset(command_joint_positions_rad)
+                while time.perf_counter() < deadline_s:
+                    self._raise_if_otg_failed()
+                    command_joint_positions_rad = np.asarray(
+                        self._otg.step(command_joint_positions_rad, target_joint_positions_rad),
+                        dtype=np.float64,
+                    )
+                    set_joint_positions(command_joint_positions_rad)
+                    if np.max(np.abs(command_joint_positions_rad - target_joint_positions_rad)) <= tolerance_rad:
+                        break
+                    precise_sleep(self.config.otg_dt)
+                else:
+                    raise RuntimeError(
+                        "Timed out generating FR3 start-pose trajectory before reaching the configured keyframe."
+                    )
 
         set_joint_positions(target_joint_positions_rad)
         while time.perf_counter() < deadline_s:
@@ -549,6 +576,55 @@ class FrankaResearch3(Robot):
 
         return self._reach_stall_error_m
 
+    @check_if_not_connected
+    def iter_reach_errors_m(
+        self,
+        tool_points: Sequence[Sequence[float]],
+        rotvec: Sequence[float],
+    ) -> Iterator[float]:
+        """How far IK falls short of each tool point, walked in order. Commands nothing.
+
+        The measurement `reach_stall_error_m` publishes during a move -- the distance between a
+        commanded tool point and the forward kinematics of the joints IK returned for it -- taken
+        on the model before anything is sent. It lets a caller refuse a trajectory outright
+        instead of discovering it with the arm half-way through and the peg in the gripper.
+
+        Seeded from the arm's current joints and re-seeded from each solution, because that is
+        what execution does: the solver is a local one, so whether a point is reachable depends on
+        the configuration the arm arrives in and not on the point alone. Feed it a densely sampled
+        path rather than bare waypoints, or the answer describes a journey nothing will take.
+
+        Lazy on purpose. An unreachable point costs the solver its whole iteration budget, and a
+        caller that stops at the first failure should not pay for the rest of the path.
+        """
+
+        joint_positions_rad = self._read_joint_positions()
+        rotation = Rotation.from_rotvec(np.asarray(rotvec, dtype=np.float64)).as_matrix()
+        ik_kwargs: dict[str, float] = {}
+        if self.config.ik_orientation_weight is not None:
+            ik_kwargs["orientation_weight"] = float(self.config.ik_orientation_weight)
+        return self._iter_reach_errors_m(joint_positions_rad, tool_points, rotation, ik_kwargs)
+
+    def _iter_reach_errors_m(
+        self,
+        joint_positions_rad: np.ndarray,
+        tool_points: Sequence[Sequence[float]],
+        rotation: np.ndarray,
+        ik_kwargs: dict[str, float],
+    ) -> Iterator[float]:
+        # Split out so the connection check and the joint read above happen when the caller asks,
+        # not whenever it gets round to the first point.
+        for point in tool_points:
+            desired_pose = np.eye(4, dtype=np.float64)
+            desired_pose[:3, :3] = rotation
+            desired_pose[:3, 3] = np.asarray(point, dtype=np.float64)
+            joint_positions_rad = np.asarray(
+                self._kinematics.inverse_kinematics(joint_positions_rad, desired_pose, **ik_kwargs),
+                dtype=np.float64,
+            )
+            realised_pose = self._compute_ee_pose(joint_positions_rad)
+            yield float(np.linalg.norm(realised_pose[:3, 3] - desired_pose[:3, 3]))
+
     def _note_reach_tracking(self, desired_pose: np.ndarray, target_joints_rad: np.ndarray) -> None:
         """Compare where the arm was told to go with where these joints actually put it.
 
@@ -722,14 +798,52 @@ class FrankaResearch3(Robot):
             PREV_CMD_GRIPPER_KEY: float(previous_command_gripper),
         }
 
+    def _camera_timeout_context(
+        self,
+        *,
+        failed_camera_name: str,
+        ee_pose: np.ndarray,
+        stage_timings_ms: dict[str, float] | None = None,
+    ) -> str:
+        now_s = time.perf_counter()
+        camera_states: list[str] = []
+        for camera_name, camera in self.cameras.items():
+            timestamp = getattr(camera, "latest_timestamp", None)
+            if timestamp is None:
+                age_text = "none"
+            else:
+                try:
+                    age_text = f"{(now_s - float(timestamp)) * 1e3:.1f}"
+                except (TypeError, ValueError):
+                    age_text = "invalid"
+            thread = getattr(camera, "thread", None)
+            thread_alive = "unknown" if thread is None else str(bool(thread.is_alive())).lower()
+            event = getattr(camera, "new_frame_event", None)
+            event_set = "unknown" if event is None else str(bool(event.is_set())).lower()
+            camera_states.append(
+                f"{camera_name}:age_ms={age_text},thread_alive={thread_alive},event_set={event_set}"
+            )
+        timing_text = ""
+        if stage_timings_ms:
+            timing_text = " stage_ms=[" + ",".join(
+                f"{name}={elapsed_ms:.1f}" for name, elapsed_ms in stage_timings_ms.items()
+            ) + "]"
+        return (
+            f" FR3 camera_timeout_context failed_camera={failed_camera_name} "
+            f"ee_z_m={float(ee_pose[2, 3]):.4f}{timing_text} cameras=[{'; '.join(camera_states)}]"
+        )
+
     @check_if_not_connected
     def get_observation(self, *, include_cameras: bool = True) -> RobotObservation:
         self._raise_if_otg_failed()
+        observation_start_s = time.perf_counter()
         joint_positions_rad, arm_capture_timestamp_s = self._read_joint_positions_with_timestamp()
+        after_arm_read_s = time.perf_counter()
         ee_pose = self._compute_ee_pose(joint_positions_rad)
         self._cache_observation_state_snapshot(joint_positions_rad, ee_pose)
         ee_rotvec = Rotation.from_matrix(ee_pose[:3, :3]).as_rotvec()
         gripper_pos, gripper_capture_timestamp_s = self._read_gripper_position_with_timestamp()
+        after_gripper_read_s = time.perf_counter()
 
         observation: RobotObservation = {
             "ee.x": float(ee_pose[0, 3]),
@@ -750,25 +864,41 @@ class FrankaResearch3(Robot):
         get_tactile_observation = getattr(self._gripper, 'get_tactile_observation', None)
         if callable(get_tactile_observation):
             observation.update(get_tactile_observation())
+        before_camera_read_s = time.perf_counter()
+        stage_timings_ms = {
+            "arm_read": (after_arm_read_s - observation_start_s) * 1e3,
+            "gripper_read": (after_gripper_read_s - after_arm_read_s) * 1e3,
+            "pre_camera": (before_camera_read_s - observation_start_s) * 1e3,
+        }
         if include_cameras:
             latest_samples: dict[str, tuple[np.ndarray, float]] = {}
             for camera_name, camera in self.cameras.items():
-                read_latest_with_timestamp = getattr(camera, "read_latest_with_timestamp", None)
-                if callable(read_latest_with_timestamp):
-                    latest_samples[camera_name] = read_latest_with_timestamp(
-                        max_age_ms=self.config.camera_max_age_ms
-                    )
-                else:
-                    try:
-                        frame = camera.read_latest(max_age_ms=self.config.camera_max_age_ms)
-                    except TypeError as exc:
-                        if "max_age_ms" not in str(exc):
-                            raise
-                        frame = camera.read_latest()
-                    latest_samples[camera_name] = (
-                        frame,
-                        float(getattr(camera, "latest_timestamp", time.perf_counter())),
-                    )
+                try:
+                    read_latest_with_timestamp = getattr(camera, "read_latest_with_timestamp", None)
+                    if callable(read_latest_with_timestamp):
+                        latest_samples[camera_name] = read_latest_with_timestamp(
+                            max_age_ms=self.config.camera_max_age_ms
+                        )
+                    else:
+                        try:
+                            frame = camera.read_latest(max_age_ms=self.config.camera_max_age_ms)
+                        except TypeError as exc:
+                            if "max_age_ms" not in str(exc):
+                                raise
+                            frame = camera.read_latest()
+                        latest_samples[camera_name] = (
+                            frame,
+                            float(getattr(camera, "latest_timestamp", time.perf_counter())),
+                        )
+                except TimeoutError as exc:
+                    raise TimeoutError(
+                        f"{exc}"
+                        f"{self._camera_timeout_context(
+                            failed_camera_name=camera_name,
+                            ee_pose=ee_pose,
+                            stage_timings_ms=stage_timings_ms,
+                        )}"
+                    ) from exc
 
             if latest_samples:
                 # Anchor every camera on the oldest of their latest frames and take each
@@ -810,7 +940,18 @@ class FrankaResearch3(Robot):
         return observation
 
     @check_if_not_connected
-    def move_to_start(self) -> None:
+    def move_to_start(self, speed_scale: float = 1.0) -> None:
+        """Drive the arm back to its start pose.
+
+        `speed_scale` in (0, 1] runs the move at that fraction of the OTG's configured joint
+        ceilings, which are the arm's rated maxima. It defaults to 1.0 so the between-episode
+        homing every recorder does is unchanged; the caller that turns it down is the scene
+        reset, which reaches homing from half-finished trajectories with the peg still gripped.
+
+        It has no effect on the backend's own `move_to_start()` -- the path taken when no start
+        keyframe is configured -- because that motion is generated inside libfranka.
+        """
+
         self._raise_if_otg_failed()
         self._clear_observation_state_snapshot()
         if self._arm is None:
@@ -832,7 +973,9 @@ class FrankaResearch3(Robot):
                 move_to_start()
                 moved_joint_positions_rad = self._read_joint_positions()
             else:
-                moved_joint_positions_rad = self._move_to_configured_start(configured_start)
+                moved_joint_positions_rad = self._move_to_configured_start(
+                    configured_start, speed_scale=speed_scale
+                )
         finally:
             self._reset_teleop_state()
             if otg_enabled:

@@ -28,7 +28,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from lerobot.cameras.configs import Cv2Rotation
+from lerobot.cameras.configs import ColorMode, Cv2Rotation
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 rs = pytest.importorskip("pyrealsense2")
@@ -261,6 +261,51 @@ def test_rotation(rotation):
             assert camera.width == 640
             assert camera.height == 480
             assert img.shape[:2] == (480, 640)
+
+
+@pytest.mark.parametrize(
+    ("color_mode", "rotation"),
+    [
+        (ColorMode.RGB, Cv2Rotation.NO_ROTATION),
+        (ColorMode.BGR, Cv2Rotation.NO_ROTATION),
+        (ColorMode.RGB, Cv2Rotation.ROTATE_90),
+    ],
+    ids=["rgb_unrotated", "bgr", "rgb_rot90"],
+)
+def test_a_postprocessed_image_never_shares_the_sdk_frame_buffer(color_mode, rotation):
+    """A returned image must not keep a frame checked out of the sensor's pool.
+
+    `np.asanyarray(frame.get_data())` is a view of the SDK's buffer, and the frame stays alive
+    for as long as the view does. The RGB unrotated path used to return that view untouched, so
+    every consumer that kept an image kept a frame: the DAgger takeover buffer emptied the pool
+    (16 frames by default) after twelve corrected steps and the camera stopped delivering.
+    """
+    camera = RealSenseCamera(
+        RealSenseCameraConfig(
+            serial_number_or_name="042",
+            fps=30,
+            width=640,
+            height=480,
+            color_mode=color_mode,
+            rotation=rotation,
+        )
+    )
+    sdk_buffer = np.zeros((camera.capture_height, camera.capture_width, 3), dtype=np.uint8)
+
+    processed = camera._postprocess_image(sdk_buffer)
+
+    assert not np.shares_memory(processed, sdk_buffer)
+    assert processed.flags["OWNDATA"]
+
+
+def test_the_frames_a_camera_hands_out_can_be_held():
+    """The end of the same path, through the read thread the robot actually reads from."""
+    config = RealSenseCameraConfig(serial_number_or_name="042", width=640, height=480, fps=30, warmup_s=0)
+    with RealSenseCamera(config) as camera:
+        img = camera.read()
+
+        assert img.flags["OWNDATA"]
+        assert img.base is None
 
 
 def _frame_stub(domain, timestamp_ms):

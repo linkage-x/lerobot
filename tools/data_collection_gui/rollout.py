@@ -65,8 +65,45 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_RTC_REPLAN_QUEUE_SIZE",
     "FR3_RTC_INFERENCE_DELAY_STEPS",
     "FR3_COMMAND_EMA_ALPHA",
+    # DAgger takeover. Cleared from the inherited environment like the rest, and for a sharper
+    # reason: a shell that once exported FR3_DAGGER_TAKEOVER=1 would otherwise open a second
+    # action source onto a moving arm in a rollout the browser never asked to be steerable.
+    "FR3_DAGGER_TAKEOVER",
+    "FR3_DAGGER_DATASET_ROOT",
+    "FR3_DAGGER_RELEASE_AFTER_S",
 )
 RTC_MODES = {"auto", "enabled", "disabled"}
+
+# Where corrections go when the operator turns takeover on and names no directory. One directory
+# per checkpoint, not per launch: a DAgger dataset is only worth training on once it has enough
+# corrections in it, and the states being corrected are the states *this* policy walks into. A
+# per-launch directory -- which is right for traces, whose whole job is to stay separable -- would
+# scatter one afternoon's corrections across six datasets too small to train on.
+#
+# Under `outputs/datasets` and not a directory of its own, because the gateway scans exactly one
+# level of that root for dataset roots (`_scan_datasets_root`). Anywhere else and the corrections
+# are invisible to the export page -- which is the page that merges them with the demonstrations
+# into the view the next checkpoint trains on. A dataset no tool on this machine can select is a
+# dataset that was not collected.
+DAGGER_ROOT = Path("outputs/datasets")
+DAGGER_PREFIX = "dagger_"
+
+# What `FR3_DAGGER_DATASET_ROOT` set to the empty string means between `sanitize_rollout_runtime_options`
+# and `build_rollout_command`: the operator answered the question and the answer was "nowhere".
+# Absent means they did not answer, which is the case that gets `dagger_dataset_dir`. The
+# distinction matters because the two must not collapse into one: a blank field that silently
+# meant "discard the corrections" is the failure the trace directory already taught us.
+DAGGER_STEER_ONLY = ""
+
+
+def dagger_dataset_dir(repo_root: Path, checkpoint_id: str) -> Path:
+    """The default dataset for corrections made against `checkpoint_id`.
+
+    Same flattening the log file uses, so the two land next to each other under names an operator
+    can pair up by eye.
+    """
+    flattened = checkpoint_id.replace("/", "_") or "unknown_checkpoint"
+    return repo_root / DAGGER_ROOT / f"{DAGGER_PREFIX}{flattened}"
 RTC_PREFIX_ATTENTION_SCHEDULES = {"EXP", "LINEAR", "ONES", "ZEROS"}
 
 
@@ -76,6 +113,13 @@ class RolloutMode:
 
     `movesArm` gates the confirmation the page requires. `interactive` decides whether the run
     is steered afterwards or simply runs to its end.
+
+    `takeover` is narrower than `interactive`: it is whether the *launcher* forwards the DAgger
+    flags to this mode. It does so only for `real` and `real_debug`, because the runtime refuses
+    `--dagger-takeover` without `--interactive-rollouts` and the launcher keeps the flags out of
+    the modes that would trip that. Carried here so the page can grey the switch out, and so the
+    request can be refused with a reason -- `real_once` would otherwise accept the setting, drop
+    it in the launcher's `case`, and run a rollout the operator believed they could steer.
     """
 
     id: str
@@ -83,6 +127,7 @@ class RolloutMode:
     description: str
     movesArm: bool
     interactive: bool
+    takeover: bool = False
 
 
 ROLLOUT_MODES: tuple[RolloutMode, ...] = (
@@ -124,6 +169,7 @@ ROLLOUT_MODES: tuple[RolloutMode, ...] = (
         "returns to waiting. The arm moves.",
         movesArm=True,
         interactive=True,
+        takeover=True,
     ),
     RolloutMode(
         "dagger_sim",
@@ -142,6 +188,7 @@ ROLLOUT_MODES: tuple[RolloutMode, ...] = (
         "target, clamped target and the action chunk. Needs a display on the rig machine.",
         movesArm=True,
         interactive=True,
+        takeover=True,
     ),
 )
 
@@ -217,6 +264,23 @@ def _set_optional_float_env(
     return parsed
 
 
+def _parse_bool_field(value: Any, field: str) -> bool:
+    """A switch, from whatever JSON the page sent for it.
+
+    Strings are accepted because the same options dict round-trips through `last_params.json`
+    and may be edited by hand there; anything that is not recognisably a yes or a no is refused
+    rather than treated as off, because for a takeover switch "off" is the answer that runs.
+    """
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
+        return False
+    raise RolloutError(f"{field} must be true or false; got {value!r}.")
+
+
 def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
     """Validate the Rollout page's optional runtime knobs and return launcher env values."""
     if raw in (None, ""):
@@ -267,6 +331,25 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
     )
     if ema is not None and ema > 1.0:
         raise RolloutError("commandEmaAlpha must be <= 1.")
+
+    if _parse_bool_field(raw.get("daggerTakeover", False), "daggerTakeover"):
+        options["FR3_DAGGER_TAKEOVER"] = "1"
+        if _parse_bool_field(raw.get("daggerRecord", True), "daggerRecord"):
+            root = _optional_text(raw.get("daggerDatasetRoot"))
+            if root:
+                if any(character in root for character in "\n\r\0"):
+                    raise RolloutError("daggerDatasetRoot must be a single path with no line breaks.")
+                options["FR3_DAGGER_DATASET_ROOT"] = root
+            # Left absent otherwise, for `build_rollout_command` to fill from the checkpoint. See
+            # DAGGER_STEER_ONLY for why the blank field is not allowed to mean "nowhere".
+        else:
+            options["FR3_DAGGER_DATASET_ROOT"] = DAGGER_STEER_ONLY
+        # 0 is meaningful: it turns off the automatic handback, leaving the latch as the only way
+        # in and out. Worth allowing from the page because it is how an operator rehearses the
+        # handoff without the arm deciding for them.
+        _set_optional_float_env(
+            options, raw, "daggerReleaseAfterS", "FR3_DAGGER_RELEASE_AFTER_S", minimum=0.0
+        )
     return options
 
 
@@ -289,6 +372,26 @@ class RolloutStatus:
     # was opened. The page uses it to say the device is armed, not to offer a button -- takeover
     # engages itself when the device moves.
     takeoverAvailable: bool = False
+    # The takeover pre-flight, read off the runtime's `dagger_takeover=ready` banner. `yes` is the
+    # only value a real rollout can print -- an undated driver is refused before the arm is even
+    # constructed -- so this is not a warning light, it is the operator's confirmation that the
+    # check ran. Empty means takeover was never armed for this launch.
+    daggerReportTimestamps: str = ""
+    # Seconds of a still device before the policy takes the arm back. 0 means automatic handback
+    # is off and only the hold latch moves the arm between the two drivers -- which is why the
+    # unknown case is None and not 0.0: the page says something different for each, and "we have
+    # not read the banner yet" must not render as "the arm will not hand itself back".
+    daggerReleaseAfterS: float | None = None
+    # Where corrections are being written, or empty when the operator chose to steer without
+    # recording. Shown for the reason `tracePath` is: an afternoon of corrections nobody can find
+    # afterwards is an afternoon of corrections nobody trains on.
+    daggerDatasetPath: str = ""
+    # Summed over the session, not per rollout: the question the operator is actually asking is
+    # "have I collected enough corrections to retrain yet", which no single rollout answers.
+    daggerEpisodes: int = 0
+    # Frames a rollout produced past --dagger-max-buffered-frames and had to drop. Non-zero means
+    # a correction was longer than the buffer, i.e. the dataset is missing the end of it.
+    daggerDroppedFrames: int = 0
     step: int = 0
     maxSteps: int = 0
     commandStatus: str = ""
@@ -322,6 +425,11 @@ class RolloutStatus:
     # the status rather than fetched separately because it arrives on the same log line that
     # raises `pendingOutcomeFor`, and the page draws the point before the operator grades it.
     lastRolloutGeometry: dict[str, Any] = field(default_factory=dict)
+    # Whether the operator took the arm during the last finished rollout, and for how many
+    # steps. Carried beside the geometry and for the same reason -- it arrives on the same end
+    # marker, and the page collects the grade before anything else could fetch it -- but kept a
+    # separate field because it qualifies the grade rather than describing where the arm went.
+    lastRolloutIntervention: dict[str, Any] = field(default_factory=dict)
 
 
 def build_rollout_command(
@@ -339,6 +447,7 @@ def build_rollout_command(
     preview_dir: Path = PREVIEW_DIR,
     preview_fps: float = PREVIEW_FPS,
     trace_dir: Path | None = None,
+    dagger_dataset_fallback: Path | None = None,
     base_env: dict[str, str] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """The launcher invocation for one rollout, plus the environment that configures it.
@@ -348,6 +457,10 @@ def build_rollout_command(
     answer for a checkpoint trained today and the wrong one for a checkpoint trained before a
     change -- and the dataset root recorded inside a checkpoint is an absolute path on whatever
     machine trained it, which need not be this one.
+
+    `dagger_dataset_fallback` is where corrections go when takeover is on and the operator named
+    no directory. Passed in rather than derived here because it is keyed to the checkpoint, which
+    this function knows only as a path on disk.
 
     `base_env` is whatever the caller needs the process to inherit (PYTHONPATH and friends).
     The rollout settings are applied *on top* of it and are never overwritten by it: an
@@ -369,6 +482,28 @@ def build_rollout_command(
         if key not in ROLLOUT_RUNTIME_ENV_KEYS:
             raise RolloutError(f"Unsupported rollout runtime environment key {key!r}.")
         env[key] = value
+
+    if env.get("FR3_DAGGER_TAKEOVER") == "1":
+        if not MODES_BY_ID[mode].takeover:
+            # Refused rather than dropped. The launcher forwards the DAgger flags to two modes
+            # only, so on any other one this setting is a no-op -- and a no-op here reads to the
+            # operator as a rollout they can grab the arm out of, which they cannot.
+            raise RolloutError(
+                f"{MODES_BY_ID[mode].label} does not take DAgger takeover: the runtime refuses it "
+                "without interactive rollouts. Use 'Interactive rollouts' or "
+                "'Interactive + MuJoCo viewer'."
+            )
+        if "FR3_DAGGER_DATASET_ROOT" not in env:
+            # Absent, not blank: the inherited copy was cleared above, so the only thing that can
+            # have put it here is this launch's own options. Blank is the operator saying
+            # "steer only" and is left exactly as it is; absent is a question nobody asked them,
+            # and the answer that loses corrections is not the one to default to.
+            if dagger_dataset_fallback is None:
+                raise RolloutError(
+                    "DAgger takeover needs somewhere to write corrections, and no default was "
+                    "supplied for this checkpoint."
+                )
+            env["FR3_DAGGER_DATASET_ROOT"] = str(dagger_dataset_fallback)
 
     env["FR3_INFER_CHECKPOINT"] = checkpoint_path
     env["FR3_MOVE_TO_START"] = "1" if move_to_start else "0"
@@ -420,12 +555,23 @@ _STATUS_RE = re.compile(r"\bstatus=([A-Za-z_]+)")
 _ROLLOUT_START_RE = re.compile(r"interactive_rollout_start index=(\d+)")
 _ROLLOUT_END_RE = re.compile(r"interactive_rollout_end index=(\d+) status=(\w+)")
 _KEYBOARD_BACKEND_RE = re.compile(r"keyboard_backend=(\w+)")
+_DAGGER_READY_RE = re.compile(r"dagger_takeover=ready\b")
+_DAGGER_TIMESTAMPS_RE = re.compile(r"\breport_timestamps=(\w+)")
+_DAGGER_RELEASE_RE = re.compile(r"\brelease_after_s=([\d.]+)")
+_DAGGER_DATASET_RE = re.compile(r"dagger_dataset=(created|extending)\s+root=(\S+)")
+_DAGGER_WRITTEN_RE = re.compile(
+    r"dagger_dataset_written\s+rollout=\d+\s+episodes=(\d+)\s+frames=(\d+)"
+    r"\s+skipped_spans=(\d+)\s+dropped_frames=(\d+)"
+)
 _ARM_AT_START_RE = re.compile(r"\barm_at_start=([01])\b")
 _HOMING_RE = re.compile(r"interactive_homing=(\w+)")
 _GEOMETRY_POINT_RE = re.compile(
     r"\b(grasp_xyz|release_xyz|approach_xyz)=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)"
 )
 _GEOMETRY_SCALAR_RE = re.compile(r"\b(apex_z|lift_m|descent_m)=(-?[\d.]+)")
+_GEOMETRY_DRIVER_RE = re.compile(r"\b(grasp_by|release_by|approach_by)=(policy|expert)")
+_INTERVENED_RE = re.compile(r"\bintervened=(\d+)")
+_EXPERT_STEPS_RE = re.compile(r"\bexpert_steps=(\d+)")
 _GEOMETRY_COUNT_RE = re.compile(r"\b(samples|held_steps|closed)=(\d+)")
 # The runtime writes these as log fields; the page reads them as JSON. Renamed at this single
 # crossing so neither side has to carry the other's convention.
@@ -439,6 +585,9 @@ _GEOMETRY_FIELD_NAMES = {
     "samples": "samples",
     "held_steps": "heldSteps",
     "closed": "closed",
+    "grasp_by": "graspBy",
+    "release_by": "releaseBy",
+    "approach_by": "approachBy",
 }
 
 
@@ -470,7 +619,36 @@ def parse_rollout_geometry(text: str) -> dict[str, Any]:
             continue
         field_name = _GEOMETRY_FIELD_NAMES[match.group(1)]
         geometry[field_name] = bool(value) if field_name == "closed" else value
+    # Who was driving at each of those instants. Carried with the point rather than derived from
+    # the rollout-level `intervened`, which cannot say *when*: an operator who took the arm after
+    # the grasp did not place it, and one who seated the peg did not leave the policy a success.
+    for match in _GEOMETRY_DRIVER_RE.finditer(text):
+        geometry[_GEOMETRY_FIELD_NAMES[match.group(1)]] = match.group(2)
     return geometry
+
+
+def parse_rollout_intervention(text: str) -> dict[str, Any]:
+    """Whether the operator drove part of this rollout, and for how many steps.
+
+    Kept apart from the geometry although it arrives on the same line: the landing points say
+    where the arm ended up, this says whose hand put it there. A rollout the operator finished
+    by hand says nothing about the policy's success rate, and a grade that cannot be told apart
+    from an unassisted one is how it ends up in that rate anyway.
+
+    The runtime prints `intervened=1` only when its own trace shows expert spans, so on a marker
+    that carries a summary at all, absence means no takeover. On one that does not -- a runtime
+    older than the field -- the answer is unknown, and the empty dict says so rather than
+    reporting an assisted rollout as clean.
+    """
+    if "samples=" not in text:
+        return {}
+    match = _INTERVENED_RE.search(text)
+    intervened = bool(match and match.group(1) != "0")
+    steps = _EXPERT_STEPS_RE.search(text)
+    return {
+        "intervened": intervened,
+        "expertSteps": int(steps.group(1)) if intervened and steps else 0,
+    }
 
 
 def parse_rollout_line(line: str) -> dict[str, Any]:
@@ -540,6 +718,7 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
         # Cleared here so the plot never shows the previous rollout's landing point attached to
         # the one now running.
         parsed["lastRolloutGeometry"] = {}
+        parsed["lastRolloutIntervention"] = {}
         parsed["message"] = f"Rollout {start_match.group(1)} running."
         return parsed
 
@@ -552,6 +731,7 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
         # the rollout starts, because a rollout that never finished has nothing to grade.
         parsed["pendingOutcomeFor"] = int(end_match.group(1))
         parsed["lastRolloutGeometry"] = parse_rollout_geometry(stripped)
+        parsed["lastRolloutIntervention"] = parse_rollout_intervention(stripped)
         parsed["message"] = f"Rollout {end_match.group(1)} ended ({end_match.group(2)})."
         return parsed
 
@@ -580,6 +760,52 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
     if "interactive_rollouts=stopped" in stripped:
         parsed["state"] = "complete"
         parsed["message"] = "Interactive rollout session ended."
+        return parsed
+
+    if _DAGGER_READY_RE.search(stripped):
+        # The device is open. Said here as well as on the control-channel line because this is the
+        # earlier of the two and the one carrying the pre-flight, and because the operator reads
+        # this banner before they touch anything.
+        parsed["takeoverAvailable"] = True
+        timestamps = _DAGGER_TIMESTAMPS_RE.search(stripped)
+        if timestamps:
+            parsed["daggerReportTimestamps"] = timestamps.group(1)
+        release = _DAGGER_RELEASE_RE.search(stripped)
+        if release:
+            try:
+                parsed["daggerReleaseAfterS"] = float(release.group(1))
+            except ValueError:
+                pass
+        parsed["message"] = "SpaceMouse armed for takeover: " + stripped[len("[INFO] ") :][:360]
+        return parsed
+
+    dataset_match = _DAGGER_DATASET_RE.search(stripped)
+    if dataset_match:
+        # The runtime's own answer, which can differ from the one this launch asked for: it
+        # resolves the path and says whether it created the dataset or is extending one. Extending
+        # is the ordinary case after the first session and is worth seeing, because the alternative
+        # -- a fresh dataset every time, from a path that moved -- looks identical on the page
+        # until training day.
+        parsed["daggerDatasetPath"] = dataset_match.group(2)
+        parsed["message"] = (
+            f"DAgger corrections {dataset_match.group(1)}: {dataset_match.group(2)}"
+        )
+        return parsed
+
+    written_match = _DAGGER_WRITTEN_RE.search(stripped)
+    if written_match:
+        episodes, frames, skipped, dropped = (int(written_match.group(i)) for i in (1, 2, 3, 4))
+        # Summed by the caller, not assigned: see `daggerEpisodes`. Reported under different names
+        # from the fields they add into, so a line that says "this rollout wrote two" can never be
+        # mistaken for "the session has two".
+        parsed["daggerEpisodesWritten"] = episodes
+        parsed["daggerDroppedFramesWritten"] = dropped
+        skipped_text = f", {skipped} too short to keep" if skipped else ""
+        parsed["message"] = (
+            f"Wrote {episodes} correction episode(s), {frames} frames{skipped_text}."
+            if episodes
+            else f"No corrections to write from that rollout{skipped_text or '.'}"
+        )
         return parsed
 
     backend_match = _KEYBOARD_BACKEND_RE.search(stripped)

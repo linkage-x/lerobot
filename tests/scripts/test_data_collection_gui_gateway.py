@@ -1832,7 +1832,10 @@ def test_approve_mujoco_report_rechecks_metrics_instead_of_bypassing_failure(tmp
 
     assert state.replay.mujocoValidation["status"] == "failed"
     assert state.replay.mujocoValidation["maxPositionErrorMm"] == pytest.approx(104.3)
-    assert state.replay.safety == "fault"
+    # The verdict is about the trajectory, so it stays in `mujocoValidation`. `safety` describes
+    # the rig, which this told nobody anything about -- see the two tests in
+    # test_fr3_gui_record_and_sync.py that own that rule.
+    assert state.replay.safety == "locked"
     with pytest.raises(RuntimeError, match="MuJoCo validation required"):
         gateway._require_mujoco_validation(state)
     assert gateway._require_mujoco_validation(
@@ -2464,7 +2467,9 @@ def test_mujoco_validation_fails_when_metrics_exceed_threshold(tmp_path):
 
     assert state.replay.mujocoValidation["status"] == "failed"
     assert "max position error" in state.replay.mujocoValidation["message"]
-    assert state.replay.safety == "fault"
+    # A badly scoring trajectory is not a sick machine: the score fails, `safety` is left to the
+    # preflight that is the only thing entitled to speak for the rig.
+    assert state.replay.safety == "locked"
 
 
 def test_mujoco_validation_requires_structured_result(tmp_path):
@@ -5192,11 +5197,33 @@ def test_takeover_is_a_control_word_the_gateway_will_forward(tmp_path):
     state.rollout_process = process
     state.rollout.interactive = True
     state.rollout.state = "rolling"
+    # Armed, because that is the only rollout where Hold means anything: the runtime binds the
+    # key to a device, and the case where it did not is the test below.
+    state.rollout.takeoverAvailable = True
 
     result = gateway._send_rollout_control(state, "takeover")
 
     assert result["ok"] is True
     assert process.written == [b"takeover\n"]
+
+
+def test_holding_a_rollout_that_has_no_device_is_refused_on_screen(tmp_path):
+    """The runtime would answer this with one log line among thousands.
+
+    An operator pressing Hold is reaching for a brake. If there is none, they have to be told
+    where they are looking, not left to infer it from an arm that kept moving.
+    """
+    state = _rollout_state(tmp_path)
+    process = _FakeControlProcess()
+    state.rollout_process = process
+    state.rollout.interactive = True
+    state.rollout.state = "rolling"
+    state.rollout.takeoverAvailable = False
+
+    with pytest.raises(ValueError, match="no device to hold"):
+        gateway._send_rollout_control(state, "takeover")
+
+    assert process.written == []
 
 
 def test_takeover_with_no_rollout_running_is_refused(tmp_path):

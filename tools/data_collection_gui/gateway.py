@@ -40,6 +40,7 @@ from tools.data_collection_gui import task_ladders
 from tools.data_collection_gui import training as training_backend
 from tools.fr3.scene_reset import (
     SceneResetError,
+    parse_mask_strokes,
     pose_probe_command,
     sanitize_pose_probe_request,
     scene_reset_command,
@@ -5588,6 +5589,12 @@ def _apply_rollout_output(state: GatewayState, line: str) -> None:
             pass
         return
     parsed = rollout_backend.parse_rollout_line(line)
+    # Per-rollout counts, added rather than assigned: the runtime prints one of these lines at the
+    # end of each rollout and the operator's question spans the session.
+    episodes_written = int(parsed.pop("daggerEpisodesWritten", 0) or 0)
+    dropped_written = int(parsed.pop("daggerDroppedFramesWritten", 0) or 0)
+    status.daggerEpisodes += episodes_written
+    status.daggerDroppedFrames += dropped_written
     for key, value in parsed.items():
         if key == "state":
             # A stop the operator already asked for is not undone by a line the runtime wrote
@@ -5675,15 +5682,19 @@ def _rollout_last_params_path(state: GatewayState) -> Path:
     return state.repo_root / "outputs" / "logs" / "rollout" / "last_params.json"
 
 
-# The knobs the page may carry from one rollout to the next. `checkpointId` is not among them:
-# the reason to roll out again is almost always a different checkpoint, and a stale one would be
-# pre-selected under settings that look deliberate.
+# The knobs the page may carry from one rollout to the next, `checkpointId` among them. Tuning a
+# policy is the same checkpoint rolled out over and over, and finding its row again in a list of
+# forty was a click paid on every single run. Remembering it is a pre-selection and nothing more:
+# the contract check still runs against it, a checkpoint that has since been deleted simply does
+# not come back, and the operator can pick another before starting.
 #
-# `confirmMotion` and `overrideContract` are excluded for a stronger reason. They are the two
-# gates that stand between a click and an arm that moves, and between a click and a checkpoint
-# the rig has already reported as mismatched. A remembered "yes" is a gate that answers itself,
-# so both are re-asked on every start no matter what the last rollout did.
-_ROLLOUT_LAST_PARAM_KEYS = ("mode", "maxSteps", "moveToStart", "runtimeOptions")
+# `confirmMotion` and `overrideContract` stay excluded, and the checkpoint being remembered does
+# not weaken the reason. They are the two gates that stand between a click and an arm that moves,
+# and between a click and a checkpoint the rig has already reported as mismatched. A remembered
+# "yes" is a gate that answers itself, so both are re-asked on every start no matter what the
+# last rollout did -- including when the checkpoint that comes back is the one they were answered
+# for last time.
+_ROLLOUT_LAST_PARAM_KEYS = ("mode", "checkpointId", "maxSteps", "moveToStart", "runtimeOptions")
 
 
 def _record_rollout_params(state: GatewayState, params: dict[str, Any]) -> None:
@@ -5719,6 +5730,14 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
     if state.profile != "workstation":
         raise ValueError("Rollouts run on the workstation profile, which is where the FR3 is.")
     if _rollout_is_running(state):
+        if state.rollout.state == "stopped":
+            # Stopped, but not gone: the runtime is inside the shutdown the stop asked for, and
+            # that shutdown is where a DAgger dataset gets its footer written. Killing it to make
+            # room for the next rollout would throw away what the last one recorded.
+            raise ValueError(
+                "The last rollout is still shutting down -- it is closing its dataset and "
+                "releasing the arm. Try again in a few seconds."
+            )
         raise ValueError("A rollout is already running; stop it before starting another.")
     if _training_is_running(state) and str(payload.get("mode") or "") != "env":
         # Both want the GPU, and the rollout is the one with a deadline: a policy starved of
@@ -5779,6 +5798,9 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
         state,
         {
             "mode": mode.id,
+            # The validated id, not the raw one: what comes back next session is a checkpoint
+            # this machine was able to resolve, never a string that failed to name one.
+            "checkpointId": checkpoint_id,
             "maxSteps": int(payload.get("maxSteps") or 0),
             "moveToStart": bool(payload.get("moveToStart", True)),
             "runtimeOptions": payload.get("runtimeOptions")
@@ -5789,6 +5811,10 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     trace_dir = rollout_backend.trace_session_dir(state.repo_root, stamp)
+    # Keyed to the checkpoint rather than to this launch: see DAGGER_ROOT. Passed unconditionally
+    # because `build_rollout_command` uses it only when takeover is on and the operator named no
+    # directory of their own.
+    dagger_fallback = rollout_backend.dagger_dataset_dir(state.repo_root, checkpoint_id)
 
     command, env = rollout_backend.build_rollout_command(
         state.repo_root,
@@ -5802,6 +5828,7 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
         move_to_start=bool(payload.get("moveToStart", True)),
         runtime_options=runtime_options,
         trace_dir=trace_dir,
+        dagger_dataset_fallback=dagger_fallback,
         base_env=_tool_env(state.repo_root),
     )
 
@@ -5846,6 +5873,10 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
         startedAt=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         logPath=str(log_path),
         tracePath=str(trace_dir),
+        # From the resolved environment rather than from the payload, so the page shows the path
+        # the process was actually given -- including the derived default the operator never
+        # typed. Empty when takeover is off, and when it is on but they chose to steer only.
+        daggerDatasetPath=env.get("FR3_DAGGER_DATASET_ROOT", ""),
         previewDir=str(rollout_backend.PREVIEW_DIR),
     )
     state.log(
@@ -5948,6 +5979,14 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
         raise ValueError(
             f"{state.rollout.mode} is not an interactive mode; it runs to completion on its own."
         )
+    if command == "takeover" and not state.rollout.takeoverAvailable:
+        # The runtime would answer this with `interactive_pipe_takeover_ignored`, in the log, one
+        # line among thousands. The operator pressing Hold is reaching for a brake; they have to
+        # be told on screen that there is none, not left to infer it from an arm that kept going.
+        raise ValueError(
+            "This rollout was not started with DAgger takeover, so there is no device to hold "
+            "the arm with. Restart with takeover enabled."
+        )
     # Checked here as well as in the runtime, which drops a home request pressed mid-rollout.
     # Two gates because they answer different questions: the runtime's keeps the arm from moving
     # unattended, and this one gives the operator a reason on screen instead of a click that
@@ -5980,25 +6019,63 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
     return {"ok": True, "rollout": asdict(state.rollout)}
 
 
+# How long the runtime is given to act on the `quit` it was just sent, before its process group
+# is signalled. Not politeness: that shutdown is what closes the run's DAgger dataset --
+# `VideoEncodingManager.__exit__` calls `dataset.finalize()`, which flushes the buffered episode
+# metadata and writes the data parquet's footer. A SIGTERM sent in the same breath as the `quit`
+# kills the process wherever it stands, `finally` blocks and all, and leaves a root holding
+# frames nothing can open. On 2026-09-02 that cost a session of 432 recorded correction frames,
+# which read back as "Parquet magic bytes not found in footer".
+#
+# The wait ends on the process, not on the clock, so a rollout with nothing to write still stops
+# as promptly as it ever did. The length covers encoding a rollout's corrections on this rig --
+# two cameras, a few hundred frames -- because that encode happens inside the same shutdown.
+ROLLOUT_QUIT_GRACE_S = 20.0
+# After SIGTERM, before SIGKILL. The runtime turns SIGTERM into the same clean shutdown it does
+# for `quit`, so this is a second helping of the same grace rather than a countdown to a kill.
+ROLLOUT_TERM_GRACE_S = 10.0
+
+
+def _reap_rollout(process: subprocess.Popen[bytes], *, quit_sent: bool) -> None:
+    """Wait out the runtime's own shutdown, escalating only if it does not end.
+
+    Runs in a thread and off the state lock: the wait is seconds long, the lock is what every
+    status poll takes, and doing this inline would freeze the page for as long as the stop takes.
+    """
+
+    if quit_sent:
+        try:
+            process.wait(timeout=ROLLOUT_QUIT_GRACE_S)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+    try:
+        _terminate_process_group(process, timeout_s=ROLLOUT_TERM_GRACE_S)
+    except (OSError, ProcessLookupError):
+        # Lost the race with a process that exited while being signalled. Nothing to escalate to.
+        pass
+
+
 def _stop_rollout(state: GatewayState) -> dict[str, Any]:
     process = state.rollout_process
     if process is None or process.poll() is not None:
         return {"ok": True, "rollout": asdict(state.rollout), "message": "No rollout is running."}
     state.rollout.state = "stopped"
-    state.rollout.message = "Stopping rollout…"
+    state.rollout.message = "Stopping rollout; the runtime is closing its dataset and releasing the arm…"
     # Ask first: the runtime's quit path disconnects the robot through its own `finally`, which
-    # releases the arm in a controlled way. SIGTERM to the group is the fallback for a process
-    # that is no longer reading its stdin.
+    # releases the arm in a controlled way and closes any dataset the run was writing. Then give
+    # it the time to finish -- see ROLLOUT_QUIT_GRACE_S -- and signal the group only if it does
+    # not end on its own. A process whose stdin has gone never heard the request, so it is not
+    # granted the grace: for it, signalling is the only channel left.
+    quit_sent = False
     try:
         if process.stdin is not None:
             process.stdin.write(b"quit\n")
             process.stdin.flush()
+            quit_sent = True
     except (BrokenPipeError, OSError):
         pass
-    try:
-        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-    except (OSError, ProcessLookupError):
-        process.terminate()
+    Thread(target=_reap_rollout, args=(process,), kwargs={"quit_sent": quit_sent}, daemon=True).start()
     state.log("warn", f"Stopped rollout {state.rollout.mode} on {state.rollout.checkpointId}")
     return {"ok": True, "rollout": asdict(state.rollout)}
 
@@ -6016,6 +6093,10 @@ def _record_rollout_outcome(state: GatewayState, payload: dict[str, Any]) -> dic
         # page that could send its own would be able to record a grade against a point the
         # arm never visited.
         "geometry": dict(state.rollout.lastRolloutGeometry or {}),
+        # Same provenance rule, and the sharper case for it: the runtime counted the operator's
+        # steps off its own per-step trace, so a page cannot file a rollout it drove by hand as
+        # one the policy did alone.
+        "intervention": dict(state.rollout.lastRolloutIntervention or {}),
     }
     # Forwarded only when the page actually sent them, so an ungraded rollout reaches the log
     # as one instead of as stage 0 -- which is a real grade meaning "never reached the object".
@@ -6151,6 +6232,11 @@ def _serve_rollout_camera_still(
 # base-frame rectangle the plot draws, so a peg in the image and a landing point over it are
 # the same millimetres.
 _TABLE_PLANE_SUBDIR = Path("outputs") / "metrology" / "table_plane"
+# Beside the table plane, because it is the same kind of thing: a property of this table,
+# measured against the calibration in the directory next to it, that outlives the browser tab it
+# was drawn in. Deliberately not part of a run's `last_params` -- the Record page and the Rollout
+# page draw the same physical region, and neither should have to redraw what the other measured.
+_SCENE_RESET_MASK_PATH = Path("outputs") / "metrology" / "scene_reset_mask.json"
 # How close two probed points have to be for the second to mean "I misclicked the first".
 _TABLE_POINT_MERGE_M = 0.005
 
@@ -6160,6 +6246,55 @@ def _table_camera_key(raw: Any) -> str:
     if not camera_key or not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", camera_key):
         raise ValueError("camera must be a rollout camera key such as 'side'.")
     return camera_key
+
+
+def _scene_reset_mask_path(state: GatewayState) -> Path:
+    return state.repo_root / _SCENE_RESET_MASK_PATH
+
+
+def _load_scene_reset_mask(state: GatewayState) -> dict[str, Any]:
+    """The stored target region, or an empty one.
+
+    Never raises. A stored mask this process cannot read is a region the operator has to be able
+    to draw again, not a page that refuses to open -- the same degradation `load_calibration`
+    makes next door, and for the same reason.
+    """
+
+    try:
+        raw = json.loads(_scene_reset_mask_path(state).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"strokes": [], "updatedAt": ""}
+    try:
+        strokes = parse_mask_strokes(raw)
+    except SceneResetError:
+        return {"strokes": [], "updatedAt": ""}
+    updated_at = str(raw.get("updatedAt") or "") if isinstance(raw, dict) else ""
+    return {"strokes": [asdict(stroke) for stroke in strokes], "updatedAt": updated_at}
+
+
+def _save_scene_reset_mask(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Store the region the operator drew, validated exactly as a reset request would.
+
+    Validated on the way in rather than on the way out, so a mask that cannot be reset with is
+    refused while the operator is still looking at the canvas -- not a fortnight later, from a
+    file, with the drawing long gone.
+
+    Written through a temporary file for the reason the table plane is: this is overwritten on
+    every stroke, and a half-written mask read by the next page load would be a target region
+    with a piece missing.
+    """
+
+    strokes = parse_mask_strokes(payload.get("mask", payload))
+    record = {
+        "strokes": [asdict(stroke) for stroke in strokes],
+        "updatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    path = _scene_reset_mask_path(state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+    return {"ok": True, **record}
 
 
 def _table_plane_path(state: GatewayState, camera_key: str) -> Path:
@@ -11575,14 +11710,17 @@ def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> Non
         if contract.get("status") != "passed":
             reasons.extend(str(reason) for reason in contract.get("failures", []))
 
-    # MuJoCo validation is the robot-replay gate. A failed validation means the selected
-    # trajectory is not authorized for real motion, so surface it as a safety fault until the
-    # operator reruns validation or explicitly uses the failed-validation override path.
+    # The verdict goes in `mujocoValidation`, and nowhere else. `safety` answers a different
+    # question -- whether this rig has been checked and may move the real arm -- and a simulated
+    # replay is not evidence either way: writing "ready" here let a sim score put the word
+    # "ready" in front of an operator about to press a real-robot button, and writing "fault"
+    # reported a badly-scoring *trajectory* as a sick *machine*, hiding the robot-free controls
+    # that are exactly what the operator reaches for next. One variable, two questions, is the
+    # whole bug; the preflight owns `safety`, this owns the score.
     if reasons:
         validation["status"] = "failed"
         validation["message"] = "MuJoCo validation failed: " + "; ".join(reasons)
         state.replay.state = "aborted"
-        state.replay.safety = "fault"
     else:
         validation["status"] = "passed"
         validation["message"] = (
@@ -11590,7 +11728,6 @@ def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> Non
             f"within {max_pos_threshold:.2f}mm / {max_rot_threshold:.2f}deg"
         )
         state.replay.state = "complete"
-        state.replay.safety = "ready"
     state.replay.mujocoValidation = validation
     _refresh_mujoco_validation_current(state)
     if dataset_root is not None and _is_dataset_root(dataset_root):
@@ -13092,6 +13229,11 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/api/scene-reset/mask":
+            state = self.server.state
+            with state.lock:
+                _json_response(self, HTTPStatus.OK, {"ok": True, **_load_scene_reset_mask(state)})
+            return
         if path == "/api/rollout/last-params":
             with self.server.state.lock:
                 _json_response(
@@ -13633,6 +13775,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                             HTTPStatus.OK,
                             _send_rollout_control(state, str(body.get("command") or "")),
                         )
+                    return
+                if path == "/api/scene-reset/mask":
+                    with state.lock:
+                        _json_response(self, HTTPStatus.OK, _save_scene_reset_mask(state, body))
                     return
                 if path == "/api/rollout/scene-reset":
                     with state.lock:

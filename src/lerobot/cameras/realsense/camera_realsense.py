@@ -728,6 +728,26 @@ class RealSenseCamera(Camera):
         if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
             processed_image = cv2.rotate(processed_image, self.rotation)
 
+        if processed_image is image:
+            # Neither OpenCV call ran (RGB, unrotated), so this is still the zero-copy view of
+            # the SDK's frame buffer that `np.asanyarray(frame.get_data())` produced, and numpy
+            # keeps the frame alive for as long as any consumer holds the array. A held frame is
+            # one the sensor cannot reuse: the pool is `RS2_OPTION_FRAMES_QUEUE_SIZE` frames (16
+            # by default), and once it is empty the camera stops delivering entirely rather than
+            # dropping the odd frame.
+            #
+            # Consumers do hold them. Measured on the FR3 rig with the DAgger takeover buffer,
+            # which keeps one image per corrected step: delivery stopped at the twelfth held
+            # frame, the age of the newest frame then grew by a control period every step, and
+            # `camera_max_age_ms` aborted the rollout 14 steps after the operator took the arm --
+            # every time, on both cameras at once, because both are held by the same step.
+            # Releasing the images restored delivery immediately.
+            #
+            # So copy, and hand out an image the caller may keep. It costs one memcpy per frame
+            # (0.9 MB at 640x480x3, ~55 MB/s at 60 fps) and it is what the BGR and rotated paths
+            # above already do by construction.
+            processed_image = image.copy()
+
         return processed_image
 
     # A frame older than this cannot be a real acquisition delay; it means the two clocks were

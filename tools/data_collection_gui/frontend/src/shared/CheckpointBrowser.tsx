@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../apiClient";
 import type { Checkpoint, CheckpointListing, TrainingHost } from "../types";
 
@@ -30,6 +30,14 @@ export function successRate(checkpoint: Checkpoint): string {
   return `${outcomes.success}/${graded}`;
 }
 
+/** How many rows the picker opens on.
+ *
+ * The scan returns newest first, and the checkpoint an operator wants to roll out is almost
+ * always one of the last few trained. An unbounded table pushed the mode, safety and RTC
+ * controls -- the ones that have to be read before a run -- off the bottom of the page.
+ */
+const PICKER_VISIBLE = 10;
+
 const VERDICT_LABEL: Record<Checkpoint["verdict"], string> = {
   ok: "Matches rig",
   warn: "Check first",
@@ -57,11 +65,34 @@ export function checkpointMatches(checkpoint: Checkpoint, query: string): boolea
     .includes(needle);
 }
 
+/** Which checkpoint a remembered id resolves to, or null when it resolves to nothing.
+ *
+ * The Rollout page remembers its checkpoint by id, because an id is all the gateway records --
+ * and the object the page's contract gates are checked against does not exist until this list
+ * has been fetched. So a restore is a wait rather than an assignment: the id is held until a
+ * listing that contains it arrives.
+ *
+ * Two ways it comes to nothing, and both are answers rather than failures to retry:
+ *   - the operator has already picked something, which outranks anything a previous session did;
+ *   - the id is not in the listing, because the checkpoint was deleted or trained elsewhere.
+ */
+export function checkpointToRestore(
+  checkpoints: Checkpoint[],
+  restoreId: string,
+  selectedId: string
+): Checkpoint | null {
+  if (!restoreId || selectedId) return null;
+  return checkpoints.find((item) => item.id === restoreId) ?? null;
+}
+
 type Props = {
   /** "picker" hides the destructive actions and reports the selection upward. */
   mode: "manage" | "picker";
   selectedId?: string;
   onSelect?: (checkpoint: Checkpoint | null) => void;
+  /** Selected once the listing containing it arrives, then never again. The Rollout page uses
+   *  it to bring back the checkpoint the last rollout ran. */
+  restoreId?: string;
   /** Bump to force a refresh from outside (e.g. after a training run finishes). */
   refreshToken?: number;
   disabled?: boolean;
@@ -71,6 +102,7 @@ export function CheckpointBrowser({
   mode,
   selectedId = "",
   onSelect,
+  restoreId = "",
   refreshToken = 0,
   disabled = false
 }: Props) {
@@ -81,6 +113,7 @@ export function CheckpointBrowser({
   const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState("");
   const [hideBlocked, setHideBlocked] = useState(false);
+  const [showAll, setShowAll] = useState(false);
   const [expanded, setExpanded] = useState<string>("");
   const [selection, setSelection] = useState<string[]>([]);
   const [error, setError] = useState("");
@@ -109,6 +142,21 @@ export function CheckpointBrowser({
       (item) => checkpointMatches(item, query) && (!hideBlocked || item.verdict !== "block")
     );
   }, [listing, query, hideBlocked]);
+
+  // The manage view is a disk-reclamation tool: it has to show everything it offers to delete,
+  // so the cap is the picker's alone.
+  const visibleCheckpoints = useMemo(() => {
+    if (mode !== "picker" || showAll || checkpoints.length <= PICKER_VISIBLE) return checkpoints;
+    const head = checkpoints.slice(0, PICKER_VISIBLE);
+    // A checkpoint picked before the list was filtered or refreshed can sit past the cut.
+    // Dropping its row would leave the rollout controls below naming a checkpoint that is
+    // nowhere on screen, with the radio for it unreachable.
+    if (selectedId && !head.some((item) => item.id === selectedId)) {
+      const picked = checkpoints.find((item) => item.id === selectedId);
+      if (picked) head.push(picked);
+    }
+    return head;
+  }, [checkpoints, mode, selectedId, showAll]);
 
   const totalBytes = useMemo(
     // `last` is a symlink onto a numbered step, so counting it would double the newest
@@ -149,6 +197,20 @@ export function CheckpointBrowser({
       return next.length === current.length ? current : next;
     });
   }, [deletable]);
+
+  // One shot, tracked by the id itself so a later restore of a different id still fires. The
+  // list refreshes on a timer-free but frequent set of triggers (host switch, delete, the
+  // Training page's refresh token), and re-applying the restore on each of them would drag the
+  // page back to last session's checkpoint every time the operator picked a different one.
+  const restoredRef = useRef("");
+  useEffect(() => {
+    if (!restoreId || restoredRef.current === restoreId) return;
+    const picked = checkpointToRestore(listing?.checkpoints ?? [], restoreId, selectedId);
+    // Neither a match nor a selection: the listing holding it has not arrived yet, so wait.
+    if (!picked && !selectedId) return;
+    restoredRef.current = restoreId;
+    if (picked) onSelect?.(picked);
+  }, [listing, onSelect, restoreId, selectedId]);
 
   const toggleOne = (id: string) =>
     setSelection((current) =>
@@ -341,130 +403,145 @@ export function CheckpointBrowser({
       )}
 
       {checkpoints.length > 0 && (
-        <table className="table checkpoint-table">
-          <thead>
-            <tr>
-              {(mode === "picker" || canBulkDelete) && <th aria-label="select" />}
-              <th>Checkpoint</th>
-              <th>Policy</th>
-              <th>Dataset</th>
-              <th>Size</th>
-              <th>Rollouts</th>
-              <th>Verdict</th>
-              <th aria-label="actions" />
-            </tr>
-          </thead>
-          <tbody>
-            {checkpoints.map((checkpoint) => {
-              const isSelected = selectedId === checkpoint.id;
-              const isExpanded = expanded === checkpoint.id;
-              return [
-                <tr
-                  key={checkpoint.id}
-                  className={isSelected ? "selected-row" : undefined}
-                  onClick={
-                    mode === "picker" && !disabled ? () => onSelect?.(checkpoint) : undefined
-                  }
-                >
-                  {mode === "picker" && (
-                    <td>
-                      <input
-                        type="radio"
-                        name="checkpoint"
-                        checked={isSelected}
-                        disabled={disabled}
-                        onChange={() => onSelect?.(checkpoint)}
-                      />
-                    </td>
-                  )}
-                  {canBulkDelete && (
-                    <td>
-                      {!checkpoint.aliasOf && (
+        <div className={mode === "picker" ? "table-scroll" : undefined}>
+          <table className="table checkpoint-table">
+            <thead>
+              <tr>
+                {(mode === "picker" || canBulkDelete) && <th aria-label="select" />}
+                <th>Checkpoint</th>
+                <th>Policy</th>
+                <th>Dataset</th>
+                <th>Size</th>
+                <th>Rollouts</th>
+                <th>Verdict</th>
+                <th aria-label="actions" />
+              </tr>
+            </thead>
+            <tbody>
+              {visibleCheckpoints.map((checkpoint) => {
+                const isSelected = selectedId === checkpoint.id;
+                const isExpanded = expanded === checkpoint.id;
+                return [
+                  <tr
+                    key={checkpoint.id}
+                    className={isSelected ? "selected-row" : undefined}
+                    onClick={
+                      mode === "picker" && !disabled ? () => onSelect?.(checkpoint) : undefined
+                    }
+                  >
+                    {mode === "picker" && (
+                      <td>
                         <input
-                          type="checkbox"
-                          aria-label={`select ${checkpoint.id}`}
-                          checked={selection.includes(checkpoint.id)}
-                          disabled={disabled || busy}
-                          onClick={(event) => event.stopPropagation()}
-                          onChange={() => toggleOne(checkpoint.id)}
+                          type="radio"
+                          name="checkpoint"
+                          checked={isSelected}
+                          disabled={disabled}
+                          onChange={() => onSelect?.(checkpoint)}
                         />
+                      </td>
+                    )}
+                    {canBulkDelete && (
+                      <td>
+                        {!checkpoint.aliasOf && (
+                          <input
+                            type="checkbox"
+                            aria-label={`select ${checkpoint.id}`}
+                            checked={selection.includes(checkpoint.id)}
+                            disabled={disabled || busy}
+                            onClick={(event) => event.stopPropagation()}
+                            onChange={() => toggleOne(checkpoint.id)}
+                          />
+                        )}
+                      </td>
+                    )}
+                    <td>
+                      <strong>{checkpoint.jobName}</strong>
+                      <div className="cell-sub">
+                        step {checkpoint.step.toLocaleString()}
+                        {checkpoint.aliasOf ? ` · last → ${checkpoint.aliasOf}` : ""}
+                        {checkpoint.totalSteps
+                          ? ` of ${checkpoint.totalSteps.toLocaleString()}`
+                          : ""}
+                      </div>
+                    </td>
+                    <td>{checkpoint.policyType || "—"}</td>
+                    <td>
+                      <div className="cell-sub">{checkpoint.view.actionMode || "unknown contract"}</div>
+                      <div className="cell-sub">
+                        {checkpoint.view.exists
+                          ? `${checkpoint.view.episodes} ep · ${checkpoint.view.fps} fps`
+                          : "view not on this machine"}
+                      </div>
+                    </td>
+                    <td>{formatBytes(checkpoint.sizeBytes)}</td>
+                    <td>{successRate(checkpoint)}</td>
+                    <td>
+                      <span className={`pill pill-${verdictClass(checkpoint.verdict)}`}>
+                        {VERDICT_LABEL[checkpoint.verdict]}
+                      </span>
+                    </td>
+                    <td className="row-actions">
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setExpanded(isExpanded ? "" : checkpoint.id);
+                        }}
+                      >
+                        {isExpanded ? "Hide" : "Details"}
+                      </button>
+                      {mode === "manage" && isRemote && (
+                        <button
+                          type="button"
+                          disabled={busy || disabled}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void onFetch(checkpoint);
+                          }}
+                        >
+                          Fetch here
+                        </button>
+                      )}
+                      {mode === "manage" && !isRemote && !checkpoint.aliasOf && (
+                        <button
+                          type="button"
+                          className="danger"
+                          disabled={busy || disabled}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void onDelete(checkpoint);
+                          }}
+                        >
+                          Delete
+                        </button>
                       )}
                     </td>
-                  )}
-                  <td>
-                    <strong>{checkpoint.jobName}</strong>
-                    <div className="cell-sub">
-                      step {checkpoint.step.toLocaleString()}
-                      {checkpoint.aliasOf ? ` · last → ${checkpoint.aliasOf}` : ""}
-                      {checkpoint.totalSteps
-                        ? ` of ${checkpoint.totalSteps.toLocaleString()}`
-                        : ""}
-                    </div>
-                  </td>
-                  <td>{checkpoint.policyType || "—"}</td>
-                  <td>
-                    <div className="cell-sub">{checkpoint.view.actionMode || "unknown contract"}</div>
-                    <div className="cell-sub">
-                      {checkpoint.view.exists
-                        ? `${checkpoint.view.episodes} ep · ${checkpoint.view.fps} fps`
-                        : "view not on this machine"}
-                    </div>
-                  </td>
-                  <td>{formatBytes(checkpoint.sizeBytes)}</td>
-                  <td>{successRate(checkpoint)}</td>
-                  <td>
-                    <span className={`pill pill-${verdictClass(checkpoint.verdict)}`}>
-                      {VERDICT_LABEL[checkpoint.verdict]}
-                    </span>
-                  </td>
-                  <td className="row-actions">
-                    <button
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setExpanded(isExpanded ? "" : checkpoint.id);
-                      }}
-                    >
-                      {isExpanded ? "Hide" : "Details"}
-                    </button>
-                    {mode === "manage" && isRemote && (
-                      <button
-                        type="button"
-                        disabled={busy || disabled}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void onFetch(checkpoint);
-                        }}
-                      >
-                        Fetch here
-                      </button>
-                    )}
-                    {mode === "manage" && !isRemote && !checkpoint.aliasOf && (
-                      <button
-                        type="button"
-                        className="danger"
-                        disabled={busy || disabled}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void onDelete(checkpoint);
-                        }}
-                      >
-                        Delete
-                      </button>
-                    )}
-                  </td>
-                </tr>,
-                isExpanded ? (
-                  <tr key={`${checkpoint.id}-detail`} className="detail-row">
-                    <td colSpan={mode === "picker" || canBulkDelete ? 8 : 7}>
-                      <CheckpointDetail checkpoint={checkpoint} />
-                    </td>
-                  </tr>
-                ) : null
-              ];
-            })}
-          </tbody>
-        </table>
+                  </tr>,
+                  isExpanded ? (
+                    <tr key={`${checkpoint.id}-detail`} className="detail-row">
+                      <td colSpan={mode === "picker" || canBulkDelete ? 8 : 7}>
+                        <CheckpointDetail checkpoint={checkpoint} />
+                      </td>
+                    </tr>
+                  ) : null
+                ];
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {mode === "picker" && checkpoints.length > PICKER_VISIBLE && (
+        <div className="row-actions checkpoint-more">
+          <button type="button" onClick={() => setShowAll((value) => !value)}>
+            {showAll ? `Show newest ${PICKER_VISIBLE}` : `Show all ${checkpoints.length}`}
+          </button>
+          <span className="hint">
+            {showAll
+              ? `All ${checkpoints.length} checkpoints, newest first.`
+              : `Newest ${PICKER_VISIBLE} of ${checkpoints.length}, newest first.`}
+          </span>
+        </div>
       )}
 
       {mode === "manage" && (listing?.checkpoints?.length ?? 0) > 0 && (

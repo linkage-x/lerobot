@@ -1,4 +1,5 @@
-import type { RolloutGeometry, RolloutOutcomeEntry } from "../types";
+import type { EventDriver, RolloutGeometry, RolloutOutcomeEntry } from "../types";
+import { landingPointDriver } from "./rolloutAttribution";
 
 /** Turning graded rollouts into the dots on the landing map.
  *
@@ -22,6 +23,11 @@ export type PlottedPoint = {
   stage?: number;
   /** The stage that counted as success on the ladder that graded it. */
   terminalStage?: number;
+  /** Who put the gripper here. Drawn as a ring rather than as a colour or a hollow dot, both of
+   *  which already mean something else on this map: an operator-driven point is a real landing
+   *  point that says nothing about the policy's reach, so it has to stay visible and stay
+   *  distinguishable. Undefined on rollouts the runtime did not attribute. */
+  drivenBy?: EventDriver;
 };
 
 // A sequential ramp rather than a palette. `stage` is ordinal, so how far a rollout got has to
@@ -83,6 +89,9 @@ export function describe(
     parts.push(`stage ${grade.stage}${of}${grade.stageId ? ` ${grade.stageId}` : ""}`);
     if (grade.blocker && grade.blocker !== "unknown") parts.push(grade.blocker);
   }
+  if (landingPointDriver(geometry) === "expert") {
+    parts.push("operator was driving at this point");
+  }
   if (!geometry.closed) {
     parts.push("gripper never closed (approach point)");
   } else {
@@ -111,6 +120,7 @@ export function buildLandingPoints(
       at: entry.recordedAt,
       stage: entry.stage,
       terminalStage: entry.terminalStage,
+      drivenBy: landingPointDriver(entry.geometry),
       title: [
         describe(entry.geometry ?? {}, `${label} — ${entry.outcome}`, entry),
         entry.note ? `“${entry.note}”` : ""
@@ -135,6 +145,7 @@ export function buildLandingPoints(
       y: pendingPoint[1],
       outcome: "pending",
       closed: pendingGeometry?.closed ?? true,
+      drivenBy: landingPointDriver(pendingGeometry),
       at: "",
       title: describe(pendingGeometry ?? {}, `Rollout ${pendingIndex} — not graded yet`)
     });

@@ -106,3 +106,29 @@ suite("stage colours", () => {
     expect(point.title).toContain("object_pose_offset");
   });
 });
+
+suite("who produced a landing point", () => {
+  it("marks the point rather than dropping it when the operator was driving", () => {
+    // Dropping them would leave the map showing only the attempts that went well: an
+    // intervention is usually a rescue, so the rescued placements are exactly the interesting
+    // ones. The dot stays; a ring says whose hand put it there.
+    const assisted = entry("2026-08-31T04:06:01+00:00", "failure", [0.34, -0.13], 4);
+    assisted.geometry = { ...assisted.geometry, graspBy: "expert" };
+
+    const [point] = buildLandingPoints([assisted], 0, undefined);
+
+    expect(point.drivenBy).toBe("expert");
+    expect(point.title).toContain("operator was driving");
+  });
+
+  it("leaves a point from an older log unattributed rather than crediting the policy", () => {
+    const [point] = buildLandingPoints(
+      [entry("2026-08-31T04:06:01+00:00", "success", [0.34, -0.13], 5)],
+      0,
+      undefined
+    );
+
+    expect(point.drivenBy).toBeUndefined();
+    expect(point.title).not.toContain("operator was driving");
+  });
+});

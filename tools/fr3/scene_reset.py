@@ -10,6 +10,7 @@ fails the reset QC checks.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import inspect
 import json
 import math
 import random
@@ -24,12 +25,53 @@ except Exception:  # noqa: BLE001
 
 
 SCENE_RESET_LIFT_M = 0.08
+# How fast the commanded tool point may travel between waypoints, in m/s.
+#
+# A step used to send its waypoint as one absolute pose and leave the arm to find its own way
+# there. Between the post-grasp lift and the place approach that is a single 514 mm command, and
+# the OTG underneath is configured at the FR3's rated joint maxima, so the tool crossed it at
+# roughly a metre a second with the peg in the gripper. The teleop path never does this: the
+# driver clamps a relative command to `max_target_delta_pos`, 1 mm a step on this rig. But the
+# absolute-pose branch of `send_action` has no equivalent clamp, and a reset only ever uses that
+# branch, so the limit has to live here.
+#
+# Walking the setpoint also makes the straight line the QC samples the line the arm travels.
+# Sampling a segment the executor never commanded was checking a path nothing followed.
+SCENE_RESET_MAX_SPEED_MS = 0.15
+# How long the arm may be behind its own command before a step gives up, in seconds.
+#
+# `FrankaResearch3.reach_stall_error_m` is non-zero only when IK could not realise the pose it
+# was handed -- it compares two poses from the kinematics model, so servo lag and a slow gripper
+# do not show up in it. Under a rate-limited setpoint the command is never more than a few mm
+# ahead of the arm, so a reading that stays non-zero means the waypoint itself is out of reach
+# and waiting cannot help. Without this, a reset spent its whole 20 s timeout leaning on a joint
+# limit with the peg gripped.
+SCENE_RESET_REACH_STALL_S = 0.5
+# What fraction of the arm's rated joint speed a reset homes at.
+#
+# `move_to_start` is a joint-space move at the OTG's configured ceilings, which are the FR3's
+# rated maxima -- the same ceilings that turned a single large absolute command into a metre a
+# second across the table. Rate-limiting the reset's Cartesian steps and then homing flat out
+# would leave the fastest motion of a reset in the one step nobody was watching. A failed reset
+# reaches homing from states the success path never produces: mid-transfer, sometimes at the edge
+# of the arm's reach, usually still holding the peg.
+SCENE_RESET_HOMING_SPEED_SCALE = 0.25
 _SCENE_RESET_EPS = 1e-6
 _TRAJECTORY_QC_SAMPLE_STEP_M = 0.01
 
 
 class SceneResetError(ValueError):
     """A reset request that is invalid before a robot should move."""
+
+
+class SceneResetUnreachableError(RuntimeError):
+    """A waypoint IK cannot realise, found with the arm already part-way through the reset.
+
+    Deliberately not a `SceneResetError`: that one means the request was wrong before anything
+    moved and nothing needs recovering. This one is only knowable from the arm standing at the
+    edge of its own reach, so it leaves a trajectory half-executed and something holding the
+    peg. The caller's recovery differs accordingly -- see `_abort_scene_reset`.
+    """
 
 
 @dataclass(frozen=True)
@@ -139,6 +181,21 @@ def _parse_strokes(raw: Any) -> tuple[SceneResetStroke, ...]:
     return tuple(strokes)
 
 
+def parse_mask_strokes(raw: Any) -> tuple[SceneResetStroke, ...]:
+    """The same mask validation a reset request gets, but with "no region" allowed.
+
+    A reset with no target region has nowhere to put the peg, so the request parser refuses an
+    empty one. A *stored* mask is a different question: an operator who cleared the region has
+    said something, and the next page load has to hear "no region" rather than be handed back
+    the region they just deleted.
+    """
+
+    raw_strokes = raw.get("strokes") if isinstance(raw, dict) else raw
+    if isinstance(raw_strokes, list) and not raw_strokes:
+        return ()
+    return _parse_strokes(raw)
+
+
 def _sample_xy_from_strokes(strokes: tuple[SceneResetStroke, ...], rng: random.Random) -> tuple[float, float]:
     weights = [stroke.radiusM * stroke.radiusM for stroke in strokes]
     stroke = rng.choices(strokes, weights=weights, k=1)[0]
@@ -197,14 +254,83 @@ def _iter_segment_samples(
         yield tuple(a + (b - a) * alpha for a, b in zip(start, end, strict=True))  # type: ignore[misc]
 
 
+def _iter_reach_path(
+    points: list[tuple[str, tuple[float, float, float]]],
+) -> Iterable[tuple[str, tuple[float, float, float]]]:
+    """The QC's sampled path as one ordered walk, without the seam between segments repeated.
+
+    The workspace check can afford to sample each segment independently -- a box test has no
+    memory. The reach check cannot: it feeds each solution back in as the next seed, so a point
+    solved twice would quietly advance the walk by nothing while costing a solve.
+    """
+
+    for index, ((start_name, start), (end_name, end)) in enumerate(zip(points, points[1:], strict=False)):
+        for sample_index, sample in enumerate(_iter_segment_samples(start, end)):
+            if sample_index == 0 and index > 0:
+                continue
+            yield f"{start_name}->{end_name}[{sample_index}]", sample
+
+
+def _check_reach_along_path(
+    points: list[tuple[str, tuple[float, float, float]]],
+    reach_probe: Any,
+    tolerance_m: float,
+) -> int:
+    """Refuse a path the arm's own IK cannot follow, and say where it gives out.
+
+    The workspace fence is an axis-aligned box; the set of tool points reachable at a fixed tool
+    orientation is not, and the box is the larger of the two near the top. A place height that
+    passes the fence by 7 cm can still be 6 mm past the last configuration IK can find, and the
+    solver reports that by returning the joints it already had -- no exception, no flag. Asking it
+    here, on the model, is the difference between refusing a request and discovering it with the
+    peg 60 cm up.
+    """
+
+    labelled = list(_iter_reach_path(points))
+    checked = 0
+    # zip is what makes this lazy: a probe that yields per point stops being pulled the moment
+    # this raises, so an unreachable target does not pay for the rest of the trajectory.
+    for (label, xyz), error_m in zip(labelled, reach_probe([xyz for _label, xyz in labelled]), strict=False):
+        checked += 1
+        if error_m > tolerance_m:
+            raise SceneResetError(
+                f"trajectory QC failed: {label} at "
+                f"({xyz[0]:+.4f}, {xyz[1]:+.4f}, {xyz[2]:+.4f}) is {error_m * 1000.0:.1f} mm past what "
+                f"the arm can reach at this tool orientation, against a tolerance of "
+                f"{tolerance_m * 1000.0:.1f} mm. This is the arm's own reach, not the workspace "
+                f"fence -- lower the place height, or move the target region closer in."
+            )
+    return checked
+
+
+def _reach_probe(robot: Any, rotvec: tuple[float, float, float]) -> Any:
+    """The robot's own IK as a QC callable, or None for a robot that cannot answer.
+
+    Read through `getattr` for the reason `_reach_stall_error_m` is: the reset also runs against
+    the MuJoCo twin and the test fakes, and an arm that cannot check its own reach must not be
+    treated as an arm whose reach is exhausted.
+    """
+
+    iter_reach_errors_m = getattr(robot, "iter_reach_errors_m", None)
+    if not callable(iter_reach_errors_m):
+        return None
+    return lambda tool_points: iter_reach_errors_m(tool_points, rotvec)
+
+
 def validate_scene_reset_trajectory(
     request: SceneResetRequest,
     *,
     workspace_min: Iterable[float] | None = None,
     workspace_max: Iterable[float] | None = None,
     current_xyz: tuple[float, float, float] | None = None,
+    reach_probe: Any = None,
 ) -> dict[str, Any]:
-    """Run deterministic reset QC before any waypoint is sent to the robot."""
+    """Run deterministic reset QC before any waypoint is sent to the robot.
+
+    `reach_probe` is optional because this also runs gateway-side, where the request is checked
+    before any robot exists to ask. Where it is supplied, it is the last check and the slowest:
+    everything geometry can reject on its own is already gone by then.
+    """
 
     _validate_common_request_fields(request)
     low, high = _workspace_bounds(workspace_min, workspace_max)
@@ -230,11 +356,16 @@ def validate_scene_reset_trajectory(
         for sample_index, sample in enumerate(_iter_segment_samples(start, end)):
             _check_xyz_in_workspace(sample, f"segment:{start_name}->{end_name}[{sample_index}]", low, high)
 
+    reach_checked = 0
+    if reach_probe is not None:
+        reach_checked = _check_reach_along_path(points, reach_probe, request.toleranceM)
+
     return {
         "ok": True,
         "waypoints": len(waypoints),
         "liftM": SCENE_RESET_LIFT_M,
         "sampleStepM": _TRAJECTORY_QC_SAMPLE_STEP_M,
+        "reachCheckedPoints": reach_checked,
     }
 
 
@@ -372,6 +503,34 @@ def _distance(a: tuple[float, float, float], b: tuple[float, float, float]) -> f
     return math.sqrt(sum((ai - bi) ** 2 for ai, bi in zip(a, b, strict=True)))
 
 
+def _step_toward(
+    start: tuple[float, float, float],
+    goal: tuple[float, float, float],
+    max_step_m: float,
+) -> tuple[float, float, float]:
+    """The next setpoint along the straight line to `goal`, at most `max_step_m` from `start`."""
+
+    delta = tuple(g - s for s, g in zip(start, goal, strict=True))
+    distance = math.sqrt(sum(component * component for component in delta))
+    if distance <= max_step_m or distance <= 0.0:
+        return goal
+    scale = max_step_m / distance
+    return tuple(s + component * scale for s, component in zip(start, delta, strict=True))  # type: ignore[return-value]
+
+
+def _reach_stall_error_m(robot: Any) -> float:
+    """How far IK is behind the commanded pose, for a robot that can say. 0.0 for one that cannot.
+
+    Read through `getattr` because the reset also runs against the MuJoCo twin and the test
+    fakes, and an arm that cannot report a stall is not the same as one that is stalling.
+    """
+
+    try:
+        return max(0.0, float(getattr(robot, "reach_stall_error_m", 0.0) or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _scene_reset_waits_for_gripper_position(name: str) -> bool:
     # Once the peg is clamped, the measured opening is the peg thickness, not the closed command.
     # Waiting for `closedGripper` would block the lift and carry steps forever on a successful grasp.
@@ -396,17 +555,49 @@ def _run_step(
         f"xyz={xyz[0]:+.4f},{xyz[1]:+.4f},{xyz[2]:+.4f} gripper={gripper:.3f}",
         flush=True,
     )
-    deadline = time.perf_counter() + request.timeoutS
+    # Where the setpoint starts walking from. The previous step converged to within toleranceM
+    # of its own waypoint, so this is that waypoint up to a few mm -- close enough that the
+    # walked line and the line the QC sampled are the same line.
+    commanded, _start_rotvec, _start_gripper = _observation_xyz_rotvec_gripper(robot)
+    max_step_m = SCENE_RESET_MAX_SPEED_MS * request.controlPeriodS
+    # timeoutS keeps its meaning of "how long this step may take to settle"; the walk to the
+    # waypoint is granted on top of it. Folding travel into the timeout would turn slowing the
+    # setpoint down into a timeout on waypoints that are perfectly reachable.
+    deadline = (
+        time.perf_counter()
+        + request.timeoutS
+        + _distance(commanded, xyz) / SCENE_RESET_MAX_SPEED_MS
+    )
     last_error = ""
     position_reached_at: float | None = None
+    stalled_since: float | None = None
     while time.perf_counter() < deadline:
         now = time.perf_counter()
-        _send_absolute(robot, xyz, rotvec, gripper)
+        commanded = _step_toward(commanded, xyz, max_step_m)
+        _send_absolute(robot, commanded, rotvec, gripper)
         current_xyz, _current_rotvec, current_gripper = _observation_xyz_rotvec_gripper(robot)
+        stall_m = _reach_stall_error_m(robot)
+        if stall_m <= 0.0:
+            stalled_since = None
+        elif stalled_since is None:
+            stalled_since = now
+        elif now - stalled_since >= SCENE_RESET_REACH_STALL_S:
+            raise SceneResetUnreachableError(
+                f"scene reset step {name} asks for a tool point the arm cannot reach: IK has "
+                f"been {stall_m * 1000.0:.1f} mm short of the commanded pose for "
+                f"{now - stalled_since:.1f}s on the way to "
+                f"({xyz[0]:+.4f}, {xyz[1]:+.4f}, {xyz[2]:+.4f}). This is the arm's own reach at "
+                f"this tool orientation, not the workspace fence."
+            )
         pos_error = _distance(current_xyz, xyz)
         gripper_error = abs(current_gripper - gripper)
         last_error = f"pos_err_mm={pos_error * 1000.0:.1f} gripper_err={gripper_error:.3f}"
-        pos_ok = pos_error <= request.toleranceM
+        # The walked setpoint has to land on the waypoint before the step can be done, not merely
+        # get within toleranceM of it. Otherwise a step converges on the last interpolated point
+        # and the arm is left a few mm short of a coordinate that was asked for exactly -- which
+        # for the pose probe, whose whole job is putting the tool at a known base coordinate for
+        # the camera to be solved against, is calibration error rather than tracking error.
+        pos_ok = commanded == xyz and pos_error <= request.toleranceM
         gripper_ok = gripper_error <= request.gripperTolerance
         if pos_ok and position_reached_at is None:
             position_reached_at = now
@@ -436,6 +627,75 @@ def _run_step(
     raise TimeoutError(f"scene reset step {name} timed out: {last_error}")
 
 
+def _move_to_start(robot: Any) -> None:
+    """Home the arm, slowly on an arm that can be told to.
+
+    The signature is inspected rather than the call being retried on TypeError, so a TypeError
+    raised from inside a homing move is never mistaken for an older signature and silently
+    re-run at full speed. The MuJoCo twin and the test fakes take no argument and are homed as
+    they always were.
+    """
+
+    try:
+        accepts_speed_scale = "speed_scale" in inspect.signature(robot.move_to_start).parameters
+    except (TypeError, ValueError):
+        accepts_speed_scale = False
+    if accepts_speed_scale:
+        robot.move_to_start(speed_scale=SCENE_RESET_HOMING_SPEED_SCALE)
+    else:
+        robot.move_to_start()
+
+
+def _hold_where_it_is(robot: Any, gripper: float) -> None:
+    """Stop asking for the point the arm could not reach.
+
+    A step that fails leaves the driver's OTG target at the IK solution for a pose the arm never
+    realised, and nothing in the loop clears it: the arm goes on leaning into its own limit for
+    as long as the process lives, which is how a failed reset ended with the tool held 62 cm up,
+    straining, until the runtime was killed. Commanding the pose it is measurably at replaces
+    that target with one it is already holding.
+
+    The gripper keeps whatever it was last told. A reset that fails carrying the peg should not
+    also drop it from wherever it stopped.
+    """
+
+    xyz, rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+    _send_absolute(robot, xyz, rotvec, gripper)
+
+
+def _abort_scene_reset(robot: Any, request: SceneResetRequest, *, gripper: float) -> dict[str, Any]:
+    """Bring a failed reset to rest, and home the arm if the request asked for homing.
+
+    Every step here is wrapped, because recovery runs while an error is already being reported
+    and the operator needs to read that error rather than one raised trying to tidy up after it.
+    """
+
+    returned_to_start = False
+    try:
+        _hold_where_it_is(robot, gripper)
+        print(f"[INFO] scene_reset_abort=holding request_id={request.requestId}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - recovery must not replace the failure being reported
+        print(
+            f"[WARN] scene_reset_abort=hold_failed request_id={request.requestId} details={exc}",
+            flush=True,
+        )
+    if request.returnToStart:
+        try:
+            _move_to_start(robot)
+            returned_to_start = True
+            print(
+                f"[INFO] scene_reset_abort=returned_to_start request_id={request.requestId}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - same reason as the hold above
+            print(
+                f"[WARN] scene_reset_abort=return_to_start_failed "
+                f"request_id={request.requestId} details={exc}",
+                flush=True,
+            )
+    return {"returnedToStart": returned_to_start}
+
+
 def execute_scene_reset(robot: Any, request: SceneResetRequest) -> dict[str, Any]:
     """Execute the fixed-pick/random-place reset on an already connected FR3 robot."""
 
@@ -447,6 +707,9 @@ def execute_scene_reset(robot: Any, request: SceneResetRequest) -> dict[str, Any
             workspace_min=workspace_min,
             workspace_max=workspace_max,
             current_xyz=current_xyz,
+            # The tool orientation the whole reset is executed at, so the reach check asks about
+            # the poses that will actually be commanded rather than about bare points.
+            reach_probe=_reach_probe(robot, rotvec),
         )
     except SceneResetError as exc:
         print(f"[WARN] scene_reset=failed request_id={request.requestId} details=trajectory_qc_failed: {exc}", flush=True)
@@ -456,21 +719,38 @@ def execute_scene_reset(robot: Any, request: SceneResetRequest) -> dict[str, Any
         f"[INFO] scene_reset=start request_id={request.requestId} "
         f"pick_xyz={request.pickXyz[0]:+.4f},{request.pickXyz[1]:+.4f},{request.pickXyz[2]:+.4f} "
         f"target_xyz={request.targetXyz[0]:+.4f},{request.targetXyz[1]:+.4f},{request.targetXyz[2]:+.4f} "
-        f"lift_m={SCENE_RESET_LIFT_M:.3f} trajectory_qc=passed waypoints={qc['waypoints']}",
+        f"lift_m={SCENE_RESET_LIFT_M:.3f} trajectory_qc=passed waypoints={qc['waypoints']} "
+        f"reach_checked={qc['reachCheckedPoints']}",
         flush=True,
     )
+    # What the gripper was last told, so an abort can hold the arm still without deciding on its
+    # own whether the peg is dropped. Seeded open: nothing has been commanded yet at this point.
+    commanded_gripper = request.openGripper
     try:
         for waypoint in build_scene_reset_waypoints(request):
+            commanded_gripper = waypoint.gripper
             _run_step(robot, request, waypoint.name, waypoint.xyz, rotvec, waypoint.gripper)
         if request.returnToStart:
             print(f"[INFO] scene_reset_step=start request_id={request.requestId} name=return_to_start", flush=True)
-            robot.move_to_start()
+            _move_to_start(robot)
             print(f"[INFO] scene_reset_step=done request_id={request.requestId} name=return_to_start", flush=True)
         print(f"[INFO] scene_reset=done request_id={request.requestId}", flush=True)
-        return {"ok": True, "request": request.payload(), "trajectoryQc": qc}
+        return {
+            "ok": True,
+            "request": request.payload(),
+            "trajectoryQc": qc,
+            "returnedToStart": bool(request.returnToStart),
+        }
     except Exception as exc:  # noqa: BLE001 - the caller reports this without killing the gateway
         print(f"[WARN] scene_reset=failed request_id={request.requestId} details={exc}", flush=True)
-        return {"ok": False, "error": str(exc), "request": request.payload(), "trajectoryQc": qc}
+        recovery = _abort_scene_reset(robot, request, gripper=commanded_gripper)
+        return {
+            "ok": False,
+            "error": str(exc),
+            "request": request.payload(),
+            "trajectoryQc": qc,
+            **recovery,
+        }
 
 
 # ------------------------------------------------------------------------------ pose probe ---
@@ -529,8 +809,12 @@ def validate_pose_probe_trajectory(
     workspace_min: Iterable[float] | None = None,
     workspace_max: Iterable[float] | None = None,
     current_xyz: tuple[float, float, float] | None = None,
+    reach_probe: Any = None,
 ) -> dict[str, Any]:
-    """Run deterministic probe QC before any waypoint is sent to the robot."""
+    """Run deterministic probe QC before any waypoint is sent to the robot.
+
+    `reach_probe` as in the reset's QC: optional, last, and the only check that needs a robot.
+    """
 
     if request.timeoutS <= 0.0 or request.toleranceM <= 0.0 or request.controlPeriodS <= 0.0:
         raise SceneResetError("timeoutS, toleranceM and controlPeriodS must be positive.")
@@ -556,7 +840,15 @@ def validate_pose_probe_trajectory(
     for (start_name, start), (end_name, end) in zip(points, points[1:], strict=False):
         for sample_index, sample in enumerate(_iter_segment_samples(start, end)):
             _check_xyz_in_workspace(sample, f"segment:{start_name}->{end_name}[{sample_index}]", low, high)
-    return {"ok": True, "waypoints": len(waypoints), "clearanceM": POSE_PROBE_CLEARANCE_M}
+    reach_checked = 0
+    if reach_probe is not None:
+        reach_checked = _check_reach_along_path(points, reach_probe, request.toleranceM)
+    return {
+        "ok": True,
+        "waypoints": len(waypoints),
+        "clearanceM": POSE_PROBE_CLEARANCE_M,
+        "reachCheckedPoints": reach_checked,
+    }
 
 
 def sanitize_pose_probe_request(
@@ -621,6 +913,7 @@ def execute_pose_probe(robot: Any, request: PoseProbeRequest, *, on_arrival: Any
             workspace_min=workspace_min,
             workspace_max=workspace_max,
             current_xyz=current_xyz,
+            reach_probe=_reach_probe(robot, rotvec),
         )
     except SceneResetError as exc:
         print(f"[WARN] pose_probe=failed request_id={request.requestId} details=trajectory_qc_failed: {exc}", flush=True)
@@ -629,7 +922,8 @@ def execute_pose_probe(robot: Any, request: PoseProbeRequest, *, on_arrival: Any
     print(
         f"[INFO] pose_probe=start request_id={request.requestId} "
         f"xyz={request.xyz[0]:+.4f},{request.xyz[1]:+.4f},{request.xyz[2]:+.4f} "
-        f"clearance_m={POSE_PROBE_CLEARANCE_M:.3f} trajectory_qc=passed waypoints={qc['waypoints']}",
+        f"clearance_m={POSE_PROBE_CLEARANCE_M:.3f} trajectory_qc=passed waypoints={qc['waypoints']} "
+        f"reach_checked={qc['reachCheckedPoints']}",
         flush=True,
     )
     try:
@@ -643,4 +937,17 @@ def execute_pose_probe(robot: Any, request: PoseProbeRequest, *, on_arrival: Any
         return {"ok": True, "request": request.payload(), "trajectoryQc": qc}
     except Exception as exc:  # noqa: BLE001 - the caller reports this without killing the session
         print(f"[WARN] pose_probe=failed request_id={request.requestId} details={exc}", flush=True)
+        # Same reasoning as the reset's abort: a probe that runs out of reach leaves the OTG
+        # target on a pose the arm never made, and the waiting loop it returns to does not
+        # command the arm at all. There is nothing to home here -- the probe never claimed the
+        # start pose -- so the hold is the whole recovery.
+        try:
+            _hold_where_it_is(robot, request.gripper)
+            print(f"[INFO] pose_probe_abort=holding request_id={request.requestId}", flush=True)
+        except Exception as hold_exc:  # noqa: BLE001 - must not replace the failure above
+            print(
+                f"[WARN] pose_probe_abort=hold_failed request_id={request.requestId} "
+                f"details={hold_exc}",
+                flush=True,
+            )
         return {"ok": False, "error": str(exc), "request": request.payload(), "trajectoryQc": qc}

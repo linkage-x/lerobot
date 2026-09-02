@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 import json
+import os
+import signal
 import subprocess
 
 import numpy as np
@@ -15,7 +17,9 @@ from lerobot.cameras.configs import ColorMode, Cv2Backends
 from lerobot.cameras.gmsl2.configuration_gmsl2 import Gmsl2CameraConfig
 from lerobot.cameras.hikrobot.configuration_hikrobot import HikrobotCameraConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.datasets.utils import validate_frame
 from lerobot.robots.franka_research3 import FrankaResearch3Config
+from tools.fr3.dagger_dataset import build_dagger_frame, dagger_dataset_features
 from tools.fr3 import fr3_act_infer_real, fr3_act_infer_real_runtime
 
 
@@ -843,6 +847,53 @@ def test_build_policy_observation_without_a_crop_still_resizes_the_full_frame():
 
     assert observation['observation.images.side'].shape == (2, 3, 3)
     assert not np.array_equal(observation['observation.images.side'], frame[2:4, 1:4])
+
+
+def test_a_dagger_frame_carries_the_view_crop_not_the_raw_camera_frame():
+    """A DAgger correction is written in the schema of the view the policy was trained on.
+
+    A view's images are its own crop of the camera, so the robot's raw frame is the wrong shape
+    for the dataset the corrections are appended to -- and nothing notices until the buffer is
+    flushed, which is after the rollout has ended and the correction has been driven. One
+    insertion's 476 expert steps were lost to exactly that. The images therefore come from
+    `build_policy_observation`, which has already put the live frame through the view's crop.
+    """
+    input_features = {
+        'observation.images.side': PolicyFeature(type=FeatureType.VISUAL, shape=(3, 2, 3)),
+    }
+    raw_frame = np.arange(8 * 8 * 3, dtype=np.uint8).reshape(8, 8, 3)
+
+    policy_observation = fr3_act_infer_real_runtime.build_policy_observation(
+        _crop_state_observation(raw_frame),
+        state_names=[],
+        input_features=input_features,
+        camera_crop_specs={'observation.images.side': [1, 2, 3, 2]},
+        camera_crop_source_hw={'observation.images.side': (8, 8)},
+    )
+
+    view_features = dagger_dataset_features(
+        {
+            'observation.images.side': {
+                'dtype': 'video',
+                'shape': (2, 3, 3),
+                'names': ['height', 'width', 'channels'],
+            },
+        }
+    )
+
+    def dagger_frame(image):
+        return build_dagger_frame(
+            dataset_features=view_features,
+            observation_values={'side': image},
+            action_values={},
+            task='insert the peg',
+        )
+
+    # The recorder's own validator, which is what raised at flush time on the rig.
+    validate_frame(dagger_frame(policy_observation['observation.images.side']), view_features)
+
+    with pytest.raises(ValueError, match='does not have the expected shape'):
+        validate_frame(dagger_frame(raw_frame), view_features)
 
 
 def test_build_policy_observation_rejects_a_crop_drawn_on_another_frame_size():
@@ -1927,6 +1978,46 @@ def test_the_operator_s_stretches_come_back_as_spans_not_a_count():
     assert summary["expert_steps"] == 3
 
 
+def test_each_landing_point_says_who_was_driving_when_it_happened():
+    """Rollout-level `intervened` cannot answer this, and it is the question that decides both
+    the map and the grade: a grasp the policy made before the operator stepped in is still the
+    policy's, and a peg the operator seated is not the policy's success."""
+    # Closes at step 2 under the policy, operator takes over at 4, opens at 6 under the operator.
+    gripper = [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    positions = [(0.31, -0.22, z) for z in (0.20, 0.12, 0.05, 0.12, 0.13, 0.08, 0.06)]
+    sources = ["policy", "policy", "policy", "policy", "expert", "expert", "expert"]
+
+    summary = _trace_from(gripper, positions, sources=sources).summary()
+
+    assert summary["grasp_by"] == "policy"
+    assert summary["release_by"] == "expert"
+
+
+def test_a_rollout_that_never_gripped_still_says_who_reached():
+    gripper = [1.0, 1.0, 1.0]
+    positions = [(0.31, -0.22, z) for z in (0.20, 0.09, 0.14)]
+
+    summary = _trace_from(
+        gripper, positions, sources=["policy", "expert", "expert"]
+    ).summary()
+
+    assert summary["approach_xyz"] == [0.31, -0.22, 0.09]
+    assert summary["approach_by"] == "expert"
+    assert "grasp_by" not in summary
+
+
+def test_the_end_marker_carries_the_attribution_beside_each_point():
+    gripper = [1.0, 1.0, 0.0, 0.0, 1.0]
+    positions = [(0.31, -0.22, z) for z in (0.20, 0.12, 0.05, 0.09, 0.14)]
+
+    fields = _trace_from(
+        gripper, positions, sources=["policy", "policy", "policy", "expert", "expert"]
+    ).summary_log_fields()
+
+    assert "grasp_by=policy" in fields
+    assert "release_by=expert" in fields
+
+
 def test_the_end_marker_says_the_rollout_was_intervened():
     # On the marker because that is the line the page already reads. A rollout the operator drove
     # part of says nothing about the policy's success rate, and the reader has to be able to see
@@ -1941,3 +2032,55 @@ def test_the_end_marker_says_the_rollout_was_intervened():
     assert "intervened=1" in fields
     assert "expert_steps=2" in fields
     assert "expert_spans=1-2" in fields
+
+
+def test_a_sigterm_becomes_the_interrupt_a_shutdown_unwinds_on():
+    """The signal the gateway sends must reach the `finally` that closes the dataset.
+
+    Python's default action for SIGTERM is to die where it stands, which on 2026-09-02 cost a
+    session its DAgger dataset: the frames were written, `finalize()` never ran, and the parquet
+    came back with no footer.
+    """
+    guard = fr3_act_infer_real_runtime.TerminateAsKeyboardInterrupt(emit=lambda _line: None)
+    guard.install()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            os.kill(os.getpid(), signal.SIGTERM)
+    finally:
+        guard.restore()
+
+    assert guard.shutting_down is True
+
+
+def test_a_second_sigterm_does_not_interrupt_the_shutdown_it_started():
+    """The slow part of the shutdown *is* the dataset close.
+
+    An operator who presses stop twice, or a gateway escalating on a timer, must not land a
+    second exception in the middle of writing a parquet footer -- that is the same loss by a
+    different route. SIGKILL stays the escalation for a shutdown that never ends.
+    """
+    lines: list[str] = []
+    guard = fr3_act_infer_real_runtime.TerminateAsKeyboardInterrupt(emit=lines.append)
+    guard.install()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            os.kill(os.getpid(), signal.SIGTERM)
+        # No raise: the second one is absorbed, and says so.
+        os.kill(os.getpid(), signal.SIGTERM)
+    finally:
+        guard.restore()
+
+    assert any('ignored' in line for line in lines), lines
+
+
+def test_restoring_the_guard_gives_the_signal_back_to_whoever_had_it():
+    """Left installed, it would outlive the run and turn a later SIGTERM into an interrupt
+    raised in whatever the process had moved on to."""
+    previous = signal.getsignal(signal.SIGTERM)
+    guard = fr3_act_infer_real_runtime.TerminateAsKeyboardInterrupt(emit=lambda _line: None)
+
+    guard.install()
+    assert signal.getsignal(signal.SIGTERM) is guard
+    guard.restore()
+
+    assert signal.getsignal(signal.SIGTERM) is previous

@@ -26,6 +26,7 @@ from tools.data_collection_gui import rollout as rollout_backend  # noqa: E402
 from tools.data_collection_gui import table_plane  # noqa: E402
 from tools.data_collection_gui import task_ladders  # noqa: E402
 from tools.data_collection_gui import training as training_backend  # noqa: E402
+from tools.fr3.scene_reset import SceneResetError  # noqa: E402
 
 SCAN_SCRIPT = REPO_ROOT / "tools" / "fr3" / "scan_checkpoints.py"
 
@@ -995,6 +996,41 @@ def test_a_rollout_remembers_its_settings_for_the_next_one(tmp_path: Path):
     assert params["runtimeOptions"]["rtcInferenceDelaySteps"] is None
 
 
+def test_the_checkpoint_is_carried_to_the_next_rollout(tmp_path: Path):
+    # Tuning a policy is the same checkpoint rolled out over and over, and finding its row again
+    # in a list of forty was a click paid on every run.
+    state = _rollout_state(tmp_path)
+
+    gateway._start_rollout(state, {"mode": "smoke", "checkpointId": "job_a/020000"})
+    gateway._stop_rollout(state)
+
+    assert gateway._rollout_last_params(state)["checkpointId"] == "job_a/020000"
+
+
+def test_the_takeover_switch_is_carried_to_the_next_rollout(tmp_path: Path):
+    # The one setting that was deliberately forgotten before: a remembered "yes" opens a second
+    # action source onto a loop that is driving a real arm. It is remembered now because an
+    # afternoon of collecting corrections is otherwise the same switch re-ticked before every
+    # single rollout, and what stands in for the protection that dropped is a sentence in the
+    # page's carry-over notice -- plus the motion gate below, which is never carried.
+    state = _rollout_state(tmp_path)
+
+    gateway._start_rollout(
+        state,
+        {
+            "mode": "real",
+            "checkpointId": "job_a/020000",
+            "confirmMotion": True,
+            "runtimeOptions": {"daggerTakeover": True, "daggerRecord": True},
+        },
+    )
+    gateway._stop_rollout(state)
+
+    options = gateway._rollout_last_params(state)["runtimeOptions"]
+    assert options["daggerTakeover"] is True
+    assert options["daggerRecord"] is True
+
+
 def test_the_safety_gates_are_never_carried_to_the_next_rollout(tmp_path: Path):
     # confirmMotion is what stands between a click and an arm that moves; overrideContract is
     # what stands between a click and a checkpoint the rig reported as mismatched. A remembered
@@ -1015,8 +1051,9 @@ def test_the_safety_gates_are_never_carried_to_the_next_rollout(tmp_path: Path):
     params = gateway._rollout_last_params(state)
     assert "confirmMotion" not in params
     assert "overrideContract" not in params
-    # Nor the checkpoint: the next rollout is almost always a different one.
-    assert "checkpointId" not in params
+    # The checkpoint they were answered for does come back, and that is the point: a remembered
+    # checkpoint must not arrive with the answers that were given for it last time.
+    assert params["checkpointId"] == "job_a/020000"
 
 
 def test_a_hand_written_params_file_cannot_smuggle_a_gate_back_in(tmp_path: Path):
@@ -1038,7 +1075,7 @@ def test_a_hand_written_params_file_cannot_smuggle_a_gate_back_in(tmp_path: Path
 
     params = gateway._rollout_last_params(state)
 
-    assert params == {"mode": "smoke"}
+    assert params == {"mode": "smoke", "checkpointId": "job_a/020000"}
 
 
 def test_no_previous_rollout_means_no_carried_settings(tmp_path: Path):
@@ -1114,6 +1151,161 @@ def test_the_rollout_owns_its_stdin_and_not_its_stdout(tmp_path: Path):
     assert process.stdout is None
     assert Path(state.rollout.logPath).is_file()
     gateway._stop_rollout(state)
+
+
+SLOW_QUIT_LAUNCHER = """#!/usr/bin/env bash
+echo "[INFO] interactive_rollouts=enabled keyboard_backend=pipe start_key='s'"
+echo "[INFO] interactive_waiting_for_start arm_at_start=1 press 's' to start."
+while IFS= read -r line; do
+  case "$line" in
+    quit)  sleep 1; echo "[INFO] interactive_rollouts=stopped"; exit 0 ;;
+  esac
+done
+"""
+
+DEAF_LAUNCHER = """#!/usr/bin/env bash
+echo "[INFO] interactive_rollouts=enabled keyboard_backend=pipe start_key='s'"
+echo "[INFO] interactive_waiting_for_start arm_at_start=1 press 's' to start."
+while IFS= read -r line; do
+  :
+done
+"""
+
+
+def _relaunch_with(state: gateway.GatewayState, script: str) -> None:
+    """Swap the fake launcher for one that shuts down differently. Call before starting."""
+    launcher = state.repo_root / rollout_backend.LAUNCHER
+    launcher.write_text(script, encoding="utf-8")
+    launcher.chmod(0o755)
+
+
+def test_the_drawn_mask_survives_a_page_reload(tmp_path: Path):
+    """The region is measured against a camera still of the table, not typed from memory.
+
+    Redrawn every load, it is redrawn slightly differently every load, and a rollout series'
+    place points move without anyone deciding to move them.
+    """
+    state = _rollout_state(tmp_path)
+    strokes = [{"x": 0.44, "y": -0.12, "radiusM": 0.035}, {"x": 0.46, "y": -0.10, "radiusM": 0.04}]
+
+    saved = gateway._save_scene_reset_mask(state, {"strokes": strokes})
+
+    assert saved["ok"] is True
+    assert saved["updatedAt"]
+    assert gateway._load_scene_reset_mask(state)["strokes"] == strokes
+
+
+def test_a_cleared_mask_is_stored_as_cleared(tmp_path: Path):
+    """"No region" is an answer an operator gave, not a save that failed.
+
+    Treated as "nothing to store", the next load would hand back the region they had just
+    deleted -- and the Clear button would be the one control on the page that does not last.
+    """
+    state = _rollout_state(tmp_path)
+    gateway._save_scene_reset_mask(state, {"strokes": [{"x": 0.44, "y": -0.12, "radiusM": 0.035}]})
+
+    gateway._save_scene_reset_mask(state, {"strokes": []})
+
+    assert gateway._load_scene_reset_mask(state)["strokes"] == []
+
+
+def test_a_mask_that_cannot_be_reset_with_is_refused_while_it_is_still_on_screen(tmp_path: Path):
+    """Validated on the way in, with the same parser a reset request gets.
+
+    A radius the sampler cannot use is worth refusing while the operator is looking at the
+    canvas, rather than a fortnight later out of a file with the drawing long gone.
+    """
+    state = _rollout_state(tmp_path)
+
+    with pytest.raises(SceneResetError):
+        gateway._save_scene_reset_mask(state, {"strokes": [{"x": 0.44, "y": -0.12, "radiusM": 9.0}]})
+
+    assert gateway._scene_reset_mask_path(state).exists() is False
+
+
+def test_an_unreadable_mask_file_reads_as_no_region(tmp_path: Path):
+    """A file this process cannot parse is a region the operator has to draw again, not a page
+    that refuses to open."""
+    state = _rollout_state(tmp_path)
+    path = gateway._scene_reset_mask_path(state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+
+    assert gateway._load_scene_reset_mask(state) == {"strokes": [], "updatedAt": ""}
+
+
+def test_a_mask_is_never_read_half_written(tmp_path: Path):
+    """It is rewritten on every stroke, and the page that reads it is a different process."""
+    state = _rollout_state(tmp_path)
+
+    gateway._save_scene_reset_mask(state, {"strokes": [{"x": 0.44, "y": -0.12, "radiusM": 0.035}]})
+
+    path = gateway._scene_reset_mask_path(state)
+    leftovers = [item.name for item in path.parent.iterdir() if item.name.startswith(".")]
+    assert leftovers == [], leftovers
+    assert json.loads(path.read_text(encoding="utf-8"))["strokes"]
+
+
+def test_a_stop_lets_the_runtime_close_its_own_dataset(tmp_path: Path):
+    """The stop used to write `quit` and signal the process group in the same breath.
+
+    The runtime's shutdown is what calls `dataset.finalize()` -- the episode metadata flush and
+    the data parquet's footer -- and a SIGTERM that lands first kills it mid-write. One stop on
+    2026-09-02 left a DAgger root of 432 recorded correction frames that nothing can open.
+
+    The exit code is the assertion: a shell killed by SIGTERM reports -15, so this fails the
+    moment the grace goes away again.
+    """
+    state = _rollout_state(tmp_path)
+    _relaunch_with(state, SLOW_QUIT_LAUNCHER)
+    gateway._start_rollout(state, {"mode": "smoke", "checkpointId": "job_a/020000"})
+    process = state.rollout_process
+    assert process is not None
+
+    gateway._stop_rollout(state)
+
+    assert _wait_for(lambda: process.poll() is not None), "the rollout never exited"
+    assert process.returncode == 0
+
+
+def test_a_rollout_that_never_answers_is_still_stopped(tmp_path: Path, monkeypatch):
+    """The grace is bounded, because the thing being waited on is holding an arm.
+
+    A runtime wedged in a driver is not going to read its stdin however long it is given, and
+    the operator pressed stop.
+    """
+    state = _rollout_state(tmp_path)
+    _relaunch_with(state, DEAF_LAUNCHER)
+    monkeypatch.setattr(gateway, "ROLLOUT_QUIT_GRACE_S", 0.3)
+    monkeypatch.setattr(gateway, "ROLLOUT_TERM_GRACE_S", 0.3)
+    gateway._start_rollout(state, {"mode": "smoke", "checkpointId": "job_a/020000"})
+    process = state.rollout_process
+    assert process is not None
+
+    gateway._stop_rollout(state)
+
+    assert _wait_for(lambda: process.poll() is not None), "the rollout was never signalled"
+    assert process.returncode != 0
+
+
+def test_the_next_rollout_is_refused_while_the_last_one_is_closing(tmp_path: Path):
+    """Refused with the reason, not with the generic "already running".
+
+    The two states look the same to `_rollout_is_running` and mean opposite things to an
+    operator: one is "you forgot to stop it", the other is "it is stopping, and cutting it short
+    is what loses the corrections".
+    """
+    state = _rollout_state(tmp_path)
+    _relaunch_with(state, SLOW_QUIT_LAUNCHER)
+    gateway._start_rollout(state, {"mode": "smoke", "checkpointId": "job_a/020000"})
+    process = state.rollout_process
+    assert process is not None
+    gateway._stop_rollout(state)
+
+    with pytest.raises(ValueError, match="still shutting down"):
+        gateway._start_rollout(state, {"mode": "smoke", "checkpointId": "job_a/020000"})
+
+    assert _wait_for(lambda: process.poll() is not None)
 
 
 def test_start_and_stop_reach_the_running_rollout(tmp_path: Path):
@@ -1388,6 +1580,29 @@ def test_recording_an_outcome_clears_the_prompt(tmp_path: Path):
     assert state.rollout.pendingOutcomeFor == 0
 
 
+def test_an_assisted_rollout_is_graded_as_assisted_whatever_the_page_says(tmp_path: Path):
+    """The count comes off the runtime's trace, like the landing point.
+
+    A page that could send its own would be able to file the rollout it drove by hand as one the
+    policy did alone, which is the single way this log can lie about a checkpoint.
+    """
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(
+        checkpointId="job_a/020000",
+        mode="real",
+        step=782,
+        pendingOutcomeFor=1,
+        lastRolloutIntervention={"intervened": True, "expertSteps": 476},
+    )
+
+    result = gateway._record_rollout_outcome(
+        state, {"outcome": "success", "intervened": False, "expertSteps": 0}
+    )
+
+    assert result["entry"]["intervened"] is True
+    assert result["entry"]["expertSteps"] == 476
+
+
 def test_the_gateways_own_environment_cannot_override_the_checkpoints_contract(tmp_path: Path):
     """A stray FR3_* in the gateway's environment must not decide what the arm does.
 
@@ -1614,6 +1829,63 @@ def test_rollout_end_marker_carries_the_landing_points():
     assert geometry["heldSteps"] == 223
 
 
+def test_the_landing_points_say_who_was_driving_when_they_happened():
+    """The map draws whoever produced the point, and the grade needs the same fact about the
+    terminal event. Rollout-level `intervened` cannot say *when*."""
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] interactive_rollout_end index=3 status=stopped samples=430 closed=1 "
+        "grasp_xyz=0.3162,-0.2214,0.0461 release_xyz=0.3599,-0.1330,0.0510 "
+        "held_steps=223 grasp_by=policy release_by=expert intervened=1 expert_steps=88"
+    )
+
+    geometry = parsed["lastRolloutGeometry"]
+    assert geometry["graspBy"] == "policy"
+    assert geometry["releaseBy"] == "expert"
+
+
+def test_a_landing_point_from_a_runtime_that_names_no_driver_stays_unattributed():
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] interactive_rollout_end index=3 status=stopped samples=430 closed=1 "
+        "grasp_xyz=0.3162,-0.2214,0.0461"
+    )
+
+    assert "graspBy" not in parsed["lastRolloutGeometry"]
+
+
+def test_a_recorded_landing_point_keeps_who_produced_it(tmp_path: Path):
+    checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/030000",
+            "outcome": "failure",
+            "geometry": {
+                "graspXyz": [0.31, -0.22, 0.046],
+                "graspBy": "policy",
+                "releaseBy": "expert",
+            },
+        },
+    )
+
+    entry = checkpoint_backend.load_rollout_outcomes(tmp_path)[-1]
+    assert entry["geometry"]["graspBy"] == "policy"
+    assert entry["geometry"]["releaseBy"] == "expert"
+
+
+def test_a_landing_point_cannot_be_attributed_to_something_that_is_not_a_driver(tmp_path: Path):
+    """Two words, because there are two things that can drive the arm. Anything else is a caller
+    inventing a third."""
+    checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/030000",
+            "outcome": "failure",
+            "geometry": {"graspXyz": [0.31, -0.22, 0.046], "graspBy": "the intern"},
+        },
+    )
+
+    assert "graspBy" not in checkpoint_backend.load_rollout_outcomes(tmp_path)[-1]["geometry"]
+
+
 def test_a_rollout_that_never_closed_reports_where_it_reached():
     """The approach point is the whole result for a failure that never gripped.
 
@@ -1648,6 +1920,90 @@ def test_starting_a_rollout_clears_the_previous_landing_point():
     parsed = rollout_backend.parse_rollout_line("[INFO] interactive_rollout_start index=5")
 
     assert parsed["lastRolloutGeometry"] == {}
+
+
+# ------------------------------------------------------------ who was driving ---
+#
+# A rollout an operator finished by hand measures the operator. These keep that fact attached to
+# the grade, because the outcome log is what two checkpoints are compared on.
+
+
+def test_the_end_marker_says_the_operator_drove_and_for_how_long():
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] interactive_rollout_end index=1 status=stopped samples=782 closed=1 "
+        "grasp_xyz=0.3881,-0.2503,0.0585 held_steps=239 "
+        "intervened=1 expert_steps=476 expert_spans=135-610"
+    )
+
+    assert parsed["lastRolloutIntervention"] == {"intervened": True, "expertSteps": 476}
+
+
+def test_a_rollout_nobody_touched_says_so_rather_than_saying_nothing():
+    """False here is a measurement -- the runtime reported a summary and it had no expert spans
+    -- and it is what lets the log tell an unassisted rollout from an unexamined one."""
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] interactive_rollout_end index=2 status=completed samples=430 closed=1 "
+        "grasp_xyz=0.3162,-0.2214,0.0461 held_steps=223"
+    )
+
+    assert parsed["lastRolloutIntervention"] == {"intervened": False, "expertSteps": 0}
+
+
+def test_an_end_marker_without_a_summary_does_not_claim_the_policy_drove():
+    """A runtime older than the field counted nobody, which is not the same as counting zero."""
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] interactive_rollout_end index=1 status=stopped"
+    )
+
+    assert parsed["lastRolloutIntervention"] == {}
+
+
+def test_starting_a_rollout_clears_the_previous_takeover():
+    parsed = rollout_backend.parse_rollout_line("[INFO] interactive_rollout_start index=5")
+
+    assert parsed["lastRolloutIntervention"] == {}
+
+
+def test_a_recorded_outcome_keeps_who_was_driving(tmp_path: Path):
+    checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/030000",
+            "outcome": "success",
+            "intervention": {"intervened": True, "expertSteps": 476},
+        },
+    )
+
+    entry = checkpoint_backend.load_rollout_outcomes(tmp_path)[-1]
+    assert entry["intervened"] is True
+    assert entry["expertSteps"] == 476
+
+
+def test_an_unassisted_rollout_is_recorded_as_measured_not_as_unknown(tmp_path: Path):
+    checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/030000",
+            "outcome": "success",
+            "intervention": {"intervened": False, "expertSteps": 0},
+        },
+    )
+
+    entry = checkpoint_backend.load_rollout_outcomes(tmp_path)[-1]
+    assert entry["intervened"] is False
+    assert entry["expertSteps"] == 0
+
+
+def test_an_outcome_nobody_counted_records_no_intervention_field(tmp_path: Path):
+    """Absent, not false: `false` would put a rollout that may have been driven by hand into the
+    same bucket as the ones the policy did alone."""
+    checkpoint_backend.append_rollout_outcome(
+        tmp_path, {"checkpointId": "job_a/030000", "outcome": "success", "intervention": {}}
+    )
+
+    entry = checkpoint_backend.load_rollout_outcomes(tmp_path)[-1]
+    assert "intervened" not in entry
+    assert "expertSteps" not in entry
 
 
 def test_recorded_outcomes_keep_the_landing_point(tmp_path: Path):
@@ -2381,3 +2737,257 @@ def test_a_settings_dump_gets_no_trace_directory(tmp_path: Path):
     command, _ = _command(tmp_path, mode="env", trace_dir=tmp_path / "traces")
 
     assert "--rollout-trace-dir" not in command
+
+
+# --------------------------------------------------------- DAgger takeover from the browser ---
+#
+# The takeover already worked from a terminal. What these cover is the two things that change
+# when a browser launches it: the operator cannot type a dataset path per batch, and they cannot
+# press `t` -- the gateway holds the runtime's stdin as a pipe, so the keyboard backend is not
+# reading a keyboard at all.
+
+
+def test_takeover_is_refused_on_a_mode_the_launcher_would_silently_drop_it_from(tmp_path: Path):
+    """`real_once` accepts the environment variable and never passes the flag on.
+
+    The runtime would refuse `--dagger-takeover` without `--interactive-rollouts`, but the flag
+    never reaches it: the launcher's `case` puts `dagger_args` in two branches only. So the
+    failure is silent -- a rollout the operator believes they can grab the arm out of, which runs
+    to its step limit with the SpaceMouse doing nothing.
+    """
+    with pytest.raises(rollout_backend.RolloutError, match="interactive"):
+        _command(
+            tmp_path,
+            mode="real_once",
+            runtime_options=rollout_backend.sanitize_rollout_runtime_options(
+                {"daggerTakeover": True}
+            ),
+            dagger_dataset_fallback=tmp_path / "outputs" / "dagger" / "job_a",
+        )
+
+
+def test_takeover_gets_a_destination_the_operator_never_typed(tmp_path: Path):
+    """A blank field must not mean "throw the corrections away".
+
+    This is the trace-directory lesson applied one layer up: the browser has nowhere to type a
+    path per session, and the answer that loses data is not the one to default to.
+    """
+    fallback = tmp_path / "outputs" / "dagger" / "job_a_020000"
+    _, env = _command(
+        tmp_path,
+        runtime_options=rollout_backend.sanitize_rollout_runtime_options({"daggerTakeover": True}),
+        dagger_dataset_fallback=fallback,
+    )
+
+    assert env["FR3_DAGGER_TAKEOVER"] == "1"
+    assert env["FR3_DAGGER_DATASET_ROOT"] == str(fallback)
+
+
+def test_a_named_corrections_dataset_beats_the_derived_one(tmp_path: Path):
+    _, env = _command(
+        tmp_path,
+        runtime_options=rollout_backend.sanitize_rollout_runtime_options(
+            {"daggerTakeover": True, "daggerDatasetRoot": "outputs/dagger/insert_s6"}
+        ),
+        dagger_dataset_fallback=tmp_path / "outputs" / "dagger" / "derived",
+    )
+
+    assert env["FR3_DAGGER_DATASET_ROOT"] == "outputs/dagger/insert_s6"
+
+
+def test_steering_without_recording_is_something_the_operator_has_to_say(tmp_path: Path):
+    """Not the same as leaving the field blank, and the launcher can tell them apart.
+
+    An empty value fails the launcher's `-n` test exactly as an absent one does, so the takeover
+    runs and writes nothing -- which is the right behaviour for feeling out the handoff on a real
+    arm, and the wrong one to arrive at by forgetting to fill something in.
+    """
+    _, env = _command(
+        tmp_path,
+        runtime_options=rollout_backend.sanitize_rollout_runtime_options(
+            {"daggerTakeover": True, "daggerRecord": False}
+        ),
+        dagger_dataset_fallback=tmp_path / "outputs" / "dagger" / "derived",
+    )
+
+    assert env["FR3_DAGGER_TAKEOVER"] == "1"
+    assert env["FR3_DAGGER_DATASET_ROOT"] == ""
+
+
+def test_a_rollout_that_asked_for_no_takeover_opens_no_device(tmp_path: Path):
+    _, env = _command(tmp_path, dagger_dataset_fallback=tmp_path / "outputs" / "dagger" / "d")
+
+    assert "FR3_DAGGER_TAKEOVER" not in env
+    assert "FR3_DAGGER_DATASET_ROOT" not in env
+
+
+def test_a_takeover_left_in_the_gateways_own_environment_cannot_arm_a_rollout(tmp_path: Path):
+    """The one that would be worst to inherit: a second action source onto a moving arm.
+
+    A shell that once exported this to run a takeover by hand would otherwise hand every browser
+    rollout a live SpaceMouse, with nothing on the page saying so.
+    """
+    _, env = _command(
+        tmp_path,
+        base_env={"FR3_DAGGER_TAKEOVER": "1", "FR3_DAGGER_DATASET_ROOT": "/somewhere/stale"},
+        dagger_dataset_fallback=tmp_path / "outputs" / "dagger" / "d",
+    )
+
+    assert "FR3_DAGGER_TAKEOVER" not in env
+    assert "FR3_DAGGER_DATASET_ROOT" not in env
+
+
+def test_corrections_against_one_checkpoint_accumulate_in_one_dataset(tmp_path: Path):
+    """Per checkpoint, not per launch -- the opposite of the trace directory, deliberately.
+
+    A trace is only useful separated by batch. A DAgger dataset is only useful once it is big
+    enough to train on, and the states it corrects are the states this policy walks into.
+    """
+    first = rollout_backend.dagger_dataset_dir(tmp_path, "L4_full48_holdout22_40/030000")
+    second = rollout_backend.dagger_dataset_dir(tmp_path, "L4_full48_holdout22_40/030000")
+    other = rollout_backend.dagger_dataset_dir(tmp_path, "L4_full48_holdout22_40/040000")
+
+    assert first == second
+    assert first != other
+    # Flattened the same way the log file's name is, so the two sit side by side under names an
+    # operator can pair up by eye.
+    assert "/" not in first.name
+
+
+def test_turning_automatic_handback_off_survives_being_zero(tmp_path: Path):
+    """0 is an instruction, not a missing field: it leaves Hold as the only way in and out."""
+    options = rollout_backend.sanitize_rollout_runtime_options(
+        {"daggerTakeover": True, "daggerReleaseAfterS": 0}
+    )
+
+    assert options["FR3_DAGGER_RELEASE_AFTER_S"] == "0"
+
+
+def test_a_takeover_switch_that_is_neither_yes_nor_no_is_refused():
+    # Refused rather than read as off, because off is the answer that runs.
+    with pytest.raises(rollout_backend.RolloutError, match="daggerTakeover"):
+        rollout_backend.sanitize_rollout_runtime_options({"daggerTakeover": "maybe"})
+
+
+def test_a_corrections_path_cannot_carry_a_second_line():
+    with pytest.raises(rollout_backend.RolloutError, match="line breaks"):
+        rollout_backend.sanitize_rollout_runtime_options(
+            {"daggerTakeover": True, "daggerDatasetRoot": "outputs/dagger/a\nb"}
+        )
+
+
+def test_the_page_learns_the_device_is_armed_from_the_preflight_banner():
+    """The banner is what the operator reads before touching anything, so the page reads it too.
+
+    `report_timestamps` is the check that the driver dates its reports -- without dates the arm
+    keeps flying after the hand comes off and the handback timer never expires. A real rollout
+    cannot start without it, which is exactly why the field is worth showing: "it says yes" is a
+    check an operator can make, and an absent field is not.
+    """
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] dagger_takeover=ready device_id=0 translation_scale=0.000615 "
+        "rotation_scale=0.000648 release_after_s=1.00 motion_gain=6.67 nominal_step_ms=33.3 "
+        "full_deflection_mm_per_step=4.1 report_timestamps=yes"
+    )
+
+    assert parsed["takeoverAvailable"] is True
+    assert parsed["daggerReportTimestamps"] == "yes"
+    assert parsed["daggerReleaseAfterS"] == pytest.approx(1.0)
+
+
+def test_the_page_shows_where_the_runtime_actually_put_the_corrections():
+    """The runtime's own answer, which is the one that can differ from what was asked for."""
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] dagger_dataset=extending root=outputs/dagger/job_a repo_id=job_a episodes=12"
+    )
+
+    assert parsed["daggerDatasetPath"] == "outputs/dagger/job_a"
+
+
+def test_episodes_written_are_reported_under_a_name_that_is_not_the_running_total():
+    """One rollout's count must not be assignable to the session's, or the total would reset.
+
+    The gateway sums these; the field they add into is `daggerEpisodes`. Named apart so the
+    generic setattr loop that applies every other parsed key cannot touch the total.
+    """
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] dagger_dataset_written rollout=3 episodes=2 frames=71 skipped_spans=1 "
+        "dropped_frames=0"
+    )
+
+    assert parsed["daggerEpisodesWritten"] == 2
+    assert parsed["daggerDroppedFramesWritten"] == 0
+    assert "daggerEpisodes" not in parsed
+
+
+def test_a_truncated_correction_is_counted_so_the_page_can_say_so():
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] dagger_dataset_written rollout=4 episodes=1 frames=450 skipped_spans=0 "
+        "dropped_frames=118"
+    )
+
+    assert parsed["daggerDroppedFramesWritten"] == 118
+
+
+def test_only_the_two_interactive_real_modes_offer_takeover():
+    """The page greys the switch out from this, so it has to match the launcher's `case`."""
+    offering = {mode.id for mode in rollout_backend.ROLLOUT_MODES if mode.takeover}
+
+    assert offering == {"real", "real_debug"}
+
+
+def test_an_unread_handback_time_is_not_the_same_as_one_that_is_off():
+    """0 says the arm will never hand itself back; the page has to be able to say that only when
+    the runtime did. A float default of 0.0 would have every rollout claim it for the first few
+    lines, before the banner arrives."""
+    assert rollout_backend.RolloutStatus().daggerReleaseAfterS is None
+
+
+def test_hold_is_refused_on_a_rollout_that_opened_no_device(tmp_path: Path):
+    """The runtime would answer this in the log and nowhere else.
+
+    `interactive_pipe_takeover_ignored` is one line among thousands, and the operator pressing
+    Hold is reaching for a brake. They have to be told on screen that this rollout has none,
+    rather than infer it from an arm that kept going.
+    """
+    state = _rollout_state(tmp_path)
+    gateway._start_rollout(state, {"mode": "real", "checkpointId": "job_a/020000", "confirmMotion": True})
+    try:
+        state.rollout.state = "rolling"
+        state.rollout.takeoverAvailable = False
+
+        with pytest.raises(ValueError, match="no device"):
+            gateway._send_rollout_control(state, "takeover")
+    finally:
+        gateway._stop_rollout(state)
+
+
+def test_hold_reaches_the_runtime_once_a_device_is_armed(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    gateway._start_rollout(state, {"mode": "real", "checkpointId": "job_a/020000", "confirmMotion": True})
+    try:
+        state.rollout.state = "rolling"
+        state.rollout.takeoverAvailable = True
+
+        result = gateway._send_rollout_control(state, "takeover")
+
+        assert result["ok"] is True
+        # The page must not claim a direction: the latch is a toggle the runtime owns, and a page
+        # that guessed would sooner or later disagree with the arm about who is driving.
+        assert "toggled" in state.rollout.message
+    finally:
+        gateway._stop_rollout(state)
+
+
+def test_corrections_land_where_the_export_page_can_find_them(tmp_path: Path):
+    """One level under the datasets root, which is exactly as deep as the gateway scans.
+
+    The export page is what merges corrections with the demonstrations into the view the next
+    checkpoint trains on. A DAgger dataset the picker cannot list is one nobody can train on
+    without dropping to the CLI, which makes the whole browser path stop one step short of the
+    thing it exists to produce.
+    """
+    root = rollout_backend.dagger_dataset_dir(tmp_path, "L4_full48_holdout22_40/030000")
+
+    assert root.parent == tmp_path / "outputs" / "datasets"
+    assert root.name.startswith(rollout_backend.DAGGER_PREFIX)

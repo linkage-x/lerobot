@@ -48,6 +48,7 @@ import type {
   TableWindow,
   SceneResetRequest,
   SceneResetResult,
+  SceneResetStroke,
   TrainingHistoryEntry,
   TrainingView,
   TrainingWandbStatus,
@@ -1010,8 +1011,8 @@ export class DataCollectionGuiApi {
     return payload?.ladders ?? [];
   }
 
-  /** The previous rollout's settings, so a new one starts where the last left off.
-   *  Never carries the safety gates; those are re-asked every time. */
+  /** The previous rollout's settings, including which checkpoint it ran, so a new one starts
+   *  where the last left off. Never carries the safety gates; those are re-asked every time. */
   async fetchRolloutLastParams(): Promise<RolloutLastParams> {
     const payload = await this.trainingGet<{ params: RolloutLastParams }>(
       "/api/rollout/last-params"
@@ -1024,10 +1025,10 @@ export class DataCollectionGuiApi {
   }
 
   /** One control word to the running rollout's stdin: the runtime reads it as a keypress.
-   *  `takeover` latches the arm to the operator's device and is not sent by this page -- moving
-   *  the SpaceMouse takes the arm on its own. It stays in the alphabet because the terminal and
-   *  the page drive the same session with the same words, and a latch is still worth having for
-   *  an operator who wants the arm held still without touching the device. */
+   *  `takeover` is the latch, not the ordinary way in -- moving the SpaceMouse takes the arm on
+   *  its own. The page sends it because a rollout the gateway launched has its stdin held as a
+   *  pipe, which no keyboard backend can read: the `t` key a terminal operator would press does
+   *  not exist here, and without this the browser session has no way to hold the arm still. */
   async controlRollout(command: "start" | "stop" | "home" | "quit" | "takeover") {
     return this.trainingPost<{ rollout?: RolloutRun }>("/api/rollout/control", { command });
   }
@@ -1149,6 +1150,21 @@ export class DataCollectionGuiApi {
       camera: cameraKey,
       index
     });
+  }
+
+  /** The target region stored on the rig, or none.
+   *
+   *  Rig-side rather than in the browser, for the same reason the table calibration is: the mask
+   *  is a region of a physical table measured against a camera bolted above it, and it has to be
+   *  the same region whichever machine, browser or page an operator opens next.
+   */
+  async fetchSceneResetMask(): Promise<SceneResetStroke[]> {
+    const payload = await this.trainingGet<{ strokes: SceneResetStroke[] }>("/api/scene-reset/mask");
+    return payload?.strokes ?? [];
+  }
+
+  async saveSceneResetMask(strokes: SceneResetStroke[]) {
+    return this.trainingPost<{ strokes: SceneResetStroke[] }>("/api/scene-reset/mask", { strokes });
   }
 
   async clearTableAlignment(cameraKey: string) {

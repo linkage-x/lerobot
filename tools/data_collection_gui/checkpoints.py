@@ -557,6 +557,15 @@ def append_rollout_outcome(repo_root: Path, record: dict[str, Any]) -> dict[str,
     # that produced no samples -- leaves the field absent instead of claiming the origin.
     if isinstance(geometry, dict) and geometry:
         entry["geometry"] = _sanitize_rollout_geometry(geometry)
+    # Absent when the runtime did not report it, like the grade and the landing point: a record
+    # reading `intervened: false` because nobody was asked is indistinguishable from one that
+    # reads it because the policy did the rollout alone, and the whole point of the field is
+    # that those two must never be counted together. Flat rather than nested under `geometry`,
+    # so filtering a log down to the unassisted rollouts is one key.
+    intervention = record.get("intervention")
+    if isinstance(intervention, dict) and "intervened" in intervention:
+        entry["intervened"] = bool(intervention["intervened"])
+        entry["expertSteps"] = max(int(intervention.get("expertSteps") or 0), 0)
     path = rollout_log_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -566,6 +575,10 @@ def append_rollout_outcome(repo_root: Path, record: dict[str, Any]) -> dict[str,
 
 _GEOMETRY_POINT_FIELDS = ("graspXyz", "releaseXyz", "approachXyz")
 _GEOMETRY_SCALAR_FIELDS = ("apexZ", "liftM", "descentM")
+# Who was driving at each of those points. Kept beside the coordinates because that is the only
+# place the answer means anything: a landing point is evidence about whoever produced it.
+_GEOMETRY_DRIVER_FIELDS = ("graspBy", "releaseBy", "approachBy")
+_GEOMETRY_DRIVERS = ("policy", "expert")
 
 
 def _sanitize_rollout_geometry(geometry: dict[str, Any]) -> dict[str, Any]:
@@ -588,6 +601,10 @@ def _sanitize_rollout_geometry(geometry: dict[str, Any]) -> dict[str, Any]:
             clean[key] = value
     if "closed" in geometry:
         clean["closed"] = bool(geometry.get("closed"))
+    for key in _GEOMETRY_DRIVER_FIELDS:
+        value = geometry.get(key)
+        if value in _GEOMETRY_DRIVERS:
+            clean[key] = value
     return clean
 
 

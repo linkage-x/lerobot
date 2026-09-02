@@ -4615,6 +4615,24 @@ button.danger {
   font-weight: 650;
 }
 
+/* A window over a table that grows without bound -- the checkpoint picker and the rollout
+   log both do. Roughly ten rows tall, so the controls under them stay reachable. */
+.table-scroll {
+  max-height: 360px;
+  overflow: auto;
+}
+
+/* The column labels have to survive the scroll: "Outcome" and "Assisted" are pills, and a pill
+   with no header above it says nothing. `border-collapse: collapse` drops a sticky cell's own
+   border, hence the inset shadow standing in for it. */
+.table-scroll .table thead th {
+  background: #ffffff;
+  box-shadow: inset 0 -1px 0 #e1e6ea;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
 .cell-sub {
   color: #60707c;
   font-size: 12px;
@@ -4697,6 +4715,10 @@ button.danger {
 
 .detail-row > td {
   background: #f7f9fa;
+}
+
+.checkpoint-more .hint {
+  margin: 0;
 }
 
 .checkpoint-detail {
@@ -4833,6 +4855,13 @@ button.danger {
 
 .outcome-prompt {
   border-color: #9ccdc4;
+}
+
+/* On the heading rather than below it: whether a human drove the rollout changes what the
+ * grade underneath is allowed to mean, so it has to be read before the form is filled in. */
+.outcome-assisted-pill {
+  margin-left: 8px;
+  vertical-align: middle;
 }
 
 /* Motion confirmation is the last thing between a click and a moving arm, so it is the one
@@ -4974,6 +5003,20 @@ button.danger {
 .landing-map-legend .dot.hollow {
   background: transparent;
   border: 2px solid #5b6a75;
+}
+
+/* The ring that says an operator's hand produced this landing point. Dashed and drawn outside
+ * the marker, so it stacks with the two encodings already on it -- fill for how far the rollout
+ * got, hollow for a gripper that never closed -- instead of competing with either. */
+.landing-map-assisted {
+  stroke-dasharray: 3 3;
+  stroke-width: 1.5;
+  opacity: 0.85;
+}
+
+.landing-map-legend .dot.assisted {
+  background: transparent;
+  border: 1.5px dashed #6f4e12;
 }
 
 .scene-reset-card { overflow: hidden; }

@@ -24,7 +24,11 @@ from tools.fr3.dagger_dataset import (
     DaggerEpisodeWriter,
     DaggerFrameBuffer,
     build_dagger_frame,
+    dagger_dataset_can_load_locally,
+    dagger_dataset_has_tasks,
     dagger_dataset_features,
+    dagger_dataset_is_unfinalized,
+    dagger_dataset_root_is_recreatable,
     sent_command_to_dataset_action,
 )
 
@@ -78,6 +82,106 @@ def pose(position, rotvec):
 
 def identity_gripper(value: float) -> float:
     return value
+
+
+# --- opening correction datasets --------------------------------------------------------
+
+
+def test_an_empty_dagger_root_can_be_recreated(tmp_path):
+    root = tmp_path / 'dagger_policy_030000'
+    root.mkdir()
+
+    assert dagger_dataset_root_is_recreatable(root) is True
+    assert dagger_dataset_has_tasks(root) is False
+    assert dagger_dataset_can_load_locally(root) is False
+
+
+def test_a_no_episode_dagger_metadata_shell_can_be_recreated(tmp_path):
+    root = tmp_path / 'dagger_policy_030000'
+    (root / 'meta').mkdir(parents=True)
+    (root / 'meta' / 'info.json').write_text('{}', encoding='utf-8')
+
+    assert dagger_dataset_root_is_recreatable(root) is True
+    assert dagger_dataset_has_tasks(root) is False
+    assert dagger_dataset_can_load_locally(root) is False
+
+
+def test_a_dagger_root_with_payload_is_not_recreated(tmp_path):
+    root = tmp_path / 'dagger_policy_030000'
+    data_file = root / 'data' / 'chunk-000' / 'file-000.parquet'
+    data_file.parent.mkdir(parents=True)
+    data_file.write_bytes(b'payload')
+
+    assert dagger_dataset_root_is_recreatable(root) is False
+
+
+def test_a_session_killed_before_finalize_is_named_as_such(tmp_path):
+    """The shape a SIGTERMed rollout leaves: frames on disk, no episode metadata.
+
+    Both halves are asserted together because they are what the runtime chooses its message
+    from -- refusing the root, and being able to say the corrections in it are unreadable rather
+    than merely in the way.
+    """
+    root = tmp_path / 'dagger_policy_030000'
+    (root / 'meta').mkdir(parents=True)
+    (root / 'meta' / 'info.json').write_text('{}', encoding='utf-8')
+    (root / 'meta' / 'tasks.parquet').write_bytes(b'parquet')
+    data_file = root / 'data' / 'chunk-000' / 'file-000.parquet'
+    data_file.parent.mkdir(parents=True)
+    data_file.write_bytes(b'frames with no footer')
+
+    assert dagger_dataset_is_unfinalized(root) is True
+    assert dagger_dataset_can_load_locally(root) is False
+    assert dagger_dataset_root_is_recreatable(root) is False
+
+
+def test_a_finished_dataset_is_not_mistaken_for_an_interrupted_one(tmp_path):
+    root = tmp_path / 'dagger_policy_030000'
+    (root / 'meta' / 'episodes' / 'chunk-000').mkdir(parents=True)
+    (root / 'meta' / 'episodes' / 'chunk-000' / 'file-000.parquet').write_bytes(b'parquet')
+    (root / 'meta' / 'info.json').write_text('{}', encoding='utf-8')
+    (root / 'meta' / 'tasks.parquet').write_bytes(b'parquet')
+    data_file = root / 'data' / 'chunk-000' / 'file-000.parquet'
+    data_file.parent.mkdir(parents=True)
+    data_file.write_bytes(b'parquet')
+
+    assert dagger_dataset_is_unfinalized(root) is False
+    assert dagger_dataset_can_load_locally(root) is True
+
+
+def test_an_empty_root_is_not_an_interrupted_session(tmp_path):
+    """A directory with nothing in it is the recreatable case, not the unrecoverable one."""
+    root = tmp_path / 'dagger_policy_030000'
+    root.mkdir()
+
+    assert dagger_dataset_is_unfinalized(root) is False
+
+
+def test_a_metadata_only_dagger_root_can_be_recreated(tmp_path):
+    root = tmp_path / 'dagger_policy_030000'
+    (root / 'meta').mkdir(parents=True)
+    (root / 'meta' / 'info.json').write_text('{}', encoding='utf-8')
+    (root / 'meta' / 'tasks.parquet').write_bytes(b'parquet')
+
+    assert dagger_dataset_has_tasks(root) is True
+    assert dagger_dataset_can_load_locally(root) is False
+    assert dagger_dataset_root_is_recreatable(root) is True
+
+
+def test_a_complete_dagger_root_is_loadable_not_recreated(tmp_path):
+    root = tmp_path / 'dagger_policy_030000'
+    (root / 'meta').mkdir(parents=True)
+    (root / 'meta' / 'info.json').write_text('{}', encoding='utf-8')
+    (root / 'meta' / 'tasks.parquet').write_bytes(b'parquet')
+    episode_file = root / 'meta' / 'episodes' / 'chunk-000' / 'file-000.parquet'
+    episode_file.parent.mkdir(parents=True)
+    episode_file.write_bytes(b'episodes')
+    data_file = root / 'data' / 'chunk-000' / 'file-000.parquet'
+    data_file.parent.mkdir(parents=True)
+    data_file.write_bytes(b'data')
+
+    assert dagger_dataset_can_load_locally(root) is True
+    assert dagger_dataset_root_is_recreatable(root) is False
 
 
 # --- the buffer: which steps are kept, and where a span begins ---------------------------

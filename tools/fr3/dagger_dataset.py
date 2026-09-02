@@ -36,6 +36,7 @@ callables by the runtime, which already holds the real ones.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -56,6 +57,60 @@ DEFAULT_MAX_BUFFERED_FRAMES = 450
 
 OBSERVATION_PREFIX = 'observation'
 ACTION_PREFIX = 'action'
+DAGGER_INFO_PATH = Path('meta/info.json')
+DAGGER_TASK_PATHS = (Path('meta/tasks.parquet'), Path('meta/tasks.jsonl'))
+DAGGER_EPISODES_DIR = Path('meta/episodes')
+DAGGER_DATA_DIR = Path('data')
+DAGGER_RECREATABLE_FILES = {DAGGER_INFO_PATH, *DAGGER_TASK_PATHS}
+
+
+def dagger_dataset_has_tasks(root: Path) -> bool:
+    """Whether `root` has task metadata written by `save_episode`."""
+    return any((root / path).exists() for path in DAGGER_TASK_PATHS)
+
+
+def dagger_dataset_can_load_locally(root: Path) -> bool:
+    """Whether `LeRobotDataset(repo_id, root=root)` should load without consulting the Hub."""
+    return (
+        (root / DAGGER_INFO_PATH).exists()
+        and dagger_dataset_has_tasks(root)
+        and any((root / DAGGER_EPISODES_DIR).rglob('*.parquet'))
+        and any((root / DAGGER_DATA_DIR).rglob('*.parquet'))
+    )
+
+
+def dagger_dataset_is_unfinalized(root: Path) -> bool:
+    """Whether `root` holds a session that wrote frames but never closed its writers.
+
+    `save_episode` lands the data parquet and the videos, but the episode metadata sits in a
+    ten-episode buffer and the data file keeps its footer until `finalize()`. A run that dies
+    before that -- the gateway used to SIGTERM a rollout in the same breath as asking it to quit
+    -- leaves exactly this shape: `data/` and `videos/` populated, `meta/episodes/` absent, and a
+    parquet pyarrow refuses to open.
+
+    Worth telling apart from a directory that merely holds someone else's files, because the
+    corrections in it are not misplaced, they are unreadable: an operator told only to "move it
+    aside" will keep it waiting for a recovery that cannot come.
+    """
+    return (
+        (root / DAGGER_INFO_PATH).exists()
+        and any((root / DAGGER_DATA_DIR).rglob('*.parquet'))
+        and not any((root / DAGGER_EPISODES_DIR).rglob('*.parquet'))
+    )
+
+
+def dagger_dataset_root_is_recreatable(root: Path) -> bool:
+    """True when a stale DAgger root contains no correction payload worth preserving.
+
+    `LeRobotDataset.create` refuses an existing directory. A previous takeover session can leave
+    behind either an empty directory or metadata files before any span is saved, and either form
+    should be replaced by a real dataset on the next run. Anything with payload files is treated
+    as operator data and must be inspected rather than overwritten.
+    """
+    if root.is_symlink() or not root.is_dir():
+        return False
+    files = {path.relative_to(root) for path in root.rglob('*') if path.is_file()}
+    return files.issubset(DAGGER_RECREATABLE_FILES)
 
 
 def dagger_dataset_features(base_features: dict[str, dict]) -> dict[str, dict]:
@@ -144,6 +199,13 @@ def build_dagger_frame(
 
     Same helper, same prefixes, same ``task`` key -- because a frame that is merely *similar* to
     a recorded one is a frame that trains a policy on a schema it will not meet again.
+
+    ``observation_values`` must carry each image already in the *dataset's* own geometry: the
+    dataset being imitated is usually a training view, whose images are its crop of the camera
+    rather than the raw frame. Nothing here can check that -- the shapes are only validated when
+    the buffer is flushed, which is after the operator has driven the whole correction -- so the
+    caller passes what the policy was shown (``build_policy_observation``'s output), not what the
+    robot reported.
     """
     frame = {
         **build_dataset_frame(dataset_features, observation_values, prefix=OBSERVATION_PREFIX),
