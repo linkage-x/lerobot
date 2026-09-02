@@ -49,6 +49,16 @@ DEFAULT_EXPORTS_ROOT = Path("outputs/exports")
 # Training views are grouped one level below the exports root. The grouping directory is not
 # itself a dataset, so every scan that walks the exports root has to descend into it explicitly.
 TRAINING_VIEWS_DIR_NAME = "training_views"
+# Guided calibration captures live in their own tree, outside the datasets root.
+# A board sweep is not a recording of a task: counting it as task progress and
+# merging it into a v3 export are both wrong, and both followed automatically
+# from it landing under the task's dataset root. Its own root is what lets
+# _dataset_kind classify it once instead of every consumer re-deciding from the
+# directory name. Laid out as <root>/calib_<ts>/{intrinsics,extrinsics}/, so the
+# two captures a session produces map onto the two solve pointers that already
+# exist -- intrinsics and extrinsics cannot share a capture.
+DEFAULT_CALIBRATION_CAPTURES_ROOT = Path("outputs/calibration_captures")
+CALIBRATION_CAPTURE_KINDS = ("intrinsics", "extrinsics")
 DEPLOYMENT_PROFILES: dict[str, dict[str, Any]] = {
     "thor": {
         "label": "Thor Acquisition",
@@ -116,6 +126,13 @@ _RECORDER_OUTPUT_RING_CAP = 300
 class RecordingStatus:
     state: str = "idle"
     datasetRoot: str = ""
+    # Where the recorder says the NEXT episode will land, echoed back from its
+    # ``Capture root:`` line. Equal to datasetRoot for ordinary captures; the
+    # calibration wizard redirects it so a board sweep never lands in the task's
+    # training dataset. It is an acknowledgement, not a request -- a recorder
+    # built before the redirect existed never emits it, and the wizard refuses to
+    # record rather than assume its segments went where it asked.
+    captureRoot: str = ""
     repoId: str = ""
     episodeIndex: int = 0
     savedEpisodes: int = 0
@@ -294,6 +311,13 @@ class CalibrationSession:
     stage: str = "idle"  # idle | capture | ready | solving | done | failed
     datasetName: str = ""
     datasetRoot: str = ""
+    # The session's own capture tree, <calibration captures root>/calib_<ts>.
+    # The wizard owns where its segments are written rather than inheriting
+    # whatever dataset the recorder was pointed at when it was spawned, which is
+    # how board sweeps used to end up counted as task progress and exported into
+    # the training set. Its two subdirectories are the two captures a session
+    # produces -- see _calibration_step_capture_root.
+    captureRoot: str = ""
     steps: list[CalibrationStep] = field(default_factory=list)
     currentIndex: int = 0
     message: str = ""
@@ -1195,6 +1219,31 @@ def _scan_datasets_root(state: GatewayState) -> list[Path]:
     return [entry for entry in root.iterdir() if _is_dataset_root(entry)]
 
 
+def _calibration_captures_root(state: GatewayState) -> Path:
+    return state.repo_root / DEFAULT_CALIBRATION_CAPTURES_ROOT
+
+
+def _scan_calibration_captures_root(state: GatewayState) -> list[Path]:
+    """The intrinsics/extrinsics captures under every calibration session.
+
+    Two levels deep, like training views: <root>/calib_<ts>/<kind>. The session
+    directory groups them and is not itself a dataset, so a single-level scan
+    would find nothing and the solve dropdown would not list a capture recorded
+    moments earlier.
+    """
+    root = _calibration_captures_root(state)
+    if not root.is_dir():
+        return []
+    entries: list[Path] = []
+    for session_dir in root.iterdir():
+        if not session_dir.is_dir():
+            continue
+        entries.extend(
+            capture for capture in session_dir.iterdir() if _is_dataset_root(capture)
+        )
+    return entries
+
+
 def _scan_exports_root(state: GatewayState) -> list[Path]:
     root = _task_exports_root(state)
     if not root.is_dir():
@@ -1250,11 +1299,32 @@ def _dataset_kind(state: GatewayState, dataset_root: Path) -> str:
         return "training_view"
     except (OSError, ValueError):
         pass
+    # A calibration sweep is measurement data, not a demonstration. Classifying
+    # it here is what keeps it out of task progress and out of v3 exports:
+    # _count_completed_episodes and the export scan both already skip anything
+    # whose kind is not "recorded".
+    try:
+        resolved.relative_to(_calibration_captures_root(state).resolve())
+        return "calibration"
+    except (OSError, ValueError):
+        pass
     try:
         resolved.relative_to(_task_exports_root(state).resolve())
     except (OSError, ValueError):
         return "recorded"
     return "exported"
+
+
+# Kinds that must never be taken for "the capture that just happened", however
+# new they are on disk: a training view is a re-expression of an older
+# recording, and a calibration sweep is instrument data with no demonstration in
+# it at all. Both would otherwise take the slot the moment they are written --
+# the sweep on every single wizard run.
+_NOT_A_FRESH_CAPTURE_KINDS = frozenset({"training_view", "calibration"})
+
+
+def _can_claim_latest_capture(dataset_kind: str) -> bool:
+    return dataset_kind not in _NOT_A_FRESH_CAPTURE_KINDS
 
 
 _REPLAY_CANDIDATES_MEMO: tuple[float, tuple[Any, ...], list[Path]] | None = None
@@ -1281,6 +1351,7 @@ def _complete_replay_candidates_memo_key(state: GatewayState) -> tuple[Any, ...]
         _path_memo_key(state.repo_root),
         _path_memo_key(state.datasets_root),
         _path_memo_key(_task_exports_root(state)),
+        _path_memo_key(_calibration_captures_root(state)),
         _dataset_scan_signature(state),
     )
 
@@ -1297,7 +1368,7 @@ def _complete_replay_dataset_candidates(state: GatewayState) -> list[Path]:
     if memo is not None and now - memo[0] < _REPLAY_CANDIDATES_TTL_S and memo[1] == memo_key:
         return list(memo[2])
     candidates = list(_complete_dataset_candidates(state))
-    for entry in _scan_exports_root(state):
+    for entry in (*_scan_exports_root(state), *_scan_calibration_captures_root(state)):
         if entry not in candidates and _dataset_is_complete(entry):
             candidates.append(entry)
     result = sorted(candidates, key=_dataset_modified_s, reverse=True)
@@ -3523,7 +3594,7 @@ def _start_calibration_session(
         return {"ok": False, "error": "配置里没有相机"}
 
     name = f"calib_{time.strftime('%Y%m%d_%H%M%S')}"
-    datasets_dir = _task_datasets_dir(state) or (state.datasets_root or state.repo_root / "outputs" / "datasets")
+    capture_root = _calibration_captures_root(state) / name
     # One episode per camera, then one shared episode for the rig. The order is
     # the order the operator will walk the room in.
     steps = [CalibrationStep(kind="intrinsics", camera=camera) for camera in cameras]
@@ -3533,7 +3604,8 @@ def _start_calibration_session(
         active=True,
         stage="capture",
         datasetName=name,
-        datasetRoot=str(Path(datasets_dir) / name),
+        datasetRoot=str(capture_root),
+        captureRoot=str(capture_root),
         steps=steps,
         currentIndex=0,
         message="按提示逐台录制；被遮挡或不需要的相机可以跳过。",
@@ -3559,6 +3631,7 @@ def _calibration_session_advance(state: GatewayState) -> None:
         return
     session.stage = "ready"
     session.message = f"采集完成（{len(captured)} 段），可以开始解算。"
+    _clear_capture_root(state)
 
 
 # Recorder states in which the current episode is still open, i.e. there is
@@ -3580,6 +3653,59 @@ def _calibration_segment_written(state: GatewayState, step: CalibrationStep) -> 
     return step.episodeIndex >= 0 and int(state.recording.savedEpisodes) > step.episodeIndex
 
 
+def _calibration_step_capture_root(session: CalibrationSession, step: CalibrationStep) -> Path:
+    """Where this step's segment is written.
+
+    Intrinsics and extrinsics get separate trees because they are separate
+    problems: intrinsics is one independent single-camera fit per camera,
+    extrinsics is one joint fit over the cameras that saw the board at the same
+    instant. The solve has had two pointers for these all along; this is the
+    capture side of the same split.
+    """
+    kind = "intrinsics" if step.kind == "intrinsics" else "extrinsics"
+    return Path(session.captureRoot) / kind
+
+
+def _calibration_capture_intent(
+    session: CalibrationSession, step: CalibrationStep
+) -> dict[str, Any]:
+    """What this episode's meta.json will record about why it was captured.
+
+    ``target_camera`` is the part that cannot be recovered afterwards: on disk,
+    cam_05's intrinsics sweep and the ten other cameras that happened to be
+    rolling through it are eleven indistinguishable videos. Without this written
+    down, "episode 7 is cam_05's sweep" lives only in this session object and is
+    gone the moment the gateway restarts.
+    """
+    return {
+        "purpose": f"calibration_{step.kind}",
+        "target_camera": step.camera,
+        "session_id": session.datasetName,
+        "protocol": (
+            "charuco_400_edge_sweep"
+            if step.kind == "intrinsics"
+            else "charuco_400_covisibility_sweep"
+        ),
+        "segment_seconds": session.episodeTimeS,
+    }
+
+
+def _clear_capture_root(state: GatewayState) -> None:
+    """Best-effort: put the recorder back on its own session dataset.
+
+    Not the safety net. ``_start_episode`` asserts the destination before every
+    episode, which is what actually makes an abandoned wizard harmless. This is
+    so the recorder log says where things stand when a session ends normally.
+    """
+    process = state.process
+    if process is None or process.stdin is None or not _state_is_gmsl2(state):
+        return
+    try:
+        _write_recorder_stdin(process, "capture_root:\n")
+    except (OSError, RuntimeError, ValueError) as exc:
+        state.log("warn", f"could not reset the recorder capture root: {exc}")
+
+
 def _calibration_step_record(state: GatewayState, action: str) -> dict[str, Any]:
     session = state.calibration_session
     if not session.active or session.stage != "capture":
@@ -3597,7 +3723,17 @@ def _calibration_step_record(state: GatewayState, action: str) -> dict[str, Any]
                     "ok": False,
                     "error": "相机还没连接。请先到「采集」页点 Connect，等相机全部就绪后再回来录制。",
                 }
-            _start_episode(state, session.episodeTimeS)
+            # The wizard, not the recorder's spawn-time config, decides where a
+            # sweep lands -- and refuses to record at all if the recorder does
+            # not confirm it, rather than let a segment go silently into the
+            # task's training dataset.
+            _start_episode(
+                state,
+                session.episodeTimeS,
+                capture_root=_calibration_step_capture_root(session, step),
+                capture_intent=_calibration_capture_intent(session, step),
+                require_capture_root_ack=True,
+            )
             step.status = "recording"
             step.note = ""
             # The index this segment will take, read before the recorder confirms:
@@ -3641,14 +3777,15 @@ def _calibration_step_record(state: GatewayState, action: str) -> dict[str, Any]
                 step.status = "captured"
                 if not episode_open:
                     step.note = f"录满 {session.episodeTimeS:g}s 自动收尾并保存"
-                # Point the solve at what the recorder actually wrote. The session
-                # names a calib_<ts> dataset when it starts, but the recorder's
-                # dataset root was fixed when it was spawned at Connect, so that
-                # name is a label and not a path: _start_extrinsics_calibration
-                # would resolve it and find no episodes/ under it.
-                if state.recording.datasetRoot:
-                    session.datasetRoot = state.recording.datasetRoot
-                    session.datasetName = Path(state.recording.datasetRoot).name
+                # Point the solve at what this session recorded. The wizard owns
+                # the destination now, so each half of the solve follows its own
+                # capture tree; this used to have to read the path back off the
+                # recorder, because the session name was a label and not a path.
+                capture_root = _calibration_step_capture_root(session, step)
+                if step.kind == "intrinsics":
+                    state.calibration.intrinsicsDatasetRoot = str(capture_root)
+                else:
+                    state.calibration.solveDatasetRoot = str(capture_root)
                 _calibration_session_advance(state)
             else:
                 step.status = "pending"
@@ -3691,10 +3828,18 @@ def _cancel_calibration_session(state: GatewayState) -> dict[str, Any]:
         return {"ok": False, "error": "正在录制中，请先保存或丢弃当前段"}
     # Leaving the wizard must not orphan what it recorded. The episodes are on
     # disk either way; without this the only pointer to them goes with the
-    # session, and the fallback scan will not find a capture whose name does not
-    # happen to contain "calib".
-    if state.calibration_session.datasetRoot:
-        state.calibration.solveDatasetRoot = state.calibration_session.datasetRoot
+    # session. Point at the capture trees rather than the session directory --
+    # that one only groups them and has no episodes/ for the solver to read.
+    session = state.calibration_session
+    if session.captureRoot:
+        for kind, field_name in (
+            ("extrinsics", "solveDatasetRoot"),
+            ("intrinsics", "intrinsicsDatasetRoot"),
+        ):
+            capture = Path(session.captureRoot) / kind
+            if (capture / "episodes").is_dir():
+                setattr(state.calibration, field_name, str(capture))
+    _clear_capture_root(state)
     state.calibration_session = CalibrationSession()
     state.log("info", "Calibration session cancelled")
     return {"ok": True, "session": _calibration_session_payload(state)}
@@ -4950,7 +5095,20 @@ def _run_hand_eye_plan(
 
 
 def _newest_calibration_dataset(state: GatewayState) -> Path | None:
-    """Most recent recorded sweep that looks like a calibration capture."""
+    """Most recent extrinsics sweep, newest layout first.
+
+    The calibration captures tree is authoritative because a capture there says
+    what it is by where it sits. The "calib" name scan under the datasets root is
+    kept for sweeps recorded before calibration had its own root -- they are
+    still perfectly solvable, and this is the only thing that still finds them.
+    """
+    captures = [
+        capture
+        for capture in _scan_calibration_captures_root(state)
+        if capture.name == "extrinsics" and (capture / "episodes").is_dir()
+    ]
+    if captures:
+        return max(captures, key=lambda p: p.stat().st_mtime)
     roots = [state.datasets_root] if state.datasets_root else []
     roots.append(state.repo_root / "outputs" / "datasets")
     for root in roots:
@@ -4989,8 +5147,12 @@ def _solve_dataset(state: GatewayState, dataset_arg: str = "") -> tuple[Path | N
         if resolved is None or not (resolved / "episodes").is_dir():
             return None, "missing"
         return resolved, "manual"
-    if session.active and session.datasetRoot:
-        resolved = _resolve_dataset_root(state.repo_root, session.datasetRoot)
+    if session.active and session.captureRoot:
+        # The extrinsics half: it is the one the solve cannot run without, and
+        # the session directory itself only groups the two captures.
+        resolved = _resolve_dataset_root(
+            state.repo_root, str(Path(session.captureRoot) / "extrinsics")
+        )
         if resolved is not None and (resolved / "episodes").is_dir():
             return resolved, "session"
     newest = _newest_calibration_dataset(state)
@@ -5041,7 +5203,13 @@ def _solve_candidates(state: GatewayState) -> list[dict[str, Any]]:
     for extra in (
         state.calibration.solveDatasetRoot,
         state.calibration.intrinsicsDatasetRoot,
-        state.calibration_session.datasetRoot,
+        # Both halves of the live session: the grouping directory itself has no
+        # episodes/, so naming it here would list nothing.
+        *(
+            str(Path(state.calibration_session.captureRoot) / kind)
+            for kind in CALIBRATION_CAPTURE_KINDS
+            if state.calibration_session.captureRoot
+        ),
     ):
         resolved = _resolve_dataset_root(state.repo_root, extra) if extra else None
         if resolved is None or str(resolved) in seen or not (resolved / "episodes").is_dir():
@@ -7632,9 +7800,9 @@ def _recorded_dataset_items(state: GatewayState) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     candidates = _complete_replay_dataset_candidates(state)
     # "Latest" drives one-click actions on freshly captured data (Live Record -> Open in Replay),
-    # so a derived training view must never claim it even when it is the newest directory.
+    # so a derived view or a board sweep must never claim it even when it is the newest directory.
     latest_recorded = next(
-        (root for root in candidates if _dataset_kind(state, root) != "training_view"),
+        (root for root in candidates if _can_claim_latest_capture(_dataset_kind(state, root))),
         None,
     )
     for dataset_root in candidates:
@@ -9952,6 +10120,10 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         else:
             state.recording.message = f"Recorder exited with code {process.returncode}"
         state.recording.datasetRoot = str(_dataset_config(state.config).get("root") or state.recording.datasetRoot)
+        # The recorder that acknowledged a redirect is gone, so its
+        # acknowledgement is no longer a fact about anything. Leaving it set
+        # would let the next recorder inherit a claim it never made.
+        state.recording.captureRoot = ""
         _set_all_device_states(
             state,
             "idle" if process.returncode == 0 or exited_from in ("idle", "discarding") else "error",
@@ -10016,7 +10188,18 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
                 "message": f"Selected {_dataset_kind(state, selected_replay_root)} dataset: {selected_replay_root.name}",
             }
     if recorded_datasets and not trajectory_meta.get("datasetRoot"):
-        latest_dataset = recorded_datasets[0]
+        # Same rule as isLatest, read off the cached items rather than the disk:
+        # _snapshot runs under state.lock and must not walk the dataset tree.
+        # The unfiltered fallback stays for a tree that holds nothing else --
+        # showing a derived dataset beats opening the Replay page on nothing.
+        latest_dataset = next(
+            (
+                item
+                for item in recorded_datasets
+                if _can_claim_latest_capture(str(item.get("datasetKind") or "recorded"))
+            ),
+            recorded_datasets[0],
+        )
         trajectory_meta = {
             **trajectory_meta,
             "datasetRoot": latest_dataset["path"],
@@ -10697,7 +10880,38 @@ def _connect_recorder(state: GatewayState, *, backend: str | None = None) -> Non
     _start_output_reader(state, state.process)
 
 
-def _start_episode(state: GatewayState, episode_time_s: float | None = None) -> None:
+_CAPTURE_ROOT_ACK_TIMEOUT_S = 5.0
+
+
+def _await_capture_root(state: GatewayState, expected: Path, timeout_s: float) -> bool:
+    """Wait for the recorder to confirm where the next episode will be written.
+
+    A redirect is only a request until the recorder echoes it back. A recorder
+    built before ``capture_root`` existed logs the line as unrecognised and keeps
+    writing to the session dataset -- which is exactly the silent pollution the
+    redirect exists to end -- so a caller that depends on the redirect has to see
+    the acknowledgement before it records anything.
+
+    Polled without ``state.lock`` on purpose: the output consumer thread needs
+    that lock to apply the very line being waited for.
+    """
+    wanted = str(expected)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if state.recording.captureRoot == wanted:
+            return True
+        time.sleep(0.05)
+    return state.recording.captureRoot == wanted
+
+
+def _start_episode(
+    state: GatewayState,
+    episode_time_s: float | None = None,
+    *,
+    capture_root: Path | None = None,
+    capture_intent: dict[str, Any] | None = None,
+    require_capture_root_ack: bool = False,
+) -> None:
     """Queue one episode, optionally overriding how long the recorder runs it.
 
     ``episode_time_s`` asks the recorder for a specific length for this episode
@@ -10708,10 +10922,51 @@ def _start_episode(state: GatewayState, episode_time_s: float | None = None) -> 
     Only the GMSL2 recorder implements the command -- the FR3 runtime queues
     unrecognised stdin lines as commands, so sending it there would be noise in
     its state machine.
+
+    ``capture_root`` sends this episode somewhere other than the recorder's
+    session dataset, and ``capture_intent`` records why it was captured in its
+    meta.json. ``capture_root=None`` means "the session dataset", and is asserted
+    rather than assumed: an abandoned calibration session leaves the recorder
+    still redirected, and Live Record passing no root is what puts it back.
     """
     process = _ensure_recorder_running(state)
     if state.recording.state not in ("armed", "idle"):
         raise RuntimeError(f"Cannot start an episode while recorder is {state.recording.state}.")
+
+    if _state_is_gmsl2(state):
+        # Sent only when it would actually change something. The recorder echoes
+        # every redirect, so restating an unchanged root would add a line to the
+        # operator's log before each capture; and a recorder too old to echo at
+        # all reports nothing, which must read as "not redirected" rather than as
+        # a mismatch worth correcting before every episode.
+        acknowledged = state.recording.captureRoot
+        if capture_root is not None:
+            if acknowledged != str(capture_root):
+                _write_recorder_stdin(process, f"capture_root:{capture_root}\n")
+        elif acknowledged and acknowledged != str(state.recording.datasetRoot or ""):
+            # The recorder says it is writing somewhere other than its own
+            # dataset -- an abandoned calibration session. Put it back before
+            # this episode rather than let a task recording land in that tree.
+            _write_recorder_stdin(process, "capture_root:\n")
+        if require_capture_root_ack:
+            if capture_root is None:
+                raise RuntimeError("Cannot require a capture-root acknowledgement without a root.")
+            if not _await_capture_root(state, capture_root, _CAPTURE_ROOT_ACK_TIMEOUT_S):
+                raise RuntimeError(
+                    f"录制器没有确认采集目录 {capture_root}"
+                    f"（它报告的是 {state.recording.captureRoot or '（无）'}）。"
+                    "多半是 Thor 上的录制器还是旧版本：先 deploy，再到「采集」页重新 Connect。"
+                )
+        if capture_intent:
+            _write_recorder_stdin(
+                process,
+                f"capture_intent:{json.dumps(capture_intent, separators=(',', ':'))}\n",
+            )
+    elif capture_root is not None or capture_intent is not None:
+        raise RuntimeError(
+            "This recorder cannot redirect where an episode is written; only the "
+            "GMSL2 recorder implements capture_root/capture_intent."
+        )
 
     if episode_time_s is not None and episode_time_s > 0:
         if not _state_is_gmsl2(state):
@@ -11474,6 +11729,13 @@ def _apply_recorder_output(state: GatewayState, output: str) -> None:
     if root_match:
         dataset_root = root_match.group(1).strip()
         state.recording.datasetRoot = dataset_root
+
+    # A separate line from "Dataset root:" on purpose: datasetRoot is what this
+    # recording session is called, captureRoot is where the next episode's bytes
+    # go, and only the second one moves when the wizard redirects a sweep.
+    capture_root_match = re.search(r"Capture root:\s*(.+)", output)
+    if capture_root_match:
+        state.recording.captureRoot = capture_root_match.group(1).strip()
 
     ready_match = re.search(r"Episode\s+(\d+)\s+ready", output)
     if ready_match:

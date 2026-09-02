@@ -192,8 +192,14 @@ def _calibration_gateway_state(tmp_path: Path) -> gateway.GatewayState:
     return state
 
 
-def _open_calibration_segment(state: gateway.GatewayState, monkeypatch) -> None:
-    def fake_start_episode(fake_state: gateway.GatewayState, episode_time_s: float | None = None) -> None:
+def _open_calibration_segment(
+    state: gateway.GatewayState, monkeypatch, calls: list[dict] | None = None
+) -> None:
+    def fake_start_episode(
+        fake_state: gateway.GatewayState, episode_time_s: float | None = None, **kwargs
+    ) -> None:
+        if calls is not None:
+            calls.append({"episode_time_s": episode_time_s, **kwargs})
         fake_state.recording.state = "recording"
         fake_state.recording.frameIndex = 0
 
@@ -214,6 +220,69 @@ def _capture_recorder_stdin(monkeypatch) -> list[str]:
     monkeypatch.setattr(gateway, "_ensure_recorder_running", lambda _state: object())
     monkeypatch.setattr(gateway, "_write_recorder_stdin", lambda _proc, text: written.append(text))
     return written
+
+
+def test_start_episode_sends_a_calibration_sweep_somewhere_else(tmp_path, monkeypatch):
+    state = _calibration_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    capture_root = tmp_path / "outputs" / "calibration_captures" / "calib_1" / "intrinsics"
+    state.recording.captureRoot = str(capture_root)  # already acknowledged
+
+    gateway._start_episode(
+        state, 30, capture_root=capture_root, capture_intent={"target_camera": "cam_06"}
+    )
+
+    # Destination and intent both have to land before the start newline: after it
+    # the episode is already recording somewhere.
+    assert written == [
+        'capture_intent:{"target_camera":"cam_06"}\n',
+        "episode_time:30\n",
+        "\n",
+    ]
+
+
+def test_start_episode_refuses_a_redirect_the_recorder_never_confirmed(tmp_path, monkeypatch):
+    # A recorder built before capture_root existed logs the line as unrecognised
+    # and keeps writing to the session dataset. Believing the redirect took is
+    # exactly how a board sweep ends up in the training set anyway, so the
+    # acknowledgement is a precondition, not a nicety.
+    state = _calibration_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    monkeypatch.setattr(gateway, "_CAPTURE_ROOT_ACK_TIMEOUT_S", 0.05)
+    capture_root = tmp_path / "outputs" / "calibration_captures" / "calib_1" / "intrinsics"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        gateway._start_episode(state, 30, capture_root=capture_root, require_capture_root_ack=True)
+
+    assert "deploy" in str(excinfo.value)
+    # It asked, then stopped: no episode was started anywhere.
+    assert written == [f"capture_root:{capture_root}\n"]
+    assert state.recording.state == "armed"
+
+
+def test_start_episode_puts_an_abandoned_calibration_redirect_back(tmp_path, monkeypatch):
+    # The wizard clears the redirect when it ends, but a gateway that never got
+    # there would leave the recorder pointed at the calibration tree. Live Record
+    # states its own destination rather than inheriting that.
+    state = _calibration_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    state.recording.captureRoot = str(tmp_path / "outputs" / "calibration_captures" / "calib_1")
+
+    gateway._start_episode(state)
+
+    assert written == ["capture_root:\n", "\n"]
+
+
+def test_start_episode_says_nothing_about_the_capture_root_when_nothing_moved(tmp_path, monkeypatch):
+    # The recorder echoes every redirect, so restating an unchanged destination
+    # would put a line in the operator's log before each capture.
+    state = _calibration_gateway_state(tmp_path)
+    written = _capture_recorder_stdin(monkeypatch)
+    state.recording.captureRoot = state.recording.datasetRoot
+
+    gateway._start_episode(state)
+
+    assert written == ["\n"]
 
 
 def test_start_episode_asks_the_gmsl2_recorder_for_a_specific_length(tmp_path, monkeypatch):
@@ -294,7 +363,9 @@ def test_calibration_start_asks_the_recorder_for_the_session_length(tmp_path, mo
     state = _calibration_gateway_state(tmp_path)
     seen: list[float | None] = []
 
-    def fake_start_episode(fake_state: gateway.GatewayState, episode_time_s: float | None = None) -> None:
+    def fake_start_episode(
+        fake_state: gateway.GatewayState, episode_time_s: float | None = None, **_kwargs
+    ) -> None:
         seen.append(episode_time_s)
         fake_state.recording.state = "recording"
 
@@ -304,6 +375,59 @@ def test_calibration_start_asks_the_recorder_for_the_session_length(tmp_path, mo
     assert gateway._calibration_step_record(state, "start")["ok"] is True
 
     assert seen == [45.0]
+
+
+def test_calibration_records_into_its_own_tree_not_the_task_dataset(tmp_path, monkeypatch):
+    # A board sweep landing in the task's dataset was counted as task progress
+    # and merged into the v3 export. The wizard owns its destination now, and
+    # states it per segment rather than inheriting whatever the recorder was
+    # pointed at when it was spawned at Connect.
+    state = _calibration_gateway_state(tmp_path)
+    calls: list[dict] = []
+    _open_calibration_segment(state, monkeypatch, calls)
+
+    captures_root = tmp_path / "outputs" / "calibration_captures"
+    session = state.calibration_session
+    assert Path(session.captureRoot).parent == captures_root
+    assert session.captureRoot != state.recording.datasetRoot
+
+    # Intrinsics and extrinsics cannot share a capture, so they do not share a
+    # directory either -- the two trees are the two solve pointers.
+    assert calls[0]["capture_root"] == Path(session.captureRoot) / "intrinsics"
+    # The recorder is required to confirm the redirect; assuming it took is how a
+    # segment would silently end up in the training dataset anyway.
+    assert calls[0]["require_capture_root_ack"] is True
+
+    intent = calls[0]["capture_intent"]
+    assert intent["purpose"] == "calibration_intrinsics"
+    # The one thing the videos cannot tell you afterwards: which camera this
+    # sweep was for. Eleven full-rig segments look identical on disk.
+    assert intent["target_camera"] == "cam_06"
+    assert intent["session_id"] == session.datasetName
+
+
+def test_calibration_extrinsics_goes_to_a_different_tree_than_intrinsics(tmp_path, monkeypatch):
+    state = _calibration_gateway_state(tmp_path)
+    calls: list[dict] = []
+
+    def fake_start_episode(
+        fake_state: gateway.GatewayState, episode_time_s: float | None = None, **kwargs
+    ) -> None:
+        calls.append({"episode_time_s": episode_time_s, **kwargs})
+        fake_state.recording.state = "recording"
+
+    monkeypatch.setattr(gateway, "_start_episode", fake_start_episode)
+    assert gateway._start_calibration_session(state)["ok"] is True
+    # Skip straight past the per-camera sweeps to the shared rig one.
+    for _ in range(len(state.calibration_session.steps) - 1):
+        assert gateway._calibration_step_skip(state)["ok"] is True
+    assert state.calibration_session.steps[-1].kind == "extrinsics"
+
+    assert gateway._calibration_step_record(state, "start")["ok"] is True
+
+    session = state.calibration_session
+    assert calls[-1]["capture_root"] == Path(session.captureRoot) / "extrinsics"
+    assert calls[-1]["capture_intent"]["purpose"] == "calibration_extrinsics"
 
 
 def test_calibration_save_ends_a_live_segment_early(tmp_path, monkeypatch):
@@ -322,10 +446,14 @@ def test_calibration_save_ends_a_live_segment_early(tmp_path, monkeypatch):
     assert step.status == "captured"
     assert step.episodeIndex == 2
     assert state.calibration_session.currentIndex == 1
-    # The solve has to run over the dataset the recorder is writing into, not the
-    # calib_<ts> label the session made up before knowing it.
-    assert state.calibration_session.datasetRoot == state.recording.datasetRoot
-    assert state.calibration_session.datasetName == "thor_gmsl2_Nch_v1"
+    # Each half of the solve follows its own capture tree. This used to read the
+    # path back off the recorder, because the wizard did not own where its
+    # segments landed and its own calib_<ts> name was a label, not a path.
+    session = state.calibration_session
+    assert state.calibration.intrinsicsDatasetRoot == str(Path(session.captureRoot) / "intrinsics")
+    # An intrinsics sweep says nothing about where the cameras are relative to
+    # each other, so it must not become the extrinsics capture.
+    assert state.calibration.solveDatasetRoot == ""
 
 
 def test_calibration_save_registers_a_segment_the_recorder_already_auto_saved(tmp_path, monkeypatch):
@@ -3453,37 +3581,129 @@ def test_the_bar_walks_all_three_steps_of_a_real_solve(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_a_failed_solve_can_be_retried_on_the_same_capture(tmp_path):
-    """The 2026-08-20 dead end: the wizard records into a dataset named after
-    the rig (thor_gmsl2_10ch_v1_...), the solve failed, and the fallback scan
-    only finds directories with "calib" in the name -- so an intact 11-episode
-    capture became unreachable the moment its first solve failed."""
+def _wizard_capture(tmp_path: Path, *, kind: str, episodes: int, cameras: int) -> Path:
+    """One half of a guided session's capture, in the layout the wizard writes.
+
+    Carries the per-episode meta.json a real recorder writes, including the
+    capture_intent block -- which is both what the dataset scan keys on and the
+    only record of which camera a sweep was for.
+    """
+    capture = tmp_path / "outputs" / "calibration_captures" / "calib_20260820_152528" / kind
+    for episode in range(episodes):
+        directory = capture / "episodes" / f"episode_{episode:06d}"
+        directory.mkdir(parents=True)
+        for camera in range(cameras):
+            (directory / f"cam_{camera:02d}.mkv").write_bytes(b"x" * 2048)
+        (directory / "meta.json").write_text(
+            json.dumps(
+                {
+                    "episode_index": episode,
+                    "capture_intent": {
+                        "purpose": f"calibration_{kind}",
+                        "target_camera": f"cam_{episode:02d}" if kind == "intrinsics" else "",
+                        "session_id": "calib_20260820_152528",
+                    },
+                }
+            )
+        )
+    return capture
+
+
+def test_a_wizard_capture_is_classified_as_calibration_not_a_recording(tmp_path):
+    # This one classification is what keeps a board sweep out of task progress
+    # and out of the v3 export: both already skip anything whose kind is not
+    # "recorded", so neither had to learn about calibration separately.
     state = _solve_state(tmp_path)
-    dataset = _charuco_capture(tmp_path, episodes=2, cameras=3)
-    renamed = dataset.parent / "thor_gmsl2_10ch_v1_20260820_152528"
-    dataset.rename(renamed)
+    state.datasets_root = tmp_path / "outputs" / "datasets"
+    intrinsics = _wizard_capture(tmp_path, kind="intrinsics", episodes=1, cameras=2)
+    ordinary = _charuco_capture(tmp_path, episodes=1, cameras=2)
+
+    assert gateway._dataset_kind(state, intrinsics) == "calibration"
+    assert gateway._dataset_kind(state, ordinary) == "recorded"
+
+
+def test_a_wizard_capture_is_offered_to_the_solve(tmp_path):
+    # Its own root would be a dead end if the scan stopped at the datasets root:
+    # the capture would be classified correctly and then be unselectable. The
+    # session directory groups the two captures and is not itself one, so the
+    # scan has to descend a level -- the same shape as training views.
+    state = _solve_state(tmp_path)
+    state.datasets_root = tmp_path / "outputs" / "datasets"
+    intrinsics = _wizard_capture(tmp_path, kind="intrinsics", episodes=1, cameras=2)
+    state.cached_recorded_datasets = gateway._recorded_dataset_items(state)
+
+    paths = [candidate["path"] for candidate in gateway._solve_candidates(state)]
+
+    assert str(intrinsics) in paths
+
+
+def test_a_wizard_capture_never_claims_to_be_the_latest_recording(tmp_path):
+    # "Latest" is what one-click actions follow (Live Record -> Open in Replay,
+    # and the dataset the Replay page opens on). A sweep is the newest directory
+    # on disk the moment a session ends and holds no demonstration at all, so
+    # letting it claim the slot would aim those actions at a board sweep until
+    # the next task recording happens to land.
+    state = _solve_state(tmp_path)
+    state.datasets_root = tmp_path / "outputs" / "datasets"
+    ordinary = tmp_path / "outputs" / "datasets" / "pick_place_20260902_101500"
+    episode = ordinary / "episodes" / "episode_000000"
+    episode.mkdir(parents=True)
+    for camera in range(2):
+        (episode / f"cam_{camera:02d}.mkv").write_bytes(b"x" * 2048)
+    (episode / "meta.json").write_text(json.dumps({"episode_index": 0}))
+    older_ns = int((time.time() - 3600) * 1e9)
+    for path in (ordinary, *ordinary.rglob("*")):
+        os.utime(path, ns=(older_ns, older_ns))
+    sweep = _wizard_capture(tmp_path, kind="extrinsics", episodes=1, cameras=2)
+
+    items = {item["path"]: item for item in gateway._recorded_dataset_items(state)}
+
+    assert items[str(sweep)]["datasetKind"] == "calibration"
+    assert items[str(sweep)]["isLatest"] is False
+    assert items[str(ordinary)]["isLatest"] is True
+
+
+def test_a_failed_solve_can_be_retried_on_the_same_capture(tmp_path):
+    """The 2026-08-20 dead end: the solve failed and the fallback scan only
+    finds directories with "calib" in the name -- so an intact capture became
+    unreachable the moment its first solve failed. The wizard now names its own
+    tree, so the session still points at the capture after a failure."""
+    state = _solve_state(tmp_path)
+    extrinsics = _wizard_capture(tmp_path, kind="extrinsics", episodes=2, cameras=3)
     state.calibration_session = gateway.CalibrationSession(
-        active=True, stage="failed", datasetName=renamed.name, datasetRoot=str(renamed)
+        active=True,
+        stage="failed",
+        datasetName=extrinsics.parent.name,
+        datasetRoot=str(extrinsics.parent),
+        captureRoot=str(extrinsics.parent),
     )
 
     resolved, source = gateway._solve_dataset(state)
 
-    assert resolved == renamed
+    # The session directory only groups the two captures; the solvable one is
+    # the extrinsics tree under it.
+    assert resolved == extrinsics
     assert source == "session"
 
 
 def test_leaving_the_wizard_does_not_orphan_what_it_recorded(tmp_path):
     state = _solve_state(tmp_path)
-    dataset = _charuco_capture(tmp_path, episodes=1, cameras=2)
-    renamed = dataset.parent / "thor_gmsl2_10ch_v1_20260820_152528"
-    dataset.rename(renamed)
+    extrinsics = _wizard_capture(tmp_path, kind="extrinsics", episodes=1, cameras=2)
+    intrinsics = _wizard_capture(tmp_path, kind="intrinsics", episodes=2, cameras=2)
     state.calibration_session = gateway.CalibrationSession(
-        active=True, stage="failed", datasetName=renamed.name, datasetRoot=str(renamed)
+        active=True,
+        stage="failed",
+        datasetName=extrinsics.parent.name,
+        datasetRoot=str(extrinsics.parent),
+        captureRoot=str(extrinsics.parent),
     )
 
     assert gateway._cancel_calibration_session(state)["ok"] is True
 
-    assert gateway._solve_dataset(state) == (renamed, "manual")
+    assert gateway._solve_dataset(state) == (extrinsics, "manual")
+    # Both halves survive the wizard: re-solving needs the intrinsics capture
+    # too, and nothing else on disk says which tree it was.
+    assert state.calibration.intrinsicsDatasetRoot == str(intrinsics)
 
 
 def test_a_named_capture_is_never_silently_replaced_by_another(tmp_path):

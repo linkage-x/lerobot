@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>标定采集解耦设计</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>
+  :root{
+    --bg:#f6f7f9;
+    --card:#ffffff;
+    --card-alt:#fafbfc;
+    --text:#1f2937;
+    --muted:#6b7280;
+    --line:#e5e7eb;
+    --line-strong:#d1d5db;
+    --accent:#2563eb;
+    --accent-soft:#eff6ff;
+    --ok:#15803d;
+    --ok-bg:#ecfdf5;
+    --warn:#b45309;
+    --warn-bg:#fffbeb;
+    --p0:#991b1b;
+    --p0-bg:#fef2f2;
+    --code-bg:#f3f4f6;
+    --code-text:#334155;
+    --anchor:#5b21b6;
+    --anchor-bg:#f5f3ff;
+    --flow-bg:#0f172a;
+    --flow-text:#dbe3ef;
+    --flow-dim:#7c8ba1;
+    --flow-hi:#7dd3fc;
+    --th-bg:#f9fafb;
+    --shadow:0 8px 24px rgba(15,23,42,.06);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#0e1015;
+      --card:#171a21;
+      --card-alt:#1c2029;
+      --text:#e4e7ec;
+      --muted:#98a2b3;
+      --line:#272b35;
+      --line-strong:#3a404d;
+      --accent:#7cabf7;
+      --accent-soft:#16233a;
+      --ok:#5cd48a;
+      --ok-bg:#11251a;
+      --warn:#f0b45f;
+      --warn-bg:#2a2010;
+      --p0:#f28b8b;
+      --p0-bg:#2b1417;
+      --code-bg:#232833;
+      --code-text:#c3ccda;
+      --anchor:#c4b5fd;
+      --anchor-bg:#211d33;
+      --flow-bg:#080a0f;
+      --flow-text:#cbd5e1;
+      --flow-dim:#6b7889;
+      --flow-hi:#7dd3fc;
+      --th-bg:#1c2029;
+      --shadow:0 8px 24px rgba(0,0,0,.45);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0e1015;
+    --card:#171a21;
+    --card-alt:#1c2029;
+    --text:#e4e7ec;
+    --muted:#98a2b3;
+    --line:#272b35;
+    --line-strong:#3a404d;
+    --accent:#7cabf7;
+    --accent-soft:#16233a;
+    --ok:#5cd48a;
+    --ok-bg:#11251a;
+    --warn:#f0b45f;
+    --warn-bg:#2a2010;
+    --p0:#f28b8b;
+    --p0-bg:#2b1417;
+    --code-bg:#232833;
+    --code-text:#c3ccda;
+    --anchor:#c4b5fd;
+    --anchor-bg:#211d33;
+    --flow-bg:#080a0f;
+    --flow-text:#cbd5e1;
+    --flow-dim:#6b7889;
+    --flow-hi:#7dd3fc;
+    --th-bg:#1c2029;
+    --shadow:0 8px 24px rgba(0,0,0,.45);
+  }
+
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    font-family:Inter,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    line-height:1.68;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1120px;margin:0 auto;padding:34px 22px 84px;display:flex;flex-direction:column;gap:22px}
+
+  /* ---------- hero ---------- */
+  .hero{
+    background:linear-gradient(135deg,#111827,#1f2937 55%,#1e293b);
+    color:#fff;border-radius:22px;padding:34px 36px;box-shadow:var(--shadow);
+  }
+  .hero .eyebrow{
+    font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+    color:#93b4f0;margin:0 0 12px;
+  }
+  .hero h1{margin:0 0 10px;font-size:clamp(26px,4vw,34px);letter-spacing:.2px;text-wrap:balance;font-weight:800}
+  .hero .thesis{margin:0;color:#cdd5e0;max-width:64ch;font-size:16px}
+  .hero .meta{display:flex;gap:9px;flex-wrap:wrap;margin-top:20px}
+  .pill{
+    display:inline-flex;align-items:center;gap:7px;
+    padding:6px 12px;border-radius:999px;font-size:12.5px;font-weight:600;
+    border:1px solid rgba(255,255,255,.2);color:#e5e7eb;
+  }
+  .pill.lit{border-color:rgba(147,180,240,.55);color:#bfd4f7;background:rgba(37,99,235,.16)}
+
+  /* ---------- sections ---------- */
+  section{display:flex;flex-direction:column;gap:14px}
+  .section-title{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+  .section-title h2{
+    margin:0;font-size:21px;font-weight:700;letter-spacing:.1px;
+  }
+  .section-title .n{
+    font-family:"JetBrains Mono",ui-monospace,monospace;
+    font-size:13px;font-weight:700;color:var(--accent);
+    border:1px solid var(--line-strong);border-radius:7px;padding:1px 8px;
+  }
+  .section-title .sub{color:var(--muted);font-size:14px}
+
+  .card{
+    background:var(--card);border:1px solid var(--line);border-radius:16px;
+    padding:20px 22px;box-shadow:var(--shadow);
+  }
+  .card > :first-child{margin-top:0}
+  .card > :last-child{margin-bottom:0}
+  .card h3{margin:0 0 8px;font-size:16px;font-weight:700}
+  .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+  .grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
+  p{margin:0 0 10px}
+  ul{margin:8px 0 0;padding-left:20px}
+  li{margin:5px 0}
+
+  .badge{
+    display:inline-block;padding:3px 9px;border-radius:999px;
+    font-size:11.5px;font-weight:700;letter-spacing:.02em;white-space:nowrap;
+  }
+  .b-p0{color:var(--p0);background:var(--p0-bg)}
+  .b-warn{color:var(--warn);background:var(--warn-bg)}
+  .b-ok{color:var(--ok);background:var(--ok-bg)}
+  .b-todo{color:var(--accent);background:var(--accent-soft)}
+  .b-hold{color:var(--muted);background:var(--code-bg)}
+
+  /* ---------- code anchors: the recurring object of this document ---------- */
+  code,.mono{
+    font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:.87em;
+  }
+  code{background:var(--code-bg);color:var(--code-text);border-radius:5px;padding:1.5px 5px}
+  .anchor{
+    background:var(--anchor-bg);color:var(--anchor);
+    border-radius:5px;padding:1.5px 6px;white-space:nowrap;
+    font-family:"JetBrains Mono",ui-monospace,monospace;font-size:.83em;font-weight:500;
+  }
+
+  /* ---------- tables ---------- */
+  .table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:12px}
+  table{width:100%;border-collapse:collapse;font-size:14px;min-width:520px}
+  th,td{padding:10px 13px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{background:var(--th-bg);font-weight:700;font-size:13px;white-space:nowrap}
+  tbody tr:last-child td{border-bottom:none}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;font-family:"JetBrains Mono",ui-monospace,monospace}
+  tr.hi td{background:var(--p0-bg)}
+  .rowlabel{font-weight:600;white-space:nowrap}
+
+  /* ---------- flow blocks ---------- */
+  .flow{
+    white-space:pre;background:var(--flow-bg);color:var(--flow-text);
+    padding:18px 20px;border-radius:12px;overflow-x:auto;
+    font-family:"JetBrains Mono",ui-monospace,monospace;font-size:12.5px;line-height:1.6;
+    border:1px solid rgba(125,211,252,.14);
+  }
+  .flow .dim{color:var(--flow-dim)}
+  .flow .hi{color:var(--flow-hi)}
+  .flow .bad{color:#fca5a5}
+  .flow .good{color:#86efac}
+
+  /* ---------- callouts ---------- */
+  .callout{
+    border-left:3px solid var(--accent);background:var(--accent-soft);
+    padding:13px 16px;border-radius:0 10px 10px 0;
+  }
+  .callout.p0{border-color:var(--p0);background:var(--p0-bg)}
+  .callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  .callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  .callout p:last-child{margin-bottom:0}
+  .callout .lbl{
+    display:block;font-size:11.5px;font-weight:800;letter-spacing:.1em;
+    text-transform:uppercase;margin-bottom:5px;color:var(--muted);
+  }
+  blockquote{
+    margin:10px 0;padding:0 0 0 15px;border-left:2px solid var(--line-strong);
+    color:var(--muted);font-size:14px;
+  }
+  blockquote p:last-child{margin-bottom:0}
+
+  /* ---------- cost list ---------- */
+  .cost{
+    display:grid;grid-template-columns:44px 1fr;gap:0 16px;
+    background:var(--card);border:1px solid var(--line);border-radius:16px;
+    padding:18px 20px;box-shadow:var(--shadow);
+  }
+  .cost.severe{border-color:var(--p0);border-width:1.5px}
+  .cost .idx{
+    font-family:"JetBrains Mono",ui-monospace,monospace;font-size:19px;font-weight:700;
+    color:var(--muted);line-height:1.35;
+  }
+  .cost.severe .idx{color:var(--p0)}
+  .cost .head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:6px}
+  .cost .head h3{margin:0;font-size:16.5px}
+  .cost .body{grid-column:2}
+
+  /* ---------- layer stack ---------- */
+  .layer{
+    background:var(--card);border:1px solid var(--line);border-radius:16px;
+    box-shadow:var(--shadow);overflow:hidden;
+  }
+  .layer.hold{opacity:.85;border-style:dashed}
+  .layer-head{
+    display:flex;align-items:center;gap:13px;flex-wrap:wrap;
+    padding:15px 20px;background:var(--card-alt);border-bottom:1px solid var(--line);
+  }
+  .layer-head .tag{
+    font-family:"JetBrains Mono",ui-monospace,monospace;font-weight:700;font-size:14px;
+    color:#fff;background:var(--accent);border-radius:7px;padding:3px 10px;
+  }
+  .layer.hold .layer-head .tag{background:var(--muted)}
+  .layer-head h3{margin:0;font-size:16.5px;flex:1 1 220px}
+  .layer-body{padding:18px 20px;display:flex;flex-direction:column;gap:12px}
+  .kv{display:grid;grid-template-columns:76px 1fr;gap:6px 14px;font-size:14.5px}
+  .kv dt{
+    font-size:11.5px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;
+    color:var(--muted);padding-top:4px;
+  }
+  .kv dd{margin:0}
+
+  /* ---------- decisions ---------- */
+  .decision{
+    display:flex;gap:14px;align-items:flex-start;
+    padding:16px 18px;border:1px solid var(--line);border-radius:14px;
+    background:var(--card);box-shadow:var(--shadow);
+  }
+  .decision .mark{color:var(--ok);font-size:19px;line-height:1.4;flex:0 0 auto}
+  .decision h3{margin:0 0 5px;font-size:15.5px}
+  .decision p{margin:0;font-size:14px;color:var(--muted)}
+  .decision p strong{color:var(--text)}
+
+  footer{
+    color:var(--muted);font-size:13px;border-top:1px solid var(--line);
+    padding-top:18px;margin-top:6px;
+  }
+  a{color:var(--accent)}
+  a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+  @media (max-width:560px){
+    .hero{padding:26px 22px;border-radius:18px}
+    .wrap{padding:22px 14px 60px}
+    .cost{grid-template-columns:1fr}
+    .cost .idx{font-size:15px;margin-bottom:2px}
+    .cost .body{grid-column:1}
+    .kv{grid-template-columns:1fr;gap:2px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <p class="eyebrow">Calibration · 采集架构设计</p>
+  <h1>标定采集解耦设计</h1>
+  <p class="thesis">内参是 11 个独立的单相机问题，外参是 1 个 11 体联合问题。代码里这句话写对了，数据里没有——两者至今共用同一个 recorder、同一个 dataset root、同一份 11 路视频。这份文档给出把它们拆开的四层方案，以及为什么其中第二层修的是一个正在静默发生的正确性问题。</p>
+  <div class="meta">
+    <span class="pill">2026-09-02</span>
+    <span class="pill">分支 hph/error_study_pr</span>
+    <span class="pill">Thor GMSL2 · 11 路 AR0234 · 1920×1080@60</span>
+    <span class="pill lit">决策已定 · 待实现</span>
+  </div>
+</header>
+
+<!-- ============ 1 ============ -->
+<section>
+  <div class="section-title">
+    <span class="n">01</span>
+    <h2>三个问题的答案</h2>
+    <span class="sub">全部对照 HEAD 复核过</span>
+  </div>
+
+  <div class="grid3">
+    <div class="card">
+      <h3>内参段也是 11 路一起录吗？</h3>
+      <p><span class="badge b-p0">是</span> 一路不少。</p>
+      <p>标定向导没有自己的录制器。<span class="anchor">gateway.py:3583</span> <code>_calibration_step_record("start")</code> 直接调 <code>_start_episode</code>，和 Live Record 按 StartEpisode 是同一个函数。</p>
+    </div>
+    <div class="card">
+      <h3>内外参数据集分开了吗？</h3>
+      <p><span class="badge b-warn">解算分了，采集没分</span></p>
+      <p>解算侧有 <code>intrinsicsDatasetRoot</code> / <code>solveDatasetRoot</code> 两个独立指针 <span class="anchor">gateway.py:5004</span>；采集侧只有 Connect 时绑定的那一个 root。</p>
+    </div>
+    <div class="card">
+      <h3>能与 Live Record 解耦吗？</h3>
+      <p><span class="badge b-ok">能</span>，而且不解耦正在制造 bug。</p>
+      <p>关键是 <code>ep_dir</code> 在每个 episode 循环里现算 <span class="anchor">thor_record.py:1642</span>——<strong>换 dataset root 根本不需要碰 Argus</strong>。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 2 ============ -->
+<section>
+  <div class="section-title">
+    <span class="n">02</span>
+    <h2>第一性：这是两类结构不同的问题</h2>
+  </div>
+
+  <div class="card">
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th></th><th>内参</th><th>外参</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="rowlabel">问题结构</td><td>N 个<strong>独立</strong>的单相机问题</td><td>1 个 N 体<strong>联合</strong>问题</td></tr>
+          <tr><td class="rowlabel">约束来源</td><td>板子走到<strong>这一台</strong>的画幅多靠边</td><td><strong>多台同时</strong>看到同一块板</td></tr>
+          <tr><td class="rowlabel">其他相机的贡献</td><td>恒为零</td><td>是全部</td></tr>
+          <tr><td class="rowlabel">操作距离</td><td>0.5–0.8 m（A 板 marker 成像 25–45 px）</td><td>桌面中部上方，走遍作业区</td></tr>
+          <tr><td class="rowlabel">最小充分采集单元</td><td class="mono">1 路 × T</td><td class="mono">N 路 × T</td></tr>
+          <tr class="hi"><td class="rowlabel">现在实际采集</td><td class="mono">11 路 × T（<strong>11× 过采集</strong>）</td><td class="mono">11 路 × T ✓</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="callout">
+    <span class="lbl">这条结论代码里已经写对了</span>
+    <p><code>CalibrationStep</code> 的 docstring <span class="anchor">gateway.py:276</span>：</p>
+    <blockquote><p>Intrinsics need one sweep per camera because the binding constraint is how much of <em>that</em> camera's frame the board reaches; extrinsics need a single sweep that several cameras see at once, because the constraint is co-visibility. <strong>They cannot share a capture.</strong></p></blockquote>
+    <p>操作指引写得更直白 <span class="anchor">calibrationGuide.ts:20</span>：「只面对当前这一台相机，其余相机此刻不用管——内参是逐台标的」。</p>
+    <p><strong>设计意图从一开始就是逐台的。只有管线是全集的。</strong>那句 "cannot share a capture" 落实到了「分成不同的 step」，没有落实到「分成不同的数据」。</p>
+  </div>
+</section>
+
+<!-- ============ 3 ============ -->
+<section>
+  <div class="section-title">
+    <span class="n">03</span>
+    <h2>现状：一条采集路径，两种用途</h2>
+    <span class="sub">相机集合在 Connect 那一刻就被定死</span>
+  </div>
+
+  <div class="card">
+    <div class="flow"><span class="dim">   Live Record                                    标定向导</span>
+   StartEpisode <span class="dim">─────┐                 ┌─────</span> _calibration_step_record("start")
+   <span class="dim">                  │                 │</span>                    <span class="dim">gateway.py:3583</span>
+   <span class="dim">                  └────────┬────────┘</span>
+   <span class="dim">                           ▼</span>
+        <span class="hi">_start_episode(state, episodeTimeS)</span>                <span class="dim">gateway.py:10700</span>
+   <span class="dim">                           │</span>  stdin 只有 <span class="hi">"episode_time:30\n"</span> + 空行
+   <span class="dim">                           │</span>  <span class="bad">没有任何相机维度的参数</span>
+   <span class="dim">                           ▼</span>
+        thor_record 主循环                                  <span class="dim">thor_record.py:1642</span>
+        <span class="hi">ep_dir = cfg.dataset_root / "episodes" / episode_%06d</span>
+   <span class="dim">                           │</span>  <span class="hi">START &lt;idx&gt; &lt;frames&gt; &lt;ep_dir&gt;</span>     <span class="dim">…sync_session.py:601</span>
+   <span class="dim">                           ▼</span>                                        <span class="dim">…recorder.cpp:420</span>
+        Argus 持久会话 <span class="bad">（11 路，Connect 时锁定）</span>          <span class="dim">persistent_session.py:776</span>
+   <span class="dim">                           ▼</span>
+        <span class="bad">&lt;当前 active task 的训练数据集&gt;/episodes/</span>
+            episode_000000/  cam_00.mkv … cam_10.mkv   <span class="dim">← cam_00 内参段</span>
+            episode_000001/  cam_00.mkv … cam_10.mkv   <span class="dim">← cam_01 内参段</span>
+            <span class="dim">…</span>
+            episode_000010/  cam_00.mkv … cam_10.mkv   <span class="dim">← cam_10 内参段</span>
+            episode_000011/  cam_00.mkv … cam_10.mkv   <span class="dim">← 外参段</span>
+                                                       <span class="bad">12 段 × 11 路 = 132 个视频</span></div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h3>底层协议里没有位置可以表达「只录一台」</h3>
+      <p>守护进程协议只认三个参数：<code>START &lt;idx&gt; &lt;frames&gt; &lt;episode_dir&gt;</code> <span class="anchor">argus_online_sync_session.py:601</span>，C++ 侧同样 <span class="anchor">…video_recorder.cpp:420</span>。相机集合是 <code>connect()</code> 的产物，不是 <code>START</code> 的参数。</p>
+      <p><strong>所以「录内参时只录目标相机」在当前架构里没有任何一层能表达这个意图。</strong></p>
+    </div>
+    <div class="card">
+      <h3>向导自己知道它没有 root，于是绕了过去</h3>
+      <p><span class="anchor">gateway.py:3647</span> 那段注释写得很直白：<code>calib_&lt;ts&gt;</code> 只是个 label 不是路径，<code>_start_extrinsics_calibration</code> 去解析它会找不到 <code>episodes/</code>。</p>
+      <p>于是标定段落进了 <code>_task_datasets_dir</code> 下当前任务的目录 <span class="anchor">gateway.py:3526</span>。这个 workaround 是耦合的直接产物，L1 之后可以整段删掉。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 4 ============ -->
+<section>
+  <div class="section-title">
+    <span class="n">04</span>
+    <h2>耦合的六项代价</h2>
+    <span class="sub">按严重度排序，不是按大小</span>
+  </div>
+
+  <div class="cost severe">
+    <div class="idx">01</div>
+    <div class="body">
+      <div class="head"><h3>内参拟合吃进了协议明确排除的帧</h3><span class="badge b-p0">正确性 · 静默</span></div>
+      <p><span class="anchor">calibrate_intrinsics.py:99</span> 按相机名把<strong>所有 episode</strong> 的 npz 合并：</p>
+      <div class="flow">by_camera.setdefault(<span class="hi">path.stem.split("__")[1]</span>, []).append(path)</div>
+      <p>于是 cam_05 的内参拟合，吃进去的不只是「操作员站在 cam_05 前 0.5–0.8 m 挥板」那一段，还有另外 10 段里 cam_05 恰好瞄到板子的帧。那些帧的距离、角度、模糊程度全在指引明确判定为不可靠的区间之外——B 板在 1.2 m 处实测检出 <strong>0/63</strong>，A 板也要求 0.5–0.8 m。</p>
+    </div>
+  </div>
+
+  <div class="cost severe">
+    <div class="idx">02</div>
+    <div class="body">
+      <div class="head"><h3>验收判据被同一批帧顶过门槛</h3><span class="badge b-p0">共模盲区</span></div>
+      <p><code>observed_radius_fraction</code> <span class="anchor">gateway.py:5571</span> 是在上面那个合并集合上算的。后果是：<strong>一台相机自己那段挥得不合格，靠别人挥板时蹭到的边角帧把覆盖率顶过门槛，就会静默通过。</strong></p>
+      <div class="callout p0">
+        <p>这不是假设。0804 那轮标定第一次就是栽在覆盖率上——48–71%，畸变拟合在自己画幅内折返，整份采集重录；重录后 cam_08 从 62% 提到 96%。<strong>而验收判据本身能被别的段的帧污染，意味着下一次同样的失败可能不会被拦下来。</strong></p>
+        <p>结构上，这与之前 cube 晃动那类问题同构：判据和被判对象共享同一个被污染的输入，所有既有检查同时失效。</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="cost">
+    <div class="idx">03</div>
+    <div class="body">
+      <div class="head"><h3>标定段被算成任务进度，并会被导进 v3 训练集</h3><span class="badge b-warn">数据污染</span></div>
+      <p>如果 Connect 时绑定了 active task，dataset root 就是<strong>那个任务的训练数据集</strong>。于是 12 段挥板：</p>
+      <ul>
+        <li><code>_count_completed_episodes</code> <span class="anchor">gateway.py:6045</span> 按目录名前缀统计，标定段被算成任务进度</li>
+        <li><code>_export_command</code> 按同样的名字前缀合并所有 session，标定段会被导进 v3 训练集</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="cost">
+    <div class="idx">04</div>
+    <div class="body">
+      <div class="head"><h3>检测 6×，内参那一半是 11×</h3><span class="badge b-warn">成本</span></div>
+      <p>检测是整条链路最贵的一步（<code>timeout=3600</code>，<span class="anchor">gateway.py:5681</span>），<code>stride=2</code> <span class="anchor">gateway.py:5263</span>。</p>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>项</th><th class="num">当前</th><th class="num">最小充分</th><th class="num">倍数</th></tr></thead>
+          <tbody>
+            <tr><td>待检测视频</td><td class="num">132</td><td class="num">22</td><td class="num">6.0×</td></tr>
+            <tr class="hi"><td>其中内参部分</td><td class="num">121</td><td class="num">11</td><td class="num">11.0×</td></tr>
+            <tr><td>解码检测帧（30 s @60 fps, stride 2）</td><td class="num">118,800</td><td class="num">19,800</td><td class="num">6.0×</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="cost">
+    <div class="idx">05</div>
+    <div class="body">
+      <div class="head"><h3>磁盘 6×</h3><span class="badge b-warn">成本</span></div>
+      <p>20 Mbps × 30 s = <strong>75 MB / 路 / 段</strong>（<code>bitrate_kbps: 20000</code>，<code>episodeTimeS = 30.0</code> <span class="anchor">gateway.py:304</span>）。</p>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>方案</th><th>内参</th><th>外参</th><th class="num">合计</th></tr></thead>
+          <tbody>
+            <tr><td>当前</td><td class="mono">11 段 × 11 路</td><td class="mono">1 段 × 11 路</td><td class="num">9.90 GB</td></tr>
+            <tr><td>最小充分</td><td class="mono">11 段 × 1 路</td><td class="mono">1 段 × 11 路</td><td class="num">1.65 GB</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="cost">
+    <div class="idx">06</div>
+    <div class="body">
+      <div class="head"><h3>一条「结构性不可能」其实是耦合的产物</h3><span class="badge b-warn">假阳性</span></div>
+      <p><code>_intrinsics_preflight</code> <span class="anchor">gateway.py:5096</span> 的注释断言：</p>
+      <blockquote><p>cam_02/cam_03 point away from the board area and detect nothing in every episode, which makes "re-fit and export from a full-rig capture" <strong>structurally impossible</strong> rather than unlucky</p></blockquote>
+      <p>但 <code>_capture_cameras</code> <span class="anchor">gateway.py:5091</span> 的定义是「采集里<strong>有视频</strong>的相机」。cam_02/cam_03 出现在内参采集里，纯粹是因为它们被顺带录进去了——操作员从来没打算给它们标内参。内参采集只包含被扫过的相机之后，这条 preflight 就不会因为「顺带录进来的相机」而拦截。</p>
+      <div class="callout warn">
+        <p>要说明清楚：<strong>导出器无法从在产 run 承接未重拟的相机，这是另一条真实的结构性缺口，解耦不解决它。</strong>解耦之后 preflight 触发时才是真信号，缺口本身要单独补（见落地顺序第 4 项）。</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="cost">
+    <div class="idx">07</div>
+    <div class="body">
+      <div class="head"><h3>provenance 只活在内存里</h3><span class="badge b-warn">可审计性</span></div>
+      <p><code>CalibrationSession</code> <span class="anchor">gateway.py:292</span> 是纯内存 dataclass。「episode 7 是 cam_05 的内参段」这条信息只存在于 <code>step.episodeIndex</code>。网关一重启、向导一 cancel，磁盘上就是 12 个无法区分的 episode。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 5 ============ -->
+<section>
+  <div class="section-title">
+    <span class="n">05</span>
+    <h2>设计：四层，加一层缓议</h2>
+    <span class="sub">每层独立可上线，收益递减、风险递增</span>
+  </div>
+
+  <div class="callout ok">
+    <span class="lbl">关键约束，以及为什么它不挡路</span>
+    <p><strong>Argus 会话必须一次开好。</strong>nvargus-daemon 的不稳定、<code>spawn_stagger_s</code> / <code>connect_stable_s</code> 的存在，都指向同一件事。所以「标定用自己的 recorder 进程」这条路虽然最干净，但要付一次完整 Connect（11 路串行）并重新踩 Argus 不稳定的风险——<strong>不推荐，也不需要</strong>。</p>
+    <p><code>ep_dir</code> 是每个 episode 循环里现算的，<code>START</code> 把完整路径传给守护进程 <span class="anchor">thor_record.py:1642</span>。<strong>换 dataset root 不需要碰 Argus。</strong>而且这条路已有现成先例：<code>episode_time:&lt;秒&gt;</code> 就是为这个向导加的、走 side-effect 而不是走 FSM 队列的 stdin 命令 <span class="anchor">thor_record.py:387</span>。</p>
+  </div>
+
+  <div class="layer">
+    <div class="layer-head">
+      <span class="tag">L0</span>
+      <h3>把意图写进磁盘</h3>
+      <span class="badge b-todo">前置 · 最便宜</span>
+    </div>
+    <div class="layer-body">
+      <p>每个 episode 的 <code>meta.json</code>（<code>_write_episode_meta</code> <span class="anchor">thor_record.py:582</span>）加一个块：</p>
+      <div class="flow"><span class="hi">"capture_intent"</span>: {
+    <span class="hi">"purpose"</span>: "calibration_intrinsics",
+    <span class="hi">"target_camera"</span>: "cam_05",
+    <span class="hi">"session_id"</span>: "calib_20260902_143012",
+    <span class="hi">"protocol"</span>: "charuco_400_edge_sweep"
+}</div>
+      <dl class="kv">
+        <dt>机制</dt><dd>新 stdin 命令 <code>capture_intent:&lt;json&gt;</code>，在 start 之前设进去，与 <code>episode_time:</code> 同一条 side-effect 通道。</dd>
+        <dt>收益</dt><dd>本身不大，但<strong>后面每一层都要靠它</strong>；并且把「哪段是谁的扫描」从内存挪到磁盘，网关重启不再丢失。</dd>
+        <dt>验收</dt><dd>向导录一段后，<code>meta.json</code> 里能读出 <code>target_camera</code>；重启网关后仍在。</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="layer">
+    <div class="layer-head">
+      <span class="tag">L1</span>
+      <h3>采集数据分离</h3>
+      <span class="badge b-p0">核心</span>
+    </div>
+    <div class="layer-body">
+      <p>新 stdin 命令 <code>capture_root:&lt;path&gt;</code>，让下一个 episode 写到另一个 root（同样是 side-effect，不进 FSM 队列）。向导在 session start 时指向标定专用 root，session 结束时清空。</p>
+      <div class="flow"><span class="good">outputs/calibration_captures/calib_20260902_143012/</span>
+    <span class="hi">intrinsics/</span>episodes/episode_000000..000010/   <span class="dim">→ intrinsicsDatasetRoot</span>
+    <span class="hi">extrinsics/</span>episodes/episode_000000/          <span class="dim">→ solveDatasetRoot</span></div>
+      <p>一次会话产出两个目录，天然对上解算侧<strong>已经存在</strong>的那两个指针。配套三处：</p>
+      <ul>
+        <li><code>_dataset_kind</code> <span class="anchor">gateway.py:1241</span> 加一个 <code>"calibration"</code> 分支——这是现成的按目录归类机制（<code>training_view</code> / <code>exported</code> 已经这么做）。加上之后 <span class="anchor">gateway.py:6063</span> 那行 <code>!= "recorded"</code> 的过滤<strong>自动</strong>把标定段排除出任务进度和 v3 导出，一行都不用改。</li>
+        <li><code>_complete_replay_dataset_candidates</code> 要把新 root 纳入扫描，否则 <code>_solve_candidates</code> 的下拉里看不到刚录的标定采集。</li>
+        <li><span class="anchor">gateway.py:3647</span> 那段「name is a label and not a path」的 workaround 整段删掉——向导重新成为 dataset root 的真值来源。</li>
+      </ul>
+      <div class="callout ok">
+        <p><strong>Live Record 与标定的解耦到这一层就完成了。</strong>进程仍然共用（这是对的，Argus 只能有一个 owner），但数据、命名、统计、导出全部分离。</p>
+      </div>
+      <dl class="kv">
+        <dt>验收</dt><dd>标定一轮后：任务的 <code>completedEpisodes</code> 不变；v3 导出不含 <code>calib_*</code>；解算下拉能选到新采集。</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="layer">
+    <div class="layer-head">
+      <span class="tag">L2</span>
+      <h3>解算侧按段过滤相机</h3>
+      <span class="badge b-p0">唯一修正确性的一层</span>
+    </div>
+    <div class="layer-body">
+      <p><code>detect_charuco</code> 已经有 <code>--cameras</code> <span class="anchor">detect_charuco.py:48</span>，但它是<strong>全局的</strong>，表达不了「episode_3 只取 cam_03」。加一个 <code>--intent-manifest</code>：读每个 episode 的 <code>capture_intent.target_camera</code>，内参 episode 只检测目标相机。</p>
+      <ul>
+        <li>检测 <strong>132 → 22</strong> 个视频</li>
+        <li><code>calibrate_intrinsics</code> 的 <code>by_camera</code> 合并问题<strong>自动消失</strong>——每台相机的 npz 只来自它自己那一段</li>
+        <li><code>observed_radius_fraction</code> 恢复成「这一段挥得够不够」的诚实判据</li>
+      </ul>
+      <div class="callout p0">
+        <p>代价 01 和 02 只有这一层能修。L3 / L4 只省资源。<strong>如果只能做两层，做 L1 + L2。</strong></p>
+      </div>
+      <dl class="kv">
+        <dt>验收</dt><dd>同一份采集，加 manifest 前后对比每台相机的 <code>observed_radius_fraction</code>：差值就是此前被别段帧顶上去的量。</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="layer">
+    <div class="layer-head">
+      <span class="tag">L3</span>
+      <h3>存储侧剪枝</h3>
+      <span class="badge b-todo">磁盘 6×</span>
+    </div>
+    <div class="layer-body">
+      <p>在 online_sync 的同步闸门通过、episode 确认保存<strong>之后</strong>，按 <code>capture_intent.target_camera</code> 删掉非目标相机的 mkv，并在 <code>meta.json</code> 里记下删了哪些。</p>
+      <div class="callout warn">
+        <p><strong>必须在同步闸门之后做。</strong><code>missing_frame_policy: fail_episode</code> 和 SOF 全簇对齐（实测偏差 0.008–0.009 ms）需要全部相机在场，提前删会把闸门本身弄坏。</p>
+      </div>
+      <dl class="kv">
+        <dt>开关</dt><dd>默认对标定采集开启，留一个 <code>keep_all_cameras</code> 退路。</dd>
+        <dt>验收</dt><dd>9.90 GB → 1.65 GB；同步报告仍然覆盖全部 11 路。</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="layer hold">
+    <div class="layer-head">
+      <span class="tag">L4</span>
+      <h3>真正只录目标相机</h3>
+      <span class="badge b-hold">建议缓议</span>
+    </div>
+    <div class="layer-body">
+      <p><code>START &lt;idx&gt; &lt;frames&gt; &lt;dir&gt; [--cams=cam_05]</code>，C++ 侧仍然全簇采集（同步语义不能动），只对子集起编码器 / muxer。</p>
+      <ul>
+        <li>省的是 10 路硬件编码 + NVMM 带宽，而 Thor 有专用编码器，L3 之后这些本来也不构成瓶颈</li>
+        <li>代价是改 C++、改守护进程协议、重新做同步语义的 burn-in</li>
+        <li>而且它<strong>改变了同步语义的可审计性</strong>：现在同步报告能证明全簇对齐成立，子集录制之后这条证据链会变薄</li>
+      </ul>
+      <p><strong>除非实测证明编码器或 NVMM 是瓶颈，否则 L3 之后 L4 的边际收益接近零，风险却最高。</strong></p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 6 ============ -->
+<section>
+  <div class="section-title">
+    <span class="n">06</span>
+    <h2>已定的三条决策</h2>
+    <span class="sub">2026-09-02</span>
+  </div>
+
+  <div class="grid2">
+    <div class="decision">
+      <span class="mark">✓</span>
+      <div>
+        <h3>非目标相机的帧：不留</h3>
+        <p>L2 过滤 + L3 删除。按指引它们是<strong>协议外数据</strong>，而现在它们正在静默进入拟合并影响验收判据。保留原始证据的价值不足以抵消这一点。</p>
+      </div>
+    </div>
+    <div class="decision">
+      <span class="mark">✓</span>
+      <div>
+        <h3>标定采集落 <code>outputs/calibration_captures/</code></h3>
+        <p>独立 root，<code>_dataset_kind</code> 一个分支就把任务统计和 v3 导出隔离掉。附带效果：<code>outputs/</code> 被 deploy 的 <code>--delete-delay</code> 排除在镜像之外，<strong>标定采集不会被 deploy 抹掉</strong>。</p>
+      </div>
+    </div>
+    <div class="decision">
+      <span class="mark">✓</span>
+      <div>
+        <h3>不给标定单开 recorder 进程</h3>
+        <p>Argus 只能有一个 owner，重开一次 Connect 要重新承担 nvargus-daemon 的不稳定风险。换 root 走 stdin side-effect，完全绕开这个脆弱面。</p>
+      </div>
+    </div>
+    <div class="decision">
+      <span class="mark">✓</span>
+      <div>
+        <h3>L4 缓议</h3>
+        <p>先做 L0–L3。只有当实测证明编码器或 NVMM 是瓶颈时才动 C++ 与守护进程协议。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 7 ============ -->
+<section>
+  <div class="section-title">
+    <span class="n">07</span>
+    <h2>落地顺序</h2>
+    <span class="sub">前两步拿到约 80% 的价值，且完全不触碰 Argus</span>
+  </div>
+
+  <div class="card">
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th class="num">#</th><th>内容</th><th>改动范围</th><th>收益</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="num">1</td>
+            <td><strong>L0 + L1</strong></td>
+            <td>gateway + thor_record<br><span class="badge b-ok">纯 Python，不碰 Argus / C++</span></td>
+            <td>数据分离、训练集不再被污染、provenance 落盘、删掉一处 workaround</td>
+          </tr>
+          <tr class="hi">
+            <td class="num">2</td>
+            <td><strong>L2</strong></td>
+            <td>metrology CLI + gateway 拼参数</td>
+            <td><strong>修掉静默的内参正确性问题</strong>；检测 6×</td>
+          </tr>
+          <tr>
+            <td class="num">3</td>
+            <td><strong>L3</strong></td>
+            <td>thor_record 保存路径（同步闸门之后）</td>
+            <td>磁盘 6×</td>
+          </tr>
+          <tr>
+            <td class="num">4</td>
+            <td>导出器承接未重拟相机</td>
+            <td><code>export_production_calibration</code></td>
+            <td>解掉那条<em>真正的</em>结构性缺口（与解耦独立）</td>
+          </tr>
+          <tr>
+            <td class="num">—</td>
+            <td><strong>L4</strong> <span class="badge b-hold">缓议</span></td>
+            <td>C++ 守护进程协议 + 同步 burn-in</td>
+            <td>编码器 / NVMM，L3 之后边际收益近零</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 8 ============ -->
+<section>
+  <div class="section-title">
+    <span class="n">08</span>
+    <h2>明确不做的事</h2>
+  </div>
+  <div class="grid3">
+    <div class="card">
+      <h3>不动同步语义</h3>
+      <p>全簇 SOF 对齐和 <code>missing_frame_policy</code> 是所有下游时间对齐的地基。剪枝一律在闸门之后。</p>
+    </div>
+    <div class="card">
+      <h3>不重开 Argus 会话</h3>
+      <p>标定与 Live Record 共用 recorder 进程是<strong>正确的</strong>——要拆的是数据，不是进程。</p>
+    </div>
+    <div class="card">
+      <h3>不把解耦当成 preflight 的修复</h3>
+      <p>导出器承接不了未重拟相机是独立缺口，单独排在第 4 项，不靠这次改动顺带解决。</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <p>代码锚点对照 <code>hph/error_study_pr</code> @ <code>c99911db</code> 复核。行号会随后续提交漂移，函数名不会。</p>
+</footer>
+
+</div>
+</body>
+</html>

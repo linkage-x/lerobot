@@ -17,6 +17,7 @@ The protocol on stdout / stdin matches what ``gateway._apply_recorder_output``
 already understands so the existing GUI plumbing keeps working:
 
   * ``Dataset root: <path>``                       → gateway shows path
+  * ``Capture root: <path>``                       → where the NEXT episode lands
   * ``Cameras: cam_00, cam_03, ...``               → marks each camera id
   * ``Box devices: box_gripper, box_imu, ...``     → marks each box sensor id
   * ``Episode <N> ready``                          → arms the GUI
@@ -32,6 +33,17 @@ stdin commands accepted (the gateway writes lines to our stdin):
   * ``n`` or ``no``        → discard
   * ``q`` or ``quit``      → exit the program cleanly
   * ``episode_time:<seconds>`` → length of the NEXT episode only (0 = config)
+  * ``capture_root:<path>``    → write subsequent episodes under <path> instead
+                                 of the session's dataset root; empty clears it
+  * ``capture_intent:<json>``  → why the NEXT episode is being recorded; lands
+                                 in its meta.json as ``capture_intent``
+
+``capture_root`` exists because the Argus session is fixed at Connect but the
+destination need not be: a calibration board sweep must not land in the task's
+training dataset, and respawning the recorder to change the root would re-open
+eleven cameras. Each root keeps its own episode numbering -- reusing the
+session counter across roots would have the second root overwrite
+``episode_000000`` of the first.
 
 The recorder always runs in *streaming* mode; frame pixels never enter Python.
 Progress shown to the operator is estimated from elapsed time * configured fps.
@@ -337,6 +349,8 @@ def _read_stdin_loop(
     on_calibrate_origin: Callable[[str], None] | None = None,
     on_calibrate_touch: Callable[[str], None] | None = None,
     on_episode_time: Callable[[float], None] | None = None,
+    on_capture_root: Callable[[str], None] | None = None,
+    on_capture_intent: Callable[[str], None] | None = None,
 ) -> None:
     while not stop.is_set():
         line = sys.stdin.readline()
@@ -400,6 +414,25 @@ def _read_stdin_loop(
                 continue
             if on_episode_time is not None:
                 on_episode_time(seconds)
+        elif cmd_key == "capture_root":
+            # `capture_root:<path>` redirects where subsequent episodes are
+            # written; an empty value restores the session's dataset root. Unlike
+            # episode_time this one is sticky, because a calibration session
+            # records a dozen segments in a row -- the gateway clears it when the
+            # wizard ends, and asserts the intended root before every episode so
+            # an abandoned session cannot leak into the next task recording.
+            # Side-effect, not an FSM command, for the same reason as above.
+            if on_capture_root is not None:
+                on_capture_root(box_id)
+        elif cmd_key == "capture_intent":
+            # `capture_intent:<compact json>` records WHY the next episode is
+            # being recorded (which camera's intrinsics sweep, which wizard
+            # session). It is written into that episode's meta.json and consumed
+            # there, so it can never leak into the episode after it. Without it
+            # the only record of "episode 7 is cam_05's sweep" lives in gateway
+            # memory and is gone on restart.
+            if on_capture_intent is not None:
+                on_capture_intent(box_id)
         else:
             logger.warning("ignoring unrecognized stdin command: %r", line)
 
@@ -425,6 +458,21 @@ def _preview_demand_decision(
     if last_demand_mono <= 0.0:
         return False
     return (now_mono - last_demand_mono) <= ttl_s
+
+
+def _next_episode_index_for_root(root: Path, cache: dict[Path, int]) -> int:
+    """Next free episode index under ``root``, remembered per root.
+
+    Episode numbering is a property of the directory, not of the session. A
+    single session counter would have the second root a session writes to start
+    at the first root's count -- and, coming back to a root, overwrite an episode
+    already sitting there. The directory is scanned once per root; from then on
+    the cache carries that root's numbering, so interleaving two roots leaves
+    each of them counting up from where it actually is.
+    """
+    if root not in cache:
+        cache[root] = gr._next_episode_index(root)
+    return cache[root]
 
 
 def _next_episode_length_s(pending_s: float, config_s: float) -> float:
@@ -591,6 +639,7 @@ def _write_episode_meta(
     wallclock_start_utc: str,
     wallclock_end_utc: str,
     world_frame: dict[str, Any],
+    capture_intent: dict[str, Any] | None = None,
 ) -> Path:
     """Write per-episode meta.json under the persistent-pipeline model.
 
@@ -731,6 +780,14 @@ def _write_episode_meta(
             "config": asdict(box_cfg),
             "snapshots": box_snapshots,
         }
+    if capture_intent:
+        # Why this episode was recorded, as declared by whoever asked for it
+        # (the calibration wizard names the camera whose sweep this is). Like
+        # world_frame it cannot be reconstructed afterwards -- from the videos
+        # alone, eleven full-rig segments are indistinguishable. The key is
+        # ABSENT on ordinary captures on purpose: consumers must be able to tell
+        # "nothing was declared" from "declared, and it was this".
+        meta["capture_intent"] = capture_intent
     meta_path = handle.directory / "meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))
     return meta_path
@@ -1175,6 +1232,10 @@ def main(argv: list[str] | None = None) -> int:
     cfg.dataset_root = dataset_root_base.parent / f"{dataset_name}_{stamp}"
     cfg.repo_id = _name_with_camera_count(cfg.repo_id, camera_count)
     _emit(f"Dataset root: {cfg.dataset_root}")
+    # Baseline for `capture_root:` -- stated at Connect so the gateway knows the
+    # destination from the start and can tell a recorder that understands the
+    # redirect from one that silently ignores it.
+    _emit(f"Capture root: {cfg.dataset_root}")
     _emit(f"Cameras: {', '.join(camera_ids)}")
 
     if cfg.hardware_sync.enabled:
@@ -1503,12 +1564,70 @@ def main(argv: list[str] | None = None) -> int:
         pending_episode_time_s = float(seconds)
         logger.info("next episode length set to %.3gs by the gateway", seconds)
 
+    # Where subsequent episodes are written (`capture_root:<path>`), and the next
+    # episode index within each root we have written to. None means the session's
+    # own dataset root. Sticky, unlike episode_time, because a calibration
+    # session records a dozen segments in a row. Written from the stdin thread
+    # and read from the command loop -- single reference/dict assignments, which
+    # CPython publishes atomically.
+    capture_root_override: Path | None = None
+    ep_index_by_root: dict[Path, int] = {}
+    pending_capture_intent: dict[str, Any] | None = None
+
+    def _note_capture_root(raw: str) -> None:
+        nonlocal capture_root_override
+        text = (raw or "").strip()
+        if not text:
+            capture_root_override = None
+            _emit(f"Capture root: {cfg.dataset_root}")
+            logger.info("capture root cleared; episodes go to %s", cfg.dataset_root)
+            return
+        root = Path(text).expanduser()
+        if not root.is_absolute():
+            # A relative path would resolve against whatever cwd the gateway
+            # happened to spawn us with -- not something the operator can see or
+            # reason about. Refuse rather than guess.
+            logger.warning("ignoring relative capture_root: %r", text)
+            _emit(f"WARNING: capture_root must be absolute, ignoring {text}")
+            return
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # Fail here rather than at episode start, which would abort a sweep
+            # the operator has already walked.
+            logger.warning("cannot create capture_root %s: %s", root, exc)
+            _emit(f"WARNING: cannot create capture root {root}: {exc}")
+            return
+        capture_root_override = root
+        # The echo is the gateway's only proof the redirect took: an older
+        # recorder ignores the command, and without an ack the wizard would
+        # believe its segments went somewhere they did not.
+        _emit(f"Capture root: {root}")
+        logger.info("capture root set to %s", root)
+
+    def _note_capture_intent(raw: str) -> None:
+        nonlocal pending_capture_intent
+        text = (raw or "").strip()
+        if not text:
+            pending_capture_intent = None
+            return
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            logger.warning("ignoring unparseable capture_intent %r: %s", text, exc)
+            return
+        if not isinstance(payload, dict):
+            logger.warning("ignoring non-object capture_intent: %r", text)
+            return
+        pending_capture_intent = payload
+
     stdin_thread = threading.Thread(
         target=_read_stdin_loop,
         args=(
             cmd_queue, stop_event, _note_preview_demand,
             _trigger_six_d_force_cali, _trigger_six_d_force_cali_origin,
             _trigger_touch_cali, _note_episode_time,
+            _note_capture_root, _note_capture_intent,
         ),
         daemon=True, name="thor-record-stdin",
     )
@@ -1565,8 +1684,19 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _sigint)
     signal.signal(signal.SIGTERM, _sigint)
 
+    def _active_capture_root() -> Path:
+        return capture_root_override if capture_root_override is not None else cfg.dataset_root
+
+    def _next_index_for(root: Path) -> int:
+        return _next_episode_index_for_root(root, ep_index_by_root)
+
     saved = 0
-    ep_idx = gr._next_episode_index(cfg.dataset_root)
+    # Only episodes that landed in the session's own dataset count against the
+    # capture budget; a calibration sweep is not one of the episodes the operator
+    # set out to record, and letting it consume the budget would stop the
+    # recorder early afterwards.
+    saved_in_dataset = 0
+    ep_idx = _next_index_for(cfg.dataset_root)
     budget = cfg.num_episodes if cfg.num_episodes > 0 else None
     budget_str = str(budget) if budget else "unlimited"
     # The stdin hint is a CLI affordance for a human running this in a terminal.
@@ -1639,7 +1769,14 @@ def main(argv: list[str] | None = None) -> int:
             if cmd.kind == "quit":
                 break
 
-            ep_dir = cfg.dataset_root / "episodes" / f"episode_{ep_idx:06d}"
+            # Resolved per episode, not once per session: the gateway can
+            # redirect the destination between episodes (capture_root) without
+            # the Argus session being touched.
+            active_root = _active_capture_root()
+            ep_idx = _next_index_for(active_root)
+            ep_dir = active_root / "episodes" / f"episode_{ep_idx:06d}"
+            capture_intent = pending_capture_intent
+            pending_capture_intent = None
             requested_wall_start = datetime.now(timezone.utc).isoformat()
             t0_split_start_mono = time.monotonic()
             handle = pcs.start_episode(ep_dir, ep_idx)
@@ -1788,7 +1925,7 @@ def main(argv: list[str] | None = None) -> int:
                 meta_path = _write_episode_meta(
                     handle, cfg, locked, argus_failed, connect_errors,
                     box_cfg, box_snapshots, decision, wall_start, wall_end,
-                    world_frame,
+                    world_frame, capture_intent,
                 )
                 # Hardware SOF frame times (t0-relative) that correct the
                 # BOX↔camera per-episode skew (ts_sync.md §5.4); None for
@@ -1826,7 +1963,17 @@ def main(argv: list[str] | None = None) -> int:
                 # legacy fallback would fill the whole parquet with stale sensor values.
                 v3_snapshots = box_snapshots if sensor_data else []
                 try:
-                    if lr3_writer is not None:
+                    if lr3_writer is not None and active_root != cfg.dataset_root:
+                        # The writer was opened for the session's dataset. An
+                        # episode redirected elsewhere is not part of that
+                        # dataset, and appending its rows would give the training
+                        # set frames whose videos live in another tree.
+                        logger.info(
+                            "BOX LeRobot v3 rows skipped: episode %d was captured under %s, "
+                            "not the session dataset %s",
+                            ep_idx, active_root, cfg.dataset_root,
+                        )
+                    elif lr3_writer is not None:
                         if box_started and not sensor_data:
                             logger.warning(
                                 "BOX LeRobot v3 rows skipped: no recorded BOX samples; "
@@ -1848,12 +1995,19 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception as exc:
                     logger.warning("failed to write BOX LeRobot v3 rows: %s", exc)
                 saved += 1
+                if active_root == cfg.dataset_root:
+                    saved_in_dataset += 1
+                else:
+                    logger.info("episode %d saved under capture root %s", ep_idx, active_root)
                 if decision == "stream_exit":
                     _emit("Episode saved with stream exits.")
                 else:
                     _emit("Episode saved.")
+                # Session-wide and monotonic across roots on purpose: the gateway
+                # reads this as "how many episodes has this recorder written",
+                # which is how it tells whether a segment it started landed.
                 _emit(f"Total saved episodes: {saved}/{budget_str}")
-                ep_idx += 1
+                ep_index_by_root[active_root] = ep_idx + 1
             else:
                 # Discard: delete the per-camera .mkv fragments the
                 # splitmuxsink just closed, then drop the (now-empty)
@@ -1877,9 +2031,9 @@ def main(argv: list[str] | None = None) -> int:
 
             if stop_episode or stop_event.is_set():
                 break
-            if budget is not None and saved >= budget:
+            if budget is not None and saved_in_dataset >= budget:
                 break
-            _emit(f"Episode {ep_idx} ready")
+            _emit(f"Episode {_next_index_for(_active_capture_root())} ready")
     finally:
         stop_event.set()
         # Stop the preview controller before tearing down pcs so it can't call

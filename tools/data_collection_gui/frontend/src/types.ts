@@ -342,7 +342,10 @@ export type CollectionTask = {
   updatedAt: string;
 };
 
-export type DatasetKind = "recorded" | "exported" | "training_view";
+// "calibration" is a board sweep recorded by the guided wizard, not a
+// demonstration: it never counts towards a task's episode budget and is never
+// merged into a v3 export.
+export type DatasetKind = "recorded" | "exported" | "training_view" | "calibration";
 
 export type RecordedDataset = {
   path: string;

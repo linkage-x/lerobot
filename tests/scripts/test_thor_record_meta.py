@@ -310,3 +310,72 @@ def test_has_recorded_sensor_samples_treats_keyed_empty_buffers_as_empty() -> No
             data={"accel": [0.0, 0.0, 9.8]},
         )],
     }) is True
+
+
+def _minimal_handle(tmp_path: Path, name: str = "episode_000000") -> ps.EpisodeHandle:
+    ep_dir = tmp_path / name
+    ep_dir.mkdir(parents=True, exist_ok=True)
+    return ps.EpisodeHandle(
+        idx=0,
+        directory=ep_dir,
+        t0_wall_s=100.0,
+        t0_mono_s=10.0,
+        stop_wall_s=101.0,
+        fragments={
+            "cam_06": ps.FragmentInfo(
+                sid=6,
+                name="cam_06",
+                fragment_id=0,
+                path=ep_dir / "cam_06.mkv",
+                first_pts_s=None,
+                first_wall_s=100.0,
+                state=ps.FragmentState.EPISODE,
+            ),
+        },
+    )
+
+
+def _write_meta(thor_record, tmp_path: Path, handle, capture_intent) -> dict:
+    meta_path = thor_record._write_episode_meta(
+        handle,
+        _recorder_config(tmp_path),
+        locked=[6],
+        argus_failed=[],
+        connect_stream_errors=[],
+        box_cfg=bc.BoxFleetConfig(enabled=False),
+        box_snapshots=[],
+        stop_reason="save",
+        wallclock_start_utc="2026-09-02T00:00:00+00:00",
+        wallclock_end_utc="2026-09-02T00:00:30+00:00",
+        world_frame={"world_frame_id": "world_20260819_031843", "status": "ok"},
+        capture_intent=capture_intent,
+    )
+    return json.loads(meta_path.read_text())
+
+
+def test_capture_intent_is_written_into_the_episode_meta(tmp_path: Path) -> None:
+    # Which camera a sweep was for cannot be recovered from the videos: an
+    # intrinsics segment and the ten other cameras rolling through it are
+    # indistinguishable on disk. Without this, that fact lives only in gateway
+    # memory and is gone when the gateway restarts.
+    thor_record = _load_thor_record_module()
+    intent = {
+        "purpose": "calibration_intrinsics",
+        "target_camera": "cam_06",
+        "session_id": "calib_20260902_143012",
+        "protocol": "charuco_400_edge_sweep",
+    }
+
+    meta = _write_meta(thor_record, tmp_path, _minimal_handle(tmp_path), intent)
+
+    assert meta["capture_intent"] == intent
+
+
+def test_an_ordinary_capture_declares_no_intent_at_all(tmp_path: Path) -> None:
+    # Absent, not empty: a consumer choosing which cameras to detect has to be
+    # able to tell "nothing was declared" from "declared, and it was this".
+    thor_record = _load_thor_record_module()
+
+    meta = _write_meta(thor_record, tmp_path, _minimal_handle(tmp_path), None)
+
+    assert "capture_intent" not in meta

@@ -45,7 +45,11 @@ function TrainingViewPage({
   const allDatasets = snapshot.recordedDatasets ?? [];
   // Views are replay candidates, so they arrive in the same list as the recordings. They belong
   // under the recording they were derived from, not next to it as another build source.
-  const datasets = allDatasets.filter((dataset) => dataset.datasetKind !== "training_view");
+  // Calibration sweeps arrive in that list too and are not a build source at all: there is no
+  // demonstration in them to re-express into an action contract.
+  const datasets = allDatasets.filter(
+    (dataset) => dataset.datasetKind !== "training_view" && dataset.datasetKind !== "calibration"
+  );
   const viewsFor = (dataset: RecordedDataset) =>
     allDatasets.filter(
       (candidate) =>
