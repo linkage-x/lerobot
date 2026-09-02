@@ -406,6 +406,28 @@ def test_calibration_records_into_its_own_tree_not_the_task_dataset(tmp_path, mo
     assert intent["session_id"] == session.datasetName
 
 
+def test_a_sweep_asks_for_pruning_by_saying_nothing_about_it(tmp_path, monkeypatch):
+    # The recorder prunes the cameras a sweep was not for once the sync gate has
+    # used them, so the default intent carries no opinion: absent means prune.
+    state = _calibration_gateway_state(tmp_path)
+    calls: list[dict] = []
+    _open_calibration_segment(state, monkeypatch, calls)
+
+    assert "keep_all_cameras" not in calls[0]["capture_intent"]
+
+
+def test_keeping_every_camera_is_a_config_decision_carried_in_the_intent(tmp_path, monkeypatch):
+    # The way back to the raw evidence. It travels with the segment so its own
+    # meta.json records that the choice was made, rather than looking like a
+    # capture from before pruning existed.
+    state = _calibration_gateway_state(tmp_path)
+    state.config["calibration"] = {"keep_all_cameras": True}
+    calls: list[dict] = []
+    _open_calibration_segment(state, monkeypatch, calls)
+
+    assert calls[0]["capture_intent"]["keep_all_cameras"] is True
+
+
 def test_calibration_extrinsics_goes_to_a_different_tree_than_intrinsics(tmp_path, monkeypatch):
     state = _calibration_gateway_state(tmp_path)
     calls: list[dict] = []

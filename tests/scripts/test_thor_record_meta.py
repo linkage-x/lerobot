@@ -379,3 +379,110 @@ def test_an_ordinary_capture_declares_no_intent_at_all(tmp_path: Path) -> None:
     meta = _write_meta(thor_record, tmp_path, _minimal_handle(tmp_path), None)
 
     assert "capture_intent" not in meta
+
+
+# ---------------------------------------------------------------------------
+# Pruning the cameras a sweep was not for, once the sync gate is done with them
+
+
+def _episode_on_disk(tmp_path: Path, cameras: list[str], *, sizes: int = 4096) -> Path:
+    """An episode directory as the recorder leaves it: video plus SOF sidecars."""
+    ep_dir = tmp_path / "episode_000003"
+    ep_dir.mkdir(parents=True)
+    for camera in cameras:
+        (ep_dir / f"{camera}.mkv").write_bytes(b"v" * sizes)
+        (ep_dir / f"{camera}.argus_frame_metadata.csv").write_text("logical_frame_index\n0\n")
+    return ep_dir
+
+
+ELEVEN = [f"cam_{index:02d}" for index in range(11)]
+
+
+def test_a_sweep_keeps_only_the_camera_it_was_for(tmp_path: Path) -> None:
+    # 8.25 of the 9.9 GB an eleven-camera session writes is other cameras
+    # watching a sweep that was not theirs, and nothing reads it now that the
+    # detection step reads each episode on the camera it declares.
+    thor_record = _load_thor_record_module()
+    ep_dir = _episode_on_disk(tmp_path, ELEVEN)
+
+    record = thor_record._prune_non_target_cameras(ep_dir, {"target_camera": "cam_05"})
+
+    assert sorted(p.name for p in ep_dir.glob("*.mkv")) == ["cam_05.mkv"]
+    assert record["removed"] == [f"cam_{i:02d}.mkv" for i in range(11) if i != 5]
+    assert record["bytes_freed"] == 10 * 4096
+
+
+def test_the_sidecars_that_prove_the_alignment_are_not_touched(tmp_path: Path) -> None:
+    # They are the evidence that the whole-cluster SOF alignment held, they cost
+    # kilobytes, and the BOX-camera skew correction reads them.
+    thor_record = _load_thor_record_module()
+    ep_dir = _episode_on_disk(tmp_path, ELEVEN)
+
+    thor_record._prune_non_target_cameras(ep_dir, {"target_camera": "cam_05"})
+
+    assert len(list(ep_dir.glob("cam_*.argus_frame_metadata.csv"))) == 11
+
+
+def test_an_extrinsics_segment_is_never_pruned(tmp_path: Path) -> None:
+    # Every camera that saw the board at the same instant is the point of it.
+    thor_record = _load_thor_record_module()
+    ep_dir = _episode_on_disk(tmp_path, ELEVEN)
+
+    record = thor_record._prune_non_target_cameras(
+        ep_dir, {"purpose": "calibration_extrinsics", "target_camera": ""}
+    )
+
+    assert record is None
+    assert len(list(ep_dir.glob("*.mkv"))) == 11
+
+
+def test_an_ordinary_capture_is_never_pruned(tmp_path: Path) -> None:
+    thor_record = _load_thor_record_module()
+    ep_dir = _episode_on_disk(tmp_path, ELEVEN)
+
+    assert thor_record._prune_non_target_cameras(ep_dir, None) is None
+    assert len(list(ep_dir.glob("*.mkv"))) == 11
+
+
+def test_keeping_every_camera_is_recorded_as_a_decision(tmp_path: Path) -> None:
+    # So a later reader can tell "kept on purpose" from "recorded before pruning
+    # existed" -- the same distinction capture_intent itself exists to make.
+    thor_record = _load_thor_record_module()
+    ep_dir = _episode_on_disk(tmp_path, ELEVEN)
+
+    record = thor_record._prune_non_target_cameras(
+        ep_dir, {"target_camera": "cam_05", "keep_all_cameras": True}
+    )
+
+    assert record["removed"] == []
+    assert record["skipped_reason"] == "keep_all_cameras"
+    assert len(list(ep_dir.glob("*.mkv"))) == 11
+
+
+def test_a_sweep_missing_its_own_camera_is_left_whole(tmp_path: Path) -> None:
+    # Pruning here would destroy the episode rather than trim it: what remained
+    # would be nothing this sweep can fit, and the video that is there is the
+    # only evidence left of what went wrong.
+    thor_record = _load_thor_record_module()
+    ep_dir = _episode_on_disk(tmp_path, ["cam_00", "cam_01"])
+
+    record = thor_record._prune_non_target_cameras(ep_dir, {"target_camera": "cam_05"})
+
+    assert record["skipped_reason"] == "target_camera_has_no_video"
+    assert record["removed"] == []
+    assert len(list(ep_dir.glob("*.mkv"))) == 2
+
+
+def test_what_was_pruned_is_merged_into_the_episode_meta(tmp_path: Path) -> None:
+    # The directory alone cannot say whether a camera was pruned or never
+    # recorded, and the sync report above it still covers all eleven.
+    thor_record = _load_thor_record_module()
+    meta_path = tmp_path / "meta.json"
+    meta_path.write_text(json.dumps({"episode_index": 3, "online_sync": {"cameras": 11}}))
+
+    thor_record._annotate_episode_meta(meta_path, {"camera_pruning": {"removed": ["cam_00.mkv"]}})
+
+    meta = json.loads(meta_path.read_text())
+    assert meta["camera_pruning"]["removed"] == ["cam_00.mkv"]
+    assert meta["online_sync"] == {"cameras": 11}
+    assert meta["episode_index"] == 3

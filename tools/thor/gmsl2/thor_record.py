@@ -36,7 +36,10 @@ stdin commands accepted (the gateway writes lines to our stdin):
   * ``capture_root:<path>``    → write subsequent episodes under <path> instead
                                  of the session's dataset root; empty clears it
   * ``capture_intent:<json>``  → why the NEXT episode is being recorded; lands
-                                 in its meta.json as ``capture_intent``
+                                 in its meta.json as ``capture_intent``. A
+                                 ``target_camera`` also prunes the other
+                                 cameras' video once the sync gate has passed,
+                                 unless the payload says ``keep_all_cameras``
 
 ``capture_root`` exists because the Argus session is fixed at Connect but the
 destination need not be: a calibration board sweep must not land in the task's
@@ -791,6 +794,89 @@ def _write_episode_meta(
     meta_path = handle.directory / "meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))
     return meta_path
+
+
+def _annotate_episode_meta(meta_path: Path, updates: dict[str, Any]) -> None:
+    """Merge more into an episode's meta.json after it was first written.
+
+    Part of what belongs in it is only known once the episode is on disk: the
+    sync verdicts, and which cameras were pruned after the gate had finished
+    using them. A failure here costs the annotation, never the episode.
+    """
+    try:
+        payload = json.loads(meta_path.read_text())
+        payload.update(updates)
+        meta_path.write_text(json.dumps(payload, indent=2))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("failed to annotate %s: %s", meta_path.name, exc)
+
+
+def _prune_non_target_cameras(
+    ep_dir: Path, capture_intent: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Delete the video of the cameras this episode was not recorded for.
+
+    An intrinsics sweep is one camera's protocol, but the cluster records all
+    eleven: eleven sweeps come to about 9.9 GB, of which some 8.25 GB is other
+    cameras watching a sweep that was not theirs. Nothing reads those any more
+    -- the detection step is told to read each episode on the camera it
+    declares -- so they are bytes that exist only to be backed up.
+
+    Called after the sync gate has passed and the episode is being kept, never
+    before. The gate needs every camera present: ``missing_frame_policy:
+    fail_episode`` and the whole-cluster SOF alignment are computed over the
+    full set, so pruning earlier would break the check rather than the storage.
+    The per-camera ``argus_frame_metadata.csv`` sidecars stay for the same
+    reason -- they are the evidence the alignment held, they cost kilobytes, and
+    the BOX-camera skew correction reads them.
+
+    Returns what to record in meta.json, or None when the episode named no
+    single target camera and nothing was ever considered for deletion.
+    """
+    if not capture_intent:
+        return None
+    target = str(capture_intent.get("target_camera") or "").strip()
+    if not target:
+        # An extrinsics segment, or an ordinary capture. Every camera is the
+        # point of the first and nothing was declared about the second.
+        return None
+    videos = sorted(ep_dir.glob("cam_*.mkv")) + sorted(ep_dir.glob("cam_*.mp4"))
+    kept = [video for video in videos if video.stem == target]
+    others = [video for video in videos if video.stem != target]
+    record: dict[str, Any] = {
+        "target_camera": target,
+        "kept": [video.name for video in kept],
+        "removed": [],
+        "bytes_freed": 0,
+    }
+    if capture_intent.get("keep_all_cameras"):
+        # The way back to raw evidence, decided per session and recorded here so
+        # a later reader can tell "kept on purpose" from "recorded before this
+        # existed" -- which is the same distinction capture_intent itself makes.
+        record["skipped_reason"] = "keep_all_cameras"
+        return record
+    if not kept:
+        # The one case where deleting would destroy the episode instead of
+        # trimming it: the sweep has no video for the camera it was for, so what
+        # would be left is nothing this sweep can fit, and the videos that are
+        # here are the only remaining evidence of what went wrong.
+        logger.warning(
+            "not pruning %s: capture_intent names %s, which has no video here",
+            ep_dir.name, target,
+        )
+        record["skipped_reason"] = "target_camera_has_no_video"
+        return record
+    for video in others:
+        try:
+            size = video.stat().st_size
+            video.unlink()
+        except OSError as exc:
+            logger.warning("could not prune %s: %s", video.name, exc)
+            record.setdefault("failed", []).append(video.name)
+            continue
+        record["removed"].append(video.name)
+        record["bytes_freed"] += size
+    return record
 
 
 def _evaluate_argus_frame_sync(
@@ -1933,20 +2019,18 @@ def main(argv: list[str] | None = None) -> int:
                 frame_times = lr3.camera_frame_times_rel(
                     ep_dir, getattr(handle, "t0_mono_s", None)
                 )
-                try:
-                    payload = json.loads(meta_path.read_text())
-                    payload["cleanup_duration_s"] = cleanup_duration_s
-                    payload["split_emit_ms"] = split_emit_ms
-                    if frame_sync_payload is not None:
-                        payload["argus_frame_sync"] = frame_sync_payload
-                    if online_sync_payload is not None:
-                        payload["online_sync"] = online_sync_payload
-                    payload["box_camera_alignment"] = _box_camera_alignment_summary(
+                annotations: dict[str, Any] = {
+                    "cleanup_duration_s": cleanup_duration_s,
+                    "split_emit_ms": split_emit_ms,
+                    "box_camera_alignment": _box_camera_alignment_summary(
                         frame_times, cfg.cameras.fps
-                    )
-                    meta_path.write_text(json.dumps(payload, indent=2))
-                except (OSError, json.JSONDecodeError) as exc:
-                    logger.warning("failed to annotate cleanup duration: %s", exc)
+                    ),
+                }
+                if frame_sync_payload is not None:
+                    annotations["argus_frame_sync"] = frame_sync_payload
+                if online_sync_payload is not None:
+                    annotations["online_sync"] = online_sync_payload
+                _annotate_episode_meta(meta_path, annotations)
                 has_recorded_samples = _has_recorded_sensor_samples(recorded_samples)
                 if has_recorded_samples:
                     _write_sensor_samples(ep_dir, recorded_samples, t_start)
@@ -1994,6 +2078,21 @@ def main(argv: list[str] | None = None) -> int:
                         logger.warning("BOX LeRobot v3 rows skipped; writer is unavailable")
                 except Exception as exc:
                     logger.warning("failed to write BOX LeRobot v3 rows: %s", exc)
+                # Last, so that nothing upstream of here can find a video gone:
+                # the sync gate, the frame-time sidecar read and the v3 rows have
+                # all had the full cluster by now.
+                pruned = _prune_non_target_cameras(ep_dir, capture_intent)
+                if pruned is not None:
+                    _annotate_episode_meta(meta_path, {"camera_pruning": pruned})
+                    if pruned["removed"]:
+                        logger.info(
+                            "pruned %d non-target cameras from %s (%.2f GB)",
+                            len(pruned["removed"]), ep_dir.name, pruned["bytes_freed"] / 1e9,
+                        )
+                        _emit(
+                            f"Pruned {len(pruned['removed'])} non-target cameras "
+                            f"({pruned['bytes_freed'] / 1e9:.2f} GB freed)"
+                        )
                 saved += 1
                 if active_root == cfg.dataset_root:
                     saved_in_dataset += 1

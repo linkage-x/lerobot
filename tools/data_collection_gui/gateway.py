@@ -3667,7 +3667,7 @@ def _calibration_step_capture_root(session: CalibrationSession, step: Calibratio
 
 
 def _calibration_capture_intent(
-    session: CalibrationSession, step: CalibrationStep
+    session: CalibrationSession, step: CalibrationStep, *, keep_all_cameras: bool = False
 ) -> dict[str, Any]:
     """What this episode's meta.json will record about why it was captured.
 
@@ -3687,7 +3687,23 @@ def _calibration_capture_intent(
             else "charuco_400_covisibility_sweep"
         ),
         "segment_seconds": session.episodeTimeS,
+        # The recorder prunes the other ten cameras' video from a sweep once the
+        # sync gate has used them. This is the way back to that raw evidence,
+        # and it travels in the intent so the episode's own meta.json records
+        # that the choice was made rather than that pruning did not exist yet.
+        **({"keep_all_cameras": True} if keep_all_cameras else {}),
     }
+
+
+def _calibration_keeps_all_cameras(state: GatewayState) -> bool:
+    """Whether a sweep should keep the video of the cameras it was not for.
+
+    Config, not a button: it is a rare deliberate choice made before a session,
+    and every other answer to "why is this capture six times the size" would
+    have to be reconstructed from the files.
+    """
+    calibration = state.config.get("calibration") or {}
+    return bool(calibration.get("keep_all_cameras"))
 
 
 def _clear_capture_root(state: GatewayState) -> None:
@@ -3731,7 +3747,9 @@ def _calibration_step_record(state: GatewayState, action: str) -> dict[str, Any]
                 state,
                 session.episodeTimeS,
                 capture_root=_calibration_step_capture_root(session, step),
-                capture_intent=_calibration_capture_intent(session, step),
+                capture_intent=_calibration_capture_intent(
+                    session, step, keep_all_cameras=_calibration_keeps_all_cameras(state)
+                ),
                 require_capture_root_ack=True,
             )
             step.status = "recording"
