@@ -5257,7 +5257,14 @@ def _production_intrinsics_cameras(state: GatewayState) -> list[str]:
 
 
 def _capture_cameras(dataset: Path) -> list[str]:
-    """Camera names with video in a capture, i.e. the ones a fit would cover."""
+    """The cameras a fit from this capture would cover.
+
+    Not "every camera with video in it": an intrinsics sweep is one camera's
+    protocol, and since the detection step reads only the camera each episode
+    declares, the fit produces a model for exactly those. A full-rig capture
+    where cam_02 never swept therefore no longer claims to cover cam_02 -- which
+    is what the export preflight below is really asking about.
+    """
     return sorted({video.stem for _, video in _capture_videos(dataset / "episodes")})
 
 
@@ -5432,20 +5439,41 @@ _DETECTION_STRIDE = 2
 _DETECTION_MANIFEST = "manifest.json"
 
 
+# The module ``detect_charuco`` plans with. Located from this file rather than
+# from ``state.repo_root`` because it is code vendored in this checkout, not a
+# data root the operator repoints: a gateway started with --repo-root elsewhere
+# still has to plan the work exactly the way the detector it spawns will, or the
+# two disagree about what "already detected" means.
+_METROLOGY_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "opencv_kalibr"
+_CAPTURE_INTENT_MODULE: Any = None
+
+
+def _capture_intent_module() -> Any:
+    global _CAPTURE_INTENT_MODULE
+    if _CAPTURE_INTENT_MODULE is None:
+        if str(_METROLOGY_ROOT) not in sys.path:
+            sys.path.insert(0, str(_METROLOGY_ROOT))
+        from metrology import capture_intent
+
+        _CAPTURE_INTENT_MODULE = capture_intent
+    return _CAPTURE_INTENT_MODULE
+
+
 def _capture_videos(episodes: Path) -> list[tuple[str, Path]]:
     """(npz stem, video) for every video the detection step will read.
 
-    Enumerated exactly the way ``detect_charuco`` does -- ``episode_*``
-    subdirectories, or the directory itself when the videos sit in it directly,
-    and its ``<episode>__<camera>`` npz naming -- so "is this capture already
-    detected" is answered against the same files it would write.
+    Planned by the module the detector plans with, down to the
+    ``<episode>__<camera>`` npz naming, so "is this capture already detected" is
+    answered against the files it would actually write. For an intrinsics
+    capture that is one video per episode rather than eleven: the other ten
+    cameras were rolling through a sweep that was not theirs.
+
+    ``strict=False`` because this also runs on the status poll. A capture whose
+    declaration does not match its files has to surface as the detection step's
+    refusal, not as a status endpoint that stops answering.
     """
-    directories = sorted(p for p in episodes.glob("episode_*") if p.is_dir()) or [episodes]
-    videos: list[tuple[str, Path]] = []
-    for directory in directories:
-        for video in sorted(directory.glob("cam_*.mkv")) + sorted(directory.glob("cam_*.mp4")):
-            videos.append((f"{directory.name}__{video.stem}", video))
-    return videos
+    module = _capture_intent_module()
+    return module.planned_videos(module.plan_episodes(episodes, strict=False))
 
 
 def _charuco_video_count(episodes: Path) -> int:
@@ -5504,7 +5532,15 @@ def _clear_detections(detections: Path) -> None:
     """
     if not detections.is_dir():
         return
-    for path in [*detections.glob("*.npz"), detections / _DETECTION_MANIFEST]:
+    # The detector's own record of which cameras it was told to read goes with
+    # them: left behind, it would describe a decision that no longer produced
+    # any of the files in the directory.
+    stale = [
+        *detections.glob("*.npz"),
+        detections / _DETECTION_MANIFEST,
+        detections / _capture_intent_module().MANIFEST_FILENAME,
+    ]
+    for path in stale:
         with suppress(OSError):
             path.unlink()
 
@@ -5845,6 +5881,12 @@ def _run_extrinsics_calibration(
             "--episodes", str(capture_episodes),
             "--out", str(directory),
             "--stride", str(_DETECTION_STRIDE),
+            # Each episode is read only on the camera it declares. Harmless on a
+            # capture that declares nothing and on the extrinsics half, where
+            # every camera is the point; on an intrinsics capture it is the
+            # difference between fitting cam_05 on its own edge sweep and
+            # fitting it on that sweep plus the ten it merely watched.
+            "--intent-manifest",
         ]
         if not _run(label, args, 3600):
             return None

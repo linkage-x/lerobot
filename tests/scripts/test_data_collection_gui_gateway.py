@@ -3359,6 +3359,14 @@ def test_detection_output_is_read_as_one_unit_per_video():
     assert done is False
     assert detail.startswith("sync frames")
 
+    # What the intent filter excluded is announced before the table. It names an
+    # episode and a camera, so it has to stay unreadable as a video row -- a
+    # line counted here would move the bar for work that is not happening.
+    done, _detail = gateway._solve_progress_line("intent: episode_000000 -> cam_05 (10 other cameras skipped)")
+    assert done is False
+    done, _detail = gateway._solve_progress_line("intent: 11/12 episodes restricted, 110 videos skipped")
+    assert done is False
+
 
 def test_the_detection_bar_is_scaled_by_the_videos_it_will_open(tmp_path):
     dataset = _charuco_capture(tmp_path, episodes=3, cameras=4)
@@ -3371,6 +3379,43 @@ def test_the_detection_bar_is_scaled_by_the_videos_it_will_open(tmp_path):
     (flat / "cam_06.mkv").write_bytes(b"")
     (flat / "cam_07.mp4").write_bytes(b"")
     assert gateway._charuco_video_count(flat) == 2
+
+
+def test_only_the_camera_a_sweep_was_for_is_counted_and_detected(tmp_path):
+    # The rig records all eleven cameras through every sweep. Counting them all
+    # would size the bar for 132 videos while the detector opens 22, and -- the
+    # part that matters -- would look for npz that are never written, so a
+    # finished detection pass could never be reused.
+    episodes = tmp_path / "episodes"
+    for index, target in enumerate(("cam_05", "cam_06")):
+        directory = episodes / f"episode_{index:06d}"
+        directory.mkdir(parents=True)
+        for camera in range(11):
+            (directory / f"cam_{camera:02d}.mkv").write_bytes(b"x" * 2048)
+        (directory / "meta.json").write_text(
+            json.dumps({"capture_intent": {"purpose": "calibration_intrinsics", "target_camera": target}})
+        )
+
+    assert gateway._charuco_video_count(episodes) == 2
+    assert [stem for stem, _video in gateway._capture_videos(episodes)] == [
+        "episode_000000__cam_05",
+        "episode_000001__cam_06",
+    ]
+
+
+def test_an_extrinsics_segment_is_still_counted_on_every_camera(tmp_path):
+    # The joint fit is about the cameras that saw the board at the same instant,
+    # so this half of a session declares no target camera and keeps all of them.
+    episodes = tmp_path / "episodes"
+    directory = episodes / "episode_000000"
+    directory.mkdir(parents=True)
+    for camera in range(4):
+        (directory / f"cam_{camera:02d}.mkv").write_bytes(b"x" * 2048)
+    (directory / "meta.json").write_text(
+        json.dumps({"capture_intent": {"purpose": "calibration_extrinsics", "target_camera": ""}})
+    )
+
+    assert gateway._charuco_video_count(episodes) == 4
 
 
 def test_a_solve_step_reports_its_output_while_it_is_still_running(tmp_path):
@@ -3887,6 +3932,11 @@ def test_the_solve_can_refit_intrinsics_from_a_second_capture(tmp_path, monkeypa
     def fake_step(_state, _python, args, *, label, timeout, on_line=None):
         module = next((arg for arg in args if arg.startswith("metrology.cli.")), "")
         steps.append((label, module))
+        if module.endswith("detect_charuco"):
+            # Every episode is read on the camera it declares. Without this the
+            # intrinsics half reads eleven videos per sweep, and each camera's
+            # fit quietly absorbs the ten sweeps that were not its own.
+            assert "--intent-manifest" in args
         if module.endswith("calibrate_intrinsics"):
             Path(args[args.index("--out") + 1]).write_text("{}", encoding="utf-8")
         if module.endswith("calibrate_extrinsics"):
@@ -4665,6 +4715,57 @@ def test_experiment_mode_is_the_way_past_that_refusal(tmp_path, monkeypatch):
     assert started["ok"] is True
     # Four steps, not five: the export is gone rather than skipped at the end.
     assert state.calibration.progress.stepCount == 4
+
+
+def _intrinsics_sweeps(tmp_path: Path, targets: list[str], *, declared: bool = True) -> Path:
+    """A wizard intrinsics capture: one sweep per camera, all eleven recorded."""
+    capture = tmp_path / "outputs" / "calibration_captures" / "calib_20260902_143012" / "intrinsics"
+    for index, target in enumerate(targets):
+        directory = capture / "episodes" / f"episode_{index:06d}"
+        directory.mkdir(parents=True)
+        for camera in range(11):
+            (directory / f"cam_{camera:02d}.mkv").write_bytes(b"x" * 2048)
+        meta: dict = {"episode_index": index}
+        if declared:
+            meta["capture_intent"] = {"purpose": "calibration_intrinsics", "target_camera": target}
+        (directory / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return capture
+
+
+def test_a_full_rig_capture_no_longer_claims_the_cameras_it_never_swept(tmp_path):
+    """That refusal was, in part, a product of the capture coupling.
+
+    The rig records all eleven cameras through every sweep, so a capture of
+    eleven sweeps held eleven cameras' video and the preflight above could never
+    pass on one. Those cameras were in its camera set only because the detector
+    read them; now that each episode is read on the camera it declares, the set
+    is the cameras that were actually swept.
+    """
+    state = _solve_state(tmp_path)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_05", "cam_06"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    capture = _intrinsics_sweeps(tmp_path, ["cam_05", "cam_06"])
+
+    preflight = gateway._intrinsics_preflight(state, capture)
+
+    assert preflight["cameras"] == ["cam_05", "cam_06"]
+    assert preflight["uncalibrated"] == []
+    assert preflight["blocking"] is False
+
+
+def test_a_capture_that_declares_nothing_still_carries_every_camera_into_the_export(tmp_path):
+    # The counterfactual, and what older captures keep: with nothing declared
+    # there is no way to know which camera a segment was for, so all eleven are
+    # in the fit and the nine with no production lens block the export.
+    state = _solve_state(tmp_path)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_05", "cam_06"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    capture = _intrinsics_sweeps(tmp_path, ["cam_05", "cam_06"], declared=False)
+
+    preflight = gateway._intrinsics_preflight(state, capture)
+
+    assert len(preflight["cameras"]) == 11
+    assert preflight["blocking"] is True
 
 
 def test_a_fresh_rig_is_not_blocked_by_its_own_first_calibration(tmp_path):
