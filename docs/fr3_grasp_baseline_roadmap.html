@@ -78,8 +78,10 @@
       <span class="pill">ckpt: L4_full48_holdout22_40 / 030000</span>
       <span class="pill">训练：48 ep / 30000 steps / loss 0.123</span>
       <span class="pill">当前门禁：S6 DAgger 接管</span>
-      <span class="pill">归因：策略 z 噪声（坐标系漂移已证伪）</span>
-      <span class="pill">S6：接管链路与数据写出均已实现 · 均未上过机</span>
+      <span class="pill">归因：策略 z 噪声<b>已复测证实</b>（61.5±8.4 vs demo 50.1±3.5）</span>
+      <span class="pill">瓶颈已移：6/10 停在 stage 4→5，搬到孔上方却碰不到孔</span>
+      <span class="pill">09-01 已修：rollout 围栏比记录高 50 mm，下降被削平</span>
+      <span class="pill">S6：MuJoCo 复演练已过（5 段全交还）· 未上真机</span>
       <span class="pill">S1 / S5 可并行</span>
       <span class="pill">RL：S7，触发判据见第九节</span>
       <span class="pill">S2 / S3 / S4 等落点图决策</span>
@@ -573,10 +575,17 @@
         <li><b>不是"停在半路"，而是下降深度本身不同。</b>策略和 demo 一样都是降到底再闭合
           （闭合点比该轮自身最低点高 0.0–1.2 mm，demo 中位 0.2 mm）。闭合高度 = 下降深度。</li>
         <li><b>深度把结果分开了。</b>闭合高度 ≥ 58 mm 的 8 轮里 7 轮抓住；&lt; 58 mm 的 8 轮里只有 2 轮抓住
-          （Fisher p ≈ 0.04，<b>n = 16</b>）。</li>
+          （Fisher p ≈ 0.04，<b>n = 16</b>）。
+          <br><span class="small"><b>09-02 复测没有复现这一条。<span class="badge warn">未复现</span></b>
+          同一判据、同一闭合点定义（runtime 的 <code>_dominant_closed_span</code>）：≥58 mm 到 stage≥4 是 4/5，
+          &lt;58 mm 是 3/4，<b>Fisher p = 1.000</b>；成功那一轮闭合在 66.2 mm，在 9 轮里<b>排第 4</b>，不高不低。
+          所以<b>不要据此去调闭合高度</b>——没有证据说往哪个方向调会更好。散布本身（上一段那 2.4 倍）复现了，
+          "深度分开结果"这层没有。</span></li>
       </ul>
       <p>策略这一维的散布 sd ≈ 9 mm，是 demo 的 <b>2.6 倍</b>。上一条 callout 说"现有数据无法验证 TCP 偏移"仍然成立
         ——这里量到的是<b>深度的散布</b>，不是偏移的方向，两者不是一回事。</p>
+      <p class="small"><b>09-02 已复测（n=10，围栏修好、peg 固定）：2.4 倍。</b>把"墙"和"摆放散布"两个替代解释
+        都去掉之后这个比值原样复现，见下方围栏 callout。</p>
 
       <div class="callout ok">
         <b>两种机制会产生一模一样的日志特征，光看日志分不开——判别实验已经把它们分开了。</b>
@@ -585,7 +594,8 @@
             数据集是 3 月录的，仓库里有 <code>tools/fr3/fr3_migrate_tool_frame.py</code>，工具坐标系被迁移过；
             若 TCP 定义变过，同一个"50 mm"对应的物理高度就不同。
             <b>但留档轨迹在今天的真机上原样重播，仍然复现得出抓取</b> —— 记录里的 z 在当前运行时下
-            依旧指向录制时那个物理高度。<b>没有一个运行时常数在等着被修。</b></li>
+            依旧指向录制时那个物理高度。<b>没有一个<i>坐标系</i>常数在等着被修。</b>
+            <span class="small">（这句原先写的是"没有一个运行时常数在等着被修"。09-01 发现运行时确实藏着一个——不是坐标系常数，是工作围栏，它把下降削平了。见本节末的围栏 callout；判别实验本身不受影响。）</span></li>
           <li><b>(b) 策略的 z 自身就噪。<span class="badge warn">保留</span></b>那是数据分布问题，属于 DAgger。</li>
         </ul>
         判据是本页原先就写下的那一条：<code>fr3_das_replay_real.py --episode N</code> 把某条 demo 原样回放、
@@ -611,15 +621,73 @@
       </div>
 
       <div class="callout warn">
+        <b>rollout 的工作围栏比录制时高 50 mm：那批"降到底"其实是撞在一面没人知道的墙上。
+        <span class="badge done">09-01 已修</span></b>
+        <code>fr3_act_infer_real_runtime.py</code> 里写死过 <code>workspace_min=(0.1, -0.6, 0.05)</code>，
+        而录制用的 <code>fr3_record_config.yaml</code> 是 <code>[0.18, -0.45, 0.0]</code>，
+        而 demo 经常降到 50 mm 以下。驱动的 <code>send_action</code> 把每条指令位姿夹进这个盒子，
+        再把<b>夹完之后</b>的位姿当作 <code>prev_cmd</code> 回报——于是夹取不抛错、不打日志，
+        本进程的步长闸和牵引闸也永远看不到它：命令被截短，手臂停在半路，而所有数字仍然显示这轮很健康。
+        <br><b>轨迹里直接看得见这面墙。</b>08-31 那批 10 轮共 5619 帧，实测 EE z
+        <b>没有一帧低于 49.08 mm</b>——[49,50) mm 有 131 帧，49 mm 以下 0 帧。分布不是渐稀，是齐根切断；
+        另有 61 帧压在 50.00 mm 的 ±0.05 mm 里。这些帧的 <code>status</code> 全是 <code>pass</code>。
+        （50 mm 的指令地板下面还能测到 49.08 mm，是阻抗顺应压出来的那不到 1 mm。）
+        <br><b>demo 基线（09-01 实测，<code>fr3_spacemouse-insert</code> 全 50 集 24945 帧，
+        闭合按 <code>action.gripper.pos</code> 判，观测通道 47% 掉零不可用）</b>：
+        <div class="tablewrap">
+        <table>
+          <tr><th></th><th>中位</th><th>范围</th></tr>
+          <tr><td>闭合高度 <code>z@close</code></td><td><b>50.7 mm</b>（mean 50.1，<b>sd 3.5</b>）</td><td>41.3 – 56.6</td></tr>
+          <tr><td>每集最低点</td><td>48.2 mm</td><td>40.7 – 56.3</td></tr>
+          <tr><td>最低点降到 50 mm 以下的集数</td><td colspan="2"><b>30 / 50</b></td></tr>
+        </table>
+        </div>
+        所以旧围栏那个 50 mm 地板，<b>压在六成示范集的最低点之上</b>。
+        （本页早先引用的"记录帧最低 28 mm"是 <b>pick_and_place</b> 数据集的数，不是本任务的；
+        记录围栏要同时容下两个任务，所以 28 mm 仍是围栏的约束数，40.7 mm 才是本任务的。）
+        <br><b>它动摇的是深度那组数，不是判别实验。</b>回放判别仍然成立，(a) 依旧出局：
+        demo 闭合中位 50.7 mm，正贴着地板上沿，几乎不被夹取影响，所以"原样重播仍能抓住"这件事不受牵连。
+        但<b>「闭合高度 &lt; 58 mm 的 8 轮里只有 2 轮抓住」这个分组，低的那一侧整整齐齐落在夹取生效的区间里</b>——
+        现有数据分不开"策略自己降过头"和"策略撞上一面墙、指令还在往下压而手臂不动"这两件事。
+        同理，散布 sd ≈ 9 mm 是在一个<b>被截尾</b>的分布上量出来的，2.6 倍这个比值只会被低估。
+        <br><b>要做的是重测，不是重新归因。</b>重测已完成（09-01 16:34 + 09-02 09:48，共 11 轮扣掉 1 轮误触发
+        = <b>n=10</b>，peg 固定、围栏修好、每轮独立评分）。横幅确认围栏已换
+        （<code>min=(0.180,-0.450,0.000) source=fr3_record_config.yaml</code>）。
+        <div class="tablewrap">
+        <table>
+          <tr><th></th><th>闭合高度</th><th>50.00 mm 处堆积</th><th>最低点低于 50 mm 的轮次</th></tr>
+          <tr><td>08-31（有墙）</td><td>sd ≈ 9 mm（2.6×）</td><td>61 帧，局部密度 4.4×</td><td>0 / 10</td></tr>
+          <tr><td><b>09-01+02（无墙）</b></td><td><b>61.5 ± 8.4 mm</b>（2.4×）</td><td><b>0 帧</b></td><td><b>2 / 10</b>（45.2 / 48.8 mm）</td></tr>
+          <tr><td>demo（n=50）</td><td>50.1 ± 3.5 mm</td><td>—</td><td>30 / 50</td></tr>
+        </table>
+        </div>
+        <b>结论：墙是真的、确实拦过（拆掉之后有两轮降到了 50 以下，旧批一帧都没有），但它不是散布的原因
+        ——拆掉之后散布没收窄。</b>策略仍比 demo 高 11.4 mm、散布 2.4 倍。
+        <b>本节的深度证据不再是"待重测"，(b) 策略 z 自身噪声由推论升为复测证实。</b>
+        <br><span class="small">两轮不进深度统计：09-01 第 4 轮从未闭合，365 帧里 <b>154 帧
+        <code>leash_limited</code></b>（42%，旧批 1.5%，09-02 那 7 轮全是 0%），是个未解释的孤例；
+        09-02 第 2 轮是误触发（98 帧、闭合在半空 118.8 mm），已按 aborted 排除。</span>
+        <br><b>改法</b>：围栏不再有第二份。<code>tools/fr3/workspace_fence.py</code> 从
+        <code>--record-config</code> 指的那份记录配置里读 <code>robot.workspace_min/max</code>，
+        缺键就报错而不是回退到默认盒子（回退正是这个 bug 复发的路），启动横幅打印
+        <code>workspace_fence min=… max=… source=…</code>，明说这一轮用的是哪一份。
+        <code>tests/scripts/test_fr3_workspace_fence.py</code> 钉住"解出来的地板必须低于记录帧最深处"。
+      </div>
+
+      <div class="callout warn">
         <b>顺带一条：第 2、8、9、15 轮夹爪指令<b>从未闭合</b>，其中三轮的备注却是 push down。</b>
         也就是说销是在<b>接近过程中被撞倒的</b>，不是闭合时被挤倒的。这两件事现在都折在 stage 2 里，
         但它们指向不同的工作项（接近轨迹 vs 闭合位姿）。下一批评分时 <code>blocker</code> 要能把它们分开。
       </div>
 
       <div class="callout warn">
-        <b>下一批 rollout 请把 peg 固定在同一个位置。</b>
+        <b>下一批 rollout 请把 peg 固定在同一个位置。<span class="badge done">09-02 已做</span></b>
         本批闭合点 x 极差 103 mm、y 极差 205 mm，闭合高度彼此不可比；固定位置之后，
         散布才是策略的散布，而不是摆放的散布。10 轮即可。
+        <br><b>并且要在修好的围栏下跑</b>（启动横幅里 <code>workspace_fence … source=</code> 指向记录配置，
+        不是 built-in default）：这批同时是上一条围栏 callout 的重测，围栏没换的话量到的还是那面墙。
+        <br><b>做完了</b>：09-02 那批抓取点 x 极差 10 mm、y 极差 13 mm（本批是 103 / 205 mm），
+        围栏横幅已核。摆放散布消掉之后闭合高度散布仍是 8.4 mm——结论见上方围栏 callout。
       </div>
 
       <h3>落地形状（已实现）</h3>
@@ -826,6 +894,56 @@
         报告里连同当次的钳制上限一起记——一个交还距离只有放在产生它的那组上限旁边才有意义，
         而启动器传的那组和脚本自带的默认值并不相同。原来这个 <code>--output</code> 要手敲，
         于是一次演练做完了，数却没落下来。
+      </div>
+
+      <div class="callout warn">
+        <b>第一次演练（09-01）：接管拿到手就交不回来。</b>2189 步里 1813 步在操作者手里，7 段接管，
+        最后一段从第 993 步一直到 rollout 结束都没有交还，<code>max_handback_gap_mm=271.3</code>。
+        现场现象是<b>手拿开之后机械臂还在走</b>，而同时实测 SpaceMouse 一松手就不再产生新信号。
+        <br><b>两个毛病，同一个根</b>：<code>pyspacemouse</code> 以非阻塞方式打开设备，一次
+        <code>read()</code> 只从内核队列里取<b>一份</b>报文；队列取空之后，
+        <code>read()</code> 返回的是设备的<b>缓存状态</b>而不是"空"。于是
+        （一）一步只读一份，设备每秒约 126 份对上 30 Hz 的控制环，每秒落后约 96 份——
+        手已经拿开了，队列里还压着一秒前的报文在推机械臂；
+        （二）队列见底以后，同一份非零报文被当成新输入无限重放，机械臂匀速漂走，
+        而"设备安静够久就交还"的计时器<b>被每一份复制品重置</b>，所以永远等不到交还。
+        <br><b>改法</b>：每步把队列抽干，只用<b>最新</b>那一份——这是速率控制，
+        把抽出来的几份加起来就退回成"每步都顶着钳制"的老 bug；报文带上驱动写的时间戳，
+        时间戳没动就是设备这一步没说话，运动量按 0 算。夹爪轴不受这条规则约束：
+        按住按钮同样不产生新报文，夹爪由 teleoperator 自己的状态机推进，
+        用报文新鲜度去卡它，等于在操作者正夹着东西的时候把手臂还给策略。
+        日志里现在直接读得出来：<code>takeover=moving/holding/stale</code> 与
+        <code>takeover_reads=N</code>（N 长期大于 5 就是队列在积压）。
+        <br><b>这次的 271 mm 不算数</b>：它量的是失控漂移的距离，不是操作者开出去的距离。
+      </div>
+
+      <div class="callout ok">
+        <b>复演练已跑，接管交得回来了。<span class="badge done">09-01 15:02</span></b>
+        报告在工作站 <code>hph@192.168.100.155:~/Code/lerobot/outputs/dagger_sim/dryrun_20260901_150205.json</code>
+        （修复前那次是同目录 <code>dryrun_20260901_113203.json</code>，两份对着读）。
+        <div class="tablewrap">
+        <table>
+          <tr><th></th><th>11:33 修复前</th><th>15:02 修复后</th></tr>
+          <tr><td>steps / expert_steps</td><td>2189 / 1813（<b>83%</b> 在操作者手里）</td><td>683 / 329（48%）</td></tr>
+          <tr><td>接管段数</td><td>7 段，末段 <b>993→2188 顶到 rollout 结束</b></td><td>5 段，<b>全部有终点</b>（末段 460–514，之后又跑到 683）</td></tr>
+          <tr><td>交还次数</td><td>6 次（<b>7 段只交还 6 次</b>）</td><td><b>5 次，5 段全交还</b></td></tr>
+          <tr><td><code>handback_gaps_mm</code></td><td>271.3 / 158.3 / 204.6 / 0.3 / 2.4 / 2.3</td><td>84.7 / 68.0 / 215.7 / 55.3 / 1.0</td></tr>
+        </table>
+        </div>
+        <b>过线的不是"最大间隙从 271 降到 216"，是段数和交还次数对上了。</b>
+        修复前 7 段只交还 6 次，那漏掉的一次就是失控本身；修复后每一段都是操作者松手结束的。
+        <br><b>两条边界，免得这两个数被读过头。</b>
+        （一）<code>handback_gap_mm</code> 是<b>仿真专有量</b>：演练里 demo 流被冻住，间隙量的是回到那个冻结位姿的距离。
+        真机上策略每步都在跑，接管结束后它直接从操作者留下的 <code>prev_cmd</code> 继续，没有"走回去"这一段，
+        所以这个数<b>不要往真机上套</b>。
+        （二）这次演练跑在 15:09 那次提交<b>之前</b>的工作树上，而 15:36 还加了一笔按实际步长修正接管增益的改动
+        （<code>step_period_s</code> / <code>_gain_for_step</code>）。它在演练里几乎是空操作——那个循环稳得住帧率，
+        修正比 ≈ 1.00——真正的读数在真机：横幅的 <code>motion_gain</code> 对比日志里的 <code>takeover_gain</code>。
+        <br><b>顺带堵上一个会让这次修复静默失效的口子。</b>队列抽干与"复制品不算新报文"都依赖驱动给每份报文盖时间戳
+        （<code>last_report_timestamp</code>）。驱动没有这个属性时，接管只能退回"一步一读、每读都算新"——正是修复前的行为，
+        而且不报错。现在真机模式在<b>构造机械臂、加载 checkpoint 之前</b>就拒跑并指出是哪一份
+        <code>lerobot</code> 被导进来了（<code>PYTHONPATH</code> 的事）；MuJoCo 演练仍放行，但会 WARN，
+        且报告里记下 <code>report_timestamps</code>——今天这两份报告都说不出自己跑在哪条路径上，就是它要解决的问题。
       </div>
 
       <div class="callout ok">

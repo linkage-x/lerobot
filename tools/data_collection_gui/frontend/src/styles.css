@@ -4998,19 +4998,85 @@ button.danger {
   touch-action: none;
   cursor: crosshair;
 }
-.scene-reset-bg-img {
-  position: absolute;
-  left: 7.7778%;
-  top: 7.7778%;
-  width: 84.4444%;
-  height: 84.4444%;
-  object-fit: cover;
+/* The camera still after it has been re-projected onto the table plane. Drawn inside the SVG
+   at the plot rectangle, so it needs no positioning of its own -- only to be quiet enough that
+   the points and the mask drawn over it stay legible. */
+.table-view-image {
   filter: grayscale(0.82) saturate(0.28) contrast(0.78) brightness(1.08);
-  opacity: 0.42;
+  opacity: 0.46;
   pointer-events: none;
 }
 .scene-reset-frame-with-bg {
   fill: rgba(248, 250, 252, 0.34);
+}
+.scene-reset-pick-marker circle {
+  fill: rgba(220, 38, 38, 0.16);
+  stroke: #dc2626;
+  stroke-width: 1.4;
+}
+.scene-reset-pick-marker line {
+  stroke: #dc2626;
+  stroke-width: 1.2;
+}
+.scene-reset-pick-marker text {
+  fill: #b91c1c;
+  font-size: 11px;
+  font-weight: 600;
+}
+.scene-reset-reference-dot {
+  fill: #aebbc5;
+  opacity: 0.9;
+  pointer-events: none;
+}
+.scene-reset-reference-control {
+  display: flex;
+  justify-content: flex-start;
+}
+.scene-reset-reference-source {
+  max-width: 260px;
+}
+/* The frozen still of the arm standing at a probed point, and the crosshairs marking where the
+   tool has already been clicked in it. The overlay is not interactive: every click has to reach
+   the image, which is the thing whose pixel coordinates mean something. */
+.table-align-frame {
+  position: relative;
+  margin: 10px 0;
+  max-width: 640px;
+}
+.table-align-frame img {
+  border: 1px solid #d5dde3;
+  border-radius: 6px;
+  cursor: crosshair;
+  display: block;
+  width: 100%;
+}
+.table-align-frame svg {
+  height: 100%;
+  left: 0;
+  pointer-events: none;
+  position: absolute;
+  top: 0;
+  width: 100%;
+}
+.table-align-marker circle {
+  fill: none;
+  stroke: #16a34a;
+  stroke-width: 2;
+}
+.table-align-marker line {
+  stroke: #16a34a;
+  stroke-width: 1.6;
+}
+.table-align-marker text {
+  fill: #15803d;
+  font-size: 16px;
+  font-weight: 700;
+}
+.table-align-targets {
+  flex-wrap: wrap;
+}
+.table-align-points {
+  margin-top: 10px;
 }
 .scene-reset-mask-stroke {
   fill: rgba(37, 99, 235, 0.18);
@@ -5026,13 +5092,6 @@ button.danger {
 .scene-reset-form .field.inline {
   min-width: 92px;
   flex: 1 1 92px;
-}
-.scene-reset-reference-control {
-  display: flex;
-  justify-content: flex-start;
-}
-.scene-reset-reference-source {
-  max-width: 260px;
 }
 @media (max-width: 860px) {
   .scene-reset-layout { grid-template-columns: 1fr; }

@@ -1148,6 +1148,9 @@ export type RolloutRun = {
   startedAt: string;
   finishedAt: string;
   logPath: string;
+  /** This launch's trace directory, one per launch. The runtime restarts its rollout numbering
+   *  at 1 on every start, so a shared directory would overwrite the previous batch. */
+  tracePath: string;
   previewDir: string;
   lastLines: string[];
   /** Non-zero when a finished rollout is waiting for the operator to grade it. */
@@ -1188,8 +1191,58 @@ export type RolloutLandmarks = {
   datasetRoot?: string;
   /** Measured as the mean of every demonstration's release point, not configured. */
   hole?: [number, number];
+  /** The same mean release point with its height: where the demonstrations left the peg, and
+   *  therefore where a scene reset has to reach to pick it back up. */
+  placeXyz?: [number, number, number];
   points?: DemoLandingPoint[];
   graspRadiusM?: { min: number; max: number; mean: number };
+};
+
+/** The base-frame rectangle a map is drawing, and therefore the one its backdrop must cover. */
+export type TableWindow = { minX: number; maxX: number; minY: number; maxY: number };
+
+/** One correspondence in a camera's table calibration: where the tool was, where it appeared.
+ *
+ *  `u`/`v` are pixels in the camera's own still and `x`/`y` are metres in the robot base frame.
+ *  The base half is measured by the robot, never typed: it comes from the runtime's report of
+ *  the point it actually reached.
+ */
+export type TablePlanePoint = { u: number; v: number; x: number; y: number };
+
+/** How one camera's pixels map onto the table plane, and how well.
+ *
+ *  `calibrated` is the only thing a map should branch on. Points can exist without a fit (fewer
+ *  than four), and a fit can exist and be bad, which is what `maxResidualMm` is for: it is the
+ *  distance between where the robot was and where the fit says the click was, in the units the
+ *  error budget is written in.
+ */
+export type TableAlignment = {
+  ok?: boolean;
+  cameraKey: string;
+  planeZ: number;
+  imageWidth: number;
+  imageHeight: number;
+  points: TablePlanePoint[];
+  imageToBase: number[][] | null;
+  residualsMm: number[];
+  maxResidualMm: number;
+  /** Why enough points still produced no mapping — three of them in a line, most often. */
+  fitError: string;
+  calibrated: boolean;
+  minPoints: number;
+  recommendedPoints: number;
+  updatedAt: string;
+  probeFrame?: {
+    requestId: string;
+    xyz: number[];
+    at: number;
+    pendingRequestId: string;
+    pendingXyz: number[];
+    /** A still exists and belongs to the probe that was asked for. */
+    ready: boolean;
+    /** The arm is still on its way to the point this still is supposed to show. */
+    moving: boolean;
+  };
 };
 
 export type RolloutStatusPayload = {

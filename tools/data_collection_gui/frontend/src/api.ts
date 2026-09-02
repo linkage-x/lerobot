@@ -44,6 +44,8 @@ import type {
   TrainingStartRequest,
   RolloutLastParams,
   RolloutLandmarks,
+  TableAlignment,
+  TableWindow,
   SceneResetRequest,
   SceneResetResult,
   TrainingHistoryEntry,
@@ -1069,6 +1071,88 @@ export class DataCollectionGuiApi {
   /** Cache-busted so the browser re-requests each poll rather than serving the first frame. */
   rolloutCameraUrl(cameraKey: string, nonce: number): string {
     return `${this.apiBase}/api/rollout/camera.jpg?camera=${encodeURIComponent(cameraKey)}&t=${nonce}`;
+  }
+
+  // A still of the parked cell, in camera pixels. Separate from rolloutCameraUrl because that
+  // one is a liveness view and refuses a frame older than a few seconds -- between rollouts
+  // every frame is older than that, and a still is what a reference layer wants anyway.
+  cameraStillUrl(cameraKey: string, nonce: number): string {
+    const params = new URLSearchParams({ camera: cameraKey, t: String(nonce) });
+    return `${this.apiBase}/api/rollout/camera-still.jpg?${params.toString()}`;
+  }
+
+  /** The same still re-projected onto the table, cropped to exactly the base-frame rectangle
+   *  the caller is plotting. The window is sent rather than assumed because the maps rescale
+   *  around their data; anything the server had to guess would drift from the points drawn
+   *  over it. 409 while the camera has never been aligned, which is why callers treat a failed
+   *  load as "no backdrop" rather than as an error. */
+  tableViewUrl(
+    cameraKey: string,
+    window: TableWindow,
+    width: number,
+    height: number,
+    nonce: number
+  ): string {
+    const params = new URLSearchParams({
+      camera: cameraKey,
+      minX: window.minX.toFixed(5),
+      maxX: window.maxX.toFixed(5),
+      minY: window.minY.toFixed(5),
+      maxY: window.maxY.toFixed(5),
+      width: String(Math.round(width)),
+      height: String(Math.round(height)),
+      t: String(nonce)
+    });
+    return `${this.apiBase}/api/rollout/table-view.jpg?${params.toString()}`;
+  }
+
+  /** The frozen still taken while the arm stood at the last probed point. */
+  tableProbeFrameUrl(cameraKey: string, nonce: number): string {
+    const params = new URLSearchParams({ camera: cameraKey, t: String(nonce) });
+    return `${this.apiBase}/api/rollout/table-probe-frame.jpg?${params.toString()}`;
+  }
+
+  async fetchTableAlignment(cameraKey: string): Promise<TableAlignment | null> {
+    try {
+      const response = await fetch(
+        `${this.apiBase}/api/rollout/table-alignment?camera=${encodeURIComponent(cameraKey)}`,
+        { headers: { Accept: "application/json" } }
+      );
+      if (!response.ok) return null;
+      return (await response.json()) as TableAlignment;
+    } catch {
+      return null;
+    }
+  }
+
+  async probeTablePoint(cameraKey: string, xyz: [number, number, number]) {
+    return this.trainingPost<Record<string, never>>("/api/rollout/table-probe", {
+      camera: cameraKey,
+      x: xyz[0],
+      y: xyz[1],
+      z: xyz[2]
+    });
+  }
+
+  async recordTablePoint(
+    cameraKey: string,
+    click: { u: number; v: number; imageWidth: number; imageHeight: number }
+  ) {
+    return this.trainingPost<TableAlignment>("/api/rollout/table-point", {
+      camera: cameraKey,
+      ...click
+    });
+  }
+
+  async deleteTablePoint(cameraKey: string, index: number) {
+    return this.trainingPost<TableAlignment>("/api/rollout/table-point/delete", {
+      camera: cameraKey,
+      index
+    });
+  }
+
+  async clearTableAlignment(cameraKey: string) {
+    return this.trainingPost<TableAlignment>("/api/rollout/table-clear", { camera: cameraKey });
   }
 
   async fetchRealSenseStatus(): Promise<RealSensePreviewStatus | null> {

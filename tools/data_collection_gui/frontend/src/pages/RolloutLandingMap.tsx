@@ -1,12 +1,14 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 
 import type {
   DemoLandingPoint,
   RolloutGeometry,
   RolloutLandmarks,
-  RolloutOutcomeEntry
+  RolloutOutcomeEntry,
+  TableWindow
 } from "../types";
 import { buildLandingPoints, formatMm, type PlottedPoint, pointFill, stageFill } from "./landingMapPoints";
+import { windowForPlot } from "./tableWindow";
 
 /** A top-down map of where rollouts actually put the gripper, over where the demonstrations did.
  *
@@ -18,8 +20,10 @@ import { buildLandingPoints, formatMm, type PlottedPoint, pointFill, stageFill }
  * only interpretable relative to the region the policy was ever shown.
  *
  * Plotted in the robot's own base frame rather than in camera pixels. The base frame is the one
- * the dataset, the runtime and this page already agree on, so nothing here depends on a camera
- * calibration that could be stale.
+ * the dataset, the runtime and this page already agree on, so no point on this map depends on a
+ * camera calibration that could be stale. The camera can still appear *underneath* them, but
+ * only the other way round: the still is re-projected into this plot's base-frame window, and
+ * when there is no calibration to do that with, the backdrop is simply absent.
  */
 
 const SIZE = 460;
@@ -34,15 +38,22 @@ export function RolloutLandingMap({
   entries,
   pendingIndex,
   pendingGeometry,
-  checkpointId
+  checkpointId,
+  tableViewUrl,
+  backgroundLabel = "side camera"
 }: {
   landmarks: RolloutLandmarks;
   entries: RolloutOutcomeEntry[];
   pendingIndex: number;
   pendingGeometry?: RolloutGeometry;
   checkpointId: string;
+  /** Builds the URL of the camera still re-projected onto exactly this rectangle of table.
+   *  Absent until the camera has been aligned, and then the map draws its grid alone. */
+  tableViewUrl?: (window: TableWindow, width: number, height: number) => string;
+  backgroundLabel?: string;
 }) {
   const demoPoints: DemoLandingPoint[] = landmarks.points ?? [];
+  const [backgroundLoaded, setBackgroundLoaded] = useState(false);
 
   const rolloutPoints = useMemo<PlottedPoint[]>(
     () => buildLandingPoints(entries, pendingIndex, pendingGeometry),
@@ -84,10 +95,13 @@ export function RolloutLandingMap({
       span,
       centreX,
       centreY,
-      // Base y grows to the robot's left, so it is drawn rightward and base x upward: the view
-      // an operator has standing in front of the cell, rather than one they have to mirror.
+      // Base x runs rightward and base y upward, matching the axis labels and the scene-reset
+      // map. The camera backdrop is re-projected into this same convention, so changing either
+      // half without the other silently mirrors the table under the points.
       toScreenX: (x: number) => originX + (x - centreX) * scale,
       toScreenY: (y: number) => originY - (y - centreY) * scale,
+      toWorldX: (screenX: number) => centreX + (screenX - originX) / scale,
+      toWorldY: (screenY: number) => centreY + (originY - screenY) / scale,
       scale
     };
   }, [demoPoints, rolloutPoints, landmarks.hole]);
@@ -100,6 +114,17 @@ export function RolloutLandingMap({
       </p>
     );
   }
+
+  // The plot rectangle expressed in base metres, which is what the backdrop has to cover.
+  const plotWidth = SIZE - PAD_LEFT - PAD_RIGHT;
+  const plotHeight = SIZE - PAD_TOP - PAD_BOTTOM;
+  const viewWindow: TableWindow = windowForPlot(frame, {
+    left: PAD_LEFT,
+    top: PAD_TOP,
+    right: SIZE - PAD_RIGHT,
+    bottom: SIZE - PAD_BOTTOM
+  });
+  const backgroundUrl = tableViewUrl ? tableViewUrl(viewWindow, plotWidth, plotHeight) : "";
 
   const gridLines: { value: number; axis: "x" | "y" }[] = [];
   const halfSpan = frame.span / 2;
@@ -128,11 +153,27 @@ export function RolloutLandingMap({
   return (
     <div className="landing-map">
       <svg viewBox={`0 0 ${SIZE} ${SIZE}`} role="img" aria-label="Rollout landing points">
+        {backgroundUrl ? (
+          <image
+            href={backgroundUrl}
+            x={PAD_LEFT}
+            y={PAD_TOP}
+            width={plotWidth}
+            height={plotHeight}
+            preserveAspectRatio="none"
+            className="table-view-image"
+            onError={() => setBackgroundLoaded(false)}
+            onLoad={() => setBackgroundLoaded(true)}
+            style={{ visibility: backgroundLoaded ? "visible" : "hidden" }}
+          >
+            <title>{`${backgroundLabel}, projected onto the table plane`}</title>
+          </image>
+        ) : null}
         <rect
           x={PAD_LEFT}
           y={PAD_TOP}
-          width={SIZE - PAD_LEFT - PAD_RIGHT}
-          height={SIZE - PAD_TOP - PAD_BOTTOM}
+          width={plotWidth}
+          height={plotHeight}
           className="landing-map-frame"
         />
         {gridLines.map(({ value, axis }) => {

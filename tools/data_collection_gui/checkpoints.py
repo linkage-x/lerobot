@@ -719,16 +719,25 @@ def demo_landing_points(dataset_root: Path) -> dict[str, Any]:
                 "descentM": round(apex_z - float(position[release_idx, 2]), 5),
             }
         )
-        releases.append([float(position[release_idx, 0]), float(position[release_idx, 1])])
+        releases.append(
+            [
+                float(position[release_idx, 0]),
+                float(position[release_idx, 1]),
+                float(position[release_idx, 2]),
+            ]
+        )
 
     if not points:
         return {}
     # The demonstrations all release into the same hole, so their mean release point *is* the
     # hole -- measured rather than configured, which keeps it correct if the fixture is moved.
-    hole = [
-        round(float(np.mean([release[0] for release in releases])), 5),
-        round(float(np.mean([release[1] for release in releases])), 5),
+    # The z is carried too: it is the height the gripper was at when it let the peg go, which
+    # is exactly the height it has to return to in order to pick that peg back up. That makes
+    # this point the scene reset's pick pose, not just a marker on the landing map.
+    place_xyz = [
+        round(float(np.mean([release[axis] for release in releases])), 5) for axis in range(3)
     ]
+    hole = place_xyz[:2]
     radii = [
         float(np.hypot(point["graspXyz"][0] - hole[0], point["graspXyz"][1] - hole[1]))
         for point in points
@@ -736,6 +745,7 @@ def demo_landing_points(dataset_root: Path) -> dict[str, Any]:
     landmarks = {
         "datasetRoot": str(root),
         "hole": hole,
+        "placeXyz": place_xyz,
         "points": points,
         "graspRadiusM": {
             "min": round(min(radii), 5),

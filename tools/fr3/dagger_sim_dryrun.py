@@ -57,7 +57,12 @@ from tools.fr3.command_guard import (  # noqa: E402
     observation_with_prev_cmd,
     smooth_robot_command_ema,
 )
-from tools.fr3.dagger_takeover import ExpertTakeover, expert_spans, motion_gain_for  # noqa: E402
+from tools.fr3.dagger_takeover import (  # noqa: E402
+    ExpertTakeover,
+    backend_dates_reports,
+    expert_spans,
+    motion_gain_for,
+)
 from tools.fr3.interactive_control import InteractiveRolloutKeyboard  # noqa: E402
 from tools.fr3.live_frames import LiveFrameEmitter  # noqa: E402
 
@@ -129,18 +134,36 @@ def build_expert_takeover(args: argparse.Namespace, *, step_period_s: float) -> 
         emit(f"WARN: SpaceMouse did not connect ({exc}); running without takeover")
         return None
     motion_gain = motion_gain_for(tick_hz=float(teleop.config.frequency), step_period_s=step_period_s)
+    # A rehearsal on an undated driver is allowed -- there is no arm here to run away, and the
+    # replay is still worth watching. It is said out loud because the numbers it produces are the
+    # ones the real rig is gated on, and on this path they measure the degraded read: one report
+    # per step, every copy counted as new. The real runtime refuses this driver outright.
+    dated = backend_dates_reports(teleop)
+    if not dated:
+        emit(
+            "WARN: this SpaceMouse driver does not date its reports (no last_report_timestamp). "
+            "The rehearsal runs, but its handback gaps measure the pre-fix read and do not "
+            "transfer to the rig -- fix PYTHONPATH (see tools/fr3/dagger_takeover.py) and re-run "
+            "before reading anything off this report."
+        )
     emit(
         f"dagger_takeover=ready device_id={overrides['device_id']} "
         f"translation_scale={teleop.config.translation_scale:.6f} "
         f"rotation_scale={teleop.config.rotation_scale:.6f} "
         f"release_after_s={float(args.takeover_release_after_s):.2f} "
         f"motion_gain={motion_gain:.2f} "
-        f"full_deflection_mm_per_step={teleop.config.translation_scale * motion_gain * 1000.0:.1f}"
+        f"full_deflection_mm_per_step={teleop.config.translation_scale * motion_gain * 1000.0:.1f} "
+        f"report_timestamps={'yes' if dated else 'no'}"
     )
     return ExpertTakeover(
         teleop,
         release_after_s=float(args.takeover_release_after_s),
         motion_gain=motion_gain,
+        # Handed over for the same reason the real rollout hands it over: the rehearsal is only
+        # worth running if it exercises the code the rig runs. This loop has almost no work in it
+        # and holds its rate, so the correction should sit at 1.00 here -- which is itself the
+        # thing worth seeing, next to whatever the real one reports.
+        step_period_s=step_period_s,
     )
 
 
@@ -325,6 +348,12 @@ def run_dryrun(args: argparse.Namespace) -> dict[str, Any]:
         "demo_frames_total": total_frames,
         "expert_steps": expert_steps,
         "expert_spans": spans,
+        # Recorded for the same reason the clamp is: a handback gap read months later cannot say
+        # for itself whether it came off the dated read or the degraded one, and the two measure
+        # different things. None when no device was connected at all.
+        "report_timestamps": (
+            None if takeover is None else bool(takeover.dates_reports)
+        ),
         # The clamp the run was bounded by, recorded rather than assumed: a handback gap only
         # means something next to the limits that produced it, and the launcher passes different
         # ones than this script's own defaults.

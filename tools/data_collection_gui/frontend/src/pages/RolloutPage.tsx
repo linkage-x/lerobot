@@ -12,11 +12,14 @@ import type {
   RolloutRun,
   RolloutRuntimeOptions,
   SceneResetRequest,
+  TableAlignment,
+  TableWindow,
   TaskLadder
 } from "../types";
 import { RolloutLandingMap } from "./RolloutLandingMap";
 import { RolloutLiveViewer } from "./RolloutLiveViewer";
 import { SceneResetPanel } from "./SceneResetPanel";
+import { TableAlignmentPanel } from "./TableAlignmentPanel";
 
 /**
  * Running a trained checkpoint on the real FR3.
@@ -106,11 +109,34 @@ export function RolloutPage() {
   const [history, setHistory] = useState<RolloutOutcomeEntry[]>([]);
   const [landmarks, setLandmarks] = useState<RolloutLandmarks>({});
   const [frameNonce, setFrameNonce] = useState(0);
+  const [backgroundNonce, setBackgroundNonce] = useState(0);
+  const [tableAlignment, setTableAlignment] = useState<TableAlignment | null>(null);
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const mode = useMemo(() => modes.find((item) => item.id === modeId), [modes, modeId]);
-  const sceneResetBackgroundUrl = api.cameraSnapshotUrl("side");
   const isLive = run !== null && LIVE_STATES.has(run.state);
+  // Scene reset drives the arm through the rollout process's own stdin, so it is only offered
+  // while that process is sitting between rollouts waiting for a command.
+  const sceneResetPanelUsable = Boolean(run?.interactive) && run?.state === "waiting";
+  // The map is painted in base x/y, so the reference layer is the camera that looks across the
+  // table rather than the one riding the gripper.
+  const sceneResetCameraKey = run?.cameraKeys?.includes("side")
+    ? "side"
+    : run?.cameraKeys?.[0] ?? "side";
+  // Handed to both maps so each asks for its own base-frame rectangle. Absent until the camera
+  // has been aligned to the table: no backdrop is the correct drawing of "we do not know where
+  // this picture is", and it is what the panel below exists to change.
+  const tableViewUrl = useCallback(
+    (window: TableWindow, width: number, height: number) =>
+      api.tableViewUrl(sceneResetCameraKey, window, width, height, backgroundNonce),
+    [sceneResetCameraKey, backgroundNonce]
+  );
+  const tableBackdrop = tableAlignment?.calibrated ? tableViewUrl : undefined;
+  // The plane the demonstrations released the peg on is the plane the pegs and the landing
+  // points live on, so it is the one worth projecting.
+  const tablePlaneZ = landmarks.placeXyz?.[2] ?? 0.035;
+  const tableCentre: [number, number] = landmarks.hole ??
+    (landmarks.placeXyz ? [landmarks.placeXyz[0], landmarks.placeXyz[1]] : [0.45, 0.0]);
   const blocking = useMemo(
     () => (selected?.issues ?? []).filter((issue) => issue.level === "block"),
     [selected]
@@ -256,6 +282,17 @@ export function RolloutPage() {
     const timer = window.setInterval(() => setFrameNonce((value) => value + 1), 200);
     return () => window.clearInterval(timer);
   }, [isLive]);
+
+  // The map backdrop is a still, not a stream: the runtime publishes one frame each time it
+  // parks the arm and waits. Re-fetching slowly is enough to pick up the frame from the
+  // rollout that just ended, and polling it at the live camera rate would buy nothing --
+  // each fetch also costs the gateway one perspective warp.
+  useEffect(() => {
+    if (!sceneResetPanelUsable) return undefined;
+    setBackgroundNonce((value) => value + 1);
+    const timer = window.setInterval(() => setBackgroundNonce((value) => value + 1), 3000);
+    return () => window.clearInterval(timer);
+  }, [sceneResetPanelUsable]);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -650,6 +687,9 @@ export function RolloutPage() {
             </pre>
           )}
           {run.logPath && <p className="hint">Full log: <code>{run.logPath}</code></p>}
+          {/* Named on screen because this is where the batch's evidence lands, and a batch
+              analysed out of the wrong directory is worse than one nobody analysed. */}
+          {run.tracePath && <p className="hint">Traces: <code>{run.tracePath}</code></p>}
         </section>
       )}
 
@@ -659,6 +699,8 @@ export function RolloutPage() {
           <h3>Where the gripper landed</h3>
         </div>
         <RolloutLandingMap
+          tableViewUrl={tableBackdrop}
+          backgroundLabel={`${sceneResetCameraKey} camera`}
           landmarks={landmarks}
           entries={mappedEntries}
           pendingIndex={run?.pendingOutcomeFor ?? 0}
@@ -670,10 +712,15 @@ export function RolloutPage() {
       <SceneResetPanel
         title="Scene reset"
         landmarks={landmarks}
-        backgroundImageUrl={sceneResetBackgroundUrl}
-        backgroundLabel="side camera"
+        tableViewUrl={tableBackdrop}
+        backgroundLabel={`${sceneResetCameraKey} camera`}
+        backgroundHint={
+          tableAlignment?.calibrated
+            ? ""
+            : `no ${sceneResetCameraKey} backdrop until the camera is aligned to the table below;`
+        }
         busy={busy}
-        disabled={!run?.interactive || run.state !== "waiting"}
+        disabled={!sceneResetPanelUsable}
         disabledReason={
           !run?.interactive
             ? "Start Interactive rollouts first; that process owns the FR3 connection."
@@ -682,6 +729,21 @@ export function RolloutPage() {
               : ""
         }
         onReset={onSceneReset}
+      />
+
+      <TableAlignmentPanel
+        cameraKey={sceneResetCameraKey}
+        planeZDefault={tablePlaneZ}
+        centre={tableCentre}
+        disabled={!sceneResetPanelUsable}
+        disabledReason={
+          !run?.interactive
+            ? "Start Interactive rollouts first; that process owns the FR3 connection and the cameras."
+            : run.state !== "waiting"
+              ? "Probing a point is only available between rollouts."
+              : ""
+        }
+        onAlignmentChange={setTableAlignment}
       />
 
       {/* ------------------------------------------------------ checkpoint --- */}

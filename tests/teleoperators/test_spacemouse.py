@@ -80,6 +80,44 @@ def test_get_action_returns_zero_when_no_data(teleop):
     assert action["gripper"] == pytest.approx(teleop.config.initial_gripper)
 
 
+def test_the_last_report_timestamp_only_moves_when_a_report_does(teleop):
+    # `poll` hands back the device's cached state once the hidraw queue is empty, so the axes
+    # cannot say whether the operator is still driving. This is the field that can, and a caller
+    # that has to know -- the DAgger takeover, which gives the arm back when the device goes
+    # quiet -- has nothing else to read.
+    teleop.connect()
+    assert teleop.last_report_timestamp is None
+
+    teleop._driver.readings.append(
+        SpaceMouseReading(translation=[0.0, 0.0, 0.0], rotation=[0.0, 0.0, 0.0], buttons=(False, False), timestamp=12.5)
+    )
+    teleop.get_action()
+    assert teleop.last_report_timestamp == pytest.approx(12.5)
+
+    # Nothing new arrived: the last thing the device said stands, and stays dated when it said it.
+    teleop.get_action()
+    assert teleop.last_report_timestamp == pytest.approx(12.5)
+
+    teleop._driver.readings.append(
+        SpaceMouseReading(translation=[0.0, 0.0, 0.0], rotation=[0.0, 0.0, 0.0], buttons=(False, False), timestamp=12.6)
+    )
+    teleop.get_action()
+    assert teleop.last_report_timestamp == pytest.approx(12.6)
+
+
+def test_an_undated_reading_leaves_the_timestamp_alone(teleop):
+    # A backend that does not date its reports reads as "never said anything", which is what
+    # every caller of this property already has to handle.
+    teleop.connect()
+    teleop._driver.readings.append(
+        SpaceMouseReading(translation=[0.0, 0.0, 0.0], rotation=[0.0, 0.0, 0.0], buttons=(False, False))
+    )
+
+    teleop.get_action()
+
+    assert teleop.last_report_timestamp is None
+
+
 def test_get_action_maps_axes_and_scales(teleop):
     teleop.connect()
     teleop._driver.readings.append(

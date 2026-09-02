@@ -326,6 +326,9 @@ export function LiveRecordPage({
   const [sceneResetTrainingViews, setSceneResetTrainingViews] = useState<TrainingView[]>([]);
   const [sceneResetReferenceSource, setSceneResetReferenceSource] = useState("");
   const [sceneResetReferenceLandmarks, setSceneResetReferenceLandmarks] = useState<RolloutLandmarks>({});
+  // Cache-buster for the scene-reset backdrop. Slow on purpose: it is a still of a parked cell,
+  // and each fetch costs the gateway one perspective warp.
+  const [backdropNonce, setBackdropNonce] = useState(0);
   const [selectedBackend, setSelectedBackend] = useState<RecordingBackend>(
     snapshot.recording.backend ?? "real"
   );
@@ -372,6 +375,12 @@ export function LiveRecordPage({
   // exactly (recordingControlAvailability), is suppressed while busy, ignores
   // modifier combos (so Ctrl/Cmd+S etc. stay with the browser), and never fires
   // while the operator is typing in an input/textarea/select.
+  useEffect(() => {
+    if (!workstationProfile) return undefined;
+    const timer = window.setInterval(() => setBackdropNonce((value) => value + 1), 5000);
+    return () => window.clearInterval(timer);
+  }, [workstationProfile]);
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.repeat || event.isComposing) return;
@@ -643,8 +652,15 @@ export function LiveRecordPage({
         <SceneResetPanel
           title="Record scene reset"
           landmarks={sceneResetPanelLandmarks}
-          backgroundImageUrl={recorderConnected ? api.cameraSnapshotUrl("side") : undefined}
+          // The same table calibration the Rollout page's maps use -- it is a property of where
+          // the camera is bolted, not of which page is asking. No backdrop appears until that
+          // camera has been aligned there, and none appears while the recorder holds the device
+          // without publishing frames.
+          tableViewUrl={(window, width, height) =>
+            api.tableViewUrl("side", window, width, height, backdropNonce)
+          }
           backgroundLabel="side camera"
+          backgroundHint="no side backdrop: align the camera to the table on the Rollout page;"
           referenceSourceControl={sceneResetReferenceControl}
           busy={busy}
           disabled={!(["armed", "review"].includes(snapshot.recording.state))}

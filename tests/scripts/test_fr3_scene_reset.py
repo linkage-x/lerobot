@@ -4,7 +4,10 @@ import pytest
 
 from tools.fr3.scene_reset import (
     SceneResetError,
+    build_pose_probe_waypoints,
+    execute_pose_probe,
     execute_scene_reset,
+    sanitize_pose_probe_request,
     sanitize_scene_reset_request,
     validate_scene_reset_trajectory,
 )
@@ -120,6 +123,60 @@ def test_scene_reset_trajectory_qc_rejects_workspace_escape():
     with pytest.raises(SceneResetError, match="outside the robot workspace"):
         validate_scene_reset_trajectory(
             request,
+            workspace_min=(0.18, -0.45, 0.0),
+            workspace_max=(0.70, 0.45, 0.10),
+        )
+
+
+def test_a_pose_probe_descends_from_above_and_backs_off_the_same_way():
+    request = sanitize_pose_probe_request({"xyz": [0.45, 0.05, 0.035]})
+
+    names = [waypoint.name for waypoint in build_pose_probe_waypoints(request)]
+    heights = [waypoint.xyz[2] for waypoint in build_pose_probe_waypoints(request)]
+
+    assert names == ["approach_above_probe", "descend_8cm_to_probe", "retreat_8cm_from_probe"]
+    assert heights == [0.115, 0.035, 0.115]
+    # The tool never travels sideways at table height, which is the whole reason the approach
+    # and the retreat are waypoints rather than something the caller does around this.
+    assert all(
+        waypoint.xyz[:2] == (0.45, 0.05) for waypoint in build_pose_probe_waypoints(request)
+    )
+
+
+def test_the_probe_still_is_taken_while_the_arm_is_standing_at_the_point():
+    """The snapshot has to happen between the descent and the retreat.
+
+    Taken any later it shows an empty table -- the waiting loop homes the arm the moment the
+    probe returns -- and the click on it would be recorded against a coordinate the tool was
+    nowhere near.
+    """
+
+    request = sanitize_pose_probe_request({"xyz": [0.45, 0.0, 0.035], "dwellS": 0.0})
+    robot = FakeRobot()
+    seen: list[tuple[float, float, float]] = []
+
+    result = execute_pose_probe(robot, request, on_arrival=lambda: seen.append(robot.xyz))
+
+    assert result["ok"] is True
+    assert seen == [(0.45, 0.0, 0.035)]
+    assert robot.xyz == (0.45, 0.0, 0.115)
+
+
+def test_a_probe_outside_the_workspace_is_refused_before_the_arm_moves():
+    with pytest.raises(SceneResetError, match="outside the robot workspace"):
+        sanitize_pose_probe_request(
+            {"xyz": [0.90, 0.0, 0.035]},
+            workspace_min=(0.18, -0.45, 0.0),
+            workspace_max=(0.70, 0.45, 0.70),
+        )
+
+
+def test_a_probe_whose_approach_leaves_the_workspace_is_refused_too():
+    # The point itself is legal and the 8 cm above it is not, which is exactly the case a check
+    # on the commanded coordinate alone would wave through.
+    with pytest.raises(SceneResetError, match="outside the robot workspace"):
+        sanitize_pose_probe_request(
+            {"xyz": [0.45, 0.0, 0.035]},
             workspace_min=(0.18, -0.45, 0.0),
             workspace_max=(0.70, 0.45, 0.10),
         )

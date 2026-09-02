@@ -46,9 +46,17 @@ class InteractiveRolloutKeyboard:
         self.stop_requested = threading.Event()
         self.home_requested = threading.Event()
         self.scene_reset_requested = threading.Event()
+        # A calibration probe: one commanded point, taken so a still can be tied to the base
+        # frame. Separate from scene reset because they are different motions with different
+        # QC, and because an operator watching the arm should be told which one it is doing.
+        self.probe_pose_requested = threading.Event()
         self.quit_requested = threading.Event()
-        self._scene_reset_payload: dict[str, Any] | None = None
-        self._scene_reset_lock = threading.Lock()
+        self._json_requests = {
+            'scene_reset': self.scene_reset_requested,
+            'probe_pose': self.probe_pose_requested,
+        }
+        self._json_payloads: dict[str, dict[str, Any]] = {}
+        self._json_lock = threading.Lock()
         # The manual override, not the ordinary way in: takeover normally engages itself when
         # the SpaceMouse moves (see tools/fr3/dagger_takeover.py). This latch is for an operator
         # who wants the arm held still without touching the device.
@@ -108,6 +116,7 @@ class InteractiveRolloutKeyboard:
         'quit': 'quit',
         'takeover': 'takeover',
         'scene_reset': 'scene_reset',
+        'probe_pose': 'probe_pose',
     }
 
     def _listen_pipe_loop(self) -> None:
@@ -143,26 +152,37 @@ class InteractiveRolloutKeyboard:
                     print('[WARN] interactive_pipe_takeover_ignored reason=takeover_disabled')
                 else:
                     self._on_press(self.takeover_key)
-            elif resolved == 'scene_reset':
-                payload_text = raw_command.split(maxsplit=1)[1] if len(raw_command.split(maxsplit=1)) == 2 else "{}"
-                try:
-                    payload = json.loads(payload_text)
-                except json.JSONDecodeError as exc:
-                    print(f'[WARN] interactive_pipe_scene_reset_ignored reason=bad_json details={exc}')
-                    continue
-                if not isinstance(payload, dict):
-                    print('[WARN] interactive_pipe_scene_reset_ignored reason=payload_not_object')
-                    continue
-                with self._scene_reset_lock:
-                    self._scene_reset_payload = payload
-                print('[INFO] interactive_key=scene_reset')
-                self.scene_reset_requested.set()
+            elif resolved in self._json_requests:
+                self._queue_json_command(resolved, raw_command)
             elif len(command) == 1:
                 self._on_press(command)
             else:
                 print(f'[WARN] interactive_pipe_command_ignored={command!r}')
         print('[INFO] interactive_pipe=closed_by_peer')
         self._on_press(self.quit_key)
+
+    def _queue_json_command(self, name: str, raw_command: str) -> None:
+        """Accept one command that carries coordinates rather than being a bare word.
+
+        The payload replaces any earlier one instead of queueing behind it: these are requests
+        to move the arm, and the operator's most recent instruction is the only one they still
+        mean.
+        """
+
+        parts = raw_command.split(maxsplit=1)
+        payload_text = parts[1] if len(parts) == 2 else '{}'
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            print(f'[WARN] interactive_pipe_{name}_ignored reason=bad_json details={exc}')
+            return
+        if not isinstance(payload, dict):
+            print(f'[WARN] interactive_pipe_{name}_ignored reason=payload_not_object')
+            return
+        with self._json_lock:
+            self._json_payloads[name] = payload
+        print(f'[INFO] interactive_key={name}')
+        self._json_requests[name].set()
 
     @staticmethod
     def _stdin_is_pipe() -> bool:
@@ -265,6 +285,7 @@ class InteractiveRolloutKeyboard:
         self.stop_requested.clear()
         self.home_requested.clear()
         self.scene_reset_requested.clear()
+        self.probe_pose_requested.clear()
         # Every rollout begins under the policy. A latch left set from the last one would hand
         # the arm to a SpaceMouse nobody is holding, at the moment a fresh rollout starts
         # moving. (Automatic takeover cannot be left behind this way: it is a property of what
@@ -289,16 +310,21 @@ class InteractiveRolloutKeyboard:
             if self.home_requested.is_set():
                 self.home_requested.clear()
                 return 'home'
-            if self.scene_reset_requested.is_set():
-                self.scene_reset_requested.clear()
-                return 'scene_reset'
+            for name, event in self._json_requests.items():
+                if event.is_set():
+                    event.clear()
+                    return name
         return 'quit'
 
+    def _pop_json_payload(self, name: str) -> dict[str, Any] | None:
+        with self._json_lock:
+            return self._json_payloads.pop(name, None)
+
     def pop_scene_reset_payload(self) -> dict[str, Any] | None:
-        with self._scene_reset_lock:
-            payload = self._scene_reset_payload
-            self._scene_reset_payload = None
-        return payload
+        return self._pop_json_payload('scene_reset')
+
+    def pop_probe_pose_payload(self) -> dict[str, Any] | None:
+        return self._pop_json_payload('probe_pose')
 
     def takeover_is_engaged(self) -> bool:
         return self.takeover_key is not None and self.takeover_engaged.is_set()

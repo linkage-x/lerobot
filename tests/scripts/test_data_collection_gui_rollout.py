@@ -23,6 +23,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from tools.data_collection_gui import checkpoints as checkpoint_backend  # noqa: E402
 from tools.data_collection_gui import rollout as rollout_backend  # noqa: E402
+from tools.data_collection_gui import table_plane  # noqa: E402
 from tools.data_collection_gui import task_ladders  # noqa: E402
 from tools.data_collection_gui import training as training_backend  # noqa: E402
 
@@ -1262,6 +1263,118 @@ def test_a_stale_preview_frame_is_not_served_as_live(tmp_path: Path, monkeypatch
     assert gateway._rollout_preview_frame("ee") is None
 
 
+class _RecordingHandler:
+    """Just enough of BaseHTTPRequestHandler for the JPEG writers."""
+
+    def __init__(self) -> None:
+        self.status = None
+        self.headers: list[tuple[str, str]] = []
+        self.body = bytearray()
+
+    def send_response(self, status) -> None:
+        self.status = status
+
+    def send_header(self, key, value) -> None:
+        self.headers.append((key, value))
+
+    def end_headers(self) -> None:
+        pass
+
+    @property
+    def wfile(self):
+        handler = self
+
+        class _Sink:
+            def write(self, payload):
+                handler.body.extend(payload)
+
+        return _Sink()
+
+
+class _RunningProcess:
+    pid = 4321
+
+    def poll(self):
+        return None
+
+
+def test_the_camera_still_serves_the_frame_the_live_view_refuses(tmp_path: Path, monkeypatch):
+    """The reset map's reference layer is older than the live window by construction.
+
+    Between rollouts the runtime publishes one frame and then blocks on the operator, so the
+    file's age says how long they have been thinking, not whether the cameras are alive. The
+    live endpoint must keep refusing it; the reset background must not, or the map is drawn on
+    an empty grid for every rollout after the first.
+    """
+    preview_dir = tmp_path / "preview"
+    preview_dir.mkdir()
+    frame = preview_dir / "side.jpg"
+    frame.write_bytes(b"\xff\xd8side")
+    monkeypatch.setattr(rollout_backend, "PREVIEW_DIR", preview_dir)
+    parked = time.time() - (rollout_backend.PREVIEW_STALE_S + 30)
+    os.utime(frame, (parked, parked))
+
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="waiting", cameraKeys=["side", "ee"])
+    state.rollout_process = _RunningProcess()
+
+    live = _RecordingHandler()
+    gateway._serve_rollout_camera_snapshot(live, state=state, camera_key="side")
+    assert live.status == gateway.HTTPStatus.SERVICE_UNAVAILABLE
+
+    still = _RecordingHandler()
+    gateway._serve_rollout_camera_still(still, state=state, camera_key="side")
+    assert still.status == gateway.HTTPStatus.OK
+    assert bytes(still.body) == b"\xff\xd8side"
+
+
+def test_the_camera_still_never_opens_a_camera_the_rollout_holds(tmp_path: Path, monkeypatch):
+    """A RealSense is exclusive, so a second pipeline is a timeout, not a picture."""
+    preview_dir = tmp_path / "preview"
+    preview_dir.mkdir()
+    monkeypatch.setattr(rollout_backend, "PREVIEW_DIR", preview_dir)
+
+    def fail_if_preview_spawns(*_args, **_kwargs):
+        raise AssertionError("the rollout owns the camera; nothing else may open it")
+
+    monkeypatch.setattr(gateway, "_realsense_device_preview_frame", fail_if_preview_spawns)
+
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="waiting", cameraKeys=["side"])
+    state.rollout_process = _RunningProcess()
+    state.devices = [{"id": "side", "kind": "camera", "config": {"type": "intelrealsense"}}]
+
+    handler = _RecordingHandler()
+    gateway._serve_rollout_camera_still(handler, state=state, camera_key="side")
+
+    # No frame published yet, and the answer is to say so rather than to fight for the device.
+    assert handler.status == gateway.HTTPStatus.SERVICE_UNAVAILABLE
+
+
+def test_the_camera_still_opens_the_camera_when_no_rollout_is_running(tmp_path: Path, monkeypatch):
+    preview_dir = tmp_path / "preview"
+    preview_dir.mkdir()
+    monkeypatch.setattr(rollout_backend, "PREVIEW_DIR", preview_dir)
+    served: list[str] = []
+
+    def record_device_preview(_state, *, device_id, device):  # noqa: ARG001
+        served.append(device_id)
+        return b"\xff\xd8device", gateway.HTTPStatus.OK, ""
+
+    monkeypatch.setattr(gateway, "_realsense_device_preview_frame", record_device_preview)
+
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="idle", cameraKeys=["side"])
+    state.rollout_process = None
+    state.devices = [{"id": "side", "kind": "camera", "config": {"type": "intelrealsense"}}]
+
+    handler = _RecordingHandler()
+    gateway._serve_rollout_camera_still(handler, state=state, camera_key="side")
+
+    assert served == ["side"]
+    assert bytes(handler.body) == b"\xff\xd8device"
+
+
 def test_recording_an_outcome_clears_the_prompt(tmp_path: Path):
     state = _rollout_state(tmp_path)
     state.rollout = rollout_backend.RolloutStatus(
@@ -1651,6 +1764,12 @@ def test_demo_landing_points_reduce_each_episode_to_its_grasp_and_release(tmp_pa
     # rather than assumed.
     assert point["descentM"] == pytest.approx(0.07)
     assert landmarks["hole"] == pytest.approx(landmarks["points"][0]["releaseXyz"][:2])
+    # The pick pose a scene reset needs is the release point *with its height*: the peg was let
+    # go there, so that is the height a gripper has to return to in order to take it back. The
+    # map's `hole` is the same measurement with the z dropped, and derived from it rather than
+    # separately, so the two can never disagree about where the demonstrations put the peg.
+    assert landmarks["placeXyz"] == pytest.approx(landmarks["points"][0]["releaseXyz"])
+    assert landmarks["hole"] == landmarks["placeXyz"][:2]
 
 
 def test_a_demonstration_that_starts_with_the_gripper_shut_grasps_on_the_falling_edge(
@@ -1943,3 +2062,322 @@ def test_one_unreadable_ladder_does_not_take_the_others_down(tmp_path: Path):
     )
 
     assert [ladder.task for ladder in task_ladders.list_ladders(tmp_path)] == ["demo_task"]
+
+
+class _StdinProcess:
+    """A running rollout whose stdin can be read back, so control lines can be asserted."""
+
+    pid = 5150
+
+    def __init__(self) -> None:
+        self.written = bytearray()
+
+        class _Stdin:
+            def __init__(self, sink):
+                self._sink = sink
+
+            def write(self, payload):
+                self._sink.extend(payload)
+
+            def flush(self):
+                pass
+
+        self.stdin = _Stdin(self.written)
+
+    def poll(self):
+        return None
+
+    def lines(self) -> list[str]:
+        return bytes(self.written).decode().splitlines()
+
+
+def _probe_ready(tmp_path: Path, monkeypatch, *, request_id: str, xyz: list[float], camera: str = "side"):
+    """Stand in for the runtime: a still and the sidecar it writes beside it at the point."""
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir(exist_ok=True)
+    (probe_dir / f"{camera}.jpg").write_bytes(b"\xff\xd8probe")
+    (probe_dir / "probe.json").write_text(
+        json.dumps({"requestId": request_id, "xyz": xyz, "cameras": [camera], "at": time.time()})
+    )
+    monkeypatch.setattr(rollout_backend, "PROBE_DIR", probe_dir)
+    monkeypatch.setattr(rollout_backend, "PROBE_SIDECAR_PATH", probe_dir / "probe.json")
+    return probe_dir
+
+
+def test_a_table_probe_sends_the_arm_to_the_point_and_remembers_which_one(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="waiting", interactive=True, cameraKeys=["side"])
+    process = _StdinProcess()
+    state.rollout_process = process
+
+    result = gateway._request_table_probe(state, {"camera": "side", "x": 0.45, "y": 0.05, "z": 0.035})
+
+    assert result["ok"] is True
+    line = process.lines()[0]
+    assert line.startswith("probe_pose ")
+    assert json.loads(line.removeprefix("probe_pose "))["xyz"] == [0.45, 0.05, 0.035]
+    # The pending request id is the other end of the match with the still the runtime writes.
+    assert state.table_probe["requestId"] == json.loads(line.removeprefix("probe_pose "))["requestId"]
+    # The arm is moving, so the page must stop saying the cell is safe to reach into.
+    assert state.rollout.state == "resetting"
+    assert state.rollout.armAtStart is False
+
+
+def test_a_table_probe_is_refused_while_a_rollout_is_running(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="rolling", interactive=True, cameraKeys=["side"])
+    state.rollout_process = _StdinProcess()
+
+    with pytest.raises(ValueError, match="waiting"):
+        gateway._request_table_probe(state, {"camera": "side", "x": 0.45, "y": 0.0, "z": 0.035})
+
+
+def test_a_table_point_is_labelled_with_where_the_arm_got_to_not_where_it_was_sent(
+    tmp_path: Path, monkeypatch
+):
+    """The browser knows what it asked for; only the runtime knows what happened.
+
+    A probe that was refused, that timed out, or that stopped short would otherwise be recorded
+    as if the tool had arrived, and a calibration is exactly the artifact in which that kind of
+    error is invisible afterwards.
+    """
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="waiting", interactive=True, cameraKeys=["side"])
+    state.rollout_process = _StdinProcess()
+    _probe_ready(tmp_path, monkeypatch, request_id="probe-1", xyz=[0.461, 0.052, 0.035])
+    state.table_probe = {"cameraKey": "side", "requestId": "probe-1", "xyz": [0.45, 0.05, 0.035]}
+
+    result = gateway._record_table_point(
+        state, {"camera": "side", "u": 210.0, "v": 305.0, "imageWidth": 640, "imageHeight": 480}
+    )
+
+    assert result["points"] == [{"u": 210.0, "v": 305.0, "x": 0.461, "y": 0.052}]
+    assert result["planeZ"] == pytest.approx(0.035)
+    assert result["calibrated"] is False  # one point of the four a plane needs
+
+
+def test_a_table_point_is_refused_while_the_arm_is_still_on_its_way(tmp_path: Path, monkeypatch):
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="resetting", interactive=True, cameraKeys=["side"])
+    _probe_ready(tmp_path, monkeypatch, request_id="probe-1", xyz=[0.45, 0.05, 0.035])
+    # The still on disk belongs to the previous probe, not the one just asked for.
+    state.table_probe = {"cameraKey": "side", "requestId": "probe-2", "xyz": [0.50, 0.05, 0.035]}
+
+    with pytest.raises(ValueError, match="not finished"):
+        gateway._record_table_point(
+            state, {"camera": "side", "u": 210.0, "v": 305.0, "imageWidth": 640, "imageHeight": 480}
+        )
+
+    handler = _RecordingHandler()
+    gateway._serve_table_probe_frame(handler, state=state, camera_key="side")
+    assert handler.status == gateway.HTTPStatus.SERVICE_UNAVAILABLE
+
+
+def test_clicking_the_same_probed_point_twice_corrects_it_rather_than_duplicating_it(
+    tmp_path: Path, monkeypatch
+):
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="waiting", interactive=True, cameraKeys=["side"])
+    _probe_ready(tmp_path, monkeypatch, request_id="probe-1", xyz=[0.45, 0.05, 0.035])
+    state.table_probe = {"cameraKey": "side", "requestId": "probe-1", "xyz": [0.45, 0.05, 0.035]}
+    click = {"camera": "side", "imageWidth": 640, "imageHeight": 480}
+
+    gateway._record_table_point(state, {**click, "u": 200.0, "v": 300.0})
+    result = gateway._record_table_point(state, {**click, "u": 214.0, "v": 297.0})
+
+    # Two points at one coordinate add no constraint and drag the fit toward the worse click.
+    assert result["points"] == [{"u": 214.0, "v": 297.0, "x": 0.45, "y": 0.05}]
+
+
+def _calibrate_side_camera(state, tmp_path: Path) -> None:
+    """A stored calibration for the 'side' camera, as four probes would have left one."""
+    calibration = table_plane.TablePlaneCalibration(
+        cameraKey="side", planeZ=0.035, imageWidth=640, imageHeight=480
+    )
+    for (u, v), (x, y) in zip(
+        [(180.0, 300.0), (460.0, 300.0), (420.0, 190.0), (220.0, 190.0)],
+        [(0.37, 0.08), (0.37, -0.08), (0.53, -0.08), (0.53, 0.08)],
+        strict=True,
+    ):
+        calibration.add_point(table_plane.TablePlanePoint(u=u, v=v, x=x, y=y), plane_z=0.035)
+    table_plane.save_calibration(gateway._table_plane_path(state, "side"), calibration)
+
+
+def test_the_table_view_refuses_to_draw_anything_before_the_camera_is_aligned(
+    tmp_path: Path, monkeypatch
+):
+    """No backdrop is the correct drawing of "we do not know where this picture is".
+
+    The bug this whole path replaces was a still stretched to fill the plot box: it looked like
+    a reference and lined up with nothing, so a target region painted against it was aimed at
+    the wrong part of the table.
+    """
+    preview_dir = tmp_path / "preview"
+    preview_dir.mkdir()
+    (preview_dir / "side.jpg").write_bytes(b"\xff\xd8side")
+    monkeypatch.setattr(rollout_backend, "PREVIEW_DIR", preview_dir)
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="waiting", cameraKeys=["side"])
+    state.rollout_process = _RunningProcess()
+
+    handler = _RecordingHandler()
+    gateway._serve_table_view(
+        handler,
+        state=state,
+        query={
+            "camera": ["side"],
+            "minX": ["0.30"],
+            "maxX": ["0.60"],
+            "minY": ["-0.15"],
+            "maxY": ["0.15"],
+            "width": ["300"],
+            "height": ["300"],
+        },
+    )
+
+    assert handler.status == gateway.HTTPStatus.CONFLICT
+
+
+def test_the_table_view_serves_the_window_the_caller_asked_for(tmp_path: Path, monkeypatch):
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    preview_dir = tmp_path / "preview"
+    preview_dir.mkdir()
+    ok, buffer = cv2.imencode(".jpg", np.full((480, 640, 3), 200, dtype=np.uint8))
+    assert ok
+    (preview_dir / "side.jpg").write_bytes(buffer.tobytes())
+    monkeypatch.setattr(rollout_backend, "PREVIEW_DIR", preview_dir)
+
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="waiting", cameraKeys=["side"])
+    state.rollout_process = _RunningProcess()
+    _calibrate_side_camera(state, tmp_path)
+
+    handler = _RecordingHandler()
+    gateway._serve_table_view(
+        handler,
+        state=state,
+        query={
+            "camera": ["side"],
+            "minX": ["0.30"],
+            "maxX": ["0.60"],
+            "minY": ["-0.15"],
+            "maxY": ["0.15"],
+            "width": ["300"],
+            "height": ["220"],
+        },
+    )
+
+    assert handler.status == gateway.HTTPStatus.OK
+    assert ("Content-Type", "image/jpeg") in handler.headers
+    served = cv2.imdecode(np.frombuffer(bytes(handler.body), dtype=np.uint8), cv2.IMREAD_COLOR)
+    # Exactly the pixels asked for: the plot places this image over its own axes and any other
+    # size would be stretched back into place, which is the failure the window exists to avoid.
+    assert served.shape[:2] == (220, 300)
+
+
+def test_clearing_an_alignment_leaves_the_maps_with_no_backdrop(tmp_path: Path):
+    state = _rollout_state(tmp_path)
+    _calibrate_side_camera(state, tmp_path)
+    assert gateway._load_table_plane(state, "side").calibrated
+
+    result = gateway._clear_table_points(state, {"camera": "side"})
+
+    assert result["calibrated"] is False
+    assert result["points"] == []
+    assert gateway._load_table_plane(state, "side").calibrated is False
+
+
+class _FakeArm:
+    """Enough of the FR3 for the probe's step loop: it goes where it is told, immediately."""
+
+    def __init__(self) -> None:
+        self.xyz = (0.30, 0.0, 0.20)
+        self.gripper = 1.0
+
+    def get_observation(self, *, include_cameras=False):  # noqa: ARG002
+        return {
+            "ee.x": self.xyz[0],
+            "ee.y": self.xyz[1],
+            "ee.z": self.xyz[2],
+            "ee.wx": 0.0,
+            "ee.wy": 0.0,
+            "ee.wz": 0.0,
+            "gripper.pos": self.gripper,
+        }
+
+    def send_action(self, action):
+        self.xyz = (action["ee.x"], action["ee.y"], action["ee.z"])
+        self.gripper = action["gripper.pos"]
+        return dict(action)
+
+
+def test_the_probe_line_the_gateway_writes_is_the_one_the_runtime_acts_on(tmp_path: Path, monkeypatch):
+    """The gateway, the control channel and the arm, joined at the seams they meet on.
+
+    Three processes have to agree on this one line: the gateway composes it, the runtime's pipe
+    channel resolves the word and the payload, and the probe executes it. Each half is easy to
+    change without the others noticing, and the failure is silent -- a calibration built from
+    points the arm never visited looks exactly like one built from points it did.
+    """
+    import io as _io
+    import sys as _sys
+
+    from tools.fr3.interactive_control import InteractiveRolloutKeyboard
+    from tools.fr3.scene_reset import execute_pose_probe, pose_probe_request_from_payload
+
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="waiting", interactive=True, cameraKeys=["side"])
+    process = _StdinProcess()
+    state.rollout_process = process
+    gateway._request_table_probe(state, {"camera": "side", "x": 0.45, "y": 0.05, "z": 0.035})
+    line = process.lines()[0]
+
+    keyboard = InteractiveRolloutKeyboard(start_key="s", stop_key="x", home_key="h", quit_key="q")
+    monkeypatch.setattr(_sys, "stdin", _io.StringIO(line + "\n"))
+    keyboard._listen_pipe_loop()
+    assert keyboard.probe_pose_requested.is_set()
+
+    request = pose_probe_request_from_payload(keyboard.pop_probe_pose_payload())
+    arm = _FakeArm()
+    reached: list[tuple[float, float, float]] = []
+    result = execute_pose_probe(arm, request, on_arrival=lambda: reached.append(arm.xyz))
+    assert result["ok"] is True
+
+    # What the runtime would write beside the still, from where the arm actually ended up.
+    _probe_ready(tmp_path, monkeypatch, request_id=request.requestId, xyz=list(reached[0]))
+    recorded = gateway._record_table_point(
+        state, {"camera": "side", "u": 300.0, "v": 240.0, "imageWidth": 640, "imageHeight": 480}
+    )
+
+    assert recorded["points"] == [{"u": 300.0, "v": 240.0, "x": 0.45, "y": 0.05}]
+    assert recorded["planeZ"] == pytest.approx(0.035)
+
+
+def test_each_launch_gets_its_own_trace_directory(tmp_path: Path):
+    """The runtime numbers traces from 1 on every start and overwrites what is there.
+
+    A browser operator has nowhere to type a directory, so the gateway derives one per launch.
+    Sharing one would mean each session silently destroying the last -- which is what happened on
+    2026-09-01, taking four traces of the graded 08-31 batch with them.
+    """
+    trace_dir = tmp_path / "outputs" / "rollout_traces" / "session_20260901_163400"
+    command, _ = _command(tmp_path, trace_dir=trace_dir)
+
+    assert "--rollout-trace-dir" in command
+    assert command[command.index("--rollout-trace-dir") + 1] == str(trace_dir)
+    assert command.index("--rollout-trace-dir") > command.index("real")
+
+
+def test_two_launches_a_second_apart_do_not_share_a_trace_directory(tmp_path: Path):
+    assert rollout_backend.trace_session_dir(tmp_path, "20260901_163400") != (
+        rollout_backend.trace_session_dir(tmp_path, "20260901_163401")
+    )
+
+
+def test_a_settings_dump_gets_no_trace_directory(tmp_path: Path):
+    # `env` prints and exits without a runtime, so a directory would only be named and never used.
+    command, _ = _command(tmp_path, mode="env", trace_dir=tmp_path / "traces")
+
+    assert "--rollout-trace-dir" not in command

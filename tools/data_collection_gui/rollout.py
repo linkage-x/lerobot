@@ -33,9 +33,24 @@ LAUNCHER = Path("tools/fr3/run_pick_place_infer_workstation.sh")
 # once it ends, so they should never touch a disk or survive a reboot.
 PREVIEW_DIR = Path("/dev/shm/lerobot_rollout_preview")
 PREVIEW_FPS = 5.0
+# One directory per launch, because the runtime numbers its traces from 1 every time it starts
+# and writes `rollout_001.csv` with no regard for what is already there. Left to the runtime's
+# default (a single flat `outputs/rollout_traces`) every browser session silently overwrites the
+# last one -- which it did on 2026-09-01, taking four traces of the graded 08-31 batch with it.
+TRACE_ROOT = Path("outputs/rollout_traces")
+
+
+def trace_session_dir(repo_root: Path, stamp: str) -> Path:
+    """Where this launch's per-rollout CSVs go. `stamp` is the launch's, shared with its log."""
+    return repo_root / TRACE_ROOT / f"session_{stamp}"
 # A frame older than this is not a live view. Rollouts run at the dataset's rate, well above the
 # preview rate, so the only way to exceed this is a run that has stopped producing frames.
 PREVIEW_STALE_S = 3.0
+# Stills taken while the arm stands at a commanded calibration point, plus the sidecar naming
+# the request each one belongs to. A subdirectory of the preview dir so one runtime argument
+# still places everything this process publishes, and so both die with the same reboot.
+PROBE_DIR = PREVIEW_DIR / "probe"
+PROBE_SIDECAR_PATH = PROBE_DIR / "probe.json"
 
 # Runtime knobs the browser owns. They are cleared from any inherited environment before the
 # page applies its explicit choices, because stale shell values are otherwise indistinguishable
@@ -294,6 +309,10 @@ class RolloutStatus:
     startedAt: str = ""
     finishedAt: str = ""
     logPath: str = ""
+    # This launch's trace directory. Shown for the same reason the log path is: the operator is
+    # the one who has to find these afterwards, and a batch whose location is not on screen is a
+    # batch that gets analysed as whatever happened to be in the default directory.
+    tracePath: str = ""
     previewDir: str = ""
     lastLines: list[str] = field(default_factory=list)
     # Set once the operator has been asked to record how the last rollout went, so the page can
@@ -319,6 +338,7 @@ def build_rollout_command(
     runtime_options: dict[str, str] | None = None,
     preview_dir: Path = PREVIEW_DIR,
     preview_fps: float = PREVIEW_FPS,
+    trace_dir: Path | None = None,
     base_env: dict[str, str] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """The launcher invocation for one rollout, plus the environment that configures it.
@@ -385,6 +405,11 @@ def build_rollout_command(
             "--live-frame-interval",
             "1",
         ]
+        if trace_dir is not None:
+            # Passed rather than left to the runtime's default: see TRACE_ROOT. A terminal
+            # operator picks this per batch; the browser has no place to type it, so the
+            # gateway derives one per launch.
+            command += ["--rollout-trace-dir", str(trace_dir)]
     return command, env
 
 

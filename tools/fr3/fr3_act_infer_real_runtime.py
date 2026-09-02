@@ -80,7 +80,14 @@ from tools.fr3.command_guard import (
 )
 from tools.fr3.command_guard import PREV_CMD_POSITION_KEYS as _GUARD_PREV_CMD_POSITION_KEYS
 from tools.fr3.command_guard import PREV_CMD_ROTVEC_KEYS as _GUARD_PREV_CMD_ROTVEC_KEYS
-from tools.fr3.dagger_takeover import ExpertTakeover, expert_spans, motion_gain_for
+from tools.fr3.dagger_takeover import (
+    ExpertTakeover,
+    backend_dates_reports,
+    expert_spans,
+    motion_gain_for,
+    undated_backend_error,
+)
+from tools.fr3.workspace_fence import resolve_workspace_fence
 from tools.fr3.dagger_dataset import (
     DEFAULT_MAX_BUFFERED_FRAMES,
     DaggerEpisodeWriter,
@@ -92,8 +99,11 @@ from tools.fr3.dagger_dataset import (
 )
 from tools.fr3.interactive_control import InteractiveRolloutKeyboard
 from tools.fr3.scene_reset import (
+    PoseProbeRequest,
     SceneResetError,
+    execute_pose_probe,
     execute_scene_reset,
+    pose_probe_request_from_payload,
     scene_reset_request_from_payload,
 )
 from tools.fr3.live_frames import LiveFrameEmitter
@@ -604,6 +614,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=_DEFAULT_MAX_LEASH_ROT_DELTA_DEG,
         help='Rotational counterpart of --max-leash-pos-delta-mm.',
+    )
+    parser.add_argument(
+        '--record-config',
+        type=str,
+        default=None,
+        help=(
+            "The rig's record config, read for its robot.workspace_min/max fence. The driver clips "
+            'every commanded pose to that box and reports the clipped pose back, so a rollout with '
+            'a box of its own can stop short of where the demonstrations went without anything '
+            'saying so. Name the config the rig records with; omit it only on a rig that has none.'
+        ),
+    )
+    parser.add_argument(
+        '--workspace-min',
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=('X', 'Y', 'Z'),
+        help=(
+            'Override the workspace fence lower corner, in the robot base frame. Requires '
+            '--workspace-max, and replaces --record-config entirely rather than per axis.'
+        ),
+    )
+    parser.add_argument(
+        '--workspace-max',
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=('X', 'Y', 'Z'),
+        help='Upper corner of --workspace-min.',
     )
     parser.add_argument(
         '--tactile-fallback',
@@ -2118,6 +2158,19 @@ def show_policy_camera_preview_window(
     return True
 
 
+def _write_bytes_atomic(path: Path, payload: bytes) -> None:
+    """Publish a file by rename.
+
+    A reader polling these must never see a half-written JPEG, and it polls far more often
+    than anything here writes.
+    """
+
+    tmp_path = path.with_name(f'.{path.name}.tmp')
+    with open(tmp_path, 'wb') as handle:
+        handle.write(payload)
+    os.replace(tmp_path, path)
+
+
 class PolicyCameraPreviewSink:
     """Publish the frames the policy is seeing as JPEG files a viewer can poll.
 
@@ -2138,6 +2191,7 @@ class PolicyCameraPreviewSink:
         self.camera_keys = list(camera_keys)
         self._min_interval_s = 1.0 / fps if fps > 0 else 0.0
         self._pending: dict[str, np.ndarray] | None = None
+        self._pending_immediate = False
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._closed = threading.Event()
@@ -2158,9 +2212,26 @@ class PolicyCameraPreviewSink:
             f"cameras={','.join(self.camera_keys)}"
         )
 
-    def publish(self, policy_observation: dict[str, np.ndarray]) -> None:
+    def publish(self, policy_observation: dict[str, np.ndarray], *, immediate: bool = False) -> None:
+        """Queue one frame per camera for encoding.
+
+        `immediate` exempts this frame from the publish rate limit. A rollout publishes many
+        frames a second and only the newest matters, but the still published when the arm
+        parks is the only one that will be written until the next rollout starts -- dropping
+        it for arriving too soon after the last rollout frame would leave the viewer with a
+        file whose age no longer says anything about the scene it shows.
+        """
         if self._failed or self._closed.is_set():
             return
+        frames = self._frames_from(policy_observation)
+        if not frames:
+            return
+        with self._lock:
+            self._pending = frames
+            self._pending_immediate = self._pending_immediate or immediate
+        self._wake.set()
+
+    def _frames_from(self, policy_observation: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         frames: dict[str, np.ndarray] = {}
         for camera_key in self.camera_keys:
             image = policy_observation.get(f'{_OBS_IMAGES_PREFIX}{camera_key}')
@@ -2172,11 +2243,36 @@ class PolicyCameraPreviewSink:
             # Copied, not referenced: the caller reuses its observation buffers, and the
             # encoder thread would otherwise race with the next capture.
             frames[camera_key] = np.array(image, dtype=np.uint8, copy=True)
+        return frames
+
+    def write_still(self, policy_observation: dict[str, np.ndarray], output_dir: Path) -> list[str]:
+        """Encode and write one frame per camera on the calling thread.
+
+        The calibration probe uses this instead of `publish`. It is standing at a commanded
+        coordinate and about to say so in the log, and a reader that acts on that line has to
+        find the frame taken there -- not the one the encoder thread had not got to yet, which
+        shows the arm somewhere else and would be measured as if it did not.
+        """
+
+        import cv2
+
+        frames = self._frames_from(policy_observation)
         if not frames:
-            return
-        with self._lock:
-            self._pending = frames
-        self._wake.set()
+            return []
+        directory = Path(output_dir)
+        written: list[str] = []
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            for camera_key, image_rgb in frames.items():
+                ok, buffer = cv2.imencode('.jpg', image_rgb[..., ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+                if not ok:
+                    continue
+                _write_bytes_atomic(directory / f'{camera_key}.jpg', buffer.tobytes())
+                written.append(camera_key)
+        except Exception as exc:  # noqa: BLE001 - a still must never end a session
+            print(f'[WARN] policy_camera_still_write_failed dir={directory}: {exc}')
+            return written
+        return written
 
     def _encode_loop(self) -> None:
         import cv2
@@ -2188,11 +2284,13 @@ class PolicyCameraPreviewSink:
             self._wake.clear()
             with self._lock:
                 frames = self._pending
+                immediate = self._pending_immediate
                 self._pending = None
+                self._pending_immediate = False
             if not frames:
                 continue
             now_s = time.monotonic()
-            if self._min_interval_s and now_s - last_write_s < self._min_interval_s:
+            if not immediate and self._min_interval_s and now_s - last_write_s < self._min_interval_s:
                 continue
             last_write_s = now_s
             for camera_key, image_rgb in frames.items():
@@ -2200,20 +2298,11 @@ class PolicyCameraPreviewSink:
                     ok, buffer = cv2.imencode('.jpg', image_rgb[..., ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                     if not ok:
                         continue
-                    self._write_atomic(self.output_dir / f'{camera_key}.jpg', buffer.tobytes())
+                    _write_bytes_atomic(self.output_dir / f'{camera_key}.jpg', buffer.tobytes())
                 except Exception as exc:  # noqa: BLE001 - a preview must never end a rollout
                     print(f'[WARN] policy_camera_preview_write_failed camera={camera_key}: {exc}')
                     self._failed = True
                     return
-
-    @staticmethod
-    def _write_atomic(path: Path, payload: bytes) -> None:
-        # A reader polling this file must never see a half-written JPEG, and it polls far more
-        # often than this writes.
-        tmp_path = path.with_name(f'.{path.name}.tmp')
-        with open(tmp_path, 'wb') as handle:
-            handle.write(payload)
-        os.replace(tmp_path, path)
 
     def close(self) -> None:
         self._closed.set()
@@ -3695,10 +3784,26 @@ def build_expert_takeover(args: argparse.Namespace, *, step_period_s: float) -> 
         overrides['rotation_scale'] = float(args.dagger_rotation_scale)
     teleop = SpaceMouseTeleop(SpaceMouseTeleopConfig(**overrides))
     teleop.connect()
+    # The backstop. The pre-flight above already refused this run before the arm existed; this one
+    # asks the object actually being handed to the takeover, so no future call path can reach the
+    # rig by skipping the early gate. The device is released before the exit so a second attempt
+    # finds it free.
+    if not backend_dates_reports(teleop):
+        driver_module = getattr(type(teleop), '__module__', None)
+        driver_file = getattr(sys.modules.get(driver_module), '__file__', None)
+        try:
+            teleop.disconnect()
+        except Exception:  # noqa: BLE001 - already failing; the exit message is what matters
+            pass
+        raise SystemExit('--dagger-takeover refused: ' + undated_backend_error(driver_module=driver_file))
     release_after_s = float(args.dagger_takeover_release_after_s)
     # `frequency` is the rate the scales are calibrated against, not the device's report rate --
     # see `motion_gain_for`. This loop runs slower, so one reading has to cover proportionally
-    # more ground to move the arm at the speed the recorder moved it.
+    # more ground to move the arm at the speed the recorder moved it. `step_period_s` is handed
+    # over as well as folded into the gain, because it is the rate this loop is *supposed* to hold
+    # and the rate it holds are two different numbers on a rig doing real inference: the takeover
+    # measures its own steps and corrects the gain by what it finds, so the operator gets the
+    # recorded speed rather than the nominal one.
     motion_gain = motion_gain_for(tick_hz=float(teleop.config.frequency), step_period_s=step_period_s)
     print(
         '[INFO] dagger_takeover=ready '
@@ -3707,9 +3812,19 @@ def build_expert_takeover(args: argparse.Namespace, *, step_period_s: float) -> 
         f"rotation_scale={teleop.config.rotation_scale:.6f} "
         f'release_after_s={release_after_s:.2f} '
         f'motion_gain={motion_gain:.2f} '
-        f'full_deflection_mm_per_step={teleop.config.translation_scale * motion_gain * 1000.0:.1f}'
+        f'nominal_step_ms={step_period_s * 1000.0:.1f} '
+        f'full_deflection_mm_per_step={teleop.config.translation_scale * motion_gain * 1000.0:.1f} '
+        # Always yes by the time this prints -- the refusal above is the only other outcome. It is
+        # printed anyway because the operator's pre-flight is this banner, and "the field is there
+        # and says yes" is a check they can make; an absent field is not.
+        'report_timestamps=yes'
     )
-    return ExpertTakeover(teleop, release_after_s=release_after_s, motion_gain=motion_gain)
+    return ExpertTakeover(
+        teleop,
+        release_after_s=release_after_s,
+        motion_gain=motion_gain,
+        step_period_s=step_period_s,
+    )
 
 
 def build_dagger_writer(
@@ -4175,6 +4290,38 @@ def run_inference(args: argparse.Namespace) -> int:
         else None
     )
 
+    # Refused here, before the arm is constructed and the policy is loaded, because this is a
+    # pre-flight and a pre-flight that fires after the operator has homed the arm and waited out a
+    # checkpoint load is one they will learn to run past. The property lives on the driver class,
+    # so no device has to be plugged in to answer it.
+    if args.dagger_takeover:
+        from lerobot.teleoperators.spacemouse.teleop_spacemouse import SpaceMouseTeleop
+
+        if not backend_dates_reports(SpaceMouseTeleop):
+            raise SystemExit(
+                '--dagger-takeover refused: '
+                + undated_backend_error(
+                    driver_module=getattr(
+                        sys.modules.get(SpaceMouseTeleop.__module__), '__file__', None
+                    )
+                )
+            )
+
+    # The fence the driver will clip against, resolved before the config is built so the banner can
+    # say where it came from. It stopped being a literal here because a literal cannot be compared
+    # with the recording rig's, and the two had silently drifted 50 mm apart on z -- 22 mm above the
+    # lowest frame in the demonstrations, which put every grasp inside the wall.
+    workspace_min, workspace_max, workspace_fence_source = resolve_workspace_fence(
+        record_config_path=args.record_config,
+        workspace_min=args.workspace_min,
+        workspace_max=args.workspace_max,
+    )
+    print(
+        f'[INFO] workspace_fence min=({workspace_min[0]:.3f}, {workspace_min[1]:.3f}, {workspace_min[2]:.3f}) '
+        f'max=({workspace_max[0]:.3f}, {workspace_max[1]:.3f}, {workspace_max[2]:.3f}) '
+        f'source={workspace_fence_source}'
+    )
+
     tactile_fallback_observation = build_tactile_fallback_observation(args.tactile_fallback)
     tactile_enabled = bool(required_tactile_keys) and tactile_fallback_observation is None
     robot_cfg = FrankaResearch3Config(
@@ -4184,8 +4331,8 @@ def run_inference(args: argparse.Namespace) -> int:
         allow_mock_gripper=False,
         urdf_path=str(robot_urdf_path),
         target_frame_name=target_frame_name,
-        workspace_min=(0.1, -0.6, 0.05),
-        workspace_max=(0.9, 0.6, 0.8),
+        workspace_min=workspace_min,
+        workspace_max=workspace_max,
         stiffness=controller_stiffness,
         damping=controller_damping,
         filter_coeff=args.controller_filter_coeff,
@@ -4377,14 +4524,16 @@ def run_inference(args: argparse.Namespace) -> int:
         )
         preview_sink.start()
 
-    def publish_current_camera_preview_snapshot() -> None:
+    def build_camera_preview_observation() -> dict[str, np.ndarray]:
+        """The frames a viewer should see, prepared exactly as the policy's are."""
+
         if preview_sink is None:
-            return
+            return {}
         try:
             robot_observation = robot.get_observation()
         except Exception as exc:  # noqa: BLE001 - a background frame must not stop rollout control
-            print(f'[WARN] scene_reset_preview_snapshot=skipped reason={exc}')
-            return
+            print(f'[WARN] camera_preview_snapshot=skipped reason={exc}')
+            return {}
         preview_observation: dict[str, np.ndarray] = {}
         for camera_key in required_image_keys:
             if camera_key not in robot_observation:
@@ -4410,9 +4559,51 @@ def run_inference(args: argparse.Namespace) -> int:
                     source_hw=camera_crop_source_hw.get(feature_key) if camera_crop_source_hw else None,
                 )
             preview_observation[feature_key] = image
-        if preview_observation:
-            preview_sink.publish(preview_observation)
+        return preview_observation
+
+    def publish_current_camera_preview_snapshot() -> None:
+        preview_observation = build_camera_preview_observation()
+        if preview_sink is not None and preview_observation:
+            preview_sink.publish(preview_observation, immediate=True)
             print('[INFO] scene_reset_preview_snapshot=published', flush=True)
+
+    def write_pose_probe_still(request: PoseProbeRequest) -> None:
+        """Freeze the view of the arm standing at one probed coordinate.
+
+        Written to its own directory rather than over the live preview because it is evidence,
+        not a view: the operator clicks the tool in it minutes later, by which time the arm has
+        retreated and the waiting loop has homed it. The sidecar names the request that
+        produced it, so a reader can tell this still from the previous probe's.
+        """
+
+        if preview_sink is None or args.preview_jpeg_dir is None:
+            print('[WARN] pose_probe_still=skipped reason=no_preview_sink', flush=True)
+            return
+        preview_observation = build_camera_preview_observation()
+        if not preview_observation:
+            print('[WARN] pose_probe_still=skipped reason=no_frames', flush=True)
+            return
+        directory = Path(args.preview_jpeg_dir) / 'probe'
+        cameras = preview_sink.write_still(preview_observation, directory)
+        if not cameras:
+            print('[WARN] pose_probe_still=skipped reason=no_frames_written', flush=True)
+            return
+        sidecar = {
+            'requestId': request.requestId,
+            'xyz': [float(value) for value in request.xyz],
+            'cameras': cameras,
+            'at': time.time(),
+        }
+        try:
+            _write_bytes_atomic(directory / 'probe.json', json.dumps(sidecar, sort_keys=True).encode())
+        except OSError as exc:
+            print(f'[WARN] pose_probe_still=sidecar_failed details={exc}', flush=True)
+            return
+        print(
+            f"[INFO] pose_probe_still=written request_id={request.requestId} "
+            f"cameras={','.join(cameras)} dir={directory}",
+            flush=True,
+        )
 
     if args.preview and args.align_gripper_to_dataset_start:
         print('[INFO] preview_gripper_alignment=requested; using virtual observation correction without moving hardware.')
@@ -5067,8 +5258,16 @@ def run_inference(args: argparse.Namespace) -> int:
                     log_message += (
                         f" source={command_source} takeover={takeover_debug.get('status', '')}"
                         f" takeover_gripper={int(bool(takeover_debug.get('gripper_owned')))}"
-                        # How many SpaceMouse reports this step absorbed. Reading one per step
-                        # is what made takeover feel like treacle: see tools/fr3/dagger_takeover.
+                        # `reads` is how many SpaceMouse reports this step took off the queue.
+                        # One, steadily, is the loop keeping up; a run of larger numbers is the
+                        # arm following a hand from several steps ago. `takeover=stale` is the
+                        # device saying nothing at all -- see tools/fr3/dagger_takeover.
+                        f" takeover_reads={int(takeover_debug.get('reads', 0))}"
+                        # The gain this step used and the step it was measured over. `takeover_gain`
+                        # steadily above the `motion_gain` printed at startup is the loop missing
+                        # its rate -- the same story `loop_ms` tells, measured from the device end.
+                        f" takeover_gain={float(takeover_debug.get('gain', 0.0)):.2f}"
+                        f" takeover_step_ms={float(takeover_debug.get('step_ms', 0.0)):.1f}"
                         f" step_mm={takeover_debug.get('step_mm', 0.0):.1f}"
                     )
                 log_message += f" loop_ms={elapsed_s * 1000.0:.1f} sleep_ms={sleep_s * 1000.0:.1f}"
@@ -5158,6 +5357,18 @@ def run_inference(args: argparse.Namespace) -> int:
                         continue
                     result = execute_scene_reset(robot, request)
                     arm_at_start = bool(result.get('ok')) and bool(request.returnToStart)
+                    continue
+                if command == 'probe_pose':
+                    payload = interactive_keyboard.pop_probe_pose_payload()
+                    try:
+                        probe_request = pose_probe_request_from_payload(payload or {})
+                    except SceneResetError as exc:
+                        print(f'[WARN] pose_probe=failed details={exc}')
+                        continue
+                    # Set before the motion, not after it: from here the arm is off the start
+                    # pose whatever the probe does next, including failing halfway.
+                    arm_at_start = False
+                    execute_pose_probe(robot, probe_request, on_arrival=lambda: write_pose_probe_still(probe_request))
                     continue
                 rollout_index += 1
                 arm_at_start = False

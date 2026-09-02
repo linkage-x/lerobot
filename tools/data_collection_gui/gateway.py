@@ -35,10 +35,13 @@ from urllib.request import urlopen
 
 from tools.data_collection_gui import checkpoints as checkpoint_backend
 from tools.data_collection_gui import rollout as rollout_backend
+from tools.data_collection_gui import table_plane
 from tools.data_collection_gui import task_ladders
 from tools.data_collection_gui import training as training_backend
 from tools.fr3.scene_reset import (
     SceneResetError,
+    pose_probe_command,
+    sanitize_pose_probe_request,
     scene_reset_command,
     sanitize_scene_reset_request,
 )
@@ -371,6 +374,10 @@ class GatewayState:
         default_factory=lambda: deque(maxlen=ROLLOUT_LIVE_FRAME_CAPACITY)
     )
     rollout_live_frame_seq: int = 0
+    # The calibration probe the browser last asked the arm to visit. The still the runtime
+    # writes at that point is only a measurement if it can be matched to the coordinate it was
+    # taken at, and this is that end of the match.
+    table_probe: dict[str, Any] = field(default_factory=dict)
     teleop_process: subprocess.Popen[str] | None = None
     teleop_started_at_s: float | None = None
     realsense_preview_process: subprocess.Popen[str] | None = None
@@ -5780,6 +5787,9 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
         },
     )
 
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    trace_dir = rollout_backend.trace_session_dir(state.repo_root, stamp)
+
     command, env = rollout_backend.build_rollout_command(
         state.repo_root,
         mode=mode.id,
@@ -5791,12 +5801,12 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
         max_steps=int(payload.get("maxSteps") or 0),
         move_to_start=bool(payload.get("moveToStart", True)),
         runtime_options=runtime_options,
+        trace_dir=trace_dir,
         base_env=_tool_env(state.repo_root),
     )
 
     log_dir = state.repo_root / "outputs" / "logs" / "rollout"
     log_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     log_path = log_dir / f"rollout_{checkpoint_id.replace('/', '_')}_{mode.id}_{stamp}.log"
 
     try:
@@ -5835,6 +5845,7 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
         message=f"Starting {mode.label} on {checkpoint_id}…",
         startedAt=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         logPath=str(log_path),
+        tracePath=str(trace_dir),
         previewDir=str(rollout_backend.PREVIEW_DIR),
     )
     state.log(
@@ -6025,16 +6036,45 @@ def _record_rollout_outcome(state: GatewayState, payload: dict[str, Any]) -> dic
     return {"ok": True, "entry": entry}
 
 
-def _rollout_preview_frame(camera_key: str) -> bytes | None:
+def _rollout_preview_frame(
+    camera_key: str, *, max_age_s: float | None = rollout_backend.PREVIEW_STALE_S
+) -> bytes | None:
+    """The frame the rollout runtime last published for one camera.
+
+    ``max_age_s=None`` drops the freshness gate. That is right for a still reference and wrong
+    for a live view, so the caller states which one it is asking for.
+    """
     path = rollout_backend.PREVIEW_DIR / f"{camera_key}.jpg"
     try:
-        stat_result = path.stat()
-        if time.time() - stat_result.st_mtime > rollout_backend.PREVIEW_STALE_S:
+        if max_age_s is not None and time.time() - path.stat().st_mtime > max_age_s:
             return None
         frame = path.read_bytes()
     except OSError:
         return None
     return frame or None
+
+
+def _write_jpeg_response(handler: BaseHTTPRequestHandler, frame: bytes) -> None:
+    try:
+        handler.send_response(HTTPStatus.OK)
+        handler.send_header("Content-Type", "image/jpeg")
+        handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        handler.send_header("Content-Length", str(len(frame)))
+        handler.end_headers()
+        handler.wfile.write(frame)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
+def _rollout_owns_cameras(state: GatewayState) -> bool:
+    """True while the rollout runtime holds the rig's cameras open.
+
+    RealSense devices are exclusive, and a preview pipeline started against one the runtime
+    already has open does not fail loudly: it spawns, produces no frame, and 503s a timeout
+    later. That is what left the scene-reset map without its side view during a session.
+    """
+    process = state.rollout_process
+    return process is not None and process.poll() is None
 
 
 def _serve_rollout_camera_snapshot(
@@ -6049,15 +6089,333 @@ def _serve_rollout_camera_snapshot(
             handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "no rollout preview frame yet"}
         )
         return
+    _write_jpeg_response(handler, frame)
+
+
+def _camera_still_bytes(state: GatewayState, camera_key: str) -> tuple[bytes | None, HTTPStatus, str]:
+    """The most recent still of the cell, from whichever process can currently produce one.
+
+    Deliberately not `/api/rollout/camera.jpg`'s frame: that one refuses anything older than
+    PREVIEW_STALE_S because a frozen image there would misreport what the policy is being fed.
+    Between rollouts nothing is being fed anything -- the runtime publishes a single snapshot
+    when it parks the arm and starts waiting for a command -- and that still of a cell nobody
+    is moving is exactly the reference an operator paints a target region against.
+    """
+
+    if not camera_key:
+        return None, HTTPStatus.BAD_REQUEST, "missing camera"
+    if _rollout_owns_cameras(state):
+        frame = _rollout_preview_frame(camera_key, max_age_s=None)
+        if frame is None:
+            return (
+                None,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "the rollout has not published a preview frame yet",
+            )
+        return frame, HTTPStatus.OK, ""
+    # Nothing owns the cameras, so the panel can have a live look instead of a still.
+    device = next(
+        (
+            item
+            for item in state.devices
+            if item.get("id") == camera_key and item.get("kind") == "camera"
+        ),
+        None,
+    )
+    config = (
+        device.get("config")
+        if isinstance(device, dict) and isinstance(device.get("config"), dict)
+        else {}
+    )
+    if state.profile == "workstation" and str(config.get("type", "")).lower() == "intelrealsense":
+        return _realsense_device_preview_frame(state, device_id=camera_key, device=device)
+    return None, HTTPStatus.SERVICE_UNAVAILABLE, f"no camera still available for {camera_key}"
+
+
+def _serve_rollout_camera_still(
+    handler: BaseHTTPRequestHandler, *, state: GatewayState, camera_key: str
+) -> None:
+    """The raw still, in camera pixels. What the table-alignment panel is clicked on."""
+
+    frame, status, error = _camera_still_bytes(state, camera_key)
+    if frame is None:
+        _json_response(handler, status, {"error": error})
+        return
+    _write_jpeg_response(handler, frame)
+
+
+# ------------------------------------------------------------------ table plane alignment ---
+# The maps on the Rollout page are drawn in base x/y. A camera still is not: it is a projection
+# of the table, and stretching it to fill a plot box lines nothing up with anything. These
+# routes are the other half -- the calibration that lets a still be re-projected into the same
+# base-frame rectangle the plot draws, so a peg in the image and a landing point over it are
+# the same millimetres.
+_TABLE_PLANE_SUBDIR = Path("outputs") / "metrology" / "table_plane"
+# How close two probed points have to be for the second to mean "I misclicked the first".
+_TABLE_POINT_MERGE_M = 0.005
+
+
+def _table_camera_key(raw: Any) -> str:
+    camera_key = str(raw or "").strip()
+    if not camera_key or not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", camera_key):
+        raise ValueError("camera must be a rollout camera key such as 'side'.")
+    return camera_key
+
+
+def _table_plane_path(state: GatewayState, camera_key: str) -> Path:
+    return state.repo_root / _TABLE_PLANE_SUBDIR / f"{camera_key}.json"
+
+
+def _load_table_plane(state: GatewayState, camera_key: str) -> table_plane.TablePlaneCalibration:
+    return table_plane.load_calibration(_table_plane_path(state, camera_key), camera_key=camera_key)
+
+
+def _table_probe_sidecar() -> dict[str, Any]:
+    """What the runtime says about the still it last wrote at a probed point."""
+
     try:
-        handler.send_response(HTTPStatus.OK)
-        handler.send_header("Content-Type", "image/jpeg")
-        handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-        handler.send_header("Content-Length", str(len(frame)))
-        handler.end_headers()
-        handler.wfile.write(frame)
-    except (BrokenPipeError, ConnectionResetError):
-        pass
+        raw = json.loads(rollout_backend.PROBE_SIDECAR_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _table_probe_frame_state(state: GatewayState, camera_key: str) -> dict[str, Any]:
+    """Whether the frozen still on disk is the one the last probe was supposed to produce.
+
+    The runtime writes the still and its sidecar while the arm is standing at the point, so a
+    sidecar naming the pending request is proof the arm got there. Anything else -- no file, or
+    a file from the previous probe -- means the answer is "not yet", and clicking the stale
+    image would record a coordinate the tool in it was never at.
+    """
+
+    sidecar = _table_probe_sidecar()
+    # Read once: the attribute is replaced wholesale by the next probe, and re-reading it here
+    # could describe half of one probe and half of the next.
+    pending = state.table_probe
+    pending = pending if pending.get("cameraKey") == camera_key else {}
+    matched = bool(pending) and sidecar.get("requestId") == pending.get("requestId")
+    return {
+        "requestId": str(sidecar.get("requestId") or ""),
+        "xyz": [float(value) for value in sidecar.get("xyz") or []][:3],
+        "at": float(sidecar.get("at") or 0.0),
+        "pendingRequestId": str(pending.get("requestId") or ""),
+        "pendingXyz": [float(value) for value in pending.get("xyz") or []][:3],
+        "ready": matched or (not pending and bool(sidecar)),
+        "moving": bool(pending) and not matched,
+    }
+
+
+def _table_alignment_snapshot(state: GatewayState, camera_key: str) -> dict[str, Any]:
+    calibration = _load_table_plane(state, camera_key)
+    payload = calibration.payload()
+    payload["ok"] = True
+    payload["probeFrame"] = _table_probe_frame_state(state, camera_key)
+    return payload
+
+
+def _request_table_probe(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Send the arm to one base coordinate so its own tool can be the calibration target."""
+
+    if state.profile != "workstation":
+        raise ValueError("Table alignment is only available for the FR3 workstation profile.")
+    camera_key = _table_camera_key(payload.get("camera"))
+    if state.rollout.state != "waiting":
+        raise ValueError("Probing a point is only allowed while the interactive session is waiting.")
+    process = state.rollout_process
+    if process is None or process.poll() is not None or process.stdin is None:
+        raise ValueError("Start an interactive rollout session before probing table points.")
+    if not state.rollout.interactive:
+        raise ValueError("Probing needs an interactive rollout session so the gateway owns stdin.")
+    workspace_min, workspace_max = _scene_reset_workspace_bounds(state)
+    request = sanitize_pose_probe_request(
+        {
+            "xyz": [payload.get("x"), payload.get("y"), payload.get("z")],
+            "gripper": payload.get("gripper", 0.0),
+        },
+        workspace_min=workspace_min,
+        workspace_max=workspace_max,
+    )
+    try:
+        process.stdin.write((pose_probe_command(request) + "\n").encode())
+        process.stdin.flush()
+    except (BrokenPipeError, OSError) as exc:
+        raise ValueError(f"Rollout is no longer accepting control commands: {exc}") from exc
+    state.table_probe = {
+        "cameraKey": camera_key,
+        "requestId": request.requestId,
+        "xyz": list(request.xyz),
+        "sentAt": time.time(),
+    }
+    # Same state the reset uses, because it is the same fact: the arm is moving and the cell is
+    # not safe to reach into.
+    state.rollout.state = "resetting"
+    state.rollout.armAtStart = False
+    state.rollout.message = (
+        "Table probe sent: the arm is going to "
+        f"x={request.xyz[0]:+.3f}, y={request.xyz[1]:+.3f}, z={request.xyz[2]:+.3f} "
+        "and will hold there for a still."
+    )
+    state.log("warn", f"Table probe requested camera={camera_key} xyz={list(request.xyz)}")
+    return {"ok": True, "probe": dict(state.table_probe), "rollout": asdict(state.rollout)}
+
+
+def _record_table_point(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    """Attach one click on the frozen still to the coordinate the arm was actually at.
+
+    The base coordinate is taken from the runtime's sidecar rather than from the browser. The
+    browser knows where it *asked* the arm to go; only the runtime knows the still it wrote was
+    taken there, and a calibration built from the request would silently absorb every probe
+    that was refused, timed out, or landed somewhere else.
+    """
+
+    camera_key = _table_camera_key(payload.get("camera"))
+    frame_state = _table_probe_frame_state(state, camera_key)
+    if frame_state["moving"]:
+        raise ValueError("The arm has not finished this probe yet; wait for the still to refresh.")
+    if not frame_state["requestId"] or len(frame_state["xyz"]) != 3:
+        raise ValueError("Probe a point first: there is no still of the arm at a known coordinate.")
+    try:
+        u = float(payload.get("u"))
+        v = float(payload.get("v"))
+        width = int(payload.get("imageWidth") or 0)
+        height = int(payload.get("imageHeight") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("u, v, imageWidth and imageHeight must be numbers.") from exc
+    if width <= 0 or height <= 0:
+        raise ValueError("imageWidth and imageHeight must be positive.")
+    if not (0.0 <= u <= width and 0.0 <= v <= height):
+        raise ValueError("The click is outside the still.")
+
+    x, y, z = frame_state["xyz"]
+    calibration = _load_table_plane(state, camera_key)
+    calibration.imageWidth = width
+    calibration.imageHeight = height
+    # A second click on the same probed point is a correction, not a new measurement: two
+    # points at one coordinate carry no extra constraint and would drag the fit toward whichever
+    # of the two clicks was worse.
+    calibration.points = [
+        point
+        for point in calibration.points
+        if math.hypot(point.x - x, point.y - y) > _TABLE_POINT_MERGE_M
+    ]
+    calibration.add_point(table_plane.TablePlanePoint(u=u, v=v, x=x, y=y), plane_z=z)
+    table_plane.save_calibration(_table_plane_path(state, camera_key), calibration)
+    state.log(
+        "info",
+        f"Table point recorded camera={camera_key} pixel=({u:.1f},{v:.1f}) "
+        f"base=({x:+.4f},{y:+.4f}) points={len(calibration.points)}",
+    )
+    return _table_alignment_snapshot(state, camera_key)
+
+
+def _delete_table_point(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    camera_key = _table_camera_key(payload.get("camera"))
+    calibration = _load_table_plane(state, camera_key)
+    try:
+        index = int(payload.get("index"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("index must be a number.") from exc
+    if index < 0 or index >= len(calibration.points):
+        raise ValueError(f"There is no point {index} to delete.")
+    calibration.points.pop(index)
+    # Not strict: deleting is how an operator escapes a set that cannot be fitted, so it reports
+    # what the remaining points came to rather than refusing to remove anything.
+    calibration.refit(strict=False)
+    table_plane.save_calibration(_table_plane_path(state, camera_key), calibration)
+    return _table_alignment_snapshot(state, camera_key)
+
+
+def _clear_table_points(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    camera_key = _table_camera_key(payload.get("camera"))
+    calibration = table_plane.TablePlaneCalibration(cameraKey=camera_key, planeZ=0.0)
+    table_plane.save_calibration(_table_plane_path(state, camera_key), calibration)
+    state.log("warn", f"Table alignment cleared for camera={camera_key}")
+    return _table_alignment_snapshot(state, camera_key)
+
+
+def _serve_table_probe_frame(
+    handler: BaseHTTPRequestHandler, *, state: GatewayState, camera_key: str
+) -> None:
+    """The frozen still taken while the arm stood at the last probed point."""
+
+    frame_state = _table_probe_frame_state(state, camera_key)
+    if frame_state["moving"]:
+        _json_response(
+            handler,
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            {"error": "the arm has not finished this probe yet", "moving": True},
+        )
+        return
+    try:
+        frame = (rollout_backend.PROBE_DIR / f"{camera_key}.jpg").read_bytes()
+    except OSError:
+        _json_response(
+            handler,
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            {"error": f"no probe still for {camera_key} yet"},
+        )
+        return
+    _write_jpeg_response(handler, frame)
+
+
+def _serve_table_view(
+    handler: BaseHTTPRequestHandler, *, state: GatewayState, query: dict[str, list[str]]
+) -> None:
+    """One camera still, re-projected into the exact base-frame rectangle the caller plots.
+
+    The window comes from the request rather than from a shared constant because the plots
+    rescale themselves around their data: the caller is the only thing that knows what its axes
+    span this second, and any other arrangement lets the backdrop and the points drift apart
+    without either end being wrong.
+    """
+
+    try:
+        camera_key = _table_camera_key(query.get("camera", [""])[0])
+        window = table_plane.TableWindow(
+            minX=float(query.get("minX", [""])[0]),
+            maxX=float(query.get("maxX", [""])[0]),
+            minY=float(query.get("minY", [""])[0]),
+            maxY=float(query.get("maxY", [""])[0]),
+        )
+        width = int(float(query.get("width", ["360"])[0]))
+        height = int(float(query.get("height", ["360"])[0]))
+    except (IndexError, TypeError, ValueError, table_plane.TablePlaneError) as exc:
+        _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": f"bad table view request: {exc}"})
+        return
+    if not (16 <= width <= 2048 and 16 <= height <= 2048):
+        _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": "width and height must be 16-2048 px."})
+        return
+
+    calibration = _load_table_plane(state, camera_key)
+    if not calibration.calibrated or calibration.imageToBase is None:
+        _json_response(
+            handler,
+            HTTPStatus.CONFLICT,
+            {"error": f"{camera_key} has not been aligned to the table yet", "calibrated": False},
+        )
+        return
+    frame, status, error = _camera_still_bytes(state, camera_key)
+    if frame is None:
+        _json_response(handler, status, {"error": error})
+        return
+    try:
+        warped = table_plane.warp_still_to_window(
+            frame,
+            image_to_base=calibration.imageToBase,
+            window=window,
+            width=width,
+            height=height,
+            source_size=(
+                (calibration.imageWidth, calibration.imageHeight)
+                if calibration.imageWidth and calibration.imageHeight
+                else None
+            ),
+        )
+    except table_plane.TablePlaneError as exc:
+        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+        return
+    _write_jpeg_response(handler, warped)
 
 
 def _annotation_store_path(dataset_root: Path) -> Path:
@@ -9442,6 +9800,33 @@ def _ensure_realsense_device_preview(
     return True
 
 
+def _realsense_device_preview_frame(
+    state: GatewayState, *, device_id: str, device: dict[str, Any]
+) -> tuple[bytes | None, HTTPStatus, str]:
+    """Start the device's preview pipeline if needed and wait for one frame from it.
+
+    Returns the failure as a status and a message rather than writing it, so a caller that
+    wants the bytes for something other than an HTTP body -- the table view warps them -- can
+    have them without a second copy of the wait loop.
+    """
+
+    if state.camera_preview_suspended:
+        return None, HTTPStatus.CONFLICT, "camera preview suspended while recorder connects"
+    with state.camera_preview_lock:
+        state.camera_preview_last_access[device_id] = time.time()
+    if not _ensure_realsense_device_preview(state, device_id=device_id, device=device):
+        return None, HTTPStatus.SERVICE_UNAVAILABLE, "RealSense preview unavailable"
+    deadline = time.monotonic() + _PREVIEW_FIRST_FRAME_TIMEOUT_S
+    while time.monotonic() < deadline:
+        with state.camera_preview_lock:
+            cached = state.camera_preview_frames.get(device_id)
+            state.camera_preview_last_access[device_id] = time.time()
+        if cached is not None:
+            return cached[0], HTTPStatus.OK, ""
+        time.sleep(0.1)
+    return None, HTTPStatus.SERVICE_UNAVAILABLE, "no RealSense preview frame yet"
+
+
 def _serve_realsense_device_preview_snapshot(
     handler: BaseHTTPRequestHandler,
     *,
@@ -9449,26 +9834,9 @@ def _serve_realsense_device_preview_snapshot(
     device_id: str,
     device: dict[str, Any],
 ) -> None:
-    if state.camera_preview_suspended:
-        _json_response(handler, HTTPStatus.CONFLICT, {"error": "camera preview suspended while recorder connects"})
-        return
-    with state.camera_preview_lock:
-        state.camera_preview_last_access[device_id] = time.time()
-    if not _ensure_realsense_device_preview(state, device_id=device_id, device=device):
-        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "RealSense preview unavailable"})
-        return
-    deadline = time.monotonic() + _PREVIEW_FIRST_FRAME_TIMEOUT_S
-    frame: bytes | None = None
-    while time.monotonic() < deadline:
-        with state.camera_preview_lock:
-            cached = state.camera_preview_frames.get(device_id)
-            state.camera_preview_last_access[device_id] = time.time()
-        if cached is not None:
-            frame = cached[0]
-            break
-        time.sleep(0.1)
+    frame, status, error = _realsense_device_preview_frame(state, device_id=device_id, device=device)
     if frame is None:
-        _json_response(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "no RealSense preview frame yet"})
+        _json_response(handler, status, {"error": error})
         return
     handler.send_response(HTTPStatus.OK)
     handler.send_header("Content-Type", "image/jpeg")
@@ -12642,6 +13010,34 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             camera_key = query.get("camera", [""])[0]
             _serve_rollout_camera_snapshot(self, state=self.server.state, camera_key=camera_key)
             return
+        if path == "/api/rollout/camera-still.jpg":
+            camera_key = query.get("camera", [""])[0]
+            _serve_rollout_camera_still(self, state=self.server.state, camera_key=camera_key)
+            return
+        if path == "/api/rollout/table-view.jpg":
+            _serve_table_view(self, state=self.server.state, query=query)
+            return
+        if path == "/api/rollout/table-probe-frame.jpg":
+            state = self.server.state
+            try:
+                camera_key = _table_camera_key(query.get("camera", [""])[0])
+            except ValueError as exc:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            # No lock: this writes a JPEG to a socket the client controls the pace of, and
+            # everything it reads is either a file or one atomically replaced dict.
+            _serve_table_probe_frame(self, state=state, camera_key=camera_key)
+            return
+        if path == "/api/rollout/table-alignment":
+            state = self.server.state
+            try:
+                camera_key = _table_camera_key(query.get("camera", [""])[0])
+            except ValueError as exc:
+                _json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                return
+            with state.lock:
+                _json_response(self, HTTPStatus.OK, _table_alignment_snapshot(state, camera_key))
+            return
         if path == "/api/checkpoints":
             state = self.server.state
             host_id = query.get("host", [training_backend.LOCAL_HOST_ID])[0]
@@ -12800,6 +13196,17 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             device_id = query.get("key", [""])[0]
             if not device_id:
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "missing key"})
+                return
+            if (
+                _rollout_owns_cameras(self.server.state)
+                and device_id in set(self.server.state.rollout.cameraKeys)
+            ):
+                # The runtime has the camera open; the frames it publishes are the only ones
+                # anybody can get, and opening a second pipeline against an exclusive device
+                # would only cost a timeout.
+                _serve_rollout_camera_snapshot(
+                    self, state=self.server.state, camera_key=device_id
+                )
                 return
             use_recorder_preview = _should_use_recorder_camera_preview(self.server.state)
             device = next(
@@ -13231,6 +13638,22 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     with state.lock:
                         _json_response(self, HTTPStatus.OK, _request_rollout_scene_reset(state, body))
                     return
+                if path == "/api/rollout/table-probe":
+                    with state.lock:
+                        _json_response(self, HTTPStatus.OK, _request_table_probe(state, body))
+                    return
+                if path == "/api/rollout/table-point":
+                    with state.lock:
+                        _json_response(self, HTTPStatus.OK, _record_table_point(state, body))
+                    return
+                if path == "/api/rollout/table-point/delete":
+                    with state.lock:
+                        _json_response(self, HTTPStatus.OK, _delete_table_point(state, body))
+                    return
+                if path == "/api/rollout/table-clear":
+                    with state.lock:
+                        _json_response(self, HTTPStatus.OK, _clear_table_points(state, body))
+                    return
                 if path == "/api/rollout/stop":
                     with state.lock:
                         _json_response(self, HTTPStatus.OK, _stop_rollout(state))
@@ -13242,6 +13665,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             except (
                 rollout_backend.RolloutError,
                 SceneResetError,
+                table_plane.TablePlaneError,
                 checkpoint_backend.CheckpointError,
                 training_backend.TrainingError,
                 ValueError,

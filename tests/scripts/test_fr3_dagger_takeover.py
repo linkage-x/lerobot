@@ -11,7 +11,14 @@ import pytest
 
 from lerobot.utils.rotation import Rotation
 
-from tools.fr3.dagger_takeover import ExpertTakeover, expert_spans, motion_gain_for
+from tools.fr3.dagger_takeover import (
+    MAX_STEP_PERIOD_RATIO,
+    ExpertTakeover,
+    backend_dates_reports,
+    expert_spans,
+    motion_gain_for,
+    undated_backend_error,
+)
 
 POLICY_COMMAND = {
     "ee.x": 0.400,
@@ -531,6 +538,106 @@ def test_a_zero_gain_still_reads_the_hand_as_engaged():
     assert debug["moved"] is True
 
 
+# --- moving at the recorded speed on a loop that misses its rate ---------------------------------
+#
+# The puck is a velocity: full deflection is 0.000615 m per 200 Hz tick, so 0.123 m/s, and that is
+# what it meant for every frame in the dataset. A gain sized from the loop's *nominal* period only
+# reproduces that while the loop keeps its nominal period. On the rig a step also carries two
+# camera reads and a forward pass, and the operator has no way to ask for the missing speed --
+# they are already against the stop.
+
+FULL_DEFLECTION_M = 0.000615
+RECORDED_SPEED_MM_S = FULL_DEFLECTION_M * 200.0 * 1000.0  # 123 mm/s
+
+
+def drive_at_full_deflection(takeover, device, clock, *, seconds):
+    """One control step: the reports that arrived during it, then the step itself."""
+    device.arrive(mouse_action(enabled=True, target_x=FULL_DEFLECTION_M))
+    clock.advance(seconds)
+    return take(takeover, latched=False)[1]
+
+
+def full_deflection_takeover(clock, *, nominal_hz=60.0):
+    device = QueuedSpaceMouse()
+    takeover = ExpertTakeover(
+        device,
+        motion_gain=motion_gain_for(tick_hz=200.0, step_period_s=1.0 / nominal_hz),
+        step_period_s=1.0 / nominal_hz,
+        clock=clock,
+    )
+    return device, takeover
+
+
+def test_a_loop_that_keeps_its_rate_moves_the_arm_at_the_recorded_speed():
+    # The number this whole section is about, in the units the operator feels it in.
+    clock = FakeClock()
+    device, takeover = full_deflection_takeover(clock)
+
+    drive_at_full_deflection(takeover, device, clock, seconds=1.0 / 60.0)
+    debug = drive_at_full_deflection(takeover, device, clock, seconds=1.0 / 60.0)
+
+    assert debug["gain"] == pytest.approx(200.0 / 60.0)
+    assert debug["step_mm"] * 60.0 == pytest.approx(RECORDED_SPEED_MM_S, abs=0.5)
+
+
+def test_a_slow_step_moves_the_arm_further_so_the_speed_stays_the_one_the_hand_asked_for():
+    # A loop settled at 30 Hz against a 60 Hz nominal. Each step is held twice as long, so it has
+    # to cover twice the ground -- otherwise the same hand drives the arm at half the speed it
+    # drove it while recording, which is the one thing the operator cannot compensate for.
+    clock = FakeClock()
+    device, takeover = full_deflection_takeover(clock)
+
+    drive_at_full_deflection(takeover, device, clock, seconds=1.0 / 30.0)
+    debug = drive_at_full_deflection(takeover, device, clock, seconds=1.0 / 30.0)
+
+    assert debug["gain"] == pytest.approx(200.0 / 30.0)
+    assert debug["step_ms"] == pytest.approx(1000.0 / 30.0)
+    assert debug["step_mm"] == pytest.approx(4.1, abs=0.05)
+    # The invariant, not the millimetres: the speed is the same one the 60 Hz loop produced.
+    assert debug["step_mm"] * 30.0 == pytest.approx(RECORDED_SPEED_MM_S, abs=0.5)
+
+
+def test_a_stalled_step_arrives_as_a_slow_step_rather_than_as_a_lunge():
+    # A second of dead time is not a control step, and honouring it literally would ask for 123 mm
+    # in one command -- with the operator's hand still where it was before the freeze. The bound
+    # is what makes the correction safe to apply without knowing why the loop stopped.
+    clock = FakeClock()
+    device, takeover = full_deflection_takeover(clock)
+
+    drive_at_full_deflection(takeover, device, clock, seconds=1.0 / 60.0)
+    debug = drive_at_full_deflection(takeover, device, clock, seconds=1.0)
+
+    assert debug["gain"] == pytest.approx(MAX_STEP_PERIOD_RATIO * 200.0 / 60.0)
+    assert debug["step_mm"] == pytest.approx(4.0 * 2.05, abs=0.05)
+
+
+def test_the_first_step_of_a_run_is_taken_at_the_nominal_rate():
+    # There is no previous step to measure, and the gap since the last rollout -- homing, waiting
+    # for the operator to press s -- is not one. Nominal is the honest answer, not a measurement.
+    clock = FakeClock()
+    device, takeover = full_deflection_takeover(clock)
+    clock.advance(45.0)
+
+    debug = drive_at_full_deflection(takeover, device, clock, seconds=0.0)
+
+    assert debug["gain"] == pytest.approx(200.0 / 60.0)
+    assert debug["step_ms"] == pytest.approx(0.0)
+
+
+def test_a_caller_that_names_no_step_period_keeps_the_gain_it_was_given():
+    # Sim replays, tests, anything whose loop rate is not a measured quantity. Correcting a gain
+    # by a clock nobody paced against would be inventing a speed, not reproducing one.
+    clock = FakeClock()
+    device = QueuedSpaceMouse()
+    takeover = ExpertTakeover(device, motion_gain=2.0, clock=clock)
+
+    drive_at_full_deflection(takeover, device, clock, seconds=1.0 / 60.0)
+    debug = drive_at_full_deflection(takeover, device, clock, seconds=1.0 / 6.0)
+
+    assert debug["gain"] == pytest.approx(2.0)
+    assert debug["step_mm"] == pytest.approx(FULL_DEFLECTION_M * 2.0 * 1000.0)
+
+
 # --- letting go ---------------------------------------------------------------------------------
 #
 # The first MuJoCo rehearsal ran one takeover for 1196 steps to the end of the rollout and handed
@@ -619,3 +726,47 @@ def test_a_backend_that_does_not_date_its_reports_is_taken_at_its_word():
     assert debug["status"] == "moving"
     assert device.polls == 1
     assert command["ee.x"] == pytest.approx(LAST_SENT["ee.x"] + 0.002)
+
+
+class ConnectedButSilentSpaceMouse(QueuedSpaceMouse):
+    """A patched driver at the moment it connects: dated, but nothing has arrived yet.
+
+    This is the state every rig is in when the banner prints -- the operator's hand is not on the
+    puck -- and it is the case a check on the *value* of the timestamp gets backwards.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.last_report_timestamp = None
+
+
+def test_a_driver_that_carries_no_timestamp_at_all_is_the_undated_one():
+    assert backend_dates_reports(QueuedSpaceMouse()) is True
+    assert backend_dates_reports(UndatedSpaceMouse(mouse_action())) is False
+
+
+def test_a_dated_driver_that_has_not_heard_from_the_device_yet_still_counts_as_dated():
+    # The refusal fires at connect, before any report exists. Reading the timestamp's value here
+    # would refuse every correctly patched rig on the rig's normal startup state.
+    device = ConnectedButSilentSpaceMouse()
+
+    assert device.last_report_timestamp is None
+    assert backend_dates_reports(device) is True
+
+
+def test_the_takeover_says_whether_its_own_device_dates_its_reports():
+    # Asked of the object because the answer changes what its other numbers mean: a handback gap
+    # measured on an undated device is the runaway's length, not the operator's excursion.
+    assert ExpertTakeover(QueuedSpaceMouse()).dates_reports is True
+    assert ExpertTakeover(UndatedSpaceMouse(mouse_action())).dates_reports is False
+
+
+def test_the_refusal_explains_the_import_rather_than_blaming_the_device():
+    # The device is almost never the cause -- the wrong copy of lerobot is -- so the message has
+    # to carry the path that was loaded and the variable that decides it.
+    message = undated_backend_error(driver_module="/home/hanyu/Codes/lerobot/src/lerobot/x.py")
+
+    assert "/home/hanyu/Codes/lerobot/src/lerobot/x.py" in message
+    assert "PYTHONPATH" in message
+    # And it must not read as "the rehearsal is broken too": that path is deliberately allowed.
+    assert "dagger_sim" in message

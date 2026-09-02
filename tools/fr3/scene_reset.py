@@ -471,3 +471,176 @@ def execute_scene_reset(robot: Any, request: SceneResetRequest) -> dict[str, Any
     except Exception as exc:  # noqa: BLE001 - the caller reports this without killing the gateway
         print(f"[WARN] scene_reset=failed request_id={request.requestId} details={exc}", flush=True)
         return {"ok": False, "error": str(exc), "request": request.payload(), "trajectoryQc": qc}
+
+
+# ------------------------------------------------------------------------------ pose probe ---
+# Probing is the reset's little sibling: one commanded point, no object, nothing sampled. It
+# exists so the camera can be tied to the base frame without a calibration board -- the robot
+# puts its own tool at a base coordinate the gateway chose, a still is taken there, and an
+# operator clicks the tool in it. Four of those pairs are a plane homography (see
+# tools/data_collection_gui/table_plane.py).
+#
+# It reuses the reset's clearance, QC and step loop deliberately. A second way of moving the
+# arm to a typed-in coordinate is a second set of workspace checks to keep in step, and the
+# one that gets skipped is always the one nobody thought of as a real motion.
+POSE_PROBE_CLEARANCE_M = SCENE_RESET_LIFT_M
+
+
+@dataclass(frozen=True)
+class PoseProbeRequest:
+    xyz: tuple[float, float, float]
+    # Closed, so the tool is a single point in the image instead of two fingers with a gap
+    # between them that every operator would bisect slightly differently.
+    gripper: float = 0.0
+    # Time held at the point before the still is taken. The camera pipeline is several frames
+    # deep, so a frame grabbed the instant the controller reports convergence can still show
+    # the arm arriving.
+    dwellS: float = 0.6
+    timeoutS: float = 20.0
+    toleranceM: float = 0.006
+    gripperTolerance: float = 0.08
+    controlPeriodS: float = 1.0 / 30.0
+    requestId: str = ""
+
+    def payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def build_pose_probe_waypoints(request: PoseProbeRequest) -> tuple[SceneResetWaypoint, ...]:
+    """Down from above, then straight back up.
+
+    The retreat is a waypoint rather than something the caller does afterwards so that the QC
+    below covers it: the arm leaves the probe point at the same clearance it arrived at, and
+    never travels laterally at table height.
+    """
+
+    x, y, z = request.xyz
+    above = (x, y, z + POSE_PROBE_CLEARANCE_M)
+    return (
+        SceneResetWaypoint("approach_above_probe", above, request.gripper),
+        SceneResetWaypoint("descend_8cm_to_probe", (x, y, z), request.gripper),
+        SceneResetWaypoint("retreat_8cm_from_probe", above, request.gripper),
+    )
+
+
+def validate_pose_probe_trajectory(
+    request: PoseProbeRequest,
+    *,
+    workspace_min: Iterable[float] | None = None,
+    workspace_max: Iterable[float] | None = None,
+    current_xyz: tuple[float, float, float] | None = None,
+) -> dict[str, Any]:
+    """Run deterministic probe QC before any waypoint is sent to the robot."""
+
+    if request.timeoutS <= 0.0 or request.toleranceM <= 0.0 or request.controlPeriodS <= 0.0:
+        raise SceneResetError("timeoutS, toleranceM and controlPeriodS must be positive.")
+    if request.dwellS < 0.0 or request.dwellS > 5.0:
+        raise SceneResetError("dwellS must be in [0, 5] seconds.")
+    if request.gripperTolerance < 0.0:
+        raise SceneResetError("gripperTolerance must be non-negative.")
+    if request.gripper < 0.0 or request.gripper > 1.0:
+        raise SceneResetError("gripper must be normalized in [0, 1].")
+    for index, value in enumerate(request.xyz):
+        if not math.isfinite(value):
+            raise SceneResetError(f"xyz[{index}] must be finite.")
+
+    low, high = _workspace_bounds(workspace_min, workspace_max)
+    waypoints = build_pose_probe_waypoints(request)
+    points: list[tuple[str, tuple[float, float, float]]] = [
+        (waypoint.name, waypoint.xyz) for waypoint in waypoints
+    ]
+    if current_xyz is not None:
+        points.insert(0, ("current", current_xyz))
+    for name, xyz in points:
+        _check_xyz_in_workspace(xyz, name, low, high)
+    for (start_name, start), (end_name, end) in zip(points, points[1:], strict=False):
+        for sample_index, sample in enumerate(_iter_segment_samples(start, end)):
+            _check_xyz_in_workspace(sample, f"segment:{start_name}->{end_name}[{sample_index}]", low, high)
+    return {"ok": True, "waypoints": len(waypoints), "clearanceM": POSE_PROBE_CLEARANCE_M}
+
+
+def sanitize_pose_probe_request(
+    raw: Any,
+    *,
+    workspace_min: Iterable[float] | None = None,
+    workspace_max: Iterable[float] | None = None,
+) -> PoseProbeRequest:
+    """Validate a UI probe request before the arm is asked to visit the point."""
+
+    if not isinstance(raw, dict):
+        raise SceneResetError("pose probe payload must be a JSON object.")
+    request = PoseProbeRequest(
+        xyz=_xyz(raw.get("xyz"), "xyz"),
+        gripper=_finite_float(raw.get("gripper", 0.0), "gripper"),
+        dwellS=_finite_float(raw.get("dwellS", 0.6), "dwellS"),
+        timeoutS=_finite_float(raw.get("timeoutS", 20.0), "timeoutS"),
+        toleranceM=_finite_float(raw.get("toleranceM", 0.006), "toleranceM"),
+        gripperTolerance=_finite_float(raw.get("gripperTolerance", 0.08), "gripperTolerance"),
+        controlPeriodS=_finite_float(raw.get("controlPeriodS", 1.0 / 30.0), "controlPeriodS"),
+        requestId=str(raw.get("requestId") or f"pose_probe_{time.time_ns()}"),
+    )
+    validate_pose_probe_trajectory(request, workspace_min=workspace_min, workspace_max=workspace_max)
+    return request
+
+
+def pose_probe_command(request: PoseProbeRequest) -> str:
+    return "probe_pose " + json.dumps(request.payload(), sort_keys=True, separators=(",", ":"))
+
+
+def pose_probe_request_from_payload(payload: Any) -> PoseProbeRequest:
+    if not isinstance(payload, dict):
+        raise SceneResetError("probe_pose payload must be an object.")
+    request = PoseProbeRequest(
+        xyz=_xyz(payload.get("xyz"), "xyz"),
+        gripper=_finite_float(payload.get("gripper", 0.0), "gripper"),
+        dwellS=_finite_float(payload.get("dwellS", 0.6), "dwellS"),
+        timeoutS=_finite_float(payload.get("timeoutS", 20.0), "timeoutS"),
+        toleranceM=_finite_float(payload.get("toleranceM", 0.006), "toleranceM"),
+        gripperTolerance=_finite_float(payload.get("gripperTolerance", 0.08), "gripperTolerance"),
+        controlPeriodS=_finite_float(payload.get("controlPeriodS", 1.0 / 30.0), "controlPeriodS"),
+        requestId=str(payload.get("requestId") or ""),
+    )
+    validate_pose_probe_trajectory(request)
+    return request
+
+
+def execute_pose_probe(robot: Any, request: PoseProbeRequest, *, on_arrival: Any = None) -> dict[str, Any]:
+    """Put the tool at one base coordinate, hold, call back, and retreat.
+
+    `on_arrival` runs while the arm is standing at the point, and its job is to write the
+    still that will be clicked. It runs inside the probe rather than after it because the
+    caller's next act is to hand the arm back to the waiting loop, which on this runtime homes
+    it -- a snapshot taken there would show an empty table and a point somewhere else.
+    """
+
+    current_xyz, rotvec, _gripper = _observation_xyz_rotvec_gripper(robot)
+    workspace_min, workspace_max = _robot_workspace_bounds(robot)
+    try:
+        qc = validate_pose_probe_trajectory(
+            request,
+            workspace_min=workspace_min,
+            workspace_max=workspace_max,
+            current_xyz=current_xyz,
+        )
+    except SceneResetError as exc:
+        print(f"[WARN] pose_probe=failed request_id={request.requestId} details=trajectory_qc_failed: {exc}", flush=True)
+        return {"ok": False, "error": f"trajectory_qc_failed: {exc}", "request": request.payload()}
+
+    print(
+        f"[INFO] pose_probe=start request_id={request.requestId} "
+        f"xyz={request.xyz[0]:+.4f},{request.xyz[1]:+.4f},{request.xyz[2]:+.4f} "
+        f"clearance_m={POSE_PROBE_CLEARANCE_M:.3f} trajectory_qc=passed waypoints={qc['waypoints']}",
+        flush=True,
+    )
+    try:
+        for waypoint in build_pose_probe_waypoints(request):
+            _run_step(robot, request, waypoint.name, waypoint.xyz, rotvec, waypoint.gripper)
+            if waypoint.name == "descend_8cm_to_probe":
+                precise_sleep(request.dwellS)
+                if callable(on_arrival):
+                    on_arrival()
+        print(f"[INFO] pose_probe=done request_id={request.requestId}", flush=True)
+        return {"ok": True, "request": request.payload(), "trajectoryQc": qc}
+    except Exception as exc:  # noqa: BLE001 - the caller reports this without killing the session
+        print(f"[WARN] pose_probe=failed request_id={request.requestId} details={exc}", flush=True)
+        return {"ok": False, "error": str(exc), "request": request.payload(), "trajectoryQc": qc}

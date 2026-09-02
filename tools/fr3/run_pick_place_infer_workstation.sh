@@ -49,6 +49,12 @@ gripper_backend="${FR3_GRIPPER_BACKEND-pika}"
 gripper_port="${FR3_GRIPPER_PORT-/dev/serial/by-path/pci-0000:00:14.0-usb-0:9.1.4:1.0-port0}"
 gripper_max_width_mm="${FR3_GRIPPER_MAX_WIDTH_MM-90}"
 camera_config="${FR3_INFER_CAMERA_CONFIG-tools/fr3/fr3_il_infer_realsense_camera_config.yaml}"
+# The record config, named here because this file is the layer that knows which rig it started.
+# The runtime reads robot.workspace_min/max out of it: the driver clips every commanded pose to
+# that box and reports the clipped pose back, so a rollout running a box of its own stops short of
+# where the demonstrations went and says nothing. It did -- the runtime's own copy stood at
+# z >= 0.05 against this file's z >= 0, and the recorded frames reach z = 0.028.
+record_config="${FR3_RECORD_CONFIG-tools/fr3/fr3_record_config.yaml}"
 
 # The IK tool frame, and the reason this script exists rather than a few env vars on the host one.
 # The two Pika frames are fixed on the same URDF and 410.85 mm apart, so naming the wrong one does
@@ -176,6 +182,7 @@ common_args=(
   --gripper-max-width-mm "${gripper_max_width_mm}"
   --robot-urdf-path "${robot_urdf_path}"
   --target-frame-name "${target_frame_name}"
+  --record-config "${record_config}"
   --first-frame-max-pos-delta-mm "${first_frame_max_pos_delta_mm}"
   --first-frame-max-rot-delta-deg "${first_frame_max_rot_delta_deg}"
   --max-step-pos-delta-mm "${max_step_pos_delta_mm}"
@@ -271,6 +278,7 @@ announce() {
   echo "[INFO] task_prompt=${task_prompt:-<auto from single dataset task>}"
   echo "[INFO] cameras=${camera_config} (keys must match the checkpoint's observation.images.*)"
   echo "[INFO] tool_frame=${target_frame_name} urdf=${robot_urdf_path}"
+  echo "[INFO] workspace_fence=${record_config} (robot.workspace_min/max; the box the driver clips to)"
   echo "[INFO] gripper=${gripper_backend}@${gripper_port} max_width=${gripper_max_width_mm}mm close_below=${gripper_close_below:-<disabled>} (normalized 0..1)"
   echo "[INFO] safety: first_frame<${first_frame_max_pos_delta_mm}mm/${first_frame_max_rot_delta_deg}deg, per_step<${max_step_pos_delta_mm}mm/${max_step_rot_delta_deg}deg (vs prev_cmd), leash<${max_leash_pos_delta_mm}mm/${max_leash_rot_delta_deg}deg (vs measured)"
   echo "[INFO] rtc: mode=${rtc_mode} horizon=${rtc_execution_horizon:-<runtime default>} guidance=${rtc_max_guidance_weight:-<runtime default>} schedule=${rtc_prefix_attention_schedule:-<runtime default>} replan_q=${rtc_replan_queue_size:-<runtime default>} delay=${rtc_inference_delay_steps:-auto}"
@@ -374,7 +382,7 @@ case "$mode" in
     exec "${FR3_HOST_PYTHON}" tools/fr3/dagger_sim_dryrun.py \
       --dataset "${dagger_dataset}" \
       --episode "${FR3_DAGGER_SIM_EPISODE-0}" \
-      --config-path "${FR3_RECORD_CONFIG-tools/fr3/fr3_record_config.yaml}" \
+      --config-path "${record_config}" \
       --output "${dagger_report}" \
       --max-step-pos-delta-mm "${max_step_pos_delta_mm}" \
       --max-step-rot-delta-deg "${max_step_rot_delta_deg}" \
