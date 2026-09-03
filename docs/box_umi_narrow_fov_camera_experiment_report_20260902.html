@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>窄 FOV 相机更换实验报告 · 2026-09-02</title>
+<style>
+  :root{
+    --bg:#f6f7f9;
+    --card:#ffffff;
+    --text:#1f2937;
+    --muted:#6b7280;
+    --line:#e5e7eb;
+    --accent:#2563eb;
+    --accent-soft:#eff6ff;
+    --ok:#15803d;
+    --ok-bg:#ecfdf5;
+    --warn:#b45309;
+    --warn-bg:#fffbeb;
+    --bad:#991b1b;
+    --bad-bg:#fef2f2;
+    --shadow:0 8px 24px rgba(15,23,42,.06);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    line-height:1.65;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:36px 22px 72px}
+  .hero{
+    background:linear-gradient(135deg,#111827,#1f2937);
+    color:#fff;
+    border-radius:22px;
+    padding:34px 36px;
+    box-shadow:var(--shadow);
+    margin-bottom:24px;
+  }
+  .hero h1{margin:0 0 10px;font-size:30px;letter-spacing:.2px}
+  .hero p{margin:6px 0;color:#d1d5db}
+  .meta{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}
+  .pill{
+    display:inline-flex;align-items:center;gap:7px;
+    padding:6px 11px;border-radius:999px;font-size:13px;font-weight:600;
+    border:1px solid rgba(255,255,255,.18);color:#e5e7eb
+  }
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+  .card{
+    background:var(--card);
+    border:1px solid var(--line);
+    border-radius:18px;
+    padding:22px;
+    box-shadow:var(--shadow);
+  }
+  .full{grid-column:1/-1}
+  h2,h3{margin-top:0}
+  .section-title{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
+  .section-title h2{margin:0;font-size:22px}
+  .badge{display:inline-block;padding:4px 9px;border-radius:999px;font-size:12px;font-weight:700}
+  .done{color:var(--ok);background:var(--ok-bg)}
+  .warn{color:var(--warn);background:var(--warn-bg)}
+  .bad{color:var(--bad);background:var(--bad-bg)}
+  .small{font-size:13px;color:var(--muted)}
+  .callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:14px 16px;border-radius:10px;margin:12px 0}
+  .callout.ok{border-color:var(--ok);background:var(--ok-bg)}
+  .callout.warn{border-color:var(--warn);background:var(--warn-bg)}
+  .callout.bad{border-color:var(--bad);background:var(--bad-bg)}
+  .table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .metric-table{width:100%;border-collapse:collapse;font-size:14px}
+  .metric-table th,.metric-table td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  .metric-table th{background:#f9fafb}
+  code,.mono{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+    background:#f3f4f6;border-radius:6px;padding:2px 5px;font-size:.92em
+  }
+  .kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:12px 0}
+  .kpi{border:1px solid var(--line);border-radius:14px;background:#fff;padding:14px}
+  .kpi .num{font-size:25px;font-weight:800;line-height:1.2;color:#111827}
+  .kpi .label{font-size:13px;color:var(--muted);margin-top:5px}
+  ul{padding-left:20px}
+  li{margin:5px 0}
+  @media (max-width:820px){
+    .grid,.kpi-grid{grid-template-columns:1fr}
+    .hero{padding:26px 22px}
+    .full{grid-column:auto}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+<section class="hero">
+<h1>窄 FOV 相机更换实验报告</h1>
+<p>结论：不建议为了降低当前轨迹误差而更换窄 FOV 相机。它直接改善的是角点随机精度，而当前误差主瓶颈是外参 accuracy；但若目标改成“让更小 marker 稳定可检、缩小 marker rig”，窄 FOV 是值得单独评估的机械封装变量。</p>
+<div class="meta">
+  <span class="pill">日期：2026-09-02</span>
+  <span class="pill">主参考：trajectory GT roadmap v17.3-v17.6</span>
+  <span class="pill">判定：不作为轨迹修复项更换</span>
+  <span class="pill">潜在价值：小 marker / 小 rig</span>
+  <span class="pill">优先级：把环境固定 marker 做成常驻监视器</span>
+</div>
+<p class="small" style="margin-top:16px;color:#9ca3af">
+  本报告从 <a href="box_umi_trajectory_gt_replay_roadmap.html" style="color:#93c5fd">BOX 高精度 UMI Trajectory GT &amp; Dual-FR3 Replay Roadmap</a> 单独抽取窄 FOV 相关证据；完整误差预算背景见
+  <a href="box_umi_error_budget_evidence.html" style="color:#93c5fd">3 mm 误差预算证据册</a> 与
+  <a href="box_umi_roadmap_changelog.html" style="color:#93c5fd">roadmap 版本历史</a>。
+</p>
+</section>
+
+<div class="grid">
+<section class="card full">
+<div class="section-title"><h2>一页结论</h2><span class="badge bad">轨迹误差修复项不更换</span></div>
+<div class="callout bad">
+  <b>决策句：</b>作为当前轨迹误差修复项，窄 FOV 镜头的直接正收益封顶在角点 precision，量级只有 <b>0.027-0.116 mm</b>；当前相机侧误差约 <b>2 mm</b>，且主要是外参 accuracy 偏置。七台全换会让 <span class="mono">cam_09</span> 丢掉全部 9 个环境固定 marker 观测，正好破坏当前最有价值的相机被碰检测通道。<b>这里的 9 个是环境固定 marker，不是 marker rig；cam_09 对 marker rig 的可见数另算，最多约 3 个。</b><b>但这不否定另一个价值：</b>在 marker 仍落在视场内时，窄 FOV 可以提高同尺寸 marker 的像素占比，从而支持更小 marker / 更紧凑 marker rig；这是 detectability 与 mechanical packaging 收益，不是 trajectory accuracy 收益。
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="num">0.027 mm</div><div class="label">单台窄 FOV 在实测工作偏角下，对角点通道的预计节省</div></div>
+  <div class="kpi"><div class="num">0.116 mm</div><div class="label">把角点精度提升到无穷大的理论收益上限</div></div>
+  <div class="kpi"><div class="num">≈2.0 mm</div><div class="label">当前相机内外参 / 三角测量行的诚实口径</div></div>
+  <div class="kpi"><div class="num">0 / 9</div><div class="label">七台全换窄视锥后，cam_09 保留的环境固定 marker 观测数；非 marker rig</div></div>
+  <div class="kpi"><div class="num">48 → ≈40 mm</div><div class="label">按 1.2× 角分辨率增益粗算，可保持相近像素尺寸的 marker 线性尺寸</div></div>
+</div>
+<p>
+  这不是“窄 FOV 没有任何物理好处”。它确实可能提高每个角点的角分辨率，尤其在大偏角处；也可能让原本低于检测阈值的 marker 变得可识别，或者允许使用更小的物理 marker。但本系统的轨迹误差超支不是角点白噪声主导，而是外参偏置、相机被碰、跨采集世界变化、以及生产 cube 口径下的 marker→TCP 未标定和夹爪刚性问题。更精确地读一套已经偏了的外参，只会得到更精确的错误答案。
+</p>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>实验问题与验收口径</h2><span class="badge warn">必须分 precision / accuracy</span></div>
+<table class="metric-table">
+<tr><th>问题</th><th>采用的判据</th><th>结果</th></tr>
+<tr>
+  <td>换窄 FOV 能不能把当前轨迹误差压到 3 mm 目标附近？</td>
+  <td>看它是否作用在 p95 误差主项上，而不是只改善角点随机项。</td>
+  <td><b>不能。</b>rig 口径当前 TCP 平移 p95 约 5.5-7.4 mm；A′ 估计仍约 3.8-4.0 mm。角点通道的最大可省量不足以翻转结论。</td>
+</tr>
+<tr>
+  <td>单台窄 FOV 相机是否提供可观角点 precision 收益？</td>
+  <td>用实测相机模型和当前角点通道误差量级换算到 TCP 贡献。</td>
+  <td><b>有，但太小。</b>81.6° 镜头在实际工作偏角下把角点通道从 0.116 mm 压到 0.089 mm，仅省 0.027 mm。</td>
+</tr>
+<tr>
+  <td>七台全部更换是否避开“混 FOV 格式不可表示”的工程问题？</td>
+  <td>不混镜头，按同位置同朝向模拟所有现役相机的窄视锥。</td>
+  <td><b>避开了格式问题，但引入更大的测量链损失。</b>环境固定 marker 观测从 36 个降到 22 个，cam_09 变成 0/9。这个 0/9 不计 marker rig；cam_09 的 marker rig 可见数另算，最多约 3 个。</td>
+</tr>
+<tr>
+  <td>窄 FOV 能否让更小 marker 稳定可检？</td>
+  <td>只在 marker 仍落入视场、且相机位置不变时讨论像素占比；把它从轨迹 accuracy 问题中拆出。</td>
+  <td><b>可以，值得单独评估。</b>实测模型在 10°/20° 偏角的角分辨率增益约 1.14×/1.30×，marker 中位偏角 16.3°，粗算 48 mm marker 可降到约 40 mm 仍保持相近像素尺寸。</td>
+</tr>
+</table>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>方法</h2><span class="badge done">不动硬件 + 既有采集</span></div>
+<p>
+  roadmap 中涉及两类窄 FOV 判定：第一类是一台 81.6° 镜头装在 <span class="mono">cam_01</span> 上的单台实验，用于估计角分辨率与角点通道收益；第二类是 2026-09-02 追加的“七台全换”模拟，用同位置同朝向的 81.6°×52.0°直线视锥套在现役相机上，检查 marker rig 与环境固定 marker 是否仍落在视锥内。
+</p>
+<ul>
+  <li><b>单台实验输入：</b>2026-09-01 当天 <span class="mono">ep0</span> 单路数据；拟合出的真实参数为 HFOV 81.6° / VFOV 52.0° / DFOV 89.7°，<span class="mono">f=1091 px/rad</span>，held-out 0.202 px，覆盖 88%。</li>
+  <li><b>全换模拟输入：</b><span class="mono">20260901_182755/ep0</span> 的 123 帧；用等距鱼眼像素转换为视线角，再判断是否落入窄视锥。</li>
+  <li><b>配套 accuracy 证据：</b>同一份录制、同一批检测缓存、同一份 layout、同一组 marker ID 过滤，只换 <span class="mono">fixed_camera_run_name</span>，比较 <span class="mono">calib_20260820_173825</span> 与 <span class="mono">calib_20260902_103833</span>。</li>
+  <li><b>小 marker 推算口径：</b>只把角分辨率增益当作一阶比例尺，不声称已验证检测稳定性。若实际偏角附近增益约 1.2×，则保持相近像素尺寸时 marker 线性尺寸约可按 <span class="mono">1 / 1.2</span> 缩放。</li>
+</ul>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>小 Marker 与机械封装价值</h2><span class="badge warn">单独评估，不并入轨迹精度结论</span></div>
+<div class="callout warn">
+  <b>新增结论：</b>窄 FOV 不值得为了降低当前轨迹误差而换，但如果目标是“让更小 marker 仍可稳定检测、缩小 marker rig”，它是值得单独评估的。这条收益属于 mechanical packaging / detectability，不属于 trajectory accuracy。
+</div>
+<p>
+  在相机位置不变、marker 仍落在视场内时，窄 FOV 会让同尺寸 marker 占更多像素，因此确实可能把原来低于检测阈值的 marker 拉到可识别范围；反过来，也允许使用更小的物理 marker。roadmap 中的 cam_01 数据支持“marker 像素会变大”这个方向，但那次距离与镜头效应混在一起，不能直接把 1.46-1.94× 当作纯 FOV 收益。
+</p>
+<table class="metric-table">
+<tr><th>推算项</th><th>数值</th><th>含义</th></tr>
+<tr>
+  <td>实测镜头</td>
+  <td>HFOV 81.6° / VFOV 52.0°，<span class="mono">f=1091 px/rad</span></td>
+  <td>规格“80°”按水平口径读；和现役等距鱼眼 <span class="mono">1002 px/rad</span> 的基础焦距差不大。</td>
+</tr>
+<tr>
+  <td>角分辨率增益</td>
+  <td>10° / 20° / 30° / 40° 偏角约 <b>1.14× / 1.30× / 1.60× / 2.11×</b></td>
+  <td>实际 marker 中位偏角 16.3°，所以可粗读为约 <b>1.2×</b>，不是 129/80 那种大比例。</td>
+</tr>
+<tr>
+  <td>marker 尺寸一阶折算</td>
+  <td><span class="mono">48 mm / 1.2 ≈ 40 mm</span></td>
+  <td>有机会把当前 marker rig 允许下限 <b>48 mm</b> 粗降到约 <b>40 mm</b>，仍保持相近像素尺寸；不是缩小一半。</td>
+</tr>
+<tr>
+  <td>潜在间接收益</td>
+  <td>更小 marker → 更紧凑 rig → 可能减小 marker→TCP 杠杆臂</td>
+  <td>这条可能比直接提高角点精度更值得关注，但必须和新 rig 结构、遮挡、视场余量一起评估。</td>
+</tr>
+</table>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>有效证据</h2><span class="badge done">用于决策</span></div>
+<div class="table-scroll">
+<table class="metric-table">
+<tr><th>证据</th><th>roadmap 读数</th><th>对窄 FOV 决策的含义</th></tr>
+<tr>
+  <td><b>E1 · 当前超支项在外参 accuracy</b></td>
+  <td>8 相机内外参 / 三角测量目前实际误差约 <b>2.0 mm</b>，超预算 2.5×；超出的 1.2 mm 全部在外参，且几乎全是旋转。<span class="mono">cam_09</span> 解出 <b>1.988°</b> 旋转错，端到端 p50 3.66 → 3.42 mm。</td>
+  <td>换镜头不直接修复外参偏置。当前首要问题是发现并纠正“世界变了”，不是再提高角点读数。</td>
+</tr>
+<tr>
+  <td><b>E2 · bootstrap 证明采样噪声不是主项</b></td>
+  <td>200 次标定 bootstrap 的有限样本散布只有 <b>0.0068° / 0.060 mm</b>，折算标签位移 p50 <b>0.156 mm</b>，约占 2.0 mm 相机行的 1%。</td>
+  <td>更准的图像测量只作用在很小的随机项上，无法吃掉 2 mm 级系统偏置。</td>
+</tr>
+<tr>
+  <td><b>E3 · 角点通道收益封顶很低</b></td>
+  <td>角点通道整条只值 <b>0.116 mm</b>；单台 81.6° 镜头按实测工作偏角代入后，从 0.116 mm 降到 <b>0.089 mm</b>，净省 <b>0.027 mm</b>，约为 p50 缺口的 1%。</td>
+  <td>即使窄 FOV 赢了角点 precision，收益也无法改变“轨迹误差是否达标”的结论。</td>
+</tr>
+<tr>
+  <td><b>E4 · 全换会损失相机被碰监测</b></td>
+  <td>现场 9 个环境固定 marker 在跨采集无人触碰时中心变化中位 <b>0.07-0.48 px = 0.004°-0.028°</b>；对 cam_09 的 1.988° 被碰事件信噪比 <b>72×-483×</b>。套窄视锥后，36 个环境固定 marker 观测只剩 <b>22 个（61%）</b>，<span class="mono">cam_09</span> 为 <b>0/9</b>。<b>这不是 marker rig 计数</b>；cam_09 在 marker rig 上最多约 3 个 marker。</td>
+  <td>窄 FOV 会削掉当前最便宜、最直接的 accuracy 监视器。它不是收益≈0，而是负收益。</td>
+</tr>
+<tr>
+  <td><b>E5 · 垂直视场没有余量</b></td>
+  <td>在一条居中的 30 秒轨迹上，窄 FOV 垂直半视场 26.0° 的剩余量已经很紧：<span class="mono">cam_13</span> -0.3°、<span class="mono">cam_12</span> +1.5°、<span class="mono">cam_09</span> +2.4°、<span class="mono">cam_14</span> +4.3°；<span class="mono">cam_07</span> 已经装不下。</td>
+  <td>当前模拟只是作业体积下界。真实作业更大时，窄 FOV 的覆盖风险只会增加。</td>
+</tr>
+<tr>
+  <td><b>E6 · 缩短标定间隔也不是主杠杆</b></td>
+  <td>把标定从录制前 12 天换成录制后 16 小时，逐相机弥散中位只降 <b>0.25 mm（7.2%）</b>，标签位移中位 <b>0.766 mm</b>。结论改为：杠杆是检测相机被碰，缩短间隔只值不到 10%。</td>
+  <td>accuracy 的主问题不是“多采一点、换新一点、像素准一点”能解决，而是要有持续监控和生产闸门。</td>
+</tr>
+</table>
+</div>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>已撤销或降级的证据</h2><span class="badge warn">不再作为依据</span></div>
+<p>
+  v17.4 对 v17.3 做了关键纠偏：一次临时分析把场景固定 marker 混进 rig marker 统计，导致若干“直觉为什么不成立”的解释失效。报告保留这段，是为了避免后续继续引用已作废的数字。
+</p>
+<table class="metric-table">
+<tr><th>原说法</th><th>状态</th><th>正确读法</th></tr>
+<tr>
+  <td>cam_01 的 marker 成像 97.5-122.2 px，现役 34.8-66.9 px，因此窄 FOV 成像优势 2.3-2.9×。</td>
+  <td><span class="badge warn">下修</span></td>
+  <td>现役 marker 成像应为 <b>52.2-81.1 px</b>；cam_01 优势改为 <b>1.46-1.94×</b>。距离与 FOV 共线仍成立，但量级没有初稿夸张。</td>
+</tr>
+<tr>
+  <td>cam_01 每帧贡献约 8 个角点，而 cam_09/13/14 各 40-44 个角点。</td>
+  <td><span class="badge bad">撤销</span></td>
+  <td>40-44 个角点混入了固定 marker。按 rig 五 ID 重算后，cam_01 为 <b>6.5-9.9</b>，最好的现役为 <b>9.7-11.4</b>。</td>
+</tr>
+<tr>
+  <td>两次 rig 采集无法评估窄 FOV，因为 cam_01 的 ≥4 marker 帧不足。</td>
+  <td><span class="badge bad">撤销</span></td>
+  <td>真实门槛是 ≥4 个角点，即 ≥1 个 marker；cam_01 有 <b>113 / 123</b> 帧合格。真正阻碍是 cam_01 当时没有外参，不能进 BA。</td>
+</tr>
+<tr>
+  <td>窄 FOV 会看不到 rig。</td>
+  <td><span class="badge bad">撤回</span></td>
+  <td>七台全换模拟显示 rig 观测保留 <b>87%-100%</b>。真正负面项不是 rig 立即丢失，而是环境固定 marker 监测被削弱、垂直 FOV 余量不足。</td>
+</tr>
+</table>
+<div class="callout ok">
+  <b>未被撤销的主依据：</b>角点通道收益上限 0.116 mm、窄 FOV 单台净省 0.027 mm、相机行 2 mm 中只有约 1% 是采样噪声、七台全换削弱环境固定 marker 监测。这些证据不依赖被撤销的混 marker 统计。
+</div>
+</section>
+
+<section class="card">
+<div class="section-title"><h2>决策矩阵</h2><span class="badge bad">净收益为负</span></div>
+<table class="metric-table">
+<tr><th>维度</th><th>窄 FOV 影响</th></tr>
+<tr><td>角点 precision</td><td>小幅改善，已量化为 0.027 mm 级收益。</td></tr>
+<tr><td>marker detectability</td><td><b>可能改善。</b>在视场仍覆盖 marker 时，同尺寸 marker 占更多像素；也可能把当前 marker rig 允许下限 48 mm 粗降到约 40 mm。</td></tr>
+<tr><td>机械封装 / marker rig 尺寸</td><td><b>可能间接有利。</b>更小 marker 可能让 rig 更紧凑，并进一步减小 marker→TCP 杠杆臂；该收益需要随新 rig 机械方案单独评估。</td></tr>
+<tr><td>外参 accuracy</td><td>不修复。当前 2 mm 主项仍在。</td></tr>
+<tr><td>环境固定 marker 监测</td><td>变差，cam_09 的环境固定 marker 从 9 个观测降到 0；marker rig 计数另算。</td></tr>
+<tr><td>工作区覆盖</td><td>变差，垂直 FOV 已无余量。</td></tr>
+<tr><td>工程成本</td><td>全换需重做场景基准；混 FOV 在现行生产格式中不可表示。</td></tr>
+<tr><td>综合判定</td><td><b>不作为当前轨迹误差修复项执行。</b>除非同时重做场景基准，否则全换为负收益；即使重做，仍不解决当前 accuracy 主瓶颈。<b>但作为小 marker / 小 rig 的设计变量，保留单独评估价值。</b></td></tr>
+</table>
+</section>
+
+<section class="card">
+<div class="section-title"><h2>建议动作</h2><span class="badge done">替代主线</span></div>
+<ul>
+  <li><b>不要采购 / 更换窄 FOV 镜头作为当前轨迹误差修复项。</b></li>
+  <li><b>允许把窄 FOV 放进新 marker rig 的机械封装评估：</b>目标不是压低现有轨迹误差，而是验证更小 marker 是否仍稳定可检、rig 是否能更紧凑、marker→TCP 杠杆臂是否能随之减小。</li>
+  <li><b>小 marker 评估要设独立判据：</b>在目标作业体积内逐相机统计 marker 像素边长、检测率、误检率、姿态解稳定性、遮挡余量；不要用重投影残差替代 detectability。</li>
+  <li><b>把环境固定 marker 做成常驻相机健康监视器：</b>检测本来就在跑，存基线并按 3σ 比较；这是 v17.6 直接派生出的 P0。</li>
+  <li><b>补齐环境固定 marker 盲区：</b><span class="mono">cam_12</span> 与 <span class="mono">cam_01</span> 当前各 0 个，需补贴 2-3 个。</li>
+  <li><b>继续把主线放在 accuracy：</b>相机被碰检测、生产标定指针陈旧闸门、外参提升流程、以及生产 cube 口径的 marker→TCP / hand-eye 和装夹刚性。</li>
+</ul>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>边界条件</h2><span class="badge warn">不能过度外推</span></div>
+<ul>
+  <li>干净的“同位置同朝向、只差镜头”的并排 A/B 从未做过；roadmap 主动放弃该实验，因为即使它赢，收益封顶 0.027-0.116 mm，对决策无影响。</li>
+  <li>当前所有误差数仍未由独立 GT 最终认证。它们足以证伪“窄 FOV 是主杠杆”，但不能替代 Phase 7 的独立 GT benchmark。</li>
+  <li>如果未来目标变成更换 marker rig、使用更小 marker、改变作业体积、或重做整套场景基准，窄 FOV 应作为新系统设计变量重新评估；这不是当前修复 3 mm 轨迹误差的动作。</li>
+</ul>
+</section>
+
+</div>
+</div>
+</body>
+</html>
