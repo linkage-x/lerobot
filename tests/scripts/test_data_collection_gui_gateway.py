@@ -3993,6 +3993,65 @@ def test_the_solve_can_refit_intrinsics_from_a_second_capture(tmp_path, monkeypa
     assert state.calibration.progress.stepCount == 5
 
 
+def _refit_and_capture_export_args(
+    tmp_path: Path, monkeypatch, run_name: str, production_run: str = ""
+) -> list[str]:
+    """Run a re-fit solve to completion and hand back the export's argv."""
+    state = _solve_state(tmp_path)
+    state.calibration.intrinsicsRun = production_run
+    state.calibration.state = "running"
+    state.calibration.progress = gateway.CalibrationProgress(startedAt=1000.0)
+    extrinsics = _charuco_capture(tmp_path, episodes=1, cameras=3)
+    intrinsics = _charuco_capture(tmp_path / "i", episodes=2, cameras=3)
+    report = tmp_path / "outputs" / "metrology" / run_name / "extrinsics_report.json"
+    export_args: list[str] = []
+
+    def fake_step(_state, _python, args, *, label, timeout, on_line=None):
+        module = next((arg for arg in args if arg.startswith("metrology.cli.")), "")
+        if module.endswith("calibrate_intrinsics"):
+            Path(args[args.index("--out") + 1]).write_text("{}", encoding="utf-8")
+        if module.endswith("calibrate_extrinsics"):
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(json.dumps({"rmse_px": 0.2, "per_camera_rmse": {}}), encoding="utf-8")
+        if module.endswith("export_production_calibration"):
+            export_args.extend(args)
+        return subprocess.CompletedProcess(["python"], 0, "", "")
+
+    monkeypatch.setattr(gateway, "_calibration_step", fake_step)
+    gateway._run_extrinsics_calibration(
+        state, extrinsics, run_name, Path(sys.executable), intrinsics_dataset=intrinsics
+    )
+    assert state.calibration.state == "complete", state.calibration.message
+    return export_args
+
+
+def test_a_refit_tells_the_exporter_to_keep_the_lenses_it_did_not_touch(tmp_path, monkeypatch):
+    """An intrinsics run is resolved by name and loaded whole.
+
+    A capture that swept two cameras produces a report about two cameras, so
+    without this the export puts production on a run holding two lenses -- the
+    other nine not stale but gone, which the promotion review then refuses as
+    `cameras_removed`. Re-fitting one camera would have meant re-fitting the rig.
+    """
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_00", "cam_01"])
+
+    args = _refit_and_capture_export_args(tmp_path, monkeypatch, "run_c", "prod_intrinsics")
+
+    assert "--carry-forward-intrinsics" in args
+    assert args[args.index("--carry-forward-intrinsics") + 1] == str(
+        tmp_path / "outputs" / "calibration" / "prod_intrinsics"
+    )
+
+
+def test_a_first_calibration_has_nothing_to_carry_forward(tmp_path, monkeypatch):
+    """The flag names a run to copy out of, and the exporter refuses one that
+    holds nothing. On a fresh rig there is no such run, so it must not be sent
+    -- the refusal would land on an export that is perfectly correct."""
+    args = _refit_and_capture_export_args(tmp_path, monkeypatch, "run_d")
+
+    assert "--carry-forward-intrinsics" not in args
+
+
 def test_asking_to_refit_intrinsics_without_a_capture_is_refused_up_front(tmp_path, monkeypatch):
     state = _solve_state(tmp_path)
     dataset = _charuco_capture(tmp_path, episodes=1, cameras=2)
@@ -4788,6 +4847,50 @@ def test_a_capture_that_declares_nothing_still_carries_every_camera_into_the_exp
 
     assert len(preflight["cameras"]) == 11
     assert preflight["blocking"] is True
+
+
+def test_the_preflight_names_the_lenses_the_export_will_carry_rather_than_lose(tmp_path):
+    """The other half of the same question, and it no longer blocks.
+
+    Nine of production's eleven lenses are not re-fitted by a two-camera sweep.
+    They used to leave production with the export; now they are copied into the
+    new run, so what is left is a statement -- "内参已更新" after a two-camera
+    sweep would otherwise read as a re-measurement of the whole rig.
+    """
+    state = _solve_state(tmp_path)
+    _production_intrinsics_run(
+        tmp_path, "prod_intrinsics", [f"cam_{index:02d}" for index in range(11)]
+    )
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    capture = _intrinsics_sweeps(tmp_path, ["cam_05", "cam_06"])
+
+    preflight = gateway._intrinsics_preflight(state, capture)
+
+    assert preflight["cameras"] == ["cam_05", "cam_06"]
+    assert preflight["carriedForward"] == [
+        "cam_00", "cam_01", "cam_02", "cam_03", "cam_04", "cam_07", "cam_08", "cam_09", "cam_10",
+    ]
+    assert preflight["blocking"] is False
+
+
+def test_carrying_forward_cannot_rescue_a_camera_production_never_had(tmp_path):
+    """Why the refusal survives the exporter learning to carry cameras across.
+
+    cam_09 is swept here and has no production lens, so it has to come out of
+    *this* fit: there is nothing to carry in its place, and the export dies at
+    the last step if it saw no board.
+    """
+    state = _solve_state(tmp_path)
+    _production_intrinsics_run(tmp_path, "prod_intrinsics", ["cam_05", "cam_06"])
+    state.calibration.intrinsicsRun = "prod_intrinsics"
+    capture = _intrinsics_sweeps(tmp_path, ["cam_05", "cam_09"])
+
+    preflight = gateway._intrinsics_preflight(state, capture)
+
+    assert preflight["uncalibrated"] == ["cam_09"]
+    assert preflight["carriedForward"] == ["cam_06"]
+    assert preflight["blocking"] is True
+    assert "cam_09" in gateway._preflight_message(preflight)
 
 
 def test_a_fresh_rig_is_not_blocked_by_its_own_first_calibration(tmp_path):

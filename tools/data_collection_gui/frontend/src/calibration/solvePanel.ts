@@ -79,7 +79,18 @@ export function intrinsicsNote(solve: CalibrationSolve | undefined, refit: boole
     return "还没选内参采集——需要逐台相机各录一段、板子走到画面四角的那种采集";
   }
   const episodes = solve.intrinsicsEpisodes ? `${solve.intrinsicsEpisodes} 段` : "";
-  return `将从 ${solve.intrinsicsDatasetName}${episodes ? `（${episodes}）` : ""} 重新拟合内参，覆盖现有的 ${solve.intrinsicsRun || "内参"}`;
+  const base = `将从 ${solve.intrinsicsDatasetName}${episodes ? `（${episodes}）` : ""} 重新拟合内参，覆盖现有的 ${solve.intrinsicsRun || "内参"}`;
+  // An intrinsics run is loaded whole, so a partial re-sweep used to mean the
+  // untouched cameras left production entirely. They are carried across now --
+  // said here because "内参已更新" would otherwise read as a re-measurement of
+  // the whole rig when only two cameras were swept.
+  const carried = solve.intrinsicsPreflight?.carriedForward ?? [];
+  const swept = solve.intrinsicsPreflight?.cameras ?? [];
+  if (!carried.length) return base;
+  return (
+    `${base}；本次只重拟 ${swept.length} 台，` +
+    `其余 ${carried.length} 台（${carried.join("、")}）原样承接自在产 run，不会从生产里消失`
+  );
 }
 
 export type SolveButtonView = { visible: boolean; label: string; disabled: boolean };
@@ -120,14 +131,12 @@ export function captureTally(steps: CalibrationSessionStep[]): string {
 
 /** Whether re-fitting and exporting from this capture is doomed, and why.
  *
- * `export_production_calibration` builds a whole intrinsics run from one report
- * and has no way to carry a camera forward from the run in production, so every
- * camera with video in the capture must come out of the fit with a usable model.
- * On this rig cam_02/cam_03 point away from the board area and detect nothing in
- * every episode, which makes "re-fit the whole rig and export" structurally
- * impossible rather than unlucky -- and the failure lands at the *last* step,
- * after both captures have been decoded. Saying it before the click is worth an
- * hour every time it fires.
+ * Cameras the capture does not sweep are carried into the new run from the one
+ * in production, so a partial re-sweep is fine. What is not fine is a camera
+ * *in* the capture with no production lens: it must come out of this fit with a
+ * usable model, nothing can be carried forward in its place, and the failure
+ * lands at the *last* step, after both captures have been decoded. Saying it
+ * before the click is worth an hour every time it fires.
  *
  * It only blocks when production already ships intrinsics: a first calibration
  * of a fresh rig has nothing to extend and nothing to lose.
@@ -148,7 +157,7 @@ export function preflightView(
     message:
       `${names} 没有在产内参，重算后必须各自拟合出可用模型才能导出——` +
       `任何一台看不到板都会让整轮在最后一步作废，已解码的部分全部白跑。` +
-      `而且导出只写这份报告里的相机，当前在产的 ${preflight.production.length} 台不会被保留。`,
+      `没重拟的相机会从在产 run 承接过来，但这几台在产 run 里本来就没有。`,
     hint: "勾上「只解算，不导出」跑这一轮：BA 照常解出这些相机并给残差，只是不写进生产。",
   };
 }

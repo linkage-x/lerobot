@@ -5289,39 +5289,53 @@ def _capture_cameras(dataset: Path) -> list[str]:
 def _intrinsics_preflight(state: GatewayState, intrinsics: Path | None) -> dict[str, Any]:
     """Whether re-fitting intrinsics from this capture can survive the export.
 
-    ``export_production_calibration`` writes a whole intrinsics run from one
-    report and has no way to carry a camera forward from the run already in
-    production, so every camera with video in the capture must come out of the
-    fit with a usable model -- one that saw no board takes the export down at
-    the last step, after the entire decode. On this rig cam_02/cam_03 point
-    away from the board area and detect nothing in every episode, which makes
-    "re-fit and export from a full-rig capture" structurally impossible rather
-    than unlucky.
+    Two questions, and only one of them still blocks.
+
+    Cameras production ships that this capture does not sweep are copied into
+    the new run by the exporter (``--carry-forward-intrinsics``), so a
+    three-camera re-sweep no longer deletes the other eight. They are reported
+    all the same: "11 台内参已导出" after a three-camera sweep is a sentence
+    that reads as a re-measurement of the whole rig, and it would not be one.
+
+    A camera *in* the capture with no production lens still blocks. It has to
+    come out of this fit with a usable model, there is nothing in production to
+    carry forward in its place, and one that saw no board takes the export down
+    at the last step, after both captures have been decoded. Now that detection
+    reads each episode only on the camera it declares, a camera is in the
+    capture because somebody swept it -- so this fires on a stated intent
+    rather than on a camera that merely happened to be rolling.
 
     Blocking applies only when production already ships intrinsics: a first
     calibration of a fresh rig has nothing to extend and nothing to lose.
     """
     production = _production_intrinsics_cameras(state)
     if intrinsics is None or not production:
-        return {"cameras": [], "production": production, "uncalibrated": [], "blocking": False}
+        return {
+            "cameras": [],
+            "production": production,
+            "uncalibrated": [],
+            "carriedForward": [],
+            "blocking": False,
+        }
     cameras = _capture_cameras(intrinsics)
     uncalibrated = [name for name in cameras if name not in set(production)]
     return {
         "cameras": cameras,
         "production": production,
         "uncalibrated": uncalibrated,
+        # Not re-fitted by this capture, and kept by the export rather than lost.
+        "carriedForward": [name for name in production if name not in set(cameras)],
         "blocking": bool(uncalibrated),
     }
 
 
 def _preflight_message(preflight: dict[str, Any]) -> str:
-    """The refusal, naming the cameras and the two ways past it."""
+    """The refusal, naming the cameras and why carrying forward cannot save them."""
     names = "、".join(preflight.get("uncalibrated") or [])
-    kept = len(preflight.get("production") or [])
     return (
         f"重算内参并导出会在最后一步失败：这份采集里 {names} 没有在产内参，"
         f"导出时它们必须各自拟合出可用的模型，任何一台看不到板都会让整轮作废（已解码的部分全部白跑）。"
-        f"当前在产内参只有 {kept} 台，导出也不会把它们保留下来。"
+        f"没重拟的相机会从在产 run 承接过来，但这几台在产 run 里本来就没有，承接不了。"
     )
 
 
@@ -5970,6 +5984,13 @@ def _run_extrinsics_calibration(
         )
         if fitted_intrinsics is not None:
             export_args += ["--intrinsics-report", str(fitted_intrinsics), "--model", "fisheye"]
+            # An intrinsics run is resolved by name and loaded whole, so a report
+            # about the three cameras that were swept would put production on a
+            # run holding three lenses -- the other eight not stale, just gone.
+            # Carrying them across is what makes a partial re-sweep a thing the
+            # operator can actually do.
+            if state.calibration.intrinsicsRun and intrinsics_run.is_dir():
+                export_args += ["--carry-forward-intrinsics", str(intrinsics_run)]
         elif not keep_intrinsics_run:
             export_args += [
                 "--intrinsics-report", str(state.repo_root / _CALIB_INTRINSICS_REPORT),
@@ -6162,7 +6183,8 @@ def _start_extrinsics_calibration(
                 state,
                 _preflight_message(preflight),
                 hint="改用「只解算，不导出」跑这一轮：BA 会把这些相机一起解出来并给出残差，"
-                "只是不写进生产。要真正把它们并进生产内参，需要导出器支持从在产 run 承接未重拟的相机。",
+                "只是不写进生产。要把它们真正并进生产内参，得先让它们在自己那一段里拟合出可用模型——"
+                "承接机制救不了没有在产内参的相机。",
             )
 
     run_name = f"calib_{time.strftime('%Y%m%d_%H%M%S')}"

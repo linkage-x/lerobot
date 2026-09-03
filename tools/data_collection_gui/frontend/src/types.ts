@@ -481,14 +481,18 @@ export type CalibrationSolve = {
   intrinsicsPreflight?: IntrinsicsPreflight;
 };
 
-/** Which cameras a re-fit would have to produce a lens for, and which of them
- * production has no lens for today. The exporter writes a whole intrinsics run
- * from one report with no way to carry a camera forward, so any camera in the
- * capture that fails its fit takes the export down at the last step. */
+/** Which cameras a re-fit would have to produce a lens for, which of them
+ * production has no lens for today, and which of production's lenses this
+ * capture does not re-fit. The last group is carried into the new run by the
+ * exporter, so it is a note; the middle one still blocks, because a camera in
+ * the capture that fails its fit takes the export down at the last step and
+ * there is nothing in production to put in its place. */
 export type IntrinsicsPreflight = {
   cameras: string[];
   production: string[];
   uncalibrated: string[];
+  /** Kept from the production run because this capture never swept them. */
+  carriedForward?: string[];
   blocking: boolean;
 };
 
