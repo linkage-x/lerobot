@@ -381,6 +381,70 @@ def resolve_resume_config_path(checkpoint: Path) -> Path:
     )
 
 
+def assert_resume_trains_the_named_view(
+    resume_config_path: Path, *, view_root: Path, repo_id: str, steps: int, steps_supplied: bool
+) -> None:
+    """Refuse a resume whose checkpoint config does not describe the view this run names.
+
+    `--resume` does not mean "start from these weights". `TrainPipelineConfig.validate` takes the
+    `elif self.resume:` branch and reloads the *entire* train config from the checkpoint --
+    dataset root, episode subset, job name, output directory, optimizer schedule -- so
+    `--view-root` is accepted, printed by the `[prepare]` lines above, and then silently ignored.
+    A run launched to train a merged DAgger view trains the old base view instead, writes into the
+    old run's output directory, and reports success.
+
+    The step check catches the other half of the same surprise: resuming a finished checkpoint
+    with the step count it finished at leaves `while step < steps` with nothing to do, so the run
+    exits after "End of training" having done zero optimizer steps and having produced nothing.
+
+    Deliberately not checked: job name and output directory. The launcher stamps a fresh timestamp
+    into every job name, so a legitimate resume of an interrupted run never matches, and refusing
+    on that would only make resume unusable for the one thing it is for.
+    """
+    config = json.loads(resume_config_path.read_text(encoding="utf-8"))
+    dataset = config.get("dataset") or {}
+    checkpoint_root = dataset.get("root")
+    checkpoint_repo_id = dataset.get("repo_id")
+
+    if not checkpoint_root and not checkpoint_repo_id:
+        raise ValueError(
+            f"{resume_config_path} names no dataset, so there is no way to tell whether resuming "
+            f"it would train {view_root}. Start a fresh run with --pretrained-path instead."
+        )
+
+    mismatch = ""
+    if checkpoint_root and Path(checkpoint_root).resolve() != view_root.resolve():
+        mismatch = f"dataset root {checkpoint_root}"
+    elif not checkpoint_root and checkpoint_repo_id != repo_id:
+        mismatch = f"repo id {checkpoint_repo_id}"
+    if mismatch:
+        raise ValueError(
+            f"--resume would not train {view_root}. The checkpoint config {resume_config_path} "
+            f"was written for {mismatch}, and a resumed run takes its dataset from that file, not "
+            "from --view-root. Resume only continues an interrupted run on its own dataset; to "
+            "train a different view starting from these weights, launch a fresh run with "
+            "--pretrained-path pointing at a base model."
+        )
+
+    episodes = dataset.get("episodes")
+    if episodes:
+        print(
+            f"[resume] checkpoint config restricts training to {len(episodes)} episode(s) of "
+            f"{checkpoint_root or checkpoint_repo_id}; --resume keeps that subset."
+        )
+
+    step_path = resume_config_path.parent.parent / "training_state" / "training_step.json"
+    if not steps_supplied or not step_path.is_file():
+        return
+    saved_step = int(json.loads(step_path.read_text(encoding="utf-8")).get("step") or 0)
+    if saved_step >= steps:
+        raise ValueError(
+            f"--resume would run zero steps: {step_path.parent.parent.name} is already at step "
+            f"{saved_step} and --steps is {steps}. Raise --steps past {saved_step} to keep "
+            "training this run, or start a fresh run to train something else."
+        )
+
+
 def feature_dim(feature: dict[str, Any]) -> int:
     shape = feature.get("shape")
     if not isinstance(shape, list) or len(shape) != 1:
@@ -2342,6 +2406,13 @@ def main() -> None:
     if args.resume:
         checkpoint = args.resume_checkpoint or (args.output_dir / "checkpoints" / "last")
         resume_config_path = resolve_resume_config_path(checkpoint)
+        assert_resume_trains_the_named_view(
+            resume_config_path,
+            view_root=view_root,
+            repo_id=args.repo_id,
+            steps=args.steps,
+            steps_supplied=steps_supplied,
+        )
         cmd = [
             sys.executable,
             "-m",

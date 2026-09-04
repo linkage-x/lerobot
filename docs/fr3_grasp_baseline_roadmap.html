@@ -85,6 +85,8 @@
       <span class="pill">S1 / S5 可并行</span>
       <span class="pill">RL：S7，触发判据见第九节</span>
       <span class="pill">S2 / S3 / S4 等落点图决策</span>
+      <span class="pill">多任务：S8，采集前的契约是 S8.1，见第十节</span>
+      <span class="pill">09-03 已测：<b>这个 ckpt 不读 prompt</b>（0.08–0.15× 噪声地板）</span>
     </div>
   </div>
 
@@ -131,6 +133,13 @@
           <td>需要落点图把视觉分辨率、yaw 与数据盲区分开</td>
         </tr>
         <tr>
+          <td>语言条件化</td>
+          <td><span class="badge warn">已测</span> <b>这个 checkpoint 不读 prompt</b></td>
+          <td>换掉整条指令，动作只动 0.044–0.084 mm/步；同 prompt 换流匹配噪声动 0.553 mm/步。
+            即 <b>0.08–0.15× 噪声地板</b>，16 帧里超过地板的有 0/16 与 1/16</td>
+          <td>只对 L4/030000 成立，且是 LoRA 的性质不是 pi0.5 的：它在 48 集<b>同一个</b> prompt 上微调</td>
+        </tr>
+        <tr>
           <td>坐标系/标定</td>
           <td><span class="badge done">已证伪</span> 没有漂移，也就没有一个常数在等着被修</td>
           <td>留档 demo 轨迹在真机原样重播，仍能复现抓取</td>
@@ -164,6 +173,11 @@
         <li><b><code>drz</code>：</b>R² 分母近零，H22/H40 差两个数量级；下一指标应是 chunk 累计 yaw 的绝对角度误差（度）。</li>
         <li><b>观测夹爪：</b><code>observation.state.gripper.pos</code> 有 47% 帧掉成 0；事件检测必须读取指令。</li>
         <li><b>S1 曲线：</b>005000–025000 尚未与 030000 连成 holdout 曲线，平台期未知。</li>
+        <li><b>采样噪声在真机上实现了多少：</b>S8.0 顺带量到，同一观测下换流匹配噪声，
+          50 步 chunk 的终点差 <b>9.4 mm</b>（yaw 0.42°）。这与第七节量到的闭合深度散布 8.4 mm 同量级。
+          但两者不可直接相比：9.4 mm 是整条 chunk 的三维终点发散，闭合深度是单轴单点，
+          而<b>其中多少会真的到达机械臂，取决于每个 chunk 执行多少步才重规划</b>——这次实验没有测这一项。
+          值得单独量一次，因为它指向的修法（推理步数 / 采样）与 DAgger 不是同一条路。</li>
       </ul>
     </div>
 
@@ -341,6 +355,25 @@
       </div>
 
       <div class="phase">
+        <div class="name">S8.0<br><span class="badge done">09-03 已测</span></div>
+        <div><b>prompt 消融：这个 checkpoint 不读 prompt。</b>换整条指令的动作变化是流匹配噪声地板的
+          <b>0.08–0.15×</b>（16 帧，逐帧配对下 0/16 与 1/16 超过地板）。推论坐实。
+          <code>tools/fr3/fr3_probe_prompt_sensitivity.py</code>，留档
+          <code>outputs/probe/prompt_sensitivity_L4_030000.json</code>。</div>
+        <div>这是 LoRA 的性质不是 pi0.5 的，修法是数据性质——而多任务本身就提供它。
+          <b>同一条实验也把第九节 R1 的"几乎免费"推翻了一半</b>，两条路线在此合流。见第十节。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">S8.1<br><span class="badge p0">采集第二任务之前</span></div>
+        <div><b>多任务的录制契约：第二个任务选什么、工作空间包络、prompt 写法、相机不许动。</b>
+          这四条在第一帧录下来之前是免费的，录完之后每一条都只能重录。
+          尤其是包络——两个任务共用一份 <code>q01/q99</code>，而 state 在 pi0.5 里只有这一条 256 档的通路，
+          第二任务的工作空间<b>就是</b>插孔任务的状态分辨率。</div>
+        <div>零代码、零机械臂时间，但它是一个<b>不可逆</b>的决定。见第十节。</div>
+      </div>
+
+      <div class="phase">
         <div class="name">S0.2<br><span class="badge done">08-31 完成</span></div>
         <div><b>固定协议 20 轮：0 成功。</b>加上上午会话的 2/9，合计 <b>2/29 ≈ 7%</b>。
           二元标签到此为止已经用尽——20 轮全是 <code>failure</code>，而它们其实断在三个完全不同的环节上。</div>
@@ -402,6 +435,17 @@
           触发判据不是日历，是一个可检验的量：<b>策略的散布已经收到 demo 的散布，而任务仍然失败。</b>
           现在策略闭合深度 sd 9 mm vs demo 3.5 mm——还没到。</div>
         <div>最便宜的一级（等级条件化 token）几乎免费，但需要 DAgger 先把正例补上。</div>
+      </div>
+
+      <div class="phase">
+        <div class="name">S8<br><span class="badge warn">排在 S6 之后</span></div>
+        <div><b>多任务训练：插孔 + 第二任务混一个 view，靠 prompt 区分。</b>
+          架构上成立（第十节四条已查证），动作归一化几乎免费，工具链只差 gateway 传
+          <code>--task-prompt-map</code>。<b>不排在前面的理由是归因</b>：混合一次动四个变量
+          （混合比、state 区间、camera crop、prompt 集合），而当前 n=10 撑不住任何一条的归因。</div>
+        <div>被低估的价值不是"一个模型做两件事"，而是让语言通路重新活起来——那是 R1/R2 的前置，
+          而 S8.0 已经量出它现在是死的。<b>自带成功判据</b>：训完把 S8.0 原样再跑一遍，
+          比值必须显著越过 1，否则混合只是把两个任务并成一个更宽的分布。</div>
       </div>
     </div>
 
@@ -1057,7 +1101,11 @@
         阶段评分把每一条 rollout 变成了一个<b>有序标量</b>——那正是 return 的定义。
         所以在这条路线上，"上 RL"的第一级不是一个遥远的大工程，只是训练时多喂一个 token。
         代价是一次重训，因此它排在"先不要改权重"这条约束之后。
-      </div>
+        <br><b>09-03 修正："几乎免费"只对写入端成立。</b>
+        S8.0 实测这个 checkpoint 读不到 prompt 里的条件（0.08–0.15× 噪声地板，见第十节），
+        而 <code>stage</code> token 正是要从那条通路进来。所以 R1 的成本不止一次重训，
+        还包含"先让条件真的能被读到"——而那要求训练集里那个条件<b>真的变化</b>，
+        与多任务面对的是同一个前提。这一段留在原处而不是删掉，是因为它被推翻的正是"免费"那半句。</div>
 
       <h3>为什么不能跳过 DAgger 直接做 R1</h3>
       <p>条件化 token 要学会"高等级长什么样"，前提是<b>高等级和低等级出现在同一片 state 分布里</b>。
@@ -1081,8 +1129,246 @@
       </div>
     </div>
 
+    <div class="card full">
+      <h2>十、多任务：让一个模型同时做两件事</h2>
+
+      <div class="callout p0">
+        <b>可行性成立，但杠杆不在训练，在采集之前的三个决定。</b>
+        架构上 pi0.5 本来就是语言条件化的，四个必要条件已经查证成立，工具链只差 gateway 传一个参数。
+        但 S8.0 实测这个 checkpoint <b>现在并不读 prompt</b>（0.08–0.15× 噪声地板）——
+        那是"48 集同一个 prompt"这个数据性质造成的，因此由多任务数据本身修复，而不是一处代码改动。
+        真正决定这件事是赚是赔的，是<b>第二个任务选什么、录在哪个工作空间里、prompt 怎么写</b>——
+        这三条在第一帧录下来之前是免费的，录完之后每一条都只能重录。
+        所以本节排在采集之前，而不是排在训练那一步。
+      </div>
+
+      <h3>已确认成立的四条</h3>
+      <div class="tablewrap">
+      <table>
+        <tr><th>条件</th><th>结论</th><th>证据</th></tr>
+        <tr>
+          <td>语言条件化通路存在</td>
+          <td><b>成立</b></td>
+          <td>pi0.5 的 prompt 是 <code>Task: {文本}, State: {256 档离散状态};\nAction: </code>
+            （<code>processor_pi05.py:79</code>）；前向是 prefix（图像+语言，冻结 PaliGemma）与
+            suffix（噪声动作+时间步，gemma_expert）的<b>联合注意力</b>
+            （<code>modeling_pi05.py:743-763</code>）</td>
+        </tr>
+        <tr>
+          <td>VLM 冻结不构成障碍</td>
+          <td><b>成立</b></td>
+          <td>语言 token 的 K/V 由冻结的 PaliGemma 给出，但它<b>随 prompt 而变</b>；
+            而 L4 的 LoRA 正则覆盖 <code>gemma_expert</code> 的 <code>q/k/v/o_proj</code>——
+            "怎么读语言 token"这条通路本身可训练。与第十一节"不给 LM / vision tower 加 LoRA"不冲突</td>
+        </tr>
+        <tr>
+          <td>数据契约可对齐</td>
+          <td><b>成立</b></td>
+          <td>view 构建器的三条规则（相机取交集、丢 <code>prev_cmd.*</code>、丢 <code>drx/dry</code>）
+            是按数据推导而非写死的：两个任务只要<b>录制契约相同</b>，就会自动落到同一个
+            8 维 state / 5 维 action</td>
+        </tr>
+        <tr>
+          <td>动作归一化可共享</td>
+          <td><b>成立</b><span class="small">（实测，用存量数据做代理）</span></td>
+          <td>拿盘上的 pick_and_place 当代理量：五个动作维的 std 变化
+            <code>dx −5.0% · dy −7.5% · dz +0.3% · drz −10.5% · gripper −0.0%</code>；
+            夹爪张开占比 55.2% vs 55.9%。<b>逐维权重 [1,1,1,0.2,2.0] 可原样保留</b></td>
+        </tr>
+        <tr>
+          <td>工具链</td>
+          <td><span class="badge warn">差一个参数</span></td>
+          <td><code>fr3_train_il_policy.py:2120</code> 已有 <code>--task-prompt-map</code>
+            （<code>{录制 prompt: 训练 prompt}</code>）；但 <code>gateway.py:4187</code> 只传
+            <code>--task-prompt</code>，它把每一集改写成<b>同一句</b>——对多任务恰好是最错的那个选项</td>
+        </tr>
+      </table>
+      </div>
+
+      <h3>唯一的定量代价：第二任务的工作空间就是插孔任务的状态分辨率</h3>
+
+      <p>在 pi0.5 里，机器人状态<b>只有一条</b>进入模型的通路：按 <code>q01/q99</code> 归一化到
+        <code>[-1,1]</code>，再离散成 <b>256 档</b>写进 prompt 文本。
+        <code>embed_suffix</code> 只接收动作和时间步，<code>state_proj</code> 在 pi0.5 中明确不存在
+        （<code>modeling_pi05.py:1126</code> 直接跳过这个权重）。
+        所以混合数据把 <code>q01–q99</code> 区间撑开多少，插孔任务的状态分辨率就粗多少。</p>
+
+      <p class="small">下表是拿盘上的 pick_and_place 当代理量出来的——它不是要采的那个任务，
+        但它说明这个机制的量级是"倍"，不是"百分之几"：</p>
+
+      <div class="tablewrap">
+      <table>
+        <tr><th>维度</th><th>插孔单任务跨度</th><th>混合后跨度</th><th>撑开</th><th>单任务 mm/档</th><th>混合后 mm/档</th></tr>
+        <tr><td class="mono">ee.x</td><td>209.6 mm</td><td>491.2 mm</td><td class="num"><b>2.34×</b></td><td>0.82</td><td><b>1.92</b></td></tr>
+        <tr><td class="mono">ee.z</td><td>351.5 mm</td><td>537.9 mm</td><td class="num">1.53×</td><td>1.37</td><td><b>2.10</b></td></tr>
+        <tr><td class="mono">ee.y</td><td>287.5 mm</td><td>339.6 mm</td><td class="num">1.18×</td><td>1.12</td><td>1.33</td></tr>
+      </table>
+      </div>
+
+      <div class="callout warn">
+        <b>这个代价正好落在当前唯一的瓶颈上。</b>
+        第七节量到的策略闭合深度散布是 8.4 mm，第六节盯的是"末端几毫米"，
+        而 x 轴的状态分辨率会从 0.82 mm/档 变成 1.92 mm/档。
+        <br>但反过来说，因为第二任务的数据<b>还没有录</b>，这个代价是可以<b>提前定价</b>的：
+        工作空间包络录成什么样，这张表就长成什么样。录完再发现，只能重录。
+      </div>
+
+      <h3>因此采集之前必须定下三件事（S8.1）</h3>
+
+      <ol>
+        <li><b>第二个任务选什么。</b>见下一小节——这一条决定多任务是赚是赔。</li>
+        <li><b>工作空间包络，一次定死。</b>两个任务共用一份 <code>q01/q99</code>，所以包络是一个
+          <b>全局决定</b>，不是每个任务各自的属性。要么把第二任务约束进插孔现有的包络
+          （分辨率不变，但放弃覆盖增益），要么<b>有意识地</b>扩到一个选定的边界，
+          并且此后插孔任务自己的新数据也录在同一个包络里。
+          最坏的做法是让它"录成什么样就是什么样"。
+          <br><span class="small">围栏同理：<code>workspace_fence.py</code> 从记录配置读
+            <code>workspace_min/max</code>，一份围栏要同时容下两个任务——这一条第七节末尾已经写过，
+            这里只是多了一个任务。</span></li>
+        <li><b>prompt 在录制时就写对。</b>两个任务的指令必须在词面上就分得开，
+          而且要是<b>真正描述动作和对象的句子</b>——冻结的 PaliGemma 是靠词义把它们分开的，
+          <code>"Pick and Place"</code> 这种标签式短语给不了多少可分性。
+          <br>盘上现成的反例：pick_and_place 的 view 里有 <code>"Pick and Place"</code> 和
+          <code>"Pick and place"</code> 两个 <code>task_index</code>，同一个任务两条目。</li>
+      </ol>
+
+      <h3>为什么第二个任务应当与瓶颈同构</h3>
+
+      <p><b>第一性原理：多任务的收益来自两个任务共享的那部分结构被<i>两批数据同时约束</i>，
+        代价则由不共享的那部分承担。</b>所以问题不是"再加一个任务好不好"，
+        而是"新任务在<b>正在失败的那一级</b>上提供不提供约束"。</p>
+
+      <p>现在的漏斗停在 <code>stage 4→5</code>：7/10 夹住并搬到孔上方，然后销从头到尾没碰到孔。
+        据此分两类：</p>
+
+      <div class="tablewrap">
+      <table>
+        <tr><th>第二任务类型</th><th>对 stage 4→5 的约束</th><th>要付的分辨率代价</th><th>净值</th></tr>
+        <tr>
+          <td>松容差搬运（把物体放进一个大框、堆叠、清台面）</td>
+          <td><b>零帧</b>。它的最后一级本来就没有毫米级对准</td>
+          <td>照付，而且这类任务的工作空间通常更大</td>
+          <td><b>纯成本</b></td>
+        </tr>
+        <tr>
+          <td>另一个<b>插入类</b>任务（不同孔位 / 不同朝向 / 不同直径 / 插头入插座 / 盖子对口）</td>
+          <td>每一帧都落在同一个约束结构上，而具体几何不同</td>
+          <td>可以录进同一个包络，代价接近零</td>
+          <td><b>正</b></td>
+        </tr>
+      </table>
+      </div>
+
+      <div class="callout ok">
+        <b>为什么"同一个约束、不同几何"恰好是这里最需要的数据。</b>
+        第一节已经确认环带内泛化成立，但边界写的是"<b>只证明角度内插</b>"——
+        模型确实在按视觉找本次物体，却只在一个孔上被约束过。
+        单孔数据里，"对准这个孔"和"走到 (359, −133)"是同一件事，训练无法把两者分开。
+        第二个孔把这两件事拆开，于是"对准"只能被学成<b>观测的函数</b>。
+        这既是失败那一级的定向数据，也是第一节那条结论最便宜的外推检验。
+      </div>
+
+      <div class="callout warn">
+        <b>一句话判据：多任务的价值完全取决于第二个任务是否与瓶颈同构。选错了，它是纯成本。</b>
+        这也意味着"先随便采一个任务把多任务链路跑通"是个坏主意——
+        链路可以用<b>已有</b>的 pick_and_place 存量数据跑通（它正是为此才有价值），
+        真正要采的那个任务应当按上面的判据挑。
+      </div>
+
+      <h3>已测：这个 checkpoint 不读 prompt（S8.0，09-03）</h3>
+
+      <p>L4/L5 的 48 集训练数据<b>全部是同一个 prompt</b>。常量输入不产生区分性梯度，
+        attention 对它的那份权重可以被并进偏置——所以推论是 LoRA 已经学会忽略 prompt。
+        <code>tools/fr3/fr3_probe_prompt_sensitivity.py</code> 把这条推论变成了实测。</p>
+
+      <p>做法是在留档帧上做<b>配对消融</b>：同一帧、同一状态，每次只改一样东西——
+        换 prompt（同噪声种子）得到 prompt 效应，换噪声种子（同 prompt）得到<b>噪声地板</b>，
+        取下一个采样帧得到"一次真实观测变化"的上参照。
+        比较对象必须是噪声地板而不是零：pi0.5 是流匹配策略，从噪声积分出动作，
+        同一个 prompt 跑两次本来就不一样，否则任何非零差值都会被读成"它听懂了"。</p>
+
+      <div class="tablewrap">
+      <table>
+        <tr><th>条件（16 帧，holdout ep 22/40，L4/030000）</th><th>每步差</th><th>50 步 chunk 终点差</th><th>yaw</th><th>相对噪声地板</th></tr>
+        <tr>
+          <td><b>噪声地板</b>：同 prompt，换流匹配噪声</td>
+          <td class="num">0.553 mm</td><td class="num">9.40 mm</td><td class="num">0.42°</td><td class="num">1.00×</td>
+        </tr>
+        <tr>
+          <td>换成 <code>"Pick up the cube and place it in the box"</code></td>
+          <td class="num">0.044 mm</td><td class="num">1.67 mm</td><td class="num">0.016°</td><td class="num"><b>0.08×</b></td>
+        </tr>
+        <tr>
+          <td>换成 <code>"Wipe the table with the sponge"</code>（这台机器从没做过）</td>
+          <td class="num">0.084 mm</td><td class="num">2.61 mm</td><td class="num">0.029°</td><td class="num"><b>0.15×</b></td>
+        </tr>
+        <tr>
+          <td><span class="small">上参照：相邻采样帧（一次真实观测变化）</span></td>
+          <td class="num">1.666 mm</td><td>—</td><td>—</td><td class="num">3.01×</td>
+        </tr>
+      </table>
+      </div>
+
+      <div class="callout warn">
+        <b>结论：语言通路是死的，而且不是"弱"，是低于噪声地板一个数量级。</b>
+        把整条任务指令换成一件这台机器从未做过的事，动作的变化只有重新掷一次噪声的
+        0.15 倍；逐帧配对下，prompt 效应超过噪声地板的帧是 <b>0/16</b> 和 <b>1/16</b>。
+        <br>方向倒是对的——完全离域的"擦桌子"比同域的"把方块放进盒子"多动约 2 倍，
+        说明残留的敏感度存在且排序正确。但在这台机器上，<b>prompt 目前不是一个控制输入</b>。
+        <br><span class="small">留档：<code>outputs/probe/prompt_sensitivity_L4_030000.json</code>。
+        证据边界——只测了 L4/030000 一个 checkpoint、16 帧、两条替代指令。</span>
+      </div>
+
+      <div class="callout ok">
+        <b>好消息是这是 LoRA 的性质，不是 pi0.5 的。</b>
+        基座模型当然读 prompt——它就是为此预训练的。把它读没的是"48 集同一个 prompt"这个<b>数据性质</b>，
+        而不是架构或 LoRA 覆盖面。所以修法也是数据性质：<b>训练集里必须真的存在 prompt 变化</b>——
+        而这正是多任务训练本身提供的东西。
+        <br>于是 S8 自带一个<b>零成本的成功判据</b>：多任务训完之后，把这个脚本原样再跑一遍。
+        比值必须显著越过 1；如果训完还是 0.1×，那说明混合数据没有真的在教条件化，
+        模型只是把两个任务并成了一个更宽的分布——那时无论成功率是多少，都不能叫"多任务成功"。
+      </div>
+
+      <div class="callout warn">
+        <b>对第九节 R1 的直接后果。</b>R1 是把 <code>stage</code> 序数当条件 token 送进策略。
+        这次测的正是"送进 prompt 的条件能不能被读到"，而答案是现在读不到。
+        所以 R1 不是"训练时多喂一个 token"就能生效的——它和多任务面对的是同一个前提，
+        且要靠同一件事解决：训练集里那个条件必须真的变化。
+        <b>这两条路线在此合流，第九节把 R1 说成"几乎免费"这一句需要按此重读。</b>
+      </div>
+
+      <div class="callout p0">
+        <b>顺带量到的一条，不属于本节但值得记下来：噪声地板本身是 9.4 mm。</b>
+        同一观测、同一 prompt，只换流匹配噪声，50 步 chunk 的终点就差 9.4 mm——
+        与第七节的闭合深度散布 8.4 mm 同量级。
+        <b>两者不能直接相比</b>：一个是整条 chunk 的三维终点发散，一个是单轴单点；
+        而其中多少会真的到达机械臂，取决于每个 chunk 执行多少步才重规划，本次实验没有测这一项。
+        但它足以让"散布全部来自数据分布"这条归因不再是唯一候选，已记入第三节待测。
+      </div>
+
+      <h3>为什么排在 S6 之后</h3>
+
+      <p>混合训练一次要动<b>四个变量</b>：数据混合比、state 归一化区间、camera crop、prompt 集合。
+        而本页的硬规则是"一次只动一个变量"，当前成功率是 <code>1/10</code>（n=10）——
+        混合之后，插孔成功率的任何变化都无法归因到其中任何一个。</p>
+
+      <p>crop 尤其要注意：两个任务的数据合成一个 view，只能有<b>一套</b> crop。
+        改插孔现在这一套（ee <code>542×286</code> / side <code>444×382</code>），
+        030000 这个回退锚点就失去视觉可比性；而 S2「腕部 crop 改接近 1:1」本来就被列为
+        <b>要单独试的那个变量</b>。<b>推论是一条录制约束：两个任务的数据之间不要动相机。</b>
+        crop 是在 480×640 原始帧上后期裁的，能不能共用一套，取决于相机位姿有没有变过。</p>
+
+      <div class="callout p0">
+        <b>优先级结论：S8.0 立即可并行（零成本）；S8.1 在采集第二任务数据<i>之前</i>；
+          S8 训练本身排在 S6 之后。</b>
+        多任务被低估的价值不是"一个模型做两件事"，而是<b>让语言通路重新活起来</b>——
+        那是 R1/R2 的前置条件，也是这条路线上唯一能把模型从"一个插孔专家"变成"可指令策略"的改动。
+        但它的收益要靠第二个任务选得对才拿得到，而那个选择现在还免费。
+      </div>
+    </div>
+
     <div class="card">
-      <h2>十、当前不要重开的方向</h2>
+      <h2>十一、当前不要重开的方向</h2>
       <ul>
         <li>不给 language model / vision tower 加 LoRA：信息已完好到达 KV cache。</li>
         <li>不靠提高 <code>num_inference_steps</code> 缩散布：它只改变 ODE 积分精度。</li>
@@ -1094,11 +1380,17 @@
           +10 mm 只是把分布整体抬高，sd 9 mm 不变，低尾照样闭合过浅。按 (b) 走 DAgger。</li>
         <li><b>不要现在上 RL。</b>策略的散布还是示教的 2.6 倍，缺的是模仿不是超越示教；
           且自动回报尚不存在，见第九节。</li>
+        <li><b>不要为了"把多任务链路跑通"去采一个新任务。</b>链路可以用盘上已有的
+          pick_and_place 存量数据跑通；要采的那个任务应当按"与瓶颈同构"来挑，而不是按"好采"来挑。见第十节。</li>
+        <li><b>不要用 <code>--task-prompt</code> 建多任务 view。</b>它把每一集改写成同一句，
+          正好抹掉多任务唯一的区分信号。多任务要走 <code>--task-prompt-map</code>。</li>
+        <li><b>两个任务的数据之间不要动相机。</b>一个 view 只能有一套 crop；
+          相机位姿变过，就没有一套 crop 能同时服务两个任务，而 crop 是 S2 要单独试的那个变量。</li>
       </ul>
     </div>
 
     <div class="card">
-      <h2>十一、文档边界</h2>
+      <h2>十二、文档边界</h2>
       <p>本页只回答三个问题：</p>
       <ol>
         <li>现在已经知道什么；</li>

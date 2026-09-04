@@ -1,9 +1,17 @@
 import { describe, expect, it } from "vitest";
-import type { RecordedDataset } from "../types";
+import type { RecordedDataset, TrainingView } from "../types";
 import {
+  cropRectsFromSpecs,
+  cropSelectionFingerprint,
+  cropSourceFingerprint,
+  cropSourcesMatch,
   cropSpecsForSelection,
+  cropsAreFullFrame,
+  fullFrameCropsForFeatures,
   groupDatasetsByTask,
+  selectionCameraDimensionsProblem,
   selectionFpsProblem,
+  suggestedCropViewForSelection,
   summarizeSelection,
   taskBaseName,
   trainingViewName,
@@ -19,6 +27,29 @@ function dataset(overrides: Partial<RecordedDataset> & { name: string }): Record
     updatedAt: "",
     ...overrides
   } as RecordedDataset;
+}
+
+function trainingView(overrides: Partial<TrainingView> & { name: string }): TrainingView {
+  const { name, ...rest } = overrides;
+  return {
+    name,
+    root: `/views/${name}`,
+    repoId: `local/${name}`,
+    episodes: 0,
+    frames: 0,
+    fps: 30,
+    actionMode: "delta_ee_from_prev_cmd",
+    cameras: [],
+    sourceFps: {},
+    frameStride: {},
+    cameraCrops: {},
+    sourceRoots: [],
+    excludedEpisodes: {},
+    buildId: "",
+    sourceDigest: "",
+    modifiedAt: "",
+    ...rest
+  };
 }
 
 const sideCam = { key: "observation.images.side", width: 640, height: 480 };
@@ -159,6 +190,94 @@ describe("summarizeSelection", () => {
       30
     );
     expect(summary).toMatchObject({ datasets: 2, episodes: 3, frames: 1600 });
+  });
+});
+
+describe("crop source fingerprints", () => {
+  it("matches only the same dataset path and camera dimensions", () => {
+    const first = cropSourceFingerprint(
+      dataset({ name: "a_20260101_000000", cameraFeatures: [sideCam] })
+    );
+    const same = cropSourceFingerprint(
+      dataset({ name: "a_20260101_000000", cameraFeatures: [sideCam] })
+    );
+    const differentSource = cropSourceFingerprint(
+      dataset({ name: "b_20260101_000000", cameraFeatures: [sideCam] })
+    );
+    const differentShape = cropSourceFingerprint(
+      dataset({
+        name: "a_20260101_000000",
+        cameraFeatures: [{ key: "observation.images.side", width: 320, height: 240 }]
+      })
+    );
+
+    expect(cropSourcesMatch(first, same)).toBe(true);
+    expect(cropSourcesMatch(first, differentSource)).toBe(false);
+    expect(cropSourcesMatch(first, differentShape)).toBe(false);
+  });
+
+  it("keeps one fingerprint for the selected build sources regardless of preview order", () => {
+    const first = dataset({ name: "a_20260101_000000", cameraFeatures: [sideCam] });
+    const second = dataset({ name: "b_20260101_000000", cameraFeatures: [sideCam] });
+
+    expect(cropSourcesMatch(cropSelectionFingerprint([first, second]), cropSelectionFingerprint([second, first]))).toBe(
+      true
+    );
+    expect(cropSourcesMatch(cropSelectionFingerprint([first, second]), cropSourceFingerprint(first))).toBe(false);
+  });
+
+  it("builds full-frame crop boxes for the current source dimensions", () => {
+    expect(fullFrameCropsForFeatures([sideCam])).toEqual({
+      "observation.images.side": { x: 0, y: 0, w: 640, h: 480 }
+    });
+  });
+
+  it("restores crop rectangles from a built view manifest", () => {
+    expect(cropRectsFromSpecs({ "observation.images.side": [58, 194, 542, 286] })).toEqual({
+      "observation.images.side": { x: 58, y: 194, w: 542, h: 286 }
+    });
+  });
+
+  it("detects whether the current crop state is only full-frame", () => {
+    expect(cropsAreFullFrame({ "observation.images.side": { x: 0, y: 0, w: 640, h: 480 } }, [sideCam])).toBe(true);
+    expect(cropsAreFullFrame({ "observation.images.side": { x: 58, y: 194, w: 542, h: 286 } }, [sideCam])).toBe(false);
+  });
+
+  it("suggests a compatible built view crop by selected source root", () => {
+    const source = dataset({ name: "insert_20260821_170816", cameraFeatures: [sideCam] });
+    const view = trainingView({
+      name: "insert__delta_ee_from_prev_cmd",
+      cameraCrops: { "observation.images.side": [58, 194, 542, 286] },
+      sourceRoots: [source.path]
+    });
+
+    expect(suggestedCropViewForSelection([view], [source], "delta_ee_from_prev_cmd"))?.toBe(view);
+  });
+
+  it("does not suggest a crop view when that crop cannot fit every selected source", () => {
+    const raw = dataset({ name: "insert_20260821_170816", cameraFeatures: [sideCam] });
+    const policyReady = dataset({
+      name: "dagger_L4_full48_holdout22_40_030000",
+      cameraFeatures: [{ key: "observation.images.side", width: 444, height: 382 }]
+    });
+    const view = trainingView({
+      name: "insert__delta_ee_from_prev_cmd",
+      cameraCrops: { "observation.images.side": [58, 194, 542, 286] },
+      sourceRoots: [raw.path]
+    });
+
+    expect(suggestedCropViewForSelection([view], [raw, policyReady], "delta_ee_from_prev_cmd")).toBeNull();
+  });
+
+  it("reports same-key camera dimensions mixed across selected sources", () => {
+    const raw = dataset({ name: "insert_20260821_170816", cameraFeatures: [sideCam] });
+    const policyReady = dataset({
+      name: "dagger_L4_full48_holdout22_40_030000",
+      cameraFeatures: [{ key: "observation.images.side", width: 444, height: 382 }]
+    });
+
+    expect(selectionCameraDimensionsProblem([raw, policyReady])).toContain("mixed source sizes");
+    expect(selectionCameraDimensionsProblem([raw])).toBe("");
   });
 });
 

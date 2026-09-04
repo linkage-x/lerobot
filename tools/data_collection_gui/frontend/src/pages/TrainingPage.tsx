@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../apiClient";
 import type {
+  Checkpoint,
   DependencyInstall,
   TrainingHistoryEntry,
   TrainingHost,
@@ -159,6 +160,9 @@ function describeHistoryEntry(entry: TrainingHistoryEntry): string {
       parts.push(`loss w ${separated.actionLossWeights.join("/")}`);
     }
   }
+  if (p.resumeTraining && p.resumeCheckpoint) {
+    parts.push(`resume ${p.resumeCheckpoint.split("/").slice(-3).join("/")}`);
+  }
   if (entry.viewName) parts.push(entry.viewName);
   return parts.join(" · ");
 }
@@ -205,7 +209,12 @@ export function TrainingPage() {
   // never reads use_amp -- it wraps the step in `accelerator.autocast()` and builds its
   // Accelerator without `mixed_precision=`, so the run is fp32 unless accelerate is configured
   // separately. Two checkpoints would have looked like they differed in numeric precision when
-  // they did not. See the note under the box.
+  // they did not.
+  //
+  // Training ignoring it is not the whole story, though, and the hint under the box says so:
+  // `fr3_act_infer_real_runtime.py` gates `torch.autocast` on `policy.config.use_amp`, so this
+  // box silently decides how the checkpoint is *evaluated*. The gateway runs
+  // `fr3_align_checkpoint_use_amp` before each rollout so that stays comparable across runs.
   const [useAmp, setUseAmp] = useState(false);
   const [policyConfig, setPolicyConfig] = useState("");
   const [policyConfigEdited, setPolicyConfigEdited] = useState(false);
@@ -214,6 +223,9 @@ export function TrainingPage() {
   ]);
 
   const [pretrainedPath, setPretrainedPath] = useState("");
+  const [resumeTraining, setResumeTraining] = useState(false);
+  const [resumeCheckpoint, setResumeCheckpoint] = useState("");
+  const [resumeCheckpointId, setResumeCheckpointId] = useState("");
   // Whether the operator has typed their own base checkpoint. Until they do, it tracks the
   // policy -- leaving pi0.5's base sitting in the field after switching to ACT would send
   // lerobot_train looking for pi0.5 weights to load into a ResNet.
@@ -223,7 +235,10 @@ export function TrainingPage() {
   const [loraAlpha, setLoraAlpha] = useState("");
   const [loraTargetModules, setLoraTargetModules] = useState("");
 
-  const [wandbEnabled, setWandbEnabled] = useState(false);
+  // On by default: a run nobody can plot afterwards is a run that has to be repeated to be
+  // compared, and these are hours long. See `wandbWillLog` for why the raw flag is not what
+  // gets sent.
+  const [wandbEnabled, setWandbEnabled] = useState(true);
   const [wandbProject, setWandbProject] = useState("lerobot");
   const [wandbEntity, setWandbEntity] = useState("");
   const [wandbKeyInput, setWandbKeyInput] = useState("");
@@ -265,6 +280,13 @@ export function TrainingPage() {
     [policy, loraTargetModules]
   );
   const isRunning = run !== null && RUNNING_STATES.has(run.state);
+  // What the launch actually asks for. The gateway refuses a run with W&B on and no API key
+  // stored for the machine, and the checkbox below is disabled in exactly that case -- so a bare
+  // `wandbEnabled` default of true would refuse every launch on a keyless machine with no way to
+  // turn it off from the page. Storing a key flips logging on by itself, which is the default
+  // this expresses.
+  const wandbWillLog = wandbEnabled && Boolean(wandb?.configured);
+
   const policySupport = machine?.policies?.[policy];
   const loraSupport = machine?.features?.lora;
   const isFinetunePolicy = FINETUNE_POLICIES.has(policy);
@@ -469,21 +491,28 @@ export function TrainingPage() {
   };
 
   const onStart = async () => {
-    if (actionLossWeightsApply && parsedActionLossWeights.error) {
+    if (resumeTraining && !resumeCheckpoint.trim()) {
       setNotice("");
-      setError(parsedActionLossWeights.error);
+      setError("Pick a checkpoint to resume from, for example outputs/train/<job>/checkpoints/030000.");
       return;
     }
-    let resolvedPolicyConfig: string;
-    try {
-      resolvedPolicyConfig = withActionLossWeights(
-        policyConfig,
-        actionLossWeightsApply ? (parsedActionLossWeights.weights ?? []) : null
-      );
-    } catch (configError) {
-      setNotice("");
-      setError(configError instanceof Error ? configError.message : String(configError));
-      return;
+    let resolvedPolicyConfig = "";
+    if (!resumeTraining) {
+      if (actionLossWeightsApply && parsedActionLossWeights.error) {
+        setNotice("");
+        setError(parsedActionLossWeights.error);
+        return;
+      }
+      try {
+        resolvedPolicyConfig = withActionLossWeights(
+          policyConfig,
+          actionLossWeightsApply ? (parsedActionLossWeights.weights ?? []) : null
+        );
+      } catch (configError) {
+        setNotice("");
+        setError(configError instanceof Error ? configError.message : String(configError));
+        return;
+      }
     }
     const result = await wrap("Start training", () =>
       api.startTraining({
@@ -497,14 +526,16 @@ export function TrainingPage() {
         saveFreq: Number(saveFreq) || 5000,
         logFreq: Number(logFreq) || 100,
         device: "auto",
-        useAmp,
+        useAmp: resumeTraining ? false : useAmp,
         policyConfig: resolvedPolicyConfig,
-        pretrainedPath: pretrainedPath.trim(),
-        loraEnabled,
+        pretrainedPath: resumeTraining ? "" : pretrainedPath.trim(),
+        resumeTraining,
+        resumeCheckpoint: resumeTraining ? resumeCheckpoint.trim() : "",
+        loraEnabled: resumeTraining ? false : loraEnabled,
         loraR: Number(loraR) || 16,
-        loraAlpha: Number(loraAlpha) || 0,
-        loraTargetModules,
-        wandbEnabled,
+        loraAlpha: resumeTraining ? 0 : Number(loraAlpha) || 0,
+        loraTargetModules: resumeTraining ? "" : loraTargetModules,
+        wandbEnabled: wandbWillLog,
         wandbProject,
         wandbEntity
       })
@@ -567,6 +598,11 @@ export function TrainingPage() {
       setPretrainedPath(p.pretrainedPath);
       setPretrainedPathEdited(p.pretrainedPath.trim() !== "");
     }
+    if (p.resumeTraining !== undefined) setResumeTraining(p.resumeTraining);
+    if (p.resumeCheckpoint !== undefined) {
+      setResumeCheckpoint(p.resumeCheckpoint);
+      setResumeCheckpointId("");
+    }
     if (p.loraEnabled !== undefined) setLoraEnabled(p.loraEnabled);
     if (p.loraR !== undefined) setLoraR(String(p.loraR));
     if (p.loraAlpha !== undefined) setLoraAlpha(p.loraAlpha ? String(p.loraAlpha) : "");
@@ -594,13 +630,19 @@ export function TrainingPage() {
     if (result.ok) setNotice("Stop signal sent.");
   };
 
+  const onResumeCheckpointSelect = (checkpoint: Checkpoint | null) => {
+    setResumeCheckpointId(checkpoint?.id ?? "");
+    setResumeCheckpoint(checkpoint?.path ?? "");
+  };
+
   const startDisabled =
     busy ||
     isRunning ||
     !viewName ||
     !jobName ||
     (selectedView?.episodes ?? 0) < 1 ||
-    (actionLossWeightsApply && Boolean(parsedActionLossWeights.error));
+    (resumeTraining && !resumeCheckpoint.trim()) ||
+    (!resumeTraining && actionLossWeightsApply && Boolean(parsedActionLossWeights.error));
 
   return (
     <div className="page">
@@ -812,13 +854,13 @@ export function TrainingPage() {
         <label className="field-inline">
           <input
             type="checkbox"
-            checked={wandbEnabled}
+            checked={wandbWillLog}
             onChange={(event) => setWandbEnabled(event.target.checked)}
             disabled={!wandb?.configured || isRunning}
           />
           <span>Log this run to W&amp;B</span>
         </label>
-        {wandbEnabled && (
+        {wandbWillLog && (
           <div className="field-row">
             <label className="field">
               <span>Project</span>
@@ -996,6 +1038,44 @@ export function TrainingPage() {
           </label>
         </div>
 
+        <label className="field-inline">
+          <input
+            type="checkbox"
+            checked={resumeTraining}
+            onChange={(event) => setResumeTraining(event.target.checked)}
+            disabled={isRunning}
+          />
+          <span>Resume optimizer/trainer state from a checkpoint</span>
+        </label>
+        {resumeTraining && (
+          <div className="subcard">
+            <label className="field">
+              <span>Resume checkpoint</span>
+              <input
+                value={resumeCheckpoint}
+                onChange={(event) => {
+                  setResumeCheckpoint(event.target.value);
+                  setResumeCheckpointId("");
+                }}
+                placeholder="outputs/train/<job>/checkpoints/030000"
+                disabled={isRunning}
+              />
+            </label>
+            <p className="hint">
+              Resume uses the checkpoint&apos;s saved <code>train_config.json</code> and optimizer
+              state. The path must be visible on the selected Training machine. The controls below
+              for base checkpoint, LoRA, AMP, and policy JSON are ignored; use Steps/Batch/Frequency
+              above for the overrides the resume path supports.
+            </p>
+            <CheckpointBrowser
+              mode="picker"
+              selectedId={resumeCheckpointId}
+              onSelect={onResumeCheckpointSelect}
+              disabled={isRunning}
+            />
+          </div>
+        )}
+
         <div className="field-row">
           <label className="field">
             <span>Base checkpoint (optional)</span>
@@ -1006,7 +1086,7 @@ export function TrainingPage() {
                 setPretrainedPath(event.target.value);
               }}
               placeholder="lerobot/pi05_base, or a local checkpoint directory"
-              disabled={isRunning}
+              disabled={isRunning || resumeTraining}
             />
           </label>
           <label className="field-inline">
@@ -1014,12 +1094,12 @@ export function TrainingPage() {
               type="checkbox"
               checked={loraEnabled}
               onChange={(event) => setLoraEnabled(event.target.checked)}
-              disabled={isRunning || !pretrainedPath.trim() || loraSupport?.available === false}
+              disabled={isRunning || resumeTraining || !pretrainedPath.trim() || loraSupport?.available === false}
             />
             <span>LoRA (freeze the base, train an adapter)</span>
           </label>
         </div>
-        {loraEnabled && (
+        {loraEnabled && !resumeTraining && (
           <>
             <div className="field-row">
               <label className="field">
@@ -1130,7 +1210,7 @@ export function TrainingPage() {
               setPolicyConfig(event.target.value);
             }}
             placeholder='{"chunk_size": 50, "optimizer_lr": 2.5e-5}'
-            disabled={isRunning}
+            disabled={isRunning || resumeTraining}
           />
         </label>
         <p className="hint">
@@ -1203,15 +1283,21 @@ export function TrainingPage() {
             type="checkbox"
             checked={useAmp}
             onChange={(event) => setUseAmp(event.target.checked)}
-            disabled={isRunning}
+            disabled={isRunning || resumeTraining}
           />
           <span>Mixed precision (AMP)</span>
         </label>
         <p className="hint">
-          Recorded into the checkpoint&apos;s config, but not acted on:{" "}
-          <code>lerobot_train.py</code> leaves precision to Accelerate and never passes it{" "}
-          <code>mixed_precision</code>, so training runs fp32 either way. Ticking this changes what
-          the run says about itself, not what it does.
+          Not acted on while training: <code>lerobot_train.py</code> leaves precision to Accelerate
+          and never passes it <code>mixed_precision</code>, so the run is fp32 either way. Ticking
+          this changes what the run says about itself, not what it does.
+        </p>
+        <p className="hint">
+          It is acted on at rollout. The runtime wraps inference in <code>torch.autocast</code>{" "}
+          only when the checkpoint records this as on, so two identically trained checkpoints that
+          disagree here are evaluated on different inference paths. The gateway aligns the recorded
+          value before starting a rollout &mdash; see <code>fr3_align_checkpoint_use_amp.py</code>{" "}
+          &mdash; so this box does not quietly decide how a policy is graded.
         </p>
 
         <div className="row-actions">

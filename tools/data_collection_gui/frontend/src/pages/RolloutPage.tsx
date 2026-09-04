@@ -625,7 +625,9 @@ export function RolloutPage() {
               {run.daggerDatasetPath ? (
                 <p className="hint">
                   Corrections: <code>{run.daggerDatasetPath}</code>
-                  {run.daggerEpisodes ? ` — ${run.daggerEpisodes} episode(s) so far` : ""}
+                  {run.daggerEpisodes ? ` — ${run.daggerEpisodes} episode(s) so far` : ""}. Stop
+                  the rollout before QC or training so the dataset writer can finalize the last
+                  parquet file.
                 </p>
               ) : (
                 <p className="hint warn">

@@ -38,6 +38,7 @@ from tools.data_collection_gui import rollout as rollout_backend
 from tools.data_collection_gui import table_plane
 from tools.data_collection_gui import task_ladders
 from tools.data_collection_gui import training as training_backend
+from tools.fr3 import fr3_align_checkpoint_use_amp as use_amp_alignment
 from tools.fr3.scene_reset import (
     SceneResetError,
     parse_mask_strokes,
@@ -52,6 +53,8 @@ DEFAULT_RECORDER_SCRIPT = Path("tools/handheld/handheld_record.py")
 # Gateway-driven FR3 SpaceMouse recorder. Handles both the hardware arm and its MuJoCo twin
 # behind one `--backend` switch, so both produce byte-identical dataset schemas.
 WORKSTATION_RECORDER_SCRIPT = Path("tools/fr3/fr3_gui_record_runtime.py")
+POLICY_READY_MERGE_SCRIPT = Path("tools/fr3/fr3_merge_policy_ready_datasets.py")
+POLICY_READY_DAGGER_MERGE_TARGET = "policy_ready_dagger"
 RECORD_BACKENDS = ("real", "sim")
 DEFAULT_RECORD_BACKEND = "real"
 # Action contracts the workstation Training View page can build. Recording always stores
@@ -4216,6 +4219,296 @@ def _training_views_root(state: GatewayState) -> Path:
     return _task_exports_root(state) / TRAINING_VIEWS_DIR_NAME
 
 
+def _host_training_views_root(state: GatewayState, host: training_backend.TrainingHost) -> str:
+    if host.kind == "remote":
+        return f"{host.repoDir}/outputs/exports/{TRAINING_VIEWS_DIR_NAME}"
+    return str(_training_views_root(state))
+
+
+def _strip_matching_remote_prefix(host: training_backend.TrainingHost, value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    match = re.match(r"^([A-Za-z0-9._-]+@[A-Za-z0-9._-]+):(/.+)$", raw)
+    if not match:
+        return raw
+    target, path = match.groups()
+    if host.kind != "remote" or target != host.sshTarget:
+        raise ValueError(
+            f"Remote path {raw!r} belongs to {target}, but the selected merge host is {host.label}."
+        )
+    return path
+
+
+def _map_path_for_merge_host(
+    state: GatewayState,
+    host: training_backend.TrainingHost,
+    value: str,
+    *,
+    default_relative_to_repo: bool = True,
+) -> str:
+    path_value = _strip_matching_remote_prefix(host, value)
+    if not path_value:
+        return ""
+    path = Path(path_value)
+    if host.kind == "remote":
+        if path.is_absolute():
+            try:
+                relative = path.relative_to(state.repo_root)
+            except ValueError:
+                return str(path)
+            return f"{host.repoDir}/{relative.as_posix()}"
+        return f"{host.repoDir}/{path.as_posix()}" if default_relative_to_repo else path.as_posix()
+    return str(path if path.is_absolute() else state.repo_root / path)
+
+
+def _resolve_merge_base_view(
+    state: GatewayState, host: training_backend.TrainingHost, raw_value: str
+) -> str:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        raise ValueError("baseView is required.")
+    raw = _strip_matching_remote_prefix(host, raw)
+    if "/" not in raw and raw in {entry["name"] for entry in _training_view_entries(state)}:
+        if host.kind == "remote":
+            return f"{_host_training_views_root(state, host)}/{raw}"
+        return str(_training_views_root(state) / raw)
+    if "/" not in raw and not Path(raw).is_absolute():
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", raw):
+            raise ValueError("baseView name may only contain letters, digits, '.', '_' and '-'.")
+        return f"{_host_training_views_root(state, host)}/{raw}"
+    return _map_path_for_merge_host(state, host, raw)
+
+
+def _resolve_merge_dagger_roots(
+    state: GatewayState, host: training_backend.TrainingHost, raw_values: Any
+) -> list[str]:
+    if isinstance(raw_values, str):
+        raw_values = [raw_values]
+    if not isinstance(raw_values, (list, tuple)):
+        raise ValueError("daggerRoots must be a list of dataset paths.")
+    roots: list[str] = []
+    for raw in raw_values:
+        mapped = _map_path_for_merge_host(state, host, str(raw or "").strip())
+        if mapped and mapped not in roots:
+            roots.append(mapped)
+    if not roots:
+        raise ValueError("Select at least one DAgger dataset to merge.")
+    return roots
+
+
+def _parse_merge_base_episodes(raw_values: Any) -> list[int]:
+    if raw_values in (None, ""):
+        return []
+    if isinstance(raw_values, str):
+        raw_values = [item.strip() for item in raw_values.split(",") if item.strip()]
+    if not isinstance(raw_values, (list, tuple)):
+        raise ValueError("baseEpisodes must be a list of episode indices.")
+    episodes: list[int] = []
+    for raw in raw_values:
+        try:
+            episode = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid base episode index {raw!r}.") from exc
+        if episode < 0:
+            raise ValueError("baseEpisodes must not contain negative episode indices.")
+        if episode not in episodes:
+            episodes.append(episode)
+    return episodes
+
+
+def _merge_output_name(base_view: str, dagger_roots: Sequence[str], requested: str) -> str:
+    if requested.strip():
+        name = requested.strip()
+    else:
+        dagger_tag = "plus" + str(len(dagger_roots)) + "dagger"
+        if len(dagger_roots) == 1:
+            dagger_name = Path(dagger_roots[0]).name
+            match = re.search(r"_(\d{6}|\d{5,})$", dagger_name)
+            dagger_tag = f"plus_dagger_{match.group(1)}" if match else "plus_dagger"
+        name = f"{Path(base_view).name}__{dagger_tag}"
+    return _safe_training_view_name(name)
+
+
+def _resolve_merge_output_root(
+    state: GatewayState,
+    host: training_backend.TrainingHost,
+    base_view: str,
+    dagger_roots: Sequence[str],
+    payload: dict[str, Any],
+) -> tuple[str, str, str]:
+    requested_root = str(payload.get("outputRoot") or "").strip()
+    output_name = _merge_output_name(base_view, dagger_roots, str(payload.get("outputName") or ""))
+    if requested_root:
+        output_root = _map_path_for_merge_host(state, host, requested_root)
+        output_name = Path(output_root).name
+    else:
+        output_root = f"{_host_training_views_root(state, host)}/{output_name}"
+    repo_id = str(payload.get("repoId") or "").strip() or f"local/{output_name}"
+    return output_root, output_name, repo_id
+
+
+def _policy_ready_merge_argv(
+    state: GatewayState,
+    host: training_backend.TrainingHost,
+    *,
+    base_view: str,
+    dagger_roots: Sequence[str],
+    output_root: str,
+    repo_id: str,
+    check_only: bool = False,
+    overwrite: bool = False,
+    copy_videos: bool = False,
+    base_episodes: Sequence[int] | None = None,
+) -> list[str]:
+    python_path = host.pythonPath if host.kind == "remote" else "{python}"
+    script = str(POLICY_READY_MERGE_SCRIPT if host.kind == "remote" else state.repo_root / POLICY_READY_MERGE_SCRIPT)
+    argv = [
+        python_path,
+        script,
+        "--base-view", base_view,
+        "--dagger-roots", *dagger_roots,
+        "--output-root", output_root,
+        "--repo-id", repo_id,
+        "--json",
+    ]
+    if base_episodes:
+        argv.extend(["--base-episodes", ",".join(str(episode) for episode in base_episodes)])
+    if check_only:
+        argv.append("--check-only")
+    if overwrite:
+        argv.append("--overwrite")
+    if copy_videos:
+        argv.append("--copy-videos")
+    return argv
+
+
+def _parse_json_line(output: str) -> dict[str, Any]:
+    for line in reversed(output.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {"ok": False, "error": "merge command produced no JSON output", "detail": output.splitlines()[-8:]}
+
+
+def _ensure_merge_code_on_host(state: GatewayState, host: training_backend.TrainingHost) -> None:
+    if host.kind != "remote":
+        return
+    sync = training_backend.sync_repo_to_host(state.repo_root, host)
+    if not sync.get("ok"):
+        raise ValueError(str(sync.get("message") or "sync failed"))
+
+
+def _check_policy_ready_dagger_merge(state: GatewayState, payload: dict[str, Any], *, sync: bool = True) -> dict[str, Any]:
+    host = training_backend.resolve_host(state.repo_root, str(payload.get("hostId") or ""))
+    if sync:
+        _ensure_merge_code_on_host(state, host)
+    base_view = _resolve_merge_base_view(state, host, str(payload.get("baseView") or payload.get("baseViewName") or ""))
+    dagger_roots = _resolve_merge_dagger_roots(state, host, payload.get("daggerRoots"))
+    output_root, output_name, repo_id = _resolve_merge_output_root(state, host, base_view, dagger_roots, payload)
+    base_episodes = _parse_merge_base_episodes(payload.get("baseEpisodes"))
+    argv = _policy_ready_merge_argv(
+        state,
+        host,
+        base_view=base_view,
+        dagger_roots=dagger_roots,
+        output_root=output_root,
+        repo_id=repo_id,
+        check_only=True,
+        base_episodes=base_episodes,
+    )
+    command, env = training_backend.build_launch_command(state.repo_root, host, argv, wandb_key="")
+    result = subprocess.run(command, cwd=state.repo_root, env=env, capture_output=True, text=True, timeout=120)
+    parsed = _parse_json_line((result.stdout or "") + "\n" + (result.stderr or ""))
+    parsed.update({
+        "host": asdict(host),
+        "baseView": base_view,
+        "daggerRoots": dagger_roots,
+        "baseEpisodes": base_episodes,
+        "outputRoot": output_root,
+        "outputName": output_name,
+        "repoId": repo_id,
+    })
+    if result.returncode != 0 and parsed.get("ok", False):
+        parsed["ok"] = False
+        parsed["error"] = f"merge check exited {result.returncode}"
+    return parsed
+
+
+def _start_policy_ready_dagger_merge(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
+    if _export_is_running(state):
+        raise RuntimeError("A dataset export or training-view build is already running; wait for it to finish.")
+    host = training_backend.resolve_host(state.repo_root, str(payload.get("hostId") or ""))
+    _ensure_merge_code_on_host(state, host)
+    base_view = _resolve_merge_base_view(state, host, str(payload.get("baseView") or payload.get("baseViewName") or ""))
+    dagger_roots = _resolve_merge_dagger_roots(state, host, payload.get("daggerRoots"))
+    output_root, output_name, repo_id = _resolve_merge_output_root(state, host, base_view, dagger_roots, payload)
+    base_episodes = _parse_merge_base_episodes(payload.get("baseEpisodes"))
+    check = _check_policy_ready_dagger_merge(
+        state,
+        {
+            **payload,
+            "hostId": host.id,
+            "baseView": base_view,
+            "daggerRoots": dagger_roots,
+            "baseEpisodes": base_episodes,
+            "outputRoot": output_root,
+            "repoId": repo_id,
+        },
+        sync=False,
+    )
+    if not check.get("ok"):
+        raise ValueError(str(check.get("error") or check.get("summary") or "merge check failed"))
+    argv = _policy_ready_merge_argv(
+        state,
+        host,
+        base_view=base_view,
+        dagger_roots=dagger_roots,
+        output_root=output_root,
+        repo_id=repo_id,
+        overwrite=bool(payload.get("overwrite")),
+        copy_videos=bool(payload.get("copyVideos")),
+        base_episodes=base_episodes,
+    )
+    command, env = training_backend.build_launch_command(state.repo_root, host, argv, wandb_key="")
+    process = subprocess.Popen(
+        command,
+        cwd=state.repo_root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    state.export_process = process
+    state.dataset_export = DatasetExportStatus(
+        state="exporting",
+        target=POLICY_READY_DAGGER_MERGE_TARGET,
+        datasetRoot=base_view,
+        datasetRoots=[base_view, *dagger_roots],
+        outputPath=output_root,
+        selectedEpisodes=int(check.get("totalEpisodes") or 0),
+        totalFrames=int(check.get("totalFrames") or 0),
+        message=f"Merging policy-ready DAgger view {output_name} on {host.label}...",
+        pid=process.pid,
+    )
+    state.log("info", f"Started policy-ready DAgger merge on {host.label}: {output_root}")
+    Thread(
+        target=_read_export_output,
+        args=(state, process),
+        daemon=True,
+        name=f"policy-ready-merge-{process.pid}",
+    ).start()
+    return {"ok": True, "merge": check, "export": asdict(state.dataset_export)}
+
+
 def _training_view_fps_conflict(dataset_roots: Sequence[Path], view_fps: int) -> str | None:
     """Why this rate cannot express these recordings, or None if it can.
 
@@ -4286,6 +4579,12 @@ def _start_training_view(
         if _dataset_kind(state, dataset_root) == "training_view":
             raise ValueError(
                 f"{dataset_root.name} is already a training view; build from the recording instead."
+            )
+        if _active_dagger_dataset_matches(state, dataset_root):
+            raise ValueError(
+                f"{dataset_root.name} is still being written by the active DAgger rollout. "
+                "Stop/quit the rollout and wait for it to finish closing the dataset before "
+                "building a training view."
             )
         if dataset_root not in dataset_roots:
             dataset_roots.append(dataset_root)
@@ -4451,6 +4750,17 @@ def _start_approved_dataset_export(
 
 def _apply_export_output(state: GatewayState, output: str) -> None:
     state.dataset_export.message = output
+    if output.startswith("{"):
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError:
+            payload = {}
+        if isinstance(payload, dict) and payload.get("outputRoot"):
+            state.dataset_export.outputPath = str(payload.get("outputRoot") or state.dataset_export.outputPath)
+            state.dataset_export.selectedEpisodes = int(payload.get("totalEpisodes") or state.dataset_export.selectedEpisodes or 0)
+            state.dataset_export.totalFrames = int(payload.get("totalFrames") or state.dataset_export.totalFrames or 0)
+            state.dataset_export.message = str(payload.get("summary") or output)
+            return
     match = re.search(r"Export plan: (\d+) episodes", output)
     if match:
         state.dataset_export.selectedEpisodes = int(match.group(1))
@@ -4478,6 +4788,17 @@ def _training_view_completion_message(state: GatewayState) -> str | None:
     nobody on this page asked for. The manifest inside the view is the authoritative record of
     what was built.
     """
+    if state.dataset_export.target == POLICY_READY_DAGGER_MERGE_TARGET:
+        manifest: dict[str, Any] = {}
+        if state.dataset_export.outputPath:
+            manifest = _load_json_file(Path(state.dataset_export.outputPath) / "meta" / "il_view_manifest.json")
+        episodes = int(manifest.get("total_episodes") or state.dataset_export.selectedEpisodes or 0)
+        frames = int(manifest.get("total_rows") or state.dataset_export.totalFrames or 0)
+        dagger_count = len(manifest.get("dagger_dataset_roots") or [])
+        contract = str(manifest.get("action_mode") or "policy-ready")
+        state.dataset_export.selectedEpisodes = episodes
+        state.dataset_export.totalFrames = frames
+        return f"Combined view ready: {episodes} episode(s) · {frames} frames · {contract} · {dagger_count} DAgger source(s)"
     if state.dataset_export.target not in TRAINING_VIEW_ACTION_MODES:
         return None
     contract = state.dataset_export.target
@@ -4783,6 +5104,8 @@ _TRAINING_HISTORY_PARAM_KEYS = (
     "useAmp",
     "policyConfig",
     "pretrainedPath",
+    "resumeTraining",
+    "resumeCheckpoint",
     "loraEnabled",
     "loraR",
     "loraAlpha",
@@ -5155,21 +5478,29 @@ def _start_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[st
     # run and on the history entry that can refill the form for the next one. One dict rather
     # than two readings of `payload` is what keeps "what ran" and "what is offered back" from
     # drifting apart as knobs are added.
+    resume_training = bool(payload.get("resumeTraining"))
+    resume_checkpoint = _map_resume_checkpoint_for_host(
+        state, host, str(payload.get("resumeCheckpoint") or "").strip()
+    )
     argv_settings: dict[str, Any] = {
         "policy": policy,
-        "pretrainedPath": str(payload.get("pretrainedPath") or "").strip(),
-        "loraEnabled": bool(payload.get("loraEnabled")),
+        "pretrainedPath": ""
+        if resume_training
+        else str(payload.get("pretrainedPath") or "").strip(),
+        "resumeTraining": resume_training,
+        "resumeCheckpoint": resume_checkpoint,
+        "loraEnabled": False if resume_training else bool(payload.get("loraEnabled")),
         "loraR": int(payload.get("loraR") or 16),
-        "loraAlpha": int(payload.get("loraAlpha") or 0),
-        "loraTargetModules": str(payload.get("loraTargetModules") or ""),
+        "loraAlpha": 0 if resume_training else int(payload.get("loraAlpha") or 0),
+        "loraTargetModules": "" if resume_training else str(payload.get("loraTargetModules") or ""),
         "steps": int(payload.get("steps") or 20000),
         "batchSize": int(payload.get("batchSize") or 8),
         "numWorkers": int(payload.get("numWorkers") or 4),
         "saveFreq": int(payload.get("saveFreq") or 5000),
         "logFreq": int(payload.get("logFreq") or 100),
         "device": str(payload.get("device") or "auto"),
-        "useAmp": bool(payload.get("useAmp")),
-        "policyConfig": str(payload.get("policyConfig") or ""),
+        "useAmp": False if resume_training else bool(payload.get("useAmp")),
+        "policyConfig": "" if resume_training else str(payload.get("policyConfig") or ""),
         "wandbEnabled": wandb_enabled,
         "wandbProject": str(payload.get("wandbProject") or "lerobot"),
         "wandbEntity": str(payload.get("wandbEntity") or ""),
@@ -5185,6 +5516,8 @@ def _start_training_run(state: GatewayState, payload: dict[str, Any]) -> dict[st
         lora_r=argv_settings["loraR"],
         lora_alpha=argv_settings["loraAlpha"],
         lora_target_modules=argv_settings["loraTargetModules"],
+        resume=argv_settings["resumeTraining"],
+        resume_checkpoint=argv_settings["resumeCheckpoint"],
         steps=argv_settings["steps"],
         batch_size=argv_settings["batchSize"],
         num_workers=argv_settings["numWorkers"],
@@ -5543,6 +5876,48 @@ def _rollout_is_running(state: GatewayState) -> bool:
     return process is not None and process.poll() is None
 
 
+def _active_dagger_dataset_matches(state: GatewayState, dataset_root: Path) -> bool:
+    dagger_root = str(state.rollout.daggerDatasetPath or "").strip()
+    if not dagger_root or not _rollout_is_running(state):
+        return False
+    try:
+        return Path(dagger_root).resolve() == dataset_root.resolve()
+    except OSError:
+        return False
+
+
+def _active_dagger_qc_result(state: GatewayState, dataset_root: Path) -> dict[str, Any] | None:
+    if not _active_dagger_dataset_matches(state, dataset_root):
+        return None
+    message = (
+        "DAgger dataset is still being written by the active rollout. Stop/quit the rollout "
+        "and wait for it to finish closing the dataset before running QC or training."
+    )
+    return {
+        "status": "fail",
+        "summary": message,
+        "valid_frames_pct": 0.0,
+        "checks": [{"name": "dagger_finalized", "status": "fail", "message": message}],
+        "completed_at": _now_iso(),
+    }
+
+
+def _map_resume_checkpoint_for_host(
+    state: GatewayState, host: training_backend.TrainingHost, value: str
+) -> str:
+    checkpoint = str(value or "").strip()
+    if host.kind != "remote" or not checkpoint:
+        return checkpoint
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.is_absolute():
+        return checkpoint
+    try:
+        relative = checkpoint_path.relative_to(state.repo_root)
+    except ValueError:
+        return checkpoint
+    return f"{host.repoDir}/{relative.as_posix()}"
+
+
 def _guard_checkpoint_deletion(state: GatewayState, checkpoint_ids: list[str]) -> None:
     """Refuse to delete weights that something on this machine is still holding.
 
@@ -5815,6 +6190,25 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
     # because `build_rollout_command` uses it only when takeover is on and the operator named no
     # directory of their own.
     dagger_fallback = rollout_backend.dagger_dataset_dir(state.repo_root, checkpoint_id)
+
+    # `use_amp` is inert during training -- lerobot_train.py never reads it -- but the runtime
+    # wraps inference in `torch.autocast` only when it is true. A checkpoint trained after the
+    # training page's default was turned off would therefore be evaluated on a different
+    # inference path from every checkpoint it is being compared against, which is the one thing
+    # an A/B between two checkpoints has to hold still. Aligned here because this is the last
+    # point before the value is read, and it catches checkpoints fetched from another machine as
+    # well as ones trained on this one.
+    try:
+        alignment = use_amp_alignment.align_checkpoint_use_amp(
+            Path(str(selected.get("pretrainedPath") or selected.get("path") or ""))
+        )
+    except use_amp_alignment.AlignmentError as exc:
+        # Warned, not refused. A rollout blocked over a metadata field costs an operator more
+        # than the mismatch it is protecting against, and the log still says what this run got.
+        state.log("warn", f"Could not align use_amp on {checkpoint_id}: {exc}")
+    else:
+        if alignment.changed:
+            state.log("warn", f"Aligned use_amp before the rollout -- {alignment.summary}")
 
     command, env = rollout_backend.build_rollout_command(
         state.repo_root,
@@ -13690,6 +14084,14 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     result = _start_dependency_install(state, body)
                     _json_response(self, HTTPStatus.OK, result)
                     return
+                if path == "/api/training/dagger-merge/check":
+                    result = _check_policy_ready_dagger_merge(state, body)
+                    _json_response(self, HTTPStatus.OK, result)
+                    return
+                if path == "/api/training/dagger-merge/start":
+                    result = _start_policy_ready_dagger_merge(state, body)
+                    _json_response(self, HTTPStatus.OK, result)
+                    return
                 if path == "/api/training/start":
                     # Started outside the lock for the same reason the probe is: a remote start
                     # runs an rsync first, and that can take a minute.
@@ -13875,11 +14277,14 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 if dataset_root is None:
                     _json_response(self, HTTPStatus.NOT_FOUND, {"error": "dataset not in candidate list"})
                     return
-                qc_result = _run_qc(
-                    dataset_root,
-                    repo_root=state.repo_root,
-                    ik_python=_mujoco_replay_python(state),
-                )
+                with state.lock:
+                    qc_result = _active_dagger_qc_result(state, dataset_root)
+                if qc_result is None:
+                    qc_result = _run_qc(
+                        dataset_root,
+                        repo_root=state.repo_root,
+                        ik_python=_mujoco_replay_python(state),
+                    )
                 try:
                     _write_processing_meta_qc(dataset_root, qc_result)
                 except OSError as exc:

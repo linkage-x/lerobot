@@ -1010,3 +1010,72 @@ def test_the_source_digest_changes_when_the_selection_does(tmp_path):
 
     assert one["source_digest"] == again["source_digest"]
     assert one["source_digest"] != both["source_digest"]
+
+
+def _write_resume_checkpoint(
+    root: Path, *, dataset_root: Path, step: int = 30000, episodes: list[int] | None = None
+) -> Path:
+    """A checkpoint directory shaped the way lerobot_train saves one."""
+    checkpoint = root / "checkpoints" / f"{step:06d}"
+    pretrained = checkpoint / "pretrained_model"
+    pretrained.mkdir(parents=True, exist_ok=True)
+    dataset: dict = {"repo_id": f"local/{dataset_root.name}", "root": str(dataset_root)}
+    if episodes is not None:
+        dataset["episodes"] = episodes
+    (pretrained / "train_config.json").write_text(
+        json.dumps({"dataset": dataset, "steps": step, "job_name": root.name}), encoding="utf-8"
+    )
+    state = checkpoint / "training_state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "training_step.json").write_text(json.dumps({"step": step}), encoding="utf-8")
+    return pretrained / "train_config.json"
+
+
+def test_resume_refuses_a_checkpoint_trained_on_a_different_view(tmp_path):
+    """The failure this replaces is silent: `--view-root` is printed and then ignored.
+
+    `TrainPipelineConfig.validate` reloads the whole config from the checkpoint when resuming, so
+    a run launched against a merged DAgger view trains the old base view, writes into the old
+    run's output directory, and exits reporting success.
+    """
+    old_view = tmp_path / "views" / "base_only"
+    new_view = tmp_path / "views" / "base_plus_dagger"
+    old_view.mkdir(parents=True)
+    new_view.mkdir(parents=True)
+    config_path = _write_resume_checkpoint(tmp_path / "train" / "L4", dataset_root=old_view)
+
+    with pytest.raises(ValueError) as excinfo:
+        fr3_train_il_policy.assert_resume_trains_the_named_view(
+            config_path,
+            view_root=new_view,
+            repo_id=f"local/{new_view.name}",
+            steps=30000,
+            steps_supplied=True,
+        )
+    assert str(old_view) in str(excinfo.value)
+    assert "--pretrained-path" in str(excinfo.value)
+
+
+def test_resume_refuses_a_run_that_would_take_zero_steps(tmp_path):
+    """Resuming a finished checkpoint at its own step count exits without training anything."""
+    view = tmp_path / "views" / "one"
+    view.mkdir(parents=True)
+    config_path = _write_resume_checkpoint(tmp_path / "train" / "L4", dataset_root=view, step=30000)
+
+    with pytest.raises(ValueError, match="zero steps"):
+        fr3_train_il_policy.assert_resume_trains_the_named_view(
+            config_path, view_root=view, repo_id="local/one", steps=30000, steps_supplied=True
+        )
+
+
+def test_resume_allows_continuing_the_same_view_past_its_saved_step(tmp_path):
+    """The one thing resume is for still works, episode subset and all."""
+    view = tmp_path / "views" / "one"
+    view.mkdir(parents=True)
+    config_path = _write_resume_checkpoint(
+        tmp_path / "train" / "L4", dataset_root=view, step=30000, episodes=[0, 1, 2]
+    )
+
+    fr3_train_il_policy.assert_resume_trains_the_named_view(
+        config_path, view_root=view, repo_id="local/one", steps=40000, steps_supplied=True
+    )

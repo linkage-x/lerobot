@@ -159,6 +159,16 @@ def validate_pretrained_path(value: str) -> str:
     return value
 
 
+def validate_resume_checkpoint_path(value: str) -> str:
+    value = (value or "").strip()
+    if not PRETRAINED_PATH_RE.match(value):
+        raise TrainingError(
+            f"Resume checkpoint must be a checkpoint directory or pretrained_model path (got {value!r}). "
+            "Names are used to build shell commands, so anything else is refused."
+        )
+    return value
+
+
 def validate_extras(values: Any) -> list[str]:
     """The extras to install, de-duplicated in the order asked for.
 
@@ -491,6 +501,8 @@ def build_train_argv(
     lora_r: int = 16,
     lora_alpha: int = 0,
     lora_target_modules: str = "",
+    resume: bool = False,
+    resume_checkpoint: str = "",
 ) -> list[str]:
     """The training argv, identical in shape for local and remote.
 
@@ -524,29 +536,37 @@ def build_train_argv(
         "--log-freq", str(int(log_freq)),
         "--device", device,
     ]
-    if pretrained_path:
-        argv += ["--pretrained-path", validate_pretrained_path(pretrained_path)]
-    if lora_enabled:
-        # Refused here rather than by the training script alone: on a remote host that failure
-        # is a line in a log file the page is not showing yet, and the operator has already
-        # waited out an rsync to see it.
-        if not pretrained_path:
+    if resume:
+        if not resume_checkpoint.strip():
             raise TrainingError(
-                "LoRA finetunes an existing model and no base checkpoint was given. Set "
-                "'Base checkpoint' (for example lerobot/pi05_base), or turn LoRA off."
+                "Resume training needs a checkpoint path, for example "
+                "outputs/train/<job>/checkpoints/030000."
             )
-        argv += ["--lora", "--lora-r", str(int(lora_r))]
-        # An adapter's strength is alpha / r, so the rank alone does not say how hard it
-        # pulls. Sent only when the operator names one; left out, the training script tracks
-        # the rank and the scaling stays 1.0.
-        if lora_alpha:
-            argv += ["--lora-alpha", str(int(lora_alpha))]
-        if lora_target_modules.strip():
-            argv += ["--lora-target-modules", validate_lora_targets(lora_target_modules)]
-    if use_amp:
-        argv.append("--use-amp")
-    if policy_config.strip():
-        argv += ["--policy-config", policy_config.strip()]
+        argv += ["--resume", "--resume-checkpoint", validate_resume_checkpoint_path(resume_checkpoint)]
+    else:
+        if pretrained_path:
+            argv += ["--pretrained-path", validate_pretrained_path(pretrained_path)]
+        if lora_enabled:
+            # Refused here rather than by the training script alone: on a remote host that failure
+            # is a line in a log file the page is not showing yet, and the operator has already
+            # waited out an rsync to see it.
+            if not pretrained_path:
+                raise TrainingError(
+                    "LoRA finetunes an existing model and no base checkpoint was given. Set "
+                    "'Base checkpoint' (for example lerobot/pi05_base), or turn LoRA off."
+                )
+            argv += ["--lora", "--lora-r", str(int(lora_r))]
+            # An adapter's strength is alpha / r, so the rank alone does not say how hard it
+            # pulls. Sent only when the operator names one; left out, the training script tracks
+            # the rank and the scaling stays 1.0.
+            if lora_alpha:
+                argv += ["--lora-alpha", str(int(lora_alpha))]
+            if lora_target_modules.strip():
+                argv += ["--lora-target-modules", validate_lora_targets(lora_target_modules)]
+        if use_amp:
+            argv.append("--use-amp")
+        if policy_config.strip():
+            argv += ["--policy-config", policy_config.strip()]
     if wandb_enabled:
         argv.append("--wandb")
         if wandb_project.strip():

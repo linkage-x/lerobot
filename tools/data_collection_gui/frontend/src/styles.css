@@ -498,6 +498,13 @@ button.danger {
   text-align: right;
 }
 
+/* The merge check names training views and dataset directories, which are far longer than the
+   short check labels this table was sized for. Scoped so the QC and calibration tables keep
+   their fixed first column. */
+.merge-check .check-row strong {
+  overflow-wrap: anywhere;
+}
+
 .placeholder-panel {
   min-height: 260px;
 }

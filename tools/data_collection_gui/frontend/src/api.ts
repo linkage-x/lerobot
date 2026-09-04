@@ -51,6 +51,8 @@ import type {
   SceneResetStroke,
   TrainingHistoryEntry,
   TrainingView,
+  DaggerMergeCheck,
+  DaggerMergeRequest,
   TrainingWandbStatus,
   TaskLadder,
 } from "./types";
@@ -942,6 +944,26 @@ export class DataCollectionGuiApi {
 
   async stopTraining() {
     return this.trainingPost<{ training?: TrainingRun }>("/api/training/stop", {});
+  }
+
+  /** Whether these datasets can be merged into one policy-ready view, without writing anything.
+   *
+   *  Its own call rather than a flag on the merge: the answer is a list of refusals the
+   *  operator can act on (QC not passed, a prompt that differs, a schema that does not line
+   *  up), and those have to be readable *before* a job starts rewriting a dataset. The gateway
+   *  runs the merge script with --check-only and hands back its JSON plus the paths it
+   *  resolved, so what the page shows is what a merge would actually run on.
+   */
+  async checkDaggerMerge(request: DaggerMergeRequest) {
+    return this.trainingPost<DaggerMergeCheck>("/api/training/dagger-merge/check", request);
+  }
+
+  /** Start the merge. The gateway re-runs the check first and refuses on anything it finds, so
+   *  a stale "compatible" on the page cannot become a started job. Progress lands in the
+   *  snapshot's datasetExport, the same slot a training-view build uses -- they write to the
+   *  same place and only one may run at a time. */
+  async startDaggerMerge(request: DaggerMergeRequest) {
+    return this.trainingPost<{ merge?: DaggerMergeCheck }>("/api/training/dagger-merge/start", request);
   }
 
   // --------------------------------------------------- checkpoints & rollout ---

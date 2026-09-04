@@ -912,6 +912,59 @@ export type TrainingView = {
   modifiedAt: string;
 };
 
+/** One dataset going into a policy-ready DAgger merge, as the merge script reports it.
+ *  `qc_status` keeps the script's own spelling: these objects are `asdict(SourceSummary)`
+ *  forwarded verbatim, and renaming a key here would only hide which side produced it. */
+export type DaggerMergeSource = {
+  role: "base" | "dagger" | string;
+  root: string;
+  episodes: number;
+  frames: number;
+  fps: number;
+  tasks: string[];
+  qc_status?: string;
+};
+
+export type DaggerMergeCheckItem = {
+  name: string;
+  status: "pass" | "warn" | "fail" | string;
+  message: string;
+};
+
+/** The answer to "can these be merged", from `--check-only`. The gateway adds the resolved
+ *  paths it would use, so what the UI shows is what a merge would actually run on rather than
+ *  what was typed into the form. */
+export type DaggerMergeCheck = {
+  ok: boolean;
+  error?: string;
+  summary?: string;
+  actionMode?: string;
+  fps?: number;
+  baseView?: string;
+  daggerRoots?: string[];
+  baseEpisodes?: number[];
+  outputRoot?: string;
+  outputName?: string;
+  repoId?: string;
+  totalEpisodes?: number;
+  totalFrames?: number;
+  sources?: DaggerMergeSource[];
+  checks?: DaggerMergeCheckItem[];
+  /** Last lines of a merge command that printed no JSON at all -- a crash, not a refusal. */
+  detail?: string[];
+};
+
+export type DaggerMergeRequest = {
+  baseView: string;
+  daggerRoots: string[];
+  /** Base-view episodes to keep. Empty means every episode; a subset is how a holdout stays
+   *  out of the trained set. */
+  baseEpisodes: number[];
+  outputName: string;
+  overwrite: boolean;
+  copyVideos: boolean;
+};
+
 export type TrainingRun = {
   state: "idle" | "syncing" | "starting" | "running" | "complete" | "error" | "stopped";
   hostId: string;
@@ -949,6 +1002,10 @@ export type TrainingStartRequest = {
   policyConfig: string;
   /** HF repo id or local checkpoint dir to finetune from. Empty trains from scratch. */
   pretrainedPath: string;
+  /** Continue a saved optimizer/trainer state instead of starting a fresh run from weights. */
+  resumeTraining: boolean;
+  /** Checkpoint directory or its pretrained_model child used with resumeTraining. */
+  resumeCheckpoint: string;
   /** Freeze the base weights and train a PEFT adapter instead. Needs pretrainedPath. */
   loraEnabled: boolean;
   loraR: number;
@@ -976,6 +1033,8 @@ export type TrainingHistoryParams = Partial<
     | "useAmp"
     | "policyConfig"
     | "pretrainedPath"
+    | "resumeTraining"
+    | "resumeCheckpoint"
     | "loraEnabled"
     | "loraR"
     | "loraAlpha"

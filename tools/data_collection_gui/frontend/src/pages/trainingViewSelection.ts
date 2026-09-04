@@ -1,5 +1,5 @@
 import type { CameraCropSpecs } from "../api";
-import type { DatasetCameraFeature, RecordedDataset } from "../types";
+import type { DatasetCameraFeature, RecordedDataset, TrainingView } from "../types";
 import { fullFrameCrop, isFullFrame, type CropRect } from "./cropGeometry";
 
 /** The task a recording belongs to, from its directory name.
@@ -108,6 +108,111 @@ export function summarizeSelection(datasets: RecordedDataset[], viewFps: number)
 
 function cropForFeature(crops: Record<string, CropRect>, feature: DatasetCameraFeature): CropRect {
   return crops[feature.key] ?? fullFrameCrop(feature.width, feature.height);
+}
+
+export type CropSourceFingerprint = {
+  paths: string[];
+  cameras: Record<string, { width: number; height: number }>;
+};
+
+export function cropSourceFingerprint(dataset: RecordedDataset | null | undefined): CropSourceFingerprint | null {
+  if (!dataset) return null;
+  return cropSelectionFingerprint([dataset]);
+}
+
+export function cropSelectionFingerprint(datasets: RecordedDataset[]): CropSourceFingerprint | null {
+  if (datasets.length === 0) return null;
+  const cameras: Record<string, { width: number; height: number }> = {};
+  for (const dataset of datasets) {
+    for (const feature of dataset.cameraFeatures ?? []) {
+      if (feature.width <= 0 || feature.height <= 0) continue;
+      cameras[feature.key] = { width: feature.width, height: feature.height };
+    }
+  }
+  return { paths: datasets.map((dataset) => dataset.path).sort(), cameras };
+}
+
+export function cropSourceFingerprintKey(source: CropSourceFingerprint | null | undefined): string {
+  if (!source) return "";
+  return JSON.stringify({
+    paths: source.paths,
+    cameras: Object.entries(source.cameras).sort(([left], [right]) => left.localeCompare(right))
+  });
+}
+
+export function cropSourcesMatch(
+  left: CropSourceFingerprint | null | undefined,
+  right: CropSourceFingerprint | null | undefined
+): boolean {
+  if (!left || !right) return false;
+  return cropSourceFingerprintKey(left) === cropSourceFingerprintKey(right);
+}
+
+export function fullFrameCropsForFeatures(features: DatasetCameraFeature[]): Record<string, CropRect> {
+  return Object.fromEntries(
+    features
+      .filter((feature) => feature.width > 0 && feature.height > 0)
+      .map((feature) => [feature.key, fullFrameCrop(feature.width, feature.height)])
+  );
+}
+
+export function selectionCameraDimensionsProblem(datasets: RecordedDataset[]): string {
+  const byKey = new Map<string, Set<string>>();
+  for (const dataset of datasets) {
+    for (const feature of dataset.cameraFeatures ?? []) {
+      if (feature.width <= 0 || feature.height <= 0) continue;
+      const sizes = byKey.get(feature.key) ?? new Set<string>();
+      sizes.add(`${feature.width}x${feature.height}`);
+      byKey.set(feature.key, sizes);
+    }
+  }
+  for (const [key, sizes] of byKey.entries()) {
+    if (sizes.size > 1) {
+      return `${key} has mixed source sizes (${Array.from(sizes).sort().join(" and ")}); use the DAgger merge flow for policy-ready datasets`;
+    }
+  }
+  return "";
+}
+
+export function cropRectsFromSpecs(specs: Record<string, number[]> | null | undefined): Record<string, CropRect> {
+  const crops: Record<string, CropRect> = {};
+  for (const [key, box] of Object.entries(specs ?? {})) {
+    if (!Array.isArray(box) || box.length < 4) continue;
+    const [x, y, w, h] = box;
+    if (![x, y, w, h].every(Number.isFinite)) continue;
+    crops[key] = { x, y, w, h };
+  }
+  return crops;
+}
+
+export function cropsAreFullFrame(
+  crops: Record<string, CropRect>,
+  features: DatasetCameraFeature[]
+): boolean {
+  const cameraFeatures = features.filter((feature) => feature.width > 0 && feature.height > 0);
+  if (cameraFeatures.length === 0) return false;
+  return cameraFeatures.every((feature) => {
+    const rect = cropForFeature(crops, feature);
+    return isFullFrame(rect, feature.width, feature.height);
+  });
+}
+
+export function suggestedCropViewForSelection(
+  views: TrainingView[],
+  datasets: RecordedDataset[],
+  actionMode: string
+): TrainingView | null {
+  if (datasets.length === 0) return null;
+  const selectedPaths = new Set(datasets.map((dataset) => dataset.path));
+  const candidates = views.filter((view) => {
+    if (view.actionMode && view.actionMode !== actionMode) return false;
+    if (Object.keys(view.cameraCrops ?? {}).length === 0) return false;
+    if (!(view.sourceRoots ?? []).some((root) => selectedPaths.has(root))) return false;
+    const crops = cropRectsFromSpecs(view.cameraCrops);
+    return !cropSpecsForSelection(datasets, true, crops).error;
+  });
+  const targetName = trainingViewName(datasets.map((dataset) => dataset.name), actionMode);
+  return candidates.find((view) => view.name === targetName) ?? candidates[0] ?? null;
 }
 
 /** The crop specs to send for a whole selection, or why it cannot be sent.

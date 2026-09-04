@@ -627,6 +627,26 @@ def test_processing_item_and_qc_include_online_sync_manifest(tmp_path):
     assert qc["online_sync"]["episodes"][0]["frameCountByCamera"] == {"cam_00": 2, "cam_01": 2}
 
 
+def test_active_dagger_dataset_is_reported_unfinalized_before_qc_reads_parquet(tmp_path):
+    dataset_root = tmp_path / "outputs" / "datasets" / "dagger_active"
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+    state.rollout_process = _FakeTrainProcess()
+    state.rollout.daggerDatasetPath = str(dataset_root)
+
+    qc = gateway._active_dagger_qc_result(state, dataset_root)
+
+    assert qc is not None
+    assert qc["status"] == "fail"
+    assert qc["checks"][0]["name"] == "dagger_finalized"
+    assert "still being written" in qc["summary"]
+
+
 def test_replay_timeline_includes_camera_controls_sidecar(tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "recorded"
@@ -2072,6 +2092,22 @@ def test_training_view_refuses_a_dataset_that_has_not_passed_qc(tmp_path):
     state, dataset_root, _view_root = _training_view_state(tmp_path)
 
     with pytest.raises(ValueError, match="must pass QC"):
+        gateway._start_training_view(state, str(dataset_root), "delta_ee_from_prev_cmd")
+
+
+def test_training_view_refuses_an_active_dagger_dataset(tmp_path, monkeypatch):
+    state, dataset_root, _view_root = _training_view_state(tmp_path)
+    _write_passing_qc(dataset_root)
+
+    class RunningRollout:
+        def poll(self):
+            return None
+
+    state.rollout_process = RunningRollout()
+    state.rollout.daggerDatasetPath = str(dataset_root)
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda *a, **k: pytest.fail("build started"))
+
+    with pytest.raises(ValueError, match="still being written by the active DAgger rollout"):
         gateway._start_training_view(state, str(dataset_root), "delta_ee_from_prev_cmd")
 
 
@@ -4833,6 +4869,58 @@ def test_a_started_run_records_its_settings_for_the_next_one(tmp_path, monkeypat
     assert params["logFreq"] == 100
 
 
+def test_a_started_resume_run_records_the_checkpoint_without_fresh_knobs(tmp_path, monkeypatch):
+    state = _training_start_state(tmp_path, monkeypatch)
+    monkeypatch.setattr(gateway, "_training_is_running", lambda _state: False)
+    checkpoint = str(tmp_path / "outputs" / "train" / "base" / "checkpoints" / "030000")
+
+    gateway._start_training_run(
+        state,
+        {
+            "viewName": "pick__delta_ee_from_prev_cmd",
+            "policy": "pi05",
+            "steps": 50000,
+            "resumeTraining": True,
+            "resumeCheckpoint": checkpoint,
+            "pretrainedPath": "lerobot/pi05_base",
+            "loraEnabled": True,
+            "loraR": 32,
+            "policyConfig": '{"optimizer_lr": 5e-05}',
+            "useAmp": True,
+        },
+    )
+
+    params = gateway._training_history_entries(state)[0]["params"]
+    assert params["resumeTraining"] is True
+    assert params["resumeCheckpoint"] == checkpoint
+    assert params["pretrainedPath"] == ""
+    assert params["loraEnabled"] is False
+    assert params["policyConfig"] == ""
+    assert params["useAmp"] is False
+
+
+def test_resume_checkpoint_inside_repo_is_mapped_to_the_remote_checkout(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+    host = gateway.training_backend.TrainingHost(
+        id="user@10.0.0.5:/remote/lerobot",
+        label="Remote",
+        kind="remote",
+        sshTarget="user@10.0.0.5",
+        repoDir="/remote/lerobot",
+    )
+    checkpoint = tmp_path / "outputs" / "train" / "job" / "checkpoints" / "030000"
+
+    mapped = gateway._map_resume_checkpoint_for_host(state, host, str(checkpoint))
+
+    assert mapped == "/remote/lerobot/outputs/train/job/checkpoints/030000"
+
+
 def _write_finished_run(repo_root: Path, job_name: str, **config) -> Path:
     """A run directory as lerobot_train leaves it: weights, and a train_config.json beside them."""
     run_dir = repo_root / "outputs" / "train" / job_name
@@ -5431,3 +5519,167 @@ def test_a_machine_short_of_nothing_but_torch_still_gets_a_sync(tmp_path, monkey
     assert seen["extras"] == []
     assert _wait_for_install(state) == "complete"
     assert "base dependencies" in state.deps_install.message
+
+
+
+def test_check_policy_ready_dagger_merge_builds_local_command(tmp_path, monkeypatch):
+    state, _dataset_root, view_root = _training_view_state(tmp_path)
+    dagger_root = tmp_path / "repo" / "outputs" / "datasets" / "dagger_L4_full48_holdout22_40_030000"
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"ok": True, "totalEpisodes": 3, "totalFrames": 6, "summary": "compatible"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+
+    result = gateway._check_policy_ready_dagger_merge(
+        state,
+        {"hostId": "local", "baseView": view_root.name, "daggerRoots": [str(dagger_root)], "outputName": "combined", "baseEpisodes": "0,1"},
+    )
+
+    assert result["ok"] is True
+    assert result["baseView"] == str(view_root)
+    assert result["daggerRoots"] == [str(dagger_root)]
+    assert result["baseEpisodes"] == [0, 1]
+    assert result["outputRoot"].endswith("/outputs/exports/training_views/combined")
+    assert "--check-only" in captured["command"]
+    assert "--json" in captured["command"]
+    assert "--base-episodes" in captured["command"]
+    assert captured["command"][captured["command"].index("--base-episodes") + 1] == "0,1"
+    assert str(state.repo_root / "tools" / "fr3" / "fr3_merge_policy_ready_datasets.py") in captured["command"]
+    assert captured["kwargs"]["timeout"] == 120
+
+
+def test_start_policy_ready_dagger_merge_updates_export_status(tmp_path, monkeypatch):
+    state, _dataset_root, view_root = _training_view_state(tmp_path)
+    dagger_root = tmp_path / "repo" / "outputs" / "datasets" / "dagger_L4_full48_holdout22_40_030000"
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"ok": True, "totalEpisodes": 3, "totalFrames": 6, "summary": "compatible"}),
+            stderr="",
+        )
+
+    class FakeProcess:
+        pid = 4321
+        stdout = io.StringIO("")
+
+        def poll(self):
+            return None
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            captured["thread"] = {"args": args, "kwargs": kwargs}
+
+        def start(self):
+            captured["thread_started"] = True
+
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+    monkeypatch.setattr(gateway.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(gateway, "Thread", FakeThread)
+
+    result = gateway._start_policy_ready_dagger_merge(
+        state,
+        {
+            "hostId": "local",
+            "baseView": view_root.name,
+            "daggerRoots": [str(dagger_root)],
+            "outputName": "combined",
+            "overwrite": True,
+            "baseEpisodes": [0, 1],
+        },
+    )
+
+    assert result["ok"] is True
+    assert state.dataset_export.target == gateway.POLICY_READY_DAGGER_MERGE_TARGET
+    assert state.dataset_export.outputPath.endswith("/outputs/exports/training_views/combined")
+    assert state.dataset_export.selectedEpisodes == 3
+    assert state.dataset_export.totalFrames == 6
+    assert state.dataset_export.pid == 4321
+    assert "--check-only" not in captured["command"]
+    assert "--overwrite" in captured["command"]
+    assert captured["command"][captured["command"].index("--base-episodes") + 1] == "0,1"
+    assert captured["thread_started"] is True
+
+
+def test_policy_ready_dagger_merge_maps_matching_remote_paths(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(repoId="local/test"),
+        replay=gateway.ReplayStatus(dataset="local/test"),
+    )
+    host = gateway.training_backend.TrainingHost(
+        id="hph@192.168.100.155:/home/hph/Code/lerobot",
+        label="hph",
+        kind="remote",
+        sshTarget="hph@192.168.100.155",
+        repoDir="/home/hph/Code/lerobot",
+    )
+
+    dagger = "hph@192.168.100.155:/home/hph/Code/lerobot/outputs/datasets/dagger_L4_full48_holdout22_40_030000"
+    roots = gateway._resolve_merge_dagger_roots(state, host, [dagger])
+    assert roots == ["/home/hph/Code/lerobot/outputs/datasets/dagger_L4_full48_holdout22_40_030000"]
+
+    local_repo_path = tmp_path / "outputs" / "exports" / "training_views" / "base"
+    assert (
+        gateway._map_path_for_merge_host(state, host, str(local_repo_path))
+        == "/home/hph/Code/lerobot/outputs/exports/training_views/base"
+    )
+
+    wrong_host_path = "alice@10.0.0.5:/home/alice/Code/lerobot/outputs/datasets/dagger"
+    with pytest.raises(ValueError, match="belongs to alice@10.0.0.5"):
+        gateway._resolve_merge_dagger_roots(state, host, [wrong_host_path])
+
+
+def test_starting_a_rollout_aligns_use_amp_before_building_the_command():
+    """`use_amp` is inert during training but gates `torch.autocast` in the rollout runtime, so a
+    checkpoint trained after the training page's default was turned off would be graded on a
+    different inference path from the checkpoints it is compared against.
+
+    Asserted against the source because `_start_rollout` needs the workstation profile, a real
+    checkpoint listing and a subprocess before it reaches this line -- and the thing that has to
+    hold is only that the alignment happens *before* the command is built, since after it the
+    value has already been read by a process the gateway no longer controls.
+    """
+    import inspect
+
+    source = inspect.getsource(gateway._start_rollout)
+    align = source.find("use_amp_alignment.align_checkpoint_use_amp(")
+    build = source.find("rollout_backend.build_rollout_command(")
+    assert align > -1, (
+        "_start_rollout no longer aligns use_amp. Rollouts of checkpoints trained on either side "
+        "of the training page's default will silently differ in whether inference runs under "
+        "torch.autocast, and nothing reports it."
+    )
+    assert build > -1
+    assert align < build, "use_amp is aligned after the rollout command is built, which is too late"
+
+
+def test_a_use_amp_alignment_failure_does_not_block_the_rollout():
+    """The mismatch this guards against is worth a warning, not a stopped rollout: refusing to
+    start over a metadata field costs the operator more than the inconsistency it prevents."""
+    import inspect
+
+    source = inspect.getsource(gateway._start_rollout)
+    handler = source[source.find("use_amp_alignment.AlignmentError") :]
+    assert "use_amp_alignment.AlignmentError" in source, (
+        "_start_rollout no longer handles AlignmentError; an unreadable checkpoint config would "
+        "turn into a failed rollout start"
+    )
+    assert 'state.log("warn"' in handler.split("else:")[0]
+    assert "raise" not in handler.split("else:")[0]

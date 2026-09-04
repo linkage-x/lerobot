@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import type { CameraCropSpecs, GuiSnapshot } from "../api";
 import { api } from "../apiClient";
-import type { DatasetCameraFeature, DatasetFramePreview, RecordedDataset, TrainingView } from "../types";
+import type {
+  DaggerMergeCheck,
+  DatasetCameraFeature,
+  DatasetFramePreview,
+  RecordedDataset,
+  TrainingView
+} from "../types";
 import {
   StatusDot,
   Metric,
@@ -12,15 +18,33 @@ import {
   taskStatusDot
 } from "../shared/ui";
 import { CameraCropPicker, CropNumberField } from "./CameraCropPicker";
+import {
+  daggerMergeCandidates,
+  mergeBlockedReason,
+  mergeFormFingerprint,
+  mergedViewName,
+  parseEpisodeSelection,
+  visibleDaggerCandidates
+} from "./daggerMerge";
 import { fullFrameCrop, isFullFrame, normalizeCrop, sideRoiCrop, type CropRect } from "./cropGeometry";
 import {
+  cropRectsFromSpecs,
+  cropSelectionFingerprint,
+  cropSourceFingerprint,
+  cropSourceFingerprintKey,
+  cropSourcesMatch,
   cropSpecsForSelection,
+  cropsAreFullFrame,
+  fullFrameCropsForFeatures,
   groupDatasetsByTask,
+  selectionCameraDimensionsProblem,
   selectionFpsProblem,
+  suggestedCropViewForSelection,
   summarizeSelection,
   taskBaseName,
   trainingViewName,
-  viewFpsProblem
+  viewFpsProblem,
+  type CropSourceFingerprint
 } from "./trainingViewSelection";
 
 type ActionMode = "absolute_ee" | "delta_ee_from_prev_cmd" | "delta_ee_from_current";
@@ -49,7 +73,12 @@ const actionModeCopy: Record<ActionMode, { label: string; blurb: string }> = {
   }
 };
 
+// Mirrors POLICY_READY_DAGGER_MERGE_TARGET in gateway.py. A merge reports progress through the
+// same datasetExport slot a view build does, so the status panel has to be able to name it.
+const POLICY_READY_DAGGER_MERGE_TARGET = "policy_ready_dagger";
+
 function contractLabel(contract: string): string {
+  if (contract === POLICY_READY_DAGGER_MERGE_TARGET) return "Policy-ready DAgger merge";
   return actionModeCopy[contract as ActionMode]?.label ?? contract;
 }
 
@@ -73,6 +102,360 @@ function useDebounced<T>(value: T, delayMs: number): T {
     return () => window.clearTimeout(timer);
   }, [value, delayMs]);
   return settled;
+}
+
+/** Grow a training view with the corrections a DAgger rollout collected.
+ *
+ *  Deliberately not a mode of the Build panel above. Build derives a delta action contract by
+ *  differencing raw absolute-EE recordings; DAgger frames are already written in the action
+ *  space of the checkpoint that produced them, so putting them through the builder would
+ *  difference an already-differenced action and quietly train on the wrong numbers. This path
+ *  merges policy-ready frames as they are, which is only possible against a view that exists.
+ *
+ *  The merge writes into the same training-views root a build does, so what lands here is what
+ *  the Training page offers next -- no copying, no second place to look.
+ *
+ *  No training-host picker, although the endpoint takes one: a run resolves its view from the
+ *  *gateway's* views root (_start_training_run in gateway.py), so a merge run on a remote host
+ *  would write a view that the very next step cannot see. Merging where the gateway runs is the
+ *  only variant whose output is reachable.
+ */
+function DaggerMergePanel({
+  snapshot,
+  busy,
+  building,
+  builtViews,
+  datasets
+}: {
+  snapshot: GuiSnapshot;
+  busy: boolean;
+  building: boolean;
+  builtViews: TrainingView[];
+  datasets: RecordedDataset[];
+}) {
+  const [baseViewName, setBaseViewName] = useState("");
+  const [daggerPaths, setDaggerPaths] = useState<string[]>([]);
+  const [baseEpisodesText, setBaseEpisodesText] = useState("");
+  const [outputName, setOutputName] = useState("");
+  const [overwrite, setOverwrite] = useState(false);
+  const [copyVideos, setCopyVideos] = useState(false);
+  const [includeNonDagger, setIncludeNonDagger] = useState(false);
+  const [check, setCheck] = useState<DaggerMergeCheck | null>(null);
+  // What the standing check answered. A form edited afterwards must not leave a "compatible"
+  // sitting next to a Merge button that would now run something else.
+  const [checkedFingerprint, setCheckedFingerprint] = useState("");
+  const [checking, setChecking] = useState(false);
+  const [merging, setMerging] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const baseView = builtViews.find((view) => view.name === baseViewName) ?? null;
+  const candidates = daggerMergeCandidates(datasets, snapshot.processing);
+  const selected = candidates.filter((candidate) => daggerPaths.includes(candidate.dataset.path));
+  const selectedPaths = selected.map((candidate) => candidate.dataset.path);
+  const visible = visibleDaggerCandidates(candidates, { includeNonDagger, selectedPaths });
+  const hiddenCount = candidates.length - visible.length;
+  const episodeSelection = parseEpisodeSelection(baseEpisodesText, baseView?.episodes ?? 0);
+  const keptBaseEpisodes = episodeSelection.error
+    ? 0
+    : episodeSelection.episodes.length || baseView?.episodes || 0;
+  const targetName = baseViewName ? mergedViewName(baseViewName, selectedPaths, outputName) : "";
+  const existingView = builtViews.find((view) => view.name === targetName) ?? null;
+  const fingerprint = mergeFormFingerprint({
+    baseView: baseViewName,
+    daggerRoots: selectedPaths,
+    baseEpisodes: episodeSelection.episodes,
+    outputName
+  });
+  const checkIsCurrent = check !== null && checkedFingerprint === fingerprint;
+  const blockedReason = mergeBlockedReason({
+    baseView,
+    daggerCount: selectedPaths.length,
+    episodeError: episodeSelection.error,
+    keptBaseEpisodes,
+    existingView,
+    overwrite
+  });
+  const daggerEpisodes = selected.reduce((total, candidate) => total + candidate.dataset.totalEpisodes, 0);
+  const daggerFrames = selected.reduce((total, candidate) => total + candidate.dataset.totalFrames, 0);
+
+  const request = {
+    baseView: baseViewName,
+    daggerRoots: selectedPaths,
+    baseEpisodes: episodeSelection.episodes,
+    outputName: outputName.trim(),
+    overwrite,
+    copyVideos
+  };
+
+  const toggleDagger = (path: string) => {
+    setDaggerPaths((current) =>
+      current.includes(path) ? current.filter((item) => item !== path) : [...current, path]
+    );
+  };
+
+  const runCheck = async () => {
+    setChecking(true);
+    setError("");
+    setNotice("");
+    const result = await api.checkDaggerMerge(request);
+    setChecking(false);
+    setCheck(result);
+    setCheckedFingerprint(fingerprint);
+  };
+
+  const runMerge = async () => {
+    setMerging(true);
+    setError("");
+    setNotice("");
+    const result = await api.startDaggerMerge(request);
+    setMerging(false);
+    if (!result.ok) {
+      setError(result.error || "The merge could not be started.");
+      return;
+    }
+    // The gateway re-checks before it starts and returns that check; showing it rather than the
+    // one on screen keeps the panel reporting what the running job was actually cleared against.
+    if (result.merge) {
+      setCheck(result.merge);
+      setCheckedFingerprint(fingerprint);
+    }
+    setNotice(`Merging into ${targetName}. Progress is under Build Status below.`);
+  };
+
+  const checkBlockedReason = !baseView
+    ? "Pick the training view these corrections were collected against"
+    : selectedPaths.length === 0
+      ? "Select at least one DAgger correction dataset"
+      : episodeSelection.error;
+
+  return (
+    <section className="panel">
+      <div className="panel-heading">
+        <h2>DAgger Merge</h2>
+        <span>{targetName || "nothing selected"}</span>
+      </div>
+      <p className="panel-note">
+        Append the corrections a DAgger rollout recorded to the view the rolled-out checkpoint was
+        trained on. The correction frames are already in that checkpoint's action space, so they
+        are merged as they are — running them through Build above would difference an
+        already-differenced action. The merge refuses anything that would not line up: a different
+        rate, a different prompt, a different feature schema, or a correction dataset that has not
+        passed QC. Videos are symlinked unless you ask for copies.
+      </p>
+      {builtViews.length === 0 ? (
+        <div className="empty-dataset-list">
+          No training views yet. Build one above first — a merge extends a view, it cannot create one.
+        </div>
+      ) : (
+        <>
+          <label className="field">
+            <span>Base training view</span>
+            <select
+              value={baseViewName}
+              disabled={busy || merging}
+              onChange={(event) => setBaseViewName(event.target.value)}
+            >
+              <option value="">pick the view the checkpoint was trained on…</option>
+              {builtViews.map((view) => (
+                <option key={view.name} value={view.name}>
+                  {view.name} ({view.episodes} ep · {view.fps} fps
+                  {view.actionMode ? ` · ${contractLabel(view.actionMode)}` : ""})
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field">
+            <span>Base episodes to keep (optional)</span>
+            <input
+              value={baseEpisodesText}
+              onChange={(event) => setBaseEpisodesText(event.target.value)}
+              placeholder={baseView ? `all ${baseView.episodes} episode(s), e.g. 0-${Math.max(0, baseView.episodes - 1)}` : "all episodes"}
+              disabled={busy || merging || !baseView}
+            />
+          </label>
+          <p className="panel-note">
+            Empty keeps the whole base view. A subset is how a holdout stays a holdout: the
+            episodes a checkpoint was evaluated on must not enter the set it is retrained on, and
+            this is the only point where they can be left out — the merged view renumbers its
+            episodes, so the split cannot be reconstructed afterwards.
+            {episodeSelection.episodes.length > 0 && !episodeSelection.error ? (
+              <> Keeping {episodeSelection.episodes.length} of {baseView?.episodes ?? 0} base episode(s).</>
+            ) : null}
+          </p>
+          {visible.length === 0 ? (
+            <div className="empty-dataset-list">
+              No correction datasets. A DAgger rollout writes them to{" "}
+              <code>outputs/datasets/dagger_*</code>; tick &quot;show every recording&quot; to
+              reach one that was renamed.
+            </div>
+          ) : (
+            <div className="source-group">
+              {visible.map(({ dataset, qc, blockedReason: rowBlocked }) => {
+                const checked = daggerPaths.includes(dataset.path);
+                return (
+                  <div className={checked ? "source-row selected" : "source-row"} key={dataset.path}>
+                    <label className="source-row-main">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={busy || merging || Boolean(rowBlocked)}
+                        onChange={() => toggleDagger(dataset.path)}
+                      />
+                      <div>
+                        <div className="row-title">
+                          <StatusDot
+                            state={
+                              qc?.status === "qc_pass"
+                                ? "running"
+                                : qc?.status === "qc_warn"
+                                  ? "warning"
+                                  : qc?.status === "qc_failed"
+                                    ? "error"
+                                    : "idle"
+                            }
+                          />
+                          <strong>{dataset.name}</strong>
+                          <em>{qc ? processingStatusLabel[qc.status] : "QC not run"}</em>
+                        </div>
+                        <p>
+                          {dataset.totalEpisodes} episode(s) · {dataset.totalFrames} frames
+                          {dataset.fps ? ` · ${dataset.fps} fps` : ""}
+                        </p>
+                        {rowBlocked ? <p className="panel-note">{rowBlocked}.</p> : null}
+                      </div>
+                    </label>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <div className="control-row">
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={includeNonDagger}
+                onChange={(event) => setIncludeNonDagger(event.target.checked)}
+              />
+              <span>Show every recording{hiddenCount > 0 ? ` (${hiddenCount} hidden)` : ""}</span>
+            </label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={overwrite}
+                disabled={busy || merging}
+                onChange={(event) => setOverwrite(event.target.checked)}
+              />
+              <span>Replace the view if it already exists</span>
+            </label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={copyVideos}
+                disabled={busy || merging}
+                onChange={(event) => setCopyVideos(event.target.checked)}
+              />
+              <span>Copy videos instead of symlinking</span>
+            </label>
+          </div>
+          <label className="field">
+            <span>Merged view name (optional)</span>
+            <input
+              value={outputName}
+              onChange={(event) => setOutputName(event.target.value)}
+              placeholder={targetName || "derived from the base view and the corrections"}
+              disabled={busy || merging}
+            />
+          </label>
+          <div className="summary-grid">
+            <Metric label="Base episodes" value={baseView ? keptBaseEpisodes : 0} />
+            <Metric label="Correction sets" value={selectedPaths.length} />
+            <Metric label="Correction episodes" value={daggerEpisodes} />
+            <Metric label="Correction frames" value={daggerFrames.toLocaleString()} />
+            <Metric label="Contract" value={baseView?.actionMode ? contractLabel(baseView.actionMode) : "—"} />
+            <Metric label="Rate" value={baseView?.fps ? `${baseView.fps} fps` : "—"} />
+          </div>
+          {existingView ? (
+            <p className="panel-note">
+              {existingView.name} already exists ({existingView.episodes} episode(s), built{" "}
+              {existingView.buildId || existingView.modifiedAt}). Replacing it changes the frames
+              behind a path that checkpoints trained from keep pointing at.
+            </p>
+          ) : null}
+          {checkBlockedReason ? <p className="panel-note">{checkBlockedReason}.</p> : null}
+          {!checkBlockedReason && blockedReason ? <p className="panel-note">{blockedReason}.</p> : null}
+          <div className="control-row">
+            <button disabled={busy || checking || merging || Boolean(checkBlockedReason)} onClick={runCheck}>
+              {checking ? "Checking…" : "Check Compatibility"}
+            </button>
+            <button
+              className="primary"
+              disabled={
+                busy || building || checking || merging || Boolean(blockedReason) || !checkIsCurrent || !check?.ok
+              }
+              title={
+                blockedReason ||
+                (building ? "A build or merge is already running" : "") ||
+                (checkIsCurrent && check?.ok ? undefined : "Run the compatibility check first")
+              }
+              onClick={runMerge}
+            >
+              {merging ? "Starting…" : `Merge into ${targetName || "a new view"}`}
+            </button>
+          </div>
+          {error ? <p className="banner banner-error">{error}</p> : null}
+          {notice ? <p className="banner banner-ok">{notice}</p> : null}
+          {check ? (
+            <div className="subcard merge-check">
+              <p className={check.ok ? "banner banner-ok" : "banner banner-error"}>
+                {check.ok
+                  ? check.summary || "These datasets can be merged."
+                  : check.error || "The merge check refused these datasets."}
+              </p>
+              {checkIsCurrent ? null : (
+                <p className="panel-note">
+                  The form changed since this check ran; check again before merging.
+                </p>
+              )}
+              {check.sources && check.sources.length > 0 ? (
+                <div className="check-table">
+                  {check.sources.map((source) => (
+                    <div className="check-row" key={`${source.role}-${source.root}`}>
+                      <strong>{source.root.split("/").pop()}</strong>
+                      <span>
+                        {source.episodes} episode(s) · {source.frames} frames · {source.fps} fps
+                        {source.tasks?.length ? ` · "${source.tasks[0]}"` : ""}
+                      </span>
+                      <em>{source.role === "base" ? "base" : source.qc_status || "dagger"}</em>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {check.checks && check.checks.length > 0 ? (
+                <div className="check-table">
+                  {check.checks.map((item, index) => (
+                    <div className="check-row" key={`${item.name}-${index}`}>
+                      <strong>{item.name}</strong>
+                      <span>{item.message}</span>
+                      <em className={item.status === "pass" ? "qc-pass" : "qc-fail"}>{item.status}</em>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {check.detail?.length ? <pre className="log-tail">{check.detail.join("\n")}</pre> : null}
+              {check.ok ? (
+                <p className="hint">
+                  Merged view: <code>{check.outputRoot}</code> · {check.totalEpisodes} episode(s) ·{" "}
+                  {(check.totalFrames ?? 0).toLocaleString()} frames. It appears on the Training page
+                  once the merge finishes.
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+        </>
+      )}
+    </section>
+  );
 }
 
 /** Workstation counterpart of Dataset Export: build the policy-ready view of a v3 recording. */
@@ -107,6 +490,7 @@ function TrainingViewPage({
   const [taskPrompt, setTaskPrompt] = useState("");
   const [cropEnabled, setCropEnabled] = useState(false);
   const [cameraCrops, setCameraCrops] = useState<Record<string, CropRect>>({});
+  const [cropSource, setCropSource] = useState<CropSourceFingerprint | null>(null);
   // Which recording the crop is drawn on. The box applies to every build this page starts, so
   // the preview picks a source rather than following the row that is about to be built.
   const [previewPath, setPreviewPath] = useState("");
@@ -130,7 +514,7 @@ function TrainingViewPage({
   // outlive the recording it names.
   const selected = datasets.filter((dataset) => selectedPaths.includes(dataset.path));
   const taskGroups = useMemo(() => groupDatasetsByTask(datasets), [datasets.map((d) => d.path).join("|")]);
-  const cropCameraFeatures = Array.from(
+  const selectedCropCameraFeatures = Array.from(
     new Map(
       selected
         .flatMap((dataset) => dataset.cameraFeatures ?? [])
@@ -143,11 +527,36 @@ function TrainingViewPage({
   const previewCandidates = selected.filter((dataset) =>
     (dataset.cameraFeatures ?? []).some((feature) => feature.width > 0 && feature.height > 0)
   );
+  const activePreviewPath = previewCandidates.some((dataset) => dataset.path === previewPath)
+    ? previewPath
+    : previewCandidates[0]?.path ?? "";
+  const activePreviewDataset = previewCandidates.find((dataset) => dataset.path === activePreviewPath) ?? null;
+  const cropCameraFeatures = (activePreviewDataset?.cameraFeatures ?? selectedCropCameraFeatures).filter(
+    (feature) => feature.width > 0 && feature.height > 0
+  );
+  const cropSelectionSource = cropSelectionFingerprint(selected);
+  const cropPreviewSource = cropSourceFingerprint(activePreviewDataset) ?? cropSelectionSource;
+  const cropPreviewSourceKey = cropSourceFingerprintKey(cropPreviewSource);
+  const cropSourceKey = cropSourceFingerprintKey(cropSource);
+  const cropFeatureKey = cropCameraFeatures
+    .map((feature) => `${feature.key}:${feature.width}x${feature.height}`)
+    .sort()
+    .join("|");
+  const suggestedCropView = suggestedCropViewForSelection(builtViews, selected, actionMode);
+  const suggestedCameraCrops = cropRectsFromSpecs(suggestedCropView?.cameraCrops);
+  const defaultCameraCrops = Object.keys(suggestedCameraCrops).length > 0
+    ? suggestedCameraCrops
+    : fullFrameCropsForFeatures(cropCameraFeatures);
+  const defaultCameraCropKey = JSON.stringify(
+    Object.entries(defaultCameraCrops).sort(([left], [right]) => left.localeCompare(right))
+  );
+  const currentCropsAreFullFrame = cropsAreFullFrame(cameraCrops, cropCameraFeatures);
   const recordedPrompts = Array.from(
     new Set(selected.map((dataset) => dataset.taskPrompt ?? "").filter(Boolean))
   );
   const summary = summarizeSelection(selected, viewFps);
   const fpsProblem = selectionFpsProblem(selected, viewFps);
+  const cameraDimensionsProblem = selectionCameraDimensionsProblem(selected);
   const cropResult = cropSpecsForSelection(selected, cropEnabled, cameraCrops);
   const targetViewName = trainingViewName(selected.map((dataset) => dataset.name), actionMode);
   const existingView = builtViews.find((view) => view.name === targetViewName) ?? null;
@@ -163,7 +572,9 @@ function TrainingViewPage({
         ? "Every selected episode is marked not for training"
         : fpsProblem
           ? `Cannot build at ${viewFps === 0 ? "the source rate" : `${viewFps} fps`}: ${fpsProblem}`
-          : cropResult.error ?? "";
+          : cameraDimensionsProblem
+            ? cameraDimensionsProblem
+            : cropResult.error ?? "";
 
   const toggleSelected = (path: string) => {
     setSelectedPaths((current) =>
@@ -184,13 +595,14 @@ function TrainingViewPage({
     const crops = Object.entries(view.cameraCrops ?? {});
     setCropEnabled(crops.length > 0);
     setCameraCrops((current) => {
-      const next = { ...current };
+      const next = crops.length > 0 ? { ...current } : {};
       for (const [key, box] of crops) {
         const [x, y, w, h] = box;
         next[key] = { x, y, w, h };
       }
       return next;
     });
+    setCropSource(crops.length > 0 ? cropPreviewSource : null);
     // The sources only when nothing is ticked yet. Adopting a view's settings is usually the
     // first step of "build that task again, now that it has more sessions", so replacing an
     // explicit selection would drop the very recording that prompted the rebuild.
@@ -202,9 +614,6 @@ function TrainingViewPage({
   };
   // Derived, not stored: the dataset list is repolled every second and a stored path would
   // survive the recording it names being deleted.
-  const activePreviewPath = previewCandidates.some((dataset) => dataset.path === previewPath)
-    ? previewPath
-    : previewCandidates[0]?.path ?? "";
   const previewEpisodes = framePreview?.episodes ?? [];
   const activePreviewEpisode = previewEpisodes.some((item) => item.episode === previewEpisode)
     ? previewEpisode
@@ -229,6 +638,22 @@ function TrainingViewPage({
   }, [exportStatus.state]);
 
   useEffect(() => {
+    if (!cropEnabled) {
+      if (cropSource !== null) setCropSource(null);
+      return;
+    }
+    if (!cropPreviewSource) return;
+    if (!cropSource) {
+      setCropSource(cropPreviewSource);
+      return;
+    }
+    if (!cropSourcesMatch(cropSource, cropPreviewSource)) {
+      setCameraCrops(defaultCameraCrops);
+      setCropSource(cropPreviewSource);
+    }
+  }, [cropEnabled, cropPreviewSourceKey, cropSourceKey, cropFeatureKey, defaultCameraCropKey]);
+
+  useEffect(() => {
     if (!cropEnabled || !activePreviewPath) {
       setFramePreview(null);
       return;
@@ -246,9 +671,11 @@ function TrainingViewPage({
 
   const setCameraCrop = (key: string, rect: CropRect) => {
     setCameraCrops((current) => ({ ...current, [key]: rect }));
+    setCropSource(cropPreviewSource);
   };
   const useRecommendedCameraCrop = () => {
     setCropEnabled(true);
+    setCropSource(cropPreviewSource);
     setCameraCrops(
       Object.fromEntries(
         cropCameraFeatures.map((feature) => [
@@ -259,11 +686,8 @@ function TrainingViewPage({
     );
   };
   const resetCameraCrops = () => {
-    setCameraCrops(
-      Object.fromEntries(
-        cropCameraFeatures.map((feature) => [feature.key, fullFrameCrop(feature.width, feature.height)])
-      )
-    );
+    setCropSource(cropPreviewSource);
+    setCameraCrops(fullFrameCropsForFeatures(cropCameraFeatures));
   };
   // The gateway refuses to build a view of a dataset that has not passed QC, so the row has to
   // say where a dataset stands before the button is pressed. Shown rather than filtered: on this
@@ -356,7 +780,14 @@ function TrainingViewPage({
               type="checkbox"
               checked={cropEnabled}
               disabled={busy || building || cropCameraFeatures.length === 0}
-              onChange={(event) => setCropEnabled(event.target.checked)}
+              onChange={(event) => {
+                const enabled = event.target.checked;
+                setCropEnabled(enabled);
+                setCropSource(enabled ? cropPreviewSource : null);
+                if (enabled && (Object.keys(cameraCrops).length === 0 || currentCropsAreFullFrame)) {
+                  setCameraCrops(defaultCameraCrops);
+                }
+              }}
             />
             <span>Use crop for training view</span>
           </label>
@@ -773,6 +1204,14 @@ function TrainingViewPage({
           </button>
         </div>
       </section>
+
+      <DaggerMergePanel
+        snapshot={snapshot}
+        busy={busy}
+        building={building}
+        builtViews={builtViews}
+        datasets={datasets}
+      />
 
       {exportStatus.state !== "idle" && (
         <section className="panel">

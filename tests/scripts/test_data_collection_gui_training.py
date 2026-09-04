@@ -195,6 +195,67 @@ def test_policy_config_json_is_passed_through_as_one_argument():
     assert argv[argv.index("--policy-config") + 1] == '{"optimizer_lr": 1e-5}'
 
 
+def test_resume_training_names_checkpoint_and_drops_fresh_finetune_knobs():
+    checkpoint = "/repo/outputs/train/L4_full48_holdout22_40/checkpoints/030000"
+    argv = training.build_train_argv(
+        host=_remote_host(),
+        view_root="/repo/view",
+        repo_id="local/v",
+        job_name="v__pi05",
+        policy="pi05",
+        steps=40000,
+        batch_size=2,
+        num_workers=4,
+        save_freq=2000,
+        log_freq=100,
+        device="cuda",
+        use_amp=True,
+        policy_config='{"optimizer_lr": 1e-4}',
+        pretrained_path="lerobot/pi05_base",
+        lora_enabled=True,
+        lora_r=32,
+        lora_alpha=32,
+        lora_target_modules="all-linear",
+        resume=True,
+        resume_checkpoint=checkpoint,
+        wandb_enabled=False,
+        wandb_project="",
+        wandb_entity="",
+    )
+
+    assert "--resume" in argv
+    assert argv[argv.index("--resume-checkpoint") + 1] == checkpoint
+    assert argv[argv.index("--steps") + 1] == "40000"
+    assert "--pretrained-path" not in argv
+    assert "--lora" not in argv
+    assert "--policy-config" not in argv
+    assert "--use-amp" not in argv
+
+
+def test_resume_training_requires_a_checkpoint_path():
+    with pytest.raises(training.TrainingError, match="Resume training needs a checkpoint path"):
+        training.build_train_argv(
+            host=_remote_host(),
+            view_root="/repo/view",
+            repo_id="local/v",
+            job_name="v__pi05",
+            policy="pi05",
+            steps=10,
+            batch_size=2,
+            num_workers=4,
+            save_freq=5,
+            log_freq=1,
+            device="cuda",
+            use_amp=False,
+            policy_config="",
+            resume=True,
+            resume_checkpoint="",
+            wandb_enabled=False,
+            wandb_project="",
+            wandb_entity="",
+        )
+
+
 # ---------------------------------------------------------------- launch command ---
 
 

@@ -940,6 +940,33 @@ def test_load_camera_crop_specs_reads_the_crop_and_the_frame_it_was_drawn_on(tmp
     assert source_hw == {'observation.images.side': (480, 640)}
 
 
+def test_load_camera_crop_specs_recurses_through_a_cropped_source_view(tmp_path: Path):
+    base_view = _write_cropped_view(tmp_path, crop=[108, 58, 444, 382], source_shape=[480, 640, 3])
+    dagger_root = tmp_path / 'dagger'
+    (dagger_root / 'meta').mkdir(parents=True)
+    (dagger_root / 'meta' / 'info.json').write_text(
+        json.dumps({'features': {'observation.images.side': {'shape': [382, 444, 3]}}}),
+        encoding='utf-8',
+    )
+    merged_view = tmp_path / 'merged_view'
+    (merged_view / 'meta').mkdir(parents=True)
+    (merged_view / 'meta' / 'il_view_manifest.json').write_text(
+        json.dumps(
+            {
+                'source_dataset_roots': [str(base_view), str(dagger_root)],
+                'camera_crop_specs': {'observation.images.side': [108, 58, 444, 382]},
+                'image_resize_shape': None,
+            }
+        ),
+        encoding='utf-8',
+    )
+
+    crops, source_hw = fr3_act_infer_real_runtime.load_camera_crop_specs(merged_view)
+
+    assert crops == {'observation.images.side': [108, 58, 444, 382]}
+    assert source_hw == {'observation.images.side': (480, 640)}
+
+
 def test_load_camera_crop_specs_is_empty_for_a_full_frame_view(tmp_path: Path):
     view_root = tmp_path / 'view'
     (view_root / 'meta').mkdir(parents=True)

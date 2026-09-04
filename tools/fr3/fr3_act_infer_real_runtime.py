@@ -1008,15 +1008,44 @@ def resolve_alignment_dataset_root_and_state_key(dataset_root: Path) -> tuple[Pa
 
 
 def _load_crop_source_frame_shapes(
-    manifest: dict[str, Any], manifest_path: Path, feature_keys: list[str]
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    feature_keys: list[str],
+    *,
+    _visited_roots: set[Path] | None = None,
 ) -> dict[str, tuple[int, int]]:
     """The (H, W) each crop was drawn on, read off the recording the view was built from."""
     roots = manifest.get('source_dataset_roots') or []
     if not roots and manifest.get('source_dataset_root'):
         roots = [manifest['source_dataset_root']]
+    visited_roots = _visited_roots or set()
     for root_value in roots:
         try:
-            info = _load_dataset_info(_resolve_existing_dataset_root(root_value))
+            root = _resolve_existing_dataset_root(root_value)
+        except (FileNotFoundError, ValueError, OSError):
+            continue
+        if root in visited_roots:
+            continue
+        visited_roots.add(root)
+
+        nested_manifest_path = root / 'meta' / 'il_view_manifest.json'
+        if nested_manifest_path.is_file():
+            try:
+                nested_manifest = json.loads(nested_manifest_path.read_text(encoding='utf-8'))
+            except (OSError, json.JSONDecodeError):
+                nested_manifest = None
+            if isinstance(nested_manifest, dict):
+                nested_shapes = _load_crop_source_frame_shapes(
+                    nested_manifest,
+                    nested_manifest_path,
+                    feature_keys,
+                    _visited_roots=visited_roots,
+                )
+                if len(nested_shapes) == len(feature_keys):
+                    return nested_shapes
+
+        try:
+            info = _load_dataset_info(root)
         except (FileNotFoundError, ValueError, OSError):
             continue
         features = info.get('features') or {}
