@@ -1480,7 +1480,45 @@ def _summarize_delta_reports(
     }
 
 
-def build_policy_section(args: argparse.Namespace, image_resize_shape: list[int] | None) -> dict[str, Any]:
+# Action dimensions a human-gated takeover leaves untouched. `dagger_takeover` drives the EE
+# with the SpaceMouse and deliberately *holds* the gripper at whatever the policy last commanded,
+# so that engaging a correction cannot drop what is between the fingers. Right on the arm, wrong
+# in the dataset: the gripper column of a correction frame is then the learner's own output
+# wearing an expert's label, which is the one thing DAgger's argument forbids -- and on this rig
+# it also carries the highest loss weight. Suffix-matched so a view that renamed or reordered its
+# action columns still resolves to the right index.
+INTERVENTION_UNLABELLED_ACTION_SUFFIXES = ("gripper.pos",)
+
+
+def intervention_unsupervised_dims_for_view(view_root: Path) -> list[int]:
+    """Which action dims a correction frame in this view does not label. Empty for a plain view.
+
+    Derived from the view rather than passed in, for the same reason the delta report is: the
+    answer is a property of how these episodes were recorded, and a flag an operator has to
+    remember for exactly the views that were merged with DAgger data is a flag that will be
+    forgotten on the run where it matters. A view with no `is_intervention` column has no
+    correction frames, so there is nothing to mask and the key stays absent from the config.
+    """
+    info_path = view_root / "meta" / "info.json"
+    if not info_path.is_file():
+        return []
+    features = load_json(info_path).get("features")
+    if not isinstance(features, dict) or "is_intervention" not in features:
+        return []
+    action = features.get("action")
+    names = list(action.get("names") or []) if isinstance(action, dict) else []
+    return [
+        index
+        for index, name in enumerate(names)
+        if str(name).endswith(INTERVENTION_UNLABELLED_ACTION_SUFFIXES)
+    ]
+
+
+def build_policy_section(
+    args: argparse.Namespace,
+    image_resize_shape: list[int] | None,
+    intervention_unsupervised_dims: list[int] | None = None,
+) -> dict[str, Any]:
     """The `policy` block of the generated train config.
 
     `act` and `diffusion` are spelled out explicitly, from flags that default to the
@@ -1530,6 +1568,11 @@ def build_policy_section(args: argparse.Namespace, image_resize_shape: list[int]
                 "optimizer_lr": args.dp_lr,
             }
         )
+    if args.policy == "pi05" and intervention_unsupervised_dims:
+        # Only pi0.5 has the field, and only a DAgger-merged view produces a non-empty list.
+        # Set before `--policy-config` so an operator who wants the upstream behaviour back can
+        # say `{"intervention_unsupervised_action_dims": null}` and win.
+        policy["intervention_unsupervised_action_dims"] = list(intervention_unsupervised_dims)
     policy.update(parse_policy_config(args.policy_config))
     return policy
 
@@ -1671,7 +1714,9 @@ def adopt_existing_view(args: argparse.Namespace, view_root: Path) -> dict[str, 
 
 def make_train_config(args: argparse.Namespace, view_root: Path, repo_id: str, config_path: Path) -> None:
     image_resize_shape = parse_hw(args.image_resize_shape)
-    policy = build_policy_section(args, image_resize_shape)
+    policy = build_policy_section(
+        args, image_resize_shape, intervention_unsupervised_dims_for_view(view_root)
+    )
 
     dataset_cfg: dict[str, Any] = {
         "repo_id": repo_id,
@@ -1905,7 +1950,9 @@ def run_smoke(args: argparse.Namespace, view_root: Path, repo_id: str) -> None:
     # Built from the same block the train config gets, minus the keys that describe the
     # training run rather than the policy. A smoke test that constructed the policy a
     # different way from training would be testing the smoke test.
-    policy_section = build_policy_section(args, parse_hw(args.image_resize_shape))
+    policy_section = build_policy_section(
+        args, parse_hw(args.image_resize_shape), intervention_unsupervised_dims_for_view(view_root)
+    )
     cfg_kwargs = {
         key: value
         for key, value in policy_section.items()

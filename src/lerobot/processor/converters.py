@@ -160,6 +160,13 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
 
     This includes padding flags, task description, and indices.
 
+    `is_intervention` travels with the padding flags because it answers the same question they
+    do: which entries of the batch carry a label a policy should regress on. A frame recorded
+    while a human was driving is still a real frame, but the axes that human did not touch are
+    the learner's own output written back as if it were the expert's -- a column a loss has to
+    be able to see in order to skip. Keys not listed here never reach `policy.forward`, so a
+    dataset column that is not an observation is dropped silently without one.
+
     Args:
         batch: The batch dictionary.
 
@@ -172,8 +179,19 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     index_key = {"index": batch["index"]} if "index" in batch else {}
     task_index_key = {"task_index": batch["task_index"]} if "task_index" in batch else {}
     episode_index_key = {"episode_index": batch["episode_index"]} if "episode_index" in batch else {}
+    intervention_key = (
+        {"is_intervention": batch["is_intervention"]} if "is_intervention" in batch else {}
+    )
 
-    return {**pad_keys, **task_key, **subtask_key, **index_key, **task_index_key, **episode_index_key}
+    return {
+        **pad_keys,
+        **task_key,
+        **subtask_key,
+        **index_key,
+        **task_index_key,
+        **episode_index_key,
+        **intervention_key,
+    }
 
 
 def create_transition(

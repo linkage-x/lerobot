@@ -5125,6 +5125,7 @@ _TRAINING_POLICY_CONFIG_KEYS = (
     "compile_model",
     "normalization_mapping",
     "action_loss_weights",
+    "intervention_unsupervised_action_dims",
     "chunk_size",
     "n_action_steps",
     "num_inference_steps",

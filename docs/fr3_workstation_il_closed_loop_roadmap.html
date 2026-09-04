@@ -549,6 +549,98 @@ step=270  safe_ee=(0.3916, -0.2185, 0.0489)  model_gripper_raw=1.14</div>
 
     <div class="card full">
       <div class="section-head">
+        <h2>DAgger 合并反而退化：24% 的新数据里，有 32% 的监督是伪造的</h2>
+        <span class="badge p0">2026-09-04 DAgger 根因</span>
+      </div>
+      <p><code>L4_full48_plus_dagger_030000</code>（48 条示教 + 47 条 DAgger 片段，31418 帧）训到 30K 后，插孔比 <code>L4_full48_holdout22_40</code> baseline <b>明显退化</b>：定位不准、犹豫、反复停顿。两个 checkpoint 的超参逐字相同（batch 8 / 30000 步 / LoRA r64 α64 / warmup 200 / MEAN_STD / <code>action_loss_weights [1,1,1,0.2,2.0]</code>），<code>use_amp_alignment.json</code> 记录对齐发生在 <code>2026-09-04T02:40:32Z</code>，早于 02:48 那次 rollout，<b>两边跑在同一条 autocast 路径上</b>。唯一的变量就是数据。</p>
+
+      <h3 style="margin:14px 0 6px">闭环证据：策略学会了不动</h3>
+      <p>只统计 <code>source=policy</code> 的步（接管帧已剔除），比较 policy 自己发出的每步指令位移：</p>
+      <table class="table">
+        <tr><th>指标</th><th>baseline ck030000<br>（两次 rollout）</th><th><b>+DAgger ck030000</b></th><th></th></tr>
+        <tr><td>单步指令位移中位数</td><td>1.962 / 1.865 mm</td><td><b>0.059 mm</b></td><td>塌了 33 倍</td></tr>
+        <tr><td>p90</td><td>2.860 / 3.192 mm</td><td>1.819 mm</td><td></td></tr>
+        <tr><td>&lt;0.05 mm（原地不动）</td><td>10% / 11%</td><td><b>47%</b></td><td>一半的控制步没有动</td></tr>
+        <tr><td>&lt;0.2 mm</td><td>20% / 28%</td><td><b>61%</b></td><td></td></tr>
+        <tr><td>单次 rollout 的 policy 步数</td><td>154–411</td><td><b>1086 / 2287 / 1086</b></td><td>不收敛，靠超时结束</td></tr>
+        <tr><td><code>model_gripper_raw</code> 落在 0.05–0.95</td><td>11% / 15%</td><td><b>28%</b></td><td>夹爪指令变糊</td></tr>
+      </table>
+      <p>“定位不准”是结果，<b>“不动”才是行为</b>。而“不动”正是这批 DAgger 数据自己的统计特征。</p>
+
+      <h3 style="margin:14px 0 6px">数据侧：同一批状态上，两种互相矛盾的动作分布</h3>
+      <p>按 <code>observation.state.ee.z &lt; 0.10 m</code> 取插孔段。DAgger 只占全量 23.7% 的帧，但占<b>插孔段 34%</b>——修正天然集中在瓶颈处，所以它在关键状态上的权重远高于名义比例。</p>
+      <table class="table">
+        <tr><th>插孔段 (z&lt;0.10)</th><th>示教 48 条 (n=11608)</th><th>DAgger 47 条 (n=5968)</th></tr>
+        <tr><td>|dxyz| 中位</td><td>0.76 mm/帧</td><td><b>0.51 mm</b></td></tr>
+        <tr><td>|dxyz| p95 / max</td><td>2.54 / 15.80 mm</td><td>1.95 / <b>2.48 mm</b></td></tr>
+        <tr><td>&lt;0.1 mm 帧</td><td>25%</td><td><b>37%</b></td></tr>
+        <tr><td>连续静止段平均 / 最长</td><td>17 / 39 帧</td><td><b>30 / 107 帧</b>（3.6 秒）</td></tr>
+        <tr><td>夹爪动作落在中间值</td><td>10%</td><td><b>37%</b></td></tr>
+        <tr><td><code>drz</code> std（全量）</td><td>9.8e-04</td><td><b>1.7e-04</b>，79.6% 是精确 0</td></tr>
+      </table>
+      <p>人做纠偏时本来就会“慢慢挪、停下来看”。<b>操作员的思考时间被原样标注成了专家动作。</b></p>
+
+      <h3 style="margin:14px 0 6px">机理一：片段末尾的零动作被 padding 放大 49 倍，而 pi0.5 不 mask</h3>
+      <p><code>dagger_dataset.py</code> 的合同是“操作员松手 = 片段结束”，所以 <b>98% 的 DAgger episode 最后一帧位移恰好是 0</b>（示教是 100%，但那是任务做完后的收势）。而 <code>LeRobotDataset._get_query_indices</code> 在 episode 边界用 <code>min(ep_end-1, ...)</code> 钳位，<code>chunk_size=50</code> 意味着每条 episode 尾部把最后一个动作重复最多 49 次：</p>
+      <div class="flow">src/lerobot/policies/act/modeling_act.py:148    F.l1_loss(...) * ~batch["action_is_pad"].unsqueeze(-1)
+src/lerobot/policies/pi05/modeling_pi05.py       losses.mean()          # 全文没有 is_pad
+
+padding 占动作监督的比例
+  示教 48 条   58800 / 1198550 =  4.9%     （发生在任务完成后的收势位姿）
+  DAgger 47 条 56244 /  372350 = 15.1%     （发生在孔边上，内容是“接下来 50 步不动”）
+  真实抽样验证：ep94（89 帧）倒数第 3 帧 → 50 步里 47 步是 padding</div>
+      <p><code>action_is_pad</code> 一直被 dataset 算出来、被 <code>converters.py</code> 带进 batch，只是 pi0/pi0.5 从来没读过它。ACT 从写出来那天就 mask 了。<b>片段越碎，被伪造的监督越多</b>——本视图最短的一条 span 只有 2 帧，它 96% 的监督是 padding。</p>
+
+      <h3 style="margin:14px 0 6px">机理二：夹爪那一维根本不是专家标签，是策略自己的输出——还带 2.0 权重</h3>
+      <div class="flow">tools/fr3/dagger_takeover.py:428
+    self._gripper_hold = float(previous_sent_command[GRIPPER_KEY])   # 接管时冻结在“策略最后一次输出”</div>
+      <p>设计意图是对的：SpaceMouse 报的是绝对夹爪位置，接管瞬间直通会让夹爪弹到操作员上次按键的位置，而失败往往发生在指间已经夹着东西的时候。<b>在机械臂上是对的，写进数据集就是错的</b>——那一列成了 learner 自己的输出披上专家标签，正是 DAgger 正确性论证唯一禁止的事。而 <code>action_loss_weights</code> 给夹爪的是全场最高的 <b>2.0</b>。回放侧对上了：中间值夹爪指令 11–15% → 28%。夹爪没夹紧，peg 在指间松动，本身就直接表现为“对不准孔”。</p>
+
+      <h3 style="margin:14px 0 6px">机理三：delta 动作 + 闭环，<code>a=0</code> 是吸引子</h3>
+      <p>执行零位移 → 下一帧观测几乎不变 → 再预测零位移。静止样本在闭环里不会被别的样本平均掉，而是<b>自我强化</b>。数据里 35–37% 的静止帧，在闭环里变成 47%——<b>策略的静止率超过了数据本身</b>。baseline 是反过来的（数据 18–25% 静止，策略 10%）。同时 pi0.5 是 flow matching，对同一观测下的多峰目标不取均值而是<b>采样其中一个峰</b>：孔边上现在有“果断插进去”和“蠕动然后停住”两个峰，每个 chunk 随机选一个，宏观上就是犹豫和反复。</p>
+
+      <div class="callout warn">
+        <b>已排除，省得再查：</b>
+        <br>• <b>归一化漂移</b>：action std 只缩了 8–10%（0.00070→0.00064），state 分位数基本没动。不是原因。
+        <br>• <b>裁剪 / 几何不一致</b>：DAgger 视频是 symlink 直接挂进合并视图的，542×286 / 444×382 与 base 逐位一致，<code>build_dagger_frame</code> 写的就是 policy 看到的裁剪。（唯一差别是编码器 h264 vs libsvtav1。）
+        <br>• <b>prompt</b>：<code>total_tasks=1</code>，两边同一句。
+        <br>• <b>超参 / use_amp</b>：见开头。
+        <br>• 次要变量：固定 30000 步预算下示教帧的曝光从 10.0 epoch 降到 7.64（被稀释 24%），解释不了 33 倍的步长塌缩。
+      </div>
+
+      <h3 style="margin:14px 0 6px">已落地的修复</h3>
+      <p>两条都是“把伪造的监督从 loss 里拿掉”，不是调权重、不是重采样——被去掉的条目<b>不进分子也不进分母</b>，否则 mask 只是给 padding 多的样本悄悄降了学习率。</p>
+      <table class="table">
+        <tr><th>修复</th><th>代码落点</th><th>行为</th></tr>
+        <tr>
+          <td><b>padding 不再当监督</b></td>
+          <td><code>modeling_pi05.py::action_supervision_mask / _masked_mean</code>，<code>forward()</code> 的三处 reduction 全部改为按有效项求均值</td>
+          <td>无条件生效（与 ACT 一致）。没有 <code>action_is_pad</code> 的 batch 返回 <code>None</code>，reduction 与上游逐位相同。</td>
+        </tr>
+        <tr>
+          <td><b>接管帧不再监督夹爪</b></td>
+          <td><code>configuration_pi05.py::intervention_unsupervised_action_dims</code>；<code>converters.py::_extract_complementary_data</code> 把 <code>is_intervention</code> 随 pad flag 一起带进 batch；<code>fr3_train_il_policy.py::intervention_unsupervised_dims_for_view</code> 从 view 自己的 <code>meta/info.json</code> 推导索引</td>
+          <td>视图里有 <code>is_intervention</code> 列才生效，索引按 action 列名后缀 <code>gripper.pos</code> 匹配（<code>--action-drop-dims</code> 会重排列，写死 4 会 mask 错维）。<code>--policy-config</code> 仍然最后生效，可覆盖。</td>
+        </tr>
+      </table>
+      <div class="flow">合并视图 L4_full48_plus_dagger_030000 上，被拿掉的监督
+  整体   supervised_fraction = 0.8865        # 11.3% 的动作监督是伪造的
+  DAgger 部分                 = 0.6792        # 32.1%
+  示教部分                    = 0.9510        # 4.9%（纯 padding）
+新增 loss_dict["supervised_fraction"] -> wandb（与 loss_per_dim 同路，控制台不打；无 wandb 时
+用上面这三个数离线核对，它们只取决于 episode 长度和 chunk_size）</div>
+      <div class="callout warn">
+        <b>loss 数值不再与旧 run 可比。</b>padding 是“重复上一帧”的<b>易题</b>，去掉它会让报告的 loss 略微升高；<code>loss_per_dim</code> 同理，且夹爪那一维现在只在示教帧上统计。跨 run 比 loss 前先看 <code>supervised_fraction</code> 是不是同一个数。
+      </div>
+      <p class="small">回归覆盖：<code>tests/policies/pi0_pi05/test_pi05_action_supervision_mask.py</code>（纯张量：不 mask 时返回 None、padding 离开分母、按维分别计数、两种 mask 叠加、越界索引报错、flag 形状兼容），<code>tests/scripts/test_fr3_train_il_policy.py</code>（无 <code>is_intervention</code> 的视图不写该键、合并视图推出 <code>[4]</code>、列重排后推出 <code>[0]</code>、非 pi0.5 不写、<code>--policy-config</code> 覆盖）。真实视图端到端已验证：<code>make_pre_post_processors</code> 的完整 preprocessor 之后 <code>action_is_pad</code> 与 <code>is_intervention</code> 都还在 batch 里（此前 <code>batch_to_transition</code> 会把后者静默丢掉）；ep94（89 帧）倒数第 3 帧 50 步里有 47 步是 padding，监督条目从 250 降到 <b>12</b>，示教帧仍是 250。20 步真机训练跑通，生成配置里自动出现 <code>'intervention_unsupervised_action_dims': [4]</code>，无需手填 JSON。</p>
+
+      <div class="callout p0">
+        <b>下一步不是继续加 DAgger 数据，是用同一批数据重训一次。</b>数据没变、超参没变、只有 loss 的定义变了，所以这是一次干净的单变量对照：如果 <code>&lt;0.05 mm</code> 的步占比回到 baseline 的 10% 量级，机理一 + 二成立；如果只回到 25–30%，剩下的就是机理三和“操作员死时间”本身，那时再动采集侧（见任务清单 P1）。
+      </div>
+    </div>
+
+    <div class="card full">
+      <div class="section-head">
         <h2>近期任务清单</h2>
         <span class="badge todo">Next</span>
       </div>
@@ -624,6 +716,30 @@ step=270  safe_ee=(0.3916, -0.2185, 0.0489)  model_gripper_raw=1.14</div>
           <td>训练一个最小 ACT checkpoint 并跑 <code>smoke</code>/<code>preview</code>。</td>
           <td><code>tools/fr3/fr3_train_il_policy.py</code>、<code>tools/fr3/run_pick_place_infer_workstation.sh</code></td>
           <td>checkpoint 加载、相机打开、首帧对齐、action decode 全通过，无运动异常。</td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0</span></td>
+          <td>用 <b>同一个</b> <code>L4_full48_plus_dagger_030000</code> 视图重训 30K，验证 supervision mask。数据不变、超参不变，只有 loss 定义变了——单变量对照。</td>
+          <td>Training 页面（视图带 <code>is_intervention</code> 时 <code>intervention_unsupervised_action_dims</code> 自动写入生成配置，无需手填 JSON）</td>
+          <td>训练日志出现 <code>supervised_fraction≈0.887</code>；rollout 的 <code>&lt;0.05 mm</code> 步占比从 47% 回到 baseline 的 10% 量级，单步位移中位数回到 mm 级。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1</span></td>
+          <td>采集侧丢掉操作员的死时间：span 内连续 <code>|delta| &lt; 0.05 mm</code> 超过 k 帧的段不写入数据集。DAgger 的连续静止段平均 30 帧、最长 107 帧，示教只有 17 帧。</td>
+          <td><code>tools/fr3/dagger_dataset.py::DaggerFrameBuffer.append</code></td>
+          <td>新采集的 DAgger 视图里 <code>&lt;0.1 mm</code> 帧占比回到示教的 25% 量级；<b>先等重训结果</b>，若 mask 已经解决就不要动采集合同。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1</span></td>
+          <td>接管时记录“夹爪轴是否被操作员接管”，让按了按键的那些帧重新变成真标签。现在全部一刀切 mask 掉，会连真专家的夹爪监督一起丢（保守，但有损）。</td>
+          <td><code>tools/fr3/dagger_takeover.py</code>（<code>_gripper_owned</code> 已经算出来了，只是没写进 frame）、<code>tools/fr3/dagger_dataset.py</code> 的 feature schema</td>
+          <td>新列写入后，mask 只作用于 <code>gripper_owned=0</code> 的帧。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1</span></td>
+          <td>查 <code>observation.state.gripper.pos</code> 的 47% 零值掉线：示教里 44.3% 的插孔帧读到精确 0，DAgger / 部署路径里<b>一个都没有</b>（min 0.2825）。同一个通道在训练和部署时含义不同。</td>
+          <td><code>tools/fr3/</code> 的 pika 夹爪读数链路、录制侧</td>
+          <td>录制数据里的零值率与 rollout 实测同量级；否则示教里 44% 的插孔帧携带一个部署时不可能出现的观测值。</td>
         </tr>
         <tr>
           <td><span class="badge warn">P1</span></td>

@@ -801,6 +801,91 @@ def test_a_base_checkpoint_supplies_weights_and_nothing_else(tmp_path):
     assert "use_peft" not in policy
 
 
+# --------------------------------------------------------------------------------------
+# Which action dims a DAgger correction frame does not label
+# --------------------------------------------------------------------------------------
+
+
+def _write_view_info(root: Path, *, action_names: list[str], intervention: bool) -> Path:
+    features: dict = {
+        "observation.state": {"dtype": "float32", "shape": [8], "names": ["ee.x"] * 8},
+        "action": {"dtype": "float32", "shape": [len(action_names)], "names": action_names},
+    }
+    if intervention:
+        features["is_intervention"] = {
+            "dtype": "float32",
+            "shape": [1],
+            "names": ["is_intervention"],
+        }
+    (root / "meta").mkdir(parents=True, exist_ok=True)
+    (root / "meta" / "info.json").write_text(json.dumps({"features": features}), encoding="utf-8")
+    return root
+
+
+_DELTA_ACTION_NAMES = [
+    "delta_ee_from_prev_cmd.dx",
+    "delta_ee_from_prev_cmd.dy",
+    "delta_ee_from_prev_cmd.dz",
+    "delta_ee_from_prev_cmd.drz",
+    "gripper.pos",
+]
+
+
+def test_a_view_without_corrections_masks_nothing(tmp_path):
+    """A plain demonstration view has no intervention frames, so there is nothing to skip."""
+    root = _write_view_info(tmp_path / "view", action_names=_DELTA_ACTION_NAMES, intervention=False)
+
+    assert fr3_train_il_policy.intervention_unsupervised_dims_for_view(root) == []
+    policy = fr3_train_il_policy.build_policy_section(
+        _args(policy="pi05"), None, fr3_train_il_policy.intervention_unsupervised_dims_for_view(root)
+    )
+    assert "intervention_unsupervised_action_dims" not in policy
+
+
+def test_a_dagger_merged_view_drops_the_gripper_the_takeover_never_drove(tmp_path):
+    """The takeover holds the gripper at the policy's own last command; that is not a label."""
+    root = _write_view_info(tmp_path / "view", action_names=_DELTA_ACTION_NAMES, intervention=True)
+
+    dims = fr3_train_il_policy.intervention_unsupervised_dims_for_view(root)
+
+    assert dims == [4]
+    policy = fr3_train_il_policy.build_policy_section(_args(policy="pi05"), None, dims)
+    assert policy["intervention_unsupervised_action_dims"] == [4]
+    # The field is pi0.5's; handing it to a policy that has no such config key is a parse error.
+    from lerobot.policies.pi05.configuration_pi05 import PI05Config
+
+    assert "intervention_unsupervised_action_dims" in {f.name for f in dataclasses.fields(PI05Config)}
+
+
+def test_the_gripper_index_comes_from_the_view_not_from_a_constant(tmp_path):
+    """`--action-drop-dims` reorders the action columns, so a hardcoded 4 would mask the wrong one."""
+    root = _write_view_info(
+        tmp_path / "view",
+        action_names=["gripper.pos", "delta_ee_from_prev_cmd.dx", "delta_ee_from_prev_cmd.dz"],
+        intervention=True,
+    )
+
+    assert fr3_train_il_policy.intervention_unsupervised_dims_for_view(root) == [0]
+
+
+def test_only_pi05_gets_the_field(tmp_path):
+    """ACT has no such config key, and an unknown key is a parse error rather than a no-op."""
+    policy = fr3_train_il_policy.build_policy_section(_args(policy="act"), None, [4])
+
+    assert "intervention_unsupervised_action_dims" not in policy
+
+
+def test_policy_config_still_wins_over_the_view_derived_default(tmp_path):
+    """`--policy-config` is the escape hatch for an operator who has measured something."""
+    policy = fr3_train_il_policy.build_policy_section(
+        _args(policy="pi05", policy_config='{"intervention_unsupervised_action_dims": null}'),
+        None,
+        [4],
+    )
+
+    assert policy["intervention_unsupervised_action_dims"] is None
+
+
 def test_a_dense_run_emits_no_peft_block():
     assert fr3_train_il_policy.build_peft_section(_args(policy="pi05")) is None
 

@@ -92,6 +92,18 @@ class PI05Config(PreTrainedConfig):
     # mean 1 so changing them does not also change the effective learning rate.
     action_loss_weights: list[float] | None = None
 
+    # Action dimensions carrying no expert label on frames the dataset marks `is_intervention`.
+    # None (upstream behaviour) trains every dimension of every frame.
+    #
+    # A human-gated correction only re-labels the axes the human actually drove. On this rig the
+    # gripper is deliberately *not* one of them: `tools/fr3/dagger_takeover.py` holds it at the
+    # value the policy last commanded, so that taking over cannot drop what is between the
+    # fingers. That is right on the arm and wrong in the dataset -- the column is then the
+    # learner's own output relabelled as the expert's, which is the one thing DAgger's
+    # correctness argument forbids. Listing the index here drops it from the loss on those frames
+    # only; the demonstrations keep supervising it everywhere else.
+    intervention_unsupervised_action_dims: list[int] | None = None
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)

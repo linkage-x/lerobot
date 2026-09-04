@@ -931,6 +931,83 @@ def apply_action_loss_weights(losses: Tensor, weights: Sequence[float]) -> Tenso
     return losses * (w * (w.numel() / total))
 
 
+# The column `tools/fr3/dagger_dataset.py` writes on every frame a human drove. Carried into the
+# batch by `processor/converters.py::_extract_complementary_data`.
+INTERVENTION_KEY = "is_intervention"
+
+
+def action_supervision_mask(
+    losses: Tensor,
+    *,
+    action_is_pad: Tensor | None = None,
+    is_intervention: Tensor | None = None,
+    intervention_unsupervised_dims: Sequence[int] | None = None,
+) -> Tensor | None:
+    """Which entries of a (B, T, D) loss tensor were actually labelled by an expert.
+
+    Two kinds are not, and both are fabricated rather than recorded:
+
+    **Padding.** A chunk that runs off the end of an episode is clamped to the episode's last
+    frame (`LeRobotDataset._get_query_indices`), so the tail of every episode is its final action
+    repeated up to `chunk_size - 1` times. On a demonstration that is a handful of frames after a
+    finished task. On a DAgger correction span it is not: spans end the instant the operator lets
+    go, so 98% of them end on a delta of exactly zero, and with `chunk_size = 50` each one turns
+    into up to 1225 targets that say *hold still* -- 15.1% of the correction supervision on the
+    L4+dagger view, concentrated in precisely the states where the correction was needed. ACT has
+    masked this since it was written (`modeling_act.py`); pi0/pi0.5 never have.
+
+    **Dimensions an intervention did not label.** See `intervention_unsupervised_action_dims` in
+    the config: a human-gated takeover re-labels the axes the human drove and leaves the rest
+    holding the learner's own last command.
+
+    Returns None when nothing is masked, so the common case pays no arithmetic and the reductions
+    stay bit-identical to upstream.
+    """
+    mask: Tensor | None = None
+
+    if action_is_pad is not None:
+        pad = action_is_pad
+        if pad.ndim == losses.ndim - 1:
+            pad = pad.unsqueeze(-1)
+        mask = (~pad.bool()).to(dtype=losses.dtype, device=losses.device).expand_as(losses)
+
+    dims = list(intervention_unsupervised_dims or ())
+    if dims and is_intervention is not None:
+        action_dim = losses.shape[-1]
+        for dim in dims:
+            if not 0 <= int(dim) < action_dim:
+                raise ValueError(
+                    f"intervention_unsupervised_action_dims contains {dim}, which is not a "
+                    f"dimension of a {action_dim}-dimensional action."
+                )
+        # (B,), however the column arrives: a per-frame float32 (B, 1) from the dataset, or a
+        # bare (B,) once something has squeezed it.
+        flags = is_intervention.to(device=losses.device).reshape(losses.shape[0], -1)[:, 0] > 0.5
+        keep = torch.ones(losses.shape[-1], dtype=torch.bool, device=losses.device)
+        keep[torch.as_tensor(sorted({int(d) for d in dims}), device=losses.device)] = False
+        # Frames without the flag keep every dimension; flagged ones lose the listed ones.
+        per_frame = torch.where(flags[:, None], keep[None, :], torch.ones_like(keep)[None, :])
+        per_frame = per_frame.to(dtype=losses.dtype)[:, None, :].expand_as(losses)
+        mask = per_frame if mask is None else mask * per_frame
+
+    return mask
+
+
+def _masked_mean(values: Tensor, mask: Tensor | None, dim: Sequence[int] | None = None) -> Tensor:
+    """Mean over the entries a mask keeps. Unmasked entries never enter the denominator.
+
+    Dividing by the *kept* count rather than by the tensor's size is what makes masking mean
+    "this was never supervision" instead of "this was supervision, and it was zero" -- the latter
+    is just a smaller learning rate on the frames that have the most padding.
+    """
+    if mask is None:
+        return values.mean() if dim is None else values.mean(dim=list(dim))
+    if dim is None:
+        return (values * mask).sum() / mask.sum().clamp(min=1.0)
+    dim = list(dim)
+    return (values * mask).sum(dim=dim) / mask.sum(dim=dim).clamp(min=1.0)
+
+
 class PI05Policy(PreTrainedPolicy):
     """PI05 Policy for LeRobot."""
 
@@ -1303,9 +1380,25 @@ class PI05Policy(PreTrainedPolicy):
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
+        # Everything below reduces over the *labelled* entries only. A masked entry is not a
+        # target of zero, it is not a target at all, so it stays out of both the numerator and
+        # the denominator -- see `action_supervision_mask` for what is masked and why.
+        mask = action_supervision_mask(
+            losses,
+            action_is_pad=batch.get("action_is_pad"),
+            is_intervention=batch.get(INTERVENTION_KEY),
+            intervention_unsupervised_dims=self.config.intervention_unsupervised_action_dims,
+        )
+
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": _masked_mean(losses, mask, dim=[0, 1]).detach().cpu().numpy().tolist(),
         }
+        if mask is not None:
+            # The share of the chunk that carried a label. Worth a metric of its own: it is a
+            # property of how the episodes were cut, and a run whose corrections are short
+            # fragments spends much less of its batch on real supervision than the step count
+            # suggests.
+            loss_dict["supervised_fraction"] = mask.mean().item()
 
         # Applied after the truncation above so the weights line up with the real action dims
         # rather than the padded ones. `loss_per_dim` is recorded *before* this, so the log keeps
@@ -1313,17 +1406,17 @@ class PI05Policy(PreTrainedPolicy):
         if self.config.action_loss_weights is not None:
             losses = apply_action_loss_weights(losses, self.config.action_loss_weights)
             loss_dict["loss_per_dim_weighted"] = (
-                losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist()
+                _masked_mean(losses, mask, dim=[0, 1]).detach().cpu().numpy().tolist()
             )
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
+            per_sample_loss = _masked_mean(losses, mask, dim=(1, 2))
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = _masked_mean(losses, mask)
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
