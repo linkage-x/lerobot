@@ -555,17 +555,21 @@ step=270  safe_ee=(0.3916, -0.2185, 0.0489)  model_gripper_raw=1.14</div>
       <p><code>L4_full48_plus_dagger_030000</code>（48 条示教 + 47 条 DAgger 片段，31418 帧）训到 30K 后，插孔比 <code>L4_full48_holdout22_40</code> baseline <b>明显退化</b>：定位不准、犹豫、反复停顿。两个 checkpoint 的超参逐字相同（batch 8 / 30000 步 / LoRA r64 α64 / warmup 200 / MEAN_STD / <code>action_loss_weights [1,1,1,0.2,2.0]</code>），<code>use_amp_alignment.json</code> 记录对齐发生在 <code>2026-09-04T02:40:32Z</code>，早于 02:48 那次 rollout，<b>两边跑在同一条 autocast 路径上</b>。唯一的变量就是数据。</p>
 
       <h3 style="margin:14px 0 6px">闭环证据：策略学会了不动</h3>
-      <p>只统计 <code>source=policy</code> 的步（接管帧已剔除），比较 policy 自己发出的每步指令位移：</p>
+      <p>由 <code>tools/fr3/fr3_compare_rollout_motion.py</code> 从 <code>outputs/rollout_traces/</code> 逐帧算出（2026-09-04 重算，取代此处原先的两条 rollout 手工估计）。三条口径必须钉死，否则数字会朝相反方向骗人：<b>只取 <code>source=policy</code> 的步</b>；<b>只对步号相邻且两端都是 policy 的相邻帧作差</b>（跨接管作差等于把操作员的位移记到策略头上）；<b>丢掉 leash 限幅的帧</b>（那一步的位移是 guard 的）。还有一条容易搞错的：trace 里的 <code>x,y,z</code> 是 <b>观测</b> EE 位置（<code>absolute_state_observation_i</code>，见 <code>fr3_act_infer_real_runtime.py:5231</code>），<b>不是指令</b>——所以这里量的是机械臂实际动了多少，限幅帧被剔掉之后它才等价于策略的意图。</p>
       <table class="table">
-        <tr><th>指标</th><th>baseline ck030000<br>（两次 rollout）</th><th><b>+DAgger ck030000</b></th><th></th></tr>
-        <tr><td>单步指令位移中位数</td><td>1.962 / 1.865 mm</td><td><b>0.059 mm</b></td><td>塌了 33 倍</td></tr>
-        <tr><td>p90</td><td>2.860 / 3.192 mm</td><td>1.819 mm</td><td></td></tr>
-        <tr><td>&lt;0.05 mm（原地不动）</td><td>10% / 11%</td><td><b>47%</b></td><td>一半的控制步没有动</td></tr>
-        <tr><td>&lt;0.2 mm</td><td>20% / 28%</td><td><b>61%</b></td><td></td></tr>
-        <tr><td>单次 rollout 的 policy 步数</td><td>154–411</td><td><b>1086 / 2287 / 1086</b></td><td>不收敛，靠超时结束</td></tr>
-        <tr><td><code>model_gripper_raw</code> 落在 0.05–0.95</td><td>11% / 15%</td><td><b>28%</b></td><td>夹爪指令变糊</td></tr>
+        <tr><th>指标</th><th>baseline ck030000<br>（36 条 trace / 13014 步对）</th><th><b>+DAgger ck030000</b><br>（2 条 / 3896 步对）</th><th></th></tr>
+        <tr><td>单步实际位移中位数</td><td>1.643 mm</td><td><b>0.039 mm</b></td><td>塌了 42 倍</td></tr>
+        <tr><td>p90 / max</td><td>2.855 / 11.068 mm</td><td>1.756 / 3.248 mm</td><td>上限也被削平</td></tr>
+        <tr><td>&lt;0.05 mm（原地不动）</td><td>14.3%</td><td><b>54.2%</b></td><td>一半以上的控制步没有动</td></tr>
+        <tr><td>&lt;0.2 mm</td><td>25.9%</td><td><b>67.9%</b></td><td></td></tr>
+        <tr><td><b>逐条 rollout 的静止率</b></td><td><b>中位 10.2%，范围 2.1%–32.5%</b></td><td><b>中位 55.4%，范围 48.2%–62.5%</b></td><td><b>两个分布不重叠</b></td></tr>
+        <tr><td>单次 rollout 的 policy 步数</td><td>中位 360（98–715）</td><td><b>中位 1954（1621–2287）</b></td><td>不收敛，靠超时结束</td></tr>
+        <tr><td>夹爪落在 0.05–0.95</td><td>4.7%</td><td><b>21.9%</b></td><td>夹爪指令变糊（cmd 与 raw 同值）</td></tr>
       </table>
       <p>“定位不准”是结果，<b>“不动”才是行为</b>。而“不动”正是这批 DAgger 数据自己的统计特征。</p>
+      <div class="callout warn">
+        <b>不重叠这一条，比中位数塌 42 倍更重要。</b>baseline 36 条 rollout 里最差的一条静止率 32.5%，DAgger 2 条里最好的一条 48.2%——中间隔着一条 16 个百分点的空带。所以这不是「两次 rollout 手气不好」，而且它顺带给出了今晚的判据：<b>候选落进 baseline 的包络（≤32.5%）算修复，落在 ≥48.2% 算没修，落在 32.5%–48.2% 之间就是判不了，必须再跑几条 rollout</b>。同样重要的是别拿旧数字对比——上表整列都是新口径重算的，与本节 2026-09-03 初稿里的 1.962 / 47% / 28% <b>不可混用</b>。
+      </div>
 
       <h3 style="margin:14px 0 6px">数据侧：同一批状态上，两种互相矛盾的动作分布</h3>
       <p>按 <code>observation.state.ee.z &lt; 0.10 m</code> 取插孔段。DAgger 只占全量 23.7% 的帧，但占<b>插孔段 34%</b>——修正天然集中在瓶颈处，所以它在关键状态上的权重远高于名义比例。</p>
@@ -635,7 +639,70 @@ padding 占动作监督的比例
       <p class="small">回归覆盖：<code>tests/policies/pi0_pi05/test_pi05_action_supervision_mask.py</code>（纯张量：不 mask 时返回 None、padding 离开分母、按维分别计数、两种 mask 叠加、越界索引报错、flag 形状兼容），<code>tests/scripts/test_fr3_train_il_policy.py</code>（无 <code>is_intervention</code> 的视图不写该键、合并视图推出 <code>[4]</code>、列重排后推出 <code>[0]</code>、非 pi0.5 不写、<code>--policy-config</code> 覆盖）。真实视图端到端已验证：<code>make_pre_post_processors</code> 的完整 preprocessor 之后 <code>action_is_pad</code> 与 <code>is_intervention</code> 都还在 batch 里（此前 <code>batch_to_transition</code> 会把后者静默丢掉）；ep94（89 帧）倒数第 3 帧 50 步里有 47 步是 padding，监督条目从 250 降到 <b>12</b>，示教帧仍是 250。20 步真机训练跑通，生成配置里自动出现 <code>'intervention_unsupervised_action_dims': [4]</code>，无需手填 JSON。</p>
 
       <div class="callout p0">
-        <b>下一步不是继续加 DAgger 数据，是用同一批数据重训一次。</b>数据没变、超参没变、只有 loss 的定义变了，所以这是一次干净的单变量对照：如果 <code>&lt;0.05 mm</code> 的步占比回到 baseline 的 10% 量级，机理一 + 二成立；如果只回到 25–30%，剩下的就是机理三和“操作员死时间”本身，那时再动采集侧（见任务清单 P1）。
+        <b>下一步不是继续加 DAgger 数据，是用同一批数据重训一次。</b>数据没变、超参没变、只有 loss 的定义变了，所以这是一次干净的单变量对照。已于 <code>2026-09-04T04:45:35Z</code> 启动（job <code>...__pi05__20260904_044535</code>）：与 0903 那次的生成配置逐键 diff 只差三处——<code>job_name</code>、<code>output_dir</code>、以及新增的 <code>policy.intervention_unsupervised_action_dims=[4]</code>（从 view 的 <code>meta/info.json</code> 自动推导，未手填）。首个记录点 <code>train/supervised_fraction=0.8675</code>，与全量期望 0.8865 一致，说明 mask 在真机训练里确实生效。
+        <br><br><b>判读用 <code>fr3_compare_rollout_motion.py --recovery baseline,dagger,candidate</code>，阈值写死在源码里（confirmed ≥80%、partial ≥40% 的缺口回填率），不看数再定。</b>对应到上面的包络：≤32.5% 算修复，≥48.2% 算没修，中间必须补 rollout。
+        <br><br><b>跑 rollout 前先对齐 <code>use_amp</code>。</b>baseline ck030000 的 <code>config.json</code> 天生是 <code>use_amp: true</code>（没有 alignment 记录），0903 那个 checkpoint 是 <code>false</code> 靠 <code>fr3_align_checkpoint_use_amp.py</code> 在 rollout 前改成 true 的。新 run 的生成配置同样是 <code>use_amp: false</code>，<b>不对齐就会拿一条不同的 autocast 路径去比一个策略</b>——正是 A/B 唯一必须按住不动的东西。
+      </div>
+    </div>
+
+    <div class="card full">
+      <div class="section-head">
+        <h2>示教语料的夹爪观测有 47% 是哨兵值——而且只坏在 2026-08-21 那一天</h2>
+        <span class="badge p0">2026-09-04 观测通道</span>
+      </div>
+      <p><code>observation.state</code> 的第 8 维 <code>gripper.pos</code> 是 policy 的输入。在 <code>insert</code> 的 48 条示教里，它有 <b>47%</b> 的帧读到<b>精确 0</b>。这不是「夹爪闭合」，是 Pika SDK 的初始值被当成测量值返回了。</p>
+
+      <h3 style="margin:14px 0 6px">先证明它不是真实读数</h3>
+      <p>取 814 段连续零值，看每一段<b>两侧</b>的物理值：</p>
+      <div class="flow">92.4% 的零值段，两侧是同一个物理值
+  0.31 → 0.00 → 0.31   52.3%    峰一直夹在手里，宽度不可能归零再回来
+  1.00 → 0.00 → 1.00   39.4%    手全张着，不可能在中位 7 帧（117 ms）里合上再张开
+  其余（跨越档位的段）  7.6%    中位 16 帧
+
+值域是三个离散档，0.01–0.25 之间<b>一帧都没有</b>：0.00 是哨兵，不是测量。</div>
+      <p>机制在代码里写着——<code>PikaGripperHardwareDriver.has_telemetry()</code> 的注释自己说明了：<i>“Until a frame carrying <code>motor</code> is parsed, <code>get_gripper_distance()</code> keeps returning the SDK's initial 0.0”</i>。而读取路径 <code>get_position()</code> 只做 <code>clip(width/max_width, 0, 1)</code>，<b>没有任何新鲜度检查</b>：SDK 说 0，就录 0。<code>has_telemetry()</code> 只在 connect 时当一次性诊断用，且注释写明「fail open」。</p>
+
+      <h3 style="margin:14px 0 6px">再定位到哪一天</h3>
+      <table class="table">
+        <tr><th>录制</th><th>零值</th><th>0.31（夹住峰）</th><th>1.00（张开）</th><th>其他</th></tr>
+        <tr><td>eeframe 20260813</td><td>0.0%</td><td>41.2%</td><td>55.7%</td><td>3.1%</td></tr>
+        <tr><td>spacemouse 20260819</td><td>0.0%</td><td>46.6%</td><td>50.5%</td><td>2.9%</td></tr>
+        <tr><td>pick_and_place 20260820</td><td>0.0%</td><td>44.1%</td><td>52.7%</td><td>3.2%</td></tr>
+        <tr><td><b>insert 20260821_145637</b></td><td><b>47.6%</b></td><td>25.6%</td><td>25.3%</td><td>1.5%</td></tr>
+        <tr><td><b>insert 20260821_170816</b></td><td><b>47.0%</b></td><td>23.3%</td><td>28.0%</td><td>1.6%</td></tr>
+        <tr><td><b>spacemouse 20260821_174204</b></td><td><b>45.8%</b></td><td>28.2%</td><td>23.9%</td><td>2.1%</td></tr>
+        <tr><td>DAgger 20260902–03（rollout 路径）</td><td>0.0%</td><td>57.2%</td><td>29.2%</td><td>13.6%</td></tr>
+      </table>
+      <p>前后都干净，<b>只有 8 月 21 日那一天坏</b>，而且那天录的三批全坏。这期间 <code>backends.py</code> 没有改动（唯一一次提交是 RealSense / homing / rollout 归属，不碰夹爪），<code>denormalize_live_gripper_observation</code> 也只是单位换算、不过滤哨兵——<b>所以是当天的链路/硬件故障，不是代码路径差异</b>。不巧的是，<code>insert</code> 的全部 48 条示教都录在那一天。</p>
+
+      <h3 style="margin:14px 0 6px">后果：这是一个已经存在的 train/serve 偏移</h3>
+      <div class="callout warn">
+        部署时机器人产出的是<b>干净</b>通道（0902/0903 的 DAgger 帧就是 rollout 路径录的，零值 0.0%）。所以：
+        <br>• 训练时 <code>gripper.pos</code> 有 47% 的帧是 0，<b>部署时一帧都没有</b>。这一维在训练和部署时分布完全不同。
+        <br>• 在合并视图里更糟：<b><code>gripper.pos == 0</code> 是「这帧来自示教」的充分条件</b>（示教 47%，DAgger 0%）。而两半的动作统计正好相反（示教在动，DAgger 插孔段 37% 静止）。也就是说，网络手里有一个完全可靠的比特可以用来在两种矛盾行为之间切换——<b>而这个比特在部署时永远指向 DAgger 那一侧</b>。
+        <br>• 这是<b>假说</b>，不是已证事实：能证明的是这个特征存在且可分，不能证明网络用了它。判定方法是拿现成 checkpoint 做消融（同一批观测，注入 0 与保持真值，比较预测动作），需要 GPU，等今晚训练跑完。
+        <br>• 但它做出一个可证伪的预测：<b>今晚的 supervision-mask 对照不修这一条</b>，所以如果这条是主因，重训不会完全恢复。
+      </div>
+
+      <h3 style="margin:14px 0 6px">修复：离线补齐，并且有样本外验证</h3>
+      <p>按「保持上一个有效值」补齐 0821 的三批录制，结果落进健康日的区间正中——<b>三个档位全中，且没有对它拟合过任何东西</b>：</p>
+      <div class="flow">                          零值      0.31      1.00      其他
+健康日 0813/0819/0820     0.0%   41.2-46.6%  50.5-55.7%  2.9-3.3%
+0821 修复后               0.5%   43.7-45.3%  49.4-52.9%  2.6-5.3%
+0821 修复前              47.0%   23.3-28.2%  23.9-28.0%  1.5-2.1%
+
+无法补的只有每条 episode 开头就是零值的段（三批合计 227 帧，0.4-0.5%）——前面没有有效值可保持。</div>
+      <p>工具已落地：<code>tools/fr3/fr3_repair_gripper_sentinel.py</code>。默认<b>只报告不写</b>，报告本身就是判据——把同一个工具跑在健康录制上，那一列就是对照行。写入前它要自己过两道前提检查，任一不过就<b>拒绝</b>而不是猜：
+      <br>• <b>哨兵必须与真实读数隔离</b>：真的合手是一段连续下降，会在中间宽度上留下帧；0821 的最小真实读数是 0.3019，与 0 之间一帧都没有。若读数是连到 0 的连续谱（例如 <code>pick_and_place_20260820_175306</code> 只有 2 帧孤立零值），工具拒绝。
+      <br>• <b>断口两侧必须回到同一档位</b>：0821 三批分别是 92.8% / 92.1% / 92.7%（阈值 80%）。若这个比例低，说明手在断口里是动着的，「保持上一个值」就会编造一次并未发生的静止。
+      <br>另外三条硬约束：只改 <code>observation.state:gripper.pos</code> 这<b>一维</b>（<code>action:gripper.pos</code> 和 <code>prev_cmd.gripper.pos</code> 的 43% 零值是真的——0.0 就是「合手」这条指令），不跨 episode 边界保持，以及重算统计时<b>没被改的那些维必须与盘上逐位一致</b>，否则拒绝写——一个由两套算法各写一半的 stats 块，比一个过期的更糟，因为下游分不出来。原始文件留在 <code>meta/gripper_sentinel_repair/original/</code>（在 LeRobot 的 <code>data/*/*.parquet</code> 与 <code>meta/episodes/*/*.parquet</code> 两个 glob 之外，不会被当成数据读进去）。</p>
+      <p>在真实录制的副本上跑过一遍：schema 与 row group 布局不变，<code>action</code> / <code>prev_cmd.gripper.pos</code> / 时间戳 / 索引<b>全部逐位相同</b>，只有 state 第 14 维的 9814 个格子变了；<code>meta/stats.json</code> 与逐 episode 的 <code>stats/observation.state/*</code> 也只有第 14 维移动（<code>mean</code> 0.343 → 0.675）；修好的副本能被 <code>LeRobotDataset</code> 正常加载。档位分布 45.9% / 52.1%，落在健康日区间内。</p>
+      <p>驱动侧还要补一道闸，否则同样的故障会再一次静默地录进数据：<code>get_position()</code> 应当在 SDK 没有新解析帧时<b>保持上一次的有效读数并把陈旧度记进 observation</b>，而不是把 0 当成宽度。哨兵与真实全闭在这套硬件上可分（0.01–0.25 之间零帧），但正确的判据是 telemetry 新鲜度，不是值本身。</p>
+
+      <p class="small">现有的 dataset QC 不会拦下这个：<code>gripper_range</code> 检查的是「落在 [0,1] 内」，而 0.0 落在里面。三批录制当时都是 <code>8 pass · 0 warn · 0 fail</code>。回归覆盖：<code>tests/scripts/test_fr3_repair_gripper_sentinel.py</code>（断口识别与 episode 边界、保持/回填两种规则、两道前提检查各自的拒绝、stats 单维补丁与不一致时的拒绝，以及在合成录制上端到端验证 <code>action</code> 不变、row group 不变、原件不被二次覆盖）。</p>
+
+      <div class="callout p0">
+        <b>顺序不能乱：先读今晚的对照结果，再动这一条。</b>重建视图会改掉正在训练的那批帧，而且两个变量一起改就再也分不清是谁修好的。今晚的 job 读的是现有视图，<b>不要重建</b>。下一次实验的单变量就是这个夹爪修复。
       </div>
     </div>
 
@@ -719,9 +786,9 @@ padding 占动作监督的比例
         </tr>
         <tr>
           <td><span class="badge p0">P0</span></td>
-          <td>用 <b>同一个</b> <code>L4_full48_plus_dagger_030000</code> 视图重训 30K，验证 supervision mask。数据不变、超参不变，只有 loss 定义变了——单变量对照。</td>
-          <td>Training 页面（视图带 <code>is_intervention</code> 时 <code>intervention_unsupervised_action_dims</code> 自动写入生成配置，无需手填 JSON）</td>
-          <td>训练日志出现 <code>supervised_fraction≈0.887</code>；rollout 的 <code>&lt;0.05 mm</code> 步占比从 47% 回到 baseline 的 10% 量级，单步位移中位数回到 mm 级。</td>
+          <td><b>跑中</b>（<code>20260904_044535</code>，2026-09-04 启动）：用 <b>同一个</b> <code>L4_full48_plus_dagger_030000</code> 视图重训 30K，验证 supervision mask。数据不变、超参不变，只有 loss 定义变了——单变量对照。出 ck030000 后<b>先跑 <code>fr3_align_checkpoint_use_amp.py</code></b> 再 rollout。</td>
+          <td>Training 页面（视图带 <code>is_intervention</code> 时 <code>intervention_unsupervised_action_dims</code> 自动写入生成配置，无需手填 JSON）；判读用 <code>tools/fr3/fr3_compare_rollout_motion.py</code></td>
+          <td>wandb <code>train/supervised_fraction≈0.887</code>（已见 0.8675）；<code>--recovery baseline,dagger,candidate</code> 给出 <b>CONFIRMED</b>，即逐条 rollout 静止率落进 baseline 包络（≤32.5%）。</td>
         </tr>
         <tr>
           <td><span class="badge warn">P1</span></td>
@@ -737,9 +804,9 @@ padding 占动作监督的比例
         </tr>
         <tr>
           <td><span class="badge warn">P1</span></td>
-          <td>查 <code>observation.state.gripper.pos</code> 的 47% 零值掉线：示教里 44.3% 的插孔帧读到精确 0，DAgger / 部署路径里<b>一个都没有</b>（min 0.2825）。同一个通道在训练和部署时含义不同。</td>
-          <td><code>tools/fr3/</code> 的 pika 夹爪读数链路、录制侧</td>
-          <td>录制数据里的零值率与 rollout 实测同量级；否则示教里 44% 的插孔帧携带一个部署时不可能出现的观测值。</td>
+          <td><b>已诊断（见上一张卡）</b>：Pika SDK 在没解析到 <code>motor</code> 帧时返回初始 0.0，<code>get_position()</code> 无新鲜度检查照录；故障只发生在 2026-08-21，而 <code>insert</code> 的 48 条示教全录在那天。两件事要做：(1) 离线按「保持上一个有效值」修复 0821 的录制并重建视图——<b>工具已完成并在副本上验证过，尚未对真实录制执行</b>；(2) 驱动侧加闸——SDK 无新帧时保持上次有效读数并把陈旧度写进 observation。<b>排在今晚对照结果之后</b>。</td>
+          <td><code>tools/fr3/fr3_repair_gripper_sentinel.py</code>（已落地）；<code>src/lerobot/robots/franka_research3/backends.py::PikaGripperHardwareDriver.get_position</code>（待改，见批处理清单）</td>
+          <td>修复后的 0821 分布落进健康日区间（已验证：0.31 → 43.7-45.3%，1.00 → 49.4-52.9%）；重建视图后 <code>gripper.pos == 0</code> 不再是「这帧来自示教」的充分条件。</td>
         </tr>
         <tr>
           <td><span class="badge warn">P1</span></td>
