@@ -82,7 +82,8 @@ export function SceneResetPanel({
   busy,
   disabled,
   disabledReason,
-  onReset
+  onReset,
+  onRunnableChange
 }: {
   title?: string;
   landmarks?: RolloutLandmarks;
@@ -102,6 +103,14 @@ export function SceneResetPanel({
   disabled?: boolean;
   disabledReason?: string;
   onReset: (request: SceneResetRequest) => Promise<{ ok: boolean; error?: string }>;
+  /** Hands this panel's own Reset button to a caller that wants to offer it somewhere else --
+   *  the rollout page's session bar, which floats over a page this panel sits several screens
+   *  down. Called with the function that sends the request the panel would send, or with null
+   *  whenever the panel would refuse to send one. Handing out the function rather than letting
+   *  the caller rebuild the request keeps one assembly of it and one rule for when it may go:
+   *  a second copy is how a bar ends up sending a reset with a mask the panel had already
+   *  rejected. Expected to be a stable callback that stores what it is given. */
+  onRunnableChange?: (runnable: (() => Promise<void>) | null) => void;
 }) {
   const [pickX, setPickX] = useState("0.40");
   const [pickY, setPickY] = useState("0.00");
@@ -244,6 +253,18 @@ export function SceneResetPanel({
   };
 
   const cannotRun = busy || disabled || !confirmMotion || strokes.length === 0;
+
+  // Republished on every render rather than on a dependency list: `runReset` closes over every
+  // field in this panel, so any list short of "all of them" would hand out a function that sends
+  // yesterday's pick pose. The caller is told what may be sent, not asked to track when it
+  // changed.
+  useEffect(() => {
+    onRunnableChange?.(cannotRun ? null : runReset);
+  });
+
+  // Withdrawn when the panel goes away, so nothing keeps a button that would fire a request
+  // assembled from a component that no longer exists.
+  useEffect(() => () => onRunnableChange?.(null), [onRunnableChange]);
 
   return (
     <section className="card scene-reset-card">

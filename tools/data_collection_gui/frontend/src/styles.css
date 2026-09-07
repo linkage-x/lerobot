@@ -4791,6 +4791,76 @@ button.danger {
 
 /* ----------------------------------------------------------------- rollout --- */
 
+/* The rollout page lays its cards out with margins rather than as grid rows. `position: sticky`
+   is measured against the element's containing block, and for a grid item that is its own grid
+   area -- on an auto-sized row, exactly its own height -- so the session bar could not have
+   moved a pixel while it was a child of .page's grid. */
+.rollout-page {
+  display: block;
+}
+
+.rollout-page > * + * {
+  margin-top: 14px;
+}
+
+/* The controls a live session is driven by: at a place on the window rather than a place on the
+   page, because the loop between two rollouts (grade, reset the scene, start the next) used to
+   be three scroll positions apart and is walked a few dozen times an afternoon. It carries the
+   live card's teal rule -- every button in it moves a robot -- and a shadow, because it floats
+   over the page rather than sitting in it. */
+.rollout-session-bar {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #d2d9de;
+  border-left: 3px solid #0f766e;
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgb(15 23 42 / 12%);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  justify-content: space-between;
+  padding: 10px 12px;
+  position: sticky;
+  top: 0;
+  /* Over the cards it scrolls across, under the confirmation modals. */
+  z-index: 20;
+}
+
+.rollout-session-state {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.rollout-session-state strong {
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.rollout-session-state .hint {
+  margin: 0;
+}
+
+/* One line of it, the rest in the banner below: enough to tell a refused command from one that
+   was accepted, without the bar growing a paragraph while an operator is reading the arm. */
+.rollout-session-error {
+  color: #8d2d12;
+  font-size: 13px;
+  max-width: 46ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Held away from the four buttons that drive the session, because it is the one that ends it:
+   starting again costs a minute of policy load, and the arm stops wherever it stands. */
+.rollout-session-end {
+  margin-left: 10px;
+}
+
 /* The live panel gets a teal rule down its left edge: on a page where every other section is
  * configuration, this is the one that is currently connected to a robot. */
 .rollout-live {
@@ -4800,7 +4870,9 @@ button.danger {
 /* Every log block scrolls inside itself. A <pre> has no base rule here, so it took the browser
    default -- no wrapping, no overflow -- and the .page track above now pins the card to the
    container width, which would leave a long line spilling out of the card instead of scrolling.
-   Both halves are needed: the track stops the page widening, this stops the content escaping. */
+   Both halves are needed: the track stops the page widening, this stops the content escaping.
+   On the rollout page the first half is `.rollout-page`'s block layout instead, which sizes a
+   card to its container for the same reason. */
 .log-block {
   max-width: 100%;
   overflow: auto;

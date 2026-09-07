@@ -3,6 +3,7 @@ import { api } from "../apiClient";
 import { CheckpointBrowser, successRate } from "../shared/CheckpointBrowser";
 import { assistedSuccessBlocked, terminalEventDriver } from "./rolloutAttribution";
 import { carriedOverNotice } from "./rolloutCarryover";
+import { LIVE_STATES, sessionAvailability, sessionNote } from "./rolloutSessionControls";
 import { Metric, PageHeader, StatusDot } from "../shared/ui";
 import type {
   Checkpoint,
@@ -44,7 +45,6 @@ import { TableAlignmentPanel } from "./TableAlignmentPanel";
  * commanding the arm.
  */
 
-const LIVE_STATES = new Set(["starting", "waiting", "homing", "resetting", "rolling"]);
 const RTC_SCHEDULES: RolloutRtcSchedule[] = ["EXP", "LINEAR", "ONES", "ZEROS"];
 const DEFAULT_TASK_PROMPT_PLACEHOLDER = "Pick up the peg and insert it fully into the hole.";
 
@@ -146,6 +146,16 @@ export function RolloutPage() {
   const [frameNonce, setFrameNonce] = useState(0);
   const [backgroundNonce, setBackgroundNonce] = useState(0);
   const [tableAlignment, setTableAlignment] = useState<TableAlignment | null>(null);
+  // The scene reset panel's own Reset button, handed up so the session bar can offer it without
+  // the operator scrolling to the panel. The function is held in a ref rather than in state
+  // because the panel republishes it on every render -- storing it in state would re-render this
+  // page just as often -- and only the boolean the bar draws itself from is state.
+  const sceneResetRunnableRef = useRef<(() => Promise<void>) | null>(null);
+  const [sceneResetRunnable, setSceneResetRunnable] = useState(false);
+  const onSceneResetRunnableChange = useCallback((runnable: (() => Promise<void>) | null) => {
+    sceneResetRunnableRef.current = runnable;
+    setSceneResetRunnable(runnable !== null);
+  }, []);
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const mode = useMemo(() => modes.find((item) => item.id === modeId), [modes, modeId]);
@@ -156,6 +166,15 @@ export function RolloutPage() {
   // Scene reset drives the arm through the rollout process's own stdin, so it is only offered
   // while that process is sitting between rollouts waiting for a command.
   const sceneResetPanelUsable = Boolean(run?.interactive) && run?.state === "waiting";
+  // Every button in the session bar, decided in one place. The bar is pressable from a scroll
+  // position where none of the run's state is on screen, so the rules cannot be spelled out
+  // beside the thing each one reads.
+  const availability = sessionAvailability(run, busy, sceneResetRunnable);
+  const sceneResetBarReason = availability.canResetScene
+    ? "Sends the reset the panel below is set up for: a new sample inside the painted region."
+    : sceneResetPanelUsable
+      ? "Paint a target region and tick the motion box in Scene reset below first."
+      : "Only between the rollouts of an interactive session.";
   // The map is painted in base x/y, so the reference layer is the camera that looks across the
   // table rather than the one riding the gripper.
   const sceneResetCameraKey = run?.cameraKeys?.includes("side")
@@ -507,11 +526,101 @@ export function RolloutPage() {
     (blocking.length > 0 && !overrideContract);
 
   return (
-    <div className="page">
+    // `rollout-page` lays the cards out with margins instead of a grid track, which is what lets
+    // the bar below stick: a sticky grid item is measured against its own grid area, and an
+    // auto-sized row is exactly the item's height, so inside .page's grid it could not move.
+    <div className="page rollout-page">
       <PageHeader
         title="Real-robot rollout"
         subtitle="Run a trained checkpoint on the FR3, and record how it went."
       />
+
+      {/* ------------------------------------------------------ session bar --- */}
+      {/* The controls a live session is driven by, on screen wherever the page is scrolled to.
+
+          They used to sit in the head of the live card, which is the order an author writes in
+          rather than the order an operator works in. Between two rollouts the loop is: grade the
+          one that just ended, put the peg back, start the next -- and those were three different
+          scroll positions, walked a few dozen times an afternoon, with Start at the far end of
+          it every time. Scene reset was the worst of them: a full screen of map and form, two
+          cards down, for what is one button once the region has been painted.
+
+          So the buttons live here, at a place on the window instead of a place on the page, and
+          Reset scene is the panel's own button rather than a second implementation of it. What
+          stayed on the page is what is read rather than pressed: the instruments in the live
+          card, the landing map, the history. */}
+      {isLive && run && (
+        <div className="rollout-session-bar">
+          <div className="rollout-session-state">
+            <StatusDot state={stateTone(run.state)} />
+            <strong>{run.state}</strong>
+            <span className="hint">
+              rollout {run.rolloutIndex || "—"} · step{" "}
+              {run.maxSteps ? `${run.step} / ${run.maxSteps}` : run.step}
+            </span>
+            {/* Only for the states an operator otherwise reads as a broken button: a policy load
+                that takes a minute, and the two in which the arm is already carrying out a
+                command of its own. */}
+            {sessionNote(run) && <span className="hint">{sessionNote(run)}</span>}
+            {/* A refusal has to arrive where the button was pressed. The banner carrying the
+                whole of it is at the top of the page, which is exactly where the operator is
+                not standing once these controls stopped living there. */}
+            {error && (
+              <span className="rollout-session-error" title={error}>
+                {error}
+              </span>
+            )}
+          </div>
+          {/* Left to right in the order the loop uses them: home the arm, put the peg back,
+              start. Start and Stop sit together because only ever one of the two is live --
+              Start on `waiting`, Stop on `rolling` -- so they cannot be confused for each
+              other. */}
+          <div className="row-actions">
+            {run.interactive && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => void onControl("home")}
+                  disabled={!availability.canHome}
+                  title="A rollout that ran to its own end leaves the arm as displaced as one that was stopped."
+                >
+                  Move to start
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void sceneResetRunnableRef.current?.()}
+                  disabled={!availability.canResetScene}
+                  title={sceneResetBarReason}
+                >
+                  Reset scene
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void onControl("start")}
+                  disabled={!availability.canStart}
+                >
+                  Start rollout
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void onControl("stop")}
+                  disabled={!availability.canStop}
+                >
+                  Stop rollout
+                </button>
+              </>
+            )}
+            <button
+              type="button"
+              className="danger rollout-session-end"
+              onClick={() => void onStop()}
+              disabled={!availability.canEnd}
+            >
+              End session
+            </button>
+          </div>
+        </div>
+      )}
 
       {error && <div className="banner banner-error">{error}</div>}
       {notice && !error && <div className="banner banner-ok">{notice}</div>}
@@ -526,195 +635,23 @@ export function RolloutPage() {
       {/* --------------------------------------------------------- live run --- */}
       {run && run.state !== "idle" && (
         <section className="card rollout-live">
+          {/* The session's buttons are in the bar above, not here: this card is several
+              screens tall and they are needed from all of it. What stays is what the card is
+              for -- which checkpoint is on the arm right now. */}
           <div className="card-head">
             <h3>
               <StatusDot state={stateTone(run.state)} /> {run.mode || "rollout"} ·{" "}
               {run.checkpointId || "—"}
             </h3>
-            {isLive && (
-              <div className="row-actions">
-                {run.interactive && (
-                  <>
-                    {/* Enabled only on `waiting`, which the runtime declares by printing
-                        `interactive_waiting_for_start`. Everything before that -- homing the
-                        arm, a minute of loading the policy, opening the cameras -- is
-                        `starting`, and a Start pressed there is read by the listener thread and
-                        then cleared by the loop when it reaches its wait. The click looked like
-                        it worked and nothing happened. */}
-                    <button
-                      type="button"
-                      onClick={() => void onControl("start")}
-                      disabled={busy || run.state !== "waiting"}
-                    >
-                      Start rollout
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void onControl("stop")}
-                      disabled={busy || run.state !== "rolling"}
-                    >
-                      Stop rollout
-                    </button>
-                    {/* After Stop rather than beside Start, because that is the order it is
-                        used in. Enabled on `waiting` rather than on "Stop was pressed": a
-                        rollout that ran to its own end leaves the arm just as displaced as one
-                        that was interrupted, and both land here. */}
-                    <button
-                      type="button"
-                      onClick={() => void onControl("home")}
-                      disabled={busy || run.state !== "waiting"}
-                    >
-                      Move to start
-                    </button>
-                  </>
-                )}
-                <button type="button" className="danger" onClick={() => void onStop()} disabled={busy}>
-                  End session
-                </button>
-              </div>
-            )}
           </div>
 
           <p className="hint">{run.message}</p>
 
-          {/* There is no Take over button, and that is the design: moving the SpaceMouse takes
-              the arm, and the policy resumes about a second after the operator stops. A button
-              is a thing to find at the moment something is going wrong, and a latched one is a
-              thing to forget -- the next rollout would start under a device nobody is holding.
-              Who is driving right now is drawn in the live view's own pill, off the frames the
-              runtime publishes, rather than off this click.
-
-              Hold is the other half of that latch and does have a button, because a rollout this
-              gateway launched holds the runtime's stdin as a pipe: the `t` key a terminal
-              operator would press cannot reach it, so without this the browser has no brake. It
-              freezes the arm at the last command it sent -- the gripper included -- which is what
-              an operator wants when the policy is heading somewhere wrong and they need a moment
-              before steering. The runtime clears the latch when the rollout stops, so it cannot
-              be left on for the next one. */}
-          {run.takeoverAvailable && (
-            <div className="subcard">
-              <div className="row-actions">
-                <span className="pill">SpaceMouse armed</span>
-                {run.state === "rolling" && (
-                  <button
-                    type="button"
-                    onClick={() => void onControl("takeover")}
-                    disabled={busy}
-                  >
-                    Hold / release (freeze the arm)
-                  </button>
-                )}
-              </div>
-              <p className="hint">
-                Move the device to take the arm over.{" "}
-                {run.daggerReleaseAfterS === 0
-                  ? "Automatic handback is off: Hold is the only way in and out."
-                  : run.daggerReleaseAfterS
-                    ? `The policy resumes ${run.daggerReleaseAfterS} s after you stop.`
-                    : "The policy resumes on its own once you stop."}{" "}
-                Taking over does not move the gripper until you press a gripper button.
-              </p>
-              {run.daggerReportTimestamps && (
-                <p className="hint">
-                  Pre-flight: <code>report_timestamps={run.daggerReportTimestamps}</code> — the
-                  driver dates each report, so a device that has gone quiet is told apart from one
-                  still being pushed. Without it the arm would keep flying after your hand came
-                  off; a real rollout cannot start without it.
-                </p>
-              )}
-              {run.daggerDatasetPath ? (
-                <p className="hint">
-                  Corrections: <code>{run.daggerDatasetPath}</code>
-                  {run.daggerEpisodes ? ` — ${run.daggerEpisodes} episode(s) so far` : ""}. Stop
-                  the rollout before QC or training so the dataset writer can finalize the last
-                  parquet file.
-                </p>
-              ) : (
-                <p className="hint warn">
-                  Steer only — corrections are not being written anywhere.
-                </p>
-              )}
-              {Boolean(run.daggerDroppedFrames) && (
-                <p className="hint warn">
-                  {run.daggerDroppedFrames} correction frame(s) dropped past the buffer cap: a
-                  takeover ran longer than the runtime holds in memory, so the end of it is
-                  missing from the dataset.
-                </p>
-              )}
-            </div>
-          )}
-
-          {run.interactive && run.state === "waiting" && !run.armAtStart && (
-            <p className="hint">
-              The arm is where the last rollout left it. The dataset frame is anchored to the
-              pose the episodes started from, so the next rollout would begin somewhere the
-              policy was never shown — press <b>Move to start</b> first. The gripper is left
-              exactly as it is: if it is still holding something, take it before homing.
-            </p>
-          )}
-
-          {/* Drawn from the joint angles the runtime publishes each step, so it follows the arm
-              rather than replaying it afterwards. Mounted only while something is producing
-              frames: the canvas holds WebGL context and STL meshes, and an idle page has no
-              reason to. */}
-          {isLive && (
-            // Mounted for the whole session, polling only while a rollout is actually
-            // publishing: the canvas holds its WebGL context and meshes between rollouts (so the
-            // arm does not vanish and reappear), and nothing is asked for while nothing moves.
-            <RolloutLiveViewer live={run.state === "rolling"} rolloutIndex={run.rolloutIndex} />
-          )}
-
-          <div className="metric-row">
-            <Metric label="State" value={run.state} />
-            <Metric label="Step" value={run.maxSteps ? `${run.step} / ${run.maxSteps}` : run.step} />
-            <Metric label="Rollout" value={run.rolloutIndex || "—"} />
-            <Metric label="Command" value={run.commandStatus || "—"} />
-            <Metric label="Step-limited" value={run.clampedSteps} />
-            <Metric label="Leashed" value={run.leashedSteps} />
-            <Metric label="Tool frame" value={run.targetFrameName || "—"} />
-          </div>
-
-          {run.clampedSteps > 0 && (
-            <p className="hint">
-              {run.clampedSteps} step(s) asked for more motion in a single tick than the step
-              limit allows, measured against the policy's own previous command. A few is normal;
-              a steady stream means the policy is asking for motion the demonstrations never
-              contained.
-            </p>
-          )}
-
-          {run.leashedSteps > 0 && (
-            <p className="hint">
-              {run.leashedSteps} step(s) hit the leash: the command ran further ahead of the
-              measured pose than tracking lag explains. Unlike step-limiting, this points at the
-              arm rather than the policy — something is blocking it, or it has stopped following.
-            </p>
-          )}
-
-          {run.cameraKeys.length > 0 && (
-            <div className="rollout-cameras">
-              {run.cameraKeys.map((cameraKey) => (
-                <figure key={cameraKey}>
-                  <img
-                    src={api.rolloutCameraUrl(cameraKey, frameNonce)}
-                    alt={`policy input ${cameraKey}`}
-                    onError={(event) => {
-                      (event.target as HTMLImageElement).style.visibility = "hidden";
-                    }}
-                    onLoad={(event) => {
-                      (event.target as HTMLImageElement).style.visibility = "visible";
-                    }}
-                  />
-                  <figcaption>{cameraKey}</figcaption>
-                </figure>
-              ))}
-              <p className="hint wide">
-                These are the frames the policy is being fed — after cropping and resizing, not
-                the raw camera. If one is black or stale, the policy is seeing that too.
-              </p>
-            </div>
-          )}
-
+          {/* First thing in the card while a grade is owed, ahead of the instruments below:
+              the rollout it is asking about is over, the viewer and the camera strip are
+              showing a scene that has stopped moving, and this is the only thing being asked
+              of the operator. It used to sit under all of them, which put the one form that
+              cannot be filled in later at the bottom of the deepest card on the page. */}
           {run.pendingOutcomeFor > 0 && (
             <div className="subcard outcome-prompt">
               <h4>
@@ -864,6 +801,144 @@ export function RolloutPage() {
             </div>
           )}
 
+          {/* There is no Take over button, and that is the design: moving the SpaceMouse takes
+              the arm, and the policy resumes about a second after the operator stops. A button
+              is a thing to find at the moment something is going wrong, and a latched one is a
+              thing to forget -- the next rollout would start under a device nobody is holding.
+              Who is driving right now is drawn in the live view's own pill, off the frames the
+              runtime publishes, rather than off this click.
+
+              Hold is the other half of that latch and does have a button, because a rollout this
+              gateway launched holds the runtime's stdin as a pipe: the `t` key a terminal
+              operator would press cannot reach it, so without this the browser has no brake. It
+              freezes the arm at the last command it sent -- the gripper included -- which is what
+              an operator wants when the policy is heading somewhere wrong and they need a moment
+              before steering. The runtime clears the latch when the rollout stops, so it cannot
+              be left on for the next one. */}
+          {run.takeoverAvailable && (
+            <div className="subcard">
+              <div className="row-actions">
+                <span className="pill">SpaceMouse armed</span>
+                {run.state === "rolling" && (
+                  <button
+                    type="button"
+                    onClick={() => void onControl("takeover")}
+                    disabled={busy}
+                  >
+                    Hold / release (freeze the arm)
+                  </button>
+                )}
+              </div>
+              <p className="hint">
+                Move the device to take the arm over.{" "}
+                {run.daggerReleaseAfterS === 0
+                  ? "Automatic handback is off: Hold is the only way in and out."
+                  : run.daggerReleaseAfterS
+                    ? `The policy resumes ${run.daggerReleaseAfterS} s after you stop.`
+                    : "The policy resumes on its own once you stop."}{" "}
+                Taking over does not move the gripper until you press a gripper button.
+              </p>
+              {run.daggerReportTimestamps && (
+                <p className="hint">
+                  Pre-flight: <code>report_timestamps={run.daggerReportTimestamps}</code> — the
+                  driver dates each report, so a device that has gone quiet is told apart from one
+                  still being pushed. Without it the arm would keep flying after your hand came
+                  off; a real rollout cannot start without it.
+                </p>
+              )}
+              {run.daggerDatasetPath ? (
+                <p className="hint">
+                  Corrections: <code>{run.daggerDatasetPath}</code>
+                  {run.daggerEpisodes ? ` — ${run.daggerEpisodes} episode(s) so far` : ""}. Stop
+                  the rollout before QC or training so the dataset writer can finalize the last
+                  parquet file.
+                </p>
+              ) : (
+                <p className="hint warn">
+                  Steer only — corrections are not being written anywhere.
+                </p>
+              )}
+              {Boolean(run.daggerDroppedFrames) && (
+                <p className="hint warn">
+                  {run.daggerDroppedFrames} correction frame(s) dropped past the buffer cap: a
+                  takeover ran longer than the runtime holds in memory, so the end of it is
+                  missing from the dataset.
+                </p>
+              )}
+            </div>
+          )}
+
+          {run.interactive && run.state === "waiting" && !run.armAtStart && (
+            <p className="hint">
+              The arm is where the last rollout left it. The dataset frame is anchored to the
+              pose the episodes started from, so the next rollout would begin somewhere the
+              policy was never shown — press <b>Move to start</b> first. The gripper is left
+              exactly as it is: if it is still holding something, take it before homing.
+            </p>
+          )}
+
+          {/* Drawn from the joint angles the runtime publishes each step, so it follows the arm
+              rather than replaying it afterwards. Mounted only while something is producing
+              frames: the canvas holds WebGL context and STL meshes, and an idle page has no
+              reason to. */}
+          {isLive && (
+            // Mounted for the whole session, polling only while a rollout is actually
+            // publishing: the canvas holds its WebGL context and meshes between rollouts (so the
+            // arm does not vanish and reappear), and nothing is asked for while nothing moves.
+            <RolloutLiveViewer live={run.state === "rolling"} rolloutIndex={run.rolloutIndex} />
+          )}
+
+          <div className="metric-row">
+            <Metric label="State" value={run.state} />
+            <Metric label="Step" value={run.maxSteps ? `${run.step} / ${run.maxSteps}` : run.step} />
+            <Metric label="Rollout" value={run.rolloutIndex || "—"} />
+            <Metric label="Command" value={run.commandStatus || "—"} />
+            <Metric label="Step-limited" value={run.clampedSteps} />
+            <Metric label="Leashed" value={run.leashedSteps} />
+            <Metric label="Tool frame" value={run.targetFrameName || "—"} />
+          </div>
+
+          {run.clampedSteps > 0 && (
+            <p className="hint">
+              {run.clampedSteps} step(s) asked for more motion in a single tick than the step
+              limit allows, measured against the policy's own previous command. A few is normal;
+              a steady stream means the policy is asking for motion the demonstrations never
+              contained.
+            </p>
+          )}
+
+          {run.leashedSteps > 0 && (
+            <p className="hint">
+              {run.leashedSteps} step(s) hit the leash: the command ran further ahead of the
+              measured pose than tracking lag explains. Unlike step-limiting, this points at the
+              arm rather than the policy — something is blocking it, or it has stopped following.
+            </p>
+          )}
+
+          {run.cameraKeys.length > 0 && (
+            <div className="rollout-cameras">
+              {run.cameraKeys.map((cameraKey) => (
+                <figure key={cameraKey}>
+                  <img
+                    src={api.rolloutCameraUrl(cameraKey, frameNonce)}
+                    alt={`policy input ${cameraKey}`}
+                    onError={(event) => {
+                      (event.target as HTMLImageElement).style.visibility = "hidden";
+                    }}
+                    onLoad={(event) => {
+                      (event.target as HTMLImageElement).style.visibility = "visible";
+                    }}
+                  />
+                  <figcaption>{cameraKey}</figcaption>
+                </figure>
+              ))}
+              <p className="hint wide">
+                These are the frames the policy is being fed — after cropping and resizing, not
+                the raw camera. If one is black or stale, the policy is seeing that too.
+              </p>
+            </div>
+          )}
+
           {run.lastLines.length > 0 && (
             <pre className="log-block" ref={logRef}>
               {run.lastLines.join("\n")}
@@ -876,22 +951,11 @@ export function RolloutPage() {
         </section>
       )}
 
-      {/* ---------------------------------------------------- landing map --- */}
-      <section className="card">
-        <div className="card-head">
-          <h3>Where the gripper landed</h3>
-        </div>
-        <RolloutLandingMap
-          tableViewUrl={tableBackdrop}
-          backgroundLabel={`${sceneResetCameraKey} camera`}
-          landmarks={landmarks}
-          entries={mappedEntries}
-          pendingIndex={run?.pendingOutcomeFor ?? 0}
-          pendingGeometry={run?.lastRolloutGeometry}
-          checkpointId={run?.checkpointId ?? selected?.id ?? ""}
-        />
-      </section>
-
+      {/* Above the map rather than below it: this is the other half of the loop the bar
+          drives -- the region a reset samples from, and the pick pose it grasps at -- while
+          the map is read afterwards. Its Reset button is published to the bar, so the panel
+          is somewhere to come when the region has to change, not somewhere to visit between
+          every pair of rollouts. */}
       <SceneResetPanel
         title="Scene reset"
         landmarks={landmarks}
@@ -912,7 +976,24 @@ export function RolloutPage() {
               : ""
         }
         onReset={onSceneReset}
+        onRunnableChange={onSceneResetRunnableChange}
       />
+
+      {/* ---------------------------------------------------- landing map --- */}
+      <section className="card">
+        <div className="card-head">
+          <h3>Where the gripper landed</h3>
+        </div>
+        <RolloutLandingMap
+          tableViewUrl={tableBackdrop}
+          backgroundLabel={`${sceneResetCameraKey} camera`}
+          landmarks={landmarks}
+          entries={mappedEntries}
+          pendingIndex={run?.pendingOutcomeFor ?? 0}
+          pendingGeometry={run?.lastRolloutGeometry}
+          checkpointId={run?.checkpointId ?? selected?.id ?? ""}
+        />
+      </section>
 
       <TableAlignmentPanel
         cameraKey={sceneResetCameraKey}
