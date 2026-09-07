@@ -71,6 +71,8 @@
   .metric-table{width:100%;border-collapse:collapse;font-size:14px}
   .metric-table th,.metric-table td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
   .metric-table th{background:#f9fafb}
+  .metric-table tr.hl td{background:#fffbeb}
+  .metric-table tr.hl td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
   code,.mono{
     font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
     background:#f3f4f6;border-radius:6px;padding:2px 5px;font-size:.92em
@@ -81,7 +83,44 @@
   .kpi .label{font-size:13px;color:var(--muted);margin-top:5px}
   ul{padding-left:20px}
   li{margin:5px 0}
+  .chain{display:grid;grid-template-columns:repeat(auto-fit,minmax(196px,1fr));gap:10px;margin:14px 0}
+  .chain .step{border:1px solid var(--line);border-radius:12px;padding:12px;background:#fff;position:relative}
+  .chain .step .t{font-size:13px;font-weight:700;color:#111827}
+  .chain .step .v{font-size:19px;font-weight:800;margin:5px 0 3px;color:var(--accent)}
+  .chain .step .n{font-size:12px;color:var(--muted);line-height:1.5}
+  .chain .step.dead{background:var(--bad-bg);border-color:#fecaca}
+  .chain .step.dead .v{color:var(--bad)}
+  .talk{counter-reset:tk;list-style:none;padding-left:0}
+  .talk>li{counter-increment:tk;position:relative;padding:12px 14px 12px 52px;border:1px solid var(--line);
+           border-radius:12px;background:#fff;margin:10px 0}
+  .talk>li::before{content:counter(tk);position:absolute;left:14px;top:12px;width:26px;height:26px;
+           border-radius:999px;background:#111827;color:#fff;font-weight:800;font-size:13px;
+           display:flex;align-items:center;justify-content:center}
+  .talk>li b{display:block;margin-bottom:3px}
+  .twocol{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .lst{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:#fff}
+  .lst h4{margin:0 0 8px;font-size:15px}
+  .lst.g{border-color:#bbf7d0;background:var(--ok-bg)}
+  .lst.r{border-color:#fecaca;background:var(--bad-bg)}
+  .rev{text-decoration:line-through;color:var(--muted)}
+  .big{font-size:15.5px;line-height:1.85}
+  .big p{margin:10px 0}
+  .ana{border-left:4px solid #8b5cf6;background:#f5f3ff;padding:13px 16px;border-radius:10px;margin:12px 0;font-size:15px;line-height:1.8}
+  .ana .tag{display:inline-block;font-size:12px;font-weight:800;color:#6d28d9;background:#ede9fe;
+            padding:2px 8px;border-radius:999px;margin-bottom:6px}
+  .why{border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin:14px 0;background:#fff}
+  .why h4{margin:0 0 8px;font-size:16.5px;color:#111827}
+  .why .num-line{margin-top:10px;padding:9px 12px;background:#f9fafb;border-radius:8px;
+                 font-size:14px;border-left:3px solid var(--accent)}
+  .queue{counter-reset:q;list-style:none;padding-left:0}
+  .queue>li{counter-increment:q;position:relative;padding:11px 14px 11px 50px;border:1px solid var(--line);
+            border-radius:12px;background:#fff;margin:9px 0;font-size:15px;line-height:1.75}
+  .queue>li::before{content:"第" counter(q) "步";position:absolute;left:12px;top:11px;font-size:11px;
+            font-weight:800;color:#fff;background:#111827;border-radius:999px;padding:3px 7px}
   @media (max-width:820px){
+    .chain{grid-template-columns:1fr}
+    .twocol{grid-template-columns:1fr}
+
     .grid,.kpi-grid{grid-template-columns:1fr}
     .hero{padding:26px 22px}
     .full{grid-column:auto}
@@ -98,8 +137,12 @@
   <span class="pill">主参考：trajectory GT roadmap v17.3-v17.6</span>
   <span class="pill">判定：不作为轨迹修复项更换</span>
   <span class="pill">潜在价值：小 marker / 小 rig</span>
-  <span class="pill">优先级：把环境固定 marker 做成常驻监视器</span>
+  <span class="pill" style="background:rgba(37,99,235,.22);border-color:rgba(147,197,253,.5)">2026-09-03 增补：换相机仍判否</span>
+  <span class="pill" style="background:rgba(180,83,9,.28);border-color:rgba(253,186,116,.5)">缩小 rig 待定价：U1 / U2 未决</span>
 </div>
+<p style="margin-top:14px;padding:12px 14px;border-radius:10px;background:rgba(255,255,255,.07);border-left:3px solid #93c5fd">
+  <b style="color:#fff">2026-09-03 复盘增补。</b><span style="color:#e5e7eb">本报告 09-02 版回答的是「换窄 FOV 能不能修当前轨迹误差」。09-03 组会前追问的是另一个问题：<b style="color:#fff">能不能为了缩小 marker rig 而部分/全部更换外部固定相机</b>。<b style="color:#fff">换相机的答案仍是不换</b>——但两条原论据被推翻，承重理由换成了「被重印贴纸严格支配」：窄 FOV 给 1.2×，而<b style="color:#fff">单是把贴纸裁到实测下限就给 1.35×</b>。<b style="color:#fff">当天下午把 J2 跑掉了</b>（把已录好的视频缩小重认，8 台相机 × 245 帧 × 12 档尺度），结论有三条：<b style="color:#fff">(1) 实测下限 45 mm，现行「50 px」规矩基本正确，没有白送的余量</b>；<b style="color:#fff">(2) 在用 marker 是 60.6 mm，不是本报告此前写的 56 mm</b>（56 是旧 cube 的尺寸）；<b style="color:#fff">(3) 换 4X4 字典的天花板是 1.08× 而不是 1.33×</b>——八成的检测失败发生在「找四边形」那一级，而格子数管不到它。<b style="color:#fff">第 (3) 条推翻了本报告当天上午自己写下的「重印贴纸 1.56× 严格支配窄 FOV」</b>，但不改变「不换相机」——承重的三条论据都不经过 marker 尺寸这条链。<b style="color:#fff">而「缩小 rig 本身值不值得」是另一个问题，目前无法定价</b>（收益区间跨 25 倍，卡在 U1/U2 两个未决点上），不能跟着一起判否。见下方「2026-09-03 决策复盘」。</span>
+</p>
 <p class="small" style="margin-top:16px;color:#9ca3af">
   本报告从 <a href="box_umi_trajectory_gt_replay_roadmap.html" style="color:#93c5fd">BOX 高精度 UMI Trajectory GT &amp; Dual-FR3 Replay Roadmap</a> 单独抽取窄 FOV 相关证据；完整误差预算背景见
   <a href="box_umi_error_budget_evidence.html" style="color:#93c5fd">3 mm 误差预算证据册</a> 与
@@ -111,18 +154,618 @@
 <section class="card full">
 <div class="section-title"><h2>一页结论</h2><span class="badge bad">轨迹误差修复项不更换</span></div>
 <div class="callout bad">
-  <b>决策句：</b>作为当前轨迹误差修复项，窄 FOV 镜头的直接正收益封顶在角点 precision，量级只有 <b>0.027-0.116 mm</b>；当前相机侧误差约 <b>2 mm</b>，且主要是外参 accuracy 偏置。七台全换会让 <span class="mono">cam_09</span> 丢掉全部 9 个环境固定 marker 观测，正好破坏当前最有价值的相机被碰检测通道。<b>这里的 9 个是环境固定 marker，不是 marker rig；cam_09 对 marker rig 的可见数另算，最多约 3 个。</b><b>但这不否定另一个价值：</b>在 marker 仍落在视场内时，窄 FOV 可以提高同尺寸 marker 的像素占比，从而支持更小 marker / 更紧凑 marker rig；这是 detectability 与 mechanical packaging 收益，不是 trajectory accuracy 收益。
+  <b>决策句：</b>作为当前轨迹误差修复项，窄 FOV 镜头的直接正收益封顶在角点 precision，量级只有 <b>0.027-0.116 mm</b>；当前相机侧误差约 <b>2 mm</b>，且主要是外参 accuracy 偏置。七台全换还会让 <span class="mono">cam_07</span> 直接装不下窄视锥（垂直 -4.6°）、<span class="mono">cam_13</span> 只剩 -0.3° 余量，等于把七台压到 5-6 台，削的正是 p95 尾巴。<b>但这不否定另一个价值：</b>在 marker 仍落在视场内时，窄 FOV 可以提高同尺寸 marker 的像素占比，从而支持更小 marker / 更紧凑 marker rig；这是 detectability 与 mechanical packaging 收益，不是 trajectory accuracy 收益。
 </div>
 <div class="kpi-grid">
   <div class="kpi"><div class="num">0.027 mm</div><div class="label">单台窄 FOV 在实测工作偏角下，对角点通道的预计节省</div></div>
   <div class="kpi"><div class="num">0.116 mm</div><div class="label">把角点精度提升到无穷大的理论收益上限</div></div>
   <div class="kpi"><div class="num">≈2.0 mm</div><div class="label">当前相机内外参 / 三角测量行的诚实口径</div></div>
-  <div class="kpi"><div class="num">0 / 9</div><div class="label">七台全换窄视锥后，cam_09 保留的环境固定 marker 观测数；非 marker rig</div></div>
+  <div class="kpi"><div class="num">8% → 38%</div><div class="label">2 相机帧只占样本 8%，却占了误差最差 5% 的 38%——窄视锥削的正是这条尾巴</div></div>
   <div class="kpi"><div class="num">48 → ≈40 mm</div><div class="label">按 1.2× 角分辨率增益粗算，可保持相近像素尺寸的 marker 线性尺寸</div></div>
 </div>
 <p>
   这不是“窄 FOV 没有任何物理好处”。它确实可能提高每个角点的角分辨率，尤其在大偏角处；也可能让原本低于检测阈值的 marker 变得可识别，或者允许使用更小的物理 marker。但本系统的轨迹误差超支不是角点白噪声主导，而是外参偏置、相机被碰、跨采集世界变化、以及生产 cube 口径下的 marker→TCP 未标定和夹爪刚性问题。更精确地读一套已经偏了的外参，只会得到更精确的错误答案。
 </p>
+</section>
+
+<section class="card full" id="review-0903">
+<div class="section-title"><h2>2026-09-03 决策复盘：为「缩小 marker rig」而换相机？</h2><span class="badge bad">换相机判否 · 缩 rig 待定价</span></div>
+
+<div class="callout bad">
+  <b>决策句（换相机）：不换。</b>这条链断在第 ①-② 段：窄 FOV 在实际工作偏角只给 <b>1.2×</b>，把实测下限从 45 mm 挪到约 37.5 mm；而<b>光是把贴纸裁到实测下限本身就是 1.35×</b>（60.6 → 45 mm），叠上字典的天花板 1.08× 共 1.46×。<b>代价却是实的——<span class="mono">cam_07</span> 出局、p95 尾巴变厚。</b>
+  <br><br>
+  <b>⚠ 「严格支配」这个说法当天下午被自己的实验削弱了：</b>窄 FOV 的 1.2× 与重印贴纸的 1.46× <b>是可叠加的，不是二选一</b>，所以它不再是「被支配」。
+  <b>但结论不变，因为承重的从来不是这条</b>——角点通道封顶 0.027 mm、「2 mm 里只有约 1% 是采样噪声」、七台压到 5–6 台并加厚 p95，三条都不经过 marker 尺寸。
+  <br><br>
+  <b>2026-09-03 补：这两个「更便宜的手段」现在也标了价，都不是免费的。</b>裁到 45 mm 要付掉 4% 的 marker 观测和 0.13–0.58 mm 的 TCP 精度；换字典要花掉 6X6 那份「测不出来」的容错余量。<b>结论方向不变（换相机仍被支配），但「零成本」这个说法作废。</b>见「J2 已跑完」一节。
+  <br><br>
+  <b>决策句（缩小 rig）：暂缓定价，不是判否。</b>「缩 L 值多少」取决于两个尚未澄清的点（现役 L 究竟是 102.3 还是 259.5 mm；逐帧姿态项是否重复记账），见下方「缩短 L 的定价：两个未决点」。<b>这两个点不影响换相机的结论，但决定要不要为缩小 rig 单独立项。</b>
+</div>
+
+<p>
+  09-02 版判的是「窄 FOV 能不能修当前轨迹误差」。这次问的是另一个问题——<b>能否为了把 marker rig 做小而换相机</b>。这是一条四段的因果链，每一段单独看都成立，但每一段都有实测天花板，乘起来就没了：
+</p>
+
+<div class="chain">
+  <div class="step"><div class="t">① 换窄 FOV / 长焦</div><div class="v">×1.2</div><div class="n">角分辨率增益。轴上 1.09×，marker 中位偏角 16.3° 处约 1.2×，40° 边缘才 2.11×。</div></div>
+  <div class="step"><div class="t">② marker 可缩小</div><div class="v">48 → 40 mm</div><div class="n">一阶折算，保持相近像素边长。不是缩一半。</div></div>
+  <div class="step"><div class="t">③ rig 可更紧凑</div><div class="v">L: 102.3 mm</div><div class="n">杠杆臂已从旧 cube 的 241.5 mm 降到 102.3 mm，M2 目标 ≤100 mm —— <b>已经基本到位</b>。</div></div>
+  <div class="step dead"><div class="t">④ L·θ<sub>cam</sub></div><div class="v">已删除</div><div class="n">2026-08-27 判定<b>相机外参</b>旋转误差被读在刚体另一点上属重复记账，已从 <span class="mono">e_total</span> 移出。<b>注意「同名不同物」：被删的只有这一项。</b></div></div>
+  <div class="step"><div class="t">⑤ L·θ<sub>mount</sub></div><div class="v">未删除</div><div class="n">rig→TCP 安装旋转与相机误差完全独立，删掉重复那笔之后<b>反而成了预算最大单项</b>：2.0°×259.5 mm = 9.1 mm。M6 hand-eye 打到 0.2° 是这一项上的 10× 动作。</div></div>
+</div>
+
+<div class="callout">
+  <b>读法（2026-09-03 更正）：</b><span class="mono">e = L·θ</span>。<b>hand-eye 不改变 L，它改变 θ</b>——于是它把「缩短 L」的<b>边际价值</b>压低 10×，<b>而不是压到零</b>。按 <span class="mono">dE/dL = θ</span>：
+  <table class="metric-table" style="margin:10px 0 4px;background:#fff;border-radius:8px">
+  <tr><th>θ</th><th>每缩短 1 mm 杠杆值多少</th><th>缩短 40 mm 值多少</th></tr>
+  <tr><td>2.0°（现值，<b>声明而非实测</b>）</td><td>35 µm/mm</td><td><b>1.40 mm</b></td></tr>
+  <tr><td>0.2°（M6 hand-eye 目标）</td><td>3.5 µm/mm</td><td><b>0.14 mm</b></td></tr>
+  </table>
+  <b>所以这是顺序问题，不是存废问题：</b>hand-eye 是这一项上的 10× 动作且不用买硬件，缩 L 是 1.1× 动作且要重开模具。<b>先做 hand-eye，再回来给 L 定价。</b>
+  <span class="small">（本报告 09-03 初稿曾写成「hand-eye 落地后 L 再缩就基本不值钱」——那是把 θ<sub>cam</sub> 与 θ<sub>mount</sub> 揉成了一个，已更正。）</span>
+</div>
+
+<h3 style="margin-top:24px;font-size:17px">hand-eye 盖不住、但仍按 L 放大的三项</h3>
+<div class="table-scroll">
+<table class="metric-table">
+<tr><th style="width:20%">项</th><th style="width:24%">量级</th><th>为什么 hand-eye 不管用</th></tr>
+<tr>
+  <td><b>安装面 → TCP 公差</b></td>
+  <td>155 mm 杠杆上 0.2° = <b>0.54 mm</b>，1.0° = <b>2.7 mm</b></td>
+  <td>供应商 V2 明写：<b>hand-eye 不覆盖「安装面 → TCP」这一段</b>，只能靠加工公差。这一项纯粹是 <span class="mono">L·θ</span>，<b>L 是唯一的杠杆</b>。</td>
+</tr>
+<tr>
+  <td><b>重复拆装</b></td>
+  <td>—</td>
+  <td>分布式 rig 设计文档写明 <b>102.3 mm 是「单次装配的值，不能按冻结常量用」</b>。hand-eye 是静态标定，每次拆装都可能作废；同样的角度重复性，杠杆短则毫米数小。</td>
+</tr>
+<tr>
+  <td><b>装夹刚性 / 形变</b></td>
+  <td>—</td>
+  <td>长杠杆在安装面上产生更大力矩——它不只是角度误差的<b>放大器</b>，还部分是它的<b>产生器</b>。这一项自我强化，hand-eye 碰不到。</td>
+</tr>
+</table>
+</div>
+
+<h3 style="margin-top:24px;font-size:17px">缩短 L 的定价：两个未决点</h3>
+<div class="callout warn">
+  <b>下面两点澄清之前，「缩 L 值多少」这个数不成立。</b>它们不影响「换相机」的结论（那条链断在 1.2× 那一段，与 L 无关），但决定要不要为缩小 rig 单独立项。
+</div>
+<div class="table-scroll">
+<table class="metric-table">
+<tr><th style="width:22%">未决点</th><th style="width:34%">冲突在哪</th><th>取值范围</th></tr>
+<tr>
+  <td><b>U1 · 现役到底是哪个 L</b></td>
+  <td>生产 bundle 里的 <span class="mono">marker_to_tcp_calibration_20260812.json</span> 仍是<b>旧高位 cube 几何</b>，roadmap 的 9.1 mm 正是按 <b>259.5 mm</b> 折的；而分布式 rig 的实测合成杠杆臂是 <b>102.3 mm</b>。两个数在文档里都叫「现役」。</td>
+  <td>若生产链路上跑的仍是 259.5 mm：压到 102 mm 值 <b>9.1 → 3.6 mm</b>（现值 2.0° 下）；hand-eye 之后仍值 <b>0.90 → 0.36 mm</b>。<b>先查清楚，否则任何定价都锚错。</b></td>
+</tr>
+<tr>
+  <td><b>U2 · 逐帧姿态项算不算重复记账</b></td>
+  <td>roadmap（08-27）：<span class="mono">L·θ<sub>cam</sub></span> 重复记账，已删。<br>供应商 V2 验收表：「姿态误差折算到 TCP p95：6.32 → 2.59 → 目标 &lt;1.5 mm」<b>仍然在册</b>，用的是实测逐相机姿态分歧 0.64° → 0.67°。<b>两份文档现在是打架的。</b></td>
+  <td>若供应商读法成立：0.67° 在 102.3 mm 上 p95 <b>2.59 mm</b>，压到 60 mm 是 <b>1.52 mm</b>——省 1 mm 出头，<b>L 就完全不是小事</b>。若 roadmap 读法成立，这一项归零。</td>
+</tr>
+</table>
+</div>
+<div class="callout warn">
+  <b>另外，L 也不是可以随便缩。</b>供应商文档记了一次教训：2026-08-21 有个中间版本把 cube 前移来缩短杠杆，结果前向 marker 被相机本体挡住，「用 1-3 mm 的 marker 观测损失换杠杆臂的一点线性缩短，<b>净亏</b>」。<b>M2（L ≤ 100 mm）与 M3（可见性）本来就是对着干的。</b>
+</div>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="num">35 → 3.5</div><div class="label">µm/mm：hand-eye 把「缩短 L」的边际价值压低 10×——<b>是定价问题，不是存废问题</b></div></div>
+  <div class="kpi"><div class="num">1.08×</div><div class="label">6X6→4X4 的<b>实测天花板</b>。<span class="rev">1.33×</span> 是 px/模块比值——而<b>八成失败在「找四边形」级，格子数管不到</b></div></div>
+  <div class="kpi"><div class="num">45 mm</div><div class="label"><b>实测</b>贴纸下限（95% 保留率）。今天是 60.6 mm，余量 <b>1.35×</b>——<b>不是白送，是安全垫</b></div></div>
+  <div class="kpi"><div class="num">中等 PR</div><div class="label">混 FOV 的实测改动量。原「格式不可表示」说法作废</div></div>
+</div>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>本次撤回的两条论据</h2><span class="badge warn">原报告据此反对，现已推翻</span></div>
+<p>
+  09-02 版反对更换时用了两条论据，组会讨论中被指出都站不住。两条都撤，并且都要从下方「决策矩阵」里改掉，否则会继续被引用。
+</p>
+<table class="metric-table">
+<tr><th style="width:26%">原论据</th><th style="width:10%">状态</th><th>正确读法</th></tr>
+<tr>
+  <td class="rev">窄 FOV 为了保覆盖必须把相机后退 1.59×，净 marker 像素反而 0.69×——对「小 marker」这个目标自相矛盾。</td>
+  <td><span class="badge bad">撤销</span></td>
+  <td><b>「必须后退」是错误前提。</b>正确做法是不后退，接受每台相机少看一点，靠多相机视角互补吸收。实测支持这个读法：七台窄视锥模拟里 <b>rig 观测保留率 87%-100%</b>，被削掉的是每台相机的边缘，不是 rig 本身。同距离下窄 FOV 就是净 <b>1.2×</b>，不打折。</td>
+</tr>
+<tr>
+  <td class="rev">部分更换有一堵额外的硬墙：混 FOV 在现行生产标定格式中不可表示。</td>
+  <td><span class="badge bad">撤销</span></td>
+  <td><b>去代码里量过了，比 roadmap 的描述轻得多——是一个中等 PR，不是墙。</b>见下表。这条不该继续作为反对理由；它是一个成本项，且成本不高。</td>
+</tr>
+</table>
+
+<h3 style="margin-top:22px;font-size:17px">混 FOV 支持的实测改动面</h3>
+<div class="table-scroll">
+<table class="metric-table">
+<tr><th>层</th><th>位置</th><th>改动量</th></tr>
+<tr>
+  <td><b>生产消费侧</b></td>
+  <td><span class="mono">metrology/calibration_io.py</span>（<span class="mono">ProductionCamera.model</span>，:77 / :136 / :162）、<span class="mono">metrology/rig_layout.py:42</span></td>
+  <td><span class="badge done">不用改</span> 本来就是逐相机分支。出标签的那条 corner 级 BA 通路已经支持混模型。</td>
+</tr>
+<tr>
+  <td><b>解算侧</b></td>
+  <td><span class="mono">metrology/extrinsics.py</span>：<span class="mono">solve_pnp(model,…)</span> @:112、<span class="mono">project_points(</span> @:247</td>
+  <td><b>一行。</b>两处本来就在逐相机循环里、用的是 <span class="mono">intrinsics[camera]["K"]</span>，把标量 <span class="mono">model</span> 换成 <span class="mono">intrinsics[camera]["model"]</span> 即可。</td>
+</tr>
+<tr>
+  <td><b>加载守卫</b></td>
+  <td><span class="mono">extrinsics.py:383</span> <span class="mono">raise ValueError("Mixed camera models …")</span></td>
+  <td><b>删掉。</b>每份 <span class="mono">intrinsics_producer.json</span> 本来就自带 per-camera <span class="mono">model</span>，这个守卫只是把它们塌缩成一个。</td>
+</tr>
+<tr>
+  <td><b>导出层（主要工作量）</b></td>
+  <td><span class="mono">metrology/cli/export_production_calibration.py</span>：run 级 <span class="mono">--model</span> / <span class="mono">MODEL_TAGS</span> / <span class="mono">DIST_LENGTHS</span> 校验 / 顶层 <span class="mono">camera_model</span> 字段</td>
+  <td><b>要写。</b>但逐行的 <span class="mono">"model"</span> 字段（:356 / :378）已经存在，主要是把 run 级的那份改成逐相机。另需 <span class="mono">--base-intrinsics</span> 支持增量扩台（现在只能整套重建）。</td>
+</tr>
+<tr>
+  <td><b>追踪器侧</b></td>
+  <td><span class="mono">cli/run_marker_rig_ba.py:406</span> <span class="mono">detector_camera = next(iter(cameras_by_name.values()))</span>；<span class="mono">tracker_cfg["camera_model"]</span>；<span class="mono">hikon_cube_tracking_in_robot_base.py</span> 的 <span class="mono">check_camera_model</span></td>
+  <td><b>要写。</b>检测器现在是拿「第一台相机」的 K/D 建的，要改成逐相机。<span class="mono">check_camera_model</span> 本来就逐相机比对，只是比的对象是一个全局配置值。</td>
+</tr>
+</table>
+</div>
+<div class="callout warn">
+  <b>要修的文档：</b>roadmap 里「先要改的是这里，不是镜头」这句，应改成「<b>这里改起来不贵，所以它不构成反对理由</b>」。建议写进 v17.7。
+</div>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>纯窄 FOV + 长焦：得失清单</h2><span class="badge warn">不后退、不换分辨率的前提下</span></div>
+<div class="twocol">
+<div class="lst g">
+<h4>得</h4>
+<ul>
+  <li><b>px/rad：</b>轴上 1.09×，中位斜视 16.3° 处 <b>1.2×</b>，40° 边缘 2.11× → marker 可 48 → 40 mm</li>
+  <li><b>躲开鱼眼边界病：</b><span class="mono">fold@inf</span>、<span class="mono">cam_08</span> 角点反解 nan；畸变模型更简单、内参更稳</li>
+  <li><b>角点通道噪声：</b>0.116 → 0.089 mm</li>
+</ul>
+</div>
+<div class="lst r">
+<h4>失</h4>
+<ul>
+  <li><b>相机会掉队：</b><span class="mono">cam_07</span> 直接装不下（水平 -6.7° / 垂直 -4.6°），<span class="mono">cam_13</span> 只剩 -0.3° → 七台实际变 <b>5-6 台</b></li>
+  <li><b>p95 尾巴变厚：</b>每帧参与相机数下移，而 <b>2 相机帧占样本 8%、却占最差 5% 的 38%</b></li>
+  <li><b>景深变浅：</b>长焦 + 工作距离 0.45-0.94 m 跨了 2 倍 → 光圈/对焦余量吃紧</li>
+  <li><b>运动模糊变严重：</b>同样 680 mm/s 在更长焦距上摊到更多 px，部分吃掉那 1.2×</li>
+  <li><b>标定更难：</b>视场小，标定板难占满；共视基线缩短</li>
+  <li><b>混模型导出/加载层要改：</b>已量化为中等 PR（不是墙，但是成本）</li>
+</ul>
+</div>
+</div>
+<div class="callout bad" style="margin-top:16px">
+  <b>净账：</b>收益 0.027 mm（角点）+ 一个<b>尚未定价</b>的杠杆项（取决于 U1/U2，见上方「缩短 L 的定价：两个未决点」）；代价落在 <b>p95 尾巴</b>上——而它恰好就是被管理的那个指标。<b>但换相机的结论不依赖这个定价</b>，也不依赖 marker 尺寸那条链——见下方「J2 已跑完」结果五，那条链当天下午被自己的实验改写了，而承重的三条论据都在链外。
+</div>
+<div class="callout warn">
+  <b>一个容易被跳过的逻辑点：</b>「不后退、接受覆盖损失」这个让步<b>并没有救窄 FOV</b>，因为真正该比的对象不是现状，是<b>高分辨率</b>。窄 FOV 拿覆盖换像素，高分辨率不用换。愿意付覆盖代价，不改变「同样的钱花在分辨率上更划算」。窄 FOV 唯一独有的好处是结构性躲开鱼眼畸变边界那个病，而那个病生产上已经用 fisheye 模型绕过了。<b>唯一能让窄 FOV 赢过高分辨率的场景，是 GMSL2 链路 / Thor 的带宽、NVMM、录制管线已经顶到分辨率上限——这个数我们还没查，是该先查的一个。</b>
+</div>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>动相机之前，两级更便宜的杠杆</h2><span class="badge done">全部零采购</span></div>
+<div class="table-scroll">
+<table class="metric-table">
+<tr><th style="width:22%">杠杆</th><th style="width:12%">增益</th><th style="width:14%">成本</th><th>说明</th></tr>
+<tr>
+  <td><b>① 60.6 → 45 mm</b></td>
+  <td><b>1.35×</b></td>
+  <td>重印贴纸 + <b>4% 观测</b> + <b>0.13–0.58 mm</b></td>
+  <td><b>45 mm 是实测值</b>（J2，95% 保留率下限 46.5 px），不再是准则 T1 那个 <span class="mono">size ≥ 50·d_max/f</span> 外推出来的 48 mm——不过实测下来<b>那条规矩基本是对的</b>。<b>这不是「白送」：多出来的 15.6 mm 是安全垫，裁掉等于把它全部花掉</b>，marker 观测从 100% 掉到 96%，角点精度按实测标度 <span class="mono">尺寸<sup>−0.34</sup></span>（绝对）/ <span class="mono">尺寸<sup>−1.34</sup></span>（相对）劣化，折到 TCP 多 <b>0.13–0.58 mm</b>。<span class="small">（2026-09-03 两次更正：原写作「白送」；原写作 56 mm，实为 60.6 mm，56 是旧 cube 的尺寸。）</span></td>
+</tr>
+<tr>
+  <td><b>② DICT_6X6 → DICT_4X4</b></td>
+  <td><span class="rev">1.33×</span> <b>≤1.08×</b></td>
+  <td>重印贴纸</td>
+  <td>含边框 8×8 模块 → 6×6 模块，同物理尺寸下 <b>px/模块 ×1.33，比窄 FOV 的 1.2× 还多</b>。<b>附带好处：</b>rig marker 与环境固定 marker 按字典彻底分开，直接消灭 v17.4 那一类「统计口径混淆」事故。<b>代价：</b>汉明距离下降，需实测误检率。</td>
+</tr>
+<tr>
+  <td><b>①+② 叠加</b></td>
+  <td><span class="rev">≈1.56×</span> <b>≤1.46×</b></td>
+  <td>重印贴纸</td>
+  <td><b>60.6 mm → 约 41.6 mm</b>，一台相机都不用换。<b>⚠ 原写作「→ 约 34 mm，已超过窄 FOV 全换」，两处都错了</b>：② 的天花板是 1.08× 不是 1.33×（J2 结果五），而窄 FOV 的 1.2× 与本行<b>可以叠加</b>，不构成「被支配」。<b>另外 J2 实测：做到 36 mm 要丢掉 8% 的 marker 观测。</b>见下两节。</td>
+</tr>
+</table>
+</div>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>能不能三项一起上，把贴纸做到 30 mm？</h2><span class="badge warn">白话版 · 不需要技术背景</span><span class="badge done">当天已实测：不能，做到 42 mm 就到头了</span></div>
+
+<div class="big">
+<p><b>先说结论：算术上没错，实际不能这么做。当天下午的实测把三个数都改了。</b></p>
+
+<p>
+  三个办法各自能让贴纸做小一点：裁掉现有余量（原以为 1.17 倍）、换一种格子更少的图案（原以为 1.33 倍）、换长焦镜头（1.2 倍）。
+  三个乘起来是 1.87 倍，<span class="mono">56 ÷ 1.87 = 30 mm</span>。<b>算术没错，但三个输入有两个是错的。</b>
+</p>
+<div class="num-line" style="border-color:var(--bad)">
+  <b>实测之后：</b>裁余量是 <b>1.35 倍</b>（原来的基数 56 mm 抄错了，实际 60.6 mm）；
+  换图案<b>拿不到 1.33 倍，天花板只有 1.08 倍</b>（下面第 ⑤ 条）；镜头那 1.2 倍是平均值（第 ③ 条）。
+  <b>不换相机的话，三项里能用的两项合起来是 1.46 倍 —— 60.6 ÷ 1.46 ≈ 42 mm，不是 30 mm。</b>
+</div>
+
+<div class="ana">
+  <span class="tag">打个比方</span><br/>
+  这就像商场的<b>「满减 + 会员折扣 + 优惠券」</b>。海报上每一张都写着能省钱，加起来能打三折。
+  但真到结账才发现：<b>第一张其实是把你自己储值卡里的钱花掉了</b>（那不是省，是花）；
+  <b>第二张的折扣写的是「最高可达」</b>，你这单达不到；
+  <b>第三张用完会触发另一条限制</b>，反而多花钱。
+  <br/><br/>
+  下面四条就是这三张券的真实条款。
+</div>
+
+<div class="why">
+<h4>① 底线已经量出来了：45 mm，而且没有白送的余量 <span class="badge done" style="font-size:11px;vertical-align:middle">2026-09-03 实测</span></h4>
+<p>
+  这一条原来写的是「我们不知道底线在哪，可能 30 也可能 55，蒙着眼睛往前逼近很危险」。
+  <b>当天下午把已录好的视频缩小重认了一遍，现在知道了：45 mm。</b>
+  也就是说，<b>那条一直被当作「没验证过」的「至少 50 个像素」规矩，基本是对的</b>——没有藏着一大截余量。
+</p>
+<p>
+  同时更正一个数：<b>贴纸现在做的是 60.6 mm，不是 56 mm。</b>
+  56 是从一个早就不用的旧件的配置里抄来的。
+  所以真正的余量是 <b>1.35 倍</b>，而不是叠加算术里假设的 1.87 倍。
+</p>
+<div class="num-line">
+  <b>还有一个反直觉的发现：根本没有「悬崖」。</b>
+  不存在「大于某个尺寸就认得出、小于就认不出」的那条线——贴纸越小，认出来的比例越低，
+  <b>从第一毫米就开始掉</b>。所以「底线」只能是我们自己挑的一条及格线，这里挑的是「还认得出 95%」。<br/>
+  <b>做到 36 mm，会丢掉 8% 的观测；做到 30 mm，丢 12%。</b>那不是免费的。
+</div>
+</div>
+
+<div class="why">
+<h4>② 第一个办法不是「赚」，是「花积蓄」——这条现在有实测撑着了</h4>
+<p>
+  贴纸现在做 60.6 mm，实测底线 45 mm。多出来的这 15.6 mm <b>不是浪费，是安全垫</b>。
+  裁到底线，等于把它<b>全部</b>花掉：能认出来的观测从 100% 掉到 96%，
+  而且画面里的贴纸变小、看得没那么清楚，<b>算出来的朝向就没那么准</b>。
+</p>
+<div class="num-line">
+  代价具体是多少：折算到夹爪尖上是<b>多 0.12 到 0.57 mm</b>。<br/>
+  <span class="small">（区间这么宽，是因为「支架的朝向到底是靠好几张贴纸一起算出来的，还是靠单独一张算出来的」——
+  这一点报告里还没钉死，而两种情况下代价差 4 倍。这是一个该去查清楚的事，不是一个该含糊过去的事。）</span><br/>
+  <b>对比一下：</b>把整个支架缩短 40 mm（要重新开模、重新装配的大动作）只省 <b>0.14 mm</b>。<br/>
+  <b>也就是说，光是第一步这个「免费」的裁小，代价就可能比大动干戈缩短支架赚回来的还多。</b>
+</div>
+</div>
+
+<div class="why">
+<h4>③ 换镜头的「1.2 倍」是平均值，不是保底值</h4>
+<p>
+  长焦镜头在<b>画面边缘</b>提升很大（2.1 倍），但在<b>画面正中间</b>只有 1.09 倍。
+  1.2 倍是把所有情况平均出来的数。
+</p>
+<p>
+  <b>但贴纸尺寸必须按最差的情况定，不能按平均情况定</b>——按平均水深 1 米设计，照样淹死人。
+  贴纸只要有一次没被认出来，那一帧的数据就没了。
+</p>
+<div class="num-line">
+  按画面正中间的 1.09 倍重算，再换上实测的另外两个数：<b>三项连乘只到 39 mm</b>，不是 30 mm。
+</div>
+</div>
+
+<div class="why">
+<h4>④ 最容易被忽略的一条：支架做小了，它自己反而更难测准</h4>
+<div class="ana" style="margin-top:4px">
+  <span class="tag">打个比方</span><br/>
+  想知道一块板子朝哪边歪了，你在板子上取<b>两个参考点</b>——这两点<b>离得越远，越容易看出歪了多少</b>。
+  这就是为什么量角度要用长尺子，短尺子量不准。
+</div>
+<p>
+  支架上那几张贴纸<b>彼此之间的距离，就是这把尺子</b>。
+  支架做小，尺子就变短，<b>判断整个支架朝向的能力反而下降</b>。
+</p>
+<p>
+  而我们缩小支架的<b>初衷</b>，正是为了让「朝向判断不准」这件事造成的后果变小。
+  <b>缩过头，朝向本身变得更不准，比省下来的还多——白忙一场，甚至倒亏。</b>
+</p>
+<div class="num-line">
+  所以支架有一个<b>自己的尺寸下限</b>，这个下限跟「贴纸能不能被认出来」完全无关，是另一件事。
+  再加上每个方向必须同时看到至少 2 张不共面的贴纸（M3），它们之间还得留出足够角度，不能挤成一堆。
+</div>
+</div>
+
+<div class="why">
+<h4>⑤ 第二张券（换图案）当天下午被实测打掉了 <span class="badge done" style="font-size:11px;vertical-align:middle">2026-09-03 实测</span></h4>
+<div class="ana" style="margin-top:4px">
+  <span class="tag">打个比方</span><br/>
+  认一张贴纸分两步：<b>先在画面里圈出「这儿有个方块」</b>，<b>再看清方块里的花纹是哪一个编号</b>。
+  「换成格子更少的图案」只能让<b>第二步</b>更容易——第一步只管找方块，根本不看里面有几个格子。
+</div>
+<p>
+  原来假设瓶颈在第二步，所以指望换图案能省 1.33 倍。<b>实测下来，八成的失败发生在第一步</b>——
+  连方块都没圈出来，谈不上花纹认不认得清。
+</p>
+<div class="num-line">
+  所以哪怕换上一个「完全不用看花纹就能认」的理想图案，贴纸也只能从 <b>45 mm 做到 41.7 mm</b>，
+  <b>1.08 倍，不是 1.33 倍</b>。<br/>
+  <b>而这 1.08 倍还要拿容错能力去换</b>——格子少了，认错的风险就上来了（见第 3 步）。
+  <b>划不来，这一项基本可以从清单里划掉。</b>
+</div>
+</div>
+
+<div class="callout bad">
+  <b>一句话总结给决策用：</b>30 mm 这个数字是「三张券全部叠加、每张都按最理想条款算」的结果。
+  <b>它不是一个可以拿去开模的目标。</b>当天下午按「先便宜、先能验证」的顺序做完第一步，实测答案是<b>约 42 mm</b>（不换相机），
+  而且<b>裁到那里，代价很可能已经超过缩短支架能省下来的</b>。<b>真正该做的仍然是排队，一次一步，每一步都先验证再往下走——今天这一步就是这么被证伪的。</b>
+</div>
+
+<h3 style="margin-top:22px;font-size:17px">正确的顺序（按「先便宜、先能验证」排）</h3>
+<ol class="queue">
+<li><b>先量底线。</b> <span class="badge done" style="font-size:11px">2026-09-03 已完成</span>
+    把已录好的视频缩小重新识别，看贴纸小到多少才真的认不出来。
+    <b>结果：45 mm，没有发现余量</b>，那条「至少 50 个像素」的老规矩基本是对的。
+    原本指望的「余量充足、后面三步都不用做」<b>没有兑现</b>。见上一节。</li>
+<li><b>按量出来的底线裁贴纸</b>：那个数是 <b>45 mm</b>——不是 48，也不是 36。
+    <b>但裁到 45 mm 就把安全垫全用完了</b>，所以在裁之前先回答「为什么要裁」：
+    如果只是为了缩短支架的杠杆臂，实测代价（0.13–0.58 mm）很可能比收益（0.14 mm）还大。</li>
+<li><b>换图案之前，先测一次「认错率」。</b>
+    格子少的图案容错能力弱。<b>认不出来只是丢一帧，不要紧；认错了是把错的位置当成对的喂给算法，那个致命</b>——
+    现有数据里，认错造成的整帧大错（超过 100 mm）占了 4.88%。</li>
+<li><b>换相机放最后。</b>它要花钱买硬件，还会让最差 5% 的那部分误差变大，
+    而它能给的（画面正中 1.09 倍）比前面几步都少。</li>
+</ol>
+</div>
+</section>
+
+<section class="card full" id="j2-result">
+<div class="section-title"><h2>J2 已跑完：把录像缩小重认，实测贴纸能做到多小</h2><span class="badge done">2026-09-03 实测 · 8 相机 × 245 帧 × 12 档尺度</span></div>
+
+<div class="callout bad">
+  <b>结论：没有白送的余量，上一节那句「可能躺着一大截余量」被自己的实验否掉了。</b>
+  实测 95% 保留率的下限是 <b>46.5 px</b>（95% CI 45.9–47.2），折成物理尺寸 <b>≈45 mm</b>——
+  <b>而现行那条从未验证的「50 px」规矩，基本是对的。</b>
+  今天在用的贴纸是 <b>60.6 mm</b>（不是本报告此前写的 56 mm，见下方更正），离下限只有 <b>1.35 倍</b>，
+  不是叠加算术假设的 1.87 倍。<b>做到 36 mm 要丢掉 8% 的 marker 观测。</b>
+</div>
+
+<div class="callout warn">
+  <b>先更正一个数：现行 marker 是 60.6 mm，不是 56 mm。</b>
+  本报告此前多处引用的 56 mm 来自追踪配置里的 <span class="mono">marker_size_cm: 5.6</span>，
+  那是<b>旧 cube（36h11，id 0–4 / 11–15）</b>的尺寸，不是 2026-08-18 起在用的 marker rig。
+  在用 rig 的边长是三份独立采集、多种求解变体一致解出的：
+  <span class="mono">60.54 / 60.60 / 60.62 / 60.62 / 60.87 mm</span>（跨采集全域 60.42–61.24），CAD 底板 69.6 mm。
+  <b>这条与 v17.5 查出的「生产追踪配置声明的字典与在用 rig 不一致」是同一处配置的两个症状。</b>
+</div>
+
+<h3 style="margin-top:20px;font-size:17px">方法：为什么不能直接把视频缩小了事</h3>
+<p>
+  把画面等比缩小 <span class="mono">s</span> 倍，marker 的成像尺寸就变成 <span class="mono">s</span> 倍——
+  这确实就是把贴纸印小 <span class="mono">s</span> 倍的效果。但<b>只做缩小会得到一个偏乐观的答案</b>，
+  而且三条偏差<b>全部指向同一个方向</b>：让缩小后的图比真实的小贴纸更好认。
+</p>
+<div class="table-scroll">
+<table class="metric-table">
+<tr><th style="width:26%">缩小带来的假象</th><th style="width:37%">真实的小贴纸是什么情况</th><th>本次的修正</th></tr>
+<tr>
+  <td><b>传感器噪声被平均掉了</b></td>
+  <td><span class="mono">INTER_AREA</span> 在 <span class="mono">s</span> 倍下平均了 <span class="mono">1/s²</span> 个像素，噪声 σ 降为 <span class="mono">s</span> 倍。真实的小 marker 承受全部单像素噪声。</td>
+  <td>补回 <span class="mono">σ·√(1−s²)</span>。<b>实测压缩后噪声只有 0.86 DN</b>，这一项其实很小。</td>
+</tr>
+<tr>
+  <td><b>光学模糊跟着一起缩小了</b></td>
+  <td>PSF 从 <span class="mono">w</span> px 变成 <span class="mono">w·s</span> px，<b>模糊相对 marker 的比例没变</b>。真实情况是 marker 缩小而 PSF 不动，比例变差。</td>
+  <td>补回 <span class="mono">w·√(1−s²)</span> 的高斯模糊。<b>w 是实测的，不是猜的</b>——见下。</td>
+</tr>
+<tr>
+  <td><b>检测器自己的尺寸闸门失效了</b></td>
+  <td><span class="mono">minMarkerPerimeterRate=0.03</span> 是相对 <span class="mono">max(W,H)</span> 的，画面一缩阈值跟着缩，<b>永远不触发</b>；真实的小 marker 在原尺寸画面里直接撞上它。</td>
+  <td>缩图里把该参数改成 <span class="mono">0.03/s</span>，还原成同一个<b>绝对像素</b>阈值（1920 宽下 = 边长 14.4 px 的硬墙）。</td>
+</tr>
+</table>
+</div>
+<p class="small">
+  其余与尺寸相关的检测参数（自适应阈值窗 3–23 px、角点精修窗 5 px）本来就是绝对像素，
+  在两种情形下相对缩小后的 marker 是同一个大小，<b>不需要修正</b>。
+</p>
+
+<div class="callout">
+  <b>模糊量是实测的。</b>每个被检出的 marker 都提供四条高对比直边，且亚像素位置已由角点精修给出。
+  沿边法向采样叠加得到边缘扩散函数，拟合 erf 得到总模糊 σ；
+  扣掉像素孔径（1 px 方窗，σ=1/√12=0.289，缩图会重新引入同样一份）后就是随画面缩小的光学部分。
+  八台相机、<b>23,673 条边</b>：<b>σ<sub>optical</sub> 中位 0.84 px，范围 0.54–1.03</b>
+  （<span class="mono">cam_01</span> 1.03 最糊，<span class="mono">cam_09</span> 0.54 最锐且拟合残差比别台差 40 倍，单独存疑）。
+  <b>这一步不是可选的：0.6 px 与 1.0 px 两个假设之间，下限相差 1.34 倍（36.9 → 49.3 px），比被测效应本身还大。</b>
+</div>
+
+<h3 style="margin-top:20px;font-size:17px">结果一：印多小，丢多少</h3>
+<p class="small">
+  数据：<span class="mono">20260901_182755/ep0</span>（与 E4、v17.5、v17.6 同一份录制），8 台相机 × 245 帧（frame-step 5），
+  rig 的五个 marker（id 7/12/14/16/17）。基准是同一帧原分辨率检出的那一套，所以 <span class="mono">scale 1.00</span> 恒为 100%——这一列是标尺自洽性检查，不是结果。
+</p>
+<div class="table-scroll">
+<table class="metric-table">
+<tr>
+  <th rowspan="2" style="width:11%">印刷尺寸</th><th rowspan="2" style="width:9%">画面中位边长</th>
+  <th colspan="2" style="width:26%">实测模糊（可信的一档）</th>
+  <th colspan="2" style="width:26%">只缩小、不补模糊（偏乐观）</th>
+  <th rowspan="2">读法</th>
+</tr>
+<tr><th>marker 观测</th><th>≥2 marker 的相机视角</th><th>marker 观测</th><th>≥2 marker 的相机视角</th></tr>
+<tr><td><b>60.6 mm</b>（今天）</td><td>78.7 px</td><td>100%</td><td>100%</td><td>100%</td><td>100%</td><td>基准</td></tr>
+<tr><td><b>51.5 mm</b></td><td>66.9 px</td><td><b>97.5%</b></td><td>97.9%</td><td>97.9%</td><td>98.1%</td><td>丢 2%</td></tr>
+<tr class="hl"><td><b>45 mm</b>（实测下限）</td><td>≈58 px</td><td><b>≈96%</b></td><td>≈96%</td><td>97%</td><td>97%</td><td><b>裁到这里，安全垫就用完了</b></td></tr>
+<tr><td><b>42.4 mm</b></td><td>55.1 px</td><td><b>95.5%</b></td><td>95.8%</td><td>96.8%</td><td>96.8%</td><td>已在下限以下</td></tr>
+<tr class="hl"><td><b>36.4 mm</b></td><td>47.2 px</td><td><b>92.3%</b></td><td>92.2%</td><td>95.4%</td><td>94.9%</td><td><b>叠加算术的目标：丢 8%</b></td></tr>
+<tr><td><b>30.3 mm</b></td><td>39.4 px</td><td><b>88.5%</b></td><td>87.8%</td><td>92.6%</td><td>92.3%</td><td>丢 12%</td></tr>
+<tr><td><b>25.5 mm</b></td><td>33.1 px</td><td><b>81.7%</b></td><td>79.4%</td><td>89.3%</td><td>88.8%</td><td>丢 20%</td></tr>
+<tr><td><b>21.2 mm</b></td><td>27.5 px</td><td>70.6%</td><td>64.1%</td><td>81.6%</td><td>78.8%</td><td>—</td></tr>
+<tr><td><b>18.2 mm</b></td><td>23.6 px</td><td>53.3%</td><td>43.7%</td><td>68.7%</td><td>63.8%</td><td>—</td></tr>
+<tr><td><b>15.2 mm</b></td><td>19.7 px</td><td>24.8%</td><td>15.7%</td><td>41.5%</td><td>38.3%</td><td>—</td></tr>
+</table>
+</div>
+<div class="callout warn">
+  <b>最该记住的一条：没有悬崖。</b>从第一步起就在平滑地掉，不存在一个「过了这条线才开始不认」的门槛。
+  <b>所以「底线」只能是一个选定的保留率，不是一个物理常数。</b>本节取 95%。
+  <b>而对比两组列还说明另一件事：</b>如果只做「把视频缩小」这个显而易见的动作而不补那三项，
+  36 mm 会读出 95.4%（看起来可以接受），实际是 92.3%。<b>差 28% 的判定尺度，且错在危险的一侧。</b>
+</div>
+
+<h3 style="margin-top:20px;font-size:17px">结果二：下限本身，与那道假悬崖</h3>
+<div class="table-scroll">
+<table class="metric-table">
+<tr><th style="width:26%">轨道</th><th style="width:16%">50% 检出</th><th style="width:22%">95% 检出（下限）</th><th style="width:16%">99% 检出</th><th>说明</th></tr>
+<tr class="hl"><td><b>实测模糊（可信）</b></td><td>25.1 px</td><td><b>46.5 px</b> <span class="small">CI 45.9–47.2</span></td><td>65.6 px</td><td><b>≈45 mm。现行 50 px 规矩基本正确</b></td></tr>
+<tr><td>实测模糊 · 只算正对镜头的</td><td>20.4 px</td><td><b>29.0 px</b></td><td>35.4 px</td><td><b>约束是偏角不是尺寸</b>——正对时下限低 38%</td></tr>
+<tr><td>只缩小，不补模糊</td><td>21.9 px</td><td>36.3 px</td><td>48.1 px</td><td>偷懒版会得到的答案，偏低 28%</td></tr>
+<tr><td>再把尺寸闸门也放开</td><td>18.6 px</td><td>37.8 px</td><td>56.3 px</td><td>闸门在 20 px 以上完全不起作用</td></tr>
+</table>
+</div>
+<div class="callout">
+  <b>唯一一道真悬崖在 14.4 px，而它是一个配置参数，不是物理。</b>
+  <span class="mono">minMarkerPerimeterRate=0.03</span> 在 1920 宽画面上等于「边长 &lt; 14.4 px 一律不看」。
+  实测：12–16 px 这一档，放开闸门有 <b>11.6%–30.1%</b> 的检出率，生产参数下是 <b>0.0%–0.4%</b>。
+  <b>但这道墙在任何我们会考虑的印刷尺寸上都够不着</b>（45 mm 对应 58 px），
+  所以它是一条「知道就好」的事实，不是可动用的余量。
+</div>
+
+<h3 style="margin-top:20px;font-size:17px">结果三：逐相机，谁先撑不住</h3>
+<div class="table-scroll">
+<table class="metric-table">
+<tr><th style="width:12%">相机</th><th style="width:14%">95% 下限</th><th style="width:16%">今天的 p05 成像边长</th><th style="width:12%">余量</th><th style="width:16%">最小安全印刷尺寸</th><th>中位方正度</th></tr>
+<tr class="hl"><td><span class="mono">cam_01</span></td><td>70.2 px</td><td>91.6 px</td><td><b>1.30×</b></td><td><b>46.4 mm</b></td><td>0.69（最斜，且最糊 1.03 px）</td></tr>
+<tr class="hl"><td><span class="mono">cam_09</span></td><td>34.5 px</td><td>46.6 px</td><td><b>1.35×</b></td><td><b>44.8 mm</b></td><td>0.74（贴纸成像全场最小）</td></tr>
+<tr><td><span class="mono">cam_13</span></td><td>46.6 px</td><td>64.1 px</td><td>1.37×</td><td>44.1 mm</td><td>0.75</td></tr>
+<tr><td><span class="mono">cam_12</span></td><td>44.1 px</td><td>63.1 px</td><td>1.43×</td><td>42.3 mm</td><td>0.77</td></tr>
+<tr><td><span class="mono">cam_06</span></td><td>43.7 px</td><td>67.7 px</td><td>1.55×</td><td>39.1 mm</td><td>0.81</td></tr>
+<tr><td><span class="mono">cam_07</span></td><td>41.4 px</td><td>64.5 px</td><td>1.56×</td><td>38.9 mm</td><td>0.80</td></tr>
+<tr><td><span class="mono">cam_14</span></td><td>38.5 px</td><td>60.0 px</td><td>1.56×</td><td>38.9 mm</td><td>0.74</td></tr>
+<tr><td><span class="mono">cam_08</span></td><td>28.1 px</td><td>49.1 px</td><td>1.75×</td><td>34.7 mm</td><td>0.91（最正对）</td></tr>
+</table>
+</div>
+<p class="small">
+  两条路互相印证：<b>逐相机取最紧的一台</b>给 46.4 mm，<b>从 46.5 px 按 f=1002 px/rad、d=0.94 m 折算</b>给 43.6 mm。
+  取 <b>≈45 mm</b>。<b>而「谁先撑不住」不是看谁的贴纸小，是看谁看得斜、谁的镜头糊</b>——
+  <span class="mono">cam_08</span> 的贴纸比 <span class="mono">cam_13</span> 小得多，余量却大得多。
+</p>
+
+<h3 style="margin-top:20px;font-size:17px">结果四：角点精度怎么随尺寸变——本报告此前的假设，一半对</h3>
+<p>
+  上一节写「贴纸小 17%，姿态精度<b>同比例</b>变差」，那是假设角点误差的像素值不变、纯按 1/尺寸 换算。<b>实测不是这样</b>：
+  贴纸变小时，角点的<b>绝对</b>像素误差自己也在变大。
+</p>
+<div class="table-scroll">
+<table class="metric-table">
+<tr><th style="width:16%">成像边长</th><th style="width:12%">样本数</th><th style="width:18%">角点偏移 p50 (px)</th><th style="width:18%">角点偏移 p95 (px)</th><th>偏移 / 边长</th></tr>
+<tr><td>14–18 px</td><td>133</td><td>1.181</td><td>1.570</td><td>6.67%</td></tr>
+<tr><td>18–22 px</td><td>1409</td><td>1.158</td><td>1.562</td><td>5.67%</td></tr>
+<tr><td>22–28 px</td><td>3927</td><td>1.082</td><td>1.656</td><td>4.33%</td></tr>
+<tr><td>28–35 px</td><td>4438</td><td>0.981</td><td>1.820</td><td>3.13%</td></tr>
+<tr><td>35–45 px</td><td>5564</td><td>0.923</td><td>2.040</td><td>2.33%</td></tr>
+<tr><td>45–60 px</td><td>6452</td><td>0.804</td><td>2.080</td><td>1.57%</td></tr>
+</table>
+</div>
+<div class="callout warn">
+  <b>实测标度：绝对角点误差 ∝ 尺寸<sup>−0.34</sup>，相对角点误差 ∝ 尺寸<sup>−1.34</sup></b>（14–60 px 区间；60 px 以上被基准自身的角点误差托底，不入拟合）。
+  于是 60.6 → 45 mm（缩 1.35 倍）的代价<b>取决于 rig 姿态是怎么解出来的，而这一点本报告没有钉死</b>：
+  <ul style="margin:8px 0 4px 18px">
+    <li><b>若姿态来自多 marker 基线</b>（marker 之间的距离不随贴纸变小而变）：只吃绝对误差，姿态 ×1.11 → 0.67° → 0.74°，折到 TCP <b>1.20 → 1.33 mm，+0.13 mm</b>。</li>
+    <li><b>若姿态来自单 marker PnP</b>（基线就是 marker 自己的边）：吃相对误差，姿态 ×1.49 → 1.00°，折到 TCP <b>1.20 → 1.78 mm，+0.58 mm</b>。</li>
+  </ul>
+  <b>本报告此前写的 +0.20 mm 恰好落在两者之间</b>——方向对，量级要看这个未决点。
+  <b>另外这两个数都还没算上丢掉的那 4–5% 观测</b>，而按 2026-08-27 的实测，每帧相机数正是 p95 尾巴的主要驱动
+  （两相机帧只占 8% 的样本，却占了最差 5% 误差的 38%）。
+</div>
+
+<h3 style="margin-top:20px;font-size:17px">结果五：② 换字典的天花板是 1.08×，不是 1.33× <span class="badge bad" style="font-size:11px;vertical-align:middle">推翻本报告当天早些时候的一条论据</span></h3>
+<p>
+  ArUco 的检测分两级：<b>先找四边形</b>（自适应阈值 → 轮廓 → 多边形逼近 → 几何过滤），<b>再解码格子</b>。
+  <b>格子数只影响第二级</b>——第一级是纯轮廓几何，marker 里有几个格子它完全不知道。
+  所以「6X6 → 4X4 给 1.33× px/模块」这个说法，<b>只有在失败主要发生在第二级时才会兑现</b>。
+  <span class="mono">detectMarkers</span> 的第三个返回值（成形为四边形但没解出 ID 的候选）本来就在，把它记下来就能分辨。
+</p>
+<div class="table-scroll">
+<table class="metric-table">
+<tr><th style="width:16%">成像边长</th><th style="width:12%">样本数</th><th style="width:16%">找到四边形</th><th style="width:16%">解出 ID</th><th style="width:12%">差</th><th>失败里「有四边形但解不出」的占比</th></tr>
+<tr><td>20–26 px</td><td>6771</td><td>0.592</td><td>0.512</td><td>0.079</td><td>16%</td></tr>
+<tr class="hl"><td>26–35 px</td><td>7698</td><td>0.805</td><td>0.756</td><td>0.049</td><td><b>20%</b></td></tr>
+<tr class="hl"><td>35–50 px</td><td>9141</td><td>0.903</td><td>0.885</td><td>0.018</td><td><b>16%</b></td></tr>
+<tr><td>50–65 px</td><td>6494</td><td>0.958</td><td>0.950</td><td>0.008</td><td>17%</td></tr>
+<tr><td>65–90 px</td><td>5964</td><td>0.986</td><td>0.982</td><td>0.005</td><td>25%</td></tr>
+</table>
+</div>
+<div class="callout bad">
+  <b>八成的失败根本没走到解码那一步。</b>在生产参数 + 实测模糊下，「找到四边形」与「解出 ID」两条曲线几乎重合：
+  95% 交叉点分别是 <b>43.1 px</b>（CI 42.5–43.7）与 <b>46.5 px</b>（CI 45.9–47.2）。
+  <br/><br/>
+  <b>也就是说，哪怕换上一个「零个格子也能认」的完美解码器，下限也只能从 46.5 px 挪到 43.1 px——1.08 倍，折成 45.0 → 41.7 mm。</b>
+  <b>1.33× 是 px/模块的比值，不是尺寸下限上的比值。</b>换 4X4 拿不到那个数，因为瓶颈不在它管的那一级。
+  <span class="small">（边界：本判据严格只封住解码级。4X4 的模块更大、黑白块对比更整，理论上也可能顺带让轮廓更干净，那属于二阶效应，本实验测不到；要确认仍须 J3 真印 4X4。）</span>
+</div>
+<div class="callout warn">
+  <b>连带撤回今天早些时候写下的一条论据。</b>本报告当天上午写的「重印贴纸拿 1.56×（1.17 × 1.33），严格支配窄 FOV 的 1.2×」<b>不成立</b>：
+  1.17× 的基数错了（56 应为 60.6 mm，实际余量 1.35×），1.33× 则拿不到（天花板 1.08×）。
+  <b>修正后的对比是：重印贴纸 1.35 × 1.08 = 1.46×（60.6 → 41.6 mm），窄 FOV 另给 1.2×，而且两者是<u>可叠加</u>的，不是二选一。</b>
+  <br/><br/>
+  <b>但这不改变「不换相机」的结论</b>，因为承重的从来不是这条：
+  角点通道封顶 0.116 mm、「2 mm 里只有约 1% 是采样噪声」、以及全换会把七台压到 5–6 台并加厚 p95——<b>这三条都不经过 marker 尺寸这条链</b>。
+  <b>真正的变化是：整条「把 marker 做小」的支路，两端的余量都比之前认为的小</b>——
+  能缩的比例更小（1.46× 而非 1.87×），而缩了要付的代价（4% 观测 + 0.13–0.58 mm）很可能已经超过缩短杠杆臂的收益（0.14 mm）。
+</div>
+
+<h3 style="margin-top:20px;font-size:17px">结果六：6X6 的认错率低到测不出来</h3>
+<div class="callout">
+  全 sweep 共 <b>117,600 次检测器调用</b>。
+  <b>解码出场景中根本不存在的 ID：2 次</b>（17 ppm；在用 ID 只占 50 个码位中的 15 个，所以这个判据能抓到约 70% 的误解码）。
+  <b>把一个同时可见的 marker 认到别处去：0 次。</b>
+  「白话版」第 3 步说的「换图案前先测认错率」现在有了基线——<b>要跟 17 ppm 比</b>，而不是跟「感觉还行」比。
+  <b>不过按结果五，这个基线现在多半用不上了：换 4X4 要花掉这份余量，换来的却封顶在 1.08×。</b>
+  <br/><br/>
+  <b>另外一条反直觉的观察：</b>轻度缩小反而<b>救回</b>了 4,685 次原分辨率漏检的观测（0.85× 一档就有 1,096 次），
+  全部是场景中真实存在的 ID、无一例错位——面积平均对很斜的 marker 起了降噪作用。
+</div>
+
+<div class="callout bad">
+  <b>三条边界，方向全部一致：本节的表仍然偏乐观。</b>
+  <b>(a)</b> 数据是一条居中的 20 秒轨迹，真实作业体积更大 ⇒ 距离更远 ⇒ 成像更小（与 v17.6 对垂直视场那条 caveat 同源）。
+  <b>(b)</b> 本实验测的是「同一个 rig 上把贴纸印小」，<b>不是「把整个 rig 做小」</b>——后者还会缩短 marker 之间的基线，
+  也就是白话版第 ④ 条那把「量角度的尺子」，本实验完全没碰。
+  <b>(c)</b> 缩小 + 补模糊补噪声，仍然不等于真印小了重录。<b>J3（真印真录）依然是唯一的确认手段</b>，
+  但它现在有了明确的验证目标：<b>45 mm 附近，以及 36 mm 处那 8% 的损失是否兑现</b>。
+</div>
+
+<p class="small" style="margin-top:14px">
+  工具：<span class="mono">metrology/cli/marker_size_floor.py</span>（尺度扫描 + 三项修正 + 保留率/下限/角点/误检）、
+  <span class="mono">metrology/cli/measure_edge_blur.py</span>（边缘扩散函数测模糊）。
+  产物（Thor）：<span class="mono">outputs/metrology/size_floor_182755_v3/</span>（本节全部数字的唯一来源，51,382 次判定/轨道 × 5 轨道，随机种子固定，v2 逐位复现）、
+  <span class="mono">outputs/metrology/size_floor_182755/edge_blur.json</span>（逐相机模糊）。
+  <b>注意：两个 CLI 尚未提交</b>——按 <span class="mono">sync_to_target --delete-delay</span> 的镜像语义，别人从自己的工作区 deploy 一次就会把 Thor 上这两个文件抹掉（<span class="mono">outputs/</span> 被 exclude，产物不受影响）。
+</p>
+</section>
+
+<section class="card full">
+<div class="section-title"><h2>翻转条件与两个零成本判据</h2><span class="badge warn">跑完再决定，别先买</span></div>
+<p>结论不是「永远不换」，是「按现在的数不换」。下面两个数都能在现有数据上算出来，不花钱、不动硬件；跑完再决定。</p>
+<div class="table-scroll">
+<table class="metric-table">
+<tr><th style="width:22%">判据</th><th style="width:30%">怎么做</th><th>判定线</th></tr>
+<tr>
+  <td><b>J1 · 窄视锥消融</b></td>
+  <td>拿现有 detections + 外参，把窄视锥会删掉的观测<b>逐条剔掉</b>，重跑 BA，对比逐相机弥散 / p95 / 每帧相机数直方图。<b>必须跑在伸得最远的那些 episode 上</b>，而不是那条居中的 30 秒（E4 自己承认那只是下界）。</td>
+  <td><b>p95 恶化 &lt; 0.3 mm</b> 才继续谈。窄 FOV 的角点收益已实测封顶 0.027 mm，恶化超过这个数就不必算了。<br><span class="small">该消融在正确方向上保守：完全忽略那 1.2× 精度增益（反正只值 0.027 mm），只算观测损失。</span></td>
+</tr>
+<tr>
+  <td><b>J2 · 真实检测下限</b> <span class="badge done" style="font-size:11px">2026-09-03 已完成</span></td>
+  <td>最终没有走 <span class="mono">fit_marker_visibility.py</span>——它要外参、layout、位姿，而这个问题只需要检测。改写了 <span class="mono">metrology/cli/marker_size_floor.py</span>：同一帧解码一次当基准，再对 12 档降采样副本逐档重检，<b>并补上降采样相对「真印小」偏乐观的三项</b>（噪声被平均、模糊跟着缩、检测器尺寸闸门失效）；模糊量由 <span class="mono">metrology/cli/measure_edge_blur.py</span> 从 23,673 条 marker 边的边缘扩散函数实测。</td>
+  <td><b>实测下限 46.5 px ≈ 45 mm（95% 保留率）。原来的预期落空了：没有白送的余量，「50 px」那条规矩基本是对的。</b>而且<b>不存在悬崖</b>——检出率从第一步就平滑下滑，「下限」只能是选定的保留率。<b>换相机分支没有因此自动关闭，但也没有被打开</b>：它仍被「重印贴纸」支配，只是两边现在都标了价。详见「J2 已跑完」一节。</td>
+</tr>
+<tr>
+  <td><b>J3 · 小 marker 实录（可选，一次采集）</b></td>
+  <td><span class="mono">cam_01</span> 上那台 81.6° 镜头还在，GUI 也有「只解算，不导出（实验）」通路。印一组 34 / 40 / 45 mm 贴纸和现有 60.6 mm 一起贴在当前 rig 上，录一次。<span class="small">（2026-09-03 按 J2 结果调整了尺寸档位与基准尺寸。）</span></td>
+  <td>逐相机统计检测率 / 误检率 / 像素边长 / 姿态解稳定性。<b>一次采集把「小 marker」这一整个分支判掉。</b><b>J2 已经给了它明确的验证目标</b>：45 mm 附近是否真的还有 95%，以及 36 mm 处那 8% 的损失是否兑现。<b>J2 是降采样，J3 是真印真录，后者仍是唯一的确认手段。</b></td>
+</tr>
+</table>
+</div>
+<div class="callout">
+  <b>会让结论翻转的组合条件：</b>①+② 叠出的 36 mm 仍不够 <b>且</b> J1 显示 p95 恶化 &lt; 0.3 mm。两条同时成立才重开这个议题——<b>而且那时要选的大概率是高分辨率而不是窄 FOV，除非 GMSL2/Thor 带宽已顶死。</b>
+</div>
+<div class="callout warn">
+  <b>方法论说明（回应「离线重建的陷阱」）：</b>J1 这个消融是安全的——窄 FOV 严格只是<b>删除</b>同一批物理光线上的观测，没有合成任何新数据，也不存在「用现行策略产出的数据去评估替代策略」的循环。它唯一测不到的是「更小的 marker 还能不能被检出」，那个必须靠 J2/J3 真印真录。
+</div>
 </section>
 
 <section class="card full">
@@ -140,14 +783,14 @@
   <td><b>有，但太小。</b>81.6° 镜头在实际工作偏角下把角点通道从 0.116 mm 压到 0.089 mm，仅省 0.027 mm。</td>
 </tr>
 <tr>
-  <td>七台全部更换是否避开“混 FOV 格式不可表示”的工程问题？</td>
-  <td>不混镜头，按同位置同朝向模拟所有现役相机的窄视锥。</td>
-  <td><b>避开了格式问题，但引入更大的测量链损失。</b>环境固定 marker 观测从 36 个降到 22 个，cam_09 变成 0/9。这个 0/9 不计 marker rig；cam_09 的 marker rig 可见数另算，最多约 3 个。</td>
+  <td>七台全部更换（不混镜头）代价如何？</td>
+  <td>按同位置同朝向，把 81.6°×52.0° 直线视锥套在所有现役相机上。</td>
+  <td><b>rig 本身保得住，掉的是相机台数。</b>rig 观测保留 87%-100%，但 <span class="mono">cam_07</span> 装不下（垂直 -4.6°）、<span class="mono">cam_13</span> 只剩 -0.3°——七台实际变 5-6 台，而 2 相机帧占最差 5% 误差的 38%。</td>
 </tr>
 <tr>
   <td>窄 FOV 能否让更小 marker 稳定可检？</td>
   <td>只在 marker 仍落入视场、且相机位置不变时讨论像素占比；把它从轨迹 accuracy 问题中拆出。</td>
-  <td><b>可以，值得单独评估。</b>实测模型在 10°/20° 偏角的角分辨率增益约 1.14×/1.30×，marker 中位偏角 16.3°，粗算 48 mm marker 可降到约 40 mm 仍保持相近像素尺寸。</td>
+  <td><b>可以，值得单独评估。</b>实测模型在 10°/20° 偏角的角分辨率增益约 1.14×/1.30×，marker 中位偏角 16.3°，粗算可把下限再降 1.2×。<b>（2026-09-03 更新基数：下限是实测的 45 mm 而非外推的 48 mm，所以窄 FOV 能把它挪到约 37.5 mm。）</b></td>
 </tr>
 </table>
 </section>
@@ -155,7 +798,7 @@
 <section class="card full">
 <div class="section-title"><h2>方法</h2><span class="badge done">不动硬件 + 既有采集</span></div>
 <p>
-  roadmap 中涉及两类窄 FOV 判定：第一类是一台 81.6° 镜头装在 <span class="mono">cam_01</span> 上的单台实验，用于估计角分辨率与角点通道收益；第二类是 2026-09-02 追加的“七台全换”模拟，用同位置同朝向的 81.6°×52.0°直线视锥套在现役相机上，检查 marker rig 与环境固定 marker 是否仍落在视锥内。
+  roadmap 中涉及两类窄 FOV 判定：第一类是一台 81.6° 镜头装在 <span class="mono">cam_01</span> 上的单台实验，用于估计角分辨率与角点通道收益；第二类是 2026-09-02 追加的“七台全换”模拟，用同位置同朝向的 81.6°×52.0°直线视锥套在现役相机上，检查 marker rig 是否仍落在视锥内、以及每台相机还剩多少垂直余量。
 </p>
 <ul>
   <li><b>单台实验输入：</b>2026-09-01 当天 <span class="mono">ep0</span> 单路数据；拟合出的真实参数为 HFOV 81.6° / VFOV 52.0° / DFOV 89.7°，<span class="mono">f=1091 px/rad</span>，held-out 0.202 px，覆盖 88%。</li>
@@ -187,13 +830,13 @@
 </tr>
 <tr>
   <td>marker 尺寸一阶折算</td>
-  <td><span class="mono">48 mm / 1.2 ≈ 40 mm</span></td>
-  <td>有机会把当前 marker rig 允许下限 <b>48 mm</b> 粗降到约 <b>40 mm</b>，仍保持相近像素尺寸；不是缩小一半。</td>
+  <td><span class="mono">45 mm / 1.2 ≈ 37.5 mm</span></td>
+  <td>有机会把当前 marker rig 允许下限 <b>45 mm</b>（2026-09-03 实测值，此前写的 48 mm 是准则外推）粗降到约 <b>37.5 mm</b>，仍保持相近像素尺寸；不是缩小一半。</td>
 </tr>
 <tr>
   <td>潜在间接收益</td>
   <td>更小 marker → 更紧凑 rig → 可能减小 marker→TCP 杠杆臂</td>
-  <td>这条可能比直接提高角点精度更值得关注，但必须和新 rig 结构、遮挡、视场余量一起评估。</td>
+  <td>这条可能比直接提高角点精度更值得关注，但必须和新 rig 结构、遮挡、视场余量一起评估。<b>（2026-09-03：这一项目前无法定价，收益区间跨 25 倍——0.14 mm 到 3.6 mm，卡在 U1/U2 两个未决点上，见上方「缩短 L 的定价」。）</b></td>
 </tr>
 </table>
 </section>
@@ -219,17 +862,12 @@
   <td>即使窄 FOV 赢了角点 precision，收益也无法改变“轨迹误差是否达标”的结论。</td>
 </tr>
 <tr>
-  <td><b>E4 · 全换会损失相机被碰监测</b></td>
-  <td>现场 9 个环境固定 marker 在跨采集无人触碰时中心变化中位 <b>0.07-0.48 px = 0.004°-0.028°</b>；对 cam_09 的 1.988° 被碰事件信噪比 <b>72×-483×</b>。套窄视锥后，36 个环境固定 marker 观测只剩 <b>22 个（61%）</b>，<span class="mono">cam_09</span> 为 <b>0/9</b>。<b>这不是 marker rig 计数</b>；cam_09 在 marker rig 上最多约 3 个 marker。</td>
-  <td>窄 FOV 会削掉当前最便宜、最直接的 accuracy 监视器。它不是收益≈0，而是负收益。</td>
-</tr>
-<tr>
-  <td><b>E5 · 垂直视场没有余量</b></td>
+  <td><b>E4 · 垂直视场没有余量</b></td>
   <td>在一条居中的 30 秒轨迹上，窄 FOV 垂直半视场 26.0° 的剩余量已经很紧：<span class="mono">cam_13</span> -0.3°、<span class="mono">cam_12</span> +1.5°、<span class="mono">cam_09</span> +2.4°、<span class="mono">cam_14</span> +4.3°；<span class="mono">cam_07</span> 已经装不下。</td>
   <td>当前模拟只是作业体积下界。真实作业更大时，窄 FOV 的覆盖风险只会增加。</td>
 </tr>
 <tr>
-  <td><b>E6 · 缩短标定间隔也不是主杠杆</b></td>
+  <td><b>E5 · 缩短标定间隔也不是主杠杆</b></td>
   <td>把标定从录制前 12 天换成录制后 16 小时，逐相机弥散中位只降 <b>0.25 mm（7.2%）</b>，标签位移中位 <b>0.766 mm</b>。结论改为：杠杆是检测相机被碰，缩短间隔只值不到 10%。</td>
   <td>accuracy 的主问题不是“多采一点、换新一点、像素准一点”能解决，而是要有持续监控和生产闸门。</td>
 </tr>
@@ -262,11 +900,16 @@
 <tr>
   <td>窄 FOV 会看不到 rig。</td>
   <td><span class="badge bad">撤回</span></td>
-  <td>七台全换模拟显示 rig 观测保留 <b>87%-100%</b>。真正负面项不是 rig 立即丢失，而是环境固定 marker 监测被削弱、垂直 FOV 余量不足。</td>
+  <td>七台全换模拟显示 rig 观测保留 <b>87%-100%</b>。真正负面项不是 rig 立即丢失，而是垂直 FOV 余量不足导致每帧参与解算的相机数下降。</td>
+</tr>
+<tr>
+  <td>七台全换会让 <span class="mono">cam_09</span> 丢掉全部 9 个环境固定 marker 观测（36→22，61%），削掉当前最便宜的相机被碰监视器，因此是负收益。<span class="small">（原 E4）</span></td>
+  <td><span class="badge bad">撤销</span><br><span class="small">2026-09-03</span></td>
+  <td><b>这些环境固定 marker 并不是有意布设的参考基准</b>，只是场景里恰好存在、被顺带用于统计的贴片。它们不构成一条被设计出来、会因换镜头而失去的测量通道——需要的话按窄视锥重新布点即可。<b>该条不再作为反对更换的理由，相关叙述已从全文移除。</b></td>
 </tr>
 </table>
 <div class="callout ok">
-  <b>未被撤销的主依据：</b>角点通道收益上限 0.116 mm、窄 FOV 单台净省 0.027 mm、相机行 2 mm 中只有约 1% 是采样噪声、七台全换削弱环境固定 marker 监测。这些证据不依赖被撤销的混 marker 统计。
+  <b>未被撤销的主依据：</b>角点通道收益上限 0.116 mm、窄 FOV 单台净省 0.027 mm、相机行 2 mm 中只有约 1% 是采样噪声、七台全换后垂直 FOV 无余量。这些证据不依赖被撤销的混 marker 统计。
 </div>
 </section>
 
@@ -275,13 +918,15 @@
 <table class="metric-table">
 <tr><th>维度</th><th>窄 FOV 影响</th></tr>
 <tr><td>角点 precision</td><td>小幅改善，已量化为 0.027 mm 级收益。</td></tr>
-<tr><td>marker detectability</td><td><b>可能改善。</b>在视场仍覆盖 marker 时，同尺寸 marker 占更多像素；也可能把当前 marker rig 允许下限 48 mm 粗降到约 40 mm。</td></tr>
+<tr><td>marker detectability</td><td><b>可能改善。</b>在视场仍覆盖 marker 时，同尺寸 marker 占更多像素；也可能把当前 marker rig 允许下限从<b>实测的 45 mm</b> 粗降到约 37.5 mm。<b>但实测发现真正的约束是偏角不是尺寸</b>：正对镜头时下限是 29.0 px，混合偏角下是 46.5 px，差 1.6 倍——<span class="mono">cam_08</span> 的 marker 成像最小却余量最大，<span class="mono">cam_01</span> 成像最大却余量最小。</td></tr>
 <tr><td>机械封装 / marker rig 尺寸</td><td><b>可能间接有利。</b>更小 marker 可能让 rig 更紧凑，并进一步减小 marker→TCP 杠杆臂；该收益需要随新 rig 机械方案单独评估。</td></tr>
 <tr><td>外参 accuracy</td><td>不修复。当前 2 mm 主项仍在。</td></tr>
-<tr><td>环境固定 marker 监测</td><td>变差，cam_09 的环境固定 marker 从 9 个观测降到 0；marker rig 计数另算。</td></tr>
 <tr><td>工作区覆盖</td><td>变差，垂直 FOV 已无余量。</td></tr>
-<tr><td>工程成本</td><td>全换需重做场景基准；混 FOV 在现行生产格式中不可表示。</td></tr>
-<tr><td>综合判定</td><td><b>不作为当前轨迹误差修复项执行。</b>除非同时重做场景基准，否则全换为负收益；即使重做，仍不解决当前 accuracy 主瓶颈。<b>但作为小 marker / 小 rig 的设计变量，保留单独评估价值。</b></td></tr>
+<tr><td>工程成本</td><td><span class="rev">混 FOV 在现行生产格式中不可表示。</span><b>（2026-09-03 更正：实测为中等 PR——生产消费侧本来就逐相机，解算侧改一行，主要工作在导出层与追踪器。这条不再构成反对理由，只是成本项。详见上方「本次撤回的两条论据」。）</b></td></tr>
+<tr><td>rig 尺寸 → TCP 收益</td><td><b>尚未定价（U1/U2 未决）。</b>被删的只有 <span class="mono">L·θ<sub>cam</sub></span>（相机外参，重复记账）；<span class="mono">L·θ<sub>mount</sub></span>（rig→TCP 安装旋转）<b>未删，且在删掉重复那笔后成了预算最大单项</b>。hand-eye 把边际价值从 35 µm/mm 压到 3.5 µm/mm——<b>是定价问题不是存废问题</b>。取值区间 0.14 mm（L 已 102.3、θ 已 0.2°）到 3.6 mm（L 实为 259.5、θ 仍 2.0°）。</td></tr>
+<tr><td>换相机 vs 缩小 rig</td><td><b>两件事要分开判。</b><span class="rev">换相机被「重印贴纸」严格支配</span>——<b>2026-09-03 下午撤回</b>：重印贴纸的上限是 1.46×（1.35× 裁尺寸 × 1.08× 换字典），窄 FOV 的 1.2× 与它<b>可叠加</b>，所以不是支配关系。<b>换相机的结论改由链外的三条承重</b>（角点封顶、1% 采样噪声、七台压到 5–6 台）；缩小 rig 值不值得，等 U1/U2 澄清后单独立项。<b>注意 J2 测的是「同一 rig 上把贴纸印小」，没有测「把整个 rig 做小」</b>——后者还会缩短 marker 之间的基线，那是另一件事。</td></tr>
+<tr><td>更便宜的替代</td><td><b>存在，但既不是零成本，也不比窄 FOV 大很多。</b>60.6→45 mm（<b>1.35×，实测下限</b>）+ DICT_6X6→4X4（<b>≤1.08×，实测天花板</b>）叠加 = 60.6→约 <b>41.6 mm</b>，零采购。<b>（2026-09-03 三处更正：基数 56→60.6 mm；「白送」作废——裁到 45 mm 要付 4% 观测与 0.13–0.58 mm，做到 36 mm 要付 8% 观测；<span class="rev">字典 1.33×</span> 作废——八成失败在「找四边形」级，格子数管不到，实测天花板 1.08×。字典要花掉的容错余量本身实测为「117,600 次调用里只有 2 次解出不存在的 ID」。）</b></td></tr>
+<tr><td>综合判定</td><td><b>不作为当前轨迹误差修复项执行；也不作为「缩小 rig」的手段执行（2026-09-03）。</b>全换会把七台压到 5-6 台、加厚 p95 尾巴，而角点收益封顶 0.027 mm；即便缩小 rig 最终被定价为有价值，达成它的最便宜手段也是重印贴纸（1.35× 起）而非换相机（1.2×）。<b>「缩小 rig 本身值不值得」是另一个待定问题，见 U1/U2。</b></td></tr>
 </table>
 </section>
 
@@ -291,9 +936,18 @@
   <li><b>不要采购 / 更换窄 FOV 镜头作为当前轨迹误差修复项。</b></li>
   <li><b>允许把窄 FOV 放进新 marker rig 的机械封装评估：</b>目标不是压低现有轨迹误差，而是验证更小 marker 是否仍稳定可检、rig 是否能更紧凑、marker→TCP 杠杆臂是否能随之减小。</li>
   <li><b>小 marker 评估要设独立判据：</b>在目标作业体积内逐相机统计 marker 像素边长、检测率、误检率、姿态解稳定性、遮挡余量；不要用重投影残差替代 detectability。</li>
-  <li><b>把环境固定 marker 做成常驻相机健康监视器：</b>检测本来就在跑，存基线并按 3σ 比较；这是 v17.6 直接派生出的 P0。</li>
-  <li><b>补齐环境固定 marker 盲区：</b><span class="mono">cam_12</span> 与 <span class="mono">cam_01</span> 当前各 0 个，需补贴 2-3 个。</li>
   <li><b>继续把主线放在 accuracy：</b>相机被碰检测、生产标定指针陈旧闸门、外参提升流程、以及生产 cube 口径的 marker→TCP / hand-eye 和装夹刚性。</li>
+</ul>
+<h3 style="margin-top:20px;font-size:16px">2026-09-03 复盘派生（按顺序做）</h3>
+<ul>
+  <li><b>先澄清 U1：</b>生产链路上实际生效的杠杆臂是 102.3 mm 还是 <span class="mono">marker_to_tcp_calibration_20260812.json</span> 的 259.5 mm？<b>这个数不定，缩 L 的收益就没有锚。</b></li>
+  <li><b>再裁决 U2：</b>逐帧姿态项（供应商 V2「6.32 → 2.59 → 目标 &lt;1.5 mm」那一行）与 roadmap 08-27 的重复记账判定，二者必须合一；<b>结果决定缩小 rig 要不要单独立项。</b></li>
+  <li><b>顺序上先做 M6 hand-eye：</b>它是 θ<sub>mount</sub> 上的 10× 动作且不用买硬件；做完再回来给 L 定价。</li>
+  <li><b><span class="rev">免费的两级先吃掉</span>→ 两级都不免费，先想清楚为什么要吃：</b>60.6→45 mm（<b>实测下限</b>，代价 4% 观测 + 0.13–0.58 mm）+ <span class="rev">DICT_6X6→4X4（1.33×）</span> <b>→ 这一项基本可以从清单里划掉</b>：实测天花板只有 1.08×，却要花掉 6X6 那份「测不出来」的容错余量。<b>若仍要做，理由应当是「把 rig marker 与环境 marker 按字典彻底分开」这个副产品，而不是尺寸增益。</b><b>如果动机只是缩短杠杆臂，实测代价很可能大于收益（0.14 mm）——先做 M6 再回来。</b><span class="small">（2026-09-03 按 J2 结果改写，原写作「免费」。）</span></li>
+  <li><b>跑 J1 窄视锥消融</b>（现有数据，最远的 episode）：p95 恶化是否 &lt; 0.3 mm。</li>
+  <li><b><span class="rev">跑 J2 真实检测下限</span> ✓ 2026-09-03 已完成：</b>实测下限 <b>46.5 px ≈ 45 mm</b>，「50 px」基本正确；<b>没有悬崖</b>，检出率平滑下滑。工具是新写的 <span class="mono">marker_size_floor.py</span> + <span class="mono">measure_edge_blur.py</span>，不是原计划的 <span class="mono">fit_marker_visibility.py</span>。<b>派生的下一步</b>：钉死 U3「rig 姿态是多 marker 解还是单 marker 解」——它决定裁小贴纸的代价是 0.12 还是 0.57 mm。</li>
+  <li><b>查一个我们还不知道的数：</b>GMSL2 链路 / Thor 的带宽、NVMM、录制管线是否已顶到分辨率上限——它决定真要买时是选高分辨率还是窄 FOV。</li>
+  <li><b>改文档：</b>roadmap v17.7 把「混 FOV 不可表示 / 先要改的是这里」降级为成本项，附实测改动面。</li>
 </ul>
 </section>
 
@@ -303,6 +957,11 @@
   <li>干净的“同位置同朝向、只差镜头”的并排 A/B 从未做过；roadmap 主动放弃该实验，因为即使它赢，收益封顶 0.027-0.116 mm，对决策无影响。</li>
   <li>当前所有误差数仍未由独立 GT 最终认证。它们足以证伪“窄 FOV 是主杠杆”，但不能替代 Phase 7 的独立 GT benchmark。</li>
   <li>如果未来目标变成更换 marker rig、使用更小 marker、改变作业体积、或重做整套场景基准，窄 FOV 应作为新系统设计变量重新评估；这不是当前修复 3 mm 轨迹误差的动作。</li>
+  <li><b>（09-03）缩短 L 的收益目前无法定价，区间跨了 25 倍</b>（0.14 mm ~ 3.6 mm），取决于 U1（现役 L 是 102.3 还是 259.5 mm）与 U2（逐帧姿态项是否重复记账，roadmap 与供应商 V2 现有冲突）。<b>在这两点澄清前，不要引用任何单一数字。</b></li>
+  <li><b>（09-03）hand-eye 只覆盖 rig→TCP 安装旋转这一段。</b>「安装面 → TCP」加工公差、重复拆装、装夹刚性三项它都不覆盖，且仍按 L 放大——所以即使 hand-eye 达标，L 也不会变成无关变量。</li>
+  <li><b>（09-03）「多相机互补能吸收覆盖损失」目前只在一条居中的 30 秒轨迹上成立</b>（rig 保留 87%-100%）。真实作业体积下的余量未量化，J1 消融就是为了补这个数——在它出来之前，不要把「互补足够」当既成事实。</li>
+  <li><b><span class="rev">（09-03）DICT_4X4 的 1.33× 是模块数的一阶推算，不是实测。</span>（09-03 下午已实测，结论更强）</b>1.33× <b>拿不到</b>：八成的检测失败发生在「找四边形」级，与格子数无关，实测天花板 <b>1.08×</b>（J2 结果五）。汉明距离下降带来的误检率上升仍未测，但已基本不必测——收益封顶在 1.08× 就不值得花那份余量。</li>
+  <li><b>（09-03）混 FOV 改动面是静态读码估计</b>（<span class="mono">extrinsics.py</span> / <span class="mono">calibration_io.py</span> / <span class="mono">export_production_calibration.py</span> / <span class="mono">run_marker_rig_ba.py</span>），未实际实现与回归；「中等 PR」是量级判断，不是排期。</li>
 </ul>
 </section>
 
