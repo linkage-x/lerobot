@@ -381,6 +381,8 @@ class PikaGripperHardwareDriver:
         self._last_command_width_mm: float | None = None
         self._last_command_time_s: float | None = None
         self._pending_command_width_mm: float | None = None
+        self._last_valid_width_mm: float | None = None
+        self._last_valid_at_s: float | None = None
 
     def has_telemetry(self) -> bool:
         """Whether the SDK has parsed at least one gripper frame off the serial link.
@@ -390,6 +392,10 @@ class PikaGripperHardwareDriver:
         adapter, or the gripper at the wrong baud rate. Until a frame carrying `motor`
         is parsed, `get_gripper_distance()` keeps returning the SDK's initial 0.0 and
         every commanded position is written into the void.
+
+        Re-read on every call rather than cached, so `get_width_mm()` can ask it per read:
+        `latest_data` holds the *most recent* parsed frame, which makes this a freshness test
+        and not only a connect-time one.
         """
         if self._gripper is None:
             return False
@@ -447,19 +453,68 @@ class PikaGripperHardwareDriver:
         self._last_command_width_mm = None
         self._last_command_time_s = None
         self._pending_command_width_mm = None
+        self._last_valid_width_mm = None
+        self._last_valid_at_s = None
 
-    def get_width_mm(self) -> float:
-        """Raw gripper opening in millimetres, before normalization and clipping.
+    def read_raw_width_mm(self) -> float:
+        """Whatever the SDK reports right now, sentinel included.
 
-        `get_position()` clips into [0, 1], which hides a `max_width_mm` that does not
-        match the hardware; diagnostics need the unclipped reading.
+        `get_width_mm()` holds the last measurement across a telemetry gap, which is what a
+        control loop and a recording want. A diagnostic wants the opposite: there, the gap is
+        the thing being looked for, and a held value hides it.
         """
         if self._gripper is None:
             raise RuntimeError("Gripper backend is not connected.")
         return float(self._gripper.get_gripper_distance())
 
+    def get_width_mm(self) -> float:
+        """Last *measured* gripper opening in millimetres, before normalization and clipping.
+
+        `get_position()` clips into [0, 1], which hides a `max_width_mm` that does not
+        match the hardware; diagnostics need the unclipped reading.
+
+        The SDK has no way to say "no new frame": `get_gripper_distance()` answers 0.0 both
+        when the hand is shut and when nothing has been parsed. A read taken while the link is
+        unhealthy was therefore stored as a fully closed hand -- on 2026-08-21 that put the
+        sentinel on ~47% of every frame recorded that day, and those recordings are the entire
+        `insert` demonstration corpus, so a policy input the live rig never produces was
+        trained on for weeks. Holding the last real reading is what this should have done all
+        along.
+
+        The test is `has_telemetry()`, deliberately **not** the value. On this hardware the
+        sentinel and a genuinely closed hand happen to be separable (no reading falls between
+        0.01 and 0.25), but that is a property of one gripper's travel, not a contract, and a
+        guard that keyed on the value would start eating real measurements on the first
+        gripper whose range reaches zero.
+        """
+        width_mm = self.read_raw_width_mm()
+        if self.has_telemetry():
+            self._last_valid_width_mm = width_mm
+            self._last_valid_at_s = time.perf_counter()
+            return width_mm
+        if self._last_valid_width_mm is None:
+            raise RuntimeError(
+                "Pika gripper has no telemetry and has never had any, so there is no reading to "
+                "hold. connect() refuses a link like this unless telemetry_timeout_s is 0."
+            )
+        return self._last_valid_width_mm
+
     def get_position(self) -> float:
         return float(np.clip(self.get_width_mm() / self.max_width_mm, 0.0, 1.0))
+
+    def get_position_with_timestamp(self) -> tuple[float, float]:
+        """Position together with when that reading was last seen fresh.
+
+        The staleness needs no column of its own. The observation already carries
+        `pika_gripper.capture_timestamp_s`, so a held reading shows up as a capture stamp that
+        stops advancing while every other stamp keeps moving -- which means a recording says
+        which of its frames were measured and which were held. That is exactly what was missing
+        when the sentinel went unnoticed for a whole day of recording.
+        """
+        position = self.get_position()
+        # get_position() refreshed this if the link was healthy, and raised if there has never
+        # been a reading, so by here it is set.
+        return position, float(self._last_valid_at_s)
 
     def set_position(self, normalized_position: float) -> None:
         if self._gripper is None:

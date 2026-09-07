@@ -714,8 +714,13 @@ def test_pika_gripper_hardware_driver_deduplicates_and_rate_limits(monkeypatch):
     assert FakeSDKGripper.instances[-1].set_gripper_distance_calls == [20.0, 40.0]
 
 
-def _make_fake_pika_sdk(latest_data: dict, voltage: float = 0.0):
-    """Fake Gripper whose connect()/enable() succeed like the real SDK's always do."""
+def _make_fake_pika_sdk(latest_data: dict, voltage: float = 0.0, distance_mm: float = 0.0):
+    """Fake Gripper whose connect()/enable() succeed like the real SDK's always do.
+
+    `distance_mm` is settable per instance, and so is `serial_comm.latest_data`, so a test can
+    play the failure the real link has: the parsed frame stops carrying `motor` and the SDK
+    reverts to answering 0.0.
+    """
 
     class FakeSDKGripper:
         instances: list["FakeSDKGripper"] = []
@@ -724,6 +729,7 @@ def _make_fake_pika_sdk(latest_data: dict, voltage: float = 0.0):
             self.port = port
             self.serial_comm = types.SimpleNamespace(latest_data=dict(latest_data))
             self.motor_status = {"Voltage": voltage}
+            self.distance_mm = distance_mm
             self.disconnected = False
             type(self).instances.append(self)
 
@@ -740,7 +746,7 @@ def _make_fake_pika_sdk(latest_data: dict, voltage: float = 0.0):
             self.disconnected = True
 
         def get_gripper_distance(self):
-            return 0.0
+            return self.distance_mm
 
         def set_gripper_distance(self, width_mm):
             del width_mm
@@ -795,6 +801,127 @@ def test_pika_gripper_connect_accepts_bus_voltage_as_proof_of_life(monkeypatch):
     driver.connect()
 
     assert driver.has_telemetry() is True
+    driver.disconnect()
+
+
+def _connected_pika_driver(monkeypatch, *, distance_mm):
+    """A driver on a healthy link, plus the fake SDK instance behind it."""
+    fake_cls = _make_fake_pika_sdk(
+        latest_data={"motor": {"Position": 1.2}}, distance_mm=distance_mm
+    )
+    monkeypatch.setitem(sys.modules, "pika.gripper", types.SimpleNamespace(Gripper=fake_cls))
+    driver = PikaGripperHardwareDriver(
+        serial_port="/dev/ttyUSB80",
+        enable_settle_s=0.0,
+        telemetry_timeout_s=0.1,
+    )
+    driver.connect()
+    return driver, fake_cls.instances[-1]
+
+
+def _drop_the_link(sdk):
+    """What the real link does when a frame arrives without `motor`: the SDK reverts to 0.0."""
+    sdk.serial_comm.latest_data = {"motorstatus": {}}
+    sdk.motor_status = {"Voltage": 0.0}
+    sdk.distance_mm = 0.0
+
+
+def test_pika_gripper_holds_the_last_measurement_across_a_telemetry_gap(monkeypatch):
+    # The whole 2026-08-21 insert corpus recorded this sentinel as a width on ~47% of frames,
+    # which put a policy *input* in training that the live rig never produces.
+    driver, sdk = _connected_pika_driver(monkeypatch, distance_mm=27.0)
+    assert driver.get_width_mm() == pytest.approx(27.0)
+
+    _drop_the_link(sdk)
+
+    assert driver.has_telemetry() is False
+    assert driver.get_width_mm() == pytest.approx(27.0)
+    assert driver.get_position() == pytest.approx(27.0 / 90.0)
+
+    sdk.serial_comm.latest_data = {"motor": {"Position": 0.4}}
+    sdk.distance_mm = 5.0
+    assert driver.get_width_mm() == pytest.approx(5.0)
+    driver.disconnect()
+
+
+def test_pika_gripper_holds_rather_than_keying_on_the_value(monkeypatch):
+    # A real 0.0 -- a hand commanded fully shut on a healthy link -- must be recorded, not
+    # mistaken for the sentinel. The guard tests telemetry, never the number.
+    driver, sdk = _connected_pika_driver(monkeypatch, distance_mm=27.0)
+    assert driver.get_width_mm() == pytest.approx(27.0)
+
+    sdk.distance_mm = 0.0
+    assert driver.get_width_mm() == pytest.approx(0.0)
+    assert driver.get_position() == pytest.approx(0.0)
+    driver.disconnect()
+
+
+def test_pika_gripper_capture_timestamp_stops_advancing_while_held(monkeypatch):
+    # The staleness rides the observation column that already exists, so a recording says
+    # which frames were measured and which were held.
+    driver, sdk = _connected_pika_driver(monkeypatch, distance_mm=27.0)
+    _, fresh_at_s = driver.get_position_with_timestamp()
+
+    _drop_the_link(sdk)
+    held_position, held_at_s = driver.get_position_with_timestamp()
+
+    assert held_position == pytest.approx(27.0 / 90.0)
+    assert held_at_s == pytest.approx(fresh_at_s)
+
+    sdk.serial_comm.latest_data = {"motor": {"Position": 0.4}}
+    sdk.distance_mm = 5.0
+    _, moved_at_s = driver.get_position_with_timestamp()
+    assert moved_at_s > held_at_s
+    driver.disconnect()
+
+
+def test_pika_gripper_raw_read_still_reports_the_sentinel(monkeypatch):
+    # Holding must not blind the diagnostics: fr3_pika_gripper_verify looks for exactly the
+    # dropout that get_width_mm now smooths over.
+    driver, sdk = _connected_pika_driver(monkeypatch, distance_mm=27.0)
+    driver.get_width_mm()
+
+    _drop_the_link(sdk)
+
+    assert driver.read_raw_width_mm() == pytest.approx(0.0)
+    assert driver.get_width_mm() == pytest.approx(27.0)
+    driver.disconnect()
+
+
+def test_pika_gripper_does_not_hold_when_the_telemetry_gate_fails_open(monkeypatch):
+    # has_telemetry() fails open on an SDK it cannot introspect, so every read counts as
+    # fresh and the guard must stay out of the way rather than freezing the readback.
+    class BareSDKGripper:
+        def __init__(self, port):
+            self.port = port
+            self.distance_mm = 27.0
+
+        def connect(self):
+            return True
+
+        def enable(self):
+            return True
+
+        def disable(self):
+            return True
+
+        def disconnect(self):
+            return None
+
+        def get_gripper_distance(self):
+            return self.distance_mm
+
+    monkeypatch.setitem(sys.modules, "pika.gripper", types.SimpleNamespace(Gripper=BareSDKGripper))
+    driver = PikaGripperHardwareDriver(
+        serial_port="/dev/ttyUSB80",
+        enable_settle_s=0.0,
+        telemetry_timeout_s=0.1,
+    )
+    driver.connect()
+
+    assert driver.get_width_mm() == pytest.approx(27.0)
+    driver._gripper.distance_mm = 0.0
+    assert driver.get_width_mm() == pytest.approx(0.0)
     driver.disconnect()
 
 
@@ -2879,7 +3006,12 @@ def test_gripper_capture_timestamp_comes_from_the_driver_when_it_reports_one(rob
 
 
 def test_gripper_capture_timestamp_falls_back_for_a_backend_without_sampling_instants(robot):
-    """`pika` and `corenetic` read on demand, so the read instant is a true upper bound."""
+    """A driver that cannot say when it sampled falls back to the read instant.
+
+    `corenetic` is the backend that takes this branch: its own stamps are the BOX MCU's clock.
+    `pika` no longer does -- it reports when its reading was last fresh, so that a held value
+    is visible; see `test_pika_gripper_capture_timestamp_stops_advancing_while_held`.
+    """
     robot.connect()
     assert not hasattr(robot._gripper, "get_position_with_timestamp")
     robot.reset_capture_timestamp_origin()

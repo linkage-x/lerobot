@@ -725,12 +725,16 @@ class FrankaResearch3(Robot):
         10 Hz, so a pickup-time stamp can be optimistic by 100 ms. `das` knows its instant too --
         the databus hands it over in a callback.
 
-        `pika` and `corenetic` take the branch below, where the read instant is a true upper
-        bound rather than a guess. `pika` reads straight through to the SDK's last parsed frame
-        and the SDK records no arrival time. `corenetic` samples do carry a timestamp, but it is
-        the BOX MCU's clock -- putting it in this column would mean splicing two time bases
-        together with no measured offset between them, which buys a plausible number and loses
-        the ability to tell the offset from a real lag.
+        `pika` answers too, though not with an arrival time -- the SDK records none. It stamps
+        the last read for which telemetry was fresh, so a reading it is holding across a link
+        dropout shows up here as a stamp that stops advancing while the arm's keeps moving.
+        That is an upper bound on the measurement's age, which is the honest claim.
+
+        `corenetic` takes the branch below, where the read instant is a true upper bound rather
+        than a guess. Its samples do carry a timestamp, but it is the BOX MCU's clock -- putting
+        it in this column would mean splicing two time bases together with no measured offset
+        between them, which buys a plausible number and loses the ability to tell the offset
+        from a real lag.
         """
         if self._gripper is None:
             raise RuntimeError("Gripper backend is not connected.")

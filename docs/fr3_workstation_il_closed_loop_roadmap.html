@@ -647,6 +647,38 @@ padding 占动作监督的比例
 
     <div class="card full">
       <div class="section-head">
+        <h2>supervision mask 修回 57%：冻结消失了，但候选仍贴着 baseline 包络的顶</h2>
+        <span class="badge warn">2026-09-07 单变量对照结果</span>
+      </div>
+      <p>候选 <code>...__pi05__20260904_044535/030000</code>，与 0903 那次<b>同一个视图、同一套超参</b>，只有 loss 的定义变了（padding + 未标注维度进 mask）。2026-09-07 在 <code>session_20260907_012851</code> 上打分 11 条 rollout，判读口径与上一张卡逐字相同（只取 <code>source=policy</code>、只作差相邻的 policy 步、丢掉 leash 限幅帧）。</p>
+      <table class="table">
+        <tr><th>指标</th><th>baseline ck030000<br>（36 条 / 13014 步对）</th><th>+DAgger ck030000<br>（2 条 / 3896 步对）</th><th><b>候选 ck030000</b><br>（11 条 / 7302 步对）</th></tr>
+        <tr><td>单步实际位移中位数</td><td>1.643 mm</td><td>0.039 mm</td><td><b>0.371 mm</b></td></tr>
+        <tr><td>逐条 rollout 的中位位移</td><td>1.842 mm（0.092–2.805）</td><td>0.042 mm（0.025–0.058）</td><td><b>0.513 mm（0.087–0.807）</b></td></tr>
+        <tr><td>p90 / max</td><td>2.855 / 11.068 mm</td><td>1.756 / 3.248 mm</td><td>2.498 / 3.899 mm</td></tr>
+        <tr><td>&lt;0.05 mm（原地不动）</td><td>14.3%</td><td>54.2%</td><td><b>31.5%</b></td></tr>
+        <tr><td>&lt;0.2 mm</td><td>25.9%</td><td>67.9%</td><td>45.0%</td></tr>
+        <tr><td><b>逐条 rollout 的静止率</b></td><td>中位 10.2%（2.1%–32.5%）</td><td>中位 55.4%（48.2%–62.5%）</td><td><b>中位 29.8%（23.5%–45.2%）</b></td></tr>
+        <tr><td>单次 rollout 的 policy 步数</td><td>中位 360（98–715）</td><td>中位 1954（1621–2287）</td><td><b>中位 715（32–1130）</b></td></tr>
+        <tr><td>夹爪落在 0.05–0.95</td><td>4.7%</td><td>21.9%</td><td><b>6.7%</b></td></tr>
+        <tr><td>结局分布</td><td>aborted 5 / failure 30 / success 1</td><td>failure 2</td><td>aborted 3 / failure 8</td></tr>
+      </table>
+      <div class="callout warn">
+        <b>回填率 57.0%，判 PARTIAL</b>（源码里写死的阈值：confirmed ≥80%、partial ≥40%，缺口 39.8 个百分点）。按逐条包络读是同一件事的另一面：<b>0 条落进 ≥48.2% 的「没修」区，8 条落进 ≤32.5% 的 baseline 包络，3 条落在 32.5%–48.2% 的判不了区间</b>。所以退化的<b>那个行为</b>被消掉了，而候选并没有回到 baseline——8 条「合格」的是 23.5%–31.4%，全部挤在 baseline 包络的顶端，而 baseline 36 条里只有 3 条超过 23.8%。
+      </div>
+
+      <h3 style="margin:14px 0 6px">三条高值里有一条不算数</h3>
+      <p><code>rollout_006</code> 静止率 45.2%，但它只有 <b>31 个可用步对</b>（约 1 秒，未接管即中止）——一个 31 步的比率和 600–1100 步的比率不是同一种量。剔掉全部 &lt;100 步对的 rollout 后重算（baseline 35 条、候选 10 条）：候选 pooled 静止率 31.4%，逐条范围收到 23.5%–43.8%，<b>回填率 57.3%，仍然是 PARTIAL</b>。判读不依赖那条短 rollout，剩下两条高值（<code>rollout_005</code> 43.8%、<code>rollout_014</code> 43.4%）是真的。</p>
+
+      <h3 style="margin:14px 0 6px">残差落在平移上，不在夹爪上</h3>
+      <p>mask 的<b>直接目标</b>——被策略自己的输出冒充专家标签的夹爪维——已经修干净了：中间带占比 21.9% → <b>6.7%</b>，baseline 是 4.7%。而平移只修回一半（中位单步 0.039 → 0.371 mm，baseline 1.643 mm）。两者不同步，说明剩下的静止<b>不是伪造的标签</b>，而是<b>真标签</b>：DAgger 片段里操作员自己按住不动的那些帧，动作确实是 0，mask 按定义不碰它们。这正好指向下面清单里那条「采集侧丢掉操作员的死时间」——它原先的前置条件是「先等重训结果，若 mask 已经解决就不要动采集合同」，现在这个条件已经判出来了：<b>没有解决完，该动了</b>。</p>
+      <p class="small">旁证（不是判据，样本太小）：候选 9 条有接管记录的 rollout 里，静止率与 <code>expertSteps</code> 的相关系数 <b>r = 0.79</b>——两条 43%+ 的正是接管最多的两条（266、220 步）。机理上本来就该相关（策略停住，操作员才伸手），但它同时是一个警告：这批新 DAgger 数据又是在同一种耦合下采的，停得最久的 rollout 贡献最多的操作员帧。</p>
+
+      <p class="small">复现：<code>.venv-fr3/bin/python tools/fr3/fr3_compare_rollout_motion.py --group baseline=L4_full48_holdout22_40/030000 --group dagger=...20260903_061702/030000 --group candidate=...20260904_044535/030000 --recovery baseline,dagger,candidate</code></p>
+    </div>
+
+    <div class="card full">
+      <div class="section-head">
         <h2>示教语料的夹爪观测有 47% 是哨兵值——而且只坏在 2026-08-21 那一天</h2>
         <span class="badge p0">2026-09-04 观测通道</span>
       </div>
@@ -785,16 +817,16 @@ padding 占动作监督的比例
           <td>checkpoint 加载、相机打开、首帧对齐、action decode 全通过，无运动异常。</td>
         </tr>
         <tr>
-          <td><span class="badge p0">P0</span></td>
-          <td><b>跑中</b>（<code>20260904_044535</code>，2026-09-04 启动）：用 <b>同一个</b> <code>L4_full48_plus_dagger_030000</code> 视图重训 30K，验证 supervision mask。数据不变、超参不变，只有 loss 定义变了——单变量对照。出 ck030000 后<b>先跑 <code>fr3_align_checkpoint_use_amp.py</code></b> 再 rollout。</td>
+          <td><span class="badge warn">已判读</span></td>
+          <td><b>PARTIAL，回填 57%</b>（<code>20260904_044535</code>，2026-09-07 用 11 条 rollout 判读）：同一视图、同一超参重训 30K 验证 supervision mask。夹爪维修干净（中间带 21.9%→6.7%），平移只修回一半；0 条落进「没修」区，8 条进 baseline 包络但贴着顶，3 条判不了。详见上面的 2026-09-07 卡片。</td>
           <td>Training 页面（视图带 <code>is_intervention</code> 时 <code>intervention_unsupervised_action_dims</code> 自动写入生成配置，无需手填 JSON）；判读用 <code>tools/fr3/fr3_compare_rollout_motion.py</code></td>
-          <td>wandb <code>train/supervised_fraction≈0.887</code>（已见 0.8675）；<code>--recovery baseline,dagger,candidate</code> 给出 <b>CONFIRMED</b>，即逐条 rollout 静止率落进 baseline 包络（≤32.5%）。</td>
+          <td>判据是 <b>CONFIRMED</b>（回填 ≥80%）；实得 <b>PARTIAL 57.0%</b>，剔掉 &lt;100 步对的短 rollout 后 57.3%，结论不变。<code>train/supervised_fraction</code> 全程 ≈0.887，mask 确实生效——不足的是覆盖面，不是实现。</td>
         </tr>
         <tr>
           <td><span class="badge warn">P1</span></td>
           <td>采集侧丢掉操作员的死时间：span 内连续 <code>|delta| &lt; 0.05 mm</code> 超过 k 帧的段不写入数据集。DAgger 的连续静止段平均 30 帧、最长 107 帧，示教只有 17 帧。</td>
           <td><code>tools/fr3/dagger_dataset.py::DaggerFrameBuffer.append</code></td>
-          <td>新采集的 DAgger 视图里 <code>&lt;0.1 mm</code> 帧占比回到示教的 25% 量级；<b>先等重训结果</b>，若 mask 已经解决就不要动采集合同。</td>
+          <td>新采集的 DAgger 视图里 <code>&lt;0.1 mm</code> 帧占比回到示教的 25% 量级。<b>前置条件已在 2026-09-07 判出：mask 只修回 57%，残差正是这些真标签的静止帧，此条现在生效。</b></td>
         </tr>
         <tr>
           <td><span class="badge warn">P1</span></td>
@@ -804,8 +836,8 @@ padding 占动作监督的比例
         </tr>
         <tr>
           <td><span class="badge warn">P1</span></td>
-          <td><b>已诊断（见上一张卡）</b>：Pika SDK 在没解析到 <code>motor</code> 帧时返回初始 0.0，<code>get_position()</code> 无新鲜度检查照录；故障只发生在 2026-08-21，而 <code>insert</code> 的 48 条示教全录在那天。两件事要做：(1) 离线按「保持上一个有效值」修复 0821 的录制并重建视图——<b>工具已完成并在副本上验证过，尚未对真实录制执行</b>；(2) 驱动侧加闸——SDK 无新帧时保持上次有效读数并把陈旧度写进 observation。<b>排在今晚对照结果之后</b>。</td>
-          <td><code>tools/fr3/fr3_repair_gripper_sentinel.py</code>（已落地）；<code>src/lerobot/robots/franka_research3/backends.py::PikaGripperHardwareDriver.get_position</code>（待改，见批处理清单）</td>
+          <td><b>已诊断（见上一张卡）</b>：Pika SDK 在没解析到 <code>motor</code> 帧时返回初始 0.0，<code>get_position()</code> 无新鲜度检查照录；故障只发生在 2026-08-21，而 <code>insert</code> 的 48 条示教全录在那天。两件事要做：(1) 离线按「保持上一个有效值」修复 0821 的录制并重建视图——<b>工具已完成并在副本上验证过，尚未对真实录制执行</b>；(2) 驱动侧加闸——<b>2026-09-07 已落地</b>：<code>get_width_mm()</code> 在 <code>has_telemetry()</code> 为假时保持上一个有效读数（判据是新鲜度，不是值），陈旧度不新增字段，由 <code>get_position_with_timestamp()</code> 让既有的 <code>pika_gripper.capture_timestamp_s</code> 停住来表达；诊断另走不保持的 <code>read_raw_width_mm()</code> 并报 <code>stale=n/N</code>，否则这道闸会把 <code>fr3_pika_gripper_verify</code> 唯一能看见掉线的地方一起遮掉。<b>2026-09-07 对照已判读完毕，此条解除阻塞</b>；(1) 的只读预演已跑过三条 0821 录制（<code>insert_20260821_145637</code>、<code>insert_20260821_170816</code>、<code>fr3_spacemouse_20260821_174204</code>），全部判 <code>ready</code>，共 <b>23218 帧待修</b>、227 帧（开头无参照）按默认留空。</td>
+          <td><code>tools/fr3/fr3_repair_gripper_sentinel.py</code>（已落地，<b>待对真实录制执行</b>）；<code>src/lerobot/robots/franka_research3/backends.py::PikaGripperHardwareDriver</code>（<b>已落地 2026-09-07</b>）</td>
           <td>修复后的 0821 分布落进健康日区间（已验证：0.31 → 43.7-45.3%，1.00 → 49.4-52.9%）；重建视图后 <code>gripper.pos == 0</code> 不再是「这帧来自示教」的充分条件。</td>
         </tr>
         <tr>

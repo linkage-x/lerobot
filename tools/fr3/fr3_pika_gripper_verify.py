@@ -259,14 +259,26 @@ def load_gripper_config(config_path: Path) -> dict[str, Any]:
 
 
 def read_check(driver, *, samples: int, interval_s: float) -> dict[str, Any]:
-    """Sample the gripper readback without commanding anything."""
+    """Sample the gripper readback without commanding anything.
+
+    Reads *raw*. `get_width_mm()` holds its last measurement across a telemetry gap, which is
+    right for a control loop and wrong here: a flaky link is the thing this is looking for, and
+    a held value would make it read as a clean one. `stale_samples` counts the reads the driver
+    would have held -- on the link that produced the 2026-08-21 recordings it would have been
+    roughly half of them.
+    """
     widths_mm: list[float] = []
+    stale = 0
+    read_raw = getattr(driver, "read_raw_width_mm", None)
     for _ in range(max(samples, 1)):
-        widths_mm.append(float(driver.get_width_mm()))
+        widths_mm.append(float(read_raw() if callable(read_raw) else driver.get_width_mm()))
+        if not driver.has_telemetry():
+            stale += 1
         if interval_s > 0.0:
             time.sleep(interval_s)
     return {
         "samples": len(widths_mm),
+        "stale_samples": stale,
         "min_mm": min(widths_mm),
         "max_mm": max(widths_mm),
         "mean_mm": statistics.fmean(widths_mm),
@@ -477,7 +489,8 @@ def main(argv: list[str] | None = None) -> int:
             f"samples={read_result['samples']} "
             f"min={read_result['min_mm']:.2f}mm max={read_result['max_mm']:.2f}mm "
             f"mean={read_result['mean_mm']:.2f}mm spread={read_result['spread_mm']:.2f}mm "
-            f"normalized={read_result['mean_mm'] / max_width_mm:.3f}"
+            f"normalized={read_result['mean_mm'] / max_width_mm:.3f} "
+            f"stale={read_result['stale_samples']}/{read_result['samples']}"
         )
 
         write_results: list[dict[str, Any]] = []
