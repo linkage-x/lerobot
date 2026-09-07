@@ -824,9 +824,9 @@ padding 占动作监督的比例
         </tr>
         <tr>
           <td><span class="badge warn">P1</span></td>
-          <td>采集侧丢掉操作员的死时间：span 内连续 <code>|delta| &lt; 0.05 mm</code> 超过 k 帧的段不写入数据集。DAgger 的连续静止段平均 30 帧、最长 107 帧，示教只有 17 帧。</td>
-          <td><code>tools/fr3/dagger_dataset.py::DaggerFrameBuffer.append</code></td>
-          <td>新采集的 DAgger 视图里 <code>&lt;0.1 mm</code> 帧占比回到示教的 25% 量级。<b>前置条件已在 2026-09-07 判出：mask 只修回 57%，残差正是这些真标签的静止帧，此条现在生效。</b></td>
+          <td><b>2026-09-07 已落地</b>：采集侧丢掉操作员的死时间。<code>DaggerFrameBuffer</code> 现在接收每步真正发给机械臂的 <code>command_to_send</code>，span 内一段「什么都没发生」的帧保留前 <code>k</code> 帧（默认 <b>17</b>，即示教自己的平均静止游程；<code>--dagger-max-still-frames</code> 传负数关掉），其余丢弃并单独计数。<b>判据是相对「上一帧被写入的指令」，不是相对上一步</b>——于是每一个被丢的帧都保证在某个<b>已写入</b>帧的 0.05 mm 之内，它携带的位移不是被删掉、而是本来就不存在（delta 动作数据集能安全丢帧的全部理由）；反过来，每步 0.02 mm 的慢速逼近会自己累积过阈值而被保留，逐步判据会把它一帧一帧删光。<b>三条通道都要静</b>：平移 &lt;0.05 mm、旋转 &lt;0.03°（同一个 0.05 mm 折算到 100 mm 工具半径，两轴才不会对同一只手给出两种说法）、夹爪指令变化 &lt;1e-3——夹爪单列是因为「机械臂不动、手指在合」正是抓取里最该留下的那一帧，只看位置的规则会把它精确删除。无法测量（没给 command）的帧一律算运动，绝不假定静止。计数与 buffer 上限分开报（<code>still_frames_dropped</code> vs <code>dropped_frames</code>）：前者是规则在工作，后者是这条 rollout 的纠偏不完整。</td>
+          <td><code>tools/fr3/dagger_dataset.py::DaggerFrameBuffer</code>（<code>_is_dead_time</code>、<code>STILL_STEP_MM</code>/<code>STILL_ROTATION_DEG</code>/<code>STILL_GRIPPER_DELTA</code>/<code>DEFAULT_MAX_STILL_FRAMES</code>）、<code>tools/fr3/fr3_act_infer_real_runtime.py</code> 的 append 调用点与 <code>--dagger-max-still-frames</code>；测试 <code>tests/scripts/test_fr3_dagger_dataset.py</code>（9 例，含不变式与「合夹爪不算死时间」）</td>
+          <td>新采集的 DAgger 视图里 <code>&lt;0.1 mm</code> 帧占比回到示教的 25% 量级。<b>前置条件已在 2026-09-07 判出：mask 只修回 57%，残差正是这些真标签的静止帧，此条现在生效。<b>验收还没做</b>：这条规则只作用于<b>新采集</b>的数据，既有视图一帧未变，要等下一次 DAgger 采集后再量 <code>&lt;0.1 mm</code> 帧占比（插孔段：示教 25%、旧 DAgger 37%）。离线自检：127 帧里含一段 107 帧真静止的 span，按默认 k 修剪到 37 帧。</b></td>
         </tr>
         <tr>
           <td><span class="badge warn">P1</span></td>

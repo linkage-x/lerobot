@@ -92,6 +92,7 @@ from tools.fr3.dagger_takeover import (
 from tools.fr3.workspace_fence import resolve_workspace_fence
 from tools.fr3.dagger_dataset import (
     DEFAULT_MAX_BUFFERED_FRAMES,
+    DEFAULT_MAX_STILL_FRAMES,
     DaggerEpisodeWriter,
     DaggerFrameBuffer,
     build_dagger_frame,
@@ -841,6 +842,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             f'(default {DEFAULT_MAX_BUFFERED_FRAMES}, about 15 s of correction at 30 Hz). They are '
             'held rather than written as they happen because save_episode encodes video, and the '
             'end of a correction is when the policy is about to resume driving a real arm.'
+        ),
+    )
+    parser.add_argument(
+        '--dagger-max-still-frames',
+        type=int,
+        default=DEFAULT_MAX_STILL_FRAMES,
+        help=(
+            'Consecutive frames the arm may go nowhere before the rest of that run stops being '
+            f'written (default {DEFAULT_MAX_STILL_FRAMES}, the demonstrations\' own mean run of still '
+            'frames; negative keeps every frame). An operator deciding where to move next is inside '
+            'the takeover span, and writing that as an expert action labelled "do not move" is what '
+            'taught the last DAgger checkpoint to stand still.'
         ),
     )
     parser.add_argument(
@@ -5278,6 +5291,10 @@ def run_inference(args: argparse.Namespace) -> int:
                             task=dagger_task,
                         ),
                         is_expert=True,
+                        # The post-clamp command, which is both what the frame's action encodes
+                        # and what the arm was actually told -- so the buffer's "did this step
+                        # go anywhere" is asked of the same motion the dataset will teach.
+                        sent_command=command_to_send,
                     )
                 else:
                     dagger_buffer.append({}, is_expert=False)
@@ -5545,7 +5562,10 @@ def run_inference(args: argparse.Namespace) -> int:
                 print(f'[INFO] interactive_rollout_start index={rollout_index}')
                 trace = RolloutGeometryTrace(rollout_index, trace_dir=rollout_trace_dir)
                 dagger_buffer = (
-                    DaggerFrameBuffer(max_frames=int(args.dagger_max_buffered_frames))
+                    DaggerFrameBuffer(
+                        max_frames=int(args.dagger_max_buffered_frames),
+                        max_still_frames=int(args.dagger_max_still_frames),
+                    )
                     if dagger_writer is not None
                     else None
                 )

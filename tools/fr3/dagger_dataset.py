@@ -18,6 +18,15 @@ are the policy's own actions in the moments it was going wrong: regressing on th
 training on the mistake being corrected. The span boundaries here are exactly
 ``expert_spans``', so the trace and the dataset can never disagree about what was corrected.
 
+**An operator holding still is not a correction.** A takeover span is bounded by the device,
+not by the motion, so the seconds an operator spends looking at the peg before deciding where to
+move it fall inside the span and are written as expert actions whose label is "do not move". The
+demonstrations contain pauses too -- a run of 17 still frames on average, 39 at the longest --
+but DAgger's run to 30 on average and 107 at the longest, and on a delta action in closed loop a
+zero is self-reinforcing: predicting no motion leaves the next observation unchanged, which
+predicts no motion again. So a run of still frames is kept up to the length the demonstrations
+themselves reach and the rest is dropped. See ``DaggerFrameBuffer``, which owns the rule.
+
 **One episode per span, written after the rollout, not at the seam.** ``save_episode`` encodes
 video; it takes seconds. The instant a span ends is the instant the operator has let go and the
 policy is about to resume driving a real arm, which is the worst moment in the whole rollout to
@@ -54,6 +63,27 @@ IS_INTERVENTION_KEY = 'is_intervention'
 # Past the cap frames are dropped and counted rather than the process being allowed to grow
 # into the swap of a machine that is driving an arm.
 DEFAULT_MAX_BUFFERED_FRAMES = 450
+
+# What counts as "this step went nowhere", and how long an operator may go nowhere before the
+# frames stop being written.
+#
+# 0.05 mm is `fr3_compare_rollout_motion`'s own still-step threshold, so the filter here and the
+# closed-loop verdict that judges its effect divide frames the same way rather than by two
+# numbers that happen to be close. 17 frames is the *demonstrations'* mean run of consecutive
+# still frames through the insertion segment (their longest is 39); DAgger's mean is 30 and its
+# longest 107 -- 3.6 s of an operator thinking, labelled as an expert action. Keeping the first
+# 17 keeps a pause a demonstration would also contain; what goes is the tail only DAgger has.
+STILL_STEP_MM = 0.05
+# The same 0.05 mm expressed as an angle at a 100 mm tool radius. A rotation that moves the
+# fingertips less than the translation threshold moves the wrist is not a correction either, and
+# an angular threshold picked independently would make the two axes disagree about the same hand.
+STILL_ROTATION_DEG = 0.03
+# Normalised gripper units. The device's own touch threshold is 0.02 (`dagger_takeover`), so a
+# millesimal is comfortably below a finger and comfortably above float noise -- and the gripper
+# is tested at all because closing it while the arm holds still is not dead time, it is the
+# single most important frame of a grasp.
+STILL_GRIPPER_DELTA = 1e-3
+DEFAULT_MAX_STILL_FRAMES = 17
 
 OBSERVATION_PREFIX = 'observation'
 ACTION_PREFIX = 'action'
@@ -136,14 +166,40 @@ class DaggerFrameBuffer:
 
     Holds frames, not episodes: a span becomes an episode at flush time. Appending is all that
     happens inside the control loop, and appending is a list append.
+
+    Two frames are refused. The cap refuses what will not fit in memory, and the dead-time rule
+    refuses an operator who has stopped moving -- see ``max_still_frames``. They are counted
+    apart because they mean opposite things: the first says this rollout's corrections are
+    incomplete, the second says they were trimmed on purpose.
     """
 
-    def __init__(self, *, max_frames: int = DEFAULT_MAX_BUFFERED_FRAMES):
+    def __init__(
+        self,
+        *,
+        max_frames: int = DEFAULT_MAX_BUFFERED_FRAMES,
+        max_still_frames: int | None = DEFAULT_MAX_STILL_FRAMES,
+    ):
+        """``max_still_frames`` is how many consecutive frames the arm may go nowhere before the
+        rest of that run stops being written; ``None`` (or a negative) keeps every frame.
+
+        Judged against the last command this buffer called motion, never against the previous
+        step, and that is the whole safety argument: every frame dropped is within
+        ``STILL_STEP_MM`` of a frame that *was* written, so the displacement it carried is not
+        lost from the episode -- it was never there. A slow drift crosses the threshold on its
+        own and is kept, which a per-step test would have thrown away one imperceptible step at
+        a time.
+        """
         self._max_frames = max(0, int(max_frames))
+        self._max_still_frames = (
+            None if max_still_frames is None or int(max_still_frames) < 0 else int(max_still_frames)
+        )
         self._spans: list[list[dict[str, Any]]] = []
         self._open = False
         self._frames = 0
         self._dropped = 0
+        self._still_dropped = 0
+        self._still_run = 0
+        self._still_reference: dict[str, float] | None = None
 
     @property
     def frame_count(self) -> int:
@@ -155,17 +211,50 @@ class DaggerFrameBuffer:
         return self._dropped
 
     @property
+    def still_frames_dropped(self) -> int:
+        """Frames the dead-time rule refused. Unlike `dropped_frames` this is the rule working."""
+        return self._still_dropped
+
+    @property
     def span_count(self) -> int:
         return len(self._spans)
 
-    def append(self, frame: dict[str, Any], *, is_expert: bool) -> None:
-        """Offer one control step. Only the expert's are kept; the rest close the open span."""
+    def append(
+        self,
+        frame: dict[str, Any],
+        *,
+        is_expert: bool,
+        sent_command: dict[str, float] | None = None,
+    ) -> None:
+        """Offer one control step. Only the expert's are kept; the rest close the open span.
+
+        ``sent_command`` is the command that actually reached the arm this step, in the robot's
+        own base frame (``ee.x``/``ee.y``/``ee.z``, ``ee.wx``/``ee.wy``/``ee.wz``,
+        ``gripper.pos``) -- the pose is read from it rather than from ``frame`` because the
+        frame's action is already encoded into whatever space the imitated dataset uses, and a
+        delta view and an absolute view would need two different readings of the same number.
+        Omitting it leaves the dead-time rule off for that frame: a step whose motion cannot be
+        measured is never assumed to be motionless.
+        """
         if not is_expert:
             # The span ends the moment the policy is driving again, which is the same instant
             # `expert_spans` ends it. Closing here rather than counting a gap keeps the two
             # definitions of "a span" from having to agree by coincidence.
             self._open = False
+            # A new span measures stillness from its own first frame. Carrying the reference
+            # across the policy's steps would judge the operator's first correction against a
+            # pose the policy has since driven away from.
+            self._still_reference = None
+            self._still_run = 0
             return
+        if self._is_dead_time(sent_command):
+            self._still_run += 1
+            if self._still_run > self._max_still_frames:
+                self._still_dropped += 1
+                return
+        else:
+            self._still_run = 0
+            self._still_reference = None if sent_command is None else dict(sent_command)
         if self._frames >= self._max_frames:
             self._dropped += 1
             # The span stays open: what follows the cap is still the same correction, and
@@ -186,6 +275,37 @@ class DaggerFrameBuffer:
         self._open = False
         self._frames = 0
         self._dropped = 0
+        self._still_dropped = 0
+        self._still_run = 0
+        self._still_reference = None
+
+    def _is_dead_time(self, sent_command: dict[str, float] | None) -> bool:
+        """Whether this command adds nothing to the pose the last kept frame already recorded.
+
+        All three channels have to be quiet. Translation and rotation are the obvious ones; the
+        gripper is here because an operator closing on a peg while holding the arm perfectly
+        still is producing the most valuable frame in the correction, and a rule that read
+        position alone would delete exactly that.
+        """
+        if self._max_still_frames is None or sent_command is None or self._still_reference is None:
+            return False
+        reference = self._still_reference
+        try:
+            position = _xyz(sent_command)
+            reference_position = _xyz(reference)
+            rotation = _matrix_from_rotvec(_wxyz(sent_command))
+            reference_rotation = _matrix_from_rotvec(_wxyz(reference))
+            gripper = float(sent_command['gripper.pos'])
+            reference_gripper = float(reference['gripper.pos'])
+        except (KeyError, TypeError, ValueError):
+            # A command missing a key is a command this rule cannot read, and an unreadable
+            # step is motion until proven otherwise.
+            return False
+        if float(np.linalg.norm(position - reference_position)) * 1000.0 >= STILL_STEP_MM:
+            return False
+        if _rotation_angle_deg(reference_rotation, rotation) >= STILL_ROTATION_DEG:
+            return False
+        return abs(gripper - reference_gripper) < STILL_GRIPPER_DELTA
 
 
 def build_dagger_frame(
@@ -277,10 +397,12 @@ class DaggerEpisodeWriter:
             'frames': frames_written,
             'skipped_spans': skipped,
             'dropped_frames': buffer.dropped_frames,
+            'still_frames_dropped': buffer.still_frames_dropped,
         }
         self._emit(
             f'[INFO] dagger_dataset_written rollout={rollout_index} episodes={written} '
-            f'frames={frames_written} skipped_spans={skipped} dropped_frames={buffer.dropped_frames}'
+            f'frames={frames_written} skipped_spans={skipped} dropped_frames={buffer.dropped_frames} '
+            f'still_frames_dropped={buffer.still_frames_dropped}'
         )
         if buffer.dropped_frames:
             self._emit(
@@ -346,6 +468,32 @@ def sent_command_to_dataset_action(
     if encode_delta is None:
         return absolute_action, quaternion_xyzw
     return dict(encode_delta(absolute_action, dataset_observation_i)), quaternion_xyzw
+
+
+def _xyz(command: dict[str, float]) -> np.ndarray:
+    return np.asarray(
+        [float(command['ee.x']), float(command['ee.y']), float(command['ee.z'])],
+        dtype=np.float64,
+    )
+
+
+def _wxyz(command: dict[str, float]) -> np.ndarray:
+    return np.asarray(
+        [float(command['ee.wx']), float(command['ee.wy']), float(command['ee.wz'])],
+        dtype=np.float64,
+    )
+
+
+def _rotation_angle_deg(reference: np.ndarray, rotation: np.ndarray) -> float:
+    """The angle between two rotations, in degrees.
+
+    Via the trace, which is the branch `_quaternion_from_matrix` avoids -- here it is the right
+    one: the quantity wanted *is* the angle, the ill-conditioned end is 180 degrees away from
+    anything this asks about, and the clip covers the rounding that puts the cosine outside
+    [-1, 1] when the two rotations are the same to a float.
+    """
+    cosine = (float(np.trace(reference.T @ rotation)) - 1.0) / 2.0
+    return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
 
 
 def _pose_from_position_and_rotvec(position_xyz: np.ndarray, rotvec_xyz: np.ndarray) -> np.ndarray:

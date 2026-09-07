@@ -20,6 +20,7 @@ import pytest
 
 from tools.fr3.dagger_dataset import (
     DEFAULT_MAX_BUFFERED_FRAMES,
+    DEFAULT_MAX_STILL_FRAMES,
     IS_INTERVENTION_KEY,
     DaggerEpisodeWriter,
     DaggerFrameBuffer,
@@ -249,6 +250,155 @@ def test_the_default_cap_is_seconds_of_correction_not_a_whole_rollout():
     assert 200 <= DEFAULT_MAX_BUFFERED_FRAMES <= 1200
 
 
+# --- the buffer: what an operator who has stopped moving leaves behind ---------------------
+
+
+def _command(x_mm: float = 0.0, *, yaw_deg: float = 0.0, gripper: float = 1.0) -> dict[str, float]:
+    """A sent command `metres` from the origin, a base-frame pose the buffer can difference."""
+    return {
+        'ee.x': x_mm / 1000.0,
+        'ee.y': 0.0,
+        'ee.z': 0.0,
+        'ee.wx': 0.0,
+        'ee.wy': 0.0,
+        'ee.wz': float(np.radians(yaw_deg)),
+        'gripper.pos': float(gripper),
+    }
+
+
+def test_a_pause_is_kept_up_to_the_length_a_demonstration_would_also_have():
+    """The first frames of a hold are real behaviour; only the tail only DAgger has is dropped."""
+    buffer = DaggerFrameBuffer(max_still_frames=3)
+
+    for index in range(8):
+        buffer.append({'n': index}, is_expert=True, sent_command=_command())
+
+    # One frame of motion (the span's first, which has nothing to be judged against) plus the
+    # three the cap allows.
+    assert [frame['n'] for span in buffer.spans() for frame in span] == [0, 1, 2, 3]
+    assert buffer.still_frames_dropped == 4
+    assert buffer.dropped_frames == 0
+
+
+def test_the_dead_time_rule_is_off_when_the_step_cannot_be_measured():
+    """A frame offered without its command is motion until proven otherwise, never dropped."""
+    buffer = DaggerFrameBuffer(max_still_frames=0)
+
+    for index in range(6):
+        buffer.append({'n': index}, is_expert=True)
+
+    assert buffer.frame_count == 6
+    assert buffer.still_frames_dropped == 0
+
+
+def test_a_drift_too_slow_to_see_per_step_is_kept():
+    """Stillness is measured against the last frame kept, not the previous step.
+
+    0.02 mm a step is below the threshold every step and 0.2 mm over ten -- a real approach at
+    a fifth of a millimetre. A per-step test would have deleted all of it.
+    """
+    buffer = DaggerFrameBuffer(max_still_frames=1)
+
+    for index in range(11):
+        buffer.append({'n': index}, is_expert=True, sent_command=_command(x_mm=0.02 * index))
+
+    kept = [frame['n'] for span in buffer.spans() for frame in span]
+    assert kept[0] == 0
+    # Every third frame clears 0.05 mm from the last one kept, and the frame after a kept one
+    # is the run's first still frame, which `max_still_frames=1` still allows.
+    assert buffer.frame_count > 4
+    assert buffer.still_frames_dropped > 0
+
+
+def test_closing_the_gripper_while_the_arm_holds_still_is_not_dead_time():
+    """The most valuable frame of a grasp is one where nothing but the fingers move."""
+    buffer = DaggerFrameBuffer(max_still_frames=0)
+
+    buffer.append({'n': 'first'}, is_expert=True, sent_command=_command(gripper=1.0))
+    for index in range(3):
+        buffer.append({'n': index}, is_expert=True, sent_command=_command(gripper=1.0))
+    buffer.append({'n': 'grasp'}, is_expert=True, sent_command=_command(gripper=0.0))
+
+    kept = [frame['n'] for span in buffer.spans() for frame in span]
+    assert kept == ['first', 'grasp']
+    assert buffer.still_frames_dropped == 3
+
+
+def test_turning_the_tool_in_place_is_not_dead_time():
+    buffer = DaggerFrameBuffer(max_still_frames=0)
+
+    buffer.append({'n': 'first'}, is_expert=True, sent_command=_command(yaw_deg=0.0))
+    buffer.append({'n': 'noise'}, is_expert=True, sent_command=_command(yaw_deg=0.01))
+    buffer.append({'n': 'turn'}, is_expert=True, sent_command=_command(yaw_deg=0.5))
+
+    kept = [frame['n'] for span in buffer.spans() for frame in span]
+    assert kept == ['first', 'turn']
+
+
+def test_stillness_is_measured_within_a_span_not_across_the_policys_steps():
+    """The reference is dropped when the policy takes over: the pose it drives to is not the
+    operator's, and a second correction judged against the first would start already still."""
+    buffer = DaggerFrameBuffer(max_still_frames=0)
+
+    buffer.append({'n': 0}, is_expert=True, sent_command=_command())
+    buffer.append({}, is_expert=False)
+    buffer.append({'n': 1}, is_expert=True, sent_command=_command())
+
+    assert [frame['n'] for span in buffer.spans() for frame in span] == [0, 1]
+    assert buffer.still_frames_dropped == 0
+
+
+def test_the_trim_is_counted_apart_from_the_cap():
+    """They mean opposite things: one says the corrections are incomplete, the other says they
+    were trimmed on purpose, and a single counter would make the warning line lie."""
+    buffer = DaggerFrameBuffer(max_frames=2, max_still_frames=0)
+    dataset = FakeDataset()
+    lines: list[str] = []
+
+    buffer.append({}, is_expert=True, sent_command=_command())
+    buffer.append({}, is_expert=True, sent_command=_command(x_mm=1.0))
+    buffer.append({}, is_expert=True, sent_command=_command(x_mm=2.0))
+    buffer.append({}, is_expert=True, sent_command=_command(x_mm=2.0))
+
+    summary = DaggerEpisodeWriter(dataset, emit=lines.append).write(buffer, rollout_index=3)
+
+    assert summary['dropped_frames'] == 1
+    assert summary['still_frames_dropped'] == 1
+    assert any('still_frames_dropped=1' in line for line in lines)
+
+
+def test_the_default_pause_cap_is_the_demonstrations_own_run_length():
+    """17 frames is what the insertion segment of the 48 demonstrations averages; DAgger's own
+    mean is 30 and its longest 107. Picking DAgger's number would trim nothing."""
+    assert DEFAULT_MAX_STILL_FRAMES == 17
+
+    buffer = DaggerFrameBuffer()
+    for _ in range(DEFAULT_MAX_STILL_FRAMES + 5):
+        buffer.append({}, is_expert=True, sent_command=_command())
+
+    assert buffer.frame_count == DEFAULT_MAX_STILL_FRAMES + 1
+    assert buffer.still_frames_dropped == 4
+
+
+def test_every_frame_the_rule_drops_is_within_the_threshold_of_one_that_was_written():
+    """The invariant that makes dropping safe for a delta action: the displacement a dropped
+    frame carried is not lost from the episode, it was never there."""
+    buffer = DaggerFrameBuffer(max_still_frames=2)
+    commands = [_command(x_mm=value) for value in (0.0, 0.01, 0.02, 0.03, 0.04, 0.3, 0.31, 0.32, 0.33)]
+
+    for index, command in enumerate(commands):
+        buffer.append({'n': index}, is_expert=True, sent_command=command)
+
+    kept = {frame['n'] for span in buffer.spans() for frame in span}
+    for index, command in enumerate(commands):
+        if index in kept:
+            continue
+        nearest_mm = min(
+            abs(command['ee.x'] - commands[other]['ee.x']) * 1000.0 for other in kept if other < index
+        )
+        assert nearest_mm < 0.05
+
+
 # --- the writer: one episode per span ----------------------------------------------------
 
 
@@ -321,7 +471,13 @@ def test_a_rollout_with_no_takeover_writes_nothing():
 
     summary = DaggerEpisodeWriter(dataset, emit=lambda _: None).write(buffer, rollout_index=0)
 
-    assert summary == {'episodes': 0, 'frames': 0, 'skipped_spans': 0, 'dropped_frames': 0}
+    assert summary == {
+        'episodes': 0,
+        'frames': 0,
+        'skipped_spans': 0,
+        'dropped_frames': 0,
+        'still_frames_dropped': 0,
+    }
     assert dataset.saved_episodes == []
 
 
