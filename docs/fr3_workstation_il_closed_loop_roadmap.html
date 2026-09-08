@@ -740,6 +740,155 @@ padding 占动作监督的比例
 
     <div class="card full">
       <div class="section-head">
+        <h2>2026-09-08 复核：把接管重读成终局失败之后，卡住的是 z≈0.12 以下的末端对准</h2>
+        <span class="badge p0">2026-09-08 闭环判读（第二版，取代同日第一版）</span>
+      </div>
+      <div class="callout warn">
+        <b>机理部分已被同日第三版取代（见下一张卡）。</b>本卡说的「末端伺服在 z≈0.12 死掉」是<b>结果不是原因</b>：策略在下降途中根本没有转向（示教转 79.0°，策略 19.6°，p = 0.00098），落点在 z≈0.25–0.12 之间就定死了。本卡引用的末端 <code>cos = 0.13</code> 也随截断口径漂移，稳健值 <b>−0.12 … −0.53</b>。<b>本卡关于夹爪的结论（不是瓶颈、z 触发）与接管的重读不受影响，仍然成立。</b>
+      </div>
+      <p>今天在 4 个 session（<code>session_20260908_013607 / 023132 / 023415 / 030356</code>）上跑了 <b>18 条 rollout</b>，同一个 checkpoint <code>...__pi05__20260907_060137/030000</code>。原始记分 <b>failure 17 / aborted 1 / success 0</b>，ladder <code>approach</code> 9 / <code>contact</code> 8。<b>本卡按「接管 = 终局失败」重新判读</b>：操作员只在两类即将发生的物理失败上按下接管——<b>(A) XY 偏到会空抓或碰倒销</b>，<b>(B) 销未对准而策略即将下压</b>。这不是删失，是失败，只是失败原因没有被记进 <code>rollout_log</code>。</p>
+
+      <div class="callout warn">
+        <b>先撤回同日第一版的三条结论。</b>
+        <ol style="margin:6px 0 0 18px">
+          <li><b>「夹爪一次都没有自己合过、3–7 级结构上不可达」——错。</b>该统计只在<b>首次接管之前</b>的自主帧上做，而那正是手臂尚未到达抓取高度的截断分布；在这个条件下夹爪张开是<b>正确行为</b>。全量重算后结论反转，见下一节。</li>
+          <li><b>「ladder 分数量的是操作员的耐心」——错。</b>接管由「即将物理失败」触发，不是由秒表触发。<code>stage</code> 仍然偏低估，但它是<b>失败点</b>而不是打断点。</li>
+          <li><b>「DAgger 把 XY 逼近做坏了约 2.8×」——过强。</b>控制销位难度之后差异不显著（p=0.142）。真正稳健的发现是另一件事：<b>策略在 z≈0.12 处停止横向对准</b>。</li>
+        </ol>
+      </div>
+
+      <h3 style="margin:16px 0 6px">(1) 夹爪：策略自己会合，而且是 z 触发的</h3>
+      <p>判据来自 trace 里被忽略的一列：<b>接管期间 <code>gripper_cmd</code> 被冻结（hold），而 <code>gripper_raw</code> 仍是策略每一步活的输出</b>。于是接管段恰好是一个天然的「反事实探针」——手被人摆到正确位置，策略的夹爪意图仍在照常计算。</p>
+      <pre><code> step      z   g_cmd   g_raw  source        ← session_20260908_023415/rollout_001
+  222  0.073   1.000   0.999  expert        操作员在横向纠偏，全程<b>没有碰夹爪</b>（cmd 恒为 1.000）
+  228  0.064   1.000   0.984  expert
+  232  0.060   1.000   0.779  expert        z 一到 0.060，策略自己开始合
+  236  0.060   1.000   0.487  expert
+  241  0.060   1.000   0.020  expert        策略的夹爪意图已经完全闭合</code></pre>
+      <table class="table">
+        <tr><th>量</th><th>值</th><th>读法</th></tr>
+        <tr><td>首次闭合时的 z（21 条有闭合的 rollout）</td><td>中位 <b>0.0535</b>，范围 0.047–0.087</td><td>闭合是 <b>z / 阶段触发</b>，与 XY 是否对准无关——这正是「偏了也会合」</td></tr>
+        <tr><td>首次接管之后的自主帧中 <code>gripper_raw &lt; 0.5</code></td><td><b>6928 / 9799 = 70.7%</b></td><td>22 条里 21 条 <code>min gripper_raw ≈ −0.02</code>，完全闭合</td></tr>
+        <tr><td><code>rollout_log</code> 自带的 <code>geometry.closed</code></td><td><b>17 / 18 = true</b></td><td>日志早就写了闭合发生过，第一版没有去读</td></tr>
+        <tr><td>接管帧中操作员真正拥有夹爪</td><td>159 / 3846 = 4.1%</td><td><b>重新解读</b>：这是<b>正常的</b>——人只修手臂，夹爪归策略；不是数据缺陷</td></tr>
+      </table>
+      <div class="callout ok">
+        <b>结论：夹爪不是瓶颈，<code>[4]</code> 掩码也不是缺陷。</b>接管期间硬件执行的是被冻结的 <code>gripper_cmd</code>（张开），若把它当监督写进数据集，等于在抓取高度上教「保持张开」——<b>现在的掩码正好挡住了这条错误监督</b>。原 P0-3（切 <code>state:gripper.pos</code>）与 P0-4（<code>gripper_owned</code>）<b>双双降级</b>：<code>R²=0.686</code> 仍是训练数据里的真实捷径，但 rollout 侧没有任何可归因的损害。
+      </div>
+
+      <h3 style="margin:16px 0 6px">(2) 真正的机制：横向伺服在 z≈0.12 处死掉</h3>
+      <p>把每一自主步的速度向量与「当前位姿 → 销」的方向做夹角余弦。<code>cos≈1</code> = 正对着销走；<code>cos≈0</code> = 打转/噪声。销位真值取<b>人接管后修到并成功闭合</b>的那个点。</p>
+      <table class="table">
+        <tr><th>z 段（m）</th><th>示教 cos(v, err)</th><th>示教 逼近速度</th><th>cand0907 cos(v, err)</th><th>cand0907 逼近速度</th><th>cand0907 中位残差</th></tr>
+        <tr><td>0.20–0.30</td><td>0.94</td><td>1.178 mm/步</td><td>0.90</td><td>1.175 mm/步</td><td>95.5 mm</td></tr>
+        <tr><td>0.15–0.20</td><td>0.79</td><td>0.423</td><td>0.85</td><td>0.778</td><td>58.7 mm</td></tr>
+        <tr><td>0.12–0.15</td><td>0.68</td><td>0.186</td><td>0.62</td><td>0.551</td><td>38.1 mm</td></tr>
+        <tr><td><b>0.09–0.12</b></td><td><b>0.77</b></td><td><b>0.210</b></td><td><b>0.13</b></td><td><b>0.004</b></td><td><b>39.9 mm</b></td></tr>
+        <tr><td><b>0.07–0.09</b></td><td><b>0.87</b></td><td><b>0.355</b></td><td><b>−0.04</b></td><td><b>−0.000</b></td><td>19.3 mm</td></tr>
+        <tr><td>0.05–0.07</td><td>0.80</td><td>0.092</td><td>—（自主段几乎到不了）</td><td>—</td><td>—</td></tr>
+      </table>
+      <div class="callout p0">
+        <b>粗逼近是学会了的，末端精对准一步都没学会。</b>z&gt;0.15 时策略与示教几乎重合（cos 0.90/0.85 vs 0.94/0.79）；<b>示教在 z&lt;0.12 之后 cos 反而回升到 0.77→0.87</b>——那是人在做最后 5 cm 的精对准；<b>同一高度上策略掉到 0.13 → −0.04，逼近速度归零</b>，残差就此锁死在 38–40 mm，然后 z 触发的闭合照常执行。这同时解释了 baseline 时代最高频的失败标注 <code>push down</code>（10/29）。
+      </div>
+
+      <h3 style="margin:16px 0 6px">(3) 把「场景变难」从「策略变差」里拆出来</h3>
+      <p>销到 home 位（固定在 <code>x=0.3094, y=−0.0009</code>）的距离是场景难度的干净度量。<b>它在 08-31 与今天之间显著变了</b>，此前所有跨 checkpoint 比较都被它污染。</p>
+      <table class="table">
+        <tr><th>量</th><th>baseline 08-31（无接管）</th><th>cand0907 09-08</th><th>统计</th></tr>
+        <tr><td>销距 home 中位</td><td>123 mm（29–214）</td><td>199 mm（89–339）</td><td>Mann-Whitney <b>p=0.043</b>，场景确实变难了</td></tr>
+        <tr><td>z=0.09–0.12 绝对残差</td><td>14.3 mm</td><td>39.9 mm</td><td><b>p=0.012</b>（显著）</td></tr>
+        <tr><td>残差 ÷ 起始销距（归一化）</td><td>0.156</td><td>0.213</td><td><b>p=0.142（不显著）</b></td></tr>
+      </table>
+      <p class="small">代际趋势（z=0.09–0.12 绝对残差）：baseline <b>14.3</b> → cand0903 <b>41.5</b> → cand0904 <b>43.0</b> → cand0907 <b>39.9</b> mm。<b>一次性掉下去然后持平</b>，不是逐代恶化。销距对残差的相关：今天 <code>corr(销距, 自主最小残差) = +0.53</code>；自主做到 &lt;20 mm 的 5 条销距中位 156 mm，做不到的 13 条中位 250 mm。baseline 同样受制于此：抓到的 14 条销距中位 <b>105 mm</b>，没抓到的 15 条中位 <b>169 mm</b>。</p>
+      <div class="callout warn">
+        <b>覆盖不足这条可以排除。</b>训练视图 78 个有闭合的 episode，销距分布 <b>38–305 mm，中位 196，48% 超过 200 mm</b>。今天的销位除 1 条（339 mm）外<b>全部落在示教分布之内</b>，而且 08-31 那批（中位 123 mm）其实<b>比训练分布还容易</b>——历史上的 <code>5/50 = 10.0%</code>（对应 checkpoint 精确口径 <b>4/49 = 8.2%</b>）是在偏易场景上取得的，偏乐观。
+      </div>
+
+      <h3 style="margin:16px 0 6px">(4) 同形状的 DAgger 再加下去，对这个失效带没有期望收益</h3>
+      <p>今天 3846 个接管帧的 z 分布：<b>92.2% 落在 z&lt;0.12</b>（中位 0.080），<code>0.15–0.20</code> 段<b>一帧都没有</b>。也就是说——<b>三代 DAgger 已经把绝大多数纠偏数据精确地倒进了失效带，末端 cos 仍然是 0.13</b>。</p>
+      <div class="callout p0">
+        这是一条<b>反对「再采一轮就好」的直接证据</b>：失效带不缺数据。因此下一步必须先做<b>归因</b>（RTC chunk 陈旧？末端感知丢失？），而不是继续加数据或继续动训练超参。
+      </div>
+      <p class="small">量级坍缩这一支已被数据部分排除：z=0.09–0.12 上策略的横向速度 <b>0.529 mm/步</b>，示教是 <b>0.388</b>——策略动得<b>更多</b>，只是方向是噪声。所以问题在<b>方向</b>而不在<b>幅度</b>，MEAN_STD 把小修正压没了的猜想不成立。</p>
+
+      <h3 style="margin:16px 0 6px">仍然成立的两条（与第一版一致）</h3>
+      <p>「不动」的退化确实修回了一截：回填率 <b>57% → 68% PARTIAL</b>，中位单步 0.371 → <b>0.654 mm</b>（baseline 1.643，仍慢 2.5×）。训练侧干净：loss 0.15、grdn 0.75、7.64 epoch、<code>supervised_fraction ≈ 0.887</code>。<code>blockers</code> 一列操作员当时就填对了：<code>object_pose_offset</code> ×6、<code>perception</code> ×4、<code>policy_action</code> ×5——与本卡的结论一致。</p>
+      <p class="small">文档自身的一处过期：清单里仍挂着「P0 ACTION 归一化改 MIN_MAX」，而 0903 起每次训练用的都是 <code>MEAN_STD</code>；该条已被取代。</p>
+    </div>
+
+    <div class="card full">
+      <div class="section-head">
+        <h2>2026-09-08 归因收官：RTC 和裁剪框都被排除，缺的是下降途中的那一次转向</h2>
+        <span class="badge p0">2026-09-08 第三版：P0-1 / P0-2 已执行，两条都被证伪</span>
+      </div>
+      <p>P0-1 与 P0-2 都按预登记的判据跑完了，<b>两条假设都被自己的可证伪条件推翻</b>。推翻它们的过程中出现了一个此前没有量过的量——<b>下降途中航向的转动量</b>——它把当天所有互相矛盾的观测一次性解释掉了。本卡取代第二版对<b>机理</b>的描述；第二版对<b>夹爪</b>的结论（不是瓶颈、z 触发）不受影响，仍然成立。</p>
+
+      <h3 style="margin:16px 0 6px">(1) P0-1：RTC 出局</h3>
+      <p><code>session_20260908_053752</code> 跑了 <b>8 条</b>，checkpoint 与当天前 18 条完全相同（<code>...20260907_060137/030000</code>），日志确认<b>只改了一个变量</b>：<code>execution_horizon=16 → 4</code>（<code>rtc: mode=auto horizon=4 guidance=10 schedule=EXP replan_q=25</code>）。判读用「每条 rollout 先取中位、再对 rollout 取中位」，避免把同一条轨迹里高度相关的帧当独立样本。</p>
+      <table class="table">
+        <tr><th>截断口径（z∈[0.09,0.12]）</th><th>A 组 horizon=16</th><th>B 组 horizon=4</th><th>Mann-Whitney p</th></tr>
+        <tr><td>截到首次闭合</td><td>cos <b>−0.14</b>（n=14）</td><td>cos <b>−0.37</b>（n=5）</td><td>0.823</td></tr>
+        <tr><td>截到最低点</td><td>cos <b>−0.37</b>（n=15）</td><td>cos <b>−0.37</b>（n=7）</td><td>0.783</td></tr>
+        <tr><td>截到首次接管</td><td>cos <b>−0.12</b>（n=14）</td><td>cos <b>−0.37</b>（n=5）</td><td>0.823</td></tr>
+        <tr><td>不截断</td><td>cos <b>−0.53</b>（n=17）</td><td>cos <b>−0.38</b>（n=7）</td><td>0.494</td></tr>
+      </table>
+      <p>预登记判据是「B 组 cos 回到 ≥0.50 且逼近速度 &gt; 0.10 mm/步」。实测 <b>四种口径全部不满足</b>，逼近速度 A <b>−0.059</b> / B <b>−0.026</b> mm/步，都还是零附近。<b>RTC 出局</b>；按预登记规则，<b>不去动 guidance / replan_q</b>。</p>
+      <div class="callout warn">
+        <b>顺带修正第二版的一个数字。</b>第二版写的末端 cos <b>+0.13</b> 是<b>随截断口径漂移</b>的，稳健值应为 <b>−0.12 … −0.53</b>。结论方向不变（末端横向控制确实失效），但那个具体数字不该被引用。
+      </div>
+
+      <h3 style="margin:16px 0 6px">(2) P0-2：裁剪框与遮挡出局</h3>
+      <p>不必重建裁剪：训练视图里的图<b>本来就是按推理合同裁好存的</b>——<code>observation.images.ee = [286,542,3]</code> 对应 <code>58,194,542,286</code>，<code>side = [382,444,3]</code> 对应 <code>108,58,444,382</code>。也就是说导出来的就是<b>视觉塔当时吃进去的那一帧</b>。高度口径先做了校验：训练视图示教半边的首次闭合 z 中位 <b>0.0535</b>，与 runtime trace 的 <b>0.0535</b> 一致。</p>
+      <table class="table">
+        <tr><th>取样</th><th>高度</th><th>销是否在 ee 裁剪框内</th><th>是否被两指遮挡</th></tr>
+        <tr><td>示教下降 3 条 × 5 个高度</td><td>z = 0.20 / 0.15 / 0.12 / 0.10 / 0.07</td><td><b>15/15 可见</b></td><td>否</td></tr>
+        <tr><td>接管瞬间 6 条（策略已偏，正是失败构型）</td><td>z = 0.061 … 0.108</td><td><b>6/6 可见</b></td><td>否</td></tr>
+      </table>
+      <p>接管瞬间那一组是关键：它拍的<b>不是对准好的样子，而是策略即将失败的样子</b>。销在这些帧里仍然清楚地留在框内、没有被手指挡住，只是常常落在画面<b>右上的边缘区</b>，而两指在画面底部。<b>预登记的可证伪条件成立 → 感知丢失出局。</b></p>
+      <p class="small">副产物，记下来免得以后有人重新推一遍：原始 <code>outputs/datasets/dagger_...</code> 目录里的 <code>ee.z</code> 与 runtime 差 <b>108 mm</b>（同一物理事件的首次闭合 z 为 <b>−0.0545</b> vs <b>+0.0535</b>）。这<b>不是</b>训练/部署合同错位——导出成训练视图那一步已经把坐标系换回来了，视图里示教半边与 DAgger 半边同框、且与 runtime 一致。只有直接读原始 dagger 目录才会踩到。</p>
+
+      <h3 style="margin:16px 0 6px">(3) 真正的机制：示教在下降途中转 79°，策略转 20°</h3>
+      <p>把「速度方向与销的夹角」换成一个更朴素的量——<b>速度在世界系里的航向角本身</b>——机制就直接露出来了。</p>
+      <table class="table">
+        <tr><th>z 段</th><th>策略平均航向</th><th>策略集中度 R</th><th>示教平均航向</th><th>示教集中度 R</th><th>示教 cos→销</th></tr>
+        <tr><td>0.20–0.30</td><td>−59.9°</td><td>0.85</td><td>−68.9°</td><td>0.76</td><td>0.95</td></tr>
+        <tr><td>0.15–0.20</td><td>−58.1°</td><td>0.93</td><td>−43.7°</td><td>0.51</td><td>0.79</td></tr>
+        <tr><td>0.12–0.15</td><td>−57.2°</td><td>0.94</td><td>−11.4°</td><td>0.30</td><td>0.64</td></tr>
+        <tr><td>0.09–0.12</td><td>−59.9°</td><td>0.88</td><td>−23.2°</td><td>0.40</td><td><b>0.82</b></td></tr>
+        <tr><td>0.07–0.09</td><td>—</td><td>—</td><td>−32.6°</td><td>0.53</td><td><b>0.81</b></td></tr>
+      </table>
+      <p><b>策略的航向从 30 cm 到 9 cm 一动不动</b>（−59.9° → −59.9°，R 始终 0.85–0.94，意思是<b>每一条 rollout 都朝同一个方向走</b>）。示教正好相反：航向一路转，集中度从 0.76 掉到 0.30——<b>因为每一条示教都在朝自己那个销转</b>。逐条量首尾转动量：</p>
+      <div class="callout p0">
+        <b>下降途中的航向转动量：示教中位 79.0°（n=30），策略中位 19.6°（n=20），Mann-Whitney p = 0.00098。</b><br>
+        策略只转了示教的四分之一。<b>「末端伺服在 z≈0.12 死掉」这个说法是错的——根本没有末端伺服可以死。</b>策略在粗逼近阶段定下一个航向，然后基本沿直线飞完全程；越靠近销，残差方向转得越快，于是 cos 塌掉。塌陷是<b>结果</b>，不是原因。
+      </div>
+      <p>这个模型能定量预测落点。用粗逼近段的<b>瞄准误差</b>（航向与「当前位置→销」方位之差，中位 <b>21.1°</b>）乘以当时的距离，得到「不修正就会错开多少」：</p>
+      <table class="table">
+        <tr><th>量</th><th>值</th></tr>
+        <tr><td>预测落点偏差 = 距离 × sin(瞄准误差)，中位</td><td>39.4 mm</td></tr>
+        <tr><td><b>无人协助</b>时策略实际最近逼近距离，中位</td><td>28.2 mm</td></tr>
+        <tr><td>相关</td><td>Pearson <b>r = +0.68, p = 0.0003</b>（Spearman 0.63, p = 0.0011）</td></tr>
+        <tr><td>拟合</td><td>实际 = <b>0.76 ×</b> 预测 − 1.6 mm</td></tr>
+        <tr><td>无人协助做到 ≤10 mm / ≤20 mm</td><td><b>4/24</b> / <b>8/24</b></td></tr>
+      </table>
+      <p><b>粗逼近阶段的瞄准误差，一个量就解释了约四分之三的终点落点。</b>下面发生什么已经不重要了。</p>
+
+      <h3 style="margin:16px 0 6px">(4) 被这一版一并排除掉的几条</h3>
+      <table class="table">
+        <tr><th>假设</th><th>判据</th><th>结论</th></tr>
+        <tr><td>策略被更显眼的齿轮吸引（销小、暗、低饱和；齿轮橙色高对比还过曝）</td><td>齿轮位置由 23 条已抬升 rollout 的 <code>releaseXyz</code> 定出：<b>(0.3519, −0.1345)，sd 7.4 / 6.2 mm</b>，几乎不动，而销位到处跑——是个干净的非循环地标</td><td><b>否。</b>末端 <code>cos→齿轮 = −0.79</code>，比 cos→销 还负，策略是在<b>远离</b>齿轮</td></tr>
+        <tr><td>策略察觉不对、主动退开或抬起</td><td><code>cos→起点 = −0.95</code>，<code>dz = −1.25 mm/步</code></td><td><b>否。</b>它一路远离起点、稳定下压——正是操作员说的「即将下压」那一类</td></tr>
+        <tr><td>末端 cos 时好时坏说明有间歇性的伺服</td><td><code>corr(销与齿轮的方位夹角, cos→销) = +0.63, p = 0.004</code></td><td><b>否。</b>那只是几何：航向固定不变，销恰好落在反侧时 cos 就是正的</td></tr>
+      </table>
+
+      <h3 style="margin:16px 0 6px">(5) 这一版真正改变的优先级</h3>
+      <div class="callout p0">
+        落点在 <b>z≈0.25 到 z≈0.12 之间就已经定死了</b>。而今天 3846 个接管帧 <b>92.2% 在 z&lt;0.12</b>、<code>0.15–0.20</code> 段<b>一帧都没有</b>——三代 DAgger 把纠偏数据<b>精确地倒在了唯一来不及的地方</b>。第二版说「同形状再采没有期望收益」，这一版给出了理由：<b>不是没收益，是采错了高度段</b>。原 P1-6 因此升为 P0。
+      </div>
+      <p class="small">数据卫生（与判读无关，但会挡下一次训练）：<code>outputs/datasets/dagger_...20260907_060137_030000/meta/episodes/file-004.parquet</code> <b>已损坏</b>（13:43 写入时截断，<code>Parquet magic bytes not found in footer</code>），<code>data/file-004.parquet</code> 同样。65 个 episode 里 <b>18 个当前读不出来</b>。本卡所有统计都是在剩下的 47 个上做的。</p>
+    </div>
+    <div class="card full">
+      <div class="section-head">
         <h2>近期任务清单</h2>
         <span class="badge todo">Next</span>
       </div>
@@ -749,6 +898,66 @@ padding 占动作监督的比例
           <th>任务</th>
           <th>代码落点</th>
           <th>验收</th>
+        </tr>
+        <tr>
+          <td><span class="badge done">P0-1 ✔</span></td>
+          <td><b>2026-09-08 已执行，结论：RTC 出局。</b><code>session_20260908_053752</code> 8 条，<code>execution_horizon 16 → 4</code>，同 checkpoint、只改这一个变量。四种截断口径下 z∈[0.09,0.12] 的 cos 都<b>没有</b>回到 ≥0.50（B 组 −0.37 … −0.38，A 组 −0.12 … −0.53，Mann-Whitney p = 0.49 … 0.82），逼近速度仍在零附近。<b>按预登记规则收档：不再动 guidance / replan_q。</b></td>
+          <td>—（已完成）</td>
+          <td><b>已判读。</b>顺带修正：第二版引用的末端 cos <b>+0.13</b> 随截断口径漂移，稳健值 <b>−0.12 … −0.53</b>。</td>
+        </tr>
+        <tr>
+          <td><span class="badge done">P0-2 ✔</span></td>
+          <td><b>2026-09-08 已执行，结论：裁剪框与遮挡出局。</b>训练视图里的图本就按推理合同裁好存的（ee <code>[286,542,3]</code>、side <code>[382,444,3]</code>），导出的即视觉塔当时吃进去的帧。示教下降 3 条 × 5 个高度 <b>15/15 销可见</b>；<b>接管瞬间</b>（策略已偏，正是失败构型）6 条在 z = 0.061–0.108 <b>6/6 销可见且未被两指遮挡</b>。</td>
+          <td>—（已完成）</td>
+          <td><b>可证伪条件成立 → 感知丢失出局。</b>另记：原始 <code>outputs/datasets/dagger_...</code> 的 <code>ee.z</code> 与 runtime 差 108 mm，但导出视图已换回坐标系，<b>不是</b>合同错位。</td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0-3</span></td>
+          <td><b>2026-09-08 新增，现在的主线。策略下降途中不转向——先分清「学不会」还是「到不了」。</b>示教下降途中航向转 <b>79.0°</b>，策略只转 <b>19.6°</b>（p = 0.00098），落点被粗逼近段 21.1° 的瞄准误差定死（r = +0.68 预测实际落点）。两种可能必须先分开：<b>(a) 策略压根没学会这个转向</b>；<b>(b) 学会了，但 rollout 走到 z=0.15 时已处在示教从未到过的状态</b>（复合误差）。<b>最小实验（离线，不用真机）</b>：拿<b>留出的示教</b> episode，在 z∈[0.12,0.25] 逐帧喂给当前 checkpoint，取预测动作的航向，与该条示教的真实航向、以及「当前位置→该条销」的方位作比。</td>
+          <td><code>tools/fr3/fr3_check_policy_dataset_frame.py</code> 复用其取帧与前处理；判读脚本复用本卡的航向/转动量统计</td>
+          <td><b>判据</b>：留出示教上预测航向的<b>转动量</b>。<br>≥60° → 策略<b>会</b>转，问题是分布漂移 ⇒ 直接做 P0-4（在 0.15–0.25 采纠偏数据），<b>不要</b>动模型结构。<br>≤30° → 策略<b>不会</b>转 ⇒ 做 P0-5（解冻视觉塔）。<br><b>可证伪</b>：若预测航向连示教自己的下一步都对不上（与真实航向差 &gt;60°），说明这个 checkpoint 在示教分布上就已经不跟随观测，问题比转向更靠前，回到训练侧。</td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0-4</span></td>
+          <td><b>2026-09-08 由 P1-6 升级。把 DAgger 采集搬到来得及的高度段。</b>落点在 <b>z≈0.25 → 0.12</b> 之间就定死了，而今天 3846 个接管帧 <b>92.2% 在 z&lt;0.12</b>、<code>0.15–0.20</code> 段<b>一帧都没有</b>。三代 DAgger 把纠偏数据精确倒在了唯一来不及的地方——<b>不是没收益，是采错了高度段</b>。操作规程改成：<b>看到航向偏了就在 z∈[0.15,0.25] 接管并把航向拧对</b>，而不是等它下到 8 cm 快空抓了才救。</td>
+          <td>操作规程（接管时机）；<code>tools/fr3/dagger_dataset.py</code> 的分带统计做验收</td>
+          <td><b>判据</b>：新采集中 z∈[0.15,0.25] 的接管帧占比 <b>≥25%</b>（当前为 0%）。<br><b>可证伪</b>：补足该段后重训，若留出示教上的转动量与 rollout 落点都不动，则「数据在错误高度」这条解释被推翻，回到 P0-5。</td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0-5</span></td>
+          <td><b>2026-09-08 改写动机（原 P0-3）。视觉塔解冻——但动机换了，判据也换了。</b>此前的理由是「末端 cos 低」，那条已经作废（没有末端伺服可言）。<b>新理由更准</b>：粗逼近段的<b>瞄准误差中位 21.1°</b>，也就是策略在 13 cm 距离上对销方位的估计就差了 20 度；<code>modules_to_save: []</code>、SigLIP 与 <code>gemma_2b</code> 全冻，冻结的通用特征够做「往那片区域去」，不够做「对准那个销」。<b>必须排在 P0-3 之后</b>——若 P0-3 判为分布漂移，解冻只是浪费一次重训。</td>
+          <td><code>tools/fr3/fr3_train_il_policy.py --lora-target-modules</code>、<code>src/lerobot/policies/pi05/modeling_pi05.py::_get_default_peft_targets</code></td>
+          <td><b>判据</b>：留出示教上的<b>瞄准误差</b>中位从 21.1° 降到 <b>&lt;10°</b>，且真机无人协助最近逼近距离中位从 <b>28.2 mm</b> 降到 <b>&lt;15 mm</b>。<br><b>可证伪</b>：解冻后瞄准误差仍 &gt;18° → 不是视觉表征的容量问题，回到动作端与数据端。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1-6</span></td>
+          <td><b>2026-09-08 降级（原 P0-4）。把接管记成带类型的终局失败。</b>机制现在已经清楚，这条不再是判读的前置，但仍然该做：每次接管落 <code>takeover_reason ∈ {xy_miss_grasp, misaligned_press, stall, fence, budget}</code>，并记<b>接管瞬间的 xy 残差与 z</b>。有了它，失效模式分布不必再每次从 trace 反推。</td>
+          <td><code>tools/fr3/dagger_takeover.py</code>、<code>tools/data_collection_gui/rollout.py::parse_rollout_intervention</code></td>
+          <td>每个 <code>expertSpan</code> 带一个 reason 与一对 (xy 残差, z)；<code>rollout_log</code> 能直接出失效模式分布表。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1-7</span></td>
+          <td><b>2026-09-08 保留（原 P1-5）。匹配难度的对照。</b>销距在 08-31（中位 123 mm）与 09-08（199 mm）之间显著变了（p = 0.043），归一化后两代差异不显著（p = 0.142）。<b>本轮补上了它的机制解释</b>：落点 ≈ 距离 × sin(瞄准误差)，所以销越远落点越差是<b>预期内</b>的，不必再当成谜。这条因此从「判读前置」降为「基线口径校准」。</td>
+          <td>Rollout 页面 + 固定销位清单</td>
+          <td><b>判据</b>：近组 80–150 mm ×10、远组 200–280 mm ×10，同批销位交替跑 cand0907 与 baseline。<br><b>可证伪</b>：若两组的落点<b>不</b>随距离按 sin(瞄准误差) 缩放，本卡的落点模型被推翻。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1-8</span></td>
+          <td><b>2026-09-08 新增，数据卫生但会挡下一次训练。</b><code>outputs/datasets/dagger_...20260907_060137_030000/</code> 的 <code>meta/episodes/file-004.parquet</code> 与 <code>data/file-004.parquet</code> <b>已损坏</b>（<code>Parquet magic bytes not found in footer</code>，13:43 写入时截断），65 个 episode 里 <b>18 个读不出来</b>。本卡统计是在剩下 47 个上做的。下一次重训前必须先修或先丢，否则要么训练直接崩，要么<b>静默地少训 28% 的 DAgger 数据</b>。</td>
+          <td><code>tools/fr3/dagger_dataset.py</code> 的写入收尾；导出视图时加一次 parquet 可读性校验</td>
+          <td>五个 shard 全部可读，<code>total_episodes</code> 与实际可读数一致；导出脚本在遇到坏 shard 时<b>报错而不是跳过</b>。</td>
+        </tr>
+        <tr>
+          <td><span class="badge todo">P2-9</span></td>
+          <td><b>2026-09-08 维持降级（原 P2-7，夹爪两条）。保留为卫生项，无已证损害。</b>第二版的夹爪结论不受本轮影响：策略自己会合、且是 z 触发（首次闭合 z 中位 0.0535），接管后自主帧 70.7% 处于闭合。<code>state:gripper.pos → action</code> 的 <code>R² = 0.686</code> 仍是训练数据里的真实捷径，<code>gripper_owned</code> 也确实没写进 frame，但<b>两者都没有可归因的 rollout 损害</b>。<b>在瞄准误差修好之前不要动</b>。</td>
+          <td><code>tools/fr3/fr3_train_il_policy.py --state-keys</code>、<code>tools/fr3/dagger_takeover.py</code></td>
+          <td>等主线闭环后再定；动之前先跑不看图线性探针。</td>
+        </tr>
+        <tr>
+          <td><span class="badge todo">P2-10</span></td>
+          <td><b>2026-09-08 维持（原 P2-8）。确认 dead-time trimming 是否真的进了这个视图。</b>回填 57% → <b>68%</b>，中位单步 <b>0.654 vs baseline 1.643 mm</b>。本轮再次确认这不是成功率主线：失败是<b>方向</b>问题（航向不转），不是<b>速度</b>问题。纯数据卫生。</td>
+          <td><code>tools/fr3/dagger_dataset.py::DaggerFrameBuffer</code></td>
+          <td>该视图 DAgger 半边插孔段的 <b>&lt;0.1 mm 帧占比</b>对着两个锚读：示教 25%、旧 DAgger 37%。</td>
         </tr>
         <tr>
           <td><span class="badge p0">P0</span></td>
