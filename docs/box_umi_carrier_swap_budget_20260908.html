@@ -1,0 +1,887 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="把 Hybrid Carrier V1 换掉现役 marker rig，TCP 轨迹误差 p95 能走到哪里——按误差预算逐行分账，附与全 ArUco 方案的同口径 A/B，并标出哪些数是量的、哪些是判断。">
+<title>换 Carrier 值多少毫米</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap">
+
+<style>
+:root{
+  --ground:#F6F7F9;
+  --paper:#FFFFFF;
+  --paper-2:#F1F3F7;
+  --ink:#101720;
+  --ink-2:#3A4553;
+  --muted:#6B7787;
+  --rule:#DCE1E8;
+  --rule-strong:#BFC8D3;
+  --blue:#0057B8;
+  --green:#00814A;
+  --red:#C1121F;
+  --amber:#B45309;
+  --slate:#5A6675;
+  --blue-wash:#E8F0FA;
+  --green-wash:#E3F1E9;
+  --red-wash:#FAE9EA;
+  --amber-wash:#FAF0E2;
+  --on-bar:#FFFFFF;
+  --shadow:0 1px 2px rgba(16,23,32,.05), 0 8px 24px -14px rgba(16,23,32,.22);
+
+  --f-display:"Archivo","Noto Sans SC","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  --f-body:"Archivo","Noto Sans SC","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  --f-mono:"IBM Plex Mono","SFMono-Regular",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0D1219;
+    --paper:#141B24;
+    --paper-2:#1A222C;
+    --ink:#E7ECF3;
+    --ink-2:#B4BECB;
+    --muted:#8792A1;
+    --rule:#243040;
+    --rule-strong:#3A4859;
+    --blue:#6BA8F0;
+    --green:#43C98A;
+    --red:#FF7B78;
+    --amber:#E0A458;
+    --slate:#8493A6;
+    --blue-wash:#152540;
+    --green-wash:#112A20;
+    --red-wash:#301A1C;
+    --amber-wash:#2C2317;
+    --on-bar:#0D1219;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 28px -16px rgba(0,0,0,.7);
+  }
+}
+:root[data-theme="dark"]{
+  --on-bar:#0D1219;
+  --ground:#0D1219;
+  --paper:#141B24;
+  --paper-2:#1A222C;
+  --ink:#E7ECF3;
+  --ink-2:#B4BECB;
+  --muted:#8792A1;
+  --rule:#243040;
+  --rule-strong:#3A4859;
+  --blue:#6BA8F0;
+  --green:#43C98A;
+  --red:#FF7B78;
+  --amber:#E0A458;
+  --slate:#8493A6;
+  --blue-wash:#152540;
+  --green-wash:#112A20;
+  --red-wash:#301A1C;
+  --amber-wash:#2C2317;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 28px -16px rgba(0,0,0,.7);
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background:var(--ground);
+  color:var(--ink);
+  font-family:var(--f-body);
+  font-size:16px;
+  line-height:1.72;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px;margin:0 auto;padding:0 28px 96px}
+.measure{max-width:70ch}
+
+/* ---------- masthead ---------- */
+header.masthead{
+  border-bottom:1px solid var(--rule);
+  padding:56px 0 34px;
+  margin-bottom:40px;
+}
+.eyebrow{
+  font-family:var(--f-mono);
+  font-size:11.5px;
+  letter-spacing:.16em;
+  text-transform:uppercase;
+  color:var(--muted);
+  display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;
+  margin-bottom:20px;
+}
+.eyebrow .tick{color:var(--rule-strong)}
+h1{
+  font-family:var(--f-display);
+  font-weight:700;
+  font-size:clamp(34px,5.2vw,54px);
+  line-height:1.08;
+  letter-spacing:-.022em;
+  margin:0 0 18px;
+  text-wrap:balance;
+}
+.dek{
+  font-size:19px;line-height:1.62;color:var(--ink-2);
+  max-width:64ch;margin:0 0 26px;
+}
+.dek b{color:var(--ink);font-weight:600}
+
+.verdict{
+  display:flex;flex-wrap:wrap;gap:0;
+  border:1px solid var(--rule);border-radius:3px;
+  background:var(--paper);overflow:hidden;box-shadow:var(--shadow);
+}
+.verdict > div{
+  flex:1 1 190px;padding:18px 22px;
+  border-right:1px solid var(--rule);
+}
+.verdict > div:last-child{border-right:none}
+.verdict .vk{
+  font-family:var(--f-mono);font-size:10.5px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--muted);display:block;margin-bottom:7px;
+}
+.verdict .vv{
+  font-family:var(--f-mono);font-weight:500;font-size:27px;
+  letter-spacing:-.02em;line-height:1.1;font-variant-numeric:tabular-nums;
+  display:block;
+}
+.verdict .vn{font-size:13px;color:var(--muted);line-height:1.5;display:block;margin-top:5px}
+.v-today .vv{color:var(--amber)}
+.v-real .vv{color:var(--blue)}
+.v-pie .vv{color:var(--green)}
+.v-bad .vv{color:var(--red)}
+
+/* ---------- sections ---------- */
+section{margin:56px 0 0}
+h2{
+  font-family:var(--f-display);font-weight:600;
+  font-size:26px;letter-spacing:-.014em;line-height:1.25;
+  margin:0 0 6px;text-wrap:balance;
+}
+h2 .num{
+  font-family:var(--f-mono);font-size:13px;font-weight:500;
+  color:var(--muted);letter-spacing:.08em;margin-right:12px;
+  vertical-align:2px;
+}
+h3{
+  font-family:var(--f-display);font-weight:600;font-size:17px;
+  letter-spacing:-.006em;margin:32px 0 8px;
+}
+.sub{color:var(--muted);font-size:14.5px;margin:0 0 24px;max-width:66ch}
+p{margin:0 0 16px}
+.measure p:last-child{margin-bottom:0}
+b,strong{font-weight:600}
+code,.mono{font-family:var(--f-mono);font-size:.92em;font-variant-numeric:tabular-nums}
+code{
+  background:var(--paper-2);border:1px solid var(--rule);
+  border-radius:2px;padding:1px 5px;color:var(--ink-2);
+}
+a{color:var(--blue)}
+a:focus-visible,summary:focus-visible{outline:2px solid var(--blue);outline-offset:3px;border-radius:2px}
+
+/* ---------- figure frame ---------- */
+figure{margin:28px 0 0;padding:0}
+.plate{
+  background:var(--paper);border:1px solid var(--rule);border-radius:3px;
+  padding:24px 26px 20px;box-shadow:var(--shadow);
+}
+figcaption{
+  font-size:13.5px;color:var(--muted);line-height:1.6;
+  margin-top:14px;padding-top:13px;border-top:1px solid var(--rule);
+  max-width:80ch;
+}
+figcaption b{color:var(--ink-2)}
+.scroller{overflow-x:auto}
+.fig-title{
+  font-family:var(--f-mono);font-size:11px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--muted);margin-bottom:16px;
+}
+svg{display:block;max-width:100%;height:auto}
+svg text{font-family:var(--f-mono);font-variant-numeric:tabular-nums}
+
+/* ---------- variance stack ---------- */
+.stack-row{margin-bottom:26px}
+.stack-head{
+  display:flex;justify-content:space-between;align-items:baseline;
+  gap:16px;margin-bottom:8px;
+}
+.stack-head .sl{font-family:var(--f-display);font-weight:600;font-size:15px}
+.stack-head .sr{font-family:var(--f-mono);font-size:12.5px;color:var(--muted)}
+.stack{
+  display:flex;height:38px;border-radius:2px;overflow:hidden;
+  border:1px solid var(--rule);
+}
+.stack span{
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--f-mono);font-size:11px;color:var(--on-bar);
+  overflow:hidden;white-space:nowrap;
+}
+.sg-cam{background:var(--slate)}
+.sg-time{background:var(--blue)}
+.sg-smooth{background:var(--green)}
+.sg-solver{background:var(--red)}
+.sg-geom{background:var(--rule-strong)}
+.bracket{
+  display:flex;margin-top:6px;font-family:var(--f-mono);font-size:11.5px;
+  color:var(--muted);
+}
+.bracket .bk{
+  border-top:1px solid var(--rule-strong);padding-top:5px;
+  text-align:center;
+}
+.legend{
+  display:flex;flex-wrap:wrap;gap:8px 20px;margin-top:20px;
+  font-family:var(--f-mono);font-size:11.5px;color:var(--muted);
+}
+.legend i{
+  width:11px;height:11px;border-radius:2px;display:inline-block;
+  margin-right:7px;vertical-align:-1px;
+}
+
+/* ---------- table ---------- */
+.tablewrap{overflow-x:auto;margin-top:26px}
+table{border-collapse:collapse;width:100%;min-width:760px;font-size:14.5px}
+th{
+  font-family:var(--f-mono);font-size:10.5px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--muted);font-weight:500;
+  text-align:left;padding:0 14px 10px 0;
+  border-bottom:1px solid var(--rule-strong);white-space:nowrap;
+}
+td{
+  padding:14px 14px 14px 0;border-bottom:1px solid var(--rule);
+  vertical-align:top;line-height:1.55;
+}
+tr:last-child td{border-bottom:none}
+td.n{font-family:var(--f-mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+td.row-name{font-weight:600;white-space:nowrap}
+.swatch{
+  width:3px;height:15px;border-radius:1px;display:inline-block;
+  margin-right:9px;vertical-align:-2px;
+}
+.delta{color:var(--green);font-weight:500}
+.delta-none{color:var(--muted)}
+.chip{
+  font-family:var(--f-mono);font-size:10.5px;letter-spacing:.06em;
+  padding:2px 7px;border-radius:2px;white-space:nowrap;
+  border:1px solid transparent;
+}
+.chip-m{background:var(--green-wash);color:var(--green);border-color:var(--green)}
+.chip-s{background:var(--blue-wash);color:var(--blue);border-color:var(--blue)}
+.chip-j{background:var(--paper-2);color:var(--muted);border-color:var(--rule-strong)}
+
+/* ---------- callouts ---------- */
+.note{
+  border-left:2px solid var(--rule-strong);
+  padding:2px 0 2px 20px;margin:24px 0;
+  font-size:15px;color:var(--ink-2);max-width:70ch;
+}
+.note.warn{border-left-color:var(--amber)}
+.note.warn .nt{color:var(--amber)}
+.note.good{border-left-color:var(--green)}
+.note.good .nt{color:var(--green)}
+.nt{
+  font-family:var(--f-mono);font-size:10.5px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--muted);display:block;margin-bottom:6px;
+}
+
+.formula{
+  font-family:var(--f-mono);font-size:13.5px;line-height:2.1;
+  background:var(--paper);border:1px solid var(--rule);border-radius:3px;
+  padding:16px 20px;margin:22px 0;overflow-x:auto;
+  font-variant-numeric:tabular-nums;
+}
+.formula .lbl{color:var(--muted);display:inline-block;min-width:132px}
+.formula .res{font-weight:600}
+
+/* ---------- risk cards ---------- */
+.risks{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1px;
+  background:var(--rule);border:1px solid var(--rule);border-radius:3px;margin-top:26px;overflow:hidden}
+.risk{background:var(--paper);padding:22px 22px 24px}
+.risk .rh{
+  font-family:var(--f-mono);font-size:10.5px;letter-spacing:.13em;
+  text-transform:uppercase;margin-bottom:9px;
+}
+.risk h4{font-family:var(--f-display);font-size:16.5px;font-weight:600;margin:0 0 9px;line-height:1.35}
+.risk p{font-size:14px;color:var(--ink-2);margin:0;line-height:1.62}
+.r-fatal .rh{color:var(--red)}
+.r-mid .rh{color:var(--amber)}
+.r-low .rh{color:var(--muted)}
+
+/* ---------- print bars ---------- */
+.pbars{display:flex;flex-direction:column;gap:11px}
+.pbar{display:grid;grid-template-columns:186px 1fr 62px;gap:14px;align-items:center}
+.pbar .pl{font-size:13.5px;text-align:right;color:var(--ink-2);line-height:1.35}
+.pbar .pt{height:22px;background:var(--paper-2);border-radius:2px;overflow:hidden}
+.pbar .pf{height:100%;border-radius:2px}
+.pbar .pv{font-family:var(--f-mono);font-size:13px;font-variant-numeric:tabular-nums;text-align:left}
+
+/* ---------- footer ---------- */
+footer{
+  margin-top:72px;padding-top:26px;border-top:1px solid var(--rule);
+  font-size:13.5px;color:var(--muted);line-height:1.7;
+}
+footer .fh{
+  font-family:var(--f-mono);font-size:10.5px;letter-spacing:.13em;
+  text-transform:uppercase;margin-bottom:10px;color:var(--muted);
+}
+footer ul{margin:0;padding-left:18px}
+footer li{margin-bottom:5px}
+
+@media (max-width:680px){
+  .wrap{padding:0 18px 64px}
+  .verdict > div{border-right:none;border-bottom:1px solid var(--rule)}
+  .verdict > div:last-child{border-bottom:none}
+  .pbar{grid-template-columns:120px 1fr 54px;gap:10px}
+  .pbar .pl{font-size:12px}
+}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="masthead">
+  <div class="eyebrow">
+    <span>Hybrid Carrier V1 · rig0907</span><span class="tick">/</span>
+    <span>口径 A′ · TCP 平移 p95</span><span class="tick">/</span>
+    <span>2026-09-08</span><span class="tick">/</span>
+    <span>内部估算 · 未经独立 GT 认证</span>
+  </div>
+
+  <h1>换 Carrier 值多少毫米</h1>
+
+  <p class="dek">
+    把打印出来的 Hybrid Carrier V1 换掉现役分布式 marker rig，轨迹误差能走到哪里。
+    答案取决于一件事：<b>p95 里只有 54% 的方差是 carrier 能碰的</b>，剩下 46% 是相机外参，
+    换什么靶标都不动。所以这是一张<b>尾巴账</b>——中位数几乎不变，能改的是分位数尾部。
+    至于"那不如退回全 ArUco"：同一套回路里它差 <b>3 倍</b>，而且差距全在涂装棱上，
+    与 marker 的数量和尺寸无关（E 节）。
+  </p>
+
+  <div class="verdict">
+    <div class="v-today">
+      <span class="vk">今天 · A′</span>
+      <span class="vv">3.8–4.0</span>
+      <span class="vn">mm　08-27 口径（不是首页那个 5.5–7.4）</span>
+    </div>
+    <div class="v-real">
+      <span class="vk">换装后 · 实际点</span>
+      <span class="vv">3.3–3.5</span>
+      <span class="vn">mm　只兑现有机理支撑的两行</span>
+    </div>
+    <div class="v-pie">
+      <span class="vk">换装后 · 饼</span>
+      <span class="vv">2.8–3.0</span>
+      <span class="vn">mm　SLA + 尺度标定 + 全部兑现</span>
+    </div>
+    <div class="v-bad">
+      <span class="vk">换装后 · FDM 直接打</span>
+      <span class="vv">4.1–4.3</span>
+      <span class="vn">mm　比今天更差，见「裂缝一」</span>
+    </div>
+  </div>
+</header>
+
+<section class="measure">
+  <h2><span class="num">A</span>起点不是 5.5–7.4</h2>
+  <p class="sub">在算收益之前，先把基线钉对。</p>
+  <p>
+    路线图首页那个大字框标的是 <b>2026-08-21 口径</b>。08-27 做了两次下调，那一页没跟着改：
+    先删掉 <code>L·θ</code> 这笔重复记账（p95 5.52 → 4.45），再把 p95 从"分位数各自 RSS"
+    换成实测的联合口径（× 0.85–0.895 → <b>3.78–3.98</b>）。
+  </p>
+  <div class="note warn">
+    <span class="nt">读法</span>
+    两次下调<b>都不是精度改善</b>——一次删掉重复的项，一次换掉一个被实测证明高估尾部的合成规则。
+    真实误差一分未变。但拿它当基线算收益时必须用新值，否则会把已经记过的账再赚一遍。
+  </div>
+  <p>
+    还有一个数没变：<b>实测上界 A = 7.43 mm</b>（逐相机弥散，p99 10.62，&gt;20 mm 粗差 0.07%）。
+    它和 A′ 量的<b>不是同一件事</b>——A 问"换一台相机信，答案会变多少"，
+    系统性高估标签对单台相机的敏感度。所以下面这把尺子只画 A′，A 单独讨论。
+  </p>
+</section>
+
+<section>
+  <h2><span class="num">B</span>四个场景落在尺子的哪一格</h2>
+  <p class="sub">全部为 A′ 口径：按误差预算逐行合成，再乘实测联合折算因子 0.85–0.895。</p>
+
+  <figure>
+    <div class="plate scroller">
+      <div class="fig-title">TCP 平移误差 p95 · 毫米</div>
+      <svg viewBox="0 0 1000 302" role="img" aria-label="四个换装场景在 2 到 5 毫米刻度上的位置，目标线在 3 毫米">
+        <!-- minor ticks -->
+        <g stroke="var(--rule)" stroke-width="1">
+          <line x1="200" y1="46" x2="200" y2="52"/><line x1="225.3" y1="46" x2="225.3" y2="52"/>
+          <line x1="250.7" y1="46" x2="250.7" y2="52"/><line x1="276" y1="46" x2="276" y2="52"/>
+          <line x1="301.3" y1="46" x2="301.3" y2="52"/><line x1="352" y1="46" x2="352" y2="52"/>
+          <line x1="377.3" y1="46" x2="377.3" y2="52"/><line x1="402.7" y1="46" x2="402.7" y2="52"/>
+          <line x1="428" y1="46" x2="428" y2="52"/><line x1="478.7" y1="46" x2="478.7" y2="52"/>
+          <line x1="504" y1="46" x2="504" y2="52"/><line x1="529.3" y1="46" x2="529.3" y2="52"/>
+          <line x1="554.7" y1="46" x2="554.7" y2="52"/><line x1="605.3" y1="46" x2="605.3" y2="52"/>
+          <line x1="630.7" y1="46" x2="630.7" y2="52"/><line x1="656" y1="46" x2="656" y2="52"/>
+          <line x1="681.3" y1="46" x2="681.3" y2="52"/><line x1="732" y1="46" x2="732" y2="52"/>
+          <line x1="757.3" y1="46" x2="757.3" y2="52"/><line x1="782.7" y1="46" x2="782.7" y2="52"/>
+          <line x1="808" y1="46" x2="808" y2="52"/><line x1="858.7" y1="46" x2="858.7" y2="52"/>
+          <line x1="884" y1="46" x2="884" y2="52"/><line x1="909.3" y1="46" x2="909.3" y2="52"/>
+          <line x1="934.7" y1="46" x2="934.7" y2="52"/>
+        </g>
+        <!-- major ticks + labels -->
+        <g stroke="var(--rule-strong)" stroke-width="1">
+          <line x1="200" y1="40" x2="200" y2="52"/><line x1="326.7" y1="40" x2="326.7" y2="52"/>
+          <line x1="453.3" y1="40" x2="453.3" y2="52"/><line x1="580" y1="40" x2="580" y2="52"/>
+          <line x1="706.7" y1="40" x2="706.7" y2="52"/><line x1="833.3" y1="40" x2="833.3" y2="52"/>
+          <line x1="960" y1="40" x2="960" y2="52"/>
+        </g>
+        <g fill="var(--muted)" font-size="11.5" text-anchor="middle">
+          <text x="200" y="30">2.0</text><text x="326.7" y="30">2.5</text>
+          <text x="453.3" y="30">3.0</text><text x="580" y="30">3.5</text>
+          <text x="706.7" y="30">4.0</text><text x="833.3" y="30">4.5</text>
+          <text x="960" y="30">5.0</text>
+        </g>
+        <line x1="200" y1="52" x2="960" y2="52" stroke="var(--rule-strong)" stroke-width="1"/>
+
+        <!-- target line -->
+        <line x1="453.3" y1="52" x2="453.3" y2="268" stroke="var(--amber)" stroke-width="1.5" stroke-dasharray="4 4"/>
+        <text x="459" y="266" fill="var(--amber)" font-size="11.5" font-weight="500">目标 p95 ≤ 3 mm</text>
+
+        <!-- rows -->
+        <!-- 1: floor 2.55-2.69 -->
+        <text x="185" y="82" fill="var(--ink)" font-size="12.5" text-anchor="end">理论地板</text>
+        <text x="185" y="97" fill="var(--muted)" font-size="10.5" text-anchor="end">能碰的三行清零</text>
+        <rect x="339.3" y="72" width="35.5" height="22" rx="2" fill="var(--rule-strong)"/>
+        <text x="384" y="88" fill="var(--muted)" font-size="12">2.55 – 2.69</text>
+
+        <!-- 2: pie 2.81-2.96 -->
+        <text x="185" y="128" fill="var(--ink)" font-size="12.5" text-anchor="end">饼</text>
+        <text x="185" y="143" fill="var(--muted)" font-size="10.5" text-anchor="end">SLA + 尺度标定 + 全兑现</text>
+        <rect x="405.2" y="118" width="38" height="22" rx="2" fill="var(--green)"/>
+        <text x="399" y="134" fill="var(--green)" font-size="12" font-weight="500" text-anchor="end">2.81 – 2.96</text>
+
+        <!-- 3: realistic 3.35-3.52 -->
+        <text x="185" y="174" fill="var(--ink)" font-size="12.5" text-anchor="end">实际点</text>
+        <text x="185" y="189" fill="var(--muted)" font-size="10.5" text-anchor="end">只兑现 solver + smoothing</text>
+        <rect x="542" y="164" width="43.1" height="22" rx="2" fill="var(--blue)"/>
+        <text x="594" y="180" fill="var(--blue)" font-size="12" font-weight="500">3.35 – 3.52</text>
+
+        <!-- 4: today 3.78-3.98 -->
+        <text x="185" y="220" fill="var(--ink)" font-size="12.5" text-anchor="end">今天 · 不换</text>
+        <text x="185" y="235" fill="var(--muted)" font-size="10.5" text-anchor="end">现役分布式 rig</text>
+        <rect x="650.9" y="210" width="50.7" height="22" rx="2" fill="var(--amber)"/>
+        <text x="711" y="226" fill="var(--amber)" font-size="12" font-weight="500">3.78 – 3.98</text>
+
+        <!-- 5: FDM 4.06-4.27 -->
+        <text x="185" y="266" fill="var(--ink)" font-size="12.5" text-anchor="end">FDM 直接打</text>
+        <text x="185" y="281" fill="var(--muted)" font-size="10.5" text-anchor="end">不做打印后尺度标定</text>
+        <rect x="722" y="256" width="53.2" height="22" rx="2" fill="var(--red)"/>
+        <text x="784" y="272" fill="var(--red)" font-size="12" font-weight="500">4.06 – 4.27</text>
+      </svg>
+    </div>
+    <figcaption>
+      <b>刻度是 A′ 合成值，不是实测。</b>四个场景共用同一套算式，只改被 carrier 影响的那几行。
+      「理论地板」是把 carrier 能碰的三行全部设为零得到的——<b>再好的靶标也过不去它</b>，
+      因为剩下的相机行 3.0 mm 本身就是判断值。
+      实测上界 A = 7.43 mm 落在这把尺子之外，它量的是逐相机弥散，不能和 A′ 放同一根轴上比。
+    </figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2><span class="num">C</span>为什么中位数动不了</h2>
+  <p class="sub">把 p50 和 p95 拆成方差份额——这是决定整张账的一张图。</p>
+
+  <figure>
+    <div class="plate">
+      <div class="stack-row">
+        <div class="stack-head">
+          <span class="sl">p50 = 2.24 mm</span>
+          <span class="sr">相机行独占 80% 方差</span>
+        </div>
+        <div class="stack" role="img" aria-label="p50 方差份额：相机 79.6%，timing 16.1%，smoothing 3.2%，solver 1.0%，几何 0.2%">
+          <span class="sg-cam" style="width:79.6%">相机外参 79.6%</span>
+          <span class="sg-time" style="width:16.1%">16.1%</span>
+          <span class="sg-smooth" style="width:3.2%"></span>
+          <span class="sg-solver" style="width:1.0%"></span>
+          <span class="sg-geom" style="width:0.2%"></span>
+        </div>
+        <div class="bracket">
+          <span style="width:79.6%"></span>
+          <span class="bk" style="width:20.4%">carrier 能碰的 20%</span>
+        </div>
+      </div>
+
+      <div class="stack-row" style="margin-bottom:4px">
+        <div class="stack-head">
+          <span class="sl">p95 = 4.45 mm（RSS，折算前）</span>
+          <span class="sr">尾部才有空间</span>
+        </div>
+        <div class="stack" role="img" aria-label="p95 方差份额：相机 45.5%，smoothing 29.1%，timing 20.2%，solver 5.1%，几何 0.2%">
+          <span class="sg-cam" style="width:45.5%">相机外参 45.5%</span>
+          <span class="sg-smooth" style="width:29.1%">smoothing 29.1%</span>
+          <span class="sg-time" style="width:20.2%">timing 20.2%</span>
+          <span class="sg-solver" style="width:5.1%">5.1%</span>
+          <span class="sg-geom" style="width:0.2%"></span>
+        </div>
+        <div class="bracket">
+          <span style="width:45.5%"></span>
+          <span class="bk" style="width:54.5%">carrier 能碰的 55%</span>
+        </div>
+      </div>
+
+      <div class="legend">
+        <span><i class="sg-cam"></i>相机内外参 · carrier 碰不到</span>
+        <span><i class="sg-time"></i>timing / 速度</span>
+        <span><i class="sg-smooth"></i>轨迹滤波</span>
+        <span><i class="sg-solver"></i>solver 随机项</span>
+        <span><i class="sg-geom"></i>marker 几何 · 已确认可忽略</span>
+      </div>
+    </div>
+    <figcaption>
+      三个彩色段用的是 carrier 自己的三个印刷色 <span class="mono">#0057B8 / #00814A / #C1121F</span>——
+      <b>它能动的正好是这三行</b>。灰段是相机外参：bootstrap 已证明那 2.0 mm 里只有约 1% 是标定采样噪声，
+      其余是相机被碰与跨天漂移，<b>是偏置不是噪声</b>，换靶标不改，加相机也不按 √N 平均掉。
+    </figcaption>
+  </figure>
+
+  <div class="note measure">
+    <span class="nt">一句话</span>
+    p50 从 2.24 最多走到 <b>≈2.1 mm</b>。<b>这个 rig 买的是尾巴，不是中位数。</b>
+    如果换装的理由被说成"标签会更准"，那是把账算错了地方。
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">D</span>逐行分账</h2>
+  <p class="sub">
+    最后一列是证据等级——这张表一半是量出来的，一半是判断，混着读会得出错误的结论。
+  </p>
+
+  <div class="tablewrap">
+    <table>
+      <tr>
+        <th>误差行</th><th>今天 p95</th><th>换 carrier</th><th>依据</th><th>证据</th>
+      </tr>
+      <tr>
+        <td class="row-name"><i class="swatch sg-cam"></i>相机内外参</td>
+        <td class="n">3.0</td>
+        <td class="n delta-none">2.7 – 3.0</td>
+        <td>融合可见相机数 p05 4→5 / p50 5→6（H2 模拟，安装 yaw 90°）。但 2 mm 是偏置，多一台相机只部分平均</td>
+        <td><span class="chip chip-j">判断</span></td>
+      </tr>
+      <tr>
+        <td class="row-name"><i class="swatch sg-geom"></i>marker 几何</td>
+        <td class="n">0.2</td>
+        <td class="n delta-none">0.1</td>
+        <td>渲染→检测 48 姿态 <b>0.61 mm 中位 / 1.52 p90 / 0.24°</b>，单相机、名义 CAD、0 失败</td>
+        <td><span class="chip chip-s">仿真</span></td>
+      </tr>
+      <tr>
+        <td class="row-name"><i class="swatch sg-solver"></i>solver 随机项</td>
+        <td class="n">1.0</td>
+        <td class="n delta">0.4 – 0.6</td>
+        <td>同口径 A/B（见 E 节）：现役 5 板 ArUco <b>1.84 / 3.04</b> → carrier <b>0.61 / 1.52</b>，
+            <b>p90 比值 0.50</b>。现在的口径还要"每视图 ≥3 marker"、丢掉 5.7% 帧</td>
+        <td><span class="chip chip-m">机理实测</span></td>
+      </tr>
+      <tr>
+        <td class="row-name"><i class="swatch sg-time"></i>timing / 速度</td>
+        <td class="n">2.0</td>
+        <td class="n delta">1.0 – 1.4</td>
+        <td>大面高对比棱在运动模糊下退化慢于 6×6 模块解码。<b>本表风险最大的一行</b>——没有任何直接证据</td>
+        <td><span class="chip chip-j">判断</span></td>
+      </tr>
+      <tr>
+        <td class="row-name"><i class="swatch sg-smooth"></i>轨迹滤波</td>
+        <td class="n">2.4</td>
+        <td class="n delta">1.3 – 1.6</td>
+        <td>5/5 个超阈帧<b>全部</b>落在"BA 参与相机集合变化"上；carrier 让集合更稳（cam_13 从 0.1% 到 100%）</td>
+        <td><span class="chip chip-m">机理实测</span></td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="formula">
+    <span class="lbl">今天</span>√(3.0² + 0.2² + 1.0² + 2.0² + 2.4²) = 4.45　→ ×0.85–0.895 → <span class="res">3.78 – 3.98 mm</span><br>
+    <span class="lbl">实际点</span>√(3.0² + 0.1² + 0.5² + 2.0² + 1.5²) = 3.94　→ ×0.85–0.895 → <span class="res">3.35 – 3.52 mm</span><br>
+    <span class="lbl">饼</span>√(2.7² + 0.1² + 0.5² + 1.2² + 1.4²) = 3.31　→ ×0.85–0.895 → <span class="res">2.81 – 2.96 mm</span><br>
+    <span class="lbl">FDM 直接打</span>√(3.0² + 2.7² + 0.5² + 2.0² + 1.5²) = 4.77　→ ×0.85–0.895 → <span class="res">4.06 – 4.27 mm</span>
+  </div>
+
+  <div class="note measure">
+    <span class="nt">这个折算因子本身是外推</span>
+    0.85–0.895 是在误差传播 MC 自己那六个输入源上测的，而这五行不是同一组项——
+    smoothing 根本不在 MC 里。方向（RSS 高估尾部）是稳健的实测结论，<b>但这五项的具体因子从没被测过</b>。
+    换 rig 不改变这一点：新数字和旧数字带着同一个待办。
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">E</span>那不如退回全 ArUco？</h2>
+  <p class="sub">
+    同一套 render&nbsp;→&nbsp;detect 回路、同一批 48 个姿态、同一个相机和噪声、同一个解算器，
+    唯一的变量是身上带什么。
+  </p>
+
+  <figure>
+    <div class="plate">
+      <div class="fig-title">单相机位姿误差中位数 · 48 姿态 · 0.55–0.85 m · 毫米</div>
+      <div class="pbars">
+        <div class="pbar">
+          <span class="pl">carrier · 31 棱 + 3 anchor</span>
+          <span class="pt"><span class="pf" style="width:10.2%;background:var(--green)"></span></span>
+          <span class="pv">0.61</span>
+        </div>
+        <div class="pbar">
+          <span class="pl">同一个身体 · 只留 3 个 ArUco</span>
+          <span class="pt"><span class="pf" style="width:25.7%;background:var(--slate)"></span></span>
+          <span class="pv">1.54</span>
+        </div>
+        <div class="pbar">
+          <span class="pl">现役 rig · 5 块板 · CAD 软先验</span>
+          <span class="pt"><span class="pf" style="width:29.3%;background:var(--slate)"></span></span>
+          <span class="pv">1.76</span>
+        </div>
+        <div class="pbar">
+          <span class="pl">现役 rig · 5 块板 · 自由 BA</span>
+          <span class="pt"><span class="pf" style="width:30.7%;background:var(--slate)"></span></span>
+          <span class="pv">1.84</span>
+        </div>
+        <div class="pbar">
+          <span class="pl">现役 rig · 跳过 layout BA</span>
+          <span class="pt"><span class="pf" style="width:93.0%;background:var(--red)"></span></span>
+          <span class="pv">5.58</span>
+        </div>
+      </div>
+    </div>
+    <figcaption>
+      <b>决定性的是第二根条，不是第一根。</b>把 carrier 的涂装剥光只留 3 个 ArUco，它就落回现役 rig
+      那一档（1.54 vs 1.84）——而现役 rig 带的是<b>更大、更多</b>的 marker（69.6 mm 板 / 约 61 mm marker，
+      对 carrier 的 62 / 48）。<b>marker 的数量和尺寸不是这两个靶标的区别，每视图 31 条可测棱才是。</b>
+    </figcaption>
+  </figure>
+
+  <div class="tablewrap">
+    <table>
+      <tr>
+        <th>目标</th><th>p50</th><th>p90</th><th>max</th><th>drot</th><th>每帧观测量</th><th>这一行是什么</th>
+      </tr>
+      <tr>
+        <td class="row-name"><i class="swatch sg-smooth"></i>carrier</td>
+        <td class="n">0.61</td><td class="n">1.52</td><td class="n">2.06</td><td class="n">0.24°</td>
+        <td class="n">3 anchor + 200 边测量</td>
+        <td>3 个 ArUco anchor + 13 个涂装面 / 31 条棱</td>
+      </tr>
+      <tr>
+        <td class="row-name"><i class="swatch sg-cam"></i>carrier 去涂装</td>
+        <td class="n">1.54</td><td class="n">2.74</td><td class="n">4.01</td><td class="n">0.29°</td>
+        <td class="n">3 anchor</td>
+        <td>同一个身体，只印那 3 张 ArUco 贴纸</td>
+      </tr>
+      <tr>
+        <td class="row-name"><i class="swatch sg-cam"></i>现役 rig · 自由 BA</td>
+        <td class="n">1.84</td><td class="n">3.04</td><td class="n">4.62</td><td class="n">0.32°</td>
+        <td class="n">3 anchor</td>
+        <td>5 块板，layout 由图像自由 BA 解出</td>
+      </tr>
+      <tr>
+        <td class="row-name"><i class="swatch sg-cam"></i>现役 rig · CAD 软先验</td>
+        <td class="n">1.76</td><td class="n">3.07</td><td class="n">6.90</td><td class="n">0.31°</td>
+        <td class="n">3 anchor</td>
+        <td>同上，<code>--cad-prior-mm</code> 软先验 BA</td>
+      </tr>
+      <tr>
+        <td class="row-name"><i class="swatch sg-solver"></i>现役 rig · 跳过 BA</td>
+        <td class="n">5.58</td><td class="n">7.86</td><td class="n">10.25</td><td class="n">0.70°</td>
+        <td class="n">3 anchor</td>
+        <td>实物按名义 CAD 解算，即"不做 layout 自标定"</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="note">
+    <span class="nt">最后一行的机理，和打印收缩是同一条式子</span>
+    两份 CAD 系 layout 的 marker 中心差 <b>1.29 mm RMS</b>、成对中心距净涨 <b>0.9%</b>；
+    在 0.7 m 上被放大读出，正是 <code>s·d</code>。
+    区别只在<b>哪一端吸收它</b>——<code>bootstrap_marker_layout</code> 从图像里把靶标几何拟合出来，
+    <code>build_hybrid_carrier_model</code> 把 STEP 当既定事实。
+    所以这一行支持的是<b>给 carrier 补一个打印后尺度标定</b>，不是退回 ArUco。
+  </div>
+
+  <h3>但 rig 那三行是上界，不是预测</h3>
+  <p>
+    包装器渲染的是 5 块悬空的板：没有框体、没有夹爪、没有手，所以凡是法向朝着相机的 marker 都能解出。
+    真实录像远没有这么慷慨——而且<b>每视图 marker 数正是那张表的排序变量</b>：
+  </p>
+
+  <div class="tablewrap">
+    <table>
+      <tr>
+        <th>相机</th><th>每帧解出 marker 数</th><th>逐相机弥散 p50</th><th>p95</th><th>入射角中位</th><th>丢帧率</th>
+      </tr>
+      <tr><td class="row-name">cam_06</td><td class="n">1.08</td><td class="n">9.93</td><td class="n">16.53</td><td class="n">53.8°</td><td class="n">14.3%</td></tr>
+      <tr><td class="row-name">cam_08</td><td class="n">1.25</td><td class="n">5.32</td><td class="n">15.02</td><td class="n">53.2°</td><td class="n">12.2%</td></tr>
+      <tr><td class="row-name">cam_07</td><td class="n">2.27</td><td class="n">1.71</td><td class="n">5.53</td><td class="n">27.7°</td><td class="n">0.4%</td></tr>
+      <tr><td class="row-name">cam_12</td><td class="n">3.05</td><td class="n">1.35</td><td class="n">3.51</td><td class="n">10.1°</td><td class="n">0.0%</td></tr>
+      <tr><td class="row-name">cam_13</td><td class="n">3.30</td><td class="n">3.80</td><td class="n">5.23</td><td class="n">20.4°</td><td class="n">0.0%</td></tr>
+      <tr><td class="row-name">cam_14</td><td class="n">3.34</td><td class="n">5.72</td><td class="n">7.58</td><td class="n">21.7°</td><td class="n">0.0%</td></tr>
+    </table>
+  </div>
+  <p class="sub" style="margin-top:12px">
+    1844 帧真实录像 · <span class="mono">dispersion_best.json</span> · 弥散单位 mm。
+    cam_09 已被物理挪动，本次不参与（<span class="mono">no09</span> 变体）。
+  </p>
+
+  <div class="note warn">
+    <span class="nt">「ArUco 有现成的自标定管线」这句话要打折</span>
+    08-18 两份 rig layout 都报 <code>success: false</code>，重投影 RMSE ≈ <b>5.0 px</b>，
+    拒掉 <b>18–21%</b> 的观测。生产夹爪 cube 那一版更甚：拒掉 <b>2740/3400（80%）</b>，
+    解出的角点刚性 RMS 逐 marker 是 <b>38 / 61 / 84 / 139 / 343 mm</b>
+    （rig 是 0.75–1.5 mm，只有 17 号板 6.12 mm——那是一个真实的装配问题）。
+    <b>一个 layout 根本量不出来的靶标，没有"现成的 BA"可以指望。</b>
+  </div>
+
+  <div class="note measure">
+    <span class="nt">这些数不是什么</span>
+    理想针孔、精确内参、无畸变、单相机、高斯模糊 2.5 LSB 噪声。
+    <b>绝对毫米不是生产误差</b>——生产还带着鱼眼标定误差、真实光照和真实运动。
+    <b>同一批姿态上两行之间的比值才是结论</b>，单独一行的绝对值不是。
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">F</span>饼的三条裂缝</h2>
+  <p class="sub">按会不会把收益吃光排序。</p>
+
+  <div class="risks">
+    <div class="risk r-fatal">
+      <div class="rh">致命 · 会由正转负</div>
+      <h4>FDM 是净亏，不是打折</h4>
+      <p>
+        <code>build_hybrid_carrier_model</code> 只吃 STEP，<b>没有 <code>--scale</code>、也没有几何 BA</b>。
+        现役 rig 恰恰相反——走 <code>--cad-prior-mm</code> 软先验 BA，打印误差会被吸收掉。
+        换过去等于主动放弃一个现有的补偿机制。SLA + 卡尺量 200 mm 基准（→250 ppm）是<b>入场券，不是优化项</b>。
+      </p>
+    </div>
+    <div class="risk r-mid">
+      <div class="rh">中 · 吃掉相机行的收益</div>
+      <h4>手部遮挡没建模</h4>
+      <p>
+        H2 那个"相机数 p50 6"只算了 carrier 挡自己（181 个 occluder 三角形）。
+        现役 cube 的 +Y 面<b>几何上该看得见却只解出 25%</b>，说明真实丢帧主因就是手。
+        相机行那 0.3 mm 的收益可能被它整个吃掉。
+      </p>
+    </div>
+    <div class="risk r-low">
+      <div class="rh">低 · 但会静默出错</div>
+      <h4>anchor id 仍要手给</h4>
+      <p>
+        STEP 里没有记 marker id 的地方，三个 <code>--anchor-id</code> 只能写在命令行。
+        给错<b>不报错</b>，会解出一个看起来合理的错位姿。
+        （<code>--pad-size-mm 62</code> 给错反而是响的：默认 60 会找到 0 个 pad 并报错。）
+      </p>
+    </div>
+  </div>
+
+  <figure>
+    <div class="plate">
+      <div class="fig-title">打印工艺 · 渲染→检测回路的位姿误差中位数 · 毫米</div>
+      <div class="pbars">
+        <div class="pbar">
+          <span class="pl">完美几何</span>
+          <span class="pt"><span class="pf" style="width:32%;background:var(--rule-strong)"></span></span>
+          <span class="pv">0.96</span>
+        </div>
+        <div class="pbar">
+          <span class="pl">SLA · 500 ppm + 0.05 mm</span>
+          <span class="pt"><span class="pf" style="width:37.3%;background:var(--green)"></span></span>
+          <span class="pv">1.12</span>
+        </div>
+        <div class="pbar">
+          <span class="pl">只有翘曲 · 0.25 mm</span>
+          <span class="pt"><span class="pf" style="width:46%;background:var(--blue)"></span></span>
+          <span class="pv">1.38</span>
+        </div>
+        <div class="pbar">
+          <span class="pl">只有收缩 · 3000 ppm</span>
+          <span class="pt"><span class="pf" style="width:90.3%;background:var(--red)"></span></span>
+          <span class="pv">2.71</span>
+        </div>
+        <div class="pbar">
+          <span class="pl">FDM · 收缩 + 翘曲</span>
+          <span class="pt"><span class="pf" style="width:94.3%;background:var(--red)"></span></span>
+          <span class="pv">2.83</span>
+        </div>
+      </div>
+    </div>
+    <figcaption>
+      <b>致命项是收缩，不是粗糙度。</b>FDM 的 2.83 里，收缩单独就占 2.71——机理是整体缩放 s 让距离偏 s·d
+      （0.3% × 0.7 m = 2.1 mm），<b>随距离变，多相机融合消不掉</b>。
+      而层高台阶只有 0.24 mm ≈ 0.35 px，0 个面需要支撑，31/31 都是二面棱——那些原本担心的项全部不成问题。
+    </figcaption>
+  </figure>
+</section>
+
+<section class="measure">
+  <h2><span class="num">G</span>真正值钱的不在这张表上</h2>
+  <p class="sub">A 口径把 marker→TCP 结构性移除了，所以它看不见 carrier 最大的那笔收益。</p>
+  <p>
+    今天生产夹爪口径（B）<b>给不出任何数</b>，卡在两件事上。carrier 直接拆掉其中一件：
+  </p>
+  <div class="note good">
+    <span class="nt">B 口径的第一个堵点 · carrier 拆掉它</span>
+    <b>cube 晃动是时变量，不进 RSS，它直接破坏刚体假设本身</b>，而且本页所有既有检查对它免疫——
+    多相机一致性看不见（晃动是共模量），重投影残差也看不见（单相机 cube pose 中位只用 1–2 个 marker，近乎退化）。
+    <b>一体打印件 + 每视图 31 条棱，同时解决"会晃"和"看不见它晃"。</b>
+  </div>
+  <p>
+    第二个堵点是 marker→TCP 常量（<code>rotation_sigma_deg = 2.0°</code> 是一个<b>声明</b>不是测量，
+    按现役杠杆臂折算即 9.1 mm），要靠 FR3 hand-eye 解决，跟换不换 rig 无关。
+  </p>
+  <p>
+    <b>在 A 口径上抠 0.5–1 mm，远不如让 B 口径第一次有数。</b>
+    B 才是真正会进训练集的那条路径。
+  </p>
+</section>
+
+<section class="measure">
+  <h2><span class="num">H</span>还剩哪一处判断</h2>
+  <p class="sub">上一版这里写的是"该做但没做的那次仿真"。它做了，见 E 节；剩下的是这些。</p>
+  <p>
+    D 表里原本 <b>solver</b> 和 <b>timing</b> 两行都是纯判断，合计占预估收益一半以上。
+    <b>solver 已经换成比值</b>（同口径 A/B，p90 0.50），<b>timing 仍然一个直接证据都没有</b>——
+    "大面高对比棱在运动模糊下退化慢于 6×6 模块解码"是个合理的机理，但本页没有任何数支持它，
+    而它独占 p95 方差的 20.2%。补法同样是那套 harness：给渲染加运动模糊，扫模糊长度。
+  </p>
+  <div class="note good">
+    <span class="nt">已经补上的前置条件</span>
+    现役 rig 的 <code>marker_layout.json</code> 本仓库里没有（生产 <code>marker_layout_path</code>
+    至今为空），已从 Thor 的 <span class="mono">outputs/metrology/newrig_20260818/</span> 取回；
+    harness 本身以 <code>metrology.cli.compare_fiducial_targets</code> 进了仓库，附 9 个单元测试。
+  </div>
+  <div class="note warn">
+    <span class="nt">仍然成立的前提</span>
+    没有独立 GT，本页每个数字<b>只能证伪不能验收</b>。共模误差——全场尺度、world 系整体偏置、
+    多台相机共享的模型误差——对这里的所有数都不可见。换了 rig 也一样。
+    E 节那把尺子还额外受限于它自己的理想相机模型。
+  </div>
+</section>
+
+<footer>
+  <div class="fh">数字出处</div>
+  <ul>
+    <li><b>预算行与折算因子</b>　<span class="mono">docs/box_umi_trajectory_gt_replay_roadmap.html</span> · 3 mm 轨迹精度误差预算表（08-27 口径）</li>
+    <li><b>靶标同口径 A/B</b>　<span class="mono">metrology.cli.compare_fiducial_targets</span>，48 姿态、seed 20260908、0.55–0.85 m、倾角 ±26°、模糊 0.8 px、噪声 2.5 LSB、理想针孔单相机</li>
+    <li><b>现役 rig layout</b>　Thor <span class="mono">outputs/metrology/newrig_20260818/</span>：<span class="mono">marker_layout_measured / layout_cadprior / layout_cad</span> 及各自 report</li>
+    <li><b>现役 rig 真实弥散</b>　<span class="mono">dispersion_best.json</span>（<span class="mono">cadprior_no09_a</span>，1844 帧，杠杆臂 102.01 mm）</li>
+    <li><b>carrier 几何</b>　3 anchors（DICT_6X6_50，62 mm pad / 48 mm marker）· 13 facets · 31/31 可测且无偏棱 · 1693.48 mm 可测棱长 · 特征弥散 rms 75.52 mm · 手性承载面积 0.734</li>
+    <li><b>相机可见性</b>　H2 重放，602 帧真实轨迹 × 7 台生产标定相机 × 12 个安装 yaw，自遮挡开；yaw 90° 为唯一两项指标都好的解</li>
+    <li><b>打印工艺</b>　变形模型渲染 + 名义 CAD 检测，单相机</li>
+    <li><b>构建链</b>　<span class="mono">paint_carrier_step → build_hybrid_carrier_model → render_carrier_install_guide</span>，三条命令，无 <span class="mono">--repaint</span></li>
+  </ul>
+  <p style="margin-top:18px">
+    本页是<b>内部口径的估算</b>，用于排优先级，不构成验收。四个场景共用同一套算式，
+    差别只在被 carrier 影响的那几行取值；证据等级列已标出哪些是量的、哪些是判断。
+  </p>
+</footer>
+
+</div>
+</body>
+</html>
