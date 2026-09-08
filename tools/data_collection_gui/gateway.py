@@ -6288,6 +6288,29 @@ def _start_rollout(state: GatewayState, payload: dict[str, Any]) -> dict[str, An
     return {"ok": True, "rollout": asdict(state.rollout)}
 
 
+# What to tell an operator whose command arrived while the runtime was between two activities.
+#
+# `waiting` means the runtime is parked in `InteractiveRolloutKeyboard.wait_for_command`, which is
+# the only place it reads one. `finishing` is the gap on either side of that -- the rollout has
+# ended and its trace and DAgger episode are still being written -- and a command sent into the
+# gap is latched by the listener thread and then cleared at the gate. These endpoints refuse it
+# rather than write it, so the operator gets a sentence instead of an arm that never moves.
+_NOT_AT_THE_GATE = (
+    "The last rollout is still being written out (trace and corrections). "
+    "The runtime is not reading commands yet — try again in a moment."
+)
+
+
+def _require_rollout_at_the_gate(state: GatewayState, what: str) -> None:
+    if state.rollout.state == "finishing":
+        raise ValueError(_NOT_AT_THE_GATE)
+    if state.rollout.state != "waiting":
+        raise ValueError(
+            f"{what} is only allowed while the interactive session is waiting "
+            f"(it is {state.rollout.state})."
+        )
+
+
 def _scene_reset_workspace_bounds(state: GatewayState) -> tuple[tuple[float, float, float] | None, tuple[float, float, float] | None]:
     robot = state.config.get("robot") if isinstance(state.config.get("robot"), dict) else {}
     workspace_min = robot.get("workspace_min")
@@ -6312,8 +6335,7 @@ def _build_scene_reset_command(state: GatewayState, payload: dict[str, Any]) -> 
 def _request_rollout_scene_reset(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
     if state.profile != "workstation":
         raise ValueError("Scene reset is only available for the FR3 workstation profile.")
-    if state.rollout.state != "waiting":
-        raise ValueError("Scene reset from Rollout is only allowed while the interactive session is waiting.")
+    _require_rollout_at_the_gate(state, "Scene reset from Rollout")
     process = state.rollout_process
     if process is None or process.poll() is not None or process.stdin is None:
         raise ValueError("Start an interactive rollout session before using scene reset from this page.")
@@ -6387,6 +6409,8 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
     # unattended, and this one gives the operator a reason on screen instead of a click that
     # looks accepted and does nothing.
     if command == "home" and state.rollout.state != "waiting":
+        if state.rollout.state == "finishing":
+            raise ValueError(_NOT_AT_THE_GATE)
         raise ValueError(
             "Move to start only runs between rollouts, when the arm is parked. "
             "Stop the current rollout first."
@@ -6497,7 +6521,7 @@ def _record_rollout_outcome(state: GatewayState, payload: dict[str, Any]) -> dic
     # as one instead of as stage 0 -- which is a real grade meaning "never reached the object".
     # The backend derives `outcome` from `stage` and refuses the two disagreeing, so nothing
     # here needs to reconcile them.
-    for key in ("taskLadder", "stage", "stageId", "blocker", "inDistribution"):
+    for key in ("taskLadder", "stage", "stageId", "blocker", "blockers", "inDistribution"):
         if payload.get(key) is not None:
             record[key] = payload[key]
     try:
@@ -6750,8 +6774,7 @@ def _request_table_probe(state: GatewayState, payload: dict[str, Any]) -> dict[s
     if state.profile != "workstation":
         raise ValueError("Table alignment is only available for the FR3 workstation profile.")
     camera_key = _table_camera_key(payload.get("camera"))
-    if state.rollout.state != "waiting":
-        raise ValueError("Probing a point is only allowed while the interactive session is waiting.")
+    _require_rollout_at_the_gate(state, "Probing a point")
     process = state.rollout_process
     if process is None or process.poll() is not None or process.stdin is None:
         raise ValueError("Start an interactive rollout session before probing table points.")

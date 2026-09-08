@@ -79,7 +79,13 @@ export function formatMm(value: number): string {
 export function describe(
   geometry: RolloutGeometry,
   prefix: string,
-  grade?: { stage?: number; stageId?: string; terminalStage?: number; blocker?: string }
+  grade?: {
+    stage?: number;
+    stageId?: string;
+    terminalStage?: number;
+    blocker?: string;
+    blockers?: string[];
+  }
 ): string {
   const parts = [prefix];
   // Ahead of the geometry, because it is the part the geometry cannot supply: `lift` and
@@ -87,7 +93,16 @@ export function describe(
   if (grade?.stage !== undefined) {
     const of = grade.terminalStage !== undefined ? `/${grade.terminalStage}` : "";
     parts.push(`stage ${grade.stage}${of}${grade.stageId ? ` ${grade.stageId}` : ""}`);
-    if (grade.blocker && grade.blocker !== "unknown") parts.push(grade.blocker);
+    // Every blocker, not just the primary one: a rollout the operator had to rescue three times
+    // has three of these, and a tooltip showing one of them reads as a rollout that had one
+    // problem. Falls back to the singular field for records written before it was a list.
+    const blockers = grade.blockers?.length
+      ? grade.blockers
+      : grade.blocker
+        ? [grade.blocker]
+        : [];
+    const named = blockers.filter((blocker) => blocker !== "unknown");
+    if (named.length) parts.push(named.join(" + "));
   }
   if (landingPointDriver(geometry) === "expert") {
     parts.push("operator was driving at this point");

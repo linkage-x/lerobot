@@ -22,8 +22,12 @@ Three things are kept apart on purpose:
   are not the same size, so these numbers must never be averaged. Report the funnel -- the
   fraction reaching at least each stage -- and read the largest drop between neighbours as the
   next thing to work on.
-* `blocker` -- why it stopped there. The same stage fails for different reasons, and merging
-  them counts two different work items as one.
+* `blockers` -- why it stopped there, and with DAgger takeover, why the operator had to reach
+  in each separate time. The same stage fails for different reasons, and merging them counts two
+  different work items as one -- which is also why this is a list: a rollout with three takeover
+  spans has three reasons, and squeezing them into one field puts two of them in the prose of
+  the note, where no funnel can count them. `blocker` remains beside it as the first one, so
+  every reader written against the single field keeps working and keeps meaning the same thing.
 * `inDistribution` -- whether the attempt was inside what the demonstrations cover. A failure
   outside it is not evidence about the policy.
 """
@@ -286,17 +290,19 @@ def normalize_grade(payload: dict[str, Any], ladder: Ladder | None) -> dict[str,
         "terminalStage": ladder.terminal.ordinal,
     }
 
-    blocker = payload.get("blocker")
-    if blocker not in (None, ""):
-        blocker = str(blocker).strip()
-        if blocker not in ladder.blockers:
-            known = ", ".join(ladder.blockers)
-            raise LadderError(f"Blocker {blocker!r} is not one of: {known}.")
-        graded["blocker"] = blocker
+    blockers = _normalize_blockers(payload, ladder)
+    if blockers:
+        # Both written, always. `blocker` is the first one -- the reason the rollout stopped
+        # where its stage says it stopped, which is the one the funnel is about -- and the list
+        # carries the rest. Writing the list even when it holds one entry means a reader never
+        # has to handle two shapes.
+        graded["blocker"] = blockers[0]
+        graded["blockers"] = list(blockers)
     elif stage.ordinal < ladder.terminal.ordinal:
         # A rollout that fell short stopped for a reason. Recording "unknown" is allowed;
         # recording nothing loses the question ever having been asked.
         graded["blocker"] = "unknown"
+        graded["blockers"] = ["unknown"]
 
     in_distribution = payload.get("inDistribution")
     if in_distribution is not None:
@@ -314,6 +320,44 @@ def normalize_grade(payload: dict[str, Any], ladder: Ladder | None) -> dict[str,
     else:
         graded["outcome"] = derived
     return graded
+
+
+def _normalize_blockers(payload: dict[str, Any], ladder: Ladder) -> tuple[str, ...]:
+    """The reasons this rollout needed help, in the order the operator gave them.
+
+    Takes `blockers` (a list) or `blocker` (one), so a caller written before takeover made this
+    plural still grades. When both arrive they have to agree on the first entry: `blocker` is
+    defined as the primary one, and a payload where the two disagree is a payload whose author
+    believed something this function does not.
+
+    Order is kept and duplicates are dropped. With one blocker per takeover span the order is
+    the order they happened in, which is what makes "the first one" mean the same thing as the
+    stage the rollout is graded at.
+    """
+    raw = payload.get("blockers")
+    primary = payload.get("blocker")
+    if raw is None:
+        raw = [] if primary in (None, "") else [primary]
+    elif not isinstance(raw, (list, tuple)):
+        raise LadderError(f"Blockers must be a list (got {raw!r}).")
+
+    ordered: list[str] = []
+    for value in raw:
+        blocker = str(value or "").strip()
+        if not blocker:
+            continue
+        if blocker not in ladder.blockers:
+            known = ", ".join(ladder.blockers)
+            raise LadderError(f"Blocker {blocker!r} is not one of: {known}.")
+        if blocker not in ordered:
+            ordered.append(blocker)
+
+    if primary not in (None, "") and ordered and str(primary).strip() != ordered[0]:
+        raise LadderError(
+            f"Blocker {str(primary).strip()!r} is not the first of blockers {ordered!r}. "
+            "`blocker` is the primary one; send it first or send only the list."
+        )
+    return tuple(ordered)
 
 
 def stage_funnel(entries: list[dict[str, Any]], ladder: Ladder) -> list[dict[str, Any]]:

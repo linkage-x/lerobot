@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -669,10 +670,64 @@ def test_the_rollout_lifecycle_markers_drive_the_page_state():
 
     assert waiting["state"] == "waiting"
     assert started["state"] == "rolling" and started["rolloutIndex"] == 3 and started["step"] == 0
-    assert ended["state"] == "waiting" and ended["lastRolloutStatus"] == "stopped"
+    # Not "waiting". The rollout is over; the runtime is still writing its trace and, with
+    # takeover on, encoding a correction episode. See the invariant test below.
+    assert ended["state"] == "finishing" and ended["lastRolloutStatus"] == "stopped"
     # This is what makes the page ask for an outcome exactly once per finished rollout.
     assert ended["pendingOutcomeFor"] == 3
     assert session_over["state"] == "complete"
+
+
+def test_only_the_gate_marker_reports_the_session_as_waiting():
+    """The one invariant behind the reset-scene button that did nothing.
+
+    `waiting` is the page's word for "the runtime is parked in wait_for_command", which is the
+    only place it can act on anything the gateway writes -- and that method clears every pending
+    request on the way in. So a marker that reports `waiting` before the runtime is actually
+    there opens five buttons onto a pipe whose contents are about to be thrown away. That is
+    what `interactive_rollout_end` did: it printed, the page said waiting, the operator graded
+    the rollout and pressed Reset scene, and the runtime was still encoding a DAgger episode.
+    The command was accepted, written, latched and cleared, and nothing moved.
+
+    Stated as a sweep over the markers rather than one assertion per line, so a marker added
+    later cannot quietly re-open the window.
+    """
+    reports_waiting = [
+        line
+        for line in (
+            "[INFO] interactive_waiting_for_start arm_at_start=1 press 's' to start.",
+            "[INFO] interactive_rollout_start index=2",
+            "[INFO] interactive_rollout_end index=2 status=stopped",
+            "[INFO] interactive_homing=start gripper_pos=0.5",
+            "[INFO] interactive_homing=done",
+            "[INFO] scene_reset=start request_id=abc pick_xyz=+0.4,+0.0,+0.03",
+            "[INFO] scene_reset_step=done request_id=abc name=lift",
+            "[INFO] scene_reset=done request_id=abc",
+            "[WARN] scene_reset=failed request_id=abc details=unreachable",
+            "[INFO] interactive_rollouts=enabled keyboard_backend=pipe start_key='s'",
+            "[INFO] dagger_corrections=extending path=/tmp/x",
+        )
+        if rollout_backend.parse_rollout_line(line).get("state") == "waiting"
+    ]
+
+    assert reports_waiting == [
+        "[INFO] interactive_waiting_for_start arm_at_start=1 press 's' to start."
+    ]
+
+
+def test_the_end_of_an_activity_is_reported_as_finishing_not_as_the_gate():
+    """The states the page draws for the gap, so the buttons are shut with a reason on them."""
+    ended = rollout_backend.parse_rollout_line("[INFO] interactive_rollout_end index=1 status=completed")
+    reset_done = rollout_backend.parse_rollout_line("[INFO] scene_reset=done request_id=abc")
+    reset_failed = rollout_backend.parse_rollout_line(
+        "[WARN] scene_reset=failed request_id=abc details=trajectory_qc_failed: unreachable"
+    )
+
+    assert ended["state"] == "finishing"
+    assert reset_done["state"] == "finishing"
+    assert reset_failed["state"] == "finishing"
+    # And the reset that failed still says the arm is not where a rollout may start from.
+    assert reset_failed["armAtStart"] is False
 
 
 def test_the_waiting_banner_says_whether_the_arm_is_still_at_its_start_pose():
@@ -1843,6 +1898,51 @@ def test_the_landing_points_say_who_was_driving_when_they_happened():
     assert geometry["releaseBy"] == "expert"
 
 
+def test_the_end_marker_says_how_many_separate_times_the_operator_reached_in():
+    """80 expert steps is one long rescue or four short ones, and that changes the grade.
+
+    The stage a rollout earned is the one it reached before the *first* takeover -- after that it
+    is continuing out of a state a human put it in -- so the page has to know where the first one
+    began. The runtime has printed these spans since takeover shipped; the page kept only the
+    total and asked the operator to remember the rest.
+    """
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] interactive_rollout_end index=3 status=stopped samples=430 closed=1 "
+        "grasp_xyz=0.3162,-0.2214,0.0461 held_steps=223 "
+        "intervened=1 expert_steps=88 expert_spans=41-58;120-133;190-204"
+    )
+
+    assert parsed["lastRolloutIntervention"]["spans"] == [[41, 58], [120, 133], [190, 204]]
+    assert parsed["lastRolloutIntervention"]["expertSteps"] == 88
+
+
+def test_a_rollout_with_no_takeover_carries_no_spans():
+    parsed = rollout_backend.parse_rollout_line(
+        "[INFO] interactive_rollout_end index=3 status=completed samples=430 closed=1 "
+        "grasp_xyz=0.3162,-0.2214,0.0461"
+    )
+
+    assert parsed["lastRolloutIntervention"] == {"intervened": False, "expertSteps": 0}
+    assert "spans" not in parsed["lastRolloutIntervention"]
+
+
+def test_a_graded_rollout_keeps_where_each_takeover_was(tmp_path: Path):
+    """Stored with the grade so the stage on a record can be checked against the step the first
+    takeover began at, long after the log line has scrolled away."""
+    entry = checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/030000",
+            "outcome": "failure",
+            "intervention": {"intervened": True, "expertSteps": 88, "spans": [[41, 58], [120, 133]]},
+        },
+    )
+
+    assert entry["intervened"] is True
+    assert entry["expertSteps"] == 88
+    assert entry["expertSpans"] == [[41, 58], [120, 133]]
+
+
 def test_a_landing_point_from_a_runtime_that_names_no_driver_stays_unattributed():
     parsed = rollout_backend.parse_rollout_line(
         "[INFO] interactive_rollout_end index=3 status=stopped samples=430 closed=1 "
@@ -1935,7 +2035,13 @@ def test_the_end_marker_says_the_operator_drove_and_for_how_long():
         "intervened=1 expert_steps=476 expert_spans=135-610"
     )
 
-    assert parsed["lastRolloutIntervention"] == {"intervened": True, "expertSteps": 476}
+    assert parsed["lastRolloutIntervention"] == {
+        "intervened": True,
+        "expertSteps": 476,
+        # One span here: 476 steps in a single stretch. See the multi-span test below for why
+        # the shape matters more than the total.
+        "spans": [[135, 610]],
+    }
 
 
 def test_a_rollout_nobody_touched_says_so_rather_than_saying_nothing():
@@ -2294,6 +2400,94 @@ def test_a_stage_this_task_does_not_have_is_refused(tmp_path: Path):
         )
 
 
+def test_a_rollout_the_operator_rescued_three_times_records_three_reasons(tmp_path: Path):
+    """One takeover span, one reason. The single field could hold only the first of them.
+
+    A DAgger rollout is routinely helped more than once, and the reasons differ: the peg was
+    misplaced, then later the policy would not descend. Before this the operator picked one and
+    typed the rest into the note, where no funnel can count them -- the same defect the ladder
+    was built to end, one level down.
+    """
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    entry = checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/020000",
+            "taskLadder": "demo_task",
+            "stage": 2,
+            "blockers": ["object_pose_offset", "operator_stop"],
+        },
+    )
+
+    assert entry["blockers"] == ["object_pose_offset", "operator_stop"]
+    # The primary one stays where every existing reader looks for it, and is defined as the
+    # first: the reason the rollout stopped where its stage says it stopped.
+    assert entry["blocker"] == "object_pose_offset"
+
+
+def test_one_blocker_is_still_written_as_a_list(tmp_path: Path):
+    """So nothing reading the log has to handle both shapes."""
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    entry = checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {"checkpointId": "job_a/020000", "taskLadder": "demo_task", "stage": 2, "blocker": "object_pose_offset"},
+    )
+
+    assert entry["blocker"] == "object_pose_offset"
+    assert entry["blockers"] == ["object_pose_offset"]
+
+
+def test_the_same_reason_ticked_twice_is_recorded_once(tmp_path: Path):
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    entry = checkpoint_backend.append_rollout_outcome(
+        tmp_path,
+        {
+            "checkpointId": "job_a/020000",
+            "taskLadder": "demo_task",
+            "stage": 2,
+            "blockers": ["operator_stop", "object_pose_offset", "operator_stop"],
+        },
+    )
+
+    assert entry["blockers"] == ["operator_stop", "object_pose_offset"]
+
+
+def test_a_primary_blocker_that_is_not_the_first_of_the_list_is_refused(tmp_path: Path):
+    """`blocker` is defined as the first one. A payload where the two disagree believes
+    something this schema does not, and storing either answer would be a guess."""
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    with pytest.raises(checkpoint_backend.CheckpointError, match="is not the first"):
+        checkpoint_backend.append_rollout_outcome(
+            tmp_path,
+            {
+                "checkpointId": "job_a/020000",
+                "taskLadder": "demo_task",
+                "stage": 2,
+                "blocker": "operator_stop",
+                "blockers": ["object_pose_offset", "operator_stop"],
+            },
+        )
+
+
+def test_one_bad_reason_in_a_list_refuses_the_whole_grade(tmp_path: Path):
+    _write_ladder(tmp_path, _DEMO_LADDER)
+
+    with pytest.raises(checkpoint_backend.CheckpointError, match="not one of"):
+        checkpoint_backend.append_rollout_outcome(
+            tmp_path,
+            {
+                "checkpointId": "job_a/020000",
+                "taskLadder": "demo_task",
+                "stage": 2,
+                "blockers": ["object_pose_offset", "vibes"],
+            },
+        )
+
+
 def test_a_blocker_outside_the_vocabulary_is_refused(tmp_path: Path):
     """Free-text reasons are what the batch already had, and they cannot be tallied."""
     _write_ladder(tmp_path, _DEMO_LADDER)
@@ -2314,6 +2508,7 @@ def test_a_shortfall_with_no_reason_given_records_that_it_was_unknown(tmp_path: 
     )
 
     assert entry["blocker"] == "unknown"
+    assert entry["blockers"] == ["unknown"]
 
 
 def test_a_ladder_using_a_stage_outside_the_shared_vocabulary_is_refused(tmp_path: Path):
@@ -2486,6 +2681,87 @@ def test_a_table_probe_is_refused_while_a_rollout_is_running(tmp_path: Path):
 
     with pytest.raises(ValueError, match="waiting"):
         gateway._request_table_probe(state, {"camera": "side", "x": 0.45, "y": 0.0, "z": 0.035})
+
+
+def test_the_gateway_refuses_a_reset_the_runtime_would_throw_away(tmp_path: Path):
+    """The whole of the reset-scene bug, in the three places it lived.
+
+    The runtime prints `interactive_rollout_end` and then spends seconds writing its trace and
+    encoding a DAgger episode before it reaches `wait_for_command`, which clears every pending
+    request on the way in. The page used to read that end marker as `waiting`, so the operator's
+    own loop -- grade, reset the scene, start the next -- pressed Reset squarely into the gap.
+    The gateway accepted it, wrote it to stdin, the listener thread latched it, and the gate
+    cleared it. No motion, no error, and the page went back to "Waiting for Start" on its own.
+
+    So the refusal is asserted at the seam it has to hold: the state the marker produces, and
+    the endpoint that reads that state.
+    """
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="rolling", interactive=True, cameraKeys=["side"])
+    process = _StdinProcess()
+    state.rollout_process = process
+    request = {
+        "pickXyz": [0.45, 0.0, 0.035],
+        "targetZ": 0.06,
+        "liftM": 0.08,
+        "approachClearanceM": 0.08,
+        "mask": {"strokes": [{"x": 0.45, "y": 0.0, "radiusM": 0.03}]},
+    }
+
+    gateway._apply_rollout_output(state, "[INFO] interactive_rollout_end index=4 status=stopped")
+    assert state.rollout.state == "finishing"
+
+    with pytest.raises(ValueError, match="still being written out"):
+        gateway._request_rollout_scene_reset(state, request)
+    # Nothing reached the pipe, which is the point: a command written here is one the runtime
+    # discards, and the operator would have no way to tell that from a dead button.
+    assert process.lines() == []
+
+    gateway._apply_rollout_output(
+        state, "[INFO] interactive_waiting_for_start arm_at_start=0 press 's' to start."
+    )
+    assert state.rollout.state == "waiting"
+    assert gateway._request_rollout_scene_reset(state, request)["ok"] is True
+    assert process.lines()[0].startswith("scene_reset ")
+
+
+def test_the_runtime_says_so_when_it_drops_a_command_at_its_gate(capsys):
+    """The other half: the gate stops throwing requests away in silence.
+
+    Refusing at the gateway closes the window the GUI opens, but the terminal backends and any
+    future caller can still land in it. A dropped request that prints nothing is indistinguishable
+    from a button that is not wired up, which is what made this take a session to find.
+    """
+    from tools.fr3.interactive_control import InteractiveRolloutKeyboard
+
+    keyboard = InteractiveRolloutKeyboard(start_key="s", stop_key="x", home_key="h", quit_key="q")
+    # Latched while the runtime was still busy, which is the state the listener thread leaves them
+    # in. Both are cleared on the way into the gate; the warning is the only trace they ever left.
+    keyboard.scene_reset_requested.set()
+    keyboard.home_requested.set()
+    # Released after entry, so the wait returns on a real command rather than on a quit -- which
+    # sets start and stop itself and would be counted as two more losses.
+    releasing = threading.Timer(0.05, keyboard.start_requested.set)
+    releasing.start()
+    try:
+        assert keyboard.wait_for_command(arm_at_start=False) == "start"
+    finally:
+        releasing.cancel()
+
+    printed = capsys.readouterr().out
+    assert "interactive_command_dropped=home,scene_reset" in printed
+    assert "arrived_before_the_runtime_reached_its_gate" in printed
+
+
+def test_a_quit_is_not_reported_as_a_dropped_command(capsys):
+    """Quit sets start and stop to break the wait. That is the gate's own signalling."""
+    from tools.fr3.interactive_control import InteractiveRolloutKeyboard
+
+    keyboard = InteractiveRolloutKeyboard(start_key="s", stop_key="x", home_key="h", quit_key="q")
+    keyboard._on_press("q")
+
+    assert keyboard.wait_for_command(arm_at_start=True) == "quit"
+    assert "interactive_command_dropped" not in capsys.readouterr().out
 
 
 def test_a_table_point_is_labelled_with_where_the_arm_got_to_not_where_it_was_sent(

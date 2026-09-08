@@ -1086,7 +1086,10 @@ export class DataCollectionGuiApi {
     note?: string;
     taskLadder?: string;
     stageId?: string;
-    blocker?: string;
+    /** Every reason the operator had to reach in, first one first. The gateway stores the first
+     *  as `blocker` and the whole list as `blockers`, so nothing that reads the singular field
+     *  has to change. */
+    blockers?: string[];
   }) {
     return this.trainingPost<{ entry?: RolloutOutcomeEntry }>("/api/rollout/outcome", record);
   }

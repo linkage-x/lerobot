@@ -355,7 +355,15 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
 
 @dataclass
 class RolloutStatus:
-    state: str = "idle"  # idle | starting | waiting | homing | resetting | rolling | complete | error | stopped
+    # idle | starting | waiting | finishing | homing | resetting | rolling | complete | error | stopped
+    #
+    # `waiting` is the narrow one and the load-bearing one: it means the runtime is sitting in
+    # `InteractiveRolloutKeyboard.wait_for_command`, which is the only place it can act on a
+    # command. It is set by exactly one marker, `interactive_waiting_for_start`, and by nothing
+    # else -- see `parse_rollout_line`. `finishing` is what the states that used to claim
+    # `waiting` say instead: the activity is over, the runtime is on its way back to the gate,
+    # and anything sent before it arrives is dropped on the floor.
+    state: str = "idle"
     mode: str = ""
     checkpointId: str = ""
     checkpointPath: str = ""
@@ -572,6 +580,10 @@ _GEOMETRY_SCALAR_RE = re.compile(r"\b(apex_z|lift_m|descent_m)=(-?[\d.]+)")
 _GEOMETRY_DRIVER_RE = re.compile(r"\b(grasp_by|release_by|approach_by)=(policy|expert)")
 _INTERVENED_RE = re.compile(r"\bintervened=(\d+)")
 _EXPERT_STEPS_RE = re.compile(r"\bexpert_steps=(\d+)")
+# `expert_spans=41-58;120-133` -- one inclusive step range per stretch the operator was driving.
+# The runtime has printed this since takeover shipped; the page threw it away and kept only the
+# total, which is the number that cannot answer "how many separate times did you reach in".
+_EXPERT_SPANS_RE = re.compile(r"\bexpert_spans=((?:\d+-\d+)(?:;\d+-\d+)*)")
 _GEOMETRY_COUNT_RE = re.compile(r"\b(samples|held_steps|closed)=(\d+)")
 # The runtime writes these as log fields; the page reads them as JSON. Renamed at this single
 # crossing so neither side has to carry the other's convention.
@@ -628,7 +640,7 @@ def parse_rollout_geometry(text: str) -> dict[str, Any]:
 
 
 def parse_rollout_intervention(text: str) -> dict[str, Any]:
-    """Whether the operator drove part of this rollout, and for how many steps.
+    """Whether the operator drove part of this rollout, for how many steps, and in how many goes.
 
     Kept apart from the geometry although it arrives on the same line: the landing points say
     where the arm ended up, this says whose hand put it there. A rollout the operator finished
@@ -639,16 +651,31 @@ def parse_rollout_intervention(text: str) -> dict[str, Any]:
     that carries a summary at all, absence means no takeover. On one that does not -- a runtime
     older than the field -- the answer is unknown, and the empty dict says so rather than
     reporting an assisted rollout as clean.
+
+    `spans` is the part the total cannot say. 80 expert steps is one long rescue or four short
+    ones, and the difference is the whole grade: the stage a rollout earned is the one it reached
+    before the *first* takeover, because from that moment on it is continuing out of a state a
+    human put it in. A page that only knows the total has to ask the operator to remember where
+    the first one was.
     """
     if "samples=" not in text:
         return {}
     match = _INTERVENED_RE.search(text)
     intervened = bool(match and match.group(1) != "0")
     steps = _EXPERT_STEPS_RE.search(text)
-    return {
+    parsed: dict[str, Any] = {
         "intervened": intervened,
         "expertSteps": int(steps.group(1)) if intervened and steps else 0,
     }
+    spans = _EXPERT_SPANS_RE.search(text)
+    if intervened and spans:
+        # A list of pairs rather than the runtime's own string: the page draws them and the log
+        # is read by scripts, and neither should have to re-parse `41-58;120-133`.
+        parsed["spans"] = [
+            [int(first), int(last)]
+            for first, last in (part.split("-", 1) for part in spans.group(1).split(";"))
+        ]
+    return parsed
 
 
 def parse_rollout_line(line: str) -> dict[str, Any]:
@@ -724,7 +751,12 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
 
     end_match = _ROLLOUT_END_RE.search(stripped)
     if end_match:
-        parsed["state"] = "waiting"
+        # Not "waiting". The rollout is over, but the runtime is not at its gate yet: it still has
+        # a trace to write and, with takeover on, a DAgger episode to encode -- seconds to tens of
+        # seconds during which every pending request is dropped when the gate is finally reached.
+        # That window is exactly when the operator grades and reaches for Reset scene, which is
+        # how a reset came to be accepted, written to stdin, and then silently swallowed.
+        parsed["state"] = "finishing"
         parsed["rolloutIndex"] = int(end_match.group(1))
         parsed["lastRolloutStatus"] = end_match.group(2)
         # The page prompts for an outcome against this index. Recorded here rather than when
@@ -747,12 +779,15 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
         return parsed
 
     if "scene_reset=done" in stripped:
-        parsed["state"] = "waiting"
-        parsed["message"] = "Scene reset finished; waiting for the next command."
+        # Printed after the return-to-start move, but still before the loop publishes a preview
+        # snapshot and re-enters the gate. Same rule as the rollout end marker: the reset being
+        # over is not the runtime being ready for the next one.
+        parsed["state"] = "finishing"
+        parsed["message"] = "Scene reset finished; the runtime is returning to its command gate."
         return parsed
 
     if "scene_reset=failed" in stripped:
-        parsed["state"] = "waiting"
+        parsed["state"] = "finishing"
         parsed["armAtStart"] = False
         parsed["message"] = stripped[:400]
         return parsed
@@ -817,8 +852,9 @@ def parse_rollout_line(line: str) -> dict[str, Any]:
         # being ready to act on it: `start` is read by the listener thread the moment this line
         # prints, but the loop clears every pending request when it reaches its wait, so a start
         # sent in that window is swallowed without a trace. `interactive_waiting_for_start` is
-        # the marker that means the runtime is actually at the gate, and it is the only one that
-        # may enable Start.
+        # the marker that means the runtime is actually at the gate, and it is the only marker in
+        # this function that may report `waiting` -- every other end-of-activity line reports
+        # `finishing`, because the gap between the two is real and what is sent into it is lost.
         parsed["message"] = f"Rollout control channel ready ({backend_match.group(1)}); waiting for the runtime to reach its start gate."
         return parsed
 

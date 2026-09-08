@@ -548,7 +548,15 @@ def append_rollout_outcome(repo_root: Path, record: dict[str, Any]) -> dict[str,
     }
     # Absent on an ungraded rollout rather than defaulted: stage 0 is a real grade ("never
     # reached the object"), so writing it for "nobody said" would invent evidence.
-    for key in ("taskLadder", "stage", "stageId", "terminalStage", "blocker", "inDistribution"):
+    for key in (
+        "taskLadder",
+        "stage",
+        "stageId",
+        "terminalStage",
+        "blocker",
+        "blockers",
+        "inDistribution",
+    ):
         if key in graded:
             entry[key] = graded[key]
     # Stored with the grade rather than in a file of its own: a landing point without an outcome
@@ -566,6 +574,16 @@ def append_rollout_outcome(repo_root: Path, record: dict[str, Any]) -> dict[str,
     if isinstance(intervention, dict) and "intervened" in intervention:
         entry["intervened"] = bool(intervention["intervened"])
         entry["expertSteps"] = max(int(intervention.get("expertSteps") or 0), 0)
+        # Where in the rollout each takeover was, so a reader can tell one long rescue from four
+        # short ones -- and so the stage on this record can be checked against the step the first
+        # one began at, which is the moment after which the rollout stopped being the policy's.
+        spans = intervention.get("spans")
+        if isinstance(spans, list) and spans:
+            entry["expertSpans"] = [
+                [int(span[0]), int(span[1])]
+                for span in spans
+                if isinstance(span, (list, tuple)) and len(span) == 2
+            ]
     path = rollout_log_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:

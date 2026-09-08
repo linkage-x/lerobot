@@ -281,11 +281,26 @@ class InteractiveRolloutKeyboard:
         left it, and a banner that keeps claiming otherwise is how an operator ends up starting
         a rollout from a pose the dataset frame was never anchored to.
         """
+        # Said out loud rather than done quietly. Dropping these is the right behaviour and the
+        # docstring above says why, but a dropped request is indistinguishable from a dead button
+        # at the other end of the pipe, and the GUI has been bitten by exactly that: a Reset scene
+        # accepted while the runtime was still writing a DAgger episode, latched here, and cleared
+        # on the way in. The page's own fix is to stop offering the button before this line prints
+        # (`interactive_waiting_for_start` is the only marker that means "at the gate"); this is
+        # the record that says so when it happens anyway.
+        dropped = [name for name, event in self._pending_requests() if event.is_set()]
         self.start_requested.clear()
         self.stop_requested.clear()
         self.home_requested.clear()
         self.scene_reset_requested.clear()
         self.probe_pose_requested.clear()
+        # Quit sets start and stop to break the wait below; that is this method's own signalling,
+        # not an operator request that went missing.
+        if dropped and not self.quit_requested.is_set():
+            print(
+                '[WARN] interactive_command_dropped=' + ','.join(dropped)
+                + ' reason=arrived_before_the_runtime_reached_its_gate'
+            )
         # Every rollout begins under the policy. A latch left set from the last one would hand
         # the arm to a SpaceMouse nobody is holding, at the moment a fresh rollout starts
         # moving. (Automatic takeover cannot be left behind this way: it is a property of what
@@ -315,6 +330,20 @@ class InteractiveRolloutKeyboard:
                     event.clear()
                     return name
         return 'quit'
+
+    def _pending_requests(self) -> tuple[tuple[str, threading.Event], ...]:
+        """Every request flag, paired with the word the pipe channel accepts for it.
+
+        One list so a new command cannot be added to `_PIPE_COMMAND_WORDS` and forgotten here --
+        which would make it the one command whose loss is silent again.
+        """
+        return (
+            ('start', self.start_requested),
+            ('stop', self.stop_requested),
+            ('home', self.home_requested),
+            ('scene_reset', self.scene_reset_requested),
+            ('probe_pose', self.probe_pose_requested),
+        )
 
     def _pop_json_payload(self, name: str) -> dict[str, Any] | None:
         with self._json_lock:

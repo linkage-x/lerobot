@@ -15,6 +15,9 @@ import type { RolloutRun } from "../types";
 export const LIVE_STATES = new Set([
   "starting",
   "waiting",
+  // The runtime between two activities: the end marker has printed, the gate has not been
+  // reached. A live session, so End stays offered -- but not a pressable one, see `between`.
+  "finishing",
   "homing",
   "resetting",
   "rolling"
@@ -47,6 +50,13 @@ export function sessionAvailability(
   // `waiting` is the runtime printing `interactive_waiting_for_start`: everything before it --
   // homing, a minute of loading the policy, opening the cameras -- is `starting`, and a Start
   // pressed there is read by the listener thread and then cleared when the loop reaches its wait.
+  //
+  // `finishing` is the same trap at the other end of a rollout, and the one that actually bit:
+  // the runtime prints `interactive_rollout_end` and then spends seconds writing a trace and
+  // encoding a DAgger episode. The page used to call that `waiting` and offer all five buttons,
+  // so a Reset scene pressed in the loop's own rhythm -- grade, reset, start -- was accepted by
+  // the gateway, written to stdin, and then cleared at the gate. Nothing moved and nothing said
+  // why. Only the gate marker may open these buttons.
   const between = idle && Boolean(run?.interactive) && state === "waiting";
   return {
     canStart: between,
@@ -71,6 +81,11 @@ export function sessionNote(run: RolloutRun | null): string {
       return "Moving to the start pose.";
     case "resetting":
       return "Resetting the scene.";
+    case "finishing":
+      // The one an operator is most likely to read as a broken button, because the arm has
+      // visibly stopped: the rollout is over and the runtime is still writing its correction
+      // episode. Seconds, and longer the longer the takeover was.
+      return "Rollout finished — writing the trace and any corrections. The controls come back when the runtime reaches its next command.";
     default:
       return "";
   }

@@ -80,7 +80,9 @@ function stateTone(state: RolloutRun["state"]): string {
   // "running" is the arm-is-moving-right-now dot, which homing is as much as rolling is;
   // "armed" is the it-could-move-at-any-moment one. The state text beside it says which.
   if (state === "rolling" || state === "homing" || state === "resetting") return "running";
-  if (state === "waiting" || state === "starting") return "armed";
+  // `finishing` is "armed" and not "running": the arm has stopped, but the loop moves it to the
+  // init pose on its way back to the gate, so this is not a state to reach into the cell in.
+  if (state === "waiting" || state === "starting" || state === "finishing") return "armed";
   if (state === "error") return "error";
   if (state === "complete") return "complete";
   return "idle";
@@ -139,7 +141,13 @@ export function RolloutPage() {
   const [ladders, setLadders] = useState<TaskLadder[]>([]);
   const [outcomeTask, setOutcomeTask] = useState("");
   const [outcomeStageId, setOutcomeStageId] = useState("");
-  const [outcomeBlocker, setOutcomeBlocker] = useState("");
+  // A list, because a rollout with three takeover spans has three reasons the operator reached
+  // in. The stage stays one number -- it is an ordinal on a chain and two checkpoints have to be
+  // comparable on it -- but "why did you have to help" is genuinely plural, and the reasons that
+  // did not fit in the single field used to end up in the prose of the note where nothing counts
+  // them. Order is the order they happened, so the first entry is the one that belongs to the
+  // graded stage.
+  const [outcomeBlockers, setOutcomeBlockers] = useState<string[]>([]);
   const [history, setHistory] = useState<RolloutOutcomeEntry[]>([]);
   const [showAllHistory, setShowAllHistory] = useState(false);
   const [landmarks, setLandmarks] = useState<RolloutLandmarks>({});
@@ -174,7 +182,12 @@ export function RolloutPage() {
     ? "Sends the reset the panel below is set up for: a new sample inside the painted region."
     : sceneResetPanelUsable
       ? "Paint a target region and tick the motion box in Scene reset below first."
-      : "Only between the rollouts of an interactive session.";
+      : run?.state === "finishing"
+        // Named rather than folded into "between the rollouts", because this is the state the
+        // operator presses in: the rollout has ended, the arm has stopped, and the runtime is
+        // still writing. A reset sent now is dropped at the gate, so it is not offered.
+        ? "The last rollout is still being written out. Reset comes back when the runtime reaches its next command."
+        : "Only between the rollouts of an interactive session.";
   // The map is painted in base x/y, so the reference layer is the camera that looks across the
   // table rather than the one riding the gripper.
   const sceneResetCameraKey = run?.cameraKeys?.includes("side")
@@ -484,6 +497,12 @@ export function RolloutPage() {
   // when the object got there, it did not -- so that grade is blocked rather than warned about:
   // this log is what two checkpoints are compared on, and a success it did not earn is the one
   // entry that cannot be corrected by looking at more of them.
+  // Measured by the runtime off its own per-step trace and printed on the rollout-end line as
+  // `expert_spans=41-58;120-133`. Shown rather than left in the log because the grading rule
+  // below refers to it: the stage a rollout earned is the one it reached before the *first*
+  // takeover, and an operator asked to remember where that was, twenty minutes into a batch,
+  // will grade against the last one instead.
+  const takeoverSpans = run?.lastRolloutIntervention?.spans ?? [];
   const terminalWasOperators = terminalEventDriver(run?.lastRolloutGeometry) === "expert";
   const successBlocked = assistedSuccessBlocked(run?.lastRolloutGeometry, assistedSuccessAck);
 
@@ -498,8 +517,8 @@ export function RolloutPage() {
         note,
         ...(ladder && gradedStage ? { taskLadder: ladder.task, stageId: gradedStage.id } : {}),
         // Only meaningful on a shortfall: the terminal stage did not stop anywhere.
-        ...(ladder && gradedStage && outcomeBlocker && gradedStage.ordinal < ladder.terminal
-          ? { blocker: outcomeBlocker }
+        ...(ladder && gradedStage && outcomeBlockers.length && gradedStage.ordinal < ladder.terminal
+          ? { blockers: outcomeBlockers }
           : {}),
         // Sent only when it is not derivable. `aborted` is the one outcome a stage cannot
         // imply -- it says the round is not evidence about the policy at all.
@@ -509,7 +528,7 @@ export function RolloutPage() {
     if (result.ok) {
       setOutcomeNote("");
       setOutcomeStageId("");
-      setOutcomeBlocker("");
+      setOutcomeBlockers([]);
       setAssistedSuccessAck(false);
       setNotice(`Recorded ${outcome ?? derivedOutcome}${gradedStage ? ` at stage ${gradedStage.ordinal}` : ""}.`);
       await refreshHistory();
@@ -588,7 +607,18 @@ export function RolloutPage() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => void sceneResetRunnableRef.current?.()}
+                  onClick={() => {
+                    // The boolean this button is enabled from is state; the function it fires is
+                    // a ref. They are written together, but a click landing in the render between
+                    // them would find the ref empty -- and a button that does nothing at all is
+                    // the failure this whole path was just fixed for. Say so instead.
+                    const runnable = sceneResetRunnableRef.current;
+                    if (!runnable) {
+                      setNotice("Scene reset is not ready yet — press it again in a moment.");
+                      return;
+                    }
+                    void runnable();
+                  }}
                   disabled={!availability.canResetScene}
                   title={sceneResetBarReason}
                 >
@@ -659,6 +689,7 @@ export function RolloutPage() {
                 {run.lastRolloutIntervention?.intervened && (
                   <span className="pill pill-warn outcome-assisted-pill">
                     人工接管 {run.lastRolloutIntervention.expertSteps ?? 0} 步
+                    {takeoverSpans.length > 1 ? ` · ${takeoverSpans.length} 段` : ""}
                   </span>
                 )}
               </h4>
@@ -668,11 +699,24 @@ export function RolloutPage() {
               </p>
               {run.lastRolloutIntervention?.intervened && (
                 <p className="hint warn">
-                  这一轮你接管过 {run.lastRolloutIntervention.expertSteps ?? 0} 步：
-                  <strong>要填，但不能按“孔插进去了”来评 —— 按你接管之前策略自己走到哪一步来评。</strong>
-                  阶段选它被接管前够到的那一阶段，"卡在哪"选你之所以要伸手的原因，note 里写清楚从第几步起是人在开。
-                  终点是你的手放上去之后到达的，记成成功就是把这一分记在了 checkpoint 头上 ——
-                  下一版是不是真的变好，比的就是这条记录。
+                  这一轮你接管过 {run.lastRolloutIntervention.expertSteps ?? 0} 步
+                  {takeoverSpans.length
+                    ? `，分 ${takeoverSpans.length} 段：${takeoverSpans
+                        .map(([first, last]) => `${first}–${last}`)
+                        .join("、")}`
+                    : ""}
+                  ：
+                  <strong>
+                    要填，但不能按“孔插进去了”来评 ——
+                    按<u>第一次接管之前</u>策略自己走到哪一步来评
+                    {takeoverSpans.length > 1 ? `（也就是第 ${takeoverSpans[0][0]} 步之前）` : ""}。
+                  </strong>
+                  {takeoverSpans.length > 1
+                    ? "第一次接管之后策略是从你摆好的状态往下走的，后面那些阶段不是它自己挣来的。阶段只填第一段之前够到的那一阶段；"
+                    : "阶段选它被接管前够到的那一阶段；"}
+                  “卡在哪”把<strong>每一段</strong>你之所以要伸手的原因都勾上（按顺序，第一个对应上面那一阶段），
+                  note 里写清楚从第几步起是人在开。 终点是你的手放上去之后到达的，记成成功就是把这一分记在了
+                  checkpoint 头上 —— 下一版是不是真的变好，比的就是这条记录。
                 </p>
               )}
               <label className="field">
@@ -693,7 +737,7 @@ export function RolloutPage() {
                         onChange={(event) => {
                           setOutcomeTask(event.target.value);
                           setOutcomeStageId("");
-                          setOutcomeBlocker("");
+                          setOutcomeBlockers([]);
                         }}
                       >
                         {ladders.map((item) => (
@@ -705,7 +749,10 @@ export function RolloutPage() {
                     </label>
                   )}
                   <label className="field">
-                    <span>走到了哪一步</span>
+                    <span>
+                      走到了哪一步
+                      {takeoverSpans.length > 1 ? "（第一次接管之前）" : ""}
+                    </span>
                     <select
                       value={outcomeStageId}
                       onChange={(event) => setOutcomeStageId(event.target.value)}
@@ -719,23 +766,45 @@ export function RolloutPage() {
                     </select>
                   </label>
                   {gradedStage && gradedStage.ordinal < ladder.terminal && (
-                    <label className="field">
-                      <span>卡在哪</span>
-                      <select
-                        value={outcomeBlocker}
-                        onChange={(event) => setOutcomeBlocker(event.target.value)}
-                      >
-                        <option value="">未判明</option>
+                    <div className="field">
+                      <span>卡在哪{takeoverSpans.length > 1 ? "（每段接管一个，按发生顺序）" : ""}</span>
+                      {/* Checkboxes rather than a multiple <select>: this is filled in at the
+                          rig, often with one hand, and a ctrl-click list is the control that
+                          silently discards the previous choice when someone clicks without the
+                          modifier. Order follows the order they were ticked, so the first one is
+                          the reason belonging to the graded stage. */}
+                      <div className="blocker-choices">
                         {ladder.blockers
                           .filter((blocker) => blocker.id !== "unknown")
                           .map((blocker) => (
-                            <option key={blocker.id} value={blocker.id}>
-                              {blocker.label}
-                              {blocker.instance ? ` — ${blocker.instance}` : ""}
-                            </option>
+                            <label key={blocker.id} className="checkbox">
+                              <input
+                                type="checkbox"
+                                checked={outcomeBlockers.includes(blocker.id)}
+                                onChange={() =>
+                                  setOutcomeBlockers((current) =>
+                                    current.includes(blocker.id)
+                                      ? current.filter((id) => id !== blocker.id)
+                                      : [...current, blocker.id]
+                                  )
+                                }
+                              />
+                              <span>
+                                {outcomeBlockers.indexOf(blocker.id) >= 0
+                                  ? `${outcomeBlockers.indexOf(blocker.id) + 1}. `
+                                  : ""}
+                                {blocker.label}
+                                {blocker.instance ? ` — ${blocker.instance}` : ""}
+                              </span>
+                            </label>
                           ))}
-                      </select>
-                    </label>
+                      </div>
+                      <p className="hint">
+                        {outcomeBlockers.length === 0
+                          ? "一个都不勾 = 未判明。"
+                          : `第 1 个（${outcomeBlockers[0]}）记作主因，对应上面那一阶段；其余按顺序一起存。`}
+                      </p>
+                    </div>
                   )}
                   <p className="hint">
                     成功 = 到达第 {ladder.terminal} 阶段（{ladder.stages[ladder.stages.length - 1].instance}）。
@@ -971,9 +1040,11 @@ export function RolloutPage() {
         disabledReason={
           !run?.interactive
             ? "Start Interactive rollouts first; that process owns the FR3 connection."
-            : run.state !== "waiting"
-              ? "Scene reset is only available between rollouts."
-              : ""
+            : run.state === "finishing"
+              ? "The last rollout is still being written out; the runtime is not reading commands yet."
+              : run.state !== "waiting"
+                ? "Scene reset is only available between rollouts."
+                : ""
         }
         onReset={onSceneReset}
         onRunnableChange={onSceneResetRunnableChange}

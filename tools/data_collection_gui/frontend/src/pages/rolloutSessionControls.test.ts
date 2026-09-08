@@ -36,6 +36,22 @@ describe("which session controls may be pressed", () => {
     expect(sessionAvailability(run({ state: "rolling" }), false, true).canStart).toBe(false);
   });
 
+  it("shuts every arm control while the runtime is still writing the last rollout out", () => {
+    // The reset-scene bug. `interactive_rollout_end` prints, the arm stops, and the runtime
+    // spends seconds on its trace and its DAgger episode before it reaches the gate -- where it
+    // clears whatever the operator sent in the meantime. The page used to call that `waiting`,
+    // so Reset scene was offered exactly into the window where pressing it did nothing at all.
+    const finishing = sessionAvailability(run({ state: "finishing" }), false, true);
+
+    expect(finishing.canStart).toBe(false);
+    expect(finishing.canHome).toBe(false);
+    expect(finishing.canResetScene).toBe(false);
+    // End stays live: it is the way out of a session, and it does not go through the gate.
+    expect(finishing.canEnd).toBe(true);
+    // And the operator is told why, or a correctly disabled button is just a broken one.
+    expect(sessionNote(run({ state: "finishing" }))).toContain("writing the trace");
+  });
+
   it("does not offer Start while the runtime is still loading the policy", () => {
     // The click would be read by the listener thread and then cleared when the loop reaches its
     // wait: it looks like it worked and nothing happens.

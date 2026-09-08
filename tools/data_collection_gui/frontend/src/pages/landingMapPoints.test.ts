@@ -105,6 +105,37 @@ suite("stage colours", () => {
     expect(point.title).toContain("stage 2/7 contact");
     expect(point.title).toContain("object_pose_offset");
   });
+
+  it("names every reason the operator had to reach in, not just the first", () => {
+    // A rollout rescued three times had three problems. A tooltip that shows one of them reads
+    // as a rollout that had one, which is the reading the map is there to prevent.
+    const rescued: RolloutOutcomeEntry = {
+      ...entry("2026-09-07T09:11:00+00:00", "failure", [0.41, -0.02], 5),
+      stage: 4,
+      stageId: "transport",
+      terminalStage: 7,
+      blocker: "object_pose_offset",
+      blockers: ["object_pose_offset", "policy_action"]
+    };
+
+    const [point] = buildLandingPoints([rescued], 0, undefined);
+
+    expect(point.title).toContain("object_pose_offset + policy_action");
+  });
+
+  it("still reads a record written before the field was a list", () => {
+    const older: RolloutOutcomeEntry = {
+      ...entry("2026-08-31T07:18:47+00:00", "failure", [0.37, -0.05], 4),
+      stage: 2,
+      stageId: "contact",
+      terminalStage: 7,
+      blocker: "perception"
+    };
+
+    const [point] = buildLandingPoints([older], 0, undefined);
+
+    expect(point.title).toContain("perception");
+  });
 });
 
 suite("who produced a landing point", () => {

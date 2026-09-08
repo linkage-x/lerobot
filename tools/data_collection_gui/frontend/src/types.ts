@@ -1175,7 +1175,14 @@ export type RolloutRun = {
   state:
     | "idle"
     | "starting"
+    /** The runtime is sitting in its command gate. The only state in which it can act on
+     *  anything the page sends, and the only one any arm control may be offered in. */
     | "waiting"
+    /** Between the two: the last activity has printed its end marker but the runtime has not
+     *  reached the gate yet -- it is writing a trace, encoding a DAgger episode, publishing a
+     *  preview. Every request that arrives now is cleared on the way in, so the page must not
+     *  offer one. */
+    | "finishing"
     | "homing"
     | "resetting"
     | "rolling"
@@ -1250,6 +1257,13 @@ export type RolloutIntervention = {
   intervened?: boolean;
   /** Steps the operator drove, out of the rollout's total. Zero when `intervened` is false. */
   expertSteps?: number;
+  /** Inclusive `[first, last]` step of each separate stretch the operator drove.
+   *
+   *  The total cannot distinguish one long rescue from four short ones, and the difference is
+   *  the grade: a rollout earns the stage it reached before the *first* takeover, because from
+   *  then on it is continuing out of a state a human put it in. Absent on a runtime older than
+   *  the field. */
+  spans?: [number, number][];
 };
 
 /** The landing points of one rollout, measured by the runtime from its own per-step trace.
@@ -1404,7 +1418,15 @@ export type RolloutOutcomeEntry = {
   stageId?: string;
   /** The stage that counts as success. Stored per record so an old grade still renders right. */
   terminalStage?: number;
+  /** The primary blocker: why it stopped where its stage says it stopped. Always the first of
+   *  `blockers`, and kept as its own field so readers written before takeover made this plural
+   *  still work. */
   blocker?: string;
+  /** Every reason the operator had to reach in — one per takeover span, in the order they
+   *  happened. Absent on records written before the field; present with one entry otherwise. */
+  blockers?: string[];
+  /** Where each takeover was, as inclusive `[first, last]` step ranges. */
+  expertSpans?: [number, number][];
   /** Whether the attempt was inside what the demonstrations cover. */
   inDistribution?: boolean;
 };
