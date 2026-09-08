@@ -6404,16 +6404,26 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
             "This rollout was not started with DAgger takeover, so there is no device to hold "
             "the arm with. Restart with takeover enabled."
         )
-    # Checked here as well as in the runtime, which drops a home request pressed mid-rollout.
-    # Two gates because they answer different questions: the runtime's keeps the arm from moving
-    # unattended, and this one gives the operator a reason on screen instead of a click that
-    # looks accepted and does nothing.
-    if command == "home" and state.rollout.state != "waiting":
+    # Checked here as well as in the runtime, which clears every pending request on its way into
+    # the gate. Two gates because they answer different questions: the runtime's keeps the arm
+    # from moving unattended, and this one gives the operator a reason on screen instead of a
+    # click that looks accepted and does nothing.
+    #
+    # Start is in this list for the same reason home is, and it was the one command left out of
+    # it: written into the pipe from any state at all, latched by the listener thread, and then
+    # cleared by `wait_for_command`. An operator who pressed Start and watched a still arm had
+    # no way to tell that from a dead button.
+    if command in ("start", "home") and state.rollout.state != "waiting":
         if state.rollout.state == "finishing":
             raise ValueError(_NOT_AT_THE_GATE)
+        if command == "home":
+            raise ValueError(
+                "Move to start only runs between rollouts, when the arm is parked. "
+                "Stop the current rollout first."
+            )
         raise ValueError(
-            "Move to start only runs between rollouts, when the arm is parked. "
-            "Stop the current rollout first."
+            f"Start only runs when the runtime is waiting for it (it is {state.rollout.state}). "
+            "Wait for the page to say it is waiting for Start, then press it again."
         )
     try:
         process.stdin.write(f"{command}\n".encode())
@@ -6421,10 +6431,22 @@ def _send_rollout_control(state: GatewayState, command: str) -> dict[str, Any]:
     except (BrokenPipeError, OSError) as exc:
         raise ValueError(f"Rollout is no longer accepting control commands: {exc}") from exc
     if command == "start":
+        # Named here rather than left to the runtime's own marker, which is printed at once but
+        # reaches this object through the log file (a 0.4s follower sleep) and the page through
+        # a 1s poll. The page installs the status this call returns, so leaving "waiting" in it
+        # re-arms every gate -- the one above included -- with a truth that has just expired:
+        # for that second and a half Start and Move to start stay lit for a runtime that has
+        # already left its gate, and a press landing there is latched and then cleared on the
+        # way in. Scene reset never had this hole because it has always named its state here.
+        # The runtime's marker overwrites this a moment later either way.
+        state.rollout.state = "rolling"
+        # The arm leaves the start pose when the policy takes it, not when we hear that it did.
+        state.rollout.armAtStart = False
         state.rollout.message = "Start sent."
     elif command == "stop":
         state.rollout.message = "Stop sent; ending the current rollout."
     elif command == "home":
+        state.rollout.state = "homing"
         state.rollout.message = "Move to start sent; the arm is heading for its start pose."
     elif command == "takeover":
         # A toggle, not a state this page owns: the runtime decides which way it went and says

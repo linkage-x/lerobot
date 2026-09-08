@@ -1371,8 +1371,12 @@ def test_start_and_stop_reach_the_running_rollout(tmp_path: Path):
 
     assert _wait_for(lambda: state.rollout.state == "waiting"), state.rollout.message
     gateway._send_rollout_control(state, "start")
-    assert _wait_for(lambda: state.rollout.state == "rolling"), state.rollout.message
-    assert state.rollout.rolloutIndex == 1
+    # Waited on the index rather than on the state: sending the command closes the gate here and
+    # now (a status that still said `waiting` is what let a second press be swallowed), so
+    # `rolling` no longer proves the runtime read the line. The index only ever comes from the
+    # runtime's own start marker.
+    assert _wait_for(lambda: state.rollout.rolloutIndex == 1), state.rollout.message
+    assert state.rollout.state == "rolling"
 
     gateway._send_rollout_control(state, "stop")
     assert _wait_for(lambda: state.rollout.pendingOutcomeFor == 1), state.rollout.message
@@ -2762,6 +2766,90 @@ def test_a_quit_is_not_reported_as_a_dropped_command(capsys):
 
     assert keyboard.wait_for_command(arm_at_start=True) == "quit"
     assert "interactive_command_dropped" not in capsys.readouterr().out
+
+
+def test_start_is_refused_while_the_last_rollout_is_still_being_written_out(tmp_path: Path):
+    """The same gap as the reset bug, on the button the operator presses most.
+
+    `start` was the one control word with no gate on it at all: written into the pipe from any
+    state, latched by the listener thread, and cleared by `wait_for_command` on the way in. An
+    operator pressing Start during the trace write and the DAgger encode -- which is where their
+    own loop puts them, grading the rollout that just ended -- watched a still arm and a page
+    that went back to "Waiting for Start" by itself.
+    """
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="rolling", interactive=True)
+    process = _StdinProcess()
+    state.rollout_process = process
+
+    gateway._apply_rollout_output(state, "[INFO] interactive_rollout_end index=7 status=max_steps")
+    assert state.rollout.state == "finishing"
+
+    with pytest.raises(ValueError, match="still being written out"):
+        gateway._send_rollout_control(state, "start")
+    assert process.lines() == []
+
+    gateway._apply_rollout_output(
+        state, "[INFO] interactive_waiting_for_start arm_at_start=0 press 's' to start."
+    )
+    assert gateway._send_rollout_control(state, "start")["ok"] is True
+    assert process.lines() == ["start"]
+
+
+def test_sending_start_closes_the_gate_it_walked_through(tmp_path: Path):
+    """The window that made this intermittent rather than constant.
+
+    The runtime prints `interactive_rollout_start` at once, but that marker reaches the page by
+    way of the log file (a 0.4s follower sleep) and a 1s poll -- and the page installs the status
+    *this call returns*. Leaving `waiting` in it re-armed the page's own guard with a truth that
+    had just expired, so for a second and a half after Start the button stayed lit, and a second
+    press went into the pipe to be dropped.
+    """
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="waiting", interactive=True, armAtStart=True)
+    process = _StdinProcess()
+    state.rollout_process = process
+
+    result = gateway._send_rollout_control(state, "start")
+
+    assert result["rollout"]["state"] == "rolling"
+    # The arm leaves the start pose when the policy takes it, not when the page hears that it did.
+    assert result["rollout"]["armAtStart"] is False
+    with pytest.raises(ValueError, match="waiting for it"):
+        gateway._send_rollout_control(state, "start")
+    assert process.lines() == ["start"]
+
+
+def test_move_to_start_and_then_start_does_not_lose_the_start(tmp_path: Path):
+    """Park the arm, then run it: the pairing an operator does without pausing in between.
+
+    Both commands used to be accepted while the status still said `waiting`, so the second one
+    was written into a runtime that was busy homing and cleared when it reached its gate. The
+    arm finished parking and stopped, the page said "Waiting for Start", and the Start that was
+    pressed had left no trace anywhere.
+    """
+    state = _rollout_state(tmp_path)
+    state.rollout = rollout_backend.RolloutStatus(state="waiting", interactive=True)
+    process = _StdinProcess()
+    state.rollout_process = process
+
+    gateway._send_rollout_control(state, "home")
+    assert state.rollout.state == "homing"
+
+    with pytest.raises(ValueError, match="waiting for it"):
+        gateway._send_rollout_control(state, "start")
+    assert process.lines() == ["home"]
+
+    # And it works the moment the runtime says it is back at the gate, which is the only thing
+    # that may say so.
+    gateway._apply_rollout_output(state, "[INFO] interactive_homing=done")
+    with pytest.raises(ValueError, match="waiting for it"):
+        gateway._send_rollout_control(state, "start")
+    gateway._apply_rollout_output(
+        state, "[INFO] interactive_waiting_for_start arm_at_start=1 press 's' to start."
+    )
+    assert gateway._send_rollout_control(state, "start")["ok"] is True
+    assert process.lines() == ["home", "start"]
 
 
 def test_a_table_point_is_labelled_with_where_the_arm_got_to_not_where_it_was_sent(
