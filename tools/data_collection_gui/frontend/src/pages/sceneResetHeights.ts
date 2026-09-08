@@ -21,11 +21,16 @@ export const TABLE_Z_M = 0.035;
 /** The height the peg is released from, in metres. Fixed, and not derived from the
  *  demonstrations -- the panel still shows what they measured, but the place height defaults
  *  to this value instead of being copied from a loaded dataset. */
-export const PLACE_Z_M = 0.055;
+export const PLACE_Z_M = 0.058;
 
 
-/** How far above the pick a place height may sit before it counts as a drop, in metres. */
-export const DROP_WARNING_M = 0.02;
+/** How far above the pick a place height may sit before it counts as a drop, in metres.
+ *
+ * Has to clear the gap the two defaults above sit apart (23 mm), or a fresh panel -- one with no
+ * measurement yet, so the pick falls back to the table -- opens on a warning about the rig's own
+ * setup, which is a banner nobody can act on. It stays far below the 50 cm the constant exists
+ * to catch, and far below any release height that would actually let the peg fall. */
+export const DROP_WARNING_M = 0.025;
 
 /** What to tell the operator when the place height is not the height the peg came from.
  *

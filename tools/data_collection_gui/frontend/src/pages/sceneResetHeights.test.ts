@@ -19,10 +19,10 @@ describe("PLACE_Z_M", () => {
     expect(PLACE_Z_M).toBeLessThan(0.1);
   });
 
-  it("is the 55 mm the rig is set up to release from", () => {
+  it("is the 58 mm the rig is set up to release from", () => {
     // Pinned rather than derived: the release height is a property of the peg and the fingers,
     // and the whole point of this constant is that nothing recalculates it per dataset.
-    expect(PLACE_Z_M).toBeCloseTo(0.055, 6);
+    expect(PLACE_Z_M).toBeCloseTo(0.058, 6);
   });
 
   it("does not, with the default pick, order a drop", () => {
