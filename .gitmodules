@@ -5,3 +5,6 @@
 [submodule "tools/thor/box_sdk"]
 	path = tools/thor/box_sdk
 	url = git@github.com:linkage-x/box-sdk.git
+[submodule "third_party/Track4World"]
+	path = third_party/Track4World
+	url = git@github.com:linkage-x/Track4World.git
