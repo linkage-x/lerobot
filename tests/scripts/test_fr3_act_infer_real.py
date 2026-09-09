@@ -2111,3 +2111,172 @@ def test_restoring_the_guard_gives_the_signal_back_to_whoever_had_it():
     guard.restore()
 
     assert signal.getsignal(signal.SIGTERM) is previous
+
+
+# ------------------------------------------------- choosing among sampled chunks ---
+#
+# The deployment defect the 09-08 offline probe found is that the policy's action distribution
+# below z = 0.20 is 52-55 deg wide while its *mean* direction is right, and the runtime executes
+# one draw from it. These tests pin the rule that turns N draws into one executed chunk -- and
+# in particular that it never rescales, because amplitude is the thing four DAgger generations
+# had just restored.
+
+
+def _chunk(steps, lateral_indices=(0, 1), dim=5):
+    """A chunk whose per-step XY is `steps` and whose other columns are recognisable."""
+    chunk = torch.zeros(len(steps), dim)
+    for i, (dx, dy) in enumerate(steps):
+        chunk[i, lateral_indices[0]] = dx
+        chunk[i, lateral_indices[1]] = dy
+        chunk[i, dim - 1] = float(i)
+    return chunk
+
+
+def test_the_executed_draw_comes_from_the_cluster_not_the_outlier():
+    """Three draws heading roughly +x, one heading -y: the outlier is what must not run.
+
+    Which cluster member wins is not asserted, because the outlier legitimately tilts the
+    reference direction it is measured against -- with these four the mean points at -18 deg, so
+    the slightly -y cluster member is genuinely the nearest. That is a property of a circular
+    mean over draws, not a defect: the alternative, a reference immune to the draws it
+    summarises, would be no longer be the distribution's own centre.
+    """
+    chunks = torch.stack([
+        _chunk([(1.0, 0.1)] * 4),
+        _chunk([(1.0, -0.1)] * 4),
+        _chunk([(1.0, 0.0)] * 4),
+        _chunk([(0.0, -1.0)] * 4),
+    ])
+
+    chosen = fr3_act_infer_real_runtime.select_action_chunk_medoid(
+        chunks, lateral_indices=(0, 1), horizon=4
+    )
+
+    assert chosen in (0, 1, 2)
+
+
+def test_a_lone_dissenter_is_dropped_however_far_it_dissents():
+    """The 52 deg width is the target, so one wild draw in eight must not reach the arm."""
+    chunks = torch.stack([_chunk([(1.0, 0.0)] * 4)] * 7 + [_chunk([(-1.0, 0.0)] * 4)])
+
+    assert fr3_act_infer_real_runtime.select_action_chunk_medoid(
+        chunks, lateral_indices=(0, 1), horizon=4
+    ) != 7
+
+
+def test_selection_keeps_a_real_draw_rather_than_a_shortened_average():
+    """The whole point of a medoid here: the executed vector keeps a draw's own magnitude.
+
+    Averaging these four would give 0.5 of the length the draws have, which is the failure the
+    5th-round probe measured (mean vector at 80-91% of a single draw) against a policy already
+    moving at 43% of the operator's amplitude.
+    """
+    chunks = torch.stack([
+        _chunk([(1.0, 1.0)] * 4),
+        _chunk([(1.0, -1.0)] * 4),
+        _chunk([(1.0, 1.0)] * 4),
+        _chunk([(1.0, -1.0)] * 4),
+    ])
+
+    chosen = fr3_act_infer_real_runtime.select_action_chunk_medoid(
+        chunks, lateral_indices=(0, 1), horizon=4
+    )
+    executed = fr3_act_infer_real_runtime.action_chunk_lateral_displacements(
+        chunks, lateral_indices=(0, 1), horizon=4
+    )[chosen]
+    averaged = fr3_act_infer_real_runtime.action_chunk_lateral_displacements(
+        chunks, lateral_indices=(0, 1), horizon=4
+    ).mean(dim=0)
+
+    assert float(torch.linalg.vector_norm(executed)) == pytest.approx(4.0 * 2.0**0.5)
+    assert float(torch.linalg.vector_norm(averaged)) == pytest.approx(4.0)
+
+
+def test_only_the_steps_that_will_run_before_the_next_replan_are_compared():
+    """A draw that agrees for the execution horizon and diverges after it agrees about nothing.
+
+    Both draws go +x for the first four steps; one then turns hard. Comparing whole chunks would
+    call them different, but the tail is replanned before it is ever sent.
+    """
+    chunks = torch.stack([
+        _chunk([(1.0, 0.0)] * 4 + [(0.0, 5.0)] * 4),
+        _chunk([(1.0, 0.0)] * 4 + [(0.0, -5.0)] * 4),
+        _chunk([(-1.0, 0.0)] * 8),
+    ])
+
+    over_horizon = fr3_act_infer_real_runtime.action_chunk_lateral_displacements(
+        chunks, lateral_indices=(0, 1), horizon=4
+    )
+
+    assert over_horizon[0].tolist() == over_horizon[1].tolist()
+    assert fr3_act_infer_real_runtime.select_action_chunk_medoid(
+        chunks, lateral_indices=(0, 1), horizon=4
+    ) in (0, 1)
+
+
+def test_a_horizon_longer_than_the_chunk_uses_the_chunk():
+    chunks = torch.stack([_chunk([(1.0, 0.0)] * 3), _chunk([(1.0, 0.1)] * 3)])
+
+    displacement = fr3_act_infer_real_runtime.action_chunk_lateral_displacements(
+        chunks, lateral_indices=(0, 1), horizon=50
+    )
+
+    assert displacement.shape == (2, 2)
+    assert displacement[0].tolist() == pytest.approx([3.0, 0.0])
+
+
+def test_draws_that_all_stand_still_fall_back_to_the_first_rather_than_chasing_noise():
+    """At the top of a descent every draw is legitimately near-zero.
+
+    Selecting by the angle between two numerical noise vectors is worse than not selecting, so
+    the rule declines rather than inventing a direction.
+    """
+    chunks = torch.stack([
+        _chunk([(0.0, 0.0)] * 4),
+        _chunk([(1e-9, -1e-9)] * 4),
+        _chunk([(-1e-9, 1e-9)] * 4),
+    ])
+
+    assert fr3_act_infer_real_runtime.select_action_chunk_medoid(
+        chunks, lateral_indices=(0, 1), horizon=4
+    ) == 0
+
+
+def test_exactly_opposed_draws_fall_back_rather_than_picking_by_rounding():
+    chunks = torch.stack([_chunk([(1.0, 0.0)] * 4), _chunk([(-1.0, 0.0)] * 4)])
+
+    assert fr3_act_infer_real_runtime.select_action_chunk_medoid(
+        chunks, lateral_indices=(0, 1), horizon=4
+    ) == 0
+
+
+def test_the_lateral_and_gripper_columns_are_read_off_the_action_contract():
+    lateral, gripper = fr3_act_infer_real_runtime.resolve_sampling_action_indices(
+        ['delta_ee_from_prev_cmd.dx', 'delta_ee_from_prev_cmd.dy', 'delta_ee_from_prev_cmd.dz',
+         'delta_ee_from_prev_cmd.drz', 'gripper.pos']
+    )
+
+    assert lateral == (0, 1)
+    assert gripper == 4
+
+
+def test_an_absolute_action_contract_offers_no_lateral_columns_to_select_on():
+    """Selection is defined on displacements. An absolute-pose contract has none, and saying so
+    here is what lets the runtime refuse --action-samples before it touches the arm."""
+    lateral, gripper = fr3_act_infer_real_runtime.resolve_sampling_action_indices(
+        ['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw', 'gripper']
+    )
+
+    assert lateral is None
+    assert gripper == 7
+
+
+def test_a_single_sample_needs_no_lateral_columns():
+    """The default path must stay usable on any action contract, selection or not."""
+    parsed = fr3_act_infer_real_runtime.parse_args([
+        '--checkpoint', '/tmp/ckpt', '--camera-config', '/tmp/cams.yaml',
+    ])
+
+    assert parsed.action_samples == 1
+    assert parsed.action_aggregate == 'medoid'
+    assert parsed.action_sample_horizon == 0

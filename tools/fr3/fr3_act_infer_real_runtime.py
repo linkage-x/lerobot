@@ -370,6 +370,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--no-rtc', dest='rtc_mode', action='store_const', const='disabled', help='Disable RTC.')
     parser.add_argument('--rtc-auto', dest='rtc_mode', action='store_const', const='auto', help='Auto-enable RTC for supported policies.')
     parser.add_argument(
+        '--action-samples',
+        type=int,
+        default=1,
+        help=(
+            'Draw N action chunks per inference in one batched forward and execute one of them '
+            '(default 1 = the single draw deployment has always used). Aimed at the 52-55 deg '
+            'conditional width measured offline: the mean direction is right, one draw is not.'
+        ),
+    )
+    parser.add_argument(
+        '--action-aggregate',
+        choices=('medoid', 'mean'),
+        default='medoid',
+        help=(
+            'How to turn N draws into the chunk that is executed. medoid executes the real draw '
+            'nearest the draws mean direction, keeping its magnitude; mean averages them, which '
+            'measurably shortens the vector and is here only so that claim can be A/B tested.'
+        ),
+    )
+    parser.add_argument(
+        '--action-sample-horizon',
+        type=int,
+        default=0,
+        help=(
+            'Steps of each draw compared when selecting among them. 0 (default) uses the RTC '
+            'execution horizon, i.e. the steps that will actually run before the next replan.'
+        ),
+    )
+    parser.add_argument(
         '--rtc-execution-horizon',
         type=int,
         default=_DEFAULT_RTC_EXECUTION_HORIZON,
@@ -3025,6 +3054,22 @@ def convert_base_command_from_I_to_E(base_robot_command_i: dict[str, float]) -> 
     return dict(base_robot_command_i)
 
 
+def resolve_sampling_action_indices(action_names: list[str]) -> tuple[tuple[int, int] | None, int | None]:
+    """Which action columns multi-draw selection reads: the two lateral deltas, and the gripper.
+
+    Read off the dataset's own feature names for the same reason the delta reference is: a
+    hard-coded pair of column numbers would keep working, silently selecting on the wrong axis,
+    if a view were ever exported with a different action layout.
+    """
+    lateral: tuple[int, int] | None = None
+    dx = next((i for i, name in enumerate(action_names) if name.endswith('.dx')), None)
+    dy = next((i for i, name in enumerate(action_names) if name.endswith('.dy')), None)
+    if dx is not None and dy is not None:
+        lateral = (dx, dy)
+    gripper = next((i for i, name in enumerate(action_names) if name.startswith('gripper')), None)
+    return lateral, gripper
+
+
 def build_delta_action_reconstructor(action_names: list[str]) -> DeltaEEToAbsoluteEEAction | None:
     """One stateful reconstructor for a delta-action checkpoint, or None for absolute EE.
 
@@ -4025,6 +4070,82 @@ def resolve_rollout_task_prompt(ds_meta: LeRobotDatasetMetadata, explicit_task_p
         )
     return None
 
+def action_chunk_lateral_displacements(
+    chunks: torch.Tensor, *, lateral_indices: tuple[int, int], horizon: int
+) -> torch.Tensor:
+    """Each draw's net XY displacement over the steps that will actually be executed.
+
+    Measured over the execution horizon rather than the whole chunk because the tail of a chunk
+    is replanned before it is ever sent, so a draw that disagrees only after step ten disagrees
+    about nothing.
+    """
+    steps = max(1, min(int(horizon), int(chunks.shape[1])))
+    return torch.stack(
+        (
+            chunks[:, :steps, lateral_indices[0]].sum(dim=1),
+            chunks[:, :steps, lateral_indices[1]].sum(dim=1),
+        ),
+        dim=1,
+    )
+
+
+def select_action_chunk_medoid(
+    chunks: torch.Tensor,
+    *,
+    lateral_indices: tuple[int, int],
+    horizon: int,
+    min_lateral_m: float = 1e-5,
+) -> int:
+    """Which of N sampled chunks to execute: the real draw nearest the draws' mean direction.
+
+    Averaging the draws is the obvious aggregation and it is the wrong one here. What four DAgger
+    generations restored is *amplitude* -- the lateral path inside z in [0.08,0.12) went from
+    8.0 mm back to the demonstrations' 37.4 mm -- and a mean over draws that disagree in
+    direction is shorter than any of them: the 09-08 probe measured the mean vector at 80-91% of
+    a single draw, against a policy whose amplitude was already 43% of the operator's. Spending
+    the only thing that improved in order to reduce variance is a bad trade.
+
+    A medoid keeps one real draw, so the magnitude and the within-chunk timing are the model's
+    own and only the directional outliers are dropped. The 52-55 deg conditional width measured
+    offline is what this is aimed at, and it is aimed at it without touching the scale.
+
+    Returns an index into `chunks`. Falls back to draw 0 when fewer than two draws have a lateral
+    displacement worth calling a direction: at the top of a descent every draw is legitimately
+    near-zero, and choosing by the angle of numerical noise would be worse than not choosing.
+    """
+    vectors = action_chunk_lateral_displacements(chunks, lateral_indices=lateral_indices, horizon=horizon)
+    magnitudes = torch.linalg.vector_norm(vectors.to(torch.float32), dim=1)
+    usable = torch.nonzero(magnitudes >= float(min_lateral_m), as_tuple=False).flatten()
+    if int(usable.numel()) < 2:
+        return 0
+    units = vectors[usable].to(torch.float32) / magnitudes[usable].unsqueeze(1)
+    mean_direction = units.mean(dim=0)
+    resultant = float(torch.linalg.vector_norm(mean_direction))
+    if resultant < 1e-9:
+        # Every draw cancelled every other one. There is no direction to be near.
+        return 0
+    return int(usable[int(torch.argmax(units @ (mean_direction / resultant)))])
+
+
+def _expand_observation_batch(observation: dict[str, Any], samples: int) -> dict[str, Any]:
+    """Repeat a batch-of-one observation into `samples` rows, one per independent draw.
+
+    pi05 samples its flow-matching noise per batch element (`bsize = tokens.shape[0]`), so N
+    identical rows come back as N independent draws from one forward pass. That is the whole
+    reason this is affordable on the rig: batch 1 leaves the GPU mostly idle, and the marginal
+    cost of the extra rows is far below N times anything.
+    """
+    expanded: dict[str, Any] = {}
+    for key, value in observation.items():
+        if torch.is_tensor(value) and value.dim() >= 1 and value.shape[0] == 1:
+            expanded[key] = value.expand(samples, *value.shape[1:])
+        elif isinstance(value, list) and len(value) == 1:
+            expanded[key] = value * samples
+        else:
+            expanded[key] = value
+    return expanded
+
+
 def predict_action_chunk_for_rollout(
     observation: dict[str, np.ndarray],
     *,
@@ -4038,14 +4159,26 @@ def predict_action_chunk_for_rollout(
     execution_horizon: int,
     task: str | None = None,
     robot_type: str | None = None,
+    action_samples: int = 1,
+    action_aggregate: str = 'medoid',
+    lateral_action_indices: tuple[int, int] | None = None,
+    gripper_action_index: int | None = None,
+    action_sample_horizon: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Predict one action chunk for a queue-driven rollout.
 
     The returned first tensor is still in policy/raw action space, because RTC uses it as the
     previous-chunk prefix on the next inference. The second tensor is already postprocessed into
     the dataset action contract and can be decoded one step at a time against the live robot state.
+
+    With ``action_samples > 1`` the observation is drawn N times in one batched forward and one
+    chunk is chosen -- see `select_action_chunk_medoid`. Both tensors then describe the *same*
+    choice, so RTC's prefix on the next inference is the chunk the arm actually executed.
     """
     observation = dict(observation)
+    samples = max(1, int(action_samples))
+    if samples > 1 and lateral_action_indices is None:
+        raise ValueError('action_samples > 1 needs lateral_action_indices to choose among the draws.')
     with (
         torch.no_grad(),
         torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
@@ -4057,14 +4190,40 @@ def predict_action_chunk_for_rollout(
             robot_type=robot_type,
         )
         preprocessed_observation = preprocessor(prepared_observation)
+        if samples > 1:
+            preprocessed_observation = _expand_observation_batch(preprocessed_observation, samples)
+            if prev_chunk_left_over is not None and prev_chunk_left_over.dim() == 2:
+                # Every draw is guided by the same prefix. Expanded here rather than left to
+                # RTC's own broadcast so the shapes it asserts on stay exact.
+                prev_chunk_left_over = prev_chunk_left_over.unsqueeze(0).expand(samples, -1, -1)
         actions = policy.predict_action_chunk(
             preprocessed_observation,
             inference_delay=int(inference_delay),
             prev_chunk_left_over=prev_chunk_left_over,
             execution_horizon=int(execution_horizon),
         )
-        original_actions = actions.squeeze(0).detach().clone()
-        processed_actions = postprocessor(actions).squeeze(0).detach().cpu().clone()
+        processed = postprocessor(actions)
+        if samples == 1:
+            original_actions = actions.squeeze(0).detach().clone()
+            processed_actions = processed.squeeze(0).detach().cpu().clone()
+        else:
+            horizon = int(action_sample_horizon) or int(execution_horizon)
+            chosen = select_action_chunk_medoid(
+                processed, lateral_indices=lateral_action_indices, horizon=horizon
+            )
+            original_actions = actions[chosen].detach().clone()
+            processed_actions = processed[chosen].detach().cpu().clone()
+            if action_aggregate == 'mean':
+                # Kept for the A/B the medoid claim needs, not because it is the recommendation:
+                # this is the aggregation the probe measured shortening the vector by 9-20%.
+                # The gripper column never joins the average -- it is a z-triggered switch, and
+                # a mean over draws that disagree about it commands a half-open hand.
+                original_actions = actions.mean(dim=0).detach().clone()
+                averaged = processed.mean(dim=0)
+                if gripper_action_index is not None:
+                    original_actions[:, gripper_action_index] = actions[chosen][:, gripper_action_index]
+                    averaged[:, gripper_action_index] = processed[chosen][:, gripper_action_index]
+                processed_actions = averaged.detach().cpu().clone()
     return original_actions, processed_actions
 
 
@@ -4403,6 +4562,25 @@ def run_inference(args: argparse.Namespace) -> int:
     # a single instance for the whole run.
     delta_reference = delta_reference_from_action_names(action_names)
     delta_reconstructor = build_delta_action_reconstructor(action_names)
+    lateral_action_indices, gripper_action_index = resolve_sampling_action_indices(action_names)
+    action_samples = max(1, int(args.action_samples))
+    if action_samples > 1:
+        if lateral_action_indices is None:
+            raise SystemExit(
+                f'--action-samples {action_samples} needs lateral delta columns to select among the '
+                f'draws, and this action contract has none: {action_names}. Run with '
+                '--action-samples 1, or point at a delta-EE view.'
+            )
+        print(
+            '[INFO] action_samples=%d aggregate=%s selection_horizon=%s lateral=%s gripper=%s'
+            % (
+                action_samples,
+                args.action_aggregate,
+                int(args.action_sample_horizon) or int(args.rtc_execution_horizon),
+                [action_names[i] for i in lateral_action_indices],
+                None if gripper_action_index is None else action_names[gripper_action_index],
+            )
+        )
     robot_init_state = parse_robot_init_state(args.robot_init_state)
     mujoco_model_path = resolve_mujoco_model_path(args.gripper_backend, args.mujoco_model)
     robot_urdf_path, target_frame_name = resolve_robot_tool_model(
@@ -4998,6 +5176,11 @@ def run_inference(args: argparse.Namespace) -> int:
                             execution_horizon=int(args.rtc_execution_horizon),
                             task=task_prompt,
                             robot_type=robot.name,
+                            action_samples=action_samples,
+                            action_aggregate=str(args.action_aggregate),
+                            lateral_action_indices=lateral_action_indices,
+                            gripper_action_index=gripper_action_index,
+                            action_sample_horizon=int(args.action_sample_horizon),
                         )
                         chunk_latency_s = time.perf_counter() - chunk_start_t
                         latency_tracker.add(chunk_latency_s)
@@ -5050,6 +5233,11 @@ def run_inference(args: argparse.Namespace) -> int:
                                 'execution_horizon': int(args.rtc_execution_horizon),
                                 'task': task_prompt,
                                 'robot_type': robot.name,
+                                'action_samples': action_samples,
+                                'action_aggregate': str(args.action_aggregate),
+                                'lateral_action_indices': lateral_action_indices,
+                                'gripper_action_index': gripper_action_index,
+                                'action_sample_horizon': int(args.action_sample_horizon),
                             },
                             action_index_before_inference=action_queue.get_action_index(),
                             guidance_delay_steps=guidance_delay_steps,
