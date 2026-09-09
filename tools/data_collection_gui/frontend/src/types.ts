@@ -203,6 +203,11 @@ export type ReplayStatus = {
   realEndEffectorMode?: RealEndEffectorMode;
   mujocoOverrideAccepted?: boolean;
   realReplayLog?: string[];
+  p0NativeState?: "idle" | "running" | "complete" | "failed" | "aborted";
+  p0NativeEpisode?: 0 | 1;
+  p0NativeGripperWidthMm?: number;
+  p0NativeMode?: "" | "check" | "execute";
+  p0NativeLog?: string[];
   // Bumped when the dataset content changes under an unchanged (root, episode)
   // selection (e.g. after deleting an episode); the inspector refetches on it.
   revision?: number;

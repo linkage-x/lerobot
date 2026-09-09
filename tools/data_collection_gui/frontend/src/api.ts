@@ -444,6 +444,23 @@ export class DataCollectionGuiApi {
     throw new Error("Gateway unavailable; real-robot replay cannot start.");
   }
 
+  async startP0NativeReplay(
+    episode: 0 | 1,
+    gripperWidthMm: number,
+    execute: boolean,
+    confirmation = ""
+  ): Promise<GuiSnapshot> {
+    const params = new URLSearchParams({
+      episode: String(episode),
+      gripper_width_mm: String(gripperWidthMm)
+    });
+    if (execute) params.set("confirmation", confirmation);
+    const endpoint = execute ? "p0-native-execute" : "p0-native-check";
+    const remote = await this.postRemoteSnapshot(`/api/replay/${endpoint}?${params.toString()}`);
+    if (remote) return remote;
+    throw new Error("Gateway unavailable; P0 native arm replay cannot start.");
+  }
+
   async fetchMujocoPreview(
     datasetPath: string,
     episode: number,

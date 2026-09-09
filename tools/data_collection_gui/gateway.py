@@ -169,6 +169,11 @@ class ReplayStatus:
     realEndEffectorMode: str = "corenetic_gripper_ee"
     mujocoOverrideAccepted: bool = False
     realReplayLog: list[str] = field(default_factory=list)
+    p0NativeState: str = "idle"
+    p0NativeEpisode: int = 0
+    p0NativeGripperWidthMm: float = 88.0
+    p0NativeMode: str = ""
+    p0NativeLog: list[str] = field(default_factory=list)
     # Bumped whenever the on-disk dataset content changes under a stable
     # (datasetRoot, episode) selection — e.g. deleting an episode keeps the
     # selection on the same slot but swaps in different frames/videos. The UI
@@ -9204,7 +9209,13 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
     replay_process = state.replay_process
     if replay_process is not None and replay_process.poll() is not None:
         replay_kind = state.replay_process_kind or "mujoco"
-        label = "MuJoCo replay" if replay_kind == "mujoco" else "Real robot replay"
+        label = (
+            "MuJoCo replay"
+            if replay_kind == "mujoco"
+            else "P0 native arm replay"
+            if replay_kind.startswith("p0_native_")
+            else "Real robot replay"
+        )
         state.log("info" if replay_process.returncode == 0 else "warn", f"{label} exited with code {replay_process.returncode}")
         state.replay_process = None
         state.replay_process_kind = ""
@@ -9212,6 +9223,16 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         state.replay.pid = None
         if replay_kind == "mujoco":
             _finish_mujoco_validation(state, replay_process.returncode)
+        elif replay_kind.startswith("p0_native_"):
+            _append_p0_native_log(
+                state,
+                "complete" if replay_process.returncode == 0 else "error",
+                f"{state.replay.p0NativeMode or 'run'} exited with code {replay_process.returncode}",
+            )
+            state.replay.p0NativeState = "complete" if replay_process.returncode == 0 else "failed"
+            state.replay.safety = "locked"
+            state.replay.state = "complete" if replay_process.returncode == 0 else "aborted"
+            state.replay.message = f"{label} exited with code {replay_process.returncode}"
         else:
             _stop_realsense_preview(state)
             _append_real_replay_log(
@@ -10302,6 +10323,9 @@ def _read_replay_process_output(state: GatewayState, process: subprocess.Popen[s
             if state.replay_process_kind == "mujoco":
                 _apply_mujoco_replay_output(state, output)
                 state.log("info", f"mujoco replay: {output}")
+            elif state.replay_process_kind.startswith("p0_native_"):
+                _append_p0_native_log(state, "output", output)
+                state.log("info", f"p0 native replay: {output}")
             else:
                 _append_real_replay_log(state, "replay", output)
                 state.log("info", f"real replay: {output}")
@@ -11200,6 +11224,106 @@ def _append_real_replay_log(state: GatewayState, stage: str, message: str) -> No
     del state.replay.realReplayLog[:-120]
 
 
+P0_NATIVE_REPLAY_SCRIPT = Path(
+    "/home/nvidia/box_api/replay_p0_native_arm_only_20260908/run_native_arm.sh"
+)
+P0_NATIVE_MAX_GRIPPER_WIDTH_MM = 89.05
+
+
+def _append_p0_native_log(state: GatewayState, stage: str, message: str) -> None:
+    line = f"{time.strftime('%H:%M:%S')} [{stage}] {message}"
+    state.replay.p0NativeLog.append(line)
+    del state.replay.p0NativeLog[:-120]
+
+
+def _p0_native_replay_command(episode: int, gripper_width_mm: float, *, execute: bool) -> list[str]:
+    """Build the fixed P0 handoff command without accepting paths or extra arguments."""
+    if isinstance(episode, bool) or int(episode) not in (0, 1):
+        raise ValueError("P0 native replay episode must be 0 or 1")
+    width = float(gripper_width_mm)
+    if not math.isfinite(width) or not 0.0 <= width <= P0_NATIVE_MAX_GRIPPER_WIDTH_MM:
+        raise ValueError(
+            f"P0 native replay gripper width must be between 0 and {P0_NATIVE_MAX_GRIPPER_WIDTH_MM:.2f} mm"
+        )
+    command = [
+        "bash",
+        str(P0_NATIVE_REPLAY_SCRIPT),
+        str(int(episode)),
+        "--gripper-width-mm",
+        f"{width:.6g}",
+    ]
+    if execute:
+        command = ["sudo", "-n", *command]
+        command.append("--execute")
+    return command
+
+
+def _start_p0_native_replay(
+    state: GatewayState,
+    episode_raw: str,
+    gripper_width_raw: str,
+    *,
+    execute: bool,
+    confirmation: str = "",
+) -> None:
+    if state.profile != "thor":
+        raise RuntimeError("P0 native arm replay is only available on the Thor deployment")
+    if state.process is not None and state.process.poll() is None:
+        raise RuntimeError("Stop the active recorder before starting P0 native arm replay")
+    if state.replay_process is not None and state.replay_process.poll() is None:
+        raise RuntimeError("Another replay process is already running")
+    try:
+        episode = int(str(episode_raw).strip())
+    except ValueError as exc:
+        raise ValueError("P0 native replay episode must be 0 or 1") from exc
+    try:
+        gripper_width_mm = float(str(gripper_width_raw).strip())
+    except ValueError as exc:
+        raise ValueError("P0 native replay gripper width must be a number") from exc
+    if execute and confirmation != "YES":
+        raise RuntimeError("P0 native hardware replay requires the exact confirmation YES")
+    if not P0_NATIVE_REPLAY_SCRIPT.is_file():
+        raise RuntimeError(f"P0 native replay package is missing: {P0_NATIVE_REPLAY_SCRIPT}")
+
+    command = _p0_native_replay_command(episode, gripper_width_mm, execute=execute)
+    mode = "execute" if execute else "check"
+    state.replay.p0NativeLog = []
+    _append_p0_native_log(
+        state,
+        "request",
+        f"mode={mode} episode={episode} gripper_width_mm={gripper_width_mm:g}; gripper control is disabled",
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=P0_NATIVE_REPLAY_SCRIPT.parent,
+        stdin=subprocess.PIPE if execute else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    if execute and process.stdin is not None:
+        process.stdin.write("YES\n")
+        process.stdin.flush()
+        process.stdin.close()
+    state.replay_process = process
+    state.replay_process_kind = f"p0_native_{mode}"
+    state.replay_started_at_s = time.monotonic()
+    state.replay.pid = process.pid
+    state.replay.state = "replaying" if execute else "preflight"
+    state.replay.safety = "active" if execute else "locked"
+    state.replay.p0NativeState = "running"
+    state.replay.p0NativeEpisode = episode
+    state.replay.p0NativeGripperWidthMm = gripper_width_mm
+    state.replay.p0NativeMode = mode
+    state.replay.message = f"P0 native arm {mode} started for episode {episode}"
+    state.log(
+        "warn" if execute else "info",
+        f"Started P0 native arm {mode} pid={process.pid} episode={episode} width_mm={gripper_width_mm:g}",
+    )
+    _start_replay_output_reader(state, process)
+
+
 def _real_preflight_env(state: GatewayState) -> dict[str, str]:
     env = _tool_env(state.repo_root)
     python_path = _mujoco_replay_python(state)
@@ -11677,6 +11801,9 @@ def _abort_replay(state: GatewayState) -> None:
     if replay_kind == "real":
         _stop_realsense_preview(state)
         _append_real_replay_log(state, "abort", "operator stopped real replay")
+    if replay_kind.startswith("p0_native_"):
+        state.replay.p0NativeState = "aborted"
+        _append_p0_native_log(state, "abort", "operator stopped P0 native arm replay")
     if replay_kind == "mujoco" and state.replay.mujocoValidation:
         state.replay.mujocoValidation["status"] = "failed"
         state.replay.mujocoValidation["message"] = "MuJoCo validation aborted before completion"
@@ -12213,6 +12340,25 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     )
                     _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
                     return
+                if path == "/api/replay/p0-native-check":
+                    _start_p0_native_replay(
+                        self.server.state,
+                        query.get("episode", [""])[0],
+                        query.get("gripper_width_mm", [""])[0],
+                        execute=False,
+                    )
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
+                if path == "/api/replay/p0-native-execute":
+                    _start_p0_native_replay(
+                        self.server.state,
+                        query.get("episode", [""])[0],
+                        query.get("gripper_width_mm", [""])[0],
+                        execute=True,
+                        confirmation=query.get("confirmation", [""])[0],
+                    )
+                    _json_response(self, HTTPStatus.OK, _snapshot(self.server.state))
+                    return
                 if path == "/api/teleop/start-sim":
                     if self.server.state.profile != "workstation":
                         _json_response(
@@ -12465,6 +12611,9 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             if path == "/api/replay/start-real":
                 _append_real_replay_log(self.server.state, "error", str(exc))
+            elif path in ("/api/replay/p0-native-check", "/api/replay/p0-native-execute"):
+                self.server.state.replay.p0NativeState = "failed"
+                _append_p0_native_log(self.server.state, "error", str(exc))
             self.server.state.log("warn", f"{path} failed: {exc}")
             _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return

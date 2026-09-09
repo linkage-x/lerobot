@@ -282,6 +282,9 @@ function App() {
         onRealReplay={(mode, robotIp, endEffectorMode, overrideMujocoFailure) =>
           run(() => api.startRealCubeReplay(mode, robotIp, endEffectorMode, overrideMujocoFailure))
         }
+        onP0NativeReplay={(episode, gripperWidthMm, execute, confirmation) =>
+          run(() => api.startP0NativeReplay(episode, gripperWidthMm, execute, confirmation))
+        }
         onAbort={() => run(() => api.abortReplay())}
         onSelectDataset={(path) => run(() => api.selectRecordedDataset(path))}
         onSelectEpisode={(episode) => run(() => api.selectReplayEpisode(episode))}

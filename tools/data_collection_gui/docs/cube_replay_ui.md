@@ -65,6 +65,35 @@ as a verified robot command stream.
 Use `Abort` to terminate the replay process group. Treat Abort as a software
 control, not as a replacement for the robot's physical emergency stop.
 
+## Frozen P0 native arm replay
+
+The Thor Episode Replay page also exposes a separate **P0 Native Arm Replay**
+panel for the 2026-09-08 handoff package. This is deliberately independent of
+the dataset/cube replay above: it does not rebuild IK and cannot accept a
+script path or arbitrary command-line arguments.
+
+The two backend endpoints are:
+
+```text
+POST /api/replay/p0-native-check?episode=0&gripper_width_mm=88
+POST /api/replay/p0-native-execute?episode=0&gripper_width_mm=88&confirmation=YES
+```
+
+Only episodes 0 and 1 and widths from 0 through 89.05 mm are accepted. The
+execute endpoint launches exactly:
+
+```text
+sudo -n bash /home/nvidia/box_api/replay_p0_native_arm_only_20260908/run_native_arm.sh \
+  <0-or-1> --gripper-width-mm <width> --execute
+```
+
+The browser requires the operator to type `YES`; the gateway checks the same
+token and supplies it to the frozen script's own confirmation prompt. The
+gateway must run on Thor and the package must already exist at the fixed path.
+The width declares the physical opening for model/safety checks; this arm-only
+entry point does not command the Corenetic gripper. `Abort` terminates the
+spawned process group but is not a substitute for the physical emergency stop.
+
 ## Testing without robot motion
 
 With a real dataset available, validate in this order:

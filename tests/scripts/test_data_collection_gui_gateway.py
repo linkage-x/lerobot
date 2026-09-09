@@ -2069,6 +2069,59 @@ def test_real_replay_rejects_two_cube_mode(tmp_path):
         gateway._start_real_replay(state, "both", "192.168.1.99")
 
 
+def test_p0_native_replay_command_is_fixed_and_validated():
+    assert gateway._p0_native_replay_command(0, 88.0, execute=False) == [
+        "bash",
+        "/home/nvidia/box_api/replay_p0_native_arm_only_20260908/run_native_arm.sh",
+        "0",
+        "--gripper-width-mm",
+        "88",
+    ]
+    assert gateway._p0_native_replay_command(1, 12.5, execute=True) == [
+        "sudo",
+        "-n",
+        "bash",
+        "/home/nvidia/box_api/replay_p0_native_arm_only_20260908/run_native_arm.sh",
+        "1",
+        "--gripper-width-mm",
+        "12.5",
+        "--execute",
+    ]
+    with pytest.raises(ValueError, match="episode must be 0 or 1"):
+        gateway._p0_native_replay_command(2, 88.0, execute=True)
+    with pytest.raises(ValueError, match="between 0 and 89.05"):
+        gateway._p0_native_replay_command(0, 89.06, execute=True)
+    with pytest.raises(ValueError, match="between 0 and 89.05"):
+        gateway._p0_native_replay_command(0, float("nan"), execute=True)
+
+
+def test_p0_native_execute_requires_exact_confirmation(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+        profile="thor",
+    )
+    with pytest.raises(RuntimeError, match="exact confirmation YES"):
+        gateway._start_p0_native_replay(state, "0", "88", execute=True, confirmation="yes")
+
+
+def test_p0_native_replay_is_thor_only(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+        profile="workstation",
+    )
+
+    with pytest.raises(RuntimeError, match="only available on the Thor"):
+        gateway._start_p0_native_replay(state, "0", "88", execute=False)
+
+
 def test_real_preflight_failure_is_preserved_in_panel_log(monkeypatch, tmp_path):
     state = gateway.GatewayState(
         repo_root=tmp_path,

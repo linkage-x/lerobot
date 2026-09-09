@@ -333,6 +333,107 @@ export function RealRobotReplayPanel({
   );
 }
 
+export function P0NativeArmReplayPanel({
+  status,
+  busy,
+  onStart,
+  onAbort
+}: {
+  status: ReplayStatus;
+  busy: boolean;
+  onStart: (episode: 0 | 1, gripperWidthMm: number, execute: boolean, confirmation: string) => void;
+  onAbort: () => void;
+}) {
+  const [episode, setEpisode] = useState<0 | 1>(status.p0NativeEpisode ?? 0);
+  const [widthText, setWidthText] = useState(String(status.p0NativeGripperWidthMm ?? 88));
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [confirmation, setConfirmation] = useState("");
+  const width = Number(widthText);
+  const widthValid = Number.isFinite(width) && width >= 0 && width <= 89.05;
+  const active = status.p0NativeState === "running";
+  const startExecute = () => {
+    onStart(episode, width, true, confirmation);
+    setConfirmOpen(false);
+    setConfirmation("");
+  };
+
+  return (
+    <section className="panel real-robot-panel">
+      <div className="panel-heading">
+        <h2>P0 Native Arm Replay</h2>
+        <span>Frozen 2026-09-08 package · arm only</span>
+      </div>
+      <div className="real-robot-settings">
+        <div className="teleop-config-grid">
+          <label>
+            <span>Episode</span>
+            <select value={episode} onChange={(event) => setEpisode(Number(event.target.value) as 0 | 1)}>
+              <option value={0}>Episode 0 · 571 frames</option>
+              <option value={1}>Episode 1 · 420 frames</option>
+            </select>
+          </label>
+          <label>
+            <span>Fixed gripper opening (mm)</span>
+            <input
+              inputMode="decimal"
+              min="0"
+              max="89.05"
+              step="0.1"
+              type="number"
+              value={widthText}
+              onChange={(event) => setWidthText(event.target.value)}
+            />
+          </label>
+        </div>
+        <div className="control-row">
+          <button disabled={busy || active || !widthValid} onClick={() => onStart(episode, width, false, "")} type="button">
+            Run offline check
+          </button>
+          <button className="danger" disabled={busy || active || !widthValid} onClick={() => setConfirmOpen(true)} type="button">
+            Execute P0 on FR3
+          </button>
+          <button disabled={busy || !active} onClick={onAbort} type="button">Abort</button>
+        </div>
+        <p className="panel-note">
+          Runs only the fixed Thor package. The gripper is not commanded; the width is a declared physical opening used by safety checks. Abort is not an emergency stop.
+        </p>
+      </div>
+      <div className="real-replay-log-block">
+        <div className="real-replay-log-heading">
+          <strong>P0 native replay diagnostics</strong>
+          <span>{status.p0NativeState ?? "idle"}</span>
+        </div>
+        <pre className="real-replay-log">
+          {status.p0NativeLog?.length ? status.p0NativeLog.join("\n") : "No P0 native replay has been started."}
+        </pre>
+      </div>
+      {confirmOpen ? (
+        <div className="danger-modal-backdrop" role="presentation">
+          <div aria-labelledby="p0-native-confirm-title" aria-modal="true" className="danger-modal" role="dialog">
+            <h3 id="p0-native-confirm-title">Confirm P0 native hardware motion</h3>
+            <p>
+              Episode <strong>{episode}</strong>, fixed opening <strong>{width} mm</strong>. This moves FR3 using the frozen P0 native trajectory package.
+            </p>
+            <ul>
+              <li>The gripper is empty and physically holds the declared opening.</li>
+              <li>The workspace, table edge, cables and payload are checked.</li>
+              <li>An operator is at the robot with the physical emergency stop available.</li>
+            </ul>
+            <label>
+              Type <strong>YES</strong> to execute
+              <input autoFocus value={confirmation} onChange={(event) => setConfirmation(event.target.value)} />
+            </label>
+            <div className="control-row">
+              <button onClick={() => { setConfirmOpen(false); setConfirmation(""); }} type="button">Cancel</button>
+              <button className="danger" disabled={confirmation !== "YES"} onClick={startExecute} type="button">Execute now</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 export function EventLog({ events }: { events: EventLogItem[] }) {
   return (
     <section className="panel event-panel">
@@ -900,6 +1001,7 @@ export function EpisodeReplayPage({
   onMujocoReplay,
   onApproveMujoco,
   onRealReplay,
+  onP0NativeReplay,
   onAbort,
   onSelectDataset,
   onSelectEpisode,
@@ -914,6 +1016,7 @@ export function EpisodeReplayPage({
   onMujocoReplay: (mode: MujocoCubeMode) => void;
   onApproveMujoco: (mode: MujocoCubeMode) => void;
   onRealReplay: (mode: RealCubeMode, robotIp: string, endEffectorMode: RealEndEffectorMode, overrideMujocoFailure: boolean) => void;
+  onP0NativeReplay: (episode: 0 | 1, gripperWidthMm: number, execute: boolean, confirmation: string) => void;
   onAbort: () => void;
   onSelectDataset: (path: string) => void;
   onSelectEpisode: (episode: number) => void;
@@ -972,6 +1075,9 @@ export function EpisodeReplayPage({
         cubeSelection={cubeSelection}
       />
       <RealRobotReplayPanel status={snapshot.replay} busy={busy} onStart={onRealReplay} />
+      {(snapshot.deployment?.profile ?? "thor") === "thor" ? (
+        <P0NativeArmReplayPanel status={snapshot.replay} busy={busy} onStart={onP0NativeReplay} onAbort={onAbort} />
+      ) : null}
       <EpisodeAnnotationPanel
         annotation={snapshot.annotation}
         datasetPath={activePath}
