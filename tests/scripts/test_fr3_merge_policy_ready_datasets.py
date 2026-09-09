@@ -382,6 +382,39 @@ def test_policy_ready_merge_refuses_schema_mismatch(tmp_path):
         validate_policy_ready_merge(base, [dagger])
 
 
+def test_policy_ready_merge_refuses_a_dagger_root_that_is_still_being_written(tmp_path):
+    """The 2026-09-08 failure: green preflight, then ArrowInvalid in the middle of the merge.
+
+    ``info.json`` said 67 episodes / QC PASS while a shard had no footer, because every check
+    the preflight ran stopped at ``exists()``. The refusal has to name the shard -- "this
+    dataset is broken" sends the operator looking through sixty files.
+    """
+    base = tmp_path / "base"
+    dagger = tmp_path / "dagger"
+    _write_dataset(base, episodes=1)
+    _write_dataset(dagger, episodes=2, include_intervention=True)
+    _write_qc(dagger, "pass")
+    shard = next(iter(sorted((dagger / "data").glob("chunk-*/*.parquet"))))
+    written = shard.read_bytes()
+    shard.write_bytes(written[: len(written) // 2])
+
+    with pytest.raises(MergeError, match=r"cannot be opened.*" + shard.name):
+        validate_policy_ready_merge(base, [dagger])
+
+
+def test_policy_ready_merge_refuses_a_base_view_with_an_unopenable_shard(tmp_path):
+    base = tmp_path / "base"
+    dagger = tmp_path / "dagger"
+    _write_dataset(base, episodes=1)
+    _write_dataset(dagger, episodes=1, include_intervention=True)
+    _write_qc(dagger, "pass")
+    shard = next(iter(sorted((base / "meta" / "episodes").glob("chunk-*/*.parquet"))))
+    shard.write_bytes(b"episodes without a footer")
+
+    with pytest.raises(MergeError, match="cannot be opened"):
+        validate_policy_ready_merge(base, [dagger])
+
+
 def test_policy_ready_merge_refuses_prompt_mismatch(tmp_path):
     base = tmp_path / "base"
     dagger = tmp_path / "dagger"

@@ -15,7 +15,11 @@ looks like a policy that never quite reaches.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from tools.fr3.dagger_dataset import (
@@ -30,6 +34,8 @@ from tools.fr3.dagger_dataset import (
     dagger_dataset_features,
     dagger_dataset_is_unfinalized,
     dagger_dataset_root_is_recreatable,
+    dagger_dataset_unreadable_shards,
+    parquet_file_is_readable,
     sent_command_to_dataset_action,
 )
 
@@ -88,6 +94,24 @@ def identity_gripper(value: float) -> float:
 # --- opening correction datasets --------------------------------------------------------
 
 
+def write_closed_parquet(path):
+    """A real parquet file, footer and all -- what a finalized shard looks like.
+
+    These fixtures used to write the bytes ``b'parquet'`` and call it a shard, which is the same
+    assumption the production checks were making: that a file of the right name is a file that
+    opens. Writing real ones is what lets the tests below tell the two apart.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({'index': [0, 1, 2]}), path)
+
+
+def write_unclosed_parquet(path):
+    """A shard whose footer was never written: what a live or killed writer leaves behind."""
+    write_closed_parquet(path)
+    written = path.read_bytes()
+    path.write_bytes(written[: len(written) // 2])
+
+
 def test_an_empty_dagger_root_can_be_recreated(tmp_path):
     root = tmp_path / 'dagger_policy_030000'
     root.mkdir()
@@ -138,16 +162,53 @@ def test_a_session_killed_before_finalize_is_named_as_such(tmp_path):
 
 def test_a_finished_dataset_is_not_mistaken_for_an_interrupted_one(tmp_path):
     root = tmp_path / 'dagger_policy_030000'
-    (root / 'meta' / 'episodes' / 'chunk-000').mkdir(parents=True)
-    (root / 'meta' / 'episodes' / 'chunk-000' / 'file-000.parquet').write_bytes(b'parquet')
+    (root / 'meta').mkdir(parents=True)
     (root / 'meta' / 'info.json').write_text('{}', encoding='utf-8')
     (root / 'meta' / 'tasks.parquet').write_bytes(b'parquet')
-    data_file = root / 'data' / 'chunk-000' / 'file-000.parquet'
-    data_file.parent.mkdir(parents=True)
-    data_file.write_bytes(b'parquet')
+    write_closed_parquet(root / 'meta' / 'episodes' / 'chunk-000' / 'file-000.parquet')
+    write_closed_parquet(root / 'data' / 'chunk-000' / 'file-000.parquet')
 
+    assert dagger_dataset_unreadable_shards(root) == []
     assert dagger_dataset_is_unfinalized(root) is False
     assert dagger_dataset_can_load_locally(root) is True
+
+
+def test_a_session_still_writing_is_unfinalized_despite_its_episode_metadata(tmp_path):
+    """The shape that cost three batches of corrections, and that both checks used to pass.
+
+    The episode buffer flushes every ten episodes, so a long session has real, readable metadata
+    on disk while the shard it is currently appending to has no footer. Counting files found
+    ``meta/episodes/`` non-empty and called the dataset finished; opening them does not.
+    """
+    root = tmp_path / 'dagger_policy_030000'
+    (root / 'meta').mkdir(parents=True)
+    (root / 'meta' / 'info.json').write_text('{}', encoding='utf-8')
+    (root / 'meta' / 'tasks.parquet').write_bytes(b'parquet')
+    write_closed_parquet(root / 'meta' / 'episodes' / 'chunk-000' / 'file-000.parquet')
+    write_closed_parquet(root / 'data' / 'chunk-000' / 'file-000.parquet')
+    write_unclosed_parquet(root / 'data' / 'chunk-000' / 'file-001.parquet')
+
+    assert dagger_dataset_unreadable_shards(root) == [Path('data/chunk-000/file-001.parquet')]
+    assert dagger_dataset_is_unfinalized(root) is True
+    assert dagger_dataset_can_load_locally(root) is False
+
+
+def test_a_shard_with_no_footer_is_not_readable_however_pyarrow_words_it(tmp_path):
+    """The falsifiability clause on P0-0, pinned as a test.
+
+    The check was written on the assumption that `pq.read_metadata` refuses a file whose footer
+    was never written. If some pyarrow version returns metadata for one anyway, the magic-bytes
+    half has to carry the check -- so assert the *verdict*, which stays true either way, and let
+    this fail if neither half catches it.
+    """
+    closed = tmp_path / 'closed.parquet'
+    unclosed = tmp_path / 'unclosed.parquet'
+    write_closed_parquet(closed)
+    write_unclosed_parquet(unclosed)
+
+    assert parquet_file_is_readable(closed) is True
+    assert parquet_file_is_readable(unclosed) is False
+    assert parquet_file_is_readable(tmp_path / 'absent.parquet') is False
 
 
 def test_an_empty_root_is_not_an_interrupted_session(tmp_path):
@@ -174,12 +235,8 @@ def test_a_complete_dagger_root_is_loadable_not_recreated(tmp_path):
     (root / 'meta').mkdir(parents=True)
     (root / 'meta' / 'info.json').write_text('{}', encoding='utf-8')
     (root / 'meta' / 'tasks.parquet').write_bytes(b'parquet')
-    episode_file = root / 'meta' / 'episodes' / 'chunk-000' / 'file-000.parquet'
-    episode_file.parent.mkdir(parents=True)
-    episode_file.write_bytes(b'episodes')
-    data_file = root / 'data' / 'chunk-000' / 'file-000.parquet'
-    data_file.parent.mkdir(parents=True)
-    data_file.write_bytes(b'data')
+    write_closed_parquet(root / 'meta' / 'episodes' / 'chunk-000' / 'file-000.parquet')
+    write_closed_parquet(root / 'data' / 'chunk-000' / 'file-000.parquet')
 
     assert dagger_dataset_can_load_locally(root) is True
     assert dagger_dataset_root_is_recreatable(root) is False

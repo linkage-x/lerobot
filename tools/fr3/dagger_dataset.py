@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pyarrow.parquet as pq
 
 from lerobot.datasets.utils import build_dataset_frame
 
@@ -93,10 +94,63 @@ DAGGER_EPISODES_DIR = Path('meta/episodes')
 DAGGER_DATA_DIR = Path('data')
 DAGGER_RECREATABLE_FILES = {DAGGER_INFO_PATH, *DAGGER_TASK_PATHS}
 
+# The four bytes a finished parquet file ends with. A file whose footer was never written --
+# the shape a killed or still-running session leaves -- ends with frame data instead, and no
+# amount of checking that the path exists will say so.
+PARQUET_FOOTER_MAGIC = b'PAR1'
+
 
 def dagger_dataset_has_tasks(root: Path) -> bool:
     """Whether `root` has task metadata written by `save_episode`."""
     return any((root / path).exists() for path in DAGGER_TASK_PATHS)
+
+
+def parquet_file_is_readable(path: Path) -> bool:
+    """Whether `path` is a parquet file something can actually open.
+
+    Existence is not the question. A writer still running -- or one killed mid-session -- leaves
+    a file of the right name and a plausible size whose footer was never written, and every
+    check that stops at `exists()` calls that dataset complete.
+
+    The footer magic is read first and `pq.read_metadata` second because they fail on different
+    things. The four bytes name the exact shape this guard exists for, an unclosed file, without
+    depending on how a given pyarrow version words its error; `read_metadata` then catches the
+    footer that is present but corrupt, which the magic alone would pass.
+    """
+    try:
+        with path.open('rb') as handle:
+            handle.seek(0, 2)
+            if handle.tell() < len(PARQUET_FOOTER_MAGIC):
+                return False
+            handle.seek(-len(PARQUET_FOOTER_MAGIC), 2)
+            if handle.read(len(PARQUET_FOOTER_MAGIC)) != PARQUET_FOOTER_MAGIC:
+                return False
+    except OSError:
+        return False
+    try:
+        pq.read_metadata(path)
+    except Exception:
+        return False
+    return True
+
+
+def dagger_dataset_shards(root: Path) -> list[Path]:
+    """Every parquet file a load of `root` would have to open, in a stable order."""
+    return sorted((root / DAGGER_DATA_DIR).rglob('*.parquet')) + sorted(
+        (root / DAGGER_EPISODES_DIR).rglob('*.parquet')
+    )
+
+
+def dagger_dataset_unreadable_shards(root: Path) -> list[Path]:
+    """The shards under `root` that cannot be opened, relative to `root`.
+
+    Returned rather than counted because the operator's next question is always *which file*,
+    and a session that wrote thirty shards and lost one is a different situation from a session
+    that lost all of them.
+    """
+    return [
+        path.relative_to(root) for path in dagger_dataset_shards(root) if not parquet_file_is_readable(path)
+    ]
 
 
 def dagger_dataset_can_load_locally(root: Path) -> bool:
@@ -106,6 +160,7 @@ def dagger_dataset_can_load_locally(root: Path) -> bool:
         and dagger_dataset_has_tasks(root)
         and any((root / DAGGER_EPISODES_DIR).rglob('*.parquet'))
         and any((root / DAGGER_DATA_DIR).rglob('*.parquet'))
+        and not dagger_dataset_unreadable_shards(root)
     )
 
 
@@ -118,14 +173,20 @@ def dagger_dataset_is_unfinalized(root: Path) -> bool:
     -- leaves exactly this shape: `data/` and `videos/` populated, `meta/episodes/` absent, and a
     parquet pyarrow refuses to open.
 
+    A long session leaves a second shape, and it is the one that cost three batches of
+    corrections: the buffer flushes every ten episodes, so `meta/episodes/` is populated and the
+    earlier shards open fine while the *current* pair of files has no footer. Checking only that
+    the metadata directory is non-empty called that dataset finished. Any shard that will not
+    open makes the root unfinalized, whatever the metadata says.
+
     Worth telling apart from a directory that merely holds someone else's files, because the
     corrections in it are not misplaced, they are unreadable: an operator told only to "move it
     aside" will keep it waiting for a recovery that cannot come.
     """
-    return (
-        (root / DAGGER_INFO_PATH).exists()
-        and any((root / DAGGER_DATA_DIR).rglob('*.parquet'))
-        and not any((root / DAGGER_EPISODES_DIR).rglob('*.parquet'))
+    if not (root / DAGGER_INFO_PATH).exists() or not any((root / DAGGER_DATA_DIR).rglob('*.parquet')):
+        return False
+    return not any((root / DAGGER_EPISODES_DIR).rglob('*.parquet')) or bool(
+        dagger_dataset_unreadable_shards(root)
     )
 
 

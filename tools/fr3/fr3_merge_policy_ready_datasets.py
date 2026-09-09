@@ -179,6 +179,61 @@ def task_names(root: Path) -> list[str]:
     return [normalize_prompt(task) for task in table.index.tolist()]
 
 
+PARQUET_FOOTER_MAGIC = b"PAR1"
+
+
+def parquet_file_is_readable(path: Path) -> bool:
+    """Whether `path` is a parquet file that can actually be opened.
+
+    Kept identical in behaviour to ``dagger_dataset.parquet_file_is_readable`` and duplicated
+    rather than imported: this script runs on the workstation from a checkout that does not
+    always have the runtime's import chain available, and a preflight that fails to import is a
+    preflight that gets skipped.
+    """
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            if handle.tell() < len(PARQUET_FOOTER_MAGIC):
+                return False
+            handle.seek(-len(PARQUET_FOOTER_MAGIC), 2)
+            if handle.read(len(PARQUET_FOOTER_MAGIC)) != PARQUET_FOOTER_MAGIC:
+                return False
+    except OSError:
+        return False
+    try:
+        pq.read_metadata(path)
+    except Exception:
+        return False
+    return True
+
+
+def assert_every_shard_opens(root: Path) -> None:
+    """Open every parquet this merge will read, before calling the source ready.
+
+    ``meta/info.json`` is a claim, not evidence. On 2026-09-08 it said "67 episodes, QC PASS"
+    while two shards had no footer, so the preflight went green and ``load_episodes`` threw
+    ``ArrowInvalid`` partway through the merge -- after the operator had been told it was safe
+    to start. Opening the files here puts the failure in the check that exists to catch it, and
+    names the shard instead of the dataset.
+    """
+    broken = [
+        path.relative_to(root)
+        for path in (*dataset_data_files(root), *dataset_episode_files(root))
+        if not parquet_file_is_readable(path)
+    ]
+    if not broken:
+        return
+    names = ", ".join(str(path) for path in broken[:5])
+    if len(broken) > 5:
+        names += f" (+{len(broken) - 5} more)"
+    raise MergeError(
+        f"{root.name} has {len(broken)} parquet shard(s) that cannot be opened: {names}. "
+        "Either a recording is still writing to this root -- stop it and let it finalize, never "
+        "SIGKILL -- or the session that wrote it died before closing its files. Merging now "
+        "would fail partway through."
+    )
+
+
 def load_episodes(root: Path) -> pd.DataFrame:
     files = dataset_episode_files(root)
     if not files:
@@ -235,6 +290,7 @@ def validate_policy_ready_merge(
     if not action_mode:
         raise MergeError(f"{base_view} manifest has no action_mode; it is not a training view")
 
+    assert_every_shard_opens(base_view)
     base_episode_rows = load_episodes(base_view)
     base_episode_filter = sorted({int(episode) for episode in (base_episodes or [])})
     if base_episode_filter:
@@ -286,6 +342,7 @@ def validate_policy_ready_merge(
             raise MergeError(f"{dagger_root.name} must be QC PASS before merge; current QC status is {status}")
         if not dataset_data_files(dagger_root) or not dataset_episode_files(dagger_root):
             raise MergeError(f"{dagger_root.name} is not a finalized LeRobot v3 dataset")
+        assert_every_shard_opens(dagger_root)
         sources.append(
             SourceSummary(
                 role="dagger",

@@ -100,6 +100,7 @@ from tools.fr3.dagger_dataset import (
     dagger_dataset_features,
     dagger_dataset_is_unfinalized,
     dagger_dataset_root_is_recreatable,
+    dagger_dataset_unreadable_shards,
     image_source_keys,
     sent_command_to_dataset_action,
 )
@@ -3945,12 +3946,20 @@ def build_dagger_writer(
         if root.exists():
             if not dagger_dataset_root_is_recreatable(root):
                 if dagger_dataset_is_unfinalized(root):
+                    broken = dagger_dataset_unreadable_shards(root)
+                    detail = (
+                        'the episode metadata was never flushed and the data parquet has no footer'
+                        if not broken
+                        else f'{len(broken)} shard(s) have no footer and cannot be opened: '
+                        + ', '.join(str(path) for path in broken[:5])
+                        + (f' (+{len(broken) - 5} more)' if len(broken) > 5 else '')
+                    )
                     raise SystemExit(
-                        f'--dagger-dataset-root {root} holds a DAgger session that was killed '
-                        'before it closed its dataset: the frames and videos are on disk, but the '
-                        'episode metadata was never flushed and the data parquet has no footer, '
-                        'so nothing can open it. Move it aside and start a fresh directory -- '
-                        'those corrections cannot be recovered.'
+                        f'--dagger-dataset-root {root} holds a DAgger session that never closed '
+                        f'its dataset: the frames and videos are on disk, but {detail}. If a '
+                        'recording is still running against this root, stop it with q / the stop '
+                        'button / SIGTERM and let it finalize -- never SIGKILL. Otherwise move it '
+                        'aside and start a fresh directory; those corrections cannot be recovered.'
                     )
                 raise SystemExit(
                     f'--dagger-dataset-root {root} exists but is not a loadable LeRobot dataset '
