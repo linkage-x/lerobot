@@ -893,6 +893,57 @@ def test_processing_item_and_qc_include_online_sync_manifest(tmp_path):
     assert qc["online_sync"]["episodes"][0]["frameCountByCamera"] == {"cam_00": 2, "cam_01": 2}
 
 
+def _episode_dir_with_videos(dataset_root: Path, episode: int, cameras: tuple[str, ...] = ("cam_00", "cam_01")):
+    ep_dir = dataset_root / "episodes" / f"episode_{episode:06d}"
+    ep_dir.mkdir(parents=True, exist_ok=True)
+    for camera in cameras:
+        (ep_dir / f"{camera}.mkv").write_bytes(b"")
+    return ep_dir
+
+
+def test_qc_fails_when_an_episode_has_video_but_no_parquet_rows(tmp_path):
+    """The 2026-09-09 Thor capture: BOX not up at episode start, so the v3 writer
+    emitted no rows while the recorder still wrote the videos and saved the episode.
+    The parquet stays internally consistent, so every other check passes -- and the
+    EE tracker then pairs directories to episodes positionally and shifts every label
+    after the unpaired one."""
+    dataset_root = tmp_path / "gmsl2_v3"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=2)
+    for episode in (0, 1, 2):
+        _episode_dir_with_videos(dataset_root, episode)
+
+    qc = gateway._run_qc(dataset_root)
+
+    check = next(check for check in qc["checks"] if check["name"] == "episode_video_pairing")
+    assert check["status"] == "fail"
+    assert "[2] have video but no parquet rows" in check["message"]
+    assert qc["status"] == "fail"
+
+
+def test_qc_passes_when_every_episode_directory_has_rows(tmp_path):
+    dataset_root = tmp_path / "gmsl2_v3"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=2)
+    for episode in (0, 1):
+        _episode_dir_with_videos(dataset_root, episode)
+
+    qc = gateway._run_qc(dataset_root)
+
+    check = next(check for check in qc["checks"] if check["name"] == "episode_video_pairing")
+    assert check["status"] == "pass"
+
+
+def test_qc_fails_when_a_parquet_episode_has_no_video(tmp_path):
+    dataset_root = tmp_path / "gmsl2_v3"
+    _write_minimal_episode_dataset(dataset_root, total_episodes=2)
+    _episode_dir_with_videos(dataset_root, 0)
+
+    qc = gateway._run_qc(dataset_root)
+
+    check = next(check for check in qc["checks"] if check["name"] == "episode_video_pairing")
+    assert check["status"] == "fail"
+    assert "[1] have parquet rows but no video" in check["message"]
+
+
 def test_lerobot_v3_gmsl2_timeline_ignores_replay_warmup(tmp_path):
     repo_root = tmp_path / "repo"
     dataset_root = repo_root / "outputs" / "datasets" / "episode_set"

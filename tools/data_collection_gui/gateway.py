@@ -7394,6 +7394,44 @@ def _run_qc(
             else:
                 checks.append({"name": "gripper_range", "status": "pass", "message": f"in [0, 1] ({gripper_source})"})
 
+        # An episode can reach disk as video and contribute no parquet rows: when the
+        # BOX stream is not up at episode start the recorder writes the ten videos,
+        # reports the episode saved, and the v3 writer emits nothing for it. Nothing
+        # else here notices -- the parquet is internally consistent -- but the EE
+        # tracker walks the episode directories in order against the parquet's global
+        # row index, so an unpaired directory shifts every label after it.
+        episodes_root = dataset_root / "episodes"
+        if episodes_root.is_dir():
+            video_episodes: dict[int, int] = {}
+            for episode_dir in sorted(episodes_root.glob("episode_*")):
+                if not episode_dir.is_dir():
+                    continue
+                videos = len(list(episode_dir.glob("cam_*.mkv"))) + len(list(episode_dir.glob("cam_*.mp4")))
+                if videos:
+                    try:
+                        video_episodes[int(episode_dir.name.removeprefix("episode_"))] = videos
+                    except ValueError:
+                        continue
+            unpaired = sorted(set(video_episodes) - set(by_episode))
+            rowless = sorted(set(by_episode) - set(video_episodes))
+            if unpaired or rowless:
+                parts = []
+                if unpaired:
+                    parts.append(f"episodes {unpaired} have video but no parquet rows")
+                if rowless:
+                    parts.append(f"episodes {rowless} have parquet rows but no video")
+                checks.append({
+                    "name": "episode_video_pairing",
+                    "status": "fail",
+                    "message": "; ".join(parts) + " - EE trajectory generation cannot align frames to rows",
+                })
+            elif video_episodes:
+                checks.append({
+                    "name": "episode_video_pairing",
+                    "status": "pass",
+                    "message": f"{len(video_episodes)} episode directories match the parquet episodes",
+                })
+
         if camera_keys:
             missing_cams: list[str] = []
             for cam in camera_keys:
