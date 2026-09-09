@@ -113,6 +113,14 @@ from tools.fr3.scene_reset import (
     pose_probe_request_from_payload,
     scene_reset_request_from_payload,
 )
+from tools.fr3.terminal_servo import (
+    TerminalServoError,
+    terminal_servo_arming,
+    TerminalServoRequest,
+    execute_terminal_servo,
+    parse_terminal_servo_pose,
+    validate_terminal_servo_trajectory,
+)
 from tools.fr3.live_frames import LiveFrameEmitter
 
 # The guard carries its own copy of the prev_cmd key names so that it can be imported
@@ -396,6 +404,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             'Steps of each draw compared when selecting among them. 0 (default) uses the RTC '
             'execution horizon, i.e. the steps that will actually run before the next replan.'
+        ),
+    )
+    parser.add_argument(
+        '--terminal-servo-pose',
+        default='',
+        help=(
+            'E5. Take the arm off the policy once it is descending with the peg below '
+            '--terminal-servo-handoff-z and drive it to this absolute "x,y,z" in metres, then '
+            'release. Off by default. The demonstrations that let go at the seated depth mean '
+            '0.3599,-0.1333,0.0523, and scatter a median 3.5 mm about it against a 2.5 mm '
+            'radial clearance -- which is the prediction this is run to refute.'
+        ),
+    )
+    parser.add_argument(
+        '--terminal-servo-handoff-z',
+        type=float,
+        default=0.12,
+        help=(
+            'Height at which --terminal-servo-pose takes over, in metres. The trigger also '
+            'requires the peg to be held and the arm to have been above this height since it '
+            'was grasped, so the pick descent does not fire it.'
         ),
     )
     parser.add_argument(
@@ -4581,6 +4610,27 @@ def run_inference(args: argparse.Namespace) -> int:
                 None if gripper_action_index is None else action_names[gripper_action_index],
             )
         )
+    # E5. Built here rather than at the handoff so a mistyped pose or one outside the workspace
+    # is a startup error, not something discovered with a peg in the gripper 12 cm above the
+    # fixture. The reach check is not run yet -- it needs the arm -- so this is the deterministic
+    # half of the QC; `execute_terminal_servo` runs the whole of it again against the robot.
+    terminal_servo_request: TerminalServoRequest | None = None
+    if str(args.terminal_servo_pose).strip():
+        try:
+            terminal_servo_request = TerminalServoRequest(
+                xyz=parse_terminal_servo_pose(args.terminal_servo_pose),
+                handoffZ=float(args.terminal_servo_handoff_z),
+                controlPeriodS=1.0 / policy_fps,
+                requestId=f'terminal_servo_{time.time_ns()}',
+            )
+            validate_terminal_servo_trajectory(terminal_servo_request)
+        except TerminalServoError as exc:
+            raise SystemExit(f'--terminal-servo-pose is not usable: {exc}') from exc
+        print(
+            '[INFO] terminal_servo=configured xyz=%.4f,%.4f,%.4f handoff_z=%.4f max_speed_ms=%.3f'
+            % (*terminal_servo_request.xyz, terminal_servo_request.handoffZ,
+               terminal_servo_request.maxSpeedMs)
+        )
     robot_init_state = parse_robot_init_state(args.robot_init_state)
     mujoco_model_path = resolve_mujoco_model_path(args.gripper_backend, args.mujoco_model)
     robot_urdf_path, target_frame_name = resolve_robot_tool_model(
@@ -4970,6 +5020,15 @@ def run_inference(args: argparse.Namespace) -> int:
             'current_offset': max(int(args.act_temporal_action_offset), 0),
             'stuck_count': 0,
         }
+        # E5's handoff, and each of its three conditions is there because a simpler trigger
+        # fires on the wrong descent. The peg has to be held -- read off the gripper *command*,
+        # the same signal `RolloutGeometryTrace` uses and for the same reason: the observed
+        # width reads 0 on 47% of frames, so an observation-keyed test fires on dropouts. The
+        # arm has to have been above the handoff height while holding it, or the approach to
+        # the pick, which descends through the same height on its way to z = 0.046, hands over
+        # before the peg has even been grasped. Only then does crossing the height downward
+        # take the arm off the policy.
+        terminal_servo_state: dict[str, bool] = {'armed': False, 'fired': False}
         rtc_planner = AsyncActionChunkPlanner() if rtc_enabled else None
 
         def finish_rollout(status: str) -> str:
@@ -4983,6 +5042,30 @@ def run_inference(args: argparse.Namespace) -> int:
                 return finish_rollout('quit' if interactive_keyboard.quit_requested.is_set() else 'stopped')
             loop_start_t = time.perf_counter()
             robot_observation = robot.get_observation()
+            if terminal_servo_request is not None and not terminal_servo_state['fired']:
+                observed_z = float(robot_observation['ee.z'])
+                commanded_gripper = (
+                    float(previous_sent_command['gripper.pos'])
+                    if previous_sent_command is not None
+                    else 1.0
+                )
+                terminal_servo_state['armed'], hand_over_now = terminal_servo_arming(
+                    terminal_servo_state['armed'],
+                    commanded_gripper=commanded_gripper,
+                    observed_z=observed_z,
+                    handoff_z=terminal_servo_request.handoffZ,
+                    closed_below=_TRACE_GRIPPER_CLOSED_BELOW,
+                )
+                if hand_over_now:
+                    terminal_servo_state['fired'] = True
+                    print(
+                        f'[INFO] terminal_servo_handoff step={step_idx} z={observed_z:.4f} '
+                        f'handoff_z={terminal_servo_request.handoffZ:.4f}'
+                    )
+                    servo_result = execute_terminal_servo(robot, terminal_servo_request)
+                    return finish_rollout(
+                        'terminal_servo_ok' if servo_result.get('ok') else 'terminal_servo_failed'
+                    )
             previous_tracking_position_delta: np.ndarray | None = None
             previous_tracking_rotation_delta: np.ndarray | None = None
             if previous_sent_command is not None:
