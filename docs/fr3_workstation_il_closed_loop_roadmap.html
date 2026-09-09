@@ -1153,12 +1153,19 @@ padding 占动作监督的比例
         <h2>近期任务清单</h2>
         <span class="badge todo">Next</span>
       </div>
+      <p class="small"><b>2026-09-09 重排：</b>主线实验改用第六版第 (7) 节的 <b>E 编号</b>（E1–E5），与那张卡一一对应；<b>P 编号只保留已判读的项与非主线项</b>。原 <b>P0-4</b>（逐步取横向分量的均值）由 <b>E3</b> 取代——向量平均会压掉刚被 DAgger 补回来的幅度；原 <b>P0-5</b>（52° 宽度的来源）与原 <b>P1-6</b>（补采 z∈[0.15,0.25]）并入 <b>E4</b>，在 E2 给出 n 之前都不开工。</p>
       <table class="table">
         <tr>
           <th>优先级</th>
           <th>任务</th>
           <th>代码落点</th>
           <th>验收</th>
+        </tr>
+        <tr>
+          <td><span class="badge p0">P0-0</span></td>
+          <td><b>2026-09-08 新增，第三次踩同一个坑。让「没落盘」这件事变得看得见。</b>今天 15:39 起的那次会话，31 条 rollout / 4192 帧到 18:04 仍只存在于进程句柄里：两个 <code>file-003.parquet</code> 挂在 <code>O_WRONLY</code> 上无 footer，两个 <code>file-003.mp4</code> 无 moov。同级已经躺着 <code>.unreadable-20260902</code> 和 <code>.dropped-20260908</code> 两份尸体。真正的缺陷不是写入路径——<code>q</code> / 停止按钮 / <code>Ctrl-C</code> / <code>SIGTERM</code> 都能正确收尾——<b>而是没有任何东西会告诉你它还没收尾</b>：<code>dagger_dataset_is_unfinalized()</code> 对这个目录返回 <b>False</b>、<code>dagger_dataset_can_load_locally()</code> 返回 <b>True</b>，两个都是绿灯，因为它们只查文件 <code>exists()</code>，从不试着打开。</td>
+          <td><code>tools/fr3/dagger_dataset.py::dagger_dataset_is_unfinalized</code> 与 <code>::dagger_dataset_can_load_locally</code>（改成对每个 shard 试 <code>pq.read_metadata</code>）；<code>tools/fr3/fr3_merge_policy_ready_datasets.py</code> 的预检同样只信 <code>info.json</code>，应在预检阶段就打开每个 shard；另可在 gateway 里显示「本会话尚未落盘的 episode 数」</td>
+          <td><b>判据</b>：对着一个正在写的 DAgger 根目录，预检必须<b>红灯</b>并报出具体是哪个 shard 打不开；对着已收尾的目录仍然绿灯。<br><b>可证伪</b>：若 <code>pq.read_metadata</code> 对一个仅缺 footer 的文件也能成功返回，则这条检查抓不住本故障，需要改为验证 footer magic（末 4 字节 <code>PAR1</code>）。</td>
         </tr>
         <tr>
           <td><span class="badge done">P0-1 ✔</span></td>
@@ -1173,50 +1180,74 @@ padding 占动作监督的比例
           <td><b>可证伪条件成立 → 感知丢失出局。</b>另记：原始 <code>outputs/datasets/dagger_...</code> 的 <code>ee.z</code> 与 runtime 差 108 mm，但导出视图已换回坐标系，<b>不是</b>合同错位。</td>
         </tr>
         <tr>
-          <td><span class="badge p0">P0-3</span></td>
-          <td><b>2026-09-08 新增，现在的主线。策略下降途中不转向——先分清「学不会」还是「到不了」。</b>示教下降途中航向转 <b>79.0°</b>，策略只转 <b>19.6°</b>（p = 0.00098），落点被粗逼近段 21.1° 的瞄准误差定死（r = +0.68 预测实际落点）。两种可能必须先分开：<b>(a) 策略压根没学会这个转向</b>；<b>(b) 学会了，但 rollout 走到 z=0.15 时已处在示教从未到过的状态</b>（复合误差）。<b>最小实验（离线，不用真机）</b>：拿<b>留出的示教</b> episode，在 z∈[0.12,0.25] 逐帧喂给当前 checkpoint，取预测动作的航向，与该条示教的真实航向、以及「当前位置→该条销」的方位作比。</td>
-          <td><code>tools/fr3/fr3_check_policy_dataset_frame.py</code> 复用其取帧与前处理；判读脚本复用本卡的航向/转动量统计</td>
-          <td><b>判据</b>：留出示教上预测航向的<b>转动量</b>。<br>≥60° → 策略<b>会</b>转，问题是分布漂移 ⇒ 直接做 P0-4（在 0.15–0.25 采纠偏数据），<b>不要</b>动模型结构。<br>≤30° → 策略<b>不会</b>转 ⇒ 做 P0-5（解冻视觉塔）。<br><b>可证伪</b>：若预测航向连示教自己的下一步都对不上（与真实航向差 &gt;60°），说明这个 checkpoint 在示教分布上就已经不跟随观测，问题比转向更靠前，回到训练侧。</td>
+          <td><span class="badge done">P0-3 ✔</span></td>
+          <td><b>2026-09-08 已执行（离线，未用真机），结论：预登记的两个分支<b>都没中</b>。</b>把示教自己的观测逐帧喂给 <code>030000</code>：策略的航向逐段跟着示教走（每段差 5–11°，下降剖面差 &lt;2 mm/16 步，逐条转动量 51.1° vs 69.1°，配对 p = 0.299）——<b>不是「学不会转」</b>；但单次采样的瞄准误差在 z&lt;0.20 明显劣于示教（39.3° vs 22.1°，p = 9.6e−12），而这些帧<b>在训练集内</b>——<b>也不是「纯分布漂移」</b>。<b>同一帧采 8 次取均值，0.12–0.15 段的差距补回 91%（21.8° vs 示教 20.4°，p = 0.67，与人无法区分）。</b>诊断：<b>条件分布的中心是对的，宽度在 z&lt;0.20 有 52–55°</b>；部署端只抽一次就照着走。</td>
+          <td>—（已完成）<br><code>outputs/analysis/p03/</code>：<code>p03_holdout_heading.py</code>、<code>p03_variance.py</code>、<code>p03_steps.py</code>、<code>p03_agg.py</code> 与三份 json</td>
+          <td><b>已判读，但要记一条方法教训：原判据（单条 episode 转动量 ≥60°/≤30°）无法判读。</b>pi05 是流匹配采样，整实验独立跑两遍，同一条 episode 的转动量相差<b>中位 23.2°、p90 57.0°</b>——判据的分辨率不如噪声。<b>此后凡是基于采样式策略的判据，必须先跑重复性检验再定阈值。</b></td>
         </tr>
         <tr>
-          <td><span class="badge p0">P0-4</span></td>
-          <td><b>2026-09-08 由 P1-6 升级。把 DAgger 采集搬到来得及的高度段。</b>落点在 <b>z≈0.25 → 0.12</b> 之间就定死了，而今天 3846 个接管帧 <b>92.2% 在 z&lt;0.12</b>、<code>0.15–0.20</code> 段<b>一帧都没有</b>。三代 DAgger 把纠偏数据精确倒在了唯一来不及的地方——<b>不是没收益，是采错了高度段</b>。操作规程改成：<b>看到航向偏了就在 z∈[0.15,0.25] 接管并把航向拧对</b>，而不是等它下到 8 cm 快空抓了才救。</td>
-          <td>操作规程（接管时机）；<code>tools/fr3/dagger_dataset.py</code> 的分带统计做验收</td>
-          <td><b>判据</b>：新采集中 z∈[0.15,0.25] 的接管帧占比 <b>≥25%</b>（当前为 0%）。<br><b>可证伪</b>：补足该段后重训，若留出示教上的转动量与 rollout 落点都不动，则「数据在错误高度」这条解释被推翻，回到 P0-5。</td>
+          <td><span class="badge p0">E1</span><br><span class="small">免费，不占真机</span></td>
+          <td><b>2026-09-09 新编号（第六版 E1）。把跳过的离线闸门补上。</b>第五版 (8) 预登记的是「只有离线两项都过，才值得花真机时间」，09-09 实际顺序反了——先花了真机时间，闸门至今没跑（<code>outputs/analysis/</code> 当天无新文件）。在 10 条留出 DAgger episode 上对 <code>dagger108</code> 与基线各重跑一遍 8 次抽样探针：它给的是<b>几百帧</b>的 n，不是 n = 3。闭环数据现在替它写好了一个<b>事前预测</b>：逐帧幅度比应从 2.15× / 2.30× 掉向 1。</td>
+          <td>复用 <code>outputs/analysis/p09_bias.py</code> 的取帧与配对逻辑，换 checkpoint；纯 GPU，不占真机</td>
+          <td><b>判据</b>（同第五版 (8)）：逐帧幅度比中位 <b>&lt; 1.3×</b>，且方向夹角 &lt;60° 的占比不下降。<br><b>可证伪 / 另一半价值</b>：若探针说<b>幅度比没动</b>，则闭环那个 8 → 37 mm 的改善不是从这里来的，<b>探针的取帧口径本身要重估</b>（它只取接管帧，而接管帧由操作员挑选）。两种结果都值钱。</td>
         </tr>
         <tr>
-          <td><span class="badge p0">P0-5</span></td>
-          <td><b>2026-09-08 改写动机（原 P0-3）。视觉塔解冻——但动机换了，判据也换了。</b>此前的理由是「末端 cos 低」，那条已经作废（没有末端伺服可言）。<b>新理由更准</b>：粗逼近段的<b>瞄准误差中位 21.1°</b>，也就是策略在 13 cm 距离上对销方位的估计就差了 20 度；<code>modules_to_save: []</code>、SigLIP 与 <code>gemma_2b</code> 全冻，冻结的通用特征够做「往那片区域去」，不够做「对准那个销」。<b>必须排在 P0-3 之后</b>——若 P0-3 判为分布漂移，解冻只是浪费一次重训。</td>
+          <td><span class="badge p0">E2</span><br><span class="small">真机 ~1 小时</span></td>
+          <td><b>2026-09-09 新编号（第六版 E2）。同配置再跑 15–20 条，一个变量都不改。</b>「新 ckpt 与示教打平」（终段横向路程 37.4 vs 36.0 mm、净收敛 13.9 vs 13.2 mm）现在坐在 <b>n = 3</b> 上，两条坏 rollout 就能翻掉它。<b>此刻最值钱的一小时真机时间是 n，不是新变量。</b>顺带把空中掉销的复现率一并量出来（本轮 1/5，此前 105 条里 0 次）。</td>
+          <td>Rollout 页面：同 checkpoint、同 RTC 参数、同批销位；开新会话前先按 P0-0 把上一个会话收尾（<code>q</code> / 停止 / <code>SIGTERM</code>，<b>不要 SIGKILL</b>）</td>
+          <td><b>判据</b>（n ≥ 15）：z ∈ [0.08,0.12) 带内横向路程中位 <b>≥ 30 mm</b>、净收敛 <b>≥ 10 mm</b>；同时记入带 / 出带误差与掉销复现率。<br><b>可证伪</b>：路程中位跌回 <b>&lt; 20 mm</b> ⇒ 第六版 (2) 那条「四代 DAgger 补回了终段做功」不成立，本轮主线作废，回到第五版。</td>
+        </tr>
+        <tr>
+          <td><span class="badge p0">E3</span><br><span class="small">部署端，不重训</span></td>
+          <td><b>2026-09-09 取代原 P0-4（第六版 E3）。多次采样改用 medoid 选择，不要向量平均。</b>原 P0-4 写的是「逐步取横向分量的均值」，第六版把这个写法推翻了：四代 DAgger 刚补回来的正是<b>幅度</b>（带内横向路程 8.0 → 37.4 mm），而向量平均已实测把模长压到单次抽样的 <b>80–91%</b>——等于直接吃掉本轮唯一的收益。<b>medoid 保留一个真实 draw 的模长与 chunk 内的时间连贯性，只砍掉方向离群的抽样。</b>做法：把 observation 的 batch 维扩到 N，取各 draw 前 K 步横向位移的圆均值方向，执行离它最近的那个 draw；<code>gripper</code> 维照旧不参与聚合。</td>
+          <td><code>tools/fr3/fr3_act_infer_real_runtime.py::predict_action_chunk_for_rollout</code>（加 <code>--action-samples N</code> 与 <code>--action-aggregate medoid</code>）；<code>src/lerobot/policies/pi05/modeling_pi05.py::sample_actions</code> 的 <code>bsize = tokens.shape[0]</code>，把观测沿 batch 维扩开即是 N 次抽样，不必写循环</td>
+          <td><b>判据</b>：带内 eff 从 <b>0.31</b> 升到 <b>≥ 0.40</b>（示教 0.43），<b>且横向路程不低于 30 mm</b>。<br><b>可证伪</b>：路程跌破 30 mm ⇒ 聚合又在吃幅度，立即收档，不要再调 N。<br><b>前置（不占真机）</b>：batch = N 的<b>一次</b>前向，p90 延迟必须 <b>&lt; 1.0 s</b>，否则本条不上真机。现测 <code>rtc_lat_ms</code> 中位 <b>328 ms</b> / p90 <b>500 ms</b>，replan 间隔约 20 个执行步（≈16 Hz ⇒ 1.2 s）：<b>串行 8 次前向放不下</b>，但 batch = 1 时 4090 是空着的，边际成本远小于 8×。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">E4</span><br><span class="small">先别动，等 E2 的 n</span></td>
+          <td><b>2026-09-09 合并原 P0-5 与原 P1-6（第六版 E4）。入带误差这一项。</b>终段的差已经分解干净：<b>绝对收敛量打平</b>（13.9 vs 示教 13.2 mm），剩下的只有<b>入带误差多 7.2 mm</b>（25.9 vs 18.7）与 eff 0.31 vs 0.43 两项。<b>n = 3 下这 7.2 mm 不成立</b>；而「抬得比示教高所以入带更偏」这条解释已被第六版 (5) 排除（corr = −0.22，p = 0.58，n = 85）——<b>不要去压抬升高度</b>。两条旧任务作为它的备选留在这里：<b>原 P0-5</b>（离线量示教邻域的动作散布，判 52° 宽度是策略发散还是数据本来就散）是<b>诊断</b>，<b>原 P1-6</b>（把 DAgger 接管搬到 z∈[0.15,0.25]）是<b>修法</b>。两者都不要在 E2 给出 n 之前开工。</td>
+          <td>诊断复用 <code>outputs/analysis/p03/p03_variance.py</code> 的取帧与配对逻辑（去掉推理部分）；修法是操作规程（接管时机）加 <code>tools/fr3/dagger_dataset.py</code> 的分带统计做验收</td>
+          <td><b>触发条件</b>：E2 之后（n ≥ 15）入带误差中位仍 <b>≥ 23 mm</b> 才立项；若 E2 把它带回 &lt;23 mm，本条整条不做。<br><b>立项后的判据</b>：示教邻域散布 ≈ 策略散布（差 &lt;15°）⇒ 分布本来就多模态，修法是<b>消歧</b>（<code>n_obs_steps &gt; 1</code>、或把销位显式喂进去），不是收紧模型；示教散布<b>远小于</b>策略（&lt;25° vs 52°）⇒ 模型过度发散，修法在训练端，且此时 P1-7 的解冻才重新有动机。<br><b>可证伪</b>：若两段（0.20 以上 / 以下）示教散布之比与策略散布之比方向相反，则「宽度随高度增长」不是从数据里来的，本条框架重来。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">E5</span><br><span class="small">结构性，测的是上界</span></td>
+          <td><b>2026-09-09 新增（第六版 E5）。孔是世界坐标里的一个定点，为什么要让策略从像素里重新发现它？</b>50 条示教的释放点散布只有 <b>5.0 mm</b>，而 EE 位姿本来就在观测里。终段真正不可观测的只有「销在夹爪里怎么坐」，<b>示教自己 5.0 mm 的释放散布就是它的上界</b>。现在的做法是让一个 chunk 策略从 48 条示教的像素里<b>重新发现一个常数</b>，精度要求 3 mm。若目标是「把销插进去」而不是「训练一个通用策略」，这条是最便宜的判决实验。</td>
+          <td>Rollout 运行时：在入带那一刻（z 首次下穿 0.12）把控制切给一个直接伺服到示教释放位姿的控制器，量终残差</td>
+          <td><b>它给出的是上界，不是一个方案。</b>残差 ≈ 示教的 <b>3.8 mm</b> ⇒ 终段确实只是「伺服到一个已知常数」，策略侧继续投入的边际收益很低。<br><b>可证伪 / 反向读法</b>：若该控制器的残差也<b>远大于</b> 3.8 mm，则终段任何策略侧改进都到不了示教水平，问题在标定或销在夹爪里的位姿，而不在策略——那时 E3 / E4 都该停。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1-7</span></td>
+          <td><b>2026-09-08 降级并<b>作废原动机</b>（原 P0-5）。视觉塔解冻——在找到新动机之前不要做。</b>它的动机一直是「粗逼近段瞄准误差 21.1°，冻结的通用特征不够对准销」。P0-3 把这条打掉了：<b>0.20 m 以上策略与人持平</b>（19.4° vs 17.9°，p = 0.093），8 次取均值后（23.2°）比示教（25.8°）还准。<b>冻结的视觉塔足以支持正确的平均方向</b>。若 E4 判为「模型过度发散」，解冻才重新成为候选——届时动机是<b>方差</b>，判据也要跟着换成方差。</td>
           <td><code>tools/fr3/fr3_train_il_policy.py --lora-target-modules</code>、<code>src/lerobot/policies/pi05/modeling_pi05.py::_get_default_peft_targets</code></td>
-          <td><b>判据</b>：留出示教上的<b>瞄准误差</b>中位从 21.1° 降到 <b>&lt;10°</b>，且真机无人协助最近逼近距离中位从 <b>28.2 mm</b> 降到 <b>&lt;15 mm</b>。<br><b>可证伪</b>：解冻后瞄准误差仍 &gt;18° → 不是视觉表征的容量问题，回到动作端与数据端。</td>
+          <td><b>暂不设判据</b>——等 E4 给出方差的来源。若届时要做，判据是 z&lt;0.20 的采样散布从 <b>52°</b> 降到 <b>&lt;30°</b>，而不是瞄准误差。</td>
         </tr>
         <tr>
-          <td><span class="badge warn">P1-6</span></td>
-          <td><b>2026-09-08 降级（原 P0-4）。把接管记成带类型的终局失败。</b>机制现在已经清楚，这条不再是判读的前置，但仍然该做：每次接管落 <code>takeover_reason ∈ {xy_miss_grasp, misaligned_press, stall, fence, budget}</code>，并记<b>接管瞬间的 xy 残差与 z</b>。有了它，失效模式分布不必再每次从 trace 反推。</td>
+          <td><span class="badge done">P1-8 ✔</span></td>
+          <td><b>2026-09-08 已执行：坏 shard 已隔离，数据集恢复自洽。</b>复核后情况比上一版记的更差——<code>file-004</code> 在 13:43 之后<b>仍在继续追加</b>（14:44 还在长）却始终无 footer，实际是 <b>67</b> 个 episode 里坏 <b>20</b> 个 / <b>1208</b> 帧（上一版「18/65」已过时）。上一版「静默少训 28%」也要修正：<b>预检</b>读 <code>info.json</code> 会报「67 episodes, QC PASS」绿灯，<code>load_episodes()</code> 才在 <code>pq.read_table</code> 上抛 <code>ArrowInvalid</code>——是<b>预检通过、合并当场崩</b>。已把两个坏 parquet 与对应的两个 <code>file-004.mp4</code> 移到同级 <code>...030000.dropped-20260908/</code>（隔离非删除，附 README 与 <code>info.json.before</code>），<code>info.json</code> 改为 <b>47 / 3627 / "0:47"</b>。</td>
+          <td>已改：该数据集的 <code>meta/info.json</code>。<br><b>未修</b>：写入收尾的 bug 本身，见验收列</td>
+          <td><b>已验证</b>：<code>load_episodes()</code> 读出 47 条 / 3627 帧与 <code>info.json</code> 一致；<code>LeRobotDataset</code> 加载 3627 帧、首末帧都能解码；存活 episode 的 <code>file_index</code> 最大为 3，不引用被丢的 shard。<br><b>仍欠</b>：<code>TerminateAsKeyboardInterrupt</code>（2026-09-02 同样丢 432 帧时加的补丁）<b>没覆盖住这条路径</b>，写入 bug 未修；且导出脚本应在遇到坏 shard 时<b>报错而不是让预检放行</b>。</td>
+        </tr>
+        <tr>
+          <td><span class="badge warn">P1-9</span></td>
+          <td><b>2026-09-08 维持（原 P1-6）。把接管记成带类型的终局失败。</b>机制已经清楚，这条不是判读的前置，但仍该做：每次接管落 <code>takeover_reason ∈ {xy_miss_grasp, misaligned_press, stall, fence, budget}</code>，并记<b>接管瞬间的 xy 残差与 z</b>。有了它，失效模式分布不必再每次从 trace 反推；E2 / E3 的真机验收也能直接按 reason 分组读。</td>
           <td><code>tools/fr3/dagger_takeover.py</code>、<code>tools/data_collection_gui/rollout.py::parse_rollout_intervention</code></td>
           <td>每个 <code>expertSpan</code> 带一个 reason 与一对 (xy 残差, z)；<code>rollout_log</code> 能直接出失效模式分布表。</td>
         </tr>
         <tr>
-          <td><span class="badge warn">P1-7</span></td>
-          <td><b>2026-09-08 保留（原 P1-5）。匹配难度的对照。</b>销距在 08-31（中位 123 mm）与 09-08（199 mm）之间显著变了（p = 0.043），归一化后两代差异不显著（p = 0.142）。<b>本轮补上了它的机制解释</b>：落点 ≈ 距离 × sin(瞄准误差)，所以销越远落点越差是<b>预期内</b>的，不必再当成谜。这条因此从「判读前置」降为「基线口径校准」。</td>
+          <td><span class="badge warn">P1-10</span></td>
+          <td><b>2026-09-08 维持（原 P1-7）。匹配难度的对照。</b>销距在 08-31（中位 123 mm）与 09-08（199 mm）之间显著变了（p = 0.043），归一化后两代差异不显著（p = 0.142）。第三版给过机制解释（落点 ≈ 距离 × sin(瞄准误差)）。本轮补一条更强的先验：示教<b>约 80% 的横向对准在 z = 0.24 以上就做完</b>，所以销距主要影响 0.24 以上那一段，与 E3 / E4 要修的低段是<b>两件事</b>，跑对照时别混在一起读。</td>
           <td>Rollout 页面 + 固定销位清单</td>
-          <td><b>判据</b>：近组 80–150 mm ×10、远组 200–280 mm ×10，同批销位交替跑 cand0907 与 baseline。<br><b>可证伪</b>：若两组的落点<b>不</b>随距离按 sin(瞄准误差) 缩放，本卡的落点模型被推翻。</td>
+          <td><b>判据</b>：近组 80–150 mm ×10、远组 200–280 mm ×10，同批销位交替跑。<br><b>可证伪</b>：若两组落点<b>不</b>随距离按 sin(瞄准误差) 缩放，第三版的落点模型被推翻。</td>
         </tr>
         <tr>
-          <td><span class="badge warn">P1-8</span></td>
-          <td><b>2026-09-08 新增，数据卫生但会挡下一次训练。</b><code>outputs/datasets/dagger_...20260907_060137_030000/</code> 的 <code>meta/episodes/file-004.parquet</code> 与 <code>data/file-004.parquet</code> <b>已损坏</b>（<code>Parquet magic bytes not found in footer</code>，13:43 写入时截断），65 个 episode 里 <b>18 个读不出来</b>。本卡统计是在剩下 47 个上做的。下一次重训前必须先修或先丢，否则要么训练直接崩，要么<b>静默地少训 28% 的 DAgger 数据</b>。</td>
-          <td><code>tools/fr3/dagger_dataset.py</code> 的写入收尾；导出视图时加一次 parquet 可读性校验</td>
-          <td>五个 shard 全部可读，<code>total_episodes</code> 与实际可读数一致；导出脚本在遇到坏 shard 时<b>报错而不是跳过</b>。</td>
-        </tr>
-        <tr>
-          <td><span class="badge todo">P2-9</span></td>
-          <td><b>2026-09-08 维持降级（原 P2-7，夹爪两条）。保留为卫生项，无已证损害。</b>第二版的夹爪结论不受本轮影响：策略自己会合、且是 z 触发（首次闭合 z 中位 0.0535），接管后自主帧 70.7% 处于闭合。<code>state:gripper.pos → action</code> 的 <code>R² = 0.686</code> 仍是训练数据里的真实捷径，<code>gripper_owned</code> 也确实没写进 frame，但<b>两者都没有可归因的 rollout 损害</b>。<b>在瞄准误差修好之前不要动</b>。</td>
+          <td><span class="badge todo">P2-11</span></td>
+          <td><b>2026-09-08 维持降级（原 P2-9）。夹爪两条保留为卫生项，无已证损害。</b>第二版的夹爪结论不受本轮影响：策略自己会合、且是 z 触发（首次闭合 z 中位 0.0535），接管后自主帧 70.7% 处于闭合。<code>state:gripper.pos → action</code> 的 <code>R² = 0.686</code> 仍是训练数据里的真实捷径，<code>gripper_owned</code> 也确实没写进 frame，但<b>两者都没有可归因的 rollout 损害</b>。<b>在 E2 / E3 收敛之前不要动。</b></td>
           <td><code>tools/fr3/fr3_train_il_policy.py --state-keys</code>、<code>tools/fr3/dagger_takeover.py</code></td>
           <td>等主线闭环后再定；动之前先跑不看图线性探针。</td>
         </tr>
         <tr>
-          <td><span class="badge todo">P2-10</span></td>
-          <td><b>2026-09-08 维持（原 P2-8）。确认 dead-time trimming 是否真的进了这个视图。</b>回填 57% → <b>68%</b>，中位单步 <b>0.654 vs baseline 1.643 mm</b>。本轮再次确认这不是成功率主线：失败是<b>方向</b>问题（航向不转），不是<b>速度</b>问题。纯数据卫生。</td>
+          <td><span class="badge todo">P2-12</span></td>
+          <td><b>2026-09-08 维持（原 P2-10）。确认 dead-time trimming 是否真的进了这个视图。</b>回填 57% → <b>68%</b>，中位单步 <b>0.654 vs baseline 1.643 mm</b>。本轮再次确认这不是成功率主线：P0-3 量到策略的<b>下降剖面</b>与示教差 &lt;2 mm/16 步，速度通道是好的，坏的是横向通道的方差。纯数据卫生。</td>
           <td><code>tools/fr3/dagger_dataset.py::DaggerFrameBuffer</code></td>
           <td>该视图 DAgger 半边插孔段的 <b>&lt;0.1 mm 帧占比</b>对着两个锚读：示教 25%、旧 DAgger 37%。</td>
         </tr>
