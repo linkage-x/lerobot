@@ -10316,6 +10316,25 @@ def _set_mujoco_validation_metric(validation: dict[str, Any], key: str, value: s
 
 def _apply_mujoco_replay_output(state: GatewayState, output: str) -> None:
     validation = state.replay.mujocoValidation or _new_mujoco_validation(state, status="running")
+    collision_match = re.search(
+        r"mujoco_dual_collision_result\s+collision_free=(?P<free>True|False)\s+"
+        r"recorded_collision_frames=(?P<frames>\d+)\s+"
+        r"interpolation_collision_segments=(?P<segments>\d+)\s+"
+        r"minimum_distance_m=(?P<distance>-?[0-9.eE+]+)\s+"
+        r"base_calibrated=(?P<calibrated>True|False)\s+"
+        r"geometry_approximate=(?P<approximate>True|False)",
+        output,
+    )
+    if collision_match:
+        validation["collisionCheck"] = {
+            "checked": True,
+            "collisionFree": collision_match.group("free") == "True",
+            "collisionFrameCount": int(collision_match.group("frames")),
+            "interpolationCollisionSegmentCount": int(collision_match.group("segments")),
+            "minimumDistanceM": float(collision_match.group("distance")),
+            "baseTransformCalibrated": collision_match.group("calibrated") == "True",
+            "collisionGeometryApproximate": collision_match.group("approximate") == "True",
+        }
     result_match = re.search(
         r"mujoco_replay_result(?:=|\s+)status=(?P<status>\w+)\s+"
         r"completed_frames=(?P<completed>\d+)\s+total_frames=(?P<total>\d+)\s+"
@@ -10515,6 +10534,21 @@ def _finish_mujoco_validation(state: GatewayState, exit_code: int | None) -> Non
             reasons.append(f"max rotation error {float(max_rot):.2f}deg > {max_rot_threshold:.2f}deg")
     if total > 0 and completed < total:
         reasons.append(f"incomplete episode {completed}/{total} frames")
+    if str(validation.get("cubeMode") or "") == "both":
+        collision = validation.get("collisionCheck") if isinstance(validation.get("collisionCheck"), dict) else {}
+        if not collision.get("checked"):
+            reasons.append("missing dual-arm collision check")
+        else:
+            if not collision.get("collisionFree"):
+                reasons.append(
+                    "dual-arm collision detected "
+                    f"({int(collision.get('collisionFrameCount') or 0)} recorded frames, "
+                    f"{int(collision.get('interpolationCollisionSegmentCount') or 0)} interpolated segments)"
+                )
+            if not collision.get("baseTransformCalibrated"):
+                reasons.append("left/right base transform is assumed, not measured")
+            if collision.get("collisionGeometryApproximate"):
+                reasons.append("FR3 collision geometry uses visual-mesh proxies")
 
     dataset_root_value = str(validation.get("datasetRoot") or "")
     try:
@@ -11041,6 +11075,24 @@ def _approve_mujoco_report(state: GatewayState, cube_mode: str) -> None:
         "maxRotationErrorDeg": max(float(metrics["max_rotation_error_deg"]) for metrics in metric_rows),
         "cubeMode": selected_cube_mode,
     })
+    if selected_cube_mode == "both":
+        collision = report.get("dual_arm_collision") if isinstance(report.get("dual_arm_collision"), dict) else {}
+        base_transforms = (
+            collision.get("base_transforms")
+            if isinstance(collision.get("base_transforms"), dict)
+            else {}
+        )
+        validation["collisionCheck"] = {
+            "checked": bool(collision.get("checked")),
+            "collisionFree": bool(collision.get("collision_free")),
+            "collisionFrameCount": int(collision.get("collision_frame_count") or 0),
+            "interpolationCollisionSegmentCount": int(
+                collision.get("interpolation_collision_segment_count") or 0
+            ),
+            "minimumDistanceM": collision.get("minimum_distance_m"),
+            "baseTransformCalibrated": bool(base_transforms.get("calibrated")),
+            "collisionGeometryApproximate": bool(collision.get("collision_geometry_approximate")),
+        }
     state.replay.mujocoValidation = validation
     _finish_mujoco_validation(state, 0)
     state.log("info" if validation.get("status") == "passed" else "warn", validation["message"])

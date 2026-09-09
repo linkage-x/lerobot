@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.15)
+project(native_plan_audit LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+find_package(pybind11 CONFIG REQUIRED)
+find_package(Eigen3 REQUIRED)
+pybind11_add_module(_native_plan_audit src/audit_binding.cpp src/path.cpp src/trajectory.cpp)
+target_include_directories(_native_plan_audit PRIVATE include)
+target_link_libraries(_native_plan_audit PRIVATE Eigen3::Eigen)
+# Intentionally no libfranka, SDK, Robot controller or network dependency.

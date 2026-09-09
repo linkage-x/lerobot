@@ -1,0 +1,15 @@
+{
+  "blocked": true,
+  "timestamp": "2026-09-02T18:36:00+08:00",
+  "host": "upai-pro03",
+  "reason": "FCI-level 1200-byte/1-kHz preflight failed after host-side tuning: max RTT 1.579 ms exceeds the 0.90 ms gate; an earlier run also showed 0.92% loss and a 1021 ms spike.",
+  "control_command_success_rate_last_motion": 0.73,
+  "host_tuning": {
+    "cpu_frequency_locked": true,
+    "eee_disabled": true,
+    "tso_gso_gro_disabled": true,
+    "nic_irq_cpu": 12,
+    "control_cpu": 13
+  },
+  "required_before_unblock": "Configure the managed switch to isolate/prioritize FR3 traffic (prefer an access VLAN for the robot and a tagged VLAN on Thor, plus strict MAC/IP QoS), then pass the 10000-packet 1200-byte 1-kHz gate and a guarded hold test with control_command_success_rate >= 0.99."
+}

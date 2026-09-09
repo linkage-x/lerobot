@@ -18,9 +18,11 @@ import {
   skipConsequence,
   stepTitle,
 } from "./calibrationGuide";
-import { SolvePanel, type SolveOptions } from "./SolvePanel";
+// The repository also contains `solvePanel.ts`. On case-insensitive macOS,
+// extensionless resolution can pick that helper instead of this component.
+import { SolvePanel, type SolveOptions } from "./SolvePanel.tsx";
 import { captureTally } from "./solvePanel";
-import { SolveProgress } from "./SolveProgress";
+import { SolveProgress } from "./SolveProgress.tsx";
 import { StepCameraPreview } from "./StepCameraPreview";
 import { previewCameras, previewStatus } from "./stepPreview";
 
