@@ -1441,8 +1441,8 @@ padding 占动作监督的比例
         <tr>
           <td><span class="badge warn">E5</span><br><span class="small">2026-09-09 降级：30 分钟的确认</span></td>
           <td><b>2026-09-09 降级（第八版 (4)）。它的结果现在可以直接推出来，不必花半天去等。</b>本条原本是「伺服到示教释放位姿，量终残差」，第七版把它排第一，理由是「两种结果都会改变要不要投 RL」。<b>公差参数到手后，预测已经写死</b>：把 TCP 送到 (0.3597, −0.1331)，销尖会落在 std ≈ 5 mm 的圆盘里，<b>约 75% 的次数偏出 2.5 mm</b>；何况孔还在蠕变。<b>它原本的前提「孔是世界坐标里的一个定点」也已被推翻。</b><br><br><b>仍然值得跑一次，但只作为确认</b>——它是本卡整条推理最直接的可证伪点。</td>
-          <td>Rollout 运行时：在 z 首次下穿 0.12 时把控制切给一个伺服到固定位姿的控制器，量终残差与实际插入成败</td>
-          <td><b>预测</b>：残差 p90 ≫ 2.5 mm，插入成功率远低于示教。<br><b>可证伪（这才是跑它的理由）</b>：<b>若它反而稳定打进去了</b>，则「TCP 散布与销尖脱钩」不成立，第八版整个框架要重来，而且终段问题当场就解决了。<b>这是一次代价 30 分钟、赔率极不对称的下注。</b></td>
+          <td><b>2026-09-09 已实现，可以跑了。</b>新增 <code>tools/fr3/terminal_servo.py</code>，rollout 页面「高级」里填 <b>终段伺服位姿 <code>0.3599,-0.1333,0.0523</code></b>（交接高度默认 0.12）即可。触发是个状态机而不是高度判据：一条 rollout 会两次下穿 0.12（一次是去桌面取销，落到 z=0.046），所以必须<b>握着销、且握着销时曾高于交接高度</b>，再往下穿才交接；握持读的是<b>夹爪指令</b>不是实测宽度（实测在 47% 的帧上读 0）。下降段限速 0.05 m/s 并做<b>接触停止</b>——判据是工具是否持续高于自己的设定点，不是 <code>reach_stall_error_m</code>（那是 IK 够不着，不是有东西挡着）。手腕姿态<b>只记录不控制</b>：E5 问的是位置是否决定销尖，边下边转腕会同时改变两者。</td>
+          <td><b>预测</b>：残差 p90 ≫ 2.5 mm，插入成功率远低于示教。<br><b>可证伪（这才是跑它的理由）</b>：<b>若它反而稳定打进去了</b>，则「TCP 散布与销尖脱钩」不成立，第八版整个框架要重来，而且终段问题当场就解决了。<b>这是一次代价 30 分钟、赔率极不对称的下注。</b><br><b>怎么读</b>：每次结束打一行 <code>[INFO] terminal_servo=done stopped_on=… stopped_z=… above_target_mm=…</code>。<code>stopped_on=target</code> 表示一路无阻到坐底深度；<code>contact</code> 表示销被挡住了，<code>above_target_mm</code> 即它停在坐底深度以上多少——<b>销站在夹具面上和销坐进孔里，是同一个 XY、不同的 z</b>，所以这个高度本身就是插入判据。阈值不写死在代码里，由这一批的分布定。</td>
         </tr>
         <tr>
           <td><span class="badge p0">E4</span><br><span class="small"><b>主线</b>，2026-09-09 提升</span></td>
@@ -1465,7 +1465,7 @@ padding 占动作监督的比例
         <tr>
           <td><span class="badge p0">E3</span><br><span class="small">已实现，待上机；判据已换</span></td>
           <td><b>2026-09-09 代码已落（<code>--action-samples N</code> / <code>--action-aggregate</code>），前置已过，但两条前提都变了。</b>实现的是 <b>medoid 选择</b>：把 observation 沿 batch 维扩到 N（pi05 每个 batch 元素独立采噪声，一次前向即 N 次抽样），比较各 draw <b>在执行视界内</b>的横向位移，执行离圆均值方向最近的<b>那一个真实 draw</b>。默认 <code>--action-samples 1</code>，与现行行为逐字节一致。<br><br><b>变化一：可行性前置 PASS。</b>batch=8 一次前向 中位 500 ms / <b>p90 521 ms</b>（判据 &lt;1.0 s，replan 间隔 ≈1.2 s），只是单次的 <b>2.4 倍</b>不是 8 倍。<br><b>变化二：反对向量平均的论据被 E1 削掉了大半。</b>逐帧 均值模长/单次模长：base <b>0.859</b>（复现 09-08 的 0.80–0.91），dagger108 <b>0.968</b>——在新 ckpt 上平均只吃约 3% 幅度，因为 draw 之间本来就更一致（24° vs 37°）。<b>所以 <code>mean</code> 的 A/B 现在是真要跑的对照，不是走过场。</b></td>
-          <td><code>tools/fr3/fr3_act_infer_real_runtime.py::predict_action_chunk_for_rollout</code>、<code>::select_action_chunk_medoid</code>；<code>src/lerobot/policies/pi05/modeling_pi05.py::sample_actions</code></td>
+          <td><code>tools/fr3/fr3_act_infer_real_runtime.py::predict_action_chunk_for_rollout</code>、<code>::select_action_chunk_medoid</code>；<code>src/lerobot/policies/pi05/modeling_pi05.py::sample_actions</code><br><br><b>2026-09-09 补：上一版「已实现」是不成立的。</b>三个命令行参数只加在 runtime 自己的 parser 上，而 rollout 不是从那里启动的——页面 → <code>rollout.py</code> → <code>FR3_*</code> 环境变量 → <code>run_pick_place_infer_workstation.sh</code> → <code>fr3_act_infer_real.py</code> 的<b>白名单转发</b> → runtime，四层里少任何一层这个参数就根本设不了。三个参数四层全缺，所以这个 A/B <b>此前无法被执行</b>。已补齐。<b>教训</b>：此后凡是给 rollout 加的可调项，验收要包含「从页面上能不能设」，而不只是「runtime <code>--help</code> 里有没有」。</td>
           <td><b>原判据（eff ≥ 0.40）作废——它已经被满足，而且不是 E3 干的</b>：dagger108 在 n=10 下 eff 已是 0.61。<br><b>新判据</b>：同批销位下 <code>--action-samples 8</code>（medoid）对 <code>--action-samples 1</code>，<b>出带误差中位下降 ≥3 mm</b>，且<b>入带误差不变差</b>。<br><b>三臂对照</b>：medoid / mean / N=1 各 ≥8 条，直接判平均是否真的吃幅度。<br><b>可证伪</b>：三臂的出带误差无显著差异 ⇒ 终段瓶颈不在「执行了哪一个 draw」，采样聚合这条线收档，全力转 E4 / E5。</td>
         </tr>
         <tr>
