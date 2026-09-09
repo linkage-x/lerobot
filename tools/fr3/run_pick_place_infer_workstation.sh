@@ -114,6 +114,14 @@ rtc_prefix_attention_schedule="${FR3_RTC_PREFIX_ATTENTION_SCHEDULE-EXP}"
 rtc_replan_queue_size="${FR3_RTC_REPLAN_QUEUE_SIZE-25}"
 rtc_inference_delay_steps="${FR3_RTC_INFERENCE_DELAY_STEPS-}"
 command_ema_alpha="${FR3_COMMAND_EMA_ALPHA-}"
+# E3 and E5. Both default to unset, meaning the runtime's own defaults: one draw executed as it
+# always has been, and no terminal servo. They are here rather than baked in because each is an
+# arm of an experiment that has to be switchable between rollouts without editing anything.
+action_samples="${FR3_ACTION_SAMPLES-}"
+action_aggregate="${FR3_ACTION_AGGREGATE-}"
+action_sample_horizon="${FR3_ACTION_SAMPLE_HORIZON-}"
+terminal_servo_pose="${FR3_TERMINAL_SERVO_POSE-}"
+terminal_servo_handoff_z="${FR3_TERMINAL_SERVO_HANDOFF_Z-}"
 controller_stiffness="${FR3_CONTROLLER_STIFFNESS-}"
 controller_damping="${FR3_CONTROLLER_DAMPING-}"
 gripper_change_delay_s="${FR3_GRIPPER_CHANGE_DELAY_S-}"
@@ -265,6 +273,21 @@ fi
 if [[ -n "${gripper_change_min_delta}" ]]; then
   common_args+=(--gripper-change-min-delta "${gripper_change_min_delta}")
 fi
+if [[ -n "${action_samples}" ]]; then
+  common_args+=(--action-samples "${action_samples}")
+fi
+if [[ -n "${action_aggregate}" ]]; then
+  common_args+=(--action-aggregate "${action_aggregate}")
+fi
+if [[ -n "${action_sample_horizon}" ]]; then
+  common_args+=(--action-sample-horizon "${action_sample_horizon}")
+fi
+if [[ -n "${terminal_servo_pose}" ]]; then
+  common_args+=(--terminal-servo-pose "${terminal_servo_pose}")
+fi
+if [[ -n "${terminal_servo_handoff_z}" ]]; then
+  common_args+=(--terminal-servo-handoff-z "${terminal_servo_handoff_z}")
+fi
 
 home_the_arm() {
   echo "[INFO] moving FR3 ${robot_ip} to fr3_pika_gripper.xml home keyframe (FR3_MOVE_TO_START=0 to skip)"
@@ -281,6 +304,8 @@ announce() {
   echo "[INFO] workspace_fence=${record_config} (robot.workspace_min/max; the box the driver clips to)"
   echo "[INFO] gripper=${gripper_backend}@${gripper_port} max_width=${gripper_max_width_mm}mm close_below=${gripper_close_below:-<disabled>} (normalized 0..1)"
   echo "[INFO] safety: first_frame<${first_frame_max_pos_delta_mm}mm/${first_frame_max_rot_delta_deg}deg, per_step<${max_step_pos_delta_mm}mm/${max_step_rot_delta_deg}deg (vs prev_cmd), leash<${max_leash_pos_delta_mm}mm/${max_leash_rot_delta_deg}deg (vs measured)"
+  echo "[INFO] sampling: samples=${action_samples:-1} aggregate=${action_aggregate:-<runtime default>} horizon=${action_sample_horizon:-<execution horizon>}"
+  echo "[INFO] terminal_servo: pose=${terminal_servo_pose:-<off>} handoff_z=${terminal_servo_handoff_z:-<runtime default>}"
   echo "[INFO] rtc: mode=${rtc_mode} horizon=${rtc_execution_horizon:-<runtime default>} guidance=${rtc_max_guidance_weight:-<runtime default>} schedule=${rtc_prefix_attention_schedule:-<runtime default>} replan_q=${rtc_replan_queue_size:-<runtime default>} delay=${rtc_inference_delay_steps:-auto}"
 }
 
@@ -298,6 +323,11 @@ case "$mode" in
     echo "FR3_RTC_REPLAN_QUEUE_SIZE=${rtc_replan_queue_size:-<runtime default>}"
     echo "FR3_RTC_INFERENCE_DELAY_STEPS=${rtc_inference_delay_steps:-<auto>}"
     echo "FR3_COMMAND_EMA_ALPHA=${command_ema_alpha:-<disabled>}"
+    echo "FR3_ACTION_SAMPLES=${action_samples:-1}"
+    echo "FR3_ACTION_AGGREGATE=${action_aggregate:-<runtime default>}"
+    echo "FR3_ACTION_SAMPLE_HORIZON=${action_sample_horizon:-<execution horizon>}"
+    echo "FR3_TERMINAL_SERVO_POSE=${terminal_servo_pose:-<off>}"
+    echo "FR3_TERMINAL_SERVO_HANDOFF_Z=${terminal_servo_handoff_z:-<runtime default>}"
     echo "FR3_CONTROLLER_STIFFNESS=${controller_stiffness:-<driver default>}"
     echo "FR3_CONTROLLER_DAMPING=${controller_damping:-<driver default>}"
     echo "HF_HOME=${HF_HOME:-<unset, tokenizer will be fetched from huggingface.co>}"

@@ -609,6 +609,46 @@ def test_rollout_runtime_options_reject_invalid_values():
         rollout_backend.sanitize_rollout_runtime_options({"commandEmaAlpha": 1.5})
 
 
+def test_the_sampling_and_terminal_servo_options_reach_the_launcher(tmp_path: Path):
+    """E3 and E5. Both were reachable from the runtime's command line and from nowhere else."""
+
+    runtime_options = rollout_backend.sanitize_rollout_runtime_options(
+        {
+            "actionSamples": 8,
+            "actionAggregate": "mean",
+            "actionSampleHorizon": 10,
+            "terminalServoPose": "0.3599,-0.1333,0.0523",
+            "terminalServoHandoffZ": 0.12,
+        }
+    )
+
+    _, env = _command(tmp_path, runtime_options=runtime_options)
+
+    assert env["FR3_ACTION_SAMPLES"] == "8"
+    assert env["FR3_ACTION_AGGREGATE"] == "mean"
+    assert env["FR3_ACTION_SAMPLE_HORIZON"] == "10"
+    assert env["FR3_TERMINAL_SERVO_POSE"] == "0.3599,-0.1333,0.0523"
+    assert env["FR3_TERMINAL_SERVO_HANDOFF_Z"] == "0.12"
+
+
+def test_the_terminal_servo_is_off_unless_the_page_names_a_pose(tmp_path: Path):
+    """It takes the arm off the policy, so an absent field has to mean absent, never a default."""
+
+    _, env = _command(tmp_path, runtime_options=rollout_backend.sanitize_rollout_runtime_options({}))
+
+    assert "FR3_TERMINAL_SERVO_POSE" not in env
+    assert "FR3_ACTION_SAMPLES" not in env
+
+
+def test_a_terminal_servo_pose_is_refused_by_the_page_the_same_way_the_command_line_refuses_it():
+    with pytest.raises(rollout_backend.RolloutError, match="terminalServoPose"):
+        rollout_backend.sanitize_rollout_runtime_options({"terminalServoPose": "0.36,-0.13"})
+    with pytest.raises(rollout_backend.RolloutError, match="actionAggregate"):
+        rollout_backend.sanitize_rollout_runtime_options({"actionAggregate": "median"})
+    with pytest.raises(rollout_backend.RolloutError, match="actionSamples"):
+        rollout_backend.sanitize_rollout_runtime_options({"actionSamples": 0})
+
+
 def test_an_unknown_mode_is_refused(tmp_path: Path):
     with pytest.raises(rollout_backend.RolloutError, match="Unknown rollout mode"):
         _command(tmp_path, mode="real_yolo")

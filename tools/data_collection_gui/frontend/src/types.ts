@@ -1435,6 +1435,8 @@ export type RolloutRtcMode = "auto" | "enabled" | "disabled";
 
 export type RolloutRtcSchedule = "EXP" | "LINEAR" | "ONES" | "ZEROS";
 
+export type RolloutActionAggregate = "medoid" | "mean";
+
 export type RolloutRuntimeOptions = {
   /** Empty lets the runtime recover the single task prompt recorded in the dataset view. */
   taskPrompt?: string;
@@ -1448,6 +1450,18 @@ export type RolloutRuntimeOptions = {
   rtcInferenceDelaySteps?: number | null;
   /** null or undefined disables extra command EMA smoothing. */
   commandEmaAlpha?: number | null;
+  /** Draw N action chunks per inference and execute one of them (E3). 1, or undefined, is the
+   *  single draw deployment has always used. */
+  actionSamples?: number;
+  /** medoid executes the real draw nearest the draws' mean direction; mean averages them. */
+  actionAggregate?: RolloutActionAggregate;
+  /** Steps of each draw compared when selecting. 0 or undefined uses the execution horizon. */
+  actionSampleHorizon?: number;
+  /** E5. `x,y,z` in metres: below the handoff height, with the peg held, the arm comes off the
+   *  policy and is driven here, then lets go. Empty or undefined leaves the policy in charge. */
+  terminalServoPose?: string;
+  /** null or undefined leaves the runtime's 0.12 m handoff height. */
+  terminalServoHandoffZ?: number | null;
   /** Open a SpaceMouse and let the operator take the arm mid-rollout. Only `real` and
    *  `real_debug` accept it; anything else is refused with a reason rather than dropped. */
   daggerTakeover?: boolean;

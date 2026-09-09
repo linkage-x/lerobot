@@ -11,6 +11,7 @@ import type {
   RolloutLandmarks,
   RolloutOutcomeEntry,
   RolloutRtcMode,
+  RolloutActionAggregate,
   RolloutRtcSchedule,
   RolloutRun,
   RolloutRuntimeOptions,
@@ -121,6 +122,12 @@ export function RolloutPage() {
   const [rtcReplanQueueSize, setRtcReplanQueueSize] = useState("25");
   const [rtcInferenceDelaySteps, setRtcInferenceDelaySteps] = useState("");
   const [commandEmaAlpha, setCommandEmaAlpha] = useState("");
+  // E3 and E5. Both blank by default, which is the deployment that has been running all along:
+  // one draw executed as drawn, and the policy in charge to the end.
+  const [actionSamples, setActionSamples] = useState("");
+  const [actionAggregate, setActionAggregate] = useState<RolloutActionAggregate>("medoid");
+  const [terminalServoPose, setTerminalServoPose] = useState("");
+  const [terminalServoHandoffZ, setTerminalServoHandoffZ] = useState("");
   // Off until a previous rollout says otherwise. Takeover opens a second action source onto a
   // loop that is moving a real arm, so when it does come back on the carry-over notice says so
   // out loud -- the switch itself lives in a subcard that is easy to start a rollout without
@@ -225,6 +232,10 @@ export function RolloutPage() {
       rtcReplanQueueSize: positiveNumberOr(rtcReplanQueueSize, 25),
       rtcInferenceDelaySteps: optionalNumberOrNull(rtcInferenceDelaySteps),
       commandEmaAlpha: optionalNumberOrNull(commandEmaAlpha),
+      actionSamples: positiveNumberOr(actionSamples, 1),
+      actionAggregate,
+      terminalServoPose: terminalServoPose.trim() || undefined,
+      terminalServoHandoffZ: optionalNumberOrNull(terminalServoHandoffZ),
       // Sent only for the modes the launcher forwards it to. On any other mode the gateway
       // refuses the start rather than dropping the setting, so not sending it is what keeps a
       // leftover switch from blocking a smoke test.
@@ -242,6 +253,10 @@ export function RolloutPage() {
       rtcReplanQueueSize,
       rtcInferenceDelaySteps,
       commandEmaAlpha,
+      actionSamples,
+      actionAggregate,
+      terminalServoPose,
+      terminalServoHandoffZ,
       takeoverSupported,
       daggerTakeover,
       daggerRecord,
@@ -361,6 +376,15 @@ export function RolloutPage() {
         );
         setCommandEmaAlpha(
           options.commandEmaAlpha == null ? "" : String(options.commandEmaAlpha)
+        );
+        if (options.actionSamples !== undefined) setActionSamples(String(options.actionSamples));
+        if (options.actionAggregate !== undefined) setActionAggregate(options.actionAggregate);
+        // Deliberately not carried over. Every other knob here tunes how the policy runs; this
+        // one takes the arm off it, and a leftover pose would quietly turn the next rollout into
+        // an E5 trial that nobody asked for.
+        setTerminalServoPose("");
+        setTerminalServoHandoffZ(
+          options.terminalServoHandoffZ == null ? "" : String(options.terminalServoHandoffZ)
         );
         // The switch comes back with the destination and the handback. It is not one of the
         // motion gates -- it opens the SpaceMouse, it does not start the arm -- and a session
@@ -1244,6 +1268,65 @@ export function RolloutPage() {
               <p className="hint">
                 EMA is intentionally off for the first pi0.5+LoRA rollout: RTC replanning already
                 smooths the queue, while extra EMA can blur the final insertion correction.
+              </p>
+              <div className="row-actions">
+                <label className="field inline">
+                  <span>Action draws</span>
+                  <input
+                    value={actionSamples}
+                    onChange={(event) => setActionSamples(event.target.value)}
+                    inputMode="numeric"
+                    placeholder="1"
+                    disabled={isLive}
+                  />
+                </label>
+                <label className="field inline">
+                  <span>Aggregate</span>
+                  <select
+                    value={actionAggregate}
+                    onChange={(event) =>
+                      setActionAggregate(event.target.value as RolloutActionAggregate)
+                    }
+                    disabled={isLive}
+                  >
+                    <option value="medoid">medoid (executes a real draw)</option>
+                    <option value="mean">mean (averages them)</option>
+                  </select>
+                </label>
+              </div>
+              <p className="hint">
+                More than one draw costs one batched forward, measured at 521 ms p90 for eight
+                against a 1.2 s replan interval. It aims at the 52-55&deg; conditional width the
+                offline probe measured below z = 0.20: the mean direction is right, one draw is not.
+              </p>
+              <div className="row-actions">
+                <label className="field inline">
+                  <span>Terminal servo pose</span>
+                  <input
+                    value={terminalServoPose}
+                    onChange={(event) => setTerminalServoPose(event.target.value)}
+                    placeholder="off; e.g. 0.3599,-0.1333,0.0523"
+                    disabled={isLive}
+                  />
+                </label>
+                <label className="field inline">
+                  <span>Handoff z</span>
+                  <input
+                    value={terminalServoHandoffZ}
+                    onChange={(event) => setTerminalServoHandoffZ(event.target.value)}
+                    inputMode="decimal"
+                    placeholder="0.12"
+                    disabled={isLive}
+                  />
+                </label>
+              </div>
+              <p className="hint">
+                E5. Once the arm is descending below the handoff height <em>with the peg held</em>,
+                it comes off the policy and is driven to this absolute pose, then lets go. The
+                demonstrations that released at the seated depth mean 0.3599,-0.1333,0.0523 and
+                scatter a median 3.5 mm about it against a 2.5 mm radial clearance, so this is
+                expected to miss — it is run because inserting anyway would overturn that reading.
+                Blank on every fresh page load, deliberately.
               </p>
             </>
           )}

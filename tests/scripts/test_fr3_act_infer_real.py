@@ -205,6 +205,57 @@ def test_policy_compile_override_leaves_uncompiled_policy_unchanged(capsys):
     assert cfg.compile_model is False
     assert captured.out == ''
 
+def test_build_docker_command_passes_the_sampling_and_terminal_servo_flags(tmp_path: Path):
+    """The launcher forwards a whitelist, so a runtime flag missing from it cannot be set at all.
+
+    Both of these were shipped on the runtime and reachable from nowhere the operator launches
+    from, which is the same as not having shipped them.
+    """
+
+    args = fr3_act_infer_real.parse_args(
+        [
+            '--workspace',
+            str(tmp_path),
+            '--checkpoint=/lerobot/outputs/train/2026-03-19/10-48-39_act/checkpoints/060000',
+            '--camera-config=/lerobot/tools/fr3/fr3_act_infer_camera_config.yaml',
+            '--action-samples',
+            '8',
+            '--action-aggregate',
+            'mean',
+            '--action-sample-horizon',
+            '10',
+            '--terminal-servo-pose',
+            '0.3599,-0.1333,0.0523',
+            '--terminal-servo-handoff-z',
+            '0.12',
+        ]
+    )
+
+    command_text = ' '.join(fr3_act_infer_real.build_docker_command(args))
+
+    assert '--action-samples=8' in command_text
+    assert '--action-aggregate=mean' in command_text
+    assert '--action-sample-horizon=10' in command_text
+    assert '--terminal-servo-pose=0.3599,-0.1333,0.0523' in command_text
+    assert '--terminal-servo-handoff-z=0.12' in command_text
+
+
+def test_build_docker_command_leaves_the_terminal_servo_out_when_no_pose_was_given(tmp_path: Path):
+    args = fr3_act_infer_real.parse_args(
+        [
+            '--workspace',
+            str(tmp_path),
+            '--checkpoint=/lerobot/outputs/train/2026-03-19/10-48-39_act/checkpoints/060000',
+            '--camera-config=/lerobot/tools/fr3/fr3_act_infer_camera_config.yaml',
+        ]
+    )
+
+    command_text = ' '.join(fr3_act_infer_real.build_docker_command(args))
+
+    assert '--terminal-servo' not in command_text
+    assert '--action-samples' not in command_text
+
+
 def test_build_docker_command_passes_preview_and_safety_flags(tmp_path: Path):
     args = fr3_act_infer_real.parse_args(
         [

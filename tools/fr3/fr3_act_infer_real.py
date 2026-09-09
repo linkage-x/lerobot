@@ -162,6 +162,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--rtc-prefix-attention-schedule', choices=RTC_PREFIX_ATTENTION_SCHEDULE_CHOICES, default=None)
     parser.add_argument('--rtc-replan-queue-size', type=int, default=None)
     parser.add_argument('--rtc-inference-delay-steps', type=int, default=None)
+    # Sampling aggregation (E3) and the terminal servo (E5). Both are experiments driven from
+    # the rollout page, and both are forwarded rather than defaulted here so that the runtime
+    # stays the single place their defaults are written down.
+    parser.add_argument('--action-samples', type=int, default=None)
+    parser.add_argument('--action-aggregate', choices=('medoid', 'mean'), default=None)
+    parser.add_argument('--action-sample-horizon', type=int, default=None)
+    parser.add_argument('--terminal-servo-pose', default=None)
+    parser.add_argument('--terminal-servo-handoff-z', type=float, default=None)
     parser.add_argument(
         '--use-otg',
         dest='use_otg',
@@ -638,6 +646,19 @@ def build_docker_command(args: argparse.Namespace) -> list[str]:
         ),
         *([f'--rtc-replan-queue-size={args.rtc_replan_queue_size}'] if args.rtc_replan_queue_size is not None else []),
         *([f'--rtc-inference-delay-steps={args.rtc_inference_delay_steps}'] if args.rtc_inference_delay_steps is not None else []),
+        *([f'--action-samples={args.action_samples}'] if args.action_samples is not None else []),
+        *([f'--action-aggregate={args.action_aggregate}'] if args.action_aggregate is not None else []),
+        *([f'--action-sample-horizon={args.action_sample_horizon}'] if args.action_sample_horizon is not None else []),
+        *(
+            [f'--terminal-servo-pose={shlex.quote(args.terminal_servo_pose)}']
+            if args.terminal_servo_pose
+            else []
+        ),
+        *(
+            [f'--terminal-servo-handoff-z={args.terminal_servo_handoff_z}']
+            if args.terminal_servo_handoff_z is not None
+            else []
+        ),
         *(['--use-otg'] if args.use_otg is True else ['--no-use-otg'] if args.use_otg is False else []),
         *([f'--otg-control-frequency={args.otg_control_frequency}'] if args.otg_control_frequency is not None else []),
         *(

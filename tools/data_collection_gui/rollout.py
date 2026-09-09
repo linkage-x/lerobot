@@ -25,6 +25,9 @@ from typing import Any
 # re-matched here because a live frame is the one runtime line whose format is machine-chosen
 # on both ends -- a second regex for it would be a second definition of the wire format.
 from tools.fr3.live_frames import parse_live_frame  # noqa: F401  (re-exported for the gateway)
+# Imported rather than re-implemented: the page and the command line must refuse the same poses,
+# and a second copy of "three finite metres" is a second thing to keep in step.
+from tools.fr3.terminal_servo import TerminalServoError, parse_terminal_servo_pose
 
 LAUNCHER = Path("tools/fr3/run_pick_place_infer_workstation.sh")
 
@@ -65,6 +68,14 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_RTC_REPLAN_QUEUE_SIZE",
     "FR3_RTC_INFERENCE_DELAY_STEPS",
     "FR3_COMMAND_EMA_ALPHA",
+    # Sampling aggregation (E3) and the terminal servo (E5). Cleared with the rest for the same
+    # reason the DAgger keys are: a shell that once exported FR3_TERMINAL_SERVO_POSE would
+    # otherwise take the arm off the policy in a rollout the browser never asked it to.
+    "FR3_ACTION_SAMPLES",
+    "FR3_ACTION_AGGREGATE",
+    "FR3_ACTION_SAMPLE_HORIZON",
+    "FR3_TERMINAL_SERVO_POSE",
+    "FR3_TERMINAL_SERVO_HANDOFF_Z",
     # DAgger takeover. Cleared from the inherited environment like the rest, and for a sharper
     # reason: a shell that once exported FR3_DAGGER_TAKEOVER=1 would otherwise open a second
     # action source onto a moving arm in a rollout the browser never asked to be steerable.
@@ -73,6 +84,7 @@ ROLLOUT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "FR3_DAGGER_RELEASE_AFTER_S",
 )
 RTC_MODES = {"auto", "enabled", "disabled"}
+ACTION_AGGREGATES = {"medoid", "mean"}
 
 # Where corrections go when the operator turns takeover on and names no directory. One directory
 # per checkpoint, not per launch: a DAgger dataset is only worth training on once it has enough
@@ -331,6 +343,34 @@ def sanitize_rollout_runtime_options(raw: Any) -> dict[str, str]:
     )
     if ema is not None and ema > 1.0:
         raise RolloutError("commandEmaAlpha must be <= 1.")
+
+    _set_optional_int_env(options, raw, "actionSamples", "FR3_ACTION_SAMPLES", minimum=1)
+    aggregate = _optional_text(raw.get("actionAggregate"))
+    if aggregate:
+        aggregate = aggregate.lower()
+        if aggregate not in ACTION_AGGREGATES:
+            raise RolloutError(
+                f"actionAggregate must be one of {', '.join(sorted(ACTION_AGGREGATES))}; "
+                f"got {raw.get('actionAggregate')!r}."
+            )
+        options["FR3_ACTION_AGGREGATE"] = aggregate
+    _set_optional_int_env(
+        options, raw, "actionSampleHorizon", "FR3_ACTION_SAMPLE_HORIZON", minimum=0
+    )
+
+    # E5. Refused here as well as at startup, because the page is where a mistyped pose is
+    # cheapest to catch -- the alternative is a launcher that comes up, homes the arm and then
+    # exits on its own argument.
+    servo_pose = _optional_text(raw.get("terminalServoPose"))
+    if servo_pose:
+        try:
+            parse_terminal_servo_pose(servo_pose)
+        except TerminalServoError as exc:
+            raise RolloutError(f"terminalServoPose is not usable: {exc}") from exc
+        options["FR3_TERMINAL_SERVO_POSE"] = servo_pose
+    _set_optional_float_env(
+        options, raw, "terminalServoHandoffZ", "FR3_TERMINAL_SERVO_HANDOFF_Z", minimum=0.0
+    )
 
     if _parse_bool_field(raw.get("daggerTakeover", False), "daggerTakeover"):
         options["FR3_DAGGER_TAKEOVER"] = "1"
