@@ -5,6 +5,7 @@ import type {
   CalibrationStatus,
   CalibrationSession,
   MarkerTcpSession,
+  P1EyeHandStatus,
   ConfigSummary,
   DatasetExportStatus,
   DeploymentProfile,
@@ -67,6 +68,7 @@ export type GuiSnapshot = {
   calibration: CalibrationStatus;
   calibrationSession?: CalibrationSession;
   markerTcp?: MarkerTcpSession;
+  p1EyeHand?: P1EyeHandStatus;
   datasetExport: DatasetExportStatus;
   recordedDatasets: RecordedDataset[];
   processing: ProcessingItem[];
@@ -202,6 +204,16 @@ export class DataCollectionGuiApi {
       pendingSampleId: "",
       message: "Marker→TCP repeatability session not started",
       reportPath: ""
+    },
+    p1EyeHand: {
+      state: "idle",
+      message: "P1_simple_eye_hand_calibration has not run",
+      pid: null,
+      runDir: "",
+      calibrationPath: "",
+      candidatePath: "",
+      activePath: "",
+      log: []
     },
     datasetExport: {
       state: "idle",
@@ -858,6 +870,20 @@ export class DataCollectionGuiApi {
     return this.calibrationSessionPost("/api/calibration/marker-tcp/report");
   }
 
+  async startP1EyeHand(confirmation: string): Promise<{ ok: boolean; error?: string }> {
+    return this.calibrationSessionPost(
+      `/api/calibration/p1-eye-hand/start?confirmation=${encodeURIComponent(confirmation)}`
+    );
+  }
+
+  async cancelP1EyeHand(): Promise<{ ok: boolean; error?: string }> {
+    return this.calibrationSessionPost("/api/calibration/p1-eye-hand/cancel");
+  }
+
+  async activateP1EyeHand(): Promise<{ ok: boolean; error?: string }> {
+    return this.calibrationSessionPost("/api/calibration/p1-eye-hand/activate");
+  }
+
   async fetchRigCheck(): Promise<RigCheckResponse | null> {
     try {
       const response = await fetch(`${this.apiBase}/api/calibration/rig-check`, {
@@ -1335,6 +1361,7 @@ export class DataCollectionGuiApi {
       tasks: snapshot.tasks ?? this.snapshot.tasks ?? [],
       calibration: snapshot.calibration ?? this.snapshot.calibration,
       markerTcp: snapshot.markerTcp ?? this.snapshot.markerTcp,
+      p1EyeHand: snapshot.p1EyeHand ?? this.snapshot.p1EyeHand,
       datasetExport: snapshot.datasetExport ?? {
         ...this.snapshot.datasetExport,
         datasetRoot: snapshot.replay.datasetRoot || snapshot.recording.datasetRoot,

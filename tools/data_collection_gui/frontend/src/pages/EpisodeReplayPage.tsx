@@ -360,8 +360,8 @@ export function P0NativeArmReplayPanel({
   return (
     <section className="panel real-robot-panel">
       <div className="panel-heading">
-        <h2>P0 Native Arm Replay</h2>
-        <span>Frozen 2026-09-08 package · arm only</span>
+        <h2>P0 Native Arm Replay · Checks Disabled</h2>
+        <span>Frozen 2026-09-08 knots · arm only · high risk</span>
       </div>
       <div className="real-robot-settings">
         <div className="teleop-config-grid">
@@ -387,15 +387,15 @@ export function P0NativeArmReplayPanel({
         </div>
         <div className="control-row">
           <button disabled={busy || active || !widthValid} onClick={() => onStart(episode, width, false, "")} type="button">
-            Run offline check
+            Inspect fixed plan (no audit)
           </button>
           <button className="danger" disabled={busy || active || !widthValid} onClick={() => setConfirmOpen(true)} type="button">
-            Execute P0 on FR3
+            Execute unchecked P0 on FR3
           </button>
           <button disabled={busy || !active} onClick={onAbort} type="button">Abort</button>
         </div>
         <p className="panel-note">
-          Runs only the fixed Thor package. The gripper is not commanded; the width is a declared physical opening used by safety checks. Abort is not an emergency stop.
+          High risk: trajectory audit, robot-state safety checks, and collision/scene checks are disabled. panda_py moves from the measured joints to the stored start pose at speed factor 0.05; replay chunk replanning remains disabled. The gripper is not commanded. Abort is not an emergency stop.
         </p>
       </div>
       <div className="real-replay-log-block">
@@ -410,14 +410,15 @@ export function P0NativeArmReplayPanel({
       {confirmOpen ? (
         <div className="danger-modal-backdrop" role="presentation">
           <div aria-labelledby="p0-native-confirm-title" aria-modal="true" className="danger-modal" role="dialog">
-            <h3 id="p0-native-confirm-title">Confirm P0 native hardware motion</h3>
+            <h3 id="p0-native-confirm-title">Confirm unchecked P0 hardware motion</h3>
             <p>
-              Episode <strong>{episode}</strong>, fixed opening <strong>{width} mm</strong>. This moves FR3 using the frozen P0 native trajectory package.
+              Episode <strong>{episode}</strong>, declared fixed opening <strong>{width} mm</strong>. This sends the frozen P0 joint knots to FR3 without project-side trajectory or environment validation.
             </p>
             <ul>
-              <li>The gripper is empty and physically holds the declared opening.</li>
-              <li>The workspace, table edge, cables and payload are checked.</li>
-              <li>An operator is at the robot with the physical emergency stop available.</li>
+              <li>No trajectory audit, robot-state safety gate, or collision/scene check will run.</li>
+              <li>panda_py will read the current joints and move to the stored trajectory start pose at speed factor 0.05.</li>
+              <li>That start path is unchecked, and no measured-position replanning occurs at replay chunk boundaries.</li>
+              <li>The gripper is empty, the workspace is cleared manually, and an operator holds the physical emergency stop.</li>
             </ul>
             <label>
               Type <strong>YES</strong> to execute

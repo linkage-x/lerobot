@@ -2072,7 +2072,7 @@ def test_real_replay_rejects_two_cube_mode(tmp_path):
 def test_p0_native_replay_command_is_fixed_and_validated():
     assert gateway._p0_native_replay_command(0, 88.0, execute=False) == [
         "bash",
-        "/home/nvidia/box_api/replay_p0_native_arm_only_20260908/run_native_arm.sh",
+        "/home/nvidia/lerobot/tools/thor/run_p0_native_arm_unchecked.sh",
         "0",
         "--gripper-width-mm",
         "88",
@@ -2081,7 +2081,7 @@ def test_p0_native_replay_command_is_fixed_and_validated():
         "sudo",
         "-n",
         "bash",
-        "/home/nvidia/box_api/replay_p0_native_arm_only_20260908/run_native_arm.sh",
+        "/home/nvidia/lerobot/tools/thor/run_p0_native_arm_unchecked.sh",
         "1",
         "--gripper-width-mm",
         "12.5",
@@ -2108,6 +2108,34 @@ def test_p0_native_execute_requires_exact_confirmation(tmp_path):
         gateway._start_p0_native_replay(state, "0", "88", execute=True, confirmation="yes")
 
 
+def test_p0_native_execute_gets_confirmed_tty(tmp_path):
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys; "
+            "print(f'isatty={sys.stdin.isatty()}', flush=True); "
+            "print(f'confirmation={input().strip()}', flush=True)"
+        ),
+    ]
+
+    process, master_fd = gateway._spawn_p0_native_process(
+        command,
+        tmp_path,
+        execute=True,
+        confirmation="YES",
+    )
+    try:
+        output, _ = process.communicate(timeout=5)
+    finally:
+        if master_fd is not None:
+            os.close(master_fd)
+
+    assert process.returncode == 0
+    assert "isatty=True" in output
+    assert "confirmation=YES" in output
+
+
 def test_p0_native_replay_is_thor_only(tmp_path):
     state = gateway.GatewayState(
         repo_root=tmp_path,
@@ -2120,6 +2148,23 @@ def test_p0_native_replay_is_thor_only(tmp_path):
 
     with pytest.raises(RuntimeError, match="only available on the Thor"):
         gateway._start_p0_native_replay(state, "0", "88", execute=False)
+
+
+def test_p1_eye_hand_requires_exact_motion_confirmation(tmp_path):
+    state = gateway.GatewayState(
+        repo_root=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+        profile="thor",
+    )
+
+    result = gateway._start_p1_eye_hand(state, "YES")
+
+    assert result["ok"] is False
+    assert "P1_MOVE_FR3" in result["error"]
+    assert state.p1_eye_hand_process is None
 
 
 def test_real_preflight_failure_is_preserved_in_panel_log(monkeypatch, tmp_path):

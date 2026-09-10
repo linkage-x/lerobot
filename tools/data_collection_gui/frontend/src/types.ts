@@ -149,6 +149,17 @@ export type MarkerTcpSession = {
   trackingRunPath?: string;
 };
 
+export type P1EyeHandStatus = {
+  state: "idle" | "preparing" | "capturing" | "detecting" | "retargeting" | "ready" | "active" | "failed" | "cancelled" | string;
+  message: string;
+  pid: number | null;
+  runDir: string;
+  calibrationPath: string;
+  candidatePath: string;
+  activePath: string;
+  log: string[];
+};
+
 export type RecordingBackend = "real" | "sim";
 
 export type TeleopCameraView = {

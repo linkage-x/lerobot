@@ -11,6 +11,7 @@ import ipaddress
 import json
 import math
 import os
+import pty
 import queue
 import re
 import select
@@ -335,6 +336,18 @@ class MarkerTcpSession:
 
 
 @dataclass
+class P1EyeHandStatus:
+    state: str = "idle"  # idle | preparing | capturing | detecting | retargeting | ready | active | failed | cancelled
+    message: str = "P1 simple eye-hand calibration has not run"
+    runDir: str = ""
+    calibrationPath: str = ""
+    candidatePath: str = ""
+    activePath: str = ""
+    pid: int | None = None
+    log: list[str] = field(default_factory=list)
+
+
+@dataclass
 class GatewayState:
     repo_root: Path
     config_path: Path
@@ -348,6 +361,7 @@ class GatewayState:
     calibration: CalibrationStatus = field(default_factory=CalibrationStatus)
     calibration_session: CalibrationSession = field(default_factory=CalibrationSession)
     marker_tcp_session: MarkerTcpSession = field(default_factory=MarkerTcpSession)
+    p1_eye_hand: P1EyeHandStatus = field(default_factory=P1EyeHandStatus)
     dataset_export: DatasetExportStatus = field(default_factory=DatasetExportStatus)
     teleop: TeleopStatus = field(default_factory=TeleopStatus)
     export_process: subprocess.Popen[str] | None = None
@@ -357,6 +371,11 @@ class GatewayState:
     process: subprocess.Popen[str] | None = None
     replay_process: subprocess.Popen[str] | None = None
     replay_process_kind: str = ""
+    # The frozen P0 executor deliberately rejects non-interactive stdin. Keep
+    # the PTY master alive for the lifetime of that child so its slave remains
+    # a real terminal after the gateway supplies the confirmed YES response.
+    p0_native_pty_master_fd: int | None = None
+    p1_eye_hand_process: subprocess.Popen[str] | None = None
     teleop_process: subprocess.Popen[str] | None = None
     teleop_started_at_s: float | None = None
     realsense_preview_process: subprocess.Popen[str] | None = None
@@ -3343,6 +3362,182 @@ def _cancel_calibration_session(state: GatewayState) -> dict[str, Any]:
 
 def _marker_tcp_root(state: GatewayState) -> Path:
     return state.repo_root / "outputs" / "metrology" / "marker_tcp_repeatability"
+
+
+P1_EYE_HAND_SCRIPT = Path("tools/thor/p1_simple_eye_hand_calibration.py")
+
+
+def _p1_eye_hand_payload(state: GatewayState) -> dict[str, Any]:
+    if state.p1_eye_hand_process is None and state.p1_eye_hand.state == "idle":
+        root = state.repo_root / "outputs/calibration/p1_simple_eye_hand_calibration"
+        active_path = root / "active.json"
+        if active_path.is_file():
+            with suppress(Exception):
+                active = json.loads(active_path.read_text(encoding="utf-8"))
+                state.p1_eye_hand.state = "active"
+                state.p1_eye_hand.message = "P1 relocalized P0 plan is active"
+                state.p1_eye_hand.runDir = str(active.get("run_dir", ""))
+                state.p1_eye_hand.calibrationPath = str(active.get("calibration_path", ""))
+                state.p1_eye_hand.candidatePath = str(active.get("plan_path", ""))
+                state.p1_eye_hand.activePath = str(active_path)
+        else:
+            for run_dir in sorted(root.glob("run_*"), reverse=True):
+                calibration_path = run_dir / "calibration.json"
+                candidate_path = run_dir / "p0_relocalized_timed_plan.json"
+                if not calibration_path.is_file() or not candidate_path.is_file():
+                    continue
+                with suppress(Exception):
+                    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+                    if calibration.get("status") == "passed":
+                        state.p1_eye_hand.state = "ready"
+                        state.p1_eye_hand.message = "Passing P1 candidate ready for explicit activation"
+                        state.p1_eye_hand.runDir = str(run_dir)
+                        state.p1_eye_hand.calibrationPath = str(calibration_path)
+                        state.p1_eye_hand.candidatePath = str(candidate_path)
+                        break
+    return asdict(state.p1_eye_hand)
+
+
+def _p1_eye_hand_python(state: GatewayState) -> Path:
+    candidates = [
+        state.repo_root / ".venv-fr3/bin/python",
+        Path("/home/nvidia/Code/infer/.venv-fr3/bin/python"),
+        state.repo_root / ".venv/bin/python3",
+        Path(sys.executable),
+    ]
+    return next((path for path in candidates if path.is_file()), Path(sys.executable))
+
+
+def _p1_eye_hand_env(state: GatewayState) -> dict[str, str]:
+    env = os.environ.copy()
+    lib_dirs = [
+        state.repo_root / ".venv-fr3/lib/python3.12/site-packages/cmeel.prefix/lib",
+        Path("/home/nvidia/Code/infer/.venv-fr3/lib/python3.12/site-packages/cmeel.prefix/lib"),
+        Path("/usr/local/lib"),
+    ]
+    entries = [str(path) for path in lib_dirs if path.is_dir()]
+    if env.get("LD_LIBRARY_PATH"):
+        entries.append(env["LD_LIBRARY_PATH"])
+    env["LD_LIBRARY_PATH"] = ":".join(entries)
+    env["PYTHONPATH"] = f"{state.repo_root / 'src'}:{state.repo_root}:{env.get('PYTHONPATH', '')}"
+    return env
+
+
+def _p1_eye_hand_reader(state: GatewayState, process: subprocess.Popen[str]) -> None:
+    assert process.stdout is not None
+    for raw in process.stdout:
+        line = raw.rstrip("\n")
+        with state.lock:
+            state.p1_eye_hand.log.append(line)
+            del state.p1_eye_hand.log[:-240]
+            if line.startswith("P1_STATUS "):
+                with suppress(json.JSONDecodeError):
+                    payload = json.loads(line[len("P1_STATUS ") :])
+                    state.p1_eye_hand.state = str(payload.get("stage", state.p1_eye_hand.state))
+                    state.p1_eye_hand.message = str(payload.get("message", state.p1_eye_hand.message))
+                    state.p1_eye_hand.runDir = str(payload.get("runDir", state.p1_eye_hand.runDir))
+                    state.p1_eye_hand.calibrationPath = str(
+                        payload.get("calibrationPath", state.p1_eye_hand.calibrationPath)
+                    )
+                    state.p1_eye_hand.candidatePath = str(payload.get("candidatePath", state.p1_eye_hand.candidatePath))
+                    state.p1_eye_hand.activePath = str(payload.get("activePath", state.p1_eye_hand.activePath))
+    rc = process.wait()
+    with state.lock:
+        if state.p1_eye_hand_process is process:
+            state.p1_eye_hand_process = None
+        state.p1_eye_hand.pid = None
+        if rc != 0 and state.p1_eye_hand.state != "cancelled":
+            state.p1_eye_hand.state = "failed"
+            state.p1_eye_hand.message = f"P1 calibration exited with code {rc}"
+            state.log("error", state.p1_eye_hand.message)
+        elif state.p1_eye_hand.state not in {"ready", "active", "cancelled"}:
+            state.p1_eye_hand.state = "ready"
+            state.p1_eye_hand.message = "P1 candidate ready for review and activation"
+
+
+def _start_p1_eye_hand(state: GatewayState, confirmation: str) -> dict[str, Any]:
+    if state.profile != "thor":
+        return {"ok": False, "error": "P1 eye-hand calibration is only available on Thor"}
+    if confirmation != "P1_MOVE_FR3":
+        return {"ok": False, "error": "Type the exact confirmation P1_MOVE_FR3"}
+    if state.process is not None and state.process.poll() is None:
+        return {"ok": False, "error": "Stop the active recorder before P1 calibration"}
+    if state.replay_process is not None and state.replay_process.poll() is None:
+        return {"ok": False, "error": "Stop the active replay before P1 calibration"}
+    if state.p1_eye_hand_process is not None and state.p1_eye_hand_process.poll() is None:
+        return {"ok": False, "error": "P1 calibration is already running"}
+    script = state.repo_root / P1_EYE_HAND_SCRIPT
+    if not script.is_file():
+        return {"ok": False, "error": f"P1 script missing: {script}"}
+    command = [
+        str(_p1_eye_hand_python(state)), str(script), "run", "--execute",
+        "--confirmation", confirmation, "--count", "50",
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=state.repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+        env=_p1_eye_hand_env(state),
+    )
+    state.p1_eye_hand = P1EyeHandStatus(
+        state="capturing",
+        message=(
+            "HIGH RISK: FR3 is moving through 50 selected 0720 extrinsics-database poses. "
+            "Targets below TCP Z=0.250469 m are filtered using the measured table-contact "
+            "Z=0.100469 m, and camera-near poses are prioritized; no project scene/collision "
+            "model check validates those paths after the base move. Keep the physical E-stop ready."
+        ),
+        pid=process.pid,
+    )
+    state.p1_eye_hand_process = process
+    state.log("warn", f"Started P1_simple_eye_hand_calibration pid={process.pid}; real FR3 motion authorized")
+    Thread(target=_p1_eye_hand_reader, args=(state, process), daemon=True, name="p1-eye-hand-reader").start()
+    return {"ok": True, "p1EyeHand": _p1_eye_hand_payload(state)}
+
+
+def _cancel_p1_eye_hand(state: GatewayState) -> dict[str, Any]:
+    process = state.p1_eye_hand_process
+    if process is not None and process.poll() is None:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+    state.p1_eye_hand.state = "cancelled"
+    state.p1_eye_hand.message = "P1 calibration cancelled; use the physical E-stop for immediate safety"
+    state.p1_eye_hand.pid = None
+    return {"ok": True, "p1EyeHand": _p1_eye_hand_payload(state)}
+
+
+def _activate_p1_eye_hand(state: GatewayState) -> dict[str, Any]:
+    if state.p1_eye_hand.state != "ready" or not state.p1_eye_hand.calibrationPath:
+        return {"ok": False, "error": "A passing P1 candidate must be ready before activation"}
+    run_dir = Path(state.p1_eye_hand.calibrationPath).parent
+    command = [
+        str(_p1_eye_hand_python(state)),
+        str(state.repo_root / P1_EYE_HAND_SCRIPT),
+        "activate",
+        str(run_dir),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=state.repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_p1_eye_hand_env(state),
+    )
+    output = (completed.stdout + completed.stderr).strip()
+    state.p1_eye_hand.log.extend(output.splitlines())
+    del state.p1_eye_hand.log[:-240]
+    if completed.returncode != 0:
+        return {"ok": False, "error": output or f"activation exited with code {completed.returncode}"}
+    state.p1_eye_hand.state = "active"
+    state.p1_eye_hand.message = "P1 relocalized P0 plan is active for the next unchecked replay"
+    active_path = state.repo_root / "outputs/calibration/p1_simple_eye_hand_calibration/active.json"
+    state.p1_eye_hand.activePath = str(active_path)
+    state.log("warn", f"Activated P1 relocalized P0 plan: {active_path}")
+    return {"ok": True, "p1EyeHand": _p1_eye_hand_payload(state)}
 
 
 def _marker_tcp_session_path(state: GatewayState) -> Path | None:
@@ -9209,6 +9404,8 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
     replay_process = state.replay_process
     if replay_process is not None and replay_process.poll() is not None:
         replay_kind = state.replay_process_kind or "mujoco"
+        if replay_kind.startswith("p0_native_"):
+            _close_p0_native_pty(state)
         label = (
             "MuJoCo replay"
             if replay_kind == "mujoco"
@@ -9336,6 +9533,7 @@ def _snapshot(state: GatewayState) -> dict[str, Any]:
         "calibration": _calibration_payload(state),
         "calibrationSession": _calibration_session_payload(state),
         "markerTcp": _marker_tcp_session_payload(state),
+        "p1EyeHand": _p1_eye_hand_payload(state),
         "recordedDatasets": recorded_datasets,
         "processing": list(state.cached_processing_items),
         "trajectory": trajectory,
@@ -9871,6 +10069,8 @@ def _box_touch_cali_log_payload(state: GatewayState) -> dict[str, Any]:
 
 
 def _connect_recorder(state: GatewayState, *, backend: str | None = None) -> None:
+    if state.p1_eye_hand_process is not None and state.p1_eye_hand_process.poll() is None:
+        raise RuntimeError("P1 eye-hand calibration owns the FR3 and cameras; cancel it before Connect")
     if state.process is not None and state.process.poll() is None:
         state.recording.message = "Devices are already connected"
         return
@@ -11225,7 +11425,7 @@ def _append_real_replay_log(state: GatewayState, stage: str, message: str) -> No
 
 
 P0_NATIVE_REPLAY_SCRIPT = Path(
-    "/home/nvidia/box_api/replay_p0_native_arm_only_20260908/run_native_arm.sh"
+    "/home/nvidia/lerobot/tools/thor/run_p0_native_arm_unchecked.sh"
 )
 P0_NATIVE_MAX_GRIPPER_WIDTH_MM = 89.05
 
@@ -11236,8 +11436,66 @@ def _append_p0_native_log(state: GatewayState, stage: str, message: str) -> None
     del state.replay.p0NativeLog[:-120]
 
 
+def _close_p0_native_pty(state: GatewayState) -> None:
+    master_fd = state.p0_native_pty_master_fd
+    state.p0_native_pty_master_fd = None
+    if master_fd is not None:
+        with suppress(OSError):
+            os.close(master_fd)
+
+
+def _spawn_p0_native_process(
+    command: Sequence[str],
+    cwd: Path,
+    *,
+    execute: bool,
+    confirmation: str = "",
+) -> tuple[subprocess.Popen[str], int | None]:
+    """Start the frozen executor with a TTY only for confirmed hardware motion."""
+    if execute and confirmation != "YES":
+        raise RuntimeError("P0 native hardware replay requires the exact confirmation YES")
+
+    master_fd: int | None = None
+    slave_fd: int | None = None
+    process: subprocess.Popen[str] | None = None
+    try:
+        if execute:
+            master_fd, slave_fd = pty.openpty()
+        process = subprocess.Popen(
+            list(command),
+            cwd=cwd,
+            stdin=slave_fd if execute else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        if slave_fd is not None:
+            os.close(slave_fd)
+            slave_fd = None
+        if execute:
+            assert master_fd is not None
+            payload = b"YES\n"
+            if os.write(master_fd, payload) != len(payload):
+                raise RuntimeError("Failed to send the complete P0 native confirmation")
+        return process, master_fd
+    except Exception:
+        if slave_fd is not None:
+            with suppress(OSError):
+                os.close(slave_fd)
+        if master_fd is not None:
+            with suppress(OSError):
+                os.close(master_fd)
+        if process is not None and process.poll() is None:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            with suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=1.0)
+        raise
+
+
 def _p0_native_replay_command(episode: int, gripper_width_mm: float, *, execute: bool) -> list[str]:
-    """Build the fixed P0 handoff command without accepting paths or extra arguments."""
+    """Build the fixed unchecked P0 command without accepting arbitrary arguments."""
     if isinstance(episode, bool) or int(episode) not in (0, 1):
         raise ValueError("P0 native replay episode must be 0 or 1")
     width = float(gripper_width_mm)
@@ -11268,10 +11526,16 @@ def _start_p0_native_replay(
 ) -> None:
     if state.profile != "thor":
         raise RuntimeError("P0 native arm replay is only available on the Thor deployment")
+    if state.p1_eye_hand_process is not None and state.p1_eye_hand_process.poll() is None:
+        raise RuntimeError("P1 eye-hand calibration is moving FR3; cancel it before replay")
     if state.process is not None and state.process.poll() is None:
         raise RuntimeError("Stop the active recorder before starting P0 native arm replay")
-    if state.replay_process is not None and state.replay_process.poll() is None:
-        raise RuntimeError("Another replay process is already running")
+    if state.replay_process is not None:
+        if state.replay_process.poll() is None:
+            raise RuntimeError("Another replay process is already running")
+        # A new request can arrive before the next snapshot poll has reaped the
+        # prior run. Do not overwrite and leak its retained PTY master.
+        _close_p0_native_pty(state)
     try:
         episode = int(str(episode_raw).strip())
     except ValueError as exc:
@@ -11291,23 +11555,20 @@ def _start_p0_native_replay(
     _append_p0_native_log(
         state,
         "request",
-        f"mode={mode} episode={episode} gripper_width_mm={gripper_width_mm:g}; gripper control is disabled",
+        f"HIGH RISK: mode={mode} episode={episode} gripper_width_mm={gripper_width_mm:g}; "
+        "trajectory audit, state safety checks, and collision checks are disabled; "
+        "a slow measured-position start move is enabled, replay chunk replanning is disabled, "
+        "and gripper control is disabled",
     )
-    process = subprocess.Popen(
+    process, pty_master_fd = _spawn_p0_native_process(
         command,
-        cwd=P0_NATIVE_REPLAY_SCRIPT.parent,
-        stdin=subprocess.PIPE if execute else subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
+        P0_NATIVE_REPLAY_SCRIPT.parent,
+        execute=execute,
+        confirmation=confirmation,
     )
-    if execute and process.stdin is not None:
-        process.stdin.write("YES\n")
-        process.stdin.flush()
-        process.stdin.close()
     state.replay_process = process
     state.replay_process_kind = f"p0_native_{mode}"
+    state.p0_native_pty_master_fd = pty_master_fd
     state.replay_started_at_s = time.monotonic()
     state.replay.pid = process.pid
     state.replay.state = "replaying" if execute else "preflight"
@@ -11316,10 +11577,11 @@ def _start_p0_native_replay(
     state.replay.p0NativeEpisode = episode
     state.replay.p0NativeGripperWidthMm = gripper_width_mm
     state.replay.p0NativeMode = mode
-    state.replay.message = f"P0 native arm {mode} started for episode {episode}"
+    state.replay.message = f"Unchecked P0 native arm {mode} started for episode {episode}"
     state.log(
-        "warn" if execute else "info",
-        f"Started P0 native arm {mode} pid={process.pid} episode={episode} width_mm={gripper_width_mm:g}",
+        "warn",
+        f"Started unchecked P0 native arm {mode} pid={process.pid} episode={episode} "
+        f"width_mm={gripper_width_mm:g}; project-side safety and collision gates are disabled",
     )
     _start_replay_output_reader(state, process)
 
@@ -11464,6 +11726,8 @@ def _start_dry_run_replay(state: GatewayState) -> None:
 
 
 def _start_mujoco_replay(state: GatewayState, cube_mode: str = DEFAULT_MUJOCO_CUBE_MODE) -> None:
+    if state.p1_eye_hand_process is not None and state.p1_eye_hand_process.poll() is None:
+        raise RuntimeError("P1 eye-hand calibration is running; cancel it before replay")
     if state.replay_process is not None and state.replay_process.poll() is None:
         state.replay.message = "MuJoCo replay is already running"
         return
@@ -11683,6 +11947,8 @@ def _start_real_replay(
     end_effector_mode: str = "corenetic_gripper_ee",
     override_mujoco_failure: bool = False,
 ) -> None:
+    if state.p1_eye_hand_process is not None and state.p1_eye_hand_process.poll() is None:
+        raise RuntimeError("P1 eye-hand calibration is moving FR3; cancel it before replay")
     if state.replay_process is not None and state.replay_process.poll() is None:
         state.replay.message = "Replay process is already running"
         return
@@ -11802,6 +12068,7 @@ def _abort_replay(state: GatewayState) -> None:
         _stop_realsense_preview(state)
         _append_real_replay_log(state, "abort", "operator stopped real replay")
     if replay_kind.startswith("p0_native_"):
+        _close_p0_native_pty(state)
         state.replay.p0NativeState = "aborted"
         _append_p0_native_log(state, "abort", "operator stopped P0 native arm replay")
     if replay_kind == "mujoco" and state.replay.mujocoValidation:
@@ -11916,6 +12183,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         if path == "/api/calibration/marker-tcp":
             with self.server.state.lock:
                 _json_response(self, HTTPStatus.OK, {"ok": True, "markerTcp": _marker_tcp_session_payload(self.server.state)})
+            return
+        if path == "/api/calibration/p1-eye-hand":
+            with self.server.state.lock:
+                _json_response(self, HTTPStatus.OK, {"ok": True, "p1EyeHand": _p1_eye_hand_payload(self.server.state)})
             return
         if path.startswith("/api/assets/pika/"):
             name = path[len("/api/assets/pika/"):]
@@ -12419,6 +12690,23 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/calibration/marker-tcp/start":
                     result = _start_marker_tcp_session(self.server.state)
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/p1-eye-hand/start":
+                    result = _start_p1_eye_hand(
+                        self.server.state,
+                        (query.get("confirmation", [""])[0] or "").strip(),
+                    )
+                    status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                    _json_response(self, status, result)
+                    return
+                if path == "/api/calibration/p1-eye-hand/cancel":
+                    result = _cancel_p1_eye_hand(self.server.state)
+                    _json_response(self, HTTPStatus.OK, result)
+                    return
+                if path == "/api/calibration/p1-eye-hand/activate":
+                    result = _activate_p1_eye_hand(self.server.state)
                     status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                     _json_response(self, status, result)
                     return

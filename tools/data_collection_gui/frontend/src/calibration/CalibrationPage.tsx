@@ -33,6 +33,7 @@ import { IntrinsicsCoveragePanel } from "./IntrinsicsCoveragePanel";
 import { WorldFramePanel } from "./WorldFramePanel";
 import { CalibrationWizard } from "./CalibrationWizard";
 import { MarkerTcpPanel } from "./MarkerTcpPanel";
+import { P1EyeHandPanel } from "./P1EyeHandPanel";
 
 const OPERATOR_KEY = "lerobot.calibration.operator";
 
@@ -198,6 +199,8 @@ export function CalibrationPage({
       />
 
       <MarkerTcpPanel snapshot={snapshot} api={api} busy={busy} />
+
+      <P1EyeHandPanel snapshot={snapshot} api={api} busy={busy} />
 
       {/* --- per-BOX groups: readiness + monitors + calibration by device --- */}
       {boxGroups.map((group) => (
