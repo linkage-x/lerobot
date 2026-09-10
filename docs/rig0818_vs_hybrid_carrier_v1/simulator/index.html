@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="rig0818 与 Hybrid Carrier V1 的浏览器端配对误差仿真器">
+  <title>rig0818 × Hybrid Carrier V1 · Browser A/B Simulator</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="hero">
+    <nav><a href="../roadmap.html">← 理论与仿真 Roadmap</a><span>M0 · M1/L1 · MC-lite</span></nav>
+    <div class="hero-grid">
+      <div>
+        <p class="eyebrow">PAIRED BROWSER SIMULATION · 2026-09-10</p>
+        <h1>同一个世界，比较<br><em>两种靶标</em></h1>
+        <p class="lede">同轨迹、同七相机、同遮挡、同系统扰动。R0、H0、H1 只改变靶标观测几何，误差与覆盖率在一页内对齐。</p>
+      </div>
+      <div class="decision-card" id="decision-card">
+        <span class="decision-kicker">当前证据状态</span>
+        <strong id="decision-label">等待仿真</strong>
+        <p id="decision-reason">页面载入 CAD 后会自动运行默认配对实验。</p>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="status-strip" aria-label="输入状态">
+      <div><i id="status-hybrid"></i><span>0907 descriptor</span><b id="status-hybrid-text">载入中</b></div>
+      <div><i id="status-rig"></i><span>R0 measured layout</span><b id="status-rig-text">代理</b></div>
+      <div><i class="warn"></i><span>camera / trajectory</span><b>合成契约</b></div>
+      <button class="quiet" id="load-layout-button" type="button">载入 measured R0 layout</button>
+      <input id="layout-file" type="file" accept="application/json,.json" hidden>
+    </section>
+
+    <section class="overview" aria-labelledby="overview-title">
+      <div class="section-head">
+        <div><p class="eyebrow">RESULT AT A GLANCE</p><h2 id="overview-title">最终误差对比</h2></div>
+        <div class="run-meta"><label>结果来源 <select id="result-layer"><option value="mc">MC-lite 情景模型</option><option value="l2" disabled>L2 真实图像检测</option></select></label><span id="run-state" role="status">准备输入…</span><button id="run-button" class="primary" type="button">运行配对仿真</button></div>
+      </div>
+      <div class="metric-grid" id="metric-grid">
+        <article class="metric-card r0"><div><span>R0 · rig0818</span><small>5 anchors</small></div><strong data-metric="R0-p95">—</strong><p>TCP translation p95</p><footer><span data-metric="R0-coverage">—</span> coverage</footer></article>
+        <article class="metric-card h0"><div><span>H0 · 0907 anchors</span><small>3 anchors</small></div><strong data-metric="H0-p95">—</strong><p>TCP translation p95</p><footer><span data-metric="H0-coverage">—</span> coverage</footer></article>
+        <article class="metric-card h1"><div><span>H1 · 0907 full</span><small>3 anchors + 31 edges</small></div><strong data-metric="H1-p95">—</strong><p>TCP translation p95</p><footer><span data-metric="H1-coverage">—</span> coverage</footer></article>
+        <article class="delta-card"><span>R0 → H1 paired Δp95</span><strong data-metric="delta">—</strong><p data-metric="delta-ci">95% block-bootstrap CI —</p><div class="gate-scale"><i id="delta-bar"></i><b>0.8 mm G2 threshold</b></div></article>
+      </div>
+      <p class="scope-note"><b>口径：</b><span id="scope-note">当前显示 MC-lite 情景结果。未闭环的输入会阻止页面宣布 G2 Go。</span></p>
+    </section>
+
+    <section class="audit" id="l2-panel">
+      <div class="section-head"><div><p class="eyebrow">L2 · RENDER → DETECT → MULTI-CAMERA SOLVE</p><h2>真实图像检测对照</h2></div><div><button class="quiet" id="load-l2-button">载入 L2 报告</button><button class="quiet" id="reload-l2-button">刷新本地结果</button><input id="l2-file" type="file" accept=".json,application/json" hidden></div></div>
+      <p id="l2-status" role="status">运行离线图像试验后，在这里查看真实 detector 的误差。顶部 MC-lite 可独立使用。</p>
+      <div id="l2-previews" class="l2-previews"></div>
+      <div class="table-wrap"><table><thead><tr><th>图像解算分支</th><th>TCP p95</th><th>rotation p95</th><th>accepted / requested</th><th>达标率</th><th>失败率</th></tr></thead><tbody id="l2-table"></tbody></table></div>
+      <details class="method"><summary>运行图像试验与阅读口径</summary><p>在仓库根目录执行 <code>python3 docs/rig0818_vs_hybrid_carrier_v1/simulator/l2_runner.py</code>，完成后点击“刷新本地结果”。H0/H1 使用相同彩图与角点；H1 增加原生检测器读取的边缘。原生冷启动分支另列。所有分支以已知 TCP 真值计误差，未出姿态的帧保留在分母内。</p><p>这是合成相机与代理 R0 下的 L2 pilot。完整生产门控、真实相机/任务输入、有证据的 L3 系统扰动和平滑仍需验证，因此不能据此宣布实机精度或 G2 Go。</p></details>
+    </section>
+
+    <section class="workbench">
+      <aside class="controls" aria-labelledby="controls-title">
+        <div class="section-head compact"><div><p class="eyebrow">MC-LITE EXPERIMENT</p><h2 id="controls-title">共同条件</h2></div><button id="reset-button" class="quiet" type="button">恢复默认</button></div>
+        <label>情景预设<select id="preset"><option value="task">任务域</option><option value="clear">无遮挡几何</option><option value="stress">高速重遮挡</option><option value="socket">球窝 TCP</option></select></label>
+        <div class="control-pair">
+          <label>姿态 / 帧<input id="poses" type="number" min="48" max="1200" step="24" value="240"></label>
+          <label>连续 episode<input id="episodes" type="number" min="4" max="30" step="1" value="12"></label>
+        </div>
+        <label>世界遮挡 <output id="occlusion-out">22%</output><input id="occlusion" type="range" min="0" max="75" value="22"></label>
+        <label>线速度 <output id="speed-out">0.28 m/s</output><input id="speed" type="range" min="0" max="0.7" step="0.01" value="0.28"></label>
+        <label>角速度 <output id="angular-speed-out">55°/s</output><input id="angular-speed" type="range" min="0" max="160" step="1" value="55"></label>
+        <label>曝光 <output id="exposure-out">5.0 ms</output><input id="exposure" type="range" min="1" max="16" step="0.5" value="5"></label>
+        <label>角点 σ <output id="corner-sigma-out">0.22 px</output><input id="corner-sigma" type="range" min="0.08" max="1.2" step="0.01" value="0.22"></label>
+        <label>edge σ <output id="edge-sigma-out">0.42 px</output><input id="edge-sigma" type="range" min="0.1" max="2" step="0.01" value="0.42"></label>
+        <label>edge 组内相关 ρ <output id="edge-rho-out">0.55</output><input id="edge-rho" type="range" min="0" max="0.95" step="0.01" value="0.55"></label>
+        <label>TCP 杠杆臂 <output id="tcp-out">120 mm</output><input id="tcp" type="range" min="0" max="220" step="5" value="120"></label>
+        <label>掉线相机数<select id="camera-dropout"><option value="0">0 / 7</option><option value="1">1 / 7</option><option value="2">2 / 7</option><option value="4">4 / 7（压力）</option></select></label>
+        <label>随机种子<input id="seed" type="number" step="1" value="20260910"></label>
+        <p id="pending-note" role="status">参数对应当前 MC-lite 结果。</p>
+        <details><summary>当前层级与限制</summary><p>Canvas 画面来自与 FIM 相同的几何。检测成功概率、安装和相机偏差仍是 MC-lite 假设；L2 必须调用冻结的生产 detector 才能替换它们。</p></details>
+      </aside>
+
+      <div class="visual-panel">
+        <div class="panel-head"><div><p class="eyebrow">SHARED 3D WORLD</p><h2>几何、相机与可见约束</h2></div><div class="segmented" id="target-tabs"><button class="active" data-target="R0">R0</button><button data-target="H0">H0</button><button data-target="H1">H1</button></div></div>
+        <canvas id="scene" aria-label="目标、七相机和遮挡物三维视图"></canvas>
+        <div class="scene-controls"><button id="play-button" class="quiet" type="button">暂停</button><label>姿态 <input id="pose-scrubber" type="range" min="0" max="239" value="0"></label><span id="scene-caption">拖动画面旋转视角</span></div>
+      </div>
+    </section>
+
+    <section class="plots">
+      <article class="plot-card wide"><div class="panel-head"><div><p class="eyebrow" id="cdf-layer">MC-LITE · ALL REQUESTED FRAMES</p><h2>TCP translation error CDF</h2></div><div class="legend"><i class="r0"></i>R0 <i class="h0"></i>H0 <i class="h1"></i>H1</div></div><canvas id="cdf-chart"></canvas><p>分母为所有请求帧；失败帧不被删除，曲线最高点等于出姿态率。3 mm 为平移阈值，联合达标率另外检查旋转 ≤0.5°。</p></article>
+      <article class="plot-card"><div class="panel-head"><div><p class="eyebrow">L1 / FIM</p><h2>预测 TCP σ</h2></div></div><canvas id="fim-chart"></canvas><p>每个姿态的 worst-axis σ；这是局部可观测性指标，不是总误差。</p></article>
+      <article class="plot-card"><div class="panel-head"><div><p class="eyebrow">ATTRIBUTION</p><h2>误差与产出</h2></div></div><div id="comparison-bars" class="comparison-bars"></div></article>
+    </section>
+
+    <section class="audit">
+      <div class="section-head"><div><p class="eyebrow">GATES &amp; AUDIT</p><h2>结论为什么成立，或为什么还不能成立</h2></div><div><button id="export-json" class="quiet" type="button" disabled>导出 decision.json</button><button id="export-csv" class="quiet" type="button" disabled>导出 trials.csv</button></div></div>
+      <div class="audit-grid">
+        <article><h3>G0 · 模拟器可解释</h3><ul id="g0-list"><li>等待运行</li></ul></article>
+        <article><h3>G1 · 是否值得做 L2</h3><div id="g1-result" class="gate-result pending">等待运行</div><p id="g1-detail">—</p></article>
+        <article><h3>G2 · 是否值得做机械样机</h3><div id="g2-result" class="gate-result pending">INCONCLUSIVE</div><p id="g2-detail">需要 measured R0、真实相机/轨迹、原生 detector L2 与有证据的 L3 分布。</p></article>
+      </div>
+      <p>以下门槛和审计表对应 MC-lite / L1。顶部可切换查看独立的 L2 图像误差。</p>
+      <div class="table-wrap"><table><thead><tr><th>arm</th><th>p50</th><th>p95</th><th>p99</th><th>rot p95</th><th>coverage</th><th>≤3 mm &amp; ≤0.5° yield</th><th>catastrophic</th><th>L1 σ p95</th></tr></thead><tbody id="metrics-table"><tr><td colspan="9">等待运行</td></tr></tbody></table></div>
+      <details class="method"><summary>查看模型、配对和统计口径</summary><div class="method-grid"><p><b>成像：</b>七台声明式相机使用 OpenCV 等距鱼眼多项式。角点数值 Jacobian 与页面可见性调用同一投影。</p><p><b>边：</b>H1 的每条 CAD edge 只贡献图像法向一维残差；同边样本按 n_eff = n/(1+(n−1)ρ) 降权。</p><p><b>配对：</b>三个 arm 共享真值、遮挡、相机、时序、共模偏差与标准正态 draw。安装误差使用同等级分布和配对抽样。</p><p><b>区间：</b>Δp95 = p95(R0) − p95(H1)，只在双方共同成功帧上计算，并按连续 episode 整块 bootstrap。覆盖率仍以所有请求帧为分母。</p></div></details>
+    </section>
+  </main>
+
+  <footer><span>Browser simulator v0.2 · local/offline</span><a href="inputs_manifest.json">inputs manifest</a><a href="experiment_spec.json">experiment spec</a><a href="noise_sources.json">noise sources</a></footer>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

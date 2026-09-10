@@ -1,0 +1,55 @@
+{
+  "schema": "rig_target_ab_experiment/v1",
+  "experiment_id": "rig0818_hybrid0907_browser_mc_lite_v1",
+  "phase": "M0_M1_MC_lite_and_L2_pilot",
+  "l2_pilot": {
+    "runner": "l2_runner.py",
+    "report": "l2_report.json",
+    "renderer": "subpixel fisheye rays with triangle depth and metric textures",
+    "controlled_comparison": "identical H0/H1 images and anchor observations; H1 adds native edge measurements using H0 joint initialization",
+    "native_branch": "separate per-camera cold starts plus joint BA",
+    "status": "synthetic-domain pilot; full production gates and evidence-backed L3 not yet validated"
+  },
+  "arms": {
+    "R0": "five ArUco anchors from rig0818 layout",
+    "H0": "Hybrid Carrier V1 anchors only",
+    "H1": "the same Hybrid Carrier image geometry with correlated edge-normal residuals"
+  },
+  "pairing": "Every arm receives the same target pose, camera state, world occluders, episode-level common bias, timing draw and standard-normal measurement draw.",
+  "projection": "OpenCV-style equidistant fisheye polynomial, with declared K and four distortion coefficients.",
+  "estimator_proxy": "Numerical pose Jacobian, whitened corner residuals, correlated edge-normal effective sample size, full-rank 6x6 FIM inversion and TCP covariance propagation.",
+  "default_run": {
+    "seed": 20260910,
+    "poses": 240,
+    "episodes": 12,
+    "occlusion": 0.22,
+    "linear_speed_mps": 0.28,
+    "angular_speed_deg_s": 55,
+    "exposure_ms": 5,
+    "sync_sigma_ms": 2.2,
+    "corner_sigma_px": 0.22,
+    "edge_sigma_px": 0.42,
+    "edge_correlation": 0.55,
+    "tcp_offset_mm": 120,
+    "camera_dropout": 0
+  },
+  "metrics": [
+    "accepted TCP translation p50/p95/p99",
+    "rotation p95",
+    "coverage on all requested frames",
+    "all-frame 3 mm and 0.5 degree yield",
+    "wrong-accept and catastrophic rate",
+    "common-success paired delta p95 with episode-block bootstrap",
+    "p95 over poses of worst-axis TCP sigma"
+  ],
+  "gates": {
+    "G0": "All validation checks pass and measured R0 layout plus frozen camera snapshot are loaded.",
+    "G1": "A declared, repeatable geometry or visibility mechanism is large enough to justify L2.",
+    "G2": "Requires validated L2 detector evidence and L3 input distributions; CI lower bound of delta p95 >= 0.8 mm, H1 p95 <= 3 mm, rotation p95 <= 0.5 degree, coverage > 99% without decline, and no tail inversion."
+  },
+  "non_claims": [
+    "MC-lite detector acceptance is a sensitivity model, not a measured detector ROC.",
+    "Synthetic cameras and trajectories cannot certify production millimetres.",
+    "A browser-rendered geometry pass does not replace native detector image-loop validation or independent ground truth."
+  ]
+}

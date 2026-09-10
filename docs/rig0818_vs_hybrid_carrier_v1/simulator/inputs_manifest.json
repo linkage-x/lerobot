@@ -1,0 +1,49 @@
+{
+  "schema": "rig_target_ab_inputs/v1",
+  "frozen_at": "2026-09-10",
+  "repository_revision": "6b742239fd48ca7c854e64be56db0288081131ec",
+  "metrology_revision": "bbc47c81f37cf95f3012f7be260ac07004736db9",
+  "coordinate_contract": {
+    "length_unit": "m",
+    "angle_unit": "rad",
+    "target_origin": "socket sphere centre",
+    "pose": "T_world_target",
+    "camera_pose": "T_world_camera with +z optical axis",
+    "tcp": "same target-frame vector for every arm in one run"
+  },
+  "targets": {
+    "R0": {
+      "name": "marker rig 0818",
+      "cad_path": "../../../third_party/opencv_kalibr/metrology/fixtures/cad/marker_rig_20260818_cad.json",
+      "cad_sha256": "ca734ef2f0c5e35e17a3ffd95278c6c7eb9b19e461d49f3c7ceb5b3f38315e34",
+      "marker_ids": [7, 12, 14, 16, 17],
+      "marker_to_plate": {"7": 4, "12": 2, "14": 1, "16": 0, "17": 3},
+      "marker_edge_mm": {"7": 60.88, "12": 60.63, "14": 60.55, "16": 60.56, "17": 61.12},
+      "geometry_status": "proxy",
+      "geometry_note": "The measured-layout artifact is absent from this checkout. Default marker centres and normals come from CAD; edge lengths are the two-capture means documented in box_umi_marker_rig_tcp_20260818.html. Load marker_layout/measured_v1 in the UI before a G0 decision."
+    },
+    "H0_H1": {
+      "name": "Hybrid Carrier V1 0907",
+      "descriptor_path": "../../../third_party/opencv_kalibr/metrology/fixtures/cad/hybrid_carrier_v1_20260907.json",
+      "descriptor_sha256": "7efe6a91666e3eb3686c82c2b74d90f4200b78db1837da13eca22f2f85b56559",
+      "anchor_ids": [30, 31, 32],
+      "paste_quadrants": {"30": 3, "31": 3, "32": 2},
+      "facet_count": 13,
+      "edge_count": 31,
+      "occluder_triangle_count": 181,
+      "geometry_status": "descriptor"
+    }
+  },
+  "cameras": {
+    "status": "synthetic-seven-camera-contract",
+    "note": "The app ships a declared seven-camera fisheye rig so it runs without production files. It can establish geometry mechanisms and sensitivity, not production accuracy. A frozen production K/D/extrinsic snapshot is required for G2."
+  },
+  "trajectory": {
+    "status": "synthetic-continuous-task-proxy",
+    "note": "Deterministic continuous SE(3) episodes cover the shared workspace. No estimated visual trajectory is used as truth. A frozen real task-distribution sample is required for G2."
+  },
+  "source_report": {
+    "path": "../../box_umi_marker_rig_tcp_20260818.html",
+    "sha256": "b45982b45c4aaa233a8c9c05256d352f45f7174eedba74b662a9563ee636786c"
+  }
+}

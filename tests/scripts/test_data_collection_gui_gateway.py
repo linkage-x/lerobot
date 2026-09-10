@@ -902,23 +902,38 @@ def _episode_dir_with_videos(dataset_root: Path, episode: int, cameras: tuple[st
     return ep_dir
 
 
-def test_qc_fails_when_an_episode_has_video_but_no_parquet_rows(tmp_path):
-    """The 2026-09-09 Thor capture: BOX not up at episode start, so the v3 writer
-    emitted no rows while the recorder still wrote the videos and saved the episode.
-    The parquet stays internally consistent, so every other check passes -- and the
-    EE tracker then pairs directories to episodes positionally and shifts every label
-    after the unpaired one."""
+@pytest.mark.parametrize("missing_episode", [0, 2])
+def test_qc_warns_when_an_episode_has_video_but_no_parquet_rows(tmp_path, missing_episode):
+    """BOX absence leaves video-only episodes; tracking skips them by episode ID.
+
+    Cover an initial missing episode (the Thor capture) and a trailing one.
+    """
     dataset_root = tmp_path / "gmsl2_v3"
     _write_minimal_episode_dataset(dataset_root, total_episodes=2)
+    if missing_episode == 0:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        path = dataset_root / "data" / "chunk-000" / "file-000.parquet"
+        table = pq.read_table(path)
+        table = table.set_column(
+            table.schema.get_field_index("episode_index"),
+            "episode_index",
+            pa.array([index + 1 for index in table["episode_index"].to_pylist()], type=pa.int64()),
+        )
+        pq.write_table(table, path)
     for episode in (0, 1, 2):
         _episode_dir_with_videos(dataset_root, episode)
 
     qc = gateway._run_qc(dataset_root)
 
     check = next(check for check in qc["checks"] if check["name"] == "episode_video_pairing")
-    assert check["status"] == "fail"
-    assert "[2] have video but no parquet rows" in check["message"]
-    assert qc["status"] == "fail"
+    assert check["status"] == "warn"
+    assert f"[{missing_episode}] have video but no parquet rows" in check["message"]
+    assert "pairs the 2 parquet episodes by episode number" in check["message"]
+    assert "missing sensor observations are not reconstructed" in check["message"]
+    assert qc["status"] == "warn"
+    assert len(list((dataset_root / "episodes").glob("episode_*"))) == 3
 
 
 def test_qc_passes_when_every_episode_directory_has_rows(tmp_path):
@@ -933,16 +948,21 @@ def test_qc_passes_when_every_episode_directory_has_rows(tmp_path):
     assert check["status"] == "pass"
 
 
-def test_qc_fails_when_a_parquet_episode_has_no_video(tmp_path):
+@pytest.mark.parametrize("extra_video_episode", [False, True])
+def test_qc_fails_when_a_parquet_episode_has_no_video(tmp_path, extra_video_episode):
     dataset_root = tmp_path / "gmsl2_v3"
     _write_minimal_episode_dataset(dataset_root, total_episodes=2)
     _episode_dir_with_videos(dataset_root, 0)
+    if extra_video_episode:
+        _episode_dir_with_videos(dataset_root, 2)
 
     qc = gateway._run_qc(dataset_root)
 
     check = next(check for check in qc["checks"] if check["name"] == "episode_video_pairing")
     assert check["status"] == "fail"
     assert "[1] have parquet rows but no video" in check["message"]
+    assert "cannot align frames to rows" in check["message"]
+    assert qc["status"] == "fail"
 
 
 def test_lerobot_v3_gmsl2_timeline_ignores_replay_warmup(tmp_path):

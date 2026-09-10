@@ -7428,9 +7428,9 @@ def _run_qc(
         # An episode can reach disk as video and contribute no parquet rows: when the
         # BOX stream is not up at episode start the recorder writes the ten videos,
         # reports the episode saved, and the v3 writer emits nothing for it. Nothing
-        # else here notices -- the parquet is internally consistent -- but the EE
-        # tracker walks the episode directories in order against the parquet's global
-        # row index, so an unpaired directory shifts every label after it.
+        # else here notices -- the parquet is internally consistent. The EE tracker
+        # now pairs raw videos by episode number and skips video-only episodes, so
+        # those are a completeness warning. Rows without video still block tracking.
         episodes_root = dataset_root / "episodes"
         if episodes_root.is_dir():
             video_episodes: dict[int, int] = {}
@@ -7451,10 +7451,18 @@ def _run_qc(
                     parts.append(f"episodes {unpaired} have video but no parquet rows")
                 if rowless:
                     parts.append(f"episodes {rowless} have parquet rows but no video")
+                if rowless:
+                    consequence = "EE trajectory generation cannot align frames to rows"
+                else:
+                    consequence = (
+                        f"EE trajectory generation skips these video-only episodes and pairs "
+                        f"the {len(by_episode)} parquet episodes by episode number; "
+                        "missing sensor observations are not reconstructed"
+                    )
                 checks.append({
                     "name": "episode_video_pairing",
-                    "status": "fail",
-                    "message": "; ".join(parts) + " - EE trajectory generation cannot align frames to rows",
+                    "status": "fail" if rowless else "warn",
+                    "message": "; ".join(parts) + " - " + consequence,
                 })
             elif video_episodes:
                 checks.append({

@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="rig0818 与 0907 Hybrid Carrier V1 的同轨迹、同相机、同 TCP 理论与仿真比较计划。">
+<title>rig0818 × Hybrid Carrier V1 · 理论与仿真 Roadmap</title>
+<style>
+:root{--bg:#f3f5f8;--paper:#fff;--ink:#192938;--muted:#5c6d7d;--line:#dce3e9;--blue:#245cc5;--teal:#007d79;--amber:#9b570b;--red:#a33036;--soft:#eef4ff}
+*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:80px}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.8 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}a{color:var(--blue);text-underline-offset:3px}main{max-width:1180px;margin:auto;padding:28px 24px 64px}header{padding:36px;border-radius:20px;background:linear-gradient(120deg,#142737,#174c58);color:white}header p{color:#dbe8ec;max-width:980px}h1{font-size:clamp(25px,3.5vw,38px);line-height:1.3;margin:10px 0 18px}h2{font-size:24px;line-height:1.45;margin:0 0 16px}h3{font-size:19px;margin:24px 0 8px}.eyebrow{text-transform:uppercase;letter-spacing:.12em;font-size:12px;color:#afd8d8}.tags{display:flex;flex-wrap:wrap;gap:8px}.tag{font-size:12px;border:1px solid #ffffff40;border-radius:20px;padding:3px 10px}.nav{position:sticky;top:0;z-index:3;background:#f3f5f8f5;backdrop-filter:blur(10px);display:flex;gap:16px;flex-wrap:wrap;padding:14px 2px;border-bottom:1px solid var(--line);font-size:14px}.nav a{text-decoration:none}.section{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:26px;margin-top:22px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:20px 0 0}.stat{background:#ffffff10;padding:15px;border-radius:12px}.stat b{display:block;font-size:26px}.stat span{font-size:12px;color:#dbe8ec}.callout{border-left:4px solid var(--blue);background:var(--soft);padding:15px 18px;margin:18px 0;border-radius:4px 10px 10px 4px}.warn{border-color:var(--amber);background:#fff6e7}.good{border-color:var(--teal);background:#edf8f6}.small{font-size:13px;color:var(--muted)}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;vertical-align:top;padding:12px;border-bottom:1px solid var(--line)}th{background:#f3f6fa;font-weight:650}td:first-child{min-width:120px}code,pre{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}code{font-size:.88em;background:#f0f3f7;border-radius:4px;padding:2px 4px;overflow-wrap:anywhere}pre{background:#152b3b;color:#e2eff3;padding:20px;border-radius:10px;overflow:auto;line-height:1.7;font-size:13px}pre code{background:none;padding:0;color:inherit}.status{display:inline-block;padding:2px 8px;border-radius:6px;background:#fff1d9;color:#85530e;font-size:12px}.ready{background:#e8f3ef;color:#126b53}.flow{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:18px 0}.flow div{background:#edf3f8;padding:15px;border-radius:10px}.flow b{display:block;color:var(--teal)}.flow span{font-size:13px}details{border:1px solid var(--line);border-radius:10px;margin:14px 0;padding:0 16px}summary{cursor:pointer;padding:12px 0;font-weight:650}details>div{padding-bottom:14px}li{margin:6px 0}ul,ol{padding-left:23px}.formula{background:#f0f5f8;border-radius:10px;padding:16px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:14px;overflow-x:auto}.calculator{border:1px solid var(--line);border-radius:12px;padding:20px;margin-top:14px}.controls{display:grid;grid-template-columns:1fr 1fr;gap:24px}input[type=range]{width:100%;accent-color:var(--teal)}label{display:block;font-size:14px}.results{display:flex;gap:32px;flex-wrap:wrap;margin-top:12px}.results strong{font-size:29px;color:var(--teal)}.results span{display:block;font-size:13px;color:var(--muted)}.bar{height:12px;background:#dce8ee;border-radius:6px;overflow:hidden;margin-top:8px}.bar>i{display:block;height:100%;background:var(--teal);width:96.4%}.refs li{font-size:14px}.foot{padding-top:20px;color:var(--muted);font-size:13px}.phase-title{display:flex;gap:12px;align-items:center;flex-wrap:wrap}button{border:1px solid var(--line);padding:7px 12px;border-radius:7px;background:white;color:var(--ink);cursor:pointer}a:focus-visible,summary:focus-visible,button:focus-visible,input:focus-visible{outline:3px solid #e3a223;outline-offset:4px}@media(max-width:760px){main{padding:16px 12px 40px}header,.section{padding:22px 18px}.stats{grid-template-columns:repeat(2,1fr)}.grid,.controls{grid-template-columns:1fr}.flow{grid-template-columns:1fr}.nav{position:static;gap:12px}th,td{padding:9px}h2{font-size:21px}}@media print{body{background:white;font-size:11pt}main{max-width:none;padding:0}header{background:white;color:var(--ink);border:2px solid var(--line)}header p,.eyebrow,.stat span{color:var(--muted)}.stat b{color:var(--ink)}.nav,.print-button,.calculator{display:none}.section{break-inside:auto;box-shadow:none}h2,h3{break-after:avoid}tr{break-inside:avoid}details{display:block}details>div{display:block}a{color:inherit}pre{white-space:pre-wrap}.table-wrap{overflow:visible}}
+</style>
+</head>
+<body>
+<main>
+<header>
+<div class="eyebrow">Decision experiment / 2026-09-10 / v1.0</div>
+<h1>rig0818 × Hybrid Carrier V1<br>理论误差与仿真比较 Roadmap</h1>
+<p><strong>结论：需要设计并执行分层虚拟 A/B，作为 0907 夹爪版机械开发前的判别实验。</strong>先回答同一物理 TCP、同一任务轨迹下，几何与彩色边缘能否带来足够的误差和鲁棒性收益，再决定是否投入机械集成。当前没有可用于宣布“0907 胜出”的公平实验。</p>
+<div class="tags"><span class="tag">网页仿真器 v0.2</span><span class="tag">L2 图像 pilot 已接通</span><span class="tag">本地离线优先</span><span class="tag">不占用 Thor</span><span class="tag">不替代 independent GT</span></div>
+<div class="stats"><div class="stat"><b>3.8–4.0 mm</b><span>主路线图 A′ p95 工程估计</span></div><div class="stat"><b>≤3 mm</b><span>最终 TCP 平移 p95 目标</span></div><div class="stat"><b>0.8–1.0 mm</b><span>现有估计距目标的差额</span></div><div class="stat"><b>3 层</b><span>几何 → 检测 → 系统误差</span></div></div>
+</header>
+<nav class="nav" aria-label="路线图导航"><a href="simulator/">打开网页仿真器 ↗</a><a href="#decision">为何需要</a><a href="#targets">比较对象</a><a href="#contract">公平口径</a><a href="#layers">实验设计</a><a href="#metrics">指标</a><a href="#gates">Go / No-Go</a><a href="#plan">执行计划</a><a href="#sources">依据</a><button class="print-button" type="button" onclick="window.print()">打印 / PDF</button></nav>
+
+<section class="section" id="decision">
+<h2>01 · 为什么现在值得做</h2>
+<div class="callout good"><strong>实现进度：</strong><a href="simulator/">浏览器端配对仿真器</a>已完成 M0 数值检查、M1/L1、MC-lite 和 L2 图像 pilot。新增逐像素鱼眼射线渲染、真实 ArUco / Hybrid 检测、统一多相机 BA；页面可切换预测与图像误差，查看配对 Δp95、区间、全帧 CDF、达标率与失败率。缺 measured R0、冻结生产相机/任务和完整 L3 证据时保持 <strong>Inconclusive</strong>。<a href="simulator/README.md">运行方法与当前边界</a>。</div>
+<p><a href="../box_umi_trajectory_gt_replay_roadmap.html">主路线图</a>的 v18.0 / v18.1 已明确：0907-on-gripper 当前 No-Go，先做同轨迹 visibility / FIM / TCP covariance 比较。本计划将这条决策展开为可执行实验，并补上仅看 FIM 无法回答的失败率、系统偏置与总误差问题。</p>
+<div class="table-wrap"><table><thead><tr><th>现有证据</th><th>允许得出的结论</th><th>仍不能推出什么</th></tr></thead><tbody>
+<tr><td>A′ p95 ≈3.8–4.0 mm</td><td>这是当前 rig 口径的工程预算参考；它包含历史统计与外推。</td><td>不是独立 GT 实测，也不能作为这次仿真的固定“真值”。A = 7.43 mm 为逐相机弥散诊断量，不能与它拼成精度区间。</td></tr>
+<tr><td>主路线图对 0907 的收益预估 ≈0.43–0.46 mm</td><td>已有机理支持的改善不足以直接覆盖目标差额，值得先做低机械成本筛选。</td><td>3.35–3.52 mm 的“实际点”与 2.55–2.69 mm 的“理论地板”都是预算情景，不是新仿真结果，也不是硬物理极限。</td></tr>
+<tr><td>0909 carrier 实机可解</td><td>检测器与多相机链路能够工作；可用来核对投影尺寸、检测数量和噪声量级。</td><td>与 0818 / 0821 的速度、外参、几何和筛选均不相同；≥3 anchor 对 0907 是全见，对五 marker rig 是部分可见，不能据此宣布成倍提升。</td></tr>
+<tr><td>已有 render → detect A/B</td><td>可复用同 seed、几何真值与求解模型分离、去除彩色面、遮挡和曝光运动的实验框架。</td><td>默认单相机 pinhole、理想标定、简化遮挡；它不能直接预测七相机 fisheye 生产 TCP 的总 p95。</td></tr>
+</tbody></table></div>
+<div class="callout good"><strong>实验的价值是辨别收益来自哪里：</strong>更好的 3D 布局、更多可靠图像信息、更稳的检测，还是仅仅修正了贴纸尺度／装配误差。即使结论为 No-Go，也能避免把机械开发投入一个只改善随机噪声、却碰不到主导偏置的方向。</div>
+<p>本分支不取代相机状态监测、真实 marker→TCP 测量或独立 GT。刚性一体化仍有价值；它不等于必须采用 0907 的具体几何。无需先搭建双 FR3 动力学或接触仿真，当前需要的是<strong>相机测量链 + 靶标几何 + 任务遮挡</strong>的离线仿真。</p>
+</section>
+
+<section class="section" id="targets">
+<h2>02 · 比较对象：先分清 rig0818、旧 cube 与 0907</h2>
+<div class="table-wrap"><table><thead><tr><th>实验臂</th><th>模型与估计器</th><th>回答的问题</th></tr></thead><tbody>
+<tr><td><strong>R0 · rig0818</strong><br>主要基线</td><td>五枚 DICT_6X6_50 marker：ID 7/12/14/16/17。采用冻结的最佳实测 layout；名义 CAD 独立留作制造偏差对照。通过 layout 检测适配器进入统一多相机 corner BA。</td><td>当前分布式 rig 的实际几何能力。不要用生产旧 cube、错误的 56 mm 配置或全字典场景 marker 代替它。</td></tr>
+<tr><td><strong>H0 · 0907 anchors-only</strong></td><td>相同 0907 本体、三枚 47.24 mm anchor（ID 30/31/32）、相同图像；只使用解码角点，经同一个 corner BA 求解。</td><td>R0 ↔ H0 隔离 anchor 布局与尺寸变化；不能把这段收益算给颜色／边缘。</td></tr>
+<tr><td><strong>H1 · 0907 full</strong><br>主要候选</td><td>同一 H0 图像、同一 anchor 检测／初始化，增加 13 个 facet、31 条 CAD edge 的生产细化和回退策略。另报完整原生 detector 路径。</td><td>H0 ↔ H1 的受控求解分支测边缘增量；原生路径另外测颜色假设排序等检测行为的总影响。</td></tr>
+<tr><td>Hplain · 去色实物对照<br>次要消融</td><td>保持本体和遮挡，渲染去色版本。与“在同一彩图上禁用边缘”分开命名。</td><td>区分外观改变与约束关闭。不要把两者混成一个 anchors-only 基线。</td></tr>
+<tr><td>H2 · anchor-free / 单 anchor recovery<br>独立探索</td><td>仅作为预先定义的恢复模式；与生产门控严格分栏，状态种子必须来自算法历史。</td><td>严重遮挡能否恢复，以及错误接受风险。不得用实验性弱门控结果替换 H1 的生产比较。</td></tr>
+</tbody></table></div>
+<p class="small">rig0818 CAD 给出约 69.6 mm 的载板边长、约 102.0 mm 的载板质心至球窝距离；载板大小不是 marker 黑边实测尺寸。0818 文档记录 marker 约 60.6–61.0 mm，逐枚值依 layout 版本变化，M0 必须锁定具体文件。0907 的 47.24 mm、贴纸转角 30→3 / 31→3 / 32→2 来自当前描述符。不能把这些不同物理量统一成一个“marker size”。</p>
+</section>
+
+<section class="section" id="contract">
+<h2>03 · 公平比较的输入契约</h2>
+<div class="grid"><div><h3>同一个物理 TCP 走同一条轨迹</h3>
+<p>约定 <code>T_A_B</code> 将 B 系坐标变换到 A 系。对每个候选冻结 <code>T_TCP_rig</code>，由任务的 <code>T_world_TCP(t)</code> 生成各候选真值：</p>
+<div class="formula">T_world_rig(t) = T_world_TCP(t) · T_TCP_rig<br>T_world_TCP_est = T_world_rig_est · T_rig_TCP</div>
+<p>0818 的数据自定义 rig 系可能带约 102.3 mm TCP 偏移，而 CAD 球窝系可以把 TCP 放在零点；0907 也可以以球窝为零点。<strong>改原点不会增加观测信息。</strong>应在同一个物理点上比较，不比较两个任意模型原点的位置误差。</p>
+</div><div><h3>同一相机、任务与环境扰动</h3>
+<p>主实验使用冻结的七相机 <code>cam_06/07/08/09/12/13/14</code> 配置、相同分辨率、fisheye 模型与曝光。内外参需来自同一快照并记录内容哈希；不能按“当前路径”动态读取。</p>
+<p>轨迹来源包括真实 manipulation 的姿态与速度分布、工作区覆盖扫描、独立生成的连续 SE(3) 压力轨迹。真实估计轨迹只用作<strong>任务分布代理</strong>；仿真误差参考是显式设定的真值，不是原来的视觉标签。</p>
+</div></div>
+<ul>
+<li><strong>truth 与 estimator 分开：</strong>几何、K/D、相机外参、时钟分别保留真值和求解输入两份对象。系统误差试验只改变其中一侧；一起改会把误差抵消。</li>
+<li><strong>公平安装空间：</strong>先做 socket-TCP 现成结构对照，再做 gripper contact-TCP 候选安装对照；第二组显式建模实际安装旋转、偏移、包络及开度依赖，不能把球窝原点直接等同于夹爪接触点。</li>
+<li><strong>制造状态分组：</strong>nominal/nominal 用于设计潜力，measured/measured 用于当前物体，measured/nominal 用于公差敏感度。双方使用同等级几何校准，禁止只给候选“完美 CAD”。</li>
+<li><strong>训练／验证分离：</strong>安装方向优化、噪声拟合、阈值调参只用开发集；最终比较用未参与调参的 episode、姿态、遮挡和 seed。缺失输入记为待补，不用默认值悄悄代替。</li>
+<li><strong>采集完整性：</strong>按 episode ID 配视频和行；仅视频、无 BOX 行的数据可用于图像检测研究，但不能伪装成完整多模态训练轨迹。0909 的两个可用 episode 共 2403 行只是已知证据，当前不向 Thor 发起读取或作业。</li>
+</ul>
+</section>
+
+<section class="section" id="prerequisites">
+<h2>04 · M0：先证明模拟器没有把答案写进输入</h2>
+<p><span class="status ready">浏览器 M0 核心已实现</span> 已核对描述符哈希、贴纸转角、坐标／单位、统一 fisheye 投影、实体遮挡、相关 edge 降权与奇异 FIM。新增真实 ArUco 解码对照、R0 绕序反例和 TCP 协方差坐标不变性测试。缺失 measured R0、生产相机快照和真实任务轨迹继续阻止 G0；完整图像域的超采样收敛阈值尚待冻结。</p>
+<div class="table-wrap"><table><thead><tr><th>已核查到的代码状态</th><th>本实验必须补的检查</th><th>退出条件</th></tr></thead><tbody>
+<tr><td><code>hybrid_carrier_render.py</code> 默认从空映射取转角 0；0907 描述符却固定 [3,3,2]。默认 A/B 调用没有显式传入这一映射。</td><td>按真实贴纸 corner 编号独立构造预期投影，覆盖三个非零 quadrant、镜像错误和法向翻转；修正默认值或显式传值并记录。</td><td>无噪声的已知位姿测试通过；故意错贴或读错描述符的反例确实失败／报大误差。不能只断言 <code>success=True</code>。</td></tr>
+<tr><td>旧 <code>compare_fiducial_targets.py</code> 是单 pinhole 相机；方形贴纸采用平面 homography 粘贴。</td><td>多相机 fisheye 渲染须做逐像素射线／纹理映射或经过验证的成像重映射。鱼眼图上的平面贴纸一般不是严格四角 homography。</td><td>中心与边缘、近远距离的角点及边上采样与独立投影一致；亚像素误差阈值先由超采样收敛试验冻结。</td></tr>
+<tr><td><code>evaluate_marker_layout_fim.py</code> 主要做深度、画幅、有效半径检查；Level 3 另有朝向／尺寸门限。都不足以替代完整遮挡场景。</td><td>加入表面正反面、自遮挡深度、支架／手／夹爪／物体遮挡与部分贴纸可解码性；从 CAD 显式读取法向，不能对非凸支架只靠“朝向原点外侧”猜。</td><td>已知遮挡场景有预期可见集；隐藏特征不再贡献 FIM。支持架缺 mesh 时报告上下界，不给实际 coverage 结论。</td></tr>
+<tr><td>旧比较汇总主要报成功样本 p50/p90，失败计数另列；同边多个样本可能相关。</td><td>保留每个试次、失败原因、错误接受、完整协方差与边 ID；引入相关残差及姿态误差检验。</td><td>奇异信息矩阵判为弱观测；增加同一条边的重复样本不会虚假地把 σ 压向零。</td></tr>
+</tbody></table></div>
+<div class="callout warn"><strong>必须有两个独立基准：</strong>① 解析投影／有限差分 Jacobian；② 已知世界 TCP 的图像级真值。渲染器与检测器共用错误 corner 顺序、尺度或变换时，round-trip 可以自洽却同时出错。坐标变换、单位 m/mm、K/D 系数顺序和零点平移均要有反例验证。</div>
+</section>
+
+<section class="section" id="layers">
+<h2>05 · 三层仿真，各自回答一个问题</h2>
+<div class="flow"><div><b>M0</b><span>锁输入与验证模拟器</span></div><div><b>L1</b><span>几何、可见性、信息量</span></div><div><b>L2</b><span>图像、检测与失败尾部</span></div><div><b>L3</b><span>联合系统扰动与轨迹</span></div><div><b>M4</b><span>分层证据与开发决策</span></div></div>
+<h3>L1 · 条件精度下限：布局到底有没有优势</h3>
+<p>在真值位姿、正确对应关系与冻结的观测噪声模型下，合成可见 anchor 角点和 edge 法向残差。使用完整遮挡后的约束构造局部信息矩阵；先 R0 ↔ H0，再 H0 ↔ H1。边样本只提供法向距离约束，不当作一个完整二维角点。</p>
+<div class="formula">F = Jᵀ Σ<sub>image</sub><sup>−1</sup> J<br>C<sub>pose | calibration, geometry, correspondences</sub> ≈ F<sup>−1</sup><br>σ<sub>TCP,worst</sub> = √λ<sub>max</sub>(C<sub>TCP,translation</sub>)　[mm]</div>
+<p>它是给定噪声、正确局部解与可见性下的预测。CRLB 解释还要求相应统计模型与正则性；鲁棒求解器输出的逆 Hessian 不能自动称为全局误差下界。<a href="https://ceres-solver.readthedocs.io/latest/nnls_covariance.html">协方差计算的白化与秩条件参见 Ceres 官方说明</a>。</p>
+<ul><li>同时输出位置／姿态信息、最弱方向、规范化 Jacobian 的条件数与有效秩；用声明的长度标尺归一化 m 与 rad，禁止拿带混合单位的条件数做跨 rig 排名。</li><li>协方差奇异时标记不可观测；伪逆在零空间得到的数不能当作“零不确定度”。FIM 检不出相距很远的 PnP 多解，后者交给 L2。</li><li>输出 <code>p95_over_poses(σ_TCP,worst)</code>，明确它是“不同姿态的预测标准差分布”，不叫“TCP error p95”。</li><li>边噪声至少比较独立模型、同边共模偏移模型和保守下采样模型；同一标记的角点也允许相关。若收益仅存在于把数百边像素当独立样本的模型，判为未证实。</li></ul>
+
+<details open><summary>TCP 传播：保留平移—旋转相关，避免 L·θ 重复记账</summary><div>
+<p>固定采用局部参数 <code>δξ=[δt_world, δθ_world]</code>，其中位置在 rig 原点加性扰动，旋转为左乘扰动。令 <code>p_world_TCP=t+R p_rig_TCP</code>：</p>
+<div class="formula">J<sub>TCP</sub> = [ I　−[R p<sub>rig_TCP</sub>]<sub>×</sub> ]<br>C<sub>TCP</sub> = J<sub>TCP</sub> C<sub>pose</sub> J<sub>TCP</sub>ᵀ</div>
+<p>其他 SE(3) 扰动约定需先换 Jacobian。保留 C 的交叉块；安装／TCP 本身不确定时扩大随机变量并传播其联合协方差。不要再添加独立的 <code>(L·θ)²</code>。把模型原点从 feature 质心移到球窝后，正确变换协方差应得到相同物理 TCP 误差；把这条坐标不变性写成检查。</p>
+</div></details>
+
+<h3>L2 · 渲染与真实检测：理想信息能否被稳定读到</h3>
+<p>用冻结 detector 与生产 solve / gate / fallback，在同一组多相机合成帧上完整运行。R0 使用实际 layout 的 ArUco 路径，H1 使用当前 Hybrid strategy；各自保留原生行为，同时有统一 corner BA 的受控对照。曝光用连续位姿的时间积分，明确标签对应 SOF、曝光中点还是其他时间基准。</p>
+<ul><li>同时建模贴纸像素尺寸、入射角、fisheye 边缘、光照／白平衡、反光、边线宽度、光学模糊、噪声与背景相似颜色。输出误检 ID 和错误 corner 对应，不把它们并入普通高斯角点噪声。</li><li>分别做无历史冷启动、正常连续跟踪、丢失后重捕获；每个目标独立维护种子，禁止跨目标／episode 传状态，禁止用真值初始化正式结果。</li><li>重点检查 0/1/2/3 个可解码 anchor、强遮挡、错误 PnP 分支与细化失败。局部 residual 或 σ 小并不保证选对全局位姿。</li><li>颜色带来的假设排序变化与 edge refinement 分开记录。对“有 anchor 就跳过弱约束检查”的路径做显式消融，不只测试 anchor-free 的安全门。</li></ul>
+
+<h3>L3 · 系统扰动与时间序列：能否改善任务 TCP 总误差</h3>
+<p>在明确的仿真世界中分开“真实相机／实物”和“求解器认为的相机／模型”。先单源定位，再联合抽样重跑真实解算，最后按相同参数运行 raw BA 与 offline smoother 两条输出。用联合误差样本直接计算分位数，不能对各来源 p95 做 RSS，也不能沿用历史 0.85–0.895 修正因子。分布传播方法参考 <a href="https://www.bipm.org/en/web/guest/publications/guides">BIPM JCGM 101:2008</a>。</p>
+<div class="table-wrap"><table><thead><tr><th>扰动来源</th><th>抽样层级与相关结构</th><th>能否归功于换靶标</th></tr></thead><tbody>
+<tr><td>角点与 edge 定位</td><td>帧／特征随机项 + 同 marker／同 edge 的相关项；按像素尺寸、角度、模糊分层拟合。</td><td>可以，但只能用实测／验证过的噪声变化；不要预设彩色边一定更准。</td></tr>
+<tr><td>K / D / 外参</td><td>每个虚拟 session 抽一次并跨帧保持；区分相机独立偏差与网络共模。联合采样 K/D；不能独立随意抽 fx/fy，忽略已知相关。</td><td>靶标可能改变对偏差的敏感度；相机本身的偏差不会因换靶标自动缩小。</td></tr>
+<tr><td>尺度、几何与安装</td><td>本体尺度与贴纸绕自身中心的尺度分开；增加贴纸位移、转角、翘曲、facet/墨线偏移、重装安装偏差。每件／每次安装固定，必要时加入载荷或开度相关形变。</td><td>必须比较等等级制造条件。rig 原点等于 TCP 不会消除尺度、安装与实物形变误差。</td></tr>
+<tr><td>时间与运动</td><td>相机间 SOF skew、Camera↔BOX 标签偏移、曝光积分分别建模；session 偏移与 frame jitter 分开。</td><td>同速度同 Δt 的标签错时不由换靶标消失；运动模糊造成的检测退化可不同。</td></tr>
+<tr><td>共模 world 变换／尺度</td><td>对整个相机网络注入可解释的确定性偏差，不给参考轨迹做自由对齐来抹掉它。</td><td>两种靶标可能同受影响；用于展示误差地板。情景量级没有出处时只报敏感度。</td></tr>
+<tr><td>平滑与缺测</td><td>连续轨迹上使用同一平滑策略；保留急停、换向、接触与缺测段，并测滞后和填补误差。</td><td>是共同下游模块；只有基于各自原始观测的联合重跑，才能计入靶标带来的间接收益。</td></tr>
+</tbody></table></div>
+<p>每个扰动值附 <code>source / units / distribution / correlation / sampling_scope / evidence_status</code>。缺少可测分布时，用低／中／高压力情景并明确标为假设，不把情景权重伪装成真实发生概率。不要为“复现约 4 mm”倒调噪声。</p>
+</section>
+
+<section class="section" id="matrix">
+<h2>06 · 实验矩阵：先任务域，再压力边界</h2>
+<div class="table-wrap"><table><thead><tr><th>维度</th><th>第一轮</th><th>扩展与约束</th></tr></thead><tbody>
+<tr><td>工作区 / 姿态</td><td>相同历史 manipulation 轨迹的分层采样；加独立空间网格与 SO(3) 姿态。</td><td>保留真实时间权重；压力网格单独统计。不能用“正对每种靶标的最佳视角”分别出题。</td></tr>
+<tr><td>可见相机</td><td>七路完整；逐一掉一路。</td><td>21 组掉两路、仅 2–3 路压力测试。按相机身份分组，不能只按数量汇总。</td></tr>
+<tr><td>遮挡</td><td>真实夹爪／支架静态几何；手部用可调胶囊／网格包络；常见操作物体。</td><td>0/15/30/45/60/75% 图像遮挡作为诊断阶梯。同一世界遮挡物对不同靶标的遮挡比例可不同，主 A/B 不能强制改遮挡物使两者比例相等。</td></tr>
+<tr><td>运动</td><td>任务静止、低／中／高线速度与角速度分层；覆盖历史约 680 mm/s 高速区。</td><td>曝光按真实元数据范围扫；以 m/s × s 生成模糊而非仅任意 smear-mm。急停、换向和相机集合切换不可被均匀抽帧漏掉。</td></tr>
+<tr><td>几何 / 外观</td><td>双方 measured 与 nominal；H0/H1 使用同一图像的 edge-off/on 对照。</td><td>贴纸尺寸、facet 墨边、背景同色、反光与手部误着色等单因素扫描，再测少量关键交互。</td></tr>
+<tr><td>模型误差</td><td>零偏理想、已测采样噪声、会话固定偏差三个等级。</td><td>单相机被碰与共模偏差单列；先按测量来源冻结范围，缺 D 协方差时保留未知项。</td></tr>
+</tbody></table></div>
+<p><strong>计算规模分级：</strong>先 100–200 个姿态做正确性与性能 pilot；L1 再扩到约 1,000 个任务／压力姿态；L2 用 200–400 个分层姿态起步并补连续片段；L3 先 200 个 session 级配对扰动，再按关键指标的区间稳定性追加。以上是起步配置，不是统计充分性保证。缓存几何、可见性和静态纹理，先计时再决定 worker 数，不执行所有维度的笛卡尔积。</p>
+</section>
+
+<section class="section" id="metrics">
+<h2>07 · 结果必须让“更准”和“少报难帧”分得开</h2>
+<div class="table-wrap"><table><thead><tr><th>指标组</th><th>必须报告</th><th>统计口径</th></tr></thead><tbody>
+<tr><td>TCP 真值误差</td><td>平移范数与 SO(3) 角误差的 p50/p95/p99/max；按速度、遮挡、位置和相机子集分层。</td><td>绝对模式不逐 episode 做自由 SE(3) / Sim(3) 对齐；先报告 raw，再报告 smoother。</td></tr>
+<tr><td>coverage / yield</td><td>几何可观测率、detector 出姿态率、生产门控接受率、真实误差在 3 mm / 0.5° 内的比例。</td><td>分母都是预注册的所有请求帧。失败与拒绝不能从统计账本消失；部署可检测的 valid 与仿真真值判定的 accurate 分开。</td></tr>
+<tr><td>公平误差比较</td><td>两者共同成功帧上的配对误差；双方各自成功集；各类失败率；固定全帧分母的达标 CDF。</td><td>共同成功集不能单独作为胜负依据。可将未返回位姿记为 +∞ 的全帧误差用于补充评价，同时单列失败，不编造有限惩罚误差。</td></tr>
+<tr><td>粗差与错误接受</td><td>超 3 mm / 0.5° 为超标；超 20 mm 或 5° 为本实验提议的 catastrophic 阈值；区分拒绝和自信地接受错误。</td><td>阈值在 pilot 后、正式盲测前冻结；reported σ 小且真值错误大必须单独计数。原主线不同粗差阈值仅作对照。</td></tr>
+<tr><td>轨迹局部质量</td><td>40 / 100 / 400 ms / 1 s RPE、缺失持续时长、重捕获延迟、急停与接触区误差、jitter。</td><td>按 timestamp 配对、不跨 episode；coverage gap 不插值成真观测。静止 jitter 小不意味着绝对误差小。</td></tr>
+<tr><td>不确定度可信度</td><td>预测置信椭球覆盖率；在相同切空间用 NEES 检验协方差与真值误差是否匹配。</td><td>理想正确模型与含系统偏差分别评价；非高斯／多模态失败另报，不用一个缩放系数掩盖。</td></tr>
+<tr><td>代价</td><td>每相机帧与联合帧耗时、p95 延时、重捕获峰值、内存；机械包络、突出和任务遮挡。</td><td>不把“更多耗时换更小误差”隐去；本阶段评估离线标注，不自动要求实时控制频率。</td></tr>
+</tbody></table></div>
+<p>主差值定义为 <code>Δp95 = p95(e_R0) − p95(e_H1)</code>，不是 <code>p95(e_R0 − e_H1)</code>。用相同任务与外部扰动 draw 做配对 bootstrap，按 session / episode / 连续时间块重采样，避免把相邻帧当独立试验。独立生成噪声的附加复核用于确认结果不依赖某个随机耦合方式。</p>
+<p class="small">罕见灾难不能用一段连续 2403 帧的“零次失败”证明消失。只在近似独立试次下，零事件的 95% 发生率上界才可粗读为 3/N；时间相关、场景单一时需扩大独立场景与 episode，而非只补相邻帧。</p>
+</section>
+
+<section class="section" id="gates">
+<h2>08 · 修订 Go / No-Go：从预测 σ 到实际收益必须有证据链</h2>
+<p>保留主路线图“值得机械开发需要约 0.8 mm 以上收益”的工程意图，但将 <strong>FIM 筛选</strong>与<strong>总误差判决</strong>分开。原文“TCP translation covariance p95 下降 30–40%”没有指定矩阵标量、单位和分位数对象，不能直接作为最终开发 Gate。</p>
+<div class="calculator">
+<strong>为什么协方差改善不等于总误差改善</strong>
+<p class="small">下列是零均值、独立分量的单轴方差示意，不是本项目的误差预测；系统偏置、多模态与实际 p95 不按它换算。默认：可改善项方差减少 35%，却只占总方差 20%。</p>
+<div class="controls"><label for="variance">可改善项的方差减少：<output id="variance-label">35%</output><input id="variance" type="range" min="0" max="100" value="35" step="1"></label><label for="share">该项占总方差的比例：<output id="share-label">20%</output><input id="share" type="range" min="0" max="100" value="20" step="1"></label></div>
+<div class="results" aria-live="polite"><div><strong id="component-result">19.4%</strong><span>该项标准差下降</span></div><div><strong id="total-result">3.6%</strong><span>总标准差下降</span></div></div>
+<div class="bar" aria-hidden="true"><i id="remaining-bar"></i></div>
+<p class="small">σ_component,new / σ_component,old = √(1−r)；σ_total,new / σ_total,old = √(1−a·r)。因此“方差下降 30–40%”本身只对应该项 σ 下降约 16–23%。</p>
+<noscript><p>未启用 JavaScript：默认情景结果为该项标准差下降 19.4%，总标准差下降约 3.6%。</p></noscript>
+</div>
+<div class="table-wrap"><table><thead><tr><th>Gate</th><th>通过条件</th><th>不通过时</th></tr></thead><tbody>
+<tr><td><strong>G0 · 结果可解释</strong></td><td>坐标／转角／遮挡反例、独立投影和噪声验证通过；双方输入、安装候选、采样与阈值冻结。</td><td>修模拟器或补输入；结论是“实验不可判”，不是某个靶标 No-Go。</td></tr>
+<tr><td><strong>G1 · 有值得继续的优势</strong></td><td>在任务域看到可重复的 TCP σ／姿态改善，或检测／遮挡收益有独立证据。若采用 σ 改善 30% 作筛选，必须明确写成 <code>p95_over_poses(σ_TCP,worst)</code>，仅作规划代理。</td><td>若几何无明显收益且检测无优势线索，停止扩展。FIM 单项不优但存在可检出性收益时，仍允许做有限 L2 反证。</td></tr>
+<tr><td><strong>G2 · 条件 Go：值得做机械样机</strong></td><td>经 L2/L3 可信模型，在预注册任务域上配对 Δp95 的 95% 区间下界 ≥0.8 mm；并且 H1 的模拟 TCP p95 ≤3 mm、旋转 p95 ≤0.5°。总 coverage 达到主线 &gt;99% 目标且相对 R0 不降低；高速／遮挡关键桶不反转。若基线有足够事件，弱／灾难帧至少减半，错误接受率不升高。</td><td>这是严格工程立项门槛，仿真通过仍非真实精度认证。统计事件不足或输入分布不可信，转“证据不足”，不能宣布 Go。</td></tr>
+<tr><td><strong>No-Go · 停止 0907 geometry 分支</strong></td><td>可信联合情景只支持约 0.3–0.5 mm 收益；或保守边相关／真实遮挡一加优势消失；或恶化高风险尾部。</td><td>保留 rig0818 或设计更简单的 rigid integrated carrier；继续处理相机、尺度与安装问题。独立的检测器研究不因几何 No-Go 自动停止。</td></tr>
+<tr><td><strong>Inconclusive · 定向补测</strong></td><td>区间跨过 0.8 mm、手部几何未知、D/安装偏差没有来源，或结论随合理情景反转。</td><td>只补最能改变决策的一项数据；例如手握包络、贴纸边长或边相关噪声。不要无目标地扩大全矩阵。</td></tr>
+</tbody></table></div>
+<p class="small">G2 数值是本路线图建议的决策规范，尚未执行验证。收益 ≥0.8 mm 不保证从 4.0 mm 降到 ≤3.0 mm，所以同时检查候选绝对值；仿真基线若不代表实际工位，只能宣布“该情景下成立”。若机械包络／遮挡改善很大但精度未过 G2，应另立包装／可用性目标，不改写精度结论。</p>
+</section>
+
+<section class="section" id="plan">
+<h2>09 · 可执行工作包与退出点</h2>
+<div class="table-wrap"><table><thead><tr><th>阶段 / 状态</th><th>工作与依赖</th><th>交付件</th><th>初始预算</th></tr></thead><tbody>
+<tr><td>M0<br><span class="status ready">内核完成 / 输入 WAIT</span></td><td>冻结 R0/H0/H1、TCP frame、安装候选、相机快照、姿态来源与软件版本；修转角并做模拟器验证。依赖已批准使用的本地数据副本。</td><td>已交付 <a href="simulator/inputs_manifest.json"><code>inputs_manifest.json</code></a>、<a href="simulator/experiment_spec.json"><code>experiment_spec.json</code></a> 与页面 G0 检查；measured R0 / production camera / task trajectory 当前为 WAIT。</td><td>约 1–2 人日；缺测项另计。</td></tr>
+<tr><td>M1 / L1<br><span class="status ready">browser pilot 已实现</span></td><td>复用 projection / pose Jacobian / TCP covariance，补统一可见性及边相关模型；先现成结构，再 gripper 挂载范围。</td><td>页面逐姿态 visibility / FIM 图、三 arm 指标表、逐帧 <code>trials.csv</code> 导出与第一轮 G1 判定；批量 parquet runner 待真实输入冻结后补。</td><td>约 1–2 人日；先跑 pilot。</td></tr>
+<tr><td>M2 / L2<br><span class="status ready">图像 pilot 已实现</span></td><td>已接通七相机 fisheye 射线渲染、实体遮挡、曝光积分、原生 detector 和多相机 BA；H0/H1 共用彩图与角点，原生冷启动另列。修正 R0 CAD→ArUco 镜像绕序。完整生产门控、连续跟踪与收敛阈值冻结仍待补。</td><td><a href="simulator/l2_runner.py">离线 runner</a>、<a href="simulator/l2_report.json">逐帧 JSON / 图像预览 / 输入哈希</a>与页面 L2 误差比较。当前替代 parquet 的自包含 JSON 可直接导入网页。</td><td>先完成 48 帧 × 7 相机 pilot，再扩大分层验证。</td></tr>
+<tr><td>M3 / L3<br><span class="status ready">MC-lite 已实现</span></td><td>几何级 MC-lite 可在 M1 后先跑；总误差结论必须等 M2 噪声／失败模型核对。加入 session 偏差、制造与安装、同步、raw/smoothed 连续输出。</td><td>已交付 <a href="simulator/noise_sources.json"><code>noise_sources.json</code></a>、逐帧 CSV、共同成功集 Δp95 与 episode-block bootstrap 区间；完整 L3 等待 L2 噪声／失败模型。</td><td>约 2–3 人日；未知分布不自动变默认常数。</td></tr>
+<tr><td>M4<br><span class="status">页面已就绪 / 决策 WAIT</span></td><td>冻结开发集／验证集结果，执行 G2；选出最少的真实验证场景。只有条件 Go 才进入夹爪样机。</td><td><a href="simulator/"><code>comparison report</code> 页面</a>与机器可读 <code>decision.json</code> 导出已就绪；当前因证据层未闭环固定输出 Inconclusive。</td><td>约 0.5–1 人日；不含机械制造与 independent GT。</td></tr>
+</tbody></table></div>
+<div class="callout"><strong>最小首轮：</strong>M0 → M1 + MC-lite → G1。先用这一小轮决定是否扩大图像实验；若主要希望是检测／遮挡改善，补少量 L2 后再退出。上表人日是实施估计，不是运行时承诺；无需等待 Thor 空闲即可先完成本地输入契约、代码验证和合成 pilot。</div>
+<h3>已有代码如何复用</h3>
+<ul>
+<li><a href="../../third_party/opencv_kalibr/metrology/cli/evaluate_marker_layout_fim.py">evaluate_marker_layout_fim.py</a>、<a href="../../third_party/opencv_kalibr/metrology/cli/level3_tcp_uncertainty_map.py">level3_tcp_uncertainty_map.py</a>：复用 Jacobian／TCP 传播和空间姿态采样；补实体遮挡、edge 约束和明确的量纲。</li>
+<li><a href="../../third_party/opencv_kalibr/metrology/cli/compare_fiducial_targets.py">compare_fiducial_targets.py</a>、<a href="../../third_party/opencv_kalibr/metrology/hybrid_carrier_render.py">hybrid_carrier_render.py</a>：复用配对 seed、render/detect 模型分离和曝光／遮挡框架；修转角、扩多相机真实成像和失败统计。</li>
+<li><a href="../../third_party/opencv_kalibr/metrology/cli/error_propagation_mc.py">error_propagation_mc.py</a>：复用真实 BA 重跑思路与单源／联合对照；现有代码以固定实测检测为中心，新实验还需显式仿真真值、系统偏差与靶标条件化检测。</li>
+<li><a href="../../third_party/opencv_kalibr/hikon_cube_tracking_offline/hybrid_carrier_tracking_in_robot_base.py">Hybrid strategy</a>：复用当前 production gates / fallback；实验 runner 提供 R0 layout adapter，不把 0818 套进旧 cube 的默认 ID 或 marker 尺寸。</li>
+</ul>
+<p><a href="simulator/">网页仿真器</a>提供 M0 / M1 / MC-lite / L2 pilot、输入清单、实验契约、逐帧 CSV 与 JSON。L2 调用本仓库现有 metrology 检测与 BA，不修改 detector 或独立检测器仓库。完整 production strategy 一致性与 evidence-backed L3 尚未标记完成。</p>
+</section>
+
+<section class="section" id="deliverables">
+<h2>10 · 最终报告应长什么样</h2>
+<ol>
+<li><strong>一页决策：</strong>Go / No-Go / Inconclusive，作用域、基线与候选版本、结论成立的噪声／机械条件。</li>
+<li><strong>三套互不混算的图：</strong>L1 的预测 σ 地图；L2 的全帧成功／超标／粗差 CDF；L3 的模拟 TCP 总误差与配对 Δp95 区间。</li>
+<li><strong>归因表：</strong>R0→H0 的 geometry 收益、H0→H1 的 edge 收益、原生检测行为收益；manufacturing、安装和标定修正独立列账。</li>
+<li><strong>场景审计：</strong>每个关键桶的总帧数、独立 session 数、失效数、拒绝数、图像投影尺寸、真实可见集及重复边样本有效信息量。</li>
+<li><strong>反例页：</strong>至少展示最差姿态、重遮挡、错误转角、鱼眼外环、错误 PnP 分支、相机集合切换和共模偏置；附可重放 seed 与 truth。</li>
+<li><strong>复现包：</strong>输入内容 SHA-256、相机和模型版本、dirty patch、依赖版本、完整配置、原始逐试次表、命令与机器资源；所有随机 draw 可追溯。</li>
+</ol>
+<p>若条件 Go，真实验证最少需要：同日、同一相机快照、可重复参考轨迹；相同操作遮挡与速度分布；独立 TCP 位置／姿态参考；重装、开度、载荷和跨日复测。论文中可先报告受控仿真机理与失败边界，但“实机毫米级精度”和“优于 rig0818”必须分别取得对应证据。</p>
+</section>
+
+<section class="section" id="sources">
+<h2>11 · 阅读依据与证据优先级</h2>
+<p>本评估以 2026-09-10 阅读到的主路线图 v18.0 / v18.1 决策与实际代码为基线。主页面中较早段落仍有“cam_09 未上线”等历史状态，后文已有更新；本计划不将历史叙述当作当前部署事实。仿真前统一锁定输入，避免依赖“最新”文件名。</p>
+<ol class="refs">
+<li><a href="../box_umi_trajectory_gt_replay_roadmap.html">BOX UMI Trajectory GT &amp; Dual-FR3 Replay 主路线图</a>：当前 A′ 口径、3 mm 目标、0907-on-gripper 虚拟 A/B 决策、L·θ 去重、p95 联合扰动与独立 GT 限定。</li>
+<li><a href="../box_umi_marker_rig_tcp_20260818.html">0818 分布式 rig / TCP 报告</a>与<a href="../../third_party/opencv_kalibr/metrology/fixtures/cad/marker_rig_20260818_cad.json">rig0818 CAD 摘要</a>：五载板几何、球窝与质心位置、实测 layout 与坐标系差别。CAD 摘要不等同于完整支架遮挡 mesh。</li>
+<li><a href="../hybrid_carrier_v1_roadmap_20260904.html">Hybrid Carrier V1 现有路线图</a>与<a href="../../third_party/opencv_kalibr/metrology/fixtures/cad/hybrid_carrier_v1_20260907.json">0907 描述符</a>：anchor/facet/edge、paste quadrant、实机检测和尺度修正。历史已撤回 A/B 与尚未重算的自报 σ 不作为本实验基准。</li>
+<li><a href="../box_umi_error_budget_evidence.html">误差预算证据册</a>与<a href="../box_umi_metrology_method.html">Metrology 方法学</a>：precision / accuracy 边界、相关扰动与 TCP 传播。借用方法，不把旧数值自动迁移到新靶标。</li>
+<li><a href="https://ceres-solver.readthedocs.io/latest/nnls_covariance.html">Ceres Solver · Covariance Estimation</a>：加权残差、Jacobian 秩与局部协方差的前提。</li>
+<li><a href="https://www.bipm.org/en/web/guest/publications/guides">BIPM · JCGM 101:2008</a>：以 Monte Carlo 传播输入分布的测量不确定度方法。</li>
+<li><a href="https://docs.opencv.org/doc/doxygen/html/d2/d14/namespacecv_1_1fisheye.html">OpenCV · fisheye</a>：真实镜头模型下的 projectPoints 与 Jacobian 接口；渲染与求解必须采用声明的成像模型。</li>
+</ol>
+</section>
+<footer class="foot">独立实验路线图 · M0 核心 / M1 / MC-lite / L2 图像 pilot 已实现，完整 L2 / evidence-backed L3 待验证 · 本机运行，没有连接 Thor 或更改生产服务。与主路线图并列维护，输入或门槛变化需记录版本。</footer>
+</main>
+<script>
+'use strict';
+const variance = document.getElementById('variance');
+const share = document.getElementById('share');
+function updateVarianceExample(){
+ const r = Number(variance.value) / 100;
+ const a = Number(share.value) / 100;
+ document.getElementById('variance-label').textContent = variance.value + '%';
+ document.getElementById('share-label').textContent = share.value + '%';
+ document.getElementById('component-result').textContent = (100 * (1 - Math.sqrt(1-r))).toFixed(1) + '%';
+ document.getElementById('total-result').textContent = (100 * (1 - Math.sqrt(1-a*r))).toFixed(1) + '%';
+ document.getElementById('remaining-bar').style.width = (100 * Math.sqrt(1-a*r)) + '%';
+}
+variance.addEventListener('input', updateVarianceExample);
+share.addEventListener('input', updateVarianceExample);
+updateVarianceExample();
+</script>
+</body>
+</html>
