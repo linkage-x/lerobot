@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { GuiSnapshot } from "../api";
-import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus } from "../types";
+import type { BoxPreviewPayload, BoxCaliLog, BoxCaliLogLine, CollectionTask, ConfigSummary, DeviceStatus, EpisodeAnnotation, EventLogItem, ProcessingItem, ProcessingStatus, RecordedDataset, RecordingStatus, ReplayStatus, SubtaskSegment, TaskStatus, DatasetExportStatus, AnnotationOutcome, AnnotationQuality, ReviewStatus, TrackingTarget } from "../types";
 import { StatusDot, Metric, PageHeader, stateLabel, QualityOverview, processingStatusLabel, datasetNamePrefixes, taskDatasetBaseName, processingItemsForTask, taskNeedsQcExportConfirmation } from "../shared/ui";
 
 export const processingStatusDot: Record<ProcessingStatus, string> = {
@@ -109,6 +109,66 @@ export function OnlineSyncManifestBlock({ item }: { item: ProcessingItem }) {
   );
 }
 
+export function TrackingDetectionBlock({
+  item,
+  busy,
+  onOpenReplay
+}: {
+  item: ProcessingItem;
+  busy: boolean;
+  onOpenReplay: () => void;
+}) {
+  const summary = item.detectionSummary;
+  if (!summary) {
+    return null;
+  }
+  const isCarrier = summary.target === "hybrid_carrier_v1";
+  return (
+    <div className="qc-block tracking-evidence-block">
+      <div className="qc-block-heading">
+        <div>
+          <h3>Marker detection evidence</h3>
+          <p>{summary.label} · camera views, before multi-camera fusion</p>
+        </div>
+        <button disabled={busy || !summary.overlayAvailable} onClick={onOpenReplay}>
+          Inspect overlays
+        </button>
+      </div>
+      <div className="summary-grid compact-summary-grid">
+        <Metric label="Target" value={summary.label} />
+        <Metric label="Detected views" value={`${summary.detectedViews}/${summary.totalViews}`} />
+        <Metric label="Detection rate" value={`${summary.detectionRatePct.toFixed(1)}%`} />
+        <Metric label="Replay evidence" value={summary.overlayAvailable ? "available" : "none"} />
+      </div>
+      <div className="tracking-camera-table">
+        <div className="tracking-camera-row tracking-camera-header">
+          <span>Camera</span>
+          <span>Detected</span>
+          <span>Anchors</span>
+          <span>Residual</span>
+          {isCarrier ? <span>Facet edges</span> : null}
+        </div>
+        {summary.perCamera.map((camera) => (
+          <div className="tracking-camera-row" key={`${camera.camera}-${camera.streamKey}`}>
+            <strong>{camera.camera}</strong>
+            <span>{camera.detectedViews}/{camera.totalViews} · {camera.detectionRatePct.toFixed(1)}%</span>
+            <span>{camera.medianAnchors == null ? "—" : camera.medianAnchors.toFixed(1)}</span>
+            <span>{camera.medianRmsePx == null ? "—" : `${camera.medianRmsePx.toFixed(2)} px`}</span>
+            {isCarrier ? (
+              <span>{camera.medianEdgeSamples == null ? "—" : camera.medianEdgeSamples.toFixed(0)}</span>
+            ) : null}
+          </div>
+        ))}
+      </div>
+      <p className="panel-note">
+        {isCarrier
+          ? "Cyan outlines are observed ArUco corners; coloured outlines are visible CAD facets projected from the solved pose."
+          : "Cube wireframes are projected from each camera's solved pose."}
+      </p>
+    </div>
+  );
+}
+
 export function DatasetProcessingPage({
   snapshot,
   busy,
@@ -119,7 +179,7 @@ export function DatasetProcessingPage({
 }: {
   snapshot: GuiSnapshot;
   busy: boolean;
-  onGenerate: (path: string, markerTcpCalibrationPath?: string) => void;
+  onGenerate: (path: string, markerTcpCalibrationPath?: string, trackingTarget?: TrackingTarget) => void;
   onRunQc: (path: string) => void;
   onOpenReplay: (path: string) => void;
   onSetDatasetsRoot: (path: string) => void;
@@ -127,6 +187,9 @@ export function DatasetProcessingPage({
   const items = snapshot.processing;
   const [selectedPath, setSelectedPath] = useState<string>(items[0]?.path ?? "");
   const selected = items.find((item) => item.path === selectedPath) ?? items[0];
+  const [trackingTarget, setTrackingTarget] = useState<TrackingTarget>(
+    items[0]?.trackingTarget ?? "april_cube"
+  );
   const runningCount = items.filter((item) => item.status === "running" || item.status === "queued").length;
   const failedCount = items.filter((item) => item.status === "qc_failed" || item.status === "error").length;
   const readyCount = items.filter((item) => item.status === "qc_pass").length;
@@ -139,12 +202,18 @@ export function DatasetProcessingPage({
   // Pre-filling made "just press Generate" silently pick that over the production bundle
   // named in the tracker YAML, which is the one that gets curated for all cubes.
   // "Latest Solve" is still one click away when that is genuinely what you want.
+  useEffect(() => {
+    if (selected?.trackingTarget) {
+      setTrackingTarget(selected.trackingTarget);
+    }
+  }, [selected?.path, selected?.trackingTarget]);
   const [markerTcpPathInput, setMarkerTcpPathInput] = useState<string>("");
   useEffect(() => {
     setRootInput(currentRoot);
   }, [currentRoot]);
   const rootDirty = rootInput.trim() !== currentRoot;
   const markerTcpPath = markerTcpPathInput.trim();
+  const markerTcpForRun = trackingTarget === "april_cube" ? markerTcpPath : "";
 
   return (
     <div className="page-stack">
@@ -179,39 +248,69 @@ export function DatasetProcessingPage({
       </section>
       <section className="panel">
         <div className="panel-heading">
-          <h2>EE Trajectory Options</h2>
-          <span>marker→TCP</span>
+          <h2>Detection Target</h2>
+          <span>explicit physical model</span>
         </div>
-        <div className="datasets-root-row trajectory-option-row">
-          <input
-            className="datasets-root-input"
-            value={markerTcpPathInput}
-            onChange={(event) => setMarkerTcpPathInput(event.target.value)}
-            placeholder="可选：outputs/.../marker_to_tcp_calibration.json"
-            spellCheck={false}
-          />
+        <div className="tracking-target-grid" role="radiogroup" aria-label="Detection target">
           <button
-            disabled={busy || !latestMarkerTcpPath}
-            onClick={() => setMarkerTcpPathInput(latestMarkerTcpPath)}
+            className={trackingTarget === "april_cube" ? "tracking-target-card active" : "tracking-target-card"}
+            aria-pressed={trackingTarget === "april_cube"}
+            disabled={busy}
+            onClick={() => setTrackingTarget("april_cube")}
           >
-            Latest Solve
+            <strong>AprilTag Cube</strong>
+            <span>Legacy 6-face cube tracker and calibrated marker→TCP bundle.</span>
           </button>
           <button
-            disabled={busy || !markerTcpPathInput.trim()}
-            onClick={() => setMarkerTcpPathInput("")}
+            className={trackingTarget === "hybrid_carrier_v1" ? "tracking-target-card active" : "tracking-target-card"}
+            aria-pressed={trackingTarget === "hybrid_carrier_v1"}
+            disabled={busy}
+            onClick={() => setTrackingTarget("hybrid_carrier_v1")}
           >
-            Clear
+            <strong>0907 Hybrid Carrier V1</strong>
+            <span>ArUco 30/31/32 anchors plus red/green/blue CAD-facet refinement.</span>
           </button>
         </div>
         <p className="panel-note">
-          {markerTcpPath
-            ? `Generate 将使用 ${markerTcpPath}（覆盖 tracker YAML 的默认 bundle）`
-            : "留空 = 使用 tracker YAML 里的 production marker→TCP bundle，正常情况保持留空。"}
+          目标必须显式选择：错误的字典和几何模型可能得到“无检测”，不能靠文件名猜测物理夹具。
         </p>
-        <p className="panel-note">
-          解算目录里的 bundle 是从上一版合并出来的：只有刚解的那个 cube 是新的，其余 cube
-          仍是旧值。要给多个夹爪生成轨迹时，用留空的 production bundle，不要指向解算目录。
-        </p>
+        {trackingTarget === "april_cube" ? (
+          <>
+            <div className="datasets-root-row trajectory-option-row">
+              <input
+                className="datasets-root-input"
+                value={markerTcpPathInput}
+                onChange={(event) => setMarkerTcpPathInput(event.target.value)}
+                placeholder="可选：outputs/.../marker_to_tcp_calibration.json"
+                spellCheck={false}
+              />
+              <button
+                disabled={busy || !latestMarkerTcpPath}
+                onClick={() => setMarkerTcpPathInput(latestMarkerTcpPath)}
+              >
+                Latest Solve
+              </button>
+              <button
+                disabled={busy || !markerTcpPathInput.trim()}
+                onClick={() => setMarkerTcpPathInput("")}
+              >
+                Clear
+              </button>
+            </div>
+            <p className="panel-note">
+              {markerTcpPath
+                ? `Generate 将使用 ${markerTcpPath}（覆盖 tracker YAML 的默认 bundle）`
+                : "留空 = 使用 tracker YAML 里的 production marker→TCP bundle，正常情况保持留空。"}
+            </p>
+          </>
+        ) : (
+          <div className="carrier-contract-note">
+            <strong>TCP comes from geometry</strong>
+            <span>
+              0907 carrier 的球窝中心就是 CAD 原点；方向约定由版本化 carrier bundle 固定，不接受 cube 标定覆盖。
+            </span>
+          </div>
+        )}
       </section>
       <section className="panel">
         <div className="panel-heading">
@@ -256,7 +355,7 @@ export function DatasetProcessingPage({
                   active={item.path === selected?.path}
                   busy={busy}
                   onSelect={() => setSelectedPath(item.path)}
-                  onGenerate={() => onGenerate(item.path, markerTcpPath)}
+                  onGenerate={() => onGenerate(item.path, markerTcpForRun, trackingTarget)}
                   onRunQc={() => onRunQc(item.path)}
                   onOpenReplay={() => onOpenReplay(item.path)}
                 />
@@ -278,12 +377,20 @@ export function DatasetProcessingPage({
               <Metric label="Frames" value={selected.totalFrames} />
               <Metric label="Trajectory" value={selected.trajectoryVersion ?? "—"} />
               <Metric label="Valid frames" value={selected.validFramesPct != null ? `${selected.validFramesPct}%` : "—"} />
-              <Metric label="Marker→TCP" value={selected.markerTcpCalibrationPath || "default"} />
+              <Metric label="Tracking target" value={selected.detectionSummary?.label ?? selected.trackingTarget ?? "AprilTag Cube"} />
+              <Metric
+                label="Marker→TCP"
+                value={
+                  (selected.trackingTarget ?? "april_cube") === "hybrid_carrier_v1"
+                    ? "CAD socket origin"
+                    : selected.markerTcpCalibrationPath || "default"
+                }
+              />
             </div>
             <div className="control-row">
               <button
                 disabled={busy || selected.status === "running" || selected.status === "queued"}
-                onClick={() => onGenerate(selected.path, markerTcpPath)}
+                onClick={() => onGenerate(selected.path, markerTcpForRun, trackingTarget)}
               >
                 {selected.trajectoryVersion ? "Regenerate Trajectory" : "Generate EE Trajectory"}
               </button>
@@ -307,6 +414,7 @@ export function DatasetProcessingPage({
                 Open Replay
               </button>
             </div>
+            <TrackingDetectionBlock item={selected} busy={busy} onOpenReplay={() => onOpenReplay(selected.path)} />
             <div className="qc-block">
               <h3>QC summary</h3>
               <p>{selected.qcSummary}</p>

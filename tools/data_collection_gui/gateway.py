@@ -90,6 +90,9 @@ DEFAULT_EE_TRAJECTORY_RUNNER = Path("third_party/opencv_kalibr/run_april_cube_tr
 DEFAULT_EE_TRAJECTORY_CONFIG = Path(
     "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/april_cube_tracking_in_robot_base_thor.yaml"
 )
+HYBRID_CARRIER_EE_TRAJECTORY_CONFIG = Path(
+    "third_party/opencv_kalibr/hikon_cube_tracking_offline/config_thor/hybrid_carrier_tracking_in_robot_base_thor.yaml"
+)
 # Resolved marker layout the solve writes next to its production bundle, so a
 # non-identity rig frame travels with the bundle instead of being lost.
 DEFAULT_MARKER_LAYOUT_NAME = "marker_layout_resolved.json"
@@ -97,6 +100,19 @@ DEFAULT_MARKER_LAYOUT_NAME = "marker_layout_resolved.json"
 # (save_to_dataset.sidecar_dir and output.run_name_suffix). Kept in sync here so
 # the gateway reads back exactly what the tracker writes.
 DEFAULT_EE_TRAJECTORY_ALGORITHM = "april_cube_tracking_in_robot_base"
+DEFAULT_TRACKING_TARGET = "april_cube"
+TRACKING_TARGETS = {
+    DEFAULT_TRACKING_TARGET: {
+        "label": "AprilTag cube",
+        "config": DEFAULT_EE_TRAJECTORY_CONFIG,
+        "algorithm": DEFAULT_EE_TRAJECTORY_ALGORITHM,
+    },
+    "hybrid_carrier_v1": {
+        "label": "Hybrid Carrier V1",
+        "config": HYBRID_CARRIER_EE_TRAJECTORY_CONFIG,
+        "algorithm": "hybrid_carrier_v1_anchors_facets",
+    },
+}
 DEFAULT_TRAJ_SIDECAR_NAME = "april_cube_tracking_in_robot_base"
 DEFAULT_TRACKING_RUN_SUFFIX = "_thor_april_tracking_in_robot_base"
 DEFAULT_CUBE_TRAJECTORY_NAMES = ("left", "right", "head")
@@ -2243,6 +2259,8 @@ def _processing_item_from_dataset(
         "validFramesPct": None,
         "logTail": [],
         "markerTcpCalibrationPath": "",
+        "trackingTarget": DEFAULT_TRACKING_TARGET,
+        "detectionSummary": None,
         "onlineSync": _online_sync_manifest_summary(dataset_root),
         "qcChecks": [],
         "ikEvaluation": None,
@@ -2255,6 +2273,16 @@ def _processing_item_from_dataset(
         current_job = meta.get("current_job") if isinstance(meta.get("current_job"), dict) else {}
         version_info = versions.get(active_version) if isinstance(active_version, str) else None
         qc = version_info.get("qc") if isinstance(version_info, dict) else None
+        tracking_target = str(
+            current_job.get("tracking_target")
+            or (version_info.get("tracking_target") if isinstance(version_info, dict) else "")
+            or DEFAULT_TRACKING_TARGET
+        )
+        detection_summary = current_job.get("detection_summary")
+        if not isinstance(detection_summary, dict) and isinstance(version_info, dict):
+            detection_summary = version_info.get("detection_summary")
+        if not isinstance(detection_summary, dict):
+            detection_summary = None
         marker_tcp_path = ""
         if isinstance(current_job, dict):
             marker_tcp_path = str(current_job.get("marker_to_tcp_calibration_path", "") or "")
@@ -2300,6 +2328,8 @@ def _processing_item_from_dataset(
             "validFramesPct": float(qc["valid_frames_pct"]) if isinstance(qc, dict) and qc.get("valid_frames_pct") is not None else None,
             "logTail": list(current_job.get("log_tail") or []) if isinstance(current_job, dict) else [],
             "markerTcpCalibrationPath": marker_tcp_path,
+            "trackingTarget": tracking_target,
+            "detectionSummary": detection_summary,
             "qcChecks": list(qc.get("checks") or []) if isinstance(qc, dict) else [],
             "ikEvaluation": qc.get("ik_evaluation") if isinstance(qc, dict) else None,
         }
@@ -4406,8 +4436,9 @@ def _write_ee_trajectory_override_config(
     state: GatewayState,
     dataset_root: Path,
     marker_to_tcp_calibration_path: Path,
+    *, base_config_path: Path | None = None,
 ) -> Path:
-    base_config_path = state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG
+    base_config_path = base_config_path or (state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG)
     if not base_config_path.is_file():
         raise FileNotFoundError(f"EE trajectory config not found: {base_config_path}")
     cfg = _load_yaml_mapping(base_config_path)
@@ -7529,6 +7560,7 @@ def _write_processing_meta_qc(dataset_root: Path, qc_result: dict[str, Any]) -> 
         active_version = "v1" if "v1" not in versions else f"v{len(versions) + 1}"
     version_entry = versions.get(active_version) if isinstance(versions.get(active_version), dict) else {}
     versions[active_version] = {
+        **version_entry,
         "created_at": version_entry.get("created_at") or _now_iso(),
         "algorithm": version_entry.get("algorithm") or "identity-mvp",
         "qc": qc_result,
@@ -7559,20 +7591,51 @@ def _next_processing_version(versions: dict[str, Any]) -> str:
     return f"v{index}"
 
 
+def _tracking_target_spec(raw_target: str | None) -> tuple[str, dict[str, Any]]:
+    target = str(raw_target or DEFAULT_TRACKING_TARGET).strip().lower()
+    spec = TRACKING_TARGETS.get(target)
+    if spec is None:
+        raise ValueError(
+            f"unknown tracking target {target!r}; expected one of {sorted(TRACKING_TARGETS)}"
+        )
+    return target, spec
+
+
+def _tracking_calibration_stamp(state: GatewayState, config_path: Path) -> dict[str, str]:
+    """Stamp the config the launched job actually reads, not the cube default."""
+    out = {"configPath": str(config_path), "intrinsicsRun": "", "extrinsicsRun": ""}
+    try:
+        cfg = _load_yaml_mapping(config_path)
+        calibration = cfg.get("calibration") if isinstance(cfg.get("calibration"), dict) else {}
+        out["intrinsicsRun"] = str(calibration.get("intrinsics_run_name", "") or "")
+        out["extrinsicsRun"] = str(calibration.get("fixed_camera_run_name", "") or "")
+    except Exception as exc:  # noqa: BLE001 - metadata should name an unreadable config
+        out["error"] = str(exc)
+    return out
+
+
 def _ee_trajectory_command(
     state: GatewayState,
     dataset_root: Path,
     *,
     marker_to_tcp_calibration_path: Path | None = None,
+    tracking_target: str = DEFAULT_TRACKING_TARGET,
 ) -> list[str]:
     runner_path = state.repo_root / DEFAULT_EE_TRAJECTORY_RUNNER
-    config_path = state.repo_root / DEFAULT_EE_TRAJECTORY_CONFIG
+    tracking_target, target_spec = _tracking_target_spec(tracking_target)
+    if marker_to_tcp_calibration_path is not None and tracking_target != DEFAULT_TRACKING_TARGET:
+        raise ValueError(
+            "marker-to-TCP override is cube-only; Hybrid Carrier V1 uses its versioned CAD socket bundle"
+        )
+    config_path = state.repo_root / Path(target_spec["config"])
     if not runner_path.is_file():
         raise FileNotFoundError(f"EE trajectory runner not found: {runner_path}")
     if not config_path.is_file():
         raise FileNotFoundError(f"EE trajectory config not found: {config_path}")
     if marker_to_tcp_calibration_path is not None:
-        config_path = _write_ee_trajectory_override_config(state, dataset_root, marker_to_tcp_calibration_path)
+        config_path = _write_ee_trajectory_override_config(
+            state, dataset_root, marker_to_tcp_calibration_path, base_config_path=config_path
+        )
     return [
         "bash",
         str(runner_path),
@@ -7580,6 +7643,8 @@ def _ee_trajectory_command(
         str(dataset_root),
         "--config",
         str(config_path),
+        "--tracking-target",
+        tracking_target,
     ]
 
 
@@ -7595,6 +7660,8 @@ def _update_traj_gen_meta(
     exit_code: int | None = None,
     marker_to_tcp_calibration_path: str | Path | None = None,
     calibration: dict[str, str] | None = None,
+    tracking_target: str | None = None,
+    detection_summary: dict[str, Any] | None = None,
 ) -> None:
     existing = _load_processing_meta(dataset_root) or {}
     current_job = existing.get("current_job") if isinstance(existing.get("current_job"), dict) else {}
@@ -7612,6 +7679,13 @@ def _update_traj_gen_meta(
         job["command"] = command
     elif isinstance(current_job, dict) and isinstance(current_job.get("command"), list):
         job["command"] = current_job["command"]
+    target_text = str(
+        tracking_target
+        or (current_job.get("tracking_target") if isinstance(current_job, dict) else "")
+        or DEFAULT_TRACKING_TARGET
+    )
+    target_text, target_spec = _tracking_target_spec(target_text)
+    job["tracking_target"] = target_text
     marker_path_text = (
         str(marker_to_tcp_calibration_path)
         if marker_to_tcp_calibration_path is not None
@@ -7639,15 +7713,22 @@ def _update_traj_gen_meta(
         job["completed_at"] = _now_iso()
 
     updated = {**existing, "current_job": job}
+    evidence = detection_summary
+    if evidence is None and isinstance(current_job, dict):
+        evidence = current_job.get("detection_summary")
+    if isinstance(evidence, dict) and evidence:
+        job["detection_summary"] = evidence
     if version is not None:
         versions = updated.get("versions") if isinstance(updated.get("versions"), dict) else {}
         versions[version] = {
             "created_at": _now_iso(),
-            "algorithm": DEFAULT_EE_TRAJECTORY_ALGORITHM,
+            "algorithm": str(target_spec["algorithm"]),
+            "tracking_target": target_text,
             "dataset_root": str(dataset_root),
             "sidecar_dir": str(dataset_root / "derived" / DEFAULT_TRAJ_SIDECAR_NAME),
             "command": job.get("command") or command or [],
             "marker_to_tcp_calibration_path": marker_path_text,
+            "detection_summary": evidence if isinstance(evidence, dict) else None,
             "qc": versions.get(version, {}).get("qc") if isinstance(versions.get(version), dict) else None,
         }
         updated["active_version"] = version
@@ -7700,9 +7781,12 @@ def _read_traj_gen_output(
 
     existing = _load_processing_meta(dataset_root) or {}
     versions = existing.get("versions") if isinstance(existing.get("versions"), dict) else {}
+    current_job = existing.get("current_job") if isinstance(existing.get("current_job"), dict) else {}
+    tracking_target, target_spec = _tracking_target_spec(current_job.get("tracking_target"))
     if exit_code == 0:
         version = _next_processing_version(versions)
-        message = "EE trajectory generated from AprilTag cube tracking"
+        message = f"EE trajectory generated from {target_spec['label']} tracking"
+        detection_summary = _tracking_detection_summary(state, dataset_root, tracking_target)
         _update_traj_gen_meta(
             dataset_root,
             job_id=job_id,
@@ -7711,6 +7795,8 @@ def _read_traj_gen_output(
             log_tail=[*log_tail, f"[traj-gen] complete exit_code={exit_code}"][-24:],
             version=version,
             exit_code=exit_code,
+            tracking_target=tracking_target,
+            detection_summary=detection_summary,
         )
         _refresh_cached_processing_item(state, dataset_root)
         with state.lock:
@@ -7724,6 +7810,7 @@ def _read_traj_gen_output(
             message=message,
             log_tail=[*log_tail, f"[traj-gen] failed exit_code={exit_code}"][-24:],
             exit_code=exit_code,
+            tracking_target=tracking_target,
         )
         _refresh_cached_processing_item(state, dataset_root)
         with state.lock:
@@ -7735,8 +7822,10 @@ def _queue_traj_gen(
     dataset_root: Path,
     *,
     marker_to_tcp_calibration_path: Path | None = None,
+    tracking_target: str = DEFAULT_TRACKING_TARGET,
     allow_stale_calibration: bool = False,
 ) -> None:
+    tracking_target, target_spec = _tracking_target_spec(tracking_target)
     # Checked here rather than only in the HTTP handler so that every path into
     # trajectory generation goes through it, including any future automatic one.
     if not allow_stale_calibration:
@@ -7762,21 +7851,24 @@ def _queue_traj_gen(
             state,
             dataset_root,
             marker_to_tcp_calibration_path=marker_to_tcp_calibration_path,
+            tracking_target=tracking_target,
         )
         marker_path_text = "" if marker_to_tcp_calibration_path is None else str(marker_to_tcp_calibration_path)
+        launched_config_path = Path(command[command.index("--config") + 1])
         _update_traj_gen_meta(
             dataset_root,
             job_id=job_id,
             status="running",
             command=command,
             message=(
-                f"Running AprilTag cube tracking for {dataset_root.name}"
+                f"Running {target_spec['label']} tracking for {dataset_root.name}"
                 + (f" with marker→TCP bundle {marker_path_text}" if marker_path_text else "")
             ),
             # Which calibration this trajectory was built on, recorded next to
             # the trajectory itself. Read months later this is the only thing
             # that can answer "was this produced before or after the repoint".
-            calibration=_production_calibration_runs(state),
+            calibration=_tracking_calibration_stamp(state, launched_config_path),
+            tracking_target=tracking_target,
             log_tail=[f"[traj-gen] {' '.join(command)}"],
             marker_to_tcp_calibration_path=marker_path_text or None,
         )
@@ -7801,6 +7893,7 @@ def _queue_traj_gen(
             message=f"Failed to start EE trajectory generation: {exc}",
             log_tail=[f"[traj-gen] failed to start: {exc}"],
             marker_to_tcp_calibration_path=marker_to_tcp_calibration_path,
+            tracking_target=tracking_target,
         )
         _refresh_cached_processing_item(state, dataset_root)
         raise
@@ -8466,6 +8559,89 @@ def _tracking_run_dir(state: GatewayState, dataset_root: Path) -> Path:
     return state.repo_root / "outputs" / "tracking_analysis" / f"{dataset_root.name}{DEFAULT_TRACKING_RUN_SUFFIX}"
 
 
+def _median_number(values: list[float]) -> float | None:
+    finite = sorted(value for value in values if math.isfinite(value))
+    if not finite:
+        return None
+    middle = len(finite) // 2
+    if len(finite) % 2:
+        return finite[middle]
+    return (finite[middle - 1] + finite[middle]) / 2.0
+
+
+def _tracking_detection_summary(
+    state: GatewayState,
+    dataset_root: Path,
+    tracking_target: str,
+) -> dict[str, Any] | None:
+    """Reduce tracker records to evidence a person can judge in the UI."""
+    target, spec = _tracking_target_spec(tracking_target)
+    tracking_run = _tracking_run_dir(state, dataset_root)
+    summary = _load_json_file(tracking_run / "summary.json")
+    streams = summary.get("active_streams") if isinstance(summary.get("active_streams"), list) else []
+    if not streams:
+        return None
+
+    per_camera: list[dict[str, Any]] = []
+    total_views = 0
+    detected_views = 0
+    for stream in streams:
+        if not isinstance(stream, dict):
+            continue
+        serial = str(stream.get("serial") or "")
+        stream_key = str(stream.get("stream_key") or "")
+        camera_name = str(stream.get("camera_name") or stream_key or serial)
+        csv_path = tracking_run / "per_camera" / f"camera_{serial}_records.csv"
+        if not serial or not csv_path.is_file():
+            continue
+        views = 0
+        detected = 0
+        anchors: list[float] = []
+        residuals: list[float] = []
+        edge_samples: list[float] = []
+        try:
+            with csv_path.open("r", encoding="utf-8", newline="") as csv_file:
+                for row in csv.DictReader(csv_file):
+                    views += 1
+                    if int(float(row.get("cube_detected", "0") or 0)) <= 0:
+                        continue
+                    detected += 1
+                    marker_count = _csv_float(row, "cube_num_markers")
+                    rmse = _csv_float(row, "cube_reprojection_rmse_px")
+                    edges = _csv_float(row, "num_edge_samples")
+                    if marker_count is not None:
+                        anchors.append(marker_count)
+                    if rmse is not None:
+                        residuals.append(rmse)
+                    if edges is not None:
+                        edge_samples.append(edges)
+        except OSError:
+            continue
+        total_views += views
+        detected_views += detected
+        per_camera.append({
+            "camera": camera_name,
+            "streamKey": stream_key,
+            "totalViews": views,
+            "detectedViews": detected,
+            "detectionRatePct": round(100.0 * detected / views, 1) if views else 0.0,
+            "medianAnchors": _median_number(anchors),
+            "medianRmsePx": _median_number(residuals),
+            "medianEdgeSamples": _median_number(edge_samples),
+        })
+    if not per_camera:
+        return None
+    return {
+        "target": target,
+        "label": str(spec["label"]),
+        "totalViews": total_views,
+        "detectedViews": detected_views,
+        "detectionRatePct": round(100.0 * detected_views / total_views, 1) if total_views else 0.0,
+        "perCamera": per_camera,
+        "overlayAvailable": detected_views > 0,
+    }
+
+
 def _mat4_inverse_rigid(matrix: list[list[float]]) -> list[list[float]]:
     rotation = [[float(matrix[r][c]) for c in range(3)] for r in range(3)]
     translation = [float(matrix[r][3]) for r in range(3)]
@@ -8489,6 +8665,17 @@ def _transform_point(matrix: list[list[float]], point: tuple[float, float, float
         matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z + matrix[0][3],
         matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z + matrix[1][3],
         matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z + matrix[2][3],
+    )
+
+
+def _transform_vector(
+    matrix: list[list[float]], vector: tuple[float, float, float]
+) -> tuple[float, float, float]:
+    x, y, z = vector
+    return (
+        matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z,
+        matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z,
+        matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z,
     )
 
 
@@ -8529,6 +8716,7 @@ def _project_point(
     camera_matrix: list[list[float]],
     dist_coeffs: list[float],
     point_cam: tuple[float, float, float],
+    camera_model: str = "rational",
 ) -> list[float] | None:
     x, y, z = point_cam
     if z <= 1e-6 or not all(math.isfinite(value) for value in (x, y, z)):
@@ -8539,6 +8727,25 @@ def _project_point(
     cy = float(camera_matrix[1][2])
     xn = x / z
     yn = y / z
+    if dist_coeffs and str(camera_model).strip().lower() == "fisheye":
+        coeffs = [float(value) for value in dist_coeffs]
+        radius = math.hypot(xn, yn)
+        if radius > 1e-12:
+            theta = math.atan(radius)
+            theta2 = theta * theta
+            theta_d = theta * (
+                1.0
+                + (coeffs[0] if len(coeffs) > 0 else 0.0) * theta2
+                + (coeffs[1] if len(coeffs) > 1 else 0.0) * theta2**2
+                + (coeffs[2] if len(coeffs) > 2 else 0.0) * theta2**3
+                + (coeffs[3] if len(coeffs) > 3 else 0.0) * theta2**4
+            )
+            scale = theta_d / radius
+            xn, yn = xn * scale, yn * scale
+        return [
+            float(camera_matrix[0][0]) * xn + float(camera_matrix[0][1]) * yn + float(camera_matrix[0][2]),
+            float(camera_matrix[1][0]) * xn + float(camera_matrix[1][1]) * yn + float(camera_matrix[1][2]),
+        ]
     if dist_coeffs:
         coeffs = [float(value) for value in dist_coeffs]
         k1 = coeffs[0] if len(coeffs) > 0 else 0.0
@@ -8637,23 +8844,34 @@ def _cube_overlay_from_row(
     *,
     camera_matrix: list[list[float]],
     dist_coeffs: list[float],
-    t_cam_base: list[list[float]],
+    t_cam_base: list[list[float]] | None,
     cube_size_m: float,
+    camera_model: str = "rational",
 ) -> dict[str, Any] | None:
     if int(float(row.get("cube_detected", "0") or 0)) <= 0:
         return None
-    t_base_cube = _pose_matrix_from_csv_row(row, "cube_base")
-    if t_base_cube is None:
-        return None
-    t_cam_cube = _mat4_mul(t_cam_base, t_base_cube)
-    corners = [_project_point(camera_matrix, dist_coeffs, _transform_point(t_cam_cube, point)) for point in _cube_corners(cube_size_m)]
+    # The detector already emits T_cam_target. Prefer that direct observation:
+    # it avoids turning a visualization into a second extrinsics computation.
+    t_cam_cube = _pose_matrix_from_csv_row(row, "cube_cam")
+    if t_cam_cube is None:
+        t_base_cube = _pose_matrix_from_csv_row(row, "cube_base")
+        if t_base_cube is None or t_cam_base is None:
+            return None
+        t_cam_cube = _mat4_mul(t_cam_base, t_base_cube)
+    project = lambda point: _project_point(
+        camera_matrix,
+        dist_coeffs,
+        _transform_point(t_cam_cube, point),
+        camera_model=camera_model,
+    )
+    corners = [project(point) for point in _cube_corners(cube_size_m)]
     axis_points = [
         (0.0, 0.0, 0.0),
         (cube_size_m, 0.0, 0.0),
         (0.0, cube_size_m, 0.0),
         (0.0, 0.0, cube_size_m),
     ]
-    axes = [_project_point(camera_matrix, dist_coeffs, _transform_point(t_cam_cube, point)) for point in axis_points]
+    axes = [project(point) for point in axis_points]
     finite = [point for point in corners if point is not None]
     label = None
     if finite:
@@ -8662,6 +8880,7 @@ def _cube_overlay_from_row(
         label = axes[0]
     cube_name = str(row.get("cube_name") or "cube")
     return {
+        "kind": "cube",
         "cubeName": cube_name,
         "color": CUBE_OVERLAY_COLORS.get(cube_name, "#ffffff"),
         "corners": corners,
@@ -8679,7 +8898,213 @@ def _cube_overlay_from_row(
     }
 
 
-def _read_video_cube_overlays(state: GatewayState, dataset_root: Path, episode: int) -> dict[int, dict[str, list[dict[str, Any]]]]:
+_CARRIER_FACET_COLORS = {
+    "red": "#ef4444",
+    "green": "#22c55e",
+    "blue": "#3b82f6",
+    "black": "#111827",
+    "white": "#f8fafc",
+}
+
+
+def _carrier_points(raw_points: Any, scale: float) -> list[tuple[float, float, float]]:
+    points: list[tuple[float, float, float]] = []
+    if not isinstance(raw_points, list):
+        return points
+    for raw in raw_points:
+        if not isinstance(raw, list) or len(raw) < 3:
+            continue
+        try:
+            point = (float(raw[0]) * scale, float(raw[1]) * scale, float(raw[2]) * scale)
+        except (TypeError, ValueError):
+            continue
+        if all(math.isfinite(value) for value in point):
+            points.append(point)
+    return points
+
+
+def _load_hybrid_carrier_overlay_model(
+    state: GatewayState,
+    summary: dict[str, Any],
+) -> dict[str, Any] | None:
+    tracker_summary = summary.get("cube_tracker") if isinstance(summary.get("cube_tracker"), dict) else {}
+    pose_mode = str(tracker_summary.get("pose_estimation_mode") or "")
+    if "hybrid_carrier" not in pose_mode:
+        return None
+    config_path = Path(str(summary.get("config") or ""))
+    if not config_path.is_absolute():
+        config_path = state.repo_root / config_path
+    try:
+        config = _load_yaml_mapping(config_path)
+    except Exception:  # noqa: BLE001 - missing geometry disables only the overlay
+        return None
+    carrier_cfg = config.get("carrier") if isinstance(config.get("carrier"), dict) else {}
+    model_path = Path(str(carrier_cfg.get("model_path") or ""))
+    if not model_path.is_absolute():
+        model_path = state.repo_root / model_path
+    descriptor = _load_json_file(model_path)
+    if descriptor.get("schema") != "hybrid_carrier_cad/v1":
+        return None
+    unit_scale = {"m": 1.0, "cm": 0.01, "mm": 0.001}.get(str(descriptor.get("units") or "").lower())
+    if unit_scale is None:
+        return None
+
+    anchors: list[dict[str, Any]] = []
+    for item in descriptor.get("anchors") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            marker_id = int(item["marker_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        points = _carrier_points(item.get("marker_corners"), unit_scale)
+        if len(points) == 4:
+            anchors.append({"id": marker_id, "name": str(item.get("name") or marker_id), "points": points})
+
+    facets: list[dict[str, Any]] = []
+    for item in descriptor.get("facets") or []:
+        if not isinstance(item, dict) or not bool(item.get("use_for_pose", True)):
+            continue
+        points = _carrier_points(item.get("polygon"), unit_scale)
+        normal_points = _carrier_points([item.get("normal")], 1.0)
+        if len(points) < 3 or not normal_points:
+            continue
+        facets.append({
+            "name": str(item.get("name") or "facet"),
+            "colour": str(item.get("colour") or "white").lower(),
+            "points": points,
+            "normal": normal_points[0],
+        })
+    if not anchors:
+        return None
+    return {
+        "carrierId": str(descriptor.get("carrier_id") or "hybrid_carrier"),
+        "anchors": anchors,
+        "facets": facets,
+    }
+
+
+def _hybrid_carrier_overlay_from_row(
+    row: dict[str, Any],
+    *,
+    camera_matrix: list[list[float]],
+    dist_coeffs: list[float],
+    t_cam_base: list[list[float]] | None,
+    camera_model: str,
+    carrier_model: dict[str, Any],
+) -> dict[str, Any] | None:
+    if int(float(row.get("cube_detected", "0") or 0)) <= 0:
+        return None
+    t_cam_carrier = _pose_matrix_from_csv_row(row, "cube_cam")
+    if t_cam_carrier is None:
+        t_base_carrier = _pose_matrix_from_csv_row(row, "cube_base")
+        if t_base_carrier is None or t_cam_base is None:
+            return None
+        t_cam_carrier = _mat4_mul(t_cam_base, t_base_carrier)
+
+    marker_ids: list[int] = []
+    for raw in str(row.get("detected_marker_ids") or "").split(","):
+        try:
+            marker_ids.append(int(raw.strip()))
+        except ValueError:
+            continue
+    polygons: list[dict[str, Any]] = []
+
+    def project(point: tuple[float, float, float]) -> list[float] | None:
+        return _project_point(
+            camera_matrix,
+            dist_coeffs,
+            _transform_point(t_cam_carrier, point),
+            camera_model=camera_model,
+        )
+
+    # Painted boundaries show the evidence used by the precision-refinement
+    # stage. Back-facing facets are suppressed so the drawing stays legible.
+    for facet in carrier_model.get("facets") or []:
+        points = facet["points"]
+        centre = tuple(sum(point[axis] for point in points) / len(points) for axis in range(3))
+        centre_cam = _transform_point(t_cam_carrier, centre)
+        normal_cam = _transform_vector(t_cam_carrier, facet["normal"])
+        if sum(normal_cam[axis] * centre_cam[axis] for axis in range(3)) >= 0.0:
+            continue
+        projected = [project(point) for point in points]
+        if all(point is not None for point in projected):
+            colour = _CARRIER_FACET_COLORS.get(facet["colour"], "#cbd5e1")
+            polygons.append({
+                "role": "facet",
+                "label": facet["name"],
+                "color": colour,
+                "points": projected,
+            })
+
+    anchor_points: list[list[float]] = []
+    try:
+        observed_anchors = json.loads(str(row.get("detected_marker_corners_px") or "[]"))
+    except json.JSONDecodeError:
+        observed_anchors = []
+    if isinstance(observed_anchors, list):
+        for observed in observed_anchors:
+            if not isinstance(observed, dict):
+                continue
+            try:
+                marker_id = int(observed.get("marker_id"))
+            except (TypeError, ValueError):
+                continue
+            points: list[list[float]] = []
+            for raw_point in observed.get("points") or []:
+                if not isinstance(raw_point, list) or len(raw_point) < 2:
+                    continue
+                try:
+                    point = [float(raw_point[0]), float(raw_point[1])]
+                except (TypeError, ValueError):
+                    continue
+                if all(math.isfinite(value) for value in point):
+                    points.append(point)
+            if len(points) == 4:
+                anchor_points.extend(points)
+                polygons.append({
+                    "role": "anchor",
+                    "label": f"id {marker_id}",
+                    "color": "#22d3ee",
+                    "points": points,
+                })
+
+    axis_length_m = 0.05
+    axes = [project(point) for point in (
+        (0.0, 0.0, 0.0),
+        (axis_length_m, 0.0, 0.0),
+        (0.0, axis_length_m, 0.0),
+        (0.0, 0.0, axis_length_m),
+    )]
+    finite = anchor_points or [point for polygon in polygons for point in polygon["points"] if point is not None]
+    label = (
+        [sum(point[0] for point in finite) / len(finite), sum(point[1] for point in finite) / len(finite)]
+        if finite
+        else axes[0]
+    )
+    return {
+        "kind": "hybrid_carrier",
+        "cubeName": str(carrier_model.get("carrierId") or "hybrid_carrier"),
+        "color": "#22d3ee",
+        "corners": [],
+        "polygons": polygons,
+        "markerIds": marker_ids,
+        "axes": {"origin": axes[0], "x": axes[1], "y": axes[2], "z": axes[3]},
+        "label": label,
+        "detected": 1,
+        "numMarkers": int(float(row.get("cube_num_markers", "0") or 0)),
+        "numEdgeSamples": int(float(row.get("num_edge_samples", "0") or 0)),
+        "rmsePx": _csv_float(row, "cube_reprojection_rmse_px"),
+        "usedForFusion": int(float(row.get("used_for_fusion", "0") or 0)) > 0,
+        "message": str(row.get("detection_message") or ""),
+    }
+
+
+def _read_video_cube_overlays(
+    state: GatewayState,
+    dataset_root: Path,
+    episode: int,
+) -> dict[int, dict[str, list[dict[str, Any]]]]:
     tracking_run = _tracking_run_dir(state, dataset_root)
     summary = _load_json_file(tracking_run / "summary.json")
     if not summary:
@@ -8688,7 +9113,10 @@ def _read_video_cube_overlays(state: GatewayState, dataset_root: Path, episode: 
     if not fixed_summary.is_absolute():
         fixed_summary = state.repo_root / fixed_summary
     camera_poses = _load_camera_poses_in_base(fixed_summary)
-    cube_size_m = float(((summary.get("cube_tracker") or {}).get("cube_size_cm") or DEFAULT_CUBE_SIZE_M * 100.0)) / 100.0
+    tracker_summary = summary.get("cube_tracker") if isinstance(summary.get("cube_tracker"), dict) else {}
+    cube_size_m = float((tracker_summary.get("cube_size_cm") or DEFAULT_CUBE_SIZE_M * 100.0)) / 100.0
+    camera_model = str(tracker_summary.get("camera_model") or "rational")
+    carrier_model = _load_hybrid_carrier_overlay_model(state, summary)
     overlays: dict[int, dict[str, list[dict[str, Any]]]] = {}
     active_streams = summary.get("active_streams") if isinstance(summary.get("active_streams"), list) else []
     for stream in active_streams:
@@ -8699,12 +9127,15 @@ def _read_video_cube_overlays(state: GatewayState, dataset_root: Path, episode: 
         serial = str(stream.get("serial") or "")
         if not stream_key or not serial:
             continue
-        intrinsics = _load_camera_intrinsics(Path(str(stream.get("intrinsics_path") or "")))
+        intrinsics_path = Path(str(stream.get("intrinsics_path") or ""))
+        if not intrinsics_path.is_absolute():
+            intrinsics_path = state.repo_root / intrinsics_path
+        intrinsics = _load_camera_intrinsics(intrinsics_path)
         t_base_cam = camera_poses.get(camera_name)
-        if intrinsics is None or t_base_cam is None:
+        if intrinsics is None or (t_base_cam is None and carrier_model is None):
             continue
         camera_matrix, dist_coeffs = intrinsics
-        t_cam_base = _mat4_inverse_rigid(t_base_cam)
+        t_cam_base = _mat4_inverse_rigid(t_base_cam) if t_base_cam is not None else None
         per_camera_csv = tracking_run / "per_camera" / f"camera_{serial}_records.csv"
         if not per_camera_csv.is_file():
             continue
@@ -8719,16 +9150,28 @@ def _read_video_cube_overlays(state: GatewayState, dataset_root: Path, episode: 
                         continue
                     if row_episode != int(episode):
                         continue
-                    overlay = _cube_overlay_from_row(
-                        row,
-                        camera_matrix=camera_matrix,
-                        dist_coeffs=dist_coeffs,
-                        t_cam_base=t_cam_base,
-                        cube_size_m=cube_size_m,
-                    )
+                    if carrier_model is not None:
+                        overlay = _hybrid_carrier_overlay_from_row(
+                            row,
+                            camera_matrix=camera_matrix,
+                            dist_coeffs=dist_coeffs,
+                            t_cam_base=t_cam_base,
+                            camera_model=camera_model,
+                            carrier_model=carrier_model,
+                        )
+                    else:
+                        overlay = _cube_overlay_from_row(
+                            row,
+                            camera_matrix=camera_matrix,
+                            dist_coeffs=dist_coeffs,
+                            t_cam_base=t_cam_base,
+                            cube_size_m=cube_size_m,
+                            camera_model=camera_model,
+                        )
                     if overlay is None:
                         continue
-                    overlays.setdefault(frame_index, {}).setdefault(f"observation.images.{stream_key}", []).append(overlay)
+                    image_key = f"observation.images.{stream_key}"
+                    overlays.setdefault(frame_index, {}).setdefault(image_key, []).append(overlay)
         except OSError:
             continue
     return overlays
@@ -13270,6 +13713,10 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
         if path == "/api/processing/traj-gen":
             state = self.server.state
             requested = (query.get("path", [""])[0] or "").strip()
+            tracking_target = (
+                query.get("tracking_target", query.get("trackingTarget", [DEFAULT_TRACKING_TARGET]))[0]
+                or DEFAULT_TRACKING_TARGET
+            ).strip()
             marker_tcp_raw = (
                 query.get("marker_to_tcp_calibration_path", query.get("markerTcpCalibrationPath", [""]))[0]
                 or ""
@@ -13289,6 +13736,7 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                     dataset_root,
                     marker_to_tcp_calibration_path=marker_tcp_path,
                     allow_stale_calibration=allow_stale,
+                    tracking_target=tracking_target,
                 )
                 with state.lock:
                     response = _snapshot(state)

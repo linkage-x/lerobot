@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import shutil
@@ -5197,3 +5198,220 @@ def test_the_review_cache_notices_a_new_run_appearing(tmp_path):
     assert gateway._calibration_payload(state)["promotion"]["candidates"]["extrinsics"] == (
         "calib_20260903_090000_extrinsics"
     )
+
+
+def test_hybrid_carrier_target_selects_dedicated_runner_config(tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "carrier_set"
+    dataset_root.mkdir(parents=True)
+    runner_path = repo_root / gateway.DEFAULT_EE_TRAJECTORY_RUNNER
+    config_path = repo_root / gateway.HYBRID_CARRIER_EE_TRAJECTORY_CONFIG
+    runner_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    runner_path.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    config_path.write_text("calibration: {}\ncarrier: {}\n", encoding="utf-8")
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+
+    command = gateway._ee_trajectory_command(
+        state,
+        dataset_root,
+        tracking_target="hybrid_carrier_v1",
+    )
+
+    assert command[command.index("--config") + 1] == str(config_path)
+    assert command[command.index("--tracking-target") + 1] == "hybrid_carrier_v1"
+    with pytest.raises(ValueError, match="cube-only"):
+        gateway._ee_trajectory_command(
+            state,
+            dataset_root,
+            tracking_target="hybrid_carrier_v1",
+            marker_to_tcp_calibration_path=repo_root / "cube_bundle.json",
+        )
+
+
+def test_tracking_detection_summary_reports_per_camera_evidence(tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "carrier_set"
+    tracking_run = repo_root / "outputs" / "tracking_analysis" / (
+        dataset_root.name + gateway.DEFAULT_TRACKING_RUN_SUFFIX
+    )
+    per_camera = tracking_run / "per_camera"
+    per_camera.mkdir(parents=True)
+    (tracking_run / "summary.json").write_text(
+        json.dumps(
+            {
+                "active_streams": [
+                    {"serial": "S1", "stream_key": "cam_0", "camera_name": "cam_00"}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rows = [
+        {
+            "cube_detected": 1,
+            "cube_num_markers": 2,
+            "cube_reprojection_rmse_px": 1.0,
+            "num_edge_samples": 100,
+        },
+        {
+            "cube_detected": 0,
+            "cube_num_markers": 0,
+            "cube_reprojection_rmse_px": "",
+            "num_edge_samples": 0,
+        },
+        {
+            "cube_detected": 1,
+            "cube_num_markers": 3,
+            "cube_reprojection_rmse_px": 2.0,
+            "num_edge_samples": 140,
+        },
+    ]
+    with (per_camera / "camera_S1_records.csv").open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+
+    result = gateway._tracking_detection_summary(state, dataset_root, "hybrid_carrier_v1")
+
+    assert result is not None
+    assert result["target"] == "hybrid_carrier_v1"
+    assert result["detectedViews"] == 2
+    assert result["detectionRatePct"] == pytest.approx(66.7)
+    assert result["perCamera"][0]["medianAnchors"] == pytest.approx(2.5)
+    assert result["perCamera"][0]["medianRmsePx"] == pytest.approx(1.5)
+    assert result["perCamera"][0]["medianEdgeSamples"] == pytest.approx(120.0)
+
+
+def test_hybrid_carrier_overlay_combines_observed_anchors_with_projected_facets(tmp_path):
+    repo_root = tmp_path / "repo"
+    dataset_root = repo_root / "outputs" / "datasets" / "carrier_set"
+    tracking_run = repo_root / "outputs" / "tracking_analysis" / (
+        dataset_root.name + gateway.DEFAULT_TRACKING_RUN_SUFFIX
+    )
+    per_camera = tracking_run / "per_camera"
+    per_camera.mkdir(parents=True)
+    intrinsics = repo_root / "intrinsics.json"
+    intrinsics.write_text(
+        json.dumps(
+            {
+                "camera_matrix": [[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]],
+                "dist_coeffs": [0.0, 0.0, 0.0, 0.0],
+            }
+        ),
+        encoding="utf-8",
+    )
+    descriptor = repo_root / "carrier.json"
+    descriptor.write_text(
+        json.dumps(
+            {
+                "schema": "hybrid_carrier_cad/v1",
+                "carrier_id": "carrier_test",
+                "units": "m",
+                "anchors": [
+                    {
+                        "name": "a30",
+                        "marker_id": 30,
+                        "marker_corners": [
+                            [-0.05, -0.05, 0.0],
+                            [0.05, -0.05, 0.0],
+                            [0.05, 0.05, 0.0],
+                            [-0.05, 0.05, 0.0],
+                        ],
+                    }
+                ],
+                "facets": [
+                    {
+                        "name": "red_front",
+                        "colour": "red",
+                        "use_for_pose": True,
+                        "normal": [0.0, 0.0, -1.0],
+                        "polygon": [
+                            [-0.1, -0.1, 0.0],
+                            [0.1, -0.1, 0.0],
+                            [0.0, 0.1, 0.0],
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = repo_root / "carrier.yaml"
+    config_path.write_text("carrier:\n  model_path: carrier.json\n", encoding="utf-8")
+    (tracking_run / "summary.json").write_text(
+        json.dumps(
+            {
+                "config": str(config_path),
+                "calibration_inputs": {"fixed_camera_summary": ""},
+                "cube_tracker": {
+                    "pose_estimation_mode": "hybrid_carrier",
+                    "camera_model": "rational",
+                },
+                "active_streams": [
+                    {
+                        "stream_key": "cam_0",
+                        "camera_name": "cam_00",
+                        "serial": "S1",
+                        "intrinsics_path": str(intrinsics),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed = [{"marker_id": 30, "points": [[101.0, 102.0], [151.0, 102.0], [151.0, 152.0], [101.0, 152.0]]}]
+    row = {
+        "episode_index": 1,
+        "frame_index": 7,
+        "cube_detected": 1,
+        "cube_num_markers": 1,
+        "detected_marker_ids": "30",
+        "detected_marker_corners_px": json.dumps(observed),
+        "num_edge_samples": 42,
+        "cube_reprojection_rmse_px": 1.25,
+        "used_for_fusion": 1,
+        "cube_cam_x_m": 0.0,
+        "cube_cam_y_m": 0.0,
+        "cube_cam_z_m": 1.0,
+        "cube_cam_qx": 0.0,
+        "cube_cam_qy": 0.0,
+        "cube_cam_qz": 0.0,
+        "cube_cam_qw": 1.0,
+    }
+    with (per_camera / "camera_S1_records.csv").open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+    state = gateway.GatewayState(
+        repo_root=repo_root,
+        config_path=repo_root / "config.yaml",
+        config={},
+        recording=gateway.RecordingStatus(),
+        replay=gateway.ReplayStatus(),
+    )
+
+    overlays = gateway._read_video_cube_overlays(state, dataset_root, episode=1)
+    overlay = overlays[7]["observation.images.cam_0"][0]
+
+    assert overlay["kind"] == "hybrid_carrier"
+    assert overlay["markerIds"] == [30]
+    assert overlay["numEdgeSamples"] == 42
+    anchor = next(polygon for polygon in overlay["polygons"] if polygon["role"] == "anchor")
+    facet = next(polygon for polygon in overlay["polygons"] if polygon["role"] == "facet")
+    assert anchor["points"] == observed[0]["points"]
+    assert facet["color"] == "#ef4444"
+    assert overlay["axes"]["origin"] == pytest.approx([320.0, 240.0])

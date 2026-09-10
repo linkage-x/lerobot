@@ -265,8 +265,8 @@ function App() {
       <DatasetProcessingPage
         snapshot={snapshot}
         busy={busy}
-        onGenerate={(path, markerTcpCalibrationPath) =>
-          run(() => api.queueTrajGen(path, markerTcpCalibrationPath ?? ""))
+        onGenerate={(path, markerTcpCalibrationPath, trackingTarget) =>
+          run(() => api.queueTrajGen(path, markerTcpCalibrationPath ?? "", trackingTarget ?? "april_cube"))
         }
         onRunQc={(path) => run(() => api.runQc(path))}
         onOpenReplay={(path) => selectAndOpenReplay(path)}

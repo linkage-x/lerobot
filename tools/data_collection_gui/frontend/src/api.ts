@@ -16,6 +16,7 @@ import type {
   IntrinsicsCoverageResponse,
   ProcessingItem,
   ProcessingStatus,
+  TrackingTarget,
   RecordedDataset,
   RecordingStatus,
   ReplayStatus,
@@ -575,8 +576,12 @@ export class DataCollectionGuiApi {
     return this.getSnapshot();
   }
 
-  async queueTrajGen(path: string, markerTcpCalibrationPath = ""): Promise<GuiSnapshot> {
-    const params = new URLSearchParams({ path });
+  async queueTrajGen(
+    path: string,
+    markerTcpCalibrationPath = "",
+    trackingTarget: TrackingTarget = "april_cube"
+  ): Promise<GuiSnapshot> {
+    const params = new URLSearchParams({ path, tracking_target: trackingTarget });
     if (markerTcpCalibrationPath.trim()) {
       params.set("marker_to_tcp_calibration_path", markerTcpCalibrationPath.trim());
     }

@@ -650,6 +650,16 @@ export type ReplayTimelineFrame = {
 };
 
 export type CubeVideoOverlay = {
+  kind?: "cube" | "hybrid_carrier";
+  polygons?: Array<{
+    role: "anchor" | "facet";
+    label: string;
+    color: string;
+    points: Array<[number, number] | null>;
+  }>;
+  markerIds?: number[];
+  numEdgeSamples?: number;
+  message?: string;
   cubeName: string;
   color: string;
   corners: Array<[number, number] | null>;
@@ -664,6 +674,27 @@ export type CubeVideoOverlay = {
   numMarkers: number;
   rmsePx: number | null;
   usedForFusion: boolean;
+};
+
+export type TrackingTarget = "april_cube" | "hybrid_carrier_v1";
+
+export type TrackingDetectionSummary = {
+  target: TrackingTarget;
+  label: string;
+  totalViews: number;
+  detectedViews: number;
+  detectionRatePct: number;
+  overlayAvailable: boolean;
+  perCamera: Array<{
+    camera: string;
+    streamKey: string;
+    totalViews: number;
+    detectedViews: number;
+    detectionRatePct: number;
+    medianAnchors: number | null;
+    medianRmsePx: number | null;
+    medianEdgeSamples: number | null;
+  }>;
 };
 
 export type ReplayTimeline = {
@@ -690,6 +721,8 @@ export type ReplayTimeline = {
 export type ProcessingItem = {
   path: string;
   name: string;
+  trackingTarget?: TrackingTarget;
+  detectionSummary?: TrackingDetectionSummary | null;
   status: ProcessingStatus;
   trajectoryVersion: string | null;
   qcSummary: string;
