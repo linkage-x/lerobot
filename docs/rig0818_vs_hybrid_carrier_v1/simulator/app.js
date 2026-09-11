@@ -106,7 +106,7 @@ function acceptResult(result){
 
 function showError(error){
   console.error(error);const note=$('#scope-note');note.innerHTML=`<span class="error-box">${escapeHtml(error.message||String(error))}</span>`;
-  $('#decision-label').textContent='仿真失败';$('#decision-reason').textContent='请查看页面错误和浏览器控制台。';$('#decision-card').className='decision-card fail';
+  const g2=$('#g2-result');g2.className='gate-result fail';g2.textContent='沙盒运行失败';
 }
 
 function escapeHtml(text){return String(text).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
@@ -120,10 +120,7 @@ function renderResult(){
   setMetric('delta',paired.deltaP95Mm===null?'—':`${paired.deltaP95Mm>=0?'+':''}${fmt(paired.deltaP95Mm,2,' mm')}`);
   setMetric('delta-ci',paired.ci95Mm[0]===null?'95% CI unavailable':`95% CI [${fmt(paired.ci95Mm[0])}, ${fmt(paired.ci95Mm[1])}] mm · n=${paired.count}`);
   $('#delta-bar').style.width=`${clamp((paired.deltaP95Mm||0)/.8*100,0,100)}%`;
-  const card=$('#decision-card');card.className='decision-card';
-  if(gates.decision==='CONDITIONAL_GO'){card.classList.add('ready');$('#decision-label').textContent='CONDITIONAL GO';$('#decision-reason').textContent='数值门槛与证据层均通过；仍需按路线图执行真实最小 A/B。';}
-  else if(gates.decision==='NO_GO'){card.classList.add('fail');$('#decision-label').textContent='NO-GO';$('#decision-reason').textContent='冻结证据下未通过开发门槛。';}
-  else{$('#decision-label').textContent='INCONCLUSIVE';$('#decision-reason').textContent='仿真结果已就绪；measured R0、生产相机/任务分布、完整生产门控与有证据的 L3 系统误差尚未闭环。';}
+  // The hero decision belongs to the real-input report (l3-app.js); the sandbox never writes it.
   const layer=$('#result-layer').value==='l2'?'L2 图像解算':'MC-lite 情景模型';
   if(!$('#run-button').disabled)$('#run-state').textContent=`${layer} · ${metrics.R0.total} 帧 · seed ${activeResult().config.seed}`;
   $('#scope-note').textContent=`${layer} · 各 arm 卡片为各自成功集 p95；配对 Δp95 = ${fmt(paired.deltaP95Mm,2,' mm')}，区间 ${paired.ci95Mm[0]===null?'不可用（共同成功样本不足）':`[${fmt(paired.ci95Mm[0])}, ${fmt(paired.ci95Mm[1])}] mm`}。正值表示 H1 误差更小；结果仅适用于声明的合成情景。`;

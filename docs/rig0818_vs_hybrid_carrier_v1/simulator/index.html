@@ -3,29 +3,110 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="rig0818 与 Hybrid Carrier V1 的浏览器端配对误差仿真器">
-  <title>rig0818 × Hybrid Carrier V1 · Browser A/B Simulator</title>
+  <meta name="description" content="rig0818 与 Hybrid Carrier V1 在真实相机、真实操作轨迹上的配对误差仿真与立项判定">
+  <title>rig0818 × Hybrid Carrier V1 · Paired Error Simulator</title>
+  <link rel="icon" href="data:,">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <header class="hero">
-    <nav><a href="../roadmap.html">← 理论与仿真 Roadmap</a><span>M0 · M1/L1 · MC-lite</span></nav>
+    <nav><a href="../roadmap.html">← 理论与仿真 Roadmap</a><span>L2 图像闭环 · L3 系统扰动 · 真实输入</span></nav>
     <div class="hero-grid">
       <div>
-        <p class="eyebrow">PAIRED BROWSER SIMULATION · 2026-09-10</p>
+        <p class="eyebrow">PAIRED IMAGE-LOOP SIMULATION · 132514 TASK · 0804 CAMERAS</p>
         <h1>同一个世界，比较<br><em>两种靶标</em></h1>
-        <p class="lede">同轨迹、同七相机、同遮挡、同系统扰动。R0、H0、H1 只改变靶标观测几何，误差与覆盖率在一页内对齐。</p>
+        <p class="lede">真实七相机标定、真实双手操作轨迹、夹爪与手的遮挡：逐帧光线渲染鱼眼图像，交给生产检测器、生产 corner BA 与离线平滑，再与已知真值对比。R0、H0、H1 之间只差靶标本身。</p>
       </div>
       <div class="decision-card" id="decision-card">
-        <span class="decision-kicker">当前证据状态</span>
-        <strong id="decision-label">等待仿真</strong>
-        <p id="decision-reason">页面载入 CAD 后会自动运行默认配对实验。</p>
+        <span class="decision-kicker" id="decision-kicker">当前证据状态</span>
+        <strong id="decision-label">载入结果中</strong>
+        <p id="decision-reason">读取 l3_report.json…</p>
       </div>
     </div>
   </header>
 
   <main>
-    <section class="status-strip" aria-label="输入状态">
+    <section class="status-strip l3-status" aria-label="真实输入状态">
+      <div><i></i><span>相机</span><b>0804 fisheye · 7 台实标 · 已哈希</b></div>
+      <div><i></i><span>任务轨迹</span><b>132514 双手 · dev ep0 / 留出 ep1–2</b></div>
+      <div><i class="warn"></i><span>遮挡几何</span><b>URDF 夹爪机构 + 假设外壳与手</b></div>
+      <div><i class="warn" id="l3-r0-dot"></i><span>R0 几何</span><b id="l3-r0-text">读取中</b></div>
+    </section>
+
+    <section class="overview l3-overview" aria-labelledby="l3-title">
+      <div class="section-head">
+        <div><p class="eyebrow">RESULT AT A GLANCE · REAL INPUTS · HELD-OUT EPISODES</p><h2 id="l3-title">最终误差对比</h2></div>
+        <div class="selector-row">
+          <div class="segmented" id="l3-level" role="group" aria-label="扰动级别"><button type="button" data-level="nominal">名义</button><button type="button" data-level="evidence" class="active">证据级</button><button type="button" data-level="stress">2× 压力</button></div>
+          <div class="segmented" id="l3-output" role="group" aria-label="输出"><button type="button" data-output="raw">逐帧 BA</button><button type="button" data-output="smoothed" class="active">离线平滑</button></div>
+        </div>
+      </div>
+      <div id="l3-verdict" class="verdict open" role="status">读取 l3_report.json…</div>
+      <div class="metric-grid" id="l3-cards"></div>
+      <div class="l3-plots">
+        <article class="plot-card forest-card">
+          <div class="panel-head"><div><p class="eyebrow">EVERY SCENARIO ON ONE AXIS</p><h2>收益区间 vs 立项门槛</h2></div><div class="legend"><i class="below"></i>整段低于门槛 <i class="straddle"></i>跨门槛 <i class="above"></i>整段过门槛</div></div>
+          <canvas id="l3-forest" aria-label="各扰动级别、输出与分层的 Δp95 区间森林图"></canvas>
+          <p>每行一个配对比较：圆点 = Δp95，横条 = 95% bootstrap 区间，虚线 = 0.8 mm 立项门槛（需要整条横条落在虚线右侧）。高亮行是判定主口径：证据级扰动 + 离线平滑。</p>
+        </article>
+        <article class="plot-card">
+          <div class="panel-head"><div><p class="eyebrow" id="l3-cdf-layer">ALL REQUESTED FRAMES</p><h2>TCP 平移误差 CDF</h2></div><div class="legend"><i class="r0"></i>R0 <i class="h0"></i>H0 <i class="h1"></i>H1</div></div>
+          <canvas id="l3-cdf" aria-label="三个分支的全帧误差累计分布"></canvas>
+          <p>分母为全部请求帧，曲线最高点 = 出位姿率；虚线为 3 mm。</p>
+        </article>
+        <article class="plot-card">
+          <div class="panel-head"><div><p class="eyebrow">ATTRIBUTION</p><h2>收益从哪来</h2></div></div>
+          <div id="l3-attribution" class="attribution"></div>
+        </article>
+      </div>
+      <article class="plot-card mechanism-card">
+        <div class="panel-head"><div><p class="eyebrow">SAME POSES · READ AT DIFFERENT POINTS OF THE BODY</p><h2>差距在刚体上的哪一点出现</h2></div></div>
+        <div id="l3-mechanism"></div>
+      </article>
+      <p class="scope-note"><b>口径：</b><span id="l3-scope">—</span></p>
+    </section>
+
+    <section class="replay-panel" id="l3-replay" aria-labelledby="replay-title">
+      <div class="panel-head">
+        <div><p class="eyebrow">WEBGL REPLAY · PRODUCTION CAMERA MODEL</p><h2 id="replay-title">真实场景回放</h2></div>
+        <div class="replay-controls">
+          <div class="segmented" id="l3-arm" role="group" aria-label="着色分支"><button type="button" data-arm="R0">R0</button><button type="button" data-arm="H0">H0</button><button type="button" data-arm="H1" class="active">H1</button></div>
+          <select id="l3-view" aria-label="视角"><option value="orbit">自由视角</option></select>
+        </div>
+      </div>
+      <div class="replay-grid">
+        <div class="scene-wrap"><canvas id="l3-scene" aria-label="真实相机、夹爪、手与靶标的三维回放"></canvas><canvas id="l3-scene-overlay" aria-hidden="true"></canvas></div>
+        <aside class="frame-info" id="l3-frame-info" aria-live="polite"></aside>
+      </div>
+      <div class="scene-controls"><button id="l3-play" class="quiet" type="button">播放</button><label>帧 <input id="l3-frame" type="range" min="0" max="0" value="0"></label><span id="l3-frame-caption">—</span></div>
+      <p class="scene-note" id="l3-scene-status">载入相机、夹爪与靶标几何…</p>
+    </section>
+
+    <section class="audit" aria-labelledby="examples-title">
+      <div class="section-head"><div><p class="eyebrow">COUNTEREXAMPLES · RENDERED INPUT IMAGES</p><h2 id="examples-title">最差与失败帧</h2></div></div>
+      <p class="small-note">图像是送进检测器的鱼眼渲染裁剪（显示时去掉了噪声与模糊）；绿框 = 解码到的本靶标 marker。</p>
+      <div id="l3-examples" class="examples"></div>
+    </section>
+
+    <section class="audit" id="l3-evidence" aria-labelledby="evidence-title">
+      <div class="section-head"><div><p class="eyebrow">GATES &amp; AUDIT · REAL INPUTS</p><h2 id="evidence-title">结论为什么成立，或为什么还不能成立</h2></div><div><a class="quiet link-button" href="l3_report.json">l3_report.json</a></div></div>
+      <div class="audit-grid">
+        <article><h3>G0 · 输入与模拟器</h3><ul id="l3-checks"><li>等待报告</li></ul></article>
+        <article><h3>渲染收敛与检测器偏差</h3><div id="l3-convergence"></div></article>
+        <article><h3>跟踪质量（名义 session）</h3><div id="l3-tracking"></div></article>
+      </div>
+      <details class="method" open><summary>安装方向选择（只用 dev episode 0）</summary><div class="table-wrap"><table id="l3-mounts"></table></div></details>
+      <details class="method"><summary>L3 扰动来源、量级与依据</summary><div class="table-wrap"><table id="l3-perturbations"></table></div></details>
+      <details class="method"><summary>复现包与限制</summary><div id="l3-provenance"></div></details>
+    </section>
+
+    <section class="sandbox-intro" aria-labelledby="sandbox-title">
+      <p class="eyebrow">SYNTHETIC SANDBOX · NOT PART OF THE DECISION</p>
+      <h2 id="sandbox-title">合成情景沙盒</h2>
+      <p>下面保留先前的 M1 / MC-lite 情景模型与合成相机 L2 pilot，用来做敏感度探索和交互式“如果”实验；它们用合成相机与合成轨迹，不参与上方判定。</p>
+    </section>
+
+    <section class="status-strip" aria-label="沙盒输入状态">
       <div><i id="status-hybrid"></i><span>0907 descriptor</span><b id="status-hybrid-text">载入中</b></div>
       <div><i id="status-rig"></i><span>R0 measured layout</span><b id="status-rig-text">代理</b></div>
       <div><i class="warn"></i><span>camera / trajectory</span><b>合成契约</b></div>
@@ -35,8 +116,8 @@
 
     <section class="overview" aria-labelledby="overview-title">
       <div class="section-head">
-        <div><p class="eyebrow">RESULT AT A GLANCE</p><h2 id="overview-title">最终误差对比</h2></div>
-        <div class="run-meta"><label>结果来源 <select id="result-layer"><option value="mc">MC-lite 情景模型</option><option value="l2" disabled>L2 真实图像检测</option></select></label><span id="run-state" role="status">准备输入…</span><button id="run-button" class="primary" type="button">运行配对仿真</button></div>
+        <div><p class="eyebrow">MC-LITE · SYNTHETIC CAMERAS</p><h2 id="overview-title">情景模型误差对比</h2></div>
+        <div class="run-meta"><label>结果来源 <select id="result-layer"><option value="mc">MC-lite 情景模型</option><option value="l2" disabled>L2 合成图像 pilot</option></select></label><span id="run-state" role="status">准备输入…</span><button id="run-button" class="primary" type="button">运行配对仿真</button></div>
       </div>
       <div class="metric-grid" id="metric-grid">
         <article class="metric-card r0"><div><span>R0 · rig0818</span><small>5 anchors</small></div><strong data-metric="R0-p95">—</strong><p>TCP translation p95</p><footer><span data-metric="R0-coverage">—</span> coverage</footer></article>
@@ -48,11 +129,11 @@
     </section>
 
     <section class="audit" id="l2-panel">
-      <div class="section-head"><div><p class="eyebrow">L2 · RENDER → DETECT → MULTI-CAMERA SOLVE</p><h2>真实图像检测对照</h2></div><div><button class="quiet" id="load-l2-button">载入 L2 报告</button><button class="quiet" id="reload-l2-button">刷新本地结果</button><input id="l2-file" type="file" accept=".json,application/json" hidden></div></div>
-      <p id="l2-status" role="status">运行离线图像试验后，在这里查看真实 detector 的误差。顶部 MC-lite 可独立使用。</p>
+      <div class="section-head"><div><p class="eyebrow">L2 PILOT · SYNTHETIC CAMERAS</p><h2>合成相机图像检测对照</h2></div><div><button class="quiet" id="load-l2-button">载入 L2 报告</button><button class="quiet" id="reload-l2-button">刷新本地结果</button><input id="l2-file" type="file" accept=".json,application/json" hidden></div></div>
+      <p id="l2-status" role="status">运行离线图像试验后，在这里查看合成相机下真实 detector 的误差。</p>
       <div id="l2-previews" class="l2-previews"></div>
       <div class="table-wrap"><table><thead><tr><th>图像解算分支</th><th>TCP p95</th><th>rotation p95</th><th>accepted / requested</th><th>达标率</th><th>失败率</th></tr></thead><tbody id="l2-table"></tbody></table></div>
-      <details class="method"><summary>运行图像试验与阅读口径</summary><p>在仓库根目录执行 <code>python3 docs/rig0818_vs_hybrid_carrier_v1/simulator/l2_runner.py</code>，完成后点击“刷新本地结果”。H0/H1 使用相同彩图与角点；H1 增加原生检测器读取的边缘。原生冷启动分支另列。所有分支以已知 TCP 真值计误差，未出姿态的帧保留在分母内。</p><p>这是合成相机与代理 R0 下的 L2 pilot。完整生产门控、真实相机/任务输入、有证据的 L3 系统扰动和平滑仍需验证，因此不能据此宣布实机精度或 G2 Go。</p></details>
+      <details class="method"><summary>运行合成 pilot 与阅读口径</summary><p>在仓库根目录执行 <code>python3 docs/rig0818_vs_hybrid_carrier_v1/simulator/l2_runner.py --poses 48</code>，完成后点击“刷新本地结果”。H0/H1 使用相同彩图与角点；原生冷启动分支另列。它使用合成七相机与合成轨迹，只作为检测层机理检查；真实输入的结论见页面顶部。</p></details>
     </section>
 
     <section class="workbench">
@@ -74,11 +155,11 @@
         <label>掉线相机数<select id="camera-dropout"><option value="0">0 / 7</option><option value="1">1 / 7</option><option value="2">2 / 7</option><option value="4">4 / 7（压力）</option></select></label>
         <label>随机种子<input id="seed" type="number" step="1" value="20260910"></label>
         <p id="pending-note" role="status">参数对应当前 MC-lite 结果。</p>
-        <details><summary>当前层级与限制</summary><p>Canvas 画面来自与 FIM 相同的几何。检测成功概率、安装和相机偏差仍是 MC-lite 假设；L2 必须调用冻结的生产 detector 才能替换它们。</p></details>
+        <details><summary>当前层级与限制</summary><p>Canvas 画面来自与 FIM 相同的几何。检测成功概率、安装和相机偏差是 MC-lite 假设；真实输入的图像闭环结果在页面顶部。</p></details>
       </aside>
 
       <div class="visual-panel">
-        <div class="panel-head"><div><p class="eyebrow">SHARED 3D WORLD</p><h2>几何、相机与可见约束</h2></div><div class="segmented" id="target-tabs"><button class="active" data-target="R0">R0</button><button data-target="H0">H0</button><button data-target="H1">H1</button></div></div>
+        <div class="panel-head"><div><p class="eyebrow">SYNTHETIC 3D WORLD</p><h2>几何、相机与可见约束</h2></div><div class="segmented" id="target-tabs"><button class="active" data-target="R0">R0</button><button data-target="H0">H0</button><button data-target="H1">H1</button></div></div>
         <canvas id="scene" aria-label="目标、七相机和遮挡物三维视图"></canvas>
         <div class="scene-controls"><button id="play-button" class="quiet" type="button">暂停</button><label>姿态 <input id="pose-scrubber" type="range" min="0" max="239" value="0"></label><span id="scene-caption">拖动画面旋转视角</span></div>
       </div>
@@ -91,19 +172,19 @@
     </section>
 
     <section class="audit">
-      <div class="section-head"><div><p class="eyebrow">GATES &amp; AUDIT</p><h2>结论为什么成立，或为什么还不能成立</h2></div><div><button id="export-json" class="quiet" type="button" disabled>导出 decision.json</button><button id="export-csv" class="quiet" type="button" disabled>导出 trials.csv</button></div></div>
+      <div class="section-head"><div><p class="eyebrow">MC-LITE GATES &amp; AUDIT</p><h2>情景模型的门槛与审计</h2></div><div><button id="export-json" class="quiet" type="button" disabled>导出 decision.json</button><button id="export-csv" class="quiet" type="button" disabled>导出 trials.csv</button></div></div>
       <div class="audit-grid">
         <article><h3>G0 · 模拟器可解释</h3><ul id="g0-list"><li>等待运行</li></ul></article>
         <article><h3>G1 · 是否值得做 L2</h3><div id="g1-result" class="gate-result pending">等待运行</div><p id="g1-detail">—</p></article>
-        <article><h3>G2 · 是否值得做机械样机</h3><div id="g2-result" class="gate-result pending">INCONCLUSIVE</div><p id="g2-detail">需要 measured R0、真实相机/轨迹、原生 detector L2 与有证据的 L3 分布。</p></article>
+        <article><h3>G2 · 情景模型（不作立项依据）</h3><div id="g2-result" class="gate-result pending">INCONCLUSIVE</div><p id="g2-detail">情景模型永远不能宣布 Go；立项判定见页面顶部真实输入结果。</p></article>
       </div>
-      <p>以下门槛和审计表对应 MC-lite / L1。顶部可切换查看独立的 L2 图像误差。</p>
       <div class="table-wrap"><table><thead><tr><th>arm</th><th>p50</th><th>p95</th><th>p99</th><th>rot p95</th><th>coverage</th><th>≤3 mm &amp; ≤0.5° yield</th><th>catastrophic</th><th>L1 σ p95</th></tr></thead><tbody id="metrics-table"><tr><td colspan="9">等待运行</td></tr></tbody></table></div>
       <details class="method"><summary>查看模型、配对和统计口径</summary><div class="method-grid"><p><b>成像：</b>七台声明式相机使用 OpenCV 等距鱼眼多项式。角点数值 Jacobian 与页面可见性调用同一投影。</p><p><b>边：</b>H1 的每条 CAD edge 只贡献图像法向一维残差；同边样本按 n_eff = n/(1+(n−1)ρ) 降权。</p><p><b>配对：</b>三个 arm 共享真值、遮挡、相机、时序、共模偏差与标准正态 draw。安装误差使用同等级分布和配对抽样。</p><p><b>区间：</b>Δp95 = p95(R0) − p95(H1)，只在双方共同成功帧上计算，并按连续 episode 整块 bootstrap。覆盖率仍以所有请求帧为分母。</p></div></details>
     </section>
   </main>
 
-  <footer><span>Browser simulator v0.2 · local/offline</span><a href="inputs_manifest.json">inputs manifest</a><a href="experiment_spec.json">experiment spec</a><a href="noise_sources.json">noise sources</a></footer>
+  <footer><span>Paired error simulator v0.3 · local / offline</span><a href="l3_report.json">l3_report.json</a><a href="inputs_manifest.json">inputs manifest</a><a href="experiment_spec.json">experiment spec</a><a href="noise_sources.json">noise sources</a></footer>
   <script type="module" src="app.js"></script>
+  <script type="module" src="l3-app.js"></script>
 </body>
 </html>

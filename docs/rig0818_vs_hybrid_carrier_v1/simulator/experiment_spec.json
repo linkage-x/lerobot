@@ -1,55 +1,47 @@
 {
-  "schema": "rig_target_ab_experiment/v1",
-  "experiment_id": "rig0818_hybrid0907_browser_mc_lite_v1",
-  "phase": "M0_M1_MC_lite_and_L2_pilot",
-  "l2_pilot": {
-    "runner": "l2_runner.py",
-    "report": "l2_report.json",
-    "renderer": "subpixel fisheye rays with triangle depth and metric textures",
-    "controlled_comparison": "identical H0/H1 images and anchor observations; H1 adds native edge measurements using H0 joint initialization",
-    "native_branch": "separate per-camera cold starts plus joint BA",
-    "status": "synthetic-domain pilot; full production gates and evidence-backed L3 not yet validated"
+  "schema": "rig_target_ab_experiment/v2",
+  "experiment_id": "rig0818_hybrid0907_on_gripper_virtual_ab_v2",
+  "phase": "M0 real inputs + L2 production image loop + L3 estimator perturbation + M4 decision page",
+  "decision_question": "Does mounting the 0907 Hybrid Carrier on the gripper instead of rig0818 support a >= 0.8 mm final TCP p95 gain on the recorded manipulation task?",
+  "real_input_image_loop": {
+    "runner": "l3_runner.py",
+    "report": "l3_report.json",
+    "inputs": {
+      "cameras": "inputs/cameras_0804_fisheye.json (7 calibrated Thor GMSL2 fisheye cameras, 1920x1080)",
+      "task": "inputs/task_132514.json (bimanual 60 fps; dev episode 0, held-out episodes 1-2)",
+      "occluders": "inputs/gripper_v2.json (URDF finger mechanism mesh, declared housing and hand envelopes; the other hand's gripper and hand too)"
+    },
+    "arms": {
+      "R0": "rig0818: measured 0818b layout (five DICT_6X6_50 markers, 60.4-60.8 mm, CAD frame) on 69.6 mm pads with declared black bracket rods; production ArUco detector + production corner BA",
+      "H0": "0907 carrier image, anchors only; production corner BA over the carrier's exported marker layout",
+      "H1": "the same 0907 images; production HybridCarrierTracker seeded from the previous joint pose + carrier_frame_pose (corner BA then facet refinement, 12 mm limit)"
+    },
+    "mounts": {
+      "gripper": "both targets seat their CAD socket on the same stud over the housing, lowest point 5 mm clear; yaw {0,90,180,270} x boom tilt {0,-25} deg searched per arm on dev episode 0 (max coverage, then min raw p95) and frozen before held-out rendering",
+      "socket_tcp": "control: each target keeps its dev-chosen gripper yaw and tilt (dome up) and only its CAD socket origin moves onto the TCP point; no own gripper. Before 2026-09-11 the control took the URDF TCP axes (TCP z = -y of the box), which laid both targets on their side"
+    },
+    "mechanism": "the same accepted per-frame poses re-read at the anchor centroid, the rig origin (socket), a common arm (R0's centroid->TCP length along each target's own direction) and the TCP label; plus the 2026-09-09 bench statistics computed on simulated poses (slow-hand 1 s cubic noise floor, facet refinement step, cameras decoding per frame)",
+    "rendering": "subpixel fisheye rays (4x supersample, convergence checked against 8x), exact triangle depth with per-triangle projected-box culling, metric ArUco textures and facet ink, 3-sample exposure integration over the recorded twist, 0.4 px blur, 1 DN noise",
+    "truth_vs_estimator": "images are rendered from truth; each L3 session perturbs only what the solver is told (camera K and pose, marker layout, body scale, marker->TCP bundle, label time), with one draw shared by all arms",
+    "levels": {"nominal": "image noise only", "evidence": "measured or scenario sigmas from noise_sources.json", "stress": "2x evidence"},
+    "outputs": {"raw": "per-frame production BA / carrier pose", "smoothed": "production offline SE(3) smoother over each hand x episode (the dataset label)"},
+    "statistics": "all requested frames in every denominator; paired dp95 = p95(R0) - p95(H1) on common-success frames; 95% interval from a bootstrap that resamples sessions and 2 s time blocks; inverted-CDF quantiles for point and interval",
+    "decision": {
+      "CONDITIONAL_GO": "primary scenario (gripper, evidence, smoothed): lower bound >= 0.8 mm, H1 p95 <= 3 mm, rotation p95 <= 0.5 deg, coverage > 99% and not below R0, catastrophic rate not above R0, no fast/occluded bucket with the interval entirely below zero",
+      "NO_GO": "upper bound of the primary interval < 0.8 mm",
+      "INCONCLUSIVE": "otherwise",
+      "formal": "the formal decision equals the numeric one only when every blocking G0 check is closed; the page recomputes it from the numbers and ignores decision strings in the file"
+    }
   },
-  "arms": {
-    "R0": "five ArUco anchors from rig0818 layout",
-    "H0": "Hybrid Carrier V1 anchors only",
-    "H1": "the same Hybrid Carrier image geometry with correlated edge-normal residuals"
-  },
-  "pairing": "Every arm receives the same target pose, camera state, world occluders, episode-level common bias, timing draw and standard-normal measurement draw.",
-  "projection": "OpenCV-style equidistant fisheye polynomial, with declared K and four distortion coefficients.",
-  "estimator_proxy": "Numerical pose Jacobian, whitened corner residuals, correlated edge-normal effective sample size, full-rank 6x6 FIM inversion and TCP covariance propagation.",
-  "default_run": {
-    "seed": 20260910,
-    "poses": 240,
-    "episodes": 12,
-    "occlusion": 0.22,
-    "linear_speed_mps": 0.28,
-    "angular_speed_deg_s": 55,
-    "exposure_ms": 5,
-    "sync_sigma_ms": 2.2,
-    "corner_sigma_px": 0.22,
-    "edge_sigma_px": 0.42,
-    "edge_correlation": 0.55,
-    "tcp_offset_mm": 120,
-    "camera_dropout": 0
-  },
-  "metrics": [
-    "accepted TCP translation p50/p95/p99",
-    "rotation p95",
-    "coverage on all requested frames",
-    "all-frame 3 mm and 0.5 degree yield",
-    "wrong-accept and catastrophic rate",
-    "common-success paired delta p95 with episode-block bootstrap",
-    "p95 over poses of worst-axis TCP sigma"
-  ],
-  "gates": {
-    "G0": "All validation checks pass and measured R0 layout plus frozen camera snapshot are loaded.",
-    "G1": "A declared, repeatable geometry or visibility mechanism is large enough to justify L2.",
-    "G2": "Requires validated L2 detector evidence and L3 input distributions; CI lower bound of delta p95 >= 0.8 mm, H1 p95 <= 3 mm, rotation p95 <= 0.5 degree, coverage > 99% without decline, and no tail inversion."
+  "synthetic_sandbox": {
+    "kernel": "simulator-core.js (M0/M1/MC-lite in the browser, synthetic seven-camera rig and trajectory)",
+    "l2_pilot": {"runner": "l2_runner.py", "report": "l2_report.json", "status": "synthetic-domain detector pilot"},
+    "role": "interactive sensitivity only; never part of the decision"
   },
   "non_claims": [
-    "MC-lite detector acceptance is a sensitivity model, not a measured detector ROC.",
-    "Synthetic cameras and trajectories cannot certify production millimetres.",
-    "A browser-rendered geometry pass does not replace native detector image-loop validation or independent ground truth."
+    "A simulated pass is not physical accuracy certification; independent GT and a real paired A/B remain required.",
+    "rig0818 marker geometry is the measured 0818b layout; the bracket between its pads is still drawn as declared rods, and a fresh remount would need its own layout.",
+    "The BOX housing, hand envelope and both gripper mounts are declared assumptions.",
+    "Truth is a smoothed 0812-cube trajectory used as a task-distribution proxy; it is not the ground truth of the 132514 demonstration."
   ]
 }

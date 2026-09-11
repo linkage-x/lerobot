@@ -1,7 +1,7 @@
 {
-  "schema": "rig_target_ab_inputs/v1",
+  "schema": "rig_target_ab_inputs/v2",
   "frozen_at": "2026-09-10",
-  "repository_revision": "6b742239fd48ca7c854e64be56db0288081131ec",
+  "repository_revision": "d37d4762cde6f7afe107584107643bdc230a0f4a",
   "metrology_revision": "bbc47c81f37cf95f3012f7be260ac07004736db9",
   "coordinate_contract": {
     "length_unit": "m",
@@ -9,25 +9,60 @@
     "target_origin": "socket sphere centre",
     "pose": "T_world_target",
     "camera_pose": "T_world_camera with +z optical axis",
-    "tcp": "same target-frame vector for every arm in one run"
+    "tcp": "same target-frame vector for every arm in one run",
+    "world_frame_id": "world_20260819_031843"
   },
   "targets": {
     "R0": {
       "name": "marker rig 0818",
       "cad_path": "../../../third_party/opencv_kalibr/metrology/fixtures/cad/marker_rig_20260818_cad.json",
       "cad_sha256": "ca734ef2f0c5e35e17a3ffd95278c6c7eb9b19e461d49f3c7ceb5b3f38315e34",
-      "marker_ids": [7, 12, 14, 16, 17],
-      "marker_to_plate": {"7": 4, "12": 2, "14": 1, "16": 0, "17": 3},
-      "marker_edge_mm": {"7": 60.88, "12": 60.63, "14": 60.55, "16": 60.56, "17": 61.12},
-      "geometry_status": "proxy",
-      "geometry_note": "The measured-layout artifact is absent from this checkout. Default marker centres and normals come from CAD; edge lengths are the two-capture means documented in box_umi_marker_rig_tcp_20260818.html. Load marker_layout/measured_v1 in the UI before a G0 decision."
+      "marker_ids": [
+        7,
+        12,
+        14,
+        16,
+        17
+      ],
+      "marker_to_plate": {
+        "7": 4,
+        "12": 2,
+        "14": 1,
+        "16": 0,
+        "17": 3
+      },
+      "marker_edge_mm": {
+        "7": 60.88,
+        "12": 60.63,
+        "14": 60.55,
+        "16": 60.56,
+        "17": 61.12
+      },
+      "geometry_status": "measured",
+      "geometry_note": "The real-input runner uses the measured layout for both the rendered truth and the solver; the CAD descriptor is kept for plate assignment and normals checks. The browser sandbox still starts from the CAD proxy unless the layout is loaded.",
+      "measured_layout": {
+        "path": "inputs/r0_layout_measured.json",
+        "sha256": "edd5ba6f0ccba637e4f534783f67904c50116d2fb75d23a19e1bfb15073912a5",
+        "layout_id": "cadprior_no09_10",
+        "origin": "nvidia@192.168.111.122:~/lerobot/outputs/metrology/newrig_20260818_115119/layout_cadprior_no09_10.json (0818b capture, CAD prior sigma 1 mm, cam_09 excluded; pivot |p_rig| 0.90 mm)",
+        "frame_convention": "CAD part-studio frame; origin = pivot socket sphere centre, so a pivot fit on this layout has 0 as its known answer",
+        "generated_utc": "2026-08-18T05:08:13Z"
+      }
     },
     "H0_H1": {
       "name": "Hybrid Carrier V1 0907",
       "descriptor_path": "../../../third_party/opencv_kalibr/metrology/fixtures/cad/hybrid_carrier_v1_20260907.json",
       "descriptor_sha256": "7efe6a91666e3eb3686c82c2b74d90f4200b78db1837da13eca22f2f85b56559",
-      "anchor_ids": [30, 31, 32],
-      "paste_quadrants": {"30": 3, "31": 3, "32": 2},
+      "anchor_ids": [
+        30,
+        31,
+        32
+      ],
+      "paste_quadrants": {
+        "30": 3,
+        "31": 3,
+        "32": 2
+      },
       "facet_count": 13,
       "edge_count": 31,
       "occluder_triangle_count": 181,
@@ -36,14 +71,73 @@
   },
   "cameras": {
     "status": "synthetic-seven-camera-contract",
-    "note": "The app ships a declared seven-camera fisheye rig so it runs without production files. It can establish geometry mechanisms and sensitivity, not production accuracy. A frozen production K/D/extrinsic snapshot is required for G2."
+    "note": "The app ships a declared seven-camera fisheye rig so it runs without production files. It can establish geometry mechanisms and sensitivity, not production accuracy. A frozen production K/D/extrinsic snapshot is required for G2.",
+    "scope": "MC-lite sandbox only; the real-input runner reads real_inputs"
   },
   "trajectory": {
     "status": "synthetic-continuous-task-proxy",
-    "note": "Deterministic continuous SE(3) episodes cover the shared workspace. No estimated visual trajectory is used as truth. A frozen real task-distribution sample is required for G2."
+    "note": "Deterministic continuous SE(3) episodes cover the shared workspace. No estimated visual trajectory is used as truth. A frozen real task-distribution sample is required for G2.",
+    "scope": "MC-lite sandbox only; the real-input runner reads real_inputs"
   },
   "source_report": {
     "path": "../../box_umi_marker_rig_tcp_20260818.html",
     "sha256": "b45982b45c4aaa233a8c9c05256d352f45f7174eedba74b662a9563ee636786c"
+  },
+  "real_inputs": {
+    "cameras_0804_fisheye.json": {
+      "path": "inputs/cameras_0804_fisheye.json",
+      "sha256": "e330f52e1657d80dfbba1681c238d3367ce18d6a44432e6c0f8da4e13aaca847",
+      "status": "frozen-real",
+      "sources": {
+        "outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_extrinsics/summary.json": "d0932c337be0b0e3c4525965145b48589d053f21f5b0f40bd1a11b8fb772484d",
+        "tools/thor/gmsl2/world/world_reference.json": "d7de86e29521d81260164643b53e5f07afe5cc70bedc78f0b3297a53037b98f0",
+        "outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics/converted/cam_06_H120K-I05130029/intrinsics_producer.json": "27bb91afd5e852e10d017bf21f20f6e4bfefb240e9a3f13f6e9313c0c0ca995e",
+        "outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics/converted/cam_07_H120K-I05130066/intrinsics_producer.json": "99fd89fe4dbe3834921bcedd08625535396d48e0e62e34022070fc2638393486",
+        "outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics/converted/cam_08_H120K-I05130024/intrinsics_producer.json": "f652ccad0983816d3573e1da7b50e3661fa3076b80d27dd910d83c96ca6630ce",
+        "outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics/converted/cam_09_H120K-I05130058/intrinsics_producer.json": "df67f7c1f995accf9d6914ed5f2a0db4d426d721c86bcc7db80134ace8029624",
+        "outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics/converted/cam_12_H120K-I05130067/intrinsics_producer.json": "c9894c68e57594c8a1f2926a43e517ecc7dbeea5e6785febbfb5556adb2f51bb",
+        "outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics/converted/cam_13_H120K-I05130031/intrinsics_producer.json": "8927df0c1b98f59c09ae37b0248aaebee82f7724d061e42e8d1dac07758b3723",
+        "outputs/calibration/thor_gmsl2_selfcal_0804_fisheye_intrinsics/converted/cam_14_H120K-I05130057/intrinsics_producer.json": "5eebef5cd9f37dc83a447e8654704b47bc9eef9077a4923e7358d0c87eafaf39"
+      }
+    },
+    "task_132514.json": {
+      "path": "inputs/task_132514.json",
+      "sha256": "6cb54da368c3f7baddc64fa2a7fd248a9f42e2d8a89f3b24ad7fa28df6ac2be2",
+      "status": "frozen-real-task",
+      "sources": {
+        "outputs/metrology/phase5_contact_review_132514/src/marker_to_tcp_calibration_20260812.left_right_tmp.json": "c7a84579cc74b63f3425339be7580056f88586dcb997ef84cd00cd336a45b68d",
+        "outputs/metrology/phase5_contact_review_132514/dataset/episodes/episode_000000/online_sync_manifest.json": "cfc0ec590cfe5ad53c97049fd746147730c1865196e83b13901550768f0dc5c8",
+        "outputs/metrology/phase5_contact_review_132514/dataset/episodes/episode_000001/online_sync_manifest.json": "4daaa542b7bb28fbe6217daba5ec97df3376ae38445599d9e018c67ddacd34ba",
+        "outputs/metrology/phase5_contact_review_132514/dataset/episodes/episode_000002/online_sync_manifest.json": "b30f9037a76ed0871b31f1931df7acdb585f7d4320f925c19eccc3285ec813e7",
+        "outputs/metrology/phase5_contact_review_132514/ba_markers/left/marker_rig_ba.left.csv": "477c7fe14664e6aeea2ef3ac7f8190aa9cc590eae7a28ce05d2feb960a97181d",
+        "outputs/metrology/phase5_contact_review_132514/src/left_full/marker_rig_ba.left.with_episode.csv": "7f552d38850358b2ffa7c9e72611a98a6c3d42b42c9e70bef52e02eba21e9a42",
+        "outputs/metrology/phase5_contact_review_132514/ba_markers/right/marker_rig_ba.right.csv": "e1aa170166260bdeb4b63e74a12ab4e291a82ef545059d854ab8fcaf086503bc",
+        "outputs/metrology/phase5_contact_review_132514/src/right_full/marker_rig_ba.right.with_episode.csv": "adeae6176449131cd4c220d01b8675b83fd5e273999c37774139af20b35ad0d6"
+      }
+    },
+    "gripper_v2.json": {
+      "path": "inputs/gripper_v2.json",
+      "sha256": "b12f54c1ed7ceda7ee2d8b1df77406b1607e1eb339ca25c10162d71b8bf504cb",
+      "status": "urdf-mechanism+assumed-housing-and-hand",
+      "sources": {
+        "third_party/opencv_kalibr/corenetic_gripper_V2_0_description/urdf/gripper_V2_0_description.urdf": "471061b95fa467405720714e79703ba792d2270bdef70a0c8c6b5afe272fa307",
+        "third_party/opencv_kalibr/corenetic_gripper_V2_0_description/meshes/link_lt_gripper_base.STL": "a292cdd7c0e46bf44d0c9a9c147d278896625a5f538543166f8ba88a7069dcfe",
+        "third_party/opencv_kalibr/corenetic_gripper_V2_0_description/meshes/link_lt_gripper_drive.STL": "f4bacc9fd69aae55d8d6854bd35667ed51db6558b4db2f731fbbf3f58ef13a06",
+        "third_party/opencv_kalibr/corenetic_gripper_V2_0_description/meshes/link_lt_gripper_knuckle_left_outer.STL": "f006e906e7d5b2ac31307d8e026ef34ee12287a15d7a25f6f96e61d1bf44e279",
+        "third_party/opencv_kalibr/corenetic_gripper_V2_0_description/meshes/link_lt_gripper_finger_left.STL": "80321dcbd641a2325fa61cbc2af6b376ebc1eaecaba11198f1470bd5dd480a44",
+        "third_party/opencv_kalibr/corenetic_gripper_V2_0_description/meshes/link_lt_gripper_knuckle_left_inner.STL": "da5add25095a4b3234b0cea7b10658f6256d2ee6761bec8ac063af059d5e6eef",
+        "third_party/opencv_kalibr/corenetic_gripper_V2_0_description/meshes/link_lt_gripper_knuckle_right_outer.STL": "2d77f451cb65271712302ab35a276700e45683595a54734bb017a3c1d5277bda",
+        "third_party/opencv_kalibr/corenetic_gripper_V2_0_description/meshes/link_lt_gripper_finger_right.STL": "121ed35ba2b61eaae00072fda6370bcebdd339fcc6d9663e9fe118191fb19856",
+        "third_party/opencv_kalibr/corenetic_gripper_V2_0_description/meshes/link_lt_gripper_knuckle_right_inner.STL": "729b436731f2f2207aa535d3e8e491c12ea0510ada1c58cacc802c3a87c63c8a"
+      }
+    },
+    "r0_layout_measured.json": {
+      "path": "inputs/r0_layout_measured.json",
+      "sha256": "edd5ba6f0ccba637e4f534783f67904c50116d2fb75d23a19e1bfb15073912a5",
+      "status": "measured",
+      "sources": {
+        "nvidia@192.168.111.122:~/lerobot/outputs/metrology/newrig_20260818_115119/layout_cadprior_no09_10.json (0818b capture, CAD prior sigma 1 mm, cam_09 excluded; pivot |p_rig| 0.90 mm)": "edd5ba6f0ccba637e4f534783f67904c50116d2fb75d23a19e1bfb15073912a5"
+      }
+    }
   }
 }

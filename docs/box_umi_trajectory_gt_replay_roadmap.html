@@ -145,7 +145,7 @@
 <span class="pill">双 FR3 replay：新增主线</span><span class="pill">独立 6DoF replay GT：规划中</span><span class="pill">关键精度项默认展开</span></div>
 <p style="margin-top:16px;color:#9ca3af;font-size:13px">
       <b>当前状态（截至 2026-09-10）：</b>生产链已换血——估计器是<b>全相机角点联合 corner BA</b>、写入数据集的是<b>离线 SE(3) batch smoother</b>、sidecar 为 <b>v2</b>（每帧带真实 timestamp、σ、可见相机数、残差）。
-      <b>当前工程预算：TCP 平移 A′ p95 ≈ 3.8–4.0 mm、p50 ≈ 2.24 mm（rig 口径 / 纯相机侧；估计，不是独立 GT）；独立诊断上界 A = 7.43 mm（逐相机弥散，不是标签误差）</b>。目标 p95 ≤ 3 mm，因此按 A′ 口径仍超标约 <b>0.8–1.0 mm（1.26–1.33×）</b>。旧的 <b>5.5–7.4 mm</b> 抬头已降级为历史口径：5.5 mm 来自已被修正的旧 RSS 账本，7.43 mm 则仍保留为诊断上界，二者不再拼成一个“当前误差区间”。而真正会进训练集的<b>生产夹爪（cube）口径仍给不出数</b>（marker→TCP 未标定 + cube 晃动破坏刚体假设）。逐项分账见误差预算表的「目前实际误差」列。<b>误差的现行口径是 2 mm 量级，不是 0.2 mm</b>：本页所有亚毫米数字都产自单次标定内部（同一套外参既拟合又检验），只能给误差下限——详见误差预算表前的口径谱系表，不要再用 held-out 0.244 mm 论证端到端精度。
+      <b>当前工程预算必须分两层读：</b>① <b>Recording / rig 口径</b>：TCP 平移 A′ p95 ≈ <b>3.8–4.0 mm</b>、p50 ≈ 2.24 mm（纯相机侧；估计，不是独立 GT），诊断上界 A = 7.43 mm（逐相机弥散，不是标签误差）；② <b>Replay 口径</b>：FR3 physical tracking、world↔base、retarget/retime、tool/TCP 与 contact 尚未完成独立分账，<b>不能把 A′ 当成最终机器人回放误差</b>。Phase 11 暂以 FR3 physical tracking <b>1–2 mm-class</b> 作为工程 Gate（不是当前实测）；仅做敏感性估算时，若 recording 3.8–4.0 mm 与 robot execution 1–2 mm 近似独立，则“record + robot”约 <b>4.0–4.5 mm p95</b>；完整 E2E replay 暂只按 <b>4–6 mm-class planning envelope</b> 管理，明确标注为推断、非验收数字。若最终要冻结为严格 p95 ≤3 mm，必须在 Phase 11/12 实测后<b>重新反推各子系统预算</b>，recording 侧不能继续把 3 mm 当作可吃满的最终额度。旧的 <b>5.5–7.4 mm</b> 抬头仍只保留为历史口径。真正会进训练集的<b>生产夹爪（cube）口径仍给不出数</b>（marker→TCP 未标定 + cube 晃动破坏刚体假设）。
       <b>三层阻塞：</b>①<b>实物几何被供应商阻塞</b>（等夹爪设计更新；现 rig 为单次自打印装配，repeatability 分布不会迁移到新夹爪）；②<b>尺子本身还有一台已知错的相机</b>——cam_09 已于 2026-08-21 从数据解出修正（<b>2° 旋转，不是 30 mm 平移</b>，端到端复核整机 p50 3.66 → 3.42 mm），但<b>尚未进生产</b>；③<b>没有独立 GT</b>，3 mm 至今无法被认证，tracker 采购是前置期最长的一项。
       <b>2026-08-21 新增一个此前从未进过预算的项</b>：在真实操作速度下（rig 速度 p95 达 680 mm/s）误差随速度上升——逐相机弥散 p95 由 10.6 涨到 18.9 mm，而<b>融合重投影残差几乎不动</b>（3.68 → 3.81 px），所以这一项<b>无法用残差监控</b>，只能按速度分层统计。
       <b>读本页的一条通则：</b>逐相机弥散是诊断量，不是标签误差——它系统性<b>高估</b>标签对单台相机/单个 marker 的敏感度，凡由它推出的数字都按「上界」读。
@@ -190,7 +190,7 @@
 </div>
 <table class="metric-table">
 <tr><th>指标</th><th>目标</th></tr>
-<tr><td>TCP 平移误差</td><td>≤ 3 mm</td></tr>
+<tr><td>Recording TCP 平移误差</td><td>Phase 3 当前 Gate ≤ 3 mm；<b>不是最终 replay 的整机预算</b>，最终分配需由 Phase 11/12 反推</td></tr>
 <tr><td>TCP 旋转误差</td><td>≤ 0.5°</td></tr>
 <tr><td>静止 jitter</td><td>&lt; 0.5–1 mm</td></tr>
 <tr><td>双手相对位姿误差</td><td>≤ 3 mm；同时报告 common-view native consistency</td></tr>
@@ -199,7 +199,7 @@
 <tr><td>Tracking coverage</td><td>&gt; 99%（“有没有可靠轨迹”）</td></tr>
 <tr><td>Training-valid yield</td><td>单独统计；通过 tracking + QC + bimanual + dual-FR3 executability 后才计入</td></tr>
 <tr><td>FR3 relative replay fidelity</td><td>目标与录制 GT 同量级；以 shared first-frame alignment 后的 p95 / RPE 验收</td></tr>
-<tr><td>FR3 absolute physical replay</td><td>先建立实测误差预算；最终目标为 3 mm-class，不能由 FR3 FK 自证</td></tr>
+<tr><td>FR3 absolute physical replay</td><td>先建立实测误差预算；最终目标为 3 mm-class。若要冻结为严格 ≤3 mm，必须反推并收紧 recording / registration / retarget / robot 各项分配；不能由 FR3 FK 自证</td></tr>
 <tr><td>Replay-certified yield</td><td>与 training-valid yield 分开统计；额外要求独立 6DoF physical replay 通过</td></tr>
 <tr><td>World-frame provenance</td><td>100% episode / calibration 可追溯到 <span class="mono">world_frame_id</span>；全相机移动只触发 continuity break，不使历史轨迹失效</td></tr>
 </table>
@@ -235,11 +235,11 @@ IMU factor graph / QC</div>
 </section>
 <section class="card full" data-block="error-budget-3mm-20260814">
 <div class="section-title">
-<h2>3 mm 轨迹精度误差预算</h2>
+<h2>Recording 轨迹精度误差预算（3 mm 子系统 Gate）</h2>
 <span class="badge p0">Phase 3 驱动</span>
 </div>
 <p class="goal">
-  目标口径：TCP 平移误差按 p95 ≤ 3 mm 管理。各项按近似独立的 RMS 预算合成；最终仍必须由 Phase 7 独立 GT benchmark 验收。
+  本表只管理 <b>recording subsystem</b>：TCP 平移暂按 p95 ≤ 3 mm 作为 Phase 3 Gate，各项按近似独立的 RMS 预算合成；<b>不包含 FR3 执行、world↔base 注册、retarget/retime 与 contact</b>。若最终系统要求严格 replay p95 ≤ 3 mm，则必须由 Phase 11/12 的实测 replay budget 反推并收紧本表分配；最终仍必须由独立 GT benchmark 验收。
 </p>
 <div class="callout">
 <span class="mono">e_total ≈ sqrt(e_camera² + e_marker_geometry² + e_marker_tcp² + (L·θ)² + e_solver² + e_timing² + e_smoothing²)</span><br/>
@@ -275,16 +275,25 @@ IMU factor graph / QC</div>
 <b>粗算：当前轨迹误差（2026-09-10 口径）</b><div class="small" style="margin-top:6px;padding:8px 10px;border-left:3px solid #b45309;background:#fffbeb"><b>2026-09-10 口径整理：不再把 5.5 与 7.43 mm 拼成一个“当前区间”。</b>5.5 mm 属于旧账本：08-27 已删除 <span class="mono">L·θ</span> 重复记账，并用联合扰动实测证明“分位数各自 RSS”高估尾部，因此当前用于工程决策的是 <b>A′ p95 = 3.78–3.98 mm（约 3.8–4.0 mm）</b>。<b>A = 7.43 mm</b> 仍保留，但只作为逐相机弥散的实测诊断上界。2026-09-09 新量到的 marker 自身尺度落在 <b>B / cube</b> 口径，不改变 A / A′；B 仍因 marker→TCP、cube 晃动与重装夹未测而给不出可信总误差。</div>
 
 <div style="background:#fff;border:2px solid #b45309;border-radius:12px;padding:18px 20px;margin:12px 0">
-<div style="font-size:13px;color:#6b7280;letter-spacing:.04em">当前工程预算 · TCP 平移 · rig 口径（纯相机侧）</div>
+<div style="font-size:13px;color:#6b7280;letter-spacing:.04em">当前工程预算 · Recording TCP 平移 · rig 口径（不含 FR3 执行）</div>
 <div style="font-size:38px;font-weight:800;line-height:1.15;margin:6px 0 2px;color:#b45309">A′ p95 ≈ 3.8 – 4.0 mm</div>
 <div style="font-size:17px;font-weight:600;color:#374151;margin-bottom:10px">A′ p50 ≈ 2.24 mm　·　诊断上界 A p95 = 7.43 mm</div>
-<div style="font-size:15px">目标是 <b>p95 ≤ 3 mm</b> → 按 A′ 口径仍超标约 <b style="color:#b45309">0.8 – 1.0 mm（1.26 – 1.33×）</b>。</div>
+<div style="font-size:15px">Recording 当前 Gate 是 <b>p95 ≤ 3 mm</b> → 按 A′ 口径仍超标约 <b style="color:#b45309">0.8 – 1.0 mm（1.26 – 1.33×）</b>；<b>这不是最终 replay 可用的全部误差额度</b>。</div>
 <div class="small" style="margin-top:8px">
 <b>A′ 是当前工程决策基线，但仍是估计，不是 independent GT。</b>其 3.8–4.0 mm 来自删除重复记账后的 4.45 mm RSS，再乘联合扰动实测得到的 0.85–0.895 折算区间；这个折算对当前五项仍有外推成分，因此应读作“约 4 mm、且已知偏保守”。<b>A = 7.43 mm 不是另一端真值</b>，而是逐相机弥散：它回答“换一台相机信，答案会变多少”，系统性高估最终融合标签对单台相机的敏感度。旧的 <b>5.5–7.4 mm</b> 只保留在历史记录中，不再作为当前误差标题。
 </div>
 <div style="margin-top:12px;padding-top:11px;border-top:1px dashed #d1d5db;font-size:15px">
 <b>而真正会进训练集的「生产夹爪（cube）口径」：<span style="color:#b91c1c">给不出数。</span></b>
 <span class="small">marker→TCP 未标定、cube 晃动直接破坏刚体假设、重装夹零测量。硬凑一个下界是 <b>≈7.5 mm</b>，但它没有意义——<b>该口径当前根本没有合格数据</b>（本表已判定装夹恢复刚性前的数据不进训练集）。</span>
+</div>
+</div>
+
+<div style="background:#fff;border:2px solid #2563eb;border-radius:12px;padding:18px 20px;margin:12px 0">
+<div style="font-size:13px;color:#6b7280;letter-spacing:.04em">Replay 工程粗估 · 只用于规划，不作为验收数字</div>
+<div style="font-size:26px;font-weight:800;line-height:1.2;margin:6px 0 8px;color:#2563eb">record + robot ≈ 4.0–4.5 mm p95</div>
+<div style="font-size:15px"><b>完整 E2E replay：暂按 4–6 mm-class planning envelope。</b></div>
+<div class="small" style="margin-top:8px">
+FR3 physical tracking 当前<b>没有独立 GT 实测值</b>；这里的 1–2 mm 只是 Phase 11 的工程 Gate。4.0–4.5 mm 来自把 recording A′=3.8–4.0 mm 与假设的 robot execution=1–2 mm 做近似独立 RSS 的<b>敏感性估算</b>；4–6 mm-class 进一步给 world↔base、retarget/retime、tool/TCP、timing 与 contact 留出规划余量，<b>不是由现有数据直接测得，也不能用于宣称 replay 已达到某个精度</b>。Phase 11/12 完成后应删除这组 planning 数，替换成 position/orientation × speed × workspace 的 physical tracking map 与真正的 E2E replay benchmark。
 </div>
 </div>
 
@@ -379,8 +388,8 @@ IMU factor graph / QC</div>
 </p>
 </div>
 <div class="callout">
-<b>新增：Record → Replay 是第二套误差预算，不能把“录制 p95 ≤3 mm”直接等同于“真实 replay ≤3 mm”。</b><br/>
-<span class="mono">e_replay ≈ f(e_record, e_world↔base, e_retarget, e_robot_model, e_control, e_tool/TCP, e_timing, e_contact)</span>。其中 p95 不应机械地做 RSS 相加，但工程上必须逐项测量并分账。先把 FR3 自身 physical tracking、双 base 注册和 retarget distortion 测出来，再决定 absolute replay 是否能冻结为严格 ≤3 mm；在此之前使用“3 mm-class / 同量级”而不是伪精确承诺。
+<b>更新：Record → Replay 是第二套误差预算，A′ 3.8–4.0 mm 只属于 recording。</b><br/>
+<span class="mono">e_replay ≈ f(e_record, e_world↔base, e_retarget, e_robot_model, e_control, e_tool/TCP, e_timing, e_contact)</span>。其中 p95 <b>不能机械 RSS</b>。当前仅作规划敏感性估算：若 FR3 physical tracking 能落在 Phase 11 的 <b>1–2 mm-class Gate</b>，且暂只考虑 recording + robot execution，则约 <b>4.0–4.5 mm p95</b>；把注册、retarget/retime、tool/TCP 与 contact 也纳入后，完整 E2E 暂按 <b>4–6 mm-class</b> 做 planning envelope。<b>两组 replay 数都不是测量，也不是冻结预算。</b>最终必须先测 FR3 physical tracking、双 base 注册和 retarget distortion，再反推 recording 子系统应占多少额度；若整机要严格 ≤3 mm，recording 显然不能把 3 mm 吃满。
 </div>
 <div class="callout warn">
 <b>2026-09-10 · 0907-on-gripper 开发决策：当前 No-Go，先做零机械成本的理论/仿真判别。</b><br/>
@@ -1410,7 +1419,7 @@ marker 不必组成物理立方体；必要条件是所有可见 marker corner �
 <span class="mono">e_physical = error(T_cmd, T_physical_GT)</span>：真实 TCP 是否走到命令位置。<br/>
 只有后者能回答“命令左移 30 mm，实际物理 TCP 到底走了多少”。
 </div>
-<div class="gate"><b>Gate：</b>建立 position/orientation × speed × workspace 的 p50/p95 map，并给出 FR3 physical tracking 的预算；若基础 30 mm relative move 已明显超过 1–2 mm 级，应先解决 TCP、tool calibration、base registration 或 controller，而不是继续归因于 UMI GT。</div>
+<div class="gate"><b>Gate：</b>建立 position/orientation × speed × workspace 的 p50/p95 map，并给出 FR3 physical tracking 的实测预算；<b>1–2 mm 目前只是工程 Gate，不是当前机器人执行误差的测量值</b>。若基础 30 mm relative move 已明显超过 1–2 mm 级，应先解决 TCP、tool calibration、base registration 或 controller，而不是继续归因于 UMI GT。</div>
 </section>
 
 <section class="card full" data-block="physical-replay">
@@ -1527,7 +1536,7 @@ relative / absolute / bimanual / contact replay metrics</div>
 <tr><th style="min-width:96px">优先级</th><th>工作</th><th>当前动作</th><th>需要你提供的输入</th><th>退出条件 / 产物</th></tr>
 
 <tr><td><span class="badge p0">P0-Decision</span></td><td><b>0907-on-gripper · Go / No-Go</b><br/><span class="small">2026-09-10：开发前先证明收益量级</span></td>
-<td><b>当前 No-Go，不做夹爪机械开发。</b>现有 A′ 预算下，0907 有机理支撑的可信收益约 <b>0.43–0.46 mm p95</b>，不足以覆盖从 3.8–4.0 mm 到 3 mm 所需的 0.8–1.0 mm；约 1 mm 的“饼”依赖未验证项。先做同一真实轨迹上的虚拟 A/B：把现役 rig 与 0907 分别刚性挂到同一 TCP，使用同一套相机、同一帧姿态、同一夹爪/手遮挡，逐帧计算 visibility、FIM / pose covariance、TCP covariance 与弱观测帧。<b>不要再用手持低速 0907 的 1.91 / 4.90 mm 直接替代现役口径</b>：速度、处理包与外参均未对齐。</td>
+<td><b>当前 No-Go，不做夹爪机械开发。</b><br/><b>2026-09-11 虚拟 A/B 已执行（<a href="rig0818_vs_hybrid_carrier_v1/simulator/">判定页</a>）：正式判定 No-Go，停止 0907 geometry 分支。</b>输入是真实 0804 七相机、132514 留出 episode 1–2 共 1221 帧、夹爪/手遮挡，以及从 Thor 取回的 rig0818 实测 layout（0818b，pivot |p_rig| 0.90 mm）；逐帧鱼眼渲染后走生产检测、corner BA、carrier 精修与离线平滑，两种靶标的安装方向用同一候选集、只在 dev 集上选定。证据级扰动 + 离线平滑后 p95：rig0818 <b>4.80 mm</b>，0907 全量 <b>7.97 mm</b>。配对 Δp95 = <b>−3.17 mm [−4.12, −2.40]</b>，方向与“至少好 0.8 mm”相反；三级扰动、两种输出与所有有数据的速度/遮挡分层结论一致；彩色边缘精修只带来 +0.40 mm。差距来自旋转 × 力臂而非平移：同一批位姿在球窝处读出两者打平（名义 1.06 vs 1.06 mm），3 个 anchor 的角点分布半径 63 mm（rig0818 为 96 mm）使旋转误差大 1.5 倍，再被 290–370 mm 力臂放大；球窝移到 TCP 的无力臂对照打平（Δ −0.13 [−0.63, +0.33] mm，上界仍低于 0.8 mm）。这与 09-09 手持真机（数值全部在 rig 原点、单相机一致性、对照物是 cube）不矛盾。<br/><span class="small">以下为执行前的立项论证：</span>现有 A′ 预算下，0907 有机理支撑的可信收益约 <b>0.43–0.46 mm p95</b>，不足以覆盖从 3.8–4.0 mm 到 3 mm 所需的 0.8–1.0 mm；约 1 mm 的“饼”依赖未验证项。先做同一真实轨迹上的虚拟 A/B：把现役 rig 与 0907 分别刚性挂到同一 TCP，使用同一套相机、同一帧姿态、同一夹爪/手遮挡，逐帧计算 visibility、FIM / pose covariance、TCP covariance 与弱观测帧。<b>不要再用手持低速 0907 的 1.91 / 4.90 mm 直接替代现役口径</b>：速度、处理包与外参均未对齐。</td>
 <td>现有即可：<b>0907 STEP、现役 rig 几何、真实 manipulation TCP trajectory、7 相机 extrinsics</b>；还需把<b>夹爪/手的遮挡几何</b>放进同一仿真。无需先加工 0907 夹爪版。</td>
 <td><b>Go：</b>结果能支持 ≳0.8 mm 最终 p95 收益量级；工程代理为 TCP translation covariance p95 ↓≥30–40%、rotation covariance 显著下降、coverage 不降、weak/catastrophic frames ↓≥50%，且高速/遮挡区仍成立。<br/><b>No-Go：</b>若只显示 0.3–0.5 mm 级收益或优势主要来自理想无遮挡视角，停止 0907 geometry 分支；改做更简单的 rigid integrated carrier。<br/><span class="small">注意：这是 geometry 立项 Gate，不替代后续 physical paired A/B 与 independent GT。</span></td></tr>
 
@@ -1760,7 +1769,8 @@ training-valid dataset                  replay-certified subset
 </section>
 </div>
 <p class="small" style="margin-top:24px">
-    <b>最近六次修订</b>（完整版本历史 54 条 v11 → v18.1，含已被推翻的结论，见 <a href="box_umi_roadmap_changelog.html">版本历史</a>）：
+    <b>最近修订</b>（完整版本历史见 <a href="box_umi_roadmap_changelog.html">版本历史</a>；当前主文档 v18.2）：
+    版本：2026-09-10 v18.2 · <b>把 Recording 与 Replay 误差预算彻底拆开。</b>A′ p95 3.8–4.0 mm 明确只属于 recording / rig 口径，不含 FR3 执行。Phase 11 的 1–2 mm 明确标成 robot physical tracking 的工程 Gate、不是实测值；仅用于规划时，recording + robot execution 的敏感性估算约 <b>4.0–4.5 mm p95</b>，完整 E2E 暂按 <b>4–6 mm-class planning envelope</b>，两者都不得作为验收数字。总体目标与误差预算表同步改写：Phase 3 的 recording ≤3 mm 只是子系统 Gate；若最终要冻结为严格 replay ≤3 mm，必须等 Phase 11/12 实测后反推并收紧 recording / registration / retarget / robot 各项分配。<br>
     版本：2026-09-10 v18.1 · <b>统一“当前轨迹误差”口径：撤下 5.5–7.4 mm 作为当前标题。</b>旧标题把两个不同性质的量拼成了区间：5.5 mm 来自已被 08-27 修正的旧 RSS 账本，7.43 mm 则是逐相机弥散实测上界。当前工程决策基线统一为 <b>A′ p95 = 3.78–3.98 mm（约 3.8–4.0 mm），p50 ≈2.24 mm</b>；<b>A p95 = 7.43 mm</b> 只单列为诊断上界；3 mm 仍须 independent GT 认证。按 A′ 看，当前距目标还差约 <b>0.8–1.0 mm</b>。历史版本中的 5.5–7.4 mm 保留但明确标注为旧口径。<br>
     版本：2026-09-10 v18.0 · <b>0907-on-gripper 改为开发前 Go/No-Go：当前 No-Go，先做零机械成本 virtual A/B。</b>现有 A′ 同口径下，现役最佳 rig 为 <b>3.78–3.98 mm p95</b>，0907 只有机理支撑的“实际点”为 <b>3.35–3.52 mm</b>，即可信预期仅 <b>0.43–0.46 mm</b>；把 carrier 能碰的项全清零，理论地板 <b>2.55–2.69 mm</b>，说明绝对上限约 1.2–1.4 mm，而 <b>2.81–2.96 mm</b> 的“饼”依赖未实测的 timing / camera-side 收益，不能作为开发立项依据。由于把 0907 搬到夹爪上本身有机械、标定与软件集成成本，主线不再采用“先开发再 physical A/B”的策略：先把现役 rig 与 0907 虚拟挂到<b>同一真实 manipulation trajectory / 同一 TCP / 同一相机 / 同一夹爪与手遮挡</b>上，比较 visibility、FIM / pose covariance、TCP covariance、coverage 与 weak-observation tails。<b>立项 Gate：</b>只有结果能支持 ≳0.8 mm 最终 p95 收益量级（代理：translation covariance p95 ↓≥30–40%、rotation covariance 显著下降、coverage 不降、弱/灾难帧 ↓≥50%，且高速/遮挡区仍成立）才开发 0907-on-gripper；若只有 0.3–0.5 mm 级改善则停止该 geometry 分支。另钉死一条边界：<b>刚性 integrated carrier 有结构性价值，但这不等于 0907 geometry 已被证明值得开发。</b><br>
     版本：2026-09-09 v17.9 · <b>误差预算复核：marker 自身的尺度从来没被扫过，在 cube 口径上值 6 mm；外加撤回一个不可复现的数</b>。起因是给 carrier 的 marker→TCP 找实测 σ 时写的<b>双尺度</b>估计器（本体 vs 贴纸），把同一把尺子对准生产 cube 后读出的东西。① <b>「marker 尺寸 / marker rig 几何」那一行的「已不是瓶颈」只对 layout 成立</b>：那次受控 A/B 换的是 marker 之间的位置，<span class="mono">marker_size_cm</span> 全程钉在 5.6 <b>从未被扫过</b>——而该行自己的第一句就写着 5.8→5.6 让相机间一致性 26.6→4.1 mm，灵敏度约 <b>6 mm/1%</b>。于是该行「剩下的都在相机模型那一侧」这句归因，其排除法里<b>漏掉了 marker 尺度</b>。② <b>离线扫参数（0903，991 帧，7 相机 right cube，只改这一个值）</b>：逐相机弥散 p50 5.65→17.39、5.60（现役）→<b>10.16</b>、5.55→<b>3.97</b>、5.50→5.43 mm；BA 与逐相机融合之差这条<u>独立</u>判据落在<b>同一个极小点</b>（12.13 / 7.31 / <b>3.88</b> / 5.79 mm）。联合重投影单调下降，<b>不能</b>用来定这个参数（缩小 marker 总能靠位姿换掉残差，那是尺度-深度退化方向）。③ <b>三条独立证据都指向真实边长 ≈55.5 mm</b>：2026-08-19 的三角化（均值 55.53，当时缺口是「可能来自外参整体尺度」）；新的<b>本体/贴纸差分</b>拟合把缺口补上——本体 <b>+2567</b> ppm 与贴纸 <b>−6152</b> ppm <b>符号相反</b>，全局外参尺度造不出反号，差分 −8719 ppm → <b>55.51 mm</b>；以及上面那次扫描的极小点 5.55。<b>也不是检测器伪影</b>：角点偏差是固定像素量、尺寸误差是固定比例，按成像边长分档（50→58 px，跨 16%）读数只动 2.3%，<span class="mono">corr(1/px,ppm)=−0.13</span>。④ <b>它落在 B 口径不落在 A</b>：cube 的角点表是从 <span class="mono">marker_size_cm</span> 生成的，rig 的 layout 是从数据反解的（带逐个不同的实测边长）。<b>所以当时粗算的抬头 p95 5.5–7.4 mm 一个字不动</b>——本次没有任何测量动过相机项或 timing 项。<b>（v18.1 已将该抬头降级为历史口径：当前工程基线改用 A′ 3.8–4.0 mm，7.43 mm 单列为 A 诊断上界。）</b>⑤ <b>marker→TCP 那一行第一次有了被测量的数</b>，但只对手持 carrier 成立：球窝球心在零件原点（7.8e−16 mm），平移是<b>构造上的零</b>；实物本体尺度 −4102 ppm 在 134.8 mm 杠杆臂上把原点挪开 <b>p50 0.52 / p90 0.71 mm</b>，<b>首次落在该行 ≤1.0 mm 预算内</b>。旋转仍是约定不是测量。⑥ <b style="color:#b91c1c">撤回</b>：v17.8 里用来跟 carrier 对比的「0903 cube 同口径 5.24 / 9.65 mm」不可复现——同配置同数据当前代码给出 10.16 / 23.27 mm，而管线经检验<b>逐位确定</b>（连跑两次 <span class="mono">reproj 1.498511 / ba_vs_fusion 7.310987</span> 完全相同），故差异不是噪声而是来源不可考。受影响的只是「好 2–3 倍」的<b>倍数</b>，方向不变；该对比本就未对齐门限，已由 cube <b>自己的</b> A/B 取代。<b>动 <span class="mono">marker_size_cm</span> 之前必须在 Thor 用生产的 <span class="mono">pupil_apriltags</span> 重扫一遍</b>（本次走的是 OpenCV 解码路径），且 <span class="mono">check_thor_umi_cube_geometry</span> 以 1e−6 容差钉死 5.6，改值须连它一起改。<b>未部署到 Thor，未提交</b>。<br>版本：2026-09-09 v17.8 · <b>Hybrid Carrier 接进生产追踪器；一个 1.6% 的贴纸尺寸错误推翻了 v17.7 的「打平」结论</b>。① <b>carrier→TCP 常数不需要 pivot 采集</b>：这个 rig 的 part studio 把球窝球心放在零点（R 12.68 mm，实测离原点 7.8e−16 mm），球窝球心就是 TCP，所以平移是<b>构造上的零</b>；builder 现在实测球窝并写进描述符，球心一旦离开原点两个工具都<b>拒绝</b>而不是把偏移吸收掉。旋转是<b>约定</b>（z 由球窝开口方向定、x 由悬臂定，合起来是单位阵），bundle 里如实标注，混入 cube 打标签的数据集前必须先钉死。σ = 0.7 mm 来自实测的本体尺度 −4541 ppm × 134.8 mm 杠杆臂，不是球窝的 CAD 位置误差。② <b>贴纸从来就不是 48 mm</b>：新增的 <span class="mono">estimate_build_scale</span> 同时拟合「anchor 之间」（本体）和「贴纸绕自身中心」（印张）两个尺度——这是后果相反的两种毛病，只拟合一个会报出平均值并怪错人。实测本体 −4102 ppm、<b>贴纸 −15848 ppm</b>，即 anchor 实为 <b>47.24 mm</b>。这个数从来没被量过：ArUco 贴纸<b>不在</b> <span class="mono">rig0907_patterns_RGB_exact1mm_A4.pdf</span> 上。贴纸小 1.58% 会把单 anchor PnP 推远 1.58%（2 m 处 32 mm），正是 v17.7 归因给「单 anchor 几何」的那批粗差。按 47.24 mm 重建、重解 400 连续帧（2756 视角）：全部视角 |dt| p50 6.58→<b>2.98</b> mm、p90 15.91→<b>10.22</b> mm，3 anchor 4.62→<b>1.91</b> mm，粗差 130→74，残余贴纸尺度仅 −312 ppm。<b>v17.7 的「同口径打平」因此撤回</b>：对同一套外参重解的 0903 cube（5.24 / 9.65 mm），修正后的 carrier 在 2、3 anchor 上好 2–3 倍。同一把尺子对准生产 cube 读出贴纸尺度 −6166/−8762 ppm（AprilTag 边长 55.66/55.51 mm vs 配置 56.0），但 cube 杠杆臂只有 53 mm 且我用的是 OpenCV 而非生产的 <span class="mono">pupil_apriltags</span>，<b>换生产检测器重拟后再动</b>。③ <b>逐帧种子化</b>：ink 图每帧只算一次、遮挡皮每个位姿只投影一次、用上一帧联合位姿开窗并免枚举——850→<b>118 ms/相机帧</b>，20 s 七相机 episode 从 2.3 小时降到约 8 分钟；与冷启动一致到 0.019 mm，分歧全在单 anchor 相机且多数是种子那版更准。种子出信任半径即整帧冷启动重来。④ <b>接进生产追踪器</b>（<span class="mono">hybrid_carrier_tracking_in_robot_base.py</span>）：只换角点表、检测器、帧位姿三处；<span class="mono">estimate_frame_pose</span> 是<b>包一层</b>不是替换，corner BA 仍判定可解性并产出全部诊断，facet 只做细化且走太远就丢弃。「一帧不带上一帧先验」的原则保留——往前带的只有搜索种子，且是<b>联合</b>位姿而非单相机自己的答案。40 帧实跑 40/40 解出、中位 7 相机、重投影 1.590 px；corner BA 与独立的逐相机融合路径互证到 <b>1.8 mm</b>（此前差 801 mm，根因是逐相机位姿须按 pipeline 约定用<b>厘米</b>上报——这种单位错不会报错，只有 <span class="mono">ba_vs_fusion_position_m</span> 在喊，已加测试钉死）。<b>未部署到 Thor</b>。详见 <a href="hybrid_carrier_v1_roadmap_20260904.html">Hybrid Carrier V1 Roadmap</a>。<br>

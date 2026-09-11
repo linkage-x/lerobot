@@ -1,14 +1,40 @@
 {
-  "schema": "rig_target_ab_noise_sources/v1",
-  "sources": [
-    {"name": "corner_localization", "unit": "px", "distribution": "normal", "scope": "observation", "correlation": "independent corners in MC-lite", "default": 0.22, "evidence_status": "historical rig report; must be remeasured per detector/target"},
-    {"name": "edge_normal_localization", "unit": "px", "distribution": "normal", "scope": "edge sample", "correlation": "exchangeable within each CAD edge", "default": 0.42, "evidence_status": "scenario assumption"},
-    {"name": "edge_sample_correlation", "unit": "ratio", "distribution": "fixed scenario", "scope": "CAD edge", "correlation": "n_eff=n/(1+(n-1)rho)", "default": 0.55, "evidence_status": "scenario assumption"},
-    {"name": "camera_network_translation", "unit": "mm", "distribution": "normal", "scope": "episode", "correlation": "shared by R0/H0/H1", "default": 1.1, "evidence_status": "stress scenario; frozen calibration covariance absent"},
-    {"name": "camera_network_rotation", "unit": "deg", "distribution": "normal", "scope": "episode", "correlation": "shared by R0/H0/H1", "default": 0.10, "evidence_status": "stress scenario; frozen calibration covariance absent"},
-    {"name": "target_install_translation", "unit": "mm", "distribution": "normal", "scope": "episode", "correlation": "same distribution and paired draw across all arms", "default": 0.60, "evidence_status": "scenario assumption; equal manufacturing quality"},
-    {"name": "target_install_rotation", "unit": "deg", "distribution": "normal", "scope": "episode", "correlation": "same distribution and paired draw across all arms", "default": 0.18, "evidence_status": "scenario assumption; equal manufacturing quality"},
-    {"name": "camera_box_sync", "unit": "ms", "distribution": "normal", "scope": "episode plus frame jitter", "correlation": "shared by R0/H0/H1", "default": 2.2, "evidence_status": "scenario assumption; online SOF manifest delta is a different quantity"},
-    {"name": "motion_blur", "unit": "m/s times s", "distribution": "derived", "scope": "frame", "correlation": "shared motion, target-dependent detector sensitivity", "default": null, "evidence_status": "sensitivity model"}
-  ]
+  "schema": "rig_target_ab_noise_sources/v2",
+  "real_input_l3": {
+    "applies_to": "l3_runner.py estimator perturbations; truth images are never perturbed",
+    "pairing": "one draw per session, identical for R0, H0 and H1 (marker k of R0 and anchor k of the carrier share draw k)",
+    "levels": {"nominal": 0.0, "evidence": 1.0, "stress": 2.0},
+    "sources": [
+      {"name": "cam_rot_deg", "unit": "deg", "sigma_evidence": 0.06, "scope": "per axis, per camera, per session", "evidence_status": "measured", "evidence": "0820->0902 quiet drift: median relative orientation change 0.091 deg over 21 camera baselines"},
+      {"name": "cam_trans_mm", "unit": "mm", "sigma_evidence": 0.20, "scope": "per axis, per camera, per session", "evidence_status": "measured", "evidence": "same comparison: median baseline length change 0.23 mm"},
+      {"name": "focal_ppm", "unit": "ppm", "sigma_evidence": 400, "scope": "per camera, per session", "evidence_status": "measured", "evidence": "two independent intrinsics sweeps differ by -796 ppm in scale (outputs/metrology/intrinsics_sensitivity_0824)"},
+      {"name": "principal_px", "unit": "px", "sigma_evidence": 0.5, "scope": "per axis, per camera, per session", "evidence_status": "scenario", "evidence": "held-out self-calibration RMSE 0.16 px bounds the fit, not the sweep-to-sweep shift"},
+      {"name": "marker_trans_mm", "unit": "mm", "sigma_evidence": 0.30, "scope": "per axis, per marker, per session", "evidence_status": "measured", "evidence": "0818 layout: |p_rig| 1.03 vs 0.90 mm between two captures (0.48 mm apart)"},
+      {"name": "marker_rot_deg", "unit": "deg", "sigma_evidence": 0.30, "scope": "per axis, per marker, per session", "evidence_status": "scenario", "evidence": "sticker / plate seating"},
+      {"name": "body_scale_ppm", "unit": "ppm", "sigma_evidence": 500, "scope": "per target, per session; carrier edges scale with the body", "evidence_status": "scenario", "evidence": "residual after measuring sticker size (47.24 vs 48 mm was a corrected 1.6% error)"},
+      {"name": "tcp_trans_mm", "unit": "mm", "sigma_evidence": 0.50, "scope": "per axis, per session, same TCP-frame draw for every arm", "evidence_status": "measured", "evidence": "0818 pivot |p_rig| 0.90-1.03 mm, whole chain"},
+      {"name": "tcp_rot_deg", "unit": "deg", "sigma_evidence": 0.15, "scope": "per axis, per session, same draw for every arm", "evidence_status": "scenario", "evidence": "a single-pivot bundle cannot observe rotation; axes are a CAD convention"},
+      {"name": "timing_ms", "unit": "ms", "sigma_evidence": 1.5, "scope": "per session label-time offset", "evidence_status": "measured", "evidence": "Camera<->BOX offset spread across 0817 episodes: 0.20 ms (left) / 2.58 ms (right)"}
+    ],
+    "image_level": {
+      "noise_sigma_dn": 1.0, "blur_sigma_px": 0.4, "exposure_ms": 4.0, "exposure_samples": 3, "supersample": 4,
+      "evidence_status": "scenario",
+      "note": "ideal diffuse paint; real lighting, specular highlights and print quality are not modelled. Exposure is integrated over the truth twist, so motion blur follows the recorded speed."
+    },
+    "not_modelled": ["inter-camera SOF skew (measured <= 9 us, 60 fps manifest)", "lens vignetting and rolling shutter", "gripper opening changes (fixed 0.35 rad)"]
+  },
+  "mc_lite_sandbox": {
+    "applies_to": "simulator-core.js (synthetic cameras and trajectory)",
+    "sources": [
+      {"name": "corner_localization", "unit": "px", "distribution": "normal", "scope": "observation", "correlation": "independent corners in MC-lite", "default": 0.22, "evidence_status": "historical rig report; must be remeasured per detector/target"},
+      {"name": "edge_normal_localization", "unit": "px", "distribution": "normal", "scope": "edge sample", "correlation": "exchangeable within each CAD edge", "default": 0.42, "evidence_status": "scenario assumption"},
+      {"name": "edge_sample_correlation", "unit": "ratio", "distribution": "fixed scenario", "scope": "CAD edge", "correlation": "n_eff=n/(1+(n-1)rho)", "default": 0.55, "evidence_status": "scenario assumption"},
+      {"name": "camera_network_translation", "unit": "mm", "distribution": "normal", "scope": "episode", "correlation": "shared by R0/H0/H1", "default": 1.1, "evidence_status": "stress scenario; frozen calibration covariance absent"},
+      {"name": "camera_network_rotation", "unit": "deg", "distribution": "normal", "scope": "episode", "correlation": "shared by R0/H0/H1", "default": 0.10, "evidence_status": "stress scenario; frozen calibration covariance absent"},
+      {"name": "target_install_translation", "unit": "mm", "distribution": "normal", "scope": "episode", "correlation": "same distribution and paired draw across all arms", "default": 0.60, "evidence_status": "scenario assumption; equal manufacturing quality"},
+      {"name": "target_install_rotation", "unit": "deg", "distribution": "normal", "scope": "episode", "correlation": "same distribution and paired draw across all arms", "default": 0.18, "evidence_status": "scenario assumption; equal manufacturing quality"},
+      {"name": "camera_box_sync", "unit": "ms", "distribution": "normal", "scope": "episode plus frame jitter", "correlation": "shared by R0/H0/H1", "default": 2.2, "evidence_status": "scenario assumption; online SOF manifest delta is a different quantity"},
+      {"name": "motion_blur", "unit": "m/s times s", "distribution": "derived", "scope": "frame", "correlation": "shared motion, target-dependent detector sensitivity", "default": null, "evidence_status": "sensitivity model"}
+    ]
+  }
 }
