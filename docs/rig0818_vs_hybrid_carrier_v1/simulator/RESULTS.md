@@ -24,7 +24,7 @@ Pose coverage is 100% for all three arms, on the gripper mount and on the contro
 
 - **Every gripper-mount interval is below zero**, not just below the 0.8 mm gate. That holds for all three perturbation levels and both outputs.
 - **The corrected control ties.** With the socket on the TCP and no arm, the difference is −0.13 [−0.63, +0.33] mm smoothed and +0.11 [−0.45, +0.60] mm per-frame. Even with no arm, the upper bound stays below the gate.
-- **Not investigated:** at zero arm and nominal noise, the production smoother adds more error to the carrier than to R0. Per-frame p95 goes from 0.51 to 1.43 mm for the carrier, against 0.47 to 0.65 mm for R0, and the effect is already visible at slow speed. Both targets' BA translation σ sit under the smoother's 0.1 mm floor, so it is not a weighting difference in translation.
+- **Explained afterwards ([follow-up](#the-production-smoothers-residual)):** at zero arm and nominal noise, the production smoother adds more error to the carrier than to R0. Per-frame p95 goes from 0.51 to 1.43 mm for the carrier, against 0.47 to 0.65 mm for R0, and the effect is already visible at slow speed. The translation floor is not the cause. The smoother charges a rotation about the base origin only against the rotation σ, so rotation σ times the TCP's 0.78 m distance from that origin becomes the effective position σ: 0.34 mm for R0, 0.73 mm for the carrier. The decision does not depend on it.
 - **Where the gap comes from** (primary scenario):
   - R0 → H0 is −3.57 [−4.48, −2.75] mm: three 47 mm anchors instead of five 61 mm markers. The loss is in rotation, not translation; see [why the 09-09 bench looked better](#why-the-09-09-bench-looked-better).
   - H0 → H1 is +0.40 [+0.01, +0.78] mm: painted-edge refinement on the same images. It is accepted on 98.9% of frames and never trips the 12 mm guard. It helps, but by about a ninth of what the anchors lose.
@@ -46,7 +46,7 @@ Pose coverage is 100% for all three arms, on the gripper mount and on the contro
   - native tracker parity (0 of 1221 and 0 of 611 frames differ);
   - renderer convergence, all-frame denominators, held-out split;
   - real cameras, real task trajectory, real finger mechanism.
-- **Disclosed, not blocking:** the housing and hand envelope, the mounts themselves, the 0902 extrinsics, and the 4 ms exposure. Production runs Argus auto exposure (`exposure_us: 0`), which can reach about 14 ms in 60 Hz trigger mode.
+- **Disclosed, not blocking:** the housing and hand envelope, the mounts themselves, and the 0902 extrinsics. The 4 ms exposure was measured afterwards on the 132514 footage at about 8.7 ms. At 9 ms the NO-GO holds and the gap widens ([follow-up](#exposure-measured-at-about-87-ms)). The formal report is still the 4 ms run.
 
 ### Why the 09-09 bench looked better
 
@@ -99,6 +99,48 @@ Absolute values here are not comparable to the main roadmap's A′ 3.8–4.0 mm.
 ### Superseded CAD-proxy run (kept as a sensitivity check)
 
 [l3_report_cad_proxy.json](l3_report_cad_proxy.json) is the same pipeline with R0 built from CAD plate centres plus measured edge lengths. Its primary Δ was −2.58 [−3.34, −1.92] mm. Its formal decision was INCONCLUSIVE only because the measured layout was still missing. That report predates the deterministic block labels, so its intervals can move by a few hundredths of a millimetre if regenerated. Swapping in the measured layout moved R0's chosen mount and widened the gap by 0.6 mm; the direction did not change. Its control still has the old sideways orientation.
+
+## Follow-ups (2026-09-11)
+
+The scripts for both are in [followups/](followups/); their caches live under `outputs/rig_target_ab/followups_20260911/`.
+
+### Exposure: measured at about 8.7 ms
+
+- **What production records.** The cameras run Argus auto exposure: `exposure_us: 0` in `tools/thor/gmsl2/thor_gmsl2_11ch_example.yaml` since the file was created, and the gateway on Thor starts with that file. The per-frame Argus metadata has no exposure column. Its EOF − SOF is 14.68 ms on all nine cameras and every frame, which is the readout, and the nine SOFs agree within ±10 µs. The "about 14 ms" once quoted here was the recorder's clamp at 0.85 of the frame period, not a measurement.
+- **Measured from motion blur.** A global-shutter exposure E smears the image by L = v·E along the motion, so only edges whose gradient is parallel to the motion get wider.
+  - On 13 fast frames of 132514, the cube's image speed is 430–590 px/s, from the recorded trajectory projected through the 0804 cameras.
+  - Fitting the widening against the perpendicular edges gives a median E of 8.7 ms (IQR 7.5–9.3 ms).
+  - Static frames of the same cameras give L of 0 px (max 0.74 px).
+  - One cam_06 frame read 17 ms, longer than the frame period. The cube was rotating there, which its centre velocity misses.
+- **Rerun at 9 ms** with five exposure samples, the mounts frozen from this run, and the control thinned to every 16th frame: [l3_report_exposure9ms.json](l3_report_exposure9ms.json).
+
+| Gripper mount, TCP translation p95 in mm | 4 ms (formal) | 9 ms |
+|---|---:|---:|
+| Nominal · per-frame BA, R0 / H1 | 1.74 / 4.20 | 2.02 / 5.14 |
+| Evidence · smoothed, R0 / H1 | 4.80 / 7.97 | 4.95 / 8.44 |
+| **Primary Δp95 R0 − H1 [95% CI]** | **−3.17 [−4.12, −2.40]** | **−3.48 [−4.46, −2.57]** |
+
+- **Longer exposure costs the carrier more than R0:** +0.94 against +0.28 mm at nominal. Every level and output stays below zero, and coverage stays 100%.
+- **Label time.** The simulator stamps a label at mid-exposure. A production label anchored at the trigger edge or at SOF sits at least E/2 ≈ 4.4 ms from mid-exposure unless compensated. At the task's p95 speed of 0.48 m/s that is about 2 mm. Both arms share it here; the absolute budget and cross-modal alignment do not.
+
+### The production smoother's residual
+
+- **Mechanism.** `metrology/trajectory_smoothing.py` perturbs each observed pose on the left, `T = Exp(δ)·T_obs`.
+  - A rotation in δ turns the pose about the base origin and moves the TCP by φ × t. That move is charged only against the rotation σ.
+  - The TCP position is therefore held by roughly √(σ_t² + (σ_r·|t|)²), not by σ_t.
+  - With |t| ≈ 0.78 m, σ_r·|t| is 0.34 mm for R0 and 0.73 mm for the carrier, against a 0.1 mm translation floor.
+  - The carrier's σ comes from the anchor corner BA alone. H0 and H1 report the same σ, so the painted edges do not tighten it.
+- **Re-smoothing the cached per-frame solves.** The copy reproduces the cached output exactly. Segments converge within 15 of the 50 allowed iterations, and a linear loss is worse, so neither convergence nor the robust loss is the cause.
+
+| Socket control, nominal | R0 p95 | H1 p95 | H1 second-difference jitter p95 |
+|---|---:|---:|---:|
+| Per-frame BA | 0.47 | 0.51 | 0.80 |
+| Production smoother | 0.65 | 1.42 | 3.84 |
+| Body-frame residual, `T = T_obs·Exp(δ)` | 0.46 | 0.51 | 0.83 |
+
+- **Noise-free truth** through the production smoother moves the TCP by 0.44 mm p95 at this run's frame spacing, and by 0.70 mm at 60 Hz (1.3–1.4 mm at medium and high speed). With the body-frame residual the figures are 0.04 and 0.25 mm.
+- **The decision does not depend on it.** Pooled over the 24 evidence sessions, Δp95 R0 − H1 is −3.28 mm per-frame, −3.17 mm with the production smoother, and −3.19 mm with the body-frame residual. At that level session-fixed errors dominate, and no smoother removes them.
+- **Production labels** go through the same smoother and settings. What a fix would change there is recorded in the main roadmap's offline smoothing section.
 
 ## Synthetic L2 pilot (sandbox, not part of the decision)
 

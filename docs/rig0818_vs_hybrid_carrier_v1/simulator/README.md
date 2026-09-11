@@ -46,6 +46,28 @@ Each stage caches its output under `outputs/rig_target_ab/<run-name>/`: `select`
 - **Rigid-body breakdown** (`groups.<group>.mechanism`): the same per-frame poses re-read at the anchor centroid, the rig origin (socket), a common arm and the TCP, plus rotation. The TCP error is the centroid error plus rotation × arm. A number reported at the socket, such as every number from the 09-09 bench, says nothing about the rotation term. `bench_crosscheck` recomputes the bench's own statistics on the simulated poses: noise floor, facet refinement step, cameras decoding per frame.
 - The noiseless ArUco corner bias is reported, not gated. It is a property of the detector on these images; R0's 4.4 mm quiet zone against a black bracket is the main source.
 
+## Follow-ups (2026-09-11)
+
+The scripts behind the two follow-ups in [RESULTS.md](RESULTS.md#follow-ups-2026-09-11) are in `followups/`. Run them from the repository root; caches go to `outputs/rig_target_ab/followups_20260911/`.
+
+```bash
+F=docs/rig0818_vs_hybrid_carrier_v1/simulator/followups
+# Offline smoother: re-smooth the cached solves of measured_r0_socketfix
+python3 $F/smoother_ablation.py                  # nominal session 0, both groups, all variants
+for s in $(seq 0 23); do python3 $F/smoother_ablation.py --level evidence --session $s --groups gripper --only prod_copy,right; done
+python3 $F/agg_evidence.py                       # pooled Δp95 over the 24 evidence sessions
+python3 $F/syn60.py                              # 60 Hz truth + noise, matched sigma, base-origin shift
+python3 $F/real_v4.py                            # phase 5 CLI smoothing on the real 132514 poses: as run vs body frame
+# Exposure: pick fast frames, fetch the listed videos from Thor, measure blur
+python3 $F/select_blur_frames.py
+python3 $F/measure_blur.py
+# 9 ms rerun (copy select.json from measured_r0_socketfix into the new run first, so the mounts stay frozen)
+python3 docs/rig0818_vs_hybrid_carrier_v1/simulator/l3_runner.py --run-name exposure9ms --exposure-ms 9 --exposure-samples 5 \
+  --stride-socket 16 --stages render,native,solve,smooth,convergence,report \
+  --out docs/rig0818_vs_hybrid_carrier_v1/simulator/l3_report_exposure9ms.json
+python3 $F/compare_exposure.py
+```
+
 ## Tests
 
 ```bash
