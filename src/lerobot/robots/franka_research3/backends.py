@@ -149,6 +149,13 @@ def _resolve_das_databus_cls(gen_con_sdk_path: str | None):
     )
 
 
+def _sphere_inertia(mass_kg: float, radius_m: float = 0.02) -> tuple[float, ...]:
+    """A valid diagonal inertia of the right order, for a payload whose shape is not modelled."""
+
+    value = 0.4 * float(mass_kg) * float(radius_m) ** 2
+    return (value, 0.0, 0.0, 0.0, value, 0.0, 0.0, 0.0, value)
+
+
 @dataclass
 class PandaPyArmDriver:
     robot_ip: str
@@ -156,6 +163,9 @@ class PandaPyArmDriver:
     stiffness: list[float] | None = None
     filter_coeff: float | None = None
     state_poll_frequency_hz: float = 200.0
+    payload_mass_kg: float = 0.0
+    payload_com_m: tuple[float, float, float] | None = None
+    payload_inertia: tuple[float, ...] | None = None
 
     def __post_init__(self):
         try:
@@ -186,6 +196,7 @@ class PandaPyArmDriver:
         # only add latency to the connect path.
         state = self._robot.get_state()
         self._assert_arm_accepts_control(state)
+        self._apply_payload(state)
         self._start_controller(state)
         self._start_state_reader()
 
@@ -227,6 +238,72 @@ class PandaPyArmDriver:
         if remedy is not None:
             raise RuntimeError(f"FR3 at {self.robot_ip} cannot start a controller: {remedy}")
         logger.info("FR3 arm at %s accepts control (robot_mode=%s)", self.robot_ip, mode_name)
+
+    # libfranka refuses a zero inertia tensor alongside a non-zero mass (measured 2026-09-11:
+    # "Set Load command rejected: invalid argument!"), so the point-mass shortcut is not
+    # available. The inertia does not enter the gravity term this exists for at all -- what it
+    # has to be is physically valid and of the right order. A uniform sphere of this radius is
+    # that, and `payload_inertia` overrides it for anything whose shape matters.
+    _PAYLOAD_DEFAULT_RADIUS_M = 0.02
+
+    def _apply_payload(self, state: Any) -> None:
+        """Tell libfranka what the fingers are carrying, before any control loop exists.
+
+        Desk configures the *tool* (`m_ee`); it cannot know the payload, so `m_load` stays 0.0
+        and the gravity model is short by the weight of whatever is being held. Under a
+        joint-position controller that shortfall does not decay: it is a constant torque the PD
+        law can only answer with a constant position error, which on the way out looks exactly
+        like an arm that settled short of its tolerance and stopped closing.
+
+        Called before `start_controller` because `setLoad` is a configuration command and
+        libfranka refuses it while a control loop is running.
+
+        The centre of mass defaults to the flange-to-EE translation the robot already reports
+        rather than to a number written here. What dominates is the force term, and that needs
+        only the mass; a moment arm off by a few centimetres costs well under 0.05 Nm, which is
+        below what the joint torque estimate resolves.
+        """
+
+        get_robot = getattr(self._robot, "get_robot", None)
+        if get_robot is None:
+            if self.payload_mass_kg <= 0.0:
+                # Nothing asked for and nothing this driver could have left behind. A binding
+                # without the libfranka handle is not an error on its own.
+                return
+            # Refused rather than skipped. A configured payload that silently does not reach the
+            # arm is the exact failure this exists to remove, and it would be invisible.
+            raise RuntimeError(
+                "payload_mass_kg is set but this panda_py binding exposes no get_robot(), so "
+                "the load cannot be sent to libfranka. Set the payload in Desk instead, or "
+                "clear payload_mass_kg."
+            )
+        if self.payload_mass_kg <= 0.0:
+            # Cleared, not skipped. `setLoad` is robot-side state that survives the connection:
+            # a payload set by one run is still configured for the next one, so "no payload
+            # configured" has to mean "tell the arm there is none" or it silently means "keep
+            # whatever the last run left". Measured on the rig 2026-09-11.
+            get_robot().set_load(0.0, [0.0, 0.0, 0.0], [0.0] * 9)
+            logger.info("FR3 at %s payload cleared", self.robot_ip)
+            return
+        com = self.payload_com_m
+        if com is None:
+            flange_to_ee = getattr(state, "F_T_EE", None)
+            # Column-major 4x4: the translation is the last column, entries 12..14.
+            com = (
+                (0.0, 0.0, 0.0)
+                if flange_to_ee is None
+                else (float(flange_to_ee[12]), float(flange_to_ee[13]), float(flange_to_ee[14]))
+            )
+        inertia = self.payload_inertia or _sphere_inertia(self.payload_mass_kg)
+        get_robot().set_load(float(self.payload_mass_kg), [float(v) for v in com], [float(v) for v in inertia])
+        logger.info(
+            "FR3 at %s payload set: %.4f kg at flange xyz=%.4f,%.4f,%.4f",
+            self.robot_ip,
+            self.payload_mass_kg,
+            com[0],
+            com[1],
+            com[2],
+        )
 
     def _start_controller(self, state: Any | None = None) -> None:
         if self._robot is None:

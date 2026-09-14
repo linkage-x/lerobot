@@ -464,6 +464,9 @@ class FrankaResearch3(Robot):
             damping=self.config.damping,
             stiffness=self.config.stiffness,
             filter_coeff=self.config.filter_coeff,
+            payload_mass_kg=self.config.payload_mass_kg,
+            payload_com_m=self.config.payload_com_m,
+            payload_inertia=self.config.payload_inertia,
         )
         gripper = None
         kinematics = self._make_kinematics_driver()

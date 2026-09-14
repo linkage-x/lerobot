@@ -31,6 +31,7 @@ from lerobot.robots.franka_research3.backends import (
     FrankaHandGripperHardwareDriver,
     RuckigOTGDriver,
     PandaPyArmDriver,
+    _sphere_inertia,
     PikaGripperHardwareDriver,
 )
 from lerobot.robots.franka_research3.processor_franka_research3 import (
@@ -3286,3 +3287,158 @@ def test_ruckig_refuses_a_scale_outside_the_range(ruckig_otg):
         with pytest.raises(ValueError, match=r"scale must be in \(0, 1\]"):
             with ruckig_otg.limits_scaled_by(scale):
                 pass
+
+
+def _payload_panda_module(*, with_get_robot: bool = True, f_t_ee: list[float] | None = None):
+    """A panda_py stand-in that records the order of `set_load` against `start_controller`.
+
+    The order is the point: `setLoad` is a configuration command and libfranka refuses it once a
+    control loop is running, so a payload applied after the controller silently never lands.
+    """
+
+    calls: list[tuple] = []
+
+    class DummyController:
+        def set_control(self, joint_positions):
+            pass
+
+    class DummyLibfrankaRobot:
+        def set_load(self, mass, com, inertia):
+            calls.append(("set_load", float(mass), tuple(float(v) for v in com), tuple(float(v) for v in inertia)))
+
+    class DummyPanda:
+        def __init__(self, robot_ip):
+            self.robot_ip = robot_ip
+            # Column-major 4x4; the flange-to-EE translation lives in entries 12..14.
+            transform = f_t_ee if f_t_ee is not None else ([0.0] * 12 + [0.0, 0.0, 0.1034, 1.0])
+            self.state = types.SimpleNamespace(
+                q=np.zeros(7, dtype=np.float64),
+                robot_mode=types.SimpleNamespace(name="kIdle"),
+                F_T_EE=transform,
+            )
+
+        def get_state(self):
+            return self.state
+
+        def start_controller(self, controller):
+            calls.append(("start_controller",))
+
+        def stop_controller(self):
+            pass
+
+    if with_get_robot:
+        DummyPanda.get_robot = lambda self: DummyLibfrankaRobot()
+
+    module = types.SimpleNamespace(
+        Panda=DummyPanda, controllers=types.SimpleNamespace(JointPosition=DummyController)
+    )
+    return module, calls
+
+
+def test_a_configured_payload_reaches_libfranka_before_the_controller_starts(monkeypatch):
+    """Measured on the rig 2026-09-11: `m_load` was 0.0 while the peg hung in the fingers.
+
+    Desk knows the tool, not what it is holding, so the gravity model was short by the peg's
+    weight -- and a constant missing torque under a joint-position PD law is a constant position
+    error, which reads downstream as an arm that settled short of its tolerance.
+    """
+
+    module, calls = _payload_panda_module()
+    monkeypatch.setitem(sys.modules, "panda_py", module)
+    driver = PandaPyArmDriver(
+        robot_ip="192.168.1.206", state_poll_frequency_hz=0.0, payload_mass_kg=0.1257
+    )
+    driver.connect()
+
+    assert [call[0] for call in calls] == ["set_load", "start_controller"]
+    assert calls[0][1] == pytest.approx(0.1257)
+    driver.disconnect()
+
+
+def test_an_arm_carrying_nothing_clears_the_load_rather_than_leaving_the_last_run_s(monkeypatch):
+    """`setLoad` is robot-side state that outlives the connection -- measured on the rig.
+
+    A run that configures a payload leaves it configured for the next process, so "no payload"
+    has to be sent, not skipped. Skipping means the arm silently carries the previous run's peg
+    in its gravity model while the fingers are empty.
+    """
+
+    module, calls = _payload_panda_module()
+    monkeypatch.setitem(sys.modules, "panda_py", module)
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+
+    assert [call[0] for call in calls] == ["set_load", "start_controller"]
+    assert calls[0][1] == 0.0 and calls[0][2] == (0.0, 0.0, 0.0)
+    driver.disconnect()
+
+
+def test_a_default_inertia_is_valid_because_libfranka_refuses_a_zero_one(monkeypatch):
+    """Measured 2026-09-11: mass with an all-zero inertia is "Set Load command rejected"."""
+
+    module, calls = _payload_panda_module()
+    monkeypatch.setitem(sys.modules, "panda_py", module)
+    driver = PandaPyArmDriver(
+        robot_ip="192.168.1.206", state_poll_frequency_hz=0.0, payload_mass_kg=0.1257
+    )
+    driver.connect()
+
+    inertia = calls[0][3]
+    assert inertia == pytest.approx(_sphere_inertia(0.1257))
+    assert all(inertia[i] > 0.0 for i in (0, 4, 8)), "a zero diagonal is what the arm refuses"
+    driver.disconnect()
+
+
+def test_a_binding_without_the_libfranka_handle_is_fine_when_nothing_is_being_carried(monkeypatch):
+    module, calls = _payload_panda_module(with_get_robot=False)
+    monkeypatch.setitem(sys.modules, "panda_py", module)
+    driver = PandaPyArmDriver(robot_ip="192.168.1.206", state_poll_frequency_hz=0.0)
+    driver.connect()
+
+    assert [call[0] for call in calls] == ["start_controller"]
+    driver.disconnect()
+
+
+def test_the_payload_centre_of_mass_defaults_to_the_tool_the_robot_already_knows(monkeypatch):
+    """Rather than to a constant written in the driver, which would be a second tool definition."""
+
+    module, calls = _payload_panda_module()
+    monkeypatch.setitem(sys.modules, "panda_py", module)
+    driver = PandaPyArmDriver(
+        robot_ip="192.168.1.206", state_poll_frequency_hz=0.0, payload_mass_kg=0.1257
+    )
+    driver.connect()
+
+    assert calls[0][2] == pytest.approx((0.0, 0.0, 0.1034))
+    driver.disconnect()
+
+
+def test_an_explicit_centre_of_mass_and_inertia_are_sent_as_given(monkeypatch):
+    module, calls = _payload_panda_module()
+    monkeypatch.setitem(sys.modules, "panda_py", module)
+    inertia = tuple(float(v) for v in range(9))
+    driver = PandaPyArmDriver(
+        robot_ip="192.168.1.206",
+        state_poll_frequency_hz=0.0,
+        payload_mass_kg=0.25,
+        payload_com_m=(0.001, -0.002, 0.16),
+        payload_inertia=inertia,
+    )
+    driver.connect()
+
+    assert calls[0][1] == pytest.approx(0.25)
+    assert calls[0][2] == pytest.approx((0.001, -0.002, 0.16))
+    assert calls[0][3] == pytest.approx(inertia)
+    driver.disconnect()
+
+
+def test_a_binding_that_cannot_send_a_load_refuses_rather_than_dropping_it(monkeypatch):
+    """A payload configured but not applied is invisible, and invisible is the failure mode."""
+
+    module, _calls = _payload_panda_module(with_get_robot=False)
+    monkeypatch.setitem(sys.modules, "panda_py", module)
+    driver = PandaPyArmDriver(
+        robot_ip="192.168.1.206", state_poll_frequency_hz=0.0, payload_mass_kg=0.1257
+    )
+    with pytest.raises(RuntimeError, match="payload_mass_kg is set"):
+        driver.connect()

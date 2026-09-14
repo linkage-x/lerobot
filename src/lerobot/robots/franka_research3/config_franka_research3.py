@@ -86,6 +86,17 @@ class FrankaResearch3Config(RobotConfig):
     damping: list[float] | None = None
     stiffness: list[float] | None = None
     filter_coeff: float | None = None
+    # What the fingers are carrying, in kg. Desk configures the *tool* (`m_ee`); it cannot know
+    # the payload, so libfranka's gravity model is short by this weight until something says so,
+    # and under a joint-position controller a constant missing torque becomes a constant
+    # position error. 0.0 keeps the arm's present behaviour.
+    payload_mass_kg: float = 0.0
+    # Centre of mass of that payload in the *flange* frame. None uses the flange-to-EE
+    # translation the robot already reports, which is the tool tip it was told about.
+    payload_com_m: tuple[float, float, float] | None = None
+    # Row-major 3x3 inertia of the payload about its centre of mass. None treats it as a point
+    # mass: for a peg of a few hundred grams the force term dominates and the inertia is noise.
+    payload_inertia: tuple[float, ...] | None = None
     camera_max_age_ms: float = 100.0
     # Frames whose cameras disagree by more than this are suspect. By default the hardware robot
     # refuses them outright, which is appropriate for replay/inference. Workstation recording can
@@ -163,6 +174,12 @@ class FrankaResearch3Config(RobotConfig):
             raise ValueError("das_max_distance_m must be greater than das_min_distance_m.")
         if not 0.0 <= self.das_initial_position <= 1.0:
             raise ValueError("das_initial_position must be within [0.0, 1.0].")
+        if self.payload_mass_kg < 0:
+            raise ValueError("payload_mass_kg cannot be negative.")
+        if self.payload_com_m is not None and len(self.payload_com_m) != 3:
+            raise ValueError("payload_com_m must be three numbers (x, y, z) in the flange frame.")
+        if self.payload_inertia is not None and len(self.payload_inertia) != 9:
+            raise ValueError("payload_inertia must be nine numbers (row-major 3x3).")
         if self.otg_control_frequency <= 0:
             raise ValueError("otg_control_frequency must be positive.")
         if self.otg_async_control_frequency <= 0:
