@@ -38,6 +38,7 @@ from tools.data_collection_gui import rollout as rollout_backend
 from tools.data_collection_gui import table_plane
 from tools.data_collection_gui import task_ladders
 from tools.data_collection_gui import training as training_backend
+from tools.data_collection_gui import unattended as unattended_backend
 from tools.fr3 import fr3_align_checkpoint_use_amp as use_amp_alignment
 from tools.fr3.scene_reset import (
     SceneResetError,
@@ -6711,6 +6712,85 @@ def _load_scene_reset_mask(state: GatewayState) -> dict[str, Any]:
         return {"strokes": [], "updatedAt": ""}
     updated_at = str(raw.get("updatedAt") or "") if isinstance(raw, dict) else ""
     return {"strokes": [asdict(stroke) for stroke in strokes], "updatedAt": updated_at}
+
+
+def _unattended_tail(raw: Any) -> int:
+    try:
+        value = int(str(raw or "").strip() or unattended_backend.DEFAULT_TAIL)
+    except ValueError:
+        return unattended_backend.DEFAULT_TAIL
+    return max(1, min(5000, value))
+
+
+def _unattended_guard(call: Any) -> dict[str, Any]:
+    """Every unattended endpoint answers `{ok: false, error}` rather than raising a 500.
+
+    The page polls these once a second for hours. A stack trace through the handler would take
+    the whole gateway response down and leave the operator with a blank panel over a robot that
+    is still moving -- which is the one moment the page must keep rendering.
+    """
+
+    try:
+        return {"ok": True, **call()}
+    except unattended_backend.UnattendedError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _unattended_list(state: GatewayState) -> dict[str, Any]:
+    return _unattended_guard(
+        lambda: {
+            "runs": unattended_backend.list_runs(state.repo_root),
+            "active": unattended_backend.active_run(state.repo_root),
+            "kinds": [
+                {"id": kind.id, "label": kind.label, "unit": kind.unit}
+                for kind in unattended_backend.RUN_KINDS.values()
+            ],
+        }
+    )
+
+
+def _unattended_read(state: GatewayState, run_id: str, tail: int) -> dict[str, Any]:
+    return _unattended_guard(
+        lambda: {"run": unattended_backend.read_run(state.repo_root, run_id, tail=tail)}
+    )
+
+
+def _unattended_plan(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    return _unattended_guard(
+        lambda: unattended_backend.plan_run(
+            state.repo_root, str(body.get("kind") or ""), body.get("request") or {}
+        )
+    )
+
+
+def _unattended_start(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    return _unattended_guard(
+        lambda: {
+            "run": unattended_backend.start_run(
+                state.repo_root, str(body.get("kind") or ""), body.get("request") or {}
+            )
+        }
+    )
+
+
+def _unattended_stop(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    return _unattended_guard(
+        lambda: {
+            "run": unattended_backend.request_stop(
+                state.repo_root,
+                str(body.get("id") or ""),
+                mode=str(body.get("mode") or "boundary"),
+            )
+        }
+    )
+
+
+def _unattended_release(state: GatewayState, body: dict[str, Any]) -> dict[str, Any]:
+    return _unattended_guard(
+        lambda: {"run": unattended_backend.release_brake(state.repo_root, str(body.get("id") or ""))}
+    )
 
 
 def _save_scene_reset_mask(state: GatewayState, payload: dict[str, Any]) -> dict[str, Any]:
@@ -13674,6 +13754,17 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
             with state.lock:
                 _json_response(self, HTTPStatus.OK, {"ok": True, **_load_scene_reset_mask(state)})
             return
+        if path == "/api/unattended/runs":
+            # Deliberately outside the gateway lock. These read a directory and nothing else --
+            # an unattended run holds no gateway state -- and taking the lock would let a slow
+            # disk stall the 1 Hz status poll of whatever else is running.
+            _json_response(self, HTTPStatus.OK, _unattended_list(self.server.state))
+            return
+        if path == "/api/unattended/run":
+            run_id = (query.get("id", [""])[0] or "").strip()
+            tail = _unattended_tail(query.get("tail", [""])[0])
+            _json_response(self, HTTPStatus.OK, _unattended_read(self.server.state, run_id, tail))
+            return
         if path == "/api/rollout/last-params":
             with self.server.state.lock:
                 _json_response(
@@ -14227,6 +14318,18 @@ class DataCollectionGuiHandler(BaseHTTPRequestHandler):
                 if path == "/api/scene-reset/mask":
                     with state.lock:
                         _json_response(self, HTTPStatus.OK, _save_scene_reset_mask(state, body))
+                    return
+                if path == "/api/unattended/plan":
+                    _json_response(self, HTTPStatus.OK, _unattended_plan(state, body))
+                    return
+                if path == "/api/unattended/start":
+                    _json_response(self, HTTPStatus.OK, _unattended_start(state, body))
+                    return
+                if path == "/api/unattended/stop":
+                    _json_response(self, HTTPStatus.OK, _unattended_stop(state, body))
+                    return
+                if path == "/api/unattended/release-brake":
+                    _json_response(self, HTTPStatus.OK, _unattended_release(state, body))
                     return
                 if path == "/api/rollout/scene-reset":
                     with state.lock:

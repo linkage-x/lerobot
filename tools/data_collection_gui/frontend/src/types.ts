@@ -1527,3 +1527,57 @@ export type RolloutStartRequest = {
   moveToStart?: boolean;
   runtimeOptions?: RolloutRuntimeOptions;
 };
+
+/** A run that outlives the page watching it. See tools/data_collection_gui/unattended.py.
+ *
+ *  `state` carries the distinction the whole panel exists to show: `complete` and `crashed` both
+ *  mean the process is gone, and only one of them means the run finished. A row count cannot tell
+ *  them apart, so the state is computed at the gateway and rendered verbatim here rather than
+ *  being re-derived from the rows.
+ */
+export type UnattendedState =
+  | "planned"
+  | "starting"
+  | "running"
+  | "complete"
+  | "halted"
+  | "crashed";
+
+export type UnattendedKind = { id: string; label: string; unit: string };
+
+export type UnattendedListEntry = {
+  id: string;
+  kind: string;
+  state: UnattendedState;
+  startedAt?: number;
+  unitsDone: number;
+  unitsPlanned: number;
+  stopRequested: boolean;
+  alive: boolean;
+  lastRowAgeS: number | null;
+};
+
+export type UnattendedPlan = {
+  kind: string;
+  request: Record<string, unknown>;
+  schedule: Record<string, unknown>[];
+  qc: Record<string, unknown>;
+  fence: { min: number[]; max: number[]; source: string };
+  /** The schedule as the runtime's own `--plan-only` prints it: what a person authorises. */
+  text: string;
+  units: number;
+};
+
+export type UnattendedRow = Record<string, unknown> & { kind?: string };
+
+export type UnattendedRun = UnattendedListEntry & {
+  dir: string;
+  pid: number | null;
+  argv: string[];
+  logPath: string;
+  stopReason: string;
+  plan: UnattendedPlan | Record<string, never>;
+  rows: UnattendedRow[];
+  rowsTotal: number;
+  summary: (Record<string, unknown> & { ok?: boolean; haltedOn?: string }) | null;
+};

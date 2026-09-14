@@ -27,6 +27,10 @@ import type {
   RealEndEffectorMode,
   MujocoPreview,
   RolloutLiveFrames,
+  UnattendedKind,
+  UnattendedListEntry,
+  UnattendedPlan,
+  UnattendedRun,
   RealSensePreviewStatus,
   TrajectoryPoint,
   TeleopStatus,
@@ -1190,6 +1194,48 @@ export class DataCollectionGuiApi {
 
   async saveSceneResetMask(strokes: SceneResetStroke[]) {
     return this.trainingPost<{ strokes: SceneResetStroke[] }>("/api/scene-reset/mask", { strokes });
+  }
+
+  /** Runs that outlive this page. Every one of these reads or writes a directory on the rig, so
+   *  a closed browser, a reloaded page and a restarted gateway all see the same run -- which is
+   *  the point: an unattended run must not depend on anybody watching it. */
+  async fetchUnattendedRuns() {
+    return this.trainingGet<{
+      ok: boolean;
+      runs: UnattendedListEntry[];
+      active: UnattendedListEntry | null;
+      kinds: UnattendedKind[];
+      error?: string;
+    }>("/api/unattended/runs");
+  }
+
+  async fetchUnattendedRun(id: string, tail?: number) {
+    return this.trainingGet<{ ok: boolean; run: UnattendedRun; error?: string }>(
+      "/api/unattended/run",
+      tail ? { id, tail: String(tail) } : { id }
+    );
+  }
+
+  /** Expand and fence-check a plan without writing or moving anything. */
+  async planUnattendedRun(kind: string, request: Record<string, unknown>) {
+    return this.trainingPost<{ kind: string; label: string; unit: string; plan: UnattendedPlan }>(
+      "/api/unattended/plan",
+      { kind, request }
+    );
+  }
+
+  async startUnattendedRun(kind: string, request: Record<string, unknown>) {
+    return this.trainingPost<{ run: UnattendedRun }>("/api/unattended/start", { kind, request });
+  }
+
+  /** `boundary` finishes the unit in flight and parks holding the peg; `now` stops where it
+   *  stands. Two actions, never one button with a modifier. */
+  async stopUnattendedRun(id: string, mode: "boundary" | "now") {
+    return this.trainingPost<{ run: UnattendedRun }>("/api/unattended/stop", { id, mode });
+  }
+
+  async releaseUnattendedBrake(id: string) {
+    return this.trainingPost<{ run: UnattendedRun }>("/api/unattended/release-brake", { id });
   }
 
   async clearTableAlignment(cameraKey: string) {

@@ -16,6 +16,7 @@ import { QcReportPage } from "./pages/QcReportPage";
 import { DatasetExportPage } from "./pages/DatasetExportPage";
 import { TrainingPage } from "./pages/TrainingPage";
 import { RolloutPage } from "./pages/RolloutPage";
+import { UnattendedPage } from "./pages/UnattendedPage";
 import { TaskLibraryPage } from "./pages/TaskLibraryPage";
 import { DeviceManagerPage } from "./pages/DeviceManagerPage";
 import { TeleoperationPage } from "./pages/TeleoperationPage";
@@ -29,6 +30,7 @@ export type PageId =
   | "dataset-export"
   | "training"
   | "rollout"
+  | "unattended"
   | "dashboard"
   | "qc-report"
   | "model-evaluation"
@@ -48,6 +50,7 @@ const mvpPages: PageMeta[] = [
   { id: "dataset-export", label: "Dataset Export", kind: "mvp" },
   { id: "training", label: "Training", kind: "mvp" },
   { id: "rollout", label: "Rollout", kind: "mvp" },
+  { id: "unattended", label: "Unattended Runs", kind: "mvp" },
   { id: "task-library", label: "Task Library", kind: "mvp" },
   { id: "calibration", label: "Calibration", kind: "mvp" },
   { id: "device-manager", label: "Device Manager", kind: "mvp" }
@@ -74,7 +77,10 @@ const navGroups: NavGroup[] = [
   // only page whose work can run on a machine other than the one the gateway is on.
   // Rollout sits beside Training rather than under it: it consumes a checkpoint the way
   // Training consumes a view, and it is the only page whose buttons move the robot.
-  { label: "Model", ids: ["training", "rollout"] }
+  // Unattended sits beside Rollout because both move the robot, and apart from it because a
+  // rollout is a person driving a policy while an unattended run is a schedule that outlives
+  // whoever started it. The page for one cannot be the page for the other.
+  { label: "Model", ids: ["training", "rollout", "unattended"] }
 ];
 
 const workstationPageIds = new Set<PageId>([
@@ -91,7 +97,10 @@ const workstationPageIds = new Set<PageId>([
   "dataset-export",
   "training",
   // Rollout drives the FR3 and its two RealSense units directly, so it exists only where they do.
-  "rollout"
+  "rollout",
+  // Same reason, plus one of its own: an unattended run's state is a directory on the rig, so the
+  // page is only meaningful on the machine that has it.
+  "unattended"
 ]);
 
 function pageAllowedForProfile(page: PageId, profile: "thor" | "workstation"): boolean {
@@ -368,6 +377,8 @@ function App() {
       <TrainingPage />
     ) : activePage === "rollout" ? (
       <RolloutPage />
+    ) : activePage === "unattended" ? (
+      <UnattendedPage api={api} />
     ) : activePage === "dataset-export" ? (
       <DatasetExportPage
         snapshot={snapshot}
